@@ -16,6 +16,7 @@
 #include <linux/pm_wakeup.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/rtkit-helper.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/soc/apple/t8132.h>
 #include <linux/string.h>
 #include <linux/suspend.h>
@@ -44,6 +45,10 @@ struct apple_rtkit_helper {
 	bool ap_idle;
 	/* It was told, gave no answer, and wasn't told otherwise. */
 	bool idle_unanswered;
+	/* T8140 MTP: started after a CPU reset and stopped with an RTKit sleep, to restart. */
+	bool restartable;
+	/* The firmware is stopping for a sleep, so RTKit may free the buffers given to it. */
+	bool free_buffers;
 	/* Ends a sleep whose .prepare failed, which gets no .complete. */
 	struct notifier_block pm_nb;
 
@@ -109,7 +114,11 @@ static int apple_rtkit_helper_shmem_setup(void *cookie, struct apple_rtkit_shmem
 
 static void apple_rtkit_helper_shmem_destroy(void *cookie, struct apple_rtkit_shmem *bfr)
 {
-	// no-op
+	struct apple_rtkit_helper *helper = cookie;
+
+	/* Others keep theirs: a quiesced firmware may still write its log. */
+	if (helper->free_buffers && bfr->buffer && !bfr->is_mapped)
+		dma_free_coherent(helper->dev, bfr->size, bfr->buffer, bfr->iova);
 }
 
 static const struct apple_rtkit_ops apple_rtkit_helper_ops = {
@@ -244,6 +253,67 @@ static int apple_rtkit_helper_inherit_buffers(
 	return count;
 }
 
+/*
+ * A T8140 MTP firmware that ran and was stopped for a sleep, as U-Boot leaves it, only comes
+ * back from its reset vector, and the run bit alone doesn't take it there. So its CPU is reset
+ * first. An image iBoot loaded and nobody started boots cold either way.
+ */
+static int apple_rtkit_helper_start(struct apple_rtkit_helper *helper)
+{
+	struct device *dev = helper->dev;
+	void __iomem *ctrl = helper->asc_base + APPLE_ASC_CPU_CONTROL;
+	int ret;
+
+	if (helper->restartable) {
+		if (readl(ctrl) & APPLE_ASC_CPU_CONTROL_RUN) {
+			dev_warn(dev, "CPU already running with no handoff; not resetting it\n");
+		} else {
+			ret = apple_sleep_aon_cpu_reset(dev);
+			if (ret)
+				dev_warn(dev, "no CPU reset (%d); only a never-started firmware boots\n",
+					 ret);
+		}
+	}
+
+	writel_relaxed(APPLE_ASC_CPU_CONTROL_RUN, ctrl);
+
+	/* Works for both wake and boot */
+	if (of_device_is_compatible(dev->of_node, "apple,t8142-mtp"))
+		return apple_rtkit_wake_early_ap(helper->rtk);
+	return apple_rtkit_wake(helper->rtk);
+}
+
+/*
+ * A T8140 MTP gets an RTKit sleep, so apple_rtkit_helper_start() can bring it back, and is left
+ * running with its buffers if it doesn't answer. Others are quiesced.
+ */
+static void apple_rtkit_helper_stop(struct apple_rtkit_helper *helper)
+{
+	void __iomem *ctrl = helper->asc_base + APPLE_ASC_CPU_CONTROL;
+	int ret;
+
+	if (!helper->restartable) {
+		if (apple_rtkit_is_running(helper->rtk))
+			apple_rtkit_quiesce(helper->rtk);
+		writel_relaxed(0, ctrl);
+		return;
+	}
+
+	if (apple_rtkit_is_running(helper->rtk)) {
+		helper->free_buffers = true;
+		ret = apple_rtkit_shutdown(helper->rtk);
+		if (ret) {
+			helper->free_buffers = false;
+			dev_err(helper->dev, "RTKit sleep not answered (%d); left running\n", ret);
+			return;
+		}
+	}
+
+	/* Twice, each time from what it reads back, as for a sleep. */
+	writel(readl(ctrl) & ~APPLE_ASC_CPU_CONTROL_RUN, ctrl);
+	writel(readl(ctrl) & ~APPLE_ASC_CPU_CONTROL_RUN, ctrl);
+}
+
 static int apple_rtkit_helper_pm_register(struct apple_rtkit_helper *helper);
 
 static int apple_rtkit_helper_probe(struct platform_device *pdev)
@@ -263,6 +333,7 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	helper->dev = dev;
+	helper->restartable = of_device_is_compatible(dev->of_node, "apple,t8140-mtp");
 	platform_set_drvdata(pdev, helper);
 
 	helper->asc_base = devm_platform_ioremap_resource_byname(pdev, "asc");
@@ -364,17 +435,12 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(helper->rtk),
 				     "Failed to initialize RTKit\n");
 
-	writel_relaxed(APPLE_ASC_CPU_CONTROL_RUN,
-		       helper->asc_base + APPLE_ASC_CPU_CONTROL);
-
-	/* Works for both wake and boot */
-	if (of_device_is_compatible(dev->of_node, "apple,t8142-mtp"))
-		ret = apple_rtkit_wake_early_ap(helper->rtk);
-	else
-		ret = apple_rtkit_wake(helper->rtk);
+	ret = apple_rtkit_helper_start(helper);
 	if (ret != 0)
 		return dev_err_probe(dev, ret, "Failed to wake up coprocessor\n");
 
+	if (helper->restartable)
+		dev_info(dev, "started the MTP without a handoff\n");
 	return apple_rtkit_helper_pm_register(helper);
 }
 
@@ -386,10 +452,7 @@ static void apple_rtkit_helper_remove(struct platform_device *pdev)
 	if (helper->adopted || helper->preserved)
 		return;
 
-	if (apple_rtkit_is_running(helper->rtk))
-		apple_rtkit_quiesce(helper->rtk);
-
-	writel_relaxed(0, helper->asc_base + APPLE_ASC_CPU_CONTROL);
+	apple_rtkit_helper_stop(helper);
 }
 
 static int apple_rtkit_helper_ap_power(struct apple_rtkit_helper *helper, bool on)
@@ -536,7 +599,7 @@ static int __maybe_unused apple_rtkit_helper_freeze(struct device *dev)
 	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
 
 	/* A hibernation image cannot recreate the firmware's live DMA ownership. */
-	return helper->adopted ? -EBUSY : 0;
+	return helper->adopted || helper->restartable ? -EBUSY : 0;
 }
 
 static const struct dev_pm_ops apple_rtkit_helper_pm_ops = {
