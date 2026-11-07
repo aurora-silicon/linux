@@ -470,54 +470,6 @@
 		};
 	};
 
-	error-handler {
-		compatible = "apple,t8140-error-handler", "apple,soc-error-handler";
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 282 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 284 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 286 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 288 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 892 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 352 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 361 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 351 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 358 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 354 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 355 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 356 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 359 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 357 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 290 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 293 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 296 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 299 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 177 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 178 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 179 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 180 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 185 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 184 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 181 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 182 IRQ_TYPE_LEVEL_HIGH>;
-		/* Not yet qualified on the J700. */
-		status = "disabled";
-	};
-
-	event-log-handler {
-		compatible = "apple,t8140-event-log", "apple,soc-event-log";
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 232 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 233 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 261 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 278 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 37 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 38 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 652 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 644 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 879 IRQ_TYPE_LEVEL_HIGH>;
-		/* Not yet qualified on the J700. */
-		status = "disabled";
-	};
 
 	soc: soc {
 		compatible = "simple-bus";
@@ -1816,7 +1768,8 @@
 		admac_base_ns: dma-controller@313800000 {
 			compatible = "apple,t8140-admac";
 			reg = <0x3 0x13800000 0x0 0x34000>;
-			dma-channels = <13>;
+			/* ADT has 13 slots per direction; Linux IDs alternate TX/RX. */
+			dma-channels = <26>;
 			interrupts-extended = <&aic AIC_IRQ 449 IRQ_TYPE_LEVEL_HIGH>,
 					      <0>, <0>, <0>;
 			#dma-cells = <1>;
@@ -1836,7 +1789,8 @@
 		admac_leap_ns: dma-controller@313300000 {
 			compatible = "apple,t8140-admac";
 			reg = <0x3 0x13300000 0x0 0x34000>;
-			dma-channels = <9>;
+			/* ADT has 9 slots per direction, including loopback RX4. */
+			dma-channels = <18>;
 			interrupts-extended = <&aic AIC_IRQ 452 IRQ_TYPE_LEVEL_HIGH>,
 					      <0>, <0>, <0>;
 			#dma-cells = <1>;
@@ -2050,6 +2004,7 @@
 };
 
 #include "t8140-pmgr.dtsi"
+#include "t8140-peripherals.dtsi"
 
 /*
  * DRAM interface class: width and maximum rate are inferred from topology

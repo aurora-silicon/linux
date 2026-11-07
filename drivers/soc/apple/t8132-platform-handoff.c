@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
-/* Supply missing platform descriptions for the original J713 loader ABI.
+/* Supply missing platform descriptions for the original J713 loader ABI,
+ * which the J715 shares.
  * Keep the shared m1n1 payload usable by the stable kernel. Hardware control
  * remains in the ordinary MCC, PMC and CLPC drivers, with one DTS data source.
  * J713 PMGR ownership/status also comes from its board DTS, before any domain
@@ -9,6 +10,7 @@
 #include <linux/libfdt.h>
 #include <linux/of.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/t8132.h>
 #include <linux/string.h>
 
 extern const u8 __dtb_t8132_platform_data_begin[];
@@ -215,8 +217,7 @@ static int __init t8132_platform_handoff(void)
 	unsigned int added = 0, changed = 0;
 	int root, node, ret;
 
-	if (!of_machine_is_compatible("apple,j713") ||
-	    !of_machine_is_compatible("apple,t8132"))
+	if (!apple_t8132_air() || !of_machine_is_compatible("apple,t8132"))
 		return 0;
 	if (fdt_check_header(data))
 		return -EINVAL;
