@@ -142,6 +142,120 @@ fn device(only: bool, refuse: bool) -> SepData {
             subprocess.run([str(path / "test"), "--test-threads=1"], check=True)
 
 
+@unittest.skipUnless(shutil.which("rustc"), "rustc required")
+class MachineRefkeyTests(unittest.TestCase):
+    def test_production_read_only_refkey_cache(self):
+        harness = r'''
+use std::cell::{Cell, RefCell};
+use std::ffi::CStr;
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+type Result<T> = std::result::Result<T, u8>;
+const GFP_KERNEL: u8 = 0;
+macro_rules! dev_err { ($($arg:tt)*) => {}; }
+macro_rules! dev_warn { ($($arg:tt)*) => {}; }
+thread_local! {
+    static READABLE: Cell<bool> = const { Cell::new(true) };
+    static VALID: Cell<bool> = const { Cell::new(true) };
+    static READS: Cell<usize> = const { Cell::new(0) };
+    static WRITES: Cell<usize> = const { Cell::new(0) };
+    static CREATES: Cell<usize> = const { Cell::new(0) };
+}
+struct KVec<T>(Vec<T>);
+impl<T: Clone> KVec<T> {
+    fn new() -> Self { Self(Vec::new()) }
+    fn resize(&mut self, len: usize, value: T, _: u8) -> Result<()> {
+        self.0.resize(len, value); Ok(())
+    }
+}
+impl<T> Deref for KVec<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] { &self.0 }
+}
+impl<T> DerefMut for KVec<T> {
+    fn deref_mut(&mut self) -> &mut [T] { &mut self.0 }
+}
+mod sks { pub type KeyBagHandle = u8; }
+mod module_parameters {
+    pub struct Param;
+    impl Param { pub fn value(&self) -> u8 { 0 } }
+    #[allow(non_upper_case_globals)]
+    pub const refkey_v2: Param = Param;
+}
+mod shim {
+    use super::*;
+    pub struct StoreFile;
+    impl StoreFile {
+        pub fn open_readonly(_: &CStr) -> Result<Self> {
+            READS.with(|n| n.set(n.get()+1));
+            if READABLE.with(|v| v.get()) { Ok(Self) } else { Err(2) }
+        }
+        pub fn open(_: &CStr) -> Result<Self> {
+            WRITES.with(|n| n.set(n.get()+1)); Ok(Self)
+        }
+        pub fn size(&self) -> Result<u64> { Ok(3) }
+        pub fn read_exact(&self, _: u64, out: &mut [u8]) -> Result<()> {
+            out.fill(0xa5); Ok(())
+        }
+        pub fn write_all(&self, _: u64, _: &[u8]) -> Result<()> { Ok(()) }
+        pub fn sync(&self) -> Result<()> { Ok(()) }
+    }
+}
+struct Cache(RefCell<Option<()>>);
+impl Cache {
+    fn lock(&self) -> std::cell::RefMut<'_, Option<()>> { self.0.borrow_mut() }
+}
+struct SepData { machine_refkey: Cache, keystore_only: AtomicBool }
+impl SepData {
+MACHINE
+    fn sks_create_refkey(&self, _: u8, _: &[u8]) -> Option<KVec<u8>> {
+        CREATES.with(|n| n.set(n.get()+1)); Some(KVec(vec![1,2,3]))
+    }
+    fn cache_machine_refkey(&self, _: KVec<u8>) -> bool {
+        if !VALID.with(|v| v.get()) { return false; }
+        *self.machine_refkey.lock() = Some(()); true
+    }
+}
+fn device(only: bool) -> SepData {
+    SepData { machine_refkey: Cache(RefCell::new(None)), keystore_only: AtomicBool::new(only) }
+}
+fn no_writes() {
+    WRITES.with(|n| assert_eq!(n.get(), 0));
+    CREATES.with(|n| assert_eq!(n.get(), 0));
+}
+#[test] fn cached_refkey_never_reopens_initrd_file() {
+    let d = device(true); d.sks_machine_refkey(1, &[]);
+    READABLE.with(|v| v.set(false));
+    for _ in 0..5 { d.sks_machine_refkey(1, &[]); }
+    READS.with(|n| assert_eq!(n.get(), 1)); no_writes();
+}
+#[test] fn missing_initrd_refkey_never_creates_or_persists() {
+    READABLE.with(|v| v.set(false));
+    let d = device(true); d.sks_machine_refkey(1, &[]);
+    assert!(d.machine_refkey.lock().is_none()); no_writes();
+}
+#[test] fn invalid_existing_refkey_is_never_replaced_in_either_phase() {
+    VALID.with(|v| v.set(false));
+    for only in [false,true] { device(only).sks_machine_refkey(1, &[]); }
+    no_writes();
+}
+#[test] fn default_attach_retains_missing_refkey_provisioning() {
+    READABLE.with(|v| v.set(false));
+    let d = device(false); d.sks_machine_refkey(1, &[]);
+    assert!(d.machine_refkey.lock().is_some());
+    CREATES.with(|n| assert_eq!(n.get(), 1));
+    WRITES.with(|n| assert_eq!(n.get(), 1));
+}
+'''
+        harness = harness.replace("MACHINE", function("drivers/soc/apple/refkey.rs", "sks_machine_refkey"))
+        with tempfile.TemporaryDirectory(prefix="sep-machine-refkey-") as tmp:
+            path = Path(tmp)
+            (path / "test.rs").write_text(harness)
+            subprocess.run(["rustc", "--edition=2021", "--test", str(path / "test.rs"),
+                            "-o", str(path / "test")], check=True)
+            subprocess.run([str(path / "test"), "--test-threads=1"], check=True)
+
+
 class LoaderTests(unittest.TestCase):
     def test_completion_replaces_modprobe(self):
         source = (ROOT / "tools/aurora-sep/load-driver").read_text().split("work=$(mktemp", 1)[0]
