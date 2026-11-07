@@ -409,7 +409,9 @@ static int ane_h16_power_cycle(struct ane_h16_device *h, bool verify)
 	for (i = 1; verify && i < h->powered; i++) {
 		if (!h->genpd[i].added || h->genpd[i].offs == offs[i]) {
 			dev_err(h->dev, "H16 ANE: domain %u did not power off; no restart\n", i);
-			return -EIO;
+			/* Powered again, so the quarantine can read its evidence. */
+			ret = ane_h16_power_up(h);
+			return ret ?: -EIO;
 		}
 	}
 	ret = ane_h16_power_up(h);
@@ -1015,6 +1017,11 @@ static void ane_h16_startup_fwlog(struct ane_h16_device *h)
  * A startup that timed out at bring-up: keep the log, then a verified power
  * cycle. Every mapping stays; nothing is released while the engine may hold it.
  */
+static bool ane_h16_powered(void *ctx)
+{
+	return ((struct ane_h16_device *)ctx)->engine_on;
+}
+
 static int ane_h16_restart_engine(void *ctx)
 {
 	struct ane_h16_device *h = ctx;
@@ -1042,6 +1049,7 @@ static const struct ane_h16_boot_ops ane_h16_ops = {
 	.log = ane_h16_log,
 	.quarantine = ane_h16_quarantine,
 	.restart = ane_h16_restart_engine,
+	.powered = ane_h16_powered,
 };
 
 static void ane_h16_busy(void *ctx, bool busy);

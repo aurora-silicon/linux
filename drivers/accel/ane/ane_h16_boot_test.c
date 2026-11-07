@@ -64,6 +64,8 @@ struct ane_h16_sim {
 	u32 power_cycles;
 	int restart_error;
 	bool reset;
+	bool unpowered;
+	u32 quarantine_reads;
 };
 
 static const u32 sim_power_words[] = { 0x3c0, 0xc008, 0xc000, 0xc010, 0xc018 };
@@ -406,6 +408,13 @@ static void sim_log(void *ctx, const char *item, u64 a, u64 b)
 		s->timeout_bodies++;
 	if (!strcmp(item, "startup timeout scratch"))
 		s->timeout_scratch++;
+	if (!strcmp(item, "quarantine scratch"))
+		s->quarantine_reads++;
+}
+
+static bool sim_powered(void *ctx)
+{
+	return !((struct ane_h16_sim *)ctx)->unpowered;
 }
 
 /* A verified power cycle: the CPU is held in reset until the next RUN. */
@@ -795,6 +804,7 @@ static void sim_use_restart(struct ane_h16_sim *s, u32 stalls, unsigned int budg
 {
 	s->ops = sim_ops;
 	s->ops.restart = sim_restart;
+	s->ops.powered = sim_powered;
 	/* Reuse clears the surfaces; keep them inside the sparse simulated heap. */
 	s->heap_request = SZ_64K;
 	s->boot.ops = &s->ops;
@@ -856,6 +866,22 @@ static void ane_h16_startup_restart_refused_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, s->command_count, 1U);
 	KUNIT_EXPECT_TRUE(test, s->boot.quarantined);
 	KUNIT_EXPECT_EQ(test, s->quarantines, 1U);
+	/* Still powered: the quarantine reads its evidence. */
+	KUNIT_EXPECT_EQ(test, s->quarantine_reads, 8U);
+}
+
+/* A restart that left the engine off quarantines without touching it. */
+static void ane_h16_startup_restart_unpowered_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	sim_use_restart(s, 1, 2);
+	s->restart_error = -EIO;
+	s->unpowered = true;
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), -EIO);
+	KUNIT_EXPECT_TRUE(test, s->boot.quarantined);
+	KUNIT_EXPECT_EQ(test, s->quarantines, 1U);
+	KUNIT_EXPECT_EQ(test, s->quarantine_reads, 0U);
 }
 
 /* Without the op (or with no budget) a timeout ends the attempt, as before. */
@@ -1124,6 +1150,7 @@ static struct kunit_case ane_h16_boot_cases[] = {
 	KUNIT_CASE(ane_h16_startup_restart_test),
 	KUNIT_CASE(ane_h16_startup_restart_budget_test),
 	KUNIT_CASE(ane_h16_startup_restart_refused_test),
+	KUNIT_CASE(ane_h16_startup_restart_unpowered_test),
 	KUNIT_CASE(ane_h16_startup_no_budget_test),
 	{}
 };

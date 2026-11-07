@@ -136,6 +136,8 @@ struct ane_h16_boot_ops {
 	 * can be released from the same entry. 0 only for a verified reset.
 	 */
 	int (*restart)(void *ctx);
+	/* Optional. False while the engine's domains are off: no MMIO then. */
+	bool (*powered)(void *ctx);
 };
 
 /*
@@ -232,9 +234,12 @@ static inline int ane_h16_fail(struct ane_h16_boot *b, int error)
 		b->error = error;
 	if (b->ran && !b->quarantined) {
 		b->quarantined = true;
-		for (i = 0; i < 8; i++)
-			b->ops->log(b->ctx, "quarantine scratch", i, ane_h16_read(b, i));
-		ane_h16_faults(b, true);
+		/* A failed restart can leave the engine off: then no register reads. */
+		if (!b->ops->powered || b->ops->powered(b->ctx)) {
+			for (i = 0; i < 8; i++)
+				b->ops->log(b->ctx, "quarantine scratch", i, ane_h16_read(b, i));
+			ane_h16_faults(b, true);
+		}
 		b->ops->quarantine(b->ctx, b->error);
 	}
 	return b->error;
