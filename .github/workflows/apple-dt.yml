@@ -26,6 +26,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Require fleet inventories
+        run: |
+          for board in t6040-j616s t8140-j700 t6000-j316s t8112-j413; do
+            test -s "arch/arm64/boot/dts/apple/adt-coverage/$board.txt"
+          done
       - name: Install DT validation tools
         run: |
           sudo apt-get update -q

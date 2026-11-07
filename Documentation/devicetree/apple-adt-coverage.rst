@@ -22,6 +22,8 @@ MISSING entries for gap inventories, while still failing on malformed input or
 broken DT references. The CI job reports counts before running the strict check
 beside ``dtbs_check``. A draft inventory with real gaps intentionally fails the
 strict step until those gaps have been resolved or reviewed as exemptions.
+The workflow also requires each fleet inventory file, so deleting one cannot
+silently reduce the set of boards checked.
 
 Manifest format and review
 --------------------------
