@@ -1032,6 +1032,34 @@ impl SndSocT8140AopData {
         Ok(())
     }
 
+    /// `pw0 ` if running; the leaves stay with the stream.
+    fn service_stop(&self, svc: &Service) {
+        if svc.running.load(Relaxed) {
+            if let Err(e) = self.service_set_power(svc, SPKR_POWER_STATE_PW0) {
+                dev_err!(self.dev, "{}: pw0 failed: {:?}\n", svc.name, e);
+            }
+            svc.running.store(false, Relaxed);
+        }
+    }
+
+    /// A system sleep: nothing the firmware runs may outlast the streams, whose DMA stops with
+    /// the sleep. Each one's next prepare or start asks for it again.
+    fn sleep_stop(&self) {
+        if self.powered.xchg(false, Relaxed) {
+            if let Err(e) = self.lpai_run_put() {
+                dev_err!(self.dev, "unable to return lpai to idle: {:?}\n", e);
+            }
+        }
+        self.flush_hpai_start();
+        self.service_stop(&self.hpai);
+        if let Err(e) = self.spkr_prepare() {
+            dev_err!(self.dev, "spkr: stop failed: {:?}\n", e);
+        }
+        self.service_stop(&self.tap);
+        self.service_stop(&self.cout);
+        self.service_stop(&self.cin);
+    }
+
     /// Called from sleeping prepare/shutdown paths while ALSA serializes
     /// this stream: a queued start must finish before the mute and pw0.
     fn flush_spkr_start(&self) {
@@ -2557,6 +2585,8 @@ impl AsocContext {
 
 pub(crate) struct SndSocT8140AopDriver {
     card: *mut bindings::snd_card,
+    /// The card's two microphone PCMs, null until created.
+    pcms: [*mut bindings::snd_pcm; 2],
     data: Arc<SndSocT8140AopData>,
     asoc: KBox<AsocContext>,
     asoc_registered: bool,
@@ -2612,6 +2642,7 @@ impl SndSocT8140AopDriver {
         // whatever was set up.
         let mut this = SndSocT8140AopDriver {
             card: ptr::null_mut(),
+            pcms: [ptr::null_mut(); 2],
             asoc: AsocContext::new(data.clone())?,
             data: data.clone(),
             asoc_registered: false,
@@ -2725,6 +2756,7 @@ impl SndSocT8140AopDriver {
             (*pcm).private_free = Some(pcm_free_private);
             (*pcm).info_flags = 0;
         }
+        self.pcms[device as usize] = pcm;
         // SAFETY: as above.
         copy_str(unsafe { &mut (*pcm).name }, name.to_bytes_with_nul())?;
         if device == 0 {
@@ -2743,6 +2775,21 @@ impl SndSocT8140AopDriver {
             }
         }
         Ok(())
+    }
+
+    /// A system sleep: stop the card's own streams, then whatever the firmware runs for them
+    /// and for the sound card's. Userspace prepares its streams again afterwards, since none
+    /// of them can resume.
+    pub(crate) fn sleep_stop(&self) {
+        for pcm in self.pcms.iter().copied().filter(|pcm| !pcm.is_null()) {
+            // SAFETY: the PCMs live as long as the card, and the driver core keeps
+            // unbind away from a system sleep.
+            let ret = unsafe { bindings::snd_pcm_suspend_all(pcm) };
+            if ret < 0 {
+                dev_err!(self.data.dev, "unable to suspend a PCM: {}\n", ret);
+            }
+        }
+        self.data.sleep_stop();
     }
 
     /// Undo probe: stop the reports, unregister the ASoC component and free
