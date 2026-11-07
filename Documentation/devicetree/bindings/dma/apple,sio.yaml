@@ -27,6 +27,8 @@ properties:
               - apple,t6000-sio
               - apple,t6020-sio
               - apple,t6030-sio
+              - apple,t6031-sio
+              - apple,t8122-sio
               - apple,t8103-sio
               - apple,t8112-sio
           - const: apple,sio
@@ -34,7 +36,10 @@ properties:
         const: apple,t6041-sio
 
   reg:
-    maxItems: 1
+    minItems: 1
+    items:
+      - description: Coprocessor control registers
+      - description: Coprocessor boot interface
 
   '#dma-cells':
     const: 1

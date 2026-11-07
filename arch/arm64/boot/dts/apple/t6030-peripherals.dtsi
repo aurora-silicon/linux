@@ -424,6 +424,17 @@
 		status = "disabled";
 	};
 
+	usb_otg0: usb@702100000 {
+		compatible = "apple,t6030-usb2-otg", "apple,usb2-otg";
+		reg = <0x7 0x02100000 0x0 0x1000>,
+		      <0x7 0x02a84000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1085 IRQ_TYPE_LEVEL_HIGH>;
+		phys = <&atcphy0 PHY_TYPE_USB2>;
+		phy-names = "usb2-phy";
+		status = "disabled";
+	};
+
 	scaler0: scaler@391000000 {
 		compatible = "apple,t6030-scaler", "apple,scaler";
 		reg = <0x3 0x91000000 0x0 0x30000>,

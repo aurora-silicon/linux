@@ -2181,3 +2181,7 @@
 #include "t6030-peripherals.dtsi"
 
 #include "t6030-peripheral-buses.dtsi"
+
+#include "t6030-coprocessors.dtsi"
+
+#include "t6030-misc-interfaces.dtsi"
