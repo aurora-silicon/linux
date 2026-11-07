@@ -4947,6 +4947,18 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	char fw_str[DCP_FW_VERSION_STR_LEN];
 	int ret;
 
+	/*
+	 * T8142 (J813) on macOS 27.0: the H17P interface written for its 26.x
+	 * firmware makes the 27.0 DCP firmware panic right after the first
+	 * hotplug ("ap_link: callback failed with: 0x5"). It runs the T6050's
+	 * firmware-27 generation.
+	 */
+	if (of_device_is_compatible(dev->of_node, "apple,t8142-dcp")) {
+		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
+		if (ret >= 0 && !strcmp(compat_str, "27.0.0"))
+			return DCP_FIRMWARE_V_27_0;
+	}
+
 	if (hw->firmware_compat == DCP_FIRMWARE_V_27_0) {
 		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
 		if (ret < 0 || strcmp(compat_str, "27.0.0"))
@@ -6074,6 +6086,13 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	mutex_init(&dcp->dcpavserv.lock);
 	INIT_WORK(&dcp->dcpavserv.close_wq, dcpavserv_close_work);
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
+	/*
+	 * T8142 on firmware 27 runs as the T6050's firmware-27 instance, with
+	 * the default method profile: with H17G every swap fails with status 4.
+	 */
+	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    of_device_is_compatible(dev->of_node, "apple,t8142-dcp"))
+		dcp->hw.iomfb_method_profile = DCP_IOMFB_METHODS_DEFAULT;
 	/* The display such a processor finds at boot is its first sink. */
 	if (dcp_sink_metadata(dcp))
 		dcp_desktop_metadata_new_sink(dcp);
