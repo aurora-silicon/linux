@@ -83,7 +83,7 @@ impl Backend {
                 if !sleep {
                     return Err(FALLBACK);
                 }
-                match pool.acquire_render(self.owner, Request::of(packet), deadline_ns, || {
+                match pool.acquire_render(self.owner, self.pairs.into(), Request::of(packet), deadline_ns, || {
                     // Atomics only: the callback runs under the pool mutex.
                     if packet.cancel_requested() || self.closed.load(Ordering::Acquire) {
                         return Err(ECANCELED);
@@ -386,7 +386,7 @@ impl Backend {
             Some(lease) => Some(lease),
             None if known != 0 => self
                 .admission
-                .try_acquire_render(self.owner, Request::of(packet))
+                .try_acquire_render(self.owner, self.pairs.into(), Request::of(packet))
                 .ok()
                 .flatten(),
             None => None,
@@ -545,7 +545,7 @@ impl Backend {
         if self.backlog.load(Ordering::Acquire) != 0 || packet.has_dependencies() {
             return false;
         }
-        let admission = match self.admission.try_acquire_render(self.owner, Request::of(packet)) {
+        let admission = match self.admission.try_acquire_render(self.owner, self.pairs.into(), Request::of(packet)) {
             Ok(Some(lease)) => lease,
             _ => return false,
         };
