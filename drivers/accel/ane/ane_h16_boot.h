@@ -2,6 +2,8 @@
 #ifndef __ANE_H16_BOOT_H__
 #define __ANE_H16_BOOT_H__
 
+#include <linux/slab.h>
+
 #include "ane_fw_transport.h"
 
 enum ane_h16_stage {
@@ -128,6 +130,12 @@ struct ane_h16_boot_ops {
 	void (*mailbox)(void *ctx);
 	void (*log)(void *ctx, const char *item, u64 a, u64 b);
 	void (*quarantine)(void *ctx, int error);
+	/*
+	 * Optional. After a startup timeout: power the engine off and on again,
+	 * verify that every domain went off, and restore the preload so the CPU
+	 * can be released from the same entry. 0 only for a verified reset.
+	 */
+	int (*restart)(void *ctx);
 };
 
 /*
@@ -159,6 +167,9 @@ struct ane_h16_boot {
 	bool failed;
 	bool ran;
 	bool quarantined;
+	/* Startup timeouts answered with a verified restart, and the budget. */
+	unsigned int restarts;
+	unsigned int max_restarts;
 };
 
 static inline int ane_h16_stage_parse(const char *name)
@@ -662,6 +673,31 @@ static inline int ane_h16_startup(struct ane_h16_boot *b)
 }
 
 /*
+ * A startup that timed out left the firmware stopped part way, with requests
+ * of its own outstanding. Its rings cannot be resumed, so the engine is
+ * power cycled (the backend verifies the reset) and booted again from the
+ * preload, as after a cold system sleep: the pool, IPC and heap are reused
+ * and cleared, and the shared allocations are carried over, retired, so the
+ * new firmware's requests of the same tag and size get the same memory.
+ */
+static inline int ane_h16_restart(struct ane_h16_boot *b)
+{
+	struct ane_fw_transport *old;
+	int ret = b->ops->restart(b->ctx);
+
+	if (ret)
+		return ret;
+	old = kmemdup(&b->transport, sizeof(*old), GFP_KERNEL);
+	if (!old)
+		return -ENOMEM;
+	ret = ane_h16_scratch_boot(b);
+	if (!ret)
+		ane_fw_transport_carry_shared(&b->transport, old);
+	kfree(old);
+	return ret;
+}
+
+/*
  * Advance from the last completed stage to @stage. The program stage belongs
  * to the caller; here it runs startup. A stage at or below the completed one,
  * or any call after a failure, is refused.
@@ -702,6 +738,15 @@ static inline int ane_h16_run(struct ane_h16_boot *b, enum ane_h16_stage stage)
 	}
 	if (!ret && stage >= ANE_H16_STARTUP && b->stage < ANE_H16_STARTUP) {
 		ret = ane_h16_startup(b);
+		while (ret == -ETIMEDOUT && b->ops->restart &&
+		       b->restarts < b->max_restarts) {
+			b->restarts++;
+			b->ops->log(b->ctx, "startup restart/budget", b->restarts,
+				    b->max_restarts);
+			ret = ane_h16_restart(b);
+			if (!ret)
+				ret = ane_h16_startup(b);
+		}
 		if (!ret)
 			b->stage = ANE_H16_STARTUP;
 	}

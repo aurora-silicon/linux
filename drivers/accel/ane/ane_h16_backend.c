@@ -155,9 +155,14 @@ static void ane_h16_log(void *ctx, const char *item, u64 a, u64 b)
 	dev_info(h->dev, "H16 %s %llx %llx\n", item, a, b);
 }
 
+static void ane_h16_startup_fwlog(struct ane_h16_device *h);
+
 static void ane_h16_quarantine(void *ctx, int error)
 {
 	struct ane_h16_device *h = ctx;
+
+	if (error == -ETIMEDOUT && h->boot.stage == ANE_H16_BOOT)
+		ane_h16_startup_fwlog(h);
 
 	dev_err(h->dev, "H16 quarantine error %d; mappings, power and module held until reboot\n",
 		error);
@@ -380,24 +385,33 @@ static void ane_h16_genpd_record(struct ane_h16_device *h)
 }
 
 /*
- * The cold fallback after a failed warm boot: the engine is powered off
- * again, then booted from the preload as at bring-up (pristine DATA, heap
- * tail, pool, IPC and heap cleared and reused, RTKit restarted, 0x29 at
- * startup), the shared allocations carried over, and every open program
- * replayed behind its handle.
+ * Power the engine off (if on) and on again, then restore what a release of
+ * the CPU from the preload needs: DAPF records, RVBAR, the verified DATA, a
+ * cleared heap tail and fresh RTKit state. With @verify, the cpu, mpm, td and
+ * base domains must each have reported an OFF transition, so the CPU and the
+ * engine were reset. The first domain, sys, is their parent and stays on at
+ * runtime while another consumer holds it; it goes off only in system sleep.
  */
-static int ane_h16_cold_boot(struct ane_h16_device *h)
+static int ane_h16_power_cycle(struct ane_h16_device *h, bool verify)
 {
 	struct ane_h16_boot *b = &h->boot;
-	struct ane_fw_transport *old;
 	size_t size = b->soc->preload_size[1];
+	unsigned int offs[ARRAY_SIZE(h->genpd)], i;
 	void *live;
 	int ret;
 
 	if (!h->pristine_data)
 		return -ENODATA;
+	for (i = 0; i < h->powered; i++)
+		offs[i] = h->genpd[i].offs;
 	if (h->engine_on)
 		ane_h16_power_down(h);
+	for (i = 1; verify && i < h->powered; i++) {
+		if (!h->genpd[i].added || h->genpd[i].offs == offs[i]) {
+			dev_err(h->dev, "H16 ANE: domain %u did not power off; no restart\n", i);
+			return -EIO;
+		}
+	}
 	ret = ane_h16_power_up(h);
 	if (!ret)
 		ret = ane_h16_dapf(b, true);
@@ -418,6 +432,25 @@ static int ane_h16_cold_boot(struct ane_h16_device *h)
 	h->tx_read = 0;
 	h->tx_write = 0;
 	h->mode_stopped = false;
+	return 0;
+}
+
+/*
+ * The cold fallback after a failed warm boot: the engine is powered off
+ * again, then booted from the preload as at bring-up (pristine DATA, heap
+ * tail, pool, IPC and heap cleared and reused, RTKit restarted, 0x29 at
+ * startup), the shared allocations carried over, and every open program
+ * replayed behind its handle.
+ */
+static int ane_h16_cold_boot(struct ane_h16_device *h)
+{
+	struct ane_h16_boot *b = &h->boot;
+	struct ane_fw_transport *old;
+	int ret;
+
+	ret = ane_h16_power_cycle(h, false);
+	if (ret)
+		return ret;
 	old = kmemdup(&b->transport, sizeof(*old), GFP_KERNEL);
 	if (!old)
 		return -ENOMEM;
@@ -946,6 +979,56 @@ static void ane_h16_shared_note(void *ctx, const char *event, u64 dva, u64 size,
 		 event, size, tag, dva);
 }
 
+/*
+ * The firmware's own text log (its first SHAREDMALLOC) after a startup that
+ * stopped: where the firmware got to. Read only.
+ */
+static void ane_h16_startup_fwlog(struct ane_h16_device *h)
+{
+	struct ane_fw_transport *t = &h->boot.transport;
+	const struct ane_fw_surface *log = ane_fw_transport_shared_tagged(t, ANE_FW_SHARED_LOG);
+	char line[ANE_H16_FWLOG_RECORD];
+	unsigned int i, lines = 0;
+
+	if (!log || !log->cpu)
+		return;
+	t->ops->read_barrier(t->ctx);
+	for (i = 0; i < log->size / ANE_H16_FWLOG_RECORD; i++) {
+		const u8 *r = (const u8 *)log->cpu + i * ANE_H16_FWLOG_RECORD;
+
+		if (!ane_h16_fwlog_line(r, line))
+			continue;
+		dev_info(h->dev, "H16 startup fwlog[%03x] %s\n", i, line);
+		lines++;
+	}
+	dev_info(h->dev, "H16 startup fwlog records %u\n", lines);
+}
+
+/*
+ * Power cycles allowed after a startup timeout at bring-up. On the J616s the
+ * firmware stops part way through startup on about one boot in ten: it posts
+ * no further request and never answers the pending command.
+ */
+#define ANE_H16_STARTUP_RESTARTS 2
+
+/*
+ * A startup that timed out at bring-up: keep the log, then a verified power
+ * cycle. Every mapping stays; nothing is released while the engine may hold it.
+ */
+static int ane_h16_restart_engine(void *ctx)
+{
+	struct ane_h16_device *h = ctx;
+	int ret;
+
+	ane_h16_startup_fwlog(h);
+	ret = ane_h16_power_cycle(h, true);
+	if (ret)
+		dev_err(h->dev, "H16 ANE: startup timed out; power cycle failed, error %d\n", ret);
+	else
+		dev_warn(h->dev, "H16 ANE: startup timed out; engine power cycled, booting again\n");
+	return ret;
+}
+
 static const struct ane_h16_boot_ops ane_h16_ops = {
 	.read32 = ane_h16_mmio_read32,
 	.read64 = ane_h16_mmio_read64,
@@ -958,6 +1041,7 @@ static const struct ane_h16_boot_ops ane_h16_ops = {
 	.mailbox = ane_h16_mailbox,
 	.log = ane_h16_log,
 	.quarantine = ane_h16_quarantine,
+	.restart = ane_h16_restart_engine,
 };
 
 static void ane_h16_busy(void *ctx, bool busy);
@@ -1287,6 +1371,7 @@ static int ane_h16_preload_identity(struct ane_h16_device *h)
 	if (b->soc->sleep_warm || b->soc->sleep_cold) {
 		h->pristine_data = snap[1];
 		snap[1] = NULL;
+		b->max_restarts = ANE_H16_STARTUP_RESTARTS;
 	}
 	h->shared_next = b->build->shared_dva;
 	h->program_next = b->build->shared_dva + ANE_FW_SHARED_TOTAL;
