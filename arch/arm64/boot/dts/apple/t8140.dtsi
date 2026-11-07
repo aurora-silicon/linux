@@ -430,8 +430,7 @@
 		ranges;
 
 		uat_handoff: uat-handoff {
-			size = <0 0>; /* The loader supplies reg and enables the region. */
-			status = "disabled";
+			reg = <0 0 0 0>;
 		};
 
 		/*
@@ -459,98 +458,18 @@
 
 		/* Only reserved: the GPU node does not reference it */
 		uat_l2_pagetables: uat-l2-pagetables {
-			size = <0 0>; /* The loader supplies reg and enables the region. */
-			status = "disabled";
+			reg = <0 0 0 0>;
 		};
 
 		uat_pagetables: uat-pagetables {
-			size = <0 0>; /* The loader supplies reg and enables the region. */
-			status = "disabled";
+			reg = <0 0 0 0>;
 		};
 
 		uat_ttbs: uat-ttbs {
-			size = <0 0>; /* The loader supplies reg and enables the region. */
-			status = "disabled";
+			reg = <0 0 0 0>;
 		};
 	};
 
-	error-handler@220000000 {
-		compatible = "apple,t8140-error-handler", "apple,soc-error-handler";
-		/* ADT /arm-io/error-handler banks; firmware/AP access is unqualified. */
-		reg = <0x2 0x20000000 0x0 0x2f000000>,
-		      <0x2 0x80d00000 0x0 0x40000>,
-		      <0x2 0x80900000 0x0 0x8000>,
-		      <0x3 0x00000000 0x0 0x70000>,
-		      <0x3 0x00728000 0x0 0x4000>,
-		      <0x3 0x082dc000 0x0 0x18000>,
-		      <0x3 0x003d0000 0x0 0x4000>,
-		      <0x3 0x00768000 0x0 0x4000>,
-		      <0x3 0x02000000 0x0 0x1000000>,
-		      <0x2 0x4f000000 0x0 0x4000>,
-		      <0x2 0x50000000 0x0 0x4000>,
-		      <0x2 0x51000000 0x0 0x4000>,
-		      <0x2 0x52000000 0x0 0x4000>,
-		      <0x2 0x5f000000 0x0 0x4000>,
-		      <0x2 0x6f000000 0x0 0x4000>,
-		      <0x2 0x5300a000 0x0 0x9a4>,
-		      <0x2 0x54000000 0x0 0x20000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 282 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 284 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 286 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 288 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 892 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 352 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 361 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 351 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 358 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 354 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 355 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 356 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 359 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 357 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 290 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 293 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 296 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 299 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 177 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 178 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 179 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 180 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 185 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 184 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 181 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 182 IRQ_TYPE_LEVEL_HIGH>;
-		/* Not yet qualified on the J700. */
-		status = "disabled";
-	};
-
-	event-log-handler@300700000 {
-		compatible = "apple,t8140-event-log", "apple,soc-event-log";
-		/* ADT /arm-io/event-log-handler banks; firmware/AP access is unqualified. */
-		reg = <0x3 0x00700000 0x0 0xcc000>,
-		      <0x3 0x08280000 0x0 0x80000>,
-		      <0x3 0x00000000 0x0 0x70000>,
-		      <0x3 0x08200000 0x0 0x7c000>,
-		      <0x3 0x0028c000 0x0 0x4000>,
-		      <0x3 0x00280000 0x0 0x8000>,
-		      <0x4 0x01878000 0x0 0x4000>,
-		      <0x4 0x01868000 0x0 0x8000>,
-		      <0x3 0x02800000 0x0 0xbc000>,
-		      <0x3 0x02900000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 232 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 233 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 261 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 278 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 37 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 38 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 652 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 644 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 879 IRQ_TYPE_LEVEL_HIGH>;
-		/* Not yet qualified on the J700. */
-		status = "disabled";
-	};
 
 	soc: soc {
 		compatible = "simple-bus";
@@ -1377,11 +1296,11 @@
 			status = "disabled";
 		};
 
-		gpu: gpu@480000000 {
+		gpu: gpu@482600000 {
 			compatible = "apple,agx-t8140";
-			reg = <0x4 0x80000000 0x0 0x4000000>,
-			      <0x4 0x82600000 0x0 0x88000>;
-			reg-names = "sgx", "asc";
+			reg = <0x4 0x82600000 0x0 0x88000>,
+			      <0x4 0x80000000 0x0 0x4000000>;
+			reg-names = "asc", "sgx";
 			mboxes = <&gfx_mbox>, <&gfx1_mbox>;
 			power-domains = <&ps_gfx>;
 			memory-region = <&uat_ttbs>, <&uat_pagetables>,

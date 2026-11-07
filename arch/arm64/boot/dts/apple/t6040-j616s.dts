@@ -105,10 +105,6 @@
 	status = "okay";
 };
 
-&debug_port2 {
-	swclk-gpios = <&pinctrl 42 GPIO_ACTIVE_HIGH>;
-	swdio-gpios = <&pinctrl 43 GPIO_ACTIVE_HIGH>;
-};
 
 &i2c4 {
 	sd_card_control: card-control@20 {

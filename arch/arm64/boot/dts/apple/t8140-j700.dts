@@ -2029,8 +2029,3 @@
 &ane_dart2 {
 	status = "okay";
 };
-
-&debug_port4 {
-	swclk-gpios = <&pinctrl_ap 86 GPIO_ACTIVE_HIGH>;
-	swdio-gpios = <&pinctrl_ap 85 GPIO_ACTIVE_HIGH>;
-};

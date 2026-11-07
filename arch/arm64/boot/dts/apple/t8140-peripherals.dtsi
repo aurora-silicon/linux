@@ -5,7 +5,83 @@
  * ownership from firmware or make their registers safe to access.
  */
 
-/ {
+&soc {
+	error-handler@220000000 {
+		compatible = "apple,t8140-error-handler", "apple,soc-error-handler";
+		/* ADT /arm-io/error-handler banks; firmware/AP access is unqualified. */
+		reg = <0x2 0x20000000 0x0 0x2f000000>,
+		      <0x2 0x80d00000 0x0 0x40000>,
+		      <0x2 0x80900000 0x0 0x8000>,
+		      <0x3 0x00000000 0x0 0x70000>,
+		      <0x3 0x00728000 0x0 0x4000>,
+		      <0x3 0x082dc000 0x0 0x18000>,
+		      <0x3 0x003d0000 0x0 0x4000>,
+		      <0x3 0x00768000 0x0 0x4000>,
+		      <0x3 0x02000000 0x0 0x1000000>,
+		      <0x2 0x4f000000 0x0 0x4000>,
+		      <0x2 0x50000000 0x0 0x4000>,
+		      <0x2 0x51000000 0x0 0x4000>,
+		      <0x2 0x52000000 0x0 0x4000>,
+		      <0x2 0x5f000000 0x0 0x4000>,
+		      <0x2 0x6f000000 0x0 0x4000>,
+		      <0x2 0x5300a000 0x0 0x9a4>,
+		      <0x2 0x54000000 0x0 0x20000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 282 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 284 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 286 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 288 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 892 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 352 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 361 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 351 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 358 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 354 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 355 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 356 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 359 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 357 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 290 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 293 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 296 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 299 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 177 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 178 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 179 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 180 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 185 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 184 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 181 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 182 IRQ_TYPE_LEVEL_HIGH>;
+		/* Not yet qualified on the J700. */
+		status = "disabled";
+	};
+	event-log-handler@300700000 {
+		compatible = "apple,t8140-event-log", "apple,soc-event-log";
+		/* ADT /arm-io/event-log-handler banks; firmware/AP access is unqualified. */
+		reg = <0x3 0x00700000 0x0 0xcc000>,
+		      <0x3 0x08280000 0x0 0x80000>,
+		      <0x3 0x00000000 0x0 0x70000>,
+		      <0x3 0x08200000 0x0 0x7c000>,
+		      <0x3 0x0028c000 0x0 0x4000>,
+		      <0x3 0x00280000 0x0 0x8000>,
+		      <0x4 0x01878000 0x0 0x4000>,
+		      <0x4 0x01868000 0x0 0x8000>,
+		      <0x3 0x02800000 0x0 0xbc000>,
+		      <0x3 0x02900000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 232 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 233 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 261 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 278 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 37 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 38 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 652 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 644 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 879 IRQ_TYPE_LEVEL_HIGH>;
+		/* Not yet qualified on the J700. */
+		status = "disabled";
+	};
 
 	/* ADT /arm-io/dwi. */
 	dwi: dwi@300200000 {
@@ -154,48 +230,6 @@
 		status = "disabled";
 	};
 
-	/* ADT /arm-io/dcp0-expert. */
-	/* ADT /arm-io/dcp-exclave-ioreporting. */
-	dcp_ioreporting: dcp-ioreporting {
-		compatible = "apple,t8140-dcp-ioreporting", "apple,dcp-ioreporting";
-		status = "disabled";
-	};
-
-	/* ADT /arm-io/dcp0-expert. */
-	dcp_expert: display-expert@3082b8044 {
-		compatible = "apple,t8140-dcp-expert", "apple,dcp-expert";
-		reg = <0x3 0x082b8044 0x0 0xc>,
-		      <0x3 0x08008000 0x0 0x4>,
-		      <0x4 0x123ac050 0x0 0x4>,
-		      <0x4 0x12370000 0x0 0x40>,
-		      <0x4 0x12384000 0x0 0x40>,
-		      <0x4 0x12378000 0x0 0x40>,
-		      <0x4 0x1237c000 0x0 0x40>,
-		      <0x4 0x12380000 0x0 0x40>,
-		      <0x4 0x12374000 0x0 0x40>,
-		      <0x4 0x123b8000 0x0 0x40>,
-		      <0x4 0x1239c000 0x0 0x40>,
-		      <0x4 0x123a0000 0x0 0x40>,
-		      <0x4 0x12388000 0x0 0x40>,
-		      <0x4 0x1238c000 0x0 0x40>,
-		      <0x4 0x12394000 0x0 0x40>,
-		      <0x4 0x12398000 0x0 0x40>,
-		      <0x4 0x12390000 0x0 0x40>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 693 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
-	};
-
-	/* ADT /arm-io/dcpext-expert. */
-	dcpext_expert: display-expert@4163ac050 {
-		compatible = "apple,t8140-dcp-expert", "apple,dcp-expert";
-		reg = <0x4 0x163ac050 0x0 0x4>,
-		      <0x4 0x16370000 0x0 0x40>,
-		      <0x4 0x16374000 0x0 0x40>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 765 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
-	};
 
 	/* ADT /arm-io/dcp-exclave-mailbox. */
 	dcp_secure_mbox: mailbox@452e7c000 {
@@ -292,9 +326,6 @@
 		apple,pmgr = <&pmgr>;
 		status = "disabled";
 	};
-};
-
-/ {
 
 	/* ADT /arm-io/aop-gpio; coprocessor/firmware ownership unqualified. */
 	pinctrl_aop: pinctrl@310824000 {
@@ -479,97 +510,6 @@
 		power-domains = <&ps_sio_cpu>;
 		status = "disabled";
 	};
-};
-
-/ {
-
-	/* ADT /arm-io/mtp-aop-mux; no qualified host transport/ownership contract. */
-	hid_mux: hid-transport-mux {
-		compatible = "apple,t8140-hid-transport-mux", "apple,hid-transport-mux";
-		status = "disabled";
-	};
-
-	/* ADT /arm-io/apple-processor-trace; no qualified host transport/ownership contract. */
-	processor_trace: processor-trace {
-		compatible = "apple,t8140-processor-trace", "apple,processor-trace";
-		status = "disabled";
-	};
-
-	/* ADT /arm-io/aod2; no qualified host transport/ownership contract. */
-	debug_port2: debug-port-2 {
-		compatible = "apple,t8140-debug-port", "apple,debug-port";
-		status = "disabled";
-	};
-
-	/* ADT /arm-io/aod3; no qualified host transport/ownership contract. */
-	debug_port3: debug-port-3 {
-		compatible = "apple,t8140-debug-port", "apple,debug-port";
-		status = "disabled";
-	};
-
-	/* ADT /arm-io/aod4; no qualified host transport/ownership contract. */
-	debug_port4: debug-port-4 {
-		compatible = "apple,t8140-debug-port", "apple,debug-port";
-		status = "disabled";
-	};
-
-	/* ADT /sacm; no qualified host transport/ownership contract. */
-	sac_manager: sac-manager {
-		compatible = "apple,t8140-sac-manager", "apple,sac-manager";
-		status = "disabled";
-	};
-
-	/* ADT /arm-io/dcp-sac-controller; no qualified host transport/ownership contract. */
-	sac_controller: sac-controller {
-		compatible = "apple,t8140-sac-controller", "apple,sac-controller";
-		apple,manager = <&sac_manager>;
-		status = "disabled";
-	};
-
-	/* ADT /arm-io/nco; no qualified host transport/ownership contract. */
-	nco_service: nco-service {
-		compatible = "apple,t8140-nco-service", "apple,nco-service";
-		apple,clock-controller = <&peripheral_clocks>;
-		apple,clock-selectors = <377 378 375 376>;
-		status = "disabled";
-	};
-
-	/* ADT /arm-io/exdisplaypipe; no qualified host transport/ownership contract. */
-	secure_display_pipe: secure-display-pipe {
-		compatible = "apple,t8140-secure-display-pipe", "apple,secure-display-pipe";
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 739 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 740 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 741 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 691 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&disp0_dart 3>, <&disp0_dart 4>;
-		status = "disabled";
-	};
-
-	/* ADT /arm-io/isp-exclave-proxy; no qualified host transport/ownership contract. */
-	isp_service_proxy: isp-service-proxy {
-		compatible = "apple,t8140-isp-service-proxy", "apple,isp-service-proxy";
-		status = "disabled";
-	};
-
-	/* ADT /arm-io/audio-hp-mic-proxy; no qualified host transport/ownership contract. */
-	audio_mic_proxy: audio-mic-proxy {
-		compatible = "apple,t8140-audio-mic-proxy", "apple,audio-mic-proxy";
-		status = "disabled";
-	};
-
-	/* ADT /arm-io/audio-shared-dart-proxy; no qualified host transport/ownership contract. */
-	audio_dart_proxy: audio-dart-proxy {
-		compatible = "apple,t8140-audio-dart-proxy", "apple,audio-dart-proxy";
-		iommus = <&aop_dart 9>, <&aop_dart 11>;
-		status = "disabled";
-	};
-
-	/* ADT /dock-debug-wireless; no qualified host transport/ownership contract. */
-	wireless_debug_dock: wireless-debug-dock {
-		compatible = "apple,t8140-wireless-debug-dock", "apple,wireless-debug-dock";
-		status = "disabled";
-	};
 
 	/* ADT /dock-connect; no qualified host transport/ownership contract. */
 	debug_dock: debug-dock@3082d8008 {
@@ -580,9 +520,7 @@
 			     <AIC_IRQ 304 IRQ_TYPE_LEVEL_HIGH>;
 		status = "disabled";
 	};
-};
 
-/ {
 	/* ADT /arm-io/eic named MMIO apertures are absolute addresses. */
 	eic: secure-controller@340700000 {
 		compatible = "apple,t8140-eic", "apple,eic";
@@ -593,6 +531,13 @@
 		      <0x3 0x482a8000 0x0 0x4000>,
 		      <0x3 0x482b0000 0x0 0x4000>;
 		reg-names = "ps", "wd-isp", "gpio", "fpwm", "gltb", "wd-e";
+		status = "disabled";
+	};
+
+	xspmi_controller: spmi-proxy-controller@348614000 {
+		compatible = "apple,t8140-xspmi-controller", "apple,xspmi-controller";
+		reg = <0x3 0x48614000 0x0 0x4000>;
+		apple,response-vector = <256>;
 		status = "disabled";
 	};
 };
@@ -624,101 +569,6 @@
 	spmi_all_ace: controller@e {
 		compatible = "apple,t8140-spmi-all-ace", "apple,spmi-all-ace";
 		reg = <0xe SPMI_USID>;
-		status = "disabled";
-	};
-};
-
-/ {
-	xspmi_controller: spmi-proxy-controller@348614000 {
-		compatible = "apple,t8140-xspmi-controller", "apple,xspmi-controller";
-		reg = <0x3 0x48614000 0x0 0x4000>;
-		apple,response-vector = <256>;
-		status = "disabled";
-	};
-
-	smc_mogul: smc-mogul {
-		compatible = "apple,t8140-smc-mogul", "apple,smc-mogul";
-		apple,smc = <&smc>;
-		apple,control-address = <0x10>;
-		status = "disabled";
-	};
-};
-
-/* Register-less DP audio interfaces: ADT DMA channels and PMGR gates. */
-/ {
-
-	dpaudio0: audio-controller-0 {
-		compatible = "apple,t8140-dpaudio", "apple,dpaudio";
-		dmas = <&sio 0x64>;
-		dma-names = "tx";
-		power-domains = <&ps_dpa0>;
-		/* No qualified firmware audio route is assigned at boot. */
-		status = "disabled";
-	};
-
-	dpaudio1: audio-controller-1 {
-		compatible = "apple,t8140-dpaudio", "apple,dpaudio";
-		dmas = <&sio 0x66>;
-		dma-names = "tx";
-		power-domains = <&ps_dpa1>;
-		/* No qualified firmware audio route is assigned at boot. */
-		status = "disabled";
-	};
-};
-
-/* Firmware audio endpoints with no qualified independent host client. */
-/ {
-
-	/* ADT /arm-io/iop-voicetrigger-controller/audio-vt-device. */
-	audio_voice_trigger: audio-voice-trigger {
-		compatible = "apple,t8140-audio-voice-trigger", "apple,audio-voice-trigger";
-		status = "disabled";
-	};
-
-	/* ADT /arm-io/iop-audio-controller/audio-mca-loopback. */
-	audio_mca_loopback: audio-mca-loopback {
-		compatible = "apple,t8140-audio-mca-loopback", "apple,audio-mca-loopback";
-		dmas = <&admac_base_ns 6>, <&admac_base_ns 7>;
-		status = "disabled";
-	};
-
-	/* ADT /arm-io/iop-audio-controller/audio-leap-internal-loopback. */
-	audio_leap_loopback: audio-leap-loopback {
-		compatible = "apple,t8140-audio-leap-loopback", "apple,audio-leap-loopback";
-		dmas = <&admac_leap_ns 8>, <&admac_leap_ns 9>;
-		status = "disabled";
-	};
-
-	/* ADT /arm-io/iop-audio-controller/lp-mic-device. */
-	audio_low_power_mic: audio-low-power-mic {
-		compatible = "apple,t8140-audio-low-power-mic", "apple,audio-low-power-mic";
-		status = "disabled";
-	};
-
-	/* ADT /arm-io/iop-audio-controller/lp-mic-io-buffer-device. */
-	audio_mic_buffer: audio-mic-buffer {
-		compatible = "apple,t8140-audio-mic-buffer", "apple,audio-mic-buffer";
-		iommus = <&aop_dart 9>;
-		status = "disabled";
-	};
-
-	/* ADT /arm-io/iop-audio-controller/siri-listening-device. */
-	audio_listening_client: audio-listening-client {
-		compatible = "apple,t8140-audio-listening-client", "apple,audio-listening-client";
-		status = "disabled";
-	};
-
-	/* ADT /arm-io/iop-audio-controller/audio-speaker-tap. */
-	audio_speaker_tap: audio-speaker-tap {
-		compatible = "apple,t8140-audio-speaker-tap", "apple,audio-speaker-tap";
-		dmas = <&admac_base_ns 3>;
-		status = "disabled";
-	};
-
-	/* ADT /arm-io/iop-audio-controller/lp-mic-injection-device. */
-	audio_mic_injection: audio-mic-injection {
-		compatible = "apple,t8140-audio-mic-injection", "apple,audio-mic-injection";
-		dmas = <&admac_base_ns 10>;
 		status = "disabled";
 	};
 };

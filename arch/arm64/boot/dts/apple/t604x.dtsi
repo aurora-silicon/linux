@@ -915,6 +915,9 @@
 		iommus = <&dcp_dart 23>;
 		apple,bw-scratch = <&pmgr_dcp 0 4 0x20000>;
 		apple,iomfb-surfaces = <1 1 0 0>;
+		/* the boot loader describes the piodma's regions with 2+2 cells */
+		#address-cells = <2>;
+		#size-cells = <2>;
 		/* enabled once the boot loader has handed the display over */
 		status = "disabled";
 
