@@ -257,7 +257,6 @@ allOf:
       required:
         - reg
 
-
 additionalProperties: false
 
 examples:
