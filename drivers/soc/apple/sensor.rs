@@ -145,6 +145,12 @@ pub(crate) const STATUS_LEN: usize = 16;
 static_assert!(STATUS_AT + STATUS_LEN == STATUS_XFER_LEN);
 
 // Offsets index the 16-byte status, not the 23-byte transfer.
+// Status flags, status[11]. In the macOS trace of the J700 sensor it reads 0x0c
+// while armed or idle with no finger, 0x0e once a finger is on and 0x8e with a
+// frame ready: bit 1 is the finger detector, bit 7 a frame.
+const STATUS_FLAGS: usize = 11;
+const FLAG_FINGER: u8 = 0x02;
+static_assert!(STATUS_FLAGS < STATUS_LEN);
 const STATUS_STATE: usize = STATUS_AT + 7;
 const STATUS_COUNT: usize = STATUS_AT + 12;
 
@@ -748,6 +754,11 @@ impl Status {
 
     pub(crate) fn patch_ack(&self) -> u8 {
         self.raw[STATUS_PATCH_ACK]
+    }
+
+    /// The sensor's finger detector sees a finger.
+    pub(crate) fn finger_present(&self) -> bool {
+        self.raw[STATUS_FLAGS] & FLAG_FINGER != 0
     }
 
     pub(crate) fn is_silent(&self) -> bool {
