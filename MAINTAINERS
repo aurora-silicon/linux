@@ -2778,7 +2778,8 @@ F:	drivers/iommu/apple-dart.c
 F:	drivers/iommu/io-pgtable-dart.c
 F:	drivers/irqchip/irq-apple-aic.c
 F:	drivers/mfd/macsmc*.c
-F:	drivers/nfc/apple-stockholm.c
+F:	drivers/nfc/.kunitconfig
+F:	drivers/nfc/apple-stockholm*.c
 F:	drivers/nvme/host/apple.c
 F:	drivers/nvmem/apple-efuses.c
 F:	drivers/nvmem/apple-spmi-nvmem.c
