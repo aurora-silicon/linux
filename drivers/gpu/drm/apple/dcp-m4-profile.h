@@ -50,10 +50,13 @@ static const struct dcp_m4_profile dcp_m4_profile_j713 = {
 	.timing = dcp_m4_timing_j713,
 };
 
-/*
- * The J715: the same firmware ABI with a 2880x1864 panel. Its timing is
- * not in the ADT and has not been read from a J715 DCP yet.
- */
+/* The J715's panel timing, as macOS reports it (TimingElements, ID 2). */
+static const u32 dcp_m4_timing_j715[2][8] = {
+	{ 2880, 2960, 8, 32, 40, 7710975, 1, 0 },
+	{ 1864, 1961, 47, 8, 42, 3932165, 1, 0 },
+};
+
+/* The J715: the same firmware ABI with a 2880x1864 panel. */
 static const struct dcp_m4_profile dcp_m4_profile_j715 = {
 	.name = "J715", .machine = "apple,j715",
 	.panel_width = 2880, .panel_height = 1864, .boot_stride = 11520,
@@ -64,6 +67,7 @@ static const struct dcp_m4_profile dcp_m4_profile_j715 = {
 	.done_method = 590, .done_size = 0x730, .open_method = 457,
 	.brightness_max = 500, .brightness_default = 120,
 	.width_mm = 0, .height_mm = 0,
+	.timing = dcp_m4_timing_j715,
 };
 
 static const struct dcp_m4_profile *const dcp_m4_profiles[] = {
