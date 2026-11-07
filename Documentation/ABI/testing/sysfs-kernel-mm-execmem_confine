@@ -1,0 +1,19 @@
+What:		/sys/kernel/mm/execmem_confine/
+Date:		November 2026
+Contact:	Linux memory management list <linux-mm@kvack.org>
+Description:
+		Present when executable allocations (module text, BPF, kprobes,
+		ftrace) are confined to a fixed physical window
+		(CONFIG_EXECMEM_CONFINE, for example an arm64 CTXR window).
+		All files are read-only and hold a byte count:
+
+		====================  ==========================================
+		window_bytes          size of the window
+		pool_bytes            part of the window executable allocations
+		                      can use (the rest holds the kernel image
+		                      and memory reserved before the window)
+		free_bytes            part of pool_bytes not in use
+		module_reserve_bytes  part of the pool BPF JIT images can't use,
+		                      so that module text still loads when the
+		                      rest is full
+		====================  ==========================================

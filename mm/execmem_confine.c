@@ -26,10 +26,12 @@
 #include <linux/genalloc.h>
 #include <linux/kasan.h>
 #include <linux/kmemleak.h>
+#include <linux/kobject.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/set_memory.h>
 #include <linux/slab.h>
+#include <linux/sysfs.h>
 #include <linux/vmalloc.h>
 #include <linux/xarray.h>
 
@@ -387,3 +389,59 @@ static int __init execmem_confine_late_init(void)
 	return 0;
 }
 late_initcall(execmem_confine_late_init);
+
+/*
+ * /sys/kernel/mm/execmem_confine/: how much of the window the pool has and
+ * how much of it is free, so that an ENOMEM from a module load or a BPF
+ * program can be told apart from other failures.
+ */
+static ssize_t window_bytes_show(struct kobject *kobj,
+				 struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%llu\n", (unsigned long long)confine_size);
+}
+
+static ssize_t pool_bytes_show(struct kobject *kobj,
+			       struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%zu\n", gen_pool_size(confine_pool));
+}
+
+static ssize_t free_bytes_show(struct kobject *kobj,
+			       struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%zu\n", gen_pool_avail(confine_pool));
+}
+
+static ssize_t module_reserve_bytes_show(struct kobject *kobj,
+					 struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%zu\n", confine_reserve);
+}
+
+static struct kobj_attribute window_bytes_attr = __ATTR_RO(window_bytes);
+static struct kobj_attribute pool_bytes_attr = __ATTR_RO(pool_bytes);
+static struct kobj_attribute free_bytes_attr = __ATTR_RO(free_bytes);
+static struct kobj_attribute module_reserve_bytes_attr = __ATTR_RO(module_reserve_bytes);
+
+static struct attribute *execmem_confine_attrs[] = {
+	&window_bytes_attr.attr,
+	&pool_bytes_attr.attr,
+	&free_bytes_attr.attr,
+	&module_reserve_bytes_attr.attr,
+	NULL,
+};
+
+static const struct attribute_group execmem_confine_group = {
+	.name = "execmem_confine",
+	.attrs = execmem_confine_attrs,
+};
+
+static int __init execmem_confine_sysfs_init(void)
+{
+	if (!confine_ready)
+		return 0;
+
+	return sysfs_create_group(mm_kobj, &execmem_confine_group);
+}
+late_initcall(execmem_confine_sysfs_init);

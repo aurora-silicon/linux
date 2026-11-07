@@ -80,6 +80,13 @@ How it works
 * If the window's pool is exhausted the allocation fails, exactly as a hardware
   CTXR fault would prevent executing from outside the window; there is no buddy
   fallback.
+* BPF JIT images may not take the last quarter of the pool, which stays for
+  module text, and ``bpf_jit_limit`` (the cap on unprivileged JIT memory)
+  defaults to half of the pool instead of half of the vmalloc space. Without
+  both, an unprivileged user filling the pool with socket filters would stop
+  modules from loading.
+* ``/sys/kernel/mm/execmem_confine/`` reports the window, pool, free and
+  reserved byte counts.
 * Code in the window can't execute at EL1 on a confined core. The boot CPU isn't
   confined and enters as it always has, through EL1 and ``finalise_el2``. Once it
   has reserved a window at EL2, it sets a flag that later entries read with the
