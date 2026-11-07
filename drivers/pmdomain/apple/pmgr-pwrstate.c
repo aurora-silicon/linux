@@ -15,6 +15,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/suspend.h>
 #include <linux/regmap.h>
 #include <linux/mfd/syscon.h>
 #include <linux/reset-controller.h>
@@ -59,6 +60,8 @@ struct apple_pmgr_ps {
 	bool firmware_owned;
 	/* apple,sleep-retained: kept on while the system sleeps */
 	bool sleep_retained;
+	/* apple,sleep-driver-owned: the driver behind it brings it back after a sleep */
+	bool sleep_driver_owned;
 	/* Never enable automatic power management (apple,no-auto-pm). */
 	bool no_auto_pm;
 	bool inherited_on;
@@ -360,6 +363,50 @@ static int apple_pmgr_ps_resume_early(struct device *dev)
 	return 0;
 }
 
+/*
+ * A firmware-driven suspend powers the SoC down and its sleep engine leaves the
+ * domains in states of its own: AUTO_ENABLE cleared, some at clock gating. genpd
+ * only powers a domain back on if it turned it off itself, so its idea of a
+ * domain it left on is now wrong. Put each domain back where genpd thinks it is.
+ *
+ * On T8140 macOS re-raises 22 domains in the first 5 ms after a wake and lowers
+ * 30 others (measured under aura). Which of them Linux needs isn't established,
+ * so this follows genpd's books rather than a list.
+ */
+static int apple_pmgr_ps_resume_noirq(struct device *dev)
+{
+	struct apple_pmgr_ps *ps = dev_get_drvdata(dev);
+	unsigned long flags;
+	u32 reg;
+	int ret;
+
+	if (!pm_resume_via_firmware() || ps->firmware_owned || ps->inherited_on ||
+	    ps->sleep_driver_owned)
+		return 0;
+
+	spin_lock_irqsave(&ps->genpd.slock, flags);
+	ret = regmap_read(ps->regmap, ps->offset, &reg);
+	if (!ret) {
+		if (ps->genpd.status == GENPD_STATE_OFF) {
+			if (FIELD_GET(APPLE_PMGR_PS_TARGET, reg) != APPLE_PMGR_PS_PWRGATE)
+				ret = apple_pmgr_ps_set(&ps->genpd, APPLE_PMGR_PS_PWRGATE,
+							false);
+		} else {
+			bool auto_enable = !ps->no_auto_enable && !ps->no_auto_pm;
+
+			if (FIELD_GET(APPLE_PMGR_PS_TARGET, reg) != APPLE_PMGR_PS_ACTIVE ||
+			    (auto_enable && !(reg & APPLE_PMGR_AUTO_ENABLE)))
+				ret = apple_pmgr_ps_set(&ps->genpd, APPLE_PMGR_PS_ACTIVE,
+							auto_enable);
+		}
+	}
+	spin_unlock_irqrestore(&ps->genpd.slock, flags);
+	if (ret)
+		dev_err(dev, "PS %s: resync after sleep failed: %d\n", ps->genpd.name, ret);
+
+	return 0;
+}
+
 static int apple_pmgr_reset_assert(struct reset_controller_dev *rcdev, unsigned long id)
 {
 	struct apple_pmgr_ps *ps = rcdev_to_apple_pmgr_ps(rcdev);
@@ -588,6 +635,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	 */
 	ps->firmware_owned = of_property_read_bool(node, "apple,firmware-owned");
 	ps->sleep_retained = of_property_read_bool(node, "apple,sleep-retained");
+	ps->sleep_driver_owned = of_property_read_bool(node, "apple,sleep-driver-owned");
 	/*
 	 * Only T8132 hands over inherited-on domains with this contract. Older
 	 * M3 device trees carry the property with another meaning; keep them
@@ -742,6 +790,7 @@ MODULE_DEVICE_TABLE(of, apple_pmgr_ps_of_match);
 
 static const struct dev_pm_ops apple_pmgr_ps_pm_ops = {
 	LATE_SYSTEM_SLEEP_PM_OPS(apple_pmgr_ps_suspend_late, apple_pmgr_ps_resume_early)
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(NULL, apple_pmgr_ps_resume_noirq)
 };
 
 static struct platform_driver apple_pmgr_ps_driver = {
