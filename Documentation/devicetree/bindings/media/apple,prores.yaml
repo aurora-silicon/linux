@@ -21,6 +21,9 @@ properties:
       - items:
           - const: apple,t6041-prores
           - const: apple,prores
+      - items:
+          - const: apple,t6000-prores
+          - const: apple,prores
 
   reg:
     minItems: 2

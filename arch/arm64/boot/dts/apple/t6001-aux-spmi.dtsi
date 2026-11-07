@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Disabled auxiliary SPMI resources; primary polled PMIC access is retained. */
+
+&{/soc} {
+	primary_spmi_monitor: spmi-monitor@2920a0e00 {
+		compatible = "apple,t6000-spmi-monitor", "apple,spmi-monitor";
+		reg = <0x2 0x920a0e00 0x0 0x100>,
+		      <0x2 0x920a0400 0x0 0x78>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 636 IRQ_TYPE_LEVEL_HIGH>;
+		apple,controller = <&nub_spmi0>;
+		status = "disabled";
+	};
+
+	clvr_spmi3: spmi@28e519100 {
+		compatible = "apple,t6000-spmi", "apple,spmi";
+		reg = <0x2 0x8e519100 0x0 0x100>,
+		      <0x2 0x8e518e00 0x0 0x100>,
+		      <0x2 0x8e518400 0x0 0x78>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 346 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+		pmic@f {
+			compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
+			reg = <0xf SPMI_USID>;
+			status = "disabled";
+		};
+	};
+
+	clvr_spmi4: spmi@28e521100 {
+		compatible = "apple,t6000-spmi", "apple,spmi";
+		reg = <0x2 0x8e521100 0x0 0x100>,
+		      <0x2 0x8e520e00 0x0 0x100>,
+		      <0x2 0x8e520400 0x0 0x78>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 348 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+		pmic@f {
+			compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
+			reg = <0xf SPMI_USID>;
+			status = "disabled";
+		};
+	};
+};

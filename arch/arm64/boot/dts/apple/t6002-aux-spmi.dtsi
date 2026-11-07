@@ -1,0 +1,187 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Disabled auxiliary SPMI resources; primary polled PMIC access is retained. */
+
+&die0 {
+	primary_spmi_monitor: spmi-monitor@2920a0e00 {
+		compatible = "apple,t6000-spmi-monitor", "apple,spmi-monitor";
+		reg = <0x2 0x920a0e00 0x0 0x100>,
+		      <0x2 0x920a0400 0x0 0x78>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 636 IRQ_TYPE_LEVEL_HIGH>;
+		apple,controller = <&nub_spmi0>;
+		status = "disabled";
+	};
+
+	clvr_spmi3: spmi@28e519100 {
+		compatible = "apple,t6000-spmi", "apple,spmi";
+		reg = <0x2 0x8e519100 0x0 0x100>,
+		      <0x2 0x8e518e00 0x0 0x100>,
+		      <0x2 0x8e518400 0x0 0x78>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 346 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+		pmic@f {
+			compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
+			reg = <0xf SPMI_USID>;
+			status = "disabled";
+		};
+	};
+
+	clvr_spmi4: spmi@28e521100 {
+		compatible = "apple,t6000-spmi", "apple,spmi";
+		reg = <0x2 0x8e521100 0x0 0x100>,
+		      <0x2 0x8e520e00 0x0 0x100>,
+		      <0x2 0x8e520400 0x0 0x78>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 348 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+		pmic@f {
+			compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
+			reg = <0xf SPMI_USID>;
+			status = "disabled";
+		};
+	};
+};
+
+&die1 {
+	nub_spmi0_die1: spmi@2920a1300 {
+		compatible = "apple,t6000-spmi", "apple,spmi";
+		reg = <0x2 0x920a1300 0x0 0x100>,
+		      <0x2 0x920a0e00 0x0 0x100>,
+		      <0x2 0x920a0400 0x0 0x78>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1 636 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+		pmic@f {
+			compatible = "apple,maverick-pmic", "apple,spmi-nvmem";
+			reg = <0xf SPMI_USID>;
+			status = "disabled";
+		};
+	};
+
+	nub_spmi1_die1: spmi@2920a9300 {
+		compatible = "apple,t6000-spmi", "apple,spmi";
+		reg = <0x2 0x920a9300 0x0 0x100>,
+		      <0x2 0x920a8e00 0x0 0x100>,
+		      <0x2 0x920a8400 0x0 0x78>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1 640 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+		pmic@e {
+			compatible = "apple,maverick-pmic", "apple,spmi-nvmem";
+			reg = <0xe SPMI_USID>;
+			status = "disabled";
+		};
+	};
+
+	clvr_spmi0_die1: spmi@28e501100 {
+		compatible = "apple,t6000-spmi", "apple,spmi";
+		reg = <0x2 0x8e501100 0x0 0x100>,
+		      <0x2 0x8e500e00 0x0 0x100>,
+		      <0x2 0x8e500400 0x0 0x78>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1 340 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+		pmic@f {
+			compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
+			reg = <0xf SPMI_USID>;
+			status = "disabled";
+		};
+	};
+
+	clvr_spmi1_die1: spmi@28e509100 {
+		compatible = "apple,t6000-spmi", "apple,spmi";
+		reg = <0x2 0x8e509100 0x0 0x100>,
+		      <0x2 0x8e508e00 0x0 0x100>,
+		      <0x2 0x8e508400 0x0 0x78>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1 342 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+		pmic@f {
+			compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
+			reg = <0xf SPMI_USID>;
+			status = "disabled";
+		};
+	};
+
+	clvr_spmi2_die1: spmi@28e511100 {
+		compatible = "apple,t6000-spmi", "apple,spmi";
+		reg = <0x2 0x8e511100 0x0 0x100>,
+		      <0x2 0x8e510e00 0x0 0x100>,
+		      <0x2 0x8e510400 0x0 0x78>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1 344 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+		pmic@f {
+			compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
+			reg = <0xf SPMI_USID>;
+			status = "disabled";
+		};
+	};
+
+	clvr_spmi3_die1: spmi@28e519100 {
+		compatible = "apple,t6000-spmi", "apple,spmi";
+		reg = <0x2 0x8e519100 0x0 0x100>,
+		      <0x2 0x8e518e00 0x0 0x100>,
+		      <0x2 0x8e518400 0x0 0x78>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1 346 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+		pmic@f {
+			compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
+			reg = <0xf SPMI_USID>;
+			status = "disabled";
+		};
+	};
+
+	clvr_spmi4_die1: spmi@28e521100 {
+		compatible = "apple,t6000-spmi", "apple,spmi";
+		reg = <0x2 0x8e521100 0x0 0x100>,
+		      <0x2 0x8e520e00 0x0 0x100>,
+		      <0x2 0x8e520400 0x0 0x78>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1 348 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+		pmic@f {
+			compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
+			reg = <0xf SPMI_USID>;
+			status = "disabled";
+		};
+	};
+};

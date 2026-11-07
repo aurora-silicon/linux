@@ -23,6 +23,7 @@ properties:
           - apple,chapel-pmic
           - apple,maverick-pmic
           - apple,sera-pmic
+          - apple,monaco-pmic
           - apple,stowe-pmic
       - const: apple,spmi-nvmem
 

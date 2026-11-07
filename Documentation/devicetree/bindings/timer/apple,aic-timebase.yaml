@@ -18,6 +18,12 @@ properties:
       - items:
           - const: apple,t6041-aic-timebase
           - const: apple,aic-timebase
+      - items:
+          - const: apple,t8103-aic-timebase
+          - const: apple,aic-timebase
+      - items:
+          - const: apple,t6000-aic-timebase
+          - const: apple,aic-timebase
 
   reg:
     maxItems: 1

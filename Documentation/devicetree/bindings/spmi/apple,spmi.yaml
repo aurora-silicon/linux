@@ -39,7 +39,11 @@ properties:
       - const: apple,t8142-spmi
 
   reg:
-    maxItems: 1
+    minItems: 1
+    maxItems: 3
+    description:
+      Primary controller aperture, optionally followed by secondary control
+      and interrupt-status apertures on first-generation Macs.
 
   interrupts:
     maxItems: 1
