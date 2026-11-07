@@ -38,6 +38,16 @@ static const struct apple_pmu_rtc_hw apple_pmu_rtc_baku = {
 	.offset_in_seconds = true,
 };
 
+/*
+ * Stowe (M2) has Baku's register block and Abbey's offset format: the SMC
+ * RTC keeps a signed 33.15 fixed-point offset in the PMU scratchpad.
+ */
+static const struct apple_pmu_rtc_hw apple_pmu_rtc_stowe = {
+	.base = 0xf800,
+	.event = 0xf80c,
+	.event_bit = BIT(0),
+};
+
 static const struct apple_pmu_rtc_hw apple_pmu_rtc_abbey = {
 	.base = 0x2000,
 	.event = 0x2000,
@@ -92,7 +102,7 @@ static int apple_pmu_rtc_offset(struct apple_pmu_rtc *rtc, s64 *ticks)
 			return -ERANGE;
 		*ticks = offset << APPLE_PMU_RTC_HZ_SHIFT;
 	} else {
-		/* Abbey stores a signed 48-bit offset in 1/32768 seconds. */
+		/* Abbey and Stowe store a signed 48-bit offset in 1/32768 seconds. */
 		*ticks = sign_extend64(offset, 47) * 2;
 	}
 	return 0;
@@ -438,6 +448,7 @@ disable_wakeup:
 static const struct of_device_id apple_pmu_rtc_match[] = {
 	{ .compatible = "apple,j700-pmu-rtc", .data = &apple_pmu_rtc_baku },
 	{ .compatible = "apple,t6041-pmu-rtc", .data = &apple_pmu_rtc_abbey },
+	{ .compatible = "apple,t8112-pmu-rtc", .data = &apple_pmu_rtc_stowe },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, apple_pmu_rtc_match);
