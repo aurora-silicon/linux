@@ -172,3 +172,13 @@
 		};
 	};
 };
+
+&{/soc} {
+	pmgr: power-management@380700000 {
+		compatible = "apple,t8142-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+		reg = <0x3 0x80700000 0 0xd0000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		status = "disabled";
+	};
+};

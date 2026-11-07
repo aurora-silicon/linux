@@ -122,6 +122,7 @@
 		reg = <0x3 0x5260000 0x0 0x20000>;
 		interrupts = <AIC_IRQ 1208 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		/* A dedicated scaler-DART gate mapping is not published by this ADT. */
 		status = "disabled";
 	};
 
@@ -404,3 +405,5 @@
 		status = "disabled";
 	};
 };
+
+#include "t8142-scaler-v23.dtsi"
