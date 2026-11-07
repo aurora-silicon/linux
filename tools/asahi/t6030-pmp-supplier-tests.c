@@ -126,6 +126,8 @@ static bool passive_present, passive_lockable, passive_data;
 static const char *machine;
 static const void *pmp_data;
 static struct device *pmp_device;
+/* Set only while the PMP is stopped for a system sleep, which this test never does. */
+static bool pmp_asleep;
 static int pmp_lock, ready_calls, add_calls, add_result;
 static int poll_calls, device_locked, power_calls, power_result, link_calls;
 static int find_calls, lockable, present_device, link_ok;

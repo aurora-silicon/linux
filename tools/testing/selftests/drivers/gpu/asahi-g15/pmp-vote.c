@@ -19,6 +19,8 @@ struct device { void *of_node; };
 static struct device owner;
 static struct device *pmp_device = &owner;
 static const void *pmp_data = &owner;
+/* Set only while the PMP is stopped for a system sleep, which this test never does. */
+static bool pmp_asleep;
 static bool t6030, requested;
 static int ready, check, power_result[2], report_result[3], powers, reports;
 static char calls[16];

@@ -13,6 +13,15 @@
 #define PMP_PTD_RANGE_REQUEST	10
 #define PMP_PTD_RANGE_ACK	11
 
+/*
+ * The request word for a PMP that is starting: requests made through entries,
+ * and every other bit as it was found.
+ */
+static inline u64 apple_pmp_request_word(u64 found, u64 known, u64 shadow)
+{
+	return (found & ~known) | shadow;
+}
+
 /* The PTD request read, request update and acknowledgment apertures. */
 static inline bool apple_pmp_ranges_valid(const u8 *table, size_t len,
 					  u32 request_read, u32 request_write,
