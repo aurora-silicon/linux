@@ -83,6 +83,7 @@ config APPLE_T8140_SLEEP
 	bool "Apple T8140 system sleep at EL2"
 	depends on ARM64 && (ARCH_APPLE || COMPILE_TEST)
 	depends on HOTPLUG_CPU && SUSPEND
+	select APPLE_TUNABLE
 	help
 	  Powers the secondary CPUs off and suspends the system to RAM on an
 	  Apple T8140 whose kernel runs directly at EL2, with no monitor to ask.

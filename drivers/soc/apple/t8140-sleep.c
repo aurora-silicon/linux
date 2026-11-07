@@ -45,6 +45,7 @@
 #include <linux/smp.h>
 #include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/sleep.h>
+#include <linux/soc/apple/tunable.h>
 #include <linux/suspend.h>
 #include <clocksource/arm_arch_timer.h>
 #include <asm/arch_timer.h>
@@ -233,7 +234,62 @@ struct t8140_s2r_mailbox {
 #define ASC_CPU_STATUS		0x48
 
 #define PS_ANS			0x278
+#define PS_APCIE_GP		0x258
 #define PS_APCIE_SYS_GP		0x2a0
+#define PS_APCIE_ST		0x310
+#define PS_APCIE_SYS_ST		0x3a0
+#define PS_APCIE_PHY_SW		0x3c0
+
+/* The part of the PCIe block that ANS shares, whether or not its host is bound. */
+#define APCIE_AXI_EN0		0x104
+#define APCIE_AXI_EN1		0x108
+#define APCIE_CLK_CTRL		0x0
+#define APCIE_CLK_BUSY		BIT(31)
+#define APCIE_CLK_RUN		BIT(5)
+#define APCIE_CLK_OFF		BIT(1)
+#define APCIE_CLK_OFF2		BIT(2)
+#define APCIE_CLK_START		0x4
+#define APCIE_CLK_START_GO	BIT(31)
+#define APCIE_PHY_COMMON	0x4000
+#define APCIE_PHY_CTRL		0x8000
+#define APCIE_PHY_CTRL_CLK0REQ	BIT(0)
+#define APCIE_PHY_CTRL_CLK1REQ	BIT(1)
+#define APCIE_PHY_CTRL_CLK0ACK	BIT(2)
+#define APCIE_PHY_CTRL_CLK1ACK	BIT(3)
+#define APCIE_PHY_CTRL_RESET	BIT(4)
+#define APCIE_PHY_CTRL_UP	BIT(27)
+#define APCIE_PHY_RUN		0x8004
+#define APCIE_PHY_RUN_EN	BIT(0)
+#define APCIE_PHY_RUN_EN2	BIT(4)
+#define APCIE_PHY_READY		0x8008
+#define APCIE_PHY_IP_PLL_CTL	0x90
+#define APCIE_PHY_IP_PLL_HOLD	BIT(16)
+#define APCIE_PORT_INTSTAT	0x100
+#define APCIE_PORT_INTMSK	0x104
+#define APCIE_PORT_INT_LINK	GENMASK(7, 4)
+#define APCIE_PORT_L2		0x88
+#define APCIE_PORT_L2_ENTER	0x11
+#define APCIE_PORT_L2_BUSY	BIT(0)
+#define APCIE_PORT_PERST_GUARD	0x13c
+#define APCIE_PORT_LINKSTS	0x208
+#define APCIE_PORT_LINKSTS_UP	BIT(0)
+#define APCIE_PORT_APPCLK	0x800
+#define APCIE_PORT_APPCLK_EN	BIT(0)
+#define APCIE_PORT_APPCLK_CGDIS	BIT(8)
+#define APCIE_PORT_PERST	0x82c
+#define APCIE_PORT_PHY_LINK	BIT(31)
+#define APCIE_PORT_PHY_EN0	BIT(9)
+#define APCIE_PORT_PHY_EN1	BIT(10)
+#define APCIE_ENGINE_CTRL	0x0
+#define APCIE_ENGINE_IRQ_MASK	0x8
+#define APCIE_ENGINE_STOP	BIT(0)
+#define APCIE_FABRIC_STOP	0x4
+#define APCIE_PORT_STOP_US	5000
+#define APCIE_RC_ZERO		0x04
+#define APCIE_RC_READY_START	0x50
+#define APCIE_RC_READY_CFG	0x54
+#define APCIE_RC_READY_STAT	0x58
+#define APCIE_POLL_US		50000
 
 /* The coprocessors the last mile stops. Each driver idles its own first. */
 #define SLEEP_COPROCS		4
@@ -371,6 +427,28 @@ struct t8140_sleep {
 	unsigned int ps_rewake_timeouts;
 	u64 cntkctl;
 	int cpus_stop_ret;
+	int ans_off_ret;
+	int pcie_ans_on_ret;
+	void __iomem *apcie_axi;
+	void __iomem *apcie_cio3pll;
+	void __iomem *apcie_clkgen;
+	void __iomem *apcie_phy;
+	void __iomem *apcie_rc;
+	bool apcie_port_stopped;
+	/* A real sleep left the radio's port down, and nothing sets it up again */
+	bool apcie_port_down;
+	void __iomem *apcie_port;
+	void __iomem *apcie_port_phy;
+	void __iomem *apcie_engine;
+	void __iomem *apcie_fabric;
+	struct apple_tunable *apcie_axi_tunable;
+	struct apple_tunable *apcie_cio3pll_tunable;
+	struct apple_tunable *apcie_clkgen_tunable;
+	struct apple_tunable *apcie_phy_tunable;
+	void __iomem *apcie_phy_ip;
+	struct apple_tunable *apcie_phy_ip_pll;
+	struct apple_tunable *apcie_phy_ip_lanes;
+	bool pcie_ans_stopped;
 	/* The words t8140_sleep_lower_stray() lowered, one bit each */
 	u8 stray_lowered;
 	/* What must be bound for a sleep, and what must have stopped by the last step */
@@ -678,11 +756,14 @@ static void t8140_sleep_coprocs_stop(struct t8140_sleep *s, bool first)
 {
 	int i;
 
+	if (first)
+		s->pcie_ans_stopped = false;
 	for (i = 0; i < SLEEP_COPROCS; i++) {
 		struct t8140_sleep_coproc *c = &t8140_sleep_coprocs[i];
 
 		if (!c->dev || !c->ready || c->first != first)
 			continue;
+		s->pcie_ans_stopped |= c->pcie_ans;
 		if (c->stopped)
 			continue;
 		if (c->last_stop)
@@ -1241,9 +1322,15 @@ static int t8140_sleep_refuse(struct t8140_sleep *s)
 		refused = true;
 	}
 
-	/* ANS lowers its PCIe block with it, which this can't bring back yet. */
-	if (idled || t8140_ps_on(s, PS_ANS) || t8140_ps_on(s, PS_APCIE_SYS_GP)) {
-		dev_err(s->dev, "refused: ANS or its PCIe block is on\n");
+	/* ANS's link needs these after a real power loss. */
+	if (idled && !s->apcie_phy_tunable) {
+		dev_err(s->dev, "refused: no tunables to bring ANS's PCIe block back\n");
+		refused = true;
+	}
+
+	/* Only ANS's driver can stop it, and it doesn't come back without a real sleep. */
+	if (!idled && (t8140_ps_on(s, PS_ANS) || t8140_ps_on(s, PS_APCIE_SYS_GP))) {
+		dev_err(s->dev, "refused: ANS or PCIe is on with no driver to stop it\n");
 		refused = true;
 	}
 
@@ -1480,7 +1567,225 @@ bool apple_sleep_debug_link_cut(void)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_debug_link_cut);
 
-/* About 4 ms after the other cores stop on macOS: deepest first. */
+/*
+ * The radio's link and the engine that starts it, in macOS's order, measured on one
+ * sleep: the link into L2, the engine stopped, PERST# asserted, the PHY's clocks off.
+ * macOS does it 40 ms before ANS's idle. Here it follows, so that a refused sleep finds
+ * the link untouched. A link that's down or a radio that's gone only makes the poll time
+ * out, and the power goes next either way.
+ */
+static void t8140_apcie_port_stop(struct t8140_sleep *s)
+{
+	void __iomem *port = s->apcie_port;
+	void __iomem *phy = s->apcie_port_phy;
+	u32 val;
+
+	writel(readl(port + APCIE_PORT_INTMSK) | APCIE_PORT_INT_LINK, port + APCIE_PORT_INTMSK);
+	writel(APCIE_PORT_INT_LINK, port + APCIE_PORT_INTSTAT);
+
+	writel(readl(port + APCIE_PORT_APPCLK) | APCIE_PORT_APPCLK_CGDIS, port + APCIE_PORT_APPCLK);
+	/* A loader can leave the port ready with the link never trained. */
+	if (readl(port + APCIE_PORT_LINKSTS) & APCIE_PORT_LINKSTS_UP) {
+		writel(APCIE_PORT_L2_ENTER, port + APCIE_PORT_L2);
+		readl_poll_timeout_atomic(port + APCIE_PORT_L2, val, !(val & APCIE_PORT_L2_BUSY),
+					  10, APCIE_PORT_STOP_US);
+	}
+	writel(readl(phy) & ~APCIE_PORT_PHY_LINK, phy);
+
+	if (s->apcie_engine && s->apcie_fabric) {
+		writel(0, s->apcie_engine + APCIE_ENGINE_IRQ_MASK);
+		writel(3, s->apcie_fabric + APCIE_FABRIC_STOP);
+		writel(readl(s->apcie_engine + APCIE_ENGINE_CTRL) | APCIE_ENGINE_STOP,
+		       s->apcie_engine + APCIE_ENGINE_CTRL);
+	}
+	udelay(1000);
+
+	/* What this bit does isn't known. macOS sets it around PERST#. */
+	writel(readl(port + APCIE_PORT_PERST_GUARD) | BIT(8), port + APCIE_PORT_PERST_GUARD);
+	writel(0, port + APCIE_PORT_PERST);
+	writel(readl(port + APCIE_PORT_PERST_GUARD) & ~BIT(8), port + APCIE_PORT_PERST_GUARD);
+
+	writel(readl(phy) & ~APCIE_PORT_PHY_EN1, phy);
+	writel(readl(phy) & ~APCIE_PORT_PHY_EN0, phy);
+	writel(readl(phy) | APCIE_PHY_CTRL_RESET, phy);
+	writel(readl(phy) & ~APCIE_PHY_CTRL_CLK0REQ, phy);
+	readl_poll_timeout_atomic(phy, val, !(val & APCIE_PHY_CTRL_CLK0ACK), 1, APCIE_POLL_US);
+	writel(readl(phy) & ~APCIE_PHY_CTRL_CLK1REQ, phy);
+
+	writel(readl(port + APCIE_PORT_APPCLK) & ~APCIE_PORT_APPCLK_EN, port + APCIE_PORT_APPCLK);
+	writel(readl(port + APCIE_PORT_INTSTAT), port + APCIE_PORT_INTSTAT);
+}
+
+static void t8140_apcie_port_stop_once(struct t8140_sleep *s)
+{
+	/* Only as the loader set it up: after a wake its registers abort. */
+	if (s->apcie_port_stopped || s->apcie_port_down || !s->apcie_port || !s->apcie_port_phy ||
+	    !t8140_ps_on(s, PS_APCIE_GP) || !t8140_ps_on(s, PS_APCIE_PHY_SW))
+		return;
+	s->apcie_port_stopped = true;
+	t8140_apcie_port_stop(s);
+}
+
+/* A poll here only paces the steps: the power goes next whatever it reads. */
+static void t8140_apcie_phy_off(struct t8140_sleep *s)
+{
+	void __iomem *ctrl = s->apcie_phy + APCIE_PHY_CTRL;
+	void __iomem *run = s->apcie_phy + APCIE_PHY_RUN;
+	u32 val;
+
+	writel(readl(ctrl) | APCIE_PHY_CTRL_RESET, ctrl);
+	writel(readl(ctrl) & ~APCIE_PHY_CTRL_CLK1REQ, ctrl);
+	readl_poll_timeout_atomic(ctrl, val, !(val & APCIE_PHY_CTRL_CLK1ACK), 1, APCIE_POLL_US);
+	writel(readl(ctrl) & ~APCIE_PHY_CTRL_CLK0REQ, ctrl);
+	readl_poll_timeout_atomic(ctrl, val, !(val & APCIE_PHY_CTRL_CLK0ACK), 1, APCIE_POLL_US);
+	writel(readl(ctrl) & ~APCIE_PHY_CTRL_UP, ctrl);
+	writel(readl(run) & ~APCIE_PHY_RUN_EN2, run);
+	writel(readl(run) & ~APCIE_PHY_RUN_EN, run);
+}
+
+static void t8140_apcie_clk_off(struct t8140_sleep *s)
+{
+	void __iomem *clk = s->apcie_clkgen + APCIE_CLK_CTRL;
+	u32 val;
+
+	writel(readl(clk) & ~APCIE_CLK_RUN, clk);
+	writel(readl(clk) | APCIE_CLK_OFF, clk);
+	readl_poll_timeout_atomic(clk, val, !(val & APCIE_CLK_BUSY), 1, APCIE_POLL_US);
+	writel(readl(clk) | APCIE_CLK_OFF2, clk);
+}
+
+/*
+ * ANS's own link runs on this block, and macOS takes it down with the domains. Its
+ * order, measured on one sleep, in the same microseconds as the power words. A block's
+ * registers fault with its domain off, and a loader may have left any of these off.
+ */
+static void t8140_sleep_lower_apcie(struct t8140_sleep *s)
+{
+	u32 val;
+
+	t8140_apcie_port_stop_once(s);
+	/* The PHY's registers need both domains on. */
+	if (s->apcie_phy && t8140_ps_on(s, PS_APCIE_PHY_SW) && t8140_ps_on(s, PS_APCIE_SYS_ST))
+		t8140_apcie_phy_off(s);
+	t8140_ps_lower(s, PS_APCIE_PHY_SW);
+
+	if (s->apcie_clkgen && t8140_ps_on(s, PS_APCIE_SYS_ST))
+		t8140_apcie_clk_off(s);
+	t8140_ps_lower(s, PS_APCIE_SYS_ST);
+	t8140_ps_lower(s, PS_APCIE_ST);
+
+	val = t8140_ps_lower_start(s, PS_APCIE_SYS_GP);
+	if (s->apcie_axi && t8140_ps_on(s, PS_APCIE_SYS_GP)) {
+		writel(readl(s->apcie_axi + APCIE_AXI_EN0) & ~BIT(0), s->apcie_axi + APCIE_AXI_EN0);
+		writel(readl(s->apcie_axi + APCIE_AXI_EN1) & ~BIT(0), s->apcie_axi + APCIE_AXI_EN1);
+	}
+	t8140_ps_lower_finish(s, PS_APCIE_SYS_GP, val);
+
+	t8140_ps_lower(s, PS_APCIE_GP);
+	t8140_ps_lower(s, PS_ANS);
+}
+
+/* Read-modify-write in table order, with no write where nothing changes. */
+static void t8140_tunable_apply_changed(void __iomem *regs, const struct apple_tunable *t)
+{
+	size_t i;
+
+	for (i = 0; i < t->sz; i++) {
+		void __iomem *reg = regs + t->values[i].offset;
+		u32 old = readl(reg);
+		u32 val = (old & ~t->values[i].mask) | (t->values[i].value & t->values[i].mask);
+
+		if (val != old)
+			writel(val, reg);
+	}
+}
+
+/*
+ * The power loss takes the PHY's PLL and lane settings with it, and ANS's link can't
+ * train without them. Applied as macOS does: the PLL table, then the lanes, then the
+ * PLL's hold released. That takes about the settling time the PHY needs here.
+ */
+static void t8140_apcie_phy_ip_apply(struct t8140_sleep *s)
+{
+	void __iomem *ctl = s->apcie_phy_ip + APCIE_PHY_IP_PLL_CTL;
+
+	t8140_tunable_apply_changed(s->apcie_phy_ip, s->apcie_phy_ip_pll);
+	t8140_tunable_apply_changed(s->apcie_phy_ip, s->apcie_phy_ip_lanes);
+	writel(readl(ctl) & ~APCIE_PHY_IP_PLL_HOLD, ctl);
+}
+
+/*
+ * Brought up from power-off in macOS's order, measured on one sleep: all of it follows
+ * the domains on the waking core, well before ANS runs. Whether ANS needs each step is
+ * inferred. Nothing else does this if no host driver is bound.
+ */
+static int t8140_sleep_raise_apcie(struct t8140_sleep *s)
+{
+	void __iomem *ctrl = s->apcie_phy + APCIE_PHY_CTRL;
+	void __iomem *run = s->apcie_phy + APCIE_PHY_RUN;
+	u32 val;
+	int ret;
+
+	ret = t8140_ps_raise(s, PS_ANS);
+	ret |= t8140_ps_raise(s, PS_APCIE_GP);
+	ret |= t8140_ps_raise_start(s, PS_APCIE_SYS_GP);
+	if (!ret) {
+		writel(readl(s->apcie_axi + APCIE_AXI_EN0) | BIT(0), s->apcie_axi + APCIE_AXI_EN0);
+		writel(readl(s->apcie_axi + APCIE_AXI_EN1) | BIT(0), s->apcie_axi + APCIE_AXI_EN1);
+	}
+	t8140_ps_raise_finish(s, PS_APCIE_SYS_GP);
+	ret |= t8140_ps_raise(s, PS_APCIE_ST);
+	ret |= t8140_ps_raise(s, PS_APCIE_SYS_ST);
+	if (ret)
+		return ret;
+
+	apple_tunable_apply(s->apcie_axi, s->apcie_axi_tunable);
+	apple_tunable_apply(s->apcie_cio3pll, s->apcie_cio3pll_tunable);
+	apple_tunable_apply(s->apcie_clkgen, s->apcie_clkgen_tunable);
+	writel(readl(s->apcie_clkgen + APCIE_CLK_START) | APCIE_CLK_START_GO,
+	       s->apcie_clkgen + APCIE_CLK_START);
+	/* Both off bits: the lowering sets them, and only a power-off clears OFF. */
+	writel(readl(s->apcie_clkgen + APCIE_CLK_CTRL) & ~(APCIE_CLK_OFF2 | APCIE_CLK_OFF),
+	       s->apcie_clkgen + APCIE_CLK_CTRL);
+	ret = readl_poll_timeout_atomic(s->apcie_clkgen + APCIE_CLK_CTRL, val,
+					!(val & APCIE_CLK_BUSY), 1, APCIE_POLL_US);
+	if (ret)
+		return ret;
+
+	ret = t8140_ps_raise(s, PS_APCIE_PHY_SW);
+	if (ret)
+		return ret;
+
+	apple_tunable_apply(s->apcie_phy, s->apcie_phy_tunable);
+	writel(readl(ctrl) | APCIE_PHY_CTRL_CLK0REQ, ctrl);
+	ret = readl_poll_timeout_atomic(ctrl, val, val & APCIE_PHY_CTRL_CLK0ACK, 1, APCIE_POLL_US);
+	if (ret)
+		return ret;
+	writel(readl(ctrl) | APCIE_PHY_CTRL_CLK1REQ, ctrl);
+	ret = readl_poll_timeout_atomic(ctrl, val, val & APCIE_PHY_CTRL_CLK1ACK, 1, APCIE_POLL_US);
+	if (ret)
+		return ret;
+	writel(readl(ctrl) & ~APCIE_PHY_CTRL_RESET, ctrl);
+
+	writel(readl(run) | APCIE_PHY_RUN_EN, run);
+	t8140_apcie_phy_ip_apply(s);
+	writel(readl(run) | APCIE_PHY_RUN_EN2, run);
+	ret = readl_poll_timeout_atomic(s->apcie_phy + APCIE_PHY_READY, val, val & BIT(0), 1,
+					APCIE_POLL_US);
+	if (ret)
+		return ret;
+	writel(readl(s->apcie_phy + APCIE_PHY_COMMON) | BIT(0), s->apcie_phy + APCIE_PHY_COMMON);
+	writel(readl(ctrl) | APCIE_PHY_CTRL_UP, ctrl);
+
+	writel(0, s->apcie_rc + APCIE_RC_ZERO);
+	writel(0x140, s->apcie_rc + APCIE_RC_READY_CFG);
+	writel(1, s->apcie_rc + APCIE_RC_READY_START);
+
+	return readl_poll_timeout_atomic(s->apcie_rc + APCIE_RC_READY_STAT, val, val & BIT(0), 1,
+					 APCIE_POLL_US);
+}
+
+/* About 4 ms after the other cores stop on macOS: deepest first, ANS last. */
 static void t8140_sleep_lower_io(struct t8140_sleep *s)
 {
 	/*
@@ -1491,6 +1796,10 @@ static void t8140_sleep_lower_io(struct t8140_sleep *s)
 	t8140_ps_lower(s, PS_ATC0_COMMON);
 	if (!READ_ONCE(t8140_usb_asleep))
 		t8140_ps_lower(s, PS_ATC0_USB_AON);
+	if (s->pcie_ans_stopped) {
+		t8140_sleep_lower_apcie(s);
+		s->ans_off_ret = t8140_ps_wait_off(s, PS_ANS);
+	}
 }
 
 static void t8140_sleep_set_wd2(struct t8140_sleep *s, unsigned int secs)
@@ -1980,6 +2289,7 @@ static int t8140_sleep_commit(unsigned long unused)
 	s->siq_cfg = read_sysreg_s(SYS_APL_SIQ_CFG_EL1);
 	s->cpus_stop_ret = spin_table_stop_parked();
 
+	t8140_sleep_lower_io(s);
 	t8140_sleep_arm_wd2(s);
 	t8140_sleep_wait_still_on(s);
 
@@ -2103,6 +2413,15 @@ static void t8140_sleep_return(struct t8140_sleep *s)
 	/* macOS stops it here. Keep a longer one over device resume, until .end. */
 	t8140_sleep_set_wd2(s, WDT_SUSPEND_SECS);
 
+	/*
+	 * What the commit lowered for a driver comes back before anything uses it, in
+	 * macOS's order, measured about 14 ms after this point. With no driver, genpd's
+	 * books decide, as they do for every other domain.
+	 */
+	if (s->pcie_ans_stopped)
+		s->pcie_ans_on_ret = t8140_sleep_raise_apcie(s);
+	s->apcie_port_down = true;
+
 	dcache_inval_poc((unsigned long)s->mbox, (unsigned long)(s->mbox + 1));
 	s->resumes_after = READ_ONCE(s->mbox->resumes);
 
@@ -2164,8 +2483,10 @@ static int t8140_sleep_begin(suspend_state_t state)
 {
 	/* The last sleep's cut is its port controller's to take, by its .complete. */
 	WRITE_ONCE(t8140_debug_link_cut, false);
-	if (t8140_sleep)
+	if (t8140_sleep) {
+		t8140_sleep->apcie_port_stopped = false;
 		t8140_sleep->usb_down_ran = false;
+	}
 	t8140_sleep_set_wd2(t8140_sleep, WDT_SUSPEND_SECS);
 	pm_set_suspend_via_firmware();
 
@@ -2242,8 +2563,13 @@ static void t8140_sleep_report(void)
 	if (s->cluster_e_ret || s->cluster_ave_ret || s->cluster_ave_commit_ret)
 		dev_err(s->dev, "cluster power timed out: E %d AVE %d, AVE at the commit %d\n",
 			s->cluster_e_ret, s->cluster_ave_ret, s->cluster_ave_commit_ret);
+	if (s->ans_off_ret)
+		dev_err(s->dev, "ANS did not read off at the commit: %d\n", s->ans_off_ret);
 	if (s->usb_down_ret)
 		dev_err(s->dev, "debug link: the stop failed: %d\n", s->usb_down_ret);
+	if (s->pcie_ans_stopped && s->pcie_ans_on_ret)
+		dev_err(s->dev, "ANS's PCIe block did not come up after the wake: %d\n",
+			s->pcie_ans_on_ret);
 }
 
 static const struct platform_suspend_ops t8140_sleep_ops = {
@@ -2398,6 +2724,83 @@ static int t8140_sleep_map_mailbox(struct t8140_sleep *s)
 	return 0;
 }
 
+static struct apple_tunable *t8140_sleep_apcie_tunable(struct t8140_sleep *s,
+						       struct device_node *np,
+						       const char *name, const char *prop)
+{
+	int idx = of_property_match_string(np, "reg-names", name);
+	struct apple_tunable *t;
+	struct resource res;
+
+	if (idx < 0 || of_address_to_resource(np, idx, &res))
+		return NULL;
+	t = devm_apple_tunable_parse(s->dev, np, prop, &res);
+
+	return IS_ERR(t) ? NULL : t;
+}
+
+static void __iomem *t8140_sleep_apcie_block(struct t8140_sleep *s, struct device_node *np,
+					     const char *name, const char *prop,
+					     struct apple_tunable **tunable)
+{
+	int idx = of_property_match_string(np, "reg-names", name);
+
+	if (idx < 0)
+		return NULL;
+	if (prop) {
+		*tunable = t8140_sleep_apcie_tunable(s, np, name, prop);
+		if (!*tunable)
+			return NULL;
+	}
+
+	return of_iomap(np, idx);
+}
+
+/*
+ * Its registers go with PCIe's node, which a test tree may have disabled, and a loader
+ * publishes the tunables there. Missing ones only refuse a real sleep with ANS stopped.
+ */
+static void t8140_sleep_map_apcie(struct t8140_sleep *s)
+{
+	struct device_node *np = of_parse_phandle(s->dev->of_node, "apple,apcie", 0);
+	struct device_node *engine;
+
+	if (!np)
+		return;
+	s->apcie_axi = t8140_sleep_apcie_block(s, np, "axi2af", "apple,tunable-axi2af",
+					       &s->apcie_axi_tunable);
+	s->apcie_cio3pll = t8140_sleep_apcie_block(s, np, "cio3pll", "apple,tunable-cio3pll",
+						   &s->apcie_cio3pll_tunable);
+	s->apcie_clkgen = t8140_sleep_apcie_block(s, np, "clkgen", "apple,tunable-clkgen",
+						  &s->apcie_clkgen_tunable);
+	s->apcie_phy = t8140_sleep_apcie_block(s, np, "phy-block", "apple,tunable-phy",
+					       &s->apcie_phy_tunable);
+	s->apcie_rc = t8140_sleep_apcie_block(s, np, "rc", NULL, NULL);
+	s->apcie_phy_ip = t8140_sleep_apcie_block(s, np, "phy-ip", "apple,tunable-phy-ip-pll",
+						  &s->apcie_phy_ip_pll);
+	s->apcie_phy_ip_lanes = t8140_sleep_apcie_tunable(s, np, "phy-ip",
+							  "apple,tunable-phy-ip-auspma");
+	if (!s->apcie_axi || !s->apcie_cio3pll || !s->apcie_clkgen || !s->apcie_phy ||
+	    !s->apcie_rc || !s->apcie_phy_ip || !s->apcie_phy_ip_lanes) {
+		dev_info(s->dev,
+			 "no PCIe tunables for ANS: a real sleep with it stopped refuses, s2idle stays the default\n");
+		s->apcie_phy_tunable = NULL;
+		s->apcie_phy = NULL;
+		s->apcie_clkgen = NULL;
+		s->apcie_axi = NULL;
+	}
+
+	s->apcie_port = t8140_sleep_apcie_block(s, np, "port0", NULL, NULL);
+	s->apcie_port_phy = t8140_sleep_apcie_block(s, np, "phy0", NULL, NULL);
+	engine = of_parse_phandle(np, "apple,piodma", 0);
+	if (engine) {
+		s->apcie_engine = t8140_sleep_apcie_block(s, engine, "engine", NULL, NULL);
+		s->apcie_fabric = t8140_sleep_apcie_block(s, engine, "fabric", NULL, NULL);
+		of_node_put(engine);
+	}
+	of_node_put(np);
+}
+
 static void t8140_sleep_map_debug_port(struct t8140_sleep *s)
 {
 	struct device_node *np = of_parse_phandle(s->dev->of_node, "apple,debug-port", 0);
@@ -2443,6 +2846,7 @@ static int t8140_sleep_probe(struct platform_device *pdev)
 	ret = t8140_sleep_map_displays(s);
 	if (ret)
 		return ret;
+	t8140_sleep_map_apcie(s);
 	t8140_sleep_map_debug_port(s);
 
 	platform_set_drvdata(pdev, s);
@@ -2455,6 +2859,9 @@ static int t8140_sleep_probe(struct platform_device *pdev)
 	t8140_sleep = s;
 	/* Deep becomes the default sleep state, unless mem_sleep_default= chose another. */
 	suspend_set_ops(&t8140_sleep_ops);
+	/* Not when every real sleep would refuse because ANS couldn't come back. */
+	if (!s->apcie_phy_tunable && mem_sleep_default == PM_SUSPEND_MAX)
+		mem_sleep_current = PM_SUSPEND_TO_IDLE;
 
 	dev_info(dev, "deep sleep %s: boot object resumes %llu\n",
 		 mem_sleep_current == PM_SUSPEND_MEM ? "is the default" :
