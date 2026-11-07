@@ -138,6 +138,8 @@ mod tests {
 
     /// The G17 family's statistics tags, as `InitData::statistics_types` gives them.
     const G17: u64 = super::super::fw::channels::STATISTICS_TYPES as u64;
+    /// M5's, which add tag 32.
+    const M5: u64 = super::super::fw::m5::STATISTICS_TYPES;
 
     #[test]
     fn retains_all_words_and_separates_role_and_tag() {
@@ -165,11 +167,25 @@ mod tests {
     #[test]
     fn rejects_invalid_tags_before_indexing() {
         let mut reports = Reports::new().unwrap();
-        for tag in [0, 15, 29, 31, 32, u32::MAX] {
+        for tag in [0, 15, 29, 31, 32, 63, 64, u32::MAX] {
             let mut words = [0; EVENT_WORDS];
             words[0] = tag;
             reports.record(Role::Primary, words, 1, G17, true);
         }
         assert!(reports.samples.iter().all(|s| s.count == 0));
+    }
+
+    #[test]
+    fn follows_the_family_mask() {
+        let mut reports = Reports::new().unwrap();
+        let mut words = [0; EVENT_WORDS];
+        words[0] = 32;
+        reports.record(Role::Secondary, words, 1, G17, true);
+        assert_eq!(reports.samples[TAGS + 32].count, 0);
+        reports.record(Role::Secondary, words, 2, M5, true);
+        assert_eq!(reports.samples[TAGS + 32].count, 1);
+        words[0] = 64;
+        reports.record(Role::Secondary, words, 3, u64::MAX, true);
+        assert_eq!(reports.samples.iter().filter(|s| s.count != 0).count(), 1);
     }
 }
