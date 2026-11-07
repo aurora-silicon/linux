@@ -33,3 +33,5 @@
 &cpuidle {
 	status = "okay";
 };
+
+#include "t8132-j623-audio.dtsi"

@@ -40,3 +40,5 @@
 &cpuidle {
 	status = "okay";
 };
+
+#include "t8132-j773g-audio.dtsi"
