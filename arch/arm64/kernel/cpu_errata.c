@@ -314,6 +314,8 @@ static bool has_impdef_pmuv3(const struct arm64_cpu_capabilities *entry, int sco
 static const struct midr_range apple_broken_seis_cpus[] = {
 	MIDR_ALL_VERSIONS(MIDR_APPLE_T6040_E),
 	MIDR_ALL_VERSIONS(MIDR_APPLE_T6040_P),
+	MIDR_ALL_VERSIONS(MIDR_APPLE_TAHITI_E),
+	MIDR_ALL_VERSIONS(MIDR_APPLE_TAHITI_P),
 	{},
 };
 

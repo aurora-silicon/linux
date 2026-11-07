@@ -2535,6 +2535,31 @@ config RANDOMIZE_MODULE_REGION_FULL
 	  the region is exhausted. In this particular case of region
 	  exhaustion, modules might be able to fall back to a larger 2GB area.
 
+config ARM64_CTXR_EXECMEM
+	bool "Confine kernel executable code to a fixed physical window (CTXR)"
+	depends on EXECMEM && MMU
+	select EXECMEM_CONFINE
+	select GENERIC_ALLOCATOR
+	select PTDUMP
+	help
+	  On some Apple-silicon machines the boot firmware arms a CTXR (code
+	  text execute range) on the secondary CPUs: privileged code can only
+	  be fetched from inside a fixed physical window. To run the kernel at
+	  EL2 behind such a window (rather than dropping it to EL1), every
+	  executable physical page must live inside it.
+
+	  With this option the kernel reserves a single window — described by
+	  the bootloader in /chosen/aurora,ctxr-exec-window, where it has already
+	  placed the static image, or by the "ctxr_exec_window=" command-line
+	  option for VM bring-up — and backs every run-time executable allocation
+	  (modules, BPF, kprobes, ftrace) with pages drawn from the window's free
+	  memory. A verifier sweeps the kernel page tables and reports (or, when
+	  the window is enforcing, panics on) any executable mapping that escapes.
+
+	  This has no effect unless the bootloader or the command line supplies
+	  a window, so a distribution kernel for Apple silicon can enable it.
+	  Say Y for such a kernel, and N otherwise.
+
 config CC_HAVE_STACKPROTECTOR_SYSREG
 	def_bool $(cc-option,-mstack-protector-guard=sysreg -mstack-protector-guard-reg=sp_el0 -mstack-protector-guard-offset=0)
 
