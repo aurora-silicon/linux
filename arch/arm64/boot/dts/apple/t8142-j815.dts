@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+/dts-v1/;
+
+#include "t8142.dtsi"
+
+/ {
+	model = "Apple MacBook Air (15-inch, M5)";
+	compatible = "apple,j815", "apple,t8142", "apple,arm-platform";
+	chassis-type = "laptop";
+};
+
+#include "t8142-j815-inventory.dtsi"
