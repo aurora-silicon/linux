@@ -29,3 +29,19 @@
 		};
 	};
 };
+
+&i2c4 {
+	touchbar_control: touchbar-driver@4c {
+		compatible = "apple,t8103-touchbar-driver", "apple,touchbar-driver";
+		reg = <0x4c>;
+		status = "disabled";
+	};
+};
+
+&i2c4 {
+	touchbar_calibration: touchbar-calibration@50 {
+		compatible = "apple,t8103-touchbar-calibration", "apple,touchbar-calibration";
+		reg = <0x50>;
+		status = "disabled";
+	};
+};

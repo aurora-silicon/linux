@@ -811,3 +811,43 @@
 		status = "disabled";
 	};
 };
+
+&{/soc} {
+	primary_spmi_monitor: spmi-monitor@23d0d8e00 {
+		compatible = "apple,t8103-spmi-monitor", "apple,spmi-monitor";
+		reg = <0x2 0x3d0d8e00 0x0 0x100>,
+		      <0x2 0x3d0d8400 0x0 0x78>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 343 IRQ_TYPE_LEVEL_HIGH>;
+		apple,controller = <&nub_spmi>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <0>;
+		status = "disabled";
+	};
+};
+
+&pmic1 {
+	battery_monitor: battery-monitor {
+		compatible = "apple,t8103-battery-monitor", "apple,battery-monitor";
+		interrupt-parent = <&primary_spmi_monitor>;
+		interrupts = <62 IRQ_TYPE_NONE>;
+		status = "disabled";
+	};
+};
+
+&aop_spmi1 {
+	stockholm: nfc@c {
+		compatible = "apple,t8103-stockholm-spmi", "apple,stockholm-spmi";
+		reg = <0xc SPMI_USID>;
+		interrupt-parent = <&aop_spmi1>;
+		interrupts = <160 IRQ_TYPE_NONE>,
+			     <161 IRQ_TYPE_NONE>,
+			     <162 IRQ_TYPE_NONE>,
+			     <163 IRQ_TYPE_NONE>,
+			     <164 IRQ_TYPE_NONE>,
+			     <165 IRQ_TYPE_NONE>,
+			     <166 IRQ_TYPE_NONE>;
+		status = "disabled";
+	};
+};

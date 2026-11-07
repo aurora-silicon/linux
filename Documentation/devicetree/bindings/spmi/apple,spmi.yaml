@@ -39,7 +39,9 @@ properties:
       - const: apple,t8142-spmi
 
   reg:
-    maxItems: 1
+    minItems: 1
+    maxItems: 3
+    description: Primary controller, secondary controller and interrupt-status apertures.
 
   interrupts:
     maxItems: 1
