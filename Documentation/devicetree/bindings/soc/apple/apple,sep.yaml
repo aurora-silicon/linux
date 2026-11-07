@@ -42,6 +42,39 @@ select:
                 const: apple,sep
       required:
         - compatible
+properties:
+  compatible: true
+
+  reg: true
+
+  mboxes:
+    maxItems: 1
+
+  mbox-names:
+    const: mbox
+
+  iommus: true
+
+  power-domains: true
+
+  memory-region: true
+
+  iboot-manifest:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    description:
+      The signed iBoot manifest of the running boot, added by the bootloader.
+      The SEP needs it to open the machine's secure storage.
+
+  local-policy-manifest:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    description:
+      The signed local boot policy of the running boot, added by the
+      bootloader, for the same purpose.
+
+# The root declares the union of property types for DTB decoding. The
+# conditional variants below each retain their closed property contract.
+additionalProperties: true
+
 allOf:
   -
     if:
@@ -108,8 +141,6 @@ allOf:
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
-
-unevaluatedProperties: false
 
 $defs:
   legacy-driver:

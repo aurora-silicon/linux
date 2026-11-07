@@ -61,6 +61,113 @@ select:
                 const: apple,dart
       required:
         - compatible
+properties:
+  compatible: true
+
+  apple,managed-sids:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    items:
+      - const: 1
+      - const: 2
+    description: >
+      J713 radio ordinary stream ownership profile. Only these inactive
+      normal streams and their exact-RID entries may be adopted by the OS.
+      Other streams and RID entries remain inherited. The documented static
+      SID16 bypass role may be initialized only from a disabled stream with
+      no valid root; an existing bypass remains unchanged. PIODMA and other
+      reserved roles are not modified. This does not authorize a controller
+      reset or takeover of active page tables. Both the radio DART and PCI
+      host describe the same two ordinary streams. Error reporting must
+      already be unmasked at admission; the OS preserves the inherited global
+      error-mask policy rather than changing it for these streams.
+
+  reg: true
+
+  reg-names: true
+
+  interrupts: true
+
+  clocks: true
+
+  '#iommu-cells':
+    enum: [1, 5]
+    description:
+      One cell describes the stream ID emitted by a master. Five cells
+      describe the stream ID followed by the 64-bit base and length of its
+      device-visible DMA window.
+
+  nonposted-mmio: true
+
+  power-domains: true
+
+  apple,dma-range:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    minItems: 2
+    maxItems: 2
+    description: >
+      Device-visible DMA aperture encoded as a base and a nonzero size. The
+      IOMMU DMA allocator restricts mappings to this range; high address bits
+      may select a firmware-visible alias of the translation aperture.
+      A consumer may further specify its own aperture in its binding.
+
+  apple,dma-offset:
+    $ref: /schemas/types.yaml#/definitions/uint64
+    description: >
+      Offset added to device-visible DMA addresses when indexing the DART page
+      tables. This models host bridges which alias a low PCI bus aperture into
+      a high DART translation window.
+
+  apple,firmware-root-handoff:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    const: 1
+    description: >
+      The bootloader has reserved the actual three-level locked root and leaf
+      table pages as normal RAM and completed the display coprocessor power
+      handoff. Linux retains occupied root slots and excludes their entire
+      IOVA spans from allocation. This does not assert immutable descendants.
+
+  apple,tunable:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: Register offset
+        - description: Mask to be applied to the register value
+        - description: Bits to be set after applying the mask
+    description: >
+      List of (register offset, mask, value) tuples copied from Apple's Device
+      Tree by the bootloader and required to initialize dynamically powered
+      DART instances.
+
+  apple,bypass-sids:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 8
+    items:
+      maximum: 255
+    description:
+      Reserved streams of a USB4 PCIe tunnel DART that its PCIe-C port issues
+      its own writes on, such as the interrupt controller writes its MSIs
+      turn into. They are set to bypass after every reset of the DART.
+
+  apple,remap-streams:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    minItems: 1
+    maxItems: 256
+    items:
+      items:
+        - description: Source stream ID, unique within this list.
+          maximum: 255
+        - description: Destination stream ID, which must not itself be remapped.
+          maximum: 15
+    description:
+      T8110 stream remaps. A source uses the destination stream's translation
+      and filtering state without a separate page-table root. Source and
+      destination must differ, and both must exist on the controller.
+
+# The root declares the union of property types for DTB decoding. The
+# conditional variants below each retain their closed property contract.
+additionalProperties: true
+
 allOf:
   -
     if:
@@ -125,8 +232,6 @@ allOf:
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
-
-unevaluatedProperties: false
 
 $defs:
   legacy-driver:
