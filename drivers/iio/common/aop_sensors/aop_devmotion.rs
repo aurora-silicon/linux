@@ -26,7 +26,7 @@ use kernel::{
         atomic::{Acquire, Atomic, Relaxed, Release},
         Arc, Mutex, SpinLock,
     },
-    time,
+    time::{self, delay::fsleep, Delta},
     types::{ForeignOwnable, Opaque},
     workqueue::{self, impl_has_delayed_work, DelayedWork, Work, WorkItem},
 };
@@ -45,12 +45,19 @@ const CALIBRATION_DEFAULT: u32 = 1;
 /// opening the report client is the operation that arms it.
 const STATUS_UNSUPPORTED: u32 = 0xe000_02c7;
 const PROP_FASTPATH_PAYLOAD_SIZE: u32 = 81;
-const INTERVAL_US: u32 = 20_000;
+/// The default sample rate. The fusion engine refreshes the shared buffer at
+/// its own fixed rate (200 Hz on the M4 Pro) whatever interval property 0
+/// holds, so the host paces itself: it polls at the requested rate and keeps
+/// the client open only while samples are consumed.
+const DEFAULT_HZ: u32 = 50;
+const MAX_HZ: u32 = 200;
+/// How long a direct read waits for the first sample of a new client.
+const FIRST_SAMPLE_MS: i64 = 100;
+const FIRST_SAMPLE_POLL_MS: i64 = 5;
 const FASTPATH_COMMAND_LEN: usize = 84;
 const FASTPATH_HEADER_LEN: usize = 64;
 const FASTPATH_PAGE_SIZE: usize = 4096;
 const MAX_REPORT_LEN: usize = 108;
-const POLL_MS: u32 = 5;
 const Q_FRAC_BITS: i32 = 30;
 
 /// The latest quaternion, in the IIO-defined W, X, Y, Z order.
@@ -181,8 +188,10 @@ impl Control {
         )
     }
 
-    fn enable(&self) -> Result {
-        self.set(PROP_INTERVAL, INTERVAL_US)
+    /// Writes the consumer's interval. The firmware records it, but the
+    /// fast-path buffer is refreshed at the fusion rate regardless.
+    fn enable(&self, interval_us: u32) -> Result {
+        self.set(PROP_INTERVAL, interval_us)
     }
 
     fn disable(&self) -> Result {
@@ -206,6 +215,13 @@ struct State {
     client_id: Atomic<u64>,
     next_client_id: Atomic<u64>,
     last_aop_timestamp: Atomic<u64>,
+    hz: Atomic<u32>,
+    buffer_on: Atomic<bool>,
+    /// Set across system sleep and after unbind: no client may be open.
+    parked: Atomic<bool>,
+    /// Serializes opening and closing the client.
+    #[pin]
+    stream: Mutex<()>,
     #[pin]
     poll_work: DelayedWork<State>,
 }
@@ -313,7 +329,8 @@ impl State {
 
     fn start(self: &Arc<Self>) -> Result {
         self.open_fastpath()?;
-        if let Err(e) = self.control.enable() {
+        let interval_us = 1_000_000 / self.hz.load(Relaxed);
+        if let Err(e) = self.control.enable(interval_us) {
             if self.close_fastpath().is_err() {
                 self.retain_ring.store(true, Release);
             }
@@ -328,12 +345,74 @@ impl State {
         self.active.store(false, Release);
         let interval = self.control.disable();
         let close = self.close_fastpath();
+        // A later client must not be answered with this client's last sample.
+        self.sample.lock().valid = false;
         interval.and(close)
     }
 
+    /// Opens or closes the client to match its consumers. The caller holds
+    /// the stream lock.
+    fn sync_locked(self: &Arc<Self>) -> Result {
+        let want = self.buffer_on.load(Acquire) && !self.parked.load(Acquire);
+        match (want, self.active.load(Acquire)) {
+            (true, false) => self.start(),
+            (false, true) => self.stop(),
+            _ => Ok(()),
+        }
+    }
+
+    fn set_buffer(self: &Arc<Self>, on: bool) -> Result {
+        let _guard = self.stream.lock();
+        self.buffer_on.store(on, Release);
+        let ret = self.sync_locked();
+        if on && ret.is_err() {
+            // The IIO core does not call predisable after a failed enable.
+            self.buffer_on.store(false, Release);
+        }
+        ret
+    }
+
+    fn set_parked(self: &Arc<Self>, parked: bool) -> Result {
+        let _guard = self.stream.lock();
+        self.parked.store(parked, Release);
+        self.sync_locked()
+    }
+
+    /// Returns the current orientation. Without a buffer consumer the client
+    /// is opened only for this read.
+    fn read_now(self: &Arc<Self>) -> Result<[i32; 4]> {
+        let _guard = self.stream.lock();
+        if !self.active.load(Acquire) {
+            if self.parked.load(Acquire) {
+                return Err(EBUSY);
+            }
+            self.start()?;
+            let mut waited = 0;
+            while waited < FIRST_SAMPLE_MS && !self.sample.lock().valid {
+                fsleep(Delta::from_millis(FIRST_SAMPLE_POLL_MS));
+                waited += FIRST_SAMPLE_POLL_MS;
+                self.poll();
+            }
+            let sample = *self.sample.lock();
+            self.stop()?;
+            return if sample.valid {
+                Ok(sample.quat)
+            } else {
+                Err(ENODATA)
+            };
+        }
+        let sample = *self.sample.lock();
+        if sample.valid {
+            Ok(sample.quat)
+        } else {
+            Err(ENODATA)
+        }
+    }
+
     fn queue_poll(self: &Arc<Self>) {
-        let _ =
-            workqueue::system_dfl().enqueue_delayed(self.clone(), time::msecs_to_jiffies(POLL_MS));
+        let period_ms = 1000 / self.hz.load(Relaxed);
+        let _ = workqueue::system_dfl()
+            .enqueue_delayed(self.clone(), time::msecs_to_jiffies(period_ms));
     }
 
     fn poll(&self) {
@@ -441,7 +520,15 @@ unsafe extern "C" fn read_raw_multi(
     mask: isize,
 ) -> i32 {
     // SAFETY: `priv_` is the `Arc<State>` installed during allocation.
-    let state = unsafe { Arc::<State>::borrow((*indio_dev).priv_.cast()) };
+    let state: Arc<State> = unsafe { Arc::<State>::borrow((*indio_dev).priv_.cast()) }.into();
+    if mask == bindings::BINDINGS_IIO_CHAN_INFO_SAMP_FREQ as isize {
+        // SAFETY: The caller provided at least one element.
+        unsafe {
+            *vals = state.hz.load(Relaxed) as i32;
+            *val_len = 1;
+        }
+        return bindings::IIO_VAL_INT as i32;
+    }
     if mask == bindings::BINDINGS_IIO_CHAN_INFO_SCALE as isize {
         if max_len < 2 {
             return EINVAL.to_errno();
@@ -457,17 +544,72 @@ unsafe extern "C" fn read_raw_multi(
     if mask != bindings::BINDINGS_IIO_CHAN_INFO_RAW as isize || max_len < 4 {
         return EINVAL.to_errno();
     }
-    let sample = *state.sample.lock();
-    if !sample.valid {
-        return ENODATA.to_errno();
-    }
+    let quat = match state.read_now() {
+        Ok(quat) => quat,
+        Err(e) => return e.to_errno(),
+    };
     // SAFETY: The caller provided at least four elements.
     unsafe {
-        ptr::copy_nonoverlapping(sample.quat.as_ptr(), vals, sample.quat.len());
-        *val_len = sample.quat.len() as i32;
+        ptr::copy_nonoverlapping(quat.as_ptr(), vals, quat.len());
+        *val_len = quat.len() as i32;
     }
     bindings::IIO_VAL_INT_MULTIPLE as i32
 }
+
+/// # Safety
+///
+/// The IIO core supplies the registered device.
+unsafe extern "C" fn write_raw(
+    indio_dev: *mut bindings::iio_dev,
+    _chan: *const bindings::iio_chan_spec,
+    val: c_int,
+    val2: c_int,
+    mask: isize,
+) -> c_int {
+    // SAFETY: `priv_` is the `Arc<State>` installed during allocation.
+    let state = unsafe { Arc::<State>::borrow((*indio_dev).priv_.cast()) };
+    if mask != bindings::BINDINGS_IIO_CHAN_INFO_SAMP_FREQ as isize
+        || val2 != 0
+        || !(1..=MAX_HZ as c_int).contains(&val)
+    {
+        return EINVAL.to_errno();
+    }
+    // The next poll and the next client use the new rate.
+    state.hz.store(val as u32, Relaxed);
+    0
+}
+
+/// # Safety
+///
+/// The IIO core supplies the registered device.
+unsafe extern "C" fn buffer_postenable(indio_dev: *mut bindings::iio_dev) -> c_int {
+    // SAFETY: `priv_` is the `Arc<State>` installed during allocation.
+    let state: Arc<State> = unsafe { Arc::<State>::borrow((*indio_dev).priv_.cast()) }.into();
+    match state.set_buffer(true) {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    }
+}
+
+/// # Safety
+///
+/// The IIO core supplies the registered device.
+unsafe extern "C" fn buffer_predisable(indio_dev: *mut bindings::iio_dev) -> c_int {
+    // SAFETY: `priv_` is the `Arc<State>` installed during allocation.
+    let state: Arc<State> = unsafe { Arc::<State>::borrow((*indio_dev).priv_.cast()) }.into();
+    match state.set_buffer(false) {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    }
+}
+
+static BUFFER_OPS: bindings::iio_buffer_setup_ops = bindings::iio_buffer_setup_ops {
+    preenable: None,
+    postenable: Some(buffer_postenable),
+    predisable: Some(buffer_predisable),
+    postdisable: None,
+    validate_scan_mask: None,
+};
 
 fn quaternion_channel() -> bindings::iio_chan_spec {
     let mut chan = bindings::iio_chan_spec {
@@ -485,6 +627,7 @@ fn quaternion_channel() -> bindings::iio_chan_spec {
         },
         info_mask_separate: (1usize << bindings::BINDINGS_IIO_CHAN_INFO_RAW)
             | (1usize << bindings::BINDINGS_IIO_CHAN_INFO_SCALE),
+        info_mask_shared_by_all: 1usize << bindings::BINDINGS_IIO_CHAN_INFO_SAMP_FREQ,
         ..Default::default()
     };
     chan.set_modified(1);
@@ -560,6 +703,7 @@ impl MotionIio {
                 channels: [quaternion_channel(), timestamp_channel()],
                 info: bindings::iio_info {
                     read_raw_multi: Some(read_raw_multi),
+                    write_raw: Some(write_raw),
                     ..Default::default()
                 },
                 _p: PhantomPinned,
@@ -585,6 +729,10 @@ impl MotionIio {
                 client_id: Atomic::new(0),
                 next_client_id: Atomic::new(1),
                 last_aop_timestamp: Atomic::new(0),
+                hz: Atomic::new(DEFAULT_HZ),
+                buffer_on: Atomic::new(false),
+                parked: Atomic::new(false),
+                stream <- new_mutex!(()),
                 poll_work <- new_delayed_work!("State::poll_work"),
             }),
             GFP_KERNEL,
@@ -611,7 +759,7 @@ impl MotionIio {
             bindings::devm_iio_kfifo_buffer_setup_ext(
                 dev.as_raw(),
                 indio_dev,
-                ptr::null(),
+                &BUFFER_OPS,
                 ptr::null_mut(),
             )
         };
@@ -682,8 +830,10 @@ unsafe extern "C" fn pm_event(
     // SAFETY: By the callback contract above.
     let hook = unsafe { &*nb.cast::<PmHook>() };
     let ret = match action as u32 {
-        bindings::PM_SUSPEND_PREPARE | bindings::PM_HIBERNATION_PREPARE => hook.state.stop(),
-        bindings::PM_POST_SUSPEND | bindings::PM_POST_HIBERNATION => hook.state.start(),
+        bindings::PM_SUSPEND_PREPARE | bindings::PM_HIBERNATION_PREPARE => {
+            hook.state.set_parked(true)
+        }
+        bindings::PM_POST_SUSPEND | bindings::PM_POST_HIBERNATION => hook.state.set_parked(false),
         _ => return bindings::NOTIFY_DONE as c_int,
     };
     if let Err(e) = ret {
@@ -814,7 +964,6 @@ impl platform::Driver for IIOAopDevMotionDriver {
         let (mut iio, state) = MotionIio::new(pdev, control)?;
         iio.register()?;
         let pm = PmHook::new(state.clone())?;
-        state.start()?;
         Ok(IIOAopDevMotionDriver {
             pm,
             state,
@@ -824,7 +973,7 @@ impl platform::Driver for IIOAopDevMotionDriver {
 
     fn unbind(_dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
         this.pm.unregister();
-        let _ = this.state.stop();
+        let _ = this.state.set_parked(true);
         this.state.disable_poll();
     }
 }

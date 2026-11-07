@@ -83,11 +83,18 @@ with EPIC command 25. Only then does the driver write the non-zero interval in m
 property 0. Reports are polled from the published shared-memory slot rather
 than received as fake-HID subtype 0xc4 messages.
 
-The driver requests 50 Hz. Around system sleep it writes a zero interval and
-closes the fast path with command 26; after resume it opens the fast path
-before restoring the interval. A failed or timed-out close retains the DMA
-mapping because the firmware may still hold its address. This fused stream
-needs no separate calibration blob.
+The firmware records the property 0 interval but refreshes the shared buffer
+at the fusion engine's own rate (every 5 ms on the M4 Pro) whatever value it
+holds, and keeps refreshing it until the client is closed. The driver
+therefore paces itself: ``sampling_frequency`` (default 50 Hz, 1 to 200 Hz)
+sets how often it polls the buffer, and the client is open only while samples
+are consumed. Enabling the buffer opens the client and disabling it closes it
+with command 26 after writing a zero interval. A direct read without an
+enabled buffer opens the client, waits up to 100 ms for the first sample and
+closes it again. Around system sleep an open client is closed and reopened
+after resume. A failed or timed-out close retains the DMA mapping because the
+firmware may still hold its address. This fused stream needs no separate
+calibration blob.
 
 Board temperature
 =================
