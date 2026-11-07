@@ -275,10 +275,9 @@
  * beside it. ACIO populates each container once the router has a PCIe tunnel,
  * and the kernel cold-initializes the port (apple,pciec-kernel-init).
  *
- * apple,tunable-rc, -fabric, -debug and the port's apple,tunable come from the
- * board, which a bootloader may fill in instead. The oe-fabric
- * block and its tunable belong to the port's PIO-DMA engine in the ADT, which
- * no bootloader passes on, so they are described here.
+ * The calibration is in t8132-pciec-tunables.dtsi. The oe-fabric block and
+ * its tunable belong to the port's PIO-DMA engine in the ADT, which no
+ * bootloader passes on, so they are described here.
  */
 / {
 	usb4_0_pcie_tunnel: usb4-pcie-tunnel-0 {
