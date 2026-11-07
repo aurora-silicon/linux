@@ -178,6 +178,7 @@
 		reg = <0x3 0x01000000 0x0 0x4000>,
 		      <0x3 0x00000000 0x0 0x1000000>,
 		      <0x3 0x010c0000 0x0 0x4000>;
+		reg-names = "core", "wrapper", "aux";
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1960 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_scodec>;
