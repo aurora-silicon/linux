@@ -148,4 +148,66 @@ struct sep_bio_attest {
  */
 #define SEP_BIO_PREPARE_ENROL _IOW(SEP_BIO_IOC_MAGIC, 0x0d, struct sep_bio_enrol_start)
 
+/*
+ * DESIGN DRAFT, not a stable ABI: the per-user key bag whose secret is the
+ * login password. Root only, on the re-arm node, never on /dev/sep-bio. The
+ * password passes through once per call and the kernel keeps no copy.
+ * 0x0e and 0x0f are taken by the lockout re-arm.
+ */
+#define SEP_KEYBAG_SECRET_MAX 256
+
+struct sep_keybag_unlock {      /* UNLOCK and CREATE */
+	__u32 uid;
+	__u32 secret_len;          /* UNLOCK permits zero to cancel pending lock */
+	__u8  secret[SEP_KEYBAG_SECRET_MAX];
+};
+
+#define SEP_KEYBAG_LOCK_SCREEN  1   /* after grace_s */
+#define SEP_KEYBAG_LOCK_SUSPEND 2   /* at once */
+#define SEP_KEYBAG_LOCK_LOGOUT  3   /* at once; the password is needed again */
+
+struct sep_keybag_lock {
+	__u32 uid;
+	__u32 reason;
+	__u32 grace_s;
+	__u32 reserved;
+};
+
+#define SEP_KEYBAG_STATE_LOCKED_SINCE_BOOT 0
+#define SEP_KEYBAG_STATE_UNLOCKED          1
+#define SEP_KEYBAG_STATE_LOCKING           2
+#define SEP_KEYBAG_STATE_LOCKED            3
+
+#define SEP_KEYBAG_BIO_ALLOWED             0
+#define SEP_KEYBAG_BIO_PASSWORD_SINCE_BOOT 1
+#define SEP_KEYBAG_BIO_NO_UNLOCK_48H       2
+#define SEP_KEYBAG_BIO_NO_PASSWORD_156H    3
+#define SEP_KEYBAG_BIO_FAILED_MATCHES      4
+
+struct sep_keybag_state {
+	__u32 uid;                /* in */
+	__u32 bag_state;          /* SEP_KEYBAG_STATE_* */
+	__u32 biometry;           /* SEP_KEYBAG_BIO_* */
+	__u32 failed_matches;
+	__u64 since_password_s;   /* ~0 when none since boot */
+	__u64 since_unlock_s;
+	__u32 enclave_lock_state; /* raw enclave state word */
+	__u32 lock_phase;         /* enclave lock phase */
+};
+
+struct sep_keybag_change {
+	__u32 uid;
+	__u32 old_len;
+	__u32 new_len;
+	__u32 reserved;
+	__u8  old_secret[SEP_KEYBAG_SECRET_MAX];
+	__u8  new_secret[SEP_KEYBAG_SECRET_MAX];
+};
+
+#define SEP_BIO_KEYBAG_STATE  _IOWR(SEP_BIO_IOC_MAGIC, 0x10, struct sep_keybag_state)
+#define SEP_BIO_KEYBAG_UNLOCK _IOW(SEP_BIO_IOC_MAGIC, 0x11, struct sep_keybag_unlock)
+#define SEP_BIO_KEYBAG_LOCK   _IOW(SEP_BIO_IOC_MAGIC, 0x12, struct sep_keybag_lock)
+#define SEP_BIO_KEYBAG_CHANGE _IOW(SEP_BIO_IOC_MAGIC, 0x13, struct sep_keybag_change)
+#define SEP_BIO_KEYBAG_CREATE _IOW(SEP_BIO_IOC_MAGIC, 0x14, struct sep_keybag_unlock)
+
 #endif /* _UAPI_LINUX_APPLE_SEP_H */
