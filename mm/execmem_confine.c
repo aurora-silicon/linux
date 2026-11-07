@@ -40,9 +40,8 @@
 
 struct confine_chunk {
 	struct vm_struct	*area;
-	unsigned long		pool_va;	/* linear-map VA handed out by the pool */
 	size_t			size;
-	struct page		**pages;
+	struct page		**pages;		/* one window page each */
 };
 
 static phys_addr_t confine_base __ro_after_init;
@@ -55,6 +54,18 @@ static bool confine_ready __ro_after_init;
 static DEFINE_XARRAY(confine_chunks);
 /* serialises pool (de)allocation and the xarray */
 static DEFINE_MUTEX(confine_lock);
+
+/* Return a chunk's pages to the window pool. The caller holds no lock. */
+static void confine_pool_free(struct page **pages, unsigned int nr)
+{
+	unsigned int i;
+
+	mutex_lock(&confine_lock);
+	for (i = 0; i < nr; i++)
+		gen_pool_free(confine_pool,
+			      (unsigned long)page_address(pages[i]), PAGE_SIZE);
+	mutex_unlock(&confine_lock);
+}
 
 void __init execmem_confine_set_window(phys_addr_t base, phys_addr_t size)
 {
@@ -125,7 +136,7 @@ void *execmem_confine_alloc(struct execmem_range *range, size_t size,
 	struct confine_chunk *ck;
 	struct vm_struct *area;
 	struct page **pages;
-	unsigned long pool_va, vaddr;
+	unsigned long vaddr;
 	unsigned int i, nr;
 	int err;
 
@@ -153,7 +164,7 @@ void *execmem_confine_alloc(struct execmem_range *range, size_t size,
 	if (!area)
 		return NULL;
 
-	pages = kmalloc_array(nr, sizeof(*pages), GFP_KERNEL);
+	pages = kvmalloc_array(nr, sizeof(*pages), GFP_KERNEL);
 	if (!pages)
 		goto err_area;
 
@@ -161,17 +172,26 @@ void *execmem_confine_alloc(struct execmem_range *range, size_t size,
 	if (!ck)
 		goto err_pages;
 
-	mutex_lock(&confine_lock);
-	pool_va = gen_pool_alloc(confine_pool, size);
-	mutex_unlock(&confine_lock);
-	if (!pool_va) {
-		pr_warn_ratelimited("window exhausted, cannot satisfy %zu bytes\n",
-				    size);
-		goto err_ck;
-	}
+	/*
+	 * Draw the backing a page at a time. The pages are vmapped one by one,
+	 * so they need not be physically contiguous; a single gen_pool_alloc()
+	 * of the whole size could fail on a fragmented window with free pages
+	 * to spare.
+	 */
+	for (i = 0; i < nr; i++) {
+		unsigned long page_va;
 
-	for (i = 0; i < nr; i++)
-		pages[i] = virt_to_page((void *)(pool_va + ((unsigned long)i << PAGE_SHIFT)));
+		mutex_lock(&confine_lock);
+		page_va = gen_pool_alloc(confine_pool, PAGE_SIZE);
+		mutex_unlock(&confine_lock);
+		if (!page_va) {
+			pr_warn_ratelimited("window exhausted, cannot satisfy %zu bytes\n",
+					    size);
+			confine_pool_free(pages, i);
+			goto err_ck;
+		}
+		pages[i] = virt_to_page((void *)page_va);
+	}
 
 	vaddr = (unsigned long)area->addr;
 	err = vmap_pages_range(vaddr, vaddr + size, pgprot, pages, PAGE_SHIFT);
@@ -188,7 +208,6 @@ void *execmem_confine_alloc(struct execmem_range *range, size_t size,
 	area->nr_pages = nr;
 
 	ck->area = area;
-	ck->pool_va = pool_va;
 	ck->size = size;
 	ck->pages = pages;
 
@@ -223,16 +242,14 @@ err_map:
 	 * before the pages can be mapped again for someone else.
 	 */
 	flush_tlb_kernel_range(vaddr, vaddr + size);
-	mutex_lock(&confine_lock);
-	gen_pool_free(confine_pool, pool_va, size);
-	mutex_unlock(&confine_lock);
+	confine_pool_free(pages, nr);
 	kfree(ck);
-	kfree(pages);
+	kvfree(pages);
 	return NULL;
 err_ck:
 	kfree(ck);
 err_pages:
-	kfree(pages);
+	kvfree(pages);
 err_area:
 	free_vm_area(area);
 	return NULL;
@@ -262,10 +279,12 @@ bool execmem_confine_free(void *ptr)
 	/*
 	 * We bypass vfree(), so VM_FLUSH_RESET_PERMS does not run for us: drop
 	 * the mapping back to non-executable, writable before tearing it down,
-	 * so the window never retains a stale executable alias.
+	 * so the window never retains a stale executable alias. A failure here
+	 * would leave an executable alias behind, so warn rather than ignore it.
 	 */
-	set_memory_nx(vaddr, nr);
-	set_memory_rw(vaddr, nr);
+	if (set_memory_nx(vaddr, nr) || set_memory_rw(vaddr, nr))
+		pr_warn_ratelimited("could not reset perms on %#lx before freeing\n",
+				    vaddr);
 
 	free_vm_area(ck->area);
 
@@ -276,11 +295,9 @@ bool execmem_confine_free(void *ptr)
 	 */
 	flush_tlb_kernel_range(vaddr, vaddr + ck->size);
 
-	mutex_lock(&confine_lock);
-	gen_pool_free(confine_pool, ck->pool_va, ck->size);
-	mutex_unlock(&confine_lock);
+	confine_pool_free(ck->pages, nr);
 
-	kfree(ck->pages);
+	kvfree(ck->pages);
 	kfree(ck);
 	return true;
 }
@@ -308,13 +325,16 @@ static unsigned long __init execmem_confine_verify(unsigned long *nr_exec_out)
 	/* Every confined allocation is backed by pool pages, inside the window. */
 	mutex_lock(&confine_lock);
 	xa_for_each(&confine_chunks, idx, ck) {
-		phys_addr_t pa = virt_to_phys((void *)ck->pool_va);
-		phys_addr_t end = pa + ck->size - 1;
+		unsigned int i, nr = ck->size >> PAGE_SHIFT;
 
-		if (!phys_in_window(pa) || !phys_in_window(end)) {
-			pr_err("confined chunk at %#lx backs out-of-window phys [%pa, %pa]\n",
-			       (unsigned long)ck->area->addr, &pa, &end);
-			violations++;
+		for (i = 0; i < nr; i++) {
+			phys_addr_t pa = page_to_phys(ck->pages[i]);
+
+			if (!phys_in_window(pa)) {
+				pr_err("confined chunk at %#lx backs out-of-window phys %pa\n",
+				       (unsigned long)ck->area->addr, &pa);
+				violations++;
+			}
 		}
 	}
 	mutex_unlock(&confine_lock);
