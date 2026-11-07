@@ -27,7 +27,7 @@
 };
 
 &smc {
-	smc_gpio_low_stockholm: gpio-low {
+	smc_gpio_low: gpio-low {
 		compatible = "apple,smc-low-gpio";
 		gpio-controller;
 		#gpio-cells = <2>;
@@ -46,7 +46,7 @@
 			     <230 IRQ_TYPE_EDGE_RISING>,
 			     <227 IRQ_TYPE_EDGE_RISING>;
 		interrupt-names = "host-wake", "data-ready", "error";
-		enable-gpios = <&smc_gpio_low_stockholm 0xe GPIO_ACTIVE_HIGH>;
+		enable-gpios = <&smc_gpio_low 0xe GPIO_ACTIVE_HIGH>;
 	};
 };
 
