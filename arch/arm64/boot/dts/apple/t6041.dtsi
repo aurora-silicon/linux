@@ -23,9 +23,6 @@
 /delete-node/ &jpeg0_dart;
 /delete-node/ &jpeg1_dart;
 /delete-node/ &scaler0_dart;
-/delete-node/ &usb4_0_mbox;
-/delete-node/ &usb4_1_mbox;
-/delete-node/ &usb4_2_mbox;
 /delete-node/ &sio_mbox;
 /delete-node/ &pinctrl_smc;
 /delete-node/ &ps_gpx;
@@ -128,19 +125,7 @@
 /delete-node/ &ps_dispext0_fe;
 /delete-node/ &ps_dispext0_cpu;
 /delete-node/ &ps_pcpu0_3;
-/delete-node/ &ps_atc0_cio;
-/delete-node/ &ps_atc0_pcie;
-/delete-node/ &ps_atc0_cio_pcie;
-/delete-node/ &ps_atc0_cio_usb;
-/delete-node/ &ps_atc1_cio;
-/delete-node/ &ps_atc1_pcie;
-/delete-node/ &ps_atc1_cio_pcie;
-/delete-node/ &ps_atc1_cio_usb;
-/delete-node/ &ps_atc2_cio;
-/delete-node/ &ps_atc2_pcie;
-/delete-node/ &ps_atc2_cio_pcie;
 /delete-node/ &ps_pcpu0_4;
-/delete-node/ &ps_atc2_cio_usb;
 /delete-node/ &ps_atc3_cio;
 /delete-node/ &ps_atc3_pcie;
 /delete-node/ &ps_atc3_cio_pcie;
@@ -357,6 +342,8 @@
 /delete-node/ &gfx_mbox;
 /delete-node/ &opp_p0;
 /delete-node/ &opp_p1;
+
+#include "t6040-usb4.dtsi"
 
 / {
 	opp_p0: opp-table-p0 {
