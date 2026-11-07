@@ -275,3 +275,6 @@
 };
 
 #include "hwmon-mini.dtsi"
+
+
+#include "t8112-j473-peripherals.dtsi"

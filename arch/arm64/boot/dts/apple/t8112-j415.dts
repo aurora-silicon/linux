@@ -316,3 +316,6 @@
 &pmp_report_isp_sys {
 	status = "okay";
 };
+
+
+#include "t8112-j415-peripherals.dtsi"
