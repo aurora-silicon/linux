@@ -83,7 +83,7 @@ properties:
       SN012776 only. The DC blocker setting of the amplifier's group, as the
       Mac's boot ADT gives it (its amp-dcblocker-config), copied by the boot
       loader; its first two bytes are DC_BLK0 and DC_BLK1. Absent when the
-      ADT has none, and the registers then keep their reset values.
+      ADT has none; the driver then writes DC_BLK0 = 0x01 and DC_BLK1 = 0x00.
 
   apple,amp-tx-zd-config:
     $ref: /schemas/types.yaml#/definitions/uint8-array
