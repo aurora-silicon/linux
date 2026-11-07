@@ -76,6 +76,9 @@ const _: () = {
     let two = Layout::m5_for(ContextStore::of(2), true);
     assert!(two.bytes == 0x10000 && two.status == 0x4000 && two.auxiliary == 0x8000);
     assert!(matches!(two.viewport, Some(0x9c0)));
+    let max = Layout::m5(&crate::g17::fw::m5::initdata::J716C);
+    assert!(max.bytes == 0x10000 && max.status == 0x4000 && max.auxiliary == 0x8000);
+    assert!(matches!(max.viewport, Some(0x1000)));
     let eight = Layout::m5_for(ContextStore::of(8), false);
     assert!(eight.bytes == 0x14000 && eight.status == 0x8000 && eight.auxiliary == 0xc000);
 };
