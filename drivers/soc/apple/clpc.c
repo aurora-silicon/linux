@@ -76,6 +76,9 @@ enum apple_clpc_rail {
 #define APPLE_CLPC_REASON_HOLD		BIT(4)
 #define APPLE_CLPC_REASON_ANE		BIT(5)
 
+/* A lower GPU busy level must last this long; a higher one applies at once. */
+#define APPLE_CLPC_GPU_DOWN_MS		400
+
 /**
  * struct apple_clpc_hw - per-SoC CLPC parameters
  * @rail: PMC rail of the DCS and of the fabric
@@ -100,13 +103,25 @@ enum apple_clpc_rail {
  *	measured on; SoCs sharing this CLPC without it get no cluster floor
  * @gpu_input: the GPU driver reports its work in flight through
  *	apple_clpc_gpu_get(); while there is some, both rails go to the top
- *	of @map
+ *	of @map, or to @gpu_busy if the driver reports a busy share
  * @idle_on_time: sample every period even with no vote held, instead of
  *	from a deferrable timer
  * @low_power_khz: CPU frequency ceiling of the low-power platform profile,
  *	taken up to the next table frequency; 0 for no platform profile
  * @low_power_mw: package power (the SMC's PHPC key) the low-power profile
  *	holds the CPU clusters to; 0 for none
+ * @gpu_busy: state of each rail for reported GPU work below @gpu_busy_mid,
+ *	@gpu_busy_high and @gpu_busy_top and at or above it; all zero to always
+ *	use the top of @map
+ * @gpu_busy_mid: GPU busy share in permille (apple_clpc_gpu_set_busy())
+ *	from which reported GPU work gets the second column of @gpu_busy
+ * @gpu_busy_high: busy share from which it gets the third column
+ * @gpu_busy_top: busy share from which it gets the top column, as does a
+ *	GPU that reports no share. The share is time spent executing at
+ *	whatever clock the GPU runs, not bandwidth: a 120 fps game reads
+ *	about a third, a scrolling browser a few percent.
+ * @level_khz: frequency @map's quarters are taken from, so that clusters of
+ *	different speed share them; 0 for each cluster's own maximum
  */
 struct apple_clpc_hw {
 	unsigned int rail[APPLE_CLPC_RAILS];
@@ -119,6 +134,11 @@ struct apple_clpc_hw {
 	unsigned int pmp_agent;
 	unsigned int gpu_dense;
 	bool gpu_input;
+	u8 gpu_busy[APPLE_CLPC_RAILS][APPLE_CLPC_LEVELS];
+	unsigned int gpu_busy_mid;
+	unsigned int gpu_busy_high;
+	unsigned int gpu_busy_top;
+	unsigned int level_khz;
 	u8 ane[APPLE_CLPC_RAILS];
 	unsigned int ane_cluster;
 	unsigned int ane_cluster_khz;
@@ -152,6 +172,11 @@ struct apple_clpc_gpu {
 	bool active;
 	u64 updated_ns;
 	u64 sequence;
+	/* Busy share of the last window in permille, if the GPU reports one */
+	unsigned int busy;
+	bool busy_valid;
+	unsigned int level;
+	unsigned long level_since;
 	struct delayed_work *wake;
 };
 
@@ -263,6 +288,26 @@ void apple_clpc_gpu_set_active(struct apple_clpc_gpu *gpu, bool active)
 }
 EXPORT_SYMBOL_GPL(apple_clpc_gpu_set_active);
 
+/**
+ * apple_clpc_gpu_set_busy() - Report the GPU busy share of the last window
+ * @gpu: the GPU input, from apple_clpc_gpu_get()
+ * @permille: share of the window the GPU spent executing work, 0..1000
+ *
+ * Scales the floor that reported GPU work gets, see &struct apple_clpc_hw.gpu_busy.
+ */
+void apple_clpc_gpu_set_busy(struct apple_clpc_gpu *gpu, unsigned int permille)
+{
+	unsigned long flags;
+
+	if (!gpu)
+		return;
+	spin_lock_irqsave(&gpu->lock, flags);
+	gpu->busy = min(permille, 1000U);
+	gpu->busy_valid = true;
+	spin_unlock_irqrestore(&gpu->lock, flags);
+}
+EXPORT_SYMBOL_GPL(apple_clpc_gpu_set_busy);
+
 void apple_clpc_gpu_put(struct apple_clpc_gpu *gpu)
 {
 	if (gpu) {
@@ -329,6 +374,36 @@ int apple_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu **out)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_clpc_gpu_get);
+
+/*
+ * The column of @hw->gpu_busy for reported GPU work, from its busy share.
+ * Called once per CLPC sample: a higher column applies at once, a lower one
+ * at the first sample at least APPLE_CLPC_GPU_DOWN_MS after the last one
+ * that asked for the current column or a higher one.
+ */
+static unsigned int apple_clpc_gpu_level(const struct apple_clpc_hw *hw,
+					 struct apple_clpc_gpu *gpu)
+{
+	unsigned long flags;
+	unsigned int level;
+
+	spin_lock_irqsave(&gpu->lock, flags);
+	if (!gpu->busy_valid || gpu->busy >= hw->gpu_busy_top)
+		level = APPLE_CLPC_LEVELS - 1;
+	else if (gpu->busy >= hw->gpu_busy_high)
+		level = 2;
+	else
+		level = gpu->busy >= hw->gpu_busy_mid ? 1 : 0;
+	if (level >= gpu->level ||
+	    time_after_eq(jiffies, gpu->level_since +
+			  msecs_to_jiffies(APPLE_CLPC_GPU_DOWN_MS))) {
+		gpu->level = level;
+		gpu->level_since = jiffies;
+	}
+	level = gpu->level;
+	spin_unlock_irqrestore(&gpu->lock, flags);
+	return level;
+}
 
 static bool apple_clpc_gpu_active(struct apple_clpc_gpu *gpu, u64 *updated, u64 *sequence)
 {
@@ -536,7 +611,8 @@ static void apple_clpc_sample_cluster(struct apple_clpc *clpc,
 	policy = cpufreq_cpu_get(cl->policy_cpu);
 	if (policy) {
 		if (policy->cpuinfo.max_freq)
-			cl->level = policy->cur * 100 / policy->cpuinfo.max_freq;
+			cl->level = policy->cur * 100 /
+				(clpc->hw->level_khz ?: policy->cpuinfo.max_freq);
 		cpufreq_cpu_put(policy);
 	}
 
@@ -713,22 +789,26 @@ static void apple_clpc_gpu_floor_count(struct apple_clpc *clpc, bool released)
 
 /*
  * The GPU driver's input, where it drives demand instead of the GFX power
- * state: every rail at the top of @map, or at @gpu where that is higher,
- * while the driver reports work.
+ * state: while the driver reports work, every rail at its top state, or at
+ * the gpu_busy state for the busy share the driver reports.
  */
 static bool apple_clpc_gpu_input_demand(const struct apple_clpc_hw *hw,
 					struct apple_clpc_gpu *gpu,
 					unsigned int *demand)
 {
 	u64 updated, sequence;
-	unsigned int rail;
+	unsigned int level, rail;
 
 	if (!gpu || hw->gpu_demand ||
 	    !apple_clpc_gpu_active(gpu, &updated, &sequence))
 		return false;
+	level = apple_clpc_gpu_level(hw, gpu);
 	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
-		demand[rail] = max(demand[rail],
-				   max(hw->map[rail][APPLE_CLPC_LEVELS - 1], hw->gpu[rail]));
+		demand[rail] = max_t(unsigned int, demand[rail],
+				     max_t(unsigned int, hw->gpu[rail],
+					   hw->gpu_busy[APPLE_CLPC_DCS][APPLE_CLPC_LEVELS - 1] ?
+					   hw->gpu_busy[rail][level] :
+					   hw->map[rail][APPLE_CLPC_LEVELS - 1]));
 	return true;
 }
 
@@ -1014,9 +1094,21 @@ static int apple_clpc_status_show(struct seq_file *s, void *unused)
 		   READ_ONCE(clpc->last_floor), READ_ONCE(clpc->last_reason),
 		   READ_ONCE(clpc->last_vote_ns));
 	if (clpc->gpu) {
+		struct apple_clpc_gpu *gpu = clpc->gpu;
+		unsigned int busy, level;
+		unsigned long flags;
 		u64 updated, sequence;
-		bool active = apple_clpc_gpu_active(clpc->gpu, &updated, &sequence);
+		bool active = apple_clpc_gpu_active(gpu, &updated, &sequence);
+		bool busy_valid;
 
+		/* Show the level the last sample chose; reading must not move it. */
+		spin_lock_irqsave(&gpu->lock, flags);
+		busy = gpu->busy;
+		busy_valid = gpu->busy_valid;
+		level = gpu->level;
+		spin_unlock_irqrestore(&gpu->lock, flags);
+		seq_printf(s, "host_gpu busy: %u permille (%s) level %u\n",
+			   busy, busy_valid ? "reported" : "none", level);
 		seq_printf(s, "host_gpu: active %u request_ns %llu sequence %llu\n",
 			   active, updated, sequence);
 	}
@@ -1544,8 +1636,9 @@ static const struct apple_clpc_hw apple_clpc_hw_t8140 = {
 /*
  * T6040: DCS states 0-5 on rail 0, fabric states 0-2 on rail 1. No cluster
  * runs below a quarter of its maximum (P 1260 of 4512 MHz, E 1020 of
- * 2592 MHz), so the first column only completes the table. A busy cluster
- * in the upper half asks for the top states. With the floor held at DCS 5
+ * 2592 MHz), so the first column only completes the table. Both clusters
+ * take their quarters from 4512 MHz, so the E cluster at its top speed
+ * (57 %) gets the third column, not the fourth. With the floor held at DCS 5
  * and fabric 2 the CPUs read 237-242 GB/s at 135 ns DRAM latency, against
  * 41 GB/s and 314 ns at 0 and 0. The second column is provisional until the
  * power of each DCS state is measured.
@@ -1553,24 +1646,34 @@ static const struct apple_clpc_hw apple_clpc_hw_t8140 = {
  * A cluster requests only after three busy samples in a row (12 ms). At idle
  * a single busy sample raised the floor about 60 % of the time, from short
  * bursts of background work; three in a row bring that to about 11 %.
- * GPU demand bypasses the CPU streak and uses the same qualified DCS 5 /
- * fabric 2 states until publication/in-flight demand ends and HOLD_MS expires.
+ * GPU demand bypasses the CPU streak and takes its states from gpu_busy by
+ * the busy share the GPU driver reports, the qualified DCS 5 / fabric 2 at
+ * the top or with no share reported, until publication/in-flight demand
+ * ends and HOLD_MS expires.
  * GFX supplier power cannot drive this input: firmware keeps it always on.
  */
 static const struct apple_clpc_hw apple_clpc_hw_t6040 = {
 	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
 	.map = {
-		[APPLE_CLPC_DCS] = { 1, 2, 5, 5 },
-		[APPLE_CLPC_SOC] = { 0, 1, 2, 2 },
+		[APPLE_CLPC_DCS] = { 1, 1, 3, 4 },
+		[APPLE_CLPC_SOC] = { 0, 0, 0, 0 },
 	},
 	.sustain = 3,
 	.gpu_demand = false,
 	.gpu_input = true,
+	.gpu_busy = {
+		[APPLE_CLPC_DCS] = { 1, 2, 4, 5 },
+		[APPLE_CLPC_SOC] = { 0, 0, 0, 2 },
+	},
+	.gpu_busy_mid = 160,
+	.gpu_busy_high = 500,
+	.gpu_busy_top = 800,
+	.level_khz = 4512000,
 	/*
 	 * ANE work needs two things its own floor (PMC SoC-max: fabric 2)
 	 * does not give it. ResNet-50 streams about 50 MB of weights per
-	 * inference and runs DRAM bound at DCS 0, so hold the DCS 5 / fabric
-	 * 2 a busy CPU cluster gets. And the engine runs at a speed set by
+	 * inference and runs DRAM bound at DCS 0, so hold the qualified
+	 * DCS 5 / fabric 2. And the engine runs at a speed set by
 	 * the frequency of the second P cluster (cpu-map cluster2), whatever
 	 * runs on it: MobileNetV1 takes 65-375 us of engine time (mean 165)
 	 * with that cluster at its idle frequency and 88-91 us with it at
