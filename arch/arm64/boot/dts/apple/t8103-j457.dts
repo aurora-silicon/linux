@@ -151,3 +151,5 @@
 &isp {
 	apple,platform-id = <2>;
 };
+
+#include "t8103-j457-control.dtsi"

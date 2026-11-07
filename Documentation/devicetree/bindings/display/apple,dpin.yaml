@@ -18,6 +18,12 @@ properties:
       - items:
           - const: apple,t6041-dpin
           - const: apple,dpin
+      - items:
+          - const: apple,t8103-dpin
+          - const: apple,dpin
+      - items:
+          - const: apple,t6000-dpin
+          - const: apple,dpin
 
   reg:
     maxItems: 1

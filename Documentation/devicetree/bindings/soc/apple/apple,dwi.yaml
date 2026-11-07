@@ -22,6 +22,12 @@ properties:
       - items:
           - const: apple,t8140-dwi
           - const: apple,dwi
+      - items:
+          - const: apple,t8103-dwi
+          - const: apple,dwi
+      - items:
+          - const: apple,t6000-dwi
+          - const: apple,dwi
 
   reg:
     maxItems: 1
