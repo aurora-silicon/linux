@@ -147,9 +147,9 @@ allOf:
                     compatible:
                       contains:
                         enum:
-                          - apple,t8122-aes
                           - apple,t6030-aes
                           - apple,t6031-aes
+                          - apple,t8122-aes
                 then:
                   properties:
                     reg:

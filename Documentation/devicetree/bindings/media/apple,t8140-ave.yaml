@@ -189,9 +189,9 @@ allOf:
                     compatible:
                       contains:
                         enum:
-                          - apple,t8122-ave
                           - apple,t6030-ave
                           - apple,t6031-ave
+                          - apple,t8122-ave
                 then:
                   properties:
                     reg:

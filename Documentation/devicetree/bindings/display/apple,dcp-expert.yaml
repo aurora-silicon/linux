@@ -20,8 +20,8 @@ select:
       contains:
         enum:
           - apple,t6041-dcp-expert
-          - apple,t8140-dcp-expert
           - apple,t8132-dcp-expert
+          - apple,t8140-dcp-expert
   required:
     - compatible
 

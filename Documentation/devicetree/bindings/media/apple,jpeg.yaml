@@ -186,9 +186,9 @@ allOf:
                     compatible:
                       contains:
                         enum:
-                          - apple,t8122-jpeg
                           - apple,t6030-jpeg
                           - apple,t6031-jpeg
+                          - apple,t8122-jpeg
                 then:
                   properties:
                     power-domains:

@@ -21,10 +21,10 @@ select:
     compatible:
       contains:
         enum:
-          - apple,t8122-dart-smmu
           - apple,t6030-dart-smmu
           - apple,t6031-dart-smmu
           - apple,t6032-dart-smmu
+          - apple,t8122-dart-smmu
           - apple,t8132-dart-smmu
   required:
     - compatible
