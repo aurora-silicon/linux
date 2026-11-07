@@ -16,6 +16,9 @@ properties:
   compatible:
     oneOf:
       - items:
+          - const: apple,t8142-secure-watchdog
+          - const: apple,secure-watchdog
+      - items:
           - const: apple,t8140-secure-watchdog
           - const: apple,secure-watchdog
 
