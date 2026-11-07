@@ -489,6 +489,7 @@ impl Registry {
         fence(Ordering::Acquire);
         let consumer = init.control_consumer()?.load(Ordering::Relaxed);
         let producer = init.control_producer()?.load(Ordering::Relaxed);
+        super::channel::observe_control(consumer, producer);
         let mut freed = 0;
         for mut queue in self
             .compute
@@ -722,7 +723,7 @@ impl Backend {
                 // Creators hold the device mutex, so neither check above can
                 // have changed; the slot only fails on a broken invariant.
                 let slot = admission.reserve_queue()?;
-                firmware.uat.new_execution_context(vm).map(|execution| (execution, slot))
+                firmware.uat.new_execution_context(vm, super::channel::control_witnessed()).map(|execution| (execution, slot))
             } else {
                 Err(ENOSPC)
             };

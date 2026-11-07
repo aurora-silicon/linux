@@ -202,6 +202,7 @@ impl Firmware {
         teardown.publish_ready(&mut service, recovery, super::now_ns())?;
         let consumer = self.init.control_consumer()?.load(Ordering::Relaxed);
         let producer = self.init.control_producer()?.load(Ordering::Relaxed);
+        crate::g17::channel::observe_control(consumer, producer);
         let mut consumed = false;
         while teardown
             .take_consumed(consumer, producer, &mut service)?
