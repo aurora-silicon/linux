@@ -139,6 +139,8 @@ allOf:
         resets:
           maxItems: 1
 
+        dma-coherent: true
+
         interrupts:
           minItems: 2
           items:
