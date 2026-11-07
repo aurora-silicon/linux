@@ -82,8 +82,8 @@
 };
 
 &debug_port2 {
-	swclk-gpios = <&pinctrl_ap 42 GPIO_ACTIVE_HIGH>;
-	swdio-gpios = <&pinctrl_ap 43 GPIO_ACTIVE_HIGH>;
+	swclk-gpios = <&pinctrl 42 GPIO_ACTIVE_HIGH>;
+	swdio-gpios = <&pinctrl 43 GPIO_ACTIVE_HIGH>;
 };
 
 &i2c4 {
