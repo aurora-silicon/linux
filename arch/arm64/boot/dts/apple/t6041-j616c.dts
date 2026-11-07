@@ -910,6 +910,18 @@
 	memory-region = <&aop_mmio_pmgr>;
 };
 
+#include "hwmon-fan-dual.dtsi"
+
+&smc_hwmon {
+	fan-F0Ac {
+		apple,fan-manual-control;
+	};
+
+	fan-F1Ac {
+		apple,fan-manual-control;
+	};
+};
+
 #include "t604x-extdisp.dtsi"
 
 /delete-node/ &atcphy0_xbar;
