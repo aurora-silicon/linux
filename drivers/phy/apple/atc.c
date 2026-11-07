@@ -6717,14 +6717,32 @@ static int atcphy_suspend_noirq(struct device *dev)
 	return 0;
 }
 
+/*
+ * A PHY in a DisplayPort mode doesn't sleep in place, and a sleep that reached its commit
+ * lowered ATC0_COMMON under it, behind its power domain's back: the lanes and the AUX
+ * channel went. Have atcphy_resume() set the tracked mode up again, before the display
+ * controller connects the link anew.
+ */
+static void atcphy_sleep_lost_dp(struct apple_atcphy *atcphy)
+{
+	if (!atcphy->hw->has_t8140_dp || !atcphy->hw->restore_after_pd_off ||
+	    !pm_resume_via_firmware() || !atcphy_modes[atcphy->mode].enable_dp_aux)
+		return;
+	WRITE_ONCE(atcphy->pd_was_off, true);
+	dev_dbg(atcphy->dev, "DisplayPort mode %d lost in the sleep: setting it up again\n",
+		atcphy->mode);
+}
+
 static int atcphy_resume_noirq(struct device *dev)
 {
 	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
 	int ret = 0;
 
 	guard(mutex)(&atcphy->lock);
-	if (!atcphy->hibernated)
+	if (!atcphy->hibernated) {
+		atcphy_sleep_lost_dp(atcphy);
 		return 0;
+	}
 	apple_sleep_usb_set_asleep(false);
 
 	atcphy_usb2_sleep_exit(atcphy);
