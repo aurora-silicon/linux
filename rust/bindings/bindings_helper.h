@@ -73,6 +73,9 @@
 #include <linux/iio/buffer.h>
 #include <linux/iio/iio.h>
 #include <linux/iio/kfifo_buf.h>
+#include <linux/iio/trigger.h>
+#include <linux/iio/trigger_consumer.h>
+#include <linux/iio/triggered_buffer.h>
 #include <linux/iio/types.h>
 #include <linux/input.h>
 #include <linux/interrupt.h>
@@ -158,6 +161,8 @@ const blk_features_t RUST_CONST_HELPER_BLK_FEAT_ROTATIONAL = BLK_FEAT_ROTATIONAL
 const fop_flags_t RUST_CONST_HELPER_FOP_UNSIGNED_OFFSET = FOP_UNSIGNED_OFFSET;
 const u32 RUST_CONST_HELPER_APPLE_RTKIT_COPROC_PLACES_BUFFERS = APPLE_RTKIT_COPROC_PLACES_BUFFERS;
 const u32 RUST_CONST_HELPER_APPLE_RTKIT_NEEDS_COREANALYTICS = APPLE_RTKIT_NEEDS_COREANALYTICS;
+const u32 RUST_CONST_HELPER_APPLE_RTKIT_FIRMWARE_OWNED_CRASHLOG = APPLE_RTKIT_FIRMWARE_OWNED_CRASHLOG;
+const u32 RUST_CONST_HELPER_APPLE_RTKIT_EARLY_CRASHLOG = APPLE_RTKIT_EARLY_CRASHLOG;
 
 const u64 BINDINGS_SNDRV_PCM_FMTBIT_FLOAT_LE = SNDRV_PCM_FMTBIT_FLOAT_LE;
 const u64 BINDINGS_SNDRV_PCM_FMTBIT_S32_LE = SNDRV_PCM_FMTBIT_S32_LE;

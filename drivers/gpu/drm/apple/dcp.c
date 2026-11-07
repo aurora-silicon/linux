@@ -4122,6 +4122,18 @@ static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
 
 #define DCP_BL_FALLBACK_DELAY msecs_to_jiffies(2000)
 
+/*
+ * H17G (M5) internal panel: a pipe stop never comes back (see
+ * iomfb_blank_h17p()), so DPMS blanks the panel and keeps the pipe running.
+ */
+static bool dcp_h17g_panel(struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	       dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G &&
+	       dcp->connector_type == DRM_MODE_CONNECTOR_eDP &&
+	       dcp_has_panel(dcp);
+}
+
 static bool dcp_uses_soft_dpms(struct apple_dcp *dcp)
 {
 	/* The 14.7 panel has its own known-level blank and restore hooks. */
@@ -4209,6 +4221,12 @@ void dcp_poweron(struct platform_device *pdev)
 		ret = dcp_backlight_dpms(dcp, true);
 		if (ret)
 			dev_warn(dcp->dev, "backlight restore unavailable: %d\n", ret);
+		return;
+	}
+
+	if (dcp_h17g_panel(dcp)) {
+		/* The pipe never stopped; the next swap restores the level. */
+		dcp->brightness.update = true;
 		return;
 	}
 
@@ -4336,6 +4354,11 @@ void dcp_poweroff(struct platform_device *pdev)
 		ret = dcp_backlight_dpms(dcp, false);
 		if (ret)
 			dev_warn(dcp->dev, "backlight blank unavailable: %d\n", ret);
+		return;
+	}
+
+	if (dcp_h17g_panel(dcp)) {
+		iomfb_blank_h17p(dcp);
 		return;
 	}
 
