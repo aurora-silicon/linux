@@ -8,9 +8,6 @@ title: Apple AVD (Apple Video Decoder)
 
 description:
   AVD is a video decode block present on all apple silicon devices.
-  The T8132 full-window description is kept disabled until its firmware,
-  reset and driver register-layout contracts are qualified. It does not
-  select the four-window layout used by an enabled decoder driver.
 
 maintainers:
   - Sofus <sofus.c@icloud.com>
@@ -83,7 +80,6 @@ allOf:
         - power-domains
         - clocks
         - status
-
     else:
       properties:
         compatible:

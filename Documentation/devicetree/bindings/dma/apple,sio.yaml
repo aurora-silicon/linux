@@ -12,8 +12,6 @@ description:
   being a pretend DMA controller. The SoC-specific compatible selects the
   firmware protocol and channel configuration. In particular, apple,t6030-sio
   requires protocol-10 boot tables before the coprocessor can be started.
-  The T8132 full-window description remains disabled until its firmware
-  channel layout and handoff are qualified.
 
 maintainers:
   - Martin Povišer <povik+lin@cutebit.org>
@@ -55,9 +53,22 @@ allOf:
                 minItems: 3
                 maxItems: 3
           else:
-            properties:
-              reg:
-                maxItems: 1
+            if:
+              properties:
+                compatible:
+                  contains:
+                    enum:
+                      - apple,t6031-sio
+                      - apple,t8122-sio
+            then:
+              properties:
+                reg:
+                  minItems: 2
+                  maxItems: 2
+            else:
+              properties:
+                reg:
+                  maxItems: 1
 
 properties:
   compatible:
@@ -67,6 +78,8 @@ properties:
               - apple,t6000-sio
               - apple,t6020-sio
               - apple,t6030-sio
+              - apple,t6031-sio
+              - apple,t8122-sio
               - apple,t8103-sio
               - apple,t8112-sio
               - apple,t8132-sio
