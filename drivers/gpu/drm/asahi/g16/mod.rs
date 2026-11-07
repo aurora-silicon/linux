@@ -421,7 +421,8 @@ impl Gpu {
     /// RTKit callbacks hold [`Shared`], which holds the [`Firmware`] (or the [`boot::Orphan`] of a
     /// failed start) until reboot.
     pub(crate) fn retain(&self) {
-        boot::glue::retain_module();
+        // Admission already pinned the module, so this cannot fail.
+        let _ = boot::glue::retain_module();
     }
 }
 

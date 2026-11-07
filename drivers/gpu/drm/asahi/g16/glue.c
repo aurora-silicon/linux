@@ -25,7 +25,8 @@
 
 bool asahi_g16_board(void);
 int asahi_g16_hold_power(struct device *dev);
-void asahi_g16_module_get(void);
+bool asahi_g16_module_try_get(void);
+void asahi_g16_module_put(void);
 bool asahi_g16_ram_disjoint(u64 start, u64 size);
 void __iomem *asahi_g16_ioremap_wc(u64 start, size_t size);
 bool asahi_g16_dma_unsupported(struct device *dev);
@@ -169,10 +170,19 @@ int asahi_g16_hold_power(struct device *dev)
 	return dev->pm_domain ? 0 : -EINVAL;
 }
 
-/* Pin this module until reboot. */
-void asahi_g16_module_get(void)
+/*
+ * Pin this module until reboot, unless its removal has begun: a deferred
+ * probe can run after rmmod has passed its reference check.
+ */
+bool asahi_g16_module_try_get(void)
 {
-	__module_get(THIS_MODULE);
+	return try_module_get(THIS_MODULE);
+}
+
+/* Drop a reference asahi_g16_module_try_get() took. */
+void asahi_g16_module_put(void)
+{
+	module_put(THIS_MODULE);
 }
 
 /* The range is disjoint from System RAM (ADT region admission). */
