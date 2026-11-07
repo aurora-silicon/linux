@@ -52,13 +52,15 @@ const PROP_FASTPATH_PAYLOAD_SIZE: u32 = 81;
 const DEFAULT_HZ: u32 = 50;
 const MAX_HZ: u32 = 200;
 /// How long a direct read waits for the first sample of a new client.
-const FIRST_SAMPLE_MS: i64 = 100;
+const FIRST_SAMPLE_MS: i64 = 500;
 const FIRST_SAMPLE_POLL_MS: i64 = 5;
 const FASTPATH_COMMAND_LEN: usize = 84;
 const FASTPATH_HEADER_LEN: usize = 64;
 const FASTPATH_PAGE_SIZE: usize = 4096;
 const MAX_REPORT_LEN: usize = 108;
 const Q_FRAC_BITS: i32 = 30;
+/// IEEE-754 single 1.0.
+const IDENTITY_W: u32 = 0x3f80_0000;
 
 /// The latest quaternion, in the IIO-defined W, X, Y, Z order.
 #[derive(Clone, Copy, Default)]
@@ -121,11 +123,20 @@ fn decode(report: &[u8]) -> Option<[i32; 4]> {
         // Type 1 is a five-byte state report and has no orientation.
         _ => return None,
     };
-    let x = f32_to_q30(le_u32(report, offset)?)?;
-    let y = f32_to_q30(le_u32(report, offset + 4)?)?;
-    let z = f32_to_q30(le_u32(report, offset + 8)?)?;
-    let w = f32_to_q30(le_u32(report, offset + 12)?)?;
-    Some([w, x, y, z])
+    let bits = [
+        le_u32(report, offset)?,
+        le_u32(report, offset + 4)?,
+        le_u32(report, offset + 8)?,
+        le_u32(report, offset + 12)?,
+    ];
+    // After the AOP starts the fusion engine it publishes the exact identity
+    // quaternion until the filter has its first estimate (about 140 ms on
+    // the M4 Pro). A measured attitude is never bit-exactly the identity.
+    if bits == [0, 0, 0, IDENTITY_W] {
+        return None;
+    }
+    let [x, y, z, w] = bits.map(f32_to_q30);
+    Some([w?, x?, y?, z?])
 }
 
 struct Control {

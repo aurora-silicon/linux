@@ -90,8 +90,10 @@ therefore paces itself: ``sampling_frequency`` (default 50 Hz, 1 to 200 Hz)
 sets how often it polls the buffer, and the client is open only while samples
 are consumed. Enabling the buffer opens the client and disabling it closes it
 with command 26 after writing a zero interval. A direct read without an
-enabled buffer opens the client, waits up to 100 ms for the first sample and
-closes it again. Around system sleep an open client is closed and reopened
+enabled buffer opens the client, waits up to 500 ms for the first sample and
+closes it again. After the AOP starts the fusion engine, the service publishes
+the exact identity quaternion until the filter has its first estimate (about
+140 ms on the M4 Pro); the driver does not report those placeholders. Around system sleep an open client is closed and reopened
 after resume. A failed or timed-out close retains the DMA mapping because the
 firmware may still hold its address. This fused stream needs no separate
 calibration blob.
