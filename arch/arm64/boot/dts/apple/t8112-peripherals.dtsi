@@ -134,7 +134,7 @@
 		status = "disabled";
 	};
 
-	m2_dockchannel_uart: serial@23d128000 {
+	m2_dockchannel_uart: serial@23d12c000 {
 		compatible = "apple,t8112-dockchannel-uart", "apple,dockchannel-uart";
 		reg-names = "data", "config", "irq";
 		reg = <0x2 0x3d12c000 0x0 0x4000>,
