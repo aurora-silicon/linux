@@ -4096,6 +4096,20 @@ static void apple_dart_free_irq(struct apple_dart *dart)
 			apple_dart_display_irq_peers[i] = NULL;
 }
 
+/*
+ * The M4 Macs whose radio DART has the J713's managed stream profile (the
+ * J604 and J773g ADTs map the same two radio streams; the iMacs have no ADT
+ * yet and are assumed to).
+ */
+static const char *const apple_dart_t8132_radio_boards[] = {
+	"apple,j604",
+	"apple,j623",
+	"apple,j624",
+	"apple,j713",
+	"apple,j773g",
+	NULL
+};
+
 static int apple_dart_probe(struct platform_device *pdev)
 {
 	int ret, sid;
@@ -4128,7 +4142,8 @@ static int apple_dart_probe(struct platform_device *pdev)
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 		(res->start == 0x286300000ULL || res->start == 0x48a300000ULL);
 	/* The J713 radio DART's fault interrupt is not described by its loader. */
-	j713_radio = res && !tunneled && of_machine_is_compatible("apple,j713") &&
+	j713_radio = res && !tunneled &&
+		of_machine_compatible_match(apple_dart_t8132_radio_boards) &&
 		of_machine_is_compatible("apple,t8132") &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 		res->start == 0x490000000ULL;
