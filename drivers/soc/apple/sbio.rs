@@ -205,6 +205,24 @@ mod lockout_tests {
     }
 
     #[test]
+    fn assessment_reasons() {
+        use crate::sbio::assessment_reason;
+        let mut a = [0u8; 238];
+        assert_eq!(assessment_reason(&a).0, "too little of the finger, or too light a touch");
+        assert!(assessment_reason(&a).1 == crate::bio::Guidance::Center);
+        a[14..18].copy_from_slice(&205u32.to_le_bytes());
+        assert_eq!(assessment_reason(&a).0, "the finger moved (hold it still)");
+        assert!(assessment_reason(&a).1 == crate::bio::Guidance::TooFast);
+        a[40..44].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(assessment_reason(&a).0, "a wet finger (dry it)");
+        a[64] = 1;
+        assert_eq!(assessment_reason(&a).0, "dirt on the sensor (clean it)");
+        assert!(assessment_reason(&a).1 == crate::bio::Guidance::Clean);
+        let short = assessment_reason(&[0u8; 8]).0;
+        assert_eq!(short, "too little of the finger, or too light a touch");
+    }
+
+    #[test]
     fn lock_state_bits() {
         // 0x0045: identification lockout, biometry lockout, device locked.
         assert_ne!(0x0045 & LOCK_STATE_NEEDS_PASSWORD, 0);
@@ -2877,11 +2895,9 @@ impl SepData {
         }
 
         if assessment[crate::sbio::ASSESS_USABLE_MATCH] == 0 {
-            dev_warn!(
-                self.dev,
-                "verify: the image is not usable for matching (partial contact)\n"
-            );
-            self.retry_cause(bio::Guidance::Center);
+            let (reason, cause) = crate::sbio::assessment_reason(&assessment);
+            dev_warn!(self.dev, "verify: the image is not usable for matching: {}\n", reason);
+            self.retry_cause(cause);
             return bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY);
         }
 
@@ -3985,12 +4001,14 @@ impl SepData {
         }
         let usable = assessment[crate::sbio::ASSESS_USABLE_ENROL] != 0;
         if !usable {
+            let (reason, cause) = crate::sbio::assessment_reason(&assessment);
             dev_info!(
                 self.dev,
-                "enrol: capture {} is not usable for enrolment (partial contact)\n",
-                counter
+                "enrol: capture {} is not usable for enrolment: {}\n",
+                counter,
+                reason
             );
-            return ImageOutcome::Retry(bio::Guidance::Center);
+            return ImageOutcome::Retry(cause);
         }
 
         let Some(result) = self.sbio_enrol_step(&crate::sbio::sbio_enrolment_result()) else {
@@ -7223,6 +7241,46 @@ pub(crate) const ASSESS_USABLE_MATCH: usize = 0x06;
 pub(crate) const ASSESS_USABLE_ENROL: usize = 0x07;
 
 static_assert!(ASSESS_USABLE_MATCH < ASSESS_USABLE_ENROL);
+
+/// The assessment's feedback word, its finger-problem class and its dirt
+/// byte: why the enclave did not use an image.
+const ASSESS_FEEDBACK: usize = 14;
+const ASSESS_PROBLEM: usize = 40;
+const ASSESS_DIRT: usize = 64;
+const FEEDBACK_BAD_IMAGE: u32 = 200;
+const FEEDBACK_BAD_BLOCKS: u32 = 201;
+const FEEDBACK_CHANNEL_NOISE: u32 = 202;
+const FEEDBACK_ARRAY_NOISE: u32 = 204;
+const FEEDBACK_MOVEMENT: u32 = 205;
+const PROBLEM_WET: u32 = 1;
+static_assert!(ASSESS_DIRT < ASSESS_MIN_LEN);
+
+/// Why an image assessment rejected the image, in words for the log. The
+/// reasons are those macOS turns into its status messages (finger moved,
+/// clean the sensor, bad image); with none set the image was simply not
+/// good enough (too little of the finger, too light a touch).
+pub(crate) fn assessment_reason(a: &[u8]) -> (&'static str, crate::bio::Guidance) {
+    use crate::bio::Guidance;
+    let word = |at: usize| {
+        a.get(at..at + 4)
+            .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    if a.get(ASSESS_DIRT).is_some_and(|b| *b != 0) {
+        return ("dirt on the sensor (clean it)", Guidance::Clean);
+    }
+    if word(ASSESS_PROBLEM) == PROBLEM_WET {
+        return ("a wet finger (dry it)", Guidance::Clean);
+    }
+    match word(ASSESS_FEEDBACK) {
+        FEEDBACK_MOVEMENT => ("the finger moved (hold it still)", Guidance::TooFast),
+        FEEDBACK_BAD_IMAGE => ("a bad image", Guidance::LiftAndMove),
+        FEEDBACK_BAD_BLOCKS => ("a bad image (damaged blocks)", Guidance::LiftAndMove),
+        FEEDBACK_CHANNEL_NOISE | FEEDBACK_ARRAY_NOISE => {
+            ("a bad image (sensor noise)", Guidance::LiftAndMove)
+        }
+        _ => ("too little of the finger, or too light a touch", Guidance::Center),
+    }
+}
 
 pub(crate) const SBIO_SESSION_SHARE_LEN: usize = 40;
 
