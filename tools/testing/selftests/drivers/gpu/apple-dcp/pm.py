@@ -428,6 +428,8 @@ int main(void)
      helpers+=ns['function'](s,'atcphy_mux_is_noop')+'\n'
      helpers+=''.join(atc_function(s,name) for name in
        ('atcphy_park_retry_delay','atcphy_park_retry','atcphy_park_due','atcphy_mux_change'))
+     # The mux callback's body, split out so the wake can set the mode it had.
+     helpers+=''.join(atc_function(s,name) for name in ('atcphy_mux_done','atcphy_mux_update_to'))
      helpers+=ns['function'](s,'atcphy_mux_update')+'\n'
      # Lane fixtures provide the target mapping and locked body; use the real callback here.
      # The mux callback powers an idle-power-off PHY first; this PHY is not one.

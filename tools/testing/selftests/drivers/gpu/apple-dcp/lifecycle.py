@@ -1090,7 +1090,7 @@ def teardown(root):
                 'atcphy_park_pipehandler',
                 'atcphy_get_mode_config', 'atcphy_dp_configure',
                 'j700_field_update', 'j700_aux_disable', 'atcphy_disable_dp_aux',
-                'atcphy_power_off', 'atcphy_power_on', *ATC_POST_TUNABLE, 'atcphy_configure', 'atcphy_restore_after_pd_off',
+                'atcphy_power_off', 'atcphy_power_on', *ATC_POST_TUNABLE, 'atcphy_configure', 'atcphy_forget_common_state', 'atcphy_restore_after_pd_off',
                 'atcphy_usb2_init', 'atcphy_usb3_power_off',
                 'atcphy_usb3_route', 'atcphy_usb3_set_mode', 'atcphy_usb2_power_off',
                 '_atcphy_dwc3_reset_assert', 'atcphy_dwc3_reset_assert', 'atcphy_mux_set'),
