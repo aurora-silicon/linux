@@ -561,7 +561,8 @@ static void mt_startup_work(struct work_struct *work)
 		spin_lock_irqsave(&m->response_lock, flags);
 		generation = m->reg_generation;
 		*reg = m->reg_desired;
-		if (m->stopping || generation == m->reg_attempted) {
+		/* Stopped for a sleep, the restart runs this generation again. */
+		if (m->stopping || READ_ONCE(m->hif_suspended) || generation == m->reg_attempted) {
 			spin_unlock_irqrestore(&m->response_lock, flags);
 			kfree(reg);
 			return;

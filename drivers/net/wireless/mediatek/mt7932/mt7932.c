@@ -46,7 +46,8 @@ static void mt_shutdown(struct pci_dev *pdev);
 bool mt_rf_allowed(struct mt7932 *m)
 {
 	return !READ_ONCE(m->stopping) && READ_ONCE(m->rf_ready) && !READ_ONCE(m->reg_pending) &&
-	       !READ_ONCE(m->policy_failed) && !READ_ONCE(m->link_failed);
+	       !READ_ONCE(m->policy_failed) && !READ_ONCE(m->link_failed) &&
+	       !READ_ONCE(m->hif_suspended);
 }
 
 int mt_request_input(struct mt7932 *m, const struct firmware **fw, const char *name)
@@ -132,6 +133,30 @@ static void mt_rx_post(struct mt7932_ring *q, unsigned int index)
 	d->control = cpu_to_le32(MT7932_RX_CAPACITY << 16);
 }
 
+/*
+ * The host interface control command and event, the same ID both ways. The command is
+ * type, direction, stop, suspend in 36 bytes; the event's body is type, TX traffic, RX
+ * traffic, suspend, with at least as many bytes.
+ */
+#define MT7932_CID_HIF_CTRL	0xf6
+#define MT7932_HIF_PCIE		2
+#define MT7932_HIF_IDLE		2
+#define MT7932_HIF_LENGTH	36
+
+/* response_lock held. */
+static void mt_hif_event(struct mt7932 *m, const struct mt7932_event *event)
+{
+	const u8 *body = event->packet + 36;
+
+	if (!m->hif_waiting || event->length < 36 + MT7932_HIF_LENGTH ||
+	    body[0] != MT7932_HIF_PCIE || !!body[3] != m->hif_suspending)
+		return;
+	m->hif_waiting = false;
+	m->hif_result = body[3] && (body[1] != MT7932_HIF_IDLE || body[2] != MT7932_HIF_IDLE) ?
+			-EBUSY : 0;
+	complete(&m->hif_done);
+}
+
 static void mt_receive(struct mt7932 *m, const u8 *packet, size_t length)
 {
 	struct mt7932_event event;
@@ -155,6 +180,10 @@ static void mt_receive(struct mt7932 *m, const u8 *packet, size_t length)
 		return;
 	}
 	spin_lock_irqsave(&m->response_lock, flags);
+	if (event.eid == MT7932_CID_HIF_CTRL) {
+		mt_hif_event(m, &event);
+		goto unlock;
+	}
 	if (event.eid == 0xee) {
 		mt_link_event(m, &event);
 		goto unlock;
@@ -375,6 +404,9 @@ int mt_request_ext(struct mt7932 *m, u8 cid, u8 ext, bool runtime, bool set, boo
 	int ret;
 
 	if (READ_ONCE(m->stopping))
+		return -ESHUTDOWN;
+	/* With the host interface stopped only its own control may reach the BAR. */
+	if (READ_ONCE(m->hif_gate) && !READ_ONCE(m->hif_waiting))
 		return -ESHUTDOWN;
 	if (q->used >= q->slots) {
 		/* Command buffers can wrap only after every published descriptor has
@@ -1106,6 +1138,8 @@ static ssize_t removal_retry_store(struct device *dev,
 }
 static DEVICE_ATTR_WO(removal_retry);
 
+static struct pci_driver mt_driver;
+
 static int mt_retire_dma(struct mt7932 *m)
 {
 	int ret;
@@ -1128,11 +1162,35 @@ static int mt_retire_dma(struct mt7932 *m)
 	return ret;
 }
 
+/*
+ * Removal waits forever for a reset that fails, which a recovery in a worker can't do. So stop
+ * here first, where a failure keeps the function bound. A radio stopped this way stays down
+ * until it's removed, and remove then has nothing left to wait for.
+ */
+static int mt_radio_stop(struct pci_dev *pdev)
+{
+	struct mt7932 *m;
+	int ret = 0;
+
+	device_lock(&pdev->dev);
+	m = pdev->dev.driver == &mt_driver.driver ? pci_get_drvdata(pdev) : NULL;
+	if (m) {
+		mt_stop_host(m);
+		ret = mt_retire_dma(m);
+		if (ret)
+			dev_err(&pdev->dev, "restart refused: DMA still owned: %d\n", ret);
+	}
+	device_unlock(&pdev->dev);
+
+	return ret;
+}
+
 static void mt_remove(struct pci_dev *pdev)
 {
 	struct mt7932 *m = pci_get_drvdata(pdev);
 	int ret;
 
+	apple_piodma_radio_set_stop(NULL);
 	mt_stop_host(m);
 	while ((ret = mt_retire_dma(m))) {
 		WRITE_ONCE(m->removal_error, ret);
@@ -1216,6 +1274,7 @@ static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	init_completion(&m->response);
 	init_completion(&m->cal_response);
 	init_completion(&m->reset_retry);
+	init_completion(&m->hif_done);
 	mutex_init(&m->command_mutex);
 	spin_lock_init(&m->response_lock);
 	ret = mt_ownership(m);
@@ -1251,6 +1310,7 @@ retain:
 	ret = device_create_file(&pdev->dev, &dev_attr_removal_retry);
 	if (ret)
 		dev_warn(&pdev->dev, "removal retry attribute unavailable: %d\n", ret);
+	apple_piodma_radio_set_stop(mt_radio_stop);
 	return 0;
 }
 
@@ -1264,19 +1324,177 @@ static void mt_shutdown(struct pci_dev *pdev)
 	/* Storage remains allocated through reset, even if the engine is stuck. */
 }
 
+/* command_mutex held; the firmware answers once its host interface has changed state. */
+static int mt_hif_ctrl(struct mt7932 *m, bool suspend)
+{
+	u8 body[MT7932_HIF_LENGTH] = { MT7932_HIF_PCIE, 1, suspend, suspend };
+	unsigned long flags;
+	int ret;
+
+	reinit_completion(&m->hif_done);
+	spin_lock_irqsave(&m->response_lock, flags);
+	m->hif_suspending = suspend;
+	m->hif_result = -ETIMEDOUT;
+	m->hif_waiting = true;
+	spin_unlock_irqrestore(&m->response_lock, flags);
+	ret = mt_request(m, MT7932_CID_HIF_CTRL, true, true, false, body, sizeof(body));
+	if (!ret)
+		wait_for_completion_timeout(&m->hif_done, msecs_to_jiffies(1000));
+	spin_lock_irqsave(&m->response_lock, flags);
+	m->hif_waiting = false;
+	if (!ret)
+		ret = m->hif_result;
+	spin_unlock_irqrestore(&m->response_lock, flags);
+	return ret;
+}
+
+/* Every published command and frame retired, ahead of the firmware's own stop. */
+static int mt_hif_tx_idle(struct mt7932 *m)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(500);
+
+	do {
+		mt_data_clean(m);
+		mt_tx_clean(&m->tx[17]);
+		if (!READ_ONCE(m->tx[0].queued) && !m->tx[17].queued)
+			return 0;
+		usleep_range(1000, 2000);
+	} while (time_before(jiffies, deadline));
+	return -EBUSY;
+}
+
+/* Driver own again, DMA back on, then the firmware's host interface. Rings stay as they were. */
+static int mt_hif_restart(struct mt7932 *m)
+{
+	int ret;
+
+	ret = mt_ownership(m);
+	if (ret)
+		return ret;
+	mt_write(m, 0x10188, 0xff);
+	if (mt_read(m, m->rx[0].reg) != lower_32_bits(m->rx[0].dma) ||
+	    mt_read(m, m->tx[17].reg) != lower_32_bits(m->tx[17].dma)) {
+		dev_err(&m->pdev->dev, "DMA rings lost across the sleep: RX0 %#x, TX17 %#x\n",
+			mt_read(m, m->rx[0].reg), mt_read(m, m->tx[17].reg));
+		return -EIO;
+	}
+	mt_write(m, W + 0x208, m->hif_glo);
+	WRITE_ONCE(m->running, true);
+	mt_write(m, W + 0x204, m->irq_mask);
+	mutex_lock(&m->command_mutex);
+	ret = mt_hif_ctrl(m, false);
+	if (!ret)
+		WRITE_ONCE(m->hif_gate, false);
+	mutex_unlock(&m->command_mutex);
+	if (ret) {
+		/* Not left running into the next sleep. */
+		WRITE_ONCE(m->running, false);
+		mt_write(m, W + 0x204, 0);
+		synchronize_irq(pci_irq_vector(m->pdev, 0));
+		mt_write(m, W + 0x204, 0);
+		mt_dma_stop(m);
+		return ret;
+	}
+	WRITE_ONCE(m->hif_suspended, false);
+	/* What arrived or was asked for while stopped, now that it can run. */
+	if (READ_ONCE(m->cal_request_count))
+		schedule_work(&m->cal_work);
+	if (READ_ONCE(m->interface_registered) && READ_ONCE(m->reg_pending))
+		schedule_work(&m->startup_work);
+	if (m->netdev)
+		netif_device_attach(m->netdev);
+	return 0;
+}
+
 /*
- * Stopping the firmware for sleep would take the whole remove and probe
- * sequence, so leave it running across suspend-to-idle. A saved state keeps
- * the PCI core from changing the function's power state or command register,
- * and the awake path keeps the PCIe controller powered until resume.
+ * What macOS does at sleep, without its wake-on-LAN setup: cfg80211 has already left
+ * the network, as no wakeup is configured. The firmware stops its host interface and is
+ * given ownership, and keeps running. PERST# then resets the link, not the firmware.
+ *
+ * Trouble here costs Wi-Fi at the wake, never the machine its sleep.
+ */
+static int mt_hif_suspend(struct mt7932 *m)
+{
+	int ret;
+
+	if (!READ_ONCE(m->ready) || READ_ONCE(m->stopping) || READ_ONCE(m->hif_suspended))
+		return 0;
+	/* New work waits from here, and what already runs finishes before the gate. */
+	WRITE_ONCE(m->hif_suspended, true);
+	if (m->interface_registered) {
+		if (m->netdev)
+			netif_device_detach(m->netdev);
+		flush_work(&m->startup_work);
+		flush_work(&m->connect_work);
+		flush_work(&m->disconnect_work);
+		flush_work(&m->cal_work);
+		flush_work(&m->power_work);
+		mt_abort_scan(m->wiphy, &m->wdev);
+		ret = mt_scan_quiesce(m);
+		if (ret)
+			dev_warn(&m->pdev->dev, "scan still retiring at the sleep: %d\n", ret);
+	}
+	mutex_lock(&m->command_mutex);
+	WRITE_ONCE(m->hif_gate, true);
+	ret = mt_hif_tx_idle(m);
+	if (!ret)
+		ret = mt_hif_ctrl(m, true);
+	mutex_unlock(&m->command_mutex);
+	if (ret)
+		dev_err(&m->pdev->dev, "firmware did not stop its host interface: %d\n", ret);
+	WRITE_ONCE(m->running, false);
+	mt_write(m, W + 0x204, 0);
+	synchronize_irq(pci_irq_vector(m->pdev, 0));
+	mt_write(m, W + 0x204, 0);
+	m->hif_glo = mt_read(m, W + 0x208) & ~(BIT(1) | BIT(3));
+	ret = mt_dma_stop(m);
+	if (ret)
+		dev_err(&m->pdev->dev, "DMA did not stop for the sleep: %d\n", ret);
+	mt_write(m, 0xe0010, 1);
+	ret = mt_poll(m, 0xe0010, BIT(2), BIT(2), 50000);
+	if (ret)
+		dev_err(&m->pdev->dev, "firmware did not take ownership for the sleep: %d\n", ret);
+	else
+		dev_dbg(&m->pdev->dev, "host interface stopped for the sleep, firmware kept\n");
+	return 0;
+}
+
+/*
+ * Stopping the firmware for sleep takes the whole remove and probe sequence, so
+ * leave it running across suspend-to-idle. A saved state keeps the PCI core from
+ * changing the function's power state or command register, and the awake path
+ * keeps the PCIe controller powered until resume.
  */
 static int mt_suspend(struct device *dev)
 {
 	if (!pm_suspend_no_platform())
-		return -EOPNOTSUPP;
+		return mt_hif_suspend(pci_get_drvdata(to_pci_dev(dev)));
 	pci_save_state(to_pci_dev(dev));
 	device_set_awake_path(dev);
 	return 0;
+}
+
+static int mt_resume(struct device *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct mt7932 *m = pci_get_drvdata(pdev);
+	unsigned long flags;
+	int ret;
+
+	if (!READ_ONCE(m->hif_suspended))
+		return 0;
+	/* As macOS does: a chip that no longer answers isn't touched further. */
+	ret = pci_device_is_present(pdev) ? mt_hif_restart(m) : -ENODEV;
+	if (!ret) {
+		dev_dbg(dev, "back after the sleep, firmware kept\n");
+		return 0;
+	}
+	dev_err(dev, "Wi-Fi didn't keep its firmware across the sleep: %d; restarting it\n", ret);
+	spin_lock_irqsave(&m->response_lock, flags);
+	mt_rf_fail_locked(m, ret);
+	spin_unlock_irqrestore(&m->response_lock, flags);
+	apple_piodma_radio_recover();
+	return ret;
 }
 
 /*
@@ -1295,6 +1513,7 @@ static int mt_freeze(struct device *dev)
 
 static const struct dev_pm_ops mt_pm_ops = {
 	.suspend = mt_suspend,
+	.resume = mt_resume,
 	.freeze = mt_freeze,
 	.poweroff = mt_freeze,
 };

@@ -564,7 +564,8 @@ static void mt_cal_work(struct work_struct *work)
 	int ret;
 
 	mutex_lock(&m->command_mutex);
-	if (!READ_ONCE(m->rf_ready))
+	/* Stopped for a sleep, the requests wait for the restart. */
+	if (!READ_ONCE(m->rf_ready) || READ_ONCE(m->hif_suspended))
 		goto unlock;
 	ret = mt_request_input(m, &oca, "mediatek/mt7932/oca2.bin");
 	if (ret)

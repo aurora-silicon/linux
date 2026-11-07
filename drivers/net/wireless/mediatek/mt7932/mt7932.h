@@ -93,6 +93,12 @@ struct mt7932 {
 	bool dma_owned, module_pinned;
 	struct completion reset_retry;
 	int removal_error;
+	/* The firmware keeps running across a deep sleep with its host interface stopped. */
+	struct completion hif_done;
+	int hif_result;
+	u32 hif_glo;
+	/* hif_suspended stops new work; hif_gate then closes the BAR to all but the control. */
+	bool hif_waiting, hif_suspending, hif_suspended, hif_gate;
 	bool ram_config;
 	bool runtime_epoch;
 	bool runtime_cal_valid;
