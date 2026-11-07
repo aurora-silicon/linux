@@ -11,28 +11,25 @@ maintainers:
 
 description: |
   AES hardware attached to the SIO DART. The register banks are the
-  engine and shared control windows, with a third auxiliary window on
-  newer variants. T6000 uses both SIO translation banks for the same stream.
+  engine, shared control and auxiliary control windows, in that order.
 
 properties:
   compatible:
-    oneOf:
-      - items:
-          - const: apple,t6041-aes
-          - const: apple,aes
-      - items:
-          - const: apple,t8140-aes
-          - const: apple,aes
-      - items:
-          - const: apple,t8103-aes
-          - const: apple,aes
-      - items:
-          - const: apple,t6000-aes
-          - const: apple,aes
+    items:
+      - enum:
+          - apple,t6000-aes
+          - apple,t6030-aes
+          - apple,t6031-aes
+          - apple,t6041-aes
+          - apple,t8103-aes
+          - apple,t8122-aes
+          - apple,t8140-aes
+      - const: apple,aes
 
   reg:
     minItems: 2
     maxItems: 3
+    description: Engine and control banks, with an auxiliary bank on later variants.
 
   interrupts:
     maxItems: 1
@@ -56,7 +53,12 @@ allOf:
       properties:
         compatible:
           contains:
-            enum: ["apple,t8103-aes", "apple,t6000-aes"]
+            enum:
+              - apple,t6000-aes
+              - apple,t6030-aes
+              - apple,t6031-aes
+              - apple,t8103-aes
+              - apple,t8122-aes
     then:
       properties:
         reg:

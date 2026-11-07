@@ -19,10 +19,12 @@ properties:
     oneOf:
       - const: apple,t8140-prores
       - items:
-          - const: apple,t6041-prores
-          - const: apple,prores
-      - items:
-          - const: apple,t6000-prores
+          - enum:
+              - apple,t6000-prores
+              - apple,t6030-prores
+              - apple,t6031-prores
+              - apple,t6041-prores
+              - apple,t8122-prores
           - const: apple,prores
 
   reg:
@@ -42,7 +44,8 @@ properties:
     maxItems: 2
 
   iommus:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
 
   power-domains:
     minItems: 1
@@ -62,7 +65,6 @@ properties:
 required:
   - compatible
   - reg
-  - reg-names
   - interrupts
   - iommus
   - power-domains
@@ -72,25 +74,47 @@ allOf:
       properties:
         compatible:
           contains:
-            const: apple,t6041-prores
+            enum:
+              - apple,t6030-prores
+              - apple,t6031-prores
+              - apple,t8122-prores
     then:
       properties:
         reg:
-          minItems: 3
+          minItems: 2
           maxItems: 3
-        reg-names:
-          minItems: 3
-          maxItems: 3
-        interrupts:
+        power-domains:
+          maxItems: 1
+    else:
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6041-prores
+          then:
+            properties:
+              reg:
+                minItems: 3
+                maxItems: 3
+              reg-names:
+                minItems: 3
+                maxItems: 3
+              interrupts:
+                maxItems: 1
+            required:
+              - resets
+          else:
+            properties:
+              reg:
+                maxItems: 2
+              reg-names:
+                maxItems: 2
+      properties:
+        iommus:
           maxItems: 1
       required:
-        - resets
-    else:
-      properties:
-        reg:
-          maxItems: 2
-        reg-names:
-          maxItems: 2
+        - reg-names
 
 additionalProperties: false
 

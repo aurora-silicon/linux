@@ -18,16 +18,20 @@ description:
 properties:
   compatible:
     oneOf:
-      - items:
-          - enum:
-              - apple,t8103-mcc
-              - apple,t6000-mcc
-          - const: apple,mcc
       - enum:
           - apple,t8132-mcc
           - apple,t8140-mcc
       - items:
-          - const: apple,t6041-mcc
+          - enum:
+              - apple,t6000-mcc
+              - apple,t6030-mcc
+              - apple,t6031-mcc
+              - apple,t8103-mcc
+              - apple,t8122-mcc
+          - const: apple,mcc
+      - items:
+          - enum:
+              - apple,t6041-mcc
           - const: apple,t8140-mcc
 
   reg:

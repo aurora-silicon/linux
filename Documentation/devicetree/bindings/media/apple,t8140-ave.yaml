@@ -23,17 +23,17 @@ properties:
           - apple,t8112-ave
           - apple,t8140-ave
       - items:
-          - const: apple,t8103-ave
+          - enum:
+              - apple,t6030-ave
+              - apple,t6031-ave
+              - apple,t8103-ave
+              - apple,t8122-ave
           - const: apple,ave
 
   reg:
     minItems: 3
-    items:
-      - description: Codec registers
-      - description: Mailbox registers
-      - description: Coprocessor registers
-      - description: Power-management registers
-      - description: Firmware PIO aperture
+    maxItems: 5
+    description: Codec, mailbox and coprocessor banks, plus two M3 auxiliary banks.
 
   reg-names:
     minItems: 3
@@ -44,6 +44,9 @@ properties:
       - const: pmgr
       - const: pio
 
+  clocks:
+    maxItems: 1
+
   interrupts:
     items:
       - description: Mailbox, raised when the firmware posts to a host ring
@@ -52,11 +55,8 @@ properties:
       - description: Codec interrupt handled by the firmware
       - description: Codec interrupt handled by the firmware
 
-  clocks:
-    maxItems: 1
-
   power-domains:
-    minItems: 5
+    minItems: 1
     maxItems: 6
 
   power-domain-names:
@@ -84,10 +84,8 @@ properties:
 required:
   - compatible
   - reg
-  - reg-names
   - interrupts
   - power-domains
-  - power-domain-names
   - iommus
 
 allOf:
@@ -95,7 +93,31 @@ allOf:
       properties:
         compatible:
           contains:
-            enum: ["apple,t6041-ave", "apple,t8140-ave"]
+            enum:
+              - apple,t6030-ave
+              - apple,t6031-ave
+              - apple,t8122-ave
+    then:
+      properties:
+        reg:
+          minItems: 5
+        reg-names:
+          maxItems: 3
+    else:
+      properties:
+        power-domains:
+          minItems: 5
+      required:
+        - reg-names
+        - power-domain-names
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t6041-ave
+              - apple,t8112-ave
+              - apple,t8140-ave
     then:
       properties:
         reg:
