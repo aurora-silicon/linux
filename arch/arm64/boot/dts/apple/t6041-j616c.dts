@@ -951,7 +951,7 @@
 			apple,config-index = <5>;
 			apple,input-size = <1920 2160>;
 			apple,output-size = <1280 720>;
-			apple,crop = <0 0 1280 720>;
+			apple,crop = <0 0 1920 1080>;
 		};
 	};
 };
