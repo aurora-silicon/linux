@@ -796,12 +796,6 @@
 		status = "disabled";
 	};
 
-	peripheral_clocks: clock-controller {
-		compatible = "apple,t8103-pmgr-clocks", "apple,pmgr-clocks";
-		#clock-cells = <1>;
-		apple,pmgr = <&pmgr>;
-		status = "disabled";
-	};
 };
 
 &nub_spmi1 {
@@ -848,6 +842,15 @@
 			     <164 IRQ_TYPE_NONE>,
 			     <165 IRQ_TYPE_NONE>,
 			     <166 IRQ_TYPE_NONE>;
+		status = "disabled";
+	};
+};
+
+/ {
+	peripheral_clocks: clock-controller {
+		compatible = "apple,t8103-pmgr-clocks", "apple,pmgr-clocks";
+		#clock-cells = <1>;
+		apple,pmgr = <&pmgr>;
 		status = "disabled";
 	};
 };

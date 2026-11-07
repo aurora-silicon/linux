@@ -28,15 +28,12 @@ properties:
           - const: apple,pwm
 
   reg:
-    minItems: 1
     maxItems: 1
 
   interrupts:
-    minItems: 1
     maxItems: 1
 
   power-domains:
-    minItems: 1
     maxItems: 1
 
 required:

@@ -11,9 +11,6 @@ maintainers:
 
 description: A SPMI controller present on most Apple SoCs
 
-allOf:
-  - $ref: spmi.yaml#
-
 properties:
   compatible:
     oneOf:
@@ -63,6 +60,20 @@ dependentRequired:
   interrupt-controller:
     - "#interrupt-cells"
     - interrupts
+
+# New controller descriptions retain all three windows without changing the
+# register contract of other generations.
+allOf:
+  - $ref: spmi.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum: ["apple,t8103-spmi", "apple,t6000-spmi"]
+    else:
+      properties:
+        reg:
+          maxItems: 1
 
 unevaluatedProperties: false
 
