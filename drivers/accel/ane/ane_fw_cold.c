@@ -1577,6 +1577,13 @@ static void ane_fw_debugfs(struct ane_fw_backend *b)
 		dput(root);
 }
 
+/*
+ * How long dynamic power gating stays off after the last EXECUTE, as on
+ * H16: toggling it around every request costs the H17 engine about 70 us
+ * (gate open plus gate close) of each back-to-back EXECUTE.
+ */
+#define ANE_FW_GATE_HOLD_NS (2 * NSEC_PER_MSEC)
+
 static int ane_fw_program_stage(struct ane_fw_backend *b)
 {
 	int ret;
@@ -1586,6 +1593,7 @@ static int ane_fw_program_stage(struct ane_fw_backend *b)
 				   ANE_FW_TIMEOUT_NS);
 	if (ret)
 		return ret;
+	b->session.gate_hold_ns = ANE_FW_GATE_HOLD_NS;
 	ret = ane_h16_accel_register(&b->pdev->dev, &b->session);
 	if (ret)
 		return ret;
