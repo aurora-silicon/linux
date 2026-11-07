@@ -35,11 +35,11 @@ Command line (bring-up / VM)
         ctxr_exec_enforce=<bool>         (default: enforcing)
 
     ``size`` and ``base`` accept the usual ``K``/``M``/``G`` suffixes, and both
-    are required. The last use of an option wins. The kernel must be at EL2, and
-    when the device tree also carries a window the command-line one must lie
-    inside it: the command line can only pick a window within what the firmware
-    armed, never a different region. A value that doesn't parse is ignored with
-    a warning.
+    are required. The last use of an option wins. The kernel must be at EL2.
+    When the device tree also carries a window, the command-line one is used
+    only if it is identical; a different one is ignored with a warning and the
+    device-tree window is used, because the whole firmware window has to be
+    reserved (see below). A value that doesn't parse is ignored with a warning.
 
 The secondary CPUs can only run code inside the window, and the boot CPU isn't
 confined. So when a window is given but can't be used, the kernel logs why,

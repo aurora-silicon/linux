@@ -240,36 +240,37 @@ bool __init ctxr_exec_secondaries_held(void)
 	return ctxr_hold_cpus;
 }
 
-/* Is [b, b + s) wholly inside [base, base + size)? */
-static bool __init ctxr_within(phys_addr_t b, phys_addr_t s,
-			       phys_addr_t base, phys_addr_t size)
-{
-	return b >= base && b + s <= base + size;
-}
-
 void __init ctxr_exec_reserve(void)
 {
 	phys_addr_t base = 0, size = 0;
 	int dt = ctxr_parse_dt(&base, &size);
+	bool cmd = ctxr_cmd_size;
 
 	/*
 	 * A command-line window and a device-tree window take the same EL2 and
 	 * hold checks: a core confined to the firmware's window can't run this
-	 * kernel from outside it, whichever supplied the bounds. The command
-	 * line can only pick a window inside the firmware's one.
+	 * kernel from outside it, whichever supplied the bounds. The whole
+	 * device-tree window must be reserved, or the part the kernel doesn't
+	 * use reaches the page allocator and EL0 stalls on it on a confined
+	 * core. So a command-line window can only replace the device-tree one
+	 * when it is identical; a different one (a sub-window, say) is ignored.
 	 */
-	if (dt < 0)
+	if (dt < 0) {
 		ctxr_hold_secondaries("malformed aurora,ctxr-exec-window");
-	else if (dt || ctxr_cmd_size) {
-		if (!is_kernel_in_hyp_mode())
+	} else if (dt || cmd) {
+		if (!is_kernel_in_hyp_mode()) {
 			ctxr_hold_secondaries("window given but the kernel is not at EL2");
-		else if (ctxr_cmd_size && dt &&
-			 !ctxr_within(ctxr_cmd_base, ctxr_cmd_size, base, size))
-			ctxr_hold_secondaries("ctxr_exec_window= is not inside the device-tree window");
-		else if (ctxr_cmd_size && !ctxr_establish(ctxr_cmd_base, ctxr_cmd_size))
-			ctxr_hold_secondaries("unusable ctxr_exec_window=");
-		else if (!ctxr_cmd_size && !ctxr_establish(base, size))
+		} else if (cmd && dt &&
+			   (ctxr_cmd_base != base || ctxr_cmd_size != size)) {
+			pr_warn("ignoring ctxr_exec_window=; using the device-tree window\n");
+			if (!ctxr_establish(base, size))
+				ctxr_hold_secondaries("unusable window");
+		} else if (cmd) {
+			if (!ctxr_establish(ctxr_cmd_base, ctxr_cmd_size))
+				ctxr_hold_secondaries("unusable ctxr_exec_window=");
+		} else if (!ctxr_establish(base, size)) {
 			ctxr_hold_secondaries("unusable window");
+		}
 	}
 
 	/*
@@ -278,7 +279,7 @@ void __init ctxr_exec_reserve(void)
 	 * PoC here, before any secondary is released. The boot CPU never reads
 	 * it. See init_kernel_el.
 	 */
-	WRITE_ONCE(ctxr_stay_el2, ctxr_active);
+	WRITE_ONCE(ctxr_stay_el2, ctxr_active && is_kernel_in_hyp_mode());
 	dcache_clean_inval_poc((unsigned long)&ctxr_stay_el2,
 			       (unsigned long)&ctxr_stay_el2 + sizeof(ctxr_stay_el2));
 }
