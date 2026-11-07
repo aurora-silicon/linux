@@ -52,16 +52,20 @@ Qualify availability handling before introducing a calibration handoff.
 | `apr0` and `dart-apr0` | No ProRes engine/DART | The integration ProRes driver matches T8140 only. The existence of APR on this Mac must not be inferred from `pmp_report_prores`, which T6000 deletes. A T6000 report ID and driver port are unqualified. |
 | `scaler0`, `dart-scaler0`, mapper children | No scaler | No matching scaler/CSC driver in integration. |
 | `ave0` and `dart-ave0` | AVE plus two DART windows exist, disabled | Existing T6000 AVE match data does not remove the firmware-loader handoff requirement. Keep disabled; do not treat this as missing MMIO. |
+| `pmp` firmware/performance services | PMP, DART, mailbox and report descriptions exist, but J316s does not enable PMP | Existing [PMP opt-in PR](https://github.com/aurora-silicon/linux/pull/1064) owns the driver/loader coordination. J314s enablement is not J316s qualification. No duplicate status flip is added. |
 | `avd0` PIODMA/window resources | AVD and DART exist; PIODMA additions are separate work | [AVD PIODMA PR](https://github.com/aurora-silicon/linux/pull/710); do not duplicate. Decode functionality is not established by DT validation. |
 | `spi4/dp855`; `lcd-pmicwp`, `lcd-pmic`, `lcd-sswp`, `lcd-ss`, `tcon-registers`, `lcd-eeprom` | No display bridge child | SPI4 description added disabled. No DP855 transport/binding is present; its indirect resources cannot be made ordinary I2C children. |
 | `spi4/display-temp-sens{1,2,3}`, TMP103 at `0x70`–`0x72` | No panel temperature devices | A TMP103 driver exists, but the DP855-mediated bus does not. Adding direct I2C nodes would describe the wrong transport. |
 | `i2c4/sd-card`, address `0x20` | I2C4 exists disabled; PCIe SD reader exists | Auxiliary SD control function lacks a compatible/driver. This is not evidence that the PCIe SD reader is missing. |
 | `pwm1` (`pwm,t6000`), sharing the PWM register region | Only FPWM0 is modeled | Plain PWM and FPWM have different interfaces. No compatible-supported plain-PWM driver was found; do not add a second FPWM device over the same registers. |
 | `dwi`, `dcp-sac-controller`, `dcp0-expert`, `dcpext{0,1}-expert`, `backlight/twodbl`, `sacm` | DCP/panel/PHY/display graph exists | Firmware display functions; no separate matching AP driver. ADT feature and tuning properties are not proof of Linux feature support. |
-| `aes` | No AES device | No matching Apple AES driver. Storage encryption and key ownership require their own implementation. |
+| DP-audio `reset-domains` in the Linux description | Legacy property remains in integration | [T600x/T602x DT cleanup](https://github.com/aurora-silicon/linux/pull/1030) removes it. This is a binding-description defect, not an extra ADT reset controller; avoid duplicating the open fix. |
+| `aes`, `dart-sio/mapper-aes` SID 1 | No AES consumer | No matching Apple AES driver. The SIO DART exists, but adding an orphan mapping is not AES support. Storage encryption and key ownership require their own implementation. |
+| `nub-spmi0/btm`, sharing the primary PMIC's SID 15 | No dedicated BTM function | No matching consumer was established; primary PMIC NVMEM and SMC battery/thermal services are separate existing interfaces. |
 | PMU `info-rtc*`, alarm masks/events, fault and scratchpad functions | Primary PMIC NVMEM cells, SMC RTC/reboot and power services exist | Direct PMIC alarm/RTC functions are not modeled. The SMC RTC interface is a separate existing path; a direct PMIC port needs a driver and interrupt ownership proof. |
 | `smctempsensor0`, `sacm` thermal descriptions | SMC hwmon, laptop and dual-fan descriptions exist; no board DT thermal policy | ADT is not a Linux trip/cooling policy. Additional die channels and a thermal policy need qualified sensor keys and cooling mappings. Dynamic SMC services must be inventoried at runtime to claim complete sensor coverage. |
 | WLAN wake path | Wi-Fi/Bluetooth PCIe children exist; board has no `wakeup-source` | Existing `wifi/brcmf-wowlan-wake` branch contains the associated driver/DT work. Integration lacks its retention/wake implementation; a DT-only flag is insufficient. Physical wake remains unqualified. |
+| `smc-gpio` `wake-events`, `no-resume-restore`, supported interrupt groups | Physical SMC pin bank and virtual SMC GPIO service both exist | Resource description matches the capture. ADT wake/resume policy is not a literal `wakeup-source` conversion; AP/SMC ownership and wake routing need qualification. |
 | `cpu-debug-interface`, `nub-swd0`, `timesync`, `apple-processor-trace` | No corresponding endpoint nodes | Debug/trace/timesync consumers are not matched by integration drivers. |
 
 ## Existing coverage that is not a new gap
@@ -70,6 +74,14 @@ The CPU topology, AIC/timebase, watchdog, GPIO banks, main PMGR, NCO,
 PMP/report transport, SEP and sensor SPI2, ANS/SART, SMC, console UART,
 SPI1 NOR/NVRAM, keyboard/trackpad SPI3, I2C0–5, FPWM0, SIO/ADMAC/MCA,
 ISP and ANE have DTS descriptions. Their presence is not a hardware-test result.
+In particular, `smc-gpio` maps to the existing physical bank at
+`0x290820000`, with 30 pins and AIC IRQs 743–749. It is distinct from
+the SMC protocol's `smc/gpio` service.
+The saved DART mapper identities also match the existing AOP SID 0,
+AOP ADMAC SID 7, SIO SID 0, ADMAC SID 2, ISP SID 0 and ANE SID 0.
+AVD's additional PIODMA/ADS-buffer mapper identities (SIDs 1 and 2) are
+not equivalent to the existing AVD SID-0 attachment; the remaining resource
+and consumer work is tracked with the AVD gap above.
 
 The three external USB-C ports have ATC PHY, USB DRD/DART, ACIO CPU/mailbox,
 NHI, PCIe tunnel and graph descriptions. The fourth ATC is the HDMI path;

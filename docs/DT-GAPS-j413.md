@@ -19,6 +19,7 @@ public source. See [the audit method](DT-AUDIT-METHOD.md).
 | `/arm-io/spi4`: physical `0x235110000`, size `0x4000`, AIC IRQ 752 | Describe SPI4, disabled | `drivers/spi/spi-apple.c`; no DP855 child or pin configuration is enabled. |
 | `/arm-io/nub-spmi1`: first window at `0x23d794000` | Describe the polled controller window, disabled | `drivers/spmi/spmi-apple-controller.c`; no auxiliary PMIC function is enabled. |
 | `nub-spmi1/pmu-aux`, Vale at SID 14 | Describe a read-only NVMEM provider below the disabled bus and document Vale identity | `drivers/nvmem/apple-spmi-nvmem.c`; no regulator map or extra NVMEM cells are inferred. |
+| `dp-audio0`, `dp-audio1`: SIO channels `0x64` and `0x66`, with their own PMGR gates | Add a T8112 binding and remove the unused `reset-domains` properties | `drivers/gpu/drm/apple/audio.c` matches `apple,dpaudio`; DMA, power and graph routes are retained. |
 | `/arm-io/aop-spmi0`, `aop-spmi1`: first windows at `0x24a894000`, `0x24a8d4000` | Describe both polled controller windows, disabled | Same driver; no AP bus ownership transfer, interrupt-controller mode, radio or NFC child is enabled. |
 
 The peripheral descriptions are in `t8112.dtsi`; other T8112 boards inherit
@@ -45,16 +46,21 @@ independent prerequisite. Qualify availability handling before loader handoff.
 | `scaler0`, `dart-scaler`, mapper children | No scaler/CSC node | No matching Apple scaler driver in integration. |
 | `dart-scdc` | No corresponding IOMMU/consumer | No qualified SCDC consumer path; a standalone orphan DART is not functional codec support. |
 | `ave`, `dart-ave` | AVE and two DART windows exist disabled | T8112 match data exists, but firmware/loader handoff is still required. Keep disabled. |
+| `pmp` firmware/performance services | PMP, DART, mailbox and report nodes exist, but PMP remains disabled | Existing [PMP opt-in PR](https://github.com/aurora-silicon/linux/pull/1064) owns the driver/loader and AVD performance coordination. Do not add an isolated status flip. |
 | AVD PIODMA/resource windows | AVD/DART present | [AVD PIODMA PR](https://github.com/aurora-silicon/linux/pull/710) owns the additional description. Do not duplicate it. |
 | `spi4/dp855`; its `lcd-pmicwp`, `lcd-pmic`, `lcd-sswp`, `lcd-ss`, `tcon-registers`, `lcd-eeprom` | No bridge child | SPI4 described disabled. There is no DP855 bus/transport binding in integration; these are indirect display resources. |
 | `i2c2/atcrt0` at `0x18`, `atcrt1` at `0x19`; their `AppleTypeCRetimer` children | I2C2 exists disabled, no retimer children | ADT compatible is only `atcrt`; no matching driver/binding. Generic Type-C retimer support does not identify this hardware. Graph insertion waits for a real binding. |
 | `i2c4/avellino-pre` at `0x77`, `avellino-post` at `0x44` | I2C4 enabled, no children | No compatible or qualified driver is provided by the capture; do not invent one from the device names. |
 | Plain `pwm` at `0x235040000` | FPWM1 at `0x235044000` exists for keyboard backlight | Distinct plain-PWM interface; no matching driver established. It must not be aliased to the FPWM driver. |
 | `dwi`, `lcd0-sac`, `dcp0-expert`, `dcpext-expert`, `dcp-sac-controller`, backlight and `sacm` | DCP/panel and external display graphs exist | Firmware display services and feature/policy descriptions, with no separate AP driver. Their presence does not prove Linux display-feature parity. |
-| `aes` | No AES node | No matching Apple AES driver; storage/key ownership needs separate implementation. |
+| `dp-audio0/1` resource properties | DTS carried `reset-domains` and legacy register windows; no T8112 schema existed | Add the binding and drop the ignored reset property. The capture has DMA/gate identities but no `reg`; existing register windows are retained as an optional legacy description and remain unqualified by this capture. The firmware audio driver does not map them. |
+| `aes`, `dart-sio/mapper-aes` SID 1 | No AES consumer | No matching Apple AES driver. The existing SIO DART is not an AES implementation; storage/key ownership needs separate support. |
+| `dart-aop/mapper-scm`, SID 6 | No corresponding consumer | The capture names this additional mapper but does not establish a matching Linux driver or ownership handoff. Do not attach it to the ADMAC SID-10 stream by analogy. |
+| `nub-spmi0/btm`, sharing primary PMIC SID 14 | No dedicated BTM function | No matching consumer was established. Existing PMIC NVMEM and SMC battery/thermal services are separate interfaces. |
 | PMU `info-rtc*`, alarm control/masks/events, fault and scratchpad functions | Stowe NVMEM cells plus SMC RTC/reboot/power services | Direct PMIC RTC/alarm is not modeled. Existing SMC RTC is a separate path; no T8112 direct-PMIC alarm driver is established. |
 | `smctempsensor0`, firmware thermal descriptions | SMC hwmon and laptop sensor nodes; no J413 DT trip/cooling policy | More sensor channels and a policy require qualified keys/cooling mappings. Runtime SMC enumeration is needed for a complete sensor inventory. ADT does not justify invented trip values. |
 | WLAN wake wiring | Wi-Fi/Bluetooth PCIe children present, no board `wakeup-source` | Existing `wifi/brcmf-wowlan-wake` branch supplies the associated driver and DT work. Integration lacks that retention/wake implementation. Physical wake is unqualified. |
+| `smc-gpio` `wake-events`, `no-resume-restore`, supported interrupt groups | Physical SMC pin bank and virtual SMC GPIO service both exist | Resource description matches the capture. ADT wake/resume policy is not a literal `wakeup-source` conversion; AP/SMC ownership and wake routing remain unqualified. |
 | `cpu-debug-interface`, `aft`, `timesync`, `apple-processor-trace` | No corresponding endpoint nodes | No qualified matching integration consumers. |
 
 ## Existing coverage that is not a new gap
@@ -64,6 +70,13 @@ NCO, PMP/report transport, SEP, SPI2 fingerprint sensor, ANS/SART, SMC,
 UART and dockchannel/MTP input stack, SPI1 NOR/NVRAM, I2C0–4, FPWM1,
 SIO/ADMAC/MCA, ISP and ANE are described. J413 has no integrated SD-card
 reader or HDMI connector in this capture; neither is a missing board node.
+The physical SMC GPIO bank at `0x23e820000` already has the capture's
+18 pins and AIC IRQs 490–496. It is distinct from `smc/gpio`, the virtual
+SMC protocol provider.
+The DART mapper identities match existing AOP SID 0, AOP ADMAC SID 10,
+SIO SID 0, ADMAC SID 2, ISP SID 0 and ANE SID 0. AVD's additional
+PIODMA/ADS-buffer mappers (SIDs 1 and 2) must not be conflated with the
+existing SID-0 attachment; remaining consumer work is recorded above.
 
 Both Type-C ports have ATC PHY, USB DRD/DART, ACIO processor/mailbox,
 NHI, PCIe tunnel and display graph descriptions. The two unmodeled retimers
