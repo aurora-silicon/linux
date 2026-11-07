@@ -301,6 +301,10 @@
 };
 
 / {
+	/*
+	 * The loader fills the operating points, the CS and AFR tables and the
+	 * memory regions, and disables the GPU again on anything unexpected.
+	 */
 	gpu: gpu@288000000 {
 		compatible = "apple,agx-t6041";
 		reg = <0x2 0x8a600000 0x0 0x88000>,
@@ -308,7 +312,6 @@
 		reg-names = "asc", "sgx";
 		mboxes = <&agx_mbox>;
 		power-domains = <&ps_gfx>;
-		status = "disabled";
 	};
 
 	agx_mbox: mailbox@28a600000 {
@@ -323,7 +326,6 @@
 		apple,firmware-role = "GFX";
 		power-domains = <&ps_gfx>;
 		#mbox-cells = <0>;
-		status = "disabled";
 	};
 };
 
