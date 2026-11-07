@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/apple,m2-dpin.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple M2 generation DisplayPort input
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  DisplayPort input resources on M2 generation SoCs. The register apertures
+  follow hardware resource order. Firmware configuration and tuning are
+  supplied by the bootloader and are not part of this binding. Unqualified
+  instances must remain disabled.
+
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6020-dpin
+          - apple,t6021-dpin
+          - apple,t6022-dpin
+          - apple,t8112-dpin
+  required:
+    - compatible
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t6020-dpin
+          - apple,t6021-dpin
+          - apple,t6022-dpin
+          - apple,t8112-dpin
+      - const: apple,dpin
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+  - interrupts
+
+additionalProperties: false

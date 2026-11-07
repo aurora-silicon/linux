@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Additional T8112 hardware resources. Keep unqualified blocks disabled. */
+
+&{/soc} {
+	m2_aop_spmi0_sideband: spmi-sideband@24a884000 {
+		compatible = "apple,t8112-spmi-sideband", "apple,spmi-sideband";
+		reg = <0x2 0x4a884000 0x0 0x4000>;
+		status = "disabled";
+	};
+
+	m2_aop_spmi0: spmi@24a894000 {
+		compatible = "apple,t8112-spmi", "apple,spmi";
+		reg = <0x2 0x4a894000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 353 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		status = "disabled";
+	};
+};

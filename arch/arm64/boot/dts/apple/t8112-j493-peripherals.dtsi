@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Additional T8112 hardware resources. Keep unqualified blocks disabled. */
+
+&{/soc} {
+	m2_spi4: spi@235110000 {
+		compatible = "apple,t8112-spi", "apple,spi";
+		reg = <0x2 0x35110000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 752 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_spi4>;
+		clocks = <&clkref>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+};
