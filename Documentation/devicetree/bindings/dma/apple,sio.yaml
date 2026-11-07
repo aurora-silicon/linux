@@ -12,28 +12,111 @@ description:
   being a pretend DMA controller. The SoC-specific compatible selects the
   firmware protocol and channel configuration. In particular, apple,t6030-sio
   requires protocol-10 boot tables before the coprocessor can be started.
+  The T8132 full-window description remains disabled until its firmware
+  channel layout and handoff are qualified.
 
 maintainers:
   - Martin Povišer <povik+lin@cutebit.org>
 
-select:
-  properties:
-    compatible:
-      contains:
-        enum:
-          - apple,t6000-sio
-          - apple,t6020-sio
-          - apple,t6030-sio
-          - apple,t6041-sio
-          - apple,t8103-sio
-          - apple,t8112-sio
-          - apple,t8132-sio
-          - apple,t8140-sio
-  required:
-    - compatible
+allOf:
+  - $ref: dma-controller.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8132-sio
+      required:
+        - compatible
+    then:
+      properties:
+        reg:
+          minItems: 2
+          maxItems: 2
+        clocks:
+          minItems: 3
+          maxItems: 3
+        status:
+          const: disabled
+      required:
+        - clocks
+        - status
+    else:
+      required:
+        - dma-channels
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t8140-sio
+          then:
+            properties:
+              reg:
+                minItems: 3
+                maxItems: 3
+          else:
+            properties:
+              reg:
+                maxItems: 1
 
 properties:
-  compatible: true
+  compatible:
+    oneOf:
+      - items:
+          - enum:
+              - apple,t6000-sio
+              - apple,t6020-sio
+              - apple,t6030-sio
+              - apple,t8103-sio
+              - apple,t8112-sio
+              - apple,t8132-sio
+              - apple,t8140-sio
+          - const: apple,sio
+      - description: T6041 firmware requires a generation-specific backend.
+        const: apple,t6041-sio
+
+  reg:
+    minItems: 1
+    maxItems: 3
+    description: |
+      Coprocessor control registers. T8140 also publishes an auxiliary ASC
+      window and the remaining ASC registers after the mailbox window.
+      The mailbox registers are described by the mailbox provider.
+
+  clocks:
+    minItems: 1
+    maxItems: 3
+
+  status: true
+
+  '#dma-cells':
+    const: 1
+    description:
+      DMA clients specify a single cell that corresponds to the RTKit endpoint
+      number used for arranging the transfers in question
+
+  dma-channels:
+    maximum: 128
+
+  mboxes:
+    maxItems: 1
+
+  iommus:
+    maxItems: 1
+
+  power-domains:
+    maxItems: 1
+
+  resets:
+    maxItems: 1
+
+  memory-region:
+    minItems: 2
+    maxItems: 8
+    description:
+      A number of references to reserved memory regions among which are the DATA/TEXT
+      sections of coprocessor executable firmware and also auxiliary firmware data
+      describing the available DMA-enabled peripherals
 
   apple,sio-firmware-params:
     $ref: /schemas/types.yaml#/definitions/uint32-array
@@ -63,161 +146,15 @@ properties:
          is done upfront in the loader which can be better suited for keeping up with
          Apple's firmware changes.
 
-allOf:
-  - if:
-      properties:
-        compatible:
-          contains:
-            const: apple,t8132-sio
-      required:
-        - compatible
-    then:
-      allOf:
-        - $ref: dma-controller.yaml#
-      properties:
-        compatible:
-          items:
-            - const: apple,t8132-sio
-            - const: apple,sio
-        reg:
-          minItems: 2
-          maxItems: 2
-        clocks:
-          minItems: 3
-          maxItems: 3
-        '#dma-cells':
-          const: 1
-        mboxes:
-          maxItems: 1
-        iommus:
-          maxItems: 1
-        power-domains:
-          maxItems: 1
-        status:
-          const: disabled
-      required:
-        - compatible
-        - reg
-        - clocks
-        - '#dma-cells'
-        - mboxes
-        - iommus
-        - power-domains
-        - status
-    else:
-      allOf:
-        - $ref: dma-controller.yaml#
-        - if:
-            properties:
-              compatible:
-                contains:
-                  const: apple,t8140-sio
-          then:
-            properties:
-              reg:
-                minItems: 3
-                maxItems: 3
-          else:
-            properties:
-              reg:
-                maxItems: 1
+required:
+  - compatible
+  - reg
+  - '#dma-cells'
+  - mboxes
+  - iommus
+  - power-domains
 
-      properties:
-        compatible:
-          oneOf:
-            - items:
-                - enum:
-                    - apple,t6000-sio
-                    - apple,t6020-sio
-                    - apple,t6030-sio
-                    - apple,t8103-sio
-                    - apple,t8112-sio
-                    - apple,t8140-sio
-                - const: apple,sio
-            - description: T6041 firmware requires a generation-specific backend.
-              const: apple,t6041-sio
-
-        reg:
-          minItems: 1
-          maxItems: 3
-          description: |
-            Coprocessor control registers. T8140 also publishes an auxiliary ASC
-            window and the remaining ASC registers after the mailbox window.
-            The mailbox registers are described by the mailbox provider.
-
-        clocks:
-          minItems: 1
-          maxItems: 3
-
-        '#dma-cells':
-          const: 1
-          description:
-            DMA clients specify a single cell that corresponds to the RTKit endpoint
-            number used for arranging the transfers in question
-
-        dma-channels:
-          maximum: 128
-
-        mboxes:
-          maxItems: 1
-
-        iommus:
-          maxItems: 1
-
-        power-domains:
-          maxItems: 1
-
-        resets:
-          maxItems: 1
-
-        memory-region:
-          minItems: 2
-          maxItems: 8
-          description:
-            A number of references to reserved memory regions among which are the DATA/TEXT
-            sections of coprocessor executable firmware and also auxiliary firmware data
-            describing the available DMA-enabled peripherals
-
-        apple,sio-firmware-params:
-          $ref: /schemas/types.yaml#/definitions/uint32-array
-          description: |
-            Parameters in the form of opaque key/value pairs that are to be sent to the SIO
-            coprocesssor once it boots. These parameters can point into the reserved memory
-            regions (in device address space).
-
-            Note that unlike Apple's firmware, we treat the parameters, and the data they
-            refer to, as opaque. Apple embed short data blobs into their SIO devicetree node
-            that describe the DMA-enabled peripherals (presumably with defined semantics).
-            Their driver processes those blobs and sets up data structure in mapped device
-            memory, then references this memory in the parameters sent to the SIO. At the
-            level of description we are opting for in this binding, we assume the job of
-            constructing those data structures has been done in advance, leaving behind an
-            opaque list of key/value parameter pairs to be sent by a prospective driver.
-
-            This approach is chosen for two reasons:
-
-             - It means we don't need to try to understand the semantics of Apple's blobs
-               as long as we know the transformation we need to do from Apple's devicetree
-               data to SIO data (which can be shoved away into a loader). It also means the
-               semantics of Apple's blobs (or of something to replace them) need not be part
-               of the binding and be kept up with Apple's firmware changes in the future.
-
-             - It leaves less work for the driver attaching on this binding. Instead the work
-               is done upfront in the loader which can be better suited for keeping up with
-               Apple's firmware changes.
-
-      required:
-        - compatible
-        - reg
-        - '#dma-cells'
-        - dma-channels
-        - mboxes
-        - iommus
-        - power-domains
-
-      additionalProperties: false
-
-unevaluatedProperties: false
+additionalProperties: false
 
 examples:
   - |
