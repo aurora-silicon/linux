@@ -72,7 +72,7 @@ pub(crate) const CONFIG: Config = Config {
                     0xdc, 0x36, 0x66, 0x76, 0x36, 0x00,
                 ],
             }],
-            variant: &crate::g17::fw::variant::V26B123_M5,
+            variant: &crate::g17::fw::variant::V26C5035_M5,
             config: None,
         },
         crate::g17::fw::variant::Build {
