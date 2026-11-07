@@ -54,6 +54,28 @@
 	status = "okay";
 };
 
+/* The mics and the ambient light sensor, as on the M1 iMacs; untested here. */
+&aop_mbox {
+	status = "okay";
+};
+
+&aop_dart {
+	status = "okay";
+};
+
+&aop_admac {
+	status = "okay";
+};
+
+&aop {
+	status = "okay";
+};
+
+&aop_audio {
+	apple,chassis-name = "J433";
+	apple,machine-kind = "iMac";
+};
+
 &i2c1 {
 	jack_codec: codec@4b {
 		compatible = "cirrus,cs42l84";
