@@ -12,7 +12,7 @@
 
 #define DCP_M4_TIMING_TOKENS 2048
 
-/* The first qualified J713 physical mode, not a generic panel-mode fallback. */
+/* The profile's qualified physical mode, not a generic panel-mode fallback. */
 struct dcp_m4_timing {
 	u32 id, color_id;
 	u32 hdisplay, hsync_start, hsync_end, htotal;
@@ -148,12 +148,11 @@ static inline int dcp_m4_timing_axis(const struct dcp_m4_timing_parser *p,
 		"Active", "Total", "FrontPorch", "SyncWidth", "BackPorch", "PreciseSyncRate",
 		"SyncPolarity", "PixelRepetition",
 	};
-	static const u32 values[2][8] = {
-		{ 2560, 2640, 8, 32, 40, 6877358, 1, 0 },
-		{ 1664, 1749, 33, 8, 44, 3932166, 1, 0 },
-	};
+	const u32 (*values)[8] = dcp_m4_pf->timing;
 	int axis = dcp_m4_timing_field(p, mode, name, 1);
 
+	if (!values)
+		return -ENODEV;
 	if (axis < 0)
 		return axis;
 	for (unsigned int i = 0; i < 8; i++)
@@ -171,7 +170,10 @@ static inline int dcp_m4_parse_timing(const void *data, size_t size, struct dcp_
 	};
 	static const u32 color_values[] = { 1, 8, 0, 0, 0, 16, 0 };
 	int ret = -EINVAL, colors, color;
+	const u32 *h, *v;
 
+	if (!dcp_m4_pf->timing)
+		return -ENODEV;
 	if (!data || !out || size < 4 || size > (1U << 20) || get_unaligned_le32(data) != 0xd3)
 		return -EINVAL;
 	p = kzalloc(sizeof(*p), GFP_KERNEL);
@@ -207,12 +209,16 @@ static inline int dcp_m4_parse_timing(const void *data, size_t size, struct dcp_
 	for (unsigned int i = 0; i < 7; i++)
 		if (!dcp_m4_timing_equals(p, color, color_fields[i], 4, color_values[i]))
 			goto done;
+	h = dcp_m4_pf->timing[0];
+	v = dcp_m4_pf->timing[1];
 	*out = (struct dcp_m4_timing) {
 		.id = 2, .color_id = 1,
-		.hdisplay = 2560, .hsync_start = 2568, .hsync_end = 2600, .htotal = 2640,
-		.vdisplay = 1664, .vsync_start = 1697, .vsync_end = 1705, .vtotal = 1749,
-		.clock_khz = ((2640ULL * 1749 * 3932166 >> 16) + 500) / 1000,
-		.refresh_16_16 = 3932166,
+		.hdisplay = h[0], .hsync_start = h[0] + h[2],
+		.hsync_end = h[0] + h[2] + h[3], .htotal = h[1],
+		.vdisplay = v[0], .vsync_start = v[0] + v[2],
+		.vsync_end = v[0] + v[2] + v[3], .vtotal = v[1],
+		.clock_khz = (((u64)h[1] * v[1] * v[5] >> 16) + 500) / 1000,
+		.refresh_16_16 = v[5],
 	};
 	ret = 0;
 done:

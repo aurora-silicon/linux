@@ -1,0 +1,77 @@
+name: Device tree checks
+
+# Every Apple device tree is validated against its dt-schema bindings (CHECK_DTBS) at the
+# base and at the head of the change; a warning the base does not have fails the job, and
+# every binding the change adds or edits must pass dt_binding_check. This keeps the
+# "describe every device" work from regressing while the existing warnings are burnt down.
+
+on:
+  pull_request:
+    branches: [integration/aurora, aurora-wip]
+    paths:
+      - 'arch/arm64/boot/dts/apple/**'
+      - 'Documentation/devicetree/bindings/**'
+      - 'include/dt-bindings/**'
+      - 'scripts/dtc/**'
+      - '.github/workflows/dt-checks.yml'
+  push:
+    branches: [integration/aurora]
+    paths:
+      - 'arch/arm64/boot/dts/apple/**'
+      - 'Documentation/devicetree/bindings/**'
+      - 'include/dt-bindings/**'
+      - 'scripts/dtc/**'
+      - '.github/workflows/dt-checks.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dt-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CLANG_VERSION: '18'
+
+jobs:
+  dt-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: tree:0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q flex bison bc libyaml-dev clang-$CLANG_VERSION lld-$CLANG_VERSION llvm-$CLANG_VERSION
+          echo "/usr/lib/llvm-$CLANG_VERSION/bin" >> "$GITHUB_PATH"
+          pip install --quiet dtschema yamllint
+
+      - name: CHECK_DTBS and dt_binding_check, base vs head
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          head=$(git rev-parse HEAD)
+          # A pull request is checked out as its merge into the CURRENT base branch tip, which is
+          # HEAD^1 (pull_request.base.sha can be the stale tip from when the PR was opened).
+          if [ "$EVENT" = pull_request ]; then base=$(git rev-parse HEAD^1); else base=$BEFORE; fi
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then base=$(git rev-parse HEAD~1); fi
+          scripts/dtc/apple-dt-check.sh "$base" "$head" "$RUNNER_TEMP/dt"
+
+      - name: Keep the warning lists
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dt-check-warnings
+          path: |
+            ${{ runner.temp }}/dt/*.warn
+          if-no-files-found: ignore

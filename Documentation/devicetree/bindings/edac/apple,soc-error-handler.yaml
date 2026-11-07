@@ -35,10 +35,13 @@ properties:
     maxItems: 89
 
   reg:
-    minItems: 25
+    minItems: 10
     maxItems: 25
     description: |
-      T6041 per-source NI0 through NI6 status apertures, in interrupt order.
+      T6041 uses the qualified per-source NI status apertures in interrupt
+      order. T8140 publishes its native error/event register banks in
+      hardware-description order; their presence does not establish safe
+      AP access and the instances remain disabled until qualified.
 
 required:
   - compatible
@@ -55,6 +58,9 @@ allOf:
         interrupts:
           minItems: 89
           maxItems: 89
+        reg:
+          minItems: 25
+          maxItems: 25
       required:
         - reg
   - if:
@@ -67,6 +73,9 @@ allOf:
         interrupts:
           minItems: 26
           maxItems: 26
+        reg:
+          minItems: 17
+          maxItems: 17
   - if:
       properties:
         compatible:
@@ -87,6 +96,9 @@ allOf:
         interrupts:
           minItems: 9
           maxItems: 9
+        reg:
+          minItems: 10
+          maxItems: 10
 
 additionalProperties: false
 
