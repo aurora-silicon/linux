@@ -17,6 +17,12 @@ properties:
   compatible:
     oneOf:
       - items:
+          - const: apple,t8142-pciec-piodma
+          - const: apple,pciec-piodma
+      - items:
+          - const: apple,t8152-pciec-piodma
+          - const: apple,pciec-piodma
+      - items:
           - const: apple,t6041-pciec-piodma
           - const: apple,pciec-piodma
       - items:
