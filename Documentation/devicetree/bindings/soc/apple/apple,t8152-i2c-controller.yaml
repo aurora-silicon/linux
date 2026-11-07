@@ -41,6 +41,10 @@ properties:
     minItems: 1
     maxItems: 1
 
+  clocks:
+    description: The 24 MHz reference clock.
+    maxItems: 1
+
 required:
   - compatible
   - reg

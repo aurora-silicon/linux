@@ -437,6 +437,7 @@
 		reg = <0x3 0xa5018000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 1249 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&hw_ps_87>;
+		clocks = <&clkref>;
 		status = "disabled";
 	};
 

@@ -6,6 +6,7 @@
 		compatible = "apple,t8152-i2c-controller", "apple,i2c-controller";
 		reg = <0x3 0x31010000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 1413 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clkref>;
 		status = "disabled";
 	};
 
@@ -13,6 +14,7 @@
 		compatible = "apple,t8152-i2c-controller", "apple,i2c-controller";
 		reg = <0x3 0x31014000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 1414 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clkref>;
 		status = "disabled";
 	};
 
@@ -20,6 +22,7 @@
 		compatible = "apple,t8152-i2c-controller", "apple,i2c-controller";
 		reg = <0x3 0x3101c000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 1416 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clkref>;
 		status = "disabled";
 	};
 
@@ -428,6 +431,7 @@
 		      <0x3 0x82b8020 0x0 0x4>;
 		interrupts = <AIC_IRQ 447 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 0 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clkref>;
 		status = "disabled";
 	};
 
@@ -737,6 +741,7 @@
 		compatible = "apple,t8152-i2c-controller", "apple,i2c-controller";
 		reg = <0x3 0x31018000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 1415 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clkref>;
 		status = "disabled";
 	};
 

@@ -20,3 +20,7 @@
 &m6_pm_cpufreq {
 	status = "disabled";
 };
+
+&smc_mbox {
+	status = "disabled";
+};

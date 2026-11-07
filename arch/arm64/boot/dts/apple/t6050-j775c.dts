@@ -43,3 +43,21 @@
 };
 
 #include "t6050-j775c-peripherals.dtsi"
+
+/* Board-specific storage and SMC handoff still require qualification. */
+
+&nvme {
+	status = "disabled";
+};
+
+&ans_mbox {
+	status = "disabled";
+};
+
+&smc {
+	status = "disabled";
+};
+
+&smc_mbox {
+	status = "disabled";
+};

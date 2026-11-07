@@ -10,6 +10,7 @@
 		reg = <0x3 0xa5014000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 1248 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&hw_ps_86>;
+		clocks = <&clkref>;
 		status = "disabled";
 	};
 
@@ -18,6 +19,7 @@
 		reg = <0x3 0xa501c000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 1250 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&hw_ps_88>;
+		clocks = <&clkref>;
 		status = "disabled";
 	};
 
@@ -165,6 +167,7 @@
 		      <0x3 0x882b8020 0x0 0x4>;
 		interrupts = <AIC_IRQ 361 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 0 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clkref>;
 		status = "disabled";
 	};
 

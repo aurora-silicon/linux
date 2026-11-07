@@ -24,6 +24,7 @@
 		compatible = "apple,t6050-i2c-controller", "apple,i2c-controller";
 		reg = <0x5 0x501c000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 1378 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clkref>;
 		status = "disabled";
 	};
 
@@ -31,6 +32,7 @@
 		compatible = "apple,t6050-i2c-controller", "apple,i2c-controller";
 		reg = <0x5 0x5020000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 1379 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clkref>;
 		status = "disabled";
 	};
 
