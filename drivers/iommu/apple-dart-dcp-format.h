@@ -157,7 +157,9 @@ static inline int dcp_adt_value(struct dcp_adt_tables *out,
 
 	if (kind == 1 && !strcmp(name, "target-type")) {
 		bit = 1;
-		if (length != 5 || memcmp(value, "J713", 5))
+		/* The M4 Airs share the retained display handoff. */
+		if (length != 5 ||
+		    (memcmp(value, "J713", 5) && memcmp(value, "J715", 5)))
 			return -ENODEV;
 	} else if (kind == 3 && !strcmp(name, "compatible")) {
 		bit = 2;

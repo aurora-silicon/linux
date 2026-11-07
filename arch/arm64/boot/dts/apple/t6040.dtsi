@@ -6,6 +6,7 @@
  */
 
 #include "t604x.dtsi"
+#include "t6040-peripherals.dtsi"
 
 /* The M4 Pro has five cores in each P cluster. */
 /delete-node/ &cpu_p05;
