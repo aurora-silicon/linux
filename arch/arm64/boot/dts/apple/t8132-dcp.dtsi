@@ -1,34 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * Apple MacBook Air (13-inch, M4) internal display coprocessor (DCP).
- *
- * Node structure and values match the cleanroom J713 live device tree.
- * The DCP, its mailbox and both display DARTs are live when Linux starts:
- * the DART driver leaves the DARTs untouched until apple_dart.j713_dcp or
- * apple_dart.j713_display is set and the device re-probed, and the DCP
- * common Apple display driver (appledrm) adopts the inherited session after
- * guarded DART admission; no display lifecycle sysfs triggers are required.
- *
- * The boot loader completes these nodes. On dcp it publishes
- * apple,firmware-uuid, -version and -compat and the memory-region list of
- * DCP firmware reservations (apple,asc-mem, no-map, with iommu-addresses,
- * plus one apple,dcp-os-log region). After validating the inherited
- * frontend mappings it adds memory-region and apple,j713-inherited-mappings
- * to piodma and display-subsystem and enables them and disp0_dart.
- * apple,j713-native-piodma and apple,j713-native-scanout opt in to that.
- * The DCP, PIODMA and scanout paths use non-coherent DMA only, so those
- * nodes are marked dma-noncoherent.
- * The DART driver also reads the ADT through the loader's phram "adt"
- * region. Without that handoff the DCP and frontend are refused.
+ * The T8132 internal display coprocessor (DCP), its mailbox, firmware
+ * DART (SID23) and display DART (SID0 scanout, SID16 PIODMA), as on the
+ * J713. iBoot leaves them running. They stay disabled, and the DART driver
+ * keeps off them, until a board's panel handoff is qualified.
  *
  * Copyright The Asahi Linux Contributors
  */
+
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
 
 / {
 	aliases {
 		dcp = &dcp;
 		disp0 = &display;
-		disp0_piodma = &disp0_piodma;
 	};
 };
 
@@ -45,9 +31,9 @@
 				  "recv-empty", "recv-not-empty";
 		power-domains = <&ps_disp_cpu>;
 		#mbox-cells = <0>;
+		status = "disabled";
 	};
 
-	/* DCP firmware DART: SID23. */
 	dcp_dart: iommu@30a340000 {
 		compatible = "apple,t8132-dart", "apple,t8110-dart";
 		reg = <0x3 0x0a340000 0x0 0x20000>;
@@ -55,9 +41,9 @@
 		interrupts = <AIC_IRQ 678 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		status = "disabled";
 	};
 
-	/* Display frontend DART: SID0 scanout, SID16 PIODMA. */
 	disp0_dart: iommu@30a300000 {
 		compatible = "apple,t8132-dart", "apple,t8110-dart";
 		reg = <0x3 0x0a300000 0x0 0xc000>;
@@ -65,7 +51,7 @@
 		interrupts = <AIC_IRQ 678 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x0 0x10 0x0>;
-		status = "disabled"; /* Enabled by the loader. */
+		status = "disabled";
 	};
 
 	dcp: dcp@30ae00000 {
@@ -84,31 +70,20 @@
 		iommus = <&dcp_dart 23>;
 		power-domains = <&ps_disp_cpu>;
 		dma-noncoherent;
-		apple,j713-native-piodma;
-		apple,j713-native-scanout;
-		/* Full 2560x1664 panel including the notch rows, 224 ppi. */
-		apple,panel-width-mm = <290>;
-		apple,panel-height-mm = <188>;
-		#address-cells = <2>;
-		#size-cells = <2>;
+		status = "disabled";
 
 		disp0_piodma: piodma {
 			iommus = <&disp0_dart 16>;
 			dma-noncoherent;
-			status = "disabled"; /* Enabled by the loader. */
+			status = "disabled";
 		};
 	};
 
+	/* The scanout frontend; it has no registers of its own. */
 	display: display-subsystem {
 		compatible = "apple,t8132-display-subsystem", "apple,t8132-display-diagnostics";
 		iommus = <&disp0_dart 0>;
 		dma-noncoherent;
-		status = "disabled"; /* Enabled by the loader. */
+		status = "disabled";
 	};
 };
-
-/*
- * The shared J713 power-domain policy leaves the running display domains
- * firmware-owned. Native display adoption does not register a second genpd
- * owner or change their hardware state.
- */

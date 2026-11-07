@@ -2950,7 +2950,8 @@ struct macaudio_platform_cfg macaudio_j616_cfg = {
  * J614s: the same amps and frame as the J616s, but its speakers have not
  * been brought up and have no protection profile. Keep them off entirely
  * until they get their own bring-up: the speaker link is not bound, so no
- * stream ever reaches the amps.
+ * stream ever reaches the amps. The J604 (T8132, MacBook Pro 14" M4) has
+ * the same amps, frame and chassis, and is in the same state.
  */
 struct macaudio_platform_cfg macaudio_j614_cfg = {
 	.enable_speakers = false,
@@ -2962,6 +2963,23 @@ struct macaudio_platform_cfg macaudio_j614_cfg = {
 	.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
 		   SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
 	.secondary_bclk_ratio = 250,
+	.fe_cpu_is_platform = true,
+	.route_only_fes = BIT(0),
+};
+
+/*
+ * J773 (Mac mini, M4 Pro) and J575c (Mac Studio, M4 Max): one SN012776 on
+ * the AOP's speaker stream. Neither speaker has been brought up or has a
+ * protection profile, and the J773s stream returns no V/I sense, so keep
+ * them off as on the J614s: the speaker link is not bound.
+ */
+struct macaudio_platform_cfg macaudio_j575c_j773_cfg = {
+	.enable_speakers = false,
+	.amp = AMP_SN012776,
+	.speakers = SPKR_1W,
+	.stereo = false,
+	.safe_vol = -20,
+	.fe_dai_names = { "j616-pcm-0", "j616-pcm-1", "j616-pcm-2" },
 	.fe_cpu_is_platform = true,
 	.route_only_fes = BIT(0),
 };
@@ -3084,8 +3102,16 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	/* j514    AID28   sn012776    15      2x 2W+1T Compat: apple,j314-macaudio */
 	/* j516    AID29   sn012776    15      2x 2W+1T Compat: apple,j316-macaudio */
 	/* j575    AID33   sn012776    15      1x 1W    Compat: apple,j375-macaudio */
+	/* j575c   -       sn012776    -       1x 1W    (AOP-fed; speaker off until bring-up) */
+	{ .compatible = "apple,j575c-macaudio", .data = &macaudio_j575c_j773_cfg },
+	/* j575c   -       cs42l84     -       the jack, a card of its own (AOP-fed) */
+	{ .compatible = "apple,j575c-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* j613    AID20   sn012776    15      2x 1W+1T Compat: apple,j413-macaudio */
 	/* j615    AID21   sn012776    15      2x 2W+1T Compat: apple,j415-macaudio */
+	/* j604    -       sn012776    15      2x 2W+1T (AOP-fed; speakers off until bring-up) */
+	{ .compatible = "apple,j604-macaudio", .data = &macaudio_j614_cfg },
+	/* j604    -       cs42l84     -       the jack, a card of its own (AOP-fed) */
+	{ .compatible = "apple,j604-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* j614    AID34   sn012776    15      2x 2W+1T (AOP-fed; speakers off until bring-up) */
 	{ .compatible = "apple,j614-macaudio", .data = &macaudio_j614_cfg },
 	/* j614    AID34   cs42l84     -       the jack, a card of its own (AOP-fed) */
@@ -3094,6 +3120,10 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j616-macaudio", .data = &macaudio_j616_cfg },
 	/* j616    AID35   cs42l84     -       the jack, a card of its own (AOP-fed) */
 	{ .compatible = "apple,j616-macaudio-jack", .data = &macaudio_j616_jack_cfg },
+	/* j623    -       cs42l84     -       the jack only (AOP-fed) */
+	{ .compatible = "apple,j623-macaudio-jack", .data = &macaudio_j616_jack_cfg },
+	/* j624    -       cs42l84     -       the jack only (AOP-fed) */
+	{ .compatible = "apple,j624-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* j700    AID44   max98360a   -       2x 1W    (AOP-fed, software gain) */
 	{ .compatible = "apple,j700-macaudio", .data = &macaudio_j700_cfg },
 	/* j713    -       sn012776    15      2x 1W+1T (AOP-fed, one serializer) */
@@ -3107,6 +3137,10 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	/* j715    -       sn012776    15      2x 2W+1T (AOP-fed, one serializer) */
 	{ .compatible = "apple,j715-macaudio", .data = &macaudio_j715_cfg },
 	{ .compatible = "apple,j715-macaudio-jack", .data = &macaudio_j616_jack_cfg },
+	/* j773    -       sn012776    15      1x 1W    (AOP-fed; speaker off until bring-up) */
+	{ .compatible = "apple,j773-macaudio", .data = &macaudio_j575c_j773_cfg },
+	/* j773    -       cs42l84     -       the jack, a card of its own (AOP-fed) */
+	{ .compatible = "apple,j773-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* Fallback, jack only */
 	{ .compatible = "apple,macaudio"},
 	{ }
