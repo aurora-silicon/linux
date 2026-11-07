@@ -208,6 +208,8 @@ struct apple_nvme_hw {
 	bool needs_ioq_registers;
 	/* T8132 needs a PMGR reset when starting a stopped coprocessor. */
 	bool cold_reset;
+	/* The ANS is never reset through PMGR here, so no reset is named. */
+	bool reset_optional;
 	u32 max_queue_depth;
 	unsigned long quirks;
 };
@@ -2393,7 +2395,9 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		goto out_detach_genpd;
 	}
 
-	anv->reset = devm_reset_control_array_get_exclusive(anv->dev);
+	anv->reset = anv->hw->reset_optional ?
+		devm_reset_control_array_get_optional_exclusive(anv->dev) :
+		devm_reset_control_array_get_exclusive(anv->dev);
 	if (IS_ERR(anv->reset)) {
 		ret = dev_err_probe(dev, PTR_ERR(anv->reset),
 				    "Failed to get reset control");
@@ -2754,8 +2758,26 @@ static const struct apple_nvme_hw apple_nvme_t6040_hw = {
 	.quirks = NVME_QUIRK_NO_APST,
 };
 
+/*
+ * T6050 (M5 Ultra) ANS on bare metal: T6040's split layout (a 64 KiB "nvme"
+ * block, a separate NVMMU, linear submission queues), 64 queue entries. Like
+ * every post-M4 ANS without cold_reset it is never reset through PMGR, so no
+ * reset is named.
+ */
+static const struct apple_nvme_hw apple_nvme_t6050_hw = {
+	.has_lsq_nvmmu = true,
+	.has_separate_nvmmu = true,
+	.needs_ioq_registers = true,
+	.lsq_in_nvmmu = true,
+	.reset_optional = true,
+	.max_queue_depth = 64,
+	/* FUA is not shown durable on this ANS: flush instead. */
+	.quirks = NVME_QUIRK_NO_APST | NVME_QUIRK_BROKEN_FUA,
+};
+
 static const struct of_device_id apple_nvme_of_match[] = {
 	{ .compatible = "apple,t6041-nvme-ans2", .data = &apple_nvme_t6040_hw },
+	{ .compatible = "apple,t6050-nvme-ans2", .data = &apple_nvme_t6050_hw },
 	{ .compatible = "apple,t8015-nvme-ans2", .data = &apple_nvme_t8015_hw },
 	{ .compatible = "apple,t8103-nvme-ans2", .data = &apple_nvme_t8103_hw },
 	{ .compatible = "apple,t8132-nvme-ans2", .data = &apple_nvme_t8132_hw },
