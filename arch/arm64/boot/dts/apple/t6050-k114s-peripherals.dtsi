@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /* Register and interrupt resources; ownership-sensitive blocks stay disabled. */
 
-&die0 {
+&{/soc} {
 
 	hw_i2c3: i2c@50501c000 {
 		compatible = "apple,t6050-i2c", "apple,t8103-i2c";

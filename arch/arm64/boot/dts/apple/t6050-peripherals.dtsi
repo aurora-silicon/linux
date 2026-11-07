@@ -1,7 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /* Shared disabled peripheral resources. */
 
-&die0 {
+/ {
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		nonposted-mmio;
+	};
+};
+
+&{/soc} {
 	hw_i2c0: i2c@505010000 {
 		compatible = "apple,t6050-i2c", "apple,t8103-i2c";
 		reg = <0x5 0x5010000 0x0 0x4000>;
