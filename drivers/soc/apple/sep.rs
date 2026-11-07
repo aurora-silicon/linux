@@ -3047,9 +3047,5 @@ module! {
             default: 0,
             description: "Opt-in J414s enrollment test: export owner from the fresh context, then save user before master at completion",
         },
-        tid_rearm_variant: u8 {
-            default: 0,
-            description: "Test only: one extra step at a Touch ID password re-arm: 0 none, 1 SBIO communication init, 2 device-view resync, 3 user catacomb reload",
-        },
     },
 }
