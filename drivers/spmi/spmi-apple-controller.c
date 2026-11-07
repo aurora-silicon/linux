@@ -12,7 +12,9 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/bitmap.h>
 #include <linux/bits.h>
+#include <linux/cleanup.h>
 #include <linux/completion.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
@@ -23,8 +25,10 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 #include <linux/spinlock.h>
 #include <linux/spmi.h>
+#include <linux/suspend.h>
 
 /* SPMI Controller Registers */
 #define SPMI_STATUS_REG 0
@@ -84,6 +88,7 @@ struct apple_spmi {
 	DECLARE_BITMAP(irq_mask_cache, SPMI_NUM_PERIPHERAL_IRQS);
 	int irq;
 	bool notify_irq;
+	bool notify_parked;
 	bool prev_fail;
 };
 
@@ -468,6 +473,63 @@ static int apple_spmi_init_irq(struct platform_device *pdev,
 	return 0;
 }
 
+/*
+ * Every command asks for an interrupt on its response, on the vector this
+ * driver waits on. The system's wake logic watches this queue's interrupt line
+ * for the PMU's RTC alarm, so that vector has to be quiet and clear before a
+ * firmware-driven suspend, or the commit may read our own traffic as a wake.
+ * macOS clears the same enable bit at about the same point (measured under aura).
+ * Any command sent from here on polls for its response.
+ */
+static int apple_spmi_suspend_noirq(struct device *dev)
+{
+	struct apple_spmi *spmi = dev_get_drvdata(dev);
+	unsigned long flags;
+
+	if (!spmi->notify_irq || !pm_suspend_via_firmware())
+		return 0;
+
+	guard(mutex)(&spmi->fifo_lock);
+	spmi->notify_irq = false;
+	spmi->notify_parked = true;
+	raw_spin_lock_irqsave(&spmi->irq_mask_lock, flags);
+	apple_spmi_irq_mask_raw(spmi, SPMI_IRQ_NOTIFY);
+	apple_spmi_irq_ack_raw(spmi, SPMI_IRQ_NOTIFY);
+	raw_spin_unlock_irqrestore(&spmi->irq_mask_lock, flags);
+
+	return 0;
+}
+
+static int apple_spmi_resume_noirq(struct device *dev)
+{
+	struct apple_spmi *spmi = dev_get_drvdata(dev);
+	u32 words[SPMI_NUM_PERIPHERAL_IRQS / 32];
+	unsigned long flags;
+	size_t i;
+
+	if (!spmi->notify_parked)
+		return 0;
+
+	guard(mutex)(&spmi->fifo_lock);
+	raw_spin_lock_irqsave(&spmi->irq_mask_lock, flags);
+	/* Whether the enables survive a real sleep has not been measured. */
+	if (pm_resume_via_firmware()) {
+		bitmap_to_arr32(words, spmi->irq_mask_cache, SPMI_NUM_PERIPHERAL_IRQS);
+		for (i = 0; i < ARRAY_SIZE(words); i++)
+			writel(words[i], spmi->regs + SPMI_IRQ_MASK_BASE + i * 4);
+	}
+	apple_spmi_irq_ack_raw(spmi, SPMI_IRQ_NOTIFY);
+	apple_spmi_irq_unmask_raw(spmi, SPMI_IRQ_NOTIFY);
+	raw_spin_unlock_irqrestore(&spmi->irq_mask_lock, flags);
+	spmi->notify_parked = false;
+	spmi->notify_irq = true;
+
+	return 0;
+}
+
+static DEFINE_NOIRQ_DEV_PM_OPS(apple_spmi_pm_ops, apple_spmi_suspend_noirq,
+			       apple_spmi_resume_noirq);
+
 static int apple_spmi_probe(struct platform_device *pdev)
 {
 	struct apple_spmi *spmi;
@@ -529,6 +591,7 @@ static struct platform_driver apple_spmi_driver = {
 	.driver		= {
 		.name	= "apple-spmi",
 		.of_match_table = apple_spmi_match_table,
+		.pm	= pm_sleep_ptr(&apple_spmi_pm_ops),
 	},
 };
 module_platform_driver(apple_spmi_driver);
