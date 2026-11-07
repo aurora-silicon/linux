@@ -19,12 +19,14 @@ properties:
     oneOf:
       - items:
           - enum:
+              - apple,t6000-spmi
               - apple,t6020-spmi
               - apple,t6030-spmi
               - apple,t6031-spmi
               - apple,t6041-spmi
               - apple,t8012-spmi
               - apple,t8015-spmi
+              - apple,t8112-spmi
               - apple,t8122-spmi
               - apple,t8132-spmi
               - apple,t8140-spmi
