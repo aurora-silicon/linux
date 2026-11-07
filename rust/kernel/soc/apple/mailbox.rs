@@ -91,6 +91,11 @@ impl<T: MailCallback> Mailbox<T> {
         unsafe { device::Device::from_raw((*self.mbox).dev) }
     }
 
+    /// The C mailbox, for code that drives it with interrupts off.
+    pub fn as_raw(&self) -> *mut bindings::apple_mbox {
+        self.mbox
+    }
+
     /// Sends the specified message
     pub fn send(&self, msg: Message, atomic: bool) -> Result<()> {
         // SAFETY: Calling the c function, `mbox` is a valid pointer
