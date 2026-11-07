@@ -929,7 +929,7 @@ impl Firmware {
         self.primary.state.shared.note_gpu_activity();
         self.effort.submit();
         self.effort.note_waiters(now_ns(), fence::waiters());
-        self.apply_effort(power::FULL_EFFORT)
+        self.apply_effort(power::submission_effort())
     }
 
     /// One governor step with the hotspot temperature reading; returns whether to run again and
