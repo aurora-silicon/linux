@@ -3,7 +3,8 @@
  * Host fixture for the Thunderbolt DPIN1 dispatch and tiled-display split
  * admission. The production bodies of dcp_tb_dispatch_request(),
  * dcp_tb_split_locked(), dcp_typec_port_untileable(),
- * dcp_fabric_tunnel_slot() and dcp_fabric_binding_request() are pasted in;
+ * dcp_typec_route_no_dp_alt(), dcp_fabric_tunnel_slot() and
+ * dcp_fabric_binding_request() are pasted in;
  * only what lies below them (join, connect, teardown, release, attach,
  * rebalance) is stubbed, and every stub call is recorded.
  */
@@ -42,7 +43,12 @@ static void list_add_tail(struct list_head *n, struct list_head *h)
 	     pos = container_of(pos->member.next, __typeof__(*pos), member))
 
 struct mutex { int unused; };
-struct device { int unused; };
+struct device_node { const char *compatible; };
+struct device { struct device_node *of_node; };
+static bool of_device_is_compatible(const struct device_node *np, const char *compatible)
+{
+	return np && np->compatible && !strcmp(np->compatible, compatible);
+}
 struct mux_chip;
 struct mux_control { struct mux_chip *chip; };
 struct mux_chip { struct mux_control mux[3]; unsigned int controllers; };
@@ -196,13 +202,15 @@ dcp_typec_rebalance_locked(struct apple_dcp_typec_port *arriving, unsigned int d
 
 /* --- topology --- */
 static struct apple_dcp dcp_a, dcp_b;
+static struct device dev_a, dev_b;
+static struct device_node np_a, np_b;
 static struct apple_dcp_typec_route route_a, route_b;
 static struct apple_dcp_typec_port port;
 static struct mux_chip chip;
 
 static int set_active(void *binding, bool active) { (void)binding; (void)active; return 0; }
 
-enum kind { NONE, ALL_EXTERNAL, ALL_INTERNAL, MIXED };
+enum kind { NONE, ALL_EXTERNAL, ALL_INTERNAL, MIXED, T8132_DCPEXT };
 
 static void topology(enum kind kind, bool port1_ready)
 {
@@ -219,6 +227,13 @@ static void topology(enum kind kind, bool port1_ready)
 		chip.mux[i].chip = &chip;
 	dcp_a.external = kind == ALL_EXTERNAL || kind == MIXED;
 	dcp_b.external = kind == ALL_EXTERNAL;
+	/* A T8132 dcpext is no external processor: only its compatible says so. */
+	np_a.compatible = np_b.compatible =
+		kind == T8132_DCPEXT ? "apple,t8132-dcpext" : "apple,dcp";
+	dev_a.of_node = &np_a;
+	dev_b.of_node = &np_b;
+	dcp_a.dev = &dev_a;
+	dcp_b.dev = &dev_b;
 	dcp_a.dptxport[1].enabled = dcp_b.dptxport[1].enabled = port1_ready;
 	route_a.dcp = &dcp_a;
 	route_b.dcp = &dcp_b;
@@ -427,6 +442,26 @@ static void split_existing_active(void)
 	CHECK(!st.teardown && !st.attach && port.split_dcp == &dcp_a);
 }
 
+/* T8132: a dcpext has no DP alt mode and no tiles; dpin1 is a display of its own. */
+static void t8132_dcpext_dpin1_alone(void)
+{
+	topology(T8132_DCPEXT, true);
+	CHECK(split(true, 9) == -EOPNOTSUPP);
+	CHECK(request(1, true, 9) == 0);
+	CHECK(st.attach == 1 && st.attach_dpin[0] == 1 && port.secondary_owner);
+	CHECK(!st.join && !st.connect && !st.teardown);
+}
+
+static void t8132_dcpext_dpin1_with_tile_hint(void)
+{
+	topology(T8132_DCPEXT, true);
+	owner_on(&dcp_a);
+	dcp_a.dptxport[0].tile_hint = true;
+	CHECK(split(true, 9) == -EOPNOTSUPP);
+	CHECK(request(1, true, 9) == 0);
+	CHECK(st.attach == 1 && st.attach_dpin[0] == 1 && !st.join);
+}
+
 static const struct { const char *name; void (*fn)(void); } cases[] = {
 	{ "t6030-dpin1-alone", t6030_dpin1_alone },
 	{ "t6030-dpin1-alone-before-services", t6030_dpin1_alone_before_services },
@@ -445,6 +480,8 @@ static const struct { const char *name; void (*fn)(void); } cases[] = {
 	{ "split-retired-teardown-first", split_retired_teardown_first },
 	{ "split-existing-release", split_existing_release },
 	{ "split-existing-active", split_existing_active },
+	{ "t8132-dcpext-dpin1-alone", t8132_dcpext_dpin1_alone },
+	{ "t8132-dcpext-dpin1-with-tile-hint", t8132_dcpext_dpin1_with_tile_hint },
 };
 
 int main(int argc, char **argv)

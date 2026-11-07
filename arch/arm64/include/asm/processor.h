@@ -149,6 +149,8 @@ struct cpu_context {
 	unsigned long pc;
 };
 
+struct apple_amx_state;
+
 struct thread_struct {
 	struct cpu_context	cpu_context;	/* cpu context */
 
@@ -204,6 +206,12 @@ struct thread_struct {
 #endif
 #ifdef CONFIG_ARM64_ACTLR_STATE
 	u64			actlr;
+#endif
+#ifdef CONFIG_ARM64_APPLE_X86_FP
+	u64			afpcr;		/* AFPCR_EL0 while EnAFP is set */
+#endif
+#ifdef CONFIG_ARM64_APPLE_AMX
+	struct apple_amx_state	*amx;		/* NULL until first AMX use */
 #endif
 };
 
@@ -422,6 +430,40 @@ extern void __init minsigstksz_setup(void);
 #include <asm/fpsimd.h>
 
 /* Userspace interface for PR_S[MV]E_{SET,GET}_VL prctl()s: */
+#ifdef CONFIG_ARM64_APPLE_X86_FLAGS
+int apple_x86_flags_get(void);
+int apple_x86_flags_set(unsigned long val);
+#define AURORA_GET_X86_FLAGS()		apple_x86_flags_get()
+#define AURORA_SET_X86_FLAGS(arg)	apple_x86_flags_set(arg)
+#endif
+
+#ifdef CONFIG_ARM64_APPLE_X86_FP
+int apple_x86_fp_get(void);
+int apple_x86_fp_set(unsigned long val);
+bool apple_afp_enabled(struct task_struct *t);
+u64 apple_afp_read_afpcr(struct task_struct *t);
+void apple_afp_write_afpcr(struct task_struct *t, u64 afpcr);
+#define AURORA_GET_X86_FP()		apple_x86_fp_get()
+#define AURORA_SET_X86_FP(arg)		apple_x86_fp_set(arg)
+#else
+static inline bool apple_afp_enabled(struct task_struct *t)
+{
+	return false;
+}
+#endif
+
+#ifdef CONFIG_ARM64_APPLE_FP_PRESERVE
+int apple_fp_preserve_get(void);
+int apple_fp_preserve_set(unsigned long val);
+#define AURORA_GET_FP_PRESERVE()	apple_fp_preserve_get()
+#define AURORA_SET_FP_PRESERVE(arg)	apple_fp_preserve_set(arg)
+#endif
+
+#ifdef CONFIG_ARM64_APPLE_AMX
+int apple_amx_get(void);
+#define AURORA_GET_AMX()		apple_amx_get()
+#endif
+
 #define SVE_SET_VL(arg)	sve_set_current_vl(arg)
 #define SVE_GET_VL()	sve_get_current_vl()
 #define SME_SET_VL(arg)	sme_set_current_vl(arg)

@@ -40,6 +40,8 @@
 			reg = <0 0 0 0>; /* To be filled by loader */
 			power-domains = <&ps_disp_cpu>, <&ps_dptx_ext_phy>;
 			/* Format properties will be added by loader */
+			panel = <&panel>;
+			post-init-providers = <&panel>;
 			status = "disabled";
 		};
 	};
@@ -97,6 +99,7 @@
 		/* To be filled by the loader */
 		local-mac-address = [00 00 00 00 00 00];
 		apple,antenna-sku = "XX";
+		brcm,ccode-map-trivial;
 	};
 
 	bluetooth0: bluetooth@0,1 {

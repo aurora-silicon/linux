@@ -117,3 +117,4 @@ u8 dcp_crtc_eotf(struct apple_dcp *dcp, struct drm_crtc *crtc,
 		 struct drm_atomic_commit *commit);
 int dcp_crtc_check_hdr(struct apple_dcp *dcp, struct drm_crtc *crtc,
 		       struct drm_atomic_commit *commit);
+void dcp_hdr_metadata_forget(struct apple_dcp *dcp);

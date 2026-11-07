@@ -57,17 +57,27 @@ properties:
           - const: apple,pcie
       - items:
           - enum:
+              - apple,t6030-pcie
+              - apple,t6031-pcie
               - apple,t6041-pcie
               - apple,t8122-pcie
           - const: apple,t6020-pcie
       - const: apple,t6020-pcie
+      - items:
+          - const: apple,t6020-pcie-ge
+          - const: apple,t6020-pcie
       - const: apple,t8140-pcie
+      - const: apple,t8152-pcie
       - const: apple,t8132-pcie
       - const: apple,t8103-pciec
       - items:
           - const: apple,t8112-pciec
           - const: apple,t8103-pciec
       - const: apple,t6000-pciec
+      - items:
+          - const: apple,t8132-pciec
+          - const: apple,t8122-pciec
+          - const: apple,t8103-pciec
 
   apple,managed-sids:
     $ref: /schemas/types.yaml#/definitions/uint32-array
@@ -107,6 +117,12 @@ properties:
   msi-ranges:
     maxItems: 1
 
+  apple,msi-vector-base:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      First vector of this PCIe-C controller's slice of the MSI window it
+      shares with the internal PCIe controller.
+
   iommu-map: true
   iommu-map-mask: true
 
@@ -123,7 +139,11 @@ properties:
 
   apple,pciec-kernel-init:
     type: boolean
-    description: The kernel initializes the tunneled controller from reset.
+    description: |
+      The kernel initializes the tunneled controller when firmware has not
+      already initialized it. The compatible selects the initialization
+      sequence. T600x and T8112 use the Intr2AXI bridge and require tunables
+      for their associated DART before the tunnel children can be populated.
 
   apple,tunable-rc:
     $ref: '#/$defs/tunable'
@@ -187,6 +207,14 @@ required:
 unevaluatedProperties: false
 
 allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8132-pciec
+    then:
+      required:
+        - apple,msi-vector-base
   - $ref: /schemas/pci/pci-host-bridge.yaml#
   - $ref: /schemas/interrupt-controller/msi-controller.yaml#
   - if:
@@ -231,7 +259,7 @@ allOf:
       properties:
         reg:
           minItems: 5
-          maxItems: 7
+          maxItems: 9
         reg-names:
           oneOf:
             - items:
@@ -248,6 +276,16 @@ allOf:
                 - const: debug
                 - const: ltssm
                 - enum: [intr2axi, oe-fabric]
+            - items:
+                - const: config
+                - const: rc
+                - const: port0
+                - const: fabric
+                - const: debug
+                - const: ioa
+                - const: ltssm
+                - const: intr2axi
+                - const: oe-fabric
         interrupts:
           maxItems: 1
         ranges:
@@ -287,20 +325,38 @@ allOf:
               interrupts:
                 maxItems: 3
           else:
-            properties:
-              reg-names:
-                minItems: 3
-                items:
-                  - const: config
-                  - const: rc
-                  - const: port0
-                  - const: port1
-                  - const: port2
-                  - const: port3
-                  - const: phy0
-                  - const: phy1
-                  - const: phy2
-                  - const: phy3
+            if:
+              properties:
+                compatible:
+                  contains:
+                    const: apple,t8152-pcie
+            then:
+              properties:
+                reg:
+                  minItems: 4
+                  maxItems: 8
+                reg-names:
+                  minItems: 4
+                  maxItems: 8
+                  items:
+                    enum: [config, rc, port0, phy0, port1, phy1, port2, phy2]
+                interrupts:
+                  maxItems: 3
+            else:
+              properties:
+                reg-names:
+                  minItems: 3
+                  items:
+                    - const: config
+                    - const: rc
+                    - const: port0
+                    - const: port1
+                    - const: port2
+                    - const: port3
+                    - const: phy0
+                    - const: phy1
+                    - const: phy2
+                    - const: phy3
       patternProperties:
         "^pci@":
           properties:

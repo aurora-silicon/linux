@@ -16,6 +16,7 @@
 / {
 	compatible = "apple,j715", "apple,t8132", "apple,arm-platform";
 	model = "Apple MacBook Air (15-inch, M4, 2025)";
+	chassis-type = "laptop";
 
 	led-controller {
 		compatible = "pwm-leds";

@@ -46,18 +46,102 @@ impl ReportRing {
 pub(crate) struct Rings {
     quarantined: [[bool; 2]; 2],
     reports: super::reports::Reports,
+    telemetry: super::telemetry::Telemetry,
+    max_age_ns: u64,
+    suspended: bool,
+    discard_statistics: [bool; 2],
+    statistics_epoch: u64,
+    statistics_powered: bool,
+    statistics_cutoff: [Option<u32>; 2],
 }
 
 impl Rings {
-    pub(crate) fn new() -> Result<Self> {
+    pub(crate) fn new(graph: super::fw::variant::InitGraph) -> Result<Self> {
         Ok(Self {
             quarantined: [[false; 2]; 2],
             reports: super::reports::Reports::new()?,
+            telemetry: super::telemetry::Telemetry::default(),
+            max_age_ns: super::stats::max_age_ns(graph),
+            suspended: false,
+            discard_statistics: [false; 2],
+            statistics_epoch: 0,
+            statistics_powered: true,
+            statistics_cutoff: [None; 2],
         })
     }
 
+    pub(super) fn invalidate_statistics(&mut self) {
+        self.telemetry.invalidate();
+        // The packets have no epoch marker. Discard each role's already
+        // queued records before accepting a new baseline after the boundary.
+        self.discard_statistics = [true; 2];
+        self.statistics_cutoff = [None; 2];
+    }
+
+    pub(super) fn suspend_statistics(&mut self, suspended: bool) {
+        self.suspended = suspended;
+        self.invalidate_statistics();
+    }
+
+    pub(super) fn statistics_suspended(&self) -> bool {
+        self.suspended
+    }
+
+    pub(super) fn observe_statistics_power(
+        &mut self,
+        dev: &Device,
+        init: &InitData,
+        roles: &[Role],
+        powered: bool,
+        epoch: u64,
+    ) {
+        if !powered || !self.statistics_powered || epoch != self.statistics_epoch {
+            self.telemetry.invalidate();
+            // End the queued prefix *now*, not at the next drain. A boolean
+            // discard-next-batch also throws away records produced after this
+            // observation, even if the queue was empty at the boundary.
+            for &role in roles {
+                if self.quarantined[role as usize][ReportRing::Statistics as usize] {
+                    continue;
+                }
+                let cutoff = (|| {
+                    let state = status::STATS_STATE as usize;
+                    let producer = init
+                        .status_word(role, state + RX_PRODUCER_OFFSET)?
+                        .load(Ordering::Relaxed);
+                    fence(Ordering::Acquire);
+                    if producer >= STATISTICS_SLOTS {
+                        return Err(EIO);
+                    }
+                    Ok(producer)
+                })();
+                match cutoff {
+                    Ok(producer) => self.statistics_cutoff[role as usize] = Some(producer),
+                    Err(error) => self.stop_report(dev, role, ReportRing::Statistics, error),
+                }
+            }
+        }
+        self.statistics_powered = powered;
+        self.statistics_epoch = epoch;
+    }
+
+    pub(super) fn read_statistics(&self, now_ns: u64) -> super::telemetry::Readout {
+        self.telemetry.read(now_ns, self.max_age_ns)
+    }
+
     pub(super) fn write_reports(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
-        self.reports.write(f)
+        self.reports.write(f)?;
+        writeln!(
+            f,
+            "admission suspended={} discard_queued={:?} quarantine={:?} power_epoch={} powered={} cutoff={:?}",
+            self.suspended, self.discard_statistics, self.quarantined, self.statistics_epoch,
+            self.statistics_powered, self.statistics_cutoff
+        )?;
+        let view = self.read_statistics(super::now_ns());
+        writeln!(f, "qualified max_age_ns={} util_status={} util_host_ns={} util_samples={} pstate_status={} pstate_host_ns={} pstate_timestamp={} delta_ticks={:?} tiler={} renderer={} device={} pstate={} delivery_intervals_ns={:?}",
+            self.max_age_ns, view.util_status, view.util_host_ns, view.util_samples,
+            view.pstate_status, view.pstate_host_ns, view.pstate_timestamp, self.telemetry.delta_ticks,
+            view.tiler, view.renderer, view.device, view.pstate, self.telemetry.delivery_intervals)
     }
 
     pub(crate) fn drain_trace(&mut self, dev: &Device, init: &InitData, role: Role) {
@@ -69,23 +153,57 @@ impl Rings {
     }
 
     fn drain_report(&mut self, dev: &Device, init: &InitData, role: Role, ring: ReportRing) {
-        let quarantined = &mut self.quarantined[role as usize][ring as usize];
-        if *quarantined {
+        if self.quarantined[role as usize][ring as usize] {
             return;
         }
-        if let Err(error) = Self::consume_report(init, role, ring, &mut self.reports) {
-            *quarantined = true;
-            dev_err!(
-                dev.as_ref(),
-                "G17 {:?} {:?} ring stopped: {:?}\n",
-                role,
-                ring,
-                error
-            );
+        let statistics = matches!(ring, ReportRing::Statistics);
+        let accept = !self.suspended
+            && self.statistics_powered
+            && !self.discard_statistics[role as usize]
+            && !self
+                .quarantined
+                .iter()
+                .any(|rings| rings[ReportRing::Statistics as usize]);
+        if let Err(error) = Self::consume_report(
+            init,
+            role,
+            ring,
+            &mut self.reports,
+            &mut self.telemetry,
+            self.max_age_ns,
+            accept,
+            &mut self.statistics_cutoff[role as usize],
+        ) {
+            self.stop_report(dev, role, ring, error);
+        } else if statistics && !self.suspended {
+            self.discard_statistics[role as usize] = false;
         }
     }
 
-    fn consume_report(init: &InitData, role: Role, ring: ReportRing, reports: &mut super::reports::Reports) -> Result {
+    fn stop_report(&mut self, dev: &Device, role: Role, ring: ReportRing, error: Error) {
+        self.quarantined[role as usize][ring as usize] = true;
+        if matches!(ring, ReportRing::Statistics) {
+            self.invalidate_statistics();
+        }
+        dev_err!(
+            dev.as_ref(),
+            "G17 {:?} {:?} ring stopped: {:?}\n",
+            role,
+            ring,
+            error
+        );
+    }
+
+    fn consume_report(
+        init: &InitData,
+        role: Role,
+        ring: ReportRing,
+        reports: &mut super::reports::Reports,
+        telemetry: &mut super::telemetry::Telemetry,
+        max_age_ns: u64,
+        accept_statistics: bool,
+        statistics_cutoff: &mut Option<u32>,
+    ) -> Result {
         let (state, entries, capacity, allowed_types) = ring.geometry();
         let consumer_word = init.status_word(role, state)?;
         let producer_word = init.status_word(role, state + RX_PRODUCER_OFFSET)?;
@@ -97,10 +215,21 @@ impl Rings {
         if consumer >= capacity || producer >= capacity {
             return Err(EIO);
         }
+        // One receive time per drain: records the firmware published in one
+        // producer update are one delivery (see Telemetry::note_delivery).
+        // Only a statistics drain with records reads the clock.
+        let host_ns = if matches!(ring, ReportRing::Statistics) && consumer != producer {
+            super::now_ns()
+        } else {
+            0
+        };
         while consumer != producer {
+            if matches!(ring, ReportRing::Statistics) && *statistics_cutoff == Some(consumer) {
+                *statistics_cutoff = None;
+            }
             let offset = entries + consumer as usize * EVENT_RECORD_SIZE;
-            // Copy all words before returning the slot. Interpretation is a
-            // separate firmware qualification step, never a scheduling input.
+            // Decode only the complete copy, before returning the slot.
+            // Statistics never affect scheduling or power control.
             let words = init.status_read_words::<EVENT_WORDS>(role, offset)?;
             super::trace::report(role as u8, ring as u8, &words);
             let tag = words[0];
@@ -108,7 +237,11 @@ impl Rings {
                 return Err(EIO);
             }
             if matches!(ring, ReportRing::Statistics) {
-                reports.record(role, words, super::now_ns());
+                let admitted = accept_statistics && statistics_cutoff.is_none();
+                reports.record(role, words, host_ns, admitted);
+                if admitted {
+                    telemetry.record(&words, host_ns, max_age_ns);
+                }
             }
             consumer = (consumer + 1) & (capacity - 1);
             fence(Ordering::SeqCst);
@@ -118,6 +251,9 @@ impl Rings {
             }
         }
         if matches!(ring, ReportRing::Statistics) {
+            if *statistics_cutoff == Some(consumer) {
+                *statistics_cutoff = None;
+            }
             fence(Ordering::SeqCst);
         }
         Ok(())

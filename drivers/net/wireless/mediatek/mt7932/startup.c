@@ -149,7 +149,8 @@ static noinline_for_stack int mt_publish_policy(struct mt7932 *m,
 {
 	u8 dbdc[36] = {0,0,0,0,2,0,36};
 	unsigned int i;
-	struct mt7932_6g_limits limits = mt7932_6g_limits(reg);
+	struct mt7932_6g_limits limits =
+		mt7932_6g_limits_mask(reg, policy->legacy_channels);
 	u8 body[1020];
 	unsigned int j;
 	int ret;
@@ -180,6 +181,7 @@ static noinline_for_stack int mt_publish_policy(struct mt7932 *m,
 			return ret;
 	}
 	m->six_power_valid = false;
+	m->six_legacy_channels = policy->legacy_channels;
 	for (i = 0; i < policy->six_pages; i++) {
 		memcpy(body, policy->six_page[i], policy->six_length[i]);
 		if (policy->six_cid[i] == 0x5d)
@@ -192,7 +194,22 @@ static noinline_for_stack int mt_publish_policy(struct mt7932 *m,
 		if (ret)
 			return ret;
 	}
-	if (policy->six_pages)
+	if (m->six_class_dirty) {
+		struct mt7932_6g_ap clear = m->six_ap;
+
+		/* The established all-0x7f command removes the prior AP ceiling.
+		 * Publish VLP's country tables first, while RF admission is fenced.
+		 */
+		memset(clear.limit, 127, sizeof(clear.limit));
+		ret = mt7932_6g_tpe_body(body, sizeof(body), &clear, NULL);
+		if (ret < 0)
+			return ret;
+		ret = mt_request(m, 0x5d, true, true, false, body, 60);
+		if (ret)
+			return ret;
+		m->six_class_dirty = false;
+	}
+	if (policy->six_channels)
 		m->six_power_valid = true;
 	/* Native SETs have no response/atomic policy-commit event. Command
 	 * submission is not misrepresented as firmware readback or an ACK.
@@ -371,7 +388,132 @@ static int mt_policy_get(void *ctx, const char *path, struct mt7932_policy_file 
 static void mt_policy_put(void *ctx, struct mt7932_policy_file *file)
 {
 	release_firmware(file->handle);
+	release_firmware(file->class_handle);
 	file->handle = NULL;
+	file->class_handle = NULL;
+}
+
+/* command_mutex held. Reopen and authenticate the exact installed policy,
+ * then publish the AP's class before EA/40. No active-class readback exists.
+ */
+int mt_6g_connect_policy(struct mt7932 *m, const struct mt7932_6g_ap *ap)
+{
+	struct mt7932_policy_file file = {};
+	struct mt7932_policy *policy;
+	struct mt7932_6g_limits limits;
+	struct mt7932_reg_snapshot *reg;
+	u8 hash[SHA256_DIGEST_SIZE], *body;
+	char path[MT7932_POLICY_PATH_MAX];
+	u8 tpe[60];
+	s8 gain[3][4];
+	bool sidecar = m->policy_choice.class_valid;
+	u64 channels;
+	unsigned long flags;
+	unsigned int first, channel, begin, end;
+	int ret, length;
+	bool submitted = false;
+
+	lockdep_assert_held(&m->command_mutex);
+	ret = mt7932_j700_6g_gains(ap, gain);
+	if (ret)
+		return ret;
+	ret = mt7932_6g_tpe_body(tpe, sizeof(tpe), ap, gain);
+	if (ret < 0)
+		return ret;
+	policy = kzalloc_obj(*policy, GFP_KERNEL);
+	reg = kzalloc_obj(*reg, GFP_KERNEL);
+	body = kmalloc(1020, GFP_KERNEL);
+	if (!policy || !reg || !body) {
+		ret = -ENOMEM;
+		goto free;
+	}
+	mt7932_policy_path(path, sizeof(path),
+			   sidecar ? MT7932_POLICY_V4 : m->policy_choice.source,
+			   m->policy_choice.alpha2);
+	ret = mt_policy_get(m, path, &file);
+	if (ret)
+		goto free;
+	sha256(file.data, file.size, hash);
+	if (memcmp(hash,
+		   sidecar ? m->policy_choice.class_sha256 :
+			     m->policy_choice.sha256,
+		   sizeof(hash))) {
+		ret = -ESTALE;
+		goto free;
+	}
+	ret = mt7932_policy_parse(policy, file.data, file.size,
+				  m->policy_choice.domain);
+	if (ret)
+		goto free;
+	channels = policy->six_class[ap->mode].channels;
+	begin = ap->center - 2 * (BIT(ap->bandwidth) - 1);
+	end = ap->center + 2 * (BIT(ap->bandwidth) - 1);
+	for (channel = begin; channel <= end; channel += 4) {
+		int frequency = ieee80211_channel_to_frequency(channel, NL80211_BAND_6GHZ);
+		struct ieee80211_channel *c = ieee80211_get_channel(m->wiphy, frequency);
+
+		if (!c || !(channels & BIT_ULL((channel - 1) / 4)) ||
+		    mt7932_6g_class(ap->mode == MT7932_6G_LPI ? 0 : 2,
+				    c->flags) < 0) {
+			ret = -EACCES;
+			goto free;
+		}
+	}
+	spin_lock_irqsave(&m->response_lock, flags);
+	*reg = m->reg_desired;
+	spin_unlock_irqrestore(&m->response_lock, flags);
+	limits = mt7932_6g_limits(reg);
+	if (ap->mode == MT7932_6G_LPI) {
+		/* The LP table, cfg80211 and AP envelope all remain upper bounds.
+		 * Reusing VLP's fixed 14 dBm ceiling would obscure the LP data.
+		 */
+		limits.eirp = 254;
+		for (channel = 0; channel < MT7932_CHANNELS_6G; channel++) {
+			unsigned int index =
+				mt7932_6g_reg_index(1 + 4 * channel);
+
+			if (channels & BIT_ULL(channel))
+				limits.eirp = min_t(int, limits.eirp,
+						    2 * reg->power[index]);
+		}
+	}
+	m->six_legacy_assoc = false;
+	for (first = 0; first < MT7932_6G_RECORDS; first += 8) {
+		length = mt7932_6g_class_page(body, 1020, policy, ap->mode,
+					      m->policy_choice.domain, first);
+		if (length < 0) {
+			ret = length;
+			goto free;
+		}
+		mt7932_6g_limit_page(body, &limits);
+		submitted = true;
+		m->six_class_dirty = true;
+		ret = mt_request(m, 0x5d, true, true, false, body, length);
+		if (ret)
+			goto free;
+	}
+	dev_dbg(&m->pdev->dev, "CID5D_CLASS: byte1=%02x band=3 channel=%u\n",
+		0x0a | (ap->mode << 4), ap->primary);
+	ret = mt_request(m, 0x5d, true, true, false, tpe, sizeof(tpe));
+	if (!ret)
+		dev_dbg(&m->pdev->dev,
+			"CID5D_TPE: length=60 band=3 channel=%u count=%u\n",
+			ap->primary, ap->count);
+free:
+	/* No atomic SET/rollback exists. A partial publication closes RF
+	 * admission; a checked firmware reset is required before reuse.
+	 */
+	if (ret && submitted) {
+		spin_lock_irqsave(&m->response_lock, flags);
+		mt_rf_fail_locked(m, ret);
+		spin_unlock_irqrestore(&m->response_lock, flags);
+	}
+	if (file.handle)
+		mt_policy_put(m, &file);
+	kfree(body);
+	kfree(reg);
+	kfree(policy);
+	return ret;
 }
 
 static void mt_policy_report(struct mt7932 *m, const struct mt7932_policy_choice *choice,
@@ -402,19 +544,26 @@ static void mt_startup_work(struct work_struct *work)
 	};
 	struct mt7932_policy_choice choice;
 	struct mt7932_policy_file file;
-	struct mt7932_reg_snapshot reg;
+	struct mt7932_reg_snapshot *reg;
 	struct mt7932_policy *policy;
 	unsigned long flags;
 	u32 generation;
 	bool submitted;
 	int ret;
 
+	reg = kzalloc_obj(*reg, GFP_KERNEL);
+	if (!reg) {
+		dev_err(&m->pdev->dev,
+			"REGULATORY_BLOCKED: snapshot allocation failed\n");
+		return;
+	}
 	for (;;) {
 		spin_lock_irqsave(&m->response_lock, flags);
 		generation = m->reg_generation;
-		reg = m->reg_desired;
+		*reg = m->reg_desired;
 		if (m->stopping || generation == m->reg_attempted) {
 			spin_unlock_irqrestore(&m->response_lock, flags);
+			kfree(reg);
 			return;
 		}
 		m->reg_attempted = generation;
@@ -435,12 +584,12 @@ static void mt_startup_work(struct work_struct *work)
 			flush_work(&m->scan_finish_work);
 			flush_work(&m->cal_work);
 		}
-		ret = reg.error;
+		ret = reg->error;
 		if (READ_ONCE(m->retired_scan_seq))
 			ret = -EBUSY;
 		memset(&file, 0, sizeof(file));
 		memset(&choice, 0, sizeof(choice));
-		memcpy(choice.alpha2, reg.alpha2, 2);
+		memcpy(choice.alpha2, reg->alpha2, 2);
 		policy = NULL;
 		submitted = false;
 		if (READ_ONCE(m->policy_failed) || READ_ONCE(m->link_failed) ||
@@ -448,8 +597,10 @@ static void mt_startup_work(struct work_struct *work)
 			ret = -EIO;
 		if (!ret) {
 			policy = kzalloc_obj(*policy, GFP_KERNEL);
-			ret = policy ? mt7932_policy_select(&loader, &reg, policy, &file, &choice) :
-				-ENOMEM;
+			ret = policy ?
+				      mt7932_policy_select(&loader, reg, policy,
+							   &file, &choice) :
+				      -ENOMEM;
 			mt_policy_report(m, &choice, ret);
 			if (!ret)
 				mt_policy_disable(m, policy, generation);
@@ -459,7 +610,7 @@ static void mt_startup_work(struct work_struct *work)
 			goto next;
 		if (!ret) {
 			submitted = true;
-			ret = mt_publish_policy(m, &reg, policy);
+			ret = mt_publish_policy(m, reg, policy);
 			if (!ret && !m->startup_started)
 				ret = mt_startup_once(m);
 			/* A partial SET sequence is not a rollback. Only missing or
@@ -483,13 +634,15 @@ static void mt_startup_work(struct work_struct *work)
 			m->policy_choice = choice;
 		}
 		if (ret)
-			dev_warn_ratelimited(&m->pdev->dev, "REGULATORY_BLOCKED: %c%c generation=%u error=%d recovery-required=%u\n",
-				 reg.alpha2[0], reg.alpha2[1], generation, ret,
-				 m->policy_failed || m->link_failed);
+			dev_warn_ratelimited(&m->pdev->dev,
+					     "REGULATORY_BLOCKED: %c%c generation=%u error=%d recovery-required=%u\n",
+					     reg->alpha2[0], reg->alpha2[1], generation, ret,
+					     m->policy_failed || m->link_failed);
 		else
-			dev_dbg(&m->pdev->dev, "REGULATORY_READY: %c%c firmware=%c%c generation=%u current=%u\n",
-				reg.alpha2[0], reg.alpha2[1], reg.domain[0], reg.domain[1],
-				generation, !m->reg_pending);
+			dev_dbg(&m->pdev->dev,
+				"REGULATORY_READY: %c%c firmware=%c%c generation=%u current=%u\n",
+				reg->alpha2[0], reg->alpha2[1], reg->domain[0],
+				reg->domain[1], generation, !m->reg_pending);
 		spin_unlock_irqrestore(&m->response_lock, flags);
 next:
 		mutex_unlock(&m->command_mutex);
@@ -542,8 +695,6 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 			rule = freq_reg_info(m->wiphy, MHZ_TO_KHZ(channel->center_freq));
 			if (!IS_ERR(rule) && !(rule->flags & NL80211_RRF_NO_IR))
 				flags &= ~IEEE80211_CHAN_NO_IR;
-			if (flags & IEEE80211_CHAN_NO_6GHZ_VLP_CLIENT)
-				flags |= IEEE80211_CHAN_DISABLED;
 		}
 
 		reg.power[i] = channel->max_power;
@@ -564,8 +715,8 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 			channel->flags |= IEEE80211_CHAN_DISABLED;
 			continue;
 		}
-		/* Radar channels carry cfg80211's RADAR flag: the firmware may
-		 * listen there, but the station never probes or joins them.
+		/* Radar channels carry cfg80211's RADAR flag: the station never
+		 * probes them, and joins only an AP it has heard there.
 		 */
 		put_unaligned_le16(channel->hw_value, reg.domain + 12 + count * 8);
 		/* Driver bandwidth limits are already in channel->flags. Adding
@@ -584,12 +735,14 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 		spin_unlock_irqrestore(&m->response_lock, irqflags);
 		return;
 	}
-	if (!m->reg_pending && m->connected && !m->disconnecting &&
+	if (!m->reg_pending &&
+	    ((m->connected && !m->disconnecting) || m->roam_moving) &&
 	    mt7932_reg_only_relaxes(&m->reg_desired, &reg) &&
 	    memcmp(&reg, &m->reg_desired, sizeof(reg))) {
-		/* A pass would end the connection only to permit more than the
-		 * firmware now allows. Keep the stricter applied domain and run
-		 * the pass once the connection has ended.
+		/* A pass would end the connection, or the move to another AP
+		 * under way, only to permit more than the firmware now allows.
+		 * Keep the stricter applied domain and run the pass once the
+		 * connection has ended.
 		 */
 		m->reg_deferred = reg;
 		m->reg_deferral = true;
@@ -611,6 +764,7 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 		return;
 	}
 	m->reg_desired = reg;
+	m->six_ap_valid = false;
 	m->reg_deferral = false;
 	m->reg_generation++;
 	/* The next package pass records its own set. */
@@ -655,9 +809,13 @@ static const struct cfg80211_ops mt_cfg_ops = {
 int mt_register_regulatory_gate(struct mt7932 *m)
 {
 	static const int rates[] = {10,20,55,110,60,90,120,180,240,360,480,540};
-	static const u32 ciphers[] = { WLAN_CIPHER_SUITE_CCMP };
+	static const u32 ciphers[] = { WLAN_CIPHER_SUITE_CCMP,
+				       WLAN_CIPHER_SUITE_AES_CMAC };
 	static const u32 akms[] = {
-		WLAN_AKM_SUITE_PSK, WLAN_AKM_SUITE_SAE, WLAN_AKM_SUITE_OWE,
+		WLAN_AKM_SUITE_PSK,
+		WLAN_AKM_SUITE_PSK_SHA256,
+		WLAN_AKM_SUITE_SAE,
+		WLAN_AKM_SUITE_OWE,
 	};
 	unsigned int i;
 	int ret;
@@ -773,6 +931,7 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 			m->band6.iftype_data = &m->he6;
 			m->band6.n_iftype_data = 1;
 			m->wiphy->bands[NL80211_BAND_6GHZ] = &m->band6;
+			m->wiphy->flags |= WIPHY_FLAG_SPLIT_SCAN_6GHZ;
 		}
 	}
 	ret = wiphy_register(m->wiphy);
@@ -811,9 +970,8 @@ static const char *mt7932_policy_fallback_reason(int fallback)
 }
 
 static const char *const mt7932_policy_names[] = {
-	[MT7932_POLICY_NONE] = "none",
-	[MT7932_POLICY_V2] = "policy-v2",
-	[MT7932_POLICY_V1] = "policy",
+	[MT7932_POLICY_NONE] = "none",	  [MT7932_POLICY_V4] = "policy-v4",
+	[MT7932_POLICY_V2] = "policy-v2", [MT7932_POLICY_V1] = "policy",
 	[MT7932_POLICY_WORLD] = "world",
 };
 
@@ -824,6 +982,7 @@ unsigned int mt7932_policy_candidates(const u8 alpha2[2],
 
 	/* 00 and the other numeric codes have no country package. */
 	if (mt7932_policy_country(alpha2)) {
+		sources[n++] = MT7932_POLICY_V4;
 		sources[n++] = MT7932_POLICY_V2;
 		sources[n++] = MT7932_POLICY_V1;
 	}
@@ -835,6 +994,10 @@ void mt7932_policy_path(char *buf, size_t len, enum mt7932_policy_source source,
 			const u8 alpha2[2])
 {
 	switch (source) {
+	case MT7932_POLICY_V4:
+		scnprintf(buf, len, "mediatek/mt7932/policy-v4/%c%c.bin",
+			  alpha2[0], alpha2[1]);
+		break;
 	case MT7932_POLICY_V2:
 		scnprintf(buf, len, "mediatek/mt7932/policy-v2/%c%c.bin", alpha2[0], alpha2[1]);
 		break;
@@ -860,8 +1023,57 @@ static int mt7932_policy_check_version(enum mt7932_policy_source source,
 				       const u8 *data, size_t size)
 {
 	unsigned int version = size >= 6 ? get_unaligned_le16(data + 4) : 0;
+	unsigned int expected = 1;
 
-	return version == (source == MT7932_POLICY_V2 ? 2 : 1) ? 0 : -EINVAL;
+	if (source == MT7932_POLICY_V4)
+		expected = 4;
+	else if (source == MT7932_POLICY_V2)
+		expected = 2;
+	return version == expected ? 0 : -EINVAL;
+}
+
+/* Prefer the original v2 VLP publication whenever it is installed. Retain
+ * v4's LP view as a sidecar, rather than replacing the working VLP pages or
+ * changing the two post-queue association SETs. Both files stay pinned until
+ * publication and both hashes are checked again before class selection.
+ */
+static int mt7932_policy_keep_vlp(const struct mt7932_policy_loader *loader,
+				  struct mt7932_policy *policy,
+				  struct mt7932_policy_file *file,
+				  struct mt7932_policy_choice *choice)
+{
+	struct mt7932_policy_file legacy = {};
+	struct mt7932_policy *old;
+	struct mt7932_6g_table lpi = policy->six_class[MT7932_6G_LPI];
+	struct mt7932_6g_table vlp = policy->six_class[MT7932_6G_VLP];
+	char path[MT7932_POLICY_PATH_MAX];
+
+	old = kzalloc_obj(*old, GFP_KERNEL);
+	if (!old)
+		return -ENOMEM;
+	mt7932_policy_path(path, sizeof(path), MT7932_POLICY_V2,
+			   choice->alpha2);
+	if (loader->get(loader->ctx, path, &legacy))
+		goto free;
+	if (mt7932_policy_check_version(MT7932_POLICY_V2, legacy.data,
+					legacy.size) ||
+	    mt7932_policy_parse(old, legacy.data, legacy.size,
+				choice->alpha2)) {
+		loader->put(loader->ctx, &legacy);
+		goto free;
+	}
+	sha256(file->data, file->size, choice->class_sha256);
+	choice->class_valid = true;
+	legacy.class_handle = file->handle;
+	*file = legacy;
+	*policy = *old;
+	policy->six_class[MT7932_6G_LPI] = lpi;
+	policy->six_class[MT7932_6G_VLP] = vlp;
+	policy->six_channels |= lpi.channels | vlp.channels;
+	choice->source = MT7932_POLICY_V2;
+free:
+	kfree(old);
+	return 0;
 }
 
 int mt7932_policy_select(const struct mt7932_policy_loader *loader,
@@ -907,6 +1119,15 @@ int mt7932_policy_select(const struct mt7932_policy_loader *loader,
 	}
 	if (ret)
 		return ret;
+
+	if (choice->source == MT7932_POLICY_V4) {
+		ret = mt7932_policy_keep_vlp(loader, policy, file, choice);
+		if (ret) {
+			loader->put(loader->ctx, file);
+			memset(file, 0, sizeof(*file));
+			return ret;
+		}
+	}
 
 	/*
 	 * A country without a usable package of its own keeps its cfg80211
@@ -965,6 +1186,9 @@ static int mt_policy_show(struct seq_file *s, void *unused)
 		seq_printf(s, "size: %u\n", c->size);
 		seq_printf(s, "sha256: %8phN\n", c->sha256);
 		seq_printf(s, "6ghz_primaries: %u\n", c->six_primaries);
+		if (c->class_valid)
+			seq_printf(s, "class_source: policy-v4\nclass_sha256: %*phN\n",
+				   SHA256_DIGEST_SIZE, c->class_sha256);
 	}
 	seq_printf(s, "fallback: %s\n", mt7932_policy_fallback_reason(c->fallback));
 	for (i = 0; i < c->n_tried; i++) {

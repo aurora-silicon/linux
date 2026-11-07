@@ -221,7 +221,7 @@ pub(crate) fn encode_compute(
         let start = a.pointer & !127;
         if a.size == 0
             || end <= start
-            || (end - start) / 128 > u32::MAX as u64
+            || (end - start) / 128 > u64::from(u32::MAX)
             || !gpu(start, end - start, 128)
         {
             return Err(ComputeEncodeError::Attachment);

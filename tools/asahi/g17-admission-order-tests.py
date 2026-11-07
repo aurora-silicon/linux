@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicUsize,AtomicBool,Ordering};
 type Result<T=()> = std::result::Result<T,i32>;
 const ECANCELED:i32=-125;const EIO:i32=-5;const EFAULT:i32=-14;
 mod g17 {pub mod fw {pub mod compute_pool {
- pub fn required_blocks(cores:u32,pages:u16)->crate::Result<usize> {
+ pub fn required_blocks(_:usize,cores:u32,pages:u16)->crate::Result<usize> {
   if cores==0 {Err(-22)} else {Ok(21+usize::from(pages))}
  }
 }}}
@@ -39,7 +39,7 @@ struct Status(i32);
 impl Status {fn get(&self)->i32{self.0}}
 struct Context {status:Status}
 impl Context {fn status(&self)->&Status{&self.status} fn is_current(&self)->bool{true}}
-struct Shared {active_cores:u32,crashed:AtomicBool}
+struct Shared {compute_blocks:usize,active_cores:u32,crashed:AtomicBool}
 struct Backend {shared:Shared,physical:AtomicUsize,closed:AtomicBool,context:Context}
 impl Backend {
  fn ensure_compute(&self,_:u16)->Result {self.physical.fetch_add(1,Ordering::SeqCst);Ok(())}
@@ -50,14 +50,14 @@ impl Api for Backend {
 ''' + method('runtime/backend.rs', 'fn ensure_compute(') + r'''
 }
 fn main(){
- let backend=Backend{shared:Shared{active_cores:10,crashed:AtomicBool::new(false)},physical:AtomicUsize::new(0),closed:AtomicBool::new(false),context:Context{status:Status(0)}};
+ let backend=Backend{shared:Shared{compute_blocks:21,active_cores:10,crashed:AtomicBool::new(false)},physical:AtomicUsize::new(0),closed:AtomicBool::new(false),context:Context{status:Status(0)}};
  // Four clients each enqueue nine queues in reverse dependency order. The
  // final host signal cannot be submitted if ioctl admission blocks on channels.
  for _client in 0..4 {for _queue in (0..9).rev() {<Backend as Api>::ensure_compute(&backend,0).unwrap();}}
  assert_eq!(backend.physical.load(Ordering::SeqCst),0,"unsignalled work must not pin physical capacity");
  Backend::ensure_compute(&backend,0).unwrap();
  assert_eq!(backend.physical.load(Ordering::SeqCst),1);
- let invalid=Backend{shared:Shared{active_cores:0,crashed:AtomicBool::new(false)},physical:AtomicUsize::new(0),closed:AtomicBool::new(false),context:Context{status:Status(0)}};
+ let invalid=Backend{shared:Shared{compute_blocks:21,active_cores:0,crashed:AtomicBool::new(false)},physical:AtomicUsize::new(0),closed:AtomicBool::new(false),context:Context{status:Status(0)}};
  assert_eq!(<Backend as Api>::ensure_compute(&invalid,0),Err(-22));
  assert_eq!(invalid.physical.load(Ordering::SeqCst),0);
  for _ in 0..512 {
@@ -68,7 +68,7 @@ fn main(){
  println!("PASS closed builders cannot install after logical close; production ioctl sizing validates 36 reverse-order submissions without physical admission; invalid sizing consumes no channel");
 }
 '''
-    fixed = 'crate::g17::fw::compute_pool::required_blocks(self.shared.active_cores, scs_pages)\n            .map(|_| ())'
+    fixed = 'crate::g17::fw::compute_pool::required_blocks(self.shared.compute_blocks, self.shared.active_cores, scs_pages)\n            .map(|_| ())'
     assert code.count(fixed) == 1
     with tempfile.TemporaryDirectory(prefix='g17-admission-order-') as tmp:
         for name, source in [('fixed', code), ('eager-physical-admission', code.replace(fixed, 'Backend::ensure_compute(self, scs_pages)')), ('ignore-logical-close', code.replace('self.closed.load(Ordering::Acquire)', 'false'))]:

@@ -30,6 +30,7 @@ properties:
               - apple,t6031-usb4-nhi
               - apple,t8112-usb4-nhi
               - apple,t8122-usb4-nhi
+              - apple,t8132-usb4-nhi
           - const: apple,t8103-usb4-nhi
 
   reg:
@@ -144,6 +145,7 @@ allOf:
               - apple,t6030-usb4-nhi
               - apple,t6031-usb4-nhi
               - apple,t8122-usb4-nhi
+              - apple,t8132-usb4-nhi
               - apple,t8142-usb4-nhi
     then:
       properties:

@@ -14,6 +14,7 @@
 #include <linux/blk-crypto-profile.h>
 #include <linux/blkdev.h>
 #include <linux/blk-mq.h>
+#include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
 #include <linux/dmapool.h>
@@ -24,6 +25,7 @@
 #include <linux/iopoll.h>
 #include <linux/jiffies.h>
 #include <linux/kref.h>
+#include <linux/ktime.h>
 #include <linux/mempool.h>
 #include <linux/mm.h>
 #include <linux/overflow.h>
@@ -991,22 +993,54 @@ static bool apple_nvme_handle_cq(struct apple_nvme_queue *q, bool force)
 	return found;
 }
 
+static bool apple_nvme_handle_queues(struct apple_nvme *anv)
+{
+	bool found = apple_nvme_handle_cq(&anv->ioq, false);
+
+	found |= apple_nvme_handle_cq(&anv->adminq, false);
+	return found;
+}
+
+/*
+ * ANS raises one completion interrupt per posted entry, and the interrupt can
+ * reach the CPU before the entry is visible in the completion queue. On T6040
+ * the entry showed up 2-16 us after an interrupt that found both queues
+ * empty. No second interrupt follows, so returning at that point leaves the
+ * command waiting for the I/O timeout. Give a late entry time to land.
+ */
+#define APPLE_NVME_LATE_CQE_US	100
+
+static bool apple_nvme_wait_late_cqe(struct apple_nvme *anv)
+{
+	ktime_t end;
+
+	if (!apple_nvme_queue_enabled(&anv->ioq) &&
+	    !apple_nvme_queue_enabled(&anv->adminq))
+		return false;
+
+	end = ktime_add_us(ktime_get(), APPLE_NVME_LATE_CQE_US);
+	do {
+		udelay(1);
+		if (apple_nvme_handle_queues(anv))
+			return true;
+	} while (ktime_before(ktime_get(), end));
+
+	return false;
+}
+
 static irqreturn_t apple_nvme_irq(int irq, void *data)
 {
 	struct apple_nvme *anv = data;
-	bool handled = false;
 	unsigned long flags;
+	bool handled;
 
 	spin_lock_irqsave(&anv->lock, flags);
-	if (apple_nvme_handle_cq(&anv->ioq, false))
-		handled = true;
-	if (apple_nvme_handle_cq(&anv->adminq, false))
-		handled = true;
+	handled = apple_nvme_handle_queues(anv);
+	if (!handled)
+		handled = apple_nvme_wait_late_cqe(anv);
 	spin_unlock_irqrestore(&anv->lock, flags);
 
-	if (handled)
-		return IRQ_HANDLED;
-	return IRQ_NONE;
+	return handled ? IRQ_HANDLED : IRQ_NONE;
 }
 
 static int apple_nvme_create_cq(struct apple_nvme *anv)
@@ -2695,6 +2729,18 @@ static const struct apple_nvme_hw apple_nvme_t8140_hw = {
 };
 
 /*
+ * T8142 (M5) is laid out like T8140; the final shutdown sends SHN, as on
+ * every post-M4 controller.
+ */
+static const struct apple_nvme_hw apple_nvme_t8142_hw = {
+	.has_lsq_nvmmu = true,
+	.has_separate_nvmmu = true,
+	.needs_ioq_registers = true,
+	.max_queue_depth = 64,
+	.quirks = NVME_QUIRK_BROKEN_FUA,
+};
+
+/*
  * T6040 (M4 Pro) with the 26.x ANS firmware: the T8132 controller, but the
  * "nvme" register block ends at 0x10000 and the linear submission queue
  * doorbells are in the NVMMU block. APST has never been run on it.
@@ -2714,6 +2760,7 @@ static const struct of_device_id apple_nvme_of_match[] = {
 	{ .compatible = "apple,t8103-nvme-ans2", .data = &apple_nvme_t8103_hw },
 	{ .compatible = "apple,t8132-nvme-ans2", .data = &apple_nvme_t8132_hw },
 	{ .compatible = "apple,t8140-nvme-ans2", .data = &apple_nvme_t8140_hw },
+	{ .compatible = "apple,t8142-nvme-ans2", .data = &apple_nvme_t8142_hw },
 	{ .compatible = "apple,nvme-ans2", .data = &apple_nvme_t8103_hw },
 	{},
 };

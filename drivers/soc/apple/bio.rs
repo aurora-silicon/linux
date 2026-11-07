@@ -6,7 +6,7 @@ use kernel::ioctl::{_IO, _IOR, _IOW, _IOWR};
 use kernel::prelude::*;
 use kernel::uaccess::{UserPtr, UserSlice};
 
-pub(crate) const IFACE_VERSION: u32 = 4;
+pub(crate) const IFACE_VERSION: u32 = 5;
 
 pub(crate) const ENROL_USER_ID: i32 = 1000;
 
@@ -21,6 +21,11 @@ const SEP_USER_CAPACITY: usize = 3;
 
 pub(crate) const DEVICE_NAME: &CStr = c"sep-bio";
 pub(crate) const DEVICE_MODE: u16 = 0o600;
+
+/// The Touch ID lockout's own node. fprintd holds `/dev/sep-bio` open, so
+/// a password authentication cannot reach the lockout through that node.
+pub(crate) const REARM_DEVICE_NAME: &CStr = c"sep-bio-rearm";
+pub(crate) const REARM_DEVICE_MODE: u16 = 0o600;
 
 #[derive(Clone, Copy, Default)]
 #[repr(u32)]
@@ -100,8 +105,33 @@ struct List {
 #[repr(C)]
 struct EnrolStart {
     flags: u32,
+    account_uid: u32,
+    finger: u32,
     reserved: u32,
     label: [u8; LABEL_LEN],
+}
+
+#[repr(C)]
+pub(crate) struct EnclaveList {
+    pub(crate) count: u32,
+    pub(crate) reserved: u32,
+    pub(crate) uuid: [[u8; UUID_LEN]; MAX_IDENTITIES],
+}
+
+impl EnclaveList {
+    pub(crate) fn new() -> Self {
+        Self { count: 0, reserved: 0, uuid: [[0; UUID_LEN]; MAX_IDENTITIES] }
+    }
+
+    pub(crate) fn push(&mut self, uuid: [u8; UUID_LEN]) -> Result<()> {
+        let at = self.count as usize;
+        if at >= MAX_IDENTITIES {
+            return Err(EOVERFLOW);
+        }
+        self.uuid[at] = uuid;
+        self.count += 1;
+        Ok(())
+    }
 }
 
 #[repr(C)]
@@ -136,8 +166,8 @@ struct VerifyPoll {
 }
 
 #[repr(C)]
-struct Delete {
-    uuid: [u8; UUID_LEN],
+pub(crate) struct Delete {
+    pub(crate) uuid: [u8; UUID_LEN],
 }
 
 pub(crate) const ATTEST_CHALLENGE_LEN: usize = 32;
@@ -158,16 +188,50 @@ pub(crate) struct Attest {
     pub(crate) reserved: [u8; 3],
 }
 
+/// The Touch ID lockout, as `/dev/sep-bio-rearm` reports it.
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct Lockout {
+    /// 1 while every verify is refused until a password authentication.
+    pub(crate) locked: u32,
+    /// Failed matches since the last match or re-arm.
+    pub(crate) failures: u32,
+    pub(crate) reserved: [u32; 2],
+}
+
+impl Lockout {
+    pub(crate) fn new(locked: bool, failures: u32) -> Lockout {
+        Lockout {
+            locked: u32::from(locked),
+            failures,
+            reserved: [0; 2],
+        }
+    }
+}
+
+pub(crate) const REARM_SECRET_MAX: usize = 1024;
+
+/// A password which userspace has already verified for the requesting user.
+#[repr(C)]
+pub(crate) struct Rearm {
+    pub(crate) secret_len: u32,
+    pub(crate) reserved: u32,
+    pub(crate) secret: [u8; REARM_SECRET_MAX],
+}
+
 // Sizes are baked into the ioctl numbers.
 static_assert!(core::mem::size_of::<Identity>() == 144);
 static_assert!(core::mem::size_of::<Info>() == 32);
 static_assert!(core::mem::size_of::<List>() == 4616);
-static_assert!(core::mem::size_of::<EnrolStart>() == 136);
+static_assert!(core::mem::size_of::<EnrolStart>() == 144);
+static_assert!(core::mem::size_of::<EnclaveList>() == 520);
 static_assert!(core::mem::size_of::<EnrolPoll>() == 40);
 static_assert!(core::mem::size_of::<VerifyStart>() == 40);
 static_assert!(core::mem::size_of::<VerifyPoll>() == 72);
 static_assert!(core::mem::size_of::<Delete>() == 16);
 static_assert!(core::mem::size_of::<Attest>() == 176);
+static_assert!(core::mem::size_of::<Lockout>() == 16);
+static_assert!(core::mem::size_of::<Rearm>() == 1032);
 
 macro_rules! ioctl_pod {
     (to_user: $($t:ty),*; from_user: $($u:ty),*) => {
@@ -182,8 +246,8 @@ macro_rules! ioctl_pod {
     };
 }
 ioctl_pod! {
-    to_user: Info, List, EnrolPoll, VerifyPoll, Attest;
-    from_user: EnrolStart, VerifyStart, Delete, Attest
+    to_user: Info, List, EnclaveList, EnrolPoll, VerifyPoll, Attest, Lockout;
+    from_user: EnrolStart, VerifyStart, Delete, Attest, Rearm
 }
 
 const MAGIC: u32 = 0xB1;
@@ -198,6 +262,12 @@ const IOC_CANCEL: u32 = _IO(MAGIC, 0x07);
 const IOC_DELETE: u32 = _IOW::<Delete>(MAGIC, 0x08);
 const IOC_DELETE_ALL: u32 = _IO(MAGIC, 0x09);
 pub(crate) const IOC_ATTEST: u32 = _IOWR::<Attest>(MAGIC, 0x0a);
+pub(crate) const IOC_LIST_ENCLAVE: u32 = _IOR::<EnclaveList>(MAGIC, 0x0b);
+pub(crate) const IOC_DELETE_ORPHAN: u32 = _IOW::<Delete>(MAGIC, 0x0c);
+pub(crate) const IOC_PREPARE_ENROL: u32 = _IOW::<EnrolStart>(MAGIC, 0x0d);
+// On /dev/sep-bio-rearm only.
+pub(crate) const IOC_LOCKOUT_STATE: u32 = _IOR::<Lockout>(MAGIC, 0x0e);
+pub(crate) const IOC_REARM: u32 = _IOW::<Rearm>(MAGIC, 0x0f);
 
 pub(crate) struct MatchEvidence {
     identity: [u8; UUID_LEN],
@@ -336,6 +406,10 @@ impl IdentityIndex {
 
     pub(crate) fn persist(&self, store: &mut Store) -> Result<()> {
         self.save(store)
+    }
+
+    pub(crate) fn can_persist_next(&self, store: &Store) -> bool {
+        store.can_write(&identity_key(), 8 + (self.entries.len() + 1) * (UUID_LEN + LABEL_LEN))
     }
 
     pub(crate) fn identity_v1_for(
@@ -481,7 +555,7 @@ pub(crate) struct Handled {
     pub(crate) delete_identities: KVec<crate::sbio::IdentityV1>,
 }
 
-fn ok() -> Result<Handled> {
+pub(crate) fn ok() -> Result<Handled> {
     Ok(Handled {
         ret: 0,
         wake: false,
@@ -492,12 +566,18 @@ fn ok() -> Result<Handled> {
     })
 }
 
-fn require_admin() -> Result<()> {
+pub(crate) fn require_admin() -> Result<()> {
     if crate::shim::capable_admin() {
         Ok(())
     } else {
         Err(EPERM)
     }
+}
+
+pub(crate) fn orphan_delete(identity: crate::sbio::IdentityV1) -> Result<Handled> {
+    let mut handled = ok()?;
+    handled.delete_identity = Some(identity);
+    Ok(handled)
 }
 
 fn require_sensor(present: bool) -> Result<()> {
@@ -567,22 +647,85 @@ fn list(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     ok()
 }
 
+fn validate_enrol_request(request: &EnrolStart) -> Result<()> {
+    // NSS account resolution occurs in libfprint. This ABI requires its
+    // resolved uid, the named finger and the generated user label.
+    if request.flags != 0 || request.reserved != 0
+        || request.account_uid == u32::MAX || !(1..=10).contains(&request.finger)
+        || !request.label.starts_with(b"FP1-")
+        || request.label[12] != b'-' || request.label[14] != b'-'
+        || request.label[23] != b'-' || request.label[24] == 0
+        || request.label[13] != b"123456789A"[request.finger as usize - 1]
+        || !request.label.contains(&0)
+    {
+        return Err(EINVAL);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_enrol_start_arg(arg: usize) -> Result<()> {
+    let user = UserPtr::from_addr(arg);
+    let request: EnrolStart = UserSlice::new(user, core::mem::size_of::<EnrolStart>())
+        .reader().read()?;
+    validate_enrol_request(&request)
+}
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[::kernel::macros::kunit_tests(apple_sep_enrol_request)]
+mod enrol_request_tests {
+    use super::*;
+
+    fn valid() -> EnrolStart {
+        let mut request = EnrolStart {
+            flags: 0, account_uid: 1000, finger: 7, reserved: 0,
+            label: [0; LABEL_LEN],
+        };
+        request.label[..28].copy_from_slice(b"FP1-20261027-7-12345678-user");
+        request
+    }
+
+    #[test]
+    fn resolved_account_and_known_finger() {
+        assert!(validate_enrol_request(&valid()).is_ok());
+    }
+
+    #[test]
+    fn missing_uid_is_refused() {
+        let mut request = valid();
+        request.account_uid = u32::MAX;
+        assert!(validate_enrol_request(&request).is_err());
+    }
+
+    #[test]
+    fn unknown_or_mismatched_finger_is_refused() {
+        let mut request = valid();
+        request.finger = 0;
+        assert!(validate_enrol_request(&request).is_err());
+        request.finger = 6;
+        assert!(validate_enrol_request(&request).is_err());
+    }
+
+    #[test]
+    fn missing_username_is_refused() {
+        let mut request = valid();
+        request.label[24] = 0;
+        assert!(validate_enrol_request(&request).is_err());
+    }
+}
+
 fn enrol_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     require_admin()?;
     let request: EnrolStart = UserSlice::new(user, core::mem::size_of::<EnrolStart>())
         .reader()
         .read()?;
-    if request.flags != 0 || request.reserved != 0 {
-        return Err(EINVAL);
-    }
+    validate_enrol_request(&request)?;
     require_sensor(ctx.sensor_present)?;
 
     if ctx.session.worker_epoch.is_some() || !ctx.session.op.may_start() {
         return Err(EBUSY);
     }
-    if matches!(ctx.live_identity_count, Some(count) if count >= SEP_USER_CAPACITY)
-        || ctx.index.total() >= MAX_IDENTITIES
-    {
+    let count = ctx.live_identity_count.ok_or(EIO)?;
+    if count >= SEP_USER_CAPACITY || ctx.index.total() >= MAX_IDENTITIES {
         return Err(ENOSPC);
     }
 
@@ -958,6 +1101,10 @@ pub(crate) fn abort_capture(session: &mut Session) -> bool {
 /// The ioctls that start a sensor capture.
 pub(crate) fn starts_capture(cmd: u32) -> bool {
     cmd == IOC_ENROL_START || cmd == IOC_VERIFY_START
+}
+
+pub(crate) fn idle_for_mutation(session: &Session) -> bool {
+    session.worker_epoch.is_none() && session.op.may_start()
 }
 
 fn delete(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {

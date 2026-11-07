@@ -8,7 +8,7 @@
 
 Name:           aurora-sep
 Version:        1
-Release:        10%{?dist}
+Release:        11%{?dist}
 Summary:        Loader and desktop integration for the Apple SEP fingerprint driver
 
 License:        GPL-2.0-only
@@ -29,6 +29,7 @@ Source15:       aurora-sep-policy-change
 Source11:       aurora_sep.te
 Source12:       aurora_sep.fc
 Source13:       OS-IDENTITY.md
+Source16:       sep-bio-identities
 
 BuildArch:      noarch
 BuildRequires:  systemd-rpm-macros
@@ -97,6 +98,7 @@ sed 's|@FPRINTD@|%{_libexecdir}/fprintd|' %{SOURCE7} \
     >%{buildroot}%{_unitdir}/fprintd.service.d/50-aurora-sep-no-timeout.conf
 install -Dpm 0644 %{SOURCE8} \
     %{buildroot}%{_prefix}/lib/systemd/logind.conf.d/50-aurora-sep.conf
+install -Dpm 0755 %{SOURCE16} %{buildroot}%{_bindir}/sep-bio-identities
 # Load the driver at boot, so the enclave is up before the login screen asks.
 install -d %{buildroot}%{_presetdir}
 echo 'enable aurora-sep.service' >%{buildroot}%{_presetdir}/80-aurora-sep.preset
@@ -137,6 +139,7 @@ fi
 %{_libexecdir}/aurora-sep-load
 %{_libexecdir}/aurora-sep-ready
 %{_libexecdir}/aurora-sep-greeter-fingerprint
+%{_bindir}/sep-bio-identities
 %{_sbindir}/aurora-sep-policy-change
 %{_unitdir}/aurora-sep.service
 %{_unitdir}/aurora-sep-ready.service
@@ -153,10 +156,13 @@ fi
 %ghost %verify(not md5 size mode mtime) %{_sharedstatedir}/selinux/%{selinuxtype}/active/modules/200/%{modulename}
 
 %changelog
-* Fri Oct 30 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-10
+* Sun Nov 01 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-11
 - aurora-sep-selinux: name the device type aurora_sep_device_t, as the
   distribution packages do, let fprintd read input devices for the lid
   follower and let the readiness helpers open the device as init_t
+
+* Fri Oct 30 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-10
+- Add the Linux-lane orphan identity list and delete tool
 
 * Wed Oct 28 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-9
 - Start the login screen without waiting for Touch ID, and show it again

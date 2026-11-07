@@ -98,7 +98,8 @@ enum {
  * The IOP has not been started and no firmware image is programmed,
  * so nothing on this transport can answer the host until it is.
  */
-#define ANE_ASC_CPU_CONTROL	0x1400044	/* RUN = BIT(4) */
+#define ANE_ASC_CPU_CONTROL	0x1400044
+#define ANE_ASC_CPU_CONTROL_RUN	BIT(4)
 #define ANE_ASC_CPU_STATUS	0x1400048	/* m1n1 R_CPU_STATUS shape */
 #define ANE_ASC_RVBAR		0x1050000	/* fw entry | valid bit0 */
 #define ANE_ASC_EDPRCR		0x1010310	/* read whitelist */
@@ -371,6 +372,7 @@ struct ane_t6021_ep {
 };
 
 struct reset_control;
+struct firmware;
 
 struct ane_t6021 {
 	struct device *dev;
@@ -397,6 +399,7 @@ struct ane_t6021 {
 	 */
 	bool power_gated;
 	bool cpu_started;
+	bool boot_pin;
 	bool fw_alive;
 	bool booted;
 
@@ -422,6 +425,8 @@ struct ane_t6021 {
 	void *fw_buf;
 	dma_addr_t fw_iova;
 	u32 fw_size;
+	/* Validated pristine image retained for bounded, source-stable recovery. */
+	const struct firmware *fw_image;
 	/* Entry alias: IOVA the fw pages are aliased at (the latched
 	 * RVBAR entry); 0 = no alias mapped. The DMA allocator has no
 	 * runtime reservation API on this kernel, so instead of a prose
@@ -737,11 +742,15 @@ void ane_t6021_csne_ping_attempt(struct ane_t6021 *ane);
  */
 int ane_t6021_fwload_check(struct device *dev);
 int ane_t6021_fwload_probe(struct ane_t6021 *ane);
+int ane_t6021_fwload_reload(struct ane_t6021 *ane);
+bool ane_t6021_fwload_recoverable(struct ane_t6021 *ane);
+void ane_t6021_boot_release_pin(struct ane_t6021 *ane);
 void ane_t6021_fwload_remove(struct ane_t6021 *ane);
 bool ane_t6021_fwload_options_ok(void);
 bool ane_t6021_fwload_placement_ok(struct device *dev);
 bool ane_t6021_fwload_requested(void);
 
+struct ane_fw_platform;
 struct ane_fw_image;
 struct ane_asc_tunables;
 
@@ -753,8 +762,9 @@ struct ane_asc_tunables;
  *    for this SoC (T6021 only), so fw_alias_reserved=1 may map it; the
  *    other SoCs always run the firmware from driver-owned memory.
  *  ps_cpu_off: the ANE CPU ps word in the DT "pmgr" window (probe guard).
- *  pwgate_off: the PWGATE word in the DT "set" window, checked
- *    open before any engine read; 0 = not checked.
+ *  pwgate_off: the power gate word in the DT "set" window. The driver
+ *    opens it before ane_sys_cpu powers on, closes it after that state
+ *    powers off, and checks it open before any engine read; 0 = no gate.
  *  pmu_pa: the page of the seven ANE ps words; the firmware's power
  *    service writes them through its DART at IOVA == PA. ps_off: the
  *    first of the seven in that page.
@@ -762,6 +772,7 @@ struct ane_asc_tunables;
  *    trace_td; 0 = trace_td unsupported.
  */
 struct ane_t602x_soc {
+	const struct ane_fw_platform *platform;
 	u32 soc;
 	u32 soc_revision;
 	bool revision_fuse;

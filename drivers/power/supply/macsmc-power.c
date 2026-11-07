@@ -786,25 +786,6 @@ static int macsmc_battery_set_property(struct power_supply *psy,
 	return ret < 0 ? ret : 0;
 }
 
-/*
- * An earlier kernel could leave force-discharge set in CHLS without a charge limit, which this
- * driver never asks of the SMC. Clear the bit once at probe; the limit byte is kept.
- */
-static int macsmc_battery_clear_stray_discharge(struct macsmc_power *power)
-{
-	u16 chls;
-	int ret;
-
-	guard(mutex)(&power->charge_lock);
-	ret = apple_smc_read_u16(power->smc, SMC_KEY(CHLS), &chls);
-	if (ret)
-		return ret;
-	if (!(chls & CHLS_FORCE_DISCHARGE) || macsmc_chls_has_limit(chls))
-		return 0;
-	ret = apple_smc_write_u16(power->smc, SMC_KEY(CHLS), chls & ~CHLS_FORCE_DISCHARGE);
-	return ret < 0 ? ret : 0;
-}
-
 static int macsmc_battery_property_is_writeable(struct power_supply *psy,
 						enum power_supply_property psp)
 {
@@ -1108,26 +1089,16 @@ static int macsmc_power_probe(struct platform_device *pdev)
 				     of_machine_is_compatible("apple,j700");
 		power->status_from_current = of_machine_is_compatible("apple,j700");
 
-		/* Reset "Optimised Battery Charging" flags to default state */
-		if (power->has_chte)
-			apple_smc_write_u32(smc, SMC_KEY(CHTE), 0);
-		else if (power->has_ch0c)
-			apple_smc_write_u8(smc, SMC_KEY(CH0C), 0);
-
-		if (power->has_ch0i)
-			apple_smc_write_u8(smc, SMC_KEY(CH0I), 0);
-
-		apple_smc_write_u8(smc, SMC_KEY(CH0K), 0);
-		apple_smc_write_u8(smc, SMC_KEY(CH0B), 0);
-
+		/* Preserve firmware charge policy until userspace changes it. */
 		/* Detect charge limit method (CHWA vs CHLS) */
 		if (apple_smc_read_flag(power->smc, SMC_KEY(CHWA), &flag) == 0)
 			power->has_chwa = true;
 		else if (apple_smc_read_u16(power->smc, SMC_KEY(CHLS), &vu16) >= 0)
 			power->has_chls = true;
 
-		if (power->has_chls && macsmc_battery_clear_stray_discharge(power))
-			dev_warn(dev, "Failed to clear force-discharge without a charge limit\n");
+		if (power->has_chls && (vu16 & CHLS_FORCE_DISCHARGE) &&
+		    !macsmc_chls_has_limit(vu16))
+			dev_warn(dev, "CHLS force-discharge without a limit; select charge_behaviour=auto to clear\n");
 
 		/*
 		 * CHLS carries auto-discharge, so a CHLS-only Mac can select auto
