@@ -194,6 +194,9 @@ pub(crate) struct Config {
     /// The SoC's values of region C.
     pub(crate) region_c: &'static fw::initdata::RegionCConfig,
     pub(crate) chip: Option<&'static fw::initdata::v25g83::Chip>,
+    /// 25G83 initialization contents captured on one unit, written instead of what the
+    /// builders produce; `None` builds them.
+    pub(crate) captured: Option<&'static fw::initdata::v25g83::Captured>,
     /// Physical address of the firmware's per-slot recovery keys, read while the firmware is
     /// halted to attribute a fault; `None` where it is unknown (recovery then relies on the
     /// firmware's own blame).
@@ -1173,7 +1176,9 @@ impl Gpu {
         } else {
             None
         };
-        let variant = Self::firmware_variant(dev, &cfg.firmware)?;
+        let (variant, measured) = Self::firmware_variant(dev, &cfg.firmware)?;
+        // A build measured with its own configuration of the SoC runs with that one.
+        let cfg = measured.unwrap_or(cfg);
         let id = regs.get_g17_id()?;
         if let Some(calibration) = calibration {
             calibration.check_cores(&id.core_masks)?;
@@ -1324,14 +1329,15 @@ impl Gpu {
         Ok(gpu)
     }
 
-    /// Returns the variant of the loaded firmware build. An identified SoC refuses a build it
-    /// does not know, before anything is written to the GPU.
+    /// Returns the variant of the loaded firmware build and the configuration measured with it,
+    /// if it has its own. An identified SoC refuses a build it does not know, before anything
+    /// is written to the GPU.
     fn firmware_variant(
         dev: &AsahiDrmDevice,
         firmware: &fw::variant::Firmware,
-    ) -> Result<&'static fw::Variant> {
+    ) -> Result<(&'static fw::Variant, Option<&'static Config>)> {
         let builds = match firmware {
-            fw::variant::Firmware::Fixed(variant) => return Ok(variant),
+            fw::variant::Firmware::Fixed(variant) => return Ok((variant, None)),
             fw::variant::Firmware::Identified(builds) => builds,
         };
         let version = Self::os_firmware_version(dev);
@@ -1346,7 +1352,7 @@ impl Gpu {
         for build in Iterator::chain(preferred, others) {
             if Self::identify_image(dev, build).is_ok() {
                 dev_info!(dev.as_ref(), "GPU firmware: {}\n", build.name);
-                return Ok(build.variant);
+                return Ok((build.variant, build.config));
             }
         }
         dev_err!(

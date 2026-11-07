@@ -52,6 +52,7 @@ pub(crate) const CONFIG: Config = Config {
     uat_quirks: crate::mmu::UatQuirks::DEFAULT,
     region_c: &crate::g17::fw::initdata::REGION_C_26A428,
     chip: None,
+    captured: None,
     adopt_root_entries: true,
     fabric_bridge: true,
     firmware: crate::g17::fw::variant::Firmware::Fixed(&crate::g17::fw::variant::V26A428),
