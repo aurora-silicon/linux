@@ -232,8 +232,6 @@ int apple_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu **out)
 	int ret = -EPROBE_DEFER;
 
 	*out = NULL;
-	if (!dev->of_node)
-		return 0;
 	np = of_parse_phandle(dev->of_node, "apple,clpc", 0);
 	/*
 	 * Device trees that predate the link on the T8140 GPU still have
@@ -848,11 +846,12 @@ static int apple_clpc_ane_states_open(struct inode *inode, struct file *file)
 /* The top measured CPU/GPU states bound the rail's supported range. */
 static void apple_clpc_ane_states_set(struct apple_clpc *clpc, const int *states)
 {
-	unsigned int rail;
+	unsigned int rail, top;
 
-	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
-		clpc->ane_states[rail] = clamp_t(int, states[rail], 0,
-			max(clpc->hw->map[rail][APPLE_CLPC_LEVELS - 1], clpc->hw->gpu[rail]));
+	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++) {
+		top = max(clpc->hw->map[rail][APPLE_CLPC_LEVELS - 1], clpc->hw->gpu[rail]);
+		clpc->ane_states[rail] = clamp(states[rail], 0, (int)top);
+	}
 }
 
 static ssize_t apple_clpc_ane_states_write(struct file *file, const char __user *buf,

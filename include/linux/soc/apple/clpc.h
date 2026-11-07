@@ -13,6 +13,7 @@ struct apple_clpc_ane;
 int apple_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu **out);
 void apple_clpc_gpu_set_active(struct apple_clpc_gpu *gpu, bool active);
 void apple_clpc_gpu_put(struct apple_clpc_gpu *gpu);
+/* Optional, single-publisher input: success with NULL means no provider. */
 int apple_clpc_ane_get(struct device *dev, struct apple_clpc_ane **out);
 void apple_clpc_ane_set_active(struct apple_clpc_ane *ane, bool active);
 void apple_clpc_ane_put(struct apple_clpc_ane *ane);
