@@ -150,6 +150,12 @@ pub(crate) struct G17pRenderParameters {
     pub(crate) merge_upper_x_bits: u32,
     pub(crate) merge_upper_y_bits: u32,
     pub(crate) layers: u16,
+    /// Sample count: 1, 2 or 4. Defaults to 1, so every existing parameter
+    /// vector keeps its exact register program.
+    pub(crate) samples: u8,
+    /// Imageblock bytes per sample, as the render UAPI carries it. Read only
+    /// at two and four samples (`isp_sample_control`).
+    pub(crate) sample_size: u8,
     /// Utile dimensions in pixels, including the sample-layout adjustment.
     pub(crate) utile_width: u8,
     pub(crate) utile_height: u8,
@@ -280,6 +286,8 @@ impl G17pRenderParameters {
             merge_upper_x_bits: 0x3cdd_b3d9,
             merge_upper_y_bits: 0x3cdd_b3d9,
             layers: 1,
+            samples: 1,
+            sample_size: 0,
             utile_width: 32,
             utile_height: 32,
             utile_config: 0xa000,
@@ -326,6 +334,32 @@ struct Geometry {
     screen: u64,
     pixels: u64,
     macro_size: u64,
+}
+
+/// Register 0x10051 and fragment descriptor +0x1f38. A single-sample render
+/// keeps the TIB block count its captures were matched against. At two and
+/// four samples the field is the ISP sample allocation instead, in bits
+/// 16..20, as the g17 M5 driver programs it for native-sized 4x renders
+/// (ewb/j716c-daily isp_sample_control). The block count left it zero, and
+/// a 4x render of more than 16 tiles failed the GPU.
+fn isp_sample_control(p: &G17pRenderParameters) -> u64 {
+    if p.samples <= 1 {
+        return p.tib_blocks;
+    }
+    let sample_bytes = (p.sample_size.max(8) as u64 + 7) & !7;
+    let groups = sample_bytes.div_ceil(32);
+    let units = (p.utile_width as u64 >> 3) * (p.utile_height as u64 >> 2) * groups;
+    let value = match p.samples {
+        2 => units.max(8) >> 3,
+        4 => units >> 1,
+        _ => 0,
+    };
+    let value = if p.samples == 2 && p.utile_width == 16 && p.utile_height == 16 {
+        value
+    } else {
+        value >> 1
+    };
+    (value & 0x1f) << 16
 }
 
 const fn align(value: u64, alignment: u64) -> u64 {
@@ -619,7 +653,7 @@ fn build_fragment_registers_for_work_key(
         RegisterWrite::new(0x15021, p.aux_fb_flags),
         RegisterWrite::new(0x15211, ((p.height as u64) << 32) | p.width as u64),
         RegisterWrite::new(0x15049, p.aux_fb_page_count),
-        RegisterWrite::new(0x10051, p.tib_blocks),
+        RegisterWrite::new(0x10051, isp_sample_control(p)),
         RegisterWrite::new(0x15321, p.depth_dimensions),
         RegisterWrite::new(0x15301, p.depth_clear_value_bits as u64),
         RegisterWrite::new(0x15309, (p.stencil_clear_value | 0x300) as u64),
@@ -1060,7 +1094,7 @@ pub(crate) fn build_fragment_descriptor_base(
     put_u64(raw, 0x1ea8, parameters.partial_load_pipeline_bind);
     put_u64(raw, 0x1eb0, parameters.partial_load_pipeline);
     put_u32(raw, 0x1ec0, 0x0404_0404);
-    put_u64(raw, 0x1f38, parameters.tib_blocks);
+    put_u64(raw, 0x1f38, isp_sample_control(parameters));
     put_u64(raw, 0x1f40, parameters.aux_fb_flags);
     put_u32(raw, 0x1f48, parameters.width);
     put_u32(raw, 0x1f4c, parameters.height);
@@ -1071,7 +1105,14 @@ pub(crate) fn build_fragment_descriptor_base(
     put_u32(raw, 0x1f98, parameters.partial_store_pipeline_bind as u32);
     put_u64(raw, 0x1f9c, parameters.partial_store_pipeline);
     put_u32(raw, 0x1fa8, parameters.depth_clear_value_bits);
-    put_u64(raw, 0x1fac, (parameters.tib_blocks << 33) | 0x300);
+    // +0x1fb0 is the imageblock allocation per sample. Twice the block count
+    // is that at one sample with a 32x32 utile; a multisampled render names
+    // it directly, as native's 4x captures keep it (g17 M5 driver).
+    if parameters.samples > 1 {
+        put_u64(raw, 0x1fac, ((parameters.sample_size as u64) << 32) | 0x300);
+    } else {
+        put_u64(raw, 0x1fac, (parameters.tib_blocks << 33) | 0x300);
+    }
     // Native copies isMemorylessRender through the UMD render record +0x240,
     // parsed record +0x1b8, and host descriptor +0x8bf into this byte. It is
     // not a TIB-size predicate: native's memoryless policy also selects the
