@@ -1,14 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * J613 25G83 (macOS 26.6.2 firmware): the boot NOR and its NVRAM sit
- * behind the QSPIMC controller, not SPI1.
- *
- * ADT /arm-io/qspi: P=0x2a1118000, C=P+0x800, IRQ 771, gate 73;
- * /arm-io/qspi/spinor/anvram: 0x700000, 1 MiB.
- *
- * spi-apple-qspi defaults read-only. Bounded NVRAM writes need an explicit
- * runtime opt-in. Leave the MTD device openable O_RDWR: asahi-bless opens
- * it that way for --get-boot without writing.
+ * J613 25G83 (macOS 26.6.2 firmware): the NOR and its NVRAM sit behind QSPI,
+ * not SPI1. The driver stays read-only unless writes are opted in at runtime;
+ * the MTD stays openable O_RDWR for asahi-bless --get-boot.
  */
 
 / {

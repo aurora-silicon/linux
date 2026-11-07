@@ -4129,7 +4129,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 		(res->start == 0x286300000ULL || res->start == 0x48a300000ULL);
 	/* The radio DART's fault interrupt is not described by the loader. */
-	j713_radio = res && !tunneled && apple_t8132_air() &&
+	j713_radio = res && !tunneled && apple_t8132_managed_radio() &&
 		of_machine_is_compatible("apple,t8132") &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 		res->start == 0x490000000ULL;
@@ -4532,12 +4532,12 @@ params_done:
 		of_node_put(iommu);
 		of_node_put(mtp);
 	}
-	if (apple_t8132_air() && of_machine_is_compatible("apple,t8132") &&
+	if (apple_t8132_live_mtp() && of_machine_is_compatible("apple,t8132") &&
 	    res->start == 0x394800000ULL && dart->hw->type == DART_T8110 &&
 	    !dart->locked && !tunneled && dart->supports_bypass &&
 	    apple_dart_streams_bypassed(dart)) {
 		dart->retained_mtp = true;
-		dev_info(dev, "Retaining the live J713 MTP bypass\n");
+		dev_info(dev, "Retaining the live T8132 MTP bypass\n");
 	}
 	if (dart->preserve_display) {
 		if (dart->hw->type != DART_T8110 || !bitmap_empty(dart->remapped, DART_MAX_STREAMS)) {

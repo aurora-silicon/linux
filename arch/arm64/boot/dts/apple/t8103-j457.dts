@@ -151,3 +151,6 @@
 &isp {
 	apple,platform-id = <2>;
 };
+
+/* One fan on the 2-port model, from the product spec, not an ADT. */
+#include "hwmon-fan.dtsi"

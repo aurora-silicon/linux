@@ -1,20 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * HDMI port of the t6030 (M3 Pro) MacBook Pros j514s and j516s.
- *
- * The first external display processor drives ATC3 as a four-lane
- * DisplayPort PHY through the ATC3 display crossbar into an on-board
- * DP-to-HDMI converter, as on the M1/M2 Pro and Max MacBook Pros. The
- * converter has its own power enable, the HDMI port another one, and the
- * port's hotplug signal comes in on an AOP GPIO.
- *
- * The processor stays a hybrid pipeline: while no HDMI display is attached
- * it can still be lent to a USB-C port.
- *
- * The HDMI port's audio is the processor's audio service with DPA1, the
- * DisplayPort audio interface its port@0 links (no AP-side registers): SIO
- * channel 0x66 carries the samples, as on the M1 Pro/Max HDMI port. The
- * loader reserves the SIO firmware and enables the SIO with its parameters.
+ * HDMI port of the T6030 (M3 Pro) J514S and J516S: dcpext drives ATC3 as a
+ * four-lane DP PHY into a DP-to-HDMI converter, as on the M1/M2 Pro and Max
+ * MacBook Pros, and can still lend itself to a USB-C port. Its audio is DPA1
+ * on SIO channel 0x66.
  */
 
 / {
@@ -114,10 +103,7 @@
 	status = "okay";
 };
 
-/*
- * ATC3 has no USB consumer that would hold its common block on, so across
- * system sleep it would power down and lose the HDMI PHY state.
- */
+/* Nothing else holds ATC3 on across sleep, which loses the PHY state. */
 &ps_atc3_common {
 	apple,always-on;
 };
