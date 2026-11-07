@@ -15,18 +15,25 @@ description: |
 
 properties:
   compatible:
-    oneOf:
-      - items:
-          - const: apple,t6041-aes
-          - const: apple,aes
-      - items:
-          - const: apple,t8140-aes
-          - const: apple,aes
+    items:
+      - enum:
+          - apple,t6000-aes
+          - apple,t6020-aes
+          - apple,t6021-aes
+          - apple,t6022-aes
+          - apple,t6030-aes
+          - apple,t6031-aes
+          - apple,t6041-aes
+          - apple,t8103-aes
+          - apple,t8112-aes
+          - apple,t8122-aes
+          - apple,t8140-aes
+      - const: apple,aes
 
   reg:
-    minItems: 3
+    minItems: 2
     maxItems: 3
-    description: Register apertures in hardware-description order.
+    description: Engine and control banks, with an auxiliary bank on later variants.
 
   interrupts:
     maxItems: 1
@@ -35,7 +42,8 @@ properties:
     maxItems: 1
 
   iommus:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
 
 required:
   - compatible
@@ -43,5 +51,42 @@ required:
   - interrupts
   - power-domains
   - iommus
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t6000-aes
+              - apple,t6020-aes
+              - apple,t6021-aes
+              - apple,t6022-aes
+              - apple,t6030-aes
+              - apple,t6031-aes
+              - apple,t8103-aes
+              - apple,t8112-aes
+              - apple,t8122-aes
+    then:
+      properties:
+        reg:
+          maxItems: 2
+    else:
+      properties:
+        reg:
+          minItems: 3
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6000-aes
+    then:
+      properties:
+        iommus:
+          minItems: 2
+    else:
+      properties:
+        iommus:
+          maxItems: 1
 
 additionalProperties: false

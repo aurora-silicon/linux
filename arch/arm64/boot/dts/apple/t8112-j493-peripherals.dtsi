@@ -1,0 +1,36 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Additional T8112 hardware resources. Keep unqualified blocks disabled. */
+
+&aop_spmi1 {
+	interrupt-parent = <&aic>;
+	interrupts = <AIC_IRQ 357 IRQ_TYPE_LEVEL_HIGH>;
+	#address-cells = <2>;
+	#size-cells = <0>;
+	interrupt-controller;
+	#interrupt-cells = <2>;
+	status = "disabled";
+
+	nfc@c {
+		compatible = "apple,t8112-spmi-nfc",
+			"apple,spmi-nfc";
+		reg = <0xc SPMI_USID>;
+		interrupt-parent = <&aop_spmi1>;
+		interrupts = <160 IRQ_TYPE_LEVEL_HIGH>,
+			<161 IRQ_TYPE_LEVEL_HIGH>,
+			<162 IRQ_TYPE_LEVEL_HIGH>,
+			<163 IRQ_TYPE_LEVEL_HIGH>,
+			<164 IRQ_TYPE_LEVEL_HIGH>,
+			<165 IRQ_TYPE_LEVEL_HIGH>,
+			<166 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+};
+
+&nub_spmi1 {
+	pmic@e {
+		compatible = "apple,vale-pmic", "apple,spmi-nvmem";
+		reg = <0xe SPMI_USID>;
+		read-only;
+		status = "disabled";
+	};
+};
