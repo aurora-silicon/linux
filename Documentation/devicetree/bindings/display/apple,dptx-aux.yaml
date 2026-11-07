@@ -2,29 +2,110 @@
 %YAML 1.2
 ---
 $id: "http://devicetree.org/schemas/display/apple,dptx-aux.yaml#"
+
 $schema: "http://devicetree.org/meta-schemas/core.yaml#"
+
 title: "Apple dptx aux hardware resources"
+
 maintainers:
   - "Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>"
+
 description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+
+select:
+  anyOf:
+    -
+      properties:
+        compatible:
+          contains:
+            enum:
+              - "apple,dptx-aux"
+              - "apple,t6050-dptx-aux"
+      required:
+        - "compatible"
+    -
+      properties:
+        compatible:
+          items:
+            -
+              const: "apple,t6050-dptx-aux"
+            -
+              const: "apple,dptx-aux"
+      required:
+        - "compatible"
+
 properties:
-  compatible:
-    items:
-      -
-        const: "apple,t6050-dptx-aux"
-      -
-        const: "apple,dptx-aux"
-  status:
-    const: "disabled"
-  reg:
-    minItems: 2
-    maxItems: 2
-    description: "Native register apertures in hardware-interface order, including shared auxiliary views."
-  power-domains:
-    maxItems: 1
-required:
-  - "compatible"
-  - "reg"
-  - "status"
-  - "power-domains"
-additionalProperties: false
+  compatible: true
+  status: true
+  reg: true
+  power-domains: true
+  interrupts: true
+  iommus: true
+  clocks: true
+  resets: true
+
+additionalProperties: true
+
+allOf:
+  - if:
+      anyOf:
+        -
+          properties:
+            compatible:
+              items:
+                -
+                  const: "apple,t6050-dptx-aux"
+                -
+                  const: "apple,dptx-aux"
+            status:
+              const: "disabled"
+          required:
+            - "compatible"
+            - "status"
+    then:
+      oneOf:
+        -
+          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          properties:
+            compatible:
+              items:
+                -
+                  const: "apple,t6050-dptx-aux"
+                -
+                  const: "apple,dptx-aux"
+            status:
+              const: "disabled"
+            reg:
+              minItems: 2
+              maxItems: 2
+              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+            power-domains:
+              maxItems: 1
+          required:
+            - "compatible"
+            - "reg"
+            - "status"
+            - "power-domains"
+          additionalProperties: false
+    else:
+      properties:
+        compatible:
+          items:
+            -
+              const: "apple,t6050-dptx-aux"
+            -
+              const: "apple,dptx-aux"
+        status:
+          const: "disabled"
+        reg:
+          minItems: 2
+          maxItems: 2
+          description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+        power-domains:
+          maxItems: 1
+      required:
+        - "compatible"
+        - "reg"
+        - "status"
+        - "power-domains"
+      additionalProperties: false

@@ -139,6 +139,8 @@ properties:
       the exclave DART contexts. Absence does not prove a handoff on T8140.
   status: true
 
+additionalProperties: true
+
 allOf:
   - if:
       anyOf:

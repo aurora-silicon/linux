@@ -67,6 +67,8 @@ properties:
   resets: true
   status: true
 
+additionalProperties: true
+
 allOf:
   - if:
       anyOf:

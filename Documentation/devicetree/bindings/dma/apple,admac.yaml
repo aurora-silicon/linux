@@ -72,6 +72,8 @@ properties:
   clocks: true
   status: true
 
+additionalProperties: true
+
 allOf:
   - if:
       anyOf:

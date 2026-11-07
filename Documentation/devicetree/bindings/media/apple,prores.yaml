@@ -57,6 +57,8 @@ properties:
   resets: true
   status: true
 
+additionalProperties: true
+
 allOf:
   - if:
       anyOf:
@@ -87,7 +89,7 @@ allOf:
             status:
               const: "disabled"
             reg:
-              minItems: 5
+              minItems: 2
               maxItems: 5
               description: "Native register apertures in hardware-interface order, including shared auxiliary views."
             interrupts:

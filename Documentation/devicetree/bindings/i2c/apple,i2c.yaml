@@ -68,6 +68,8 @@ properties:
   iommus: true
   status: true
 
+additionalProperties: true
+
 allOf:
   - if:
       anyOf:

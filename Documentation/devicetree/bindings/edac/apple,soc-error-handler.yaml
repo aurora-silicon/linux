@@ -61,6 +61,16 @@ select:
         compatible:
           items:
             -
+              const: "apple,t6050-error-handler"
+            -
+              const: "apple,soc-error-handler"
+      required:
+        - "compatible"
+    -
+      properties:
+        compatible:
+          items:
+            -
               const: "apple,t6050-event-log"
             -
               const: "apple,soc-event-log"
@@ -77,9 +87,24 @@ properties:
   resets: true
   status: true
 
+additionalProperties: true
+
 allOf:
   - if:
       anyOf:
+        -
+          properties:
+            compatible:
+              items:
+                -
+                  const: "apple,t6050-error-handler"
+                -
+                  const: "apple,soc-error-handler"
+            status:
+              const: "disabled"
+          required:
+            - "compatible"
+            - "status"
         -
           properties:
             compatible:
@@ -95,6 +120,30 @@ allOf:
             - "status"
     then:
       oneOf:
+        -
+          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          properties:
+            compatible:
+              items:
+                -
+                  const: "apple,t6050-error-handler"
+                -
+                  const: "apple,soc-error-handler"
+            status:
+              const: "disabled"
+            reg:
+              minItems: 214
+              maxItems: 214
+              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+            interrupts:
+              minItems: 105
+              maxItems: 105
+          required:
+            - "compatible"
+            - "reg"
+            - "status"
+            - "interrupts"
+          additionalProperties: false
         -
           description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
           properties:
