@@ -21,6 +21,7 @@
  * @smc: Pointer to apple_smc struct of the mfd parent
  * @input: Allocated input_dev; devres managed
  * @nb: Notifier block used for incoming events from SMC (e.g. button pressed down)
+ * @pm_nb: Notifier block for the start and end of a system suspend
  * @wakeup_mode: Set to true when system is suspended and power button events should wake it
  */
 struct macsmc_input {
@@ -28,6 +29,7 @@ struct macsmc_input {
 	struct apple_smc *smc;
 	struct input_dev *input;
 	struct notifier_block nb;
+	struct notifier_block pm_nb;
 	bool wakeup_mode;
 };
 
@@ -105,6 +107,30 @@ static int macsmc_input_event(struct notifier_block *nb, unsigned long event, vo
 		/* SMC event meant for another driver */
 		return NOTIFY_DONE;
 	}
+}
+
+/*
+ * A suspend's first steps run before .prepare, and the SMC reports the lid and the button as
+ * plain events until its AP idle notice. Treat them as wakes from the suspend's start, so a lid
+ * opened or a button pressed while the machine goes down ends the suspend, as on macOS.
+ */
+static int macsmc_input_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct macsmc_input *smcin = container_of(nb, struct macsmc_input, pm_nb);
+
+	if (action == PM_SUSPEND_PREPARE)
+		WRITE_ONCE(smcin->wakeup_mode, true);
+	else if (action == PM_POST_SUSPEND)
+		WRITE_ONCE(smcin->wakeup_mode, false);
+
+	return NOTIFY_DONE;
+}
+
+static void macsmc_input_unregister_pm_notifier(void *data)
+{
+	struct macsmc_input *smcin = data;
+
+	unregister_pm_notifier(&smcin->pm_nb);
 }
 
 static void macsmc_input_unregister_notifier(void *data)
@@ -199,7 +225,12 @@ static int macsmc_input_probe(struct platform_device *pdev)
 	if (error)
 		return error;
 
-	return 0;
+	smcin->pm_nb.notifier_call = macsmc_input_pm_notify;
+	error = register_pm_notifier(&smcin->pm_nb);
+	if (error)
+		return error;
+
+	return devm_add_action_or_reset(&pdev->dev, macsmc_input_unregister_pm_notifier, smcin);
 }
 
 static int macsmc_input_pm_prepare(struct device *dev)
