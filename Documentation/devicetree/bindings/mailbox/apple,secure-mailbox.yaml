@@ -21,7 +21,6 @@ properties:
           - const: apple,secure-mailbox
 
   reg:
-    minItems: 1
     maxItems: 1
     description: Register apertures in hardware-description order.
 
@@ -30,7 +29,6 @@ properties:
     maxItems: 2
 
   iommus:
-    minItems: 1
     maxItems: 1
 
 required:

@@ -24,16 +24,13 @@ properties:
           - const: apple,dwi
 
   reg:
-    minItems: 1
     maxItems: 1
     description: Register apertures in hardware-description order.
 
   interrupts:
-    minItems: 1
     maxItems: 1
 
   power-domains:
-    minItems: 1
     maxItems: 1
 
 required:
