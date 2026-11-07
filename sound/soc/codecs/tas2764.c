@@ -341,6 +341,7 @@ static int tas2764_update_pwr_ctrl(struct tas2764_priv *tas2764)
 }
 
 static void tas2764_flush_shutdown(struct tas2764_priv *tas2764);
+static int tas2764_apply_init_quirks(struct tas2764_priv *tas2764);
 
 #ifdef CONFIG_PM
 /*
@@ -417,6 +418,16 @@ static int tas2764_codec_resume(struct snd_soc_component *component)
 	regcache_cache_only(tas2764->regmap, false);
 
 	ret = regcache_sync(tas2764->regmap);
+	/*
+	 * An amp whose SDZ went low came back from a power-on reset, and the
+	 * cache sync restores only the cached registers: the init quirks
+	 * also write TI's volatile quirk page, which the reset cleared and
+	 * nothing wrote again. Without them a J316 woofer amp latched an
+	 * over-current at the first stream after a resume. Apply them again,
+	 * as the probe does.
+	 */
+	if (ret >= 0 && !tas2764->sdz_group && tas2764->devid == DEVID_SN012776)
+		ret = tas2764_apply_init_quirks(tas2764);
 	if (ret >= 0)
 		ret = tas2764_update_pwr_ctrl(tas2764);
 
@@ -1341,9 +1352,36 @@ static bool tas2764_volatile_register(struct device *dev, unsigned int reg)
 	}
 }
 
+/*
+ * The registers the driver writes: page 0, the page 1 and page 6 registers of
+ * the quirk sequences and the SDOUT high-impedance masks, and TI's quirk pages
+ * (volatile). A cache sync after a resume writes back only these. Anything
+ * else in the cache got there through a read alone, such as a regmap debugfs
+ * dump of every page, and some of those registers are reserved: a raw block
+ * written over them at resume is never completed by the amp and leaves the
+ * I2C controller stuck in its transaction, taking every amp on the bus with
+ * it.
+ */
+static bool tas2764_writeable_register(struct device *dev, unsigned int reg)
+{
+	switch (reg) {
+	case TAS2764_REG(0x0, 0x00) ... TAS2764_REG(0x0, 0x7f):
+	case TAS2764_REG(0x1, 0x33):
+	case TAS2764_REG(0x1, 0x37):
+	case TAS2764_SDOUT_HIZ_1 ... TAS2764_SDOUT_HIZ_9:
+	case TAS2764_REG(0x1, 0x47):
+	case TAS2764_REG(0x6, 0x14) ... TAS2764_REG(0x6, 0x1f):
+	case TAS2764_REG(0xf0, 0x0) ... TAS2764_REG(0xff, 0x7f):
+		return true;
+	default:
+		return false;
+	}
+}
+
 static const struct regmap_config tas2764_i2c_regmap = {
 	.reg_bits = 8,
 	.val_bits = 8,
+	.writeable_reg = tas2764_writeable_register,
 	.volatile_reg = tas2764_volatile_register,
 	.reg_defaults = tas2764_reg_defaults,
 	.num_reg_defaults = ARRAY_SIZE(tas2764_reg_defaults),
