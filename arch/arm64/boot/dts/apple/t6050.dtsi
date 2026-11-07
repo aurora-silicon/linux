@@ -22,150 +22,330 @@
 	cpus {
 		#address-cells = <2>;
 		#size-cells = <0>;
-		cpu0: cpu@0 {
+		cpu0: cpu@40000 {
 			compatible = "apple,sawtooth";
 			device_type = "cpu";
-			reg = <0 0x0>;
+			reg = <0 0x40000>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			status = "disabled";
 		};
-		cpu1: cpu@1 {
+		cpu1: cpu@40001 {
 			compatible = "apple,sawtooth";
 			device_type = "cpu";
-			reg = <0 0x1>;
+			reg = <0 0x40001>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			status = "disabled";
 		};
-		cpu2: cpu@2 {
+		cpu2: cpu@40002 {
 			compatible = "apple,sawtooth";
 			device_type = "cpu";
-			reg = <0 0x2>;
+			reg = <0 0x40002>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			status = "disabled";
 		};
-		cpu3: cpu@3 {
+		cpu3: cpu@40003 {
 			compatible = "apple,sawtooth";
 			device_type = "cpu";
-			reg = <0 0x3>;
+			reg = <0 0x40003>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			status = "disabled";
 		};
-		cpu4: cpu@4 {
+		cpu4: cpu@40004 {
 			compatible = "apple,sawtooth";
 			device_type = "cpu";
-			reg = <0 0x4>;
+			reg = <0 0x40004>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			status = "disabled";
 		};
-		cpu5: cpu@5 {
+		cpu5: cpu@40005 {
 			compatible = "apple,sawtooth";
 			device_type = "cpu";
-			reg = <0 0x5>;
+			reg = <0 0x40005>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			status = "disabled";
 		};
-		cpu6: cpu@100 {
+		cpu6: cpu@40100 {
 			compatible = "apple,sawtooth";
 			device_type = "cpu";
-			reg = <0 0x100>;
+			reg = <0 0x40100>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			status = "disabled";
 		};
-		cpu7: cpu@101 {
+		cpu7: cpu@40101 {
 			compatible = "apple,sawtooth";
 			device_type = "cpu";
-			reg = <0 0x101>;
+			reg = <0 0x40101>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			status = "disabled";
 		};
-		cpu8: cpu@102 {
+		cpu8: cpu@40102 {
 			compatible = "apple,sawtooth";
 			device_type = "cpu";
-			reg = <0 0x102>;
+			reg = <0 0x40102>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			status = "disabled";
 		};
-		cpu9: cpu@103 {
+		cpu9: cpu@40103 {
 			compatible = "apple,sawtooth";
 			device_type = "cpu";
-			reg = <0 0x103>;
+			reg = <0 0x40103>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			status = "disabled";
 		};
-		cpu10: cpu@104 {
+		cpu10: cpu@40104 {
 			compatible = "apple,sawtooth";
 			device_type = "cpu";
-			reg = <0 0x104>;
+			reg = <0 0x40104>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			status = "disabled";
 		};
-		cpu11: cpu@105 {
+		cpu11: cpu@40105 {
 			compatible = "apple,sawtooth";
 			device_type = "cpu";
-			reg = <0 0x105>;
+			reg = <0 0x40105>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			status = "disabled";
 		};
-		cpu12: cpu@200 {
+		cpu12: cpu@10200 {
 			compatible = "apple,everest";
 			device_type = "cpu";
-			reg = <0 0x200>;
+			reg = <0 0x10200>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			status = "disabled";
 		};
-		cpu13: cpu@201 {
+		cpu13: cpu@10201 {
 			compatible = "apple,everest";
 			device_type = "cpu";
-			reg = <0 0x201>;
+			reg = <0 0x10201>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			status = "disabled";
 		};
-		cpu14: cpu@202 {
+		cpu14: cpu@10202 {
 			compatible = "apple,everest";
 			device_type = "cpu";
-			reg = <0 0x202>;
+			reg = <0 0x10202>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			status = "disabled";
 		};
-		cpu15: cpu@203 {
+		cpu15: cpu@10203 {
 			compatible = "apple,everest";
 			device_type = "cpu";
-			reg = <0 0x203>;
+			reg = <0 0x10203>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			status = "disabled";
 		};
-		cpu16: cpu@204 {
+		cpu16: cpu@10204 {
 			compatible = "apple,everest";
 			device_type = "cpu";
-			reg = <0 0x204>;
+			reg = <0 0x10204>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			status = "disabled";
 		};
-		cpu17: cpu@205 {
+		cpu17: cpu@10205 {
 			compatible = "apple,everest";
 			device_type = "cpu";
-			reg = <0 0x205>;
+			reg = <0 0x10205>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			status = "disabled";
 		};
+#ifdef T6050_J775D
+		cpu18: cpu@41000 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x41000>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			status = "disabled";
+		};
+#endif
+#ifdef T6050_J775D
+		cpu19: cpu@41001 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x41001>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			status = "disabled";
+		};
+#endif
+#ifdef T6050_J775D
+		cpu20: cpu@41002 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x41002>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			status = "disabled";
+		};
+#endif
+#ifdef T6050_J775D
+		cpu21: cpu@41003 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x41003>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			status = "disabled";
+		};
+#endif
+#ifdef T6050_J775D
+		cpu22: cpu@41004 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x41004>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			status = "disabled";
+		};
+#endif
+#ifdef T6050_J775D
+		cpu23: cpu@41005 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x41005>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			status = "disabled";
+		};
+#endif
+#ifdef T6050_J775D
+		cpu24: cpu@41100 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x41100>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			status = "disabled";
+		};
+#endif
+#ifdef T6050_J775D
+		cpu25: cpu@41101 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x41101>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			status = "disabled";
+		};
+#endif
+#ifdef T6050_J775D
+		cpu26: cpu@41102 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x41102>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			status = "disabled";
+		};
+#endif
+#ifdef T6050_J775D
+		cpu27: cpu@41103 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x41103>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			status = "disabled";
+		};
+#endif
+#ifdef T6050_J775D
+		cpu28: cpu@41104 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x41104>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			status = "disabled";
+		};
+#endif
+#ifdef T6050_J775D
+		cpu29: cpu@41105 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x41105>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			status = "disabled";
+		};
+#endif
+#ifdef T6050_J775D
+		cpu30: cpu@11200 {
+			compatible = "apple,everest";
+			device_type = "cpu";
+			reg = <0 0x11200>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			status = "disabled";
+		};
+#endif
+#ifdef T6050_J775D
+		cpu31: cpu@11201 {
+			compatible = "apple,everest";
+			device_type = "cpu";
+			reg = <0 0x11201>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			status = "disabled";
+		};
+#endif
+#ifdef T6050_J775D
+		cpu32: cpu@11202 {
+			compatible = "apple,everest";
+			device_type = "cpu";
+			reg = <0 0x11202>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			status = "disabled";
+		};
+#endif
+#ifdef T6050_J775D
+		cpu33: cpu@11203 {
+			compatible = "apple,everest";
+			device_type = "cpu";
+			reg = <0 0x11203>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			status = "disabled";
+		};
+#endif
+#ifdef T6050_J775D
+		cpu34: cpu@11204 {
+			compatible = "apple,everest";
+			device_type = "cpu";
+			reg = <0 0x11204>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			status = "disabled";
+		};
+#endif
+#ifdef T6050_J775D
+		cpu35: cpu@11205 {
+			compatible = "apple,everest";
+			device_type = "cpu";
+			reg = <0 0x11205>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			status = "disabled";
+		};
+#endif
 	};
 
 	timer {
