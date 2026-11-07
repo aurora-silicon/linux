@@ -38,8 +38,8 @@
 #include <linux/regmap.h>
 #include <linux/seq_file.h>
 #include <linux/soc/apple/pmc.h>
-#include <linux/workqueue.h>
 #include <linux/uaccess.h>
+#include <linux/workqueue.h>
 
 #define APPLE_CLPC_MAX_CLUSTERS	8
 #define APPLE_CLPC_LEVELS	4
@@ -855,7 +855,7 @@ static void apple_clpc_ane_states_set(struct apple_clpc *clpc, const int *states
 }
 
 static ssize_t apple_clpc_ane_states_write(struct file *file, const char __user *buf,
-					 size_t count, loff_t *ppos)
+					   size_t count, loff_t *ppos)
 {
 	struct apple_clpc *clpc = ((struct seq_file *)file->private_data)->private;
 	char text[48], extra;
@@ -1377,9 +1377,9 @@ static void apple_clpc_ane_demand_hold_test(struct kunit *test)
 	memset(demand, 0, sizeof(demand));
 	KUNIT_EXPECT_FALSE(test, apple_clpc_ane_input_demand(clpc, demand));
 	KUNIT_EXPECT_EQ(test, apple_clpc_vote(&vote, demand[APPLE_CLPC_DCS],
-					     now + hold - 1), 4u);
+					      now + hold - 1), 4u);
 	KUNIT_EXPECT_EQ(test, apple_clpc_vote(&vote, demand[APPLE_CLPC_DCS],
-					     now + hold), 0u);
+					      now + hold), 0u);
 	/* A request completing before the worker runs still earns the hold. */
 	apple_clpc_ane_set_active(&ane, true);
 	apple_clpc_ane_set_active(&ane, false);
