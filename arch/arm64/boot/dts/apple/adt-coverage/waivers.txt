@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# board-glob ADT-path-glob | reason
+# Patterns apply to a single path component; ** is deliberately unsupported.
+# Hardware without a DT representation must remain MISSING until reviewed.
+* /arm-io | ADT SoC bus container; child hardware is inventoried separately.
+* /cpus | CPU collection container; individual CPUs are checked separately.
+* /arm-io/pmgr/power-domains | ADT power-domain collection container; individual domains require review.
+* /arm-io/pmgr/power-devices | ADT power-device collection container; individual power-state records are checked separately.

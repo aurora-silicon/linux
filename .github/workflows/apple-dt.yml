@@ -1,0 +1,45 @@
+name: Apple DT validation
+
+on:
+  pull_request:
+    paths:
+      - 'arch/arm64/boot/dts/apple/**'
+      - 'Documentation/devicetree/**'
+      - 'scripts/dtc/**'
+      - '.github/workflows/apple-dt.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apple-dt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install DT validation tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q clang lld llvm flex bison make bc \
+            libssl-dev libelf-dev device-tree-compiler python3-libfdt python3-venv
+          python3 -m venv --system-site-packages .dt-venv
+          .dt-venv/bin/pip install dtschema
+          echo "$GITHUB_WORKSPACE/.dt-venv/bin" >> "$GITHUB_PATH"
+      - name: Configure Apple DTBs
+        run: |
+          make O=out ARCH=arm64 LLVM=1 allnoconfig
+          scripts/config --file out/.config -e ARCH_APPLE
+          make O=out ARCH=arm64 LLVM=1 olddefconfig
+      - name: dtbs_check
+        run: make O=out ARCH=arm64 LLVM=1 -j2 dtbs_check
+      - name: Test the coverage checker
+        run: python3 scripts/dtc/apple-adt-coverage-test.py
+      - name: Report ADT coverage
+        run: |
+          python3 scripts/dtc/apple-adt-coverage.py \
+            --dtb-dir out/arch/arm64/boot/dts/apple --report
+      - name: Require complete ADT coverage
+        run: |
+          python3 scripts/dtc/apple-adt-coverage.py \
+            --dtb-dir out/arch/arm64/boot/dts/apple
