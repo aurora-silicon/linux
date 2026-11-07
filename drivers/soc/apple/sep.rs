@@ -446,11 +446,13 @@ const ENROL_CAPTURE_TIMEOUT_MS: u32 = 60_000;
 const ENROL_POLL_ATTEMPTS: u32 = ENROL_CAPTURE_TIMEOUT_MS / ENROL_POLL_MS;
 static_assert!(ENROL_POLL_ATTEMPTS * ENROL_POLL_MS == ENROL_CAPTURE_TIMEOUT_MS);
 
-const ENROL_REPOSITION_MS: u32 = 1800;
+// How long the next capture waits for the last touch's finger to be lifted
+// before it arms anyway: as long as a capture waits for a finger.
+const LIFT_WAIT_MS: u32 = ENROL_CAPTURE_TIMEOUT_MS;
 
-const MATCH_SETTLE_MS: u32 = ENROL_REPOSITION_MS;
-
-const ENROL_IDLE_TIMEOUT_MS: u32 = 2000;
+// The backstop interval of that wait. The sensor's interrupt wakes it at the
+// lift; this bounds a missed edge (macOS arms within 2 ms of the lift).
+const LIFT_POLL_MS: u32 = 20;
 
 const PATCH_POLL_MS: u32 = 20;
 const PATCH_POLL_ATTEMPTS: u32 = 250;
@@ -704,7 +706,10 @@ struct SepData {
     #[pin]
     enrol_identity_candidates: Mutex<KVec<[u8; bio::UUID_LEN]>>,
 
-    last_capture_end_ns: Atomic<u64>,
+    // Boot-time clock when the sensor was paused after a touch whose finger
+    // may still be down, or 0. The next capture is armed once the sensor
+    // reports the finger lifted, as macOS does, instead of after a fixed pause.
+    paused_at_ns: Atomic<u64>,
 
     // Boot-time clock at the start of the last sensor power cycle, for
     // reporting how far into a bring-up a step failed.
@@ -1019,7 +1024,7 @@ impl SepData {
                 bg_ops_ready: Atomic::new(false),
                 persistence_owed: Atomic::new(false),
                 enrol_identity_candidates <- new_mutex!(KVec::new()),
-                last_capture_end_ns: Atomic::new(0),
+                paused_at_ns: Atomic::new(0),
                 sensor_power_ns: Atomic::new(0),
                 device_view_synced: Atomic::new(false),
                 phase: Atomic::new(PHASE_ATTACH),

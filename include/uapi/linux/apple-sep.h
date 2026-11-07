@@ -84,6 +84,11 @@ struct sep_bio_enclave_list {
 #define SEP_BIO_GUIDANCE_PLACE         1
 #define SEP_BIO_GUIDANCE_LIFT_AND_MOVE 2
 #define SEP_BIO_GUIDANCE_HOLD_STILL    3
+/*
+ * The finger of the last touch is still on the sensor; the next capture is
+ * armed when it is lifted. Older readers treat it as SEP_BIO_GUIDANCE_NONE.
+ */
+#define SEP_BIO_GUIDANCE_LIFT          4
 
 struct sep_bio_enrol_poll {
 	__u32 state;

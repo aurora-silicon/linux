@@ -46,6 +46,8 @@ pub(crate) enum Guidance {
     Place = 1,
     LiftAndMove = 2,
     HoldStill = 3,
+    // The last touch's finger is still down; the next capture waits for it.
+    Lift = 4,
 }
 
 #[derive(Clone, Copy, Default)]
