@@ -153,5 +153,4 @@
 #include "t6001-peripherals.dtsi"
 #include "t6001-aux-spmi.dtsi"
 #include "t6001-display-extra.dtsi"
-#include "t6001-cpu-debug.dtsi"
 #endif
