@@ -136,17 +136,21 @@ static void apple_jpeg_job_reject_test(struct kunit *test)
 						   GFP_KERNEL);
 	const struct apple_jpeg_reg_layout *layout = apple_jpeg_t8140.layout;
 	struct apple_jpeg_job job;
+	int ret;
 
 	KUNIT_ASSERT_NOT_NULL(test, w);
 	job = apple_jpeg_test_job();
 	job.luma_stride = 1000;
-	KUNIT_EXPECT_EQ(test, apple_jpeg_build_job(layout, &job, w, APPLE_JPEG_MAX_WRITES), -EINVAL);
+	ret = apple_jpeg_build_job(layout, &job, w, APPLE_JPEG_MAX_WRITES);
+	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
 	job = apple_jpeg_test_job();
 	job.output += 16;
-	KUNIT_EXPECT_EQ(test, apple_jpeg_build_job(layout, &job, w, APPLE_JPEG_MAX_WRITES), -EINVAL);
+	ret = apple_jpeg_build_job(layout, &job, w, APPLE_JPEG_MAX_WRITES);
+	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
 	job = apple_jpeg_test_job();
 	job.input_end = job.chroma - 1;
-	KUNIT_EXPECT_EQ(test, apple_jpeg_build_job(layout, &job, w, APPLE_JPEG_MAX_WRITES), -EINVAL);
+	ret = apple_jpeg_build_job(layout, &job, w, APPLE_JPEG_MAX_WRITES);
+	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
 	job = apple_jpeg_test_job();
 	KUNIT_EXPECT_EQ(test, apple_jpeg_build_job(layout, &job, w, 10), -ENOSPC);
 }
