@@ -34,20 +34,20 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,t6000-sart"
-              - "apple,t6020-sart"
-              - "apple,t6030-sart"
-              - "apple,t6031-sart"
-              - "apple,t6041-sart"
-              - "apple,t8015-sart"
-              - "apple,t8103-sart"
-              - "apple,t8112-sart"
-              - "apple,t8122-sart"
-              - "apple,t8132-sart"
-              - "apple,t8140-sart"
-              - "apple,t8142-sart"
+              - apple,t6000-sart
+              - apple,t6020-sart
+              - apple,t6030-sart
+              - apple,t6031-sart
+              - apple,t6041-sart
+              - apple,t8015-sart
+              - apple,t8103-sart
+              - apple,t8112-sart
+              - apple,t8122-sart
+              - apple,t8132-sart
+              - apple,t8140-sart
+              - apple,t8142-sart
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
@@ -55,13 +55,13 @@ select:
             -
               contains:
                 enum:
-                  - "apple,t8142-sart"
-                  - "apple,t8152-sart"
+                  - apple,t8142-sart
+                  - apple,t8152-sart
             -
               contains:
-                const: "apple,sart"
+                const: apple,sart
       required:
-        - "compatible"
+        - compatible
 allOf:
   -
     if:
@@ -73,48 +73,57 @@ allOf:
                 -
                   contains:
                     enum:
-                      - "apple,t8142-sart"
-                      - "apple,t8152-sart"
+                      - apple,t8142-sart
+                      - apple,t8152-sart
                 -
                   contains:
-                    const: "apple,sart"
+                    const: apple,sart
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
           not:
             required:
-              - "mboxes"
+              - mboxes
     then:
       oneOf:
         -
-          description: "Apple storage physical address filter. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          type: object
+          description: |
+            Apple storage physical address filter. Initial resource description for an unsupported
+            firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver
+            exists. This form must stay disabled; it does not substitute for the enabled driver contract
+            or supply firmware, calibration, programming sequences or unresolved providers.
           properties:
             compatible:
               items:
                 -
                   enum:
-                    - "apple,t8142-sart"
-                    - "apple,t8152-sart"
+                    - apple,t8142-sart
+                    - apple,t8152-sart
                 -
-                  const: "apple,sart"
+                  const: apple,sart
             status:
-              const: "disabled"
+              const: disabled
             reg:
-              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              description: |
+                Register apertures of the complete hardware complex, in hardware interface order.
               minItems: 1
               maxItems: 3
           required:
-            - "compatible"
-            - "reg"
-            - "status"
+            - compatible
+            - reg
+            - status
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
 
+unevaluatedProperties: false
+
 $defs:
   legacy-driver:
+    type: object
     properties:
       compatible:
         oneOf:

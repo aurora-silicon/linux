@@ -17,19 +17,19 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,spi"
-              - "apple,t6000-spi"
-              - "apple,t6020-spi"
-              - "apple,t6030-spi"
-              - "apple,t6031-spi"
-              - "apple,t6041-spi"
-              - "apple,t8103-spi"
-              - "apple,t8112-spi"
-              - "apple,t8122-spi"
-              - "apple,t8132-spi"
-              - "apple,t8140-spi"
+              - apple,spi
+              - apple,t6000-spi
+              - apple,t6020-spi
+              - apple,t6030-spi
+              - apple,t6031-spi
+              - apple,t6041-spi
+              - apple,t8103-spi
+              - apple,t8112-spi
+              - apple,t8122-spi
+              - apple,t8132-spi
+              - apple,t8140-spi
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
@@ -37,14 +37,14 @@ select:
             -
               contains:
                 enum:
-                  - "apple,t8142-spi"
-                  - "apple,t8152-spi"
-                  - "apple,t6050-spi"
+                  - apple,t8142-spi
+                  - apple,t8152-spi
+                  - apple,t6050-spi
             -
               contains:
-                const: "apple,spi"
+                const: apple,spi
       required:
-        - "compatible"
+        - compatible
 allOf:
   -
     if:
@@ -56,55 +56,64 @@ allOf:
                 -
                   contains:
                     enum:
-                      - "apple,t8142-spi"
-                      - "apple,t8152-spi"
-                      - "apple,t6050-spi"
+                      - apple,t8142-spi
+                      - apple,t8152-spi
+                      - apple,t6050-spi
                 -
                   contains:
-                    const: "apple,spi"
+                    const: apple,spi
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
           not:
             required:
-              - "mboxes"
+              - mboxes
     then:
       oneOf:
         -
-          description: "Apple spi controller. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          type: object
+          description: |
+            Apple spi controller. Initial resource description for an unsupported firmware/backend
+            layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form
+            must stay disabled; it does not substitute for the enabled driver contract or supply
+            firmware, calibration, programming sequences or unresolved providers.
           properties:
             compatible:
               items:
                 -
                   enum:
-                    - "apple,t8142-spi"
-                    - "apple,t8152-spi"
-                    - "apple,t6050-spi"
+                    - apple,t8142-spi
+                    - apple,t8152-spi
+                    - apple,t6050-spi
                 -
-                  const: "apple,spi"
+                  const: apple,spi
             status:
-              const: "disabled"
+              const: disabled
             reg:
-              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              description: |
+                Register apertures of the complete hardware complex, in hardware interface order.
               maxItems: 1
             interrupts:
-              description: "Interrupt lines wired to the system interrupt controller."
+              description: Interrupt lines wired to the system interrupt controller.
               maxItems: 1
             power-domains:
-              description: "Power and combined clock gates required by this hardware."
+              description: Power and combined clock gates required by this hardware.
               maxItems: 1
           required:
-            - "compatible"
-            - "reg"
-            - "status"
+            - compatible
+            - reg
+            - status
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
 
+unevaluatedProperties: false
+
 $defs:
   legacy-driver:
+    type: object
     allOf:
       - $ref: spi-controller.yaml#
     properties:

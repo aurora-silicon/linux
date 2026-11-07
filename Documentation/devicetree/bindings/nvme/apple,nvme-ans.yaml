@@ -17,21 +17,21 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,nvme-ans2"
-              - "apple,t6000-nvme-ans2"
-              - "apple,t6020-nvme-ans2"
-              - "apple,t6030-nvme-ans2"
-              - "apple,t6031-nvme-ans2"
-              - "apple,t6041-nvme-ans2"
-              - "apple,t8015-nvme-ans2"
-              - "apple,t8103-nvme-ans2"
-              - "apple,t8112-nvme-ans2"
-              - "apple,t8122-nvme-ans2"
-              - "apple,t8132-nvme-ans2"
-              - "apple,t8140-nvme-ans2"
-              - "apple,t8142-nvme-ans2"
+              - apple,nvme-ans2
+              - apple,t6000-nvme-ans2
+              - apple,t6020-nvme-ans2
+              - apple,t6030-nvme-ans2
+              - apple,t6031-nvme-ans2
+              - apple,t6041-nvme-ans2
+              - apple,t8015-nvme-ans2
+              - apple,t8103-nvme-ans2
+              - apple,t8112-nvme-ans2
+              - apple,t8122-nvme-ans2
+              - apple,t8132-nvme-ans2
+              - apple,t8140-nvme-ans2
+              - apple,t8142-nvme-ans2
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
@@ -39,13 +39,13 @@ select:
             -
               contains:
                 enum:
-                  - "apple,t8142-nvme-ans2"
-                  - "apple,t8152-nvme-ans2"
+                  - apple,t8142-nvme-ans2
+                  - apple,t8152-nvme-ans2
             -
               contains:
-                const: "apple,nvme-ans"
+                const: apple,nvme-ans
       required:
-        - "compatible"
+        - compatible
 allOf:
   -
     if:
@@ -57,52 +57,61 @@ allOf:
                 -
                   contains:
                     enum:
-                      - "apple,t8142-nvme-ans2"
-                      - "apple,t8152-nvme-ans2"
+                      - apple,t8142-nvme-ans2
+                      - apple,t8152-nvme-ans2
                 -
                   contains:
-                    const: "apple,nvme-ans"
+                    const: apple,nvme-ans
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
           not:
             required:
-              - "mboxes"
+              - mboxes
     then:
       oneOf:
         -
-          description: "Apple storage controller and coprocessor. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          type: object
+          description: |
+            Apple storage controller and coprocessor. Initial resource description for an unsupported
+            firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver
+            exists. This form must stay disabled; it does not substitute for the enabled driver contract
+            or supply firmware, calibration, programming sequences or unresolved providers.
           properties:
             compatible:
               items:
                 -
                   enum:
-                    - "apple,t8142-nvme-ans2"
-                    - "apple,t8152-nvme-ans2"
+                    - apple,t8142-nvme-ans2
+                    - apple,t8152-nvme-ans2
                 -
-                  const: "apple,nvme-ans"
+                  const: apple,nvme-ans
             status:
-              const: "disabled"
+              const: disabled
             reg:
-              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              description: |
+                Register apertures of the complete hardware complex, in hardware interface order.
               minItems: 10
               maxItems: 10
             interrupts:
-              description: "Interrupt lines wired to the system interrupt controller."
+              description: Interrupt lines wired to the system interrupt controller.
               minItems: 4
               maxItems: 5
           required:
-            - "compatible"
-            - "reg"
-            - "status"
+            - compatible
+            - reg
+            - status
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
 
+unevaluatedProperties: false
+
 $defs:
   legacy-driver:
+    type: object
     properties:
       compatible:
         oneOf:

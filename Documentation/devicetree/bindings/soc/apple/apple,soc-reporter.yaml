@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 %YAML 1.2
 ---
-$id: "http://devicetree.org/schemas/soc/apple/apple,soc-reporter.yaml#"
-$schema: "http://devicetree.org/meta-schemas/core.yaml#"
-title: "Apple soc reporting register windows"
+$id: http://devicetree.org/schemas/soc/apple/apple,soc-reporter.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+title: Apple soc reporting register windows
 maintainers:
-  - "Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>"
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
 select:
   properties:
     compatible:
@@ -13,29 +13,33 @@ select:
         -
           contains:
             enum:
-              - "apple,t8152-soc-reporter"
+              - apple,t8152-soc-reporter
         -
           contains:
-            const: "apple,soc-reporter"
+            const: apple,soc-reporter
   required:
-    - "compatible"
-description: "Apple soc reporting register windows. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+    - compatible
+description: |
+  Apple soc reporting register windows. Initial resource description for an unsupported firmware/backend
+  layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay
+  disabled; it does not substitute for the enabled driver contract or supply firmware, calibration,
+  programming sequences or unresolved providers.
 properties:
   compatible:
     items:
       -
         enum:
-          - "apple,t8152-soc-reporter"
+          - apple,t8152-soc-reporter
       -
-        const: "apple,soc-reporter"
+        const: apple,soc-reporter
   status:
-    const: "disabled"
+    const: disabled
   reg:
-    description: "Register apertures of the complete hardware complex, in hardware interface order."
+    description: Register apertures of the complete hardware complex, in hardware interface order.
     minItems: 5
     maxItems: 5
 required:
-  - "compatible"
-  - "reg"
-  - "status"
+  - compatible
+  - reg
+  - status
 additionalProperties: false
