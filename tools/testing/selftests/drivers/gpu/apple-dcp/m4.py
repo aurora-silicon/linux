@@ -663,6 +663,7 @@ PANEL_TIMINGS = {
 PANEL_MODES = {
     'j713': (2560, 2568, 2600, 2640, 1664, 1697, 1705, 1749, 277042, 3932166),
     'j715': (2880, 2888, 2920, 2960, 1864, 1911, 1919, 1961, 348274, 3932165),
+    'j604': (3024, 3032, 3064, 3104, 1964, 2066, 2074, 2160, 804560, 7864351),
 }
 
 TIMING_SHIMS = r'''
@@ -813,8 +814,33 @@ def timing_cases():
     perturbed('J713', 'j713', j713)
     perturbed('J715', 'j715', j715)
 
+    case('J604 six elements', 'j604', j604, 'j604')
+    case('J604 six elements, ID 2 last', 'j604', j604[1:] + j604[:1], 'j604')
+    case('J604 preferred element only', 'j604', j604[:1], 'j604')
+    case('J604 changed non-preferred timing', 'j604',
+         edit(j604, 1, setter('VerticalAttributes', 'PreciseSyncRate', value=3932161)), 'j604')
+    perturbed('J604', 'j604', j604)
+    for field, value in (('IsVirtual', True), ('IsInterlaced', True), ('IsSplit', True),
+                         ('IsOverscanned', True), ('TimingType', 4),
+                         ('MinimumVariableRefreshRate', 48 << 16),
+                         ('MaximumVariableRefreshRate', 120 << 16)):
+        case('J604 %s changed' % field, 'j604', edit(j604, 0, setter(field, value=value)))
+    case('J604 color depth changed', 'j604',
+         edit(j604, 0, setter('ColorModes', 0, 'Depth', value=10)))
+    case('J604 second color mode', 'j604',
+         edit(j604, 0, lambda e: e['ColorModes'].append(dict(e['ColorModes'][0], ID=2))))
+    case('J604 without ID 2 (renumbered)', 'j604', edit(j604, 0, setter('ID', value=8)))
+    case('J604 without ID 2 (removed)', 'j604', j604[1:])
+    case('J604 with two ID 2 elements', 'j604', edit(j604, 1, setter('ID', value=2)))
+    case('J604 with a second preferred element', 'j604',
+         edit(j604, 1, setter('IsPreferred', value=True)))
+    case('J604 element without IsPreferred', 'j604', edit(j604, 1, lambda e: e.pop('IsPreferred')))
+    case('J604 element without an ID', 'j604', edit(j604, 1, lambda e: e.pop('ID')))
+    case('J604 element that is not a dictionary', 'j604', j604[:1] + [7] + j604[2:])
+    case('J604 seven elements', 'j604', j604 + [dict(j604[5], ID=9)])
     case('J604 report on the J713', 'j713', j604)
     case('J604 preferred element on the J713', 'j713', j604[:1])
+    case('J713 report on the J604', 'j604', j713)
     case('J604 report on the J715', 'j715', j604)
     return cases
 
