@@ -128,6 +128,23 @@ is not emitted by the currently qualified firmware graphs. A dormant pstate
 record, a host request or a command timer cannot provide achieved frequency.
 ``drm-curfreq-gpu`` must wait for a qualified shared snapshot.
 
+Hardware acceptance
+-------------------
+
+Validate the same candidate on J616s (G16S) and Neo (G17P), retaining the known
+boot fallback. Record the firmware graph, ``aurora-diag gpu``, ``agx_stats``,
+the load client's fdinfo and the initial kernel warning count. Poll statistics
+at 4--10 Hz through 60 seconds idle, at least 60 seconds of ``glmark2``, then
+60 seconds idle. Require utilisation to rise under load and return to fresh
+zero samples at idle, with every value in 0--100 and zero new kernel warnings.
+Stale or unavailable samples do not satisfy the idle-zero check.
+
+Repeat ten idle/load transitions, suspend/resume and a normal GPU power epoch.
+Require no ring quarantine or cross-epoch accumulation, renewed valid samples
+after each boundary and no rendering/recovery regression. Confirm only the
+submitting client's fdinfo engine counters increase. These checks are runtime
+acceptance criteria; host decoder tests alone do not establish a hardware pass.
+
 Host arithmetic tests
 ---------------------
 
