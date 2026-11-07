@@ -1502,6 +1502,12 @@
 			#address-cells = <2>;
 			#size-cells = <0>;
 			status = "disabled";
+
+			pmic@e {
+				compatible = "apple,vale-pmic", "apple,spmi-nvmem";
+				reg = <0xe SPMI_USID>;
+				read-only;
+			};
 		};
 
 		smc: smc@23e400000 {
