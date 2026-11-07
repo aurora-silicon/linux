@@ -300,7 +300,7 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd,
 	ave_start_put32(
 		cmd, l->gop_flags,
 		(p->bframes ? 0x600 : 0x200) |
-			(fw->counted && cq ? 0x10000 | (hevc ? 0x100 : 0) : 0));
+			(cq && hevc ? 0x100 : 0) | (fw->counted && cq ? 0x10000 : 0));
 	ave_start_put32(cmd, l->p_frames, p->intra_only ? 0 : 1);
 	ave_start_put32(cmd, l->max_b, p->bframes ? 3 : 0);
 	ave_start_put32(cmd, l->ref_depth, p->bframes ? 3 : 1);
