@@ -90,3 +90,49 @@
 	power-domains = <&ps_ane_sys_cpu>, <&ps_ane_set1>,
 		<&ps_ane_set2>, <&ps_ane_set3>, <&ps_ane_set4>, <&ps_pms_sram>;
 };
+
+/ {
+	soc {
+		jpeg0: jpeg@409000000 {
+			compatible = "apple,t6000-jpeg";
+			reg = <0x4 0x09000000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 0 1076 IRQ_TYPE_LEVEL_HIGH>;
+			iommus = <&jpeg0_dart 0>;
+			power-domains = <&ps_jpg>, <&pmp_report_jpg>;
+			power-domain-names = "core", "perf";
+			status = "disabled";
+		};
+
+		jpeg0_dart: iommu@409004000 {
+			compatible = "apple,t6000-dart";
+			reg = <0x4 0x09004000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 0 1077 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			power-domains = <&ps_jpg>;
+			status = "disabled";
+		};
+
+		jpeg1: jpeg@409008000 {
+			compatible = "apple,t6000-jpeg";
+			reg = <0x4 0x09008000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 0 1081 IRQ_TYPE_LEVEL_HIGH>;
+			iommus = <&jpeg1_dart 0>;
+			power-domains = <&ps_jpg>, <&pmp_report_jpg>;
+			power-domain-names = "core", "perf";
+			status = "disabled";
+		};
+
+		jpeg1_dart: iommu@40900c000 {
+			compatible = "apple,t6000-dart";
+			reg = <0x4 0x0900c000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 0 1082 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			power-domains = <&ps_jpg>;
+			status = "disabled";
+		};
+	};
+};

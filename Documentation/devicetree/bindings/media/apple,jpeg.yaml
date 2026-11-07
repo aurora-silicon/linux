@@ -15,14 +15,17 @@ description: |
   share a power domain. The power controller manages the gate; no separate
   clock or firmware interface is required.
 
-  On T6041 the DMA window reserves one 4 GiB slice of the DART high alias for
-  the engine's 32-bit buffer pointer registers. T8140 engines take 64-bit
-  buffer addresses and use their DART's full window.
+  T6000 engines have 32-bit buffer pointers and require DMA addresses below
+  4 GiB. T6041, T8112 and T8140 engines have 64-bit buffer pointers. Each
+  engine exposes only its non-overlapping 16 KiB register window; its adjacent
+  DART is a separate device.
 
 properties:
   compatible:
     enum:
+      - apple,t6000-jpeg
       - apple,t6041-jpeg
+      - apple,t8112-jpeg
       - apple,t8140-jpeg
 
   reg:
@@ -51,8 +54,9 @@ properties:
     items:
       - const: 0x10000000000
       - const: 0x100000000
-    description: Device-visible DMA window, as a 64-bit base and size.
-      Only for engines with 32-bit buffer pointers.
+    description: Per-engine DMA allocation window, as a 64-bit base and size.
+      Existing T6041 descriptions constrain allocations to a 4 GiB slice of
+      the DART high aperture.
 
 required:
   - compatible
@@ -92,6 +96,44 @@ examples:
             iommus = <&jpeg0_dart 0>;
             power-domains = <&ps_jpg>;
             apple,dma-range = /bits/ 64 <0x10000000000 0x100000000>;
+            status = "disabled";
+        };
+    };
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        jpeg@409000000 {
+            compatible = "apple,t6000-jpeg";
+            reg = <0x4 0x09000000 0x0 0x4000>;
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 0 1076 IRQ_TYPE_LEVEL_HIGH>;
+            iommus = <&jpeg0_dart 0>;
+            power-domains = <&ps_jpg>, <&pmp_report_jpg>;
+            power-domain-names = "core", "perf";
+            status = "disabled";
+        };
+    };
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        jpeg@265000000 {
+            compatible = "apple,t8112-jpeg";
+            reg = <0x2 0x65000000 0x0 0x4000>;
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 725 IRQ_TYPE_LEVEL_HIGH>;
+            iommus = <&jpeg0_dart 0>;
+            power-domains = <&ps_jpg>, <&pmp_report_jpg>;
+            power-domain-names = "core", "perf";
             status = "disabled";
         };
     };
