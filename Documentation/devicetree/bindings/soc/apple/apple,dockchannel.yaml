@@ -27,7 +27,6 @@ select:
           contains:
             enum:
               - "apple,dockchannel"
-              - "apple,dockchannel-hid.yaml"
               - "apple,t6000-dockchannel"
               - "apple,t6020-dockchannel"
               - "apple,t6030-dockchannel"

@@ -44,11 +44,7 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,managed-sids"
-              - "apple,msi-vector-base"
               - "apple,pcie"
-              - "apple,pciec-kernel-init"
-              - "apple,piodma"
               - "apple,t6000-pcie"
               - "apple,t6000-pciec"
               - "apple,t6020-pcie"
@@ -67,11 +63,6 @@ select:
               - "apple,t8132-pciec"
               - "apple,t8140-pcie"
               - "apple,t8152-pcie"
-              - "apple,tunable"
-              - "apple,tunable-debug"
-              - "apple,tunable-fabric"
-              - "apple,tunable-oe-fabric"
-              - "apple,tunable-rc"
       required:
         - "compatible"
     -

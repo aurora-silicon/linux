@@ -22,9 +22,7 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,channel"
               - "apple,dockchannel-uart"
-              - "apple,sw-drain"
               - "apple,t6020-dockchannel-uart"
               - "apple,t6021-dockchannel-uart"
               - "apple,t6022-dockchannel-uart"

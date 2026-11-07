@@ -28,9 +28,6 @@ select:
             enum:
               - "apple,mtp"
               - "apple,rtk-helper-asc4"
-              - "apple,rtkit-buffers"
-              - "apple,rtkit-buffers,"
-              - "apple,rtkit-handoff"
               - "apple,t6020-mtp"
               - "apple,t6020-rtk-helper-asc4"
               - "apple,t6030-mtp"

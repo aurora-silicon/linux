@@ -23,17 +23,7 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,board-id"
-              - "apple,dram-capacity"
-              - "apple,dram-channel-disable"
-              - "apple,dram-vendor-id"
-              - "apple,pio-ranges"
-              - "apple,pmc"
-              - "apple,pmc-msg-disabled"
-              - "apple,pmc-pmgr"
               - "apple,pmp"
-              - "apple,pmp-report"
-              - "apple,soc-chip-variant"
               - "apple,t6000-pmp-v2"
               - "apple,t6020-pmp-v2"
               - "apple,t6030-pmp-v2"
@@ -43,7 +33,6 @@ select:
               - "apple,t8122-pmp-v2"
               - "apple,t8132-pmp-v2"
               - "apple,t8140-pmp-v2"
-              - "apple,tunable-"
       required:
         - "compatible"
     -

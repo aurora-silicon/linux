@@ -1160,7 +1160,7 @@
 		      <0x2 0x8a044000 0x0 0x4000>,
 		      <0x2 0x8a040000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 731 IRQ_TYPE_LEVEL_HIGH>;
-		#address-cells = <1>;
+		#address-cells = <2>;
 		#size-cells = <0>;
 		status = "disabled";
 	};
@@ -1173,7 +1173,7 @@
 		      <0x2 0x8a104000 0x0 0x4000>,
 		      <0x2 0x8a100000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 746 IRQ_TYPE_LEVEL_HIGH>;
-		#address-cells = <1>;
+		#address-cells = <2>;
 		#size-cells = <0>;
 		status = "disabled";
 	};
@@ -1297,7 +1297,7 @@
 		      <0x2 0x8a1a4000 0x0 0x4000>,
 		      <0x2 0x8a1a0000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 763 IRQ_TYPE_LEVEL_HIGH>;
-		#address-cells = <1>;
+		#address-cells = <2>;
 		#size-cells = <0>;
 		status = "disabled";
 	};
@@ -2547,7 +2547,7 @@
 	};
 
 	uart0: serial@505200000 {
-		compatible = "apple,t6050-uart", "apple,uart";
+		compatible = "apple,t6050-uart", "apple,s5l-uart";
 		reg = <0x5 0x5200000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 1359 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_uart0>;
@@ -2671,7 +2671,7 @@
 		      <0x2 0x8a004000 0x0 0x4000>,
 		      <0x2 0x8a000000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 726 IRQ_TYPE_LEVEL_HIGH>;
-		#address-cells = <1>;
+		#address-cells = <2>;
 		#size-cells = <0>;
 		status = "disabled";
 	};
@@ -2682,7 +2682,7 @@
 		      <0x2 0x8a084000 0x0 0x4000>,
 		      <0x2 0x8a080000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 736 IRQ_TYPE_LEVEL_HIGH>;
-		#address-cells = <1>;
+		#address-cells = <2>;
 		#size-cells = <0>;
 		status = "disabled";
 	};
@@ -2693,7 +2693,7 @@
 		      <0x2 0x8a0c4000 0x0 0x4000>,
 		      <0x2 0x8a0c0000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 741 IRQ_TYPE_LEVEL_HIGH>;
-		#address-cells = <1>;
+		#address-cells = <2>;
 		#size-cells = <0>;
 		status = "disabled";
 	};
@@ -2704,7 +2704,7 @@
 		      <0x2 0x8a184000 0x0 0x4000>,
 		      <0x2 0x8a180000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 761 IRQ_TYPE_LEVEL_HIGH>;
-		#address-cells = <1>;
+		#address-cells = <2>;
 		#size-cells = <0>;
 		status = "disabled";
 	};
@@ -2715,7 +2715,7 @@
 		      <0x2 0x90904000 0x0 0x4000>,
 		      <0x2 0x90900000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 620 IRQ_TYPE_LEVEL_HIGH>;
-		#address-cells = <1>;
+		#address-cells = <2>;
 		#size-cells = <0>;
 		status = "disabled";
 	};
@@ -3771,7 +3771,7 @@
 		      <0x2 0x8a1c4000 0x0 0x4000>,
 		      <0x2 0x8a1c0000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 765 IRQ_TYPE_LEVEL_HIGH>;
-		#address-cells = <1>;
+		#address-cells = <2>;
 		#size-cells = <0>;
 		status = "disabled";
 	};

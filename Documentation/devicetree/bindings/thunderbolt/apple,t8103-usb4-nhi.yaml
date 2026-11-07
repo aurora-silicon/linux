@@ -35,8 +35,6 @@ select:
               - "apple,t8122-usb4-nhi"
               - "apple,t8132-usb4-nhi"
               - "apple,t8142-usb4-nhi"
-              - "apple,thunderbolt-drom"
-              - "apple,tunable-nhi"
       required:
         - "compatible"
     -

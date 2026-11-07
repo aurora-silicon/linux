@@ -28,12 +28,6 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,bypass-sids"
-              - "apple,dma-offset"
-              - "apple,dma-range"
-              - "apple,firmware-root-handoff"
-              - "apple,managed-sids"
-              - "apple,remap-streams"
               - "apple,t6000-dart"
               - "apple,t6000-display-dart"
               - "apple,t6020-dart"
@@ -51,7 +45,6 @@ select:
               - "apple,t8140-dart"
               - "apple,t8142-dart"
               - "apple,t8152-dart"
-              - "apple,tunable"
       required:
         - "compatible"
     -
