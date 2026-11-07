@@ -73,6 +73,17 @@ config NFC_APPLE_STOCKHOLM
 
 	  Say M here to compile this driver as a module named apple-stockholm.
 
+config NFC_APPLE_STOCKHOLM_KUNIT_TEST
+	bool "KUnit tests for the Apple Stockholm driver" if !KUNIT_ALL_TESTS
+	depends on NFC_APPLE_STOCKHOLM && KUNIT
+	depends on KUNIT=y || NFC_APPLE_STOCKHOLM=m
+	default KUNIT_ALL_TESTS
+	help
+	  Tests for the parsing of the NCI identity responses, built into the
+	  apple-stockholm driver.
+
+	  If unsure, say N.
+
 source "drivers/nfc/fdp/Kconfig"
 source "drivers/nfc/pn544/Kconfig"
 source "drivers/nfc/pn533/Kconfig"

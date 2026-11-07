@@ -609,7 +609,6 @@
 		dmas = <&sio 0x64>;
 		dma-names = "tx";
 		power-domains = <&ps_dpa0>;
-		reset-domains = <&ps_dpa0>;
 		status = "disabled";
 
 		ports {

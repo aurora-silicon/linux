@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 #include <kunit/test.h>
 #include <linux/module.h>
+#include <linux/soc/apple/clpc.h>
 
 #include "ane_fw_cold.h"
 #include "ane_fw_sleep.h"
@@ -337,7 +338,25 @@ static void ane_cold_rvbar_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_fw_rvbar_check(0x20000000001ULL, text), ANE_FW_RVBAR_FOREIGN);
 }
 
+/* The boot/transport configs intentionally leave the floor driver disabled. */
+static void ane_cold_no_clpc_test(struct kunit *test)
+{
+#if !IS_REACHABLE(CONFIG_APPLE_CLPC)
+	struct apple_clpc_ane *ane = NULL;
+	struct device dev = {};
+
+	KUNIT_EXPECT_EQ(test, apple_clpc_ane_get(&dev, &ane), 0);
+	KUNIT_EXPECT_PTR_EQ(test, ane, NULL);
+	apple_clpc_ane_set_active(ane, true);
+	apple_clpc_ane_set_active(ane, false);
+	apple_clpc_ane_put(ane);
+#else
+	kunit_skip(test, "CLPC enabled; absence is covered by the CLPC suite");
+#endif
+}
+
 static struct kunit_case ane_cold_cases[] = {
+	KUNIT_CASE(ane_cold_no_clpc_test),
 	KUNIT_CASE(ane_cold_restartable_test),
 	KUNIT_CASE(ane_cold_rvbar_test),
 	KUNIT_CASE(ane_cold_sleep_test),
