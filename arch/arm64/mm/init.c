@@ -617,7 +617,8 @@ struct execmem_info __init *execmem_arch_setup(void)
 				.end	= VMALLOC_END,
 				.pgprot	= PAGE_KERNEL,
 				.alignment = 1,
-				.flags	= cflags,
+				/* JIT images can't use up what modules need. */
+				.flags	= cflags ? cflags | EXECMEM_CONFINE_BOUNDED : 0,
 			},
 		},
 	};

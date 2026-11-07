@@ -53,11 +53,15 @@ enum execmem_type {
  *				(see CONFIG_EXECMEM_CONFINE). The virtual range
  *				is still taken from [start, end); only the
  *				physical backing is restricted.
+ * @EXECMEM_CONFINE_BOUNDED:	with EXECMEM_CONFINE, allocations for this range
+ *				never take the confined pool below the share
+ *				kept for the other confined ranges (module text)
  */
 enum execmem_range_flags {
 	EXECMEM_KASAN_SHADOW	= (1 << 0),
 	EXECMEM_ROX_CACHE	= (1 << 1),
 	EXECMEM_CONFINE		= (1 << 2),
+	EXECMEM_CONFINE_BOUNDED	= (1 << 3),
 };
 
 #ifdef CONFIG_ARCH_HAS_EXECMEM_ROX

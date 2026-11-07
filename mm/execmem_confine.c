@@ -49,21 +49,33 @@ static phys_addr_t confine_size __ro_after_init;
 static struct gen_pool *confine_pool __ro_after_init;
 static bool confine_enforce __ro_after_init;
 static bool confine_ready __ro_after_init;
+/*
+ * Pool bytes an EXECMEM_CONFINE_BOUNDED range (BPF) may never take, so that a
+ * pool filled with JIT images still loads modules.
+ */
+static size_t confine_reserve __ro_after_init;
 
 /* keyed by mapped-VA PFN -> struct confine_chunk */
 static DEFINE_XARRAY(confine_chunks);
 /* serialises pool (de)allocation and the xarray */
 static DEFINE_MUTEX(confine_lock);
 
-/* Return a chunk's pages to the window pool. The caller holds no lock. */
-static void confine_pool_free(struct page **pages, unsigned int nr)
+/* Return a chunk's pages to the window pool. The caller holds confine_lock. */
+static void __confine_pool_free(struct page **pages, unsigned int nr)
 {
 	unsigned int i;
 
-	mutex_lock(&confine_lock);
+	lockdep_assert_held(&confine_lock);
 	for (i = 0; i < nr; i++)
 		gen_pool_free(confine_pool,
 			      (unsigned long)page_address(pages[i]), PAGE_SIZE);
+}
+
+/* Return a chunk's pages to the window pool. The caller holds no lock. */
+static void confine_pool_free(struct page **pages, unsigned int nr)
+{
+	mutex_lock(&confine_lock);
+	__confine_pool_free(pages, nr);
 	mutex_unlock(&confine_lock);
 }
 
@@ -82,16 +94,17 @@ int __init execmem_confine_init(struct gen_pool *pool, bool enforce)
 
 	confine_pool = pool;
 	confine_enforce = enforce;
+	confine_reserve = PAGE_ALIGN(gen_pool_size(pool) / 4);
 	smp_wmb();
 	confine_ready = true;
 
 	{
 		phys_addr_t end = confine_base + confine_size;
 
-		pr_info("window [%pa, %pa) (%llu MiB), %s\n",
+		pr_info("window [%pa, %pa) (%llu MiB), %s; %zu KiB kept for module text\n",
 			&confine_base, &end,
 			(unsigned long long)(confine_size >> 20),
-			enforce ? "enforcing" : "reporting");
+			enforce ? "enforcing" : "reporting", confine_reserve >> 10);
 	}
 	return 0;
 }
@@ -135,6 +148,7 @@ void *execmem_confine_alloc(struct execmem_range *range, size_t size,
 {
 	struct confine_chunk *ck;
 	struct vm_struct *area;
+	bool bounded = range->flags & EXECMEM_CONFINE_BOUNDED;
 	struct page **pages;
 	unsigned long vaddr;
 	unsigned int i, nr;
@@ -176,22 +190,29 @@ void *execmem_confine_alloc(struct execmem_range *range, size_t size,
 	 * Draw the backing a page at a time. The pages are vmapped one by one,
 	 * so they need not be physically contiguous; a single gen_pool_alloc()
 	 * of the whole size could fail on a fragmented window with free pages
-	 * to spare.
+	 * to spare. The lock is held across the loop so that the reserve check
+	 * below still holds when the last page is taken.
 	 */
-	for (i = 0; i < nr; i++) {
-		unsigned long page_va;
-
-		mutex_lock(&confine_lock);
-		page_va = gen_pool_alloc(confine_pool, PAGE_SIZE);
+	mutex_lock(&confine_lock);
+	if (bounded && gen_pool_avail(confine_pool) < size + confine_reserve) {
 		mutex_unlock(&confine_lock);
+		pr_warn_ratelimited("%zu bytes refused: %zu KiB of the window is kept for module text\n",
+				    size, confine_reserve >> 10);
+		goto err_ck;
+	}
+	for (i = 0; i < nr; i++) {
+		unsigned long page_va = gen_pool_alloc(confine_pool, PAGE_SIZE);
+
 		if (!page_va) {
+			__confine_pool_free(pages, i);
+			mutex_unlock(&confine_lock);
 			pr_warn_ratelimited("window exhausted, cannot satisfy %zu bytes\n",
 					    size);
-			confine_pool_free(pages, i);
 			goto err_ck;
 		}
 		pages[i] = virt_to_page((void *)page_va);
 	}
+	mutex_unlock(&confine_lock);
 
 	vaddr = (unsigned long)area->addr;
 	err = vmap_pages_range(vaddr, vaddr + size, pgprot, pages, PAGE_SHIFT);
