@@ -1561,6 +1561,12 @@ impl SepData {
                     transfer::DeviceStatus::Answered(crate::sbio::SBIO_STATUS_COLD_TRANSITION)
                 ) =>
             {
+                // Not a restore: the enclave did not take the record (macOS
+                // discards such a record). The host record keeps the count.
+                dev_warn!(
+                    self.dev,
+                    "sbio: LOAD_LOCKOUT refused the saved lockout record (0x8002, it does not match the restored catacombs); the failed-attempt count comes from the host record\n"
+                );
                 RestoreOutcome::EmptyTolerated
             }
             Ok(_) => RestoreOutcome::Failed,
@@ -1791,7 +1797,20 @@ impl SepData {
         }
 
         match self.sbio_transfer(&crate::sbio::sbio_confirm_save(&selector)) {
-            Ok(done) if done.status.is_ok() => true,
+            Ok(done) if done.status.is_ok() => {
+                // The master is saved last in every catacomb transaction. The
+                // enclave checks a reloaded lockout record against the
+                // catacombs, so one saved before this generation is refused
+                // at the next start (LOAD_LOCKOUT 0x8002): save it again.
+                let master = who.value() == crate::sbio::CatacombUser::MASTER.value();
+                if master && !self.save_lockout() {
+                    dev_warn!(
+                        self.dev,
+                        "sbio: the lockout record was not saved again after the catacombs; the next start may refuse it\n"
+                    );
+                }
+                true
+            }
             Ok(done) => {
                 dev_err!(self.dev, "enrol: {} CONFIRM_SAVE refused with status {}\n", what, done.status);
                 false
