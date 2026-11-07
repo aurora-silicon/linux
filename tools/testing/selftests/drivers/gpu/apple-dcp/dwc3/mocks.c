@@ -198,6 +198,17 @@ static inline bool apple_t8132_air(void)
 	return of_machine_is_compatible("apple,j713") ||
 	       of_machine_is_compatible("apple,j715");
 }
+static inline bool apple_t8132_pro_mini_imac(void)
+{
+	return of_machine_is_compatible("apple,j604") ||
+	       of_machine_is_compatible("apple,j623") ||
+	       of_machine_is_compatible("apple,j624") ||
+	       of_machine_is_compatible("apple,j773g");
+}
+static inline bool apple_t8132_usb_host_first(void)
+{
+	return apple_t8132_air() || apple_t8132_pro_mini_imac();
+}
 
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(p, v) ((p) = (v))
