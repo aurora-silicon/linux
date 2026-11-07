@@ -178,6 +178,13 @@ mod lockout_tests {
     }
 
     #[test]
+    fn j700_communication_init_carries_word_six() {
+        let op = sbio_init_communication(SBIO_INIT_COMMUNICATION_J700);
+        assert_eq!(op.opcode(), 0x73);
+        assert_eq!(op.payload(), &6u32.to_le_bytes());
+    }
+
+    #[test]
     fn match_cancel_is_empty() {
         let op = sbio_match_cancel();
         assert_eq!(op.opcode(), 0x0b);
@@ -1472,9 +1479,8 @@ impl SepData {
             None
         };
         if let Some(word) = init_word {
-            let result = self.sbio_transfer_raw(
-                0x73, c"INIT_SBIO_COMMUNICATION", &word.to_le_bytes(),
-            );
+            let op = crate::sbio::sbio_init_communication(word);
+            let result = self.sbio_transfer(&op);
             match result {
                 Ok(done) if done.status.is_ok()
                     && (self.profile.nonce_session || done.payload.is_empty()) => {
@@ -4517,6 +4523,13 @@ impl SepData {
         // one is carried over.
         *self.match_context.lock() = None;
         let _ = self.handle_bg_ops(c"at a password re-arm");
+        // J700 opens SBIO with this word-six transaction after every SEP
+        // restart. Replay that one missing session boundary only after the
+        // password has succeeded and before creating any replacement match
+        // state. Other profiles retain their existing re-arm sequence.
+        if self.profile.nonce_session && !self.reinitialize_sbio_communication() {
+            return None;
+        }
         // The password verification alone leaves matching refused: the old
         // cold-match credentials stay live until a restart of the enclave,
         // and a restart is the only thing that has ever ended the refusal.
@@ -4550,6 +4563,39 @@ impl SepData {
             dev_warn!(self.dev, "Touch ID: re-arm: the enclave's lockout record was not saved; a restart restores the older one\n");
         }
         Some(confirmed)
+    }
+
+    fn reinitialize_sbio_communication(&self) -> bool {
+        let op = crate::sbio::sbio_init_communication(
+            crate::sbio::SBIO_INIT_COMMUNICATION_J700,
+        );
+        match self.sbio_transfer(&op) {
+            Ok(done) if done.status.is_ok() => {
+                dev_info!(
+                    self.dev,
+                    "Touch ID: re-arm: SBIO communication re-initialization accepted (word 6, {} reply bytes)\n",
+                    done.payload.len()
+                );
+                true
+            }
+            Ok(done) => {
+                dev_err!(
+                    self.dev,
+                    "Touch ID: re-arm: SBIO communication re-initialization refused: status {}, {} reply bytes\n",
+                    done.status,
+                    done.payload.len()
+                );
+                false
+            }
+            Err(e) => {
+                dev_err!(
+                    self.dev,
+                    "Touch ID: re-arm: SBIO communication re-initialization failed: {:?}\n",
+                    e
+                );
+                false
+            }
+        }
     }
 
     fn mint_token_bytes(&self) -> Option<[u8; bio::TOKEN_LEN]> {
@@ -5734,6 +5780,18 @@ pub(crate) fn sbio_update_device_list() -> SbioOp {
     }
 }
 
+const OP_SBIO_INIT_COMMUNICATION: u16 = 0x73;
+pub(crate) const SBIO_INIT_COMMUNICATION_J700: u32 = 6;
+
+pub(crate) fn sbio_init_communication(word: u32) -> SbioOp {
+    SbioOp {
+        opcode: OP_SBIO_INIT_COMMUNICATION,
+        payload: pad_payload(&word.to_le_bytes()),
+        payload_len: core::mem::size_of::<u32>(),
+        name: c"INIT_SBIO_COMMUNICATION",
+    }
+}
+
 /// Opens a match operation: the enclave answers the operation's device list,
 /// a four-byte device count and one 24-byte record per device. Empty. Sent at
 /// the start of every logical match, before its first image; the operation
@@ -6610,7 +6668,7 @@ const fn encode_sbio(opcode: u16, marker: u8, seq: u16) -> Message {
     }
 }
 
-static_assert!(encode_sbio(0x73, transfer::MARKER_FIRST, 0).msg0 == 0x0000_0073_fc08);
+static_assert!(encode_sbio(OP_SBIO_INIT_COMMUNICATION, transfer::MARKER_FIRST, 0).msg0 == 0x0000_0073_fc08);
 
 pub(crate) fn encode_sbio_raw(opcode: u16, seq: u16) -> Option<Message> {
     Some(encode_sbio(opcode, transfer::MARKER_FIRST, seq))
