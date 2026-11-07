@@ -1,0 +1,54 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Apple MacBook Pro (14-inch, M4 Max, 2024). Unqualified peripherals remain disabled. */
+
+/dts-v1/;
+
+#include "t6041.dtsi"
+
+/ {
+	compatible = "apple,j614c", "apple,t6041", "apple,arm-platform";
+	model = "Apple MacBook Pro (14-inch, M4 Max, 2024)";
+	chassis-type = "laptop";
+
+	aliases {
+		serial0 = &serial0;
+		sep = &sep;
+		pmp = &pmp;
+		gpu = &gpu;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		stdout-path = "serial0:115200n8";
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>;
+			/* The loader supplies this boot's framebuffer allocation. */
+			status = "disabled";
+		};
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		/* Runtime firmware reservations are supplied by the loader. */
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0 0 0 0>; /* Filled by the loader. */
+	};
+};
+
+/* UART enablement is qualified separately from this description. */
+
+/* The Max console has the same register interface as the Pro. */
+&serial0 {
+	reg = <0x4 0x29200000 0 0x4000>;
+};
+
+#include "t6041-j614c-audio.dtsi"
