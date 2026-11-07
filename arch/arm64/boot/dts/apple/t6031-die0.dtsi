@@ -200,6 +200,12 @@
 		};
 	};
 
+	pmgr_dcp: power-management@2903d0000 {
+		reg = <0x2 0x903d0000 0x0 0x4000>;
+		reg-names = "dcp-fw-pmgr";
+		#apple,bw-scratch-cells = <3>;
+	};
+
 	pmp: pmp@290700000 {
 		compatible = "apple,t6031-pmp-v2", "apple,t6000-pmp-v2";
 		reg = <0x2 0x90700000 0x0 0x100000>,
