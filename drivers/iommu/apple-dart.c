@@ -4546,13 +4546,15 @@ params_done:
 		of_node_put(iommu);
 		of_node_put(mtp);
 	}
-	if (of_machine_is_compatible("apple,j713") &&
+	/* The J604 has the J713's MTP. */
+	if ((of_machine_is_compatible("apple,j713") ||
+	     of_machine_is_compatible("apple,j604")) &&
 	    of_machine_is_compatible("apple,t8132") &&
 	    res->start == 0x394800000ULL && dart->hw->type == DART_T8110 &&
 	    !dart->locked && !tunneled && dart->supports_bypass &&
 	    apple_dart_streams_bypassed(dart)) {
 		dart->retained_mtp = true;
-		dev_info(dev, "Retaining the live J713 MTP bypass\n");
+		dev_info(dev, "Retaining the live T8132 MTP bypass\n");
 	}
 	if (dart->preserve_display) {
 		if (dart->hw->type != DART_T8110 || !bitmap_empty(dart->remapped, DART_MAX_STREAMS)) {
