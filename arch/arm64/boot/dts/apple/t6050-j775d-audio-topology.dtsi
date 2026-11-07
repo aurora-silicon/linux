@@ -1,0 +1,28 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Codec identities only; no amplifier programming or acoustic configuration. */
+
+&i2c1 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	hw_audio_speaker: codec@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Speaker 0";
+		status = "disabled";
+	};
+};
+
+&i2c2 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	hw_jack_codec: codec@4b {
+		compatible = "cirrus,cs42l84";
+		reg = <0x4b>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Jack";
+		status = "disabled";
+	};
+};

@@ -2,28 +2,34 @@
 /* Shared disabled peripheral resources. */
 
 &{/soc} {
-	hw_i2c0: i2c-controller@331010000 {
-		compatible = "apple,t8152-i2c-controller", "apple,i2c-controller";
+	hw_i2c0: i2c@331010000 {
+		compatible = "apple,t8152-i2c", "apple,t8103-i2c";
 		reg = <0x3 0x31010000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 1413 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&clkref>;
 		status = "disabled";
+		#address-cells = <1>;
+		#size-cells = <0>;
 	};
 
-	hw_i2c1: i2c-controller@331014000 {
-		compatible = "apple,t8152-i2c-controller", "apple,i2c-controller";
+	hw_i2c1: i2c@331014000 {
+		compatible = "apple,t8152-i2c", "apple,t8103-i2c";
 		reg = <0x3 0x31014000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 1414 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&clkref>;
 		status = "disabled";
+		#address-cells = <1>;
+		#size-cells = <0>;
 	};
 
-	hw_i2c3: i2c-controller@33101c000 {
-		compatible = "apple,t8152-i2c-controller", "apple,i2c-controller";
+	hw_i2c3: i2c@33101c000 {
+		compatible = "apple,t8152-i2c", "apple,t8103-i2c";
 		reg = <0x3 0x3101c000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 1416 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&clkref>;
 		status = "disabled";
+		#address-cells = <1>;
+		#size-cells = <0>;
 	};
 
 	hw_dart_apcie2: dart-complex@38a000000 {
@@ -737,12 +743,14 @@
 		status = "disabled";
 	};
 
-	hw_i2c2: i2c-controller@331018000 {
-		compatible = "apple,t8152-i2c-controller", "apple,i2c-controller";
+	hw_i2c2: i2c@331018000 {
+		compatible = "apple,t8152-i2c", "apple,t8103-i2c";
 		reg = <0x3 0x31018000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 1415 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&clkref>;
 		status = "disabled";
+		#address-cells = <1>;
+		#size-cells = <0>;
 	};
 
 	hw_atc_phy2: atc-phy-complex@382418000 {

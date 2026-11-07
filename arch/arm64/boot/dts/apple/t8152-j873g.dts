@@ -27,3 +27,5 @@
 };
 
 #include "t8152-j873g-unbound.dtsi"
+
+#include "t8152-j873g-audio-topology.dtsi"

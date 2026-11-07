@@ -19,6 +19,8 @@ No firmware, calibration or register programming values are included.
 - Complete the transport children and firmware-service bindings, pinmux,
   port graphs and board wiring. Listing a controller does not cover its
   attached peripherals.
+- Audit the parent dependencies of new disabled PMGR gates before enabling
+  a gate or its consumer.
 - Resolve every provider/routing gap called out below. No guessed
   address, interrupt parent or power-domain relationship was substituted.
 - Validate on this board; no boot or peripheral test was performed.
@@ -250,8 +252,8 @@ from those records are reproduced here.
 
 | Hardware path below the SoC bus | Classification and remaining audit |
 | --- | --- |
-| `i2c1/audio-speaker` | Attached device or firmware service; endpoint binding and board wiring audit pending. |
-| `i2c2/audio-codec-output` | Attached device or firmware service; endpoint binding and board wiring audit pending. |
+| `i2c1/audio-speaker` | `&hw_audio_speaker` identifies the disabled codec; reset, interrupt, power and audio routing audit pending. |
+| `i2c2/audio-codec-output` | `&hw_jack_codec` identifies the disabled codec; reset, interrupt, power and audio routing audit pending. |
 | `i2c5/aqc-a` | Attached device or firmware service; endpoint binding and board wiring audit pending. |
 | `i2c6/uatcrt0` | Attached device or firmware service; endpoint binding and board wiring audit pending. |
 | `i2c6/uatcrt1` | Attached device or firmware service; endpoint binding and board wiring audit pending. |

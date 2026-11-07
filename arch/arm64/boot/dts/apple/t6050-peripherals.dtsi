@@ -2,28 +2,34 @@
 /* Shared disabled peripheral resources. */
 
 &die0 {
-	hw_i2c0: i2c-controller@505010000 {
-		compatible = "apple,t6050-i2c-controller", "apple,i2c-controller";
+	hw_i2c0: i2c@505010000 {
+		compatible = "apple,t6050-i2c", "apple,t8103-i2c";
 		reg = <0x5 0x5010000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 1375 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&clkref>;
 		status = "disabled";
+		#address-cells = <1>;
+		#size-cells = <0>;
 	};
 
-	hw_i2c6: i2c-controller@505028000 {
-		compatible = "apple,t6050-i2c-controller", "apple,i2c-controller";
+	hw_i2c6: i2c@505028000 {
+		compatible = "apple,t6050-i2c", "apple,t8103-i2c";
 		reg = <0x5 0x5028000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 1381 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&clkref>;
 		status = "disabled";
+		#address-cells = <1>;
+		#size-cells = <0>;
 	};
 
-	hw_i2c8: i2c-controller@505030000 {
-		compatible = "apple,t6050-i2c-controller", "apple,i2c-controller";
+	hw_i2c8: i2c@505030000 {
+		compatible = "apple,t6050-i2c", "apple,t8103-i2c";
 		reg = <0x5 0x5030000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 1383 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&clkref>;
 		status = "disabled";
+		#address-cells = <1>;
+		#size-cells = <0>;
 	};
 
 	hw_apcie0_piodma: pcie-piodma@410030000 {

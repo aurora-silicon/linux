@@ -20,3 +20,5 @@
 &pmc {
 	status = "disabled";
 };
+
+#include "t8142-j704-audio-topology.dtsi"

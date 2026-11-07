@@ -18,12 +18,14 @@
 		status = "disabled";
 	};
 
-	hw_i2c4: i2c-controller@331020000 {
-		compatible = "apple,t8152-i2c-controller", "apple,i2c-controller";
+	hw_i2c4: i2c@331020000 {
+		compatible = "apple,t8152-i2c", "apple,t8103-i2c";
 		reg = <0x3 0x31020000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 1417 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&clkref>;
 		status = "disabled";
+		#address-cells = <1>;
+		#size-cells = <0>;
 	};
 
 	hw_fpwm0: pwm-controller@331040000 {

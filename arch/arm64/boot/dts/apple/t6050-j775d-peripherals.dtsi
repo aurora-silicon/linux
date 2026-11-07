@@ -4,12 +4,14 @@
 /* Register and interrupt resources; ownership-sensitive blocks stay disabled. */
 
 &die0 {
-	hw_i2c7: i2c-controller@50502c000 {
-		compatible = "apple,t6050-i2c-controller", "apple,i2c-controller";
+	hw_i2c7: i2c@50502c000 {
+		compatible = "apple,t6050-i2c", "apple,t8103-i2c";
 		reg = <0x5 0x502c000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 1382 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&clkref>;
 		status = "disabled";
+		#address-cells = <1>;
+		#size-cells = <0>;
 	};
 
 	hw_nub_spmi1: spmi-complex@28a054000 {
@@ -28,20 +30,24 @@
 		status = "disabled";
 	};
 
-	hw_i2c4: i2c-controller@505020000 {
-		compatible = "apple,t6050-i2c-controller", "apple,i2c-controller";
+	hw_i2c4: i2c@505020000 {
+		compatible = "apple,t6050-i2c", "apple,t8103-i2c";
 		reg = <0x5 0x5020000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 1379 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&clkref>;
 		status = "disabled";
+		#address-cells = <1>;
+		#size-cells = <0>;
 	};
 
-	hw_i2c5: i2c-controller@505024000 {
-		compatible = "apple,t6050-i2c-controller", "apple,i2c-controller";
+	hw_i2c5: i2c@505024000 {
+		compatible = "apple,t6050-i2c", "apple,t8103-i2c";
 		reg = <0x5 0x5024000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 1380 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&clkref>;
 		status = "disabled";
+		#address-cells = <1>;
+		#size-cells = <0>;
 	};
 
 	hw_dart_apcie1: dart-complex@411000000 {

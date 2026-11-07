@@ -19,6 +19,8 @@ No firmware, calibration or register programming values are included.
 - Complete the transport children and firmware-service bindings, pinmux,
   port graphs and board wiring. Listing a controller does not cover its
   attached peripherals.
+- Audit the parent dependencies of new disabled PMGR gates before enabling
+  a gate or its consumer.
 - Resolve every provider/routing gap called out below. No guessed
   address, interrupt parent or power-domain relationship was substituted.
 - Validate on this board; no boot or peripheral test was performed.
@@ -208,8 +210,8 @@ from those records are reproduced here.
 | `dart-apcie2/mapper-apcie2` | DMA stream metadata; check the master IOMMU reference and stream ownership. |
 | `dart-apcie2/mapper-apcie2-piodma` | DMA stream metadata; check the master IOMMU reference and stream ownership. |
 | `i2c1/aqc-a` | Attached device or firmware service; endpoint binding and board wiring audit pending. |
-| `i2c1/audio-codec-output` | Attached device or firmware service; endpoint binding and board wiring audit pending. |
-| `i2c3/audio-speaker` | Attached device or firmware service; endpoint binding and board wiring audit pending. |
+| `i2c1/audio-codec-output` | `&hw_jack_codec` identifies the disabled codec; reset, interrupt, power and audio routing audit pending. |
+| `i2c3/audio-speaker` | `&hw_audio_speaker` identifies the disabled codec; reset, interrupt, power and audio routing audit pending. |
 | `spi3/usb3hub-flash` | Attached device or firmware service; endpoint binding and board wiring audit pending. |
 | `spi3/usb3hub-flash/usb3hub-fw` | Attached device or firmware service; endpoint binding and board wiring audit pending. |
 | `nub-spmi-a0/hpm0` | Attached device or firmware service; endpoint binding and board wiring audit pending. |
