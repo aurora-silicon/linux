@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * G16 (T8132, M4) helpers that have no Rust bindings: static inlines,
- * macros and THIS_MODULE. Built only with CONFIG_DRM_ASAHI_G16.
+ * G16 (T8132, M4) helpers that have no Rust bindings: static inlines
+ * and macros. The module pin is retain.c's. Built only with CONFIG_DRM_ASAHI_G16.
  */
 #include <linux/device.h>
 #include <linux/atomic.h>
@@ -25,7 +25,6 @@
 
 bool asahi_g16_board(void);
 int asahi_g16_hold_power(struct device *dev);
-void asahi_g16_module_get(void);
 bool asahi_g16_ram_disjoint(u64 start, u64 size);
 void __iomem *asahi_g16_ioremap_wc(u64 start, size_t size);
 bool asahi_g16_dma_unsupported(struct device *dev);
@@ -167,12 +166,6 @@ int asahi_g16_hold_power(struct device *dev)
 		return ret;
 	pm_runtime_enable(dev);
 	return dev->pm_domain ? 0 : -EINVAL;
-}
-
-/* Pin this module until reboot. */
-void asahi_g16_module_get(void)
-{
-	__module_get(THIS_MODULE);
 }
 
 /* The range is disjoint from System RAM (ADT region admission). */

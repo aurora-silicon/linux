@@ -33,10 +33,12 @@ impl RayQueryStage {
     }
 }
 
-pub(crate) fn required_blocks(active_cores: u32, pages: [u16; 2]) -> Result<usize> {
+/// The render pool of an owner is shared by its `pairs` render pairs, each with
+/// its own compute-pool extras.
+pub(crate) fn required_blocks(active_cores: u32, pages: [u16; 2], pairs: u8) -> Result<usize> {
     let extra = compute_pool::extra_bytes(active_cores, pages[0])?
         .checked_add(compute_pool::extra_bytes(active_cores, pages[1])?)
-        .and_then(|bytes| bytes.checked_mul(crate::hw::t8140::queues::RENDER_PAIRS_PER_OWNER as u64))
+        .and_then(|bytes| bytes.checked_mul(u64::from(pairs)))
         .ok_or(EOVERFLOW)?;
     let bytes = extra.checked_add((RENDER_BLOCKS * FREE_LIST_BLOCK_SIZE) as u64)
         .ok_or(EOVERFLOW)?;

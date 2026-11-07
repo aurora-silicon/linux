@@ -141,12 +141,19 @@ int apple_dart_save_tunnel_state(struct device *dev);
 int apple_dart_restore_tunnel_state(struct device *dev);
 /* Registered J713 managed radio provider, with no owned valid root or fault. */
 int apple_dart_radio_check_idle(struct device *dev);
+/* A firmware-owned buffer's address for a host copy; Linux's own mappings refused. */
+int apple_dart_fw_remote(struct device *dev, dma_addr_t iova, bool write, phys_addr_t *phys);
 #else
 static inline int apple_dart_quiesce_commands(struct device *dev) { return 0; }
 static inline int apple_dart_resume_commands(struct device *dev) { return 0; }
 static inline int apple_dart_save_tunnel_state(struct device *dev) { return -EOPNOTSUPP; }
 static inline int apple_dart_restore_tunnel_state(struct device *dev) { return -EOPNOTSUPP; }
 static inline int apple_dart_radio_check_idle(struct device *dev) { return -EOPNOTSUPP; }
+static inline int apple_dart_fw_remote(struct device *dev, dma_addr_t iova, bool write,
+				       phys_addr_t *phys)
+{
+	return -EOPNOTSUPP;
+}
 #endif
 
 #endif
