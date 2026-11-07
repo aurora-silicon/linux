@@ -10,6 +10,8 @@
 };
 
 &spi4 {
+	clocks = <&peripheral_clocks 380>;
+
 	panel_controller: panel-timing-controller@0 {
 		compatible = "parade,dp855";
 		reg = <0>;

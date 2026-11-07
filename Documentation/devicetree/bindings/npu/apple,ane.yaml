@@ -50,8 +50,9 @@ properties:
       - description: Fifth auxiliary window
 
   clocks:
-    minItems: 1
+    minItems: 4
     maxItems: 4
+    description: Native secondary-engine clock selectors in hardware-description order.
 
   reg-names:
     minItems: 1
@@ -427,8 +428,6 @@ allOf:
           maxItems: 1
         power-domains:
           maxItems: 1
-        clocks:
-          minItems: 4
       required:
         - clocks
     else:
