@@ -13,44 +13,29 @@ description: |
   AES hardware attached to the SIO DART. The register banks are the
   engine, shared control and auxiliary control windows, in that order.
 
-properties:
-  compatible:
-    items:
-      - enum:
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
           - apple,t6000-aes
           - apple,t6020-aes
           - apple,t6021-aes
           - apple,t6022-aes
           - apple,t6030-aes
           - apple,t6031-aes
+          - apple,t6032-aes
           - apple,t6041-aes
           - apple,t8103-aes
           - apple,t8112-aes
           - apple,t8122-aes
+          - apple,t8132-aes
           - apple,t8140-aes
-      - const: apple,aes
+  required:
+    - compatible
 
-  reg:
-    minItems: 2
-    maxItems: 3
-    description: Engine and control banks, with an auxiliary bank on later variants.
-
-  interrupts:
-    maxItems: 1
-
-  power-domains:
-    maxItems: 1
-
-  iommus:
-    minItems: 1
-    maxItems: 2
-
-required:
-  - compatible
-  - reg
-  - interrupts
-  - power-domains
-  - iommus
+properties:
+  compatible: true
 
 allOf:
   - if:
@@ -58,35 +43,149 @@ allOf:
         compatible:
           contains:
             enum:
-              - apple,t6000-aes
-              - apple,t6020-aes
-              - apple,t6021-aes
-              - apple,t6022-aes
-              - apple,t6030-aes
-              - apple,t6031-aes
-              - apple,t8103-aes
-              - apple,t8112-aes
-              - apple,t8122-aes
+              - apple,t8132-aes
+      required:
+        - compatible
     then:
-      properties:
-        reg:
-          maxItems: 2
-    else:
-      properties:
-        reg:
-          minItems: 3
-  - if:
       properties:
         compatible:
-          contains:
-            const: apple,t6000-aes
-    then:
-      properties:
-        iommus:
-          minItems: 2
-    else:
-      properties:
+          items:
+            - enum:
+                - apple,t8132-aes
+            - const: apple,aes
+
+        reg:
+          minItems: 3
+          maxItems: 3
+
+        interrupts:
+          maxItems: 1
+
+        power-domains:
+          maxItems: 1
+
         iommus:
           maxItems: 1
 
-additionalProperties: false
+      required:
+        - compatible
+        - reg
+        - interrupts
+        - power-domains
+        - iommus
+    else:
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t6032-aes
+            required:
+              - compatible
+          then:
+            properties:
+              compatible:
+                items:
+                  - const: apple,t6032-aes
+                  - const: apple,aes
+
+              reg:
+                minItems: 2
+                maxItems: 2
+
+              interrupts:
+                maxItems: 1
+
+              power-domains:
+                maxItems: 1
+
+              iommus:
+                maxItems: 1
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - power-domains
+              - iommus
+          else:
+            properties:
+              compatible:
+                items:
+                  - enum:
+                      - apple,t6000-aes
+                      - apple,t6020-aes
+                      - apple,t6021-aes
+                      - apple,t6022-aes
+                      - apple,t6030-aes
+                      - apple,t6031-aes
+                      - apple,t6041-aes
+                      - apple,t8103-aes
+                      - apple,t8112-aes
+                      - apple,t8122-aes
+                      - apple,t8140-aes
+                  - const: apple,aes
+
+              reg:
+                minItems: 2
+                maxItems: 3
+                description: Engine and control banks, with an auxiliary bank on later variants.
+
+              interrupts:
+                maxItems: 1
+
+              power-domains:
+                maxItems: 1
+
+              iommus:
+                minItems: 1
+                maxItems: 2
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - power-domains
+              - iommus
+
+            allOf:
+              - if:
+                  properties:
+                    compatible:
+                      contains:
+                        enum:
+                          - apple,t6000-aes
+                          - apple,t6020-aes
+                          - apple,t6021-aes
+                          - apple,t6022-aes
+                          - apple,t6030-aes
+                          - apple,t6031-aes
+                          - apple,t8103-aes
+                          - apple,t8112-aes
+                          - apple,t8122-aes
+                then:
+                  properties:
+                    reg:
+                      maxItems: 2
+                else:
+                  properties:
+                    reg:
+                      minItems: 3
+              - if:
+                  properties:
+                    compatible:
+                      contains:
+                        const: apple,t6000-aes
+                then:
+                  properties:
+                    iommus:
+                      minItems: 2
+                else:
+                  properties:
+                    iommus:
+                      maxItems: 1
+
+            additionalProperties: false
+
+unevaluatedProperties: false

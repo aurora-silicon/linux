@@ -380,3 +380,87 @@
 		status = "disabled";
 	};
 };
+
+/* CPU and cluster power states are described without granting control. */
+&pmgr {
+	power-controller@0 {
+		compatible = "apple,t8112-pmgr-pwrstate", "apple,pmgr-pwrstate";
+		reg = <0x0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ecpu0";
+		status = "disabled";
+	};
+	power-controller@8 {
+		compatible = "apple,t8112-pmgr-pwrstate", "apple,pmgr-pwrstate";
+		reg = <0x8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ecpu1";
+		status = "disabled";
+	};
+	power-controller@10 {
+		compatible = "apple,t8112-pmgr-pwrstate", "apple,pmgr-pwrstate";
+		reg = <0x10 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ecpu2";
+		status = "disabled";
+	};
+	power-controller@18 {
+		compatible = "apple,t8112-pmgr-pwrstate", "apple,pmgr-pwrstate";
+		reg = <0x18 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ecpu3";
+		status = "disabled";
+	};
+	power-controller@20 {
+		compatible = "apple,t8112-pmgr-pwrstate", "apple,pmgr-pwrstate";
+		reg = <0x20 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pcpu0";
+		status = "disabled";
+	};
+	power-controller@28 {
+		compatible = "apple,t8112-pmgr-pwrstate", "apple,pmgr-pwrstate";
+		reg = <0x28 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pcpu1";
+		status = "disabled";
+	};
+	power-controller@30 {
+		compatible = "apple,t8112-pmgr-pwrstate", "apple,pmgr-pwrstate";
+		reg = <0x30 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pcpu2";
+		status = "disabled";
+	};
+	power-controller@38 {
+		compatible = "apple,t8112-pmgr-pwrstate", "apple,pmgr-pwrstate";
+		reg = <0x38 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pcpu3";
+		status = "disabled";
+	};
+	power-controller@40 {
+		compatible = "apple,t8112-pmgr-pwrstate", "apple,pmgr-pwrstate";
+		reg = <0x40 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ecpm";
+		status = "disabled";
+	};
+	power-controller@48 {
+		compatible = "apple,t8112-pmgr-pwrstate", "apple,pmgr-pwrstate";
+		reg = <0x48 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pcpm";
+		status = "disabled";
+	};
+};

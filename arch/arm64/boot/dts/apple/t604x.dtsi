@@ -616,6 +616,7 @@
 			     <AIC_IRQ 1443 IRQ_TYPE_LEVEL_HIGH>;
 		resets = <&ps_avd_sys>;
 		iommus = <&avd_dart 0>;
+		dma-coherent;
 	};
 
 	avd_dart: iommu@281020000 {

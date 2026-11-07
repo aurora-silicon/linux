@@ -130,3 +130,38 @@
 		};
 	};
 };
+
+&i2c6 {
+	retimer@18 {
+		compatible = "apple,t6041-atcrt", "apple,atcrt";
+		reg = <0x18>;
+		status = "disabled";
+	};
+	retimer@19 {
+		compatible = "apple,t6041-atcrt", "apple,atcrt";
+		reg = <0x19>;
+		status = "disabled";
+	};
+	retimer@1a {
+		compatible = "apple,t6041-atcrt", "apple,atcrt";
+		reg = <0x1a>;
+		status = "disabled";
+	};
+};
+
+/* Scaler/CSC (MSR) and its DART, proven on this board. */
+&ps_msr0 {
+	status = "okay";
+};
+
+&ps_msr0_ase_core {
+	status = "okay";
+};
+
+&scaler0_dart {
+	status = "okay";
+};
+
+&scaler0 {
+	status = "okay";
+};

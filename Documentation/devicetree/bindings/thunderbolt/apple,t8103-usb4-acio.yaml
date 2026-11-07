@@ -17,8 +17,8 @@ description: |
 
   The co-processor exposes the Native Host Interface (NHI) and its DART IOMMU
   to the main SoC bus once it is running. They are therefore represented as
-  child nodes. All child registers are located in a single 16 MiB MMIO window
-  and use addresses relative to this window.
+  child nodes. All child registers use addresses relative to the router's MMIO
+  window. Type 7 expands that window and shifts its child offsets by 16 MiB.
 
   ACIO can only be powered on after the Type-C PHY has been switched to
   USB4/Thunderbolt mode. Before the connection to the remote device can be
@@ -30,6 +30,7 @@ properties:
     oneOf:
       - const: apple,t8103-usb4-acio
       - const: apple,t8142-usb4-acio
+      - const: apple,t6040-usb4-acio
       - items:
           - enum:
               - apple,t6000-usb4-acio
@@ -50,7 +51,7 @@ properties:
           PCIe adapter configuration space of the USB4 router. Present where
           the root complex exposes the adapter separately, so that the tunnel
           can be configured before a PCIe-C link is brought up.
-      - description: MxWrap co-processor control registers, on T8132
+      - description: MxWrap co-processor control registers
 
   reg-names:
     minItems: 2
@@ -59,6 +60,14 @@ properties:
       - const: sram
       - const: pcie-adapter
       - const: cpu
+
+  interrupts:
+    maxItems: 1
+    description: Type 7 SRAM parity interrupt
+
+  interrupt-names:
+    items:
+      - const: sram-parity
 
   mboxes:
     maxItems: 1
@@ -161,11 +170,12 @@ properties:
     required:
       - port@1
 
-  iommu@a80000:
+patternProperties:
+  "^iommu@(a80000|1a80000)$":
     $ref: /schemas/iommu/apple,dart.yaml#
     description: DART IOMMU exposed by ACIO and used for DMA from the NHI
 
-  nhi@f00000:
+  "^nhi@(f00000|1f00000)$":
     $ref: /schemas/thunderbolt/apple,t8103-usb4-nhi.yaml#
     description: Native Host Interface exposed by ACIO
 
@@ -182,8 +192,6 @@ required:
   - ranges
   - nonposted-mmio
   - ports
-  - iommu@a80000
-  - nhi@f00000
 
 allOf:
   - $ref: /schemas/usb/usb-switch.yaml#
@@ -204,6 +212,21 @@ allOf:
     else:
       properties:
         lstx-gpios: false
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6040-usb4-acio
+    then:
+      required:
+        - iommu@1a80000
+        - nhi@1f00000
+        - interrupts
+        - interrupt-names
+    else:
+      required:
+        - iommu@a80000
+        - nhi@f00000
 
 additionalProperties: false
 
