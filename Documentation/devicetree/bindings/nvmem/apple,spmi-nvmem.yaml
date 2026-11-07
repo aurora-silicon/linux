@@ -25,6 +25,7 @@ properties:
           - apple,mirabeau-pmic
           - apple,monaco-pmic
           - apple,sera-pmic
+          - apple,simetra-pmic
           - apple,stowe-pmic
           - apple,vale-pmic
       - const: apple,spmi-nvmem
@@ -32,11 +33,12 @@ properties:
   reg:
     maxItems: 1
 
-  battery-monitor:
-    $ref: /schemas/power/supply/apple,battery-monitor.yaml#
-
   interrupts:
     maxItems: 1
+    description: Native event in the SPMI interrupt domain.
+
+  battery-monitor:
+    $ref: /schemas/power/supply/apple,battery-monitor.yaml#
 
   rtc:
     $ref: /schemas/rtc/apple,j700-pmu-rtc.yaml#

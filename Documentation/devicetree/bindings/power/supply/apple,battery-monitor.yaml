@@ -19,6 +19,8 @@ properties:
   compatible:
     items:
       - enum:
+          - apple,t8103-battery-monitor
+          - apple,t6000-battery-monitor
           - apple,t6041-battery-monitor
           - apple,t8140-battery-monitor
       - const: apple,battery-monitor

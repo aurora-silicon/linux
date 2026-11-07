@@ -27,6 +27,7 @@ select:
           - apple,t6031-ave
           - apple,t6032-ave
           - apple,t6041-ave
+          - apple,t8103-ave
           - apple,t8112-ave
           - apple,t8122-ave
           - apple,t8132-ave
@@ -134,6 +135,7 @@ allOf:
                           - apple,t6022-ave
                           - apple,t6030-ave
                           - apple,t6031-ave
+                          - apple,t8103-ave
                           - apple,t8122-ave
                       - const: apple,ave
 
@@ -148,8 +150,11 @@ allOf:
                   - const: codec
                   - const: mailbox
                   - const: coproc
-                  - const: power-control
-                  - const: fabric
+                  - enum: [pmgr, power-control]
+                  - enum: [fabric, pio]
+
+              clocks:
+                maxItems: 1
 
               interrupts:
                 items:
@@ -209,18 +214,27 @@ allOf:
                   properties:
                     reg:
                       minItems: 5
-                      maxItems: 5
                 else:
                   properties:
-                    reg:
-                      minItems: 3
-                      maxItems: 3
                     power-domains:
                       minItems: 5
-                      maxItems: 6
                   required:
                     - reg-names
                     - power-domain-names
+              - if:
+                  properties:
+                    compatible:
+                      contains:
+                        enum:
+                          - apple,t6041-ave
+                          - apple,t8112-ave
+                          - apple,t8140-ave
+                then:
+                  properties:
+                    reg:
+                      maxItems: 3
+                    reg-names:
+                      maxItems: 3
 
             additionalProperties: false
 
