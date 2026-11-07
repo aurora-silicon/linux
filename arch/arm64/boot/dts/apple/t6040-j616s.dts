@@ -55,8 +55,6 @@
 	width-mm = <345>;
 	height-mm = <223>;
 	adj-height-mm = <216>;
-	/* "Wide color (P3)" in the Apple technical specifications */
-	apple,color-gamut = "display-p3";
 };
 
 &aop_audio {
