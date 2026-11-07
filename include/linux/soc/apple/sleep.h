@@ -83,6 +83,9 @@ bool apple_sleep_debug_link_cut_peek(struct device *dev);
  */
 bool apple_sleep_debug_link_cut(void);
 
+/* After a deep sleep, put back the pins it reset. ANS's driver calls it before the run bit. */
+void apple_sleep_restore_pins(void);
+
 /*
  * After a refused sleep, for a firmware that idled on a domain that can't gate alone: the
  * sleep engine's PMGR reset of its own domains, its DARTs kept. The caller starts it after.
@@ -157,6 +160,10 @@ static inline bool apple_sleep_debug_link_cut_peek(struct device *dev)
 static inline bool apple_sleep_debug_link_cut(void)
 {
 	return false;
+}
+
+static inline void apple_sleep_restore_pins(void)
+{
 }
 
 static inline int apple_sleep_engine_reset(struct device *dev)

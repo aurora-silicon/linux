@@ -2798,6 +2798,8 @@ static int apple_nvme_resume_early(struct device *dev)
 	anv->sleep_idled = false;
 	if (anv->sleep_stop)
 		apple_sleep_coproc_set_ready(dev, false);
+	/* Its link doesn't come up with the pins as the sleep left them. */
+	apple_sleep_restore_pins();
 	/* macOS writes the SART's entries back again right before the run bit. */
 	if (anv->sart)
 		apple_sart_replay(anv->sart);

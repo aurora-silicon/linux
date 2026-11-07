@@ -26,6 +26,7 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/bitmap.h>
 #include <linux/bits.h>
 #include <linux/cacheflush.h>
 #include <linux/cpu.h>
@@ -40,6 +41,7 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/of_irq.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/smp.h>
@@ -463,6 +465,14 @@ struct t8140_sleep {
 		u32 ps;
 	} gate[16];
 	unsigned int gate_count;
+	/* The AP pins, which a deep sleep resets */
+	void __iomem *pins;
+	u32 *pins_saved;
+	unsigned long *pins_skip;
+	unsigned int npins;
+	unsigned int pin_irq_groups;
+	bool pins_saved_valid;
+	bool pins_lost;
 	bool returned;
 };
 
@@ -532,6 +542,64 @@ bool apple_sleep_debug_link_cut_peek(struct device *dev)
 	return t8140_debug_port_is(dev) && READ_ONCE(t8140_debug_link_cut);
 }
 EXPORT_SYMBOL_GPL(apple_sleep_debug_link_cut_peek);
+
+#define PIN_REG(n)		(4 * (n))
+#define PIN_LOCK		BIT(21)
+#define PIN_CTL			0xc48
+#define PIN_IRQ(g, w)		(0x800 + 0x40 * (g) + 4 * (w))
+
+/* Before any device suspends, with the pins' domain on. Skipped pins aren't read. */
+static void t8140_pins_save(struct t8140_sleep *s)
+{
+	unsigned int pin;
+
+	s->pins_lost = false;
+	s->pins_saved_valid = false;
+	if (!s->pins)
+		return;
+	for (pin = 0; pin < s->npins; pin++)
+		if (!test_bit(pin, s->pins_skip))
+			s->pins_saved[pin] = readl(s->pins + PIN_REG(pin));
+	s->pins_saved_valid = true;
+}
+
+/*
+ * A deep sleep resets every pin, and the pin controller's driver puts back only the
+ * ones it configured. macOS puts all of them back right before ANS's run bit, and
+ * ANS's link doesn't come up without that: 1 written at 0xc48, every interrupt
+ * group's pending bits cleared, then each pin written back as it reads, then as it
+ * was, its lock bit last.
+ */
+void apple_sleep_restore_pins(void)
+{
+	struct t8140_sleep *s = t8140_sleep;
+	unsigned int pin, grp, w, changed = 0;
+
+	if (!s || !s->pins_lost)
+		return;
+	s->pins_lost = false;
+
+	writel(1, s->pins + PIN_CTL);
+	for (grp = 0; grp < s->pin_irq_groups; grp++)
+		for (w = 0; w < DIV_ROUND_UP(s->npins, 32); w++)
+			writel(U32_MAX, s->pins + PIN_IRQ(grp, w));
+	for (pin = 0; pin < s->npins; pin++) {
+		void __iomem *reg = s->pins + PIN_REG(pin);
+		u32 want = s->pins_saved[pin], cur;
+
+		if (test_bit(pin, s->pins_skip))
+			continue;
+		cur = readl(reg);
+		changed += cur != want;
+		writel(cur, reg);
+		if (want & PIN_LOCK)
+			writel(want & ~PIN_LOCK, reg);
+		writel(want, reg);
+	}
+	dev_info(s->dev, "%u of %u AP pins changed by the sleep, all put back\n", changed,
+		 s->npins - bitmap_weight(s->pins_skip, s->npins));
+}
+EXPORT_SYMBOL_GPL(apple_sleep_restore_pins);
 
 /* Below EL2 a monitor owns the last mile, and this code doesn't run it. */
 int apple_sleep_coproc_register(struct device *dev, void __iomem *asc, bool pcie_ans,
@@ -2421,6 +2489,7 @@ static void t8140_sleep_return(struct t8140_sleep *s)
 	if (s->pcie_ans_stopped)
 		s->pcie_ans_on_ret = t8140_sleep_raise_apcie(s);
 	s->apcie_port_down = true;
+	s->pins_lost = s->pins_saved_valid;
 
 	dcache_inval_poc((unsigned long)s->mbox, (unsigned long)(s->mbox + 1));
 	s->resumes_after = READ_ONCE(s->mbox->resumes);
@@ -2486,6 +2555,7 @@ static int t8140_sleep_begin(suspend_state_t state)
 	if (t8140_sleep) {
 		t8140_sleep->apcie_port_stopped = false;
 		t8140_sleep->usb_down_ran = false;
+		t8140_pins_save(t8140_sleep);
 	}
 	t8140_sleep_set_wd2(t8140_sleep, WDT_SUSPEND_SECS);
 	pm_set_suspend_via_firmware();
@@ -2801,6 +2871,34 @@ static void t8140_sleep_map_apcie(struct t8140_sleep *s)
 	of_node_put(np);
 }
 
+/* macOS leaves the skipped pins alone, and reading one may fault. */
+static void t8140_sleep_map_pins(struct t8140_sleep *s)
+{
+	struct device_node *np = of_parse_phandle(s->dev->of_node, "apple,pinctrl", 0);
+	u32 npins, pin;
+	int i, n;
+
+	if (!np)
+		return;
+	if (!of_device_is_available(np) || of_property_read_u32(np, "apple,npins", &npins) ||
+	    !npins || npins > 512)
+		goto out;
+	s->pins_saved = devm_kcalloc(s->dev, npins, sizeof(*s->pins_saved), GFP_KERNEL);
+	s->pins_skip = devm_bitmap_zalloc(s->dev, npins, GFP_KERNEL);
+	if (!s->pins_saved || !s->pins_skip)
+		goto out;
+	n = of_property_count_u32_elems(s->dev->of_node, "apple,pinctrl-skip-pins");
+	for (i = 0; i < n; i++)
+		if (!of_property_read_u32_index(s->dev->of_node, "apple,pinctrl-skip-pins", i,
+						&pin) && pin < npins)
+			set_bit(pin, s->pins_skip);
+	s->pin_irq_groups = of_irq_count(np);
+	s->npins = npins;
+	s->pins = of_iomap(np, 0);
+out:
+	of_node_put(np);
+}
+
 static void t8140_sleep_map_debug_port(struct t8140_sleep *s)
 {
 	struct device_node *np = of_parse_phandle(s->dev->of_node, "apple,debug-port", 0);
@@ -2847,6 +2945,7 @@ static int t8140_sleep_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 	t8140_sleep_map_apcie(s);
+	t8140_sleep_map_pins(s);
 	t8140_sleep_map_debug_port(s);
 
 	platform_set_drvdata(pdev, s);
