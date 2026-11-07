@@ -61,6 +61,76 @@ select:
                 const: apple,mtp
       required:
         - compatible
+properties:
+  compatible: true
+
+  reg: true
+
+  reg-names: true
+
+  mboxes:
+    maxItems: 1
+
+  iommus: true
+
+  apple,rtkit-handoff:
+    enum:
+      - mtp-live-v1
+    description: |
+      The producer reserves firmware-visible buffers and retains their DART
+      mappings, and transfers a running RTKit session without renegotiation.
+      On T8132 it also supplies apple,rtkit-buffers, leaves the initial
+      DockChannel HID header unread, and retains the helper's identity DART
+      bypass. The host continues servicing system endpoints without restarting
+      the coprocessor or taking it to QUIESCED.
+
+  apple,rtkit-buffers:
+    oneOf:
+      - type: boolean
+      - $ref: /schemas/types.yaml#/definitions/uint32-array
+        minItems: 5
+        maxItems: 20
+    description: |
+      An empty property records that no shared buffers were negotiated.
+      Otherwise this is the inventory of every shared buffer negotiated,
+      in groups of five cells: system endpoint number, device address high
+      cell, device address low cell, exact protocol size in bytes, and the
+      original request's is-mapped flag (0 or 1). Endpoint numbers are 1 for
+      crashlog, 2 for syslog, 4 for IOReport, and 8 for OSLog, each at most once.
+      The last cell records whether firmware supplied the original address;
+      it does not classify the backing memory as SRAM or DRAM. Device
+      addresses are physical addresses under the retained identity bypass.
+      SRAM buffers must lie inside the sram register resource. Every DRAM
+      buffer must lie inside a no-map reserved-memory region referenced by
+      memory-region. The inventory is installed before mailbox RX is enabled;
+      repeating an existing request cannot replace a live allocation.
+
+  memory-region: true
+
+  linux-enablement-mac,rtkit-inherited:
+    deprecated: true
+    description: |
+      Legacy J713 preservation contract. An empty property or one 32-bit
+      cell containing 1 retains the running helper. A cell containing 0
+      selects ordinary startup. This carries no buffer inventory or verified
+      reservation record; the consumer can service system notifications but
+      cannot reconstruct or replace the existing shared buffers. New
+      producers use mtp-live-v1 and may retain this marker for older kernels.
+    oneOf:
+      - type: boolean
+      - $ref: /schemas/types.yaml#/definitions/uint32
+        enum: [0, 1]
+
+  '#helper-cells':
+    const: 0
+    description:
+      Present in existing device trees. Nothing references the helper with
+      argument cells; the DockChannel HID transport uses a plain phandle.
+
+# The root declares the union of property types for DTB decoding. The
+# conditional variants below each retain their closed property contract.
+additionalProperties: true
+
 allOf:
   -
     if:
@@ -124,8 +194,6 @@ allOf:
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
-
-unevaluatedProperties: false
 
 $defs:
   legacy-driver:

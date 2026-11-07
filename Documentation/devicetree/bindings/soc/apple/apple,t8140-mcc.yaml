@@ -43,6 +43,25 @@ select:
                 const: apple,mcc
       required:
         - compatible
+properties:
+  compatible: true
+
+  reg: true
+
+  nonposted-mmio: true
+
+  apple,boot-dma-devices:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      maxItems: 1
+    description:
+      Devices that take over DMA the bootloader left running. Cache allocation
+      is enabled only once each of them is bound to its driver.
+
+# The root declares the union of property types for DTB decoding. The
+# conditional variants below each retain their closed property contract.
+additionalProperties: true
+
 allOf:
   -
     if:
@@ -101,8 +120,6 @@ allOf:
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
-
-unevaluatedProperties: false
 
 $defs:
   legacy-driver:

@@ -56,6 +56,63 @@ select:
                 const: apple,pinctrl
       required:
         - compatible
+properties:
+  compatible: true
+
+  reg: true
+
+  clocks: true
+
+  gpio-controller: true
+
+  '#gpio-cells':
+    const: 2
+
+  gpio-ranges:
+    maxItems: 1
+
+  apple,irq-group-base:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 6
+    default: 0
+    description: First hardware interrupt group owned by the host.
+
+  apple,npins:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: The number of pins in this GPIO controller.
+
+  gpio-reserved-ranges: true
+
+  interrupts: true
+
+  interrupt-controller: true
+
+  '#interrupt-cells':
+    const: 2
+
+  power-domains: true
+
+patternProperties:
+  '-pins$':
+    type: object
+    $ref: pinmux-node.yaml#
+
+    properties:
+      pinmux:
+        description:
+          Values are constructed from pin number and alternate function
+          configuration number using the APPLE_PINMUX() helper macro
+          defined in include/dt-bindings/pinctrl/apple.h.
+
+    required:
+      - pinmux
+
+    additionalProperties: false
+
+# The root declares the union of property types for DTB decoding. The
+# conditional variants below each retain their closed property contract.
+additionalProperties: true
+
 allOf:
   -
     if:
@@ -138,8 +195,6 @@ allOf:
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
-
-unevaluatedProperties: false
 
 $defs:
   legacy-driver:

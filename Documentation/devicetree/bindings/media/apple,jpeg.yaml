@@ -46,6 +46,31 @@ select:
                 const: apple,jpeg
       required:
         - compatible
+properties:
+  compatible: true
+
+  reg: true
+
+  interrupts: true
+
+  iommus: true
+
+  power-domains: true
+
+  power-domain-names: true
+
+  apple,dma-range:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    items:
+      - const: 0x10000000000
+      - const: 0x100000000
+    description: Device-visible DMA window, as a 64-bit base and size.
+      Only for engines with 32-bit buffer pointers.
+
+# The root declares the union of property types for DTB decoding. The
+# conditional variants below each retain their closed property contract.
+additionalProperties: true
+
 allOf:
   -
     if:
@@ -110,8 +135,6 @@ allOf:
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
-
-unevaluatedProperties: false
 
 $defs:
   legacy-driver:
