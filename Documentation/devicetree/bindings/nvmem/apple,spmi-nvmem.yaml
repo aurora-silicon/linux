@@ -22,6 +22,7 @@ properties:
           - apple,baku-pmic
           - apple,chapel-pmic
           - apple,maverick-pmic
+          - apple,mirabeau-pmic
           - apple,monaco-pmic
           - apple,sera-pmic
           - apple,stowe-pmic
@@ -29,6 +30,9 @@ properties:
       - const: apple,spmi-nvmem
 
   reg:
+    maxItems: 1
+
+  interrupts:
     maxItems: 1
 
   rtc:

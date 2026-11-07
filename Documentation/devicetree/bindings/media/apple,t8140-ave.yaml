@@ -16,23 +16,36 @@ description: |
 
 properties:
   compatible:
-    enum:
-      - apple,t6000-ave
-      - apple,t6041-ave
-      - apple,t8112-ave
-      - apple,t8140-ave
+    oneOf:
+      - enum:
+          - apple,t6000-ave
+          - apple,t6041-ave
+          - apple,t8112-ave
+          - apple,t8140-ave
+      - items:
+          - enum:
+              - apple,t6020-ave
+              - apple,t6021-ave
+              - apple,t6022-ave
+          - const: apple,ave
 
   reg:
+    minItems: 3
     items:
       - description: Codec registers
       - description: Mailbox registers
       - description: Coprocessor registers
+      - description: Power control registers
+      - description: Fabric register aperture
 
   reg-names:
+    minItems: 3
     items:
       - const: codec
       - const: mailbox
       - const: coproc
+      - const: power-control
+      - const: fabric
 
   interrupts:
     items:
@@ -61,7 +74,8 @@ properties:
           PMC).
 
   iommus:
-    maxItems: 2
+    minItems: 2
+    maxItems: 4
 
   memory-region:
     items:

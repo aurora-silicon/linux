@@ -18,6 +18,7 @@ properties:
       - items:
           - enum:
               - apple,t6020-spi
+              - apple,t8112-spi
               - apple,t6030-spi
               - apple,t6031-spi
               - apple,t6041-spi

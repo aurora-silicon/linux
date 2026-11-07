@@ -29,16 +29,33 @@ properties:
       - items:
           - const: apple,t8140-event-log
           - const: apple,soc-event-log
+      - items:
+          - enum:
+              - apple,t8112-error-handler
+              - apple,t6020-error-handler
+              - apple,t6021-error-handler
+              - apple,t6022-error-handler
+          - const: apple,soc-error-handler
+      - items:
+          - enum:
+              - apple,t8112-event-log
+              - apple,t6020-event-log
+              - apple,t6021-event-log
+              - apple,t6022-event-log
+          - const: apple,soc-event-log
+
+  power-domains:
+    maxItems: 1
+    description: Power domain needed for the associated error-source registers.
 
   interrupts:
     minItems: 9
-    maxItems: 89
+    maxItems: 255
 
   reg:
-    minItems: 25
-    maxItems: 25
-    description: |
-      T6041 per-source NI0 through NI6 status apertures, in interrupt order.
+    minItems: 16
+    maxItems: 255
+    description: Error or event source register apertures in hardware order.
 
 required:
   - compatible
@@ -87,6 +104,17 @@ allOf:
         interrupts:
           minItems: 9
           maxItems: 9
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6041-error-handler
+    then:
+      properties:
+        reg:
+          minItems: 25
+          maxItems: 25
 
 additionalProperties: false
 

@@ -21,9 +21,17 @@ description: |
 
 properties:
   compatible:
-    enum:
-      - apple,t6041-jpeg
-      - apple,t8140-jpeg
+    oneOf:
+      - enum:
+          - apple,t6041-jpeg
+          - apple,t8140-jpeg
+      - items:
+          - enum:
+              - apple,t8112-jpeg
+              - apple,t6020-jpeg
+              - apple,t6021-jpeg
+              - apple,t6022-jpeg
+          - const: apple,jpeg
 
   reg:
     maxItems: 1
