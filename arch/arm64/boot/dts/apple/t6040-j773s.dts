@@ -484,7 +484,7 @@
 };
 
 /* The loader fills the operating points, calibration and all six memory regions. */
-&gfx_mbox {
+&agx_mbox {
 	status = "okay";
 };
 
@@ -529,14 +529,14 @@
 
 				port@0 {
 					reg = <0>;
-					typec0_con_hs: endpoint {
-						remote-endpoint = <&usb_drd0_hs>;
+					typec0_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_0_hs>;
 					};
 				};
 
 				port@1 {
 					reg = <1>;
-					typec0_con_ss: endpoint {
+					typec0_connector_ss: endpoint {
 						remote-endpoint = <&atcphy0_ss>;
 					};
 				};
@@ -565,14 +565,14 @@
 
 				port@0 {
 					reg = <0>;
-					typec1_con_hs: endpoint {
-						remote-endpoint = <&usb_drd1_hs>;
+					typec1_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_1_hs>;
 					};
 				};
 
 				port@1 {
 					reg = <1>;
-					typec1_con_ss: endpoint {
+					typec1_connector_ss: endpoint {
 						remote-endpoint = <&atcphy1_ss>;
 					};
 				};
@@ -601,14 +601,14 @@
 
 				port@0 {
 					reg = <0>;
-					typec2_con_hs: endpoint {
-						remote-endpoint = <&usb_drd2_hs>;
+					typec2_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_2_hs>;
 					};
 				};
 
 				port@1 {
 					reg = <1>;
-					typec2_con_ss: endpoint {
+					typec2_connector_ss: endpoint {
 						remote-endpoint = <&atcphy2_ss>;
 					};
 				};
@@ -627,14 +627,14 @@
 		port@0 {
 			reg = <0>;
 			atcphy0_ss: endpoint {
-				remote-endpoint = <&typec0_con_ss>;
+				remote-endpoint = <&typec0_connector_ss>;
 			};
 		};
 
 		port@1 {
 			reg = <1>;
 			atcphy0_usb3: endpoint {
-				remote-endpoint = <&usb_drd0_ss>;
+				remote-endpoint = <&dwc3_0_ss>;
 			};
 		};
 	};
@@ -644,15 +644,15 @@
 	status = "okay";
 };
 
-&usb_drd0_dart_0 {
+&dwc3_0_dart_0 {
 	status = "okay";
 };
 
-&usb_drd0_dart_1 {
+&dwc3_0_dart_1 {
 	status = "okay";
 };
 
-&usb_drd0 {
+&dwc3_0 {
 	status = "okay";
 
 	ports {
@@ -661,14 +661,14 @@
 
 		port@0 {
 			reg = <0>;
-			usb_drd0_hs: endpoint {
-				remote-endpoint = <&typec0_con_hs>;
+			dwc3_0_hs: endpoint {
+				remote-endpoint = <&typec0_connector_hs>;
 			};
 		};
 
 		port@1 {
 			reg = <1>;
-			usb_drd0_ss: endpoint {
+			dwc3_0_ss: endpoint {
 				remote-endpoint = <&atcphy0_usb3>;
 			};
 		};
@@ -685,14 +685,14 @@
 		port@0 {
 			reg = <0>;
 			atcphy1_ss: endpoint {
-				remote-endpoint = <&typec1_con_ss>;
+				remote-endpoint = <&typec1_connector_ss>;
 			};
 		};
 
 		port@1 {
 			reg = <1>;
 			atcphy1_usb3: endpoint {
-				remote-endpoint = <&usb_drd1_ss>;
+				remote-endpoint = <&dwc3_1_ss>;
 			};
 		};
 	};
@@ -702,15 +702,15 @@
 	status = "okay";
 };
 
-&usb_drd1_dart_0 {
+&dwc3_1_dart_0 {
 	status = "okay";
 };
 
-&usb_drd1_dart_1 {
+&dwc3_1_dart_1 {
 	status = "okay";
 };
 
-&usb_drd1 {
+&dwc3_1 {
 	status = "okay";
 
 	ports {
@@ -719,14 +719,14 @@
 
 		port@0 {
 			reg = <0>;
-			usb_drd1_hs: endpoint {
-				remote-endpoint = <&typec1_con_hs>;
+			dwc3_1_hs: endpoint {
+				remote-endpoint = <&typec1_connector_hs>;
 			};
 		};
 
 		port@1 {
 			reg = <1>;
-			usb_drd1_ss: endpoint {
+			dwc3_1_ss: endpoint {
 				remote-endpoint = <&atcphy1_usb3>;
 			};
 		};
@@ -743,14 +743,14 @@
 		port@0 {
 			reg = <0>;
 			atcphy2_ss: endpoint {
-				remote-endpoint = <&typec2_con_ss>;
+				remote-endpoint = <&typec2_connector_ss>;
 			};
 		};
 
 		port@1 {
 			reg = <1>;
 			atcphy2_usb3: endpoint {
-				remote-endpoint = <&usb_drd2_ss>;
+				remote-endpoint = <&dwc3_2_ss>;
 			};
 		};
 	};
@@ -760,15 +760,15 @@
 	status = "okay";
 };
 
-&usb_drd2_dart_0 {
+&dwc3_2_dart_0 {
 	status = "okay";
 };
 
-&usb_drd2_dart_1 {
+&dwc3_2_dart_1 {
 	status = "okay";
 };
 
-&usb_drd2 {
+&dwc3_2 {
 	status = "okay";
 
 	ports {
@@ -777,14 +777,14 @@
 
 		port@0 {
 			reg = <0>;
-			usb_drd2_hs: endpoint {
-				remote-endpoint = <&typec2_con_hs>;
+			dwc3_2_hs: endpoint {
+				remote-endpoint = <&typec2_connector_hs>;
 			};
 		};
 
 		port@1 {
 			reg = <1>;
-			usb_drd2_ss: endpoint {
+			dwc3_2_ss: endpoint {
 				remote-endpoint = <&atcphy2_usb3>;
 			};
 		};

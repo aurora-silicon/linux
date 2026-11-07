@@ -306,12 +306,12 @@
 		reg = <0x2 0x8a600000 0x0 0x88000>,
 		      <0x2 0x88000000 0x0 0x3758000>;
 		reg-names = "asc", "sgx";
-		mboxes = <&gfx_mbox>;
+		mboxes = <&agx_mbox>;
 		power-domains = <&ps_gfx>;
 		status = "disabled";
 	};
 
-	gfx_mbox: mailbox@28a600000 {
+	agx_mbox: mailbox@28a600000 {
 		compatible = "apple,t6040-ascwrap-v6";
 		reg = <0x2 0x8a600000 0x0 0x88000>,
 		      <0x2 0x8a050000 0x0 0x8>;

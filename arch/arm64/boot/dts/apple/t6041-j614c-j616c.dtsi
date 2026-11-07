@@ -380,8 +380,8 @@
 
 				port@0 {
 					reg = <0>;
-					typec1_con_hs: endpoint {
-						remote-endpoint = <&usb_drd1_hs>;
+					typec1_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_1_hs>;
 					};
 				};
 			};
@@ -413,8 +413,8 @@
 
 				port@0 {
 					reg = <0>;
-					typec2_con_hs: endpoint {
-						remote-endpoint = <&usb_drd2_hs>;
+					typec2_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_2_hs>;
 					};
 				};
 			};
@@ -427,15 +427,15 @@
 	status = "okay";
 };
 
-&usb_drd1_dart_0 {
+&dwc3_1_dart_0 {
 	status = "okay";
 };
 
-&usb_drd1_dart_1 {
+&dwc3_1_dart_1 {
 	status = "okay";
 };
 
-&usb_drd1 {
+&dwc3_1 {
 	maximum-speed = "high-speed";
 	phys = <&atcphy1 PHY_TYPE_USB2>;
 	phy-names = "usb2-phy";
@@ -453,8 +453,8 @@
 
 		port@0 {
 			reg = <0>;
-			usb_drd1_hs: endpoint {
-				remote-endpoint = <&typec1_con_hs>;
+			dwc3_1_hs: endpoint {
+				remote-endpoint = <&typec1_connector_hs>;
 			};
 		};
 	};
@@ -465,15 +465,15 @@
 	status = "okay";
 };
 
-&usb_drd2_dart_0 {
+&dwc3_2_dart_0 {
 	status = "okay";
 };
 
-&usb_drd2_dart_1 {
+&dwc3_2_dart_1 {
 	status = "okay";
 };
 
-&usb_drd2 {
+&dwc3_2 {
 	maximum-speed = "high-speed";
 	phys = <&atcphy2 PHY_TYPE_USB2>;
 	phy-names = "usb2-phy";
@@ -491,8 +491,8 @@
 
 		port@0 {
 			reg = <0>;
-			usb_drd2_hs: endpoint {
-				remote-endpoint = <&typec2_con_hs>;
+			dwc3_2_hs: endpoint {
+				remote-endpoint = <&typec2_connector_hs>;
 			};
 		};
 	};

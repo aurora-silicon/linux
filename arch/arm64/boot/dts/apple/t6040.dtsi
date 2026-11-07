@@ -217,13 +217,13 @@
 		reg = <0x2 0x8a600000 0x0 0x88000>,
 		      <0x2 0x88000000 0x0 0x3758000>;
 		reg-names = "asc", "sgx";
-		mboxes = <&gfx_mbox>;
+		mboxes = <&agx_mbox>;
 		power-domains = <&pmp_gfx>;
 		apple,clpc = <&clpc>;
 		status = "disabled";
 	};
 
-	gfx_mbox: mailbox@28a600000 {
+	agx_mbox: mailbox@28a600000 {
 		compatible = "apple,t6040-ascwrap-v6";
 		reg = <0x2 0x8a600000 0x0 0x88000>,
 		      <0x2 0x8a050000 0x0 0x8>;
@@ -561,27 +561,27 @@
 	power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1", "perf";
 };
 
-&usb_drd0_dart_0 {
+&dwc3_0_dart_0 {
 	apple,dma-range = <0x100 0x4000 0x0 0xffff0000>;
 };
 
-&usb_drd0_dart_1 {
+&dwc3_0_dart_1 {
 	apple,dma-range = <0x100 0x4000 0x0 0xffff0000>;
 };
 
-&usb_drd1_dart_0 {
+&dwc3_1_dart_0 {
 	apple,dma-range = <0x100 0x4000 0x0 0xffff0000>;
 };
 
-&usb_drd1_dart_1 {
+&dwc3_1_dart_1 {
 	apple,dma-range = <0x100 0x4000 0x0 0xffff0000>;
 };
 
-&usb_drd2_dart_0 {
+&dwc3_2_dart_0 {
 	apple,dma-range = <0x100 0x4000 0x0 0xffff0000>;
 };
 
-&usb_drd2_dart_1 {
+&dwc3_2_dart_1 {
 	apple,dma-range = <0x100 0x4000 0x0 0xffff0000>;
 };
 

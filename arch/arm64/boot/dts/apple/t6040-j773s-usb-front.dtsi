@@ -229,7 +229,7 @@
 		status = "disabled";
 	};
 
-	usb_drd3_dart_0: iommu@39af00000 {
+	dwc3_3_dart_0: iommu@39af00000 {
 		compatible = "apple,t6041-dart", "apple,t8110-dart";
 		reg = <0x3 0x9af00000 0x0 0xc000>;
 		interrupt-parent = <&aic>;
@@ -240,7 +240,7 @@
 		status = "disabled";
 	};
 
-	usb_drd3_dart_1: iommu@39af80000 {
+	dwc3_3_dart_1: iommu@39af80000 {
 		compatible = "apple,t6041-dart", "apple,t8110-dart";
 		reg = <0x3 0x9af80000 0x0 0xc000>;
 		interrupt-parent = <&aic>;
@@ -251,7 +251,7 @@
 		status = "disabled";
 	};
 
-	usb_drd3: usb@39a280000 {
+	dwc3_3: usb@39a280000 {
 		compatible = "apple,t6040-dwc3", "apple,t8103-dwc3";
 		reg = <0x3 0x9a280000 0x0 0xcd00>,
 		      <0x3 0x9a28cd00 0x0 0x3200>,
@@ -260,7 +260,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1715 IRQ_TYPE_LEVEL_HIGH>;
 		dr_mode = "host";
-		iommus = <&usb_drd3_dart_0 0>, <&usb_drd3_dart_1 1>;
+		iommus = <&dwc3_3_dart_0 0>, <&dwc3_3_dart_1 1>;
 		power-domains = <&ps_atc3_usb>;
 		resets = <&atcphy3>;
 		phys = <&atcphy3 PHY_TYPE_USB2>, <&atcphy3 PHY_TYPE_USB3>;
