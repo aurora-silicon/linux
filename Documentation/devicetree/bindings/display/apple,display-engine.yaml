@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: "http://devicetree.org/schemas/display/apple,display-engine.yaml#"
+$schema: "http://devicetree.org/meta-schemas/core.yaml#"
+title: "Apple display engine hardware resources"
+maintainers:
+  - "Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>"
+description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+properties:
+  compatible:
+    items:
+      -
+        const: "apple,t6050-display-engine"
+      -
+        const: "apple,display-engine"
+  status:
+    const: "disabled"
+  reg:
+    minItems: 5
+    maxItems: 5
+    description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+  interrupts:
+    minItems: 11
+    maxItems: 13
+  iommus:
+    minItems: 2
+    maxItems: 2
+  clocks:
+    maxItems: 2
+required:
+  - "compatible"
+  - "reg"
+  - "status"
+  - "interrupts"
+  - "iommus"
+  - "clocks"
+additionalProperties: false

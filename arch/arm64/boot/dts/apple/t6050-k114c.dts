@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/dts-v1/;
+
+#define T6050_K114C
+#include "t6050.dtsi"
+#include "t6050-peripherals.dtsi"
+
+/ {
+	model = "Apple K114C";
+	compatible = "apple,k114c", "apple,t6050", "apple,arm-platform";
+	chassis-type = "laptop";
+};

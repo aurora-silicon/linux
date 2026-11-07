@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/dts-v1/;
+
+#define T6050_J775C
+#include "t6050.dtsi"
+#include "t6050-peripherals.dtsi"
+
+/ {
+	model = "Apple J775C";
+	compatible = "apple,j775c", "apple,t6050", "apple,arm-platform";
+	chassis-type = "desktop";
+};

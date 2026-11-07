@@ -699,3 +699,6 @@
 	hdmi-pwren-gpios = <&smc_pcio 0 GPIO_ACTIVE_HIGH>;
 	dp2hdmi-pwren-gpios = <&smc_pcio 1 GPIO_ACTIVE_HIGH>;
 };
+
+#define T6050_J775D
+#include "t6050-peripherals.dtsi"
