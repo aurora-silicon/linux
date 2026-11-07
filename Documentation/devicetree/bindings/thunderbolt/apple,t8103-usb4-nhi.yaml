@@ -25,17 +25,17 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,t6000-usb4-nhi"
-              - "apple,t6020-usb4-nhi"
-              - "apple,t6030-usb4-nhi"
-              - "apple,t6031-usb4-nhi"
-              - "apple,t8103-usb4-nhi"
-              - "apple,t8112-usb4-nhi"
-              - "apple,t8122-usb4-nhi"
-              - "apple,t8132-usb4-nhi"
-              - "apple,t8142-usb4-nhi"
+              - apple,t6000-usb4-nhi
+              - apple,t6020-usb4-nhi
+              - apple,t6030-usb4-nhi
+              - apple,t6031-usb4-nhi
+              - apple,t8103-usb4-nhi
+              - apple,t8112-usb4-nhi
+              - apple,t8122-usb4-nhi
+              - apple,t8132-usb4-nhi
+              - apple,t8142-usb4-nhi
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
@@ -43,14 +43,14 @@ select:
             -
               contains:
                 enum:
-                  - "apple,t8142-usb4-nhi"
-                  - "apple,t8152-usb4-nhi"
-                  - "apple,t6050-usb4-nhi"
+                  - apple,t8142-usb4-nhi
+                  - apple,t8152-usb4-nhi
+                  - apple,t6050-usb4-nhi
             -
               contains:
-                const: "apple,usb4-nhi"
+                const: apple,usb4-nhi
       required:
-        - "compatible"
+        - compatible
 allOf:
   -
     if:
@@ -62,62 +62,71 @@ allOf:
                 -
                   contains:
                     enum:
-                      - "apple,t8142-usb4-nhi"
-                      - "apple,t8152-usb4-nhi"
-                      - "apple,t6050-usb4-nhi"
+                      - apple,t8142-usb4-nhi
+                      - apple,t8152-usb4-nhi
+                      - apple,t6050-usb4-nhi
                 -
                   contains:
-                    const: "apple,usb4-nhi"
+                    const: apple,usb4-nhi
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
           not:
             required:
-              - "mboxes"
+              - mboxes
     then:
       oneOf:
         -
-          description: "Apple usb4 router. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          type: object
+          description: |
+            Apple usb4 router. Initial resource description for an unsupported firmware/backend layout.
+            Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay
+            disabled; it does not substitute for the enabled driver contract or supply firmware,
+            calibration, programming sequences or unresolved providers.
           properties:
             compatible:
               items:
                 -
                   enum:
-                    - "apple,t8142-usb4-nhi"
-                    - "apple,t8152-usb4-nhi"
-                    - "apple,t6050-usb4-nhi"
+                    - apple,t8142-usb4-nhi
+                    - apple,t8152-usb4-nhi
+                    - apple,t6050-usb4-nhi
                 -
-                  const: "apple,usb4-nhi"
+                  const: apple,usb4-nhi
             status:
-              const: "disabled"
+              const: disabled
             reg:
-              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              description: |
+                Register apertures of the complete hardware complex, in hardware interface order.
               minItems: 6
               maxItems: 6
             interrupts:
-              description: "Interrupt lines wired to the system interrupt controller."
+              description: Interrupt lines wired to the system interrupt controller.
               minItems: 24
               maxItems: 25
             iommus:
-              description: "DMA translation streams emitted by this hardware."
+              description: DMA translation streams emitted by this hardware.
               minItems: 24
               maxItems: 24
             power-domains:
-              description: "Power and combined clock gates required by this hardware."
+              description: Power and combined clock gates required by this hardware.
               minItems: 3
               maxItems: 3
           required:
-            - "compatible"
-            - "reg"
-            - "status"
+            - compatible
+            - reg
+            - status
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
 
+unevaluatedProperties: false
+
 $defs:
   legacy-driver:
+    type: object
     properties:
       compatible:
         oneOf:

@@ -20,20 +20,20 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,t6000-avd"
-              - "apple,t6020-avd"
-              - "apple,t6030-avd"
-              - "apple,t6031-avd"
-              - "apple,t6041-avd"
-              - "apple,t6041-max-avd"
-              - "apple,t8103-avd"
-              - "apple,t8112-avd"
-              - "apple,t8122-avd"
-              - "apple,t8132-avd"
-              - "apple,t8140-avd"
-              - "apple,t8142-avd"
+              - apple,t6000-avd
+              - apple,t6020-avd
+              - apple,t6030-avd
+              - apple,t6031-avd
+              - apple,t6041-avd
+              - apple,t6041-max-avd
+              - apple,t8103-avd
+              - apple,t8112-avd
+              - apple,t8122-avd
+              - apple,t8132-avd
+              - apple,t8140-avd
+              - apple,t8142-avd
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
@@ -41,14 +41,14 @@ select:
             -
               contains:
                 enum:
-                  - "apple,t8142-avd"
-                  - "apple,t8152-avd"
-                  - "apple,t6050-avd"
+                  - apple,t8142-avd
+                  - apple,t8152-avd
+                  - apple,t6050-avd
             -
               contains:
-                const: "apple,avd"
+                const: apple,avd
       required:
-        - "compatible"
+        - compatible
 allOf:
   -
     if:
@@ -60,58 +60,67 @@ allOf:
                 -
                   contains:
                     enum:
-                      - "apple,t8142-avd"
-                      - "apple,t8152-avd"
-                      - "apple,t6050-avd"
+                      - apple,t8142-avd
+                      - apple,t8152-avd
+                      - apple,t6050-avd
                 -
                   contains:
-                    const: "apple,avd"
+                    const: apple,avd
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
           not:
             required:
-              - "mboxes"
+              - mboxes
     then:
       oneOf:
         -
-          description: "Apple video decoding accelerator complex. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          type: object
+          description: |
+            Apple video decoding accelerator complex. Initial resource description for an unsupported
+            firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver
+            exists. This form must stay disabled; it does not substitute for the enabled driver contract
+            or supply firmware, calibration, programming sequences or unresolved providers.
           properties:
             compatible:
               items:
                 -
                   enum:
-                    - "apple,t8142-avd"
-                    - "apple,t8152-avd"
-                    - "apple,t6050-avd"
+                    - apple,t8142-avd
+                    - apple,t8152-avd
+                    - apple,t6050-avd
                 -
-                  const: "apple,avd"
+                  const: apple,avd
             status:
-              const: "disabled"
+              const: disabled
             reg:
-              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              description: |
+                Register apertures of the complete hardware complex, in hardware interface order.
               minItems: 2
               maxItems: 3
             interrupts:
-              description: "Interrupt lines wired to the system interrupt controller."
+              description: Interrupt lines wired to the system interrupt controller.
               minItems: 2
               maxItems: 2
             iommus:
-              description: "DMA translation streams emitted by this hardware."
+              description: DMA translation streams emitted by this hardware.
               minItems: 3
               maxItems: 3
           required:
-            - "compatible"
-            - "reg"
-            - "status"
+            - compatible
+            - reg
+            - status
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
 
+unevaluatedProperties: false
+
 $defs:
   legacy-driver:
+    type: object
     properties:
       compatible:
         oneOf:

@@ -22,14 +22,14 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,soc-error-handler"
-              - "apple,soc-event-log"
-              - "apple,t6041-error-handler"
-              - "apple,t6041-event-log"
-              - "apple,t8140-error-handler"
-              - "apple,t8140-event-log"
+              - apple,soc-error-handler
+              - apple,soc-event-log
+              - apple,t6041-error-handler
+              - apple,t6041-event-log
+              - apple,t8140-error-handler
+              - apple,t8140-event-log
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
@@ -37,13 +37,13 @@ select:
             -
               contains:
                 enum:
-                  - "apple,t8142-error-handler"
-                  - "apple,t8152-error-handler"
+                  - apple,t8142-error-handler
+                  - apple,t8152-error-handler
             -
               contains:
-                const: "apple,soc-error-handler"
+                const: apple,soc-error-handler
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
@@ -51,14 +51,14 @@ select:
             -
               contains:
                 enum:
-                  - "apple,t8142-event-log"
-                  - "apple,t8152-event-log"
-                  - "apple,t6050-event-log"
+                  - apple,t8142-event-log
+                  - apple,t8152-event-log
+                  - apple,t6050-event-log
             -
               contains:
-                const: "apple,soc-event-log"
+                const: apple,soc-event-log
       required:
-        - "compatible"
+        - compatible
 allOf:
   -
     if:
@@ -70,19 +70,19 @@ allOf:
                 -
                   contains:
                     enum:
-                      - "apple,t8142-error-handler"
-                      - "apple,t8152-error-handler"
+                      - apple,t8142-error-handler
+                      - apple,t8152-error-handler
                 -
                   contains:
-                    const: "apple,soc-error-handler"
+                    const: apple,soc-error-handler
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
           not:
             required:
-              - "mboxes"
+              - mboxes
         -
           properties:
             compatible:
@@ -90,80 +90,95 @@ allOf:
                 -
                   contains:
                     enum:
-                      - "apple,t8142-event-log"
-                      - "apple,t8152-event-log"
-                      - "apple,t6050-event-log"
+                      - apple,t8142-event-log
+                      - apple,t8152-event-log
+                      - apple,t6050-event-log
                 -
                   contains:
-                    const: "apple,soc-event-log"
+                    const: apple,soc-event-log
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
           not:
             required:
-              - "mboxes"
+              - mboxes
     then:
       oneOf:
         -
-          description: "Apple soc error monitoring register windows. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          type: object
+          description: |
+            Apple soc error monitoring register windows. Initial resource description for an unsupported
+            firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver
+            exists. This form must stay disabled; it does not substitute for the enabled driver contract
+            or supply firmware, calibration, programming sequences or unresolved providers.
           properties:
             compatible:
               items:
                 -
                   enum:
-                    - "apple,t8142-error-handler"
-                    - "apple,t8152-error-handler"
+                    - apple,t8142-error-handler
+                    - apple,t8152-error-handler
                 -
-                  const: "apple,soc-error-handler"
+                  const: apple,soc-error-handler
             status:
-              const: "disabled"
+              const: disabled
             reg:
-              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              description: |
+                Register apertures of the complete hardware complex, in hardware interface order.
               minItems: 33
               maxItems: 120
             interrupts:
-              description: "Interrupt lines wired to the system interrupt controller."
+              description: Interrupt lines wired to the system interrupt controller.
               minItems: 31
               maxItems: 96
           required:
-            - "compatible"
-            - "reg"
-            - "status"
+            - compatible
+            - reg
+            - status
           additionalProperties: false
         -
-          description: "Apple soc event log register windows. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          type: object
+          description: |
+            Apple soc event log register windows. Initial resource description for an unsupported
+            firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver
+            exists. This form must stay disabled; it does not substitute for the enabled driver contract
+            or supply firmware, calibration, programming sequences or unresolved providers.
           properties:
             compatible:
               items:
                 -
                   enum:
-                    - "apple,t8142-event-log"
-                    - "apple,t8152-event-log"
-                    - "apple,t6050-event-log"
+                    - apple,t8142-event-log
+                    - apple,t8152-event-log
+                    - apple,t6050-event-log
                 -
-                  const: "apple,soc-event-log"
+                  const: apple,soc-event-log
             status:
-              const: "disabled"
+              const: disabled
             reg:
-              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              description: |
+                Register apertures of the complete hardware complex, in hardware interface order.
               minItems: 51
               maxItems: 141
             interrupts:
-              description: "Interrupt lines wired to the system interrupt controller."
+              description: Interrupt lines wired to the system interrupt controller.
               minItems: 9
               maxItems: 23
           required:
-            - "compatible"
-            - "reg"
-            - "status"
+            - compatible
+            - reg
+            - status
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
 
+unevaluatedProperties: false
+
 $defs:
   legacy-driver:
+    type: object
     properties:
       compatible:
         oneOf:
