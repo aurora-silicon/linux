@@ -2,6 +2,7 @@
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/spi/apple,qspi.yaml#
+
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
 title: Apple ARM SoC QSPIMC controller
@@ -14,40 +15,127 @@ description: |
   It is distinct from the ordinary Apple SPIMC controller despite serving a
   similar set of SPI NOR devices.
 
+select:
+  anyOf:
+    -
+      properties:
+        compatible:
+          contains:
+            enum:
+              - "apple,t6041-qspi"
+              - "apple,t6050-qspi"
+              - "apple,t8122-qspi"
+              - "apple,t8132-qspi"
+              - "apple,t8140-qspi"
+              - "apple,t8152-qspi"
+      required:
+        - "compatible"
+    -
+      properties:
+        compatible:
+          allOf:
+            -
+              contains:
+                enum:
+                  - "apple,t8142-qspi"
+                  - "apple,t8152-qspi"
+            -
+              contains:
+                const: "apple,qspi"
+      required:
+        - "compatible"
 allOf:
-  - $ref: spi-controller.yaml#
+  -
+    if:
+      anyOf:
+        -
+          properties:
+            compatible:
+              allOf:
+                -
+                  contains:
+                    enum:
+                      - "apple,t8142-qspi"
+                      - "apple,t8152-qspi"
+                -
+                  contains:
+                    const: "apple,qspi"
+            status:
+              const: "disabled"
+          required:
+            - "compatible"
+            - "status"
+          not:
+            required:
+              - "mboxes"
+    then:
+      oneOf:
+        -
+          description: "Apple quad spi controller and pin interface. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          properties:
+            compatible:
+              items:
+                -
+                  enum:
+                    - "apple,t8142-qspi"
+                    - "apple,t8152-qspi"
+                -
+                  const: "apple,qspi"
+            status:
+              const: "disabled"
+            reg:
+              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              minItems: 2
+              maxItems: 2
+            interrupts:
+              description: "Interrupt lines wired to the system interrupt controller."
+              maxItems: 1
+            power-domains:
+              description: "Power and combined clock gates required by this hardware."
+              maxItems: 1
+          required:
+            - "compatible"
+            - "reg"
+            - "status"
+          additionalProperties: false
+    else:
+      $ref: "#/$defs/legacy-driver"
 
-properties:
-  compatible:
-    oneOf:
-      - enum:
-          - apple,t8122-qspi
-          - apple,t8132-qspi
-          - apple,t6041-qspi
-          - apple,t8140-qspi
-      - items:
-          - const: apple,t8152-qspi
-          - const: apple,t8140-qspi
+$defs:
+  legacy-driver:
+    allOf:
+      - $ref: spi-controller.yaml#
+    properties:
+      compatible:
+        oneOf:
+          - enum:
+              - apple,t8122-qspi
+              - apple,t8132-qspi
+              - apple,t6041-qspi
+              - apple,t8140-qspi
+          - items:
+              - enum:
+                  - apple,t6050-qspi
+                  - apple,t8152-qspi
+              - const: apple,t8140-qspi
 
-  reg:
-    maxItems: 1
+      reg:
+        maxItems: 1
 
-  clocks:
-    maxItems: 1
+      clocks:
+        maxItems: 1
 
-  interrupts:
-    maxItems: 1
+      interrupts:
+        maxItems: 1
 
-  power-domains:
-    maxItems: 1
-
-required:
-  - compatible
-  - reg
-  - clocks
-  - interrupts
-
-unevaluatedProperties: false
+      power-domains:
+        maxItems: 1
+    required:
+      - compatible
+      - reg
+      - clocks
+      - interrupts
+    unevaluatedProperties: false
 
 examples:
   - |

@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: "http://devicetree.org/schemas/soc/apple/apple,display-engine.yaml#"
+$schema: "http://devicetree.org/meta-schemas/core.yaml#"
+title: "Apple display scanout engine"
+maintainers:
+  - "Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>"
+select:
+  properties:
+    compatible:
+      allOf:
+        -
+          contains:
+            enum:
+              - "apple,t8142-display-engine"
+              - "apple,t8152-display-engine"
+              - "apple,t6050-display-engine"
+        -
+          contains:
+            const: "apple,display-engine"
+  required:
+    - "compatible"
+description: "Apple display scanout engine. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+properties:
+  compatible:
+    items:
+      -
+        enum:
+          - "apple,t8142-display-engine"
+          - "apple,t8152-display-engine"
+          - "apple,t6050-display-engine"
+      -
+        const: "apple,display-engine"
+  status:
+    const: "disabled"
+  reg:
+    description: "Register apertures of the complete hardware complex, in hardware interface order."
+    minItems: 5
+    maxItems: 5
+  interrupts:
+    description: "Interrupt lines wired to the system interrupt controller."
+    minItems: 6
+    maxItems: 13
+  iommus:
+    description: "DMA translation streams emitted by this hardware."
+    minItems: 2
+    maxItems: 2
+required:
+  - "compatible"
+  - "reg"
+  - "status"
+additionalProperties: false

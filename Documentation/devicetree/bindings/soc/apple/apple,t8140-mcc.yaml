@@ -2,6 +2,7 @@
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/soc/apple/apple,t8140-mcc.yaml#
+
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
 title: Apple memory cache controller
@@ -15,36 +16,116 @@ description:
   two apertures with two planes each and a multicast cache-enable register;
   its enabled cache is retained until a dirty-data drain is qualified.
 
-properties:
-  compatible:
-    oneOf:
-      - enum:
-          - apple,t8132-mcc
-          - apple,t8140-mcc
-      - items:
-          - const: apple,t6041-mcc
-          - const: apple,t8140-mcc
+select:
+  anyOf:
+    -
+      properties:
+        compatible:
+          contains:
+            enum:
+              - "apple,t6041-mcc"
+              - "apple,t8132-mcc"
+              - "apple,t8140-mcc"
+      required:
+        - "compatible"
+    -
+      properties:
+        compatible:
+          allOf:
+            -
+              contains:
+                enum:
+                  - "apple,t8142-mcc"
+                  - "apple,t8152-mcc"
+                  - "apple,t6050-mcc"
+            -
+              contains:
+                const: "apple,mcc"
+      required:
+        - "compatible"
+allOf:
+  -
+    if:
+      anyOf:
+        -
+          properties:
+            compatible:
+              allOf:
+                -
+                  contains:
+                    enum:
+                      - "apple,t8142-mcc"
+                      - "apple,t8152-mcc"
+                      - "apple,t6050-mcc"
+                -
+                  contains:
+                    const: "apple,mcc"
+            status:
+              const: "disabled"
+          required:
+            - "compatible"
+            - "status"
+          not:
+            required:
+              - "mboxes"
+    then:
+      oneOf:
+        -
+          description: "Apple memory cache controller complex. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          properties:
+            compatible:
+              items:
+                -
+                  enum:
+                    - "apple,t8142-mcc"
+                    - "apple,t8152-mcc"
+                    - "apple,t6050-mcc"
+                -
+                  const: "apple,mcc"
+            status:
+              const: "disabled"
+            reg:
+              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              minItems: 4
+              maxItems: 18
+          required:
+            - "compatible"
+            - "reg"
+            - "status"
+          additionalProperties: false
+    else:
+      $ref: "#/$defs/legacy-driver"
 
-  reg:
-    description: Per-plane blocks on T8140, or the two multicast apertures on T8132.
-    minItems: 1
-    maxItems: 32
+$defs:
+  legacy-driver:
+    properties:
+      compatible:
+        oneOf:
+          - enum:
+              - apple,t8132-mcc
+              - apple,t8140-mcc
+          - items:
+              - const: apple,t6041-mcc
+              - const: apple,t8140-mcc
 
-  nonposted-mmio: true
+      reg:
+        description: Per-plane blocks on T8140, or the two multicast apertures on T8132.
+        minItems: 1
+        maxItems: 32
 
-  apple,boot-dma-devices:
-    $ref: /schemas/types.yaml#/definitions/phandle-array
-    items:
-      maxItems: 1
-    description:
-      Devices that take over DMA the bootloader left running. Cache allocation
-      is enabled only once each of them is bound to its driver.
+      nonposted-mmio: true
 
-required:
-  - compatible
-  - reg
-
-additionalProperties: false
+      apple,boot-dma-devices:
+        $ref: /schemas/types.yaml#/definitions/phandle-array
+        items:
+          maxItems: 1
+        description:
+          Devices that take over DMA the bootloader left running. Cache allocation
+          is enabled only once each of them is bound to its driver.
+    required:
+      - compatible
+      - reg
+    additionalProperties: false
 
 examples:
   - |

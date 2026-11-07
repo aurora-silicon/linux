@@ -5,7 +5,7 @@
 
 &{/soc} {
 
-	hw_apcie0_piodma: pcie-piodma@488030000 {
+	hw_apcie0_piodma: dma-controller@488030000 {
 		compatible = "apple,t8142-pcie-piodma", "apple,pcie-piodma";
 		reg = <0x4 0x88030000 0x0 0x4000>,
 		      <0x4 0x88034000 0x0 0x4000>,
@@ -15,8 +15,8 @@
 		status = "disabled";
 	};
 
-	hw_acio0: usb4-router@401f00000 {
-		compatible = "apple,t8142-usb4-router", "apple,usb4-router";
+	hw_acio0: usb4@401f00000 {
+		compatible = "apple,t8142-usb4-nhi", "apple,usb4-nhi";
 		reg = <0x4 0x1f00000 0x0 0x100000>,
 		      <0x4 0x1ac0000 0x0 0x4000>,
 		      <0x4 0x1ac4000 0x0 0x4000>,
@@ -51,8 +51,8 @@
 		status = "disabled";
 	};
 
-	hw_acio1: usb4-router@409f00000 {
-		compatible = "apple,t8142-usb4-router", "apple,usb4-router";
+	hw_acio1: usb4@409f00000 {
+		compatible = "apple,t8142-usb4-nhi", "apple,usb4-nhi";
 		reg = <0x4 0x9f00000 0x0 0x100000>,
 		      <0x4 0x9ac0000 0x0 0x4000>,
 		      <0x4 0x9ac4000 0x0 0x4000>,
@@ -87,7 +87,7 @@
 		status = "disabled";
 	};
 
-	hw_aop_exclave_mailbox: secure-mailbox@5e067c000 {
+	hw_aop_exclave_mailbox: mailbox@5e067c000 {
 		compatible = "apple,t8142-secure-mailbox", "apple,secure-mailbox";
 		reg = <0x5 0xe067c000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 497 IRQ_TYPE_LEVEL_HIGH>,
@@ -96,8 +96,8 @@
 		status = "disabled";
 	};
 
-	hw_aop2: aop-coproc@391600000 {
-		compatible = "apple,t8142-aop-coproc", "apple,aop-coproc";
+	hw_aop2: aop2@391600000 {
+		compatible = "apple,t8142-aop2", "apple,aop2";
 		reg = <0x3 0x91600000 0x0 0x88000>,
 		      <0x3 0x91050000 0x0 0x4000>,
 		      <0x3 0x9162c000 0x0 0x3c008>;
@@ -109,8 +109,8 @@
 		status = "disabled";
 	};
 
-	hw_avd: video-decoder-complex@500000000 {
-		compatible = "apple,t8142-video-decoder-complex", "apple,video-decoder-complex";
+	hw_avd: video-decoder@500000000 {
+		compatible = "apple,t8142-avd", "apple,avd";
 		reg = <0x5 0x0 0x0 0x1404000>,
 		      <0x3 0x88078000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 1077 IRQ_TYPE_LEVEL_HIGH>,
@@ -118,13 +118,14 @@
 		status = "disabled";
 	};
 
-	hw_admac_leap_ns: admac-complex@393300000 {
-		compatible = "apple,t8142-admac-complex", "apple,admac-complex";
+	hw_admac_leap_ns: dma-controller@393300000 {
+		compatible = "apple,t8142-admac", "apple,admac";
 		reg = <0x3 0x93300000 0x0 0x34000>,
 		      <0x3 0x882a8000 0x0 0x8>;
 		interrupts = <AIC_IRQ 552 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&aop_dart 10>;
 		status = "disabled";
+		#dma-cells = <1>;
 	};
 
 
