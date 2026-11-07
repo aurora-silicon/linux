@@ -22,6 +22,8 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/soc/apple/rtkit.h>
+#include <linux/soc/apple/sleep.h>
+#include <linux/suspend.h>
 #include <linux/wait.h>
 
 #include "dmaengine.h"
@@ -154,6 +156,11 @@ typedef void (*sio_ack_callback)(struct sio_chan *, void *, bool);
 struct sio_hw_data {
 	u32 fifo_threshold;
 	bool clear_period_desc;
+	/*
+	 * Only run the firmware, so that it can be stopped for a system sleep. Nothing
+	 * uses its DMA here, and its service parameters haven't been traced.
+	 */
+	bool firmware_only;
 	int (*check_boot_tables)(struct device *dev);
 };
 
@@ -163,6 +170,8 @@ struct sio_data {
 	struct dma_device dma;
 	struct device *dev;
 	struct apple_rtkit *rtk;
+	/* The firmware is stopped for a system sleep. */
+	bool asleep;
 	u32 protocol;
 	void *shmem;
 	dma_addr_t shmem_iova;
@@ -373,8 +382,13 @@ static const struct sio_hw_data sio_hw_t6030 = {
 	.check_boot_tables = sio_t6030_check_boot_tables,
 };
 
+static const struct sio_hw_data sio_hw_t8140 = {
+	.firmware_only = true,
+};
+
 static const struct of_device_id sio_of_match[] = {
 	{ .compatible = "apple,t6030-sio", .data = &sio_hw_t6030 },
+	{ .compatible = "apple,t8140-sio", .data = &sio_hw_t8140 },
 	{ .compatible = "apple,sio", .data = &sio_hw_generic },
 	{ }
 };
@@ -1709,6 +1723,11 @@ static int sio_probe(struct platform_device *pdev)
 	if (err)
 		return dev_err_probe(&pdev->dev, err, "SIO did not boot\n");
 
+	if (hw->firmware_only) {
+		dev_info(&pdev->dev, "firmware running, no DMA service\n");
+		goto rpm_put;
+	}
+
 	err = apple_rtkit_start_ep(sio->rtk, EP_SIO);
 	if (err)
 		return dev_err_probe(&pdev->dev, err, "starting SIO endpoint\n");
@@ -1748,6 +1767,9 @@ static void sio_remove(struct platform_device *pdev)
 {
 	struct sio_data *sio = platform_get_drvdata(pdev);
 
+	if (sio->hw->firmware_only)
+		return;
+
 	of_dma_controller_free(pdev->dev.of_node);
 	dma_async_device_unregister(&sio->dma);
 }
@@ -1765,7 +1787,93 @@ static __maybe_unused int sio_resume(struct device *dev)
 	return 0;
 }
 
-static DEFINE_RUNTIME_DEV_PM_OPS(sio_pm_ops, sio_suspend, sio_resume, NULL);
+/* A channel with a transfer can't be carried through a firmware restart. */
+static bool sio_chan_busy(struct sio_chan *siochan)
+{
+	unsigned long flags;
+	bool busy;
+
+	spin_lock_irqsave(&siochan->vc.lock, flags);
+	busy = siochan->current_tx || siochan->idle || siochan->ring;
+	spin_unlock_irqrestore(&siochan->vc.lock, flags);
+
+	return busy;
+}
+
+static __maybe_unused int sio_suspend_late(struct device *dev)
+{
+	struct sio_data *sio = dev_get_drvdata(dev);
+	int i, ret;
+
+	if (!pm_suspend_via_firmware() || sio->asleep)
+		return 0;
+
+	for (i = 0; i < sio->nchannels; i++) {
+		if (sio_chan_busy(&sio->channels[i])) {
+			dev_err(dev, "channel %d is busy, refusing the sleep\n", i);
+			return -EBUSY;
+		}
+	}
+
+	ret = apple_rtkit_sleep_stop(sio->rtk, sio->base + REG_CPU_CONTROL);
+	if (ret) {
+		dev_err(dev, "firmware did not stop for sleep: %d\n", ret);
+		if (apple_rtkit_sleep_return(sio->rtk, sio->base + REG_CPU_CONTROL))
+			dev_err(dev, "firmware did not come back\n");
+		return ret;
+	}
+	sio->asleep = true;
+
+	return 0;
+}
+
+static __maybe_unused int sio_resume_early(struct device *dev)
+{
+	struct sio_data *sio = dev_get_drvdata(dev);
+	int ret;
+
+	if (!sio->asleep)
+		return 0;
+	/*
+	 * A refused sleep: an idled firmware doesn't wake with its power kept, and SIO_CPU shares
+	 * SIO's switch, so it can't be power-cycled alone. The sleep engine's own PMGR reset of it
+	 * restarts it (S); if that fails it stays stopped until the next real sleep.
+	 */
+	if (!pm_resume_via_firmware()) {
+		if (!apple_rtkit_sleep_return(sio->rtk, sio->base + REG_CPU_CONTROL)) {
+			sio->asleep = false;
+			return 0;
+		}
+		ret = apple_sleep_engine_reset(dev);
+		if (!ret)
+			ret = apple_rtkit_power_cycled_return(sio->rtk,
+							      sio->base + REG_CPU_CONTROL);
+		if (ret) {
+			dev_warn(dev, "sleep refused: firmware not back after a reset (%d), stopped until a real sleep\n",
+				 ret);
+			return 0;
+		}
+		sio->asleep = false;
+		dev_info(dev, "sleep refused: firmware back after a reset\n");
+		return 0;
+	}
+	sio->asleep = false;
+
+	/* Endpoints and parameters stay with the firmware: nothing is sent again. */
+	ret = apple_rtkit_sleep_return(sio->rtk, sio->base + REG_CPU_CONTROL);
+	if (ret)
+		dev_err(dev, "firmware did not come back from sleep: %d\n", ret);
+	else
+		dev_dbg(dev, "firmware back from sleep\n");
+
+	return 0;
+}
+
+static const struct dev_pm_ops sio_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+	LATE_SYSTEM_SLEEP_PM_OPS(sio_suspend_late, sio_resume_early)
+	RUNTIME_PM_OPS(sio_suspend, sio_resume, NULL)
+};
 
 static struct platform_driver apple_sio_driver = {
 	.driver = {
