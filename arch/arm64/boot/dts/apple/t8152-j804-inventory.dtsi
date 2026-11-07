@@ -654,4 +654,14 @@
 		      <0x5 0x6e92c000 0x0 0x4000>;
 		status = "disabled";
 	};
+
+	dt5_aop_exclave_mailbox: secure-mailbox@550750000 {
+		compatible = "apple,t8152-secure-mailbox", "apple,secure-mailbox";
+		reg = <0x5 0x50750000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 629 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 630 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 631 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&dt5_dart_sbr 1>;
+		status = "disabled";
+	};
 };
