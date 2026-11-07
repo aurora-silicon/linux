@@ -25,14 +25,6 @@ properties:
   reg:
     maxItems: 1
 
-  apple,read-queue-depth:
-    $ref: /schemas/types.yaml#/definitions/uint32
-    description: Number of entries in the read request queue.
-
-  apple,write-queue-depth:
-    $ref: /schemas/types.yaml#/definitions/uint32
-    description: Number of entries in the write request queue.
-
   apple,response-vector:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Local response vector of the firmware transport.
@@ -40,8 +32,6 @@ properties:
 required:
   - compatible
   - reg
-  - apple,read-queue-depth
-  - apple,write-queue-depth
   - apple,response-vector
 
 additionalProperties: false
