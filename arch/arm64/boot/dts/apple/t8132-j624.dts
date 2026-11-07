@@ -197,3 +197,31 @@
 		};
 	};
 };
+
+/*
+ * The PMGR domains of the USB-C ports this board wires beyond ATC0/ATC1, as
+ * the M4 firmware path's policy enables ATC0/ATC1's.
+ */
+&ps_atc2_common {
+	status = "okay";
+};
+
+&ps_atc2_usb_aon {
+	status = "okay";
+};
+
+&ps_atc2_usb {
+	status = "okay";
+};
+
+&ps_atc3_common {
+	status = "okay";
+};
+
+&ps_atc3_usb_aon {
+	status = "okay";
+};
+
+&ps_atc3_usb {
+	status = "okay";
+};
