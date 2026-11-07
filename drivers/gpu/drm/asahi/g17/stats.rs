@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! A sysfs reader owns the session, never a pointer into detachable Firmware.
+//! Reads drain the statistics rings without waking the GPU or servicing work.
 
 use super::{fw::variant::InitGraph, telemetry::Readout, Shared};
 use core::sync::atomic::Ordering;
@@ -17,6 +18,18 @@ impl Reader {
         if self.0.crashed.load(Ordering::Acquire) || firmware.recovery.pending() {
             firmware.rings.invalidate_statistics();
         } else {
+            // A statistics producer update need not coincide with an event
+            // notification. Consume complete queued records on demand too,
+            // using the same epoch, suspension and quarantine admission as
+            // the event worker. The device mutex serializes both consumers.
+            firmware.observe_statistics_power();
+            for &role in firmware.roles() {
+                firmware
+                    .rings
+                    .drain_statistics(&self.0.dev, &firmware.init, role);
+            }
+            // Power may have changed while copying the records. Do not
+            // export samples across an observed boundary.
             firmware.observe_statistics_power();
         }
         qualify(
