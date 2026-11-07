@@ -436,6 +436,8 @@
 		      <0x7 0x02a84000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1085 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_atc0_usb>;
+		iommus = <&dwc3_0_dart_0 1>, <&dwc3_0_dart_1 1>;
 		phys = <&atcphy0 PHY_TYPE_USB2>;
 		phy-names = "usb2-phy";
 		status = "disabled";

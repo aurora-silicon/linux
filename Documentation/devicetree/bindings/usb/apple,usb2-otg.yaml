@@ -43,6 +43,10 @@ properties:
   interrupts:
     maxItems: 1
 
+  iommus:
+    minItems: 2
+    maxItems: 2
+
   power-domains:
     maxItems: 1
 
@@ -55,6 +59,8 @@ required:
   - compatible
   - reg
   - interrupts
+  - iommus
+  - power-domains
   - phys
   - phy-names
 
