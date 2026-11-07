@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* T8132 SIO resources; channel layout and firmware regions require loader support. */
+
+&soc {
+	sio_mbox: mailbox@3ade08000 {
+		compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0xade08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1078 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 1079 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 1080 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 1081 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_sio_cpu>;
+		status = "disabled";
+	};
+
+	sio: dma-controller@3ade00000 {
+		compatible = "apple,t8132-sio", "apple,sio";
+		reg = <0x3 0xade00000 0x0 0x88000>,
+		      <0x3 0xad850000 0x0 0x4000>;
+		#dma-cells = <1>;
+		mboxes = <&sio_mbox>;
+		iommus = <&dart_sio0 0>;
+		power-domains = <&ps_sio_cpu>;
+		clocks = <&peripheral_clocks 416>, <&peripheral_clocks 414>, <&peripheral_clocks 415>;
+		status = "disabled";
+	};
+};
