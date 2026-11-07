@@ -2437,6 +2437,22 @@ static void brcmf_set_join_pref(struct brcmf_if *ifp,
 		bphy_err(drvr, "Set join_pref error (%d)\n", err);
 }
 
+/*
+ * Until the firmware reports the BSS it joined, a failed join is reported
+ * against the BSS this join asks for, not the one the interface was last
+ * associated with: userspace puts the reported BSS on its ignore list
+ * (brcmf_bss_connect_done()). A stale BSSID there made wpa_supplicant ignore
+ * a working AP for up to two minutes while it retried the one that failed.
+ */
+static void brcmf_connect_set_target(struct brcmf_cfg80211_profile *profile,
+				     const u8 *bssid)
+{
+	if (bssid)
+		memcpy(profile->bssid, bssid, ETH_ALEN);
+	else
+		eth_zero_addr(profile->bssid);
+}
+
 static s32
 brcmf_cfg80211_connect(struct wiphy *wiphy, struct net_device *ndev,
 		       struct cfg80211_connect_params *params)
@@ -2470,6 +2486,8 @@ brcmf_cfg80211_connect(struct wiphy *wiphy, struct net_device *ndev,
 
 	if (params->bssid_hint)
 		params->bssid = params->bssid_hint;
+
+	brcmf_connect_set_target(profile, params->bssid);
 
 	if (ifp->vif == cfg->p2p.bss_idx[P2PAPI_BSSCFG_PRIMARY].vif) {
 		/* A normal (non P2P) connection request setup. */
@@ -6846,7 +6864,9 @@ brcmf_bss_connect_done(struct brcmf_cfg80211_info *cfg,
 				  &ifp->vif->sme_state);
 			conn_params.status = WLAN_STATUS_AUTH_TIMEOUT;
 		}
-		conn_params.links[0].bssid = profile->bssid;
+		/* A join without a BSSID that failed names no BSS. */
+		if (!is_zero_ether_addr(profile->bssid))
+			conn_params.links[0].bssid = profile->bssid;
 		conn_params.req_ie = conn_info->req_ie;
 		conn_params.req_ie_len = conn_info->req_ie_len;
 		conn_params.resp_ie = conn_info->resp_ie;

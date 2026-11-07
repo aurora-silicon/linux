@@ -927,6 +927,7 @@ int tb_domain_init(void)
 	ret = bus_register(&tb_bus_type);
 	if (ret)
 		goto err_xdomain;
+	tb_dp_pm_gate_init();
 
 	return 0;
 
@@ -941,6 +942,7 @@ err_acpi:
 
 void tb_domain_exit(void)
 {
+	tb_dp_pm_gate_exit();
 	bus_unregister(&tb_bus_type);
 	ida_destroy(&tb_domain_ida);
 	tb_nvm_exit();

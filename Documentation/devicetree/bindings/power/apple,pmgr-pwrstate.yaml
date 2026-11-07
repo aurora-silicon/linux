@@ -97,6 +97,13 @@ properties:
       Forces this power domain to always be powered up.
     type: boolean
 
+  apple,externally-clocked:
+    description:
+      The domain's clock comes from outside the PMGR, such as an MCA
+      cluster clocked by its NCO. Until that clock runs the domain only
+      reaches the clock-gated state, which then counts as powered up.
+    type: boolean
+
   apple,no-auto-pm:
     description: |
       Never enables automatic power management (auto-enable) for this

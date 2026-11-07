@@ -181,6 +181,10 @@
 	status = "okay";
 };
 
+&mcc {
+	status = "okay";
+};
+
 &smc_hwmon {
 	temperature-TCMz {
 		apple,key-id = "TCMz";
@@ -367,6 +371,8 @@
 		height-mm = <223>;
 		adj-height-mm = <216>;
 		apple,max-brightness = <500>;
+		/* "Wide color (P3)" in the Apple technical specifications */
+		apple,color-gamut = "display-p3";
 	};
 };
 
@@ -966,6 +972,18 @@
 
 &isp_dart2 {
 	status = "okay";
+};
+
+#include "hwmon-fan-dual.dtsi"
+
+&smc_hwmon {
+	fan-F0Ac {
+		apple,fan-manual-control;
+	};
+
+	fan-F1Ac {
+		apple,fan-manual-control;
+	};
 };
 
 #include "t604x-extdisp.dtsi"

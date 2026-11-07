@@ -31,6 +31,8 @@
 	width-mm = <345>;
 	height-mm = <223>;
 	adj-height-mm = <216>;
+	/* "Wide color (P3)" in the Apple technical specifications */
+	apple,color-gamut = "display-p3";
 };
 
 &aop_audio {
@@ -57,4 +59,24 @@
  */
 &mesa {
 	firmware-name = "apple/mesacal-j616s.bin", "apple/msrk-j616s.bin";
+};
+
+&ps_jpg {
+	status = "okay";
+};
+
+&jpeg0_dart {
+	status = "okay";
+};
+
+&jpeg0 {
+	status = "okay";
+};
+
+&jpeg1_dart {
+	status = "okay";
+};
+
+&jpeg1 {
+	status = "okay";
 };

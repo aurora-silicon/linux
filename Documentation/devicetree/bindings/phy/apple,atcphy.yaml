@@ -205,6 +205,14 @@ properties:
   power-domains:
     maxItems: 1
 
+  phys:
+    maxItems: 1
+    description: Phandle to the eUSB2 to USB 2.0 repeater.
+
+  phy-names:
+    items:
+      - const: eusb2-repeater
+
   ports:
     $ref: /schemas/graph.yaml#/properties/ports
     properties:
