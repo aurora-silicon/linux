@@ -18,6 +18,18 @@ properties:
   compatible:
     oneOf:
       - items:
+          - const: apple,t8142-error-handler
+          - const: apple,soc-error-handler
+      - items:
+          - const: apple,t8142-event-log
+          - const: apple,soc-event-log
+      - items:
+          - const: apple,t8152-error-handler
+          - const: apple,soc-error-handler
+      - items:
+          - const: apple,t8152-event-log
+          - const: apple,soc-event-log
+      - items:
           - const: apple,t6041-error-handler
           - const: apple,soc-error-handler
       - items:
@@ -32,22 +44,84 @@ properties:
 
   interrupts:
     minItems: 9
-    maxItems: 89
+    maxItems: 96
 
   reg:
     minItems: 10
-    maxItems: 25
+    maxItems: 120
     description: |
       T6041 uses the qualified per-source NI status apertures in interrupt
       order. T8140 publishes its native error/event register banks in
       hardware-description order; their presence does not establish safe
       AP access and the instances remain disabled until qualified.
+      T8142 and T8152 likewise retain their native status windows; T8152
+      board descriptions publish 112 or 120 error-handler apertures.
 
 required:
   - compatible
   - interrupts
 
 allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8142-error-handler
+    then:
+      properties:
+        reg:
+          minItems: 33
+          maxItems: 33
+        interrupts:
+          minItems: 31
+          maxItems: 31
+      required:
+        - reg
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8142-event-log
+    then:
+      properties:
+        reg:
+          minItems: 51
+          maxItems: 51
+        interrupts:
+          minItems: 13
+          maxItems: 13
+      required:
+        - reg
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8152-error-handler
+    then:
+      properties:
+        reg:
+          minItems: 112
+          maxItems: 120
+        interrupts:
+          minItems: 96
+          maxItems: 96
+      required:
+        - reg
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8152-event-log
+    then:
+      properties:
+        reg:
+          minItems: 57
+          maxItems: 57
+        interrupts:
+          minItems: 9
+          maxItems: 9
+      required:
+        - reg
   - if:
       properties:
         compatible:
@@ -83,6 +157,8 @@ allOf:
             const: apple,t6041-event-log
     then:
       properties:
+        reg:
+          maxItems: 25
         interrupts:
           minItems: 21
           maxItems: 21
