@@ -697,6 +697,47 @@ mod enrol_request_tests {
         request
     }
 
+    fn take_enrol_poll(session: &mut Session) -> Result<EnrolPoll> {
+        let out = enrol_poll_report(session)?;
+        mark_enrol_seen(session);
+        Ok(out)
+    }
+
+    fn enrolling(session: &mut Session) -> u64 {
+        session.open = true;
+        session.start_worker().unwrap();
+        session.op = Op::Enrol {
+            label: [0; LABEL_LEN],
+            stage: 0,
+            terminal: None,
+            guidance: Guidance::Place,
+            percent: 0,
+        };
+        session.worker_epoch.unwrap()
+    }
+
+    // An enrolment capture that did not count is reported once, with its
+    // cause, and the enrolment goes on.
+    #[test]
+    fn uncounted_enrol_capture_is_reported_once() {
+        let mut session = Session::new();
+        let epoch = enrolling(&mut session);
+        assert!(enrol_retry(&mut session, epoch, Guidance::Center));
+        let first = take_enrol_poll(&mut session).unwrap();
+        assert_eq!(first.status, ENROL_POLL_RETRY);
+        assert!(first.guidance == Guidance::Center);
+        assert!(matches!(first.state, State::Pending));
+        let second = take_enrol_poll(&mut session).unwrap();
+        assert_eq!(second.status, 0);
+        // A stage after a retry: the next poll carries the stage, no retry.
+        assert!(enrol_advance(&mut session, epoch, 3, 40, Guidance::LiftAndMove));
+        let third = take_enrol_poll(&mut session).unwrap();
+        assert!(matches!(third.state, State::Progress));
+        assert_eq!((third.stage, third.status), (3, 0));
+        // A stale worker cannot report into a newer enrolment.
+        assert!(!enrol_retry(&mut session, epoch + 1, Guidance::Center));
+    }
+
     #[test]
     fn resolved_account_and_known_finger() {
         assert!(validate_enrol_request(&valid()).is_ok());
@@ -878,13 +919,14 @@ pub(crate) fn enrol_is_live(session: &Session, epoch: u64) -> bool {
     worker_is_current(session, epoch) && matches!(&session.op, Op::Enrol { terminal: None, .. })
 }
 
-fn enrol_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
+/// What an enrolment poll reports now.
+fn enrol_poll_report(session: &Session) -> Result<EnrolPoll> {
     let mut out = EnrolPoll {
         stages_total: ENROL_STAGES,
         ..EnrolPoll::default()
     };
 
-    match &ctx.session.op {
+    match &session.op {
         Op::Idle => out.state = State::Idle,
         Op::Verify { .. } => return Err(EBUSY),
         Op::Enrol {
@@ -901,12 +943,12 @@ fn enrol_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
                 None => {
                     // Guidance also wakes the poller, but it is not an image
                     // capture or a completed enrollment stage.
-                    out.state = if ctx.session.enrol_stage_unseen {
+                    out.state = if session.enrol_stage_unseen {
                         State::Progress
                     } else {
                         State::Pending
                     };
-                    if ctx.session.enrol_retry_unseen {
+                    if session.enrol_retry_unseen {
                         out.status = ENROL_POLL_RETRY;
                     }
                 }
@@ -921,13 +963,22 @@ fn enrol_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
             }
         }
     }
+    Ok(out)
+}
 
+/// The poll was delivered: its one-shot reports are seen.
+fn mark_enrol_seen(session: &mut Session) {
+    session.unseen = false;
+    session.enrol_stage_unseen = false;
+    session.enrol_retry_unseen = false;
+}
+
+fn enrol_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
+    let out = enrol_poll_report(ctx.session)?;
     UserSlice::new(user, core::mem::size_of::<EnrolPoll>())
         .writer()
         .write(&out)?;
-    ctx.session.unseen = false;
-    ctx.session.enrol_stage_unseen = false;
-    ctx.session.enrol_retry_unseen = false;
+    mark_enrol_seen(ctx.session);
     ok()
 }
 
