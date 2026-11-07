@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: "http://devicetree.org/schemas/soc/apple/apple,gpu-coproc.yaml#"
+$schema: "http://devicetree.org/meta-schemas/core.yaml#"
+title: "Apple graphics management coprocessor"
+maintainers:
+  - "Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>"
+select:
+  properties:
+    compatible:
+      allOf:
+        -
+          contains:
+            enum:
+              - "apple,t8142-gpu-coproc"
+              - "apple,t8152-gpu-coproc"
+              - "apple,t6050-gpu-coproc"
+        -
+          contains:
+            const: "apple,gpu-coproc"
+  required:
+    - "compatible"
+description: "Apple graphics management coprocessor. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+properties:
+  compatible:
+    items:
+      -
+        enum:
+          - "apple,t8142-gpu-coproc"
+          - "apple,t8152-gpu-coproc"
+          - "apple,t6050-gpu-coproc"
+      -
+        const: "apple,gpu-coproc"
+  status:
+    const: "disabled"
+  reg:
+    description: "Register apertures of the complete hardware complex, in hardware interface order."
+    minItems: 2
+    maxItems: 3
+  interrupts:
+    description: "Interrupt lines wired to the system interrupt controller."
+    minItems: 2
+    maxItems: 4
+required:
+  - "compatible"
+  - "reg"
+  - "status"
+additionalProperties: false

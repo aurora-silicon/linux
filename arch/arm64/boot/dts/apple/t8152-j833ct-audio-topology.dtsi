@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Disabled codec identities; all acoustic configuration stays with the loader. */
+
+&hw_i2c1 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	hw_jack_codec: codec@4b {
+		compatible = "cirrus,cs42l84";
+		reg = <0x4b>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Jack";
+		status = "disabled";
+	};
+};
+
+&hw_i2c3 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	hw_audio_speaker: codec@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Speaker 0";
+		status = "disabled";
+	};
+
+	hw_audio_speaker_left_tweeter: codec@39 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x39>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Tweeter";
+		status = "disabled";
+	};
+
+	hw_audio_speaker_right_woofer: codec@3b {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3b>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer";
+		status = "disabled";
+	};
+
+	hw_audio_speaker_right_tweeter: codec@3c {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3c>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Tweeter";
+		status = "disabled";
+	};
+};

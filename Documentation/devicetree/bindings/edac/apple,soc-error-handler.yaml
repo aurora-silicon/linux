@@ -2,6 +2,7 @@
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/edac/apple,soc-error-handler.yaml#
+
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
 title: Apple SoC platform error and event log interrupt handlers
@@ -14,81 +15,227 @@ description: |
   errors to dedicated platform interrupt groups. A second group reports
   fatal events latched by peripheral event logs.
 
-properties:
-  compatible:
-    oneOf:
-      - items:
-          - const: apple,t6041-error-handler
-          - const: apple,soc-error-handler
-      - items:
-          - const: apple,t8140-error-handler
-          - const: apple,soc-error-handler
-      - items:
-          - const: apple,t6041-event-log
-          - const: apple,soc-event-log
-      - items:
-          - const: apple,t8140-event-log
-          - const: apple,soc-event-log
-
-  interrupts:
-    minItems: 9
-    maxItems: 89
-
-  reg:
-    minItems: 25
-    maxItems: 25
-    description: |
-      T6041 per-source NI0 through NI6 status apertures, in interrupt order.
-
-required:
-  - compatible
-  - interrupts
-
-allOf:
-  - if:
+select:
+  anyOf:
+    -
       properties:
         compatible:
           contains:
-            const: apple,t6041-error-handler
-    then:
-      properties:
-        interrupts:
-          minItems: 89
-          maxItems: 89
+            enum:
+              - "apple,soc-error-handler"
+              - "apple,soc-event-log"
+              - "apple,t6041-error-handler"
+              - "apple,t6041-event-log"
+              - "apple,t8140-error-handler"
+              - "apple,t8140-event-log"
       required:
-        - reg
-  - if:
+        - "compatible"
+    -
       properties:
         compatible:
-          contains:
-            const: apple,t8140-error-handler
-    then:
-      properties:
-        interrupts:
-          minItems: 26
-          maxItems: 26
-  - if:
-      properties:
-        compatible:
-          contains:
-            const: apple,t6041-event-log
-    then:
-      properties:
-        interrupts:
-          minItems: 21
-          maxItems: 21
-  - if:
+          allOf:
+            -
+              contains:
+                enum:
+                  - "apple,t8142-error-handler"
+                  - "apple,t8152-error-handler"
+            -
+              contains:
+                const: "apple,soc-error-handler"
+      required:
+        - "compatible"
+    -
       properties:
         compatible:
-          contains:
-            const: apple,t8140-event-log
+          allOf:
+            -
+              contains:
+                enum:
+                  - "apple,t8142-event-log"
+                  - "apple,t8152-event-log"
+                  - "apple,t6050-event-log"
+            -
+              contains:
+                const: "apple,soc-event-log"
+      required:
+        - "compatible"
+allOf:
+  -
+    if:
+      anyOf:
+        -
+          properties:
+            compatible:
+              allOf:
+                -
+                  contains:
+                    enum:
+                      - "apple,t8142-error-handler"
+                      - "apple,t8152-error-handler"
+                -
+                  contains:
+                    const: "apple,soc-error-handler"
+            status:
+              const: "disabled"
+          required:
+            - "compatible"
+            - "status"
+          not:
+            required:
+              - "mboxes"
+        -
+          properties:
+            compatible:
+              allOf:
+                -
+                  contains:
+                    enum:
+                      - "apple,t8142-event-log"
+                      - "apple,t8152-event-log"
+                      - "apple,t6050-event-log"
+                -
+                  contains:
+                    const: "apple,soc-event-log"
+            status:
+              const: "disabled"
+          required:
+            - "compatible"
+            - "status"
+          not:
+            required:
+              - "mboxes"
     then:
-      properties:
-        interrupts:
-          minItems: 9
-          maxItems: 9
+      oneOf:
+        -
+          description: "Apple soc error monitoring register windows. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          properties:
+            compatible:
+              items:
+                -
+                  enum:
+                    - "apple,t8142-error-handler"
+                    - "apple,t8152-error-handler"
+                -
+                  const: "apple,soc-error-handler"
+            status:
+              const: "disabled"
+            reg:
+              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              minItems: 33
+              maxItems: 120
+            interrupts:
+              description: "Interrupt lines wired to the system interrupt controller."
+              minItems: 31
+              maxItems: 96
+          required:
+            - "compatible"
+            - "reg"
+            - "status"
+          additionalProperties: false
+        -
+          description: "Apple soc event log register windows. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          properties:
+            compatible:
+              items:
+                -
+                  enum:
+                    - "apple,t8142-event-log"
+                    - "apple,t8152-event-log"
+                    - "apple,t6050-event-log"
+                -
+                  const: "apple,soc-event-log"
+            status:
+              const: "disabled"
+            reg:
+              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              minItems: 51
+              maxItems: 141
+            interrupts:
+              description: "Interrupt lines wired to the system interrupt controller."
+              minItems: 9
+              maxItems: 23
+          required:
+            - "compatible"
+            - "reg"
+            - "status"
+          additionalProperties: false
+    else:
+      $ref: "#/$defs/legacy-driver"
 
-additionalProperties: false
+$defs:
+  legacy-driver:
+    properties:
+      compatible:
+        oneOf:
+          - items:
+              - const: apple,t6041-error-handler
+              - const: apple,soc-error-handler
+          - items:
+              - const: apple,t8140-error-handler
+              - const: apple,soc-error-handler
+          - items:
+              - const: apple,t6041-event-log
+              - const: apple,soc-event-log
+          - items:
+              - const: apple,t8140-event-log
+              - const: apple,soc-event-log
+
+      interrupts:
+        minItems: 9
+        maxItems: 89
+
+      reg:
+        minItems: 25
+        maxItems: 25
+        description: |
+          T6041 per-source NI0 through NI6 status apertures, in interrupt order.
+    required:
+      - compatible
+      - interrupts
+    allOf:
+      - if:
+          properties:
+            compatible:
+              contains:
+                const: apple,t6041-error-handler
+        then:
+          properties:
+            interrupts:
+              minItems: 89
+              maxItems: 89
+          required:
+            - reg
+      - if:
+          properties:
+            compatible:
+              contains:
+                const: apple,t8140-error-handler
+        then:
+          properties:
+            interrupts:
+              minItems: 26
+              maxItems: 26
+      - if:
+          properties:
+            compatible:
+              contains:
+                const: apple,t6041-event-log
+        then:
+          properties:
+            interrupts:
+              minItems: 21
+              maxItems: 21
+      - if:
+          properties:
+            compatible:
+              contains:
+                const: apple,t8140-event-log
+        then:
+          properties:
+            interrupts:
+              minItems: 9
+              maxItems: 9
+    additionalProperties: false
 
 examples:
   - |

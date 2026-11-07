@@ -5,7 +5,7 @@
 #include "t8152-j804-peripherals.dtsi"
 
 / {
-	model = "Apple MacBook Pro (J804)";
+	model = "Apple MacBook Pro (14-inch, M6)";
 	compatible = "apple,j804", "apple,t8152", "apple,arm-platform";
 };
 
