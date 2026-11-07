@@ -198,7 +198,6 @@
 	};
 
 	/*
-	/*
 	 * opp-microwatt: one busy CPU's power, fitted to J613 measurements.
 	 * Above 3288 MHz the hardware caps P power; those are extrapolated.
 	 */
@@ -535,7 +534,6 @@
 			power-domains = <&ps_avd_sys>;
 		};
 
-		/*
 		/* apple_sep enables it; the SEP only takes IOVAs in this window. */
 		sep_dart: iommu@29cac0000 {
 			compatible = "apple,t8122-dart", "apple,t8110-dart";
@@ -593,7 +591,6 @@
 			status = "disabled";
 		};
 
-		/*
 		/* Touch ID: pads muxed by iBoot, native chip select, 200 MHz. */
 		spi2: spi@2a1108000 {
 			compatible = "apple,t8122-spi", "apple,t8103-spi";
@@ -1127,7 +1124,6 @@
 						     "Tp05", "Tp0L", "Tp0b", "Tp0r";
 				apple,thermal-pressure-key = "mTPL";
 
-				/*
 				/* CPU die temperatures, first: thermal zones index them. */
 				temperature-Te05 {
 					apple,key-id = "Te05";
@@ -1859,7 +1855,6 @@
 			};
 		};
 
-		/*
 		/* ADT atc-dpxbar,t602x; the gate enables them with dcpext. */
 		atcphy0_xbar: mux@70304c000 {
 			compatible = "apple,t8122-display-crossbar",
