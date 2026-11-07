@@ -15,16 +15,15 @@ description: |
 
 properties:
   compatible:
-    oneOf:
-      - items:
-          - const: apple,t6041-pciec-piodma
-          - const: apple,pciec-piodma
-      - items:
-          - enum:
-              - apple,t8122-pciec-piodma
-              - apple,t6030-pciec-piodma
-              - apple,t6031-pciec-piodma
-          - const: apple,pciec-piodma
+    items:
+      - enum:
+          - apple,t6000-pciec-piodma
+          - apple,t6030-pciec-piodma
+          - apple,t6031-pciec-piodma
+          - apple,t6041-pciec-piodma
+          - apple,t8103-pciec-piodma
+          - apple,t8122-pciec-piodma
+      - const: apple,pciec-piodma
 
   reg:
     minItems: 4

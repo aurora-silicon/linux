@@ -24,9 +24,10 @@ properties:
           - apple,t8140-ave
       - items:
           - enum:
-              - apple,t8122-ave
               - apple,t6030-ave
               - apple,t6031-ave
+              - apple,t8103-ave
+              - apple,t8122-ave
           - const: apple,ave
 
   reg:
@@ -35,10 +36,16 @@ properties:
     description: Codec, mailbox and coprocessor banks, plus two M3 auxiliary banks.
 
   reg-names:
+    minItems: 3
     items:
       - const: codec
       - const: mailbox
       - const: coproc
+      - const: pmgr
+      - const: pio
+
+  clocks:
+    maxItems: 1
 
   interrupts:
     items:
@@ -87,24 +94,35 @@ allOf:
         compatible:
           contains:
             enum:
-              - apple,t8122-ave
               - apple,t6030-ave
               - apple,t6031-ave
+              - apple,t8122-ave
     then:
       properties:
         reg:
           minItems: 5
-          maxItems: 5
+        reg-names:
+          maxItems: 3
     else:
       properties:
-        reg:
-          minItems: 3
-          maxItems: 3
         power-domains:
           minItems: 5
-          maxItems: 6
       required:
         - reg-names
         - power-domain-names
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t6041-ave
+              - apple,t8112-ave
+              - apple,t8140-ave
+    then:
+      properties:
+        reg:
+          maxItems: 3
+        reg-names:
+          maxItems: 3
 
 additionalProperties: false
