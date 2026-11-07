@@ -4523,6 +4523,12 @@ impl SepData {
         // Redo what a restart's cold-match preparation does, without the
         // Catacomb loads: retire every cold-match credential, unlock the
         // designated bag with its secret, and set up one new credential.
+        // Test only: one boot-only step from t-5420, picked per boot with
+        // apple_sep.tid_rearm_variant, so each is tried on its own.
+        let variant = module_parameters::tid_rearm_variant.value();
+        if variant == 1 || variant == 3 {
+            self.rearm_variant_step(variant);
+        }
         let (deleted, refused) = self.retire_cold_match_contexts();
         let unlocked = self.unlock_special_bag();
         if !self.establish_scrd_match_context(user) {
@@ -4541,6 +4547,9 @@ impl SepData {
             refused,
             unlocked
         );
+        if variant == 2 {
+            self.rearm_variant_step(variant);
+        }
         // Bring the sensor up from a power cycle for the next verify, as
         // after a restart.
         let _ = sensor::idle();
@@ -4550,6 +4559,152 @@ impl SepData {
             dev_warn!(self.dev, "Touch ID: re-arm: the enclave's lockout record was not saved; a restart restores the older one\n");
         }
         Some(confirmed)
+    }
+
+    /// Test only (t-5420 boot-difference candidates, one per boot):
+    /// 1 = SBIO communication initialization (0x73), 2 = device-view resync
+    /// (UPDATE_DEVICE_LIST 0x7b + MATCH_POLICY 0x1f), 3 = load of the saved
+    /// user catacomb (0x6d) while the user component is active. Logs the
+    /// answer, the component states and the identity count around it. If the
+    /// step leaves a catacomb component cold, the boot's restore and
+    /// device-view sync are redone so matching keeps its identities.
+    fn rearm_variant_step(&self, variant: u8) {
+        let before = self.log_identity_count(c"before the re-arm variant step");
+        self.log_component_states(c"before the re-arm variant step");
+        let answered = match variant {
+            1 => {
+                let word = if self.profile.nonce_session {
+                    6u32
+                } else if matches!(self.profile.key_store, profile::KeyStore::Sepos13 { .. }) {
+                    1u32
+                } else {
+                    0u32
+                };
+                match self.sbio_transfer_raw(0x73, c"INIT_SBIO_COMMUNICATION", &word.to_le_bytes()) {
+                    Ok(done) => {
+                        dev_info!(
+                            self.dev,
+                            "Touch ID: re-arm variant 1: INIT_SBIO_COMMUNICATION word {} answered status {}, {} bytes\n",
+                            word,
+                            done.status,
+                            done.payload.len()
+                        );
+                        done.status.is_ok()
+                    }
+                    Err(e) => {
+                        dev_err!(self.dev, "Touch ID: re-arm variant 1: INIT_SBIO_COMMUNICATION transport failed ({:?})\n", e);
+                        false
+                    }
+                }
+            }
+            2 => {
+                let synced = self.sync_device_view();
+                dev_info!(
+                    self.dev,
+                    "Touch ID: re-arm variant 2: device-view resync (0x7b + 0x1f) {}\n",
+                    synced
+                );
+                synced
+            }
+            3 => self.rearm_reload_user_catacomb(),
+            _ => {
+                dev_warn!(self.dev, "Touch ID: re-arm variant {} is unknown; no extra step\n", variant);
+                return;
+            }
+        };
+        let cold = self.log_component_states(c"after the re-arm variant step");
+        if cold {
+            let restored = self.restore_all_components();
+            let synced = self.sync_device_view();
+            dev_warn!(
+                self.dev,
+                "Touch ID: re-arm variant {}: a catacomb component went cold; restore redone {} and device view synced {}\n",
+                variant,
+                restored,
+                synced
+            );
+            self.log_component_states(c"after the re-arm variant restore");
+        }
+        let after = self.log_identity_count(c"after the re-arm variant step");
+        dev_info!(
+            self.dev,
+            "Touch ID: re-arm variant {} step answered ok {}, identities {:?} -> {:?}\n",
+            variant,
+            answered,
+            before,
+            after
+        );
+    }
+
+    /// Logs the master, owner and user component states; true if any of
+    /// them would need a load (cold).
+    fn log_component_states(&self, when: &CStr) -> bool {
+        let Some(reply) = self.read_component_states() else {
+            dev_warn!(self.dev, "sbio: component states unavailable {}\n", when);
+            return false;
+        };
+        let states = crate::sbio::ComponentStates::new(&reply);
+        let ids = [
+            crate::sbio::CatacombUser::MASTER.value(),
+            crate::sbio::CatacombUser::OWNER.value(),
+            SBIO_PROBE_USER_ID,
+        ];
+        let [master, owner, user] = ids.map(|id| states.state_for(id));
+        dev_info!(
+            self.dev,
+            "sbio: component states {}: master {:?}, owner {:?}, user {:?}\n",
+            when,
+            master,
+            owner,
+            user
+        );
+        [master, owner, user].iter().any(|state| {
+            state.is_some_and(|s| {
+                matches!(crate::sbio::component_action(s), crate::sbio::ComponentAction::Load)
+            })
+        })
+    }
+
+    /// Variant 3: send LOAD_CATACOMB with the saved user catacomb although
+    /// the component is active, and report the answer. No save follows.
+    fn rearm_reload_user_catacomb(&self) -> bool {
+        let Some(blob) = self.read_stored(PRIVATE_TYPE_CATACOMB_USER, c"user catacomb") else {
+            dev_err!(self.dev, "Touch ID: re-arm variant 3: no saved user catacomb\n");
+            return false;
+        };
+        let at = crate::sbio::SBIO_SAVED_USER_ID_AT;
+        if blob.len() < at + 4
+            || i32::from_le_bytes([blob[at], blob[at + 1], blob[at + 2], blob[at + 3]])
+                != SBIO_PROBE_USER_ID
+        {
+            dev_err!(self.dev, "Touch ID: re-arm variant 3: the saved user catacomb is not user {}\n", SBIO_PROBE_USER_ID);
+            return false;
+        }
+        let Some(request) = crate::sbio::SbioLoadCatacomb::new(&blob) else {
+            dev_err!(self.dev, "Touch ID: re-arm variant 3: the saved user catacomb is malformed\n");
+            return false;
+        };
+        let since = self.bio_lock_state_seq.load(Relaxed);
+        let answered = match self.sbio_transfer_raw(request.opcode(), request.name(), request.payload()) {
+            Ok(done) => {
+                dev_info!(
+                    self.dev,
+                    "Touch ID: re-arm variant 3: user LOAD_CATACOMB ({} bytes) answered status {}, {} bytes\n",
+                    blob.len(),
+                    done.status,
+                    done.payload.len()
+                );
+                done.status.answered().is_some()
+            }
+            Err(e) => {
+                dev_err!(self.dev, "Touch ID: re-arm variant 3: user LOAD_CATACOMB transport failed ({:?})\n", e);
+                false
+            }
+        };
+        if let Some(state) = self.await_lock_state(SBIO_PROBE_USER_ID as u32, since, 500) {
+            dev_info!(self.dev, "Touch ID: re-arm variant 3: user lock state after the load {:#06x}\n", state);
+        }
+        answered
     }
 
     fn mint_token_bytes(&self) -> Option<[u8; bio::TOKEN_LEN]> {
