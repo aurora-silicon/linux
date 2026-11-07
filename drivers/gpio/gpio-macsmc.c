@@ -36,10 +36,11 @@
 #define MACSMC_J700_RADIO_REG_ON_HI	0x80000
 
 /*
- * On the J713 and J715, /amfm/function-reg_on is pKW4("gP13", 0x00800000).
- * The firmware function preserves the template's upper 16 bits and inserts
- * the level into its low 16 bits. This does not establish generic CMD_OUTPUT
- * semantics, a pin-mode command, or a readback operation for this line.
+ * On the J713, J715, J604 and J773g, /amfm/function-reg_on is
+ * pKW4("gP13", 0x00800000) (apple_t8132_managed_radio()). The firmware
+ * function preserves the template's upper 16 bits and inserts the level into
+ * its low 16 bits. This does not establish generic CMD_OUTPUT semantics, a
+ * pin-mode command, or a readback operation for this line.
  */
 #define MACSMC_J713_RADIO_REG_ON_GPIO	0x13
 #define MACSMC_J713_RADIO_REG_ON_TEMPLATE	0x00800000
@@ -451,7 +452,7 @@ static int macsmc_gpio_probe(struct platform_device *pdev)
 	smcgp->base_key = data ? data->base_key : _SMC_KEY("gP\0\0");
 	smcgp->j700_pcio = of_machine_is_compatible("apple,j700") &&
 				device_is_compatible(&pdev->dev, "apple,smc-gpio");
-	smcgp->j713 = apple_t8132_air();
+	smcgp->j713 = apple_t8132_managed_radio();
 	mutex_init(&smcgp->j713_reg_on_lock);
 	ret = macsmc_gpio_parse_templates(smcgp);
 	if (ret)

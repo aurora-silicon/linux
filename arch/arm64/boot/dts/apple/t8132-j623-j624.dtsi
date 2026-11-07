@@ -1,0 +1,192 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple iMac (24-inch, M4, 2024): parts common to the 2-port (J623) and
+ * 4-port (J624) models.
+ *
+ * There is no ADT for these boards yet. The layout follows the M3 iMacs
+ * (J433, J434) and the T8132 wiring the J713, J604 and J773g ADTs share.
+ * Each value that is not from an ADT or the shared T8132 files is marked
+ * "guessed".
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+#include "t8132.dtsi"
+#include "t8132-jxxx.dtsi"
+#include "t8132-board.dtsi"
+#include "t8132-apcie-port2.dtsi"
+#include "t8132-isp.dtsi"
+#include "t8132-gpu.dtsi"
+#include "t8132-dcp.dtsi"
+#include "t8132-dcpext.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/spmi/spmi.h>
+
+/ {
+	chassis-type = "all-in-one";
+
+	aliases {
+		ethernet0 = &ethernet0;
+	};
+
+	/*
+	 * The headphone jack: the AOP audio component's jack back-end (DAI 4)
+	 * to the CS42L84, as a card of its own. The speakers are not
+	 * described until their amps are known.
+	 */
+	sound_jack: sound-jack {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&aop_audio 4>;
+			};
+
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+	};
+
+	/*
+	 * Physical size of the 4480x2520 panel (23.5", 218 ppi), so simpledrm
+	 * reports the real DPI.
+	 */
+	fb_panel: panel {
+		width-mm = <522>;
+		height-mm = <294>;
+		status = "disabled";
+	};
+};
+
+&framebuffer0 {
+	panel = <&fb_panel>;
+};
+
+&aop_audio {
+	/* The microphones on LEAP, the jack on base-ns TX2 and RX2 (guessed). */
+	dmas = <&admac0 1>, <&admac1 4>, <&admac1 5>;
+	dma-names = "dma", "cout", "cin";
+	apple,machine-kind = "iMac";
+};
+
+/*
+ * The CS42L84 headphone codec at i2c1 0x4b: reset on nub GPIO 17,
+ * interrupt on AP GPIO 98 (guessed, as on every M4 ADT), tip sense
+ * inverted (guessed, as on the M3 iMacs).
+ */
+&i2c1 {
+	status = "okay";
+
+	jack_codec: codec@4b {
+		compatible = "cirrus,cs42l84";
+		reg = <0x4b>;
+		reset-gpios = <&pinctrl_nub 17 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		interrupts-extended = <&pinctrl_ap 98 IRQ_TYPE_LEVEL_LOW>;
+		cirrus,ts-inv = <1>;
+		sound-name-prefix = "Jack";
+	};
+};
+
+/*
+ * The port controllers of ATC1 and ATC0 at nub-spmi-a0 0xa and 0xc
+ * (guessed, as on every M4 ADT).
+ */
+&nub_spmi_a0 {
+	hpm1: usb-pd@a {
+		compatible = "apple,t8132-sn201202x", "apple,sn201202x";
+		reg = <0xa SPMI_USID>;
+		interrupts = <37 IRQ_TYPE_EDGE_RISING>,
+			     <43 IRQ_TYPE_EDGE_RISING>,
+			     <45 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "sleep", "wake";
+		wakeup-source;
+
+		typec1: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Back 2";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec1_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_1_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec1_connector_ss: endpoint {
+						remote-endpoint = <&atcphy1_typec_lanes>;
+					};
+				};
+			};
+		};
+	};
+
+	hpm0: usb-pd@c {
+		compatible = "apple,t8132-sn201202x", "apple,sn201202x";
+		reg = <0xc SPMI_USID>;
+		interrupts = <11 IRQ_TYPE_EDGE_RISING>,
+			     <17 IRQ_TYPE_EDGE_RISING>,
+			     <19 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "sleep", "wake";
+		wakeup-source;
+
+		typec0: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Back 1";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec0_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_0_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec0_connector_ss: endpoint {
+						remote-endpoint = <&atcphy0_typec_lanes>;
+					};
+				};
+			};
+		};
+	};
+};
+
+/*
+ * brcm,board-type is "apple," + the ADT /arm-io/wlan module-instance,
+ * which is not known for these boards; the boot loader supplies it.
+ */
+
+/*
+ * The Gigabit Ethernet controller in the power adapter, on the third
+ * PCIe port as on the Mac mini (guessed).
+ */
+&port02 {
+	ethernet0: ethernet@0,0 {
+		reg = <0x20000 0x0 0x0 0x0 0x0>;
+		/* To be filled by the loader */
+		local-mac-address = [00 10 18 00 00 00];
+	};
+};
+
+#include "hwmon-common.dtsi"
+#include "hwmon-fan-dual.dtsi"

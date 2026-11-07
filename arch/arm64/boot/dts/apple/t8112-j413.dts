@@ -182,6 +182,16 @@
 
 &aop {
 	status = "okay";
+
+	accel {
+		compatible = "apple,t8112-aop-accel", "apple,aop-accel";
+		status = "disabled";
+	};
+
+	gyro {
+		compatible = "apple,t8112-aop-gyro", "apple,aop-gyro";
+		status = "disabled";
+	};
 };
 
 &aop_audio {
@@ -291,4 +301,13 @@
 
 &pmp_report_isp_sys {
 	status = "okay";
+};
+
+&nub_spmi1 {
+	pmic@e {
+		compatible = "apple,vale-pmic", "apple,spmi-nvmem";
+		reg = <0xe SPMI_USID>;
+		read-only;
+		status = "disabled";
+	};
 };
