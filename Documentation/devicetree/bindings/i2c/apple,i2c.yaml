@@ -31,6 +31,7 @@ select:
               - "apple,t6030-i2c"
               - "apple,t6031-i2c"
               - "apple,t6041-i2c"
+              - "apple,t6050-i2c"
               - "apple,t7000-i2c"
               - "apple,t8010-i2c"
               - "apple,t8015-i2c"
@@ -134,6 +135,7 @@ allOf:
                     - apple,t6030-i2c
                     - apple,t6031-i2c
                     - apple,t6041-i2c
+                    - apple,t6050-i2c
                     - apple,t8122-i2c
                     - apple,t8132-i2c
                     - apple,t8140-i2c

@@ -25,6 +25,7 @@ select:
               - apple,t6030-avd
               - apple,t6031-avd
               - apple,t6041-avd
+              - apple,t6050-avd
               - apple,t6041-max-avd
               - apple,t8103-avd
               - apple,t8112-avd
@@ -160,6 +161,9 @@ allOf:
             properties:
               compatible:
                 oneOf:
+                  - items:
+                      - const: apple,t6050-avd
+                      - const: apple,t8142-avd
                   - items:
                       - enum:
                           - apple,t6030-avd
