@@ -17,7 +17,9 @@ description: |
 properties:
   compatible:
     oneOf:
-      - const: apple,t8140-prores
+      - enum:
+      - apple,t6000-prores
+      - apple,t8140-prores
       - items:
           - const: apple,t6041-prores
           - const: apple,prores
@@ -88,6 +90,16 @@ allOf:
           maxItems: 2
         reg-names:
           maxItems: 2
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          const: apple,t6000-prores
+    then:
+      properties:
+        interrupts:
+          maxItems: 1
 
 additionalProperties: false
 

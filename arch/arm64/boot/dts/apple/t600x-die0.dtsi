@@ -8,6 +8,30 @@
 
 &SOC_NODE {
 
+	apr0_dart: iommu@311008000 {
+		compatible = "apple,t6000-dart", "apple,t8110-dart";
+		reg = <0x3 0x11008000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1479 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_scodec>;
+		status = "disabled";
+	};
+
+	apr0: video-codec@311000000 {
+		compatible = "apple,t6000-prores";
+		reg = <0x3 0x11000000 0x0 0x4000>,
+		      <0x3 0x10000000 0x0 0x1000000>;
+		reg-names = "core", "wrapper";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1482 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&apr0_dart 0>;
+		power-domains = <&ps_scodec>, <&pmp_report_scodec>;
+		power-domain-names = "core", "perf";
+		resets = <&ps_scodec>;
+		status = "disabled";
+	};
+
 	ave_dart1: iommu@20d030000 {
 		compatible = "apple,t6000-dart";
 		reg = <0x2 0x0d030000 0 0x4000>;
@@ -237,6 +261,7 @@
 			compatible = "apple,t6000-pmp-v2-report-entry";
 			reg = <0x14>;
 			label = "pmp-scodec";
+			apple,dvfs = <0x115 2>;
 			#power-domain-cells = <0>;
 			power-domains = <&ps_scodec>;
 			status = "disabled";
