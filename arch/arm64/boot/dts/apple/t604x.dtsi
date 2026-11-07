@@ -326,19 +326,17 @@
 	};
 
 	/*
-	 * DVFS states from the ADT: /arm-io/pmgr voltage-states1-sram (E),
-	 * voltage-states5-sram (P0) and voltage-states13-sram (P1), word 0
-	 * in kHz. opp-level is the hardware p-state. Each P cluster has its
-	 * own table even though the frequencies are the same: opp-shared
-	 * means one clock domain per table.
+	 * DVFS states from the ADT /arm-io/pmgr voltage-states1-sram (E),
+	 * voltage-states5-sram (P0) and voltage-states13-sram (P1), word 0 in
+	 * kHz; opp-level is the hardware p-state. Each P cluster has its own
+	 * table: opp-shared means one clock domain per table.
 	 *
-	 * opp-microwatt is the power of one busy core, measured on a J616s
-	 * from the SMC core-rail meters (P0 PR0b, P1 PP0b, E PP2b) with the
-	 * cluster pinned at each state. The P values follow a k * V^2 * f + c
-	 * fit to the sweep, because the PMP's die-temperature limit clips the
-	 * two top states within seconds. One busy E core does not register on
-	 * its meter below 2352 MHz, so the E values are the idle cluster plus
-	 * a quarter of the four-core increase.
+	 * opp-microwatt is one busy core's power on a J616s, from the SMC
+	 * core-rail meters (P0 PR0b, P1 PP0b, E PP2b). The P values follow a
+	 * k * V^2 * f + c fit, as the PMP clips the two top states within
+	 * seconds; the E values are the idle cluster plus a quarter of the
+	 * four-core increase, since one E core does not register below
+	 * 2352 MHz.
 	 */
 	opp_e: opp-table-e {
 		compatible = "operating-points-v2";
@@ -1066,19 +1064,15 @@
 	};
 
 	/*
-	 * PMC voter interface: the floor word of agent a at "voters" +
-	 * 0x4000 * a, the floors the PMC honours and the rail enable words
-	 * at "rails". Both lie inside pmgr_dcp's range, which the DCP driver
-	 * only hands to its firmware, so the two do not conflict; "rails"
-	 * comes first so that this node's unit address differs from
-	 * pmgr_dcp's.
+	 * PMC voter interface: agent a's floor word at "voters" + 0x4000 * a,
+	 * and the rail enables at "rails". Both lie inside pmgr_dcp's range,
+	 * which the DCP driver only hands to its firmware; "rails" comes first
+	 * so this node's unit address differs from pmgr_dcp's.
+	 *
 	 * Static voters are the PMP (0), CLPC (1) and AP (3). The PMP votes
-	 * the DCS and fabric for memory clients other than the CPUs, the GPU
-	 * among them; without its agent, GPU work runs at a low DCS
-	 * state unless a CPU is busy. iBoot leaves the PMP's floor at the top
-	 * DCS state, so its agent must stay off while the PMP does not run:
-	 * apple,pmp holds off the PMC until the PMP driver has bound, and
-	 * unbinds the PMC first.
+	 * the DCS and fabric for non-CPU memory clients such as the GPU, and
+	 * iBoot leaves its floor at the top DCS state, so apple,pmp keeps the
+	 * PMC off until the PMP driver has bound.
 	 */
 	pmc: power-management@5048aa000 {
 		compatible = "apple,t6041-pmc";

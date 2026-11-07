@@ -391,17 +391,12 @@
 
 &smc_hwmon {
 	/*
-	 * Every key here and in the zone sensors is in this machine's SMC key
-	 * table as a readable float and was read on the J616s (SMC firmware
-	 * of macOS 26.6.2).
-	 * The J614s key table has not been read yet.
-	 * Keys that only ever read a fixed placeholder (Tz1*, Ta0*) or a
-	 * fixed limit (TVMx, TVmS, TVms, PHPB, PHPM) are left out; rails that
-	 * read 0 W while idle are kept. GPU (Tg*), P-cluster (Tp*) and
-	 * E-cluster (Te*) labels follow load tests: Tg* only read live while
-	 * the GPU is powered and rise with GPU load, Tp* and Te* rise with CPU
-	 * load. Other names follow the SMC key groups and are not otherwise
-	 * verified. SBA1-3 are the three cells of the 3S battery.
+	 * Every key here and in the zone sensors is a readable float in the
+	 * J616s SMC key table (macOS 26.6.2); the J614s table has not been
+	 * read. Keys that only read a placeholder (Tz1*, Ta0*) or a fixed
+	 * limit (TVMx, TVmS, TVms, PHPB, PHPM) are left out. Tg*, Tp* and Te*
+	 * labels follow GPU and CPU load tests; the others follow the SMC key
+	 * groups. SBA1-3 are the cells of the 3S battery.
 	 */
 	temperature-TAOL {
 		apple,key-id = "TAOL";
