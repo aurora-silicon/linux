@@ -2296,7 +2296,7 @@ static int parse_color_element(struct dcp_parse_ctx *handle, struct dcp_color_el
 
 	*e = (struct dcp_color_element) {
 		.id = -1, .depth = -1, .range = -1, .eotf = -1, .encoding = -1,
-		.colorimetry = -1, .score = -1, .is_virtual = true, .restricted = false,
+		.colorimetry = -1, .score = -1, .is_virtual = true,
 	};
 	if (ret)
 		return ret;
@@ -2354,31 +2354,32 @@ static int parse_id_list(struct dcp_parse_ctx *handle, s64 *ids, unsigned int *c
 
 /*
  * Each colour element (virtual ones too) of the timing @timing_id in a
- * TimingElements catalog, flagged if the timing lists it as unsafe or as
- * needing DSC; whether the timing is interlaced. A malformed timing entry is
- * skipped. -ENOENT if the catalog has no such timing.
+ * TimingElements catalog, flagged if the timing lists it as unsafe and if it
+ * lists it as needing DSC; whether the timing is interlaced. A malformed
+ * timing entry is skipped. -ENOENT if the catalog has no such timing.
  */
 int dcp_parse_timing_colors(const void *blob, size_t len, u32 timing_id,
 			    dcp_color_element_fn emit, void *data, bool *interlaced)
 {
 	struct dcp_parse_ctx ctx;
 	struct iterator timings;
-	s64 *restricted;
+	s64 *unsafe, *dsc;
 	int ret = parse(blob, len, &ctx);
 
 	if (!ret)
 		ret = iterator_begin(&ctx, &timings, false);
 	if (ret)
 		return ret;
-	restricted = kcalloc(DCP_TIMING_RESTRICTED_MAX, sizeof(*restricted), GFP_KERNEL);
-	if (!restricted)
+	unsafe = kcalloc(2 * DCP_TIMING_RESTRICTED_MAX, sizeof(*unsafe), GFP_KERNEL);
+	if (!unsafe)
 		return -ENOMEM;
+	dsc = unsafe + DCP_TIMING_RESTRICTED_MAX;
 	ret = -ENOENT;
 	for (; timings.idx < timings.len; ++timings.idx) {
 		struct dcp_parse_ctx entry_start = ctx, colors = {};
 		struct iterator entry, it;
 		bool match = false, have_colors = false, is_interlaced = false;
-		unsigned int nr_restricted = 0;
+		unsigned int nr_unsafe = 0, nr_dsc = 0;
 		int err;
 
 		/* ColorModes may come before the ID: find both, then walk the colours. */
@@ -2398,9 +2399,10 @@ int dcp_parse_timing_colors(const void *blob, size_t len, u32 timing_id,
 				colors = ctx;
 				have_colors = true;
 				err = skip(&ctx);
-			} else if (!strcmp(key, "UnsafeColorElementIDs") ||
-				   !strcmp(key, "DSCRequiredColorElementIDs")) {
-				err = parse_id_list(&ctx, restricted, &nr_restricted);
+			} else if (!strcmp(key, "UnsafeColorElementIDs")) {
+				err = parse_id_list(&ctx, unsafe, &nr_unsafe);
+			} else if (!strcmp(key, "DSCRequiredColorElementIDs")) {
+				err = parse_id_list(&ctx, dsc, &nr_dsc);
 			} else if (!strcmp(key, "IsInterlaced")) {
 				err = parse_bool(&ctx, &is_interlaced);
 			} else {
@@ -2431,14 +2433,16 @@ int dcp_parse_timing_colors(const void *blob, size_t len, u32 timing_id,
 			ret = parse_color_element(it.handle, &e);
 			if (ret)
 				break;
-			for (unsigned int i = 0; i < nr_restricted; i++)
-				e.restricted |= restricted[i] == e.id;
+			for (unsigned int i = 0; i < nr_unsafe; i++)
+				e.unsafe |= unsafe[i] == e.id;
+			for (unsigned int i = 0; i < nr_dsc; i++)
+				e.dsc_required |= dsc[i] == e.id;
 			emit(data, &e);
 		}
 		goto out;
 	}
 out:
-	kfree(restricted);
+	kfree(unsafe);
 	return ret;
 }
 

@@ -22,6 +22,10 @@ mod gem;
 
 #[cfg(CONFIG_DRM_ASAHI_G16)]
 mod g16;
+#[cfg(CONFIG_DRM_ASAHI_G18)]
+mod g18;
+#[cfg(CONFIG_DRM_ASAHI_M5)]
+mod m5;
 mod gpu;
 mod hw;
 mod initdata;
@@ -78,6 +82,9 @@ struct DriverModule {
     _g15: G15Registration,
     // Field drop order unregisters/joins driver producers before queue teardown.
     _g16: Option<Pin<KBox<G16Registration>>>,
+    #[cfg(CONFIG_DRM_ASAHI_G18)]
+    #[pin]
+    _g18: kernel::driver::Registration<kernel::platform::Adapter<g18::probe::Driver>>,
     #[pin]
     _driver: kernel::driver::Registration<kernel::platform::Adapter<driver::AsahiPlatformDriver>>,
     _cleanup: cleanup::QueueOwner,
@@ -99,6 +106,8 @@ impl kernel::InPlaceModule for DriverModule {
                 module,
             ),
             _g16: register_g16(module)?,
+            #[cfg(CONFIG_DRM_ASAHI_G18)]
+            _g18 <- kernel::driver::Registration::new(g18::probe::DRIVER_NAME, module),
             // All fallible fields are initialized. This final unit initializer cannot fail.
             #[cfg(CONFIG_DRM_ASAHI_G15)]
             _g15_ready: g15::activate(),
@@ -197,6 +206,10 @@ module! {
         oom_attribution: u8 {
             default: 1,
             description: "Count held GPU memory in its creator's RSS for the OOM killer (1 = on)",
+        },
+        m5_fw_trace: u32 {
+            default: 0,
+            description: "M5: firmware trace classes (power bit 0, submission bit 1, recovery classifier bit 9)",
         },
         g16_deadline_ms: u32 {
             default: 5000,

@@ -1,0 +1,917 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Mac mini (M4 Pro, 2024)
+ *
+ * target-type: J773s
+ *
+ * Wired like the J616s from this board's ADT (macOS 26.6.2). It has no
+ * panel, keyboard, trackpad, battery, camera or Touch ID sensor.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include "t6040.dtsi"
+#include "t604x-j575-j773.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	compatible = "apple,j773s", "apple,t6040", "apple,arm-platform";
+	model = "Apple Mac mini (M4 Pro, 2024)";
+
+	aliases {
+		nvram = &nvram;
+		spi0 = &qspi;
+		rtc0 = &smc_rtc;
+		rtc1 = &pmu_rtc;
+		wifi0 = "/pcie@1cb0000000/pci@0,0/wifi@0,0";
+		bluetooth0 = "/pcie@1cb0000000/pci@0,0/bluetooth@0,1";
+		ethernet0 = &ethernet0;
+		/* the boot loader finds the GPU node through this alias */
+		gpu = &gpu;
+		pmp = &pmp;
+		/* the boot loader reserves the SEP firmware through this alias */
+		sep = &sep;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		/* The loader adds its own reservations */
+
+		/* Filled and enabled by the loader, as on the J616s. */
+		ane_fw_text: ane-firmware-text@0 {
+			compatible = "apple,asc-mem";
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		ane_fw_data: ane-firmware-data@0 {
+			compatible = "apple,asc-mem";
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		gpu_fw_text: gpu-fw-text {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		gpu_fw_data: gpu-fw-data {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		uat_ttbs: uat-ttbs {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		uat_pagetables: uat-pagetables {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		uat_l2_pagetables: uat-l2-pagetables {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		uat_handoff: uat-handoff {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+	};
+};
+
+/* GPU operating points, thermal zones and the sensors they read */
+#include "t6040-gpu-thermal.dtsi"
+
+/ {
+	/* The speaker amp's shutdown line (SDZ, AP pin 54, low = shutdown). */
+	speaker_sdz: regulator-sn012776-sdz {
+		compatible = "regulator-fixed";
+		regulator-name = "sn012776-sdz";
+		gpios = <&pinctrl 54 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+
+	/*
+	 * The speaker stays off: there is no protection profile for it, and
+	 * the ADT's AOP speaker stream returns no V/I sense. The card, the amp
+	 * and the AOP speaker stream are all left out or disabled.
+	 */
+	sound: sound {
+		compatible = "apple,j773-macaudio", "apple,macaudio";
+		model = "Mac mini J773";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Speaker";
+
+			cpu {
+				sound-dai = <&aop_audio 3>;
+			};
+
+			codec {
+				sound-dai = <&speaker>;
+			};
+		};
+	};
+
+	/* The headphone jack, a card of its own as on the J616s. */
+	sound_jack: sound-jack {
+		compatible = "apple,j773-macaudio-jack", "apple,macaudio";
+		model = "Mac mini J773 Jack";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&aop_audio 4>;
+			};
+
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+	};
+};
+
+&cpuidle {
+	status = "okay";
+};
+
+&smc {
+	status = "okay";
+
+	smc_gpio_low: gpio-low {
+		compatible = "apple,smc-low-gpio";
+		gpio-controller;
+		#gpio-cells = <2>;
+		apple,output-templates = <0xe 0x00800000>;
+	};
+};
+
+/* The Stockholm NFC controller (ADT aop-spmi0 stockholm-spmi), as on the J616s. */
+&aop_spmi0 {
+	status = "okay";
+
+	stockholm: nfc@9 {
+		compatible = "apple,stockholm-nci";
+		reg = <9 SPMI_USID>;
+		interrupt-parent = <&aop_spmi0>;
+		interrupts = <229 IRQ_TYPE_EDGE_RISING>,
+			     <230 IRQ_TYPE_EDGE_RISING>,
+			     <227 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "host-wake", "data-ready", "error";
+		enable-gpios = <&smc_gpio_low 0xe GPIO_ACTIVE_HIGH>;
+	};
+};
+
+&smc_mbox {
+	status = "okay";
+};
+
+&nub_spmi0 {
+	status = "okay";
+};
+
+&pinctrl {
+	status = "okay";
+
+	wifi_clkreq_pins: wifi-clkreq-pins {
+		pinmux = <APPLE_PINMUX(0, 1)>;
+	};
+
+	eth_clkreq_pins: eth-clkreq-pins {
+		pinmux = <APPLE_PINMUX(2, 1)>;
+	};
+};
+
+/* As on the J616s: the AOP firmware owns this bank's interrupts. */
+&pinctrl_nub {
+	status = "okay";
+	/delete-property/ interrupt-controller;
+	/delete-property/ #interrupt-cells;
+	/delete-property/ interrupts;
+};
+
+/* Boot NOR; the partition is the ADT /arm-io/qspi/spinor/anvram. */
+&qspi {
+	status = "okay";
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <10000000>;
+		spi-rx-bus-width = <1>;
+		spi-tx-bus-width = <1>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			nvram: partition@700000 {
+				label = "nvram";
+				reg = <0x700000 0x100000>;
+			};
+		};
+	};
+};
+
+&ps_qspi {
+	status = "okay";
+};
+
+/* The Type-C retimers (ADT uatcrt at 0x18/0x19/0x1a); no driver yet. */
+&i2c6 {
+	status = "okay";
+};
+
+/*
+ * Fan and system keys. The J773s SMC key table has not been read: keys it
+ * lacks keep their channel and stay hidden.
+ */
+#include "hwmon-common.dtsi"
+#include "hwmon-mini.dtsi"
+
+&smc_hwmon {
+	apple,thermal-pressure-key = "mTPL";
+};
+
+&pcie_dart {
+	status = "okay";
+};
+
+&apcie2_dart {
+	status = "okay";
+};
+
+/*
+ * Wi-Fi and Bluetooth on port 0 and Ethernet on port 2 (ADT apcie0
+ * pci-bridge0 and pci-bridge2). The boot loader finds them through the
+ * aliases and adds the calibration and the addresses. The Ethernet chip
+ * depends on the configuration, so its node has no compatible.
+ */
+/ {
+	pcie0: pcie@1cb0000000 {
+		compatible = "apple,t6041-pcie", "apple,t6020-pcie";
+		reg = <0x1c 0xb0000000 0x0 0x1000000>,	/* config */
+		      <0x4 0x14000000 0x0 0x4000>,	/* rc */
+		      <0x4 0x10028000 0x0 0x4000>,	/* port0 */
+		      <0x4 0x11028000 0x0 0x4000>,	/* port1 */
+		      <0x4 0x12028000 0x0 0x4000>,	/* port2 */
+		      <0x4 0x13028000 0x0 0x4000>,	/* port3 */
+		      <0x4 0x17020000 0x0 0x4000>,	/* phy0 */
+		      <0x4 0x17024000 0x0 0x4000>,	/* phy1 */
+		      <0x4 0x17028000 0x0 0x4000>,	/* phy2 */
+		      <0x4 0x1702c000 0x0 0x4000>;	/* phy3 */
+		reg-names = "config", "rc",
+			    "port0", "port1", "port2", "port3",
+			    "phy0", "phy1", "phy2", "phy3";
+		ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0x0 0x20000000>,
+			 <0x02000000 0x0 0x80000000 0xb 0x80000000 0x0 0x40000000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&wifi_clkreq_pins &eth_clkreq_pins>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		bus-range = <0 2>;
+		iommu-map-mask = <0xffff>;
+		iommu-map = <0x100 &pcie_dart 1 2>, <0x200 &apcie2_dart 1 1>;
+		msi-ranges = <&aic AIC_IRQ 2071 IRQ_TYPE_EDGE_RISING 32>;
+		msi-parent = <&pcie0>;
+		msi-controller;
+		/* indexed by port */
+		interrupts = <AIC_IRQ 1723 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1732 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1741 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-parent = <&aic>;
+		device_type = "pci";
+
+		port00: pci@0,0 {
+			reg = <0 0 0 0 0>;
+			ranges;
+			interrupt-map = <0 0 0 1 &port00 0 0 0 0>,
+					<0 0 0 2 &port00 0 0 0 1>,
+					<0 0 0 3 &port00 0 0 0 2>,
+					<0 0 0 4 &port00 0 0 0 3>;
+			interrupt-map-mask = <0 0 0 7>;
+			#interrupt-cells = <1>;
+			interrupt-controller;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			/* ADT /amfm reg_on gP13 */
+			pwren-gpios = <&smc_gpio 0x13 GPIO_ACTIVE_HIGH>;
+			reset-gpios = <&pinctrl 4 GPIO_ACTIVE_LOW>;
+			device_type = "pci";
+
+			bluetooth0: bluetooth@0,1 {
+				compatible = "pci14e4,5f72";
+				reg = <0x100 0 0 0 0>;
+				/* To be filled by the loader */
+				local-bd-address = [00 00 00 00 00 00];
+				/* ADT /arm-io/wlan module-instance */
+				brcm,board-type = "apple,sakhalin";
+				status = "okay";
+			};
+
+			wifi0: wifi@0,0 {
+				compatible = "pci14e4,4434", "brcm,bcm4329-fmac";
+				reg = <0 0 0 0 0>;
+				brcm,ccode-map-trivial;
+				brcm,board-type = "apple,sakhalin";
+			};
+		};
+
+		port02: pci@2,0 {
+			device_type = "pci";
+			reg = <0x1000 0 0 0 0>;
+			reset-gpios = <&pinctrl 6 GPIO_ACTIVE_LOW>;
+			bus-range = <2 2>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges;
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			interrupt-map-mask = <0 0 0 7>;
+			interrupt-map = <0 0 0 1 &port02 0 0 0 0>,
+					<0 0 0 2 &port02 0 0 0 1>,
+					<0 0 0 3 &port02 0 0 0 2>,
+					<0 0 0 4 &port02 0 0 0 3>;
+
+			ethernet0: ethernet@0,0 {
+				reg = <0x20000 0x0 0x0 0x0 0x0>;
+				/* To be filled by the loader */
+				local-mac-address = [00 10 18 00 00 00];
+			};
+		};
+	};
+};
+
+&ans_mbox {
+	status = "okay";
+};
+
+&ans_sart {
+	status = "okay";
+};
+
+&nvme {
+	status = "okay";
+};
+
+&pmp_dart {
+	status = "okay";
+};
+
+&pmp_report {
+	status = "okay";
+};
+
+&pmp {
+	status = "okay";
+};
+
+&pmp_mbox {
+	status = "okay";
+};
+
+&pmc {
+	status = "okay";
+};
+
+&mcc {
+	status = "okay";
+};
+
+&aop {
+	status = "okay";
+};
+
+&aop_mbox {
+	status = "okay";
+};
+
+&aop_dart {
+	status = "okay";
+};
+
+/* No ambient light sensor and no lid. */
+&aop_als {
+	status = "disabled";
+};
+
+&aop_las {
+	status = "disabled";
+};
+
+&admac0 {
+	status = "okay";
+};
+
+&admac1 {
+	status = "okay";
+};
+
+/*
+ * No microphones: only the jack's streams, "cout" and "cin" on base-ns ADMAC
+ * channels 4 and 5 (ADT audio-codec-output and audio-codec-input).
+ */
+&aop_audio {
+	dmas = <&admac1 4>, <&admac1 5>;
+	dma-names = "cout", "cin";
+	apple,chassis-name = "J773";
+	apple,machine-kind = "Mac mini";
+};
+
+/*
+ * The SN012776 speaker amp (ADT /arm-io/i2c1/audio-speaker): interrupt on AP
+ * pin 55, sense slots from speaker-config as on the J616s. Disabled with the
+ * speaker card.
+ */
+&i2c1 {
+	speaker: codec@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		SDZ-supply = <&speaker_sdz>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Speaker";
+		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <0>;
+		ti,vmon-slot-no = <2>;
+		status = "disabled";
+	};
+};
+
+/*
+ * The CS42L84 headphone codec (ADT /arm-io/i2c2/audio-codec-output@4B):
+ * reset on nub pin 58, interrupt on AP pin 106, as on the J616s.
+ */
+&i2c2 {
+	status = "okay";
+
+	jack_codec: codec@4b {
+		compatible = "cirrus,cs42l84";
+		reg = <0x4b>;
+		reset-gpios = <&pinctrl_nub 58 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		interrupts-extended = <&pinctrl 106 IRQ_TYPE_LEVEL_LOW>;
+		sound-name-prefix = "Jack";
+	};
+};
+
+/* As on the J616s: the loaded GPU firmware keeps running across sleep. */
+&ps_afr {
+	apple,always-on;
+};
+
+&ps_gfx {
+	apple,always-on;
+};
+
+/* The loader fills the operating points, calibration and all six memory regions. */
+&agx_mbox {
+	status = "okay";
+};
+
+&gpu {
+	memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>,
+			<&gpu_fw_data>, <&uat_l2_pagetables>, <&gpu_fw_text>;
+	memory-region-names = "ttbs", "pagetables", "handoff", "fw-data",
+			      "l2-pagetables", "fw-text";
+	operating-points-v2 = <&gpu_opp>;
+	apple,cs-opp = <&gpu_cs_opp>;
+	apple,afr-opp = <&gpu_afr_opp>;
+	apple,idle-off-delay-ms = <16>;
+	status = "okay";
+};
+
+/*
+ * The three back Thunderbolt ports (ADT nub-spmi-a0 hpm0-2), all on one
+ * bus. The ADT lists the event, sleep and wake interrupts; select is event
+ * + 2. The two front ports are behind a hub, in t6040-j773s-usb-front.dtsi.
+ */
+&nub_spmi_a0 {
+	status = "okay";
+
+	hpm0: usb-pd@c {
+		compatible = "apple,sn201202x";
+		reg = <0xc SPMI_USID>;
+		interrupts = <11 IRQ_TYPE_EDGE_RISING>,
+			     <13 IRQ_TYPE_EDGE_RISING>,
+			     <17 IRQ_TYPE_EDGE_RISING>,
+			     <19 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+
+		typec0: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Back Middle";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec0_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_0_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec0_connector_ss: endpoint {
+						remote-endpoint = <&atcphy0_ss>;
+					};
+				};
+			};
+		};
+	};
+
+	hpm1: usb-pd@a {
+		compatible = "apple,sn201202x";
+		reg = <0xa SPMI_USID>;
+		interrupts = <37 IRQ_TYPE_EDGE_RISING>,
+			     <39 IRQ_TYPE_EDGE_RISING>,
+			     <43 IRQ_TYPE_EDGE_RISING>,
+			     <45 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+
+		typec1: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Back Left";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec1_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_1_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec1_connector_ss: endpoint {
+						remote-endpoint = <&atcphy1_ss>;
+					};
+				};
+			};
+		};
+	};
+
+	hpm2: usb-pd@8 {
+		compatible = "apple,sn201202x";
+		reg = <0x8 SPMI_USID>;
+		interrupts = <63 IRQ_TYPE_EDGE_RISING>,
+			     <65 IRQ_TYPE_EDGE_RISING>,
+			     <69 IRQ_TYPE_EDGE_RISING>,
+			     <71 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+
+		typec2: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Back Right";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec2_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_2_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec2_connector_ss: endpoint {
+						remote-endpoint = <&atcphy2_ss>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&atcphy0 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			atcphy0_ss: endpoint {
+				remote-endpoint = <&typec0_connector_ss>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			atcphy0_usb3: endpoint {
+				remote-endpoint = <&dwc3_0_ss>;
+			};
+		};
+	};
+};
+
+&atcphy0_mbox {
+	status = "okay";
+};
+
+&dwc3_0_dart_0 {
+	status = "okay";
+};
+
+&dwc3_0_dart_1 {
+	status = "okay";
+};
+
+&dwc3_0 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dwc3_0_hs: endpoint {
+				remote-endpoint = <&typec0_connector_hs>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			dwc3_0_ss: endpoint {
+				remote-endpoint = <&atcphy0_usb3>;
+			};
+		};
+	};
+};
+
+&atcphy1 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			atcphy1_ss: endpoint {
+				remote-endpoint = <&typec1_connector_ss>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			atcphy1_usb3: endpoint {
+				remote-endpoint = <&dwc3_1_ss>;
+			};
+		};
+	};
+};
+
+&atcphy1_mbox {
+	status = "okay";
+};
+
+&dwc3_1_dart_0 {
+	status = "okay";
+};
+
+&dwc3_1_dart_1 {
+	status = "okay";
+};
+
+&dwc3_1 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dwc3_1_hs: endpoint {
+				remote-endpoint = <&typec1_connector_hs>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			dwc3_1_ss: endpoint {
+				remote-endpoint = <&atcphy1_usb3>;
+			};
+		};
+	};
+};
+
+&atcphy2 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			atcphy2_ss: endpoint {
+				remote-endpoint = <&typec2_connector_ss>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			atcphy2_usb3: endpoint {
+				remote-endpoint = <&dwc3_2_ss>;
+			};
+		};
+	};
+};
+
+&atcphy2_mbox {
+	status = "okay";
+};
+
+&dwc3_2_dart_0 {
+	status = "okay";
+};
+
+&dwc3_2_dart_1 {
+	status = "okay";
+};
+
+&dwc3_2 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dwc3_2_hs: endpoint {
+				remote-endpoint = <&typec2_connector_hs>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			dwc3_2_ss: endpoint {
+				remote-endpoint = <&atcphy2_usb3>;
+			};
+		};
+	};
+};
+
+#include "t6040-j773s-usb3.dtsi"
+#include "t6040-j773s-usb-front.dtsi"
+
+/* The video encoder, its DARTs and its power domains. */
+&ps_venc0_sys {
+	status = "okay";
+};
+
+&ps_venc0_dma {
+	status = "okay";
+};
+
+&ps_venc0_pipe4 {
+	status = "okay";
+};
+
+&ps_venc0_pipe5 {
+	status = "okay";
+};
+
+&ps_venc0_me0 {
+	status = "okay";
+};
+
+&ps_venc0_me1 {
+	status = "okay";
+};
+
+&ave0_dart0 {
+	status = "okay";
+};
+
+&ave0_dart1 {
+	status = "okay";
+};
+
+&ave {
+	status = "okay";
+};
+
+/* The JPEG codecs (ADT jpeg0 and jpeg1), as on the J616s. */
+&ps_jpg {
+	status = "okay";
+};
+
+&jpeg0_dart {
+	status = "okay";
+};
+
+&jpeg0 {
+	status = "okay";
+};
+
+&jpeg1_dart {
+	status = "okay";
+};
+
+&jpeg1 {
+	status = "okay";
+};
+
+/* The Abbey PMICs on the two other NUB SPMI buses (ADT spmi-abbeyF1/F2). */
+&nub_spmi1 {
+	status = "okay";
+
+	pmic@e {
+		compatible = "apple,abbey-pmic", "apple,spmi-nvmem";
+		reg = <0xe SPMI_USID>;
+	};
+};
+
+&nub_spmi2 {
+	status = "okay";
+
+	pmic@e {
+		compatible = "apple,abbey-pmic", "apple,spmi-nvmem";
+		reg = <0xe SPMI_USID>;
+	};
+};
+
+&ps_nub_spmi_ahb {
+	status = "okay";
+};
+
+&ps_nub_spmi1 {
+	status = "okay";
+};
+
+&ps_nub_spmi2 {
+	status = "okay";
+};
+
+/* As on the J616s: idle until the loader fills the preload reservations. */
+&ane0_dart0 {
+	status = "okay";
+};
+
+&ane0_dart1 {
+	status = "okay";
+};
+
+&ane0_dart2 {
+	status = "okay";
+};
+
+&ane {
+	memory-region = <&ane_fw_text>, <&ane_fw_data>;
+	memory-region-names = "firmware-text", "firmware-data";
+	power-domains = <&ps_ane_sys>, <&ps_ane_cpu>, <&ps_ane_mpm>,
+			<&ps_ane_td>, <&ps_ane_base>, <&pmc_soc_max>;
+	power-domain-names = "sys", "cpu", "mpm", "td", "base", "perf";
+	status = "okay";
+};
+
+/*
+ * HDMI is not described: it runs through the LPDPTX PHY (ADT lpdptx-phy0,
+ * display crossbar output 4) and a converter on i2c8, which have no T6040
+ * driver. The SEP stays off: its driver only runs on boards whose Touch ID
+ * wiring was read.
+ */

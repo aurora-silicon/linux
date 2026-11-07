@@ -1,0 +1,163 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The T8132 external display pipes dispext0 and dispext1, as on the J713:
+ * each a DCP with its own mailbox, firmware DART (SID23) and display DART
+ * (SID0 scanout, SID16 PIODMA), sharing the internal pipe's firmware clock
+ * window (disp-4), which also holds their bandwidth request slots in the
+ * PMC. iBoot starts both and may scan out through one (the Mac mini's
+ * HDMI port is dispext0). They stay disabled, and the DART driver keeps
+ * off them, until a board's handoff is qualified.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+	aliases {
+		dcpext0 = &dcpext0;
+		dcpext1 = &dcpext1;
+	};
+};
+
+&soc {
+	dcpext0_mbox: mailbox@286e08000 {
+		compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x2 0x86e08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 731 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 732 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 733 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 734 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		power-domains = <&ps_dispext0_cpu>;
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	dcpext0_dart: iommu@286340000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x2 0x86340000 0x0 0x20000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 750 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		power-domains = <&ps_dispext0_cpu>;
+		status = "disabled";
+	};
+
+	dispext0_dart: iommu@286300000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x2 0x86300000 0x0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 750 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		power-domains = <&ps_dispext0_cpu>;
+		status = "disabled";
+	};
+
+	dcpext0: dcp@286e00000 {
+		compatible = "apple,t8132-dcpext";
+		reg = <0x2 0x86e00000 0x0 0x4000>,
+		      <0x2 0x84000000 0x0 0xc20000>,
+		      <0x2 0x86240000 0x0 0x10000>,
+		      <0x2 0x863a8000 0x0 0x4000>,
+		      <0x2 0x86800000 0x0 0x800000>,
+		      <0x3 0x82800000 0x0 0xbc000>,
+		      <0x2 0x86850000 0x0 0x4000>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3",
+			    "disp-4", "iop-vbar";
+		mboxes = <&dcpext0_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcpext0_dart 23>;
+		power-domains = <&ps_dispext0_cpu>;
+		dma-noncoherent;
+		apple,dcp-index = <1>;
+		apple,bw-scratch = <&pmgr_dcpext 0 4 0>;
+		status = "disabled";
+
+		dcpext0_piodma: piodma {
+			iommus = <&dispext0_dart 16>;
+			dma-noncoherent;
+			status = "disabled";
+		};
+	};
+
+	/*
+	 * The external pipes' realtime bandwidth request slots in the PMC,
+	 * 0x2c000 and 0x30000 into the window the dcpexts have as disp-4.
+	 */
+	pmgr_dcpext: power-management@38282c000 {
+		reg = <0x3 0x8282c000 0x0 0x8>,
+		      <0x3 0x82830000 0x0 0x8>;
+		reg-names = "dcpext0-bw-scratch", "dcpext1-bw-scratch";
+		#apple,bw-scratch-cells = <3>;
+	};
+
+	dcpext1_mbox: mailbox@48ae08000 {
+		compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x4 0x8ae08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 803 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 804 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 805 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 806 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		power-domains = <&ps_dispext1_cpu>;
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	dcpext1_dart: iommu@48a340000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x4 0x8a340000 0x0 0x20000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 824 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		power-domains = <&ps_dispext1_cpu>;
+		status = "disabled";
+	};
+
+	dispext1_dart: iommu@48a300000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x4 0x8a300000 0x0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 824 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		power-domains = <&ps_dispext1_cpu>;
+		status = "disabled";
+	};
+
+	dcpext1: dcp@48ae00000 {
+		compatible = "apple,t8132-dcpext";
+		reg = <0x4 0x8ae00000 0x0 0x4000>,
+		      <0x4 0x88000000 0x0 0xc20000>,
+		      <0x4 0x8a240000 0x0 0x10000>,
+		      <0x4 0x8a3a8000 0x0 0x4000>,
+		      <0x4 0x8a800000 0x0 0x800000>,
+		      <0x3 0x82800000 0x0 0xbc000>,
+		      <0x4 0x8a850000 0x0 0x4000>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3",
+			    "disp-4", "iop-vbar";
+		mboxes = <&dcpext1_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcpext1_dart 23>;
+		power-domains = <&ps_dispext1_cpu>;
+		dma-noncoherent;
+		apple,dcp-index = <2>;
+		apple,bw-scratch = <&pmgr_dcpext 1 4 0>;
+		status = "disabled";
+
+		dcpext1_piodma: piodma {
+			iommus = <&dispext1_dart 16>;
+			dma-noncoherent;
+			status = "disabled";
+		};
+	};
+};

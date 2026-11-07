@@ -3323,7 +3323,7 @@ static int apple_cio_probe(struct platform_device *pdev)
 			apple_cio_pcie_tunnel_is_preinitialized(
 				acio->pcie_tunnel_np);
 		if (!acio->pcie_tunnel_preinitialized) {
-			dev_warn(dev,
+			dev_info(dev,
 				 "PCIe-C tunnel disabled: not initialized by m1n1 or the kernel\n");
 		} else {
 			ret = apple_cio_map_pcie_intr2axi(acio);
