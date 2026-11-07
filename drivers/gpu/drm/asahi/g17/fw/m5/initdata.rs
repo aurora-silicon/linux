@@ -156,6 +156,18 @@ impl RootProfile {
             _ => WORK_RING_BUNDLE_OFFSETS,
         }
     }
+
+    /// Status-config layout of the M5 graph built for this profile.
+    pub(crate) const fn m5_status_config(self) -> &'static M5StatusConfigMap {
+        match self {
+            Self::J714G17S26A428
+            | Self::J714G17S26B123
+            | Self::J714G17S26C5035
+            | Self::J700G17P
+            | Self::J813G17G25G76
+            | Self::J873G18G26A428 => &M5_26A428_STATUS_CONFIG,
+        }
+    }
 }
 
 const INITDATA_ADDR_MASK: u64 = 0x0000_0fff_ffff_ffff;
@@ -3037,12 +3049,15 @@ fn write_m5_status_config_words(
 }
 
 pub(crate) fn encode_m5_private_cluster(
-    m5_layout: &M5Layout,
+    profile: RootProfile,
     private_base: u64,
     fwctl_state: u64,
     out: &mut [u8],
 ) -> Result<(), InitdataError> {
-    let layout = m5_layout.private;
+    let layout = profile
+        .m5_layout()
+        .ok_or(InitdataError::InterfaceMismatch)?
+        .private;
     if out.len() != layout.total {
         return Err(InitdataError::BufferSize);
     }
@@ -3062,9 +3077,14 @@ pub(crate) fn encode_m5_private_cluster(
     out.fill(0);
     let status_b = layout.status_b;
     let status_a = layout.roles[0].status_a;
-    encode_m5_primary_status_b(m5_layout, fwctl_state, fwctl_ring,
-                                        private_base + status_b as u64,
-                                        &mut out[status_b..status_a])?;
+    encode_m5_primary_status_b_for(
+        profile.m5_status_config(),
+        layout.status_config - status_b,
+        fwctl_state,
+        fwctl_ring,
+        private_base + status_b as u64,
+        &mut out[status_b..status_a],
+    )?;
     for role in layout.roles {
         encode_status_block(&mut out[role.status_a..role.status_a + STATUS_BLOCK_SIZE])?;
     }

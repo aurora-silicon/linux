@@ -166,7 +166,8 @@ impl InitData {
         m::encode_common26_aon_ptd(board, &mut self.object_mut(aon)?.bytes_mut()[..m::M5_AON_PTD_SIZE])
             .map_err(|_| EINVAL)?;
         m::encode_m5_region_c(self.object_mut(self.region_c)?.bytes_mut()).map_err(|_| EINVAL)?;
-        m::encode_m5_private_cluster(layout, PRIVATE, FWCTL,
+        self.m5_status_config = profile.m5_status_config();
+        m::encode_m5_private_cluster(profile, PRIVATE, FWCTL,
             &mut self.object_mut(self.cluster)?.bytes_mut()[..private.total]).map_err(|_| EINVAL)?;
         let windows = board.register_windows();
         let windows = &windows[..board.register_window_count()];
