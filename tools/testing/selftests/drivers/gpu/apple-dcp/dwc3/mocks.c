@@ -331,6 +331,11 @@ static void dwc3_apple_setup_cio(struct dwc3_apple *a)
 	(void)a;
 	setup_cio++;
 }
+/* The hibernation block's register setup; teardown order doesn't depend on it. */
+static void __attribute__((unused)) dwc3_apple_setup_hibernation(struct dwc3_apple *a)
+{
+	(void)a;
+}
 static int dwc3_apple_usb2_mode_before_reset(enum dwc3_apple_state s,
 					     enum phy_mode *m)
 {
