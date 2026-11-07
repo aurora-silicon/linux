@@ -13,6 +13,7 @@
 
 #define ASC_HW_VERSION			0x0000
 #define ASC_RESET			0x0004
+#define   ASC_RESET_ENGINE		BIT(0)
 #define ASC_RESET_APIODMA		0x0008
 #define ASC_IS_RUNNING			0x000c
 #define ASC_REG_FIFO_AVAIL		0x0014

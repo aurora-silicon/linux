@@ -18,6 +18,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iommu.h>
+#include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -47,6 +48,7 @@
 #define ASC_MAX_SIZE		16384
 #define ASC_STRIDE_ALIGN	128
 #define ASC_JOB_TIMEOUT_MS	500
+#define ASC_IDLE_TIMEOUT_US	10000
 
 /**
  * struct apple_scaler_variant - per-SoC engine description
@@ -74,7 +76,6 @@ struct apple_scaler {
 	spinlock_t hw_lock;	/* protects the fields below */
 	struct apple_scaler_ctx *active;
 	bool need_init;
-	bool need_reset;
 	u32 transform_id;
 	struct delayed_work watchdog;
 	struct asc_reg writes[ASC_JOB_MAX_WRITES];
@@ -105,12 +106,30 @@ static void asc_write(struct apple_scaler *asc, u32 reg, u32 val)
 
 /* ---- hardware --------------------------------------------------------- */
 
-/* After power-up: clear stale status and enable completion and errors. */
-static void asc_hw_init(struct apple_scaler *asc)
+/*
+ * After power-up or a failed job: wait for idle, pulse the engine reset
+ * (no register may be read while it is held), clear stale status and
+ * enable completion and errors.
+ */
+static int asc_hw_init(struct apple_scaler *asc)
 {
+	u32 v;
+	int ret;
+
+	ret = readl_relaxed_poll_timeout(asc->regs + ASC_IS_RUNNING, v, !(v & BIT(0)),
+					 10, ASC_IDLE_TIMEOUT_US);
+	if (ret)
+		return ret;
+	asc_write(asc, ASC_RESET, ASC_RESET_ENGINE);
+	asc_write(asc, ASC_RESET, 0);
+	ret = readl_relaxed_poll_timeout(asc->regs + ASC_IS_RUNNING, v, !(v & BIT(0)),
+					 10, ASC_IDLE_TIMEOUT_US);
+	if (ret)
+		return ret;
 	asc_write(asc, ASC_IRQ_STATUS, asc_read(asc, ASC_IRQ_STATUS));
 	asc_write(asc, ASC_IRQ_ENABLE, ASC_IRQ_DONE | ASC_IRQ_ERRORS);
 	asc->need_init = false;
+	return 0;
 }
 
 static void asc_finish(struct apple_scaler *asc, struct apple_scaler_ctx *ctx, int err)
@@ -138,7 +157,6 @@ static void asc_finish(struct apple_scaler *asc, struct apple_scaler_ctx *ctx, i
 /* A failed job leaves the engine in an unknown state: reset before the next. */
 static void asc_recover(struct apple_scaler *asc)
 {
-	asc->need_reset = true;
 	asc->need_init = true;
 }
 
@@ -243,14 +261,20 @@ static void asc_device_run(void *priv)
 		return;
 	}
 
-	if (asc->need_reset) {
-		ret = asc->rst ? reset_control_reset(asc->rst) : 0;
+	/*
+	 * Engine reset and interrupt setup, once per power-up and after any
+	 * failure. If the engine does not go idle, fall back to the PMGR reset
+	 * of its power domain and try once more.
+	 */
+	if (asc->need_init) {
+		ret = asc_hw_init(asc);
+		if (ret && asc->rst && !reset_control_reset(asc->rst))
+			ret = asc_hw_init(asc);
 		if (ret) {
-			dev_err_ratelimited(asc->dev, "engine reset failed: %d\n", ret);
-			asc_finish(asc, ctx, ret);
+			dev_err_ratelimited(asc->dev, "engine does not go idle: %d\n", ret);
+			asc_finish(asc, ctx, -EIO);
 			return;
 		}
-		asc->need_reset = false;
 	}
 
 	asc_image(&job.src, &ctx->src, &src->vb2_buf);
@@ -275,8 +299,6 @@ static void asc_device_run(void *priv)
 		asc_finish(asc, ctx, n);
 		return;
 	}
-	if (asc->need_init)
-		asc_hw_init(asc);
 	asc->active = ctx;
 	/* Buffers must be visible to the engine before START, the last write. */
 	dma_wmb();
