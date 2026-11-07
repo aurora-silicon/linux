@@ -29,6 +29,9 @@ properties:
   reg:
     maxItems: 1
 
+  battery-monitor:
+    $ref: /schemas/power/supply/apple,battery-monitor.yaml#
+
   rtc:
     $ref: /schemas/rtc/apple,j700-pmu-rtc.yaml#
 

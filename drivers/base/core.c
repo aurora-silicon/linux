@@ -1082,8 +1082,9 @@ static void device_links_missing_supplier(struct device *dev)
 		if (link->supplier->links.status == DL_DEV_DRIVER_BOUND) {
 			WRITE_ONCE(link->status, DL_STATE_AVAILABLE);
 		} else {
-			dev_err(dev, "devices misses supplier %s\n", dev_name(link->supplier));
-			WARN_ON(!device_link_test(link, DL_FLAG_SYNC_STATE_ONLY));
+			WARN(!device_link_test(link, DL_FLAG_SYNC_STATE_ONLY),
+			     "%s: supplier %s missing\n", dev_name(dev),
+			     dev_name(link->supplier));
 			WRITE_ONCE(link->status, DL_STATE_DORMANT);
 		}
 	}

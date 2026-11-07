@@ -109,6 +109,10 @@ properties:
       Link to the SuperSpeed lanes of the Type-C connector. Absent on a fixed
       DisplayPort PHY.
 
+  ports:
+    $ref: /schemas/graph.yaml#/properties/ports
+    description: USB and DisplayPort lane connections to the Type-C connector.
+
   apple,tunable-axi2af:
     $ref: "#/$defs/apple,tunable"
     description: Tunables applied to the axi2af region.
