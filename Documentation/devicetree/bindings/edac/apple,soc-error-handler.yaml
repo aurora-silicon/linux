@@ -50,7 +50,7 @@ properties:
 
   interrupts:
     minItems: 9
-    maxItems: 255
+    maxItems: 322
 
   reg:
     minItems: 16

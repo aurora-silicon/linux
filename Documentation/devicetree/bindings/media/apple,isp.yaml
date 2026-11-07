@@ -10,10 +10,10 @@ maintainers:
   - Jonathan Goyvaerts <jonathan.goyvaerts@gmail.com>
 
 description:
-  The ISP controls the attached camera sensor and processes its frames
-  through firmware the bootloader loads. The firmware segments are described
-  as reserved memory mapped at the addresses the firmware runs them at. The
-  host exchanges commands and image buffers through three DART instances.
+  The ISP controls the attached camera sensor and processes its frames using
+  a coprocessor. The host exchanges commands and image buffers through three
+  DART instances. The memory handoff identifies either the allocation heap or
+  separate firmware text, data and heap regions.
 
 select:
   properties:
@@ -148,16 +148,16 @@ allOf:
             const: apple,t6041-isp
     then:
       properties:
-          power-domains:
-            items:
-              - description: ISP system domain
-              - description: ISP CPU domain
-              - description: ISP FE domain
-              - description: ISP DPRX domain
-              - description: ISP secure domain
-              - description: ISP BE domain
-              - description: ISP CLR domain
-              - description: Camera sensor domain
+        power-domains:
+          items:
+            - description: ISP system domain
+            - description: ISP CPU domain
+            - description: ISP FE domain
+            - description: ISP DPRX domain
+            - description: ISP secure domain
+            - description: ISP BE domain
+            - description: ISP CLR domain
+            - description: Camera sensor domain
         memory-region:
           minItems: 3
         memory-region-names:
