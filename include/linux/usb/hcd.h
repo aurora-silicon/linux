@@ -112,6 +112,7 @@ struct usb_hcd {
 #define HCD_FLAG_DEAD			6	/* controller has died? */
 #define HCD_FLAG_INTF_AUTHORIZED	7	/* authorize interfaces? */
 #define HCD_FLAG_DEFER_RH_REGISTER	8	/* Defer roothub registration */
+#define HCD_FLAG_PHY_SUSPENDED		9	/* root hub PHYs released by a suspend */
 
 	/* The flags can be tested using these macros; they are likely to
 	 * be slightly faster than test_bit().
