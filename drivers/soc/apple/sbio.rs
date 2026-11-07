@@ -639,36 +639,55 @@ impl SepData {
         }
     }
 
-    /// Starts a match operation (`0x7d`) and checks its device list.
-    fn open_match_operation(&self) -> bool {
+    /// Starts the enclave's operation for a prompt or an enrolment
+    /// (`OPERATION_DEVICE_LIST`, `0x7d`) and checks its device list: a count
+    /// and one 24-byte record per device, at least one. `what` names the
+    /// caller in the log.
+    fn open_operation(&self, what: &CStr, kind: &CStr) -> bool {
         match self.sbio_call(&crate::sbio::sbio_operation_device_list()) {
             SbioOutcome::Ok(reply) => match crate::sbio::operation_device_count(&reply) {
-                Some(count) => {
+                Some(count) if count > 0 => {
                     dev_info!(
                         self.dev,
-                        "verify: match operation opened (OPERATION_DEVICE_LIST, {} device(s))\n",
+                        "{}: {} operation opened (OPERATION_DEVICE_LIST, {} device(s))\n",
+                        what,
+                        kind,
                         count
                     );
                     true
                 }
+                Some(_) => {
+                    dev_err!(self.dev, "{}: OPERATION_DEVICE_LIST listed no device\n", what);
+                    false
+                }
                 None => {
                     dev_err!(
                         self.dev,
-                        "verify: OPERATION_DEVICE_LIST answered a malformed list ({} bytes)\n",
+                        "{}: OPERATION_DEVICE_LIST answered a malformed list ({} bytes)\n",
+                        what,
                         reply.len()
                     );
                     false
                 }
             },
             SbioOutcome::PrerequisiteMissing => {
-                dev_err!(self.dev, "verify: OPERATION_DEVICE_LIST refused: prerequisite missing\n");
+                dev_err!(
+                    self.dev,
+                    "{}: OPERATION_DEVICE_LIST refused: prerequisite missing\n",
+                    what
+                );
                 false
             }
             _ => {
-                dev_err!(self.dev, "verify: OPERATION_DEVICE_LIST failed\n");
+                dev_err!(self.dev, "{}: OPERATION_DEVICE_LIST failed\n", what);
                 false
             }
         }
+    }
+
+    /// Starts a match operation (`0x7d`) and checks its device list.
+    fn open_match_operation(&self) -> bool {
+        self.open_operation(c"verify", c"match")
     }
 
     /// Ends the imaging of a touch the way macOS does: PAUSE_CAPTURE stops
@@ -1180,16 +1199,21 @@ impl SepData {
         let op =
             crate::sbio::sbio_begin_enrol(user, crate::sbio::BE_AUTH_TYPE_ACM_CONTEXT, &acm_handle);
 
-        match self.sbio_enrol_step(&op) {
-            Some(_payload) => {
-                self.enrol_open.store(true, Relaxed);
-                Some(OpenEnrolment {
-                    sep: self,
-                    armed: true,
-                })
-            }
-            _ => None,
+        if self.sbio_enrol_step(&op).is_none() {
+            return None;
         }
+        self.enrol_open.store(true, Relaxed);
+        let open = OpenEnrolment {
+            sep: self,
+            armed: true,
+        };
+        // macOS sends OPERATION_DEVICE_LIST right after BEGIN_ENROL, before
+        // the first capture, as it does at the start of a match operation.
+        // Dropping `open` on a failure cancels the enrolment.
+        if !self.open_operation(c"enrol", c"enrolment") {
+            return None;
+        }
+        Some(open)
     }
 
     fn probe_owner_export(&self) {
