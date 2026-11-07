@@ -611,6 +611,8 @@ static void isp_vb2_stop_streaming(struct vb2_queue *q)
 {
 	struct apple_isp *isp = vb2_get_drv_priv(q);
 
+	/* A restart still due from a sleep has nothing left to restart. */
+	clear_bit(ISP_STATE_SLEEPING, &isp->state);
 	apple_isp_stop_streaming(isp);
 	isp_vb2_release_buffers(isp, VB2_BUF_STATE_ERROR);
 	v4l2_ctrl_grab(isp->exposure_priority, false);

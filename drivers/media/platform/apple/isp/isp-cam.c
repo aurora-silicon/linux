@@ -1102,7 +1102,7 @@ int apple_isp_start_capture(struct apple_isp *isp)
 
 void apple_isp_stop_capture(struct apple_isp *isp)
 {
-	if (isp->ipc_failed || isp->fw_state == ISP_FW_DEAD)
+	if (isp->ipc_failed || isp->fw_state != ISP_FW_RUNNING)
 		return;
 	isp_cmd_ch_stop(isp, 0); // TODO channel mask
 	isp_cmd_ch_buffer_return(isp, isp->current_ch);
