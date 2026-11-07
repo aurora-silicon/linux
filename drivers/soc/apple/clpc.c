@@ -3,9 +3,9 @@
  * Apple SoC host performance controller (CLPC) floors
  *
  * On macOS the CLPC raises the floor of the memory controller (DCS) and the
- * SoC fabric while the CPU clusters or the GPU are busy, through its own
+ * SoC fabric while CPU clusters, the GPU or the ANE are busy, through its own
  * voter agent in the PMC. This driver keeps that agent's floor in step with
- * Linux CPU load:
+ * Linux demand:
  *
  *  - every sampling period, each cpufreq policy reports how busy its
  *    busiest CPU was and how fast the policy runs relative to its maximum;
@@ -39,6 +39,7 @@
 #include <linux/seq_file.h>
 #include <linux/soc/apple/pmc.h>
 #include <linux/workqueue.h>
+#include <linux/uaccess.h>
 
 #define APPLE_CLPC_MAX_CLUSTERS	8
 #define APPLE_CLPC_LEVELS	4
@@ -341,6 +342,8 @@ int apple_clpc_ane_get(struct device *dev, struct apple_clpc_ane **out)
 	struct apple_clpc *clpc;
 
 	*out = NULL;
+	if (!dev->of_node)
+		return 0;
 	np = of_parse_phandle(dev->of_node, "apple,clpc", 0);
 	if (!np && !of_find_property(dev->of_node, "apple,clpc", NULL))
 		np = of_find_compatible_node(NULL, NULL, "apple,t8140-clpc");
@@ -1145,6 +1148,7 @@ static const struct apple_clpc_hw apple_clpc_hw_t8140 = {
 	.pmp_backoff = true,
 	.pmp_agent = 0,
 	.gpu_dense = 2,
+	/* Measured ANE demand: raise DRAM without raising the fabric floor. */
 	.ane = { [APPLE_CLPC_DCS] = 4, [APPLE_CLPC_SOC] = 0 },
 };
 
