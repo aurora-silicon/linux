@@ -30,13 +30,6 @@ select:
           contains:
             enum:
               - "apple,ane"
-              - "apple,ane-type"
-              - "apple,dapf-ranges"
-              - "apple,exclave-assigned"
-              - "apple,firmware-iovas"
-              - "apple,firmware-preloaded"
-              - "apple,performance-controller"
-              - "apple,preload-data-sha256"
               - "apple,t6000-ane"
               - "apple,t6001-ane"
               - "apple,t6020-ane"
@@ -582,6 +575,7 @@ allOf:
                     - apple,t8140-ane
                     - apple,t6041-ane
                     - apple,t6001-ane
+          then: true
           else:
             properties:
               power-domains:

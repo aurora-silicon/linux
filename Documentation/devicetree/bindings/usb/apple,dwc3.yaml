@@ -32,12 +32,6 @@ select:
               - "apple,t8132-dwc3"
               - "apple,t8140-dwc3"
               - "apple,t8142-dwc3"
-              - "apple,tunable"
-              - "apple,tunable-cfg-host"
-              - "apple,tunable-dbg"
-              - "apple,tunable-gbl-default"
-              - "apple,tunable-gbl-host"
-              - "apple,tunable-link"
       required:
         - "compatible"
     -

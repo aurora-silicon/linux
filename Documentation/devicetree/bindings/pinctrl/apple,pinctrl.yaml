@@ -22,8 +22,6 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,irq-group-base"
-              - "apple,npins"
               - "apple,pinctrl"
               - "apple,s5l8960x-pinctrl"
               - "apple,s8000-pinctrl"

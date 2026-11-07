@@ -28,13 +28,7 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,aop-als"
-              - "apple,aop-las"
-              - "apple,aop-motion.yaml"
               - "apple,t6041-aop"
-              - "apple,t6041-aop-als"
-              - "apple,t6041-aop-audio.yaml"
-              - "apple,t6041-aop-las"
               - "apple,t8132-aop"
       required:
         - "compatible"

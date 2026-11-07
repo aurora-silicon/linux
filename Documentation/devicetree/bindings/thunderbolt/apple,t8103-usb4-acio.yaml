@@ -33,22 +33,16 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,dart.yaml"
-              - "apple,pcie-tunnel"
               - "apple,t6000-usb4-acio"
               - "apple,t6020-usb4-acio"
               - "apple,t6030-usb4-acio"
               - "apple,t6031-usb4-acio"
               - "apple,t6040-usb4-acio"
               - "apple,t8103-usb4-acio"
-              - "apple,t8103-usb4-nhi.yaml"
               - "apple,t8112-usb4-acio"
               - "apple,t8122-usb4-acio"
               - "apple,t8132-usb4-acio"
               - "apple,t8142-usb4-acio"
-              - "apple,tunable-pcie-adapter"
-              - "apple,tunable-rc"
-              - "apple,tunable-rc,"
       required:
         - "compatible"
     -

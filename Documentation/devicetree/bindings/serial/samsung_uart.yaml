@@ -2,6 +2,7 @@
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/serial/samsung_uart.yaml#
+
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
 title: Samsung S3C, S5P, Exynos, and S5L (Apple SoC) SoC UART Controller
@@ -15,187 +16,300 @@ description: |+
   node, according to serialN format, where N is the port number (non-negative
   decimal integer) as specified by User's Manual of respective SoC.
 
+select:
+  anyOf:
+    -
+      properties:
+        compatible:
+          contains:
+            enum:
+              - "apple,s5l-uart"
+              - "apple,t8140-uart"
+              - "axis,artpec8-uart"
+              - "axis,artpec9-uart"
+              - "google,gs101-uart"
+              - "samsung,exynos2200-uart"
+              - "samsung,exynos4210-uart"
+              - "samsung,exynos5433-uart"
+              - "samsung,exynos7-uart"
+              - "samsung,exynos7870-uart"
+              - "samsung,exynos7885-uart"
+              - "samsung,exynos850-uart"
+              - "samsung,exynos8890-uart"
+              - "samsung,exynos8895-uart"
+              - "samsung,exynosautov9-uart"
+              - "samsung,exynosautov920-uart"
+              - "samsung,s3c6400-uart"
+              - "samsung,s5pv210-uart"
+              - "tesla,fsd-uart"
+      required:
+        - "compatible"
+    -
+      properties:
+        compatible:
+          items:
+            -
+              const: "apple,t6050-uart"
+            -
+              const: "apple,s5l-uart"
+      required:
+        - "compatible"
+
 properties:
-  compatible:
-    oneOf:
-      - enum:
-          - apple,s5l-uart
-          - axis,artpec8-uart
-          - google,gs101-uart
-          - samsung,s3c6400-uart
-          - samsung,s5pv210-uart
-          - samsung,exynos4210-uart
-          - samsung,exynos5433-uart
-          - samsung,exynos850-uart
-          - samsung,exynos8895-uart
-      - items:
-          - const: apple,t8140-uart
-          - const: apple,s5l-uart
-      - items:
-          - enum:
-              - samsung,exynos2200-uart
-          - const: google,gs101-uart
-      - items:
-          - enum:
-              - samsung,exynos7-uart
-              - tesla,fsd-uart
-          - const: samsung,exynos4210-uart
-      - items:
-          - enum:
-              - samsung,exynos7885-uart
-          - const: samsung,exynos5433-uart
-      - items:
-          - enum:
-              - samsung,exynosautov9-uart
-              - samsung,exynosautov920-uart
-          - const: samsung,exynos850-uart
-      - items:
-          - enum:
-              - axis,artpec9-uart
-              - samsung,exynos7870-uart
-              - samsung,exynos8890-uart
-          - const: samsung,exynos8895-uart
-
-  reg:
-    maxItems: 1
-
+  compatible: true
+  reg: true
   reg-io-width:
     description: |
       The size (in bytes) of the IO accesses that should be performed
       on the device.
     enum: [ 1, 4 ]
-
-  clocks:
-    minItems: 2
-    maxItems: 5
-
-  clock-names:
-    minItems: 2
-    maxItems: 5
-
+  clocks: true
+  clock-names: true
   dmas:
     items:
       - description: DMA controller phandle and request line for RX
       - description: DMA controller phandle and request line for TX
-
   dma-names:
     items:
       - const: rx
       - const: tx
-
-  interrupts:
-    description: RX interrupt and optionally TX interrupt.
-    minItems: 1
-    maxItems: 2
-
-  power-domains:
-    maxItems: 1
-
+  interrupts: true
+  power-domains: true
   samsung,uart-fifosize:
     description: The fifo size supported by the UART channel.
     $ref: /schemas/types.yaml#/definitions/uint32
     enum: [16, 64, 256]
+  iommus: true
+  resets: true
+  status: true
 
-required:
-  - compatible
-  - clocks
-  - clock-names
-  - interrupts
-  - reg
+additionalProperties: true
 
 allOf:
-  - $ref: serial.yaml#
-
   - if:
-      properties:
-        compatible:
-          contains:
-            enum:
-              - samsung,s3c6400-uart
+      anyOf:
+        -
+          properties:
+            compatible:
+              items:
+                -
+                  const: "apple,t6050-uart"
+                -
+                  const: "apple,s5l-uart"
+            status:
+              const: "disabled"
+          required:
+            - "compatible"
+            - "status"
     then:
-      properties:
-        clocks:
-          minItems: 3
-          maxItems: 3
-
-        clock-names:
-          items:
-            - const: uart
-            - const: clk_uart_baud2
-            - const: clk_uart_baud3
-
+      oneOf:
+        -
+          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          properties:
+            compatible:
+              items:
+                -
+                  const: "apple,t6050-uart"
+                -
+                  const: "apple,s5l-uart"
+            status:
+              const: "disabled"
+            reg:
+              maxItems: 1
+              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+            interrupts:
+              maxItems: 1
+            power-domains:
+              maxItems: 1
+            clocks:
+              maxItems: 2
+          required:
+            - "compatible"
+            - "reg"
+            - "status"
+            - "interrupts"
+            - "power-domains"
+            - "clocks"
+          additionalProperties: false
     else:
       properties:
+        compatible:
+          oneOf:
+            - enum:
+                - apple,s5l-uart
+                - axis,artpec8-uart
+                - google,gs101-uart
+                - samsung,s3c6400-uart
+                - samsung,s5pv210-uart
+                - samsung,exynos4210-uart
+                - samsung,exynos5433-uart
+                - samsung,exynos850-uart
+                - samsung,exynos8895-uart
+            - items:
+                - const: apple,t8140-uart
+                - const: apple,s5l-uart
+            - items:
+                - enum:
+                    - samsung,exynos2200-uart
+                - const: google,gs101-uart
+            - items:
+                - enum:
+                    - samsung,exynos7-uart
+                    - tesla,fsd-uart
+                - const: samsung,exynos4210-uart
+            - items:
+                - enum:
+                    - samsung,exynos7885-uart
+                - const: samsung,exynos5433-uart
+            - items:
+                - enum:
+                    - samsung,exynosautov9-uart
+                    - samsung,exynosautov920-uart
+                - const: samsung,exynos850-uart
+            - items:
+                - enum:
+                    - axis,artpec9-uart
+                    - samsung,exynos7870-uart
+                    - samsung,exynos8890-uart
+                - const: samsung,exynos8895-uart
+
+        reg:
+          maxItems: 1
+
+        reg-io-width:
+          description: |
+            The size (in bytes) of the IO accesses that should be performed
+            on the device.
+          enum: [ 1, 4 ]
+
+        clocks:
+          minItems: 2
+          maxItems: 5
+
         clock-names:
           minItems: 2
+          maxItems: 5
+
+        dmas:
           items:
-            - const: uart
-            - const: clk_uart_baud0
-            - const: clk_uart_baud1
-            - const: clk_uart_baud2
-            - const: clk_uart_baud3
+            - description: DMA controller phandle and request line for RX
+            - description: DMA controller phandle and request line for TX
 
-  - if:
-      properties:
-        compatible:
-          contains:
-            enum:
-              - samsung,s5pv210-uart
-    then:
-      properties:
-        clocks:
-          minItems: 3
-          maxItems: 3
+        dma-names:
+          items:
+            - const: rx
+            - const: tx
 
-        clock-names:
-          minItems: 3
-          maxItems: 3
-
-  - if:
-      properties:
-        compatible:
-          contains:
-            enum:
-              - apple,s5l-uart
-              - axis,artpec8-uart
-              - samsung,exynos4210-uart
-              - samsung,exynos5433-uart
-    then:
-      properties:
-        clocks:
+        interrupts:
+          description: RX interrupt and optionally TX interrupt.
+          minItems: 1
           maxItems: 2
 
-        clock-names:
-          maxItems: 2
+        power-domains:
+          maxItems: 1
 
-  - if:
-      properties:
-        compatible:
-          contains:
-            enum:
-              - google,gs101-uart
-              - samsung,exynos8895-uart
-    then:
+        samsung,uart-fifosize:
+          description: The fifo size supported by the UART channel.
+          $ref: /schemas/types.yaml#/definitions/uint32
+          enum: [16, 64, 256]
       required:
-        - samsung,uart-fifosize
-      properties:
-        clocks:
-          maxItems: 2
+        - compatible
+        - clocks
+        - clock-names
+        - interrupts
+        - reg
+      allOf:
+        - $ref: serial.yaml#
 
-        clock-names:
-          maxItems: 2
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - samsung,s3c6400-uart
+          then:
+            properties:
+              clocks:
+                minItems: 3
+                maxItems: 3
 
-  - if:
-      properties:
-        compatible:
-          contains:
-            enum:
-              - google,gs101-uart
-    then:
-      properties:
-        reg-io-width: false
+              clock-names:
+                items:
+                  - const: uart
+                  - const: clk_uart_baud2
+                  - const: clk_uart_baud3
 
-unevaluatedProperties: false
+          else:
+            properties:
+              clock-names:
+                minItems: 2
+                items:
+                  - const: uart
+                  - const: clk_uart_baud0
+                  - const: clk_uart_baud1
+                  - const: clk_uart_baud2
+                  - const: clk_uart_baud3
+
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - samsung,s5pv210-uart
+          then:
+            properties:
+              clocks:
+                minItems: 3
+                maxItems: 3
+
+              clock-names:
+                minItems: 3
+                maxItems: 3
+
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,s5l-uart
+                    - axis,artpec8-uart
+                    - samsung,exynos4210-uart
+                    - samsung,exynos5433-uart
+          then:
+            properties:
+              clocks:
+                maxItems: 2
+
+              clock-names:
+                maxItems: 2
+
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - google,gs101-uart
+                    - samsung,exynos8895-uart
+          then:
+            required:
+              - samsung,uart-fifosize
+            properties:
+              clocks:
+                maxItems: 2
+
+              clock-names:
+                maxItems: 2
+
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - google,gs101-uart
+          then:
+            properties:
+              reg-io-width: false
+      unevaluatedProperties: false
 
 examples:
   - |

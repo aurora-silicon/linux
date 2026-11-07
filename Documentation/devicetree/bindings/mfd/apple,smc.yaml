@@ -22,10 +22,6 @@ select:
           contains:
             enum:
               - "apple,smc"
-              - "apple,smc-gpio.yaml"
-              - "apple,smc-hwmon.yaml"
-              - "apple,smc-reboot.yaml"
-              - "apple,smc-rtc.yaml"
               - "apple,t6000-smc"
               - "apple,t6020-smc"
               - "apple,t6030-smc"

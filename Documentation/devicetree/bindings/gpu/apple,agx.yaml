@@ -17,8 +17,6 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,afr-leak-coef"
-              - "apple,afr-opp"
               - "apple,agx-g13c"
               - "apple,agx-g13d"
               - "apple,agx-g13g"
@@ -33,23 +31,6 @@ select:
               - "apple,agx-t8112"
               - "apple,agx-t8132"
               - "apple,agx-t8140"
-              - "apple,clpc"
-              - "apple,core-leak-coef"
-              - "apple,core-mask"
-              - "apple,cs-leak-coef"
-              - "apple,cs-opp"
-              - "apple,firmware-abi"
-              - "apple,firmware-version"
-              - "apple,idle-off-delay-ms"
-              - "apple,max-power-mw"
-              - "apple,perf-base-pstate"
-              - "apple,perf-map-a"
-              - "apple,perf-map-b"
-              - "apple,perf-relative-a"
-              - "apple,perf-relative-b"
-              - "apple,pmp"
-              - "apple,sram-leak-coef"
-              - "apple,t6040-handoff-version"
       required:
         - "compatible"
     -

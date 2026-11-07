@@ -168,6 +168,16 @@
 		};
 	};
 
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupts = <AIC_FIQ 0 AIC_TMR_GUEST_PHYS IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_FIQ 0 AIC_TMR_GUEST_VIRT IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_FIQ 0 AIC_TMR_HV_PHYS IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_FIQ 0 AIC_TMR_HV_VIRT IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "phys", "virt", "hyp-phys", "hyp-virt";
+		status = "disabled";
+	};
+
 	soc {
 		compatible = "simple-bus";
 		#address-cells = <2>;
@@ -177,10 +187,10 @@
 
 		aic: interrupt-controller@280400000 {
 			compatible = "apple,t6050-aic3", "apple,t8122-aic3";
-			reg = <2 0x80400000 0 0x1cc000>;
+			reg = <2 0x80400000 0 0x1cc000>, <2 0x80440000 0 0x4000>;
+			reg-names = "core", "event";
 			interrupt-controller;
 			#interrupt-cells = <4>;
-			#address-cells = <0>;
 			status = "disabled";
 		};
 	};
@@ -346,13 +356,10 @@
 		compatible = "apple,t6050-nvme-ans2", "apple,nvme-ans";
 		reg = <0x4 0x19600000 0x0 0x88000>,
 		      <0x4 0x19050000 0x0 0x4000>,
-		      <0x2 0x0 0x0 0x0>,
 		      <0x4 0x1dcc0000 0x0 0x60010>,
 		      <0x4 0x1b000000 0x0 0x18000>,
 		      <0x4 0x1db90000 0x0 0xc000>,
 		      <0x4 0x1dd47c00 0x0 0x4000>,
-		      <0x2 0x0 0x0 0x0>,
-		      <0x2 0x0 0x0 0x0>,
 		      <0x4 0x5dcc0000 0x0 0x10000>;
 		interrupts = <AIC_IRQ 0 1348 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 1347 IRQ_TYPE_LEVEL_HIGH>,

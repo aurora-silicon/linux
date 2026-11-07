@@ -18,9 +18,6 @@ select:
           contains:
             enum:
               - "apple,nvme-ans2"
-              - "apple,rtkit-handoff"
-              - "apple,sart"
-              - "apple,sart.yaml."
               - "apple,t6000-nvme-ans2"
               - "apple,t6020-nvme-ans2"
               - "apple,t6030-nvme-ans2"
@@ -107,8 +104,8 @@ allOf:
             status:
               const: "disabled"
             reg:
-              minItems: 10
-              maxItems: 10
+              minItems: 7
+              maxItems: 7
               description: "Native register apertures in hardware-interface order, including shared auxiliary views."
             interrupts:
               minItems: 5
