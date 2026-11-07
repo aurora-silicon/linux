@@ -776,12 +776,15 @@ impl Backend {
             if shared.crashed.load(core::sync::atomic::Ordering::Acquire) {
                 return Err(EIO);
             }
-            let slot = firmware.queues.admission.reserve_queue()?;
             // Installed compute channels narrow render's QIDs: every open
-            // logical queue keeps a dedicated render pair within reach.
-            if !firmware.queues.qids.render_fits(firmware.queues.admission.queues() as usize) {
+            // logical queue keeps a dedicated render pair within reach. Checked
+            // before the slot is claimed: giving a claimed slot back wakes the
+            // queue waiters, the caller's own wait included, which then spins.
+            // Only this path claims slots, under the device mutex.
+            if !firmware.queues.qids.render_fits(firmware.queues.admission.queues() as usize + 1) {
                 return Err(super::capacity::refused(super::capacity::Site::LogicalQueues));
             }
+            let slot = firmware.queues.admission.reserve_queue()?;
             // The new context may take a pooled scheduler page a released context's QoS row
             // still names: clear those rows first.
             firmware.queues.qos_ids.forget_released(|ids| firmware.port.qos_forget(ids));
@@ -804,7 +807,8 @@ impl Backend {
                     if closing == 0 || now_ns().saturating_sub(started) >= RETAINED_CONTEXT_WAIT_NS {
                         return Err(super::capacity::refused(super::capacity::Site::ExecutionContexts));
                     }
-                    drop(slot);
+                    // Its own return of the slot must not end the wait below.
+                    let observed = slot.cancel(observed);
                     drop(state);
                     drop(lease);
                     // Nothing is visible yet: a signalled creator restarts.

@@ -800,6 +800,19 @@ impl QueueSlot {
     pub(crate) fn pool(&self) -> &Arc<Pool> {
         &self.pool
     }
+    /// Gives back a slot no queue was published in, for a creator that sampled the waiters'
+    /// domain as `observed` before claiming it. Returns the sample that creator waits on next
+    /// ([`Availability::notify_own`]): its own return still wakes the other waiters, but not
+    /// itself.
+    ///
+    /// [`Availability::notify_own`]: crate::g17::availability::Availability::notify_own
+    pub(crate) fn cancel(self, observed: u64) -> u64 {
+        let this = core::mem::ManuallyDrop::new(self);
+        // SAFETY: `this` is never used or dropped again, so the pool reference moves out once.
+        let pool = unsafe { core::ptr::read(&this.pool) };
+        pool.queues.fetch_sub(1, Ordering::AcqRel);
+        pool.waiters.as_ref().map_or(observed, |waiters| waiters.notify_own(observed))
+    }
 }
 impl Drop for QueueSlot {
     fn drop(&mut self) {
@@ -1003,6 +1016,35 @@ impl Pool {
                  used.count_ones(), State::MASK.count_ones(), retained.count_ones(),
                  (state.active & State::MASK).count_ones(), (state.quarantined & State::MASK).count_ones(),
                  (state.kill_hold & State::MASK).count_ones())
+    }
+}
+
+#[kunit_tests(asahi_g17_queue_slot_cancel)]
+mod queue_slot_cancel_tests {
+    use super::*;
+    use crate::g17::availability::Availability;
+
+    #[test]
+    fn a_creator_does_not_wake_itself_by_giving_back_its_slot() -> Result {
+        let waiters = Availability::new()?;
+        let pool = Pool::with_waiters(MAX_EXECUTION_CONTEXTS, Some(waiters.clone()), None)?;
+        let observed = waiters.observe();
+        let slot = pool.reserve_queue()?;
+        let next = slot.cancel(observed);
+        assert_eq!(pool.queues(), 0);
+        // The return advanced the domain, so other waiters wake, but the creator's next
+        // sample is current: its wait registers instead of returning at once.
+        assert_eq!(next, waiters.observe());
+        assert_ne!(next, observed);
+        assert!(waiters.wait(next)?.is_some());
+        // A return by anyone else after the sample still ends the creator's wait.
+        let observed = waiters.observe();
+        let slot = pool.reserve_queue()?;
+        drop(pool.reserve_queue()?);
+        assert_eq!(slot.cancel(observed), observed);
+        assert!(waiters.wait(observed)?.is_none());
+        waiters.notify();
+        Ok(())
     }
 }
 
