@@ -458,6 +458,8 @@ struct Active {
     observed_at: Option<u64>,
     failure_deferred: bool,
     qos_pending: bool,
+    /// Producer QIDs named by this command's type-4 completion-stamp waits.
+    native_wait_producers: [u64; 2],
 }
 struct Previous<B = Binding, C = Arc<Context>> {
     binding: Option<B>,
@@ -757,6 +759,19 @@ impl Queue {
         // front has no completion observation and is itself the successor.
         let queued = front.observed.is_none() || active.next().is_some();
         (completed && queued && !self.quarantined)
+            .then(|| front.packet.context.policy().priority())
+    }
+    /// Priority of a published front command whose type-4 wait names a QID in
+    /// this completion batch. The stamp wait remains the only truth predicate;
+    /// the ordinary work notification merely asks firmware to evaluate it now.
+    pub(crate) fn native_wait_rekick_priority(&self, masks: [u64; 2]) -> Option<u8> {
+        let front = self.active.front()?;
+        let matches = front
+            .native_wait_producers
+            .iter()
+            .zip(masks)
+            .any(|(waiters, completed)| *waiters & completed != 0);
+        (matches && front.ticket.is_some() && front.observed.is_none() && !self.quarantined)
             .then(|| front.packet.context.policy().priority())
     }
     /// The oldest command is a published long job (ray traversal or AS build) whose
@@ -2320,6 +2335,11 @@ impl Queue {
             scs_enabled: scratch.enabled(),
             priority: policy.priority(),
         };
+        let mut native_wait_producers = [0u64; 2];
+        for wait in native {
+            let qid = usize::from(wait.dependency.qid());
+            native_wait_producers[qid / 64] |= 1u64 << (qid % 64);
+        }
         let published = host.next_compute_publication()?;
         self.last_published = published;
         self.active
@@ -2332,6 +2352,7 @@ impl Queue {
                 observed_at: None,
                 failure_deferred: false,
                 qos_pending: false,
+                native_wait_producers,
             })
             .map_err(|_| EBUSY)?;
         self.retirement_ready = false;

@@ -281,11 +281,16 @@ impl Firmware {
             true,
             true,
         );
-        if !compute_enabled && !render_enabled {
+        let waiter_enabled = completion_rekick::selected_for_waiter(
+            self.variant.graph,
+            true,
+            masks != [0, 0],
+        );
+        if !compute_enabled && !render_enabled && !waiter_enabled {
             return Ok(());
         }
         let mut compute = [false; Policy::PRIORITIES as usize];
-        if compute_enabled {
+        if compute_enabled || waiter_enabled {
             for queue in self
                 .queues
                 .compute
@@ -293,7 +298,12 @@ impl Firmware {
                 .flatten()
                 .filter_map(|entry| entry.queue.as_deref())
             {
-                if let Some(priority) = queue.completion_rekick_priority(masks) {
+                let priority = if waiter_enabled {
+                    queue.native_wait_rekick_priority(masks)
+                } else {
+                    queue.completion_rekick_priority(masks)
+                };
+                if let Some(priority) = priority {
                     compute[usize::from(priority)] = true;
                 }
             }
@@ -318,7 +328,12 @@ impl Firmware {
                 let message =
                     (0x83 << crate::g17::MSG_TYPE_SHIFT) | pipe | u64::from(priority) << 2;
                 crate::g17::trace::doorbell(engine, || self.bridge.regs.g17_core_power());
-                crate::g17::trace::message(crate::g17::trace::REKICK, message);
+                let kind = if waiter_enabled && engine == crate::g17::trace::COMPUTE {
+                    crate::g17::trace::WAIT_REKICK
+                } else {
+                    crate::g17::trace::REKICK
+                };
+                crate::g17::trace::message(kind, message);
                 self.primary.notify(message)?;
             }
         }

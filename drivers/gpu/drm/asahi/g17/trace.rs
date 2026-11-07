@@ -70,6 +70,9 @@ pub(super) const EFFORT: u8 = 2;
 /// Test-only post-completion work notification. The value is the following
 /// ordinary mailbox message, also recorded with [`MAILBOX`].
 pub(super) const REKICK: u8 = 3;
+/// Test-only work notification for a front type-4 wait whose producer QID was
+/// present in the just-drained completion batch.
+pub(super) const WAIT_REKICK: u8 = 4;
 
 /// A host-to-firmware message: a mailbox message, a device-control record by
 /// opcode, or a new performance effort value.

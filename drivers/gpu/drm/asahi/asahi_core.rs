@@ -237,7 +237,7 @@ module! {
         },
         g16_completion_rekick_arm: u8 {
             default: 0,
-            description: "G16 TEST ONLY: post-completion work re-kick (0=A/off, 1=compute, 2=render, 3=both)",
+            description: "G16 TEST ONLY: post-completion work re-kick (0=A/off, 1=compute, 2=render, 3=both, 4=type-4 waiter)",
         },
     },
 }

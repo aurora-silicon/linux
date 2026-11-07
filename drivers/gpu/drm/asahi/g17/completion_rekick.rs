@@ -27,6 +27,8 @@ enum Arm {
     Render,
     /// Enable both independent arms.
     Both,
+    /// Re-kick compute when a completed QID is named by the front type-4 wait.
+    Waiter,
 }
 
 impl Arm {
@@ -35,8 +37,13 @@ impl Arm {
             1 => Self::Compute,
             2 => Self::Render,
             3 => Self::Both,
+            4 => Self::Waiter,
             _ => Self::A,
         }
+    }
+
+    const fn covers_waiter(self) -> bool {
+        matches!(self, Self::Waiter)
     }
 
     const fn covers(self, engine: Engine) -> bool {
@@ -78,13 +85,40 @@ pub(crate) fn selected_for(
     )
 }
 
+const fn waiter_decision(
+    value: u8,
+    graph: InitGraph,
+    wait_at_front: bool,
+    producer_completed: bool,
+) -> bool {
+    matches!(graph, InitGraph::V25G83)
+        && Arm::from_param(value).covers_waiter()
+        && wait_at_front
+        && producer_completed
+}
+
+/// Whether the selected boot arm permits a work notification for a compute
+/// queue whose front item is a type-4 wait naming this completion batch.
+pub(crate) fn selected_for_waiter(
+    graph: InitGraph,
+    wait_at_front: bool,
+    producer_completed: bool,
+) -> bool {
+    waiter_decision(
+        module_parameters::g16_completion_rekick_arm.value(),
+        graph,
+        wait_at_front,
+        producer_completed,
+    )
+}
+
 #[kunit_tests(asahi_g17_completion_rekick)]
 mod tests {
     use super::*;
 
     #[test]
     fn baseline_and_invalid_arms_never_rekick() {
-        for value in [0, 4, u8::MAX] {
+        for value in [0, 5, u8::MAX] {
             assert!(!decision(
                 value,
                 InitGraph::V25G83,
@@ -92,6 +126,7 @@ mod tests {
                 true,
                 true
             ));
+            assert!(!waiter_decision(value, InitGraph::V25G83, true, true));
             assert!(!decision(
                 value,
                 InitGraph::V25G83,
@@ -110,6 +145,8 @@ mod tests {
         assert!(decision(2, InitGraph::V25G83, Engine::Render, true, true));
         assert!(decision(3, InitGraph::V25G83, Engine::Compute, true, true));
         assert!(decision(3, InitGraph::V25G83, Engine::Render, true, true));
+        assert!(!decision(4, InitGraph::V25G83, Engine::Compute, true, true));
+        assert!(!decision(4, InitGraph::V25G83, Engine::Render, true, true));
     }
 
     #[test]
@@ -125,6 +162,18 @@ mod tests {
     fn other_firmware_graphs_are_unchanged() {
         for engine in [Engine::Compute, Engine::Render] {
             assert!(!decision(3, InitGraph::G17P, engine, true, true));
+        }
+        assert!(!waiter_decision(4, InitGraph::G17P, true, true));
+    }
+
+    #[test]
+    fn waiter_arm_requires_front_wait_and_matching_completion() {
+        assert!(waiter_decision(4, InitGraph::V25G83, true, true));
+        assert!(!waiter_decision(4, InitGraph::V25G83, false, true));
+        assert!(!waiter_decision(4, InitGraph::V25G83, true, false));
+        assert!(!waiter_decision(4, InitGraph::V25G83, false, false));
+        for value in 0..=3 {
+            assert!(!waiter_decision(value, InitGraph::V25G83, true, true));
         }
     }
 }
