@@ -20,6 +20,9 @@ parser.add_argument('--kernel-root', type=Path, default=ROOT,
 args = parser.parse_args()
 DTB, ROOT = args.dtb, args.kernel_root.resolve()
 source = (ROOT / 'drivers/iommu/apple-dart.c').read_text()
+t8132 = (ROOT / 'include/linux/soc/apple/t8132.h').read_text()
+air = t8132[t8132.index('static inline bool apple_t8132_air('):]
+air = air[:air.index('\n}\n') + 3]
 
 
 def property(node, name, kind='s'):
@@ -77,8 +80,10 @@ static bool board, soc, bypassed;
 static unsigned int checks;
 static bool of_machine_is_compatible(const char *s) {
     if (!strcmp(s,"apple,j713")) return board;
+    if (!strcmp(s,"apple,j715")) return false;
     assert(!strcmp(s,"apple,t8132")); return soc;
 }
+AIR_HELPER
 static bool of_device_is_compatible(const struct device_node *n,const char *s) {
     for(unsigned int i=0;i<n->count;i++) if(!strcmp(n->compatible[i],s))return true;
     return false;
@@ -127,6 +132,7 @@ int main(void) {
 }
 '''
 for name, value in {
+    'AIR_HELPER': air,
     'RADIO_EXPRESSION': radio, 'MTP_EXPRESSION': mtp, 'IRQ_EXPRESSION': irq,
     'IRQ_EXPECTED': '(display||radio)' if 'preserve_display' in irq else 'radio',
     'RADIO_COMPAT': radio_compat, 'MTP_COMPAT': mtp_compat,

@@ -2990,6 +2990,27 @@ struct macaudio_platform_cfg macaudio_j713_cfg = {
 };
 
 /*
+ * J715 (T8132, MacBook Air 15" M4): the same stream with six SN012776 amps,
+ * two woofers and a tweeter per side, on all six playback and twelve sense
+ * slots. The speakers stay at their safe level as on the J713.
+ */
+struct macaudio_platform_cfg macaudio_j715_cfg = {
+	.enable_speakers = true,
+	.amp = AMP_SN012776,
+	.speakers = SPKR_2W1T,
+	.stereo = true,
+	.safe_vol = -20,
+	.fe_dai_names = { "j616-pcm-0", "j616-pcm-1", "j616-pcm-2" },
+	.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
+		   SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
+	.secondary_bclk_ratio = 250,
+	.fe_cpu_is_platform = true,
+	/* No headphone codec on this card: the jack is a card of its own. */
+	.route_only_fes = BIT(0),
+	.speaker_fe_channels = 6,
+};
+
+/*
  * The J614s and J616s headphone jack, a card of its own: a CS42L84 on the
  * AOP's "jack" back-end, which the firmware runs on MCA cluster 2 as a 64-SCLK
  * frame at 48 kHz (3.072 MHz, the primary front-end's ratio) with a
@@ -3083,6 +3104,9 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j873-macaudio", .data = &macaudio_j873_cfg },
 	/* j813    AID?    sn012776    15      2x 1W+1T (AOP-fed, V/I sense) */
 	{ .compatible = "apple,j813-macaudio", .data = &macaudio_j813_cfg },
+	/* j715    -       sn012776    15      2x 2W+1T (AOP-fed, one serializer) */
+	{ .compatible = "apple,j715-macaudio", .data = &macaudio_j715_cfg },
+	{ .compatible = "apple,j715-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* Fallback, jack only */
 	{ .compatible = "apple,macaudio"},
 	{ }
