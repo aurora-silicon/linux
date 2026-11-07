@@ -18,7 +18,13 @@ pub(super) const TIMEOUT_MS: kernel::time::Msecs = super::timeout::POLL_MS;
 /// `RENDER_DEPTH` commands. A deeper scheduler would only park run_job in
 /// admission until a retirement; the scheduler waits for the credit instead.
 const RENDER_CREDITS: u32 = crate::hw::t8140::queues::RENDER_DEPTH as u32;
-const COMPUTE_CREDITS: u32 = 16;
+const COMPUTE_CREDITS: u32 = crate::hw::t8140::queues::COMPUTE_DEPTH as u32;
+/// drm_sched deduplicates a job's dependencies by fence context with a scan of
+/// all earlier ones per add. Completion fences each own a context, so a command
+/// behind a long frontier (about 120 of them under Astro Bot) made every submit
+/// quadratic, about 1 ms of CPU. Past this many, the scheduler waits on one
+/// merged fence instead: the same wait, while status checks keep each fence.
+const MERGED_DEPENDENCIES: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Engine {
@@ -463,8 +469,12 @@ impl<B: Backend> Scheduler<B> {
                 packet: packet.clone(),
             },
         )?;
-        for dependency in dependencies {
-            job.add_dependency(dependency)?;
+        if dependencies.len() > MERGED_DEPENDENCIES {
+            job.add_dependency(super::sync_input::merge(&dependencies)?)?;
+        } else {
+            for dependency in dependencies {
+                job.add_dependency(dependency)?;
+            }
         }
         let mut job = job.arm();
         packet.completion.mark_accepted();
