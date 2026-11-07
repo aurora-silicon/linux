@@ -15,6 +15,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/soc/apple/pmgr-pwrstate.h>
 #include <linux/scatterlist.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
@@ -391,8 +392,31 @@ static void ane_h16_genpd_record(struct ane_h16_device *h)
  * cleared heap tail and fresh RTKit state. With @verify, the cpu, mpm, td and
  * base domains must each have reported an OFF transition, so the CPU and the
  * engine were reset. The first domain, sys, is their parent and stays on at
- * runtime while another consumer holds it; it goes off only in system sleep.
+ * runtime under the DARTs, so with @verify it is then power cycled on its own
+ * (ane_h16_sys_cycle()); in system sleep it goes off with the others.
  */
+/*
+ * Power the sys domain (the first, the parent of the other four) off and on
+ * again. At runtime the ANE DARTs, which sit in it, hold it on, so it stays
+ * on across a runtime power cycle of the other four. A firmware startup stall
+ * on the J616s survives that, and is cleared once sys is off too, as it is in
+ * system sleep. The DARTs keep their SID0 state across it, as they do across
+ * system sleep (the ANE DART's suspend and resume neither save nor restore).
+ */
+static int ane_h16_sys_cycle(struct ane_h16_device *h)
+{
+	struct device_node *np = of_parse_phandle(h->dev->of_node, "power-domains", 0);
+	int ret;
+
+	if (!np)
+		return -ENODEV;
+	ret = apple_pmgr_ps_cycle(np);
+	of_node_put(np);
+	if (ret)
+		dev_err(h->dev, "H16 ANE: sys domain power cycle failed, error %d\n", ret);
+	return ret;
+}
+
 static int ane_h16_power_cycle(struct ane_h16_device *h, bool verify)
 {
 	struct ane_h16_boot *b = &h->boot;
@@ -413,6 +437,13 @@ static int ane_h16_power_cycle(struct ane_h16_device *h, bool verify)
 			/* Powered again, so the quarantine can read its evidence. */
 			ret = ane_h16_power_up(h);
 			return ret ?: -EIO;
+		}
+	}
+	if (verify) {
+		ret = ane_h16_sys_cycle(h);
+		if (ret) {
+			ret = ane_h16_power_up(h) ?: ret;
+			return ret;
 		}
 	}
 	ret = ane_h16_power_up(h);
