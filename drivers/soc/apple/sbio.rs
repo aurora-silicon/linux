@@ -639,6 +639,15 @@ impl SepData {
         self.paused_at_ns.store(0, Relaxed);
     }
 
+    /// Names why a verify capture did not count, in the poll's `guidance`
+    /// that comes with its `SEP_BIO_STATUS_RETRY`: PLACE when no finger came,
+    /// CENTER for partial contact, LIFT_AND_MOVE for a bad frame.
+    /// The failed result that follows wakes the poller.
+    fn retry_cause(&self, cause: bio::Guidance) {
+        let epoch = self.capture_epoch.load(Relaxed);
+        let _ = bio::capture_guide(&mut self.bio_session.lock(), epoch, cause);
+    }
+
     /// Waits until the finger of the last touch is off the sensor, so that the
     /// next capture takes a new touch and not the resting finger. macOS arms
     /// the next capture within 2 ms of the lift; a finger lifted before the
@@ -672,9 +681,7 @@ impl SepData {
             // Lifted: the sensor stopped imaging (idle, or armed for a new
             // finger) and its finger detector is clear. macOS reads the same
             // status (state 0, flags 0x0c) at the lift interrupt.
-            let lifted = st.state == sensor::STATE_NEEDS_PATCH
-                || (matches!(st.state, sensor::STATE_IDLE | sensor::STATE_ARMED)
-                    && !st.finger_present());
+            let lifted = st.finger_off();
             if first.is_none() {
                 first = Some(st.raw);
             }
@@ -2531,7 +2538,8 @@ impl SepData {
             CaptureWait::Timeout => {
                 dev_warn!(self.dev, "verify: the capture ended without a frame\n");
                 // No finger came: nothing was compared, so ask again rather
-                // than report an error.
+                // than report an error. PLACE names the cause.
+                self.retry_cause(bio::Guidance::Place);
                 return bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY);
             }
             CaptureWait::Fault(state) => {
@@ -2568,6 +2576,7 @@ impl SepData {
                     sent,
                     computed
                 );
+                self.retry_cause(bio::Guidance::LiftAndMove);
                 return bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY);
             }
             Err(sensor::CaptureError::Length(n)) => {
@@ -2576,6 +2585,7 @@ impl SepData {
                     "verify: the sensor advertised an unusable frame length {}\n",
                     n
                 );
+                self.retry_cause(bio::Guidance::LiftAndMove);
                 return bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY);
             }
             Err(sensor::CaptureError::Bus(e)) => {
@@ -2637,6 +2647,7 @@ impl SepData {
                 self.dev,
                 "verify: the image is not usable for matching (partial contact)\n"
             );
+            self.retry_cause(bio::Guidance::Center);
             return bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY);
         }
 
@@ -2780,14 +2791,15 @@ impl SepData {
                         break Some(Ok(()));
                     }
                 }
-                ImageOutcome::Retry => {
+                ImageOutcome::Retry(cause) => {
                     counter = counter.saturating_add(1);
-                    // The capture did not take (partial/unusable contact). Nudge
-                    // the person to hold still and press again rather than
-                    // silently re-capturing with no feedback.
-                    if bio::capture_guide(
-                        &mut self.bio_session.lock(), self.capture_epoch.load(Relaxed),
-                        bio::Guidance::HoldStill,
+                    // The capture did not count. Report it once with its cause
+                    // (SEP_BIO_STATUS_RETRY in the poll), so userspace can say
+                    // why instead of re-capturing with no feedback.
+                    if bio::enrol_retry(
+                        &mut self.bio_session.lock(),
+                        self.capture_epoch.load(Relaxed),
+                        cause,
                     ) {
                         self.bio_wake();
                     }
@@ -3675,7 +3687,7 @@ impl SepData {
                     sent,
                     computed
                 );
-                return ImageOutcome::Retry;
+                return ImageOutcome::Retry(bio::Guidance::LiftAndMove);
             }
             Err(sensor::CaptureError::Length(n)) => {
                 dev_warn!(
@@ -3684,7 +3696,7 @@ impl SepData {
                     counter,
                     n
                 );
-                return ImageOutcome::Retry;
+                return ImageOutcome::Retry(bio::Guidance::LiftAndMove);
             }
             Err(sensor::CaptureError::Bus(e)) => {
                 dev_err!(self.dev, "enrol: reading the frame of capture {} failed ({:?})\n", counter, e);
@@ -3739,7 +3751,12 @@ impl SepData {
         }
         let usable = assessment[crate::sbio::ASSESS_USABLE_ENROL] != 0;
         if !usable {
-            return ImageOutcome::Retry;
+            dev_info!(
+                self.dev,
+                "enrol: capture {} is not usable for enrolment (partial contact)\n",
+                counter
+            );
+            return ImageOutcome::Retry(bio::Guidance::Center);
         }
 
         let Some(result) = self.sbio_enrol_step(&crate::sbio::sbio_enrolment_result()) else {

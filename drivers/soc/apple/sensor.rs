@@ -774,19 +774,34 @@ pub(crate) fn status() -> Result<Status> {
     // SAFETY: both buffers are `STATUS_XFER_LEN` bytes and live across the call.
     check(unsafe { sep_sensor_xfer(tx.as_ptr().cast(), rx.as_mut_ptr().cast(), STATUS_XFER_LEN) })?;
 
-    let mut raw = [0u8; STATUS_LEN];
-    raw.copy_from_slice(&rx[STATUS_AT..STATUS_AT + STATUS_LEN]);
+    Ok(Status::parse(&rx))
+}
 
-    Ok(Status {
-        state: rx[STATUS_STATE],
-        offset12: u32::from_le_bytes([
-            rx[STATUS_COUNT],
-            rx[STATUS_COUNT + 1],
-            rx[STATUS_COUNT + 2],
-            rx[STATUS_COUNT + 3],
-        ]),
-        raw,
-    })
+impl Status {
+    /// Decodes the 23 bytes a GET_STATUS transfer reads back.
+    fn parse(rx: &[u8; STATUS_XFER_LEN]) -> Status {
+        let mut raw = [0u8; STATUS_LEN];
+        raw.copy_from_slice(&rx[STATUS_AT..STATUS_AT + STATUS_LEN]);
+
+        Status {
+            state: rx[STATUS_STATE],
+            offset12: u32::from_le_bytes([
+                rx[STATUS_COUNT],
+                rx[STATUS_COUNT + 1],
+                rx[STATUS_COUNT + 2],
+                rx[STATUS_COUNT + 3],
+            ]),
+            raw,
+        }
+    }
+
+    /// No finger is on the sensor: it is idle or armed for a finger, and its
+    /// finger detector is clear. After PAUSE_CAPTURE this is the lift. A
+    /// sensor that needs its patch counts too, so the capture reports it.
+    pub(crate) fn finger_off(&self) -> bool {
+        self.state == STATE_NEEDS_PATCH
+            || (matches!(self.state, STATE_IDLE | STATE_ARMED) && !self.finger_present())
+    }
 }
 
 pub(crate) struct Capture(KVec<u8>);
@@ -853,4 +868,87 @@ pub(crate) fn read_capture(length: u32) -> core::result::Result<Capture, Capture
     }
 
     Ok(Capture(buf))
+}
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[::kernel::macros::kunit_tests(apple_sep_sensor_status)]
+mod status_tests {
+    use super::*;
+
+    // GET_STATUS replies the J700 sensor gave macOS 26.6.2, read from the
+    // AppleBiometricSensor unified log of our own traces
+    // (traces/touchid/20261107-macos-ident, an LA prompt with three misses
+    // and a match; and a Setup Assistant enrolment). Each is paired with what
+    // macOS's driver concluded: finger on, or finger off / no finger.
+    const fn rx(state: u8, sub: u8, flags: u8, tail: [u8; 4]) -> [u8; STATUS_XFER_LEN] {
+        [
+            0, 0, 0, 0, 0, 0, 0, 0x80, 0x20, 0, 0x10, 0, 0, 0, state, sub, 0xa1, 0, flags, tail[0],
+            tail[1], tail[2], tail[3],
+        ]
+    }
+    const IDENT: [u8; 4] = [0x56, 0x33, 0x02, 0x02];
+    const IDLE_LIFTED: [u8; STATUS_XFER_LEN] = rx(0x00, 0x00, 0x0c, IDENT);
+    const IDLE_AFTER_IDLE_CMD: [u8; STATUS_XFER_LEN] = rx(0x00, 0x00, 0x5c, IDENT);
+    const ARMED_EMPTY: [u8; STATUS_XFER_LEN] = rx(0x11, 0x06, 0x0c, [0, 0, 0, 0]);
+    const ARMED_FINGER: [u8; STATUS_XFER_LEN] = rx(0x11, 0x02, 0x0e, [0x80, 0, 0, 0x80]);
+    const FINGER_ON: [u8; STATUS_XFER_LEN] = rx(0x13, 0x00, 0x0e, [0, 0, 0, 0]);
+    const FRAME_READY: [u8; STATUS_XFER_LEN] = rx(0x07, 0x00, 0x8e, [0, 0x72, 0, 0]);
+    const IMAGING: [u8; STATUS_XFER_LEN] = rx(0x16, 0x03, 0x0e, [0x04, 0x06, 0x18, 0x1d]);
+
+    #[test]
+    fn decodes_the_statuses_macos_saw() {
+        for (bytes, off) in [
+            (IDLE_LIFTED, true),
+            (IDLE_AFTER_IDLE_CMD, true),
+            (ARMED_EMPTY, true),
+            (ARMED_FINGER, false),
+            (FINGER_ON, false),
+            (FRAME_READY, false),
+            (IMAGING, false),
+        ] {
+            let st = Status::parse(&bytes);
+            assert_eq!(st.finger_off(), off);
+            assert_eq!(st.finger_present(), !off);
+        }
+        assert_eq!(Status::parse(&FRAME_READY).available(), Some(0x7200));
+        assert_eq!(Status::parse(&ARMED_EMPTY).available(), None);
+        assert_eq!(Status::parse(&FINGER_ON).state, STATE_READING);
+    }
+
+    // Prompt 1 of the 17:32 trace, status by status: three touches, each
+    // paused after its frames, then lifted. A lift detector that arms on the
+    // first finger_off() after a touch must fire exactly where macOS logged
+    // FingerOFF and re-armed (07.042, 08.537, 09.910), never on a frame.
+    #[test]
+    fn replays_three_back_to_back_touches() {
+        let seq = [
+            (FINGER_ON, false),   // 06.356 touch 1 lands
+            (FRAME_READY, false), // 06.437 .. 06.702 frames (match + tail)
+            (FRAME_READY, false),
+            (IDLE_LIFTED, true),  // 07.042 lift -> START_CAPTURE
+            (ARMED_EMPTY, false), // 07.043 armed, waiting
+            (FINGER_ON, false),   // 07.728 touch 2
+            (FRAME_READY, false),
+            (IDLE_LIFTED, true),  // 08.537 lift
+            (ARMED_EMPTY, false),
+            (FINGER_ON, false),   // 09.077 touch 3
+            (FRAME_READY, false),
+            (IDLE_LIFTED, true),  // 09.910 lift
+        ];
+        let mut touched = false;
+        let mut lifts = 0;
+        for (bytes, macos_lift) in seq {
+            let st = Status::parse(&bytes);
+            let lift = touched && st.finger_off();
+            assert_eq!(lift, macos_lift);
+            if st.finger_present() {
+                touched = true;
+            }
+            if lift {
+                touched = false;
+                lifts += 1;
+            }
+        }
+        assert_eq!(lifts, 3);
+    }
 }

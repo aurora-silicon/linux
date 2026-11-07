@@ -354,7 +354,8 @@ enum ImageOutcome {
         complete: bool,
         has_template: bool,
     },
-    Retry,
+    // The capture did not count; the guidance says why.
+    Retry(bio::Guidance),
     NoFinger,
     Failed(u32),
 }
@@ -419,6 +420,7 @@ static_assert!(ENROL_STATUS_UNFILED != ENROL_STATUS_TIMEOUT);
 static_assert!(ENROL_STATUS_UNFILED != ENROL_STATUS_TOO_MANY);
 
 const ENROL_STATUS_RETRY: u32 = 5;
+static_assert!(bio::ENROL_POLL_RETRY == ENROL_STATUS_RETRY);
 // 7 is SEP_BIO_STATUS_REJECTED in libfprint's aurora driver.
 // The enclave stopped matching after too many failed attempts. Only a
 // password authentication, through /dev/sep-bio-rearm, makes it match again.

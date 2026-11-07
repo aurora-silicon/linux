@@ -48,6 +48,10 @@ pub(crate) enum Guidance {
     HoldStill = 3,
     // The last touch's finger is still down; the next capture waits for it.
     Lift = 4,
+    // A cause reported with a retry (an unusable capture): partial contact,
+    // rest more of the finger on the middle of the sensor. The UAPI also
+    // names TOO_FAST (6) and CLEAN (7) for the image-assessment feedback.
+    Center = 5,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -71,6 +75,9 @@ const TOKEN_LIFETIME_NS: u64 = 10 * 1_000_000_000;
 const SUSPEND_SLACK_NS: u64 = 1_000_000;
 
 const STATUS_LOCAL: u32 = 0;
+/// `SEP_BIO_STATUS_RETRY` in a running enrolment's poll: the latest capture
+/// did not count; `guidance` says why.
+pub(crate) const ENROL_POLL_RETRY: u32 = 5;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -502,6 +509,8 @@ pub(crate) struct Session {
     op: Op,
     unseen: bool,
     enrol_stage_unseen: bool,
+    // An enrolment capture was not usable; the next poll reports it once.
+    enrol_retry_unseen: bool,
     token: Option<ResultToken>,
 }
 
@@ -514,6 +523,7 @@ impl Session {
             op: Op::Idle,
             unseen: false,
             enrol_stage_unseen: false,
+            enrol_retry_unseen: false,
             token: None,
         }
     }
@@ -524,6 +534,7 @@ impl Session {
         self.op = Op::Idle;
         self.unseen = false;
         self.enrol_stage_unseen = false;
+        self.enrol_retry_unseen = false;
         self.token = None;
     }
 
@@ -741,6 +752,7 @@ fn enrol_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     };
     ctx.session.unseen = false;
     ctx.session.enrol_stage_unseen = false;
+    ctx.session.enrol_retry_unseen = false;
     Ok(Handled {
         ret: 0,
         wake: false,
@@ -775,6 +787,24 @@ pub(crate) fn enrol_advance(
             *guidance = guide;
             session.unseen = true;
             session.enrol_stage_unseen = true;
+            return true;
+        }
+    }
+    false
+}
+
+/// An enrolment capture was not usable: the enrolment goes on, and the next
+/// poll reports `ENROL_POLL_RETRY` once with the cause in `guidance`, so
+/// userspace can say why the touch did not count.
+pub(crate) fn enrol_retry(session: &mut Session, epoch: u64, cause: Guidance) -> bool {
+    if !worker_is_current(session, epoch) {
+        return false;
+    }
+    if let Op::Enrol { terminal, guidance, .. } = &mut session.op {
+        if terminal.is_none() {
+            *guidance = cause;
+            session.unseen = true;
+            session.enrol_retry_unseen = true;
             return true;
         }
     }
@@ -875,6 +905,9 @@ fn enrol_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
                         State::Progress
                     } else {
                         State::Pending
+                    };
+                    if ctx.session.enrol_retry_unseen {
+                        out.status = ENROL_POLL_RETRY;
                     }
                 }
                 Some(EnrolOutcome::Failed(status)) => {
@@ -894,6 +927,7 @@ fn enrol_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
         .write(&out)?;
     ctx.session.unseen = false;
     ctx.session.enrol_stage_unseen = false;
+    ctx.session.enrol_retry_unseen = false;
     ok()
 }
 
