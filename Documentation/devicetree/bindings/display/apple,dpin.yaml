@@ -17,10 +17,14 @@ select:
     compatible:
       contains:
         enum:
+          - apple,t6020-dpin
+          - apple,t6021-dpin
+          - apple,t6022-dpin
           - apple,t6030-dpin
           - apple,t6031-dpin
           - apple,t6032-dpin
           - apple,t6041-dpin
+          - apple,t8112-dpin
           - apple,t8122-dpin
           - apple,t8132-dpin
   required:
@@ -92,9 +96,13 @@ allOf:
                       - const: apple,dpin
                   - items:
                       - enum:
-                          - apple,t8122-dpin
+                          - apple,t6020-dpin
+                          - apple,t6021-dpin
+                          - apple,t6022-dpin
                           - apple,t6030-dpin
                           - apple,t6031-dpin
+                          - apple,t8112-dpin
+                          - apple,t8122-dpin
                       - const: apple,dpin
 
               reg:

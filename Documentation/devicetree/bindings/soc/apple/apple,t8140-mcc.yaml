@@ -20,10 +20,14 @@ select:
     compatible:
       contains:
         enum:
+          - apple,t6020-mcc
+          - apple,t6021-mcc
+          - apple,t6022-mcc
           - apple,t6030-mcc
           - apple,t6031-mcc
           - apple,t6032-mcc
           - apple,t6041-mcc
+          - apple,t8112-mcc
           - apple,t8122-mcc
           - apple,t8132-mcc
           - apple,t8140-mcc
@@ -74,9 +78,13 @@ allOf:
                 - const: apple,t8140-mcc
             - items:
                 - enum:
-                    - apple,t8122-mcc
+                    - apple,t6020-mcc
+                    - apple,t6021-mcc
+                    - apple,t6022-mcc
                     - apple,t6030-mcc
                     - apple,t6031-mcc
+                    - apple,t8112-mcc
+                    - apple,t8122-mcc
                 - const: apple,mcc
 
         reg:

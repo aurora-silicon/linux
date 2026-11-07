@@ -24,10 +24,14 @@ select:
     compatible:
       contains:
         enum:
+          - apple,t6020-jpeg
+          - apple,t6021-jpeg
+          - apple,t6022-jpeg
           - apple,t6030-jpeg
           - apple,t6031-jpeg
           - apple,t6032-jpeg
           - apple,t6041-jpeg
+          - apple,t8112-jpeg
           - apple,t8122-jpeg
           - apple,t8132-jpeg
           - apple,t8140-jpeg
@@ -129,9 +133,13 @@ allOf:
                       - apple,t8140-jpeg
                   - items:
                       - enum:
-                          - apple,t8122-jpeg
+                          - apple,t6020-jpeg
+                          - apple,t6021-jpeg
+                          - apple,t6022-jpeg
                           - apple,t6030-jpeg
                           - apple,t6031-jpeg
+                          - apple,t8112-jpeg
+                          - apple,t8122-jpeg
                       - const: apple,jpeg
 
               reg:
