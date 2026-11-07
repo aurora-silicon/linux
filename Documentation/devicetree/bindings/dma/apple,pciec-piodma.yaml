@@ -21,9 +21,13 @@ properties:
           - const: apple,pciec-piodma
       - items:
           - enum:
-              - apple,t8122-pciec-piodma
+              - apple,t6020-pciec-piodma
+              - apple,t6021-pciec-piodma
+              - apple,t6022-pciec-piodma
               - apple,t6030-pciec-piodma
               - apple,t6031-pciec-piodma
+              - apple,t8112-pciec-piodma
+              - apple,t8122-pciec-piodma
           - const: apple,pciec-piodma
 
   reg:
