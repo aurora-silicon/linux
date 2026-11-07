@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 %YAML 1.2
 ---
-$id: "http://devicetree.org/schemas/display/apple,dcp-expert.yaml#"
-$schema: "http://devicetree.org/meta-schemas/core.yaml#"
-title: "Apple display engine control and status windows"
+$id: http://devicetree.org/schemas/display/apple,dcp-expert.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+title: Apple display engine control and status windows
 maintainers:
-  - "Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>"
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
 select:
   properties:
     compatible:
@@ -13,36 +13,40 @@ select:
         -
           contains:
             enum:
-              - "apple,t8142-dcp-expert"
-              - "apple,t8152-dcp-expert"
-              - "apple,t6050-dcp-expert"
+              - apple,t8142-dcp-expert
+              - apple,t8152-dcp-expert
+              - apple,t6050-dcp-expert
         -
           contains:
-            const: "apple,dcp-expert"
+            const: apple,dcp-expert
   required:
-    - "compatible"
-description: "Apple display engine control and status windows. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+    - compatible
+description: |
+  Apple display engine control and status windows. Initial resource description for an unsupported
+  firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This
+  form must stay disabled; it does not substitute for the enabled driver contract or supply firmware,
+  calibration, programming sequences or unresolved providers.
 properties:
   compatible:
     items:
       -
         enum:
-          - "apple,t8142-dcp-expert"
-          - "apple,t8152-dcp-expert"
-          - "apple,t6050-dcp-expert"
+          - apple,t8142-dcp-expert
+          - apple,t8152-dcp-expert
+          - apple,t6050-dcp-expert
       -
-        const: "apple,dcp-expert"
+        const: apple,dcp-expert
   status:
-    const: "disabled"
+    const: disabled
   reg:
-    description: "Register apertures of the complete hardware complex, in hardware interface order."
+    description: Register apertures of the complete hardware complex, in hardware interface order.
     minItems: 3
     maxItems: 13
   interrupts:
-    description: "Interrupt lines wired to the system interrupt controller."
+    description: Interrupt lines wired to the system interrupt controller.
     maxItems: 1
 required:
-  - "compatible"
-  - "reg"
-  - "status"
+  - compatible
+  - reg
+  - status
 additionalProperties: false
