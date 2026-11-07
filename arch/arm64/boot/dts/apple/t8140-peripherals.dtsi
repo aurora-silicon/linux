@@ -607,7 +607,7 @@
 	battery_monitor: battery-monitor {
 		compatible = "apple,t8140-battery-monitor", "apple,battery-monitor";
 		interrupt-parent = <&nub_spmi0>;
-		interrupts = <12 IRQ_TYPE_LEVEL_HIGH>;
+		interrupts = <12 IRQ_TYPE_EDGE_RISING>;
 		status = "disabled";
 	};
 };
@@ -632,8 +632,6 @@
 	xspmi_controller: spmi-proxy-controller@348614000 {
 		compatible = "apple,t8140-xspmi-controller", "apple,xspmi-controller";
 		reg = <0x3 0x48614000 0x0 0x4000>;
-		apple,read-queue-depth = <256>;
-		apple,write-queue-depth = <256>;
 		apple,response-vector = <256>;
 		status = "disabled";
 	};

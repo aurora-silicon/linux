@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
-"""Check DMA references against provider geometry in compiled board DTBs.
+"""Check DMA geometry and SPMI interrupt references in compiled board DTBs.
 
 Run on the buildbox after compiling the boards. dt-schema validates each
 node's shape; this checks the cross-node channel bounds, including disabled
@@ -58,6 +58,7 @@ def check(path):
         if "phandle" in props:
             providers[cells(props["phandle"])[0]] = (name, props)
     references = 0
+    spmi_interrupts = 0
     for name, props in nodes.items():
         specifiers = cells(props.get("dmas", b""))
         offset = 0
@@ -79,7 +80,28 @@ def check(path):
                     f"{capacity[0]} logical channels"
                 )
             references += 1
-    print(f"{path.name}: {references} DMA references within provider geometry")
+        interrupt_parent = props.get("interrupt-parent")
+        if interrupt_parent and "interrupts" in props:
+            phandle, = cells(interrupt_parent)
+            if phandle not in providers:
+                raise ValueError(f"{name}: interrupt provider {phandle} is absent")
+            provider_name, provider = providers[phandle]
+            compatible = provider.get("compatible", b"").split(b"\0")
+            if b"apple,t8103-spmi" in compatible:
+                specifiers = cells(props["interrupts"])
+                if len(specifiers) % 2:
+                    raise ValueError(f"{name}: malformed SPMI interrupt specifier")
+                for offset in range(0, len(specifiers), 2):
+                    # spmi-apple-controller.c accepts IRQ_TYPE_EDGE_RISING only.
+                    if specifiers[offset + 1] != 1:
+                        raise ValueError(
+                            f"{name}: {provider_name} supports rising-edge interrupts only"
+                        )
+                    spmi_interrupts += 1
+    print(
+        f"{path.name}: {references} DMA references within provider geometry; "
+        f"{spmi_interrupts} SPMI interrupt specifiers supported by the controller"
+    )
 
 
 if __name__ == "__main__":
