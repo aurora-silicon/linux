@@ -176,15 +176,23 @@ struct sep_bio_attest {
 struct sep_bio_lockout {
 	__u32 locked;    /* 1 while every verify is refused */
 	__u32 failures;  /* failed matches since the last match or re-arm */
-	__u32 reserved[2];
+	__u32 reserved;
+	__u32 flags;     /* SEP_BIO_LOCKOUT_FLAG_*; zero from older kernels */
 };
+
+/*
+ * SEP_BIO_REARM never waits for a capture while Touch ID is not locked, and
+ * then clears pending failed attempts: call it after every verified password.
+ * Without this flag, call it only while 'locked'.
+ */
+#define SEP_BIO_LOCKOUT_FLAG_EVERY_PASSWORD 1
 
 #define SEP_BIO_LOCKOUT_STATE _IOR(SEP_BIO_IOC_MAGIC, 0x0e, struct sep_bio_lockout)
 /*
  * Ends a lockout. Call it only once the user's password has been verified:
  * the password is used once to unwrap the Linux-owned FV re-arm record and is
- * wiped after the request. Needs CAP_SYS_ADMIN. Without a lockout it does
- * nothing.
+ * wiped after the request. Needs CAP_SYS_ADMIN. Without a lockout it clears
+ * the failed attempts (see SEP_BIO_LOCKOUT_FLAG_EVERY_PASSWORD).
  */
 #define SEP_BIO_REARM_SECRET_MAX 1024
 struct sep_bio_rearm {

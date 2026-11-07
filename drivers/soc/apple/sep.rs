@@ -781,6 +781,10 @@ struct SepData {
     // Failed matches since the last match or re-arm, across prompts.
     bio_nomatch_streak: Atomic<u32>,
 
+    // A password cleared the failed attempts while a capture held the sensor
+    // lock; the enclave's own count is cleared at the next authentication.
+    enclave_failures_owed: Atomic<bool>,
+
     // Opens of the Touch ID device. One open is one prompt: fprintd claims
     // the device for one PAM authentication.
     bio_open_gen: Atomic<u64>,
@@ -1054,6 +1058,7 @@ impl SepData {
                 bio_lockout: Atomic::new(false),
                 bio_lockout_logged: Atomic::new(false),
                 bio_nomatch_streak: Atomic::new(0),
+                enclave_failures_owed: Atomic::new(false),
                 bio_open_gen: Atomic::new(0),
                 match_scope_gen: Atomic::new(0),
                 match_scope_touches: Atomic::new(0),
