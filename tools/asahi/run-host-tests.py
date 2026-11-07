@@ -153,6 +153,9 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('ack-clobber', 'arm-ack', 'offset-seconds',
                                    'offset-sign', 'event-bit', 'wrong-base'), out()),
     'qspi-nvram-tests.py': [(out('--output'), PASS)],
+    'rtkit-crashlog-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('buffer-header', 'section-header', 'section-size', 'footer-room',
+                                   'mailbox-minimum', 'version-string', 'message-string'), out()),
     'rtkit-oslog-tests.py': [(out(), PASS)]
         + mutations('--mutate', ('admission', 'channel', 'counter', 'reset', 'buffer'), out()),
     't6030-clock-tests.py': [(out(), PASS)],
