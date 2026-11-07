@@ -16,12 +16,16 @@ description: |
   state and must not be represented as fixed clocks sampled at one boot.
   The provider remains disabled until a generation-specific clock driver
   can resolve selectors and coordinate ownership with firmware.
+  Selectors are scoped by the referenced PMGR; a dual-die platform has
+  one provider per die.
 
 properties:
   compatible:
     items:
       - enum:
+          - apple,t6000-pmgr-clocks
           - apple,t6041-pmgr-clocks
+          - apple,t8103-pmgr-clocks
           - apple,t8140-pmgr-clocks
           - apple,t8142-pmgr-clocks
       - const: apple,pmgr-clocks
