@@ -575,10 +575,12 @@ int main(void) {
         }
     }
     /* G16S/G17P: pstate unsupported by firmware, utilisation still valid. */
-    current=(struct asahi_qualified_stats){.util_status=1,.pstate_status=3,.tiler=30,.renderer=80,.device=57,.pstate=0};
+    current=(struct asahi_qualified_stats){.util_status=1,.pstate_status=3,.tiler=30,.renderer=80,.device=57,.pstate=0,
+                                          .util_samples=19,.util_host_ns=123};
     agx_stats_show(NULL,&stats.attr,now);
     assert(strstr(now,"utilisation_status valid\nutil_tiler_percent 30\nutil_renderer_percent 80\nutil_device_percent 57\n"
                       "pstate_status unsupported\npstate unsupported\nrequested_frequency_hz unsupported\n"));
+    assert(strstr(now,"utilisation_source firmware-statistics-tag-0x13\nutilisation_samples 19\nutilisation_host_ns 123\n"));
     struct device dev;
     struct asahi_gpu_memory memory={0};
     void *handle=NULL;
