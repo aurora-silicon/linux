@@ -6,6 +6,7 @@ Apple device coverage manifests
 ``arch/arm64/boot/dts/apple/adt-coverage/<soc>-<board>.txt`` inventories ADT
 hardware. Each line gives an ADT device path, translated physical base (or
 ``/bus/path@0xaddress``), and a DT node path, ``MISSING``, or ``WAIVED: reason``.
+For split apertures, a mapped entry may use a secondary register base.
 ``-`` means no usable register address. Duplicate sibling names have a ``~N``
 suffix. Disabled DT nodes count as represented. PMGR table records appear
 under ``pmgr/power-devices`` and ``pmgr/power-domains``.
