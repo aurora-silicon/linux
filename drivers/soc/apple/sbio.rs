@@ -659,6 +659,7 @@ impl SepData {
         let deadline = started.saturating_add(u64::from(LIFT_WAIT_MS) * 1_000_000);
         let mut dropped: u32 = 0;
         let mut told = false;
+        let mut first: Option<[u8; sensor::STATUS_LEN]> = None;
         loop {
             if !bio::capture_is_live(&self.bio_session.lock(), self.capture_epoch.load(Relaxed)) {
                 return false;
@@ -668,20 +669,27 @@ impl SepData {
                 self.forget_finger_lift();
                 return true;
             };
-            let lifted = matches!(
-                st.state,
-                sensor::STATE_IDLE | sensor::STATE_ARMED | sensor::STATE_NEEDS_PATCH
-            );
+            // Lifted: the sensor stopped imaging (idle, or armed for a new
+            // finger) and its finger detector is clear. macOS reads the same
+            // status (state 0, flags 0x0c) at the lift interrupt.
+            let lifted = st.state == sensor::STATE_NEEDS_PATCH
+                || (matches!(st.state, sensor::STATE_IDLE | sensor::STATE_ARMED)
+                    && !st.finger_present());
+            if first.is_none() {
+                first = Some(st.raw);
+            }
             if lifted {
                 self.forget_finger_lift();
                 let now = shim::boottime_ns();
                 dev_info!(
                     self.dev,
-                    "{}: finger off the sensor {} ms after the last touch ended (waited {} ms, {} late frame(s) dropped); arming the capture\n",
+                    "{}: finger off the sensor {} ms after the last touch ended (waited {} ms, {} late frame(s) dropped; status {} then {}); arming the capture\n",
                     what,
                     now.saturating_sub(paused_at) / 1_000_000,
                     now.saturating_sub(started) / 1_000_000,
-                    dropped
+                    dropped,
+                    Hex(&first.unwrap_or(st.raw)),
+                    Hex(&st.raw)
                 );
                 return true;
             }
