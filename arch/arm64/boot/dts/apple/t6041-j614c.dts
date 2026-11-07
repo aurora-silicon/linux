@@ -52,3 +52,5 @@
 &serial0 {
 	reg = <0x4 0x29200000 0 0x4000>;
 };
+
+#include "t6041-j614c-audio.dtsi"

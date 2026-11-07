@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* J773S audio endpoints. Keep the routes and hardware disabled until qualified. */
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+	speaker_sdz: regulator-speaker-sdz {
+		compatible = "regulator-fixed";
+		regulator-name = "speaker-sdz";
+		gpios = <&pinctrl_ap 54 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		status = "disabled";
+	};
+};
+
+&i2c1 {
+	audio_speaker: codec@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		#sound-dai-cells = <0>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		interrupts-extended = <&pinctrl_ap 55 IRQ_TYPE_LEVEL_LOW>;
+		status = "disabled";
+	};
+
+};
+
+&i2c2 {
+	audio_codec_output: codec@4b {
+		compatible = "cirrus,cs42l84";
+		reg = <0x4b>;
+		#sound-dai-cells = <0>;
+		reset-gpios = <&pinctrl_nub 58 GPIO_ACTIVE_HIGH>;
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		status = "disabled";
+	};
+
+};

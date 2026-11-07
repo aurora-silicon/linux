@@ -54,3 +54,5 @@
 /delete-node/ &audio_low_power_mic;
 /delete-node/ &audio_mic_buffer;
 /delete-node/ &audio_listening_client;
+
+#include "t6040-j773s-audio.dtsi"
