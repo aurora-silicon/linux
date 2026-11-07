@@ -14,21 +14,50 @@ description: |
   carry image data and PIODMA transfers. Firmware performance votes are
   not fixed clock rates and are not encoded as clock-frequency values.
 
-select:
-  properties:
-    compatible:
-      contains:
-        enum:
-          - apple,t6041-scaler
-          - apple,t8140-scaler
-          - apple,t8122-scaler
-          - apple,t6030-scaler
-          - apple,t6031-scaler
-  required:
-    - compatible
-
 properties:
-  compatible: true
+  compatible:
+    oneOf:
+      - items:
+          - const: apple,t6041-scaler
+          - const: apple,scaler
+      - items:
+          - const: apple,t8140-scaler
+          - const: apple,scaler
+      - items:
+          - enum:
+              - apple,t8122-scaler
+              - apple,t6030-scaler
+              - apple,t6031-scaler
+          - const: apple,scaler
+
+  reg:
+    minItems: 3
+    maxItems: 4
+
+  interrupts:
+    minItems: 2
+    maxItems: 2
+
+  power-domains:
+    minItems: 1
+    maxItems: 2
+
+  iommus:
+    minItems: 1
+    maxItems: 2
+
+  clocks:
+    maxItems: 1
+
+  resets:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - power-domains
+  - iommus
 
 allOf:
   - if:
@@ -39,82 +68,24 @@ allOf:
               - apple,t8122-scaler
               - apple,t6030-scaler
               - apple,t6031-scaler
-      required:
-        - compatible
     then:
       properties:
-        compatible:
-          items:
-            - enum:
-                - apple,t8122-scaler
-                - apple,t6030-scaler
-                - apple,t6031-scaler
-            - const: apple,scaler
-
         reg:
           minItems: 3
           maxItems: 4
-
-        interrupts:
-          minItems: 2
-          maxItems: 2
-
-        power-domains:
-          minItems: 1
-          maxItems: 2
-
-        iommus:
-          minItems: 1
-          maxItems: 2
-
-      required:
-        - compatible
-        - reg
-        - interrupts
-        - power-domains
-        - iommus
-
     else:
       properties:
-        compatible:
-          oneOf:
-            - items:
-                - const: apple,t6041-scaler
-                - const: apple,scaler
-            - items:
-                - const: apple,t8140-scaler
-                - const: apple,scaler
-
         reg:
           minItems: 4
           maxItems: 4
-          description: Register apertures in hardware-description order.
-
-        interrupts:
-          minItems: 2
-          maxItems: 2
-
         power-domains:
           minItems: 2
           maxItems: 2
-
         iommus:
           minItems: 2
           maxItems: 2
-
-        clocks:
-          maxItems: 1
-
-        resets:
-          maxItems: 1
-
       required:
-        - compatible
-        - reg
-        - interrupts
-        - power-domains
         - resets
-        - iommus
         - clocks
 
-unevaluatedProperties: false
+additionalProperties: false

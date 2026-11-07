@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * Apple DCP firmware 26.6.2 (T8132/J713).
+ * Apple DCP firmware 26.6.2 (T8132/J713, J715).
  *
  * The appledrm component and KMS paths own this controller.  This backend owns
  * only its generation-specific EP37 RPC ABI and retained firmware session.
@@ -55,6 +55,16 @@
 #include "dcp-m4-frame.h"
 #include "parser.h"
 #include "t8132_ext_drm.h"
+
+const struct dcp_m4_profile *dcp_m4_pf = &dcp_m4_profile_j713;
+
+static const struct dcp_m4_profile *dcp_m4_machine_profile(void)
+{
+	for (unsigned int i = 0; i < ARRAY_SIZE(dcp_m4_profiles); i++)
+		if (of_machine_is_compatible(dcp_m4_profiles[i]->machine))
+			return dcp_m4_profiles[i];
+	return NULL;
+}
 
 static unsigned int idle_cache_ms = 1000;
 
@@ -2528,6 +2538,7 @@ int iomfb_m4_init(struct apple_dcp *owner)
 	struct device *dev = owner->dev;
 	struct iomfb_m4 *dcp;
 	struct resource *res;
+	const struct dcp_m4_profile *pf = dcp_m4_machine_profile();
 	const char *uuid;
 	u32 ready = 0;
 	int ret;
@@ -2538,13 +2549,17 @@ int iomfb_m4_init(struct apple_dcp *owner)
 	    (of_property_read_u32(dev->of_node, "apple,t8132-dcpext-firmware-ready", &ready) ||
 	     ready != 1))
 		return dev_err_probe(dev, -ENODEV, "external DCP not handed over\n");
-	if (!of_machine_is_compatible("apple,j713") ||
+	if (!pf ||
 	    (!external && !of_device_is_compatible(dev->of_node, "apple,t8132-dcp")) ||
 	    !iomfb_m4_firmware_property(dev->of_node, "apple,firmware-version") ||
 	    !iomfb_m4_firmware_property(dev->of_node, "apple,firmware-compat") ||
 	    of_property_read_string(dev->of_node, "apple,firmware-uuid", &uuid) ||
 	    strcmp(uuid, "81BAF476-679D-3CC0-8C6A-E6B6FA659D5E"))
 		return dev_err_probe(dev, -ENODEV, "unqualified firmware 26.6.2 handoff\n");
+	/* Refuse before any message, so the boot framebuffer stays. */
+	if (!external && !pf->timing)
+		return dev_err_probe(dev, -ENODEV, "no qualified %s panel timing\n", pf->name);
+	dcp_m4_pf = pf;
 	ret = dcp_m4_dart_check(dev);
 	if (ret)
 		return dev_err_probe(dev, ret, "inherited SID23 domain not qualified\n");

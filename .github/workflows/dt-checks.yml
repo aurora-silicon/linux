@@ -57,10 +57,13 @@ jobs:
 
       - name: CHECK_DTBS and dt_binding_check, base vs head
         env:
-          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
         run: |
           head=$(git rev-parse HEAD)
-          base=$BASE
+          # A pull request is checked out as its merge into the CURRENT base branch tip, which is
+          # HEAD^1 (pull_request.base.sha can be the stale tip from when the PR was opened).
+          if [ "$EVENT" = pull_request ]; then base=$(git rev-parse HEAD^1); else base=$BEFORE; fi
           if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then base=$(git rev-parse HEAD~1); fi
           scripts/dtc/apple-dt-check.sh "$base" "$head" "$RUNNER_TEMP/dt"
 

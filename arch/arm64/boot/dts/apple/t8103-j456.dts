@@ -19,6 +19,7 @@
 
 	aliases {
 		ethernet0 = &ethernet0;
+		sep = &sep;
 	};
 };
 

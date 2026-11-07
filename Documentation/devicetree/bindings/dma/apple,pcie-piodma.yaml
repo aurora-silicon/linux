@@ -13,81 +13,34 @@ description: |
   PCIe auxiliary DMA register banks and completion interrupt. The stream
   is distinct from the PCIe endpoint streams in the same DART.
 
-select:
-  properties:
-    compatible:
-      contains:
-        enum:
-          - apple,t6041-pcie-piodma
-          - apple,t8122-pcie-piodma
-          - apple,t6030-pcie-piodma
-          - apple,t6031-pcie-piodma
-  required:
-    - compatible
-
 properties:
-  compatible: true
-
-allOf:
-  - if:
-      properties:
-        compatible:
-          contains:
-            enum:
+  compatible:
+    oneOf:
+      - items:
+          - const: apple,t6041-pcie-piodma
+          - const: apple,pcie-piodma
+      - items:
+          - enum:
               - apple,t8122-pcie-piodma
               - apple,t6030-pcie-piodma
               - apple,t6031-pcie-piodma
-      required:
-        - compatible
-    then:
-      properties:
-        compatible:
-          items:
-            - enum:
-                - apple,t8122-pcie-piodma
-                - apple,t6030-pcie-piodma
-                - apple,t6031-pcie-piodma
-            - const: apple,pcie-piodma
+          - const: apple,pcie-piodma
 
-        reg:
-          minItems: 3
-          maxItems: 4
+  reg:
+    minItems: 3
+    maxItems: 3
+    description: Register apertures in hardware-description order.
 
-        interrupts:
-          maxItems: 1
+  interrupts:
+    maxItems: 1
 
-        iommus:
-          maxItems: 1
+  iommus:
+    maxItems: 1
 
-      required:
-        - compatible
-        - reg
-        - interrupts
-        - iommus
+required:
+  - compatible
+  - reg
+  - interrupts
+  - iommus
 
-    else:
-      properties:
-        compatible:
-          oneOf:
-            - items:
-                - const: apple,t6041-pcie-piodma
-                - const: apple,pcie-piodma
-
-        reg:
-          minItems: 3
-          maxItems: 3
-          description: Register apertures in hardware-description order.
-
-        interrupts:
-          maxItems: 1
-
-        iommus:
-          maxItems: 1
-
-      required:
-        - compatible
-        - reg
-        - interrupts
-        - iommus
-
-unevaluatedProperties: false
+additionalProperties: false

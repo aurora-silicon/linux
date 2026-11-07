@@ -17,13 +17,14 @@ properties:
   compatible:
     oneOf:
       - items:
-          - const: apple,t6031-aon-ptd
-          - const: apple,aon-ptd
-      - items:
           - const: apple,t6041-aon-ptd
           - const: apple,aon-ptd
       - items:
           - const: apple,t8140-aon-ptd
+          - const: apple,aon-ptd
+      - items:
+          - enum:
+              - apple,t6031-aon-ptd
           - const: apple,aon-ptd
 
   reg:

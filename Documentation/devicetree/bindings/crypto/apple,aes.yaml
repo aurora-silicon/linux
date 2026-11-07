@@ -13,21 +13,42 @@ description: |
   AES hardware attached to the SIO DART. The register banks are the
   engine, shared control and auxiliary control windows, in that order.
 
-select:
-  properties:
-    compatible:
-      contains:
-        enum:
-          - apple,t6041-aes
-          - apple,t8140-aes
-          - apple,t8122-aes
-          - apple,t6030-aes
-          - apple,t6031-aes
-  required:
-    - compatible
-
 properties:
-  compatible: true
+  compatible:
+    oneOf:
+      - items:
+          - const: apple,t6041-aes
+          - const: apple,aes
+      - items:
+          - const: apple,t8140-aes
+          - const: apple,aes
+      - items:
+          - enum:
+              - apple,t8122-aes
+              - apple,t6030-aes
+              - apple,t6031-aes
+          - const: apple,aes
+
+  reg:
+    minItems: 2
+    maxItems: 3
+    description: Engine and control banks, with an auxiliary bank on later variants.
+
+  interrupts:
+    maxItems: 1
+
+  power-domains:
+    maxItems: 1
+
+  iommus:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - power-domains
+  - iommus
 
 allOf:
   - if:
@@ -38,68 +59,15 @@ allOf:
               - apple,t8122-aes
               - apple,t6030-aes
               - apple,t6031-aes
-      required:
-        - compatible
     then:
       properties:
-        compatible:
-          items:
-            - enum:
-                - apple,t8122-aes
-                - apple,t6030-aes
-                - apple,t6031-aes
-            - const: apple,aes
-
         reg:
           minItems: 2
           maxItems: 2
-
-        interrupts:
-          maxItems: 1
-
-        power-domains:
-          maxItems: 1
-
-        iommus:
-          maxItems: 1
-
-      required:
-        - compatible
-        - reg
-        - interrupts
-        - power-domains
-        - iommus
-
     else:
       properties:
-        compatible:
-          oneOf:
-            - items:
-                - const: apple,t6041-aes
-                - const: apple,aes
-            - items:
-                - const: apple,t8140-aes
-                - const: apple,aes
-
         reg:
           minItems: 3
           maxItems: 3
-          description: Register apertures in hardware-description order.
 
-        interrupts:
-          maxItems: 1
-
-        power-domains:
-          maxItems: 1
-
-        iommus:
-          maxItems: 1
-
-      required:
-        - compatible
-        - reg
-        - interrupts
-        - power-domains
-        - iommus
-
-unevaluatedProperties: false
+additionalProperties: false
