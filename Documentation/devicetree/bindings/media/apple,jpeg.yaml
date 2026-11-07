@@ -24,8 +24,11 @@ select:
     compatible:
       contains:
         enum:
+          - apple,t6030-jpeg
+          - apple,t6031-jpeg
           - apple,t6032-jpeg
           - apple,t6041-jpeg
+          - apple,t8122-jpeg
           - apple,t8132-jpeg
           - apple,t8140-jpeg
   required:
@@ -36,11 +39,7 @@ properties:
 
   apple,dma-range:
     $ref: /schemas/types.yaml#/definitions/uint64-array
-    items:
-      - const: 0x10000000000
-      - const: 0x100000000
-    description: Device-visible DMA window, as a 64-bit base and size.
-      Only for engines with 32-bit buffer pointers.
+    description: Shared hardware resource metadata.
 
 allOf:
   - if:
@@ -124,9 +123,16 @@ allOf:
           else:
             properties:
               compatible:
-                enum:
-                  - apple,t6041-jpeg
-                  - apple,t8140-jpeg
+                oneOf:
+                  - enum:
+                      - apple,t6041-jpeg
+                      - apple,t8140-jpeg
+                  - items:
+                      - enum:
+                          - apple,t8122-jpeg
+                          - apple,t6030-jpeg
+                          - apple,t6031-jpeg
+                      - const: apple,jpeg
 
               reg:
                 maxItems: 1
@@ -175,6 +181,18 @@ allOf:
                 else:
                   properties:
                     apple,dma-range: false
+              - if:
+                  properties:
+                    compatible:
+                      contains:
+                        enum:
+                          - apple,t8122-jpeg
+                          - apple,t6030-jpeg
+                          - apple,t6031-jpeg
+                then:
+                  properties:
+                    power-domains:
+                      maxItems: 1
 
             additionalProperties: false
 

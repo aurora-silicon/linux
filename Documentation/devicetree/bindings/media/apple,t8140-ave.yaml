@@ -20,9 +20,12 @@ select:
       contains:
         enum:
           - apple,t6000-ave
+          - apple,t6030-ave
+          - apple,t6031-ave
           - apple,t6032-ave
           - apple,t6041-ave
           - apple,t8112-ave
+          - apple,t8122-ave
           - apple,t8132-ave
           - apple,t8140-ave
   required:
@@ -115,17 +118,23 @@ allOf:
           else:
             properties:
               compatible:
-                enum:
-                  - apple,t6000-ave
-                  - apple,t6041-ave
-                  - apple,t8112-ave
-                  - apple,t8140-ave
+                oneOf:
+                  - enum:
+                      - apple,t6000-ave
+                      - apple,t6041-ave
+                      - apple,t8112-ave
+                      - apple,t8140-ave
+                  - items:
+                      - enum:
+                          - apple,t8122-ave
+                          - apple,t6030-ave
+                          - apple,t6031-ave
+                      - const: apple,ave
 
               reg:
-                items:
-                  - description: Codec registers
-                  - description: Mailbox registers
-                  - description: Coprocessor registers
+                minItems: 3
+                maxItems: 5
+                description: Codec, mailbox and coprocessor banks, plus two M3 auxiliary banks.
 
               reg-names:
                 items:
@@ -142,7 +151,7 @@ allOf:
                   - description: Codec interrupt handled by the firmware
 
               power-domains:
-                minItems: 5
+                minItems: 1
                 maxItems: 6
 
               power-domain-names:
@@ -170,11 +179,35 @@ allOf:
             required:
               - compatible
               - reg
-              - reg-names
               - interrupts
               - power-domains
-              - power-domain-names
               - iommus
+
+            allOf:
+              - if:
+                  properties:
+                    compatible:
+                      contains:
+                        enum:
+                          - apple,t8122-ave
+                          - apple,t6030-ave
+                          - apple,t6031-ave
+                then:
+                  properties:
+                    reg:
+                      minItems: 5
+                      maxItems: 5
+                else:
+                  properties:
+                    reg:
+                      minItems: 3
+                      maxItems: 3
+                    power-domains:
+                      minItems: 5
+                      maxItems: 6
+                  required:
+                    - reg-names
+                    - power-domain-names
 
             additionalProperties: false
 

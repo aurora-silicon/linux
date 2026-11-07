@@ -17,7 +17,10 @@ select:
     compatible:
       contains:
         enum:
+          - apple,t6030-rsm
+          - apple,t6031-rsm
           - apple,t6032-rsm
+          - apple,t8122-rsm
           - apple,t8140-rsm
   required:
     - compatible
@@ -67,6 +70,12 @@ allOf:
             - items:
                 - const: apple,t8140-rsm
                 - const: apple,rsm
+            - items:
+                - enum:
+                    - apple,t8122-rsm
+                    - apple,t6030-rsm
+                    - apple,t6031-rsm
+                - const: apple,rsm
 
         reg:
           minItems: 2
@@ -77,6 +86,9 @@ allOf:
           maxItems: 1
 
         iommus:
+          maxItems: 1
+
+        power-domains:
           maxItems: 1
 
       required:

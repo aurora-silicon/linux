@@ -4,13 +4,13 @@
 $id: http://devicetree.org/schemas/iommu/apple,dart-smmu.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple M4 base SoC system MMU companion interface
+title: Apple system MMU companion interface
 
 maintainers:
   - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
 
 description: |
-  Hardware resources of the M4 base SoC system MMU companion interface.
+  Hardware resources of the Apple Silicon system MMU companion interface.
   The interface is described for discovery and must remain disabled until
   its ownership, initialization and shutdown are supported. Register windows
   are listed in hardware resource order; firmware configuration and tuning
@@ -21,6 +21,9 @@ select:
     compatible:
       contains:
         enum:
+          - apple,t8122-dart-smmu
+          - apple,t6030-dart-smmu
+          - apple,t6031-dart-smmu
           - apple,t6032-dart-smmu
           - apple,t8132-dart-smmu
   required:
@@ -30,6 +33,9 @@ properties:
   compatible:
     items:
       - enum:
+          - apple,t8122-dart-smmu
+          - apple,t6030-dart-smmu
+          - apple,t6031-dart-smmu
           - apple,t6032-dart-smmu
           - apple,t8132-dart-smmu
       - const: apple,dart-smmu

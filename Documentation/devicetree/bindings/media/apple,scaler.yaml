@@ -19,8 +19,11 @@ select:
     compatible:
       contains:
         enum:
+          - apple,t6030-scaler
+          - apple,t6031-scaler
           - apple,t6032-scaler
           - apple,t6041-scaler
+          - apple,t8122-scaler
           - apple,t8132-scaler
           - apple,t8140-scaler
   required:
@@ -124,22 +127,27 @@ allOf:
                   - items:
                       - const: apple,t8140-scaler
                       - const: apple,scaler
+                  - items:
+                      - enum:
+                          - apple,t8122-scaler
+                          - apple,t6030-scaler
+                          - apple,t6031-scaler
+                      - const: apple,scaler
 
               reg:
-                minItems: 4
+                minItems: 3
                 maxItems: 4
-                description: Register apertures in hardware-description order.
 
               interrupts:
                 minItems: 2
                 maxItems: 2
 
               power-domains:
-                minItems: 2
+                minItems: 1
                 maxItems: 2
 
               iommus:
-                minItems: 2
+                minItems: 1
                 maxItems: 2
 
               clocks:
@@ -153,9 +161,36 @@ allOf:
               - reg
               - interrupts
               - power-domains
-              - resets
               - iommus
-              - clocks
+
+            allOf:
+              - if:
+                  properties:
+                    compatible:
+                      contains:
+                        enum:
+                          - apple,t8122-scaler
+                          - apple,t6030-scaler
+                          - apple,t6031-scaler
+                then:
+                  properties:
+                    reg:
+                      minItems: 3
+                      maxItems: 4
+                else:
+                  properties:
+                    reg:
+                      minItems: 4
+                      maxItems: 4
+                    power-domains:
+                      minItems: 2
+                      maxItems: 2
+                    iommus:
+                      minItems: 2
+                      maxItems: 2
+                  required:
+                    - resets
+                    - clocks
 
             additionalProperties: false
 

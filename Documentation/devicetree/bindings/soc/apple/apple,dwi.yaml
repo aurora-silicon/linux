@@ -18,8 +18,11 @@ select:
     compatible:
       contains:
         enum:
+          - apple,t6030-dwi
+          - apple,t6031-dwi
           - apple,t6032-dwi
           - apple,t6041-dwi
+          - apple,t8122-dwi
           - apple,t8132-dwi
           - apple,t8140-dwi
   required:
@@ -99,6 +102,12 @@ allOf:
                       - const: apple,dwi
                   - items:
                       - const: apple,t8140-dwi
+                      - const: apple,dwi
+                  - items:
+                      - enum:
+                          - apple,t8122-dwi
+                          - apple,t6030-dwi
+                          - apple,t6031-dwi
                       - const: apple,dwi
 
               reg:

@@ -34,7 +34,7 @@ properties:
 
   apple,pmgr:
     $ref: /schemas/types.yaml#/definitions/phandle
-    description: Primary PMGR syscon. Additional control banks are described by reg.
+    description: Shared hardware resource metadata.
 
 allOf:
   - if:
