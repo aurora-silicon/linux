@@ -157,6 +157,8 @@ allOf:
             const: apple,t6041-event-log
     then:
       properties:
+        reg:
+          maxItems: 25
         interrupts:
           minItems: 21
           maxItems: 21
