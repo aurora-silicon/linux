@@ -346,58 +346,6 @@
 #include "t6040-usb4.dtsi"
 
 / {
-	/* ADT pmgr reg[44]: AppleT6041PMGR::enableCioReconfig at +0x2024. */
-	pmgr_cio: power-management@502820000 {
-		compatible = "apple,t6041-pmgr-cio", "syscon", "simple-mfd";
-		#address-cells = <1>;
-		#size-cells = <1>;
-		reg = <0x5 0x02820000 0 0x4000>;
-
-		cio_reset: reset-controller@2024 {
-			compatible = "apple,t6041-cio-reset", "apple,t6000-cio-reset";
-			reg = <0x2024 0x4>;
-			#reset-cells = <1>;
-		};
-	};
-};
-
-&pinctrl_aop {
-	/* ADT acioN gpio-lstx. */
-	usb4_0_lstx_pins: usb4-0-lstx-pins {
-		pinmux = <APPLE_PINMUX(49, 1)>;
-	};
-
-	usb4_1_lstx_pins: usb4-1-lstx-pins {
-		pinmux = <APPLE_PINMUX(51, 1)>;
-	};
-
-	usb4_2_lstx_pins: usb4-2-lstx-pins {
-		pinmux = <APPLE_PINMUX(53, 1)>;
-	};
-};
-
-&usb4_0_acio {
-	resets = <&cio_reset 0>;
-	pinctrl-names = "lstx";
-	pinctrl-0 = <&usb4_0_lstx_pins>;
-	lstx-gpios = <&pinctrl_aop 49 GPIO_ACTIVE_HIGH>;
-};
-
-&usb4_1_acio {
-	resets = <&cio_reset 1>;
-	pinctrl-names = "lstx";
-	pinctrl-0 = <&usb4_1_lstx_pins>;
-	lstx-gpios = <&pinctrl_aop 51 GPIO_ACTIVE_HIGH>;
-};
-
-&usb4_2_acio {
-	resets = <&cio_reset 2>;
-	pinctrl-names = "lstx";
-	pinctrl-0 = <&usb4_2_lstx_pins>;
-	lstx-gpios = <&pinctrl_aop 53 GPIO_ACTIVE_HIGH>;
-};
-
-/ {
 	opp_p0: opp-table-p0 {
 		compatible = "operating-points-v2";
 		opp-shared;
