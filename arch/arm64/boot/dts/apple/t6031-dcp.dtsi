@@ -15,8 +15,8 @@
  * the other boards, never with apple_t6031_display.enable=0. Compatibles are t6031-specific,
  * so a kernel that does not know them leaves the nodes unbound.
  *
- * Only the T6031 board files include this file: t6034.dtsi includes
- * t6031.dtsi, and none of this is known to hold on T6034.
+ * The T6031 and T6034 board files include this file; the gate acts only on
+ * apple,t6031 machines, so on T6034 every node stays disabled.
  * The panel child is board-specific and is added by the board file.
  */
 

@@ -20,6 +20,7 @@
 	chassis-type = "laptop";
 
 	aliases {
+		keyboard = &keyboard;
 		sep = &sep;
 	};
 
@@ -263,3 +264,78 @@
 };
 
 #include "hwmon-laptop.dtsi"
+
+/*
+ * External display on both USB-C ports, wired as on the J613: the same
+ * ports, ATCs and crossbars. Not yet tested on a J615.
+ */
+/ {
+	aliases {
+		dcpext = &dcpext;
+	};
+};
+
+&dcpext {
+	apple,connector-type = "USB-C";
+	phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>;
+	phy-names = "typec0", "typec1";
+	mux-controls = <&atcphy0_xbar 0>, <&atcphy1_xbar 0>;
+	mux-control-names = "typec0", "typec1";
+	apple,typec-mux-indices = <2 2>;
+	apple,typec-dptx-phys = <0 1>;
+	/* RTKit quirks of AsahiLinux/linux#607 (syslog/ioreport acks, kdebug). */
+	apple,sync-syslog-ack;
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext_typec0: endpoint {
+					remote-endpoint = <&typec0_dcpext>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext_typec1: endpoint {
+					remote-endpoint = <&typec1_dcpext>;
+				};
+			};
+		};
+	};
+};
+
+&typec0 {
+	ports {
+		port@3 {
+			reg = <3>;
+
+			typec0_dcpext: endpoint {
+				remote-endpoint = <&dcpext_typec0>;
+			};
+		};
+	};
+};
+
+&typec1 {
+	ports {
+		port@3 {
+			reg = <3>;
+
+			typec1_dcpext: endpoint {
+				remote-endpoint = <&dcpext_typec1>;
+			};
+		};
+	};
+};
