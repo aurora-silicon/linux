@@ -1335,3 +1335,5 @@
 #include "t8132-error-handlers.dtsi"
 
 #include "t8132-sio.dtsi"
+
+#include "t8132-avd.dtsi"
