@@ -17,6 +17,12 @@ properties:
   compatible:
     oneOf:
       - items:
+          - const: apple,t8142-pcie-piodma
+          - const: apple,pcie-piodma
+      - items:
+          - const: apple,t8152-pcie-piodma
+          - const: apple,pcie-piodma
+      - items:
           - const: apple,t6041-pcie-piodma
           - const: apple,pcie-piodma
 
