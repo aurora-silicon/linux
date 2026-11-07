@@ -403,15 +403,17 @@
 		 * Provisional outer protection, not recovered Apple board limits.
 		 * The active-trip ladder works with the power_allocator governor's
 		 * non-power-actor path as well as step_wise. Equal map bounds give
-		 * exact policy requests, with the strictest zone winning. Critical
-		 * shutdown remains independent of GPU probe and forward progress.
+		 * exact policy requests, with the strictest zone winning. These
+		 * zones carry no critical trips: a sensor index that reads wrong
+		 * must not power the machine off. Add them once each sensor has
+		 * been checked against its key on hardware; until then the SMC and
+		 * the platform firmware keep their own overtemperature protection.
 		 * The actuator bounds the last rung at its provisional nonzero floor.
 		 */
 		smc-tp0t-thermal {
 			polling-delay-passive = <100>;
 			polling-delay = <100>;
 			thermal-sensors = <&smc_hwmon 6>;
-			critical-action = "shutdown";
 
 			trips {
 				smc_tp0t_thermal_0: cap-0 {
@@ -444,11 +446,6 @@
 					type = "hot";
 				};
 
-				trip-critical {
-					temperature = <98000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
 			};
 
 			cooling-maps {
@@ -475,7 +472,6 @@
 			polling-delay-passive = <100>;
 			polling-delay = <100>;
 			thermal-sensors = <&smc_hwmon 11>; /* TCMz */
-			critical-action = "shutdown";
 
 			trips {
 				charger_thermal_0: cap-0 {
@@ -508,11 +504,6 @@
 					type = "hot";
 				};
 
-				trip-critical {
-					temperature = <95000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
 			};
 
 			cooling-maps {
@@ -539,7 +530,6 @@
 			polling-delay-passive = <100>;
 			polling-delay = <100>;
 			thermal-sensors = <&smc_hwmon 12>; /* Ts0A */
-			critical-action = "shutdown";
 
 			trips {
 				chassis1_thermal_0: cap-0 {
@@ -572,11 +562,6 @@
 					type = "hot";
 				};
 
-				trip-critical {
-					temperature = <88000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
 			};
 
 			cooling-maps {
@@ -603,7 +588,6 @@
 			polling-delay-passive = <100>;
 			polling-delay = <100>;
 			thermal-sensors = <&smc_hwmon 13>; /* Ts0I */
-			critical-action = "shutdown";
 
 			trips {
 				chassis2_thermal_0: cap-0 {
@@ -636,11 +620,6 @@
 					type = "hot";
 				};
 
-				trip-critical {
-					temperature = <88000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
 			};
 
 			cooling-maps {
@@ -667,7 +646,6 @@
 			polling-delay-passive = <100>;
 			polling-delay = <100>;
 			thermal-sensors = <&smc_hwmon 14>; /* Ts0M */
-			critical-action = "shutdown";
 
 			trips {
 				chassis3_thermal_0: cap-0 {
@@ -700,11 +678,6 @@
 					type = "hot";
 				};
 
-				trip-critical {
-					temperature = <88000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
 			};
 
 			cooling-maps {
@@ -731,7 +704,6 @@
 			polling-delay-passive = <100>;
 			polling-delay = <100>;
 			thermal-sensors = <&smc_hwmon 50>;
-			critical-action = "shutdown";
 
 			trips {
 				smc_tp02_thermal_0: cap-0 {
@@ -764,11 +736,6 @@
 					type = "hot";
 				};
 
-				trip-critical {
-					temperature = <98000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
 			};
 
 			cooling-maps {
@@ -795,7 +762,6 @@
 			polling-delay-passive = <100>;
 			polling-delay = <100>;
 			thermal-sensors = <&smc_hwmon 52>;
-			critical-action = "shutdown";
 
 			trips {
 				smc_tp06_thermal_0: cap-0 {
@@ -828,11 +794,6 @@
 					type = "hot";
 				};
 
-				trip-critical {
-					temperature = <98000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
 			};
 
 			cooling-maps {
@@ -859,7 +820,6 @@
 			polling-delay-passive = <100>;
 			polling-delay = <100>;
 			thermal-sensors = <&smc_hwmon 56>;
-			critical-action = "shutdown";
 
 			trips {
 				smc_tp0e_thermal_0: cap-0 {
@@ -892,11 +852,6 @@
 					type = "hot";
 				};
 
-				trip-critical {
-					temperature = <98000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
 			};
 
 			cooling-maps {
@@ -923,7 +878,6 @@
 			polling-delay-passive = <100>;
 			polling-delay = <100>;
 			thermal-sensors = <&smc_hwmon 63>;
-			critical-action = "shutdown";
 
 			trips {
 				smc_tpx1_thermal_0: cap-0 {
@@ -956,11 +910,6 @@
 					type = "hot";
 				};
 
-				trip-critical {
-					temperature = <98000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
 			};
 
 			cooling-maps {
@@ -987,7 +936,6 @@
 			polling-delay-passive = <100>;
 			polling-delay = <100>;
 			thermal-sensors = <&smc_hwmon 65>;
-			critical-action = "shutdown";
 
 			trips {
 				smc_tpx3_thermal_0: cap-0 {
@@ -1020,11 +968,6 @@
 					type = "hot";
 				};
 
-				trip-critical {
-					temperature = <98000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
 			};
 
 			cooling-maps {

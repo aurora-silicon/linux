@@ -36,7 +36,7 @@ rounded down in milliwatts, with a minimum of one milliwatt for tiny test
 inputs. The 25 percent floor is **provisional**, not a qualified board minimum
 or a claim about a physical pstate. State 100 does not publish zero or stop
 the GPU. Absolute requests below the provisional floor are rejected, preserving
-the previous restriction. Critical shutdown remains independent of GPU work.
+the previous restriction.
 
 Registration publishes the floor before INIT, port attachment and submission;
 its initial cooling state is 100. The governor may subsequently relax its own
@@ -62,15 +62,21 @@ bring-up policy, not device safety ratings. The intentional missing-actuator
 J700 initialization refusal is removed for the admitted layout; invalid
 mappings, absent initialized power and unknown firmware still fail closed.
 
-J700 has independent SMC thermal zones and critical shutdown actions:
+J700 has independent SMC thermal zones:
 
-=================== ===================== ============= ========
-Zones               Cap temperatures (C)   Hot (C)       Critical
-=================== ===================== ============= ========
-Tp*/Tpx*            85, 88, 92, 95         92            98 C
-Charger (TCMz)      80, 83, 88, 92         88            95 C
-Chassis (Ts0A/I/M)  70, 75, 80, 85         80            88 C
-=================== ===================== ============= ========
+=================== ===================== =============
+Zones               Cap temperatures (C)   Hot (C)
+=================== ===================== =============
+Tp*/Tpx*            85, 88, 92, 95         92
+Charger (TCMz)      80, 83, 88, 92         88
+Chassis (Ts0A/I/M)  70, 75, 80, 85         80
+=================== ===================== =============
+
+These zones have no critical trips. A sensor index that reads the wrong
+channel, or a value the driver misparses, must never power the machine off.
+Critical trips are added per zone only after its sensor has been read and
+matched to its key on hardware with the trips disabled. Until then the SMC
+and the platform firmware keep their own overtemperature protection.
 
 Cooling states 25, 50, 75 and 100 apply 75, 50, 25 and the provisional
 25 percent floor, with 5 C hysteresis. The last two states deliberately
@@ -132,14 +138,14 @@ J700 supplies the GPU cooling binding and outer policy in this series.
 J616s currently has no GPU ``#cooling-cells`` or GPU cooling-map references;
 the actuator is therefore not attached there. Before qualifying J616s,
 the PWR owner must review a separate board policy with indexed sensor
-identities, trips, hysteresis, independent critical actions and exact GPU
+identities, trips, hysteresis and exact GPU
 cooling states. Validate its compiled DTB and firmware admission before
 requesting a one-shot. Existing CPU cooling maps do not qualify GPU binding.
 An absent GPU cooling device or zone link is a failed prerequisite, never
 evidence that G16S thermal integration passed.
 
 First boot with no GPU load. Verify the cooling device, independent thermal
-zones, all critical trips, requested/applied/readback agreement and nonzero
+zones, sensor readings against their keys, requested/applied/readback agreement and nonzero
 PPM target. Set state 100 and verify the initialized maximum's 25 percent
 floor (2387 mW for a 9550 mW maximum), never zero. Check states 75, 50, 25 and
 0 at no load, returning to 100 after each. Confirm the PPM word remains a

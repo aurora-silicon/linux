@@ -51,6 +51,11 @@ class Tree:
         return [int(value, 16) for value in
                 self.read("-t", "x", node, prop).split()]
 
+    def has(self, node, prop):
+        result = subprocess.run(["fdtget", str(self.path), node, prop],
+                                capture_output=True, text=True)
+        return result.returncode == 0
+
     def children(self, node):
         result = subprocess.run(["fdtget", "-l", str(self.path), node],
                                 check=True, capture_output=True, text=True)
@@ -72,7 +77,7 @@ def check_policy(tree, zone):
         temps = [85000, 88000, 92000, 95000, 98000]
     require(tree.cells(path, "polling-delay") == [100], "polling too slow")
     require(tree.cells(path, "polling-delay-passive") == [100], "passive polling too slow")
-    require(tree.strings(path, "critical-action") == ["shutdown"], "wrong critical action")
+    require(not tree.has(path, "critical-action"), "critical action on an unvalidated sensor")
     gpu_nodes = [f"/soc/{n}" for n in tree.children("/soc") if n.startswith("gpu@")]
     require(len(gpu_nodes) == 1, "expected one GPU")
     gpu = gpu_nodes[0]
@@ -93,10 +98,8 @@ def check_policy(tree, zone):
     require(tree.strings(f"{path}/trips/trip-hot", "type") == ["hot"], "missing hot trip")
     require(tree.cells(f"{path}/trips/trip-hot", "hysteresis") == [5000],
             "wrong hot hysteresis")
-    critical = f"{path}/trips/trip-critical"
-    require(tree.cells(critical, "temperature") == [temps[4]], "wrong critical temperature")
-    require(tree.strings(critical, "type") == ["critical"], "missing critical shutdown")
-    require(tree.cells(critical, "hysteresis") == [0], "wrong critical hysteresis")
+    require("trip-critical" not in tree.children(f"{path}/trips"),
+            "critical trip on an unvalidated sensor")
 
 
 def main():
