@@ -1634,11 +1634,14 @@ static int cd321x_check_setup(struct cd321x *cd321x, u64 event)
 	if (cd321x->pm.phase == CD321X_PM_REMOVED ||
 	    (!cd321x->pm.setup_pending && !(event & ~cd321x_irq_mask(tps))))
 		return 0;
-	/* A reset may have removed controller-side contaminant mitigation. */
-	if (tps->contaminant_ops)
-		tps->contaminant_ops->invalidate(tps);
 	ret = cd321x_setup_run(&cd321x->pm, event, cd321x_irq_mask(tps),
 			       &cd321x_setup_ops, cd321x);
+	/*
+	 * A controller that had to be restored was reset, which also removed
+	 * its contaminant mitigation. An intact controller kept it.
+	 */
+	if (ret && tps->contaminant_ops)
+		tps->contaminant_ops->invalidate(tps);
 	if (cd321x->pm.phase == CD321X_PM_PREPARED ||
 	    cd321x->pm.phase == CD321X_PM_INITIALIZING)
 		return 0;
@@ -1650,11 +1653,8 @@ static int cd321x_check_setup(struct cd321x *cd321x, u64 event)
 			dev_err(tps->dev, "controller setup recovery exhausted: %d\n", ret);
 		return ret;
 	}
-	if (ret) {
+	if (ret)
 		dev_warn(tps->dev, "restored controller power state and interrupt mask\n");
-		if (tps->contaminant_ops)
-			tps->contaminant_ops->event(tps);
-	}
 	/* Only a fresh snapshot may be applied after restoring the controller. */
 	cd321x->state_valid = false;
 	cd321x->pm.phase = CD321X_PM_REVALIDATE;
@@ -1737,11 +1737,9 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 	}
 	if (cd321x_check_setup(container_of(tps, struct cd321x, tps), event) < 0)
 		goto err_unlock;
-	if (event & SN201202X_INT_LDCM_UPDATE && tps->contaminant_ops) {
-		tps->contaminant = TYPEC_CONTAMINANT_UNKNOWN;
-		tps->contaminant_ops->event(tps);
-		goto err_unlock;
-	}
+	/* Read the new detector result before the cable state is applied. */
+	if (event & SN201202X_INT_LDCM_UPDATE && tps->contaminant_ops)
+		tps->contaminant_ops->refresh(tps);
 
 	if (!tps6598x_read_status(tps, &status))
 		goto err_lost;
