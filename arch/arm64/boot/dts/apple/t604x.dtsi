@@ -1566,6 +1566,14 @@
 		aop_gyro: gyro {
 			compatible = "apple,t6041-aop-gyro", "apple,aop-gyro";
 		};
+
+		aop_devmotion: devmotion6 {
+			compatible = "apple,t6041-aop-devmotion6", "apple,aop-devmotion6";
+		};
+
+		aop_temp: als-temp {
+			compatible = "apple,t6041-aop-als-temp", "apple,aop-als-temp";
+		};
 	};
 
 	/* ADT lists the interrupts as 1, 0, 3, 2 of the block: send-empty is the lowest. */
