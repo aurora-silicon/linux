@@ -713,7 +713,7 @@ impl Firmware {
     fn note_submission(&mut self) -> Result {
         self.port.note_gpu_activity();
         self.effort.submit();
-        self.apply_effort(power::FULL_EFFORT)
+        self.apply_effort(power::submission_effort())
     }
 
     fn apply_effort(&mut self, effort: u32) -> Result {
