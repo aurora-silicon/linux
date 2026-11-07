@@ -13,68 +13,24 @@ description: |
   Processor debug register apertures. Access ownership must be established
   before a debugger accesses this block.
 
-select:
-  properties:
-    compatible:
-      contains:
-        enum:
-          - apple,t6041-cpu-debug
-          - apple,t8132-cpu-debug
-  required:
-    - compatible
-
 properties:
-  compatible: true
+  compatible:
+    oneOf:
+      - items:
+          - const: apple,t6041-cpu-debug
+          - const: apple,cpu-debug
 
-allOf:
-  - if:
-      properties:
-        compatible:
-          contains:
-            enum:
-              - apple,t8132-cpu-debug
-      required:
-        - compatible
-    then:
-      properties:
-        compatible:
-          items:
-            - enum:
-                - apple,t8132-cpu-debug
-            - const: apple,cpu-debug
+  reg:
+    minItems: 2
+    maxItems: 2
+    description: Register apertures in hardware-description order.
 
-        reg:
-          minItems: 2
-          maxItems: 2
+  interrupts:
+    maxItems: 1
 
-        interrupts:
-          maxItems: 1
+required:
+  - compatible
+  - reg
+  - interrupts
 
-      required:
-        - compatible
-        - reg
-        - interrupts
-    else:
-      properties:
-        compatible:
-          oneOf:
-            - items:
-                - const: apple,t6041-cpu-debug
-                - const: apple,cpu-debug
-
-        reg:
-          minItems: 2
-          maxItems: 2
-          description: Register apertures in hardware-description order.
-
-        interrupts:
-          maxItems: 1
-
-      required:
-        - compatible
-        - reg
-        - interrupts
-
-      additionalProperties: false
-
-unevaluatedProperties: false
+additionalProperties: false

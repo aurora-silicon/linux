@@ -21,6 +21,7 @@ select:
     compatible:
       contains:
         enum:
+          - apple,t6032-dart-smmu
           - apple,t8132-dart-smmu
   required:
     - compatible
@@ -29,6 +30,7 @@ properties:
   compatible:
     items:
       - enum:
+          - apple,t6032-dart-smmu
           - apple,t8132-dart-smmu
       - const: apple,dart-smmu
 

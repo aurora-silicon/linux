@@ -375,21 +375,6 @@
 		status = "disabled";
 	};
 
-	dbgCPU: debug@389700000 {
-		compatible = "apple,t8132-cpu-debug", "apple,cpu-debug";
-		reg = <0x3 0x89700000 0x0 0x28000>,
-		      <0x3 0x895c0000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 352 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
-	};
-
-	aft: trace@220180000 {
-		compatible = "apple,t8132-aft", "apple,aft";
-		reg = <0x2 0x20180000 0x0 0xc000>;
-		status = "disabled";
-	};
-
 };
 
 / {
