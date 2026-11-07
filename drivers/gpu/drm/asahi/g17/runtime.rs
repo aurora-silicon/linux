@@ -761,6 +761,7 @@ impl Backend {
                 execution,
                 owner_pid,
                 policy,
+                shared.variant.mcache_dsid_client,
                 shared.renders.clone(),
                 shared.progress.clone(),
             )?,

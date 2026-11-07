@@ -1462,6 +1462,19 @@ impl FragmentSlot {
     const UNK_1FAC_BASE: u64 = 0x300;
     const UNK_1FAC_TIB_SHIFT: u32 = 33;
 
+    fn mcache_layout(attachments: usize) -> Result<(u64, usize)> {
+        let count = attachments.checked_add(1).ok_or(EINVAL)?;
+        if count > MCACHE_RANGES_MAX {
+            return Err(EINVAL);
+        }
+        let offset = if count <= MCACHE_INLINE_RANGES {
+            Self::INLINE_MCACHE_OFFSET
+        } else {
+            Self::SPILL_MCACHE_OFFSET
+        };
+        Ok((offset, count))
+    }
+
     /// Writes the complete descriptor except the completion link and the
     /// MCache table.
     ///
@@ -1573,8 +1586,8 @@ impl FragmentSlot {
     /// `aux_fb_va`, then `attachments`, translated in UAT context `context`.
     /// `slot_va` is the GPU address of this slot as seen by the pass's VM.
     ///
-    /// Returns the table for the fragment kick entry, or `None` when the pass
-    /// has no attachments.
+    /// Returns the table for the fragment kick entry. The auxiliary framebuffer
+    /// is mandatory even when the pass has no render-target attachments.
     pub(crate) fn set_mcache(
         &mut self,
         slot_va: u64,
@@ -1582,20 +1595,11 @@ impl FragmentSlot {
         attachments: &[WriteRange],
         context: u8,
     ) -> Result<Option<McacheTable>> {
-        if attachments.is_empty() {
-            return Ok(None);
-        }
-        let count = attachments.len() + 1;
-        if count > MCACHE_RANGES_MAX {
-            return Err(EINVAL);
-        }
-        let (offset, ranges) = if count <= MCACHE_INLINE_RANGES {
-            (
-                Self::INLINE_MCACHE_OFFSET,
-                &mut self.descriptor.arrays[0].mcache[..count],
-            )
+        let (offset, count) = Self::mcache_layout(attachments.len())?;
+        let ranges = if count <= MCACHE_INLINE_RANGES {
+            &mut self.descriptor.arrays[0].mcache[..count]
         } else {
-            (Self::SPILL_MCACHE_OFFSET, &mut self.mcache[..count])
+            &mut self.mcache[..count]
         };
         let table = McacheTable::new(offset_va(slot_va, offset)?, count)?;
         let aux_fb = WriteRange {
@@ -1641,6 +1645,24 @@ mod ta_mode_tests {
         assert!(!V25F84.ta_mode_1);
         assert!(!V25G83.ta_mode_1);
         assert!(!V26A428.ta_mode_1);
+        assert!(pro.mcache);
+        assert_eq!(pro.mcache_dsid_client, Some(0x22));
+        assert!(pro.few_primitives);
+        assert!(!max.mcache);
+        assert_eq!(max.mcache_dsid_client, None);
+        assert!(!max.few_primitives);
+    }
+
+    #[test]
+    fn attachmentless_mcache_keeps_the_auxiliary_range() {
+        assert_eq!(
+            FragmentSlot::mcache_layout(0).unwrap(),
+            (FragmentSlot::INLINE_MCACHE_OFFSET, 1)
+        );
+        assert_eq!(
+            FragmentSlot::mcache_layout(MCACHE_RANGES_MAX).unwrap_err(),
+            EINVAL
+        );
     }
 
     fn fixture() -> (RenderPass, RenderResources) {

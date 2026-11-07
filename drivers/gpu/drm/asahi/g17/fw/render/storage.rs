@@ -108,7 +108,7 @@ impl Support {
         });
         self.control.run_cursor = 0xe0;
         self.submitted = 1;
-        self.scheduler.init();
+        self.scheduler.init(None);
         Ok(())
     }
 }
