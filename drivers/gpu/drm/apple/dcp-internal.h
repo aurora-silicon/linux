@@ -11,6 +11,7 @@
 #include <linux/ioport.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/spinlock.h>
 #include <linux/mux/consumer.h>
 #include <linux/phy/phy.h>
@@ -646,6 +647,9 @@ struct apple_dcp {
 	struct delayed_work secure_poll_wq;
 	/* Stopped and not restarted, which outlives a suspend that gets refused. */
 	bool s2r_fw_down;
+	/* DCPEXT kept down through a dark wake, see dcp_s2r_dark_finish(). */
+	bool s2r_dark_held;
+	struct notifier_block s2r_pm_nb;
 	/* This driver raised the display domains, and nothing has lowered them since. */
 	bool s2r_domains_up;
 	/* Counted in pmc-dcp, the number of powered DCPs */

@@ -5952,6 +5952,8 @@ static void dcp_t8132_ext_routes(struct apple_dcp *dcp)
 		 dcp->nr_typec_routes);
 }
 
+static int dcp_s2r_pm_register(struct apple_dcp *dcp);
+
 static int dcp_platform_probe_pipe(struct platform_device *pdev)
 {
 	const struct apple_dcp_hw_data *hw = of_device_get_match_data(&pdev->dev);
@@ -6128,6 +6130,9 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	}
 
 	platform_set_drvdata(pdev, dcp);
+	ret = dcp_s2r_pm_register(dcp);
+	if (ret)
+		return ret;
 
 	if (iomfb_is_m4(dcp)) {
 		dcp->fixed_connector_type = DRM_MODE_CONNECTOR_eDP;
@@ -6809,10 +6814,13 @@ static int dcp_platform_prepare(struct device *dev)
 	return 0;
 }
 
+static void dcp_s2r_dark_finish(struct apple_dcp *dcp);
+
 static void dcp_platform_complete(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
+	dcp_s2r_dark_finish(dcp);
 	if (!dcp->external)
 		return;
 	mutex_lock(&dcp->hpd_mutex);
@@ -7700,6 +7708,27 @@ static int dcp_s2r_refused_domains_off(struct apple_dcp *dcp)
 	return ret ?: dcp_s2r_domains_off(dcp);
 }
 
+static void dcp_s2r_restart_done(struct apple_dcp *dcp, int ret)
+{
+	bool ext = dcp_s2r_ext_capable(dcp);
+
+	dcp_s2r_put_darts(dcp);
+	/* An attached display's crossbar output; its link reconnects from the Type-C work. */
+	if (ext)
+		dcp_typec_route_unpark(dcp);
+	if (ret) {
+		WRITE_ONCE(dcp->crashed, true);
+		dev_warn(dcp->dev, "firmware stopped for sleep, display stays off until reboot\n");
+		return;
+	}
+	/* Back from a full restart, even after a failed start had marked it crashed. */
+	WRITE_ONCE(dcp->crashed, false);
+	WRITE_ONCE(dcp->s2r_fw_down, false);
+	iomfb_pause_presentation(dcp, false);
+	if (ext && !READ_ONCE(dcp->typec_work_enabled))
+		dcp_enable_typec_work(dcp);
+}
+
 /*
  * If the display doesn't come back, the panel stays dark until reboot, and the driver
  * must not talk to the stopped firmware, so treat it as a crashed DCP. Nothing else in
@@ -7729,21 +7758,7 @@ static int dcp_s2r_restart(struct apple_dcp *dcp, bool real)
 		else if (ret)
 			dev_err(dcp->dev, "warm restart failed: %d\n", ret);
 	}
-	dcp_s2r_put_darts(dcp);
-	/* An attached display's crossbar output; its link reconnects from the Type-C work. */
-	if (dcp_s2r_ext_capable(dcp))
-		dcp_typec_route_unpark(dcp);
-	if (ret) {
-		WRITE_ONCE(dcp->crashed, true);
-		dev_warn(dcp->dev, "firmware stopped for sleep, display stays off until reboot\n");
-	} else {
-		/* Back from a full restart, even after a failed start had marked it crashed. */
-		WRITE_ONCE(dcp->crashed, false);
-		WRITE_ONCE(dcp->s2r_fw_down, false);
-		iomfb_pause_presentation(dcp, false);
-		if (dcp_s2r_ext_capable(dcp) && !READ_ONCE(dcp->typec_work_enabled))
-			dcp_enable_typec_work(dcp);
-	}
+	dcp_s2r_restart_done(dcp, ret);
 
 	return ret;
 }
@@ -7756,6 +7771,18 @@ static int dcp_s2r_resume(struct apple_dcp *dcp)
 	/* A real sleep took the domains' power. */
 	if (real)
 		dcp->s2r_domains_up = false;
+	/* A dark wake sleeps again with the panel never lit, as if DPMS had turned it off. */
+	if (pm_dark_wake() && dcp_s2r_capable(dcp) && !dcp->dpms_powered_off) {
+		dcp->dpms_powered_off = true;
+		dev_info(dcp->dev, "dark wake: firmware and panel stay off\n");
+	}
+	/* DCPEXT too, its crossbar output parked: dcp_s2r_dark_finish() if no resume follows. */
+	if (pm_dark_wake() && dcp_s2r_ext_capable(dcp)) {
+		dcp->s2r_dark_held = true;
+		dev_info(dcp->dev, "dark wake: firmware and output stay off\n");
+		return 0;
+	}
+	dcp->s2r_dark_held = false;
 	/* Off by DPMS before the sleep: it stays off until DPMS on brings it back. */
 	if (dcp->dpms_powered_off) {
 		/* Off after a refused idle, its power may be on: DPMS on needs it lowered. */
@@ -7767,6 +7794,56 @@ static int dcp_s2r_resume(struct apple_dcp *dcp)
 	dcp_s2r_restart(dcp, real);
 
 	return 0;
+}
+
+/*
+ * The suspend after a dark wake failed before suspending DCPEXT, or before preparing it. It's
+ * still down from the real sleep, whose wake reset its CPU: start it as after one.
+ */
+static void dcp_s2r_dark_finish(struct apple_dcp *dcp)
+{
+	int ret;
+
+	if (!dcp->s2r_dark_held || pm_dark_wake() || IS_ERR_OR_NULL(dcp->rtk))
+		return;
+	dcp->s2r_dark_held = false;
+	dcp->s2r_stopped = false;
+	dcp_s2r_find_darts(dcp);
+	ret = dcp_s2r_ext_start(dcp, true);
+	dev_info(dcp->dev, "dark wake over without a resume: firmware %s: %d\n",
+		 ret ? "not back" : "back", ret);
+	dcp_s2r_restart_done(dcp, ret);
+}
+
+static int dcp_s2r_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct apple_dcp *dcp = container_of(nb, struct apple_dcp, s2r_pm_nb);
+
+	if (action == PM_POST_SUSPEND)
+		dcp_s2r_dark_finish(dcp);
+
+	return NOTIFY_DONE;
+}
+
+static void dcp_s2r_pm_unregister(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	unregister_pm_notifier(&dcp->s2r_pm_nb);
+}
+
+static int dcp_s2r_pm_register(struct apple_dcp *dcp)
+{
+	int ret;
+
+	if (!dcp_s2r_ext_capable(dcp))
+		return 0;
+	dcp->s2r_pm_nb.notifier_call = dcp_s2r_pm_notify;
+	ret = register_pm_notifier(&dcp->s2r_pm_nb);
+	if (ret)
+		return ret;
+
+	return devm_add_action_or_reset(dcp->dev, dcp_s2r_pm_unregister, dcp);
 }
 
 /*
