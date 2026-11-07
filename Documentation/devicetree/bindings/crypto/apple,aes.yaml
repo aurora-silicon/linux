@@ -51,15 +51,12 @@ allOf:
           maxItems: 2
 
         interrupts:
-          minItems: 1
           maxItems: 1
 
         power-domains:
-          minItems: 1
           maxItems: 1
 
         iommus:
-          minItems: 1
           maxItems: 1
 
       required:

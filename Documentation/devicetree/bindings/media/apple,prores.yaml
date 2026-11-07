@@ -51,11 +51,9 @@ allOf:
           maxItems: 3
 
         interrupts:
-          minItems: 1
           maxItems: 1
 
         power-domains:
-          minItems: 1
           maxItems: 1
 
         iommus:

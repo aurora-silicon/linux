@@ -50,11 +50,9 @@ allOf:
           maxItems: 3
 
         interrupts:
-          minItems: 1
           maxItems: 1
 
         iommus:
-          minItems: 1
           maxItems: 1
 
       required:
