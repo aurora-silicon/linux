@@ -323,10 +323,21 @@ static void dwc3_apple_set_ptrcap(struct dwc3_apple *appledwc, u32 mode)
 	dwc3_set_prtcap(&appledwc->dwc, mode, false);
 }
 
+/* The M4 Macs whose ATCs are wired as on the J713. */
+static const char *const dwc3_apple_t8132_host_boards[] = {
+	"apple,j604",
+	"apple,j623",
+	"apple,j624",
+	"apple,j713",
+	"apple,j773g",
+	NULL
+};
+
 static bool dwc3_apple_host_before_core_init(struct dwc3_apple *appledwc,
 					     enum dwc3_apple_state state)
 {
-	return state == DWC3_APPLE_HOST && of_machine_is_compatible("apple,j713") &&
+	return state == DWC3_APPLE_HOST &&
+		of_machine_compatible_match(dwc3_apple_t8132_host_boards) &&
 		of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3");
 }
 

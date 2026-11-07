@@ -168,6 +168,18 @@ err_free_event_buffers:
     return ret;
 }
 '''
+    boards = re.search(r"^static const char \*const dwc3_apple_t8132_host_boards\[\] = \{.*?^\};\n",
+                       apple, re.M | re.S).group()
+    program += boards + r'''
+/* The board list must keep the J713; the other boards take the same path. */
+static bool of_machine_compatible_match(const char *const *compats)
+{
+    for (; *compats; compats++)
+        if (!strcmp(*compats,"apple,j713"))
+            return of_machine_is_compatible(*compats);
+    return false;
+}
+'''
     for name in ["dwc3_apple_set_ptrcap", "dwc3_apple_host_before_core_init",
                  "dwc3_apple_core_probe", "dwc3_apple_core_init"]:
         program += function(apple,name)
