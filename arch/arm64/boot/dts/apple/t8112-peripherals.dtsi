@@ -158,6 +158,12 @@
 		status = "disabled";
 	};
 
+	m2_aop_spmi0_sideband: spmi-sideband@24a884000 {
+		compatible = "apple,t8112-spmi-sideband", "apple,spmi-sideband";
+		reg = <0x2 0x4a884000 0x0 0x4000>;
+		status = "disabled";
+	};
+
 	m2_aop_spmi1_sideband: spmi-sideband@24a8c4000 {
 		compatible = "apple,t8112-spmi-sideband", "apple,spmi-sideband";
 		reg = <0x2 0x4a8c4000 0x0 0x4000>;

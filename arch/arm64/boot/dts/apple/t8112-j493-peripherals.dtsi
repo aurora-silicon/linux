@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /* Additional T8112 hardware resources. Keep unqualified blocks disabled. */
 
-&{/soc} {
-
-};
-
 &aop_spmi1 {
 	interrupt-parent = <&aic>;
 	interrupts = <AIC_IRQ 357 IRQ_TYPE_LEVEL_HIGH>;
