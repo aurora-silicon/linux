@@ -17,3 +17,5 @@
 	model = "Apple iMac (24-inch, 2x USB-C, M4, 2024)";
 	chassis-type = "all-in-one";
 };
+
+#include "t8132-j623-audio.dtsi"
