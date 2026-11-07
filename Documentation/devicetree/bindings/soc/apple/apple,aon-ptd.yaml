@@ -24,6 +24,9 @@ select:
   required:
     - compatible
 
+properties:
+  compatible: true
+
 allOf:
   - if:
       properties:
@@ -63,7 +66,6 @@ allOf:
         - '#interrupt-cells'
         - '#address-cells'
 
-      additionalProperties: false
     else:
       properties:
         compatible:
@@ -100,4 +102,4 @@ allOf:
         - interrupt-controller
         - '#interrupt-cells'
 
-      additionalProperties: false
+unevaluatedProperties: false

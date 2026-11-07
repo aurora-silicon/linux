@@ -28,6 +28,9 @@ select:
   required:
     - compatible
 
+properties:
+  compatible: true
+
 allOf:
   - if:
       properties:
@@ -51,7 +54,6 @@ allOf:
         - compatible
         - '#clock-cells'
 
-      additionalProperties: false
     else:
       properties:
         compatible:
@@ -101,4 +103,4 @@ allOf:
                 minItems: 44
                 maxItems: 44
 
-      additionalProperties: false
+unevaluatedProperties: false
