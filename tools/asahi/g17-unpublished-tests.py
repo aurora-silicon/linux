@@ -46,7 +46,7 @@ fn main(){
    let context=q.binding.as_ref().unwrap().context.clone();
    if predecessor!=0 {
     let old=Context::new(100+owner,&live);
-    q.previous=Some(Previous{binding:if predecessor==1{Some(Binding{context:old.clone()})}else{None},context:old,publication:None});
+    q.previous=Some(Previous{binding:if predecessor==1{Some(Binding{context:old.clone()})}else{None},context:old,publication:None,moved:false});
    }
    channels.push(Backend{q:std::cell::RefCell::new(q),owner,context});
   }
@@ -64,12 +64,12 @@ fn main(){
   match guard {
    0=>q.unpublished_binding=false,
    1=>q.exit=Some(Exit{phase:Phase::Acknowledged}),
-   2=>q.active.push(Active{packet:Arc::new(Packet{completion:Arc::new(Completion)}),ticket:None,qos_pending:false}).unwrap(),
+   2=>q.active.push(Active{packet:Arc::new(Packet{completion:Arc::new(Completion)}),ticket:None,observed:None,qos_pending:false}).unwrap(),
    3=>q.replays.push(Arc::new(Packet{completion:Arc::new(Completion)})).unwrap(),
    4=>q.growing=true,
    5=>q.quarantined=true,
    6=>q.awaiting_witness=true,
-   7=>q.previous=Some(Previous{context:context.clone(),binding:None,publication:Some((1,1))}),
+   7=>q.previous=Some(Previous{context:context.clone(),binding:None,publication:Some((1,1)),moved:false}),
    8=>q.pool_phase=PoolPhase::ReleaseSent(3),
    9=>owner=3,
    10=>ctx=Context::new(4,&live),
@@ -91,7 +91,9 @@ fn main(){
 def main():
     source=fixture()
     compute=(ROOT/'queue/compute.rs').read_text()
-    assert compute.count('visible = true;\n                self.unpublished_binding = false;')==2
+    # Every publication path (G17P shared, G17P, M5) clears the unpublished
+    # binding exactly when its record becomes firmware-visible.
+    assert compute.count('visible = true;\n                self.unpublished_binding = false;')==3
     backend=(ROOT/'runtime/backend.rs').read_text()
     assert 'if !lease.is_current() { drop(state); drop(lease); continue; }' in backend
     no_kill, count = re.subn(r'\|\|\s*self\.exit\.is_some\(\)\s*(?=\|\|\s*self\.active\.len\s*!=\s*0)', '', source)
