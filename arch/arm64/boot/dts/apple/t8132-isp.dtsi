@@ -40,12 +40,12 @@
 			apple,output-size = <1920 1080>;
 			apple,crop = <0 0 1920 1080>;
 		};
-		/* 1280x720 */
+		/* 1280x720: the same window as 1920x1080, scaled down */
 		preset1 {
 			apple,config-index = <5>;
 			apple,input-size = <1920 2160>;
 			apple,output-size = <1280 720>;
-			apple,crop = <0 0 1280 720>;
+			apple,crop = <0 0 1920 1080>;
 		};
 	};
 };
