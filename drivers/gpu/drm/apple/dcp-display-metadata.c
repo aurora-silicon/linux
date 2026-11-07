@@ -186,6 +186,18 @@ const struct dcp_color_space *dcp_color_space_lookup(const char *name)
 	return ERR_PTR(-EINVAL);
 }
 
+const struct dcp_color_space *dcp_panel_gamut_color_space(enum dcp_panel_gamut gamut)
+{
+	switch (gamut) {
+	case DCP_PANEL_GAMUT_SRGB:
+		return dcp_color_space_lookup("srgb");
+	case DCP_PANEL_GAMUT_DISPLAY_P3:
+		return dcp_color_space_lookup("display-p3");
+	default:
+		return NULL;
+	}
+}
+
 /*
  * Firmware chromaticities win. Without a complete, valid set, use the panel's
  * named target. Without either the block keeps its nominal white only.

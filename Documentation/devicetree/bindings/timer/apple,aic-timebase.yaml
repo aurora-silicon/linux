@@ -14,16 +14,18 @@ description: |
 
 properties:
   compatible:
-    oneOf:
-      - items:
-          - const: apple,t8142-aic-timebase
-          - const: apple,aic-timebase
-      - items:
-          - const: apple,t8152-aic-timebase
-          - const: apple,aic-timebase
-      - items:
-          - const: apple,t6041-aic-timebase
-          - const: apple,aic-timebase
+    items:
+      - enum:
+          - apple,t6000-aic-timebase
+          - apple,t6020-aic-timebase
+          - apple,t6021-aic-timebase
+          - apple,t6022-aic-timebase
+          - apple,t6041-aic-timebase
+          - apple,t8103-aic-timebase
+          - apple,t8112-aic-timebase
+          - apple,t8142-aic-timebase
+          - apple,t8152-aic-timebase
+      - const: apple,aic-timebase
 
   reg:
     maxItems: 1
