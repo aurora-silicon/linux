@@ -341,6 +341,7 @@ static int tas2764_update_pwr_ctrl(struct tas2764_priv *tas2764)
 }
 
 static void tas2764_flush_shutdown(struct tas2764_priv *tas2764);
+static int tas2764_apply_init_quirks(struct tas2764_priv *tas2764);
 
 #ifdef CONFIG_PM
 /*
@@ -417,6 +418,16 @@ static int tas2764_codec_resume(struct snd_soc_component *component)
 	regcache_cache_only(tas2764->regmap, false);
 
 	ret = regcache_sync(tas2764->regmap);
+	/*
+	 * An amp whose SDZ went low came back from a power-on reset, and the
+	 * cache sync restores only the cached registers: the init quirks
+	 * also write TI's volatile quirk page, which the reset cleared and
+	 * nothing wrote again. Without them a J316 woofer amp latched an
+	 * over-current at the first stream after a resume. Apply them again,
+	 * as the probe does.
+	 */
+	if (ret >= 0 && !tas2764->sdz_group && tas2764->devid == DEVID_SN012776)
+		ret = tas2764_apply_init_quirks(tas2764);
 	if (ret >= 0)
 		ret = tas2764_update_pwr_ctrl(tas2764);
 
