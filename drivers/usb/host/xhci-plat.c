@@ -650,11 +650,12 @@ static int xhci_plat_resume_common(struct device *dev, bool power_lost)
 		}
 	}
 
+	/* A positive result: the controller lost its state, which the quirk set up again. */
 	ret = xhci_priv_resume_quirk(hcd);
-	if (ret)
+	if (ret < 0)
 		goto disable_clks;
 
-	ret = xhci_resume(xhci, power_lost || priv->power_lost, false);
+	ret = xhci_resume(xhci, power_lost || priv->power_lost || ret > 0, false);
 	if (ret)
 		goto disable_clks;
 
