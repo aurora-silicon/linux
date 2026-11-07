@@ -17,6 +17,12 @@ properties:
   compatible:
     oneOf:
       - items:
+          - const: apple,t8142-esm
+          - const: apple,esm
+      - items:
+          - const: apple,t8152-esm
+          - const: apple,esm
+      - items:
           - const: apple,t8140-esm
           - const: apple,esm
 
