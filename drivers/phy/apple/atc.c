@@ -4200,6 +4200,15 @@ static void atcphy_restore_after_pd_off(struct apple_atcphy *atcphy)
 	atcphy->tunnel_clock_on = false;
 	atcphy->tunnel_rate = 0;
 	atcphy->tunnel_users = 0;
+	/* Nothing the DisplayPort side owned or was stopping survived the domain. */
+	if (atcphy->hw->has_t8140_dp) {
+		atcphy->dp_owned_pmas = 0;
+		atcphy->dp_idle_pmas = 0;
+		atcphy->dp_usb_context_valid = 0;
+		atcphy->dp_usb_context_dirty = 0;
+		atcphy->aux_power_requested = false;
+		atcphy->mode_dirty = false;
+	}
 
 	if (!atcphy->dp_only) {
 		_atcphy_dwc3_reset_assert(atcphy);
@@ -6557,6 +6566,7 @@ static const struct atcphy_hw atcphy_hw_t8140 = {
 	.has_usb2phy_reg = true,
 	.has_t8140_dp = true,
 	.optional_tunables = true,
+	.restore_after_pd_off = true,
 };
 
 static const struct atcphy_hw atcphy_hw_t8142 = {

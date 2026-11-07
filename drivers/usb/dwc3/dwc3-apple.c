@@ -19,6 +19,7 @@
 #include <linux/reset.h>
 #include <linux/soc/apple/t8132.h>
 #include <linux/soc/apple/tunable.h>
+#include <linux/suspend.h>
 #include <linux/usb/phy.h>
 
 #include "dwc3-apple-state.h"
@@ -91,6 +92,10 @@
  * dwc3_apple_init(). In host mode xHCI then keeps running in suspend-to-idle when a USB device
  * may wake the system, as a halted xHC could not signal the wakeup.
  *
+ * A deep sleep takes the controller's power domain away, so nothing can be kept running across
+ * it. The glue stops everything before the freezer runs, the way a cable disconnect does, and
+ * brings it back once the system has resumed. See dwc3_apple_pm_notify().
+ *
  * Runtime PM (T6040 and T8132, see dwc3_apple_core_probe()): the glue holds a reference from
  * the reset deassert to the end of the shutdown, so with no cable the controller can
  * runtime-suspend and its power domain drop, its DARTs (which save and restore their state) and,
@@ -157,6 +162,11 @@ struct dwc3_apple {
 	bool rpm_held;
 	bool pre_core_rpm;
 	bool dt_dis_u3_susphy;
+	struct notifier_block pm_nb;
+	/* Stopped for a deep sleep: the state to come back to, and the wakeup setting. */
+	bool sleep_stopped;
+	bool sleep_wakeup;
+	enum dwc3_apple_state sleep_state;
 
 	void __iomem *drd_cfg;
 	struct apple_tunable *tunables[DWC3_APPLE_NR_TUNABLES];
@@ -766,6 +776,12 @@ static int dwc3_usb_role_switch_set(struct usb_role_switch *sw, enum usb_role ro
 	if (appledwc->fixed_hub)
 		return 0;
 
+	/* Stopped for a sleep: this is what comes back after it. */
+	if (appledwc->sleep_stopped) {
+		appledwc->sleep_state = dwc3_apple_state_for_role(role);
+		return 0;
+	}
+
 	/*
 	 * Stay off instead of starting device mode (see dwc3_apple_host_only()). Reporting success
 	 * keeps the port controller from retrying: get() then reports USB_ROLE_NONE.
@@ -820,7 +836,7 @@ static enum usb_role dwc3_usb_role_switch_get(struct usb_role_switch *sw)
 
 	guard(mutex)(&appledwc->lock);
 
-	switch (appledwc->state) {
+	switch (appledwc->sleep_stopped ? appledwc->sleep_state : appledwc->state) {
 	case DWC3_APPLE_HOST:
 		return USB_ROLE_HOST;
 	case DWC3_APPLE_DEVICE:
@@ -848,6 +864,59 @@ static int dwc3_apple_setup_role_switch(struct dwc3_apple *appledwc)
 		return PTR_ERR(appledwc->role_sw);
 
 	return 0;
+}
+
+/*
+ * Runs before the freezer, when the sleep's real target isn't known yet, so this goes by the
+ * state "mem" means now. Writing "freeze" with deep selected costs a USB restart and nothing else.
+ * A stop that fails refuses the sleep. PM_POST_SUSPEND follows an abandoned sleep as well.
+ */
+static int dwc3_apple_pm_notify(struct notifier_block *nb, unsigned long action, void *unused)
+{
+	struct dwc3_apple *appledwc = container_of(nb, struct dwc3_apple, pm_nb);
+	struct device *dev = appledwc->dev;
+	int ret;
+
+	guard(mutex)(&appledwc->lock);
+
+	switch (action) {
+	case PM_SUSPEND_PREPARE:
+		if (pm_suspend_default_s2idle() || appledwc->shutting_down)
+			break;
+		appledwc->sleep_state = appledwc->state;
+		ret = dwc3_apple_exit(appledwc);
+		if (ret)
+			return notifier_from_errno(ret);
+		/* A wakeup path would keep the domain on, and it's going away. */
+		appledwc->sleep_wakeup = device_may_wakeup(dev);
+		device_set_wakeup_enable(dev, false);
+		appledwc->sleep_stopped = true;
+		break;
+	case PM_POST_SUSPEND:
+		if (!appledwc->sleep_stopped)
+			break;
+		appledwc->sleep_stopped = false;
+		device_set_wakeup_enable(dev, appledwc->sleep_wakeup);
+		if (appledwc->shutting_down ||
+		    (appledwc->sleep_state != DWC3_APPLE_HOST &&
+		     appledwc->sleep_state != DWC3_APPLE_DEVICE))
+			break;
+		ret = dwc3_apple_init(appledwc, appledwc->sleep_state);
+		if (ret)
+			dev_err(dev, "Failed to start after sleep, err=%d\n", ret);
+		break;
+	default:
+		break;
+	}
+
+	return NOTIFY_DONE;
+}
+
+static void dwc3_apple_pm_notifier_remove(void *data)
+{
+	struct dwc3_apple *appledwc = data;
+
+	unregister_pm_notifier(&appledwc->pm_nb);
 }
 
 static bool dwc3_apple_has_fixed_hub(struct device *dev)
@@ -940,6 +1009,13 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	 * details.
 	 */
 	appledwc->state = DWC3_APPLE_PROBE_PENDING;
+	appledwc->pm_nb.notifier_call = dwc3_apple_pm_notify;
+	ret = register_pm_notifier(&appledwc->pm_nb);
+	if (ret)
+		return ret;
+	ret = devm_add_action_or_reset(dev, dwc3_apple_pm_notifier_remove, appledwc);
+	if (ret)
+		return ret;
 	/*
 	 * Until the first cable there is no core to keep powered: let the controller
 	 * runtime-suspend, and its DARTs with it, so that its power domain can drop.
@@ -989,6 +1065,7 @@ static void dwc3_apple_remove(struct platform_device *pdev)
 
 	guard(mutex)(&appledwc->lock);
 
+	appledwc->shutting_down = true;
 	usb_role_switch_unregister(appledwc->role_sw);
 
 	/*

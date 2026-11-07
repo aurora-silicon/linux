@@ -1068,6 +1068,9 @@ def teardown(root):
     for name in ('atcphy_mode_configuration', 'atcphy_hw', 'atcphy_dp_link_rate_configuration'):
         decls.append(block(files['atc'], files['atc'].index('struct ' + name + ' {')) + ';')
     decls.append(block(files['state'], files['state'].index('enum dwc3_apple_state {')) + ';')
+    role = 'static inline enum dwc3_apple_state dwc3_apple_state_for_role('
+    if role in files['state']:
+        decls.append(block(files['state'], files['state'].index(role)))
     start = files['atc'].index('static const struct {\n\tconst struct atcphy_mode_configuration normal;')
     end = files['atc'].index('\n};', start) + 3
     decls.append(files['atc'][start:end])

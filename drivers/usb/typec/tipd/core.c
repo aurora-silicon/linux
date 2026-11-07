@@ -16,6 +16,8 @@
 #include <linux/regmap.h>
 #include <linux/unaligned.h>
 #include <linux/usb/pd.h>
+#include <linux/soc/apple/sleep.h>
+#include <linux/suspend.h>
 #include <linux/usb/typec.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
@@ -1577,6 +1579,51 @@ static void cd321x_prepare(struct tps6598x *tps)
 	/* Gate scheduling first; neither worker may be drained under its mutex. */
 	cancel_delayed_work_sync(&cd321x->resume_work);
 	cancel_delayed_work_sync(&cd321x->update_work);
+
+	/* As macOS does a second or so before the commit, measured on the same controller. */
+	if (pm_suspend_via_firmware() && device_property_read_bool(tps->dev, "apple,sleep-ssps")) {
+		int ret;
+
+		guard(mutex)(&tps->lock);
+		ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S3);
+		if (ret)
+			dev_warn(tps->dev, "didn't take system power state S3: %d\n", ret);
+		else
+			dev_dbg(tps->dev, "system power state S3\n");
+	}
+}
+
+/*
+ * A sleep cut this port's debug link. Rearm it the way a boot loader does: unlock with
+ * the board's key, debug mode on, enable the debug VDM, debug mode off, lock.
+ */
+static void cd321x_rearm_debug_link(struct tps6598x *tps)
+{
+	static const u8 vdm[] = { 0x06, 0x46, 0x82, 0x01 };
+	static const u8 no_key[4];
+	const char *key;
+	u8 on = 1, off = 0, out = 0;
+	int ret;
+
+	if (device_property_read_string(tps->dev, "apple,debug-lock-key", &key) ||
+	    strlen(key) != sizeof(no_key) || !apple_sleep_debug_link_was_cut(tps->dev))
+		return;
+
+	ret = tps6598x_exec_cmd(tps, "LOCK", sizeof(no_key), (const u8 *)key, 1, &out);
+	if (!ret && !(out & 0xf))
+		ret = tps6598x_exec_cmd(tps, "DBMa", 1, &on, 1, &out);
+	if (!ret && !(out & 0xf))
+		ret = tps6598x_exec_cmd(tps, "DVEn", sizeof(vdm), vdm, 1, &out);
+	if (!ret && (out & 0xf))
+		ret = -EIO;
+	if (!ret)
+		ret = tps6598x_exec_cmd(tps, "DBMa", 1, &off, 0, NULL);
+	if (!ret)
+		ret = tps6598x_exec_cmd(tps, "LOCK", sizeof(no_key), no_key, 0, NULL);
+	if (ret)
+		dev_warn(tps->dev, "debug link not rearmed: %d\n", ret);
+	else
+		dev_dbg(tps->dev, "debug link rearmed\n");
 }
 
 static void cd321x_complete(struct tps6598x *tps)
@@ -1584,6 +1631,15 @@ static void cd321x_complete(struct tps6598x *tps)
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 
 	guard(mutex)(&tps->lock);
+	/*
+	 * The cut was a cold reset of this controller's firmware: its interrupt mask and power
+	 * state are back at their defaults, so set them up again whether or not an event comes.
+	 */
+	if (apple_sleep_debug_link_cut_peek(tps->dev))
+		cd321x->pm.setup_pending = true;
+	if (pm_suspend_via_firmware() && device_property_read_bool(tps->dev, "apple,sleep-ssps"))
+		tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
+	cd321x_rearm_debug_link(tps);
 	if (cd321x_pm_resume(&cd321x->pm))
 		mod_delayed_work(system_freezable_wq, &cd321x->resume_work, 0);
 }

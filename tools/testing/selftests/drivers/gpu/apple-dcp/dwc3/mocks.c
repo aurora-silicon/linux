@@ -85,6 +85,9 @@ struct dwc3_apple {
 	void *dev;
 	struct phy *usb2_phy, *usb3_phy;
 	bool fixed_hub, core_active, core_exit_pending, reset_pending, shutting_down;
+	/* Stopped for a deep sleep, and the state to bring back. */
+	bool sleep_stopped;
+	enum dwc3_apple_state sleep_state;
 	bool rpm_held, host_only;
 	/* T8132 only: runtime PM before the first core probe; never set here. */
 	bool pre_core_rpm;
