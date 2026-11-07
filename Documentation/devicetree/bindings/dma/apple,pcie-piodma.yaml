@@ -22,6 +22,7 @@ select:
           - apple,t8122-pcie-piodma
           - apple,t6030-pcie-piodma
           - apple,t6031-pcie-piodma
+          - apple,t6032-pcie-piodma
   required:
     - compatible
 
@@ -34,60 +35,93 @@ allOf:
         compatible:
           contains:
             enum:
-              - apple,t8122-pcie-piodma
-              - apple,t6030-pcie-piodma
-              - apple,t6031-pcie-piodma
+              - apple,t6032-pcie-piodma
       required:
         - compatible
     then:
       properties:
         compatible:
           items:
-            - enum:
-                - apple,t8122-pcie-piodma
-                - apple,t6030-pcie-piodma
-                - apple,t6031-pcie-piodma
+            - const: apple,t6032-pcie-piodma
             - const: apple,pcie-piodma
 
         reg:
           minItems: 3
-          maxItems: 4
-
-        interrupts:
-          maxItems: 1
-
-        iommus:
-          maxItems: 1
-
-      required:
-        - compatible
-        - reg
-        - interrupts
-        - iommus
-
-    else:
-      properties:
-        compatible:
-          oneOf:
-            - items:
-                - const: apple,t6041-pcie-piodma
-                - const: apple,pcie-piodma
-
-        reg:
-          minItems: 3
           maxItems: 3
-          description: Register apertures in hardware-description order.
 
         interrupts:
+          minItems: 1
           maxItems: 1
 
         iommus:
+          minItems: 1
           maxItems: 1
 
       required:
         - compatible
         - reg
         - interrupts
-        - iommus
+    else:
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t8122-pcie-piodma
+                    - apple,t6030-pcie-piodma
+                    - apple,t6031-pcie-piodma
+            required:
+              - compatible
+          then:
+            properties:
+              compatible:
+                items:
+                  - enum:
+                      - apple,t8122-pcie-piodma
+                      - apple,t6030-pcie-piodma
+                      - apple,t6031-pcie-piodma
+                  - const: apple,pcie-piodma
+
+              reg:
+                minItems: 3
+                maxItems: 4
+
+              interrupts:
+                maxItems: 1
+
+              iommus:
+                maxItems: 1
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - iommus
+
+          else:
+            properties:
+              compatible:
+                oneOf:
+                  - items:
+                      - const: apple,t6041-pcie-piodma
+                      - const: apple,pcie-piodma
+
+              reg:
+                minItems: 3
+                maxItems: 3
+                description: Register apertures in hardware-description order.
+
+              interrupts:
+                maxItems: 1
+
+              iommus:
+                maxItems: 1
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - iommus
 
 unevaluatedProperties: false

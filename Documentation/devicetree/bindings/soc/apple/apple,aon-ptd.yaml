@@ -13,9 +13,24 @@ description: |
   Always-on power telemetry register banks and upstream interrupts. The
   firmware owns the telemetry data and interrupt routing at boot.
 
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6031-aon-ptd
+          - apple,t6032-aon-ptd
+          - apple,t6041-aon-ptd
+          - apple,t8140-aon-ptd
+  required:
+    - compatible
+
 properties:
   compatible:
     oneOf:
+      - items:
+          - const: apple,t6032-aon-ptd
+          - const: apple,aon-ptd
       - items:
           - const: apple,t6031-aon-ptd
           - const: apple,aon-ptd

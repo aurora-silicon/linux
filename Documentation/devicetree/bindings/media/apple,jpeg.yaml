@@ -29,6 +29,7 @@ select:
           - apple,t8122-jpeg
           - apple,t6030-jpeg
           - apple,t6031-jpeg
+          - apple,t6032-jpeg
   required:
     - compatible
 
@@ -41,32 +42,35 @@ allOf:
         compatible:
           contains:
             enum:
-              - apple,t8122-jpeg
-              - apple,t6030-jpeg
-              - apple,t6031-jpeg
+              - apple,t6032-jpeg
       required:
         - compatible
     then:
       properties:
         compatible:
           items:
-            - enum:
-                - apple,t8122-jpeg
-                - apple,t6030-jpeg
-                - apple,t6031-jpeg
+            - const: apple,t6032-jpeg
             - const: apple,jpeg
 
         reg:
+          minItems: 1
           maxItems: 1
 
         interrupts:
+          minItems: 1
           maxItems: 1
 
         power-domains:
+          minItems: 1
           maxItems: 1
 
         iommus:
+          minItems: 1
           maxItems: 1
+
+        clocks:
+          minItems: 2
+          maxItems: 2
 
       required:
         - compatible
@@ -74,61 +78,102 @@ allOf:
         - interrupts
         - power-domains
         - iommus
-
+        - clocks
     else:
-      properties:
-        compatible:
-          enum:
-            - apple,t6041-jpeg
-            - apple,t8140-jpeg
-
-        reg:
-          maxItems: 1
-
-        interrupts:
-          maxItems: 1
-
-        iommus:
-          maxItems: 1
-
-        power-domains:
-          minItems: 1
-          items:
-            - description: The engine's power domain
-            - description: Performance request held while the engine works
-
-        power-domain-names:
-          minItems: 1
-          items:
-            - const: core
-            - const: perf
-
-        apple,dma-range:
-          $ref: /schemas/types.yaml#/definitions/uint64-array
-          items:
-            - const: 0x10000000000
-            - const: 0x100000000
-          description: Device-visible DMA window, as a 64-bit base and size.
-            Only for engines with 32-bit buffer pointers.
-
-      required:
-        - compatible
-        - reg
-        - interrupts
-        - iommus
-        - power-domains
-
       allOf:
         - if:
             properties:
               compatible:
-                const: apple,t6041-jpeg
-          then:
+                contains:
+                  enum:
+                    - apple,t8122-jpeg
+                    - apple,t6030-jpeg
+                    - apple,t6031-jpeg
             required:
-              - apple,dma-range
+              - compatible
+          then:
+            properties:
+              compatible:
+                items:
+                  - enum:
+                      - apple,t8122-jpeg
+                      - apple,t6030-jpeg
+                      - apple,t6031-jpeg
+                  - const: apple,jpeg
+
+              reg:
+                maxItems: 1
+
+              interrupts:
+                maxItems: 1
+
+              power-domains:
+                maxItems: 1
+
+              iommus:
+                maxItems: 1
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - power-domains
+              - iommus
+
           else:
             properties:
-              apple,dma-range: false
+              compatible:
+                enum:
+                  - apple,t6041-jpeg
+                  - apple,t8140-jpeg
+
+              reg:
+                maxItems: 1
+
+              interrupts:
+                maxItems: 1
+
+              iommus:
+                maxItems: 1
+
+              power-domains:
+                minItems: 1
+                items:
+                  - description: The engine's power domain
+                  - description: Performance request held while the engine works
+
+              power-domain-names:
+                minItems: 1
+                items:
+                  - const: core
+                  - const: perf
+
+              apple,dma-range:
+                $ref: /schemas/types.yaml#/definitions/uint64-array
+                items:
+                  - const: 0x10000000000
+                  - const: 0x100000000
+                description: Device-visible DMA window, as a 64-bit base and size.
+                  Only for engines with 32-bit buffer pointers.
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - iommus
+              - power-domains
+
+            allOf:
+              - if:
+                  properties:
+                    compatible:
+                      const: apple,t6041-jpeg
+                then:
+                  required:
+                    - apple,dma-range
+                else:
+                  properties:
+                    apple,dma-range: false
 
 unevaluatedProperties: false
 

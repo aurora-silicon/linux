@@ -23,6 +23,7 @@ select:
           - apple,t8122-prores
           - apple,t6030-prores
           - apple,t6031-prores
+          - apple,t6032-prores
   required:
     - compatible
 
@@ -35,19 +36,14 @@ allOf:
         compatible:
           contains:
             enum:
-              - apple,t8122-prores
-              - apple,t6030-prores
-              - apple,t6031-prores
+              - apple,t6032-prores
       required:
         - compatible
     then:
       properties:
         compatible:
           items:
-            - enum:
-                - apple,t8122-prores
-                - apple,t6030-prores
-                - apple,t6031-prores
+            - const: apple,t6032-prores
             - const: apple,prores
 
         reg:
@@ -56,9 +52,10 @@ allOf:
 
         interrupts:
           minItems: 1
-          maxItems: 2
+          maxItems: 1
 
         power-domains:
+          minItems: 1
           maxItems: 1
 
         iommus:
@@ -71,51 +68,94 @@ allOf:
         - interrupts
         - power-domains
         - iommus
-
     else:
-      properties:
-        compatible:
-          const: apple,t8140-prores
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t8122-prores
+                    - apple,t6030-prores
+                    - apple,t6031-prores
+            required:
+              - compatible
+          then:
+            properties:
+              compatible:
+                items:
+                  - enum:
+                      - apple,t8122-prores
+                      - apple,t6030-prores
+                      - apple,t6031-prores
+                  - const: apple,prores
 
-        reg:
-          items:
-            - description: Engine registers
-            - description: Wrapper registers
+              reg:
+                minItems: 2
+                maxItems: 3
 
-        reg-names:
-          items:
-            - const: core
-            - const: wrapper
+              interrupts:
+                minItems: 1
+                maxItems: 2
 
-        interrupts:
-          minItems: 1
-          maxItems: 2
+              power-domains:
+                maxItems: 1
 
-        iommus:
-          maxItems: 1
+              iommus:
+                minItems: 1
+                maxItems: 2
 
-        power-domains:
-          minItems: 1
-          items:
-            - description: The engine's power domain
-            - description: Performance request held while the engine works
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - power-domains
+              - iommus
 
-        power-domain-names:
-          minItems: 1
-          items:
-            - const: core
-            - const: perf
+          else:
+            properties:
+              compatible:
+                const: apple,t8140-prores
 
-        resets:
-          maxItems: 1
+              reg:
+                items:
+                  - description: Engine registers
+                  - description: Wrapper registers
 
-      required:
-        - compatible
-        - reg
-        - reg-names
-        - interrupts
-        - iommus
-        - power-domains
+              reg-names:
+                items:
+                  - const: core
+                  - const: wrapper
+
+              interrupts:
+                minItems: 1
+                maxItems: 2
+
+              iommus:
+                maxItems: 1
+
+              power-domains:
+                minItems: 1
+                items:
+                  - description: The engine's power domain
+                  - description: Performance request held while the engine works
+
+              power-domain-names:
+                minItems: 1
+                items:
+                  - const: core
+                  - const: perf
+
+              resets:
+                maxItems: 1
+
+            required:
+              - compatible
+              - reg
+              - reg-names
+              - interrupts
+              - iommus
+              - power-domains
 
 unevaluatedProperties: false
 

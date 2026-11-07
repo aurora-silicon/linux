@@ -23,6 +23,7 @@ select:
           - apple,t8122-aes
           - apple,t6030-aes
           - apple,t6031-aes
+          - apple,t6032-aes
   required:
     - compatible
 
@@ -35,19 +36,14 @@ allOf:
         compatible:
           contains:
             enum:
-              - apple,t8122-aes
-              - apple,t6030-aes
-              - apple,t6031-aes
+              - apple,t6032-aes
       required:
         - compatible
     then:
       properties:
         compatible:
           items:
-            - enum:
-                - apple,t8122-aes
-                - apple,t6030-aes
-                - apple,t6031-aes
+            - const: apple,t6032-aes
             - const: apple,aes
 
         reg:
@@ -55,12 +51,15 @@ allOf:
           maxItems: 2
 
         interrupts:
+          minItems: 1
           maxItems: 1
 
         power-domains:
+          minItems: 1
           maxItems: 1
 
         iommus:
+          minItems: 1
           maxItems: 1
 
       required:
@@ -69,37 +68,78 @@ allOf:
         - interrupts
         - power-domains
         - iommus
-
     else:
-      properties:
-        compatible:
-          oneOf:
-            - items:
-                - const: apple,t6041-aes
-                - const: apple,aes
-            - items:
-                - const: apple,t8140-aes
-                - const: apple,aes
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t8122-aes
+                    - apple,t6030-aes
+                    - apple,t6031-aes
+            required:
+              - compatible
+          then:
+            properties:
+              compatible:
+                items:
+                  - enum:
+                      - apple,t8122-aes
+                      - apple,t6030-aes
+                      - apple,t6031-aes
+                  - const: apple,aes
 
-        reg:
-          minItems: 3
-          maxItems: 3
-          description: Register apertures in hardware-description order.
+              reg:
+                minItems: 2
+                maxItems: 2
 
-        interrupts:
-          maxItems: 1
+              interrupts:
+                maxItems: 1
 
-        power-domains:
-          maxItems: 1
+              power-domains:
+                maxItems: 1
 
-        iommus:
-          maxItems: 1
+              iommus:
+                maxItems: 1
 
-      required:
-        - compatible
-        - reg
-        - interrupts
-        - power-domains
-        - iommus
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - power-domains
+              - iommus
+
+          else:
+            properties:
+              compatible:
+                oneOf:
+                  - items:
+                      - const: apple,t6041-aes
+                      - const: apple,aes
+                  - items:
+                      - const: apple,t8140-aes
+                      - const: apple,aes
+
+              reg:
+                minItems: 3
+                maxItems: 3
+                description: Register apertures in hardware-description order.
+
+              interrupts:
+                maxItems: 1
+
+              power-domains:
+                maxItems: 1
+
+              iommus:
+                maxItems: 1
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - power-domains
+              - iommus
 
 unevaluatedProperties: false

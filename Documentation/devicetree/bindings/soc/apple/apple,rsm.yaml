@@ -21,6 +21,7 @@ select:
           - apple,t8122-rsm
           - apple,t6030-rsm
           - apple,t6031-rsm
+          - apple,t6032-rsm
   required:
     - compatible
 
@@ -33,19 +34,14 @@ allOf:
         compatible:
           contains:
             enum:
-              - apple,t8122-rsm
-              - apple,t6030-rsm
-              - apple,t6031-rsm
+              - apple,t6032-rsm
       required:
         - compatible
     then:
       properties:
         compatible:
           items:
-            - enum:
-                - apple,t8122-rsm
-                - apple,t6030-rsm
-                - apple,t6031-rsm
+            - const: apple,t6032-rsm
             - const: apple,rsm
 
         reg:
@@ -53,43 +49,87 @@ allOf:
           maxItems: 2
 
         interrupts:
+          minItems: 1
           maxItems: 1
 
         power-domains:
+          minItems: 1
           maxItems: 1
 
         iommus:
+          minItems: 1
           maxItems: 1
 
       required:
         - compatible
         - reg
         - interrupts
+        - power-domains
         - iommus
-
     else:
-      properties:
-        compatible:
-          oneOf:
-            - items:
-                - const: apple,t8140-rsm
-                - const: apple,rsm
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t8122-rsm
+                    - apple,t6030-rsm
+                    - apple,t6031-rsm
+            required:
+              - compatible
+          then:
+            properties:
+              compatible:
+                items:
+                  - enum:
+                      - apple,t8122-rsm
+                      - apple,t6030-rsm
+                      - apple,t6031-rsm
+                  - const: apple,rsm
 
-        reg:
-          minItems: 2
-          maxItems: 2
-          description: Register apertures in hardware-description order.
+              reg:
+                minItems: 2
+                maxItems: 2
 
-        interrupts:
-          maxItems: 1
+              interrupts:
+                maxItems: 1
 
-        iommus:
-          maxItems: 1
+              power-domains:
+                maxItems: 1
 
-      required:
-        - compatible
-        - reg
-        - interrupts
-        - iommus
+              iommus:
+                maxItems: 1
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - iommus
+
+          else:
+            properties:
+              compatible:
+                oneOf:
+                  - items:
+                      - const: apple,t8140-rsm
+                      - const: apple,rsm
+
+              reg:
+                minItems: 2
+                maxItems: 2
+                description: Register apertures in hardware-description order.
+
+              interrupts:
+                maxItems: 1
+
+              iommus:
+                maxItems: 1
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - iommus
 
 unevaluatedProperties: false

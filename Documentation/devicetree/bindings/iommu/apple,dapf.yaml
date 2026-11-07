@@ -24,6 +24,7 @@ select:
           - apple,t8122-dapf
           - apple,t6030-dapf
           - apple,t6031-dapf
+          - apple,t6032-dapf
   required:
     - compatible
 
@@ -34,6 +35,7 @@ properties:
           - apple,t8122-dapf
           - apple,t6030-dapf
           - apple,t6031-dapf
+          - apple,t6032-dapf
       - const: apple,dapf
 
   reg:

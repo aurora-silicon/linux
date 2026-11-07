@@ -26,6 +26,7 @@ select:
           - apple,t8122-mcc
           - apple,t6030-mcc
           - apple,t6031-mcc
+          - apple,t6032-mcc
   required:
     - compatible
 
@@ -38,58 +39,82 @@ allOf:
         compatible:
           contains:
             enum:
-              - apple,t8122-mcc
-              - apple,t6030-mcc
-              - apple,t6031-mcc
+              - apple,t6032-mcc
       required:
         - compatible
     then:
       properties:
         compatible:
           items:
-            - enum:
-                - apple,t8122-mcc
-                - apple,t6030-mcc
-                - apple,t6031-mcc
+            - const: apple,t6032-mcc
             - const: apple,mcc
 
         reg:
-          minItems: 5
-          maxItems: 11
+          minItems: 20
+          maxItems: 20
 
       required:
         - compatible
         - reg
-
     else:
-      properties:
-        compatible:
-          oneOf:
-            - enum:
-                - apple,t8132-mcc
-                - apple,t8140-mcc
-            - items:
-                - const: apple,t6041-mcc
-                - const: apple,t8140-mcc
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t8122-mcc
+                    - apple,t6030-mcc
+                    - apple,t6031-mcc
+            required:
+              - compatible
+          then:
+            properties:
+              compatible:
+                items:
+                  - enum:
+                      - apple,t8122-mcc
+                      - apple,t6030-mcc
+                      - apple,t6031-mcc
+                  - const: apple,mcc
 
-        reg:
-          description: Per-plane blocks on T8140, or the two multicast apertures on T8132.
-          minItems: 1
-          maxItems: 32
+              reg:
+                minItems: 5
+                maxItems: 11
 
-        nonposted-mmio: true
+            required:
+              - compatible
+              - reg
 
-        apple,boot-dma-devices:
-          $ref: /schemas/types.yaml#/definitions/phandle-array
-          items:
-            maxItems: 1
-          description:
-            Devices that take over DMA the bootloader left running. Cache allocation
-            is enabled only once each of them is bound to its driver.
+          else:
+            properties:
+              compatible:
+                oneOf:
+                  - enum:
+                      - apple,t8132-mcc
+                      - apple,t8140-mcc
+                  - items:
+                      - const: apple,t6041-mcc
+                      - const: apple,t8140-mcc
 
-      required:
-        - compatible
-        - reg
+              reg:
+                description: Per-plane blocks on T8140, or the two multicast apertures on T8132.
+                minItems: 1
+                maxItems: 32
+
+              nonposted-mmio: true
+
+              apple,boot-dma-devices:
+                $ref: /schemas/types.yaml#/definitions/phandle-array
+                items:
+                  maxItems: 1
+                description:
+                  Devices that take over DMA the bootloader left running. Cache allocation
+                  is enabled only once each of them is bound to its driver.
+
+            required:
+              - compatible
+              - reg
 
 unevaluatedProperties: false
 
