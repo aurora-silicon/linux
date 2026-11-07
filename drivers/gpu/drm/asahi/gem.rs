@@ -210,6 +210,21 @@ impl ObjectRef {
 
         vm.map_at(addr, self.gem.size(), &self.gem, prot, guard)
     }
+
+    /// Map at a specific address, reserving `guard_pages` unmapped pages
+    /// after the object in that Vm's allocator (T8152, module 1134).
+    #[cfg(CONFIG_DRM_ASAHI_G18)]
+    pub(crate) fn map_at_with_guards(
+        &mut self,
+        vm: &crate::mmu::Vm,
+        addr: u64,
+        prot: mmu::Prot,
+        guard_pages: usize,
+    ) -> Result<crate::mmu::KernelMapping> {
+        validate_vm_binding(&self.gem, vm)?;
+
+        vm.map_at_with_guards(addr, self.gem.size(), &self.gem, prot, guard_pages)
+    }
 }
 
 pub(crate) struct AsahiObjConfig {
@@ -395,6 +410,12 @@ impl Drop for KernelMappingPin {
 }
 
 impl AsahiObject {
+    /// Whether this is a kernel-created object.
+    #[cfg(CONFIG_DRM_ASAHI_G18)]
+    pub(crate) fn is_kernel(&self) -> bool {
+        self.kernel
+    }
+
     /// Whether CPU mappings use the cacheable WRITEBACK policy.
     pub(crate) fn is_writeback(&self) -> bool {
         self.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_WRITEBACK != 0

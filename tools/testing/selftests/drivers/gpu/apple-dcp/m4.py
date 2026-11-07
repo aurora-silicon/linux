@@ -58,7 +58,8 @@ def header_body(source):
 
 
 def production(root):
-    return PREFIX + ''.join(header_body((root / APPLE / p).read_text()) for p in HEADERS)
+    return (PREFIX + ''.join(header_body((root / APPLE / p).read_text()) for p in HEADERS) +
+            'const struct dcp_m4_profile *dcp_m4_pf = &dcp_m4_profile_j713;\n')
 
 
 def request_golden(root, output):

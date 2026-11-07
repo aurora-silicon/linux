@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+
+/ {
+	soc {
+		/*
+		 * Perf-state floors of voter agents 0-3 (PMP, CLPC, GFX, AP) and,
+		 * at 0x1c6000, the honoured states and per-rail voter enables
+		 * (rails DCS, SOC, DISP) in the PMC window, pmgr reg 46.
+		 */
+		pmc: power-management@302800000 {
+			compatible = "apple,t8152-pmc";
+			reg = <0x3 0x02800000 0x0 0x10000>,
+			      <0x3 0x029c6000 0x0 0x3000>;
+			reg-names = "voters", "rails";
+			#address-cells = <1>;
+			#size-cells = <0>;
+			#cooling-cells = <2>;
+			/* PMP, CLPC and AP agents */
+			apple,static-voters = <0 1 3>;
+
+			clpc: performance-controller@1 {
+				compatible = "apple,t8152-clpc";
+				reg = <1>;
+			};
+		};
+	};
+};
