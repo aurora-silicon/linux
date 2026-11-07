@@ -22,6 +22,8 @@ select:
           - apple,t6032-rsm
           - apple,t8122-rsm
           - apple,t8140-rsm
+          - apple,t8142-rsm
+          - apple,t8152-rsm
   required:
     - compatible
 
@@ -66,16 +68,15 @@ allOf:
     else:
       properties:
         compatible:
-          oneOf:
-            - items:
-                - const: apple,t8140-rsm
-                - const: apple,rsm
-            - items:
-                - enum:
-                    - apple,t8122-rsm
-                    - apple,t6030-rsm
-                    - apple,t6031-rsm
-                - const: apple,rsm
+          items:
+            - enum:
+                - apple,t6030-rsm
+                - apple,t6031-rsm
+                - apple,t8122-rsm
+                - apple,t8140-rsm
+                - apple,t8142-rsm
+                - apple,t8152-rsm
+            - const: apple,rsm
 
         reg:
           minItems: 2
