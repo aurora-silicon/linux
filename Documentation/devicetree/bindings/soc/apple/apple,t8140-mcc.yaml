@@ -22,17 +22,20 @@ properties:
           - apple,t8132-mcc
           - apple,t8140-mcc
       - items:
-          - const: apple,t6041-mcc
-          - const: apple,t8140-mcc
-      - items:
           - enum:
-              - apple,t8122-mcc
+              - apple,t6000-mcc
               - apple,t6030-mcc
               - apple,t6031-mcc
+              - apple,t8103-mcc
+              - apple,t8122-mcc
           - const: apple,mcc
+      - items:
+          - enum:
+              - apple,t6041-mcc
+          - const: apple,t8140-mcc
 
   reg:
-    description: Per-plane blocks on T8140, or the two multicast apertures on T8132.
+    description: Per-plane blocks or multicast memory-controller apertures.
     minItems: 1
     maxItems: 32
 

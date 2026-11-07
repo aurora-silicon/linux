@@ -19,13 +19,11 @@ properties:
     oneOf:
       - const: apple,t8140-prores
       - items:
-          - const: apple,t6041-prores
-          - const: apple,prores
-      - items:
           - enum:
-              - apple,t8122-prores
               - apple,t6030-prores
               - apple,t6031-prores
+              - apple,t6041-prores
+              - apple,t8122-prores
           - const: apple,prores
 
   reg:
@@ -76,9 +74,9 @@ allOf:
         compatible:
           contains:
             enum:
-              - apple,t8122-prores
               - apple,t6030-prores
               - apple,t6031-prores
+              - apple,t8122-prores
     then:
       properties:
         reg:

@@ -18,15 +18,12 @@ description: |
 
 properties:
   compatible:
-    oneOf:
-      - items:
-          - enum:
-              - apple,t8103-pwm
-              - apple,t8122-pwm
-          - const: apple,pwm
-      - items:
-          - const: apple,t6000-pwm
-          - const: apple,pwm
+    items:
+      - enum:
+          - apple,t6000-pwm
+          - apple,t8103-pwm
+          - apple,t8122-pwm
+      - const: apple,pwm
 
   reg:
     maxItems: 1

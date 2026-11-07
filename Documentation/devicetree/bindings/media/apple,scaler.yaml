@@ -16,22 +16,19 @@ description: |
 
 properties:
   compatible:
-    oneOf:
-      - items:
-          - const: apple,t6041-scaler
-          - const: apple,scaler
-      - items:
-          - const: apple,t8140-scaler
-          - const: apple,scaler
-      - items:
-          - enum:
-              - apple,t8122-scaler
-              - apple,t6030-scaler
-              - apple,t6031-scaler
-          - const: apple,scaler
+    items:
+      - enum:
+          - apple,t6000-scaler
+          - apple,t6030-scaler
+          - apple,t6031-scaler
+          - apple,t6041-scaler
+          - apple,t8103-scaler
+          - apple,t8122-scaler
+          - apple,t8140-scaler
+      - const: apple,scaler
 
   reg:
-    minItems: 3
+    minItems: 2
     maxItems: 4
 
   interrupts:
@@ -64,26 +61,54 @@ allOf:
       properties:
         compatible:
           contains:
-            enum:
-              - apple,t8122-scaler
-              - apple,t6030-scaler
-              - apple,t6031-scaler
+            const: apple,t8103-scaler
     then:
       properties:
         reg:
-          minItems: 3
-          maxItems: 4
+          maxItems: 2
     else:
+      if:
+        properties:
+          compatible:
+            contains:
+              const: apple,t6000-scaler
+      then:
+        properties:
+          reg:
+            minItems: 3
+            maxItems: 3
+      else:
+        if:
+          properties:
+            compatible:
+              contains:
+                enum:
+                  - apple,t6030-scaler
+                  - apple,t6031-scaler
+                  - apple,t8122-scaler
+        then:
+          properties:
+            reg:
+              minItems: 3
+        else:
+          properties:
+            reg:
+              minItems: 4
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              enum:
+                - apple,t6030-scaler
+                - apple,t6031-scaler
+                - apple,t8122-scaler
+    then:
       properties:
-        reg:
-          minItems: 4
-          maxItems: 4
         power-domains:
           minItems: 2
-          maxItems: 2
         iommus:
           minItems: 2
-          maxItems: 2
       required:
         - resets
         - clocks
