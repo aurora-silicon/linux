@@ -30,6 +30,7 @@ select:
           - apple,t8103-pmgr-clocks
           - apple,t8132-pmgr-clocks
           - apple,t8140-pmgr-clocks
+          - apple,t8142-pmgr-clocks
   required:
     - compatible
 
@@ -88,18 +89,14 @@ allOf:
           else:
             properties:
               compatible:
-                oneOf:
-                  - items:
-                      - enum:
-                          - apple,t6041-pmgr-clocks
-                          - apple,t8140-pmgr-clocks
-                      - const: apple,pmgr-clocks
-                  - items:
-                      - const: apple,t8103-pmgr-clocks
-                      - const: apple,pmgr-clocks
-                  - items:
-                      - const: apple,t6000-pmgr-clocks
-                      - const: apple,pmgr-clocks
+                items:
+                  - enum:
+                      - apple,t6000-pmgr-clocks
+                      - apple,t6041-pmgr-clocks
+                      - apple,t8103-pmgr-clocks
+                      - apple,t8140-pmgr-clocks
+                      - apple,t8142-pmgr-clocks
+                  - const: apple,pmgr-clocks
 
               reg:
                 description: PMGR control apertures in hardware-description order.
@@ -120,6 +117,16 @@ allOf:
               - apple,pmgr
 
             allOf:
+              - if:
+                  properties:
+                    compatible:
+                      contains:
+                        const: apple,t8142-pmgr-clocks
+                then:
+                  properties:
+                    reg:
+                      minItems: 54
+                      maxItems: 54
               - if:
                   properties:
                     compatible:
