@@ -112,10 +112,12 @@ impl InitData {
     ) -> Result {
         use mmu::{PROT_FW_SHARED_RW as RW, PROT_FW_SHARED_RO as RO,
                   PROT_GPU_SHARED_RW as GPU};
-        let profile = m::RootProfile::for_m5_layouts(variant.m5_layouts.ok_or(EINVAL)?);
+        let layouts = variant.m5_layouts.ok_or(EINVAL)?;
+        let profile = m::RootProfile::for_m5_layouts(layouts);
         let layout = profile.m5_layout().ok_or(EINVAL)?;
         self.m5 = true;
         self.m5_layout = layout;
+        self.set_m5_policy_layouts(layouts);
         // TA, fragment and compute share the compute work ring per priority; every
         // preparation's claim on it is counted from the first publication on.
         self.outer_credits = Some(super::outer_credit::Credits::new()?);

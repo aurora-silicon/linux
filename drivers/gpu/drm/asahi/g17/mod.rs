@@ -1488,9 +1488,9 @@ impl Gpu {
         }
         let m5 = cfg.profile.is_m5();
         if m5 {
-            // The M5 graph builds only the 26A428 InitData layouts. A firmware that checks
-            // another layout is refused here, before anything is written to the GPU.
-            if variant.m5_layouts != Some(fw::variant::M5Layouts::V26A428) {
+            // The M5 graph builds the InitData layouts the firmware build names. A build that
+            // names none is refused here, before anything is written to the GPU.
+            if variant.m5_layouts.is_none() {
                 dev_err!(
                     dev.as_ref(),
                     "No M5 InitData layouts for this GPU firmware build ({:?})\n",

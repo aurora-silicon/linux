@@ -1495,7 +1495,8 @@ pub(crate) const M5_26B123_STATUS_CONFIG_BANDS: &[LayoutBand] = &[
 ];
 
 /// Status-config size of 26B123 (entry 13 of its allocation size table).
-pub(crate) const M5_26B123_STATUS_CONFIG_SIZE: usize = 0x790;
+pub(crate) const M5_26B123_STATUS_CONFIG_SIZE: usize =
+    ABI_ALLOCATION_SIZES_26B123_M5[ALLOC_STATUS_CONFIG];
 
 /// The words 26B123 has and 26A428 does not, at 26B123 offsets: the override slot of each
 /// controller block (0x5dc and 0x640, zero) and its value (0x60c = 5000 and 0x670 = 0). The
@@ -1914,10 +1915,41 @@ const _: () = {
     assert!(M5_LAYOUT_26B123.private.total == M5_LAYOUT_26A428.private.total);
     // The kick-shared pointer and the last word the 26C5035r layout moves.
     let kick = M5_KICK_SHARED_POINTER;
-    assert!(matches!(M5_LAYOUT_26A428.hw_data_offset(kick), Some(0x27dc)));
-    assert!(matches!(M5_LAYOUT_26C5035.hw_data_offset(kick), Some(0x27e0)));
-    assert!(matches!(M5_LAYOUT_26C5035.hw_data_offset(0x2846), Some(0x284a)));
-    assert!(matches!(M5_LAYOUT_26C5035.hw_data_offset(0x271c), Some(0x271c)));
+    assert!(matches!(
+        M5_LAYOUT_26A428.hw_data_offset(kick),
+        Some(0x27dc)
+    ));
+    assert!(matches!(
+        M5_LAYOUT_26C5035.hw_data_offset(kick),
+        Some(0x27e0)
+    ));
+    assert!(matches!(
+        M5_LAYOUT_26C5035.hw_data_offset(0x2846),
+        Some(0x284a)
+    ));
+    assert!(matches!(
+        M5_LAYOUT_26C5035.hw_data_offset(0x271c),
+        Some(0x271c)
+    ));
+};
+
+const _: () = {
+    use super::super::variant::M5Layouts;
+    // Every M5 build's policy map and status-config map fill the allocations of its size table,
+    // and the policy starts where the encoders write its 26A428 form.
+    let builds = [M5Layouts::V26A428, M5Layouts::V26B123, M5Layouts::V26C5035];
+    let mut index = 0;
+    while index < builds.len() {
+        let profile = RootProfile::for_m5_layouts(builds[index]);
+        let layout = match profile.m5_layout() {
+            Some(layout) => layout,
+            None => panic!("an M5 build without an M5 layout"),
+        };
+        assert!(m5_policy_size(builds[index]) == layout.policy_size());
+        assert!(profile.m5_status_config().size == layout.status_config_size());
+        assert!(layout.shared.policy == M5_SHARED_LAYOUT.policy);
+        index += 1;
+    }
 };
 
 pub(crate) const M5_SHARED_LAYOUT: SharedClusterLayout = M5_LAYOUT_26A428.shared;
@@ -2256,7 +2288,7 @@ pub(crate) const M5_26B123_POLICY_BANDS: &[LayoutBand] = &[
 ];
 
 /// Power-policy size of 26B123 (entry 4 of its allocation size table).
-pub(crate) const M5_26B123_POLICY_SIZE: usize = 0x12728;
+pub(crate) const M5_26B123_POLICY_SIZE: usize = ABI_ALLOCATION_SIZES_26B123_M5[ALLOC_POLICY];
 
 /// The 26B123 policy controller input words the 26A428 controller defaults do not write, at 26B123
 /// offsets:
@@ -2950,26 +2982,6 @@ pub(crate) fn encode_m5_region_c(out: &mut [u8]) -> Result<(), InitdataError> {
     Ok(())
 }
 
-pub(crate) fn encode_m5_primary_status_b(
-    layout: &M5Layout,
-    fwctl_state: u64,
-    fwctl_ring: u64,
-    status_b: u64,
-    out: &mut [u8],
-) -> Result<(), InitdataError> {
-    if out.len() != layout.status_b_span() {
-        return Err(InitdataError::BufferSize);
-    }
-    encode_m5_primary_status_b_for(
-        &M5_26A428_STATUS_CONFIG,
-        layout.status_config_in_status_b(),
-        fwctl_state,
-        fwctl_ring,
-        status_b,
-        out,
-    )
-}
-
 /// Encodes the primary status-B span (`out`, from status B to the primary status A) of a build
 /// whose status config sits at `config` in the span and is laid out as `map` says.
 pub(crate) fn encode_m5_primary_status_b_for(
@@ -3156,6 +3168,14 @@ pub(crate) fn encode_m5_bundle_policy(
     Ok(())
 }
 
+/// The power policy in `out` (a bundle) in its 26A428 form, which the controller defaults write
+/// and [`relayout_m5_policy`] then lays out for the firmware build. Every M5 layout starts the
+/// policy at the same offset.
+fn m5_policy_source(out: &mut [u8]) -> Result<&mut [u8], InitdataError> {
+    out.get_mut(M5_SHARED_LAYOUT.policy..M5_SHARED_LAYOUT.policy + M5_POLICY_SIZE)
+        .ok_or(InitdataError::BufferSize)
+}
+
 /// Initial controller inputs for J714 with the matched calibration.
 pub(crate) fn encode_m5_policy_controller_defaults(out: &mut [u8]) -> Result<(), InitdataError> {
     if out.len() < M5_SHARED_PREFIX_SIZE { return Err(InitdataError::BufferSize); }
@@ -3174,7 +3194,7 @@ pub(crate) fn encode_m5_policy_controller_defaults(out: &mut [u8]) -> Result<(),
         0x42b6ec22, 0x42c80000, 0x00000000, 0x00000000,
     ];
     for (index, &value) in RELATIVE_POWER_AUX.iter().enumerate() { put_u32(out, 0x1a64 + index * 4, value); }
-    let policy = &mut out[M5_SHARED_LAYOUT.policy..M5_SHARED_LAYOUT.policy + M5_POLICY_SIZE];
+    let policy = m5_policy_source(out)?;
     const INITIAL: &[(usize, u32)] = &[
         (0xd4, 0x3f828f5c),
         (0xd8, 0x3f828f5c),
@@ -3425,7 +3445,7 @@ pub(crate) fn encode_m5_policy_controller_defaults(out: &mut [u8]) -> Result<(),
 /// tags.
 pub(crate) fn encode_m5_policy_controller_defaults_j716c(out: &mut [u8]) -> Result<(), InitdataError> {
     encode_m5_policy_controller_defaults(out)?;
-    let policy = &mut out[M5_SHARED_LAYOUT.policy..M5_SHARED_LAYOUT.policy + M5_POLICY_SIZE];
+    let policy = m5_policy_source(out)?;
     const MAXIMUM_POWER: u32 = 196_098;
     const MAXIMUM_POWER_F32: u32 = 0x483f_8080;
     for offset in [M5_POLICY_MAXIMUM_POWER, 0xad0, 0x44a4, 0x44a8, 0x44ac, 0x45e4] {
@@ -3464,7 +3484,7 @@ pub(crate) fn encode_m5_policy_controller_defaults_j775d(out: &mut [u8]) -> Resu
         0x421c_12dd, 0x4230_6915, 0x4250_6a36, 0x427d_e40c, 0x4294_0cc0, 0x42bd_bd8e, 0x42c8_0000,
     ];
     for (index, &value) in RELATIVE_POWER_AUX.iter().enumerate() { put_u32(out, 0x1a64 + index * 4, value); }
-    let policy = &mut out[M5_SHARED_LAYOUT.policy..M5_SHARED_LAYOUT.policy + M5_POLICY_SIZE];
+    let policy = m5_policy_source(out)?;
     const MAXIMUM_POWER: u32 = 345_262;
     const MAXIMUM_POWER_F32: u32 = 0x48a8_95c0;
     for offset in [M5_POLICY_MAXIMUM_POWER, 0xad0, 0x44a4, 0x44a8, 0x44ac, 0x45e4] {
