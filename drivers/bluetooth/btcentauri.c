@@ -786,7 +786,7 @@ static int cen_hci_send(struct hci_dev *hdev, struct sk_buff *skb)
 		ret = -ENOBUFS;
 	else {
 		skb_queue_tail(queue, skb);
-		mod_delayed_work(system_wq, &bt->poll, 0);
+		mod_delayed_work(system_percpu_wq, &bt->poll, 0);
 	}
 	mutex_unlock(&bt->lock);
 	if (!ret)
