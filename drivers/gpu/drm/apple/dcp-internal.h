@@ -648,6 +648,8 @@ struct apple_dcp {
 	bool s2r_fw_down;
 	/* This driver raised the display domains, and nothing has lowered them since. */
 	bool s2r_domains_up;
+	/* Counted in pmc-dcp, the number of powered DCPs */
+	bool pmc_up;
 	bool s2r_power_on;
 	bool s2r_power_oob;
 	u8 s2r_step;
