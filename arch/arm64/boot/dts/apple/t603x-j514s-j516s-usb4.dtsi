@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
-/* Additional loader aliases for the T6030 PCIe adapter tunables. */
+/*
+ * J514S/J516S: loader aliases for the T6030 PCIe adapter tunables, and the
+ * Type-C display routes of both external processors with dcpext1's audio.
+ */
 
 / {
 	aliases {
@@ -70,10 +73,7 @@
 	};
 };
 
-/*
- * DPA2: the Type-C DisplayPort processor's (dcpext1) audio, SIO channel 0x68,
- * as the ADT links dcpext1 to dp-audio2.
- */
+/* DPA2: dcpext1's audio on SIO channel 0x68, as the ADT links them. */
 &dcpext1 {
 	ports {
 		#address-cells = <1>;
