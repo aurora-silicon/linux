@@ -134,22 +134,22 @@ static void apple_jpeg_job_reject_test(struct kunit *test)
 {
 	struct apple_jpeg_write *w = kunit_kcalloc(test, APPLE_JPEG_MAX_WRITES, sizeof(*w),
 						   GFP_KERNEL);
+	const struct apple_jpeg_reg_layout *layout = apple_jpeg_t8140.layout;
 	struct apple_jpeg_job job;
 
 	KUNIT_ASSERT_NOT_NULL(test, w);
 	job = apple_jpeg_test_job();
 	job.luma_stride = 1000;
-	KUNIT_EXPECT_EQ(test, apple_jpeg_build_job(apple_jpeg_t8140.layout, &job, w, APPLE_JPEG_MAX_WRITES), -EINVAL);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_build_job(layout, &job, w, APPLE_JPEG_MAX_WRITES), -EINVAL);
 	job = apple_jpeg_test_job();
 	job.output += 16;
-	KUNIT_EXPECT_EQ(test, apple_jpeg_build_job(apple_jpeg_t8140.layout, &job, w, APPLE_JPEG_MAX_WRITES), -EINVAL);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_build_job(layout, &job, w, APPLE_JPEG_MAX_WRITES), -EINVAL);
 	job = apple_jpeg_test_job();
 	job.input_end = job.chroma - 1;
-	KUNIT_EXPECT_EQ(test, apple_jpeg_build_job(apple_jpeg_t8140.layout, &job, w, APPLE_JPEG_MAX_WRITES), -EINVAL);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_build_job(layout, &job, w, APPLE_JPEG_MAX_WRITES), -EINVAL);
 	job = apple_jpeg_test_job();
-	KUNIT_EXPECT_EQ(test, apple_jpeg_build_job(apple_jpeg_t8140.layout, &job, w, 10), -ENOSPC);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_build_job(layout, &job, w, 10), -ENOSPC);
 }
-
 
 static void apple_jpeg_layout_test(struct kunit *test)
 {
@@ -218,9 +218,11 @@ static void apple_jpeg_older_hwrev_test(struct kunit *test)
 
 	for (unsigned int i = 0; i < ARRAY_SIZE(variants); i++) {
 		KUNIT_EXPECT_EQ(test, variants[i]->hwrev_mask, 0xffff0fff);
-		for (unsigned int nibble = 0; nibble < 16; nibble++)
-			KUNIT_EXPECT_TRUE(test, apple_jpeg_hwrev_supported(variants[i],
-					 (raw[i] & 0xffff0fff) | (nibble << 12)));
+		for (unsigned int nibble = 0; nibble < 16; nibble++) {
+			u32 hwrev = (raw[i] & 0xffff0fff) | (nibble << 12);
+
+			KUNIT_EXPECT_TRUE(test, apple_jpeg_hwrev_supported(variants[i], hwrev));
+		}
 		for (unsigned int j = 0; j < ARRAY_SIZE(raw); j++)
 			KUNIT_EXPECT_EQ(test, apple_jpeg_hwrev_supported(variants[i], raw[j]),
 					i == j);
@@ -331,6 +333,7 @@ static void apple_jpeg_address_reject_test(struct kunit *test)
 	struct apple_jpeg_write *w = kunit_kcalloc(test, APPLE_JPEG_MAX_WRITES,
 						 sizeof(*w), GFP_KERNEL);
 	struct apple_jpeg_job job = apple_jpeg_test_job();
+	int ret;
 
 	KUNIT_ASSERT_NOT_NULL(test, w);
 	/* Each address and inclusive end must fit, without truncation. */
@@ -361,13 +364,14 @@ static void apple_jpeg_address_reject_test(struct kunit *test)
 			break;
 		}
 		w[0].value = 0xdeadbeef;
-		KUNIT_EXPECT_EQ(test, apple_jpeg_build_job(apple_jpeg_t6000.layout, &bad, w,
-							 APPLE_JPEG_MAX_WRITES), -ERANGE);
+		ret = apple_jpeg_build_job(apple_jpeg_t6000.layout, &bad, w,
+					   APPLE_JPEG_MAX_WRITES);
+		KUNIT_EXPECT_EQ(test, ret, -ERANGE);
 		KUNIT_EXPECT_EQ(test, w[0].value, 0xdeadbeef);
 	}
 	job.output = U64_MAX & ~31ULL;
-	KUNIT_EXPECT_EQ(test, apple_jpeg_build_job(apple_jpeg_t8140.layout, &job, w,
-						 APPLE_JPEG_MAX_WRITES), -ERANGE);
+	ret = apple_jpeg_build_job(apple_jpeg_t8140.layout, &job, w, APPLE_JPEG_MAX_WRITES);
+	KUNIT_EXPECT_EQ(test, ret, -ERANGE);
 }
 
 static struct kunit_case apple_jpeg_cases[] = {
