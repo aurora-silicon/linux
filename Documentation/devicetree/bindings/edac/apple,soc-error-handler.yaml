@@ -22,10 +22,14 @@ properties:
               - apple,t6000-error-handler
               - apple,t6001-error-handler
               - apple,t6002-error-handler
+              - apple,t6020-error-handler
+              - apple,t6021-error-handler
+              - apple,t6022-error-handler
               - apple,t6030-error-handler
               - apple,t6031-error-handler
               - apple,t6041-error-handler
               - apple,t8103-error-handler
+              - apple,t8112-error-handler
               - apple,t8122-error-handler
               - apple,t8140-error-handler
           - const: apple,soc-error-handler
@@ -34,28 +38,33 @@ properties:
               - apple,t6000-event-log
               - apple,t6001-event-log
               - apple,t6002-event-log
+              - apple,t6020-event-log
+              - apple,t6021-event-log
+              - apple,t6022-event-log
               - apple,t6030-event-log
               - apple,t6031-event-log
               - apple,t6041-event-log
               - apple,t8103-event-log
+              - apple,t8112-event-log
               - apple,t8122-event-log
               - apple,t8140-event-log
           - const: apple,soc-event-log
 
+  power-domains:
+    maxItems: 1
+    description: Power domain needed for the associated error-source registers.
+
   interrupts:
     minItems: 9
-    maxItems: 268
+    maxItems: 322
 
   reg:
     minItems: 10
-    maxItems: 205
+    maxItems: 255
     description: |
-      Per-source status and event-log register apertures. These views may
-      overlap controller resources; their description does not establish
-      safe AP ownership. Instances remain disabled until qualified.
-
-  power-domains:
-    maxItems: 1
+      Status apertures in hardware-description order. T6041 uses qualified
+      per-source NI status apertures in interrupt order. Native register
+      access on other variants requires separate qualification.
 
 required:
   - compatible
@@ -233,7 +242,6 @@ allOf:
           maxItems: 18
       required:
         - reg
-
   - if:
       properties:
         compatible:
@@ -249,7 +257,6 @@ allOf:
           maxItems: 16
       required:
         - reg
-
   - if:
       properties:
         compatible:
@@ -265,7 +272,6 @@ allOf:
           maxItems: 55
       required:
         - reg
-
   - if:
       properties:
         compatible:
@@ -281,7 +287,6 @@ allOf:
           maxItems: 28
       required:
         - reg
-
   - if:
       properties:
         compatible:
@@ -297,7 +302,6 @@ allOf:
           maxItems: 90
       required:
         - reg
-
   - if:
       properties:
         compatible:
@@ -313,7 +317,6 @@ allOf:
           maxItems: 28
       required:
         - reg
-
   - if:
       properties:
         compatible:
@@ -337,7 +340,6 @@ allOf:
               maxItems: 101
       required:
         - reg
-
   - if:
       properties:
         compatible:
