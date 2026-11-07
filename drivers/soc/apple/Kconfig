@@ -69,6 +69,16 @@ config APPLE_PMGR_DCS_KUNIT_TEST
 	  Also verify that boot constraints and concurrent endpoints retain
 	  their votes, and that suspend restores the last confirmed request.
 
+config APPLE_CLUSTER_PWRGATE
+	bool "Apple SoC CPU cluster power gates"
+	depends on OF
+	default ARCH_APPLE
+	help
+	  Sets the power-gate enable of each CPU cluster the device tree
+	  lists, early in boot. Without it, a core that the boot loader
+	  started and PMGR never powered on, such as the boot CPU, only
+	  clock-gates in WFI.
+
 config APPLE_RTKIT
 	tristate "Apple RTKit co-processor IPC protocol"
 	depends on APPLE_MAILBOX
