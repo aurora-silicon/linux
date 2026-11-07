@@ -14,79 +14,28 @@ description: |
   DART instances translate its DMA streams. The bootloader supplies the firmware
   memory handoff and IOVA mappings.
 
-properties:
-  compatible:
-    oneOf:
-      - enum:
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
           - apple,t6000-ave
+          - apple,t6020-ave
+          - apple,t6021-ave
+          - apple,t6022-ave
+          - apple,t6030-ave
+          - apple,t6031-ave
+          - apple,t6032-ave
           - apple,t6041-ave
           - apple,t8112-ave
+          - apple,t8122-ave
+          - apple,t8132-ave
           - apple,t8140-ave
-      - items:
-          - enum:
-              - apple,t6020-ave
-              - apple,t6021-ave
-              - apple,t6022-ave
-              - apple,t6030-ave
-              - apple,t6031-ave
-              - apple,t8122-ave
-          - const: apple,ave
+  required:
+    - compatible
 
-  reg:
-    minItems: 3
-    maxItems: 5
-    description: Codec, mailbox, coprocessor and generation-specific auxiliary banks.
-
-  reg-names:
-    minItems: 3
-    items:
-      - const: codec
-      - const: mailbox
-      - const: coproc
-      - const: power-control
-      - const: fabric
-
-  interrupts:
-    items:
-      - description: Mailbox, raised when the firmware posts to a host ring
-      - description: Codec interrupt handled by the firmware
-      - description: Codec interrupt handled by the firmware
-      - description: Codec interrupt handled by the firmware
-      - description: Codec interrupt handled by the firmware
-
-  power-domains:
-    minItems: 1
-    maxItems: 6
-
-  power-domain-names:
-    minItems: 5
-    items:
-      - const: dma
-      - const: pipe4
-      - const: pipe5
-      - const: me0
-      - const: me1
-      - const: perf
-        description: |
-          A performance floor the encoder needs to run at full speed, held
-          while the encoder is powered (for example the SoC rail floor of a
-          PMC).
-
-  iommus:
-    minItems: 2
-    maxItems: 4
-
-  memory-region:
-    items:
-      - description: Preloaded firmware text
-      - description: Preloaded firmware data
-
-required:
-  - compatible
-  - reg
-  - interrupts
-  - power-domains
-  - iommus
+properties:
+  compatible: true
 
 allOf:
   - if:
@@ -94,27 +43,185 @@ allOf:
         compatible:
           contains:
             enum:
-              - apple,t6020-ave
-              - apple,t6021-ave
-              - apple,t6022-ave
-              - apple,t6030-ave
-              - apple,t6031-ave
-              - apple,t8122-ave
+              - apple,t8132-ave
+      required:
+        - compatible
     then:
       properties:
+        compatible:
+          items:
+            - enum:
+                - apple,t8132-ave
+            - const: apple,ave
+
         reg:
           minItems: 5
           maxItems: 5
-    else:
-      properties:
-        reg:
-          minItems: 3
-          maxItems: 3
-        power-domains:
-          minItems: 5
-          maxItems: 6
-      required:
-        - reg-names
-        - power-domain-names
 
-additionalProperties: false
+        interrupts:
+          minItems: 5
+          maxItems: 5
+
+        power-domains:
+          minItems: 1
+          maxItems: 6
+
+        iommus:
+          minItems: 1
+          maxItems: 2
+
+        clocks:
+          maxItems: 1
+
+      required:
+        - compatible
+        - reg
+        - interrupts
+        - power-domains
+        - iommus
+    else:
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t6032-ave
+            required:
+              - compatible
+          then:
+            properties:
+              compatible:
+                items:
+                  - const: apple,t6032-ave
+                  - const: apple,ave
+
+              reg:
+                minItems: 5
+                maxItems: 5
+
+              interrupts:
+                minItems: 5
+                maxItems: 5
+
+              power-domains:
+                minItems: 5
+                maxItems: 6
+
+              iommus:
+                minItems: 2
+                maxItems: 2
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - power-domains
+              - iommus
+          else:
+            properties:
+              compatible:
+                oneOf:
+                  - enum:
+                      - apple,t6000-ave
+                      - apple,t6041-ave
+                      - apple,t8112-ave
+                      - apple,t8140-ave
+                  - items:
+                      - enum:
+                          - apple,t6020-ave
+                          - apple,t6021-ave
+                          - apple,t6022-ave
+                          - apple,t6030-ave
+                          - apple,t6031-ave
+                          - apple,t8122-ave
+                      - const: apple,ave
+
+              reg:
+                minItems: 3
+                maxItems: 5
+                description: Codec, mailbox, coprocessor and generation-specific auxiliary banks.
+
+              reg-names:
+                minItems: 3
+                items:
+                  - const: codec
+                  - const: mailbox
+                  - const: coproc
+                  - const: power-control
+                  - const: fabric
+
+              interrupts:
+                items:
+                  - description: Mailbox, raised when the firmware posts to a host ring
+                  - description: Codec interrupt handled by the firmware
+                  - description: Codec interrupt handled by the firmware
+                  - description: Codec interrupt handled by the firmware
+                  - description: Codec interrupt handled by the firmware
+
+              power-domains:
+                minItems: 1
+                maxItems: 6
+
+              power-domain-names:
+                minItems: 5
+                items:
+                  - const: dma
+                  - const: pipe4
+                  - const: pipe5
+                  - const: me0
+                  - const: me1
+                  - const: perf
+                    description: |
+                      A performance floor the encoder needs to run at full speed, held
+                      while the encoder is powered (for example the SoC rail floor of a
+                      PMC).
+
+              iommus:
+                minItems: 2
+                maxItems: 4
+
+              memory-region:
+                items:
+                  - description: Preloaded firmware text
+                  - description: Preloaded firmware data
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - power-domains
+              - iommus
+
+            allOf:
+              - if:
+                  properties:
+                    compatible:
+                      contains:
+                        enum:
+                          - apple,t6020-ave
+                          - apple,t6021-ave
+                          - apple,t6022-ave
+                          - apple,t6030-ave
+                          - apple,t6031-ave
+                          - apple,t8122-ave
+                then:
+                  properties:
+                    reg:
+                      minItems: 5
+                      maxItems: 5
+                else:
+                  properties:
+                    reg:
+                      minItems: 3
+                      maxItems: 3
+                    power-domains:
+                      minItems: 5
+                      maxItems: 6
+                  required:
+                    - reg-names
+                    - power-domain-names
+
+            additionalProperties: false
+
+unevaluatedProperties: false
