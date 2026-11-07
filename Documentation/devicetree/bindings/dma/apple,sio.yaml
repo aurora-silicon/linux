@@ -24,29 +24,29 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,sio"
-              - "apple,t6000-sio"
-              - "apple,t6020-sio"
-              - "apple,t6030-sio"
-              - "apple,t6031-sio"
-              - "apple,t6041-sio"
-              - "apple,t8103-sio"
-              - "apple,t8112-sio"
-              - "apple,t8122-sio"
-              - "apple,t8132-sio"
-              - "apple,t8140-sio"
+              - apple,sio
+              - apple,t6000-sio
+              - apple,t6020-sio
+              - apple,t6030-sio
+              - apple,t6031-sio
+              - apple,t6041-sio
+              - apple,t8103-sio
+              - apple,t8112-sio
+              - apple,t8122-sio
+              - apple,t8132-sio
+              - apple,t8140-sio
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
           items:
             -
-              const: "apple,t6050-sio"
+              const: apple,t6050-sio
             -
-              const: "apple,sio"
+              const: apple,sio
       required:
-        - "compatible"
+        - compatible
 
 properties:
   compatible: true
@@ -101,31 +101,35 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-sio"
+                  const: apple,t6050-sio
                 -
-                  const: "apple,sio"
+                  const: apple,sio
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-sio"
+                  const: apple,t6050-sio
                 -
-                  const: "apple,sio"
+                  const: apple,sio
             status:
-              const: "disabled"
+              const: disabled
             reg:
               minItems: 2
               maxItems: 2
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
             interrupts:
               minItems: 4
               maxItems: 4
@@ -138,13 +142,13 @@ allOf:
             "#dma-cells":
               const: 1
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "interrupts"
-            - "iommus"
-            - "power-domains"
-            - "clocks"
+            - compatible
+            - reg
+            - status
+            - interrupts
+            - iommus
+            - power-domains
+            - clocks
             - "#dma-cells"
           additionalProperties: false
     else:

@@ -26,7 +26,7 @@ $defs:
     properties:
       apple,key-id:
         $ref: /schemas/types.yaml#/definitions/string
-        pattern: "^[A-Za-z0-9]{4}$"
+        pattern: ^[A-Za-z0-9]{4}$
         description: The SMC FourCC key of the desired sensor.
           Must match the node's suffix.
 
@@ -45,7 +45,7 @@ properties:
     minItems: 1
     maxItems: 32
     items:
-      pattern: "^[A-Za-z0-9]{4}$"
+      pattern: ^[A-Za-z0-9]{4}$
     description:
       SMC FourCC keys for SoC die temperature sensors. Each key must report a
       readable four-byte floating-point temperature in degrees Celsius. The
@@ -59,7 +59,7 @@ properties:
 
   apple,thermal-pressure-key:
     $ref: /schemas/types.yaml#/definitions/string
-    pattern: "^[A-Za-z0-9]{4}$"
+    pattern: ^[A-Za-z0-9]{4}$
     description:
       SMC FourCC key reporting the firmware thermal pressure level as a
       readable signed 32-bit integer. This is exposed for monitoring only.
@@ -99,22 +99,22 @@ patternProperties:
     properties:
       apple,fan-minimum:
         $ref: /schemas/types.yaml#/definitions/string
-        pattern: "^[A-Za-z0-9]{4}$"
+        pattern: ^[A-Za-z0-9]{4}$
         description: SMC key containing the fan's minimum speed
 
       apple,fan-maximum:
         $ref: /schemas/types.yaml#/definitions/string
-        pattern: "^[A-Za-z0-9]{4}$"
+        pattern: ^[A-Za-z0-9]{4}$
         description: SMC key containing the fan's maximum speed
 
       apple,fan-target:
         $ref: /schemas/types.yaml#/definitions/string
-        pattern: "^[A-Za-z0-9]{4}$"
+        pattern: ^[A-Za-z0-9]{4}$
         description: Writeable endpoint for setting desired fan speed
 
       apple,fan-mode:
         $ref: /schemas/types.yaml#/definitions/string
-        pattern: "^[A-Za-z0-9]{4}$"
+        pattern: ^[A-Za-z0-9]{4}$
         description: Writeable key to enable/disable manual fan control
 
       apple,fan-manual-control:

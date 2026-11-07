@@ -44,49 +44,49 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,pcie"
-              - "apple,t6000-pcie"
-              - "apple,t6000-pciec"
-              - "apple,t6020-pcie"
-              - "apple,t6020-pcie-ge"
-              - "apple,t6030-pcie"
-              - "apple,t6031-pcie"
-              - "apple,t6040-pciec"
-              - "apple,t6041-pcie"
-              - "apple,t6050-pcie"
-              - "apple,t6050-pciec"
-              - "apple,t8103-pcie"
-              - "apple,t8103-pciec"
-              - "apple,t8112-pcie"
-              - "apple,t8112-pciec"
-              - "apple,t8122-pcie"
-              - "apple,t8122-pciec"
-              - "apple,t8132-pcie"
-              - "apple,t8132-pciec"
-              - "apple,t8140-pcie"
-              - "apple,t8152-pcie"
+              - apple,pcie
+              - apple,t6000-pcie
+              - apple,t6000-pciec
+              - apple,t6020-pcie
+              - apple,t6020-pcie-ge
+              - apple,t6030-pcie
+              - apple,t6031-pcie
+              - apple,t6040-pciec
+              - apple,t6041-pcie
+              - apple,t6050-pcie
+              - apple,t6050-pciec
+              - apple,t8103-pcie
+              - apple,t8103-pciec
+              - apple,t8112-pcie
+              - apple,t8112-pciec
+              - apple,t8122-pcie
+              - apple,t8122-pciec
+              - apple,t8132-pcie
+              - apple,t8132-pciec
+              - apple,t8140-pcie
+              - apple,t8152-pcie
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
           items:
             -
-              const: "apple,t6050-pcie"
+              const: apple,t6050-pcie
             -
-              const: "apple,pcie"
+              const: apple,pcie
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
           items:
             -
-              const: "apple,t6050-pciec"
+              const: apple,t6050-pciec
             -
-              const: "apple,pciec"
+              const: apple,pciec
       required:
-        - "compatible"
+        - compatible
 
 properties:
   compatible: true
@@ -109,7 +109,6 @@ properties:
   ranges: true
   interrupts: true
   interrupt-names: true
-  interrupt-names: true
   nonposted-mmio: true
   apple,msi-vector-base:
     $ref: /schemas/types.yaml#/definitions/uint32
@@ -118,11 +117,6 @@ properties:
   msi-parent: true
   msi-ranges:
     maxItems: 1
-  apple,msi-vector-base:
-    $ref: /schemas/types.yaml#/definitions/uint32
-    description:
-      First vector of this PCIe-C controller's slice of the MSI window it
-      shares with the internal PCIe controller.
   iommu-map: true
   iommu-map-mask: true
   power-domains: true
@@ -155,6 +149,47 @@ properties:
   clocks: true
   status: true
 
+patternProperties:
+  "^pci@":
+    $ref: /schemas/pci/pci-bus.yaml#
+    type: object
+    description: A single PCI root port
+
+    properties:
+      reg:
+        maxItems: 1
+
+      pwren-gpios:
+        description: Optional GPIO to power on the device
+        maxItems: 1
+
+      apple,link-trained-by-bootloader:
+        type: boolean
+        description: |
+          Firmware has initialized power, shared registers, PHY and clocks,
+          deasserted PERST and trained the link. The OS must validate and adopt
+          this state, with no reset, tunable replay, clock policy changes or
+          retraining fallback. Firmware must leave endpoint DMA and MSI/MSI-X
+          disabled and the port RID table without valid entries. Firmware
+          retains responsibility for power and external reset throughout use.
+          On T6050, each such root port 00:<n>.0 is admitted with one
+          endpoint, device 0 function 0, on the secondary bus the firmware
+          numbered, at Gen3 x1.
+
+      interrupt-controller: true
+
+      apple,tunable:
+        $ref: '#/$defs/tunable'
+        description: Initialization tuples relative to this port's registers.
+
+    required:
+      - interrupt-controller
+      - "#interrupt-cells"
+      - interrupt-map-mask
+      - interrupt-map
+
+    unevaluatedProperties: false
+
 additionalProperties: true
 
 allOf:
@@ -165,44 +200,48 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-pcie"
+                  const: apple,t6050-pcie
                 -
-                  const: "apple,pcie"
+                  const: apple,pcie
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
         -
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-pciec"
+                  const: apple,t6050-pciec
                 -
-                  const: "apple,pciec"
+                  const: apple,pciec
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-pcie"
+                  const: apple,t6050-pcie
                 -
-                  const: "apple,pcie"
+                  const: apple,pcie
             status:
-              const: "disabled"
+              const: disabled
             reg:
               minItems: 40
               maxItems: 40
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
             interrupts:
               minItems: 6
               maxItems: 6
@@ -210,27 +249,31 @@ allOf:
               minItems: 18
               maxItems: 18
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "interrupts"
-            - "power-domains"
+            - compatible
+            - reg
+            - status
+            - interrupts
+            - power-domains
           additionalProperties: false
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-pciec"
+                  const: apple,t6050-pciec
                 -
-                  const: "apple,pciec"
+                  const: apple,pciec
             status:
-              const: "disabled"
+              const: disabled
             reg:
               minItems: 8
               maxItems: 8
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
             interrupts:
               minItems: 6
               maxItems: 6
@@ -238,11 +281,11 @@ allOf:
               minItems: 2
               maxItems: 2
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "interrupts"
-            - "power-domains"
+            - compatible
+            - reg
+            - status
+            - interrupts
+            - power-domains
           additionalProperties: false
     else:
       properties:
@@ -318,12 +361,6 @@ allOf:
           minItems: 1
           maxItems: 6
 
-        interrupt-names:
-          minItems: 1
-          maxItems: 4
-          items:
-            pattern: "^port[0-3]$"
-
         nonposted-mmio: true
 
         apple,msi-vector-base:
@@ -335,12 +372,6 @@ allOf:
 
         msi-ranges:
           maxItems: 1
-
-        apple,msi-vector-base:
-          $ref: /schemas/types.yaml#/definitions/uint32
-          description:
-            First vector of this PCIe-C controller's slice of the MSI window it
-            shares with the internal PCIe controller.
 
         iommu-map: true
         iommu-map-mask: true
@@ -436,6 +467,19 @@ allOf:
       unevaluatedProperties: false
       allOf:
         - if:
+            not:
+              properties:
+                compatible:
+                  contains:
+                    enum: ['apple,t6050-pcie', 'apple,t6050-pciec']
+          then:
+            properties:
+              interrupt-names:
+                minItems: 1
+                maxItems: 4
+                items:
+                  pattern: ^port[0-3]$
+        - if:
             properties:
               compatible:
                 contains:
@@ -464,12 +508,12 @@ allOf:
                 minItems: 5
                 maxItems: 14
                 items:
-                  pattern: "^(config|rc|(port|phy|intr2axi)[0-3])$"
+                  pattern: ^(config|rc|(port|phy|intr2axi)[0-3])$
               interrupts:
                 maxItems: 4
               interrupt-names:
                 items:
-                  pattern: "^port[0-3]$"
+                  pattern: ^port[0-3]$
               apple,msi-vector-base:
                 const: 64
               power-domains: false

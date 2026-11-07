@@ -26,30 +26,30 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,dockchannel"
-              - "apple,t6000-dockchannel"
-              - "apple,t6020-dockchannel"
-              - "apple,t6030-dockchannel"
-              - "apple,t6031-dockchannel"
-              - "apple,t6041-dockchannel"
-              - "apple,t8103-dockchannel"
-              - "apple,t8112-dockchannel"
-              - "apple,t8122-dockchannel"
-              - "apple,t8132-dockchannel"
-              - "apple,t8140-dockchannel"
-              - "apple,t8142-dockchannel"
+              - apple,dockchannel
+              - apple,t6000-dockchannel
+              - apple,t6020-dockchannel
+              - apple,t6030-dockchannel
+              - apple,t6031-dockchannel
+              - apple,t6041-dockchannel
+              - apple,t8103-dockchannel
+              - apple,t8112-dockchannel
+              - apple,t8122-dockchannel
+              - apple,t8132-dockchannel
+              - apple,t8140-dockchannel
+              - apple,t8142-dockchannel
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
           items:
             -
-              const: "apple,t6050-dockchannel"
+              const: apple,t6050-dockchannel
             -
-              const: "apple,dockchannel"
+              const: apple,dockchannel
       required:
-        - "compatible"
+        - compatible
 
 properties:
   compatible: true
@@ -68,6 +68,12 @@ properties:
   resets: true
   status: true
 
+patternProperties:
+  '^input@[0-9a-f]+$':
+    type: object
+    $ref: /schemas/input/apple,dockchannel-hid.yaml#
+    description: A DockChannel HID transport.
+
 additionalProperties: true
 
 allOf:
@@ -78,38 +84,42 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-dockchannel"
+                  const: apple,t6050-dockchannel
                 -
-                  const: "apple,dockchannel"
+                  const: apple,dockchannel
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-dockchannel"
+                  const: apple,t6050-dockchannel
                 -
-                  const: "apple,dockchannel"
+                  const: apple,dockchannel
             status:
-              const: "disabled"
+              const: disabled
             reg:
               minItems: 6
               maxItems: 6
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
             interrupts:
               maxItems: 1
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "interrupts"
+            - compatible
+            - reg
+            - status
+            - interrupts
           additionalProperties: false
     else:
       properties:

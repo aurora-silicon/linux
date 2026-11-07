@@ -35,11 +35,11 @@ select:
         compatible:
           items:
             -
-              const: "apple,t6050-aon-ptd"
+              const: apple,t6050-aon-ptd
             -
-              const: "apple,aon-ptd"
+              const: apple,aon-ptd
       required:
-        - "compatible"
+        - compatible
 
 properties:
   compatible: true
@@ -61,39 +61,43 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-aon-ptd"
+                  const: apple,t6050-aon-ptd
                 -
-                  const: "apple,aon-ptd"
+                  const: apple,aon-ptd
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-aon-ptd"
+                  const: apple,t6050-aon-ptd
                 -
-                  const: "apple,aon-ptd"
+                  const: apple,aon-ptd
             status:
-              const: "disabled"
+              const: disabled
             reg:
               minItems: 4
               maxItems: 4
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
             interrupts:
               minItems: 32
               maxItems: 32
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "interrupts"
+            - compatible
+            - reg
+            - status
+            - interrupts
           additionalProperties: false
     else:
       properties:

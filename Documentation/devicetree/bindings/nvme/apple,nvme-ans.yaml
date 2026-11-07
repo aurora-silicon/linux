@@ -17,32 +17,32 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,nvme-ans2"
-              - "apple,t6000-nvme-ans2"
-              - "apple,t6020-nvme-ans2"
-              - "apple,t6030-nvme-ans2"
-              - "apple,t6031-nvme-ans2"
-              - "apple,t6041-nvme-ans2"
-              - "apple,t6050-nvme-ans2"
-              - "apple,t8015-nvme-ans2"
-              - "apple,t8103-nvme-ans2"
-              - "apple,t8112-nvme-ans2"
-              - "apple,t8122-nvme-ans2"
-              - "apple,t8132-nvme-ans2"
-              - "apple,t8140-nvme-ans2"
-              - "apple,t8142-nvme-ans2"
+              - apple,nvme-ans2
+              - apple,t6000-nvme-ans2
+              - apple,t6020-nvme-ans2
+              - apple,t6030-nvme-ans2
+              - apple,t6031-nvme-ans2
+              - apple,t6041-nvme-ans2
+              - apple,t6050-nvme-ans2
+              - apple,t8015-nvme-ans2
+              - apple,t8103-nvme-ans2
+              - apple,t8112-nvme-ans2
+              - apple,t8122-nvme-ans2
+              - apple,t8132-nvme-ans2
+              - apple,t8140-nvme-ans2
+              - apple,t8142-nvme-ans2
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
           items:
             -
-              const: "apple,t6050-nvme-ans2"
+              const: apple,t6050-nvme-ans2
             -
-              const: "apple,nvme-ans"
+              const: apple,nvme-ans
       required:
-        - "compatible"
+        - compatible
 
 properties:
   compatible: true
@@ -83,42 +83,46 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-nvme-ans2"
+                  const: apple,t6050-nvme-ans2
                 -
-                  const: "apple,nvme-ans"
+                  const: apple,nvme-ans
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-nvme-ans2"
+                  const: apple,t6050-nvme-ans2
                 -
-                  const: "apple,nvme-ans"
+                  const: apple,nvme-ans
             status:
-              const: "disabled"
+              const: disabled
             reg:
               minItems: 7
               maxItems: 7
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
             interrupts:
               minItems: 5
               maxItems: 5
             clocks:
               maxItems: 3
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "interrupts"
-            - "clocks"
+            - compatible
+            - reg
+            - status
+            - interrupts
+            - clocks
           additionalProperties: false
     else:
       properties:

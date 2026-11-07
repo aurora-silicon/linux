@@ -33,19 +33,19 @@ select:
           properties:
             compatible:
               contains:
-                const: "apple,t6050-dptx-phy"
+                const: apple,t6050-dptx-phy
           required:
-            - "compatible"
+            - compatible
     -
       properties:
         compatible:
           items:
             -
-              const: "apple,t6050-dptx-phy"
+              const: apple,t6050-dptx-phy
             -
-              const: "apple,dptx-phy"
+              const: apple,dptx-phy
       required:
-        - "compatible"
+        - compatible
 
 properties:
   compatible: true
@@ -56,26 +56,26 @@ properties:
   "#reset-cells": true
   status: true
   apple,pll-dcocfg:
-    $ref: "/schemas/types.yaml#/definitions/uint32"
-    description: "Boot-producer hardware configuration for the fixed DisplayPort PHY."
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
   apple,pll-dtcvreg:
-    $ref: "/schemas/types.yaml#/definitions/uint32"
-    description: "Boot-producer hardware configuration for the fixed DisplayPort PHY."
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
   apple,pll-dtccal:
-    $ref: "/schemas/types.yaml#/definitions/uint32"
-    description: "Boot-producer hardware configuration for the fixed DisplayPort PHY."
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
   apple,pll-dcdadj:
-    $ref: "/schemas/types.yaml#/definitions/uint32"
-    description: "Boot-producer hardware configuration for the fixed DisplayPort PHY."
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
   apple,pll-dlfcfg:
-    $ref: "/schemas/types.yaml#/definitions/uint32"
-    description: "Boot-producer hardware configuration for the fixed DisplayPort PHY."
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
   apple,pclkdrv-select:
-    $ref: "/schemas/types.yaml#/definitions/uint32"
-    description: "Boot-producer hardware configuration for the fixed DisplayPort PHY."
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
   apple,ufp-endpoint:
-    $ref: "/schemas/types.yaml#/definitions/uint32"
-    description: "Boot-producer hardware configuration for the fixed DisplayPort PHY."
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
   interrupts: true
   iommus: true
   clocks: true
@@ -91,38 +91,42 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-dptx-phy"
+                  const: apple,t6050-dptx-phy
                 -
-                  const: "apple,dptx-phy"
+                  const: apple,dptx-phy
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-dptx-phy"
+                  const: apple,t6050-dptx-phy
                 -
-                  const: "apple,dptx-phy"
+                  const: apple,dptx-phy
             status:
-              const: "disabled"
+              const: disabled
             reg:
               minItems: 2
               maxItems: 2
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
             power-domains:
               maxItems: 1
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "power-domains"
+            - compatible
+            - reg
+            - status
+            - power-domains
           additionalProperties: false
     else:
       properties:
@@ -134,85 +138,85 @@ allOf:
         "#reset-cells": true
         status: true
         apple,pll-dcocfg:
-          $ref: "/schemas/types.yaml#/definitions/uint32"
-          description: "Boot-producer hardware configuration for the fixed DisplayPort PHY."
+          $ref: /schemas/types.yaml#/definitions/uint32
+          description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
         apple,pll-dtcvreg:
-          $ref: "/schemas/types.yaml#/definitions/uint32"
-          description: "Boot-producer hardware configuration for the fixed DisplayPort PHY."
+          $ref: /schemas/types.yaml#/definitions/uint32
+          description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
         apple,pll-dtccal:
-          $ref: "/schemas/types.yaml#/definitions/uint32"
-          description: "Boot-producer hardware configuration for the fixed DisplayPort PHY."
+          $ref: /schemas/types.yaml#/definitions/uint32
+          description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
         apple,pll-dcdadj:
-          $ref: "/schemas/types.yaml#/definitions/uint32"
-          description: "Boot-producer hardware configuration for the fixed DisplayPort PHY."
+          $ref: /schemas/types.yaml#/definitions/uint32
+          description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
         apple,pll-dlfcfg:
-          $ref: "/schemas/types.yaml#/definitions/uint32"
-          description: "Boot-producer hardware configuration for the fixed DisplayPort PHY."
+          $ref: /schemas/types.yaml#/definitions/uint32
+          description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
         apple,pclkdrv-select:
-          $ref: "/schemas/types.yaml#/definitions/uint32"
-          description: "Boot-producer hardware configuration for the fixed DisplayPort PHY."
+          $ref: /schemas/types.yaml#/definitions/uint32
+          description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
         apple,ufp-endpoint:
-          $ref: "/schemas/types.yaml#/definitions/uint32"
-          description: "Boot-producer hardware configuration for the fixed DisplayPort PHY."
+          $ref: /schemas/types.yaml#/definitions/uint32
+          description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
       additionalProperties: true
       allOf:
         - if:
             properties:
               compatible:
                 contains:
-                  const: "apple,t6050-dptx-phy"
+                  const: apple,t6050-dptx-phy
             required:
-              - "compatible"
+              - compatible
           then:
             properties:
               compatible:
-                const: "apple,t6050-dptx-phy"
+                const: apple,t6050-dptx-phy
               reg:
                 minItems: 2
                 maxItems: 2
               reg-names:
                 items:
                   -
-                    const: "core"
+                    const: core
                   -
-                    const: "dptx"
+                    const: dptx
               power-domains:
                 maxItems: 1
               "#phy-cells":
                 const: 0
               "#reset-cells":
-                const: 1
+                const: 0
               status:
-                const: "disabled"
+                const: disabled
               apple,pll-dcocfg:
-                $ref: "/schemas/types.yaml#/definitions/uint32"
-                description: "Boot-producer hardware configuration for the fixed DisplayPort PHY."
+                $ref: /schemas/types.yaml#/definitions/uint32
+                description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
               apple,pll-dtcvreg:
-                $ref: "/schemas/types.yaml#/definitions/uint32"
-                description: "Boot-producer hardware configuration for the fixed DisplayPort PHY."
+                $ref: /schemas/types.yaml#/definitions/uint32
+                description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
               apple,pll-dtccal:
-                $ref: "/schemas/types.yaml#/definitions/uint32"
-                description: "Boot-producer hardware configuration for the fixed DisplayPort PHY."
+                $ref: /schemas/types.yaml#/definitions/uint32
+                description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
               apple,pll-dcdadj:
-                $ref: "/schemas/types.yaml#/definitions/uint32"
-                description: "Boot-producer hardware configuration for the fixed DisplayPort PHY."
+                $ref: /schemas/types.yaml#/definitions/uint32
+                description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
               apple,pll-dlfcfg:
-                $ref: "/schemas/types.yaml#/definitions/uint32"
-                description: "Boot-producer hardware configuration for the fixed DisplayPort PHY."
+                $ref: /schemas/types.yaml#/definitions/uint32
+                description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
               apple,pclkdrv-select:
-                $ref: "/schemas/types.yaml#/definitions/uint32"
-                description: "Boot-producer hardware configuration for the fixed DisplayPort PHY."
+                $ref: /schemas/types.yaml#/definitions/uint32
+                description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
               apple,ufp-endpoint:
-                $ref: "/schemas/types.yaml#/definitions/uint32"
-                description: "Boot-producer hardware configuration for the fixed DisplayPort PHY."
+                $ref: /schemas/types.yaml#/definitions/uint32
+                description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
             required:
-              - "compatible"
-              - "reg"
-              - "reg-names"
-              - "power-domains"
+              - compatible
+              - reg
+              - reg-names
+              - power-domains
               - "#phy-cells"
               - "#reset-cells"
-              - "status"
+              - status
             additionalProperties: false
           else:
             properties:

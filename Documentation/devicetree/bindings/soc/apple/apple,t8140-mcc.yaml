@@ -43,11 +43,11 @@ select:
         compatible:
           items:
             -
-              const: "apple,t6050-mcc"
+              const: apple,t6050-mcc
             -
-              const: "apple,mcc"
+              const: apple,mcc
       required:
-        - "compatible"
+        - compatible
 
 properties:
   compatible: true
@@ -74,35 +74,39 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-mcc"
+                  const: apple,t6050-mcc
                 -
-                  const: "apple,mcc"
+                  const: apple,mcc
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-mcc"
+                  const: apple,t6050-mcc
                 -
-                  const: "apple,mcc"
+                  const: apple,mcc
             status:
-              const: "disabled"
+              const: disabled
             reg:
               minItems: 4
               maxItems: 4
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
           required:
-            - "compatible"
-            - "reg"
-            - "status"
+            - compatible
+            - reg
+            - status
           additionalProperties: false
     else:
       properties:

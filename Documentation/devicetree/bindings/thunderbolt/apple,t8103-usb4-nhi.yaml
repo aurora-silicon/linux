@@ -25,29 +25,29 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,t6000-usb4-nhi"
-              - "apple,t6020-usb4-nhi"
-              - "apple,t6030-usb4-nhi"
-              - "apple,t6031-usb4-nhi"
-              - "apple,t6040-usb4-nhi"
-              - "apple,t6050-usb4-nhi"
-              - "apple,t8103-usb4-nhi"
-              - "apple,t8112-usb4-nhi"
-              - "apple,t8122-usb4-nhi"
-              - "apple,t8132-usb4-nhi"
-              - "apple,t8142-usb4-nhi"
+              - apple,t6000-usb4-nhi
+              - apple,t6020-usb4-nhi
+              - apple,t6030-usb4-nhi
+              - apple,t6031-usb4-nhi
+              - apple,t6040-usb4-nhi
+              - apple,t6050-usb4-nhi
+              - apple,t8103-usb4-nhi
+              - apple,t8112-usb4-nhi
+              - apple,t8122-usb4-nhi
+              - apple,t8132-usb4-nhi
+              - apple,t8142-usb4-nhi
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
           items:
             -
-              const: "apple,t6050-usb4-nhi"
+              const: apple,t6050-usb4-nhi
             -
-              const: "apple,usb4-nhi"
+              const: apple,usb4-nhi
       required:
-        - "compatible"
+        - compatible
 
 properties:
   compatible: true
@@ -86,31 +86,35 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-usb4-nhi"
+                  const: apple,t6050-usb4-nhi
                 -
-                  const: "apple,usb4-nhi"
+                  const: apple,usb4-nhi
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-usb4-nhi"
+                  const: apple,t6050-usb4-nhi
                 -
-                  const: "apple,usb4-nhi"
+                  const: apple,usb4-nhi
             status:
-              const: "disabled"
+              const: disabled
             reg:
               minItems: 6
               maxItems: 6
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
             interrupts:
               minItems: 25
               maxItems: 25
@@ -121,12 +125,12 @@ allOf:
               minItems: 4
               maxItems: 4
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "interrupts"
-            - "iommus"
-            - "power-domains"
+            - compatible
+            - reg
+            - status
+            - interrupts
+            - iommus
+            - power-domains
           additionalProperties: false
     else:
       properties:

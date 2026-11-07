@@ -55,23 +55,23 @@ properties:
     $ref: /schemas/graph.yaml#/properties/port
 
   apple,tunable-aus40cmn-shm:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
     description: Offset, mask and value tuples for the common analog bank
 
   apple,tunable-cio4pll:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
     description: Offset, mask and value tuples for the CIO PLL bank
 
   apple,tunable-usb2-default:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
     description: Offset, mask and value tuples for the USB2 PHY bank
 
   apple,tunable-usb2-host:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
     description: Offset, mask and value tuples for the USB2 host bank
 
   apple,tunable-pipe-default:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
     description: Offset, mask and value tuples for the PIPE handler
 
   power-domains:
@@ -91,61 +91,61 @@ properties:
       - const: usb
 
   apple,tunable-axi2af:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
     description: Offset, mask and value tuples within the named bank
 
   apple,tunable-fabric:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
     description: Offset, mask and value tuples within the named bank
 
   apple,tunable-common-cfg:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
     description: Offset, mask and value tuples within the named bank
 
   apple,tunable-lioa:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
     description: Offset, mask and value tuples within the named bank
 
   apple,tunable-lane0-rx-clock:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
     description: Offset, mask and value tuples within the named bank
 
   apple,tunable-lane1-rx-clock:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
     description: Offset, mask and value tuples within the named bank
 
   apple,tunable-lane0-rx-eq:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
     description: Offset, mask and value tuples within the named bank
 
   apple,tunable-lane1-rx-eq:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
     description: Offset, mask and value tuples within the named bank
 
   apple,tunable-auspll:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
     description: Offset, mask and value tuples within the named bank
 
   apple,tunable-uc-regs-cio:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
     description:
       Offset, mask and value tuples for the PHY firmware's registers in CIO
       (USB4/Thunderbolt) mode. Optional; an absent CIO tunable is skipped.
 
   apple,tunable-lane0-rx-top-cio:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
     description: As apple,tunable-uc-regs-cio, for lane 0's receiver top bank
 
   apple,tunable-lane1-rx-top-cio:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
     description: As apple,tunable-uc-regs-cio, for lane 1's receiver top bank
 
   apple,tunable-lane0-rx-eq-cio:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
     description: As apple,tunable-uc-regs-cio, for lane 0's receiver equalizer
 
   apple,tunable-lane1-rx-eq-cio:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
     description: As apple,tunable-uc-regs-cio, for lane 1's receiver equalizer
 
 patternProperties:

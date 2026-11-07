@@ -23,14 +23,14 @@ allOf:
         - apple,sdz-group-fail-closed
     then:
       properties:
+        shutdown-gpios: false
+
+properties:
   ti,bclk-ratio:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Serial bit clock ratio supplied by the board producer.
     minimum: 1
 
-        shutdown-gpios: false
-
-properties:
   compatible:
     oneOf:
       - enum:

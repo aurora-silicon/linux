@@ -22,23 +22,23 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,dockchannel-uart"
-              - "apple,t6020-dockchannel-uart"
-              - "apple,t6021-dockchannel-uart"
-              - "apple,t6022-dockchannel-uart"
-              - "apple,t8112-dockchannel-uart"
+              - apple,dockchannel-uart
+              - apple,t6020-dockchannel-uart
+              - apple,t6021-dockchannel-uart
+              - apple,t6022-dockchannel-uart
+              - apple,t8112-dockchannel-uart
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
           items:
             -
-              const: "apple,t6050-dockchannel-uart"
+              const: apple,t6050-dockchannel-uart
             -
-              const: "apple,dockchannel-uart"
+              const: apple,dockchannel-uart
       required:
-        - "compatible"
+        - compatible
 
 properties:
   apple,tx-never-wait:
@@ -80,38 +80,42 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-dockchannel-uart"
+                  const: apple,t6050-dockchannel-uart
                 -
-                  const: "apple,dockchannel-uart"
+                  const: apple,dockchannel-uart
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-dockchannel-uart"
+                  const: apple,t6050-dockchannel-uart
                 -
-                  const: "apple,dockchannel-uart"
+                  const: apple,dockchannel-uart
             status:
-              const: "disabled"
+              const: disabled
             reg:
               minItems: 2
               maxItems: 2
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
             interrupts:
               maxItems: 1
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "interrupts"
+            - compatible
+            - reg
+            - status
+            - interrupts
           additionalProperties: false
     else:
       allOf:

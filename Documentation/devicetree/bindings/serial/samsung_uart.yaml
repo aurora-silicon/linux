@@ -23,37 +23,37 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,s5l-uart"
-              - "apple,t8140-uart"
-              - "axis,artpec8-uart"
-              - "axis,artpec9-uart"
-              - "google,gs101-uart"
-              - "samsung,exynos2200-uart"
-              - "samsung,exynos4210-uart"
-              - "samsung,exynos5433-uart"
-              - "samsung,exynos7-uart"
-              - "samsung,exynos7870-uart"
-              - "samsung,exynos7885-uart"
-              - "samsung,exynos850-uart"
-              - "samsung,exynos8890-uart"
-              - "samsung,exynos8895-uart"
-              - "samsung,exynosautov9-uart"
-              - "samsung,exynosautov920-uart"
-              - "samsung,s3c6400-uart"
-              - "samsung,s5pv210-uart"
-              - "tesla,fsd-uart"
+              - apple,s5l-uart
+              - apple,t8140-uart
+              - axis,artpec8-uart
+              - axis,artpec9-uart
+              - google,gs101-uart
+              - samsung,exynos2200-uart
+              - samsung,exynos4210-uart
+              - samsung,exynos5433-uart
+              - samsung,exynos7-uart
+              - samsung,exynos7870-uart
+              - samsung,exynos7885-uart
+              - samsung,exynos850-uart
+              - samsung,exynos8890-uart
+              - samsung,exynos8895-uart
+              - samsung,exynosautov9-uart
+              - samsung,exynosautov920-uart
+              - samsung,s3c6400-uart
+              - samsung,s5pv210-uart
+              - tesla,fsd-uart
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
           items:
             -
-              const: "apple,t6050-uart"
+              const: apple,t6050-uart
             -
-              const: "apple,s5l-uart"
+              const: apple,s5l-uart
       required:
-        - "compatible"
+        - compatible
 
 properties:
   compatible: true
@@ -93,30 +93,34 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-uart"
+                  const: apple,t6050-uart
                 -
-                  const: "apple,s5l-uart"
+                  const: apple,s5l-uart
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-uart"
+                  const: apple,t6050-uart
                 -
-                  const: "apple,s5l-uart"
+                  const: apple,s5l-uart
             status:
-              const: "disabled"
+              const: disabled
             reg:
               maxItems: 1
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
             interrupts:
               maxItems: 1
             power-domains:
@@ -124,12 +128,12 @@ allOf:
             clocks:
               maxItems: 2
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "interrupts"
-            - "power-domains"
-            - "clocks"
+            - compatible
+            - reg
+            - status
+            - interrupts
+            - power-domains
+            - clocks
           additionalProperties: false
     else:
       properties:

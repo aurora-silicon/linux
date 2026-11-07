@@ -22,27 +22,27 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,qspi"
-              - "apple,t6030-qspi"
-              - "apple,t6031-qspi"
-              - "apple,t6041-qspi"
-              - "apple,t6050-qspi"
-              - "apple,t8122-qspi"
-              - "apple,t8132-qspi"
-              - "apple,t8140-qspi"
-              - "apple,t8152-qspi"
+              - apple,qspi
+              - apple,t6030-qspi
+              - apple,t6031-qspi
+              - apple,t6041-qspi
+              - apple,t6050-qspi
+              - apple,t8122-qspi
+              - apple,t8132-qspi
+              - apple,t8140-qspi
+              - apple,t8152-qspi
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
           items:
             -
-              const: "apple,t6050-qspi"
+              const: apple,t6050-qspi
             -
-              const: "apple,qspi"
+              const: apple,qspi
       required:
-        - "compatible"
+        - compatible
 
 properties:
   compatible: true
@@ -64,31 +64,35 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-qspi"
+                  const: apple,t6050-qspi
                 -
-                  const: "apple,qspi"
+                  const: apple,qspi
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-qspi"
+                  const: apple,t6050-qspi
                 -
-                  const: "apple,qspi"
+                  const: apple,qspi
             status:
-              const: "disabled"
+              const: disabled
             reg:
               minItems: 2
               maxItems: 2
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
             interrupts:
               maxItems: 1
             power-domains:
@@ -96,12 +100,12 @@ allOf:
             clocks:
               maxItems: 1
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "interrupts"
-            - "power-domains"
-            - "clocks"
+            - compatible
+            - reg
+            - status
+            - interrupts
+            - power-domains
+            - clocks
           additionalProperties: false
     else:
       allOf:

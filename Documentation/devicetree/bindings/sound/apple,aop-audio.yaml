@@ -30,15 +30,14 @@ select:
       properties:
         compatible:
           contains:
-            const: "apple,t6050-aop-audio"
+            const: apple,t6050-aop-audio
       required:
-        - "compatible"
+        - compatible
 
 properties:
   "compatible": true
-  dmas:
-    maxItems: 1
-  dma-names:
+  dmas: true
+  dma-names: true
     const: dma
   apple,chassis-name:
     $ref: /schemas/types.yaml#/definitions/string
@@ -55,40 +54,40 @@ allOf:
       properties:
         compatible:
           contains:
-            const: "apple,t6050-aop-audio"
+            const: apple,t6050-aop-audio
       required:
-        - "compatible"
+        - compatible
     then:
       properties:
         compatible:
           oneOf:
             -
-              const: "apple,t6050-aop-audio"
+              const: apple,t6050-aop-audio
             -
               items:
                 -
-                  const: "apple,t6050-aop-audio"
+                  const: apple,t6050-aop-audio
                 -
-                  const: "apple,aop-audio"
+                  const: apple,aop-audio
         dmas:
           minItems: 4
           maxItems: 4
         dma-names:
           items:
             -
-              const: "cout"
+              const: cout
             -
-              const: "cin"
+              const: cin
             -
-              const: "spkr"
+              const: spkr
             -
-              const: "sense"
+              const: sense
         "#sound-dai-cells":
           const: 1
       required:
-        - "compatible"
-        - "dmas"
-        - "dma-names"
+        - compatible
+        - dmas
+        - dma-names
         - "#sound-dai-cells"
       additionalProperties: false
     else:

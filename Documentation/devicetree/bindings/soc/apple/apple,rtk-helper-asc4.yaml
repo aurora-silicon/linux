@@ -26,37 +26,37 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,mtp"
-              - "apple,rtk-helper-asc4"
-              - "apple,t6020-mtp"
-              - "apple,t6020-rtk-helper-asc4"
-              - "apple,t6030-mtp"
-              - "apple,t6030-rtk-helper-asc4"
-              - "apple,t6031-mtp"
-              - "apple,t6041-mtp"
-              - "apple,t6041-rtk-helper-asc4"
-              - "apple,t8112-mtp"
-              - "apple,t8112-rtk-helper-asc4"
-              - "apple,t8122-mtp"
-              - "apple,t8122-rtk-helper-asc4"
-              - "apple,t8132-mtp"
-              - "apple,t8132-rtk-helper-asc4"
-              - "apple,t8140-mtp"
-              - "apple,t8140-rtk-helper-asc4"
-              - "apple,t8142-mtp"
-              - "apple,t8142-rtk-helper-asc4"
+              - apple,mtp
+              - apple,rtk-helper-asc4
+              - apple,t6020-mtp
+              - apple,t6020-rtk-helper-asc4
+              - apple,t6030-mtp
+              - apple,t6030-rtk-helper-asc4
+              - apple,t6031-mtp
+              - apple,t6041-mtp
+              - apple,t6041-rtk-helper-asc4
+              - apple,t8112-mtp
+              - apple,t8112-rtk-helper-asc4
+              - apple,t8122-mtp
+              - apple,t8122-rtk-helper-asc4
+              - apple,t8132-mtp
+              - apple,t8132-rtk-helper-asc4
+              - apple,t8140-mtp
+              - apple,t8140-rtk-helper-asc4
+              - apple,t8142-mtp
+              - apple,t8142-rtk-helper-asc4
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
           items:
             -
-              const: "apple,t6050-mtp"
+              const: apple,t6050-mtp
             -
-              const: "apple,mtp"
+              const: apple,mtp
       required:
-        - "compatible"
+        - compatible
 
 properties:
   compatible: true
@@ -126,31 +126,35 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-mtp"
+                  const: apple,t6050-mtp
                 -
-                  const: "apple,mtp"
+                  const: apple,mtp
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-mtp"
+                  const: apple,t6050-mtp
                 -
-                  const: "apple,mtp"
+                  const: apple,mtp
             status:
-              const: "disabled"
+              const: disabled
             reg:
               minItems: 2
               maxItems: 2
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
             interrupts:
               minItems: 4
               maxItems: 4
@@ -159,12 +163,12 @@ allOf:
             clocks:
               maxItems: 1
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "interrupts"
-            - "iommus"
-            - "clocks"
+            - compatible
+            - reg
+            - status
+            - interrupts
+            - iommus
+            - clocks
           additionalProperties: false
     else:
       properties:

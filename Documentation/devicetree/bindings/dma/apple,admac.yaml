@@ -25,30 +25,30 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,admac"
-              - "apple,t6000-admac"
-              - "apple,t6020-admac"
-              - "apple,t6030-admac"
-              - "apple,t6031-admac"
-              - "apple,t6041-admac"
-              - "apple,t6050-admac"
-              - "apple,t8103-admac"
-              - "apple,t8112-admac"
-              - "apple,t8122-admac"
-              - "apple,t8132-admac"
-              - "apple,t8140-admac"
+              - apple,admac
+              - apple,t6000-admac
+              - apple,t6020-admac
+              - apple,t6030-admac
+              - apple,t6031-admac
+              - apple,t6041-admac
+              - apple,t6050-admac
+              - apple,t8103-admac
+              - apple,t8112-admac
+              - apple,t8122-admac
+              - apple,t8132-admac
+              - apple,t8140-admac
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
           items:
             -
-              const: "apple,t6050-admac"
+              const: apple,t6050-admac
             -
-              const: "apple,admac"
+              const: apple,admac
       required:
-        - "compatible"
+        - compatible
 
 properties:
   compatible: true
@@ -82,31 +82,35 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-admac"
+                  const: apple,t6050-admac
                 -
-                  const: "apple,admac"
+                  const: apple,admac
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-admac"
+                  const: apple,t6050-admac
                 -
-                  const: "apple,admac"
+                  const: apple,admac
             status:
-              const: "disabled"
+              const: disabled
             reg:
               minItems: 2
               maxItems: 2
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
             interrupts:
               maxItems: 1
             iommus:
@@ -114,10 +118,10 @@ allOf:
             "#dma-cells":
               const: 1
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "interrupts"
+            - compatible
+            - reg
+            - status
+            - interrupts
             - "#dma-cells"
           additionalProperties: false
     else:
