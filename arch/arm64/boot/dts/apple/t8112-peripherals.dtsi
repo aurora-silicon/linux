@@ -3,7 +3,7 @@
 
 &{/soc} {
 	m2_error_handler: error-handler@200100000 {
-		compatible = "apple,t8112-error-handler", "apple,error-handler";
+		compatible = "apple,t8112-error-handler", "apple,soc-error-handler";
 		reg = <0x2 0x100000 0x0 0x100000>,
 			<0x2 0x0 0x0 0x1000>,
 			<0x2 0x1c000 0x0 0xc000>,
@@ -73,13 +73,11 @@
 	};
 
 	m2_pwm: pwm@235040000 {
-		compatible = "apple,t8112-fpwm", "apple,s5l-fpwm";
+		compatible = "apple,t8112-pwm", "apple,pwm";
 		reg = <0x2 0x35040000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 766 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_fpwm0>;
-		clocks = <&clkref>;
-		#pwm-cells = <2>;
 		status = "disabled";
 	};
 
@@ -99,7 +97,7 @@
 	};
 
 	m2_event_log_handler: event-log@23b700000 {
-		compatible = "apple,t8112-event-log", "apple,event-log";
+		compatible = "apple,t8112-event-log", "apple,soc-event-log";
 		reg = <0x2 0x3b700000 0x0 0xcc000>,
 			<0x2 0x3d280000 0x0 0x7c000>,
 			<0x2 0x3b000000 0x0 0x70000>,
@@ -137,12 +135,15 @@
 	};
 
 	m2_dockchannel_uart: serial@23d128000 {
-		compatible = "apple,t8112-dockchannel-debug", "apple,dockchannel-debug";
-		reg = <0x2 0x3d128000 0x0 0x10000>,
+		compatible = "apple,t8112-dockchannel-uart", "apple,dockchannel-uart";
+		reg-names = "data", "config", "irq";
+		reg = <0x2 0x3d12c000 0x0 0x4000>,
+			<0x2 0x3d128000 0x0 0x4000>,
 			<0x2 0x3d10c000 0x0 0x1000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 368 IRQ_TYPE_LEVEL_HIGH>;
 		status = "disabled";
+		apple,sw-drain;
 	};
 
 	m2_nub_spmi0_sideband: spmi-sideband@23d704000 {
@@ -155,27 +156,6 @@
 		compatible = "apple,t8112-spmi-sideband", "apple,spmi-sideband";
 		reg = <0x2 0x3d784000 0x0 0x4000>;
 		status = "disabled";
-	};
-
-	m2_nub_spmi1: spmi@23d794000 {
-		compatible = "apple,t8112-spmi", "apple,spmi";
-		reg = <0x2 0x3d794000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 394 IRQ_TYPE_LEVEL_HIGH>;
-		#address-cells = <2>;
-		#size-cells = <0>;
-		interrupt-controller;
-		#interrupt-cells = <2>;
-		status = "disabled";
-
-		pmic@e {
-			compatible = "apple,t8112-vale-pmic",
-				"apple,spmi-pmic";
-			reg = <0xe SPMI_USID>;
-			interrupt-parent = <&m2_nub_spmi1>;
-			interrupts = <2 IRQ_TYPE_LEVEL_HIGH>;
-			status = "disabled";
-		};
 	};
 
 	m2_aop_spmi1_sideband: spmi-sideband@24a8c4000 {
@@ -278,6 +258,7 @@
 
 	m2_apr: video-codec@27d000000 {
 		compatible = "apple,t8112-prores", "apple,prores";
+		reg-names = "core", "wrapper";
 		reg = <0x2 0x7d000000 0x0 0x4000>,
 			<0x2 0x7c000000 0x0 0x4000>;
 		interrupt-parent = <&aic>;

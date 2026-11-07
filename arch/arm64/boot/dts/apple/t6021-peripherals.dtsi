@@ -12,7 +12,7 @@
 	};
 
 	m2_event_log_handler: event-log@28e080000 {
-		compatible = "apple,t6021-event-log", "apple,event-log";
+		compatible = "apple,t6021-event-log", "apple,soc-event-log";
 		reg = <0x2 0x8e080000 0x0 0x8000>,
 			<0x2 0x8e08c000 0x0 0x4000>,
 			<0x2 0x8e0d4000 0x0 0x4000>,
@@ -136,9 +136,9 @@
 		status = "disabled";
 
 		pmic@b {
-			compatible = "apple,t6021-mirabeau-pmic",
-				"apple,spmi-pmic";
+			compatible = "apple,mirabeau-pmic", "apple,spmi-nvmem";
 			reg = <0xb SPMI_USID>;
+			read-only;
 			status = "disabled";
 		};
 	};
@@ -161,9 +161,9 @@
 		status = "disabled";
 
 		pmic@b {
-			compatible = "apple,t6021-mirabeau-pmic",
-				"apple,spmi-pmic";
+			compatible = "apple,mirabeau-pmic", "apple,spmi-nvmem";
 			reg = <0xb SPMI_USID>;
+			read-only;
 			status = "disabled";
 		};
 	};
@@ -186,9 +186,9 @@
 		status = "disabled";
 
 		pmic@b {
-			compatible = "apple,t6021-mirabeau-pmic",
-				"apple,spmi-pmic";
+			compatible = "apple,mirabeau-pmic", "apple,spmi-nvmem";
 			reg = <0xb SPMI_USID>;
+			read-only;
 			status = "disabled";
 		};
 	};
@@ -211,9 +211,9 @@
 		status = "disabled";
 
 		pmic@b {
-			compatible = "apple,t6021-mirabeau-pmic",
-				"apple,spmi-pmic";
+			compatible = "apple,mirabeau-pmic", "apple,spmi-nvmem";
 			reg = <0xb SPMI_USID>;
+			read-only;
 			status = "disabled";
 		};
 	};
@@ -236,9 +236,9 @@
 		status = "disabled";
 
 		pmic@b {
-			compatible = "apple,t6021-mirabeau-pmic",
-				"apple,spmi-pmic";
+			compatible = "apple,mirabeau-pmic", "apple,spmi-nvmem";
 			reg = <0xb SPMI_USID>;
+			read-only;
 			status = "disabled";
 		};
 	};
@@ -267,9 +267,9 @@
 		status = "disabled";
 
 		pmic@a {
-			compatible = "apple,t6021-maverick-pmic",
-				"apple,spmi-pmic";
+			compatible = "apple,maverick-pmic", "apple,spmi-nvmem";
 			reg = <0xa SPMI_USID>;
+			read-only;
 			status = "disabled";
 		};
 
@@ -282,9 +282,12 @@
 	};
 
 	m2_dockchannel_uart: serial@29e528000 {
-		compatible = "apple,t6021-dockchannel-debug", "apple,dockchannel-debug";
-		reg = <0x2 0x9e528000 0x0 0x10004>,
+		compatible = "apple,t6021-dockchannel-uart", "apple,dockchannel-uart";
+		reg-names = "data", "config", "irq";
+		reg = <0x2 0x9e52c000 0x0 0x4000>,
+			<0x2 0x9e528000 0x0 0x4000>,
 			<0x2 0x9e50c000 0x0 0x18>;
+		apple,sw-drain;
 		status = "disabled";
 	};
 
@@ -363,6 +366,7 @@
 
 	m2_apr0: video-codec@311000000 {
 		compatible = "apple,t6021-prores", "apple,prores";
+		reg-names = "core", "wrapper";
 		reg = <0x3 0x11000000 0x0 0x4000>,
 			<0x3 0x10000000 0x0 0x1000000>;
 		interrupt-parent = <&aic>;
@@ -473,7 +477,7 @@
 	};
 
 	m2_error_handler: error-handler@394c40000 {
-		compatible = "apple,t6021-error-handler", "apple,error-handler";
+		compatible = "apple,t6021-error-handler", "apple,soc-error-handler";
 		reg = <0x3 0x94c40000 0x0 0x40000>,
 			<0x2 0x8e000000 0x0 0x80000>,
 			<0x2 0x8e080000 0x0 0x80000>,
@@ -754,6 +758,7 @@
 
 	m2_apr1: video-codec@409000000 {
 		compatible = "apple,t6021-prores", "apple,prores";
+		reg-names = "core", "wrapper";
 		reg = <0x4 0x9000000 0x0 0x4000>,
 			<0x4 0x8000000 0x0 0x1000000>;
 		interrupt-parent = <&aic>;
@@ -838,9 +843,11 @@
 
 	m2_ave0: video-codec@40d100000 {
 		compatible = "apple,t6021-ave", "apple,ave";
+		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1", "perf";
+		reg-names = "codec", "mailbox", "coproc", "power-control", "fabric";
 		reg = <0x4 0xd100000 0x0 0x45c000>,
-			<0x4 0xd800000 0x0 0x800000>,
 			<0x4 0xd050000 0x0 0x8000>,
+			<0x4 0xd800000 0x0 0x800000>,
 			<0x2 0x902803e0 0x0 0x7c44>,
 			<0x4 0xc000000 0x0 0x1000000>;
 		interrupt-parent = <&aic>;
@@ -850,8 +857,7 @@
 			<AIC_IRQ 0 1106 IRQ_TYPE_LEVEL_HIGH>,
 			<AIC_IRQ 0 1105 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&m2_dart_ave0_0 0>, <&m2_dart_ave0_1 0>, <&m2_dart_ave0_2 0>, <&m2_dart_ave0_3 0>;
-		power-domains = <&ps_venc_sys>, <&ps_afr>, <&ps_venc_pipe4>, <&ps_venc_pipe5>,
-			<&ps_venc_me0>, <&ps_venc_me1>, <&ps_venc_dma>;
+		power-domains = <&ps_venc_dma>, <&ps_venc_pipe4>, <&ps_venc_pipe5>, <&ps_venc_me0>, <&ps_venc_me1>, <&ps_afr>;
 		status = "disabled";
 	};
 
@@ -929,9 +935,11 @@
 
 	m2_ave1: video-codec@507100000 {
 		compatible = "apple,t6021-ave", "apple,ave";
+		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1", "perf";
+		reg-names = "codec", "mailbox", "coproc", "power-control", "fabric";
 		reg = <0x5 0x7100000 0x0 0x45c000>,
-			<0x5 0x7800000 0x0 0x800000>,
 			<0x5 0x7050000 0x0 0x8000>,
+			<0x5 0x7800000 0x0 0x800000>,
 			<0x2 0x8e680228 0x0 0x3dfc>,
 			<0x5 0x6000000 0x0 0x1000000>;
 		interrupt-parent = <&aic>;
@@ -941,8 +949,7 @@
 			<AIC_IRQ 0 1118 IRQ_TYPE_LEVEL_HIGH>,
 			<AIC_IRQ 0 1117 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&m2_dart_ave1_0 0>, <&m2_dart_ave1_1 0>, <&m2_dart_ave1_2 0>, <&m2_dart_ave1_3 0>;
-		power-domains = <&ps_venc1_sys>, <&ps_venc1_pipe4>, <&ps_venc1_pipe5>,
-			<&ps_venc1_me0>, <&ps_venc1_me1>, <&ps_venc1_dma>;
+		power-domains = <&ps_venc1_dma>, <&ps_venc1_pipe4>, <&ps_venc1_pipe5>, <&ps_venc1_me0>, <&ps_venc1_me1>, <&ps_afr>;
 		status = "disabled";
 	};
 

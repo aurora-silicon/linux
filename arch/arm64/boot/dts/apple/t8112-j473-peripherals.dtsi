@@ -8,49 +8,46 @@
 		status = "disabled";
 	};
 
-	m2_aop_spmi0: spmi@24a894000 {
-		compatible = "apple,t8112-spmi", "apple,spmi";
-		reg = <0x2 0x4a894000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 353 IRQ_TYPE_LEVEL_HIGH>;
-		#address-cells = <2>;
-		#size-cells = <0>;
-		interrupt-controller;
-		#interrupt-cells = <2>;
-		status = "disabled";
+};
 
-		peripheral@e {
-			compatible = "apple,t8112-spmi-peripheral",
-				"apple,spmi-peripheral";
-			reg = <0xe SPMI_USID>;
-			status = "disabled";
-		};
+&aop_spmi0 {
+	interrupt-parent = <&aic>;
+	interrupts = <AIC_IRQ 353 IRQ_TYPE_LEVEL_HIGH>;
+	#address-cells = <2>;
+	#size-cells = <0>;
+	interrupt-controller;
+	#interrupt-cells = <2>;
+	status = "disabled";
+
+	peripheral@e {
+		compatible = "apple,t8112-spmi-peripheral",
+			"apple,spmi-peripheral";
+		reg = <0xe SPMI_USID>;
+		status = "disabled";
 	};
+};
 
-	m2_aop_spmi1: spmi@24a8d4000 {
-		compatible = "apple,t8112-spmi", "apple,spmi";
-		reg = <0x2 0x4a8d4000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 357 IRQ_TYPE_LEVEL_HIGH>;
-		#address-cells = <2>;
-		#size-cells = <0>;
-		interrupt-controller;
-		#interrupt-cells = <2>;
+&aop_spmi1 {
+	interrupt-parent = <&aic>;
+	interrupts = <AIC_IRQ 357 IRQ_TYPE_LEVEL_HIGH>;
+	#address-cells = <2>;
+	#size-cells = <0>;
+	interrupt-controller;
+	#interrupt-cells = <2>;
+	status = "disabled";
+
+	nfc@8 {
+		compatible = "apple,t8112-spmi-nfc",
+			"apple,spmi-nfc";
+		reg = <0x8 SPMI_USID>;
+		interrupt-parent = <&aop_spmi1>;
+		interrupts = <176 IRQ_TYPE_LEVEL_HIGH>,
+			<177 IRQ_TYPE_LEVEL_HIGH>,
+			<178 IRQ_TYPE_LEVEL_HIGH>,
+			<179 IRQ_TYPE_LEVEL_HIGH>,
+			<180 IRQ_TYPE_LEVEL_HIGH>,
+			<181 IRQ_TYPE_LEVEL_HIGH>,
+			<182 IRQ_TYPE_LEVEL_HIGH>;
 		status = "disabled";
-
-		nfc@8 {
-			compatible = "apple,t8112-spmi-nfc",
-				"apple,spmi-nfc";
-			reg = <0x8 SPMI_USID>;
-			interrupt-parent = <&m2_aop_spmi1>;
-			interrupts = <176 IRQ_TYPE_LEVEL_HIGH>,
-				<177 IRQ_TYPE_LEVEL_HIGH>,
-				<178 IRQ_TYPE_LEVEL_HIGH>,
-				<179 IRQ_TYPE_LEVEL_HIGH>,
-				<180 IRQ_TYPE_LEVEL_HIGH>,
-				<181 IRQ_TYPE_LEVEL_HIGH>,
-				<182 IRQ_TYPE_LEVEL_HIGH>;
-			status = "disabled";
-		};
 	};
 };

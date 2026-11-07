@@ -341,6 +341,5 @@
 	status = "okay";
 };
 
-#include "t8112-peripherals.dtsi"
 
 #include "t8112-j493-peripherals.dtsi"
