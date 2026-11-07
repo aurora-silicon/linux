@@ -34,6 +34,7 @@
 #include <asm/acpi.h>
 #include <asm/bug.h>
 #include <asm/cmpxchg.h>
+#include <asm/ctxr_execmem.h>
 #include <asm/cpufeature.h>
 #include <asm/efi.h>
 #include <asm/exception.h>
@@ -436,7 +437,9 @@ static void __do_kernel_fault(unsigned long addr, unsigned long esr,
 		if (esr & ESR_ELx_WNR)
 			msg = "write to read-only memory";
 		else if (is_el1_instruction_abort(esr))
-			msg = "execute from non-executable memory";
+			msg = ctxr_exec_fetch_outside_window(addr) ?
+				"execute from outside the CTXR window" :
+				"execute from non-executable memory";
 		else
 			msg = "read from unreadable memory";
 	} else if (addr < PAGE_SIZE) {

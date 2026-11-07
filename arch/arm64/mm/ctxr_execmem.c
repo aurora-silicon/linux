@@ -341,6 +341,55 @@ bool __init ctxr_exec_window_reserved(void)
 }
 
 /*
+ * True if a window is active and the kernel mapping for @addr resolves to a
+ * physical page outside it: a CTXR fetch refusal, not ordinary non-exec memory.
+ * Walks the kernel page tables; safe to call from the fault path.
+ */
+bool ctxr_exec_fetch_outside_window(unsigned long addr)
+{
+	pgd_t *pgdp;
+	p4d_t *p4dp, p4d;
+	pud_t *pudp, pud;
+	pmd_t *pmdp, pmd;
+	pte_t *ptep, pte;
+	unsigned long pfn;
+
+	if (!execmem_confine_active())
+		return false;
+
+	pgdp = pgd_offset_k(addr);
+	if (pgd_none(READ_ONCE(*pgdp)))
+		return false;
+	p4dp = p4d_offset(pgdp, addr);
+	p4d = READ_ONCE(*p4dp);
+	if (p4d_none(p4d))
+		return false;
+	pudp = pud_offset(p4dp, addr);
+	pud = READ_ONCE(*pudp);
+	if (pud_none(pud))
+		return false;
+	if (pud_leaf(pud)) {
+		pfn = pud_pfn(pud) + ((addr & ~PUD_MASK) >> PAGE_SHIFT);
+		goto out;
+	}
+	pmdp = pmd_offset(pudp, addr);
+	pmd = READ_ONCE(*pmdp);
+	if (pmd_none(pmd))
+		return false;
+	if (pmd_leaf(pmd)) {
+		pfn = pmd_pfn(pmd) + ((addr & ~PMD_MASK) >> PAGE_SHIFT);
+		goto out;
+	}
+	ptep = pte_offset_kernel(pmdp, addr);
+	pte = READ_ONCE(*ptep);
+	if (!pte_valid(pte))
+		return false;
+	pfn = pte_pfn(pte);
+out:
+	return !execmem_confine_pfn_in_window(pfn);
+}
+
+/*
  * A core enforcing the window can't fetch firmware code outside it, and
  * efi_rts_wq can run on any core. Misaligned code also makes the misaligned
  * regions after it executable, wherever they are.
