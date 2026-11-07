@@ -24,6 +24,39 @@ const LOCKOUT_MAGIC: [u8; 8] = *b"SEPLOCK1";
 const LOCKOUT_RECORD_LEN: usize = 16;
 const LOCKOUT_LOCKED: u32 = 1;
 
+/// Message tag of the enclave's unsolicited biometric lock-state notification.
+const SBIO_NOTIFY_LOCK_STATE: u8 = 0x01;
+/// The lock-state bit that is set while the enclave refuses matches.
+const LOCK_STATE_LOCKOUT: u16 = 0x40;
+/// Failed matches in a row after which Touch ID asks for the password, the
+/// limit macOS LocalAuthentication applies in a Touch ID prompt.
+const VERIFY_RETRY_LIMIT: u32 = 3;
+/// Further frames of a no-match touch relayed before the retry pass ends.
+const NOMATCH_EXTRA_FRAMES: u32 = 3;
+/// How long the no-match tail waits for each extra frame of the same touch.
+const NOMATCH_FRAME_WAIT_MS: u64 = 500;
+/// Message tag of the enclave's "background operation result ready" notice.
+/// The host answers it with BG_OPS_RESULT (0x21); until it does, the result
+/// stays queued in the enclave.
+const SBIO_NOTIFY_BG_OPS_READY: u8 = 0x03;
+/// How long a verify waits after its result for that notice.
+const BG_OPS_WAIT_MS: u32 = 1000;
+
+/// What collecting an announced background result led to.
+enum BgOps {
+    Nothing,
+    NotUpdated,
+    TemplatesUpdated,
+    Failed,
+}
+/// How long to wait after a background result for a component to need saving.
+const BG_OPS_SAVE_WAIT_MS: u32 = 10_000;
+const BG_OPS_SAVE_POLL_MS: u32 = 50;
+
+/// How long a re-arm waits for the enclave to announce the cleared state.
+const LOCK_STATE_WAIT_MS: u32 = 1000;
+const LOCK_STATE_POLL_MS: u32 = 10;
+
 fn lockout_record(locked: bool) -> [u8; LOCKOUT_RECORD_LEN] {
     let mut raw = [0u8; LOCKOUT_RECORD_LEN];
     raw[..LOCKOUT_MAGIC.len()].copy_from_slice(&LOCKOUT_MAGIC);
@@ -57,6 +90,150 @@ mod lockout_tests {
         let mut other = lockout_record(true);
         other[8] = 2;
         assert!(!lockout_record_locked(&other));
+    }
+
+    #[test]
+    fn verify_password_reply_shape() {
+        let mut body = [0u8; crate::sks::SKS_VERIFY_SECRET_REPLY_LEN];
+        body[0] = 1;
+        assert_eq!(crate::sks::verify_secret_reply_flags(&body), Some(0));
+        body[4] = 3;
+        assert_eq!(crate::sks::verify_secret_reply_flags(&body), Some(3));
+        let mut wrong_variant = body;
+        wrong_variant[0] = 0;
+        assert_eq!(crate::sks::verify_secret_reply_flags(&wrong_variant), None);
+        assert_eq!(crate::sks::verify_secret_reply_flags(&body[..8]), None);
+        assert_eq!(crate::sks::verify_secret_reply_flags(&[1u8; 16]), None);
+    }
+
+    #[test]
+    fn unlock_evaluation_wire() {
+        use crate::scrd::*;
+        let handle = [0x5au8; SCRD_ACM_HANDLE_LEN];
+        let pre = scrd_verify_unlock_policy(&handle, 1000, true);
+        let p = pre.payload();
+        assert_eq!(p.len(), 0x55);
+        assert_eq!(&p[0..4], b"DRCS");
+        assert_eq!(p[4], 3);
+        assert_eq!(&p[8..24], &handle);
+        assert_eq!(&p[24..63], b"DeviceOwnerAuthenticationWithBiometrics");
+        assert_eq!(p[63], 0);
+        assert_eq!(p[64], 1);
+        assert_eq!(&p[65..69], &[0u8; 4]);
+        assert_eq!(&p[69..73], &1u32.to_le_bytes());
+        assert_eq!(&p[73..77], &4u32.to_le_bytes());
+        assert_eq!(&p[77..81], &4u32.to_le_bytes());
+        assert_eq!(&p[81..85], &1000u32.to_le_bytes());
+        let fin = scrd_verify_unlock_policy(&handle, 1000, false);
+        assert_eq!(fin.payload()[64], 0);
+        assert_eq!(fin.payload().len(), 0x55);
+        assert_eq!(scrd_verify_touchid_enrollment(&handle).payload().len(), 0x33);
+        let del = scrd_context_delete(&handle);
+        assert_eq!(del.payload().len(), 24);
+        assert_eq!(del.payload()[4], 2);
+
+        let mut created = [0u8; SCRD_TRACKED_CREATE_REPLY_LEN];
+        created[..16].copy_from_slice(&handle);
+        created[20] = 1;
+        assert_eq!(tracked_create_reference(&created), Some(handle));
+        created[20] = 2;
+        assert_eq!(tracked_create_reference(&created), None);
+        assert_eq!(tracked_create_reference(&created[..16]), None);
+
+        let mut answer = [0u8; 20];
+        answer[4..8].copy_from_slice(&3u32.to_le_bytes());
+        answer[8..12].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            parse_policy_answer(&answer),
+            Some(PolicyAnswer { satisfied: false, requirement: Some((3, 1, 0)) })
+        );
+        assert_eq!(
+            parse_policy_answer(&1u32.to_le_bytes()),
+            Some(PolicyAnswer { satisfied: true, requirement: None })
+        );
+        assert_eq!(parse_policy_answer(&2u32.to_le_bytes()), None);
+        answer[16] = 1;
+        assert_eq!(parse_policy_answer(&answer), None);
+    }
+
+    #[test]
+    fn bg_ops_result_discriminators() {
+        let mut r = [0u8; SBIO_BG_OPS_RESULT_LEN];
+        assert_eq!(bg_ops_result_kind(&r), BgOpsResult::NoResult);
+        r[0] = 1;
+        assert_eq!(bg_ops_result_kind(&r), BgOpsResult::TemplateListNotUpdated);
+        r[2] = 1;
+        assert_eq!(bg_ops_result_kind(&r), BgOpsResult::TemplatesUpdated);
+        r[0] = 0;
+        assert_eq!(bg_ops_result_kind(&r), BgOpsResult::NoResult);
+        assert_eq!(bg_ops_result_kind(&[1u8]), BgOpsResult::NoResult);
+    }
+
+    #[test]
+    fn operation_device_list_is_empty_and_checked() {
+        let op = sbio_operation_device_list();
+        assert_eq!(op.opcode(), 0x7d);
+        assert_eq!(op.payload().len(), 0);
+        assert_eq!(operation_device_count(&[0, 0, 0, 0]), Some(0));
+        let mut one = [0u8; 28];
+        one[0] = 1;
+        assert_eq!(operation_device_count(&one), Some(1));
+        assert_eq!(operation_device_count(&one[..27]), None);
+        assert_eq!(operation_device_count(&[2, 0, 0, 0]), None);
+        assert_eq!(operation_device_count(&[0, 0, 0]), None);
+        assert_eq!(operation_device_count(&[0xff, 0xff, 0xff, 0xff]), None);
+    }
+
+    #[test]
+    fn no_match_tail_requests_are_empty() {
+        assert_eq!(sbio_retry_capture_info().opcode(), 0x3e);
+        assert!(sbio_retry_capture_info().payload().is_empty());
+        assert_eq!(sbio_match_retry_finalize().opcode(), 0x0c);
+        assert!(sbio_match_retry_finalize().payload().is_empty());
+    }
+
+    #[test]
+    fn match_cancel_is_empty() {
+        let op = sbio_match_cancel();
+        assert_eq!(op.opcode(), 0x0b);
+        assert_eq!(op.payload().len(), 0);
+        assert_eq!(sbio_match_policy().opcode(), 0x1f);
+    }
+
+    #[test]
+    fn protected_config_unlock_words() {
+        let mut raw = [0u8; SBIO_PROTECTED_CONFIG_LEN];
+        raw[0..4].copy_from_slice(&1i32.to_le_bytes());
+        raw[0x10..0x14].copy_from_slice(&(-1i32).to_le_bytes());
+        let config = ProtectedConfig::parse(&raw).unwrap();
+        assert_eq!(config.unlock_set, 1);
+        assert_eq!(config.unlock_effective, -1);
+        assert!(!config.allows_unlock());
+        raw[0x10..0x14].copy_from_slice(&1i32.to_le_bytes());
+        assert!(ProtectedConfig::parse(&raw).unwrap().allows_unlock());
+        assert!(ProtectedConfig::parse(&raw[..31]).is_none());
+        assert_eq!(ProtectedConfig::describe(-1), "unspecified");
+        assert_eq!(ProtectedConfig::describe(0), "disabled");
+    }
+
+    #[test]
+    fn authenticated_match_carries_mode_and_context() {
+        let user = UserId::new(1000).unwrap();
+        let handle = [0xa5u8; crate::scrd::SCRD_ACM_HANDLE_LEN];
+        let op = sbio_image_processing_init(ImagePurpose::Matching, true, true, 0, user, 0, Some(&handle));
+        assert_eq!(&op.payload[IPI_MATCH_MODE..IPI_MATCH_MODE + 4], &SBIO_MATCH_MODE_ACM.to_le_bytes());
+        // The LocalAuthentication class: credential set, no keybag-unlock bit.
+        assert_eq!(SBIO_MATCH_MODE_ACM, 0x88);
+        assert_eq!(&op.payload[IPI_USER_ID..IPI_USER_ID + 4], &1000i32.to_le_bytes());
+        assert_eq!(&op.payload[IPI_CREDENTIAL_LEN..IPI_CREDENTIAL_LEN + 4], &16u32.to_le_bytes());
+        assert_eq!(&op.payload[0x97..0xa7], &handle);
+        assert_eq!(op.payload().len(), 0xa7);
+        // The fixed token slot belongs to another mode and stays empty.
+        assert!(op.payload[0x83..0x93].iter().all(|b| *b == 0));
+        let plain = sbio_image_processing_init(ImagePurpose::Enrolment, true, false, 0, user, 0, None);
+        assert_eq!(&plain.payload[IPI_MATCH_MODE..IPI_MATCH_MODE + 4], &[0u8; 4]);
+        assert_eq!(&plain.payload[IPI_CREDENTIAL_LEN..IPI_CREDENTIAL_LEN + 4], &[0u8; 4]);
+        assert_eq!(plain.payload().len(), 0x97);
     }
 }
 
@@ -297,6 +474,110 @@ impl SepData {
         };
 
         synced && policy_ok
+    }
+
+    /// Ends a prompt's match operation and unlock evaluation that are still
+    /// open (a prompt that ended without a match or the retry limit).
+    fn end_match_scope(&self, why: &CStr) {
+        self.match_scope_gen.store(0, Relaxed);
+        let Some(evaluation) = self.match_context.lock().take() else {
+            return;
+        };
+        match self.sbio_call(&crate::sbio::sbio_match_cancel()) {
+            SbioOutcome::Ok(_) => {
+                dev_info!(self.dev, "verify: match operation ended (MATCH_CANCEL) at {}\n", why)
+            }
+            _ => dev_warn!(self.dev, "verify: MATCH_CANCEL at {} failed\n", why),
+        }
+        self.close_unlock_evaluation(&evaluation);
+    }
+
+    /// The tail macOS sends after a no-match result: further frames of the
+    /// same touch, each relayed (0x65) and followed by RETRY_CAPTURE_INFO,
+    /// then MATCH_RETRY_FINALIZE, then MATCH_POLICY. macOS relays the frames
+    /// the sensor queued while the finger stayed down (three in the captured
+    /// prompts); the whole touch is one result.
+    fn no_match_tail(&self) {
+        let mut frames: u32 = 0;
+        while frames < NOMATCH_EXTRA_FRAMES {
+            if sensor::start_capture().is_err() {
+                break;
+            }
+            let advertised = match self.await_capture_within(NOMATCH_FRAME_WAIT_MS) {
+                CaptureWait::Ready(n) => n,
+                _ => break,
+            };
+            let Ok(capture) = sensor::read_capture(advertised) else {
+                break;
+            };
+            let relay = crate::sbio::SbioRelay::new(&capture);
+            if self.sbio_relay(&relay).is_none() {
+                break;
+            }
+            drop(capture);
+            let op = crate::sbio::sbio_retry_capture_info();
+            match self.sbio_transfer(&op) {
+                Ok(done) if done.status.is_ok() => frames += 1,
+                Ok(done) => {
+                    dev_warn!(
+                        self.dev,
+                        "verify: no-match tail: {} answered status {} ({} bytes)\n",
+                        op.name(),
+                        done.status,
+                        done.payload.len()
+                    );
+                    break;
+                }
+                Err(e) => {
+                    dev_warn!(self.dev, "verify: no-match tail: {} failed ({:?})\n", op.name(), e);
+                    break;
+                }
+            }
+        }
+        let op = crate::sbio::sbio_match_retry_finalize();
+        match self.sbio_transfer(&op) {
+            Ok(done) => dev_info!(
+                self.dev,
+                "verify: no-match tail: {} further frame(s) relayed; {} answered status {}, {} bytes\n",
+                frames,
+                op.name(),
+                done.status,
+                done.payload.len()
+            ),
+            Err(e) => dev_warn!(self.dev, "verify: no-match tail: {} failed ({:?})\n", op.name(), e),
+        }
+    }
+
+    /// Starts a match operation (`0x7d`) and checks its device list.
+    fn open_match_operation(&self) -> bool {
+        match self.sbio_call(&crate::sbio::sbio_operation_device_list()) {
+            SbioOutcome::Ok(reply) => match crate::sbio::operation_device_count(&reply) {
+                Some(count) => {
+                    dev_info!(
+                        self.dev,
+                        "verify: match operation opened (OPERATION_DEVICE_LIST, {} device(s))\n",
+                        count
+                    );
+                    true
+                }
+                None => {
+                    dev_err!(
+                        self.dev,
+                        "verify: OPERATION_DEVICE_LIST answered a malformed list ({} bytes)\n",
+                        reply.len()
+                    );
+                    false
+                }
+            },
+            SbioOutcome::PrerequisiteMissing => {
+                dev_err!(self.dev, "verify: OPERATION_DEVICE_LIST refused: prerequisite missing\n");
+                false
+            }
+            _ => {
+                dev_err!(self.dev, "verify: OPERATION_DEVICE_LIST failed\n");
+                false
+            }
+        }
     }
 
     fn note_capture_end(&self) {
@@ -619,6 +900,54 @@ impl SepData {
         }
 
         true
+    }
+
+    /// Opens and closes one unlock evaluation at boot, before any touch, so
+    /// the log shows whether its preflight leaves a biometric match open.
+    fn probe_unlock_evaluation(&self) {
+        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+            return;
+        };
+        match self.open_unlock_evaluation(user) {
+            Some(handle) => {
+                dev_info!(self.dev, "Touch ID: unlock preflight gate passed for user {}\n", user.value());
+                self.close_unlock_evaluation(&handle);
+            }
+            None => dev_err!(
+                self.dev,
+                "Touch ID: unlock preflight gate failed for user {}; verifies will be refused\n",
+                user.value()
+            ),
+        }
+    }
+
+    /// Reads the Linux user's protected configuration once and logs whether
+    /// it allows unlock. Only the two symbolic states are logged.
+    fn log_protected_unlock(&self) {
+        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+            return;
+        };
+        let Some(raw) = self.sbio_expect_ok(&crate::sbio::sbio_protected_config(user)) else {
+            dev_warn!(self.dev, "sbio: PROTECTED_CONFIG for user {} did not answer\n", user.value());
+            return;
+        };
+        match crate::sbio::ProtectedConfig::parse(&raw) {
+            Some(config) => dev_info!(
+                self.dev,
+                "sbio: protected unlock for user {}: set={}, effective={}, admits an unlock match {}\n",
+                user.value(),
+                crate::sbio::ProtectedConfig::describe(config.unlock_set),
+                crate::sbio::ProtectedConfig::describe(config.unlock_effective),
+                config.allows_unlock()
+            ),
+            None => dev_warn!(
+                self.dev,
+                "sbio: PROTECTED_CONFIG for user {} answered {} bytes, expected {}\n",
+                user.value(),
+                raw.len(),
+                crate::sbio::SBIO_PROTECTED_CONFIG_LEN
+            ),
+        }
     }
 
     fn activate_protected_config(&self, user: crate::sbio::UserId) -> bool {
@@ -1780,6 +2109,11 @@ impl SepData {
             );
             return;
         }
+        if self.enclave_reports_lockout() {
+            let outcome = self.enter_lockout();
+            self.finish_verify(outcome, [0u8; bio::TOKEN_LEN]);
+            return;
+        }
         self.retry_restore_proof();
         if !self.templates_restored.load(Relaxed) {
             dev_err!(
@@ -1804,19 +2138,152 @@ impl SepData {
 
         self.settle_before_capture();
 
-        // The enclave refuses a capture from an uncalibrated sensor (0x65 answers 1).
-        if !self.bring_sensor_online_for_verify() {
+        // macOS registers the sensor once and keeps it for later matches: no
+        // power cycle, CLEAR_STATE or re-registration per touch. Do the same
+        // while the sensor stayed up since the last verify.
+        if self.sensor_kept.load(Relaxed) {
+            dev_info!(self.dev, "verify: sensor still registered from the last verify; no new bring-up\n");
+        } else if !self.bring_sensor_online_for_verify() {
+            // The enclave refuses a capture from an uncalibrated sensor (0x65 answers 1).
             dev_err!(self.dev, "verify: the sensor did not come back online\n");
             self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR), token_bytes);
             let _ = sensor::idle();
             return;
+        } else {
+            self.sensor_kept.store(true, Relaxed);
         }
 
-        // The match uses the plain 0x23->0x06->0x65 pipeline, with no SCRD step.
+        // Each verify matches under its own unlock evaluation: a context whose
+        // preflight leaves a biometric match outstanding, carried in the image
+        // init and completed after an enrolled match.
+        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+            self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE), token_bytes);
+            return;
+        };
+        // An unfinished template persistence blocks matching until it is done.
+        if !self.handle_bg_ops(c"before a verify") || !self.finish_owed_persistence() {
+            dev_err!(self.dev, "verify: the catacombs are not persisted after a template update; refusing before the capture\n");
+            // Not a rejected finger: ask for another try.
+            self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY), token_bytes);
+            return;
+        }
+        // macOS keeps one match operation and one unlock evaluation for every
+        // touch of a Touch ID prompt and ends them when the prompt ends: on a
+        // match, when it stops after the retry limit, or when the prompt goes
+        // away (a captured prompt: one OPERATION_DEVICE_LIST for three touches,
+        // MATCH_CANCEL only after the third). Here a prompt is one open of the
+        // Touch ID device: fprintd claims it for one PAM authentication.
+        let open_gen = self.bio_open_gen.load(Relaxed);
+        let current = if self.match_scope_gen.load(Relaxed) == open_gen {
+            *self.match_context.lock()
+        } else {
+            None
+        };
+        let evaluation = match current {
+            Some(evaluation) => {
+                let touch = self.match_scope_touches.fetch_add(1, Relaxed).saturating_add(1);
+                dev_info!(
+                    self.dev,
+                    "verify: touch {} of this authentication; its match operation and unlock evaluation stay open\n",
+                    touch
+                );
+                evaluation
+            }
+            None => {
+                self.end_match_scope(c"the start of an authentication");
+                let Some(evaluation) = self.open_unlock_evaluation(user) else {
+                    dev_err!(
+                        self.dev,
+                        "verify: the unlock evaluation did not open; refusing before the capture. This is not a non-matching finger\n"
+                    );
+                    let _ = sensor::idle();
+                    self.sensor_kept.store(false, Relaxed);
+                    sensor::power(false);
+                    self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE), token_bytes);
+                    return;
+                };
+                // Open the enclave's match operation before the first image, as
+                // macOS does at the start of a prompt; MATCH_CANCEL ends it.
+                if !self.open_match_operation() {
+                    dev_err!(
+                        self.dev,
+                        "verify: the match operation did not open; refusing before the capture. This is not a non-matching finger\n"
+                    );
+                    self.close_unlock_evaluation(&evaluation);
+                    let _ = sensor::idle();
+                    self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE), token_bytes);
+                    return;
+                }
+                *self.match_context.lock() = Some(evaluation);
+                self.match_scope_gen.store(open_gen, Relaxed);
+                self.match_scope_touches.store(1, Relaxed);
+                evaluation
+            }
+        };
 
-        let outcome = self.verify_one_image();
+        let mut outcome = self.verify_one_image();
+        // macOS saves the enclave's lockout record after every answered
+        // result (SAVE_LOCKOUT, kept on disk for the boot's LOAD_LOCKOUT).
+        if matches!(outcome, bio::VerifyOutcome::Matched(_) | bio::VerifyOutcome::NoMatch) {
+            if self.save_lockout() {
+                dev_info!(self.dev, "verify: lockout record saved after the result (SAVE_LOCKOUT)\n");
+            } else {
+                dev_warn!(self.dev, "verify: the lockout record was not saved after the result\n");
+            }
+        }
+        // A no-match below the retry limit keeps the prompt open for its next
+        // touch; anything else ends the prompt's match operation.
+        let keep_open = matches!(outcome, bio::VerifyOutcome::NoMatch)
+            && self.bio_nomatch_streak.load(Relaxed).saturating_add(1) < VERIFY_RETRY_LIMIT
+            && !self.enclave_reports_lockout();
+        if keep_open {
+            dev_info!(
+                self.dev,
+                "verify: no match; the match operation stays open for the next touch of this authentication\n"
+            );
+        } else {
+            match self.sbio_call(&crate::sbio::sbio_match_cancel()) {
+                SbioOutcome::Ok(_) => dev_info!(self.dev, "verify: match operation ended (MATCH_CANCEL)\n"),
+                _ => {
+                    dev_err!(self.dev, "verify: MATCH_CANCEL failed; not reporting this verify as a match\n");
+                    if matches!(outcome, bio::VerifyOutcome::Matched(_)) {
+                        outcome = bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
+                    }
+                }
+            }
+            if matches!(outcome, bio::VerifyOutcome::Matched(_))
+                && !self.complete_unlock_evaluation(&evaluation, user)
+            {
+                dev_err!(self.dev, "verify: the enclave matched but the unlock policy was not satisfied\n");
+                outcome = bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
+            }
+            *self.match_context.lock() = None;
+            self.match_scope_gen.store(0, Relaxed);
+            self.close_unlock_evaluation(&evaluation);
+        }
         let _ = sensor::idle();
-        sensor::power(false);
+        if matches!(
+            outcome,
+            bio::VerifyOutcome::Matched(_) | bio::VerifyOutcome::NoMatch | bio::VerifyOutcome::Failed(ENROL_STATUS_LOCKOUT)
+        ) {
+            // A template update must be persisted (user, then master) before a
+            // match is reported.
+            if !self.await_and_handle_bg_ops(c"after a match result", BG_OPS_WAIT_MS)
+                && matches!(outcome, bio::VerifyOutcome::Matched(_))
+            {
+                dev_err!(self.dev, "verify: the background result was not handled; not reporting this verify as a match\n");
+                outcome = bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY);
+            }
+        }
+        // Keep the sensor up for the next verify unless the sensor itself
+        // failed; then the next verify brings it up from a power cycle.
+        if matches!(
+            outcome,
+            bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR) | bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY)
+        ) {
+            self.sensor_kept.store(false, Relaxed);
+            sensor::power(false);
+        }
         self.note_capture_end();
         match &outcome {
             bio::VerifyOutcome::Matched(_) => self.bio_nomatch_streak.store(0, Relaxed),
@@ -1824,6 +2291,23 @@ impl SepData {
                 self.bio_nomatch_streak.fetch_add(1, Relaxed);
             }
             bio::VerifyOutcome::Failed(_) => {}
+        }
+        // The enclave announces its lockout with the no-match that causes it;
+        // the next verify must not ask for another touch.
+        if matches!(outcome, bio::VerifyOutcome::NoMatch)
+            && self.enclave_reports_lockout()
+            && !self.bio_lockout.load(Relaxed)
+        {
+            let _ = self.enter_lockout();
+        }
+        // The retry limit is the host's, as on macOS: LocalAuthentication
+        // stops offering Touch ID after three failed matches and asks for the
+        // password, while the enclave itself stays unlocked.
+        if matches!(outcome, bio::VerifyOutcome::NoMatch)
+            && !self.bio_lockout.load(Relaxed)
+            && self.bio_nomatch_streak.load(Relaxed) >= VERIFY_RETRY_LIMIT
+        {
+            self.enter_retry_limit();
         }
 
         let definitive = matches!(
@@ -1857,6 +2341,23 @@ impl SepData {
             dev_err!(self.dev, "verify: invalid probe user id\n");
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
+        // Never fall back to an unauthenticated match scope.
+        let Some(scope) = *self.match_context.lock() else {
+            dev_err!(
+                self.dev,
+                "verify: no authenticated match context; refusing before the capture. This is not a non-matching finger\n"
+            );
+            return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
+        };
+        dev_info!(
+            self.dev,
+            "verify: match mode {:#x}, user {}, credential length {}, image init length {:#x}, match context generation {}\n",
+            crate::sbio::SBIO_MATCH_MODE_ACM,
+            user.value(),
+            scope.len(),
+            crate::sbio::SBIO_IMAGE_INIT_LEN + scope.len(),
+            self.match_context_generation.load(Relaxed)
+        );
 
         if let Err(e) = sensor::start_capture() {
             dev_err!(self.dev, "verify: could not start the capture ({:?})\n", e);
@@ -1866,7 +2367,9 @@ impl SepData {
             CaptureWait::Ready(n) => n,
             CaptureWait::Timeout => {
                 dev_warn!(self.dev, "verify: the capture ended without a frame\n");
-                return bio::VerifyOutcome::Failed(ENROL_STATUS_TIMEOUT);
+                // No finger came: nothing was compared, so ask again rather
+                // than report an error.
+                return bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY);
             }
             CaptureWait::Fault(state) => {
                 dev_err!(
@@ -1938,6 +2441,7 @@ impl SepData {
             0,
             user,
             crate::shim::monotonic_ns(),
+            Some(&scope),
         );
         if self.sbio_verify_step(&init).is_none() {
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
@@ -1978,6 +2482,19 @@ impl SepData {
             MatchStep::LockedOut => return self.enter_lockout(),
             MatchStep::Refused => return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE),
         };
+        // On a no-match macOS finishes the touch before MATCH_POLICY.
+        if crate::sbio::MatchResult::parse(&result).is_some_and(|p| !p.matches(user)) {
+            self.no_match_tail();
+        }
+        // macOS reads the match policy after every answered result, before
+        // the image cleanup; neither a match nor a no-match counts without it.
+        match self.sbio_call(&crate::sbio::sbio_match_policy()) {
+            SbioOutcome::Ok(policy) if policy.len() == crate::sbio::SBIO_MATCH_POLICY_LEN => {}
+            _ => {
+                dev_err!(self.dev, "verify: MATCH_POLICY after the match result failed\n");
+                return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
+            }
+        }
         let Some(parsed) = crate::sbio::MatchResult::parse(&result) else {
             dev_err!(
                 self.dev,
@@ -2024,7 +2541,9 @@ impl SepData {
     }
 
     pub(crate) fn run_enrolment(&self) {
+        self.end_match_scope(c"an enrolment");
         self.enrol_frames_accepted.store(0, Relaxed);
+        self.sensor_kept.store(false, Relaxed);
 
         if !self.bring_sensor_online() {
             dev_err!(self.dev, "enrol: the sensor did not come back online\n");
@@ -2149,6 +2668,7 @@ impl SepData {
         }
 
         let _ = sensor::idle();
+        self.sensor_kept.store(false, Relaxed);
         sensor::power(false);
         self.note_capture_end();
 
@@ -2439,6 +2959,7 @@ impl SepData {
     }
 
     fn wake_sensor(&self) -> Option<PatchLoaded> {
+        self.sensor_kept.store(false, Relaxed);
         let _source = sensor::power_source();
         self.sensor_power_ns.store(shim::boottime_ns(), Relaxed);
         let cycled = sensor::power_cycle();
@@ -2664,6 +3185,9 @@ impl SepData {
             dev_info!(self.dev, "sbio: restore-ready after device-view proof {}\n", self.templates_restored.load(Relaxed));
             if self.templates_restored.load(Relaxed) {
                 self.reconcile_identities();
+                self.log_protected_unlock();
+                self.probe_unlock_evaluation();
+                let _ = self.handle_bg_ops(c"after the restore");
             }
         } else if !listed {
             dev_warn!(self.dev, "sbio: device-view synchronisation or match policy unavailable\n");
@@ -3021,6 +3545,7 @@ impl SepData {
             counter,
             user,
             crate::shim::monotonic_ns(),
+            None,
         );
         if self.sbio_enrol_step(&init).is_none() {
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
@@ -3075,6 +3600,10 @@ impl SepData {
     }
 
     fn await_capture(&self) -> CaptureWait {
+        self.await_capture_within(u64::from(ENROL_POLL_ATTEMPTS) * u64::from(ENROL_POLL_MS))
+    }
+
+    fn await_capture_within(&self, wait_ms: u64) -> CaptureWait {
         let mut previous: Option<[u8; sensor::STATUS_LEN]> = None;
         let mut armed_reported = false;
 
@@ -3093,9 +3622,7 @@ impl SepData {
         // attempt budget would then be spent in milliseconds and time the
         // capture out before the frame lands. Time-bounding degrades, at worst,
         // to the same duration as the poll path.
-        let deadline_ns = crate::shim::monotonic_ns().saturating_add(
-            u64::from(ENROL_POLL_ATTEMPTS) * u64::from(ENROL_POLL_MS) * 1_000_000,
-        );
+        let deadline_ns = crate::shim::monotonic_ns().saturating_add(wait_ms.saturating_mul(1_000_000));
         let mut attempt: u32 = 0;
         loop {
             if !bio::capture_is_live(&self.bio_session.lock(), self.capture_epoch.load(Relaxed)) {
@@ -3164,6 +3691,23 @@ impl SepData {
         let f = proto::decode(&msg);
         let marker = f.tag;
 
+        // An unsolicited lock-state notification carries everything in the
+        // message word and nothing in the out-of-line buffer.
+        if marker == SBIO_NOTIFY_LOCK_STATE {
+            self.on_lock_state_notification(msg.msg0);
+            return;
+        }
+        if marker == SBIO_NOTIFY_BG_OPS_READY {
+            // Collected from process context; this runs in the receive path.
+            dev_info!(self.dev, "sbio: the enclave has a background operation result ready\n");
+            self.bg_ops_ready.store(true, Relaxed);
+            self.sbio_wq.notify_all();
+            return;
+        }
+        if marker < transfer::MARKER_FIRST {
+            dev_info!(self.dev, "sbio: unhandled notification, tag {:#04x}\n", marker);
+        }
+
         if !self.sbio_ready.load(Relaxed) {
             return;
         }
@@ -3227,6 +3771,194 @@ impl SepData {
                 self.sbio_wq.notify_all();
             }
         }
+    }
+
+    // The enclave announces each change of a user's biometric lock state:
+    // the state in bits 16-31, the user in bits 32-63. Only this metadata is
+    // logged; the lockout is bit `LOCK_STATE_LOCKOUT` of the state.
+    fn on_lock_state_notification(&self, word: u64) {
+        let state = (word >> proto::MSG_TYPE_SHIFT) as u16;
+        let user = (word >> proto::MSG_DATA_SHIFT) as u32;
+        self.bio_lock_state
+            .store(u64::from(state) | (u64::from(user) << 16), Relaxed);
+        self.bio_lock_state_seq.fetch_add(1, Relaxed);
+        let lockout = if state & LOCK_STATE_LOCKOUT != 0 { "set" } else { "clear" };
+        dev_info!(
+            self.dev,
+            "sbio: lock state of user {} is {:#06x} (lockout {})\n",
+            user,
+            state,
+            lockout
+        );
+        self.sbio_wq.notify_all();
+    }
+
+    /// Waits up to `timeout_ms` for a lock-state notification for `user`
+    /// newer than `since` (a `bio_lock_state_seq` value). Returns its state.
+    fn await_lock_state(&self, user: u32, since: u32, timeout_ms: u32) -> Option<u16> {
+        let mut waited = 0;
+        loop {
+            if self.bio_lock_state_seq.load(Relaxed) != since {
+                let last = self.bio_lock_state.load(Relaxed);
+                if (last >> 16) as u32 == user {
+                    return Some(last as u16);
+                }
+            }
+            if waited >= timeout_ms {
+                return None;
+            }
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(
+                LOCK_STATE_POLL_MS,
+            )));
+            waited += LOCK_STATE_POLL_MS;
+        }
+    }
+
+    /// Collects a background operation result the enclave announced, if
+    /// any, as macOS does after every match. Logs only status and length.
+    /// Collects one announced background operation result with an empty
+    /// 0x21. The reply must be status 0 and exactly
+    /// `SBIO_BG_OPS_RESULT_LEN` bytes; otherwise the result stays pending.
+    fn collect_bg_ops_result(&self, why: &CStr) -> BgOps {
+        if !self.bg_ops_ready.xchg(false, Relaxed) {
+            return BgOps::Nothing;
+        }
+        let done = match self.sbio_transfer(&crate::sbio::sbio_bg_ops_result()) {
+            Ok(done) if done.status.is_ok() && done.payload.len() == crate::sbio::SBIO_BG_OPS_RESULT_LEN => done,
+            Ok(done) => {
+                dev_err!(
+                    self.dev,
+                    "sbio: background result ({}): status {}, {} bytes; left pending\n",
+                    why,
+                    done.status,
+                    done.payload.len()
+                );
+                self.bg_ops_ready.store(true, Relaxed);
+                return BgOps::Failed;
+            }
+            Err(e) => {
+                dev_err!(self.dev, "sbio: background result ({}) transfer failed: {:?}; left pending\n", why, e);
+                self.bg_ops_ready.store(true, Relaxed);
+                return BgOps::Failed;
+            }
+        };
+        let kind = crate::sbio::bg_ops_result_kind(&done.payload);
+        dev_info!(self.dev, "sbio: background result ({}): {:?}\n", why, kind);
+        match kind {
+            crate::sbio::BgOpsResult::TemplatesUpdated => BgOps::TemplatesUpdated,
+            _ => BgOps::NotUpdated,
+        }
+    }
+
+    /// Collects an announced result and, when it updated the templates,
+    /// persists them. Returns false when matching must stop.
+    fn handle_bg_ops(&self, why: &CStr) -> bool {
+        match self.collect_bg_ops_result(why) {
+            BgOps::Nothing | BgOps::NotUpdated => true,
+            BgOps::Failed => false,
+            BgOps::TemplatesUpdated => self.persist_template_update(),
+        }
+    }
+
+    fn await_and_handle_bg_ops(&self, why: &CStr, timeout_ms: u32) -> bool {
+        let mut waited = 0;
+        while !self.bg_ops_ready.load(Relaxed) && waited < timeout_ms {
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(LOCK_STATE_POLL_MS)));
+            waited += LOCK_STATE_POLL_MS;
+        }
+        self.handle_bg_ops(why)
+    }
+
+    /// The state bits of one component, from a fresh 0x6b.
+    fn component_state(&self, who: crate::sbio::CatacombUser) -> Option<u32> {
+        let reply = self.read_component_states()?;
+        crate::sbio::ComponentStates::new(&reply).state_for(who.value())
+    }
+
+    /// Waits until `who` is active and save-pending.
+    fn await_save_pending(&self, who: crate::sbio::CatacombUser) -> bool {
+        let mut waited = 0;
+        loop {
+            if self.component_state(who).is_some_and(|s| {
+                s & crate::sbio::COMPONENT_STATE_ACTIVE != 0
+                    && s & crate::sbio::COMPONENT_STATE_SAVE_PENDING != 0
+            }) {
+                return true;
+            }
+            if waited >= BG_OPS_SAVE_WAIT_MS {
+                return false;
+            }
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(BG_OPS_SAVE_POLL_MS)));
+            waited += BG_OPS_SAVE_POLL_MS;
+        }
+    }
+
+    /// A template update makes the user and then the master component
+    /// save-pending; macOS saves them as a pair, user first, master last.
+    /// A pair saved across generations makes the next boot's user load cold.
+    /// Each side is awaited, saved durably and confirmed in turn, then both
+    /// must show no pending save. Until that holds the obligation stays owed
+    /// and matching stays off.
+    fn persist_template_update(&self) -> bool {
+        self.persistence_owed.store(true, Relaxed);
+        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+            return false;
+        };
+        let user_c = crate::sbio::CatacombUser::enrolling(user);
+        if !self.await_save_pending(user_c) {
+            dev_err!(self.dev, "sbio: template update: the user catacomb never became save-pending\n");
+            return false;
+        }
+        if !self.save_catacomb(user_c, PRIVATE_TYPE_CATACOMB_USER, c"user catacomb after a template update") {
+            return false;
+        }
+        self.finish_owed_persistence()
+    }
+
+    /// Saves the master last once it is pending, then proves both sides
+    /// clean. Retried before each verify while an obligation is owed.
+    fn finish_owed_persistence(&self) -> bool {
+        if !self.persistence_owed.load(Relaxed) {
+            return true;
+        }
+        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+            return false;
+        };
+        let user_c = crate::sbio::CatacombUser::enrolling(user);
+        // A user save left pending by an earlier failure goes first.
+        if self.component_state(user_c).is_some_and(|s| s & crate::sbio::COMPONENT_STATE_SAVE_PENDING != 0)
+            && !self.save_catacomb(user_c, PRIVATE_TYPE_CATACOMB_USER, c"user catacomb after a template update")
+        {
+            return false;
+        }
+        // macOS appends the master to every template-update save, last, and
+        // does not wait for it to report a pending save of its own: after the
+        // user save it usually reports none. A pair saved without it makes the
+        // next boot's user load cold.
+        let master = crate::sbio::CatacombUser::MASTER;
+        if !self.component_state(master).is_some_and(|s| s & crate::sbio::COMPONENT_STATE_ACTIVE != 0) {
+            dev_err!(self.dev, "sbio: template update: the master catacomb is not active\n");
+            return false;
+        }
+        if !self.save_catacomb(master, PRIVATE_TYPE_CATACOMB_MASTER, c"master catacomb after a template update") {
+            return false;
+        }
+        let clean = |s: Option<u32>| {
+            s.is_some_and(|s| {
+                s & crate::sbio::COMPONENT_STATE_ACTIVE != 0 && s & crate::sbio::COMPONENT_STATE_SAVE_PENDING == 0
+            })
+        };
+        if !clean(self.component_state(user_c)) || !clean(self.component_state(master)) {
+            dev_err!(self.dev, "sbio: template update: a component is still save-pending after the pair was saved\n");
+            return false;
+        }
+        if !self.resnapshot_identity_keybag() {
+            dev_err!(self.dev, "sbio: template update: identity-bag snapshot failed\n");
+            return false;
+        }
+        self.persistence_owed.store(false, Relaxed);
+        dev_info!(self.dev, "sbio: template update persisted (user, then master)\n");
+        true
     }
 
     fn sbio_continue(&self, cont: &transfer::Continuation) {
@@ -3449,6 +4181,7 @@ impl SepData {
             bio::release(&mut self.bio_session.lock());
             return Err(e);
         }
+        self.bio_open_gen.fetch_add(1, Relaxed);
         Ok(())
     }
 
@@ -3525,6 +4258,10 @@ impl SepData {
     /// ones, and wait for the enrol or verify work to stop touching the sensor
     /// before devices go down.
     pub(crate) fn sleep_prepare(&self) {
+        // Power may be removed across the sleep; register afresh after it.
+        self.sensor_kept.store(false, Relaxed);
+        // A prompt does not carry across a sleep: the next verify ends it.
+        self.match_scope_gen.store(0, Relaxed);
         let woke = {
             let mut session = self.bio_session.lock();
             self.suspending.store(true, Relaxed);
@@ -3645,8 +4382,52 @@ impl SepData {
     // passcode clears. The credential is set up again only after a password
     // authentication, in `rearm_after_password`, never here: doing it on the
     // enclave's refusal would undo the lockout.
+    /// Whether the enclave's latest lock-state notification for the Linux
+    /// user has the lockout bit set.
+    fn enclave_reports_lockout(&self) -> bool {
+        let last = self.bio_lock_state.load(Relaxed);
+        self.bio_lock_state_seq.load(Relaxed) != 0
+            && (last >> 16) as u32 == SBIO_PROBE_USER_ID as u32
+            && (last as u16) & LOCK_STATE_LOCKOUT != 0
+    }
+
+    /// Locks Touch ID on the host after `VERIFY_RETRY_LIMIT` failed matches in
+    /// a row. A password authentication re-arms it, and the record keeps the
+    /// lock across a restart, as for the enclave's own lockout.
+    fn enter_retry_limit(&self) {
+        dev_info!(
+            self.dev,
+            "verify: {} failed attempts in a row; Touch ID is locked until a password authentication (the retry limit)\n",
+            self.bio_nomatch_streak.load(Relaxed)
+        );
+        self.bio_lockout.store(true, Relaxed);
+        self.bio_lockout_logged.store(true, Relaxed);
+        if !self.write_lockout_record(true) {
+            dev_warn!(
+                self.dev,
+                "verify: could not record the lockout in {}; it ends at the next restart\n",
+                LOCKOUT_RECORD
+            );
+        }
+    }
+
     fn enter_lockout(&self) -> bio::VerifyOutcome {
         let failures = self.bio_nomatch_streak.load(Relaxed);
+        if !self.enclave_reports_lockout() {
+            // A refusal with the user's lockout bit clear is the match
+            // scope's own limit, not the user's biometric lockout: it lasts
+            // until a new authenticated context, and a restart ends it, so it
+            // is not recorded across restarts.
+            dev_warn!(
+                self.dev,
+                "verify: MATCH_RESULT refused after {} failed attempts while the enclave reports user {} unlocked: a match-scope refusal; Touch ID needs a password authentication for a new match context\n",
+                failures,
+                SBIO_PROBE_USER_ID
+            );
+            self.bio_lockout.store(true, Relaxed);
+            self.bio_lockout_logged.store(true, Relaxed);
+            return bio::VerifyOutcome::Failed(ENROL_STATUS_LOCKOUT);
+        }
         if failures > 0 {
             dev_warn!(
                 self.dev,
@@ -3775,9 +4556,10 @@ impl SepData {
 
     /// Userspace calls this only after the user's password was verified. The
     /// node is root's alone and its SELinux label confines it to the re-arm
-    /// helper. The verified password authorizes an unwrap of the Linux FV
-    /// records with their stable stored secret. A new SCRD match context is
-    /// then set up and the enclave's lockout record is saved.
+    /// helper. The verified password authorizes a password-mode verification
+    /// of the designated user's key bag with its stored secret, which is what
+    /// ends the enclave's lockout. A new SCRD match context is then set up and
+    /// the enclave's lockout record is saved.
     fn rearm_after_password(&self, _password: crate::Secret) -> Result<()> {
         if !self.touchid_started.load(Relaxed) {
             // Activation sets up a fresh match credential; only the record of
@@ -3806,68 +4588,145 @@ impl SepData {
             if !self.capture_begin() {
                 continue;
             }
-            // Userspace has already verified the password. The Linux-owned FV
-            // pair is provisioned and unwrapped with one stable credential:
-            // the stored identity-bag secret. It must precede the SCRD
-            // credential refresh; a bag unlock is not a substitute for it.
-            let unwrapped = match keybag::read(keybag::Slot::Identity) {
-                Ok(keybag::State::Present(stored)) => match self.rearm_touchid_fv(stored.secret()) {
-                    Ok(()) => true,
-                    Err(e) => {
-                        dev_err!(
-                            self.dev,
-                            "Touch ID: re-arm: the Linux FV record pair did not unwrap: {:?}\n",
-                            e
-                        );
-                        false
-                    }
-                },
-                Ok(keybag::State::Absent(_)) => {
-                    dev_err!(self.dev, "Touch ID: re-arm: there is no stored identity key bag secret\n");
-                    false
-                }
-                Err(e) => {
-                    dev_err!(
-                        self.dev,
-                        "Touch ID: re-arm: the identity key bag record is unreadable: {:?}\n",
-                        e
-                    );
-                    false
-                }
-            };
-            let established = unwrapped && self.establish_scrd_match_context(user);
-            let saved = established && self.save_lockout();
-            if unwrapped && !established {
-                dev_err!(self.dev, "Touch ID: re-arm: the FV unwrap succeeded but the SCRD match credential was not re-established\n");
-            } else if established && !saved {
-                dev_warn!(self.dev, "Touch ID: re-arm: the enclave's lockout record was not saved; a restart restores the older one\n");
-            }
-            if established {
+            let outcome = self.clear_enclave_lockout(user);
+            if outcome.is_some() {
                 self.bio_nomatch_streak.store(0, Relaxed);
                 self.bio_lockout_logged.store(false, Relaxed);
                 self.bio_lockout.store(false, Relaxed);
             }
             self.capture_end();
-            break established;
+            break outcome;
         };
-        if !rearmed {
+        let Some(confirmed) = rearmed else {
             dev_err!(
                 self.dev,
-                "Touch ID: re-arming after a password authentication failed; the FV unwrap or match credential failed, and Touch ID stays locked\n"
+                "Touch ID: re-arming after a password authentication failed; Touch ID stays locked\n"
             );
             return Err(EIO);
-        }
+        };
         if !self.write_lockout_record(false) {
             dev_warn!(
                 self.dev,
                 "Touch ID: could not clear the recorded lockout; the next restart will ask for the password again\n"
             );
         }
+        if confirmed {
+            dev_info!(
+                self.dev,
+                "Touch ID: re-armed after a password authentication; the enclave reported the lockout cleared\n"
+            );
+        } else {
+            dev_warn!(
+                self.dev,
+                "Touch ID: re-armed after a password authentication, but the enclave announced no lock state; whether it matches again is unconfirmed\n"
+            );
+        }
+        Ok(())
+    }
+
+    /// The enclave side of a re-arm. `Some(true)` when the enclave announced
+    /// the user's lock state with the lockout bit clear, `Some(false)` when
+    /// it accepted the password verification but announced nothing, `None`
+    /// on any failure or when it still reports the lockout.
+    fn clear_enclave_lockout(&self, user: crate::sbio::UserId) -> Option<bool> {
+        let du = crate::sks::DesignateUser::new(SBIO_PROBE_USER_ID)?;
+        if !self.keybag_designated.load(Relaxed) || self.enrol_material.lock().is_none() {
+            dev_err!(self.dev, "Touch ID: re-arm: no user key bag is designated\n");
+            return None;
+        }
+        let stored = match keybag::read(keybag::Slot::Identity) {
+            Ok(keybag::State::Present(stored)) => stored,
+            Ok(keybag::State::Absent(_)) => {
+                dev_err!(self.dev, "Touch ID: re-arm: there is no stored identity key bag secret\n");
+                return None;
+            }
+            Err(e) => {
+                dev_err!(
+                    self.dev,
+                    "Touch ID: re-arm: the identity key bag record is unreadable: {:?}\n",
+                    e
+                );
+                return None;
+            }
+        };
+        let notify_user = user.value() as u32;
+        let since = self.bio_lock_state_seq.load(Relaxed);
+        let Some(out) = self.sks_send(self.sks_req_verify_password(du.special_handle(), stored.secret()))
+        else {
+            dev_err!(self.dev, "Touch ID: re-arm: the password verification did not answer\n");
+            return None;
+        };
+        if out.reply.status != 0 {
+            dev_err!(
+                self.dev,
+                "Touch ID: re-arm: the password verification answered SKS status {}\n",
+                out.reply.status
+            );
+            return None;
+        }
+        let body = self.sks_report_response(crate::sks::SKS_VERIFY_SECRET_NAME, &out);
+        let Some(flags) = body.and_then(crate::sks::verify_secret_reply_flags) else {
+            dev_err!(
+                self.dev,
+                "Touch ID: re-arm: the password verification reply is malformed ({} body bytes)\n",
+                body.map_or(0, |b| b.len())
+            );
+            return None;
+        };
         dev_info!(
             self.dev,
-            "Touch ID: re-armed after a password authentication; the enclave accepts matches again\n"
+            "Touch ID: re-arm: password verification of the designated bag answered status 0, returned flags {:#x}\n",
+            flags
         );
-        Ok(())
+        let confirmed = match self.await_lock_state(notify_user, since, LOCK_STATE_WAIT_MS) {
+            Some(state) if state & LOCK_STATE_LOCKOUT != 0 => {
+                dev_err!(
+                    self.dev,
+                    "Touch ID: re-arm: the enclave still reports the lockout (state {:#06x})\n",
+                    state
+                );
+                return None;
+            }
+            Some(_) => true,
+            None => false,
+        };
+        // The next verify opens a fresh unlock evaluation; nothing of the old
+        // one is carried over.
+        self.end_match_scope(c"a password re-arm");
+        let _ = self.handle_bg_ops(c"at a password re-arm");
+        // The password verification alone leaves matching refused: the old
+        // cold-match credentials stay live until a restart of the enclave,
+        // and a restart is the only thing that has ever ended the refusal.
+        // Redo what a restart's cold-match preparation does, without the
+        // Catacomb loads: retire every cold-match credential, unlock the
+        // designated bag with its secret, and set up one new credential.
+        let (deleted, refused) = self.retire_cold_match_contexts();
+        let unlocked = self.unlock_special_bag();
+        if !self.establish_scrd_match_context(user) {
+            dev_err!(
+                self.dev,
+                "Touch ID: re-arm: no new cold-match credential after retiring {} ({} refused); Touch ID stays locked\n",
+                deleted,
+                refused
+            );
+            return None;
+        }
+        dev_info!(
+            self.dev,
+            "Touch ID: re-arm: cold-match preparation redone (retired {}, refused {}, special unlock {}, new credential true)\n",
+            deleted,
+            refused,
+            unlocked
+        );
+        // Bring the sensor up from a power cycle for the next verify, as
+        // after a restart.
+        let _ = sensor::idle();
+        self.sensor_kept.store(false, Relaxed);
+        sensor::power(false);
+        if !self.save_lockout() {
+            dev_warn!(self.dev, "Touch ID: re-arm: the enclave's lockout record was not saved; a restart restores the older one\n");
+        }
+        Some(confirmed)
     }
 
     fn mint_token_bytes(&self) -> Option<[u8; bio::TOKEN_LEN]> {
@@ -4751,8 +5610,10 @@ pub(crate) struct SbioOp {
     name: &'static CStr,
 }
 
-const SBIO_MAX_PAYLOAD: usize = 0x97;
+/// The largest request: an image init with its credential-context blob.
+const SBIO_MAX_PAYLOAD: usize = SBIO_IMAGE_INIT_LEN + crate::scrd::SCRD_ACM_HANDLE_LEN;
 
+/// The image init without a credential context.
 pub(crate) const SBIO_IMAGE_INIT_LEN: usize = 0x97;
 static_assert!(SBIO_IMAGE_INIT_LEN <= SBIO_MAX_PAYLOAD);
 
@@ -4904,6 +5765,45 @@ pub(crate) fn sbio_select_context(scope: ContextScope, proof: &NoExistingCatacom
 
 pub(crate) const SBIO_PROTECTED_CONFIG_LEN: usize = 32;
 
+/// The PROTECTED_CONFIG answer: eight signed words, the set unlock,
+/// identification, login and payment settings, then the effective ones.
+/// Each is 0 (disabled), 1 (enabled) or -1 (unspecified).
+pub(crate) struct ProtectedConfig {
+    pub(crate) unlock_set: i32,
+    pub(crate) unlock_effective: i32,
+}
+
+const PC_UNLOCK_SET: usize = 0x00;
+const PC_UNLOCK_EFFECTIVE: usize = 0x10;
+static_assert!(PC_UNLOCK_EFFECTIVE + 4 <= SBIO_PROTECTED_CONFIG_LEN);
+
+impl ProtectedConfig {
+    pub(crate) fn parse(raw: &[u8]) -> Option<ProtectedConfig> {
+        if raw.len() != SBIO_PROTECTED_CONFIG_LEN {
+            return None;
+        }
+        let word = |at: usize| i32::from_le_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]]);
+        Some(ProtectedConfig {
+            unlock_set: word(PC_UNLOCK_SET),
+            unlock_effective: word(PC_UNLOCK_EFFECTIVE),
+        })
+    }
+
+    pub(crate) fn describe(value: i32) -> &'static str {
+        match value {
+            0 => "disabled",
+            1 => "enabled",
+            -1 => "unspecified",
+            _ => "unknown",
+        }
+    }
+
+    /// The macOS admission rule for an unlock match.
+    pub(crate) fn allows_unlock(&self) -> bool {
+        self.unlock_set == 1 && self.unlock_effective != -1
+    }
+}
+
 const OP_SBIO_PROTECTED_CONFIG: u16 = 0x2b;
 pub(crate) fn sbio_protected_config(id: UserId) -> SbioOp {
     SbioOp {
@@ -5009,6 +5909,33 @@ pub(crate) fn sbio_update_device_list() -> SbioOp {
         payload_len: 0,
         name: c"UPDATE_DEVICE_LIST",
     }
+}
+
+/// Opens a match operation: the enclave answers the operation's device list,
+/// a four-byte device count and one 24-byte record per device. Empty. Sent at
+/// the start of every logical match, before its first image; the operation
+/// ends with `MATCH_CANCEL`. Distinct from `UPDATE_DEVICE_LIST` (`0x7b`),
+/// which only syncs the device view.
+const OP_SBIO_OPERATION_DEVICE_LIST: u16 = 0x7d;
+pub(crate) fn sbio_operation_device_list() -> SbioOp {
+    SbioOp {
+        opcode: OP_SBIO_OPERATION_DEVICE_LIST,
+        payload: pad_payload(&[]),
+        payload_len: 0,
+        name: c"OPERATION_DEVICE_LIST",
+    }
+}
+
+const OP_DEVICE_LIST_HEADER_LEN: usize = 4;
+const OP_DEVICE_RECORD_LEN: usize = 24;
+
+/// The device count of an operation device list, if the reply is exactly a
+/// count followed by that many records.
+pub(crate) fn operation_device_count(reply: &[u8]) -> Option<u32> {
+    let header = reply.get(..OP_DEVICE_LIST_HEADER_LEN)?;
+    let count = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    let records = (count as usize).checked_mul(OP_DEVICE_RECORD_LEN)?;
+    (reply.len() == OP_DEVICE_LIST_HEADER_LEN.checked_add(records)?).then_some(count)
 }
 
 pub(crate) const SBIO_MATCH_POLICY_LEN: usize = 2;
@@ -5502,6 +6429,80 @@ impl MatchResult {
     }
 }
 
+/// Retry capture info: sent after each further frame of a no-match touch has
+/// been relayed (0x65). Empty; the enclave answers six bytes of capture
+/// metadata (button state, drive voltage), which Linux does not use. It does
+/// not count as another attempt. The name is descriptive.
+const OP_SBIO_RETRY_CAPTURE_INFO: u16 = 0x3e;
+pub(crate) fn sbio_retry_capture_info() -> SbioOp {
+    SbioOp {
+        opcode: OP_SBIO_RETRY_CAPTURE_INFO,
+        payload: pad_payload(&[]),
+        payload_len: 0,
+        name: c"RETRY_CAPTURE_INFO",
+    }
+}
+
+/// Match retry finalize: ends the same-touch retry pass of a no-match touch,
+/// so the touch counts as one result, before MATCH_POLICY. Empty request and
+/// reply. The name is descriptive.
+const OP_SBIO_MATCH_RETRY_FINALIZE: u16 = 0x0c;
+pub(crate) fn sbio_match_retry_finalize() -> SbioOp {
+    SbioOp {
+        opcode: OP_SBIO_MATCH_RETRY_FINALIZE,
+        payload: pad_payload(&[]),
+        payload_len: 0,
+        name: c"MATCH_RETRY_FINALIZE",
+    }
+}
+
+const OP_SBIO_MATCH_CANCEL: u16 = 0x0b;
+/// Ends the enclave's match mode when a match operation ends. Empty.
+pub(crate) fn sbio_match_cancel() -> SbioOp {
+    SbioOp {
+        opcode: OP_SBIO_MATCH_CANCEL,
+        payload: pad_payload(&[]),
+        payload_len: 0,
+        name: c"MATCH_CANCEL",
+    }
+}
+
+/// The background operation result: a u16 "result present" word, a u16
+/// "template list updated" word, then the update record.
+pub(crate) const SBIO_BG_OPS_RESULT_LEN: usize = 0xc8e;
+const BG_OPS_PRESENT: usize = 0x000;
+const BG_OPS_UPDATED: usize = 0x002;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BgOpsResult {
+    NoResult,
+    TemplateListNotUpdated,
+    TemplatesUpdated,
+}
+
+pub(crate) fn bg_ops_result_kind(reply: &[u8]) -> BgOpsResult {
+    let word = |at: usize| u16::from_le_bytes([reply[at], reply[at + 1]]);
+    if reply.len() < BG_OPS_UPDATED + 2 || word(BG_OPS_PRESENT) == 0 {
+        BgOpsResult::NoResult
+    } else if word(BG_OPS_UPDATED) == 0 {
+        BgOpsResult::TemplateListNotUpdated
+    } else {
+        BgOpsResult::TemplatesUpdated
+    }
+}
+
+const OP_SBIO_BG_OPS_RESULT: u16 = 0x21;
+/// Collects the background operation result the enclave announced with a
+/// tag-0x03 notice. The request is empty.
+pub(crate) fn sbio_bg_ops_result() -> SbioOp {
+    SbioOp {
+        opcode: OP_SBIO_BG_OPS_RESULT,
+        payload: pad_payload(&[]),
+        payload_len: 0,
+        name: c"BG_OPS_RESULT",
+    }
+}
+
 const OP_SBIO_IMAGE_CLEANUP: u16 = 0x22;
 pub(crate) fn sbio_image_cleanup() -> SbioOp {
     SbioOp {
@@ -5608,6 +6609,25 @@ const IPI_DEVICE_KIND: usize = 0x4f;
 const IPI_USER_ID: usize = 0x67;
 
 const IPI_DEVICE_BUILTIN: u32 = 1;
+/// The match mode word of an authenticated match.
+const IPI_MATCH_MODE: usize = 0x00;
+/// Match mode of an authenticated match in the LocalAuthentication class:
+/// macOS 26 opens a Touch ID prompt's matches with match flags 0x88
+/// (MatchModeACM). It includes the credential-set bit 0x08, which makes the
+/// request carry the ACM context as a length-prefixed blob after the base
+/// structure. The login window's keybag-unlock match adds bit 0x01 (0x89);
+/// that class has its own attempt budget in the enclave, which a password
+/// does not reset, and Linux has no keybag-unlock caller. Every verify here
+/// uses the LocalAuthentication class.
+pub(crate) const SBIO_MATCH_MODE_ACM: u32 = 0x88;
+/// The length word of the credential-set blob; its bytes follow the base.
+const IPI_CREDENTIAL_LEN: usize = 0x93;
+const IPI_CREDENTIAL: usize = SBIO_IMAGE_INIT_LEN;
+
+static_assert!(IPI_MATCH_MODE + 4 <= IPI_FIRST_IMAGE);
+static_assert!(IPI_CREDENTIAL_LEN > IPI_USER_ID + 4);
+static_assert!(IPI_CREDENTIAL_LEN + 4 == SBIO_IMAGE_INIT_LEN);
+static_assert!(IPI_CREDENTIAL + crate::scrd::SCRD_ACM_HANDLE_LEN <= SBIO_MAX_PAYLOAD);
 
 static_assert!(IPI_USER_ID + 4 <= SBIO_MAX_PAYLOAD);
 static_assert!(IPI_DEVICE_KIND + 4 <= SBIO_MAX_PAYLOAD);
@@ -5634,8 +6654,22 @@ pub(crate) fn sbio_image_processing_init(
     capture_counter: u32,
     user: UserId,
     monotonic_ns: u64,
+    scope: Option<&[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>,
 ) -> SbioOp {
     let mut payload = [0u8; SBIO_MAX_PAYLOAD];
+
+    // An authenticated match names its mode and appends the live ACM handle
+    // as a length-prefixed blob; without it the enclave matches in a scope
+    // with its own small limit.
+    let mut payload_len = SBIO_IMAGE_INIT_LEN;
+    if let Some(handle) = scope {
+        payload[IPI_MATCH_MODE..IPI_MATCH_MODE + 4]
+            .copy_from_slice(&SBIO_MATCH_MODE_ACM.to_le_bytes());
+        payload[IPI_CREDENTIAL_LEN..IPI_CREDENTIAL_LEN + 4]
+            .copy_from_slice(&(handle.len() as u32).to_le_bytes());
+        payload[IPI_CREDENTIAL..IPI_CREDENTIAL + handle.len()].copy_from_slice(handle);
+        payload_len += handle.len();
+    }
 
     if first_image {
         payload[IPI_FIRST_IMAGE] = 1;
@@ -5657,7 +6691,7 @@ pub(crate) fn sbio_image_processing_init(
     SbioOp {
         opcode: OP_SBIO_IMAGE_INIT,
         payload,
-        payload_len: SBIO_IMAGE_INIT_LEN,
+        payload_len,
         name: c"IMAGE_PROCESSING_INIT",
     }
 }

@@ -928,6 +928,31 @@ impl SepData {
         })
     }
 
+    /// `0x21` verify-secret (variant 1) in password-validation mode: the
+    /// designated user's own bag, that bag's secret, no auxiliary context.
+    /// This is the request that ends a biometric lockout.
+    pub(crate) fn sks_req_verify_password(
+        &self,
+        special: crate::sks::SpecialHandle,
+        secret: &[u8],
+    ) -> Result<SksRequest> {
+        let mut body = image::Body::new();
+        body.put_u32(crate::sks::SKS_VERIFY_SECRET_VARIANT)?;
+        body.put_u64(crate::sks::SKS_CLIENT_ID)?;
+        body.put_i32(special.value())?;
+        body.put_blob(secret)?;
+        body.put_blob(&[])?;
+        body.put_u64(crate::sks::SKS_VERIFY_SECRET_PASSWORD)?;
+        let img = image::build_request(self.sks_ipc_version(), self.sks_timestamp_us(), &body)?;
+        let len = self.sks_image_len(&img)?;
+        let msg = crate::sks::encode_sks_verify_secret(self.sks_next_seq(), len).ok_or(EINVAL)?;
+        Ok(SksRequest {
+            name: crate::sks::SKS_VERIFY_SECRET_NAME,
+            msg,
+            img,
+        })
+    }
+
     pub(crate) fn sks_step(
         &self,
         label: &CStr,
@@ -1343,6 +1368,23 @@ pub(crate) fn encode_sks_device_state_transition(seq: Sequence, len: ImageLen) -
 const OP_SKS_VERIFY_SECRET: u8 = 0x21;
 pub(crate) const SKS_VERIFY_SECRET_NAME: &CStr = c"VERIFY_SECRET";
 pub(crate) const SKS_VERIFY_SECRET_VARIANT: u32 = 1;
+/// Verify-secret flag word for a password validation.
+pub(crate) const SKS_VERIFY_SECRET_PASSWORD: u64 = 0x200;
+/// Its reply body: the variant, then a u64 of returned state flags.
+pub(crate) const SKS_VERIFY_SECRET_REPLY_LEN: usize = 12;
+
+/// The returned state flags of a variant-1 verify-secret reply body, or
+/// `None` for any other shape.
+pub(crate) fn verify_secret_reply_flags(body: &[u8]) -> Option<u64> {
+    if body.len() != SKS_VERIFY_SECRET_REPLY_LEN {
+        return None;
+    }
+    let variant = u32::from_le_bytes(body[0..4].try_into().ok()?);
+    if variant != SKS_VERIFY_SECRET_VARIANT {
+        return None;
+    }
+    Some(u64::from_le_bytes(body[4..12].try_into().ok()?))
+}
 
 pub(crate) fn encode_sks_verify_secret(seq: Sequence, len: ImageLen) -> Option<Message> {
     let msg = encode_sks_raw(OP_SKS_VERIFY_SECRET, seq.value(), len.value());

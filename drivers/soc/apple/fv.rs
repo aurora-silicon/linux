@@ -922,6 +922,10 @@ impl SepData {
     /// The pair is created on first use and reloaded from the host store
     /// afterwards. A stored pair the enclave refuses, or one that no longer
     /// decodes, is replaced by a freshly proved pair.
+    // No longer on the re-arm path: the password verification of the
+    // designated bag ends the lockout without an FV unwrap. Kept until the
+    // finger test settles whether any configuration still needs it.
+    #[allow(dead_code)]
     pub(crate) fn rearm_touchid_fv(&self, secret: &[u8]) -> Result<()> {
         self.fv_ready()?;
         let stored = self
