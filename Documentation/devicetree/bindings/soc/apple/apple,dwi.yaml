@@ -26,6 +26,9 @@ select:
   required:
     - compatible
 
+properties:
+  compatible: true
+
 allOf:
   - if:
       properties:
@@ -62,7 +65,6 @@ allOf:
         - interrupts
         - power-domains
 
-      additionalProperties: false
     else:
       properties:
         compatible:
@@ -90,4 +92,4 @@ allOf:
         - interrupts
         - power-domains
 
-      additionalProperties: false
+unevaluatedProperties: false

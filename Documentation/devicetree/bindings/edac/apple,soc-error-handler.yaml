@@ -32,6 +32,9 @@ select:
   required:
     - compatible
 
+properties:
+  compatible: true
+
 allOf:
   - if:
       properties:
@@ -167,7 +170,6 @@ allOf:
                 minItems: 26
                 maxItems: 26
 
-      additionalProperties: false
     else:
       properties:
         compatible:
@@ -243,7 +245,7 @@ allOf:
                 minItems: 9
                 maxItems: 9
 
-      additionalProperties: false
+unevaluatedProperties: false
 
 examples:
   - |

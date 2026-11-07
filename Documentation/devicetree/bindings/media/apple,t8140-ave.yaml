@@ -29,6 +29,9 @@ select:
   required:
     - compatible
 
+properties:
+  compatible: true
+
 allOf:
   - if:
       properties:
@@ -73,7 +76,6 @@ allOf:
         - power-domains
         - iommus
 
-      additionalProperties: false
     else:
       properties:
         compatible:
@@ -138,4 +140,4 @@ allOf:
         - power-domain-names
         - iommus
 
-      additionalProperties: false
+unevaluatedProperties: false
