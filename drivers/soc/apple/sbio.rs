@@ -5273,20 +5273,37 @@ impl SepData {
             "Touch ID: {}; it needs the password again (dropping the biometric tokens)\n",
             why
         );
-        self.end_match_scope(c"the biometric tokens' expiry");
+        // macOS sends the drop first, whether or not a match operation is
+        // open, and only then cancels an open unlock match.
         if let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) {
-            match self.sbio_call(&crate::sbio::sbio_drop_biometric_tokens(user)) {
-                SbioOutcome::Ok(_) => dev_info!(
+            let since = self.bio_lock_state_seq.load(Relaxed);
+            if self.send(crate::sbio::encode_drop_biometric_tokens(&user)).is_err() {
+                dev_warn!(
                     self.dev,
-                    "Touch ID: the enclave dropped the biometric tokens of user {} (DROP_BIOMETRIC_TOKENS)\n",
-                    SBIO_PROBE_USER_ID
-                ),
-                _ => dev_warn!(
-                    self.dev,
-                    "Touch ID: DROP_BIOMETRIC_TOKENS was not accepted; the host refuses matching until the password all the same\n"
-                ),
+                    "Touch ID: the DropBiometricTokens message was not sent; the host refuses matching until the password all the same\n"
+                );
+            } else {
+                match self.await_lock_state(user.value() as u32, since, LOCK_STATE_WAIT_MS) {
+                    Some(state) if state & LOCK_STATE_UNLOCK_TOKEN == 0 => dev_info!(
+                        self.dev,
+                        "Touch ID: the enclave dropped the biometric tokens of user {} (lock state {:#06x}, unlock token gone)\n",
+                        SBIO_PROBE_USER_ID,
+                        state
+                    ),
+                    Some(state) => dev_warn!(
+                        self.dev,
+                        "Touch ID: after DropBiometricTokens the enclave still reports the unlock token for user {} (lock state {:#06x}); the host refuses matching until the password all the same\n",
+                        SBIO_PROBE_USER_ID,
+                        state
+                    ),
+                    None => dev_warn!(
+                        self.dev,
+                        "Touch ID: the enclave announced no lock state after DropBiometricTokens; the host refuses matching until the password all the same\n"
+                    ),
+                }
             }
         }
+        self.end_match_scope(c"the biometric tokens' expiry");
         self.bio_lock_reason.store(age.lock_reason(), Relaxed);
         self.bio_lockout.store(true, Relaxed);
         self.bio_lockout_logged.store(true, Relaxed);
@@ -5432,7 +5449,27 @@ impl SepData {
             "Touch ID: re-arm: password verification of the designated bag answered status 0, returned flags {:#x}\n",
             flags
         );
+        // After DropBiometricTokens only the announced unlock token shows that
+        // the password verification restored them; fail closed without it.
+        let reason = self.bio_lock_reason.load(Relaxed);
+        let tokens_dropped =
+            reason == bio::LOCK_REASON_NOT_UNLOCKED || reason == bio::LOCK_REASON_PASSWORD_UNUSED;
         let confirmed = match self.await_lock_state(notify_user, since, LOCK_STATE_WAIT_MS) {
+            Some(state) if tokens_dropped && state & LOCK_STATE_UNLOCK_TOKEN == 0 => {
+                dev_err!(
+                    self.dev,
+                    "Touch ID: re-arm: the enclave did not restore the unlock token (state {:#06x}); Touch ID stays locked\n",
+                    state
+                );
+                return None;
+            }
+            None if tokens_dropped => {
+                dev_err!(
+                    self.dev,
+                    "Touch ID: re-arm: the enclave announced no lock state after the password, so the dropped unlock token is not known to be back; Touch ID stays locked\n"
+                );
+                return None;
+            }
             Some(state) if state & LOCK_STATE_NEEDS_PASSWORD != 0 => {
                 dev_err!(
                     self.dev,
@@ -6883,18 +6920,6 @@ pub(crate) fn component_action(state: u32) -> ComponentAction {
     }
 }
 
-const OP_SBIO_DROP_BIOMETRIC_TOKENS: u16 = 0x72;
-/// Has the enclave drop the user's biometric tokens: Touch ID stops standing
-/// in for the password until a password verification restores them.
-pub(crate) fn sbio_drop_biometric_tokens(user: UserId) -> SbioOp {
-    SbioOp {
-        opcode: OP_SBIO_DROP_BIOMETRIC_TOKENS,
-        payload: pad_payload(&user.value().to_le_bytes()),
-        payload_len: 4,
-        name: c"DROP_BIOMETRIC_TOKENS",
-    }
-}
-
 const OP_SBIO_SAVE_LOCKOUT: u16 = 0x70;
 pub(crate) fn sbio_save_lockout() -> SbioOp {
     SbioOp {
@@ -7626,6 +7651,25 @@ const fn encode_sbio(opcode: u16, marker: u8, seq: u16) -> Message {
 }
 
 static_assert!(encode_sbio(0x73, transfer::MARKER_FIRST, 0).msg0 == 0x0000_0073_fc08);
+
+/// Tag of DropBiometricTokens: the enclave drops the user's biometric tokens,
+/// and Touch ID stops standing in for the password until a password
+/// verification of the user's key bag restores them. Unlike a transaction it
+/// is one in-band word, like the enclave's own notices: the tag, a zero
+/// middle field and the user in the high word. There is no reply; the
+/// enclave announces the user's new lock state instead.
+const SBIO_TAG_DROP_BIOMETRIC_TOKENS: u8 = 0x72;
+
+pub(crate) const fn encode_drop_biometric_tokens(user: &UserId) -> Message {
+    Message {
+        msg0: (EP_SBIO as u64)
+            | ((SBIO_TAG_DROP_BIOMETRIC_TOKENS as u64) << MSG_TAG_SHIFT)
+            | ((user.value() as u32 as u64) << 32),
+        msg1: 0,
+    }
+}
+
+static_assert!(encode_drop_biometric_tokens(&UserId(1000)).msg0 == 0x0000_03e8_0000_7208);
 
 pub(crate) fn encode_sbio_raw(opcode: u16, seq: u16) -> Option<Message> {
     Some(encode_sbio(opcode, transfer::MARKER_FIRST, seq))
