@@ -1,0 +1,56 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Apple Mac mini (M4 Pro, 2024). Unqualified peripherals remain disabled. */
+
+/dts-v1/;
+
+#include "t6040.dtsi"
+
+/ {
+	compatible = "apple,j773s", "apple,t6040", "apple,arm-platform";
+	model = "Apple Mac mini (M4 Pro, 2024)";
+	chassis-type = "desktop";
+
+	aliases {
+		serial0 = &serial0;
+		sep = &sep;
+		pmp = &pmp;
+		gpu = &gpu;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		stdout-path = "serial0:115200n8";
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>;
+			/* The loader supplies this boot's framebuffer allocation. */
+			status = "disabled";
+		};
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		/* Runtime firmware reservations are supplied by the loader. */
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0 0 0 0>; /* Filled by the loader. */
+	};
+};
+
+&serial0 {
+	status = "okay";
+};
+
+/* These endpoints belong to the laptop board, not the Mac mini. */
+/delete-node/ &battery_monitor;
+/delete-node/ &hid_mux;
+/delete-node/ &audio_low_power_mic;
+/delete-node/ &audio_mic_buffer;
+/delete-node/ &audio_listening_client;
