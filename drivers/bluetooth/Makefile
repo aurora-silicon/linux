@@ -55,3 +55,7 @@ hci_uart-$(CONFIG_BT_HCIUART_MRVL)	+= hci_mrvl.o
 hci_uart-$(CONFIG_BT_HCIUART_AML)	+= hci_aml.o
 hci_uart-objs				:= $(hci_uart-y)
 obj-$(CONFIG_BT_CENTAURI)		+= btcentauri.o
+
+obj-$(CONFIG_BT_MTK7932_PCIE) += mt7932_bt_pcie.o
+
+CONTEXT_ANALYSIS := y
