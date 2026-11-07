@@ -28,6 +28,9 @@ const LOCKOUT_LOCKED: u32 = 1;
 const SBIO_NOTIFY_LOCK_STATE: u8 = 0x01;
 /// The lock-state bit that is set while the enclave refuses matches.
 const LOCK_STATE_LOCKOUT: u16 = 0x40;
+/// Failed matches in a row after which Touch ID asks for the password, the
+/// limit macOS LocalAuthentication applies in a Touch ID prompt.
+const VERIFY_RETRY_LIMIT: u32 = 3;
 /// Message tag of the enclave's "background operation result ready" notice.
 /// The host answers it with BG_OPS_RESULT (0x21); until it does, the result
 /// stays queued in the enclave.
@@ -206,7 +209,9 @@ mod lockout_tests {
         let user = UserId::new(1000).unwrap();
         let handle = [0xa5u8; crate::scrd::SCRD_ACM_HANDLE_LEN];
         let op = sbio_image_processing_init(ImagePurpose::Matching, true, true, 0, user, 0, Some(&handle));
-        assert_eq!(&op.payload[IPI_MATCH_MODE..IPI_MATCH_MODE + 4], &SBIO_MATCH_MODE_UNLOCK.to_le_bytes());
+        assert_eq!(&op.payload[IPI_MATCH_MODE..IPI_MATCH_MODE + 4], &SBIO_MATCH_MODE_ACM.to_le_bytes());
+        // The LocalAuthentication class: credential set, no keybag-unlock bit.
+        assert_eq!(SBIO_MATCH_MODE_ACM, 0x88);
         assert_eq!(&op.payload[IPI_USER_ID..IPI_USER_ID + 4], &1000i32.to_le_bytes());
         assert_eq!(&op.payload[IPI_CREDENTIAL_LEN..IPI_CREDENTIAL_LEN + 4], &16u32.to_le_bytes());
         assert_eq!(&op.payload[0x97..0xa7], &handle);
@@ -2162,6 +2167,15 @@ impl SepData {
         {
             let _ = self.enter_lockout();
         }
+        // The retry limit is the host's, as on macOS: LocalAuthentication
+        // stops offering Touch ID after three failed matches and asks for the
+        // password, while the enclave itself stays unlocked.
+        if matches!(outcome, bio::VerifyOutcome::NoMatch)
+            && !self.bio_lockout.load(Relaxed)
+            && self.bio_nomatch_streak.load(Relaxed) >= VERIFY_RETRY_LIMIT
+        {
+            self.enter_retry_limit();
+        }
 
         let definitive = matches!(
             &outcome,
@@ -2205,7 +2219,7 @@ impl SepData {
         dev_info!(
             self.dev,
             "verify: match mode {:#x}, user {}, credential length {}, image init length {:#x}, match context generation {}\n",
-            crate::sbio::SBIO_MATCH_MODE_UNLOCK,
+            crate::sbio::SBIO_MATCH_MODE_ACM,
             user.value(),
             scope.len(),
             crate::sbio::SBIO_IMAGE_INIT_LEN + scope.len(),
@@ -4232,6 +4246,26 @@ impl SepData {
         self.bio_lock_state_seq.load(Relaxed) != 0
             && (last >> 16) as u32 == SBIO_PROBE_USER_ID as u32
             && (last as u16) & LOCK_STATE_LOCKOUT != 0
+    }
+
+    /// Locks Touch ID on the host after `VERIFY_RETRY_LIMIT` failed matches in
+    /// a row. A password authentication re-arms it, and the record keeps the
+    /// lock across a restart, as for the enclave's own lockout.
+    fn enter_retry_limit(&self) {
+        dev_info!(
+            self.dev,
+            "verify: {} failed attempts in a row; Touch ID is locked until a password authentication (the retry limit)\n",
+            self.bio_nomatch_streak.load(Relaxed)
+        );
+        self.bio_lockout.store(true, Relaxed);
+        self.bio_lockout_logged.store(true, Relaxed);
+        if !self.write_lockout_record(true) {
+            dev_warn!(
+                self.dev,
+                "verify: could not record the lockout in {}; it ends at the next restart\n",
+                LOCKOUT_RECORD
+            );
+        }
     }
 
     fn enter_lockout(&self) -> bio::VerifyOutcome {
@@ -6407,10 +6441,15 @@ const IPI_USER_ID: usize = 0x67;
 const IPI_DEVICE_BUILTIN: u32 = 1;
 /// The match mode word of an authenticated match.
 const IPI_MATCH_MODE: usize = 0x00;
-/// Match mode of an authenticated unlock match of a positive user. It
-/// includes the credential-set bit, which makes the request carry the ACM
-/// context as a length-prefixed blob after the base structure.
-pub(crate) const SBIO_MATCH_MODE_UNLOCK: u32 = 0x89;
+/// Match mode of an authenticated match in the LocalAuthentication class:
+/// macOS 26 opens a Touch ID prompt's matches with match flags 0x88
+/// (MatchModeACM). It includes the credential-set bit 0x08, which makes the
+/// request carry the ACM context as a length-prefixed blob after the base
+/// structure. The login window's keybag-unlock match adds bit 0x01 (0x89);
+/// that class has its own attempt budget in the enclave, which a password
+/// does not reset, and Linux has no keybag-unlock caller. Every verify here
+/// uses the LocalAuthentication class.
+pub(crate) const SBIO_MATCH_MODE_ACM: u32 = 0x88;
 /// The length word of the credential-set blob; its bytes follow the base.
 const IPI_CREDENTIAL_LEN: usize = 0x93;
 const IPI_CREDENTIAL: usize = SBIO_IMAGE_INIT_LEN;
@@ -6455,7 +6494,7 @@ pub(crate) fn sbio_image_processing_init(
     let mut payload_len = SBIO_IMAGE_INIT_LEN;
     if let Some(handle) = scope {
         payload[IPI_MATCH_MODE..IPI_MATCH_MODE + 4]
-            .copy_from_slice(&SBIO_MATCH_MODE_UNLOCK.to_le_bytes());
+            .copy_from_slice(&SBIO_MATCH_MODE_ACM.to_le_bytes());
         payload[IPI_CREDENTIAL_LEN..IPI_CREDENTIAL_LEN + 4]
             .copy_from_slice(&(handle.len() as u32).to_le_bytes());
         payload[IPI_CREDENTIAL..IPI_CREDENTIAL + handle.len()].copy_from_slice(handle);
