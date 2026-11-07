@@ -8,6 +8,8 @@
 /cpus/cpu4 /cpus@0x100 -> /cpus/cpu@10100
 /cpus/cpu5 /cpus@0x101 -> /cpus/cpu@10101
 /arm-io 0x210050000 -> /soc/clock-controller@300700000
+/arm-io/spi2 0x385108000 -> /soc/spi@385108000
+/arm-io/spi2/mesa /arm-io/spi2@0x0 -> /soc/spi@385108000/fingerprint@0
 /arm-io/spi3 0x38510c000 -> /soc/spi@38510c000
 /arm-io/i2c2 0x385018000 -> /soc/i2c@385018000
 /arm-io/i2c2/usb-hub-i2c /arm-io/i2c2@0x2c -> /soc/i2c@385018000/usb-hub@2c
@@ -30,7 +32,7 @@
 /arm-io/dart-apcie0/mapper-apcie0-bt - -> /soc/iommu@390000000
 /arm-io/dart-apcie0/mapper-apcie0-piodma - -> /soc/iommu@390000000
 /arm-io/apcie0-piodma 0x390030000 -> /piodma@390030000
-/arm-io/mcc 0x300780000 -> /soc/clock-controller@300700000
+/arm-io/mcc 0x220000000 -> /soc/memory-controller@220000000
 /arm-io/aic 0x301000000 -> /soc/interrupt-controller@301000000
 /arm-io/aic-timebase - -> /timer
 /arm-io/wdt 0x3082b0000 -> /soc/watchdog@3082b0000
@@ -416,7 +418,7 @@
 /arm-io/mtp-aop-mux - -> WAIVED: Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
 /arm-io/qspi 0x385110000 -> /soc/spi@385110000
 /arm-io/qspi/spinor /arm-io/qspi@0x0 -> /soc/spi@385110000/flash@0
-/arm-io/qspi/spinor/anvram /arm-io/qspi/spinor@0x43776281 -> WAIVED: Firmware NVRAM partition; parent flash hardware is inventoried separately.
+/arm-io/qspi/spinor/anvram /arm-io/qspi/spinor@0x24000 -> WAIVED: Firmware NVRAM partition; parent flash hardware is inventoried separately.
 /arm-io/qspi/spinor/syscfg /arm-io/qspi/spinor@0x0 -> WAIVED: Firmware configuration partition; parent flash hardware is inventoried separately.
 /arm-io/uart0 0x385200000 -> /soc/serial@385200000
 /arm-io/uart0/debug-console - -> /soc/serial@385200000

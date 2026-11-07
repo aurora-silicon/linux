@@ -860,3 +860,89 @@ t8140-j700 /exclaves-test | Firmware runtime policy or service metadata; not an 
 * /port-hdmi* | Logical DCP output interface; display controllers and their routes are inventoried separately.
 * /arm-io/dp2hdmi-gpio | Logical display GPIO routing helper; GPIO controller hardware is inventoried separately.
 * /arm-io/nub-swd0 | Native debug access service; debug hardware is inventoried separately.
+
+# Saved live tables: reviewed virtual votes, each without a power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC16 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_16 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC17 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_17 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC18 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_18 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC19 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_19 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC24 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_24 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC25 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_25 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC26 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_26 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC27 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/VENC1_SYS | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/VENC1_DMA | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/VENC1_PIPE4 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/VENC1_PIPE5 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/VENC1_ME0 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/VENC1_ME1 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT3_SYS | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT3_FE | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT3_CPU | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT2_SYS | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT2_FE | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT2_CPU | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_27 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC20 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC21 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC22 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC23 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC28 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC29 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC30 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC31 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_20 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_21 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_22 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_23 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_28 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_29 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_30 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_31 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/MSR1 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/MSR1_ASE_CORE | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/ISP_CPU | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/ISP_FE | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /port-t818-1 | Firmware accessory-port relationship of the SMC; no independently addressed bus or MMIO device.
+t6040-j616s /arm-io/spi4/dp855/lcd-pmicwp | Firmware write-protection view of the panel power-management interface mediated by DP855; not an independent host bus device.
+t6040-j616s /arm-io/spi4/dp855/lcd-pmic | Firmware panel power-management register-access view mediated by DP855; its address is internal to the TCON transport.
+t6040-j616s /arm-io/spi4/dp855/lcd-sswp | Firmware write-protection view of the panel source-driver interface mediated by DP855; not an independent host bus device.
+t6040-j616s /arm-io/spi4/dp855/lcd-ss | Firmware panel source-driver register-access view mediated by DP855; its address is internal to the TCON transport.
+t6040-j616s /arm-io/spi4/dp855/tcon-registers | Firmware register-access view of the DP855 itself; the panel timing controller represents this hardware.
+t6040-j616s /arm-io/spi4/dp855/lcd-eeprom | Firmware view of panel nonvolatile storage mediated by DP855; no independently addressed host bus endpoint.
+t6000-j316s /arm-io/pmgr/power-devices/PMS_FPWM0 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6000-j316s /arm-io/pmgr/power-devices/PMS_FPWM1 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6000-j316s /arm-io/pmgr/power-devices/PMS_FPWM2 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6000-j316s /arm-io/pmgr/power-devices/PMS_FPWM3 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6000-j316s /arm-io/pmgr/power-devices/PMS_FPWM4 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6000-j316s /arm-io/pmgr/power-devices/AFNC3_IOA | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6000-j316s /arm-io/pmgr/power-devices/AFNC3_LS | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6000-j316s /arm-io/pmgr/power-devices/AFNC3_LW0 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6000-j316s /arm-io/pmgr/power-devices/GP_USB_AON | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6000-j316s /port-t818-1 | Firmware accessory-port relationship of the SMC; no independently addressed bus or MMIO device.
+t6000-j316s /arm-io/spi4/dp855/lcd-pmicwp | Firmware write-protection view of the panel power-management interface mediated by DP855; not an independent host bus device.
+t6000-j316s /arm-io/spi4/dp855/lcd-pmic | Firmware panel power-management register-access view mediated by DP855; its address is internal to the TCON transport.
+t6000-j316s /arm-io/spi4/dp855/lcd-sswp | Firmware write-protection view of the panel source-driver interface mediated by DP855; not an independent host bus device.
+t6000-j316s /arm-io/spi4/dp855/lcd-ss | Firmware panel source-driver register-access view mediated by DP855; its address is internal to the TCON transport.
+t6000-j316s /arm-io/spi4/dp855/tcon-registers | Firmware register-access view of the DP855 itself; the panel timing controller represents this hardware.
+t6000-j316s /arm-io/spi4/dp855/lcd-eeprom | Firmware view of panel nonvolatile storage mediated by DP855; no independently addressed host bus endpoint.
+t8112-j413 /arm-io/pmgr/power-devices/PMS_FPWM0 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t8112-j413 /arm-io/pmgr/power-devices/PMS_FPWM1 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t8112-j413 /arm-io/pmgr/power-devices/PMS_FPWM2 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t8112-j413 /arm-io/pmgr/power-devices/PMS_FPWM3 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t8112-j413 /arm-io/pmgr/power-devices/PMS_FPWM4 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_I2CM1 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t8112-j413 /port-t818-1 | Firmware accessory-port relationship of the SMC; no independently addressed bus or MMIO device.
+t8112-j413 /arm-io/spi4/dp855/lcd-pmicwp | Firmware write-protection view of the panel power-management interface mediated by DP855; not an independent host bus device.
+t8112-j413 /arm-io/spi4/dp855/lcd-pmic | Firmware panel power-management register-access view mediated by DP855; its address is internal to the TCON transport.
+t8112-j413 /arm-io/spi4/dp855/lcd-sswp | Firmware write-protection view of the panel source-driver interface mediated by DP855; not an independent host bus device.
+t8112-j413 /arm-io/spi4/dp855/lcd-ss | Firmware panel source-driver register-access view mediated by DP855; its address is internal to the TCON transport.
+t8112-j413 /arm-io/spi4/dp855/tcon-registers | Firmware register-access view of the DP855 itself; the panel timing controller represents this hardware.
+t8112-j413 /arm-io/spi4/dp855/lcd-eeprom | Firmware view of panel nonvolatile storage mediated by DP855; no independently addressed host bus endpoint.

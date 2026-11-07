@@ -12,28 +12,27 @@
 /arm-io 0x210f00000 -> WAIVED: ADT SoC bus container; child hardware is inventoried separately.
 /arm-io/spi2 0x235108000 -> /soc/spi@235108000
 /arm-io/spi2/mesa /arm-io/spi2@0x0 -> /soc/spi@235108000/fingerprint@0
-/arm-io/spi4 0x235110000 -> MISSING
-/arm-io/spi4/dp855 /arm-io/spi4@0x0 -> MISSING
-/arm-io/spi4/dp855/lcd-pmicwp /arm-io/spi4/dp855@0x4f -> MISSING
-/arm-io/spi4/dp855/lcd-pmic /arm-io/spi4/dp855@0x74 -> MISSING
-/arm-io/spi4/dp855/lcd-sswp /arm-io/spi4/dp855@0x71 -> MISSING
-/arm-io/spi4/dp855/lcd-ss /arm-io/spi4/dp855@0x40 -> MISSING
-/arm-io/spi4/dp855/tcon-registers /arm-io/spi4/dp855@0x0 -> MISSING
-/arm-io/spi4/dp855/lcd-eeprom /arm-io/spi4/dp855@0x0 -> MISSING
+/arm-io/spi4 0x235110000 -> /soc/spi@235110000
+/arm-io/spi4/dp855 /arm-io/spi4@0x0 -> /soc/spi@235110000/panel-timing-controller@0
+/arm-io/spi4/dp855/lcd-pmicwp /arm-io/spi4/dp855@0x4f -> WAIVED: Firmware write-protection view of the panel power-management interface mediated by DP855; not an independent host bus device.
+/arm-io/spi4/dp855/lcd-pmic /arm-io/spi4/dp855@0x74 -> WAIVED: Firmware panel power-management register-access view mediated by DP855; its address is internal to the TCON transport.
+/arm-io/spi4/dp855/lcd-sswp /arm-io/spi4/dp855@0x71 -> WAIVED: Firmware write-protection view of the panel source-driver interface mediated by DP855; not an independent host bus device.
+/arm-io/spi4/dp855/lcd-ss /arm-io/spi4/dp855@0x40 -> WAIVED: Firmware panel source-driver register-access view mediated by DP855; its address is internal to the TCON transport.
+/arm-io/spi4/dp855/tcon-registers /arm-io/spi4/dp855@0x0 -> WAIVED: Firmware register-access view of the DP855 itself; the panel timing controller represents this hardware.
+/arm-io/spi4/dp855/lcd-eeprom /arm-io/spi4/dp855@0x0 -> WAIVED: Firmware view of panel nonvolatile storage mediated by DP855; no independently addressed host bus endpoint.
 /arm-io/i2c1 0x235014000 -> /soc/i2c@235014000
 /arm-io/i2c1/audio-speaker /arm-io/i2c1@0x38 -> /soc/i2c@235014000/codec@38
 /arm-io/i2c1/audio-speaker-left-tweeter /arm-io/i2c1@0x39 -> /soc/i2c@235014000/codec@39
-/arm-io/i2c1/audio-codec-output /arm-io/i2c1@0x4b -> MISSING
 /arm-io/i2c2 0x235018000 -> /soc/i2c@235018000
-/arm-io/i2c2/atcrt0 /arm-io/i2c2@0x18 -> MISSING
-/arm-io/i2c2/atcrt1 /arm-io/i2c2@0x19 -> MISSING
+/arm-io/i2c2/atcrt0 /arm-io/i2c2@0x18 -> /soc/i2c@235018000/retimer@18
+/arm-io/i2c2/atcrt1 /arm-io/i2c2@0x19 -> /soc/i2c@235018000/retimer@19
 /arm-io/i2c3 0x23501c000 -> /soc/i2c@23501c000
 /arm-io/i2c3/audio-speaker-right-woofer /arm-io/i2c3@0x3b -> /soc/i2c@23501c000/codec@3b
 /arm-io/i2c3/audio-speaker-right-tweeter /arm-io/i2c3@0x3c -> /soc/i2c@23501c000/codec@3c
 /arm-io/i2c3/audio-codec-output /arm-io/i2c3@0x4b -> /soc/i2c@23501c000/codec@4b
 /arm-io/i2c4 0x235020000 -> /soc/i2c@235020000
-/arm-io/i2c4/avellino-pre /arm-io/i2c4@0x77 -> MISSING
-/arm-io/i2c4/avellino-post /arm-io/i2c4@0x44 -> MISSING
+/arm-io/i2c4/avellino-pre /arm-io/i2c4@0x77 -> /soc/i2c@235020000/avellino@77
+/arm-io/i2c4/avellino-post /arm-io/i2c4@0x44 -> /soc/i2c@235020000/avellino@44
 /arm-io/fpwm1 0x235044000 -> /soc/pwm@235044000
 /arm-io/fpwm1/kbd-backlight - -> /led-controller
 /arm-io/alc0 - -> /soc/aop@24ac00000
@@ -51,7 +50,7 @@
 /arm-io/apciec0/pcic0-bridge - -> /soc/usb4-pcie-tunnel-0/pcie@3b0000000/pci@0,0
 /arm-io/dart-apciec0 0x3a1008000 -> /soc/usb4-pcie-tunnel-0/iommu@3a1008000
 /arm-io/dart-apciec0/mapper-pciec0-piodma - -> /soc/usb4-pcie-tunnel-0/iommu@3a1008000
-/arm-io/apciec0-piodma 0x3a2000000 -> MISSING
+/arm-io/apciec0-piodma 0x3a2000000 -> /soc/dma-controller@3a2000000
 /arm-io/acio0 0x381f00000 -> /soc/cio@381ac0000/nhi@f00000
 /arm-io/dart-acio0 0x381a80000 -> /soc/cio@381ac0000/iommu@a80000
 /arm-io/dart-acio0/mapper-acio0 - -> /soc/cio@381ac0000/iommu@a80000
@@ -61,7 +60,7 @@
 /arm-io/apciec1/pcic1-bridge - -> /soc/usb4-pcie-tunnel-1/pcie@530000000/pci@0,0
 /arm-io/dart-apciec1 0x521008000 -> /soc/usb4-pcie-tunnel-1/iommu@521008000
 /arm-io/dart-apciec1/mapper-pciec1-piodma - -> /soc/usb4-pcie-tunnel-1/iommu@521008000
-/arm-io/apciec1-piodma 0x522000000 -> MISSING
+/arm-io/apciec1-piodma 0x522000000 -> /soc/dma-controller@522000000
 /arm-io/acio1 0x501f00000 -> /soc/cio@501ac0000/nhi@f00000
 /arm-io/dart-acio1 0x501a80000 -> /soc/cio@501ac0000/iommu@a80000
 /arm-io/dart-acio1/mapper-acio1 - -> /soc/cio@501ac0000/iommu@a80000
@@ -70,34 +69,34 @@
 /arm-io/display-crossbar0 - -> /soc/dcp@231c00000
 /arm-io/atc0-dpxbar 0x38304c000 -> /soc/mux@38304c000
 /arm-io/atc0-dpphy - -> /soc/phy@383000000
-/arm-io/atc0-dpin0 0x381e50000 -> MISSING
-/arm-io/atc0-dpin1 0x381e58000 -> MISSING
+/arm-io/atc0-dpin0 0x381e50000 -> /soc/displayport-input@381e50000
+/arm-io/atc0-dpin1 0x381e58000 -> /soc/displayport-input@381e58000
 /arm-io/atc1-dpxbar 0x50304c000 -> /soc/mux@50304c000
 /arm-io/atc1-dpphy - -> /soc/phy@503000000
-/arm-io/atc1-dpin0 0x501e50000 -> MISSING
-/arm-io/atc1-dpin1 0x501e58000 -> MISSING
-/arm-io/mcc 0x200100000 -> MISSING
+/arm-io/atc1-dpin0 0x501e50000 -> /soc/displayport-input@501e50000
+/arm-io/atc1-dpin1 0x501e58000 -> /soc/displayport-input@501e58000
+/arm-io/mcc 0x200100000 -> /soc/memory-controller@200100000
 /arm-io/aic 0x23b0c0000 -> /soc/interrupt-controller@23b0c0000
-/arm-io/aic-timebase 0x23b0dc000 -> MISSING
+/arm-io/aic-timebase 0x23b0dc000 -> /soc/timer@23b0dc000
 /arm-io/wdt 0x23d2b0000 -> /soc/watchdog@23d2b0000
-/arm-io/error-handler 0x200100000 -> MISSING
-/arm-io/dwi 0x23b200000 -> MISSING
-/arm-io/pwm 0x235040000 -> MISSING
-/arm-io/aes 0x23500c000 -> MISSING
+/arm-io/error-handler 0x200100000 -> /soc/error-handler@200100000
+/arm-io/dwi 0x23b200000 -> /soc/dwi@23b200000
+/arm-io/pwm 0x235040000 -> /soc/pwm@235040000
+/arm-io/aes 0x23500c000 -> /soc/aes@23500c000
 /arm-io/gpio 0x23c100000 -> /soc/pinctrl@23c100000
 /arm-io/aop-gpio 0x24a820000 -> /soc/pinctrl@24a820000
 /arm-io/nub-gpio 0x23d1f0000 -> /soc/pinctrl@23d1f0000
 /arm-io/smc-gpio 0x23e820000 -> /soc/pinctrl@23e820000
 /arm-io/aop 0x24a400000 -> /soc/aop@24ac00000
 /arm-io/aop/iop-aop-nub - -> /soc/aop@24ac00000
+/arm-io/aop/iop-aop-nub/accel - -> /soc/aop@24ac00000/accel
+/arm-io/aop/iop-aop-nub/gyro - -> /soc/aop@24ac00000/gyro
 /arm-io/aop/iop-aop-nub/aop-audio - -> /soc/aop@24ac00000
 /arm-io/aop/iop-aop-nub/aop-audio/audio-pdm2 - -> /soc/aop@24ac00000
 /arm-io/aop/iop-aop-nub/aop-audio/dc-800000 - -> /soc/aop@24ac00000
 /arm-io/aop/iop-aop-nub/aop-audio/dc-2400000 - -> /soc/aop@24ac00000
 /arm-io/aop/iop-aop-nub/aop-audio/audio-hp - -> /soc/aop@24ac00000
 /arm-io/aop/iop-aop-nub/aop-audio/audio-lp-mic-in - -> /soc/aop@24ac00000
-/arm-io/aop/iop-aop-nub/accel - -> /soc/aop@24ac00000
-/arm-io/aop/iop-aop-nub/gyro - -> /soc/aop@24ac00000
 /arm-io/dart-aop 0x24a808000 -> /soc/iommu@24a808000
 /arm-io/dart-aop/mapper-aop - -> /soc/iommu@24a808000
 /arm-io/dart-aop/mapper-aop-admac - -> /soc/iommu@24a808000
@@ -107,16 +106,16 @@
 /arm-io/pmgr/soc-tuner - -> WAIVED: Firmware tuning policy; not an independent hardware block.
 /arm-io/pmgr/ppm - -> WAIVED: Firmware power policy; PMGR and PMP hardware are inventoried separately.
 /arm-io/pmgr/power-devices - -> WAIVED: ADT power-device collection container; individual power-state records are checked separately.
-/arm-io/pmgr/power-devices/ECPU0 0x23b700000 -> MISSING
-/arm-io/pmgr/power-devices/ECPU1 0x23b700008 -> MISSING
-/arm-io/pmgr/power-devices/ECPU2 0x23b700010 -> MISSING
-/arm-io/pmgr/power-devices/ECPU3 0x23b700018 -> MISSING
-/arm-io/pmgr/power-devices/PCPU0 0x23b700020 -> MISSING
-/arm-io/pmgr/power-devices/PCPU1 0x23b700028 -> MISSING
-/arm-io/pmgr/power-devices/PCPU2 0x23b700030 -> MISSING
-/arm-io/pmgr/power-devices/PCPU3 0x23b700038 -> MISSING
-/arm-io/pmgr/power-devices/ECPM 0x23b700040 -> MISSING
-/arm-io/pmgr/power-devices/PCPM 0x23b700048 -> MISSING
+/arm-io/pmgr/power-devices/ECPU0 0x23b700000 -> /soc/power-management@23b700000/power-controller@0
+/arm-io/pmgr/power-devices/ECPU1 0x23b700008 -> /soc/power-management@23b700000/power-controller@8
+/arm-io/pmgr/power-devices/ECPU2 0x23b700010 -> /soc/power-management@23b700000/power-controller@10
+/arm-io/pmgr/power-devices/ECPU3 0x23b700018 -> /soc/power-management@23b700000/power-controller@18
+/arm-io/pmgr/power-devices/PCPU0 0x23b700020 -> /soc/power-management@23b700000/power-controller@20
+/arm-io/pmgr/power-devices/PCPU1 0x23b700028 -> /soc/power-management@23b700000/power-controller@28
+/arm-io/pmgr/power-devices/PCPU2 0x23b700030 -> /soc/power-management@23b700000/power-controller@30
+/arm-io/pmgr/power-devices/PCPU3 0x23b700038 -> /soc/power-management@23b700000/power-controller@38
+/arm-io/pmgr/power-devices/ECPM 0x23b700040 -> /soc/power-management@23b700000/power-controller@40
+/arm-io/pmgr/power-devices/PCPM 0x23b700048 -> /soc/power-management@23b700000/power-controller@48
 /arm-io/pmgr/power-devices/SBR 0x23b700100 -> /soc/power-management@23b700000/power-controller@100
 /arm-io/pmgr/power-devices/AIC 0x23b700108 -> /soc/power-management@23b700000/power-controller@108
 /arm-io/pmgr/power-devices/DWI 0x23b700110 -> /soc/power-management@23b700000/power-controller@110
@@ -124,11 +123,11 @@
 /arm-io/pmgr/power-devices/GPIO 0x23b700120 -> /soc/power-management@23b700000/power-controller@120
 /arm-io/pmgr/power-devices/PMS_BUSIF 0x23b700128 -> /soc/power-management@23b700000/power-controller@128
 /arm-io/pmgr/power-devices/PMS 0x23b700130 -> /soc/power-management@23b700000/power-controller@130
-/arm-io/pmgr/power-devices/PMS_FPWM0 0x23b700138 -> MISSING
-/arm-io/pmgr/power-devices/PMS_FPWM1 0x23b700140 -> MISSING
-/arm-io/pmgr/power-devices/PMS_FPWM2 0x23b700148 -> MISSING
-/arm-io/pmgr/power-devices/PMS_FPWM3 0x23b700150 -> MISSING
-/arm-io/pmgr/power-devices/PMS_FPWM4 0x23b700158 -> MISSING
+/arm-io/pmgr/power-devices/PMS_FPWM0 - -> WAIVED: Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+/arm-io/pmgr/power-devices/PMS_FPWM1 - -> WAIVED: Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+/arm-io/pmgr/power-devices/PMS_FPWM2 - -> WAIVED: Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+/arm-io/pmgr/power-devices/PMS_FPWM3 - -> WAIVED: Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+/arm-io/pmgr/power-devices/PMS_FPWM4 - -> WAIVED: Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
 /arm-io/pmgr/power-devices/PMS_C1PPT 0x23b700160 -> /soc/power-management@23b700000/power-controller@160
 /arm-io/pmgr/power-devices/SOC_DPE 0x23b700168 -> /soc/power-management@23b700000/power-controller@168
 /arm-io/pmgr/power-devices/PMGR_SOC_OCLA 0x23b700170 -> /soc/power-management@23b700000/power-controller@170
@@ -280,7 +279,7 @@
 /arm-io/pmgr/power-devices/AOP_PIODMA - -> WAIVED: Virtual PMGR vote; no independent power-state register.
 /arm-io/pmgr/power-devices/AOP_CPU - -> WAIVED: Virtual PMGR vote; no independent power-state register.
 /arm-io/pmgr/power-devices/AOP_I2CM0 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
-/arm-io/pmgr/power-devices/AOP_I2CM1 0x23d284050 -> MISSING
+/arm-io/pmgr/power-devices/AOP_I2CM1 - -> WAIVED: Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
 /arm-io/pmgr/power-devices/AOP_I2CM2 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
 /arm-io/pmgr/power-devices/AOP_SCM - -> WAIVED: Virtual PMGR vote; no independent power-state register.
 /arm-io/pmgr/power-devices/AOP_SPI0 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
@@ -460,7 +459,7 @@
 /arm-io/pmgr/power-domains/MTP_FABRIC - -> WAIVED: Logical PMGR performance domain; physical power-state records are inventoried separately.
 /arm-io/pmgr/power-domains/MTP_CPU - -> WAIVED: Logical PMGR performance domain; physical power-state records are inventoried separately.
 /arm-io/nco 0x23b044000 -> /soc/clock-controller@23b044000
-/arm-io/event-log-handler 0x23b700000 -> MISSING
+/arm-io/event-log-handler 0x23b700000 -> /soc/event-log@23b700000
 /arm-io/pmp 0x23bc00000 -> /soc/pmp@23b500000
 /arm-io/pmp/iop-pmp-nub - -> /soc/pmp@23b500000
 /arm-io/dart-pmp 0x23b300000 -> /soc/iommu@23b300000
@@ -490,14 +489,14 @@
 /arm-io/smc/iop-smc-nub/smc-charger-util - -> /soc/smc@23e400000
 /arm-io/uart0 0x235200000 -> /soc/serial@235200000
 /arm-io/uart0/debug-console - -> /soc/serial@235200000
-/arm-io/dockchannel-uart 0x23d128000 -> MISSING
+/arm-io/dockchannel-uart 0x23d128000 -> /soc/serial@23d12c000
 /arm-io/dockchannel-mtp 0x24eb14000 -> /soc/fifo@24eb14000
 /arm-io/dockchannel-mtp/mtp-transport - -> /soc/fifo@24eb14000/input@8000
 /arm-io/dockchannel-mtp/mtp-transport/multi-touch - -> /soc/fifo@24eb14000/input@8000/multi-touch
-/arm-io/dockchannel-mtp/mtp-transport/keyboard - -> /soc/fifo@24eb14000/input@8000/keyboard
 /arm-io/dockchannel-mtp/mtp-transport/stm - -> /soc/fifo@24eb14000/input@8000/stm
-/arm-io/dockchannel-mtp/mtp-transport/actuator - -> /soc/fifo@24eb14000/input@8000/actuator
+/arm-io/dockchannel-mtp/mtp-transport/keyboard - -> /soc/fifo@24eb14000/input@8000/keyboard
 /arm-io/dockchannel-mtp/mtp-transport/tp-accel - -> /soc/fifo@24eb14000/input@8000
+/arm-io/dockchannel-mtp/mtp-transport/actuator - -> /soc/fifo@24eb14000/input@8000/actuator
 /arm-io/mtp 0x24e400000 -> /soc/mtp@24e400000
 /arm-io/mtp/iop-mtp-nub - -> /soc/mtp@24e400000
 /arm-io/dart-mtp 0x24e808000 -> /soc/iommu@24e808000
@@ -506,8 +505,8 @@
 /arm-io/spi1 0x235104000 -> /soc/spi@235104000
 /arm-io/spi1/spinor /arm-io/spi1@0x0 -> /soc/spi@235104000/flash@0
 /arm-io/spi1/spinor/firmware - -> WAIVED: Firmware flash partition; parent flash hardware is inventoried separately.
-/arm-io/spi1/spinor/anvram - -> WAIVED: Firmware NVRAM partition; parent flash hardware is inventoried separately.
-/arm-io/spi1/spinor/syscfg - -> WAIVED: Firmware configuration partition; parent flash hardware is inventoried separately.
+/arm-io/spi1/spinor/anvram /arm-io/spi1/spinor@0x700000 -> WAIVED: Firmware NVRAM partition; parent flash hardware is inventoried separately.
+/arm-io/spi1/spinor/syscfg /arm-io/spi1/spinor@0x5a0000 -> WAIVED: Firmware configuration partition; parent flash hardware is inventoried separately.
 /arm-io/i2c0 0x235010000 -> /soc/i2c@235010000
 /arm-io/i2c0/hpmBusManager - -> /soc/i2c@235010000
 /arm-io/i2c0/hpmBusManager/hpm0 /arm-io/i2c0/hpmBusManager@0x38 -> /soc/i2c@235010000/usb-pd@38
@@ -530,12 +529,12 @@
 /arm-io/nub-spmi0 0x23d714000 -> /soc/spmi@23d714000
 /arm-io/nub-spmi0/pmu-main /arm-io/nub-spmi0@0xe -> /soc/spmi@23d714000/pmic@e
 /arm-io/nub-spmi0/btm /arm-io/nub-spmi0@0xe -> /soc/spmi@23d714000/pmic@e
-/arm-io/nub-spmi1 0x23d794000 -> MISSING
-/arm-io/nub-spmi1/pmu-aux /arm-io/nub-spmi1@0xe -> MISSING
-/arm-io/aop-spmi0 0x24a894000 -> MISSING
-/arm-io/aop-spmi0/spmi-wifibt /arm-io/aop-spmi0@0xe -> MISSING
-/arm-io/aop-spmi1 0x24a8d4000 -> MISSING
-/arm-io/aop-spmi1/stockholm-spmi /arm-io/aop-spmi1@0xc -> MISSING
+/arm-io/nub-spmi1 0x23d794000 -> /soc/spmi@23d794000
+/arm-io/nub-spmi1/pmu-aux /arm-io/nub-spmi1@0xe -> /soc/spmi@23d794000/pmic@e
+/arm-io/aop-spmi0 0x24a894000 -> /soc/spmi@24a894000
+/arm-io/aop-spmi0/spmi-wifibt /arm-io/aop-spmi0@0xe -> /soc/spmi@24a894000/radio-pmu@e
+/arm-io/aop-spmi1 0x24a8d4000 -> /soc/spmi@24a8d4000
+/arm-io/aop-spmi1/stockholm-spmi /arm-io/aop-spmi1@0xc -> /soc/spmi@24a8d4000/nfc@c
 /arm-io/aop-spmi1/stockholm-spmi/stockholm - -> WAIVED: NFC firmware service of the parent SPMI device, not another addressed bus device.
 /arm-io/lcd0-sac - -> /soc/dcp@231c00000
 /arm-io/disp0 0x230000000 -> /soc/dcp@231c00000
@@ -559,31 +558,29 @@
 /arm-io/dart-dispext0/mapper-dispext0 - -> /soc/iommu@271304000
 /arm-io/dart-dispext0/mapper-dispext0-piodma - -> /soc/iommu@271304000
 /arm-io/dp-audio1 - -> WAIVED: Logical display audio DMA endpoint; SIO and display controllers are inventoried separately.
-/arm-io/scaler0 0x263000000 -> MISSING
-/arm-io/dart-scaler 0x263200000 -> MISSING
-/arm-io/dart-scaler/mapper-scaler - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
-/arm-io/dart-scaler/mapper-scaler-piodma - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
-/arm-io/jpeg0 0x265000000 -> MISSING
-/arm-io/dart-jpeg0 0x265004000 -> MISSING
-/arm-io/dart-jpeg0/mapper-jpeg0 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
-/arm-io/jpeg1 0x265008000 -> MISSING
-/arm-io/dart-jpeg1 0x26500c000 -> MISSING
-/arm-io/dart-jpeg1/mapper-jpeg1 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
-/arm-io/ave 0x267100000 -> MISSING
-/arm-io/dart-ave 0x267030000 -> MISSING
-/arm-io/dart-ave/mapper-ave - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
-/arm-io/avd 0x268000000 -> MISSING
+/arm-io/scaler0 0x263000000 -> /soc/scaler@263000000
+/arm-io/dart-scaler 0x263200000 -> /soc/iommu@263200000
+/arm-io/dart-scaler/mapper-scaler - -> /soc/iommu@263200000
+/arm-io/dart-scaler/mapper-scaler-piodma - -> /soc/iommu@263200000
+/arm-io/jpeg0 0x265000000 -> /soc/jpeg@265000000
+/arm-io/dart-jpeg0 0x265004000 -> /soc/iommu@265004000
+/arm-io/dart-jpeg0/mapper-jpeg0 - -> /soc/iommu@265004000
+/arm-io/jpeg1 0x265008000 -> /soc/jpeg@265008000
+/arm-io/dart-jpeg1 0x26500c000 -> /soc/iommu@26500c000
+/arm-io/dart-jpeg1/mapper-jpeg1 - -> /soc/iommu@26500c000
+/arm-io/ave 0x267100000 -> /soc/video-codec@267100000
+/arm-io/dart-ave 0x267030000 -> /soc/iommu@267030000
+/arm-io/dart-ave/mapper-ave - -> /soc/iommu@267030000
+/arm-io/avd 0x268000000 -> /soc/avd@269080000
 /arm-io/dart-avd 0x269010000 -> /soc/iommu@269010000
 /arm-io/dart-avd/mapper-avd - -> /soc/iommu@269010000
 /arm-io/dart-avd/mapper-avd-piodma - -> /soc/iommu@269010000
 /arm-io/dart-avd/mapper-avd-adsbuf - -> /soc/iommu@269010000
-/arm-io/apr 0x27d000000 -> MISSING
-/arm-io/dart-apr 0x27d028000 -> MISSING
-/arm-io/dart-apr/mapper-apr - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
-/arm-io/scdc 0x27e400000 -> MISSING
-/arm-io/scdc/iop-scdc-nub - -> WAIVED: Firmware endpoint container; hosting coprocessor is inventoried separately.
-/arm-io/dart-scdc 0x27d02c000 -> MISSING
-/arm-io/dart-scdc/mapper-scdc - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/apr 0x27d000000 -> /soc/video-codec@27d000000
+/arm-io/dart-apr 0x27d028000 -> /soc/iommu@27d028000
+/arm-io/dart-apr/mapper-apr - -> /soc/iommu@27d028000
+/arm-io/dart-scdc 0x27d02c000 -> /soc/iommu@27d02c000
+/arm-io/dart-scdc/mapper-scdc - -> /soc/iommu@27d02c000
 /arm-io/isp 0x22a000000 -> /soc/isp@22a000000
 /arm-io/dart-isp 0x22c4a8000 -> /soc/iommu@22c4a8000
 /arm-io/dart-isp/mapper-isp - -> /soc/iommu@22c4a8000
@@ -608,12 +605,12 @@
 /arm-io/mca2/mca2b/audio-codec-input - -> /soc/i2s@238400000
 /arm-io/smctempsensor0 - -> /soc/smc@23e400000/hwmon
 /arm-io/cpu-debug-interface - -> /cpus
-/arm-io/aft 0x200110000 -> MISSING
+/arm-io/aft 0x200110000 -> /soc/fabric-tracker@200110000
 /arm-io/timesync - -> WAIVED: Firmware clock synchronization policy, not a separate timer device.
 /arm-io/apple-processor-trace - -> WAIVED: Native diagnostic trace policy; CPU debug hardware is inventoried separately.
 /buttons - -> WAIVED: Button collection container; child devices are inventoried separately.
 /port-usb-c-1 - -> /soc/i2c@235010000/usb-pd@38/connector
 /port-usb-c-2 - -> /soc/i2c@235010000/usb-pd@3f/connector
-/port-magsafe3-1 - -> /soc/smc@23e400000
+/port-t818-1 - -> WAIVED: Firmware accessory-port relationship of the SMC; no independently addressed bus or MMIO device.
 /backlight - -> /soc/dcp@231c00000
 /sacm - -> WAIVED: Display access-control policy; display hardware is inventoried separately.
