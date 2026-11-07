@@ -46,7 +46,11 @@ properties:
     maxItems: 1
 
   reset-domains:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
     maxItems: 1
+    items:
+      maxItems: 1
+    description: PMGR provider used to reset the display audio interface.
 
   ports:
     $ref: /schemas/graph.yaml#/properties/ports
