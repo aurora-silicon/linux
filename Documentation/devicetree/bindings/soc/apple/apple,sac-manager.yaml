@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,sac-manager.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple display SAC manager
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  Firmware display SAC manager. It has no independent register aperture
+  in the hardware description.
+
+properties:
+  compatible:
+    oneOf:
+      - items:
+          - const: apple,t6041-sac-manager
+          - const: apple,sac-manager
+      - items:
+          - const: apple,t8140-sac-manager
+          - const: apple,sac-manager
+
+required:
+  - compatible
+
+additionalProperties: false

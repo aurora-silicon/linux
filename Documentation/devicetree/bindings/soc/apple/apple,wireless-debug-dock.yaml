@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,wireless-debug-dock.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple wireless debug dock endpoint
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  Wireless debug dock firmware endpoint. It does not describe a second
+  wireless radio or transfer ownership of the existing radio.
+
+properties:
+  compatible:
+    oneOf:
+      - items:
+          - const: apple,t8140-wireless-debug-dock
+          - const: apple,wireless-debug-dock
+
+required:
+  - compatible
+
+additionalProperties: false

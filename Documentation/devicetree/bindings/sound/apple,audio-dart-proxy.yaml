@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/apple,audio-dart-proxy.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple isolated audio DART service proxy
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  Isolated audio firmware endpoint and its DART streams. The firmware
+  retains ownership of the stream mappings at boot.
+
+properties:
+  compatible:
+    oneOf:
+      - items:
+          - const: apple,t8140-audio-dart-proxy
+          - const: apple,audio-dart-proxy
+
+  iommus:
+    minItems: 2
+    maxItems: 2
+
+required:
+  - compatible
+  - iommus
+
+additionalProperties: false
