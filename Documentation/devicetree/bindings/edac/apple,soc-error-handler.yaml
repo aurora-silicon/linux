@@ -14,93 +14,170 @@ description: |
   errors to dedicated platform interrupt groups. A second group reports
   fatal events latched by peripheral event logs.
 
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6041-error-handler
+          - apple,t6041-event-log
+          - apple,t8132-error-handler
+          - apple,t8132-event-log
+          - apple,t8140-error-handler
+          - apple,t8140-event-log
+  required:
+    - compatible
+
 properties:
-  compatible:
-    oneOf:
-      - items:
-          - const: apple,t6041-error-handler
-          - const: apple,soc-error-handler
-      - items:
-          - const: apple,t8140-error-handler
-          - const: apple,soc-error-handler
-      - items:
-          - const: apple,t6041-event-log
-          - const: apple,soc-event-log
-      - items:
-          - const: apple,t8140-event-log
-          - const: apple,soc-event-log
-
-  interrupts:
-    minItems: 9
-    maxItems: 89
-
-  reg:
-    minItems: 10
-    maxItems: 25
-    description: |
-      T6041 uses the qualified per-source NI status apertures in interrupt
-      order. T8140 publishes its native error/event register banks in
-      hardware-description order; their presence does not establish safe
-      AP access and the instances remain disabled until qualified.
-
-required:
-  - compatible
-  - interrupts
+  compatible: true
 
 allOf:
   - if:
       properties:
         compatible:
           contains:
-            const: apple,t6041-error-handler
-    then:
-      properties:
-        interrupts:
-          minItems: 89
-          maxItems: 89
-        reg:
-          minItems: 25
-          maxItems: 25
+            enum:
+              - apple,t8132-error-handler
+              - apple,t8132-event-log
       required:
-        - reg
-  - if:
-      properties:
-        compatible:
-          contains:
-            const: apple,t8140-error-handler
+        - compatible
     then:
       properties:
-        interrupts:
-          minItems: 26
-          maxItems: 26
+        compatible:
+          oneOf:
+            - items:
+                - const: apple,t8132-error-handler
+                - const: apple,soc-error-handler
+            - items:
+                - const: apple,t8132-event-log
+                - const: apple,soc-event-log
+
         reg:
-          minItems: 17
-          maxItems: 17
-  - if:
-      properties:
-        compatible:
-          contains:
-            const: apple,t6041-event-log
-    then:
-      properties:
+          minItems: 23
+          maxItems: 55
+          description: Status apertures in hardware-description order.
+
         interrupts:
-          minItems: 21
-          maxItems: 21
-  - if:
+          minItems: 12
+          maxItems: 34
+
+      required:
+        - compatible
+        - reg
+        - interrupts
+
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t8132-error-handler
+          then:
+            properties:
+              reg:
+                minItems: 23
+                maxItems: 23
+              interrupts:
+                minItems: 34
+                maxItems: 34
+          else:
+            properties:
+              reg:
+                minItems: 55
+                maxItems: 55
+              interrupts:
+                minItems: 12
+                maxItems: 12
+    else:
       properties:
         compatible:
-          contains:
-            const: apple,t8140-event-log
-    then:
-      properties:
+          oneOf:
+            - items:
+                - const: apple,t6041-error-handler
+                - const: apple,soc-error-handler
+            - items:
+                - const: apple,t8140-error-handler
+                - const: apple,soc-error-handler
+            - items:
+                - const: apple,t6041-event-log
+                - const: apple,soc-event-log
+            - items:
+                - const: apple,t8140-event-log
+                - const: apple,soc-event-log
+
         interrupts:
           minItems: 9
-          maxItems: 9
+          maxItems: 89
+
         reg:
           minItems: 10
-          maxItems: 10
+          maxItems: 25
+          description: |
+            T6041 uses the qualified per-source NI status apertures in interrupt
+            order. T8140 publishes its native error/event register banks in
+            hardware-description order; their presence does not establish safe
+            AP access and the instances remain disabled until qualified.
 
-additionalProperties: false
+      required:
+        - compatible
+        - interrupts
+
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6041-error-handler
+          then:
+            properties:
+              interrupts:
+                minItems: 89
+                maxItems: 89
+              reg:
+                minItems: 25
+                maxItems: 25
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t8140-error-handler
+          then:
+            properties:
+              interrupts:
+                minItems: 26
+                maxItems: 26
+              reg:
+                minItems: 17
+                maxItems: 17
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6041-event-log
+          then:
+            properties:
+              interrupts:
+                minItems: 21
+                maxItems: 21
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t8140-event-log
+          then:
+            properties:
+              interrupts:
+                minItems: 9
+                maxItems: 9
+              reg:
+                minItems: 10
+                maxItems: 10
+
+      additionalProperties: false
+
+unevaluatedProperties: false
 
 examples:
   - |

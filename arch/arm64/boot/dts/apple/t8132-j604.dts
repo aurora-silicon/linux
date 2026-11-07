@@ -34,3 +34,5 @@
 &fpwm1 {
 	status = "okay";
 };
+
+#include "t8132-j604-audio.dtsi"
