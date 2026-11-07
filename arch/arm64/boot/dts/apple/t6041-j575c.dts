@@ -44,9 +44,7 @@
 	};
 };
 
-&serial0 {
-	status = "okay";
-};
+/* UART enablement is qualified separately from this description. */
 
 /* The Max console has the same register interface as the Pro. */
 &serial0 {

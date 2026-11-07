@@ -44,9 +44,7 @@
 	};
 };
 
-&serial0 {
-	status = "okay";
-};
+/* UART enablement is qualified separately from this description. */
 
 
 #include "t6040-j773s-audio.dtsi"
