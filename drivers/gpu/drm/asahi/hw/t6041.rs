@@ -44,6 +44,7 @@ pub(crate) const CONFIG: Config = Config {
     chip: Some(&CHIP),
     adopt_root_entries: false,
     fabric_bridge: false,
+    sleep_restart: false,
     recovery_slot_keys: None,
     gpu_generation: GpuGen::G16,
     firmware: fw::variant::Firmware::Identified(&[fw::variant::Build {
