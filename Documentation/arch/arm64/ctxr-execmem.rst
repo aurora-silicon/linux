@@ -68,8 +68,10 @@ How it works
 
 * ``ctxr_exec_reserve()`` (from ``arm64_memblock_init()``) parses the window,
   checks that ``[_text, _end)`` fits inside it, and reserves it from memblock.
-* ``execmem_arch_setup()`` carves the non-image remainder of the window into a
-  ``gen_pool`` and registers it with the generic confinement core
+* ``execmem_arch_setup()`` carves the window's free memory — a snapshot of the
+  ranges still free when the window was reserved, so the image and everything
+  else already reserved stay out — into a ``gen_pool`` and registers it with the
+  generic confinement core
   (``CONFIG_EXECMEM_CONFINE``). The executable ranges (module text, BPF,
   kprobes and, by inheritance, ftrace) are flagged ``EXECMEM_CONFINE``.
 * A confined allocation reserves its virtual area in the normal module range —

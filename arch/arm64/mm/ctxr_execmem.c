@@ -14,8 +14,8 @@
  *     emitted by the bootloader) or the command line (ctxr_exec_window=, used
  *     for VM/simulated bring-up),
  *   - reserves it from memblock and checks the image fits,
- *   - carves the non-image remainder into a gen_pool and hands it to the generic
- *     execmem confinement core, and
+ *   - carves the memory still free when it was reserved into a gen_pool and
+ *     hands it to the generic execmem confinement core, and
  *   - provides the page-table sweep that the verifier uses to prove, in a VM
  *     without real CTXR hardware, that no EL1-executable mapping escapes.
  */
