@@ -281,7 +281,7 @@
 		};
 	};
 
-	m2_dockchannel_uart: serial@29e528000 {
+	m2_dockchannel_uart: serial@29e52c000 {
 		compatible = "apple,t6021-dockchannel-uart", "apple,dockchannel-uart";
 		reg-names = "data", "config", "irq";
 		reg = <0x2 0x9e52c000 0x0 0x4000>,
