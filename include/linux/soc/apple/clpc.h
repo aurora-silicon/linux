@@ -11,6 +11,7 @@ struct apple_clpc_gpu;
 #if IS_REACHABLE(CONFIG_APPLE_CLPC)
 int apple_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu **out);
 void apple_clpc_gpu_set_active(struct apple_clpc_gpu *gpu, bool active);
+void apple_clpc_gpu_set_busy(struct apple_clpc_gpu *gpu, unsigned int permille);
 void apple_clpc_gpu_put(struct apple_clpc_gpu *gpu);
 #else
 static inline int apple_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu **out)
@@ -19,6 +20,7 @@ static inline int apple_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu *
 	return device_property_present(dev, "apple,clpc") ? -ENODEV : 0;
 }
 static inline void apple_clpc_gpu_set_active(struct apple_clpc_gpu *gpu, bool active) {}
+static inline void apple_clpc_gpu_set_busy(struct apple_clpc_gpu *gpu, unsigned int permille) {}
 static inline void apple_clpc_gpu_put(struct apple_clpc_gpu *gpu) {}
 #endif
 #endif
