@@ -184,6 +184,10 @@ allOf:
             interrupt-controller: true
             "#interrupt-cells":
               const: 2
+            power-domains:
+              description: Physical power and combined clock-gate dependencies.
+              minItems: 1
+              maxItems: 8
           required:
             - compatible
             - reg

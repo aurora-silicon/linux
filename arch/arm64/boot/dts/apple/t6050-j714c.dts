@@ -225,3 +225,6 @@
 #include "t6050-j714c-peripherals.dtsi"
 
 #include "t6050-j714c-audio-topology.dtsi"
+
+
+#include "t6050-j714-j716-power-domains.dtsi"

@@ -63,3 +63,6 @@
 };
 
 #include "t6050-j716s-audio-topology.dtsi"
+
+
+#include "t6050-j714-j716-power-domains.dtsi"

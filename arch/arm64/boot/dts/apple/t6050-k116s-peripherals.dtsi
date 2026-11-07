@@ -45,6 +45,7 @@
 		      <0x2 0x8a1a4000 0x0 0x4000>,
 		      <0x2 0x8a1a0000 0x0 0x4000>;
 		status = "disabled";
+		interrupts = <AIC_IRQ 0 763 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
 	hw_dart_isp0: iommu@5828c0000 {

@@ -773,6 +773,7 @@
 		      <0x2 0x8a004000 0x0 0x4000>,
 		      <0x2 0x8a000000 0x0 0x4000>;
 		status = "disabled";
+		interrupts = <AIC_IRQ 0 726 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
 	hw_nub_spmi2: spmi@28a094000 {
@@ -781,6 +782,7 @@
 		      <0x2 0x8a084000 0x0 0x4000>,
 		      <0x2 0x8a080000 0x0 0x4000>;
 		status = "disabled";
+		interrupts = <AIC_IRQ 0 736 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
 	hw_nub_spmi3: spmi@28a0d4000 {
@@ -789,6 +791,7 @@
 		      <0x2 0x8a0c4000 0x0 0x4000>,
 		      <0x2 0x8a0c0000 0x0 0x4000>;
 		status = "disabled";
+		interrupts = <AIC_IRQ 0 741 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
 	hw_nub_spmi_a0: spmi@28a188000 {
@@ -797,6 +800,7 @@
 		      <0x2 0x8a184000 0x0 0x4000>,
 		      <0x2 0x8a180000 0x0 0x4000>;
 		status = "disabled";
+		interrupts = <AIC_IRQ 0 761 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
 	hw_aop_spmi0: spmi@290914000 {
@@ -805,6 +809,7 @@
 		      <0x2 0x90904000 0x0 0x4000>,
 		      <0x2 0x90900000 0x0 0x4000>;
 		status = "disabled";
+		interrupts = <AIC_IRQ 0 620 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
 	hw_dptx0_aux: dptx-aux@29c260000 {
