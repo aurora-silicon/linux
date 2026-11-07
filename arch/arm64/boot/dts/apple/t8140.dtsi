@@ -1999,6 +1999,7 @@
 };
 
 #include "t8140-pmgr.dtsi"
+#include "t8140-peripherals.dtsi"
 
 /*
  * DRAM interface class: width and maximum rate are inferred from topology
