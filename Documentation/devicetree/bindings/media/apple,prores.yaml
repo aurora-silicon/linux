@@ -17,7 +17,9 @@ description: |
 properties:
   compatible:
     oneOf:
-      - const: apple,t8140-prores
+      - enum:
+          - apple,t6000-prores
+          - apple,t8140-prores
       - items:
           - const: apple,t6041-prores
           - const: apple,prores
@@ -71,6 +73,15 @@ required:
   - power-domains
 
 allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6000-prores
+    then:
+      properties:
+        interrupts:
+          maxItems: 1
   - if:
       properties:
         compatible:
