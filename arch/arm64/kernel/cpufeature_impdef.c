@@ -7,6 +7,7 @@
 
 #include <linux/arm-smccc.h>
 
+#include <linux/sched.h>
 #include <asm/cpufeature.h>
 #include <asm/apple_amx.h>
 #include <asm/apple_cpufeature.h>
@@ -362,6 +363,23 @@ static const struct arm64_cpu_capabilities arm64_impdef_features[] = {
 	},
 	{},
 };
+
+/*
+ * Restore what these features keep per CPU, on a CPU that was reset without
+ * going through CPU hotplug: its enable callbacks do not run again, and a
+ * context switch only writes ACTLR when the thread's value changes.
+ */
+void arm64_impdef_cpu_reset_restore(void)
+{
+#ifdef CONFIG_ARM64_ACTLR_STATE
+	if (system_has_actlr_state())
+		write_sysreg(current->thread.actlr, actlr_el1);
+#endif
+#ifdef CONFIG_ARM64_APPLE_AMX
+	if (cpus_have_cap(ARM64_HAS_AMX_APPLE))
+		cpu_disable_el0_amx(NULL);
+#endif
+}
 
 void __init init_cpucap_indirect_list_impdef(void)
 {
