@@ -1327,3 +1327,6 @@
 };
 
 #include "t8132-memory.dtsi"
+#include "t8132-gpu.dtsi"
+#include "t8132-dcp.dtsi"
+#include "t8132-dcpext.dtsi"

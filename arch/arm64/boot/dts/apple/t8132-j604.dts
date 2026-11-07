@@ -12,43 +12,15 @@
 /dts-v1/;
 
 #include "t8132.dtsi"
-#include "t8132-jxxx.dtsi"
-#include "t8132-board.dtsi"
+#include "t8132-laptop.dtsi"
 #include "t8132-atc23.dtsi"
 #include "t8132-apcie-port2.dtsi"
-#include "t8132-isp.dtsi"
-#include "t8132-gpu.dtsi"
-#include "t8132-dcp.dtsi"
-#include "t8132-dcpext.dtsi"
 #include <dt-bindings/gpio/gpio.h>
-#include <dt-bindings/leds/common.h>
 #include <dt-bindings/spmi/spmi.h>
 
 / {
 	compatible = "apple,j604", "apple,t8132", "apple,arm-platform";
 	model = "Apple MacBook Pro (14-inch, M4, 2024)";
-	chassis-type = "laptop";
-
-	aliases {
-		keyboard = &keyboard;
-	};
-
-	chosen {
-		linux-enablement-mac,dapf-handoff = "/arm-io/aop", "/arm-io/mtp",
-			"/arm-io/pmp";
-	};
-
-	/*
-	 * The speaker amps' shared shutdown line (SDZ, AP GPIO 15, the ADT
-	 * function-reset; low = shutdown). One fixed regulator, the SDZ supply
-	 * of all six, so one amp's fault takes the whole group down.
-	 */
-	speaker_sdz: regulator-sn012776-sdz {
-		compatible = "regulator-fixed";
-		regulator-name = "sn012776-sdz";
-		gpios = <&pinctrl_ap 15 GPIO_ACTIVE_HIGH>;
-		enable-active-high;
-	};
 
 	/*
 	 * The AOP firmware runs the stream: the J616s frame, six playback and
@@ -92,43 +64,6 @@
 	};
 
 	/*
-	 * The headphone jack: the AOP audio component's jack back-end (DAI 4)
-	 * to the CS42L84, as a card of its own.
-	 */
-	sound_jack: sound-jack {
-		compatible = "apple,j604-macaudio-jack", "apple,macaudio";
-		model = "MacBook Pro J604 Jack";
-		#address-cells = <1>;
-		#size-cells = <0>;
-
-		dai-link@0 {
-			reg = <0>;
-			link-name = "Headphone Jack";
-
-			cpu {
-				sound-dai = <&aop_audio 4>;
-			};
-
-			codec {
-				sound-dai = <&jack_codec>;
-			};
-		};
-	};
-
-	led-controller {
-		compatible = "pwm-leds";
-
-		led-0 {
-			pwms = <&fpwm1 0 40000>;
-			label = "kbd_backlight";
-			function = LED_FUNCTION_KBD_BACKLIGHT;
-			color = <LED_COLOR_ID_WHITE>;
-			max-brightness = <255>;
-			default-state = "keep";
-		};
-	};
-
-	/*
 	 * Physical size of the firmware framebuffer's 3024x1890 area below
 	 * the notch (14.2" panel, 254 ppi), so simpledrm reports the real DPI.
 	 */
@@ -139,17 +74,12 @@
 	};
 };
 
-&framebuffer0 {
-	panel = <&fb_panel>;
+&sound_jack {
+	compatible = "apple,j604-macaudio-jack", "apple,macaudio";
+	model = "MacBook Pro J604 Jack";
 };
 
 &aop_audio {
-	/*
-	 * The microphones on LEAP; the speakers and their sense on base-ns TX0
-	 * and RX0, the jack on TX2 and RX2 (ADT iop-audio-controller).
-	 */
-	dmas = <&admac0 1>, <&admac1 0>, <&admac1 1>, <&admac1 4>, <&admac1 5>;
-	dma-names = "dma", "spkr", "sense", "cout", "cin";
 	apple,chassis-name = "J604";
 	apple,machine-kind = "MacBook Pro";
 };
@@ -249,106 +179,15 @@
 	};
 };
 
-/*
- * The CS42L84 headphone codec (ADT /arm-io/i2c1/audio-codec-output at 0x4b).
- * Its reset line is nub GPIO 17, driven high to run the codec; its interrupt
- * is AP GPIO 98, level low. The AOP firmware runs the jack's stream.
- */
-&i2c1 {
-	status = "okay";
-
-	jack_codec: codec@4b {
-		compatible = "cirrus,cs42l84";
-		reg = <0x4b>;
-		reset-gpios = <&pinctrl_nub 17 GPIO_ACTIVE_HIGH>;
-		#sound-dai-cells = <0>;
-		interrupts-extended = <&pinctrl_ap 98 IRQ_TYPE_LEVEL_LOW>;
-		sound-name-prefix = "Jack";
-	};
+&typec0 {
+	label = "USB-C Left Front";
 };
 
-&fpwm1 {
-	status = "okay";
+&typec1 {
+	label = "USB-C Left Rear";
 };
 
-/*
- * The USB-C port controllers (ADT nub-spmi-a0 hpm0 and hpm1, nub-spmi-a1
- * hpm3). hpm5, the MagSafe port's, is not wired.
- */
-&nub_spmi_a0 {
-	hpm1: usb-pd@a {
-		compatible = "apple,t8132-sn201202x", "apple,sn201202x";
-		reg = <0xa SPMI_USID>;
-		interrupts = <37 IRQ_TYPE_EDGE_RISING>,
-			     <43 IRQ_TYPE_EDGE_RISING>,
-			     <45 IRQ_TYPE_EDGE_RISING>;
-		interrupt-names = "irq", "sleep", "wake";
-		wakeup-source;
-
-		typec1: connector {
-			compatible = "usb-c-connector";
-			label = "USB-C Left Rear";
-			power-role = "dual";
-			data-role = "dual";
-
-			ports {
-				#address-cells = <1>;
-				#size-cells = <0>;
-
-				port@0 {
-					reg = <0>;
-					typec1_connector_hs: endpoint {
-						remote-endpoint = <&dwc3_1_hs>;
-					};
-				};
-
-				port@1 {
-					reg = <1>;
-					typec1_connector_ss: endpoint {
-						remote-endpoint = <&atcphy1_typec_lanes>;
-					};
-				};
-			};
-		};
-	};
-
-	hpm0: usb-pd@c {
-		compatible = "apple,t8132-sn201202x", "apple,sn201202x";
-		reg = <0xc SPMI_USID>;
-		interrupts = <11 IRQ_TYPE_EDGE_RISING>,
-			     <17 IRQ_TYPE_EDGE_RISING>,
-			     <19 IRQ_TYPE_EDGE_RISING>;
-		interrupt-names = "irq", "sleep", "wake";
-		wakeup-source;
-
-		typec0: connector {
-			compatible = "usb-c-connector";
-			label = "USB-C Left Front";
-			power-role = "dual";
-			data-role = "dual";
-
-			ports {
-				#address-cells = <1>;
-				#size-cells = <0>;
-
-				port@0 {
-					reg = <0>;
-					typec0_connector_hs: endpoint {
-						remote-endpoint = <&dwc3_0_hs>;
-					};
-				};
-
-				port@1 {
-					reg = <1>;
-					typec0_connector_ss: endpoint {
-						remote-endpoint = <&atcphy0_typec_lanes>;
-					};
-				};
-			};
-		};
-	};
-};
-
+/* hpm3 is ATC3's port controller; hpm5, the MagSafe port's, is not wired. */
 &nub_spmi_a1 {
 	status = "okay";
 
@@ -456,56 +295,13 @@
 	pwren-gpios = <&smc_gpio 0x19 GPIO_ACTIVE_HIGH>;
 };
 
-&mtp {
-	status = "okay";
-};
-
-&mtp_mbox {
-	status = "okay";
-};
-
-&mtp_dart {
-	status = "okay";
-};
-
-&mtp_dockchannel {
-	status = "okay";
-};
-
-/* ADT function-afe-reset gP1c and function-stm-reset gP1d. */
 &mtp_hid {
-	apple,afe-reset-gpios = <&smc_gpio 28 GPIO_ACTIVE_LOW>;
-	apple,stm-reset-gpios = <&smc_gpio 29 GPIO_ACTIVE_LOW>;
-
 	multi-touch {
 		firmware-name = "apple/tpmtfw-j604.bin";
-		apple,power-method = <2>;
 	};
-
-	keyboard: keyboard {
-		hid-country-code = <0>;
-		apple,keyboard-layout-id = <0>;
-	};
-
-	stm {
-	};
-};
-
-/*
- * Mesa fingerprint sensor on spi2 (ADT /arm-io/spi2/mesa): power on NUB
- * GPIO 28, active high; data-ready on AP GPIO 199. Native chip select only.
- */
-&spi2 {
-	status = "okay";
 };
 
 &mesa {
-	status = "okay";
-	enable-gpios = <&pinctrl_nub 28 GPIO_ACTIVE_HIGH>;
-	interrupt-parent = <&pinctrl_ap>;
-	interrupts = <199 IRQ_TYPE_EDGE_RISING>;
-	spi-cs-setup-delay-ns = <20>;
-	spi-cs-hold-delay-ns = <20>;
 	/*
 	 * Per-device factory data from this Mac's own iBoot system container:
 	 * the calibration, and the signed root key the nonce session loads.

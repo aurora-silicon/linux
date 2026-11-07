@@ -9,6 +9,7 @@
 
 /dts-v1/;
 
+#include "t8132.dtsi"
 #include "t8132-j623-j624.dtsi"
 
 / {
