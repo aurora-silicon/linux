@@ -805,6 +805,10 @@ static const struct cfg80211_ops mt_cfg_ops = {
 	.dump_station = mt_dump_station,
 	.set_power_mgmt = mt_set_power_mgmt,
 	.set_cqm_rssi_config = mt_set_cqm_rssi_config,
+#ifdef CONFIG_PM
+	.suspend = mt_wow_suspend,
+	.resume = mt_wow_resume,
+#endif
 };
 
 int mt_register_regulatory_gate(struct mt7932 *m)
@@ -841,6 +845,9 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 	wiphy_ext_feature_set(m->wiphy, NL80211_EXT_FEATURE_MFP_OPTIONAL);
 	m->wiphy->max_scan_ssids = MT7932_SCAN_SSIDS;
 	m->wiphy->max_scan_ie_len = 600;
+#ifdef CONFIG_PM
+	m->wiphy->wowlan = &mt_wowlan_support;
+#endif
 	m->wiphy->reg_notifier = mt_regulatory_notify;
 	/* World roaming may relax NO_IR after observing an AP beacon without
 	 * changing alpha2. Request the callback so firmware's CID0f domain is

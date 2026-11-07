@@ -634,6 +634,7 @@ int mt_register_interface(struct mt7932 *m)
 	INIT_WORK(&m->connect_work, mt_connect_work);
 	INIT_WORK(&m->disconnect_work, mt_disconnect_work);
 	INIT_WORK(&m->power_work, mt_power_work);
+	INIT_WORK(&m->wow_work, mt_wow_work);
 	init_completion(&m->assoc_start);
 	init_completion(&m->assoc_done);
 	init_completion(&m->disconnect_done);
