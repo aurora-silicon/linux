@@ -205,7 +205,9 @@ RUST_TESTS = r'''
             assert_eq!(reader.read().util_status,telemetry::VALID);
             reader.0.state.lock().as_mut().unwrap().powered=false;
             push();
-            assert_eq!(reader.read().util_status,telemetry::STALE);
+            // Gated cores run no work: the last sample stays until it ages
+            // out, then the GPU reads idle. Neither is stale.
+            assert_eq!(reader.read().util_status,telemetry::VALID);
             reader.0.state.lock().as_mut().unwrap().powered=true;
             assert_eq!(reader.read().util_status,telemetry::STALE);
             push();
@@ -441,9 +443,11 @@ RUST_TESTS = r'''
                 2=>rings.observe_statistics_power(&dev,&init,&[Primary],true,1), // Wake observed by a fast publisher.
                 _=>rings.invalidate_statistics(), // Restart handshake.
             }
-            assert_eq!(rings.read_statistics(1).util_status,telemetry::STALE);
+            // A power gate reads idle (valid); every other boundary is stale.
+            let expect=if boundary==1 {telemetry::VALID} else {telemetry::STALE};
+            assert_eq!(rings.read_statistics(1).util_status,expect);
             rings.drain_statistics(&dev,&init,Primary);
-            assert_eq!(rings.read_statistics(1).util_status,telemetry::STALE);
+            assert_eq!(rings.read_statistics(1).util_status,expect);
             rings.observe_statistics_power(&dev,&init,&[Primary],true,u64::from(boundary >= 2));
             init.push(Primary,words);
             rings.drain_statistics(&dev,&init,Primary);

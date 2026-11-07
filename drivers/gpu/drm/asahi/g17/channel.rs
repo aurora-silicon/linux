@@ -96,7 +96,11 @@ impl Rings {
         epoch: u64,
     ) {
         if !powered || !self.statistics_powered || epoch != self.statistics_epoch {
-            self.telemetry.invalidate();
+            if powered {
+                self.telemetry.invalidate();
+            } else {
+                self.telemetry.gate();
+            }
             // End the queued prefix *now*, not at the next drain. A boolean
             // discard-next-batch also throws away records produced after this
             // observation, even if the queue was empty at the boundary.
