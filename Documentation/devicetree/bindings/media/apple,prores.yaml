@@ -53,11 +53,9 @@ allOf:
           maxItems: 2
 
         power-domains:
-          minItems: 1
           maxItems: 1
 
         iommus:
-          minItems: 1
           maxItems: 1
 
       required:
@@ -111,7 +109,6 @@ allOf:
         - interrupts
         - iommus
         - power-domains
-
 
 unevaluatedProperties: false
 

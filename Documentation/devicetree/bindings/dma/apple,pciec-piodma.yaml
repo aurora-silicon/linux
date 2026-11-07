@@ -48,7 +48,6 @@ allOf:
           maxItems: 4
 
         interrupts:
-          minItems: 1
           maxItems: 1
 
         iommus:
@@ -74,11 +73,9 @@ allOf:
           description: Register apertures in hardware-description order.
 
         interrupts:
-          minItems: 1
           maxItems: 1
 
         iommus:
-          minItems: 1
           maxItems: 1
 
       required:

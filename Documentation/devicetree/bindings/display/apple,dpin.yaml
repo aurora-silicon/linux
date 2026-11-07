@@ -43,11 +43,9 @@ allOf:
             - const: apple,dpin
 
         reg:
-          minItems: 1
           maxItems: 1
 
         interrupts:
-          minItems: 1
           maxItems: 1
 
       required:
@@ -64,12 +62,10 @@ allOf:
                 - const: apple,dpin
 
         reg:
-          minItems: 1
           maxItems: 1
           description: Register apertures in hardware-description order.
 
         interrupts:
-          minItems: 1
           maxItems: 1
 
       required:
