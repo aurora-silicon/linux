@@ -2,7 +2,7 @@
 /*
  * Apple Silicon JPEG encoder, V4L2 memory-to-memory.
  *
- * Takes full-range two-plane YUV (NV12M for 4:2:0, NV16M for 4:2:2) and
+ * Takes full-range YUV in one buffer (NV12 for 4:2:0, NV16 for 4:2:2) and
  * produces baseline JPEG with the standard Huffman tables. One job runs at
  * a time; the engine is reset before each job and the completion interrupt
  * ends it. Register layout: see apple-jpeg-hw.h.
@@ -64,7 +64,14 @@ struct apple_jpeg_ctx {
 	struct v4l2_ctrl *restart;
 	struct v4l2_pix_format_mplane src;	/* raw, OUTPUT queue */
 	struct v4l2_pix_format_mplane dst;	/* JPEG, CAPTURE queue */
+	u32 dst_keep;		/* JPEG buffer size S_FMT(CAPTURE) returned */
 	u32 sequence;
+	/*
+	 * Serialises the drain state (last source buffer, stopped) between job
+	 * completion in IRQ context and ENCODER_CMD / CAPTURE QBUF in ioctl
+	 * context, which hold only the queue mutex.
+	 */
+	spinlock_t drain_lock;
 };
 
 static struct apple_jpeg_ctx *aj_file_to_ctx(struct file *file)
@@ -115,11 +122,15 @@ static int aj_reset(struct apple_jpeg *jpeg)
 	return 0;
 }
 
+static const struct v4l2_event aj_eos = { .type = V4L2_EVENT_EOS };
+
 static void aj_finish(struct apple_jpeg *jpeg, struct apple_jpeg_ctx *ctx, int err)
 {
 	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
 	struct vb2_v4l2_buffer *src, *dst;
+	unsigned long flags;
 
+	spin_lock_irqsave(&ctx->drain_lock, flags);
 	src = v4l2_m2m_src_buf_remove(m2m);
 	dst = v4l2_m2m_dst_buf_remove(m2m);
 	if (src && dst) {
@@ -130,15 +141,14 @@ static void aj_finish(struct apple_jpeg *jpeg, struct apple_jpeg_ctx *ctx, int e
 		dst->sequence = ctx->sequence++;
 		dst->flags |= V4L2_BUF_FLAG_KEYFRAME;
 		if (v4l2_m2m_is_last_draining_src_buf(m2m, src)) {
-			static const struct v4l2_event eos = { .type = V4L2_EVENT_EOS };
-
 			dst->flags |= V4L2_BUF_FLAG_LAST;
-			v4l2_event_queue_fh(&ctx->fh, &eos);
+			v4l2_event_queue_fh(&ctx->fh, &aj_eos);
 			v4l2_m2m_mark_stopped(m2m);
 		}
 		v4l2_m2m_buf_done(src, err ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
 		v4l2_m2m_buf_done(dst, err ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
 	}
+	spin_unlock_irqrestore(&ctx->drain_lock, flags);
 	pm_runtime_mark_last_busy(jpeg->dev);
 	pm_runtime_put_autosuspend(jpeg->dev);
 	v4l2_m2m_job_finish(jpeg->m2m_dev, m2m);
@@ -212,9 +222,11 @@ static void aj_device_run(void *priv)
 	struct apple_jpeg_ctx *ctx = priv;
 	struct apple_jpeg *jpeg = ctx->jpeg;
 	struct vb2_v4l2_buffer *src, *dst;
+	struct apple_jpeg_layout layout;
 	struct apple_jpeg_job job;
 	unsigned long flags;
-	dma_addr_t y, c;
+	dma_addr_t y;
+	bool is422;
 	int n, ret;
 
 	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
@@ -227,17 +239,18 @@ static void aj_device_run(void *priv)
 	}
 
 	y = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0);
-	c = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 1);
+	is422 = ctx->src.pixelformat == V4L2_PIX_FMT_NV16;
+	apple_jpeg_raw_layout(ctx->src.width, ctx->src.height, is422, &layout);
 	job = (struct apple_jpeg_job){
 		.width = ctx->src.width,
 		.height = ctx->src.height,
-		.is422 = ctx->src.pixelformat == V4L2_PIX_FMT_NV16M,
-		.luma_stride = ctx->src.plane_fmt[0].bytesperline,
-		.chroma_stride = ctx->src.plane_fmt[1].bytesperline,
+		.is422 = is422,
+		.luma_stride = layout.bytesperline,
+		.chroma_stride = layout.bytesperline,
 		.luma = y,
-		.chroma = c,
-		.input_end = max(y + vb2_plane_size(&src->vb2_buf, 0),
-				 c + vb2_plane_size(&src->vb2_buf, 1)) - 1,
+		.chroma = y + layout.chroma_offset,
+		/* The engine's single input bound: the end of the negotiated surface. */
+		.input_end = y + layout.sizeimage - 1,
 		.output = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 0),
 		.output_size = vb2_plane_size(&dst->vb2_buf, 0),
 		.quality = v4l2_ctrl_g_ctrl(ctx->quality),
@@ -274,27 +287,26 @@ static const struct v4l2_m2m_ops aj_m2m_ops = {
 
 /* ---- formats ---------------------------------------------------------- */
 
-/* Raw input: Y plane and interleaved CbCr plane, separate buffers, full range. */
+/* Raw input: Y rows then interleaved CbCr rows in one buffer, full range. */
 static void aj_fill_raw(struct v4l2_pix_format_mplane *pix)
 {
-	bool is422 = pix->pixelformat == V4L2_PIX_FMT_NV16M;
+	bool is422 = pix->pixelformat == V4L2_PIX_FMT_NV16;
 	u32 w = clamp_t(u32, ALIGN(pix->width, 2), AJ_MIN_SIZE, AJ_MAX_SIZE);
 	u32 h = clamp_t(u32, pix->height, AJ_MIN_SIZE, AJ_MAX_SIZE);
-	u32 stride = ALIGN(w, 16), rows = ALIGN(h, 16);
+	struct apple_jpeg_layout layout;
 
-	pix->pixelformat = is422 ? V4L2_PIX_FMT_NV16M : V4L2_PIX_FMT_NV12M;
+	apple_jpeg_raw_layout(w, h, is422, &layout);
+	pix->pixelformat = is422 ? V4L2_PIX_FMT_NV16 : V4L2_PIX_FMT_NV12;
 	pix->width = w;
 	pix->height = h;
 	pix->field = V4L2_FIELD_NONE;
-	pix->num_planes = 2;
+	pix->num_planes = 1;
 	pix->flags = 0;
 	memset(pix->plane_fmt, 0, sizeof(pix->plane_fmt));
 	memset(pix->reserved, 0, sizeof(pix->reserved));
-	/* The engine reads whole macroblock rows, so the planes cover them. */
-	pix->plane_fmt[0].bytesperline = stride;
-	pix->plane_fmt[0].sizeimage = stride * rows;
-	pix->plane_fmt[1].bytesperline = stride;
-	pix->plane_fmt[1].sizeimage = stride * (is422 ? rows : rows / 2);
+	/* Chroma follows the visible luma rows; the tail covers the MCU rows. */
+	pix->plane_fmt[0].bytesperline = layout.bytesperline;
+	pix->plane_fmt[0].sizeimage = layout.sizeimage;
 	/* JPEG carries full-range BT.601; the engine does no range conversion. */
 	pix->colorspace = V4L2_COLORSPACE_SRGB;
 	pix->ycbcr_enc = V4L2_YCBCR_ENC_601;
@@ -302,15 +314,19 @@ static void aj_fill_raw(struct v4l2_pix_format_mplane *pix)
 	pix->xfer_func = V4L2_XFER_FUNC_SRGB;
 }
 
+/*
+ * The coded format follows the raw one. @keep is a JPEG buffer size already
+ * agreed on CAPTURE: a later OUTPUT change may grow the buffers but never
+ * shrinks them below it, so REQBUFS allocates at least what S_FMT returned.
+ */
 static void aj_fill_coded(struct v4l2_pix_format_mplane *dst,
-			  const struct v4l2_pix_format_mplane *src)
+			  const struct v4l2_pix_format_mplane *src, u32 keep)
 {
 	*dst = *src;
 	dst->pixelformat = V4L2_PIX_FMT_JPEG;
 	dst->num_planes = 1;
 	memset(dst->plane_fmt, 0, sizeof(dst->plane_fmt));
-	/* Worst case at quality 100 plus headers. */
-	dst->plane_fmt[0].sizeimage = PAGE_ALIGN(src->width * src->height * 3 + SZ_16K);
+	dst->plane_fmt[0].sizeimage = apple_jpeg_coded_size(src->width, src->height, keep);
 }
 
 static int aj_querycap(struct file *file, void *priv, struct v4l2_capability *cap)
@@ -322,7 +338,7 @@ static int aj_querycap(struct file *file, void *priv, struct v4l2_capability *ca
 
 static int aj_enum_fmt_out(struct file *file, void *priv, struct v4l2_fmtdesc *f)
 {
-	static const u32 fmts[] = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_NV16M };
+	static const u32 fmts[] = { V4L2_PIX_FMT_NV12, V4L2_PIX_FMT_NV16 };
 
 	if (f->index >= ARRAY_SIZE(fmts))
 		return -EINVAL;
@@ -342,8 +358,8 @@ static int aj_enum_fmt_cap(struct file *file, void *priv, struct v4l2_fmtdesc *f
 static int aj_enum_framesizes(struct file *file, void *priv, struct v4l2_frmsizeenum *fs)
 {
 	if (fs->index || (fs->pixel_format != V4L2_PIX_FMT_JPEG &&
-			  fs->pixel_format != V4L2_PIX_FMT_NV12M &&
-			  fs->pixel_format != V4L2_PIX_FMT_NV16M))
+			  fs->pixel_format != V4L2_PIX_FMT_NV12 &&
+			  fs->pixel_format != V4L2_PIX_FMT_NV16))
 		return -EINVAL;
 	fs->type = V4L2_FRMSIZE_TYPE_STEPWISE;
 	fs->stepwise = (struct v4l2_frmsize_stepwise){
@@ -372,7 +388,8 @@ static int aj_try_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
 
 static int aj_try_fmt_cap(struct file *file, void *priv, struct v4l2_format *f)
 {
-	aj_fill_coded(&f->fmt.pix_mp, &aj_file_to_ctx(file)->src);
+	aj_fill_coded(&f->fmt.pix_mp, &aj_file_to_ctx(file)->src,
+		      f->fmt.pix_mp.plane_fmt[0].sizeimage);
 	return 0;
 }
 
@@ -385,7 +402,7 @@ static int aj_s_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
 		return -EBUSY;
 	aj_fill_raw(&f->fmt.pix_mp);
 	ctx->src = f->fmt.pix_mp;
-	aj_fill_coded(&ctx->dst, &ctx->src);
+	aj_fill_coded(&ctx->dst, &ctx->src, ctx->dst_keep);
 	return 0;
 }
 
@@ -395,9 +412,42 @@ static int aj_s_fmt_cap(struct file *file, void *priv, struct v4l2_format *f)
 
 	if (vb2_is_busy(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)))
 		return -EBUSY;
-	aj_fill_coded(&f->fmt.pix_mp, &ctx->src);
+	/* A larger size the client asks for is honoured (bounded) and kept. */
+	aj_fill_coded(&f->fmt.pix_mp, &ctx->src, f->fmt.pix_mp.plane_fmt[0].sizeimage);
 	ctx->dst = f->fmt.pix_mp;
+	ctx->dst_keep = ctx->dst.plane_fmt[0].sizeimage;
 	return 0;
+}
+
+/*
+ * STOP picks the last queued source buffer, or marks the next CAPTURE buffer
+ * LAST when none is queued. Without the lock, a job completing at the same
+ * time could leave the queue after STOP chose it, or before STOP looked, and
+ * no buffer would ever carry LAST: the client waits for EOS forever.
+ */
+static int aj_encoder_cmd(struct file *file, void *priv, struct v4l2_encoder_cmd *ec)
+{
+	struct apple_jpeg_ctx *ctx = aj_file_to_ctx(file);
+	unsigned long flags;
+	int ret;
+
+	ret = v4l2_m2m_ioctl_try_encoder_cmd(file, priv, ec);
+	if (ret)
+		return ret;
+	if (ec->cmd != V4L2_ENC_CMD_STOP) {
+		ret = v4l2_m2m_ioctl_encoder_cmd(file, priv, ec);
+		/* A new stream after a drain: the next LAST is a new one. */
+		if (!ret)
+			vb2_clear_last_buffer_dequeued(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx));
+		return ret;
+	}
+	spin_lock_irqsave(&ctx->drain_lock, flags);
+	ret = v4l2_m2m_encoder_cmd(file, ctx->fh.m2m_ctx, ec);
+	/* Nothing left to encode: STOP completed at once, so EOS now. */
+	if (!ret && v4l2_m2m_has_stopped(ctx->fh.m2m_ctx))
+		v4l2_event_queue_fh(&ctx->fh, &aj_eos);
+	spin_unlock_irqrestore(&ctx->drain_lock, flags);
+	return ret;
 }
 
 static int aj_subscribe_event(struct v4l2_fh *fh, const struct v4l2_event_subscription *sub)
@@ -430,7 +480,7 @@ static const struct v4l2_ioctl_ops aj_ioctl_ops = {
 	.vidioc_streamoff = v4l2_m2m_ioctl_streamoff,
 
 	.vidioc_try_encoder_cmd = v4l2_m2m_ioctl_try_encoder_cmd,
-	.vidioc_encoder_cmd = v4l2_m2m_ioctl_encoder_cmd,
+	.vidioc_encoder_cmd = aj_encoder_cmd,
 
 	.vidioc_subscribe_event = aj_subscribe_event,
 	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
@@ -469,7 +519,7 @@ static int aj_buf_prepare(struct vb2_buffer *vb)
 	for (unsigned int i = 0; i < pix->num_planes; i++) {
 		if (vb2_plane_size(vb, i) < pix->plane_fmt[i].sizeimage)
 			return -EINVAL;
-		/* Luma and chroma need 4-byte aligned starts, output 32-byte. */
+		/* Luma (and so chroma) need 4-byte aligned starts, output 32-byte. */
 		if (vb2_dma_contig_plane_dma_addr(vb, i) & 31)
 			return -EINVAL;
 		if (V4L2_TYPE_IS_OUTPUT(vb->type))
@@ -484,15 +534,19 @@ static void aj_buf_queue(struct vb2_buffer *vb)
 {
 	struct apple_jpeg_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+	unsigned long flags;
 
+	spin_lock_irqsave(&ctx->drain_lock, flags);
 	if (!V4L2_TYPE_IS_OUTPUT(vb->type) && vb2_is_streaming(vb->vb2_queue) &&
 	    v4l2_m2m_dst_buf_is_last(ctx->fh.m2m_ctx)) {
 		vb2_set_plane_payload(vb, 0, 0);
 		vbuf->field = V4L2_FIELD_NONE;
 		v4l2_m2m_last_buffer_done(ctx->fh.m2m_ctx, vbuf);
-		return;
+		v4l2_event_queue_fh(&ctx->fh, &aj_eos);
+	} else {
+		v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, vbuf);
 	}
-	v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, vbuf);
+	spin_unlock_irqrestore(&ctx->drain_lock, flags);
 }
 
 static int aj_start_streaming(struct vb2_queue *q, unsigned int count)
@@ -518,11 +572,8 @@ static void aj_stop_streaming(struct vb2_queue *q)
 		v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_ERROR);
 	}
 	v4l2_m2m_update_stop_streaming_state(ctx->fh.m2m_ctx, q);
-	if (V4L2_TYPE_IS_OUTPUT(q->type) && v4l2_m2m_has_stopped(ctx->fh.m2m_ctx)) {
-		static const struct v4l2_event eos = { .type = V4L2_EVENT_EOS };
-
-		v4l2_event_queue_fh(&ctx->fh, &eos);
-	}
+	if (V4L2_TYPE_IS_OUTPUT(q->type) && v4l2_m2m_has_stopped(ctx->fh.m2m_ctx))
+		v4l2_event_queue_fh(&ctx->fh, &aj_eos);
 }
 
 static const struct vb2_ops aj_qops = {
@@ -575,11 +626,12 @@ static int aj_open(struct file *file)
 	if (!ctx)
 		return -ENOMEM;
 	ctx->jpeg = jpeg;
+	spin_lock_init(&ctx->drain_lock);
 	ctx->src.width = 1920;
 	ctx->src.height = 1080;
-	ctx->src.pixelformat = V4L2_PIX_FMT_NV12M;
+	ctx->src.pixelformat = V4L2_PIX_FMT_NV12;
 	aj_fill_raw(&ctx->src);
-	aj_fill_coded(&ctx->dst, &ctx->src);
+	aj_fill_coded(&ctx->dst, &ctx->src, 0);
 	v4l2_fh_init(&ctx->fh, video_devdata(file));
 
 	v4l2_ctrl_handler_init(&ctx->hdl, 2);

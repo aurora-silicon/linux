@@ -336,8 +336,8 @@ static void brcmf_msgbuf_rxbuf_ioctlresp_post(struct brcmf_msgbuf *msgbuf);
 
 
 /*
- * BCM4387 and BCM4388 firmware can read buffers posted for receive. Since
- * the packet-ID direction is now honored, DMA_FROM_DEVICE makes those
+ * BCM4378, BCM4387 and BCM4388 firmware can read buffers posted for receive.
+ * Since the packet-ID direction is now honored, DMA_FROM_DEVICE makes those
  * buffers write-only on permission-enforcing IOMMUs. Keep RX data, event and
  * ioctl-response buffers readable, with the same direction used for mapping
  * and unmapping.
@@ -352,7 +352,8 @@ brcmf_msgbuf_rx_dma_direction(struct device *dev)
 
 	pdev = to_pci_dev(dev);
 	if (pdev->vendor == PCI_VENDOR_ID_BROADCOM &&
-	    (pdev->device == BRCM_PCIE_4387_DEVICE_ID ||
+	    (pdev->device == BRCM_PCIE_4378_DEVICE_ID ||
+	     pdev->device == BRCM_PCIE_4387_DEVICE_ID ||
 	     pdev->device == BRCM_PCIE_4388_DEVICE_ID)) {
 		dev_info(dev, "using bidirectional receive DMA\n");
 		return DMA_BIDIRECTIONAL;
@@ -752,6 +753,10 @@ brcmf_msgbuf_flowring_create_worker(struct brcmf_msgbuf *msgbuf,
 		return BRCMF_FLOWRING_INVALID_ID;
 	}
 
+	/* A new ring has nothing in flight, whatever the previous ring on
+	 * this flowid left behind.
+	 */
+	atomic_set(&msgbuf->flowrings[flowid]->outstanding_tx, 0);
 	brcmf_commonring_config(msgbuf->flowrings[flowid],
 				BRCMF_H2D_TXFLOWRING_MAX_ITEM,
 				BRCMF_H2D_TXFLOWRING_ITEMSIZE, dma_buf);
@@ -1065,7 +1070,13 @@ brcmf_msgbuf_process_txstatus(struct brcmf_msgbuf *msgbuf, void *buf)
 
 	set_bit(flowid, msgbuf->txstatus_done_map);
 	commonring = msgbuf->flowrings[flowid];
-	atomic_dec(&commonring->outstanding_tx);
+	/* brcmf_msgbuf_delete_flowring() zeroes the count when it stops
+	 * waiting, and the firmware completes those frames later, when it
+	 * flushes the ring. Don't let them take the count below zero: a
+	 * negative count outlives the ring, and the next delete on this
+	 * flowid then waits out its full timeout.
+	 */
+	atomic_dec_if_positive(&commonring->outstanding_tx);
 
 	ifp = brcmf_get_ifp(msgbuf->drvr, tx_status->msg.ifidx);
 	/* Key on the flowring's ifidx, which the host assigned when it queued
@@ -1638,7 +1649,12 @@ void brcmf_msgbuf_delete_flowring(struct brcmf_pub *drvr, u16 flowid)
 		retry--;
 	}
 	if (!retry) {
-		brcmf_err("timed out waiting for txstatus\n");
+		/* Expected when the peer is gone (disconnect, suspend): the
+		 * firmware completes these frames only when it flushes the
+		 * ring for the delete request below.
+		 */
+		brcmf_dbg(MSGBUF, "flowring %u: %d tx outstanding, deleting it anyway\n",
+			  flowid, atomic_read(&commonring_del->outstanding_tx));
 		atomic_set(&commonring_del->outstanding_tx, 0);
 	}
 

@@ -35,13 +35,18 @@
  * Not yet read from a J516C.
  */
 &dcp {
-	panel {
+	panel: panel {
 		compatible = "apple,panel-j516", "apple,panel-mini-led", "apple,panel";
 		width-mm = <346>;
 		height-mm = <223>;
 		adj-height-mm = <216>;
 		apple,max-brightness = <500>;
 	};
+};
+
+&framebuffer0 {
+	panel = <&panel>;
+	post-init-providers = <&panel>;
 };
 
 &aop_audio {
