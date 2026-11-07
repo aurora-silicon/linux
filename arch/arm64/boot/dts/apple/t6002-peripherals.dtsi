@@ -364,20 +364,6 @@
 		status = "disabled";
 	};
 
-	ane1: ane@508000000 {
-		compatible = "apple,t6001-ane", "apple,ane";
-		reg = <0x5 0x08000000 0x0 0x2000000>,
-		      <0x2 0x8e680100 0x0 0x3f2c>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 0 797 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_ane1_sys_cpu>;
-		clocks = <&peripheral_clocks 318>, <&peripheral_clocks 319>, <&peripheral_clocks 320>, <&peripheral_clocks 321>;
-		iommus = <&ane1_dart0 0>, <&ane1_dart1 0>, <&ane1_dart2 0>;
-		reg-names = "engine", "pmgr";
-		interrupt-names = "ane";
-		status = "disabled";
-	};
-
 	ane1_dart0: iommu@509800000 {
 		compatible = "apple,t6000-dart", "apple,t8110-dart";
 		reg = <0x5 0x09800000 0x0 0x4000>;
@@ -414,6 +400,19 @@
 		interrupts = <AIC_IRQ 0 798 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_ane1_sys>;
 		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	ane1: ane@509c04000 {
+		compatible = "apple,t6001-ane", "apple,ane";
+		reg = <0x5 0x09c04000 0x0 0x24000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 797 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_ane1_sys_cpu>;
+		clocks = <&peripheral_clocks 318>, <&peripheral_clocks 319>, <&peripheral_clocks 320>, <&peripheral_clocks 321>;
+		iommus = <&ane1_dart0 0>, <&ane1_dart1 0>, <&ane1_dart2 0>;
+		reg-names = "engine";
+		interrupt-names = "ane";
 		status = "disabled";
 	};
 
@@ -679,20 +678,6 @@
 };
 
 &die1 {
-	ane2: ane@284000000 {
-		compatible = "apple,t6001-ane", "apple,ane";
-		reg = <0x2 0x84000000 0x0 0x2000000>,
-		      <0x2 0x8e080000 0x0 0xc02c>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1 770 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_ane_sys_cpu_die1>;
-		clocks = <&peripheral_clocks_die1 318>, <&peripheral_clocks_die1 319>, <&peripheral_clocks_die1 320>, <&peripheral_clocks_die1 321>;
-		iommus = <&ane2_dart0 0>, <&ane2_dart1 0>, <&ane2_dart2 0>;
-		reg-names = "engine", "pmgr";
-		interrupt-names = "ane";
-		status = "disabled";
-	};
-
 	ane2_dart0: iommu@285800000 {
 		compatible = "apple,t6000-dart", "apple,t8110-dart";
 		reg = <0x2 0x85800000 0x0 0x4000>;
@@ -729,6 +714,19 @@
 		interrupts = <AIC_IRQ 1 771 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_ane_sys_die1>;
 		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	ane2: ane@285c04000 {
+		compatible = "apple,t6001-ane", "apple,ane";
+		reg = <0x2 0x85c04000 0x0 0x24000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1 770 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_ane_sys_cpu_die1>;
+		clocks = <&peripheral_clocks_die1 318>, <&peripheral_clocks_die1 319>, <&peripheral_clocks_die1 320>, <&peripheral_clocks_die1 321>;
+		iommus = <&ane2_dart0 0>, <&ane2_dart1 0>, <&ane2_dart2 0>;
+		reg-names = "engine";
+		interrupt-names = "ane";
 		status = "disabled";
 	};
 
@@ -970,20 +968,6 @@
 		status = "disabled";
 	};
 
-	ane3: ane@508000000 {
-		compatible = "apple,t6001-ane", "apple,ane";
-		reg = <0x5 0x08000000 0x0 0x2000000>,
-		      <0x2 0x8e680100 0x0 0x3f2c>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1 797 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_ane1_sys_cpu_die1>;
-		clocks = <&peripheral_clocks_die1 318>, <&peripheral_clocks_die1 319>, <&peripheral_clocks_die1 320>, <&peripheral_clocks_die1 321>;
-		iommus = <&ane3_dart0 0>, <&ane3_dart1 0>, <&ane3_dart2 0>;
-		reg-names = "engine", "pmgr";
-		interrupt-names = "ane";
-		status = "disabled";
-	};
-
 	ane3_dart0: iommu@509800000 {
 		compatible = "apple,t6000-dart", "apple,t8110-dart";
 		reg = <0x5 0x09800000 0x0 0x4000>;
@@ -1020,6 +1004,19 @@
 		interrupts = <AIC_IRQ 1 798 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_ane1_sys_die1>;
 		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	ane3: ane@509c04000 {
+		compatible = "apple,t6001-ane", "apple,ane";
+		reg = <0x5 0x09c04000 0x0 0x24000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1 797 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_ane1_sys_cpu_die1>;
+		clocks = <&peripheral_clocks_die1 318>, <&peripheral_clocks_die1 319>, <&peripheral_clocks_die1 320>, <&peripheral_clocks_die1 321>;
+		iommus = <&ane3_dart0 0>, <&ane3_dart1 0>, <&ane3_dart2 0>;
+		reg-names = "engine";
+		interrupt-names = "ane";
 		status = "disabled";
 	};
 
