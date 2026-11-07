@@ -216,6 +216,10 @@ allOf:
               description: DMA translation streams emitted by this hardware.
               minItems: 2
               maxItems: 2
+            power-domains:
+              description: Physical power and combined clock-gate dependencies.
+              minItems: 1
+              maxItems: 8
           required:
             - compatible
             - reg
