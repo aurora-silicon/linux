@@ -154,7 +154,7 @@ struct mca_cluster {
 	/*
 	 * Every value written to the cluster's registers, kept so that they
 	 * can be written again after a system sleep took the MCA's power
-	 * (see mca_resume_early()).
+	 * (see mca_component_resume()).
 	 */
 	u32 regs[CLUSTER_NREGS];
 	DECLARE_BITMAP(regs_written, CLUSTER_NREGS);
@@ -1275,11 +1275,11 @@ static int mca_pcm_new(struct snd_soc_component *component,
  * at all. Codecs whose mute state needs the TDM clock (TAS2764/SN012776)
  * then latch clock and over-current faults.
  *
- * Write the registers back before the card resumes (early resume runs
- * before any device's resume): the configuration first, then the enables of
- * the clocks, the sync generator and the ports, as the driver sets them up.
- * A SERDES comes back stopped, as the suspended stream left it: its trigger
- * starts it.
+ * Write the registers back when ASoC resumes this component, which it does
+ * before it unmutes any codec, with the system's devices and power domains
+ * back: the configuration first, then the enables of the clocks, the sync
+ * generator and the ports, as the driver sets them up. A SERDES comes back
+ * stopped, as the suspended stream left it: its trigger starts it.
  *
  * Only the state of what is in use comes back: all of a cluster whose power
  * domain the driver holds (pd_link), and the port registers of a cluster
@@ -1335,9 +1335,9 @@ static void mca_restore_cluster(struct mca_cluster *cl, bool all, bool enables)
 	}
 }
 
-static int mca_resume_early(struct device *dev)
+static int mca_component_resume(struct snd_soc_component *component)
 {
-	struct mca_data *mca = dev_get_drvdata(dev);
+	struct mca_data *mca = dev_get_drvdata(component->dev);
 	bool all[MAX_NCLUSTERS], port[MAX_NCLUSTERS];
 	struct mca_cluster *cl;
 	int i, b;
@@ -1345,7 +1345,7 @@ static int mca_resume_early(struct device *dev)
 	scoped_guard(mutex, &mca->port_mutex) {
 		for (i = 0; i < mca->nclusters; i++) {
 			cl = &mca->clusters[i];
-			all[i] = cl->pd_link;
+			all[i] = cl->pd_link != NULL;
 			port[i] = cl->port_clk_driver >= 0;
 		}
 	}
@@ -1368,10 +1368,6 @@ static int mca_resume_early(struct device *dev)
 	return 0;
 }
 
-static const struct dev_pm_ops mca_pm_ops = {
-	LATE_SYSTEM_SLEEP_PM_OPS(NULL, mca_resume_early)
-};
-
 static const struct snd_soc_component_driver mca_component = {
 	.name = "apple-mca",
 	.open = mca_pcm_open,
@@ -1381,6 +1377,7 @@ static const struct snd_soc_component_driver mca_component = {
 	.pointer = mca_pointer,
 	.pcm_new = mca_pcm_new,
 	.pcm_free = mca_pcm_free,
+	.resume = mca_component_resume,
 };
 
 static void apple_mca_release(struct mca_data *mca)
@@ -1580,7 +1577,6 @@ static struct platform_driver apple_mca_driver = {
 	.driver = {
 		.name = "apple-mca",
 		.of_match_table = apple_mca_of_match,
-		.pm = pm_sleep_ptr(&mca_pm_ops),
 	},
 	.probe = apple_mca_probe,
 	.remove = apple_mca_remove,
