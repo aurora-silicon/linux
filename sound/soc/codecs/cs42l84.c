@@ -487,7 +487,7 @@ static int cs42l84_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 	struct snd_soc_component *component = codec_dai->component;
 	struct cs42l84_private *cs42l84 = snd_soc_component_get_drvdata(component);
 	unsigned int inv = fmt & SND_SOC_DAIFMT_INV_MASK;
-	unsigned int ch2_edge;
+	unsigned int ch1_edge, ch2_edge;
 
 	switch (fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) {
 	case SND_SOC_DAIFMT_BC_FC:
@@ -499,9 +499,15 @@ static int cs42l84_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 	/*
 	 * Both formats have the same bus polarities: data one bit clock after
 	 * the rising FSYNC edge, which ASoC calls IB_IF for I2S and IB_NF for
-	 * DSP_A. In I2S each channel follows its own FSYNC edge, so the frame
-	 * must be 50 %. DSP_A takes a pulse frame: in TDM mode both channels
-	 * follow the frame-start edge, one slot apart (set in hw_params).
+	 * DSP_A. Each channel's slot start counts from the FSYNC phase its
+	 * EDGE bit selects: set, the rising frame-start edge; clear, the other
+	 * phase. In I2S each channel follows its own phase (channel 1 clear,
+	 * channel 2 set), so the frame must be 50 %. DSP_A takes a pulse frame:
+	 * in TDM mode both channels follow the rising frame-start edge, one
+	 * slot apart (set in hw_params). With the bits clear, both counted from
+	 * the other phase, half a frame later: channel 1 took the second slot
+	 * and channel 2 the first slot of the next frame, which swapped left
+	 * and right on the jack.
 	 */
 	switch (fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
 	case SND_SOC_DAIFMT_I2S:
@@ -518,12 +524,17 @@ static int cs42l84_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 		return -EINVAL;
 	}
 
-	ch2_edge = cs42l84->dsp_a ? 0 : CS42L84_ASP_RX_CHx_CTL1_EDGE;
+	ch1_edge = cs42l84->dsp_a ? CS42L84_ASP_RX_CHx_CTL1_EDGE : 0;
+	ch2_edge = CS42L84_ASP_RX_CHx_CTL1_EDGE;
 	snd_soc_component_update_bits(component, CS42L84_ASP_CTL,
 			CS42L84_ASP_CTL_TDM_MODE,
 			cs42l84->dsp_a ? CS42L84_ASP_CTL_TDM_MODE : 0);
+	snd_soc_component_update_bits(component, CS42L84_ASP_RX_CH1_CTL1,
+			CS42L84_ASP_RX_CHx_CTL1_EDGE, ch1_edge);
 	snd_soc_component_update_bits(component, CS42L84_ASP_RX_CH2_CTL1,
 			CS42L84_ASP_RX_CHx_CTL1_EDGE, ch2_edge);
+	snd_soc_component_update_bits(component, CS42L84_ASP_TX_CH1_CTL1,
+			CS42L84_ASP_RX_CHx_CTL1_EDGE, ch1_edge);
 	snd_soc_component_update_bits(component, CS42L84_ASP_TX_CH2_CTL1,
 			CS42L84_ASP_RX_CHx_CTL1_EDGE, ch2_edge);
 

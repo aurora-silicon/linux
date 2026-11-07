@@ -441,6 +441,44 @@ static void cs42l84_test_unmute_bclk(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, priv->cs42l84.stream_use, BIT(SNDRV_PCM_STREAM_PLAYBACK));
 }
 
+/*
+ * The ASP slot phase: an I2S frame puts each channel on its own FSYNC phase
+ * (channel 1 clear, channel 2 set); a DSP_A pulse frame puts both on the
+ * rising frame-start edge. With the bits clear a pulse frame swaps left and
+ * right (channel 1 lands on the second slot).
+ */
+static void cs42l84_test_fmt_slot_phase(struct kunit *test)
+{
+	struct cs42l84_test_priv *priv = test->priv;
+	static const unsigned int ch1[] = { CS42L84_ASP_RX_CH1_CTL1, CS42L84_ASP_TX_CH1_CTL1 };
+	static const unsigned int ch2[] = { CS42L84_ASP_RX_CH2_CTL1, CS42L84_ASP_TX_CH2_CTL1 };
+	const unsigned int edge = CS42L84_ASP_RX_CHx_CTL1_EDGE;
+	unsigned int i;
+
+	/* DSP_A after I2S, then I2S again: each format sets every bit itself */
+	KUNIT_ASSERT_EQ(test, snd_soc_dai_set_fmt(&priv->dai, SND_SOC_DAIFMT_I2S |
+			SND_SOC_DAIFMT_BC_FC | SND_SOC_DAIFMT_IB_IF), 0);
+	KUNIT_ASSERT_EQ(test, snd_soc_dai_set_fmt(&priv->dai, SND_SOC_DAIFMT_DSP_A |
+			SND_SOC_DAIFMT_BC_FC | SND_SOC_DAIFMT_IB_NF), 0);
+	KUNIT_EXPECT_TRUE(test, priv->regs[CS42L84_ASP_CTL] & CS42L84_ASP_CTL_TDM_MODE);
+	for (i = 0; i < ARRAY_SIZE(ch1); i++) {
+		KUNIT_EXPECT_EQ(test, priv->regs[ch1[i]] & edge, edge);
+		KUNIT_EXPECT_EQ(test, priv->regs[ch2[i]] & edge, edge);
+	}
+
+	KUNIT_ASSERT_EQ(test, snd_soc_dai_set_fmt(&priv->dai, SND_SOC_DAIFMT_I2S |
+			SND_SOC_DAIFMT_BC_FC | SND_SOC_DAIFMT_IB_IF), 0);
+	KUNIT_EXPECT_FALSE(test, priv->regs[CS42L84_ASP_CTL] & CS42L84_ASP_CTL_TDM_MODE);
+	for (i = 0; i < ARRAY_SIZE(ch1); i++) {
+		KUNIT_EXPECT_EQ(test, priv->regs[ch1[i]] & edge, 0);
+		KUNIT_EXPECT_EQ(test, priv->regs[ch2[i]] & edge, edge);
+	}
+
+	/* Polarities other than the bus's are refused */
+	KUNIT_EXPECT_EQ(test, snd_soc_dai_set_fmt(&priv->dai, SND_SOC_DAIFMT_DSP_A |
+			SND_SOC_DAIFMT_BC_FC | SND_SOC_DAIFMT_NB_NF), -EINVAL);
+}
+
 static int cs42l84_test_case_init(struct kunit *test)
 {
 	struct cs42l84_test_priv *priv;
@@ -508,6 +546,7 @@ static struct kunit_case cs42l84_test_cases[] = {
 			 cs42l84_test_pll_clks_gen_params),
 	KUNIT_CASE_PARAM(cs42l84_test_mute_returns_to_rco, cs42l84_test_pll_clks_gen_params),
 	KUNIT_CASE_PARAM(cs42l84_test_unmute_bclk, cs42l84_test_bclk_clks_gen_params),
+	KUNIT_CASE(cs42l84_test_fmt_slot_phase),
 	{ } /* terminator */
 };
 
