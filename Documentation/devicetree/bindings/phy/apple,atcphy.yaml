@@ -125,6 +125,10 @@ allOf:
               - description: USB2 PHY specific controls
               - description: USB3 PIPE interface controls
               - description: Secondary eUSB2 PHY register bank (T8140)
+              - description:
+                  Power and hibernation control of the USB controller the PHY
+                  serves (T8140). The PHY drives that controller's reset and
+                  takes it through hibernation for a system sleep.
           reg-names:
             minItems: 5
             items:
@@ -134,6 +138,7 @@ allOf:
               - const: usb2phy
               - const: pipehandler
               - const: usb2phy-reg
+              - const: pwrctl
         required:
           - power-domains
   - if:
