@@ -122,6 +122,7 @@ struct ane_h16_device {
 	u64 resume_first_ns;
 	unsigned int resume_replayed;
 	unsigned int resume_restarts;
+	bool resume_floor;
 	bool resume_cold;
 	struct ane_h16_session session;
 	struct work_struct start;
@@ -200,6 +201,10 @@ static void ane_h16_quarantine(void *ctx, int error)
  */
 #define ANE_H16_CMD_SUSPEND 0x24
 #define ANE_H16_WARM_BOOT 1
+
+/* TEST ONLY (ANE4 startup-stall A/B): hold the perf floor and CLPC input across a firmware startup. */
+static bool startup_floor;
+module_param(startup_floor, bool, 0644);
 
 static void ane_h16_busy(void *ctx, bool busy);
 static void ane_h16_sleep_trace(struct ane_h16_device *h, const char *when);
@@ -614,6 +619,9 @@ static void ane_h16_sleep_resume(struct ane_h16_device *h)
 	h->resume_replayed = 0;
 	h->resume_cold = !h->boot.soc->sleep_warm;
 	h->resume_restarts = 0;
+	h->resume_floor = READ_ONCE(startup_floor);
+	if (h->resume_floor)
+		ane_h16_busy(h, true);
 	if (h->resume_cold) {
 		ret = ane_h16_cold_boot(h);
 	} else {
@@ -625,6 +633,8 @@ static void ane_h16_sleep_resume(struct ane_h16_device *h)
 			ret = ane_h16_cold_boot(h);
 		}
 	}
+	if (h->resume_floor)
+		ane_h16_busy(h, false);
 	WRITE_ONCE(h->slept, false);
 	if (ret) {
 		/* Every mapping and backing stays for diagnosis. */
@@ -1651,8 +1661,15 @@ static void ane_h16_start_work(struct work_struct *work)
 	/* Never start the firmware in the middle of a system sleep transition. */
 	flags = lock_system_sleep();
 	mutex_lock(&ane_h16_lock);
-	if (!h->acquired)
+	if (!h->acquired) {
+		bool floor = READ_ONCE(startup_floor);
+
+		if (floor)
+			ane_h16_busy(h, true);
 		ane_h16_advance(h, ANE_H16_PROGRAM);
+		if (floor)
+			ane_h16_busy(h, false);
+	}
 	mutex_unlock(&ane_h16_lock);
 	unlock_system_sleep(flags);
 }
