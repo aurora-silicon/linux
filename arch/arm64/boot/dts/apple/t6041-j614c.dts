@@ -4,6 +4,7 @@
 /dts-v1/;
 
 #include "t6041.dtsi"
+#include "t6041-j614-j616-j575-scaler.dtsi"
 
 / {
 	compatible = "apple,j614c", "apple,t6041", "apple,arm-platform";
