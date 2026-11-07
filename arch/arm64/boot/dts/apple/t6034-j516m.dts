@@ -38,3 +38,19 @@
 	compatible = "apple,j516-macaudio", "apple,j316-macaudio", "apple,macaudio";
 	model = "MacBook Pro J516";
 };
+
+&i2c4 {
+	sd_card_control: card-control@20 {
+		compatible = "apple,t6031-sd-card-control", "apple,sd-card-control";
+		reg = <0x20>;
+		status = "disabled";
+	};
+};
+
+&i2c8 {
+	display_pcon: display-converter@8 {
+		compatible = "apple,t6031-display-pcon", "apple,display-pcon";
+		reg = <0x8>;
+		status = "disabled";
+	};
+};

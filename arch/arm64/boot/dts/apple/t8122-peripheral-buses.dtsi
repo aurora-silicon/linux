@@ -69,19 +69,3 @@
 	};
 
 };
-
-/* Unclaimed Type-C retimer control ports; connector routing remains unbound. */
-&i2c2 {
-	atcrt0: retimer@18 {
-		compatible = "apple,t8122-atcrt", "apple,atcrt";
-		reg = <0x18>;
-		status = "disabled";
-	};
-
-	atcrt1: retimer@19 {
-		compatible = "apple,t8122-atcrt", "apple,atcrt";
-		reg = <0x19>;
-		status = "disabled";
-	};
-
-};

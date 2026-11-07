@@ -257,3 +257,12 @@
 #include "hwmon-common.dtsi"
 
 #include "spi1-nvram.dtsi"
+
+/* Panel control remains firmware-owned until the host transport is supported. */
+&spi4 {
+	tcon: panel-controller@0 {
+		compatible = "parade,dp855";
+		reg = <0>;
+		status = "disabled";
+	};
+};

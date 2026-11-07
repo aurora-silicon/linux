@@ -67,3 +67,19 @@
 			     "Tf34", "Tf36", "Tf39", "Tf3A", "Tf3B",
 			     "Tf44", "Tf46", "Tf49", "Tf4A", "Tf4B";
 };
+
+&i2c4 {
+	sd_card_control: card-control@20 {
+		compatible = "apple,t6031-sd-card-control", "apple,sd-card-control";
+		reg = <0x20>;
+		status = "disabled";
+	};
+};
+
+&i2c8 {
+	display_pcon: display-converter@8 {
+		compatible = "apple,t6031-display-pcon", "apple,display-pcon";
+		reg = <0x8>;
+		status = "disabled";
+	};
+};
