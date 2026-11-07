@@ -31,6 +31,7 @@ select:
               - "apple,t6030-admac"
               - "apple,t6031-admac"
               - "apple,t6041-admac"
+              - "apple,t6050-admac"
               - "apple,t8103-admac"
               - "apple,t8112-admac"
               - "apple,t8122-admac"
@@ -125,6 +126,9 @@ allOf:
       properties:
         compatible:
           oneOf:
+            - items:
+                - const: apple,t6050-admac
+                - const: apple,t8140-admac
             - items:
                 - const: apple,t6020-admac
                 - const: apple,t8103-admac

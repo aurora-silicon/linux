@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
+# SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause) AND GPL-2.0-only
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/spmi/apple,spmi.yaml#
@@ -25,6 +25,7 @@ select:
               - "apple,t6030-spmi"
               - "apple,t6031-spmi"
               - "apple,t6041-spmi"
+              - "apple,t6050-spmi"
               - "apple,t8012-spmi"
               - "apple,t8015-spmi"
               - "apple,t8103-spmi"
@@ -113,6 +114,9 @@ allOf:
       properties:
         compatible:
           oneOf:
+            - items:
+                - const: apple,t6050-spmi
+                - const: apple,t8142-spmi
             - const: apple,t8142-spmi
             - items:
                 - enum:
@@ -134,6 +138,7 @@ allOf:
                     - apple,t8132-spmi
                     - apple,t8140-spmi
                 - const: apple,t8103-spmi
+            - const: apple,t6050-spmi
 
         reg:
           minItems: 1

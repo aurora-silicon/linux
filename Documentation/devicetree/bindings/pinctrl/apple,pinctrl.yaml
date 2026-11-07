@@ -30,6 +30,7 @@ select:
               - "apple,t6030-pinctrl"
               - "apple,t6031-pinctrl"
               - "apple,t6041-pinctrl"
+              - "apple,t6050-pinctrl"
               - "apple,t7000-pinctrl"
               - "apple,t8010-pinctrl"
               - "apple,t8015-pinctrl"
@@ -64,7 +65,10 @@ properties:
     $ref: /schemas/types.yaml#/definitions/uint32
     maximum: 6
     default: 0
-    description: First hardware interrupt group owned by the host.
+    description: |
+      First interrupt group owned by this host. Interrupts lists consecutive
+      groups starting at this index. The loader must preserve any groups
+      owned by resident firmware. The range must end before group seven.
   apple,npins:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: The number of pins in this GPIO controller.
@@ -125,6 +129,9 @@ allOf:
         compatible:
           oneOf:
             - items:
+                - const: apple,t6050-pinctrl
+                - const: apple,t8132-pinctrl
+            - items:
                 - enum:
                     - apple,t6020-pinctrl
                     - apple,t6030-pinctrl
@@ -134,6 +141,7 @@ allOf:
                     - apple,t8132-pinctrl
                     - apple,t8140-pinctrl
                     - apple,t8152-pinctrl
+                    - apple,t6050-pinctrl
                 - const: apple,t8103-pinctrl
             - items:
                 # Do not add additional SoC to this list.
@@ -166,7 +174,10 @@ allOf:
           $ref: /schemas/types.yaml#/definitions/uint32
           maximum: 6
           default: 0
-          description: First hardware interrupt group owned by the host.
+          description: |
+            First interrupt group owned by this host. Interrupts lists consecutive
+            groups starting at this index. The loader must preserve any groups
+            owned by resident firmware. The range must end before group seven.
 
         apple,npins:
           $ref: /schemas/types.yaml#/definitions/uint32

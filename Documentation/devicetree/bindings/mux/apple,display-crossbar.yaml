@@ -27,10 +27,12 @@ select:
               - "apple,t6030-display-crossbar"
               - "apple,t6031-display-crossbar"
               - "apple,t6041-display-crossbar"
+              - "apple,t6050-display-crossbar"
               - "apple,t8103-display-crossbar"
               - "apple,t8112-display-crossbar"
               - "apple,t8122-display-crossbar"
               - "apple,t8132-display-crossbar"
+              - "apple,t8142-display-crossbar"
       required:
         - "compatible"
     -
@@ -48,6 +50,7 @@ properties:
   compatible: true
   reg: true
   power-domains: true
+  power-domain-names: true
   "#mux-control-cells": true
   interrupts: true
   iommus: true
@@ -97,6 +100,22 @@ allOf:
     else:
       allOf:
         - $ref: mux-controller.yaml#
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6050-display-crossbar
+          then:
+            properties:
+              power-domains:
+                minItems: 2
+                maxItems: 2
+            required:
+              - power-domain-names
+          else:
+            properties:
+              power-domains:
+                maxItems: 1
       properties:
         compatible:
           oneOf:
@@ -106,6 +125,7 @@ allOf:
                 - apple,t6000-display-crossbar
                 - apple,t6020-display-crossbar
                 - apple,t6041-display-crossbar
+                - apple,t8142-display-crossbar
                 - apple,t8132-display-crossbar
             - items:
                 - const: apple,t8112-display-crossbar
@@ -116,12 +136,21 @@ allOf:
                     - apple,t6031-display-crossbar
                     - apple,t8122-display-crossbar
                 - const: apple,t6020-display-crossbar
+            - items:
+                - const: apple,t6050-display-crossbar
+                - const: apple,t8142-display-crossbar
 
         reg:
           maxItems: 1
 
         power-domains:
-          maxItems: 1
+          minItems: 1
+          maxItems: 2
+
+        power-domain-names:
+          items:
+            - const: usb-aon
+            - const: common
 
         '#mux-control-cells':
           const: 1
