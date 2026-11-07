@@ -182,6 +182,14 @@
 
 &aop {
 	status = "okay";
+
+	accel {
+		compatible = "apple,t8112-aop-accel", "apple,aop-accel";
+	};
+
+	gyro {
+		compatible = "apple,t8112-aop-gyro", "apple,aop-gyro";
+	};
 };
 
 &aop_audio {

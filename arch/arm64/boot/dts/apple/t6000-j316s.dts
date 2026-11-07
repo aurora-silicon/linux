@@ -72,6 +72,16 @@
 	apple,machine-kind = "MacBook Pro";
 };
 
+&aop {
+	accel {
+		compatible = "apple,t6000-aop-accel", "apple,aop-accel";
+	};
+
+	gyro {
+		compatible = "apple,t6000-aop-gyro", "apple,aop-gyro";
+	};
+};
+
 &sound {
 	compatible = "apple,j316-macaudio", "apple,macaudio";
 	model = "MacBook Pro J316";
