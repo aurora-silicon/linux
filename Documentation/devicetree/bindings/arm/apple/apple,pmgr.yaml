@@ -31,6 +31,7 @@ select:
               - apple,t6030-pmgr
               - apple,t6031-pmgr
               - apple,t6041-pmgr
+              - apple,t6050-pmgr
               - apple,t7000-pmgr
               - apple,t8010-pmgr
               - apple,t8015-pmgr
@@ -180,6 +181,7 @@ $defs:
                   - apple,t6030-pmgr
                   - apple,t6031-pmgr
                   - apple,t6041-pmgr
+                  - apple,t6050-pmgr
                   - apple,t8122-pmgr
                   - apple,t8132-pmgr
                   - apple,t8140-pmgr

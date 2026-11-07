@@ -767,7 +767,7 @@
 		status = "disabled";
 	};
 
-	hw_nub_spmi0: spmi@28a014000 {
+	hw_nub_spmi0: spmi-resource@28a014000 {
 		compatible = "apple,t6050-spmi", "apple,spmi";
 		reg = <0x2 0x8a014000 0x0 0x4000>,
 		      <0x2 0x8a004000 0x0 0x4000>,
@@ -776,7 +776,7 @@
 		interrupts = <AIC_IRQ 0 726 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
-	hw_nub_spmi2: spmi@28a094000 {
+	hw_nub_spmi2: spmi-resource@28a094000 {
 		compatible = "apple,t6050-spmi", "apple,spmi";
 		reg = <0x2 0x8a094000 0x0 0x4000>,
 		      <0x2 0x8a084000 0x0 0x4000>,
@@ -785,7 +785,7 @@
 		interrupts = <AIC_IRQ 0 736 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
-	hw_nub_spmi3: spmi@28a0d4000 {
+	hw_nub_spmi3: spmi-resource@28a0d4000 {
 		compatible = "apple,t6050-spmi", "apple,spmi";
 		reg = <0x2 0x8a0d4000 0x0 0x4000>,
 		      <0x2 0x8a0c4000 0x0 0x4000>,
@@ -794,7 +794,7 @@
 		interrupts = <AIC_IRQ 0 741 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
-	hw_nub_spmi_a0: spmi@28a188000 {
+	hw_nub_spmi_a0: spmi-resource@28a188000 {
 		compatible = "apple,t6050-spmi", "apple,spmi";
 		reg = <0x2 0x8a188000 0x0 0x4000>,
 		      <0x2 0x8a184000 0x0 0x4000>,
@@ -803,7 +803,7 @@
 		interrupts = <AIC_IRQ 0 761 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
-	hw_aop_spmi0: spmi@290914000 {
+	hw_aop_spmi0: spmi-resource@290914000 {
 		compatible = "apple,t6050-spmi", "apple,spmi";
 		reg = <0x2 0x90914000 0x0 0x4000>,
 		      <0x2 0x90904000 0x0 0x4000>,

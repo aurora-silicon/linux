@@ -39,7 +39,7 @@
 		status = "disabled";
 	};
 
-	hw_nub_spmi_a1: spmi@28a1a8000 {
+	hw_nub_spmi_a1: spmi-resource@28a1a8000 {
 		compatible = "apple,t6050-spmi", "apple,spmi";
 		reg = <0x2 0x8a1a8000 0x0 0x4000>,
 		      <0x2 0x8a1a4000 0x0 0x4000>,

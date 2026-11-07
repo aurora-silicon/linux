@@ -702,7 +702,6 @@
 
 #include "t6050-j775d-peripherals.dtsi"
 
-#include "t6050-j775d-audio-topology.dtsi"
 
 
 #include "t6050-j775d-power-domains.dtsi"

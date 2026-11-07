@@ -799,7 +799,7 @@
 		 * the amp's V/I sense on RX0 (Linux channel 2N for TX N, 2N+1 for RX N).
 		 */
 		aop_audio: audio {
-			compatible = "apple,t6050-aop-audio";
+			compatible = "apple,t6050-aop-audio", "apple,aop-audio";
 			dmas = <&admac_base_ns 4>, <&admac_base_ns 5>,
 			       <&admac_base_ns 0>, <&admac_base_ns 1>;
 			dma-names = "cout", "cin", "spkr", "sense";

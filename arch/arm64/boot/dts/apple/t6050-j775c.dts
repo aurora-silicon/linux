@@ -66,3 +66,11 @@
 
 
 #include "t6050-j775c-power-domains.dtsi"
+
+&pmc {
+	status = "disabled";
+};
+
+&clpc {
+	status = "disabled";
+};
