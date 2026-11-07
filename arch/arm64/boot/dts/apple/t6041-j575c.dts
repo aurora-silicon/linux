@@ -1,0 +1,56 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Apple Mac Studio (M4 Max, 2025). Unqualified peripherals remain disabled. */
+
+/dts-v1/;
+
+#include "t6041.dtsi"
+
+/ {
+	compatible = "apple,j575c", "apple,t6041", "apple,arm-platform";
+	model = "Apple Mac Studio (M4 Max, 2025)";
+	chassis-type = "desktop";
+
+	aliases {
+		serial0 = &serial0;
+		sep = &sep;
+		pmp = &pmp;
+		gpu = &gpu;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		stdout-path = "serial0:115200n8";
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>;
+			/* The loader supplies this boot's framebuffer allocation. */
+			status = "disabled";
+		};
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		/* Runtime firmware reservations are supplied by the loader. */
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0 0 0 0>; /* Filled by the loader. */
+	};
+};
+
+&serial0 {
+	status = "okay";
+};
+
+/* The Max console has the same register interface as the Pro. */
+&serial0 {
+	reg = <0x4 0x29200000 0 0x4000>;
+};
+
+#include "t6041-j575c-audio.dtsi"

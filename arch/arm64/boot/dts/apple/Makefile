@@ -120,3 +120,6 @@ dtb-$(CONFIG_ARCH_APPLE) += t8142-j813.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t8152-j873g.dtb
 
 # Explicit cold-ANE lead test; never select as the production board DTB.
+dtb-$(CONFIG_ARCH_APPLE) += t6041-j614c.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t6041-j575c.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t6040-j773s.dtb
