@@ -482,6 +482,7 @@ struct apple_pcie {
 	void __iomem		*intr2axi_base;
 	void __iomem		*oe_fabric_base;
 	void __iomem		*early_cfg;
+	void __iomem		*t6050_phy;	/* shared PHY, mapped by a cold train */
 	struct pci_config_window *cfg;
 	struct apple_tunable	*rc_tunable;
 	struct apple_tunable	*fabric_tunable;
@@ -1880,7 +1881,8 @@ static int apple_pcie_adopt_link(struct apple_pcie_port *port)
 		return ret;
 
 	snprintf(name, sizeof(name), "intr2axi%d", port->idx);
-	port->intr2axi = devm_platform_ioremap_resource_byname(pdev, name);
+	if (!port->intr2axi)
+		port->intr2axi = devm_platform_ioremap_resource_byname(pdev, name);
 	if (IS_ERR(port->intr2axi))
 		return PTR_ERR(port->intr2axi);
 	/*
@@ -1889,8 +1891,9 @@ static int apple_pcie_adopt_link(struct apple_pcie_port *port)
 	 * controller owns the pad; the line is taken as the bootloader left it,
 	 * released, and driven only by the reset.
 	 */
-	port->perst = devm_fwnode_gpiod_get(pcie->dev, of_fwnode_handle(port->np), "reset",
-					    GPIOD_ASIS, "PERST#");
+	if (!port->perst)
+		port->perst = devm_fwnode_gpiod_get(pcie->dev, of_fwnode_handle(port->np),
+						    "reset", GPIOD_ASIS, "PERST#");
 	if (IS_ERR(port->perst)) {
 		if (PTR_ERR(port->perst) != -ENOENT)
 			return PTR_ERR(port->perst);
@@ -1992,15 +1995,30 @@ static void apple_pcie_t6050_rmw(void __iomem *addr, u32 clear, u32 set)
 	writel((readl(addr) & ~clear) | set, addr);
 }
 
-static int apple_pcie_t6050_rc_rmw(struct pci_dev *rp, int where, u32 clear, u32 set)
+/* The root port's config space through the ECAM window: there is no pci_dev before enumeration */
+static void __iomem *apple_pcie_t6050_dbi(struct apple_pcie_port *port)
 {
-	u32 value;
-	int ret;
+	return port->pcie->cfg->win + (PCI_DEVFN(port->idx, 0) << 12);
+}
 
-	ret = pci_read_config_dword(rp, where, &value);
-	if (!ret)
-		ret = pci_write_config_dword(rp, where, (value & ~clear) | set);
-	return pcibios_err_to_errno(ret);
+static void apple_pcie_t6050_dbi_rmw(void __iomem *dbi, int where, u32 clear, u32 set)
+{
+	writel((readl(dbi + where) & ~clear) | set, dbi + where);
+}
+
+static int apple_pcie_t6050_exp_cap(void __iomem *dbi)
+{
+	u8 cap = readb(dbi + PCI_CAPABILITY_LIST);
+	int i;
+
+	for (i = 0; cap && i < 48; i++) {
+		if (cap < 0x40 || (cap & 3))
+			return 0;
+		if (readb(dbi + cap + PCI_CAP_LIST_ID) == PCI_CAP_ID_EXP)
+			return cap;
+		cap = readb(dbi + cap + PCI_CAP_LIST_NEXT);
+	}
+	return 0;
 }
 
 static int apple_pcie_t6050_wait(struct apple_pcie_port *port, void __iomem *base,
@@ -2021,7 +2039,7 @@ static int apple_pcie_t6050_wait(struct apple_pcie_port *port, void __iomem *bas
  * (offset, 4, mask, value): for the port's registers, or with @rp for the root
  * port's config space. A list it did not copy is skipped.
  */
-static int apple_pcie_t6050_tune(struct apple_pcie_port *port, struct pci_dev *rp,
+static int apple_pcie_t6050_tune(struct apple_pcie_port *port, void __iomem *dbi,
 				 const char *name)
 {
 	u32 cells[64];
@@ -2037,18 +2055,11 @@ static int apple_pcie_t6050_tune(struct apple_pcie_port *port, struct pci_dev *r
 		return ret;
 	for (i = 0; i < count; i += 4)
 		if (cells[i + 1] != 4 || (cells[i] & 3) ||
-		    cells[i] >= (rp ? PCI_CFG_SPACE_EXP_SIZE : SZ_16K))
+		    cells[i] >= (dbi ? PCI_CFG_SPACE_EXP_SIZE : SZ_16K))
 			return -EINVAL;
 
-	for (i = 0; i < count; i += 4) {
-		if (!rp) {
-			apple_pcie_t6050_rmw(port->base + cells[i], cells[i + 2], cells[i + 3]);
-			continue;
-		}
-		ret = apple_pcie_t6050_rc_rmw(rp, cells[i], cells[i + 2], cells[i + 3]);
-		if (ret)
-			return ret;
-	}
+	for (i = 0; i < count; i += 4)
+		apple_pcie_t6050_rmw((dbi ?: port->base) + cells[i], cells[i + 2], cells[i + 3]);
 	return 0;
 }
 
@@ -2163,7 +2174,7 @@ static int apple_pcie_t6050_port_enable(struct apple_pcie_port *port)
 }
 
 /* Root complex tunables and a Gen3 x1 link, with the read-only registers opened for it */
-static int apple_pcie_t6050_port_configure(struct apple_pcie_port *port, struct pci_dev *rp)
+static int apple_pcie_t6050_port_configure(struct apple_pcie_port *port)
 {
 	static const char * const shadow[] = {
 		"apple,pcie-rc-gen3-shadow-tunables",
@@ -2171,57 +2182,42 @@ static int apple_pcie_t6050_port_configure(struct apple_pcie_port *port, struct 
 		"apple,pcie-rc-gen5-shadow-tunables",
 	};
 	static const u32 shadow_sel[] = { 0, BIT(24), 0 };
-	int cap = pci_pcie_cap(rp);
-	u32 value;
+	void __iomem *dbi = apple_pcie_t6050_dbi(port);
+	int cap = apple_pcie_t6050_exp_cap(dbi);
 	u16 ctl2;
-	int ret, err, i;
+	int ret, i;
 
 	if (!cap)
 		return -EIO;
-	ret = apple_pcie_t6050_rc_rmw(rp, RC_T6050_MISC_CONTROL_1, 0, RC_T6050_DBI_RO_WR_EN);
-	if (ret)
-		return ret;
-	ret = apple_pcie_t6050_tune(port, rp, "apple,pcie-rc-tunables");
-	if (ret)
-		goto lock;
-	for (i = 0; i < ARRAY_SIZE(shadow); i++) {
-		ret = apple_pcie_t6050_rc_rmw(rp, RC_T6050_GEN3_RELATED,
-					      RC_T6050_RATE_SHADOW_SEL, shadow_sel[i]) ?:
-		      apple_pcie_t6050_tune(port, rp, shadow[i]);
-		if (ret)
-			goto lock;
+	apple_pcie_t6050_dbi_rmw(dbi, RC_T6050_MISC_CONTROL_1, 0, RC_T6050_DBI_RO_WR_EN);
+	ret = apple_pcie_t6050_tune(port, dbi, "apple,pcie-rc-tunables");
+	for (i = 0; !ret && i < ARRAY_SIZE(shadow); i++) {
+		apple_pcie_t6050_dbi_rmw(dbi, RC_T6050_GEN3_RELATED, RC_T6050_RATE_SHADOW_SEL,
+					 shadow_sel[i]);
+		ret = apple_pcie_t6050_tune(port, dbi, shadow[i]);
 	}
-	ret = apple_pcie_t6050_rc_rmw(rp, 0x194, 0, BIT(0));
-	if (ret)
-		goto lock;
-
-	ret = pcibios_err_to_errno(pci_read_config_dword(rp, cap + PCI_EXP_LNKCAP2, &value));
-	if (ret)
-		goto lock;
-	if (!(value & PCI_EXP_LNKCAP2_SLS_8_0GB)) {
-		ret = -EIO;
-		goto lock;
+	if (!ret) {
+		apple_pcie_t6050_dbi_rmw(dbi, 0x194, 0, BIT(0));
+		if (!(readl(dbi + cap + PCI_EXP_LNKCAP2) & PCI_EXP_LNKCAP2_SLS_8_0GB))
+			ret = -EIO;
 	}
-	ret = pcibios_err_to_errno(pci_read_config_word(rp, cap + PCI_EXP_LNKCTL2, &ctl2)) ?:
-	      pcibios_err_to_errno(pci_write_config_word(rp, cap + PCI_EXP_LNKCTL2,
-							 (ctl2 & ~PCI_EXP_LNKCTL2_TLS) |
-							 PCI_EXP_LNKCTL2_TLS_8_0GT)) ?:
-	      apple_pcie_t6050_rc_rmw(rp, RC_T6050_PORT_LINK_CTRL, RC_T6050_LINK_MODE,
-				      FIELD_PREP(RC_T6050_LINK_MODE, 1)) ?:
-	      apple_pcie_t6050_rc_rmw(rp, RC_T6050_LINK_WIDTH_SPEED_CTRL, RC_T6050_LINK_WIDTH,
-				      FIELD_PREP(RC_T6050_LINK_WIDTH, 1)) ?:
-	      apple_pcie_t6050_rc_rmw(rp, cap + PCI_EXP_LNKCAP, PCI_EXP_LNKCAP_MLW,
-				      FIELD_PREP(PCI_EXP_LNKCAP_MLW, 1));
-lock:
-	err = apple_pcie_t6050_rc_rmw(rp, RC_T6050_MISC_CONTROL_1, RC_T6050_DBI_RO_WR_EN, 0);
-	ret = ret ?: err;
+	if (!ret) {
+		ctl2 = readw(dbi + cap + PCI_EXP_LNKCTL2);
+		writew((ctl2 & ~PCI_EXP_LNKCTL2_TLS) | PCI_EXP_LNKCTL2_TLS_8_0GT,
+		       dbi + cap + PCI_EXP_LNKCTL2);
+		apple_pcie_t6050_dbi_rmw(dbi, RC_T6050_PORT_LINK_CTRL, RC_T6050_LINK_MODE,
+					 FIELD_PREP(RC_T6050_LINK_MODE, 1));
+		apple_pcie_t6050_dbi_rmw(dbi, RC_T6050_LINK_WIDTH_SPEED_CTRL, RC_T6050_LINK_WIDTH,
+					 FIELD_PREP(RC_T6050_LINK_WIDTH, 1));
+		apple_pcie_t6050_dbi_rmw(dbi, cap + PCI_EXP_LNKCAP, PCI_EXP_LNKCAP_MLW,
+					 FIELD_PREP(PCI_EXP_LNKCAP_MLW, 1));
+	}
+	apple_pcie_t6050_dbi_rmw(dbi, RC_T6050_MISC_CONTROL_1, RC_T6050_DBI_RO_WR_EN, 0);
 	if (ret)
 		return ret;
 
-	ret = apple_pcie_t6050_rc_rmw(rp, cap + PCI_EXP_LNKCTL, 0, PCI_EXP_LNKCTL_LBMIE) ?:
-	      apple_pcie_t6050_rc_rmw(rp, RC_T6050_LINK_WIDTH_SPEED_CTRL, 0, RC_T6050_SPEED_CHANGE);
-	if (ret)
-		return ret;
+	apple_pcie_t6050_dbi_rmw(dbi, cap + PCI_EXP_LNKCTL, 0, PCI_EXP_LNKCTL_LBMIE);
+	apple_pcie_t6050_dbi_rmw(dbi, RC_T6050_LINK_WIDTH_SPEED_CTRL, 0, RC_T6050_SPEED_CHANGE);
 	writel(PCIEC_INTR2AXI_ENABLE, port->intr2axi + PCIEC_INTR2AXI_CTRL);
 	return 0;
 }
@@ -2231,7 +2227,7 @@ static int apple_pcie_t6050_port_restart(struct apple_pcie_port *port, struct pc
 {
 	return apple_pcie_t6050_port_disable(port, rp) ?:
 	       apple_pcie_t6050_port_enable(port) ?:
-	       apple_pcie_t6050_port_configure(port, rp);
+	       apple_pcie_t6050_port_configure(port);
 }
 
 /* Lane clocks, PERST# released, then the LTSSM to link up */
@@ -2268,6 +2264,151 @@ static int apple_pcie_t6050_port_train(struct apple_pcie_port *port)
 
 	/* Wait for 100ms after the link trains (PCIe r5.0, 6.6.1) */
 	msleep(100);
+	return 0;
+}
+
+/*
+ * A T6050 port the boot loader left untrained (the J714c's N1 on every boot): the shared
+ * PCIe PHY clocked and out of reset, the RC running, the endpoint powered (pwren-gpios)
+ * with PERST# held, then the port enable, configure and train sequences the root-port
+ * reset uses, and the bus numbers a boot loader leaves. The adopt checks then run as for
+ * a port trained before Linux. Order and values are m1n1's controller bring-up and the
+ * kernel's own T6050 port sequence.
+ */
+#define T6050_PHY_CTRL			0x0
+#define T6050_PHY_CTRL_CLK0REQ		BIT(0)
+#define T6050_PHY_CTRL_CLK1REQ		BIT(1)
+#define T6050_PHY_CTRL_CLK0ACK		BIT(2)
+#define T6050_PHY_CTRL_CLK1ACK		BIT(3)
+#define T6050_PHY_CTRL_RESET_T8132	BIT(4)
+#define T6050_PHY_CTRL_RESET_T8103	BIT(7)
+#define T6050_PHY_CTRL_LANES		GENMASK(9, 8)
+#define T6050_PHY_CFG			0x4
+#define T6050_PHY_STAT			0x8
+#define T6050_PHYCMN_CLK		0x0
+#define T6050_PHYCMN_CLK_MODE		GENMASK(1, 0)
+#define CORE_RC_T6050_PRE_RUN		0x54	/* m1n1 writes 0x140 here before RUN */
+
+static int apple_pcie_t6050_phy_wait(struct apple_pcie *pcie, u32 mask, u32 value)
+{
+	u32 v;
+	int ret;
+
+	ret = readl_poll_timeout(pcie->t6050_phy + T6050_PHY_CTRL, v, (v & mask) == value,
+				 10, 50000);
+	if (ret)
+		dev_err(pcie->dev, "shared PHY: %#x, waiting for %#x/%#x\n", v, value, mask);
+	return ret;
+}
+
+static int apple_pcie_t6050_shared_phy_on(struct apple_pcie *pcie)
+{
+	struct platform_device *pdev = to_platform_device(pcie->dev);
+	const u32 up = T6050_PHY_CTRL_CLK0ACK | T6050_PHY_CTRL_CLK1ACK | T6050_PHY_CTRL_LANES;
+	void __iomem *phy, *cmn;
+	u32 v;
+	int ret;
+
+	if (!pcie->t6050_phy) {
+		phy = devm_platform_ioremap_resource_byname(pdev, "phy-shared");
+		if (IS_ERR(phy))
+			return PTR_ERR(phy);
+		pcie->t6050_phy = phy;
+	}
+	phy = pcie->t6050_phy;
+	if ((readl(phy + T6050_PHY_CTRL) & (up | T6050_PHY_CTRL_RESET_T8132 |
+					    T6050_PHY_CTRL_RESET_T8103)) == up)
+		return 0;
+	cmn = devm_platform_ioremap_resource_byname(pdev, "phy-common");
+	if (IS_ERR(cmn))
+		return PTR_ERR(cmn);
+
+	apple_pcie_t6050_rmw(phy + T6050_PHY_CTRL, 0, T6050_PHY_CTRL_CLK0REQ);
+	ret = apple_pcie_t6050_phy_wait(pcie, T6050_PHY_CTRL_CLK0ACK, T6050_PHY_CTRL_CLK0ACK);
+	if (ret)
+		return ret;
+	apple_pcie_t6050_rmw(phy + T6050_PHY_CTRL, 0, T6050_PHY_CTRL_CLK1REQ);
+	ret = apple_pcie_t6050_phy_wait(pcie, T6050_PHY_CTRL_CLK1ACK, T6050_PHY_CTRL_CLK1ACK);
+	if (ret)
+		return ret;
+	apple_pcie_t6050_rmw(phy + T6050_PHY_CTRL, T6050_PHY_CTRL_RESET_T8132, 0);
+	ret = apple_pcie_t6050_phy_wait(pcie, T6050_PHY_CTRL_RESET_T8132, 0);
+	if (ret)
+		return ret;
+	apple_pcie_t6050_rmw(phy + T6050_PHY_CTRL, T6050_PHY_CTRL_RESET_T8103, 0);
+	ret = apple_pcie_t6050_phy_wait(pcie, T6050_PHY_CTRL_RESET_T8103, 0);
+	if (ret)
+		return ret;
+	apple_pcie_t6050_rmw(phy + T6050_PHY_CFG, 0, BIT(0));
+	apple_pcie_t6050_rmw(phy + T6050_PHY_CFG, 0, BIT(4));
+	apple_pcie_t6050_rmw(cmn + T6050_PHYCMN_CLK, T6050_PHYCMN_CLK_MODE,
+			     FIELD_PREP(T6050_PHYCMN_CLK_MODE, 1));
+	if (readl_poll_timeout(phy + T6050_PHY_STAT, v, v & BIT(0), 10, 250000))
+		dev_info(pcie->dev, "shared PHY: clock status %#x\n", v);
+	apple_pcie_t6050_rmw(phy + T6050_PHY_CTRL, 0, T6050_PHY_CTRL_LANES);
+	return 0;
+}
+
+static int apple_pcie_t6050_cold_train(struct apple_pcie_port *port)
+{
+	struct apple_pcie *pcie = port->pcie;
+	struct platform_device *pdev = to_platform_device(pcie->dev);
+	struct gpio_desc *pwren;
+	void __iomem *dbi;
+	char name[16];
+	u32 v, bus;
+	int ret;
+
+	bus = pcie->cfg->busr.start + 1 + port->idx;
+	if (bus > pcie->cfg->busr.end)
+		return -EINVAL;
+	ret = apple_pcie_t6050_shared_phy_on(pcie);
+	if (ret)
+		return ret;
+	if (!(readl(pcie->base + CORE_RC_CTL) & CORE_RC_CTL_RUN)) {
+		writel(0x140, pcie->base + CORE_RC_T6050_PRE_RUN);
+		writel(CORE_RC_CTL_RUN, pcie->base + CORE_RC_CTL);
+	}
+	ret = readl_poll_timeout(pcie->base + CORE_RC_STAT, v, v & CORE_RC_STAT_READY, 10, 250000);
+	if (ret)
+		return ret;
+
+	snprintf(name, sizeof(name), "intr2axi%d", port->idx);
+	if (!port->intr2axi)
+		port->intr2axi = devm_platform_ioremap_resource_byname(pdev, name);
+	if (IS_ERR(port->intr2axi))
+		return PTR_ERR(port->intr2axi);
+	if (!port->perst)
+		port->perst = devm_fwnode_gpiod_get(pcie->dev, of_fwnode_handle(port->np),
+						    "reset", GPIOD_ASIS, "PERST#");
+	if (IS_ERR(port->perst))
+		return PTR_ERR(port->perst);
+	ret = apple_pcie_t6050_perst(port, true);
+	if (ret)
+		return ret;
+
+	/* The endpoint held, then powered: the boot loader leaves it off */
+	pwren = devm_fwnode_gpiod_get(pcie->dev, of_fwnode_handle(port->np), "pwren",
+				      GPIOD_OUT_LOW, "PWREN");
+	if (IS_ERR(pwren))
+		return PTR_ERR(pwren);
+	msleep(50);
+	ret = gpiod_set_value_cansleep(pwren, 1);
+	if (ret)
+		return ret;
+	msleep(150);
+
+	ret = apple_pcie_t6050_port_enable(port) ?:
+	      apple_pcie_t6050_port_configure(port) ?:
+	      apple_pcie_t6050_port_train(port);
+	if (ret)
+		return ret;
+
+	/* Primary bus 0, the port's secondary and subordinate bus, as a boot loader leaves them */
+	dbi = apple_pcie_t6050_dbi(port);
+	v = readl(dbi + PCI_PRIMARY_BUS) & 0xff000000;
+	writel(v | (bus << 8) | (bus << 16), dbi + PCI_PRIMARY_BUS);
+	dev_info(pcie->dev, "port %d: trained by Linux, the boot loader left it down\n", port->idx);
 	return 0;
 }
 
@@ -2640,6 +2781,12 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 		}
 	} else if (pcie->hw->adopt_link) {
 		ret = apple_pcie_adopt_link(port);
+		/* A port left down that names its endpoint's power line is trained here */
+		if (ret == -ENOLINK && of_property_present(np, "pwren-gpios")) {
+			ret = apple_pcie_t6050_cold_train(port);
+			if (!ret)
+				ret = apple_pcie_adopt_link(port);
+		}
 		if (ret)
 			goto err_teardown;
 	} else {
@@ -4013,8 +4160,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 			/* A root port 00:<n>.0 on bus 0, n a GP port (0-3) */
 			if (of_property_read_u32(child, "reg", &reg) || reg & ~0xf800 ||
 			    (reg >> 11) > 3 ||
-			    !of_property_read_bool(child, "apple,link-trained-by-bootloader") ||
-			    of_property_present(child, "pwren-gpios"))
+			    !of_property_read_bool(child, "apple,link-trained-by-bootloader"))
 				return -EINVAL;
 			/*
 			 * A port whose endpoint needs a root-port reset names its PERST#
