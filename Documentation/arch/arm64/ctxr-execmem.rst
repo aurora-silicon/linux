@@ -136,7 +136,9 @@ kexec and crash kernels
     The relocation code runs from an ordinary page, outside the window, and a
     crash dump can start on a confined core, where it would hang during a panic.
     While a window is active, ``machine_kexec_prepare()`` refuses both, so
-    ``kexec_load()`` and ``kexec_file_load()`` fail with ``EOPNOTSUPP``.
+    ``kexec_load()`` and ``kexec_file_load()`` fail with ``EOPNOTSUPP``. A
+    ``crashkernel=`` reservation would then only waste memory, so it is skipped
+    with a warning when a window is active.
 
 Hibernate
     Resume runs from a ``trans_pgd`` page outside the window. This is unchanged
