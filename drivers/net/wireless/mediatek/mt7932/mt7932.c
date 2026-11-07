@@ -7,6 +7,7 @@
 #include <linux/soc/apple/pci-apple-piodma.h>
 
 #include "mt7932.h"
+#include "wow.h"
 
 #include <kunit/static_stub.h>
 
@@ -186,6 +187,10 @@ static void mt_receive(struct mt7932 *m, const u8 *packet, size_t length)
 	}
 	if (event.eid == 0xee) {
 		mt_link_event(m, &event);
+		goto unlock;
+	}
+	if (event.eid == MT7932_EID_WOW_REASON) {
+		mt_wow_reason_event(m, &event);
 		goto unlock;
 	}
 	if (event.eid == 0x0d) {
@@ -1363,9 +1368,13 @@ static int mt_hif_tx_idle(struct mt7932 *m)
 	return -EBUSY;
 }
 
-/* Driver own again, DMA back on, then the firmware's host interface. Rings stay as they were. */
+/*
+ * Driver own again, DMA back on, then the firmware's host interface, and WoW
+ * off if the sleep had it. Rings stay as they were.
+ */
 static int mt_hif_restart(struct mt7932 *m)
 {
+	bool wow;
 	int ret;
 
 	ret = mt_ownership(m);
@@ -1382,9 +1391,14 @@ static int mt_hif_restart(struct mt7932 *m)
 	WRITE_ONCE(m->running, true);
 	mt_write(m, W + 0x204, m->irq_mask);
 	mutex_lock(&m->command_mutex);
+	wow = m->wow_armed;
 	ret = mt_hif_ctrl(m, false);
-	if (!ret)
+	if (!ret) {
 		WRITE_ONCE(m->hif_gate, false);
+		ret = mt_wow_disarm(m);
+		if (ret)
+			WRITE_ONCE(m->hif_gate, true);
+	}
 	mutex_unlock(&m->command_mutex);
 	if (ret) {
 		/* Not left running into the next sleep. */
@@ -1399,6 +1413,8 @@ static int mt_hif_restart(struct mt7932 *m)
 	/* What arrived or was asked for while stopped, now that it can run. */
 	if (READ_ONCE(m->cal_request_count))
 		schedule_work(&m->cal_work);
+	if (wow)
+		schedule_work(&m->power_work);
 	if (READ_ONCE(m->interface_registered) && READ_ONCE(m->reg_pending))
 		schedule_work(&m->startup_work);
 	if (m->netdev)
@@ -1407,9 +1423,10 @@ static int mt_hif_restart(struct mt7932 *m)
 }
 
 /*
- * What macOS does at sleep, without its wake-on-LAN setup: cfg80211 has already left
- * the network, as no wakeup is configured. The firmware stops its host interface and is
- * given ownership, and keeps running. PERST# then resets the link, not the firmware.
+ * What macOS does at sleep. Without a WoWLAN configuration cfg80211 has already left
+ * the network; with one the firmware is given WoW first and stays associated. The firmware
+ * stops its host interface and is given ownership, and keeps running. PERST# then resets
+ * the link, not the firmware.
  *
  * Trouble here costs Wi-Fi at the wake, never the machine its sleep.
  */
@@ -1435,6 +1452,7 @@ static int mt_hif_suspend(struct mt7932 *m)
 			dev_warn(&m->pdev->dev, "scan still retiring at the sleep: %d\n", ret);
 	}
 	mutex_lock(&m->command_mutex);
+	mt_wow_arm(m);
 	WRITE_ONCE(m->hif_gate, true);
 	ret = mt_hif_tx_idle(m);
 	if (!ret)
