@@ -2173,6 +2173,14 @@
 #include "t6030-usb4.dtsi"
 #include "t6030-dcp.dtsi"
 
+#include "t6030-peripherals.dtsi"
+
+#include "t6030-peripheral-buses.dtsi"
+
+#include "t6030-coprocessors.dtsi"
+
+#include "t6030-misc-interfaces.dtsi"
+
 &smc_hwmon {
 	/* Not yet checked on hardware; absent firmware keys are skipped. */
 	apple,soc-die-keys = "Tf04", "Tf09", "Tf0A", "Tf0B", "Tf0D",

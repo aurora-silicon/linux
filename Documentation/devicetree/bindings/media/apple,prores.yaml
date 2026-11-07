@@ -18,10 +18,16 @@ properties:
   compatible:
     oneOf:
       - enum:
-      - apple,t6000-prores
-      - apple,t8140-prores
+          - apple,t6000-prores
+          - apple,t8140-prores
       - items:
           - const: apple,t6041-prores
+          - const: apple,prores
+      - items:
+          - enum:
+              - apple,t8122-prores
+              - apple,t6030-prores
+              - apple,t6031-prores
           - const: apple,prores
 
   reg:
@@ -41,7 +47,8 @@ properties:
     maxItems: 2
 
   iommus:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
 
   power-domains:
     minItems: 1
@@ -61,35 +68,9 @@ properties:
 required:
   - compatible
   - reg
-  - reg-names
   - interrupts
   - iommus
   - power-domains
-
-allOf:
-  - if:
-      properties:
-        compatible:
-          contains:
-            const: apple,t6041-prores
-    then:
-      properties:
-        reg:
-          minItems: 3
-          maxItems: 3
-        reg-names:
-          minItems: 3
-          maxItems: 3
-        interrupts:
-          maxItems: 1
-      required:
-        - resets
-    else:
-      properties:
-        reg:
-          maxItems: 2
-        reg-names:
-          maxItems: 2
 
 allOf:
   - if:
@@ -100,6 +81,51 @@ allOf:
       properties:
         interrupts:
           maxItems: 1
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8122-prores
+              - apple,t6030-prores
+              - apple,t6031-prores
+    then:
+      properties:
+        reg:
+          minItems: 2
+          maxItems: 3
+        power-domains:
+          maxItems: 1
+    else:
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6041-prores
+          then:
+            properties:
+              reg:
+                minItems: 3
+                maxItems: 3
+              reg-names:
+                minItems: 3
+                maxItems: 3
+              interrupts:
+                maxItems: 1
+            required:
+              - resets
+          else:
+            properties:
+              reg:
+                maxItems: 2
+              reg-names:
+                maxItems: 2
+      properties:
+        iommus:
+          maxItems: 1
+      required:
+        - reg-names
 
 additionalProperties: false
 
