@@ -91,7 +91,7 @@
 	};
 
 	clvr_spmi0: spmi@28e501100 {
-		compatible = "apple,t6000-spmi", "apple,spmi";
+		compatible = "apple,t6000-spmi", "apple,t8103-spmi";
 		reg = <0x2 0x8e501100 0x0 0x100>;
 		#address-cells = <2>;
 		#size-cells = <0>;
@@ -99,7 +99,7 @@
 	};
 
 	clvr_spmi1: spmi@28e509100 {
-		compatible = "apple,t6000-spmi", "apple,spmi";
+		compatible = "apple,t6000-spmi", "apple,t8103-spmi";
 		reg = <0x2 0x8e509100 0x0 0x100>;
 		#address-cells = <2>;
 		#size-cells = <0>;
@@ -107,7 +107,7 @@
 	};
 
 	clvr_spmi2: spmi@28e511100 {
-		compatible = "apple,t6000-spmi", "apple,spmi";
+		compatible = "apple,t6000-spmi", "apple,t8103-spmi";
 		reg = <0x2 0x8e511100 0x0 0x100>;
 		#address-cells = <2>;
 		#size-cells = <0>;
@@ -460,7 +460,7 @@
 	};
 
 	nub_spmi1: spmi@2920a9300 {
-		compatible = "apple,t6000-spmi", "apple,spmi";
+		compatible = "apple,t6000-spmi", "apple,t8103-spmi";
 		reg = <0x2 0x920a9300 0x0 0x100>;
 		#address-cells = <2>;
 		#size-cells = <0>;
@@ -499,7 +499,7 @@
 	};
 
 	aop_spmi0: spmi@293829300 {
-		compatible = "apple,t6000-spmi", "apple,spmi";
+		compatible = "apple,t6000-spmi", "apple,t8103-spmi";
 		reg = <0x2 0x93829300 0x0 0x100>;
 		#address-cells = <2>;
 		#size-cells = <0>;
@@ -507,7 +507,7 @@
 	};
 
 	aop_spmi1: spmi@29382d300 {
-		compatible = "apple,t6000-spmi", "apple,spmi";
+		compatible = "apple,t6000-spmi", "apple,t8103-spmi";
 		reg = <0x2 0x9382d300 0x0 0x100>;
 		#address-cells = <2>;
 		#size-cells = <0>;
@@ -836,7 +836,7 @@
 	};
 
 	spi4: spi@39b110000 {
-		compatible = "apple,t6000-spi", "apple,spi";
+		compatible = "apple,t6000-spi", "apple,t8103-spi";
 		reg = <0x3 0x9b110000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1110 IRQ_TYPE_LEVEL_HIGH>;

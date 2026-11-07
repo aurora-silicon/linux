@@ -308,5 +308,6 @@
 		compatible = "apple,vale-pmic", "apple,spmi-nvmem";
 		reg = <0xe SPMI_USID>;
 		read-only;
+		status = "disabled";
 	};
 };
