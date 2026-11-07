@@ -12,7 +12,9 @@ maintainers:
 description: |
   Firmware-managed numerically controlled oscillator service. Unlike the
   directly programmed NCO binding, no AP register window is published.
-  The input selectors identify clocks in the PMGR clock namespace.
+  The selectors identify clocks in the PMGR clock namespace. Their
+  firmware service association is preserved without assuming a direct
+  AP-programmable NCO input/output clock topology.
 
 properties:
   compatible:
@@ -21,12 +23,19 @@ properties:
           - const: apple,t8140-nco-service
           - const: apple,nco-service
 
-  clocks:
+  apple,clock-controller:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Provider defining the SoC hardware clock selector namespace.
+
+  apple,clock-selectors:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
     minItems: 4
     maxItems: 4
+    description: Clock selectors published for this firmware NCO service.
 
 required:
   - compatible
-  - clocks
+  - apple,clock-controller
+  - apple,clock-selectors
 
 additionalProperties: false

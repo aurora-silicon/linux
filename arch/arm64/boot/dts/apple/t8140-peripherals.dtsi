@@ -529,7 +529,8 @@
 	/* ADT /arm-io/nco; no qualified host transport/ownership contract. */
 	nco_service: nco-service {
 		compatible = "apple,t8140-nco-service", "apple,nco-service";
-		clocks = <&peripheral_clocks 377>, <&peripheral_clocks 378>, <&peripheral_clocks 375>, <&peripheral_clocks 376>;
+		apple,clock-controller = <&peripheral_clocks>;
+		apple,clock-selectors = <377 378 375 376>;
 		status = "disabled";
 	};
 
