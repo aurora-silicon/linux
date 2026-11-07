@@ -1341,9 +1341,36 @@ static bool tas2764_volatile_register(struct device *dev, unsigned int reg)
 	}
 }
 
+/*
+ * The registers the driver writes: page 0, the page 1 and page 6 registers of
+ * the quirk sequences and the SDOUT high-impedance masks, and TI's quirk pages
+ * (volatile). A cache sync after a resume writes back only these. Anything
+ * else in the cache got there through a read alone, such as a regmap debugfs
+ * dump of every page, and some of those registers are reserved: a raw block
+ * written over them at resume is never completed by the amp and leaves the
+ * I2C controller stuck in its transaction, taking every amp on the bus with
+ * it.
+ */
+static bool tas2764_writeable_register(struct device *dev, unsigned int reg)
+{
+	switch (reg) {
+	case TAS2764_REG(0x0, 0x00) ... TAS2764_REG(0x0, 0x7f):
+	case TAS2764_REG(0x1, 0x33):
+	case TAS2764_REG(0x1, 0x37):
+	case TAS2764_SDOUT_HIZ_1 ... TAS2764_SDOUT_HIZ_9:
+	case TAS2764_REG(0x1, 0x47):
+	case TAS2764_REG(0x6, 0x14) ... TAS2764_REG(0x6, 0x1f):
+	case TAS2764_REG(0xf0, 0x0) ... TAS2764_REG(0xff, 0x7f):
+		return true;
+	default:
+		return false;
+	}
+}
+
 static const struct regmap_config tas2764_i2c_regmap = {
 	.reg_bits = 8,
 	.val_bits = 8,
+	.writeable_reg = tas2764_writeable_register,
 	.volatile_reg = tas2764_volatile_register,
 	.reg_defaults = tas2764_reg_defaults,
 	.num_reg_defaults = ARRAY_SIZE(tas2764_reg_defaults),
