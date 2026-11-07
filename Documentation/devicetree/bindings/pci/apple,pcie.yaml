@@ -44,26 +44,26 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,pcie"
-              - "apple,t6000-pcie"
-              - "apple,t6000-pciec"
-              - "apple,t6020-pcie"
-              - "apple,t6020-pcie-ge"
-              - "apple,t6030-pcie"
-              - "apple,t6031-pcie"
-              - "apple,t6041-pcie"
-              - "apple,t8103-pcie"
-              - "apple,t8103-pciec"
-              - "apple,t8112-pcie"
-              - "apple,t8112-pciec"
-              - "apple,t8122-pcie"
-              - "apple,t8122-pciec"
-              - "apple,t8132-pcie"
-              - "apple,t8132-pciec"
-              - "apple,t8140-pcie"
-              - "apple,t8152-pcie"
+              - apple,pcie
+              - apple,t6000-pcie
+              - apple,t6000-pciec
+              - apple,t6020-pcie
+              - apple,t6020-pcie-ge
+              - apple,t6030-pcie
+              - apple,t6031-pcie
+              - apple,t6041-pcie
+              - apple,t8103-pcie
+              - apple,t8103-pciec
+              - apple,t8112-pcie
+              - apple,t8112-pciec
+              - apple,t8122-pcie
+              - apple,t8122-pciec
+              - apple,t8132-pcie
+              - apple,t8132-pciec
+              - apple,t8140-pcie
+              - apple,t8152-pcie
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
@@ -71,13 +71,13 @@ select:
             -
               contains:
                 enum:
-                  - "apple,t8142-pcie"
-                  - "apple,t8152-pcie"
+                  - apple,t8142-pcie
+                  - apple,t8152-pcie
             -
               contains:
-                const: "apple,pcie"
+                const: apple,pcie
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
@@ -85,14 +85,14 @@ select:
             -
               contains:
                 enum:
-                  - "apple,t8142-pciec"
-                  - "apple,t8152-pciec"
-                  - "apple,t6050-pciec"
+                  - apple,t8142-pciec
+                  - apple,t8152-pciec
+                  - apple,t6050-pciec
             -
               contains:
-                const: "apple,pciec"
+                const: apple,pciec
       required:
-        - "compatible"
+        - compatible
 allOf:
   -
     if:
@@ -104,19 +104,19 @@ allOf:
                 -
                   contains:
                     enum:
-                      - "apple,t8142-pcie"
-                      - "apple,t8152-pcie"
+                      - apple,t8142-pcie
+                      - apple,t8152-pcie
                 -
                   contains:
-                    const: "apple,pcie"
+                    const: apple,pcie
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
           not:
             required:
-              - "mboxes"
+              - mboxes
         -
           properties:
             compatible:
@@ -124,81 +124,95 @@ allOf:
                 -
                   contains:
                     enum:
-                      - "apple,t8142-pciec"
-                      - "apple,t8152-pciec"
-                      - "apple,t6050-pciec"
+                      - apple,t8142-pciec
+                      - apple,t8152-pciec
+                      - apple,t6050-pciec
                 -
                   contains:
-                    const: "apple,pciec"
+                    const: apple,pciec
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
           not:
             required:
-              - "mboxes"
+              - mboxes
     then:
       oneOf:
         -
-          description: "Apple pcie root complex and its port register windows. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          type: object
+          description: |
+            Apple pcie root complex and its port register windows. Initial resource description for an
+            unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a
+            driver exists. This form must stay disabled; it does not substitute for the enabled driver
+            contract or supply firmware, calibration, programming sequences or unresolved providers.
           properties:
             compatible:
               items:
                 -
                   enum:
-                    - "apple,t8142-pcie"
-                    - "apple,t8152-pcie"
+                    - apple,t8142-pcie
+                    - apple,t8152-pcie
                 -
-                  const: "apple,pcie"
+                  const: apple,pcie
             status:
-              const: "disabled"
+              const: disabled
             reg:
-              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              description: |
+                Register apertures of the complete hardware complex, in hardware interface order.
               minItems: 26
               maxItems: 28
             interrupts:
-              description: "Interrupt lines wired to the system interrupt controller."
+              description: Interrupt lines wired to the system interrupt controller.
               minItems: 3
               maxItems: 4
             power-domains:
-              description: "Power and combined clock gates required by this hardware."
+              description: Power and combined clock gates required by this hardware.
               minItems: 8
               maxItems: 8
           required:
-            - "compatible"
-            - "reg"
-            - "status"
+            - compatible
+            - reg
+            - status
           additionalProperties: false
         -
-          description: "Apple pcie tunnel controller. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          type: object
+          description: |
+            Apple pcie tunnel controller. Initial resource description for an unsupported
+            firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver
+            exists. This form must stay disabled; it does not substitute for the enabled driver contract
+            or supply firmware, calibration, programming sequences or unresolved providers.
           properties:
             compatible:
               items:
                 -
                   enum:
-                    - "apple,t8142-pciec"
-                    - "apple,t8152-pciec"
-                    - "apple,t6050-pciec"
+                    - apple,t8142-pciec
+                    - apple,t8152-pciec
+                    - apple,t6050-pciec
                 -
-                  const: "apple,pciec"
+                  const: apple,pciec
             status:
-              const: "disabled"
+              const: disabled
             reg:
-              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              description: |
+                Register apertures of the complete hardware complex, in hardware interface order.
               minItems: 8
               maxItems: 8
             interrupts:
-              description: "Interrupt lines wired to the system interrupt controller."
+              description: Interrupt lines wired to the system interrupt controller.
               minItems: 6
               maxItems: 6
           required:
-            - "compatible"
-            - "reg"
-            - "status"
+            - compatible
+            - reg
+            - status
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
+
+unevaluatedProperties: false
 
 $defs:
   tunable:
@@ -210,6 +224,7 @@ $defs:
         - description: Bits to set
     description: Register initialization tuples for one controller region.
   legacy-driver:
+    type: object
     properties:
       compatible:
         oneOf:

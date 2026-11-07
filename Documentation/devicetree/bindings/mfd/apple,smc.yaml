@@ -21,21 +21,21 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,smc"
-              - "apple,t6000-smc"
-              - "apple,t6020-smc"
-              - "apple,t6030-smc"
-              - "apple,t6031-smc"
-              - "apple,t6041-smc"
-              - "apple,t8103-smc"
-              - "apple,t8112-smc"
-              - "apple,t8122-smc"
-              - "apple,t8132-smc"
-              - "apple,t8140-smc"
-              - "apple,t8142-smc"
-              - "apple,t8152-smc"
+              - apple,smc
+              - apple,t6000-smc
+              - apple,t6020-smc
+              - apple,t6030-smc
+              - apple,t6031-smc
+              - apple,t6041-smc
+              - apple,t8103-smc
+              - apple,t8112-smc
+              - apple,t8122-smc
+              - apple,t8132-smc
+              - apple,t8140-smc
+              - apple,t8142-smc
+              - apple,t8152-smc
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
@@ -43,12 +43,12 @@ select:
             -
               contains:
                 enum:
-                  - "apple,t8142-smc"
+                  - apple,t8142-smc
             -
               contains:
-                const: "apple,smc"
+                const: apple,smc
       required:
-        - "compatible"
+        - compatible
 allOf:
   -
     if:
@@ -60,50 +60,59 @@ allOf:
                 -
                   contains:
                     enum:
-                      - "apple,t8142-smc"
+                      - apple,t8142-smc
                 -
                   contains:
-                    const: "apple,smc"
+                    const: apple,smc
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
           not:
             required:
-              - "mboxes"
+              - mboxes
     then:
       oneOf:
         -
-          description: "Apple system management coprocessor. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          type: object
+          description: |
+            Apple system management coprocessor. Initial resource description for an unsupported
+            firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver
+            exists. This form must stay disabled; it does not substitute for the enabled driver contract
+            or supply firmware, calibration, programming sequences or unresolved providers.
           properties:
             compatible:
               items:
                 -
                   enum:
-                    - "apple,t8142-smc"
+                    - apple,t8142-smc
                 -
-                  const: "apple,smc"
+                  const: apple,smc
             status:
-              const: "disabled"
+              const: disabled
             reg:
-              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              description: |
+                Register apertures of the complete hardware complex, in hardware interface order.
               minItems: 3
               maxItems: 3
             interrupts:
-              description: "Interrupt lines wired to the system interrupt controller."
+              description: Interrupt lines wired to the system interrupt controller.
               minItems: 4
               maxItems: 4
           required:
-            - "compatible"
-            - "reg"
-            - "status"
+            - compatible
+            - reg
+            - status
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
 
+unevaluatedProperties: false
+
 $defs:
   legacy-driver:
+    type: object
     properties:
       compatible:
         oneOf:

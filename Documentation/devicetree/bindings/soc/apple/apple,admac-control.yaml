@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 %YAML 1.2
 ---
-$id: "http://devicetree.org/schemas/soc/apple/apple,admac-control.yaml#"
-$schema: "http://devicetree.org/meta-schemas/core.yaml#"
-title: "Apple audio dma clock and event distribution"
+$id: http://devicetree.org/schemas/soc/apple/apple,admac-control.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+title: Apple audio dma clock and event distribution
 maintainers:
-  - "Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>"
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
 select:
   properties:
     compatible:
@@ -13,36 +13,40 @@ select:
         -
           contains:
             enum:
-              - "apple,t8142-admac-control"
-              - "apple,t8152-admac-control"
-              - "apple,t6050-admac-control"
+              - apple,t8142-admac-control
+              - apple,t8152-admac-control
+              - apple,t6050-admac-control
         -
           contains:
-            const: "apple,admac-control"
+            const: apple,admac-control
   required:
-    - "compatible"
-description: "Apple audio dma clock and event distribution. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+    - compatible
+description: |
+  Apple audio dma clock and event distribution. Initial resource description for an unsupported
+  firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This
+  form must stay disabled; it does not substitute for the enabled driver contract or supply firmware,
+  calibration, programming sequences or unresolved providers.
 properties:
   compatible:
     items:
       -
         enum:
-          - "apple,t8142-admac-control"
-          - "apple,t8152-admac-control"
-          - "apple,t6050-admac-control"
+          - apple,t8142-admac-control
+          - apple,t8152-admac-control
+          - apple,t6050-admac-control
       -
-        const: "apple,admac-control"
+        const: apple,admac-control
   status:
-    const: "disabled"
+    const: disabled
   reg:
-    description: "Register apertures of the complete hardware complex, in hardware interface order."
+    description: Register apertures of the complete hardware complex, in hardware interface order.
     minItems: 2
     maxItems: 2
   interrupts:
-    description: "Interrupt lines wired to the system interrupt controller."
+    description: Interrupt lines wired to the system interrupt controller.
     maxItems: 1
 required:
-  - "compatible"
-  - "reg"
-  - "status"
+  - compatible
+  - reg
+  - status
 additionalProperties: false

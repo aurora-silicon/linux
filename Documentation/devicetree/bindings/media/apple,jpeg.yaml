@@ -27,10 +27,10 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,t6041-jpeg"
-              - "apple,t8140-jpeg"
+              - apple,t6041-jpeg
+              - apple,t8140-jpeg
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
@@ -38,14 +38,14 @@ select:
             -
               contains:
                 enum:
-                  - "apple,t8142-jpeg"
-                  - "apple,t8152-jpeg"
-                  - "apple,t6050-jpeg"
+                  - apple,t8142-jpeg
+                  - apple,t8152-jpeg
+                  - apple,t6050-jpeg
             -
               contains:
-                const: "apple,jpeg"
+                const: apple,jpeg
       required:
-        - "compatible"
+        - compatible
 allOf:
   -
     if:
@@ -57,56 +57,65 @@ allOf:
                 -
                   contains:
                     enum:
-                      - "apple,t8142-jpeg"
-                      - "apple,t8152-jpeg"
-                      - "apple,t6050-jpeg"
+                      - apple,t8142-jpeg
+                      - apple,t8152-jpeg
+                      - apple,t6050-jpeg
                 -
                   contains:
-                    const: "apple,jpeg"
+                    const: apple,jpeg
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
           not:
             required:
-              - "mboxes"
+              - mboxes
     then:
       oneOf:
         -
-          description: "Apple jpeg codec and shared register windows. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          type: object
+          description: |
+            Apple jpeg codec and shared register windows. Initial resource description for an
+            unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a
+            driver exists. This form must stay disabled; it does not substitute for the enabled driver
+            contract or supply firmware, calibration, programming sequences or unresolved providers.
           properties:
             compatible:
               items:
                 -
                   enum:
-                    - "apple,t8142-jpeg"
-                    - "apple,t8152-jpeg"
-                    - "apple,t6050-jpeg"
+                    - apple,t8142-jpeg
+                    - apple,t8152-jpeg
+                    - apple,t6050-jpeg
                 -
-                  const: "apple,jpeg"
+                  const: apple,jpeg
             status:
-              const: "disabled"
+              const: disabled
             reg:
-              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              description: |
+                Register apertures of the complete hardware complex, in hardware interface order.
               minItems: 1
               maxItems: 2
             interrupts:
-              description: "Interrupt lines wired to the system interrupt controller."
+              description: Interrupt lines wired to the system interrupt controller.
               maxItems: 1
             iommus:
-              description: "DMA translation streams emitted by this hardware."
+              description: DMA translation streams emitted by this hardware.
               maxItems: 1
           required:
-            - "compatible"
-            - "reg"
-            - "status"
+            - compatible
+            - reg
+            - status
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
 
+unevaluatedProperties: false
+
 $defs:
   legacy-driver:
+    type: object
     properties:
       compatible:
         enum:
