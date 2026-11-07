@@ -956,9 +956,23 @@ static void program_custom_bar_test(struct kunit *test)
 	/* The DSID must fit the field. */
 	KUNIT_EXPECT_EQ(test, ane_h16_custom_bars(linear, &linear->info, 256, bars, &count),
 			-ENOEXEC);
-	/* Scratch form: no established tuple layout, no record. */
+	/* Scratch form: prefetch and intermediate-spill mcache records. */
 	KUNIT_ASSERT_EQ(test, ane_h16_custom_bars(mixed, &mixed->info, 36, bars, &count), 0);
-	KUNIT_EXPECT_EQ(test, count, 0);
+	KUNIT_ASSERT_EQ(test, count, 2);
+	KUNIT_EXPECT_EQ(test, bars[0].configuration, 1);
+	KUNIT_EXPECT_EQ(test, bars[0].value_type, 0);
+	KUNIT_EXPECT_EQ(test, bars[0].bar, 4);
+	KUNIT_EXPECT_EQ(test, bars[0].bit_offset, 2);
+	KUNIT_EXPECT_EQ(test, bars[0].bit_width, 8);
+	KUNIT_EXPECT_EQ(test, bars[0].flags, 0);
+	KUNIT_EXPECT_EQ(test, bars[0].value, 36);
+	KUNIT_EXPECT_EQ(test, bars[1].configuration, 1);
+	KUNIT_EXPECT_EQ(test, bars[1].value_type, 1);
+	KUNIT_EXPECT_EQ(test, bars[1].bar, 4);
+	KUNIT_EXPECT_EQ(test, bars[1].bit_offset, 8);
+	KUNIT_EXPECT_EQ(test, bars[1].bit_width, 8);
+	KUNIT_EXPECT_EQ(test, bars[1].flags, 0);
+	KUNIT_EXPECT_EQ(test, bars[1].value, 36);
 	/* Usage type to descriptor class, round 5 section 7. */
 	KUNIT_EXPECT_EQ(test, ane_h16_usage_class(1), 0);
 	KUNIT_EXPECT_EQ(test, ane_h16_usage_class(2), 1);
@@ -1172,7 +1186,26 @@ static void program_scratch_test(struct kunit *test)
 	/* The output and the scratch are the device-writable mappings. */
 	KUNIT_EXPECT_EQ(test, f->writable_maps, 2);
 	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
-	KUNIT_EXPECT_EQ(test, f->exec_length, ANE_H16_EXECUTE_BASE_SIZE);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + ANE_H16_EXECUTE_FLAGS),
+			ANE_H16_EXECUTE_FLAG_QUEUED);
+	/* The complete tuple lets the second execution use the direct path. */
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + ANE_H16_EXECUTE_FLAGS), 0);
+	KUNIT_EXPECT_EQ(test, f->exec_length,
+			ANE_H16_EXECUTE_BASE_SIZE + 2 * ANE_H16_CUSTOM_BAR_STRIDE);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0xca0), 2);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0xca8), 1);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0xcac), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0xcb0), 4);
+	KUNIT_EXPECT_EQ(test, f->exec[0xcb4], 2);
+	KUNIT_EXPECT_EQ(test, f->exec[0xcb5], 8);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->exec + 0xcb8), 36);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0xcc0), 1);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0xcc4), 1);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0xcc8), 4);
+	KUNIT_EXPECT_EQ(test, f->exec[0xccc], 8);
+	KUNIT_EXPECT_EQ(test, f->exec[0xccd], 8);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->exec + 0xcd0), 36);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x28), 3);
 	d = f->exec + 0x60 + 2 * 0x30;
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(d), 1);

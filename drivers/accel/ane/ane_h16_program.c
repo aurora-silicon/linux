@@ -428,17 +428,19 @@ int ane_h16_operation_validate(const struct ane_h16_hwx_snapshot *snapshot,
 EXPORT_SYMBOL_GPL(ane_h16_operation_validate);
 
 /*
- * The mcache custom-BAR record comes from the program descriptor relocation
- * tuple (BAR ID, field, bit offset, width at +0x868, +0x870, +0x878, +0x87c of
- * the linear 0x8a0 form). The validator pins those words. The scratch form's
- * tuple layout is not established, so it sends no record, which is legal.
+ * The mcache custom-BAR records come from the program descriptor relocation
+ * tuples pinned by the HWX validator.  The linear 0x8a0 form has one prefetch
+ * tuple (BAR ID, field, bit offset, width at +0x868, +0x870, +0x878, +0x87c).
+ * The scratch-backed 0x8c0 form has that tuple plus one intermediate-spill
+ * tuple in the kind-3 payload at +0x890.  The two records use independent
+ * mcache value types even though both name BAR 4 and their bit ranges overlap.
  */
 int ane_h16_custom_bars(const struct ane_h16_hwx_snapshot *snapshot,
 			const struct ane_h16_hwx *hwx, u32 dsid,
 			struct ane_h16_custom_bar *bars, unsigned int *count)
 {
 	const u8 *c;
-	u32 bar, offset, width;
+	u32 bar, offset, width, length;
 	int ret;
 
 	if (!hwx || !bars || !count)
@@ -451,8 +453,7 @@ int ane_h16_custom_bars(const struct ane_h16_hwx_snapshot *snapshot,
 		return -ENOEXEC;
 	c = (const u8 *)snapshot->bytes + hwx->program_offset;
 	*count = 0;
-	if (get_unaligned_le32(c + 4) != 0x8a0)
-		return 0;
+	length = get_unaligned_le32(c + 4);
 	bar = get_unaligned_le32(c + 0x868);
 	offset = get_unaligned_le32(c + 0x878);
 	width = get_unaligned_le32(c + 0x87c);
@@ -467,6 +468,25 @@ int ane_h16_custom_bars(const struct ane_h16_hwx_snapshot *snapshot,
 		.value = dsid,
 	};
 	*count = 1;
+	if (length == 0x8a0)
+		return 0;
+	if (length != 0x8c0 || snapshot->size < 0x8c0 ||
+	    hwx->program_offset > snapshot->size - 0x8c0)
+		return -ENOEXEC;
+	bar = get_unaligned_le16(c + 0x890);
+	offset = c[0x893];
+	width = c[0x894];
+	if (!width || width > 16 || offset > 64 - width || dsid >= BIT(width))
+		return -ENOEXEC;
+	bars[1] = (struct ane_h16_custom_bar) {
+		.configuration = 1,
+		.value_type = 1,
+		.bar = bar,
+		.bit_offset = offset,
+		.bit_width = width,
+		.value = dsid,
+	};
+	*count = 2;
 	return 0;
 }
 EXPORT_SYMBOL_GPL(ane_h16_custom_bars);
@@ -1153,13 +1173,12 @@ static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 	/*
 	 * The first request of a program on the engine, the first one after boot
 	 * included, takes the queued path once: only EXELOOP sets up the BAR
-	 * context and the L2-spill mapping that later direct requests reuse.
+	 * context and the L2-spill mapping that later direct requests reuse.  The
+	 * request carries every descriptor-declared custom BAR, including both
+	 * mixed-descriptor mcache streams, on the queued and direct paths.
 	 */
-	if (s->executed != p->generation) {
+	if (s->executed != p->generation)
 		call.flags = ANE_H16_EXECUTE_FLAG_QUEUED;
-		s->ops->log(s->ctx, "EXECUTE first of this program, queued", p->key.program,
-			    request.key.uuid);
-	}
 	s->executed = p->generation;
 	call.bars = p->bars;
 	call.bar_count = p->bar_count;
