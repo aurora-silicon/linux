@@ -42,6 +42,7 @@ pub(crate) mod glue {
 
     extern "C" {
         fn asahi_g16_board() -> bool;
+        fn asahi_g16_display_prepare(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
         fn asahi_g16_hold_power(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
         fn asahi_g16_module_try_get() -> bool;
         fn asahi_g16_module_put();
@@ -65,6 +66,12 @@ pub(crate) mod glue {
     pub(crate) fn board() -> bool {
         // SAFETY: Reads the machine compatible strings only.
         unsafe { asahi_g16_board() }
+    }
+
+    /// Links the GPU to the published native display, or defers until it is.
+    pub(crate) fn display_prepare(dev: &device::Device) -> Result {
+        // SAFETY: `dev` is the bound GPU device; the helper only adds a device link.
+        kernel::error::to_result(unsafe { asahi_g16_display_prepare(dev.as_raw().cast()) })
     }
 
     /// Holds the GFX power domain for the retained session.
@@ -465,6 +472,11 @@ pub(crate) fn admit(
         }
         return Err(err);
     }
+    glue::display_prepare(dev).inspect_err(|e| {
+        if *e != EPROBE_DEFER {
+            dev_err!(dev, "native display not admitted: {:?}\n", e);
+        }
+    })?;
     let adt =
         adt::read(dev).inspect_err(|e| dev_err!(dev, "ADT GPU regions not admitted: {:?}\n", e))?;
     crate::fwid::identify(

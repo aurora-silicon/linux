@@ -31,13 +31,16 @@ config DRM_ASAHI
 config DRM_ASAHI_G16
 	bool "Apple M4 (G16G) support (experimental)"
 	depends on DRM_ASAHI && ARM64
+	depends on DRM_APPLE=y || (DRM_APPLE=m && DRM_ASAHI=m)
+	depends on DRM_APPLE_DCP_T8132
 	depends on APPLE_PMP=y || APPLE_PMP=DRM_ASAHI
 	depends on APPLE_CLPC=y || APPLE_CLPC=DRM_ASAHI || APPLE_CLPC=n
 	depends on THERMAL_OF
 	help
 	  Rust backend for the qualified J713/T8132 GPU firmware.
-	  Load aurora explicitly after the native display and GFX TVM supplier
-	  are ready. Firmware-visible storage remains retained until a verified
+	  It starts after the PMP supplier and a native display the boot loader
+	  handed over; the T8132 display driver must be built in, or both
+	  drivers must be modules. Firmware-visible storage remains retained until a verified
 	  retirement or reboot. Keep the working kernel available during bring-up.
 	  A rendering VM pins about 0.7 GiB; memory-cgroup limits are advisable.
 	  An aborted receipt disables that command class until reboot.
