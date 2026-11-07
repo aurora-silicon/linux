@@ -1416,6 +1416,18 @@ static int macsmc_hwmon_die_register(struct macsmc_hwmon *hwmon)
 			 hwmon->die_listed);
 		return 0;
 	}
+	/*
+	 * MacBook Air (15-inch, M3): all twelve keys are readable floats on
+	 * J615. The Tg readings rose during a GPU workload and fell after
+	 * it stopped. Require the complete CPU/GPU set, not a CPU-only zone
+	 * if discovery of a GPU key fails.
+	 */
+	if (of_machine_is_compatible("apple,j615") &&
+	    hwmon->die_count != hwmon->die_listed) {
+		dev_warn(hwmon->dev, "no SoC die temperature zone: only %u of %u required keys is present\n",
+			 hwmon->die_count, hwmon->die_listed);
+		return 0;
+	}
 
 	for (i = 0; i < hwmon->temp.count && len + 6 <= sizeof(keys); i++) {
 		smc_key key = hwmon->temp.sensors[i].macsmc_key;
