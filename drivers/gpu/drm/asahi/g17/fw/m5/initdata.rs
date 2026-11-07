@@ -9,6 +9,8 @@
 use core::ops::Range;
 use core::result::Result;
 
+use crate::g17::fw::kick::{KickTimestamp, KICK_SLOTS};
+
 pub(crate) const ROOT_SIZE_PRIMARY: usize = 0x0b8;
 
 pub(crate) const ROOT_SIZE_SECONDARY: usize = 0x0c8;
@@ -2788,6 +2790,14 @@ pub(crate) fn encode_m5_hw_data(
     put_u32(out, 0x2660, 0);
     put_u32(out, hw_offset(board, 0x2728), 0);
     put_u32(out, hw_offset(board, 0x272c), 1);
+    // On the J813 macOS 27.0's initFirmwareData also seeds the KSM kick queues
+    // here: the NextTimestamp of each queue's first kick and the ring's entry
+    // count, taken from the driver's kick-queue setup. The firmware copies the
+    // timestamp to context +0xb80, where it seeds all 128 queue states.
+    if board.graph.is_common26() {
+        put_u64(out, hw_offset(board, 0x2730), KickTimestamp::FIRST.get());
+        put_u32(out, hw_offset(board, 0x2738), KICK_SLOTS as u32);
+    }
     if let Some(mask) = board.mcc_mask {
         put_u64(out, 0x10a8, mask);
     }
