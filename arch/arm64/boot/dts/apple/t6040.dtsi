@@ -211,13 +211,6 @@
 		};
 	};
 
-	cpu_pmu: pmu {
-		compatible = "apple,t6040-pmu";
-		interrupt-parent = <&aic>;
-		/* The AIC raises both clusters' PMU FIQs as this one. */
-		interrupts = <AIC_FIQ AIC_CPU_PMU_P IRQ_TYPE_LEVEL_HIGH>;
-	};
-
 	/* Named after its sgx range: the coprocessor range is the mailbox node's too. */
 	gpu: gpu@288000000 {
 		compatible = "apple,agx-t6040";
@@ -248,13 +241,6 @@
 	pmgr_disp: power-management@502290000 {
 		compatible = "apple,t6041-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
 		reg = <0x5 0x02290000 0x0 0x4000>;
-		#address-cells = <1>;
-		#size-cells = <1>;
-	};
-
-	pmgr_venc: power-management@502808000 {
-		compatible = "apple,t6041-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
-		reg = <0x5 0x02808000 0x0 0x4000>;
 		#address-cells = <1>;
 		#size-cells = <1>;
 	};
@@ -330,29 +316,6 @@
 };
 
 / {
-	/* Additional DARTs; enabled together with their DMA consumers. */
-	ave0_dart1: iommu@283080000 {
-		compatible = "apple,t6041-dart", "apple,t8110-dart";
-		reg = <0x2 0x83080000 0x0 0xc000>;
-		#iommu-cells = <1>;
-		apple,dma-range = <0x100 0x00004000 0x0 0xffffc000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1461 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_venc0_sys>;
-		status = "disabled";
-	};
-
-	ave0_dart0: iommu@2830a0000 {
-		compatible = "apple,t6041-dart", "apple,t8110-dart";
-		reg = <0x2 0x830a0000 0x0 0xc000>;
-		#iommu-cells = <1>;
-		apple,dma-range = <0x100 0x00004000 0x0 0xffffc000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1461 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_venc0_sys>;
-		status = "disabled";
-	};
-
 	apr0_dart: iommu@301020000 {
 		compatible = "apple,t6041-dart", "apple,t8110-dart";
 		reg = <0x3 0x01020000 0x0 0xc000>;
@@ -397,61 +360,6 @@
 		#iommu-cells = <1>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1733 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
-	};
-
-	sio_dart: iommu@429060000 {
-		compatible = "apple,t6041-dart", "apple,t8110-dart";
-		reg = <0x4 0x29060000 0x0 0x20000>;
-		#iommu-cells = <1>;
-		apple,dma-range = <0x100 0x1c000 0x2ff 0xfffe4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1587 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_sio>;
-		status = "disabled";
-	};
-
-	jpeg0: jpeg@487000000 {
-		compatible = "apple,t6041-jpeg";
-		reg = <0x4 0x87000000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1538 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&jpeg0_dart 0>;
-		power-domains = <&ps_jpg>;
-		apple,dma-range = /bits/ 64 <0x10000000000 0x100000000>;
-		status = "disabled";
-	};
-
-	jpeg0_dart: iommu@487020000 {
-		compatible = "apple,t6041-dart", "apple,t8110-dart";
-		reg = <0x4 0x87020000 0x0 0xc000>;
-		#iommu-cells = <1>;
-		apple,dma-range = <0x100 0x0 0x300 0x0>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1539 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_jpg>;
-		status = "disabled";
-	};
-
-	jpeg1: jpeg@487060000 {
-		compatible = "apple,t6041-jpeg";
-		reg = <0x4 0x87060000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1543 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&jpeg1_dart 0>;
-		power-domains = <&ps_jpg>;
-		apple,dma-range = /bits/ 64 <0x10000000000 0x100000000>;
-		status = "disabled";
-	};
-
-	jpeg1_dart: iommu@487080000 {
-		compatible = "apple,t6041-dart", "apple,t8110-dart";
-		reg = <0x4 0x87080000 0x0 0xc000>;
-		#iommu-cells = <1>;
-		apple,dma-range = <0x100 0x0 0x300 0x0>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1544 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_jpg>;
 		status = "disabled";
 	};
 
@@ -536,14 +444,6 @@
 		status = "disabled";
 	};
 
-	/* The QSPIMC input is ADT clock 434 (200 MHz). */
-	clk_200m: clock-200m {
-		compatible = "fixed-clock";
-		#clock-cells = <0>;
-		clock-frequency = <200000000>;
-		clock-output-names = "clk_200m";
-	};
-
 	spi4: spi@429110000 {
 		compatible = "apple,t6041-spi", "apple,t8103-spi";
 		reg = <0x4 0x29110000 0x0 0x4000>;
@@ -554,67 +454,6 @@
 		#address-cells = <1>;
 		#size-cells = <0>;
 		/* Panel/TCON control belongs to the display firmware. */
-		status = "disabled";
-	};
-
-	qspi: spi@429118000 {
-		compatible = "apple,t6041-qspi";
-		reg = <0x4 0x29118000 0x0 0x4800>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1573 IRQ_TYPE_LEVEL_HIGH>;
-		clocks = <&clk_200m>;
-		power-domains = <&ps_qspi>;
-		#address-cells = <1>;
-		#size-cells = <0>;
-		/* Boards enable it with their flash and its nvram partition. */
-		status = "disabled";
-	};
-
-	/* The loader supplies the SIO firmware regions and protocol tables. */
-	sio: dma-controller@429e00000 {
-		compatible = "apple,t6041-sio";
-		reg = <0x4 0x29e00000 0x0 0x8000>;
-		dma-channels = <128>;
-		#dma-cells = <1>;
-		mboxes = <&sio_mbox>;
-		iommus = <&sio_dart 0>;
-		power-domains = <&ps_sio_cpu>;
-		status = "disabled";
-	};
-
-	sio_mbox: mailbox@429e08000 {
-		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
-		reg = <0x4 0x29e08000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1591 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 1592 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 1593 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 1594 IRQ_TYPE_LEVEL_HIGH>;
-		interrupt-names = "send-empty", "send-not-empty",
-				  "recv-empty", "recv-not-empty";
-		#mbox-cells = <0>;
-		power-domains = <&ps_sio_cpu>;
-		status = "disabled";
-	};
-
-	/* The video encoder stays disabled until its firmware backend is available. */
-	ave: video-codec@283100000 {
-		compatible = "apple,t6041-ave";
-		reg = <0x2 0x83100000 0x0 0x45c000>,
-		      <0x2 0x83050000 0x0 0x4000>,
-		      <0x2 0x83800000 0x0 0x800000>;
-		reg-names = "codec", "mailbox", "coproc";
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1464 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 1458 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 1457 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 1460 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 1459 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_venc0_dma>, <&ps_venc0_pipe4>,
-				<&ps_venc0_pipe5>, <&ps_venc0_me0>, <&ps_venc0_me1>,
-				<&pmc_soc_max>;
-		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1", "perf";
-		iommus = <&ave0_dart0 0>, <&ave0_dart1 0>;
 		status = "disabled";
 	};
 
@@ -713,6 +552,13 @@
 &avd {
 	power-domains = <&ps_avd_sys>, <&pmc_soc_max>;
 	power-domain-names = "core", "perf";
+};
+
+&ave {
+	power-domains = <&ps_venc0_dma>, <&ps_venc0_pipe4>,
+			<&ps_venc0_pipe5>, <&ps_venc0_me0>, <&ps_venc0_me1>,
+			<&pmc_soc_max>;
+	power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1", "perf";
 };
 
 &usb_drd0_dart_0 {
