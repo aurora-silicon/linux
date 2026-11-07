@@ -170,6 +170,7 @@ static inline int dcp_m4_parse_timing(const void *data, size_t size, struct dcp_
 	};
 	static const u32 color_values[] = { 1, 8, 0, 0, 0, 16, 0 };
 	int ret = -EINVAL, colors, color;
+	unsigned int mode = 0, element = 1;
 	const u32 *h, *v;
 
 	if (!dcp_m4_pf->timing)
@@ -186,21 +187,35 @@ static inline int dcp_m4_parse_timing(const void *data, size_t size, struct dcp_
 	if (ret)
 		goto done;
 	ret = -EINVAL;
-	if (p->pos != size || p->token[0].type != 2 || p->token[0].count != 1 ||
-	    p->token[1].type != 1 ||
-	    !dcp_m4_timing_equals(p, 1, "ID", 4, 2) ||
-	    !dcp_m4_timing_equals(p, 1, "IsVirtual", 11, 0) ||
-	    !dcp_m4_timing_equals(p, 1, "IsPreferred", 11, 1) ||
-	    !dcp_m4_timing_equals(p, 1, "IsInterlaced", 11, 0) ||
-	    !dcp_m4_timing_equals(p, 1, "IsSplit", 11, 0) ||
-	    !dcp_m4_timing_equals(p, 1, "IsOverscanned", 11, 0) ||
-	    !dcp_m4_timing_equals(p, 1, "TimingType", 4, 3) ||
-	    !dcp_m4_timing_equals(p, 1, "MinimumVariableRefreshRate", 4, 0) ||
-	    !dcp_m4_timing_equals(p, 1, "MaximumVariableRefreshRate", 4, 0) ||
-	    dcp_m4_timing_axis(p, 1, "HorizontalAttributes", false) ||
-	    dcp_m4_timing_axis(p, 1, "VerticalAttributes", true))
+	if (p->pos != size || p->token[0].type != 2 || !p->token[0].count ||
+	    p->token[0].count > dcp_m4_pf->timing_elements)
 		goto done;
-	colors = dcp_m4_timing_field(p, 1, "ColorModes", 2);
+	/* Exactly one element is ID 2, and no other is preferred. */
+	for (unsigned int i = 0; i < p->token[0].count;
+	     i++, element = p->token[element].next) {
+		if (dcp_m4_timing_field(p, element, "ID", 4) < 0)
+			goto done;
+		if (dcp_m4_timing_equals(p, element, "ID", 4, 2)) {
+			if (mode)
+				goto done;
+			mode = element;
+		} else if (!dcp_m4_timing_equals(p, element, "IsPreferred", 11, 0)) {
+			goto done;
+		}
+	}
+	if (!mode ||
+	    !dcp_m4_timing_equals(p, mode, "IsVirtual", 11, 0) ||
+	    !dcp_m4_timing_equals(p, mode, "IsPreferred", 11, 1) ||
+	    !dcp_m4_timing_equals(p, mode, "IsInterlaced", 11, 0) ||
+	    !dcp_m4_timing_equals(p, mode, "IsSplit", 11, 0) ||
+	    !dcp_m4_timing_equals(p, mode, "IsOverscanned", 11, 0) ||
+	    !dcp_m4_timing_equals(p, mode, "TimingType", 4, 3) ||
+	    !dcp_m4_timing_equals(p, mode, "MinimumVariableRefreshRate", 4, 0) ||
+	    !dcp_m4_timing_equals(p, mode, "MaximumVariableRefreshRate", 4, 0) ||
+	    dcp_m4_timing_axis(p, mode, "HorizontalAttributes", false) ||
+	    dcp_m4_timing_axis(p, mode, "VerticalAttributes", true))
+		goto done;
+	colors = dcp_m4_timing_field(p, mode, "ColorModes", 2);
 	if (colors < 0 || p->token[colors].count != 1)
 		goto done;
 	color = colors + 1;
