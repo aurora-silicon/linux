@@ -52,7 +52,7 @@
 
 &panel {
 	compatible = "apple,panel-j616", "apple,panel-mini-led", "apple,panel";
-	width-mm = <345>;
+	width-mm = <346>;
 	height-mm = <223>;
 	adj-height-mm = <216>;
 	/* "Wide color (P3)" in the Apple technical specifications */
