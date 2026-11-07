@@ -44,28 +44,28 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,t6000-atcphy"
-              - "apple,t6020-atcphy"
-              - "apple,t6030-atcphy"
-              - "apple,t6031-atcphy"
-              - "apple,t8103-atcphy"
-              - "apple,t8112-atcphy"
-              - "apple,t8122-atcphy"
-              - "apple,t8132-atcphy"
-              - "apple,t8140-atcphy"
-              - "apple,t8142-atcphy"
+              - apple,t6000-atcphy
+              - apple,t6020-atcphy
+              - apple,t6030-atcphy
+              - apple,t6031-atcphy
+              - apple,t8103-atcphy
+              - apple,t8112-atcphy
+              - apple,t8122-atcphy
+              - apple,t8132-atcphy
+              - apple,t8140-atcphy
+              - apple,t8142-atcphy
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
           items:
             -
-              const: "apple,t6050-atcphy"
+              const: apple,t6050-atcphy
             -
-              const: "apple,atcphy"
+              const: apple,atcphy
       required:
-        - "compatible"
+        - compatible
 
 properties:
   compatible: true
@@ -227,6 +227,16 @@ properties:
   resets: true
   status: true
 
+patternProperties:
+  "^apple,dp-training-table(-rbr|-hbr|-hbr2|-hbr3)?$":
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 16
+    maxItems: 16
+    description: >
+      Firmware-provided T8140 drive presets indexed by voltage swing times
+      four plus pre-emphasis. The unsuffixed table is the required fallback;
+      a link-rate suffix selects an optional rate-specific override.
+
 additionalProperties: true
 
 allOf:
@@ -237,39 +247,43 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-atcphy"
+                  const: apple,t6050-atcphy
                 -
-                  const: "apple,atcphy"
+                  const: apple,atcphy
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-atcphy"
+                  const: apple,t6050-atcphy
                 -
-                  const: "apple,atcphy"
+                  const: apple,atcphy
             status:
-              const: "disabled"
+              const: disabled
             reg:
               minItems: 44
               maxItems: 44
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
             power-domains:
               minItems: 7
               maxItems: 7
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "power-domains"
+            - compatible
+            - reg
+            - status
+            - power-domains
           additionalProperties: false
     else:
       allOf:

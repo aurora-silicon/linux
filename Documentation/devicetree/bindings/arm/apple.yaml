@@ -180,7 +180,7 @@ description: |
 
 properties:
   $nodename:
-    const: "/"
+    const: /
   compatible:
     oneOf:
       - description: Apple A7 SoC based platforms

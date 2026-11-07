@@ -23,28 +23,28 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,pmp"
-              - "apple,t6000-pmp-v2"
-              - "apple,t6020-pmp-v2"
-              - "apple,t6030-pmp-v2"
-              - "apple,t6031-pmp-v2"
-              - "apple,t6041-pmp-v2"
-              - "apple,t8103-pmp"
-              - "apple,t8122-pmp-v2"
-              - "apple,t8132-pmp-v2"
-              - "apple,t8140-pmp-v2"
+              - apple,pmp
+              - apple,t6000-pmp-v2
+              - apple,t6020-pmp-v2
+              - apple,t6030-pmp-v2
+              - apple,t6031-pmp-v2
+              - apple,t6041-pmp-v2
+              - apple,t8103-pmp
+              - apple,t8122-pmp-v2
+              - apple,t8132-pmp-v2
+              - apple,t8140-pmp-v2
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
           items:
             -
-              const: "apple,t6050-pmp"
+              const: apple,t6050-pmp
             -
-              const: "apple,pmp"
+              const: apple,pmp
       required:
-        - "compatible"
+        - compatible
 
 properties:
   compatible: true
@@ -94,6 +94,11 @@ properties:
   resets: true
   status: true
 
+patternProperties:
+  '^apple,tunable-':
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    description: Opaque firmware calibration copied from the Apple device tree.
+
 additionalProperties: true
 
 allOf:
@@ -104,31 +109,35 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-pmp"
+                  const: apple,t6050-pmp
                 -
-                  const: "apple,pmp"
+                  const: apple,pmp
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-pmp"
+                  const: apple,t6050-pmp
                 -
-                  const: "apple,pmp"
+                  const: apple,pmp
             status:
-              const: "disabled"
+              const: disabled
             reg:
               minItems: 4
               maxItems: 4
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
             interrupts:
               minItems: 4
               maxItems: 4
@@ -140,13 +149,13 @@ allOf:
             clocks:
               maxItems: 1
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "interrupts"
-            - "iommus"
-            - "power-domains"
-            - "clocks"
+            - compatible
+            - reg
+            - status
+            - interrupts
+            - iommus
+            - power-domains
+            - clocks
           additionalProperties: false
     else:
       properties:

@@ -28,35 +28,35 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,t6000-dart"
-              - "apple,t6000-display-dart"
-              - "apple,t6020-dart"
-              - "apple,t6030-dart"
-              - "apple,t6031-dart"
-              - "apple,t6041-dart"
-              - "apple,t6050-dart"
-              - "apple,t8103-dart"
-              - "apple,t8103-usb4-dart"
-              - "apple,t8110-dart"
-              - "apple,t8112-dart"
-              - "apple,t8122-dart"
-              - "apple,t8132-dart"
-              - "apple,t8140-ane-dart"
-              - "apple,t8140-dart"
-              - "apple,t8142-dart"
-              - "apple,t8152-dart"
+              - apple,t6000-dart
+              - apple,t6000-display-dart
+              - apple,t6020-dart
+              - apple,t6030-dart
+              - apple,t6031-dart
+              - apple,t6041-dart
+              - apple,t6050-dart
+              - apple,t8103-dart
+              - apple,t8103-usb4-dart
+              - apple,t8110-dart
+              - apple,t8112-dart
+              - apple,t8122-dart
+              - apple,t8132-dart
+              - apple,t8140-ane-dart
+              - apple,t8140-dart
+              - apple,t8142-dart
+              - apple,t8152-dart
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
           items:
             -
-              const: "apple,t6050-dart"
+              const: apple,t6050-dart
             -
-              const: "apple,t8110-dart"
+              const: apple,t8110-dart
       required:
-        - "compatible"
+        - compatible
 
 properties:
   compatible: true
@@ -155,31 +155,35 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-dart"
+                  const: apple,t6050-dart
                 -
-                  const: "apple,t8110-dart"
+                  const: apple,t8110-dart
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-dart"
+                  const: apple,t6050-dart
                 -
-                  const: "apple,t8110-dart"
+                  const: apple,t8110-dart
             status:
-              const: "disabled"
+              const: disabled
             reg:
               minItems: 1
               maxItems: 6
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
             interrupts:
               maxItems: 1
             power-domains:
@@ -187,22 +191,22 @@ allOf:
             "#iommu-cells":
               const: 1
             apple,dma-range:
-              $ref: "/schemas/types.yaml#/definitions/uint64-array"
+              $ref: /schemas/types.yaml#/definitions/uint64-array
               minItems: 2
               maxItems: 2
-              description: "Device-visible DMA base and size."
+              description: Device-visible DMA base and size.
             apple,dma-offset:
-              $ref: "/schemas/types.yaml#/definitions/uint64"
-              description: "Offset of the device-visible translation window."
+              $ref: /schemas/types.yaml#/definitions/uint64
+              description: Offset of the device-visible translation window.
             reg-names:
               minItems: 1
               maxItems: 5
             nonposted-mmio: true
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "interrupts"
+            - compatible
+            - reg
+            - status
+            - interrupts
             - "#iommu-cells"
           additionalProperties: false
     else:

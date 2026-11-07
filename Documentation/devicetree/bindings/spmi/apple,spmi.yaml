@@ -19,32 +19,32 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,spmi"
-              - "apple,t6000-spmi"
-              - "apple,t6020-spmi"
-              - "apple,t6030-spmi"
-              - "apple,t6031-spmi"
-              - "apple,t6041-spmi"
-              - "apple,t8012-spmi"
-              - "apple,t8015-spmi"
-              - "apple,t8103-spmi"
-              - "apple,t8112-spmi"
-              - "apple,t8122-spmi"
-              - "apple,t8132-spmi"
-              - "apple,t8140-spmi"
-              - "apple,t8142-spmi"
+              - apple,spmi
+              - apple,t6000-spmi
+              - apple,t6020-spmi
+              - apple,t6030-spmi
+              - apple,t6031-spmi
+              - apple,t6041-spmi
+              - apple,t8012-spmi
+              - apple,t8015-spmi
+              - apple,t8103-spmi
+              - apple,t8112-spmi
+              - apple,t8122-spmi
+              - apple,t8132-spmi
+              - apple,t8140-spmi
+              - apple,t8142-spmi
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
           items:
             -
-              const: "apple,t6050-spmi"
+              const: apple,t6050-spmi
             -
-              const: "apple,spmi"
+              const: apple,spmi
       required:
-        - "compatible"
+        - compatible
 
 properties:
   compatible: true
@@ -68,31 +68,35 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-spmi"
+                  const: apple,t6050-spmi
                 -
-                  const: "apple,spmi"
+                  const: apple,spmi
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-spmi"
+                  const: apple,t6050-spmi
                 -
-                  const: "apple,spmi"
+                  const: apple,spmi
             status:
-              const: "disabled"
+              const: disabled
             reg:
               minItems: 3
               maxItems: 3
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
             interrupts:
               maxItems: 1
             "#address-cells":
@@ -100,10 +104,10 @@ allOf:
             "#size-cells":
               const: 0
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "interrupts"
+            - compatible
+            - reg
+            - status
+            - interrupts
             - "#address-cells"
             - "#size-cells"
           additionalProperties: false

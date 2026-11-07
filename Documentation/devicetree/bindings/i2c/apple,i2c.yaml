@@ -23,34 +23,34 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,i2c"
-              - "apple,s5l8960x-i2c"
-              - "apple,s8000-i2c"
-              - "apple,t6000-i2c"
-              - "apple,t6020-i2c"
-              - "apple,t6030-i2c"
-              - "apple,t6031-i2c"
-              - "apple,t6041-i2c"
-              - "apple,t7000-i2c"
-              - "apple,t8010-i2c"
-              - "apple,t8015-i2c"
-              - "apple,t8103-i2c"
-              - "apple,t8112-i2c"
-              - "apple,t8122-i2c"
-              - "apple,t8132-i2c"
-              - "apple,t8140-i2c"
+              - apple,i2c
+              - apple,s5l8960x-i2c
+              - apple,s8000-i2c
+              - apple,t6000-i2c
+              - apple,t6020-i2c
+              - apple,t6030-i2c
+              - apple,t6031-i2c
+              - apple,t6041-i2c
+              - apple,t7000-i2c
+              - apple,t8010-i2c
+              - apple,t8015-i2c
+              - apple,t8103-i2c
+              - apple,t8112-i2c
+              - apple,t8122-i2c
+              - apple,t8132-i2c
+              - apple,t8140-i2c
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
           items:
             -
-              const: "apple,t6050-i2c"
+              const: apple,t6050-i2c
             -
-              const: "apple,t8103-i2c"
+              const: apple,t8103-i2c
       required:
-        - "compatible"
+        - compatible
 
 properties:
   compatible: true
@@ -78,30 +78,34 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-i2c"
+                  const: apple,t6050-i2c
                 -
-                  const: "apple,t8103-i2c"
+                  const: apple,t8103-i2c
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-i2c"
+                  const: apple,t6050-i2c
                 -
-                  const: "apple,t8103-i2c"
+                  const: apple,t8103-i2c
             status:
-              const: "disabled"
+              const: disabled
             reg:
               maxItems: 1
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
             interrupts:
               maxItems: 1
             power-domains:
@@ -113,12 +117,12 @@ allOf:
             "#size-cells":
               const: 0
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "interrupts"
-            - "power-domains"
-            - "clocks"
+            - compatible
+            - reg
+            - status
+            - interrupts
+            - power-domains
+            - clocks
             - "#address-cells"
             - "#size-cells"
           additionalProperties: false

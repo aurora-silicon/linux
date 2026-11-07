@@ -32,11 +32,11 @@ select:
         compatible:
           items:
             -
-              const: "apple,t6050-dptx-phy"
+              const: apple,t6050-dptx-phy
             -
-              const: "apple,dptx-phy"
+              const: apple,dptx-phy
       required:
-        - "compatible"
+        - compatible
 
 properties:
   compatible: true
@@ -59,38 +59,42 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-dptx-phy"
+                  const: apple,t6050-dptx-phy
                 -
-                  const: "apple,dptx-phy"
+                  const: apple,dptx-phy
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-dptx-phy"
+                  const: apple,t6050-dptx-phy
                 -
-                  const: "apple,dptx-phy"
+                  const: apple,dptx-phy
             status:
-              const: "disabled"
+              const: disabled
             reg:
               minItems: 2
               maxItems: 2
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
             power-domains:
               maxItems: 1
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "power-domains"
+            - compatible
+            - reg
+            - status
+            - power-domains
           additionalProperties: false
     else:
       properties:

@@ -22,37 +22,37 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,dcp"
-              - "apple,dcpext"
-              - "apple,t6000-dcp"
-              - "apple,t6000-dcpext"
-              - "apple,t6020-dcp"
-              - "apple,t6020-dcpext"
-              - "apple,t6031-dcp"
-              - "apple,t6041-dcp"
-              - "apple,t6041-dcpext"
-              - "apple,t8103-dcp"
-              - "apple,t8103-dcpext"
-              - "apple,t8112-dcp"
-              - "apple,t8112-dcpext"
-              - "apple,t8132-dcp"
-              - "apple,t8132-dcpext"
-              - "apple,t8132-dcpext-firmware-ready."
-              - "apple,t8140-dcp"
-              - "apple,t8140-dcpext"
-              - "apple,t8142-dcp"
+              - apple,dcp
+              - apple,dcpext
+              - apple,t6000-dcp
+              - apple,t6000-dcpext
+              - apple,t6020-dcp
+              - apple,t6020-dcpext
+              - apple,t6031-dcp
+              - apple,t6041-dcp
+              - apple,t6041-dcpext
+              - apple,t8103-dcp
+              - apple,t8103-dcpext
+              - apple,t8112-dcp
+              - apple,t8112-dcpext
+              - apple,t8132-dcp
+              - apple,t8132-dcpext
+              - apple,t8132-dcpext-firmware-ready.
+              - apple,t8140-dcp
+              - apple,t8140-dcpext
+              - apple,t8142-dcp
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
           items:
             -
-              const: "apple,t6050-dcp"
+              const: apple,t6050-dcp
             -
-              const: "apple,dcp"
+              const: apple,dcp
       required:
-        - "compatible"
+        - compatible
 
 properties:
   compatible: true
@@ -327,31 +327,35 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-dcp"
+                  const: apple,t6050-dcp
                 -
-                  const: "apple,dcp"
+                  const: apple,dcp
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-dcp"
+                  const: apple,t6050-dcp
                 -
-                  const: "apple,dcp"
+                  const: apple,dcp
             status:
-              const: "disabled"
+              const: disabled
             reg:
               minItems: 2
               maxItems: 2
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
             interrupts:
               minItems: 7
               maxItems: 8
@@ -364,12 +368,12 @@ allOf:
             clocks:
               maxItems: 1
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "interrupts"
-            - "iommus"
-            - "clocks"
+            - compatible
+            - reg
+            - status
+            - interrupts
+            - iommus
+            - clocks
           additionalProperties: false
     else:
       properties:

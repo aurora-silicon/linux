@@ -22,35 +22,35 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,pinctrl"
-              - "apple,s5l8960x-pinctrl"
-              - "apple,s8000-pinctrl"
-              - "apple,t6000-pinctrl"
-              - "apple,t6020-pinctrl"
-              - "apple,t6030-pinctrl"
-              - "apple,t6031-pinctrl"
-              - "apple,t6041-pinctrl"
-              - "apple,t7000-pinctrl"
-              - "apple,t8010-pinctrl"
-              - "apple,t8015-pinctrl"
-              - "apple,t8103-pinctrl"
-              - "apple,t8112-pinctrl"
-              - "apple,t8122-pinctrl"
-              - "apple,t8132-pinctrl"
-              - "apple,t8140-pinctrl"
-              - "apple,t8152-pinctrl"
+              - apple,pinctrl
+              - apple,s5l8960x-pinctrl
+              - apple,s8000-pinctrl
+              - apple,t6000-pinctrl
+              - apple,t6020-pinctrl
+              - apple,t6030-pinctrl
+              - apple,t6031-pinctrl
+              - apple,t6041-pinctrl
+              - apple,t7000-pinctrl
+              - apple,t8010-pinctrl
+              - apple,t8015-pinctrl
+              - apple,t8103-pinctrl
+              - apple,t8112-pinctrl
+              - apple,t8122-pinctrl
+              - apple,t8132-pinctrl
+              - apple,t8140-pinctrl
+              - apple,t8152-pinctrl
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
           items:
             -
-              const: "apple,t6050-pinctrl"
+              const: apple,t6050-pinctrl
             -
-              const: "apple,t8103-pinctrl"
+              const: apple,t8103-pinctrl
       required:
-        - "compatible"
+        - compatible
 
 properties:
   compatible: true
@@ -77,6 +77,23 @@ properties:
   resets: true
   status: true
 
+patternProperties:
+  '-pins$':
+    type: object
+    $ref: pinmux-node.yaml#
+
+    properties:
+      pinmux:
+        description:
+          Values are constructed from pin number and alternate function
+          configuration number using the APPLE_PINMUX() helper macro
+          defined in include/dt-bindings/pinctrl/apple.h.
+
+    required:
+      - pinmux
+
+    additionalProperties: false
+
 additionalProperties: true
 
 allOf:
@@ -87,38 +104,42 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-pinctrl"
+                  const: apple,t6050-pinctrl
                 -
-                  const: "apple,t8103-pinctrl"
+                  const: apple,t8103-pinctrl
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-pinctrl"
+                  const: apple,t6050-pinctrl
                 -
-                  const: "apple,t8103-pinctrl"
+                  const: apple,t8103-pinctrl
             status:
-              const: "disabled"
+              const: disabled
             reg:
               maxItems: 1
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
             interrupts:
               minItems: 7
               maxItems: 7
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "interrupts"
+            - compatible
+            - reg
+            - status
+            - interrupts
           additionalProperties: false
     else:
       properties:

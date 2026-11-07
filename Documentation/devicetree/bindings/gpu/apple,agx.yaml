@@ -17,32 +17,32 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,agx-g13c"
-              - "apple,agx-g13d"
-              - "apple,agx-g13g"
-              - "apple,agx-g13s"
-              - "apple,agx-g14c"
-              - "apple,agx-g14d"
-              - "apple,agx-g14g"
-              - "apple,agx-g14s"
-              - "apple,agx-t6040"
-              - "apple,agx-t6041"
-              - "apple,agx-t8103"
-              - "apple,agx-t8112"
-              - "apple,agx-t8132"
-              - "apple,agx-t8140"
+              - apple,agx-g13c
+              - apple,agx-g13d
+              - apple,agx-g13g
+              - apple,agx-g13s
+              - apple,agx-g14c
+              - apple,agx-g14d
+              - apple,agx-g14g
+              - apple,agx-g14s
+              - apple,agx-t6040
+              - apple,agx-t6041
+              - apple,agx-t8103
+              - apple,agx-t8112
+              - apple,agx-t8132
+              - apple,agx-t8140
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
           items:
             -
-              const: "apple,t6050-gpu"
+              const: apple,t6050-gpu
             -
-              const: "apple,gpu"
+              const: apple,gpu
       required:
-        - "compatible"
+        - compatible
 
 properties:
   compatible: true
@@ -171,31 +171,35 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-gpu"
+                  const: apple,t6050-gpu
                 -
-                  const: "apple,gpu"
+                  const: apple,gpu
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-gpu"
+                  const: apple,t6050-gpu
                 -
-                  const: "apple,gpu"
+                  const: apple,gpu
             status:
-              const: "disabled"
+              const: disabled
             reg:
               minItems: 2
               maxItems: 2
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
             interrupts:
               minItems: 8
               maxItems: 8
@@ -204,12 +208,12 @@ allOf:
             clocks:
               maxItems: 1
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "interrupts"
-            - "power-domains"
-            - "clocks"
+            - compatible
+            - reg
+            - status
+            - interrupts
+            - power-domains
+            - clocks
           additionalProperties: false
     else:
       properties:

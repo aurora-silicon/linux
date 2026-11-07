@@ -17,29 +17,29 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,spi"
-              - "apple,t6000-spi"
-              - "apple,t6020-spi"
-              - "apple,t6030-spi"
-              - "apple,t6031-spi"
-              - "apple,t6041-spi"
-              - "apple,t8103-spi"
-              - "apple,t8112-spi"
-              - "apple,t8122-spi"
-              - "apple,t8132-spi"
-              - "apple,t8140-spi"
+              - apple,spi
+              - apple,t6000-spi
+              - apple,t6020-spi
+              - apple,t6030-spi
+              - apple,t6031-spi
+              - apple,t6041-spi
+              - apple,t8103-spi
+              - apple,t8112-spi
+              - apple,t8122-spi
+              - apple,t8132-spi
+              - apple,t8140-spi
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
           items:
             -
-              const: "apple,t6050-spi"
+              const: apple,t6050-spi
             -
-              const: "apple,t8103-spi"
+              const: apple,t8103-spi
       required:
-        - "compatible"
+        - compatible
 
 properties:
   compatible: true
@@ -61,30 +61,34 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-spi"
+                  const: apple,t6050-spi
                 -
-                  const: "apple,t8103-spi"
+                  const: apple,t8103-spi
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-spi"
+                  const: apple,t6050-spi
                 -
-                  const: "apple,t8103-spi"
+                  const: apple,t8103-spi
             status:
-              const: "disabled"
+              const: disabled
             reg:
               maxItems: 1
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
             interrupts:
               maxItems: 1
             power-domains:
@@ -96,12 +100,12 @@ allOf:
             "#size-cells":
               const: 0
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "interrupts"
-            - "power-domains"
-            - "clocks"
+            - compatible
+            - reg
+            - status
+            - interrupts
+            - power-domains
+            - clocks
             - "#address-cells"
             - "#size-cells"
           additionalProperties: false

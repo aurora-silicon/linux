@@ -34,30 +34,30 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,t6000-sart"
-              - "apple,t6020-sart"
-              - "apple,t6030-sart"
-              - "apple,t6031-sart"
-              - "apple,t6041-sart"
-              - "apple,t8015-sart"
-              - "apple,t8103-sart"
-              - "apple,t8112-sart"
-              - "apple,t8122-sart"
-              - "apple,t8132-sart"
-              - "apple,t8140-sart"
-              - "apple,t8142-sart"
+              - apple,t6000-sart
+              - apple,t6020-sart
+              - apple,t6030-sart
+              - apple,t6031-sart
+              - apple,t6041-sart
+              - apple,t8015-sart
+              - apple,t8103-sart
+              - apple,t8112-sart
+              - apple,t8122-sart
+              - apple,t8132-sart
+              - apple,t8140-sart
+              - apple,t8142-sart
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
           items:
             -
-              const: "apple,t6050-sart"
+              const: apple,t6050-sart
             -
-              const: "apple,sart"
+              const: apple,sart
       required:
-        - "compatible"
+        - compatible
 
 properties:
   compatible: true
@@ -79,35 +79,39 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-sart"
+                  const: apple,t6050-sart
                 -
-                  const: "apple,sart"
+                  const: apple,sart
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-sart"
+                  const: apple,t6050-sart
                 -
-                  const: "apple,sart"
+                  const: apple,sart
             status:
-              const: "disabled"
+              const: disabled
             reg:
               minItems: 3
               maxItems: 3
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
           required:
-            - "compatible"
-            - "reg"
-            - "status"
+            - compatible
+            - reg
+            - status
           additionalProperties: false
     else:
       properties:

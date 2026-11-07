@@ -21,22 +21,22 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,secure-mailbox"
-              - "apple,t8140-secure-mailbox"
-              - "apple,t8142-secure-mailbox"
-              - "apple,t8152-secure-mailbox"
+              - apple,secure-mailbox
+              - apple,t8140-secure-mailbox
+              - apple,t8142-secure-mailbox
+              - apple,t8152-secure-mailbox
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
           items:
             -
-              const: "apple,t6050-secure-mailbox"
+              const: apple,t6050-secure-mailbox
             -
-              const: "apple,secure-mailbox"
+              const: apple,secure-mailbox
       required:
-        - "compatible"
+        - compatible
 
 properties:
   compatible: true
@@ -58,41 +58,45 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-secure-mailbox"
+                  const: apple,t6050-secure-mailbox
                 -
-                  const: "apple,secure-mailbox"
+                  const: apple,secure-mailbox
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-secure-mailbox"
+                  const: apple,t6050-secure-mailbox
                 -
-                  const: "apple,secure-mailbox"
+                  const: apple,secure-mailbox
             status:
-              const: "disabled"
+              const: disabled
             reg:
               maxItems: 1
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
             interrupts:
               minItems: 2
               maxItems: 2
             iommus:
               maxItems: 1
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "interrupts"
-            - "iommus"
+            - compatible
+            - reg
+            - status
+            - interrupts
+            - iommus
           additionalProperties: false
     else:
       properties:

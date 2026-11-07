@@ -29,28 +29,28 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,ane"
-              - "apple,t6000-ane"
-              - "apple,t6001-ane"
-              - "apple,t6020-ane"
-              - "apple,t6021-ane"
-              - "apple,t6022-ane"
-              - "apple,t6041-ane"
-              - "apple,t8103-ane"
-              - "apple,t8112-ane"
-              - "apple,t8140-ane"
+              - apple,ane
+              - apple,t6000-ane
+              - apple,t6001-ane
+              - apple,t6020-ane
+              - apple,t6021-ane
+              - apple,t6022-ane
+              - apple,t6041-ane
+              - apple,t8103-ane
+              - apple,t8112-ane
+              - apple,t8140-ane
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
           items:
             -
-              const: "apple,t6050-ane"
+              const: apple,t6050-ane
             -
-              const: "apple,ane"
+              const: apple,ane
       required:
-        - "compatible"
+        - compatible
 
 properties:
   compatible: true
@@ -142,31 +142,35 @@ allOf:
             compatible:
               items:
                 -
-                  const: "apple,t6050-ane"
+                  const: apple,t6050-ane
                 -
-                  const: "apple,ane"
+                  const: apple,ane
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
     then:
       oneOf:
         -
-          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          description: |
+            T6050 native resource description. Firmware ownership, backend support and enables require
+            separate qualification. This variant remains disabled and contains no programming sequences or
+            firmware data.
           properties:
             compatible:
               items:
                 -
-                  const: "apple,t6050-ane"
+                  const: apple,t6050-ane
                 -
-                  const: "apple,ane"
+                  const: apple,ane
             status:
-              const: "disabled"
+              const: disabled
             reg:
               minItems: 7
               maxItems: 7
-              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+              description: |
+                Native register apertures in hardware-interface order, including shared auxiliary views.
             interrupts:
               minItems: 2
               maxItems: 2
@@ -178,13 +182,13 @@ allOf:
             clocks:
               maxItems: 3
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "interrupts"
-            - "iommus"
-            - "power-domains"
-            - "clocks"
+            - compatible
+            - reg
+            - status
+            - interrupts
+            - iommus
+            - power-domains
+            - clocks
           additionalProperties: false
     else:
       properties:

@@ -1337,12 +1337,13 @@
 	};
 #endif
 
-#if defined(T6050_J714C) || defined(T6050_J714S) || defined(T6050_J716C) || defined(T6050_J716S) || defined(T6050_K114C) || defined(T6050_K114S) || defined(T6050_K116C) || defined(T6050_K116S)
+#if defined(T6050_J714C) || defined(T6050_J714S) || defined(T6050_J716C) || defined(T6050_J716S)
 	pwm0: pwm@505040000 {
 		compatible = "apple,t6050-fpwm", "apple,s5l-fpwm";
 		reg = <0x5 0x5040000 0x0 0x4000>;
-		interrupts = <AIC_IRQ 0 1384 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_fpwm0>;
+		interrupts = <AIC_IRQ 0 1384 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 1385 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_fpwm0>, <&ps_fpwm1>;
 		#pwm-cells = <2>;
 		status = "disabled";
 	};
@@ -3496,7 +3497,7 @@
 #endif
 
 #if defined(T6050_J714C) || defined(T6050_J714S) || defined(T6050_J716C) || defined(T6050_J716S) || defined(T6050_K114C) || defined(T6050_K114S) || defined(T6050_K116C) || defined(T6050_K116S)
-	admac_hp_mic_ec_proxy: dma-controller@4d3200000 {
+	admac_hp_mic_ec_proxy: dma-controller-hp-mic@4d3200000 {
 		compatible = "apple,t6050-admac-secure", "apple,admac-secure";
 		reg = <0x4 0xd3200000 0x0 0x34000>;
 		#dma-cells = <1>;
@@ -3505,21 +3506,10 @@
 #endif
 
 #if defined(T6050_J714C) || defined(T6050_J714S) || defined(T6050_J716C) || defined(T6050_J716S) || defined(T6050_K114C) || defined(T6050_K114S) || defined(T6050_K116C) || defined(T6050_K116S)
-	admac_sllb_ec_proxy: dma-controller@4d3200000 {
+	admac_sllb_ec_proxy: dma-controller-sllb@4d3200000 {
 		compatible = "apple,t6050-admac-secure", "apple,admac-secure";
 		reg = <0x4 0xd3200000 0x0 0x34000>;
 		#dma-cells = <1>;
-		status = "disabled";
-	};
-#endif
-
-#if defined(T6050_J714C) || defined(T6050_J714S) || defined(T6050_J716C) || defined(T6050_J716S) || defined(T6050_J775C) || defined(T6050_J775D) || defined(T6050_J873S)
-	pwm1: pwm@505040000 {
-		compatible = "apple,t6050-fpwm", "apple,s5l-fpwm";
-		reg = <0x5 0x5040000 0x0 0x4000>;
-		interrupts = <AIC_IRQ 0 1385 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_fpwm1>;
-		#pwm-cells = <2>;
 		status = "disabled";
 	};
 #endif
@@ -3764,6 +3754,17 @@
 	};
 #endif
 
+#if defined(T6050_J775C) || defined(T6050_J775D) || defined(T6050_J873S)
+	pwm1: pwm@505040000 {
+		compatible = "apple,t6050-fpwm", "apple,s5l-fpwm";
+		reg = <0x5 0x5040000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 1385 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_fpwm1>;
+		#pwm-cells = <2>;
+		status = "disabled";
+	};
+#endif
+
 #if defined(T6050_J775D)
 	nub_spmi_a2_control: spmi@28a1c8000 {
 		compatible = "apple,t6050-spmi", "apple,spmi";
@@ -3809,6 +3810,17 @@
 		reg = <0x5 0x5048000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 1386 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_fpwm2>;
+		#pwm-cells = <2>;
+		status = "disabled";
+	};
+#endif
+
+#if defined(T6050_K114C) || defined(T6050_K114S) || defined(T6050_K116C) || defined(T6050_K116S)
+	pwm0: pwm@505040000 {
+		compatible = "apple,t6050-fpwm", "apple,s5l-fpwm";
+		reg = <0x5 0x5040000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 1384 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_fpwm0>;
 		#pwm-cells = <2>;
 		status = "disabled";
 	};
