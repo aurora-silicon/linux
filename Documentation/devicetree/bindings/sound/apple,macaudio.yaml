@@ -33,6 +33,8 @@ properties:
               - apple,j457-macaudio
               - apple,j473-macaudio
               - apple,j493-macaudio
+              - apple,j575c-macaudio
+              - apple,j575c-macaudio-jack
               - apple,j614-macaudio
               - apple,j614-macaudio-jack
               - apple,j616-macaudio
@@ -40,6 +42,8 @@ properties:
               - apple,j700-macaudio
               - apple,j713-macaudio
               - apple,j713-macaudio-jack
+              - apple,j773-macaudio
+              - apple,j773-macaudio-jack
           - const: apple,macaudio
       - description:
           Machines that share the speaker and jack layout of an earlier
