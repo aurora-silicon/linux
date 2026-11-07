@@ -51,6 +51,8 @@ struct apple_dcp_typec_route {
 	/* Lower mux release is consumed even when idle programming fails. */
 	bool deactivate_xbar_done;
 	int deactivate_error;
+	/* Its crossbar output is down for a sleep, and not held. */
+	bool sleep_parked;
 };
 
 int dcp_typec_phy_on(struct apple_dcp *dcp);
@@ -111,6 +113,8 @@ bool dcp_is_t8132_ext(const struct apple_dcp *dcp);
 
 /* DCP probe, resume and endpoint teardown hooks. */
 int dcp_register_typec_routes(struct apple_dcp *dcp);
+void dcp_typec_route_park(struct apple_dcp *dcp);
+void dcp_typec_route_unpark(struct apple_dcp *dcp);
 void dcp_typec_routes_disable(struct apple_dcp *dcp);
 void dcp_typec_routes_disable_dev(struct device *dev);
 void dcp_typec_retrain_work(struct work_struct *work);

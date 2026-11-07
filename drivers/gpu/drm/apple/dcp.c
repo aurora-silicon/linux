@@ -7179,9 +7179,10 @@ static int dcp_s2r_ext_suspend(struct apple_dcp *dcp)
 		return 0;
 	}
 
-	/* No A500 and no disconnect: the link just goes down. */
+	/* No A500 and no disconnect: the link and its crossbar output just go down. */
 	if (dcp_s2r_stops_crashed(dcp)) {
 		dcp_disable_typec_work(dcp, false);
+		dcp_typec_route_park(dcp);
 		return dcp_s2r_stop_crashed(dcp);
 	}
 	if (READ_ONCE(dcp->crashed) || IS_ERR_OR_NULL(dcp->rtk))
