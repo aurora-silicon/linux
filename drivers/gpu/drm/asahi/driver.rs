@@ -535,6 +535,7 @@ impl AsahiPlatformDriver {
             _device: reg.device().into(),
             _reg: reg,
             g17: None,
+            m3: None,
             #[cfg(CONFIG_DRM_ASAHI_G16)]
             g16: None,
             raw_dev: core::ptr::null_mut(),
@@ -629,6 +630,7 @@ impl AsahiPlatformDriver {
                 _device: reg.device().into(),
                 _reg: reg,
                 g17: None,
+                m3: None,
                 #[cfg(CONFIG_DRM_ASAHI_G16)]
                 g16: None,
                 raw_dev: core::ptr::null_mut(),
