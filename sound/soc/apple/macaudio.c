@@ -2882,7 +2882,8 @@ struct macaudio_platform_cfg macaudio_j616_cfg = {
  * J614s: the same amps and frame as the J616s, but its speakers have not
  * been brought up and have no protection profile. Keep them off entirely
  * until they get their own bring-up: the speaker link is not bound, so no
- * stream ever reaches the amps.
+ * stream ever reaches the amps. The J604 (T8132, MacBook Pro 14" M4) has
+ * the same amps, frame and chassis, and is in the same state.
  */
 struct macaudio_platform_cfg macaudio_j614_cfg = {
 	.enable_speakers = false,
@@ -3039,6 +3040,10 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j575c-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* j613    AID20   sn012776    15      2x 1W+1T Compat: apple,j413-macaudio */
 	/* j615    AID21   sn012776    15      2x 2W+1T Compat: apple,j415-macaudio */
+	/* j604    -       sn012776    15      2x 2W+1T (AOP-fed; speakers off until bring-up) */
+	{ .compatible = "apple,j604-macaudio", .data = &macaudio_j614_cfg },
+	/* j604    -       cs42l84     -       the jack, a card of its own (AOP-fed) */
+	{ .compatible = "apple,j604-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* j614    AID34   sn012776    15      2x 2W+1T (AOP-fed; speakers off until bring-up) */
 	{ .compatible = "apple,j614-macaudio", .data = &macaudio_j614_cfg },
 	/* j614    AID34   cs42l84     -       the jack, a card of its own (AOP-fed) */
@@ -3047,6 +3052,10 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j616-macaudio", .data = &macaudio_j616_cfg },
 	/* j616    AID35   cs42l84     -       the jack, a card of its own (AOP-fed) */
 	{ .compatible = "apple,j616-macaudio-jack", .data = &macaudio_j616_jack_cfg },
+	/* j623    -       cs42l84     -       the jack only (AOP-fed) */
+	{ .compatible = "apple,j623-macaudio-jack", .data = &macaudio_j616_jack_cfg },
+	/* j624    -       cs42l84     -       the jack only (AOP-fed) */
+	{ .compatible = "apple,j624-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* j700    AID44   max98360a   -       2x 1W    (AOP-fed, software gain) */
 	{ .compatible = "apple,j700-macaudio", .data = &macaudio_j700_cfg },
 	/* j713    -       sn012776    15      2x 1W+1T (AOP-fed, one serializer) */

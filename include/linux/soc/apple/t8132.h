@@ -17,4 +17,46 @@ static inline bool apple_t8132_air(void)
 	       of_machine_is_compatible("apple,j715");
 }
 
+/*
+ * The other M4 Macs: the MacBook Pro 14-inch (J604), the Mac mini (J773g)
+ * and the iMacs (J623, J624). The J604 and J773g ADTs are read; the iMacs
+ * have none yet.
+ */
+static inline bool apple_t8132_pro_mini_imac(void)
+{
+	return of_machine_is_compatible("apple,j604") ||
+	       of_machine_is_compatible("apple,j623") ||
+	       of_machine_is_compatible("apple,j624") ||
+	       of_machine_is_compatible("apple,j773g");
+}
+
+/*
+ * The radio port the Airs have: reg-on on the SMC's gP13 with the same
+ * template, and the radio's two ordinary streams managed on port 0 of the
+ * built-in PCIe controller. The J604 and J773g ADTs match; the iMacs are
+ * assumed to.
+ */
+static inline bool apple_t8132_managed_radio(void)
+{
+	return apple_t8132_air() || apple_t8132_pro_mini_imac();
+}
+
+/*
+ * The Airs' USB-C host sequence: a DWC3 enters host mode before core init
+ * and gets the CIO setup before xHCI starts. Every M4 Mac has these ATCs.
+ */
+static inline bool apple_t8132_usb_host_first(void)
+{
+	return apple_t8132_air() || apple_t8132_pro_mini_imac();
+}
+
+/*
+ * The Airs' MTP keyboard and trackpad, which iBoot leaves running: the
+ * J604 has the same.
+ */
+static inline bool apple_t8132_live_mtp(void)
+{
+	return apple_t8132_air() || of_machine_is_compatible("apple,j604");
+}
+
 #endif
