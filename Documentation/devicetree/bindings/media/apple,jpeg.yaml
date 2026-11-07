@@ -27,7 +27,6 @@ select:
           - apple,t6041-jpeg
           - apple,t8140-jpeg
           - apple,t8132-jpeg
-          - apple,jpeg
   required:
     - compatible
 

@@ -19,7 +19,6 @@ select:
       contains:
         enum:
           - apple,t6041-pcie-piodma
-          - apple,pcie-piodma
           - apple,t8132-pcie-piodma
   required:
     - compatible

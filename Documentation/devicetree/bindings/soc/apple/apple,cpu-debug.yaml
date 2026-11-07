@@ -19,7 +19,6 @@ select:
       contains:
         enum:
           - apple,t6041-cpu-debug
-          - apple,cpu-debug
           - apple,t8132-cpu-debug
   required:
     - compatible
