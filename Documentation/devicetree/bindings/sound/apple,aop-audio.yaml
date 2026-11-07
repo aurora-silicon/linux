@@ -38,7 +38,6 @@ properties:
   "compatible": true
   dmas: true
   dma-names: true
-    const: dma
   apple,chassis-name:
     $ref: /schemas/types.yaml#/definitions/string
     description: Board family used to identify the audio configuration.
