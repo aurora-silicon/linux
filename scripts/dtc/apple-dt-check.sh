@@ -17,7 +17,8 @@ warnings() { # rev tag
 	local rc=$?
 	grep -E '\.dtb: |[Ww]arning|rror' "$W/$2.log" | grep -v '^  ' |
 		sed -E "s#$t/##g; s#$o/##g" |
-		perl -pe 's{(\[\[[^:]*?\]\])}{(my $x = $1) =~ s/\d+/N/g; $x}ge' | sort -u > "$W/$2.warn"
+		perl -pe 's{(\[\[[^:]*?\]\])}{(my $x = $1) =~ s/\d+/N/g; $x}ge; s{b\x27(?:\\.|[^\x27])*\x27}{b\x27N\x27}g' |
+		sort -u > "$W/$2.warn"
 	echo "$2: make rc=$rc, $(wc -l < "$W/$2.warn") warning lines, $(echo $dtbs | wc -w) DTBs"
 	return $rc
 }
