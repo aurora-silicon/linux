@@ -4133,6 +4133,17 @@ static int apple_dart_probe(struct platform_device *pdev)
 		of_machine_is_compatible("apple,t8132") &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 		res->start == 0x490000000ULL;
+	/*
+	 * Off the qualified firmware nothing hands the internal display DARTs
+	 * over, but the running DCP still uses them: never reset them.
+	 */
+	if (res && !tunneled && !apple_t8132_firmware_path() &&
+	    of_machine_is_compatible("apple,t8132") &&
+	    of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
+	    (res->start == 0x30a300000ULL || res->start == 0x30a340000ULL)) {
+		dev_info(dev, "Leaving inherited display DART untouched off the qualified firmware\n");
+		return -ENODEV;
+	}
 	if (j713_display && !IS_ENABLED(CONFIG_APPLE_DART_J713_DCP))
 		return dev_err_probe(dev, -EOPNOTSUPP,
 				     "retained J713 display requires CONFIG_APPLE_DART_J713_DCP=y\n");
