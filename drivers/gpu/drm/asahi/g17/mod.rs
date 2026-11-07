@@ -1488,6 +1488,16 @@ impl Gpu {
         }
         let m5 = cfg.profile.is_m5();
         if m5 {
+            // The M5 graph builds only the 26A428 InitData layouts. A firmware that checks
+            // another layout is refused here, before anything is written to the GPU.
+            if variant.m5_layouts != Some(fw::variant::M5Layouts::V26A428) {
+                dev_err!(
+                    dev.as_ref(),
+                    "No M5 InitData layouts for this GPU firmware build ({:?})\n",
+                    variant.m5_layouts
+                );
+                return Err(ENODEV);
+            }
             let board = cfg.m5.ok_or(EINVAL)?;
             // The M5 layouts are sized for every core slot of the board, fused-off cores
             // included, so the GPU is matched on clusters and slots, not on enabled cores.

@@ -36,6 +36,17 @@ pub(crate) enum InitGraph {
     V25G83,
 }
 
+/// The InitData layouts of an M5 firmware build ([`super::m5::initdata`]). The 27.2 and later
+/// layouts are not yet confirmed from captured InitData.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum M5Layouts {
+    /// The 26A428 graph: version word 0x0c8e_0339_8728_04c0 and its allocation sizes.
+    V26A428,
+    /// The 27.2 (26B123) graph: version word 0x0c8e_4339_8728_04c0, a larger power policy
+    /// (0x12728) and status config (0x790), the 26A428 HW data.
+    V26B123,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum QueueRegistration {
     Firmware,
@@ -87,6 +98,8 @@ pub(crate) struct Variant {
     /// work. The bare-metal M5 firmware powers the cores for work by its own policy: under a
     /// hold, the M5 Ultra's core-power witness reads unpowered until the hold is released.
     pub(crate) registration_power_hold: bool,
+    /// The InitData layouts the M5 graph must build for this firmware; `None` off M5.
+    pub(crate) m5_layouts: Option<M5Layouts>,
 }
 
 /// A firmware build a SoC supports, identified by its loaded TEXT.
@@ -137,6 +150,7 @@ pub(crate) const V26A428: Variant = Variant {
     split_firmware_area: false,
     m5_commands: false,
     registration_power_hold: true,
+    m5_layouts: None,
 };
 
 /// The M4 Pro firmware (25G83, `mBoot-18000.161.10`).
@@ -171,6 +185,7 @@ pub(crate) const V25G83: Variant = Variant {
     split_firmware_area: false,
     m5_commands: false,
     registration_power_hold: true,
+    m5_layouts: None,
 };
 
 /// The 26A428 firmware of the M5 GPUs, which runs the M5 protocol (the M5 graph, queues and
@@ -179,7 +194,14 @@ pub(crate) const V26A428_M5: Variant = Variant {
     m5_commands: true,
     render_ray_query: false,
     registration_power_hold: false,
+    m5_layouts: Some(M5Layouts::V26A428),
     ..V26A428
+};
+
+/// The 27.2 M5 firmware (26B123): the 26A428 M5 protocol with the 26B123 InitData layouts.
+pub(crate) const V26B123_M5: Variant = Variant {
+    m5_layouts: Some(M5Layouts::V26B123),
+    ..V26A428_M5
 };
 
 pub(crate) const V25F84: Variant = Variant {
