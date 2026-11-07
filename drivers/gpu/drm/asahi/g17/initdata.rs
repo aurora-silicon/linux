@@ -157,8 +157,9 @@ impl WorkPublication<'_> {
 
 /// Session-long storage and mappings. Aliases are released before their backing objects.
 pub(super) struct InitData {
-    // Live publication uses interior writes under the device mutex. This owner is Send but not
-    // Sync, so safe host code cannot issue those writes concurrently through shared references.
+    // Live effort publication uses interior writes under the device mutex. Power-ceiling
+    // fields are handed to the cooling owner and serialized by its separate mutex. This owner
+    // is Send but not Sync; safe host code cannot publish effort concurrently through &self.
     _single_publisher: core::marker::PhantomData<core::cell::Cell<()>>,
     aliases: KVec<mmu::KernelMapping>,
     objects: KVec<KernelObject>,
@@ -166,6 +167,7 @@ pub(super) struct InitData {
     cluster: usize,
     bundle: usize,
     region_c: usize,
+    power_state: Option<(usize, usize)>,
     qos: usize,
     pb: usize,
     page_pool: usize,
@@ -269,6 +271,7 @@ impl InitData {
             cluster: 0,
             bundle: 0,
             region_c: 0,
+            power_state: None,
             qos: 0,
             pb: 0,
             page_pool: 0,
@@ -1193,6 +1196,10 @@ impl InitData {
             .write(abi::private::PRIMARY_STATUS_A, abi::StatusBlock::new())?;
         self.object_mut(self.cluster)?
             .write(abi::private::SECONDARY_STATUS_A, abi::StatusBlock::new())?;
+        self.power_state = Some((
+            self.cluster,
+            abi::private::STATUS_B + abi::PrimaryStatusB::POWER_STATE,
+        ));
         let fwctl_va = self.object(tables.fwctl)?.gpu_va();
         self.object_mut(self.cluster)?
             .initialize::<abi::PrimaryStatusB>(abi::private::STATUS_B, |status| {
@@ -1355,6 +1362,28 @@ impl InitData {
             options(nostack, preserves_flags))
         };
         Ok(())
+    }
+
+    /// Resolve typed fields from their retained objects before any store.
+    pub(super) fn cooling_words(
+        &self,
+        layout: &super::cooling::Layout,
+    ) -> Result<super::cooling::PowerWords> {
+        let super::cooling::Layout::Common = layout;
+        let region = self.object(self.region_c)?;
+        let (index, offset) = self.power_state.ok_or(EOPNOTSUPP)?;
+        let power = self.object(index)?;
+        Ok(super::cooling::PowerWords {
+            max_power_mw: region
+                .pointer(core::mem::offset_of!(abi::RegionC, max_power_mw), 4)?
+                .cast(),
+            ppm_enabled: power
+                .pointer(offset + core::mem::offset_of!(abi::PowerState, ppm_enabled), 4)?
+                .cast(),
+            ppm_target_mw: power
+                .pointer(offset + core::mem::offset_of!(abi::PowerState, ppm_target_mw), 4)?
+                .cast(),
+        })
     }
 
     pub(super) fn effort(&self) -> Result<u32> {
