@@ -29,3 +29,19 @@ pub(crate) fn select_board(board: &crate::g17::fw::m5::initdata::Board) {
 pub(crate) fn per_owner() -> u8 {
     PAIRS.load(Relaxed)
 }
+
+/// Renders a busy pair of a two-pair owner takes before its next render goes to
+/// an idle sibling: 1 keeps a queue at depth 1-2 on one pair.
+const SIBLING_BACKLOG: u8 = 1;
+static BACKLOG: AtomicU8 = AtomicU8::new(SIBLING_BACKLOG);
+
+/// A two-pair owner's next render stays on its least-loaded busy pair while
+/// that pair holds at most this many renders.
+pub(crate) fn sibling_backlog() -> u8 {
+    BACKLOG.load(Relaxed)
+}
+
+#[cfg(CONFIG_KUNIT = "y")]
+pub(crate) fn set_sibling_backlog(renders: u8) {
+    BACKLOG.store(renders, Relaxed);
+}
