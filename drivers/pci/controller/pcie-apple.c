@@ -40,6 +40,7 @@
 #include <linux/rcupdate.h>
 #include <linux/reset.h>
 #include <linux/soc/apple/dart.h>
+#include <linux/soc/apple/t8132.h>
 #include <linux/soc/apple/tunable.h>
 #include <linux/suspend.h>
 
@@ -66,6 +67,8 @@ module_param(s2idle_keep_link, bool, 0644);
 MODULE_PARM_DESC(s2idle_keep_link, "Keep tunneled links up through suspend-to-idle");
 
 static int link_up_timeout = 500;
+/* Fundamental resets of a conventional port whose endpoint does not train. */
+#define LINK_RESET_RETRIES	2
 module_param(link_up_timeout, int, 0644);
 MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 
@@ -88,6 +91,7 @@ MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 #define   PHY_LANE_CFG_REFCLK1REQ	BIT(1)
 #define   PHY_LANE_CFG_REFCLK0ACK	BIT(2)
 #define   PHY_LANE_CFG_REFCLK1ACK	BIT(3)
+#define   PHY_LANE_CFG_REFBUF_OFF	BIT(4)
 #define   PHY_LANE_CFG_REFCLKEN		(BIT(9) | BIT(10))
 #define   PHY_LANE_CFG_REFCLKCGEN	(BIT(30) | BIT(31))
 #define PHY_LANE_CTL			0x00004
@@ -172,6 +176,10 @@ MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 #define PORT_T602X_MSIADDR	0x016c
 #define PORT_T602X_MSIADDR_HI	0x0170
 #define PORT_T602X_PERST	0x082c
+/* T8152: lane PIPE reset is released by clearing this after PERST#. */
+#define   PORT_T8152_PIPE_RST	BIT(16)
+#define PORT_T8152_PIPE_RST_STS	0x00a8
+#define   PORT_T8152_PIPE_RST_STS_LANES	GENMASK(3, 0)
 #define PORT_T602X_RID2SID	0x3000
 #define PORT_T602X_MSIMAP	0x3800
 
@@ -209,6 +217,13 @@ struct hw_info {
 	 * keeps its link while the domain stays on, see apple_pcie_hold_domain().
 	 */
 	bool s2idle_hold_domain;
+	/* AppleT8152PCIePort::_initializeRefclkBuffer clears REFBUF_OFF. */
+	bool refbuf_off;
+	/*
+	 * APCIECoreRCGen5Port::enablePortHardware: after PERST#, wait for the
+	 * lane PIPE reset status, then release PORT_T8152_PIPE_RST.
+	 */
+	bool pipe_rst;
 };
 
 static const struct hw_info t8103_hw = {
@@ -250,6 +265,20 @@ static const struct hw_info t8140_hw = {
 	.sid_indexed_rid2sid	= true,
 	.retain_clocks		= true,
 	.root_bus_only		= true,
+};
+
+/* T8152 (M6) apcie: T602x port layout, refclk buffer powered down by iBoot. */
+static const struct hw_info t8152_hw = {
+	.phy_lane_ctl		= 0,
+	.port_msiaddr		= PORT_T602X_MSIADDR,
+	.port_msiaddr_hi	= PORT_T602X_MSIADDR_HI,
+	.port_refclk		= 0,
+	.port_perst		= PORT_T602X_PERST,
+	.port_rid2sid		= PORT_T602X_RID2SID,
+	.port_msimap		= PORT_T602X_MSIMAP,
+	.max_rid2sid		= 512,
+	.refbuf_off		= true,
+	.pipe_rst		= true,
 };
 
 static const struct hw_info t8103_pciec_hw = {
@@ -396,6 +425,8 @@ struct apple_pcie_port {
 	struct device_node	*np;
 	void __iomem		*base;
 	void __iomem		*phy;
+	/* PERST# of a conventional port with a single reset line. */
+	struct gpio_desc	*perst;
 	struct irq_domain	*domain;
 	struct list_head	entry;
 	unsigned long		*sid_map;
@@ -1521,6 +1552,11 @@ static int apple_pcie_setup_refclk(struct apple_pcie *pcie,
 	if (pcie->hw->phy_lane_ctl)
 		rmw_clear(PHY_LANE_CTL_CFGACC, port->phy + pcie->hw->phy_lane_ctl);
 
+	if (pcie->hw->refbuf_off) {
+		rmw_clear(PHY_LANE_CFG_REFBUF_OFF, port->phy + PHY_LANE_CFG);
+		udelay(1);
+	}
+
 	rmw_set(PHY_LANE_CFG_REFCLKEN, port->phy + PHY_LANE_CFG);
 
 	if (pcie->hw->port_refclk)
@@ -1581,6 +1617,8 @@ static int apple_pcie_setup_link(struct apple_pcie *pcie,
 		num_aux_resets++;
 	}
 	dev_info(pcie->dev, "Using %u auxiliary PERST#\n", num_aux_resets);
+	if (!num_aux_resets)
+		port->perst = reset;
 
 	pwren = devm_fwnode_gpiod_get(pcie->dev, of_fwnode_handle(np), "pwren",
 					    GPIOD_ASIS, "PWREN");
@@ -1635,6 +1673,17 @@ static int apple_pcie_setup_link(struct apple_pcie *pcie,
 	for (u32 idx = 0; idx < num_aux_resets; idx++)
 		gpiod_set_value_cansleep(aux_reset[idx], 0);
 
+	if (pcie->hw->pipe_rst) {
+		ret = readl_relaxed_poll_timeout(port->base + PORT_T8152_PIPE_RST_STS,
+						 stat, stat & PORT_T8152_PIPE_RST_STS_LANES,
+						 1, 20000);
+		if (ret < 0) {
+			dev_err(pcie->dev, "port %pOF lanes stuck in PIPE reset\n", np);
+			return ret;
+		}
+		rmw_clear(PORT_T8152_PIPE_RST, port->base + pcie->hw->port_perst);
+	}
+
 	/* Wait for 100ms after PERST# deassertion (PCIe r5.0, 6.6.1) */
 	msleep(100);
 
@@ -1646,6 +1695,45 @@ static int apple_pcie_setup_link(struct apple_pcie *pcie,
 	}
 
 	return 0;
+}
+
+/* DesignWare port logic, in the root port's configuration space. */
+#define DWC_PORT_DEBUG0			0x728
+#define   DWC_PORT_DEBUG0_LTSSM		GENMASK(5, 0)
+
+static u32 apple_pcie_port_ltssm(struct apple_pcie *pcie,
+				 struct apple_pcie_port *port)
+{
+	return FIELD_GET(DWC_PORT_DEBUG0_LTSSM,
+			 readl_relaxed(pcie->cfg->win + (port->idx << 15) +
+				       DWC_PORT_DEBUG0));
+}
+
+/*
+ * Give an endpoint that did not train another fundamental reset: stop the
+ * LTSSM, assert PERST#, and release it with the timing of the first bring-up
+ * (Tperst of at least 100 us, PCIe CEM r5.0 2.9.2; 100 ms before
+ * configuration, PCIe r5.0 6.6.1).
+ */
+static int apple_pcie_port_reset_endpoint(struct apple_pcie *pcie,
+					  struct apple_pcie_port *port)
+{
+	u32 stat;
+	int ret;
+
+	apple_pcie_port_rmw_clear(port, PORT_LTSSMCTL_START, PORT_LTSSMCTL);
+	rmw_clear(PORT_PERST_OFF, port->base + pcie->hw->port_perst);
+	ret = gpiod_set_value_cansleep(port->perst, 1);
+	if (ret)
+		return ret;
+	usleep_range(100, 200);
+	rmw_set(PORT_PERST_OFF, port->base + pcie->hw->port_perst);
+	ret = gpiod_set_value_cansleep(port->perst, 0);
+	if (ret)
+		return ret;
+	msleep(100);
+	return readl_relaxed_poll_timeout(port->base + PORT_STATUS, stat,
+					  stat & PORT_STATUS_READY, 100, 250000);
 }
 
 static int apple_pcie_setup_port(struct apple_pcie *pcie,
@@ -1861,16 +1949,46 @@ rid2sid_ready:
 				goto err_teardown;
 		}
 
+		/*
+		 * In about one boot in seven the J616s SD reader is detected
+		 * but sends no training sets after the first PERST# release,
+		 * and the LTSSM parks in Polling.Compliance. A Retrain Link
+		 * from the root port does not recover it; a new fundamental
+		 * reset does.
+		 */
+		if (!pcie->hw->tunneled && port->perst)
+			attempts = 1 + LINK_RESET_RETRIES;
+
 		timeout = link_up_timeout * HZ / 1000;
 		for (attempt = 0; attempt < attempts; attempt++) {
-			if (attempt)
+			if (attempt && pcie->hw->tunneled)
 				reinit_completion(&pcie->event);
 			apple_pcie_port_writel(port, PORT_LTSSMCTL_START,
 					       PORT_LTSSMCTL);
 			left = wait_for_completion_timeout(&pcie->event, timeout);
+			if (!left && (apple_pcie_port_readl(port, PORT_LINKSTS) &
+				      PORT_LINKSTS_UP))
+				left = 1;
 			if (left)
 				break;
-			dev_warn(pcie->dev, "%pOF link didn't come up\n", np);
+			if (pcie->hw->tunneled || attempt + 1 == attempts) {
+				dev_warn(pcie->dev,
+					 "%pOF link didn't come up (LTSSM %#x)\n",
+					 np, pcie->hw->tunneled ? 0 :
+					 apple_pcie_port_ltssm(pcie, port));
+				continue;
+			}
+			dev_info(pcie->dev,
+				 "%pOF link down after %dms (LTSSM %#x), resetting the endpoint\n",
+				 np, link_up_timeout, apple_pcie_port_ltssm(pcie, port));
+			/* A link-up during the reset must not be lost. */
+			reinit_completion(&pcie->event);
+			ret = apple_pcie_port_reset_endpoint(pcie, port);
+			if (ret) {
+				dev_warn(pcie->dev, "%pOF endpoint reset failed: %d\n",
+					 np, ret);
+				break;
+			}
 		}
 		if (left)
 			dev_info(pcie->dev, "%pOF link up after %ldms\n", np,
@@ -3003,7 +3121,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 		int count = of_property_count_u32_elems(dev->of_node, "apple,managed-sids");
 
 		if (!of_device_is_compatible(dev->of_node, "apple,t8132-pcie") ||
-		    !of_machine_is_compatible("apple,j713") || count <= 0 || count > 15)
+		    !apple_t8132_managed_radio() || count <= 0 || count > 15)
 			return -EINVAL;
 		ret = of_property_read_u32_array(dev->of_node, "apple,managed-sids", ids, count);
 		if (!ret && (count != 2 || ids[0] != 1 || ids[1] != 2))
@@ -3941,6 +4059,7 @@ static const struct of_device_id apple_pcie_of_match[] = {
 	{ .compatible = "apple,t6000-pciec",	.data = &t8112_pciec_hw },
 	/* T8132 currently inherits controller and PHY setup from m1n1. */
 	{ .compatible = "apple,t8132-pcie",	.data = &t602x_hw },
+	{ .compatible = "apple,t8152-pcie",	.data = &t8152_hw },
 	{ .compatible = "apple,t6020-pcie",	.data = &t602x_hw },
 	{ .compatible = "apple,t8140-pcie",	.data = &t8140_hw },
 	{ .compatible = "apple,pcie",		.data = &t8103_hw },

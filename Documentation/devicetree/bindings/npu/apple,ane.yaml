@@ -23,15 +23,19 @@ description:
 
 properties:
   compatible:
-    enum:
-      - apple,t8103-ane
-      - apple,t6000-ane
-      - apple,t6020-ane
-      - apple,t6021-ane
-      - apple,t6022-ane
-      - apple,t6041-ane
-      - apple,t8112-ane
-      - apple,t8140-ane
+    oneOf:
+      - enum:
+          - apple,t8103-ane
+          - apple,t6000-ane
+          - apple,t6020-ane
+          - apple,t6021-ane
+          - apple,t6022-ane
+          - apple,t6041-ane
+          - apple,t8112-ane
+          - apple,t8140-ane
+      - items:
+          - const: apple,t6001-ane
+          - const: apple,ane
 
   reg:
     minItems: 1
@@ -44,6 +48,11 @@ properties:
       - description: Third auxiliary window
       - description: Fourth auxiliary window
       - description: Fifth auxiliary window
+
+  clocks:
+    minItems: 4
+    maxItems: 4
+    description: Native secondary-engine clock selectors in hardware-description order.
 
   reg-names:
     minItems: 1
@@ -144,12 +153,6 @@ properties:
       Firmware accesses these registers through identity mappings of the
       containing 16 KiB pages in its private domain. These are MMIO ranges,
       not allocatable DMA memory or additional preload segments.
-
-  apple,dapf-ranges:
-    $ref: /schemas/types.yaml#/definitions/uint64-array
-    minItems: 8
-    maxItems: 8
-    description: Four inclusive SID0 physical MMIO start/end pairs
 
   apple,preload-data-sha256:
     $ref: /schemas/types.yaml#/definitions/uint8-array
@@ -319,8 +322,6 @@ allOf:
       properties:
         interrupts:
           maxItems: 1
-        power-domains:
-          minItems: 5
         reg:
           maxItems: 4
         reg-names:
@@ -401,6 +402,37 @@ allOf:
         memory-region: false
       required:
         - mboxes
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8140-ane
+              - apple,t6041-ane
+              - apple,t6001-ane
+    else:
+      properties:
+        power-domains:
+          minItems: 5
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6001-ane
+    then:
+      properties:
+        reg:
+          maxItems: 1
+        reg-names:
+          maxItems: 1
+        power-domains:
+          maxItems: 1
+      required:
+        - clocks
+    else:
+      properties:
+        clocks: false
 
 additionalProperties: false
 

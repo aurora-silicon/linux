@@ -45,7 +45,9 @@ def parser_fixture(root):
     source = (base / 'parser.c').read_text()
     parser = source[source.index('#define DCP_PARSE_HEADER'):source.index('int parse_epic_service_init(')]
     metadata = (base / 'dcp-display-metadata.h').read_text()
-    metadata = block(metadata, 'struct dcp_display_metadata {') + ';\n'
+    metadata = (block(metadata, 'struct dcp_display_metadata {') + ';\n' +
+                block(metadata, 'enum dcp_panel_gamut {') + ';\n' +
+                block(metadata, 'struct dcp_color_space {') + ';\n')
     header = (base / 'parser.h').read_text()
     header = header[header.index('struct apple_dcp;'):header.index('int parse(')]
     refresh = (base / 'dcp-refresh.h').read_text().replace('#include <linux/types.h>', '')
@@ -556,6 +558,8 @@ struct apple_dcp {
     struct dcp_display_mode *modes;
     struct { bool holding, stopped; } announce;
     bool ext_backlight, has_panel;
+    /* External pipes carry no internal panel identity. */
+    void *panel_identity;
 };
 struct rate_guard { bool *lock; };
 static struct rate_guard rate_lock(bool *p) { assert(!*p);*p=true;return (struct rate_guard){p}; }

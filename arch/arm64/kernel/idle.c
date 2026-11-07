@@ -53,9 +53,21 @@ static bool apple_wfi_loses_regs __ro_after_init;
 
 void __init apple_wfi_quirk_init(void)
 {
+	u32 model = read_cpuid_id() & MIDR_CPU_MODEL_MASK;
+
 	if (midr_is_apple_m4_or_later(read_cpuid_id())) {
 		apple_wfi_loses_regs = true;
 		pr_info("Apple: preserving registers across WFI\n");
+	}
+	/*
+	 * aura passes idle=nop on M5 for kernels without this quirk. Spinning
+	 * idle keeps all ten cores busy (cpuidle's WFI state spins too), and
+	 * the SoC sits near 90 C and throttles; WFI is safe here.
+	 */
+	if (idle == ARM64_IDLE_NOP &&
+	    (model == MIDR_APPLE_T8142_E || model == MIDR_APPLE_T8142_P)) {
+		idle = ARM64_IDLE_WFI;
+		pr_info("Apple: T8142 idles in WFI, ignoring idle=nop\n");
 	}
 }
 

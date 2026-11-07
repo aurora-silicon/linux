@@ -24,26 +24,41 @@ RUST_HEADER = r'''
 #![allow(dead_code)]
 extern crate self as kernel;
 mod prelude {
+    pub type Error = i32;
     pub type Result<T = ()> = std::result::Result<T, i32>;
     pub const EIO: i32 = -5;
     pub const EAGAIN: i32 = -11;
+    pub const GFP_KERNEL: u32 = 0;
+    pub struct KVec<T>(Vec<T>);
+    impl<T> KVec<T> {
+        pub fn with_capacity(n:usize,_:u32)->Result<Self> { Ok(Self(Vec::with_capacity(n))) }
+        pub fn push(&mut self,v:T,_:u32)->Result { self.0.push(v);Ok(()) }
+    }
+    impl<T> core::ops::Deref for KVec<T> { type Target=[T];fn deref(&self)->&[T] { &self.0 } }
+    impl<T> core::ops::DerefMut for KVec<T> { fn deref_mut(&mut self)->&mut [T] { &mut self.0 } }
+}
+mod sync { pub use std::sync::Arc; }
+mod debugfs {
+    pub trait Writer { fn write(&self, f:&mut std::fmt::Formatter<'_>)->std::fmt::Result; }
 }
 mod device {
     pub struct Device;
+    impl Device { pub fn name(&self)->&std::ffi::CStr { std::ffi::CStr::from_bytes_with_nul(b"test.gpu\0").unwrap() } }
     impl AsRef<Device> for Device { fn as_ref(&self) -> &Device { self } }
 }
 mod fmt { pub use std::fmt::*; }
 macro_rules! dev_err { ($dev:expr, $($t:tt)*) => { let _ = ($dev, format_args!($($t)*)); }; }
 mod g17 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NOW: AtomicU64 = AtomicU64::new(1);
-    fn now_ns() -> u64 { NOW.load(Ordering::Relaxed) }
+    use std::sync::atomic::Ordering;
+    // Per test thread, so a test that moves the clock cannot race the others.
+    thread_local! { static NOW: core::cell::Cell<u64> = const { core::cell::Cell::new(1) }; }
+    fn now_ns() -> u64 { NOW.with(|now| now.get()) }
     #[derive(Clone, Copy, Debug)]
     enum Role { Primary = 0, Secondary = 1 }
     mod trace { pub fn report(_:u8, _:u8, _:&[u32;18]) {} pub fn message(_:u32,_:u64) {} pub const CONTROL:u32=0; }
     mod fw {
         pub mod variant {
-            #[derive(Clone, Copy)]
+            #[derive(Clone, Copy, Debug)]
             pub enum InitGraph { V25G83, G17P }
         }
         pub mod channels {
@@ -101,17 +116,188 @@ mod g17 {
             pub fn publish_control(&self,_:u32,_:&[u8],_:bool,_:u32)->Result { Ok(()) }
         }
     }
-    mod reports {
-        use super::Role;
-        pub struct Reports;
-        impl Reports {
-            pub fn new()->crate::prelude::Result<Self> { Ok(Self) }
-            pub fn record(&mut self,_:Role,_:[u32;18],_:u64) {}
-            pub fn write(&self,_:&mut crate::fmt::Formatter<'_>)->crate::fmt::Result { Ok(()) }
-        }
+    struct Firmware { rings:channel::Rings }
+    struct State(std::sync::Mutex<Option<Box<Firmware>>>);
+    impl State {
+        fn lock(&self)->std::sync::MutexGuard<'_,Option<Box<Firmware>>> { self.0.lock().unwrap() }
     }
+    struct Variant { graph:fw::variant::InitGraph }
+    struct Shared { state:State, dev:crate::device::Device, variant:Variant }
+    mod reports;
 '''
 RUST_TESTS = r'''
+    // Complete V26A428 payloads; unqualified words must never become pstate.
+    const HIST_IDLE:[u32;18]=[0x12,0x0dc6727d,0,8,4,1,0,3,7,0,0,1000,0,0,0,0,0,0];
+    const HIST_ACTIVE:[u32;18]=[0x12,0x0003c9f5,0,10,0,1,0,3,9,0,0,1000,0,0,0,0,0,0];
+    const HIST_OTHER:[u32;18]=[0x11,0x04952a22,0,0x85498734,0,1,0,9,10,0,0,1000,0,0,0,0,0,0];
+    const TRANSITION:[u32;18]=[0x1a,0xf93dc8f2,0,1,0,1,0,3,9,0,0,1000,0,0,0,0,0,0];
+
+    fn report(rings:&channel::Rings)->String {
+        struct View<'a>(&'a channel::Rings);
+        impl std::fmt::Display for View<'_> {
+            fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result { self.0.write_reports(f) }
+        }
+        format!("{}",View(rings))
+    }
+
+    #[test]
+    fn captured_histograms_are_preserved_without_inventing_pstate() {
+        use {channel::Rings,fw::variant::InitGraph,Role::*};
+        let dev=crate::device::Device;
+        for graph in [InitGraph::V25G83,InitGraph::G17P] {
+            let init=initdata::InitData::new();
+            let mut rings=Rings::new(graph).unwrap();
+            for words in [HIST_IDLE,HIST_ACTIVE,HIST_OTHER,TRANSITION] {
+                init.push(Secondary,words);
+                rings.drain_statistics(&dev,&init,Secondary);
+                assert_eq!(rings.read_statistics(1),telemetry::Readout::default());
+                assert!(report(&rings).contains(&format!("words={:08x?}",words)));
+            }
+        }
+    }
+
+    #[test]
+    fn power_cutoff_discards_only_the_old_prefix_per_role_including_wrap() {
+        use {channel::Rings,fw::variant::InitGraph,Role::*};
+        let dev=crate::device::Device;
+        for start in [0,5,7] {
+            let init=initdata::InitData::new();
+            let mut rings=Rings::new(InitGraph::G17P).unwrap();
+            for &role in &[Primary,Secondary] {
+                for cursor in &init.cursors[role as usize] { cursor.store(start,Ordering::Relaxed); }
+                for words in [HIST_OTHER,HIST_ACTIVE,TRANSITION] { init.push(role,words); }
+            }
+            rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],true,1);
+            for &role in &[Primary,Secondary] {
+                for words in [HIST_OTHER,HIST_ACTIVE,TRANSITION] { init.push(role,words); }
+                rings.drain_statistics(&dev,&init,role);
+            }
+            let text=report(&rings);
+            for role in [0,1] { for tag in [0x11,0x12,0x1a] {
+                let line=text.lines().find(|line|line.starts_with(&format!("role={} tag={:#x} ",role,tag))).unwrap();
+                assert!(line.contains("count=2 host_ns=1 admitted=1 last_admitted=true"),"{}",line);
+            } }
+            assert_eq!(rings.read_statistics(1),telemetry::Readout::default());
+        }
+    }
+
+    #[test]
+    fn empty_boundary_keeps_new_qualified_records_but_late_wake_is_conservative() {
+        use {channel::Rings,fw::variant::InitGraph,Role::*};
+        let dev=crate::device::Device;
+        let init=initdata::InitData::new();
+        let mut rings=Rings::new(InitGraph::G17P).unwrap();
+        let util=[0x13,0,0,8,97,0,97,0,0,0,0,0,0,0,0,0,0,0];
+        let pstate=[0x10,0x2500,0,0,0,0,6,0,0,0,0,0,0,0,0,0,0,0];
+        rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],true,1);
+        init.push(Primary,util);
+        init.push(Secondary,pstate);
+        rings.drain_statistics(&dev,&init,Primary);
+        rings.drain_statistics(&dev,&init,Secondary);
+        let view=rings.read_statistics(1);
+        assert_eq!((view.util_status,view.device,view.pstate_status,view.pstate),(telemetry::VALID,97,telemetry::VALID,6));
+        rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],false,1);
+        init.push(Primary,util);
+        init.push(Secondary,pstate);
+        // A wake seen after records arrived cannot prove which side they belong to.
+        rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],true,1);
+        rings.drain_statistics(&dev,&init,Primary);
+        rings.drain_statistics(&dev,&init,Secondary);
+        let view=rings.read_statistics(1);
+        assert_eq!((view.util_status,view.pstate_status),(telemetry::STALE,telemetry::STALE));
+        init.push(Primary,util);
+        init.push(Secondary,pstate);
+        rings.drain_statistics(&dev,&init,Primary);
+        rings.drain_statistics(&dev,&init,Secondary);
+        assert_eq!(rings.read_statistics(1).pstate_status,telemetry::VALID);
+    }
+
+    #[test]
+    fn current_firmwares_report_pstate_unsupported_and_keep_utilisation() {
+        use {channel::Rings,fw::variant::InitGraph,Role::*};
+        let dev=crate::device::Device;
+        for graph in [InitGraph::V25G83,InitGraph::G17P] {
+            assert!(!stats::reports_pstate(graph));
+            let empty=stats::qualify(graph,telemetry::Readout::default());
+            assert_eq!((empty.util_status,empty.pstate_status),(telemetry::UNAVAILABLE,telemetry::UNSUPPORTED));
+            let init=initdata::InitData::new();
+            let mut rings=Rings::new(graph).unwrap();
+            init.push(Primary,[0x13,0,0,8,97,0,97,0,0,0,0,0,0,0,0,0,0,0]);
+            // Even a decodable tag 0x10 does not override the firmware's match data.
+            init.push(Primary,[0x10,0x2500,0,0,0,0,6,0,0,0,0,0,0,0,0,0,0,0]);
+            rings.drain_statistics(&dev,&init,Primary);
+            assert_eq!(rings.read_statistics(1).pstate_status,telemetry::VALID);
+            let view=stats::qualify(graph,rings.read_statistics(1));
+            assert_eq!((view.util_status,view.device,view.pstate_status,view.pstate,view.pstate_timestamp),
+                       (telemetry::VALID,97,telemetry::UNSUPPORTED,0,0));
+            rings.invalidate_statistics();
+            let view=stats::qualify(graph,rings.read_statistics(1));
+            assert_eq!((view.util_status,view.pstate_status),(telemetry::STALE,telemetry::UNSUPPORTED));
+        }
+    }
+
+    #[test]
+    fn one_drain_is_one_utilisation_delivery() {
+        use {channel::Rings,fw::variant::InitGraph,Role::*};
+        let dev=crate::device::Device;
+        let init=initdata::InitData::new();
+        let mut rings=Rings::new(InitGraph::V25G83).unwrap();
+        let util=[0x13,0,0,8,97,0,97,0,0,0,0,0,0,0,0,0,0,0];
+        // Three 8 ms records per producer update, one update every 24 ms.
+        for n in 0..3u64 {
+            NOW.with(|now| now.set(1_000+n*24_000_000));
+            for _ in 0..3 { init.push(Primary,util); }
+            rings.drain_statistics(&dev,&init,Primary);
+        }
+        let last=1_000+2*24_000_000;
+        assert!(report(&rings).contains("delivery_intervals_ns=[Some(24000000), Some(24000000)]"),"{}",report(&rings));
+        assert_eq!(rings.read_statistics(last+16_000_000).util_status,telemetry::VALID);
+        assert_eq!(rings.read_statistics(last+39_999_999).util_status,telemetry::VALID);
+        assert_eq!(rings.read_statistics(last+40_000_000).util_status,telemetry::STALE);
+    }
+
+    #[test]
+    fn off_drains_and_invalid_boundary_producers_never_admit_live_data() {
+        use {channel::Rings,fw::variant::InitGraph,Role::*};
+        let dev=crate::device::Device;
+        let init=initdata::InitData::new();
+        let mut rings=Rings::new(InitGraph::G17P).unwrap();
+        rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],false,0);
+        init.push(Secondary,HIST_IDLE);
+        rings.drain_statistics(&dev,&init,Secondary);
+        assert!(report(&rings).contains("admitted=0 last_admitted=false"));
+        init.cursors[1][1].store(fw::channels::STATISTICS_SLOTS,Ordering::Relaxed);
+        rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],true,1);
+        init.cursors[1][1].store(1,Ordering::Relaxed);
+        init.push(Primary,[0x13,0,0,100,100,0,100,0,0,0,0,0,0,0,0,0,0,0]);
+        rings.drain_statistics(&dev,&init,Primary);
+        assert_eq!(rings.read_statistics(1).util_status,telemetry::UNAVAILABLE);
+        assert!(report(&rings).contains("quarantine=[[false, false], [false, true]]"));
+    }
+
+    #[test]
+    fn debugfs_reads_do_not_change_pending_cutoffs_or_admission() {
+        use {channel::Rings,fw::variant::InitGraph,Role::*};
+        let graph=InitGraph::G17P;
+        let dev=crate::device::Device;
+        let init=initdata::InitData::new();
+        let mut rings=Rings::new(graph).unwrap();
+        init.push(Secondary,HIST_IDLE);
+        rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],true,1);
+        init.push(Secondary,HIST_ACTIVE);
+        let shared=std::sync::Arc::new(Shared { state:State(std::sync::Mutex::new(Some(Box::new(Firmware { rings })))),dev,variant:Variant { graph } });
+        let view=reports::View(shared.clone());
+        struct View<'a>(&'a reports::View);
+        impl std::fmt::Display for View<'_> {
+            fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result { crate::debugfs::Writer::write(self.0,f) }
+        }
+        let before=format!("{}",View(&view));
+        for _ in 0..10 { assert_eq!(format!("{}",View(&view)),before); }
+        let mut state=shared.state.lock();
+        let firmware=state.as_mut().unwrap();
+        firmware.rings.drain_statistics(&shared.dev,&init,Secondary);
+        assert!(report(&firmware.rings).contains("admitted=1 last_admitted=true"));
+    }
     #[test]
     fn roles_merge_and_any_statistics_quarantine_disables_both() {
         use {channel::Rings,fw::variant::InitGraph,Role::*};
@@ -150,13 +336,14 @@ RUST_TESTS = r'''
             init.push(Primary,words); // Unread at the epoch boundary.
             match boundary {
                 0=> { rings.suspend_statistics(true); rings.drain_statistics(&dev,&init,Primary); rings.suspend_statistics(false); init.push(Primary,words); }
-                1=>rings.observe_statistics_power(false,0),
-                2=>rings.observe_statistics_power(true,1), // Wake observed by a fast publisher.
+                1=>rings.observe_statistics_power(&dev,&init,&[Primary],false,0),
+                2=>rings.observe_statistics_power(&dev,&init,&[Primary],true,1), // Wake observed by a fast publisher.
                 _=>rings.invalidate_statistics(), // Restart handshake.
             }
             assert_eq!(rings.read_statistics(1).util_status,telemetry::STALE);
             rings.drain_statistics(&dev,&init,Primary);
             assert_eq!(rings.read_statistics(1).util_status,telemetry::STALE);
+            rings.observe_statistics_power(&dev,&init,&[Primary],true,u64::from(boundary >= 2));
             init.push(Primary,words);
             rings.drain_statistics(&dev,&init,Primary);
             assert_eq!(rings.read_statistics(1).util_status,telemetry::VALID);
@@ -232,6 +419,12 @@ C_TESTS = r'''
 static struct asahi_qualified_stats current;
 static void read_stats(const void *ptr,struct asahi_qualified_stats *out) { (void)ptr;*out=current; }
 static void suspend_stats(const void *ptr,bool suspended) { (void)ptr;suspend_calls+=suspended?1:10; }
+static bool read_frequency(const void *ptr,u32 pstate,u64 *hz) {
+    static const u64 table[]={0,338000000,618000000,492000000};
+    (void)ptr;
+    if(pstate>=sizeof(table)/sizeof(*table))return false;
+    *hz=table[pstate];return true;
+}
 int main(void) {
     struct asahi_stats_snapshot snap;
     struct asahi_stats_attribute stats={.snapshot=&snap,.export_enabled=true};
@@ -248,6 +441,15 @@ int main(void) {
         ssize_t before=old_agx_stats_show(NULL,&stats.attr,old);
         ssize_t after=agx_stats_show(NULL,&stats.attr,now);
         assert(before==after && !memcmp(old,now,before+1));
+        stats.frequency=read_frequency;
+        after=agx_stats_show(NULL,&stats.attr,now);
+        assert(after>before && !memcmp(old,now,before));
+        static const char *expected[]={"0", "338000000", "618000000", "492000000"};
+        char suffix[128];
+        snprintf(suffix,sizeof(suffix),"requested_frequency_hz %s\n",
+                 snap.pstate<4?expected[snap.pstate]:"unsupported");
+        assert(!strcmp(now+before,suffix));
+        stats.frequency=NULL;
     }
     stats.export_enabled=false;
     assert(agx_stats_show(NULL,&stats.attr,now)==12);
@@ -268,12 +470,18 @@ int main(void) {
             assert(strstr(now,"util_device_percent unsupported\n"));
             assert(strstr(now,"pstate unsupported\n"));
             assert(strstr(now,status==2?"pstate_status stale\n":"pstate_status unavailable\n"));
+            assert(strstr(now,status==2?"utilisation_status stale\n":"utilisation_status unavailable\n"));
         }
     }
+    /* G16S/G17P: pstate unsupported by firmware, utilisation still valid. */
+    current=(struct asahi_qualified_stats){.util_status=1,.pstate_status=3,.tiler=30,.renderer=80,.device=57,.pstate=0};
+    agx_stats_show(NULL,&stats.attr,now);
+    assert(strstr(now,"utilisation_status valid\nutil_tiler_percent 30\nutil_renderer_percent 80\nutil_device_percent 57\n"
+                      "pstate_status unsupported\npstate unsupported\nrequested_frequency_hz unsupported\n"));
     struct device dev;
     struct asahi_gpu_memory memory={0};
     void *handle=NULL;
-    assert(!asahi_sysfs_register(&dev,&snap,1,&memory,&handle,read_stats,suspend_stats));
+    assert(!asahi_sysfs_register(&dev,&snap,1,&memory,&handle,read_stats,suspend_stats,NULL));
     struct asahi_stats_attribute *registered_stats=handle;
     assert(registered==1 && removed==0);
     asahi_stats_pm_notify(&registered_stats->pm_notifier,PM_SUSPEND_PREPARE,NULL);
@@ -283,14 +491,14 @@ int main(void) {
     assert(removed==1);
     for(int failure=1;failure<=2;failure++) {
         created=0;fail_file=failure;handle=NULL;
-        assert(asahi_sysfs_register(&dev,&snap,1,&memory,&handle,read_stats,suspend_stats)==-12);
+        assert(asahi_sysfs_register(&dev,&snap,1,&memory,&handle,read_stats,suspend_stats,NULL)==-12);
         assert(registered==removed);
         assert(handle==NULL);
     }
     fail_file=0;fail_notifier=1;created=0;
-    assert(asahi_sysfs_register(&dev,&snap,1,&memory,&handle,read_stats,suspend_stats)==-12);
+    assert(asahi_sysfs_register(&dev,&snap,1,&memory,&handle,read_stats,suspend_stats,NULL)==-12);
     assert(created==0 && registered==removed);
-    puts("PASS: 512 byte-identical legacy outputs, G17 capabilities, PM lifecycle and registration rollback");
+    puts("PASS: 512 byte-identical legacy prefixes and frequency lookups, G17 capabilities, PM lifecycle and registration rollback");
 }
 '''
 
@@ -300,8 +508,8 @@ def main():
     ap.add_argument('--out', type=Path)
     ap.add_argument('--baseline', default='ebcf9cb777a434867e9d880892ee2b46887728bb',
                     help='revision containing the legacy formatter')
-    ap.add_argument('--mutation', choices=['fields', 'range', 'timestamp', 'age',
-                                           'quarantine', 'epoch', 'legacy-format'])
+    ap.add_argument('--mutation', choices=['fields', 'range', 'timestamp', 'age', 'delivery',
+                                           'quarantine', 'epoch', 'cutoff', 'whole-batch', 'legacy-format'])
     args = ap.parse_args()
     work = args.out or Path(tempfile.mkdtemp(prefix='asahi-g17-telemetry-'))
     work.mkdir(parents=True, exist_ok=True)
@@ -311,19 +519,33 @@ def main():
     # kernel logging and allocation adapters are replaced by host fixtures.
     channel = '\n'.join(line for line in channel.splitlines() if not line.startswith('//!'))
     (work / 'channel.rs').write_text(channel)
+    reports = (DRIVER / 'g17/reports.rs').read_text()
+    store = reports.split('/// The view owns the session')[0]
+    tests = reports.split('#[kernel::macros::kunit_tests(asahi_g17_reports)]')[1]
+    view = reports[reports.index('/// The view owns the session'):reports.index('fn write_power(')]
+    power_stub = '''
+fn write_power(_: &super::Firmware, f:&mut kernel::fmt::Formatter<'_>)->kernel::fmt::Result {
+    writeln!(f,"power fixture")
+}
+'''
+    reports = '\n'.join(line for line in store.splitlines() if not line.startswith('//!')) + view + power_stub + tests
+    (work / 'reports.rs').write_text(reports)
     telemetry = (DRIVER / 'g17/telemetry.rs').read_text()
     changes = {
         'fields': ('[words[3], words[4], words[6]]', '[words[3], words[4], words[5]]'),
         'range': ('value > 100', 'value > 101'),
         'timestamp': ('u64::from(words[1]) | (u64::from(words[2]) << 32)',
                       'u64::from(words[2]) | (u64::from(words[1]) << 32)'),
-        'age': ('now_ns - received >= max_age_ns', 'now_ns - received > max_age_ns'),
+        'age': ('now_ns - received >= limit', 'now_ns - received > limit'),
+        'delivery': ('[Some(a), Some(b)] => a.min(b),', '[Some(a), Some(b)] => a.max(b),'),
         'quarantine': ('.any(|rings| rings[ReportRing::Statistics as usize])', '.any(|_| false)'),
         'epoch': ('self.discard_statistics = [true; 2]', 'self.discard_statistics = [false; 2]'),
+        'cutoff': ('accept_statistics && statistics_cutoff.is_none()', 'accept_statistics'),
+        'whole-batch': ('            self.telemetry.invalidate();', '            self.invalidate_statistics();'),
     }
     if args.mutation in changes:
         before, after = changes[args.mutation]
-        if args.mutation in ('quarantine', 'epoch'):
+        if args.mutation in ('quarantine', 'epoch', 'cutoff', 'whole-batch'):
             assert before in channel
             channel = channel.replace(before, after, 1)
             (work / 'channel.rs').write_text(channel)
@@ -331,12 +553,15 @@ def main():
             assert before in telemetry
             telemetry = telemetry.replace(before, after, 1)
     (work / 'telemetry.rs').write_text(telemetry)
-    policy = item((DRIVER / 'g17/stats.rs').read_text(), 'pub(super) const fn max_age_ns')
+    stats_rs = (DRIVER / 'g17/stats.rs').read_text()
+    policy = '\n'.join(item(stats_rs, signature) for signature in
+                       ['pub(super) const fn max_age_ns', 'pub(super) const fn reports_pstate',
+                        'pub(super) fn qualify('])
     (work / 'rings.rs').write_text(RUST_HEADER + 'mod stats { use super::fw::variant::InitGraph;\n'
                                   + policy + '\n}\nmod telemetry;\nmod channel;\n' + RUST_TESTS)
     # Rust resolves child modules relative to the inline parent's directory.
     (work / 'g17').mkdir(exist_ok=True)
-    for name in ['channel.rs', 'telemetry.rs']:
+    for name in ['channel.rs', 'telemetry.rs', 'reports.rs']:
         (work / 'g17' / name).write_text((work / name).read_text())
     subprocess.run(['rustc', '--edition=2021', '--test', str(work / 'rings.rs'), '-o', str(work / 'rings')], check=True)
     subprocess.run([str(work / 'rings')], check=True)

@@ -158,6 +158,9 @@ impl recovery::Queues for Service<'_> {
     fn render_pass_started(&self, qid: u8, stamp: u64) -> Option<bool> {
         self.firmware.queues.render_pass_started(qid, stamp)
     }
+    fn render_culprit(&self, blamed: u8) -> Option<u128> {
+        self.firmware.queues.render_culprit(blamed)
+    }
     fn publish_recovery_targets(&self) -> Option<Error> {
         let mut failure = self.firmware.queues.publish_render_recovery_targets();
         for queue in self
@@ -238,6 +241,28 @@ impl recovery::Queues for Service<'_> {
         self.firmware
             .queues
             .report_render_recovery(qid, &self.firmware.port);
+    }
+    fn report_mmu_fault(&self) {
+        let banks = match self.firmware.port.fault_banks() {
+            Ok(banks) => banks,
+            Err(error) => {
+                pr_warn!("G17: recovery MMU fault banks unreadable: {:?}\n", error);
+                return;
+            }
+        };
+        for (bank, &(status, address)) in banks.iter().enumerate() {
+            match crate::regs::decode_fault(status, address, true) {
+                Some(info) => pr_warn!(
+                    "G17: recovery MMU fault bank {}: address {:#x} {} {:?} unit {:?} ({:#x}) level {} vm_slot {} sideband {:#x} (status {:#x})\n",
+                    bank, info.address, if info.read { "read" } else { "write" }, info.reason,
+                    info.unit, info.unit_code, info.level, info.vm_slot, info.sideband, status
+                ),
+                None => pr_info!(
+                    "G17: recovery MMU fault bank {}: no fault (status {:#x})\n",
+                    bank, status
+                ),
+            }
+        }
     }
     fn settle_blamed_render(&mut self, qid: u8, error: Error) {
         let result = self
@@ -323,6 +348,9 @@ impl Firmware {
             .set_generation(service.firmware.recovery.generation());
         service.firmware.rings.invalidate_statistics();
         let result = result?;
+        if result.leftover && service.firmware.recovery.forgive_restart() {
+            pr_warn!("G17: recovery dropped queued work of an already failed VM; not counted as a restart storm\n");
+        }
         if let Some(error) = result.target_error {
             dev_warn!(
                 shared.dev.as_ref(),

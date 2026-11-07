@@ -209,7 +209,8 @@ struct drm_asahi_params_global {
 	 *
 	 * G13-G15 on 14.x report DRM_ASAHI_GPU_HAL_LEGACY.
 	 * The exact J613 25G83 runtime and the G17P runtime report
-	 * DRM_ASAHI_GPU_HAL_200.
+	 * DRM_ASAHI_GPU_HAL_200. M5 (T8142) and G18 (M6) report
+	 * DRM_ASAHI_GPU_HAL_300.
 	 */
 	__u32 gpu_hal_generation;
 
@@ -241,7 +242,7 @@ enum drm_asahi_gpu_hal_generation {
 	 */
 	DRM_ASAHI_GPU_HAL_200 = 200,
 
-	/** @DRM_ASAHI_GPU_HAL_300: HAL300 command stream. Never reported by this kernel. */
+	/** @DRM_ASAHI_GPU_HAL_300: HAL300 command stream, reported by M5 (T8142) and G18 (M6). */
 	DRM_ASAHI_GPU_HAL_300 = 300,
 };
 
@@ -422,7 +423,32 @@ enum drm_asahi_feature {
 	 * include the earlier points of that timeline without adding GPU waits.
 	 */
 	DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS = (1UL) << 29,
+
+	/*
+	 * Bit 30 is used by the M5 runtime's userspace. Bits 31 and 32 belong
+	 * to the G18 (M6, T8152) backend, which alone reports them. Bit 32 is
+	 * DRM_ASAHI_FEATURE_G18_NATIVE_TILE_SAMPLES, defined after this enum so
+	 * that the enum keeps its 32-bit type.
+	 */
+
+	/**
+	 * @DRM_ASAHI_FEATURE_G18_GRAPHICS_SCRATCH: G18: render commands accept
+	 * DRM_ASAHI_RENDER_G18_RESOURCES. The kernel sizes the shared TA/3D
+	 * private-memory pool from the struct drm_asahi_g18_render_resources
+	 * the command carries and programs both launch pairs; userspace emits
+	 * nonzero SPECTPR scratch frames only for such renders.
+	 */
+	DRM_ASAHI_FEATURE_G18_GRAPHICS_SCRATCH = (1ULL) << 31,
 };
+
+/*
+ * DRM_ASAHI_FEATURE_G18_NATIVE_TILE_SAMPLES: G18: single-sample,
+ * single-layer renders with 32x32 utiles also accept 40-, 56- and 72-byte
+ * samples (the hardware's native layouts), besides tiles of at most 32 KiB
+ * and 48..128-byte samples in steps of 16. A feature bit like those of enum
+ * drm_asahi_feature; a 64-bit enumerator would widen that enum's type.
+ */
+#define DRM_ASAHI_FEATURE_G18_NATIVE_TILE_SAMPLES ((1ULL) << 32)
 
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
 #define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2
@@ -447,8 +473,9 @@ enum drm_asahi_feature {
  * treating that fence as successful execution. Syncobj signal alone is not
  * an execution-success indication. A job cancelled (ECANCELED) because
  * another VM's recovery discarded it, an input did not signal in time, or
- * its queue was closed, is not a failure of this VM: its fence carries the
- * error, error stays 0, and its output is undefined.
+ * its queue was closed, or dropped (ENODATA) because a recovery could not
+ * run it again, is not a failure of this VM: its fence carries the error,
+ * error stays 0, and its output is undefined.
  * The feature bit is the availability contract; older kernels leave it zero.
  * Kernel errors for invalid requests: EINVAL flags/pad/size, ENOENT foreign or
  * missing vm_id, EFAULT inaccessible pointer. No output on invalid request.
@@ -1251,6 +1278,18 @@ enum drm_asahi_render_flags {
 	 * may depend on it. Requires DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS.
 	 */
 	DRM_ASAHI_RENDER_FRAGMENT_BARRIERS = (1U << 20),
+
+	/*
+	 * Bits 21 to 24 are used by the M5 runtime's userspace.
+	 */
+
+	/**
+	 * @DRM_ASAHI_RENDER_G18_RESOURCES: G18 only; requires
+	 * DRM_ASAHI_FEATURE_G18_GRAPHICS_SCRATCH. The payload is a complete
+	 * struct drm_asahi_cmd_render_g18: the render command followed by a
+	 * struct drm_asahi_g18_render_resources. Any bytes after it are zero.
+	 */
+	DRM_ASAHI_RENDER_G18_RESOURCES = (1U << 25),
 };
 
 /**
@@ -1737,6 +1776,139 @@ enum drm_asahi_compute_flags {
 	 * ordered helpers cannot time out while waiting for the build.
 	 */
 	DRM_ASAHI_COMPUTE_AS_BUILD = (1L << 2),
+
+	/*
+	 * Bits 16 and 17 are used by the M5 runtime's userspace.
+	 */
+
+	/**
+	 * @DRM_ASAHI_COMPUTE_USES_TEXTURE_STATE: G18 only. The command's
+	 * dispatch binds texture or image state (a texture table, a sampled
+	 * texture, a storage image), so the kernel selects the compute mode
+	 * the native driver uses for such commands. Other backends refuse it.
+	 */
+	DRM_ASAHI_COMPUTE_USES_TEXTURE_STATE = (1L << 18),
+
+	/**
+	 * @DRM_ASAHI_COMPUTE_G18_RESOURCES: G18 only. The payload is a complete
+	 * struct drm_asahi_cmd_compute_g18: the compute command, with
+	 * @scs_layout zero, followed by a struct drm_asahi_g18_compute_resources.
+	 * Any bytes after it are zero.
+	 */
+	DRM_ASAHI_COMPUTE_G18_RESOURCES = (1L << 19),
+};
+
+/**
+ * struct drm_asahi_g18_render_resources - G18 per-render program demand
+ *
+ * Carried by render commands with DRM_ASAHI_RENDER_G18_RESOURCES, after the
+ * complete struct drm_asahi_cmd_render (see struct drm_asahi_cmd_render_g18).
+ *
+ * Effective (linked) program demand in compiler units, maximized over every
+ * draw of the render: 16-bit registers, the static thread-private (TPS)
+ * frame in bytes as programmed in SPECTPR (a multiple of 16), and IPR/staging
+ * halfwords. Tile programs are background, end-of-tile, partial background
+ * and partial end-of-tile; a zero register count marks an absent program.
+ * Tile programs must not use scratch. At least one of the vertex and
+ * fragment frames is nonzero. Tile storage is taken from the render command.
+ */
+struct drm_asahi_g18_render_resources {
+	/** @version: Must be 1. */
+	__u32 version;
+	/** @flags: Must be 3 (vertex and fragment programs present). */
+	__u32 flags;
+	/** @vertex_registers_16: Vertex program registers, in 16-bit units. */
+	__u32 vertex_registers_16;
+	/** @vertex_scratch_bytes: Vertex SPECTPR frame bytes. */
+	__u32 vertex_scratch_bytes;
+	/** @vertex_staging_16: Vertex staging halfwords. */
+	__u32 vertex_staging_16;
+	/** @fragment_registers_16: Fragment program registers, in 16-bit units. */
+	__u32 fragment_registers_16;
+	/** @fragment_scratch_bytes: Fragment SPECTPR frame bytes. */
+	__u32 fragment_scratch_bytes;
+	/** @fragment_staging_16: Fragment staging halfwords. */
+	__u32 fragment_staging_16;
+	/** @tile_registers_16: Tile program registers, in 16-bit units. */
+	__u32 tile_registers_16[4];
+	/** @tile_staging_16: Tile program staging halfwords. */
+	__u32 tile_staging_16[4];
+	/** @reserved: MBZ. */
+	__u32 reserved[4];
+};
+
+/**
+ * struct drm_asahi_g18_compute_resources - G18 per-dispatch metadata
+ *
+ * Carried by compute commands with DRM_ASAHI_COMPUTE_G18_RESOURCES, after the
+ * complete struct drm_asahi_cmd_compute (see struct drm_asahi_cmd_compute_g18).
+ *
+ * Counts are compiler halfwords or bytes as named; the kernel converts them
+ * to native units. Version 1 scales @local_bytes + @variable_shared_bytes by
+ * four for shaders using byte offsets in element-index fields; version 2 uses
+ * the actual byte footprints. @flags: bit 0 main staging known, bit 1
+ * constant program present, bit 2 constant staging known, bit 3 local
+ * geometry unknown (@local_size must then be zero). Other flag bits and
+ * @reserved must be zero.
+ */
+struct drm_asahi_g18_compute_resources {
+	/** @version: 1 or 2. */
+	__u32 version;
+	/** @flags: See above. */
+	__u32 flags;
+	/** @registers_16: Main program registers, in 16-bit units. */
+	__u32 registers_16;
+	/** @scratch_bytes: Main program scratch bytes. */
+	__u32 scratch_bytes;
+	/** @spectpr_scratch_bytes: SPECTPR frame bytes. */
+	__u32 spectpr_scratch_bytes;
+	/** @staging_16: Main program staging halfwords. */
+	__u32 staging_16;
+	/** @constant_registers_16: Constant program registers, in 16-bit units. */
+	__u32 constant_registers_16;
+	/** @constant_scratch_bytes: Constant program scratch bytes. */
+	__u32 constant_scratch_bytes;
+	/** @constant_staging_16: Constant program staging halfwords. */
+	__u32 constant_staging_16;
+	/** @local_bytes: Threadgroup memory bytes. */
+	__u32 local_bytes;
+	/** @imageblock_stride: Imageblock stride. */
+	__u32 imageblock_stride;
+	/** @variable_shared_bytes: Variable shared memory bytes. */
+	__u32 variable_shared_bytes;
+	/** @local_size: Workgroup size, or zero when unknown. */
+	__u32 local_size[3];
+	/** @reserved: MBZ. */
+	__u32 reserved;
+};
+
+/**
+ * struct drm_asahi_cmd_render_g18 - G18 render payload with program demand
+ *
+ * The payload of a render command with DRM_ASAHI_RENDER_G18_RESOURCES. Every
+ * field of @legacy keeps its meaning; fields whose feature G18 does not
+ * report (timestamp copies, ray queries) are zero.
+ */
+struct drm_asahi_cmd_render_g18 {
+	/** @legacy: The render command. */
+	struct drm_asahi_cmd_render legacy;
+	/** @resources: Program demand of the render. */
+	struct drm_asahi_g18_render_resources resources;
+};
+
+/**
+ * struct drm_asahi_cmd_compute_g18 - G18 compute payload with dispatch metadata
+ *
+ * The payload of a compute command with DRM_ASAHI_COMPUTE_G18_RESOURCES.
+ * Every field of @base keeps its meaning; fields whose feature G18 does not
+ * report (timestamp copies, the auxiliary allocation, intersection tables)
+ * are zero, and so is @base.scs_layout.
+ */
+struct drm_asahi_cmd_compute_g18 {
+	/** @base: The compute command. */
+	struct drm_asahi_cmd_compute base;
+	/** @resources: Metadata of the command's dispatches. */
+	struct drm_asahi_g18_compute_resources resources;
 };
 
 /**

@@ -43,6 +43,15 @@ Description:
 
 		pstate     u32; current performance state index (PowerState.pstate).
 
+		requested_frequency_hz
+		           G13/G14: nominal OPP frequency in Hz for the pstate
+		           printed in this read. Uses the driver's parsed
+		           operating-points-v2 table in firmware order, without
+		           sorting. This is not a measured achieved frequency.
+		           Unsupported if the index has no table entry.
+		           All pre-existing keys retain their format and order;
+		           this key is appended after temperature_scale.
+
 		power_mw   u32; latest average power reading in milliwatts
 		           (AvgPower.avg_power). May be 0 if the firmware has not
 		           yet reported AvgPower.
@@ -66,13 +75,25 @@ Description:
 		must not assume binary layout of this file.
 
 		G16S (T6040/V25G83) and G17P (T8140/V26A428) use a separate,
-		qualified snapshot. The G13/G14 output above is unchanged.
+		qualified snapshot. The existing G13/G14 keys above are unchanged.
 		The following keys replace the legacy keys on these firmwares:
 
 		utilisation_status, pstate_status
-		           Each is valid, stale, or unavailable. Numeric metrics
-		           are printed only while their capability is valid;
-		           otherwise their value is the string unsupported.
+		           One of valid, stale, unavailable or unsupported.
+		           unavailable means no qualified sample in the current
+		           epoch yet (for example right after boot, resume or
+		           a firmware restart); stale means the last sample is
+		           older than the age limit below or its epoch ended.
+		           unsupported is a fixed property of the firmware,
+		           taken from the driver's per-firmware match data, and
+		           never changes at runtime: the V25G83 and V26A428
+		           firmwares accept tag 0x10 but never emit it, and no
+		           other record carries the current pstate, so
+		           pstate_status always reads unsupported on G16S and
+		           G17P. utilisation_status is never unsupported on
+		           these firmwares. Numeric metrics are printed only
+		           while their capability is valid; otherwise their
+		           value is the string unsupported.
 
 		util_tiler_percent, util_renderer_percent, util_device_percent
 		           Unsigned integer percent (0..100), from tag 0x13
@@ -84,7 +105,9 @@ Description:
 		           A packet with any value above 100 invalidates the whole
 		           utilisation capability. Zero is a valid sample.
 
-		pstate     Logical selector 0..10 from tag 0x10 word 6. Words 1
+		pstate     Logical selector 0..10 from tag 0x10 word 6, on a
+		           firmware whose match data says it emits tag 0x10
+		           (none of the current G16S/G17P firmwares do). Words 1
 		           and 2 form a little-endian u64 firmware timestamp.
 		           The first timestamp establishes a baseline. Invalid
 		           selectors and backwards timestamps remove pstate
@@ -103,6 +126,12 @@ Description:
 		32 ms for V26A428 (two nominal periods). These are conservative
 		host policies, not firmware guarantees about packet duration.
 		The oldest contributing utilisation sample bounds its window.
+		The firmware can publish several records per producer update
+		(V25G83 produces one every 8 ms and the host receives them three
+		at a time, every 24 ms), so the age limit is added to the
+		shorter of the last two delivery intervals seen in the current
+		epoch: utilisation reads stale only once the next delivery is
+		late by the limit, never between two on-time deliveries.
 		A logical pstate has no qualified periodic-report cadence and
 		remains valid until a replacement or an epoch boundary; its
 		host receive time is retained in diagnostics, not used to invent
@@ -119,3 +148,8 @@ Description:
 		policy, timestamp and diagnostic tick deltas. Tick deltas are
 		never accumulated as GPU busy time. Firmware role streams are
 		merged in drain order without deduplication.
+		The diagnostic also identifies the platform device, records the
+		transport-admitted count and last-admission decision per role/tag,
+		and shows suspension, queued-record discard and quarantine state.
+		Transport admission does not imply semantic validity: the decoder
+		still checks each percentage, selector and timestamp.
