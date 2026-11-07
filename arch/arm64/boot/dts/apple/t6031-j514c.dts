@@ -35,13 +35,18 @@
  * Not yet read from a J514C.
  */
 &dcp {
-	panel {
+	panel: panel {
 		compatible = "apple,panel-j514", "apple,panel-mini-led", "apple,panel";
 		width-mm = <302>;
 		height-mm = <196>;
 		adj-height-mm = <189>;
 		apple,max-brightness = <500>;
 	};
+};
+
+&framebuffer0 {
+	panel = <&panel>;
+	post-init-providers = <&panel>;
 };
 
 &aop_audio {
