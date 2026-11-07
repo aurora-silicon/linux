@@ -45,6 +45,7 @@
 				  "recv-empty", "recv-not-empty";
 		power-domains = <&ps_disp_cpu>;
 		#mbox-cells = <0>;
+		status = "okay";
 	};
 
 	/* DCP firmware DART: SID23. */
@@ -55,6 +56,7 @@
 		interrupts = <AIC_IRQ 678 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		status = "okay";
 	};
 
 	/* Display frontend DART: SID0 scanout, SID16 PIODMA. */
@@ -89,8 +91,7 @@
 		/* Full 2560x1664 panel including the notch rows, 224 ppi. */
 		apple,panel-width-mm = <290>;
 		apple,panel-height-mm = <188>;
-		#address-cells = <2>;
-		#size-cells = <2>;
+		status = "okay";
 
 		disp0_piodma: piodma {
 			iommus = <&disp0_dart 16>;

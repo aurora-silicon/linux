@@ -60,6 +60,7 @@
 		compatible = "apple,t8132-gfx-tvm";
 		reg = <0x3 0x80760800 0x0 0x4>;
 		#power-domain-cells = <0>;
+		status = "okay";
 	};
 
 	gpu: gpu@302600000 {
@@ -77,6 +78,7 @@
 				<&gpu_shared_l2>, <&gpu_fw_text>, <&gpu_fw_data>;
 		memory-region-names = "ttbs", "pagetables", "handoff",
 				      "shared-l2", "fw-text", "fw-data";
+		status = "okay";
 	};
 
 	agx_mbox: mailbox@302608000 {
@@ -93,6 +95,7 @@
 		interrupt-names = "send-empty", "send-not-empty",
 				  "recv-empty", "recv-not-empty";
 		#mbox-cells = <0>;
+		status = "okay";
 	};
 };
 

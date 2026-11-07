@@ -43,6 +43,7 @@
 				  "recv-empty", "recv-not-empty";
 		power-domains = <&ps_dispext0_cpu>;
 		#mbox-cells = <0>;
+		status = "okay";
 	};
 
 	dcpext0_dart: iommu@286340000 {
@@ -53,6 +54,7 @@
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x0 0x10 0x0>;
 		power-domains = <&ps_dispext0_cpu>;
+		status = "okay";
 	};
 
 	dispext0_dart: iommu@286300000 {
@@ -63,6 +65,7 @@
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x0 0x10 0x0>;
 		power-domains = <&ps_dispext0_cpu>;
+		status = "okay";
 	};
 
 	dcpext0: dcp@286e00000 {
@@ -83,8 +86,7 @@
 		dma-noncoherent;
 		apple,dcp-index = <1>;
 		apple,bw-scratch = <&pmgr_dcpext 0 4 0>;
-		#address-cells = <2>;
-		#size-cells = <2>;
+		status = "okay";
 
 		dcpext0_piodma: piodma {
 			iommus = <&dispext0_dart 16>;
@@ -116,6 +118,7 @@
 				  "recv-empty", "recv-not-empty";
 		power-domains = <&ps_dispext1_cpu>;
 		#mbox-cells = <0>;
+		status = "okay";
 	};
 
 	dcpext1_dart: iommu@48a340000 {
@@ -126,6 +129,7 @@
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x0 0x10 0x0>;
 		power-domains = <&ps_dispext1_cpu>;
+		status = "okay";
 	};
 
 	dispext1_dart: iommu@48a300000 {
@@ -136,6 +140,7 @@
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x0 0x10 0x0>;
 		power-domains = <&ps_dispext1_cpu>;
+		status = "okay";
 	};
 
 	dcpext1: dcp@48ae00000 {
@@ -156,8 +161,7 @@
 		dma-noncoherent;
 		apple,dcp-index = <2>;
 		apple,bw-scratch = <&pmgr_dcpext 1 4 0>;
-		#address-cells = <2>;
-		#size-cells = <2>;
+		status = "okay";
 
 		dcpext1_piodma: piodma {
 			iommus = <&dispext1_dart 16>;
