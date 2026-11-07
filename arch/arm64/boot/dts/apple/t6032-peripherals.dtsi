@@ -213,7 +213,7 @@
 	};
 
 	ultra_apciec0_piodma: dma-controller@722000000 {
-		compatible = "apple,t6032-pcie-piodma", "apple,pcie-piodma";
+		compatible = "apple,t6032-pciec-piodma", "apple,pciec-piodma";
 		reg = <0x7 0x22000000 0x0 0x4000>,
 		      <0x7 0x22004000 0x0 0x4000>,
 		      <0x7 0x22008000 0x0 0x4000>,
@@ -225,7 +225,7 @@
 	};
 
 	ultra_apciec1_piodma: dma-controller@b22000000 {
-		compatible = "apple,t6032-pcie-piodma", "apple,pcie-piodma";
+		compatible = "apple,t6032-pciec-piodma", "apple,pciec-piodma";
 		reg = <0xb 0x22000000 0x0 0x4000>,
 		      <0xb 0x22004000 0x0 0x4000>,
 		      <0xb 0x22008000 0x0 0x4000>,
@@ -237,7 +237,7 @@
 	};
 
 	ultra_apciec2_piodma: dma-controller@f22000000 {
-		compatible = "apple,t6032-pcie-piodma", "apple,pcie-piodma";
+		compatible = "apple,t6032-pciec-piodma", "apple,pciec-piodma";
 		reg = <0xf 0x22000000 0x0 0x4000>,
 		      <0xf 0x22004000 0x0 0x4000>,
 		      <0xf 0x22008000 0x0 0x4000>,
@@ -249,7 +249,7 @@
 	};
 
 	ultra_apciec3_piodma: dma-controller@1322000000 {
-		compatible = "apple,t6032-pcie-piodma", "apple,pcie-piodma";
+		compatible = "apple,t6032-pciec-piodma", "apple,pciec-piodma";
 		reg = <0x13 0x22000000 0x0 0x4000>,
 		      <0x13 0x22004000 0x0 0x4000>,
 		      <0x13 0x22008000 0x0 0x4000>,
@@ -431,7 +431,7 @@
 	};
 
 	ultra_apr0: video-codec@2c5000000 {
-		compatible = "apple,t6032-apr", "apple,apr";
+		compatible = "apple,t6032-prores", "apple,prores";
 		reg = <0x2 0xc5000000 0x0 0x4000>,
 		      <0x2 0xc4000000 0x0 0x1000000>,
 		      <0x2 0xc5078000 0x0 0x4000>;
@@ -443,7 +443,7 @@
 	};
 
 	ultra_apr1: video-codec@287000000 {
-		compatible = "apple,t6032-apr", "apple,apr";
+		compatible = "apple,t6032-prores", "apple,prores";
 		reg = <0x2 0x87000000 0x0 0x4000>,
 		      <0x2 0x86000000 0x0 0x1000000>;
 		interrupt-parent = <&aic>;
@@ -656,7 +656,7 @@
 	};
 
 	ultra_apciec4_piodma: dma-controller@722000000 {
-		compatible = "apple,t6032-pcie-piodma", "apple,pcie-piodma";
+		compatible = "apple,t6032-pciec-piodma", "apple,pciec-piodma";
 		reg = <0x7 0x22000000 0x0 0x4000>,
 		      <0x7 0x22004000 0x0 0x4000>,
 		      <0x7 0x22008000 0x0 0x4000>,
@@ -668,7 +668,7 @@
 	};
 
 	ultra_apciec5_piodma: dma-controller@b22000000 {
-		compatible = "apple,t6032-pcie-piodma", "apple,pcie-piodma";
+		compatible = "apple,t6032-pciec-piodma", "apple,pciec-piodma";
 		reg = <0xb 0x22000000 0x0 0x4000>,
 		      <0xb 0x22004000 0x0 0x4000>,
 		      <0xb 0x22008000 0x0 0x4000>,
@@ -742,7 +742,7 @@
 	};
 
 	ultra_apr2: video-codec@2c5000000 {
-		compatible = "apple,t6032-apr", "apple,apr";
+		compatible = "apple,t6032-prores", "apple,prores";
 		reg = <0x2 0xc5000000 0x0 0x4000>,
 		      <0x2 0xc4000000 0x0 0x1000000>,
 		      <0x2 0xc5078000 0x0 0x4000>;
@@ -754,7 +754,7 @@
 	};
 
 	ultra_apr3: video-codec@287000000 {
-		compatible = "apple,t6032-apr", "apple,apr";
+		compatible = "apple,t6032-prores", "apple,prores";
 		reg = <0x2 0x87000000 0x0 0x4000>,
 		      <0x2 0x86000000 0x0 0x1000000>;
 		interrupt-parent = <&aic>;
