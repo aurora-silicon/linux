@@ -85,6 +85,8 @@ ASAHI_TESTS = {
     'brcmf-assoc-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('short-ie', 'header-length', 'skb-capacity', 'cmplt-header'), out('--output')),
     'brcmf-bss-tests.py': [(out(), PASS)],
+    'brcmf-cipher-tests.py': [(out(), PASS)]
+        + [(out() + ['--ref', '33bec4016c466985bfbb5ff4c2089fcab8242dcf'], KILL)],
     # The old revision reports a failed join against the last associated BSS.
     'brcmf-join-bssid-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('stale-target', 'zero-named', 'no-call'), out()),
