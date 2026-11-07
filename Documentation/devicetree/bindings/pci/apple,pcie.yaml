@@ -98,11 +98,11 @@ properties:
 
   reg:
     minItems: 3
-    maxItems: 11
+    maxItems: 13
 
   reg-names:
     minItems: 3
-    maxItems: 11
+    maxItems: 13
 
   ranges:
     minItems: 2
@@ -168,6 +168,30 @@ properties:
   apple,tunable-oe-fabric:
     $ref: '#/$defs/tunable'
     description: Initialization tuples for the oe-fabric register region.
+
+  apple,tunable-axi2af:
+    $ref: '#/$defs/tunable'
+    description: Initialization tuples for the shared PHY block's AXI bridge.
+
+  apple,tunable-cio3pll:
+    $ref: '#/$defs/tunable'
+    description: Initialization tuples for the shared PHY block's PLL.
+
+  apple,tunable-clkgen:
+    $ref: '#/$defs/tunable'
+    description: Initialization tuples for the shared PHY block's clock generator.
+
+  apple,tunable-phy:
+    $ref: '#/$defs/tunable'
+    description: Initialization tuples for the shared PHY block.
+
+  apple,tunable-phy-ip-pll:
+    $ref: '#/$defs/tunable'
+    description: PLL settings of the shared PHY, relative to its phy-ip registers.
+
+  apple,tunable-phy-ip-auspma:
+    $ref: '#/$defs/tunable'
+    description: Lane settings of the shared PHY, relative to its phy-ip registers.
 
   apple,piodma:
     $ref: /schemas/types.yaml#/definitions/phandle
@@ -367,8 +391,9 @@ allOf:
             properties:
               reg:
                 minItems: 8
-                maxItems: 8
+                maxItems: 13
               reg-names:
+                minItems: 8
                 items:
                   - const: config
                   - const: rc
@@ -378,6 +403,11 @@ allOf:
                   - const: phy0
                   - const: phy1
                   - const: phy2
+                  - const: axi2af
+                  - const: cio3pll
+                  - const: clkgen
+                  - const: phy-block
+                  - const: phy-ip
               interrupts:
                 maxItems: 3
           else:
