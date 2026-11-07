@@ -1,0 +1,22 @@
+[
+  {
+    "file": "out/arch/arm64/boot/Image",
+    "bytes": 67078656,
+    "sha256": "16e4aef1b899ca39b86c75442df36f9c2435b79e6b3267251b1b0d6d380688e1"
+  },
+  {
+    "file": "out/drivers/media/platform/apple/prores/apple-prores.ko",
+    "bytes": 674384,
+    "sha256": "32a4effb44cd9ca164ecf4ae476be05cc077c0877249935c70d01ed77c42bb14"
+  },
+  {
+    "file": "out/drivers/media/platform/apple/prores/apple-prores-test.ko",
+    "bytes": 413320,
+    "sha256": "14d63af8ce5042a3b166689710d3f53cd92cbf6df20b59396f1658d1d5374b8a"
+  },
+  {
+    "file": "out/arch/arm64/boot/dts/apple/t6000-j316s.dtb",
+    "bytes": 107425,
+    "sha256": "1f13eae31cc60e0e5421dd1493d71ebb3d2b8b88b4f32eccd4df7783e996e20a"
+  }
+]

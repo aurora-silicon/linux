@@ -1,0 +1,33 @@
+[04:31:35] Configuring KUnit Kernel ...
+Generating .config ...
+Populating config with:
+$ make ARCH=arm64 O=/build/h-50447/out/kunit olddefconfig LLVM=1 BINDGEN=bindgen-0.73.2
+[04:31:39] Building KUnit Kernel ...
+Populating config with:
+$ make ARCH=arm64 O=/build/h-50447/out/kunit olddefconfig LLVM=1 BINDGEN=bindgen-0.73.2
+Building with:
+$ make all compile_commands.json scripts_gdb ARCH=arm64 O=/build/h-50447/out/kunit --jobs=8 LLVM=1 BINDGEN=bindgen-0.73.2
+[04:32:34] Starting KUnit Kernel (1/1)...
+[04:32:34] ============================================================
+Running tests with:
+$ qemu-system-aarch64 -nodefaults -m 1024 -kernel /build/h-50447/out/kunit/arch/arm64/boot/Image.gz -append 'kunit.enable=1 console=ttyAMA0 kunit_shutdown=reboot' -no-reboot -nographic -accel kvm -accel hvf -accel tcg -serial stdio -machine virt -cpu max
+[04:32:34] =========== apple-dart-firmware-leaf (1 subtest) ===========
+[04:32:34] [PASSED] apple_dart_fw_leaf_test
+[04:32:34] ============ [PASSED] apple-dart-firmware-leaf =============
+[04:32:34] ================ apple-prores (11 subtests) ================
+[04:32:34] [PASSED] apr_test_qmat_regs
+[04:32:34] [PASSED] apr_test_dc_scale
+[04:32:34] [PASSED] apr_test_profiles
+[04:32:34] [PASSED] apr_test_desc_422
+[04:32:34] [PASSED] apr_test_desc_444
+[04:32:34] [PASSED] apr_test_desc_rejects
+[04:32:34] [PASSED] apr_test_desc_v0
+[04:32:34] [PASSED] apr_test_desc_v0_profiles
+[04:32:34] [PASSED] apr_test_budgets
+[04:32:34] [PASSED] apr_test_slices
+[04:32:34] [PASSED] apr_test_output
+[04:32:34] ================== [PASSED] apple-prores ===================
+[04:32:34] ============================================================
+[04:32:34] Testing complete. Ran 12 tests: passed: 12
+[04:32:34] Elapsed time: 59.439s total, 3.623s configuring, 55.351s building, 0.444s running
+

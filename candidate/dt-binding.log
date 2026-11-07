@@ -1,0 +1,13 @@
+make[1]: Entering directory '/build/h-50447/out'
+  SCHEMA  Documentation/devicetree/bindings/processed-schema.json
+/build/h-50447/src/Documentation/devicetree/bindings/media/._apple,prores.yaml: ignoring, error parsing file
+/build/h-50447/src/Documentation/devicetree/bindings/iommu/apple,dart.yaml: apple,tunable: multiple incompatible types: uint32-matrix
+/build/h-50447/src/Documentation/devicetree/bindings/pci/apple,pcie.yaml: apple,tunable: multiple incompatible types: uint32-matrix
+/build/h-50447/src/Documentation/devicetree/bindings/phy/ti,cd2e22.yaml: apple,tunable: multiple incompatible types: uint8-array
+  CHKDT   /build/h-50447/src/Documentation/devicetree/bindings
+which: no yamllint in (/build/h-50447/out/dtschema-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/bin)
+warning: python package 'yamllint' not installed, skipping
+  STYLE   /build/h-50447/src/Documentation/devicetree/bindings
+  DTEX    Documentation/devicetree/bindings/media/apple,prores.example.dts
+  DTC [C] Documentation/devicetree/bindings/media/apple,prores.example.dtb
+make[1]: Leaving directory '/build/h-50447/out'

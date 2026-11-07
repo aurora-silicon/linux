@@ -1,0 +1,51 @@
+Aurora ProRes T6000 validation
+
+PR: https://github.com/aurora-silicon/linux/pull/1164 Source:
+bbc26268524fa53c1e7730b8822025b87caa3eea Integration snapshot:
+95e30d5a03257664741941d226a2117ff93a7b36 Base tests:
+3013b7bc295b6b77b9021515502073d78e4ba984 The intervening integration changes do not
+alter ProRes, AVD or AVE source.
+
+All builds and tests ran in policy-approved buildbox slots. No reference Mac was
+accessed. The APR, DART and SCODEC report remain disabled.
+
+Fleet input configuration SHA256:
+60bffcfdcc27c5b936a1dc4b1d533aec3b046322bdd26f933edcd923e427574c
+Source archive SHA256:
+b920cf73920fc02109937f6454fc7872e92d7bc53eee600d096cb4a2bf0216df
+
+Base ProRes KUnit: 9/9 PASS, plus DART 1/1. Candidate ProRes KUnit: 11/11 PASS, plus
+DART 1/1; see candidate/prores-kunit.log. Full W=1 LLVM=1 Image/modules: PASS; all 5,891
+modules linked. The full tree emitted 1,229 inherited warnings, with zero ProRes
+diagnostics. See candidate/build-W1.log and results.log. Strict ProRes W=1
+KCFLAGS=-Werror: PASS, zero warnings/errors; see strict/. The unmodified syscall
+initializers emit Winitializer-overrides diagnostics under W=1. Their source blob is
+bdd2531554f27040eaa0e8f603f52087096c2875 at both the base and candidate. The isolated
+reproduction passed and emitted 473 inherited initializer warnings. The reproduction and
+complete diagnostics are retained. The build uses the existing fleet bindgen 0.73.2
+executable explicitly; stock bindgen 0.72.1 failed its generated EFI layout assertions
+before the ProRes module could compile. Compiler-version metadata changes are retained
+in config-diff.log; the fleet's enabled features are preserved.
+
+Media host parity: base-media/ and candidate/ include every suite separately. The AVD
+recovery harness has an inherited compile failure: its avd_dev shim lacks variant and
+AVD_QUIRK_NO_RECOVERY_RESET. This is not a runtime failure. The historical H.264
+conformance fixture is explicitly supplied from public commit
+757fc07a6930ee12b04fe034138dc9880dc4ff3f with retained SHA256s.
+
+These are software checks. First DMA requires the ownership repair described by PR #925
+or an equivalent, narrowly qualified PMP entry 0x115 support and the bounded boot.bin
+DTB-set trial in t6000-qualification.rst. No hardware encoding, rate-control parity or
+reset safety is claimed by this record.
+
+DT validation: binding/example and T600x DTB builds passed. The additional whole-DTB
+validation against the global schema cache hit an inherited apple,tunable type collision
+(uint8-array versus uint32-matrix). The isolated ProRes schema and built-node
+disabled-state checks are in scoped-dt/. The original aggregate return code includes
+that extra check and the inherited AVD recovery failure; individual results remain
+explicit in the logs.
+
+Log publication: machine-local build/tool directory prefixes are normalized. Raw
+unrelated apple,tunable payload bytes are omitted from the decoder error.
+log-manifest.json records the original and published SHA256 of each log. There are no
+target captures, private firmware, signing keys or lab records.

@@ -1,0 +1,7 @@
+Media host parity after normalizing the per-request build path:
+avd-queue: normalized output identical=True; exit=0
+avd-program: normalized output identical=True; exit=0
+avd-dispatch: normalized output identical=True; exit=0
+avd-recovery: normalized output identical=True; exit=1 (inherited shim compile failure)
+ave-command: normalized output identical=True; exit=0
+ave-recovery: normalized output identical=True; exit=0

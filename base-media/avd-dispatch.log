@@ -1,0 +1,3 @@
+PASS: CREATE_BUFS before S_FMT exposes HOLD; format switches clear stale flags
+PASS: production VP event: stale/duplicate/reset tags, callback dependency and retained PP ownership
+PASS: production dispatch/retire: rest/wake, final/held slices, two contexts, capacity retry, prepare/PM/abort errors, exactly-once job_finish

@@ -1,0 +1,4 @@
+iommu@311008000: status=disabled
+video-codec@311000000: status=disabled
+pmp-scodec: status=disabled
+PASS: APR, DART and SCODEC report remain disabled in the built J316s DTB

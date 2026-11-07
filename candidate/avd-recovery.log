@@ -1,0 +1,26 @@
+/build/h-50447/out/avd-recovery/recovery.c: In function ‘avd_pm_recover’:
+/build/h-50447/out/avd-recovery/recovery.c:154:16: error: ‘struct avd_dev’ has no member named ‘variant’
+  154 |         if (avd->variant && avd->variant->quirks & AVD_QUIRK_NO_RECOVERY_RESET) {
+      |                ^~
+/build/h-50447/out/avd-recovery/recovery.c:154:32: error: ‘struct avd_dev’ has no member named ‘variant’
+  154 |         if (avd->variant && avd->variant->quirks & AVD_QUIRK_NO_RECOVERY_RESET) {
+      |                                ^~
+/build/h-50447/out/avd-recovery/recovery.c:154:52: error: ‘AVD_QUIRK_NO_RECOVERY_RESET’ undeclared (first use in this function)
+  154 |         if (avd->variant && avd->variant->quirks & AVD_QUIRK_NO_RECOVERY_RESET) {
+      |                                                    ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+/build/h-50447/out/avd-recovery/recovery.c:154:52: note: each undeclared identifier is reported only once for each function it appears in
+Traceback (most recent call last):
+  File "/build/h-50447/src/drivers/media/platform/apple/avd/tests/recovery-test.py", line 158, in <module>
+    main()
+    ~~~~^^
+  File "/build/h-50447/src/drivers/media/platform/apple/avd/tests/recovery-test.py", line 151, in main
+    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                    '-Werror', '-fsanitize=address,undefined', '-g', str(code),
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                    '-o', str(exe)], check=True)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/subprocess.py", line 578, in run
+    raise CalledProcessError(retcode, process.args,
+                             output=stdout, stderr=stderr)
+subprocess.CalledProcessError: Command '['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined', '-g', '/build/h-50447/out/avd-recovery/recovery.c', '-o', '/build/h-50447/out/avd-recovery/recovery-test']' returned non-zero exit status 1.

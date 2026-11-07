@@ -1,0 +1,18 @@
+PASS: production H.264 prepare: VALID/inactive count, two-bank HOLD/rejection/final submission, PP retirement ownership
+PASS: 1600 complete legacy programs identical; 64 sparse programs change only reference slots; 32 empty-DPB non-IDR I programs equal legacy IDR; all 65536 DPB maps; syntax guards
+PASS: production HEVC pool-sized banks, old firmware/legacy fallback, exhaustion, saved-bank PP and error retirement
+PASS: production H.264 banks, IDR/P/B DMA operands, saved FIFO addresses and legacy EXECs
+PASS: production H.264 banks, IDR/P/B DMA operands, saved FIFO addresses and legacy EXECs
+PASS: production H.264 banks, IDR/P/B DMA operands, saved FIFO addresses and legacy EXECs
+PASS: production H.264 banks, IDR/P/B DMA operands, saved FIFO addresses and legacy EXECs
+PASS: production H.264 banks, IDR/P/B DMA operands, saved FIFO addresses and legacy EXECs
+PASS: production H.264 banks, IDR/P/B DMA operands, saved FIFO addresses and legacy EXECs
+PASS: production H.264 banks, IDR/P/B DMA operands, saved FIFO addresses and legacy EXECs
+PASS: production H.264 banks, IDR/P/B DMA operands, saved FIFO addresses and legacy EXECs
+PASS: host test rejects zero bank-1 inst
+PASS: host test rejects zero bank-1 pipe_state
+PASS: host test rejects zero bank-1 above_info
+PASS: host test rejects zero bank-1 ip_above
+PASS: host test rejects zero bank-1 lf_above
+PASS: host test rejects zero bank-1 lf_above_info
+PASS: host test rejects zero bank-1 mv_above_info

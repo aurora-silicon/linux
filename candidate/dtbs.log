@@ -1,0 +1,431 @@
+make[1]: Entering directory '/build/h-50447/out'
+  DTC     arch/arm64/boot/dts/apple/t6000-j314s.dtb
+  DTC     arch/arm64/boot/dts/apple/t6002-j375d.dtb
+  DTC     arch/arm64/boot/dts/apple/t6000-j316s.dtb
+  DTC     arch/arm64/boot/dts/apple/t6001-j314c.dtb
+  DTC     arch/arm64/boot/dts/apple/t6001-j316c.dtb
+  DTC     arch/arm64/boot/dts/apple/t6001-j375c.dtb
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:854.14-872.5: Warning (unit_address_vs_reg): /sound/dai-link@0: node has a unit name, but no reg or ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:874.14-883.5: Warning (unit_address_vs_reg): /sound/dai-link@1: node has a unit name, but no reg or ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-die0.dtsi:708.29-713.4: Warning (simple_bus_reg): /soc/display-subsystem: missing or empty reg/ranges property
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:114.10-117.3
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:211.10-215.3
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-pciec.dtsi:8.41-77.4: Warning (simple_bus_reg): /soc/usb4-pcie-tunnel-0: missing or empty reg/ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-pciec.dtsi:79.41-148.4: Warning (simple_bus_reg): /soc/usb4-pcie-tunnel-1: missing or empty reg/ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-pciec.dtsi:150.41-219.4: Warning (simple_bus_reg): /soc/usb4-pcie-tunnel-2: missing or empty reg/ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-pciec.dtsi:221.41-289.4: Warning (simple_bus_reg): /soc/usb4-pcie-tunnel-3: missing or empty reg/ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-die0.dtsi:665.21-706.4: Warning (avoid_unnecessary_addr_size): /soc/dcp@38bc00000: unnecessary #address-cells/#size-cells without "ranges", "dma-ranges" or child "reg" or "ranges" property
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:108.6-112.3
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-dieX.dtsi:92.25-134.4: Warning (avoid_unnecessary_addr_size): /soc/dcp@289c00000: unnecessary #address-cells/#size-cells without "ranges", "dma-ranges" or child "reg" or "ranges" property
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:131.10-208.3
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-dieX.dtsi:172.25-214.4: Warning (avoid_unnecessary_addr_size): /soc/dcp@28cc00000: unnecessary #address-cells/#size-cells without "ranges", "dma-ranges" or child "reg" or "ranges" property
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:229.10-278.3
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:614.14-623.5: Warning (unit_address_vs_reg): /sound/dai-link@0: node has a unit name, but no reg or ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:625.14-634.5: Warning (unit_address_vs_reg): /sound/dai-link@1: node has a unit name, but no reg or ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-die0.dtsi:708.29-713.4: Warning (simple_bus_reg): /soc/display-subsystem: missing or empty reg/ranges property
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:94.10-97.3
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-pciec.dtsi:8.41-77.4: Warning (simple_bus_reg): /soc/usb4-pcie-tunnel-0: missing or empty reg/ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-pciec.dtsi:79.41-148.4: Warning (simple_bus_reg): /soc/usb4-pcie-tunnel-1: missing or empty reg/ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-pciec.dtsi:150.41-219.4: Warning (simple_bus_reg): /soc/usb4-pcie-tunnel-2: missing or empty reg/ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-pciec.dtsi:221.41-289.4: Warning (simple_bus_reg): /soc/usb4-pcie-tunnel-3: missing or empty reg/ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-die0.dtsi:665.21-706.4: Warning (avoid_unnecessary_addr_size): /soc/dcp@38bc00000: unnecessary #address-cells/#size-cells without "ranges", "dma-ranges" or child "reg" or "ranges" property
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:89.6-91.3
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-dieX.dtsi:92.25-134.4: Warning (avoid_unnecessary_addr_size): /soc/dcp@289c00000: unnecessary #address-cells/#size-cells without "ranges", "dma-ranges" or child "reg" or "ranges" property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-dieX.dtsi:172.25-214.4: Warning (avoid_unnecessary_addr_size): /soc/dcp@28cc00000: unnecessary #address-cells/#size-cells without "ranges", "dma-ranges" or child "reg" or "ranges" property
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:111.10-171.3
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j316s.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j316s.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j316s.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j316s.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j316s.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j316s.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j316s.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j316s.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j316s.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j316s.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j316s.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j316s.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j316s.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:614.14-623.5: Warning (unit_address_vs_reg): /sound/dai-link@0: node has a unit name, but no reg or ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:625.14-634.5: Warning (unit_address_vs_reg): /sound/dai-link@1: node has a unit name, but no reg or ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-die0.dtsi:708.29-713.4: Warning (simple_bus_reg): /soc@200000000/display-subsystem: missing or empty reg/ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:854.14-872.5: Warning (unit_address_vs_reg): /sound/dai-link@0: node has a unit name, but no reg or ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-die0.dtsi:665.21-706.4: Warning (avoid_unnecessary_addr_size): /soc@200000000/dcp@38bc00000: unnecessary #address-cells/#size-cells without "ranges", "dma-ranges" or child "reg" or "ranges" property
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:89.6-91.3
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:874.14-883.5: Warning (unit_address_vs_reg): /sound/dai-link@1: node has a unit name, but no reg or ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-dieX.dtsi:92.25-134.4: Warning (avoid_unnecessary_addr_size): /soc@200000000/dcp@289c00000: unnecessary #address-cells/#size-cells without "ranges", "dma-ranges" or child "reg" or "ranges" property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-dieX.dtsi:172.25-214.4: Warning (avoid_unnecessary_addr_size): /soc@200000000/dcp@28cc00000: unnecessary #address-cells/#size-cells without "ranges", "dma-ranges" or child "reg" or "ranges" property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-dieX.dtsi:92.30-134.4: Warning (avoid_unnecessary_addr_size): /soc@2200000000/dcp@289c00000: unnecessary #address-cells/#size-cells without "ranges", "dma-ranges" or child "reg" or "ranges" property
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6002.dtsi:306.15-309.3
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-dieX.dtsi:172.30-214.4: Warning (avoid_unnecessary_addr_size): /soc@2200000000/dcp@28cc00000: unnecessary #address-cells/#size-cells without "ranges", "dma-ranges" or child "reg" or "ranges" property
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6002.dtsi:311.15-314.3
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-die0.dtsi:708.29-713.4: Warning (simple_bus_reg): /soc/display-subsystem: missing or empty reg/ranges property
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:114.10-117.3
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:211.10-215.3
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-pciec.dtsi:8.41-77.4: Warning (simple_bus_reg): /soc/usb4-pcie-tunnel-0: missing or empty reg/ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-pciec.dtsi:79.41-148.4: Warning (simple_bus_reg): /soc/usb4-pcie-tunnel-1: missing or empty reg/ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-pciec.dtsi:150.41-219.4: Warning (simple_bus_reg): /soc/usb4-pcie-tunnel-2: missing or empty reg/ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-pciec.dtsi:221.41-289.4: Warning (simple_bus_reg): /soc/usb4-pcie-tunnel-3: missing or empty reg/ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-die0.dtsi:665.21-706.4: Warning (avoid_unnecessary_addr_size): /soc/dcp@38bc00000: unnecessary #address-cells/#size-cells without "ranges", "dma-ranges" or child "reg" or "ranges" property
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:108.6-112.3
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-dieX.dtsi:92.25-134.4: Warning (avoid_unnecessary_addr_size): /soc/dcp@289c00000: unnecessary #address-cells/#size-cells without "ranges", "dma-ranges" or child "reg" or "ranges" property
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:131.10-208.3
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-dieX.dtsi:172.25-214.4: Warning (avoid_unnecessary_addr_size): /soc/dcp@28cc00000: unnecessary #address-cells/#size-cells without "ranges", "dma-ranges" or child "reg" or "ranges" property
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:229.10-278.3
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:854.14-872.5: Warning (unit_address_vs_reg): /sound/dai-link@0: node has a unit name, but no reg or ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:874.14-883.5: Warning (unit_address_vs_reg): /sound/dai-link@1: node has a unit name, but no reg or ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-die0.dtsi:708.29-713.4: Warning (simple_bus_reg): /soc/display-subsystem: missing or empty reg/ranges property
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:114.10-117.3
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:211.10-215.3
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-pciec.dtsi:8.41-77.4: Warning (simple_bus_reg): /soc/usb4-pcie-tunnel-0: missing or empty reg/ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-pciec.dtsi:79.41-148.4: Warning (simple_bus_reg): /soc/usb4-pcie-tunnel-1: missing or empty reg/ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-pciec.dtsi:150.41-219.4: Warning (simple_bus_reg): /soc/usb4-pcie-tunnel-2: missing or empty reg/ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-pciec.dtsi:221.41-289.4: Warning (simple_bus_reg): /soc/usb4-pcie-tunnel-3: missing or empty reg/ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-die0.dtsi:665.21-706.4: Warning (avoid_unnecessary_addr_size): /soc/dcp@38bc00000: unnecessary #address-cells/#size-cells without "ranges", "dma-ranges" or child "reg" or "ranges" property
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:108.6-112.3
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-dieX.dtsi:92.25-134.4: Warning (avoid_unnecessary_addr_size): /soc/dcp@289c00000: unnecessary #address-cells/#size-cells without "ranges", "dma-ranges" or child "reg" or "ranges" property
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:131.10-208.3
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-dieX.dtsi:172.25-214.4: Warning (avoid_unnecessary_addr_size): /soc/dcp@28cc00000: unnecessary #address-cells/#size-cells without "ranges", "dma-ranges" or child "reg" or "ranges" property
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:229.10-278.3
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:854.14-872.5: Warning (unit_address_vs_reg): /sound/dai-link@0: node has a unit name, but no reg or ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:874.14-883.5: Warning (unit_address_vs_reg): /sound/dai-link@1: node has a unit name, but no reg or ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-die0.dtsi:708.29-713.4: Warning (simple_bus_reg): /soc/display-subsystem: missing or empty reg/ranges property
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:114.10-117.3
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:211.10-215.3
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-pciec.dtsi:8.41-77.4: Warning (simple_bus_reg): /soc/usb4-pcie-tunnel-0: missing or empty reg/ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-pciec.dtsi:79.41-148.4: Warning (simple_bus_reg): /soc/usb4-pcie-tunnel-1: missing or empty reg/ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-pciec.dtsi:150.41-219.4: Warning (simple_bus_reg): /soc/usb4-pcie-tunnel-2: missing or empty reg/ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-pciec.dtsi:221.41-289.4: Warning (simple_bus_reg): /soc/usb4-pcie-tunnel-3: missing or empty reg/ranges property
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-die0.dtsi:665.21-706.4: Warning (avoid_unnecessary_addr_size): /soc/dcp@38bc00000: unnecessary #address-cells/#size-cells without "ranges", "dma-ranges" or child "reg" or "ranges" property
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:108.6-112.3
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-dieX.dtsi:92.25-134.4: Warning (avoid_unnecessary_addr_size): /soc/dcp@289c00000: unnecessary #address-cells/#size-cells without "ranges", "dma-ranges" or child "reg" or "ranges" property
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:131.10-208.3
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-dieX.dtsi:172.25-214.4: Warning (avoid_unnecessary_addr_size): /soc/dcp@28cc00000: unnecessary #address-cells/#size-cells without "ranges", "dma-ranges" or child "reg" or "ranges" property
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:229.10-278.3
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:15.10-61.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:15.10-61.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:15.10-61.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:15.10-61.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:15.10-61.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:15.10-61.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:15.10-61.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:15.10-61.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:15.10-61.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:15.10-61.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6002-j375d.dts:18.10-30.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:15.10-61.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6002-j375d.dts:18.10-30.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:15.10-61.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6002-j375d.dts:18.10-30.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:15.10-61.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6002-j375d.dts:18.10-30.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:15.10-61.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6002-j375d.dts:18.10-30.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:15.10-61.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6002-j375d.dts:18.10-30.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:15.10-61.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6002-j375d.dts:18.10-30.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:15.10-61.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6002-j375d.dts:18.10-30.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:15.10-61.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6002-j375d.dts:18.10-30.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:15.10-61.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6002-j375d.dts:18.10-30.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:15.10-61.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6002-j375d.dts:18.10-30.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:15.10-61.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6002-j375d.dts:18.10-30.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j375.dtsi:15.10-61.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6002-j375d.dts:18.10-30.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j314s.dts:26.10-28.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j314s.dts:26.10-28.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j314s.dts:26.10-28.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j314s.dts:26.10-28.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j314s.dts:26.10-28.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j314s.dts:26.10-28.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j314s.dts:26.10-28.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j314s.dts:26.10-28.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j314s.dts:26.10-28.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j314s.dts:26.10-28.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j314s.dts:26.10-28.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j314s.dts:26.10-28.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6000-j314s.dts:26.10-28.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j314c.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j314c.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j314c.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j314c.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j314c.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j314c.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j314c.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j314c.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j314c.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j314c.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j314c.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j314c.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j314c.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j316c.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j316c.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j316c.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j316c.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j316c.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j316c.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j316c.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j316c.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j316c.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j316c.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j316c.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j316c.dts:19.10-21.4
+/build/h-50447/src/arch/arm64/boot/dts/apple/t600x-common.dtsi:14.10-19.4: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t600x-j314-j316.dtsi:17.10-66.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/spi1-nvram.dtsi:11.10-13.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/isp-common.dtsi:9.10-11.4
+  also defined at /build/h-50447/src/arch/arm64/boot/dts/apple/t6001-j316c.dts:19.10-21.4
+make[1]: Leaving directory '/build/h-50447/out'

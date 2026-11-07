@@ -1,0 +1,30 @@
+Could not decode node iommu@721008000 property apple,tunable (raw value omitted)
+
+Traceback (most recent call last):
+  File "/build/h-50447/out/dtschema-venv/bin/dt-validate", line 6, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/build/h-50447/out/dtschema-venv/lib/python3.14/site-packages/dtschema/dtb_validate.py", line 443, in main
+    dtb_diagnostics = sg.check_dtb(filename)
+  File "/build/h-50447/out/dtschema-venv/lib/python3.14/site-packages/dtschema/dtb_validate.py", line 331, in check_dtb
+    dt = self.validator.decode_dtb(f.read(), decode_errors)
+  File "/build/h-50447/out/dtschema-venv/lib/python3.14/site-packages/dtschema/validator.py", line 631, in decode_dtb
+    return [dtschema.dtb.fdt_unflatten(self, dtb)]
+            ~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "/build/h-50447/out/dtschema-venv/lib/python3.14/site-packages/dtschema/dtb.py", line 591, in fdt_unflatten
+    dt = fdt_scan_node(validator, fdt, '/', offset)
+  File "/build/h-50447/out/dtschema-venv/lib/python3.14/site-packages/dtschema/dtb.py", line 320, in fdt_scan_node
+    node = fdt_scan_node(validator, fdt, nodename, offset)
+  File "/build/h-50447/out/dtschema-venv/lib/python3.14/site-packages/dtschema/dtb.py", line 320, in fdt_scan_node
+    node = fdt_scan_node(validator, fdt, nodename, offset)
+  File "/build/h-50447/out/dtschema-venv/lib/python3.14/site-packages/dtschema/dtb.py", line 320, in fdt_scan_node
+    node = fdt_scan_node(validator, fdt, nodename, offset)
+  File "/build/h-50447/out/dtschema-venv/lib/python3.14/site-packages/dtschema/dtb.py", line 312, in fdt_scan_node
+    node_dict = node_props(validator, fdt, nodename, offset)
+  File "/build/h-50447/out/dtschema-venv/lib/python3.14/site-packages/dtschema/dtb.py", line 258, in node_props
+    props_dict[p.name] = prop_value(validator, nodename, p)
+                         ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/build/h-50447/out/dtschema-venv/lib/python3.14/site-packages/dtschema/dtb.py", line 185, in prop_value
+    if len(p) / type_format[fmt].size >= min_dim:
+                ~~~~~~~~~~~^^^^^
+KeyError: 'uint8-array'

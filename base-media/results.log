@@ -1,0 +1,6 @@
+avd-queue rc=0
+avd-program rc=0
+avd-dispatch rc=0
+avd-recovery rc=1
+ave-command rc=0
+ave-recovery rc=0

@@ -1,0 +1,11 @@
+checkpatch_rc=1
+kunit_rc=0
+avd-queue rc=0
+avd-program rc=0
+avd-dispatch rc=0
+avd-recovery rc=1
+ave-command rc=0
+ave-recovery rc=0
+config_rc=0
+build_rc=0 dtb_rc=0
+binding_rc=0
