@@ -14,51 +14,104 @@ description: |
   descriptors in a DMA ring; the engine signals completion with an
   interrupt. It has no firmware. Its power domain also resets it.
 
-properties:
-  compatible:
-    const: apple,t8140-prores
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t8140-prores
+          - apple,t8132-prores
+          - apple,prores
+  required:
+    - compatible
 
-  reg:
-    items:
-      - description: Engine registers
-      - description: Wrapper registers
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8132-prores
+      required:
+        - compatible
+    then:
+      properties:
+        compatible:
+          items:
+            - enum:
+                - apple,t8132-prores
+            - const: apple,prores
 
-  reg-names:
-    items:
-      - const: core
-      - const: wrapper
+        reg:
+          minItems: 3
+          maxItems: 3
 
-  interrupts:
-    minItems: 1
-    maxItems: 2
+        interrupts:
+          minItems: 2
+          maxItems: 2
 
-  iommus:
-    maxItems: 1
+        power-domains:
+          minItems: 1
+          maxItems: 1
 
-  power-domains:
-    minItems: 1
-    items:
-      - description: The engine's power domain
-      - description: Performance request held while the engine works
+        iommus:
+          minItems: 1
+          maxItems: 1
 
-  power-domain-names:
-    minItems: 1
-    items:
-      - const: core
-      - const: perf
+      required:
+        - compatible
+        - reg
+        - interrupts
+        - power-domains
+        - iommus
 
-  resets:
-    maxItems: 1
+      additionalProperties: false
+    else:
+      properties:
+        compatible:
+          const: apple,t8140-prores
 
-required:
-  - compatible
-  - reg
-  - reg-names
-  - interrupts
-  - iommus
-  - power-domains
+        reg:
+          items:
+            - description: Engine registers
+            - description: Wrapper registers
 
-additionalProperties: false
+        reg-names:
+          items:
+            - const: core
+            - const: wrapper
+
+        interrupts:
+          minItems: 1
+          maxItems: 2
+
+        iommus:
+          maxItems: 1
+
+        power-domains:
+          minItems: 1
+          items:
+            - description: The engine's power domain
+            - description: Performance request held while the engine works
+
+        power-domain-names:
+          minItems: 1
+          items:
+            - const: core
+            - const: perf
+
+        resets:
+          maxItems: 1
+
+      required:
+        - compatible
+        - reg
+        - reg-names
+        - interrupts
+        - iommus
+        - power-domains
+
+      additionalProperties: false
 
 examples:
   - |

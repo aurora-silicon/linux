@@ -151,10 +151,11 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1233 IRQ_TYPE_LEVEL_HIGH>;
 		status = "disabled";
+		iommus = <&dart_apcie0 17>;
 	};
 
 	apciec0_piodma: dma-controller@404068000 {
-		compatible = "apple,t8132-pcie-piodma", "apple,pcie-piodma";
+		compatible = "apple,t8132-pciec-piodma", "apple,pciec-piodma";
 		reg = <0x4 0x04068000 0x0 0x4000>,
 		      <0x4 0x0406c000 0x0 0x4000>,
 		      <0x4 0x04070000 0x0 0x4000>,
@@ -162,10 +163,11 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1269 IRQ_TYPE_LEVEL_HIGH>;
 		status = "disabled";
+		iommus = <&usb4_0_pcie_dart 254>;
 	};
 
 	atc0_dpin0: displayport@401e50000 {
-		compatible = "apple,t8132-dp-in", "apple,dp-in";
+		compatible = "apple,t8132-dpin", "apple,dpin";
 		reg = <0x4 0x01e50000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1311 IRQ_TYPE_LEVEL_HIGH>;
@@ -173,7 +175,7 @@
 	};
 
 	atc0_dpin1: displayport@401e58000 {
-		compatible = "apple,t8132-dp-in", "apple,dp-in";
+		compatible = "apple,t8132-dpin", "apple,dpin";
 		reg = <0x4 0x01e58000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1312 IRQ_TYPE_LEVEL_HIGH>;
@@ -181,7 +183,7 @@
 	};
 
 	apciec1_piodma: dma-controller@40c068000 {
-		compatible = "apple,t8132-pcie-piodma", "apple,pcie-piodma";
+		compatible = "apple,t8132-pciec-piodma", "apple,pciec-piodma";
 		reg = <0x4 0x0c068000 0x0 0x4000>,
 		      <0x4 0x0c06c000 0x0 0x4000>,
 		      <0x4 0x0c070000 0x0 0x4000>,
@@ -189,10 +191,11 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1331 IRQ_TYPE_LEVEL_HIGH>;
 		status = "disabled";
+		iommus = <&usb4_1_pcie_dart 254>;
 	};
 
 	atc1_dpin0: displayport@409e50000 {
-		compatible = "apple,t8132-dp-in", "apple,dp-in";
+		compatible = "apple,t8132-dpin", "apple,dpin";
 		reg = <0x4 0x09e50000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1373 IRQ_TYPE_LEVEL_HIGH>;
@@ -200,7 +203,7 @@
 	};
 
 	atc1_dpin1: displayport@409e58000 {
-		compatible = "apple,t8132-dp-in", "apple,dp-in";
+		compatible = "apple,t8132-dpin", "apple,dpin";
 		reg = <0x4 0x09e58000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1374 IRQ_TYPE_LEVEL_HIGH>;
@@ -373,7 +376,7 @@
 	};
 
 	dbgCPU: debug@389700000 {
-		compatible = "apple,t8132-debug-port", "apple,debug-port";
+		compatible = "apple,t8132-cpu-debug", "apple,cpu-debug";
 		reg = <0x3 0x89700000 0x0 0x28000>,
 		      <0x3 0x895c0000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
