@@ -22,8 +22,9 @@ new model/board identities. Apple's restore catalog advertises three current
 
 Apple Pallas reports 26B7124 for the two new models. Its developer, AppleSeed and
 public beta audiences report 27.3 beta 1 / 26C5035r. The beta's supported product
-list exactly matches the 66 Mac/virtual-Mac identifiers in the complete public
-inventory. The checked beta has no further board names, Mac19 identifiers or
+list exactly matches the 66 current Mac/virtual-Mac identifiers in the public
+inventory. The separately named ADP3,2 Developer Transition Kit is historical
+and already covered by the 11.0.1 extracts. The checked beta has no further board names, Mac19 identifiers or
 additional newer die. This is a statement about the queried public catalogs;
 it does not establish what unreleased hardware exists.
 
@@ -69,7 +70,8 @@ ipsw download ota --platform macos --device Mac18,1 --model J804AP --beta --json
 
 Supplying only one identifier fails in that version's embedded model lookup;
 the explicit pair reaches Apple's catalog. The older mesu macOS OTA URL returned
-HTTP 403, so Pallas provided the OTA evidence. No OTA payload was needed.
+HTTP 403, so Pallas provided the OTA evidence. No OTA payload was needed. An explicit query for a 27.4 beta returned an empty
+OTA list; the latest advertised beta remained 27.3.
 
 The two board gap audits enumerate every top-level subtree and every immediate
 peripheral subtree. They explicitly retain missing coverage: the audited base
