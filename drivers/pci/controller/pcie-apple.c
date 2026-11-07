@@ -2301,6 +2301,52 @@ static int apple_pcie_t6050_phy_wait(struct apple_pcie *pcie, u32 mask, u32 valu
 	return ret;
 }
 
+/*
+ * A host tunable list (apple,tunable-<name>, groups of (offset, 4, mask, value)) applied
+ * to the host window @win. The window may contain windows mapped elsewhere (the PHY
+ * window holds the port and shared PHYs), so it is mapped without claiming it.
+ */
+static int apple_pcie_t6050_tune_host(struct apple_pcie *pcie, const char *name,
+				      const char *win)
+{
+	struct platform_device *pdev = to_platform_device(pcie->dev);
+	struct device_node *np = pcie->dev->of_node;
+	struct resource *res;
+	void __iomem *base;
+	char prop[48];
+	u32 *cells;
+	int count, i, ret;
+
+	snprintf(prop, sizeof(prop), "apple,tunable-%s", name);
+	if (!of_property_present(np, prop))
+		return 0;
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, win);
+	count = of_property_count_u32_elems(np, prop);
+	if (!res || count <= 0 || count % 4)
+		return -EINVAL;
+	cells = kmalloc_array(count, sizeof(*cells), GFP_KERNEL);
+	if (!cells)
+		return -ENOMEM;
+	ret = of_property_read_u32_array(np, prop, cells, count);
+	for (i = 0; !ret && i < count; i += 4)
+		if (cells[i + 1] != 4 || (cells[i] & 3) || cells[i] > resource_size(res) - 4)
+			ret = -EINVAL;
+	if (!ret) {
+		base = ioremap(res->start, resource_size(res));
+		if (base) {
+			for (i = 0; i < count; i += 4)
+				apple_pcie_t6050_rmw(base + cells[i], cells[i + 2], cells[i + 3]);
+			iounmap(base);
+		} else {
+			ret = -ENOMEM;
+		}
+	}
+	kfree(cells);
+	if (ret)
+		dev_err(pcie->dev, "%s: %d\n", prop, ret);
+	return ret;
+}
+
 static int apple_pcie_t6050_shared_phy_on(struct apple_pcie *pcie)
 {
 	struct platform_device *pdev = to_platform_device(pcie->dev);
@@ -2323,6 +2369,13 @@ static int apple_pcie_t6050_shared_phy_on(struct apple_pcie *pcie)
 	if (IS_ERR(cmn))
 		return PTR_ERR(cmn);
 
+	/* Fabric, clock generator and PHY tunables, then the PHY clocks (m1n1's order) */
+	ret = apple_pcie_t6050_tune_host(pcie, "axi2af", "axi2af") ?:
+	      apple_pcie_t6050_tune_host(pcie, "cio3pllcore", "pcieclkgen") ?:
+	      apple_pcie_t6050_tune_host(pcie, "pcieclkgen", "pcieclkgen") ?:
+	      apple_pcie_t6050_tune_host(pcie, "phy", "phy-window");
+	if (ret)
+		return ret;
 	apple_pcie_t6050_rmw(phy + T6050_PHY_CTRL, 0, T6050_PHY_CTRL_CLK0REQ);
 	ret = apple_pcie_t6050_phy_wait(pcie, T6050_PHY_CTRL_CLK0ACK, T6050_PHY_CTRL_CLK0ACK);
 	if (ret)
@@ -2340,6 +2393,10 @@ static int apple_pcie_t6050_shared_phy_on(struct apple_pcie *pcie)
 	if (ret)
 		return ret;
 	apple_pcie_t6050_rmw(phy + T6050_PHY_CFG, 0, BIT(0));
+	ret = apple_pcie_t6050_tune_host(pcie, "phy-ip-pll", "phy-ip") ?:
+	      apple_pcie_t6050_tune_host(pcie, "phy-ip-auspma", "phy-ip");
+	if (ret)
+		return ret;
 	apple_pcie_t6050_rmw(phy + T6050_PHY_CFG, 0, BIT(4));
 	apple_pcie_t6050_rmw(cmn + T6050_PHYCMN_CLK, T6050_PHYCMN_CLK_MODE,
 			     FIELD_PREP(T6050_PHYCMN_CLK_MODE, 1));
