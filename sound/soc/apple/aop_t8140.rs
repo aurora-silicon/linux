@@ -60,6 +60,10 @@ use kernel::{
     new_spinlock,
     platform,
     prelude::*,
+    regulator::{
+        self,
+        Regulator, //
+    },
     soc::apple::aop::{
         from_fourcc,
         EPICService,
@@ -490,6 +494,10 @@ struct SndSocT8140AopData {
     spkr_want_run: AtomicFlag,
     /// A microphone-array stream has been triggered and not yet stopped.
     hpai_want_run: AtomicFlag,
+    /// The array's rail (ADT function-input_power_enable), held while its
+    /// service runs.
+    #[pin]
+    hpai_supply: Mutex<Option<Regulator<regulator::Enabled>>>,
     /// "Speaker Playback Volume" (REG_SPKR_VOLUME), 0..=SPKR_VOLUME_MAX.
     spkr_volume: Atomic<u32>,
     /// The sleeping firmware starts queued from the atomic triggers.
@@ -953,7 +961,11 @@ impl SndSocT8140AopData {
         if !self.hpai_want_run.load(Relaxed) || self.hpai.running.load(Relaxed) {
             return Ok(());
         }
-        self.service_run(&self.hpai)
+        // As macOS does: the rail, then the stream. A failed start drops it again.
+        let supply = Regulator::<regulator::Enabled>::get(&self.dev, c"mic")?;
+        self.service_run(&self.hpai)?;
+        *self.hpai_supply.lock() = Some(supply);
+        Ok(())
     }
 
     /// Called from sleeping close paths: a queued start must finish before
@@ -967,7 +979,9 @@ impl SndSocT8140AopData {
 
     fn hpai_shutdown(&self) {
         self.flush_hpai_start();
-        self.service_shutdown(&self.hpai, &self.hpai_domains())
+        self.service_shutdown(&self.hpai, &self.hpai_domains());
+        // As macOS does: the stream's stop, then the rail.
+        *self.hpai_supply.lock() = None;
     }
 
     // ---- internal speakers: the spkr service on LEAP TX0 (leap-ns ADMAC
@@ -1052,6 +1066,7 @@ impl SndSocT8140AopData {
         }
         self.flush_hpai_start();
         self.service_stop(&self.hpai);
+        *self.hpai_supply.lock() = None;
         if let Err(e) = self.spkr_prepare() {
             dev_err!(self.dev, "spkr: stop failed: {:?}\n", e);
         }
@@ -2884,6 +2899,9 @@ impl SndSocT8140AopDriver {
         // SAFETY: the pointer was checked above and stays valid with the child.
         let svc = unsafe { *service };
 
+        // A capture takes the array's rail, which needs the SMC's GPIOs bound.
+        Regulator::<regulator::Disabled>::get(&dev, c"mic")?;
+
         // The source ring: 512 KiB through our own IOMMU stream (dart-aop 9),
         // owned by the AOP driver because the firmware binds it once per boot.
         // SAFETY: no DMA is in flight on this device yet.
@@ -2935,6 +2953,7 @@ impl SndSocT8140AopDriver {
                 pd_rx0,
                 spkr_want_run: AtomicFlag::new(false),
                 hpai_want_run: AtomicFlag::new(false),
+                hpai_supply <- new_mutex!(None),
                 spkr_volume: Atomic::new(SPKR_VOLUME_MAX),
                 spkr_start_work <- new_work!("SndSocT8140AopData::spkr_start_work"),
                 hpai_start_work <- new_work!("SndSocT8140AopData::hpai_start_work"),
