@@ -42,6 +42,12 @@ bool ctxr_exec_efi_runtime_ok(void);
  */
 bool ctxr_exec_window_reserved(void);
 
+/*
+ * Bytes of the window the executable pool gets, or 0 with no window. Valid as
+ * soon as ctxr_exec_reserve() has run, before the pool itself exists.
+ */
+u64 ctxr_exec_pool_bytes(void);
+
 /* True if cores confined to the window can't run this kernel. */
 bool ctxr_exec_secondaries_held(void);
 #else
@@ -51,6 +57,7 @@ static inline bool ctxr_exec_execmem_setup(void) { return false; }
 static inline bool ctxr_exec_efi_runtime_ok(void) { return true; }
 static inline bool ctxr_exec_window_reserved(void) { return false; }
 static inline bool ctxr_exec_secondaries_held(void) { return false; }
+static inline u64 ctxr_exec_pool_bytes(void) { return 0; }
 #endif
 
 #endif /* __ASM_CTXR_EXECMEM_H */

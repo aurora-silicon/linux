@@ -46,6 +46,8 @@ static phys_addr_t ctxr_base __initdata;
 static phys_addr_t ctxr_size __initdata;
 static bool ctxr_enforce __initdata = true;
 static bool ctxr_active __initdata;
+/* What the executable pool will get, known as soon as the window is reserved. */
+static u64 ctxr_pool_bytes __ro_after_init;
 static bool ctxr_hold_cpus __initdata;
 
 /* Read with the MMU off by cores entering init_kernel_el. */
@@ -167,6 +169,7 @@ static phys_addr_t __init ctxr_snapshot_free(phys_addr_t base, phys_addr_t size)
 static bool __init ctxr_establish(phys_addr_t base, phys_addr_t size)
 {
 	phys_addr_t img_start = __pa_symbol(_text), img_end = __pa_symbol(_end);
+	phys_addr_t usable;
 	phys_addr_t dram_start = memblock_start_of_DRAM();
 	phys_addr_t dram_end = memblock_end_of_DRAM();
 
@@ -187,7 +190,8 @@ static bool __init ctxr_establish(phys_addr_t base, phys_addr_t size)
 	 * Must run before the window is reserved, or every range looks taken.
 	 * The pool is built after the secondaries start, so check it now.
 	 */
-	if (!ctxr_snapshot_free(base, size)) {
+	usable = ctxr_snapshot_free(base, size);
+	if (!usable) {
 		pr_err("window has no free space for executable allocations\n");
 		return false;
 	}
@@ -202,6 +206,7 @@ static bool __init ctxr_establish(phys_addr_t base, phys_addr_t size)
 
 	ctxr_base = base;
 	ctxr_size = size;
+	ctxr_pool_bytes = usable;
 	ctxr_active = true;
 
 	pr_info("reserved exec window [%pa, +%llu MiB), %s\n",
@@ -322,6 +327,11 @@ bool __init ctxr_exec_execmem_setup(void)
 fail:
 	/* Only an allocation failure gets here, and confined CPUs are running. */
 	panic("ctxr-execmem: cannot build the executable pool\n");
+}
+
+u64 ctxr_exec_pool_bytes(void)
+{
+	return ctxr_pool_bytes;
 }
 
 bool __init ctxr_exec_window_reserved(void)
