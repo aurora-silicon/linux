@@ -61,6 +61,7 @@
 		 * does not survive this state going off for long.
 		 */
 		apple,always-on;
+		apple,sleep-driver-owned;
 	};
 
 	ps_venc0_sys: power-controller@240 {
@@ -206,16 +207,18 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "apcie_sys_st";
-		power-domains = <&ps_ans>, <&ps_apcie_st>;
+		power-domains = <&ps_ans>, <&ps_apcie_st>, <&ps_apcie_phy_sw>;
 	};
 
+	/* SYS_ST's parent, kept on: only a real sleep lowers it, through the sleep controller. */
 	ps_apcie_phy_sw: power-controller@3c0 {
 		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x3c0 4>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "apcie_phy_sw";
-		power-domains = <&ps_apcie_sys_st>, <&ps_apcie_sys_gp>;
+		power-domains = <&ps_apcie_sys_gp>;
+		apple,always-on;
 	};
 
 	ps_pmp: power-controller@3d0 {
@@ -851,6 +854,8 @@
 		#reset-cells = <0>;
 		label = "sio_cpu";
 		status = "okay";
+		/* The sleep reads the SIO's run bit at the commit, so it stays on until then. */
+		apple,always-on;
 	};
 
 	ps_fpwm0: power-controller@2b0 {
