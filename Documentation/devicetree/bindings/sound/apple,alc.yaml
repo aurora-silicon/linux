@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/apple,alc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple Audio Leap controller
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  Firmware microphone capture controller using an ADMAC instance. The
+  hardware description identifies the controller instance and its DMA
+  provider. Stream buffer geometry, microphone calibration and firmware
+  control sequences are runtime data and must not be copied into DTS.
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t8103-alc
+          - apple,t6000-alc
+      - const: apple,alc
+
+  apple,dma-controller:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: ADMAC controller used by the firmware capture service.
+
+  apple,instance-id:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Hardware controller instance number.
+
+required:
+  - compatible
+  - apple,dma-controller
+  - apple,instance-id
+
+additionalProperties: false

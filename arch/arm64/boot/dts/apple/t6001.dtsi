@@ -152,4 +152,6 @@
 #ifndef APPLE_T6000_SUBSET
 #include "t6001-peripherals.dtsi"
 #include "t6001-aux-spmi.dtsi"
+#include "t6001-display-extra.dtsi"
+#include "t6001-firmware-interfaces.dtsi"
 #endif

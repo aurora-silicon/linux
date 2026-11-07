@@ -93,3 +93,5 @@
 
 #include "t6000-peripherals.dtsi"
 #include "t6000-aux-spmi.dtsi"
+
+#include "t6000-firmware-interfaces.dtsi"
