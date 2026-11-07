@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
  * The T8132 G16 GPU, its ASC mailbox and the outer GFX power gate (TVM),
- * as on the J713. m1n1 fills the inherited UAT and firmware ranges (reg)
- * and enables them; a board enables the GPU once its firmware and board data
- * are qualified.
+ * as on the J713. The GPU depends on the 26.6.2 firmware, not the board: the
+ * boot loader fills the inherited UAT and firmware ranges (reg), enables
+ * them and publishes the handoff, or disables the GPU.
  *
  * Copyright The Asahi Linux Contributors
  */
@@ -54,7 +54,6 @@
 		compatible = "apple,t8132-gfx-tvm";
 		reg = <0x3 0x80760800 0x0 0x4>;
 		#power-domain-cells = <0>;
-		status = "disabled";
 	};
 
 	gpu: gpu@302600000 {
@@ -72,7 +71,6 @@
 				<&gpu_shared_l2>, <&gpu_fw_text>, <&gpu_fw_data>;
 		memory-region-names = "ttbs", "pagetables", "handoff",
 				      "shared-l2", "fw-text", "fw-data";
-		status = "disabled";
 	};
 
 	agx_mbox: mailbox@302608000 {
@@ -88,6 +86,17 @@
 		interrupt-names = "send-empty", "send-not-empty",
 				  "recv-empty", "recv-not-empty";
 		#mbox-cells = <0>;
-		status = "disabled";
 	};
+};
+
+/* The outer TVM gate is the parent of the GFX PMGR domain. */
+&ps_gfx {
+	power-domains = <&gfx_tvm>;
+	/* The G16 firmware stays live across suspend-to-idle. */
+	apple,sleep-retained;
+};
+
+/* The existing report provider owns readiness for shared PMP commands. */
+&pmp {
+	apple,pmp-report = <&pmp_report>;
 };
