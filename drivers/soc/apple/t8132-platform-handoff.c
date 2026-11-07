@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
-/* Supply missing platform descriptions for the original J713 loader ABI.
+/* Supply missing platform descriptions for the original J713 loader ABI,
+ * which the J715 shares, and the M4 PMGR ownership policy on the qualified
+ * firmware for every M4 Mac.
  * Keep the shared m1n1 payload usable by the stable kernel. Hardware control
  * remains in the ordinary MCC, PMC and CLPC drivers, with one DTS data source.
  * J713 PMGR ownership/status also comes from its board DTS, before any domain
@@ -9,6 +11,7 @@
 #include <linux/libfdt.h>
 #include <linux/of.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/t8132.h>
 #include <linux/string.h>
 
 extern const u8 __dtb_t8132_platform_data_begin[];
@@ -130,8 +133,14 @@ static int __init t8132_fdt_node_offset(const void *data,
 	return fdt_subnode_offset(data, parent, kbasename(node->full_name));
 }
 
-/* Apply only board availability/ownership, never imported register values. */
-static int __init t8132_pmgr_policy(struct of_changeset *cs, unsigned int *changed)
+/*
+ * Apply only availability/ownership, never imported register values. Only the
+ * original J713 loader tree (the Airs') can mark a domain okay that the policy
+ * refuses. Other trees state what their board wires, so keep their status,
+ * except on domains the policy gives the firmware.
+ */
+static int __init t8132_pmgr_policy(struct of_changeset *cs, unsigned int *changed,
+				    bool legacy)
 {
 	const void *data = __dtb_t8132_platform_data_begin;
 	const char * const ownership[] = { "apple,firmware-owned", "apple,inherited-on" };
@@ -150,6 +159,7 @@ static int __init t8132_pmgr_policy(struct of_changeset *cs, unsigned int *chang
 		for_each_child_of_node_scoped(pmgr, node) {
 			const char *status, *live;
 			int offset, len;
+			bool owned;
 
 			if (!of_device_is_compatible(node, "apple,t8132-pmgr-pwrstate"))
 				continue;
@@ -159,12 +169,16 @@ static int __init t8132_pmgr_policy(struct of_changeset *cs, unsigned int *chang
 			/* Unknown legacy domains stay inaccessible, rather than being probed. */
 			if (!status)
 				status = "disabled";
+			owned = offset >= 0 &&
+				(fdt_getprop(data, offset, ownership[0], NULL) ||
+				 fdt_getprop(data, offset, ownership[1], NULL));
 			if (of_property_read_string(node, "status", &live)) {
 				ret = of_changeset_add_prop_string(cs, node, "status", status);
 				if (ret)
 					goto put_pmgr;
 				(*changed)++;
-			} else if (!strcmp(status, "disabled") && strcmp(live, status)) {
+			} else if (strcmp(live, status) &&
+				   (legacy ? !strcmp(status, "disabled") : owned)) {
 				ret = of_changeset_update_prop_string(cs, node, "status", status);
 				if (ret)
 					goto put_pmgr;
@@ -215,8 +229,7 @@ static int __init t8132_platform_handoff(void)
 	unsigned int added = 0, changed = 0;
 	int root, node, ret;
 
-	if (!of_machine_is_compatible("apple,j713") ||
-	    !of_machine_is_compatible("apple,t8132"))
+	if (!apple_t8132_firmware_path() || !of_machine_is_compatible("apple,t8132"))
 		return 0;
 	if (fdt_check_header(data))
 		return -EINVAL;
@@ -229,7 +242,7 @@ static int __init t8132_platform_handoff(void)
 		goto out;
 	}
 	of_changeset_init(cs);
-	ret = t8132_pmgr_policy(cs, &changed);
+	ret = t8132_pmgr_policy(cs, &changed, apple_t8132_air());
 	if (ret)
 		goto destroy;
 

@@ -300,3 +300,5 @@
 };
 
 #include "hwmon-fan-dual.dtsi"
+
+#include "t6002-j375d-control.dtsi"

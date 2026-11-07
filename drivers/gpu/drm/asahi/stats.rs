@@ -35,6 +35,7 @@
 //! we only retain the latest values.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use kernel::prelude::*;
 
 /// Per-device snapshot of AGX firmware stats.
 ///
@@ -62,6 +63,8 @@ pub(crate) struct StatsSnapshot {
     /// Optional qualified reader. The legacy C layout above remains a prefix;
     /// C accesses this extension only through the registered Rust callbacks.
     pub(crate) g17_reader: Option<crate::g17::stats::Reader>,
+    /// Frequencies in the same DT order used to build the legacy firmware table.
+    pub(crate) frequencies_hz: KVec<u64>,
 }
 
 // Keep the Rust half of the C sysfs layout contract checked as well.
@@ -73,6 +76,10 @@ const _: () = {
 };
 
 impl StatsSnapshot {
+    pub(crate) fn requested_frequency(&self, pstate: u32) -> Option<u64> {
+        self.frequencies_hz.get(pstate as usize).copied()
+    }
+
     /// Bump the completed-submission counter (called from the queue
     /// completion path in `JobFence::command_complete`, NOT from the stats
     /// channel).
