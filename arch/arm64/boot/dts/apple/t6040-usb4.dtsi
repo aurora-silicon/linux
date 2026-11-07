@@ -309,6 +309,7 @@
 		#size-cells = <2>;
 		ranges;
 		nonposted-mmio;
+		status = "disabled";
 
 		apciec0_dart: iommu@384000000 {
 			compatible = "apple,t6041-dart", "apple,t8110-dart";
@@ -379,6 +380,7 @@
 		#size-cells = <2>;
 		ranges;
 		nonposted-mmio;
+		status = "disabled";
 
 		apciec1_dart: iommu@38c000000 {
 			compatible = "apple,t6041-dart", "apple,t8110-dart";
@@ -449,6 +451,7 @@
 		#size-cells = <2>;
 		ranges;
 		nonposted-mmio;
+		status = "disabled";
 
 		apciec2_dart: iommu@394000000 {
 			compatible = "apple,t6041-dart", "apple,t8110-dart";
