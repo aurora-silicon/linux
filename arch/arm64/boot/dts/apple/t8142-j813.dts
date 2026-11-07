@@ -21,3 +21,6 @@
 #include "t8142-j813-audio.dtsi"
 
 #include "t8142-j813-unbound.dtsi"
+
+
+#include "t8142-j813-power-domains.dtsi"

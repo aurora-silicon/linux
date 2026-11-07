@@ -22,3 +22,6 @@
 };
 
 #include "t8142-j704-audio-topology.dtsi"
+
+
+#include "t8142-j704-power-domains.dtsi"

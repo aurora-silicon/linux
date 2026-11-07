@@ -276,8 +276,8 @@ allOf:
               minItems: 3
               maxItems: 4
             power-domains:
-              description: Power and combined clock gates required by this hardware.
-              minItems: 8
+              description: Physical power and combined clock-gate dependencies.
+              minItems: 1
               maxItems: 8
           required:
             - compatible
@@ -312,6 +312,10 @@ allOf:
               description: Interrupt lines wired to the system interrupt controller.
               minItems: 6
               maxItems: 6
+            power-domains:
+              description: Physical power and combined clock-gate dependencies.
+              minItems: 1
+              maxItems: 8
           required:
             - compatible
             - reg

@@ -63,3 +63,6 @@
 };
 
 #include "t6050-j775c-audio-topology.dtsi"
+
+
+#include "t6050-j775c-power-domains.dtsi"

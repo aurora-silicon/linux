@@ -63,3 +63,6 @@
 };
 
 #include "t6050-j873s-audio-topology.dtsi"
+
+
+#include "t6050-j873s-power-domains.dtsi"

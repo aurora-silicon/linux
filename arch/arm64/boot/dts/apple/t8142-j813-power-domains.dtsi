@@ -1,0 +1,326 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Hardware gate relationships only. New controllers and states stay disabled. */
+
+&pmgr {
+	hw_pwr_3807001a0: power-controller@1a0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1a0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "global-aux-ctrl0";
+		status = "disabled";
+	};
+	hw_pwr_3807001a8: power-controller@1a8 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1a8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "global-aux-ctrl1";
+		status = "disabled";
+	};
+	hw_pwr_380700290: power-controller@290 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x290 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "disp-sys";
+		status = "disabled";
+	};
+	hw_pwr_380700298: power-controller@298 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x298 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc-sys";
+		status = "disabled";
+	};
+	hw_pwr_3807002a0: power-controller@2a0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2a0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "jpg";
+		status = "disabled";
+	};
+	hw_pwr_3807002a8: power-controller@2a8 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2a8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "msr";
+		status = "disabled";
+	};
+	hw_pwr_3807002c0: power-controller@2c0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2c0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "scodec";
+		status = "disabled";
+	};
+	hw_pwr_3807002e8: power-controller@2e8 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2e8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ane-sys";
+		status = "disabled";
+	};
+	hw_pwr_380700320: power-controller@320 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x320 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "msr-ase-core";
+		power-domains = <&hw_pwr_3807002a8>;
+		status = "disabled";
+	};
+	hw_pwr_380700328: power-controller@328 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x328 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "sio-cpu";
+		status = "disabled";
+	};
+	hw_pwr_380700358: power-controller@358 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x358 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "i2c2";
+		status = "disabled";
+	};
+	hw_pwr_3807003a0: power-controller@3a0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3a0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aes";
+		status = "disabled";
+	};
+	hw_pwr_3807003c0: power-controller@3c0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3c0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "scodec-streaming";
+		power-domains = <&hw_pwr_3807002c0>;
+		status = "disabled";
+	};
+	hw_pwr_3807003c8: power-controller@3c8 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3c8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc0-pcie";
+		power-domains = <&ps_atc0_common>;
+		status = "disabled";
+	};
+	hw_pwr_3807003d0: power-controller@3d0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3d0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc0-cio";
+		power-domains = <&ps_atc0_common>;
+		status = "disabled";
+	};
+	hw_pwr_3807003d8: power-controller@3d8 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3d8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc1-pcie";
+		power-domains = <&ps_atc1_common>;
+		status = "disabled";
+	};
+	hw_pwr_3807003e0: power-controller@3e0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3e0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc1-cio";
+		power-domains = <&ps_atc1_common>;
+		status = "disabled";
+	};
+	hw_pwr_380700440: power-controller@440 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x440 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "spi2";
+		power-domains = <&ps_spi_p>;
+		status = "disabled";
+	};
+	hw_pwr_380700450: power-controller@450 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x450 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "spi4";
+		power-domains = <&ps_spi_p>;
+		status = "disabled";
+	};
+	hw_pwr_3807004d8: power-controller@4d8 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4d8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc0-cio-pcie";
+		power-domains = <&hw_pwr_3807003d0>;
+		status = "disabled";
+	};
+	hw_pwr_3807004e0: power-controller@4e0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4e0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc0-cio-usb";
+		power-domains = <&hw_pwr_3807003d0>;
+		status = "disabled";
+	};
+	hw_pwr_3807004e8: power-controller@4e8 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4e8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc1-cio-pcie";
+		power-domains = <&hw_pwr_3807003e0>;
+		status = "disabled";
+	};
+	hw_pwr_3807004f0: power-controller@4f0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4f0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc1-cio-usb";
+		power-domains = <&hw_pwr_3807003e0>;
+		status = "disabled";
+	};
+	hw_pwr_380708000: power-controller@8000 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc-dma";
+		power-domains = <&hw_pwr_380700298>;
+		status = "disabled";
+	};
+	hw_pwr_380708008: power-controller@8008 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8008 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc-pipe4";
+		power-domains = <&hw_pwr_380708000>;
+		status = "disabled";
+	};
+	hw_pwr_380708010: power-controller@8010 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8010 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc-pipe5";
+		power-domains = <&hw_pwr_380708000>;
+		status = "disabled";
+	};
+	hw_pwr_380708018: power-controller@8018 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8018 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc-me0";
+		power-domains = <&hw_pwr_380708000>;
+		status = "disabled";
+	};
+	hw_pwr_380708020: power-controller@8020 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8020 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc-me1";
+		power-domains = <&hw_pwr_380708018>;
+		status = "disabled";
+	};
+};
+
+&hw_acio0 {
+	power-domains = <&hw_pwr_3807003d0>, <&hw_pwr_3807004d8>, <&hw_pwr_3807004e0>;
+};
+
+&hw_acio1 {
+	power-domains = <&hw_pwr_3807003e0>, <&hw_pwr_3807004e8>, <&hw_pwr_3807004f0>;
+};
+
+&hw_aes {
+	power-domains = <&hw_pwr_3807003a0>;
+};
+
+&hw_ane {
+	power-domains = <&hw_pwr_3807002e8>;
+};
+
+&hw_apciec0 {
+	power-domains = <&ps_atc0_usb_aon>, <&hw_pwr_3807003c8>;
+};
+
+&hw_apciec1 {
+	power-domains = <&ps_atc1_usb_aon>, <&hw_pwr_3807003d8>;
+};
+
+&hw_apr {
+	power-domains = <&hw_pwr_3807002c0>;
+};
+
+&hw_avd {
+	power-domains = <&ps_avd_sys>;
+};
+
+&hw_ave {
+	power-domains = <&hw_pwr_380700298>, <&hw_pwr_380708008>, <&hw_pwr_380708010>, <&hw_pwr_380708018>, <&hw_pwr_380708020>, <&hw_pwr_380708000>;
+};
+
+&hw_dcp0_expert {
+	power-domains = <&hw_pwr_380700290>;
+};
+
+&hw_dptx0_aux {
+	power-domains = <&hw_pwr_3807001a0>;
+};
+
+&hw_dptx1_aux {
+	power-domains = <&hw_pwr_3807001a8>;
+};
+
+&hw_i2c2 {
+	power-domains = <&hw_pwr_380700358>;
+};
+
+&hw_jpeg0 {
+	power-domains = <&hw_pwr_3807002a0>;
+};
+
+&hw_jpeg1 {
+	power-domains = <&hw_pwr_3807002a0>;
+};
+
+&hw_scaler0 {
+	power-domains = <&hw_pwr_3807002a8>, <&hw_pwr_380700320>;
+};
+
+&hw_scdc {
+	power-domains = <&hw_pwr_3807003c0>;
+};
+
+&hw_sio {
+	power-domains = <&hw_pwr_380700328>;
+};
+
+&hw_spi2 {
+	power-domains = <&hw_pwr_380700440>;
+};
+
+&hw_spi4 {
+	power-domains = <&hw_pwr_380700450>;
+};

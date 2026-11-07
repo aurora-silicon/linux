@@ -23,3 +23,6 @@
 #include "t6050-k116c-peripherals.dtsi"
 
 #include "t6050-k116c-audio-topology.dtsi"
+
+
+#include "t6050-k114-k116-power-domains.dtsi"
