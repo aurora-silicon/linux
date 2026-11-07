@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/apple,aop-audio.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple AOP speaker and headset audio service
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  Firmware owns the serializers while the host exchanges the headset,
+  speaker and speaker-sense streams through the audio DMA controller.
+  This interface does not contain acoustic configuration or amplifier data.
+
+allOf:
+  - $ref: dai-common.yaml#
+
+properties:
+  compatible:
+    items:
+      - const: apple,t6050-aop-audio
+      - const: apple,aop-audio
+
+  dmas:
+    items:
+      - description: Headset playback
+      - description: Headset microphone capture
+      - description: Speaker playback
+      - description: Speaker voltage and current sensing
+
+  dma-names:
+    items:
+      - const: cout
+      - const: cin
+      - const: spkr
+      - const: sense
+
+  '#sound-dai-cells':
+    const: 1
+
+required:
+  - compatible
+  - dmas
+  - dma-names
+  - '#sound-dai-cells'
+
+unevaluatedProperties: false

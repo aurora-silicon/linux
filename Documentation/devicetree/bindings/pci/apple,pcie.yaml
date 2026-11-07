@@ -52,6 +52,8 @@ select:
               - apple,t6030-pcie
               - apple,t6031-pcie
               - apple,t6041-pcie
+              - apple,t6050-pcie
+              - apple,t6050-pciec
               - apple,t8103-pcie
               - apple,t8103-pciec
               - apple,t8112-pcie
@@ -93,6 +95,7 @@ select:
                 const: apple,pciec
       required:
         - compatible
+
 properties:
   compatible: true
 
@@ -118,6 +121,15 @@ properties:
   ranges: true
 
   interrupts: true
+
+  interrupt-names: true
+
+  nonposted-mmio: true
+
+  apple,msi-vector-base:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 255
+    description: First global vector targeted by this host's local MSI map.
 
   msi-parent: true
 
@@ -183,6 +195,19 @@ patternProperties:
         description: Optional GPIO to power on the device
         maxItems: 1
 
+      apple,link-trained-by-bootloader:
+        type: boolean
+        description: |
+          Firmware has initialized power, shared registers, PHY and clocks,
+          deasserted PERST and trained the link. The OS must validate and adopt
+          this state, with no reset, tunable replay, clock policy changes or
+          retraining fallback. Firmware must leave endpoint DMA and MSI/MSI-X
+          disabled and the port RID table without valid entries. Firmware
+          retains responsibility for power and external reset throughout use.
+          On T6050, each such root port 00:<n>.0 is admitted with one
+          endpoint, device 0 function 0, on the secondary bus the firmware
+          numbered, at Gen3 x1.
+
       interrupt-controller: true
 
       apple,tunable:
@@ -197,8 +222,7 @@ patternProperties:
 
     unevaluatedProperties: false
 
-# The root declares the union of property types for DTB decoding. The
-# conditional variants below each retain their closed property contract.
+# Root property types are shared; each conditional variant remains closed.
 additionalProperties: true
 
 allOf:
@@ -357,12 +381,14 @@ $defs:
               - const: apple,t6020-pcie
           - const: apple,t8140-pcie
           - const: apple,t8152-pcie
+          - const: apple,t6050-pcie
           - const: apple,t8132-pcie
           - const: apple,t8103-pciec
           - items:
               - const: apple,t8112-pciec
               - const: apple,t8103-pciec
           - const: apple,t6000-pciec
+          - const: apple,t6050-pciec
           - items:
               - const: apple,t8132-pciec
               - const: apple,t8122-pciec
@@ -385,11 +411,11 @@ $defs:
 
       reg:
         minItems: 3
-        maxItems: 10
+        maxItems: 14
 
       reg-names:
         minItems: 3
-        maxItems: 10
+        maxItems: 14
 
       ranges:
         minItems: 2
@@ -400,6 +426,19 @@ $defs:
           Interrupt specifiers, one for each root port.
         minItems: 1
         maxItems: 4
+
+      interrupt-names:
+        minItems: 1
+        maxItems: 4
+        items:
+          pattern: "^port[0-3]$"
+
+      nonposted-mmio: true
+
+      apple,msi-vector-base:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        maximum: 255
+        description: First global vector targeted by this host's local MSI map.
 
       msi-parent: true
 
@@ -468,6 +507,19 @@ $defs:
             description: Optional GPIO to power on the device
             maxItems: 1
 
+          apple,link-trained-by-bootloader:
+            type: boolean
+            description: |
+              Firmware has initialized power, shared registers, PHY and clocks,
+              deasserted PERST and trained the link. The OS must validate and adopt
+              this state, with no reset, tunable replay, clock policy changes or
+              retraining fallback. Firmware must leave endpoint DMA and MSI/MSI-X
+              disabled and the port RID table without valid entries. Firmware
+              retains responsibility for power and external reset throughout use.
+              On T6050, each such root port 00:<n>.0 is admitted with one
+              endpoint, device 0 function 0, on the secondary bus the firmware
+              numbered, at Gen3 x1.
+
           interrupt-controller: true
 
           apple,tunable:
@@ -506,6 +558,52 @@ $defs:
           properties:
             compatible:
               contains:
+                const: apple,t6050-pcie
+        then:
+          properties:
+            reg:
+              minItems: 5
+              maxItems: 14
+            reg-names:
+              description:
+                config and rc, then port<n>, phy<n> and intr2axi<n> for each
+                bootloader-trained root port 00:<n>.0.
+              minItems: 5
+              maxItems: 14
+              items:
+                pattern: "^(config|rc|(port|phy|intr2axi)[0-3])$"
+            interrupts:
+              maxItems: 4
+            interrupt-names:
+              items:
+                pattern: "^port[0-3]$"
+            apple,msi-vector-base:
+              const: 64
+            power-domains: false
+          required:
+            - interrupt-names
+            - apple,msi-vector-base
+            - iommu-map
+          patternProperties:
+            "^pci@":
+              properties:
+                reset-gpios:
+                  description:
+                    The PERST# line of a port whose endpoint needs a root-port
+                    reset after the bootloader trained the link. Left as the
+                    bootloader set it until that reset.
+                pwren-gpios: false
+              required:
+                - apple,link-trained-by-bootloader
+        else:
+          patternProperties:
+            "^pci@":
+              properties:
+                apple,link-trained-by-bootloader: false
+      - if:
+          properties:
+            compatible:
+              contains:
                 const: apple,t8140-pcie
         then:
           properties:
@@ -540,6 +638,7 @@ $defs:
                 enum:
                   - apple,t8103-pciec
                   - apple,t6000-pciec
+                  - apple,t6050-pciec
         then:
           properties:
             reg:
@@ -628,26 +727,42 @@ $defs:
                     interrupts:
                       maxItems: 3
                 else:
-                  properties:
-                    reg-names:
-                      minItems: 3
-                      items:
-                        - const: config
-                        - const: rc
-                        - const: port0
-                        - const: port1
-                        - const: port2
-                        - const: port3
-                        - const: phy0
-                        - const: phy1
-                        - const: phy2
-                        - const: phy3
+                  if:
+                    properties:
+                      compatible:
+                        not:
+                          contains:
+                            const: apple,t6050-pcie
+                  then:
+                    properties:
+                      reg-names:
+                        minItems: 3
+                        items:
+                          - const: config
+                          - const: rc
+                          - const: port0
+                          - const: port1
+                          - const: port2
+                          - const: port3
+                          - const: phy0
+                          - const: phy1
+                          - const: phy2
+                          - const: phy3
+            - if:
+                properties:
+                  compatible:
+                    not:
+                      contains:
+                        const: apple,t6050-pcie
+              then:
+                patternProperties:
+                  "^pci@":
+                    required:
+                      - reset-gpios
           patternProperties:
             "^pci@":
               properties:
                 apple,tunable: false
-              required:
-                - reset-gpios
 
 examples:
   - |

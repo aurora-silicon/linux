@@ -26,6 +26,7 @@ select:
               - apple,t6030-dwc3
               - apple,t6031-dwc3
               - apple,t6040-dwc3
+              - apple,t6050-dwc3
               - apple,t8103-dwc3
               - apple,t8112-dwc3
               - apple,t8122-dwc3
@@ -49,6 +50,7 @@ select:
                 const: apple,dwc3
       required:
         - compatible
+
 properties:
   compatible: true
 
@@ -84,8 +86,21 @@ properties:
     $ref: "#/$defs/apple,tunable"
     description: Tunables applied to the link registers of the Apple region.
 
-# The root declares the union of property types for DTB decoding. The
-# conditional variants below each retain their closed property contract.
+  apple,tunable-cio:
+    $ref: "#/$defs/apple,tunable"
+    description:
+      Tunables applied to the CIO registers of the Apple region, from offset
+      0x20 of that region, after the driver's fixed CIO values.
+
+  apple,tunable-bulk:
+    $ref: "#/$defs/apple,tunable"
+    description: Tunables applied to the drd-bulk region.
+
+  apple,tunable-ausbc:
+    $ref: "#/$defs/apple,tunable"
+    description: Tunables applied to the drd-ausbc region.
+
+# Root property types are shared; each conditional variant remains closed.
 additionalProperties: true
 
 allOf:
@@ -170,7 +185,7 @@ $defs:
         - description: Bits to be set after applying the mask
     description: >
       Controller table from the device's Apple device tree, applied after
-      every core reset (T6040).
+      every core reset (T6040, T6050).
   legacy-driver:
     type: object
     allOf:
@@ -184,6 +199,23 @@ $defs:
         then:
           required:
             - power-domains
+      - if:
+          properties:
+            compatible:
+              contains:
+                const: apple,t6050-dwc3
+        then:
+          properties:
+            reg:
+              minItems: 3
+            reg-names:
+              minItems: 3
+        else:
+          properties:
+            reg:
+              maxItems: 3
+            reg-names:
+              maxItems: 3
     properties:
       compatible:
         oneOf:
@@ -194,6 +226,7 @@ $defs:
                   - apple,t6030-dwc3
                   - apple,t6031-dwc3
                   - apple,t6040-dwc3
+                  - apple,t6050-dwc3
                   - apple,t8112-dwc3
                   - apple,t8122-dwc3
                   - apple,t8140-dwc3
@@ -207,7 +240,9 @@ $defs:
         items:
           - description: Core DWC3 region
           - description: Apple-specific DWC3 region
-          - description: Controller configuration block (T6040)
+          - description: Controller configuration block (T6040, T6050)
+          - description: Bulk fabric block (T6050)
+          - description: AUSBC debug block (T6050)
 
       reg-names:
         minItems: 2
@@ -215,6 +250,8 @@ $defs:
           - const: dwc3-core
           - const: dwc3-apple
           - const: drd-cfg
+          - const: drd-bulk
+          - const: drd-ausbc
 
       interrupts:
         maxItems: 1
@@ -247,6 +284,20 @@ $defs:
       apple,tunable-link:
         $ref: "#/$defs/apple,tunable"
         description: Tunables applied to the link registers of the Apple region.
+
+      apple,tunable-cio:
+        $ref: "#/$defs/apple,tunable"
+        description:
+          Tunables applied to the CIO registers of the Apple region, from offset
+          0x20 of that region, after the driver's fixed CIO values.
+
+      apple,tunable-bulk:
+        $ref: "#/$defs/apple,tunable"
+        description: Tunables applied to the drd-bulk region.
+
+      apple,tunable-ausbc:
+        $ref: "#/$defs/apple,tunable"
+        description: Tunables applied to the drd-ausbc region.
     required:
       - compatible
       - reg
