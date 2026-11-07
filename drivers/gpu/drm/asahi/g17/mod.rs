@@ -1637,6 +1637,16 @@ impl Gpu {
         }
         let m5 = cfg.profile.is_m5();
         if m5 {
+            // The M5 graph builds only the 26A428 InitData layouts. A firmware that checks
+            // another layout is refused here, before anything is written to the GPU.
+            if variant.m5_layouts != Some(fw::variant::M5Layouts::V26A428) {
+                dev_err!(
+                    dev.as_ref(),
+                    "No M5 InitData layouts for this GPU firmware build ({:?})\n",
+                    variant.m5_layouts
+                );
+                return Err(ENODEV);
+            }
             let board = cfg.m5.ok_or(EINVAL)?;
             J813_FORMS.store(board.j813_forms(), core::sync::atomic::Ordering::Relaxed);
             // Hold the J813's GFX power domain for the session, as the G15 and G16 paths do
