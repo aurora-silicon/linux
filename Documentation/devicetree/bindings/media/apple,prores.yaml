@@ -36,7 +36,16 @@ properties:
     maxItems: 1
 
   power-domains:
-    maxItems: 1
+    minItems: 1
+    items:
+      - description: The engine's power domain
+      - description: Performance request held while the engine works
+
+  power-domain-names:
+    minItems: 1
+    items:
+      - const: core
+      - const: perf
 
   resets:
     maxItems: 1

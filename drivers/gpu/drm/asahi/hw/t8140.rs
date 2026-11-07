@@ -51,14 +51,17 @@ pub(crate) const CONFIG: Config = Config {
     opps: OPPS,
     uat_quirks: crate::mmu::UatQuirks::DEFAULT,
     region_c: &crate::g17::fw::initdata::REGION_C_26A428,
+    chip: None,
     adopt_root_entries: true,
     fabric_bridge: true,
     firmware: crate::g17::fw::variant::Firmware::Fixed(&crate::g17::fw::variant::V26A428),
     // The layouts the A18 Pro has always run with.
     core_layout: crate::g17::CoreLayout {
         cores: None,
+        alternate_core_masks: None,
         operand_state: crate::g17::fw::compute::OperandState::ONE_BY_SIX,
         deflake: crate::g17::fw::render::Deflake::ONE_CLUSTER,
+        compute_blocks: crate::g17::fw::freelist::COMPUTE_BLOCKS,
     },
 };
 
@@ -421,7 +424,9 @@ pub(crate) mod queues {
     // as many as a pair has command records (the render memory's RECORDS).
     pub(crate) const RENDER_PAIRS_PER_OWNER: usize = 1;
     pub(crate) const RENDER_DEPTH: u8 = 32;
-    pub(crate) const COMPUTE_DEPTH: usize = 16;
+    // The firmware stores an ioctl's compute completion stamps only once all of the ioctl's
+    // kicks finished, so finished commands hold their place until the ioctl's longest one ends.
+    pub(crate) const COMPUTE_DEPTH: usize = 32;
 }
 
 /// Read-only recovery evidence, sampled only for selected halted slots.

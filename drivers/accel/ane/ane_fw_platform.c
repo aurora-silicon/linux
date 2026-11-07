@@ -40,7 +40,7 @@ const struct ane_fw_platform ane_h16_platform = {
 	.dapf_dart = 0,
 	.dapf_offset = 0x10000,
 	.dapf_size = SZ_16K,
-	/* The DT compatible is t6041; the physical M4 Pro is T6040. */
+	/* The DT compatible is t6041 on the M4 Max and the M4 Pro (T6040) alike. */
 	.soc = 0x6040,
 	.chip_family = 16,
 	.ane_type = 0x110,
@@ -64,6 +64,13 @@ const struct ane_fw_platform ane_h16_platform = {
 	.preload_dva = { 0x10000000000, 0x100000c0000 },
 	.preload_size = { 0xc0000, 0x2ac000 },
 	.stream_mask = BIT(0) | BIT(11),
+	/*
+	 * System sleep cycles the engine cold and replays every program.
+	 * The warm path stays off: on 25G83 the J616s firmware does not take
+	 * SUSPEND (0x24), bare or after SET_SNE_PMU_BASE2 and
+	 * EXCLAVE_MODE_STOP.
+	 */
+	.sleep_cold = true,
 	.firmware_preloaded = true,
 	.safe_reset = false,
 };
@@ -90,6 +97,13 @@ const struct ane_fw_platform ane_h17_platform = {
 	.stream_mask = BIT(0),
 	.firmware_preloaded = true,
 	.safe_reset = false,
+	/* 25G83 boots this firmware in Exclave mode (SPEC-ANE-SLEEP-H17.md). */
+	.exclave_mode_stop = true,
+	/*
+	 * Off: on 25G83 SUSPEND is still not taken after 0x31 (C7), so sleep
+	 * cycles the engine cold and replays every program behind its handle.
+	 */
+	.sleep_warm = false,
 	/* Cold AP-direct acquisition is staged before any power or DMA write.
 	 * The observer uses the measured H17 26.6.2 register layout.
 	 */

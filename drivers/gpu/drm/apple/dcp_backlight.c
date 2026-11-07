@@ -365,6 +365,7 @@ static void dcp_backlight_retry_work(struct work_struct *work)
 void dcp_backlight_stop(struct apple_dcp *dcp)
 {
 	cancel_delayed_work_sync(&dcp->backlight.fade_work);
+	cancel_delayed_work_sync(&dcp->brightness.fade_work);
 	cancel_delayed_work_sync(&dcp->backlight.retry_work);
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
 		cancel_work_sync(&dcp->backlight.notify_work);
@@ -375,6 +376,8 @@ static void dcp_backlight_release(void *data)
 	dcp_backlight_stop(data);
 }
 
+static void dcp_dac_fade_work(struct work_struct *work);
+
 /*
  * The backlight device is a devres of @dev, registered after probe, so it is
  * unregistered before this action runs, and no request can start a fade
@@ -384,6 +387,7 @@ int dcp_backlight_init(struct apple_dcp *dcp, struct device *dev)
 {
 	spin_lock_init(&dcp->backlight.lock);
 	INIT_DELAYED_WORK(&dcp->backlight.fade_work, dcp_backlight_fade_work);
+	INIT_DELAYED_WORK(&dcp->brightness.fade_work, dcp_dac_fade_work);
 	INIT_WORK(&dcp->backlight.notify_work, dcp_backlight_notify_work);
 	INIT_DELAYED_WORK(&dcp->backlight.retry_work, dcp_backlight_retry_work);
 	return devm_add_action_or_reset(dev, dcp_backlight_release, dcp);
@@ -701,6 +705,64 @@ int dcp_backlight_update(struct apple_dcp *dcp)
 	return drm_crtc_set_brightness(dcp);
 }
 
+/*
+ * The firmware shows a swap's DAC value at once, so a new level would be a
+ * visible jump.  Step from the level set last towards it instead.  Each step
+ * rides on the compositor's next swap, or is presented on its own if no swap
+ * took it within a step.
+ */
+static void dcp_dac_fade_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work),
+					     struct apple_dcp, brightness.fade_work);
+	struct dcp_brightness *b = &dcp->brightness;
+	bool again;
+	u32 elapsed;
+
+	if (READ_ONCE(dcp->quiescing) || READ_ONCE(dcp->crashed))
+		return;
+	if (READ_ONCE(b->update) && READ_ONCE(dcp->mode_state.valid))
+		drm_crtc_set_brightness(dcp);
+
+	if (drm_modeset_lock_single_interruptible(&dcp->crtc->base.mutex))
+		return;
+	if (b->fading) {
+		u32 level;
+
+		elapsed = jiffies_to_msecs(jiffies - b->fade_start);
+		if (elapsed >= DCP_BL_FADE_MS) {
+			level = b->fade_to;
+			b->fading = false;
+		} else if (b->fade_to >= b->fade_from) {
+			level = b->fade_from +
+				mult_frac(b->fade_to - b->fade_from, elapsed, DCP_BL_FADE_MS);
+		} else {
+			level = b->fade_from -
+				mult_frac(b->fade_from - b->fade_to, elapsed, DCP_BL_FADE_MS);
+		}
+		if (level != b->level) {
+			b->level = level;
+			b->dac = calculate_dac(dcp, level);
+			b->update = true;
+		}
+	}
+	/* With no mode set, the next enable swap carries the pending level. */
+	again = b->fading || (b->update && READ_ONCE(dcp->mode_state.valid));
+	drm_modeset_unlock(&dcp->crtc->base.mutex);
+	if (again)
+		queue_delayed_work(system_freezable_wq, &b->fade_work,
+				   msecs_to_jiffies(DCP_BL_FADE_STEP_MS));
+}
+
+/* A lit panel with a mode fades to a new lit level; anything else jumps. */
+static bool dcp_dac_fade_starts(struct apple_dcp *dcp, u32 nits)
+{
+	struct dcp_brightness *b = &dcp->brightness;
+
+	return dcp_has_panel(dcp) && READ_ONCE(dcp->mode_state.valid) &&
+	       b->level && nits && b->level != nits;
+}
+
 static int dcp_set_brightness(struct backlight_device *bd)
 {
 	int ret = 0;
@@ -739,6 +801,18 @@ static int dcp_set_brightness(struct backlight_device *bd)
 	if (ret)
 		return ret;
 
+	/* A new level restarts the fade from the level set last. */
+	if (dcp_dac_fade_starts(dcp, brightness)) {
+		dcp->brightness.fade_from = dcp->brightness.level;
+		dcp->brightness.fade_to = brightness;
+		dcp->brightness.fade_start = jiffies;
+		dcp->brightness.fading = true;
+		drm_modeset_unlock(&dcp->crtc->base.mutex);
+		mod_delayed_work(system_freezable_wq, &dcp->brightness.fade_work, 0);
+		return 0;
+	}
+	dcp->brightness.fading = false;
+	dcp->brightness.level = brightness;
 	dcp->brightness.dac = calculate_dac(dcp, brightness);
 	dcp->brightness.update = true;
 
@@ -860,8 +934,10 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
 		dcp_backlight_sync_hint(dcp);
 	if (!dcp_backlight_active(dcp) &&
-	    dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP)
+	    dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP) {
+		dcp->brightness.level = dcp->brightness.nits;
 		dcp->brightness.dac = calculate_dac(dcp, dcp->brightness.nits);
+	}
 
 	return 0;
 }

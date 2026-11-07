@@ -11,6 +11,7 @@ struct ane_h16_sim {
 	struct ane_h16_mmio mmio;
 	struct ane_fw_platform soc;
 	u32 scratch[8];
+	u32 irq;
 	u32 dapf[SZ_16K / 4];
 	u32 dart_params;
 	u32 dapf_reads;
@@ -28,8 +29,13 @@ struct ane_h16_sim {
 	u32 pins;
 	u32 quarantines;
 	u32 allocations;
+	u32 timeout_slots;
+	u32 timeout_bodies;
+	u32 timeout_scratch;
+	u64 timeout_head;
 	u32 lock;
 	u32 fault;
+	u32 fault_address_reads;
 	u32 channel_request;
 	u32 ipc_request;
 	u32 heap_request;
@@ -45,12 +51,21 @@ struct ane_h16_sim {
 	bool wrong_table;
 	bool stale_table;
 	bool no_clear;
+	bool no_startup_reply;
 	bool shared_pending;
 	bool shared_replied;
 	bool ce_timeout;
 	bool bad_power;
 	bool bad_rvbar;
 	bool fail_map;
+	/* Restart op: startups still to stall, cycles seen, result, reset latch. */
+	struct ane_h16_boot_ops ops;
+	u32 stall_startups;
+	u32 power_cycles;
+	int restart_error;
+	bool reset;
+	bool unpowered;
+	u32 quarantine_reads;
 };
 
 static const u32 sim_power_words[] = { 0x3c0, 0xc008, 0xc000, 0xc010, 0xc018 };
@@ -93,6 +108,8 @@ static u32 sim_read32(void *ctx, enum ane_h16_window w, u32 off)
 			return s->lock;
 		if (off == s->mmio.dart_fault)
 			return s->fault;
+		if (off == s->mmio.dart_address_lo || off == s->mmio.dart_address_hi)
+			s->fault_address_reads++;
 		return 0;
 	}
 	if (w == ANE_H16_DAPF) {
@@ -108,7 +125,7 @@ static u32 sim_read32(void *ctx, enum ane_h16_window w, u32 off)
 		if (off >= s->soc.scratch && off < s->soc.scratch + 32)
 			return s->scratch[(off - s->soc.scratch) / 4];
 		if (off == s->soc.irq_status)
-			return 0;
+			return s->irq;
 	}
 	return 0xa5a5a5a5;
 }
@@ -147,6 +164,26 @@ static void sim_reply(struct ane_h16_sim *s)
 	put_unaligned_le64(tx->dva | 1, slot);
 }
 
+/* The firmware's channel table, as it publishes it in the IPC surface. */
+static void sim_publish_table(void *cpu, u64 dva)
+{
+	static const char * const names[] = {
+		"TERMINAL", "IO", "DEBUG", "BUF_H2T", "BUF_T2H",
+		"SHAREDMALLOC", "IO_T2H", "DATA_CHAIN_H2T",
+	};
+	unsigned int i;
+
+	for (i = 0; i < 8; i++) {
+		u8 *p = (u8 *)cpu + i * ANE_FW_DESCRIPTOR_SIZE;
+
+		strscpy(p, names[i], 64);
+		put_unaligned_le32(i == 0 ? 2 : i == 4 || i == 5 || i == 6, p + 0x40);
+		put_unaligned_le32(i, p + 0x44);
+		put_unaligned_le64(1, p + 0x48);
+		put_unaligned_le64(dva + ANE_FW_TABLE_SIZE + i * 64, p + 0x50);
+	}
+}
+
 static void sim_write32(void *ctx, enum ane_h16_window w, u32 off, u32 value)
 {
 	struct ane_h16_sim *s = ctx;
@@ -167,8 +204,14 @@ static void sim_write32(void *ctx, enum ane_h16_window w, u32 off, u32 value)
 		return;
 	}
 	KUNIT_EXPECT_TRUE(s->test, w == ANE_H16_ENGINE || w == ANE_H16_XL);
+	if (w == ANE_H16_ENGINE && off == s->soc.irq_ack) {
+		s->irq &= ~value;
+		return;
+	}
 	if (w == ANE_H16_ENGINE && off == f->cpu_control) {
 		s->cpu = value;
+		if (value == f->run)
+			s->reset = false;
 		if (value == f->run && s->fault_after_run)
 			s->fault = BIT(31);
 		if (value == f->run && !s->no_ready) {
@@ -193,6 +236,10 @@ static void sim_write32(void *ctx, enum ane_h16_window w, u32 off, u32 value)
 		if (cell == 7 && value == ~f->ready) {
 			u64 address = f->ipc_dva + (s->wrong_table ? SZ_16K : 0);
 
+			/* A booted-again engine publishes into the cleared, reused IPC. */
+			if (s->power_cycles && s->boot.ipc.cpu)
+				sim_publish_table(s->boot.ipc.cpu, s->boot.ipc.dva);
+
 			if (!s->stale_table) {
 				s->scratch[0] = lower_32_bits(address);
 				s->scratch[1] = upper_32_bits(address);
@@ -213,6 +260,8 @@ static void sim_write32(void *ctx, enum ane_h16_window w, u32 off, u32 value)
 			if (s->command_count < 4)
 				KUNIT_EXPECT_EQ(s->test, tx->id, f->startup[s->command_count].id);
 			s->command_count++;
+			if (s->no_startup_reply)
+				return;
 			if (tx->id == 3 && s->lifecycle_mode) {
 				u8 *slot = ane_fw_transport_slot(t, ANE_FW_SHAREDMALLOC);
 				u64 dva = s->lifecycle_mode == 2 ? 0 : s->build.shared_dva;
@@ -224,6 +273,7 @@ static void sim_write32(void *ctx, enum ane_h16_window w, u32 off, u32 value)
 				put_unaligned_le64(0, slot + 8);
 				put_unaligned_le64(s->lifecycle_mode == 2 ? 1 : 0, slot + 16);
 				s->lifecycle_requested = true;
+				s->irq |= BIT(5);
 			} else if (!tx->id) {
 				u8 *slot = ane_fw_transport_slot(t, ANE_FW_SHAREDMALLOC);
 
@@ -231,6 +281,7 @@ static void sim_write32(void *ctx, enum ane_h16_window w, u32 off, u32 value)
 				put_unaligned_le64(SZ_16K, slot + 8);
 				put_unaligned_le64(0, slot + 16);
 				s->shared_pending = true;
+				s->irq |= BIT(5);
 			} else {
 				sim_reply(s);
 			}
@@ -250,7 +301,7 @@ static void sim_write32(void *ctx, enum ane_h16_window w, u32 off, u32 value)
 		return;
 	}
 	/* The selected AXI and XL tables must finish before scratch writes. */
-	KUNIT_EXPECT_FALSE(s->test, s->boot.ran);
+	KUNIT_EXPECT_TRUE(s->test, !s->boot.ran || s->reset);
 	s->tuning_writes++;
 }
 
@@ -299,23 +350,8 @@ static int sim_alloc_at(void *ctx, u64 dva, size_t size, struct ane_fw_surface *
 	out->dva = dva;
 	out->size = size;
 	s->allocations++;
-	if (dva == s->build.ipc_dva) {
-		static const char * const names[] = {
-			"TERMINAL", "IO", "DEBUG", "BUF_H2T", "BUF_T2H",
-			"SHAREDMALLOC", "IO_T2H", "DATA_CHAIN_H2T",
-		};
-		unsigned int i;
-
-		for (i = 0; i < 8; i++) {
-			u8 *p = (u8 *)out->cpu + i * ANE_FW_DESCRIPTOR_SIZE;
-
-			strscpy(p, names[i], 64);
-			put_unaligned_le32(i == 0 ? 2 : i == 4 || i == 5 || i == 6, p + 0x40);
-			put_unaligned_le32(i, p + 0x44);
-			put_unaligned_le64(1, p + 0x48);
-			put_unaligned_le64(dva + ANE_FW_TABLE_SIZE + i * 64, p + 0x50);
-		}
-	}
+	if (dva == s->build.ipc_dva)
+		sim_publish_table(out->cpu, dva);
 	return 0;
 }
 
@@ -362,6 +398,43 @@ static void sim_mailbox(void *ctx)
 
 static void sim_log(void *ctx, const char *item, u64 a, u64 b)
 {
+	struct ane_h16_sim *s = ctx;
+
+	if (!strcmp(item, "startup SHAREDMALLOC head/slots"))
+		s->timeout_head = a;
+	if (!strcmp(item, "startup SHAREDMALLOC slot/word0"))
+		s->timeout_slots++;
+	if (!strcmp(item, "startup SHAREDMALLOC word1/word2"))
+		s->timeout_bodies++;
+	if (!strcmp(item, "startup timeout scratch"))
+		s->timeout_scratch++;
+	if (!strcmp(item, "quarantine scratch"))
+		s->quarantine_reads++;
+}
+
+static bool sim_powered(void *ctx)
+{
+	return !((struct ane_h16_sim *)ctx)->unpowered;
+}
+
+/* A verified power cycle: the CPU is held in reset until the next RUN. */
+static int sim_restart(void *ctx)
+{
+	struct ane_h16_sim *s = ctx;
+
+	s->power_cycles++;
+	if (s->restart_error)
+		return s->restart_error;
+	s->reset = true;
+	s->cpu = 0;
+	s->scratch_writes = 0;
+	s->tuning_writes = 0;
+	s->command_count = 0;
+	memset(s->scratch, 0, sizeof(s->scratch));
+	if (s->stall_startups)
+		s->stall_startups--;
+	s->no_startup_reply = s->stall_startups > 0;
+	return 0;
 }
 
 static void sim_quarantine(void *ctx, int error)
@@ -532,6 +605,32 @@ static void ane_h16_happy_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), -EBUSY);
 }
 
+/*
+ * A cold boot after sleep runs the boot again on the surfaces it mapped
+ * before: the same DVA and size is reused, cleared, with no new mapping;
+ * anything else is allocated.
+ */
+static void ane_h16_alloc_reuse_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+	struct ane_fw_surface surface = {};
+	u64 dva = s->build.pool_dva;
+	void *cpu;
+	u32 allocations;
+
+	KUNIT_ASSERT_EQ(test, ane_h16_alloc(&s->boot, dva, SZ_16K, &surface), 0);
+	cpu = surface.cpu;
+	memset(cpu, 0x5a, SZ_16K);
+	allocations = s->allocations;
+	KUNIT_ASSERT_EQ(test, ane_h16_alloc(&s->boot, dva, SZ_16K, &surface), 0);
+	KUNIT_EXPECT_EQ(test, s->allocations, allocations);
+	KUNIT_EXPECT_PTR_EQ(test, surface.cpu, cpu);
+	KUNIT_EXPECT_FALSE(test, memchr_inv(cpu, 0, SZ_16K));
+	surface.size = SZ_32K;
+	KUNIT_ASSERT_EQ(test, ane_h16_alloc(&s->boot, dva, SZ_16K, &surface), 0);
+	KUNIT_EXPECT_EQ(test, s->allocations, allocations + 1);
+}
+
 static void ane_h16_no_ready_test(struct kunit *test)
 {
 	struct ane_h16_sim *s = test->priv;
@@ -670,6 +769,174 @@ static void ane_h16_scratch3_timeout_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, s->command_count, 0U);
 }
 
+/* A timeout snapshots the ring without answering, moving it or trying again. */
+static void ane_h16_startup_timeout_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+	struct ane_fw_transport *t = &s->boot.transport;
+	u8 before[ANE_FW_SLOT_SIZE];
+	u8 *slot;
+
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_BOOT), 0);
+	slot = ane_fw_transport_slot(t, ANE_FW_SHAREDMALLOC);
+	/* An earlier reply still belongs to firmware; the host must leave it. */
+	put_unaligned_le64(s->build.shared_dva | 1, slot);
+	put_unaligned_le64(0, slot + 8);
+	put_unaligned_le64(1, slot + 16);
+	memcpy(before, slot, sizeof(before));
+	s->no_startup_reply = true;
+	s->build.command_timeout_ns = 2000000;
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), -ETIMEDOUT);
+	KUNIT_EXPECT_TRUE(test, s->boot.quarantined);
+	KUNIT_EXPECT_EQ(test, s->command_count, 1U);
+	KUNIT_EXPECT_TRUE(test, t->pending[ANE_FW_IO].active);
+	KUNIT_EXPECT_EQ(test, t->head[ANE_FW_SHAREDMALLOC], 0U);
+	KUNIT_EXPECT_EQ(test, s->timeout_head, 0ULL);
+	KUNIT_EXPECT_EQ(test, s->timeout_slots, t->channels[ANE_FW_SHAREDMALLOC].slots);
+	KUNIT_EXPECT_EQ(test, s->timeout_bodies, s->timeout_slots);
+	KUNIT_EXPECT_EQ(test, s->timeout_scratch, 8U);
+	KUNIT_EXPECT_MEMEQ(test, before, slot, sizeof(before));
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), -EBUSY);
+	KUNIT_EXPECT_EQ(test, s->command_count, 1U);
+}
+
+static void sim_use_restart(struct ane_h16_sim *s, u32 stalls, unsigned int budget)
+{
+	s->ops = sim_ops;
+	s->ops.restart = sim_restart;
+	s->ops.powered = sim_powered;
+	/* Reuse clears the surfaces; keep them inside the sparse simulated heap. */
+	s->heap_request = SZ_64K;
+	s->boot.ops = &s->ops;
+	s->boot.max_restarts = budget;
+	s->stall_startups = stalls;
+	s->no_startup_reply = stalls > 0;
+	s->build.command_timeout_ns = 2000000;
+}
+
+/* A stalled startup is power cycled and booted again; the second one completes. */
+static void ane_h16_startup_restart_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+	u32 allocations;
+
+	sim_use_restart(s, 1, 2);
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_BOOT), 0);
+	allocations = s->allocations;
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), 0);
+	KUNIT_EXPECT_EQ(test, s->boot.stage, ANE_H16_STARTUP);
+	KUNIT_EXPECT_FALSE(test, s->boot.quarantined);
+	KUNIT_EXPECT_EQ(test, s->quarantines, 0U);
+	KUNIT_EXPECT_EQ(test, s->boot.restarts, 1U);
+	KUNIT_EXPECT_EQ(test, s->power_cycles, 1U);
+	KUNIT_EXPECT_EQ(test, s->command_count, 4U);
+	KUNIT_EXPECT_EQ(test, s->boot.tick, 25000000U);
+	/*
+	 * Pool, IPC and heap are reused: the only new mapping is the shared
+	 * allocation the stalled first boot never got as far as requesting.
+	 */
+	KUNIT_EXPECT_EQ(test, s->allocations, allocations + 1);
+	KUNIT_EXPECT_EQ(test, s->timeout_scratch, 8U);
+}
+
+/* The budget bounds the cycles; the last timeout quarantines as before. */
+static void ane_h16_startup_restart_budget_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	sim_use_restart(s, 4, 2);
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, s->boot.restarts, 2U);
+	KUNIT_EXPECT_EQ(test, s->power_cycles, 2U);
+	KUNIT_EXPECT_TRUE(test, s->boot.quarantined);
+	KUNIT_EXPECT_EQ(test, s->quarantines, 1U);
+	KUNIT_EXPECT_EQ(test, s->timeout_scratch, 24U);
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), -EBUSY);
+}
+
+/* An unverified power cycle is not followed by another release of the CPU. */
+static void ane_h16_startup_restart_refused_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	sim_use_restart(s, 1, 2);
+	s->restart_error = -EIO;
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), -EIO);
+	KUNIT_EXPECT_EQ(test, s->power_cycles, 1U);
+	KUNIT_EXPECT_EQ(test, s->command_count, 1U);
+	KUNIT_EXPECT_TRUE(test, s->boot.quarantined);
+	KUNIT_EXPECT_EQ(test, s->quarantines, 1U);
+	/* Still powered: the quarantine reads its evidence. */
+	KUNIT_EXPECT_EQ(test, s->quarantine_reads, 8U);
+}
+
+/* A restart that left the engine off quarantines without touching it. */
+static void ane_h16_startup_restart_unpowered_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	sim_use_restart(s, 1, 2);
+	s->restart_error = -EIO;
+	s->unpowered = true;
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), -EIO);
+	KUNIT_EXPECT_TRUE(test, s->boot.quarantined);
+	KUNIT_EXPECT_EQ(test, s->quarantines, 1U);
+	KUNIT_EXPECT_EQ(test, s->quarantine_reads, 0U);
+}
+
+/*
+ * The boot after system sleep stalls too: its restarts come from a budget of
+ * their own, so a restart spent at bring-up does not use them up.
+ */
+static void ane_h16_resume_restart_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+	unsigned int used = 0;
+
+	sim_use_restart(s, 1, 2);
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), 0);
+	KUNIT_ASSERT_EQ(test, s->boot.restarts, 1U);
+	/* Cold boot after sleep (power cycle, scratch boot), then two stalls. */
+	s->stall_startups = 3;
+	KUNIT_ASSERT_EQ(test, ane_h16_restart(&s->boot), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_startup_restarting(&s->boot, &used, "resume"), 0);
+	KUNIT_EXPECT_EQ(test, used, 2U);
+	KUNIT_EXPECT_EQ(test, s->boot.restarts, 1U);
+	KUNIT_EXPECT_EQ(test, s->power_cycles, 4U);
+	KUNIT_EXPECT_EQ(test, s->command_count, 4U);
+	KUNIT_EXPECT_EQ(test, s->quarantines, 0U);
+}
+
+/* Past its budget, a stall after sleep is returned to the caller unquarantined. */
+static void ane_h16_resume_restart_budget_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+	unsigned int used = 0;
+
+	sim_use_restart(s, 0, 2);
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), 0);
+	s->stall_startups = 5;
+	KUNIT_ASSERT_EQ(test, ane_h16_restart(&s->boot), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_startup_restarting(&s->boot, &used, "resume"),
+			-ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, used, 2U);
+	KUNIT_EXPECT_EQ(test, s->power_cycles, 3U);
+	/* The backend's resume path quarantines; the helper leaves that to it. */
+	KUNIT_EXPECT_EQ(test, s->quarantines, 0U);
+	KUNIT_EXPECT_FALSE(test, s->boot.quarantined);
+}
+
+/* Without the op (or with no budget) a timeout ends the attempt, as before. */
+static void ane_h16_startup_no_budget_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	sim_use_restart(s, 1, 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, s->power_cycles, 0U);
+	KUNIT_EXPECT_TRUE(test, s->boot.quarantined);
+}
+
 /* Stages advance one write at a time, each at most once, in one firmware session. */
 static void ane_h16_incremental_test(struct kunit *test)
 {
@@ -749,6 +1016,21 @@ static void ane_h16_dart_fault_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, s->boot.quarantined);
 	KUNIT_EXPECT_EQ(test, s->pins, 1U);
 	KUNIT_EXPECT_EQ(test, s->quarantines, 1U);
+}
+
+static void ane_h16_fault_address_on_demand_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	s->boot.mmio = &s->mmio;
+	KUNIT_EXPECT_EQ(test, ane_h16_faults(&s->boot, false), 0);
+	KUNIT_EXPECT_EQ(test, s->fault_address_reads, 0U);
+	s->fault = BIT(31);
+	KUNIT_EXPECT_EQ(test, ane_h16_faults(&s->boot, false), -EIO);
+	KUNIT_EXPECT_EQ(test, s->fault_address_reads, 6U);
+	s->fault = 0;
+	KUNIT_EXPECT_EQ(test, ane_h16_faults(&s->boot, true), 0);
+	KUNIT_EXPECT_EQ(test, s->fault_address_reads, 12U);
 }
 
 static void ane_h16_map_failure_test(struct kunit *test)
@@ -874,6 +1156,7 @@ static void ane_h16_foreign_free_test(struct kunit *test)
 }
 
 static struct kunit_case ane_h16_boot_cases[] = {
+	KUNIT_CASE(ane_h16_alloc_reuse_test),
 	KUNIT_CASE(ane_h16_happy_test),
 	KUNIT_CASE(ane_h16_locked_matching_test),
 	KUNIT_CASE(ane_h16_dapf_program_test),
@@ -890,6 +1173,7 @@ static struct kunit_case ane_h16_boot_cases[] = {
 	KUNIT_CASE(ane_h16_power_actual_test),
 	KUNIT_CASE(ane_h16_rvbar_test),
 	KUNIT_CASE(ane_h16_dart_fault_test),
+	KUNIT_CASE(ane_h16_fault_address_on_demand_test),
 	KUNIT_CASE(ane_h16_map_failure_test),
 	KUNIT_CASE(ane_h16_no_ready_test),
 	KUNIT_CASE(ane_h16_wrong_table_test),
@@ -904,6 +1188,14 @@ static struct kunit_case ane_h16_boot_cases[] = {
 	KUNIT_CASE(ane_h16_ce_timeout_test),
 	KUNIT_CASE(ane_h16_zero_tick_test),
 	KUNIT_CASE(ane_h16_scratch3_timeout_test),
+	KUNIT_CASE(ane_h16_startup_timeout_test),
+	KUNIT_CASE(ane_h16_startup_restart_test),
+	KUNIT_CASE(ane_h16_startup_restart_budget_test),
+	KUNIT_CASE(ane_h16_startup_restart_refused_test),
+	KUNIT_CASE(ane_h16_startup_restart_unpowered_test),
+	KUNIT_CASE(ane_h16_startup_no_budget_test),
+	KUNIT_CASE(ane_h16_resume_restart_test),
+	KUNIT_CASE(ane_h16_resume_restart_budget_test),
 	{}
 };
 

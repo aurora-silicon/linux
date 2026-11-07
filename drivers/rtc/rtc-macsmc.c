@@ -135,10 +135,14 @@ static int macsmc_rtc_set_time(struct device *dev, struct rtc_time *tm)
 		__le64 off_secs;
 
 		/*
-		 * The offset holds whole seconds, so the counter's fraction of a
-		 * second is lost: the clock may run up to a second ahead.
+		 * The offset holds whole seconds, so the clock's seconds tick
+		 * with the counter's, not at the second that was set. Round the
+		 * counter to the nearest second rather than down: the clock is
+		 * then at most half a second ahead or behind, instead of up to a
+		 * whole second ahead.
 		 */
-		off_secs = cpu_to_le64(rtc_tm_to_time64(tm) - (ctr >> RTC_SEC_SHIFT));
+		off_secs = cpu_to_le64(rtc_tm_to_time64(tm) -
+				       ((ctr + BIT_ULL(RTC_SEC_SHIFT - 1)) >> RTC_SEC_SHIFT));
 		ret = nvmem_cell_write(rtc->rtc_offset, &off_secs, sizeof(off_secs));
 		return ret < 0 ? ret : 0;
 	}

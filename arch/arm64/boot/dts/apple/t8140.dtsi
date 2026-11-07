@@ -382,6 +382,13 @@
 			     <AIC_FIQ AIC_TMR_HV_VIRT IRQ_TYPE_LEVEL_HIGH>;
 	};
 
+	pmu {
+		compatible = "apple,t8140-pmu";
+		interrupt-parent = <&aic>;
+		/* The AIC raises both clusters' PMU FIQs as this one. */
+		interrupts = <AIC_FIQ AIC_CPU_PMU_P IRQ_TYPE_LEVEL_HIGH>;
+	};
+
 	clkref: clock-ref {
 		compatible = "fixed-clock";
 		#clock-cells = <0>;
@@ -463,6 +470,55 @@
 		};
 	};
 
+	error-handler {
+		compatible = "apple,t8140-error-handler", "apple,soc-error-handler";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 282 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 284 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 286 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 288 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 892 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 352 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 361 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 351 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 358 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 354 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 355 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 356 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 359 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 357 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 290 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 293 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 296 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 299 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 177 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 178 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 179 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 180 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 185 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 184 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 181 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 182 IRQ_TYPE_LEVEL_HIGH>;
+		/* Not yet qualified on the J700. */
+		status = "disabled";
+	};
+
+	event-log-handler {
+		compatible = "apple,t8140-event-log", "apple,soc-event-log";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 232 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 233 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 261 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 278 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 37 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 38 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 652 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 644 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 879 IRQ_TYPE_LEVEL_HIGH>;
+		/* Not yet qualified on the J700. */
+		status = "disabled";
+	};
+
 	soc: soc {
 		compatible = "simple-bus";
 		#address-cells = <2>;
@@ -477,7 +533,8 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1040 IRQ_TYPE_LEVEL_HIGH>;
 			iommus = <&jpeg_dart 0>;
-			power-domains = <&ps_jpg>;
+			power-domains = <&ps_jpg>, <&pmp_report_jpg>;
+			power-domain-names = "core", "perf";
 			status = "disabled";
 		};
 
@@ -498,7 +555,8 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1043 IRQ_TYPE_LEVEL_HIGH>;
 			iommus = <&jpeg1_dart 0>;
-			power-domains = <&ps_jpg>;
+			power-domains = <&ps_jpg>, <&pmp_report_jpg>;
+			power-domain-names = "core", "perf";
 			status = "disabled";
 		};
 
@@ -533,7 +591,8 @@
 			interrupts = <AIC_IRQ 1260 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 1259 IRQ_TYPE_LEVEL_HIGH>;
 			iommus = <&apr_dart 0>;
-			power-domains = <&ps_prores>;
+			power-domains = <&ps_prores>, <&pmp_report_prores>;
+			power-domain-names = "core", "perf";
 			resets = <&ps_prores>;
 			status = "disabled";
 		};
@@ -579,6 +638,33 @@
 				#power-domain-cells = <0>;
 				power-domains = <&ps_venc0_sys>, <&pmc_venc_cluster>;
 				apple,dvfs = <0x198 2>;
+			};
+
+			/*
+			 * ProRes is soc-device record 14, DVFS ordinal 7. Its VMAX
+			 * request votes the SOC rail through the PMP's static agent,
+			 * like AVD; it has no cluster-agent bit. The PMP votes no DCS
+			 * state for it, and with the CPUs idle the CLPC drops DCS to
+			 * state 0 during an encode: the DCS floor holds DRAM up while
+			 * frames are in the engine.
+			 */
+			pmp_report_prores: report@e {
+				compatible = "apple,t8140-pmp-v2-report-entry";
+				reg = <0xe>;
+				label = "pmp-prores";
+				#power-domain-cells = <0>;
+				power-domains = <&ps_prores>, <&pmc_dcs_max>;
+				apple,dvfs = <0x197 2>;
+			};
+
+			/* Both JPEG engines share soc-device record 19, DVFS ordinal 12. */
+			pmp_report_jpg: report@13 {
+				compatible = "apple,t8140-pmp-v2-report-entry";
+				reg = <0x13>;
+				label = "pmp-jpg";
+				#power-domain-cells = <0>;
+				power-domains = <&ps_jpg>;
+				apple,dvfs = <0x19c 2>;
 			};
 
 			/*
@@ -1339,6 +1425,17 @@
 			/* PMP, CLPC and AP agents */
 			apple,static-voters = <0 1 3>;
 			status = "disabled";
+
+			/*
+			 * DCS (DRAM) at its highest state, through the AP's agent.
+			 * The DCS limit still caps it.
+			 */
+			pmc_dcs_max: floor-dcs-max {
+				label = "dcs-max";
+				#power-domain-cells = <0>;
+				apple,rail = <0>;
+				apple,level = <4>;
+			};
 
 			/* VENC-CLSTR-V: the video encoder cluster, bit 3. */
 			pmc_venc_cluster: cluster-venc {

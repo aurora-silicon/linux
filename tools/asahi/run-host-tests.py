@@ -53,7 +53,11 @@ def mutations(flag, names, base, expect=KILL):
 
 # test file -> [(arguments, expectation)]. '{out}' is a fresh directory.
 ASAHI_TESTS = {
+    # The old revision reports a DART fault that clears before the second latch read as success.
+    'ane-tm-transient-fault-tests.py': [([], PASS),
+                                        (['--old-ref', 'b50066848322c6799c1433ee3a358aab2e9faabb'], PASS)],
     'aop-als-channel-tests.py': [([], PASS)],
+    'aop-bootargs-tests.py': [([], PASS)],
     'mtp-pm-tests.py': [(out(), PASS),
                          (out() + ['--old-transport', '4db3a5a22c43'], PASS)],
     'ave-pm-tests.py': [(out(), PASS),
@@ -62,6 +66,8 @@ ASAHI_TESTS = {
     'binding-lifetime-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('no-close', 'no-join'), out()),
     'apple-pwm-pm-tests.py': [([], PASS), (['--negative-control'], PASS)],
+    'apple-m4-pmu-tests.py': [([], PASS)]
+        + mutations('--mutation', ('m1-layout', 'cycles-anywhere', 'expose-8-9', 'flags-in-event'), []),
     'apple-dart-fw-tests.py': [(out(), PASS)],
     'apple-dart-range-tests.py': [([], PASS)],
     'asahi-stats-raw-tests.py': [([], PASS)],
@@ -79,9 +85,15 @@ ASAHI_TESTS = {
     'brcmf-assoc-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('short-ie', 'header-length', 'skb-capacity', 'cmplt-header'), out('--output')),
     'brcmf-bss-tests.py': [(out(), PASS)],
+    # The old revision reports a failed join against the last associated BSS.
+    'brcmf-join-bssid-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('stale-target', 'zero-named', 'no-call'), out()),
     'brcmf-pcie-dma-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('narrow-stream', 'ignore-aperture', 'revision-wide'), out('--output')),
     'brcmf-roam-tests.py': [(out(), PASS)],
+    'brcmf-suspend-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('country-gate', 'queue-reasons', 'worker-gate',
+                                   'resume-order', 'tx-drain'), out()),
     'brcmfmac-scan-timeout-tests.py': [(out('--output'), PASS)],
     'clpc-gpu-demand-tests.py': [([], PASS)],
     # The old policy always disabled compute preemption.
@@ -104,8 +116,8 @@ ASAHI_TESTS = {
     'g15-stats-drain-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
     'g15-zero-words-tests.py': [([], PASS), (['--mutations'], PASS)],
     'g17-telemetry-integration-tests.py': [(out(), PASS)]
-        + mutations('--mutation', ('fields', 'range', 'timestamp', 'age',
-                                   'quarantine', 'epoch', 'legacy-format'), out()),
+        + mutations('--mutation', ('fields', 'range', 'timestamp', 'age', 'delivery',
+                                   'quarantine', 'epoch', 'cutoff', 'whole-batch', 'legacy-format'), out()),
     'g17-admission-deadline-tests.py': [([], PASS)],
     'g17-admission-order-tests.py': [([], PASS)],
     'g17-capacity-fault-tests.py': [([], PASS)],
@@ -119,6 +131,7 @@ ASAHI_TESTS = {
     'g17-pool-release-tests.py': [([], PASS)],
     'g17-resource-tests.py': [([], PASS)],
     'g17-shared-pool-tests.py': [([], PASS)],
+    'g17-t6041-initdata-tests.py': [([], PASS)],
     'g17-uninstalled-cleanup-tests.py': [([], PASS)],
     'g17-unpublished-tests.py': [([], PASS)],
     'mt7932-association-events-tests.py': [(out(), PASS)],
@@ -134,6 +147,7 @@ ASAHI_TESTS = {
                                    'usb-rpm', 'vlp-client', 'six-band'), out('--output'))
         + [(out('--output') + ['--old-usb'], KILL), (out('--output') + ['--old-regulatory'], KILL)],
     'pciec-policy-tests.py': [(out(), PASS)],
+    'pmgr-bus-tests.py': [([], PASS)],
     'pmp-j613-hwmon-tests.py': [([], PASS)],
     'pmu-rtc-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('ack-clobber', 'arm-ack', 'offset-seconds',
@@ -150,6 +164,7 @@ ASAHI_TESTS = {
     't6030-wiring-tests.py': [(out(), PASS), (out() + ['--old-classifier', 'tb'], PASS),
                               (out() + ['--old-classifier', 'dcp'], PASS)],
     't6040-calibration-tests.py': [([], PASS)],
+    't604x-cpu-order-tests.py': [(out('--output') + ['--dtc', '{dtc}'], PASS)],
     'tb-dp-repair-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
     'tbnet-refill-tests.py': [(out(), PASS)]
         + mutations('--mutant', ('refill-count', 'no-retry', 'no-cancel', 'worker-allocation'), out()),
@@ -163,7 +178,7 @@ ASAHI_RUST = ['m3-batching-tests.rs', 'm3-runtime-tests.rs', 'pmp-bootargs-tests
 ASAHI_SHELL = ['g17-ray-query-timeout-tests.sh']
 
 # Production G17 decoder vectors also build directly with rustc --test.
-ASAHI_RUST.append('g17-telemetry-tests.rs')
+ASAHI_RUST += ['g17-telemetry-tests.rs', 'legacy-frequency-tests.rs']
 
 # Python that runs on the host but imports its neighbours, so it keeps the
 # script directory on sys.path (-E -s instead of -I).

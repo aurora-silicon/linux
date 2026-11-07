@@ -2,6 +2,8 @@
 #ifndef __ANE_H16_PROGRAM_H__
 #define __ANE_H16_PROGRAM_H__
 
+#include <linux/wait.h>
+#include <linux/workqueue.h>
 #include <linux/spinlock.h>
 
 #include "ane_fw_transport.h"
@@ -196,6 +198,12 @@ struct ane_h16_program {
 	bool closed;
 	/* Torn down cleanly: its memory went back to the session's spares. */
 	bool released;
+	/* Closed while the engine slept: torn down when the session reopens. */
+	struct list_head deferred;
+	/* Firmware boot the program was loaded in; an older one means lost. */
+	u64 epoch;
+	/* In the session's list of programs to replay after a cold boot. */
+	struct list_head node;
 };
 
 /* The quiet time that ends serving the SHAREDMALLOC ring after UNLOAD. */
@@ -268,6 +276,23 @@ struct ane_h16_session {
 	unsigned int spare_count;
 	/* Quiet time that ends serving the SHAREDMALLOC ring after UNLOAD. */
 	u64 settle_ns;
+	/*
+	 * While the firmware is suspended for system sleep, requests wait in
+	 * ane_h16_session_enter() and closes are deferred to the reopen.
+	 */
+	bool asleep;
+	struct list_head deferred;
+	/*
+	 * Firmware boot count: a cold restart across system sleep loses every
+	 * program loaded before it (ane_h16_session_restart()) until it is
+	 * replayed (ane_h16_session_replay()).
+	 */
+	u64 epoch;
+	/* Created programs not yet closed, in load order. */
+	struct list_head programs;
+	wait_queue_head_t wake;
+	/* The accel node lock the sleep gate serializes on. */
+	struct mutex *lock;
 	/* Generation of the last loaded program, and of the last one executed. */
 	u64 generation;
 	u64 executed;
@@ -276,6 +301,17 @@ struct ane_h16_session {
 	/* Firmware log lines printed after the last failed EXECUTE. */
 	unsigned int fwlog_lines;
 	bool quarantined;
+	/*
+	 * Dynamic power gating (0x002d) held off across back-to-back requests.
+	 * With gate_hold_ns zero every EXECUTE opens and closes the gate itself.
+	 * Otherwise the first EXECUTE opens it, later ones find it open, and it
+	 * closes gate_hold_ns after the last one ended (gate_work, serialized on
+	 * lock), before TERMINATE, and before system sleep.
+	 */
+	u64 gate_hold_ns;
+	bool gate_held;
+	u64 gate_last_ns;
+	struct delayed_work gate_work;
 	/* Firmware phases of the last successful EXECUTE. */
 	struct ane_h16_exec_sample timing;
 	/* Accounted EXECUTEs; the lock lets a reader snapshot them. */
@@ -294,6 +330,15 @@ int ane_h16_session_load(struct ane_h16_session *s,
 int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p);
 int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p);
 void ane_h16_session_put(struct ane_h16_session *s, struct ane_h16_program *p);
+int ane_h16_session_enter(struct ane_h16_session *s, bool nonblock);
+unsigned int ane_h16_session_dump_fwlog(struct ane_h16_session *s);
+void ane_h16_session_sleep(struct ane_h16_session *s, bool asleep);
+int ane_h16_session_gate_expire(struct ane_h16_session *s);
+void ane_h16_session_restart(struct ane_h16_session *s);
+int ane_h16_session_replay(struct ane_h16_session *s, unsigned int *replayed,
+			   u64 *first_ns);
+bool ane_h16_program_lost(const struct ane_h16_session *s, const struct ane_h16_program *p);
+
 void ane_h16_session_sync(struct ane_h16_session *s, struct ane_h16_program *p,
 			  bool for_device);
 void ane_h16_session_account(struct ane_h16_session *s, u64 lock_ns, u64 copy_in_ns,

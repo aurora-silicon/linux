@@ -20,6 +20,10 @@
 #include <linux/irqchip/arm-gic-v3.h>
 
 #include <asm/arm_pmuv3.h>
+#include <asm/apple_cpufeature.h>
+#include <asm/apple_cpufeature.h>
+#include <asm/apple_cpufeature.h>
+#include <asm/apple_amx.h>
 #include <asm/cacheflush.h>
 #include <asm/cputype.h>
 #include <asm/debug-monitors.h>
@@ -1008,8 +1012,153 @@ static u64 reset_amair_el1(struct kvm_vcpu *vcpu, const struct sys_reg_desc *r)
 static u64 reset_actlr(struct kvm_vcpu *vcpu, const struct sys_reg_desc *r)
 {
 	u64 actlr = read_sysreg(actlr_el1);
+
+	/* The guest turns the x86 flags on itself, per thread */
+	if (cpus_have_final_cap(ARM64_HAS_APFLG_APPLE))
+		actlr &= ~ACTLR_APPLE_APFLG;
+
+	/* The guest turns the x86 FP mode on itself, per thread */
+	if (cpus_have_final_cap(ARM64_HAS_AFP_APPLE))
+		actlr &= ~ACTLR_APPLE_AFP;
+
+	/* The guest turns upper-lane preservation on itself, per thread */
+	if (cpus_have_final_cap(ARM64_HAS_PRSV_APPLE))
+		actlr &= ~ACTLR_APPLE_PRSV;
 	vcpu_write_sys_reg(vcpu, actlr, ACTLR_EL1);
 	return actlr;
+}
+
+/*
+ * ASPSR_EL1 holds the guest's x86 parity/adjust flags across its exceptions.
+ * HCR_EL2.TIDCP traps its accesses; while the vCPU is loaded the hardware
+ * copy is the live one, since the guest's ERET restores the flags from it.
+ */
+static bool access_apple_aspsr(struct kvm_vcpu *vcpu, struct sys_reg_params *p,
+			       const struct sys_reg_desc *r)
+{
+	bool loaded = vcpu_get_flag(vcpu, SYSREGS_ON_CPU);
+
+	if (p->is_write) {
+		__vcpu_assign_sys_reg(vcpu, APPLE_ASPSR_EL1, p->regval);
+		if (loaded)
+			write_sysreg_s(p->regval, SYS_IMP_APL_ASPSR_EL12);
+	} else {
+		p->regval = loaded ? read_sysreg_s(SYS_IMP_APL_ASPSR_EL12) :
+			__vcpu_sys_reg(vcpu, APPLE_ASPSR_EL1);
+	}
+	return true;
+}
+
+static unsigned int apple_aspsr_visibility(const struct kvm_vcpu *vcpu,
+					   const struct sys_reg_desc *rd)
+{
+	if (IS_ENABLED(CONFIG_ARM64_APPLE_X86_FLAGS) && has_vhe() &&
+	    cpus_have_final_cap(ARM64_HAS_APFLG_APPLE))
+		return 0;
+	return REG_HIDDEN;
+}
+
+/*
+ * AFPCR_EL0 is the guest's DAZ/FTZ control for the x86 FP mode.
+ * HCR_EL2.TIDCP traps its accesses, from guest EL1 and EL0; while the vCPU
+ * is loaded the hardware register is the live one.
+ */
+static bool access_apple_afpcr(struct kvm_vcpu *vcpu, struct sys_reg_params *p,
+			       const struct sys_reg_desc *r)
+{
+	bool loaded = vcpu_get_flag(vcpu, SYSREGS_ON_CPU);
+
+	if (p->is_write) {
+		u64 val = p->regval & (AFPCR_APPLE_DAZ | AFPCR_APPLE_FTZ);
+
+		__vcpu_assign_sys_reg(vcpu, APPLE_AFPCR_EL0, val);
+		if (loaded)
+			write_sysreg_s(val, SYS_IMP_APL_AFPCR_EL0);
+	} else {
+		p->regval = loaded ? read_sysreg_s(SYS_IMP_APL_AFPCR_EL0) :
+			__vcpu_sys_reg(vcpu, APPLE_AFPCR_EL0);
+	}
+	return true;
+}
+
+static unsigned int apple_afpcr_visibility(const struct kvm_vcpu *vcpu,
+					   const struct sys_reg_desc *rd)
+{
+	if (IS_ENABLED(CONFIG_ARM64_APPLE_X86_FP) && has_vhe() &&
+	    cpus_have_final_cap(ARM64_HAS_AFP_APPLE))
+		return 0;
+	return REG_HIDDEN;
+}
+
+/*
+ * Apple AMX. HCR_EL2.TIDCP traps the guest's AMX_CTL_EL1 and AMX_STATE_T.
+ * The guest controls EN and the SET-while-SET fault, which starts on as on
+ * bare metal; the register file is allocated when the guest first sets EN
+ * and then moved by vcpu_load/vcpu_put.
+ */
+static bool access_apple_amx_ctl(struct kvm_vcpu *vcpu, struct sys_reg_params *p,
+				 const struct sys_reg_desc *r)
+{
+	bool first = false;
+	u64 val;
+
+	if (!p->is_write) {
+		p->regval = __vcpu_sys_reg(vcpu, APPLE_AMX_CTL_EL1);
+		return true;
+	}
+
+	val = p->regval & AMX_CTL_APPLE_GUEST_BITS;
+	if ((val & AMX_CTL_APPLE_EN) && !vcpu->arch.apple_amx) {
+		vcpu->arch.apple_amx = apple_amx_vcpu_alloc();
+		if (!vcpu->arch.apple_amx)
+			val &= ~AMX_CTL_APPLE_EN;	/* EN does not stick */
+		first = vcpu->arch.apple_amx;
+	}
+
+	preempt_disable();
+	__vcpu_assign_sys_reg(vcpu, APPLE_AMX_CTL_EL1, val);
+	if (vcpu_get_flag(vcpu, SYSREGS_ON_CPU)) {
+		/* vcpu_load ran without a register file: do its work now */
+		if (first)
+			apple_amx_vcpu_load(vcpu->arch.apple_amx, val);
+		else
+			apple_amx_vcpu_set_ctl(vcpu->arch.apple_amx, val);
+	}
+	preempt_enable();
+	return true;
+}
+
+static bool access_apple_amx_state(struct kvm_vcpu *vcpu,
+				   struct sys_reg_params *p,
+				   const struct sys_reg_desc *r)
+{
+	bool active;
+
+	if (p->is_write)
+		return ignore_write(vcpu, p);
+
+	preempt_disable();
+	active = apple_amx_vcpu_active(vcpu->arch.apple_amx,
+				       vcpu_get_flag(vcpu, SYSREGS_ON_CPU));
+	preempt_enable();
+	p->regval = active ? AMX_STATE_T_APPLE_ACTIVE : 0;
+	return true;
+}
+
+static u64 reset_apple_amx_ctl(struct kvm_vcpu *vcpu, const struct sys_reg_desc *r)
+{
+	apple_amx_vcpu_reset(vcpu->arch.apple_amx);
+	__vcpu_assign_sys_reg(vcpu, APPLE_AMX_CTL_EL1, AMX_CTL_APPLE_SET_FAULT);
+	return AMX_CTL_APPLE_SET_FAULT;
+}
+
+static unsigned int apple_amx_visibility(const struct kvm_vcpu *vcpu,
+					 const struct sys_reg_desc *rd)
+{
+	if (IS_ENABLED(CONFIG_ARM64_APPLE_AMX) && has_vhe() &&
+	    cpus_have_final_cap(ARM64_HAS_AMX_APPLE))
+		return 0;
+	return REG_HIDDEN;
 }
 
 static u64 reset_mpidr(struct kvm_vcpu *vcpu, const struct sys_reg_desc *r)
@@ -3964,6 +4113,12 @@ static const struct sys_reg_desc sys_reg_descs[] = {
 	TIMER_REG(CNTHV_CTL_EL2, cnthv_visibility),
 	TIMER_REG(CNTHV_CVAL_EL2, cnthv_visibility),
 
+	{ SYS_DESC(SYS_IMP_APL_AMX_STATE_T), access_apple_amx_state,
+	  .visibility = apple_amx_visibility },
+	{ SYS_DESC(SYS_IMP_APL_AMX_CTL_EL1), access_apple_amx_ctl,
+	  reset_apple_amx_ctl, APPLE_AMX_CTL_EL1, 0,
+	  .visibility = apple_amx_visibility },
+
 	{ SYS_DESC(SYS_CNTKCTL_EL12), access_cntkctl_el12 },
 
 	{ SYS_DESC(SYS_CNTP_TVAL_EL02), access_arch_timer },
@@ -3975,6 +4130,12 @@ static const struct sys_reg_desc sys_reg_descs[] = {
 	{ SYS_DESC(SYS_CNTV_CVAL_EL02), access_arch_timer },
 
 	EL2_REG(SP_EL2, NULL, reset_unknown, 0),
+
+	{ SYS_DESC(SYS_IMP_APL_AFPCR_EL0), access_apple_afpcr, reset_val,
+	  APPLE_AFPCR_EL0, 0, .visibility = apple_afpcr_visibility },
+
+	{ SYS_DESC(SYS_IMP_APL_ASPSR_EL1), access_apple_aspsr, reset_val,
+	  APPLE_ASPSR_EL1, 0, .visibility = apple_aspsr_visibility },
 };
 
 static bool handle_at_s1e01(struct kvm_vcpu *vcpu, struct sys_reg_params *p,

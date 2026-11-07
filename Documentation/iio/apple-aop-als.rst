@@ -17,7 +17,8 @@ must not be distributed with test fixtures.
 The `public Redbird report description
 <https://github.com/triutama133/ubuntu_asahi_patch/blob/3cb6569aaa56815e86b487111725a4d05406bd00/kernel-patches/README.md>`_
 identifies a 122-byte report carrying a firmware-computed CCT float at byte
-0x45. The driver exports that layout as ``in_cct_input``, in Kelvin, without
+0x45. The driver exports that value as the standard IIO colour temperature
+channel, ``in_colortemp_input``, processed and in Kelvin, without
 recalculating colour temperature from raw channels. Other lengths do not
 supply a CCT reading. This layout must be verified on each firmware family
 before its CCT readings are used for display policy. The existing CT720 and
@@ -29,7 +30,7 @@ device number::
     for d in /sys/bus/iio/devices/iio:device*; do
         [ "$(cat "$d/name" 2>/dev/null)" = aop-sensors-als ] || continue
         cat "$d/in_illuminance_input"
-        [ ! -e "$d/in_cct_input" ] || cat "$d/in_cct_input"
+        [ ! -e "$d/in_colortemp_input" ] || cat "$d/in_colortemp_input"
     done
 
 These attributes contain the last valid reading, not a sample counter. Polling

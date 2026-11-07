@@ -8,8 +8,10 @@
 #include <linux/bitops.h>
 #include <linux/bitfield.h>
 #include <linux/err.h>
+#include <linux/iopoll.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
@@ -17,6 +19,7 @@
 #include <linux/mfd/syscon.h>
 #include <linux/reset-controller.h>
 #include <linux/module.h>
+#include <linux/soc/apple/pmgr-pwrstate.h>
 
 #define APPLE_PMGR_RESET        BIT(31)
 #define APPLE_PMGR_AUTO_ENABLE  BIT(28)
@@ -37,6 +40,7 @@
 #define APPLE_PMGR_PS_PWRGATE   0x0
 
 #define APPLE_PMGR_PS_SET_TIMEOUT 100
+#define APPLE_PMGR_PS_PARENT_TIMEOUT 10000
 #define APPLE_PMGR_RESET_TIME 1
 #define APPLE_PMGR_T8132_RESET_TIME 10
 
@@ -52,17 +56,32 @@ struct apple_pmgr_ps {
 	bool externally_clocked;
 	bool system_sleep;
 	bool firmware_owned;
+	/* apple,sleep-retained: kept on while the system sleeps */
+	bool sleep_retained;
 	/* Never enable automatic power management (apple,no-auto-pm). */
 	bool no_auto_pm;
 	bool inherited_on;
 	bool no_auto_enable;
 	bool needs_reset_idle_wait;
 	bool strict_state;
+	bool wait_parent;
 	u32 reset_time_us;
 };
 
 #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
 #define rcdev_to_apple_pmgr_ps(_rcdev) container_of(_rcdev, struct apple_pmgr_ps, rcdev)
+
+static int apple_pmgr_ps_wait_parent(struct apple_pmgr_ps *ps, u32 *cur)
+{
+	int ret, err;
+
+	/* Bit 11 reports a missing upstream power/clock on T6000 GFX. */
+	ret = read_poll_timeout_atomic(regmap_read, err,
+				       err || !(*cur & APPLE_PMGR_BUSY),
+				       1, APPLE_PMGR_PS_PARENT_TIMEOUT, false,
+				       ps->regmap, ps->offset, cur);
+	return err ?: ret;
+}
 
 static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool auto_enable)
 {
@@ -116,6 +135,20 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 		return ret;
 	cur = reg;
 
+	if (ps->wait_parent && pstate == APPLE_PMGR_PS_ACTIVE) {
+		/*
+		 * GFX can remain clock-gated with bit 11 set on noirq resume,
+		 * even after genpd has powered its AFR parent on. Wait for that
+		 * hardware dependency separately, then allow the usual 100 us
+		 * for the actual state. A missing parent must still fail.
+		 * Use delay-based polling so the wait is bounded even while
+		 * timekeeping is suspended.
+		 */
+		ret = apple_pmgr_ps_wait_parent(ps, &cur);
+		if (ret)
+			goto report;
+	}
+
 	if (ps->externally_clocked && pstate == APPLE_PMGR_PS_ACTIVE) {
 		/*
 		 * If this clock domain requires an external clock, then
@@ -124,11 +157,13 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 		ret = regmap_read_poll_timeout_atomic(
 			ps->regmap, ps->offset, cur,
 			FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) >= APPLE_PMGR_PS_CLKGATE, 1,
-			APPLE_PMGR_PS_SET_TIMEOUT);
+			timeout);
 	} else {
 		ret = regmap_read_poll_timeout_atomic(
 			ps->regmap, ps->offset, cur,
-			FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) == pstate, 1,
+			FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) == pstate &&
+			(!ps->wait_parent || pstate != APPLE_PMGR_PS_ACTIVE ||
+			 !(cur & APPLE_PMGR_BUSY)), 1,
 			timeout);
 	}
 	if (ps->strict_state) {
@@ -138,6 +173,7 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 			return ret;
 	}
 
+report:
 	if (ret < 0)
 		dev_err_ratelimited(ps->dev,
 				    "PS %s: Failed to reach power state 0x%x (requested 0x%x, now: 0x%x)\n",
@@ -231,6 +267,9 @@ static int apple_pmgr_ps_power_off(struct generic_pm_domain *genpd)
 		return 0;
 	if (ps->inherited_on)
 		return -EBUSY;
+	/* A live coprocessor keeps this domain through system sleep. */
+	if (ps->sleep_retained && ps->system_sleep)
+		return -EBUSY;
 
 	ret = apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_PWRGATE, false);
 	if (ret)
@@ -239,6 +278,62 @@ static int apple_pmgr_ps_power_off(struct generic_pm_domain *genpd)
 
 	return ret;
 }
+
+/**
+ * apple_pmgr_ps_cycle() - power gate a domain and turn it on again
+ * @np: the power state node, as named by a consumer's power-domains
+ *
+ * For a coprocessor that can stop in a state only a power-off of this domain
+ * clears, while other devices in the domain (its DARTs) hold it on at
+ * runtime. The caller owns every device in the domain and keeps them idle;
+ * every subdomain must already be off. genpd's view does not change: the
+ * domain is on before and after, as is its automatic power management.
+ *
+ * Return: 0, -EBUSY if a subdomain is on, -EPERM for a domain Linux does not
+ * own, -EINVAL if the domain is off, or the error of a failed transition.
+ */
+int apple_pmgr_ps_cycle(struct device_node *np)
+{
+	struct platform_device *pdev = of_find_device_by_node(np);
+	struct apple_pmgr_ps *ps;
+	struct gpd_link *link;
+	unsigned long flags;
+	int ret, on;
+
+	if (!pdev)
+		return -ENODEV;
+	ps = platform_get_drvdata(pdev);
+	if (!ps) {
+		ret = -EPROBE_DEFER;
+		goto out;
+	}
+	if (ps->firmware_owned || ps->inherited_on) {
+		ret = -EPERM;
+		goto out;
+	}
+
+	spin_lock_irqsave(&ps->genpd.slock, flags);
+	if (ps->genpd.status != GENPD_STATE_ON) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+	list_for_each_entry(link, &ps->genpd.parent_links, parent_node) {
+		if (link->child->status == GENPD_STATE_ON) {
+			ret = -EBUSY;
+			goto unlock;
+		}
+	}
+	ret = apple_pmgr_ps_set(&ps->genpd, APPLE_PMGR_PS_PWRGATE, false);
+	on = apple_pmgr_ps_set(&ps->genpd, APPLE_PMGR_PS_ACTIVE,
+			       !ps->no_auto_enable && !ps->no_auto_pm);
+	ret = ret ?: on;
+unlock:
+	spin_unlock_irqrestore(&ps->genpd.slock, flags);
+out:
+	put_device(&pdev->dev);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmgr_ps_cycle);
 
 static void apple_pmgr_ps_set_system_sleep(struct device *dev, bool sleep)
 {
@@ -478,6 +573,9 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	ps->wait_parent = of_device_is_compatible(node, "apple,t6000-pmgr-pwrstate") &&
+			  ps->offset == 0x3c0;
+
 	ps->genpd.flags |= GENPD_FLAG_IRQ_SAFE;
 	ps->genpd.name = name;
 	ps->genpd.power_on = apple_pmgr_ps_power_on;
@@ -489,6 +587,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	 * vote and never read, reset or change the hardware state.
 	 */
 	ps->firmware_owned = of_property_read_bool(node, "apple,firmware-owned");
+	ps->sleep_retained = of_property_read_bool(node, "apple,sleep-retained");
 	/*
 	 * Only T8132 hands over inherited-on domains with this contract. Older
 	 * M3 device trees carry the property with another meaning; keep them
@@ -496,7 +595,8 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	 */
 	ps->inherited_on = t8132 && of_property_read_bool(node, "apple,inherited-on");
 	if (ps->inherited_on &&
-	    (ps->firmware_owned || of_property_present(node, "apple,min-state") ||
+	    (ps->firmware_owned || ps->sleep_retained ||
+	     of_property_present(node, "apple,min-state") ||
 	     of_property_present(node, "apple,always-on") ||
 	     of_property_present(node, "apple,force-disable") ||
 	     of_property_present(node, "apple,force-reset") ||

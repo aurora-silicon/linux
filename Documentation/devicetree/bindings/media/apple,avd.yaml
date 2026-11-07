@@ -21,6 +21,10 @@ properties:
               - apple,t6031-avd
           - const: apple,t8122-avd
       - items:
+          - const: apple,t6041-max-avd
+          - const: apple,t6041-avd
+          - const: apple,t8132-avd
+      - items:
           - const: apple,t6041-avd
           - const: apple,t8132-avd
       - enum:
@@ -31,6 +35,7 @@ properties:
           - apple,t8122-avd
           - apple,t8132-avd
           - apple,t8140-avd
+          - apple,t8142-avd
 
   reg:
     items:

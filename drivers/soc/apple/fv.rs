@@ -18,6 +18,17 @@ const FILE_KEY_MAX_LEN: usize = 168;
 const EPHEMERAL_KEY_MAX_LEN: usize = 64;
 const FV_UNWRAP_VERSION: u32 = 0;
 const FV_UNWRAP_OPTIONS: u32 = 2;
+const FV_NEW_KEK_OPTIONS: u32 = 0;
+const FV_REARM_RECORD_VERSION: u32 = 1;
+const FV_REARM_RECORD_HEADER: usize = 32;
+const FV_REARM_RECORD_MAGIC: [u8; 16] = *b"AURORA-TID-FVR01";
+const FV_REARM_BINDING: [u8; 16] = *b"AuroraTouchIDFV1";
+const FV_REARM_STORE_KEY: crate::store::Key = crate::store::Key {
+    // F5 is already accepted by rollback kernels. The UUID namespaces this
+    // record away from the F5 root record used by the SBIO lockout snapshot.
+    kind: 0xf5,
+    uuid: *b"AURORA-TID-FV001",
+};
 const PFK_UNWRAP_VERSION: u32 = 2;
 const PFK_SYSTEM_VOLUME_HANDLE: i32 = -5;
 const PFK_UNWRAP_OPTIONS: u32 = 0x102;
@@ -125,6 +136,11 @@ struct VolumeKey {
     opaque: [u8; OPAQUE_KEY_LEN],
 }
 
+struct RearmRecords<'a> {
+    kek: &'a [u8],
+    vek: &'a [u8],
+}
+
 struct FileKey {
     opaque: [u8; OPAQUE_KEY_LEN],
     iv_key: [u8; IV_KEY_LEN],
@@ -148,6 +164,260 @@ impl Drop for NewFileKey {
 impl Drop for VolumeKey {
     fn drop(&mut self) {
         image::wipe(&mut self.opaque);
+    }
+}
+
+fn fv_new_kek_body(secret: &[u8]) -> Result<image::Body> {
+    let mut body = image::Body::new();
+    body.put_u32(FV_UNWRAP_VERSION)?;
+    body.put_u64(SYSTEM_CLIENT)?;
+    body.put_blob(&FV_PARAMS_DER)?;
+    body.put_u32(FV_NEW_KEK_OPTIONS)?;
+    body.put_blob(secret)?;
+    body.put_blob(&FV_REARM_BINDING)?;
+    Ok(body)
+}
+
+fn fv_new_vek_body(secret: &[u8], kek: &[u8]) -> Result<image::Body> {
+    let mut body = image::Body::new();
+    body.put_u32(FV_UNWRAP_VERSION)?;
+    body.put_u64(SYSTEM_CLIENT)?;
+    body.put_blob(&FV_PARAMS_DER)?;
+    // FV_NEW_VEK takes the same credential used for NEW_KEK first, and that
+    // operation's returned KEK record second. The final fixed-size blob is
+    // the same FV domain identifier used by NEW_KEK.
+    body.put_blob(secret)?;
+    body.put_blob(kek)?;
+    body.put_blob(&FV_REARM_BINDING)?;
+    Ok(body)
+}
+
+fn fv_unwrap_vek_body(secret: &[u8], kek: &[u8], vek: &[u8]) -> Result<image::Body> {
+    let mut body = image::Body::new();
+    body.put_u32(FV_UNWRAP_VERSION)?;
+    body.put_u64(SYSTEM_CLIENT)?;
+    body.put_blob(&FV_PARAMS_DER)?;
+    body.put_u32(FV_UNWRAP_OPTIONS)?;
+    body.put_blob(secret)?;
+    body.put_blob(kek)?;
+    body.put_blob(vek)?;
+    body.put_blob(&[])?;
+    Ok(body)
+}
+
+fn encode_rearm_records(kek: &[u8], vek: &[u8]) -> Result<KVec<u8>> {
+    if kek.is_empty() || kek.len() > RECORD_MAX_LEN || vek.is_empty() || vek.len() > RECORD_MAX_LEN
+    {
+        return Err(EINVAL);
+    }
+    let total = FV_REARM_RECORD_HEADER
+        .checked_add(kek.len())
+        .and_then(|n| n.checked_add(vek.len()))
+        .ok_or(EOVERFLOW)?;
+    let mut raw = KVec::with_capacity(total, GFP_KERNEL)?;
+    raw.extend_from_slice(&FV_REARM_RECORD_MAGIC, GFP_KERNEL)?;
+    raw.extend_from_slice(&FV_REARM_RECORD_VERSION.to_le_bytes(), GFP_KERNEL)?;
+    raw.extend_from_slice(&(kek.len() as u32).to_le_bytes(), GFP_KERNEL)?;
+    raw.extend_from_slice(&(vek.len() as u32).to_le_bytes(), GFP_KERNEL)?;
+    raw.extend_from_slice(&0u32.to_le_bytes(), GFP_KERNEL)?;
+    raw.extend_from_slice(kek, GFP_KERNEL)?;
+    raw.extend_from_slice(vek, GFP_KERNEL)?;
+    Ok(raw)
+}
+
+fn decode_rearm_records(raw: &[u8]) -> Result<RearmRecords<'_>> {
+    if raw.len() < FV_REARM_RECORD_HEADER || raw[..16] != FV_REARM_RECORD_MAGIC {
+        return Err(EINVAL);
+    }
+    let version = u32::from_le_bytes(raw[16..20].try_into().map_err(|_| EINVAL)?);
+    let kek_len = u32::from_le_bytes(raw[20..24].try_into().map_err(|_| EINVAL)?) as usize;
+    let vek_len = u32::from_le_bytes(raw[24..28].try_into().map_err(|_| EINVAL)?) as usize;
+    let reserved = u32::from_le_bytes(raw[28..32].try_into().map_err(|_| EINVAL)?);
+    let vek_at = FV_REARM_RECORD_HEADER
+        .checked_add(kek_len)
+        .ok_or(EOVERFLOW)?;
+    let end = vek_at.checked_add(vek_len).ok_or(EOVERFLOW)?;
+    if version != FV_REARM_RECORD_VERSION
+        || reserved != 0
+        || kek_len == 0
+        || kek_len > RECORD_MAX_LEN
+        || vek_len == 0
+        || vek_len > RECORD_MAX_LEN
+        || end != raw.len()
+    {
+        return Err(EINVAL);
+    }
+    Ok(RearmRecords {
+        kek: &raw[FV_REARM_RECORD_HEADER..vek_at],
+        vek: &raw[vek_at..end],
+    })
+}
+
+/// The non-secret layout of an `FV_UNWRAP_VEK` reply body: version, one
+/// opaque-key blob, then flags. Only lengths and flags are kept, so the shape
+/// can be logged; the key bytes stay in the reply buffer, which is wiped.
+///
+/// The Neo answers the option-2 unwrap of a Linux-owned pair with the same
+/// 64-byte opaque key as a volume unwrap (a 0x98-byte reply image). The
+/// 0x2c-byte macOS body seen in the capture held a shorter key, so the length
+/// is bounded rather than fixed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct UnwrapReplyShape {
+    body_len: usize,
+    version: Option<i32>,
+    key_len: Option<usize>,
+    flags: Option<i32>,
+    trailing: usize,
+}
+
+impl UnwrapReplyShape {
+    fn of(body: &[u8]) -> UnwrapReplyShape {
+        let mut fields = proto::FieldCursor::new(body);
+        let version = fields.i32();
+        let key_len = version.and_then(|_| fields.blob()).map(<[u8]>::len);
+        let flags = key_len.and_then(|_| fields.i32());
+        let consumed = match (version, key_len, flags) {
+            (Some(_), Some(len), Some(_)) => 12 + len + (len.wrapping_neg() % 4),
+            _ => body.len(),
+        };
+        UnwrapReplyShape {
+            body_len: body.len(),
+            version,
+            key_len,
+            flags,
+            trailing: body.len().saturating_sub(consumed),
+        }
+    }
+
+    /// Reply version 0, a complete non-empty key no longer than a volume key,
+    /// flags bit 0, and nothing after the flags.
+    fn usable(&self) -> bool {
+        self.version == Some(FV_UNWRAP_VERSION as i32)
+            && matches!(self.key_len, Some(1..=OPAQUE_KEY_LEN))
+            && self.flags.is_some_and(|flags| flags & VOLUME_KEY_FLAG != 0)
+            && self.trailing == 0
+    }
+}
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[::kernel::macros::kunit_tests(apple_sep_fv_rearm)]
+mod rearm_tests {
+    use super::*;
+
+    fn le32(bytes: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+    }
+
+    fn common(body: &image::Body) -> &[u8] {
+        let bytes = body.as_slice();
+        assert_eq!(le32(bytes, 0), FV_UNWRAP_VERSION);
+        assert_eq!(&bytes[4..12], &SYSTEM_CLIENT.to_le_bytes());
+        assert_eq!(le32(bytes, 12) as usize, FV_PARAMS_DER.len());
+        assert_eq!(&bytes[16..51], &FV_PARAMS_DER);
+        assert_eq!(bytes[51], 0);
+        bytes
+    }
+
+    #[test]
+    fn new_kek_layout_binds_secret() {
+        let body = fv_new_kek_body(b"secret").unwrap();
+        let bytes = common(&body);
+        assert_eq!(le32(bytes, 52), FV_NEW_KEK_OPTIONS);
+        assert_eq!(le32(bytes, 56), 6);
+        assert_eq!(&bytes[60..66], b"secret");
+        assert_eq!(&bytes[66..68], &[0, 0]);
+        assert_eq!(le32(bytes, 68), FV_REARM_BINDING.len() as u32);
+        assert_eq!(&bytes[72..88], &FV_REARM_BINDING);
+        assert_eq!(bytes.len(), 88);
+    }
+
+    #[test]
+    fn new_vek_layout_uses_secret_then_kek() {
+        let body = fv_new_vek_body(b"secret", b"kk").unwrap();
+        let bytes = common(&body);
+        assert_eq!(le32(bytes, 52), 6);
+        assert_eq!(&bytes[56..62], b"secret");
+        assert_eq!(&bytes[62..64], &[0, 0]);
+        assert_eq!(le32(bytes, 64), 2);
+        assert_eq!(&bytes[68..70], b"kk");
+        assert_eq!(&bytes[70..72], &[0, 0]);
+        assert_eq!(le32(bytes, 72), FV_REARM_BINDING.len() as u32);
+        assert_eq!(&bytes[76..92], &FV_REARM_BINDING);
+        assert_eq!(bytes.len(), 92);
+    }
+
+    #[test]
+    fn unwrap_layout_uses_option_two_and_empty_auxiliary_blob() {
+        let body = fv_unwrap_vek_body(b"secret", b"kk", b"vek").unwrap();
+        let bytes = common(&body);
+        assert_eq!(le32(bytes, 52), FV_UNWRAP_OPTIONS);
+        assert_eq!(le32(bytes, 56), 6);
+        assert_eq!(&bytes[60..66], b"secret");
+        assert_eq!(&bytes[66..68], &[0, 0]);
+        assert_eq!(le32(bytes, 68), 2);
+        assert_eq!(&bytes[72..74], b"kk");
+        assert_eq!(le32(bytes, 76), 3);
+        assert_eq!(&bytes[80..83], b"vek");
+        assert_eq!(le32(bytes, 84), 0);
+        assert_eq!(bytes.len(), 88);
+    }
+
+    fn unwrap_reply(version: i32, key_len: usize, flags: i32, extra: usize) -> KVec<u8> {
+        let mut body = image::Body::new();
+        body.put_i32(version).unwrap();
+        let mut key = KVec::new();
+        key.resize(key_len, 0xa5, GFP_KERNEL).unwrap();
+        body.put_blob(&key).unwrap();
+        body.put_i32(flags).unwrap();
+        let mut bytes = KVec::new();
+        bytes.extend_from_slice(body.as_slice(), GFP_KERNEL).unwrap();
+        bytes.resize(bytes.len() + extra, 0, GFP_KERNEL).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn unwrap_reply_accepts_the_neo_64_byte_key() {
+        // The Neo's 0x98-byte reply image less its 0x4c-byte prefix.
+        let body = unwrap_reply(0, 64, 1, 0);
+        assert_eq!(body.len(), 0x98 - 0x4c);
+        let shape = UnwrapReplyShape::of(&body);
+        assert_eq!(shape.key_len, Some(64));
+        assert_eq!(shape.flags, Some(1));
+        assert_eq!(shape.trailing, 0);
+        assert!(shape.usable());
+    }
+
+    #[test]
+    fn unwrap_reply_accepts_the_macos_32_byte_key() {
+        assert!(UnwrapReplyShape::of(&unwrap_reply(0, 32, 1, 0)).usable());
+    }
+
+    #[test]
+    fn unwrap_reply_refuses_bad_shapes() {
+        assert!(!UnwrapReplyShape::of(&unwrap_reply(1, 64, 1, 0)).usable());
+        assert!(!UnwrapReplyShape::of(&unwrap_reply(0, 0, 1, 0)).usable());
+        assert!(!UnwrapReplyShape::of(&unwrap_reply(0, 68, 1, 0)).usable());
+        assert!(!UnwrapReplyShape::of(&unwrap_reply(0, 64, 0, 0)).usable());
+        let trailing = UnwrapReplyShape::of(&unwrap_reply(0, 64, 1, 4));
+        assert_eq!(trailing.trailing, 4);
+        assert!(!trailing.usable());
+        let short = unwrap_reply(0, 64, 1, 0);
+        let cut = UnwrapReplyShape::of(&short[..40]);
+        assert_eq!(cut.key_len, None);
+        assert!(!cut.usable());
+        assert!(!UnwrapReplyShape::of(&[]).usable());
+    }
+
+    #[test]
+    fn persistent_pair_round_trips_and_rejects_trailing_bytes() {
+        let raw = encode_rearm_records(b"kek-record", b"vek-record").unwrap();
+        let decoded = decode_rearm_records(&raw).unwrap();
+        assert_eq!(decoded.kek, b"kek-record");
+        assert_eq!(decoded.vek, b"vek-record");
+
+        let mut damaged = raw;
+        damaged.push(0, GFP_KERNEL).unwrap();
+        assert!(decode_rearm_records(&damaged).is_err());
     }
 }
 
@@ -450,16 +720,7 @@ impl SepData {
     }
 
     fn sks_req_unwrap_vek(&self, secret: &[u8], kek: &[u8], vek: &[u8]) -> Result<SksRequest> {
-        let mut body = image::Body::new();
-        body.put_u32(FV_UNWRAP_VERSION)?;
-        body.put_u64(SYSTEM_CLIENT)?;
-        body.put_blob(&FV_PARAMS_DER)?;
-        body.put_u32(FV_UNWRAP_OPTIONS)?;
-        body.put_blob(secret)?;
-        body.put_blob(kek)?;
-        body.put_blob(vek)?;
-        body.put_blob(&[])?;
-
+        let body = fv_unwrap_vek_body(secret, kek, vek)?;
         let img = image::build_request(image::Version::V1, self.sks_timestamp_us(), &body)?;
         let len = self.sks_image_len(&img)?;
         let msg = crate::sks::encode_sks_unwrap_vek(self.sks_next_seq(), len).ok_or(EINVAL)?;
@@ -496,6 +757,197 @@ impl SepData {
         let mut opaque = [0; OPAQUE_KEY_LEN];
         opaque.copy_from_slice(key);
         Ok(VolumeKey { opaque })
+    }
+
+    fn sks_req_new_rearm_kek(&self, secret: &[u8]) -> Result<SksRequest> {
+        let body = fv_new_kek_body(secret)?;
+        let img = image::build_request(image::Version::V1, self.sks_timestamp_us(), &body)?;
+        let len = self.sks_image_len(&img)?;
+        Ok(SksRequest {
+            name: crate::sks::SKS_NEW_KEK_NAME,
+            msg: crate::sks::encode_sks_new_kek(self.sks_next_seq(), len),
+            img,
+        })
+    }
+
+    fn sks_req_new_rearm_vek(&self, secret: &[u8], kek: &[u8]) -> Result<SksRequest> {
+        let body = fv_new_vek_body(secret, kek)?;
+        let img = image::build_request(image::Version::V1, self.sks_timestamp_us(), &body)?;
+        let len = self.sks_image_len(&img)?;
+        Ok(SksRequest {
+            name: crate::sks::SKS_NEW_VEK_NAME,
+            msg: crate::sks::encode_sks_new_vek(self.sks_next_seq(), len),
+            img,
+        })
+    }
+
+    fn fv_record_from_reply(
+        &self,
+        name: &'static CStr,
+        out: crate::SksOutcome,
+    ) -> Result<KVec<u8>> {
+        if out.reply.status != 0 {
+            let status: i32 = out.reply.status.into();
+            dev_err!(self.dev, "fv: {} failed with status {}\n", name, status);
+            return Err(EACCES);
+        }
+        let body = self.sks_report_response(name, &out).unwrap_or(&[]);
+        let mut fields = proto::FieldCursor::new(body);
+        let version = fields.i32();
+        let record = fields.blob().filter(|_| version == Some(FV_UNWRAP_VERSION as i32));
+        let Some(record) = record.filter(|r| !r.is_empty() && r.len() <= RECORD_MAX_LEN) else {
+            dev_err!(
+                self.dev,
+                "fv: {} answered status 0 with an unusable reply: image {} bytes, body {} bytes, version {:?}\n",
+                name,
+                out.response.len(),
+                body.len(),
+                version
+            );
+            return Err(EMSGSIZE);
+        };
+        let mut owned = KVec::with_capacity(record.len(), GFP_KERNEL)?;
+        owned.extend_from_slice(record, GFP_KERNEL)?;
+        Ok(owned)
+    }
+
+    /// One re-arm SKS exchange. A missing reply is logged here: the exchange
+    /// itself is silent when the key store was already given up on.
+    fn rearm_exchange(&self, name: &'static CStr, req: Result<SksRequest>) -> Result<crate::SksOutcome> {
+        let req = req.inspect_err(|e| {
+            dev_err!(self.dev, "Touch ID: re-arm: could not build {}: {:?}\n", name, e);
+        })?;
+        self.sks_send(Ok(req)).ok_or_else(|| {
+            dev_err!(self.dev, "Touch ID: re-arm: {} got no reply\n", name);
+            EIO
+        })
+    }
+
+    fn new_rearm_kek(&self, secret: &[u8]) -> Result<KVec<u8>> {
+        let out = self.rearm_exchange(
+            crate::sks::SKS_NEW_KEK_NAME,
+            self.sks_req_new_rearm_kek(secret),
+        )?;
+        self.fv_record_from_reply(crate::sks::SKS_NEW_KEK_NAME, out)
+    }
+
+    fn new_rearm_vek(&self, secret: &[u8], kek: &[u8]) -> Result<KVec<u8>> {
+        let out = self.rearm_exchange(
+            crate::sks::SKS_NEW_VEK_NAME,
+            self.sks_req_new_rearm_vek(secret, kek),
+        )?;
+        self.fv_record_from_reply(crate::sks::SKS_NEW_VEK_NAME, out)
+    }
+
+    /// Sends the option-2 `FV_UNWRAP_VEK` (0x41). Success is SKS status 0 and
+    /// a well-formed reply; the opaque key is never copied out of the reply,
+    /// whose buffer is wiped when `out` drops. EACCES means the enclave
+    /// refused the credential or records; other errors are local.
+    fn unwrap_rearm_vek(&self, secret: &[u8], kek: &[u8], vek: &[u8]) -> Result<()> {
+        let out = self.rearm_exchange(
+            crate::sks::SKS_UNWRAP_VEK_NAME,
+            self.sks_req_unwrap_vek(secret, kek, vek),
+        )?;
+        let status: i32 = out.reply.status.into();
+        if status != 0 {
+            dev_err!(
+                self.dev,
+                "Touch ID: re-arm FV unwrap (0x41, option 2) failed with SKS status {}\n",
+                status
+            );
+            return Err(EACCES);
+        }
+        let Some(body) = self.sks_report_response(crate::sks::SKS_UNWRAP_VEK_NAME, &out) else {
+            dev_err!(
+                self.dev,
+                "Touch ID: re-arm FV unwrap answered SKS status 0 with a malformed {}-byte reply image\n",
+                out.response.len()
+            );
+            return Err(EMSGSIZE);
+        };
+        let shape = UnwrapReplyShape::of(body);
+        if !shape.usable() {
+            dev_err!(
+                self.dev,
+                "Touch ID: re-arm FV unwrap answered SKS status 0 with an unusable reply: body {} bytes, version {:?}, key {:?} bytes, flags {:?}, {} trailing bytes\n",
+                shape.body_len,
+                shape.version,
+                shape.key_len,
+                shape.flags,
+                shape.trailing
+            );
+            return Err(EMSGSIZE);
+        }
+        dev_info!(
+            self.dev,
+            "Touch ID: re-arm FV unwrap succeeded: SKS status 0, {}-byte key discarded, flags {:#x}\n",
+            shape.key_len.unwrap_or(0),
+            shape.flags.unwrap_or(0)
+        );
+        Ok(())
+    }
+
+    /// Creates a Linux-owned KEK/VEK pair bound to `secret`, proves it with an
+    /// unwrap, and only then commits it (copy-on-write) to the host store.
+    fn provision_rearm_records(&self, secret: &[u8]) -> Result<()> {
+        let maximum = FV_REARM_RECORD_HEADER + 2 * RECORD_MAX_LEN;
+        if !self
+            .with_host_store(|store| store.can_write(&FV_REARM_STORE_KEY, maximum))
+            .unwrap_or(false)
+        {
+            dev_err!(self.dev, "Touch ID: re-arm: the host-state store has no room for the FV record pair\n");
+            return Err(ENOSPC);
+        }
+
+        let kek = self.new_rearm_kek(secret)?;
+        let vek = self.new_rearm_vek(secret, &kek)?;
+        self.unwrap_rearm_vek(secret, &kek, &vek)?;
+        let raw = encode_rearm_records(&kek, &vek)?;
+        self.with_host_store(|store| store.write(&FV_REARM_STORE_KEY, &raw))
+            .ok_or(ENODEV)?
+            .inspect_err(|e| {
+                dev_err!(self.dev, "Touch ID: re-arm: could not save the FV record pair: {:?}\n", e);
+            })?;
+        dev_info!(
+            self.dev,
+            "Touch ID: provisioned the Linux FV re-arm record pair ({} + {} bytes)\n",
+            kek.len(),
+            vek.len()
+        );
+        Ok(())
+    }
+
+    /// Performs the password authorization event that ends a biometric
+    /// lockout: one successful option-2 unwrap of the Linux-owned FV pair.
+    /// The pair is created on first use and reloaded from the host store
+    /// afterwards. A stored pair the enclave refuses, or one that no longer
+    /// decodes, is replaced by a freshly proved pair.
+    // No longer on the re-arm path: the password verification of the
+    // designated bag ends the lockout without an FV unwrap. Kept until the
+    // finger test settles whether any configuration still needs it.
+    #[allow(dead_code)]
+    pub(crate) fn rearm_touchid_fv(&self, secret: &[u8]) -> Result<()> {
+        self.fv_ready()?;
+        let stored = self
+            .with_host_store(|store| store.read(&FV_REARM_STORE_KEY))
+            .ok_or(ENODEV)??;
+        if let Some(raw) = stored {
+            match decode_rearm_records(&raw) {
+                Ok(records) => match self.unwrap_rearm_vek(secret, records.kek, records.vek) {
+                    Ok(()) => return Ok(()),
+                    Err(e) if e == EACCES => dev_warn!(
+                        self.dev,
+                        "Touch ID: re-arm: the enclave refused the stored FV record pair; provisioning a new one\n"
+                    ),
+                    Err(e) => return Err(e),
+                },
+                Err(_) => dev_warn!(
+                    self.dev,
+                    "Touch ID: re-arm: the stored FV record pair does not decode; provisioning a new one\n"
+                ),
+            }
+        }
+        self.provision_rearm_records(secret)
     }
 
     fn sks_req_unwrap_file_key(

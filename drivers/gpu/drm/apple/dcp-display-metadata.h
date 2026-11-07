@@ -19,6 +19,20 @@ struct dcp_display_metadata {
 	u32 max_luminance, max_fall, min_luminance; /* 16.16 cd/m2 */
 };
 
+/*
+ * A standard named colour space a panel is calibrated to, from the
+ * apple,color-gamut property of its device tree node. Coordinates are CIE
+ * 1931 x/y in units of 1/65536 and gamma is 16.16, as in the metadata.
+ */
+struct dcp_color_space {
+	const char *name;
+	u32 chromaticity[3][2];
+	u32 white[2];
+	u32 gamma;
+};
+
+const struct dcp_color_space *dcp_color_space_lookup(const char *name);
+
 struct drm_edid;
 struct drm_display_mode;
 struct dcp_display_mode;
@@ -26,6 +40,7 @@ const struct drm_edid *dcp_metadata_edid(const struct dcp_display_metadata *meta
 					 const struct drm_display_mode *mode);
 
 const struct drm_edid *dcp_panel_edid(const struct dcp_display_metadata *metadata,
+				      const struct dcp_color_space *target,
 				      const struct dcp_display_mode *modes, unsigned int count,
 				      u32 width_mm, u32 height_mm);
 

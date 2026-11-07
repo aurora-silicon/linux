@@ -458,7 +458,7 @@ int ane_t6021_boot_start(struct ane_t6021 *ane, int stop_after, int table_mode, 
 	 * release order frees irq before ioremap (probe-order reverse);
 	 * DMA surfaces are wedge-held, never freed.
 	 */
-	dev_warn(ane->dev,
+	dev_info(ane->dev,
 		 "boot: module pinned while firmware CPU may run\n");
 
 	if (r == -ENODATA)

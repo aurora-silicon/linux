@@ -8,6 +8,7 @@
 #include "ane_fw_protocol.h"
 #include "ane_h16_execute.h"
 
+#define ANE_FW_TERMINAL 0
 #define ANE_FW_IO 1
 #define ANE_FW_SHAREDMALLOC 5
 #define ANE_FW_IO_T2H 6
@@ -80,6 +81,7 @@ struct ane_fw_transport_ops {
 	void (*read_barrier)(void *ctx);
 	void (*write_barrier)(void *ctx);
 	u32 (*read32)(void *ctx, u32 reg);
+	/* Complete/order an irq_ack write before subsequent coherent ring reads. */
 	void (*write32)(void *ctx, u32 reg, u32 value);
 	u64 (*now_ns)(void *ctx);
 	/* Wait before the next poll of a wait that began waited_ns ago. */
@@ -118,12 +120,26 @@ struct ane_fw_transport {
 	struct ane_fw_channel channels[ANE_FW_CHANNELS];
 	struct ane_fw_transaction pending[ANE_FW_CHANNELS];
 	u32 head[ANE_FW_CHANNELS];
+	/* SHAREDMALLOC entries captured after acknowledging their notification. */
+	u32 shared_ready;
+	/* Polls that saw a request body before its notification (held, not served). */
+	u32 shared_early;
 	u8 table[ANE_FW_TABLE_SIZE];
 	size_t table_offset;
 	size_t pool_used;
 	size_t shared_bytes;
 	u32 shared_count;
+	u64 terminal_messages;
+	u64 terminal_bytes;
 	int error;
+	/* ane_fw_transport.h line that raised error, for diagnosis. */
+	unsigned int error_line;
+	/*
+	 * The second host-to-firmware command ring, at table position 2: the
+	 * firmware's mode commands (EXCLAVE_MODE_STOP) go there, outside the
+	 * IO queue they must not wait behind. ANE_FW_CHANNELS when absent.
+	 */
+	u32 control_ch;
 	/* relax() calls made by every wait so far; callers diff it. */
 	u64 polls;
 	bool armed;
@@ -152,11 +168,35 @@ ane_fw_surfaces_overlap(const struct ane_fw_surface *a, const struct ane_fw_surf
 	return a->dva < b->dva + b->size && b->dva < a->dva + a->size;
 }
 
-static inline int ane_fw_transport_fail(struct ane_fw_transport *t, int error)
+/* The first error is kept, with the line of this file that raised it. */
+static inline int __ane_fw_transport_fail(struct ane_fw_transport *t, int error,
+					  unsigned int line)
 {
-	if (!t->error)
+	if (!t->error) {
 		t->error = error;
+		t->error_line = line;
+	}
 	return t->error;
+}
+
+#define ane_fw_transport_fail(t, error) __ane_fw_transport_fail(t, error, __LINE__)
+
+/*
+ * The command ring at table position 2 (macOS channel selector 2), when it
+ * is a host-to-firmware ring like IO and not one of the rings Linux already
+ * drives. ANE_FW_CHANNELS when the table has none.
+ */
+static inline u32 ane_fw_control_channel(const struct ane_fw_channel channels[ANE_FW_CHANNELS])
+{
+	u32 ch;
+
+	for (ch = 0; ch < ANE_FW_CHANNELS; ch++)
+		if (channels[ch].index == 2)
+			break;
+	if (ch == ANE_FW_CHANNELS || ch == ANE_FW_IO || ch == ANE_FW_DATA_CHAIN ||
+	    channels[ch].type != channels[ANE_FW_IO].type)
+		return ANE_FW_CHANNELS;
+	return ch;
 }
 
 /* pool_reserved protects the init record and any other boot-owned pool bytes. */
@@ -188,7 +228,31 @@ ane_fw_transport_init(struct ane_fw_transport *t, const struct ane_fw_platform *
 	ops->read_barrier(ctx);
 	memcpy(t->table, (u8 *)ipc.cpu + t->table_offset, sizeof(t->table));
 	ret = ane_fw_channels_parse(t->table, ipc.dva, ipc.size, table_dva, t->channels);
-	return ret ? ane_fw_transport_fail(t, ret) : 0;
+	if (ret)
+		return ane_fw_transport_fail(t, ret);
+	t->control_ch = ane_fw_control_channel(t->channels);
+	return 0;
+}
+
+/*
+ * After the firmware was booted again (ane_fw_transport_init() on the same
+ * IPC and pool), give the new transport the shared allocations of the old
+ * one, all retired: the new firmware owns none of them, and its SHAREDMALLOC
+ * requests of the same tag and size are served from them
+ * (ane_fw_shared_reusable()) instead of mapping new memory every cycle.
+ */
+static inline void ane_fw_transport_carry_shared(struct ane_fw_transport *t,
+						 const struct ane_fw_transport *old)
+{
+	unsigned int i;
+
+	t->shared_count = old->shared_count;
+	t->shared_bytes = old->shared_bytes;
+	for (i = 0; i < old->shared_count; i++) {
+		t->shared[i] = old->shared[i];
+		t->shared_tags[i] = old->shared_tags[i];
+		t->shared_retired[i] = true;
+	}
 }
 
 static inline int ane_fw_transport_check(struct ane_fw_transport *t)
@@ -210,6 +274,8 @@ static inline void *ane_fw_transport_slot(struct ane_fw_transport *t, unsigned i
 static inline void ane_fw_transport_advance(struct ane_fw_transport *t, unsigned int ch)
 {
 	t->head[ch] = (t->head[ch] + 1) % t->channels[ch].slots;
+	if (ch == ANE_FW_SHAREDMALLOC)
+		t->shared_ready--;
 }
 
 static inline void ane_fw_transport_doorbell(struct ane_fw_transport *t, unsigned int ch)
@@ -294,8 +360,8 @@ static inline bool ane_fw_transport_switch_safe(const struct ane_fw_transport *t
 
 /* Commands are copied into a monotonic pool arena, never external DMA memory. */
 static inline int
-ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
-			 const void *command, size_t size, u64 deadline_ns)
+__ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
+			   const void *command, size_t size, u64 deadline_ns)
 {
 	struct ane_fw_transaction *tx;
 	size_t offset;
@@ -305,12 +371,9 @@ ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
 
 	if (ret)
 		return ret;
-	if (!t->armed || (ch != ANE_FW_IO && ch != ANE_FW_DATA_CHAIN) ||
-	    !command || size < 8 || get_unaligned_le32(command) ||
+	if (!t->armed || !command || size < 8 || get_unaligned_le32(command) ||
 	    get_unaligned_le16((const u8 *)command + 6))
 		return -EINVAL;
-	if (ane_fw_command_denied(get_unaligned_le16((const u8 *)command + 4)))
-		return -EPERM;
 	tx = &t->pending[ch];
 	if (tx->active)
 		return -EBUSY;
@@ -345,6 +408,52 @@ ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
 	t->ops->write_barrier(t->ctx);
 	ane_fw_transport_doorbell(t, ch);
 	return 0;
+}
+
+/* IO and DATA_CHAIN; mode and ownership commands are refused. */
+static inline int
+ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
+			 const void *command, size_t size, u64 deadline_ns)
+{
+	if (ch != ANE_FW_IO && ch != ANE_FW_DATA_CHAIN)
+		return -EINVAL;
+	if (command && size >= 8 &&
+	    ane_fw_command_denied(get_unaligned_le16((const u8 *)command + 4)))
+		return -EPERM;
+	return __ane_fw_transport_publish(t, ch, command, size, deadline_ns);
+}
+
+/*
+ * The kernel's SET_SNE_PMU_BASE2 on the control ring (16 bytes, the u64 PMU
+ * aperture base). Nothing else from outside the kernel reaches that ring.
+ */
+static inline int
+ane_fw_transport_publish_pmu_base(struct ane_fw_transport *t, u64 base, u64 deadline_ns)
+{
+	u8 command[ANE_FW_PMU_BASE_SIZE] = {};
+
+	if (t->control_ch >= ANE_FW_CHANNELS)
+		return -ENODEV;
+	put_unaligned_le16(ANE_FW_CMD_SET_PMU_BASE, command + 4);
+	put_unaligned_le64(base, command + 8);
+	return __ane_fw_transport_publish(t, t->control_ch, command, sizeof(command),
+					  deadline_ns);
+}
+
+/*
+ * The kernel's own system-sleep step on the control ring: only the 24-byte
+ * EXCLAVE_MODE_STOP with a zero body. Every other mode command stays denied.
+ */
+static inline int
+ane_fw_transport_publish_mode_stop(struct ane_fw_transport *t, u64 deadline_ns)
+{
+	u8 command[ANE_FW_MODE_STOP_SIZE] = {};
+
+	if (t->control_ch >= ANE_FW_CHANNELS)
+		return -ENODEV;
+	put_unaligned_le16(ANE_FW_CMD_EXCLAVE_MODE_STOP, command + 4);
+	return __ane_fw_transport_publish(t, t->control_ch, command, sizeof(command),
+					  deadline_ns);
 }
 
 /* Command arena position, for ane_fw_transport_release(). */
@@ -382,7 +491,8 @@ static inline int ane_fw_transport_poll(struct ane_fw_transport *t, unsigned int
 
 	if (ret)
 		return ret;
-	if (ch != ANE_FW_IO && ch != ANE_FW_DATA_CHAIN)
+	if (ch != ANE_FW_IO && ch != ANE_FW_DATA_CHAIN &&
+	    (ch != t->control_ch || ch >= ANE_FW_CHANNELS))
 		return -EINVAL;
 	tx = &t->pending[ch];
 	if (!tx->active)
@@ -401,6 +511,13 @@ static inline int ane_fw_transport_poll(struct ane_fw_transport *t, unsigned int
 	t->ops->read_barrier(t->ctx);
 	length = t->ops->load64(t->ctx, p + 8);
 	result = t->ops->load64(t->ctx, p + 16);
+	/*
+	 * The control ring (DEBUG) completes with DVA|1 and the length, but
+	 * leaves the result word as published, the command size (H17 C6: 0x31
+	 * completed as 0x...581 0x18 0x18). The IO rings write zero there.
+	 */
+	if (ch == t->control_ch && result == tx->size)
+		result = 0;
 	ret = ane_fw_reply_status(header, length, result, tx->dva, tx->size,
 				  tx->id, (u8 *)t->pool.cpu + (tx->dva - t->pool.dva), true);
 	if (ret)
@@ -548,12 +665,15 @@ ane_fw_shared_reusable(const struct ane_fw_transport *t, size_t size, u64 tag)
 	return t->shared_count;
 }
 
+static inline int ane_fw_transport_irq(struct ane_fw_transport *t, u32 *pending);
+
 static inline int ane_fw_transport_shared(struct ane_fw_transport *t)
 {
 	struct ane_fw_surface s = {};
 	u64 word0, word1, word2;
 	size_t size;
 	unsigned int i;
+	u32 pending;
 	u8 *p;
 	int ret = ane_fw_transport_check(t);
 
@@ -561,6 +681,20 @@ static inline int ane_fw_transport_shared(struct ane_fw_transport *t)
 		return ret;
 	if (!t->armed)
 		return -EINVAL;
+	if (!t->shared_ready) {
+		ret = ane_fw_transport_irq(t, &pending);
+		if (ret)
+			return ret;
+		if (!t->shared_ready) {
+			p = ane_fw_transport_slot(t, ANE_FW_SHAREDMALLOC);
+			t->ops->read_barrier(t->ctx);
+			word0 = t->ops->load64(t->ctx, p);
+			if (!(word0 & 1) && (word0 || t->ops->load64(t->ctx, p + 8) ||
+					     t->ops->load64(t->ctx, p + 16)))
+				t->shared_early++;
+			return -EAGAIN;
+		}
+	}
 	p = ane_fw_transport_slot(t, ANE_FW_SHAREDMALLOC);
 	word0 = t->ops->load64(t->ctx, p);
 	t->ops->read_barrier(t->ctx);
@@ -646,6 +780,68 @@ static inline int ane_fw_transport_irq(struct ane_fw_transport *t, u32 *pending)
 	*pending = value;
 	if (value)
 		t->ops->write32(t->ctx, t->soc->irq_ack, value);
+	if (t->armed && (value & BIT(t->channels[ANE_FW_SHAREDMALLOC].bit))) {
+		const struct ane_fw_channel *c = &t->channels[ANE_FW_SHAREDMALLOC];
+		u32 n;
+
+		/*
+		 * An allocation's header is zero, including on a never-used slot.
+		 * Its body can be visible before firmware posts the notification;
+		 * answering then races the producer's publication/wakeup sequence.
+		 * Capture the notified batch BEFORE replying to any entry. Draining
+		 * until empty after a reply could pick up the next unnotified request.
+		 * One pending bit may cover several already queued entries.
+		 */
+		t->ops->read_barrier(t->ctx);
+		for (n = 0; n < c->slots; n++) {
+			u32 slot = (t->head[ANE_FW_SHAREDMALLOC] + n) % c->slots;
+			u8 *p = (u8 *)t->ipc.cpu + c->offset + slot * ANE_FW_SLOT_SIZE;
+			u64 word0 = t->ops->load64(t->ctx, p);
+			u64 word1, word2;
+
+			if (word0 & 1)
+				break;
+			t->ops->read_barrier(t->ctx);
+			word1 = t->ops->load64(t->ctx, p + 8);
+			word2 = t->ops->load64(t->ctx, p + 16);
+			if (!word0 && !word1 && !word2)
+				break;
+		}
+		t->shared_ready = n;
+	}
+	return 0;
+}
+
+/*
+ * The firmware's text log on a unidirectional type 2 ring: a slot is ready when
+ * bit 0 of its header is clear, and the consumer returns it by storing 1, with
+ * no doorbell. The text is discarded. An unserved ring fills and the firmware's
+ * printf blocks behind it.
+ */
+static inline int ane_fw_transport_terminal(struct ane_fw_transport *t)
+{
+	const struct ane_fw_channel *c = &t->channels[ANE_FW_TERMINAL];
+	unsigned int i;
+
+	if (c->type != 2)
+		return 0;
+	for (i = 0; i < c->slots; i++) {
+		u8 *slot = ane_fw_transport_slot(t, ANE_FW_TERMINAL);
+		u64 header = t->ops->load64(t->ctx, slot), bytes;
+
+		t->ops->read_barrier(t->ctx);
+		if (header & 1)
+			break;
+		bytes = t->ops->load64(t->ctx, slot + 8);
+		if (bytes && !ane_fw_transport_report(t, header & ~3ULL, bytes))
+			return ane_fw_transport_fail(t, -EPROTO);
+		t->terminal_messages++;
+		t->terminal_bytes += bytes;
+		t->ops->write_barrier(t->ctx);
+		t->ops->store64(t->ctx, slot, 1);
+		t->ops->write_barrier(t->ctx);
+		ane_fw_transport_advance(t, ANE_FW_TERMINAL);
+	}
 	return 0;
 }
 
@@ -675,6 +871,9 @@ static inline int ane_fw_transport_settle(struct ane_fw_transport *t, u64 quiet_
 		} else if (ret != -EAGAIN) {
 			return ret;
 		}
+		ret = ane_fw_transport_terminal(t);
+		if (ret)
+			return ret;
 		if (now - last >= quiet_ns || now - start >= limit_ns)
 			return served;
 		t->polls++;
@@ -697,6 +896,9 @@ static inline int ane_fw_transport_wait(struct ane_fw_transport *t, unsigned int
 			return ret;
 		ret = ane_fw_transport_shared(t);
 		if (ret && ret != -EAGAIN)
+			return ret;
+		ret = ane_fw_transport_terminal(t);
+		if (ret)
 			return ret;
 		/* Recheck before sleeping, including time spent in alloc(). */
 		now = t->ops->now_ns(t->ctx);

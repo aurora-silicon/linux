@@ -2,6 +2,8 @@
 #ifndef __ANE_H16_BOOT_H__
 #define __ANE_H16_BOOT_H__
 
+#include <linux/slab.h>
+
 #include "ane_fw_transport.h"
 
 enum ane_h16_stage {
@@ -128,6 +130,14 @@ struct ane_h16_boot_ops {
 	void (*mailbox)(void *ctx);
 	void (*log)(void *ctx, const char *item, u64 a, u64 b);
 	void (*quarantine)(void *ctx, int error);
+	/*
+	 * Optional. After a startup timeout: power the engine off and on again,
+	 * verify that every domain went off, and restore the preload so the CPU
+	 * can be released from the same entry. 0 only for a verified reset.
+	 */
+	int (*restart)(void *ctx);
+	/* Optional. False while the engine's domains are off: no MMIO then. */
+	bool (*powered)(void *ctx);
 };
 
 /*
@@ -149,6 +159,9 @@ struct ane_h16_boot {
 	u64 ranges[4][2];
 	u32 requests[5];
 	u32 tick;
+	/* The PMU aperture base for SET_SNE_PMU_BASE2 at startup; 0: not sent. */
+	u64 pmu_base;
+	bool pmu_base_set;
 	u8 resource_info[100];
 	int error;
 	enum ane_h16_stage stage;
@@ -156,6 +169,9 @@ struct ane_h16_boot {
 	bool failed;
 	bool ran;
 	bool quarantined;
+	/* Startup timeouts answered with a verified restart, and the budget. */
+	unsigned int restarts;
+	unsigned int max_restarts;
 };
 
 static inline int ane_h16_stage_parse(const char *name)
@@ -196,10 +212,11 @@ static inline int ane_h16_faults(struct ane_h16_boot *b, bool log)
 	for (i = 0; i < 3; i++) {
 		enum ane_h16_window w = ANE_H16_DART0 + i;
 		u32 status = b->ops->read32(b->ctx, w, m->dart_fault);
-		u64 address = b->ops->read32(b->ctx, w, m->dart_address_lo);
 
-		address |= (u64)b->ops->read32(b->ctx, w, m->dart_address_hi) << 32;
 		if (log || (status & BIT(31))) {
+			u64 address = b->ops->read32(b->ctx, w, m->dart_address_lo);
+
+			address |= (u64)b->ops->read32(b->ctx, w, m->dart_address_hi) << 32;
 			b->ops->log(b->ctx, "DART status", i, status);
 			b->ops->log(b->ctx, "DART address", i, address);
 		}
@@ -217,9 +234,12 @@ static inline int ane_h16_fail(struct ane_h16_boot *b, int error)
 		b->error = error;
 	if (b->ran && !b->quarantined) {
 		b->quarantined = true;
-		for (i = 0; i < 8; i++)
-			b->ops->log(b->ctx, "quarantine scratch", i, ane_h16_read(b, i));
-		ane_h16_faults(b, true);
+		/* A failed restart can leave the engine off: then no register reads. */
+		if (!b->ops->powered || b->ops->powered(b->ctx)) {
+			for (i = 0; i < 8; i++)
+				b->ops->log(b->ctx, "quarantine scratch", i, ane_h16_read(b, i));
+			ane_h16_faults(b, true);
+		}
 		b->ops->quarantine(b->ctx, b->error);
 	}
 	return b->error;
@@ -459,7 +479,14 @@ static inline int ane_h16_wait(struct ane_h16_boot *b, u32 cell, u32 value,
 static inline int ane_h16_alloc(struct ane_h16_boot *b, u64 dva, size_t size,
 				struct ane_fw_surface *s)
 {
-	int ret = b->ops->alloc_at(b->ctx, dva, size, s);
+	int ret;
+
+	/* A cold boot after sleep reuses the surface it mapped before, cleared. */
+	if (s->cpu && s->dva == dva && s->size == size) {
+		memset(s->cpu, 0, size);
+		return 0;
+	}
+	ret = b->ops->alloc_at(b->ctx, dva, size, s);
 
 	if (ret)
 		return ret;
@@ -558,6 +585,40 @@ static inline int ane_h16_scratch_boot(struct ane_h16_boot *b)
 	return ret;
 }
 
+/* Read-only evidence: never acknowledge an IRQ or change a cursor on timeout. */
+static inline void ane_h16_startup_timeout(struct ane_h16_boot *b)
+{
+	struct ane_fw_transport *t = &b->transport;
+	const struct ane_fw_channel *c = &t->channels[ANE_FW_SHAREDMALLOC];
+	unsigned int i;
+	u8 *p;
+
+	b->ops->log(b->ctx, "startup timeout IRQ/polls",
+		    t->ops->read32(t->ctx, t->soc->irq_status), t->polls);
+	b->ops->log(b->ctx, "startup SHAREDMALLOC head/slots",
+		    t->head[ANE_FW_SHAREDMALLOC], c->slots);
+	b->ops->log(b->ctx, "startup SHAREDMALLOC ready/allocations",
+		    t->shared_ready, t->shared_count);
+	/* Geometry was validated before startup; include slots behind the cursor. */
+	for (i = 0; i < c->slots; i++) {
+		p = (u8 *)t->ipc.cpu + c->offset + i * ANE_FW_SLOT_SIZE;
+		t->ops->read_barrier(t->ctx);
+		b->ops->log(b->ctx, "startup SHAREDMALLOC slot/word0", i,
+			    t->ops->load64(t->ctx, p));
+		b->ops->log(b->ctx, "startup SHAREDMALLOC word1/word2",
+			    t->ops->load64(t->ctx, p + 8),
+			    t->ops->load64(t->ctx, p + 16));
+	}
+	p = ane_fw_transport_slot(t, ANE_FW_IO);
+	t->ops->read_barrier(t->ctx);
+	b->ops->log(b->ctx, "startup IO head/word0", t->head[ANE_FW_IO],
+		    t->ops->load64(t->ctx, p));
+	b->ops->log(b->ctx, "startup IO word1/word2", t->ops->load64(t->ctx, p + 8),
+		    t->ops->load64(t->ctx, p + 16));
+	for (i = 0; i < 8; i++)
+		b->ops->log(b->ctx, "startup timeout scratch", i, ane_h16_read(b, i));
+}
+
 static inline int ane_h16_startup(struct ane_h16_boot *b)
 {
 	const struct ane_h16_build *f = b->build;
@@ -578,6 +639,8 @@ static inline int ane_h16_startup(struct ane_h16_boot *b)
 		reply = (u8 *)b->pool.cpu +
 			(b->transport.pending[ANE_FW_IO].dva - b->pool.dva);
 		if (ret) {
+			if (ret == -ETIMEDOUT)
+				ane_h16_startup_timeout(b);
 			if (ret == -EREMOTEIO)
 				b->ops->log(b->ctx, "startup refusal ID/ack",
 					    f->startup[i].id, get_unaligned_le16(reply + 6));
@@ -595,8 +658,70 @@ static inline int ane_h16_startup(struct ane_h16_boot *b)
 		ret = ane_h16_faults(b, false);
 		if (ret)
 			return ret;
+		/* macOS order: START, then SET_SNE_PMU_BASE2 on the control ring. */
+		if (f->startup[i].id == 0 && b->pmu_base) {
+			b->pmu_base_set = false;
+			ret = ane_fw_transport_publish_pmu_base(&b->transport, b->pmu_base,
+								deadline);
+			if (!ret)
+				ret = ane_fw_transport_wait(&b->transport, b->transport.control_ch);
+			b->ops->log(b->ctx, "SET_SNE_PMU_BASE2 base/result", b->pmu_base, (u64)ret);
+			if (ret)
+				return ret;
+			b->pmu_base_set = true;
+		}
 	}
+	/* How often a request body was seen before its notification and held. */
+	b->ops->log(b->ctx, "startup SHAREDMALLOC allocations/early polls held",
+		    b->transport.shared_count, b->transport.shared_early);
 	return 0;
+}
+
+/*
+ * A startup that timed out left the firmware stopped part way, with requests
+ * of its own outstanding. Its rings cannot be resumed, so the engine is
+ * power cycled (the backend verifies the reset) and booted again from the
+ * preload, as after a cold system sleep: the pool, IPC and heap are reused
+ * and cleared, and the shared allocations are carried over, retired, so the
+ * new firmware's requests of the same tag and size get the same memory.
+ */
+static inline int ane_h16_restart(struct ane_h16_boot *b)
+{
+	struct ane_fw_transport *old;
+	int ret = b->ops->restart(b->ctx);
+
+	if (ret)
+		return ret;
+	old = kmemdup(&b->transport, sizeof(*old), GFP_KERNEL);
+	if (!old)
+		return -ENOMEM;
+	ret = ane_h16_scratch_boot(b);
+	if (!ret)
+		ane_fw_transport_carry_shared(&b->transport, old);
+	kfree(old);
+	return ret;
+}
+
+/*
+ * Run startup; after a timeout, restart the engine and run it again, at most
+ * b->max_restarts times in all against @used. The caller owns @used: one
+ * budget for bring-up, a fresh one for each boot after system sleep. Logs
+ * @what with the restart count and the budget.
+ */
+static inline int ane_h16_startup_restarting(struct ane_h16_boot *b,
+					     unsigned int *used,
+					     const char *what)
+{
+	int ret = ane_h16_startup(b);
+
+	while (ret == -ETIMEDOUT && b->ops->restart && *used < b->max_restarts) {
+		(*used)++;
+		b->ops->log(b->ctx, what, *used, b->max_restarts);
+		ret = ane_h16_restart(b);
+		if (!ret)
+			ret = ane_h16_startup(b);
+	}
+	return ret;
 }
 
 /*
@@ -639,7 +764,8 @@ static inline int ane_h16_run(struct ane_h16_boot *b, enum ane_h16_stage stage)
 			b->stage = ANE_H16_BOOT;
 	}
 	if (!ret && stage >= ANE_H16_STARTUP && b->stage < ANE_H16_STARTUP) {
-		ret = ane_h16_startup(b);
+		ret = ane_h16_startup_restarting(b, &b->restarts,
+						 "startup restart/budget");
 		if (!ret)
 			b->stage = ANE_H16_STARTUP;
 	}

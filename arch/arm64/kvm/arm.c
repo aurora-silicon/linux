@@ -31,6 +31,7 @@
 #include <asm/ptrace.h>
 #include <asm/mman.h>
 #include <asm/tlbflush.h>
+#include <asm/apple_amx.h>
 #include <asm/cacheflush.h>
 #include <asm/cpufeature.h>
 #include <asm/virt.h>
@@ -592,6 +593,9 @@ void kvm_arch_vcpu_postcreate(struct kvm_vcpu *vcpu)
 
 void kvm_arch_vcpu_destroy(struct kvm_vcpu *vcpu)
 {
+	apple_amx_vcpu_free(vcpu->arch.apple_amx);
+	vcpu->arch.apple_amx = NULL;
+
 	if (!is_protected_kvm_enabled())
 		kvm_mmu_free_memory_cache(&vcpu->arch.mmu_page_cache);
 	else
@@ -746,10 +750,15 @@ nommu:
 		vcpu_set_on_unsupported_cpu(vcpu);
 
 	vcpu->arch.pid = pid_nr(vcpu->pid);
+
+	apple_amx_vcpu_load(vcpu->arch.apple_amx,
+			    __vcpu_sys_reg(vcpu, APPLE_AMX_CTL_EL1));
 }
 
 void kvm_arch_vcpu_put(struct kvm_vcpu *vcpu)
 {
+	apple_amx_vcpu_put(vcpu->arch.apple_amx);
+
 	if (is_protected_kvm_enabled()) {
 		kvm_call_hyp(__vgic_v3_save_aprs, &vcpu->arch.vgic_cpu.vgic_v3);
 		kvm_call_hyp_nvhe(__pkvm_vcpu_put);

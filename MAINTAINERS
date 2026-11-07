@@ -2090,6 +2090,7 @@ F:	drivers/soc/apple/pmp.rs
 F:	include/linux/mt7932.h
 F:	include/linux/soc/apple/pmp-report.h
 F:	Documentation/devicetree/bindings/chosen/apple,dcp-rtkit-quiesced.yaml
+F:	Documentation/devicetree/bindings/chosen/aurora,ctxr-exec-window.yaml
 F:	Documentation/devicetree/bindings/display/apple,dcp.yaml
 F:	Documentation/devicetree/bindings/display/apple,display-subsystem.yaml
 F:	Documentation/PCI/controller/apple-t8140.rst
@@ -2097,6 +2098,7 @@ F:	Documentation/devicetree/bindings/iio/imu/apple,aop-motion.yaml
 F:	Documentation/devicetree/bindings/iio/light/apple,t8140-aop-als.yaml
 F:	Documentation/devicetree/bindings/input/apple,dockchannel-hid.yaml
 F:	Documentation/devicetree/bindings/mailbox/apple,ascwrap-v6.yaml
+F:	Documentation/devicetree/bindings/media/apple,t8132-isp.yaml
 F:	Documentation/devicetree/bindings/media/apple,t8140-isp.yaml
 F:	Documentation/devicetree/bindings/mux/apple,display-crossbar.yaml
 F:	Documentation/devicetree/bindings/reserved-memory/apple,asc-mem.yaml
@@ -2765,6 +2767,7 @@ F:	drivers/gpio/gpio-macsmc.c
 F:	drivers/hwmon/macsmc-hwmon*.c
 F:	drivers/pmdomain/apple/
 F:	drivers/pmdomain/apple/.kunitconfig.apple-pmp
+F:	drivers/pmdomain/apple/.kunitconfig.pmgr-pwrstate
 F:	drivers/i2c/busses/i2c-pasemi-core.c
 F:	drivers/i2c/busses/i2c-pasemi-platform.c
 F:	drivers/input/misc/macsmc-input.c
@@ -27515,6 +27518,13 @@ F:	drivers/power/supply/bq27xxx_battery.c
 F:	drivers/power/supply/bq27xxx_battery_i2c.c
 F:	include/linux/power/bq27xxx_battery.h
 
+TI CD2E22 EUSB2 REPEATER DRIVER
+M:	Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+L:	linux-phy@lists.infradead.org
+S:	Maintained
+F:	Documentation/devicetree/bindings/phy/ti,cd2e22.yaml
+F:	drivers/phy/phy-ti-cd2e22.c
+
 TI CDCE706 CLOCK DRIVER
 M:	Max Filippov <jcmvbkbc@gmail.com>
 S:	Maintained
@@ -28970,6 +28980,13 @@ T:	git https://gitlab.freedesktop.org/drm/misc/kernel.git
 F:	Documentation/gpu/vga-switcheroo.rst
 F:	drivers/gpu/vga/vga_switcheroo.c
 F:	include/linux/vga_switcheroo.h
+
+VIA LABS VL122 USB HUB SIDEBAND DRIVER
+M:	Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+L:	linux-usb@vger.kernel.org
+S:	Maintained
+F:	Documentation/devicetree/bindings/usb/via,vl122.yaml
+F:	drivers/usb/misc/vl122-hub.c
 
 VIA RHINE NETWORK DRIVER
 M:	Kevin Brace <kevinbrace@bracecomputerlab.com>

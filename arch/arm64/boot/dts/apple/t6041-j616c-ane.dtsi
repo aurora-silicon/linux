@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The Neural Engine of the J616c. iBoot pre-loads the personalized firmware.
+ * The boot loader fills the two reservations from this boot's ane0
+ * segment-ranges, renames them to their physical addresses and enables them
+ * with the ANE, its DARTs and its power domains, so all of these stay disabled
+ * until then.
+ */
+
+/ {
+	aliases {
+		ane = &ane;
+	};
+
+	reserved-memory {
+		ane_fw_text: ane-firmware-text@0 {
+			compatible = "apple,asc-mem";
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		ane_fw_data: ane-firmware-data@0 {
+			compatible = "apple,asc-mem";
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+	};
+};
+
+&ane {
+	memory-region = <&ane_fw_text>, <&ane_fw_data>;
+	memory-region-names = "firmware-text", "firmware-data";
+};
