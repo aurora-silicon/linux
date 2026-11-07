@@ -5,12 +5,13 @@ config VIDEO_APPLE_SCALER
 	depends on VIDEO_DEV
 	depends on ARCH_APPLE || (COMPILE_TEST && 64BIT)
 	depends on OF_ADDRESS && IOMMU_API && PM
+	select V4L2_MEM2MEM_DEV
+	select VIDEOBUF2_DMA_CONTIG
 	help
-	  Driver for the memory-to-memory image scaler and colour-space
-	  converter (MSR) in Apple silicon SoCs. This first version
-	  identifies the engine, attaches its power domains, IOMMU and
-	  interrupt, and keeps it idle; it does not yet expose a video
-	  device.
+	  V4L2 memory-to-memory driver for the image scaler and
+	  colour-space converter (MSR) in Apple silicon SoCs (M1 to M4
+	  generations and A18 Pro). It converts between Y'CbCr (NV12,
+	  P010) and 32-bit RGB at the same size; scaling follows.
 
 	  To compile this driver as a module, choose M here: the module
 	  will be called apple-scaler.
