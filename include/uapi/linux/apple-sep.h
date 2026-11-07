@@ -176,7 +176,7 @@ struct sep_bio_attest {
 struct sep_bio_lockout {
 	__u32 locked;    /* 1 while every verify is refused */
 	__u32 failures;  /* failed matches since the last match or re-arm */
-	__u32 reserved;
+	__u32 reason;    /* SEP_BIO_LOCK_REASON_*, while locked; 0 from older kernels */
 	__u32 flags;     /* SEP_BIO_LOCKOUT_FLAG_*; zero from older kernels */
 };
 
@@ -186,6 +186,18 @@ struct sep_bio_lockout {
  * Without this flag, call it only while 'locked'.
  */
 #define SEP_BIO_LOCKOUT_FLAG_EVERY_PASSWORD 1
+
+/*
+ * Why Touch ID needs the password. Besides too many failed attempts, it needs
+ * it when it has not been unlocked for 48 hours, or when the password has not
+ * been used for 156 hours and Touch ID has not unlocked for 4 hours (the
+ * clocks start at boot). A re-arm while not locked restarts the password
+ * clock.
+ */
+#define SEP_BIO_LOCK_REASON_NONE            0
+#define SEP_BIO_LOCK_REASON_ATTEMPTS        1
+#define SEP_BIO_LOCK_REASON_NOT_UNLOCKED    2
+#define SEP_BIO_LOCK_REASON_PASSWORD_UNUSED 3
 
 #define SEP_BIO_LOCKOUT_STATE _IOR(SEP_BIO_IOC_MAGIC, 0x0e, struct sep_bio_lockout)
 /*
