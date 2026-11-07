@@ -1,3 +1,5 @@
+.. SPDX-License-Identifier: GPL-2.0-only
+
 T6000 APR a0 qualification
 =========================
 
