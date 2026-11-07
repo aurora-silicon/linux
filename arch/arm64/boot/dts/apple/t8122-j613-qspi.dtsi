@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
-/*
- * J613 25G83 (macOS 26.6.2 firmware): the NOR and its NVRAM sit behind QSPI,
- * not SPI1. The driver stays read-only unless writes are opted in at runtime;
- * the MTD stays openable O_RDWR for asahi-bless --get-boot.
- */
+/* J613/J615 QSPIMC boot NOR and NVRAM layout. */
 
 / {
 	aliases {
@@ -12,6 +8,7 @@
 
 	soc {
 		qspi: spi@2a1118000 {
+			status = "okay";
 			compatible = "apple,t8122-qspi";
 			reg = <0x2 0xa1118000 0x0 0x4800>;
 			interrupt-parent = <&aic>;
@@ -42,7 +39,7 @@
 	};
 };
 
-/* The M1/M2 SPI1 NVRAM from t8122-jxxx.dtsi is not used on 25G83. */
+/* This board variant uses QSPIMC instead of SPI1 for NVRAM. */
 &spi1 {
 	status = "disabled";
 };

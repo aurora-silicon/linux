@@ -18,6 +18,12 @@ properties:
       - items:
           - const: apple,t6041-dpin
           - const: apple,dpin
+      - items:
+          - enum:
+              - apple,t8122-dpin
+              - apple,t6030-dpin
+              - apple,t6031-dpin
+          - const: apple,dpin
 
   reg:
     maxItems: 1
