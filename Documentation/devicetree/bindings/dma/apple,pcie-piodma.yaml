@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: "http://devicetree.org/schemas/dma/apple,pcie-piodma.yaml#"
+$schema: "http://devicetree.org/meta-schemas/core.yaml#"
+title: "Apple pcie programmed i/o dma engine"
+maintainers:
+  - "Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>"
+select:
+  properties:
+    compatible:
+      allOf:
+        -
+          contains:
+            enum:
+              - "apple,t8142-pcie-piodma"
+              - "apple,t8152-pcie-piodma"
+              - "apple,t6050-pcie-piodma"
+        -
+          contains:
+            const: "apple,pcie-piodma"
+  required:
+    - "compatible"
+description: "Apple pcie programmed i/o dma engine. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+properties:
+  compatible:
+    items:
+      -
+        enum:
+          - "apple,t8142-pcie-piodma"
+          - "apple,t8152-pcie-piodma"
+          - "apple,t6050-pcie-piodma"
+      -
+        const: "apple,pcie-piodma"
+  status:
+    const: "disabled"
+  reg:
+    description: "Register apertures of the complete hardware complex, in hardware interface order."
+    minItems: 3
+    maxItems: 3
+  interrupts:
+    description: "Interrupt lines wired to the system interrupt controller."
+    maxItems: 1
+  iommus:
+    description: "DMA translation streams emitted by this hardware."
+    maxItems: 1
+required:
+  - "compatible"
+  - "reg"
+  - "status"
+additionalProperties: false

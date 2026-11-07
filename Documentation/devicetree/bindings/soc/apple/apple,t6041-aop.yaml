@@ -2,6 +2,7 @@
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/soc/apple/apple,t6041-aop.yaml#
+
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
 title: Apple T604x and T8132 Always-On Processor
@@ -20,111 +21,196 @@ description:
   and reserves its windows, which the firmware reaches through its DART at
   their physical addresses.
 
-properties:
-  compatible:
-    enum:
-      - apple,t6041-aop
-      - apple,t8132-aop
-
-  reg:
-    minItems: 2
-    items:
-      - description: AOP SRAM, holding the boot-argument table
-      - description: ASC wrapper and processor control registers
-      - description: Second ASC register window
-      - description: AOP configuration registers
-
-  reg-names:
-    minItems: 2
-    items:
-      - const: firmware
-      - const: asc
-      - const: asc-aux
-      - const: config
-
-  mboxes:
-    maxItems: 1
-
-  mbox-names:
-    const: mbox
-
-  nonposted-mmio: true
-
-  iommus:
-    maxItems: 1
-
-  memory-region:
-    minItems: 1
-    maxItems: 18
-    description:
-      The firmware segments in DRAM (its external code and its log) and, on
-      T8132, the DAPF windows, filled in by the bootloader from the ADT. The
-      iommu-addresses property of each region gives the address the firmware
-      uses for it.
-
-  audio:
-    type: object
-    $ref: /schemas/sound/apple,t6041-aop-audio.yaml#
-    description: The audio service.
-
-  als:
-    type: object
-    description: The ambient light sensor service.
-    additionalProperties: false
-
-    properties:
-      compatible:
-        items:
-          - const: apple,t6041-aop-als
-          - const: apple,aop-als
-
-    required:
-      - compatible
-
-  las:
-    type: object
-    description: The lid angle sensor service.
-    additionalProperties: false
-
-    properties:
-      compatible:
-        items:
-          - const: apple,t6041-aop-las
-          - const: apple,aop-las
-
-    required:
-      - compatible
-
-  accel:
-    type: object
-    $ref: /schemas/iio/imu/apple,aop-motion.yaml#
-    description: The accelerometer service.
-    unevaluatedProperties: false
-
-  gyro:
-    type: object
-    $ref: /schemas/iio/imu/apple,aop-motion.yaml#
-    description: The gyroscope service.
-    unevaluatedProperties: false
-
-required:
-  - compatible
-  - reg
-  - mboxes
-  - mbox-names
-  - iommus
-
-allOf:
-  - if:
+select:
+  anyOf:
+    -
       properties:
         compatible:
-          const: apple,t6041-aop
-    then:
+          contains:
+            enum:
+              - "apple,t6041-aop"
+              - "apple,t8132-aop"
+      required:
+        - "compatible"
+    -
       properties:
-        memory-region:
-          maxItems: 4
+        compatible:
+          allOf:
+            -
+              contains:
+                enum:
+                  - "apple,t8142-aop"
+                  - "apple,t8152-aop"
+                  - "apple,t6050-aop"
+            -
+              contains:
+                const: "apple,aop"
+      required:
+        - "compatible"
+allOf:
+  -
+    if:
+      anyOf:
+        -
+          properties:
+            compatible:
+              allOf:
+                -
+                  contains:
+                    enum:
+                      - "apple,t8142-aop"
+                      - "apple,t8152-aop"
+                      - "apple,t6050-aop"
+                -
+                  contains:
+                    const: "apple,aop"
+            status:
+              const: "disabled"
+          required:
+            - "compatible"
+            - "status"
+          not:
+            required:
+              - "mboxes"
+    then:
+      oneOf:
+        -
+          description: "Apple always-on processor. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          properties:
+            compatible:
+              items:
+                -
+                  enum:
+                    - "apple,t8142-aop"
+                    - "apple,t8152-aop"
+                    - "apple,t6050-aop"
+                -
+                  const: "apple,aop"
+            status:
+              const: "disabled"
+            reg:
+              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              minItems: 3
+              maxItems: 6
+            interrupts:
+              description: "Interrupt lines wired to the system interrupt controller."
+              minItems: 3
+              maxItems: 4
+            iommus:
+              description: "DMA translation streams emitted by this hardware."
+              maxItems: 1
+          required:
+            - "compatible"
+            - "reg"
+            - "status"
+          additionalProperties: false
+    else:
+      $ref: "#/$defs/legacy-driver"
 
-additionalProperties: false
+$defs:
+  legacy-driver:
+    properties:
+      compatible:
+        enum:
+          - apple,t6041-aop
+          - apple,t8132-aop
+
+      reg:
+        minItems: 2
+        items:
+          - description: AOP SRAM, holding the boot-argument table
+          - description: ASC wrapper and processor control registers
+          - description: Second ASC register window
+          - description: AOP configuration registers
+
+      reg-names:
+        minItems: 2
+        items:
+          - const: firmware
+          - const: asc
+          - const: asc-aux
+          - const: config
+
+      mboxes:
+        maxItems: 1
+
+      mbox-names:
+        const: mbox
+
+      nonposted-mmio: true
+
+      iommus:
+        maxItems: 1
+
+      memory-region:
+        minItems: 1
+        maxItems: 18
+        description:
+          The firmware segments in DRAM (its external code and its log) and, on
+          T8132, the DAPF windows, filled in by the bootloader from the ADT. The
+          iommu-addresses property of each region gives the address the firmware
+          uses for it.
+
+      audio:
+        type: object
+        $ref: /schemas/sound/apple,t6041-aop-audio.yaml#
+        description: The audio service.
+
+      als:
+        type: object
+        description: The ambient light sensor service.
+        additionalProperties: false
+
+        properties:
+          compatible:
+            items:
+              - const: apple,t6041-aop-als
+              - const: apple,aop-als
+
+        required:
+          - compatible
+
+      las:
+        type: object
+        description: The lid angle sensor service.
+        additionalProperties: false
+
+        properties:
+          compatible:
+            items:
+              - const: apple,t6041-aop-las
+              - const: apple,aop-las
+
+        required:
+          - compatible
+
+      accel:
+        type: object
+        $ref: /schemas/iio/imu/apple,aop-motion.yaml#
+        description: The accelerometer service.
+        unevaluatedProperties: false
+
+      gyro:
+        type: object
+        $ref: /schemas/iio/imu/apple,aop-motion.yaml#
+        description: The gyroscope service.
+        unevaluatedProperties: false
+    required:
+      - compatible
+      - reg
+      - mboxes
+      - mbox-names
+      - iommus
+    allOf:
+      - if:
+          properties:
+            compatible:
+              const: apple,t6041-aop
+        then:
+          properties:
+            memory-region:
+              maxItems: 4
+    additionalProperties: false
 
 examples:
   - |

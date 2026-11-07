@@ -2,6 +2,7 @@
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/display/apple,dcp.yaml#
+
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
 title: Apple display coprocessor
@@ -14,446 +15,548 @@ description:
   through an RTKit mailbox. Its piodma child uses a separate display DART
   stream from the coprocessor itself.
 
-properties:
-  compatible:
-    oneOf:
-      - items:
-          - enum:
-              - apple,t8103-dcp
-              - apple,t8112-dcp
-              - apple,t6000-dcp
-              - apple,t6020-dcp
-              - apple,t6041-dcp
-              - apple,t8140-dcp
-              - apple,t8142-dcp
-          - const: apple,dcp
-      - items:
-          - enum:
-              - apple,t8103-dcpext
-              - apple,t8112-dcpext
-              - apple,t6000-dcpext
-              - apple,t6020-dcpext
-              - apple,t6041-dcpext
-          - const: apple,dcpext
-      - items:
-          - const: apple,t8140-dcpext
-          - const: apple,dcp
-      - description:
-          J713 internal display controller (T8132), whose inherited firmware
-          session uses IOMFB 26.6.2. The loader publishes the firmware identity,
-          reserved memory and validated display DART mappings.
-        const: apple,t8132-dcp
-      - description:
-          J713 external display coprocessors (T8132), running the internal
-          DCP's firmware. The boot loader can hand them over running; it then
-          reserves their firmware memory, publishes the firmware identity and
-          sets apple,t8132-dcpext-firmware-ready.
-        const: apple,t8132-dcpext
+select:
+  anyOf:
+    -
+      properties:
+        compatible:
+          contains:
+            enum:
+              - "apple,dcp"
+              - "apple,dcpext"
+              - "apple,t6000-dcp"
+              - "apple,t6000-dcpext"
+              - "apple,t6020-dcp"
+              - "apple,t6020-dcpext"
+              - "apple,t6041-dcp"
+              - "apple,t6041-dcpext"
+              - "apple,t8103-dcp"
+              - "apple,t8103-dcpext"
+              - "apple,t8112-dcp"
+              - "apple,t8112-dcpext"
+              - "apple,t8132-dcp"
+              - "apple,t8132-dcpext"
+              - "apple,t8132-dcpext-firmware-ready."
+              - "apple,t8140-dcp"
+              - "apple,t8140-dcpext"
+              - "apple,t8142-dcp"
+      required:
+        - "compatible"
+    -
+      properties:
+        compatible:
+          allOf:
+            -
+              contains:
+                enum:
+                  - "apple,t8142-dcp"
+                  - "apple,t8152-dcp"
+                  - "apple,t6050-dcp"
+            -
+              contains:
+                const: "apple,dcp"
+      required:
+        - "compatible"
+allOf:
+  -
+    if:
+      anyOf:
+        -
+          properties:
+            compatible:
+              allOf:
+                -
+                  contains:
+                    enum:
+                      - "apple,t8142-dcp"
+                      - "apple,t8152-dcp"
+                      - "apple,t6050-dcp"
+                -
+                  contains:
+                    const: "apple,dcp"
+            status:
+              const: "disabled"
+          required:
+            - "compatible"
+            - "status"
+          not:
+            required:
+              - "mboxes"
+    then:
+      oneOf:
+        -
+          description: "Apple display management coprocessor. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          properties:
+            compatible:
+              items:
+                -
+                  enum:
+                    - "apple,t8142-dcp"
+                    - "apple,t8152-dcp"
+                    - "apple,t6050-dcp"
+                -
+                  const: "apple,dcp"
+            status:
+              const: "disabled"
+            reg:
+              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              minItems: 2
+              maxItems: 4
+            interrupts:
+              description: "Interrupt lines wired to the system interrupt controller."
+              minItems: 3
+              maxItems: 8
+            iommus:
+              description: "DMA translation streams emitted by this hardware."
+              minItems: 1
+              maxItems: 2
+          required:
+            - "compatible"
+            - "reg"
+            - "status"
+          additionalProperties: false
+    else:
+      $ref: "#/$defs/legacy-driver"
 
-  reg:
-    minItems: 2
-    maxItems: 7
-
-  reg-names:
-    minItems: 2
-    items:
-      - const: coproc
-      - const: disp-0
-      - enum: [disp-1, iop-vbar]
-      - enum: [disp-2, iop-vbar]
-      - enum: [disp-3, iop-vbar]
-      - enum: [disp-4, iop-vbar]
-      - const: iop-vbar
-
-  mboxes:
-    maxItems: 1
-
-  mbox-names:
-    items:
-      - const: mbox
-
-  iommus:
-    maxItems: 1
-
-  power-domains:
-    maxItems: 1
-
-  dma-noncoherent: true
-
-  resets:
-    maxItems: 1
-
-  clocks:
-    minItems: 1
-    maxItems: 2
-
-  clock-names:
-    minItems: 1
-    items:
-      - const: clock-154
-      - const: clock-194
-
-  memory-region:
-    minItems: 1
-    maxItems: 64
-
-  memory-region-names:
-    minItems: 1
-    maxItems: 64
-
-  phys:
-    minItems: 1
-    maxItems: 8
-
-  phy-names:
-    minItems: 1
-    maxItems: 8
-    items:
-      pattern: '^(dp-phy|typec[0-9]+)$'
-
-  apple,bw-scratch:
-    $ref: /schemas/types.yaml#/definitions/phandle-array
-    items:
-      - items:
-          - description: Phandle of the PMGR bandwidth register provider.
-          - description: Index into the provider's reg property.
-          - description: Index in the firmware display register table.
-          - description: Byte offset of the scratch register within the resource.
-    description: |
-      PMGR bandwidth scratch resource, display index and offset. On the T8132
-      external DCPs it is the pipe's 8-byte realtime bandwidth request slot,
-      which lies inside the display register window the index names (disp-4).
-
-  apple,bw-doorbell:
-    $ref: /schemas/types.yaml#/definitions/phandle-array
-    items:
-      - items:
-          - description: Phandle of the PMGR bandwidth register provider.
-          - description: Index into the provider's reg property.
-          - description: Index in the firmware display register table.
-    description: Optional PMGR bandwidth doorbell resource and display index.
-
-  apple,iomfb-surfaces:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
-    minItems: 1
-    maxItems: 4
-    items:
-      enum: [0, 1]
-    description: |
-      Per-slot enable flags, in slot order. The legacy J700 bootloader
-      supplies a single zero to select surface zero instead.
-
-  apple,power-lut-data-x:
-    $ref: /schemas/types.yaml#/definitions/uint8-array
-    minItems: 4
-    maxItems: 4
-    description: |
-      First dimension of the display firmware power lookup table. The
-      bootloader copies the disp0 ADT property verbatim, as a little-endian
-      32-bit word, for transfer to the display firmware.
-
-  apple,power-lut-data-y:
-    $ref: /schemas/types.yaml#/definitions/uint8-array
-    minItems: 4
-    maxItems: 4
-    description: |
-      Second dimension of the display firmware power lookup table, copied
-      verbatim from disp0 in the ADT as a little-endian 32-bit word.
-
-  apple,power-lut-data-xindex:
-    $ref: /schemas/types.yaml#/definitions/uint8-array
-    minItems: 52
-    maxItems: 52
-    description: |
-      First-axis indices of the display firmware power lookup table, copied
-      verbatim from disp0 in the ADT as thirteen little-endian 32-bit words.
-      These are firmware table inputs, not a Linux backlight range.
-
-  apple,power-lut-data-yindex:
-    $ref: /schemas/types.yaml#/definitions/uint8-array
-    minItems: 4
-    maxItems: 4
-    description: |
-      Second-axis index of the display firmware power lookup table, copied
-      verbatim from disp0 in the ADT as a little-endian 32-bit word.
-
-  apple,power-lut-data-lut:
-    $ref: /schemas/types.yaml#/definitions/uint8-array
-    minItems: 52
-    maxItems: 52
-    description: |
-      Display firmware power lookup table, copied verbatim from disp0 in
-      the ADT as thirteen little-endian 32-bit words. Linux passes these
-      values to the firmware without interpreting or changing them.
-
-  apple,firmware-uuid:
-    $ref: /schemas/types.yaml#/definitions/string
-    description: UUID of the inherited display firmware image.
-
-  apple,j713-native-piodma:
-    type: boolean
-    description: Request loader validation of the inherited J713 PIODMA stream.
-
-  apple,j713-native-scanout:
-    type: boolean
-    description: Request loader validation of the inherited J713 scanout stream.
-
-  apple,panel-width-mm:
-    maxItems: 1
-    description: Physical width of the inherited internal panel.
-
-  apple,panel-height-mm:
-    maxItems: 1
-    description: Physical height of the inherited internal panel.
-
-  apple,firmware-version:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
-    minItems: 3
-    maxItems: 5
-    description: Version reported by the loaded display firmware.
-
-  apple,firmware-compat:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
-    minItems: 3
-    maxItems: 5
-    description: Loader-provided firmware ABI version used for IOMFB selection.
-
-  apple,t8132-dcpext-firmware-ready:
-    $ref: /schemas/types.yaml#/definitions/uint32
-    enum: [0, 1]
-    description:
-      Set to 1 by the boot loader once it has handed a T8132 external display
-      coprocessor over running, with its firmware memory reserved. Without
-      it the coprocessor is left alone.
-
-  apple,connector-type:
-    enum: [HDMI-A, DP, USB-C]
-
-  apple,dcp-index:
-    $ref: /schemas/types.yaml#/definitions/uint32
-    description: Display coprocessor index on multi-DCP systems.
-
-  apple,typec-hybrid-first:
-    type: boolean
-    description:
-      A hybrid pipeline (a fixed output plus Type-C routes) is planned for a
-      Type-C port before the other pipelines, while its fixed output has no
-      sink, instead of being kept back for that output. Set where this
-      pipeline is the only one that can be the primary of a display wider than
-      one pipe.
-
-  apple,dcp-endpoint:
-    $ref: /schemas/types.yaml#/definitions/uint32
-    description:
-      The display endpoint this coprocessor is to its firmware (its display
-      index), by which two external pipes name each other when a display
-      wider than one pipe is driven by two of them. 0 is the internal
-      display.
-
-  apple,dptx-phy:
-    $ref: /schemas/types.yaml#/definitions/uint32
-    description: DisplayPort transmitter PHY selector.
-
-  apple,dptx-die:
-    $ref: /schemas/types.yaml#/definitions/uint32
-    description: Die containing the DisplayPort transmitter.
-
-  apple,notch-height:
-    $ref: /schemas/types.yaml#/definitions/uint32
-    description: Height in pixels reserved for the display notch.
-
-  apple,pmp-report:
-    $ref: /schemas/types.yaml#/definitions/phandle
-    description:
-      PMP report entry for this coprocessor's display request. The display
-      firmware runs only once the PMP has acknowledged it.
-
-  apple,typec-mux-indices:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
-    minItems: 1
-    maxItems: 4
-    description: Crossbar state for each Type-C display route.
-
-  apple,typec-dptx-phys:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
-    minItems: 1
-    maxItems: 4
-    description: DisplayPort PHY index for each Type-C display route.
-
-  mux-controls:
-    $ref: /schemas/types.yaml#/definitions/phandle-array
-    minItems: 1
-    maxItems: 10
-    description: |
-      T6030 and T8132 external DCPs may also name the two DP IN tunnel states
-      of each Type-C crossbar, in addition to the fixed output and Type-C
-      routes.
-
-  mux-control-names:
-    minItems: 1
-    maxItems: 10
-    items:
-      pattern: '^(dp-xbar|typec[0-9]+(-dpin[01])?)$'
-
-  mux-index:
-    $ref: /schemas/types.yaml#/definitions/uint32
-    description: Crossbar state for a fixed output.
-
-  hdmi-hpd-gpios:
-    maxItems: 1
-
-  hdmi-pwren-gpios:
-    maxItems: 1
-
-  dp2hdmi-pwren-gpios:
-    maxItems: 1
-
-  '#address-cells':
-    const: 2
-
-  '#size-cells':
-    const: 2
-
-  piodma:
-    type: object
-    properties:
-      iommus:
-        maxItems: 1
-      dma-noncoherent: true
-      memory-region:
-        minItems: 1
-        maxItems: 64
-      apple,j713-inherited-mappings:
-        type: boolean
-        description: The loader validated the inherited J713 SID16 PIODMA mapping.
-    required:
-      - iommus
-    additionalProperties: false
-
-  panel:
-    type: object
+$defs:
+  legacy-driver:
     properties:
       compatible:
         oneOf:
-          - const: apple,panel
           - items:
-              - pattern: '^apple,panel-j[0-9]+$'
-              - const: apple,panel
+              - enum:
+                  - apple,t8103-dcp
+                  - apple,t8112-dcp
+                  - apple,t6000-dcp
+                  - apple,t6020-dcp
+                  - apple,t6041-dcp
+                  - apple,t8140-dcp
+                  - apple,t8142-dcp
+              - const: apple,dcp
           - items:
-              - pattern: '^apple,panel-j[0-9]+$'
-              - const: apple,panel-mini-led
-              - const: apple,panel
-      width-mm:
-        description: Physical panel width.
-      height-mm:
-        description: Physical panel height.
-      adj-height-mm:
-        description: Visible height below the notch.
-      apple,max-brightness:
-        $ref: /schemas/types.yaml#/definitions/uint32
-        description: Maximum firmware backlight level.
-      apple,color-gamut:
-        $ref: /schemas/types.yaml#/definitions/string
-        enum:
-          - srgb
-          - display-p3
-        description:
-          Standard colour space the panel is calibrated to by default, as
-          named in the product's published specifications. srgb has the
-          IEC 61966-2-1 primaries, display-p3 the SMPTE EG 432-1 primaries;
-          both have a D65 white and a nominal gamma of 2.2. Factory
-          calibration of the individual unit is applied by the display
-          coprocessor and is not described here. Colour data reported by
-          the firmware takes precedence.
-    required:
-      - compatible
-    additionalProperties: false
+              - enum:
+                  - apple,t8103-dcpext
+                  - apple,t8112-dcpext
+                  - apple,t6000-dcpext
+                  - apple,t6020-dcpext
+                  - apple,t6041-dcpext
+              - const: apple,dcpext
+          - items:
+              - const: apple,t8140-dcpext
+              - const: apple,dcp
+          - description:
+              J713 internal display controller (T8132), whose inherited firmware
+              session uses IOMFB 26.6.2. The loader publishes the firmware identity,
+              reserved memory and validated display DART mappings.
+            const: apple,t8132-dcp
+          - description:
+              J713 external display coprocessors (T8132), running the internal
+              DCP's firmware. The boot loader can hand them over running; it then
+              reserves their firmware memory, publishes the firmware identity and
+              sets apple,t8132-dcpext-firmware-ready.
+            const: apple,t8132-dcpext
 
-  typec-routes:
-    type: object
-    properties:
+      reg:
+        minItems: 2
+        maxItems: 7
+
+      reg-names:
+        minItems: 2
+        items:
+          - const: coproc
+          - const: disp-0
+          - enum: [disp-1, iop-vbar]
+          - enum: [disp-2, iop-vbar]
+          - enum: [disp-3, iop-vbar]
+          - enum: [disp-4, iop-vbar]
+          - const: iop-vbar
+
+      mboxes:
+        maxItems: 1
+
+      mbox-names:
+        items:
+          - const: mbox
+
+      iommus:
+        maxItems: 1
+
+      power-domains:
+        maxItems: 1
+
+      dma-noncoherent: true
+
+      resets:
+        maxItems: 1
+
+      clocks:
+        minItems: 1
+        maxItems: 2
+
+      clock-names:
+        minItems: 1
+        items:
+          - const: clock-154
+          - const: clock-194
+
+      memory-region:
+        minItems: 1
+        maxItems: 64
+
+      memory-region-names:
+        minItems: 1
+        maxItems: 64
+
+      phys:
+        minItems: 1
+        maxItems: 8
+
+      phy-names:
+        minItems: 1
+        maxItems: 8
+        items:
+          pattern: '^(dp-phy|typec[0-9]+)$'
+
+      apple,bw-scratch:
+        $ref: /schemas/types.yaml#/definitions/phandle-array
+        items:
+          - items:
+              - description: Phandle of the PMGR bandwidth register provider.
+              - description: Index into the provider's reg property.
+              - description: Index in the firmware display register table.
+              - description: Byte offset of the scratch register within the resource.
+        description: |
+          PMGR bandwidth scratch resource, display index and offset. On the T8132
+          external DCPs it is the pipe's 8-byte realtime bandwidth request slot,
+          which lies inside the display register window the index names (disp-4).
+
+      apple,bw-doorbell:
+        $ref: /schemas/types.yaml#/definitions/phandle-array
+        items:
+          - items:
+              - description: Phandle of the PMGR bandwidth register provider.
+              - description: Index into the provider's reg property.
+              - description: Index in the firmware display register table.
+        description: Optional PMGR bandwidth doorbell resource and display index.
+
+      apple,iomfb-surfaces:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        minItems: 1
+        maxItems: 4
+        items:
+          enum: [0, 1]
+        description: |
+          Per-slot enable flags, in slot order. The legacy J700 bootloader
+          supplies a single zero to select surface zero instead.
+
+      apple,power-lut-data-x:
+        $ref: /schemas/types.yaml#/definitions/uint8-array
+        minItems: 4
+        maxItems: 4
+        description: |
+          First dimension of the display firmware power lookup table. The
+          bootloader copies the disp0 ADT property verbatim, as a little-endian
+          32-bit word, for transfer to the display firmware.
+
+      apple,power-lut-data-y:
+        $ref: /schemas/types.yaml#/definitions/uint8-array
+        minItems: 4
+        maxItems: 4
+        description: |
+          Second dimension of the display firmware power lookup table, copied
+          verbatim from disp0 in the ADT as a little-endian 32-bit word.
+
+      apple,power-lut-data-xindex:
+        $ref: /schemas/types.yaml#/definitions/uint8-array
+        minItems: 52
+        maxItems: 52
+        description: |
+          First-axis indices of the display firmware power lookup table, copied
+          verbatim from disp0 in the ADT as thirteen little-endian 32-bit words.
+          These are firmware table inputs, not a Linux backlight range.
+
+      apple,power-lut-data-yindex:
+        $ref: /schemas/types.yaml#/definitions/uint8-array
+        minItems: 4
+        maxItems: 4
+        description: |
+          Second-axis index of the display firmware power lookup table, copied
+          verbatim from disp0 in the ADT as a little-endian 32-bit word.
+
+      apple,power-lut-data-lut:
+        $ref: /schemas/types.yaml#/definitions/uint8-array
+        minItems: 52
+        maxItems: 52
+        description: |
+          Display firmware power lookup table, copied verbatim from disp0 in
+          the ADT as thirteen little-endian 32-bit words. Linux passes these
+          values to the firmware without interpreting or changing them.
+
+      apple,firmware-uuid:
+        $ref: /schemas/types.yaml#/definitions/string
+        description: UUID of the inherited display firmware image.
+
+      apple,j713-native-piodma:
+        type: boolean
+        description: Request loader validation of the inherited J713 PIODMA stream.
+
+      apple,j713-native-scanout:
+        type: boolean
+        description: Request loader validation of the inherited J713 scanout stream.
+
+      apple,panel-width-mm:
+        maxItems: 1
+        description: Physical width of the inherited internal panel.
+
+      apple,panel-height-mm:
+        maxItems: 1
+        description: Physical height of the inherited internal panel.
+
+      apple,firmware-version:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        minItems: 3
+        maxItems: 5
+        description: Version reported by the loaded display firmware.
+
+      apple,firmware-compat:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        minItems: 3
+        maxItems: 5
+        description: Loader-provided firmware ABI version used for IOMFB selection.
+
+      apple,t8132-dcpext-firmware-ready:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        enum: [0, 1]
+        description:
+          Set to 1 by the boot loader once it has handed a T8132 external display
+          coprocessor over running, with its firmware memory reserved. Without
+          it the coprocessor is left alone.
+
+      apple,connector-type:
+        enum: [HDMI-A, DP, USB-C]
+
+      apple,dcp-index:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Display coprocessor index on multi-DCP systems.
+
+      apple,typec-hybrid-first:
+        type: boolean
+        description:
+          A hybrid pipeline (a fixed output plus Type-C routes) is planned for a
+          Type-C port before the other pipelines, while its fixed output has no
+          sink, instead of being kept back for that output. Set where this
+          pipeline is the only one that can be the primary of a display wider than
+          one pipe.
+
+      apple,dcp-endpoint:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description:
+          The display endpoint this coprocessor is to its firmware (its display
+          index), by which two external pipes name each other when a display
+          wider than one pipe is driven by two of them. 0 is the internal
+          display.
+
+      apple,dptx-phy:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: DisplayPort transmitter PHY selector.
+
+      apple,dptx-die:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Die containing the DisplayPort transmitter.
+
+      apple,notch-height:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Height in pixels reserved for the display notch.
+
+      apple,pmp-report:
+        $ref: /schemas/types.yaml#/definitions/phandle
+        description:
+          PMP report entry for this coprocessor's display request. The display
+          firmware runs only once the PMP has acknowledged it.
+
+      apple,typec-mux-indices:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        minItems: 1
+        maxItems: 4
+        description: Crossbar state for each Type-C display route.
+
+      apple,typec-dptx-phys:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        minItems: 1
+        maxItems: 4
+        description: DisplayPort PHY index for each Type-C display route.
+
+      mux-controls:
+        $ref: /schemas/types.yaml#/definitions/phandle-array
+        minItems: 1
+        maxItems: 10
+        description: |
+          T6030 and T8132 external DCPs may also name the two DP IN tunnel states
+          of each Type-C crossbar, in addition to the fixed output and Type-C
+          routes.
+
+      mux-control-names:
+        minItems: 1
+        maxItems: 10
+        items:
+          pattern: '^(dp-xbar|typec[0-9]+(-dpin[01])?)$'
+
+      mux-index:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Crossbar state for a fixed output.
+
+      hdmi-hpd-gpios:
+        maxItems: 1
+
+      hdmi-pwren-gpios:
+        maxItems: 1
+
+      dp2hdmi-pwren-gpios:
+        maxItems: 1
+
       '#address-cells':
-        const: 1
+        const: 2
+
       '#size-cells':
-        const: 0
-    patternProperties:
-      '^route@[0-3]$':
+        const: 2
+
+      piodma:
         type: object
         properties:
-          reg:
+          iommus:
             maxItems: 1
-          mode-switch:
+          dma-noncoherent: true
+          memory-region:
+            minItems: 1
+            maxItems: 64
+          apple,j713-inherited-mappings:
             type: boolean
-          port:
-            $ref: /schemas/graph.yaml#/properties/port
+            description: The loader validated the inherited J713 SID16 PIODMA mapping.
         required:
-          - reg
-          - mode-switch
-          - port
+          - iommus
         additionalProperties: false
+
+      panel:
+        type: object
+        properties:
+          compatible:
+            oneOf:
+              - const: apple,panel
+              - items:
+                  - pattern: '^apple,panel-j[0-9]+$'
+                  - const: apple,panel
+              - items:
+                  - pattern: '^apple,panel-j[0-9]+$'
+                  - const: apple,panel-mini-led
+                  - const: apple,panel
+          width-mm:
+            description: Physical panel width.
+          height-mm:
+            description: Physical panel height.
+          adj-height-mm:
+            description: Visible height below the notch.
+          apple,max-brightness:
+            $ref: /schemas/types.yaml#/definitions/uint32
+            description: Maximum firmware backlight level.
+          apple,color-gamut:
+            $ref: /schemas/types.yaml#/definitions/string
+            enum:
+              - srgb
+              - display-p3
+            description:
+              Standard colour space the panel is calibrated to by default, as
+              named in the product's published specifications. srgb has the
+              IEC 61966-2-1 primaries, display-p3 the SMPTE EG 432-1 primaries;
+              both have a D65 white and a nominal gamma of 2.2. Factory
+              calibration of the individual unit is applied by the display
+              coprocessor and is not described here. Colour data reported by
+              the firmware takes precedence.
+        required:
+          - compatible
+        additionalProperties: false
+
+      typec-routes:
+        type: object
+        properties:
+          '#address-cells':
+            const: 1
+          '#size-cells':
+            const: 0
+        patternProperties:
+          '^route@[0-3]$':
+            type: object
+            properties:
+              reg:
+                maxItems: 1
+              mode-switch:
+                type: boolean
+              port:
+                $ref: /schemas/graph.yaml#/properties/port
+            required:
+              - reg
+              - mode-switch
+              - port
+            additionalProperties: false
+        required:
+          - '#address-cells'
+          - '#size-cells'
+        additionalProperties: false
+
+      ports:
+        $ref: /schemas/graph.yaml#/properties/ports
     required:
-      - '#address-cells'
-      - '#size-cells'
-    additionalProperties: false
-
-  ports:
-    $ref: /schemas/graph.yaml#/properties/ports
-
-required:
-  - compatible
-  - reg
-  - reg-names
-  - mboxes
-  - iommus
-
-allOf:
-  - if:
-      properties:
-        compatible:
-          contains:
-            enum: ['apple,t6030-dcpext', 'apple,t8132-dcpext']
-      required:
-        - compatible
-    else:
-      properties:
-        mux-controls:
-          maxItems: 8
-        mux-control-names:
-          maxItems: 8
-          items:
-            pattern: '^(dp-xbar|typec[0-9]+)$'
-  - if:
-      not:
-        properties:
-          compatible:
-            contains:
-              enum: ['apple,t8132-dcp', 'apple,t8132-dcpext']
-    then:
-      required:
-        - apple,bw-scratch
-  - if:
-      not:
-        properties:
-          compatible:
-            contains:
-              enum: ['apple,t8140-dcp', 'apple,t8140-dcpext']
-    then:
-      properties:
-        apple,power-lut-data-x: false
-        apple,power-lut-data-y: false
-        apple,power-lut-data-xindex: false
-        apple,power-lut-data-yindex: false
-        apple,power-lut-data-lut: false
-  - if:
-      properties:
-        compatible:
-          contains:
-            enum: ['apple,t8140-dcp', 'apple,t8140-dcpext']
-    then:
-      properties:
-        resets: false
-
-unevaluatedProperties: false
+      - compatible
+      - reg
+      - reg-names
+      - mboxes
+      - iommus
+    allOf:
+      - if:
+          properties:
+            compatible:
+              contains:
+                enum: ['apple,t6030-dcpext', 'apple,t8132-dcpext']
+          required:
+            - compatible
+        else:
+          properties:
+            mux-controls:
+              maxItems: 8
+            mux-control-names:
+              maxItems: 8
+              items:
+                pattern: '^(dp-xbar|typec[0-9]+)$'
+      - if:
+          not:
+            properties:
+              compatible:
+                contains:
+                  enum: ['apple,t8132-dcp', 'apple,t8132-dcpext']
+        then:
+          required:
+            - apple,bw-scratch
+      - if:
+          not:
+            properties:
+              compatible:
+                contains:
+                  enum: ['apple,t8140-dcp', 'apple,t8140-dcpext']
+        then:
+          properties:
+            apple,power-lut-data-x: false
+            apple,power-lut-data-y: false
+            apple,power-lut-data-xindex: false
+            apple,power-lut-data-yindex: false
+            apple,power-lut-data-lut: false
+      - if:
+          properties:
+            compatible:
+              contains:
+                enum: ['apple,t8140-dcp', 'apple,t8140-dcpext']
+        then:
+          properties:
+            resets: false
+    unevaluatedProperties: false
 
 examples:
   - |
