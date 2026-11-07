@@ -54,6 +54,109 @@ select:
                 const: apple,ane
       required:
         - compatible
+properties:
+  compatible: true
+
+  reg: true
+
+  reg-names: true
+
+  apple,performance-controller:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      PMP report provider that owns the ANE clock-level request interface.
+      Only supported on T6000. The ANE and report SRAM must remain powered
+      while the driver holds a request.
+
+  interconnects:
+    maxItems: 1
+
+  interconnect-names:
+    const: memory
+    description: DRAM/fabric path; bandwidth requests come from the level OPP.
+
+  operating-points-v2: true
+
+  interrupts: true
+
+  interrupt-names: true
+
+  iommus: true
+
+  power-domains: true
+
+  power-domain-names: true
+
+  resets: true
+
+  mboxes:
+    maxItems: 1
+    description: Mailbox of the ANE coprocessor
+
+  memory-region: true
+
+  memory-region-names: true
+
+  apple,firmware-iovas:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    items:
+      - const: 0x10000000000
+      - const: 0x100000c0000
+    description:
+      Device addresses of the preloaded TEXT and DATA segments. Their sizes
+      are 0xc0000 and 0x2ac000 bytes respectively. The bootloader supplies
+      the physical reservations. The device addresses are fixed by the
+      firmware layout and may be described statically.
+
+  apple,dapf-ranges:
+    $ref: /schemas/types.yaml#/definitions/uint64-matrix
+    minItems: 4
+    maxItems: 4
+    items:
+      items:
+        - description: Physical start address, inclusive
+        - description: Physical end address, inclusive
+    description:
+      Four DART address protection filter (DAPF) ranges, in hardware record
+      order. Each pair contains inclusive 64-bit physical bounds, not a
+      base and length. The same records apply to all three ANE DARTs.
+      Firmware accesses these registers through identity mappings of the
+      containing 16 KiB pages in its private domain. These are MMIO ranges,
+      not allocatable DMA memory or additional preload segments.
+
+  apple,preload-data-sha256:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 32
+    maxItems: 32
+    description:
+      Optional bootloader-produced digest of the live reserved DATA
+      including all personalized parameter bytes. This establishes
+      preservation of that boot's DATA, not a cross-build firmware identity.
+      Without it the driver checks its copy against the live DATA. TEXT has
+      a driver pin.
+
+  apple,ane-type:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    enum: [0x110, 0x200]
+    description: Firmware generation identifier supplied by the bootloader
+
+  apple,firmware-preloaded:
+    type: boolean
+    description:
+      Firmware has been personalized and preloaded by iBoot. The driver
+      must preserve its runtime patches and must not stage a disk image.
+
+  apple,exclave-assigned:
+    type: boolean
+    description:
+      The ANE belongs to an exclave. Direct access requires a separate
+      Linux ownership provider to acquire a quiesced device and isolate
+      the exclave DART contexts. Absence does not prove a handoff on T8140.
+
+# The root declares the union of property types for DTB decoding. The
+# conditional variants below each retain their closed property contract.
+additionalProperties: true
+
 allOf:
   -
     if:
@@ -120,8 +223,6 @@ allOf:
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
-
-unevaluatedProperties: false
 
 $defs:
   legacy-driver:

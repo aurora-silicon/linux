@@ -48,6 +48,149 @@ select:
                 const: apple,gpu
       required:
         - compatible
+properties:
+  compatible: true
+
+  reg: true
+
+  reg-names: true
+
+  power-domains: true
+
+  dma-noncoherent: true
+
+  mboxes:
+    minItems: 1
+    maxItems: 2
+
+  memory-region: true
+
+  memory-region-names: true
+
+  apple,clpc:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: |
+      Host performance controller receiving GPU submission and idle demand.
+      GFX supplier power cannot represent GPU work on firmware that keeps
+      its coprocessor domain powered while the cores are idle.
+
+  apple,idle-off-delay-ms:
+    minimum: 2
+    maximum: 1000
+    default: 2
+    description:
+      Continuous idle time before GPU power-off, in milliseconds. The G17
+      backend extends the firmware's native delay with its host idle-hold
+      control; an absent property preserves the native policy.
+
+  apple,pmp:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: PMP firmware provider owning the GPU power vote and telemetry
+
+  operating-points-v2: true
+
+  apple,firmware-version:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 3
+    maxItems: 3
+    description:
+      Reported macOS version (major, minor, patch) whose boot firmware loaded
+      the GPU firmware. Filled in by the boot loader. This is a selection
+      hint; the T6040 driver requires the exact loaded image identity.
+
+  apple,cs-opp:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      Operating-point table of the GPU's CS clock domain, one voltage cell per
+      state.
+
+  apple,afr-opp:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      Operating-point table of the GPU's AFR clock domain, one voltage cell
+      per state.
+
+  apple,t6040-handoff-version:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    const: 2
+    description:
+      Written last by the boot loader after it has filled the T6040 operating
+      points, memory regions and per-chip calibration. Absent in the source DT.
+
+  apple,core-mask:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Enabled cores in the two ten-core T6040 clusters, low cluster first
+
+  apple,max-power-mw:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Per-chip maximum GPU power in milliwatts, calculated by the loader
+
+  apple,perf-base-pstate:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Logical base state of the frequency-relative performance table. T6040
+      supports the first active state, also used when its ADT omits the property.
+
+  apple,perf-map-a:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      All 16 A selector register fields, indexing raw ADT operating points.
+      Eleven populated entries, including off, followed by five zeros.
+
+  apple,perf-map-b:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      All 16 B selector register fields, indexing raw ADT operating points.
+      Eleven populated entries, including off, followed by five zeros.
+
+  apple,perf-relative-a:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      Per-chip relative power of each populated A selector, in percent,
+      followed by zeros for the five unused selectors.
+
+  apple,perf-relative-b:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      Relative frequency of the populated A ladder above the base state,
+      in percent, followed by zeros for the five unused selectors.
+
+  apple,core-leak-coef:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      GPU core leakage, one coefficient per cluster. Per-chip efuse values decoded by the boot loader,
+      stored as IEEE-754 binary32 bit patterns in big-endian cells.
+
+  apple,sram-leak-coef:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      GPU SRAM leakage, one coefficient per cluster. Per-chip efuse values decoded by the boot loader,
+      stored as IEEE-754 binary32 bit patterns in big-endian cells.
+
+  apple,cs-leak-coef:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      CS leakage. Per-chip efuse values decoded by the boot loader,
+      stored as IEEE-754 binary32 bit patterns in big-endian cells.
+
+  apple,afr-leak-coef:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      AFR leakage. Per-chip efuse values decoded by the boot loader,
+      stored as IEEE-754 binary32 bit patterns in big-endian cells.
+
+  apple,firmware-abi:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 3
+    description:
+      macOS version the current firmware is paired with, used to pick
+      the version of firmware ABI to be used.
+      Bootloader will overwrite this
+
+# The root declares the union of property types for DTB decoding. The
+# conditional variants below each retain their closed property contract.
+additionalProperties: true
+
 allOf:
   -
     if:
@@ -110,8 +253,6 @@ allOf:
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
-
-unevaluatedProperties: false
 
 $defs:
   legacy-driver:

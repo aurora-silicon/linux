@@ -93,6 +93,114 @@ select:
                 const: apple,pciec
       required:
         - compatible
+properties:
+  compatible: true
+
+  apple,managed-sids:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    items:
+      - const: 1
+      - const: 2
+    description: >
+      J713 radio ordinary stream ownership profile. Only these inactive
+      normal streams and their exact-RID entries may be adopted by the OS.
+      Other streams and RID entries remain inherited. The documented static
+      SID16 bypass role may be initialized only from a disabled stream with
+      no valid root; an existing bypass remains unchanged. PIODMA and other
+      reserved roles are not modified. This does not authorize a controller
+      reset or takeover of active page tables. Both the radio DART and PCI
+      host describe the same two ordinary streams.
+
+  reg: true
+
+  reg-names: true
+
+  ranges: true
+
+  interrupts: true
+
+  msi-parent: true
+
+  msi-ranges:
+    maxItems: 1
+
+  apple,msi-vector-base:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      First vector of this PCIe-C controller's slice of the MSI window it
+      shares with the internal PCIe controller.
+
+  iommu-map: true
+
+  iommu-map-mask: true
+
+  power-domains: true
+
+  resets: true
+
+  dma-coherent: true
+
+  apple,pciec-kernel-init:
+    type: boolean
+    description: |
+      The kernel initializes the tunneled controller when firmware has not
+      already initialized it. The compatible selects the initialization
+      sequence. T600x and T8112 use the Intr2AXI bridge and require tunables
+      for their associated DART before the tunnel children can be populated.
+
+  apple,tunable-rc:
+    $ref: '#/$defs/tunable'
+    description: Root-complex register initialization tuples.
+
+  apple,tunable-fabric:
+    $ref: '#/$defs/tunable'
+    description: Initialization tuples for the fabric register region.
+
+  apple,tunable-debug:
+    $ref: '#/$defs/tunable'
+    description: Initialization tuples for the debug register region.
+
+  apple,tunable-oe-fabric:
+    $ref: '#/$defs/tunable'
+    description: Initialization tuples for the oe-fabric register region.
+
+  apple,piodma:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      T8140 PIODMA bootstrap engine used before native downstream ECAM access.
+
+patternProperties:
+  "^pci@":
+    $ref: /schemas/pci/pci-bus.yaml#
+    type: object
+    description: A single PCI root port
+
+    properties:
+      reg:
+        maxItems: 1
+
+      pwren-gpios:
+        description: Optional GPIO to power on the device
+        maxItems: 1
+
+      interrupt-controller: true
+
+      apple,tunable:
+        $ref: '#/$defs/tunable'
+        description: Initialization tuples relative to this port's registers.
+
+    required:
+      - interrupt-controller
+      - "#interrupt-cells"
+      - interrupt-map-mask
+      - interrupt-map
+
+    unevaluatedProperties: false
+
+# The root declares the union of property types for DTB decoding. The
+# conditional variants below each retain their closed property contract.
+additionalProperties: true
+
 allOf:
   -
     if:
@@ -211,8 +319,6 @@ allOf:
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
-
-unevaluatedProperties: false
 
 $defs:
   tunable:
