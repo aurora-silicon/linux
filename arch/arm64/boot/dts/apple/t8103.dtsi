@@ -2296,3 +2296,5 @@
 };
 
 #include "t8103-peripherals.dtsi"
+
+#include "t8103-firmware-interfaces.dtsi"

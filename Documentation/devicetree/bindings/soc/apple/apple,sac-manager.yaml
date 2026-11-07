@@ -23,6 +23,13 @@ properties:
           - const: apple,t8140-sac-manager
           - const: apple,sac-manager
 
+      - items:
+          - const: apple,t8103-sac-manager
+          - const: apple,sac-manager
+      - items:
+          - const: apple,t6000-sac-manager
+          - const: apple,sac-manager
+
 required:
   - compatible
 

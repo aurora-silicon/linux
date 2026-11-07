@@ -1,0 +1,14 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Firmware-owned interfaces with no AP MMIO aperture in the hardware data. */
+
+/ {
+	processor_trace: processor-trace {
+		compatible = "apple,t8103-processor-trace", "apple,processor-trace";
+		status = "disabled";
+	};
+
+	sac_manager: sac-manager {
+		compatible = "apple,t8103-sac-manager", "apple,sac-manager";
+		status = "disabled";
+	};
+};

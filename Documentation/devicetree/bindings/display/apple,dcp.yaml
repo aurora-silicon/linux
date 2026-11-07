@@ -63,7 +63,7 @@ properties:
       - enum: [disp-2, iop-vbar]
       - enum: [disp-3, iop-vbar]
       - enum: [disp-4, iop-vbar]
-      - const: iop-vbar
+      - enum: [iop-vbar, coproc-aux]
 
   mboxes:
     maxItems: 1

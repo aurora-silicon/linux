@@ -23,6 +23,10 @@ description: |+
 properties:
   compatible:
     oneOf:
+      - items:
+          - const: apple,t6000-display-dart
+          - const: apple,t6000-dart
+          - const: apple,t8110-dart
       - enum:
           - apple,t8103-dart
           - apple,t8103-usb4-dart
@@ -172,6 +176,21 @@ required:
   - interrupts
 
 allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6000-display-dart
+    then:
+      properties:
+        reg:
+          minItems: 2
+      required:
+        - reg-names
+    else:
+      properties:
+        reg:
+          maxItems: 1
   - if:
       properties:
         reg:

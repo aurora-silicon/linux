@@ -23,6 +23,13 @@ properties:
           - const: apple,t8140-processor-trace
           - const: apple,processor-trace
 
+      - items:
+          - const: apple,t8103-processor-trace
+          - const: apple,processor-trace
+      - items:
+          - const: apple,t6000-processor-trace
+          - const: apple,processor-trace
+
 required:
   - compatible
 

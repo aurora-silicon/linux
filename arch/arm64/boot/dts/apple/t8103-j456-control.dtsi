@@ -1,0 +1,19 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Populated board control clients. Transport ownership is not transferred. */
+
+&spi4 {
+	panel_controller: panel-timing-controller@0 {
+		compatible = "parade,dp855";
+		reg = <0>;
+		status = "disabled";
+	};
+};
+
+/ {
+	alc0: microphone-service {
+		compatible = "apple,t8103-alc", "apple,alc";
+		apple,dma-controller = <&aop_admac>;
+		apple,instance-id = <0>;
+		status = "disabled";
+	};
+};
