@@ -1,0 +1,45 @@
+// SPDX-License-Identifier: GPL-2.0 OR MIT
+/dts-v1/;
+
+#include "t6050-max.dtsi"
+
+/ {
+	model = "Apple MacBook Pro (16-inch, M5 Pro)";
+	compatible = "apple,j716s", "apple,t6050", "apple,arm-platform";
+	chassis-type = "laptop";
+
+	aliases {
+		serial0 = &dockchannel;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		stdout-path = "serial0:1500000n8";
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>;
+			status = "disabled";
+		};
+	};
+};
+
+&dockchannel {
+	status = "okay";
+};
+
+&cpufreq_mc0 {
+	status = "disabled";
+};
+
+&cpufreq_mc1 {
+	status = "disabled";
+};
+
+&cpufreq_pc {
+	status = "disabled";
+};
+
+#include "t6050-j716s-peripherals.dtsi"

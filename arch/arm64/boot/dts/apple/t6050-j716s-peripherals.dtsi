@@ -1,0 +1,371 @@
+#include "t6050-peripherals.dtsi"
+
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Register and interrupt resources; ownership-sensitive blocks stay disabled. */
+
+&die0 {
+	hw_i2c5: i2c-controller@505024000 {
+		compatible = "apple,t6050-i2c-controller", "apple,i2c-controller";
+		reg = <0x5 0x5024000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 1380 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	hw_i2c7: i2c-controller@50502c000 {
+		compatible = "apple,t6050-i2c-controller", "apple,i2c-controller";
+		reg = <0x5 0x502c000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 1382 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	hw_i2c3: i2c-controller@50501c000 {
+		compatible = "apple,t6050-i2c-controller", "apple,i2c-controller";
+		reg = <0x5 0x501c000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 1378 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	hw_i2c4: i2c-controller@505020000 {
+		compatible = "apple,t6050-i2c-controller", "apple,i2c-controller";
+		reg = <0x5 0x5020000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 1379 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	hw_spi2: spi-controller@505108000 {
+		compatible = "apple,t6050-spi-controller", "apple,spi-controller";
+		reg = <0x5 0x5108000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 1369 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	hw_spi4: spi-controller@505110000 {
+		compatible = "apple,t6050-spi-controller", "apple,spi-controller";
+		reg = <0x5 0x5110000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 1371 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	hw_nub_spmi_a1: spmi-complex@28a1a8000 {
+		compatible = "apple,t6050-spmi-complex", "apple,spmi-complex";
+		reg = <0x2 0x8a1a8000 0x0 0x4000>,
+		      <0x2 0x8a1a4000 0x0 0x4000>,
+		      <0x2 0x8a1a0000 0x0 0x4000>;
+		status = "disabled";
+	};
+
+	hw_dart_isp0: dart-complex@5828c0000 {
+		compatible = "apple,t6050-dart-complex", "apple,dart-complex";
+		reg = <0x5 0x828c0000 0x0 0xc000>,
+		      <0x5 0x828e0000 0x0 0xc000>,
+		      <0x5 0x82900000 0x0 0xc000>,
+		      <0x5 0x828f4000 0x0 0x4000>,
+		      <0x5 0x82914000 0x0 0x4000>,
+		      <0x5 0x828d0000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupts = <AIC_IRQ 0 531 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	hw_dart_apcie1: dart-complex@411000000 {
+		compatible = "apple,t6050-dart-complex", "apple,dart-complex";
+		reg = <0x4 0x11000000 0x0 0x20000>;
+		#iommu-cells = <1>;
+		interrupts = <AIC_IRQ 0 1532 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	hw_apcie1_piodma: pcie-piodma@411030000 {
+		compatible = "apple,t6050-pcie-piodma", "apple,pcie-piodma";
+		reg = <0x4 0x11030000 0x0 0x4000>,
+		      <0x4 0x11034000 0x0 0x4000>,
+		      <0x4 0x11038000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 1533 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&hw_dart_apcie1 17>;
+		status = "disabled";
+	};
+
+	hw_dockchannel_mtp: dockchannel-complex@294b00000 {
+		compatible = "apple,t6050-dockchannel-complex", "apple,dockchannel-complex";
+		reg = <0x2 0x94b00000 0x0 0x1000>,
+		      <0x2 0x94b14000 0x0 0x1000>,
+		      <0x2 0x94b30000 0x0 0x1000>,
+		      <0x2 0x94b34000 0x0 0x1000>,
+		      <0x2 0x94b28000 0x0 0x1000>,
+		      <0x2 0x94b2c000 0x0 0x1000>;
+		interrupts = <AIC_IRQ 0 660 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	hw_secure_repair: secure-repair@2881e4000 {
+		compatible = "apple,t6050-secure-repair", "apple,secure-repair";
+		reg = <0x2 0x881e4000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 706 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 708 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 710 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 712 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 714 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 716 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 718 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	hw_acio0: usb4-router@2a1f00000 {
+		compatible = "apple,t6050-usb4-router", "apple,usb4-router";
+		reg = <0x2 0xa1f00000 0x0 0x100000>,
+		      <0x2 0xa1ac0000 0x0 0x4000>,
+		      <0x2 0xa1ac4000 0x0 0x4000>,
+		      <0x2 0xa1ac8000 0x0 0x4000>,
+		      <0x2 0xa1e44000 0x0 0x4000>,
+		      <0x2 0xa1c80000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 1591 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1592 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1593 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1594 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1595 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1596 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1597 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1598 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1599 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1600 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1601 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1602 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1579 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1580 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1581 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1582 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1583 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1584 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1585 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1586 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1587 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1588 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1589 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1590 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1608 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&hw_dart_acio0 0>, <&hw_dart_acio0 1>, <&hw_dart_acio0 2>, <&hw_dart_acio0 3>, <&hw_dart_acio0 4>, <&hw_dart_acio0 5>, <&hw_dart_acio0 6>, <&hw_dart_acio0 7>, <&hw_dart_acio0 8>, <&hw_dart_acio0 9>, <&hw_dart_acio0 10>, <&hw_dart_acio0 11>, <&hw_dart_acio0 16>, <&hw_dart_acio0 17>, <&hw_dart_acio0 18>, <&hw_dart_acio0 19>, <&hw_dart_acio0 20>, <&hw_dart_acio0 21>, <&hw_dart_acio0 22>, <&hw_dart_acio0 23>, <&hw_dart_acio0 24>, <&hw_dart_acio0 25>, <&hw_dart_acio0 26>, <&hw_dart_acio0 27>;
+		status = "disabled";
+	};
+
+	hw_acio1: usb4-router@2a9f00000 {
+		compatible = "apple,t6050-usb4-router", "apple,usb4-router";
+		reg = <0x2 0xa9f00000 0x0 0x100000>,
+		      <0x2 0xa9ac0000 0x0 0x4000>,
+		      <0x2 0xa9ac4000 0x0 0x4000>,
+		      <0x2 0xa9ac8000 0x0 0x4000>,
+		      <0x2 0xa9e44000 0x0 0x4000>,
+		      <0x2 0xa9c80000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 1623 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1624 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1625 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1626 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1627 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1628 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1629 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1630 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1631 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1632 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1633 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1634 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1611 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1612 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1613 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1614 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1615 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1616 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1617 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1618 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1619 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1620 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1621 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1622 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1640 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&hw_dart_acio1 0>, <&hw_dart_acio1 1>, <&hw_dart_acio1 2>, <&hw_dart_acio1 3>, <&hw_dart_acio1 4>, <&hw_dart_acio1 5>, <&hw_dart_acio1 6>, <&hw_dart_acio1 7>, <&hw_dart_acio1 8>, <&hw_dart_acio1 9>, <&hw_dart_acio1 10>, <&hw_dart_acio1 11>, <&hw_dart_acio1 16>, <&hw_dart_acio1 17>, <&hw_dart_acio1 18>, <&hw_dart_acio1 19>, <&hw_dart_acio1 20>, <&hw_dart_acio1 21>, <&hw_dart_acio1 22>, <&hw_dart_acio1 23>, <&hw_dart_acio1 24>, <&hw_dart_acio1 25>, <&hw_dart_acio1 26>, <&hw_dart_acio1 27>;
+		status = "disabled";
+	};
+
+	hw_acio2: usb4-router@381f00000 {
+		compatible = "apple,t6050-usb4-router", "apple,usb4-router";
+		reg = <0x3 0x81f00000 0x0 0x100000>,
+		      <0x3 0x81ac0000 0x0 0x4000>,
+		      <0x3 0x81ac4000 0x0 0x4000>,
+		      <0x3 0x81ac8000 0x0 0x4000>,
+		      <0x3 0x81e44000 0x0 0x4000>,
+		      <0x3 0x81c80000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 1655 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1656 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1657 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1658 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1659 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1660 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1661 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1662 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1663 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1664 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1665 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1666 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1643 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1644 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1645 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1646 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1647 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1648 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1649 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1650 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1651 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1652 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1653 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1654 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1672 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&hw_dart_acio2 0>, <&hw_dart_acio2 1>, <&hw_dart_acio2 2>, <&hw_dart_acio2 3>, <&hw_dart_acio2 4>, <&hw_dart_acio2 5>, <&hw_dart_acio2 6>, <&hw_dart_acio2 7>, <&hw_dart_acio2 8>, <&hw_dart_acio2 9>, <&hw_dart_acio2 10>, <&hw_dart_acio2 11>, <&hw_dart_acio2 16>, <&hw_dart_acio2 17>, <&hw_dart_acio2 18>, <&hw_dart_acio2 19>, <&hw_dart_acio2 20>, <&hw_dart_acio2 21>, <&hw_dart_acio2 22>, <&hw_dart_acio2 23>, <&hw_dart_acio2 24>, <&hw_dart_acio2 25>, <&hw_dart_acio2 26>, <&hw_dart_acio2 27>;
+		status = "disabled";
+	};
+
+	hw_atc3_dpxbar: atc-dpxbar@38b24c000 {
+		compatible = "apple,t6050-atc-dpxbar", "apple,atc-dpxbar";
+		reg = <0x3 0x8b24c000 0x0 0x4000>;
+		status = "disabled";
+	};
+
+	hw_disp0: display-engine@488000000 {
+		compatible = "apple,t6050-display-engine", "apple,display-engine";
+		reg = <0x4 0x88000000 0x0 0x4000000>,
+		      <0x4 0x8a240000 0x0 0x10000>,
+		      <0x4 0x8a3ac000 0x0 0x4000>,
+		      <0x4 0x8a800000 0x0 0x800000>,
+		      <0x2 0x86700000 0x0 0x114000>;
+		interrupts = <AIC_IRQ 0 981 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 980 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 981 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 982 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 983 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 984 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 985 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 986 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 987 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 988 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 989 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 990 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1000 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&hw_dart_disp0 0>, <&hw_dart_disp0 16>;
+		status = "disabled";
+	};
+
+	hw_dart_disp0: dart-complex@48a300000 {
+		compatible = "apple,t6050-dart-complex", "apple,dart-complex";
+		reg = <0x4 0x8a300000 0x0 0xc000>,
+		      <0x4 0x8a314000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupts = <AIC_IRQ 0 990 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	hw_dcp0_expert: display-expert@48a3ac058 {
+		compatible = "apple,t6050-display-expert", "apple,display-expert";
+		reg = <0x4 0x8a3ac058 0x0 0x4>,
+		      <0x4 0x8a374000 0x0 0x40>,
+		      <0x4 0x8a370000 0x0 0x40>,
+		      <0x4 0x8a388000 0x0 0x40>,
+		      <0x4 0x8a38c000 0x0 0x40>,
+		      <0x4 0x8a394000 0x0 0x40>,
+		      <0x4 0x8a398000 0x0 0x40>,
+		      <0x4 0x8a39c000 0x0 0x40>,
+		      <0x4 0x8a3a0000 0x0 0x40>,
+		      <0x4 0x88208000 0x0 0x40>,
+		      <0x4 0x8820c000 0x0 0x40>,
+		      <0x4 0x88210000 0x0 0x40>,
+		      <0x4 0x88214000 0x0 0x40>;
+		interrupts = <AIC_IRQ 0 985 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	hw_dcp: display-coproc@48ae00000 {
+		compatible = "apple,t6050-display-coproc", "apple,display-coproc";
+		reg = <0x4 0x8ae00000 0x0 0x88000>,
+		      <0x4 0x8a850000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 1044 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1043 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1046 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1045 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1048 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1047 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1050 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1049 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&hw_dart_dcp 23>, <&hw_dart_dcp 24>;
+		status = "disabled";
+	};
+
+	hw_dart_dcp: dart-complex@48a340000 {
+		compatible = "apple,t6050-dart-complex", "apple,dart-complex";
+		reg = <0x4 0x8a340000 0x0 0x20000>;
+		#iommu-cells = <1>;
+		interrupts = <AIC_IRQ 0 990 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	hw_dart_disp0_isoc: dart-complex@48a180000 {
+		compatible = "apple,t6050-dart-complex", "apple,dart-complex";
+		reg = <0x4 0x8a180000 0x0 0x20000>;
+		#iommu-cells = <1>;
+		interrupts = <AIC_IRQ 0 1013 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	hw_admac_disp0: admac-complex@48a140000 {
+		compatible = "apple,t6050-admac-complex", "apple,admac-complex";
+		reg = <0x4 0x8a140000 0x0 0x24000>,
+		      <0x2 0x88328000 0x0 0x8>;
+		interrupts = <AIC_IRQ 0 1012 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&hw_dart_disp0_isoc 30>;
+		status = "disabled";
+	};
+
+	hw_admac_disp0_ced_ssw: admac-control@48a2f4000 {
+		compatible = "apple,t6050-admac-control", "apple,admac-control";
+		reg = <0x4 0x8a2f4000 0x0 0x4000>,
+		      <0x4 0x8a1a0000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 1014 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	hw_avd0: video-decoder-complex@2308000000 {
+		compatible = "apple,t6050-video-decoder-complex", "apple,video-decoder-complex";
+		reg = <0x23 0x8000000 0x0 0x1404000>,
+		      <0x23 0x88090000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 2417 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 2418 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&hw_dart_avd0 0>, <&hw_dart_avd0 1>, <&hw_dart_avd0 2>;
+		status = "disabled";
+	};
+
+	hw_dart_avd0: dart-complex@2309020000 {
+		compatible = "apple,t6050-dart-complex", "apple,dart-complex";
+		reg = <0x23 0x9020000 0x0 0x20000>,
+		      <0x2 0x74000000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupts = <AIC_IRQ 0 2424 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	hw_admac_leap_s: admac-complex@293200000 {
+		compatible = "apple,t6050-admac-complex", "apple,admac-complex";
+		reg = <0x2 0x93200000 0x0 0x34000>,
+		      <0x2 0x88328000 0x0 0x8>;
+		interrupts = <AIC_IRQ 0 638 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	hw_admac_hp_mic_ec_proxy: audio-dma-proxy@4d3200000 {
+		compatible = "apple,t6050-audio-dma-proxy", "apple,audio-dma-proxy";
+		reg = <0x4 0xd3200000 0x0 0x34000>;
+		status = "disabled";
+	};
+
+	hw_admac_sllb_ec_proxy: audio-dma-proxy@4d3200000 {
+		compatible = "apple,t6050-audio-dma-proxy", "apple,audio-dma-proxy";
+		reg = <0x4 0xd3200000 0x0 0x34000>;
+		status = "disabled";
+	};
+
+
+};
