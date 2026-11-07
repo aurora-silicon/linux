@@ -13,6 +13,7 @@
 #include <linux/mfd/macsmc.h>
 #include <linux/module.h>
 #include <linux/reboot.h>
+#include <linux/suspend.h>
 
 /**
  * struct macsmc_input
@@ -214,6 +215,16 @@ static void macsmc_input_pm_complete(struct device *dev)
 	struct macsmc_input *smcin = dev_get_drvdata(dev);
 
 	smcin->wakeup_mode = false;
+
+	/* The lid may have moved while the AP was off and no event could arrive. */
+	if (pm_resume_via_firmware() && apple_smc_key_exists(smcin->smc, SMC_KEY(MSLD))) {
+		u8 val;
+
+		if (apple_smc_read_u8(smcin->smc, SMC_KEY(MSLD), &val) >= 0) {
+			input_report_switch(smcin->input, SW_LID, val);
+			input_sync(smcin->input);
+		}
+	}
 }
 
 static const struct dev_pm_ops macsmc_input_pm_ops = {

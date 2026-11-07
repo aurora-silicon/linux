@@ -112,6 +112,13 @@ struct apple_smc {
 
 	struct apple_rtkit *rtk;
 
+	/* Between the AP power notices of a firmware-driven suspend. */
+	bool ap_notified;
+	/* Told of a coming sleep, and not yet of its end. */
+	bool sleep_warned;
+	/* In a noirq phase: replies are polled for. */
+	bool polled;
+
 	struct completion init_done;
 	enum apple_smc_boot_stage boot_stage;
 
