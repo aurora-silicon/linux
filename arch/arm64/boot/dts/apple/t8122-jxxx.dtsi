@@ -51,7 +51,7 @@
 		#size-cells = <2>;
 		ranges;
 
-		/* Filled from the live ADT by opt-in m1n1 diagnostics. */
+		/* GPU memory, filled and enabled by the boot loader. */
 		uat_handoff: uat-handoff {
 			reg = <0 0 0 0>;
 			status = "disabled";
@@ -71,7 +71,6 @@
 			reg = <0 0 0 0>;
 			status = "disabled";
 		};
-		/* To be filled by loader */
 	};
 
 	memory@800000000 {
@@ -252,16 +251,6 @@
 
 &nco_clkref {
 	clock-frequency = <900000000>;
-};
-
-&smc_hwmon {
-	/*
-	 * No Tf keys on M3: the six hottest GPU keys (about 0 C while the GPU
-	 * is off), then the CPU die keys. Absent keys are skipped.
-	 */
-	apple,soc-die-keys = "Tg0D", "Tg0P", "Tg0X", "Tg0b", "Tg0j", "Tg0v",
-			     "Te05", "Te0P", "Tp05", "Tp0L", "Tp0b", "Tp0r";
-	apple,thermal-pressure-key = "mTPL";
 };
 
 #include "hwmon-common.dtsi"
