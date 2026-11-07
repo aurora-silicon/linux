@@ -50,6 +50,7 @@
 #include <linux/soc/apple/tunable.h>
 #include <linux/suspend.h>
 #include <clocksource/arm_arch_timer.h>
+#include <dt-bindings/gpio/gpio.h>
 #include <asm/arch_timer.h>
 #include <asm/barrier.h>
 #include <asm/cpu_ops.h>
@@ -235,6 +236,7 @@ struct t8140_s2r_mailbox {
 #define ASC_CPU_CONTROL_RUN	BIT(4)
 #define ASC_CPU_STATUS		0x48
 
+#define PS_GPIO			0x120
 #define PS_ANS			0x278
 #define PS_APCIE_GP		0x258
 #define PS_APCIE_SYS_GP		0x2a0
@@ -437,7 +439,7 @@ struct t8140_sleep {
 	void __iomem *apcie_phy;
 	void __iomem *apcie_rc;
 	bool apcie_port_stopped;
-	/* A real sleep left the radio's port down, and nothing sets it up again */
+	/* A real sleep left the radio's port down, until its host sets it up again */
 	bool apcie_port_down;
 	void __iomem *apcie_port;
 	void __iomem *apcie_port_phy;
@@ -473,6 +475,9 @@ struct t8140_sleep {
 	unsigned int pin_irq_groups;
 	bool pins_saved_valid;
 	bool pins_lost;
+	/* The radio port's PERST# among them, or -1 */
+	int radio_perst;
+	bool radio_perst_low;
 	bool returned;
 };
 
@@ -543,7 +548,16 @@ bool apple_sleep_debug_link_cut_peek(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_debug_link_cut_peek);
 
+/* The radio's host set its port up again after a real sleep: the next commit may stop it. */
+void apple_sleep_radio_port_up(void)
+{
+	if (t8140_sleep)
+		WRITE_ONCE(t8140_sleep->apcie_port_down, false);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_radio_port_up);
+
 #define PIN_REG(n)		(4 * (n))
+#define PIN_DATA		BIT(0)
 #define PIN_LOCK		BIT(21)
 #define PIN_CTL			0xc48
 #define PIN_IRQ(g, w)		(0x800 + 0x40 * (g) + 4 * (w))
@@ -1658,6 +1672,13 @@ static void t8140_apcie_port_stop(struct t8140_sleep *s)
 		readl_poll_timeout_atomic(port + APCIE_PORT_L2, val, !(val & APCIE_PORT_L2_BUSY),
 					  10, APCIE_PORT_STOP_US);
 	}
+	/* The radio keeps its power and firmware, in reset until its host releases it. */
+	if (s->radio_perst >= 0 && t8140_ps_on(s, PS_GPIO)) {
+		void __iomem *reg = s->pins + PIN_REG(s->radio_perst);
+
+		val = readl(reg);
+		writel(s->radio_perst_low ? val & ~PIN_DATA : val | PIN_DATA, reg);
+	}
 	writel(readl(phy) & ~APCIE_PORT_PHY_LINK, phy);
 
 	if (s->apcie_engine && s->apcie_fabric) {
@@ -1686,7 +1707,7 @@ static void t8140_apcie_port_stop(struct t8140_sleep *s)
 
 static void t8140_apcie_port_stop_once(struct t8140_sleep *s)
 {
-	/* Only as the loader set it up: after a wake its registers abort. */
+	/* Only with the port set up, by the loader or by its host after a wake, or it aborts. */
 	if (s->apcie_port_stopped || s->apcie_port_down || !s->apcie_port || !s->apcie_port_phy ||
 	    !t8140_ps_on(s, PS_APCIE_GP) || !t8140_ps_on(s, PS_APCIE_PHY_SW))
 		return;
@@ -2871,6 +2892,31 @@ static void t8140_sleep_map_apcie(struct t8140_sleep *s)
 	of_node_put(np);
 }
 
+/* The radio port's PERST# on the AP pins @np, from the enabled T8140 PCIe host's ports. */
+static void t8140_sleep_find_radio_perst(struct t8140_sleep *s, struct device_node *np)
+{
+	struct device_node *host, *port;
+	struct of_phandle_args args;
+
+	host = of_find_compatible_node(NULL, NULL, "apple,t8140-pcie");
+	if (!host)
+		return;
+	if (of_device_is_available(host)) {
+		for_each_available_child_of_node(host, port) {
+			if (of_parse_phandle_with_args(port, "reset-gpios", "#gpio-cells", 0,
+						       &args))
+				continue;
+			if (args.np == np && args.args_count >= 2 && args.args[0] < s->npins &&
+			    !test_bit(args.args[0], s->pins_skip)) {
+				s->radio_perst = args.args[0];
+				s->radio_perst_low = args.args[1] & GPIO_ACTIVE_LOW;
+			}
+			of_node_put(args.np);
+		}
+	}
+	of_node_put(host);
+}
+
 /* macOS leaves the skipped pins alone, and reading one may fault. */
 static void t8140_sleep_map_pins(struct t8140_sleep *s)
 {
@@ -2878,6 +2924,7 @@ static void t8140_sleep_map_pins(struct t8140_sleep *s)
 	u32 npins, pin;
 	int i, n;
 
+	s->radio_perst = -1;
 	if (!np)
 		return;
 	if (!of_device_is_available(np) || of_property_read_u32(np, "apple,npins", &npins) ||
@@ -2895,6 +2942,8 @@ static void t8140_sleep_map_pins(struct t8140_sleep *s)
 	s->pin_irq_groups = of_irq_count(np);
 	s->npins = npins;
 	s->pins = of_iomap(np, 0);
+	if (s->pins)
+		t8140_sleep_find_radio_perst(s, np);
 out:
 	of_node_put(np);
 }

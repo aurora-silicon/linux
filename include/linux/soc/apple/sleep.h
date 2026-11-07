@@ -83,6 +83,9 @@ bool apple_sleep_debug_link_cut_peek(struct device *dev);
  */
 bool apple_sleep_debug_link_cut(void);
 
+/* The radio's host has its port back after a real sleep, so the next commit may stop it. */
+void apple_sleep_radio_port_up(void);
+
 /* After a deep sleep, put back the pins it reset. ANS's driver calls it before the run bit. */
 void apple_sleep_restore_pins(void);
 
@@ -160,6 +163,10 @@ static inline bool apple_sleep_debug_link_cut_peek(struct device *dev)
 static inline bool apple_sleep_debug_link_cut(void)
 {
 	return false;
+}
+
+static inline void apple_sleep_radio_port_up(void)
+{
 }
 
 static inline void apple_sleep_restore_pins(void)
