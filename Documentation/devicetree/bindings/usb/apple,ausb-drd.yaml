@@ -29,11 +29,9 @@ properties:
     maxItems: 4
 
   power-domains:
-    minItems: 1
     maxItems: 1
 
   phys:
-    minItems: 1
     maxItems: 1
 
   iommus:

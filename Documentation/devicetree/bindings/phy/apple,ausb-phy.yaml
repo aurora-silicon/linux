@@ -21,15 +21,12 @@ properties:
       - const: apple,ausb-phy
 
   reg:
-    minItems: 1
     maxItems: 1
 
   power-domains:
-    minItems: 1
     maxItems: 1
 
   phys:
-    minItems: 1
     maxItems: 1
 
   '#phy-cells':

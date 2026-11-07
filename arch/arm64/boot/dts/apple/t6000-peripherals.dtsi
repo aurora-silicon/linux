@@ -236,12 +236,6 @@
 };
 
 &{/soc} {
-	peripheral_clocks: clock-controller {
-		compatible = "apple,t6000-pmgr-clocks", "apple,pmgr-clocks";
-		#clock-cells = <1>;
-		apple,pmgr = <&pmgr>;
-		status = "disabled";
-	};
 
 	mcc: memory-controller@200000000 {
 		compatible = "apple,t6000-mcc", "apple,mcc";
@@ -469,4 +463,13 @@
 	      <0x4 0x0c000000 0x0 0x1000000>;
 	reg-names = "codec", "mailbox", "coproc", "pmgr", "pio";
 	clocks = <&peripheral_clocks 350>;
+};
+
+/ {
+	peripheral_clocks: clock-controller {
+		compatible = "apple,t6000-pmgr-clocks", "apple,pmgr-clocks";
+		#clock-cells = <1>;
+		apple,pmgr = <&pmgr>;
+		status = "disabled";
+	};
 };

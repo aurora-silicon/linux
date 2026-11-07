@@ -215,13 +215,21 @@ allOf:
           contains:
             const: apple,t6002-error-handler
     then:
-      properties:
-        interrupts:
-          minItems: 268
-          maxItems: 268
-        reg:
-          minItems: 205
-          maxItems: 205
+      oneOf:
+        - properties:
+            interrupts:
+              minItems: 138
+              maxItems: 138
+            reg:
+              minItems: 104
+              maxItems: 104
+        - properties:
+            interrupts:
+              minItems: 130
+              maxItems: 130
+            reg:
+              minItems: 101
+              maxItems: 101
       required:
         - reg
 
@@ -231,15 +239,24 @@ allOf:
           contains:
             const: apple,t6002-event-log
     then:
-      properties:
-        interrupts:
-          minItems: 54
-          maxItems: 54
-        reg:
-          minItems: 54
-          maxItems: 54
+      oneOf:
+        - properties:
+            interrupts:
+              minItems: 28
+              maxItems: 28
+            reg:
+              minItems: 28
+              maxItems: 28
+        - properties:
+            interrupts:
+              minItems: 26
+              maxItems: 26
+            reg:
+              minItems: 26
+              maxItems: 26
       required:
         - reg
+
 
 additionalProperties: false
 
