@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * Apple Mac mini, J873g.
+ * Apple Mac mini (M6), J873g.
  *
  * Initial RAM boot resources measured on J873g/T8152.
  * The loader supplies usable memory, CPU release addresses and framebuffer
@@ -13,7 +13,7 @@
 
 / {
 	compatible = "apple,j873g", "apple,t8152", "apple,arm-platform";
-	model = "Apple Mac mini (J873g)";
+	model = "Apple Mac mini (M6)";
 	chassis-type = "desktop";
 
 	#address-cells = <2>;
@@ -423,15 +423,10 @@
 	      <0x3 0xa0000000 0x0 0x8000>;
 };
 
-/* Peripheral instances not exposed by this chassis. */
-/delete-node/ &pciec2_dart;
-
-/delete-node/ &acio2_dart;
+/* Unexposed chassis port instances remain described and disabled. */
 
 /* Retain the register view published by this board's live hardware capture. */
 &dwc3_2_dart {
 	reg = <0x3 0x83020000 0x0 0xc000>,
 	      <0x3 0x83040000 0x0 0xc000>;
 };
-
-/delete-node/ &apciec2_piodma;

@@ -9,11 +9,4 @@
 	chassis-type = "laptop";
 };
 
-/* Peripheral instances not exposed by this chassis. */
-/delete-node/ &pciec2_dart;
-
-/delete-node/ &acio2_dart;
-
-/delete-node/ &dwc3_2_dart;
-
-/delete-node/ &apciec2_piodma;
+/* Unexposed chassis port instances remain described and disabled. */
