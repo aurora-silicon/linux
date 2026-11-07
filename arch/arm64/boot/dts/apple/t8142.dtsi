@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
  * Common hardware inventory for boards without a qualified boot profile.
  * Firmware fills RAM and CPU release addresses. Keep new devices disabled;
@@ -182,3 +182,84 @@
 		status = "disabled";
 	};
 };
+
+/* Providers also supplied by the existing standalone boot profile. */
+&{/soc} {
+	pcie0_dart: iommu@488000000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <0x4 0x88000000 0x0 0x20000>;
+		interrupts = <AIC_IRQ 1463 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	aop_dart: iommu@390fc0000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <0x3 0x90fc0000 0x0 0xc000>;
+		interrupts = <AIC_IRQ 528 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	pmp_dart: iommu@380300000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <0x3 0x80300000 0x0 0xc000>;
+		interrupts = <AIC_IRQ 1004 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	mtp_dart: iommu@394800000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <0x3 0x94800000 0x0 0xc000>,
+		      <0x3 0x94810000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 1275 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	dwc3_0_dart: iommu@402f00000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <0x4 0x2f00000 0x0 0xc000>,
+		      <0x4 0x2f80000 0x0 0xc000>;
+		interrupts = <AIC_IRQ 1515 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	dwc3_1_dart: iommu@40af00000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <0x4 0xaf00000 0x0 0xc000>,
+		      <0x4 0xaf80000 0x0 0xc000>;
+		interrupts = <AIC_IRQ 1578 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	dcp_dart: iommu@286340000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <0x2 0x86340000 0x0 0x20000>;
+		interrupts = <AIC_IRQ 800 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	disp0_dart: iommu@286300000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <0x2 0x86300000 0x0 0xc000>,
+		      <0x2 0x86314000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 800 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	avd_dart: iommu@501020000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <0x5 0x1020000 0x0 0x20000>;
+		interrupts = <AIC_IRQ 1084 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+};
+
+#include "t8142-peripherals.dtsi"
