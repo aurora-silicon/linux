@@ -66,3 +66,5 @@
 &mtp_mt {
 	firmware-name = "apple/tpmtfw-j416c.bin";
 };
+
+#include "t6021-peripherals.dtsi"

@@ -12,43 +12,92 @@ maintainers:
 description: |
   Remote service manager register banks, interrupt and DART stream.
 
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6030-rsm
+          - apple,t6031-rsm
+          - apple,t6032-rsm
+          - apple,t8122-rsm
+          - apple,t8140-rsm
+          - apple,t8142-rsm
+          - apple,t8152-rsm
+  required:
+    - compatible
+
 properties:
-  compatible:
-    oneOf:
-      - items:
-          - const: apple,t8142-rsm
-          - const: apple,rsm
-      - items:
-          - const: apple,t8152-rsm
-          - const: apple,rsm
-      - items:
-          - const: apple,t8140-rsm
-          - const: apple,rsm
-      - items:
-          - enum:
-              - apple,t8122-rsm
-              - apple,t6030-rsm
-              - apple,t6031-rsm
-          - const: apple,rsm
+  compatible: true
 
-  reg:
-    minItems: 2
-    maxItems: 2
-    description: Register apertures in hardware-description order.
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t6032-rsm
+      required:
+        - compatible
+    then:
+      properties:
+        compatible:
+          items:
+            - const: apple,t6032-rsm
+            - const: apple,rsm
 
-  interrupts:
-    maxItems: 1
+        reg:
+          minItems: 2
+          maxItems: 2
 
-  iommus:
-    maxItems: 1
+        interrupts:
+          maxItems: 1
 
-  power-domains:
-    maxItems: 1
+        power-domains:
+          maxItems: 1
 
-required:
-  - compatible
-  - reg
-  - interrupts
-  - iommus
+        iommus:
+          maxItems: 1
 
-additionalProperties: false
+      required:
+        - compatible
+        - reg
+        - interrupts
+        - power-domains
+        - iommus
+    else:
+      properties:
+        compatible:
+          items:
+            - enum:
+                - apple,t6030-rsm
+                - apple,t6031-rsm
+                - apple,t8122-rsm
+                - apple,t8140-rsm
+                - apple,t8142-rsm
+                - apple,t8152-rsm
+            - const: apple,rsm
+
+        reg:
+          minItems: 2
+          maxItems: 2
+          description: Register apertures in hardware-description order.
+
+        interrupts:
+          maxItems: 1
+
+        iommus:
+          maxItems: 1
+
+        power-domains:
+          maxItems: 1
+
+      required:
+        - compatible
+        - reg
+        - interrupts
+        - iommus
+
+      additionalProperties: false
+
+unevaluatedProperties: false

@@ -1,0 +1,85 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Unclaimed T8132 peripheral buses. */
+
+&soc {
+	spi4: spi@3ad110000 {
+		compatible = "apple,t8132-spi", "apple,t8103-spi";
+		reg = <0x3 0xad110000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1058 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&peripheral_clocks 422>;
+		power-domains = <&ps_spi4>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	nub_spmi_a1: spmi@388a08000 {
+		compatible = "apple,t8132-spmi", "apple,t8103-spmi";
+		reg = <0x3 0x88a08000 0 0x4000>,
+		      <0x3 0x88a04000 0 0x4000>,
+		      <0x3 0x88a00000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 522 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	aop_spmi0: spmi@390914000 {
+		compatible = "apple,t8132-spmi", "apple,t8103-spmi";
+		reg = <0x3 0x90914000 0 0x4000>,
+		      <0x3 0x90904000 0 0x4000>,
+		      <0x3 0x90900000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 461 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	nub_spmi1: spmi@388614000 {
+		compatible = "apple,t8132-spmi", "apple,t8103-spmi";
+		reg = <0x3 0x88614000 0 0x4000>,
+		      <0x3 0x88604000 0 0x4000>,
+		      <0x3 0x88600000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 518 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	aop_spmi1: spmi@390b14000 {
+		compatible = "apple,t8132-spmi", "apple,t8103-spmi";
+		reg = <0x3 0x90b14000 0 0x4000>,
+		      <0x3 0x90b04000 0 0x4000>,
+		      <0x3 0x90b00000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 465 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	spi3: spi@3ad10c000 {
+		compatible = "apple,t8132-spi", "apple,t8103-spi";
+		reg = <0x3 0xad10c000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1057 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&peripheral_clocks 421>;
+		power-domains = <&ps_spi3>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+};
