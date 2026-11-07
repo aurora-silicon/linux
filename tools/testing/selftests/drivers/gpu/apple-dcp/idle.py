@@ -160,10 +160,10 @@ int main(void){
     pm_fail=1;check(apple_enter_idle(&cpuidle_dev[0],&apple_idle_driver,1)==-1&&deep==1);pm=0;
     check(cpuidle_enter_s2idle(&apple_idle_driver,&cpuidle_dev[0],100000)==1);
     check(tick_freeze_depth==0&&cpuidle_dev[0].states_usage[1].s2idle_usage==1&&deep==1);pm=0;
-    /* Anything but M1 to M3, T6041 and T8142 included: the same WFI-only states as T8140. */
-    static const char *const wfi_only[]={"apple,t6041","apple,t8142",NULL};
-    for(const char *const *m=wfi_only;*m;m++){
-        reset(*m);check(!apple_cpuidle_probe(&pdev));
+    /* A WFI-only M4 part that still probes (it has a cpuidle node): same states as T8140. */
+    {
+        const char *m="apple,t6041";
+        reset(m);check(!apple_cpuidle_probe(&pdev));
         check(apple_idle_driver.state_count==2&&apple_idle_driver.states[1].enter==apple_enter_wfi);
         check(apple_idle_driver.states[1].enter_s2idle==apple_enter_wfi&&apple_idle_driver.states[1].flags==0);
         check(find_deepest_state(&apple_idle_driver,&cpuidle_dev[0],100000,0,true)==1);

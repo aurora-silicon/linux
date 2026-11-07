@@ -181,21 +181,14 @@ static int __init apple_cpuidle_init(void)
 	if (!of_machine_is_compatible("apple,arm-platform"))
 		return 0;
 
-	if (!(of_machine_is_compatible("apple,t8103") ||
-	      of_machine_is_compatible("apple,t8112") ||
-	      of_machine_is_compatible("apple,t8122") ||
-	      of_machine_is_compatible("apple,t6000") ||
-	      of_machine_is_compatible("apple,t6001") ||
-	      of_machine_is_compatible("apple,t6002") ||
-	      of_machine_is_compatible("apple,t6020") ||
-	      of_machine_is_compatible("apple,t6021") ||
-	      of_machine_is_compatible("apple,t6022") ||
-	      of_machine_is_compatible("apple,t6030") ||
-	      of_machine_is_compatible("apple,t6031") ||
-	      of_machine_is_compatible("apple,t6032") ||
-	      of_machine_is_compatible("apple,t6034") ||
-	      of_machine_is_compatible("apple,t6050") ||
-	      of_machine_is_compatible("apple,t8140")))
+	/*
+	 * The M1 to M3 machines (CPU PD) plus the M4-and-later ones that load
+	 * the driver for its WFI state. The device-tree parts above are matched
+	 * by their cpuidle node instead.
+	 */
+	if (!of_machine_compatible_match(apple_cyc_ovrd_machines) &&
+	    !of_machine_is_compatible("apple,t6050") &&
+	    !of_machine_is_compatible("apple,t8140"))
 		return 0;
 
 	pdev = platform_device_register_simple("cpuidle-apple", -1, NULL, 0);
