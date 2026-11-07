@@ -96,9 +96,17 @@ periods (16 ms or 32 ms), with the existing measured delivery slack for batched
 packets. Suspend, recovery, GPU power epochs and ring quarantine invalidate the
 snapshot; old samples cannot become a new epoch's baseline.
 
+The firmware power-gates the GPU cores a few milliseconds after the last work
+completes and emits no utilisation record while they are gated. A power gate
+therefore ends the averaging epoch but is not a loss of knowledge: the last
+sample stays valid until it ages out, after which the gated GPU reads as a valid
+zero for every utilisation value until it powers up again. Waking starts a new
+epoch, stale until its first record arrives.
+
 These samples have neither a qualified duration nor a client identity. They do
 not change ``busy_ns`` or fdinfo's per-client ``drm-engine-*`` counters. A quiet
-ring becomes stale rather than fabricating a zero-utilisation sample. Readers
+ring on powered cores becomes stale rather than fabricating a zero-utilisation
+sample; only gated cores read as zero. Readers
 must not convert these percentages into engine nanoseconds or cycles.
 
 Deferred shared power telemetry
