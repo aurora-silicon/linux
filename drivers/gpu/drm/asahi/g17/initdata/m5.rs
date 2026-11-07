@@ -38,7 +38,16 @@ impl InitData {
             ring(0), ring(1), ring(2), ring(3), page(canonical.start)]
     }
 
-    /// Diagnostic-only read of an aligned word within the existing policy allocation.
+    /// Selects the power-policy layout of the M5 firmware build `build_m5` encodes for.
+    pub(in crate::g17) fn set_m5_policy_layouts(
+        &mut self,
+        layouts: crate::g17::fw::variant::M5Layouts,
+    ) {
+        self.m5_policy = m::m5_policy(layouts);
+    }
+
+    /// Diagnostic-only read of an aligned word within the existing policy allocation, at the
+    /// firmware build's own offset.
     /// Callers hold the device state mutex, retaining this mapping for the entire sample.
     pub(crate) fn m5_policy_telemetry_word(&self, offset: usize) -> Result<u32> {
         let layout = self.m5_layout;
@@ -199,13 +208,28 @@ impl InitData {
                 calibration.as_ref().is_ok_and(|words| words.as_slice() == expected)
             }
         };
-        if let Some(defaults) = board.controller_defaults.filter(|_| calibrated) {
+        let controller_defaults = board.controller_defaults.filter(|_| calibrated);
+        if let Some(defaults) = controller_defaults {
             defaults(self.object_mut(self.bundle)?.bytes_mut()).map_err(|_| EINVAL)?;
             let maximum = self.object(self.bundle)?.word(shared.policy + m::M5_POLICY_MAXIMUM_POWER)?
                 .load(Ordering::Relaxed);
             m::set_m5_region_maximum_power(self.object_mut(self.region_c)?.bytes_mut(), maximum)
                 .map_err(|_| EINVAL)?;
         }
+        // The policy encoders write the 26A428 layout; a build with another one gets it laid out
+        // in place, within its own allocation.
+        let policy = self.m5_policy;
+        let policy_end = shared.policy.checked_add(policy.size).ok_or(EINVAL)?;
+        if policy_end > shared.block_68 {
+            return Err(EINVAL);
+        }
+        m::relayout_m5_policy(
+            policy,
+            board,
+            controller_defaults.is_some(),
+            &mut self.object_mut(self.bundle)?.bytes_mut()[shared.policy..policy_end],
+        )
+        .map_err(|_| EINVAL)?;
         if let Some(microseconds) = board.idle_standby_us {
             m::set_m5_region_idle_standby(self.object_mut(self.region_c)?.bytes_mut(), microseconds)
                 .map_err(|_| EINVAL)?;
