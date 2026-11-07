@@ -1,6 +1,6 @@
 # J804 device-tree audit
 
-SoC: T8152. Source: redacted community ADT, checked against the same-die live J873 ADT. Audited 518 ADT node records.
+SoC: T8152 (H18), product Mac18,1. Source: redacted community ADT, checked against the same-die live J873 ADT. Audited 518 ADT node records.
 The table covers the devices directly attached to the SoC bus. Firmware
 service containers, mapper children and transport endpoints are distinguished
 from independent MMIO controllers. This is a resource-description draft,

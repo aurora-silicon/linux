@@ -16,3 +16,7 @@
 &cpufreq_p {
 	status = "disabled";
 };
+
+&pmc {
+	status = "disabled";
+};
