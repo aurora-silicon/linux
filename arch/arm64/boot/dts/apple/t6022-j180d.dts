@@ -1239,3 +1239,7 @@
 };
 
 #include "spi1-nvram.dtsi"
+
+#include "t6022-peripherals.dtsi"
+
+#include "t6022-j180d-peripherals.dtsi"
