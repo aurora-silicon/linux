@@ -17,6 +17,9 @@ properties:
   compatible:
     oneOf:
       - items:
+          - const: apple,t8152-isp-secure-proxy
+          - const: apple,isp-secure-proxy
+      - items:
           - const: apple,t8140-isp-secure-proxy
           - const: apple,isp-secure-proxy
 
