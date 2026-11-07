@@ -16,6 +16,12 @@ properties:
   compatible:
     oneOf:
       - items:
+          - const: apple,t8142-aic-timebase
+          - const: apple,aic-timebase
+      - items:
+          - const: apple,t8152-aic-timebase
+          - const: apple,aic-timebase
+      - items:
           - const: apple,t6041-aic-timebase
           - const: apple,aic-timebase
 
