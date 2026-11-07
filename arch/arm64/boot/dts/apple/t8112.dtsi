@@ -961,6 +961,18 @@
 			status = "disabled"; /* only used in J493 */
 		};
 
+		spi4: spi@235110000 {
+			compatible = "apple,t8112-spi", "apple,spi";
+			reg = <0x2 0x35110000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 752 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>;
+			power-domains = <&ps_spi4>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
 		serial0: serial@235200000 {
 			compatible = "apple,s5l-uart";
 			reg = <0x2 0x35200000 0x0 0x1000>;
@@ -1484,6 +1496,14 @@
 			};
 		};
 
+		nub_spmi1: spmi@23d794000 {
+			compatible = "apple,t8112-spmi", "apple,spmi";
+			reg = <0x2 0x3d794000 0x0 0x100>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
 		smc: smc@23e400000 {
 			compatible = "apple,t8112-smc", "apple,smc";
 			reg = <0x2 0x3e400000 0x0 0x4000>,
@@ -1599,6 +1619,22 @@
 			#iommu-cells = <1>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 338 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		aop_spmi0: spmi@24a894000 {
+			compatible = "apple,t8112-spmi", "apple,spmi";
+			reg = <0x2 0x4a894000 0x0 0x100>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		aop_spmi1: spmi@24a8d4000 {
+			compatible = "apple,t8112-spmi", "apple,spmi";
+			reg = <0x2 0x4a8d4000 0x0 0x100>;
+			#address-cells = <2>;
+			#size-cells = <0>;
 			status = "disabled";
 		};
 
