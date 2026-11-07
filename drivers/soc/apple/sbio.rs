@@ -1851,18 +1851,29 @@ impl SepData {
         if self.bringup_started.xchg(true, Relaxed) {
             return;
         }
+        if !self.run_keystore_bringup() {
+            return;
+        }
+        self.finish_keystore_bringup();
+    }
+
+    pub(crate) fn run_keystore_bringup(&self) -> bool {
         if let Err(e) = self.enable_sks() {
             dev_warn!(self.dev, "bringup: could not enable the key store ({:?}); keybag and ref-key operations are unavailable\n", e);
-            return;
+            return false;
         }
         if !self.sks_init_endpoint() {
             dev_err!(
                 self.dev,
                 "bringup: key-store endpoint init failed; the key store stays closed\n"
             );
-            return;
+            return false;
         }
         diag::keystore_open();
+        true
+    }
+
+    pub(crate) fn finish_keystore_bringup(&self) {
         if module_parameters::provision_keybag.value() != 0 {
             if module_parameters::xart_writes.value() == 0 {
                 dev_err!(
