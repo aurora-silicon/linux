@@ -477,6 +477,11 @@ impl Pool {
     pub(crate) fn queues(&self) -> u32 {
         self.queues.load(Ordering::Acquire)
     }
+    /// Whether one more logical queue fits, without reserving it. Creators
+    /// check before reserving, so a refusal never returns (and notifies) a slot.
+    pub(crate) fn has_room(&self) -> bool {
+        self.queues() < self.max_queues
+    }
     pub(crate) fn reserve_queue(self: &Arc<Self>) -> Result<QueueSlot> {
         let mut count = self.queues.load(Ordering::Acquire);
         loop {
