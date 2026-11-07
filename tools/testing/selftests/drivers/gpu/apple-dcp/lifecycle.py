@@ -741,6 +741,7 @@ def poweroff_replug(root):
     """An old disconnect's CRTC-off must not release a replacement link."""
     poweroff = apple_function(root, 'dcp_poweroff')
     assert poweroff, 'dcp_poweroff'
+    panel_predicate = apple_function(root, 'dcp_h17g_panel') or ''
     iomfb = (root / 'drivers/gpu/drm/apple/iomfb.c').read_text()
     modeset = block(iomfb, iomfb.index('int dcp_crtc_atomic_modeset('))
     assert 'dcp->crtc_unplugs = dcp->typec_unplugs;' in modeset
@@ -764,7 +765,12 @@ struct delayed_work { bool pending; };
 struct completion { int done; };
 struct apple_connector { bool connected; };
 struct dptx_port { bool enabled, connected, available; void *service; };
+#define DCP_FIRMWARE_H17P 1
+#define DCP_IOMFB_METHODS_H17G 7
+#define DRM_MODE_CONNECTOR_eDP 14
 struct apple_dcp {
+ int fw_compat, connector_type;
+ struct { int iomfb_method_profile; } hw;
  void *dev, *avep, *hdmi_hpd;
  int external_lock, hpd_mutex;
  struct delayed_work typec_reconnect_wq, placeholder_edid_wq, swap_watchdog_wq;
@@ -786,6 +792,9 @@ static int dcp_external_stop_locked(struct apple_dcp *d, u64 generation)
 { (void)d; (void)generation; return 0; }
 static void dcp_external_crtc_released(struct apple_dcp *d) { (void)d; }
 static bool dcp_uses_soft_dpms(struct apple_dcp *d) { return d->soft_dpms; }
+static bool __attribute__((unused)) dcp_has_panel(struct apple_dcp *d) { return !d->typec_output; }
+static void __attribute__((unused)) iomfb_blank_h17p(struct apple_dcp *d)
+{ (void)d; assert(!"unexpected internal-panel blank in external-link test"); }
 static int dcp_backlight_dpms(struct apple_dcp *d, bool on)
 { (void)d; (void)on; return 0; }
 static void av_service_disconnect(struct apple_dcp *d)
@@ -802,7 +811,7 @@ static void dcp_external_retry(struct apple_dcp *d, const char *why, int error, 
 { (void)d; (void)why; (void)error; (void)delay; retries++; }
 static bool gpiod_get_value_cansleep(void *gpio) { (void)gpio; return false; }
 static void disconnected_hpd_event(struct apple_connector *connector) { (void)connector; }
-''' + poweroff + r'''
+''' + panel_predicate + '\n' + poweroff + r'''
 static struct apple_dcp dcp;
 static struct apple_connector connector;
 static struct platform_device pdev = { .data = &dcp };

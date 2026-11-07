@@ -27,8 +27,8 @@
 //!
 //! The speaker front-end is copy-only: the LEAP consumes float32 and the
 //! driver converts each S32 sample through the amplifier's full scale and
-//! the "Speaker Playback Volume" control, which the card's volume lock holds
-//! 20 dB down whenever no speaker-protection daemon owns it.
+//! the "Speaker Playback Volume" control, which macaudio holds at full scale
+//! while a protection engine owns the speakers and 20 dB down otherwise.
 //!
 //! Closing the lid disconnects both internal microphones in hardware.  The
 //! array then reads back as digital silence, but the low-power microphone's
@@ -1622,14 +1622,13 @@ const FE_SPKR: usize = 1;
 /// sine with peak 13 582 000 and nothing else in the path.  A float of 0.5
 /// is therefore the I2S full scale (0 dBFS on the wire, 7.3 V peak at the
 /// MAX98360A's output on the J700) and anything above it would wrap.
-/// Protection is the userspace daemon's job, exactly as on the other Apple
-/// laptops: it owns "Speaker Playback Volume" and governs it with the
-/// speaker's thermal model, fed by the tap; when no daemon holds the lock,
-/// macaudio keeps the control 20 dB down.
+/// Protection is the job of the engine in the speaker signal path: while it
+/// owns the speakers macaudio holds "Speaker Playback Volume" at this full
+/// scale, and without an owner 20 dB down with speaker playback refused.
 const SPKR_CEILING_Q31: i64 = 1 << 30;
 
-/// "Speaker Playback Volume": the software gain below the ceiling that the
-/// speaker-protection daemon and the card's volume lock drive, 0.5 dB per
+/// "Speaker Playback Volume": the software gain below the ceiling that
+/// macaudio sets (full scale or its safe level), 0.5 dB per
 /// step from -63.0 dB (1) to 0 dB (127) relative to SPKR_CEILING_Q31, 0 =
 /// mute; entry i = round(SPKR_CEILING_Q31 * 10^(-(127 - i) / 40)).
 const SPKR_VOLUME_MAX: u32 = 127;
@@ -2907,13 +2906,13 @@ impl SndSocT8140AopDriver {
 }
 
 /// The speaker ceiling and the copy-path conversion are the whole digital
-/// protection of the J700 speakers below the daemon: check them where they
+/// protection of the J700 speakers below the engine: check them where they
 /// are built, without the hardware.
 #[kunit_tests(snd_soc_t8140_aop_audio_speaker)]
 mod tests {
     use super::*;
 
-    /// macaudio's level for the J700 while no daemon holds the lock:
+    /// macaudio's safe level for the J700 while nothing owns the speakers:
     /// MAX98360A_DB(safe_vol = -20).
     const LOCKED_VOLUME: usize = 87;
     /// 10^(0.5 / 20) in parts per 10^9.

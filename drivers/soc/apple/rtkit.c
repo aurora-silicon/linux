@@ -153,6 +153,18 @@ static bool apple_rtkit_needs_coreanalytics(struct apple_rtkit *rtk)
 	return rtk->ops->flags & APPLE_RTKIT_NEEDS_COREANALYTICS;
 }
 
+static bool apple_rtkit_firmware_owns_crashlog(struct apple_rtkit *rtk)
+{
+	return rtk->ops->flags & APPLE_RTKIT_FIRMWARE_OWNED_CRASHLOG;
+}
+
+/* The crashlog endpoint is started while the endpoint map is handled. */
+static bool apple_rtkit_early_crashlog(struct apple_rtkit *rtk)
+{
+	return apple_rtkit_coproc_places_buffers(rtk) ||
+	       (rtk->ops->flags & APPLE_RTKIT_EARLY_CRASHLOG);
+}
+
 static int apple_rtkit_management_send(struct apple_rtkit *rtk, u8 type,
 					u64 msg)
 {
@@ -232,10 +244,11 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 	}
 
 	/*
-	 * For co-processors that place their own buffers, the crashlog
-	 * endpoint is started before the map is acknowledged.
+	 * Co-processors that place all buffers, and clients that explicitly
+	 * request early crashlog startup, need the endpoint before the map is
+	 * acknowledged: G17P can request its crash DVA right after.
 	 */
-	if (apple_rtkit_coproc_places_buffers(rtk) && base == 0 &&
+	if (apple_rtkit_early_crashlog(rtk) && base == 0 &&
 	    test_bit(APPLE_RTKIT_EP_CRASHLOG, &bitmap)) {
 		ret = apple_rtkit_start_ep(rtk, APPLE_RTKIT_EP_CRASHLOG);
 		if (ret) {
@@ -276,7 +289,7 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		case APPLE_RTKIT_EP_TRACEKIT:
 			/* already started while handling the map */
 			if (ep == APPLE_RTKIT_EP_CRASHLOG &&
-			    apple_rtkit_coproc_places_buffers(rtk))
+			    apple_rtkit_early_crashlog(rtk))
 				break;
 			dev_dbg(rtk->dev,
 				"RTKit: Starting system endpoint 0x%02x\n", ep);
@@ -410,6 +423,13 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 	dev_dbg(rtk->dev, "RTKit: buffer request for 0x%zx bytes at %pad\n",
 		request.size, &request.iova);
 
+	if ((rtk->ops->flags & APPLE_RTKIT_FIRMWARE_OWNED_CRASHLOG) &&
+	    ep == APPLE_RTKIT_EP_CRASHLOG && request.iova) {
+		*buffer = request;
+		buffer->is_mapped = true;
+		return apple_rtkit_send_message(rtk, ep, msg, NULL, false);
+	}
+
 	if (request.iova && !rtk->ops->shmem_setup && !rtk->ops->shmem_setup_ep) {
 		err = -EINVAL;
 		goto error;
@@ -440,7 +460,9 @@ reply:
 					    buffer->iova);
 		}
 		apple_rtkit_send_message(rtk, ep, reply, NULL, false);
-	} else if (apple_rtkit_coproc_places_buffers(rtk)) {
+	} else if (apple_rtkit_coproc_places_buffers(rtk) ||
+		   (apple_rtkit_firmware_owns_crashlog(rtk) &&
+		    ep == APPLE_RTKIT_EP_CRASHLOG)) {
 		/* acknowledge the co-processor's own buffer with its request */
 		apple_rtkit_send_message(rtk, ep, msg, NULL, false);
 	}
@@ -733,6 +755,18 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 	}
 
 	dev_err(rtk->dev, "RTKit: co-processor has crashed\n");
+
+	/* A firmware-owned crash buffer has no CPU mapping to read the log from. */
+	if (!rtk->crashlog_buffer.buffer && !rtk->crashlog_buffer.iomem) {
+		if (apple_rtkit_firmware_owns_crashlog(rtk))
+			dev_err(rtk->dev,
+				"RTKit: firmware-owned crash log at DVA %pad (0x%zx bytes)\n",
+				&rtk->crashlog_buffer.iova, rtk->crashlog_buffer.size);
+		rtk->crashed = true;
+		if (rtk->ops->crashed)
+			rtk->ops->crashed(rtk->cookie, NULL, 0);
+		return;
+	}
 
 	/*
 	 * create a shadow copy here to make sure the co-processor isn't able

@@ -30,6 +30,7 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/soc/apple/dart.h>
+#include <linux/soc/apple/t8132.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_iommu.h>
@@ -3493,7 +3494,7 @@ static int apple_dart_def_domain_type(struct device *dev)
 	 */
 	if (cfg->stream_maps[0].dart->tunneled)
 		return IOMMU_DOMAIN_DMA;
-	if (dev_is_pci(dev) && of_machine_is_compatible("apple,j713") &&
+	if (dev_is_pci(dev) && apple_t8132_air() &&
 	    cfg->supports_bypass && !cfg->locked)
 		return IOMMU_DOMAIN_IDENTITY;
 	if (!cfg->supports_bypass)
@@ -4111,24 +4112,24 @@ static int apple_dart_probe(struct platform_device *pdev)
 	bool j713_display, j713_dcpext, j713_dispext, j713_radio;
 
 	/*
-	 * The J713 internal display DARTs are live: DCP firmware (SID23) and
-	 * the scanout/PIODMA frontend (SID0/SID16) keep using them. Leave both
-	 * untouched until userspace, with its watchdog armed, opts in.
+	 * The M4 internal display DARTs are live: DCP firmware (SID23)
+	 * and the scanout/PIODMA frontend (SID0/SID16) keep using them. Leave
+	 * both untouched until userspace, with its watchdog armed, opts in.
 	 */
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	j713_display = res && !tunneled && of_machine_is_compatible("apple,j713") &&
+	j713_display = res && !tunneled && apple_t8132_firmware_path() &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 		(res->start == 0x30a300000ULL || res->start == 0x30a340000ULL);
 	/* The external DCP firmware DARTs (SID23) of dcpext0 and dcpext1. */
-	j713_dcpext = res && !tunneled && of_machine_is_compatible("apple,j713") &&
+	j713_dcpext = res && !tunneled && apple_t8132_firmware_path() &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 		(res->start == 0x286340000ULL || res->start == 0x48a340000ULL);
 	/* The external display DARTs (SID0/SID16) of dispext0 and dispext1. */
-	j713_dispext = res && !tunneled && of_machine_is_compatible("apple,j713") &&
+	j713_dispext = res && !tunneled && apple_t8132_firmware_path() &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 		(res->start == 0x286300000ULL || res->start == 0x48a300000ULL);
-	/* The J713 radio DART's fault interrupt is not described by its loader. */
-	j713_radio = res && !tunneled && of_machine_is_compatible("apple,j713") &&
+	/* The radio DART's fault interrupt is not described by the loader. */
+	j713_radio = res && !tunneled && apple_t8132_managed_radio() &&
 		of_machine_is_compatible("apple,t8132") &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 		res->start == 0x490000000ULL;
@@ -4470,6 +4471,19 @@ params_done:
 		goto err_clk_disable;
 	}
 
+	/*
+	 * v2.2 moved the exception bitmap to 0x4000 and the per-stream
+	 * exception records to 0x8000. A node whose reg stops short of them
+	 * would fault on the first exception read during reset.
+	 */
+	if (dart->hw->type == DART_T8110 && dart->version >= 0x0202 &&
+	    resource_size(res) < DART_T8110_ERR_SID(dart->num_streams)) {
+		ret = dev_err_probe(dev, -EINVAL,
+				    "MMIO region %pR too small for v2.2 exception records (need %#x); fix the DT reg\n",
+				    res, DART_T8110_ERR_SID(dart->num_streams));
+		goto err_clk_disable;
+	}
+
 	ret = apple_dart_read_remaps(dart);
 	if (ret)
 		goto err_clk_disable;
@@ -4518,13 +4532,12 @@ params_done:
 		of_node_put(iommu);
 		of_node_put(mtp);
 	}
-	if (of_machine_is_compatible("apple,j713") &&
-	    of_machine_is_compatible("apple,t8132") &&
+	if (apple_t8132_live_mtp() && of_machine_is_compatible("apple,t8132") &&
 	    res->start == 0x394800000ULL && dart->hw->type == DART_T8110 &&
 	    !dart->locked && !tunneled && dart->supports_bypass &&
 	    apple_dart_streams_bypassed(dart)) {
 		dart->retained_mtp = true;
-		dev_info(dev, "Retaining the live J713 MTP bypass\n");
+		dev_info(dev, "Retaining the live T8132 MTP bypass\n");
 	}
 	if (dart->preserve_display) {
 		if (dart->hw->type != DART_T8110 || !bitmap_empty(dart->remapped, DART_MAX_STREAMS)) {

@@ -49,10 +49,14 @@ properties:
           reserves their firmware memory, publishes the firmware identity and
           sets apple,t8132-dcpext-firmware-ready.
         const: apple,t8132-dcpext
+      - description:
+          T6031 (M3 Max) internal display controller. The display gate enables
+          it after the boot loader has handed the running display over.
+        const: apple,t6031-dcp
 
   reg:
     minItems: 2
-    maxItems: 7
+    maxItems: 8
 
   reg-names:
     minItems: 2
@@ -63,7 +67,13 @@ properties:
       - enum: [disp-2, iop-vbar]
       - enum: [disp-3, iop-vbar]
       - enum: [disp-4, iop-vbar]
+      - enum: [disp-5, iop-vbar, coproc-aux]
       - const: iop-vbar
+
+  interrupts:
+    minItems: 7
+    maxItems: 16
+    description: Optional host display-engine interrupt sources.
 
   mboxes:
     maxItems: 1
@@ -119,7 +129,10 @@ properties:
           - description: Index into the provider's reg property.
           - description: Index in the firmware display register table.
           - description: Byte offset of the scratch register within the resource.
-    description: PMGR bandwidth scratch resource, display index and offset.
+    description: |
+      PMGR bandwidth scratch resource, display index and offset. On the T8132
+      external DCPs it is the pipe's 8-byte realtime bandwidth request slot,
+      which lies inside the display register window the index names (disp-4).
 
   apple,bw-doorbell:
     $ref: /schemas/types.yaml#/definitions/phandle-array
@@ -392,13 +405,14 @@ required:
 
 allOf:
   - if:
-      properties:
-        compatible:
-          contains:
-            enum: ['apple,t6030-dcpext', 'apple,t8132-dcpext']
-      required:
-        - compatible
-    else:
+      not:
+        properties:
+          compatible:
+            contains:
+              enum: ['apple,t6030-dcpext', 'apple,t8132-dcpext']
+        required:
+          - compatible
+    then:
       properties:
         mux-controls:
           maxItems: 8
@@ -407,11 +421,18 @@ allOf:
           items:
             pattern: '^(dp-xbar|typec[0-9]+)$'
   - if:
-      not:
-        properties:
-          compatible:
-            contains:
-              enum: ['apple,t8132-dcp', 'apple,t8132-dcpext']
+      allOf:
+        - not:
+            properties:
+              compatible:
+                contains:
+                  enum: ['apple,t6031-dcp', 'apple,t8132-dcp', 'apple,t8132-dcpext']
+        - not:
+            properties:
+              status:
+                const: disabled
+            required:
+              - status
     then:
       required:
         - apple,bw-scratch

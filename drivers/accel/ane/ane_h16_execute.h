@@ -16,7 +16,10 @@
  * Request flags word. Bit 0 keeps the request off the firmware's direct
  * submission path and queues it on the full execution loop (EXELOOP), which
  * installs a fresh BAR context and the per-priority L2-spill mapping. The
- * direct path reuses both and never sets them up. Measured on H17 (T8140):
+ * direct path reuses both and never sets them up. H16 requests carry their
+ * decoded custom-BAR tuple, so later requests may reuse the context after
+ * the first queued call. Established H17 programs use no custom BARs.
+ * Measured on H17 (T8140):
  * without it, the first job after the engine ran a different program can
  * write through that program's stale output binding. Set it on the first
  * request of each program on the engine, the first one after boot included.
@@ -103,7 +106,8 @@ ane_h16_execute_encode(void *command, size_t length, const struct ane_h16_execut
 		for (j = 0; j < i; j++) {
 			const struct ane_h16_custom_bar *a = &call->bars[j];
 
-			if (a->configuration == b->configuration && a->bar == b->bar &&
+			if (a->configuration == b->configuration &&
+			    a->value_type == b->value_type && a->bar == b->bar &&
 			    a->bit_offset < end &&
 			    b->bit_offset < a->bit_offset + a->bit_width)
 				return -EINVAL;

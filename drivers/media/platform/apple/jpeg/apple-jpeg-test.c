@@ -15,6 +15,10 @@ static void apple_jpeg_hwrev_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t8140, 0));
 	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t8140, U32_MAX));
 	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t6041, 0x110000));
+	KUNIT_EXPECT_TRUE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t6041, 0x101008));
+	KUNIT_EXPECT_TRUE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t6041, 0x10f008));
+	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t6041, 0x101009));
+	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t8140, 0x101008));
 	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(NULL, 0x110000));
 }
 
@@ -146,12 +150,65 @@ static void apple_jpeg_job_reject_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apple_jpeg_build_job(&job, w, 10), -ENOSPC);
 }
 
+/*
+ * One buffer: chroma straight after the visible luma rows, then chroma up to
+ * the MCU boundary. 1080p NV12: chroma at 1080 rows, 544 chroma rows.
+ */
+static void apple_jpeg_raw_layout_test(struct kunit *test)
+{
+	static const struct {
+		u32 w, h;
+		bool is422;
+		u32 bpl, chroma, size;
+	} cases[] = {
+		{ 1920, 1080, false, 1920, 1920 * 1080, 1920 * (1080 + 544) },
+		{ 1280, 720, false, 1280, 1280 * 720, 1280 * (720 + 360) },
+		{ 640, 480, false, 640, 640 * 480, 640 * (480 + 240) },
+		{ 3840, 2160, false, 3840, 3840 * 2160, 3840 * (2160 + 1080) },
+		/* Odd height and a width that pads the stride to 16. */
+		{ 642, 481, false, 656, 656 * 481, 656 * (481 + 248) },
+		/* 4:2:2 MCUs are 8 rows high and chroma has every row. */
+		{ 1920, 1084, true, 1920, 1920 * 1084, 1920 * (1084 + 1088) },
+	};
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(cases); i++) {
+		struct apple_jpeg_layout l;
+
+		apple_jpeg_raw_layout(cases[i].w, cases[i].h, cases[i].is422, &l);
+		KUNIT_EXPECT_EQ(test, l.bytesperline, cases[i].bpl);
+		KUNIT_EXPECT_EQ(test, l.chroma_offset, cases[i].chroma);
+		KUNIT_EXPECT_EQ(test, l.sizeimage, cases[i].size);
+		/* The 4-byte start alignment of luma carries to chroma. */
+		KUNIT_EXPECT_EQ(test, l.chroma_offset & 3, 0U);
+	}
+}
+
+/* A kept CAPTURE size survives OUTPUT changes, within the limit. */
+static void apple_jpeg_coded_size_test(struct kunit *test)
+{
+	u32 need720 = PAGE_ALIGN(1280 * 720 * 3 + SZ_16K);
+	u32 need1080 = PAGE_ALIGN(1920 * 1080 * 3 + SZ_16K);
+
+	KUNIT_EXPECT_EQ(test, apple_jpeg_coded_size(1280, 720, 0), need720);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_coded_size(1280, 720, 4096), need720);
+	/* CAPTURE was sized at the 1080p default before OUTPUT moved to 720p. */
+	KUNIT_EXPECT_EQ(test, apple_jpeg_coded_size(1280, 720, need1080), need1080);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_coded_size(1280, 720, need1080 - 1), need1080);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_coded_size(1280, 720, U32_MAX),
+			(u32)APPLE_JPEG_CODED_LIMIT);
+	/* The worst case at the largest size is above the limit and wins. */
+	KUNIT_EXPECT_EQ(test, apple_jpeg_coded_size(16384, 16384, U32_MAX),
+			(u32)PAGE_ALIGN(16384ULL * 16384 * 3 + SZ_16K));
+}
+
 static struct kunit_case apple_jpeg_cases[] = {
 	KUNIT_CASE(apple_jpeg_hwrev_test),
 	KUNIT_CASE(apple_jpeg_quant_test),
 	KUNIT_CASE(apple_jpeg_job_420_test),
 	KUNIT_CASE(apple_jpeg_job_422_test),
 	KUNIT_CASE(apple_jpeg_job_reject_test),
+	KUNIT_CASE(apple_jpeg_raw_layout_test),
+	KUNIT_CASE(apple_jpeg_coded_size_test),
 	{ }
 };
 

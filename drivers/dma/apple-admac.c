@@ -181,6 +181,8 @@ struct admac_tx {
 
 	size_t submitted_pos;
 	size_t reclaimed_pos;
+	/* The last position tx_status reported, in [0, 2 * buf_len) */
+	size_t reported_pos;
 
 	struct list_head node;
 };
@@ -329,6 +331,7 @@ static struct dma_async_tx_descriptor *admac_prep_dma_cyclic(
 
 	adtx->submitted_pos = 0;
 	adtx->reclaimed_pos = 0;
+	adtx->reported_pos = 0;
 
 	dma_async_tx_descriptor_init(&adtx->tx, chan);
 	adtx->tx.tx_submit = admac_tx_submit;
@@ -403,34 +406,101 @@ static int admac_ring_noccupied_slots(int ringval)
 	}
 }
 
+/* Reads of the report ring and the residue before the position is given up */
+#define ADMAC_RESIDUE_READS	16
+
+/* The report ring and the residue, read twice in that order */
+struct admac_residue_read {
+	u32 ring1, residue1;
+	u32 ring2, residue2;
+};
+
+/*
+ * The position of a cyclic transaction, in [0, 2 * buf_len), from one
+ * &struct admac_residue_read: the periods reclaimed, those reported since,
+ * and the part of the period in progress. False if the read is not a
+ * consistent snapshot of the controller.
+ *
+ * At the end of a period the controller runs the residue down to 0, posts
+ * the period's report, then loads the next descriptor (its full period as
+ * the residue): seen on the J316s, where a read between the last two put
+ * the playback position a period ahead and the PCM core stopped the
+ * stream for an underrun at a period's end. With the residue at 0 the report may or may not
+ * be in the ring yet: the same read is the end of the period in progress,
+ * or, the report counted, a whole period further on. And a load between
+ * the two residue reads can come with a report posted before the first
+ * ring read or after it. So only a read whose ring did not move and whose
+ * residue is non-zero and did not reload is a position.
+ */
+static bool admac_cyclic_pos(const struct admac_tx *adtx,
+			     const struct admac_residue_read *r, size_t *pos)
+{
+	if (r->ring1 != r->ring2 || !r->residue2 || r->residue2 > r->residue1 ||
+	    r->residue2 > adtx->period_len)
+		return false;
+	*pos = (adtx->reclaimed_pos +
+		adtx->period_len * (admac_ring_noccupied_slots(r->ring2) + 1) -
+		r->residue2) % (2 * adtx->buf_len);
+	return true;
+}
+
+/* Position @b is ahead of @a, both in [0, 2 * buf_len), by less than a buffer */
+static bool admac_cyclic_pos_after(const struct admac_tx *adtx, size_t a, size_t b)
+{
+	size_t span = 2 * adtx->buf_len;
+	size_t ahead = (b + span - a) % span;
+
+	return ahead && ahead < adtx->buf_len;
+}
+
+/*
+ * The position for a read that is caught in a period's end (see
+ * admac_cyclic_pos()): never ahead of the transfer, and never behind the
+ * last position reported. The periods reclaimed and reported are done
+ * either way, the report of the one ending perhaps among them.
+ */
+static size_t admac_cyclic_pos_at_period_end(const struct admac_tx *adtx,
+					     const struct admac_residue_read *r)
+{
+	size_t done = (adtx->reclaimed_pos +
+		       adtx->period_len * admac_ring_noccupied_slots(r->ring2)) %
+		      (2 * adtx->buf_len);
+
+	return admac_cyclic_pos_after(adtx, adtx->reported_pos, done) ? done :
+								       adtx->reported_pos;
+}
+
 /*
  * Read from hardware the residue of a cyclic dmaengine transaction.
+ *
+ * The read is repeated while it is caught in a period's end (see
+ * admac_cyclic_pos()), which lasts well under a microsecond. A controller
+ * that stays there, stalled at a period's end with no descriptor to load,
+ * gets admac_cyclic_pos_at_period_end(). The PCM core takes a position a
+ * period ahead of the transfer for an underrun, and one behind the last it
+ * read for a wrap of the whole buffer: both stop the stream.
+ *
+ * Context: adchan->lock held.
  */
 static u32 admac_cyclic_read_residue(struct admac_data *ad, int channo,
 				     struct admac_tx *adtx)
 {
-	u32 ring1, ring2;
-	u32 residue1, residue2;
-	int nreports;
+	struct admac_residue_read r;
 	size_t pos;
+	int i;
 
-	ring1 =    readl_relaxed(ad->base + REG_REPORT_RING(ad, channo));
-	residue1 = readl_relaxed(ad->base + REG_RESIDUE(ad, channo));
-	ring2 =    readl_relaxed(ad->base + REG_REPORT_RING(ad, channo));
-	residue2 = readl_relaxed(ad->base + REG_RESIDUE(ad, channo));
+	for (i = 0; i < ADMAC_RESIDUE_READS; i++) {
+		r.ring1 =    readl_relaxed(ad->base + REG_REPORT_RING(ad, channo));
+		r.residue1 = readl_relaxed(ad->base + REG_RESIDUE(ad, channo));
+		r.ring2 =    readl_relaxed(ad->base + REG_REPORT_RING(ad, channo));
+		r.residue2 = readl_relaxed(ad->base + REG_RESIDUE(ad, channo));
 
-	if (residue2 > residue1) {
-		/*
-		 * Controller must have loaded next descriptor between
-		 * the two residue reads
-		 */
-		nreports = admac_ring_noccupied_slots(ring1) + 1;
-	} else {
-		/* No descriptor load between the two reads, ring2 is safe to use */
-		nreports = admac_ring_noccupied_slots(ring2);
+		if (admac_cyclic_pos(adtx, &r, &pos))
+			break;
 	}
-
-	pos = adtx->reclaimed_pos + adtx->period_len * (nreports + 1) - residue2;
+	if (i == ADMAC_RESIDUE_READS)
+		pos = admac_cyclic_pos_at_period_end(adtx, &r);
+	adtx->reported_pos = pos;
 
 	return adtx->buf_len - pos % adtx->buf_len;
 }
@@ -1224,6 +1294,10 @@ static struct platform_driver apple_admac_driver = {
 	.remove = admac_remove,
 };
 module_platform_driver(apple_admac_driver);
+
+#if IS_ENABLED(CONFIG_KUNIT) && !defined(MODULE)
+#include "apple-admac-test.h"
+#endif
 
 MODULE_AUTHOR("Martin Povišer <povik+lin@cutebit.org>");
 MODULE_DESCRIPTION("Driver for Audio DMA Controller (ADMAC) on Apple SoCs");
