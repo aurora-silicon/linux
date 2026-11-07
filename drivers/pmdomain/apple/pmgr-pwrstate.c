@@ -16,6 +16,7 @@
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/regmap.h>
+#include <linux/string.h>
 #include <linux/mfd/syscon.h>
 #include <linux/reset-controller.h>
 #include <linux/module.h>
@@ -75,12 +76,30 @@ static int apple_pmgr_ps_wait_parent(struct apple_pmgr_ps *ps, u32 *cur)
 {
 	int ret, err;
 
-	/* Bit 11 reports a missing upstream power/clock on T6000 GFX. */
+	/* Bit 11 reports a missing upstream power/clock (T6000 GFX, T604x ANE_SYS). */
 	ret = read_poll_timeout_atomic(regmap_read, err,
 				       err || !(*cur & APPLE_PMGR_BUSY),
 				       1, APPLE_PMGR_PS_PARENT_TIMEOUT, false,
 				       ps->regmap, ps->offset, cur);
 	return err ?: ret;
+}
+
+/*
+ * Domains whose power-on can report a missing upstream power/clock (bit 11,
+ * actual still clock-gated) for longer than the 100 us state budget:
+ * - T6000 GFX: its AFR parent on noirq resume.
+ * - T604x ANE_SYS: the SoC fabric on resume from s2idle (0x0b4f, seen ahead
+ *   of H16 firmware startup stalls). 0x3c0 is not unique across the T604x
+ *   PMGR blocks, so this domain is matched by its label as well.
+ */
+static bool apple_pmgr_ps_has_parent_wait(struct device_node *node, u32 offset,
+					  const char *name)
+{
+	if (of_device_is_compatible(node, "apple,t6000-pmgr-pwrstate"))
+		return offset == 0x3c0;
+	if (of_device_is_compatible(node, "apple,t6041-pmgr-pwrstate"))
+		return offset == 0x3c0 && !strcmp(name, "ane_sys");
+	return false;
 }
 
 static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool auto_enable)
@@ -137,8 +156,9 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 
 	if (ps->wait_parent && pstate == APPLE_PMGR_PS_ACTIVE) {
 		/*
-		 * GFX can remain clock-gated with bit 11 set on noirq resume,
-		 * even after genpd has powered its AFR parent on. Wait for that
+		 * GFX and ANE_SYS can remain clock-gated with bit 11 set on
+		 * noirq resume, even after genpd has made its parent votes
+		 * (AFR, the SoC fabric). Wait for that
 		 * hardware dependency separately, then allow the usual 100 us
 		 * for the actual state. A missing parent must still fail.
 		 * Use delay-based polling so the wait is bounded even while
@@ -573,8 +593,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	ps->wait_parent = of_device_is_compatible(node, "apple,t6000-pmgr-pwrstate") &&
-			  ps->offset == 0x3c0;
+	ps->wait_parent = apple_pmgr_ps_has_parent_wait(node, ps->offset, name);
 
 	ps->genpd.flags |= GENPD_FLAG_IRQ_SAFE;
 	ps->genpd.name = name;
