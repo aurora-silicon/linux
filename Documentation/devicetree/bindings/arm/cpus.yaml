@@ -39,6 +39,42 @@ description: |+
   described below.
 
 properties:
+  apple,firmware-cpu-id:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Native Apple hardware-description CPU identifier. This is not a Linux
+      CPU index and can omit classification bits present in MPIDR_EL1.
+
+  apple,implementation-registers:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    items:
+      - description: Physical base address
+      - description: Aperture length in bytes
+    description: |
+      CPU implementation register aperture associated with this CPU.
+      Cluster-shared views can overlap; describing them does not grant
+      access or specify register initialization or performance policy.
+
+  apple,acc-registers:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    items:
+      - description: Physical base address
+      - description: Aperture length in bytes
+    description: |
+      cluster ACC register aperture associated with this CPU.
+      Cluster-shared views can overlap; describing them does not grant
+      access or specify register initialization or performance policy.
+
+  apple,cpm-registers:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    items:
+      - description: Physical base address
+      - description: Aperture length in bytes
+    description: |
+      cluster CPM register aperture associated with this CPU.
+      Cluster-shared views can overlap; describing them does not grant
+      access or specify register initialization or performance policy.
+
   reg:
     maxItems: 1
     description: >

@@ -38,11 +38,10 @@ properties:
   reg:
     minItems: 2
     maxItems: 37
-    description: Coprocessor and peripheral register apertures.
-
-  interrupts:
-    minItems: 4
-    maxItems: 4
+    description:
+      Coprocessor and peripheral register views. First-generation firmware
+      views include shared apertures; a driver must coordinate ownership
+      rather than claim every view as an exclusive resource.
 
   reg-names:
     items:
@@ -114,6 +113,8 @@ required:
   - compatible
   - reg
   - iommus
+  - mboxes
+  - mbox-names
 
 allOf:
   - if:
@@ -128,7 +129,6 @@ allOf:
         power-domains:
           minItems: 2
       required:
-        - interrupts
         - power-domains
     else:
       properties:
@@ -136,7 +136,6 @@ allOf:
           maxItems: 2
         power-domains:
           maxItems: 1
-        interrupts: false
       required:
         - reg-names
         - mboxes

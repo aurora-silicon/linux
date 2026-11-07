@@ -2298,3 +2298,7 @@
 #include "t8103-peripherals.dtsi"
 
 #include "t8103-firmware-interfaces.dtsi"
+
+#include "t8103-cpu-debug.dtsi"
+
+#include "t8103-cpu-registers.dtsi"

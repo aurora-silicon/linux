@@ -490,13 +490,24 @@
 		      <0x2 0x11ef0000 0x0 0x8000>,
 		      <0x2 0x10ee0000 0x0 0x8000>,
 		      <0x2 0x04d80000 0x0 0x8000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 512 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 511 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 514 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 513 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_pmp>, <&ps_pms_sram>;
 		iommus = <&pmp_dart 0>;
+		mboxes = <&pmp_mbox>;
+		mbox-names = "mbox";
+		status = "disabled";
+	};
+
+	pmp_mbox: mailbox@23bc08000 {
+		compatible = "apple,t8103-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x2 0x3bc08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 511 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 512 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 513 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 514 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_pmp>, <&ps_pms_sram>;
+		#mbox-cells = <0>;
+		interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
 		status = "disabled";
 	};
 
@@ -794,6 +805,14 @@
 		compatible = "apple,t8103-pmgr-clocks", "apple,pmgr-clocks";
 		#clock-cells = <1>;
 		apple,pmgr = <&pmgr>;
+		status = "disabled";
+	};
+};
+
+&nub_spmi1 {
+	simetra: pmic@f {
+		compatible = "apple,simetra-pmic", "apple,spmi-nvmem";
+		reg = <0xf SPMI_USID>;
 		status = "disabled";
 	};
 };

@@ -11,7 +11,10 @@ maintainers:
 
 description: |
   Processor debug register apertures. Access ownership must be established
-  before a debugger accesses this block.
+  before a debugger accesses this block. M1-family descriptors identify
+  per-CPU CoreSight and UTTDBG views. Views can overlap within one CPU
+  aperture and must not be reserved as independent exclusive resources.
+  Debug programs and implementation-control sequences are not described.
 
 properties:
   compatible:
@@ -19,11 +22,31 @@ properties:
       - items:
           - const: apple,t6041-cpu-debug
           - const: apple,cpu-debug
+      - items:
+          - const: apple,t8103-cpu-debug
+          - const: apple,cpu-debug
+      - items:
+          - const: apple,t6000-cpu-debug
+          - const: apple,cpu-debug
 
   reg:
-    minItems: 2
-    maxItems: 2
+    minItems: 1
+    maxItems: 64
     description: Register apertures in hardware-description order.
+
+  reg-names:
+    minItems: 1
+    maxItems: 64
+    items:
+      pattern: '^cpu[0-9]+-(coresight|uttdbg)$'
+
+  apple,cpu-ids:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    minItems: 1
+    maxItems: 64
+    description: Native CPU identifiers corresponding to each register view. Values
+      match apple,firmware-cpu-id on CPU nodes, not Linux CPU indices or
+      complete architectural MPIDR_EL1 values.
 
   interrupts:
     minItems: 1
@@ -32,6 +55,25 @@ properties:
 required:
   - compatible
   - reg
-  - interrupts
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8103-cpu-debug
+              - apple,t6000-cpu-debug
+    then:
+      required:
+        - reg-names
+        - apple,cpu-ids
+    else:
+      properties:
+        reg:
+          minItems: 2
+          maxItems: 2
+      required:
+        - interrupts
 
 additionalProperties: false

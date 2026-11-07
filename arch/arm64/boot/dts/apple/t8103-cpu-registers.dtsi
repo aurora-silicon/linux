@@ -1,0 +1,58 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Address/length metadata only; implementation programming stays in drivers. */
+
+&{/cpus/cpu@0} {
+	apple,firmware-cpu-id = <0x0>;
+	apple,implementation-registers = /bits/ 64 <0x210050000 0x10000>;
+	apple,acc-registers = /bits/ 64 <0x210f00000 0x50000>;
+	apple,cpm-registers = /bits/ 64 <0x210e40000 0x10000>;
+};
+
+&{/cpus/cpu@1} {
+	apple,firmware-cpu-id = <0x1>;
+	apple,implementation-registers = /bits/ 64 <0x210150000 0x10000>;
+	apple,acc-registers = /bits/ 64 <0x210f00000 0x50000>;
+	apple,cpm-registers = /bits/ 64 <0x210e40000 0x10000>;
+};
+
+&{/cpus/cpu@2} {
+	apple,firmware-cpu-id = <0x2>;
+	apple,implementation-registers = /bits/ 64 <0x210250000 0x10000>;
+	apple,acc-registers = /bits/ 64 <0x210f00000 0x50000>;
+	apple,cpm-registers = /bits/ 64 <0x210e40000 0x10000>;
+};
+
+&{/cpus/cpu@3} {
+	apple,firmware-cpu-id = <0x3>;
+	apple,implementation-registers = /bits/ 64 <0x210350000 0x10000>;
+	apple,acc-registers = /bits/ 64 <0x210f00000 0x50000>;
+	apple,cpm-registers = /bits/ 64 <0x210e40000 0x10000>;
+};
+
+&{/cpus/cpu@10100} {
+	apple,firmware-cpu-id = <0x100>;
+	apple,implementation-registers = /bits/ 64 <0x211050000 0x10000>;
+	apple,acc-registers = /bits/ 64 <0x211f00000 0x50000>;
+	apple,cpm-registers = /bits/ 64 <0x211e40000 0x10000>;
+};
+
+&{/cpus/cpu@10101} {
+	apple,firmware-cpu-id = <0x101>;
+	apple,implementation-registers = /bits/ 64 <0x211150000 0x10000>;
+	apple,acc-registers = /bits/ 64 <0x211f00000 0x50000>;
+	apple,cpm-registers = /bits/ 64 <0x211e40000 0x10000>;
+};
+
+&{/cpus/cpu@10102} {
+	apple,firmware-cpu-id = <0x102>;
+	apple,implementation-registers = /bits/ 64 <0x211250000 0x10000>;
+	apple,acc-registers = /bits/ 64 <0x211f00000 0x50000>;
+	apple,cpm-registers = /bits/ 64 <0x211e40000 0x10000>;
+};
+
+&{/cpus/cpu@10103} {
+	apple,firmware-cpu-id = <0x103>;
+	apple,implementation-registers = /bits/ 64 <0x211350000 0x10000>;
+	apple,acc-registers = /bits/ 64 <0x211f00000 0x50000>;
+	apple,cpm-registers = /bits/ 64 <0x211e40000 0x10000>;
+};
