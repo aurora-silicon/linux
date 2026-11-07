@@ -527,7 +527,7 @@ static void t8132_ext_crtc_flush(struct drm_crtc *crtc, struct drm_atomic_commit
 		if (READ_ONCE(out->dying))
 			t8132_ext_send_event(out);
 		else
-			mod_delayed_work(system_wq, &out->flip_work,
+			mod_delayed_work(system_percpu_wq, &out->flip_work,
 					 ret >= 0 ? 0 : msecs_to_jiffies(16));
 	}
 }
