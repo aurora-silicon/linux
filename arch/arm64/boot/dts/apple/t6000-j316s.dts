@@ -75,10 +75,12 @@
 &aop {
 	accel {
 		compatible = "apple,t6000-aop-accel", "apple,aop-accel";
+		status = "disabled";
 	};
 
 	gyro {
 		compatible = "apple,t6000-aop-gyro", "apple,aop-gyro";
+		status = "disabled";
 	};
 };
 
