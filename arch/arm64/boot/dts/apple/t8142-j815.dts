@@ -1,0 +1,23 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/dts-v1/;
+
+#include "t8142.dtsi"
+
+/ {
+	model = "Apple MacBook Air (J815)";
+	compatible = "apple,j815", "apple,t8142", "apple,arm-platform";
+	chassis-type = "laptop";
+};
+
+/* Peripheral instances not exposed by this chassis. */
+/delete-node/ &pcie2_dart;
+
+/delete-node/ &pciec3_dart;
+
+/delete-node/ &acio3_dart;
+
+/delete-node/ &dwc3_3_dart;
+
+/delete-node/ &apcie2_piodma;
+
+/delete-node/ &apciec3_piodma;
