@@ -166,6 +166,21 @@ mod lockout_tests {
     }
 
     #[test]
+    fn operation_device_list_is_empty_and_checked() {
+        let op = sbio_operation_device_list();
+        assert_eq!(op.opcode(), 0x7d);
+        assert_eq!(op.payload().len(), 0);
+        assert_eq!(operation_device_count(&[0, 0, 0, 0]), Some(0));
+        let mut one = [0u8; 28];
+        one[0] = 1;
+        assert_eq!(operation_device_count(&one), Some(1));
+        assert_eq!(operation_device_count(&one[..27]), None);
+        assert_eq!(operation_device_count(&[2, 0, 0, 0]), None);
+        assert_eq!(operation_device_count(&[0, 0, 0]), None);
+        assert_eq!(operation_device_count(&[0xff, 0xff, 0xff, 0xff]), None);
+    }
+
+    #[test]
     fn match_cancel_is_empty() {
         let op = sbio_match_cancel();
         assert_eq!(op.opcode(), 0x0b);
@@ -445,6 +460,38 @@ impl SepData {
         };
 
         synced && policy_ok
+    }
+
+    /// Starts a match operation (`0x7d`) and checks its device list.
+    fn open_match_operation(&self) -> bool {
+        match self.sbio_call(&crate::sbio::sbio_operation_device_list()) {
+            SbioOutcome::Ok(reply) => match crate::sbio::operation_device_count(&reply) {
+                Some(count) => {
+                    dev_info!(
+                        self.dev,
+                        "verify: match operation opened (OPERATION_DEVICE_LIST, {} device(s))\n",
+                        count
+                    );
+                    true
+                }
+                None => {
+                    dev_err!(
+                        self.dev,
+                        "verify: OPERATION_DEVICE_LIST answered a malformed list ({} bytes)\n",
+                        reply.len()
+                    );
+                    false
+                }
+            },
+            SbioOutcome::PrerequisiteMissing => {
+                dev_err!(self.dev, "verify: OPERATION_DEVICE_LIST refused: prerequisite missing\n");
+                false
+            }
+            _ => {
+                dev_err!(self.dev, "verify: OPERATION_DEVICE_LIST failed\n");
+                false
+            }
+        }
     }
 
     fn note_capture_end(&self) {
@@ -2045,6 +2092,18 @@ impl SepData {
             self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE), token_bytes);
             return;
         };
+        // Open the enclave's match operation before the first image, as
+        // macOS does at every match start; MATCH_CANCEL below ends it.
+        if !self.open_match_operation() {
+            dev_err!(
+                self.dev,
+                "verify: the match operation did not open; refusing before the capture. This is not a non-matching finger\n"
+            );
+            self.close_unlock_evaluation(&evaluation);
+            let _ = sensor::idle();
+            self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE), token_bytes);
+            return;
+        }
         *self.match_context.lock() = Some(evaluation);
 
         let mut outcome = self.verify_one_image();
@@ -5732,6 +5791,33 @@ pub(crate) fn sbio_update_device_list() -> SbioOp {
         payload_len: 0,
         name: c"UPDATE_DEVICE_LIST",
     }
+}
+
+/// Opens a match operation: the enclave answers the operation's device list,
+/// a four-byte device count and one 24-byte record per device. Empty. Sent at
+/// the start of every logical match, before its first image; the operation
+/// ends with `MATCH_CANCEL`. Distinct from `UPDATE_DEVICE_LIST` (`0x7b`),
+/// which only syncs the device view.
+const OP_SBIO_OPERATION_DEVICE_LIST: u16 = 0x7d;
+pub(crate) fn sbio_operation_device_list() -> SbioOp {
+    SbioOp {
+        opcode: OP_SBIO_OPERATION_DEVICE_LIST,
+        payload: pad_payload(&[]),
+        payload_len: 0,
+        name: c"OPERATION_DEVICE_LIST",
+    }
+}
+
+const OP_DEVICE_LIST_HEADER_LEN: usize = 4;
+const OP_DEVICE_RECORD_LEN: usize = 24;
+
+/// The device count of an operation device list, if the reply is exactly a
+/// count followed by that many records.
+pub(crate) fn operation_device_count(reply: &[u8]) -> Option<u32> {
+    let header = reply.get(..OP_DEVICE_LIST_HEADER_LEN)?;
+    let count = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    let records = (count as usize).checked_mul(OP_DEVICE_RECORD_LEN)?;
+    (reply.len() == OP_DEVICE_LIST_HEADER_LEN.checked_add(records)?).then_some(count)
 }
 
 pub(crate) const SBIO_MATCH_POLICY_LEN: usize = 2;
