@@ -89,7 +89,7 @@
 		status = "disabled";
 	};
 
-	m2_dwi: display-interface@23b200000 {
+	m2_dwi: dwi@23b200000 {
 		compatible = "apple,t8112-dwi", "apple,dwi";
 		reg = <0x2 0x3b200000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
@@ -167,23 +167,20 @@
 		interrupt-controller;
 		#interrupt-cells = <2>;
 		status = "disabled";
+
+		pmic@e {
+			compatible = "apple,t8112-vale-pmic",
+				"apple,spmi-pmic";
+			reg = <0xe SPMI_USID>;
+			interrupt-parent = <&m2_nub_spmi1>;
+			interrupts = <2 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
 	};
 
 	m2_aop_spmi1_sideband: spmi-sideband@24a8c4000 {
 		compatible = "apple,t8112-spmi-sideband", "apple,spmi-sideband";
 		reg = <0x2 0x4a8c4000 0x0 0x4000>;
-		status = "disabled";
-	};
-
-	m2_aop_spmi1: spmi@24a8d4000 {
-		compatible = "apple,t8112-spmi", "apple,spmi";
-		reg = <0x2 0x4a8d4000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 357 IRQ_TYPE_LEVEL_HIGH>;
-		#address-cells = <2>;
-		#size-cells = <0>;
-		interrupt-controller;
-		#interrupt-cells = <2>;
 		status = "disabled";
 	};
 

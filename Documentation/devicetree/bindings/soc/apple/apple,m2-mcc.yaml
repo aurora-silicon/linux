@@ -20,6 +20,9 @@ select:
     compatible:
       contains:
         enum:
+          - apple,t6020-mcc
+          - apple,t6021-mcc
+          - apple,t6022-mcc
           - apple,t8112-mcc
   required:
     - compatible
@@ -28,11 +31,15 @@ properties:
   compatible:
     items:
       - enum:
+          - apple,t6020-mcc
+          - apple,t6021-mcc
+          - apple,t6022-mcc
           - apple,t8112-mcc
       - const: apple,mcc
 
   reg:
-    maxItems: 5
+    minItems: 5
+    maxItems: 18
 
 required:
   - compatible

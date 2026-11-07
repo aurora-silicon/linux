@@ -2,6 +2,25 @@
 /* Additional T6022 hardware resources. Keep unqualified blocks disabled. */
 
 &die0 {
+	m2_aop_spmi0: spmi@2a6894000 {
+		compatible = "apple,t6020-spmi", "apple,t8103-spmi";
+		reg = <0x2 0xa6894000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 635 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		status = "disabled";
+
+		peripheral@e {
+			compatible = "apple,t6022-spmi-peripheral",
+				"apple,spmi-peripheral";
+			reg = <0xe SPMI_USID>;
+			status = "disabled";
+		};
+	};
+
 	m2_apcie_ge0_piodma: dma-controller@1694010000 {
 		compatible = "apple,t6022-pcie-piodma", "apple,pcie-piodma";
 		reg = <0x16 0x94010000 0x0 0x4000>,

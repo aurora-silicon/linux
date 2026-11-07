@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/spmi/apple,m2-spmi-pmic.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple M2 generation SPMI power management IC
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  SPMI power management IC resources. The address is a unique slave identifier on
+  its parent bus. Register access and protocol support are separate from
+  describing the peripheral and its interrupt resources.
+
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6020-maverick-pmic
+          - apple,t6020-mirabeau-pmic
+          - apple,t6021-maverick-pmic
+          - apple,t6021-mirabeau-pmic
+          - apple,t6022-maverick-pmic
+          - apple,t6022-mirabeau-pmic
+          - apple,t8112-vale-pmic
+  required:
+    - compatible
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t6020-maverick-pmic
+          - apple,t6020-mirabeau-pmic
+          - apple,t6021-maverick-pmic
+          - apple,t6021-mirabeau-pmic
+          - apple,t6022-maverick-pmic
+          - apple,t6022-mirabeau-pmic
+          - apple,t8112-vale-pmic
+      - const: apple,spmi-pmic
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false

@@ -22,7 +22,8 @@
 			<AIC_IRQ 0 1020 IRQ_TYPE_LEVEL_HIGH>,
 			<AIC_IRQ 0 1021 IRQ_TYPE_LEVEL_HIGH>,
 			<AIC_IRQ 0 1032 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&m2_dart_dispext2_0 0>, <&m2_dart_dispext2_1 0>, <&m2_dart_dispext2_0 4>, <&m2_dart_dispext2_1 4>;
+		iommus = <&m2_dart_dispext2_0 0>, <&m2_dart_dispext2_1 0>, <&m2_dart_dispext2_0 4>,
+			<&m2_dart_dispext2_1 4>;
 		status = "disabled";
 	};
 
@@ -78,7 +79,8 @@
 			<AIC_IRQ 0 1056 IRQ_TYPE_LEVEL_HIGH>,
 			<AIC_IRQ 0 1057 IRQ_TYPE_LEVEL_HIGH>,
 			<AIC_IRQ 0 1068 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&m2_dart_dispext3_0 0>, <&m2_dart_dispext3_1 0>, <&m2_dart_dispext3_0 4>, <&m2_dart_dispext3_1 4>;
+		iommus = <&m2_dart_dispext3_0 0>, <&m2_dart_dispext3_1 0>, <&m2_dart_dispext3_0 4>,
+			<&m2_dart_dispext3_1 4>;
 		status = "disabled";
 	};
 

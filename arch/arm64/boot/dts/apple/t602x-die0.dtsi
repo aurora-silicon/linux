@@ -312,7 +312,7 @@
 		#address-cells = <2>;
 		#size-cells = <0>;
 
-		pmic1: pmic@f {
+		pmic1: pmic@b {
 			compatible = "apple,maverick-pmic", "apple,spmi-nvmem";
 			reg = <0xb SPMI_USID>;
 

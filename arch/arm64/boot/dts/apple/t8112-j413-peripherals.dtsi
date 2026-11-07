@@ -30,5 +30,39 @@
 		interrupt-controller;
 		#interrupt-cells = <2>;
 		status = "disabled";
+
+		peripheral@e {
+			compatible = "apple,t8112-spmi-peripheral",
+				"apple,spmi-peripheral";
+			reg = <0xe SPMI_USID>;
+			status = "disabled";
+		};
+	};
+
+	m2_aop_spmi1: spmi@24a8d4000 {
+		compatible = "apple,t8112-spmi", "apple,spmi";
+		reg = <0x2 0x4a8d4000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 357 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		status = "disabled";
+
+		nfc@c {
+			compatible = "apple,t8112-spmi-nfc",
+				"apple,spmi-nfc";
+			reg = <0xc SPMI_USID>;
+			interrupt-parent = <&m2_aop_spmi1>;
+			interrupts = <160 IRQ_TYPE_LEVEL_HIGH>,
+				<161 IRQ_TYPE_LEVEL_HIGH>,
+				<162 IRQ_TYPE_LEVEL_HIGH>,
+				<163 IRQ_TYPE_LEVEL_HIGH>,
+				<164 IRQ_TYPE_LEVEL_HIGH>,
+				<165 IRQ_TYPE_LEVEL_HIGH>,
+				<166 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
 	};
 };
