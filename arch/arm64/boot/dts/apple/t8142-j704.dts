@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+/dts-v1/;
+
+#include "t8142.dtsi"
+
+/ {
+	model = "Apple MacBook Pro (14-inch, M5)";
+	compatible = "apple,j704", "apple,t8142", "apple,arm-platform";
+	chassis-type = "laptop";
+};
+
+#include "t8142-j704-inventory.dtsi"
