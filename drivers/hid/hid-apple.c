@@ -760,6 +760,20 @@ static void apple_setup_input(struct input_dev *input)
 	apple_setup_key_translation(input, macbookpro_dedicated_esc_fn_keys);
 }
 
+/* The Magic Keyboards with Touch ID, whose Touch ID key reports Consumer Menu. */
+static bool apple_has_touchid_key(struct hid_device *hdev)
+{
+	switch (hdev->product) {
+	case USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_FINGERPRINT_2021:
+	case USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_NUMPAD_2021:
+	case USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_FINGERPRINT_2024:
+	case USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_NUMPAD_2024:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static int apple_input_mapping(struct hid_device *hdev, struct hid_input *hi,
 		struct hid_field *field, struct hid_usage *usage,
 		unsigned long **bit, int *max)
@@ -774,6 +788,12 @@ static int apple_input_mapping(struct hid_device *hdev, struct hid_input *hi,
 		hid_map_usage_clear(hi, usage, bit, max, EV_KEY, KEY_FN);
 		asc->fn_found = true;
 		apple_setup_input(hi->input);
+		return 1;
+	}
+
+	/* The Touch ID key is the power key, as on the Macs with a built-in one. */
+	if (usage->hid == (HID_UP_CONSUMER | 0x0040) && apple_has_touchid_key(hdev)) {
+		hid_map_usage_clear(hi, usage, bit, max, EV_KEY, KEY_POWER);
 		return 1;
 	}
 
