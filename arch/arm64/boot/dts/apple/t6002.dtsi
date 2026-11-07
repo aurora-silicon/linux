@@ -434,3 +434,6 @@
 	      <0x2 0x85868000 0x0 0x4000>;
 	reg-names = "report", "ane-dvfs";
 };
+
+#include "t6002-peripherals.dtsi"
+#include "t6002-aux-spmi.dtsi"

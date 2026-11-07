@@ -60,3 +60,5 @@
 };
 
 #include "hwmon-fan-dual.dtsi"
+
+#include "t6001-j375c-peripherals.dtsi"
