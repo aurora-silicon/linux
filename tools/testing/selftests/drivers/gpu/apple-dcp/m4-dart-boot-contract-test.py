@@ -9,6 +9,7 @@ execution still requires a hardware boot.
 from pathlib import Path
 import argparse
 import json
+import re
 import subprocess
 import tempfile
 
@@ -21,8 +22,10 @@ args = parser.parse_args()
 DTB, ROOT = args.dtb, args.kernel_root.resolve()
 source = (ROOT / 'drivers/iommu/apple-dart.c').read_text()
 t8132 = (ROOT / 'include/linux/soc/apple/t8132.h').read_text()
-air = t8132[t8132.index('static inline bool apple_t8132_air('):]
-air = air[:air.index('\n}\n') + 3]
+# Every board helper, in header order: the gates call them by trait.
+air = ''
+for start in [m.start() for m in re.finditer(r'^static inline bool apple_t8132_\w+\(', t8132, re.M)]:
+    air += t8132[start:t8132.index('\n}\n', start) + 3]
 
 
 def property(node, name, kind='s'):
@@ -80,7 +83,8 @@ static bool board, soc, bypassed;
 static unsigned int checks;
 static bool of_machine_is_compatible(const char *s) {
     if (!strcmp(s,"apple,j713")) return board;
-    if (!strcmp(s,"apple,j715")) return false;
+    if (!strcmp(s,"apple,j715") || !strcmp(s,"apple,j604") || !strcmp(s,"apple,j623") ||
+        !strcmp(s,"apple,j624") || !strcmp(s,"apple,j773g")) return false;
     assert(!strcmp(s,"apple,t8132")); return soc;
 }
 AIR_HELPER
