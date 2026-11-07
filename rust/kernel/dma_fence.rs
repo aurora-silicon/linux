@@ -132,7 +132,7 @@ impl Fence {
     ///
     /// # Safety
     /// The caller must own a reference to the dma_fence, which is transferred to the new object.
-    pub(crate) unsafe fn from_raw(ptr: *mut bindings::dma_fence) -> Fence {
+    pub unsafe fn from_raw(ptr: *mut bindings::dma_fence) -> Fence {
         Fence { ptr }
     }
 
