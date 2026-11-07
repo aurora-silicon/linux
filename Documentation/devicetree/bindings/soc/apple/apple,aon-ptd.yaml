@@ -46,6 +46,10 @@ properties:
     description: Interrupt lines wired to the system interrupt controller.
     minItems: 32
     maxItems: 32
+  power-domains:
+    description: Physical power and combined clock-gate dependencies.
+    minItems: 1
+    maxItems: 8
 required:
   - compatible
   - reg

@@ -224,6 +224,10 @@ allOf:
               maxItems: 1
             "#iommu-cells":
               const: 1
+            power-domains:
+              description: Physical power and combined clock-gate dependencies.
+              minItems: 1
+              maxItems: 8
           required:
             - compatible
             - reg

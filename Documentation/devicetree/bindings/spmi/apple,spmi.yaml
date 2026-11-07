@@ -119,6 +119,13 @@ allOf:
                 Register apertures of the complete hardware complex, in hardware interface order.
               minItems: 3
               maxItems: 3
+            power-domains:
+              description: Physical power and combined clock-gate dependencies.
+              minItems: 1
+              maxItems: 8
+            interrupts:
+              description: Platform interrupt wired to the application processor.
+              maxItems: 1
           required:
             - compatible
             - reg
