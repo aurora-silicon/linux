@@ -20,6 +20,7 @@ properties:
       - const: apple,t8140-prores
       - items:
           - enum:
+              - apple,t6000-prores
               - apple,t6020-prores
               - apple,t6021-prores
               - apple,t6022-prores
