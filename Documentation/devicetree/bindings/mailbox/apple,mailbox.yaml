@@ -23,6 +23,11 @@ properties:
   compatible:
     oneOf:
       - description:
+          T8152 SMC post-office mailbox with counted FIFOs and interrupt
+          masking provided by the interrupt controller.
+        const: apple,t8152-smc-mailbox
+
+      - description:
           ASC mailboxes are the most common variant found on the M1 used
           for example for the display controller, the system management
           controller and the NVMe coprocessor.
@@ -132,6 +137,21 @@ allOf:
       properties:
         compatible:
           contains:
+            const: apple,t8152-smc-mailbox
+    then:
+      properties:
+        interrupts:
+          minItems: 2
+          maxItems: 2
+        interrupt-names:
+          items:
+            - const: send-empty
+            - const: recv-not-empty
+
+  - if:
+      properties:
+        compatible:
+          contains:
             const: apple,t8140-aop-setup-mailbox
     then:
       properties:
@@ -176,6 +196,7 @@ allOf:
                 - apple,t6021-ane-mailbox
                 - apple,t8112-ane-mailbox
                 - apple,t8140-aop-setup-mailbox
+                - apple,t8152-smc-mailbox
     then:
       properties:
         interrupts:

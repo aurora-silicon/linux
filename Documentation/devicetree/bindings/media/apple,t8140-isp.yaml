@@ -19,14 +19,18 @@ select:
   properties:
     compatible:
       contains:
-        const: apple,t8140-isp
+        enum:
+          - apple,t8140-isp
+          - apple,t8142-isp
   required:
     - compatible
 
 properties:
   compatible:
     items:
-      - const: apple,t8140-isp
+      - enum:
+          - apple,t8140-isp
+          - apple,t8142-isp
       - const: apple,isp
 
   reg:

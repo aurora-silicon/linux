@@ -28,6 +28,8 @@ properties:
       - apple,t6041-pmc
       - apple,t8132-pmc
       - apple,t8140-pmc
+      - apple,t8142-pmc
+      - apple,t8152-pmc
 
   reg:
     minItems: 2
@@ -228,6 +230,8 @@ patternProperties:
           - apple,t6041-clpc
           - apple,t8132-clpc
           - apple,t8140-clpc
+          - apple,t8142-clpc
+          - apple,t8152-clpc
 
       reg:
         maxItems: 1
