@@ -884,6 +884,48 @@ static void ane_h16_startup_restart_unpowered_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, s->quarantine_reads, 0U);
 }
 
+/*
+ * The boot after system sleep stalls too: its restarts come from a budget of
+ * their own, so a restart spent at bring-up does not use them up.
+ */
+static void ane_h16_resume_restart_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+	unsigned int used = 0;
+
+	sim_use_restart(s, 1, 2);
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), 0);
+	KUNIT_ASSERT_EQ(test, s->boot.restarts, 1U);
+	/* Cold boot after sleep (power cycle, scratch boot), then two stalls. */
+	s->stall_startups = 3;
+	KUNIT_ASSERT_EQ(test, ane_h16_restart(&s->boot), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_startup_restarting(&s->boot, &used, "resume"), 0);
+	KUNIT_EXPECT_EQ(test, used, 2U);
+	KUNIT_EXPECT_EQ(test, s->boot.restarts, 1U);
+	KUNIT_EXPECT_EQ(test, s->power_cycles, 4U);
+	KUNIT_EXPECT_EQ(test, s->command_count, 4U);
+	KUNIT_EXPECT_EQ(test, s->quarantines, 0U);
+}
+
+/* Past its budget, a stall after sleep is returned to the caller unquarantined. */
+static void ane_h16_resume_restart_budget_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+	unsigned int used = 0;
+
+	sim_use_restart(s, 0, 2);
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), 0);
+	s->stall_startups = 5;
+	KUNIT_ASSERT_EQ(test, ane_h16_restart(&s->boot), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_startup_restarting(&s->boot, &used, "resume"),
+			-ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, used, 2U);
+	KUNIT_EXPECT_EQ(test, s->power_cycles, 3U);
+	/* The backend's resume path quarantines; the helper leaves that to it. */
+	KUNIT_EXPECT_EQ(test, s->quarantines, 0U);
+	KUNIT_EXPECT_FALSE(test, s->boot.quarantined);
+}
+
 /* Without the op (or with no budget) a timeout ends the attempt, as before. */
 static void ane_h16_startup_no_budget_test(struct kunit *test)
 {
@@ -1152,6 +1194,8 @@ static struct kunit_case ane_h16_boot_cases[] = {
 	KUNIT_CASE(ane_h16_startup_restart_refused_test),
 	KUNIT_CASE(ane_h16_startup_restart_unpowered_test),
 	KUNIT_CASE(ane_h16_startup_no_budget_test),
+	KUNIT_CASE(ane_h16_resume_restart_test),
+	KUNIT_CASE(ane_h16_resume_restart_budget_test),
 	{}
 };
 

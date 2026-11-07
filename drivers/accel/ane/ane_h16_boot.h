@@ -703,6 +703,28 @@ static inline int ane_h16_restart(struct ane_h16_boot *b)
 }
 
 /*
+ * Run startup; after a timeout, restart the engine and run it again, at most
+ * b->max_restarts times in all against @used. The caller owns @used: one
+ * budget for bring-up, a fresh one for each boot after system sleep. Logs
+ * @what with the restart count and the budget.
+ */
+static inline int ane_h16_startup_restarting(struct ane_h16_boot *b,
+					     unsigned int *used,
+					     const char *what)
+{
+	int ret = ane_h16_startup(b);
+
+	while (ret == -ETIMEDOUT && b->ops->restart && *used < b->max_restarts) {
+		(*used)++;
+		b->ops->log(b->ctx, what, *used, b->max_restarts);
+		ret = ane_h16_restart(b);
+		if (!ret)
+			ret = ane_h16_startup(b);
+	}
+	return ret;
+}
+
+/*
  * Advance from the last completed stage to @stage. The program stage belongs
  * to the caller; here it runs startup. A stage at or below the completed one,
  * or any call after a failure, is refused.
@@ -742,16 +764,8 @@ static inline int ane_h16_run(struct ane_h16_boot *b, enum ane_h16_stage stage)
 			b->stage = ANE_H16_BOOT;
 	}
 	if (!ret && stage >= ANE_H16_STARTUP && b->stage < ANE_H16_STARTUP) {
-		ret = ane_h16_startup(b);
-		while (ret == -ETIMEDOUT && b->ops->restart &&
-		       b->restarts < b->max_restarts) {
-			b->restarts++;
-			b->ops->log(b->ctx, "startup restart/budget", b->restarts,
-				    b->max_restarts);
-			ret = ane_h16_restart(b);
-			if (!ret)
-				ret = ane_h16_startup(b);
-		}
+		ret = ane_h16_startup_restarting(b, &b->restarts,
+						 "startup restart/budget");
 		if (!ret)
 			b->stage = ANE_H16_STARTUP;
 	}

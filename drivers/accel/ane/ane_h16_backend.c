@@ -101,6 +101,7 @@ struct ane_h16_device {
 	bool engine_on;
 	u64 resume_first_ns;
 	unsigned int resume_replayed;
+	unsigned int resume_restarts;
 	bool resume_cold;
 	struct ane_h16_session session;
 	struct work_struct start;
@@ -442,7 +443,9 @@ static int ane_h16_power_cycle(struct ane_h16_device *h, bool verify)
  * again, then booted from the preload as at bring-up (pristine DATA, heap
  * tail, pool, IPC and heap cleared and reused, RTKit restarted, 0x29 at
  * startup), the shared allocations carried over, and every open program
- * replayed behind its handle.
+ * replayed behind its handle. The firmware can stop part way through this
+ * startup as it does at bring-up; it gets the same bounded, verified restart,
+ * with a budget of its own for each wake.
  */
 static int ane_h16_cold_boot(struct ane_h16_device *h)
 {
@@ -461,7 +464,8 @@ static int ane_h16_cold_boot(struct ane_h16_device *h)
 		ane_fw_transport_carry_shared(&b->transport, old);
 	kfree(old);
 	if (!ret)
-		ret = ane_h16_startup(b);
+		ret = ane_h16_startup_restarting(b, &h->resume_restarts,
+						 "resume restart/budget");
 	if (ret)
 		return ret;
 	h->resume_ready_ns = ktime_get_ns();
@@ -530,6 +534,7 @@ static void ane_h16_sleep_resume(struct ane_h16_device *h)
 	h->resume_first_ns = 0;
 	h->resume_replayed = 0;
 	h->resume_cold = !h->boot.soc->sleep_warm;
+	h->resume_restarts = 0;
 	if (h->resume_cold) {
 		ret = ane_h16_cold_boot(h);
 	} else {
@@ -554,9 +559,10 @@ static void ane_h16_sleep_resume(struct ane_h16_device *h)
 	ready = h->resume_ready_ns ? div_u64(h->resume_ready_ns - start, NSEC_PER_MSEC) : -1;
 	first = h->resume_first_ns ? div_u64(h->resume_first_ns - start, NSEC_PER_MSEC) : -1;
 	dev_info(h->dev,
-		 "H16 ANE: resume %s: %s, firmware ready %lld ms, first program ready %lld ms, node reopened %llu ms, %u programs replayed\n",
+		 "H16 ANE: resume %s: %s, firmware ready %lld ms, first program ready %lld ms, node reopened %llu ms, %u programs replayed, %u restarts\n",
 		 ret ? "FAILED" : "ok", h->resume_cold ? "cold" : "warm", ready, first,
-		 div_u64(ktime_get_ns() - start, NSEC_PER_MSEC), h->resume_replayed);
+		 div_u64(ktime_get_ns() - start, NSEC_PER_MSEC), h->resume_replayed,
+		 h->resume_restarts);
 }
 
 static int ane_h16_pm_event(struct notifier_block *nb, unsigned long event, void *unused)
