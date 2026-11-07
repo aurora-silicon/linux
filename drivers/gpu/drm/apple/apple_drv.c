@@ -43,6 +43,7 @@
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 #include <drm/drm_fixed.h>
+#include <linux/pm.h>
 
 #include "apple_boot_display.h"
 #include "apple_resume.h"
@@ -69,14 +70,17 @@ struct apple_drm_private {
 static DEFINE_MUTEX(apple_g15_display_lock);
 static struct device *apple_t6030_display;
 static struct device *apple_t6031_display;
+static struct device *apple_t8132_display;
 
-/* The publication slot of a G15 SoC's internal display subsystem, or NULL. */
+/* The publication slot of a G15/G16 SoC's internal display subsystem, or NULL. */
 static struct device **apple_g15_display_slot(struct device *dev)
 {
 	if (of_device_is_compatible(dev->of_node, "apple,t6030-display-subsystem"))
 		return &apple_t6030_display;
 	if (of_device_is_compatible(dev->of_node, "apple,t6031-display-subsystem"))
 		return &apple_t6031_display;
+	if (of_device_is_compatible(dev->of_node, "apple,t8132-display-subsystem"))
+		return &apple_t8132_display;
 	return NULL;
 }
 
@@ -109,7 +113,7 @@ static void apple_g15_display_withdraw(struct device *dev)
 	put_device(old);
 }
 
-/* Initial G15 firmware startup must follow successful native display setup.
+/* Initial G15/G16 firmware startup must follow successful native display setup.
  * The component's device lock does not serialize component bind/unbind, so
  * publish separately. This lock protects only publication and a device link;
  * no display calls or firmware RPC run while it is held.
@@ -143,6 +147,13 @@ int apple_drm_t6031_link_device(struct device *consumer)
 }
 EXPORT_SYMBOL_GPL(apple_drm_t6031_link_device);
 
+int apple_drm_t8132_link_device(struct device *consumer)
+{
+	return apple_g15_link_device(consumer, "apple,t8132", "apple,agx-t8132",
+				     &apple_t8132_display);
+}
+EXPORT_SYMBOL_GPL(apple_drm_t8132_link_device);
+
 DEFINE_DRM_GEM_DMA_FOPS(apple_fops);
 
 #define DART_PAGE_SIZE 16384
@@ -169,9 +180,12 @@ static int apple_drm_fbdev_probe(struct drm_fb_helper *helper,
 		if (t8132_ext_crtc(crtc))
 			continue;
 		dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
-		if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
-		    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
-			/* H17P applies the stored fourth byte as straight alpha. */
+		if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+			/*
+			 * H17P applies the stored fourth byte as straight alpha,
+			 * the H17G (M5) profile too: an XRGB console with X = 0
+			 * stays black. ARGB makes fbcon write it opaque.
+			 */
 			sizes->surface_bpp = 32;
 			sizes->surface_depth = 32;
 			break;
@@ -914,6 +928,8 @@ static int apple_probe_per_dcp(struct device *dev,
 			planes[zpos] = apple_plane_init(drm, 1U << num, surf,
 							supports_l10r,
 							supports_xrgb2101010,
+							dcp_data->hw.iomfb_method_profile ==
+								DCP_IOMFB_METHODS_H17G,
 							plane_type, interchange,
 							supports_premultiplied);
 		}
@@ -1634,18 +1650,29 @@ static int apple_platform_probe(struct platform_device *pdev)
 {
 	struct device *mdev = &pdev->dev;
 	struct component_match *match = NULL;
-	int num_dcp;
+	int num_dcp, ret;
 
 	/* add DCP components, handle less than 1 as probe error */
 	num_dcp = add_dcp_components(mdev, &match);
 	if (num_dcp < 1)
 		return -ENODEV;
 
-	return component_master_add_with_match(mdev, &apple_drm_ops, match);
+	ret = component_master_add_with_match(mdev, &apple_drm_ops, match);
+	if (ret)
+		return ret;
+
+	/*
+	 * The display restores its own state across system sleep, so the PM
+	 * core need not switch to the text console first (which flashes the
+	 * kernel log on screen on every suspend and resume).
+	 */
+	pm_vt_switch_required(mdev, false);
+	return 0;
 }
 
 static void apple_platform_remove(struct platform_device *pdev)
 {
+	pm_vt_switch_unregister(&pdev->dev);
 	component_master_del(&pdev->dev, &apple_drm_ops);
 }
 

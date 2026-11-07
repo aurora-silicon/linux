@@ -17,6 +17,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/pm_wakeup.h>
 #include <linux/reset.h>
+#include <linux/soc/apple/t8132.h>
 #include <linux/soc/apple/tunable.h>
 #include <linux/usb/phy.h>
 
@@ -326,7 +327,7 @@ static void dwc3_apple_set_ptrcap(struct dwc3_apple *appledwc, u32 mode)
 static bool dwc3_apple_host_before_core_init(struct dwc3_apple *appledwc,
 					     enum dwc3_apple_state state)
 {
-	return state == DWC3_APPLE_HOST && of_machine_is_compatible("apple,j713") &&
+	return state == DWC3_APPLE_HOST && apple_t8132_usb_host_first() &&
 		of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3");
 }
 
@@ -942,10 +943,11 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	/*
 	 * Until the first cable there is no core to keep powered: let the controller
 	 * runtime-suspend, and its DARTs with it, so that its power domain can drop.
-	 * Tested on T8132 only.
+	 * Tested on T8132; on the T6041 (M4 Max) the never-plugged ports are the usual case.
 	 */
 	if (appledwc->idle_rpm && !appledwc->fixed_hub &&
-	    of_device_is_compatible(dev->of_node, "apple,t8132-dwc3")) {
+	    (of_device_is_compatible(dev->of_node, "apple,t8132-dwc3") ||
+	     of_machine_is_compatible("apple,t6041"))) {
 		pm_runtime_set_active(dev);
 		pm_runtime_enable(dev);
 		appledwc->pre_core_rpm = true;

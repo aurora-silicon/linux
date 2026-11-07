@@ -1,0 +1,861 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Hardware resources retained for devices without a qualified OS handoff. */
+
+&{/soc} {
+	mcc: memory-controller@200100000 {
+		compatible = "apple,t8103-mcc", "apple,mcc";
+		reg = <0x2 0x00100000 0x0 0x100000>,
+		      <0x2 0x00000000 0x0 0x100000>,
+		      <0x2 0x00200000 0x0 0x200000>;
+		status = "disabled";
+	};
+
+
+	mtrtempsensor8: temperature-sensor@210ee4000 {
+		compatible = "apple,t8103-die-temperature-sensor", "apple,die-temperature-sensor";
+		reg = <0x2 0x10ee4000 0x0 0x4>,
+		      <0x2 0x10ee1014 0x0 0x4>,
+		      <0x2 0x10ee1018 0x0 0x4>,
+		      <0x2 0x10ee101c 0x0 0x4>,
+		      <0x2 0x10ee1020 0x0 0x4>,
+		      <0x2 0x10ee1004 0x0 0x4>,
+		      <0x2 0x10ee1000 0x0 0x4>,
+		      <0x2 0x10ee1160 0x0 0x4>,
+		      <0x2 0x10ee115c 0x0 0x4>,
+		      <0x2 0x10ee1168 0x0 0x4>,
+		      <0x2 0x10ee1164 0x0 0x4>,
+		      <0x2 0x10ee4004 0x0 0x4>,
+		      <0x2 0x10ee1010 0x0 0x4>,
+		      <0x2 0x10ee100c 0x0 0x4>,
+		      <0x2 0x10ee1008 0x0 0x4>;
+		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
+		status = "disabled";
+	};
+
+	mtrtempsensor9: temperature-sensor@210ee4600 {
+		compatible = "apple,t8103-die-temperature-sensor", "apple,die-temperature-sensor";
+		reg = <0x2 0x10ee4600 0x0 0x4>,
+		      <0x2 0x10ee1614 0x0 0x4>,
+		      <0x2 0x10ee1618 0x0 0x4>,
+		      <0x2 0x10ee161c 0x0 0x4>,
+		      <0x2 0x10ee1620 0x0 0x4>,
+		      <0x2 0x10ee1604 0x0 0x4>,
+		      <0x2 0x10ee1600 0x0 0x4>,
+		      <0x2 0x10ee1760 0x0 0x4>,
+		      <0x2 0x10ee175c 0x0 0x4>,
+		      <0x2 0x10ee1768 0x0 0x4>,
+		      <0x2 0x10ee1764 0x0 0x4>,
+		      <0x2 0x10ee4604 0x0 0x4>,
+		      <0x2 0x10ee1610 0x0 0x4>,
+		      <0x2 0x10ee160c 0x0 0x4>,
+		      <0x2 0x10ee1608 0x0 0x4>;
+		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
+		status = "disabled";
+	};
+
+	mtrtempsensor10: temperature-sensor@211ee4400 {
+		compatible = "apple,t8103-die-temperature-sensor", "apple,die-temperature-sensor";
+		reg = <0x2 0x11ee4400 0x0 0x4>,
+		      <0x2 0x11ee1414 0x0 0x4>,
+		      <0x2 0x11ee1418 0x0 0x4>,
+		      <0x2 0x11ee141c 0x0 0x4>,
+		      <0x2 0x11ee1420 0x0 0x4>,
+		      <0x2 0x11ee1404 0x0 0x4>,
+		      <0x2 0x11ee1400 0x0 0x4>,
+		      <0x2 0x11ee1560 0x0 0x4>,
+		      <0x2 0x11ee155c 0x0 0x4>,
+		      <0x2 0x11ee1568 0x0 0x4>,
+		      <0x2 0x11ee1564 0x0 0x4>,
+		      <0x2 0x11ee4404 0x0 0x4>,
+		      <0x2 0x11ee1410 0x0 0x4>,
+		      <0x2 0x11ee140c 0x0 0x4>,
+		      <0x2 0x11ee1408 0x0 0x4>;
+		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
+		status = "disabled";
+	};
+
+	mtrtempsensor11: temperature-sensor@211ee4600 {
+		compatible = "apple,t8103-die-temperature-sensor", "apple,die-temperature-sensor";
+		reg = <0x2 0x11ee4600 0x0 0x4>,
+		      <0x2 0x11ee1614 0x0 0x4>,
+		      <0x2 0x11ee1618 0x0 0x4>,
+		      <0x2 0x11ee161c 0x0 0x4>,
+		      <0x2 0x11ee1620 0x0 0x4>,
+		      <0x2 0x11ee1604 0x0 0x4>,
+		      <0x2 0x11ee1600 0x0 0x4>,
+		      <0x2 0x11ee1760 0x0 0x4>,
+		      <0x2 0x11ee175c 0x0 0x4>,
+		      <0x2 0x11ee1768 0x0 0x4>,
+		      <0x2 0x11ee1764 0x0 0x4>,
+		      <0x2 0x11ee4604 0x0 0x4>,
+		      <0x2 0x11ee1610 0x0 0x4>,
+		      <0x2 0x11ee160c 0x0 0x4>,
+		      <0x2 0x11ee1608 0x0 0x4>;
+		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
+		status = "disabled";
+	};
+
+	mtrtempsensor12: temperature-sensor@211ee4800 {
+		compatible = "apple,t8103-die-temperature-sensor", "apple,die-temperature-sensor";
+		reg = <0x2 0x11ee4800 0x0 0x4>,
+		      <0x2 0x11ee1814 0x0 0x4>,
+		      <0x2 0x11ee1818 0x0 0x4>,
+		      <0x2 0x11ee181c 0x0 0x4>,
+		      <0x2 0x11ee1820 0x0 0x4>,
+		      <0x2 0x11ee1804 0x0 0x4>,
+		      <0x2 0x11ee1800 0x0 0x4>,
+		      <0x2 0x11ee1960 0x0 0x4>,
+		      <0x2 0x11ee195c 0x0 0x4>,
+		      <0x2 0x11ee1968 0x0 0x4>,
+		      <0x2 0x11ee1964 0x0 0x4>,
+		      <0x2 0x11ee4804 0x0 0x4>,
+		      <0x2 0x11ee1810 0x0 0x4>,
+		      <0x2 0x11ee180c 0x0 0x4>,
+		      <0x2 0x11ee1808 0x0 0x4>;
+		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
+		status = "disabled";
+	};
+
+	mtrtempsensor13: temperature-sensor@211eec000 {
+		compatible = "apple,t8103-die-temperature-sensor", "apple,die-temperature-sensor";
+		reg = <0x2 0x11eec000 0x0 0x4>,
+		      <0x2 0x11ee9014 0x0 0x4>,
+		      <0x2 0x11ee9018 0x0 0x4>,
+		      <0x2 0x11ee901c 0x0 0x4>,
+		      <0x2 0x11ee9020 0x0 0x4>,
+		      <0x2 0x11ee9004 0x0 0x4>,
+		      <0x2 0x11ee9000 0x0 0x4>,
+		      <0x2 0x11ee9160 0x0 0x4>,
+		      <0x2 0x11ee915c 0x0 0x4>,
+		      <0x2 0x11ee9168 0x0 0x4>,
+		      <0x2 0x11ee9164 0x0 0x4>,
+		      <0x2 0x11eec004 0x0 0x4>,
+		      <0x2 0x11ee9010 0x0 0x4>,
+		      <0x2 0x11ee900c 0x0 0x4>,
+		      <0x2 0x11ee9008 0x0 0x4>;
+		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
+		status = "disabled";
+	};
+
+	mtrtempsensor14: temperature-sensor@211ef4200 {
+		compatible = "apple,t8103-die-temperature-sensor", "apple,die-temperature-sensor";
+		reg = <0x2 0x11ef4200 0x0 0x4>,
+		      <0x2 0x11ef1214 0x0 0x4>,
+		      <0x2 0x11ef1218 0x0 0x4>,
+		      <0x2 0x11ef121c 0x0 0x4>,
+		      <0x2 0x11ef1220 0x0 0x4>,
+		      <0x2 0x11ef1204 0x0 0x4>,
+		      <0x2 0x11ef1200 0x0 0x4>,
+		      <0x2 0x11ef1360 0x0 0x4>,
+		      <0x2 0x11ef135c 0x0 0x4>,
+		      <0x2 0x11ef1368 0x0 0x4>,
+		      <0x2 0x11ef1364 0x0 0x4>,
+		      <0x2 0x11ef4204 0x0 0x4>,
+		      <0x2 0x11ef1210 0x0 0x4>,
+		      <0x2 0x11ef120c 0x0 0x4>,
+		      <0x2 0x11ef1208 0x0 0x4>;
+		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
+		status = "disabled";
+	};
+
+	mtrtempsensor15: temperature-sensor@211ef4400 {
+		compatible = "apple,t8103-die-temperature-sensor", "apple,die-temperature-sensor";
+		reg = <0x2 0x11ef4400 0x0 0x4>,
+		      <0x2 0x11ef1414 0x0 0x4>,
+		      <0x2 0x11ef1418 0x0 0x4>,
+		      <0x2 0x11ef141c 0x0 0x4>,
+		      <0x2 0x11ef1420 0x0 0x4>,
+		      <0x2 0x11ef1404 0x0 0x4>,
+		      <0x2 0x11ef1400 0x0 0x4>,
+		      <0x2 0x11ef1560 0x0 0x4>,
+		      <0x2 0x11ef155c 0x0 0x4>,
+		      <0x2 0x11ef1568 0x0 0x4>,
+		      <0x2 0x11ef1564 0x0 0x4>,
+		      <0x2 0x11ef4404 0x0 0x4>,
+		      <0x2 0x11ef1410 0x0 0x4>,
+		      <0x2 0x11ef140c 0x0 0x4>,
+		      <0x2 0x11ef1408 0x0 0x4>;
+		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
+		status = "disabled";
+	};
+
+	mtrtempsensor16: temperature-sensor@211ef4600 {
+		compatible = "apple,t8103-die-temperature-sensor", "apple,die-temperature-sensor";
+		reg = <0x2 0x11ef4600 0x0 0x4>,
+		      <0x2 0x11ef1614 0x0 0x4>,
+		      <0x2 0x11ef1618 0x0 0x4>,
+		      <0x2 0x11ef161c 0x0 0x4>,
+		      <0x2 0x11ef1620 0x0 0x4>,
+		      <0x2 0x11ef1604 0x0 0x4>,
+		      <0x2 0x11ef1600 0x0 0x4>,
+		      <0x2 0x11ef1760 0x0 0x4>,
+		      <0x2 0x11ef175c 0x0 0x4>,
+		      <0x2 0x11ef1768 0x0 0x4>,
+		      <0x2 0x11ef1764 0x0 0x4>,
+		      <0x2 0x11ef4604 0x0 0x4>,
+		      <0x2 0x11ef1610 0x0 0x4>,
+		      <0x2 0x11ef160c 0x0 0x4>,
+		      <0x2 0x11ef1608 0x0 0x4>;
+		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
+		status = "disabled";
+	};
+
+	aes: crypto@23500c000 {
+		compatible = "apple,t8103-aes", "apple,aes";
+		reg = <0x2 0x3500c000 0x0 0x4000>,
+		      <0x2 0x3d2d0000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 625 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_aes>;
+		iommus = <&sio_dart 1>;
+		status = "disabled";
+	};
+
+	pwm0: pwm@235040000 {
+		compatible = "apple,t8103-pwm", "apple,pwm";
+		reg = <0x2 0x35040000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 632 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_fpwm0>;
+		status = "disabled";
+	};
+
+	spi4: spi@235110000 {
+		compatible = "apple,t8103-spi", "apple,spi";
+		reg = <0x2 0x35110000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 618 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_spi4>;
+		clocks = <&peripheral_clocks 380>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	aic_timebase: timer@23b108000 {
+		compatible = "apple,t8103-aic-timebase", "apple,aic-timebase";
+		reg = <0x2 0x3b108000 0x0 0x1000>;
+		status = "disabled";
+	};
+
+	dwi: bus-controller@23b200000 {
+		compatible = "apple,t8103-dwi", "apple,dwi";
+		reg = <0x2 0x3b200000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 4 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dwi>;
+		status = "disabled";
+	};
+
+	mtrtempsensor3: temperature-sensor@23b284000 {
+		compatible = "apple,t8103-die-temperature-sensor", "apple,die-temperature-sensor";
+		reg = <0x2 0x3b284000 0x0 0x4>,
+		      <0x2 0x3b281014 0x0 0x4>,
+		      <0x2 0x3b281018 0x0 0x4>,
+		      <0x2 0x3b28101c 0x0 0x4>,
+		      <0x2 0x3b281020 0x0 0x4>,
+		      <0x2 0x3b281004 0x0 0x4>,
+		      <0x2 0x3b281000 0x0 0x4>,
+		      <0x2 0x3b281160 0x0 0x4>,
+		      <0x2 0x3b28115c 0x0 0x4>,
+		      <0x2 0x3b281168 0x0 0x4>,
+		      <0x2 0x3b281164 0x0 0x4>,
+		      <0x2 0x3b284004 0x0 0x4>,
+		      <0x2 0x3b281010 0x0 0x4>,
+		      <0x2 0x3b28100c 0x0 0x4>,
+		      <0x2 0x3b281008 0x0 0x4>;
+		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
+		status = "disabled";
+	};
+
+	mtrtempsensor4: temperature-sensor@23b284200 {
+		compatible = "apple,t8103-die-temperature-sensor", "apple,die-temperature-sensor";
+		reg = <0x2 0x3b284200 0x0 0x4>,
+		      <0x2 0x3b281214 0x0 0x4>,
+		      <0x2 0x3b281218 0x0 0x4>,
+		      <0x2 0x3b28121c 0x0 0x4>,
+		      <0x2 0x3b281220 0x0 0x4>,
+		      <0x2 0x3b281204 0x0 0x4>,
+		      <0x2 0x3b281200 0x0 0x4>,
+		      <0x2 0x3b281360 0x0 0x4>,
+		      <0x2 0x3b28135c 0x0 0x4>,
+		      <0x2 0x3b281368 0x0 0x4>,
+		      <0x2 0x3b281364 0x0 0x4>,
+		      <0x2 0x3b284204 0x0 0x4>,
+		      <0x2 0x3b281210 0x0 0x4>,
+		      <0x2 0x3b28120c 0x0 0x4>,
+		      <0x2 0x3b281208 0x0 0x4>;
+		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
+		status = "disabled";
+	};
+
+	mtrtempsensor5: temperature-sensor@23b284400 {
+		compatible = "apple,t8103-die-temperature-sensor", "apple,die-temperature-sensor";
+		reg = <0x2 0x3b284400 0x0 0x4>,
+		      <0x2 0x3b281414 0x0 0x4>,
+		      <0x2 0x3b281418 0x0 0x4>,
+		      <0x2 0x3b28141c 0x0 0x4>,
+		      <0x2 0x3b281420 0x0 0x4>,
+		      <0x2 0x3b281404 0x0 0x4>,
+		      <0x2 0x3b281400 0x0 0x4>,
+		      <0x2 0x3b281560 0x0 0x4>,
+		      <0x2 0x3b28155c 0x0 0x4>,
+		      <0x2 0x3b281568 0x0 0x4>,
+		      <0x2 0x3b281564 0x0 0x4>,
+		      <0x2 0x3b284404 0x0 0x4>,
+		      <0x2 0x3b281410 0x0 0x4>,
+		      <0x2 0x3b28140c 0x0 0x4>,
+		      <0x2 0x3b281408 0x0 0x4>;
+		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
+		status = "disabled";
+	};
+
+	mtrtempsensor6: temperature-sensor@23b29c200 {
+		compatible = "apple,t8103-die-temperature-sensor", "apple,die-temperature-sensor";
+		reg = <0x2 0x3b29c200 0x0 0x4>,
+		      <0x2 0x3b299214 0x0 0x4>,
+		      <0x2 0x3b299218 0x0 0x4>,
+		      <0x2 0x3b29921c 0x0 0x4>,
+		      <0x2 0x3b299220 0x0 0x4>,
+		      <0x2 0x3b299204 0x0 0x4>,
+		      <0x2 0x3b299200 0x0 0x4>,
+		      <0x2 0x3b299360 0x0 0x4>,
+		      <0x2 0x3b29935c 0x0 0x4>,
+		      <0x2 0x3b299368 0x0 0x4>,
+		      <0x2 0x3b299364 0x0 0x4>,
+		      <0x2 0x3b29c204 0x0 0x4>,
+		      <0x2 0x3b299210 0x0 0x4>,
+		      <0x2 0x3b29920c 0x0 0x4>,
+		      <0x2 0x3b299208 0x0 0x4>;
+		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
+		status = "disabled";
+	};
+
+	mtrtempsensor7: temperature-sensor@23b2a4000 {
+		compatible = "apple,t8103-die-temperature-sensor", "apple,die-temperature-sensor";
+		reg = <0x2 0x3b2a4000 0x0 0x4>,
+		      <0x2 0x3b2a1014 0x0 0x4>,
+		      <0x2 0x3b2a1018 0x0 0x4>,
+		      <0x2 0x3b2a101c 0x0 0x4>,
+		      <0x2 0x3b2a1020 0x0 0x4>,
+		      <0x2 0x3b2a1004 0x0 0x4>,
+		      <0x2 0x3b2a1000 0x0 0x4>,
+		      <0x2 0x3b2a1160 0x0 0x4>,
+		      <0x2 0x3b2a115c 0x0 0x4>,
+		      <0x2 0x3b2a1168 0x0 0x4>,
+		      <0x2 0x3b2a1164 0x0 0x4>,
+		      <0x2 0x3b2a4004 0x0 0x4>,
+		      <0x2 0x3b2a1010 0x0 0x4>,
+		      <0x2 0x3b2a100c 0x0 0x4>,
+		      <0x2 0x3b2a1008 0x0 0x4>;
+		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1-clr", "ctl1-set", "ctl2-clr", "ctl2-set", "readbk1", "readcnt", "readsum", "status";
+		status = "disabled";
+	};
+
+	mtrtempsensor17: temperature-sensor@23b2e0200 {
+		compatible = "apple,t8103-die-temperature-sensor", "apple,die-temperature-sensor";
+		reg = <0x2 0x3b2e0200 0x0 0x4>,
+		      <0x2 0x3b2e0204 0x0 0x4>;
+		reg-names = "readbk", "readbk1";
+		status = "disabled";
+	};
+
+	mtrtempsensor18: temperature-sensor@23b2e0c00 {
+		compatible = "apple,t8103-die-temperature-sensor", "apple,die-temperature-sensor";
+		reg = <0x2 0x3b2e0c00 0x0 0x4>,
+		      <0x2 0x3b2e0c04 0x0 0x4>;
+		reg-names = "readbk", "readbk1";
+		status = "disabled";
+	};
+
+	tempsensor0: temperature-sensor@23b2e4000 {
+		compatible = "apple,t8103-die-temperature-sensor", "apple,die-temperature-sensor";
+		reg = <0x2 0x3b2e4000 0x0 0x4>,
+		      <0x2 0x3b2c405c 0x0 0x4>,
+		      <0x2 0x3b2c4060 0x0 0x4>,
+		      <0x2 0x3b2c4064 0x0 0x4>,
+		      <0x2 0x3b2c4068 0x0 0x4>,
+		      <0x2 0x3b2c4004 0x0 0x4>,
+		      <0x2 0x3b2c4000 0x0 0x4>,
+		      <0x2 0x3b2c4008 0x0 0x4>,
+		      <0x2 0x3b2c400c 0x0 0x4>,
+		      <0x2 0x3b2c409c 0x0 0x4>,
+		      <0x2 0x3b2c4098 0x0 0x4>,
+		      <0x2 0x3b2c40a4 0x0 0x4>,
+		      <0x2 0x3b2c40a0 0x0 0x4>,
+		      <0x2 0x3b2e4004 0x0 0x4>,
+		      <0x2 0x3b2c4058 0x0 0x4>,
+		      <0x2 0x3b2c4054 0x0 0x4>,
+		      <0x2 0x3b2c4010 0x0 0x4>;
+		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1", "ctl2", "ctl3-clr", "ctl3-set", "ctl4-clr", "ctl4-set", "readbk1", "readcnt", "readsum", "status";
+		status = "disabled";
+	};
+
+	tempsensor1: temperature-sensor@23b2e8000 {
+		compatible = "apple,t8103-die-temperature-sensor", "apple,die-temperature-sensor";
+		reg = <0x2 0x3b2e8000 0x0 0x4>,
+		      <0x2 0x3b2c805c 0x0 0x4>,
+		      <0x2 0x3b2c8060 0x0 0x4>,
+		      <0x2 0x3b2c8064 0x0 0x4>,
+		      <0x2 0x3b2c8068 0x0 0x4>,
+		      <0x2 0x3b2c8004 0x0 0x4>,
+		      <0x2 0x3b2c8000 0x0 0x4>,
+		      <0x2 0x3b2c8008 0x0 0x4>,
+		      <0x2 0x3b2c800c 0x0 0x4>,
+		      <0x2 0x3b2c809c 0x0 0x4>,
+		      <0x2 0x3b2c8098 0x0 0x4>,
+		      <0x2 0x3b2c80a4 0x0 0x4>,
+		      <0x2 0x3b2c80a0 0x0 0x4>,
+		      <0x2 0x3b2e8004 0x0 0x4>,
+		      <0x2 0x3b2c8058 0x0 0x4>,
+		      <0x2 0x3b2c8054 0x0 0x4>,
+		      <0x2 0x3b2c8010 0x0 0x4>;
+		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1", "ctl2", "ctl3-clr", "ctl3-set", "ctl4-clr", "ctl4-set", "readbk1", "readcnt", "readsum", "status";
+		status = "disabled";
+	};
+
+	tempsensor2: temperature-sensor@23b2ec000 {
+		compatible = "apple,t8103-die-temperature-sensor", "apple,die-temperature-sensor";
+		reg = <0x2 0x3b2ec000 0x0 0x4>,
+		      <0x2 0x3b2cc05c 0x0 0x4>,
+		      <0x2 0x3b2cc060 0x0 0x4>,
+		      <0x2 0x3b2cc064 0x0 0x4>,
+		      <0x2 0x3b2cc068 0x0 0x4>,
+		      <0x2 0x3b2cc004 0x0 0x4>,
+		      <0x2 0x3b2cc000 0x0 0x4>,
+		      <0x2 0x3b2cc008 0x0 0x4>,
+		      <0x2 0x3b2cc00c 0x0 0x4>,
+		      <0x2 0x3b2cc09c 0x0 0x4>,
+		      <0x2 0x3b2cc098 0x0 0x4>,
+		      <0x2 0x3b2cc0a4 0x0 0x4>,
+		      <0x2 0x3b2cc0a0 0x0 0x4>,
+		      <0x2 0x3b2ec004 0x0 0x4>,
+		      <0x2 0x3b2cc058 0x0 0x4>,
+		      <0x2 0x3b2cc054 0x0 0x4>,
+		      <0x2 0x3b2cc010 0x0 0x4>;
+		reg-names = "readbk", "alarm0", "alarm1", "alarm2", "alarm3", "ctl0-clr", "ctl0-set", "ctl1", "ctl2", "ctl3-clr", "ctl3-set", "ctl4-clr", "ctl4-set", "readbk1", "readcnt", "readsum", "status";
+		status = "disabled";
+	};
+
+	pmp_dart: iommu@23b300000 {
+		compatible = "apple,t8103-dart";
+		reg = <0x2 0x3b300000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 515 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	pmp: coprocessor@23bc00000 {
+		compatible = "apple,t8103-pmp", "apple,pmp";
+		reg = <0x2 0x3bc00000 0x0 0x60000>,
+		      <0x2 0x3b850000 0x0 0x200000>,
+		      <0x2 0x3b500000 0x0 0x80000>,
+		      <0x2 0x00024000 0x0 0x4000>,
+		      <0x2 0x00064000 0x0 0x4000>,
+		      <0x2 0x000a4000 0x0 0x4000>,
+		      <0x2 0x000e4000 0x0 0x4000>,
+		      <0x2 0x00158000 0x0 0x4000>,
+		      <0x2 0x00204000 0x0 0x4000>,
+		      <0x2 0x00244000 0x0 0x4000>,
+		      <0x2 0x00284000 0x0 0x4000>,
+		      <0x2 0x002c4000 0x0 0x4000>,
+		      <0x2 0x04d10000 0x0 0x4000>,
+		      <0x2 0x10058000 0x0 0x4000>,
+		      <0x2 0x10158000 0x0 0x4000>,
+		      <0x2 0x10258000 0x0 0x4000>,
+		      <0x2 0x10358000 0x0 0x4000>,
+		      <0x2 0x10e20000 0x0 0x60000>,
+		      <0x2 0x10e48000 0x0 0x4000>,
+		      <0x2 0x11058000 0x0 0x4000>,
+		      <0x2 0x11158000 0x0 0x4000>,
+		      <0x2 0x11258000 0x0 0x4000>,
+		      <0x2 0x11358000 0x0 0x4000>,
+		      <0x2 0x11e20000 0x0 0x60000>,
+		      <0x2 0x11e48000 0x0 0x4000>,
+		      <0x2 0x3d100000 0x0 0x14000>,
+		      <0x2 0x3d128000 0x0 0x30000>,
+		      <0x2 0x3d0d8000 0x0 0x4000>,
+		      <0x2 0x6b90c000 0x0 0x4000>,
+		      <0x2 0x00170000 0x0 0x4000>,
+		      <0x2 0x3c100000 0x0 0x4000>,
+		      <0x2 0x04e20000 0x0 0x4000>,
+		      <0x2 0x11ee0000 0x0 0x8000>,
+		      <0x2 0x11ee8000 0x0 0x8000>,
+		      <0x2 0x11ef0000 0x0 0x8000>,
+		      <0x2 0x10ee0000 0x0 0x8000>,
+		      <0x2 0x04d80000 0x0 0x8000>;
+		power-domains = <&ps_pmp>, <&ps_pms_sram>;
+		iommus = <&pmp_dart 0>;
+		mboxes = <&pmp_mbox>;
+		mbox-names = "mbox";
+		status = "disabled";
+	};
+
+	pmp_mbox: mailbox@23bc08000 {
+		compatible = "apple,t8103-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x2 0x3bc08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 511 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 512 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 513 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 514 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_pmp>, <&ps_pms_sram>;
+		#mbox-cells = <0>;
+		interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+		status = "disabled";
+	};
+
+	nub_spmi1: spmi@23d0e1300 {
+		compatible = "apple,t8103-spmi", "apple,spmi";
+		reg = <0x2 0x3d0e1300 0x0 0x100>,
+		      <0x2 0x3d0e0e00 0x0 0x100>,
+		      <0x2 0x3d0e0400 0x0 0x78>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 353 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		status = "disabled";
+	};
+
+	dockchannel_uart: fifo@23d10c000 {
+		compatible = "apple,t8103-dockchannel", "apple,dockchannel";
+		reg = <0x2 0x3d10c000 0x0 0x18>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 327 IRQ_TYPE_LEVEL_HIGH>;
+		reg-names = "irq";
+		ranges = <0 0x2 0x3d128000 0x10000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		status = "disabled";
+	};
+
+	aop_spmi1: spmi@24a829300 {
+		compatible = "apple,t8103-spmi", "apple,spmi";
+		reg = <0x2 0x4a829300 0x0 0x100>,
+		      <0x2 0x4a828e00 0x0 0x100>,
+		      <0x2 0x4a828400 0x0 0x78>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 319 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		status = "disabled";
+	};
+
+	scaler0: scaler@263000000 {
+		compatible = "apple,t8103-scaler", "apple,scaler";
+		reg = <0x2 0x63000000 0x0 0x28000>,
+		      <0x2 0x63210000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 599 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 601 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_msr>, <&ps_msr_ase_core>;
+		clocks = <&peripheral_clocks 365>;
+		iommus = <&scaler_dart 0>, <&scaler_dart 1>;
+		resets = <&ps_msr>;
+		status = "disabled";
+	};
+
+	scaler_dart: iommu@263200000 {
+		compatible = "apple,t8103-dart";
+		reg = <0x2 0x63200000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 600 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_msr>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	jpeg0: jpeg@265000000 {
+		compatible = "apple,t8103-jpeg", "apple,jpeg";
+		reg = <0x2 0x65000000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 591 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_jpg>;
+		clocks = <&peripheral_clocks 363>, <&peripheral_clocks 364>;
+		iommus = <&jpeg0_dart 0>;
+		status = "disabled";
+	};
+
+	jpeg0_dart: iommu@265004000 {
+		compatible = "apple,t8103-dart";
+		reg = <0x2 0x65004000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 592 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_jpg>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	jpeg1: jpeg@265008000 {
+		compatible = "apple,t8103-jpeg", "apple,jpeg";
+		reg = <0x2 0x65008000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 594 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_jpg>;
+		clocks = <&peripheral_clocks 363>, <&peripheral_clocks 364>;
+		iommus = <&jpeg1_dart 0>;
+		status = "disabled";
+	};
+
+	jpeg1_dart: iommu@26500c000 {
+		compatible = "apple,t8103-dart";
+		reg = <0x2 0x6500c000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 595 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_jpg>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	ave_dma: dma-controller@267020000 {
+		compatible = "apple,t8103-ave-dma", "apple,ave-dma";
+		reg = <0x2 0x67020000 0x0 0x4000>,
+		      <0x2 0x67044000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 557 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc_sys>;
+		status = "disabled";
+	};
+
+	ave_dart1: iommu@267030000 {
+		compatible = "apple,t8103-dart";
+		reg = <0x2 0x67030000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 557 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc_sys>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	ave_dart0: iommu@267040000 {
+		compatible = "apple,t8103-dart";
+		reg = <0x2 0x67040000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 557 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc_sys>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	ave: video-codec@267100000 {
+		compatible = "apple,t8103-ave", "apple,ave";
+		reg = <0x2 0x67100000 0x0 0x45c000>,
+		      <0x2 0x67050000 0x0 0x8000>,
+		      <0x2 0x67800000 0x0 0x800000>,
+		      <0x2 0x3b708000 0x0 0x4000>,
+		      <0x2 0x66000000 0x0 0x1000000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 560 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 554 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 553 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 556 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 555 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc_dma>, <&ps_venc_pipe4>, <&ps_venc_pipe5>, <&ps_venc_me0>, <&ps_venc_me1>;
+		clocks = <&peripheral_clocks 350>;
+		iommus = <&ave_dart0 0>, <&ave_dart1 0>;
+		reg-names = "codec", "mailbox", "coproc", "pmgr", "pio";
+		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
+		status = "disabled";
+	};
+
+	atc0_dpin0: displayport@381e50000 {
+		compatible = "apple,t8103-dpin", "apple,dpin";
+		reg = <0x3 0x81e50000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 807 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	atc0_dpin1: displayport@381e58000 {
+		compatible = "apple,t8103-dpin", "apple,dpin";
+		reg = <0x3 0x81e58000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 808 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	apciec0_piodma: dma-controller@3a2000000 {
+		compatible = "apple,t8103-pciec-piodma", "apple,pciec-piodma";
+		reg = <0x3 0xa2000000 0x0 0x4000>,
+		      <0x3 0xa2004000 0x0 0x4000>,
+		      <0x3 0xa2008000 0x0 0x4000>,
+		      <0x3 0xa0008000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 772 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&apciec0_dart 15>;
+		status = "disabled";
+	};
+
+	atc1_dpin0: displayport@501e50000 {
+		compatible = "apple,t8103-dpin", "apple,dpin";
+		reg = <0x5 0x01e50000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 887 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	atc1_dpin1: displayport@501e58000 {
+		compatible = "apple,t8103-dpin", "apple,dpin";
+		reg = <0x5 0x01e58000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 888 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	apciec1_piodma: dma-controller@522000000 {
+		compatible = "apple,t8103-pciec-piodma", "apple,pciec-piodma";
+		reg = <0x5 0x22000000 0x0 0x4000>,
+		      <0x5 0x22004000 0x0 0x4000>,
+		      <0x5 0x22008000 0x0 0x4000>,
+		      <0x5 0x20008000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 852 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&apciec1_dart 15>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	soc_errors: error-handler@200100000 {
+		compatible = "apple,t8103-error-handler", "apple,soc-error-handler";
+		reg = <0x2 0x00100000 0x0 0x100000>,
+		      <0x2 0x00000000 0x0 0x1000>,
+		      <0x2 0x0001c000 0x0 0xc000>,
+		      <0x2 0x00004000 0x0 0x14000>,
+		      <0x2 0x00040000 0x0 0x1000>,
+		      <0x2 0x0005c000 0x0 0xc000>,
+		      <0x2 0x00044000 0x0 0x14000>,
+		      <0x2 0x00080000 0x0 0x1000>,
+		      <0x2 0x0009c000 0x0 0xc000>,
+		      <0x2 0x00084000 0x0 0x14000>,
+		      <0x2 0x000c0000 0x0 0x1000>,
+		      <0x2 0x000dc000 0x0 0xc000>,
+		      <0x2 0x000c4000 0x0 0x14000>,
+		      <0x2 0x41440000 0x0 0x40000>,
+		      <0x2 0x41400000 0x0 0x40000>,
+		      <0x2 0x3b000000 0x0 0x70000>,
+		      <0x2 0x3b700000 0x0 0x8c000>,
+		      <0x2 0x00200000 0x0 0x200000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 203 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 257 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 258 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 210 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 213 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 216 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 219 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 222 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 225 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 228 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 231 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	soc_events: event-log@23b700000 {
+		compatible = "apple,t8103-event-log", "apple,soc-event-log";
+		reg = <0x2 0x3b700000 0x0 0x8c000>,
+		      <0x2 0x3d280000 0x0 0x74000>,
+		      <0x2 0x3b000000 0x0 0x70000>,
+		      <0x2 0x3d200000 0x0 0x80000>,
+		      <0x2 0x3b2c4000 0x0 0x4000>,
+		      <0x2 0x3b2c8000 0x0 0x4000>,
+		      <0x2 0x3b2cc000 0x0 0x4000>,
+		      <0x2 0x3b2c0000 0x0 0x4000>,
+		      <0x2 0x3b280000 0x0 0x8000>,
+		      <0x2 0x3b288000 0x0 0x8000>,
+		      <0x2 0x3b290000 0x0 0x8000>,
+		      <0x2 0x3b298000 0x0 0x8000>,
+		      <0x2 0x3b2a0000 0x0 0x8000>,
+		      <0x2 0x3b2a8000 0x0 0x8000>,
+		      <0x2 0x3b2b0000 0x0 0x8000>,
+		      <0x2 0x6b868000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 174 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 175 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 187 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 201 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 10 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 13 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 16 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 41 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 42 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 43 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 44 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 45 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 46 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 47 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 48 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 410 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+};
+
+&nub_spmi1 {
+	simetra: pmic@f {
+		compatible = "apple,simetra-pmic", "apple,spmi-nvmem";
+		reg = <0xf SPMI_USID>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	primary_spmi_monitor: spmi-monitor@23d0d8e00 {
+		compatible = "apple,t8103-spmi-monitor", "apple,spmi-monitor";
+		reg = <0x2 0x3d0d8e00 0x0 0x100>,
+		      <0x2 0x3d0d8400 0x0 0x78>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 343 IRQ_TYPE_LEVEL_HIGH>;
+		apple,controller = <&nub_spmi>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <0>;
+		status = "disabled";
+	};
+};
+
+&pmic1 {
+	battery_monitor: battery-monitor {
+		compatible = "apple,t8103-battery-monitor", "apple,battery-monitor";
+		interrupt-parent = <&primary_spmi_monitor>;
+		interrupts = <62 IRQ_TYPE_NONE>;
+		status = "disabled";
+	};
+};
+
+&aop_spmi1 {
+	stockholm: nfc@c {
+		compatible = "apple,t8103-stockholm-spmi", "apple,stockholm-spmi";
+		reg = <0xc SPMI_USID>;
+		interrupt-parent = <&aop_spmi1>;
+		interrupts = <160 IRQ_TYPE_NONE>,
+			     <161 IRQ_TYPE_NONE>,
+			     <162 IRQ_TYPE_NONE>,
+			     <163 IRQ_TYPE_NONE>,
+			     <164 IRQ_TYPE_NONE>,
+			     <165 IRQ_TYPE_NONE>,
+			     <166 IRQ_TYPE_NONE>;
+		status = "disabled";
+	};
+};
+
+/ {
+	peripheral_clocks: clock-controller {
+		compatible = "apple,t8103-pmgr-clocks", "apple,pmgr-clocks";
+		#clock-cells = <1>;
+		apple,pmgr = <&pmgr>;
+		status = "disabled";
+	};
+};
+
+&pmic1 {
+	interrupt-parent = <&primary_spmi_monitor>;
+	interrupts = <2 IRQ_TYPE_NONE>;
+};

@@ -15,6 +15,7 @@
 #include <linux/mfd/macsmc.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/soc/apple/t8132.h>
 
 #define MAX_GPIO 64
 
@@ -35,10 +36,11 @@
 #define MACSMC_J700_RADIO_REG_ON_HI	0x80000
 
 /*
- * J713 /amfm/function-reg_on is pKW4("gP13", 0x00800000). The firmware
- * function preserves the template's upper 16 bits and inserts the level
- * into its low 16 bits. This does not establish generic CMD_OUTPUT semantics,
- * a pin-mode command, or a readback operation for this line.
+ * On the J713, J715, J604 and J773g, /amfm/function-reg_on is
+ * pKW4("gP13", 0x00800000) (apple_t8132_managed_radio()). The firmware
+ * function preserves the template's upper 16 bits and inserts the level into
+ * its low 16 bits. This does not establish generic CMD_OUTPUT semantics, a
+ * pin-mode command, or a readback operation for this line.
  */
 #define MACSMC_J713_RADIO_REG_ON_GPIO	0x13
 #define MACSMC_J713_RADIO_REG_ON_TEMPLATE	0x00800000
@@ -106,6 +108,11 @@ struct macsmc_gpio {
 
 	bool j700_pcio;
 	DECLARE_BITMAP(j700_pcio_level, MAX_GPIO);
+	DECLARE_BITMAP(pcio_template_valid, MAX_GPIO);
+	u32 pcio_template_lo[MAX_GPIO];
+	u32 pcio_template_hi[MAX_GPIO];
+	DECLARE_BITMAP(output_template_valid, MAX_GPIO);
+	u32 output_template[MAX_GPIO];
 
 	bool j713;
 	struct mutex j713_reg_on_lock;
@@ -118,7 +125,14 @@ static bool macsmc_gpio_is_j700_pcio(struct macsmc_gpio *smcgp,
 {
 	return smcgp->j700_pcio &&
 	       (offset == MACSMC_J700_AFE_RESET_GPIO ||
-		offset == MACSMC_J700_RADIO_REG_ON_GPIO);
+		offset == MACSMC_J700_RADIO_REG_ON_GPIO ||
+		test_bit(offset, smcgp->pcio_template_valid));
+}
+
+static bool macsmc_gpio_has_output_template(struct macsmc_gpio *smcgp,
+					     unsigned int offset)
+{
+	return test_bit(offset, smcgp->output_template_valid);
 }
 
 static bool macsmc_gpio_is_j713_reg_on(struct macsmc_gpio *smcgp,
@@ -199,7 +213,8 @@ static int macsmc_gpio_get_direction(struct gpio_chip *gc, unsigned int offset)
 	int ret;
 
 	if (macsmc_gpio_is_j700_pcio(smcgp, offset) ||
-	    macsmc_gpio_is_j713_reg_on(smcgp, offset))
+	    macsmc_gpio_is_j713_reg_on(smcgp, offset) ||
+	    macsmc_gpio_has_output_template(smcgp, offset))
 		return GPIO_LINE_DIRECTION_OUT;
 
 	/* First try reading the explicit pin mode register */
@@ -228,6 +243,15 @@ static int macsmc_gpio_get(struct gpio_chip *gc, unsigned int offset)
 		ret = smcgp->j713_reg_on_known ? smcgp->j713_reg_on_level : -EOPNOTSUPP;
 		mutex_unlock(&smcgp->j713_reg_on_lock);
 		return ret;
+	}
+
+	/* Query the SMC output latch; CMD_OUTPUT does not change the line. */
+	if (macsmc_gpio_has_output_template(smcgp, offset)) {
+		ret = apple_smc_rw_u32(smcgp->smc, key, CMD_OUTPUT, &val);
+		if (ret < 0)
+			return ret;
+
+		return !!val;
 	}
 
 	/* pcIO cannot be read back; report the last level written. */
@@ -271,6 +295,17 @@ static int macsmc_gpio_set(struct gpio_chip *gc, unsigned int offset, int value)
 		return ret;
 	}
 
+	if (macsmc_gpio_has_output_template(smcgp, offset)) {
+		ret = apple_smc_write_u32(smcgp->smc, key,
+					  smcgp->output_template[offset] |
+					  !!value);
+		if (ret < 0)
+			dev_err_ratelimited(smcgp->dev,
+					    "templated GPIO %u set to %u failed: %d\n",
+					    offset, !!value, ret);
+		return ret;
+	}
+
 	if (macsmc_gpio_is_j700_pcio(smcgp, offset)) {
 		u32 lo, hi;
 		u64 payload;
@@ -278,6 +313,9 @@ static int macsmc_gpio_set(struct gpio_chip *gc, unsigned int offset, int value)
 		if (offset == MACSMC_J700_RADIO_REG_ON_GPIO) {
 			lo = MACSMC_J700_RADIO_REG_ON_LO;
 			hi = MACSMC_J700_RADIO_REG_ON_HI;
+		} else if (test_bit(offset, smcgp->pcio_template_valid)) {
+			lo = smcgp->pcio_template_lo[offset];
+			hi = smcgp->pcio_template_hi[offset];
 		} else {
 			lo = MACSMC_J700_AFE_RESET_LO;
 			hi = MACSMC_J700_AFE_RESET_HI;
@@ -317,7 +355,10 @@ static int macsmc_gpio_init_valid_mask(struct gpio_chip *gc,
 	if (smcgp->j700_pcio) {
 		set_bit(MACSMC_J700_AFE_RESET_GPIO, valid_mask);
 		set_bit(MACSMC_J700_RADIO_REG_ON_GPIO, valid_mask);
+		bitmap_or(valid_mask, valid_mask, smcgp->pcio_template_valid,
+			  ngpios);
 	}
+	bitmap_or(valid_mask, valid_mask, smcgp->output_template_valid, ngpios);
 
 	for (i = 0; i < count; i++) {
 		int ret, gpio_nr;
@@ -346,6 +387,54 @@ struct macsmc_gpio_of_match_data {
 	smc_key base_key;
 };
 
+static int macsmc_gpio_parse_templates(struct macsmc_gpio *smcgp)
+{
+	struct device *dev = smcgp->dev;
+	u32 *values;
+	int count, i, ret;
+
+	count = device_property_count_u32(dev, "apple,output-templates");
+	if (count > 0) {
+		if (count % 2)
+			return -EINVAL;
+		values = devm_kcalloc(dev, count, sizeof(*values), GFP_KERNEL);
+		if (!values)
+			return -ENOMEM;
+		ret = device_property_read_u32_array(dev, "apple,output-templates",
+						     values, count);
+		if (ret)
+			return ret;
+		for (i = 0; i < count; i += 2) {
+			if (values[i] >= MAX_GPIO)
+				return -EINVAL;
+			smcgp->output_template[values[i]] = values[i + 1];
+			set_bit(values[i], smcgp->output_template_valid);
+		}
+	}
+
+	count = device_property_count_u32(dev, "apple,pcio-templates");
+	if (count > 0) {
+		if (count % 3)
+			return -EINVAL;
+		values = devm_kcalloc(dev, count, sizeof(*values), GFP_KERNEL);
+		if (!values)
+			return -ENOMEM;
+		ret = device_property_read_u32_array(dev, "apple,pcio-templates",
+						     values, count);
+		if (ret)
+			return ret;
+		for (i = 0; i < count; i += 3) {
+			if (values[i] >= MAX_GPIO)
+				return -EINVAL;
+			smcgp->pcio_template_lo[values[i]] = values[i + 1];
+			smcgp->pcio_template_hi[values[i]] = values[i + 2];
+			set_bit(values[i], smcgp->pcio_template_valid);
+		}
+	}
+
+	return 0;
+}
+
 static int macsmc_gpio_probe(struct platform_device *pdev)
 {
 	struct macsmc_gpio *smcgp;
@@ -363,8 +452,12 @@ static int macsmc_gpio_probe(struct platform_device *pdev)
 	smcgp->base_key = data ? data->base_key : _SMC_KEY("gP\0\0");
 	smcgp->j700_pcio = of_machine_is_compatible("apple,j700") &&
 				device_is_compatible(&pdev->dev, "apple,smc-gpio");
-	smcgp->j713 = of_machine_is_compatible("apple,j713");
+	smcgp->j713 = apple_t8132_managed_radio();
 	mutex_init(&smcgp->j713_reg_on_lock);
+	ret = macsmc_gpio_parse_templates(smcgp);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret,
+				     "invalid GPIO command templates\n");
 
 	smcgp->first_index = macsmc_gpio_find_first_gpio_index(smcgp);
 	if (smcgp->first_index < 0)

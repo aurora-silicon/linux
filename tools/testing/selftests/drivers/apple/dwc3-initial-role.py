@@ -168,6 +168,11 @@ err_free_event_buffers:
     return ret;
 }
 '''
+    # The board selection comes from <linux/soc/apple/t8132.h>.
+    t8132 = (root / "include/linux/soc/apple/t8132.h").read_text()
+    for name in ["apple_t8132_air", "apple_t8132_pro_mini_imac",
+                 "apple_t8132_usb_host_first"]:
+        program += function(t8132,name)
     for name in ["dwc3_apple_set_ptrcap", "dwc3_apple_host_before_core_init",
                  "dwc3_apple_core_probe", "dwc3_apple_core_init"]:
         program += function(apple,name)

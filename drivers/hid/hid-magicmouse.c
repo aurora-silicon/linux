@@ -263,6 +263,9 @@ struct effect_job {
  * @quirks: Currently unused.
  * @query_dimensions: Whether to query and update dimensions on first open
  * @mtp_c1fe: Whether the MTP trackpad sends the J700 C1FE report layout.
+ * @mtp_palms: Whether the controller's contact classes are trusted for palms
+ *             on the standard MTP report (T6041).
+ * @mtp_palm_ids: MTP contact IDs reported as palms until they lift.
  * @ntouches: Number of touches in most recent touch report.
  * @scroll_accel: Number of consecutive scroll motions.
  * @scroll_jiffies: Time of last scroll motion.
@@ -289,6 +292,8 @@ struct magicmouse_sc {
 	unsigned long quirks;
 	bool query_dimensions;
 	bool mtp_c1fe;
+	bool mtp_palms;
+	DECLARE_BITMAP(mtp_palm_ids, U8_MAX + 1);
 
 	int ntouches;
 	int scroll_accel;
@@ -963,12 +968,55 @@ static void report_c1fe_finger_data(struct input_dev *input, int slot,
 static bool magicmouse_haptic_click(struct magicmouse_sc *msc, u32 pressure,
 				    bool firmware_button);
 
+/*
+ * The T6041 (M4 Max) MTP trackpad's records carry the contact ID and state in
+ * the first word and the controller's class in the low byte of the second: 1
+ * for a thumb, 2 and 3 for fingers, 6 and above for palms. Recorded on a J616C:
+ * moving fingers had a tool area of 830-1010 and class 2 or 3, a resting thumb
+ * ~1750 and class 1, a resting palm ~2040 and class 7; palms dragged across the
+ * pad reached 5100. The class flickers while a hand lands, so a contact counts
+ * as a palm once the controller classes it as one with a tool area no finger
+ * reaches, or once its tool area passes palm size, and stays a palm until it
+ * lifts. Thumbs stay touches.
+ */
+#define MAGICMOUSE_MTP_PALM_CLASS_MIN		6
+#define MAGICMOUSE_MTP_CLASSED_PALM_TOOL_MAJOR	1400
+#define MAGICMOUSE_MTP_PALM_TOOL_MAJOR		2200
+
+static u8 magicmouse_mtp_contact_id(const struct tp_finger *f)
+{
+	return le16_to_cpu(f->unknown1) & 0xff;
+}
+
+static void magicmouse_mtp_update_palms(struct magicmouse_sc *msc,
+					const u8 *records, int count)
+{
+	DECLARE_BITMAP(palms, U8_MAX + 1);
+	const struct tp_finger *f;
+	int i, tool;
+	u8 id, class;
+
+	bitmap_zero(palms, U8_MAX + 1);
+	for (i = 0; i < count; i++) {
+		f = (const struct tp_finger *)(records + i * sizeof(*f));
+		id = magicmouse_mtp_contact_id(f);
+		class = le16_to_cpu(f->unknown2) & 0xff;
+		tool = le16_to_int(f->tool_major);
+		if (tool > MAGICMOUSE_MTP_PALM_TOOL_MAJOR ||
+		    (class >= MAGICMOUSE_MTP_PALM_CLASS_MIN &&
+		     tool > MAGICMOUSE_MTP_CLASSED_PALM_TOOL_MAJOR) ||
+		    test_bit(id, msc->mtp_palm_ids))
+			__set_bit(id, palms);
+	}
+	bitmap_copy(msc->mtp_palm_ids, palms, U8_MAX + 1);
+}
+
 static void report_finger_data(struct input_dev *input, int slot,
 			       const struct input_mt_pos *pos,
-			       const struct tp_finger *f)
+			       const struct tp_finger *f, int tool)
 {
 	input_mt_slot(input, slot);
-	input_mt_report_slot_state(input, MT_TOOL_FINGER, true);
+	input_mt_report_slot_state(input, tool, true);
 
 	input_report_abs(input, ABS_MT_TOUCH_MAJOR,
 			 le16_to_int(f->touch_major) << 1);
@@ -1025,6 +1073,10 @@ static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 		return 0;
 	}
 
+	if (msc->mtp_palms)
+		magicmouse_mtp_update_palms(msc, data + hdr_sz,
+					    tp_hdr->num_fingers);
+
 	n = 0;
 	for (i = 0; i < tp_hdr->num_fingers; i++) {
 		f = (struct tp_finger *)(data + hdr_sz + i * touch_sz);
@@ -1047,7 +1099,13 @@ static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 		if (msc->mtp_c1fe) {
 			report_c1fe_finger_data(input, msc->tracking_ids[i], &msc->pos[i]);
 		} else {
-			report_finger_data(input, msc->tracking_ids[i], &msc->pos[i], f);
+			int tool = MT_TOOL_FINGER;
+
+			if (msc->mtp_palms &&
+			    test_bit(magicmouse_mtp_contact_id(f), msc->mtp_palm_ids))
+				tool = MT_TOOL_PALM;
+			report_finger_data(input, msc->tracking_ids[i], &msc->pos[i],
+					   f, tool);
 			pressure += le16_to_int(f->pressure);
 		}
 	}
@@ -1315,13 +1373,20 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 	 * nothing that user space would take for a touch size or a pressure.
 	 */
 	if (!msc->mtp_c1fe) {
+		/*
+		 * A palm's tool area on the T6041 trackpad exceeds 5000 once
+		 * scaled, so allow the full range of the record's 16-bit fields
+		 * there.
+		 */
+		int area_max = msc->mtp_palms ? 2 * S16_MAX : 5000;
+
 		/* finger touch area */
-		input_set_abs_params(input, ABS_MT_TOUCH_MAJOR, 0, 5000, 0, 0);
-		input_set_abs_params(input, ABS_MT_TOUCH_MINOR, 0, 5000, 0, 0);
+		input_set_abs_params(input, ABS_MT_TOUCH_MAJOR, 0, area_max, 0, 0);
+		input_set_abs_params(input, ABS_MT_TOUCH_MINOR, 0, area_max, 0, 0);
 
 		/* finger approach area */
-		input_set_abs_params(input, ABS_MT_WIDTH_MAJOR, 0, 5000, 0, 0);
-		input_set_abs_params(input, ABS_MT_WIDTH_MINOR, 0, 5000, 0, 0);
+		input_set_abs_params(input, ABS_MT_WIDTH_MAJOR, 0, area_max, 0, 0);
+		input_set_abs_params(input, ABS_MT_WIDTH_MINOR, 0, area_max, 0, 0);
 
 		input_set_abs_params(input, ABS_MT_PRESSURE, 0, 6000, 0, 0);
 
@@ -1337,6 +1402,11 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 				     -J314_TP_MAX_FINGER_ORIENTATION,
 				     J314_TP_MAX_FINGER_ORIENTATION, 0, 0);
 	}
+
+	/* The T6041 controller classifies palms. */
+	if (msc->mtp_palms)
+		input_set_abs_params(input, ABS_MT_TOOL_TYPE, 0, MT_TOOL_MAX,
+				     0, 0);
 
 	/* Note: Touch Y position from the device is inverted relative
 	 * to how pointer motion is reported (and relative to how USB
@@ -2323,6 +2393,8 @@ static int magicmouse_probe(struct hid_device *hdev,
 		/* The J700 trackpad sends a different report layout. */
 		np = of_get_child_by_name(dev_of_node(hdev->dev.parent), "multi-touch");
 		msc->mtp_c1fe = of_device_is_compatible(np, "apple,j700-multitouch");
+		msc->mtp_palms = !msc->mtp_c1fe &&
+				 of_machine_is_compatible("apple,t6041");
 		of_node_put(np);
 
 		msc->input_ops.raw_event = magicmouse_raw_event_mtp;

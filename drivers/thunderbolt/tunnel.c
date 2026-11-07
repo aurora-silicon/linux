@@ -919,7 +919,7 @@ static int tb_dp_reduce_bandwidth(int max_bw, u32 in_rate, u32 in_lanes,
 
 /*
  * As tb_dp_reduce_bandwidth(), for a host whose DP IN streams of a PHY share
- * one link rate (TB_HOST_DP_HBR2_MAX): the rate is kept and the lanes are
+ * one link rate (TB_HOST_DP_SHARED_RATE): the rate is kept and the lanes are
  * reduced (x4, x2, x1). @shared_rate, the rate of a DP tunnel already up on
  * the same host router, is the only rate allowed (0: none). Without one, the
  * highest rate both sides take comes first, then the usual combinations.
@@ -949,16 +949,37 @@ int tb_dp_reduce_bandwidth_shared(int max_bw, u32 in_rate, u32 in_lanes, u32 out
 }
 
 /*
+ * A DP tunnel under TB_HOST_DP_SHARED_RATE that has to be reduced, to fit
+ * @max_bw or to take @shared_rate. Next to another DP tunnel (@shared_rate),
+ * or alone but held at HBR2 for one on its way (@rate_limit), the rate is
+ * kept and the lanes go first, see tb_dp_reduce_bandwidth_shared(). Alone at
+ * up to HBR3, the combination with the most bandwidth is taken, as without
+ * the policy: HBR2 x4 rather than HBR3 x2.
+ */
+int tb_dp_host_reduce_bandwidth(int max_bw, u32 in_rate, u32 in_lanes, u32 out_rate,
+				u32 out_lanes, u32 shared_rate, u32 rate_limit,
+				u32 *new_rate, u32 *new_lanes)
+{
+	if (!shared_rate && rate_limit > TB_DP_HOST_RATE_SHARED)
+		return tb_dp_reduce_bandwidth(max_bw, in_rate, in_lanes, out_rate,
+					      out_lanes, new_rate, new_lanes);
+	return tb_dp_reduce_bandwidth_shared(max_bw, in_rate, in_lanes, out_rate,
+					     out_lanes, shared_rate, new_rate, new_lanes);
+}
+
+/*
  * The highest DP link rate (Mb/s per lane) a tunnel from @in offers its
- * DPTX, 0 for no cap: HBR2 from the DP IN adapters of a host that needs
- * one link rate for both DP IN streams of a PHY (TB_HOST_DP_HBR2_MAX).
+ * DPTX, 0 for no cap. From the DP IN adapters of a host that needs one link
+ * rate for both DP IN streams of a PHY (TB_HOST_DP_SHARED_RATE), the one the
+ * connection manager set: HBR3 alone on the host router, HBR2 next to
+ * another DP tunnel; HBR2 if it set none.
  */
 static u32 tb_dp_host_rate_cap(struct tb_tunnel *tunnel, struct tb_port *in)
 {
 	if (!tb_port_is_apple_host_dpin(in) ||
-	    !tb_host_dp_policy(tunnel->tb->nhi, TB_HOST_DP_HBR2_MAX))
+	    !tb_host_dp_policy(tunnel->tb->nhi, TB_HOST_DP_SHARED_RATE))
 		return 0;
-	return 5400;
+	return tunnel->host_rate_limit ?: TB_DP_HOST_RATE_SHARED;
 }
 
 /* @val (a DP_LOCAL_CAP) with its rate capped at the tunnel's cap, if any. */
@@ -982,6 +1003,21 @@ int tb_dp_cap_bandwidth(struct tb_tunnel *tunnel, int bw)
 	return tunnel->max_bw ? min(bw, tunnel->max_bw) : bw;
 }
 
+/*
+ * The bandwidth (Mb/s) a DP tunnel capped at @max_rate (Mb/s per lane, 0
+ * for no cap) is counted at, from the @rate and @lanes read from its DP IN
+ * adapter. Under TB_HOST_DP_SHARED_RATE the tunnel never runs above its
+ * cap, but once its DPRX is done what the adapter reports is not bounded by
+ * it: a tunnel held at HBR2 between adapters that take HBR3 is counted at
+ * HBR2 all the same, so that a second one next to it gets what HBR2 leaves.
+ */
+unsigned int tb_dp_host_counted_bandwidth(u32 max_rate, u32 rate, u32 lanes)
+{
+	if (max_rate && rate > max_rate)
+		rate = max_rate;
+	return tb_dp_bandwidth(rate, lanes);
+}
+
 static int tb_dp_xchg_caps(struct tb_tunnel *tunnel)
 {
 	u32 out_dp_cap, out_rate, out_lanes, in_dp_cap, in_rate, in_lanes, bw;
@@ -994,6 +1030,7 @@ static int tb_dp_xchg_caps(struct tb_tunnel *tunnel)
 	tunnel->max_rate = tb_dp_host_rate_cap(tunnel, in);
 	tunnel->max_bw = 0;
 	tunnel->host_rate = 0;
+	tunnel->host_max_rate = 0;
 
 	/*
 	 * Copy DP_LOCAL_CAP register to DP_REMOTE_CAP register for
@@ -1020,6 +1057,11 @@ static int tb_dp_xchg_caps(struct tb_tunnel *tunnel)
 			   out->cap_adap + DP_LOCAL_CAP, 1);
 	if (ret)
 		return ret;
+
+	/* What the tunnel could get alone on the host router: HBR3 at most. */
+	if (tunnel->max_rate)
+		tunnel->host_max_rate = min(tb_dp_cap_get_rate(in_dp_cap),
+					    tb_dp_cap_get_rate(out_dp_cap));
 
 	/*
 	 * Both sides see the capped rate: the DP OUT through its remote caps,
@@ -1065,7 +1107,7 @@ static int tb_dp_xchg_caps(struct tb_tunnel *tunnel)
 		max_bw = tunnel->max_up;
 
 	/*
-	 * Under TB_HOST_DP_HBR2_MAX a second DP tunnel from the host router
+	 * Under TB_HOST_DP_SHARED_RATE a second DP tunnel from the host router
 	 * takes the link rate of the one already up, whatever bandwidth there
 	 * is: both DP IN streams of the PHY run at one rate.
 	 */
@@ -1077,9 +1119,10 @@ static int tb_dp_xchg_caps(struct tb_tunnel *tunnel)
 		u32 new_rate, new_lanes, new_bw;
 
 		if (tunnel->max_rate)
-			ret = tb_dp_reduce_bandwidth_shared(max_bw, in_rate, in_lanes,
-							    out_rate, out_lanes, shared_rate,
-							    &new_rate, &new_lanes);
+			ret = tb_dp_host_reduce_bandwidth(max_bw, in_rate, in_lanes,
+							  out_rate, out_lanes, shared_rate,
+							  tunnel->max_rate, &new_rate,
+							  &new_lanes);
 		else
 			ret = tb_dp_reduce_bandwidth(max_bw, in_rate, in_lanes,
 						     out_rate, out_lanes, &new_rate,
@@ -1684,6 +1727,9 @@ static int tb_dp_bandwidth_mode_consumed_bandwidth(struct tb_tunnel *tunnel,
 		return ret;
 	if (allocated_bw == max_bw_rounded)
 		allocated_bw = ret;
+	/* Capped: no more than the capped rate takes, see tb_dp_host_counted_bandwidth(). */
+	if (tunnel->max_rate && allocated_bw > ret)
+		allocated_bw = ret;
 
 	if (tb_tunnel_direction_downstream(tunnel)) {
 		*consumed_up = 0;
@@ -1878,9 +1924,9 @@ static int tb_dp_consumed_bandwidth(struct tb_tunnel *tunnel, int *consumed_up,
 
 	if (tb_tunnel_direction_downstream(tunnel)) {
 		*consumed_up = 0;
-		*consumed_down = tb_dp_bandwidth(rate, lanes);
+		*consumed_down = tb_dp_host_counted_bandwidth(tunnel->max_rate, rate, lanes);
 	} else {
-		*consumed_up = tb_dp_bandwidth(rate, lanes);
+		*consumed_up = tb_dp_host_counted_bandwidth(tunnel->max_rate, rate, lanes);
 		*consumed_down = 0;
 	}
 
