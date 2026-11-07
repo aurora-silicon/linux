@@ -3501,16 +3501,7 @@
 #endif
 
 #if defined(T6050_J714C) || defined(T6050_J714S) || defined(T6050_J716C) || defined(T6050_J716S) || defined(T6050_K114C) || defined(T6050_K114S) || defined(T6050_K116C) || defined(T6050_K116S)
-	admac_hp_mic_ec_proxy: dma-controller-hp-mic@4d3200000 {
-		compatible = "apple,t6050-admac-secure", "apple,admac-secure";
-		reg = <0x4 0xd3200000 0x0 0x34000>;
-		#dma-cells = <1>;
-		status = "disabled";
-	};
-#endif
-
-#if defined(T6050_J714C) || defined(T6050_J714S) || defined(T6050_J716C) || defined(T6050_J716S) || defined(T6050_K114C) || defined(T6050_K114S) || defined(T6050_K116C) || defined(T6050_K116S)
-	admac_sllb_ec_proxy: dma-controller-sllb@4d3200000 {
+	admac_ec_proxy: dma-controller@4d3200000 {
 		compatible = "apple,t6050-admac-secure", "apple,admac-secure";
 		reg = <0x4 0xd3200000 0x0 0x34000>;
 		#dma-cells = <1>;
