@@ -18,6 +18,8 @@ properties:
     items:
       - enum:
           - apple,t6041-radio-pmu
+          - apple,t6000-wifibt-pmu
+          - apple,t6000-uwb-pmu
       - const: apple,radio-pmu
 
   reg:

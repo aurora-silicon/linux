@@ -79,5 +79,3 @@
 	compatible = "apple,j314-macaudio", "apple,macaudio";
 	model = "MacBook Pro J314";
 };
-
-#include "t6001-j314c-control.dtsi"

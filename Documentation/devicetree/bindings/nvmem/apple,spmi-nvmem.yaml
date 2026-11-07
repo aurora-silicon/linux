@@ -31,6 +31,10 @@ properties:
   reg:
     maxItems: 1
 
+  interrupts:
+    maxItems: 1
+    description: Native event in the SPMI interrupt domain.
+
   battery-monitor:
     $ref: /schemas/power/supply/apple,battery-monitor.yaml#
 

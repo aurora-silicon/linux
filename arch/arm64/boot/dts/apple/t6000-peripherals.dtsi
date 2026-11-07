@@ -445,7 +445,7 @@
 		status = "disabled";
 	};
 
-	pwm1: pwm@39b030000 {
+	pwm1: timer-pwm@39b030000 {
 		compatible = "apple,t6000-pwm", "apple,pwm";
 		reg = <0x3 0x9b030000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
