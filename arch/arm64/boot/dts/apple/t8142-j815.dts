@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/dts-v1/;
+
+#include "t8142.dtsi"
+#include "t8142-j815-peripherals.dtsi"
+
+/ {
+	model = "Apple MacBook Air (15-inch, M5)";
+	compatible = "apple,j815", "apple,t8142", "apple,arm-platform";
+};
+
+&cpufreq_e {
+	status = "disabled";
+};
+
+&cpufreq_p {
+	status = "disabled";
+};

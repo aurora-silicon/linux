@@ -365,13 +365,18 @@ properties:
 
       - description: Apple M5 SoC based platforms
         items:
-          - const: apple,j813  # MacBook Air (13-inch, M5, 2026)
+          - enum:
+              - apple,j704  # MacBook Pro (14-inch, M5)
+              - apple,j813  # MacBook Air (13-inch, M5, 2026)
+              - apple,j815  # MacBook Air (15-inch, M5)
           - const: apple,t8142
           - const: apple,arm-platform
 
       - description: Apple M6 SoC based platforms
         items:
-          - const: apple,j873g # Mac mini (M6)
+          - enum:
+              - apple,j804  # MacBook Pro (J804)
+              - apple,j873g # Mac mini (M6)
           - const: apple,t8152
           - const: apple,arm-platform
 
