@@ -277,8 +277,7 @@ it:
 - A torn last entry, from a crash while appending, is ignored at the next
   probe and overwritten by the next new record.
 
-The file holds only record kinds and session ids, no key material, and it
-can be backed up and copied like any other file.
+The file holds only record kinds and session ids, no key material.
 
 ## Cold-boot SEP Macs rewrite a pre-Linux record (2026-10-16)
 
