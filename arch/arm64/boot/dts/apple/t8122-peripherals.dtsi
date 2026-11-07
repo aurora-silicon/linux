@@ -157,7 +157,7 @@
 	};
 
 	apciec0_piodma: dma-controller@722000000 {
-		compatible = "apple,t8122-pciec-piodma", "apple,pcie-piodma";
+		compatible = "apple,t8122-pciec-piodma", "apple,pciec-piodma";
 		reg = <0x7 0x22000000 0x0 0x4000>,
 		      <0x7 0x22004000 0x0 0x4000>,
 		      <0x7 0x22008000 0x0 0x4000>,
@@ -169,7 +169,7 @@
 	};
 
 	atc0_dpin0: displayport@701e50000 {
-		compatible = "apple,t8122-dpin", "apple,dp-in";
+		compatible = "apple,t8122-dpin", "apple,dpin";
 		reg = <0x7 0x01e50000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1008 IRQ_TYPE_LEVEL_HIGH>;
@@ -177,7 +177,7 @@
 	};
 
 	atc0_dpin1: displayport@701e58000 {
-		compatible = "apple,t8122-dpin", "apple,dp-in";
+		compatible = "apple,t8122-dpin", "apple,dpin";
 		reg = <0x7 0x01e58000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1009 IRQ_TYPE_LEVEL_HIGH>;
@@ -185,7 +185,7 @@
 	};
 
 	apciec1_piodma: dma-controller@b22000000 {
-		compatible = "apple,t8122-pciec-piodma", "apple,pcie-piodma";
+		compatible = "apple,t8122-pciec-piodma", "apple,pciec-piodma";
 		reg = <0xb 0x22000000 0x0 0x4000>,
 		      <0xb 0x22004000 0x0 0x4000>,
 		      <0xb 0x22008000 0x0 0x4000>,
@@ -197,7 +197,7 @@
 	};
 
 	atc1_dpin0: displayport@b01e50000 {
-		compatible = "apple,t8122-dpin", "apple,dp-in";
+		compatible = "apple,t8122-dpin", "apple,dpin";
 		reg = <0xb 0x01e50000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1066 IRQ_TYPE_LEVEL_HIGH>;
@@ -205,7 +205,7 @@
 	};
 
 	atc1_dpin1: displayport@b01e58000 {
-		compatible = "apple,t8122-dpin", "apple,dp-in";
+		compatible = "apple,t8122-dpin", "apple,dpin";
 		reg = <0xb 0x01e58000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1067 IRQ_TYPE_LEVEL_HIGH>;

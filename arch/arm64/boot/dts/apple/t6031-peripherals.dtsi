@@ -234,7 +234,7 @@
 	};
 
 	apciec0_piodma: dma-controller@722000000 {
-		compatible = "apple,t6031-pciec-piodma", "apple,pcie-piodma";
+		compatible = "apple,t6031-pciec-piodma", "apple,pciec-piodma";
 		reg = <0x7 0x22000000 0x0 0x4000>,
 		      <0x7 0x22004000 0x0 0x4000>,
 		      <0x7 0x22008000 0x0 0x4000>,
@@ -246,7 +246,7 @@
 	};
 
 	apciec1_piodma: dma-controller@b22000000 {
-		compatible = "apple,t6031-pciec-piodma", "apple,pcie-piodma";
+		compatible = "apple,t6031-pciec-piodma", "apple,pciec-piodma";
 		reg = <0xb 0x22000000 0x0 0x4000>,
 		      <0xb 0x22004000 0x0 0x4000>,
 		      <0xb 0x22008000 0x0 0x4000>,
@@ -258,7 +258,7 @@
 	};
 
 	apciec2_piodma: dma-controller@f22000000 {
-		compatible = "apple,t6031-pciec-piodma", "apple,pcie-piodma";
+		compatible = "apple,t6031-pciec-piodma", "apple,pciec-piodma";
 		reg = <0xf 0x22000000 0x0 0x4000>,
 		      <0xf 0x22004000 0x0 0x4000>,
 		      <0xf 0x22008000 0x0 0x4000>,
@@ -270,7 +270,7 @@
 	};
 
 	atc0_dpin0: displayport@701e50000 {
-		compatible = "apple,t6031-dpin", "apple,dp-in";
+		compatible = "apple,t6031-dpin", "apple,dpin";
 		reg = <0x7 0x01e50000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1564 IRQ_TYPE_LEVEL_HIGH>;
@@ -278,7 +278,7 @@
 	};
 
 	atc0_dpin1: displayport@701e58000 {
-		compatible = "apple,t6031-dpin", "apple,dp-in";
+		compatible = "apple,t6031-dpin", "apple,dpin";
 		reg = <0x7 0x01e58000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1565 IRQ_TYPE_LEVEL_HIGH>;
@@ -286,7 +286,7 @@
 	};
 
 	atc1_dpin0: displayport@b01e50000 {
-		compatible = "apple,t6031-dpin", "apple,dp-in";
+		compatible = "apple,t6031-dpin", "apple,dpin";
 		reg = <0xb 0x01e50000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1612 IRQ_TYPE_LEVEL_HIGH>;
@@ -294,7 +294,7 @@
 	};
 
 	atc1_dpin1: displayport@b01e58000 {
-		compatible = "apple,t6031-dpin", "apple,dp-in";
+		compatible = "apple,t6031-dpin", "apple,dpin";
 		reg = <0xb 0x01e58000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1613 IRQ_TYPE_LEVEL_HIGH>;
@@ -302,7 +302,7 @@
 	};
 
 	atc2_dpin0: displayport@f01e50000 {
-		compatible = "apple,t6031-dpin", "apple,dp-in";
+		compatible = "apple,t6031-dpin", "apple,dpin";
 		reg = <0xf 0x01e50000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1660 IRQ_TYPE_LEVEL_HIGH>;
@@ -310,7 +310,7 @@
 	};
 
 	atc2_dpin1: displayport@f01e58000 {
-		compatible = "apple,t6031-dpin", "apple,dp-in";
+		compatible = "apple,t6031-dpin", "apple,dpin";
 		reg = <0xf 0x01e58000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1661 IRQ_TYPE_LEVEL_HIGH>;
