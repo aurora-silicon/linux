@@ -1215,6 +1215,7 @@
 				label = "pmp-avd-sys";
 				#power-domain-cells = <0>;
 				power-domains = <&ps_avd_sys>;
+				apple,dvfs = <0xb0 2>;
 			};
 
 			pmp_report_msr: report@b {
@@ -1272,7 +1273,12 @@
 			mbox-names = "mbox";
 			iommus = <&pmp_dart 0>;
 			power-domains = <&ps_pmp>;
+			/* The bootloader supplies board/DRAM IDs and PMP calibration. */
+			#ifdef APPLE_USE_PMP
+			status = "okay";
+			#else
 			status = "disabled";
+			#endif
 		};
 
 		pmgr: power-management@23b700000 {
@@ -1759,7 +1765,8 @@
 			interrupts = <AIC_IRQ 667 IRQ_TYPE_LEVEL_HIGH>,
 				<AIC_IRQ 668 IRQ_TYPE_LEVEL_HIGH>;
 			#ifdef APPLE_USE_PMP
-			power-domains = <&pmp_report_avd_sys>;
+			power-domains = <&ps_avd_sys>, <&pmp_report_avd_sys>;
+			power-domain-names = "core", "perf";
 			#else
 			power-domains = <&ps_avd_sys>;
 			#endif
