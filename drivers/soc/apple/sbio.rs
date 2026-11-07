@@ -26,8 +26,46 @@ const LOCKOUT_LOCKED: u32 = 1;
 
 /// Message tag of the enclave's unsolicited biometric lock-state notification.
 const SBIO_NOTIFY_LOCK_STATE: u8 = 0x01;
-/// The lock-state bit that is set while the enclave refuses matches.
-const LOCK_STATE_LOCKOUT: u16 = 0x40;
+/// Bits of the user's biometric lock state, as the enclave announces it.
+/// The user's password (passcode) is required before biometry.
+const LOCK_STATE_PASSCODE_LOCKOUT: u16 = 0x0002;
+/// Biometry is locked for the user; set with the identification lockout.
+const LOCK_STATE_BIO_LOCKOUT: u16 = 0x0004;
+/// The user holds a biometric unlock token.
+const LOCK_STATE_UNLOCK_TOKEN: u16 = 0x0008;
+/// The user has not unlocked with the password since the enclave started.
+const LOCK_STATE_BEFORE_FIRST_UNLOCK: u16 = 0x0010;
+/// A password was validated recently.
+const LOCK_STATE_PASSCODE_VALIDATED: u16 = 0x0020;
+/// Identification is locked: five completed no-matches in a row.
+const LOCK_STATE_LOCKOUT: u16 = 0x0040;
+/// The user's catacomb is damaged; matching cannot work until it is repaired.
+const LOCK_STATE_CATACOMB_CORRUPTED: u16 = 0x0080;
+/// The states in which the enclave will not match until the user's password
+/// has been verified.
+const LOCK_STATE_NEEDS_PASSWORD: u16 = LOCK_STATE_PASSCODE_LOCKOUT
+    | LOCK_STATE_BIO_LOCKOUT
+    | LOCK_STATE_BEFORE_FIRST_UNLOCK
+    | LOCK_STATE_LOCKOUT;
+/// Message tag of the enclave's notice that a user's enrolled-identity
+/// count changed (the count in bits 16-31, the user in bits 32-63).
+const SBIO_NOTIFY_ENROLLED_COUNT: u8 = 0x02;
+/// Message tag of the enclave's notice that its device list changed.
+const SBIO_NOTIFY_DEVICE_LIST: u8 = 0x04;
+
+/// The named bits of a lock state, for the log.
+fn lock_state_names(state: u16) -> [&'static str; 7] {
+    let name = |bit: u16, what: &'static str| if state & bit != 0 { what } else { "" };
+    [
+        name(LOCK_STATE_PASSCODE_LOCKOUT, " password-lockout"),
+        name(LOCK_STATE_BIO_LOCKOUT, " biometry-lockout"),
+        name(LOCK_STATE_UNLOCK_TOKEN, " unlock-token"),
+        name(LOCK_STATE_BEFORE_FIRST_UNLOCK, " before-first-unlock"),
+        name(LOCK_STATE_PASSCODE_VALIDATED, " password-validated"),
+        name(LOCK_STATE_LOCKOUT, " identification-lockout"),
+        name(LOCK_STATE_CATACOMB_CORRUPTED, " catacomb-corrupted"),
+    ]
+}
 /// Failed matches in one prompt after which the prompt's match operation
 /// ends: macOS LocalAuthentication stops a Touch ID prompt after three NoMatch
 /// and offers the password, while the enclave stays unlocked and the next
@@ -99,12 +137,26 @@ const BG_OPS_SAVE_POLL_MS: u32 = 50;
 const LOCK_STATE_WAIT_MS: u32 = 1000;
 const LOCK_STATE_POLL_MS: u32 = 10;
 
-fn lockout_record(locked: bool) -> [u8; LOCKOUT_RECORD_LEN] {
+/// The record: magic, the lock (`LOCKOUT_LOCKED` or 0), and the failed
+/// matches since the last match or password. A restart does not clear
+/// failed attempts on macOS (the enclave reloads its saved count), so the
+/// host keeps its count across one too.
+fn lockout_record(locked: bool, failures: u32) -> [u8; LOCKOUT_RECORD_LEN] {
     let mut raw = [0u8; LOCKOUT_RECORD_LEN];
     raw[..LOCKOUT_MAGIC.len()].copy_from_slice(&LOCKOUT_MAGIC);
     let state = if locked { LOCKOUT_LOCKED } else { 0 };
     raw[8..12].copy_from_slice(&state.to_le_bytes());
+    raw[12..16].copy_from_slice(&failures.to_le_bytes());
     raw
+}
+
+/// The failed matches a record holds, at most `VERIFY_RETRY_LIMIT`; 0 for a
+/// foreign record.
+fn lockout_record_failures(raw: &[u8; LOCKOUT_RECORD_LEN]) -> u32 {
+    if raw[..LOCKOUT_MAGIC.len()] != LOCKOUT_MAGIC {
+        return 0;
+    }
+    u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]).min(VERIFY_RETRY_LIMIT)
 }
 
 fn lockout_record_locked(raw: &[u8; LOCKOUT_RECORD_LEN]) -> bool {
@@ -139,17 +191,42 @@ mod lockout_tests {
 
     #[test]
     fn record_round_trips() {
-        assert!(lockout_record_locked(&lockout_record(true)));
-        assert!(!lockout_record_locked(&lockout_record(false)));
+        assert!(lockout_record_locked(&lockout_record(true, 5)));
+        assert!(!lockout_record_locked(&lockout_record(false, 0)));
+        assert_eq!(lockout_record_failures(&lockout_record(false, 3)), 3);
+        assert_eq!(lockout_record_failures(&lockout_record(true, 5)), 5);
+        // A count beyond the limit is clamped.
+        assert_eq!(lockout_record_failures(&lockout_record(false, 1000)), VERIFY_RETRY_LIMIT);
+        // A record written before the count existed holds zero there.
+        let mut old = lockout_record(true, 0);
+        old[12..16].fill(0);
+        assert_eq!(lockout_record_failures(&old), 0);
+        assert!(lockout_record_locked(&old));
+    }
+
+    #[test]
+    fn lock_state_bits() {
+        // 0x0045: identification lockout, biometry lockout, device locked.
+        assert_ne!(0x0045 & LOCK_STATE_NEEDS_PASSWORD, 0);
+        // 0x0228 / 0x0208 / 0x0209: usable (unlock token, no lockout).
+        for usable in [0x0228u16, 0x0208, 0x0209, 0x0229] {
+            assert_eq!(usable & LOCK_STATE_NEEDS_PASSWORD, 0);
+            assert_eq!(usable & LOCK_STATE_CATACOMB_CORRUPTED, 0);
+        }
+        // 0x0055 and 0x0007 need the password too.
+        assert_ne!(0x0055 & LOCK_STATE_NEEDS_PASSWORD, 0);
+        assert_ne!(0x0007 & LOCK_STATE_NEEDS_PASSWORD, 0);
+        assert_eq!(lock_state_names(0x0228)[2], " unlock-token");
     }
 
     #[test]
     fn foreign_bytes_are_no_lockout() {
-        let mut raw = lockout_record(true);
+        let mut raw = lockout_record(true, 5);
         raw[0] ^= 0xff;
         assert!(!lockout_record_locked(&raw));
+        assert_eq!(lockout_record_failures(&raw), 0);
         assert!(!lockout_record_locked(&[0u8; LOCKOUT_RECORD_LEN]));
-        let mut other = lockout_record(true);
+        let mut other = lockout_record(true, 5);
         other[8] = 2;
         assert!(!lockout_record_locked(&other));
     }
@@ -2318,6 +2395,18 @@ impl SepData {
             self.finish_verify(outcome, [0u8; bio::TOKEN_LEN]);
             return;
         }
+        if self.enclave_reports_state(LOCK_STATE_CATACOMB_CORRUPTED) {
+            dev_err!(
+                self.dev,
+                "verify: the enclave reports the Touch ID catacomb of user {} damaged; refusing before the capture. This is not a non-matching finger: the enrolment needs repair\n",
+                SBIO_PROBE_USER_ID
+            );
+            self.finish_verify(
+                bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE),
+                [0u8; bio::TOKEN_LEN],
+            );
+            return;
+        }
         self.retry_restore_proof();
         if !self.templates_restored.load(Relaxed) {
             dev_err!(
@@ -2551,12 +2640,28 @@ impl SepData {
             self.forget_finger_lift();
             sensor::power(false);
         }
+        let streak_before = self.bio_nomatch_streak.load(Relaxed);
         match &outcome {
             bio::VerifyOutcome::Matched(_) => self.bio_nomatch_streak.store(0, Relaxed),
             bio::VerifyOutcome::NoMatch => {
                 self.bio_nomatch_streak.fetch_add(1, Relaxed);
             }
             bio::VerifyOutcome::Failed(_) => {}
+        }
+        // Keep the count across a restart, as the enclave keeps its own; a
+        // lockout below writes the record itself.
+        let streak = self.bio_nomatch_streak.load(Relaxed);
+        if streak != streak_before
+            && streak < VERIFY_RETRY_LIMIT
+            && !self.bio_lockout.load(Relaxed)
+            && !self.write_lockout_record(false)
+        {
+            dev_warn!(
+                self.dev,
+                "verify: could not record {} failed attempt(s) in {}; a restart forgets them\n",
+                streak,
+                LOCKOUT_RECORD
+            );
         }
         // The enclave announces its lockout with the no-match that causes it;
         // the next verify must not ask for another touch.
@@ -4004,7 +4109,20 @@ impl SepData {
             self.sbio_wq.notify_all();
             return;
         }
-        if marker < transfer::MARKER_FIRST {
+        if marker == SBIO_NOTIFY_ENROLLED_COUNT {
+            let user = (msg.msg0 >> proto::MSG_DATA_SHIFT) as u32;
+            let count = (msg.msg0 >> proto::MSG_TYPE_SHIFT) as u16;
+            let plural = if count == 1 { "y" } else { "ies" };
+            dev_info!(
+                self.dev,
+                "sbio: user {} now has {} enrolled identit{} in the enclave\n",
+                user,
+                count,
+                plural
+            );
+        } else if marker == SBIO_NOTIFY_DEVICE_LIST {
+            dev_info!(self.dev, "sbio: the enclave's biometric device list changed\n");
+        } else if marker < transfer::MARKER_FIRST {
             dev_info!(self.dev, "sbio: unhandled notification, tag {:#04x}\n", marker);
         }
 
@@ -4075,20 +4193,28 @@ impl SepData {
 
     // The enclave announces each change of a user's biometric lock state:
     // the state in bits 16-31, the user in bits 32-63. Only this metadata is
-    // logged; the lockout is bit `LOCK_STATE_LOCKOUT` of the state.
+    // logged; `LOCK_STATE_NEEDS_PASSWORD` are the lockout bits.
     fn on_lock_state_notification(&self, word: u64) {
         let state = (word >> proto::MSG_TYPE_SHIFT) as u16;
         let user = (word >> proto::MSG_DATA_SHIFT) as u32;
         self.bio_lock_state
             .store(u64::from(state) | (u64::from(user) << 16), Relaxed);
         self.bio_lock_state_seq.fetch_add(1, Relaxed);
-        let lockout = if state & LOCK_STATE_LOCKOUT != 0 { "set" } else { "clear" };
+        let lockout = if state & LOCK_STATE_NEEDS_PASSWORD != 0 { "set" } else { "clear" };
+        let n = lock_state_names(state);
         dev_info!(
             self.dev,
-            "sbio: lock state of user {} is {:#06x} (lockout {})\n",
+            "sbio: lock state of user {} is {:#06x} (lockout {}:{}{}{}{}{}{}{})\n",
             user,
             state,
-            lockout
+            lockout,
+            n[0],
+            n[1],
+            n[2],
+            n[3],
+            n[4],
+            n[5],
+            n[6]
         );
         self.sbio_wq.notify_all();
     }
@@ -4683,12 +4809,19 @@ impl SepData {
     // authentication, in `rearm_after_password`, never here: doing it on the
     // enclave's refusal would undo the lockout.
     /// Whether the enclave's latest lock-state notification for the Linux
-    /// user has the lockout bit set.
-    fn enclave_reports_lockout(&self) -> bool {
+    /// user says matching needs the password first (a lockout, a password
+    /// lockout, or no password unlock yet).
+    /// Whether the enclave's latest lock-state notification for the Linux
+    /// user has any of `bits` set.
+    fn enclave_reports_state(&self, bits: u16) -> bool {
         let last = self.bio_lock_state.load(Relaxed);
         self.bio_lock_state_seq.load(Relaxed) != 0
             && (last >> 16) as u32 == SBIO_PROBE_USER_ID as u32
-            && (last as u16) & LOCK_STATE_LOCKOUT != 0
+            && (last as u16) & bits != 0
+    }
+
+    fn enclave_reports_lockout(&self) -> bool {
+        self.enclave_reports_state(LOCK_STATE_NEEDS_PASSWORD)
     }
 
     /// Locks Touch ID on the host after `VERIFY_RETRY_LIMIT` failed matches
@@ -4769,17 +4902,42 @@ impl SepData {
         lockout_record_locked(&raw)
     }
 
+    /// The failed matches the record holds; 0 when it is missing or foreign.
+    fn read_recorded_failures(&self) -> u32 {
+        let Ok(file) = shim::StoreFile::open_readonly(LOCKOUT_RECORD) else {
+            return 0;
+        };
+        let mut raw = [0u8; LOCKOUT_RECORD_LEN];
+        if file.size().ok() != Some(LOCKOUT_RECORD_LEN as u64)
+            || file.read_exact(0, &mut raw).is_err()
+        {
+            return 0;
+        }
+        lockout_record_failures(&raw)
+    }
+
     fn write_lockout_record(&self, locked: bool) -> bool {
         let Ok(file) = shim::StoreFile::open_trunc(LOCKOUT_RECORD) else {
             return false;
         };
-        file.write_all(0, &lockout_record(locked)).is_ok() && file.sync().is_ok()
+        let failures = self.bio_nomatch_streak.load(Relaxed);
+        file.write_all(0, &lockout_record(locked, failures)).is_ok() && file.sync().is_ok()
     }
 
     // macOS asks for the passcode after a restart before Touch ID works
     // again. Here Touch ID may unlock the login screen, so a lockout has to
     // outlast the restart instead, or restarting would reset the attempts.
     fn restore_lockout_record(&self) {
+        let failures = self.read_recorded_failures();
+        if failures > 0 {
+            self.bio_nomatch_streak.store(failures, Relaxed);
+            dev_info!(
+                self.dev,
+                "Touch ID: {} failed attempt(s) from before the restart still count ({} lock Touch ID until a password)\n",
+                failures,
+                VERIFY_RETRY_LIMIT
+            );
+        }
         if self.read_lockout_record() {
             self.bio_lockout.store(true, Relaxed);
             dev_info!(
@@ -4980,7 +5138,7 @@ impl SepData {
             flags
         );
         let confirmed = match self.await_lock_state(notify_user, since, LOCK_STATE_WAIT_MS) {
-            Some(state) if state & LOCK_STATE_LOCKOUT != 0 => {
+            Some(state) if state & LOCK_STATE_NEEDS_PASSWORD != 0 => {
                 dev_err!(
                     self.dev,
                     "Touch ID: re-arm: the enclave still reports the lockout (state {:#06x})\n",
