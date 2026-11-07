@@ -251,13 +251,17 @@ allOf:
     then:
       properties:
         reg:
-          items:
-            - description: GFX coprocessor control registers
-            - description: GPU block MMIO registers
+          minItems: 2
+          maxItems: 2
+          description: GPU and GFX coprocessor registers, ordered by reg-names.
         reg-names:
-          items:
-            - const: asc
-            - const: sgx
+          oneOf:
+            - items:
+                - const: asc
+                - const: sgx
+            - items:
+                - const: sgx
+                - const: asc
         mboxes:
           items:
             - description: GFX coprocessor mailbox
