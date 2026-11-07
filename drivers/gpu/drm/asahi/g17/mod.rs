@@ -1911,15 +1911,24 @@ impl Gpu {
             .prepare_m5_firmware()
             .inspect_err(at("M5 preparation"))?;
         let ack = shared.variant.init_ack;
-        session
-            .primary
-            .init(session.init.root_va(Role::Primary)?, ack)
-            .inspect_err(at("primary InitData"))?;
-        dev_info!(dev.as_ref(), "M5 primary initdata acknowledged\n");
-        let root_va = session.init.root_va(Role::Secondary)?;
+        let primary_root = session.init.root_va(Role::Primary)?;
+        let secondary_root = session.init.root_va(Role::Secondary)?;
+        // The J813's macOS publishes and acknowledges GFX1's InitData first, then GFX's (its
+        // 25G76 trace); the M5 Pro's graph starts with the primary.
+        if cfg.chip_id == 0x8142 {
+            let secondary = session.secondary.as_mut().ok_or(EINVAL)?;
+            secondary.init(secondary_root, ack).inspect_err(at("secondary InitData"))?;
+            dev_info!(dev.as_ref(), "M5 secondary initdata acknowledged\n");
+            session.primary.init(primary_root, ack).inspect_err(at("primary InitData"))?;
+            dev_info!(dev.as_ref(), "M5 primary initdata acknowledged\n");
+        } else {
+            session.primary.init(primary_root, ack).inspect_err(at("primary InitData"))?;
+            dev_info!(dev.as_ref(), "M5 primary initdata acknowledged\n");
+            let secondary = session.secondary.as_mut().ok_or(EINVAL)?;
+            secondary.init(secondary_root, ack).inspect_err(at("secondary InitData"))?;
+            dev_info!(dev.as_ref(), "M5 secondary initdata acknowledged\n");
+        }
         let secondary = session.secondary.as_mut().ok_or(EINVAL)?;
-        secondary.init(root_va, ack).inspect_err(at("secondary InitData"))?;
-        dev_info!(dev.as_ref(), "M5 secondary initdata acknowledged\n");
         session.primary.notify(MSG_POWER_ON_DONE)?;
         secondary.notify(MSG_POWER_ON_DONE)?;
         Self::wait_for_opening(dev, &session.init, &session.primary, session.secondary.as_ref())
