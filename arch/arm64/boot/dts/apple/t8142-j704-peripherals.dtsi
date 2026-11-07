@@ -72,7 +72,7 @@
 		status = "disabled";
 	};
 
-	hw_nub_spmi_a1: spmi@388a08000 {
+	hw_nub_spmi_a1: spmi-resource@388a08000 {
 		compatible = "apple,t8142-spmi", "apple,spmi";
 		reg = <0x3 0x88a08000 0x0 0x4000>,
 		      <0x3 0x88a04000 0x0 0x4000>,

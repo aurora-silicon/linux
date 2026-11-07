@@ -5,6 +5,10 @@
 #include "t8142-j815-peripherals.dtsi"
 
 / {
+	aliases {
+		serial0 = &dockchannel;
+		serial1 = &serial0;
+	};
 	model = "Apple MacBook Air (15-inch, M5)";
 	compatible = "apple,j815", "apple,t8142", "apple,arm-platform";
 };

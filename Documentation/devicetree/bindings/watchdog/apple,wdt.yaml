@@ -120,6 +120,8 @@ allOf:
               description: Physical power and combined clock-gate dependencies.
               minItems: 1
               maxItems: 8
+            clocks:
+              maxItems: 1
           required:
             - compatible
             - reg

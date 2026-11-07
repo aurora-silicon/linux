@@ -37,7 +37,7 @@
 		clocks = <&clkref>;
 	};
 
-	hw_nub_spmi_a1: spmi@308a08000 {
+	hw_nub_spmi_a1: spmi-resource@308a08000 {
 		compatible = "apple,t8152-spmi", "apple,spmi";
 		reg = <0x3 0x8a08000 0x0 0x4000>,
 		      <0x3 0x8a04000 0x0 0x4000>,

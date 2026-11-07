@@ -4,7 +4,7 @@
 /* Register and interrupt resources; ownership-sensitive blocks stay disabled. */
 
 &{/soc} {
-	hw_nub_spmi1: spmi@28a054000 {
+	hw_nub_spmi1: spmi-resource@28a054000 {
 		compatible = "apple,t6050-spmi", "apple,spmi";
 		reg = <0x2 0x8a054000 0x0 0x4000>,
 		      <0x2 0x8a044000 0x0 0x4000>,
@@ -13,7 +13,7 @@
 		interrupts = <AIC_IRQ 0 731 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
-	hw_nub_spmi4: spmi@28a114000 {
+	hw_nub_spmi4: spmi-resource@28a114000 {
 		compatible = "apple,t6050-spmi", "apple,spmi";
 		reg = <0x2 0x8a114000 0x0 0x4000>,
 		      <0x2 0x8a104000 0x0 0x4000>,

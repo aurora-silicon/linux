@@ -37,6 +37,7 @@ select:
               - apple,t6020-usb4-acio
               - apple,t6030-usb4-acio
               - apple,t6031-usb4-acio
+              - apple,t6050-usb4-acio
               - apple,t8103-usb4-acio
               - apple,t8112-usb4-acio
               - apple,t8122-usb4-acio
@@ -59,6 +60,7 @@ select:
                 const: apple,usb4-acio
       required:
         - compatible
+
 properties:
   compatible: true
 
@@ -115,6 +117,18 @@ properties:
       named by the pcie-adapter reg entry. Only meaningful where that entry is
       present.
 
+  apple,tunable-router-ap-fw:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: Register offset
+        - description: Mask of bits to clear
+        - description: Bits to set
+    description: |
+      As apple,tunable-rc, but applied to the PCIe router AP firmware
+      registers named by the router-ap-fw reg entry, with the other router
+      tunables once the co-processor firmware is ready.
+
   '#address-cells':
     const: 1
 
@@ -164,8 +178,7 @@ properties:
     $ref: /schemas/thunderbolt/apple,t8103-usb4-nhi.yaml#
     description: Native Host Interface exposed by ACIO
 
-# The root declares the union of property types for DTB decoding. The
-# conditional variants below each retain their closed property contract.
+# Root property types are shared; each conditional variant remains closed.
 additionalProperties: true
 
 allOf:
@@ -243,6 +256,7 @@ $defs:
         oneOf:
           - const: apple,t8103-usb4-acio
           - const: apple,t8142-usb4-acio
+          - const: apple,t6050-usb4-acio
           - items:
               - enum:
                   - apple,t6000-usb4-acio
@@ -263,7 +277,8 @@ $defs:
               PCIe adapter configuration space of the USB4 router. Present where
               the root complex exposes the adapter separately, so that the tunnel
               can be configured before a PCIe-C link is brought up.
-          - description: MxWrap co-processor control registers, on T8132
+          - description: MxWrap co-processor control registers, on T8132 and T6050
+          - description: PCIe router AP firmware registers, on T6050
 
       reg-names:
         minItems: 2
@@ -272,6 +287,7 @@ $defs:
           - const: sram
           - const: pcie-adapter
           - const: cpu
+          - const: router-ap-fw
 
       mboxes:
         maxItems: 1
@@ -284,11 +300,12 @@ $defs:
 
       power-domains:
         minItems: 3
-        maxItems: 4
+        maxItems: 5
         description: |
-          The first three domains power the ACIO co-processor complex. When
-          apple,pcie-tunnel is present, the fourth domain powers its PCIe-C
-          controller and is enabled only after the USB4 PCIe tunnel is active.
+          The first three domains (four on T6050) power the ACIO co-processor
+          complex. When apple,pcie-tunnel is present, the domain after them powers
+          its PCIe-C controller and is enabled only after the USB4 PCIe tunnel is
+          active.
 
       thunderbolt-switch:
         type: boolean
@@ -330,6 +347,18 @@ $defs:
           As apple,tunable-rc, but applied to the PCIe adapter configuration space
           named by the pcie-adapter reg entry. Only meaningful where that entry is
           present.
+
+      apple,tunable-router-ap-fw:
+        $ref: /schemas/types.yaml#/definitions/uint32-matrix
+        items:
+          items:
+            - description: Register offset
+            - description: Mask of bits to clear
+            - description: Bits to set
+        description: |
+          As apple,tunable-rc, but applied to the PCIe router AP firmware
+          registers named by the router-ap-fw reg entry, with the other router
+          tunables once the co-processor firmware is ready.
 
       '#address-cells':
         const: 1
@@ -402,7 +431,9 @@ $defs:
           properties:
             compatible:
               contains:
-                const: apple,t8132-usb4-acio
+                enum:
+                  - apple,t6050-usb4-acio
+                  - apple,t8132-usb4-acio
         then:
           properties:
             reg:
@@ -415,6 +446,24 @@ $defs:
         else:
           properties:
             lstx-gpios: false
+      - if:
+          properties:
+            compatible:
+              contains:
+                const: apple,t6050-usb4-acio
+        then:
+          properties:
+            reg:
+              minItems: 5
+            reg-names:
+              minItems: 5
+            power-domains:
+              minItems: 4
+        else:
+          properties:
+            power-domains:
+              maxItems: 4
+            apple,tunable-router-ap-fw: false
     additionalProperties: false
 
 examples:
