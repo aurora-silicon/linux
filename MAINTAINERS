@@ -2836,6 +2836,8 @@ S:	Maintained
 W:	https://aurora-silicon.github.io
 F:	Documentation/devicetree/bindings/media/apple,prores.yaml
 F:	drivers/media/platform/apple/prores/
+F:	tools/asahi/prores-enc.c
+F:	tools/asahi/prores-queue-tests.py
 
 ARM/APPLE QSPIMC DRIVER
 M:	Ryan Murray <ryan@aurorasilicon.org>

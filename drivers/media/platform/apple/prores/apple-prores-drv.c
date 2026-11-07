@@ -2,8 +2,8 @@
 /*
  * Apple ProRes (APR) V4L2 memory-to-memory encoder.
  *
- * One job runs at a time. The driver writes a descriptor into a 128 KiB DMA
- * ring, advances the producer head and waits for the completion interrupt.
+ * Publish a bounded batch of up to four descriptors in a 128 KiB DMA ring.
+ * Keep the batch mapped until each descriptor has an acknowledged DONE.
  * Raw frames come in on the OUTPUT queue as semi-planar 4:2:2 or 4:4:4 (8 or
  * 16 bits per sample) and complete ProRes frames go out on CAPTURE.
  *
@@ -46,7 +46,34 @@
 #define APR_TIMEOUT_MS		1000
 #define APR_POLL_MS		4
 #define APR_AUTOSUSPEND_MS	500
-#define APR_RING_ENTRIES	(APR_RING_BYTES / APR_DESC_BYTES)
+#define APR_MAX_DEPTH		4
+
+/* Snapshot at batch start; writes affect the next batch only. */
+static unsigned int apr_depth = 1;
+
+static int apr_set_depth(const char *val, const struct kernel_param *kp)
+{
+	unsigned int depth;
+	int ret = kstrtouint(val, 0, &depth);
+
+	if (ret)
+		return ret;
+	if (!depth || depth > APR_MAX_DEPTH)
+		return -EINVAL;
+	WRITE_ONCE(*(unsigned int *)kp->arg, depth);
+	return 0;
+}
+
+static const struct kernel_param_ops apr_depth_ops = {
+	.set = apr_set_depth,
+	.get = param_get_uint,
+};
+module_param_cb(depth, &apr_depth_ops, &apr_depth, 0644);
+MODULE_PARM_DESC(depth, "Hardware descriptors per batch (1-4, default 1); requires one DONE per job");
+
+struct apr_job {
+	struct vb2_v4l2_buffer *src, *dst;
+};
 
 struct apr_fmt {
 	u32 fourcc;
@@ -213,10 +240,14 @@ struct apr_dev {
 	size_t stats_size;
 
 	spinlock_t hw_lock;	/* protects the fields below */
-	struct apr_ctx *active;	/* job in the engine, or NULL */
+	struct apr_ctx *active;	/* owns the m2m slot until every buffer is returned */
+	struct apr_job jobs[APR_MAX_DEPTH];
+	struct apr_batch batch;
+	bool recovering;
+	bool quarantined;	/* reset failed: retain every DMA owner until reboot */
 	u32 head;		/* next free ring offset */
 	bool ring_ready;	/* engine registers programmed since power-up */
-	bool broken;		/* timed out with no way to reset */
+	bool broken;		/* machine reset required before further submission */
 	unsigned long started;	/* jiffies at submission */
 	struct delayed_work watchdog;
 };
@@ -386,35 +417,39 @@ static void apr_finish_job(struct apr_dev *apr, struct apr_ctx *ctx, int err)
 	struct vb2_v4l2_buffer *src, *dst;
 	u32 bytes = 0;
 
-	src = v4l2_m2m_src_buf_remove(m2m);
-	dst = v4l2_m2m_dst_buf_remove(m2m);
-	if (WARN_ON(!src || !dst))
-		goto out;
+	/* The m2m slot and runtime PM reference cover the entire batch. */
+	for (unsigned int i = 0; i < apr->batch.count; i++) {
+		src = v4l2_m2m_src_buf_remove(m2m);
+		dst = v4l2_m2m_dst_buf_remove(m2m);
+		if (WARN_ON(!src || !dst))
+			break;
+		bytes = 0;
 
-	if (!err) {
-		u8 *out = vb2_plane_vaddr(&dst->vb2_buf, 0);
+		if (!err) {
+			u8 *out = vb2_plane_vaddr(&dst->vb2_buf, 0);
 
-		/* The engine wrote the frame through the DART; see it now. */
-		dma_rmb();
-		err = out ? apr_check_output(out, vb2_plane_size(&dst->vb2_buf, 0),
-					     &bytes) : -EIO;
-		if (err)
-			dev_err_ratelimited(apr->dev, "engine returned no frame\n");
+			/* The engine wrote the frame through the DART; see it now. */
+			dma_rmb();
+			err = out ? apr_check_output(out, vb2_plane_size(&dst->vb2_buf, 0),
+						     &bytes) : -EIO;
+			if (err)
+				dev_err_ratelimited(apr->dev, "engine returned no frame\n");
+		}
+		vb2_set_plane_payload(&dst->vb2_buf, 0, err ? 0 : bytes);
+		v4l2_m2m_buf_copy_metadata(src, dst);
+		dst->sequence = ctx->sequence++;
+		dst->flags |= V4L2_BUF_FLAG_KEYFRAME;
+		if (v4l2_m2m_is_last_draining_src_buf(m2m, src)) {
+			static const struct v4l2_event eos = { .type = V4L2_EVENT_EOS };
+
+			dst->flags |= V4L2_BUF_FLAG_LAST;
+			v4l2_event_queue_fh(&ctx->fh, &eos);
+			v4l2_m2m_mark_stopped(m2m);
+		}
+		v4l2_m2m_buf_done(src, err ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
+		v4l2_m2m_buf_done(dst, err ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
 	}
-	vb2_set_plane_payload(&dst->vb2_buf, 0, err ? 0 : bytes);
-	v4l2_m2m_buf_copy_metadata(src, dst);
-	dst->sequence = ctx->sequence++;
-	dst->flags |= V4L2_BUF_FLAG_KEYFRAME;
-	if (v4l2_m2m_is_last_draining_src_buf(m2m, src)) {
-		static const struct v4l2_event eos = { .type = V4L2_EVENT_EOS };
-
-		dst->flags |= V4L2_BUF_FLAG_LAST;
-		v4l2_event_queue_fh(&ctx->fh, &eos);
-		v4l2_m2m_mark_stopped(m2m);
-	}
-	v4l2_m2m_buf_done(src, err ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
-	v4l2_m2m_buf_done(dst, err ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
-out:
+	apr->batch.count = 0;
 	pm_runtime_mark_last_busy(apr->dev);
 	pm_runtime_put_autosuspend(apr->dev);
 	v4l2_m2m_job_finish(apr->m2m_dev, m2m);
@@ -424,26 +459,41 @@ out:
  * Claim the active job if the engine has finished it. Returns the context to
  * finish, or NULL. Called with hw_lock held.
  */
-static struct apr_ctx *apr_take_done(struct apr_dev *apr, int *err)
+static struct apr_ctx *apr_take_done(struct apr_dev *apr, int *err, u32 *status_out)
 {
 	struct apr_ctx *ctx = apr->active;
 	u32 status, tail;
 
-	if (!ctx)
+	*status_out = 0;
+	if (!ctx || apr->recovering || apr->quarantined)
 		return NULL;
 	status = apr_read(apr, APR_REG_IRQ_STATUS);
 	if (!status)
 		return NULL;
+	*status_out = status;
 	apr_write(apr, APR_REG_IRQ_STATUS, status);
+	/* Flush the posted ACK before another status observation can count DONE. */
 	tail = apr_read(apr, APR_REG_RING_TAIL) & APR_RING_PTR_MASK;
-	*err = 0;
-	if (status != APR_IRQ_DONE || tail != apr->head) {
+	*err = apr_batch_complete(&apr->batch, status, tail);
+	if (*err < 0) {
 		dev_err_ratelimited(apr->dev,
 				    "job failed: status %#x tail %#x head %#x st %#x/%#x\n",
 				    status, tail, apr->head,
 				    apr_read(apr, APR_REG_ST0), apr_read(apr, APR_REG_ST1));
-		*err = -EIO;
+		apr->recovering = true;
+		apr_write(apr, APR_REG_IRQ_ENABLE, 0);
+		apr_write(apr, APR_REG_MODE, APR_MODE_OFF);
+		mod_delayed_work(system_wq, &apr->watchdog, 0);
+		return NULL;
 	}
+	dev_dbg(apr->dev, "completion: done %u/%u head %#x tail %#x status %#x\n",
+		apr->batch.done, apr->batch.count, apr->head, tail, status);
+	if (!*err) {
+		/* Keep the whole batch mapped, including completed frames. */
+		apr->started = jiffies;
+		return NULL;
+	}
+	*err = 0;
 	apr->active = NULL;
 	return ctx;
 }
@@ -452,32 +502,34 @@ static irqreturn_t apr_irq(int irq, void *data)
 {
 	struct apr_dev *apr = data;
 	struct apr_ctx *ctx;
+	u32 status;
 	int err = 0;
 
 	spin_lock(&apr->hw_lock);
-	ctx = apr_take_done(apr, &err);
+	ctx = apr_take_done(apr, &err, &status);
 	spin_unlock(&apr->hw_lock);
 	if (!ctx)
-		return IRQ_NONE;
+		return status ? IRQ_HANDLED : IRQ_NONE;
 	cancel_delayed_work(&apr->watchdog);
 	apr_finish_job(apr, ctx, err);
 	return IRQ_HANDLED;
 }
 
 /*
- * Backstop for a lost interrupt and for hangs. A hung engine is reset
- * through its power domain and reprogrammed; without a reset line the
- * device refuses further jobs rather than reuse memory it may still own.
+ * Backstop for a lost interrupt and for hangs. Reset before returning the
+ * batch's DMA buffers. Do not submit again after a domain reset: the DART
+ * shares the domain and its translation state must first be restored.
  */
 static void apr_watchdog(struct work_struct *work)
 {
 	struct apr_dev *apr = container_of(work, struct apr_dev, watchdog.work);
 	struct apr_ctx *ctx;
 	unsigned long flags;
+	u32 status;
 	int err = 0;
 
 	spin_lock_irqsave(&apr->hw_lock, flags);
-	ctx = apr_take_done(apr, &err);
+	ctx = apr_take_done(apr, &err, &status);
 	if (ctx) {
 		spin_unlock_irqrestore(&apr->hw_lock, flags);
 		dev_warn_once(apr->dev, "completion found without an interrupt\n");
@@ -485,87 +537,153 @@ static void apr_watchdog(struct work_struct *work)
 		return;
 	}
 	ctx = apr->active;
-	if (!ctx) {
+	if (!ctx || apr->quarantined) {
 		spin_unlock_irqrestore(&apr->hw_lock, flags);
 		return;
 	}
-	if (time_before(jiffies, apr->started + msecs_to_jiffies(APR_TIMEOUT_MS))) {
+	if (!apr->recovering &&
+	    time_before(jiffies, apr->started + msecs_to_jiffies(APR_TIMEOUT_MS))) {
 		spin_unlock_irqrestore(&apr->hw_lock, flags);
 		schedule_delayed_work(&apr->watchdog, msecs_to_jiffies(APR_POLL_MS));
 		return;
 	}
-	dev_err(apr->dev, "job timed out: head %#x tail %#x st %#x/%#x\n",
-		apr->head, apr_read(apr, APR_REG_RING_TAIL),
-		apr_read(apr, APR_REG_ST0), apr_read(apr, APR_REG_ST1));
+	if (!apr->recovering)
+		dev_err(apr->dev, "job timed out: head %#x tail %#x st %#x/%#x\n",
+			apr->head, apr_read(apr, APR_REG_RING_TAIL),
+			apr_read(apr, APR_REG_ST0), apr_read(apr, APR_REG_ST1));
 	apr->active = NULL;
 	apr_write(apr, APR_REG_IRQ_ENABLE, 0);
 	apr_write(apr, APR_REG_MODE, APR_MODE_OFF);
 	apr->ring_ready = false;
-	/* No new job can start until this one is finished below. */
+	/* A domain reset also loses the DART state: never submit after it. */
+	apr->broken = true;
+	err = apr->recovering ? -EIO : -ETIMEDOUT;
+	apr->recovering = false;
+	/* No new job can start until this batch is finished below. */
 	spin_unlock_irqrestore(&apr->hw_lock, flags);
+	/* A reload cannot repair the shared DART state after this reset. */
+	__module_get(THIS_MODULE);
+	get_device(apr->dev);
 	if (!apr->reset || reset_control_reset(apr->reset)) {
-		dev_err(apr->dev, "engine cannot be reset, refusing further jobs\n");
+		/*
+		 * MODE_OFF alone is not a DMA-stop fence. Keep the m2m slot,
+		 * ready buffers and PM reference; streamoff/close must not free
+		 * their mappings. Pin the fixed platform device and driver until
+		 * a machine reset. Manual unbind is disabled below for this case.
+		 */
 		spin_lock_irqsave(&apr->hw_lock, flags);
-		apr->broken = true;
+		apr->active = ctx;
+		apr->quarantined = true;
 		spin_unlock_irqrestore(&apr->hw_lock, flags);
+		dev_err(apr->dev, "reset failed: DMA buffers retained until machine reset\n");
+		vb2_queue_error(v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx));
+		vb2_queue_error(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx));
+		return;
 	}
-	apr_finish_job(apr, ctx, -ETIMEDOUT);
+	dev_err(apr->dev, "APR/DART domain reset: further jobs require a machine reset\n");
+	apr_finish_job(apr, ctx, err);
 }
 
+/* Called with hw_lock held, after all descriptors and outputs are prepared. */
+static void apr_publish_batch(struct apr_dev *apr, struct apr_ctx *ctx)
+{
+	apr->head = apr_batch_head(&apr->batch);
+	apr->active = ctx;
+	apr->started = jiffies;
+	dev_dbg(apr->dev, "publish: count %u start %#x head %#x\n",
+		apr->batch.count, apr->batch.start, apr->head);
+	dma_wmb();
+	writel(apr->head, apr->regs + APR_REG_RING_HEAD);
+}
+
+/*
+ * Keep the m2m job slot for a whole batch, including buffer callbacks. This
+ * lets m2m cancellation and system suspend wait for DMA ownership to end.
+ * Publish the entire bounded batch. The fetch tail is not a completion
+ * fence: retain every buffer until a separate acknowledged DONE has been
+ * observed for every descriptor. Coalesced interrupts fail closed through
+ * the watchdog; never infer missing completions from the fetch cursor.
+ */
 static void apr_device_run(void *priv)
 {
 	struct apr_ctx *ctx = priv;
 	struct apr_dev *apr = ctx->apr;
-	struct vb2_v4l2_buffer *src, *dst;
-	struct apr_frame f;
+	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
+	struct v4l2_m2m_buffer *buf;
+	unsigned int count, i;
 	unsigned long flags;
-	void *out;
 	int ret;
 
-	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
-	dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
-
+	count = min(v4l2_m2m_num_src_bufs_ready(m2m), v4l2_m2m_num_dst_bufs_ready(m2m));
+	count = min(count, READ_ONCE(apr_depth));
+	if (WARN_ON(!count)) {
+		v4l2_m2m_job_finish(apr->m2m_dev, m2m);
+		return;
+	}
+	apr->batch.count = count;
+	apr->batch.done = 0;
+	/* Keep ready-list membership until completion, including for STOP/EOS. */
+	i = 0;
+	spin_lock_irqsave(&m2m->out_q_ctx.rdy_spinlock, flags);
+	v4l2_m2m_for_each_src_buf(m2m, buf) {
+		apr->jobs[i++].src = &buf->vb;
+		if (i == count)
+			break;
+	}
+	spin_unlock_irqrestore(&m2m->out_q_ctx.rdy_spinlock, flags);
+	i = 0;
+	spin_lock_irqsave(&m2m->cap_q_ctx.rdy_spinlock, flags);
+	v4l2_m2m_for_each_dst_buf(m2m, buf) {
+		apr->jobs[i++].dst = &buf->vb;
+		if (i == count)
+			break;
+	}
+	spin_unlock_irqrestore(&m2m->cap_q_ctx.rdy_spinlock, flags);
 	ret = pm_runtime_resume_and_get(apr->dev);
 	if (ret < 0) {
+		/* Balance the common completion path without claiming a resume. */
 		pm_runtime_get_noresume(apr->dev);
-		apr_finish_job(apr, ctx, ret);
-		return;
+		apr->batch.count = 1;
+		goto finish;
 	}
-	apr_fill_frame(ctx, src, dst, &f);
-	/* Mark the output invalid so a frame the engine never wrote is caught. */
-	out = vb2_plane_vaddr(&dst->vb2_buf, 0);
-	if (!out) {
-		apr_finish_job(apr, ctx, -EINVAL);
-		return;
-	}
-	memset(out, 0, 8);
 
 	spin_lock_irqsave(&apr->hw_lock, flags);
 	if (apr->broken) {
 		spin_unlock_irqrestore(&apr->hw_lock, flags);
-		apr_finish_job(apr, ctx, -EIO);
-		return;
+		ret = -EIO;
+		apr->batch.count = 1;
+		goto finish;
 	}
-	/*
-	 * The engine's ring wrap protocol is not known, so start again at the
-	 * beginning of the ring instead of wrapping. The engine is idle here.
-	 */
-	if (!apr->ring_ready || apr->head + APR_DESC_BYTES > APR_RING_BYTES)
+	/* Restart only while the engine owns no descriptor, before ring end. */
+	if (!apr->ring_ready || apr->head + count * APR_DESC_BYTES > APR_RING_BYTES)
 		apr_hw_init(apr);
-	ret = apr_build_desc(&f, apr->ring + apr->head);
-	if (ret) {
-		spin_unlock_irqrestore(&apr->hw_lock, flags);
-		apr_finish_job(apr, ctx, ret);
-		return;
+	apr->batch.start = apr->head;
+	spin_unlock_irqrestore(&apr->hw_lock, flags);
+
+	for (i = 0; i < count; i++) {
+		struct apr_job *job = &apr->jobs[i];
+		struct apr_frame f;
+		void *out;
+
+		apr_fill_frame(ctx, job->src, job->dst, &f);
+		out = vb2_plane_vaddr(&job->dst->vb2_buf, 0);
+		if (!out) {
+			ret = -EINVAL;
+			goto finish;
+		}
+		memset(out, 0, 8);
+		ret = apr_build_desc(&f, apr->ring + apr->batch.start + i * APR_DESC_BYTES);
+		if (ret)
+			goto finish;
 	}
-	apr->head += APR_DESC_BYTES;
-	apr->active = ctx;
-	apr->started = jiffies;
-	/* Descriptor and buffers must be visible before the head moves. */
-	dma_wmb();
-	writel(apr->head, apr->regs + APR_REG_RING_HEAD);
+	spin_lock_irqsave(&apr->hw_lock, flags);
+	apr_publish_batch(apr, ctx);
 	spin_unlock_irqrestore(&apr->hw_lock, flags);
 	schedule_delayed_work(&apr->watchdog, msecs_to_jiffies(APR_POLL_MS));
+	return;
+
+finish:
+	apr_finish_job(apr, ctx, ret);
 }
 
 static const struct v4l2_m2m_ops apr_m2m_ops = {
@@ -1184,6 +1302,8 @@ static struct platform_driver apr_driver = {
 		.name = APR_NAME,
 		.of_match_table = apr_of_match,
 		.pm = pm_ptr(&apr_pm_ops),
+		/* A failed-reset quarantine must survive an attempted unbind. */
+		.suppress_bind_attrs = true,
 	},
 };
 module_platform_driver(apr_driver);

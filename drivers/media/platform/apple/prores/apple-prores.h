@@ -16,6 +16,7 @@
 #define _APPLE_PRORES_H
 
 #include <linux/bits.h>
+#include <linux/errno.h>
 #include <linux/sizes.h>
 #include <linux/types.h>
 
@@ -52,6 +53,40 @@
 
 #define APR_RING_BYTES		SZ_128K
 #define APR_DESC_BYTES		0x180
+
+/* A bounded hardware batch; retain every DMA mapping until all DONEs. */
+struct apr_batch {
+	u32 start;
+	unsigned int count;
+	unsigned int done;
+};
+
+static inline u32 apr_batch_head(const struct apr_batch *batch)
+{
+	return batch->start + batch->count * APR_DESC_BYTES;
+}
+
+/*
+ * Count only distinct, acknowledged completion events, never fetched entries.
+ * A sticky DONE can merge events: undercount and time out rather than return
+ * a buffer whose DMA completion is uncertain. The caller flushes each ACK
+ * before sampling status again. No descriptors are added to a live batch.
+ *
+ * 0: still owned by hardware, 1: whole batch finished, negative: reset needed.
+ */
+static inline int apr_batch_complete(struct apr_batch *batch, u32 status, u32 tail)
+{
+	if (!status)
+		return -EAGAIN;
+	if (!batch->count || batch->done >= batch->count)
+		return -EINVAL;
+	if (status != APR_IRQ_DONE || tail > apr_batch_head(batch) ||
+	    tail < batch->start + (batch->done + 1) * APR_DESC_BYTES ||
+	    (tail - batch->start) % APR_DESC_BYTES)
+		return -EIO;
+	batch->done++;
+	return batch->done == batch->count;
+}
 
 /* Quantisation tables the engine holds, in register order. */
 enum apr_qtable {
