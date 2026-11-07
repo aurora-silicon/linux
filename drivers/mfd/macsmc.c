@@ -769,8 +769,41 @@ static void apple_smc_notice_on(struct apple_smc *smc)
 	apple_smc_wake_reason_names(smc->wake_record, names, sizeof(names));
 	dev_info(smc->dev, "wake record: MBSE %#x, MBSW %8ph%s%s\n", event, record,
 		 names[0] ? ": " : "", names);
-	if (smc->wake_record)
-		pm_wakeup_event(smc->dev, 0);
+}
+
+/* MBSW's bit for a wake reason, by its name, or -1. */
+static int apple_smc_wake_reason_bit(const char *name)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(apple_smc_wake_reasons); i++)
+		if (!strcmp(apple_smc_wake_reasons[i].name, name))
+			return apple_smc_wake_reasons[i].bit;
+
+	return -1;
+}
+
+/*
+ * Woken for the lid alone, which the SMC reports for the lid opening and for it closing:
+ * tell the sleep driver if it's closed now.
+ */
+static void apple_smc_lid_wake(struct apple_smc *smc)
+{
+	int bit = apple_smc_wake_reason_bit("lid");
+	u8 lid = 0;
+	int ret;
+
+	if (bit < 0 || smc->wake_record != BIT_ULL(bit))
+		return;
+
+	ret = apple_smc_read_u8(smc, SMC_KEY(MSLD), &lid);
+	if (ret < 0) {
+		dev_warn(smc->dev, "Failed to read the lid after a wake: %d\n", ret);
+		return;
+	}
+	dev_info(smc->dev, "woken for the lid, which is %s\n", lid ? "closed" : "open");
+	if (lid)
+		apple_sleep_lid_closed_wake();
 }
 
 static void apple_smc_sleep_wake(struct apple_smc *smc)
@@ -778,6 +811,10 @@ static void apple_smc_sleep_wake(struct apple_smc *smc)
 	apple_smc_notice_on(smc);
 	apple_smc_write_mbse(smc, SMC_KEY(waka));
 	smc->sleep_warned = false;
+	apple_smc_lid_wake(smc);
+	/* A dark wake isn't one: with wakeup_count in use, it would abort the sleep after it. */
+	if (smc->wake_record && !pm_dark_wake())
+		pm_wakeup_event(smc->dev, 0);
 }
 
 static int apple_smc_prepare(struct device *dev)

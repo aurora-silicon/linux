@@ -13,6 +13,7 @@ struct macsmc_test_context {
 	u32 seen[8];
 	unsigned int seen_count;
 	int ap_power_result;
+	u64 record;
 };
 
 #define MACSMC_TEST_AP_IDLE	0
@@ -279,6 +280,46 @@ static void macsmc_notice_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ctx->seen[3], SMC_KEY(MBSW));
 }
 
+/* MBSW reads ctx->record, MSLD reads closed. */
+static int macsmc_test_lid_read(struct apple_smc *smc, smc_key key, void *buf, size_t size)
+{
+	struct macsmc_test_context *ctx = container_of(smc, struct macsmc_test_context, smc);
+
+	if (ctx->seen_count < ARRAY_SIZE(ctx->seen))
+		ctx->seen[ctx->seen_count++] = key;
+	memset(buf, 0, size);
+	if (key == SMC_KEY(MBSW) && size == sizeof(ctx->record))
+		put_unaligned_le64(ctx->record, buf);
+	else if (key == SMC_KEY(MSLD))
+		*(u8 *)buf = 1;
+	return size;
+}
+
+static void macsmc_lid_wake_test(struct kunit *test)
+{
+	struct macsmc_test_context *ctx = test->priv;
+
+	kunit_activate_static_stub(test, apple_smc_ap_power, macsmc_test_ap_power);
+	kunit_activate_static_stub(test, apple_smc_read, macsmc_test_lid_read);
+	ctx->result = 4;
+
+	/* The lid alone: MSLD is read last, after macOS's own order. */
+	ctx->record = BIT_ULL(10);
+	apple_smc_sleep_wake(&ctx->smc);
+	KUNIT_ASSERT_EQ(test, ctx->seen_count, 5U);
+	KUNIT_EXPECT_EQ(test, ctx->seen[0], (u32)MACSMC_TEST_AP_ON);
+	KUNIT_EXPECT_EQ(test, ctx->seen[1], SMC_KEY(MBSE));
+	KUNIT_EXPECT_EQ(test, ctx->seen[2], SMC_KEY(MBSW));
+	KUNIT_EXPECT_EQ(test, ctx->seen[3], SMC_KEY(waka));
+	KUNIT_EXPECT_EQ(test, ctx->seen[4], SMC_KEY(MSLD));
+
+	/* The lid with anything else is a normal wake: the lid isn't read. */
+	ctx->seen_count = 0;
+	ctx->record = BIT_ULL(10) | BIT_ULL(0);
+	apple_smc_sleep_wake(&ctx->smc);
+	KUNIT_EXPECT_EQ(test, ctx->seen_count, 4U);
+}
+
 static void macsmc_wake_reason_test(struct kunit *test)
 {
 	char names[128];
@@ -304,6 +345,7 @@ static struct kunit_case macsmc_parser_cases[] = {
 	KUNIT_CASE(macsmc_sleep_order_test),
 	KUNIT_CASE(macsmc_sleep_refused_test),
 	KUNIT_CASE(macsmc_notice_test),
+	KUNIT_CASE(macsmc_lid_wake_test),
 	KUNIT_CASE(macsmc_wake_reason_test),
 	{}
 };

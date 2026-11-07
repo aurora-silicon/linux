@@ -83,6 +83,13 @@ bool apple_sleep_debug_link_cut_peek(struct device *dev);
  */
 bool apple_sleep_debug_link_cut(void);
 
+/*
+ * From the SMC's driver, in its noirq resume: the SMC woke the AP for the lid alone, and the
+ * lid reads closed. If nothing else woke the SoC, the PM core goes back to sleep once every
+ * device has resumed, as macOS does from a dark wake.
+ */
+void apple_sleep_lid_closed_wake(void);
+
 /* The radio's host has its port back after a real sleep, so the next commit may stop it. */
 void apple_sleep_radio_port_up(void);
 
@@ -163,6 +170,10 @@ static inline bool apple_sleep_debug_link_cut_peek(struct device *dev)
 static inline bool apple_sleep_debug_link_cut(void)
 {
 	return false;
+}
+
+static inline void apple_sleep_lid_closed_wake(void)
+{
 }
 
 static inline void apple_sleep_radio_port_up(void)

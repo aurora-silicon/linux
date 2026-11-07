@@ -332,7 +332,7 @@ static struct {
 #define IPI_SR_PENDING		BIT(0)
 #define SYS_APL_SIQ_CFG_EL1	sys_reg(3, 4, 15, 10, 4)
 
-/* The names of ADT pmgr/ap-wake-sources, for the log only */
+/* The names of ADT pmgr/ap-wake-sources: for the log, and to tell the SMC's apart */
 static const struct {
 	u32 id;
 	const char *name;
@@ -410,6 +410,8 @@ struct t8140_sleep {
 	u32 wake_enable[WAKE_SOURCES_MAX];
 	int wake_enable_count;
 	u32 wake_saved[WAKE_WORDS];
+	/* The sources this sleep left enabled. */
+	u32 wake_armed[WAKE_WORDS];
 
 	struct {
 		struct device_node *np;
@@ -479,6 +481,8 @@ struct t8140_sleep {
 	int radio_perst;
 	bool radio_perst_low;
 	bool returned;
+	/* This sleep's wake came from the SMC's sources alone. */
+	bool smc_woke_alone;
 };
 
 static struct t8140_sleep *t8140_sleep;
@@ -1444,8 +1448,10 @@ static void t8140_wake_arm(struct t8140_sleep *s)
 	for (i = 0; i < WAKE_WORDS; i++)
 		s->wake_saved[i] = readl(s->wake + WAKE_MASK(i));
 	t8140_wake_masks(s, val);
-	for (i = 0; i < WAKE_WORDS; i++)
+	for (i = 0; i < WAKE_WORDS; i++) {
 		writel(val[i], s->wake + WAKE_MASK(i));
+		s->wake_armed[i] = ~val[i];
+	}
 }
 
 static void t8140_wake_restore(struct t8140_sleep *s)
@@ -1648,6 +1654,21 @@ bool apple_sleep_debug_link_cut(void)
 	return t8140_sleep ? t8140_sleep_usb_down(t8140_sleep) : false;
 }
 EXPORT_SYMBOL_GPL(apple_sleep_debug_link_cut);
+
+/*
+ * macOS takes the wake for a lid closing during the sleep as a dark one: every driver wakes,
+ * the display stays off, and the root domain sleeps again as soon as it sees the lid closed.
+ */
+void apple_sleep_lid_closed_wake(void)
+{
+	struct t8140_sleep *s = t8140_sleep;
+
+	if (!s || !s->smc_woke_alone)
+		return;
+	dev_info(s->dev, "the lid closed during the sleep: dark wake\n");
+	pm_set_dark_wake();
+}
+EXPORT_SYMBOL_GPL(apple_sleep_lid_closed_wake);
 
 /*
  * The radio's link and the engine that starts it, in macOS's order, measured on one
@@ -2576,6 +2597,7 @@ static int t8140_sleep_begin(suspend_state_t state)
 	if (t8140_sleep) {
 		t8140_sleep->apcie_port_stopped = false;
 		t8140_sleep->usb_down_ran = false;
+		t8140_sleep->smc_woke_alone = false;
 		t8140_pins_save(t8140_sleep);
 	}
 	t8140_sleep_set_wd2(t8140_sleep, WDT_SUSPEND_SECS);
@@ -2630,14 +2652,41 @@ static int t8140_sleep_prepare(void)
 	return 0;
 }
 
+/* Only the SMC's sources woke the SoC. */
+static bool t8140_sleep_smc_woke_alone(struct t8140_sleep *s)
+{
+	u32 smc[WAKE_WORDS] = {};
+	bool any = false;
+	int i;
+
+	/* SMC.CPUWakeupAP and SMC.OutboxNotEmpty, by their names. */
+	for (i = 0; i < ARRAY_SIZE(t8140_wake_names); i++) {
+		u32 id = t8140_wake_names[i].id;
+
+		if (strstarts(t8140_wake_names[i].name, "SMC.") && id / 32 < WAKE_WORDS)
+			smc[id / 32] |= BIT(id % 32);
+	}
+	for (i = 0; i < WAKE_WORDS; i++) {
+		u32 woke = s->wake_status[i] & s->wake_armed[i];
+
+		if (woke & ~smc[i])
+			return false;
+		any |= !!woke;
+	}
+
+	return any;
+}
+
 static void t8140_sleep_report(void)
 {
 	struct t8140_sleep *s = t8140_sleep;
 	int i;
 
+	s->smc_woke_alone = false;
 	if (!s->returned)
 		return;
 	s->returned = false;
+	s->smc_woke_alone = t8140_sleep_smc_woke_alone(s);
 
 	dev_info(s->dev, "back from sleep, boot object resumes %llu -> %llu\n",
 		 s->resumes_before, s->resumes_after);
