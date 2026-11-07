@@ -18,10 +18,19 @@ description:
 
 properties:
   compatible:
-    const: apple,sep
+    oneOf:
+      - const: apple,sep
+      - items:
+          - enum:
+              - apple,t6030-sep
+              - apple,t6031-sep
+          - const: apple,sep
 
   reg:
-    maxItems: 1
+    minItems: 1
+    items:
+      - description: Coprocessor control registers
+      - description: Coprocessor boot interface
 
   mboxes:
     maxItems: 1

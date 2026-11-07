@@ -51,6 +51,7 @@
 #include "afk.h"
 #include "av.h"
 #include "dcp.h"
+#include "dcp-edr.h"
 #include "dcp-panel-adt.h"
 #include <linux/io.h>
 #include <linux/of_address.h>
@@ -833,8 +834,7 @@ const struct drm_edid *dcp_firmware_edid(struct apple_dcp *dcp, u64 *generation)
 
 /*
  * m1n1 reserves the original ADT as a phram node labelled "adt". Read it
- * without an MTD dependency. Only the desktop panel calls this; other DCP
- * profiles retain their established identity and brightness paths.
+ * without an MTD dependency.
  */
 void dcp_panel_read_dimensions(struct apple_dcp *dcp, struct device_node *panel_np)
 {
@@ -845,10 +845,17 @@ void dcp_panel_read_dimensions(struct apple_dcp *dcp, struct device_node *panel_
 		of_property_read_u32(panel_np, "adj-height-mm", &dcp->panel.height_mm);
 }
 
-static void dcp_panel_adt_identity(struct apple_dcp *dcp)
+/*
+ * Every internal panel gets an identity, so userspace can tell it apart and
+ * keep per-display settings such as its brightness.  The identity state is
+ * allocated at probe (bind may fail and run again); bind fills it in.
+ */
+static void dcp_panel_read_adt(struct apple_dcp *dcp)
 {
+	bool desktop = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
 	struct dcp_panel_adt panel = {
-		.identity = { .manufacturer = "APP", .product = 0x0616 },
+		/* The J616s panel kept the product code it was first published with. */
+		.identity = { .manufacturer = "APP", .product = desktop ? 0x0616 : 0 },
 		.width_mm = dcp->panel.width_mm,
 		.height_mm = dcp->panel.height_mm,
 	};
@@ -874,32 +881,42 @@ static void dcp_panel_adt_identity(struct apple_dcp *dcp)
 		break;
 	}
 	of_node_put(np);
-	/* The board's OF panel dimensions remain valid if ADT has none. */
+	/*
+	 * The board's OF panel dimensions remain valid if ADT has none.  With
+	 * the notch hidden the modes are trimmed, so keep OF's adj-height-mm.
+	 */
 	dcp->panel.width_mm = panel.width_mm;
-	dcp->panel.height_mm = panel.height_mm;
-	dcp->desktop->panel_adt_identity = panel.identity;
-	dev_info(dcp->dev, "panel identity fallback: ADT %s, panel node %s, dimensions %ux%u mm\n",
+	if (!dcp->notch_height)
+		dcp->panel.height_mm = panel.height_mm;
+	if (dcp->panel_identity)
+		dcp->panel_identity->adt = panel.identity;
+	dcp->panel.color_target = ret ? NULL : dcp_panel_gamut_color_space(panel.gamut);
+	if (desktop)
+		dcp->panel.edr_ceiling = dcp_edr_ceiling(panel.edr_potential_headroom);
+	dev_info(dcp->dev, "panel ADT: %s, panel node %s, dimensions %ux%u mm\n",
 		 ret ? "unavailable" : "parsed", panel.found ? "present" : "absent",
-		 panel.width_mm, panel.height_mm);
+		 dcp->panel.width_mm, dcp->panel.height_mm);
+	if (dcp->panel.edr_ceiling)
+		dev_info(dcp->dev, "panel EDR headroom up to %u.%03u\n",
+			 dcp->panel.edr_ceiling / 1000, dcp->panel.edr_ceiling % 1000);
 }
 
 /* Internal panel identity has no detachable Type-C service or EDID transport. */
 void dcp_panel_metadata_replace(struct apple_dcp *dcp,
 				const struct dcp_display_metadata *metadata)
 {
+	struct dcp_panel_identity *id = dcp->panel_identity;
 	struct dcp_display_metadata merged;
 	unsigned long flags;
 	bool changed = false;
 
-	if (!metadata || dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP ||
-	    !dcp_has_panel(dcp))
+	if (!metadata || !id || !dcp_has_panel(dcp))
 		return;
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
 	merged = *metadata;
-	if (dcp->desktop->panel_metadata_valid &&
-	    merged.product == dcp->desktop->panel_metadata.product &&
-	    !memcmp(merged.manufacturer, dcp->desktop->panel_metadata.manufacturer, 4)) {
-		const struct dcp_display_metadata *old = &dcp->desktop->panel_metadata;
+	if (id->metadata_valid && merged.product == id->metadata.product &&
+	    !memcmp(merged.manufacturer, id->metadata.manufacturer, 4)) {
+		const struct dcp_display_metadata *old = &id->metadata;
 		bool same_serial = !merged.serial || merged.serial == old->serial;
 
 		/* Zero/empty optional fields mean unspecified, not a new panel. */
@@ -920,12 +937,11 @@ void dcp_panel_metadata_replace(struct apple_dcp *dcp,
 		if (!merged.week)
 			merged.week = old->week;
 	}
-	if (!dcp->desktop->panel_metadata_valid ||
-	    memcmp(&dcp->desktop->panel_metadata, &merged, sizeof(merged))) {
-		dcp->desktop->panel_metadata = merged;
-		dcp->desktop->panel_metadata_valid = true;
-		if (!dcp->desktop->panel_raw_edid_size) {
-			dcp->desktop->panel_metadata_generation++;
+	if (!id->metadata_valid || memcmp(&id->metadata, &merged, sizeof(merged))) {
+		id->metadata = merged;
+		id->metadata_valid = true;
+		if (!id->raw_edid_size) {
+			id->generation++;
 			changed = true;
 		}
 	}
@@ -970,14 +986,14 @@ static bool dcp_panel_edid_has_identity(const u8 *raw)
 /* Preserve a validated real EDID ahead of any metadata-derived fallback. */
 void dcp_panel_edid_receive(struct apple_dcp *dcp, const void *blob, size_t len)
 {
+	struct dcp_panel_identity *id = dcp->panel_identity;
 	const struct drm_edid *edid;
 	const u8 *raw;
 	size_t size;
 	unsigned long flags;
 	bool changed;
 
-	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP || !dcp_has_panel(dcp) ||
-	    parse_panel_edid_data(blob, len, &raw, &size))
+	if (!id || !dcp_has_panel(dcp) || parse_panel_edid_data(blob, len, &raw, &size))
 		return;
 	edid = drm_edid_alloc(raw, size);
 	if (!edid)
@@ -987,12 +1003,11 @@ void dcp_panel_edid_receive(struct apple_dcp *dcp, const void *blob, size_t len)
 		return;
 	}
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
-	changed = size != dcp->desktop->panel_raw_edid_size ||
-		  memcmp(raw, dcp->desktop->panel_raw_edid, size);
+	changed = size != id->raw_edid_size || memcmp(raw, id->raw_edid, size);
 	if (changed) {
-		memcpy(dcp->desktop->panel_raw_edid, raw, size);
-		dcp->desktop->panel_raw_edid_size = size;
-		dcp->desktop->panel_metadata_generation++;
+		memcpy(id->raw_edid, raw, size);
+		id->raw_edid_size = size;
+		id->generation++;
 	}
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	drm_edid_free(edid);
@@ -1005,8 +1020,10 @@ bool dcp_panel_metadata_current(struct apple_dcp *dcp, u64 generation)
 	unsigned long flags;
 	bool valid;
 
+	if (!dcp->panel_identity)
+		return false;
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
-	valid = generation == dcp->desktop->panel_metadata_generation;
+	valid = generation == dcp->panel_identity->generation;
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	return valid;
 }
@@ -1015,21 +1032,23 @@ const struct drm_edid *dcp_panel_edid_snapshot(struct apple_dcp *dcp,
 					       const struct dcp_display_mode *modes,
 					       unsigned int count, u64 *generation)
 {
+	struct dcp_panel_identity *id = dcp->panel_identity;
 	struct dcp_display_metadata metadata;
 	const struct drm_edid *edid;
 	u8 *raw;
 	size_t size;
 	unsigned long flags;
 
-	raw = kmalloc_objs(u8, sizeof(dcp->desktop->panel_raw_edid), GFP_KERNEL);
+	if (!id)
+		return ERR_PTR(-ENODEV);
+	raw = kmalloc_objs(u8, sizeof(id->raw_edid), GFP_KERNEL);
 	if (!raw)
 		return ERR_PTR(-ENOMEM);
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
-	size = dcp->desktop->panel_raw_edid_size;
-	memcpy(raw, dcp->desktop->panel_raw_edid, size);
-	metadata = dcp->desktop->panel_metadata_valid ?
-		dcp->desktop->panel_metadata : dcp->desktop->panel_adt_identity;
-	*generation = dcp->desktop->panel_metadata_generation;
+	size = id->raw_edid_size;
+	memcpy(raw, id->raw_edid, size);
+	metadata = id->metadata_valid ? id->metadata : id->adt;
+	*generation = id->generation;
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	/* PQ content is shown as EDR up to the peak (see dcp_edr_prepare()). */
 	if (READ_ONCE(dcp->panel.peak_nits)) {
@@ -1042,7 +1061,7 @@ const struct drm_edid *dcp_panel_edid_snapshot(struct apple_dcp *dcp,
 	}
 	/* The caller supplies the same retained catalog it is publishing. */
 	edid = size ? drm_edid_alloc(raw, size) :
-		dcp_panel_edid(&metadata, modes, count,
+		dcp_panel_edid(&metadata, dcp->panel.color_target, modes, count,
 			       dcp->panel.width_mm, dcp->panel.height_mm);
 	kfree(raw);
 	if (!edid)
@@ -4081,6 +4100,18 @@ static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
 
 #define DCP_BL_FALLBACK_DELAY msecs_to_jiffies(2000)
 
+/*
+ * H17G (M5) internal panel: a pipe stop never comes back (see
+ * iomfb_blank_h17p()), so DPMS blanks the panel and keeps the pipe running.
+ */
+static bool dcp_h17g_panel(struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	       dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G &&
+	       dcp->connector_type == DRM_MODE_CONNECTOR_eDP &&
+	       dcp_has_panel(dcp);
+}
+
 static bool dcp_uses_soft_dpms(struct apple_dcp *dcp)
 {
 	/* The 14.7 panel has its own known-level blank and restore hooks. */
@@ -4168,6 +4199,12 @@ void dcp_poweron(struct platform_device *pdev)
 		ret = dcp_backlight_dpms(dcp, true);
 		if (ret)
 			dev_warn(dcp->dev, "backlight restore unavailable: %d\n", ret);
+		return;
+	}
+
+	if (dcp_h17g_panel(dcp)) {
+		/* The pipe never stopped; the next swap restores the level. */
+		dcp->brightness.update = true;
 		return;
 	}
 
@@ -4295,6 +4332,11 @@ void dcp_poweroff(struct platform_device *pdev)
 		ret = dcp_backlight_dpms(dcp, false);
 		if (ret)
 			dev_warn(dcp->dev, "backlight blank unavailable: %d\n", ret);
+		return;
+	}
+
+	if (dcp_h17g_panel(dcp)) {
+		iomfb_blank_h17p(dcp);
 		return;
 	}
 
@@ -5242,10 +5284,9 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		}
 
 		dcp_panel_read_dimensions(dcp, panel_np);
-
-		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
-			dcp_panel_adt_identity(dcp);
 		of_node_put(panel_np);
+		/* Read target metadata for H17P and desktop firmware alike. */
+		dcp_panel_read_adt(dcp);
 		dcp->fixed_connector_type = DRM_MODE_CONNECTOR_eDP;
 		dcp->connector_type = DRM_MODE_CONNECTOR_eDP;
 	}
@@ -5814,6 +5855,23 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	iomfb_queue_init(dcp);
 
 	dcp->fw_compat = fw_compat;
+	/*
+	 * Probe-lifetime like the desktop state: component bind opens a devres
+	 * group on this device and releases it on failure or unbind.
+	 */
+	if (!iomfb_is_m4(dcp)) {
+		struct device_node *panel_np =
+			of_get_compatible_child(dev->of_node, "apple,panel-mini-led") ?:
+			of_get_compatible_child(dev->of_node, "apple,panel");
+
+		if (panel_np) {
+			of_node_put(panel_np);
+			dcp->panel_identity = devm_kzalloc(dev, sizeof(*dcp->panel_identity),
+							   GFP_KERNEL);
+			if (!dcp->panel_identity)
+				return -ENOMEM;
+		}
+	}
 	if (fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
 		dcp->desktop = devm_kzalloc(dev, sizeof(*dcp->desktop), GFP_KERNEL);
 		if (!dcp->desktop)

@@ -76,6 +76,16 @@ struct tas2764_priv {
 		unsigned int tx_mask;
 	} idle_slot_config;
 
+	/* apple,bop-config: the SN012776 brownout prevention block */
+	u8 bop_config[TAS2764_BOP_CFG_LEN];
+	bool have_bop_config;
+	/* apple,amp-dcblocker-config: the SN012776 DC_BLK0 and DC_BLK1 */
+	u8 dc_blk[2];
+	bool have_dc_blk;
+	/* apple,amp-tx-zd-config: the SN012776's SDOUT idle slots, driven to zero */
+	u32 tx_zd_mask;
+	bool have_tx_zd;
+
 	/* apple,deferred-shutdown: software shutdown waits for the bus clock to stop */
 	bool deferred_shutdown;
 	/* Muted at a stream's end, until the next one: the bus clock may stop */
@@ -86,6 +96,14 @@ struct tas2764_priv {
 	 * an unmute clearing a stale clock fault and stream_stopped
 	 */
 	struct mutex fault_lock;
+
+	/*
+	 * What the fault interrupt reported, for "Amp Fault Status": the
+	 * INT_LTCH0 bits it judged a fault or a report since probe, and how
+	 * many such interrupts there were.
+	 */
+	u8 fault_bits;
+	u32 fault_events;
 };
 
 #include "tas2764-quirks.h"
@@ -251,6 +269,13 @@ static irqreturn_t tas2764_irq_locked(struct tas2764_priv *tas2764)
 		tas2764_group_shutdown(tas2764, latched[0]);
 
 	if (latched[0]) {
+		WRITE_ONCE(tas2764->fault_bits, tas2764->fault_bits | latched[0]);
+		if (tas2764->fault_events != U32_MAX)
+			WRITE_ONCE(tas2764->fault_events, tas2764->fault_events + 1);
+		snd_soc_component_notify_control(tas2764->component, "Amp Fault Status");
+	}
+
+	if (latched[0]) {
 		dev_err_ratelimited(tas2764->dev, "other context to the fault: %02x,%02x,%02x,%02x,%02x",
 				    latched[1], latched[2], latched[3], latched[4], latched[5]);
 		snd_soc_component_update_bits(tas2764->component,
@@ -316,6 +341,7 @@ static int tas2764_update_pwr_ctrl(struct tas2764_priv *tas2764)
 }
 
 static void tas2764_flush_shutdown(struct tas2764_priv *tas2764);
+static int tas2764_apply_init_quirks(struct tas2764_priv *tas2764);
 
 #ifdef CONFIG_PM
 /*
@@ -392,6 +418,16 @@ static int tas2764_codec_resume(struct snd_soc_component *component)
 	regcache_cache_only(tas2764->regmap, false);
 
 	ret = regcache_sync(tas2764->regmap);
+	/*
+	 * An amp whose SDZ went low came back from a power-on reset, and the
+	 * cache sync restores only the cached registers: the init quirks
+	 * also write TI's volatile quirk page, which the reset cleared and
+	 * nothing wrote again. Without them a J316 woofer amp latched an
+	 * over-current at the first stream after a resume. Apply them again,
+	 * as the probe does.
+	 */
+	if (ret >= 0 && !tas2764->sdz_group && tas2764->devid == DEVID_SN012776)
+		ret = tas2764_apply_init_quirks(tas2764);
 	if (ret >= 0)
 		ret = tas2764_update_pwr_ctrl(tas2764);
 
@@ -809,6 +845,10 @@ static int tas2764_set_dai_tdm_idle(struct snd_soc_dai *dai,
 	if (rx_mode)
 		return -EOPNOTSUPP;
 
+	/* The idle slots the Mac's ADT gives were set at probe and stay */
+	if (tas2764->have_tx_zd)
+		return 0;
+
 	if (tas2764->idle_slot_config.tx_mask == tx_mask &&
 	    tas2764->idle_slot_config.tx_mode == tx_mode)
 		return 0;
@@ -906,12 +946,6 @@ static struct snd_soc_dai_driver tas2764_dai_driver[] = {
 		.ops = &tas2764_dai_ops,
 		.symmetric_rate = 1,
 	},
-};
-
-static uint8_t sn012776_bop_presets[] = {
-	0x01, 0x32, 0x02, 0x22, 0x83, 0x2d, 0x80, 0x02, 0x06,
-	0x32, 0x46, 0x30, 0x02, 0x06, 0x38, 0x40, 0x30, 0x02,
-	0x06, 0x3e, 0x37, 0x30, 0xff, 0xe6
 };
 
 static const struct regmap_config tas2764_i2c_regmap;
@@ -1091,19 +1125,49 @@ static int tas2764_codec_probe(struct snd_soc_component *component)
 
 	switch (tas2764->devid) {
 	case DEVID_SN012776:
+		/*
+		 * PVDD is the brownout source on every SN012776, and the
+		 * brownout prevention block is the one the Mac's boot ADT
+		 * gives, when it gives one.
+		 */
 		ret = snd_soc_component_update_bits(component, TAS2764_PWR_CTRL,
 					TAS2764_PWR_CTRL_BOP_SRC,
 					TAS2764_PWR_CTRL_BOP_SRC);
 		if (ret < 0)
 			goto err_sdz;
 
-		for (i = 0; i < ARRAY_SIZE(sn012776_bop_presets); i++) {
+		for (i = 0; tas2764->have_bop_config && i < TAS2764_BOP_CFG_LEN; i++) {
 			ret = snd_soc_component_write(component,
 						TAS2764_BOP_CFG0 + i,
-						sn012776_bop_presets[i]);
-
+						tas2764->bop_config[i]);
 			if (ret < 0)
 				goto err_sdz;
+		}
+
+		/* The DC blockers (the playback and sense high-pass corners) */
+		if (tas2764->have_dc_blk) {
+			ret = snd_soc_component_write(component, TAS2764_DC_BLK0,
+						      tas2764->dc_blk[0]);
+			if (ret < 0)
+				goto err_sdz;
+			ret = snd_soc_component_write(component, TAS2764_DC_BLK1,
+						      tas2764->dc_blk[1]);
+			if (ret < 0)
+				goto err_sdz;
+		}
+
+		/* The SDOUT idle slots that drive zeros, from the ADT */
+		if (tas2764->have_tx_zd && tas2764->tx_zd_mask) {
+			ret = tas2764_write_sdout_idle_mask(tas2764, tas2764->tx_zd_mask);
+			if (ret < 0)
+				goto err_sdz;
+			ret = snd_soc_component_update_bits(component, TAS2764_SDOUT_HIZ_9,
+						TAS2764_SDOUT_HIZ_9_FORCE_0_EN,
+						TAS2764_SDOUT_HIZ_9_FORCE_0_EN);
+			if (ret < 0)
+				goto err_sdz;
+			tas2764->idle_slot_config.tx_mask = tas2764->tx_zd_mask;
+			tas2764->idle_slot_config.tx_mode = SND_SOC_DAI_TDM_IDLE_ZERO;
 		}
 
 		/* Apply all enabled Apple quirks */
@@ -1187,6 +1251,34 @@ static SOC_ENUM_SINGLE_DECL(
 	tas2764_oce_enum, TAS2764_MISC_CFG1,
 	TAS2764_MISC_CFG1_OCE_RETRY_SHIFT, tas2764_oce_texts);
 
+/*
+ * "Amp Fault Status", read-only: [0] the INT_LTCH0 bits the fault interrupt
+ * reported since probe (bit 0 over temperature, 1 over current, 2 bad TDM
+ * clock, 3 limiter active, 4 PVDD below the limiter inflection point, 5
+ * limiter at maximum attenuation, 6 BOP infinite hold, 7 BOP mute), [1] the
+ * number of those interrupts, saturating, [2] 1 once this amp's SDZ group
+ * was forced off. A change is notified.
+ */
+static int tas2764_fault_info(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_info *uinfo)
+{
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	uinfo->count = 3;
+	uinfo->value.integer.min = 0;
+	uinfo->value.integer.max = U32_MAX;
+	return 0;
+}
+
+static int tas2764_fault_get(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *uvalue)
+{
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+	struct tas2764_priv *tas2764 = snd_soc_component_get_drvdata(component);
+
+	uvalue->value.integer.value[0] = READ_ONCE(tas2764->fault_bits);
+	uvalue->value.integer.value[1] = READ_ONCE(tas2764->fault_events);
+	uvalue->value.integer.value[2] = tas2764_group_failed(tas2764);
+	return 0;
+}
+
 static const struct snd_kcontrol_new tas2764_snd_controls[] = {
 	SOC_SINGLE_TLV("Speaker Volume", TAS2764_DVC, 0,
 		       TAS2764_DVC_MAX, 1, tas2764_playback_volume),
@@ -1194,6 +1286,13 @@ static const struct snd_kcontrol_new tas2764_snd_controls[] = {
 		       tas2764_digital_tlv),
 	SOC_ENUM("HPF Corner Frequency", tas2764_hpf_enum),
 	SOC_ENUM("OCE Handling", tas2764_oce_enum),
+	{
+		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+		.name = "Amp Fault Status",
+		.access = SNDRV_CTL_ELEM_ACCESS_READ | SNDRV_CTL_ELEM_ACCESS_VOLATILE,
+		.info = tas2764_fault_info,
+		.get = tas2764_fault_get,
+	},
 };
 
 static const struct snd_soc_component_driver soc_component_driver_tas2764 = {
@@ -1253,9 +1352,36 @@ static bool tas2764_volatile_register(struct device *dev, unsigned int reg)
 	}
 }
 
+/*
+ * The registers the driver writes: page 0, the page 1 and page 6 registers of
+ * the quirk sequences and the SDOUT high-impedance masks, and TI's quirk pages
+ * (volatile). A cache sync after a resume writes back only these. Anything
+ * else in the cache got there through a read alone, such as a regmap debugfs
+ * dump of every page, and some of those registers are reserved: a raw block
+ * written over them at resume is never completed by the amp and leaves the
+ * I2C controller stuck in its transaction, taking every amp on the bus with
+ * it.
+ */
+static bool tas2764_writeable_register(struct device *dev, unsigned int reg)
+{
+	switch (reg) {
+	case TAS2764_REG(0x0, 0x00) ... TAS2764_REG(0x0, 0x7f):
+	case TAS2764_REG(0x1, 0x33):
+	case TAS2764_REG(0x1, 0x37):
+	case TAS2764_SDOUT_HIZ_1 ... TAS2764_SDOUT_HIZ_9:
+	case TAS2764_REG(0x1, 0x47):
+	case TAS2764_REG(0x6, 0x14) ... TAS2764_REG(0x6, 0x1f):
+	case TAS2764_REG(0xf0, 0x0) ... TAS2764_REG(0xff, 0x7f):
+		return true;
+	default:
+		return false;
+	}
+}
+
 static const struct regmap_config tas2764_i2c_regmap = {
 	.reg_bits = 8,
 	.val_bits = 8,
+	.writeable_reg = tas2764_writeable_register,
 	.volatile_reg = tas2764_volatile_register,
 	.reg_defaults = tas2764_reg_defaults,
 	.num_reg_defaults = ARRAY_SIZE(tas2764_reg_defaults),
@@ -1264,6 +1390,114 @@ static const struct regmap_config tas2764_i2c_regmap = {
 	.num_ranges = ARRAY_SIZE(tas2764_regmap_ranges),
 	.max_register = 0xffff,
 };
+
+/*
+ * The SN012776's brownout prevention block (BOP_CFG0 on, TAS2764_BOP_CFG_LEN
+ * registers), from the device tree's apple,bop-config: the boot loader copies
+ * it from the amp group's configuration in the Mac's ADT, which macOS programs
+ * into every amp of the group. Without it the block stays at its reset values.
+ * A property of the wrong length is a broken device tree, not a reason to
+ * guess.
+ */
+static int tas2764_parse_bop_config(struct device *dev, struct tas2764_priv *tas2764)
+{
+	int len;
+
+	tas2764->have_bop_config = false;
+	if (tas2764->devid != DEVID_SN012776)
+		return 0;
+
+	len = of_property_count_u8_elems(dev->of_node, "apple,bop-config");
+	if (len == -EINVAL) {
+		dev_info(dev, "no brownout configuration in the device tree\n");
+		return 0;
+	}
+	if (len != TAS2764_BOP_CFG_LEN)
+		return dev_err_probe(dev, -EINVAL,
+				     "apple,bop-config: %d bytes, the block has %d\n",
+				     len, TAS2764_BOP_CFG_LEN);
+
+	of_property_read_u8_array(dev->of_node, "apple,bop-config",
+				  tas2764->bop_config, TAS2764_BOP_CFG_LEN);
+	tas2764->have_bop_config = true;
+	return 0;
+}
+
+/*
+ * The SN012776's DC blockers, DC_BLK0 and DC_BLK1, from the device tree's
+ * apple,amp-dcblocker-config: the boot loader copies it from the amp group's
+ * configuration in the Mac's ADT, whose first two bytes are the two registers
+ * (the rest is padding), the same for every amp of the group. Without it the
+ * SN012776 uses DC_BLK0 = 0x01 and DC_BLK1 = 0x00 on every amp.
+ */
+static int tas2764_parse_dcblocker_config(struct device *dev, struct tas2764_priv *tas2764)
+{
+	int len, ret;
+
+	tas2764->have_dc_blk = false;
+	if (tas2764->devid != DEVID_SN012776)
+		return 0;
+
+	len = of_property_count_u8_elems(dev->of_node, "apple,amp-dcblocker-config");
+	if (len == -EINVAL) {
+		tas2764->dc_blk[0] = 0x01;
+		tas2764->dc_blk[1] = 0x00;
+		tas2764->have_dc_blk = true;
+		return 0;
+	}
+	if (len < 2)
+		return dev_err_probe(dev, -EINVAL,
+				     "apple,amp-dcblocker-config: %d bytes, need 2\n", len);
+
+	ret = of_property_read_u8_array(dev->of_node, "apple,amp-dcblocker-config",
+					tas2764->dc_blk, 2);
+	if (ret)
+		return ret;
+	tas2764->have_dc_blk = true;
+	return 0;
+}
+
+/*
+ * The SN012776's SDOUT idle slots that drive zeros (SDOUT_HIZ_1..), from the
+ * device tree's apple,amp-tx-zd-config: the boot loader copies this amp's row
+ * of its group's amp-tx-zd-config in the Mac's ADT, eight bytes, one mask
+ * byte per eight slots from slot 0. Like the device tree's TDM idle masks,
+ * this driver drives slots 0 to 31 only. With the property, it replaces the
+ * idle masks of the sound card's device tree; an all-zero row leaves every
+ * idle slot in high impedance.
+ */
+#define TAS2764_TX_ZD_ROW	8
+
+static int tas2764_parse_tx_zd_config(struct device *dev, struct tas2764_priv *tas2764)
+{
+	u8 row[TAS2764_TX_ZD_ROW];
+	int len, ret, i;
+
+	tas2764->have_tx_zd = false;
+	tas2764->tx_zd_mask = 0;
+	if (tas2764->devid != DEVID_SN012776)
+		return 0;
+
+	len = of_property_count_u8_elems(dev->of_node, "apple,amp-tx-zd-config");
+	if (len == -EINVAL)
+		return 0;
+	if (len != TAS2764_TX_ZD_ROW)
+		return dev_err_probe(dev, -EINVAL,
+				     "apple,amp-tx-zd-config: %d bytes, the row has %d\n",
+				     len, TAS2764_TX_ZD_ROW);
+
+	ret = of_property_read_u8_array(dev->of_node, "apple,amp-tx-zd-config",
+					row, TAS2764_TX_ZD_ROW);
+	if (ret)
+		return ret;
+	for (i = 4; i < TAS2764_TX_ZD_ROW; i++) {
+		if (row[i])
+			dev_warn(dev, "idle slots from %d on are not supported\n", i * 8);
+	}
+	tas2764->tx_zd_mask = row[0] | row[1] << 8 | row[2] << 16 | (u32)row[3] << 24;
+	tas2764->have_tx_zd = true;
+	return 0;
+}
 
 static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
 {
@@ -1312,6 +1546,18 @@ static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
 
 	tas2764->deferred_shutdown = of_property_read_bool(dev->of_node,
 							   "apple,deferred-shutdown");
+
+	ret = tas2764_parse_bop_config(dev, tas2764);
+	if (ret)
+		return ret;
+
+	ret = tas2764_parse_dcblocker_config(dev, tas2764);
+	if (ret)
+		return ret;
+
+	ret = tas2764_parse_tx_zd_config(dev, tas2764);
+	if (ret)
+		return ret;
 
 	return tas2764_group_join(dev, tas2764);
 }
@@ -1400,3 +1646,7 @@ module_i2c_driver(tas2764_i2c_driver);
 MODULE_AUTHOR("Dan Murphy <dmurphy@ti.com>");
 MODULE_DESCRIPTION("TAS2764 I2C Smart Amplifier driver");
 MODULE_LICENSE("GPL v2");
+
+#if IS_ENABLED(CONFIG_SND_SOC_TAS2764_KUNIT_TEST)
+#include "tas2764-bop-test.h"
+#endif

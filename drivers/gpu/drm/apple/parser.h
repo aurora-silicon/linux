@@ -272,8 +272,8 @@ int parse_system_log_mnits_pairs(const void *blob, size_t size,
 struct dcp_color_element {
 	s64 id, depth, range, eotf, encoding, colorimetry, score;
 	bool is_virtual;
-	/* The timing lists it as unsafe or as needing DSC (timing walks only). */
-	bool restricted;
+	/* The timing lists it as unsafe, or as needing DSC (timing walks only). */
+	bool unsafe, dsc_required;
 };
 
 typedef void (*dcp_color_element_fn)(void *data, const struct dcp_color_element *element);

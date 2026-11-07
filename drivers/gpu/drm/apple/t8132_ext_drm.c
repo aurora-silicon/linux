@@ -23,6 +23,7 @@
 #include <linux/scatterlist.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/t8132.h>
 #include <linux/spinlock.h>
 #include <linux/suspend.h>
 #include <linux/workqueue.h>
@@ -73,7 +74,10 @@ struct t8132_ext_out {
 	struct drm_connector connector;
 	struct platform_device *pdev;
 	struct work_struct hotplug_work;
-	/* The held flip event, sent with its swap's D590 or later (drm->event_lock) */
+	/*
+	 * The held flip event, sent once its frame is on its way (see
+	 * t8132_ext_crtc_flush()) or later (drm->event_lock)
+	 */
 	struct drm_pending_vblank_event *event;
 	struct delayed_work flip_work;
 	/* The DRM device suspends before this DCP and resumes after it */
@@ -340,9 +344,10 @@ static void t8132_ext_direct_refused(struct t8132_ext_out *out, struct drm_frame
 }
 
 /*
- * The frame scanned out directly from @fb: 2 once its swap is
- * submitted (the flip comes with its D590), -ENOSPC or -EOPNOTSUPP to copy
- * it instead, else the error (the frame lost). A linear XRGB8888 or
+ * The frame scanned out directly from @fb: 3 once its swap is submitted
+ * with none older in flight (its flip now), 2 once submitted otherwise (its
+ * flip comes later, t8132_ext_drm_flip_done()), -ENOSPC or -EOPNOTSUPP to
+ * copy it instead, else the error (the frame lost). A linear XRGB8888 or
  * ARGB8888 GEM DMA buffer, own or imported, from its first byte, at the
  * mode's size, the pitch a multiple of 64 bytes, at most 32 MiB, and every
  * 16 KiB of it one 16 KiB page (t8132_ext_fb_pages()).
@@ -406,15 +411,16 @@ static int t8132_ext_present_direct(struct t8132_ext_out *out, struct apple_dcp 
 	ret = iomfb_m4_ext_present_direct(owner, &d);
 	if (ret == -EOPNOTSUPP)
 		t8132_ext_direct_refused(out, fb, t8132_ext_pages_refused);
-	return ret ?: 2;
+	return ret < 0 ? ret : ret ? 3 : 2;
 }
 
 /*
  * Present the primary plane's new frame: scanned out directly where it can
- * be, else copied into the DCP and swapped in; 2 once a direct frame's swap
- * is submitted, 1 if the commit has no new frame (no plane state), so
- * nothing was tried. A copied framebuffer is read through its kernel
- * mapping (dma-buf vmap for an imported one) inside CPU access.
+ * be, else copied into the DCP and swapped in; 2 or 3 once a direct frame's
+ * swap is submitted (see t8132_ext_present_direct()), 1 if the commit has no
+ * new frame (no plane state), so nothing was tried. A copied framebuffer is
+ * read through its kernel mapping (dma-buf vmap for an imported one) inside
+ * CPU access.
  */
 static int t8132_ext_present(struct t8132_ext_out *out, struct drm_atomic_commit *state)
 {
@@ -503,7 +509,7 @@ static void t8132_ext_crtc_flush(struct drm_crtc *crtc, struct drm_atomic_commit
 	/* Its damage is lost with it: whole frames until one is shown. */
 	if (ret <= 0)
 		out->frame_lost = !!ret;
-	if (fb && !out->first_frame && (ret <= 0 || ret == 2)) {
+	if (fb && !out->first_frame && (ret <= 0 || ret >= 2)) {
 		out->first_frame = true;
 		dev_dbg(&out->pdev->dev, "%s: first frame %ux%u %p4cc, modifier %#llx: %d\n",
 			crtc->name, fb->width, fb->height, &fb->format->format, fb->modifier, ret);
@@ -512,16 +518,17 @@ static void t8132_ext_crtc_flush(struct drm_crtc *crtc, struct drm_atomic_commit
 				     crtc->name, ret);
 	}
 	/*
-	 * A copied frame's swap has completed (D590): its flip now, else a
-	 * frame later. A direct frame's comes with its D590 (or when its swap
-	 * is given up).
+	 * A copied frame's swap has completed (D590), or a direct one went out
+	 * with none older in flight (3): its flip now, else a frame later. Any
+	 * other direct frame's (2) comes when the older swap in flight
+	 * completes, or its own at a depth of 1 (or when that is given up).
 	 */
 	if (event && ret != 2) {
 		/* Torn down: no work queued again, the event now. */
 		if (READ_ONCE(out->dying))
 			t8132_ext_send_event(out);
 		else
-			mod_delayed_work(system_wq, &out->flip_work,
+			mod_delayed_work(system_percpu_wq, &out->flip_work,
 					 ret >= 0 ? 0 : msecs_to_jiffies(16));
 	}
 }
@@ -709,10 +716,12 @@ bool t8132_ext_drm_in_commit(struct drm_atomic_commit *state)
 
 /*
  * Every flip of these CRTCs in @state, before its old planes are cleaned up:
- * a frame's flip comes with its swap's D590, or when the swap is given up
- * (5 s, or at once when the link goes), so 6 s bound it. Until then the
- * old framebuffer may still be scanned out: blocking commits return, and
- * DRM lets go of it, only after.
+ * a frame's flip comes once its swap is submitted, or with the completion of
+ * the older swap in flight (or its own), or when that swap is given up (5 s,
+ * or at once when the link goes), so 6 s bound it. Blocking commits return,
+ * and DRM lets go of the old framebuffer, only after; a framebuffer on screen
+ * or in flight keeps a reference of its window's (iomfb_m4.c) until no swap
+ * shows or holds it.
  */
 void t8132_ext_drm_wait_flips(struct drm_atomic_commit *state)
 {
@@ -734,8 +743,9 @@ void t8132_ext_drm_wait_flips(struct drm_atomic_commit *state)
 }
 
 /*
- * The swap of @dcpext's last direct frame completed (D590) or was
- * given up: its held flip event now. Any context but hard IRQ.
+ * @dcpext's last direct frame is due its flip (the older swap in flight, or
+ * its own, completed or was given up): its held flip event now. Any context
+ * but hard IRQ.
  */
 void t8132_ext_drm_flip_done(struct device *dcpext)
 {
@@ -1080,7 +1090,7 @@ int t8132_ext_drm_init(struct drm_device *drm)
 	bool mine, reg;
 	int ret = 0;
 
-	if (!of_machine_is_compatible("apple,j713"))
+	if (!apple_t8132_firmware_path())
 		return 0;
 	/* Sleep handling for the outputs of one DRM device only. */
 	mutex_lock(&t8132_ext_reg_lock);

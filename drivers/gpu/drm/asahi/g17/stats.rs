@@ -12,14 +12,17 @@ impl Reader {
     pub(crate) fn read(&self) -> Readout {
         let mut state = self.0.state.lock();
         let Some(firmware) = state.as_deref_mut() else {
-            return Readout::default();
+            return qualify(self.0.variant.graph, Readout::default());
         };
         if self.0.crashed.load(Ordering::Acquire) || firmware.recovery.pending() {
             firmware.rings.invalidate_statistics();
-            return firmware.rings.read_statistics(super::now_ns());
+        } else {
+            firmware.observe_statistics_power();
         }
-        firmware.observe_statistics_power();
-        firmware.rings.read_statistics(super::now_ns())
+        qualify(
+            self.0.variant.graph,
+            firmware.rings.read_statistics(super::now_ns()),
+        )
     }
 
     pub(crate) fn suspend(&self, suspended: bool) {
@@ -37,4 +40,29 @@ pub(super) const fn max_age_ns(graph: InitGraph) -> u64 {
         InitGraph::V25G83 => 16_000_000,
         InitGraph::G17P => 32_000_000,
     }
+}
+
+/// Whether the firmware emits the logical pstate record (tag 0x10). V25G83
+/// and V26A428 accept the tag but never emit it, and no other record carries
+/// the current pstate, so it is unsupported by these firmwares. A firmware
+/// that is shown to emit it gets `true` here and reports valid or stale.
+pub(super) const fn reports_pstate(graph: InitGraph) -> bool {
+    match graph {
+        InitGraph::V25G83 | InitGraph::G17P => false,
+    }
+}
+
+/// Apply the firmware's static capabilities to a decoded readout. The decoder
+/// and the debugfs diagnostic still keep any tag 0x10 that does arrive.
+pub(super) fn qualify(
+    graph: InitGraph,
+    mut view: super::telemetry::Readout,
+) -> super::telemetry::Readout {
+    if !reports_pstate(graph) {
+        view.pstate_status = super::telemetry::UNSUPPORTED;
+        view.pstate = 0;
+        view.pstate_host_ns = 0;
+        view.pstate_timestamp = 0;
+    }
+    view
 }

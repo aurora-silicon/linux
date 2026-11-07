@@ -182,11 +182,15 @@ pub(crate) struct ComputeTimestampCache {
 }
 
 impl ComputeTimestampCache {
-    /// Pages retained per context; deeper pipelines allocate the rest.
-    const RETAINED: usize = 8;
+    /// Pages retained per context; deeper pipelines allocate the rest. Every queued command
+    /// holds a page from submission on, and a game keeps a couple of hundred compute commands
+    /// queued, so a smaller cache refills and frees a page for nearly every command.
+    const RETAINED: usize = 256;
+    /// The cache grows to `RETAINED` only in contexts that queue that deep.
+    const INITIAL: usize = 8;
 
     pub(crate) fn new() -> Result<Arc<Self>> {
-        let pages = KVec::with_capacity(Self::RETAINED, GFP_KERNEL)?;
+        let pages = KVec::with_capacity(Self::INITIAL, GFP_KERNEL)?;
         Arc::pin_init(
             pin_init!(Self {
                 pages <- new_mutex!(pages, "G17 compute timestamp pages"),
@@ -215,7 +219,11 @@ impl ComputeTimestampCache {
     fn put(&self, page: ComputeTimestamps) {
         let rejected = {
             let mut pages = self.pages.lock();
-            pages.push_within_capacity(page).err()
+            if pages.len() < Self::RETAINED && pages.reserve(1, GFP_KERNEL).is_ok() {
+                pages.push_within_capacity(page).err().map(|rejected| rejected.0)
+            } else {
+                Some(page)
+            }
         };
         // Teardown of a page beyond the retained count runs unlocked.
         drop(rejected);
@@ -547,7 +555,7 @@ impl Completion {
     /// A firmware restart listed this command in its recovery table: it was in
     /// flight, so it may have run partly. Its stamps and completion record may
     /// still look like success. Unless a replay republishes it from the start,
-    /// it fails and the failure is always reported to the client.
+    /// it fails: its fence carries ECANCELED, and only a guilty VM is poisoned.
     pub(crate) fn note_interrupted(&self) {
         self.interrupted.store(true, Ordering::Release);
     }
@@ -563,12 +571,13 @@ impl Completion {
         (error != ECANCELED || interrupted) && !self.spared() && !(interrupted && !self.guilty())
     }
 
-    /// ECANCELED stays silent only for work that was never interrupted (closed
-    /// or cancelled by its owner); every other failure reaches the client.
+    /// A non-poisoning ECANCELED or ENODATA (work a recovery discarded or dropped) stays out of
+    /// the VM status, as the UAPI documents for work another VM's recovery discarded:
+    /// Honeykrisp reads any status error as a lost device. Every other failure reaches the client.
     fn report(&self, error: Error) {
         if self.poisons(error) {
             self.status.record(error);
-        } else if error != ECANCELED || self.interrupted() {
+        } else if !discarded(error) {
             self.status.report_failure(error);
         }
     }
@@ -715,7 +724,7 @@ impl Completion {
             guard.quarantine();
         }
         if self.spared() {
-            if error != ECANCELED || self.interrupted() {
+            if !discarded(error) {
                 self.status.report_failure(error);
             }
         } else {
@@ -724,6 +733,11 @@ impl Completion {
         self.signal_terminal(Err(error));
         self.output.finish(Err(error));
     }
+}
+
+/// The errors of work a recovery discarded (ECANCELED) or dropped before it ran (ENODATA).
+fn discarded(error: Error) -> bool {
+    error == ECANCELED || error == ENODATA
 }
 
 /// Collected under the device mutex and executed only after releasing it.

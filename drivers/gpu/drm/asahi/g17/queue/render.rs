@@ -1298,6 +1298,30 @@ impl Pair {
         Some(observation::snapshot(&self.memory, ordinal).ok()?.pass[0] != 0)
     }
 
+    /// The oldest published group has neither its tiler start nor its fragment end written.
+    pub(crate) fn front_untouched(&self) -> Option<bool> {
+        let front = self.active.iter().find(|active| active.outer_published)?;
+        Some(observation::snapshot(&self.memory, front.ticket.ordinal).ok()?.untouched())
+    }
+
+    /// The owner of a published group whose tiler started and whose fragment end is unwritten.
+    /// Groups an earlier recovery listed or blamed are skipped: a restart drops started groups,
+    /// so their records stay half-written without anything running.
+    pub(crate) fn running_owner(&self) -> Option<&Arc<VmStatus>> {
+        self.active
+            .iter()
+            .filter(|active| {
+                active.outer_published
+                    && !active.packet.completion.interrupted()
+                    && !active.packet.completion.blamed()
+            })
+            .find(|active| {
+                observation::snapshot(&self.memory, active.ticket.ordinal)
+                    .is_ok_and(|snapshot| snapshot.pass[0] != 0 && snapshot.pass[1] == 0)
+            })
+            .map(|active| active.packet.completion.status())
+    }
+
     /// Firmware is halted and all graph borrowers have joined before this copy.
     pub(crate) fn publish_recovery_targets(&self) -> Result {
         self.memory.graph.publish_recovery_targets()
@@ -1612,13 +1636,10 @@ impl Pair {
             let packet = front.packet.clone();
             failing = failing || !packet.completion.begin_replay();
             if failing {
-                if !packet.completion.spared() {
-                    packet.completion.status().record(EIO);
-                    if self.terminal.is_none() {
-                        self.terminal = Some((packet.completion.status().clone(), EIO));
-                    }
-                }
-                defer(Deferred::Retired(packet.completion.clone(), Err(EIO)))?;
+                // decide() replays only innocent groups that never ran: like `fail_dropped`,
+                // they fail without poisoning their VM. Restarts other VMs caused dropped them.
+                packet.completion.classify(recovery::Class::Spared);
+                defer(Deferred::Retired(packet.completion.clone(), Err(ENODATA)))?;
                 self.memory.retire(ordinal)?;
                 self.active.pop().ok_or(EIO)?;
                 continue;
@@ -1635,8 +1656,8 @@ impl Pair {
     /// Firmware retired every group of the pair after a restart, but some were dropped
     /// unexecuted and cannot run again in order (see `replay::decide`). Every group fails now,
     /// the ones that ran too: they consumed output the dropped ones never wrote. The work is
-    /// innocent, so it fails without poisoning its VM, with ENODATA, which its owner sees,
-    /// instead of waiting for the render timeout to fail it with ETIMEDOUT.
+    /// innocent, so it fails without poisoning its VM: its fences carry ENODATA, which stays out
+    /// of the VM status, instead of waiting for the render timeout to fail it with ETIMEDOUT.
     fn fail_dropped(
         &mut self,
         host: &mut impl Host,
@@ -1673,9 +1694,10 @@ impl Pair {
 
     /// A front group a restart interrupted after its tiler started, which firmware
     /// then retired without writing its fragment end, may have run partly. It is
-    /// not replayed (blending or storage writes could apply twice) and fails now,
-    /// reported to its owner, instead of waiting out the render timeout. Returns
-    /// None when the front is not such a group.
+    /// not replayed (blending or storage writes could apply twice) and fails now
+    /// instead of waiting out the render timeout: its fence carries ECANCELED, and
+    /// only a guilty VM is poisoned. Returns None when the front is not such a
+    /// group.
     fn settle_interrupted_front(
         &mut self,
         host: &mut impl Host,

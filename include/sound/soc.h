@@ -814,6 +814,13 @@ struct snd_soc_dai_link {
 	/* pmdown_time is ignored at stop */
 	unsigned int ignore_pmdown_time:1;
 
+	/*
+	 * -EPERM from a trigger on this link is a refusal by policy, such as
+	 * a machine driver that admits a stream only while it is allowed to
+	 * play, not a failure: the trigger still fails, but is not logged.
+	 */
+	unsigned int quiet_trigger_eperm:1;
+
 	/* Do not create a PCM for this DAI link (Backend link) */
 	unsigned int ignore:1;
 
@@ -821,6 +828,12 @@ struct snd_soc_dai_link {
 	struct snd_soc_dobj dobj; /* For topology */
 #endif
 };
+
+/* A trigger result on @link that is a quiet refusal (see quiet_trigger_eperm) */
+static inline bool snd_soc_link_trigger_refused(const struct snd_soc_dai_link *link, int ret)
+{
+	return ret == -EPERM && link->quiet_trigger_eperm;
+}
 
 static inline int snd_soc_link_num_ch_map(const struct snd_soc_dai_link *link)
 {
