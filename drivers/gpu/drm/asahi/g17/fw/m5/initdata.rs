@@ -34,22 +34,45 @@ pub(crate) enum RootProfile {
     J873G18G26A428,
 
     J714G17S26A428,
+
+    /// The M5 graph of the macOS 27.2 firmware (26B123): the 26A428 graph with a larger power
+    /// policy and status config ([`ABI_ALLOCATION_SIZES_26B123_M5`]).
+    J714G17S26B123,
 }
 
 impl RootProfile {
+    /// The M5 graph profile of a firmware build's InitData layouts.
+    pub(crate) const fn for_m5_layouts(layouts: super::super::variant::M5Layouts) -> Self {
+        use super::super::variant::M5Layouts;
+        match layouts {
+            M5Layouts::V26A428 => Self::J714G17S26A428,
+            M5Layouts::V26B123 => Self::J714G17S26B123,
+        }
+    }
+
+    /// The layout of an M5 graph profile, `None` for the others.
+    pub(crate) const fn m5_layout(self) -> Option<&'static M5Layout> {
+        match self {
+            Self::J714G17S26A428 => Some(&M5_LAYOUT_26A428),
+            Self::J714G17S26B123 => Some(&M5_LAYOUT_26B123),
+            Self::J700G17P | Self::J813G17G25G76 | Self::J873G18G26A428 => None,
+        }
+    }
+
     pub(crate) const fn version_word(self) -> u64 {
         match self {
             Self::J700G17P => INITDATA_VERSION_WORD,
             Self::J813G17G25G76 => 0x0c8a_a322_039e_04c0,
             Self::J873G18G26A428 => COMMON26_INITDATA_VERSION_WORD,
             Self::J714G17S26A428 => M5_INITDATA_VERSION_WORD,
+            Self::J714G17S26B123 => M5_26B123_INITDATA_VERSION_WORD,
         }
     }
 
     pub(crate) const fn root_size(self, role: InstanceRole) -> usize {
         match self {
             Self::J873G18G26A428 => COMMON26_ROOT_SIZE,
-            Self::J714G17S26A428 => M5_ROOT_SIZE,
+            Self::J714G17S26A428 | Self::J714G17S26B123 => M5_ROOT_SIZE,
             Self::J700G17P | Self::J813G17G25G76 => root_size(role),
         }
     }
@@ -62,8 +85,10 @@ impl RootProfile {
             (Self::J873G18G26A428, InstanceRole::Secondary) => {
                 COMMON26_CONTROL_OPENING_OPCODE_SECONDARY
             }
-            (Self::J714G17S26A428, InstanceRole::Primary) => M5_CONTROL_OPENING_OPCODE_PRIMARY,
-            (Self::J714G17S26A428, InstanceRole::Secondary) => {
+            (Self::J714G17S26A428 | Self::J714G17S26B123, InstanceRole::Primary) => {
+                M5_CONTROL_OPENING_OPCODE_PRIMARY
+            }
+            (Self::J714G17S26A428 | Self::J714G17S26B123, InstanceRole::Secondary) => {
                 M5_CONTROL_OPENING_OPCODE_SECONDARY
             }
             (_, InstanceRole::Primary) => CONTROL_OPENING_OPCODE_PRIMARY,
@@ -73,40 +98,48 @@ impl RootProfile {
 
     pub(crate) const fn control_register_opcode(self) -> Option<u32> {
         match self {
-            Self::J873G18G26A428 | Self::J714G17S26A428 => None,
+            Self::J873G18G26A428 | Self::J714G17S26A428 | Self::J714G17S26B123 => None,
             Self::J700G17P | Self::J813G17G25G76 => Some(CONTROL_OPENING_PRIMARY_REGISTER_OPCODE),
         }
     }
 
     pub(crate) const fn bundle_view_offsets(self) -> [usize; 5] {
+        if let Some(layout) = self.m5_layout() {
+            return layout.bundle_view_offsets();
+        }
         match self {
             Self::J873G18G26A428 => COMMON26_BUNDLE_VIEW_OFFSETS,
-            Self::J714G17S26A428 => M5_BUNDLE_VIEW_OFFSETS,
-            Self::J700G17P | Self::J813G17G25G76 => BUNDLE_VIEW_OFFSETS,
+            _ => BUNDLE_VIEW_OFFSETS,
         }
     }
 
     pub(crate) const fn bundle_view_extents(self) -> [usize; 5] {
+        if let Some(layout) = self.m5_layout() {
+            return layout.bundle_view_extents();
+        }
         match self {
             Self::J873G18G26A428 => COMMON26_BUNDLE_VIEW_EXTENTS,
-            Self::J714G17S26A428 => M5_BUNDLE_VIEW_EXTENTS,
-            Self::J700G17P | Self::J813G17G25G76 => BUNDLE_VIEW_EXTENTS,
+            _ => BUNDLE_VIEW_EXTENTS,
         }
     }
 
     pub(crate) const fn repeated_region_bundle_offset(self) -> usize {
+        if let Some(layout) = self.m5_layout() {
+            return layout.shared.block_88;
+        }
         match self {
             Self::J873G18G26A428 => COMMON26_SHARED_LAYOUT.block_88,
-            Self::J714G17S26A428 => M5_SHARED_LAYOUT.block_88,
-            Self::J700G17P | Self::J813G17G25G76 => MAIN_REPEATED_REGION_BUNDLE_OFFSET,
+            _ => MAIN_REPEATED_REGION_BUNDLE_OFFSET,
         }
     }
 
     pub(crate) const fn work_ring_bundle_offsets(self) -> [usize; WORK_CHANNEL_COUNT] {
+        if let Some(layout) = self.m5_layout() {
+            return work_ring_offsets(&layout.shared);
+        }
         match self {
             Self::J873G18G26A428 => COMMON26_WORK_RING_BUNDLE_OFFSETS,
-            Self::J714G17S26A428 => M5_WORK_RING_BUNDLE_OFFSETS,
-            Self::J700G17P | Self::J813G17G25G76 => WORK_RING_BUNDLE_OFFSETS,
+            _ => WORK_RING_BUNDLE_OFFSETS,
         }
     }
 }
@@ -847,7 +880,7 @@ pub(crate) fn encode_main_config_for_profile(
             put_u64(out, MAIN_REGION_VIEWS + 0x20, views.alias_high[1]);
             // J714's firmware takes both primary sentinels too; they are not
             // exclusive to the older J700 ABI.
-            if matches!(profile, RootProfile::J700G17P | RootProfile::J714G17S26A428) {
+            if profile == RootProfile::J700G17P || profile.m5_layout().is_some() {
                 put_u32(out, MAIN_PRIMARY_SENTINEL_A, 1);
                 put_u32(out, MAIN_PRIMARY_SENTINEL_B, 0xabcd_abcd);
             }
@@ -863,14 +896,14 @@ pub(crate) fn encode_main_config_for_profile(
                 RootProfile::J700G17P => MAIN_SECONDARY_KIND_VALUE,
                 RootProfile::J813G17G25G76 => 0xc,
 
-                RootProfile::J873G18G26A428 | RootProfile::J714G17S26A428 => {
-                    COMMON26_MAIN_SECONDARY_KIND
-                }
+                RootProfile::J873G18G26A428
+                | RootProfile::J714G17S26A428
+                | RootProfile::J714G17S26B123 => COMMON26_MAIN_SECONDARY_KIND,
             });
-            if profile == RootProfile::J714G17S26A428 {
+            if let Some(layout) = profile.m5_layout() {
 
                 put_u64(out, COMMON26_MAIN_SECONDARY_POLICY_PTR,
-                        bundle + M5_SHARED_LAYOUT.policy as u64);
+                        bundle + layout.shared.policy as u64);
             } else if profile == RootProfile::J873G18G26A428 {
 
                 put_u64(out, COMMON26_MAIN_SECONDARY_POLICY_PTR,
@@ -900,7 +933,7 @@ pub(crate) fn encode_region_c_for_profile(
 
         return encode_common26_region_c(out);
     }
-    if profile == RootProfile::J714G17S26A428 {
+    if profile.m5_layout().is_some() {
 
         return Err(InitdataError::BufferSize);
     }
@@ -1653,6 +1686,10 @@ pub(crate) const M5_CONTROL_OPENING_OPCODE_SECONDARY: u32 =
 
 pub(crate) const M5_INITDATA_VERSION_WORD: u64 = 0x0c8e_0339_8728_04c0;
 
+/// The interface version word, at root+0, of the 27.2 (26B123) and 27.3 beta 1 (26C5035r) M5
+/// firmware: the 26A428 word with bit 46 set. It is not yet confirmed from captured InitData.
+pub(crate) const M5_26B123_INITDATA_VERSION_WORD: u64 = 0x0c8e_4339_8728_04c0;
+
 pub(crate) const M5_ROOT_SIZE: usize = 0xc8;
 
 pub(crate) const ABI_ALLOCATION_SIZES_26A428_M5: [usize; 24] = [
@@ -1660,11 +1697,144 @@ pub(crate) const ABI_ALLOCATION_SIZES_26A428_M5: [usize; 24] = [
     0xe730, 0x0780, 0x0020, 0x01b0, 0x4800, 0x28800, 0x79800, 0x9000, 0x00a8, 0x0008, 0x1ca0, 0x00e4,
 ];
 
-pub(crate) const M5_SHARED_LAYOUT: SharedClusterLayout =
-    shared_cluster_layout(&ABI_ALLOCATION_SIZES_26A428_M5);
+/// The allocation size table of the 27.2 (26B123) and 27.3 beta 1 (26C5035r) M5 firmware, indexed
+/// like [`ABI_ALLOCATION_SIZES_26A428_M5`]. Only two entries differ from it: the power policy
+/// (index 4, 0x126b0 -> 0x12728) and the status config (index 13, 0x780 -> 0x790). The sizes are
+/// not yet confirmed from captured InitData.
+pub(crate) const ABI_ALLOCATION_SIZES_26B123_M5: [usize; 24] = [
+    0x2850, 0x0c18, 0x1048, 0x0e10, 0x12728, 0x0068, 0x0800, 0x0088, 0x1800, 0x04c0, 0x4000,
+    0x0030, 0xe730, 0x0790, 0x0020, 0x01b0, 0x4800, 0x28800, 0x79800, 0x9000, 0x00a8, 0x0008,
+    0x1ca0, 0x00e4,
+];
 
-pub(crate) const M5_PRIVATE_LAYOUT: PrivateClusterLayout =
-    private_cluster_layout(&ABI_ALLOCATION_SIZES_26A428_M5);
+const _: () = {
+    let mut index = 0;
+    while index < ABI_ALLOCATION_SIZES_26B123_M5.len() {
+        let same = ABI_ALLOCATION_SIZES_26B123_M5[index] == ABI_ALLOCATION_SIZES_26A428_M5[index];
+        assert!(same == (index != ALLOC_POLICY && index != ALLOC_STATUS_CONFIG));
+        index += 1;
+    }
+};
+
+/// The InitData layout of one M5 firmware build: its allocation size table, the packed clusters
+/// derived from it, and how its HW data differs from the 26A428 encoding.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct M5Layout {
+    /// The allocation size table.
+    pub(crate) sizes: [usize; 24],
+    /// The shared cluster (the HW data bundle).
+    pub(crate) shared: SharedClusterLayout,
+    /// The private cluster.
+    pub(crate) private: PrivateClusterLayout,
+    /// Moves the 26A428 HW data encoding to this build's offsets; empty where they are the same.
+    pub(crate) hw_data_bands: &'static [LayoutBand],
+    /// Words of this build's HW data that have no place in the 26A428 encoding: offset, value.
+    pub(crate) hw_data_words: &'static [(usize, u32)],
+}
+
+impl M5Layout {
+    const fn new(
+        sizes: [usize; 24],
+        hw_data_bands: &'static [LayoutBand],
+        hw_data_words: &'static [(usize, u32)],
+    ) -> Self {
+        Self {
+            sizes,
+            shared: shared_cluster_layout(&sizes),
+            private: private_cluster_layout(&sizes),
+            hw_data_bands,
+            hw_data_words,
+        }
+    }
+
+    pub(crate) const fn hw_data_size(&self) -> usize {
+        self.sizes[ALLOC_HW_DATA]
+    }
+
+    pub(crate) const fn policy_size(&self) -> usize {
+        self.sizes[ALLOC_POLICY]
+    }
+
+    pub(crate) const fn status_config_size(&self) -> usize {
+        self.sizes[ALLOC_STATUS_CONFIG]
+    }
+
+    /// The bundle up to its BRN table: HW data, the four views and the power policy.
+    pub(crate) const fn shared_prefix_size(&self) -> usize {
+        self.shared.brn_table
+    }
+
+    pub(crate) const fn bundle_view_offsets(&self) -> [usize; 5] {
+        [
+            self.shared.block_c18,
+            self.shared.block_1048,
+            self.shared.block_e10,
+            self.shared.block_68,
+            self.shared.block_800,
+        ]
+    }
+
+    pub(crate) const fn bundle_view_extents(&self) -> [usize; 5] {
+        [
+            self.sizes[ALLOC_BLOCK_C18],
+            self.sizes[ALLOC_BLOCK_1048],
+            self.sizes[ALLOC_BLOCK_E10],
+            self.sizes[ALLOC_BLOCK_68],
+            self.sizes[ALLOC_BLOCK_800],
+        ]
+    }
+
+    pub(crate) const fn private_status_a(&self) -> [usize; 2] {
+        [
+            self.private.roles[0].status_a,
+            self.private.roles[1].status_a,
+        ]
+    }
+
+    pub(crate) const fn private_state_grids(&self) -> [usize; 2] {
+        [
+            self.private.dm_ring_states[0],
+            self.private.secondary_control_state - WORK_STATE_GRID_OFFSETS[CONTROL_CHANNEL_INDEX],
+        ]
+    }
+
+    pub(crate) const fn status_config_in_status_b(&self) -> usize {
+        self.private.status_config - self.private.status_b
+    }
+
+    pub(crate) const fn status_b_span(&self) -> usize {
+        self.private.roles[0].status_a - self.private.status_b
+    }
+
+    /// Where this build's HW data holds the field the 26A428 encoding holds at `offset`.
+    pub(crate) const fn hw_data_offset(&self, offset: usize) -> Option<usize> {
+        if self.hw_data_bands.is_empty() {
+            return Some(offset);
+        }
+        relocate_by_bands(self.hw_data_bands, offset)
+    }
+}
+
+/// The 27.0 (26A428) M5 layout.
+pub(crate) const M5_LAYOUT_26A428: M5Layout =
+    M5Layout::new(ABI_ALLOCATION_SIZES_26A428_M5, &[], &[]);
+
+/// The 27.2 (26B123) M5 layout.
+pub(crate) const M5_LAYOUT_26B123: M5Layout =
+    M5Layout::new(ABI_ALLOCATION_SIZES_26B123_M5, &[], &[]);
+
+const _: () = {
+    // The bundle and the private cluster keep the sizes of their fixed windows.
+    assert!(M5_LAYOUT_26B123.shared.total == M5_LAYOUT_26A428.shared.total);
+    assert!(M5_LAYOUT_26B123.private.total == M5_LAYOUT_26A428.private.total);
+    // The 26B123 HW data is 26A428's.
+    let kick = M5_KICK_SHARED_POINTER;
+    assert!(matches!(M5_LAYOUT_26B123.hw_data_offset(kick), Some(0x27dc)));
+};
+
+pub(crate) const M5_SHARED_LAYOUT: SharedClusterLayout = M5_LAYOUT_26A428.shared;
+
+pub(crate) const M5_PRIVATE_LAYOUT: PrivateClusterLayout = M5_LAYOUT_26A428.private;
 
 pub(crate) const M5_SHARED_CLUSTER_SIZE: usize = M5_SHARED_LAYOUT.total;
 
@@ -1675,10 +1845,17 @@ pub(crate) const M5_HW_DATA_SIZE: usize = ABI_ALLOCATION_SIZES_26A428_M5[ALLOC_H
 pub(crate) const M5_KICK_SHARED_SIZE: usize = 0x2000;
 pub(crate) const M5_KICK_SHARED_POINTER: usize = 0x27dc;
 
-pub(crate) fn set_m5_kick_shared(out: &mut [u8], address: u64) -> Result<(), InitdataError> {
-    if out.len() != M5_HW_DATA_SIZE {
+pub(crate) fn set_m5_kick_shared(
+    layout: &M5Layout,
+    out: &mut [u8],
+    address: u64,
+) -> Result<(), InitdataError> {
+    if out.len() != layout.hw_data_size() {
         return Err(InitdataError::BufferSize);
     }
+    let pointer = layout
+        .hw_data_offset(M5_KICK_SHARED_POINTER)
+        .ok_or(InitdataError::BufferSize)?;
     required_address(address)?;
     let end = address.checked_add(M5_KICK_SHARED_SIZE as u64 - 1)
         .ok_or(InitdataError::AddressOutOfRange)?;
@@ -1686,7 +1863,7 @@ pub(crate) fn set_m5_kick_shared(out: &mut [u8], address: u64) -> Result<(), Ini
     if address & (UAT_PAGE_SIZE as u64 - 1) != 0 {
         return Err(InitdataError::AddressOutOfRange);
     }
-    put_u64(out, M5_KICK_SHARED_POINTER, address);
+    put_u64(out, pointer, address);
     Ok(())
 }
 
@@ -1893,15 +2070,23 @@ const _: () = {
 
 /// Populate the enabled-USC count from the device's sampled core masks.
 /// This count covers the whole device, not one cluster.
-pub(crate) fn set_m5_enabled_cores(out: &mut [u8], enabled: u32) -> Result<(), InitdataError> {
-    if out.len() != M5_HW_DATA_SIZE {
+pub(crate) fn set_m5_enabled_cores(
+    layout: &M5Layout,
+    out: &mut [u8],
+    enabled: u32,
+) -> Result<(), InitdataError> {
+    if out.len() != layout.hw_data_size() {
         return Err(InitdataError::BufferSize);
     }
     if enabled == 0 || enabled > 128 {
         return Err(InitdataError::InterfaceMismatch);
     }
-    put_u32(out, 0x10a4, enabled);
-    put_u32(out, 0x268c, enabled);
+    for offset in [0x10a4, 0x268c] {
+        let offset = layout
+            .hw_data_offset(offset)
+            .ok_or(InitdataError::BufferSize)?;
+        put_u32(out, offset, enabled);
+    }
     Ok(())
 }
 
@@ -2244,13 +2429,14 @@ pub(crate) fn encode_m5_register_map(
 }
 
 pub(crate) fn encode_m5_hw_data(
+    layout: &M5Layout,
     board: &Board,
     aliases: [G17PKsmCompletionAliases; M5_25G76_COMPLETION_QUEUE_COUNT],
     qos_high: u64,
     windows: &[M5RegisterWindow],
     out: &mut [u8],
 ) -> Result<(), InitdataError> {
-    if out.len() != M5_HW_DATA_SIZE {
+    if out.len() != M5_HW_DATA_SIZE || out.len() != layout.hw_data_size() {
         return Err(InitdataError::BufferSize);
     }
     required_address(qos_high)?;
@@ -2325,6 +2511,49 @@ pub(crate) fn encode_m5_hw_data(
     }
     // The inherited J813 minimum parameter-buffer size is replaced per board.
     put_u32(out, 0x26b0, board.min_parameter_buffer);
+    // Then the build's own HW data, which only adds to the 26A428 one.
+    relocate_hw_data(layout.hw_data_bands, out)?;
+    for &(offset, value) in layout.hw_data_words {
+        if offset + 4 > out.len() {
+            return Err(InitdataError::BufferSize);
+        }
+        put_u32(out, offset, value);
+    }
+    Ok(())
+}
+
+/// Moves an HW data encoding by `bands`, which are in ascending order and move their bytes up by
+/// non-negative deltas, none smaller than the band before it. The bytes no band moves anything to
+/// are cleared; the bytes past the last band have to be zero, as the move drops them.
+fn relocate_hw_data(bands: &[LayoutBand], out: &mut [u8]) -> Result<(), InitdataError> {
+    let Some(last) = bands.last() else {
+        return Ok(());
+    };
+    let dropped = out.get(last.end..).ok_or(InitdataError::BufferSize)?;
+    if dropped.iter().any(|byte| *byte != 0) {
+        return Err(InitdataError::BufferSize);
+    }
+    let mut floor = (0, 0);
+    for band in bands {
+        let delta = usize::try_from(band.delta).map_err(|_| InitdataError::BufferSize)?;
+        if band.start < floor.0 || band.end < band.start || delta < floor.1 {
+            return Err(InitdataError::BufferSize);
+        }
+        if band.end + delta > out.len() {
+            return Err(InitdataError::BufferSize);
+        }
+        floor = (band.end, delta);
+    }
+    for band in bands.iter().rev() {
+        out.copy_within(band.start..band.end, band.start + band.delta as usize);
+    }
+    let mut moved = 0;
+    for band in bands {
+        let start = band.start + band.delta as usize;
+        out[moved..start].fill(0);
+        moved = band.end + band.delta as usize;
+    }
+    out[moved..].fill(0);
     Ok(())
 }
 
@@ -2378,18 +2607,19 @@ pub(crate) fn encode_m5_region_c(out: &mut [u8]) -> Result<(), InitdataError> {
 }
 
 pub(crate) fn encode_m5_primary_status_b(
+    layout: &M5Layout,
     fwctl_state: u64,
     fwctl_ring: u64,
     status_b: u64,
     out: &mut [u8],
 ) -> Result<(), InitdataError> {
-    if out.len() != M5_STATUS_B_SPAN {
+    if out.len() != layout.status_b_span() {
         return Err(InitdataError::BufferSize);
     }
     required_address(fwctl_state)?;
     required_address(fwctl_ring)?;
     required_address(status_b)?;
-    let config = M5_STATUS_CONFIG_IN_STATUS_B;
+    let config = layout.status_config_in_status_b();
     out.fill(0);
     encode_status_block(&mut out[..STATUS_BLOCK_SIZE])?;
     put_u64(out, COMMON26_STATUS_B_FWCTL_STATE, fwctl_state);
@@ -2399,7 +2629,7 @@ pub(crate) fn encode_m5_primary_status_b(
     put_u64(out, COMMON26_STATUS_B_LINK_PTR,
             status_b + (config + M5_STATUS_CONFIG_LINK_WORD) as u64);
     write_relocated_words(M5_25G76_STATUS_CONFIG_WORDS, 0, COMMON26_STATUS_CONFIG_BANDS,
-                          &mut out[config..config + M5_STATUS_CONFIG_SIZE])?;
+                          &mut out[config..config + layout.status_config_size()])?;
     put_u32(out, config + M5_STATUS_CONFIG_LINK_WORD, 1);
     put_u64(out, config + M5_STATUS_CONFIG_LINK_PTR,
             status_b + COMMON26_STATUS_B_LINK_WORD as u64);
@@ -2407,11 +2637,12 @@ pub(crate) fn encode_m5_primary_status_b(
 }
 
 pub(crate) fn encode_m5_private_cluster(
+    m5_layout: &M5Layout,
     private_base: u64,
     fwctl_state: u64,
     out: &mut [u8],
 ) -> Result<(), InitdataError> {
-    let layout = M5_PRIVATE_LAYOUT;
+    let layout = m5_layout.private;
     if out.len() != layout.total {
         return Err(InitdataError::BufferSize);
     }
@@ -2431,7 +2662,8 @@ pub(crate) fn encode_m5_private_cluster(
     out.fill(0);
     let status_b = layout.status_b;
     let status_a = layout.roles[0].status_a;
-    encode_m5_primary_status_b(fwctl_state, fwctl_ring, private_base + status_b as u64,
+    encode_m5_primary_status_b(m5_layout, fwctl_state, fwctl_ring,
+                                        private_base + status_b as u64,
                                         &mut out[status_b..status_a])?;
     for role in layout.roles {
         encode_status_block(&mut out[role.status_a..role.status_a + STATUS_BLOCK_SIZE])?;
@@ -2448,23 +2680,25 @@ pub(crate) fn encode_m5_private_cluster(
 }
 
 pub(crate) fn encode_m5_bundle_policy(
+    m5_layout: &M5Layout,
     bindings: M5PolicyBindings,
     out: &mut [u8],
 ) -> Result<(), InitdataError> {
-    let layout = M5_SHARED_LAYOUT;
-    if out.len() < M5_SHARED_PREFIX_SIZE {
+    let layout = m5_layout.shared;
+    let prefix = m5_layout.shared_prefix_size();
+    if out.len() < prefix {
         return Err(InitdataError::BufferSize);
     }
     required_address(bindings.state)?;
     required_address(bindings.aon_ptd)?;
-    out[layout.block_c18..M5_SHARED_PREFIX_SIZE].fill(0);
+    out[layout.block_c18..prefix].fill(0);
     let m5 = M5_25G76_SHARED_LAYOUT;
     for &(offset, value) in M5_25G76_POLICY_WORDS {
         if (m5.block_1048..m5.block_e10).contains(&offset) {
             put_u32(out, layout.block_1048 + (offset - m5.block_1048), value);
         }
     }
-    let policy = &mut out[layout.policy..layout.policy + M5_POLICY_SIZE];
+    let policy = &mut out[layout.policy..layout.policy + m5_layout.policy_size()];
     put_u32(policy, 0x04, J714_GPU_POWER_SAMPLE_PERIOD_AIC_CLOCKS);
     put_u32(policy, 0x08, J714_GPU_POWER_SAMPLE_PERIOD_AIC_CLOCKS);
 
