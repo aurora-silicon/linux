@@ -18,23 +18,9 @@
 	model = "Apple MacBook Air (13-inch, M3, 2024)";
 
 	/*
-	 * The J613 is fanless: the CPUs are the only cooling devices. As on
-	 * the J700, every die sensor gets a zone that throttles both clusters,
-	 * since they share one die and one heat spreader, and the power
-	 * allocator splits the budget by the energy models, with the E cluster
-	 * weighted three to one. The E maps stop at cooling state 3 (2004 MHz):
-	 * the E cluster adds at most about 2 W, and the governor would
-	 * otherwise send an idle E cluster to its lowest state.
-	 *
-	 * The trips are the J700's: switch-on 58 C (idle is 43-52 C), control
-	 * 95 C, critical 110 C. sustainable-power comes from load tests with the
-	 * gains derived from it: with the four P cores busy, the J700's 1.5 W
-	 * held the hottest sensor at 72 C and the P cores at 2.1 GHz; 6 W held
-	 * 90-95 C at 2.6-3.0 GHz (one 96.5 C peak); 7.5 W swung between 2.2 and
-	 * 3.6 GHz with peaks of 98 C. With 6 W, all eight cores busy settled at
-	 * 92 C with the P cores at 2.2-2.4 GHz and the E cores at full clock;
-	 * the P cores with the GPU busy at 618 MHz peaked at 97 C (the GPU is
-	 * not a cooling device here).
+	 * Fanless: every die sensor throttles both clusters, E weighted 3:1
+	 * and capped at state 3. Trips as on the J700; sustainable-power from
+	 * J613 load tests.
 	 */
 	thermal-zones {
 		cpu-e0-thermal {
@@ -336,14 +322,10 @@
 &dcp {
 	panel: panel {
 		compatible = "apple,panel-j613", "apple,panel";
-		/*
-		 * 2560x1664 at 224 ppi; 181 mm high without the 64 notch rows,
-		 * as on the J413.
-		 */
+		/* 2560x1664 at 224 ppi; 64 notch rows above the desktop. */
 		width-mm = <290>;
 		height-mm = <189>;
 		adj-height-mm = <181>;
-		/* The backlight's maximum: 525 nits. */
 		apple,max-brightness = <525>;
 	};
 };

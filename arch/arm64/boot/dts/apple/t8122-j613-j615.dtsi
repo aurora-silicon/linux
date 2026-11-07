@@ -115,12 +115,7 @@
 	apple,temporal-filter = <1>;
 };
 
-/*
- * Mesa fingerprint sensor on spi2 (J613 and J615 ADT /arm-io/spi2/mesa):
- * power on NUB GPIO 29, active high. The data-ready line (AP GPIO 199) is
- * left out, so the driver polls until its trigger is confirmed. Native chip
- * select only.
- */
+/* Touch ID; its data-ready line (AP GPIO 199) is left out, so it polls. */
 &spi2 {
 	status = "okay";
 };
@@ -135,29 +130,9 @@
 #include "hwmon-laptop.dtsi"
 
 /*
- * External display on both USB-C ports: left-back (typec0, ATC0) and
- * left-front (typec1, ATC1). In the J613 ADT dcpext is display-crossbar
- * ufp1, port 0, which is crossbar state 2 (dispext1,0) in the T602x model,
- * on either ATC's crossbar. The DPTX target is the ADT's DFP index of the
- * ATC (atc0 = 0, atc1 = 1), as in the M1/M2 dcpext routes. dcpext has one
- * DPTX link, so one external display at a time: the display fabric gives
- * the pipeline to the first port that asks, and the other port keeps USB.
- *
- * dcpext, its routes, its DARTs, its mailbox and both crossbars stay
- * disabled here, like the internal DCP. The boot loader finds dcpext
- * through the "dcpext" alias, reserves its firmware and marks it
- * apple,t8122-dcpext-firmware-ready; the kernel's display gate then enables
- * all of them after the internal display was handed over, and keeps the
- * common power state of both ATCs on (apple,always-on), as for DP alt mode
- * on the M1/M2 laptops. The routes stay disabled until then, as on T6030:
- * an available route with no registered mode switch would make the Type-C
- * port wait for one forever. A kernel or boot loader without dcpext
- * support therefore sees nothing new.
- *
- * The display subsystem's iommus are left alone: the display gate accepts
- * exactly one entry there (disp0_dart stream 0) before it enables the
- * internal display, and adds <&dispext0_dart 0> itself when it enables
- * dcpext, as it does for the T6030 external processors.
+ * One external display on either USB-C port: dcpext is crossbar state 2 of
+ * each ATC and its DPTX target is the ATC index. The display gate enables it
+ * and the routes once the boot loader has readied its firmware.
  */
 &dcpext {
 	apple,connector-type = "USB-C";
