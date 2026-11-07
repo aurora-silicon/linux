@@ -332,17 +332,20 @@ impl SepData {
                 } else {
                     self.sks_prepare_identity_refkey(handle, stored.secret())
                 }
-                true
+            };
+            // Do not consume the real root's one policy window in the initrd.
+            let unlocked = if self.keystore_only.load(Relaxed) {
+                unlock()
             } else {
-                self.sks_prepare_identity_refkey(handle, stored.secret())
+                crate::xart_guard::policy_window(unlock)
+            };
+            if !unlocked {
+                let _ = self.sks_send(self.sks_req_unload_keybag(handle));
+                return Err(EIO);
             }
             let recovered = self.sks_refkey_unseal(handle, &blob, sealed);
             let _ = self.sks_send(self.sks_req_unload_keybag(handle));
-            return Err(EIO);
-        }
-        let recovered = self.sks_refkey_unseal(handle, &blob, sealed);
-        let _ = self.sks_send(self.sks_req_unload_keybag(handle));
-        recovered.ok_or(EIO)
+            recovered.ok_or(EIO)
         })
     }
 

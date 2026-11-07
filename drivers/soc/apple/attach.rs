@@ -29,9 +29,14 @@ impl Phase {
         }
     }
 
-    /// Called only after completion succeeds; a failed open remains retryable.
-    pub(crate) fn completed(&mut self) {
-        *self = Self::Complete;
+    /// Serialize this under attach_phase. A failed operation stays retryable;
+    /// success never repeats the operation, even with concurrent sysfs writers.
+    pub(crate) fn complete(&mut self, operation: impl FnOnce() -> Result<()>) -> Result<()> {
+        if self.needs_completion()? {
+            operation()?;
+            *self = Self::Complete;
+        }
+        Ok(())
     }
 }
 
@@ -111,25 +116,35 @@ mod tests {
 
     #[test]
     fn normal_attach_rejects_completion() {
-        assert_eq!(Phase::new(false).needs_completion(), Err(EINVAL));
+        let mut phase = Phase::new(false);
+        assert_eq!(
+            phase.complete(|| panic!("must not touch stores")),
+            Err(EINVAL)
+        );
     }
 
     #[test]
     fn completion_is_idempotent() {
         let mut phase = Phase::new(true);
-        assert_eq!(phase.needs_completion(), Ok(true));
-        phase.completed();
-        assert_eq!(phase.needs_completion(), Ok(false));
-        phase.completed();
-        assert_eq!(phase.needs_completion(), Ok(false));
+        let mut calls = 0;
+        assert_eq!(
+            phase.complete(|| {
+                calls += 1;
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert_eq!(phase.complete(|| panic!("must not repeat attach")), Ok(()));
+        assert_eq!(calls, 1);
     }
 
     #[test]
     fn failed_completion_can_retry() {
-        let phase = Phase::new(true);
+        let mut phase = Phase::new(true);
+        assert_eq!(phase.complete(|| Err(EIO)), Err(EIO));
         assert_eq!(phase.needs_completion(), Ok(true));
-        // An error never calls completed().
-        assert_eq!(phase.needs_completion(), Ok(true));
+        assert_eq!(phase.complete(|| Ok(())), Ok(()));
+        assert_eq!(phase.needs_completion(), Ok(false));
     }
 
     #[test]

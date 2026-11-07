@@ -289,7 +289,7 @@ static DEVICE_ATTR_RO(restore);
 static ssize_t xart_guard_show(struct device *dev,
 			       struct device_attribute *attr, char *buf)
 {
-	return sysfs_emit(buf, "%u\n", sep_diag.xart_guard);
+	return sysfs_emit(buf, "%u\n", READ_ONCE(sep_diag.xart_guard));
 }
 static DEVICE_ATTR_RO(xart_guard);
 
@@ -298,9 +298,9 @@ static ssize_t xart_guard_list_show(struct device *dev,
 {
 	const char *state;
 
-	if (!sep_diag.xart_guard)
+	if (!READ_ONCE(sep_diag.xart_guard))
 		state = "none";
-	else if (sep_diag.xart_guard_list)
+	else if (READ_ONCE(sep_diag.xart_guard_list))
 		state = "loaded";
 	else
 		state = "unavailable";
@@ -481,8 +481,8 @@ void sep_diag_set_restore(int state)
 void sep_diag_set_xart_guard(unsigned int level, bool list_loaded,
 			     int matching)
 {
-	sep_diag.xart_guard = level;
-	sep_diag.xart_guard_list = list_loaded;
+	WRITE_ONCE(sep_diag.xart_guard, level);
+	WRITE_ONCE(sep_diag.xart_guard_list, list_loaded);
 	atomic_set(&sep_diag.xart_refusals, 0);
 	atomic_set(&sep_diag.matching, matching);
 }

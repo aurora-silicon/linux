@@ -609,6 +609,7 @@ struct SepData {
     #[pin]
     identity_keybag: Mutex<Option<keybag::StoredKeyBag>>,
 
+
     #[pin]
     fw_map: Mutex<Option<FirmwareMap>>,
 
@@ -1763,7 +1764,10 @@ impl SepData {
         }
 
         if done.reply_bytes > 0 {
-            if self.ool_write(&self.ool_xarm, 0, &staging[..done.reply_bytes]).is_err() {
+            if self
+                .ool_write(&self.ool_xarm, 0, &staging[..done.reply_bytes])
+                .is_err()
+            {
                 self.fail_xarm(req.tag);
                 return;
             }
@@ -2517,10 +2521,10 @@ impl SepData {
 
     /// Completes the original attach without sending a second registration.
     fn complete_attach(&self) -> Result<()> {
-        let mut phase = self.attach_phase.lock();
-        if !phase.needs_completion()? {
-            return Ok(());
-        }
+        self.attach_phase.lock().complete(|| self.finish_attach())
+    }
+
+    fn finish_attach(&self) -> Result<()> {
         self.wait_for_trusted_ready()?;
         if module_parameters::provision_keybag.value() != 0
             && module_parameters::xart_writes.value() == 0
@@ -2578,7 +2582,6 @@ impl SepData {
         // been initialised, so completion resumes immediately after that step.
         self.finish_keystore_bringup();
         diag::bringup_ended();
-        phase.completed();
         Ok(())
     }
 
@@ -3040,7 +3043,11 @@ impl platform::Driver for SepDriver {
         data.attach(&sep_node)?;
 
         if let Err(e) = data.register_fv_kernel() {
-            dev_err!(dev, "could not register the FileVault kernel API: {:?}\n", e);
+            dev_err!(
+                dev,
+                "could not register the FileVault kernel API: {:?}\n",
+                e
+            );
         }
 
         if let Err(e) = trusted::register(data.clone()) {
@@ -3048,7 +3055,11 @@ impl platform::Driver for SepDriver {
         }
 
         if let Err(e) = pm::register(data.clone()) {
-            dev_warn!(data.dev, "sleep notifier registration failed ({:?}); a capture may run into a suspend\n", e);
+            dev_warn!(
+                data.dev,
+                "sleep notifier registration failed ({:?}); a capture may run into a suspend\n",
+                e
+            );
         }
 
         if data.registered.load(Relaxed) {
