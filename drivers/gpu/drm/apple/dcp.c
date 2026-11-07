@@ -5263,6 +5263,30 @@ clocks:
 		clocks = 0;
 	if (clocks < 0 || clocks > 64)
 		return -EINVAL;
+	/*
+	 * A DCP that also boots earlier firmware (T8142) lists the clock those
+	 * use first and names the provider clocks "firmware-<index>". Take only
+	 * the named ones here.
+	 */
+	if (clocks &&
+	    of_property_match_string(dev->of_node, "clock-names", "firmware-0") >= 0) {
+		dcp->firmware_clocks = devm_kcalloc(dev, clocks,
+						    sizeof(*dcp->firmware_clocks),
+						    GFP_KERNEL);
+		if (!dcp->firmware_clocks)
+			return -ENOMEM;
+		for (index = 0; index < clocks; index++) {
+			dcp->firmware_clocks[index].id =
+				devm_kasprintf(dev, GFP_KERNEL, "firmware-%d", index);
+			if (!dcp->firmware_clocks[index].id)
+				return -ENOMEM;
+		}
+		ret = devm_clk_bulk_get(dev, clocks, dcp->firmware_clocks);
+		if (ret)
+			return ret;
+		dcp->num_firmware_clocks = clocks;
+		return 0;
+	}
 	ret = devm_clk_bulk_get_all(dev, &dcp->firmware_clocks);
 	if (ret < 0)
 		return ret;
@@ -6137,6 +6161,13 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	mutex_init(&dcp->dcpavserv.lock);
 	INIT_WORK(&dcp->dcpavserv.close_wq, dcpavserv_close_work);
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
+	/*
+	 * T8142 on firmware 27 runs as the T6050's firmware-27 instance, with
+	 * the default method profile: with H17G every swap fails with status 4.
+	 */
+	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    of_device_is_compatible(dev->of_node, "apple,t8142-dcp"))
+		dcp->hw.iomfb_method_profile = DCP_IOMFB_METHODS_DEFAULT;
 	/* The display such a processor finds at boot is its first sink. */
 	if (dcp_sink_metadata(dcp))
 		dcp_desktop_metadata_new_sink(dcp);
