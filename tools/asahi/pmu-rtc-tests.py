@@ -64,6 +64,8 @@ struct device { void *data; bool wake; int wake_events; };
 struct nvmem_cell { u8 data[8]; size_t bytes; int error; };
 struct regmap { u8 bytes[65536]; unsigned ctrl, counter, compare, mask, event, bit; int ops, fail; };
 static int disabled, pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
+static bool firmware_suspend;
+static bool pm_suspend_via_firmware(void) { return firmware_suspend; }
 static inline __attribute__((unused)) s64 sign_extend64(u64 v, int bit) { return (s64)(v << (63 - bit)) >> (63 - bit); }
 static u64 get_unaligned_le64(const void *p) { u64 v; memcpy(&v, p, 8); return v; }
 static void mutex_lock(struct mutex *m) { (void)m; }
@@ -244,6 +246,10 @@ static void run_variant(int v) {
     reset(v); assert(!apple_pmu_rtc_prepare(&dev));
     pm_suspend_target_state = 2;
     assert(apple_pmu_rtc_prepare(&dev) == -EBUSY);
+    /* A firmware-driven suspend programs the wake itself. */
+    firmware_suspend = true;
+    assert(!apple_pmu_rtc_prepare(&dev));
+    firmware_suspend = false;
     pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
 }
 int main(void) {

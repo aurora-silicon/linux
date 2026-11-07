@@ -382,7 +382,14 @@ static int apple_pmu_rtc_prepare(struct device *dev)
 {
 	struct apple_pmu_rtc *rtc = dev_get_drvdata(dev);
 
-	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE || rtc->io_failed)
+	if (rtc->io_failed)
+		return -EBUSY;
+	/*
+	 * A firmware-driven suspend programs the wake sources itself, and the
+	 * alarm stays armed in the PMU, which stays powered. Only a sleep state
+	 * without either has no way to bring the alarm back.
+	 */
+	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE && !pm_suspend_via_firmware())
 		return -EBUSY;
 	return 0;
 }
