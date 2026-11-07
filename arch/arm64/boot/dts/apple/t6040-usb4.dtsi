@@ -8,17 +8,17 @@
 
 / {
 	aliases {
-		usb4_0_rc = &usb4_0_acio;
-		usb4_0_nhi = &usb4_0_nhi;
-		usb4_0_pcie = &usb4_0_pcie;
+		usb4-0-rc = &usb4_0_acio;
+		usb4-0-nhi = &usb4_0_nhi;
+		usb4-0-pcie = &usb4_0_pcie;
 		usb4-0-pcie-adapter = &usb4_0_acio;
-		usb4_1_rc = &usb4_1_acio;
-		usb4_1_nhi = &usb4_1_nhi;
-		usb4_1_pcie = &usb4_1_pcie;
+		usb4-1-rc = &usb4_1_acio;
+		usb4-1-nhi = &usb4_1_nhi;
+		usb4-1-pcie = &usb4_1_pcie;
 		usb4-1-pcie-adapter = &usb4_1_acio;
-		usb4_2_rc = &usb4_2_acio;
-		usb4_2_nhi = &usb4_2_nhi;
-		usb4_2_pcie = &usb4_2_pcie;
+		usb4-2-rc = &usb4_2_acio;
+		usb4-2-nhi = &usb4_2_nhi;
+		usb4-2-pcie = &usb4_2_pcie;
 		usb4-2-pcie-adapter = &usb4_2_acio;
 	};
 
@@ -309,6 +309,7 @@
 		#size-cells = <2>;
 		ranges;
 		nonposted-mmio;
+		status = "disabled";
 
 		apciec0_dart: iommu@384000000 {
 			compatible = "apple,t6041-dart", "apple,t8110-dart";
@@ -379,6 +380,7 @@
 		#size-cells = <2>;
 		ranges;
 		nonposted-mmio;
+		status = "disabled";
 
 		apciec1_dart: iommu@38c000000 {
 			compatible = "apple,t6041-dart", "apple,t8110-dart";
@@ -449,6 +451,7 @@
 		#size-cells = <2>;
 		ranges;
 		nonposted-mmio;
+		status = "disabled";
 
 		apciec2_dart: iommu@394000000 {
 			compatible = "apple,t6041-dart", "apple,t8110-dart";
