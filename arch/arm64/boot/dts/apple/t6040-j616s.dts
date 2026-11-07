@@ -104,3 +104,52 @@
 &jpeg1 {
 	status = "okay";
 };
+
+
+&i2c4 {
+	sd_card_control: card-control@20 {
+		compatible = "apple,t6041-sd-card-control", "apple,sd-card-control";
+		reg = <0x20>;
+		status = "disabled";
+	};
+};
+
+&i2c8 {
+	display_pcon: display-converter@8 {
+		compatible = "apple,t6041-display-pcon", "apple,display-pcon";
+		reg = <0x8>;
+		status = "disabled";
+	};
+};
+
+&spi4 {
+	tcon: panel-controller@0 {
+		compatible = "parade,dp855";
+		reg = <0>;
+		status = "disabled";
+
+		/* ADT display-temp-sens1..3 are downstream of the TCON. */
+		i2c {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			temperature-sensor@70 {
+				compatible = "ti,tmp103";
+				reg = <0x70>;
+				status = "disabled";
+			};
+
+			temperature-sensor@71 {
+				compatible = "ti,tmp103";
+				reg = <0x71>;
+				status = "disabled";
+			};
+
+			temperature-sensor@72 {
+				compatible = "ti,tmp103";
+				reg = <0x72>;
+				status = "disabled";
+			};
+		};
+	};
+};

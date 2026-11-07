@@ -112,8 +112,9 @@ properties:
   ports:
     $ref: /schemas/graph.yaml#/properties/ports
     description: >
-      The PHY's links when it also describes its USB3 controller, in place of
-      port. Absent on a fixed DisplayPort PHY.
+      USB and DisplayPort lane connections to the Type-C connector, and the
+      link to the USB3 controller, in place of port. Absent on a fixed
+      DisplayPort PHY.
 
     properties:
       port@0:
