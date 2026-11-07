@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config VIDEO_APPLE_SCALER
+	tristate "Apple Silicon scaler and colour-space converter"
+	depends on VIDEO_DEV
+	depends on ARCH_APPLE || (COMPILE_TEST && 64BIT)
+	depends on OF_ADDRESS && IOMMU_API && PM
+	help
+	  Driver for the memory-to-memory image scaler and colour-space
+	  converter (MSR) in Apple silicon SoCs. This first version
+	  identifies the engine, attaches its power domains, IOMMU and
+	  interrupt, and keeps it idle; it does not yet expose a video
+	  device.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called apple-scaler.
