@@ -5001,6 +5001,18 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	char fw_str[DCP_FW_VERSION_STR_LEN];
 	int ret;
 
+	/*
+	 * T8142 (J813) on macOS 27.0: the H17P interface written for its 26.x
+	 * firmware makes the 27.0 DCP firmware panic right after the first
+	 * hotplug ("ap_link: callback failed with: 0x5"). It runs the T6050's
+	 * firmware-27 generation.
+	 */
+	if (of_device_is_compatible(dev->of_node, "apple,t8142-dcp")) {
+		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
+		if (ret >= 0 && !strcmp(compat_str, "27.0.0"))
+			return DCP_FIRMWARE_V_27_0;
+	}
+
 	if (hw->firmware_compat == DCP_FIRMWARE_V_27_0) {
 		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
 		if (ret < 0 || strcmp(compat_str, "27.0.0"))
