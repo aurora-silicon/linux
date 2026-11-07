@@ -337,6 +337,7 @@ impl Backend {
                     self.owner,
                     slot,
                     footprint,
+                    packet.order.wait_through[0],
                     &mut dependencies.hazards,
                 )?;
             }
