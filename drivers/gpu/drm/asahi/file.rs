@@ -279,6 +279,9 @@ pub(crate) struct File {
     mem: Arc<memacct::Client>,
     /// Completed engine time, retained by queues after handle destruction.
     usage: Arc<crate::usage::Client>,
+    /// Largest size this file has asked GET_PARAMS for the global parameters with
+    /// ([`gpu::Gpu::admit_vm`]).
+    params_size: core::sync::atomic::AtomicU64,
 }
 
 /// Convenience type alias for our DRM `File` type.
@@ -371,6 +374,7 @@ impl File {
                 (*slot).user_range = user_range;
                 addr_of_mut!((*slot).mem).write(mem);
                 addr_of_mut!((*slot).usage).write(usage);
+                addr_of_mut!((*slot).params_size).write(core::sync::atomic::AtomicU64::new(0));
                 Ok(())
             })
         }
@@ -474,6 +478,9 @@ impl File {
             core::slice::from_raw_parts(core::ptr::from_ref(&params).cast::<u8>(), size)
         })?;
 
+        file.inner()
+            .params_size
+            .fetch_max(data.size, core::sync::atomic::Ordering::Relaxed);
         Ok(0)
     }
 
@@ -545,6 +552,13 @@ impl File {
             // Every other runtime here reports DRM_ASAHI_GPU_HAL_LEGACY.
             return Err(EINVAL);
         }
+        reg_data.gpu.admit_vm(
+            device.as_ref().as_ref(),
+            file.inner()
+                .params_size
+                .load(core::sync::atomic::Ordering::Relaxed),
+            data.flags,
+        )?;
 
         let kernel_range = data.kernel_start..data.kernel_end;
         let user_range = file.inner().user_range.clone();
@@ -641,7 +655,7 @@ impl File {
         }
         let dummy_mapping = dummy_obj.map_at(
             &vm,
-            gpu.uat_geometry().unk_page(),
+            gpu.unknown_page(),
             mmu::PROT_GPU_SHARED_RW,
             true,
         )?;

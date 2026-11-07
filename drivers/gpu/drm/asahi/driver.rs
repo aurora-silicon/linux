@@ -52,6 +52,7 @@ pub(crate) struct AsahiPlatformDriverData<'bound> {
     g17: Option<Arc<g17::Gpu>>,
     #[cfg(CONFIG_DRM_ASAHI_G16)]
     pub(crate) g16: Option<Arc<crate::g16::Gpu>>,
+    m3: Option<M3Backend>,
     /// Raw `struct device *` of the platform device. Stored once at probe
     /// time so the `Drop` impl can find the sysfs file on unregister.
     raw_dev: *mut bindings::device,
@@ -64,6 +65,11 @@ pub(crate) struct AsahiPlatformDriverData<'bound> {
 unsafe impl Send for AsahiPlatformDriverData<'_> {}
 // SAFETY: As above.
 unsafe impl Sync for AsahiPlatformDriverData<'_> {}
+
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+type M3Backend = Arc<crate::m3::m3_drm::Backend>;
+#[cfg(not(CONFIG_DRM_ASAHI_M3_T8122))]
+type M3Backend = core::convert::Infallible;
 
 /// Holds a reference to the top-level GPU object.
 #[pin_data]
@@ -242,6 +248,10 @@ impl platform::Driver for AsahiPlatformDriver {
             // Driver data is dropped after devres, so CPU control must happen in unbind.
             gpu.shutdown();
         }
+        #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+        if let Some(m3) = this.m3.as_ref() {
+            m3.stop();
+        }
         this.close_binding();
     }
 
@@ -258,6 +268,8 @@ impl platform::Driver for AsahiPlatformDriver {
         let cfg = match info.ok_or(ENODEV)? {
             ProbeConfig::Legacy(cfg) => *cfg,
             ProbeConfig::G17(cfg) => return AsahiPlatformDriver::probe_g17(pdev, cfg),
+            #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+            ProbeConfig::M3(crate::m3::Chip::T8122) => return AsahiPlatformDriver::probe_t8122(pdev),
             ProbeConfig::M3(chip) => return Err(crate::m3::refuse_probe(pdev, *chip)),
             #[cfg(CONFIG_DRM_ASAHI_M5)]
             ProbeConfig::M5 => return AsahiPlatformDriver::probe_m5(pdev),
@@ -345,6 +357,7 @@ impl platform::Driver for AsahiPlatformDriver {
             _device: reg.device().into(),
             _reg: reg,
             g17: None,
+            m3: None,
             #[cfg(CONFIG_DRM_ASAHI_G16)]
             g16: None,
             raw_dev,
@@ -382,8 +395,49 @@ impl AsahiPlatformDriver {
             _device: reg.device().into(),
             _reg: reg,
             g17: None,
+            m3: None,
             #[cfg(CONFIG_DRM_ASAHI_G16)]
             g16: None,
+            raw_dev: core::ptr::null_mut(),
+            raw_stats: core::ptr::null_mut(),
+            stats: None,
+        })
+    }
+
+    /// The M3 MacBook Air (T8122): the M3 runtime, started only when its identity gate, the
+    /// backend selection and the start experiment (`asahi.t8122_start=1`) admit it; otherwise
+    /// the probe is refused as without the runtime.
+    #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+    fn probe_t8122<'bound>(
+        pdev: &'bound platform::Device<Core<'_>>,
+    ) -> Result<AsahiPlatformDriverData<'bound>> {
+        let soc = crate::m3::t8122_admitted(pdev)?;
+        // SAFETY: The admitted M3 GPU's UAT outputs 42-bit physical addresses.
+        unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(42)?)? };
+        let resources = regs::Resources::new(pdev)?;
+        let drm = drm::UnregisteredDevice::<AsahiDrmDriver>::new(pdev, Ok(()))?;
+        let binding = unsafe { crate::binding::Owner::new(pdev.as_ref(), &drm)? };
+        let backend = crate::m3::m3_drm::Backend::start(pdev, &drm, soc)?;
+        let gpu = backend.clone() as Arc<dyn gpu::Gpu>;
+        let data = try_pin_init!(AsahiDrmRegistrationData { gpu, resources });
+        // SAFETY: The registration is stored and unregistered by platform data destruction,
+        // which drops the runtime with it.
+        let reg = match unsafe { drm::Registration::new(pdev.as_ref(), drm, data, 0) } {
+            Ok(reg) => reg,
+            Err(error) => {
+                backend.stop();
+                return Err(error);
+            }
+        };
+        dev_info!(pdev.as_ref(), "M3: firmware ready; common DRM GEM/VM frontend registered\n");
+        Ok(AsahiPlatformDriverData {
+            binding,
+            #[cfg(CONFIG_DRM_ASAHI_G16)]
+            g16: None,
+            _device: reg.device().into(),
+            _reg: reg,
+            g17: None,
+            m3: Some(backend),
             raw_dev: core::ptr::null_mut(),
             raw_stats: core::ptr::null_mut(),
             stats: None,
@@ -445,6 +499,7 @@ impl AsahiPlatformDriver {
             _device: reg.device().into(),
             _reg: reg,
             g17: Some(gpu),
+            m3: None,
             #[cfg(CONFIG_DRM_ASAHI_G16)]
             g16: None,
             raw_dev,
@@ -518,6 +573,7 @@ impl AsahiPlatformDriver {
             _device: reg.device().into(),
             _reg: reg,
             g17: None,
+            m3: None,
             g16: Some(gpu),
             raw_dev,
             raw_stats,
@@ -601,6 +657,10 @@ impl Drop for AsahiPlatformDriverData<'_> {
         if let Some(gpu) = self.g17.as_ref() {
             // Also covers failure to allocate platform driver data after the probe body returned.
             gpu.shutdown();
+        }
+        #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+        if let Some(m3) = self.m3.as_ref() {
+            m3.stop();
         }
     }
 }
