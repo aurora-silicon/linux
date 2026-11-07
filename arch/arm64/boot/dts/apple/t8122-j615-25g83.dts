@@ -7,7 +7,7 @@
  */
 #include "t8122-j615.dts"
 #include "t8122-j613-dcp-25g83.dtsi"
-#include "t8122-j613-25g83-qspi.dtsi"
+#include "t8122-j613-qspi.dtsi"
 
 /*
  * As on the J613 25G83 tree: keep U-Boot from starting the MTP. U-Boot's

@@ -219,7 +219,7 @@
 	};
 
 	error_handler: error-handler@29cc40000 {
-		compatible = "apple,t8122-error-handler", "apple,error-handler";
+		compatible = "apple,t8122-error-handler", "apple,soc-error-handler";
 		reg = <0x2 0x9cc40000 0x0 0x40000>,
 		      <0x2 0xd0000000 0x0 0x7c000>,
 		      <0x2 0xd0700000 0x0 0xcc000>,
@@ -302,7 +302,7 @@
 	};
 
 	event_log_handler: event-log@2d0700000 {
-		compatible = "apple,t8122-event-log-handler", "apple,event-log-handler";
+		compatible = "apple,t8122-event-log", "apple,soc-event-log";
 		reg = <0x2 0xd0700000 0x0 0xcc000>,
 		      <0x2 0xe4280000 0x0 0x80000>,
 		      <0x2 0xd0000000 0x0 0x70000>,

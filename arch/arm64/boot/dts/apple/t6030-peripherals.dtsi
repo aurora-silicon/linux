@@ -252,7 +252,7 @@
 	};
 
 	error_handler: error-handler@29cc40000 {
-		compatible = "apple,t6030-error-handler", "apple,error-handler";
+		compatible = "apple,t6030-error-handler", "apple,soc-error-handler";
 		reg = <0x2 0x9cc40000 0x0 0x40000>,
 		      <0x3 0x50000000 0x0 0x7c000>,
 		      <0x3 0x50700000 0x0 0xcc000>,
@@ -357,7 +357,7 @@
 	};
 
 	event_log_handler: event-log@350700000 {
-		compatible = "apple,t6030-event-log-handler", "apple,event-log-handler";
+		compatible = "apple,t6030-event-log", "apple,soc-event-log";
 		reg = <0x3 0x50700000 0x0 0xcc000>,
 		      <0x3 0x64280000 0x0 0x80000>,
 		      <0x3 0x50000000 0x0 0x70000>,

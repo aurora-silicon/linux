@@ -2,7 +2,7 @@
 /* J613 with the exact 25G83 firmware profile. */
 #include "t8122-j613.dts"
 #include "t8122-j613-dcp-25g83.dtsi"
-#include "t8122-j613-25g83-qspi.dtsi"
+#include "t8122-j613-qspi.dtsi"
 
 /*
  * Keep U-Boot from starting the MTP. U-Boot's helper binds only the generic
