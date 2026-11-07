@@ -86,7 +86,7 @@
 			<0x13 0x20008000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1320 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&apciec3_dart_die1 15>;
+		iommus = <&m2_apciec7_dart 15>;
 		status = "disabled";
 	};
 
@@ -98,6 +98,17 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1358 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&pcie_ge_dart_die1 15>;
+		status = "disabled";
+	};
+};
+
+&die1 {
+	m2_apciec7_dart: iommu@1321008000 {
+		compatible = "apple,t6020-dart", "apple,t8110-dart";
+		reg = <0x13 0x21008000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1 1319 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
 		status = "disabled";
 	};
 };

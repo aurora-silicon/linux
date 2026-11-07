@@ -419,6 +419,7 @@ allOf:
             enum: ['apple,t6030-dcpext', 'apple,t8132-dcpext']
       required:
         - compatible
+    then: {}
     else:
       properties:
         mux-controls:
