@@ -1327,3 +1327,13 @@
 };
 
 #include "t8132-memory.dtsi"
+
+#include "t8132-peripherals.dtsi"
+
+#include "t8132-peripheral-buses.dtsi"
+
+#include "t8132-error-handlers.dtsi"
+
+#include "t8132-sio.dtsi"
+
+#include "t8132-avd.dtsi"
