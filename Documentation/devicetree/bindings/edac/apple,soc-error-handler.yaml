@@ -47,6 +47,10 @@ select:
           - apple,t8132-event-log
           - apple,t8140-error-handler
           - apple,t8140-event-log
+          - apple,t8142-error-handler
+          - apple,t8142-event-log
+          - apple,t8152-error-handler
+          - apple,t8152-event-log
   required:
     - compatible
 
@@ -129,6 +133,8 @@ allOf:
                     - apple,t8112-error-handler
                     - apple,t8122-error-handler
                     - apple,t8140-error-handler
+                    - apple,t8142-error-handler
+                    - apple,t8152-error-handler
                 - const: apple,soc-error-handler
             - items:
                 - enum:
@@ -145,6 +151,8 @@ allOf:
                     - apple,t8112-event-log
                     - apple,t8122-event-log
                     - apple,t8140-event-log
+                    - apple,t8142-event-log
+                    - apple,t8152-event-log
                 - const: apple,soc-event-log
 
         power-domains:
@@ -168,6 +176,66 @@ allOf:
         - interrupts
 
       allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t8142-error-handler
+          then:
+            properties:
+              reg:
+                minItems: 33
+                maxItems: 33
+              interrupts:
+                minItems: 31
+                maxItems: 31
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t8142-event-log
+          then:
+            properties:
+              reg:
+                minItems: 51
+                maxItems: 51
+              interrupts:
+                minItems: 13
+                maxItems: 13
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t8152-error-handler
+          then:
+            properties:
+              reg:
+                minItems: 112
+                maxItems: 120
+              interrupts:
+                minItems: 96
+                maxItems: 96
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t8152-event-log
+          then:
+            properties:
+              reg:
+                minItems: 57
+                maxItems: 57
+              interrupts:
+                minItems: 9
+                maxItems: 9
+            required:
+              - reg
         - if:
             properties:
               compatible:
