@@ -21,6 +21,7 @@
 	chassis-type = "laptop";
 
 	aliases {
+		keyboard = &keyboard;
 		sep = &sep;
 	};
 

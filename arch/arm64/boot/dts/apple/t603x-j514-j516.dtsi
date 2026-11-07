@@ -25,6 +25,7 @@
 		atcphy1 = &atcphy1;
 		atcphy2 = &atcphy2;
 		bluetooth0 = &bluetooth0;
+		keyboard = &keyboard;
 		serial0 = &serial0;
 		wifi0 = &wifi0;
 
