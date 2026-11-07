@@ -428,10 +428,12 @@ pub(crate) mod scheduling {
 /// Physical workqueue capacity and logical-owner admission limits.
 pub(crate) mod queues {
     pub(crate) const RENDER_SLOTS: usize = 64;
-    // One physical pair per logical owner leaves room for every execution
-    // context in the shared 128-QID namespace. Commands queue at RENDER_DEPTH,
-    // as many as a pair has command records (the render memory's RECORDS).
-    pub(crate) const RENDER_PAIRS_PER_OWNER: usize = 1;
+    // The QID budget reserves one physical pair per logical owner, which
+    // leaves room for every execution context in the shared 128-QID
+    // namespace. A second pair comes only from surplus, on G17D
+    // (g17::pairs). Commands queue at RENDER_DEPTH per pair, as many as a pair
+    // has command records (the render memory's RECORDS).
+    pub(crate) const RENDER_PAIRS_MAX: usize = 2;
     pub(crate) const RENDER_DEPTH: u8 = 32;
     // The firmware stores an ioctl's compute completion stamps only once all of the ioctl's
     // kicks finished, so finished commands hold their place until the ioctl's longest one ends.
