@@ -11,7 +11,7 @@ use crate::g17::{
     context::Context,
     fw::{
         channels::ControlRecord,
-        compute::{OperandState, COMPUTE_DESCRIPTOR_SIZE},
+        compute::{ComputeProgram, OperandState, COMPUTE_DESCRIPTOR_SIZE},
         queue::*,
         variant::PointerLayout,
     },
@@ -27,6 +27,9 @@ use crate::g17::now_ns;
 /// Descriptor slots per queue. A kick's descriptor is rewritten when the kick 32 slots later
 /// is published; with IN_FLIGHT kicks outstanding at most, that kick has completed by then.
 const DESCRIPTORS: usize = 32;
+// Descriptors and cached records are reused by slot, so both must outlast the in-flight window.
+const _: () =
+    assert!(retirement::IN_FLIGHT <= DESCRIPTORS && retirement::IN_FLIGHT <= RECORD_SLOTS);
 const GRAPH_SIZE: usize = 0x8000;
 const CONTEXT_SIZE: usize = 0x20000;
 const RECORD_STRIDE: usize = 0x1000;
@@ -145,6 +148,7 @@ struct Graph {
     pointers: PointerLayout,
     /// Layout of the operand-state buffer for the GPU's cores.
     operand_state: &'static OperandState,
+    program: ComputeProgram,
 }
 
 impl Graph {
@@ -154,6 +158,7 @@ impl Graph {
         context: &Context,
         pointers: PointerLayout,
         operand_state: &'static OperandState,
+        program: ComputeProgram,
     ) -> Result<Self> {
         let page = mmu::UAT_PGSZ as u64;
         let prot = mmu::PROT_GPU_FW_SHARED_RW;
@@ -220,6 +225,7 @@ impl Graph {
             reclaimed: 0,
             pointers,
             operand_state,
+            program,
         })
     }
 
@@ -376,17 +382,23 @@ use crate::g17::{
 use retirement::{Batch, Observation, Recordless, Ticket, IN_FLIGHT};
 
 struct Fifo<T> {
-    entries: [Option<T>; IN_FLIGHT],
+    // On the heap: inline, two windows of IN_FLIGHT entries made Queue's construction frames
+    // too large for the kernel stack.
+    entries: KVec<Option<T>>,
     head: usize,
     len: usize,
 }
 impl<T> Fifo<T> {
-    fn new() -> Self {
-        Self {
-            entries: core::array::from_fn(|_| None),
+    fn new() -> Result<Self> {
+        let mut entries = KVec::with_capacity(IN_FLIGHT, GFP_KERNEL)?;
+        for _ in 0..IN_FLIGHT {
+            entries.push_within_capacity(None).map_err(|_| ENOMEM)?;
+        }
+        Ok(Self {
+            entries,
             head: 0,
             len: 0,
-        }
+        })
     }
     fn front(&self) -> Option<&T> {
         self.entries[self.head].as_ref()
@@ -614,9 +626,11 @@ impl Queue {
         context: Arc<Context>,
         pointers: PointerLayout,
         operand_state: &'static OperandState,
+        program: ComputeProgram,
     ) -> Result<Self> {
         let Backing { mut pool, mut kick } = backing;
-        let mut graph = Graph::new(alloc, objects, &context, pointers, operand_state)?;
+        let (active, replays) = (Fifo::new()?, Fifo::new()?);
+        let mut graph = Graph::new(alloc, objects, &context, pointers, operand_state, program)?;
         let kick_alias = kick.map_client(context.vm())?;
         let pool_alias = pool.map_client(context.vm())?;
         let binding = graph.bind(context.clone(), kick_alias, pool_alias)?;
@@ -639,8 +653,8 @@ impl Queue {
             kick,
             pool,
             graph,
-            active: Fifo::new(),
-            replays: Fifo::new(),
+            active,
+            replays,
             replay_retirement: false,
             replay_error: None,
             replay_prepared: false,
@@ -1366,7 +1380,7 @@ mod admission_tests {
 
     #[test]
     fn retained_ring_pressure_waits_without_discarding_work() {
-        let mut active = Fifo::new();
+        let mut active = Fifo::new().unwrap();
         for sequence in 0..IN_FLIGHT {
             active.push(sequence).unwrap();
         }
@@ -2149,6 +2163,7 @@ pub(crate) trait Host {
     ) -> Result<qos::Publication>;
     fn qos_cancel(&mut self, publication: qos::Publication) -> Result;
     fn publish_qid(&mut self, id: kick::Id) -> Result;
+    fn register_queue(&mut self, queue: &crate::g17::fw::kick::KsmQueue) -> Result;
     fn publish_outer(&mut self, priority: u8, slot: &crate::g17::fw::channels::WorkSlot) -> Result;
     fn notify(&mut self, message: u64) -> Result;
     fn note_submission(&mut self) -> Result;
@@ -2237,6 +2252,7 @@ impl Queue {
             self.graph.ensure_record_slot(slot)?;
         }
         let args = ComputeArgs {
+            program: self.graph.program,
             intersection: *intersection,
             scratch: *scratch,
             usc_base: *usc_base,
@@ -2296,7 +2312,7 @@ impl Queue {
             },
             mcache: None,
             event_mask: COMPUTE_KICK_EVENT_MASK,
-            register_arrays: ComputeDescriptor::register_bindings(descriptor_low, *scratch)?,
+            register_arrays: ComputeDescriptor::register_bindings(descriptor_low, *scratch, self.graph.program)?,
             scs_enabled: scratch.enabled(),
             priority: policy.priority(),
         };
@@ -2364,9 +2380,16 @@ impl Queue {
                 )?;
                 wait_vas.push(address, GFP_KERNEL)?;
             }
+            let kick_ring_va = self.kick.low_va();
             let prepared_kick = self.kick.prepare_entry(&kick_args)?;
             let mut producer;
             if first {
+                host.register_queue(&crate::g17::fw::kick::KsmQueue::new(
+                    qid,
+                    kick_ring_va,
+                    DataMaster::Compute,
+                    policy.priority(),
+                )?)?;
                 producer = self.graph.first_descriptor(descriptor_high)?;
                 host.prepare_compute_shared()?;
                 packet.mark_published();

@@ -705,14 +705,29 @@ impl Backend {
             if shared.crashed.load(core::sync::atomic::Ordering::Acquire) {
                 return Err(EIO);
             }
-            let slot = firmware.queues.admission.reserve_queue()?;
+            // Check every capacity the queue needs before reserving its slot.
+            // A refused creator must hold nothing: returning a reserved slot
+            // notifies the queue domain observed above, so the creator's own
+            // wait would end at once and admission would spin on the device
+            // mutex for the whole wait, starving the queues it waits for.
+            let admission = &firmware.queues.admission;
             // Installed compute channels narrow render's QIDs: every open
             // logical queue keeps a dedicated render pair within reach.
-            if !firmware.queues.qids.render_fits(firmware.queues.admission.queues() as usize) {
+            if !admission.has_room()
+                || !firmware.queues.qids.render_fits(admission.queues() as usize + 1)
+            {
                 return Err(super::capacity::refused(super::capacity::Site::LogicalQueues));
             }
-            match firmware.uat.new_execution_context(vm) {
-                Ok(execution) => {
+            let attempt = if firmware.uat.execution_contexts_used() < crate::mmu::MAX_EXECUTION_CONTEXTS {
+                // Creators hold the device mutex, so neither check above can
+                // have changed; the slot only fails on a broken invariant.
+                let slot = admission.reserve_queue()?;
+                firmware.uat.new_execution_context(vm).map(|execution| (execution, slot))
+            } else {
+                Err(ENOSPC)
+            };
+            match attempt {
+                Ok((execution, slot)) => {
                     break (
                         lease,
                         firmware.uat.clone(),
@@ -723,14 +738,13 @@ impl Backend {
                     )
                 }
                 Err(error) if error == ENOSPC => {
-                    // Every open queue holds one context; this one is counted
-                    // in `queues()` already but holds none yet.
-                    let open = firmware.queues.admission.queues().saturating_sub(1);
+                    // Every open queue holds one context; this one holds no
+                    // slot or context any more.
+                    let open = firmware.queues.admission.queues();
                     let closing = firmware.uat.execution_contexts_used().saturating_sub(open);
                     if closing == 0 || now_ns().saturating_sub(started) >= RETAINED_CONTEXT_WAIT_NS {
                         return Err(super::capacity::refused(super::capacity::Site::ExecutionContexts));
                     }
-                    drop(slot);
                     drop(state);
                     drop(lease);
                     // Nothing is visible yet: a signalled creator restarts.
@@ -1160,6 +1174,7 @@ impl Backend {
                     self.context.clone(),
                     self.shared.variant.pointers,
                     self.shared.operand_state,
+                    self.shared.variant.compute,
                 )?;
                 Ok(KBox::new(queue, GFP_KERNEL)?)
             })();
@@ -1399,6 +1414,9 @@ impl compute::Host for ComputeHost<'_> {
     fn publish_qid(&mut self, id: kick::Id) -> Result {
         self.qids.publish(id)
     }
+    fn register_queue(&mut self, queue: &super::fw::kick::KsmQueue) -> Result {
+        self.port.register_queues(core::slice::from_ref(queue))
+    }
     fn publish_outer(&mut self, _priority: u8, slot: &super::fw::channels::WorkSlot) -> Result {
         self.port.publish_compute(self.outer.take().ok_or(EIO)?, slot).map(|_| ())
     }
@@ -1442,6 +1460,9 @@ impl compute::Host for DirectHost<'_> {
     fn publish_qid(&mut self, _id: kick::Id) -> Result {
         // An installed queue published its identity with its first command.
         Ok(())
+    }
+    fn register_queue(&mut self, _queue: &super::fw::kick::KsmQueue) -> Result {
+        Err(EAGAIN)
     }
     fn publish_outer(&mut self, _priority: u8, slot: &super::fw::channels::WorkSlot) -> Result {
         self.port.publish_compute(self.outer.take().ok_or(EIO)?, slot).map(|_| ())
@@ -1734,7 +1755,7 @@ impl super::Firmware {
 impl Backend {
     fn ensure_compute(&self, scs_pages: u16, admission: &Admission<'_>) -> Result {
         admission.check()?;
-        let required = super::fw::compute_pool::required_blocks(self.shared.active_cores, scs_pages)?;
+        let required = super::fw::compute_pool::required_blocks(self.shared.compute_blocks, self.shared.active_cores, scs_pages)?;
         let mut deferred = DeferredBatch::publication()?;
         loop {
             admission.check()?;
@@ -1833,7 +1854,7 @@ impl Backend {
             return None;
         }
         let super::command::Validated::Compute { scratch, .. } = &packet.command else { return None; };
-        let required = super::fw::compute_pool::required_blocks(self.shared.active_cores, scratch.pages()).ok()?;
+        let required = super::fw::compute_pool::required_blocks(self.shared.compute_blocks, self.shared.active_cores, scratch.pages()).ok()?;
         loop {
             let channels = self.shared.channels.observe();
             let progress = self.shared.progress.observe();
@@ -1976,7 +1997,7 @@ impl Backend {
         let super::command::Validated::Compute { scratch, .. } = &packet.command else {
             return Some(Err(EINVAL));
         };
-        let required = match super::fw::compute_pool::required_blocks(self.shared.active_cores, scratch.pages()) {
+        let required = match super::fw::compute_pool::required_blocks(self.shared.compute_blocks, self.shared.active_cores, scratch.pages()) {
             Ok(required) => required,
             Err(error) => return Some(Err(error)),
         };
@@ -1991,7 +2012,7 @@ impl Backend {
         deferred: &mut DeferredBatch,
     ) -> Result {
         let super::command::Validated::Compute { scratch, .. } = &packet.command else { return Err(EINVAL); };
-        let required = super::fw::compute_pool::required_blocks(self.shared.active_cores, scratch.pages())?;
+        let required = super::fw::compute_pool::required_blocks(self.shared.compute_blocks, self.shared.active_cores, scratch.pages())?;
         if packet.cancel_requested() || self.admission_open().is_err() || packet.completion.status().get() != 0 {
             return Err(render::FALLBACK);
         }
@@ -2068,7 +2089,7 @@ impl Backend {
     ) -> Result {
         packet.check_dependencies()?;
         let super::command::Validated::Compute { scratch, .. } = &packet.command else { return Err(EINVAL); };
-        let required = super::fw::compute_pool::required_blocks(self.shared.active_cores, scratch.pages())?;
+        let required = super::fw::compute_pool::required_blocks(self.shared.compute_blocks, self.shared.active_cores, scratch.pages())?;
         if let Some(result) = self.compute_direct(packet, required, deferred) {
             return result;
         }

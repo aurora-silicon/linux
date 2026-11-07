@@ -1,19 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple T6030 (M3 Pro / G15S) GPU. The boot loader fills in this machine's
+ * values and the firmware memory, then enables the GPU.
+ */
 
 / {
 	aliases {
-		gpu = &gpu;	/* m1n1 dt_set_gpu() finds the node through this alias */
+		gpu = &gpu;	/* the boot loader finds the GPU through this alias */
 	};
 
 	gpu_opp: opp-table-gpu {
 		compatible = "operating-points-v2";
 
-		/*
-		 * Placeholder only. m1n1 dt_set_gpu_t6030() deletes these children and
-		 * creates one OPP per runtime pstate, with one opp-microvolt cell per
-		 * MGPU (2). The pstate count and the frequency and voltage values are
-		 * filled by the bootloader; the template pstates are zero.
-		 */
+		/* Placeholder; the boot loader writes one OPP per pstate, per MGPU. */
 		opp00 {
 			opp-hz = /bits/ 64 <0>;
 			opp-microvolt = <400000 400000>;
@@ -39,11 +38,7 @@
 			status = "disabled";
 		};
 
-		/*
-		 * Filled and enabled by m1n1 from the ADT sgx gfx-handoff-*, gfx-shared-region-* and gpu-region-*
-		 * properties. Disabled until then, so that neither the kernel nor m1n1's RAM-map scan (dt_set_memory)
-		 * sees a zero-sized placeholder.
-		 */
+		/* Filled and enabled by the boot loader; disabled while empty. */
 		uat_handoff: uat-handoff@30 {
 			reg = <0 0x30 0 0>;
 			status = "disabled";
@@ -59,10 +54,7 @@
 			status = "disabled";
 		};
 
-		/*
-		 * G15 second-level TTBR1 table: keep it in the linear map with
-		 * uat-pagetables. The bootloader fills reg and enables this node.
-		 */
+		/* G15 TTBR1 level-2 table, in the linear map with uat-pagetables. */
 		uat_pagetables_l2: uat-pagetables-l2@40 {
 			reg = <0 0x40 0 0>;
 			status = "disabled";
@@ -71,24 +63,14 @@
 };
 
 &soc {
-	/*
-	 * asc is 0x40000 at 0x2_9240_0000. sgx is 16 MiB at 0x2_9000_0000, which covers
-	 * the ID block at sgx+0xd04000, the core masks at sgx+0xe01500 and the Fender
-	 * MMU block at sgx+0xd08000. The GPU has no DART: drm/asahi owns the UAT, as on t602x.
-	 */
+	/* No DART: drm/asahi owns the UAT, as on T602x. */
 	gpu: gpu@292400000 {
-		/* m1n1 sets "okay" as its last step, after every other property has been filled in */
-		status = "disabled";
-		/* apple,agx-t6030 is the compatible drm/asahi and m1n1 match. */
 		compatible = "apple,agx-t6030", "apple,agx-g15x", "apple,agx-g15s";
 		reg = <0x2 0x92400000 0 0x40000>,
 			<0x2 0x90000000 0 0x1000000>;
 		reg-names = "asc", "sgx";
 		interrupt-parent = <&aic>;
-		/*
-		 * Seven level interrupts in source order. The valid mask 0x5f marks entry 5
-		 * (838) invalid; it is kept so the list stays aligned, as t602x keeps all 7.
-		 */
+		/* Entry 5 (838) is invalid in the ADT mask; kept, as on T602x. */
 		interrupts = <AIC_IRQ 815 IRQ_TYPE_LEVEL_HIGH>,
 			<AIC_IRQ 816 IRQ_TYPE_LEVEL_HIGH>,
 			<AIC_IRQ 817 IRQ_TYPE_LEVEL_HIGH>,
@@ -97,12 +79,8 @@
 			<AIC_IRQ 838 IRQ_TYPE_LEVEL_HIGH>,
 			<AIC_IRQ 830 IRQ_TYPE_LEVEL_HIGH>;
 		mboxes = <&agx_mbox>;
-		/* "gfx" power domain at pmgr offset 0x110 (parents gpx, afr). */
 		power-domains = <&ps_gfx>;
-		/*
-		 * Do not hold back the ps_gfx sync_state() on this device when it never probes (fw_devlink would
-		 * otherwise keep "gfx" in its boot state forever).
-		 */
+		/* Do not hold back ps_gfx sync_state() if the GPU never probes. */
 		post-init-providers = <&ps_gfx>;
 		memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>,
 				<&gpu_hw_cal_a>, <&gpu_hw_cal_b>, <&gpu_globals>;
@@ -158,20 +136,15 @@
 		apple,se-kp = <-5.0>;
 		apple,se-kp-1 = <-10.0>;
 		apple,se-reset-criteria = <50>;
-		/*
-		 * One value per MGPU (drm/asahi requires two entries). Placeholders: m1n1
-		 * writes the fused core leakage into both entries and 0 for SRAM.
-		 */
+		/* One per MGPU; the boot loader writes the fused core leakage. */
 		apple,core-leak-coef = <1.0 1.0>;
 		apple,sram-leak-coef = <0.0 0.0>;
+
+		/* The boot loader sets "okay" last. */
+		status = "disabled";
 	};
 
-	/*
-	 * gfx-asc mailbox at asc + 0x8000, as on t602x and for the other t6030 ASC mailboxes.
-	 * Interrupts 832..835 are send-empty, send-not-empty, recv-empty, recv-not-empty.
-	 * Compatible is only apple,t6030-agx-asc-mailbox, with no v4 fallback, so a kernel
-	 * without G15 support leaves IRQs 832-835 unbound.
-	 */
+	/* No asc-mailbox-v4 fallback: unbound without G15 support. */
 	agx_mbox: mbox@292408000 {
 		compatible = "apple,t6030-agx-asc-mailbox";
 		reg = <0x2 0x92408000 0x0 0x4000>;
