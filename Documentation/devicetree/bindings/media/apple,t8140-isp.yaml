@@ -23,7 +23,6 @@ select:
         compatible:
           contains:
             enum:
-              - apple,isp
               - apple,t8140-isp
               - apple,t8142-isp
       required:
