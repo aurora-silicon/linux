@@ -43,6 +43,7 @@ properties:
               - apple,t6030-dart
               - apple,t6031-dart
               - apple,t6041-dart
+              - apple,t6050-dart
               - apple,t8122-dart
               - apple,t8132-dart
               - apple,t8140-dart
