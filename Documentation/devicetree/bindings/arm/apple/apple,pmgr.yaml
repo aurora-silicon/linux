@@ -56,6 +56,36 @@ select:
                 const: apple,pmgr
       required:
         - compatible
+properties:
+  $nodename: true
+
+  compatible: true
+
+  reg: true
+
+  "#address-cells":
+    const: 1
+
+  "#size-cells":
+    const: 1
+
+patternProperties:
+  "power-controller@[0-9a-f]+$":
+    description:
+      The individual power management domains within this controller
+    type: object
+    $ref: /schemas/power/apple,pmgr-pwrstate.yaml#
+
+  "reset-controller@[0-9a-f]+$":
+    description:
+      Reset controller for the CIO (USB4/Thunderbolt) blocks
+    type: object
+    $ref: /schemas/reset/apple,t8103-cio-reset.yaml#
+
+# The root declares the union of property types for DTB decoding. The
+# conditional variants below each retain their closed property contract.
+additionalProperties: true
+
 allOf:
   -
     if:
@@ -116,8 +146,6 @@ allOf:
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
-
-unevaluatedProperties: false
 
 $defs:
   legacy-driver:
