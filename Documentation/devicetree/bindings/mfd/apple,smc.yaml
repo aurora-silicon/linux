@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) AND GPL-2.0-only
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/mfd/apple,smc.yaml#
@@ -27,6 +27,7 @@ select:
               - apple,t6030-smc
               - apple,t6031-smc
               - apple,t6041-smc
+              - apple,t6050-smc
               - apple,t8103-smc
               - apple,t8112-smc
               - apple,t8122-smc
@@ -49,6 +50,7 @@ select:
                 const: apple,smc
       required:
         - compatible
+
 properties:
   compatible: true
 
@@ -60,7 +62,9 @@ properties:
     maxItems: 1
 
   gpio:
-    $ref: /schemas/gpio/apple,smc-gpio.yaml
+    oneOf:
+      - $ref: /schemas/gpio/apple,smc-gpio.yaml
+      - $ref: /schemas/gpio/apple,smc-pcio-gpio.yaml
 
   gpio-low:
     $ref: /schemas/gpio/apple,smc-gpio.yaml
@@ -74,8 +78,7 @@ properties:
   hwmon:
     $ref: /schemas/hwmon/apple,smc-hwmon.yaml
 
-# The root declares the union of property types for DTB decoding. The
-# conditional variants below each retain their closed property contract.
+# Root property types are shared; each conditional variant remains closed.
 additionalProperties: true
 
 allOf:
@@ -149,6 +152,7 @@ $defs:
         oneOf:
           - description: T8152 SMC with read-only hardware monitoring.
             const: apple,t8152-smc
+          - const: apple,t6050-smc
           - items:
               - enum:
                   - apple,t6020-smc
@@ -182,7 +186,9 @@ $defs:
         maxItems: 1
 
       gpio:
-        $ref: /schemas/gpio/apple,smc-gpio.yaml
+        oneOf:
+          - $ref: /schemas/gpio/apple,smc-gpio.yaml
+          - $ref: /schemas/gpio/apple,smc-pcio-gpio.yaml
 
       gpio-low:
         $ref: /schemas/gpio/apple,smc-gpio.yaml

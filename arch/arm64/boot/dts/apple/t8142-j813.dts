@@ -1,26 +1,56 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple MacBook Air (13-inch, M5, 2026), J813.
+ *
+ * Initial RAM boot resources measured from the J813 Apple Device Tree.
+ * The loader supplies usable memory, CPU release addresses and framebuffer
+ * geometry. Peripheral power management is left with the boot firmware.
+ */
 /dts-v1/;
+
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+	compatible = "apple,j813", "apple,t8142", "apple,arm-platform";
+	model = "Apple MacBook Air (13-inch, M5, 2026)";
+	chassis-type = "laptop";
+
+	#address-cells = <2>;
+	#size-cells = <2>;
+	interrupt-parent = <&aic>;
+
+	aliases {
+		serial0 = &dockchannel;
+		serial1 = &serial0;
+	};
+
+};
 
 #include "t8142.dtsi"
 
-/ {
-	model = "Apple MacBook Air (13-inch, M5, 2026)";
-	compatible = "apple,j813", "apple,t8142", "apple,arm-platform";
-};
-
 #include "t8142-j813-display.dtsi"
+
 #include "t8142-j813-gpu.dtsi"
+
 #include "t8142-j813-peripherals.dtsi"
+
 #include "t8142-j813-usb.dtsi"
+
 #include "t8142-j813-avd.dtsi"
+
 #include "t8142-j813-isp.dtsi"
+
 #include "t8142-j813-psci-idle.dtsi"
+
 #include "t8142-j813-nvme.dtsi"
+
 #include "t8142-j813-n1.dtsi"
+
 #include "t8142-j813-power.dtsi"
+
 #include "t8142-j813-audio.dtsi"
 
 #include "t8142-j813-unbound.dtsi"
-
 
 #include "t8142-j813-power-domains.dtsi"

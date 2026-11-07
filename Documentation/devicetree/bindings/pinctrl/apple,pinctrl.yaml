@@ -30,6 +30,7 @@ select:
               - apple,t6030-pinctrl
               - apple,t6031-pinctrl
               - apple,t6041-pinctrl
+              - apple,t6050-pinctrl
               - apple,t7000-pinctrl
               - apple,t8010-pinctrl
               - apple,t8015-pinctrl
@@ -56,6 +57,7 @@ select:
                 const: apple,pinctrl
       required:
         - compatible
+
 properties:
   compatible: true
 
@@ -75,7 +77,10 @@ properties:
     $ref: /schemas/types.yaml#/definitions/uint32
     maximum: 6
     default: 0
-    description: First hardware interrupt group owned by the host.
+    description: |
+      First interrupt group owned by this host. Interrupts lists consecutive
+      groups starting at this index. The loader must preserve any groups
+      owned by resident firmware. The range must end before group seven.
 
   apple,npins:
     $ref: /schemas/types.yaml#/definitions/uint32
@@ -109,8 +114,7 @@ patternProperties:
 
     additionalProperties: false
 
-# The root declares the union of property types for DTB decoding. The
-# conditional variants below each retain their closed property contract.
+# Root property types are shared; each conditional variant remains closed.
 additionalProperties: true
 
 allOf:
@@ -188,6 +192,15 @@ allOf:
               description: Physical power and combined clock-gate dependencies.
               minItems: 1
               maxItems: 8
+            gpio-ranges:
+              maxItems: 1
+            apple,npins:
+              $ref: /schemas/types.yaml#/definitions/uint32
+              description: Number of physical GPIO pins in this bank.
+            apple,irq-group-base:
+              $ref: /schemas/types.yaml#/definitions/uint32
+              maximum: 6
+              description: First host-owned interrupt group.
           required:
             - compatible
             - reg
@@ -216,6 +229,7 @@ $defs:
                   - apple,t8132-pinctrl
                   - apple,t8140-pinctrl
                   - apple,t8152-pinctrl
+                  - apple,t6050-pinctrl
               - const: apple,t8103-pinctrl
           - items:
               # Do not add additional SoC to this list.
@@ -229,6 +243,10 @@ $defs:
                   - apple,t8112-pinctrl
                   - apple,t6000-pinctrl
               - const: apple,pinctrl
+
+          - items:
+              - const: apple,t6050-pinctrl
+              - const: apple,t8132-pinctrl
 
       reg:
         maxItems: 1
@@ -248,7 +266,10 @@ $defs:
         $ref: /schemas/types.yaml#/definitions/uint32
         maximum: 6
         default: 0
-        description: First hardware interrupt group owned by the host.
+        description: |
+          First interrupt group owned by this host. Interrupts lists consecutive
+          groups starting at this index. The loader must preserve any groups
+          owned by resident firmware. The range must end before group seven.
 
       apple,npins:
         $ref: /schemas/types.yaml#/definitions/uint32

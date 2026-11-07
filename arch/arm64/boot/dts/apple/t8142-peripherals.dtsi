@@ -16,7 +16,7 @@
 		status = "disabled";
 	};
 
-	hw_aop_spmi0: spmi@390914000 {
+	hw_aop_spmi0: spmi-resource@390914000 {
 		compatible = "apple,t8142-spmi", "apple,spmi";
 		reg = <0x3 0x90914000 0x0 0x4000>,
 		      <0x3 0x90904000 0x0 0x4000>,
@@ -512,7 +512,7 @@
 		#size-cells = <0>;
 	};
 
-	hw_nub_spmi0: spmi@388714000 {
+	hw_nub_spmi0: spmi-resource@388714000 {
 		compatible = "apple,t8142-spmi", "apple,spmi";
 		reg = <0x3 0x88714000 0x0 0x4000>,
 		      <0x3 0x88704000 0x0 0x4000>,
@@ -521,7 +521,7 @@
 		interrupts = <AIC_IRQ 584 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
-	hw_nub_spmi1: spmi@388614000 {
+	hw_nub_spmi1: spmi-resource@388614000 {
 		compatible = "apple,t8142-spmi", "apple,spmi";
 		reg = <0x3 0x88614000 0x0 0x4000>,
 		      <0x3 0x88604000 0x0 0x4000>,
@@ -530,7 +530,7 @@
 		interrupts = <AIC_IRQ 589 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
-	hw_nub_spmi_a0: spmi@388908000 {
+	hw_nub_spmi_a0: spmi-resource@388908000 {
 		compatible = "apple,t8142-spmi", "apple,spmi";
 		reg = <0x3 0x88908000 0x0 0x4000>,
 		      <0x3 0x88904000 0x0 0x4000>,

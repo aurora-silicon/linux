@@ -16,6 +16,22 @@ description:
 
 allOf:
   - $ref: mux-controller.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6050-display-crossbar
+    then:
+      properties:
+        power-domains:
+          minItems: 2
+          maxItems: 2
+      required:
+        - power-domain-names
+    else:
+      properties:
+        power-domains:
+          maxItems: 1
 
 properties:
   compatible:
@@ -26,6 +42,7 @@ properties:
           - apple,t6000-display-crossbar
           - apple,t6020-display-crossbar
           - apple,t6041-display-crossbar
+          - apple,t8142-display-crossbar
           - apple,t8132-display-crossbar
       - items:
           - const: apple,t8112-display-crossbar
@@ -35,12 +52,21 @@ properties:
               - apple,t6030-display-crossbar
               - apple,t8122-display-crossbar
           - const: apple,t6020-display-crossbar
+      - items:
+          - const: apple,t6050-display-crossbar
+          - const: apple,t8142-display-crossbar
 
   reg:
     maxItems: 1
 
   power-domains:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
+
+  power-domain-names:
+    items:
+      - const: usb-aon
+      - const: common
 
   '#mux-control-cells':
     const: 1

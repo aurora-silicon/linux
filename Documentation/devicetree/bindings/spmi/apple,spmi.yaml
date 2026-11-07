@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
+# SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause) AND GPL-2.0-only
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/spmi/apple,spmi.yaml#
@@ -25,6 +25,7 @@ select:
               - apple,t6030-spmi
               - apple,t6031-spmi
               - apple,t6041-spmi
+              - apple,t6050-spmi
               - apple,t8012-spmi
               - apple,t8015-spmi
               - apple,t8103-spmi
@@ -50,6 +51,7 @@ select:
                 const: apple,spmi
       required:
         - compatible
+
 properties:
   compatible: true
 
@@ -64,8 +66,7 @@ properties:
 
   power-domains: true
 
-# The root declares the union of property types for DTB decoding. The
-# conditional variants below each retain their closed property contract.
+# Root property types are shared; each conditional variant remains closed.
 additionalProperties: true
 
 allOf:
@@ -161,7 +162,9 @@ $defs:
                   - apple,t6000-spmi
                   - apple,t8112-spmi
               - const: apple,spmi
-          - const: apple,t8142-spmi
+          - enum:
+              - apple,t8142-spmi
+              - apple,t6050-spmi
 
       reg:
         maxItems: 1
