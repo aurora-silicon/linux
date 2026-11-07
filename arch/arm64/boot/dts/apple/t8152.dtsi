@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
  * Common hardware inventory for boards without a qualified boot profile.
  * Firmware fills RAM and CPU release addresses. Keep new devices disabled;
@@ -190,3 +190,33 @@
 		};
 	};
 };
+
+/* Native interfaces shared by the hardware-only board descriptions. */
+&{/soc} {
+	pcie0_dart: iommu@388000000 {
+		compatible = "apple,t8152-dart", "apple,t8110-dart";
+		reg = <0x3 0x88000000 0x0 0x20000>;
+		interrupts = <AIC_IRQ 1572 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	rsm: rsm@309825000 {
+		compatible = "apple,t8152-rsm", "apple,rsm";
+		reg = <0x3 0x9825000 0x0 0x4000>,
+		      <0x3 0x98c0000 0x0 0x4>;
+		interrupts = <AIC_IRQ 489 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&sbr_dart 43>;
+		status = "disabled";
+	};
+
+	isp_secure_proxy: isp-secure-proxy@56d800000 {
+		compatible = "apple,t8152-isp-secure-proxy", "apple,isp-secure-proxy";
+		reg = <0x5 0x6d800000 0x0 0x480000>,
+		      <0x5 0x6e780000 0x0 0x1ac000>,
+		      <0x5 0x6e92c000 0x0 0x4000>;
+		status = "disabled";
+	};
+};
+
+#include "t8152-peripherals.dtsi"
