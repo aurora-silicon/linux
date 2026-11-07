@@ -27,7 +27,6 @@ properties:
           - const: apple,aic-timebase
 
   reg:
-    minItems: 1
     maxItems: 1
     description: Register apertures in hardware-description order.
 
