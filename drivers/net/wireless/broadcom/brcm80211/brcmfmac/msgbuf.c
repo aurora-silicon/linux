@@ -753,6 +753,10 @@ brcmf_msgbuf_flowring_create_worker(struct brcmf_msgbuf *msgbuf,
 		return BRCMF_FLOWRING_INVALID_ID;
 	}
 
+	/* A new ring has nothing in flight, whatever the previous ring on
+	 * this flowid left behind.
+	 */
+	atomic_set(&msgbuf->flowrings[flowid]->outstanding_tx, 0);
 	brcmf_commonring_config(msgbuf->flowrings[flowid],
 				BRCMF_H2D_TXFLOWRING_MAX_ITEM,
 				BRCMF_H2D_TXFLOWRING_ITEMSIZE, dma_buf);
@@ -1066,7 +1070,13 @@ brcmf_msgbuf_process_txstatus(struct brcmf_msgbuf *msgbuf, void *buf)
 
 	set_bit(flowid, msgbuf->txstatus_done_map);
 	commonring = msgbuf->flowrings[flowid];
-	atomic_dec(&commonring->outstanding_tx);
+	/* brcmf_msgbuf_delete_flowring() zeroes the count when it stops
+	 * waiting, and the firmware completes those frames later, when it
+	 * flushes the ring. Don't let them take the count below zero: a
+	 * negative count outlives the ring, and the next delete on this
+	 * flowid then waits out its full timeout.
+	 */
+	atomic_dec_if_positive(&commonring->outstanding_tx);
 
 	ifp = brcmf_get_ifp(msgbuf->drvr, tx_status->msg.ifidx);
 	/* Key on the flowring's ifidx, which the host assigned when it queued
@@ -1639,7 +1649,12 @@ void brcmf_msgbuf_delete_flowring(struct brcmf_pub *drvr, u16 flowid)
 		retry--;
 	}
 	if (!retry) {
-		brcmf_err("timed out waiting for txstatus\n");
+		/* Expected when the peer is gone (disconnect, suspend): the
+		 * firmware completes these frames only when it flushes the
+		 * ring for the delete request below.
+		 */
+		brcmf_dbg(MSGBUF, "flowring %u: %d tx outstanding, deleting it anyway\n",
+			  flowid, atomic_read(&commonring_del->outstanding_tx));
 		atomic_set(&commonring_del->outstanding_tx, 0);
 	}
 
