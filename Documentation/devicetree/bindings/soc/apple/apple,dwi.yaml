@@ -15,23 +15,20 @@ description: |
 
 properties:
   compatible:
-    oneOf:
-      - items:
-          - const: apple,t6041-dwi
-          - const: apple,dwi
-      - items:
-          - const: apple,t8140-dwi
-          - const: apple,dwi
-      - items:
-          - enum:
-              - apple,t6020-dwi
-              - apple,t6021-dwi
-              - apple,t6022-dwi
-              - apple,t6030-dwi
-              - apple,t6031-dwi
-              - apple,t8112-dwi
-              - apple,t8122-dwi
-          - const: apple,dwi
+    items:
+      - enum:
+          - apple,t6000-dwi
+          - apple,t6020-dwi
+          - apple,t6021-dwi
+          - apple,t6022-dwi
+          - apple,t6030-dwi
+          - apple,t6031-dwi
+          - apple,t6041-dwi
+          - apple,t8103-dwi
+          - apple,t8112-dwi
+          - apple,t8122-dwi
+          - apple,t8140-dwi
+      - const: apple,dwi
 
   reg:
     maxItems: 1

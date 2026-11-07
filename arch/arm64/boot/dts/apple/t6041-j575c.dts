@@ -14,6 +14,7 @@
 /dts-v1/;
 
 #include "t6041.dtsi"
+#include "t6041-j614-j616-j575-scaler.dtsi"
 #include "t604x-j575-j773.dtsi"
 #include "t6041-j616c-ane.dtsi"
 #include <dt-bindings/gpio/gpio.h>
@@ -147,24 +148,96 @@
 		apple,key-id = "TCMz";
 		label = "CPU Die Max";
 	};
-	temperature-TCMb { apple,key-id = "TCMb"; label = "CPU TCMb"; };
-	temperature-Tpx0 { apple,key-id = "Tpx0"; label = "CPU Tpx0"; };
-	temperature-Tpx1 { apple,key-id = "Tpx1"; label = "CPU Tpx1"; };
-	temperature-Tpx2 { apple,key-id = "Tpx2"; label = "CPU Tpx2"; };
-	temperature-Tpx3 { apple,key-id = "Tpx3"; label = "CPU Tpx3"; };
-	temperature-Tpx4 { apple,key-id = "Tpx4"; label = "CPU Tpx4"; };
-	temperature-Tpx5 { apple,key-id = "Tpx5"; label = "CPU Tpx5"; };
-	temperature-Tpx8 { apple,key-id = "Tpx8"; label = "CPU Tpx8"; };
-	temperature-Tpx9 { apple,key-id = "Tpx9"; label = "CPU Tpx9"; };
-	temperature-TpxA { apple,key-id = "TpxA"; label = "CPU TpxA"; };
-	temperature-TpxB { apple,key-id = "TpxB"; label = "CPU TpxB"; };
-	temperature-TpxC { apple,key-id = "TpxC"; label = "CPU TpxC"; };
-	temperature-TpxD { apple,key-id = "TpxD"; label = "CPU TpxD"; };
-	temperature-Tex0 { apple,key-id = "Tex0"; label = "CPU Tex0"; };
-	temperature-Tex1 { apple,key-id = "Tex1"; label = "CPU Tex1"; };
-	temperature-Tex2 { apple,key-id = "Tex2"; label = "CPU Tex2"; };
-	temperature-Tex3 { apple,key-id = "Tex3"; label = "CPU Tex3"; };
-	temperature-TW0P { apple,key-id = "TW0P"; label = "WiFi/BT Module Temp"; };
+
+	temperature-TCMb {
+		apple,key-id = "TCMb";
+		label = "CPU TCMb";
+	};
+
+	temperature-Tpx0 {
+		apple,key-id = "Tpx0";
+		label = "CPU Tpx0";
+	};
+
+	temperature-Tpx1 {
+		apple,key-id = "Tpx1";
+		label = "CPU Tpx1";
+	};
+
+	temperature-Tpx2 {
+		apple,key-id = "Tpx2";
+		label = "CPU Tpx2";
+	};
+
+	temperature-Tpx3 {
+		apple,key-id = "Tpx3";
+		label = "CPU Tpx3";
+	};
+
+	temperature-Tpx4 {
+		apple,key-id = "Tpx4";
+		label = "CPU Tpx4";
+	};
+
+	temperature-Tpx5 {
+		apple,key-id = "Tpx5";
+		label = "CPU Tpx5";
+	};
+
+	temperature-Tpx8 {
+		apple,key-id = "Tpx8";
+		label = "CPU Tpx8";
+	};
+
+	temperature-Tpx9 {
+		apple,key-id = "Tpx9";
+		label = "CPU Tpx9";
+	};
+
+	temperature-TpxA {
+		apple,key-id = "TpxA";
+		label = "CPU TpxA";
+	};
+
+	temperature-TpxB {
+		apple,key-id = "TpxB";
+		label = "CPU TpxB";
+	};
+
+	temperature-TpxC {
+		apple,key-id = "TpxC";
+		label = "CPU TpxC";
+	};
+
+	temperature-TpxD {
+		apple,key-id = "TpxD";
+		label = "CPU TpxD";
+	};
+
+	temperature-Tex0 {
+		apple,key-id = "Tex0";
+		label = "CPU Tex0";
+	};
+
+	temperature-Tex1 {
+		apple,key-id = "Tex1";
+		label = "CPU Tex1";
+	};
+
+	temperature-Tex2 {
+		apple,key-id = "Tex2";
+		label = "CPU Tex2";
+	};
+
+	temperature-Tex3 {
+		apple,key-id = "Tex3";
+		label = "CPU Tex3";
+	};
+
+	temperature-TW0P {
+		apple,key-id = "TW0P";
+		label = "WiFi/BT Module Temp";
+	};
 };
 
 #include "hwmon-common.dtsi"
@@ -246,11 +319,12 @@
 		reg-names = "config", "rc",
 			    "port0", "port1", "port2", "port3",
 			    "phy0", "phy1", "phy2", "phy3";
-		ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0 0x20000000 0x2000000 0 0x80000000 0xb 0x80000000 0 0x40000000>;
+		ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0x0 0x20000000>,
+			 <0x02000000 0x0 0x80000000 0xb 0x80000000 0x0 0x40000000>;
 		pinctrl-names = "default";
 		pinctrl-0 = <&wifi_clkreq_pins &sd_clkreq_pins &eth_clkreq_pins &xhci_clkreq_pins>;
-		#size-cells = <2>;
 		#address-cells = <3>;
+		#size-cells = <2>;
 		bus-range = <0 4>;
 		iommu-map-mask = <0xffff>;
 		iommu-map = <0x100 &pcie_dart 1 2>, <0x200 &apcie1_dart 1 1>,
@@ -269,12 +343,15 @@
 		port00: pci@0,0 {
 			reg = <0 0 0 0 0>;
 			ranges;
-			interrupt-map = <0 0 0 1 &port00 0 0 0 0 0 0 0 2 &port00 0 0 0 1 0 0 0 3 &port00 0 0 0 2 0 0 0 4 &port00 0 0 0 3>;
+			interrupt-map = <0 0 0 1 &port00 0 0 0 0>,
+					<0 0 0 2 &port00 0 0 0 1>,
+					<0 0 0 3 &port00 0 0 0 2>,
+					<0 0 0 4 &port00 0 0 0 3>;
 			interrupt-map-mask = <0 0 0 7>;
 			#interrupt-cells = <1>;
 			interrupt-controller;
-			#size-cells = <2>;
 			#address-cells = <3>;
+			#size-cells = <2>;
 			pwren-gpios = <&smc_gpio 0x13 GPIO_ACTIVE_HIGH>;
 			reset-gpios = <&pinctrl 4 GPIO_ACTIVE_LOW>;
 			device_type = "pci";
@@ -407,8 +484,8 @@
 
 				port@0 {
 					reg = <0>;
-					typec0_con_hs: endpoint {
-						remote-endpoint = <&usb_drd0_hs>;
+					typec0_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_0_hs>;
 					};
 				};
 			};
@@ -436,8 +513,8 @@
 
 				port@0 {
 					reg = <0>;
-					typec1_con_hs: endpoint {
-						remote-endpoint = <&usb_drd1_hs>;
+					typec1_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_1_hs>;
 					};
 				};
 			};
@@ -465,8 +542,8 @@
 
 				port@0 {
 					reg = <0>;
-					typec2_con_hs: endpoint {
-						remote-endpoint = <&usb_drd2_hs>;
+					typec2_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_2_hs>;
 					};
 				};
 			};
@@ -479,15 +556,15 @@
 	status = "okay";
 };
 
-&usb_drd0_dart_0 {
+&dwc3_0_dart_0 {
 	status = "okay";
 };
 
-&usb_drd0_dart_1 {
+&dwc3_0_dart_1 {
 	status = "okay";
 };
 
-&usb_drd0 {
+&dwc3_0 {
 	maximum-speed = "high-speed";
 	phys = <&atcphy0 PHY_TYPE_USB2>;
 	phy-names = "usb2-phy";
@@ -505,8 +582,8 @@
 
 		port@0 {
 			reg = <0>;
-			usb_drd0_hs: endpoint {
-				remote-endpoint = <&typec0_con_hs>;
+			dwc3_0_hs: endpoint {
+				remote-endpoint = <&typec0_connector_hs>;
 			};
 		};
 	};
@@ -517,15 +594,15 @@
 	status = "okay";
 };
 
-&usb_drd1_dart_0 {
+&dwc3_1_dart_0 {
 	status = "okay";
 };
 
-&usb_drd1_dart_1 {
+&dwc3_1_dart_1 {
 	status = "okay";
 };
 
-&usb_drd1 {
+&dwc3_1 {
 	maximum-speed = "high-speed";
 	phys = <&atcphy1 PHY_TYPE_USB2>;
 	phy-names = "usb2-phy";
@@ -543,8 +620,8 @@
 
 		port@0 {
 			reg = <0>;
-			usb_drd1_hs: endpoint {
-				remote-endpoint = <&typec1_con_hs>;
+			dwc3_1_hs: endpoint {
+				remote-endpoint = <&typec1_connector_hs>;
 			};
 		};
 	};
@@ -555,15 +632,15 @@
 	status = "okay";
 };
 
-&usb_drd2_dart_0 {
+&dwc3_2_dart_0 {
 	status = "okay";
 };
 
-&usb_drd2_dart_1 {
+&dwc3_2_dart_1 {
 	status = "okay";
 };
 
-&usb_drd2 {
+&dwc3_2 {
 	maximum-speed = "high-speed";
 	phys = <&atcphy2 PHY_TYPE_USB2>;
 	phy-names = "usb2-phy";
@@ -581,8 +658,8 @@
 
 		port@0 {
 			reg = <0>;
-			usb_drd2_hs: endpoint {
-				remote-endpoint = <&typec2_con_hs>;
+			dwc3_2_hs: endpoint {
+				remote-endpoint = <&typec2_connector_hs>;
 			};
 		};
 	};
@@ -633,62 +710,77 @@
 			opp-hz = /bits/ 64 <0>;
 			opp-microvolt = <125000 125000 125000 125000>;
 		};
+
 		opp01 {
 			opp-hz = /bits/ 64 <338000000>;
 			opp-microvolt = <600000 600000 600000 600000>;
 		};
+
 		opp02 {
 			opp-hz = /bits/ 64 <618000000>;
 			opp-microvolt = <665000 665000 660000 660000>;
 		};
+
 		opp03 {
 			opp-hz = /bits/ 64 <796000000>;
 			opp-microvolt = <705000 705000 700000 705000>;
 		};
+
 		opp04 {
 			opp-hz = /bits/ 64 <924000000>;
 			opp-microvolt = <725000 725000 715000 730000>;
 		};
+
 		opp05 {
 			opp-hz = /bits/ 64 <952000000>;
 			opp-microvolt = <770000 770000 770000 780000>;
 		};
+
 		opp06 {
 			opp-hz = /bits/ 64 <1056000000>;
 			opp-microvolt = <770000 770000 770000 780000>;
 		};
+
 		opp07 {
 			opp-hz = /bits/ 64 <1062000000>;
 			opp-microvolt = <810000 810000 805000 810000>;
 		};
+
 		opp08 {
 			opp-hz = /bits/ 64 <1182000000>;
 			opp-microvolt = <810000 810000 805000 810000>;
 		};
+
 		opp09 {
 			opp-hz = /bits/ 64 <1182000000>;
 			opp-microvolt = <860000 860000 860000 860000>;
 		};
+
 		opp10 {
 			opp-hz = /bits/ 64 <1312000000>;
 			opp-microvolt = <860000 860000 860000 860000>;
 		};
+
 		opp11 {
 			opp-hz = /bits/ 64 <1242000000>;
 			opp-microvolt = <900000 895000 900000 900000>;
 		};
+
 		opp12 {
 			opp-hz = /bits/ 64 <1380000000>;
 			opp-microvolt = <900000 895000 900000 900000>;
 		};
+
 		opp13 {
 			opp-hz = /bits/ 64 <1326000000>;
 			opp-microvolt = <940000 925000 940000 940000>;
 		};
+
 		opp14 {
 			opp-hz = /bits/ 64 <1470000000>;
 			opp-microvolt = <940000 925000 940000 940000>;
 		};
+
 		opp15 {
 			opp-hz = /bits/ 64 <1578000000>;
 			opp-microvolt = <1020000 1020000 1020000 1020000>;
@@ -702,30 +794,37 @@
 			opp-hz = /bits/ 64 <24000000>;
 			opp-microvolt = <585000>;
 		};
+
 		opp01 {
 			opp-hz = /bits/ 64 <338000000>;
 			opp-microvolt = <585000>;
 		};
+
 		opp02 {
 			opp-hz = /bits/ 64 <618000000>;
 			opp-microvolt = <635000>;
 		};
+
 		opp03 {
 			opp-hz = /bits/ 64 <796000000>;
 			opp-microvolt = <685000>;
 		};
+
 		opp04 {
 			opp-hz = /bits/ 64 <992000000>;
 			opp-microvolt = <720000>;
 		};
+
 		opp05 {
 			opp-hz = /bits/ 64 <1188000000>;
 			opp-microvolt = <770000>;
 		};
+
 		opp06 {
 			opp-hz = /bits/ 64 <1380000000>;
 			opp-microvolt = <855000>;
 		};
+
 		opp07 {
 			opp-hz = /bits/ 64 <1470000000>;
 			opp-microvolt = <885000>;
@@ -739,30 +838,37 @@
 			opp-hz = /bits/ 64 <24000000>;
 			opp-microvolt = <585000>;
 		};
+
 		opp01 {
 			opp-hz = /bits/ 64 <338000000>;
 			opp-microvolt = <585000>;
 		};
+
 		opp02 {
 			opp-hz = /bits/ 64 <618000000>;
 			opp-microvolt = <635000>;
 		};
+
 		opp03 {
 			opp-hz = /bits/ 64 <796000000>;
 			opp-microvolt = <685000>;
 		};
+
 		opp04 {
 			opp-hz = /bits/ 64 <992000000>;
 			opp-microvolt = <720000>;
 		};
+
 		opp05 {
 			opp-hz = /bits/ 64 <1188000000>;
 			opp-microvolt = <770000>;
 		};
+
 		opp06 {
 			opp-hz = /bits/ 64 <1380000000>;
 			opp-microvolt = <855000>;
 		};
+
 		opp07 {
 			opp-hz = /bits/ 64 <1470000000>;
 			opp-microvolt = <885000>;
@@ -895,17 +1001,39 @@
 	};
 };
 
-&aop { nonposted-mmio; };
+&aop {
+	nonposted-mmio;
+};
 
 /* No ambient light sensor and no lid. */
-&aop_als { status = "disabled"; };
-&aop_las { status = "disabled"; };
+&aop_als {
+	status = "disabled";
+};
 
-&admac1 { dma-channels = <26>; nonposted-mmio; };
-&admac0 { nonposted-mmio; };
-&aop_dart { nonposted-mmio; };
-&i2c1 { nonposted-mmio; };
-&i2c2 { nonposted-mmio; };
+&aop_las {
+	status = "disabled";
+};
+
+&admac1 {
+	dma-channels = <26>;
+	nonposted-mmio;
+};
+
+&admac0 {
+	nonposted-mmio;
+};
+
+&aop_dart {
+	nonposted-mmio;
+};
+
+&i2c1 {
+	nonposted-mmio;
+};
+
+&i2c2 {
+	nonposted-mmio;
+};
 
 / {
 	reserved-memory {

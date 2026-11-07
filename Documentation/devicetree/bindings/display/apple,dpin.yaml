@@ -14,20 +14,19 @@ description: |
 
 properties:
   compatible:
-    oneOf:
-      - items:
-          - const: apple,t6041-dpin
-          - const: apple,dpin
-      - items:
-          - enum:
-              - apple,t6020-dpin
-              - apple,t6021-dpin
-              - apple,t6022-dpin
-              - apple,t6030-dpin
-              - apple,t6031-dpin
-              - apple,t8112-dpin
-              - apple,t8122-dpin
-          - const: apple,dpin
+    items:
+      - enum:
+          - apple,t6000-dpin
+          - apple,t6020-dpin
+          - apple,t6021-dpin
+          - apple,t6022-dpin
+          - apple,t6030-dpin
+          - apple,t6031-dpin
+          - apple,t6041-dpin
+          - apple,t8103-dpin
+          - apple,t8112-dpin
+          - apple,t8122-dpin
+      - const: apple,dpin
 
   reg:
     maxItems: 1
