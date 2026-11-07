@@ -24,6 +24,7 @@ properties:
           - apple,maverick-pmic
           - apple,monaco-pmic
           - apple,sera-pmic
+          - apple,simetra-pmic
           - apple,stowe-pmic
           - apple,vale-pmic
       - const: apple,spmi-nvmem

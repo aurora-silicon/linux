@@ -1,0 +1,72 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Address/length metadata only; implementation programming stays in drivers. */
+
+&{/cpus/cpu@0} {
+	apple,firmware-cpu-id = <0x0>;
+	apple,implementation-registers = /bits/ 64 <0x210050000 0x9008>;
+	apple,acc-registers = /bits/ 64 <0x210f00000 0x40088>;
+	apple,cpm-registers = /bits/ 64 <0x210e40000 0x9010>;
+};
+
+&{/cpus/cpu@1} {
+	apple,firmware-cpu-id = <0x1>;
+	apple,implementation-registers = /bits/ 64 <0x210150000 0x9008>;
+	apple,acc-registers = /bits/ 64 <0x210f00000 0x40088>;
+	apple,cpm-registers = /bits/ 64 <0x210e40000 0x9010>;
+};
+
+&{/cpus/cpu@10100} {
+	apple,firmware-cpu-id = <0x100>;
+	apple,implementation-registers = /bits/ 64 <0x211050000 0x9008>;
+	apple,acc-registers = /bits/ 64 <0x211f00000 0x40088>;
+	apple,cpm-registers = /bits/ 64 <0x211e40000 0x9010>;
+};
+
+&{/cpus/cpu@10101} {
+	apple,firmware-cpu-id = <0x101>;
+	apple,implementation-registers = /bits/ 64 <0x211150000 0x9008>;
+	apple,acc-registers = /bits/ 64 <0x211f00000 0x40088>;
+	apple,cpm-registers = /bits/ 64 <0x211e40000 0x9010>;
+};
+
+&{/cpus/cpu@10102} {
+	apple,firmware-cpu-id = <0x102>;
+	apple,implementation-registers = /bits/ 64 <0x211250000 0x9008>;
+	apple,acc-registers = /bits/ 64 <0x211f00000 0x40088>;
+	apple,cpm-registers = /bits/ 64 <0x211e40000 0x9010>;
+};
+
+&{/cpus/cpu@10103} {
+	apple,firmware-cpu-id = <0x103>;
+	apple,implementation-registers = /bits/ 64 <0x211350000 0x9008>;
+	apple,acc-registers = /bits/ 64 <0x211f00000 0x40088>;
+	apple,cpm-registers = /bits/ 64 <0x211e40000 0x9010>;
+};
+
+&{/cpus/cpu@10200} {
+	apple,firmware-cpu-id = <0x200>;
+	apple,implementation-registers = /bits/ 64 <0x212050000 0x9008>;
+	apple,acc-registers = /bits/ 64 <0x212f00000 0x40088>;
+	apple,cpm-registers = /bits/ 64 <0x212e40000 0x9010>;
+};
+
+&{/cpus/cpu@10201} {
+	apple,firmware-cpu-id = <0x201>;
+	apple,implementation-registers = /bits/ 64 <0x212150000 0x9008>;
+	apple,acc-registers = /bits/ 64 <0x212f00000 0x40088>;
+	apple,cpm-registers = /bits/ 64 <0x212e40000 0x9010>;
+};
+
+&{/cpus/cpu@10202} {
+	apple,firmware-cpu-id = <0x202>;
+	apple,implementation-registers = /bits/ 64 <0x212250000 0x9008>;
+	apple,acc-registers = /bits/ 64 <0x212f00000 0x40088>;
+	apple,cpm-registers = /bits/ 64 <0x212e40000 0x9010>;
+};
+
+&{/cpus/cpu@10203} {
+	apple,firmware-cpu-id = <0x203>;
+	apple,implementation-registers = /bits/ 64 <0x212350000 0x9008>;
+	apple,acc-registers = /bits/ 64 <0x212f00000 0x40088>;
+	apple,cpm-registers = /bits/ 64 <0x212e40000 0x9010>;
+};

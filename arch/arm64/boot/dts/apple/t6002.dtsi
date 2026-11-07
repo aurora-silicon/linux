@@ -440,3 +440,7 @@
 #include "t6002-display-extra.dtsi"
 
 #include "t6002-firmware-interfaces.dtsi"
+
+#include "t6002-cpu-debug.dtsi"
+
+#include "t6002-cpu-registers.dtsi"
