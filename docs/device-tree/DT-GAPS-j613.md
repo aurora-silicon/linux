@@ -15,17 +15,18 @@ This is a resource coverage audit, not a claim of complete board support. 298 ar
 
 | Record classification | Count |
 | --- | ---: |
-| bus device | 6 |
-| firmware service | 81 |
-| gap | 23 |
+| bus device | 11 |
+| gap | 18 |
 | partial resources | 33 |
 | resources | 71 |
-| shared hardware | 2 |
+| service review | 79 |
+| shared hardware | 4 |
 | stream | 82 |
 
 ## Remaining work
 
-- Close every explicit GAP below, including nested endpoints and shared resource ownership.
+- Close every explicit GAP and service-review entry below, including nested endpoints and shared resource ownership.
+- Some template SPMI records are alternative endpoints at the same address. Runtime model selection is needed before representing these as simultaneous devices.
 - Reconcile larger firmware resource windows with the driver-specific Linux register layout; do not expand an active device aperture without driver review.
 - Bindings and resource presence do not supply per-device calibration, firmware or an initialization contract.
 - Validate this board with `W=1` and `dtbs_check`, then perform a separately approved boot before enabling newly described engines.
@@ -37,7 +38,7 @@ This is a resource coverage audit, not a claim of complete board support. 298 ar
 
 ## Every arm-io record
 
-Paths in the first column are relative to `arm-io`. Stream entries name the owning translation block; their SID and aperture semantics still need review. Firmware aggregate/service entries are retained for audit visibility and are not silently counted as separate physical devices.
+Paths in the first column are relative to `arm-io`. Stream entries name the owning translation block; their SID and aperture semantics still need review. Service-review entries have no independently decoded MMIO resource; this is not a waiver of their hardware or binding requirements.
 
 | Firmware hardware/service record | Classification | Linux description or gap |
 | --- | --- | --- |
@@ -45,12 +46,12 @@ Paths in the first column are relative to `arm-io`. Stream entries name the owni
 | `spi2/mesa` | bus device | `/soc/spi@2a1108000/fingerprint@0` |
 | `spi4` | resources | `/soc/spi@2a1110000` |
 | `spi4/dp855` | gap | **GAP:** nested resource requires parent-specific address decoding |
-| `spi4/dp855/lcd-pmicwp` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `spi4/dp855/lcd-pmic` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `spi4/dp855/lcd-sswp` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `spi4/dp855/lcd-ss` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `spi4/dp855/tcon-registers` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `spi4/dp855/lcd-eeprom` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
+| `spi4/dp855/lcd-pmicwp` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `spi4/dp855/lcd-pmic` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `spi4/dp855/lcd-sswp` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `spi4/dp855/lcd-ss` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `spi4/dp855/tcon-registers` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `spi4/dp855/lcd-eeprom` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
 | `i2c1` | resources | `/soc/i2c@2a1014000` |
 | `i2c1/audio-speaker` | bus device | `/soc/i2c@2a1014000/codec@38` |
 | `i2c1/audio-speaker-left-tweeter` | bus device | `/soc/i2c@2a1014000/codec@39` |
@@ -62,26 +63,26 @@ Paths in the first column are relative to `arm-io`. Stream entries name the owni
 | `i2c4/avellino-pre` | gap | **GAP:** I2C device not described under this bus |
 | `i2c4/avellino-post` | gap | **GAP:** I2C device not described under this bus |
 | `fpwm1` | resources | `/soc/pwm@2a1044000` |
-| `fpwm1/kbd-backlight` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `alc0` | firmware service | Firmware service/policy or aggregate; no independent MMIO resource in this record |
-| `alc0/audio-leap-mic` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `alc4` | firmware service | Firmware service/policy or aggregate; no independent MMIO resource in this record |
-| `alc4/audio-leap-internal-loopback` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `wlan` | firmware service | Firmware service/policy or aggregate; no independent MMIO resource in this record |
-| `bluetooth` | firmware service | Firmware service/policy or aggregate; no independent MMIO resource in this record |
+| `fpwm1/kbd-backlight` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `alc0` | service review | No independent MMIO resource in this record; service/aggregate semantics require review |
+| `alc0/audio-leap-mic` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `alc4` | service review | No independent MMIO resource in this record; service/aggregate semantics require review |
+| `alc4/audio-leap-internal-loopback` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `wlan` | shared hardware | `/soc/pcie@580000000/pci@0,0/wifi@0,0` |
+| `bluetooth` | shared hardware | `/soc/pcie@580000000/pci@0,0/bluetooth@0,1` |
 | `apcie` | partial resources | `/soc/pcie@580000000`; **GAP:** 18 larger or unmatched resource window(s) |
-| `apcie/pci-bridge0` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `apcie/pci-bridge0/wlan` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `apcie/pci-bridge0/bluetooth-pcie` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
+| `apcie/pci-bridge0` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `apcie/pci-bridge0/wlan` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `apcie/pci-bridge0/bluetooth-pcie` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
 | `dart-apcie0` | resources | `/soc/iommu@594000000` |
 | `dart-apcie0/mapper-apcie0-wlan` | stream | Stream of `/soc/iommu@594000000`; stream/resource linkage needs review |
 | `dart-apcie0/mapper-apcie0-bt` | stream | Stream of `/soc/iommu@594000000`; stream/resource linkage needs review |
 | `dart-apcie0/mapper-apcie0-piodma` | stream | Stream of `/soc/iommu@594000000`; stream/resource linkage needs review |
 | `apcie0-piodma` | resources | `/soc/dma-controller@594010000` |
 | `acio-cpu0` | partial resources | `/soc/mailbox@701108000`; **GAP:** 1 larger or unmatched resource window(s) |
-| `acio-cpu0/iop-acio0-nub` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
+| `acio-cpu0/iop-acio0-nub` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
 | `apciec0` | gap | **GAP:** no matching hardware resource node |
-| `apciec0/pcic0-bridge` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
+| `apciec0/pcic0-bridge` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
 | `dart-apciec0` | resources | `/soc/iommu@721008000` |
 | `dart-apciec0/mapper-apciec0-piodma` | stream | Stream of `/soc/iommu@721008000`; stream/resource linkage needs review |
 | `apciec0-piodma` | resources | `/soc/dma-controller@722000000` |
@@ -116,9 +117,9 @@ Paths in the first column are relative to `arm-io`. Stream entries name the owni
 | `atc0-dpin0` | resources | `/soc/displayport@701e50000` |
 | `atc0-dpin1` | resources | `/soc/displayport@701e58000` |
 | `acio-cpu1` | partial resources | `/soc/mailbox@b01108000`; **GAP:** 1 larger or unmatched resource window(s) |
-| `acio-cpu1/iop-acio1-nub` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
+| `acio-cpu1/iop-acio1-nub` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
 | `apciec1` | gap | **GAP:** no matching hardware resource node |
-| `apciec1/pcic1-bridge` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
+| `apciec1/pcic1-bridge` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
 | `dart-apciec1` | resources | `/soc/iommu@b21008000` |
 | `dart-apciec1/mapper-apciec1-piodma` | stream | Stream of `/soc/iommu@b21008000`; stream/resource linkage needs review |
 | `apciec1-piodma` | resources | `/soc/dma-controller@b22000000` |
@@ -152,7 +153,7 @@ Paths in the first column are relative to `arm-io`. Stream entries name the owni
 | `atc1-dpphy` | shared hardware | `/soc/phy@b03000000` |
 | `atc1-dpin0` | resources | `/soc/displayport@b01e50000` |
 | `atc1-dpin1` | resources | `/soc/displayport@b01e58000` |
-| `display-crossbar0` | firmware service | Firmware service/policy or aggregate; no independent MMIO resource in this record |
+| `display-crossbar0` | service review | No independent MMIO resource in this record; service/aggregate semantics require review |
 | `mcc` | resources | `/soc/pmp_report@2d03c0000`; `/soc/memory-controller@2d03c0000`; `/soc/power-management@2d0780000`; `/soc/error-handler@29cc40000` |
 | `aic` | resources | `/soc/interrupt-controller@2d1000000` |
 | `aic-timebase` | resources | `/soc/interrupt-controller@2d1000000` |
@@ -166,75 +167,75 @@ Paths in the first column are relative to `arm-io`. Stream entries name the owni
 | `nub-gpio` | resources | `/soc/pinctrl@2e41f0000` |
 | `smc-gpio` | resources | `/soc/pinctrl@2ec820000` |
 | `aop` | partial resources | `/soc/aop@2f4c00000`; **GAP:** 2 larger or unmatched resource window(s) |
-| `aop/iop-aop-nub` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `aop/iop-aop-nub/aop-audio` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `aop/iop-aop-nub/aop-audio/audio-pdm2` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `aop/iop-aop-nub/aop-audio/hfdc-2400000` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `aop/iop-aop-nub/aop-audio/audio-hp` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `aop/iop-aop-nub/aop-audio/audio-lp-mic-in` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `aop/iop-aop-nub/aop-audio/audio-leap-internal-loopback` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `aop/iop-aop-nub/accel` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `aop/iop-aop-nub/gyro` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
+| `aop/iop-aop-nub` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `aop/iop-aop-nub/aop-audio` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `aop/iop-aop-nub/aop-audio/audio-pdm2` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `aop/iop-aop-nub/aop-audio/hfdc-2400000` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `aop/iop-aop-nub/aop-audio/audio-hp` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `aop/iop-aop-nub/aop-audio/audio-lp-mic-in` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `aop/iop-aop-nub/aop-audio/audio-leap-internal-loopback` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `aop/iop-aop-nub/accel` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `aop/iop-aop-nub/gyro` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
 | `dart-aop` | resources | `/soc/iommu@2f4818000`; `/soc/filter@2f481c000` |
 | `dart-aop/mapper-aop` | stream | Stream of `/soc/iommu@2f4818000` / `/soc/filter@2f481c000`; stream/resource linkage needs review |
 | `dart-aop/mapper-aop-admac` | stream | Stream of `/soc/iommu@2f4818000` / `/soc/filter@2f481c000`; stream/resource linkage needs review |
 | `dart-aop/mapper-scm` | stream | Stream of `/soc/iommu@2f4818000` / `/soc/filter@2f481c000`; stream/resource linkage needs review |
 | `pmgr` | partial resources | `/soc/event-log@2d0700000`; `/soc/cpufreq@210e20000`; `/soc/cpufreq@211e20000`; `/soc/power-management@2d0780000`; `/soc/error-handler@29cc40000`; `/soc/pmp_report@2d03c0000`; `/soc/video-encoder@315100000`; `/soc/isp@2a4000000`; `/soc/gpu@292400000`; `/soc/phy@703000000`; `/soc/phy@b03000000`; `/soc/video-codec@321000000`; **GAP:** 57 larger or unmatched resource window(s) |
-| `pmgr/clpc` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `pmgr/soc-tuner` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `pmgr/ppm` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
+| `pmgr/clpc` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `pmgr/soc-tuner` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `pmgr/ppm` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
 | `nco` | resources | `/soc/clock-controller@2d0044000` |
 | `event-log-handler` | resources | `/soc/event-log@2d0700000` |
 | `pmp` | partial resources | `/soc/pmp@2d0500000`; `/soc/dcp@28ec00000`; **GAP:** 2 larger or unmatched resource window(s) |
-| `pmp/iop-pmp-nub` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
+| `pmp/iop-pmp-nub` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
 | `dart-pmp` | resources | `/soc/iommu@2d0300000` |
 | `dart-pmp/mapper-pmp` | stream | Stream of `/soc/iommu@2d0300000`; stream/resource linkage needs review |
 | `sep` | partial resources | `/soc/sep@29e400000`; **GAP:** 1 larger or unmatched resource window(s) |
-| `sep/iop-sep-nub` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `sep/iop-sep-nub/Ocelot` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `sep/iop-sep-nub/xART` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `sep/iop-sep-nub/InvalidateHmac` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
+| `sep/iop-sep-nub` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `sep/iop-sep-nub/Ocelot` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `sep/iop-sep-nub/xART` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `sep/iop-sep-nub/InvalidateHmac` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
 | `dart-sep` | resources | `/soc/iommu@29cac0000` |
 | `dart-sep/mapper-sep` | stream | Stream of `/soc/iommu@29cac0000`; stream/resource linkage needs review |
 | `sio` | resources | `/soc/dma-controller@2a1c00000` |
-| `sio/iop-sio-nub` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `sio/iop-sio-nub/sio-dma` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
+| `sio/iop-sio-nub` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `sio/iop-sio-nub/sio-dma` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
 | `dart-sio` | resources | `/soc/iommu@2a1004000` |
 | `dart-sio/mapper-sio` | stream | Stream of `/soc/iommu@2a1004000`; stream/resource linkage needs review |
 | `dart-sio/mapper-aes` | stream | Stream of `/soc/iommu@2a1004000`; stream/resource linkage needs review |
 | `dart-sio/mapper-admac` | stream | Stream of `/soc/iommu@2a1004000`; stream/resource linkage needs review |
 | `ans` | partial resources | `/soc/nvme@30dcc0000`; **GAP:** 6 larger or unmatched resource window(s) |
-| `ans/iop-ans-nub` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
+| `ans/iop-ans-nub` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
 | `sart-ans` | resources | `/soc/sart@30dc50000`; `/soc/nvme@30dcc0000` |
 | `smc` | partial resources | `/soc/smc@2ec400000`; **GAP:** 3 larger or unmatched resource window(s) |
-| `smc/iop-smc-nub` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `smc/iop-smc-nub/smc-pmu` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `smc/iop-smc-nub/smc-charger-util-0` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `smc/iop-smc-nub/smc-charger-util-1` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `smc/iop-smc-nub/smc-charger-util` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
+| `smc/iop-smc-nub` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `smc/iop-smc-nub/smc-pmu` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `smc/iop-smc-nub/smc-charger-util-0` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `smc/iop-smc-nub/smc-charger-util-1` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `smc/iop-smc-nub/smc-charger-util` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
 | `rsm` | resources | `/soc/rsm@2e4325000` |
 | `dart-rsm` | resources | `/soc/iommu@2e433c000` |
 | `dart-rsm/mapper-rsm` | stream | Stream of `/soc/iommu@2e433c000`; stream/resource linkage needs review |
 | `uart0` | partial resources | `/soc/serial@2a1200000`; **GAP:** 1 larger or unmatched resource window(s) |
-| `uart0/debug-console` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
+| `uart0/debug-console` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
 | `dockchannel-uart` | gap | **GAP:** no matching hardware resource node |
 | `dockchannel-mtp` | partial resources | `/soc/fifo@2fab14000`; `/soc/fifo@2fab14000/input@0`; **GAP:** 1 larger or unmatched resource window(s) |
-| `dockchannel-mtp/mtp-transport` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `dockchannel-mtp/mtp-transport/multi-touch` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `dockchannel-mtp/mtp-transport/keyboard` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `dockchannel-mtp/mtp-transport/stm` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `dockchannel-mtp/mtp-transport/actuator` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `dockchannel-mtp/mtp-transport/tp-accel` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
+| `dockchannel-mtp/mtp-transport` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `dockchannel-mtp/mtp-transport/multi-touch` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `dockchannel-mtp/mtp-transport/keyboard` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `dockchannel-mtp/mtp-transport/stm` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `dockchannel-mtp/mtp-transport/actuator` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `dockchannel-mtp/mtp-transport/tp-accel` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
 | `mtp` | partial resources | `/soc/mtp@2fa400000`; **GAP:** 2 larger or unmatched resource window(s) |
-| `mtp/iop-mtp-nub` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
+| `mtp/iop-mtp-nub` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
 | `dart-mtp` | resources | `/soc/iommu@2fa808000`; `/soc/filter@2fa80c000` |
 | `dart-mtp/mapper-mtp` | stream | Stream of `/soc/iommu@2fa808000` / `/soc/filter@2fa80c000`; stream/resource linkage needs review |
 | `mtp-aop-mux` | gap | **GAP:** service or GPIO relationships still need a binding and resource mapping |
 | `qspi` | resources | `/soc/spi@2a1118000` |
-| `qspi/spinor` | gap | **GAP:** nested resource requires parent-specific address decoding |
-| `qspi/spinor/firmware` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `qspi/spinor/anvram` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `qspi/spinor/syscfg` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
+| `qspi/spinor` | gap | **GAP:** SPI NOR endpoint is not described |
+| `qspi/spinor/firmware` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `qspi/spinor/anvram` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `qspi/spinor/syscfg` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
 | `i2c2` | resources | `/soc/i2c@2a1018000` |
 | `i2c2/atcrt0` | gap | **GAP:** I2C device not described under this bus |
 | `i2c2/atcrt1` | gap | **GAP:** I2C device not described under this bus |
@@ -244,24 +245,24 @@ Paths in the first column are relative to `arm-io`. Stream entries name the owni
 | `dart-usb0` | resources | `/soc/iommu@702f00000`; `/soc/iommu@702f80000` |
 | `dart-usb0/mapper-usb0` | stream | Stream of `/soc/iommu@702f00000` / `/soc/iommu@702f80000`; stream/resource linkage needs review |
 | `usb-drd0` | partial resources | `/soc/usb@702280000`; `/soc/phy@703000000`; **GAP:** 8 larger or unmatched resource window(s) |
-| `usb-drd0/usb-drd0-port-hs` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `usb-drd0/usb-drd0-port-ss` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
+| `usb-drd0/usb-drd0-port-hs` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `usb-drd0/usb-drd0-port-ss` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
 | `usb-otg0` | resources | `/soc/usb@702100000`; `/soc/phy@703000000` |
 | `atc-phy1` | partial resources | `/soc/phy@b03000000`; **GAP:** 2 larger or unmatched resource window(s) |
 | `dart-usb1` | resources | `/soc/iommu@b02f00000`; `/soc/iommu@b02f80000` |
 | `dart-usb1/mapper-usb1` | stream | Stream of `/soc/iommu@b02f00000` / `/soc/iommu@b02f80000`; stream/resource linkage needs review |
 | `usb-drd1` | partial resources | `/soc/usb@b02280000`; `/soc/phy@b03000000`; **GAP:** 8 larger or unmatched resource window(s) |
-| `usb-drd1/usb-drd1-port-hs` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `usb-drd1/usb-drd1-port-ss` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
+| `usb-drd1/usb-drd1-port-hs` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `usb-drd1/usb-drd1-port-ss` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
 | `nub-spmi0` | partial resources | `/soc/spmi@2e4714000`; **GAP:** 3 larger or unmatched resource window(s) |
-| `nub-spmi0/pmu-main` | gap | **GAP:** SPMI endpoint and interrupt/GPIO dependencies need a binding and description |
-| `nub-spmi0/btm` | gap | **GAP:** SPMI endpoint and interrupt/GPIO dependencies need a binding and description |
+| `nub-spmi0/pmu-main` | bus device | `/soc/spmi@2e4714000/pmic@e` |
+| `nub-spmi0/btm` | bus device | `/soc/spmi@2e4714000/pmic@e` |
 | `nub-spmi1` | resources | `/soc/spmi@2e4794000` |
 | `nub-spmi1/pmu-aux` | gap | **GAP:** SPMI endpoint and interrupt/GPIO dependencies need a binding and description |
 | `nub-spmi-a0` | partial resources | `/soc/spmi@2e4908000`; **GAP:** 3 larger or unmatched resource window(s) |
-| `nub-spmi-a0/hpm0` | gap | **GAP:** SPMI endpoint and interrupt/GPIO dependencies need a binding and description |
-| `nub-spmi-a0/hpm1` | gap | **GAP:** SPMI endpoint and interrupt/GPIO dependencies need a binding and description |
-| `nub-spmi-a0/hpm5` | gap | **GAP:** SPMI endpoint and interrupt/GPIO dependencies need a binding and description |
+| `nub-spmi-a0/hpm0` | bus device | `/soc/spmi@2e4908000/usb-pd@c` |
+| `nub-spmi-a0/hpm1` | bus device | `/soc/spmi@2e4908000/usb-pd@a` |
+| `nub-spmi-a0/hpm5` | bus device | `/soc/spmi@2e4908000/usb-pd@8` |
 | `aop-spmi0` | resources | `/soc/spmi@2f4894000` |
 | `aop-spmi0/spmi-wifibt` | gap | **GAP:** SPMI endpoint and interrupt/GPIO dependencies need a binding and description |
 | `aop-spmi1` | resources | `/soc/spmi@2f48d4000` |
@@ -269,26 +270,26 @@ Paths in the first column are relative to `arm-io`. Stream entries name the owni
 | `aop-spmi1/stockholm-spmi/stockholm` | gap | **GAP:** SPMI endpoint and interrupt/GPIO dependencies need a binding and description |
 | `lcd0-sac` | gap | **GAP:** service or GPIO relationships still need a binding and resource mapping |
 | `disp0` | partial resources | `/soc/dcp@28ec00000`; **GAP:** 1 larger or unmatched resource window(s) |
-| `dcp0-expert` | firmware service | Firmware service/policy or aggregate; no independent MMIO resource in this record |
+| `dcp0-expert` | service review | No independent MMIO resource in this record; service/aggregate semantics require review |
 | `dcp` | partial resources | `/soc/dcp@28ec00000`; **GAP:** 1 larger or unmatched resource window(s) |
-| `dcp/iop-dcp-nub` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
+| `dcp/iop-dcp-nub` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
 | `dart-dcp` | resources | `/soc/iommu@28d30c000` |
 | `dart-dcp/mapper-dcp` | stream | Stream of `/soc/iommu@28d30c000`; stream/resource linkage needs review |
 | `dart-disp0` | resources | `/soc/iommu@28d304000`; `/soc/iommu@28d300000` |
 | `dart-disp0/mapper-disp0` | stream | Stream of `/soc/iommu@28d304000` / `/soc/iommu@28d300000`; stream/resource linkage needs review |
 | `dart-disp0/mapper-disp0-piodma` | stream | Stream of `/soc/iommu@28d304000` / `/soc/iommu@28d300000`; stream/resource linkage needs review |
 | `dcp-sac-controller` | gap | **GAP:** service or GPIO relationships still need a binding and resource mapping |
-| `dp-audio0` | firmware service | Firmware service/policy or aggregate; no independent MMIO resource in this record |
+| `dp-audio0` | service review | No independent MMIO resource in this record; service/aggregate semantics require review |
 | `dispext0` | partial resources | `/soc/dcp@31ac00000`; `/soc/dcp@28ec00000`; **GAP:** 1 larger or unmatched resource window(s) |
-| `dcpext-expert` | firmware service | Firmware service/policy or aggregate; no independent MMIO resource in this record |
+| `dcpext-expert` | service review | No independent MMIO resource in this record; service/aggregate semantics require review |
 | `dcpext` | partial resources | `/soc/dcp@31ac00000`; **GAP:** 1 larger or unmatched resource window(s) |
-| `dcpext/iop-dcpext-nub` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
+| `dcpext/iop-dcpext-nub` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
 | `dart-dcpext` | resources | `/soc/iommu@31930c000` |
 | `dart-dcpext/mapper-dcpext` | stream | Stream of `/soc/iommu@31930c000`; stream/resource linkage needs review |
 | `dart-dispext0` | resources | `/soc/iommu@319304000`; `/soc/iommu@319300000` |
 | `dart-dispext0/mapper-dispext0` | stream | Stream of `/soc/iommu@319304000` / `/soc/iommu@319300000`; stream/resource linkage needs review |
 | `dart-dispext0/mapper-dispext0-piodma` | stream | Stream of `/soc/iommu@319304000` / `/soc/iommu@319300000`; stream/resource linkage needs review |
-| `dp-audio1` | firmware service | Firmware service/policy or aggregate; no independent MMIO resource in this record |
+| `dp-audio1` | service review | No independent MMIO resource in this record; service/aggregate semantics require review |
 | `scaler0` | resources | `/soc/scaler@31d000000` |
 | `dart-scaler` | resources | `/soc/iommu@31d200000` |
 | `dart-scaler/mapper-scaler` | stream | Stream of `/soc/iommu@31d200000`; stream/resource linkage needs review |
@@ -314,28 +315,64 @@ Paths in the first column are relative to `arm-io`. Stream entries name the owni
 | `dart-isp` | resources | `/soc/iommu@2a64a8000`; `/soc/iommu@2a64b4000`; `/soc/iommu@2a64bc000`; `/soc/iommu@2a64b0000`; `/soc/iommu@2a64b8000`; `/soc/filter@2a64ac000` |
 | `dart-isp/mapper-isp` | stream | Stream of `/soc/iommu@2a64a8000` / `/soc/iommu@2a64b4000` / `/soc/iommu@2a64bc000` / `/soc/iommu@2a64b0000` / `/soc/iommu@2a64b8000` / `/soc/filter@2a64ac000`; stream/resource linkage needs review |
 | `ane` | partial resources | `/soc/filter@311804000`; `/soc/video-encoder@315100000`; **GAP:** 5 larger or unmatched resource window(s) |
-| `ane/iop-ane-nub` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
+| `ane/iop-ane-nub` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
 | `dart-ane` | partial resources | `/soc/filter@311804000`; **GAP:** 3 larger or unmatched resource window(s) |
 | `dart-ane/mapper-ane` | stream | Stream of `/soc/filter@311804000`; stream/resource linkage needs review |
 | `sgx` | partial resources | `/soc/gpu@292400000`; **GAP:** 1 larger or unmatched resource window(s) |
 | `gfx-asc` | resources | `/soc/gpu@292400000` |
-| `gfx-asc/iop-gfx-nub` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `mapper-gfx-asc` | firmware service | Firmware service/policy or aggregate; no independent MMIO resource in this record |
+| `gfx-asc/iop-gfx-nub` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `mapper-gfx-asc` | service review | No independent MMIO resource in this record; service/aggregate semantics require review |
 | `mca-switch` | partial resources | `/soc/i2s@2a3400000`; **GAP:** 2 larger or unmatched resource window(s) |
 | `mca0` | resources | `/soc/i2s@2a3400000` |
-| `mca0/mca0a` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `mca0/mca0a/audio-speaker` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
+| `mca0/mca0a` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `mca0/mca0a/audio-speaker` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
 | `mca1` | resources | `/soc/i2s@2a3400000` |
-| `mca1/mca1a` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `mca1/mca1a/audio-loopback` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
+| `mca1/mca1a` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `mca1/mca1a/audio-loopback` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
 | `mca2` | resources | `/soc/i2s@2a3400000` |
-| `mca2/mca2a` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `mca2/mca2a/audio-codec-output` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `mca2/mca2b` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `mca2/mca2b/audio-codec-input` | firmware service | Subordinate firmware service/configuration; no independent decoded MMIO resource |
-| `smctempsensor0` | firmware service | Firmware service/policy or aggregate; no independent MMIO resource in this record |
+| `mca2/mca2a` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `mca2/mca2a/audio-codec-output` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `mca2/mca2b` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `mca2/mca2b/audio-codec-input` | service review | Subordinate firmware service/configuration or logical device; semantic mapping requires review |
+| `smctempsensor0` | service review | No independent MMIO resource in this record; service/aggregate semantics require review |
 | `cpu-debug-interface` | gap | **GAP:** service or GPIO relationships still need a binding and resource mapping |
 | `aft` | resources | `/soc/trace@220180000` |
-| `timesync` | firmware service | Firmware service/policy or aggregate; no independent MMIO resource in this record |
-| `fillmore` | firmware service | Firmware service/policy or aggregate; no independent MMIO resource in this record |
+| `timesync` | service review | No independent MMIO resource in this record; service/aggregate semantics require review |
+| `fillmore` | service review | No independent MMIO resource in this record; service/aggregate semantics require review |
 | `apple-processor-trace` | gap | **GAP:** service or GPIO relationships still need a binding and resource mapping |
+
+## Other root records
+
+Boot metadata subtrees are identified but their properties and private data are not reproduced. Runtime memory allocations must be supplied by the loader rather than copied from a firmware template.
+
+| Root hardware or metadata record | Linux responsibility / review |
+| --- | --- |
+| `chosen` | Boot metadata; no independent hardware device. Subtree properties omitted. |
+| `options` | Boot metadata; no independent hardware device. Subtree properties omitted. |
+| `cpus` | `/cpus`; core topology and harvesting require loader/compiled-DTB reconciliation. |
+| `cpus/cpu0` | `/cpus`; core topology and harvesting require loader/compiled-DTB reconciliation. |
+| `cpus/cpu1` | `/cpus`; core topology and harvesting require loader/compiled-DTB reconciliation. |
+| `cpus/cpu2` | `/cpus`; core topology and harvesting require loader/compiled-DTB reconciliation. |
+| `cpus/cpu3` | `/cpus`; core topology and harvesting require loader/compiled-DTB reconciliation. |
+| `cpus/cpu4` | `/cpus`; core topology and harvesting require loader/compiled-DTB reconciliation. |
+| `cpus/cpu5` | `/cpus`; core topology and harvesting require loader/compiled-DTB reconciliation. |
+| `cpus/cpu6` | `/cpus`; core topology and harvesting require loader/compiled-DTB reconciliation. |
+| `cpus/cpu7` | `/cpus`; core topology and harvesting require loader/compiled-DTB reconciliation. |
+| `aliases` | Boot metadata; no independent hardware device. Subtree properties omitted. |
+| `memory` | Loader-owned runtime memory or reserved-memory allocation; not a static template address. |
+| `pram` | Loader-owned runtime memory or reserved-memory allocation; not a static template address. |
+| `vram` | Loader-owned runtime memory or reserved-memory allocation; not a static template address. |
+| `socd-trace-ram` | Loader-owned runtime memory or reserved-memory allocation; not a static template address. |
+| `hibernate` | Loader-owned runtime memory or reserved-memory allocation; not a static template address. |
+| `amfm` | **GAP:** non-arm-io hardware/service record requires semantic mapping. |
+| `buttons` | **GAP:** reconcile GPIO key and wakeup relationships. |
+| `port-usb-c-1` | **GAP:** reconcile connector graph, role and GPIO dependencies per port. |
+| `port-usb-c-2` | **GAP:** reconcile connector graph, role and GPIO dependencies per port. |
+| `port-magsafe3-1` | **GAP:** reconcile connector graph, role and GPIO dependencies per port. |
+| `backlight` | **GAP:** non-arm-io hardware/service record requires semantic mapping. |
+| `sacm` | **GAP:** non-arm-io hardware/service record requires semantic mapping. |
+| `defaults` | Boot metadata; no independent hardware device. Subtree properties omitted. |
+| `product` | Boot metadata; no independent hardware device. Subtree properties omitted. |
+| `iboot-syscfg` | Boot metadata; no independent hardware device. Subtree properties omitted. |
+| `filesystems-props` | Boot metadata; no independent hardware device. Subtree properties omitted. |
+| `osenvironments` | Boot metadata; no independent hardware device. Subtree properties omitted. |
