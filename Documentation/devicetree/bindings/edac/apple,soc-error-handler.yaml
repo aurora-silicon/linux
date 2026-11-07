@@ -54,6 +54,8 @@ properties:
       order. T8140 publishes its native error/event register banks in
       hardware-description order; their presence does not establish safe
       AP access and the instances remain disabled until qualified.
+      T8142 and T8152 likewise retain their native status windows; T8152
+      board descriptions publish 112 or 120 error-handler apertures.
 
 required:
   - compatible
@@ -98,7 +100,7 @@ allOf:
     then:
       properties:
         reg:
-          minItems: 120
+          minItems: 112
           maxItems: 120
         interrupts:
           minItems: 96
