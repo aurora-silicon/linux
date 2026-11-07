@@ -1241,11 +1241,19 @@
 		};
 	};
 
+#ifdef APPLE_T602X_NON_ULTRA
 	DIE_NODE(usb4_3_pcie_tunnel): usb4-pcie-tunnel-3 {
+#else
+	DIE_NODE(usb4_3_pcie_tunnel): usb4-pcie-tunnel@1320000000 {
+#endif
 		#address-cells = <2>;
 		#size-cells = <2>;
+#ifdef APPLE_T602X_NON_ULTRA
 		ranges;
-#ifndef APPLE_T602X_NON_ULTRA
+#else
+		/* Identity-map the controller and PCIe memory windows. */
+		ranges = <0x13 0x20000000 0x13 0x20000000 0x0 0x20000000>,
+			 <0x14 0x0 0x14 0x0 0x2 0x80000000>;
 		status = "disabled";
 #endif
 
