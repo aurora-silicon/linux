@@ -3306,6 +3306,27 @@
 	status = "okay";
 };
 
+/* Both JPEG engines; they have no board wiring. */
+&ps_jpg {
+	status = "okay";
+};
+
+&jpeg0_dart {
+	status = "okay";
+};
+
+&jpeg0 {
+	status = "okay";
+};
+
+&jpeg1_dart {
+	status = "okay";
+};
+
+&jpeg1 {
+	status = "okay";
+};
+
 #include "t6040-j616s-usb3.dtsi"
 
 /* External display chain, all disabled: the gate in drivers/soc/apple/display-gate.c enables it. */
