@@ -160,12 +160,11 @@ impl RootProfile {
     /// Status-config layout of the M5 graph built for this profile.
     pub(crate) const fn m5_status_config(self) -> &'static M5StatusConfigMap {
         match self {
-            Self::J714G17S26A428
-            | Self::J714G17S26B123
-            | Self::J714G17S26C5035
-            | Self::J700G17P
-            | Self::J813G17G25G76
-            | Self::J873G18G26A428 => &M5_26A428_STATUS_CONFIG,
+            Self::J714G17S26B123 => &M5_26B123_STATUS_CONFIG,
+            Self::J714G17S26C5035 => &M5_26B123_STATUS_CONFIG,
+            Self::J714G17S26A428 | Self::J700G17P | Self::J813G17G25G76 | Self::J873G18G26A428 => {
+                &M5_26A428_STATUS_CONFIG
+            }
         }
     }
 }
