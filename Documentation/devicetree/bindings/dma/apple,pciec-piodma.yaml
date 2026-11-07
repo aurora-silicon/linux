@@ -18,6 +18,7 @@ select:
     compatible:
       contains:
         enum:
+          - apple,t6032-pciec-piodma
           - apple,t6041-pciec-piodma
           - apple,t8132-pciec-piodma
   required:
@@ -59,30 +60,61 @@ allOf:
         - interrupts
         - iommus
     else:
-      properties:
-        compatible:
-          oneOf:
-            - items:
-                - const: apple,t6041-pciec-piodma
-                - const: apple,pciec-piodma
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t6032-pciec-piodma
+            required:
+              - compatible
+          then:
+            properties:
+              compatible:
+                items:
+                  - const: apple,t6032-pciec-piodma
+                  - const: apple,pciec-piodma
 
-        reg:
-          minItems: 4
-          maxItems: 4
-          description: Register apertures in hardware-description order.
+              reg:
+                minItems: 4
+                maxItems: 4
 
-        interrupts:
-          maxItems: 1
+              interrupts:
+                maxItems: 1
 
-        iommus:
-          maxItems: 1
+              iommus:
+                maxItems: 1
 
-      required:
-        - compatible
-        - reg
-        - interrupts
-        - iommus
+            required:
+              - compatible
+              - reg
+              - interrupts
+          else:
+            properties:
+              compatible:
+                oneOf:
+                  - items:
+                      - const: apple,t6041-pciec-piodma
+                      - const: apple,pciec-piodma
 
-      additionalProperties: false
+              reg:
+                minItems: 4
+                maxItems: 4
+                description: Register apertures in hardware-description order.
+
+              interrupts:
+                maxItems: 1
+
+              iommus:
+                maxItems: 1
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - iommus
+
+            additionalProperties: false
 
 unevaluatedProperties: false

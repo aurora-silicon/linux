@@ -17,6 +17,7 @@ select:
     compatible:
       contains:
         enum:
+          - apple,t6032-dpin
           - apple,t6041-dpin
           - apple,t8132-dpin
   required:
@@ -53,25 +54,52 @@ allOf:
         - reg
         - interrupts
     else:
-      properties:
-        compatible:
-          oneOf:
-            - items:
-                - const: apple,t6041-dpin
-                - const: apple,dpin
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t6032-dpin
+            required:
+              - compatible
+          then:
+            properties:
+              compatible:
+                items:
+                  - const: apple,t6032-dpin
+                  - const: apple,dpin
 
-        reg:
-          maxItems: 1
-          description: Register apertures in hardware-description order.
+              reg:
+                maxItems: 1
 
-        interrupts:
-          maxItems: 1
+              interrupts:
+                maxItems: 1
 
-      required:
-        - compatible
-        - reg
-        - interrupts
+            required:
+              - compatible
+              - reg
+              - interrupts
+          else:
+            properties:
+              compatible:
+                oneOf:
+                  - items:
+                      - const: apple,t6041-dpin
+                      - const: apple,dpin
 
-      additionalProperties: false
+              reg:
+                maxItems: 1
+                description: Register apertures in hardware-description order.
+
+              interrupts:
+                maxItems: 1
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+
+            additionalProperties: false
 
 unevaluatedProperties: false

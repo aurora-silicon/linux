@@ -18,6 +18,7 @@ select:
     compatible:
       contains:
         enum:
+          - apple,t6032-aes
           - apple,t6041-aes
           - apple,t8132-aes
           - apple,t8140-aes
@@ -64,37 +65,73 @@ allOf:
         - power-domains
         - iommus
     else:
-      properties:
-        compatible:
-          oneOf:
-            - items:
-                - const: apple,t6041-aes
-                - const: apple,aes
-            - items:
-                - const: apple,t8140-aes
-                - const: apple,aes
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t6032-aes
+            required:
+              - compatible
+          then:
+            properties:
+              compatible:
+                items:
+                  - const: apple,t6032-aes
+                  - const: apple,aes
 
-        reg:
-          minItems: 3
-          maxItems: 3
-          description: Register apertures in hardware-description order.
+              reg:
+                minItems: 2
+                maxItems: 2
 
-        interrupts:
-          maxItems: 1
+              interrupts:
+                maxItems: 1
 
-        power-domains:
-          maxItems: 1
+              power-domains:
+                maxItems: 1
 
-        iommus:
-          maxItems: 1
+              iommus:
+                maxItems: 1
 
-      required:
-        - compatible
-        - reg
-        - interrupts
-        - power-domains
-        - iommus
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - power-domains
+              - iommus
+          else:
+            properties:
+              compatible:
+                oneOf:
+                  - items:
+                      - const: apple,t6041-aes
+                      - const: apple,aes
+                  - items:
+                      - const: apple,t8140-aes
+                      - const: apple,aes
 
-      additionalProperties: false
+              reg:
+                minItems: 3
+                maxItems: 3
+                description: Register apertures in hardware-description order.
+
+              interrupts:
+                maxItems: 1
+
+              power-domains:
+                maxItems: 1
+
+              iommus:
+                maxItems: 1
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - power-domains
+              - iommus
+
+            additionalProperties: false
 
 unevaluatedProperties: false
