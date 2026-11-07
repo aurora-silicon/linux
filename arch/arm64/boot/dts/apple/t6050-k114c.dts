@@ -21,3 +21,5 @@
 };
 
 #include "t6050-k114c-peripherals.dtsi"
+
+#include "t6050-k114c-audio-topology.dtsi"

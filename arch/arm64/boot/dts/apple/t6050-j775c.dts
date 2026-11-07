@@ -61,3 +61,5 @@
 &smc_mbox {
 	status = "disabled";
 };
+
+#include "t6050-j775c-audio-topology.dtsi"

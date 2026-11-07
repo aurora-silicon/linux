@@ -223,3 +223,5 @@
 };
 
 #include "t6050-j714c-peripherals.dtsi"
+
+#include "t6050-j714c-audio-topology.dtsi"
