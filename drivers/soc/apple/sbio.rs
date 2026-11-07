@@ -78,6 +78,51 @@ const PROMPT_RETRY_LIMIT: u32 = 3;
 /// attempts to match".
 const VERIFY_RETRY_LIMIT: u32 = 5;
 
+const NSEC_PER_HOUR: u64 = 3600 * 1_000_000_000;
+/// Touch ID asks for the password again, as Apple documents for Touch ID
+/// (Apple Platform Security, "Touch ID, Face ID, passcodes and
+/// passwords"), when the computer has not been unlocked for 48 hours ...
+const BIO_TOKEN_MAX_NS: u64 = 48 * NSEC_PER_HOUR;
+/// ... or when the password has not been used for 156 hours and Touch ID
+/// has not unlocked it for 4 hours.
+const PASSWORD_MAX_NS: u64 = 156 * NSEC_PER_HOUR;
+const BIO_MATCH_MAX_NS: u64 = 4 * NSEC_PER_HOUR;
+
+/// Whether Touch ID's permission to stand in for the password still holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TokenAge {
+    Fresh,
+    /// No match and no password for `BIO_TOKEN_MAX_NS`.
+    NotUnlocked,
+    /// No password for `PASSWORD_MAX_NS` and no match for `BIO_MATCH_MAX_NS`.
+    PasswordUnused,
+}
+
+/// `now` and the times of the last unlock (a match or a password), the last
+/// password and the last match, all `CLOCK_BOOTTIME` nanoseconds, so time
+/// asleep counts as on macOS.
+fn token_age(now: u64, unlocked: u64, password: u64, matched: u64) -> TokenAge {
+    let age = |at: u64| now.saturating_sub(at);
+    if age(unlocked) >= BIO_TOKEN_MAX_NS {
+        TokenAge::NotUnlocked
+    } else if age(password) >= PASSWORD_MAX_NS && age(matched) >= BIO_MATCH_MAX_NS {
+        TokenAge::PasswordUnused
+    } else {
+        TokenAge::Fresh
+    }
+}
+
+impl TokenAge {
+    /// The `sep_bio_lockout.reason` it puts Touch ID in.
+    fn lock_reason(self) -> u32 {
+        match self {
+            TokenAge::Fresh => bio::LOCK_REASON_NONE,
+            TokenAge::NotUnlocked => bio::LOCK_REASON_NOT_UNLOCKED,
+            TokenAge::PasswordUnused => bio::LOCK_REASON_PASSWORD_UNUSED,
+        }
+    }
+}
+
 /// What a verify's outcome does to the prompt's match operation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PromptStep {
@@ -187,6 +232,32 @@ mod lockout_tests {
         assert_eq!(prompt_step(false, true, 2, 4), PromptStep::KeepOpen);
         // A match or an error ends it.
         assert_eq!(prompt_step(false, false, 0, 0), PromptStep::End);
+    }
+
+    #[test]
+    fn token_clocks_follow_the_documented_rules() {
+        let h = NSEC_PER_HOUR;
+        // Fresh after a recent password, with no match ever.
+        assert_eq!(token_age(10 * h, 9 * h, 9 * h, 0), TokenAge::Fresh);
+        // 48 hours without any unlock: the independent limit.
+        assert_eq!(token_age(48 * h, 0, 0, 0), TokenAge::NotUnlocked);
+        assert_eq!(token_age(48 * h - 1, 0, 0, 0), TokenAge::Fresh);
+        // Touch ID in daily use keeps it fresh until 156 hours without a
+        // password, then only while it unlocked within 4 hours.
+        assert_eq!(token_age(200 * h, 199 * h, 50 * h, 199 * h), TokenAge::Fresh);
+        assert_eq!(token_age(200 * h, 196 * h, 44 * h, 196 * h), TokenAge::PasswordUnused);
+        assert_eq!(token_age(200 * h, 197 * h, 44 * h, 197 * h), TokenAge::Fresh);
+        // A password resets both.
+        assert_eq!(token_age(200 * h, 200 * h, 200 * h, 0), TokenAge::Fresh);
+        // A clock read before a stored time (no wrap) counts as fresh.
+        assert_eq!(token_age(1, 5, 5, 5), TokenAge::Fresh);
+    }
+
+    #[test]
+    fn token_ages_name_their_reason() {
+        assert_eq!(TokenAge::Fresh.lock_reason(), bio::LOCK_REASON_NONE);
+        assert_eq!(TokenAge::NotUnlocked.lock_reason(), bio::LOCK_REASON_NOT_UNLOCKED);
+        assert_eq!(TokenAge::PasswordUnused.lock_reason(), bio::LOCK_REASON_PASSWORD_UNUSED);
     }
 
     #[test]
@@ -2427,6 +2498,15 @@ impl SepData {
             );
             return;
         }
+        let age = self.token_age_now();
+        if age != TokenAge::Fresh {
+            self.drop_biometric_tokens(age);
+            self.finish_verify(
+                bio::VerifyOutcome::Failed(ENROL_STATUS_LOCKOUT),
+                [0u8; bio::TOKEN_LEN],
+            );
+            return;
+        }
         if self.enclave_reports_lockout() {
             let outcome = self.enter_lockout();
             self.finish_verify(outcome, [0u8; bio::TOKEN_LEN]);
@@ -2688,6 +2768,7 @@ impl SepData {
             bio::VerifyOutcome::Matched(_) => {
                 self.bio_nomatch_streak.store(0, Relaxed);
                 self.enclave_failures_owed.store(false, Relaxed);
+                self.note_unlock(false);
             }
             bio::VerifyOutcome::NoMatch => {
                 self.bio_nomatch_streak.fetch_add(1, Relaxed);
@@ -4880,6 +4961,7 @@ impl SepData {
             "verify: {} failed attempts since the last match or password; Touch ID is locked until a password authentication (the retry limit)\n",
             self.bio_nomatch_streak.load(Relaxed)
         );
+        self.bio_lock_reason.store(bio::LOCK_REASON_ATTEMPTS, Relaxed);
         self.bio_lockout.store(true, Relaxed);
         self.bio_lockout_logged.store(true, Relaxed);
         if !self.write_lockout_record(true) {
@@ -4904,6 +4986,7 @@ impl SepData {
                 failures,
                 SBIO_PROBE_USER_ID
             );
+            self.bio_lock_reason.store(bio::LOCK_REASON_ATTEMPTS, Relaxed);
             self.bio_lockout.store(true, Relaxed);
             self.bio_lockout_logged.store(true, Relaxed);
             return bio::VerifyOutcome::Failed(ENROL_STATUS_LOCKOUT);
@@ -4920,6 +5003,7 @@ impl SepData {
                 "verify: MATCH_RESULT answered status 0x1 with no failed attempt since the last match; the match credential lapsed, and Touch ID is locked until a password authentication sets it up again\n"
             );
         }
+        self.bio_lock_reason.store(bio::LOCK_REASON_ATTEMPTS, Relaxed);
         self.bio_lockout.store(true, Relaxed);
         self.bio_lockout_logged.store(true, Relaxed);
         if !self.write_lockout_record(true) {
@@ -4985,6 +5069,7 @@ impl SepData {
             );
         }
         if self.read_lockout_record() {
+            self.bio_lock_reason.store(bio::LOCK_REASON_ATTEMPTS, Relaxed);
             self.bio_lockout.store(true, Relaxed);
             dev_info!(
                 self.dev,
@@ -5023,12 +5108,19 @@ impl SepData {
         }
         match cmd {
             bio::IOC_LOCKOUT_STATE => {
-                let locked = if self.touchid_started.load(Relaxed) {
-                    self.bio_lockout.load(Relaxed)
+                let (locked, reason) = if !self.touchid_started.load(Relaxed) {
+                    let locked = self.read_lockout_record();
+                    (locked, if locked { bio::LOCK_REASON_ATTEMPTS } else { bio::LOCK_REASON_NONE })
+                } else if self.bio_lockout.load(Relaxed) {
+                    (true, self.bio_lock_reason.load(Relaxed))
                 } else {
-                    self.read_lockout_record()
+                    // Expired clocks lock Touch ID at the next verify; say so
+                    // now, so that the password typed instead re-arms it.
+                    let reason = self.token_age_now().lock_reason();
+                    (reason != bio::LOCK_REASON_NONE, reason)
                 };
-                let state = bio::Lockout::new(locked, self.bio_nomatch_streak.load(Relaxed));
+                let state =
+                    bio::Lockout::new(locked, self.bio_nomatch_streak.load(Relaxed), reason);
                 kernel::uaccess::UserSlice::new(
                     kernel::uaccess::UserPtr::from_addr(arg),
                     core::mem::size_of::<bio::Lockout>(),
@@ -5082,8 +5174,9 @@ impl SepData {
             return Ok(());
         }
         let user = crate::sbio::UserId::new(SBIO_PROBE_USER_ID).ok_or(EINVAL)?;
-        if !self.bio_lockout.load(Relaxed) {
+        if !self.bio_lockout.load(Relaxed) && self.token_age_now() == TokenAge::Fresh {
             self.clear_failures_after_password(user);
+            self.note_unlock(true);
             return Ok(());
         }
         // Under the same lock as verify, enrolment and deletion, so the
@@ -5092,8 +5185,15 @@ impl SepData {
             self.wait_until_awake()?;
             let _writer = self.catacomb_writer.lock();
             if !self.bio_lockout.load(Relaxed) {
-                // Another re-arm got there first.
-                return Ok(());
+                let age = self.token_age_now();
+                if age == TokenAge::Fresh {
+                    // Another re-arm got there first.
+                    self.note_unlock(true);
+                    return Ok(());
+                }
+                // The clocks ran out before a verify noticed: drop the
+                // tokens as that verify would have, then re-arm in full.
+                self.drop_biometric_tokens(age);
             }
             if !self.capture_begin() {
                 continue;
@@ -5102,6 +5202,8 @@ impl SepData {
             if outcome.is_some() {
                 self.bio_nomatch_streak.store(0, Relaxed);
                 self.bio_lockout_logged.store(false, Relaxed);
+                self.bio_lock_reason.store(bio::LOCK_REASON_NONE, Relaxed);
+                self.note_unlock(true);
                 self.bio_lockout.store(false, Relaxed);
             }
             self.capture_end();
@@ -5132,6 +5234,69 @@ impl SepData {
             );
         }
         Ok(())
+    }
+
+    fn token_age_now(&self) -> TokenAge {
+        token_age(
+            shim::boottime_ns(),
+            self.bio_clock_unlock.load(Relaxed),
+            self.bio_clock_password.load(Relaxed),
+            self.bio_clock_match.load(Relaxed),
+        )
+    }
+
+    /// A match or a password authentication: restart the clocks it resets.
+    fn note_unlock(&self, by_password: bool) {
+        let now = shim::boottime_ns();
+        self.bio_clock_unlock.store(now, Relaxed);
+        if by_password {
+            self.bio_clock_password.store(now, Relaxed);
+        } else {
+            self.bio_clock_match.store(now, Relaxed);
+        }
+    }
+
+    /// The clocks ran out: Touch ID needs the password again. As on macOS,
+    /// end any open match operation and have the enclave drop the user's
+    /// biometric tokens (DropBiometricTokens); then lock as for too many
+    /// failed attempts, so the password's re-arm restores it, and keep the
+    /// lock across a restart. Called with the sensor lock held.
+    fn drop_biometric_tokens(&self, age: TokenAge) {
+        let why = match age {
+            TokenAge::NotUnlocked => {
+                c"Touch ID has not unlocked and no password was used for 48 hours"
+            }
+            _ => c"no password was used for 156 hours and Touch ID has not unlocked for 4 hours",
+        };
+        dev_info!(
+            self.dev,
+            "Touch ID: {}; it needs the password again (dropping the biometric tokens)\n",
+            why
+        );
+        self.end_match_scope(c"the biometric tokens' expiry");
+        if let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) {
+            match self.sbio_call(&crate::sbio::sbio_drop_biometric_tokens(user)) {
+                SbioOutcome::Ok(_) => dev_info!(
+                    self.dev,
+                    "Touch ID: the enclave dropped the biometric tokens of user {} (DROP_BIOMETRIC_TOKENS)\n",
+                    SBIO_PROBE_USER_ID
+                ),
+                _ => dev_warn!(
+                    self.dev,
+                    "Touch ID: DROP_BIOMETRIC_TOKENS was not accepted; the host refuses matching until the password all the same\n"
+                ),
+            }
+        }
+        self.bio_lock_reason.store(age.lock_reason(), Relaxed);
+        self.bio_lockout.store(true, Relaxed);
+        self.bio_lockout_logged.store(true, Relaxed);
+        if !self.write_lockout_record(true) {
+            dev_warn!(
+                self.dev,
+                "Touch ID: could not record the lock in {}; it ends at the next restart\n",
+                LOCKOUT_RECORD
+            );
+        }
     }
 
     /// A password authentication while Touch ID is not locked. On macOS the
@@ -6715,6 +6880,18 @@ pub(crate) fn component_action(state: u32) -> ComponentAction {
         ComponentAction::Load
     } else {
         ComponentAction::Unsupported
+    }
+}
+
+const OP_SBIO_DROP_BIOMETRIC_TOKENS: u16 = 0x72;
+/// Has the enclave drop the user's biometric tokens: Touch ID stops standing
+/// in for the password until a password verification restores them.
+pub(crate) fn sbio_drop_biometric_tokens(user: UserId) -> SbioOp {
+    SbioOp {
+        opcode: OP_SBIO_DROP_BIOMETRIC_TOKENS,
+        payload: pad_payload(&user.value().to_le_bytes()),
+        payload_len: 4,
+        name: c"DROP_BIOMETRIC_TOKENS",
     }
 }
 

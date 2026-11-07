@@ -785,6 +785,16 @@ struct SepData {
     // lock; the enclave's own count is cleared at the next authentication.
     enclave_failures_owed: Atomic<bool>,
 
+    // Why Touch ID is locked (`bio::LOCK_REASON_*`), while `bio_lockout`.
+    bio_lock_reason: Atomic<u32>,
+
+    // CLOCK_BOOTTIME of the last unlock (a match or a password), the last
+    // password and the last match. They start at boot: here Touch ID may
+    // unlock the login screen, where macOS asks for the password first.
+    bio_clock_unlock: Atomic<u64>,
+    bio_clock_password: Atomic<u64>,
+    bio_clock_match: Atomic<u64>,
+
     // Opens of the Touch ID device. One open is one prompt: fprintd claims
     // the device for one PAM authentication.
     bio_open_gen: Atomic<u64>,
@@ -1059,6 +1069,10 @@ impl SepData {
                 bio_lockout_logged: Atomic::new(false),
                 bio_nomatch_streak: Atomic::new(0),
                 enclave_failures_owed: Atomic::new(false),
+                bio_lock_reason: Atomic::new(0),
+                bio_clock_unlock: Atomic::new(0),
+                bio_clock_password: Atomic::new(0),
+                bio_clock_match: Atomic::new(0),
                 bio_open_gen: Atomic::new(0),
                 match_scope_gen: Atomic::new(0),
                 match_scope_touches: Atomic::new(0),
