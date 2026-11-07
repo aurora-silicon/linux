@@ -130,3 +130,21 @@
 		};
 	};
 };
+
+&i2c6 {
+	retimer@18 {
+		compatible = "apple,t6041-atcrt", "apple,atcrt";
+		reg = <0x18>;
+		status = "disabled";
+	};
+	retimer@19 {
+		compatible = "apple,t6041-atcrt", "apple,atcrt";
+		reg = <0x19>;
+		status = "disabled";
+	};
+	retimer@1a {
+		compatible = "apple,t6041-atcrt", "apple,atcrt";
+		reg = <0x1a>;
+		status = "disabled";
+	};
+};
