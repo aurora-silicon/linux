@@ -64,6 +64,8 @@ struct apple_drm_private {
 	 * the screen, the DRM device stays unregistered and its DCPs running.
 	 */
 	bool aborted;
+	/* This suspend found every firmware already stopped. */
+	bool s2r_skipped;
 };
 
 /* Component readiness is later than platform probe/bind. */
@@ -1691,12 +1693,34 @@ static const struct of_device_id of_match[] = {
 MODULE_DEVICE_TABLE(of, of_match);
 
 #ifdef CONFIG_PM_SLEEP
+/*
+ * Left stopped by a suspend that never reached the commit. Nothing can commit to
+ * them, and a refused sleep has to be able to try again.
+ */
+static bool apple_drm_firmware_stopped(struct apple_drm_private *apple)
+{
+	struct drm_crtc *crtc;
+	bool stopped = false;
+
+	drm_for_each_crtc(crtc, &apple->drm) {
+		if (t8132_ext_crtc(crtc) ||
+		    !dcp_s2r_firmware_stopped(to_apple_crtc(crtc)->dcp))
+			return false;
+		stopped = true;
+	}
+
+	return stopped;
+}
+
 static int apple_platform_suspend(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
 
-	if (apple && !apple->aborted)
-		return drm_mode_config_helper_suspend(&apple->drm);
+	if (apple && !apple->aborted) {
+		apple->s2r_skipped = apple_drm_firmware_stopped(apple);
+		if (!apple->s2r_skipped)
+			return drm_mode_config_helper_suspend(&apple->drm);
+	}
 
 	return 0;
 }
@@ -1723,7 +1747,7 @@ static int apple_platform_resume(struct device *dev)
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
 	u32 dropped = 0;
 
-	if (apple && !apple->aborted) {
+	if (apple && !apple->aborted && !apple->s2r_skipped) {
 		if (apple->drm.mode_config.suspend_state)
 			dropped = apple_drm_drop_stale_crtcs(apple->drm.mode_config.suspend_state);
 		/* Have userspace set the mode of a CRTC resumed disabled again. */

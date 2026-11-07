@@ -792,6 +792,8 @@ static int dcp_external_stop_locked(struct apple_dcp *d, u64 generation)
 { (void)d; (void)generation; return 0; }
 static void dcp_external_crtc_released(struct apple_dcp *d) { (void)d; }
 static bool dcp_uses_soft_dpms(struct apple_dcp *d) { return d->soft_dpms; }
+/* The T8140 display power cycle has its own test on hardware; here it only has to be reached. */
+static void dcp_dpms_power_off(struct apple_dcp *d) { (void)d; }
 static bool __attribute__((unused)) dcp_has_panel(struct apple_dcp *d) { return !d->typec_output; }
 static void __attribute__((unused)) iomfb_blank_h17p(struct apple_dcp *d)
 { (void)d; assert(!"unexpected internal-panel blank in external-link test"); }

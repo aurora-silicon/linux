@@ -361,6 +361,8 @@ const struct drm_edid *dcp_panel_edid_snapshot(struct apple_dcp *dcp,
 					       unsigned int count, u64 *generation);
 bool dcp_panel_metadata_current(struct apple_dcp *dcp, u64 generation);
 
+void dcp_s2r_dart_power(struct apple_dcp *dcp, u32 on);
+
 struct apple_dcp {
 	/* Generation-specific wire/transaction state, sharing the common KMS owner. */
 	struct iomfb_m4 *v26_6;
@@ -625,6 +627,33 @@ struct apple_dcp {
 	bool pipe_enabled_h17p;
 	/* Messages from the coprocessor are held in the mailbox for sleep. */
 	bool rx_held;
+
+	/* T8140 suspend-to-RAM stops the firmware, see dcp_s2r_suspend(). */
+	bool s2r_active;
+	bool s2r_stopped;
+	/* DPMS off stopped the firmware and lowered the domains; DPMS on brings them back. */
+	bool dpms_powered_off;
+	/* Refused its idle with the display off: the firmware still runs, the display is dark. */
+	bool s2r_refused_off;
+	/* The firmware's secure mailbox, where it has one. */
+	struct apple_rtkit *secure_rtk;
+	bool secure_answered;
+	bool secure_polling;
+	/* Polled every jiffy until then, see dcp_secure_poll(). */
+	unsigned long secure_fast_until;
+	int secure_map_ret;
+	s64 secure_map_us;
+	struct delayed_work secure_poll_wq;
+	/* Stopped and not restarted, which outlives a suspend that gets refused. */
+	bool s2r_fw_down;
+	/* This driver raised the display domains, and nothing has lowered them since. */
+	bool s2r_domains_up;
+	bool s2r_power_on;
+	bool s2r_power_oob;
+	u8 s2r_step;
+	struct completion s2r_dart_done;
+	struct device *s2r_disp_dart;
+	struct device *s2r_dcp_dart;
 
 	/* eDP display without DP-HDMI conversion */
 	bool main_display;

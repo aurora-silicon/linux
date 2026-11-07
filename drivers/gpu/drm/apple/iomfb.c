@@ -299,7 +299,7 @@ static bool iomfb_uses_queue(struct apple_dcp *dcp)
 	       dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G;
 }
 
-static bool iomfb_channels_idle(struct apple_dcp *dcp)
+bool iomfb_channels_idle(struct apple_dcp *dcp)
 {
 	return !dcp->ch_cmd.depth && !dcp->ch_cb.depth &&
 	       !dcp->ch_oobcmd.depth && !dcp->ch_oobcb.depth &&
@@ -2872,6 +2872,10 @@ bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
 	struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
 	struct platform_device *pdev = apple_crtc->dcp;
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	/* Can't be lit: a resume then restores its CRTC disabled, not failing every output. */
+	if (READ_ONCE(dcp->crashed))
+		return false;
 
 	if (iomfb_is_m4(dcp)) {
 		struct drm_display_mode fixed;
