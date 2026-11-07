@@ -9,6 +9,8 @@
 use core::ops::Range;
 use core::result::Result;
 
+use crate::g17::fw::variant::M5Layouts;
+
 pub(crate) const ROOT_SIZE_PRIMARY: usize = 0x0b8;
 
 pub(crate) const ROOT_SIZE_SECONDARY: usize = 0x0c8;
@@ -2142,6 +2144,218 @@ pub(crate) fn set_m5_enabled_cores(
 pub(crate) const M5_POLICY_STATE_PTR: usize = 0x8254;
 
 pub(crate) const M5_POLICY_AON_PTD_PTR: usize = 0x11a1c;
+
+/// Power policy 26A428 -> 26B123 (macOS 27.2; 27.3 beta 1 has the same layout), in 26A428
+/// offsets. The policy grows from 0x126b0 to 0x12728 bytes (allocation size table entry 4); five
+/// inserts move the words above them:
+///
+/// - +0x4910, 0x10 bytes (two u64 words). The three controller input words at 0x4910..0x4918
+///   (3500, 1000 and 3000 in the J714 defaults) move to 0x4920.
+/// - +0x491c, 4 bytes: a controller input word, at 0x492c in 26B123
+///   ([`M5_26B123_POLICY_CONTROLLER_WORDS`]).
+/// - 4 bytes between 0x494c and 0x49b8, and 0x18 bytes between 0x4a00 and 0x4a98, in space the M5
+///   encoders do not write: the bands start at the next written offset (0x4948 -> 0x495c,
+///   0x49b8 -> 0x49d0, 0x49fc -> 0x4a14, 0x4a98 -> 0x4ac8), and no word the M5 encoders write
+///   falls in either range.
+/// - +0x12668, 0x48 bytes: the table at +0x122f0 (24-byte entries) grows from 37 to 40 entries,
+///   its trailing fields moving from +0x378/+0x37c/+0x37d/+0x380 to +0x3c0/+0x3c4/+0x3c5/+0x3c8.
+///   The new entries are assumed to sit at the end.
+///
+/// The state and AON PTD pointers move with their band, 0x8254 -> 0x8284 and 0x11a1c -> 0x11a4c.
+/// The 26B123 policy may use words of its own at 0x94e4..0x954c, in space the M5 encoders do not
+/// write in 26A428 (0x94b4..0x951c); they stay zero here. The bands are
+/// not yet confirmed from captured InitData.
+pub(crate) const M5_26B123_POLICY_BANDS: &[LayoutBand] = &[
+    band(0x0000, 0x4910, 0, Evidence::Inferred),
+    band(0x4910, 0x491c, 0x10, Evidence::Inferred),
+    band(0x491c, 0x49b8, 0x14, Evidence::Inferred),
+    band(0x49b8, 0x4a98, 0x18, Evidence::Inferred),
+    band(0x4a98, 0x12668, 0x30, Evidence::Inferred),
+    band(0x12668, M5_POLICY_SIZE, 0x78, Evidence::Inferred),
+];
+
+/// Power-policy size of 26B123 (entry 4 of its allocation size table).
+pub(crate) const M5_26B123_POLICY_SIZE: usize = 0x12728;
+
+/// The 26B123 policy controller input words the 26A428 controller defaults do not write, at 26B123
+/// offsets:
+///
+/// - 0x492c, the word of the 4-byte insert at 26A428 +0x491c: 5000.
+/// - 0x4a14 (26A428 0x49fc, which the J714 defaults write as 500): 1600 for every M5.
+///
+/// The values are not yet confirmed from captured InitData.
+pub(crate) const M5_26B123_POLICY_CONTROLLER_WORDS: &[(usize, u32)] =
+    &[(0x492c, 5000), (0x4a14, 1600)];
+
+/// The 26B123 policy controller input words for the G17D core type (M5 Ultra), at 26B123
+/// offsets: 2500 at 0x4920 and 800 at 0x4928 (26A428 0x4910 and 0x4918, 3500 and 3000 in the J714
+/// defaults), 1100 at 0x492c, 0 at 0x49e4 (26A428 0x49cc, 1 in the J714 defaults) and 1600 at
+/// 0x4a14. The values are not yet confirmed from captured InitData.
+pub(crate) const M5_26B123_POLICY_CONTROLLER_WORDS_G17D: &[(usize, u32)] = &[
+    (0x4920, 2500),
+    (0x4928, 800),
+    (0x492c, 1100),
+    (0x49e4, 0),
+    (0x4a14, 1600),
+];
+
+/// The HW-data core type of the G17D (M5 Ultra) parts.
+const M5_CORE_TYPE_G17D: u32 = 0x1a;
+
+/// Where one firmware build keeps the power-policy words the M5 encoders write at their 26A428
+/// offsets.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct M5PolicyMap {
+    /// Allocation size (entry 4 of the build's allocation size table).
+    pub(crate) size: usize,
+    /// 26A428 offset -> this build's offset; empty for 26A428 itself.
+    pub(crate) bands: &'static [LayoutBand],
+    /// Words of this build's controller configuration the 26A428 controller defaults do not
+    /// write, at this build's offsets: for core types with words of their own, then for every
+    /// other core type.
+    pub(crate) controller_words_by_core: &'static [(u32, &'static [(usize, u32)])],
+    pub(crate) controller_words: &'static [(usize, u32)],
+}
+
+impl M5PolicyMap {
+    /// This build's offset of the 26A428 policy offset `offset`.
+    pub(crate) const fn relocate(&self, offset: usize) -> Option<usize> {
+        if !self.bands.is_empty() {
+            return relocate_by_bands(self.bands, offset);
+        }
+        if offset < self.size {
+            Some(offset)
+        } else {
+            None
+        }
+    }
+
+    /// This build's controller-configuration words for `board`.
+    fn controller_words_for(&self, board: &Board) -> &'static [(usize, u32)] {
+        for &(core, words) in self.controller_words_by_core {
+            if core == board.core_revision.0 {
+                return words;
+            }
+        }
+        self.controller_words
+    }
+}
+
+pub(crate) const M5_26A428_POLICY: M5PolicyMap = M5PolicyMap {
+    size: M5_POLICY_SIZE,
+    bands: &[],
+    controller_words_by_core: &[],
+    controller_words: &[],
+};
+
+pub(crate) const M5_26B123_POLICY: M5PolicyMap = M5PolicyMap {
+    size: M5_26B123_POLICY_SIZE,
+    bands: M5_26B123_POLICY_BANDS,
+    controller_words_by_core: &[(M5_CORE_TYPE_G17D, M5_26B123_POLICY_CONTROLLER_WORDS_G17D)],
+    controller_words: M5_26B123_POLICY_CONTROLLER_WORDS,
+};
+
+/// The power-policy map of an M5 firmware build. 27.2 (26B123) and 27.3 (26C5035r) share one.
+pub(crate) const fn m5_policy(layouts: M5Layouts) -> &'static M5PolicyMap {
+    match layouts {
+        M5Layouts::V26A428 => &M5_26A428_POLICY,
+        _ => &M5_26B123_POLICY,
+    }
+}
+
+/// The power-policy allocation size of an M5 firmware build.
+pub(crate) const fn m5_policy_size(layouts: M5Layouts) -> usize {
+    m5_policy(layouts).size
+}
+
+/// Whether `bands` lay `source` bytes out over `target` bytes in place: contiguous from 0 to
+/// `source`, with shifts that never shrink, ending at `target`.
+const fn expands_in_place(bands: &[LayoutBand], source: usize, target: usize) -> bool {
+    let mut index = 0;
+    let mut end = 0;
+    let mut delta: isize = 0;
+    while index < bands.len() {
+        let band = bands[index];
+        if band.start != end || band.end <= band.start || band.delta < delta {
+            return false;
+        }
+        end = band.end;
+        delta = band.delta;
+        index += 1;
+    }
+    end == source && (end as isize + delta) as usize == target
+}
+
+const _: () = {
+    assert!(expands_in_place(
+        M5_26B123_POLICY_BANDS,
+        M5_POLICY_SIZE,
+        M5_26B123_POLICY_SIZE
+    ));
+    assert!(matches!(
+        M5_26B123_POLICY.relocate(M5_POLICY_STATE_PTR),
+        Some(0x8284)
+    ));
+    assert!(matches!(
+        M5_26B123_POLICY.relocate(M5_POLICY_AON_PTD_PTR),
+        Some(0x11a4c)
+    ));
+    assert!(matches!(
+        M5_26B123_POLICY.relocate(M5_POLICY_MAXIMUM_POWER),
+        Some(0xa18)
+    ));
+};
+
+/// Lays out the power policy the M5 encoders wrote at 26A428 offsets into `policy[..0x126b0]`
+/// as `map` says, in place: every band moves, highest first, and the bytes no band covers are
+/// zeroed. With `controller_defaults`, the build's controller-configuration words for `board`
+/// follow. For 26A428 nothing changes.
+pub(crate) fn relayout_m5_policy(
+    map: &M5PolicyMap,
+    board: &Board,
+    controller_defaults: bool,
+    policy: &mut [u8],
+) -> Result<(), InitdataError> {
+    if policy.len() != map.size {
+        return Err(InitdataError::BufferSize);
+    }
+    if map.bands.is_empty() {
+        return Ok(());
+    }
+    if !expands_in_place(map.bands, M5_POLICY_SIZE, map.size) {
+        return Err(InitdataError::BufferSize);
+    }
+    // A band's target lies over its own source and the higher bands, which have moved already.
+    for band in map.bands.iter().rev() {
+        let target = band
+            .start
+            .checked_add_signed(band.delta)
+            .ok_or(InitdataError::BufferSize)?;
+        policy.copy_within(band.start..band.end, target);
+    }
+    let mut end = 0;
+    for band in map.bands {
+        let target = band
+            .start
+            .checked_add_signed(band.delta)
+            .ok_or(InitdataError::BufferSize)?;
+        policy[end..target].fill(0);
+        end = target + (band.end - band.start);
+    }
+    policy[end..].fill(0);
+    if controller_defaults {
+        for &(offset, value) in map.controller_words_for(board) {
+            if offset
+                .checked_add(4)
+                .is_none_or(|word_end| word_end > policy.len())
+            {
+                return Err(InitdataError::BufferSize);
+            }
+            put_u32(policy, offset, value);
+        }
+    }
+    Ok(())
+}
 
 pub(crate) const J714_GPU_POWER_SAMPLE_PERIOD_AIC_CLOCKS: u32 = 200_000;
 
