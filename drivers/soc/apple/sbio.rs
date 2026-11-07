@@ -5079,6 +5079,25 @@ impl SepData {
             self.wait_until_awake()?;
             let _writer = self.catacomb_writer.lock();
             if !self.bio_lockout.load(Relaxed) {
+                // Not locked: a password still clears the failed attempts,
+                // as a password does on macOS. The enclave keeps its own
+                // count; should it reach its limit anyway, it announces a
+                // lockout and the next password re-arms in full.
+                let failures = self.bio_nomatch_streak.xchg(0, Relaxed);
+                if failures > 0 {
+                    if !self.write_lockout_record(false) {
+                        dev_warn!(
+                            self.dev,
+                            "Touch ID: could not record the cleared failed attempts in {}\n",
+                            LOCKOUT_RECORD
+                        );
+                    }
+                    dev_info!(
+                        self.dev,
+                        "Touch ID: a password authentication cleared {} failed attempt(s)\n",
+                        failures
+                    );
+                }
                 return Ok(());
             }
             if !self.capture_begin() {
