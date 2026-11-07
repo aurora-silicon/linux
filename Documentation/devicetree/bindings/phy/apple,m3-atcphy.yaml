@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/phy/apple,m3-atcphy.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple M3 family Type-C PHY
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  The M3 Type-C PHY combines USB and DisplayPort interfaces. The fourth
+  PHY on the Pro and Max dies can be described with its common control
+  bank only, for DisplayPort operation. The five-bank description also
+  exposes the USB interfaces. Calibration is supplied by the bootloader.
+
+allOf:
+  - $ref: /schemas/usb/usb-switch.yaml#
+
+properties:
+  compatible:
+    oneOf:
+      - const: apple,t8122-atcphy
+      - items:
+          - enum:
+              - apple,t6030-atcphy
+              - apple,t6031-atcphy
+          - const: apple,t8122-atcphy
+
+  reg:
+    minItems: 1
+    items:
+      - description: Common PHY controls
+      - description: DisplayPort alternate mode PHY
+      - description: AXI to fabric interface
+      - description: USB2 PHY
+      - description: USB3 PIPE interface
+
+  reg-names:
+    minItems: 1
+    items:
+      - const: core
+      - const: lpdptx
+      - const: axi2af
+      - const: usb2phy
+      - const: pipehandler
+
+  '#phy-cells':
+    const: 1
+
+  '#reset-cells':
+    const: 0
+
+  power-domains:
+    maxItems: 1
+
+  mode-switch: true
+  orientation-switch: true
+
+  ports:
+    $ref: /schemas/graph.yaml#/properties/ports
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - '#phy-cells'
+  - '#reset-cells'
+  - power-domains
+
+oneOf:
+  - properties:
+      reg:
+        maxItems: 1
+      reg-names:
+        maxItems: 1
+  - properties:
+      reg:
+        minItems: 5
+      reg-names:
+        minItems: 5
+
+unevaluatedProperties: false

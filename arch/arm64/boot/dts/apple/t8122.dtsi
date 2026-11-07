@@ -1959,3 +1959,5 @@
 #include "t8122-dcp.dtsi"
 
 #include "t8122-peripherals.dtsi"
+
+#include "t8122-peripheral-buses.dtsi"

@@ -18,6 +18,7 @@
 
 	soc {
 		qspi: spi@2a1118000 {
+			status = "okay";
 			compatible = "apple,t8122-qspi";
 			reg = <0x2 0xa1118000 0x0 0x4800>;
 			interrupt-parent = <&aic>;

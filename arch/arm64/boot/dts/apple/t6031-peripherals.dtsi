@@ -145,6 +145,72 @@
 		status = "disabled";
 	};
 
+	dart_mtp_companion1: filter@2ac80c000 {
+		compatible = "apple,t6031-dapf", "apple,dapf";
+		reg = <0x2 0xac80c000 0x0 0x4000>;
+		status = "disabled";
+	};
+
+	dart_isp0_companion3: iommu@38e4b0000 {
+		compatible = "apple,t6031-dart-smmu", "apple,dart-smmu";
+		reg = <0x3 0x8e4b0000 0x0 0x4000>;
+		status = "disabled";
+	};
+
+	dart_isp0_companion4: iommu@38e4b8000 {
+		compatible = "apple,t6031-dart-smmu", "apple,dart-smmu";
+		reg = <0x3 0x8e4b8000 0x0 0x4000>;
+		status = "disabled";
+	};
+
+	dart_isp0_companion5: filter@38e4ac000 {
+		compatible = "apple,t6031-dapf", "apple,dapf";
+		reg = <0x3 0x8e4ac000 0x0 0x4000>;
+		status = "disabled";
+	};
+
+	dart_aop_companion1: filter@2a881c000 {
+		compatible = "apple,t6031-dapf", "apple,dapf";
+		reg = <0x2 0xa881c000 0x0 0x4000>;
+		status = "disabled";
+	};
+
+	dart_disp0_companion1: iommu@385300000 {
+		compatible = "apple,t6031-dart-smmu", "apple,dart-smmu";
+		reg = <0x3 0x85300000 0x0 0x4000>;
+		status = "disabled";
+	};
+
+	dart_ane0_companion3: filter@3c9804000 {
+		compatible = "apple,t6031-dapf", "apple,dapf";
+		reg = <0x3 0xc9804000 0x0 0x4000>;
+		status = "disabled";
+	};
+
+	dart_dispext0_companion1: iommu@305300000 {
+		compatible = "apple,t6031-dart-smmu", "apple,dart-smmu";
+		reg = <0x3 0x05300000 0x0 0x4000>;
+		status = "disabled";
+	};
+
+	dart_dispext1_companion1: iommu@449300000 {
+		compatible = "apple,t6031-dart-smmu", "apple,dart-smmu";
+		reg = <0x4 0x49300000 0x0 0x4000>;
+		status = "disabled";
+	};
+
+	dart_dispext2_companion1: iommu@44d300000 {
+		compatible = "apple,t6031-dart-smmu", "apple,dart-smmu";
+		reg = <0x4 0x4d300000 0x0 0x4000>;
+		status = "disabled";
+	};
+
+	dart_dispext3_companion1: iommu@2c9300000 {
+		compatible = "apple,t6031-dart-smmu", "apple,dart-smmu";
+		reg = <0x2 0xc9300000 0x0 0x4000>;
+		status = "disabled";
+	};
+
 	apcie0_piodma: dma-controller@594010000 {
 		compatible = "apple,t6031-pcie-piodma", "apple,pcie-piodma";
 		reg = <0x5 0x94010000 0x0 0x4000>,
@@ -262,6 +328,304 @@
 		status = "disabled";
 	};
 
+	error_handler: error-handler@388c40000 {
+		compatible = "apple,t6031-error-handler", "apple,error-handler";
+		reg = <0x3 0x88c40000 0x0 0x40000>,
+		      <0x2 0x90000000 0x0 0x80000>,
+		      <0x2 0x92800000 0x0 0x1e0000>,
+		      <0x2 0xa02dc000 0x0 0x4000>,
+		      <0x2 0x20000000 0x0 0x2000000>,
+		      <0x2 0x22000000 0x0 0x2000000>,
+		      <0x2 0x24000000 0x0 0x2000000>,
+		      <0x2 0x26000000 0x0 0x2000000>,
+		      <0x2 0x28000000 0x0 0x2000000>,
+		      <0x2 0x2a000000 0x0 0x2000000>,
+		      <0x2 0x2c000000 0x0 0x2000000>,
+		      <0x2 0x2e000000 0x0 0x2000000>,
+		      <0x2 0x80000000 0x0 0x4000>,
+		      <0x3 0x00000000 0x0 0x4000>,
+		      <0x3 0x40000000 0x0 0x4000>,
+		      <0x3 0x80000000 0x0 0x4000>,
+		      <0x2 0xc0000000 0x0 0x4000>,
+		      <0x3 0xc0000000 0x0 0x4000>,
+		      <0x4 0x00000000 0x0 0x4000>,
+		      <0x4 0x40000000 0x0 0x4000>,
+		      <0x2 0xa0000000 0x0 0x20000>,
+		      <0x2 0x902c0000 0x0 0x18000>,
+		      <0x2 0xa4800000 0x0 0x4000>,
+		      <0x2 0x59c00000 0x0 0x40000>,
+		      <0x2 0x5a000000 0x0 0x40000>,
+		      <0x2 0x64400000 0x0 0x40000>,
+		      <0x2 0x64000000 0x0 0x40000>,
+		      <0x2 0x67000000 0x0 0x40000>,
+		      <0x2 0x60400000 0x0 0x40000>,
+		      <0x2 0x60800000 0x0 0x40000>,
+		      <0x2 0x67400000 0x0 0x40000>,
+		      <0x2 0x60c00000 0x0 0x40000>,
+		      <0x2 0x61000000 0x0 0x40000>,
+		      <0x2 0x61400000 0x0 0x40000>,
+		      <0x2 0x4f800000 0x0 0x40000>,
+		      <0x2 0x51800000 0x0 0x40000>,
+		      <0x2 0x51c00000 0x0 0x40000>,
+		      <0x2 0x4fc00000 0x0 0x40000>,
+		      <0x2 0x52000000 0x0 0x40000>,
+		      <0x4 0x0b180000 0x0 0x18000>,
+		      <0x4 0x0b1a0000 0x0 0x18000>,
+		      <0x4 0x0b380000 0x0 0x18000>,
+		      <0x4 0x0b3a0000 0x0 0x18000>,
+		      <0x4 0x0b000000 0x0 0x18000>,
+		      <0x4 0x0b200000 0x0 0x18000>,
+		      <0x4 0x0b080000 0x0 0x18000>,
+		      <0x4 0x0b280000 0x0 0x18000>,
+		      <0x4 0x0b600000 0x0 0x18000>,
+		      <0x4 0x0b400000 0x0 0x18000>,
+		      <0x4 0x0b680000 0x0 0x18000>,
+		      <0x4 0x0b480000 0x0 0x18000>,
+		      <0x4 0x0b040000 0x0 0x18000>,
+		      <0x4 0x0b240000 0x0 0x18000>,
+		      <0x4 0x0b0c0000 0x0 0x18000>,
+		      <0x4 0x0b2c0000 0x0 0x18000>,
+		      <0x4 0x0b640000 0x0 0x18000>,
+		      <0x4 0x0b440000 0x0 0x18000>,
+		      <0x4 0x0b6c0000 0x0 0x18000>,
+		      <0x4 0x0b4c0000 0x0 0x18000>,
+		      <0x2 0x59400000 0x0 0x40000>,
+		      <0x2 0x5fc00000 0x0 0x40000>,
+		      <0x2 0x63800000 0x0 0x40000>,
+		      <0x2 0x66800000 0x0 0x40000>,
+		      <0x2 0x59800000 0x0 0x40000>,
+		      <0x2 0x60000000 0x0 0x40000>,
+		      <0x2 0x63c00000 0x0 0x40000>,
+		      <0x2 0x66c00000 0x0 0x40000>,
+		      <0x2 0x4f400000 0x0 0x40000>,
+		      <0x2 0x51400000 0x0 0x40000>,
+		      <0x2 0x53c00000 0x0 0x40000>,
+		      <0x2 0x56000000 0x0 0x40000>,
+		      <0x2 0x54000000 0x0 0x40000>,
+		      <0x2 0x56400000 0x0 0x40000>,
+		      <0x2 0x54400000 0x0 0x40000>,
+		      <0x2 0x56800000 0x0 0x40000>,
+		      <0x2 0x53432000 0x0 0x1000>,
+		      <0x2 0x4f032000 0x0 0x1000>,
+		      <0x2 0x51032000 0x0 0x1000>,
+		      <0x2 0x55032000 0x0 0x1000>,
+		      <0x2 0x53032000 0x0 0x1000>,
+		      <0x2 0x55432000 0x0 0x1000>,
+		      <0x2 0x5e832000 0x0 0x1000>,
+		      <0x2 0x62832000 0x0 0x1000>,
+		      <0x2 0x65832000 0x0 0x1000>,
+		      <0x2 0x58432000 0x0 0x1000>,
+		      <0x2 0x5ec32000 0x0 0x1000>,
+		      <0x2 0x62c32000 0x0 0x1000>,
+		      <0x2 0x58032000 0x0 0x1000>,
+		      <0x2 0x63032000 0x0 0x1000>,
+		      <0x2 0x65c32000 0x0 0x1000>,
+		      <0x2 0x58832000 0x0 0x1000>,
+		      <0x2 0x58c32000 0x0 0x1000>,
+		      <0x2 0x63432000 0x0 0x1000>,
+		      <0x2 0x5f032000 0x0 0x1000>,
+		      <0x2 0x66032000 0x0 0x1000>,
+		      <0x2 0x5f432000 0x0 0x1000>,
+		      <0x2 0x66432000 0x0 0x1000>,
+		      <0x4 0x0b114000 0x0 0x1f000>,
+		      <0x4 0x0b314000 0x0 0x1f000>,
+		      <0x4 0x0b134000 0x0 0x1f000>,
+		      <0x4 0x0b334000 0x0 0x1f000>,
+		      <0x4 0x0b714000 0x0 0x1f000>,
+		      <0x4 0x0b514000 0x0 0x1f000>,
+		      <0x4 0x0b734000 0x0 0x1f000>,
+		      <0x4 0x0b534000 0x0 0x1f000>,
+		      <0x4 0x0b030000 0x0 0x4000>,
+		      <0x4 0x0b230000 0x0 0x4000>,
+		      <0x4 0x0b030000 0x0 0x4000>,
+		      <0x4 0x0b230000 0x0 0x4000>,
+		      <0x4 0x0b630000 0x0 0x4000>,
+		      <0x4 0x0b430000 0x0 0x4000>,
+		      <0x4 0x0b030000 0x0 0x4000>,
+		      <0x4 0x0b230000 0x0 0x4000>,
+		      <0x4 0x0b030000 0x0 0x4000>,
+		      <0x4 0x0b230000 0x0 0x4000>,
+		      <0x4 0x0b630000 0x0 0x4000>,
+		      <0x4 0x0b430000 0x0 0x4000>,
+		      <0x4 0x0b630000 0x0 0x4000>,
+		      <0x4 0x0b430000 0x0 0x4000>,
+		      <0x4 0x0b630000 0x0 0x4000>,
+		      <0x4 0x0b430000 0x0 0x4000>,
+		      <0x4 0x0b1e0000 0x0 0x4000>,
+		      <0x4 0x0b3e0000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 578 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 577 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 584 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 583 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 580 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 581 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 585 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 582 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 476 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 486 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 496 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 506 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 516 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 526 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 536 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 546 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 335 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 339 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 341 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 343 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 337 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 345 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 347 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 349 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 919 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 421 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 779 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 480 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 481 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 482 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 483 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 490 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 491 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 492 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 493 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 500 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 501 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 502 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 503 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 510 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 511 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 512 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 513 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 520 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 521 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 522 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 523 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 530 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 531 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 532 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 533 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 540 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 541 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 542 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 543 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 550 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 551 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 552 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 553 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 289 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 290 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 296 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 291 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 292 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 293 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 294 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 295 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 278 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 279 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 280 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 260 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 261 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 263 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 264 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 262 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 215 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 214 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 217 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 216 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 218 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 219 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 220 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 221 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 222 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 223 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 224 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 225 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 226 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 227 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 228 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 229 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 230 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 231 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 232 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 233 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 281 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 282 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 283 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 284 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 285 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 286 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 287 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 288 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 265 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 266 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 267 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 268 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 269 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 270 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 271 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 272 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 190 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 191 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 192 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 193 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 189 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 194 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 196 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 197 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 198 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 199 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 200 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 201 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 195 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 204 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 202 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 203 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 205 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 206 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 207 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 208 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 209 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 210 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 179 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 180 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 181 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 182 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 183 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 184 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 185 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 186 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 236 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 237 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 238 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 239 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 240 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 241 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 244 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 245 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 246 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 247 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 248 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 249 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 242 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 243 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 250 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 251 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 234 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 235 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_gfx>;
+		status = "disabled";
+	};
+
+	dwi: dwi@2929b0000 {
+		compatible = "apple,t6031-dwi", "apple,dwi";
+		reg = <0x2 0x929b0000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 22 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dwi>;
+		status = "disabled";
+	};
+
 	aes: crypto@39100c000 {
 		compatible = "apple,t6031-aes", "apple,aes";
 		reg = <0x3 0x9100c000 0x0 0x4000>,
@@ -269,6 +633,63 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1324 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_aes>;
+		status = "disabled";
+	};
+
+	event_log_handler: event-log@292800000 {
+		compatible = "apple,t6031-event-log-handler", "apple,event-log-handler";
+		reg = <0x2 0x92800000 0x0 0x8000>,
+		      <0x2 0x92838000 0x0 0x4000>,
+		      <0x2 0x92840000 0x0 0x10000>,
+		      <0x2 0x928e0000 0x0 0x4000>,
+		      <0x2 0x92850000 0x0 0x4000>,
+		      <0x2 0x92880000 0x0 0x1c000>,
+		      <0x2 0x92980000 0x0 0x18000>,
+		      <0x2 0x929a0000 0x0 0x4000>,
+		      <0x2 0x928c0000 0x0 0x4000>,
+		      <0x2 0x92960000 0x0 0x1c000>,
+		      <0x2 0x929c0000 0x0 0xc000>,
+		      <0x2 0x92280000 0x0 0x10000>,
+		      <0x2 0x92294000 0x0 0x4000>,
+		      <0x2 0x922b8000 0x0 0x8000>,
+		      <0x2 0x922ac000 0x0 0x4000>,
+		      <0x2 0x90000000 0x0 0x80000>,
+		      <0x2 0xa0280000 0x0 0x10000>,
+		      <0x2 0xa029c000 0x0 0x4000>,
+		      <0x2 0xa02c0000 0x0 0x10000>,
+		      <0x2 0xa02d0000 0x0 0x4000>,
+		      <0x2 0xa02d4000 0x0 0x4000>,
+		      <0x2 0xa02d8000 0x0 0x4000>,
+		      <0x2 0xa02e4000 0x0 0x4000>,
+		      <0x2 0xa0200000 0x0 0x80000>,
+		      <0x2 0x9020c000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 50 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 51 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 52 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 53 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 54 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 55 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 56 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 422 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 451 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 454 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 455 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 456 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 472 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 474 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 475 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 780 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 969 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 978 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 1251 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 1253 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 1255 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 1257 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 1259 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 1261 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 1264 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 1268 IRQ_TYPE_LEVEL_HIGH>;
 		status = "disabled";
 	};
 

@@ -2179,3 +2179,5 @@
 #include "t6030-dcp.dtsi"
 
 #include "t6030-peripherals.dtsi"
+
+#include "t6030-peripheral-buses.dtsi"

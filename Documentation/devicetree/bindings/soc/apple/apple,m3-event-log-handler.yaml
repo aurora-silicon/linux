@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,m3-event-log-handler.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple M3 family event log interrupt interface
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  Hardware resources of the M3 family event log interrupt interface.
+  The interface is described for discovery and must remain disabled until
+  its ownership, initialization and shutdown are supported. Register windows
+  are listed in hardware resource order; firmware configuration and tuning
+  data are supplied by the boot firmware rather than this binding.
+
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t8122-event-log-handler
+          - apple,t6030-event-log-handler
+          - apple,t6031-event-log-handler
+  required:
+    - compatible
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t8122-event-log-handler
+          - apple,t6030-event-log-handler
+          - apple,t6031-event-log-handler
+      - const: apple,event-log-handler
+
+  reg:
+    minItems: 13
+    maxItems: 26
+
+  interrupts:
+    minItems: 13
+    maxItems: 26
+
+required:
+  - compatible
+  - reg
+  - interrupts
+
+additionalProperties: false

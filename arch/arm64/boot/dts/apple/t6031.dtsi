@@ -52,3 +52,5 @@
 #undef SOC_NODE
 
 #include "t6031-peripherals.dtsi"
+
+#include "t6031-peripheral-buses.dtsi"
