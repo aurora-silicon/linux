@@ -99,3 +99,11 @@
 &isp {
 	apple,platform-id = <16>;
 };
+
+&smc_hwmon {
+	/* The J516S keys (the same SoC); absent firmware keys are skipped. */
+	apple,soc-die-keys = "Tf04", "Tf09", "Tf0A", "Tf0B", "Tf0D",
+			     "Tf0E", "Tf14", "Tf18", "Tf19", "Tf1A",
+			     "Tf24", "Tf25", "Tf2A", "Tf2B";
+	apple,thermal-pressure-key = "mTPL";
+};
