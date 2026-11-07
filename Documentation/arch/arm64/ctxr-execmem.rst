@@ -153,3 +153,9 @@ window, as violations. Any violation is fatal unless ``ctxr_exec_enforce=0`` is
 given. This is also what stands in for the hardware fault when testing in a VM.
 The check runs once: memory freed after it, such as init memory, relies on
 ``free_reserved_area()`` skipping window pages.
+
+When a window is active, ``/sys/kernel/execmem_confine/`` reports it:
+``window_base`` and ``window_size``, and the pool's ``pool_size``, ``pool_free``
+and ``pool_largest_free`` (bytes). These make an allocation failure (for example
+an ``insmod`` ``ENOMEM``) on a running machine diagnosable, and give a tool a
+stable place to read the window from.

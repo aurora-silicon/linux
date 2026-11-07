@@ -26,10 +26,12 @@
 #include <linux/genalloc.h>
 #include <linux/kasan.h>
 #include <linux/kmemleak.h>
+#include <linux/kobject.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/set_memory.h>
 #include <linux/slab.h>
+#include <linux/sysfs.h>
 #include <linux/vmalloc.h>
 #include <linux/xarray.h>
 
@@ -106,8 +108,74 @@ int __init execmem_confine_init(struct gen_pool *pool, bool enforce)
 			(unsigned long long)(confine_size >> 20),
 			enforce ? "enforcing" : "reporting", confine_reserve >> 10);
 	}
+
 	return 0;
 }
+
+#ifdef CONFIG_SYSFS
+/* Longest run of free pages in the pool, in bytes. */
+static void confine_largest_chunk(struct gen_pool *pool,
+				  struct gen_pool_chunk *chunk, void *data)
+{
+	unsigned long *largest = data;
+	unsigned long bits = (chunk->end_addr - chunk->start_addr + 1) >> PAGE_SHIFT;
+	unsigned long run = 0, i;
+
+	for (i = 0; i < bits; i++) {
+		if (test_bit(i, chunk->bits))
+			run = 0;
+		else if (++run > *largest)
+			*largest = run;
+	}
+}
+
+static unsigned long confine_pool_largest(void)
+{
+	unsigned long pages = 0;
+
+	if (confine_pool)
+		gen_pool_for_each_chunk(confine_pool, confine_largest_chunk, &pages);
+	return pages << PAGE_SHIFT;
+}
+/*
+ * /sys/kernel/execmem_confine/: window bounds and pool use, so an ENOMEM from a
+ * confined allocation on a user's machine is diagnosable, and the test tools
+ * have a stable place to read the window from.
+ */
+#define CONFINE_ATTR(name, expr)					\
+	static ssize_t name##_show(struct kobject *k,			\
+				   struct kobj_attribute *a, char *buf)	\
+	{								\
+		return sysfs_emit(buf, "%llu\n", (unsigned long long)(expr)); \
+	}								\
+	static struct kobj_attribute confine_attr_##name = __ATTR_RO(name)
+
+CONFINE_ATTR(window_base, confine_base);
+CONFINE_ATTR(window_size, confine_size);
+CONFINE_ATTR(pool_size, confine_pool ? gen_pool_size(confine_pool) : 0);
+CONFINE_ATTR(pool_free, confine_pool ? gen_pool_avail(confine_pool) : 0);
+CONFINE_ATTR(pool_largest_free, confine_pool_largest());
+
+static struct attribute *confine_attrs[] = {
+	&confine_attr_window_base.attr,
+	&confine_attr_window_size.attr,
+	&confine_attr_pool_size.attr,
+	&confine_attr_pool_free.attr,
+	&confine_attr_pool_largest_free.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(confine);
+
+static void __init confine_sysfs_init(void)
+{
+	struct kobject *kobj = kobject_create_and_add("execmem_confine", kernel_kobj);
+
+	if (kobj && sysfs_create_groups(kobj, confine_groups))
+		pr_warn("could not create /sys/kernel/execmem_confine\n");
+}
+#else
+static void __init confine_sysfs_init(void) {}
+#endif
 
 bool execmem_confine_active(void)
 {
@@ -281,6 +349,7 @@ bool execmem_confine_free(void *ptr)
 	unsigned long vaddr = (unsigned long)ptr;
 	struct confine_chunk *ck;
 	unsigned int nr;
+	int nx, rw;
 
 	if (!confine_ready || !ptr)
 		return false;
@@ -299,11 +368,14 @@ bool execmem_confine_free(void *ptr)
 
 	/*
 	 * We bypass vfree(), so VM_FLUSH_RESET_PERMS does not run for us: drop
-	 * the mapping back to non-executable, writable before tearing it down,
-	 * so the window never retains a stale executable alias. A failure here
-	 * would leave an executable alias behind, so warn rather than ignore it.
+	 * the mapping back to non-executable and writable before tearing it
+	 * down. set_memory_nx() already clears exec; a set_memory_rw() failure
+	 * would leave a read-only alias of a now-reused page, so call both
+	 * (not short-circuited) and warn on either failure.
 	 */
-	if (set_memory_nx(vaddr, nr) || set_memory_rw(vaddr, nr))
+	nx = set_memory_nx(vaddr, nr);
+	rw = set_memory_rw(vaddr, nr);
+	if (nx || rw)
 		pr_warn_ratelimited("could not reset perms on %#lx before freeing\n",
 				    vaddr);
 
@@ -375,6 +447,8 @@ static int __init execmem_confine_late_init(void)
 
 	if (!confine_ready)
 		return 0;
+
+	confine_sysfs_init();
 
 	violations = execmem_confine_verify(&nr_exec);
 	pr_info("boot verify: %lu executable mapping(s), %lu violation(s): %s\n",
