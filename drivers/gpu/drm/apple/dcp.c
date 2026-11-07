@@ -7074,8 +7074,12 @@ static int dcp_s2r_stop_firmware(struct apple_dcp *dcp)
 /*
  * macOS stops this firmware with one call the size of A500, then about 4 ms later AP
  * then IOP idle and the run bit off twice. Nothing has shown it needing a secure
- * port. Its panel path is already off with no display attached. Nothing brings it
- * back yet, so an attached display refuses the sleep.
+ * port.
+ *
+ * An attached display goes first, as macOS's DP port releases its display at system
+ * sleep: the pipe off, HPD low and the display released, as DPMS off does, then the
+ * crossbar output. The route and the connector stay, and after the wake the link
+ * connects again, as macOS replays the port's HPD.
  */
 static bool dcp_s2r_ext_capable(struct apple_dcp *dcp)
 {
@@ -7171,9 +7175,12 @@ static int dcp_s2r_ext_suspend(struct apple_dcp *dcp)
 		dcp_s2r_stop_failed_start(dcp);
 		dcp_s2r_find_darts(dcp);
 		dcp->s2r_stopped = true;
+		dcp_typec_route_park(dcp);
 		ret = dcp_s2r_stop_streams(dcp);
-		if (ret)
+		if (ret) {
+			dcp_typec_route_unpark(dcp);
 			return ret == -ETIMEDOUT ? -EBUSY : ret;
+		}
 		dcp_pmc_forget(dcp);
 		device_set_wakeup_path(dcp->dev);
 		return 0;
@@ -7188,10 +7195,8 @@ static int dcp_s2r_ext_suspend(struct apple_dcp *dcp)
 	if (READ_ONCE(dcp->crashed) || IS_ERR_OR_NULL(dcp->rtk))
 		return -EBUSY;
 
-	if (READ_ONCE(dcp->active_typec_route) || READ_ONCE(dcp->typec_cable_connected)) {
-		dev_err(dcp->dev, "a display is attached, refusing sleep\n");
-		return -EBUSY;
-	}
+	if (READ_ONCE(dcp->active_typec_route) || READ_ONCE(dcp->typec_cable_connected))
+		dev_dbg(dcp->dev, "a display is attached: released for the sleep, connected again after it\n");
 
 	dcp_disable_typec_work(dcp, false);
 	ret = dcp_external_disconnect(dcp, false);
@@ -7210,10 +7215,14 @@ static int dcp_s2r_ext_suspend(struct apple_dcp *dcp)
 		return -EBUSY;
 	}
 
+	/* The display's link went above: its crossbar output follows, as on macOS. */
+	dcp_typec_route_park(dcp);
+
 	ret = iomfb_s2r_500_h17p(dcp);
 	if (ret) {
 		dev_err(dcp->dev, "no reply to A500: %d\n", ret);
 		WRITE_ONCE(dcp->crashed, true);
+		dcp_typec_route_unpark(dcp);
 		return ret == -ETIMEDOUT ? -EBUSY : ret;
 	}
 	usleep_range(4000, 5000);
@@ -7224,6 +7233,7 @@ static int dcp_s2r_ext_suspend(struct apple_dcp *dcp)
 			readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL),
 			readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS));
 		WRITE_ONCE(dcp->crashed, true);
+		dcp_typec_route_unpark(dcp);
 		return ret == -ETIMEDOUT ? -EBUSY : ret;
 	}
 
@@ -7720,6 +7730,9 @@ static int dcp_s2r_restart(struct apple_dcp *dcp, bool real)
 			dev_err(dcp->dev, "warm restart failed: %d\n", ret);
 	}
 	dcp_s2r_put_darts(dcp);
+	/* An attached display's crossbar output; its link reconnects from the Type-C work. */
+	if (dcp_s2r_ext_capable(dcp))
+		dcp_typec_route_unpark(dcp);
 	if (ret) {
 		WRITE_ONCE(dcp->crashed, true);
 		dev_warn(dcp->dev, "firmware stopped for sleep, display stays off until reboot\n");
