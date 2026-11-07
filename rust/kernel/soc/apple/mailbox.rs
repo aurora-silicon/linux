@@ -96,6 +96,24 @@ impl<T: MailCallback> Mailbox<T> {
         // SAFETY: Calling the c function, `mbox` is a valid pointer
         to_result(unsafe { bindings::apple_mbox_send(self.mbox, msg, atomic) })
     }
+
+    /// Sets bit 0 of the receive control word, for firmware that powers itself down.
+    pub fn set_recv_enabled(&self, enabled: bool) {
+        // SAFETY: Calling the c function, `mbox` is a valid pointer
+        unsafe { bindings::apple_mbox_set_recv_enabled(self.mbox, enabled) };
+    }
+
+    /// Stops taking receive interrupts, so that no handler reads the mailbox.
+    pub fn hold_rx(&self) {
+        // SAFETY: Calling the c function, `mbox` is a valid pointer
+        unsafe { bindings::apple_mbox_hold_rx(self.mbox) };
+    }
+
+    /// Undoes [`Self::hold_rx`].
+    pub fn release_rx(&self) {
+        // SAFETY: Calling the c function, `mbox` is a valid pointer
+        unsafe { bindings::apple_mbox_release_rx(self.mbox) };
+    }
 }
 
 impl<T: MailCallback> Drop for Mailbox<T> {
