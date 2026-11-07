@@ -163,6 +163,7 @@
 			status = "disabled";
 			compatible = "apple,t8152-aic3", "apple,t8122-aic3";
 			interrupt-controller;
+			#address-cells = <0>;
 			#interrupt-cells = <3>;
 			reg = <3 0x01000000 0 0x1cc000>,
 			      <3 0x01040000 0 0x4000>;
