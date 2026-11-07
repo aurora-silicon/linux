@@ -49,6 +49,10 @@ properties:
       - description: Fourth auxiliary window
       - description: Fifth auxiliary window
 
+  clocks:
+    minItems: 1
+    maxItems: 4
+
   reg-names:
     minItems: 1
     maxItems: 7
@@ -317,8 +321,6 @@ allOf:
       properties:
         interrupts:
           maxItems: 1
-        power-domains:
-          minItems: 5
         reg:
           maxItems: 4
         reg-names:
@@ -399,6 +401,39 @@ allOf:
         memory-region: false
       required:
         - mboxes
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8140-ane
+              - apple,t6041-ane
+              - apple,t6001-ane
+    else:
+      properties:
+        power-domains:
+          minItems: 5
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6001-ane
+    then:
+      properties:
+        reg:
+          maxItems: 1
+        reg-names:
+          maxItems: 1
+        power-domains:
+          maxItems: 1
+        clocks:
+          minItems: 4
+      required:
+        - clocks
+    else:
+      properties:
+        clocks: false
 
 additionalProperties: false
 
