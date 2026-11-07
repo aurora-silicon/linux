@@ -96,12 +96,6 @@
 		#address-cells = <2>;
 		#size-cells = <0>;
 		status = "disabled";
-
-		pmic@f {
-			compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
-			reg = <0xf SPMI_USID>;
-			read-only;
-		};
 	};
 
 	clvr_spmi1: spmi@28e509100 {
@@ -110,12 +104,6 @@
 		#address-cells = <2>;
 		#size-cells = <0>;
 		status = "disabled";
-
-		pmic@f {
-			compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
-			reg = <0xf SPMI_USID>;
-			read-only;
-		};
 	};
 
 	clvr_spmi2: spmi@28e511100 {
@@ -124,12 +112,6 @@
 		#address-cells = <2>;
 		#size-cells = <0>;
 		status = "disabled";
-
-		pmic@f {
-			compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
-			reg = <0xf SPMI_USID>;
-			read-only;
-		};
 	};
 
 	nco: clock-controller@28e03c000 {
@@ -483,12 +465,6 @@
 		#address-cells = <2>;
 		#size-cells = <0>;
 		status = "disabled";
-
-		pmic@e {
-			compatible = "apple,maverick-pmic", "apple,spmi-nvmem";
-			reg = <0xe SPMI_USID>;
-			read-only;
-		};
 	};
 
 	wdt: watchdog@2922b0000 {

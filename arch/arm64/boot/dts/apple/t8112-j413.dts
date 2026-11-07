@@ -302,3 +302,11 @@
 &pmp_report_isp_sys {
 	status = "okay";
 };
+
+&nub_spmi1 {
+	pmic@e {
+		compatible = "apple,vale-pmic", "apple,spmi-nvmem";
+		reg = <0xe SPMI_USID>;
+		read-only;
+	};
+};

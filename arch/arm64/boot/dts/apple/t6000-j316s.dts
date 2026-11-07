@@ -84,6 +84,38 @@
 	};
 };
 
+&nub_spmi1 {
+	pmic@e {
+		compatible = "apple,maverick-pmic", "apple,spmi-nvmem";
+		reg = <0xe SPMI_USID>;
+		read-only;
+	};
+};
+
+&clvr_spmi0 {
+	pmic@f {
+		compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
+		reg = <0xf SPMI_USID>;
+		read-only;
+	};
+};
+
+&clvr_spmi1 {
+	pmic@f {
+		compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
+		reg = <0xf SPMI_USID>;
+		read-only;
+	};
+};
+
+&clvr_spmi2 {
+	pmic@f {
+		compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
+		reg = <0xf SPMI_USID>;
+		read-only;
+	};
+};
+
 &sound {
 	compatible = "apple,j316-macaudio", "apple,macaudio";
 	model = "MacBook Pro J316";
