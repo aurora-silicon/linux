@@ -24,6 +24,8 @@
 	model = "Apple MacBook Pro (14-inch, M1 Pro, 2021)";
 
 	aliases {
+		rtc0 = &smc_rtc;
+		rtc1 = &pmu_rtc;
 		sep = &sep;
 	};
 };
