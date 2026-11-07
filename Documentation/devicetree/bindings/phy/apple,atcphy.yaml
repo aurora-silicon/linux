@@ -209,6 +209,7 @@ allOf:
         - mode-switch
         - ports
 
+
 $defs:
   apple,tunable:
     $ref: /schemas/types.yaml#/definitions/uint32-matrix
