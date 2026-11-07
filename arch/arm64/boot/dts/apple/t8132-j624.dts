@@ -9,6 +9,7 @@
 
 /dts-v1/;
 
+#include "t8132.dtsi"
 #include "t8132-j623-j624.dtsi"
 #include "t8132-atc23.dtsi"
 
@@ -134,11 +135,11 @@
 };
 
 &dwc3_2 {
-	status = "okay";
 	dr_mode = "host";
 	maximum-speed = "super-speed";
 	phys = <&atcphy2 PHY_TYPE_USB2>, <&atcphy2 PHY_TYPE_USB3>;
 	phy-names = "usb2-phy", "usb3-phy";
+	status = "okay";
 
 	ports {
 		#address-cells = <1>;
@@ -178,11 +179,11 @@
 };
 
 &dwc3_3 {
-	status = "okay";
 	dr_mode = "host";
 	maximum-speed = "super-speed";
 	phys = <&atcphy3 PHY_TYPE_USB2>, <&atcphy3 PHY_TYPE_USB3>;
 	phy-names = "usb2-phy", "usb3-phy";
+	status = "okay";
 
 	ports {
 		#address-cells = <1>;

@@ -83,27 +83,6 @@
 	firmware-name = "apple/mesacal-j616s.bin", "apple/msrk-j616s.bin";
 };
 
-&ps_jpg {
-	status = "okay";
-};
-
-&jpeg0_dart {
-	status = "okay";
-};
-
-&jpeg0 {
-	status = "okay";
-};
-
-&jpeg1_dart {
-	status = "okay";
-};
-
-&jpeg1 {
-	status = "okay";
-};
-
-
 &i2c4 {
 	sd_card_control: card-control@20 {
 		compatible = "apple,t6041-sd-card-control", "apple,sd-card-control";

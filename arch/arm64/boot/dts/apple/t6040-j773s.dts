@@ -58,38 +58,38 @@
 
 		gpu_fw_text: gpu-fw-text {
 			reg = <0 0 0 0>;
-			status = "disabled";
 			no-map;
+			status = "disabled";
 		};
 
 		gpu_fw_data: gpu-fw-data {
 			reg = <0 0 0 0>;
-			status = "disabled";
 			no-map;
+			status = "disabled";
 		};
 
 		uat_ttbs: uat-ttbs {
 			reg = <0 0 0 0>;
-			status = "disabled";
 			no-map;
+			status = "disabled";
 		};
 
 		uat_pagetables: uat-pagetables {
 			reg = <0 0 0 0>;
-			status = "disabled";
 			no-map;
+			status = "disabled";
 		};
 
 		uat_l2_pagetables: uat-l2-pagetables {
 			reg = <0 0 0 0>;
-			status = "disabled";
 			no-map;
+			status = "disabled";
 		};
 
 		uat_handoff: uat-handoff {
 			reg = <0 0 0 0>;
-			status = "disabled";
 			no-map;
+			status = "disabled";
 		};
 	};
 };
@@ -287,11 +287,12 @@
 		reg-names = "config", "rc",
 			    "port0", "port1", "port2", "port3",
 			    "phy0", "phy1", "phy2", "phy3";
-		ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0 0x20000000 0x2000000 0 0x80000000 0xb 0x80000000 0 0x40000000>;
+		ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0x0 0x20000000>,
+			 <0x02000000 0x0 0x80000000 0xb 0x80000000 0x0 0x40000000>;
 		pinctrl-names = "default";
 		pinctrl-0 = <&wifi_clkreq_pins &eth_clkreq_pins>;
-		#size-cells = <2>;
 		#address-cells = <3>;
+		#size-cells = <2>;
 		bus-range = <0 2>;
 		iommu-map-mask = <0xffff>;
 		iommu-map = <0x100 &pcie_dart 1 2>, <0x200 &apcie2_dart 1 1>;
@@ -308,12 +309,15 @@
 		port00: pci@0,0 {
 			reg = <0 0 0 0 0>;
 			ranges;
-			interrupt-map = <0 0 0 1 &port00 0 0 0 0 0 0 0 2 &port00 0 0 0 1 0 0 0 3 &port00 0 0 0 2 0 0 0 4 &port00 0 0 0 3>;
+			interrupt-map = <0 0 0 1 &port00 0 0 0 0>,
+					<0 0 0 2 &port00 0 0 0 1>,
+					<0 0 0 3 &port00 0 0 0 2>,
+					<0 0 0 4 &port00 0 0 0 3>;
 			interrupt-map-mask = <0 0 0 7>;
 			#interrupt-cells = <1>;
 			interrupt-controller;
-			#size-cells = <2>;
 			#address-cells = <3>;
+			#size-cells = <2>;
 			/* ADT /amfm reg_on gP13 */
 			pwren-gpios = <&smc_gpio 0x13 GPIO_ACTIVE_HIGH>;
 			reset-gpios = <&pinctrl 4 GPIO_ACTIVE_LOW>;
@@ -484,7 +488,7 @@
 };
 
 /* The loader fills the operating points, calibration and all six memory regions. */
-&gfx_mbox {
+&agx_mbox {
 	status = "okay";
 };
 
@@ -529,14 +533,14 @@
 
 				port@0 {
 					reg = <0>;
-					typec0_con_hs: endpoint {
-						remote-endpoint = <&usb_drd0_hs>;
+					typec0_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_0_hs>;
 					};
 				};
 
 				port@1 {
 					reg = <1>;
-					typec0_con_ss: endpoint {
+					typec0_connector_ss: endpoint {
 						remote-endpoint = <&atcphy0_ss>;
 					};
 				};
@@ -565,14 +569,14 @@
 
 				port@0 {
 					reg = <0>;
-					typec1_con_hs: endpoint {
-						remote-endpoint = <&usb_drd1_hs>;
+					typec1_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_1_hs>;
 					};
 				};
 
 				port@1 {
 					reg = <1>;
-					typec1_con_ss: endpoint {
+					typec1_connector_ss: endpoint {
 						remote-endpoint = <&atcphy1_ss>;
 					};
 				};
@@ -601,14 +605,14 @@
 
 				port@0 {
 					reg = <0>;
-					typec2_con_hs: endpoint {
-						remote-endpoint = <&usb_drd2_hs>;
+					typec2_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_2_hs>;
 					};
 				};
 
 				port@1 {
 					reg = <1>;
-					typec2_con_ss: endpoint {
+					typec2_connector_ss: endpoint {
 						remote-endpoint = <&atcphy2_ss>;
 					};
 				};
@@ -627,14 +631,14 @@
 		port@0 {
 			reg = <0>;
 			atcphy0_ss: endpoint {
-				remote-endpoint = <&typec0_con_ss>;
+				remote-endpoint = <&typec0_connector_ss>;
 			};
 		};
 
 		port@1 {
 			reg = <1>;
 			atcphy0_usb3: endpoint {
-				remote-endpoint = <&usb_drd0_ss>;
+				remote-endpoint = <&dwc3_0_ss>;
 			};
 		};
 	};
@@ -644,15 +648,15 @@
 	status = "okay";
 };
 
-&usb_drd0_dart_0 {
+&dwc3_0_dart_0 {
 	status = "okay";
 };
 
-&usb_drd0_dart_1 {
+&dwc3_0_dart_1 {
 	status = "okay";
 };
 
-&usb_drd0 {
+&dwc3_0 {
 	status = "okay";
 
 	ports {
@@ -661,14 +665,14 @@
 
 		port@0 {
 			reg = <0>;
-			usb_drd0_hs: endpoint {
-				remote-endpoint = <&typec0_con_hs>;
+			dwc3_0_hs: endpoint {
+				remote-endpoint = <&typec0_connector_hs>;
 			};
 		};
 
 		port@1 {
 			reg = <1>;
-			usb_drd0_ss: endpoint {
+			dwc3_0_ss: endpoint {
 				remote-endpoint = <&atcphy0_usb3>;
 			};
 		};
@@ -685,14 +689,14 @@
 		port@0 {
 			reg = <0>;
 			atcphy1_ss: endpoint {
-				remote-endpoint = <&typec1_con_ss>;
+				remote-endpoint = <&typec1_connector_ss>;
 			};
 		};
 
 		port@1 {
 			reg = <1>;
 			atcphy1_usb3: endpoint {
-				remote-endpoint = <&usb_drd1_ss>;
+				remote-endpoint = <&dwc3_1_ss>;
 			};
 		};
 	};
@@ -702,15 +706,15 @@
 	status = "okay";
 };
 
-&usb_drd1_dart_0 {
+&dwc3_1_dart_0 {
 	status = "okay";
 };
 
-&usb_drd1_dart_1 {
+&dwc3_1_dart_1 {
 	status = "okay";
 };
 
-&usb_drd1 {
+&dwc3_1 {
 	status = "okay";
 
 	ports {
@@ -719,14 +723,14 @@
 
 		port@0 {
 			reg = <0>;
-			usb_drd1_hs: endpoint {
-				remote-endpoint = <&typec1_con_hs>;
+			dwc3_1_hs: endpoint {
+				remote-endpoint = <&typec1_connector_hs>;
 			};
 		};
 
 		port@1 {
 			reg = <1>;
-			usb_drd1_ss: endpoint {
+			dwc3_1_ss: endpoint {
 				remote-endpoint = <&atcphy1_usb3>;
 			};
 		};
@@ -743,14 +747,14 @@
 		port@0 {
 			reg = <0>;
 			atcphy2_ss: endpoint {
-				remote-endpoint = <&typec2_con_ss>;
+				remote-endpoint = <&typec2_connector_ss>;
 			};
 		};
 
 		port@1 {
 			reg = <1>;
 			atcphy2_usb3: endpoint {
-				remote-endpoint = <&usb_drd2_ss>;
+				remote-endpoint = <&dwc3_2_ss>;
 			};
 		};
 	};
@@ -760,15 +764,15 @@
 	status = "okay";
 };
 
-&usb_drd2_dart_0 {
+&dwc3_2_dart_0 {
 	status = "okay";
 };
 
-&usb_drd2_dart_1 {
+&dwc3_2_dart_1 {
 	status = "okay";
 };
 
-&usb_drd2 {
+&dwc3_2 {
 	status = "okay";
 
 	ports {
@@ -777,14 +781,14 @@
 
 		port@0 {
 			reg = <0>;
-			usb_drd2_hs: endpoint {
-				remote-endpoint = <&typec2_con_hs>;
+			dwc3_2_hs: endpoint {
+				remote-endpoint = <&typec2_connector_hs>;
 			};
 		};
 
 		port@1 {
 			reg = <1>;
-			usb_drd2_ss: endpoint {
+			dwc3_2_ss: endpoint {
 				remote-endpoint = <&atcphy2_usb3>;
 			};
 		};
