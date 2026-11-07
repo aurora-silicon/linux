@@ -57,11 +57,15 @@ allOf:
         power-domains:
           maxItems: 1
 
+        iommus:
+          maxItems: 1
+
       required:
         - compatible
         - reg
         - interrupts
         - power-domains
+        - iommus
 
       additionalProperties: false
     else:

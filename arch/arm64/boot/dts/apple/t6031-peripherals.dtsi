@@ -218,6 +218,7 @@
 		      <0x5 0x94018000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1493 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&pcie0_dart_0 15>;
 		status = "disabled";
 	};
 
@@ -228,6 +229,7 @@
 		      <0x5 0x95018000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1502 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&pcie0_dart_1 15>;
 		status = "disabled";
 	};
 
@@ -239,6 +241,7 @@
 		      <0x7 0x20008000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1349 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&pciec0_dart 15>;
 		status = "disabled";
 	};
 
@@ -250,6 +253,7 @@
 		      <0xb 0x20008000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1377 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&pciec1_dart 15>;
 		status = "disabled";
 	};
 
@@ -261,6 +265,7 @@
 		      <0xf 0x20008000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1405 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&pciec2_dart 15>;
 		status = "disabled";
 	};
 
@@ -633,6 +638,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1324 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_aes>;
+		iommus = <&sio_dart 1>;
 		status = "disabled";
 	};
 

@@ -22,14 +22,12 @@
 		status = "disabled";
 	};
 
-	fpwm0: pwm@2a1040000 {
-		compatible = "apple,t8122-fpwm", "apple,s5l-fpwm";
+	pwm0: pwm@2a1040000 {
+		compatible = "apple,t8122-pwm", "apple,pwm";
 		reg = <0x2 0xa1040000 0 0x4000>;
-		clocks = <&clkref>;
 		power-domains = <&ps_fpwm0>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 789 IRQ_TYPE_LEVEL_HIGH>;
-		#pwm-cells = <2>;
 		status = "disabled";
 	};
 

@@ -36,6 +36,180 @@ description: >
   display crossbar is not part of the PHY resource. SuperSpeed calibration is
   supplied in banked lists so that no list spans that crossbar.
 
+allOf:
+  - $ref: /schemas/usb/usb-switch.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8122-atcphy
+              - apple,t6030-atcphy
+              - apple,t6031-atcphy
+    then:
+      properties:
+        reg:
+          minItems: 1
+          items:
+            - description: Common controls for USB and DisplayPort
+            - description: DisplayPort alternate mode PHY
+            - description: AXI to Apple Fabric interface
+            - description: USB2 PHY
+            - description: USB3 PIPE interface
+        reg-names:
+          minItems: 1
+          items:
+            - const: core
+            - const: lpdptx
+            - const: axi2af
+            - const: usb2phy
+            - const: pipehandler
+      oneOf:
+        - properties:
+            reg:
+              maxItems: 1
+            reg-names:
+              maxItems: 1
+        - properties:
+            reg:
+              minItems: 5
+            reg-names:
+              minItems: 5
+      required:
+        - power-domains
+    else:
+      if:
+        properties:
+          compatible:
+            contains:
+              const: apple,t8132-atcphy
+      then:
+        oneOf:
+          - properties:
+              reg:
+                minItems: 2
+                maxItems: 2
+              reg-names:
+                items:
+                  - const: usb2phy
+                  - const: pipehandler
+          - properties:
+              reg:
+                items:
+                  - description: USB2 PHY specific controls
+                  - description: USB3 PIPE interface controls
+                  - description: SuperSpeed PHY core, excluding the display crossbar
+                  - description: AXI to Apple Fabric interface controls
+                  - description: Local IO address translation controls
+                  - description: ATC fabric controls
+                  - description: ATC common configuration controls
+              reg-names:
+                items:
+                  - const: usb2phy
+                  - const: pipehandler
+                  - const: core
+                  - const: axi2af
+                  - const: lioa
+                  - const: fabric
+                  - const: common-config
+            required:
+              - power-domains
+      else:
+        properties:
+          reg:
+            minItems: 5
+            items:
+              - description: Common controls for all PHYs (USB2/3/4, DisplayPort, TBT)
+              - description: DisplayPort Alternate Mode PHY specific controls
+              - description: Type-C PHY AXI to Apple Fabric interconnect controls
+              - description: USB2 PHY specific controls
+              - description: USB3 PIPE interface controls
+              - description: Secondary eUSB2 PHY register bank (T8140)
+          reg-names:
+            minItems: 5
+            items:
+              - const: core
+              - const: lpdptx
+              - const: axi2af
+              - const: usb2phy
+              - const: pipehandler
+              - const: usb2phy-reg
+        required:
+          - power-domains
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8140-atcphy
+    then:
+      properties:
+        reg:
+          minItems: 6
+        reg-names:
+          minItems: 6
+    else:
+      properties:
+        apple,tunable-usb2phy-reg-dflt: false
+        apple,tunable-dp-common-pre: false
+        apple,tunable-dp-lpdptx: false
+        apple,tunable-dp-common-post: false
+      patternProperties:
+        "^apple,dp-training-table(-rbr|-hbr|-hbr2|-hbr3)?$": false
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              enum:
+                - apple,t8132-atcphy
+                - apple,t8140-atcphy
+    then:
+      properties:
+        reg:
+          maxItems: 5
+        reg-names:
+          maxItems: 5
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              const: apple,t8132-atcphy
+    then:
+      properties:
+        apple,tunable-usb3-axi2af: false
+        apple,tunable-usb3-lioa: false
+        apple,tunable-usb3-fabric: false
+        apple,tunable-usb3-config: false
+        apple,tunable-usb3-common: false
+        apple,tunable-usb3-efuse: false
+        apple,tunable-usb3-dp: false
+        apple,tunable-cio-axi2af: false
+        apple,tunable-cio-lioa: false
+        apple,tunable-cio-fabric: false
+        apple,tunable-cio-config: false
+        apple,tunable-cio-common: false
+        apple,tunable-cio-lane0: false
+        apple,tunable-cio-lane0-eq: false
+        apple,tunable-cio-lane1: false
+        apple,tunable-cio-lane1-eq: false
+        apple,tunable-cio-post: false
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              enum:
+                - apple,t8122-atcphy
+                - apple,t6030-atcphy
+                - apple,t6031-atcphy
+    then:
+      required:
+        - orientation-switch
+        - mode-switch
+        - ports
+
+
 $defs:
   apple,tunable:
     $ref: /schemas/types.yaml#/definitions/uint32-matrix
@@ -52,457 +226,242 @@ $defs:
       Unless otherwise noted these tunables are always applied to the core
       register region.
 
-
-select:
-  properties:
-    compatible:
-      contains:
-        enum:
-          - apple,t8132-atcphy
-          - apple,t8140-atcphy
-          - apple,t6000-atcphy
-          - apple,t6020-atcphy
-          - apple,t8112-atcphy
-          - apple,t8103-atcphy
-          - apple,t8142-atcphy
-          - apple,t8122-atcphy
-          - apple,t6030-atcphy
-          - apple,t6031-atcphy
-  required:
-    - compatible
-
-allOf:
-  - if:
-      properties:
-        compatible:
-          contains:
-            enum:
-              - apple,t8122-atcphy
+properties:
+  compatible:
+    oneOf:
+      - items:
+          - enum:
+              - apple,t6000-atcphy
+              - apple,t6020-atcphy
+              - apple,t8112-atcphy
+          - const: apple,t8103-atcphy
+      - const: apple,t8103-atcphy
+      - const: apple,t8122-atcphy
+      - items:
+          - enum:
               - apple,t6030-atcphy
               - apple,t6031-atcphy
-      required:
-        - compatible
-    then:
-      allOf:
-        - $ref: /schemas/usb/usb-switch.yaml#
+          - const: apple,t8122-atcphy
+      - const: apple,t8132-atcphy
+      - const: apple,t8140-atcphy
+      - const: apple,t8142-atcphy
 
-      properties:
-        compatible:
-          oneOf:
-            - const: apple,t8122-atcphy
-            - items:
-                - enum:
-                    - apple,t6030-atcphy
-                    - apple,t6031-atcphy
-                - const: apple,t8122-atcphy
+  reg:
+    minItems: 1
+    maxItems: 7
 
-        reg:
-          minItems: 1
-          items:
-            - description: Common PHY controls
-            - description: DisplayPort alternate mode PHY
-            - description: AXI to fabric interface
-            - description: USB2 PHY
-            - description: USB3 PIPE interface
+  reg-names:
+    minItems: 1
+    maxItems: 7
 
-        reg-names:
-          minItems: 1
-          items:
-            - const: core
-            - const: lpdptx
-            - const: axi2af
-            - const: usb2phy
-            - const: pipehandler
+  "#phy-cells":
+    const: 1
 
-        '#phy-cells':
-          const: 1
+  "#reset-cells":
+    const: 0
 
-        '#reset-cells':
-          const: 0
+  mode-switch: true
+  orientation-switch: true
 
-        power-domains:
-          maxItems: 1
+  power-domains:
+    maxItems: 1
 
-        mode-switch: true
-        orientation-switch: true
+  phys:
+    maxItems: 1
+    description: Phandle to the eUSB2 to USB 2.0 repeater.
 
-        ports:
-          $ref: /schemas/graph.yaml#/properties/ports
+  phy-names:
+    items:
+      - const: eusb2-repeater
 
-      required:
-        - compatible
-        - reg
-        - reg-names
-        - '#phy-cells'
-        - '#reset-cells'
-        - power-domains
+  ports:
+    $ref: /schemas/graph.yaml#/properties/ports
+    properties:
+      port@0:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: Outgoing connection to the SS port of the Type-C connector.
 
-      oneOf:
-        - properties:
-            reg:
-              maxItems: 1
-            reg-names:
-              maxItems: 1
-        - properties:
-            reg:
-              minItems: 5
-            reg-names:
-              minItems: 5
+      port@1:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: Incoming endpoint from the USB3 controller.
 
-      unevaluatedProperties: false
-    else:
-      allOf:
-        - $ref: /schemas/usb/usb-switch.yaml#
-        - if:
-            properties:
-              compatible:
-                contains:
-                  const: apple,t8132-atcphy
-          then:
-            oneOf:
-              - properties:
-                  reg:
-                    minItems: 2
-                    maxItems: 2
-                  reg-names:
-                    items:
-                      - const: usb2phy
-                      - const: pipehandler
-              - properties:
-                  reg:
-                    items:
-                      - description: USB2 PHY specific controls
-                      - description: USB3 PIPE interface controls
-                      - description: SuperSpeed PHY core, excluding the display crossbar
-                      - description: AXI to Apple Fabric interface controls
-                      - description: Local IO address translation controls
-                      - description: ATC fabric controls
-                      - description: ATC common configuration controls
-                  reg-names:
-                    items:
-                      - const: usb2phy
-                      - const: pipehandler
-                      - const: core
-                      - const: axi2af
-                      - const: lioa
-                      - const: fabric
-                      - const: common-config
-                required:
-                  - power-domains
-          else:
-            properties:
-              reg:
-                minItems: 5
-                items:
-                  - description: Common controls for all PHYs (USB2/3/4, DisplayPort, TBT)
-                  - description: DisplayPort Alternate Mode PHY specific controls
-                  - description: Type-C PHY AXI to Apple Fabric interconnect controls
-                  - description: USB2 PHY specific controls
-                  - description: USB3 PIPE interface controls
-                  - description: Secondary eUSB2 PHY register bank (T8140)
-              reg-names:
-                minItems: 5
-                items:
-                  - const: core
-                  - const: lpdptx
-                  - const: axi2af
-                  - const: usb2phy
-                  - const: pipehandler
-                  - const: usb2phy-reg
-            required:
-              - power-domains
-        - if:
-            properties:
-              compatible:
-                contains:
-                  const: apple,t8140-atcphy
-          then:
-            properties:
-              reg:
-                minItems: 6
-              reg-names:
-                minItems: 6
-          else:
-            properties:
-              apple,tunable-usb2phy-reg-dflt: false
-              apple,tunable-dp-common-pre: false
-              apple,tunable-dp-lpdptx: false
-              apple,tunable-dp-common-post: false
-            patternProperties:
-              "^apple,dp-training-table(-rbr|-hbr|-hbr2|-hbr3)?$": false
-        - if:
-            properties:
-              compatible:
-                not:
-                  contains:
-                    enum:
-                      - apple,t8132-atcphy
-                      - apple,t8140-atcphy
-          then:
-            properties:
-              reg:
-                maxItems: 5
-              reg-names:
-                maxItems: 5
-        - if:
-            properties:
-              compatible:
-                not:
-                  contains:
-                    const: apple,t8132-atcphy
-          then:
-            properties:
-              apple,tunable-usb3-axi2af: false
-              apple,tunable-usb3-lioa: false
-              apple,tunable-usb3-fabric: false
-              apple,tunable-usb3-config: false
-              apple,tunable-usb3-common: false
-              apple,tunable-usb3-efuse: false
-              apple,tunable-usb3-dp: false
-              apple,tunable-cio-axi2af: false
-              apple,tunable-cio-lioa: false
-              apple,tunable-cio-fabric: false
-              apple,tunable-cio-config: false
-              apple,tunable-cio-common: false
-              apple,tunable-cio-lane0: false
-              apple,tunable-cio-lane0-eq: false
-              apple,tunable-cio-lane1: false
-              apple,tunable-cio-lane1-eq: false
-              apple,tunable-cio-post: false
+      port@2:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: Incoming endpoint from the DisplayPort controller.
 
-      properties:
-        compatible:
-          oneOf:
-            - items:
-                - enum:
-                    - apple,t6000-atcphy
-                    - apple,t6020-atcphy
-                    - apple,t8112-atcphy
-                - const: apple,t8103-atcphy
-            - const: apple,t8103-atcphy
-            - const: apple,t8132-atcphy
-            - const: apple,t8140-atcphy
-            - const: apple,t8142-atcphy
+      port@3:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: Incoming endpoint from the USB4/Thunderbolt controller.
 
-        reg:
-          minItems: 2
-          maxItems: 7
+  apple,tunable-usb3-axi2af:
+    $ref: "#/$defs/apple,tunable"
+    description: T8132 AXI setup followed by write-disable and lock operations.
 
-        reg-names:
-          minItems: 2
-          maxItems: 7
+  apple,tunable-usb3-lioa:
+    $ref: "#/$defs/apple,tunable"
+    description: T8132 LIOA setup, applied after the AXI list.
 
-        "#phy-cells":
-          const: 1
+  apple,tunable-usb3-fabric:
+    $ref: "#/$defs/apple,tunable"
+    description: T8132 fabric setup, applied after the LIOA list.
 
-        "#reset-cells":
-          const: 0
+  apple,tunable-usb3-config:
+    $ref: "#/$defs/apple,tunable"
+    description: T8132 common-configuration setup, applied after fabric setup.
 
-        mode-switch: true
-        orientation-switch: true
+  apple,tunable-usb3-common:
+    $ref: "#/$defs/apple,tunable"
+    description: T8132 core PLL and common setup, before the selected USB lane.
 
-        power-domains:
-          maxItems: 1
+  apple,tunable-usb3-dp:
+    $ref: "#/$defs/apple,tunable"
+    description: >
+      T8132 AUX_TOP calibration within the core bank, applied after the
+      common list has supplied AUSCMN_DIG and AUSPLL_CORE. This handoff
+      applies to ADTs without AUX_SHM and is optional for USB3-only mode.
+      This list does not initialize the display crossbar or DisplayPort
+      transmitter and does not authorize taking over an active PHY epoch.
 
-        phys:
-          maxItems: 1
-          description: Phandle to the eUSB2 to USB 2.0 repeater.
+  apple,tunable-usb3-efuse:
+    $ref: "#/$defs/apple,tunable"
+    description: >
+      T8132 ADT-provided efuse-derived core values, applied after lane routing
+      and before the PHY reset is released. No raw fuse register is read.
 
-        phy-names:
-          items:
-            - const: eusb2-repeater
+  apple,tunable-cio-axi2af:
+    $ref: "#/$defs/apple,tunable"
+    description: T8132 CIO AXI setup, write-disable and lock, applied first in CIO mode.
 
-        ports:
-          $ref: /schemas/graph.yaml#/properties/ports
-          properties:
-            port@0:
-              $ref: /schemas/graph.yaml#/properties/port
-              description: Outgoing connection to the SS port of the Type-C connector.
+  apple,tunable-cio-lioa:
+    $ref: "#/$defs/apple,tunable"
+    description: T8132 CIO LIOA setup, applied after the CIO AXI list.
 
-            port@1:
-              $ref: /schemas/graph.yaml#/properties/port
-              description: Incoming endpoint from the USB3 controller.
+  apple,tunable-cio-fabric:
+    $ref: "#/$defs/apple,tunable"
+    description: T8132 CIO fabric setup, applied after the CIO LIOA list.
 
-            port@2:
-              $ref: /schemas/graph.yaml#/properties/port
-              description: Incoming endpoint from the DisplayPort controller.
+  apple,tunable-cio-config:
+    $ref: "#/$defs/apple,tunable"
+    description: T8132 CIO common-configuration setup, applied after the CIO fabric list.
 
-            port@3:
-              $ref: /schemas/graph.yaml#/properties/port
-              description: Incoming endpoint from the USB4/Thunderbolt controller.
+  apple,tunable-cio-common:
+    $ref: "#/$defs/apple,tunable"
+    description: T8132 CIO PLL, shim and top setup in the core bank, before the lanes.
 
-        apple,tunable-usb3-axi2af:
-          $ref: "#/$defs/apple,tunable"
-          description: T8132 AXI setup followed by write-disable and lock operations.
+  apple,tunable-cio-lane0:
+    $ref: "#/$defs/apple,tunable"
+    description: T8132 lane 0 CIO defaults in the core bank.
 
-        apple,tunable-usb3-lioa:
-          $ref: "#/$defs/apple,tunable"
-          description: T8132 LIOA setup, applied after the AXI list.
+  apple,tunable-cio-lane0-eq:
+    $ref: "#/$defs/apple,tunable"
+    description: T8132 lane 0 CIO equalization in the core bank, after its defaults.
 
-        apple,tunable-usb3-fabric:
-          $ref: "#/$defs/apple,tunable"
-          description: T8132 fabric setup, applied after the LIOA list.
+  apple,tunable-cio-lane1:
+    $ref: "#/$defs/apple,tunable"
+    description: T8132 lane 1 CIO defaults in the core bank.
 
-        apple,tunable-usb3-config:
-          $ref: "#/$defs/apple,tunable"
-          description: T8132 common-configuration setup, applied after fabric setup.
+  apple,tunable-cio-lane1-eq:
+    $ref: "#/$defs/apple,tunable"
+    description: T8132 lane 1 CIO equalization in the core bank, after its defaults.
 
-        apple,tunable-usb3-common:
-          $ref: "#/$defs/apple,tunable"
-          description: T8132 core PLL and common setup, before the selected USB lane.
+  apple,tunable-cio-post:
+    $ref: "#/$defs/apple,tunable"
+    description: T8132 CIO common setup applied after the crossbar, before the PHY reset is released.
 
-        apple,tunable-usb3-dp:
-          $ref: "#/$defs/apple,tunable"
-          description: >
-            T8132 AUX_TOP calibration within the core bank, applied after the
-            common list has supplied AUSCMN_DIG and AUSPLL_CORE. This handoff
-            applies to ADTs without AUX_SHM and is optional for USB3-only mode.
-            This list does not initialize the display crossbar or DisplayPort
-            transmitter and does not authorize taking over an active PHY epoch.
+  apple,tunable-common-a:
+    $ref: "#/$defs/apple,tunable"
+    description: >
+      Common tunables required for all modes, applied before tunable-axi2af.
 
-        apple,tunable-usb3-efuse:
-          $ref: "#/$defs/apple,tunable"
-          description: >
-            T8132 ADT-provided efuse-derived core values, applied after lane routing
-            and before the PHY reset is released. No raw fuse register is read.
+  apple,tunable-axi2af:
+    $ref: "#/$defs/apple,tunable"
+    description: >
+      AXI to Apple Fabric tunables, required for all modes. Unlike all other
+      tunables these are applied to the axi2af region.
 
-        apple,tunable-cio-axi2af:
-          $ref: "#/$defs/apple,tunable"
-          description: T8132 CIO AXI setup, write-disable and lock, applied first in CIO mode.
+  apple,tunable-common-b:
+    $ref: "#/$defs/apple,tunable"
+    description: >
+      Common tunables required for all modes, applied after tunable-axi2af.
 
-        apple,tunable-cio-lioa:
-          $ref: "#/$defs/apple,tunable"
-          description: T8132 CIO LIOA setup, applied after the CIO AXI list.
+  apple,tunable-lane0-usb:
+    $ref: "#/$defs/apple,tunable"
+    description: USB3 tunables for lane 0.
 
-        apple,tunable-cio-fabric:
-          $ref: "#/$defs/apple,tunable"
-          description: T8132 CIO fabric setup, applied after the CIO LIOA list.
+  apple,tunable-lane1-usb:
+    $ref: "#/$defs/apple,tunable"
+    description: USB3 tunables for lane 1.
 
-        apple,tunable-cio-config:
-          $ref: "#/$defs/apple,tunable"
-          description: T8132 CIO common-configuration setup, applied after the CIO fabric list.
+  apple,tunable-lane0-cio:
+    $ref: "#/$defs/apple,tunable"
+    description: USB4/Thunderbolt ("Converged IO") tunables for lane 0.
 
-        apple,tunable-cio-common:
-          $ref: "#/$defs/apple,tunable"
-          description: T8132 CIO PLL, shim and top setup in the core bank, before the lanes.
+  apple,tunable-lane1-cio:
+    $ref: "#/$defs/apple,tunable"
+    description: USB4/Thunderbolt ("Converged IO") tunables for lane 1.
 
-        apple,tunable-cio-lane0:
-          $ref: "#/$defs/apple,tunable"
-          description: T8132 lane 0 CIO defaults in the core bank.
+  apple,tunable-lane0-dp:
+    $ref: "#/$defs/apple,tunable"
+    description: >
+      DisplayPort tunables for lane 0.
 
-        apple,tunable-cio-lane0-eq:
-          $ref: "#/$defs/apple,tunable"
-          description: T8132 lane 0 CIO equalization in the core bank, after its defaults.
+      Note that lane here refers to a USB RX and TX pair re-used for DisplayPort
+      and not to an individual DisplayPort differential lane.
 
-        apple,tunable-cio-lane1:
-          $ref: "#/$defs/apple,tunable"
-          description: T8132 lane 1 CIO defaults in the core bank.
+  apple,tunable-lane1-dp:
+    $ref: "#/$defs/apple,tunable"
+    description: >
+      DisplayPort tunables for lane 1.
 
-        apple,tunable-cio-lane1-eq:
-          $ref: "#/$defs/apple,tunable"
-          description: T8132 lane 1 CIO equalization in the core bank, after its defaults.
+      Note that lane here refers to a USB RX and TX pair re-used for DisplayPort
+      and not to an individual DisplayPort differential lane.
 
-        apple,tunable-cio-post:
-          $ref: "#/$defs/apple,tunable"
-          description: T8132 CIO common setup applied after the crossbar, before the PHY reset is released.
+  apple,tunable-dp-common-pre:
+    $ref: "#/$defs/apple,tunable"
+    maxItems: 5461
+    description: >
+      T8140 DisplayPort core setup applied before the LPDPTX list. The
+      bootloader supplies device-specific values for the core register region.
 
-        apple,tunable-common-a:
-          $ref: "#/$defs/apple,tunable"
-          description: >
-            Common tunables required for all modes, applied before tunable-axi2af.
+  apple,tunable-dp-lpdptx:
+    $ref: "#/$defs/apple,tunable"
+    maxItems: 5461
+    description: >
+      T8140 DisplayPort setup for the lpdptx register region, applied between
+      the common-pre and common-post lists.
 
-        apple,tunable-axi2af:
-          $ref: "#/$defs/apple,tunable"
-          description: >
-            AXI to Apple Fabric tunables, required for all modes. Unlike all other
-            tunables these are applied to the axi2af region.
+  apple,tunable-dp-common-post:
+    $ref: "#/$defs/apple,tunable"
+    maxItems: 5461
+    description: >
+      T8140 DisplayPort core setup applied after the LPDPTX list. All three
+      DisplayPort lists are needed before selecting a DisplayPort PHY mode.
 
-        apple,tunable-common-b:
-          $ref: "#/$defs/apple,tunable"
-          description: >
-            Common tunables required for all modes, applied after tunable-axi2af.
+  apple,tunable-usb2phy-reg-dflt:
+    $ref: "#/$defs/apple,tunable"
+    description: >
+      Per-device defaults for the secondary eUSB2 PHY register bank of the
+      T8140, copied from Apple's Device Tree by the bootloader. Unlike the
+      other tunables these are applied to the usb2phy-reg region.
 
-        apple,tunable-lane0-usb:
-          $ref: "#/$defs/apple,tunable"
-          description: USB3 tunables for lane 0.
+patternProperties:
+  "^apple,dp-training-table(-rbr|-hbr|-hbr2|-hbr3)?$":
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 16
+    maxItems: 16
+    description: >
+      Firmware-provided T8140 drive presets indexed by voltage swing times
+      four plus pre-emphasis. The unsuffixed table is the required fallback;
+      a link-rate suffix selects an optional rate-specific override.
 
-        apple,tunable-lane1-usb:
-          $ref: "#/$defs/apple,tunable"
-          description: USB3 tunables for lane 1.
+required:
+  - compatible
+  - reg
+  - reg-names
+  - "#phy-cells"
+  - "#reset-cells"
 
-        apple,tunable-lane0-cio:
-          $ref: "#/$defs/apple,tunable"
-          description: USB4/Thunderbolt ("Converged IO") tunables for lane 0.
-
-        apple,tunable-lane1-cio:
-          $ref: "#/$defs/apple,tunable"
-          description: USB4/Thunderbolt ("Converged IO") tunables for lane 1.
-
-        apple,tunable-lane0-dp:
-          $ref: "#/$defs/apple,tunable"
-          description: >
-            DisplayPort tunables for lane 0.
-
-            Note that lane here refers to a USB RX and TX pair re-used for DisplayPort
-            and not to an individual DisplayPort differential lane.
-
-        apple,tunable-lane1-dp:
-          $ref: "#/$defs/apple,tunable"
-          description: >
-            DisplayPort tunables for lane 1.
-
-            Note that lane here refers to a USB RX and TX pair re-used for DisplayPort
-            and not to an individual DisplayPort differential lane.
-
-        apple,tunable-dp-common-pre:
-          $ref: "#/$defs/apple,tunable"
-          maxItems: 5461
-          description: >
-            T8140 DisplayPort core setup applied before the LPDPTX list. The
-            bootloader supplies device-specific values for the core register region.
-
-        apple,tunable-dp-lpdptx:
-          $ref: "#/$defs/apple,tunable"
-          maxItems: 5461
-          description: >
-            T8140 DisplayPort setup for the lpdptx register region, applied between
-            the common-pre and common-post lists.
-
-        apple,tunable-dp-common-post:
-          $ref: "#/$defs/apple,tunable"
-          maxItems: 5461
-          description: >
-            T8140 DisplayPort core setup applied after the LPDPTX list. All three
-            DisplayPort lists are needed before selecting a DisplayPort PHY mode.
-
-        apple,tunable-usb2phy-reg-dflt:
-          $ref: "#/$defs/apple,tunable"
-          description: >
-            Per-device defaults for the secondary eUSB2 PHY register bank of the
-            T8140, copied from Apple's Device Tree by the bootloader. Unlike the
-            other tunables these are applied to the usb2phy-reg region.
-
-      patternProperties:
-        "^apple,dp-training-table(-rbr|-hbr|-hbr2|-hbr3)?$":
-          $ref: /schemas/types.yaml#/definitions/uint32-array
-          minItems: 16
-          maxItems: 16
-          description: >
-            Firmware-provided T8140 drive presets indexed by voltage swing times
-            four plus pre-emphasis. The unsuffixed table is the required fallback;
-            a link-rate suffix selects an optional rate-specific override.
-
-      required:
-        - compatible
-        - reg
-        - reg-names
-        - "#phy-cells"
-        - "#reset-cells"
-        - orientation-switch
-        - mode-switch
-        - ports
-
-      additionalProperties: false
+additionalProperties: false
 
 examples:
   - |
