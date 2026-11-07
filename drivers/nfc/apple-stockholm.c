@@ -268,41 +268,77 @@ static int stockholm_nci_cmd(struct stockholm *st, u16 opcode,
 	return ret;
 }
 
+/* What CORE_RESET and CORE_INIT report about the controller. */
+struct stockholm_ident {
+	u8 nci_version;
+	u8 manufacturer;
+	u8 rf_interfaces;
+	u32 firmware;
+};
+
+/* NCI 1.x CORE_RESET_RSP payload: status, NCI version, configuration status. */
+static int stockholm_parse_reset_rsp(const u8 *rsp, int len,
+				     struct stockholm_ident *id)
+{
+	if (len < 1 || rsp[0] != NCI_STATUS_OK)
+		return -EIO;
+	/* NCI 2.x answers with the status only and reports in a notification. */
+	if (len != 3)
+		return -EOPNOTSUPP;
+
+	id->nci_version = rsp[1];
+	return 0;
+}
+
+/*
+ * NCI 1.x CORE_INIT_RSP payload: status, features (4), RF interface count and
+ * list, logical connections, routing table size (2), control payload size,
+ * large parameter size (2), manufacturer ID, manufacturer data (4).
+ */
+static int stockholm_parse_init_rsp(const u8 *rsp, int len,
+				    struct stockholm_ident *id)
+{
+	unsigned int tail;
+
+	if (len <= STOCKHOLM_INIT_RSP_RF_COUNT || rsp[0] != NCI_STATUS_OK)
+		return -EIO;
+
+	id->rf_interfaces = rsp[STOCKHOLM_INIT_RSP_RF_COUNT];
+	tail = STOCKHOLM_INIT_RSP_RF_COUNT + 1 + id->rf_interfaces +
+	       STOCKHOLM_INIT_RSP_TAIL;
+	if (len < tail + STOCKHOLM_INIT_RSP_MANUF_LEN)
+		return -EIO;
+
+	id->manufacturer = rsp[tail];
+	id->firmware = get_unaligned_le32(&rsp[tail + 1]);
+	return 0;
+}
+
 /* CORE_RESET and CORE_INIT, then log what the controller reports. */
 static int stockholm_identify(struct stockholm *st)
 {
-	struct device *dev = &st->sdev->dev;
 	u8 reset_type = NCI_RESET_TYPE_RESET_CONFIG;
-	const u8 *rsp = st->rx_payload;
-	unsigned int n_rf, tail;
-	u8 version;
-	int len;
+	struct stockholm_ident id = {};
+	int len, ret;
 
 	len = stockholm_nci_cmd(st, NCI_OP_CORE_RESET_CMD, &reset_type, 1);
 	if (len < 0)
 		return len;
-	if (len < 1 || rsp[0] != NCI_STATUS_OK)
-		return -EIO;
-	/* Only the NCI 1.x reset response carries the version (3 bytes). */
-	if (len != 3)
-		return -EOPNOTSUPP;
-	version = rsp[1];
+	ret = stockholm_parse_reset_rsp(st->rx_payload, len, &id);
+	if (ret)
+		return ret;
 
 	len = stockholm_nci_cmd(st, NCI_OP_CORE_INIT_CMD, NULL, 0);
 	if (len < 0)
 		return len;
-	if (len <= STOCKHOLM_INIT_RSP_RF_COUNT || rsp[0] != NCI_STATUS_OK)
-		return -EIO;
+	ret = stockholm_parse_init_rsp(st->rx_payload, len, &id);
+	if (ret)
+		return ret;
 
-	n_rf = rsp[STOCKHOLM_INIT_RSP_RF_COUNT];
-	tail = STOCKHOLM_INIT_RSP_RF_COUNT + 1 + n_rf + STOCKHOLM_INIT_RSP_TAIL;
-	if (len < tail + STOCKHOLM_INIT_RSP_MANUF_LEN)
-		return -EIO;
-
-	dev_info(dev,
+	dev_info(&st->sdev->dev,
 		 "NCI %u.%u controller, manufacturer %#04x, firmware %08x, %u RF interfaces; parked off\n",
-		 version >> 4, version & 0xf, rsp[tail],
-		 get_unaligned_le32(&rsp[tail + 1]), n_rf);
+		 id.nci_version >> 4, id.nci_version & 0xf, id.manufacturer,
+		 id.firmware, id.rf_interfaces);
 
 	return 0;
 }
@@ -418,6 +454,10 @@ static struct spmi_driver stockholm_driver = {
 	},
 };
 module_spmi_driver(stockholm_driver);
+
+#if IS_ENABLED(CONFIG_NFC_APPLE_STOCKHOLM_KUNIT_TEST)
+#include "apple-stockholm-test.c"
+#endif
 
 MODULE_AUTHOR("Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>");
 MODULE_DESCRIPTION("Apple Stockholm NFC controller and Secure Element (power and identity)");
