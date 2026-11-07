@@ -4671,9 +4671,22 @@
 &atcphy0 {
 	status = "okay";
 
-	port {
-		atcphy0_ss: endpoint {
-			remote-endpoint = <&typec0_con_ss>;
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			atcphy0_ss: endpoint {
+				remote-endpoint = <&typec0_con_ss>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			atcphy0_usb3: endpoint {
+				remote-endpoint = <&usb_drd0_ss>;
+			};
 		};
 	};
 };
@@ -4703,15 +4716,35 @@
 				remote-endpoint = <&typec0_con_hs>;
 			};
 		};
+
+		port@1 {
+			reg = <1>;
+			usb_drd0_ss: endpoint {
+				remote-endpoint = <&atcphy0_usb3>;
+			};
+		};
 	};
 };
 
 &atcphy1 {
 	status = "okay";
 
-	port {
-		atcphy1_ss: endpoint {
-			remote-endpoint = <&typec1_con_ss>;
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			atcphy1_ss: endpoint {
+				remote-endpoint = <&typec1_con_ss>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			atcphy1_usb3: endpoint {
+				remote-endpoint = <&usb_drd1_ss>;
+			};
 		};
 	};
 };
@@ -4741,15 +4774,35 @@
 				remote-endpoint = <&typec1_con_hs>;
 			};
 		};
+
+		port@1 {
+			reg = <1>;
+			usb_drd1_ss: endpoint {
+				remote-endpoint = <&atcphy1_usb3>;
+			};
+		};
 	};
 };
 
 &atcphy2 {
 	status = "okay";
 
-	port {
-		atcphy2_ss: endpoint {
-			remote-endpoint = <&typec2_con_ss>;
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			atcphy2_ss: endpoint {
+				remote-endpoint = <&typec2_con_ss>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			atcphy2_usb3: endpoint {
+				remote-endpoint = <&usb_drd2_ss>;
+			};
 		};
 	};
 };
@@ -4777,6 +4830,13 @@
 			reg = <0>;
 			usb_drd2_hs: endpoint {
 				remote-endpoint = <&typec2_con_hs>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			usb_drd2_ss: endpoint {
+				remote-endpoint = <&atcphy2_usb3>;
 			};
 		};
 	};
