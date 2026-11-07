@@ -19,8 +19,6 @@ properties:
     oneOf:
       - enum:
           - apple,t6000-ave
-          - apple,t6000-ave
-          - apple,t8112-ave
           - apple,t6041-ave
           - apple,t8112-ave
           - apple,t8140-ave
