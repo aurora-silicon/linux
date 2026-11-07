@@ -58,38 +58,38 @@
 
 		gpu_fw_text: gpu-fw-text {
 			reg = <0 0 0 0>;
-			status = "disabled";
 			no-map;
+			status = "disabled";
 		};
 
 		gpu_fw_data: gpu-fw-data {
 			reg = <0 0 0 0>;
-			status = "disabled";
 			no-map;
+			status = "disabled";
 		};
 
 		uat_ttbs: uat-ttbs {
 			reg = <0 0 0 0>;
-			status = "disabled";
 			no-map;
+			status = "disabled";
 		};
 
 		uat_pagetables: uat-pagetables {
 			reg = <0 0 0 0>;
-			status = "disabled";
 			no-map;
+			status = "disabled";
 		};
 
 		uat_l2_pagetables: uat-l2-pagetables {
 			reg = <0 0 0 0>;
-			status = "disabled";
 			no-map;
+			status = "disabled";
 		};
 
 		uat_handoff: uat-handoff {
 			reg = <0 0 0 0>;
-			status = "disabled";
 			no-map;
+			status = "disabled";
 		};
 	};
 };

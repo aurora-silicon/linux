@@ -14,8 +14,8 @@
 };
 
 &ps_aic {
-	status = "okay";
 	apple,firmware-owned;
+	status = "okay";
 };
 
 &ps_dwi {
@@ -23,8 +23,8 @@
 };
 
 &ps_gpio {
-	status = "okay";
 	apple,firmware-owned;
+	status = "okay";
 };
 
 &ps_pmc {
@@ -80,18 +80,18 @@
 };
 
 &ps_dispext0_sys {
-	status = "okay";
 	apple,firmware-owned;
+	status = "okay";
 };
 
 &ps_dispext0_fe {
-	status = "okay";
 	apple,firmware-owned;
+	status = "okay";
 };
 
 &ps_dispext0_cpu {
-	status = "okay";
 	apple,firmware-owned;
+	status = "okay";
 };
 
 &ps_scodec {
@@ -103,13 +103,13 @@
 };
 
 &ps_disp_sys {
-	status = "okay";
 	apple,firmware-owned;
+	status = "okay";
 };
 
 &ps_disp_fe {
-	status = "okay";
 	apple,firmware-owned;
+	status = "okay";
 };
 
 &ps_gfx {
@@ -379,18 +379,18 @@
 };
 
 &ps_dispext1_sys {
-	status = "okay";
 	apple,firmware-owned;
+	status = "okay";
 };
 
 &ps_dispext1_fe {
-	status = "okay";
 	apple,firmware-owned;
+	status = "okay";
 };
 
 &ps_dispext1_cpu {
-	status = "okay";
 	apple,firmware-owned;
+	status = "okay";
 };
 
 /* The camera powers the ISP from its first stream until it is unbound. */
@@ -527,8 +527,8 @@
 };
 
 &ps_disp_cpu {
-	status = "okay";
 	apple,firmware-owned;
+	status = "okay";
 };
 
 &ps_debug_gated {
@@ -560,8 +560,8 @@
 };
 
 &ps_nub_gpio {
-	status = "okay";
 	apple,firmware-owned;
+	status = "okay";
 };
 
 &ps_nub_sram {
@@ -573,13 +573,13 @@
 };
 
 &ps_atc0_usb_aon {
-	status = "okay";
 	apple,inherited-on;
+	status = "okay";
 };
 
 &ps_atc1_usb_aon {
-	status = "okay";
 	apple,inherited-on;
+	status = "okay";
 };
 
 &ps_atc0_usb {

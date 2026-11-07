@@ -109,8 +109,8 @@
 		 */
 		gpu_fw_text: gpu-fw-text {
 			reg = <0 0 0 0>;
-			status = "disabled";
 			no-map;
+			status = "disabled";
 		};
 
 		/*
@@ -119,8 +119,8 @@
 		 */
 		gpu_fw_data: gpu-fw-data {
 			reg = <0 0 0 0>;
-			status = "disabled";
 			no-map;
+			status = "disabled";
 		};
 
 		/*
@@ -130,26 +130,26 @@
 		 */
 		uat_ttbs: uat-ttbs {
 			reg = <0 0 0 0>;
-			status = "disabled";
 			no-map;
+			status = "disabled";
 		};
 
 		uat_pagetables: uat-pagetables {
 			reg = <0 0 0 0>;
-			status = "disabled";
 			no-map;
+			status = "disabled";
 		};
 
 		uat_l2_pagetables: uat-l2-pagetables {
 			reg = <0 0 0 0>;
-			status = "disabled";
 			no-map;
+			status = "disabled";
 		};
 
 		uat_handoff: uat-handoff {
 			reg = <0 0 0 0>;
-			status = "disabled";
 			no-map;
+			status = "disabled";
 		};
 	};
 
@@ -334,12 +334,12 @@
 };
 
 &mesa {
-	status = "okay";
 	enable-gpios = <&pinctrl_nub 53 GPIO_ACTIVE_HIGH>;
 	interrupt-parent = <&pinctrl>;
 	interrupts = <116 IRQ_TYPE_EDGE_RISING>;
 	spi-cs-setup-delay-ns = <20>;
 	spi-cs-hold-delay-ns = <20>;
+	status = "okay";
 	/* The board file names the per-device factory data. */
 };
 

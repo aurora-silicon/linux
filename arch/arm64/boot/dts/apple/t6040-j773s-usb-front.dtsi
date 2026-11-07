@@ -33,7 +33,6 @@
 		mboxes = <&atcphy3_mbox>;
 		mbox-names = "phy-cpu";
 		nonposted-mmio;
-		status = "disabled";
 
 		apple,tunable-axi2af =
 			<0x0 0x800000ff 0x80000025>,
@@ -212,6 +211,7 @@
 			<0x44 0x00000004 0x00000004>;
 		apple,tunable-usb2-host =
 			<0x8 0x00007003 0x00000003>;
+		status = "disabled";
 	};
 
 	atcphy3_mbox: mailbox@39b148000 {
@@ -265,7 +265,6 @@
 		resets = <&atcphy3>;
 		phys = <&atcphy3 PHY_TYPE_USB2>, <&atcphy3 PHY_TYPE_USB3>;
 		phy-names = "usb2-phy", "usb3-phy";
-		status = "disabled";
 
 		apple,tunable-gbl-host =
 			<0x4 0x0001ef00 0x00002f00>,
@@ -289,5 +288,6 @@
 		apple,tunable-gbl-default =
 			<0x64 0x00000002 0x00000000>,
 			<0x10 0xfff80000 0x00680000>;
+		status = "disabled";
 	};
 };
