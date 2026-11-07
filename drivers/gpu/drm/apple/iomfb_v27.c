@@ -166,13 +166,75 @@ static const struct dcp_method_entry dcp_methods_27_2[dcpep_num_methods] = {
 	IOMFB_METHOD("A533", dcpep_register_dfb_surface),
 };
 
+/*
+ * Firmware 27.3: only the methods seen, with the request and reply sizes this
+ * driver uses, in a trace of the calls the macOS 27.3 display driver makes to
+ * the DCP of a J716s while it starts. Three are one above their 27.2 IDs
+ * (set_display_refresh_properties A526, flush_supports_power A529,
+ * register_dfb_surface A534) and create_default_fb is still A504, so 27.3 has
+ * one more method somewhere between those. That trace has no display client,
+ * so it has no mode set, swap or power state call, and the methods it does not
+ * show have no entry here. Until a trace shows them the table is incomplete
+ * and the driver does not start this firmware (iomfb_v27_missing_method()).
+ */
+static const struct dcp_method_entry dcp_methods_27_3[dcpep_num_methods] = {
+	IOMFB_METHOD("A000", dcpep_late_init_signal),
+	IOMFB_METHOD("A027", dcpep_setup_video_limits),
+	IOMFB_METHOD("A136", iomfbep_a131_pmu_service_matched),
+	IOMFB_METHOD("A137", iomfbep_a132_backlight_service_matched),
+	IOMFB_METHOD("A390", dcpep_set_create_dfb),
+	IOMFB_METHOD("A391", iomfbep_a358_vi_set_temperature_hint),
+	IOMFB_METHOD("A451", dcpep_start_signal),
+	IOMFB_METHOD("A504", dcpep_create_default_fb),
+	IOMFB_METHOD("A037", dcpep_get_dfb_compression_info),
+	IOMFB_METHOD("A036", dcpep_get_dfb_info),
+	IOMFB_METHOD("A103", dcpep_get_dfb_layout),
+	IOMFB_METHOD("A503", dcpep_get_dfb_state),
+	IOMFB_METHOD("A104", dcpep_set_dfb_dimensions),
+	IOMFB_METHOD("A105", dcpep_commit_dfb_info),
+	IOMFB_METHOD("A035", dcpep_dfb_query),
+	IOMFB_METHOD("A385", dcpep_dfb_ready_query),
+	IOMFB_METHOD("A353", dcpep_pipe_query_353),
+	IOMFB_METHOD("A526", dcpep_set_display_refresh_properties),
+	IOMFB_METHOD("A529", dcpep_flush_supports_power),
+	IOMFB_METHOD("A534", dcpep_register_dfb_surface),
+};
+
 const struct dcp_method_entry *iomfb_v27_methods(const char *compat)
 {
 	if (!strcmp(compat, "27.0.0"))
 		return dcp_methods_27_0;
 	if (!strcmp(compat, "27.2.0"))
 		return dcp_methods_27_2;
+	if (!strcmp(compat, "27.3.0"))
+		return dcp_methods_27_3;
 	return NULL;
+}
+
+/*
+ * The driver sends every method of the 27.0 table. dfb_ready_query is the one
+ * it leaves out for a build whose table has no ID for it (boot_5()). Return
+ * the name of the first other method @methods has no ID for, with their number
+ * in @count, or NULL if the table is complete. A method without an ID would go
+ * out with an empty tag, which the firmware answers with a panic, so a build
+ * with an incomplete table must not be started.
+ */
+const char *iomfb_v27_missing_method(const struct dcp_method_entry *methods,
+				     unsigned int *count)
+{
+	const char *first = NULL;
+	unsigned int i;
+
+	*count = 0;
+	for (i = 0; i < dcpep_num_methods; i++) {
+		if (!dcp_methods_27_0[i].tag[0] || methods[i].tag[0] ||
+		    i == dcpep_dfb_ready_query)
+			continue;
+		if (!first)
+			first = dcp_methods_27_0[i].name;
+		(*count)++;
+	}
+	return first;
 }
 
 /* The template's calls resolve through the table probe chose for this build. */
