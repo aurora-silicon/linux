@@ -181,8 +181,8 @@ static irqreturn_t stockholm_data_irq(int irq, void *data)
 		st->rx_waiting = false;
 		complete(&st->rx_done);
 	} else {
-		dev_dbg(&st->sdev->dev, "dropped NCI packet %02x %02x len %u\n",
-			hdr[0], hdr[1], plen);
+		dev_info(&st->sdev->dev, "TEST unsolicited NCI packet %02x %02x len %u: %*ph\n",
+			 hdr[0], hdr[1], plen, min_t(int, plen, 32), hdr + NCI_CTRL_HDR_SIZE);
 	}
 	mutex_unlock(&st->io_lock);
 
@@ -227,7 +227,7 @@ static irqreturn_t stockholm_error_irq(int irq, void *data)
 static int stockholm_nci_cmd(struct stockholm *st, u16 opcode,
 			     const u8 *payload, u8 plen)
 {
-	u8 cmd[NCI_CTRL_HDR_SIZE + 2] = {};
+	u8 cmd[NCI_CTRL_HDR_SIZE + 8] = {};
 	unsigned long left;
 	int ret;
 
@@ -299,12 +299,43 @@ static int stockholm_identify(struct stockholm *st)
 	if (len < tail + STOCKHOLM_INIT_RSP_MANUF_LEN)
 		return -EIO;
 
+	dev_info(dev, "TEST CORE_INIT_RSP %*ph\n", len, rsp);
 	dev_info(dev,
 		 "NCI %u.%u controller, manufacturer %#04x, firmware %08x, %u RF interfaces; parked off\n",
 		 version >> 4, version & 0xf, rsp[tail],
 		 get_unaligned_le32(&rsp[tail + 1]), n_rf);
 
 	return 0;
+}
+
+/* TEST ONLY (not for merge): one RF discovery attempt, statuses logged. */
+static void stockholm_test_rf(struct stockholm *st)
+{
+	struct device *dev = &st->sdev->dev;
+	/* 1 mapping: ISO-DEP protocol, poll+listen, ISO-DEP interface */
+	static const u8 map[] = { 1, 0x04, 0x03, 0x02 };
+	/* 1 configuration: NFC-A passive poll, every period */
+	static const u8 disc[] = { 1, 0x00, 0x01 };
+	static const u8 idle[] = { 0x00 };
+	static const u8 nomap[] = { 0 };
+	int len;
+
+	len = stockholm_nci_cmd(st, NCI_OP_RF_DISCOVER_MAP_CMD, map, sizeof(map));
+	dev_info(dev, "TEST RF_DISCOVER_MAP(1 map) -> %d status %02x\n", len,
+		 len > 0 ? st->rx_payload[0] : 0xff);
+	len = stockholm_nci_cmd(st, NCI_OP_RF_DISCOVER_MAP_CMD, nomap, 1);
+	dev_info(dev, "TEST RF_DISCOVER_MAP(0 maps) -> %d status %02x\n", len,
+		 len > 0 ? st->rx_payload[0] : 0xff);
+	len = stockholm_nci_cmd(st, NCI_OP_RF_DISCOVER_CMD, disc, sizeof(disc));
+	dev_info(dev, "TEST RF_DISCOVER(NFC-A poll) -> %d status %02x\n", len,
+		 len > 0 ? st->rx_payload[0] : 0xff);
+	if (len > 0 && st->rx_payload[0] == NCI_STATUS_OK) {
+		msleep(2000);
+		len = stockholm_nci_cmd(st, NCI_OP_RF_DEACTIVATE_CMD, idle, 1);
+		dev_info(dev, "TEST RF_DEACTIVATE(idle) -> %d status %02x\n",
+			 len, len > 0 ? st->rx_payload[0] : 0xff);
+		msleep(200);
+	}
 }
 
 static int stockholm_check_follower(struct stockholm *st)
@@ -390,6 +421,8 @@ static int stockholm_probe(struct spmi_device *sdev)
 		enable_irq(st->error_irq);
 		enable_irq(st->data_irq);
 		err = stockholm_identify(st);
+		if (!err)
+			stockholm_test_rf(st);
 		disable_irq(st->data_irq);
 		disable_irq(st->error_irq);
 		if (err)
