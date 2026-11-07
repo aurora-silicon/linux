@@ -5,6 +5,7 @@
 No ADT input is accepted. Install python3-libfdt (or pylibfdt) to read DTBs.
 --report permits MISSING entries for inventory, but still rejects broken paths,
 malformed manifests, missing DTBs and empty selections.
+With --baseline-manifest-dir and --baseline-dtb-dir, only coverage regressions fail.
 """
 
 import argparse
@@ -69,47 +70,83 @@ def manifest_entries(filename):
         raise ValueError(f"{filename}: empty manifest")
 
 
+def inventory(manifest, dtb, board):
+    paths = node_paths(dtb, board)
+    entries = list(manifest_entries(manifest))
+    counts = Counter(entry[3] for entry in entries)
+    broken = {entry[4] for entry in entries if entry[3] == "mapped" and entry[4] not in paths}
+    return entries, counts, broken
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest-dir", type=Path, default=Path(__file__).resolve().parents[2] /
                         "arch/arm64/boot/dts/apple/adt-coverage")
-    parser.add_argument("--dtb-dir", type=Path, required=True,
-                        help="directory containing <soc>-<board>.dtb (usually out/.../apple)")
-    parser.add_argument("--board", action="append", default=[],
-                        help="check this manifest stem; repeat for multiple boards")
-    parser.add_argument("--report", action="store_true", help="inventory MISSING without failing on it")
+    parser.add_argument("--dtb-dir", type=Path, required=True)
+    parser.add_argument("--board", action="append", default=[])
+    parser.add_argument("--report", action="store_true", help="permit MISSING, but reject broken paths")
+    parser.add_argument("--baseline-manifest-dir", type=Path,
+                        help="compare with these base manifests; an empty directory bootstraps from head")
+    parser.add_argument("--baseline-dtb-dir", type=Path, help="DTBs built at the base revision")
     args = parser.parse_args(argv)
+    if bool(args.baseline_manifest_dir) != bool(args.baseline_dtb_dir):
+        parser.error("both baseline directories are required")
+    if args.report and args.baseline_manifest_dir:
+        parser.error("--report and baseline comparison are separate modes")
     try:
         import libfdt
     except ImportError:
         parser.exit(2, "apple-adt-coverage: install python3-libfdt (pylibfdt)\n")
 
-    boards = args.board or sorted(p.stem for p in args.manifest_dir.glob("t*-*.txt"))
+    for directory in (args.manifest_dir, args.baseline_manifest_dir):
+        if directory is not None and not directory.is_dir():
+            parser.error(f"manifest directory does not exist: {directory}")
+
+    head_boards = {p.stem for p in args.manifest_dir.glob("t*-*.txt")}
+    base_boards = ({p.stem for p in args.baseline_manifest_dir.glob("t*-*.txt")}
+                   if args.baseline_manifest_dir else set())
+    boards = args.board or sorted(head_boards | base_boards)
     if not boards:
         parser.error("no board manifests selected")
-    errors = 0
+    errors = []
     for board in sorted(set(boards)):
         if not re.fullmatch(r"t[0-9]+-[a-z][a-zA-Z0-9]*", board):
-            print(f"invalid board name: {board}", file=sys.stderr)
-            errors += 1
+            errors.append(f"invalid board name: {board}")
             continue
         manifest = args.manifest_dir / (board + ".txt")
         try:
-            paths = node_paths(args.dtb_dir / (board + ".dtb"), board)
-            entries = list(manifest_entries(manifest))
-            counts = Counter(entry[3] for entry in entries)
-            for number, name, address, kind, target in entries:
-                if kind == "mapped" and target not in paths:
-                    print(f"{manifest}:{number}: absent DT path: {target}", file=sys.stderr)
-                    errors += 1
-                elif kind == "missing" and not args.report:
-                    print(f"{manifest}:{number}: MISSING: {name} {address}", file=sys.stderr)
-                    errors += 1
+            entries, counts, broken = inventory(manifest, args.dtb_dir / (board + ".dtb"), board)
             print(f"{board}: MISSING={counts['missing']} mapped={counts['mapped']} "
-                  f"waived={counts['waived']} total={len(entries)}")
+                  f"waived={counts['waived']} broken={len(broken)} total={len(entries)}")
+            if args.baseline_manifest_dir:
+                baseline = args.baseline_manifest_dir / (board + ".txt")
+                if not baseline.is_file():
+                    # First introduction: measure the same inventory against base
+                    # DTBs. Later runs always use the base's committed inventory.
+                    baseline = manifest
+                    print(f"{board}: bootstrapping baseline from head inventory")
+                old, before, old_broken = inventory(
+                    baseline, args.baseline_dtb_dir / (board + ".dtb"), board)
+                removed = {e[1] for e in old} - {e[1] for e in entries}
+                if removed:
+                    errors.append(f"{board}: removed inventory devices: " + ", ".join(sorted(removed)))
+                print(f"{board}: base MISSING={before['missing']} broken={len(old_broken)}; "
+                      f"head MISSING={counts['missing']} broken={len(broken)}")
+                if counts['missing'] > before['missing']:
+                    errors.append(f"{board}: MISSING increased {before['missing']} -> {counts['missing']}")
+                for target in sorted(broken - old_broken):
+                    errors.append(f"{board}: new absent DT path: {target}")
+            else:
+                for target in sorted(broken):
+                    errors.append(f"{board}: absent DT path: {target}")
+                if not args.report:
+                    for _, name, address, kind, _ in entries:
+                        if kind == "missing":
+                            errors.append(f"{board}: MISSING: {name} {address}")
         except (OSError, UnicodeError, ValueError, libfdt.FdtException) as error:
-            print(f"{board}: {error}", file=sys.stderr)
-            errors += 1
+            errors.append(f"{board}: {error}")
+    for error in errors:
+        print(error, file=sys.stderr)
     return int(bool(errors))
 
 

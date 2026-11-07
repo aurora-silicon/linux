@@ -94,6 +94,72 @@ class CoverageTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("t9999-k1: MISSING=0 mapped=1", result.stdout)
 
+    def baseline(self, text):
+        directory = self.root / "baseline"
+        directory.mkdir(exist_ok=True)
+        (directory / self.manifest.name).write_text(text)
+        return ("--baseline-manifest-dir", str(directory), "--baseline-dtb-dir", str(self.root))
+
+    def test_ratchet_accepts_backlog_and_reductions(self):
+        args = self.baseline("/x - -> MISSING\n/y - -> MISSING\n")
+        for text in ("/x - -> MISSING\n/y - -> MISSING\n",
+                     "/x - -> /soc\n/y - -> MISSING\n"):
+            result = self.run_check(text, *args)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_ratchet_rejects_more_missing_and_removed_entries(self):
+        args = self.baseline("/x - -> /soc\n/y - -> MISSING\n")
+        result = self.run_check("/x - -> MISSING\n/y - -> MISSING\n", *args)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("MISSING increased", result.stderr)
+        result = self.run_check("/x - -> /soc\n", *args)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("removed inventory devices", result.stderr)
+
+    def test_ratchet_rejects_removed_manifest_and_new_broken_paths(self):
+        args = self.baseline("/x - -> /soc\n")
+        self.assertEqual(self.run_check("/x - -> /gone\n", *args).returncode, 1)
+        self.manifest.unlink()
+        result = subprocess.run([sys.executable, str(CHECKER), "--manifest-dir", str(self.root),
+                                 "--dtb-dir", str(self.root), *args], capture_output=True)
+        self.assertEqual(result.returncode, 1)
+
+    def test_ratchet_compares_base_dtb_and_detects_node_removal(self):
+        args = self.baseline("/x - -> /soc/device@1000\n")
+        base_dtb = self.root / "old-dtb"
+        base_dtb.mkdir()
+        (base_dtb / "t9999-j1.dtb").write_bytes((self.root / "t9999-j1.dtb").read_bytes())
+        # The path remains in both inventories, but vanishes from the head DTB.
+        dts = self.root / "head.dts"
+        dts.write_text('/dts-v1/; / { compatible="apple,j1", "apple,t9999"; soc {}; };')
+        subprocess.run(["dtc", "-q", "-o", str(self.root / "t9999-j1.dtb"), str(dts)], check=True)
+        result = self.run_check("/x - -> /soc/device@1000\n", *args[:-1], str(base_dtb))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("new absent DT path", result.stderr)
+
+    def test_ratchet_existing_broken_path_is_backlog(self):
+        args = self.baseline("/x - -> /old-gap\n")
+        result = self.run_check("/x - -> /old-gap\n", *args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_ratchet_bootstrap_uses_head_inventory_and_base_dtb(self):
+        directory = self.root / "baseline"
+        directory.mkdir()
+        result = self.run_check("/x - -> MISSING\n/y - -> /soc\n",
+                                "--baseline-manifest-dir", str(directory),
+                                "--baseline-dtb-dir", str(self.root))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("bootstrapping", result.stdout)
+
+    def test_ratchet_validates_baseline_and_options(self):
+        args = self.baseline("invalid\n")
+        self.assertEqual(self.run_check("/x - -> /soc\n", *args).returncode, 1)
+        self.assertEqual(self.run_check("/x - -> /soc\n", *args, "--report").returncode, 2)
+        self.assertEqual(self.run_check("/x - -> /soc\n", *args[:2]).returncode, 2)
+        self.assertEqual(self.run_check("/x - -> /soc\n", "--baseline-manifest-dir",
+                                       str(self.root / "absent"), "--baseline-dtb-dir",
+                                       str(self.root)).returncode, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

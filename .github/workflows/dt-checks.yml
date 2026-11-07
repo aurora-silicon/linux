@@ -51,11 +51,12 @@ jobs:
       - name: Install the tools
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q flex bison bc libyaml-dev clang-$CLANG_VERSION lld-$CLANG_VERSION llvm-$CLANG_VERSION
+          sudo apt-get install -y -q flex bison bc libyaml-dev clang-$CLANG_VERSION lld-$CLANG_VERSION llvm-$CLANG_VERSION swig device-tree-compiler
           echo "/usr/lib/llvm-$CLANG_VERSION/bin" >> "$GITHUB_PATH"
-          pip install --quiet dtschema yamllint
+          pip install --quiet dtschema yamllint pylibfdt
 
       - name: CHECK_DTBS and dt_binding_check, base vs head
+        id: dt
         env:
           EVENT: ${{ github.event_name }}
           BEFORE: ${{ github.event.before }}
@@ -65,7 +66,28 @@ jobs:
           # HEAD^1 (pull_request.base.sha can be the stale tip from when the PR was opened).
           if [ "$EVENT" = pull_request ]; then base=$(git rev-parse HEAD^1); else base=$BEFORE; fi
           if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then base=$(git rev-parse HEAD~1); fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
           scripts/dtc/apple-dt-check.sh "$base" "$head" "$RUNNER_TEMP/dt"
+
+      - name: ADT coverage, base vs head
+        if: ${{ !cancelled() && steps.dt.outputs.base != '' }}
+        env:
+          BASE: ${{ steps.dt.outputs.base }}
+        run: |
+          python3 scripts/dtc/apple-adt-coverage-test.py
+          for board in t6040-j616s t8140-j700 t6000-j316s t8112-j413; do
+            test -s "arch/arm64/boot/dts/apple/adt-coverage/$board.txt"
+          done
+          manifests=arch/arm64/boot/dts/apple/adt-coverage
+          mkdir -p "$RUNNER_TEMP/dt/manifests-base"
+          if git cat-file -e "$BASE:$manifests" 2>/dev/null; then
+            git archive "$BASE:$manifests" | tar -x -C "$RUNNER_TEMP/dt/manifests-base"
+          fi
+          python3 scripts/dtc/apple-adt-coverage.py \
+            --dtb-dir "$RUNNER_TEMP/dt/out-head/arch/arm64/boot/dts/apple" \
+            --baseline-dtb-dir "$RUNNER_TEMP/dt/out-base/arch/arm64/boot/dts/apple" \
+            --baseline-manifest-dir "$RUNNER_TEMP/dt/manifests-base" \
+            2>&1 | tee "$RUNNER_TEMP/dt/coverage.log"
 
       - name: Keep the warning lists
         if: always()
@@ -74,4 +96,5 @@ jobs:
           name: dt-check-warnings
           path: |
             ${{ runner.temp }}/dt/*.warn
+            ${{ runner.temp }}/dt/coverage.log
           if-no-files-found: ignore
