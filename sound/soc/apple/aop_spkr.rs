@@ -62,7 +62,9 @@
 use core::{
     ffi::c_void,
     mem, ptr, slice,
-    sync::atomic::{fence, AtomicBool, AtomicI32, AtomicPtr, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{
+        fence, AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU64, AtomicUsize, Ordering,
+    },
 };
 
 use kernel::{
@@ -400,11 +402,30 @@ impl Service {
 }
 
 const SENSE_FRAME_BYTES: usize = SENSE_CHANNELS as usize * 2;
-/// 10 ms periods, eight of them: whole frames, so ring offsets on period edges stay on frames.
-const SENSE_RING_PERIOD_BYTES: usize = 480 * SENSE_FRAME_BYTES;
-const SENSE_RING_BYTES: usize = 8 * SENSE_RING_PERIOD_BYTES;
-/// SNDRV_PCM_STATE_RUNNING (a cast macro the bindings do not carry).
+/// 2.5 ms periods (120 frames at 48 kHz), 32 of them: the same 80 ms ring, delivered in chunks
+/// small enough that a 512-frame front-end period completes within 2.5 ms of its last frame.
+/// Whole frames, so ring offsets on period edges stay on frames.
+const SENSE_RING_PERIOD_BYTES: usize = 120 * SENSE_FRAME_BYTES;
+const SENSE_RING_BYTES: usize = 32 * SENSE_RING_PERIOD_BYTES;
+/// The sense rate (see the front-ends' `rate_min`/`rate_max`).
+const SENSE_RATE: u64 = 48000;
+const NSEC_PER_SEC: u64 = 1_000_000_000;
+/// The ring's and one ring period's length in time.
+const SENSE_RING_NS: u64 =
+    (SENSE_RING_BYTES / SENSE_FRAME_BYTES) as u64 * NSEC_PER_SEC / SENSE_RATE;
+const SENSE_RING_PERIOD_NS: u64 =
+    (SENSE_RING_PERIOD_BYTES / SENSE_FRAME_BYTES) as u64 * NSEC_PER_SEC / SENSE_RATE;
+/// SNDRV_PCM_STATE_RUNNING and _XRUN (cast macros the bindings do not carry).
 const PCM_STATE_RUNNING: bindings::snd_pcm_state_t = 3;
+const PCM_STATE_XRUN: bindings::snd_pcm_state_t = 4;
+
+/// The ring may have gone round once or more in `elapsed_ns` since the last callback: its
+/// position alone cannot tell a lap from no advance, or two laps from one. The DMA runs at the
+/// sense rate and its reported position lags it by less than a ring period, so a lap needs at
+/// least the ring's time less a period.
+fn sense_ring_may_lap(elapsed_ns: i64) -> bool {
+    elapsed_ns < 0 || elapsed_ns as u64 + SENSE_RING_PERIOD_NS >= SENSE_RING_NS
+}
 
 /// The driver-owned sense capture (base-ns ADMAC RX0): a cyclic ring armed before every `pwrd`,
 /// so ring offset 0 is slot 0 of a frame and every whole-frame offset is a frame start.
@@ -418,6 +439,8 @@ struct SenseRing {
     cookie: AtomicI32,
     /// Ring offset (a whole frame) up to which the callback has consumed the data.
     done: AtomicUsize,
+    /// When `done` was last moved (or the ring started), CLOCK_MONOTONIC ns.
+    done_at: AtomicI64,
     /// The attached sense front-end, or null; cleared under that front-end's stream lock, which
     /// the callback holds while it uses the front-end.
     sub: AtomicPtr<bindings::snd_pcm_substream>,
@@ -435,6 +458,7 @@ impl SenseRing {
             handle: AtomicU64::new(0),
             cookie: AtomicI32::new(0),
             done: AtomicUsize::new(0),
+            done_at: AtomicI64::new(0),
             sub: AtomicPtr::new(ptr::null_mut()),
             fe_pos: AtomicUsize::new(0),
             fe_running: AtomicBool::new(false),
@@ -503,6 +527,8 @@ impl SenseRing {
             (*desc).callback = Some(sense_ring_done);
             (*desc).callback_param = ptr::from_ref(self).cast_mut().cast();
             self.done.store(0, Ordering::Release);
+            // SAFETY: no preconditions.
+            self.done_at.store(bindings::ktime_get(), Ordering::Release);
             let cookie = ((*desc).tx_submit.ok_or(EIO)?)(desc);
             if cookie < 0 {
                 return Err(Error::from_errno(cookie));
@@ -634,10 +660,34 @@ impl SenseRing {
             // Once per completed period, as ALSA's interrupt accounting expects: it treats a call
             // that advanced less than a period, some jiffies after the last one, as a missed
             // buffer wrap (and the sense front-end's rate is 0 until a playback sets it, which
-            // makes that window two jiffies), so a period longer than the ring's 10 ms overran.
+            // makes that window two jiffies), so a period longer than one ring chunk overran.
             if first / period.max(1) != pos / period.max(1) {
                 // SAFETY: a running, attached front-end, under its stream lock.
                 unsafe { bindings::snd_pcm_period_elapsed_under_stream_lock(sub) };
+            }
+        }
+        // SAFETY: locked above.
+        unsafe { bindings::snd_pcm_stream_unlock_irqrestore(sub, flags) };
+    }
+
+    /// The ring may have lapped since the last callback: the frames since then are lost or
+    /// overwritten, and delivering what the position shows would shift the sense against the
+    /// playback without a sign. Stop a running front-end with an XRUN instead.
+    ///
+    /// # Safety
+    ///
+    /// As for [`SenseRing::deliver`].
+    unsafe fn lost(&self, sub: *mut bindings::snd_pcm_substream) {
+        // SAFETY: as in `deliver`.
+        let flags = unsafe { bindings::_snd_pcm_stream_lock_irqsave(sub) };
+        if self.sub.load(Ordering::Acquire) == sub && self.fe_running.load(Ordering::Relaxed) {
+            // SAFETY: an attached front-end, under its stream lock; its runtime lives until
+            // after its close.
+            let rt = unsafe { (*sub).runtime };
+            // SAFETY: as above.
+            if !rt.is_null() && unsafe { (*rt).state } == PCM_STATE_RUNNING {
+                // SAFETY: a running front-end, under its stream lock.
+                unsafe { bindings::snd_pcm_stop(sub, PCM_STATE_XRUN) };
             }
         }
         // SAFETY: locked above.
@@ -672,6 +722,8 @@ unsafe extern "C" fn sense_ring_done(param: *mut c_void) {
             None => return,
         }
     };
+    // SAFETY: no preconditions.
+    let now_ns = unsafe { bindings::ktime_get() };
     let residue = state.residue as usize;
     if status == bindings::dma_status_DMA_ERROR || residue > SENSE_RING_BYTES {
         return;
@@ -681,11 +733,20 @@ unsafe extern "C" fn sense_ring_done(param: *mut c_void) {
     let now =
         (SENSE_RING_BYTES - residue) % SENSE_RING_BYTES / SENSE_FRAME_BYTES * SENSE_FRAME_BYTES;
     let from = ring.done.swap(now, Ordering::AcqRel);
+    let last_ns = ring.done_at.swap(now_ns, Ordering::AcqRel);
+    let sub = ring.sub.load(Ordering::Acquire);
+    // An exact lap shows no advance, and a longer one only the remainder.
+    if sense_ring_may_lap(now_ns - last_ns) {
+        if !sub.is_null() {
+            // SAFETY: a substream the ring had attached (`lost` re-checks under its lock).
+            unsafe { ring.lost(sub) };
+        }
+        return;
+    }
     let bytes = (now + SENSE_RING_BYTES - from) % SENSE_RING_BYTES;
     if bytes == 0 {
         return;
     }
-    let sub = ring.sub.load(Ordering::Acquire);
     if !sub.is_null() {
         // SAFETY: a substream the ring had attached (`deliver` re-checks under its lock).
         unsafe { ring.deliver(sub, from, bytes) };
@@ -1682,3 +1743,45 @@ impl SpeakerComponent {
 unsafe impl Send for SpeakerComponent {}
 // SAFETY: as above.
 unsafe impl Sync for SpeakerComponent {}
+
+#[kunit_tests(apple_aop_sense_ring)]
+mod tests {
+    use super::*;
+
+    const fn frames_ns(frames: u64) -> i64 {
+        (frames * NSEC_PER_SEC / SENSE_RATE) as i64
+    }
+
+    const RING_FRAMES: u64 = (SENSE_RING_BYTES / SENSE_FRAME_BYTES) as u64;
+    const PERIOD_FRAMES: u64 = (SENSE_RING_PERIOD_BYTES / SENSE_FRAME_BYTES) as u64;
+
+    #[test]
+    fn the_usual_cadence_is_no_lap() {
+        assert!(!sense_ring_may_lap(0));
+        assert!(!sense_ring_may_lap(frames_ns(PERIOD_FRAMES)));
+        // A tasklet tens of milliseconds late still reads every frame.
+        assert!(!sense_ring_may_lap(frames_ns(RING_FRAMES / 2)));
+        assert!(!sense_ring_may_lap(
+            frames_ns(RING_FRAMES - PERIOD_FRAMES) - 1
+        ));
+    }
+
+    #[test]
+    fn a_lap_or_more_is_caught() {
+        assert!(sense_ring_may_lap(frames_ns(RING_FRAMES - PERIOD_FRAMES)));
+        // Exactly one lap: the position has not moved.
+        assert!(sense_ring_may_lap(frames_ns(RING_FRAMES)));
+        // Two and a bit: the position shows only the bit.
+        assert!(sense_ring_may_lap(frames_ns(
+            2 * RING_FRAMES + PERIOD_FRAMES
+        )));
+        // A clock that went back: assume the worst.
+        assert!(sense_ring_may_lap(-1));
+    }
+
+    #[test]
+    fn the_ring_is_80_ms_of_2_5_ms_periods() {
+        assert_eq!(SENSE_RING_NS, 80_000_000);
+        assert_eq!(SENSE_RING_PERIOD_NS, 2_500_000);
+    }
+}

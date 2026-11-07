@@ -481,6 +481,32 @@
 
 &i2c2 {
 	status = "okay";
+
+	usb_repeater: phy@21 {
+		compatible = "ti,cd2e22";
+		reg = <0x21>;
+		#phy-cells = <0>;
+		ti,port = <0>;
+
+		/* apple,tunable is filled from usb-repeater-i2c by the bootloader. */
+	};
+
+	usb_hub_i2c: usb-hub@2c {
+		compatible = "via,vl122";
+		reg = <0x2c>;
+		reset-gpios = <&pinctrl_ap 142 GPIO_ACTIVE_HIGH>;
+		usb-hub = <&vl122_hub>;
+
+		/*
+		 * apple,tunable-vl, apple,tunable-vlf0 and apple,tunable-gl are
+		 * filled from usb-hub-i2c by the bootloader.
+		 */
+	};
+};
+
+&atcphy0 {
+	phys = <&usb_repeater>;
+	phy-names = "eusb2-repeater";
 };
 
 &qspi {
@@ -1792,7 +1818,7 @@
 	#address-cells = <1>;
 	#size-cells = <0>;
 
-	hub@1 {
+	vl122_hub: hub@1 {
 		compatible = "usb2109,2122";
 		reg = <1>;
 
