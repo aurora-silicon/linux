@@ -23,6 +23,9 @@ properties:
       - items:
           - const: apple,t8140-debug-port
           - const: apple,debug-port
+      - items:
+          - const: apple,t6000-debug-port
+          - const: apple,debug-port
 
   swclk-gpios:
     maxItems: 1

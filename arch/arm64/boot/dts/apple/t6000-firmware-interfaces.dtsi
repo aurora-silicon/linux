@@ -11,4 +11,8 @@
 		compatible = "apple,t6000-sac-manager", "apple,sac-manager";
 		status = "disabled";
 	};
+	nub_swd0: debug-port {
+		compatible = "apple,t6000-debug-port", "apple,debug-port";
+		status = "disabled";
+	};
 };
