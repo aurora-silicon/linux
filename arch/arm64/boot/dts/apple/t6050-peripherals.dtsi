@@ -518,6 +518,7 @@
 		power-domains = <&ps_sio>;
 		status = "disabled";
 	};
+#if defined(T6050_J775C) || defined(T6050_J775D) || defined(T6050_J873S) || defined(T6050_K114C) || defined(T6050_K114S) || defined(T6050_K116C) || defined(T6050_K116S)
 	ps_fpwm1: power-controller@2b0 {
 		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x2b0 4>;
@@ -527,6 +528,7 @@
 		power-domains = <&ps_sio>;
 		status = "disabled";
 	};
+#endif
 	ps_fpwm2: power-controller@2b8 {
 		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x2b8 4>;
@@ -679,6 +681,7 @@
 		label = "ane-cpu";
 		status = "disabled";
 	};
+#if defined(T6050_J775C) || defined(T6050_J775D) || defined(T6050_J873S)
 	ps_dptx_phy: power-controller@3f8 {
 		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x3f8 4>;
@@ -687,6 +690,7 @@
 		label = "dptx-phy";
 		status = "disabled";
 	};
+#endif
 };
 
 &pmgr2 {
@@ -1343,7 +1347,7 @@
 		reg = <0x5 0x5040000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 1384 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 1385 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_fpwm0>, <&ps_fpwm1>;
+		power-domains = <&ps_fpwm0>, <&ps_sio>;
 		#pwm-cells = <2>;
 		status = "disabled";
 	};
