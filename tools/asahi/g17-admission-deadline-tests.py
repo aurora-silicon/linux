@@ -37,12 +37,14 @@ static MODE:AtomicUsize=AtomicUsize::new(0);
 mod g17 {pub fn now_ns()->u64 {crate::NOW.load(crate::Ordering::SeqCst)}}
 mod kernel {pub mod time {pub fn msecs_to_jiffies(ms:u32)->u64 {u64::from(ms)}}}
 mod hazard {pub const WAIT_MS:u32=1000;}
+mod cfg {pub const RENDER_SLOTS:usize=2;}
 const QUARANTINE_WAIT_MS:u32=1000;
 #[derive(Clone,Copy,PartialEq)] enum Plan {Any,Conflict}
 #[derive(Clone,Copy)] struct Request<'a>(&'a ());
-struct State {owners:[u64;2],quarantined:u64,spared:u64,next_ticket:u64,waiters:usize,conflict:bool,ready:bool}
+struct State {owners:[u64;cfg::RENDER_SLOTS],quarantined:u64,spared:u64,next_ticket:u64,waiters:usize,conflict:bool,ready:bool}
 impl State {
  fn exhausted(&self)->bool {false}
+''' + item(source, 'fn owner_quarantine(') + r'''
  fn refusal(&self,_:u64)->Result {Ok(())}
  fn plan(&self,_:u64,_:Option<Request<'_>>,_:Option<u64>)->Plan {if self.conflict {Plan::Conflict}else{Plan::Any}}
  fn pick(&mut self,_:u64,_:Plan)->Option<u8> {if self.ready{Some(1)}else{None}}

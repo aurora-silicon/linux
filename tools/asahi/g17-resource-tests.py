@@ -33,7 +33,7 @@ def admission_tests(root, source):
     macro_rules! resource_exhausted { ($s:literal)=>{ENOSPC}; }
     type KVec<T> = Vec<T>; struct InFlight;
     mod cfg {\n'''+constants+'}\n'+limits+'\n'
-    methods=['const fn new','fn exhausted','fn refusal','fn advance','fn take_idle','fn acquire','fn claim_sibling','fn reassign_unused_spare','fn warmable_sibling','fn borrow_warm_sibling','fn cancel_empty_slot','fn release']
+    methods=['const fn new','fn exhausted','fn owner_quarantine','fn refusal','fn advance','fn take_idle','fn acquire','fn claim_sibling','fn reassign_unused_spare','fn warmable_sibling','fn borrow_warm_sibling','fn cancel_empty_slot','fn release']
     code=header+item('struct State')+'\nimpl State {\n'+re.search(r'    const MASK: u64 = .*;',s).group(0)+'\n'+'\n'.join(item(n) for n in methods)+'\n}\n'+'''
     fn main(){
      if cfg::RENDER_PAIRS_PER_OWNER == 1 {
