@@ -80,3 +80,32 @@
 &jpeg1 {
 	status = "okay";
 };
+
+&debug_port2 {
+	swclk-gpios = <&pinctrl_ap 42 GPIO_ACTIVE_HIGH>;
+	swdio-gpios = <&pinctrl_ap 43 GPIO_ACTIVE_HIGH>;
+};
+
+&i2c4 {
+	sd_card_control: card-control@20 {
+		compatible = "apple,t6041-sd-card-control", "apple,sd-card-control";
+		reg = <0x20>;
+		status = "disabled";
+	};
+};
+
+&i2c8 {
+	display_pcon: display-converter@8 {
+		compatible = "apple,t6041-display-pcon", "apple,display-pcon";
+		reg = <0x8>;
+		status = "disabled";
+	};
+};
+
+&spi4 {
+	tcon: panel-controller@0 {
+		compatible = "parade,dp855";
+		reg = <0>;
+		status = "disabled";
+	};
+};

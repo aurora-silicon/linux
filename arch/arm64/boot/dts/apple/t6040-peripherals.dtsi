@@ -280,3 +280,38 @@
 	};
 };
 
+
+/ {
+
+	/* ADT /arm-io/mtp-aop-mux; no qualified host transport/ownership contract. */
+	hid_mux: hid-transport-mux {
+		compatible = "apple,t6041-hid-transport-mux", "apple,hid-transport-mux";
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/apple-processor-trace; no qualified host transport/ownership contract. */
+	processor_trace: processor-trace {
+		compatible = "apple,t6041-processor-trace", "apple,processor-trace";
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/aod2; no qualified host transport/ownership contract. */
+	debug_port2: debug-port-2 {
+		compatible = "apple,t6041-debug-port", "apple,debug-port";
+		status = "disabled";
+	};
+
+	/* ADT /sacm; no qualified host transport/ownership contract. */
+	sac_manager: sac-manager {
+		compatible = "apple,t6041-sac-manager", "apple,sac-manager";
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/dcp0-sac-controller; no qualified host transport/ownership contract. */
+	sac_controller: sac-controller {
+		compatible = "apple,t6041-sac-controller", "apple,sac-controller";
+		apple,manager = <&sac_manager>;
+		status = "disabled";
+	};
+};
+

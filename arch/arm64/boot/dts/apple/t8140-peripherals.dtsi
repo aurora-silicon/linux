@@ -412,3 +412,118 @@
 		status = "disabled";
 	};
 };
+
+/ {
+
+	/* ADT /arm-io/mtp-aop-mux; no qualified host transport/ownership contract. */
+	hid_mux: hid-transport-mux {
+		compatible = "apple,t8140-hid-transport-mux", "apple,hid-transport-mux";
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/apple-processor-trace; no qualified host transport/ownership contract. */
+	processor_trace: processor-trace {
+		compatible = "apple,t8140-processor-trace", "apple,processor-trace";
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/aod2; no qualified host transport/ownership contract. */
+	debug_port2: debug-port-2 {
+		compatible = "apple,t8140-debug-port", "apple,debug-port";
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/aod3; no qualified host transport/ownership contract. */
+	debug_port3: debug-port-3 {
+		compatible = "apple,t8140-debug-port", "apple,debug-port";
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/aod4; no qualified host transport/ownership contract. */
+	debug_port4: debug-port-4 {
+		compatible = "apple,t8140-debug-port", "apple,debug-port";
+		status = "disabled";
+	};
+
+	/* ADT /sacm; no qualified host transport/ownership contract. */
+	sac_manager: sac-manager {
+		compatible = "apple,t8140-sac-manager", "apple,sac-manager";
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/dcp-sac-controller; no qualified host transport/ownership contract. */
+	sac_controller: sac-controller {
+		compatible = "apple,t8140-sac-controller", "apple,sac-controller";
+		apple,manager = <&sac_manager>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/nco; no qualified host transport/ownership contract. */
+	nco_service: nco-service {
+		compatible = "apple,t8140-nco-service", "apple,nco-service";
+		clocks = <&peripheral_clocks 377>, <&peripheral_clocks 378>, <&peripheral_clocks 375>, <&peripheral_clocks 376>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/exdisplaypipe; no qualified host transport/ownership contract. */
+	secure_display_pipe: secure-display-pipe {
+		compatible = "apple,t8140-secure-display-pipe", "apple,secure-display-pipe";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 739 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 740 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 741 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 691 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&disp0_dart 3>, <&disp0_dart 4>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/isp-exclave-proxy; no qualified host transport/ownership contract. */
+	isp_service_proxy: isp-service-proxy {
+		compatible = "apple,t8140-isp-service-proxy", "apple,isp-service-proxy";
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/audio-hp-mic-proxy; no qualified host transport/ownership contract. */
+	audio_mic_proxy: audio-mic-proxy {
+		compatible = "apple,t8140-audio-mic-proxy", "apple,audio-mic-proxy";
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/audio-shared-dart-proxy; no qualified host transport/ownership contract. */
+	audio_dart_proxy: audio-dart-proxy {
+		compatible = "apple,t8140-audio-dart-proxy", "apple,audio-dart-proxy";
+		iommus = <&aop_dart 9>, <&aop_dart 11>;
+		status = "disabled";
+	};
+
+	/* ADT /dock-debug-wireless; no qualified host transport/ownership contract. */
+	wireless_debug_dock: wireless-debug-dock {
+		compatible = "apple,t8140-wireless-debug-dock", "apple,wireless-debug-dock";
+		status = "disabled";
+	};
+
+	/* ADT /dock-connect; no qualified host transport/ownership contract. */
+	debug_dock: debug-dock@3082d8008 {
+		compatible = "apple,t8140-debug-dock", "apple,debug-dock";
+		reg = <0x3 0x082d8008 0x0 0x4>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 303 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 304 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+};
+
+/ {
+	/* ADT /arm-io/eic named MMIO apertures are absolute addresses. */
+	eic: secure-controller@340700000 {
+		compatible = "apple,t8140-eic", "apple,eic";
+		reg = <0x3 0x40700000 0x0 0x18000>,
+		      <0x3 0x63b50000 0x0 0x8000>,
+		      <0x3 0x5a000000 0x0 0x4000>,
+		      <0x3 0xc5040000 0x0 0xc000>,
+		      <0x3 0x482a8000 0x0 0x4000>,
+		      <0x3 0x482b0000 0x0 0x4000>;
+		reg-names = "ps", "wd-isp", "gpio", "fpwm", "gltb", "wd-e";
+		status = "disabled";
+	};
+};
