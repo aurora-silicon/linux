@@ -3,7 +3,7 @@
 //! Work-based firmware performance effort. Idle power gating is managed separately by the
 //! device-control ring; this input never keeps an otherwise idle GPU powered.
 
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 pub(super) const FULL_EFFORT: u32 = 0x10000;
 pub(super) const IDLE_HOLD_NS: u64 = 16_000_000;
@@ -351,6 +351,53 @@ unsafe extern "C" {
     fn asahi_clpc_gpu_get(dev: *mut core::ffi::c_void, out: *mut *mut core::ffi::c_void) -> core::ffi::c_int;
     fn asahi_clpc_gpu_set_active(gpu: *mut core::ffi::c_void, active: bool);
     fn asahi_clpc_gpu_put(gpu: *mut core::ffi::c_void);
+    fn asahi_g17_light_effort() -> u32;
+    fn asahi_g17_light_param(which: core::ffi::c_uint) -> core::ffi::c_uint;
+    fn asahi_clpc_gpu_set_busy(gpu: *mut core::ffi::c_void, permille: core::ffi::c_uint);
+}
+
+/// Busy-share window: long enough to span frames, short enough to follow a burst.
+const BUSY_WINDOW_NS: u64 = 200_000_000;
+/// A longer gap between reports was idle: start over rather than average it in.
+const BUSY_WINDOW_MAX_NS: u64 = 2_000_000_000;
+static BUSY_WINDOW_START: AtomicU64 = AtomicU64::new(0);
+static BUSY_WINDOW_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// A window under this share (permille) with no long job is quiet.
+/// Consecutive quiet windows needed to go light.
+const LIGHT_WINDOWS: u32 = 4;
+static LIGHT: AtomicBool = AtomicBool::new(false);
+static QUIET_WINDOWS: AtomicU32 = AtomicU32::new(0);
+
+/// The effort for the next submission: light once the GPU has been quiet for a while.
+pub(super) fn submission_effort() -> u32 {
+    // SAFETY: reads a module parameter.
+    let light = unsafe { asahi_g17_light_effort() };
+    if LIGHT.load(Ordering::Relaxed) && light != 0 {
+        light
+    } else {
+        FULL_EFFORT
+    }
+}
+
+fn light_param(which: u32) -> u64 {
+    // SAFETY: a plain read of a module parameter.
+    u64::from(unsafe { asahi_g17_light_param(which) })
+}
+
+fn light_step(permille: u64, longest_ns: u64) {
+    if LIGHT.load(Ordering::Relaxed) {
+        if permille >= light_param(1) || longest_ns >= light_param(3) * 1000 {
+            LIGHT.store(false, Ordering::Relaxed);
+            QUIET_WINDOWS.store(0, Ordering::Relaxed);
+        }
+    } else if permille < light_param(0) && longest_ns < light_param(2) * 1000 {
+        if QUIET_WINDOWS.fetch_add(1, Ordering::Relaxed) + 1 >= LIGHT_WINDOWS {
+            LIGHT.store(true, Ordering::Relaxed);
+        }
+    } else {
+        QUIET_WINDOWS.store(0, Ordering::Relaxed);
+    }
 }
 
 /// DT-selected memory-demand provider. Its independent allocation outlives a
@@ -377,6 +424,29 @@ impl Demand {
     pub(super) fn set_active(&self, active: bool) {
         // SAFETY: the retained reference is live; NULL denotes no DT provider.
         unsafe { asahi_clpc_gpu_set_active(self.0, active) };
+    }
+
+    /// Reports the share of the last window the GPU spent executing, once a window has run.
+    /// Racing submitters can only lose one window's report.
+    pub(super) fn report_busy(&self, now_ns: u64) {
+        let start = BUSY_WINDOW_START.load(Ordering::Relaxed);
+        let elapsed = now_ns.saturating_sub(start);
+        if elapsed < BUSY_WINDOW_NS {
+            return;
+        }
+        let total = crate::usage::TOTAL_NS.load(Ordering::Relaxed);
+        let busy = total.saturating_sub(BUSY_WINDOW_TOTAL.swap(total, Ordering::Relaxed));
+        BUSY_WINDOW_START.store(now_ns, Ordering::Relaxed);
+        if start == 0 || elapsed > BUSY_WINDOW_MAX_NS {
+            return;
+        }
+        let permille = busy.saturating_mul(1000) / elapsed;
+        light_step(permille, crate::usage::MAX_NS.swap(0, Ordering::Relaxed));
+        // Full effort does the same work in about half the time; report the share in light
+        // effort's terms so that one memory ladder fits both.
+        let scaled = if LIGHT.load(Ordering::Relaxed) { permille } else { permille * 2 };
+        // SAFETY: the retained reference is live; NULL denotes no DT provider.
+        unsafe { asahi_clpc_gpu_set_busy(self.0, scaled.min(1000) as core::ffi::c_uint) };
     }
 }
 
