@@ -13,36 +13,119 @@ description: |
   DWI hardware register window and interrupt. Register programming and
   firmware ownership must be qualified before enabling the controller.
 
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6030-dwi
+          - apple,t6031-dwi
+          - apple,t6032-dwi
+          - apple,t6041-dwi
+          - apple,t8122-dwi
+          - apple,t8132-dwi
+          - apple,t8140-dwi
+  required:
+    - compatible
+
 properties:
-  compatible:
-    oneOf:
-      - items:
-          - const: apple,t6041-dwi
-          - const: apple,dwi
-      - items:
-          - const: apple,t8140-dwi
-          - const: apple,dwi
-      - items:
-          - enum:
-              - apple,t8122-dwi
-              - apple,t6030-dwi
-              - apple,t6031-dwi
-          - const: apple,dwi
+  compatible: true
 
-  reg:
-    maxItems: 1
-    description: Register apertures in hardware-description order.
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8132-dwi
+      required:
+        - compatible
+    then:
+      properties:
+        compatible:
+          items:
+            - enum:
+                - apple,t8132-dwi
+            - const: apple,dwi
 
-  interrupts:
-    maxItems: 1
+        reg:
+          maxItems: 1
 
-  power-domains:
-    maxItems: 1
+        interrupts:
+          maxItems: 1
 
-required:
-  - compatible
-  - reg
-  - interrupts
-  - power-domains
+        power-domains:
+          maxItems: 1
 
-additionalProperties: false
+      required:
+        - compatible
+        - reg
+        - interrupts
+        - power-domains
+    else:
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t6032-dwi
+            required:
+              - compatible
+          then:
+            properties:
+              compatible:
+                items:
+                  - const: apple,t6032-dwi
+                  - const: apple,dwi
+
+              reg:
+                maxItems: 1
+
+              interrupts:
+                maxItems: 1
+
+              power-domains:
+                maxItems: 1
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - power-domains
+          else:
+            properties:
+              compatible:
+                oneOf:
+                  - items:
+                      - const: apple,t6041-dwi
+                      - const: apple,dwi
+                  - items:
+                      - const: apple,t8140-dwi
+                      - const: apple,dwi
+                  - items:
+                      - enum:
+                          - apple,t8122-dwi
+                          - apple,t6030-dwi
+                          - apple,t6031-dwi
+                      - const: apple,dwi
+
+              reg:
+                maxItems: 1
+                description: Register apertures in hardware-description order.
+
+              interrupts:
+                maxItems: 1
+
+              power-domains:
+                maxItems: 1
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - power-domains
+
+            additionalProperties: false
+
+unevaluatedProperties: false
