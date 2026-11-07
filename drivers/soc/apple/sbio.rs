@@ -2795,7 +2795,9 @@ impl SepData {
             // after a fixed pause. A spent budget ends the run at the top of
             // the loop without waiting for the lift.
             if counter < ENROL_MAX_CAPTURES {
-                self.pause_after_touch(c"enrol");
+                if self.paused_at_ns.load(Relaxed) == 0 {
+                    self.pause_after_touch(c"enrol");
+                }
                 if !self.await_finger_lift(c"enrol") {
                     break None;
                 }
@@ -3685,6 +3687,9 @@ impl SepData {
                 return ImageOutcome::Failed(ENROL_STATUS_SENSOR);
             }
         };
+        // An enrolment touch gives one frame: macOS pauses the sensor as soon
+        // as it has it, while the enclave processes the frame.
+        self.pause_after_touch(c"enrol");
 
         let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
             dev_err!(self.dev, "enrol: invalid user id before image processing\n");
