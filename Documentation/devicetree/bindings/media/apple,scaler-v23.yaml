@@ -17,7 +17,9 @@ description: |
   Register windows and interrupt sources retain hardware-interface order.
   Some logical interfaces share an aperture, so repeated register tuples
   are intentional. Firmware, coefficients and workload policy are not DT
-  resources. Keep the device disabled until its firmware handoff, clocks,
+  resources. Each instance has its own DART; an advertised MSRn-DART
+  gate belongs to that DART, rather than the scaler functional domains.
+  Keep the device disabled until its firmware handoff, clocks,
   power and reset ownership have been qualified.
 
 properties:
@@ -93,7 +95,9 @@ allOf:
       properties:
         compatible:
           contains:
-            const: apple,t8142-scaler
+            enum:
+              - apple,t6050-scaler
+              - apple,t8142-scaler
     then:
       properties:
         power-domains:
