@@ -200,6 +200,17 @@ impl OperandState {
         r0a5c9: 0x9000,
         size: 0x14000,
     };
+    /// One cluster of ten cores (M5, J813), by ONE_BY_SIX's and TWO_BY_TEN's pattern: a bank of
+    /// ten slots of 0x1800, one tail of 0x800, the end rounded up to 16 KiB.
+    pub(crate) const ONE_BY_TEN: OperandState = OperandState {
+        r10229: 0x1e800,
+        r140a8: 0x1f000,
+        r10099: 0xf405,
+        r10091: 0x1e400,
+        r0a5c1: 0x0005,
+        r0a5c9: 0xf000,
+        size: 0x20000,
+    };
     /// Two clusters of ten cores (M4 Pro): bank stride 0x1e400, tails 0x1000.
     pub(crate) const TWO_BY_TEN: OperandState = OperandState {
         r10229: 0x3c800,

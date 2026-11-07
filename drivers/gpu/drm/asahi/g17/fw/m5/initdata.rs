@@ -1538,9 +1538,13 @@ fn encode_m5_aux_perf_states(board: &Board, out: &mut [u8]) {
     let table = &mut out[M5_HW_AUX_PERF_STATE..
         M5_HW_AUX_PERF_STATE + M5_HW_AUX_PERF_STATE_SIZE];
     table.fill(0);
+    // Without CS/AFR domains (M5) the table stays zero, as in the J813's 25G76 HW data.
+    let Some(aux_perf_states) = board.aux_perf_states else {
+        return;
+    };
     put_u32(table, 0, 13);
     put_u32(table, 4, 14);
-    for (state, &(frequency, core, sram)) in board.aux_perf_states.iter().enumerate() {
+    for (state, &(frequency, core, sram)) in aux_perf_states.iter().enumerate() {
         put_u32(table, 8 + state * 4, frequency);
         for lane in 0..2 {
             put_u32(table, 0x48 + state * 8 + lane * 4, core[lane]);
@@ -1612,6 +1616,9 @@ const J714_AON_RECORDS: [[u32; 3]; 3] = [
     [0x7230_5452, 0x00ce_0001, 0x0000_1401],
 ];
 
+// J813's row tagged RT0g (one GPU cluster), as its 25G76 AON block carries.
+const J813_AON_RECORDS: [[u32; 3]; 1] = [[0x6730_5452, 0x001d_0001, 0x0000_1401]];
+
 // J716c's rows tagged RT0g, RT1g and RT0r.
 const J716C_AON_RECORDS: [[u32; 3]; 3] = [
     [0x6730_5452, 0x0058_0001, 0x0000_1401],
@@ -1675,7 +1682,8 @@ pub(crate) const M5_HW_DATA_SIZE: usize = ABI_ALLOCATION_SIZES_26A428_M5[ALLOC_H
 pub(crate) const M5_KICK_SHARED_SIZE: usize = 0x2000;
 pub(crate) const M5_KICK_SHARED_POINTER: usize = 0x27dc;
 
-pub(crate) fn set_m5_kick_shared(out: &mut [u8], address: u64) -> Result<(), InitdataError> {
+pub(crate) fn set_m5_kick_shared(board: &Board, out: &mut [u8], address: u64)
+    -> Result<(), InitdataError> {
     if out.len() != M5_HW_DATA_SIZE {
         return Err(InitdataError::BufferSize);
     }
@@ -1686,7 +1694,7 @@ pub(crate) fn set_m5_kick_shared(out: &mut [u8], address: u64) -> Result<(), Ini
     if address & (UAT_PAGE_SIZE as u64 - 1) != 0 {
         return Err(InitdataError::AddressOutOfRange);
     }
-    put_u64(out, M5_KICK_SHARED_POINTER, address);
+    put_u64(out, hw_offset(board, M5_KICK_SHARED_POINTER), address);
     Ok(())
 }
 
@@ -1753,21 +1761,41 @@ pub(crate) const M5_HW_DATA_INSERT: usize = 0x267c;
 
 pub(crate) const M5_HW_DATA_INSERT_LEN: usize = 8;
 
+/// The board's offset of a field at `offset` of the M5 Pro's HW data: below the insert they
+/// agree, past it a board without the insert has the field eight bytes lower.
+const fn hw_offset(board: &Board, offset: usize) -> usize {
+    if !board.hw_data_insert && offset >= M5_HW_DATA_INSERT + M5_HW_DATA_INSERT_LEN {
+        offset - M5_HW_DATA_INSERT_LEN
+    } else {
+        offset
+    }
+}
+
 /// What the M5 graph's HW data and power policy depend on per board. Every board is a T6050
 /// running the same firmware build; [`crate::g17::Config::m5`] names the board's.
 pub(crate) struct Board {
+    /// The chip ID the HW data names.
+    chip_id: u32,
+    /// The InitData interface version the board's firmware checks at root +0x00, where it
+    /// differs from the M5 Pro's ([`M5_INITDATA_VERSION_WORD`]).
+    pub(crate) interface_version: Option<u64>,
+    /// Whether the board's HW data has the M5 Pro firmware's eight bytes at
+    /// [`M5_HW_DATA_INSERT`]; the common 26A428 interface (J813) has not.
+    hw_data_insert: bool,
     /// GPU clusters.
     pub(crate) clusters: u32,
     /// Cores of all clusters.
     pub(crate) gpu_cores: u32,
     /// The core type and firmware revision the HW data names.
     core_revision: (u32, u32),
-    /// Main-domain performance states.
+    /// Performance states after the off state, the HW data's count.
+    perf_state_count: u32,
+    /// Main-domain performance states. A board with fewer than 13 repeats its top state.
     pub(crate) perf_states: &'static [M5PerfState; 14],
     /// Voltage tables in [`Board::perf_states`].
     perf_tables: usize,
-    /// Auxiliary-domain performance states.
-    aux_perf_states: &'static [M5AuxPerfState; 14],
+    /// Auxiliary-domain (CS/AFR) performance states, where the GPU has those domains.
+    aux_perf_states: Option<&'static [M5AuxPerfState; 14]>,
     /// The relative-frequency curve of [`Board::perf_states`].
     relative_frequency: [u32; 16],
     /// Rows of the board's AON table the firmware reads.
@@ -1803,12 +1831,16 @@ pub(crate) struct Board {
 
 /// M5 Pro: two clusters of ten cores.
 pub(crate) const J714: Board = Board {
+    chip_id: 0x6050,
+    interface_version: None,
+    hw_data_insert: true,
     clusters: 2,
     gpu_cores: 20,
     core_revision: (0x18, 4),
+    perf_state_count: J714_GPU_NUM_PERF_STATES,
     perf_states: &J714_GPU_PERF_STATES,
     perf_tables: 2,
-    aux_perf_states: &J714_AUX_PERF_STATES,
+    aux_perf_states: Some(&J714_AUX_PERF_STATES),
     relative_frequency: relative_frequency(&J714_GPU_PERF_STATES, 1),
     aon_records: &J714_AON_RECORDS,
     register_windows: &J714_REGISTER_WINDOWS,
@@ -1826,12 +1858,16 @@ pub(crate) const J714: Board = Board {
 
 /// M5 Max: four clusters of ten cores.
 pub(crate) const J716C: Board = Board {
+    chip_id: 0x6050,
+    interface_version: None,
+    hw_data_insert: true,
     clusters: 4,
     gpu_cores: 40,
     core_revision: (0x19, 4),
+    perf_state_count: J714_GPU_NUM_PERF_STATES,
     perf_states: &J716C_GPU_PERF_STATES,
     perf_tables: 4,
-    aux_perf_states: &J716C_AUX_PERF_STATES,
+    aux_perf_states: Some(&J716C_AUX_PERF_STATES),
     relative_frequency: relative_frequency(&J716C_GPU_PERF_STATES, 1),
     aon_records: &J716C_AON_RECORDS,
     register_windows: &J716C_REGISTER_WINDOWS,
@@ -1854,14 +1890,18 @@ const J775D_PERF_FLOOR: usize = 3;
 
 /// M5 Ultra: two dies of four clusters of ten cores (G17D). Values from the J775D ADT.
 pub(crate) const J775D: Board = Board {
+    chip_id: 0x6050,
+    interface_version: None,
+    hw_data_insert: true,
     clusters: 8,
     gpu_cores: 80,
     // Firmware revision 2 for raw revision 0x11.
     core_revision: (0x1a, 2),
+    perf_state_count: J714_GPU_NUM_PERF_STATES,
     perf_states: &J775D_GPU_PERF_STATES,
     // One voltage table per cluster.
     perf_tables: 8,
-    aux_perf_states: &J775D_AUX_PERF_STATES,
+    aux_perf_states: Some(&J775D_AUX_PERF_STATES),
     relative_frequency: relative_frequency(&J775D_GPU_PERF_STATES, J775D_PERF_FLOOR),
     aon_records: &J775D_AON_RECORDS,
     register_windows: &J775D_REGISTER_WINDOWS,
@@ -1884,6 +1924,39 @@ pub(crate) const J775D: Board = Board {
     completion_inputs: false,
 };
 
+/// M5 (T8142, MacBook Air J813): one cluster of ten core slots, eight enabled. Values from the
+/// J813 ADT (27.0) and its 25G76 HW data (core type 0x20 revision 5, twelve states).
+/// Bring-up: no policy controller configuration yet.
+pub(crate) const J813: Board = Board {
+    chip_id: 0x8142,
+    // The J813's 26A428 firmware compares root +0x00 with 0x0c8b_4339_83a0_04c0 (movz/movk at
+    // TEXT 0x21ed8 in both roles), the common 26A428 interface J873 also runs, not the M5 Pro's.
+    interface_version: Some(COMMON26_INITDATA_VERSION_WORD),
+    // The common 26A428 HW data, without the M5 Pro's insert.
+    hw_data_insert: false,
+    clusters: 1,
+    gpu_cores: 10,
+    core_revision: (0x20, 5),
+    perf_state_count: 12,
+    perf_states: &J813_GPU_PERF_STATES,
+    perf_tables: 1,
+    aux_perf_states: None,
+    relative_frequency: relative_frequency(&J813_GPU_PERF_STATES, 1),
+    aon_records: &J813_AON_RECORDS,
+    register_windows: &J813_REGISTER_WINDOWS,
+    min_parameter_buffer: (super::target::min_parameter_buffer_pages(1) << 15) as u32,
+    // Half J714's: 2 MiB render blocks in a 2 GiB inventory.
+    render_pool: (0x20_0000, 1 << 31),
+    calibration: None,
+    controller_defaults: None,
+    idle_standby_us: None,
+    mcc_mask: None,
+    topology_words: None,
+    fan_curve_start_mc: 84_000,
+    g17d_forms: false,
+    completion_inputs: false,
+};
+
 const _: () = {
     use super::target::min_parameter_buffer_pages;
     assert!(J714.min_parameter_buffer as u64 == min_parameter_buffer_pages(J714.clusters) << 15);
@@ -1893,7 +1966,8 @@ const _: () = {
 
 /// Populate the enabled-USC count from the device's sampled core masks.
 /// This count covers the whole device, not one cluster.
-pub(crate) fn set_m5_enabled_cores(out: &mut [u8], enabled: u32) -> Result<(), InitdataError> {
+pub(crate) fn set_m5_enabled_cores(board: &Board, out: &mut [u8], enabled: u32)
+    -> Result<(), InitdataError> {
     if out.len() != M5_HW_DATA_SIZE {
         return Err(InitdataError::BufferSize);
     }
@@ -1901,7 +1975,7 @@ pub(crate) fn set_m5_enabled_cores(out: &mut [u8], enabled: u32) -> Result<(), I
         return Err(InitdataError::InterfaceMismatch);
     }
     put_u32(out, 0x10a4, enabled);
-    put_u32(out, 0x268c, enabled);
+    put_u32(out, hw_offset(board, 0x268c), enabled);
     Ok(())
 }
 
@@ -1951,6 +2025,30 @@ pub(crate) const J714_GPU_PERF_STATES: [M5PerfState; 14] = two_tables([
     (1182, 800, 800, 800, 800), (1278, 840, 840, 840, 840),
     (1374, 880, 880, 880, 880), (1470, 925, 925, 925, 925),
     (1578, 1000, 1000, 1000, 1000), (1620, 1025, 1040, 1025, 1040),
+]);
+
+/// One-table states (MHz, core voltage, SRAM voltage), the rest 0.
+const fn one_table(states: [(u32, u32, u32); 14]) -> [M5PerfState; 14] {
+    let mut out = [(0, [0; M5_PERF_LANES], [0; M5_PERF_LANES]); 14];
+    let mut state = 0;
+    while state < 14 {
+        let (frequency, core, sram) = states[state];
+        out[state].0 = frequency;
+        out[state].1[0] = core;
+        out[state].2[0] = sram;
+        state += 1;
+    }
+    out
+}
+
+// J813 ADT sgx perf-states and perf-states-sram (MHz, mV): twelve states after the off state.
+// The encoder's table has fourteen; the last repeats the top state, which the HW data's count
+// of twelve leaves out.
+pub(crate) const J813_GPU_PERF_STATES: [M5PerfState; 14] = one_table([
+    (0, 125, 770), (338, 660, 770), (486, 675, 770), (636, 690, 770),
+    (796, 705, 770), (888, 735, 770), (988, 760, 770), (1084, 790, 790),
+    (1182, 830, 830), (1278, 865, 865), (1374, 890, 890), (1470, 945, 945),
+    (1578, 1010, 1010), (1578, 1010, 1010),
 ]);
 
 /// Four-table states (MHz, four core-voltage tables, four SRAM-voltage tables), the rest 0.
@@ -2073,6 +2171,47 @@ const J714_REGISTER_WINDOWS: [M5RegisterWindowSpec; 30] = {
         index += 1;
     }
     windows
+};
+
+/// J813: J714's 26A428 slots at the J813's addresses, matched through its ADT and its 25G76
+/// windows (M5_25G76_REGISTER_WINDOWS: from the ID registers up, 26A428 numbers each GPU block
+/// five slots higher). Slots 4 and 11 sit where J714's do, AIC + 0x68000 and MCC reg 9 +
+/// 0x8000. Bring-up: slot 20, per cluster on T6050, is left out.
+const J813_GPU_BASE: u64 = 0x5_8000_0000;
+const J813_REGISTER_WINDOWS: [M5RegisterWindowSpec; 29] = {
+    const G: u64 = J813_GPU_BASE;
+    [
+        jw(0, &[0x3_8101_4000], 0x4000, 0, 2),
+        jw(3, &[0x2_2010_4000], 0x18000, 0, 2),
+        jw(4, &[0x3_8106_8000], 0x4000, 0, 0),
+        jw(9, &[0x3_803d_0000], 0x4000, 0, 2),
+        jw(10, &[0x3_803c_0000], 0x4000, 0, 0),
+        jw(11, &[0x3_803d_8000], 0x4000, 0, 2),
+        jw(12, &[0x4_2165_c000], 0x4000, 0, 2),
+        jw(14, &[0x3_8028_0000], 0x8000, 0, 0),
+        jw(15, &[0x3_8c84_0000], 0x24000, 0, 2),
+        // 25G76 maps 0x21400; the 26A428 firmware reads G + 0x25148 at bootstrap.
+        jw(17, &[G], 0x28000, 0, 2),
+        jw(18, &[G + 0xeb_4000], 0x4000, 0, 2),
+        jw(22, &[G + 0x100_0000], 0x8000, 0, 2),
+        jw(23, &[G + 0xf0_0000], 0x10000, 0, 2),
+        jw(24, &[G + 0xec_0000], 0x10000, 0, 2),
+        jw(31, &[G + 0xd0_4000], 0x8000, 0xd0_4000, 2),
+        jw(33, &[G + 0xd5_0000], 0x10000, 0xd5_0000, 2),
+        jw(34, &[G + 0xd1_0000], 0x4000, 0xd1_0000, 2),
+        jw(36, &[G + 0xd4_0000], 0x4000, 0xd4_0000, 2),
+        jw(37, &[G + 0xd6_0000], 0x8000, 0xd6_0000, 2),
+        jw(38, &[G + 0xd4_4000], 0x4000, 0xd4_4000, 2),
+        jw(39, &[G + 0xd4_c000], 0x200, 0xd4_c000, 2),
+        jw(40, &[G + 0xe0_0000], 0x4000, 0xe0_0000, 2),
+        jw(42, &[G + 0xe4_0000], 0x4000, 0xe4_0000, 2),
+        jw(44, &[G + 0xe0_8000, G + 0xe1_0000], 0x8000, 0, 2),
+        jw(46, &[G + 0xe3_3800], 0x4000, 0, 2),
+        jw(48, &[G + 0xe6_0000], 0x58, 0xe6_0000, 2),
+        jw(52, &[G + 0xe4_8000], 0x8000, 0, 2),
+        jw(53, &[G + 0x2_3d00], 0x200, 0x2_3d00, 2),
+        jw(58, &[G + 0xe7_3800], 0x4000, 0, 2),
+    ]
 };
 
 /// J714 with all eight AMCCs in slot 3 (J716c amcc-enable-mask 0xff, MCC
@@ -2271,8 +2410,8 @@ pub(crate) fn encode_m5_hw_data(
     write_relocated_words(M5_25G76_HW_PLATFORM_WORDS, 0, COMMON26_HW_DATA_BANDS, g18)?;
     encode_m5_register_map(board, windows,
         &mut g18[HW_REGISTER_MAP_OFFSET..COMMON26_HW_REGISTER_MAP_END])?;
-    put_u32(g18, COMMON26_HW_CHIP_ID_OFFSET, 0x6050);
-    put_u32(g18, COMMON26_HW_PERF_STATE_COUNT, J714_GPU_NUM_PERF_STATES);
+    put_u32(g18, COMMON26_HW_CHIP_ID_OFFSET, board.chip_id);
+    put_u32(g18, COMMON26_HW_PERF_STATE_COUNT, board.perf_state_count);
     put_u32(g18, COMMON26_HW_FIXED_WORD_OFFSET, COMMON26_HW_FIXED_WORD_VALUE);
 
     put_u32(g18, 0x0fb4, 1);
@@ -2302,20 +2441,24 @@ pub(crate) fn encode_m5_hw_data(
     for index in 0..COMMON26_HW_PERF_ROWS {
         put_u32(g18, COMMON26_HW_PERF_INDEX_MAP + index * 4, index as u32);
         put_u32(g18, COMMON26_HW_PERF_RELATIVE_B + index * 4, board.relative_frequency[index]);
-        put_u32(g18, M5_HW_AUX_RELATIVE_FREQUENCY + index * 4, board.relative_frequency[index]);
+        if board.aux_perf_states.is_some() {
+            put_u32(g18, M5_HW_AUX_RELATIVE_FREQUENCY + index * 4, board.relative_frequency[index]);
+        }
     }
     encode_m5_aux_perf_states(board, g18);
     let table = COMMON26_KSM_COMPLETION_TABLE_OFFSET;
     g18[table..table + completion.len()].copy_from_slice(&completion);
     put_u64(g18, COMMON26_QOS_POINTER_OFFSET, qos_high);
 
-    let insert = M5_HW_DATA_INSERT;
-    let len = M5_HW_DATA_INSERT_LEN;
-    out.copy_within(insert..COMMON26_HW_DATA_SIZE, insert + len);
-    out[insert..insert + len].fill(0);
+    if board.hw_data_insert {
+        let insert = M5_HW_DATA_INSERT;
+        let len = M5_HW_DATA_INSERT_LEN;
+        out.copy_within(insert..COMMON26_HW_DATA_SIZE, insert + len);
+        out[insert..insert + len].fill(0);
+    }
     put_u32(out, 0x2660, 0);
-    put_u32(out, 0x2728, 0);
-    put_u32(out, 0x272c, 1);
+    put_u32(out, hw_offset(board, 0x2728), 0);
+    put_u32(out, hw_offset(board, 0x272c), 1);
     if let Some(mask) = board.mcc_mask {
         put_u64(out, 0x10a8, mask);
     }
@@ -2324,7 +2467,7 @@ pub(crate) fn encode_m5_hw_data(
         put_u32(out, 0x1048, cores);
     }
     // The inherited J813 minimum parameter-buffer size is replaced per board.
-    put_u32(out, 0x26b0, board.min_parameter_buffer);
+    put_u32(out, hw_offset(board, 0x26b0), board.min_parameter_buffer);
     Ok(())
 }
 

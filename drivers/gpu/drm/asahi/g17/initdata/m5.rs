@@ -163,13 +163,13 @@ impl InitData {
         };
         m::encode_m5_hw_data(board, completions, QOS, windows,
             &mut self.object_mut(self.bundle)?.bytes_mut()[..m::M5_HW_DATA_SIZE]).map_err(|_| EINVAL)?;
-        m::set_m5_kick_shared(
+        m::set_m5_kick_shared(board,
             &mut self.object_mut(self.bundle)?.bytes_mut()[..m::M5_HW_DATA_SIZE], KICK_SHARED)
             .map_err(|_| EINVAL)?;
         let masked_cores: u32 = id.core_masks.iter().map(|mask| mask.count_ones()).sum();
         let enabled_cores = if masked_cores != 0 { masked_cores }
             else { id.num_clusters.checked_mul(id.num_cores).ok_or(EOVERFLOW)? };
-        m::set_m5_enabled_cores(
+        m::set_m5_enabled_cores(board,
             &mut self.object_mut(self.bundle)?.bytes_mut()[..m::M5_HW_DATA_SIZE], enabled_cores)
             .map_err(|_| EINVAL)?;
         m::encode_m5_bundle_policy(m::M5PolicyBindings {
@@ -220,6 +220,10 @@ impl InitData {
             m::encode_root_for_profile(profile, role, &addresses, &instance,
                 &mut self.object_mut(self.roots)?.bytes_mut()[offset..offset + m::M5_ROOT_SIZE])
                 .map_err(|_| EINVAL)?;
+            if let Some(version) = board.interface_version {
+                self.object_mut(self.roots)?.bytes_mut()[offset..offset + 8]
+                    .copy_from_slice(&version.to_le_bytes());
+            }
         }
         fence(Ordering::SeqCst);
         dev_info!(dev.as_ref(), "M5 firmware graph ready: private {:#x}+{:#x}, shared {:#x}+{:#x}\n",

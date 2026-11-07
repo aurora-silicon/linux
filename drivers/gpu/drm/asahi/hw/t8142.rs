@@ -8,15 +8,9 @@
 //! J813 (2026-11-07): ID registers 0xb022000 0xb0800 0x11010a 0x40404 0x1320311 0x10030302,
 //! family 0xb, variant 2, one die, one cluster of ten core slots; core mask 0x3bd (eight
 //! enabled, slots 1 and 6 fused off).
-use crate::g17::{Config, CoreLayout, CrashBuffers, FirmwareProfile, FixedBuffer, Identity};
+use crate::g17::{Config, CoreLayout, CrashBuffers, FirmwareProfile, Identity};
 use crate::hw::{GpuGen, GpuVariant};
 
-// The ADT sgx gfx-data-shared-ro-base and gfx1-data-shared-ro-base (each 0x8000) under 27.0,
-// where the M5 Pro's coprocessors ask for their crash logs.
-const J813_CRASH_BUFFERS: [FixedBuffer; 2] = [
-    FixedBuffer { va: 0x100_0250_4000, size: 0x8000 },
-    FixedBuffer { va: 0x100_025c_0000, size: 0x8000 },
-];
 
 /// Refuses the GPU after logging its identity: no variant byte is 0xff.
 pub(crate) const PROBE: Config = Config {
@@ -34,7 +28,9 @@ pub(crate) const PROBE: Config = Config {
     // As on 25G76: each role publishes its own kernel root, the secondary 0x40000 into
     // `pagetables`.
     secondary_root_offset: Some(0x40000),
-    crash_buffers: CrashBuffers::Fixed(J813_CRASH_BUFFERS),
+    // Each role asks for its crash log at the physical address of its __DATA_SHARED_RO
+    // (0x100_0250_4000, 0x100_025c_0000 under 27.0), inside the `fw-data` region.
+    crash_buffers: CrashBuffers::FirmwareData,
     profile: FirmwareProfile::M5PublishedRoots,
     pm_metrics: None,
     windows: &[],
@@ -59,3 +55,31 @@ pub(crate) const PROBE: Config = Config {
         compute_blocks: crate::g17::fw::freelist::COMPUTE_BLOCKS,
     },
 };
+
+/// The J813 on the M5 graph: [`PROBE`] with the GPU's identity and the J813 board.
+pub(crate) const CONFIG: Config = Config {
+    identity: Identity {
+        family: 0xb,
+        variant: 2,
+        num_dies: 1,
+        gpu_variant: GpuVariant::G,
+        usc_generation: 3,
+        hal_generation: 300,
+    },
+    m5: Some(&crate::g17::fw::m5::initdata::J813),
+    // One cluster of ten core slots; the buffers are sized for all ten.
+    core_layout: CoreLayout {
+        cores: None,
+        alternate_core_masks: None,
+        operand_state: crate::g17::fw::compute::OperandState::ONE_BY_TEN,
+        deflake: crate::g17::fw::render::Deflake::ONE_CLUSTER,
+        compute_blocks: crate::g17::fw::freelist::COMPUTE_BLOCKS,
+    },
+    ..PROBE
+};
+
+// Each compute operand bank holds 6 KiB per core slot of the board.
+const _: () = assert!(
+    CONFIG.core_layout.operand_state.bank_bytes()
+        == crate::g17::fw::m5::initdata::J813.gpu_cores * 0x1800
+);

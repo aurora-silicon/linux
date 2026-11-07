@@ -22,6 +22,17 @@
 			reg = <0 0 0 0>;
 		};
 
+		/*
+		 * macOS 27.0 (26A428): both roles' __DATA and __DATA_SHARED_RO, contiguous
+		 * (ADT gfx-asc and gfx1-asc segment-ranges), where the firmware places its crash
+		 * logs. Fixed at the addresses iBoot has used on every 27.0 boot so far, until the
+		 * bootloader fills it in.
+		 */
+		/* Mapped like gfx-data: the driver reads the crash logs through the linear map. */
+		gpu_fw_data: fw-data {
+			reg = <0x100 0x02444000 0x0 0x184000>;
+		};
+
 		uat_handoff: uat-handoff {
 			reg = <0 0 0 0>;
 		};
@@ -93,9 +104,10 @@
 		mboxes = <&gfx_mbox>, <&gfx1_mbox>;
 		power-domains = <&ps_gfx>;
 		memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>,
-				<&uat_l2_pagetables>, <&gfx_data>, <&gfx1_data>;
+				<&uat_l2_pagetables>, <&gfx_data>, <&gfx1_data>,
+				<&gpu_fw_data>;
 		memory-region-names = "ttbs", "pagetables", "handoff",
-				      "shared-l2", "gfx-data", "gfx1-data";
+				      "shared-l2", "gfx-data", "gfx1-data", "fw-data";
 		operating-points-v2 = <&gpu_opp>;
 		/* Holds the DCS and fabric floor while GPU work is in flight. */
 		apple,clpc = <&clpc>;
