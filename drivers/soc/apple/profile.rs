@@ -221,8 +221,9 @@ pub(crate) const T8103: PlatformProfile = PlatformProfile {
     },
     persistent_enrol: true,
     nonce_session: false,
-    // macOS shares this enclave: keep Linux to its own xART records.
-    xart_guard: 1,
+    // Off: Touch ID setup on a cold-boot SEP rewrites a session record that
+    // predates Linux, so the guard would only block it.
+    xart_guard: 0,
 };
 
 /// M1 Pro (J316s). The M1 family cold-boots its SEP like T8103, so the boot
@@ -262,9 +263,8 @@ pub(crate) const T6000: PlatformProfile = PlatformProfile {
     persistent_enrol: true,
     nonce_session: false,
     // As T8103. On J316s, creating the identity keybag also rewrites a
-    // session record that predates Linux. The guard refuses that, so the
-    // keybag can only be created there with xart_guard=0.
-    xart_guard: 1,
+    // session record that predates Linux.
+    xart_guard: 0,
 };
 
 pub(crate) const T6020: PlatformProfile = PlatformProfile {
@@ -468,9 +468,9 @@ pub(crate) const T6041: PlatformProfile = PlatformProfile {
 /// calibration is an FSC2 image. So it takes J700's SPI mode 2 and nonce
 /// session; its device tree names its signed root key. J713 on OS firmware
 /// 26.6.2 provisions its keybag, enrols, matches and restores the enrolment
-/// after a reboot.
+/// after a reboot. The J715 ADT describes the same sensor, wiring and SEP.
 pub(crate) const T8132: PlatformProfile = PlatformProfile {
-    name: "T8132/J713",
+    name: "T8132/J713/J715",
     sensor: SensorProfile {
         controller_base: 0x3_ad10_8000,
         mode: SpiMode::Mode2,
@@ -663,8 +663,8 @@ fn select(
     if has(b"apple,t6041") && has(b"apple,j616c") {
         return Ok(&T6041);
     }
-    // Only J713: the other T8132 Macs are unread.
-    if has(b"apple,t8132") && has(b"apple,j713") {
+    // Only the M4 MacBook Airs: the other T8132 Macs are unread.
+    if has(b"apple,t8132") && (has(b"apple,j713") || has(b"apple,j715")) {
         return Ok(&T8132);
     }
     Err(ENODEV)
@@ -731,8 +731,10 @@ mod tests {
     }
 
     #[test]
-    fn t8132_selection_is_limited_to_j713() {
+    fn t8132_selection_is_limited_to_the_m4_airs() {
         assert_eq!(picked(&[b"apple,j713", b"apple,t8132"]), Some(T8132.name));
+        assert_eq!(picked(&[b"apple,j715", b"apple,t8132"]), Some(T8132.name));
+        assert_eq!(picked(&[b"apple,j604", b"apple,t8132"]), None);
         assert_eq!(picked(&[b"apple,t8132"]), None);
         assert_eq!(picked(&[b"apple,j613", b"apple,t8132"]), None);
         assert_eq!(picked(&[b"apple,j713", b"apple,t8122"]), None);

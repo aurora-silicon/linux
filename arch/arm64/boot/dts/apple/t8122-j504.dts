@@ -20,6 +20,7 @@
 	chassis-type = "laptop";
 
 	aliases {
+		keyboard = &keyboard;
 		sep = &sep;
 	};
 
@@ -33,6 +34,16 @@
 			max-brightness = <255>;
 			default-state = "keep";
 		};
+	};
+};
+
+&dcp {
+	panel: panel {
+		compatible = "apple,panel-j504", "apple,panel-mini-led", "apple,panel";
+		width-mm = <302>;
+		height-mm = <196>;
+		adj-height-mm = <189>;
+		apple,max-brightness = <600>;
 	};
 };
 
@@ -271,3 +282,11 @@
 
 #include "hwmon-fan-dual.dtsi"
 #include "hwmon-laptop.dtsi"
+
+&i2c3 {
+	display_pcon: display-converter@8 {
+		compatible = "apple,t8122-display-pcon", "apple,display-pcon";
+		reg = <0x8>;
+		status = "disabled";
+	};
+};

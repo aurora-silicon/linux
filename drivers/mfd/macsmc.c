@@ -63,6 +63,11 @@ static const struct mfd_cell apple_smc_devs[] = {
 static const struct mfd_cell apple_smc_low_gpio_dev =
 	MFD_CELL_OF("macsmc-low-gpio", NULL, NULL, 0, 0, "apple,smc-low-gpio");
 
+/* T8152 currently exposes read-only telemetry; firmware owns fan control. */
+static const struct mfd_cell apple_smc_telemetry_devs[] = {
+	MFD_CELL_OF("macsmc-hwmon", NULL, NULL, 0, 0, "apple,smc-hwmon"),
+};
+
 static void apple_smc_read_sram(struct apple_smc *smc, void *buf, size_t size)
 {
 	if (IS_ENABLED(CONFIG_MFD_MACSMC_KUNIT_TEST))
@@ -541,6 +546,13 @@ static int apple_smc_probe(struct platform_device *pdev)
 		return dev_err_probe(smc->dev, ret, "Failed to get key count");
 	smc->key_count = be32_to_cpu(count);
 
+	/* Notifications, GPIO and power management are not qualified on T8152. */
+	if (of_device_is_compatible(dev->of_node, "apple,t8152-smc"))
+		return devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
+					    apple_smc_telemetry_devs,
+					    ARRAY_SIZE(apple_smc_telemetry_devs),
+					    NULL, 0, NULL);
+
 	/* Enable notifications */
 	apple_smc_write_flag(smc, SMC_KEY(NTAP), true);
 	ret = devm_add_action_or_reset(dev, apple_smc_disable_notifications, smc);
@@ -572,6 +584,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_smc_of_match[] = {
+	{ .compatible = "apple,t8152-smc" },
 	{ .compatible = "apple,t8103-smc" },
 	{ .compatible = "apple,smc" },
 	{},

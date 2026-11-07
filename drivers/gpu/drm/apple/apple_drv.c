@@ -170,9 +170,12 @@ static int apple_drm_fbdev_probe(struct drm_fb_helper *helper,
 		if (t8132_ext_crtc(crtc))
 			continue;
 		dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
-		if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
-		    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
-			/* H17P applies the stored fourth byte as straight alpha. */
+		if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+			/*
+			 * H17P applies the stored fourth byte as straight alpha,
+			 * the H17G (M5) profile too: an XRGB console with X = 0
+			 * stays black. ARGB makes fbcon write it opaque.
+			 */
 			sizes->surface_bpp = 32;
 			sizes->surface_depth = 32;
 			break;
@@ -915,6 +918,8 @@ static int apple_probe_per_dcp(struct device *dev,
 			planes[zpos] = apple_plane_init(drm, 1U << num, surf,
 							supports_l10r,
 							supports_xrgb2101010,
+							dcp_data->hw.iomfb_method_profile ==
+								DCP_IOMFB_METHODS_H17G,
 							plane_type, interchange,
 							supports_premultiplied);
 		}

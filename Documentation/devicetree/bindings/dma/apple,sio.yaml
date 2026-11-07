@@ -18,6 +18,33 @@ maintainers:
 
 allOf:
   - $ref: dma-controller.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8140-sio
+    then:
+      properties:
+        reg:
+          minItems: 3
+          maxItems: 3
+    else:
+      if:
+        properties:
+          compatible:
+            contains:
+              enum:
+                - apple,t6031-sio
+                - apple,t8122-sio
+      then:
+        properties:
+          reg:
+            minItems: 2
+            maxItems: 2
+      else:
+        properties:
+          reg:
+            maxItems: 1
 
 properties:
   compatible:
@@ -27,14 +54,26 @@ properties:
               - apple,t6000-sio
               - apple,t6020-sio
               - apple,t6030-sio
+              - apple,t6031-sio
+              - apple,t8122-sio
               - apple,t8103-sio
               - apple,t8112-sio
+              - apple,t8140-sio
           - const: apple,sio
       - description: T6041 firmware requires a generation-specific backend.
         const: apple,t6041-sio
 
   reg:
-    maxItems: 1
+    minItems: 1
+    maxItems: 3
+    description: |
+      Coprocessor control registers. T8140 also publishes an auxiliary ASC
+      window and the remaining ASC registers after the mailbox window.
+      The mailbox registers are described by the mailbox provider.
+
+  clocks:
+    minItems: 1
+    maxItems: 3
 
   '#dma-cells':
     const: 1

@@ -18,6 +18,7 @@ properties:
     oneOf:
       - enum:
           - apple,display-subsystem
+          - apple,t6031-display-subsystem
           - apple,t8132-display-subsystem
       - const: apple,t8132-display-diagnostics
         deprecated: true
