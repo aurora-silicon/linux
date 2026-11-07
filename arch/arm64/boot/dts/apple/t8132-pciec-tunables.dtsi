@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * J713 PCIe-C (USB4 PCIe tunnel) calibration, converted from the ADT the way
- * m1n1 does it. The J713 boot chain does not pass it on yet, so it is
- * described here until a bootloader fills it in.
+ * T8132 PCIe-C (USB4 PCIe tunnel) calibration, converted from the ADT
+ * apciec0/1 tunables, which match on the J713, J715 and J773g.
+ *
+ * Copyright The Asahi Linux Contributors
  */
 
 &usb4_0_pcie {

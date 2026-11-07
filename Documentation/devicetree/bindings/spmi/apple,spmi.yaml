@@ -17,6 +17,13 @@ allOf:
 properties:
   compatible:
     oneOf:
+      - const: apple,t8142-spmi
+      - items:
+          - enum:
+              - apple,t6000-spmi
+              - apple,t8103-spmi
+              - apple,t8112-spmi
+          - const: apple,spmi
       - items:
           - enum:
               - apple,t6000-spmi
@@ -31,14 +38,6 @@ properties:
               - apple,t8132-spmi
               - apple,t8140-spmi
           - const: apple,t8103-spmi
-      - items:
-          - enum:
-              # Do not add additional SoC to this list.
-              - apple,t8103-spmi
-              - apple,t6000-spmi
-              - apple,t8112-spmi
-          - const: apple,spmi
-      - const: apple,t8142-spmi
 
   reg:
     minItems: 1

@@ -16,14 +16,6 @@
 		dcp = &dcp;
 		disp0 = &display;
 	};
-
-	/* The scanout frontend; it has no registers of its own. */
-	display: display-subsystem {
-		compatible = "apple,t8132-display-subsystem", "apple,t8132-display-diagnostics";
-		iommus = <&disp0_dart 0>;
-		dma-noncoherent;
-		status = "disabled";
-	};
 };
 
 &soc {
@@ -85,5 +77,13 @@
 			dma-noncoherent;
 			status = "disabled";
 		};
+	};
+
+	/* The scanout frontend; it has no registers of its own. */
+	display: display-subsystem {
+		compatible = "apple,t8132-display-subsystem", "apple,t8132-display-diagnostics";
+		iommus = <&disp0_dart 0>;
+		dma-noncoherent;
+		status = "disabled";
 	};
 };

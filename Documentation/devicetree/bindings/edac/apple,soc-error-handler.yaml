@@ -19,6 +19,12 @@ select:
     compatible:
       contains:
         enum:
+          - apple,t6000-error-handler
+          - apple,t6000-event-log
+          - apple,t6001-error-handler
+          - apple,t6001-event-log
+          - apple,t6002-error-handler
+          - apple,t6002-event-log
           - apple,t6020-error-handler
           - apple,t6020-event-log
           - apple,t6021-error-handler
@@ -31,6 +37,8 @@ select:
           - apple,t6031-event-log
           - apple,t6041-error-handler
           - apple,t6041-event-log
+          - apple,t8103-error-handler
+          - apple,t8103-event-log
           - apple,t8112-error-handler
           - apple,t8112-event-log
           - apple,t8122-error-handler
@@ -107,36 +115,36 @@ allOf:
         compatible:
           oneOf:
             - items:
-                - const: apple,t6041-error-handler
-                - const: apple,soc-error-handler
-            - items:
-                - const: apple,t8140-error-handler
-                - const: apple,soc-error-handler
-            - items:
-                - const: apple,t6041-event-log
-                - const: apple,soc-event-log
-            - items:
-                - const: apple,t8140-event-log
-                - const: apple,soc-event-log
-            - items:
                 - enum:
+                    - apple,t6000-error-handler
+                    - apple,t6001-error-handler
+                    - apple,t6002-error-handler
                     - apple,t6020-error-handler
                     - apple,t6021-error-handler
                     - apple,t6022-error-handler
                     - apple,t6030-error-handler
                     - apple,t6031-error-handler
+                    - apple,t6041-error-handler
+                    - apple,t8103-error-handler
                     - apple,t8112-error-handler
                     - apple,t8122-error-handler
+                    - apple,t8140-error-handler
                 - const: apple,soc-error-handler
             - items:
                 - enum:
+                    - apple,t6000-event-log
+                    - apple,t6001-event-log
+                    - apple,t6002-event-log
                     - apple,t6020-event-log
                     - apple,t6021-event-log
                     - apple,t6022-event-log
                     - apple,t6030-event-log
                     - apple,t6031-event-log
+                    - apple,t6041-event-log
+                    - apple,t8103-event-log
                     - apple,t8112-event-log
                     - apple,t8122-event-log
+                    - apple,t8140-event-log
                 - const: apple,soc-event-log
 
         power-domains:
@@ -313,6 +321,143 @@ allOf:
                   interrupts:
                     minItems: 141
                     maxItems: 141
+            required:
+              - reg
+
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t8103-error-handler
+          then:
+            properties:
+              interrupts:
+                minItems: 11
+                maxItems: 11
+              reg:
+                minItems: 18
+                maxItems: 18
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t8103-event-log
+          then:
+            properties:
+              interrupts:
+                minItems: 16
+                maxItems: 16
+              reg:
+                minItems: 16
+                maxItems: 16
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6000-error-handler
+          then:
+            properties:
+              interrupts:
+                minItems: 76
+                maxItems: 76
+              reg:
+                minItems: 55
+                maxItems: 55
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6000-event-log
+          then:
+            properties:
+              interrupts:
+                minItems: 28
+                maxItems: 28
+              reg:
+                minItems: 28
+                maxItems: 28
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6001-error-handler
+          then:
+            properties:
+              interrupts:
+                minItems: 127
+                maxItems: 127
+              reg:
+                minItems: 90
+                maxItems: 90
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6001-event-log
+          then:
+            properties:
+              interrupts:
+                minItems: 28
+                maxItems: 28
+              reg:
+                minItems: 28
+                maxItems: 28
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6002-error-handler
+          then:
+            oneOf:
+              - properties:
+                  interrupts:
+                    minItems: 138
+                    maxItems: 138
+                  reg:
+                    minItems: 104
+                    maxItems: 104
+              - properties:
+                  interrupts:
+                    minItems: 130
+                    maxItems: 130
+                  reg:
+                    minItems: 101
+                    maxItems: 101
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6002-event-log
+          then:
+            oneOf:
+              - properties:
+                  interrupts:
+                    minItems: 28
+                    maxItems: 28
+                  reg:
+                    minItems: 28
+                    maxItems: 28
+              - properties:
+                  interrupts:
+                    minItems: 26
+                    maxItems: 26
+                  reg:
+                    minItems: 26
+                    maxItems: 26
             required:
               - reg
 

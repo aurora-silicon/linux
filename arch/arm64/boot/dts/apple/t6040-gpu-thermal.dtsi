@@ -162,86 +162,25 @@
 	};
 
 	/*
-	 * CPU die temperature: SMC key TCMz (CPU die max), sensor 0 of
-	 * smc_hwmon, polled once a second as the SMC refreshes it. Per-cluster
-	 * and GPU zones follow, one per SMC die-maximum sensor (smc_hwmon
-	 * channels 1-23, in the order of the temperature nodes below): Tex0-3
-	 * throttle the E cluster, Tpx0-5 the first P cluster and Tpx8-D the
-	 * second. The die zone throttles all three. The cpufreq cooling device
-	 * sits on a cluster's policy CPU, so each map lists every CPU of its
-	 * cluster.
+	 * Zones on the SMC die-maximum sensors (smc_hwmon 0-23): TCMz for the
+	 * die, Tex0-3, Tpx0-5 and Tpx8-D per CPU cluster, and the seven
+	 * hottest GPU sensors. The PMP's loop holds the die at the ADT
+	 * fast-die-ctrl-loop target of 110 C, as on macOS; these zones are
+	 * the backstop behind it.
 	 *
-	 * The fast control is the PMP's, as on macOS: its loop holds its own
-	 * hot-spot sensors at the ADT fast-die-ctrl-loop target of 110 C and
-	 * cpufreq enforces its effort as a frequency limit within milliseconds.
-	 * Under a sustained all-core build TCMz then settles at 113 to 114 C.
-	 * The CPU zones are the slower backstop above that point: the power
-	 * allocator switches on at 75 C and controls at 115 C, so it leaves the
-	 * PMP's operating point alone and only trims what the PMP lets through.
+	 * - CPU zones run the power allocator from 75 C, control at 115 C and
+	 *   throttle only the cluster their sensor sits on. The 1 s samples
+	 *   jump by about 10 C, so the zones are integral-led.
+	 * - GPU zones: the GPU firmware limits itself from 101 C; these shed
+	 *   CPU power from the same point (on at 90 C) and shut down at 118 C.
+	 *   A powered-off GPU reads -4 to 4 C.
+	 * - Hot at 120 C only reports; critical is the ADT's 125 C sochot
+	 *   level, after three samples (critical-samples).
+	 * - The fans stay with the SMC, as on macOS: no active trips.
 	 *
-	 * The PMP's sensors do not see every hot spot. Under mixed SIMD,
-	 * memory and GPU load the per-core Tpx sensors follow a core's power
-	 * within a second and jump by 9-10 C (one standard deviation) between
-	 * 1 s samples while the PMP's effort stays at zero. A controller on
-	 * these samples cannot stop single excursions, and a proportional one
-	 * swings between no limit and full cooling every second, so the zones
-	 * are integral-led: the wide 40 C switch-on window keeps the
-	 * proportional gains low and integral-time-constant-ms sets the
-	 * integral term. Each zone throttles only the cluster its sensor sits
-	 * on: the allocator divides a zone's budget by requested power, so a
-	 * zone that throttled every cluster left a hot core's own cluster
-	 * nearly at full speed.
-	 *
-	 * Critical (orderly shutdown) is at 125 C, the per-sensor maximum the
-	 * ADT temp-sensor table gives next to the 110 C target for the PMP's
-	 * sensors (the sochot level). The SMC sensors read a few degrees above
-	 * the PMP's, so Linux shuts down at or before the hardware's own limit.
-	 * A hot trip at 120 C only reports, and the critical trip acts only
-	 * after three consecutive samples at or above it (critical-samples),
-	 * so one excursion cannot shut the machine down. Under any load the
-	 * per-core excursions have peaked at 116.5-118 C, which the former
-	 * 118 C critical trip turned into a shutdown.
-	 *
-	 * The GPU has no cooling device of its own: its firmware sets the GPU
-	 * performance state and starts limiting at 101 C. So when a GPU die
-	 * sensor reaches the GPU firmware's limit, the seven
-	 * hottest ones (Tg05, Tg0S, Tg0Y, Tg0k, Tg0z, Tg1V, Tg1l) also shed
-	 * CPU power through the CPU clusters, from the same 101 C, leaving the
-	 * shared heat budget to the GPU. They shut down at 118 C. While the
-	 * GPU is powered off its sensors report placeholder values from -4 to
-	 * 4 C.
-	 *
-	 * Every zone runs the power allocator, which acts at any temperature
-	 * unless a zone has a second passive trip: the first one is then its
-	 * switch-on point, below which it resets and grants full power. So each
-	 * zone has one: 75 C under the 115 C die and CPU control trip and 90 C
-	 * under the GPU zones' 101 C one. Without them the GPU zones, whose
-	 * placeholder readings never warm up, held all 14 CPUs to about 7.5 W
-	 * (1.26/1.02/1.26 GHz) under any all-core load. The GPU zones also
-	 * carry the die's sustainable power rather than the allocator's
-	 * estimate from the lowest CPU states (about 2.6 W).
-	 *
-	 * The fans stay with the SMC, as on macOS: macOS writes no SMC key at
-	 * runtime and its fans run in the SMC's own mode, which ramps them
-	 * under sustained load. No zone has active trips; the hwmon fans stay
-	 * cooling devices for userspace and manual control.
-	 *
-	 * sustainable-power is what the CPUs dissipate with the die held at
-	 * its operating point: 720 s of all-core load (10 P, 4 E busy loops),
-	 * headless, SMC fans in their own mode. Over the last 600 s TCMz held
-	 * 112.0 to 113.8 C with the PMP limiting the P clusters to a mean of
-	 * about 3.7 GHz and the fans at 3450/3730 rpm (where macOS settles
-	 * too). The SMC core rails then read P0 25.3 W, P1 23.9 W and E 2.1 W
-	 * on average, the units of the energy model. Each zone gets the sum
-	 * over the clusters it throttles. Without it the power allocator
-	 * estimates a budget from the cooling devices' lowest states, which
-	 * throttles far below what this machine sustains.
-	 *
-	 * All of these values were measured on the J616s. The J614s and J773s
-	 * inherit them until they are measured: Apple's package power limits
-	 * for the J614s are about 78% (CPU) and 90% (GPU) of the J616s ones,
-	 * so its budgets are generous here, and these zones are a backstop
-	 * behind the PMP.
+	 * sustainable-power is the J616s's: a 720 s all-core load held TCMz
+	 * at 112-114 C with P0 25.3 W, P1 23.9 W and E 2.1 W on the SMC core
+	 * rails. The J614s and J773s inherit these values until measured.
 	 */
 	thermal-zones {
 		cpu-die-thermal {

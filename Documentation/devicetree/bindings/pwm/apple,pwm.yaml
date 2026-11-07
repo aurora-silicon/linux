@@ -26,22 +26,20 @@ select:
           - apple,t8103-pwm
           - apple,t8112-pwm
           - apple,t8122-pwm
+          - apple,t8132-pwm
   required:
     - compatible
 
 properties:
   compatible:
-    oneOf:
-      - items:
-          - enum:
-              - apple,t8103-pwm
-              - apple,t8112-pwm
-              - apple,t8122-pwm
-              - apple,t8132-pwm
-          - const: apple,pwm
-      - items:
-          - const: apple,t6000-pwm
-          - const: apple,pwm
+    items:
+      - enum:
+          - apple,t6000-pwm
+          - apple,t8103-pwm
+          - apple,t8112-pwm
+          - apple,t8122-pwm
+          - apple,t8132-pwm
+      - const: apple,pwm
 
   reg:
     maxItems: 1
