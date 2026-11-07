@@ -837,9 +837,9 @@
 		status = "disabled";
 	};
 
-	i2c6: i2c@39b054000 {
+	i2c6: i2c@39b058000 {
 		compatible = "apple,t6020-i2c", "apple,t8103-i2c", "apple,i2c";
-		reg = <0x3 0x9b054000 0x0 0x4000>;
+		reg = <0x3 0x9b058000 0x0 0x4000>;
 		clocks = <&clkref>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1225 IRQ_TYPE_LEVEL_HIGH>;
@@ -851,9 +851,9 @@
 		status = "disabled";
 	};
 
-	i2c7: i2c@39b054000 {
+	i2c7: i2c@39b05c000 {
 		compatible = "apple,t6020-i2c", "apple,t8103-i2c", "apple,i2c";
-		reg = <0x3 0x9b054000 0x0 0x4000>;
+		reg = <0x3 0x9b05c000 0x0 0x4000>;
 		clocks = <&clkref>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1226 IRQ_TYPE_LEVEL_HIGH>;
@@ -865,9 +865,9 @@
 		status = "disabled";
 	};
 
-	i2c8: i2c@39b054000 {
+	i2c8: i2c@39b060000 {
 		compatible = "apple,t6020-i2c", "apple,t8103-i2c", "apple,i2c";
-		reg = <0x3 0x9b054000 0x0 0x4000>;
+		reg = <0x3 0x9b060000 0x0 0x4000>;
 		clocks = <&clkref>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1227 IRQ_TYPE_LEVEL_HIGH>;
