@@ -95,24 +95,28 @@ it up. Anything EL0 can execute therefore lives outside the window:
 
 * The vDSO's code is part of the image, so userspace gets a copy in ordinary
   memory.
-* No window page reaches the page allocator. ``free_reserved_area()`` skips them,
-  so freed ``__init`` memory stays reserved, as does an initrd in the window. A
-  CMA area that overlaps the window isn't activated, and a reserved-memory node
-  whose init fails stays reserved. RAM in the window that the pool doesn't use is
-  not available to the rest of the system, so a window should be no larger than
-  the executable code needs.
+* The whole reserved window stays out of the page allocator. The reservation
+  covers the entire window (which is why a command-line sub-window is refused),
+  ``free_reserved_area()`` skips window pages so freed ``__init`` memory and an
+  initrd in the window stay reserved, a CMA area that overlaps the window isn't
+  activated, and a reserved-memory node whose init fails stays reserved. RAM in
+  the window that the pool doesn't use is not available to the rest of the
+  system, so a window should be no larger than the executable code needs.
 
 * The zero page is part of the image too, and every untouched anonymous page
   that is read before it is written maps it, executable mappings included. With
   a window active, ``arch_setup_zero_pages()`` allocates the zero pages from
   memblock instead, outside the window.
 
-As a backstop, when a window is active, an EL0 instruction permission fault on a
-present, executable mapping of a window page logs the task and its address and
-PFN, then kills it with an uncatchable ``SIGSEGV`` rather than retrying. The
-mapping is resolved to a PFN either through its folio or, for a ``VM_PFNMAP`` or
-``VM_MIXEDMAP`` mapping with no struct page (a driver's ``remap_pfn_range()`` of
-an image buffer), through a raw PFN walk. Any other fault takes the usual path.
+The hardware CTXR is what actually stops an out-of-window EL0 fetch on a
+confined core. As a diagnostic backstop, when a window is active an EL0
+instruction permission fault on a user-executable mapping of a window page logs
+the task, address and PFN and kills it with an uncatchable ``SIGSEGV`` rather
+than letting it retry forever. The PFN is taken from the mapping's folio, or for
+a ``VM_PFNMAP`` mapping with no struct page (a driver's ``remap_pfn_range()`` of
+an image buffer) through ``follow_pfnmap()``; a special ``VM_MIXEDMAP`` PTE with
+no struct page isn't resolved here and is left to the hardware fault. Any other
+fault takes the usual path.
 
 EFI runtime services
 ====================
