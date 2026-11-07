@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Disabled tunnel translation and miscellaneous interfaces. */
+
+&soc {
+	pciec0_dart: iommu@721008000 {
+		compatible = "apple,t8122-dart", "apple,t8110-dart";
+		reg = <0x7 0x21008000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 962 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		power-domains = <&ps_atc0_cio_pcie>;
+		status = "disabled";
+	};
+
+	pciec1_dart: iommu@b21008000 {
+		compatible = "apple,t8122-dart", "apple,t8110-dart";
+		reg = <0xb 0x21008000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1020 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		power-domains = <&ps_atc1_cio_pcie>;
+		status = "disabled";
+	};
+
+	pwm0: pwm@2a1040000 {
+		compatible = "apple,t8122-pwm", "apple,pwm";
+		reg = <0x2 0xa1040000 0 0x4000>;
+		power-domains = <&ps_fpwm0>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 789 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+};
