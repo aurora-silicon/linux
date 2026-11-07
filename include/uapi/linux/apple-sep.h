@@ -84,6 +84,22 @@ struct sep_bio_enclave_list {
 #define SEP_BIO_GUIDANCE_PLACE         1
 #define SEP_BIO_GUIDANCE_LIFT_AND_MOVE 2
 #define SEP_BIO_GUIDANCE_HOLD_STILL    3
+/*
+ * The finger of the last touch is still on the sensor; the next capture is
+ * armed when it is lifted. Older readers treat it as SEP_BIO_GUIDANCE_NONE.
+ */
+#define SEP_BIO_GUIDANCE_LIFT          4
+/*
+ * Why a capture did not count. A verify that ends SEP_BIO_STATE_FAILED with
+ * status 5 (retry), and a running enrolment whose poll carries status 5
+ * (reported once per unusable capture), name the cause
+ * in 'guidance': PLACE when no finger came in time, LIFT_AND_MOVE for a frame
+ * that could not be read, or one of these. Older kernels leave the guidance of
+ * the capture there.
+ */
+#define SEP_BIO_GUIDANCE_CENTER        5 /* partial contact */
+#define SEP_BIO_GUIDANCE_TOO_FAST      6 /* the finger moved */
+#define SEP_BIO_GUIDANCE_CLEAN         7 /* dirt or moisture */
 
 struct sep_bio_enrol_poll {
 	__u32 state;
