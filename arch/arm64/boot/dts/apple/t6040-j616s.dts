@@ -130,3 +130,20 @@
 		};
 	};
 };
+
+/* Scaler/CSC (MSR) and its DART, proven on this board. */
+&ps_msr0 {
+	status = "okay";
+};
+
+&ps_msr0_ase_core {
+	status = "okay";
+};
+
+&scaler0_dart {
+	status = "okay";
+};
+
+&scaler0 {
+	status = "okay";
+};
