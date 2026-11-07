@@ -43,6 +43,7 @@
 		      <0x3 0x8a04000 0x0 0x4000>,
 		      <0x3 0x8a00000 0x0 0x4000>;
 		status = "disabled";
+		interrupts = <AIC_IRQ 684 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
 	hw_apcie: pcie@1cb0000000 {

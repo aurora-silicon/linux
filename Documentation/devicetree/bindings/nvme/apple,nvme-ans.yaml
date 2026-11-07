@@ -138,6 +138,10 @@ allOf:
               description: Interrupt lines wired to the system interrupt controller.
               minItems: 4
               maxItems: 5
+            power-domains:
+              description: Physical power and combined clock-gate dependencies.
+              minItems: 1
+              maxItems: 8
           required:
             - compatible
             - reg

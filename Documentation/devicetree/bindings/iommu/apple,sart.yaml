@@ -122,6 +122,10 @@ allOf:
                 Register apertures of the complete hardware complex, in hardware interface order.
               minItems: 1
               maxItems: 3
+            power-domains:
+              description: Physical power and combined clock-gate dependencies.
+              minItems: 1
+              maxItems: 8
           required:
             - compatible
             - reg

@@ -56,6 +56,7 @@
 		      <0x3 0x8904000 0x0 0x4000>,
 		      <0x3 0x8900000 0x0 0x4000>;
 		status = "disabled";
+		interrupts = <AIC_IRQ 682 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
 	hw_aop_spmi0: spmi@310914000 {
@@ -64,6 +65,7 @@
 		      <0x3 0x10904000 0x0 0x4000>,
 		      <0x3 0x10900000 0x0 0x4000>;
 		status = "disabled";
+		interrupts = <AIC_IRQ 609 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
 	hw_acio_cpu0: usb4-coproc@401178000 {
@@ -764,6 +766,7 @@
 		      <0x3 0x8704000 0x0 0x4000>,
 		      <0x3 0x8700000 0x0 0x4000>;
 		status = "disabled";
+		interrupts = <AIC_IRQ 675 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
 	hw_nub_spmi1: spmi@308614000 {
@@ -772,6 +775,7 @@
 		      <0x3 0x8604000 0x0 0x4000>,
 		      <0x3 0x8600000 0x0 0x4000>;
 		status = "disabled";
+		interrupts = <AIC_IRQ 680 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
 	hw_disp0: display-engine@284000000 {

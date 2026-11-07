@@ -175,9 +175,9 @@ allOf:
               minItems: 5
               maxItems: 10
             power-domains:
-              description: Power and combined clock gates required by this hardware.
-              minItems: 2
-              maxItems: 2
+              description: Physical power and combined clock-gate dependencies.
+              minItems: 1
+              maxItems: 8
           required:
             - compatible
             - reg
