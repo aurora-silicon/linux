@@ -115,17 +115,28 @@ Compile ``apple/t8140-j700.dtb`` and check the outer policy::
 
 These tests do not qualify firmware-achieved power or a safe minimum.
 
-Owner Neo one-shot plan
------------------------
+PWR owner qualification: Neo and J616s
+-------------------------------------
 
-This revision performs no device test. Request a separate controller-approved
-Neo one-shot, identifying the device, exact source and boot artifacts. Build
-with the unique release suffix ``-aurora-t5062-gpu-cooling-v2-01``; verify
+This revision performs no device test. Request separate controller-approved
+one-shots for Neo (G17P) and J616s (G16S), identifying each device, exact
+source and boot artifacts. Build
+with the unique release suffix ``-aurora-t5402-gpu-cooling-v2-01``; verify
 ``uname -r`` matches it after boot. Preserve the fleet-default kernel/DTB,
 artifact hashes, boot entry and bootguard fallback before staging. Record
 candidate and fleet commits, firmware identity, Mesa, workload, power source,
 ambient conditions and starting temperatures. Keep private lab records outside
 the public source tree.
+
+J700 supplies the GPU cooling binding and outer policy in this series.
+J616s currently has no GPU ``#cooling-cells`` or GPU cooling-map references;
+the actuator is therefore not attached there. Before qualifying J616s,
+the PWR owner must review a separate board policy with indexed sensor
+identities, trips, hysteresis, independent critical actions and exact GPU
+cooling states. Validate its compiled DTB and firmware admission before
+requesting a one-shot. Existing CPU cooling maps do not qualify GPU binding.
+An absent GPU cooling device or zone link is a failed prerequisite, never
+evidence that G16S thermal integration passed.
 
 First boot with no GPU load. Verify the cooling device, independent thermal
 zones, all critical trips, requested/applied/readback agreement and nonzero
@@ -152,6 +163,27 @@ frame-time p50/p95/p99/max, throughput, peak temperature, time above each trip
 and cooling residency against fleet default, labeling different power caps.
 Readback is not achieved-power evidence. Qualifying a lower floor requires
 independent achieved-state evidence and a separately reviewed test.
+
+For each board, retain a thermal-zone-to-cooling-device inventory and a
+timestamped trace of governor-driven state transitions under the bounded
+GPU load, including hysteresis and overlapping zone demands. Exercise both
+restriction and relaxation without lowering critical trips. Keep load
+bounded by the independent supervisor and the initial burst limits above.
+
+After those stages pass, request a separately bounded gpubench comparison
+using the same Mesa, workload, resolution, power cap, power source and cool
+starting conditions on fleet default and candidate. Use repeated samples;
+retain throughput and frame-time distributions. Accept only no regression
+outside the matched baseline's measured repeatability; differing caps or
+conditions require a new matched comparison. Do not treat expected throttling
+at a different cap as a performance-parity result.
+
+Capture complete boot logs and SELinux audit evidence for both kernels on
+each device. Require zero new boot-log warnings against the matched baseline
+and zero AVCs with SELinux enforcing throughout boot and the workload. Keep
+all failures and the restored-kernel checks with the qualification receipt.
+Neither board is qualified until binding, load transitions, gpubench parity,
+boot-log comparison and SELinux checks have all passed on that board.
 
 Stop bursts on a failed cap update, readback mismatch, missing or implausible
 telemetry, lost binding, GPU fault or supervisor action. Keep the strongest
