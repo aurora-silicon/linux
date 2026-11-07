@@ -2,6 +2,7 @@
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/media/apple,t8140-isp.yaml#
+
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
 title: Apple T8140 Image Signal Processor
@@ -16,139 +17,218 @@ description:
   must be serviced while capturing to receive sensor pixels.
 
 select:
-  properties:
-    compatible:
-      contains:
-        enum:
-          - apple,t8140-isp
-          - apple,t8142-isp
-  required:
-    - compatible
+  anyOf:
+    -
+      properties:
+        compatible:
+          contains:
+            enum:
+              - "apple,isp"
+              - "apple,t8140-isp"
+              - "apple,t8142-isp"
+      required:
+        - "compatible"
+    -
+      properties:
+        compatible:
+          allOf:
+            -
+              contains:
+                enum:
+                  - "apple,t8142-isp"
+                  - "apple,t8152-isp"
+            -
+              contains:
+                const: "apple,isp"
+      required:
+        - "compatible"
+allOf:
+  -
+    if:
+      anyOf:
+        -
+          properties:
+            compatible:
+              allOf:
+                -
+                  contains:
+                    enum:
+                      - "apple,t8142-isp"
+                      - "apple,t8152-isp"
+                -
+                  contains:
+                    const: "apple,isp"
+            status:
+              const: "disabled"
+          required:
+            - "compatible"
+            - "status"
+          not:
+            required:
+              - "mboxes"
+    then:
+      oneOf:
+        -
+          description: "Apple image signal processor complex. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          properties:
+            compatible:
+              items:
+                -
+                  enum:
+                    - "apple,t8142-isp"
+                    - "apple,t8152-isp"
+                -
+                  const: "apple,isp"
+            status:
+              const: "disabled"
+            reg:
+              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              minItems: 3
+              maxItems: 3
+            interrupts:
+              description: "Interrupt lines wired to the system interrupt controller."
+              minItems: 4
+              maxItems: 5
+            iommus:
+              description: "DMA translation streams emitted by this hardware."
+              minItems: 5
+              maxItems: 10
+            power-domains:
+              description: "Power and combined clock gates required by this hardware."
+              minItems: 2
+              maxItems: 2
+          required:
+            - "compatible"
+            - "reg"
+            - "status"
+          additionalProperties: false
+    else:
+      $ref: "#/$defs/legacy-driver"
 
-properties:
-  compatible:
-    items:
-      - enum:
-          - apple,t8140-isp
-          - apple,t8142-isp
-      - const: apple,isp
+$defs:
+  legacy-driver:
+    properties:
+      compatible:
+        items:
+          - enum:
+              - apple,t8140-isp
+              - apple,t8142-isp
+          - const: apple,isp
 
-  reg:
-    items:
-      - description: Coprocessor control registers
-      - description: Mailbox interrupt and doorbell registers
-      - description: Firmware handshake registers
-      - description: Capture watchdog registers
+      reg:
+        items:
+          - description: Coprocessor control registers
+          - description: Mailbox interrupt and doorbell registers
+          - description: Firmware handshake registers
+          - description: Capture watchdog registers
 
-  reg-names:
-    items:
-      - const: coproc
-      - const: mbox
-      - const: gpio
-      - const: wdt
+      reg-names:
+        items:
+          - const: coproc
+          - const: mbox
+          - const: gpio
+          - const: wdt
 
-  interrupts:
-    maxItems: 1
+      interrupts:
+        maxItems: 1
 
-  iommus:
-    items:
-      - description: First ISP DART stream
-      - description: Second ISP DART stream
-      - description: Third ISP DART stream
+      iommus:
+        items:
+          - description: First ISP DART stream
+          - description: Second ISP DART stream
+          - description: Third ISP DART stream
 
-  power-domains:
-    items:
-      - description: ISP system domain
-      - description: ISP CPU domain
-      - description: ISP CPU core 0 domain
-      - description: ISP CPU core 1 domain
-      - description: ISP FE domain
-      - description: ISP DPRX domain
-      - description: ISP secure domain
-      - description: ISP STS0 domain
-      - description: ISP STS1 domain
-      - description: ISP Pearl domain
-      - description: ISP BE domain
-      - description: ISP CLR domain
-      - description: ISP CVD domain
-      - description: ISP CVM domain
+      power-domains:
+        items:
+          - description: ISP system domain
+          - description: ISP CPU domain
+          - description: ISP CPU core 0 domain
+          - description: ISP CPU core 1 domain
+          - description: ISP FE domain
+          - description: ISP DPRX domain
+          - description: ISP secure domain
+          - description: ISP STS0 domain
+          - description: ISP STS1 domain
+          - description: ISP Pearl domain
+          - description: ISP BE domain
+          - description: ISP CLR domain
+          - description: ISP CVD domain
+          - description: ISP CVM domain
 
-  memory-region:
-    maxItems: 1
-    description: Firmware heap region provided by the bootloader
+      memory-region:
+        maxItems: 1
+        description: Firmware heap region provided by the bootloader
 
-  memory-region-names:
-    items:
-      - const: heap
+      memory-region-names:
+        items:
+          - const: heap
 
-  apple,dart-vm-size:
-    $ref: /schemas/types.yaml#/definitions/uint64
-    description:
-      Size in bytes of the host allocation aperture used by the ISP driver.
+      apple,dart-vm-size:
+        $ref: /schemas/types.yaml#/definitions/uint64
+        description:
+          Size in bytes of the host allocation aperture used by the ISP driver.
 
-  apple,platform-id:
-    $ref: /schemas/types.yaml#/definitions/uint32
-    description:
-      Platform identifier passed in the firmware boot descriptor.
+      apple,platform-id:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description:
+          Platform identifier passed in the firmware boot descriptor.
 
-  apple,temporal-filter:
-    $ref: /schemas/types.yaml#/definitions/uint32
-    description:
-      Firmware temporal-filter strength selected for the attached sensor.
+      apple,temporal-filter:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description:
+          Firmware temporal-filter strength selected for the attached sensor.
 
-  sensor-presets:
-    type: object
-    description:
-      Sensor firmware presets and the host output geometry associated with them.
-    patternProperties:
-      "^preset[0-9]+$":
+      sensor-presets:
         type: object
-        properties:
-          apple,config-index:
-            $ref: /schemas/types.yaml#/definitions/uint32
-            description: Sensor configuration index understood by the firmware
-          apple,input-size:
-            $ref: /schemas/types.yaml#/definitions/uint32-array
-            items:
-              - description: Input width in pixels
-              - description: Input height in pixels
-            description: Sensor input dimensions
-          apple,output-size:
-            $ref: /schemas/types.yaml#/definitions/uint32-array
-            items:
-              - description: Output width in pixels
-              - description: Output height in pixels
-            description: Delivered frame dimensions
-          apple,crop:
-            $ref: /schemas/types.yaml#/definitions/uint32-array
-            items:
-              - description: Horizontal crop origin in pixels
-              - description: Vertical crop origin in pixels
-              - description: Crop width in pixels
-              - description: Crop height in pixels
-            description: Cropped sensor rectangle
-        required:
-          - apple,config-index
-          - apple,input-size
-          - apple,output-size
-          - apple,crop
+        description:
+          Sensor firmware presets and the host output geometry associated with them.
+        patternProperties:
+          "^preset[0-9]+$":
+            type: object
+            properties:
+              apple,config-index:
+                $ref: /schemas/types.yaml#/definitions/uint32
+                description: Sensor configuration index understood by the firmware
+              apple,input-size:
+                $ref: /schemas/types.yaml#/definitions/uint32-array
+                items:
+                  - description: Input width in pixels
+                  - description: Input height in pixels
+                description: Sensor input dimensions
+              apple,output-size:
+                $ref: /schemas/types.yaml#/definitions/uint32-array
+                items:
+                  - description: Output width in pixels
+                  - description: Output height in pixels
+                description: Delivered frame dimensions
+              apple,crop:
+                $ref: /schemas/types.yaml#/definitions/uint32-array
+                items:
+                  - description: Horizontal crop origin in pixels
+                  - description: Vertical crop origin in pixels
+                  - description: Crop width in pixels
+                  - description: Crop height in pixels
+                description: Cropped sensor rectangle
+            required:
+              - apple,config-index
+              - apple,input-size
+              - apple,output-size
+              - apple,crop
+            additionalProperties: false
         additionalProperties: false
+    required:
+      - compatible
+      - reg
+      - reg-names
+      - interrupts
+      - iommus
+      - power-domains
+      - memory-region
+      - memory-region-names
+      - apple,dart-vm-size
+      - apple,platform-id
+      - sensor-presets
     additionalProperties: false
-
-required:
-  - compatible
-  - reg
-  - reg-names
-  - interrupts
-  - iommus
-  - power-domains
-  - memory-region
-  - memory-region-names
-  - apple,dart-vm-size
-  - apple,platform-id
-  - sensor-presets
-
-additionalProperties: false
 
 examples:
   - |

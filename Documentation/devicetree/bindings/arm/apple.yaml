@@ -376,6 +376,7 @@ properties:
         items:
           - enum:
               - apple,j804  # MacBook Pro (J804)
+              - apple,j833ct # iMac (24-inch, M6)
               - apple,j873g # Mac mini (M6)
           - const: apple,t8152
           - const: apple,arm-platform

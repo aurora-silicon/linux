@@ -5,14 +5,14 @@
 
 &{/soc} {
 
-	hw_spi3: spi-controller@33110c000 {
-		compatible = "apple,t8152-spi-controller", "apple,spi-controller";
+	hw_spi3: spi@33110c000 {
+		compatible = "apple,t8152-spi", "apple,spi";
 		reg = <0x3 0x3110c000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 1408 IRQ_TYPE_LEVEL_HIGH>;
 		status = "disabled";
 	};
 
-	hw_apcie0_piodma: pcie-piodma@388030000 {
+	hw_apcie0_piodma: dma-controller@388030000 {
 		compatible = "apple,t8152-pcie-piodma", "apple,pcie-piodma";
 		reg = <0x3 0x88030000 0x0 0x4000>,
 		      <0x3 0x88034000 0x0 0x4000>,
@@ -22,8 +22,113 @@
 		status = "disabled";
 	};
 
-	hw_error_handler: error-monitor@288d80000 {
-		compatible = "apple,t8152-error-monitor", "apple,error-monitor";
+	hw_acio0: usb4@401f00000 {
+		compatible = "apple,t8152-usb4-nhi", "apple,usb4-nhi";
+		reg = <0x4 0x1f00000 0x0 0x100000>,
+		      <0x4 0x1ac0000 0x0 0x4000>,
+		      <0x4 0x1ac4000 0x0 0x4000>,
+		      <0x4 0x1ac8000 0x0 0x4000>,
+		      <0x4 0x1e44000 0x0 0x4000>,
+		      <0x4 0x1c80000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 1641 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1642 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1643 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1644 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1645 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1646 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1647 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1648 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1649 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1650 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1651 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1652 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1629 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1630 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1631 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1632 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1633 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1634 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1635 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1636 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1637 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1638 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1639 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1640 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	hw_acio1: usb4@409f00000 {
+		compatible = "apple,t8152-usb4-nhi", "apple,usb4-nhi";
+		reg = <0x4 0x9f00000 0x0 0x100000>,
+		      <0x4 0x9ac0000 0x0 0x4000>,
+		      <0x4 0x9ac4000 0x0 0x4000>,
+		      <0x4 0x9ac8000 0x0 0x4000>,
+		      <0x4 0x9e44000 0x0 0x4000>,
+		      <0x4 0x9c80000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 1712 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1713 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1714 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1715 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1716 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1717 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1718 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1719 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1720 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1721 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1722 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1723 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1700 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1701 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1702 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1703 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1704 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1705 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1706 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1707 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1708 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1709 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1710 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1711 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	hw_acio3: usb4@411f00000 {
+		compatible = "apple,t8152-usb4-nhi", "apple,usb4-nhi";
+		reg = <0x4 0x11f00000 0x0 0x100000>,
+		      <0x4 0x11ac0000 0x0 0x4000>,
+		      <0x4 0x11ac4000 0x0 0x4000>,
+		      <0x4 0x11ac8000 0x0 0x4000>,
+		      <0x4 0x11e44000 0x0 0x4000>,
+		      <0x4 0x11c80000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 1854 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1855 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1856 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1857 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1858 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1859 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1860 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1861 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1862 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1863 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1864 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1865 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1842 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1843 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1844 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1845 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1846 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1847 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1848 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1849 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1850 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1851 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1852 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1853 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	hw_error_handler: error-handler@288d80000 {
+		compatible = "apple,t8152-error-handler", "apple,soc-error-handler";
 		reg = <0x2 0x88d80000 0x0 0x40000>,
 		      <0x2 0x88980000 0x0 0x8000>,
 		      <0x3 0x0 0x0 0x40000>,
@@ -242,8 +347,8 @@
 		status = "disabled";
 	};
 
-	hw_dart_usb0: dart-complex@403020000 {
-		compatible = "apple,t8152-dart-complex", "apple,dart-complex";
+	hw_dart_usb0: iommu@403020000 {
+		compatible = "apple,t8152-dart", "apple,dart";
 		reg = <0x4 0x3020000 0x0 0xc000>,
 		      <0x4 0x3040000 0x0 0xc000>;
 		#iommu-cells = <1>;
@@ -251,8 +356,8 @@
 		status = "disabled";
 	};
 
-	hw_dart_usb1: dart-complex@40b020000 {
-		compatible = "apple,t8152-dart-complex", "apple,dart-complex";
+	hw_dart_usb1: iommu@40b020000 {
+		compatible = "apple,t8152-dart", "apple,dart";
 		reg = <0x4 0xb020000 0x0 0xc000>,
 		      <0x4 0xb040000 0x0 0xc000>;
 		#iommu-cells = <1>;
@@ -260,8 +365,8 @@
 		status = "disabled";
 	};
 
-	hw_dart_usb2: dart-complex@383020000 {
-		compatible = "apple,t8152-dart-complex", "apple,dart-complex";
+	hw_dart_usb2: iommu@383020000 {
+		compatible = "apple,t8152-dart", "apple,dart";
 		reg = <0x3 0x83020000 0x0 0xc000>,
 		      <0x3 0x83040000 0x0 0xc000>;
 		#iommu-cells = <1>;
@@ -269,8 +374,8 @@
 		status = "disabled";
 	};
 
-	hw_usb_drd2: usb-drd-complex@382430000 {
-		compatible = "apple,t8152-usb-drd-complex", "apple,usb-drd-complex";
+	hw_usb_drd2: usb@382430000 {
+		compatible = "apple,t8152-dwc3", "apple,dwc3";
 		reg = <0x3 0x82430000 0x0 0x11800>,
 		      <0x3 0x82440000 0x0 0x4000>,
 		      <0x3 0x8243c000 0x0 0x5800>,
@@ -290,8 +395,8 @@
 		status = "disabled";
 	};
 
-	hw_dart_usb3: dart-complex@413020000 {
-		compatible = "apple,t8152-dart-complex", "apple,dart-complex";
+	hw_dart_usb3: iommu@413020000 {
+		compatible = "apple,t8152-dart", "apple,dart";
 		reg = <0x4 0x13020000 0x0 0xc000>,
 		      <0x4 0x13040000 0x0 0xc000>;
 		#iommu-cells = <1>;
@@ -299,10 +404,20 @@
 		status = "disabled";
 	};
 
+	hw_avd: video-decoder@484000000 {
+		compatible = "apple,t8152-avd", "apple,avd";
+		reg = <0x4 0x84000000 0x0 0x163c000>,
+		      <0x3 0x8078000 0x0 0x4000>,
+		      <0x3 0x16000000 0x0 0x1c000>;
+		interrupts = <AIC_IRQ 308 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 268 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
 
 };
 
-/* Present in the static board template, absent from the live snapshot. */
+/* Static template resource omitted from the live snapshot. */
 &{/soc} {
 	hw_rsm: rsm@309825000 {
 		compatible = "apple,t8152-rsm", "apple,rsm";

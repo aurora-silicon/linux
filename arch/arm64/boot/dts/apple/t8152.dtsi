@@ -270,3 +270,15 @@
 		};
 	};
 };
+
+&{/soc} {
+	uart0: serial@331200000 {
+		compatible = "apple,s5l-uart";
+		reg = <0x3 0x31200000 0 0x4000>;
+		reg-io-width = <4>;
+		interrupts = <AIC_IRQ 1397 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clkref>, <&clkref>;
+		clock-names = "uart", "clk_uart_baud0";
+		status = "disabled";
+	};
+};

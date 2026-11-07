@@ -2,6 +2,7 @@
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/media/apple,jpeg.yaml#
+
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
 title: Apple Silicon JPEG codec
@@ -19,61 +20,145 @@ description: |
   the engine's 32-bit buffer pointer registers. T8140 engines take 64-bit
   buffer addresses and use their DART's full window.
 
-properties:
-  compatible:
-    enum:
-      - apple,t6041-jpeg
-      - apple,t8140-jpeg
-
-  reg:
-    maxItems: 1
-
-  interrupts:
-    maxItems: 1
-
-  iommus:
-    maxItems: 1
-
-  power-domains:
-    minItems: 1
-    items:
-      - description: The engine's power domain
-      - description: Performance request held while the engine works
-
-  power-domain-names:
-    minItems: 1
-    items:
-      - const: core
-      - const: perf
-
-  apple,dma-range:
-    $ref: /schemas/types.yaml#/definitions/uint64-array
-    items:
-      - const: 0x10000000000
-      - const: 0x100000000
-    description: Device-visible DMA window, as a 64-bit base and size.
-      Only for engines with 32-bit buffer pointers.
-
-required:
-  - compatible
-  - reg
-  - interrupts
-  - iommus
-  - power-domains
-
-allOf:
-  - if:
+select:
+  anyOf:
+    -
       properties:
         compatible:
-          const: apple,t6041-jpeg
-    then:
+          contains:
+            enum:
+              - "apple,t6041-jpeg"
+              - "apple,t8140-jpeg"
       required:
-        - apple,dma-range
-    else:
+        - "compatible"
+    -
       properties:
-        apple,dma-range: false
+        compatible:
+          allOf:
+            -
+              contains:
+                enum:
+                  - "apple,t8142-jpeg"
+                  - "apple,t8152-jpeg"
+                  - "apple,t6050-jpeg"
+            -
+              contains:
+                const: "apple,jpeg"
+      required:
+        - "compatible"
+allOf:
+  -
+    if:
+      anyOf:
+        -
+          properties:
+            compatible:
+              allOf:
+                -
+                  contains:
+                    enum:
+                      - "apple,t8142-jpeg"
+                      - "apple,t8152-jpeg"
+                      - "apple,t6050-jpeg"
+                -
+                  contains:
+                    const: "apple,jpeg"
+            status:
+              const: "disabled"
+          required:
+            - "compatible"
+            - "status"
+          not:
+            required:
+              - "mboxes"
+    then:
+      oneOf:
+        -
+          description: "Apple jpeg codec and shared register windows. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          properties:
+            compatible:
+              items:
+                -
+                  enum:
+                    - "apple,t8142-jpeg"
+                    - "apple,t8152-jpeg"
+                    - "apple,t6050-jpeg"
+                -
+                  const: "apple,jpeg"
+            status:
+              const: "disabled"
+            reg:
+              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              minItems: 1
+              maxItems: 2
+            interrupts:
+              description: "Interrupt lines wired to the system interrupt controller."
+              maxItems: 1
+            iommus:
+              description: "DMA translation streams emitted by this hardware."
+              maxItems: 1
+          required:
+            - "compatible"
+            - "reg"
+            - "status"
+          additionalProperties: false
+    else:
+      $ref: "#/$defs/legacy-driver"
 
-additionalProperties: false
+$defs:
+  legacy-driver:
+    properties:
+      compatible:
+        enum:
+          - apple,t6041-jpeg
+          - apple,t8140-jpeg
+
+      reg:
+        maxItems: 1
+
+      interrupts:
+        maxItems: 1
+
+      iommus:
+        maxItems: 1
+
+      power-domains:
+        minItems: 1
+        items:
+          - description: The engine's power domain
+          - description: Performance request held while the engine works
+
+      power-domain-names:
+        minItems: 1
+        items:
+          - const: core
+          - const: perf
+
+      apple,dma-range:
+        $ref: /schemas/types.yaml#/definitions/uint64-array
+        items:
+          - const: 0x10000000000
+          - const: 0x100000000
+        description: Device-visible DMA window, as a 64-bit base and size.
+          Only for engines with 32-bit buffer pointers.
+    required:
+      - compatible
+      - reg
+      - interrupts
+      - iommus
+      - power-domains
+    allOf:
+      - if:
+          properties:
+            compatible:
+              const: apple,t6041-jpeg
+        then:
+          required:
+            - apple,dma-range
+        else:
+          properties:
+            apple,dma-range: false
+    additionalProperties: false
 
 examples:
   - |
