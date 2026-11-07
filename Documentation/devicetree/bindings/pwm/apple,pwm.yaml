@@ -26,6 +26,7 @@ select:
           - apple,t8103-pwm
           - apple,t8112-pwm
           - apple,t8122-pwm
+          - apple,t8132-pwm
   required:
     - compatible
 
@@ -37,6 +38,7 @@ properties:
           - apple,t8103-pwm
           - apple,t8112-pwm
           - apple,t8122-pwm
+          - apple,t8132-pwm
       - const: apple,pwm
 
   reg:
