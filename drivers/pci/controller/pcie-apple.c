@@ -2406,6 +2406,18 @@ static int apple_pcie_t6050_shared_phy_on(struct apple_pcie *pcie)
 	return 0;
 }
 
+/* The port's DART answers once the root complex is up (apple,manual-availability) */
+static void apple_pcie_dart_available(struct apple_pcie_port *port)
+{
+	struct of_phandle_args iommu = {};
+
+	if (of_map_iommu_id(port->pcie->dev->of_node, port->adopted_bus << 8, &iommu) ||
+	    !iommu.np)
+		return;
+	apple_dart_make_available(iommu.np);
+	of_node_put(iommu.np);
+}
+
 static int apple_pcie_t6050_cold_train(struct apple_pcie_port *port)
 {
 	struct apple_pcie *pcie = port->pcie;
@@ -2846,6 +2858,7 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 		}
 		if (ret)
 			goto err_teardown;
+		apple_pcie_dart_available(port);
 	} else {
 		if (pcie->hw->retain_clocks)
 			rmw_set(PORT_APPCLK_EN, port->base + PORT_APPCLK);
