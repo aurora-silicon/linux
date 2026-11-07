@@ -8,8 +8,8 @@
 		compatible = "apple,t6050-i2c", "apple,t8103-i2c";
 		reg = <0x5 0x5024000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 1380 IRQ_TYPE_LEVEL_HIGH>;
-		clocks = <&clkref>;
 		status = "disabled";
+		clocks = <&clkref>;
 		#address-cells = <1>;
 		#size-cells = <0>;
 	};
@@ -18,8 +18,8 @@
 		compatible = "apple,t6050-i2c", "apple,t8103-i2c";
 		reg = <0x5 0x502c000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 1382 IRQ_TYPE_LEVEL_HIGH>;
-		clocks = <&clkref>;
 		status = "disabled";
+		clocks = <&clkref>;
 		#address-cells = <1>;
 		#size-cells = <0>;
 	};
@@ -28,8 +28,8 @@
 		compatible = "apple,t6050-i2c", "apple,t8103-i2c";
 		reg = <0x5 0x501c000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 1378 IRQ_TYPE_LEVEL_HIGH>;
-		clocks = <&clkref>;
 		status = "disabled";
+		clocks = <&clkref>;
 		#address-cells = <1>;
 		#size-cells = <0>;
 	};
@@ -38,36 +38,36 @@
 		compatible = "apple,t6050-i2c", "apple,t8103-i2c";
 		reg = <0x5 0x5020000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 1379 IRQ_TYPE_LEVEL_HIGH>;
-		clocks = <&clkref>;
 		status = "disabled";
+		clocks = <&clkref>;
 		#address-cells = <1>;
 		#size-cells = <0>;
 	};
 
-	hw_spi2: spi-controller@505108000 {
-		compatible = "apple,t6050-spi-controller", "apple,spi-controller";
+	hw_spi2: spi@505108000 {
+		compatible = "apple,t6050-spi", "apple,spi";
 		reg = <0x5 0x5108000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 1369 IRQ_TYPE_LEVEL_HIGH>;
 		status = "disabled";
 	};
 
-	hw_spi4: spi-controller@505110000 {
-		compatible = "apple,t6050-spi-controller", "apple,spi-controller";
+	hw_spi4: spi@505110000 {
+		compatible = "apple,t6050-spi", "apple,spi";
 		reg = <0x5 0x5110000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 1371 IRQ_TYPE_LEVEL_HIGH>;
 		status = "disabled";
 	};
 
-	hw_nub_spmi_a1: spmi-complex@28a1a8000 {
-		compatible = "apple,t6050-spmi-complex", "apple,spmi-complex";
+	hw_nub_spmi_a1: spmi@28a1a8000 {
+		compatible = "apple,t6050-spmi", "apple,spmi";
 		reg = <0x2 0x8a1a8000 0x0 0x4000>,
 		      <0x2 0x8a1a4000 0x0 0x4000>,
 		      <0x2 0x8a1a0000 0x0 0x4000>;
 		status = "disabled";
 	};
 
-	hw_dart_isp0: dart-complex@5828c0000 {
-		compatible = "apple,t6050-dart-complex", "apple,dart-complex";
+	hw_dart_isp0: iommu@5828c0000 {
+		compatible = "apple,t6050-dart", "apple,dart";
 		reg = <0x5 0x828c0000 0x0 0xc000>,
 		      <0x5 0x828e0000 0x0 0xc000>,
 		      <0x5 0x82900000 0x0 0xc000>,
@@ -79,15 +79,15 @@
 		status = "disabled";
 	};
 
-	hw_dart_apcie1: dart-complex@411000000 {
-		compatible = "apple,t6050-dart-complex", "apple,dart-complex";
+	hw_dart_apcie1: iommu@411000000 {
+		compatible = "apple,t6050-dart", "apple,dart";
 		reg = <0x4 0x11000000 0x0 0x20000>;
 		#iommu-cells = <1>;
 		interrupts = <AIC_IRQ 0 1532 IRQ_TYPE_LEVEL_HIGH>;
 		status = "disabled";
 	};
 
-	hw_apcie1_piodma: pcie-piodma@411030000 {
+	hw_apcie1_piodma: dma-controller@411030000 {
 		compatible = "apple,t6050-pcie-piodma", "apple,pcie-piodma";
 		reg = <0x4 0x11030000 0x0 0x4000>,
 		      <0x4 0x11034000 0x0 0x4000>,
@@ -122,8 +122,8 @@
 		status = "disabled";
 	};
 
-	hw_acio0: usb4-router@2a1f00000 {
-		compatible = "apple,t6050-usb4-router", "apple,usb4-router";
+	hw_acio0: usb4@2a1f00000 {
+		compatible = "apple,t6050-usb4-nhi", "apple,usb4-nhi";
 		reg = <0x2 0xa1f00000 0x0 0x100000>,
 		      <0x2 0xa1ac0000 0x0 0x4000>,
 		      <0x2 0xa1ac4000 0x0 0x4000>,
@@ -159,8 +159,8 @@
 		status = "disabled";
 	};
 
-	hw_acio1: usb4-router@2a9f00000 {
-		compatible = "apple,t6050-usb4-router", "apple,usb4-router";
+	hw_acio1: usb4@2a9f00000 {
+		compatible = "apple,t6050-usb4-nhi", "apple,usb4-nhi";
 		reg = <0x2 0xa9f00000 0x0 0x100000>,
 		      <0x2 0xa9ac0000 0x0 0x4000>,
 		      <0x2 0xa9ac4000 0x0 0x4000>,
@@ -196,8 +196,8 @@
 		status = "disabled";
 	};
 
-	hw_acio2: usb4-router@381f00000 {
-		compatible = "apple,t6050-usb4-router", "apple,usb4-router";
+	hw_acio2: usb4@381f00000 {
+		compatible = "apple,t6050-usb4-nhi", "apple,usb4-nhi";
 		reg = <0x3 0x81f00000 0x0 0x100000>,
 		      <0x3 0x81ac0000 0x0 0x4000>,
 		      <0x3 0x81ac4000 0x0 0x4000>,
@@ -263,8 +263,8 @@
 		status = "disabled";
 	};
 
-	hw_dart_disp0: dart-complex@48a300000 {
-		compatible = "apple,t6050-dart-complex", "apple,dart-complex";
+	hw_dart_disp0: iommu@48a300000 {
+		compatible = "apple,t6050-dart", "apple,dart";
 		reg = <0x4 0x8a300000 0x0 0xc000>,
 		      <0x4 0x8a314000 0x0 0x4000>;
 		#iommu-cells = <1>;
@@ -272,8 +272,8 @@
 		status = "disabled";
 	};
 
-	hw_dcp0_expert: display-expert@48a3ac058 {
-		compatible = "apple,t6050-display-expert", "apple,display-expert";
+	hw_dcp0_expert: dcp-expert@48a3ac058 {
+		compatible = "apple,t6050-dcp-expert", "apple,dcp-expert";
 		reg = <0x4 0x8a3ac058 0x0 0x4>,
 		      <0x4 0x8a374000 0x0 0x40>,
 		      <0x4 0x8a370000 0x0 0x40>,
@@ -291,8 +291,8 @@
 		status = "disabled";
 	};
 
-	hw_dcp: display-coproc@48ae00000 {
-		compatible = "apple,t6050-display-coproc", "apple,display-coproc";
+	hw_dcp: dcp@48ae00000 {
+		compatible = "apple,t6050-dcp", "apple,dcp";
 		reg = <0x4 0x8ae00000 0x0 0x88000>,
 		      <0x4 0x8a850000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 1044 IRQ_TYPE_LEVEL_HIGH>,
@@ -307,29 +307,30 @@
 		status = "disabled";
 	};
 
-	hw_dart_dcp: dart-complex@48a340000 {
-		compatible = "apple,t6050-dart-complex", "apple,dart-complex";
+	hw_dart_dcp: iommu@48a340000 {
+		compatible = "apple,t6050-dart", "apple,dart";
 		reg = <0x4 0x8a340000 0x0 0x20000>;
 		#iommu-cells = <1>;
 		interrupts = <AIC_IRQ 0 990 IRQ_TYPE_LEVEL_HIGH>;
 		status = "disabled";
 	};
 
-	hw_dart_disp0_isoc: dart-complex@48a180000 {
-		compatible = "apple,t6050-dart-complex", "apple,dart-complex";
+	hw_dart_disp0_isoc: iommu@48a180000 {
+		compatible = "apple,t6050-dart", "apple,dart";
 		reg = <0x4 0x8a180000 0x0 0x20000>;
 		#iommu-cells = <1>;
 		interrupts = <AIC_IRQ 0 1013 IRQ_TYPE_LEVEL_HIGH>;
 		status = "disabled";
 	};
 
-	hw_admac_disp0: admac-complex@48a140000 {
-		compatible = "apple,t6050-admac-complex", "apple,admac-complex";
+	hw_admac_disp0: dma-controller@48a140000 {
+		compatible = "apple,t6050-admac", "apple,admac";
 		reg = <0x4 0x8a140000 0x0 0x24000>,
 		      <0x2 0x88328000 0x0 0x8>;
 		interrupts = <AIC_IRQ 0 1012 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&hw_dart_disp0_isoc 30>;
 		status = "disabled";
+		#dma-cells = <1>;
 	};
 
 	hw_admac_disp0_ced_ssw: admac-control@48a2f4000 {
@@ -340,8 +341,8 @@
 		status = "disabled";
 	};
 
-	hw_avd0: video-decoder-complex@2308000000 {
-		compatible = "apple,t6050-video-decoder-complex", "apple,video-decoder-complex";
+	hw_avd0: video-decoder@2308000000 {
+		compatible = "apple,t6050-avd", "apple,avd";
 		reg = <0x23 0x8000000 0x0 0x1404000>,
 		      <0x23 0x88090000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 2417 IRQ_TYPE_LEVEL_HIGH>,
@@ -350,8 +351,8 @@
 		status = "disabled";
 	};
 
-	hw_dart_avd0: dart-complex@2309020000 {
-		compatible = "apple,t6050-dart-complex", "apple,dart-complex";
+	hw_dart_avd0: iommu@2309020000 {
+		compatible = "apple,t6050-dart", "apple,dart";
 		reg = <0x23 0x9020000 0x0 0x20000>,
 		      <0x2 0x74000000 0x0 0x4000>;
 		#iommu-cells = <1>;
@@ -359,12 +360,13 @@
 		status = "disabled";
 	};
 
-	hw_admac_leap_s: admac-complex@293200000 {
-		compatible = "apple,t6050-admac-complex", "apple,admac-complex";
+	hw_admac_leap_s: dma-controller@293200000 {
+		compatible = "apple,t6050-admac", "apple,admac";
 		reg = <0x2 0x93200000 0x0 0x34000>,
 		      <0x2 0x88328000 0x0 0x8>;
 		interrupts = <AIC_IRQ 0 638 IRQ_TYPE_LEVEL_HIGH>;
 		status = "disabled";
+		#dma-cells = <1>;
 	};
 
 	hw_admac_hp_mic_ec_proxy: audio-dma-proxy@4d3200000 {

@@ -2,6 +2,7 @@
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/pwm/apple,s5l-fpwm.yaml#
+
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
 title: Apple FPWM controller
@@ -12,41 +13,137 @@ maintainers:
 
 description: PWM controller used for keyboard backlight on ARM Macs
 
-properties:
-  compatible:
-    items:
-      - enum:
-          - apple,t8103-fpwm
-          - apple,t8112-fpwm
-          - apple,t8122-fpwm
-          - apple,t8142-fpwm
-          - apple,t8132-fpwm
-          - apple,t6000-fpwm
-          - apple,t6020-fpwm
-          - apple,t6030-fpwm
-          - apple,t6031-fpwm
-          - apple,t6041-fpwm
-          - apple,t6050-fpwm
-      - const: apple,s5l-fpwm
+select:
+  anyOf:
+    -
+      properties:
+        compatible:
+          contains:
+            enum:
+              - "apple,s5l-fpwm"
+              - "apple,t6000-fpwm"
+              - "apple,t6020-fpwm"
+              - "apple,t6030-fpwm"
+              - "apple,t6031-fpwm"
+              - "apple,t6041-fpwm"
+              - "apple,t6050-fpwm"
+              - "apple,t8103-fpwm"
+              - "apple,t8112-fpwm"
+              - "apple,t8122-fpwm"
+              - "apple,t8132-fpwm"
+              - "apple,t8142-fpwm"
+      required:
+        - "compatible"
+    -
+      properties:
+        compatible:
+          allOf:
+            -
+              contains:
+                enum:
+                  - "apple,t8142-fpwm"
+                  - "apple,t8152-fpwm"
+            -
+              contains:
+                const: "apple,s5l-fpwm"
+      required:
+        - "compatible"
+allOf:
+  -
+    if:
+      anyOf:
+        -
+          properties:
+            compatible:
+              allOf:
+                -
+                  contains:
+                    enum:
+                      - "apple,t8142-fpwm"
+                      - "apple,t8152-fpwm"
+                -
+                  contains:
+                    const: "apple,s5l-fpwm"
+            status:
+              const: "disabled"
+          required:
+            - "compatible"
+            - "status"
+          not:
+            required:
+              - "mboxes"
+    then:
+      oneOf:
+        -
+          description: "Apple fixed-frequency pwm controller. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          properties:
+            compatible:
+              items:
+                -
+                  enum:
+                    - "apple,t8142-fpwm"
+                    - "apple,t8152-fpwm"
+                -
+                  const: "apple,s5l-fpwm"
+            status:
+              const: "disabled"
+            reg:
+              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              maxItems: 1
+            interrupts:
+              description: "Interrupt lines wired to the system interrupt controller."
+              maxItems: 1
+            power-domains:
+              description: "Power and combined clock gates required by this hardware."
+              maxItems: 1
+            "#pwm-cells":
+              const: 2
+            clocks:
+              maxItems: 1
+          required:
+            - "compatible"
+            - "reg"
+            - "status"
+            - "#pwm-cells"
+          additionalProperties: false
+    else:
+      $ref: "#/$defs/legacy-driver"
 
-  reg:
-    maxItems: 1
+$defs:
+  legacy-driver:
+    properties:
+      compatible:
+        items:
+          - enum:
+              - apple,t8103-fpwm
+              - apple,t8112-fpwm
+              - apple,t8122-fpwm
+              - apple,t8142-fpwm
+              - apple,t8132-fpwm
+              - apple,t6000-fpwm
+              - apple,t6020-fpwm
+              - apple,t6030-fpwm
+              - apple,t6031-fpwm
+              - apple,t6041-fpwm
+              - apple,t6050-fpwm
+          - const: apple,s5l-fpwm
 
-  clocks:
-    maxItems: 1
+      reg:
+        maxItems: 1
 
-  power-domains:
-    maxItems: 1
+      clocks:
+        maxItems: 1
 
-  "#pwm-cells":
-    const: 2
+      power-domains:
+        maxItems: 1
 
-required:
-  - compatible
-  - reg
-  - clocks
-
-additionalProperties: false
+      "#pwm-cells":
+        const: 2
+    required:
+      - compatible
+      - reg
+      - clocks
+    additionalProperties: false
 
 examples:
   - |

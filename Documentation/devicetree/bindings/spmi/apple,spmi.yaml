@@ -2,6 +2,7 @@
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/spmi/apple,spmi.yaml#
+
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
 title: Apple SPMI controller
@@ -11,58 +12,147 @@ maintainers:
 
 description: A SPMI controller present on most Apple SoCs
 
+select:
+  anyOf:
+    -
+      properties:
+        compatible:
+          contains:
+            enum:
+              - "apple,spmi"
+              - "apple,t6000-spmi"
+              - "apple,t6020-spmi"
+              - "apple,t6030-spmi"
+              - "apple,t6031-spmi"
+              - "apple,t6041-spmi"
+              - "apple,t8012-spmi"
+              - "apple,t8015-spmi"
+              - "apple,t8103-spmi"
+              - "apple,t8112-spmi"
+              - "apple,t8122-spmi"
+              - "apple,t8132-spmi"
+              - "apple,t8140-spmi"
+              - "apple,t8142-spmi"
+      required:
+        - "compatible"
+    -
+      properties:
+        compatible:
+          allOf:
+            -
+              contains:
+                enum:
+                  - "apple,t8142-spmi"
+                  - "apple,t8152-spmi"
+                  - "apple,t6050-spmi"
+            -
+              contains:
+                const: "apple,spmi"
+      required:
+        - "compatible"
 allOf:
-  - $ref: spmi.yaml#
+  -
+    if:
+      anyOf:
+        -
+          properties:
+            compatible:
+              allOf:
+                -
+                  contains:
+                    enum:
+                      - "apple,t8142-spmi"
+                      - "apple,t8152-spmi"
+                      - "apple,t6050-spmi"
+                -
+                  contains:
+                    const: "apple,spmi"
+            status:
+              const: "disabled"
+          required:
+            - "compatible"
+            - "status"
+          not:
+            required:
+              - "mboxes"
+    then:
+      oneOf:
+        -
+          description: "Apple spmi controller register complex. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          properties:
+            compatible:
+              items:
+                -
+                  enum:
+                    - "apple,t8142-spmi"
+                    - "apple,t8152-spmi"
+                    - "apple,t6050-spmi"
+                -
+                  const: "apple,spmi"
+            status:
+              const: "disabled"
+            reg:
+              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              minItems: 3
+              maxItems: 3
+          required:
+            - "compatible"
+            - "reg"
+            - "status"
+          additionalProperties: false
+    else:
+      $ref: "#/$defs/legacy-driver"
 
-properties:
-  compatible:
-    oneOf:
-      - items:
-          - enum:
-              - apple,t6020-spmi
-              - apple,t6030-spmi
-              - apple,t6031-spmi
-              - apple,t6041-spmi
-              - apple,t8012-spmi
-              - apple,t8015-spmi
-              - apple,t8122-spmi
-              - apple,t8132-spmi
-              - apple,t8140-spmi
-          - const: apple,t8103-spmi
-      - items:
-          - enum:
-              # Do not add additional SoC to this list.
-              - apple,t8103-spmi
-              - apple,t6000-spmi
-              - apple,t8112-spmi
-          - const: apple,spmi
-      - const: apple,t8142-spmi
+$defs:
+  legacy-driver:
+    allOf:
+      - $ref: spmi.yaml#
+    properties:
+      compatible:
+        oneOf:
+          - items:
+              - enum:
+                  - apple,t6020-spmi
+                  - apple,t6030-spmi
+                  - apple,t6031-spmi
+                  - apple,t6041-spmi
+                  - apple,t8012-spmi
+                  - apple,t8015-spmi
+                  - apple,t8122-spmi
+                  - apple,t8132-spmi
+                  - apple,t8140-spmi
+              - const: apple,t8103-spmi
+          - items:
+              - enum:
+                  # Do not add additional SoC to this list.
+                  - apple,t8103-spmi
+                  - apple,t6000-spmi
+                  - apple,t8112-spmi
+              - const: apple,spmi
+          - const: apple,t8142-spmi
 
-  reg:
-    maxItems: 1
+      reg:
+        maxItems: 1
 
-  interrupts:
-    maxItems: 1
-    description: Optional, operates in polled mode if not present
+      interrupts:
+        maxItems: 1
+        description: Optional, operates in polled mode if not present
 
-  interrupt-controller: true
+      interrupt-controller: true
 
-  "#interrupt-cells":
-    const: 2
+      "#interrupt-cells":
+        const: 2
 
-  power-domains:
-    maxItems: 1
-
-required:
-  - compatible
-  - reg
-
-dependentRequired:
-  interrupt-controller:
-    - "#interrupt-cells"
-    - interrupts
-
-unevaluatedProperties: false
+      power-domains:
+        maxItems: 1
+    required:
+      - compatible
+      - reg
+    dependentRequired:
+      interrupt-controller:
+        - "#interrupt-cells"
+        - interrupts
+    unevaluatedProperties: false
 
 examples:
   - |

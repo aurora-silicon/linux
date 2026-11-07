@@ -2,6 +2,7 @@
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/pci/apple,pcie.yaml#
+
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
 title: Apple PCIe host controller
@@ -36,6 +37,169 @@ description: |
   distributed over the root ports as the OS sees fit by programming
   the PCIe controller's port registers.
 
+select:
+  anyOf:
+    -
+      properties:
+        compatible:
+          contains:
+            enum:
+              - "apple,pcie"
+              - "apple,t6000-pcie"
+              - "apple,t6000-pciec"
+              - "apple,t6020-pcie"
+              - "apple,t6020-pcie-ge"
+              - "apple,t6030-pcie"
+              - "apple,t6031-pcie"
+              - "apple,t6041-pcie"
+              - "apple,t8103-pcie"
+              - "apple,t8103-pciec"
+              - "apple,t8112-pcie"
+              - "apple,t8112-pciec"
+              - "apple,t8122-pcie"
+              - "apple,t8122-pciec"
+              - "apple,t8132-pcie"
+              - "apple,t8132-pciec"
+              - "apple,t8140-pcie"
+              - "apple,t8152-pcie"
+      required:
+        - "compatible"
+    -
+      properties:
+        compatible:
+          allOf:
+            -
+              contains:
+                enum:
+                  - "apple,t8142-pcie"
+                  - "apple,t8152-pcie"
+            -
+              contains:
+                const: "apple,pcie"
+      required:
+        - "compatible"
+    -
+      properties:
+        compatible:
+          allOf:
+            -
+              contains:
+                enum:
+                  - "apple,t8142-pciec"
+                  - "apple,t8152-pciec"
+                  - "apple,t6050-pciec"
+            -
+              contains:
+                const: "apple,pciec"
+      required:
+        - "compatible"
+allOf:
+  -
+    if:
+      anyOf:
+        -
+          properties:
+            compatible:
+              allOf:
+                -
+                  contains:
+                    enum:
+                      - "apple,t8142-pcie"
+                      - "apple,t8152-pcie"
+                -
+                  contains:
+                    const: "apple,pcie"
+            status:
+              const: "disabled"
+          required:
+            - "compatible"
+            - "status"
+          not:
+            required:
+              - "mboxes"
+        -
+          properties:
+            compatible:
+              allOf:
+                -
+                  contains:
+                    enum:
+                      - "apple,t8142-pciec"
+                      - "apple,t8152-pciec"
+                      - "apple,t6050-pciec"
+                -
+                  contains:
+                    const: "apple,pciec"
+            status:
+              const: "disabled"
+          required:
+            - "compatible"
+            - "status"
+          not:
+            required:
+              - "mboxes"
+    then:
+      oneOf:
+        -
+          description: "Apple pcie root complex and its port register windows. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          properties:
+            compatible:
+              items:
+                -
+                  enum:
+                    - "apple,t8142-pcie"
+                    - "apple,t8152-pcie"
+                -
+                  const: "apple,pcie"
+            status:
+              const: "disabled"
+            reg:
+              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              minItems: 26
+              maxItems: 28
+            interrupts:
+              description: "Interrupt lines wired to the system interrupt controller."
+              minItems: 3
+              maxItems: 4
+            power-domains:
+              description: "Power and combined clock gates required by this hardware."
+              minItems: 8
+              maxItems: 8
+          required:
+            - "compatible"
+            - "reg"
+            - "status"
+          additionalProperties: false
+        -
+          description: "Apple pcie tunnel controller. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          properties:
+            compatible:
+              items:
+                -
+                  enum:
+                    - "apple,t8142-pciec"
+                    - "apple,t8152-pciec"
+                    - "apple,t6050-pciec"
+                -
+                  const: "apple,pciec"
+            status:
+              const: "disabled"
+            reg:
+              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              minItems: 8
+              maxItems: 8
+            interrupts:
+              description: "Interrupt lines wired to the system interrupt controller."
+              minItems: 6
+              maxItems: 6
+          required:
+            - "compatible"
+            - "reg"
+            - "status"
+          additionalProperties: false
+    else:
+      $ref: "#/$defs/legacy-driver"
+
 $defs:
   tunable:
     $ref: /schemas/types.yaml#/definitions/uint32-matrix
@@ -45,324 +209,320 @@ $defs:
         - description: Mask of bits to clear
         - description: Bits to set
     description: Register initialization tuples for one controller region.
-
-properties:
-  compatible:
-    oneOf:
-      - items:
-          - enum:
-              - apple,t8103-pcie
-              - apple,t8112-pcie
-              - apple,t6000-pcie
-          - const: apple,pcie
-      - items:
-          - enum:
-              - apple,t6030-pcie
-              - apple,t6031-pcie
-              - apple,t6041-pcie
-              - apple,t8122-pcie
-          - const: apple,t6020-pcie
-      - const: apple,t6020-pcie
-      - items:
-          - const: apple,t6020-pcie-ge
-          - const: apple,t6020-pcie
-      - const: apple,t8140-pcie
-      - const: apple,t8152-pcie
-      - const: apple,t8132-pcie
-      - const: apple,t8103-pciec
-      - items:
-          - const: apple,t8112-pciec
-          - const: apple,t8103-pciec
-      - const: apple,t6000-pciec
-      - items:
-          - const: apple,t8132-pciec
-          - const: apple,t8122-pciec
-          - const: apple,t8103-pciec
-
-  apple,managed-sids:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
-    items:
-      - const: 1
-      - const: 2
-    description: >
-      J713 radio ordinary stream ownership profile. Only these inactive
-      normal streams and their exact-RID entries may be adopted by the OS.
-      Other streams and RID entries remain inherited. The documented static
-      SID16 bypass role may be initialized only from a disabled stream with
-      no valid root; an existing bypass remains unchanged. PIODMA and other
-      reserved roles are not modified. This does not authorize a controller
-      reset or takeover of active page tables. Both the radio DART and PCI
-      host describe the same two ordinary streams.
-
-  reg:
-    minItems: 3
-    maxItems: 10
-
-  reg-names:
-    minItems: 3
-    maxItems: 10
-
-  ranges:
-    minItems: 2
-    maxItems: 3
-
-  interrupts:
-    description:
-      Interrupt specifiers, one for each root port.
-    minItems: 1
-    maxItems: 4
-
-  msi-parent: true
-
-  msi-ranges:
-    maxItems: 1
-
-  apple,msi-vector-base:
-    $ref: /schemas/types.yaml#/definitions/uint32
-    description:
-      First vector of this PCIe-C controller's slice of the MSI window it
-      shares with the internal PCIe controller.
-
-  iommu-map: true
-  iommu-map-mask: true
-
-  power-domains:
-    maxItems: 1
-
-  resets:
-    description:
-      Reset of a tunneled (PCIe-C) controller and its DART, for controllers
-      the kernel initializes itself.
-    maxItems: 1
-
-  dma-coherent: true
-
-  apple,pciec-kernel-init:
-    type: boolean
-    description: |
-      The kernel initializes the tunneled controller when firmware has not
-      already initialized it. The compatible selects the initialization
-      sequence. T600x and T8112 use the Intr2AXI bridge and require tunables
-      for their associated DART before the tunnel children can be populated.
-
-  apple,tunable-rc:
-    $ref: '#/$defs/tunable'
-    description: Root-complex register initialization tuples.
-
-  apple,tunable-fabric:
-    $ref: '#/$defs/tunable'
-    description: Initialization tuples for the fabric register region.
-
-  apple,tunable-debug:
-    $ref: '#/$defs/tunable'
-    description: Initialization tuples for the debug register region.
-
-  apple,tunable-oe-fabric:
-    $ref: '#/$defs/tunable'
-    description: Initialization tuples for the oe-fabric register region.
-
-  apple,piodma:
-    $ref: /schemas/types.yaml#/definitions/phandle
-    description:
-      T8140 PIODMA bootstrap engine used before native downstream ECAM access.
-
-patternProperties:
-  "^pci@":
-    $ref: /schemas/pci/pci-bus.yaml#
-    type: object
-    description: A single PCI root port
-
+  legacy-driver:
     properties:
+      compatible:
+        oneOf:
+          - items:
+              - enum:
+                  - apple,t8103-pcie
+                  - apple,t8112-pcie
+                  - apple,t6000-pcie
+              - const: apple,pcie
+          - items:
+              - enum:
+                  - apple,t6030-pcie
+                  - apple,t6031-pcie
+                  - apple,t6041-pcie
+                  - apple,t8122-pcie
+              - const: apple,t6020-pcie
+          - const: apple,t6020-pcie
+          - items:
+              - const: apple,t6020-pcie-ge
+              - const: apple,t6020-pcie
+          - const: apple,t8140-pcie
+          - const: apple,t8152-pcie
+          - const: apple,t8132-pcie
+          - const: apple,t8103-pciec
+          - items:
+              - const: apple,t8112-pciec
+              - const: apple,t8103-pciec
+          - const: apple,t6000-pciec
+          - items:
+              - const: apple,t8132-pciec
+              - const: apple,t8122-pciec
+              - const: apple,t8103-pciec
+
+      apple,managed-sids:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        items:
+          - const: 1
+          - const: 2
+        description: >
+          J713 radio ordinary stream ownership profile. Only these inactive
+          normal streams and their exact-RID entries may be adopted by the OS.
+          Other streams and RID entries remain inherited. The documented static
+          SID16 bypass role may be initialized only from a disabled stream with
+          no valid root; an existing bypass remains unchanged. PIODMA and other
+          reserved roles are not modified. This does not authorize a controller
+          reset or takeover of active page tables. Both the radio DART and PCI
+          host describe the same two ordinary streams.
+
       reg:
+        minItems: 3
+        maxItems: 10
+
+      reg-names:
+        minItems: 3
+        maxItems: 10
+
+      ranges:
+        minItems: 2
+        maxItems: 3
+
+      interrupts:
+        description:
+          Interrupt specifiers, one for each root port.
+        minItems: 1
+        maxItems: 4
+
+      msi-parent: true
+
+      msi-ranges:
         maxItems: 1
 
-      pwren-gpios:
-        description: Optional GPIO to power on the device
+      apple,msi-vector-base:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description:
+          First vector of this PCIe-C controller's slice of the MSI window it
+          shares with the internal PCIe controller.
+
+      iommu-map: true
+      iommu-map-mask: true
+
+      power-domains:
         maxItems: 1
 
-      interrupt-controller: true
+      resets:
+        description:
+          Reset of a tunneled (PCIe-C) controller and its DART, for controllers
+          the kernel initializes itself.
+        maxItems: 1
 
-      apple,tunable:
+      dma-coherent: true
+
+      apple,pciec-kernel-init:
+        type: boolean
+        description: |
+          The kernel initializes the tunneled controller when firmware has not
+          already initialized it. The compatible selects the initialization
+          sequence. T600x and T8112 use the Intr2AXI bridge and require tunables
+          for their associated DART before the tunnel children can be populated.
+
+      apple,tunable-rc:
         $ref: '#/$defs/tunable'
-        description: Initialization tuples relative to this port's registers.
+        description: Root-complex register initialization tuples.
 
+      apple,tunable-fabric:
+        $ref: '#/$defs/tunable'
+        description: Initialization tuples for the fabric register region.
+
+      apple,tunable-debug:
+        $ref: '#/$defs/tunable'
+        description: Initialization tuples for the debug register region.
+
+      apple,tunable-oe-fabric:
+        $ref: '#/$defs/tunable'
+        description: Initialization tuples for the oe-fabric register region.
+
+      apple,piodma:
+        $ref: /schemas/types.yaml#/definitions/phandle
+        description:
+          T8140 PIODMA bootstrap engine used before native downstream ECAM access.
+    patternProperties:
+      "^pci@":
+        $ref: /schemas/pci/pci-bus.yaml#
+        type: object
+        description: A single PCI root port
+
+        properties:
+          reg:
+            maxItems: 1
+
+          pwren-gpios:
+            description: Optional GPIO to power on the device
+            maxItems: 1
+
+          interrupt-controller: true
+
+          apple,tunable:
+            $ref: '#/$defs/tunable'
+            description: Initialization tuples relative to this port's registers.
+
+        required:
+          - interrupt-controller
+          - "#interrupt-cells"
+          - interrupt-map-mask
+          - interrupt-map
+
+        unevaluatedProperties: false
     required:
-      - interrupt-controller
-      - "#interrupt-cells"
-      - interrupt-map-mask
-      - interrupt-map
-
+      - compatible
+      - reg
+      - reg-names
+      - bus-range
+      - interrupts
+      - msi-controller
+      - msi-parent
+      - msi-ranges
     unevaluatedProperties: false
-
-required:
-  - compatible
-  - reg
-  - reg-names
-  - bus-range
-  - interrupts
-  - msi-controller
-  - msi-parent
-  - msi-ranges
-
-unevaluatedProperties: false
-
-allOf:
-  - if:
-      properties:
-        compatible:
-          contains:
-            const: apple,t8132-pciec
-    then:
-      required:
-        - apple,msi-vector-base
-  - $ref: /schemas/pci/pci-host-bridge.yaml#
-  - $ref: /schemas/interrupt-controller/msi-controller.yaml#
-  - if:
-      properties:
-        compatible:
-          contains:
-            const: apple,t8140-pcie
-    then:
-      properties:
-        apple,piodma: true
-    else:
-      properties:
-        apple,piodma: false
-  - if:
-      properties:
-        compatible:
-          contains:
-            const: apple,t8103-pcie
-    then:
-      properties:
-        reg:
-          maxItems: 5
-        interrupts:
-          maxItems: 3
-  - if:
-      properties:
-        compatible:
-          contains:
-            const: apple,t6020-pcie
-    then:
-      properties:
-        reg-names:
-          minItems: 10
-  - if:
-      properties:
-        compatible:
-          contains:
-            enum:
-              - apple,t8103-pciec
-              - apple,t6000-pciec
-    then:
-      properties:
-        reg:
-          minItems: 5
-          maxItems: 9
-        reg-names:
-          oneOf:
-            - items:
-                - const: config
-                - const: rc
-                - const: port0
-                - const: fabric
-                - const: debug
-            - items:
-                - const: config
-                - const: rc
-                - const: port0
-                - const: fabric
-                - const: debug
-                - const: ltssm
-                - enum: [intr2axi, oe-fabric]
-            - items:
-                - const: config
-                - const: rc
-                - const: port0
-                - const: fabric
-                - const: debug
-                - const: ioa
-                - const: ltssm
-                - const: intr2axi
-                - const: oe-fabric
-        interrupts:
-          maxItems: 1
-        ranges:
-          minItems: 3
-          maxItems: 3
-    else:
-      properties:
-        resets: false
-        apple,pciec-kernel-init: false
-        apple,tunable-rc: false
-        apple,tunable-fabric: false
-        apple,tunable-debug: false
-        apple,tunable-oe-fabric: false
-        ranges:
-          maxItems: 2
-      allOf:
-        - if:
-            properties:
-              compatible:
-                contains:
-                  const: apple,t8140-pcie
-          then:
-            properties:
-              reg:
-                minItems: 8
-                maxItems: 8
-              reg-names:
-                items:
-                  - const: config
-                  - const: rc
-                  - const: port0
-                  - const: port1
-                  - const: port2
-                  - const: phy0
-                  - const: phy1
-                  - const: phy2
-              interrupts:
-                maxItems: 3
-          else:
-            if:
-              properties:
-                compatible:
-                  contains:
-                    const: apple,t8152-pcie
-            then:
-              properties:
-                reg:
-                  minItems: 4
-                  maxItems: 8
-                reg-names:
-                  minItems: 4
-                  maxItems: 8
-                  items:
-                    enum: [config, rc, port0, phy0, port1, phy1, port2, phy2]
-                interrupts:
-                  maxItems: 3
-            else:
-              properties:
-                reg-names:
-                  minItems: 3
-                  items:
+    allOf:
+      - if:
+          properties:
+            compatible:
+              contains:
+                const: apple,t8132-pciec
+        then:
+          required:
+            - apple,msi-vector-base
+      - $ref: /schemas/pci/pci-host-bridge.yaml#
+      - $ref: /schemas/interrupt-controller/msi-controller.yaml#
+      - if:
+          properties:
+            compatible:
+              contains:
+                const: apple,t8140-pcie
+        then:
+          properties:
+            apple,piodma: true
+        else:
+          properties:
+            apple,piodma: false
+      - if:
+          properties:
+            compatible:
+              contains:
+                const: apple,t8103-pcie
+        then:
+          properties:
+            reg:
+              maxItems: 5
+            interrupts:
+              maxItems: 3
+      - if:
+          properties:
+            compatible:
+              contains:
+                const: apple,t6020-pcie
+        then:
+          properties:
+            reg-names:
+              minItems: 10
+      - if:
+          properties:
+            compatible:
+              contains:
+                enum:
+                  - apple,t8103-pciec
+                  - apple,t6000-pciec
+        then:
+          properties:
+            reg:
+              minItems: 5
+              maxItems: 9
+            reg-names:
+              oneOf:
+                - items:
                     - const: config
                     - const: rc
                     - const: port0
-                    - const: port1
-                    - const: port2
-                    - const: port3
-                    - const: phy0
-                    - const: phy1
-                    - const: phy2
-                    - const: phy3
-      patternProperties:
-        "^pci@":
+                    - const: fabric
+                    - const: debug
+                - items:
+                    - const: config
+                    - const: rc
+                    - const: port0
+                    - const: fabric
+                    - const: debug
+                    - const: ltssm
+                    - enum: [intr2axi, oe-fabric]
+                - items:
+                    - const: config
+                    - const: rc
+                    - const: port0
+                    - const: fabric
+                    - const: debug
+                    - const: ioa
+                    - const: ltssm
+                    - const: intr2axi
+                    - const: oe-fabric
+            interrupts:
+              maxItems: 1
+            ranges:
+              minItems: 3
+              maxItems: 3
+        else:
           properties:
-            apple,tunable: false
-          required:
-            - reset-gpios
+            resets: false
+            apple,pciec-kernel-init: false
+            apple,tunable-rc: false
+            apple,tunable-fabric: false
+            apple,tunable-debug: false
+            apple,tunable-oe-fabric: false
+            ranges:
+              maxItems: 2
+          allOf:
+            - if:
+                properties:
+                  compatible:
+                    contains:
+                      const: apple,t8140-pcie
+              then:
+                properties:
+                  reg:
+                    minItems: 8
+                    maxItems: 8
+                  reg-names:
+                    items:
+                      - const: config
+                      - const: rc
+                      - const: port0
+                      - const: port1
+                      - const: port2
+                      - const: phy0
+                      - const: phy1
+                      - const: phy2
+                  interrupts:
+                    maxItems: 3
+              else:
+                if:
+                  properties:
+                    compatible:
+                      contains:
+                        const: apple,t8152-pcie
+                then:
+                  properties:
+                    reg:
+                      minItems: 4
+                      maxItems: 8
+                    reg-names:
+                      minItems: 4
+                      maxItems: 8
+                      items:
+                        enum: [config, rc, port0, phy0, port1, phy1, port2, phy2]
+                    interrupts:
+                      maxItems: 3
+                else:
+                  properties:
+                    reg-names:
+                      minItems: 3
+                      items:
+                        - const: config
+                        - const: rc
+                        - const: port0
+                        - const: port1
+                        - const: port2
+                        - const: port3
+                        - const: phy0
+                        - const: phy1
+                        - const: phy2
+                        - const: phy3
+          patternProperties:
+            "^pci@":
+              properties:
+                apple,tunable: false
+              required:
+                - reset-gpios
 
 examples:
   - |
