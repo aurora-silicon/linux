@@ -1331,3 +1331,5 @@
 #include "t8132-peripherals.dtsi"
 
 #include "t8132-peripheral-buses.dtsi"
+
+#include "t8132-error-handlers.dtsi"
