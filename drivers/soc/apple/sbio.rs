@@ -31,6 +31,10 @@ const LOCK_STATE_LOCKOUT: u16 = 0x40;
 /// Failed matches in a row after which Touch ID asks for the password, the
 /// limit macOS LocalAuthentication applies in a Touch ID prompt.
 const VERIFY_RETRY_LIMIT: u32 = 3;
+/// Extra frames macOS relays after a no-match before it concludes the touch.
+const NOMATCH_EXTRA_FRAMES: u32 = 3;
+/// How long the no-match tail waits for each extra frame of the same touch.
+const NOMATCH_FRAME_WAIT_MS: u64 = 500;
 /// Message tag of the enclave's "background operation result ready" notice.
 /// The host answers it with BG_OPS_RESULT (0x21); until it does, the result
 /// stays queued in the enclave.
@@ -178,6 +182,14 @@ mod lockout_tests {
         assert_eq!(operation_device_count(&[2, 0, 0, 0]), None);
         assert_eq!(operation_device_count(&[0, 0, 0]), None);
         assert_eq!(operation_device_count(&[0xff, 0xff, 0xff, 0xff]), None);
+    }
+
+    #[test]
+    fn no_match_tail_requests_are_empty() {
+        assert_eq!(sbio_match_extra_frame().opcode(), 0x3e);
+        assert!(sbio_match_extra_frame().payload().is_empty());
+        assert_eq!(sbio_match_conclude().opcode(), 0x0c);
+        assert!(sbio_match_conclude().payload().is_empty());
     }
 
     #[test]
@@ -462,6 +474,76 @@ impl SepData {
         };
 
         synced && policy_ok
+    }
+
+    /// Ends a prompt's match operation and unlock evaluation that are still
+    /// open (a prompt that ended without a match or the retry limit).
+    fn end_match_scope(&self, why: &CStr) {
+        self.match_scope_gen.store(0, Relaxed);
+        let Some(evaluation) = self.match_context.lock().take() else {
+            return;
+        };
+        match self.sbio_call(&crate::sbio::sbio_match_cancel()) {
+            SbioOutcome::Ok(_) => {
+                dev_info!(self.dev, "verify: match operation ended (MATCH_CANCEL) at {}\n", why)
+            }
+            _ => dev_warn!(self.dev, "verify: MATCH_CANCEL at {} failed\n", why),
+        }
+        self.close_unlock_evaluation(&evaluation);
+    }
+
+    /// The tail macOS sends after a no-match result (11-07 capture,
+    /// traces/touchid/20261107-macos-ident): three more frames of the touch,
+    /// each relayed (0x65) and followed by 0x3e, then 0x0c, then MATCH_POLICY.
+    fn no_match_tail(&self) {
+        let mut frames: u32 = 0;
+        while frames < NOMATCH_EXTRA_FRAMES {
+            if sensor::start_capture().is_err() {
+                break;
+            }
+            let advertised = match self.await_capture_within(NOMATCH_FRAME_WAIT_MS) {
+                CaptureWait::Ready(n) => n,
+                _ => break,
+            };
+            let Ok(capture) = sensor::read_capture(advertised) else {
+                break;
+            };
+            let relay = crate::sbio::SbioRelay::new(&capture);
+            if self.sbio_relay(&relay).is_none() {
+                break;
+            }
+            drop(capture);
+            let op = crate::sbio::sbio_match_extra_frame();
+            match self.sbio_transfer(&op) {
+                Ok(done) if done.status.is_ok() => frames += 1,
+                Ok(done) => {
+                    dev_warn!(
+                        self.dev,
+                        "verify: no-match tail: {} answered status {} ({} bytes)\n",
+                        op.name(),
+                        done.status,
+                        done.payload.len()
+                    );
+                    break;
+                }
+                Err(e) => {
+                    dev_warn!(self.dev, "verify: no-match tail: {} failed ({:?})\n", op.name(), e);
+                    break;
+                }
+            }
+        }
+        let op = crate::sbio::sbio_match_conclude();
+        match self.sbio_transfer(&op) {
+            Ok(done) => dev_info!(
+                self.dev,
+                "verify: no-match tail: {} extra frame(s) relayed (0x65 + 0x3e); {} answered status {}, {} bytes\n",
+                frames,
+                op.name(),
+                done.status,
+                done.payload.len()
+            ),
+            Err(e) => dev_warn!(self.dev, "verify: no-match tail: {} failed ({:?})\n", op.name(), e),
+        }
     }
 
     /// Starts a match operation (`0x7d`) and checks its device list.
@@ -2083,51 +2165,100 @@ impl SepData {
             self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY), token_bytes);
             return;
         }
-        let Some(evaluation) = self.open_unlock_evaluation(user) else {
-            dev_err!(
-                self.dev,
-                "verify: the unlock evaluation did not open; refusing before the capture. This is not a non-matching finger\n"
-            );
-            let _ = sensor::idle();
-            self.sensor_kept.store(false, Relaxed);
-            sensor::power(false);
-            self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE), token_bytes);
-            return;
+        // macOS keeps one match operation and one unlock evaluation for every
+        // touch of a Touch ID prompt and ends them when the prompt ends: on a
+        // match, when it stops after the retry limit, or when the prompt goes
+        // away (11-07 capture: one OPERATION_DEVICE_LIST for three touches,
+        // MATCH_CANCEL only after the third). Here a prompt is one open of the
+        // Touch ID device: fprintd claims it for one PAM authentication.
+        let open_gen = self.bio_open_gen.load(Relaxed);
+        let current = if self.match_scope_gen.load(Relaxed) == open_gen {
+            *self.match_context.lock()
+        } else {
+            None
         };
-        // Open the enclave's match operation before the first image, as
-        // macOS does at every match start; MATCH_CANCEL below ends it.
-        if !self.open_match_operation() {
-            dev_err!(
-                self.dev,
-                "verify: the match operation did not open; refusing before the capture. This is not a non-matching finger\n"
-            );
-            self.close_unlock_evaluation(&evaluation);
-            let _ = sensor::idle();
-            self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE), token_bytes);
-            return;
-        }
-        *self.match_context.lock() = Some(evaluation);
+        let evaluation = match current {
+            Some(evaluation) => {
+                let touch = self.match_scope_touches.fetch_add(1, Relaxed).saturating_add(1);
+                dev_info!(
+                    self.dev,
+                    "verify: touch {} of this authentication; its match operation and unlock evaluation stay open\n",
+                    touch
+                );
+                evaluation
+            }
+            None => {
+                self.end_match_scope(c"the start of an authentication");
+                let Some(evaluation) = self.open_unlock_evaluation(user) else {
+                    dev_err!(
+                        self.dev,
+                        "verify: the unlock evaluation did not open; refusing before the capture. This is not a non-matching finger\n"
+                    );
+                    let _ = sensor::idle();
+                    self.sensor_kept.store(false, Relaxed);
+                    sensor::power(false);
+                    self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE), token_bytes);
+                    return;
+                };
+                // Open the enclave's match operation before the first image, as
+                // macOS does at the start of a prompt; MATCH_CANCEL ends it.
+                if !self.open_match_operation() {
+                    dev_err!(
+                        self.dev,
+                        "verify: the match operation did not open; refusing before the capture. This is not a non-matching finger\n"
+                    );
+                    self.close_unlock_evaluation(&evaluation);
+                    let _ = sensor::idle();
+                    self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE), token_bytes);
+                    return;
+                }
+                *self.match_context.lock() = Some(evaluation);
+                self.match_scope_gen.store(open_gen, Relaxed);
+                self.match_scope_touches.store(1, Relaxed);
+                evaluation
+            }
+        };
 
         let mut outcome = self.verify_one_image();
-        // The logical match operation ends with this verify: stop the enclave's
-        // match mode, as macOS does when its match operation ends.
-        match self.sbio_call(&crate::sbio::sbio_match_cancel()) {
-            SbioOutcome::Ok(_) => dev_info!(self.dev, "verify: match operation ended (MATCH_CANCEL)\n"),
-            _ => {
-                dev_err!(self.dev, "verify: MATCH_CANCEL failed; not reporting this verify as a match\n");
-                if matches!(outcome, bio::VerifyOutcome::Matched(_)) {
-                    outcome = bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
-                }
+        // macOS saves the enclave's lockout record after every answered
+        // result (SAVE_LOCKOUT, kept on disk for the boot's LOAD_LOCKOUT).
+        if matches!(outcome, bio::VerifyOutcome::Matched(_) | bio::VerifyOutcome::NoMatch) {
+            if self.save_lockout() {
+                dev_info!(self.dev, "verify: lockout record saved after the result (SAVE_LOCKOUT)\n");
+            } else {
+                dev_warn!(self.dev, "verify: the lockout record was not saved after the result\n");
             }
         }
-        if matches!(outcome, bio::VerifyOutcome::Matched(_))
-            && !self.complete_unlock_evaluation(&evaluation, user)
-        {
-            dev_err!(self.dev, "verify: the enclave matched but the unlock policy was not satisfied\n");
-            outcome = bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
+        // A no-match below the retry limit keeps the prompt open for its next
+        // touch; anything else ends the prompt's match operation.
+        let keep_open = matches!(outcome, bio::VerifyOutcome::NoMatch)
+            && self.bio_nomatch_streak.load(Relaxed).saturating_add(1) < VERIFY_RETRY_LIMIT
+            && !self.enclave_reports_lockout();
+        if keep_open {
+            dev_info!(
+                self.dev,
+                "verify: no match; the match operation stays open for the next touch of this authentication\n"
+            );
+        } else {
+            match self.sbio_call(&crate::sbio::sbio_match_cancel()) {
+                SbioOutcome::Ok(_) => dev_info!(self.dev, "verify: match operation ended (MATCH_CANCEL)\n"),
+                _ => {
+                    dev_err!(self.dev, "verify: MATCH_CANCEL failed; not reporting this verify as a match\n");
+                    if matches!(outcome, bio::VerifyOutcome::Matched(_)) {
+                        outcome = bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
+                    }
+                }
+            }
+            if matches!(outcome, bio::VerifyOutcome::Matched(_))
+                && !self.complete_unlock_evaluation(&evaluation, user)
+            {
+                dev_err!(self.dev, "verify: the enclave matched but the unlock policy was not satisfied\n");
+                outcome = bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
+            }
+            *self.match_context.lock() = None;
+            self.match_scope_gen.store(0, Relaxed);
+            self.close_unlock_evaluation(&evaluation);
         }
-        *self.match_context.lock() = None;
-        self.close_unlock_evaluation(&evaluation);
         let _ = sensor::idle();
         if matches!(
             outcome,
@@ -2349,6 +2480,10 @@ impl SepData {
             MatchStep::LockedOut => return self.enter_lockout(),
             MatchStep::Refused => return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE),
         };
+        // On a no-match macOS finishes the touch before MATCH_POLICY.
+        if crate::sbio::MatchResult::parse(&result).is_some_and(|p| !p.matches(user)) {
+            self.no_match_tail();
+        }
         // macOS reads the match policy after every answered result, before
         // the image cleanup; neither a match nor a no-match counts without it.
         match self.sbio_call(&crate::sbio::sbio_match_policy()) {
@@ -2404,6 +2539,7 @@ impl SepData {
     }
 
     pub(crate) fn run_enrolment(&self) {
+        self.end_match_scope(c"an enrolment");
         self.enrol_frames_accepted.store(0, Relaxed);
         self.sensor_kept.store(false, Relaxed);
 
@@ -3462,6 +3598,10 @@ impl SepData {
     }
 
     fn await_capture(&self) -> CaptureWait {
+        self.await_capture_within(u64::from(ENROL_POLL_ATTEMPTS) * u64::from(ENROL_POLL_MS))
+    }
+
+    fn await_capture_within(&self, wait_ms: u64) -> CaptureWait {
         let mut previous: Option<[u8; sensor::STATUS_LEN]> = None;
         let mut armed_reported = false;
 
@@ -3480,9 +3620,7 @@ impl SepData {
         // attempt budget would then be spent in milliseconds and time the
         // capture out before the frame lands. Time-bounding degrades, at worst,
         // to the same duration as the poll path.
-        let deadline_ns = crate::shim::monotonic_ns().saturating_add(
-            u64::from(ENROL_POLL_ATTEMPTS) * u64::from(ENROL_POLL_MS) * 1_000_000,
-        );
+        let deadline_ns = crate::shim::monotonic_ns().saturating_add(wait_ms.saturating_mul(1_000_000));
         let mut attempt: u32 = 0;
         loop {
             if !bio::capture_is_live(&self.bio_session.lock(), self.capture_epoch.load(Relaxed)) {
@@ -4041,6 +4179,7 @@ impl SepData {
             bio::release(&mut self.bio_session.lock());
             return Err(e);
         }
+        self.bio_open_gen.fetch_add(1, Relaxed);
         Ok(())
     }
 
@@ -4119,6 +4258,8 @@ impl SepData {
     pub(crate) fn sleep_prepare(&self) {
         // Power may be removed across the sleep; register afresh after it.
         self.sensor_kept.store(false, Relaxed);
+        // A prompt does not carry across a sleep: the next verify ends it.
+        self.match_scope_gen.store(0, Relaxed);
         let woke = {
             let mut session = self.bio_session.lock();
             self.suspending.store(true, Relaxed);
@@ -4549,7 +4690,7 @@ impl SepData {
         };
         // The next verify opens a fresh unlock evaluation; nothing of the old
         // one is carried over.
-        *self.match_context.lock() = None;
+        self.end_match_scope(c"a password re-arm");
         let _ = self.handle_bg_ops(c"at a password re-arm");
         // The password verification alone leaves matching refused: the old
         // cold-match credentials stay live until a restart of the enclave,
@@ -6283,6 +6424,30 @@ impl MatchResult {
 
     pub(crate) fn matches(&self, user: UserId) -> bool {
         self.user_id == user.value()
+    }
+}
+
+/// Follows each extra frame (0x65) of a no-match touch, as macOS sends it.
+/// Empty. Name and reply pending (Daybreak t-5478).
+const OP_SBIO_MATCH_EXTRA_FRAME: u16 = 0x3e;
+pub(crate) fn sbio_match_extra_frame() -> SbioOp {
+    SbioOp {
+        opcode: OP_SBIO_MATCH_EXTRA_FRAME,
+        payload: pad_payload(&[]),
+        payload_len: 0,
+        name: c"MATCH_EXTRA_FRAME",
+    }
+}
+
+/// Concludes a no-match touch before MATCH_POLICY, as macOS sends it. Empty.
+/// Name and reply pending (Daybreak t-5478).
+const OP_SBIO_MATCH_CONCLUDE: u16 = 0x0c;
+pub(crate) fn sbio_match_conclude() -> SbioOp {
+    SbioOp {
+        opcode: OP_SBIO_MATCH_CONCLUDE,
+        payload: pad_payload(&[]),
+        payload_len: 0,
+        name: c"MATCH_CONCLUDE",
     }
 }
 

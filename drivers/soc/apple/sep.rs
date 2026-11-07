@@ -774,6 +774,17 @@ struct SepData {
     // Failed matches since the last match or re-arm, for the log.
     bio_nomatch_streak: Atomic<u32>,
 
+    // Opens of the Touch ID device. One open is one prompt: fprintd claims
+    // the device for one PAM authentication.
+    bio_open_gen: Atomic<u64>,
+
+    // The open whose prompt holds the live match operation and the unlock
+    // evaluation in `match_context`, or 0 when none is open.
+    match_scope_gen: Atomic<u64>,
+
+    // Touches in that prompt so far.
+    match_scope_touches: Atomic<u32>,
+
     // The enclave's most recent biometric lock-state notification: the
     // state in bits 0-15 and the user in bits 16-47, or 0 before the first.
     // `bio_lock_state_seq` counts them, so a waiter can tell a fresh one
@@ -1033,6 +1044,9 @@ impl SepData {
                 bio_lockout: Atomic::new(false),
                 bio_lockout_logged: Atomic::new(false),
                 bio_nomatch_streak: Atomic::new(0),
+                bio_open_gen: Atomic::new(0),
+                match_scope_gen: Atomic::new(0),
+                match_scope_touches: Atomic::new(0),
                 bio_lock_state: Atomic::new(0),
                 bio_lock_state_seq: Atomic::new(0),
                 store <- new_mutex!(store),
