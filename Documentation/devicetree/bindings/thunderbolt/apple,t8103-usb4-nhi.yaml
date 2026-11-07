@@ -22,6 +22,7 @@ properties:
     oneOf:
       - const: apple,t8103-usb4-nhi
       - const: apple,t8142-usb4-nhi
+      - const: apple,t6040-usb4-nhi
       - items:
           - enum:
               - apple,t6000-usb4-nhi
@@ -124,7 +125,9 @@ allOf:
       properties:
         compatible:
           contains:
-            const: apple,t8142-usb4-nhi
+            enum:
+              - apple,t8142-usb4-nhi
+              - apple,t6040-usb4-nhi
     then:
       properties:
         reg:
@@ -147,6 +150,7 @@ allOf:
               - apple,t8122-usb4-nhi
               - apple,t8132-usb4-nhi
               - apple,t8142-usb4-nhi
+              - apple,t6040-usb4-nhi
     then:
       properties:
         iommus:

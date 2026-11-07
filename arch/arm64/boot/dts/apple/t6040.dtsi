@@ -327,33 +327,6 @@
 		status = "disabled";
 	};
 
-	apciec0_dart: iommu@384000000 {
-		compatible = "apple,t6041-dart", "apple,t8110-dart";
-		reg = <0x3 0x84000000 0x0 0x20000>;
-		#iommu-cells = <1>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1606 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
-	};
-
-	apciec1_dart: iommu@38c000000 {
-		compatible = "apple,t6041-dart", "apple,t8110-dart";
-		reg = <0x3 0x8c000000 0x0 0x20000>;
-		#iommu-cells = <1>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1638 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
-	};
-
-	apciec2_dart: iommu@394000000 {
-		compatible = "apple,t6041-dart", "apple,t8110-dart";
-		reg = <0x3 0x94000000 0x0 0x20000>;
-		#iommu-cells = <1>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1670 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
-	};
-
 	apcie1_dart: iommu@411000000 {
 		compatible = "apple,t6041-dart", "apple,t8110-dart";
 		reg = <0x4 0x11000000 0x0 0x20000>;
@@ -486,16 +459,6 @@
 		status = "disabled";
 	};
 
-	usb4_0_dart: iommu@381a80000 {
-		compatible = "apple,t6041-dart", "apple,t8110-dart";
-		reg = <0x3 0x81a80000 0x0 0xc000>;
-		#iommu-cells = <1>;
-		apple,dma-range = <0x100 0x0 0x300 0x0>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1789 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
-	};
-
 	/* ACIO 1 remains disabled until its host-router handoff is supported. */
 	usb4_1_mbox: mailbox@389108000 {
 		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
@@ -509,16 +472,6 @@
 				  "recv-empty", "recv-not-empty";
 		#mbox-cells = <0>;
 		power-domains = <&ps_atc1_cio>;
-		status = "disabled";
-	};
-
-	usb4_1_dart: iommu@389a80000 {
-		compatible = "apple,t6041-dart", "apple,t8110-dart";
-		reg = <0x3 0x89a80000 0x0 0xc000>;
-		#iommu-cells = <1>;
-		apple,dma-range = <0x100 0x0 0x300 0x0>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1837 IRQ_TYPE_LEVEL_HIGH>;
 		status = "disabled";
 	};
 
@@ -538,15 +491,6 @@
 		status = "disabled";
 	};
 
-	usb4_2_dart: iommu@391a80000 {
-		compatible = "apple,t6041-dart", "apple,t8110-dart";
-		reg = <0x3 0x91a80000 0x0 0xc000>;
-		#iommu-cells = <1>;
-		apple,dma-range = <0x100 0x0 0x300 0x0>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1885 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
-	};
 };
 
 &avd {
@@ -687,3 +631,5 @@
 	apple,peak-bandwidth-bytes-per-second = /bits/ 64 <273066666656>;
 	apple,bandwidth-class-bytes-per-second = /bits/ 64 <273000000000>;
 };
+
+#include "t6040-usb4.dtsi"

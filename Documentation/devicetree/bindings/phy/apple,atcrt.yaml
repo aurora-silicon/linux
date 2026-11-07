@@ -19,6 +19,8 @@ properties:
       - enum:
           - apple,t8103-atcrt
           - apple,t6000-atcrt
+          - apple,t8112-atcrt
+          - apple,t6041-atcrt
       - const: apple,atcrt
 
   reg:
