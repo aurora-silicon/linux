@@ -99,3 +99,19 @@
 &isp {
 	apple,platform-id = <16>;
 };
+
+&i2c4 {
+	sd_card_control: card-control@20 {
+		compatible = "apple,t6030-sd-card-control", "apple,sd-card-control";
+		reg = <0x20>;
+		status = "disabled";
+	};
+};
+
+&i2c8 {
+	display_pcon: display-converter@8 {
+		compatible = "apple,t6030-display-pcon", "apple,display-pcon";
+		reg = <0x8>;
+		status = "disabled";
+	};
+};

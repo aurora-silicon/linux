@@ -16,7 +16,11 @@ description: |
 properties:
   compatible:
     items:
-      - const: apple,t6041-display-pcon
+      - enum:
+          - apple,t6041-display-pcon
+          - apple,t8122-display-pcon
+          - apple,t6030-display-pcon
+          - apple,t6031-display-pcon
       - const: apple,display-pcon
 
   reg:

@@ -11,9 +11,19 @@ maintainers:
 
 description: A SPMI controller present on most Apple SoCs
 
+allOf:
+  - $ref: spmi.yaml#
+
 properties:
   compatible:
     oneOf:
+      - const: apple,t8142-spmi
+      - items:
+          - enum:
+              - apple,t6000-spmi
+              - apple,t8103-spmi
+              - apple,t8112-spmi
+          - const: apple,spmi
       - items:
           - enum:
               - apple,t6000-spmi
@@ -28,19 +38,13 @@ properties:
               - apple,t8132-spmi
               - apple,t8140-spmi
           - const: apple,t8103-spmi
-      - items:
-          - enum:
-              # Do not add additional SoC to this list.
-              - apple,t8103-spmi
-              - apple,t6000-spmi
-              - apple,t8112-spmi
-          - const: apple,spmi
-      - const: apple,t8142-spmi
 
   reg:
     minItems: 1
-    maxItems: 3
-    description: Primary controller, secondary controller and interrupt-status apertures.
+    items:
+      - description: SPMI command interface
+      - description: SPMI interrupt interface
+      - description: SPMI auxiliary interface
 
   interrupts:
     maxItems: 1
@@ -62,20 +66,6 @@ dependentRequired:
   interrupt-controller:
     - "#interrupt-cells"
     - interrupts
-
-# New controller descriptions retain all three windows without changing the
-# register contract of other generations.
-allOf:
-  - $ref: spmi.yaml#
-  - if:
-      properties:
-        compatible:
-          contains:
-            enum: ["apple,t8103-spmi", "apple,t6000-spmi"]
-    else:
-      properties:
-        reg:
-          maxItems: 1
 
 unevaluatedProperties: false
 

@@ -276,3 +276,11 @@
 
 #include "hwmon-fan-dual.dtsi"
 #include "hwmon-laptop.dtsi"
+
+&i2c3 {
+	display_pcon: display-converter@8 {
+		compatible = "apple,t8122-display-pcon", "apple,display-pcon";
+		reg = <0x8>;
+		status = "disabled";
+	};
+};
