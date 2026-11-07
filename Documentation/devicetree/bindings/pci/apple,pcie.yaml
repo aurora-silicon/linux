@@ -467,19 +467,6 @@ allOf:
       unevaluatedProperties: false
       allOf:
         - if:
-            not:
-              properties:
-                compatible:
-                  contains:
-                    enum: ['apple,t6050-pcie', 'apple,t6050-pciec']
-          then:
-            properties:
-              interrupt-names:
-                minItems: 1
-                maxItems: 4
-                items:
-                  pattern: ^port[0-3]$
-        - if:
             properties:
               compatible:
                 contains:
