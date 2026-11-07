@@ -151,6 +151,15 @@ class CoverageTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("bootstrapping", result.stdout)
 
+    def test_bootstrap_rejects_paths_absent_from_both_dtbs(self):
+        directory = self.root / "baseline"
+        directory.mkdir()
+        result = self.run_check("/x - -> /never-existed\n",
+                                "--baseline-manifest-dir", str(directory),
+                                "--baseline-dtb-dir", str(self.root))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("new absent DT path", result.stderr)
+
     def test_ratchet_validates_baseline_and_options(self):
         args = self.baseline("invalid\n")
         self.assertEqual(self.run_check("/x - -> /soc\n", *args).returncode, 1)

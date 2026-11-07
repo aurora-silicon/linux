@@ -120,7 +120,8 @@ def main(argv=None):
                   f"waived={counts['waived']} broken={len(broken)} total={len(entries)}")
             if args.baseline_manifest_dir:
                 baseline = args.baseline_manifest_dir / (board + ".txt")
-                if not baseline.is_file():
+                bootstrap = not baseline.is_file()
+                if bootstrap:
                     # First introduction: measure the same inventory against base
                     # DTBs. Later runs always use the base's committed inventory.
                     baseline = manifest
@@ -134,7 +135,7 @@ def main(argv=None):
                       f"head MISSING={counts['missing']} broken={len(broken)}")
                 if counts['missing'] > before['missing']:
                     errors.append(f"{board}: MISSING increased {before['missing']} -> {counts['missing']}")
-                for target in sorted(broken - old_broken):
+                for target in sorted(broken if bootstrap else broken - old_broken):
                     errors.append(f"{board}: new absent DT path: {target}")
             else:
                 for target in sorted(broken):

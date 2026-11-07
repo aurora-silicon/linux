@@ -30,7 +30,8 @@ MISSING increase, a newly absent DT path, or removal of inventory devices.
 Existing gaps remain visible without failing unrelated changes. When manifests
 are first introduced, the head inventory is also measured against the base DTBs
 to establish the baseline. A newly added inventory uses the same rule. Both
-DTB sets must exist; baseline read errors fail.
+DTB sets must exist; baseline read errors fail. Newly introduced inventories
+must have no broken DT paths, even when the base DTB lacks those paths.
 
 The checker verifies committed inventory consistency. It cannot discover ADT
 devices omitted from that inventory or establish the correctness of a mapping.
