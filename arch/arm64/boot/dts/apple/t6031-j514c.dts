@@ -30,10 +30,7 @@
 	brcm,board-type = "apple,texa";
 };
 
-/*
- * The J514S values (t6030-j514s.dts): the same chassis and panel.
- * Not yet read from a J514C.
- */
+/* The J514S panel: the same chassis. Not yet read from a J514C. */
 &dcp {
 	panel: panel {
 		compatible = "apple,panel-j514", "apple,panel-mini-led", "apple,panel";
