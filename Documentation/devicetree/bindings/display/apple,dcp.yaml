@@ -70,6 +70,11 @@ properties:
       - enum: [disp-5, iop-vbar, coproc-aux]
       - const: iop-vbar
 
+  interrupts:
+    minItems: 7
+    maxItems: 16
+    description: Optional host display-engine interrupt sources.
+
   mboxes:
     maxItems: 1
 
@@ -429,11 +434,18 @@ allOf:
           items:
             pattern: '^(dp-xbar|typec[0-9]+)$'
   - if:
-      not:
-        properties:
-          compatible:
-            contains:
-              enum: ['apple,t6031-dcp', 'apple,t8132-dcp', 'apple,t8132-dcpext']
+      allOf:
+        - not:
+            properties:
+              compatible:
+                contains:
+                  enum: ['apple,t6031-dcp', 'apple,t8132-dcp', 'apple,t8132-dcpext']
+        - not:
+            properties:
+              status:
+                const: disabled
+            required:
+              - status
     then:
       required:
         - apple,bw-scratch

@@ -505,9 +505,9 @@
 		/* Required to get >32-bit DMA via DARTs */
 		dma-ranges = <0 0 0 0 0xffffffff 0xffffc000>;
 
-		ave_dart0: iommu@67030000 {
+		ave_dart0: iommu@267030000 {
 			compatible = "apple,t8112-dart", "apple,t8110-dart";
-			reg = <0 0x67030000 0 0x4000>;
+			reg = <0x2 0x67030000 0 0x4000>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 689 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_venc_sys>;
@@ -515,9 +515,9 @@
 			status = "disabled";
 		};
 
-		ave_dart1: iommu@67040000 {
+		ave_dart1: iommu@267040000 {
 			compatible = "apple,t8112-dart", "apple,t8110-dart";
-			reg = <0 0x67040000 0 0x4000>;
+			reg = <0x2 0x67040000 0 0x4000>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 689 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_venc_sys>;
@@ -525,11 +525,11 @@
 			status = "disabled";
 		};
 
-		ave: video-codec@67100000 {
+		ave: video-codec@267100000 {
 			compatible = "apple,t8112-ave";
-			reg = <0 0x67100000 0 0x45c000>,
-			      <0 0x67050000 0 0x8000>,
-			      <0 0x67800000 0 0x800000>;
+			reg = <0x2 0x67100000 0 0x45c000>,
+			      <0x2 0x67050000 0 0x8000>,
+			      <0x2 0x67800000 0 0x800000>;
 			reg-names = "codec", "mailbox", "coproc";
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 692 IRQ_TYPE_LEVEL_HIGH>,
@@ -2648,3 +2648,5 @@
 	apple,peak-bandwidth-bytes-per-second = /bits/ 64 <102400000000>;
 	apple,bandwidth-class-bytes-per-second = /bits/ 64 <100000000000>;
 };
+
+#include "t8112-peripherals.dtsi"
