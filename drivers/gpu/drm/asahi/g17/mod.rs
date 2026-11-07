@@ -1215,12 +1215,42 @@ impl Gpu {
             );
             return Err(ENODEV);
         }
+        let m5 = cfg.profile.is_m5();
+        if m5 {
+            // The M5 graph builds only the 26A428 InitData layouts. A firmware that checks
+            // another layout is refused here, before anything is written to the GPU.
+            if variant.m5_layouts != Some(fw::variant::M5Layouts::V26A428) {
+                dev_err!(
+                    dev.as_ref(),
+                    "No M5 InitData layouts for this GPU firmware build ({:?})\n",
+                    variant.m5_layouts
+                );
+                return Err(ENODEV);
+            }
+            let board = cfg.m5.ok_or(EINVAL)?;
+            // The M5 layouts are sized for every core slot of the board, fused-off cores
+            // included, so the GPU is matched on clusters and slots, not on enabled cores.
+            if id.num_clusters != board.clusters || id.num_clusters * id.num_cores != board.gpu_cores
+            {
+                dev_err!(
+                    dev.as_ref(),
+                    "M5 board expects {} clusters of {} core slots, the GPU reports {} x {}\n",
+                    board.clusters,
+                    board.gpu_cores / board.clusters,
+                    id.num_clusters,
+                    id.num_cores
+                );
+                return Err(ENODEV);
+            }
+            fw::m5::pool::select_render_pool(board);
+            thermal::select_board(board);
+            pairs::select_board(board);
+        }
 
         let geometry = mmu::UatGeometry {
             ias: cfg.uat_ias,
             oas: cfg.uat_oas,
         };
-        let m5 = cfg.profile.is_m5();
         let max_frequency_khz = if m5 {
             fw::m5::initdata::J714_GPU_PERF_STATES[13].0 * 1000
         } else {
