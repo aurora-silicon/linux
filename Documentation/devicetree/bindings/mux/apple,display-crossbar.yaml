@@ -33,6 +33,7 @@ properties:
       - items:
           - enum:
               - apple,t6030-display-crossbar
+              - apple,t6031-display-crossbar
               - apple,t8122-display-crossbar
           - const: apple,t6020-display-crossbar
 

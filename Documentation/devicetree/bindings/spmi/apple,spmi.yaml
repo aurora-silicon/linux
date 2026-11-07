@@ -41,7 +41,11 @@ properties:
       - const: apple,t8142-spmi
 
   reg:
-    maxItems: 1
+    minItems: 1
+    items:
+      - description: SPMI command interface
+      - description: SPMI interrupt interface
+      - description: SPMI auxiliary interface
 
   interrupts:
     maxItems: 1

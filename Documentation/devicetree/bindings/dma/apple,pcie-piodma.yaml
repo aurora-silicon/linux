@@ -25,6 +25,12 @@ properties:
       - items:
           - const: apple,t6041-pcie-piodma
           - const: apple,pcie-piodma
+      - items:
+          - enum:
+              - apple,t8122-pcie-piodma
+              - apple,t6030-pcie-piodma
+              - apple,t6031-pcie-piodma
+          - const: apple,pcie-piodma
 
   reg:
     minItems: 3
