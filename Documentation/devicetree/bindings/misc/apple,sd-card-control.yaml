@@ -17,9 +17,10 @@ properties:
   compatible:
     items:
       - enum:
-          - apple,t6041-sd-card-control
+          - apple,t6000-sd-card-control
           - apple,t6030-sd-card-control
           - apple,t6031-sd-card-control
+          - apple,t6041-sd-card-control
       - const: apple,sd-card-control
 
   reg:
