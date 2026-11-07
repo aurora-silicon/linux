@@ -34,16 +34,12 @@ properties:
   compatible: true
 
   apple,boot-dma-devices:
-          $ref: /schemas/types.yaml#/definitions/phandle-array
-          items:
-            maxItems: 1
-          description:
-            Devices that take over DMA the bootloader left running. Cache allocation
-            is enabled only once each of them is bound to its driver.
-
-      required:
-        - compatible
-        - reg
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      maxItems: 1
+    description:
+      Devices that take over DMA the bootloader left running. Cache allocation
+      is enabled only once each of them is bound to its driver.
 
 allOf:
   - if:
@@ -116,7 +112,11 @@ allOf:
 
               nonposted-mmio: true
 
-      unevaluatedProperties: false
+            required:
+              - compatible
+              - reg
+
+unevaluatedProperties: false
 
 examples:
   - |
