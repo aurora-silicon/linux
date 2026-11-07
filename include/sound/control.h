@@ -80,6 +80,8 @@ struct snd_kcontrol {
 	snd_kcontrol_info_t *info;
 	snd_kcontrol_get_t *get;
 	snd_kcontrol_put_t *put;
+	/* Under controls_rwsem, before put(): 0 allows, a negative error denies. */
+	int (*write_check)(struct snd_kcontrol *kcontrol, struct snd_ctl_file *file);
 	snd_kcontrol_lock_t *lock;
 	snd_kcontrol_unlock_t *unlock;
 	union {

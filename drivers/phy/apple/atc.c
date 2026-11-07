@@ -803,6 +803,7 @@ enum atcphy_t8132_cio_tunable {
  * @phys.usb2: USB2 PHY instance
  * @phys.usb3: USB3 PHY instance
  * @phys.dp: DisplayPort PHY instance
+ * @usb2_repeater: Optional external eUSB2 to USB 2.0 repeater
  * @phy_provider: PHY provider instance
  * @rcdev: Reset controller device
  * @sw: Type-C switch instance
@@ -911,6 +912,7 @@ struct apple_atcphy {
 		struct phy *usb3;
 		struct phy *dp;
 	} phys;
+	struct phy *usb2_repeater;
 	struct phy_provider *phy_provider;
 
 	struct reset_controller_dev rcdev;
@@ -6321,6 +6323,11 @@ static void atcphy_pd_notifier_remove(void *data)
 	dev_pm_genpd_remove_notifier(data);
 }
 
+static void atcphy_usb2_repeater_exit(void *data)
+{
+	phy_exit(data);
+}
+
 /* Returns whether the PHY follows its power domain. */
 static bool atcphy_probe_pd_notifier(struct apple_atcphy *atcphy)
 {
@@ -6383,6 +6390,20 @@ static int atcphy_probe(struct platform_device *pdev)
 	ret = atcphy_load_tunables(atcphy);
 	if (ret)
 		return ret;
+
+	atcphy->usb2_repeater = devm_phy_optional_get(dev, "eusb2-repeater");
+	if (IS_ERR(atcphy->usb2_repeater))
+		return dev_err_probe(dev, PTR_ERR(atcphy->usb2_repeater),
+				     "Failed to get eUSB2 repeater\n");
+	if (atcphy->usb2_repeater) {
+		ret = phy_init(atcphy->usb2_repeater);
+		if (ret)
+			return dev_err_probe(dev, ret, "Failed to initialize eUSB2 repeater\n");
+		ret = devm_add_action_or_reset(dev, atcphy_usb2_repeater_exit,
+					       atcphy->usb2_repeater);
+		if (ret)
+			return ret;
+	}
 
 	atcphy->mode = APPLE_ATCPHY_MODE_OFF;
 	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;

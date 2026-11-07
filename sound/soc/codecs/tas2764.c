@@ -98,6 +98,14 @@ struct tas2764_priv {
 	 * an unmute clearing a stale clock fault and stream_stopped
 	 */
 	struct mutex fault_lock;
+
+	/*
+	 * What the fault interrupt reported, for "Amp Fault Status": the
+	 * INT_LTCH0 bits it judged a fault or a report since probe, and how
+	 * many such interrupts there were.
+	 */
+	u8 fault_bits;
+	u32 fault_events;
 };
 
 #include "tas2764-quirks.h"
@@ -261,6 +269,13 @@ static irqreturn_t tas2764_irq_locked(struct tas2764_priv *tas2764)
 
 	if ((latched[0] & TAS2764_INT_LTCH0_GROUP_FAULTS) && tas2764->sdz_group)
 		tas2764_group_shutdown(tas2764, latched[0]);
+
+	if (latched[0]) {
+		WRITE_ONCE(tas2764->fault_bits, tas2764->fault_bits | latched[0]);
+		if (tas2764->fault_events != U32_MAX)
+			WRITE_ONCE(tas2764->fault_events, tas2764->fault_events + 1);
+		snd_soc_component_notify_control(tas2764->component, "Amp Fault Status");
+	}
 
 	if (latched[0]) {
 		dev_err_ratelimited(tas2764->dev, "other context to the fault: %02x,%02x,%02x,%02x,%02x",
@@ -1240,6 +1255,34 @@ static SOC_ENUM_SINGLE_DECL(
 	tas2764_oce_enum, TAS2764_MISC_CFG1,
 	TAS2764_MISC_CFG1_OCE_RETRY_SHIFT, tas2764_oce_texts);
 
+/*
+ * "Amp Fault Status", read-only: [0] the INT_LTCH0 bits the fault interrupt
+ * reported since probe (bit 0 over temperature, 1 over current, 2 bad TDM
+ * clock, 3 limiter active, 4 PVDD below the limiter inflection point, 5
+ * limiter at maximum attenuation, 6 BOP infinite hold, 7 BOP mute), [1] the
+ * number of those interrupts, saturating, [2] 1 once this amp's SDZ group
+ * was forced off. A change is notified.
+ */
+static int tas2764_fault_info(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_info *uinfo)
+{
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	uinfo->count = 3;
+	uinfo->value.integer.min = 0;
+	uinfo->value.integer.max = U32_MAX;
+	return 0;
+}
+
+static int tas2764_fault_get(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *uvalue)
+{
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+	struct tas2764_priv *tas2764 = snd_soc_component_get_drvdata(component);
+
+	uvalue->value.integer.value[0] = READ_ONCE(tas2764->fault_bits);
+	uvalue->value.integer.value[1] = READ_ONCE(tas2764->fault_events);
+	uvalue->value.integer.value[2] = tas2764_group_failed(tas2764);
+	return 0;
+}
+
 static const struct snd_kcontrol_new tas2764_snd_controls[] = {
 	SOC_SINGLE_TLV("Speaker Volume", TAS2764_DVC, 0,
 		       TAS2764_DVC_MAX, 1, tas2764_playback_volume),
@@ -1247,6 +1290,13 @@ static const struct snd_kcontrol_new tas2764_snd_controls[] = {
 		       tas2764_digital_tlv),
 	SOC_ENUM("HPF Corner Frequency", tas2764_hpf_enum),
 	SOC_ENUM("OCE Handling", tas2764_oce_enum),
+	{
+		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+		.name = "Amp Fault Status",
+		.access = SNDRV_CTL_ELEM_ACCESS_READ | SNDRV_CTL_ELEM_ACCESS_VOLATILE,
+		.info = tas2764_fault_info,
+		.get = tas2764_fault_get,
+	},
 };
 
 static const struct snd_soc_component_driver soc_component_driver_tas2764 = {
@@ -1355,7 +1405,7 @@ static int tas2764_parse_bop_config(struct device *dev, struct tas2764_priv *tas
  * apple,amp-dcblocker-config: the boot loader copies it from the amp group's
  * configuration in the Mac's ADT, whose first two bytes are the two registers
  * (the rest is padding), the same for every amp of the group. Without it the
- * registers keep their reset values.
+ * SN012776 uses DC_BLK0 = 0x01 and DC_BLK1 = 0x00 on every amp.
  */
 static int tas2764_parse_dcblocker_config(struct device *dev, struct tas2764_priv *tas2764)
 {
@@ -1366,8 +1416,12 @@ static int tas2764_parse_dcblocker_config(struct device *dev, struct tas2764_pri
 		return 0;
 
 	len = of_property_count_u8_elems(dev->of_node, "apple,amp-dcblocker-config");
-	if (len == -EINVAL)
+	if (len == -EINVAL) {
+		tas2764->dc_blk[0] = 0x01;
+		tas2764->dc_blk[1] = 0x00;
+		tas2764->have_dc_blk = true;
 		return 0;
+	}
 	if (len < 2)
 		return dev_err_probe(dev, -EINVAL,
 				     "apple,amp-dcblocker-config: %d bytes, need 2\n", len);
