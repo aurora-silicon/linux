@@ -40,6 +40,7 @@
 #include <linux/rcupdate.h>
 #include <linux/reset.h>
 #include <linux/soc/apple/dart.h>
+#include <linux/soc/apple/t8132.h>
 #include <linux/soc/apple/tunable.h>
 #include <linux/suspend.h>
 
@@ -336,20 +337,6 @@ static const struct hw_info t8132_pciec_hw = {
 };
 
 static const struct of_device_id apple_pcie_of_match[];
-
-/*
- * The M4 Macs whose radio port has the J713's ordinary stream profile (the
- * J604 and J773g ADTs map the same two radio streams; the iMacs have no ADT
- * yet and are assumed to).
- */
-static const char *const apple_pcie_managed_radio_boards[] = {
-	"apple,j604",
-	"apple,j623",
-	"apple,j624",
-	"apple,j713",
-	"apple,j773g",
-	NULL
-};
 
 /**
  * apple_pcie_tunnel_needs_cold_init() - whether the kernel brings up a port
@@ -3134,8 +3121,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 		int count = of_property_count_u32_elems(dev->of_node, "apple,managed-sids");
 
 		if (!of_device_is_compatible(dev->of_node, "apple,t8132-pcie") ||
-		    !of_machine_compatible_match(apple_pcie_managed_radio_boards) ||
-		    count <= 0 || count > 15)
+		    !apple_t8132_managed_radio() || count <= 0 || count > 15)
 			return -EINVAL;
 		ret = of_property_read_u32_array(dev->of_node, "apple,managed-sids", ids, count);
 		if (!ret && (count != 2 || ids[0] != 1 || ids[1] != 2))

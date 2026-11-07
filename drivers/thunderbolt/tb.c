@@ -2306,7 +2306,7 @@ static int tb_dp_pm_notify(struct notifier_block *nb, unsigned long event, void 
 	reopen = tb_dp_pm_event(&tb_dp_pm, event);
 	up_write(&tb_dp_pm_gate);
 	if (reopen)
-		queue_work(system_unbound_wq, &tb_dp_pm_reopen_work);
+		queue_work(system_dfl_wq, &tb_dp_pm_reopen_work);
 	return NOTIFY_DONE;
 }
 
