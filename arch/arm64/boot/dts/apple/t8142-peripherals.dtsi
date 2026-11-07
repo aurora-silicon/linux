@@ -432,13 +432,15 @@
 		status = "disabled";
 	};
 
-	hw_i2c2: i2c-controller@3a5018000 {
-		compatible = "apple,t8142-i2c-controller", "apple,i2c-controller";
+	hw_i2c2: i2c@3a5018000 {
+		compatible = "apple,t8142-i2c", "apple,t8103-i2c";
 		reg = <0x3 0xa5018000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 1249 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&hw_ps_87>;
 		clocks = <&clkref>;
 		status = "disabled";
+		#address-cells = <1>;
+		#size-cells = <0>;
 	};
 
 	hw_nub_spmi1: spmi-complex@388614000 {

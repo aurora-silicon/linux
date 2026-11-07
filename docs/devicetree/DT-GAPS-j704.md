@@ -19,6 +19,8 @@ No firmware, calibration or register programming values are included.
 - Complete the transport children and firmware-service bindings, pinmux,
   port graphs and board wiring. Listing a controller does not cover its
   attached peripherals.
+- Audit the parent dependencies of new disabled PMGR gates before enabling
+  a gate or its consumer.
 - Resolve every provider/routing gap called out below. No guessed
   address, interrupt parent or power-domain relationship was substituted.
 - Validate on this board; no boot or peripheral test was performed.

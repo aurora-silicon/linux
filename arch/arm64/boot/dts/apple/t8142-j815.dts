@@ -20,3 +20,5 @@
 &pmc {
 	status = "disabled";
 };
+
+#include "t8142-j815-audio-topology.dtsi"
