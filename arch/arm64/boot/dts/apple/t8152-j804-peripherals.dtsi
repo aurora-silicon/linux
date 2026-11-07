@@ -22,6 +22,7 @@
 		compatible = "apple,t8152-i2c-controller", "apple,i2c-controller";
 		reg = <0x3 0x31020000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 1417 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clkref>;
 		status = "disabled";
 	};
 

@@ -301,3 +301,14 @@
 
 
 };
+
+/* Present in the static board template, absent from the live snapshot. */
+&{/soc} {
+	hw_rsm: rsm@309825000 {
+		compatible = "apple,t8152-rsm", "apple,rsm";
+		reg = <3 0x09825000 0 0x4000>, <3 0x098c0000 0 4>;
+		interrupts = <AIC_IRQ 489 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&hw_dart_sbr 43>;
+		status = "disabled";
+	};
+};
