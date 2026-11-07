@@ -86,6 +86,14 @@ class CoverageTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("root compatible does not match", result.stderr)
 
+    def test_board_names_are_not_limited_to_j(self):
+        dtb = (self.root / "t9999-j1.dtb").read_bytes()
+        (self.root / "t9999-k1.dtb").write_bytes(dtb.replace(b"apple,j1\0", b"apple,k1\0"))
+        (self.root / "t9999-k1.txt").write_text("/x - -> /soc\n")
+        result = self.run_check("/x - -> /soc\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("t9999-k1: MISSING=0 mapped=1", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

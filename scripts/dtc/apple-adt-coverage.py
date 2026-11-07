@@ -84,12 +84,12 @@ def main(argv=None):
     except ImportError:
         parser.exit(2, "apple-adt-coverage: install python3-libfdt (pylibfdt)\n")
 
-    boards = args.board or sorted(p.stem for p in args.manifest_dir.glob("t*-j*.txt"))
+    boards = args.board or sorted(p.stem for p in args.manifest_dir.glob("t*-*.txt"))
     if not boards:
         parser.error("no board manifests selected")
     errors = 0
     for board in sorted(set(boards)):
-        if not re.fullmatch(r"t[0-9]+-j[a-zA-Z0-9]+", board):
+        if not re.fullmatch(r"t[0-9]+-[a-z][a-zA-Z0-9]*", board):
             print(f"invalid board name: {board}", file=sys.stderr)
             errors += 1
             continue
