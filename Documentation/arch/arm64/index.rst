@@ -24,6 +24,7 @@ ARM64 Architecture
     booting
     cpu-feature-registers
     cpu-hotplug
+    ctxr-execmem
     elf_hwcaps
     gcs
     hugetlbpage

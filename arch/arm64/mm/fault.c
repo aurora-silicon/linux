@@ -10,6 +10,7 @@
 #include <linux/acpi.h>
 #include <linux/bitfield.h>
 #include <linux/bpf_defs.h>
+#include <linux/execmem.h>
 #include <linux/extable.h>
 #include <linux/kfence.h>
 #include <linux/signal.h>
@@ -19,6 +20,7 @@
 #include <linux/irqflags.h>
 #include <linux/kasan.h>
 #include <linux/kprobes.h>
+#include <linux/pagewalk.h>
 #include <linux/uaccess.h>
 #include <linux/page-flags.h>
 #include <linux/sched/signal.h>
@@ -602,6 +604,52 @@ static bool is_invalid_gcs_access(struct vm_area_struct *vma, u64 esr)
 	return false;
 }
 
+/*
+ * A core enforcing the CTXR window refuses EL0 fetches from it with a permission
+ * fault that the page tables don't explain. Nothing can fix that up, so a retry
+ * would fault forever with the task still runnable. The window page may be
+ * mapped without a struct page (a driver's remap_pfn_range() of an image
+ * buffer), so fall back to a raw PFN walk and only ever compare the PFN.
+ */
+static bool el0_fetch_refused_by_window(struct mm_struct *mm, unsigned long addr,
+					unsigned long esr, unsigned int mm_flags)
+{
+	struct vm_area_struct *vma;
+	unsigned long pfn = 0;
+
+	if (!is_el0_instruction_abort(esr) || !esr_fsc_is_permission_fault(esr) ||
+	    !execmem_confine_active())
+		return false;
+
+	if (mmap_read_lock_killable(mm))
+		return false;
+
+	vma = vma_lookup(mm, addr);
+	if (vma && (vma->vm_flags & VM_EXEC) && !fault_from_pkey(vma, mm_flags)) {
+		struct follow_pfnmap_args pfnmap = { .vma = vma, .address = addr,
+						     .allow_subpage = true };
+		struct folio_walk fw;
+
+		if (folio_walk_start(&fw, vma, addr, FW_ZEROPAGE)) {
+			if (fw.level == FW_LEVEL_PTE && pte_user_exec(fw.pte))
+				pfn = pte_pfn(fw.pte);
+			folio_walk_end(&fw, vma);
+		} else if ((vma->vm_flags & (VM_PFNMAP | VM_MIXEDMAP)) &&
+			   !follow_pfnmap_start(&pfnmap)) {
+			pfn = pfnmap.pfn;
+			follow_pfnmap_end(&pfnmap);
+		}
+	}
+	mmap_read_unlock(mm);
+
+	if (!pfn || !execmem_confine_pfn_in_window(pfn))
+		return false;
+
+	pr_warn_ratelimited("%s[%d]: EL0 fetch at %#lx from pfn %#lx refused by the CTXR window, killing it\n",
+			    current->comm, task_pid_nr(current), addr, pfn);
+	return true;
+}
+
 static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
 				   struct pt_regs *regs)
 {
@@ -678,6 +726,11 @@ static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
 	}
 
 	perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS, 1, regs, addr);
+
+	if (el0_fetch_refused_by_window(mm, addr, esr, mm_flags)) {
+		force_fatal_sig(SIGSEGV);
+		return 0;
+	}
 
 	if (!(mm_flags & FAULT_FLAG_USER))
 		goto lock_mmap;
