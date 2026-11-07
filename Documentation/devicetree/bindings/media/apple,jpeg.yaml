@@ -27,10 +27,13 @@ properties:
           - apple,t8140-jpeg
       - items:
           - enum:
-              - apple,t8112-jpeg
               - apple,t6020-jpeg
               - apple,t6021-jpeg
               - apple,t6022-jpeg
+              - apple,t6030-jpeg
+              - apple,t6031-jpeg
+              - apple,t8112-jpeg
+              - apple,t8122-jpeg
           - const: apple,jpeg
 
   reg:
@@ -80,6 +83,18 @@ allOf:
     else:
       properties:
         apple,dma-range: false
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t6030-jpeg
+              - apple,t6031-jpeg
+              - apple,t8122-jpeg
+    then:
+      properties:
+        power-domains:
+          maxItems: 1
 
 additionalProperties: false
 

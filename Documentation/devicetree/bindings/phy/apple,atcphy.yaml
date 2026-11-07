@@ -42,60 +42,100 @@ allOf:
       properties:
         compatible:
           contains:
-            const: apple,t8132-atcphy
+            enum:
+              - apple,t8122-atcphy
+              - apple,t6030-atcphy
+              - apple,t6031-atcphy
     then:
-      oneOf:
-        - properties:
-            reg:
-              minItems: 2
-              maxItems: 2
-            reg-names:
-              items:
-                - const: usb2phy
-                - const: pipehandler
-        - properties:
-            reg:
-              items:
-                - description: USB2 PHY specific controls
-                - description: USB3 PIPE interface controls
-                - description: SuperSpeed PHY core, excluding the display crossbar
-                - description: AXI to Apple Fabric interface controls
-                - description: Local IO address translation controls
-                - description: ATC fabric controls
-                - description: ATC common configuration controls
-            reg-names:
-              items:
-                - const: usb2phy
-                - const: pipehandler
-                - const: core
-                - const: axi2af
-                - const: lioa
-                - const: fabric
-                - const: common-config
-          required:
-            - power-domains
-    else:
       properties:
         reg:
-          minItems: 5
+          minItems: 1
           items:
-            - description: Common controls for all PHYs (USB2/3/4, DisplayPort, TBT)
-            - description: DisplayPort Alternate Mode PHY specific controls
-            - description: Type-C PHY AXI to Apple Fabric interconnect controls
-            - description: USB2 PHY specific controls
-            - description: USB3 PIPE interface controls
-            - description: Secondary eUSB2 PHY register bank (T8140)
+            - description: Common controls for USB and DisplayPort
+            - description: DisplayPort alternate mode PHY
+            - description: AXI to Apple Fabric interface
+            - description: USB2 PHY
+            - description: USB3 PIPE interface
         reg-names:
-          minItems: 5
+          minItems: 1
           items:
             - const: core
             - const: lpdptx
             - const: axi2af
             - const: usb2phy
             - const: pipehandler
-            - const: usb2phy-reg
+      oneOf:
+        - properties:
+            reg:
+              maxItems: 1
+            reg-names:
+              maxItems: 1
+        - properties:
+            reg:
+              minItems: 5
+            reg-names:
+              minItems: 5
       required:
         - power-domains
+    else:
+      if:
+        properties:
+          compatible:
+            contains:
+              const: apple,t8132-atcphy
+      then:
+        oneOf:
+          - properties:
+              reg:
+                minItems: 2
+                maxItems: 2
+              reg-names:
+                items:
+                  - const: usb2phy
+                  - const: pipehandler
+          - properties:
+              reg:
+                items:
+                  - description: USB2 PHY specific controls
+                  - description: USB3 PIPE interface controls
+                  - description: SuperSpeed PHY core, excluding the display crossbar
+                  - description: AXI to Apple Fabric interface controls
+                  - description: Local IO address translation controls
+                  - description: ATC fabric controls
+                  - description: ATC common configuration controls
+              reg-names:
+                items:
+                  - const: usb2phy
+                  - const: pipehandler
+                  - const: core
+                  - const: axi2af
+                  - const: lioa
+                  - const: fabric
+                  - const: common-config
+            required:
+              - power-domains
+      else:
+        properties:
+          reg:
+            minItems: 5
+            items:
+              - description: Common controls for all PHYs (USB2/3/4, DisplayPort, TBT)
+              - description: DisplayPort Alternate Mode PHY specific controls
+              - description: Type-C PHY AXI to Apple Fabric interconnect controls
+              - description: USB2 PHY specific controls
+              - description: USB3 PIPE interface controls
+              - description: Secondary eUSB2 PHY register bank (T8140)
+          reg-names:
+            minItems: 5
+            items:
+              - const: core
+              - const: lpdptx
+              - const: axi2af
+              - const: usb2phy
+              - const: pipehandler
+              - const: usb2phy-reg
+        required:
+          - power-domains
   - if:
       properties:
         compatible:
@@ -154,6 +194,20 @@ allOf:
         apple,tunable-cio-lane1: false
         apple,tunable-cio-lane1-eq: false
         apple,tunable-cio-post: false
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              enum:
+                - apple,t8122-atcphy
+                - apple,t6030-atcphy
+                - apple,t6031-atcphy
+    then:
+      required:
+        - orientation-switch
+        - mode-switch
+        - ports
 
 $defs:
   apple,tunable:
@@ -181,16 +235,22 @@ properties:
               - apple,t8112-atcphy
           - const: apple,t8103-atcphy
       - const: apple,t8103-atcphy
+      - const: apple,t8122-atcphy
+      - items:
+          - enum:
+              - apple,t6030-atcphy
+              - apple,t6031-atcphy
+          - const: apple,t8122-atcphy
       - const: apple,t8132-atcphy
       - const: apple,t8140-atcphy
       - const: apple,t8142-atcphy
 
   reg:
-    minItems: 2
+    minItems: 1
     maxItems: 7
 
   reg-names:
-    minItems: 2
+    minItems: 1
     maxItems: 7
 
   "#phy-cells":
@@ -399,9 +459,6 @@ required:
   - reg-names
   - "#phy-cells"
   - "#reset-cells"
-  - orientation-switch
-  - mode-switch
-  - ports
 
 additionalProperties: false
 
