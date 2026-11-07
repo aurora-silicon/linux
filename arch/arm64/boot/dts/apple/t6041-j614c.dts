@@ -13,6 +13,7 @@
 /dts-v1/;
 
 #include "t6041.dtsi"
+#include "t6041-j614-j616-j575-scaler.dtsi"
 #include "t6041-j616c-ane.dtsi"
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/thermal/thermal.h>

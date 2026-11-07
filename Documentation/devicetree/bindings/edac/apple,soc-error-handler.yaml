@@ -19,12 +19,20 @@ select:
     compatible:
       contains:
         enum:
+          - apple,t6020-error-handler
+          - apple,t6020-event-log
+          - apple,t6021-error-handler
+          - apple,t6021-event-log
+          - apple,t6022-error-handler
+          - apple,t6022-event-log
           - apple,t6030-error-handler
           - apple,t6030-event-log
           - apple,t6031-error-handler
           - apple,t6031-event-log
           - apple,t6041-error-handler
           - apple,t6041-event-log
+          - apple,t8112-error-handler
+          - apple,t8112-event-log
           - apple,t8122-error-handler
           - apple,t8122-event-log
           - apple,t8132-error-handler
@@ -112,28 +120,40 @@ allOf:
                 - const: apple,soc-event-log
             - items:
                 - enum:
-                    - apple,t8122-error-handler
+                    - apple,t6020-error-handler
+                    - apple,t6021-error-handler
+                    - apple,t6022-error-handler
                     - apple,t6030-error-handler
                     - apple,t6031-error-handler
+                    - apple,t8112-error-handler
+                    - apple,t8122-error-handler
                 - const: apple,soc-error-handler
             - items:
                 - enum:
-                    - apple,t8122-event-log
+                    - apple,t6020-event-log
+                    - apple,t6021-event-log
+                    - apple,t6022-event-log
                     - apple,t6030-event-log
                     - apple,t6031-event-log
+                    - apple,t8112-event-log
+                    - apple,t8122-event-log
                 - const: apple,soc-event-log
-
-        interrupts:
-          minItems: 9
-          maxItems: 159
-
-        reg:
-          minItems: 10
-          maxItems: 123
-          description: Status apertures in hardware-description order; native access requires qualification.
 
         power-domains:
           maxItems: 1
+          description: Power domain needed for the associated error-source registers.
+
+        interrupts:
+          minItems: 9
+          maxItems: 322
+
+        reg:
+          minItems: 10
+          maxItems: 255
+          description: |
+            Status apertures in hardware-description order. T6041 uses qualified
+            per-source NI status apertures in interrupt order. Native register
+            access on other variants requires separate qualification.
 
       required:
         - compatible
