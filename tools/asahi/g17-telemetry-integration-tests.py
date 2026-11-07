@@ -116,16 +116,115 @@ mod g17 {
             pub fn publish_control(&self,_:u32,_:&[u8],_:bool,_:u32)->Result { Ok(()) }
         }
     }
-    struct Firmware { rings:channel::Rings }
+    struct Recovery(bool);
+    impl Recovery { fn pending(&self)->bool { self.0 } }
+    struct Firmware {
+        rings:channel::Rings,
+        init:initdata::InitData,
+        powered:bool,
+        epoch:u64,
+        recovery:Recovery,
+    }
+    impl Firmware {
+        fn roles(&self)->&'static [Role] { &[Role::Primary,Role::Secondary] }
+        fn observe_statistics_power(&mut self) {
+            if !self.rings.statistics_suspended() {
+                let roles=self.roles();
+                self.rings.observe_statistics_power(&crate::device::Device,&self.init,roles,self.powered,self.epoch);
+            }
+        }
+    }
     struct State(std::sync::Mutex<Option<Box<Firmware>>>);
     impl State {
         fn lock(&self)->std::sync::MutexGuard<'_,Option<Box<Firmware>>> { self.0.lock().unwrap() }
     }
     struct Variant { graph:fw::variant::InitGraph }
-    struct Shared { state:State, dev:crate::device::Device, variant:Variant }
+    struct Shared { state:State, dev:crate::device::Device, variant:Variant, crashed:std::sync::atomic::AtomicBool }
     mod reports;
 '''
 RUST_TESTS = r'''
+    fn reader(graph:fw::variant::InitGraph)->stats::Reader {
+        stats::Reader(std::sync::Arc::new(Shared {
+            state:State(std::sync::Mutex::new(Some(Box::new(Firmware {
+                rings:channel::Rings::new(graph).unwrap(),
+                init:initdata::InitData::new(),powered:true,epoch:0,recovery:Recovery(false),
+            })))),dev:crate::device::Device,variant:Variant { graph },crashed:false.into(),
+        }))
+    }
+
+    #[test]
+    fn reader_drains_without_events_and_does_not_reuse_old_samples() {
+        use {fw::variant::InitGraph,Role::*};
+        for graph in [InitGraph::V25G83,InitGraph::G17P] {
+            let reader=reader(graph);
+            let sample=|tiler,renderer,device|[0x13,0,0,tiler,renderer,0,device,0,0,0,0,0,0,0,0,0,0,0];
+            {
+                let state=reader.0.state.lock();
+                let fw=state.as_ref().unwrap();
+                fw.init.push(Primary,sample(25,75,50));
+                fw.init.push(Secondary,sample(35,85,65));
+            }
+            let view=reader.read();
+            assert_eq!((view.util_status,view.tiler,view.renderer,view.device,view.util_samples),
+                       (telemetry::VALID,30,80,57,2));
+            assert_eq!(reader.read(),view); // Empty reads do not add samples.
+            NOW.with(|now|now.set(stats::max_age_ns(graph)+1));
+            assert_eq!(reader.read().util_status,telemetry::STALE);
+            {
+                let state=reader.0.state.lock();
+                state.as_ref().unwrap().init.push(Secondary,sample(0,0,0));
+            }
+            let view=reader.read();
+            assert_eq!((view.util_status,view.device,view.util_samples),(telemetry::VALID,0,1));
+            assert_eq!(view.pstate_status,telemetry::UNSUPPORTED);
+            NOW.with(|now|now.set(1));
+        }
+    }
+
+    #[test]
+    fn reader_respects_suspend_recovery_power_epochs_and_detach() {
+        use {fw::variant::InitGraph,Role::*};
+        for graph in [InitGraph::V25G83,InitGraph::G17P] {
+            let reader=reader(graph);
+            let sample=[0x13,0,0,25,75,0,50,0,0,0,0,0,0,0,0,0,0,0];
+            let push=||reader.0.state.lock().as_ref().unwrap().init.push(Primary,sample);
+            push();
+            assert_eq!(reader.read().util_status,telemetry::VALID);
+            reader.suspend(true);
+            push();
+            assert_eq!(reader.read().util_status,telemetry::STALE);
+            reader.suspend(false);
+            push();
+            assert_eq!(reader.read().util_status,telemetry::STALE);
+            push();
+            assert_eq!(reader.read().util_status,telemetry::VALID);
+            reader.0.state.lock().as_mut().unwrap().epoch+=1;
+            push();
+            assert_eq!(reader.read().util_status,telemetry::STALE);
+            push();
+            assert_eq!(reader.read().util_status,telemetry::VALID);
+            reader.0.state.lock().as_mut().unwrap().powered=false;
+            push();
+            assert_eq!(reader.read().util_status,telemetry::STALE);
+            reader.0.state.lock().as_mut().unwrap().powered=true;
+            assert_eq!(reader.read().util_status,telemetry::STALE);
+            push();
+            assert_eq!(reader.read().util_status,telemetry::VALID);
+            reader.0.state.lock().as_mut().unwrap().recovery.0=true;
+            push();
+            assert_eq!(reader.read().util_status,telemetry::STALE);
+            reader.0.state.lock().as_mut().unwrap().recovery.0=false;
+            assert_eq!(reader.read().util_status,telemetry::STALE);
+            push();
+            assert_eq!(reader.read().util_status,telemetry::VALID);
+            reader.0.crashed.store(true,Ordering::Release);
+            push();
+            assert_eq!(reader.read().util_status,telemetry::STALE);
+            *reader.0.state.lock()=None;
+            assert_eq!(reader.read().util_status,telemetry::UNAVAILABLE);
+        }
+    }
+
     // Complete V26A428 payloads; unqualified words must never become pstate.
     const HIST_IDLE:[u32;18]=[0x12,0x0dc6727d,0,8,4,1,0,3,7,0,0,1000,0,0,0,0,0,0];
     const HIST_ACTIVE:[u32;18]=[0x12,0x0003c9f5,0,10,0,1,0,3,9,0,0,1000,0,0,0,0,0,0];
@@ -285,7 +384,9 @@ RUST_TESTS = r'''
         init.push(Secondary,HIST_IDLE);
         rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],true,1);
         init.push(Secondary,HIST_ACTIVE);
-        let shared=std::sync::Arc::new(Shared { state:State(std::sync::Mutex::new(Some(Box::new(Firmware { rings })))),dev,variant:Variant { graph } });
+        let shared=std::sync::Arc::new(Shared { state:State(std::sync::Mutex::new(Some(Box::new(Firmware {
+            rings,init:initdata::InitData::new(),powered:true,epoch:0,recovery:Recovery(false),
+        })))),dev,variant:Variant { graph },crashed:false.into() });
         let view=reports::View(shared.clone());
         struct View<'a>(&'a reports::View);
         impl std::fmt::Display for View<'_> {
@@ -474,10 +575,12 @@ int main(void) {
         }
     }
     /* G16S/G17P: pstate unsupported by firmware, utilisation still valid. */
-    current=(struct asahi_qualified_stats){.util_status=1,.pstate_status=3,.tiler=30,.renderer=80,.device=57,.pstate=0};
+    current=(struct asahi_qualified_stats){.util_status=1,.pstate_status=3,.tiler=30,.renderer=80,.device=57,.pstate=0,
+                                          .util_samples=19,.util_host_ns=123};
     agx_stats_show(NULL,&stats.attr,now);
     assert(strstr(now,"utilisation_status valid\nutil_tiler_percent 30\nutil_renderer_percent 80\nutil_device_percent 57\n"
                       "pstate_status unsupported\npstate unsupported\nrequested_frequency_hz unsupported\n"));
+    assert(strstr(now,"utilisation_source firmware-statistics-tag-0x13\nutilisation_samples 19\nutilisation_host_ns 123\n"));
     struct device dev;
     struct asahi_gpu_memory memory={0};
     void *handle=NULL;
@@ -509,7 +612,7 @@ def main():
     ap.add_argument('--baseline', default='ebcf9cb777a434867e9d880892ee2b46887728bb',
                     help='revision containing the legacy formatter')
     ap.add_argument('--mutation', choices=['fields', 'range', 'timestamp', 'age', 'delivery',
-                                           'quarantine', 'epoch', 'cutoff', 'whole-batch', 'legacy-format'])
+                                           'quarantine', 'epoch', 'cutoff', 'whole-batch', 'legacy-format', 'read-drain'])
     args = ap.parse_args()
     work = args.out or Path(tempfile.mkdtemp(prefix='asahi-g17-telemetry-'))
     work.mkdir(parents=True, exist_ok=True)
@@ -554,10 +657,15 @@ fn write_power(_: &super::Firmware, f:&mut kernel::fmt::Formatter<'_>)->kernel::
             telemetry = telemetry.replace(before, after, 1)
     (work / 'telemetry.rs').write_text(telemetry)
     stats_rs = (DRIVER / 'g17/stats.rs').read_text()
+    if args.mutation == 'read-drain':
+        assert 'for &role in firmware.roles()' in stats_rs
+        stats_rs = stats_rs.replace('for &role in firmware.roles()', 'for &role in &[]', 1)
     policy = '\n'.join(item(stats_rs, signature) for signature in
                        ['pub(super) const fn max_age_ns', 'pub(super) const fn reports_pstate',
                         'pub(super) fn qualify('])
-    (work / 'rings.rs').write_text(RUST_HEADER + 'mod stats { use super::fw::variant::InitGraph;\n'
+    reader_rs = 'pub(crate) struct Reader(pub(super) Arc<Shared>);\n' + item(stats_rs, 'impl Reader')
+    (work / 'rings.rs').write_text(RUST_HEADER + 'mod stats { use super::{fw::variant::InitGraph, telemetry::Readout, Shared};\n'
+                                  + 'use std::sync::{Arc,atomic::Ordering};\n' + reader_rs + '\n'
                                   + policy + '\n}\nmod telemetry;\nmod channel;\n' + RUST_TESTS)
     # Rust resolves child modules relative to the inline parent's directory.
     (work / 'g17').mkdir(exist_ok=True)
