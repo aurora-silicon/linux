@@ -9,7 +9,11 @@
 #include <linux/types.h>
 
 #ifdef CONFIG_ARM64_CTXR_EXECMEM
-/* Set once the boot CPU has a window at EL2; see init_kernel_el. */
+/*
+ * 1 when a window is active, else 0. Written on every boot and cleaned to the
+ * PoC by ctxr_exec_reserve(); the secondary and resume entries read it with the
+ * MMU off. The boot CPU never reads it. See init_kernel_el.
+ */
 extern u32 ctxr_stay_el2;
 
 /*
@@ -50,6 +54,9 @@ u64 ctxr_exec_pool_bytes(void);
 
 /* True if cores confined to the window can't run this kernel. */
 bool ctxr_exec_secondaries_held(void);
+
+/* True if @addr's kernel mapping resolves outside an active window. */
+bool ctxr_exec_fetch_outside_window(unsigned long addr);
 #else
 static inline void ctxr_exec_reserve(void) {}
 static inline void ctxr_exec_keep_reserved(void) {}
@@ -58,6 +65,7 @@ static inline bool ctxr_exec_efi_runtime_ok(void) { return true; }
 static inline bool ctxr_exec_window_reserved(void) { return false; }
 static inline bool ctxr_exec_secondaries_held(void) { return false; }
 static inline u64 ctxr_exec_pool_bytes(void) { return 0; }
+static inline bool ctxr_exec_fetch_outside_window(unsigned long addr) { return false; }
 #endif
 
 #endif /* __ASM_CTXR_EXECMEM_H */

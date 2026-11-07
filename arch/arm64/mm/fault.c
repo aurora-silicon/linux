@@ -34,6 +34,7 @@
 #include <asm/acpi.h>
 #include <asm/bug.h>
 #include <asm/cmpxchg.h>
+#include <asm/ctxr_execmem.h>
 #include <asm/cpufeature.h>
 #include <asm/efi.h>
 #include <asm/exception.h>
@@ -436,7 +437,9 @@ static void __do_kernel_fault(unsigned long addr, unsigned long esr,
 		if (esr & ESR_ELx_WNR)
 			msg = "write to read-only memory";
 		else if (is_el1_instruction_abort(esr))
-			msg = "execute from non-executable memory";
+			msg = ctxr_exec_fetch_outside_window(addr) ?
+				"execute from outside the CTXR window" :
+				"execute from non-executable memory";
 		else
 			msg = "read from unreadable memory";
 	} else if (addr < PAGE_SIZE) {
@@ -607,9 +610,12 @@ static bool is_invalid_gcs_access(struct vm_area_struct *vma, u64 esr)
 /*
  * A core enforcing the CTXR window refuses EL0 fetches from it with a permission
  * fault that the page tables don't explain. Nothing can fix that up, so a retry
- * would fault forever with the task still runnable. The window page may be
- * mapped without a struct page (a driver's remap_pfn_range() of an image
- * buffer), so fall back to a raw PFN walk and only ever compare the PFN.
+ * would fault forever with the task still runnable. A struct-page mapping is
+ * read through its folio; a VM_PFNMAP mapping with no struct page (a driver's
+ * remap_pfn_range() of an image buffer) through follow_pfnmap(). In both the PFN
+ * is accepted only from a user-executable leaf, and only the PFN is compared. A
+ * special VM_MIXEDMAP PTE with no struct page is left to the hardware fault,
+ * which is the real guarantee; this kill is a diagnostic backstop.
  */
 static bool el0_fetch_refused_by_window(struct mm_struct *mm, unsigned long addr,
 					unsigned long esr, unsigned int mm_flags)
@@ -634,9 +640,10 @@ static bool el0_fetch_refused_by_window(struct mm_struct *mm, unsigned long addr
 			if (fw.level == FW_LEVEL_PTE && pte_user_exec(fw.pte))
 				pfn = pte_pfn(fw.pte);
 			folio_walk_end(&fw, vma);
-		} else if ((vma->vm_flags & (VM_PFNMAP | VM_MIXEDMAP)) &&
+		} else if ((vma->vm_flags & VM_PFNMAP) &&
 			   !follow_pfnmap_start(&pfnmap)) {
-			pfn = pfnmap.pfn;
+			if (pte_user_exec(pfn_pte(pfnmap.pfn, pfnmap.pgprot)))
+				pfn = pfnmap.pfn;
 			follow_pfnmap_end(&pfnmap);
 		}
 	}

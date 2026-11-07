@@ -35,11 +35,11 @@ Command line (bring-up / VM)
         ctxr_exec_enforce=<bool>         (default: enforcing)
 
     ``size`` and ``base`` accept the usual ``K``/``M``/``G`` suffixes, and both
-    are required. The last use of an option wins. The kernel must be at EL2, and
-    when the device tree also carries a window the command-line one must lie
-    inside it: the command line can only pick a window within what the firmware
-    armed, never a different region. A value that doesn't parse is ignored with
-    a warning.
+    are required. The last use of an option wins. The kernel must be at EL2.
+    When the device tree also carries a window, the command-line one is used
+    only if it is identical; a different one is ignored with a warning and the
+    device-tree window is used, because the whole firmware window has to be
+    reserved (see below). A value that doesn't parse is ignored with a warning.
 
 The secondary CPUs can only run code inside the window, and the boot CPU isn't
 confined. So when a window is given but can't be used, the kernel logs why,
@@ -95,24 +95,28 @@ it up. Anything EL0 can execute therefore lives outside the window:
 
 * The vDSO's code is part of the image, so userspace gets a copy in ordinary
   memory.
-* No window page reaches the page allocator. ``free_reserved_area()`` skips them,
-  so freed ``__init`` memory stays reserved, as does an initrd in the window. A
-  CMA area that overlaps the window isn't activated, and a reserved-memory node
-  whose init fails stays reserved. RAM in the window that the pool doesn't use is
-  not available to the rest of the system, so a window should be no larger than
-  the executable code needs.
+* The whole reserved window stays out of the page allocator. The reservation
+  covers the entire window (which is why a command-line sub-window is refused),
+  ``free_reserved_area()`` skips window pages so freed ``__init`` memory and an
+  initrd in the window stay reserved, a CMA area that overlaps the window isn't
+  activated, and a reserved-memory node whose init fails stays reserved. RAM in
+  the window that the pool doesn't use is not available to the rest of the
+  system, so a window should be no larger than the executable code needs.
 
 * The zero page is part of the image too, and every untouched anonymous page
   that is read before it is written maps it, executable mappings included. With
   a window active, ``arch_setup_zero_pages()`` allocates the zero pages from
   memblock instead, outside the window.
 
-As a backstop, when a window is active, an EL0 instruction permission fault on a
-present, executable mapping of a window page logs the task and its address and
-PFN, then kills it with an uncatchable ``SIGSEGV`` rather than retrying. The
-mapping is resolved to a PFN either through its folio or, for a ``VM_PFNMAP`` or
-``VM_MIXEDMAP`` mapping with no struct page (a driver's ``remap_pfn_range()`` of
-an image buffer), through a raw PFN walk. Any other fault takes the usual path.
+The hardware CTXR is what actually stops an out-of-window EL0 fetch on a
+confined core. As a diagnostic backstop, when a window is active an EL0
+instruction permission fault on a user-executable mapping of a window page logs
+the task, address and PFN and kills it with an uncatchable ``SIGSEGV`` rather
+than letting it retry forever. The PFN is taken from the mapping's folio, or for
+a ``VM_PFNMAP`` mapping with no struct page (a driver's ``remap_pfn_range()`` of
+an image buffer) through ``follow_pfnmap()``; a special ``VM_MIXEDMAP`` PTE with
+no struct page isn't resolved here and is left to the hardware fault. Any other
+fault takes the usual path.
 
 EFI runtime services
 ====================
@@ -136,7 +140,9 @@ kexec and crash kernels
     The relocation code runs from an ordinary page, outside the window, and a
     crash dump can start on a confined core, where it would hang during a panic.
     While a window is active, ``machine_kexec_prepare()`` refuses both, so
-    ``kexec_load()`` and ``kexec_file_load()`` fail with ``EOPNOTSUPP``.
+    ``kexec_load()`` and ``kexec_file_load()`` fail with ``EOPNOTSUPP``. A
+    ``crashkernel=`` reservation would then only waste memory, so it is skipped
+    with a warning when a window is active.
 
 Hibernate
     Resume runs from a ``trans_pgd`` page outside the window. This is unchanged
@@ -153,3 +159,9 @@ window, as violations. Any violation is fatal unless ``ctxr_exec_enforce=0`` is
 given. This is also what stands in for the hardware fault when testing in a VM.
 The check runs once: memory freed after it, such as init memory, relies on
 ``free_reserved_area()`` skipping window pages.
+
+When a window is active, ``/sys/kernel/execmem_confine/`` reports it:
+``window_base`` and ``window_size``, and the pool's ``pool_size``, ``pool_free``
+and ``pool_largest_free`` (bytes). These make an allocation failure (for example
+an ``insmod`` ``ENOMEM``) on a running machine diagnosable, and give a tool a
+stable place to read the window from.
