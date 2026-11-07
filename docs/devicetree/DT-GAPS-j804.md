@@ -19,6 +19,8 @@ No firmware, calibration or register programming values are included.
 - Complete the transport children and firmware-service bindings, pinmux,
   port graphs and board wiring. Listing a controller does not cover its
   attached peripherals.
+- Audit the parent dependencies of new disabled PMGR gates before enabling
+  a gate or its consumer.
 - Resolve every provider/routing gap called out below. No guessed
   address, interrupt parent or power-domain relationship was substituted.
 - Validate on this board; no boot or peripheral test was performed.
@@ -36,7 +38,8 @@ the speaker stream and its audio-data child, speaker tap and headphone/mic
 path; the jack codec is CS42L84. These are hardware/topology facts, not an
 acoustic tuning bundle. Do not infer an AID or copy gain/configuration data
 into DTS. Product/board-to-AID mapping and per-speaker calibration remain
-boot-environment work. The speaker path remains disabled until its transport,
+boot-environment work. The six amplifier identities and jack codec are described as disabled I2C children.
+The speaker path remains disabled until its transport,
 power sequencing and protection integration are qualified.
 
 ## SoC-bus coverage
@@ -240,14 +243,14 @@ from those records are reproduced here.
 | `spi4/dp855/lcd-ss` | Attached device or firmware service; endpoint binding and board wiring audit pending. |
 | `spi4/dp855/tcon-registers` | Attached device or firmware service; endpoint binding and board wiring audit pending. |
 | `spi4/dp855/lcd-eeprom` | Attached device or firmware service; endpoint binding and board wiring audit pending. |
-| `i2c1/audio-codec-output` | Attached device or firmware service; endpoint binding and board wiring audit pending. |
+| `i2c1/audio-codec-output` | `&hw_jack_codec` identifies the disabled codec; reset, interrupt, power and audio routing audit pending. |
 | `i2c1/mogul-las` | Attached device or firmware service; endpoint binding and board wiring audit pending. |
-| `i2c3/audio-speaker` | Attached device or firmware service; endpoint binding and board wiring audit pending. |
-| `i2c3/audio-speaker-left-woofer-2` | Attached device or firmware service; endpoint binding and board wiring audit pending. |
-| `i2c3/audio-speaker-left-tweeter` | Attached device or firmware service; endpoint binding and board wiring audit pending. |
-| `i2c3/audio-speaker-right-woofer-1` | Attached device or firmware service; endpoint binding and board wiring audit pending. |
-| `i2c3/audio-speaker-right-woofer-2` | Attached device or firmware service; endpoint binding and board wiring audit pending. |
-| `i2c3/audio-speaker-right-tweeter` | Attached device or firmware service; endpoint binding and board wiring audit pending. |
+| `i2c3/audio-speaker` | `&hw_audio_speaker` identifies the disabled codec; reset, interrupt, power and audio routing audit pending. |
+| `i2c3/audio-speaker-left-woofer-2` | `&hw_audio_speaker_left_woofer_2` identifies the disabled codec; reset, interrupt, power and audio routing audit pending. |
+| `i2c3/audio-speaker-left-tweeter` | `&hw_audio_speaker_left_tweeter` identifies the disabled codec; reset, interrupt, power and audio routing audit pending. |
+| `i2c3/audio-speaker-right-woofer-1` | `&hw_audio_speaker_right_woofer_1` identifies the disabled codec; reset, interrupt, power and audio routing audit pending. |
+| `i2c3/audio-speaker-right-woofer-2` | `&hw_audio_speaker_right_woofer_2` identifies the disabled codec; reset, interrupt, power and audio routing audit pending. |
+| `i2c3/audio-speaker-right-tweeter` | `&hw_audio_speaker_right_tweeter` identifies the disabled codec; reset, interrupt, power and audio routing audit pending. |
 | `i2c4/avellino-pre` | Attached device or firmware service; endpoint binding and board wiring audit pending. |
 | `i2c4/avellino-post` | Attached device or firmware service; endpoint binding and board wiring audit pending. |
 | `fpwm0/kbd-backlight` | Attached device or firmware service; endpoint binding and board wiring audit pending. |

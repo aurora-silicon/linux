@@ -24,3 +24,5 @@
 &smc_mbox {
 	status = "disabled";
 };
+
+#include "t8152-j804-audio-topology.dtsi"
