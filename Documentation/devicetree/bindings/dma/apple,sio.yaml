@@ -26,8 +26,8 @@ allOf:
     then:
       properties:
         reg:
-          minItems: 2
-          maxItems: 2
+          minItems: 3
+          maxItems: 3
     else:
       properties:
         reg:
@@ -50,8 +50,11 @@ properties:
 
   reg:
     minItems: 1
-    maxItems: 2
-    description: Coprocessor registers, followed on T8140 by the ASC auxiliary window.
+    maxItems: 3
+    description: |
+      Coprocessor control registers. T8140 also publishes an auxiliary ASC
+      window and the remaining ASC registers after the mailbox window.
+      The mailbox registers are described by the mailbox provider.
 
   clocks:
     minItems: 1

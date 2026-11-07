@@ -19,6 +19,19 @@ description:
 
 allOf:
   - $ref: reserved-memory.yaml#
+  - if:
+      properties:
+        status:
+          const: disabled
+      required:
+        - status
+    then:
+      anyOf:
+        - required: [reg]
+        - required: [size]
+    else:
+      required:
+        - reg
 
 properties:
   compatible:
@@ -26,6 +39,8 @@ properties:
 
   reg:
     maxItems: 1
+
+  size: true
 
   no-map: true
 
@@ -37,6 +52,5 @@ properties:
 
 required:
   - compatible
-  - reg
 
 unevaluatedProperties: false

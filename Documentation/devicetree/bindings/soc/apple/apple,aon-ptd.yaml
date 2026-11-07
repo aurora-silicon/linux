@@ -32,9 +32,20 @@ properties:
     minItems: 32
     maxItems: 32
 
+  interrupt-controller: true
+
+  '#interrupt-cells':
+    description: Firmware telemetry source identifier, plus flags on T8140.
+    enum: [1, 2]
+
+  '#address-cells':
+    const: 0
+
 required:
   - compatible
   - reg
   - interrupts
+  - interrupt-controller
+  - '#interrupt-cells'
 
 additionalProperties: false

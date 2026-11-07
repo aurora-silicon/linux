@@ -25,6 +25,18 @@ properties:
   reg:
     maxItems: 1
 
+  i2c:
+    type: object
+    $ref: /schemas/i2c/i2c-controller.yaml#
+    description: Downstream panel management bus mediated by the timing controller.
+
+    patternProperties:
+      '^temperature-sensor@7[0-2]$':
+        type: object
+        $ref: /schemas/trivial-devices.yaml#
+
+    unevaluatedProperties: false
+
 required:
   - compatible
   - reg
