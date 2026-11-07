@@ -21,9 +21,16 @@ description: |
 
 properties:
   compatible:
-    enum:
-      - apple,t6041-jpeg
-      - apple,t8140-jpeg
+    oneOf:
+      - enum:
+          - apple,t6041-jpeg
+          - apple,t8140-jpeg
+      - items:
+          - enum:
+              - apple,t8122-jpeg
+              - apple,t6030-jpeg
+              - apple,t6031-jpeg
+          - const: apple,jpeg
 
   reg:
     maxItems: 1
@@ -72,6 +79,18 @@ allOf:
     else:
       properties:
         apple,dma-range: false
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8122-jpeg
+              - apple,t6030-jpeg
+              - apple,t6031-jpeg
+    then:
+      properties:
+        power-domains:
+          maxItems: 1
 
 additionalProperties: false
 

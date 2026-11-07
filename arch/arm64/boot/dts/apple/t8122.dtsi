@@ -409,7 +409,7 @@
 		clock-output-names = "nco_ref";
 	};
 
-	soc {
+	soc: soc {
 		compatible = "simple-bus";
 		#address-cells = <2>;
 		#size-cells = <2>;
@@ -1932,3 +1932,11 @@
 #include "t8122-pmgr.dtsi"
 #include "t8122-gpu.dtsi"
 #include "t8122-dcp.dtsi"
+
+#include "t8122-peripherals.dtsi"
+
+#include "t8122-peripheral-buses.dtsi"
+
+#include "t8122-coprocessors.dtsi"
+
+#include "t8122-misc-interfaces.dtsi"

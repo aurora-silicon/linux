@@ -22,11 +22,17 @@ properties:
       - items:
           - const: apple,t8140-aes
           - const: apple,aes
+      - items:
+          - enum:
+              - apple,t8122-aes
+              - apple,t6030-aes
+              - apple,t6031-aes
+          - const: apple,aes
 
   reg:
-    minItems: 3
+    minItems: 2
     maxItems: 3
-    description: Register apertures in hardware-description order.
+    description: Engine and control banks, with an auxiliary bank on later variants.
 
   interrupts:
     maxItems: 1
@@ -43,5 +49,25 @@ required:
   - interrupts
   - power-domains
   - iommus
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8122-aes
+              - apple,t6030-aes
+              - apple,t6031-aes
+    then:
+      properties:
+        reg:
+          minItems: 2
+          maxItems: 2
+    else:
+      properties:
+        reg:
+          minItems: 3
+          maxItems: 3
 
 additionalProperties: false
