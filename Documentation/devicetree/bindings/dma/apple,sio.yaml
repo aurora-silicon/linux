@@ -12,12 +12,41 @@ description:
   being a pretend DMA controller. The SoC-specific compatible selects the
   firmware protocol and channel configuration. In particular, apple,t6030-sio
   requires protocol-10 boot tables before the coprocessor can be started.
+  The T8132 resource description remains disabled until its channel layout
+  and firmware handoff are supported; its channel count is not guessed.
 
 maintainers:
   - Martin Povišer <povik+lin@cutebit.org>
 
 allOf:
   - $ref: dma-controller.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8132-sio
+      required:
+        - compatible
+    then:
+      properties:
+        reg:
+          minItems: 2
+          maxItems: 2
+        clocks:
+          minItems: 3
+          maxItems: 3
+        status:
+          const: disabled
+      required:
+        - clocks
+        - status
+    else:
+      properties:
+        reg:
+          maxItems: 1
+        clocks: false
+      required:
+        - dma-channels
 
 properties:
   compatible:
@@ -29,12 +58,22 @@ properties:
               - apple,t6030-sio
               - apple,t8103-sio
               - apple,t8112-sio
+              - apple,t8132-sio
           - const: apple,sio
       - description: T6041 firmware requires a generation-specific backend.
         const: apple,t6041-sio
 
   reg:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
+    description:
+      Coprocessor register window, followed by an auxiliary window on T8132.
+
+  clocks:
+    maxItems: 3
+    description: Hardware clock identifiers for the T8132 SIO interface.
+
+  status: true
 
   '#dma-cells':
     const: 1
@@ -97,7 +136,6 @@ required:
   - compatible
   - reg
   - '#dma-cells'
-  - dma-channels
   - mboxes
   - iommus
   - power-domains
