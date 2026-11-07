@@ -122,7 +122,19 @@ struct apple_qspi_board {
 static const struct apple_qspi_board apple_qspi_boards[] = {
 	{ "apple,t8122-qspi", "apple,j613", 0x2a1118000ULL,
 	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
+	/*
+	 * The M4 Macs: the J713 and J773g ADTs place anvram at 0x700000; the
+	 * J604 and the iMacs are assumed to match, and to carry the J713's part.
+	 */
+	{ "apple,t8132-qspi", "apple,j604", 0x3ad118000ULL,
+	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
+	{ "apple,t8132-qspi", "apple,j623", 0x3ad118000ULL,
+	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
+	{ "apple,t8132-qspi", "apple,j624", 0x3ad118000ULL,
+	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
 	{ "apple,t8132-qspi", "apple,j713", 0x3ad118000ULL,
+	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
+	{ "apple,t8132-qspi", "apple,j773g", 0x3ad118000ULL,
 	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
 	/* Macronix is the ID macOS reports; a J616s also reads W25Q64 on the bus. */
 	{ "apple,t6041-qspi", "apple,j616s", 0x429118000ULL,
