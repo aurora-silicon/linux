@@ -475,6 +475,8 @@
 
 &wifi0 {
 	compatible = "pci14e4,4434";
+	/* WLAN wake is not qualified on these machines yet. */
+	/delete-property/ wakeup-source;
 };
 
 &bluetooth0 {
