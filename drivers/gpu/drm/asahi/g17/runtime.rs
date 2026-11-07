@@ -868,7 +868,7 @@ impl Backend {
                     outer_render <- kernel::new_mutex!(None, "g17::Backend::outer_render"),
                     admission,
                     direct_slot: core::sync::atomic::AtomicU32::new(0),
-                    pairs: crate::hw::t8140::queues::RENDER_PAIRS_PER_OWNER as u8,
+                    pairs: super::pairs::per_owner(),
                 }),
                 GFP_KERNEL,
             )?,

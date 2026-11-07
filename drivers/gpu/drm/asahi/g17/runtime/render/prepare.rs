@@ -813,8 +813,8 @@ impl super::super::Backend {
 
     pub(super) fn ensure_render(&self, packet: &Arc<Packet>, slot: u8, sleep: bool) -> Result {
         self.build_render_pair(slot, packet, false, sleep)?;
-        // An owner has exactly one pair (kick.rs asserts it): no sibling to warm.
-        if crate::hw::t8140::queues::RENDER_PAIRS_PER_OWNER == 1 {
+        // An owner held to one pair has no sibling to warm.
+        if self.pairs == 1 {
             return Ok(());
         }
         let sibling = {
