@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /* Register and interrupt resources; ownership-sensitive blocks stay disabled. */
 
-&die0 {
+&{/soc} {
 	hw_nub_spmi1: spmi@28a054000 {
 		compatible = "apple,t6050-spmi", "apple,spmi";
 		reg = <0x2 0x8a054000 0x0 0x4000>,
