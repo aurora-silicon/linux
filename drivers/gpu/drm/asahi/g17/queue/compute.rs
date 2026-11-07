@@ -9,6 +9,7 @@ pub(crate) mod retirement;
 use crate::g17::{
     channel::Rings,
     context::Context,
+    event_mask::{self, Engine},
     fw::{
         channels::ControlRecord,
         compute::{ComputeProgram, OperandState, COMPUTE_DESCRIPTOR_SIZE},
@@ -2186,7 +2187,7 @@ impl Queue {
     ) -> Result {
         use crate::g17::fw::{
             channels::WorkSlot,
-            compute::{ComputeArgs, ComputeDescriptor, COMPUTE_KICK_EVENT_MASK, COMPUTE_QOS_CLASS},
+            compute::{ComputeArgs, ComputeDescriptor, COMPUTE_QOS_CLASS},
             kick::{KickArgs, KickQos},
         };
         let (epoch, addresses) = self.publication_preflight(&packet, host)?;
@@ -2301,7 +2302,7 @@ impl Queue {
                 class: COMPUTE_QOS_CLASS,
             },
             mcache: None,
-            event_mask: COMPUTE_KICK_EVENT_MASK,
+            event_mask: event_mask::selected(Engine::Compute),
             register_arrays: ComputeDescriptor::register_bindings(descriptor_low, *scratch, self.graph.program)?,
             scs_enabled: scratch.enabled(),
             priority: policy.priority(),
