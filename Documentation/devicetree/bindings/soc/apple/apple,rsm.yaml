@@ -18,7 +18,6 @@ select:
       contains:
         enum:
           - apple,t8140-rsm
-          - apple,rsm
           - apple,t6032-rsm
   required:
     - compatible

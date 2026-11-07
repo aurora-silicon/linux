@@ -21,7 +21,6 @@ select:
         enum:
           - apple,t8140-prores
           - apple,t6032-prores
-          - apple,prores
   required:
     - compatible
 

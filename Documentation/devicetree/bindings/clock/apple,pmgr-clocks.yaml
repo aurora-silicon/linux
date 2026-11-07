@@ -24,7 +24,6 @@ select:
         enum:
           - apple,t6041-pmgr-clocks
           - apple,t8140-pmgr-clocks
-          - apple,pmgr-clocks
           - apple,t6032-pmgr-clocks
   required:
     - compatible

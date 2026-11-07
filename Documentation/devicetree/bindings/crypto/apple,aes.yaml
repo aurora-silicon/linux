@@ -19,7 +19,6 @@ select:
       contains:
         enum:
           - apple,t6041-aes
-          - apple,aes
           - apple,t8140-aes
           - apple,t6032-aes
   required:

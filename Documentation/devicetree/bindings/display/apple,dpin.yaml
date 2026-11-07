@@ -18,7 +18,6 @@ select:
       contains:
         enum:
           - apple,t6041-dpin
-          - apple,dpin
           - apple,t6032-dpin
   required:
     - compatible

@@ -19,7 +19,6 @@ select:
       contains:
         enum:
           - apple,t6041-pciec-piodma
-          - apple,pciec-piodma
           - apple,t6032-pciec-piodma
   required:
     - compatible

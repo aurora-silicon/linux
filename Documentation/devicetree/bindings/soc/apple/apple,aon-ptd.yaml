@@ -19,7 +19,6 @@ select:
       contains:
         enum:
           - apple,t6041-aon-ptd
-          - apple,aon-ptd
           - apple,t8140-aon-ptd
           - apple,t6032-aon-ptd
   required:

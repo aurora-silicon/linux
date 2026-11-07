@@ -24,7 +24,6 @@ select:
           - apple,t8140-mcc
           - apple,t6041-mcc
           - apple,t6032-mcc
-          - apple,mcc
   required:
     - compatible
 

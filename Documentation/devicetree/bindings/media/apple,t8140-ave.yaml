@@ -24,7 +24,6 @@ select:
           - apple,t8112-ave
           - apple,t8140-ave
           - apple,t6032-ave
-          - apple,ave
   required:
     - compatible
 
