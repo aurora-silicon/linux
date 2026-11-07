@@ -332,6 +332,7 @@ struct ave_ctx {
 	struct delayed_work poll_work;
 
 	u32 bitrate_mode;
+	u32 quality; /* V4L2 constant quality, 0..100 */
 	u32 bitrate;
 	u32 bitrate_peak;
 	u32 gop_size;
