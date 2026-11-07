@@ -264,24 +264,17 @@ const SKS_LOCK_STATE_VARIANT: u32 = 1;
 #[derive(Clone, Copy)]
 enum LockState {
     Unlocked,
-    Locked,
 }
 
 impl LockState {
     const fn wire(self) -> i32 {
         match self {
             LockState::Unlocked => 0,
-            LockState::Locked => 1,
         }
     }
 }
 
 static_assert!(LockState::Unlocked.wire() == 0);
-static_assert!(LockState::Locked.wire() == 1);
-
-/// Flags of a lock request: macOS locks the user's bag with state 1,
-/// flags 1 and no secret when the screen locks.
-const SKS_LOCK_FLAGS: u64 = 1;
 
 const SKS_LOCK_STATE_FLAGS: u64 = 0;
 

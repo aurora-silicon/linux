@@ -48,9 +48,6 @@ const BG_OPS_SAVE_POLL_MS: u32 = 50;
 
 /// How long a re-arm waits for the enclave to announce the cleared state.
 const LOCK_STATE_WAIT_MS: u32 = 1000;
-/// How long a re-arm waits for the enclave to report the user locked after
-/// the bag lock: past macOS's 10 s grace before the bag reports locked.
-const BAG_LOCK_WAIT_MS: u32 = 12_000;
 const LOCK_STATE_POLL_MS: u32 = 10;
 
 fn lockout_record(locked: bool) -> [u8; LOCKOUT_RECORD_LEN] {
@@ -4476,24 +4473,6 @@ impl SepData {
             }
         };
         let notify_user = user.value() as u32;
-        // The identification refusal never sets the user's lockout bit, so
-        // the password below has no locked state to end; a restart's
-        // catacomb load does set it and the boot's bag verification clears
-        // it. Lock the designated bag first, as macOS does at screen lock,
-        // and wait past its grace period for the enclave to report the user
-        // locked, so that the password ends a real lockout.
-        let relocked = self.lock_special_bag();
-        let locked_state = if relocked { self.await_lockout_set(notify_user, BAG_LOCK_WAIT_MS) } else { None };
-        dev_info!(
-            self.dev,
-            "Touch ID: re-arm: designated bag lock {}, user {} lockout bit {}\n",
-            relocked,
-            notify_user,
-            match locked_state {
-                Some(_) => "set",
-                None => "not reported",
-            }
-        );
         let since = self.bio_lock_state_seq.load(Relaxed);
         let Some(out) = self.sks_send(self.sks_req_verify_password(du.special_handle(), stored.secret()))
         else {
@@ -4869,44 +4848,6 @@ impl SepData {
             self.sks_req_unlock_special(special, stored.secret(), healthy)
         })
         .is_some()
-    }
-
-    /// Locks the designated user's key bag (state 1, flags 1, no secret).
-    fn lock_special_bag(&self) -> bool {
-        if !self.keybag_designated.load(Relaxed) {
-            return false;
-        }
-        let Some(user) = crate::sks::DesignateUser::new(SBIO_PROBE_USER_ID) else {
-            return false;
-        };
-        let special = user.special_handle();
-        let label = match self.profile.key_store {
-            profile::KeyStore::Sepos13 { .. } => c"DEVICE_STATE_TRANSITION",
-            profile::KeyStore::Variant5 => crate::sks::SKS_LOCK_STATE_NAME,
-        };
-        self.sks_step(label, |healthy| self.sks_req_lock_special(special, healthy)).is_some()
-    }
-
-    /// Waits up to `timeout_ms` for a lock-state notification of `user` with
-    /// the lockout bit set. Every notification is logged where it arrives.
-    fn await_lockout_set(&self, user: u32, timeout_ms: u32) -> Option<u16> {
-        let mut since = self.bio_lock_state_seq.load(Relaxed);
-        let mut waited = 0;
-        while waited < timeout_ms {
-            let seq = self.bio_lock_state_seq.load(Relaxed);
-            if seq != since {
-                since = seq;
-                let last = self.bio_lock_state.load(Relaxed);
-                if (last >> 16) as u32 == user && (last as u16) & LOCK_STATE_LOCKOUT != 0 {
-                    return Some(last as u16);
-                }
-            }
-            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(
-                LOCK_STATE_POLL_MS,
-            )));
-            waited += LOCK_STATE_POLL_MS;
-        }
-        None
     }
 
     fn ensure_restored_after(&self, prepared: bool) {
