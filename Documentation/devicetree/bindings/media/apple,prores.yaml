@@ -19,8 +19,9 @@ select:
     compatible:
       contains:
         enum:
-          - apple,t8140-prores
+          - apple,t6041-prores
           - apple,t8132-prores
+          - apple,t8140-prores
   required:
     - compatible
 
@@ -64,21 +65,26 @@ allOf:
         - interrupts
         - power-domains
         - iommus
-
     else:
       properties:
         compatible:
-          const: apple,t8140-prores
+          oneOf:
+            - const: apple,t8140-prores
+            - items:
+                - const: apple,t6041-prores
+                - const: apple,prores
 
         reg:
-          items:
-            - description: Engine registers
-            - description: Wrapper registers
+          minItems: 2
+          maxItems: 3
+          description: Engine, wrapper and (on T6041) auxiliary register windows.
 
         reg-names:
+          minItems: 2
           items:
             - const: core
             - const: wrapper
+            - const: aux
 
         interrupts:
           minItems: 1
@@ -109,6 +115,33 @@ allOf:
         - interrupts
         - iommus
         - power-domains
+
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6041-prores
+          then:
+            properties:
+              reg:
+                minItems: 3
+                maxItems: 3
+              reg-names:
+                minItems: 3
+                maxItems: 3
+              interrupts:
+                maxItems: 1
+            required:
+              - resets
+          else:
+            properties:
+              reg:
+                maxItems: 2
+              reg-names:
+                maxItems: 2
+
+      additionalProperties: false
 
 unevaluatedProperties: false
 

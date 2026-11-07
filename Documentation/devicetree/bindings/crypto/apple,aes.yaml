@@ -19,8 +19,8 @@ select:
       contains:
         enum:
           - apple,t6041-aes
-          - apple,t8140-aes
           - apple,t8132-aes
+          - apple,t8140-aes
   required:
     - compatible
 
@@ -63,7 +63,6 @@ allOf:
         - interrupts
         - power-domains
         - iommus
-
     else:
       properties:
         compatible:
@@ -95,5 +94,7 @@ allOf:
         - interrupts
         - power-domains
         - iommus
+
+      additionalProperties: false
 
 unevaluatedProperties: false

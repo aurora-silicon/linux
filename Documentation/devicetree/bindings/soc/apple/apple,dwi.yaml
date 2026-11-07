@@ -19,8 +19,8 @@ select:
       contains:
         enum:
           - apple,t6041-dwi
-          - apple,t8140-dwi
           - apple,t8132-dwi
+          - apple,t8140-dwi
   required:
     - compatible
 
@@ -58,7 +58,6 @@ allOf:
         - reg
         - interrupts
         - power-domains
-
     else:
       properties:
         compatible:
@@ -85,5 +84,7 @@ allOf:
         - reg
         - interrupts
         - power-domains
+
+      additionalProperties: false
 
 unevaluatedProperties: false

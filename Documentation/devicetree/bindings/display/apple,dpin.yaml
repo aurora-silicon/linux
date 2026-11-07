@@ -52,7 +52,6 @@ allOf:
         - compatible
         - reg
         - interrupts
-
     else:
       properties:
         compatible:
@@ -72,5 +71,7 @@ allOf:
         - compatible
         - reg
         - interrupts
+
+      additionalProperties: false
 
 unevaluatedProperties: false

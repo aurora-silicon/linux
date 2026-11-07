@@ -23,13 +23,17 @@ select:
       contains:
         enum:
           - apple,t6041-pmgr-clocks
-          - apple,t8140-pmgr-clocks
           - apple,t8132-pmgr-clocks
+          - apple,t8140-pmgr-clocks
   required:
     - compatible
 
 properties:
   compatible: true
+
+  apple,pmgr:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Primary PMGR syscon. Additional control banks are described by reg.
 
 allOf:
   - if:
@@ -53,7 +57,6 @@ allOf:
       required:
         - compatible
         - '#clock-cells'
-
     else:
       properties:
         compatible:
@@ -102,5 +105,7 @@ allOf:
               reg:
                 minItems: 44
                 maxItems: 44
+
+      additionalProperties: false
 
 unevaluatedProperties: false

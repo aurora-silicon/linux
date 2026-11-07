@@ -20,8 +20,8 @@ select:
       contains:
         enum:
           - apple,t6041-scaler
-          - apple,t8140-scaler
           - apple,t8132-scaler
+          - apple,t8140-scaler
   required:
     - compatible
 
@@ -70,7 +70,6 @@ allOf:
         - interrupts
         - power-domains
         - iommus
-
     else:
       properties:
         compatible:
@@ -113,5 +112,7 @@ allOf:
         - resets
         - iommus
         - clocks
+
+      additionalProperties: false
 
 unevaluatedProperties: false

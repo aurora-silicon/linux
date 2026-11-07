@@ -19,8 +19,8 @@ select:
       contains:
         enum:
           - apple,t6041-aon-ptd
-          - apple,t8140-aon-ptd
           - apple,t8132-aon-ptd
+          - apple,t8140-aon-ptd
   required:
     - compatible
 
@@ -65,7 +65,6 @@ allOf:
         - interrupt-controller
         - '#interrupt-cells'
         - '#address-cells'
-
     else:
       properties:
         compatible:
@@ -101,5 +100,7 @@ allOf:
         - interrupts
         - interrupt-controller
         - '#interrupt-cells'
+
+      additionalProperties: false
 
 unevaluatedProperties: false

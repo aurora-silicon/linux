@@ -58,7 +58,6 @@ allOf:
         - reg
         - interrupts
         - iommus
-
     else:
       properties:
         compatible:
@@ -83,5 +82,7 @@ allOf:
         - reg
         - interrupts
         - iommus
+
+      additionalProperties: false
 
 unevaluatedProperties: false
