@@ -41,15 +41,19 @@ impl InitData {
     /// Diagnostic-only read of an aligned word within the existing policy allocation.
     /// Callers hold the device state mutex, retaining this mapping for the entire sample.
     pub(crate) fn m5_policy_telemetry_word(&self, offset: usize) -> Result<u32> {
-        if !self.m5 || offset & 3 != 0 || offset.checked_add(4).is_none_or(|end| end > m::M5_POLICY_SIZE) {
+        if !self.m5 || offset & 3 != 0
+            || offset.checked_add(4).is_none_or(|end| end > self.graph.policy_size) {
             return Err(EINVAL);
         }
-        let at = m::M5_SHARED_LAYOUT.policy.checked_add(offset).ok_or(EINVAL)?;
+        let at = self.graph.shared.policy.checked_add(offset).ok_or(EINVAL)?;
         Ok(self.object(self.bundle)?.word(at)?.load(Ordering::Relaxed))
     }
 
     pub(crate) fn note_m5_submission_history(&self) -> Result {
         if !self.m5 { return Err(EINVAL); }
+        // The submission history is the M5 Pro build's status config +0x73c..; the common
+        // 26A428 one (0x6d0 bytes) has no such table.
+        if self.graph.is_common26() { return Ok(()); }
         let private = self.object(self.cluster)?;
         let base = m::M5_PRIVATE_LAYOUT.status_config;
         for _ in 0..64 {
@@ -86,6 +90,8 @@ impl InitData {
         use mmu::{PROT_FW_SHARED_RW as RW, PROT_FW_SHARED_RO as RO,
                   PROT_GPU_SHARED_RW as GPU};
         self.m5 = true;
+        self.graph = board.graph;
+        let common26 = board.graph.is_common26();
         // TA, fragment and compute share the compute work ring per priority; every
         // preparation's claim on it is counted from the first publication on.
         self.outer_credits = Some(super::outer_credit::Credits::new()?);
@@ -95,8 +101,8 @@ impl InitData {
             KernelObject::new(dev, uat.kernel_vm(), Placement::At(address), size,
                 mmu::PROT_FW_PRIV_RW, CpuMap::WriteBack)
         };
-        let private = m::M5_PRIVATE_LAYOUT;
-        let shared = m::M5_SHARED_LAYOUT;
+        let private = board.graph.private;
+        let shared = board.graph.shared;
         self.cluster = self.add(fixed(PRIVATE, private.total, RW)?)?;
         self.region_c = self.add(fixed(REGION_C, mmu::UAT_PGSZ, RO)?)?;
         self.roots = self.add(fixed(ROOTS, 0xc000, RO)?)?;
@@ -135,9 +141,18 @@ impl InitData {
         }
         m::encode_common26_aon_ptd(board, &mut self.object_mut(aon)?.bytes_mut()[..m::M5_AON_PTD_SIZE])
             .map_err(|_| EINVAL)?;
-        m::encode_m5_region_c(self.object_mut(self.region_c)?.bytes_mut()).map_err(|_| EINVAL)?;
-        m::encode_m5_private_cluster(PRIVATE, FWCTL,
-            &mut self.object_mut(self.cluster)?.bytes_mut()[..private.total]).map_err(|_| EINVAL)?;
+        if common26 {
+            m::encode_common26_board_region_c(
+                &mut self.object_mut(self.region_c)?.bytes_mut()[..m::REGION_C_SIZE])
+                .map_err(|_| EINVAL)?;
+            m::encode_common26_private_cluster(PRIVATE, FWCTL,
+                &mut self.object_mut(self.cluster)?.bytes_mut()[..private.total])
+                .map_err(|_| EINVAL)?;
+        } else {
+            m::encode_m5_region_c(self.object_mut(self.region_c)?.bytes_mut()).map_err(|_| EINVAL)?;
+            m::encode_m5_private_cluster(PRIVATE, FWCTL,
+                &mut self.object_mut(self.cluster)?.bytes_mut()[..private.total]).map_err(|_| EINVAL)?;
+        }
         let windows = board.register_windows();
         let windows = &windows[..board.register_window_count()];
         for (index, window) in windows.iter().enumerate() {
@@ -172,9 +187,14 @@ impl InitData {
         m::set_m5_enabled_cores(board,
             &mut self.object_mut(self.bundle)?.bytes_mut()[..m::M5_HW_DATA_SIZE], enabled_cores)
             .map_err(|_| EINVAL)?;
-        m::encode_m5_bundle_policy(m::M5PolicyBindings {
+        let bindings = m::M5PolicyBindings {
             state: PRIVATE + private.policy_state as u64, aon_ptd: AON, boot_timestamp: 0,
-        }, self.object_mut(self.bundle)?.bytes_mut()).map_err(|_| EINVAL)?;
+        };
+        if common26 {
+            m::encode_common26_bundle_policy(board, bindings, self.object_mut(self.bundle)?.bytes_mut())
+        } else {
+            m::encode_m5_bundle_policy(bindings, self.object_mut(self.bundle)?.bytes_mut())
+        }.map_err(|_| EINVAL)?;
         // The controller configuration applies where the part's leakage calibration matches the
         // one it was made for, or on a board whose configuration holds for every part.
         let calibrated = match board.calibration {
@@ -207,9 +227,9 @@ impl InitData {
                     [PRIVATE + private.status_config as u64, PRIVATE + private.secondary_extra_1 as u64]
                 },
             };
-            let profile = m::RootProfile::J714G17S26A428;
+            let profile = board.graph.profile;
             let channels = m::derive_channel_table_for_profile(profile, role,
-                PRIVATE + m::M5_PRIVATE_STATE_GRIDS[index] as u64,
+                PRIVATE + board.graph.state_grids[index] as u64,
                 instance.status_a, instance.main_config, BUNDLE);
             let offset = shared.main_config[index];
             m::encode_main_config_for_profile(profile, role, &addresses, &instance,
@@ -220,10 +240,6 @@ impl InitData {
             m::encode_root_for_profile(profile, role, &addresses, &instance,
                 &mut self.object_mut(self.roots)?.bytes_mut()[offset..offset + m::M5_ROOT_SIZE])
                 .map_err(|_| EINVAL)?;
-            if let Some(version) = board.interface_version {
-                self.object_mut(self.roots)?.bytes_mut()[offset..offset + 8]
-                    .copy_from_slice(&version.to_le_bytes());
-            }
         }
         fence(Ordering::SeqCst);
         dev_info!(dev.as_ref(), "M5 firmware graph ready: private {:#x}+{:#x}, shared {:#x}+{:#x}\n",

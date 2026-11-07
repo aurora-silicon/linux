@@ -1761,6 +1761,322 @@ pub(crate) const M5_HW_DATA_INSERT: usize = 0x267c;
 
 pub(crate) const M5_HW_DATA_INSERT_LEN: usize = 8;
 
+/// The common 26A428 private cluster (J873, J813): status config 0x6d0 bytes, the secondary
+/// root's second extra 0x60.
+pub(crate) const COMMON26_PRIVATE_LAYOUT: PrivateClusterLayout =
+    private_cluster_layout(&ABI_ALLOCATION_SIZES_26A428);
+
+pub(crate) const COMMON26_POLICY_SIZE: usize = ABI_ALLOCATION_SIZES_26A428[ALLOC_POLICY];
+
+const COMMON26_STATUS_CONFIG_SIZE: usize = ABI_ALLOCATION_SIZES_26A428[ALLOC_STATUS_CONFIG];
+
+const COMMON26_STATUS_CONFIG_IN_STATUS_B: usize =
+    COMMON26_PRIVATE_LAYOUT.status_config - COMMON26_PRIVATE_LAYOUT.status_b;
+
+const COMMON26_STATUS_B_SPAN: usize =
+    COMMON26_PRIVATE_LAYOUT.roles[0].status_a - COMMON26_PRIVATE_LAYOUT.status_b;
+
+/// Status config +0x6c4 = 1 and +0x6c8 = the FW VA of status B +0xe71c.
+const COMMON26_STATUS_CONFIG_LINK_WORD: usize = 0x6c4;
+const COMMON26_STATUS_CONFIG_LINK_PTR: usize = 0x6c8;
+
+/// The policy block's FW VA of the private-cluster policy state (25G76 +0x3c98).
+const COMMON26_POLICY_STATE_PTR: usize = 0x3d30;
+/// The policy block's FW VA of the AON PTD (25G76 +0x6460).
+const COMMON26_POLICY_AON_PTD_PTR: usize = 0x64d8;
+/// The policy block's boot mach_absolute_time (25G76 +0x651c).
+const COMMON26_POLICY_BOOT_TIMESTAMP: usize = 0x6c14;
+
+/// The 25G76 policy block (relative to the block) in the common 26A428 one, by the kext's
+/// initPowerAndPerformanceData stores (the G18 backend's G18G_26A428_POLICY_BANDS). 26A428
+/// inserts 0x680 bytes between the AON PTD pointer and the boot timestamp; the 25G76 words
+/// there have no place.
+const COMMON26_POLICY_BANDS: &[LayoutBand] = &[
+    band(0x0000, 0x009c, 0, Evidence::ProducerChecked),
+    band(0x00a0, 0x0200, 0x10, Evidence::ProducerChecked),
+    band(0x09b8, 0x295c, 0x10, Evidence::ProducerChecked),
+    band(0x2960, 0x29c1, 0x29, Evidence::ProducerChecked),
+    band(0x2a01, 0x2a05, 0x8d, Evidence::ProducerChecked),
+    band(0x2a08, 0x2e5c, 0x90, Evidence::ProducerChecked),
+    band(0x2e6c, 0x2e70, 0x9c, Evidence::ProducerChecked),
+    band(0x2e78, 0x2e7c, 0x74, Evidence::Inferred),
+    band(0x2f37, 0x2f43, -0x2b, Evidence::ProducerChecked),
+    band(0x2f43, 0x2f53, 0x71, Evidence::ProducerChecked),
+    band(0x2f58, 0x3260, 0x70, Evidence::ProducerChecked),
+    band(0x3c98, 0x3cac, 0x98, Evidence::ProducerChecked),
+    band(0x5cac, 0x5cb4, 0x98, Evidence::ProducerChecked),
+    band(0x63a4, 0x63f4, 0xa0, Evidence::ProducerChecked),
+    band(0x6458, 0x645c, 0x78, Evidence::ProducerChecked),
+    band(0x6460, 0x6468, 0x78, Evidence::ProducerChecked),
+    band(0x651c, 0x66a8, 0x6f8, Evidence::ProducerChecked),
+    band(0x6a18, 0x6a1c, 0x710, Evidence::ProducerChecked),
+];
+
+/// Policy fields the common 26A428 interface added: macOS sets them on J873 where the
+/// relocated 25G76 words leave zeros. +0x64e0 is the AON row tag (RT0g, set from the board).
+const COMMON26_POLICY_NEW_WORDS: [(usize, u32); 10] = [
+    (0x009c, 1), (0x00a0, 1), (0x00a4, 1), (0x00a8, 1),
+    (0x0104, COMMON26_PERF_SCALE_VALUE), (0x0b4c, 1),
+    (0x2a88, 0x7148_0000), (0x2a90, 0x0064_0000), (0x30b0, 0x42c8_0000),
+    (0x6520, 1),
+];
+
+/// Status-config fields the common 26A428 interface added, as macOS sets them on J873:
+/// +0x1dc/+0x1e0 after the secondary power-control inputs, +0x4e8 the two table enables.
+const COMMON26_STATUS_CONFIG_NEW_WORDS: [(usize, u32); 3] =
+    [(0x1dc, 1), (0x1e0, 29000), (0x4e8, 0x0001_0001)];
+
+/// Region-C fields the common 26A428 interface added, as macOS sets them on J873 (+0x38 is
+/// the new feature bit; the M5 Pro's region C carries +0x9dc and +0xe0c at +0x9e0 and
+/// +0x1c30).
+const COMMON26_REGION_C_NEW_WORDS: [(usize, u32); 4] =
+    [(0x038, 1), (0x9b0, 0x200), (0x9dc, 50), (0xe0c, 250)];
+
+/// The InitData layout a board's firmware build reads.
+pub(crate) struct Graph {
+    /// The root, main-config and channel-table encodings.
+    pub(crate) profile: RootProfile,
+    pub(crate) private: PrivateClusterLayout,
+    pub(crate) shared: SharedClusterLayout,
+    pub(crate) policy_size: usize,
+    /// The five shared blocks main +0x254 points at.
+    pub(crate) bundle_view_offsets: [usize; 5],
+    pub(crate) bundle_view_extents: [usize; 5],
+    pub(crate) work_ring_offsets: [usize; WORK_CHANNEL_COUNT],
+    /// Each role's channel-state grid in the private cluster.
+    pub(crate) state_grids: [usize; 2],
+    /// Region C's power-assert tally.
+    pub(crate) power_assert_tally: usize,
+}
+
+const fn state_grids(layout: &PrivateClusterLayout) -> [usize; 2] {
+    [
+        layout.dm_ring_states[0],
+        layout.secondary_control_state - WORK_STATE_GRID_OFFSETS[CONTROL_CHANNEL_INDEX],
+    ]
+}
+
+/// The M5 Pro's 26A428 build (J714, J716c, J775D).
+pub(crate) const M5_GRAPH: Graph = Graph {
+    profile: RootProfile::J714G17S26A428,
+    private: M5_PRIVATE_LAYOUT,
+    shared: M5_SHARED_LAYOUT,
+    policy_size: M5_POLICY_SIZE,
+    bundle_view_offsets: M5_BUNDLE_VIEW_OFFSETS,
+    bundle_view_extents: M5_BUNDLE_VIEW_EXTENTS,
+    work_ring_offsets: M5_WORK_RING_BUNDLE_OFFSETS,
+    state_grids: M5_PRIVATE_STATE_GRIDS,
+    power_assert_tally: super::power::POWER_ASSERT_TALLY,
+};
+
+/// The common 26A428 build (J873's interface; the J813).
+pub(crate) const COMMON26_GRAPH: Graph = Graph {
+    profile: RootProfile::J873G18G26A428,
+    private: COMMON26_PRIVATE_LAYOUT,
+    shared: COMMON26_SHARED_LAYOUT,
+    policy_size: COMMON26_POLICY_SIZE,
+    bundle_view_offsets: COMMON26_BUNDLE_VIEW_OFFSETS,
+    bundle_view_extents: COMMON26_BUNDLE_VIEW_EXTENTS,
+    work_ring_offsets: COMMON26_WORK_RING_BUNDLE_OFFSETS,
+    state_grids: state_grids(&COMMON26_PRIVATE_LAYOUT),
+    // The M5 Pro's tally sits in the block its region C moves from common +0xe10 to +0x1c34.
+    power_assert_tally: super::power::POWER_ASSERT_TALLY - 0x1c34 + 0xe10,
+};
+
+const _: () = {
+    assert!(M5_GRAPH.state_grids[0] == M5_PRIVATE_STATE_GRIDS[0]);
+    assert!(M5_GRAPH.state_grids[1] == state_grids(&M5_PRIVATE_LAYOUT)[1]);
+    assert!(COMMON26_PRIVATE_LAYOUT.total == 0x178000);
+    assert!(COMMON26_STATUS_CONFIG_IN_STATUS_B + COMMON26_STATUS_CONFIG_SIZE
+        <= COMMON26_STATUS_B_SPAN);
+};
+
+impl Graph {
+    pub(crate) fn is_common26(&self) -> bool {
+        self.profile == RootProfile::J873G18G26A428
+    }
+}
+
+/// Encode the common 26A428 primary status-B span: status B, status config and the gap to
+/// status A. The status config carries the board's 25G76 words relocated, the fields 26A428
+/// added and its new cross-link to status B.
+fn encode_common26_primary_status_b(
+    fwctl_state: u64,
+    fwctl_ring: u64,
+    status_b: u64,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    if out.len() != COMMON26_STATUS_B_SPAN {
+        return Err(InitdataError::BufferSize);
+    }
+    required_address(fwctl_state)?;
+    required_address(fwctl_ring)?;
+    required_address(status_b)?;
+    let config = COMMON26_STATUS_CONFIG_IN_STATUS_B;
+    out.fill(0);
+    encode_status_block(&mut out[..STATUS_BLOCK_SIZE])?;
+    put_u64(out, COMMON26_STATUS_B_FWCTL_STATE, fwctl_state);
+    put_u64(out, COMMON26_STATUS_B_FWCTL_RING, fwctl_ring);
+    put_u32(out, COMMON26_STATUS_B_CONFIG_HEADER, 1);
+    put_u32(out, COMMON26_STATUS_B_LINK_WORD, 0);
+    put_u64(out, COMMON26_STATUS_B_LINK_PTR,
+            status_b + (config + COMMON26_STATUS_CONFIG_LINK_WORD) as u64);
+    let status_config = &mut out[config..config + COMMON26_STATUS_CONFIG_SIZE];
+    write_relocated_words(M5_25G76_STATUS_CONFIG_WORDS, 0, COMMON26_STATUS_CONFIG_BANDS,
+                          status_config)?;
+    for (offset, value) in COMMON26_STATUS_CONFIG_NEW_WORDS {
+        put_u32(status_config, offset, value);
+    }
+    // 26A428 moved the last of the six 25G76 words at +0x588..+0x59c to the second place:
+    // on J873 +0x59c..+0x5b8 read 1, 700, 12, 5000, 2000, 5000, 0, 0, where the bands carry
+    // the board's six words to +0x5a4.
+    let words: [u32; 6] = core::array::from_fn(|index| {
+        let at = 0x5a4 + index * 4;
+        u32::from_le_bytes(status_config[at..at + 4].try_into().unwrap_or([0; 4]))
+    });
+    for (index, value) in [words[0], words[5], words[1], words[2], words[3], words[4], 0, 0]
+        .into_iter().enumerate() {
+        put_u32(status_config, 0x59c + index * 4, value);
+    }
+    // The two 16x16 tables 26A428 copies in at +0x1e8 and +0x3e8 (the 25G76 words have none):
+    // zero first row and column, linear elsewhere, as on J873.
+    for row in 0..16 {
+        for col in 0..16 {
+            let active = row != 0 && col != 0;
+            put_u16(status_config, 0x1e8 + 2 * (row * 16 + col),
+                    if active { (col * 0x1000 - 1) as u16 } else { 0 });
+            status_config[0x3e8 + row * 16 + col] = if active { (col * 0x10 - 1) as u8 } else { 0 };
+        }
+    }
+    put_u32(status_config, COMMON26_STATUS_CONFIG_LINK_WORD, 1);
+    put_u64(status_config, COMMON26_STATUS_CONFIG_LINK_PTR,
+            status_b + COMMON26_STATUS_B_LINK_WORD as u64);
+    Ok(())
+}
+
+/// Encode the common 26A428 private cluster mapped at `private_base`: the status-B span, both
+/// status A blocks, the secondary root's 0x60 object and one opening-producer entry per control
+/// channel.
+pub(crate) fn encode_common26_private_cluster(
+    private_base: u64,
+    fwctl_state: u64,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    let layout = COMMON26_PRIVATE_LAYOUT;
+    if out.len() != layout.total {
+        return Err(InitdataError::BufferSize);
+    }
+    required_address(private_base)?;
+    let private_end = private_base
+        .checked_add(layout.total as u64)
+        .ok_or(InitdataError::AddressOutOfRange)?;
+    required_address(private_end - 1)?;
+    required_address(fwctl_state)?;
+    let fwctl_ring = fwctl_state
+        .checked_add(COMMON26_FWCTL_RING_OFFSET as u64)
+        .ok_or(InitdataError::AddressOutOfRange)?;
+    required_address(fwctl_ring)?;
+    if fwctl_state < private_end && private_base < fwctl_ring + CONTROL_RECORD_SIZE as u64 {
+        return Err(InitdataError::PairAliasedObject);
+    }
+    out.fill(0);
+    let status_b = layout.status_b;
+    let status_a = layout.roles[0].status_a;
+    encode_common26_primary_status_b(fwctl_state, fwctl_ring, private_base + status_b as u64,
+                                     &mut out[status_b..status_a])?;
+    for role in layout.roles {
+        encode_status_block(&mut out[role.status_a..role.status_a + STATUS_BLOCK_SIZE])?;
+    }
+    let extra = layout.secondary_extra_1;
+    encode_secondary_root_extra_1_for_profile(RootProfile::J873G18G26A428,
+        &mut out[extra..extra + STATUS_BLOCK_SIZE])?;
+    put_u32(out, layout.control_state + CHANNEL_STATE_PRODUCER * CHANNEL_STATE_SPACING,
+            CONTROL_OPENING_PRIMARY_PRODUCER);
+    put_u32(out, layout.secondary_control_state + CHANNEL_STATE_PRODUCER * CHANNEL_STATE_SPACING,
+            CONTROL_OPENING_SECONDARY_PRODUCER);
+    Ok(())
+}
+
+/// Encode the six common 26A428 blocks after the HW data (0xc18, 0x1048, 0xe10, perf/policy,
+/// 0x68, 0x800): the board's 25G76 policy words relocated, the fields 26A428 added and the owned
+/// pointers. Preserves the HW data and everything from the BRN table on.
+pub(crate) fn encode_common26_bundle_policy(
+    board: &Board,
+    bindings: M5PolicyBindings,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    let layout = COMMON26_SHARED_LAYOUT;
+    if out.len() < layout.brn_table {
+        return Err(InitdataError::BufferSize);
+    }
+    required_address(bindings.state)?;
+    required_address(bindings.aon_ptd)?;
+    let state_end = bindings.state.checked_add(STATUS_BLOCK_SIZE as u64)
+        .ok_or(InitdataError::AddressOutOfRange)?;
+    let aon_end = bindings.aon_ptd.checked_add(M5_AON_PTD_SIZE as u64)
+        .ok_or(InitdataError::AddressOutOfRange)?;
+    required_address(state_end - 1)?;
+    required_address(aon_end - 1)?;
+    if bindings.state < aon_end && bindings.aon_ptd < state_end {
+        return Err(InitdataError::PairAliasedObject);
+    }
+    out[layout.block_c18..layout.brn_table].fill(0);
+    let m5 = M5_25G76_SHARED_LAYOUT;
+    let m5_policy_end = m5.policy + ABI_ALLOCATION_SIZES_25G76[ALLOC_POLICY];
+    for &(offset, value) in M5_25G76_POLICY_WORDS {
+        if (m5.block_1048..m5.block_e10).contains(&offset) {
+            put_u32(out, layout.block_1048 + (offset - m5.block_1048), value);
+        } else if !(m5.policy..m5_policy_end).contains(&offset) {
+            return Err(InitdataError::BufferSize);
+        }
+    }
+    let policy = &mut out[layout.policy..layout.policy + COMMON26_POLICY_SIZE];
+    for &(offset, value) in M5_25G76_POLICY_WORDS {
+        if (m5.policy..m5_policy_end).contains(&offset) {
+            write_relocated_words(&[(offset, value)], m5.policy, COMMON26_POLICY_BANDS, policy)?;
+        }
+    }
+    // The 25G76 block's 512 x 0x7fff u16 table at +0x1c97 moves with its band.
+    for index in 0..512 {
+        for (byte_index, byte) in 0x7fffu16.to_le_bytes().into_iter().enumerate() {
+            let source = 0x1c97 + index * 2 + byte_index;
+            let target = relocate_by_bands(COMMON26_POLICY_BANDS, source)
+                .ok_or(InitdataError::BufferSize)?;
+            *policy.get_mut(target).ok_or(InitdataError::BufferSize)? = byte;
+        }
+    }
+    for (offset, value) in COMMON26_POLICY_NEW_WORDS {
+        put_u32(policy, offset, value);
+    }
+    // The AON row the policy names: the board's first record (RT0g on J813 and J873).
+    let record = board.aon_records.first().ok_or(InitdataError::BufferSize)?;
+    put_u32(policy, 0x64e0, record[0]);
+    put_u64(policy, COMMON26_POLICY_STATE_PTR, bindings.state);
+    put_u64(policy, COMMON26_POLICY_AON_PTD_PTR, bindings.aon_ptd);
+    put_u64(policy, COMMON26_POLICY_BOOT_TIMESTAMP, bindings.boot_timestamp);
+    Ok(())
+}
+
+/// Encode a common 26A428 region C from the board's 25G76 one: the fields from +0x38 on move up
+/// by four, plus the fields 26A428 added. Unlike [`encode_common26_region_c`] it keeps the
+/// board's own tunables (standby timer, minimum confidence, state counts).
+pub(crate) fn encode_common26_board_region_c(out: &mut [u8]) -> Result<(), InitdataError> {
+    if out.len() != REGION_C_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    encode_region_c_for_profile(RootProfile::J813G17G25G76, out)?;
+    let shifted = ABI_ALLOCATION_SIZES_25G76[ALLOC_REGION_C];
+    if out[shifted..].iter().any(|byte| *byte != 0) {
+        return Err(InitdataError::BufferSize);
+    }
+    out.copy_within(0x38..shifted, 0x3c);
+    out[0x38..0x3c].fill(0);
+    for (offset, value) in COMMON26_REGION_C_NEW_WORDS {
+        put_u32(out, offset, value);
+    }
+    Ok(())
+}
+
 /// The board's offset of a field at `offset` of the M5 Pro's HW data: below the insert they
 /// agree, past it a board without the insert has the field eight bytes lower.
 const fn hw_offset(board: &Board, offset: usize) -> usize {
@@ -1776,9 +2092,8 @@ const fn hw_offset(board: &Board, offset: usize) -> usize {
 pub(crate) struct Board {
     /// The chip ID the HW data names.
     chip_id: u32,
-    /// The InitData interface version the board's firmware checks at root +0x00, where it
-    /// differs from the M5 Pro's ([`M5_INITDATA_VERSION_WORD`]).
-    pub(crate) interface_version: Option<u64>,
+    /// The InitData layout the board's firmware build reads.
+    pub(crate) graph: &'static Graph,
     /// Whether the board's HW data has the M5 Pro firmware's eight bytes at
     /// [`M5_HW_DATA_INSERT`]; the common 26A428 interface (J813) has not.
     hw_data_insert: bool,
@@ -1819,6 +2134,9 @@ pub(crate) struct Board {
     mcc_mask: Option<u64>,
     /// The two topology words (16, and the core count), where the board sets them.
     topology_words: Option<(u32, u32)>,
+    /// The board's own 25G76 HW data words where the inherited ones are the M5 Pro's, at their
+    /// offsets in the board's HW data.
+    hw_words: &'static [(usize, u32)],
     /// The hotspot at which the thermal governor's fan curve starts, millidegrees C.
     pub(crate) fan_curve_start_mc: i32,
     /// Whether the host encodings are the G17D ones measured on the M5 Ultra
@@ -1832,7 +2150,7 @@ pub(crate) struct Board {
 /// M5 Pro: two clusters of ten cores.
 pub(crate) const J714: Board = Board {
     chip_id: 0x6050,
-    interface_version: None,
+    graph: &M5_GRAPH,
     hw_data_insert: true,
     clusters: 2,
     gpu_cores: 20,
@@ -1851,6 +2169,7 @@ pub(crate) const J714: Board = Board {
     idle_standby_us: None,
     mcc_mask: None,
     topology_words: None,
+    hw_words: &[],
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
     completion_inputs: true,
@@ -1859,7 +2178,7 @@ pub(crate) const J714: Board = Board {
 /// M5 Max: four clusters of ten cores.
 pub(crate) const J716C: Board = Board {
     chip_id: 0x6050,
-    interface_version: None,
+    graph: &M5_GRAPH,
     hw_data_insert: true,
     clusters: 4,
     gpu_cores: 40,
@@ -1880,6 +2199,7 @@ pub(crate) const J716C: Board = Board {
     // The ADT GPU node's active-mcc-bit-vector: eight memory cache controllers.
     mcc_mask: Some(0xff),
     topology_words: Some((16, 40)),
+    hw_words: &[],
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
     completion_inputs: false,
@@ -1891,7 +2211,7 @@ const J775D_PERF_FLOOR: usize = 3;
 /// M5 Ultra: two dies of four clusters of ten cores (G17D). Values from the J775D ADT.
 pub(crate) const J775D: Board = Board {
     chip_id: 0x6050,
-    interface_version: None,
+    graph: &M5_GRAPH,
     hw_data_insert: true,
     clusters: 8,
     gpu_cores: 80,
@@ -1916,6 +2236,7 @@ pub(crate) const J775D: Board = Board {
     // The ADT GPU node's active-mcc-bit-vector: eight memory cache controllers.
     mcc_mask: Some(0xff),
     topology_words: None,
+    hw_words: &[],
     // The SMC raises the fans in its automatic mode from a 97 C hotspot under a sustained
     // full-chip load, with the CPU and GPU still at their top states: the curve starts there,
     // above the SMC's own start rather than below it.
@@ -1930,8 +2251,8 @@ pub(crate) const J775D: Board = Board {
 pub(crate) const J813: Board = Board {
     chip_id: 0x8142,
     // The J813's 26A428 firmware compares root +0x00 with 0x0c8b_4339_83a0_04c0 (movz/movk at
-    // TEXT 0x21ed8 in both roles), the common 26A428 interface J873 also runs, not the M5 Pro's.
-    interface_version: Some(COMMON26_INITDATA_VERSION_WORD),
+    // TEXT 0x21ed8 in both roles): the common 26A428 interface J873 also runs, not the M5 Pro's.
+    graph: &COMMON26_GRAPH,
     // The common 26A428 HW data, without the M5 Pro's insert.
     hw_data_insert: false,
     clusters: 1,
@@ -1950,8 +2271,11 @@ pub(crate) const J813: Board = Board {
     calibration: None,
     controller_defaults: None,
     idle_standby_us: None,
-    mcc_mask: None,
+    // One memory cache controller (/arm-io/sgx active-mcc-bit-vector; 25G76 +0xf8c = 1).
+    mcc_mask: Some(0x1),
+    // The J813's 25G76 HW data has 6 at +0xf28 (J714's 12), common 26A428 +0x1044.
     topology_words: None,
+    hw_words: &[(0x1044, 6)],
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
     completion_inputs: false,
@@ -2176,9 +2500,11 @@ const J714_REGISTER_WINDOWS: [M5RegisterWindowSpec; 30] = {
 /// J813: J714's 26A428 slots at the J813's addresses, matched through its ADT and its 25G76
 /// windows (M5_25G76_REGISTER_WINDOWS: from the ID registers up, 26A428 numbers each GPU block
 /// five slots higher). Slots 4 and 11 sit where J714's do, AIC + 0x68000 and MCC reg 9 +
-/// 0x8000. Bring-up: slot 20, per cluster on T6050, is left out.
+/// 0x8000. Bring-up: slot 20, per cluster on T6050, is left out. From the common 26A428 map
+/// (J873, same GPU base): slot 17 0x36000, DPEP (29) and ADCLK (30), and slot 32, the J813's
+/// 25G76 slot 27, which J714's list lacks.
 const J813_GPU_BASE: u64 = 0x5_8000_0000;
-const J813_REGISTER_WINDOWS: [M5RegisterWindowSpec; 29] = {
+const J813_REGISTER_WINDOWS: [M5RegisterWindowSpec; 32] = {
     const G: u64 = J813_GPU_BASE;
     [
         jw(0, &[0x3_8101_4000], 0x4000, 0, 2),
@@ -2190,13 +2516,16 @@ const J813_REGISTER_WINDOWS: [M5RegisterWindowSpec; 29] = {
         jw(12, &[0x4_2165_c000], 0x4000, 0, 2),
         jw(14, &[0x3_8028_0000], 0x8000, 0, 0),
         jw(15, &[0x3_8c84_0000], 0x24000, 0, 2),
-        // 25G76 maps 0x21400; the 26A428 firmware reads G + 0x25148 at bootstrap.
-        jw(17, &[G], 0x28000, 0, 2),
+        // 25G76 maps 0x21400, the common 26A428 map 0x36000.
+        jw(17, &[G], 0x36000, 0, 2),
         jw(18, &[G + 0xeb_4000], 0x4000, 0, 2),
         jw(22, &[G + 0x100_0000], 0x8000, 0, 2),
         jw(23, &[G + 0xf0_0000], 0x10000, 0, 2),
         jw(24, &[G + 0xec_0000], 0x10000, 0, 2),
+        jw(29, &[G + 0x1800], 0x27f8, 0, 0),
+        jw(30, &[G + 0xec_2200], 0xfc, 0, 0),
         jw(31, &[G + 0xd0_4000], 0x8000, 0xd0_4000, 2),
+        jw(32, &[G + 0xd0_d000], 0x1000, 0xd0_d000, 2),
         jw(33, &[G + 0xd5_0000], 0x10000, 0xd5_0000, 2),
         jw(34, &[G + 0xd1_0000], 0x4000, 0xd1_0000, 2),
         jw(36, &[G + 0xd4_0000], 0x4000, 0xd4_0000, 2),
@@ -2465,6 +2794,9 @@ pub(crate) fn encode_m5_hw_data(
     if let Some((word, cores)) = board.topology_words {
         put_u32(out, 0x100c, word);
         put_u32(out, 0x1048, cores);
+    }
+    for &(offset, value) in board.hw_words {
+        put_u32(out, offset, value);
     }
     // The inherited J813 minimum parameter-buffer size is replaced per board.
     put_u32(out, hw_offset(board, 0x26b0), board.min_parameter_buffer);
