@@ -219,8 +219,9 @@ config APPLE_SEP_KUNIT_TEST
 	  mailbox message encoding and decoding, the shared-memory registration
 	  limits, the rules that keep a keybag's lookup identity apart from
 	  the identity the enclave reports, the format and validation of the
-	  Linux host-state store, and the xART guard's decisions and its list
-	  of Linux's records. The tests touch no hardware.
+	  Linux host-state store, the xART guard's decisions and its list
+	  of Linux's records, and how the fingerprint sensor is put to sleep.
+	  The tests touch no hardware.
 
 	  If unsure, say N.
 
