@@ -23,11 +23,16 @@ properties:
       - items:
           - const: apple,t8140-scaler
           - const: apple,scaler
+      - items:
+          - const: apple,t8103-scaler
+          - const: apple,scaler
+      - items:
+          - const: apple,t6000-scaler
+          - const: apple,scaler
 
   reg:
-    minItems: 4
+    minItems: 2
     maxItems: 4
-    description: Register apertures in hardware-description order.
 
   interrupts:
     minItems: 2
@@ -56,5 +61,31 @@ required:
   - resets
   - iommus
   - clocks
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8103-scaler
+    then:
+      properties:
+        reg:
+          maxItems: 2
+    else:
+      if:
+        properties:
+          compatible:
+            contains:
+              const: apple,t6000-scaler
+      then:
+        properties:
+          reg:
+            minItems: 3
+            maxItems: 3
+      else:
+        properties:
+          reg:
+            minItems: 4
 
 additionalProperties: false

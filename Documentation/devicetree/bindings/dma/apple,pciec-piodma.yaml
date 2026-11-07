@@ -19,6 +19,12 @@ properties:
       - items:
           - const: apple,t6041-pciec-piodma
           - const: apple,pciec-piodma
+      - items:
+          - const: apple,t8103-pciec-piodma
+          - const: apple,pciec-piodma
+      - items:
+          - const: apple,t6000-pciec-piodma
+          - const: apple,pciec-piodma
 
   reg:
     minItems: 4

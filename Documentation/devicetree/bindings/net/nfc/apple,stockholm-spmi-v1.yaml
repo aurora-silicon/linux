@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/net/nfc/apple,stockholm-spmi-v1.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple first-generation Stockholm SPMI endpoint
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  The first-generation Stockholm endpoint occupies one SPMI slave address.
+  It is distinct from the later model-96 transport. Firmware command
+  sequences and an OS ownership handoff are not part of this description.
+
+properties:
+  compatible:
+    oneOf:
+      - items:
+          - const: apple,t6000-stockholm-spmi-v1
+          - const: apple,stockholm-spmi-v1
+
+      - items:
+          - const: apple,t8103-stockholm-spmi-v1
+          - const: apple,stockholm-spmi-v1
+
+  reg:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false

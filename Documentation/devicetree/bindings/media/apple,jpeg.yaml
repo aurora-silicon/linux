@@ -21,9 +21,15 @@ description: |
 
 properties:
   compatible:
-    enum:
-      - apple,t6041-jpeg
-      - apple,t8140-jpeg
+    oneOf:
+      - enum:
+          - apple,t6041-jpeg
+          - apple,t8140-jpeg
+      - items:
+          - enum:
+              - apple,t8103-jpeg
+              - apple,t6000-jpeg
+          - const: apple,jpeg
 
   reg:
     maxItems: 1
@@ -33,6 +39,10 @@ properties:
 
   iommus:
     maxItems: 1
+
+  clocks:
+    minItems: 1
+    maxItems: 2
 
   power-domains:
     minItems: 1

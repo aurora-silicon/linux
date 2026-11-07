@@ -23,15 +23,19 @@ description:
 
 properties:
   compatible:
-    enum:
-      - apple,t8103-ane
-      - apple,t6000-ane
-      - apple,t6020-ane
-      - apple,t6021-ane
-      - apple,t6022-ane
-      - apple,t6041-ane
-      - apple,t8112-ane
-      - apple,t8140-ane
+    oneOf:
+      - enum:
+          - apple,t8103-ane
+          - apple,t6000-ane
+          - apple,t6020-ane
+          - apple,t6021-ane
+          - apple,t6022-ane
+          - apple,t6041-ane
+          - apple,t8112-ane
+          - apple,t8140-ane
+      - items:
+          - const: apple,t6001-ane
+          - const: apple,ane
 
   reg:
     minItems: 1

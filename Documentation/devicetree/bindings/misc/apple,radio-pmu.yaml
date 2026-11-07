@@ -15,10 +15,17 @@ description: |
 
 properties:
   compatible:
-    items:
-      - enum:
-          - apple,t6041-radio-pmu
-      - const: apple,radio-pmu
+    oneOf:
+      - items:
+          - enum:
+              - apple,t6041-radio-pmu
+          - const: apple,radio-pmu
+      - items:
+          - const: apple,t6000-wifibt-pmu
+          - const: apple,radio-pmu
+      - items:
+          - const: apple,t6000-uwb-pmu
+          - const: apple,radio-pmu
 
   reg:
     maxItems: 1
