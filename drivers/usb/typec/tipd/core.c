@@ -1635,8 +1635,10 @@ static void cd321x_complete(struct tps6598x *tps)
 	 * The cut was a cold reset of this controller's firmware: its interrupt mask and power
 	 * state are back at their defaults, so set them up again whether or not an event comes.
 	 */
-	if (apple_sleep_debug_link_cut_peek(tps->dev))
+	if (apple_sleep_debug_link_cut_peek(tps->dev)) {
 		cd321x->pm.setup_pending = true;
+		cd321x->reset_by_cut = true;
+	}
 	if (pm_suspend_via_firmware() && device_property_read_bool(tps->dev, "apple,sleep-ssps"))
 		tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
 	cd321x_rearm_debug_link(tps);
@@ -1709,8 +1711,11 @@ static int cd321x_check_setup(struct cd321x *cd321x, u64 event)
 			dev_err(tps->dev, "controller setup recovery exhausted: %d\n", ret);
 		return ret;
 	}
-	if (ret)
+	if (ret && cd321x->reset_by_cut)
+		dev_dbg(tps->dev, "set up again after the debug link's cut\n");
+	else if (ret)
 		dev_warn(tps->dev, "restored controller power state and interrupt mask\n");
+	cd321x->reset_by_cut = false;
 	/* Only a fresh snapshot may be applied after restoring the controller. */
 	cd321x->state_valid = false;
 	cd321x->pm.phase = CD321X_PM_REVALIDATE;
@@ -3180,6 +3185,87 @@ void tipd_remove(struct tps6598x *tps)
 		gpiod_set_value_cansleep(tps->reset, 1);
 }
 EXPORT_SYMBOL_GPL(tipd_remove);
+
+/*
+ * macOS tells the port controller of a USB root port with dock-remote-wake when that port
+ * sleeps, and the controller then watches the USB2 lines for a remote wakeup (static; what its
+ * firmware does with it isn't known). The J700's root port has none, but measured on a J700,
+ * a USB keyboard on a connector wakes it this way. The mode goes by the speed on the port: 0x09
+ * for full and high speed. At the wake the controller hands the lines back before the port
+ * resumes. Only a firmware-driven sleep needs this, and a failure only logs.
+ */
+#define TIPD_USBW_HIGH_SPEED	0x09
+#define TIPD_USBW_HAND_BACK	0x80
+#define TIPD_USBW_OFF		0x00
+
+static void tipd_usbw(struct tps6598x *tps, u8 mode)
+{
+	int ret;
+
+	guard(mutex)(&tps->lock);
+	ret = tps6598x_exec_cmd(tps, "USBw", sizeof(mode), &mode, 0, NULL);
+	if (ret)
+		dev_warn(tps->dev, "USBw %#x failed: %d\n", mode, ret);
+	else
+		dev_dbg(tps->dev, "USBw %#x\n", mode);
+}
+
+/* The fixed hub's port that the connector's USB2 pair goes to, from the graph, or 0. */
+static u32 tipd_hub_port(struct tps6598x *tps)
+{
+	struct fwnode_handle *con __free(fwnode_handle) =
+		device_get_named_child_node(tps->dev, "connector");
+	struct fwnode_handle *ep __free(fwnode_handle) =
+		fwnode_graph_get_endpoint_by_id(con, 0, 0, 0);
+	struct fwnode_handle *port __free(fwnode_handle) = fwnode_graph_get_remote_port(ep);
+	u32 reg = 0;
+
+	fwnode_property_read_u32(port, "reg", &reg);
+	return reg;
+}
+
+void tipd_usb_wake(struct tps6598x *tps, bool asleep)
+{
+	bool armed;
+
+	if (!pm_suspend_via_firmware() ||
+	    !device_property_read_bool(tps->dev, "apple,usb-remote-wake"))
+		return;
+	if (asleep) {
+		u32 port = tipd_hub_port(tps);
+		bool wake = apple_sleep_usb_port_can_wake(port);
+
+		/*
+		 * Only for a device on this connector that can wake. Armed without one, the
+		 * controller reported a USB2 plug at the sleep's entry and the sleep came straight
+		 * back, on an empty port and on one left with a passive adapter (measured on a
+		 * J700). A device plugged in during the sleep still wakes through the SMC's plug
+		 * event.
+		 */
+		if (wake)
+			dev_dbg(tps->dev, "a device on hub port %u can wake: arming USB wake\n",
+				port);
+		else
+			dev_dbg(tps->dev, "nothing on hub port %u can wake: USB wake not armed\n",
+				port);
+		scoped_guard(mutex, &tps->lock)
+			tps->usbw_armed = wake;
+		if (wake)
+			tipd_usbw(tps, TIPD_USBW_HIGH_SPEED);
+		return;
+	}
+	/* Out of S3 first: .complete would only come once the port has resumed. */
+	scoped_guard(mutex, &tps->lock) {
+		tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
+		armed = tps->usbw_armed;
+		tps->usbw_armed = false;
+	}
+	if (!armed)
+		return;
+	tipd_usbw(tps, TIPD_USBW_HAND_BACK);
+	tipd_usbw(tps, TIPD_USBW_OFF);
+}
+EXPORT_SYMBOL_GPL(tipd_usb_wake);
 
 int tipd_suspend(struct tps6598x *tps)
 {
