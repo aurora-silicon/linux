@@ -125,6 +125,7 @@ struct apple_clpc_gpu {
 /* One ANE publisher, with storage surviving provider removal. */
 struct apple_clpc_ane {
 	struct kref ref;
+	/* Protects activity, event metadata and wake across provider removal. */
 	spinlock_t lock;
 	bool active;
 	bool pending;
