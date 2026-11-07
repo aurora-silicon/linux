@@ -42,6 +42,81 @@ select:
                 const: apple,isp
       required:
         - compatible
+properties:
+  compatible: true
+
+  reg: true
+
+  reg-names: true
+
+  interrupts: true
+
+  iommus: true
+
+  power-domains: true
+
+  memory-region: true
+
+  memory-region-names: true
+
+  apple,dart-vm-size:
+    $ref: /schemas/types.yaml#/definitions/uint64
+    description:
+      Size in bytes of the host allocation aperture used by the ISP driver.
+
+  apple,platform-id:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Platform identifier passed in the firmware boot descriptor.
+
+  apple,temporal-filter:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Firmware temporal-filter strength selected for the attached sensor.
+
+  sensor-presets:
+    type: object
+    description:
+      Sensor firmware presets and the host output geometry associated with them.
+    patternProperties:
+      "^preset[0-9]+$":
+        type: object
+        properties:
+          apple,config-index:
+            $ref: /schemas/types.yaml#/definitions/uint32
+            description: Sensor configuration index understood by the firmware
+          apple,input-size:
+            $ref: /schemas/types.yaml#/definitions/uint32-array
+            items:
+              - description: Input width in pixels
+              - description: Input height in pixels
+            description: Sensor input dimensions
+          apple,output-size:
+            $ref: /schemas/types.yaml#/definitions/uint32-array
+            items:
+              - description: Output width in pixels
+              - description: Output height in pixels
+            description: Delivered frame dimensions
+          apple,crop:
+            $ref: /schemas/types.yaml#/definitions/uint32-array
+            items:
+              - description: Horizontal crop origin in pixels
+              - description: Vertical crop origin in pixels
+              - description: Crop width in pixels
+              - description: Crop height in pixels
+            description: Cropped sensor rectangle
+        required:
+          - apple,config-index
+          - apple,input-size
+          - apple,output-size
+          - apple,crop
+        additionalProperties: false
+    additionalProperties: false
+
+# The root declares the union of property types for DTB decoding. The
+# conditional variants below each retain their closed property contract.
+additionalProperties: true
+
 allOf:
   -
     if:
@@ -110,8 +185,6 @@ allOf:
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
-
-unevaluatedProperties: false
 
 $defs:
   legacy-driver:

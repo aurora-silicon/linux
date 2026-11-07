@@ -59,6 +59,115 @@ select:
                 const: apple,usb4-acio
       required:
         - compatible
+properties:
+  compatible: true
+
+  reg: true
+
+  reg-names: true
+
+  mboxes:
+    maxItems: 1
+    description: Mailbox used for RTKit communication with the co-processor
+
+  resets: true
+
+  power-domains: true
+
+  thunderbolt-switch:
+    type: boolean
+    description:
+      Marks this root complex as the USB4/Thunderbolt switch that the Type-C
+      PD controller hands cable information to, so the Type-C mux can find it.
+
+  lstx-gpios:
+    maxItems: 1
+    description:
+      GPIO on the pin that carries the router's LSTX sideband signal.
+
+  apple,pcie-tunnel:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      PCIe-C tunnel container populated after the USB4 router has enabled its
+      PCIe adapter.
+
+  apple,tunable-rc:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: Register offset
+        - description: Mask of bits to clear
+        - description: Bits to set
+    description: |
+      List of (register offset, mask, value) tuples copied from Apple's Device
+      Tree, converted by the bootloader and used to configure the root complex
+      after the co-processor has booted.
+
+  apple,tunable-pcie-adapter:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: Register offset
+        - description: Mask of bits to clear
+        - description: Bits to set
+    description: |
+      As apple,tunable-rc, but applied to the PCIe adapter configuration space
+      named by the pcie-adapter reg entry. Only meaningful where that entry is
+      present.
+
+  '#address-cells':
+    const: 1
+
+  '#size-cells':
+    const: 1
+
+  ranges: true
+
+  nonposted-mmio: true
+
+  ports:
+    $ref: /schemas/graph.yaml#/properties/ports
+    description:
+      OF graph ports for the USB4 router. The port numbers correspond to the
+      USB4 router adapter numbers.
+    properties:
+      port@1:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: USB4 port connected to the USB Type-C connector
+
+      # port@2 is the second, unused USB4 port of the host router
+
+      port@3:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: PCIe adapter
+
+      port@4:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: USB3 adapter
+
+      port@5:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: First DP IN adapter
+
+      port@6:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: Second DP IN adapter
+
+    required:
+      - port@1
+
+  iommu@a80000:
+    $ref: /schemas/iommu/apple,dart.yaml#
+    description: DART IOMMU exposed by ACIO and used for DMA from the NHI
+
+  nhi@f00000:
+    $ref: /schemas/thunderbolt/apple,t8103-usb4-nhi.yaml#
+    description: Native Host Interface exposed by ACIO
+
+# The root declares the union of property types for DTB decoding. The
+# conditional variants below each retain their closed property contract.
+additionalProperties: true
+
 allOf:
   -
     if:
@@ -121,8 +230,6 @@ allOf:
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
-
-unevaluatedProperties: false
 
 $defs:
   legacy-driver:

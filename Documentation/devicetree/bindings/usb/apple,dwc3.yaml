@@ -49,6 +49,45 @@ select:
                 const: apple,dwc3
       required:
         - compatible
+properties:
+  compatible: true
+
+  reg: true
+
+  reg-names: true
+
+  interrupts: true
+
+  iommus: true
+
+  resets: true
+
+  power-domains: true
+
+  apple,tunable-gbl-default:
+    $ref: "#/$defs/apple,tunable"
+    description: Tunables applied to the DWC3 global registers.
+
+  apple,tunable-gbl-host:
+    $ref: "#/$defs/apple,tunable"
+    description: Host mode tunables applied to the DWC3 global registers.
+
+  apple,tunable-dbg:
+    $ref: "#/$defs/apple,tunable"
+    description: Tunables applied to the debug registers of the Apple region.
+
+  apple,tunable-cfg-host:
+    $ref: "#/$defs/apple,tunable"
+    description: Host mode tunables applied to the drd-cfg region.
+
+  apple,tunable-link:
+    $ref: "#/$defs/apple,tunable"
+    description: Tunables applied to the link registers of the Apple region.
+
+# The root declares the union of property types for DTB decoding. The
+# conditional variants below each retain their closed property contract.
+additionalProperties: true
+
 allOf:
   -
     if:
@@ -114,8 +153,6 @@ allOf:
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
-
-unevaluatedProperties: false
 
 $defs:
   apple,tunable:

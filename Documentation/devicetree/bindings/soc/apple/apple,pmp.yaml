@@ -48,6 +48,75 @@ select:
                 const: apple,pmp
       required:
         - compatible
+properties:
+  compatible: true
+
+  reg: true
+
+  reg-names: true
+
+  mboxes:
+    maxItems: 1
+
+  mbox-names:
+    const: mbox
+
+  iommus: true
+
+  power-domains: true
+
+  apple,pmp-report:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Report provider whose running state qualifies device-power requests.
+
+  apple,board-id:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Board identifier copied by the bootloader.
+
+  apple,dram-vendor-id:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: DRAM vendor identifier copied by the bootloader.
+
+  apple,dram-capacity:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Firmware DRAM capacity value copied by the bootloader.
+
+  apple,dram-channel-disable:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Disabled DRAM channel mask (boot argument DCHD), copied by the bootloader.
+
+  apple,pmc:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Boot argument PMC_, the PMGR's pmc value in the Apple device tree.
+
+  apple,pmc-pmgr:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      PMGR PMC configuration word from the Apple device tree. Bits 0 and 3
+      are passed as the boot arguments PMCV and PMCB.
+
+  apple,pmc-msg-disabled:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Boot argument PMCX, from the Apple device tree.
+
+  apple,soc-chip-variant:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: SoC chip variant (boot argument CVAR), copied by the bootloader.
+
+  apple,pio-ranges:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    minItems: 2
+    description: Host physical address and size pairs mapped into firmware PIO space.
+
+patternProperties:
+  '^apple,tunable-':
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    description: Opaque firmware calibration copied from the Apple device tree.
+
+# The root declares the union of property types for DTB decoding. The
+# conditional variants below each retain their closed property contract.
+additionalProperties: true
+
 allOf:
   -
     if:
@@ -117,8 +186,6 @@ allOf:
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
-
-unevaluatedProperties: false
 
 $defs:
   legacy-driver:

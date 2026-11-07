@@ -45,6 +45,21 @@ select:
                 const: apple,spi
       required:
         - compatible
+properties:
+  compatible: true
+
+  reg: true
+
+  clocks: true
+
+  interrupts: true
+
+  power-domains: true
+
+# The root declares the union of property types for DTB decoding. The
+# conditional variants below each retain their closed property contract.
+additionalProperties: true
+
 allOf:
   -
     if:
@@ -108,8 +123,6 @@ allOf:
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
-
-unevaluatedProperties: false
 
 $defs:
   legacy-driver:
