@@ -386,8 +386,10 @@
 
 	sio: dma-controller@385e00000 {
 		compatible = "apple,t8140-sio", "apple,sio";
-		reg = <0x3 0x85e00000 0x0 0x88000>,
-		      <0x3 0x85850000 0x0 0x4000>;
+		/* Split the ASC bank around the separately owned mailbox window. */
+		reg = <0x3 0x85e00000 0x0 0x8000>,
+		      <0x3 0x85850000 0x0 0x4000>,
+		      <0x3 0x85e0c000 0x0 0x7c000>;
 		#dma-cells = <1>;
 		dma-channels = <128>;
 		mboxes = <&sio_mbox>;
@@ -524,6 +526,52 @@
 		      <0x3 0x482a8000 0x0 0x4000>,
 		      <0x3 0x482b0000 0x0 0x4000>;
 		reg-names = "ps", "wd-isp", "gpio", "fpwm", "gltb", "wd-e";
+		status = "disabled";
+	};
+};
+
+&aon_ptd {
+	interrupt-controller;
+	#interrupt-cells = <2>;
+	#address-cells = <0>;
+};
+
+&{/soc/spmi@308714000/pmic@e} {
+	battery_monitor: battery-monitor {
+		compatible = "apple,t8140-battery-monitor", "apple,battery-monitor";
+		interrupt-parent = <&nub_spmi0>;
+		interrupts = <12 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+};
+
+&nub_spmi1 {
+	xspmi_proxy: proxy@d {
+		compatible = "apple,t8140-xspmi-proxy", "apple,xspmi-proxy";
+		reg = <0xd SPMI_USID>;
+		status = "disabled";
+	};
+};
+
+&nub_spmi_a0 {
+	spmi_all_ace: controller@e {
+		compatible = "apple,t8140-spmi-all-ace", "apple,spmi-all-ace";
+		reg = <0xe SPMI_USID>;
+		status = "disabled";
+	};
+};
+
+/ {
+	xspmi_controller: spmi-proxy-controller {
+		compatible = "apple,t8140-xspmi-controller", "apple,xspmi-controller";
+		apple,proxy = <&xspmi_proxy>;
+		status = "disabled";
+	};
+
+	smc_mogul: smc-mogul {
+		compatible = "apple,t8140-smc-mogul", "apple,smc-mogul";
+		apple,smc = <&smc>;
+		apple,control-address = <0x10>;
 		status = "disabled";
 	};
 };

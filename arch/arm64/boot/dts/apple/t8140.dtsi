@@ -430,7 +430,8 @@
 		ranges;
 
 		uat_handoff: uat-handoff {
-			reg = <0 0 0 0>;
+			size = <0 0>; /* The loader supplies reg and enables the region. */
+			status = "disabled";
 		};
 
 		/*
@@ -458,15 +459,18 @@
 
 		/* Only reserved: the GPU node does not reference it */
 		uat_l2_pagetables: uat-l2-pagetables {
-			reg = <0 0 0 0>;
+			size = <0 0>; /* The loader supplies reg and enables the region. */
+			status = "disabled";
 		};
 
 		uat_pagetables: uat-pagetables {
-			reg = <0 0 0 0>;
+			size = <0 0>; /* The loader supplies reg and enables the region. */
+			status = "disabled";
 		};
 
 		uat_ttbs: uat-ttbs {
-			reg = <0 0 0 0>;
+			size = <0 0>; /* The loader supplies reg and enables the region. */
+			status = "disabled";
 		};
 	};
 
@@ -1344,11 +1348,11 @@
 			status = "disabled";
 		};
 
-		gpu: gpu@482600000 {
+		gpu: gpu@480000000 {
 			compatible = "apple,agx-t8140";
-			reg = <0x4 0x82600000 0x0 0x88000>,
-			      <0x4 0x80000000 0x0 0x4000000>;
-			reg-names = "asc", "sgx";
+			reg = <0x4 0x80000000 0x0 0x4000000>,
+			      <0x4 0x82600000 0x0 0x88000>;
+			reg-names = "sgx", "asc";
 			mboxes = <&gfx_mbox>, <&gfx1_mbox>;
 			power-domains = <&ps_gfx>;
 			memory-region = <&uat_ttbs>, <&uat_pagetables>,

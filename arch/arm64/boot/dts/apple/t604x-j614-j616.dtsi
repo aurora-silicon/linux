@@ -108,7 +108,7 @@
 		 * segment-ranges[0]); the driver identifies the build from it.
 		 */
 		gpu_fw_text: gpu-fw-text {
-			reg = <0 0 0 0>;
+			size = <0 0>; /* The loader adds reg before enabling this region. */
 			status = "disabled";
 			no-map;
 		};
@@ -118,7 +118,7 @@
 		 * places its crash log here.
 		 */
 		gpu_fw_data: gpu-fw-data {
-			reg = <0 0 0 0>;
+			size = <0 0>; /* The loader adds reg before enabling this region. */
 			status = "disabled";
 			no-map;
 		};
@@ -129,25 +129,25 @@
 		 * the boot loader adds them to /memory.
 		 */
 		uat_ttbs: uat-ttbs {
-			reg = <0 0 0 0>;
+			size = <0 0>; /* The loader adds reg before enabling this region. */
 			status = "disabled";
 			no-map;
 		};
 
 		uat_pagetables: uat-pagetables {
-			reg = <0 0 0 0>;
+			size = <0 0>; /* The loader adds reg before enabling this region. */
 			status = "disabled";
 			no-map;
 		};
 
 		uat_l2_pagetables: uat-l2-pagetables {
-			reg = <0 0 0 0>;
+			size = <0 0>; /* The loader adds reg before enabling this region. */
 			status = "disabled";
 			no-map;
 		};
 
 		uat_handoff: uat-handoff {
-			reg = <0 0 0 0>;
+			size = <0 0>; /* The loader adds reg before enabling this region. */
 			status = "disabled";
 			no-map;
 		};

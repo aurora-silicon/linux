@@ -107,5 +107,29 @@
 		compatible = "parade,dp855";
 		reg = <0>;
 		status = "disabled";
+
+		/* ADT display-temp-sens1..3 are downstream of the TCON. */
+		i2c {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			temperature-sensor@70 {
+				compatible = "ti,tmp103";
+				reg = <0x70>;
+				status = "disabled";
+			};
+
+			temperature-sensor@71 {
+				compatible = "ti,tmp103";
+				reg = <0x71>;
+				status = "disabled";
+			};
+
+			temperature-sensor@72 {
+				compatible = "ti,tmp103";
+				reg = <0x72>;
+				status = "disabled";
+			};
+		};
 	};
 };

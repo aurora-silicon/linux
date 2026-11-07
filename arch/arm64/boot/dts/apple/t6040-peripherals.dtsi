@@ -238,7 +238,7 @@
 		status = "disabled";
 	};
 
-	/* ADT /arm-io/dcpext0-expert. */
+	/* ADT /arm-io/dcp0-expert. */
 	dcp_expert: display-expert@4023a8050 {
 		compatible = "apple,t6041-dcp-expert", "apple,dcp-expert";
 		reg = <0x4 0x023a8050 0x0 0x4>,
@@ -315,3 +315,27 @@
 	};
 };
 
+
+&aon_ptd {
+	interrupt-controller;
+	#interrupt-cells = <1>;
+	#address-cells = <0>;
+};
+
+&nub_spmi0 {
+	battery_monitor: battery-monitor@b {
+		compatible = "apple,t6041-battery-monitor", "apple,battery-monitor";
+		reg = <0xb SPMI_USID>;
+		interrupt-parent = <&aon_ptd>;
+		interrupts = <0x62746d30>, <0x62746d31>;
+		status = "disabled";
+	};
+};
+
+&aop_spmi0 {
+	radio_pmu: pmic@e {
+		compatible = "apple,t6041-radio-pmu", "apple,radio-pmu";
+		reg = <0xe SPMI_USID>;
+		status = "disabled";
+	};
+};
