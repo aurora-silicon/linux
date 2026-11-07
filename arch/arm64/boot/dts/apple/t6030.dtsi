@@ -2154,3 +2154,5 @@
 #include "t6030-gpu.dtsi"
 #include "t6030-usb4.dtsi"
 #include "t6030-dcp.dtsi"
+
+#include "t6030-peripherals.dtsi"

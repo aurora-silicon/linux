@@ -1,0 +1,263 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Additional T8122 hardware interfaces. Keep unclaimed engines disabled. */
+
+&soc {
+	dart_rsm: iommu@2e433c000 {
+		compatible = "apple,t8122-dart", "apple,t8110-dart";
+		reg = <0x2 0xe433c000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 297 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	dart_scaler: iommu@31d200000 {
+		compatible = "apple,t8122-dart", "apple,t8110-dart";
+		reg = <0x3 0x1d200000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 752 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	dart_jpeg0: iommu@299004000 {
+		compatible = "apple,t8122-dart", "apple,t8110-dart";
+		reg = <0x2 0x99004000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 744 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	dart_jpeg1: iommu@29900c000 {
+		compatible = "apple,t8122-dart", "apple,t8110-dart";
+		reg = <0x2 0x9900c000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 747 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	dart_ave0: iommu@315030000 {
+		compatible = "apple,t8122-dart", "apple,t8110-dart";
+		reg = <0x3 0x15030000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 698 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	dart_ave1: iommu@315040000 {
+		compatible = "apple,t8122-dart", "apple,t8110-dart";
+		reg = <0x3 0x15040000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 698 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	dart_ave2: iommu@315020000 {
+		compatible = "apple,t8122-dart-smmu", "apple,dart-smmu";
+		reg = <0x3 0x15020000 0x0 0x4000>;
+		status = "disabled";
+	};
+
+	dart_ave3: filter@315044000 {
+		compatible = "apple,t8122-dapf", "apple,dapf";
+		reg = <0x3 0x15044000 0x0 0x4000>;
+		status = "disabled";
+	};
+
+	dart_apr0: iommu@321028000 {
+		compatible = "apple,t8122-dart", "apple,t8110-dart";
+		reg = <0x3 0x21028000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 856 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	dart_apr1: iommu@32102c000 {
+		compatible = "apple,t8122-dart", "apple,t8110-dart";
+		reg = <0x3 0x2102c000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 856 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	apcie1_piodma: dma-controller@595010000 {
+		compatible = "apple,t8122-pcie-piodma", "apple,pcie-piodma";
+		reg = <0x5 0x95010000 0x0 0x4000>,
+		      <0x5 0x95014000 0x0 0x4000>,
+		      <0x5 0x95018000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 934 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	apcie0_piodma: dma-controller@594010000 {
+		compatible = "apple,t8122-pcie-piodma", "apple,pcie-piodma";
+		reg = <0x5 0x94010000 0x0 0x4000>,
+		      <0x5 0x94014000 0x0 0x4000>,
+		      <0x5 0x94018000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 925 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	apciec0_piodma: dma-controller@722000000 {
+		compatible = "apple,t8122-pcie-piodma", "apple,pcie-piodma";
+		reg = <0x7 0x22000000 0x0 0x4000>,
+		      <0x7 0x22004000 0x0 0x4000>,
+		      <0x7 0x22008000 0x0 0x4000>,
+		      <0x7 0x20008000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 963 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	atc0_dpin0: displayport@701e50000 {
+		compatible = "apple,t8122-dp-in", "apple,dp-in";
+		reg = <0x7 0x01e50000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1008 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	atc0_dpin1: displayport@701e58000 {
+		compatible = "apple,t8122-dp-in", "apple,dp-in";
+		reg = <0x7 0x01e58000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1009 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	apciec1_piodma: dma-controller@b22000000 {
+		compatible = "apple,t8122-pcie-piodma", "apple,pcie-piodma";
+		reg = <0xb 0x22000000 0x0 0x4000>,
+		      <0xb 0x22004000 0x0 0x4000>,
+		      <0xb 0x22008000 0x0 0x4000>,
+		      <0xb 0x20008000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1021 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	atc1_dpin0: displayport@b01e50000 {
+		compatible = "apple,t8122-dp-in", "apple,dp-in";
+		reg = <0xb 0x01e50000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1066 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	atc1_dpin1: displayport@b01e58000 {
+		compatible = "apple,t8122-dp-in", "apple,dp-in";
+		reg = <0xb 0x01e58000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1067 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	mcc: memory-controller@2d03c0000 {
+		compatible = "apple,t8122-mcc", "apple,mcc";
+		reg = <0x2 0xd03c0000 0x0 0x20000>,
+		      <0x2 0xd0478000 0x0 0x149c>,
+		      <0x2 0xd0780000 0x0 0x4000>,
+		      <0x2 0x20000000 0x0 0x2000000>,
+		      <0x2 0x22000000 0x0 0x2000000>;
+		status = "disabled";
+	};
+
+	aes: crypto@2a100c000 {
+		compatible = "apple,t8122-aes", "apple,aes";
+		reg = <0x2 0xa100c000 0x0 0x4000>,
+		      <0x2 0xe42dc000 0x0 0x8000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 778 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_aes>;
+		status = "disabled";
+	};
+
+	rsm: rsm@2e4325000 {
+		compatible = "apple,t8122-rsm", "apple,rsm";
+		reg = <0x2 0xe4325000 0x0 0x4000>,
+		      <0x2 0xe43c0000 0x0 0x4>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 294 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&dart_rsm 0>;
+		status = "disabled";
+	};
+
+	scaler0: scaler@31d000000 {
+		compatible = "apple,t8122-scaler", "apple,scaler";
+		reg = <0x3 0x1d000000 0x0 0x30000>,
+		      <0x3 0x1d210000 0x0 0x4000>,
+		      <0x3 0x1d204000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 751 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 753 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_msr>, <&ps_msr_ase_core>;
+		iommus = <&dart_scaler 0>, <&dart_scaler 1>;
+		status = "disabled";
+	};
+
+	jpeg0: jpeg@299000000 {
+		compatible = "apple,t8122-jpeg", "apple,jpeg";
+		reg = <0x2 0x99000000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 743 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_jpg>;
+		iommus = <&dart_jpeg0 0>;
+		status = "disabled";
+	};
+
+	jpeg1: jpeg@299008000 {
+		compatible = "apple,t8122-jpeg", "apple,jpeg";
+		reg = <0x2 0x99008000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 746 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_jpg>;
+		iommus = <&dart_jpeg1 0>;
+		status = "disabled";
+	};
+
+	ave: video-encoder@315100000 {
+		compatible = "apple,t8122-ave", "apple,ave";
+		reg = <0x3 0x15100000 0x0 0x45c000>,
+		      <0x3 0x15800000 0x0 0x800000>,
+		      <0x3 0x15050000 0x0 0x4000>,
+		      <0x2 0xd0708000 0x0 0x4000>,
+		      <0x3 0x14000000 0x0 0x1000000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 701 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 695 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 694 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 697 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 696 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc_sys>, <&ps_venc_pipe4>, <&ps_venc_pipe5>, <&ps_venc_me0>, <&ps_venc_me1>, <&ps_venc_dma>;
+		iommus = <&dart_ave0 0>, <&dart_ave1 0>;
+		status = "disabled";
+	};
+
+	apr: video-codec@321000000 {
+		compatible = "apple,t8122-prores", "apple,prores";
+		reg = <0x3 0x21000000 0x0 0x4000>,
+		      <0x3 0x20000000 0x0 0x8000>,
+		      <0x3 0x21078000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 857 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 894 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_scodec>;
+		iommus = <&dart_apr0 1>, <&dart_apr1 1>;
+		status = "disabled";
+	};
+
+	aft: trace@220180000 {
+		compatible = "apple,t8122-aft", "apple,aft";
+		reg = <0x2 0x20180000 0x0 0xc000>;
+		status = "disabled";
+	};
+
+};

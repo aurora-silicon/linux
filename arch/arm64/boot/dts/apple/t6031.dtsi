@@ -50,3 +50,5 @@
 #undef DIE
 #undef DIE_NO
 #undef SOC_NODE
+
+#include "t6031-peripherals.dtsi"
