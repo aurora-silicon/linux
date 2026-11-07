@@ -2,34 +2,120 @@
 %YAML 1.2
 ---
 $id: "http://devicetree.org/schemas/serial/apple,uart.yaml#"
+
 $schema: "http://devicetree.org/meta-schemas/core.yaml#"
+
 title: "Apple uart hardware resources"
+
 maintainers:
   - "Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>"
+
 description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+
+select:
+  anyOf:
+    -
+      properties:
+        compatible:
+          contains:
+            enum:
+              - "apple,t6050-uart"
+              - "apple,uart"
+      required:
+        - "compatible"
+    -
+      properties:
+        compatible:
+          items:
+            -
+              const: "apple,t6050-uart"
+            -
+              const: "apple,uart"
+      required:
+        - "compatible"
+
 properties:
-  compatible:
-    items:
-      -
-        const: "apple,t6050-uart"
-      -
-        const: "apple,uart"
-  status:
-    const: "disabled"
-  reg:
-    maxItems: 1
-    description: "Native register apertures in hardware-interface order, including shared auxiliary views."
-  interrupts:
-    maxItems: 1
-  power-domains:
-    maxItems: 1
-  clocks:
-    maxItems: 2
-required:
-  - "compatible"
-  - "reg"
-  - "status"
-  - "interrupts"
-  - "power-domains"
-  - "clocks"
-additionalProperties: false
+  compatible: true
+  status: true
+  reg: true
+  interrupts: true
+  power-domains: true
+  clocks: true
+  iommus: true
+  resets: true
+
+additionalProperties: true
+
+allOf:
+  - if:
+      anyOf:
+        -
+          properties:
+            compatible:
+              items:
+                -
+                  const: "apple,t6050-uart"
+                -
+                  const: "apple,uart"
+            status:
+              const: "disabled"
+          required:
+            - "compatible"
+            - "status"
+    then:
+      oneOf:
+        -
+          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          properties:
+            compatible:
+              items:
+                -
+                  const: "apple,t6050-uart"
+                -
+                  const: "apple,uart"
+            status:
+              const: "disabled"
+            reg:
+              maxItems: 1
+              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+            interrupts:
+              maxItems: 1
+            power-domains:
+              maxItems: 1
+            clocks:
+              maxItems: 2
+          required:
+            - "compatible"
+            - "reg"
+            - "status"
+            - "interrupts"
+            - "power-domains"
+            - "clocks"
+          additionalProperties: false
+    else:
+      properties:
+        compatible:
+          items:
+            -
+              const: "apple,t6050-uart"
+            -
+              const: "apple,uart"
+        status:
+          const: "disabled"
+        reg:
+          maxItems: 1
+          description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+        interrupts:
+          maxItems: 1
+        power-domains:
+          maxItems: 1
+        clocks:
+          maxItems: 2
+      required:
+        - "compatible"
+        - "reg"
+        - "status"
+        - "interrupts"
+        - "power-domains"
+        - "clocks"
+      additionalProperties: false

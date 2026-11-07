@@ -615,7 +615,7 @@
 		status = "disabled";
 	};
 
-	dcpext0: display-engine@2b0000000 {
+	dispext0: display-engine@2b0000000 {
 		compatible = "apple,t6050-display-engine", "apple,display-engine";
 		reg = <0x2 0xb0000000 0x0 0x4000000>,
 		      <0x2 0xb2240000 0x0 0x10000>,

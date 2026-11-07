@@ -92,6 +92,8 @@ properties:
          Apple's firmware changes.
   interrupts: true
 
+additionalProperties: true
+
 allOf:
   - if:
       anyOf:

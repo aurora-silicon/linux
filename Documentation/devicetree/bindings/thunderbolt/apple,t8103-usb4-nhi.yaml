@@ -77,6 +77,8 @@ properties:
   resets: true
   status: true
 
+additionalProperties: true
+
 allOf:
   - if:
       anyOf:
@@ -114,7 +116,7 @@ allOf:
               minItems: 25
               maxItems: 25
             iommus:
-              minItems: 1
+              minItems: 24
               maxItems: 24
             power-domains:
               minItems: 4
@@ -124,6 +126,7 @@ allOf:
             - "reg"
             - "status"
             - "interrupts"
+            - "iommus"
             - "power-domains"
           additionalProperties: false
     else:
