@@ -110,12 +110,20 @@ static int __init __vdso_init(enum vdso_abi abi)
 	for (i = 0; i < vdso_info[abi].vdso_pages; i++) {
 		vdso_pagelist[i] = vdso_code_page(pfn + i);
 		if (!vdso_pagelist[i])
-			return -ENOMEM;
+			goto err_free;
 	}
 
 	vdso_info[abi].cm->pages = vdso_pagelist;
 
 	return 0;
+
+err_free:
+	/* Only the confined copies were allocated; image pages must not go. */
+	if (execmem_confine_active())
+		while (i--)
+			__free_page(vdso_pagelist[i]);
+	kfree(vdso_pagelist);
+	return -ENOMEM;
 }
 
 static int __setup_additional_pages(enum vdso_abi abi,
