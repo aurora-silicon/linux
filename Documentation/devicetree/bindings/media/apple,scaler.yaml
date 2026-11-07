@@ -169,9 +169,9 @@ allOf:
                     compatible:
                       contains:
                         enum:
-                          - apple,t8122-scaler
                           - apple,t6030-scaler
                           - apple,t6031-scaler
+                          - apple,t8122-scaler
                 then:
                   properties:
                     reg:

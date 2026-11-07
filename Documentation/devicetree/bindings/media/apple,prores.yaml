@@ -169,9 +169,9 @@ allOf:
                     compatible:
                       contains:
                         enum:
-                          - apple,t8122-prores
                           - apple,t6030-prores
                           - apple,t6031-prores
+                          - apple,t8122-prores
                 then:
                   properties:
                     reg:
