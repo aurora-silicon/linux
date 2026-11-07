@@ -124,6 +124,9 @@ impl job::Backend for Backend {
     fn fence_queue(&self) -> Arc<kernel::workqueue::OwnedQueue> {
         self.shared.fence_queue()
     }
+    fn render_pairs(&self) -> u32 {
+        u32::from(self.pairs)
+    }
     fn input_sources(&self, inputs: &[crate::file::SyncItem])
         -> Option<Arc<crate::g17::sync_input::Sources>>
     {
@@ -212,7 +215,7 @@ impl job::Backend for Backend {
     }
 
     fn render_scs_blocks(&self, pages: [u16; 2]) -> Result<usize> {
-        crate::g17::fw::render_rt::required_blocks(self.shared.active_cores, pages)
+        crate::g17::fw::render_rt::required_blocks(self.shared.active_cores, pages, self.pairs)
     }
 
     fn ensure_compute(&self, command: &crate::g17::command::Validated) -> Result {

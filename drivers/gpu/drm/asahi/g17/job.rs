@@ -17,8 +17,9 @@ use kernel::{
 };
 
 pub(super) const TIMEOUT_MS: kernel::time::Msecs = super::timeout::POLL_MS;
-/// One logical render queue owns one physical pair, whose active ring holds
-/// `RENDER_DEPTH` commands. A deeper scheduler would only park run_job in
+/// Each physical pair of a logical render queue holds `RENDER_DEPTH` commands
+/// in its active ring, so a queue gets that many credits per pair it may hold
+/// ([`Backend::render_pairs`]). A deeper scheduler would only park run_job in
 /// admission until a retirement; the scheduler waits for the credit instead.
 const RENDER_CREDITS: u32 = crate::hw::t8140::queues::RENDER_DEPTH as u32;
 const COMPUTE_CREDITS: u32 = 16;
@@ -311,6 +312,9 @@ pub(crate) trait Backend: Send + Sync {
     /// The reclaim-safe queue for the scheduler's timeout work, whose handler signals the
     /// fences of timed-out jobs.
     fn fence_queue(&self) -> Arc<workqueue::OwnedQueue>;
+    /// Render pairs this logical queue may hold, fixed when it is created: its
+    /// render scheduler's credits are fixed then too.
+    fn render_pairs(&self) -> u32 { 1 }
     fn supports_engine(&self, _engine: Engine) -> bool { true }
     /// Device policy applied to a validated command before it is ordered (the M5 resource
     /// plan).
@@ -471,7 +475,10 @@ impl Fences {
 impl<B: Backend> Scheduler<B> {
     pub(crate) fn new(dev: &AsahiDrmDevice, backend: Arc<B>, engine: Engine) -> Result<Self> {
         let (credits, name) = match engine {
-            Engine::Render => (RENDER_CREDITS, c_str!("aurora_g17_render")),
+            Engine::Render => (
+                RENDER_CREDITS.checked_mul(backend.render_pairs()).ok_or(EOVERFLOW)?,
+                c_str!("aurora_g17_render"),
+            ),
             Engine::Compute => (COMPUTE_CREDITS, c_str!("aurora_g17_compute")),
         };
         let device = dev.as_ref().as_ref();
