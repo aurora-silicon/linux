@@ -357,19 +357,6 @@ properties:
       apple,max-brightness:
         $ref: /schemas/types.yaml#/definitions/uint32
         description: Maximum firmware backlight level.
-      apple,color-gamut:
-        $ref: /schemas/types.yaml#/definitions/string
-        enum:
-          - srgb
-          - display-p3
-        description:
-          Standard colour space the panel is calibrated to by default, as
-          named in the product's published specifications. srgb has the
-          IEC 61966-2-1 primaries, display-p3 the SMPTE EG 432-1 primaries;
-          both have a D65 white and a nominal gamma of 2.2. Factory
-          calibration of the individual unit is applied by the display
-          coprocessor and is not described here. Colour data reported by
-          the firmware takes precedence.
     required:
       - compatible
     additionalProperties: false
