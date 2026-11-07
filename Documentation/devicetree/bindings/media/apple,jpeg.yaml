@@ -27,9 +27,13 @@ properties:
           - apple,t8140-jpeg
       - items:
           - enum:
-              - apple,t8122-jpeg
+              - apple,t6020-jpeg
+              - apple,t6021-jpeg
+              - apple,t6022-jpeg
               - apple,t6030-jpeg
               - apple,t6031-jpeg
+              - apple,t8112-jpeg
+              - apple,t8122-jpeg
           - const: apple,jpeg
 
   reg:
@@ -84,9 +88,9 @@ allOf:
         compatible:
           contains:
             enum:
-              - apple,t8122-jpeg
               - apple,t6030-jpeg
               - apple,t6031-jpeg
+              - apple,t8122-jpeg
     then:
       properties:
         power-domains:
