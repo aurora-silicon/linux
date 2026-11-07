@@ -577,6 +577,10 @@ static int apple_smc_probe(struct platform_device *pdev)
 					    ARRAY_SIZE(apple_smc_telemetry_devs),
 					    NULL, 0, NULL);
 
+	ret = devm_device_init_wakeup(dev);
+	if (ret)
+		return ret;
+
 	/* Enable notifications */
 	apple_smc_write_flag(smc, SMC_KEY(NTAP), true);
 	ret = devm_add_action_or_reset(dev, apple_smc_disable_notifications, smc);
@@ -718,9 +722,34 @@ static int apple_smc_sleep_commit(struct apple_smc *smc)
 	return ret;
 }
 
+/* MBSW's bits, as smc-pmu's event_name properties number them on T8140. Other SoCs differ. */
+static const struct {
+	u8 bit;
+	const char *name;
+} apple_smc_wake_reasons[] = {
+	{ 0, "pwrbtn" }, { 9, "ipd_touch" }, { 10, "lid" }, { 16, "ipd_kbd" },
+	{ 18, "charger" }, { 23, "wifibt" }, { 40, "acattach" }, { 41, "acdetach" },
+	{ 42, "USB-C_plug" }, { 43, "USB2_plug" }, { 44, "USB2_wake" }, { 45, "aupo" },
+	{ 48, "rtc" },
+};
+
+static int apple_smc_wake_reason_names(u64 record, char *buf, size_t size)
+{
+	int i, len = 0;
+
+	buf[0] = 0;
+	for (i = 0; i < ARRAY_SIZE(apple_smc_wake_reasons); i++)
+		if (record & BIT_ULL(apple_smc_wake_reasons[i].bit))
+			len += scnprintf(buf + len, size - len, "%s%s", len ? " " : "",
+					 apple_smc_wake_reasons[i].name);
+
+	return len;
+}
+
 static void apple_smc_notice_on(struct apple_smc *smc)
 {
 	u8 record[8] = {};
+	char names[128];
 	u32 event = 0;
 	int ret;
 
@@ -735,7 +764,13 @@ static void apple_smc_notice_on(struct apple_smc *smc)
 	ret = apple_smc_read(smc, SMC_KEY(MBSW), record, sizeof(record));
 	if (ret < 0)
 		dev_warn(smc->dev, "Failed to read MBSW after a wake: %d\n", ret);
-	dev_dbg(smc->dev, "wake record: MBSE %#x, MBSW %8ph\n", event, record);
+
+	smc->wake_record = get_unaligned_le64(record);
+	apple_smc_wake_reason_names(smc->wake_record, names, sizeof(names));
+	dev_info(smc->dev, "wake record: MBSE %#x, MBSW %8ph%s%s\n", event, record,
+		 names[0] ? ": " : "", names);
+	if (smc->wake_record)
+		pm_wakeup_event(smc->dev, 0);
 }
 
 static void apple_smc_sleep_wake(struct apple_smc *smc)

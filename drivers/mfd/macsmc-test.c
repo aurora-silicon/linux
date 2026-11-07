@@ -279,6 +279,18 @@ static void macsmc_notice_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ctx->seen[3], SMC_KEY(MBSW));
 }
 
+static void macsmc_wake_reason_test(struct kunit *test)
+{
+	char names[128];
+
+	KUNIT_EXPECT_EQ(test, apple_smc_wake_reason_names(0, names, sizeof(names)), 0);
+	KUNIT_EXPECT_STREQ(test, names, "");
+
+	/* A bit with no name is left out. */
+	apple_smc_wake_reason_names(BIT_ULL(23) | BIT_ULL(42) | BIT_ULL(1), names, sizeof(names));
+	KUNIT_EXPECT_STREQ(test, names, "wifibt USB-C_plug");
+}
+
 static struct kunit_case macsmc_parser_cases[] = {
 	KUNIT_CASE(macsmc_key_info_lock_test),
 	KUNIT_CASE(macsmc_key_index_test),
@@ -292,6 +304,7 @@ static struct kunit_case macsmc_parser_cases[] = {
 	KUNIT_CASE(macsmc_sleep_order_test),
 	KUNIT_CASE(macsmc_sleep_refused_test),
 	KUNIT_CASE(macsmc_notice_test),
+	KUNIT_CASE(macsmc_wake_reason_test),
 	{}
 };
 

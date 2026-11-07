@@ -118,6 +118,8 @@ struct apple_smc {
 	bool sleep_warned;
 	/* In a noirq phase: replies are polled for. */
 	bool polled;
+	/* MBSW at the last wake: what the SMC had woken the AP for. */
+	u64 wake_record;
 
 	struct completion init_done;
 	enum apple_smc_boot_stage boot_stage;
