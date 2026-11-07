@@ -88,6 +88,7 @@
 		iommus = <&scaler0_dart 0>,
 		         <&scaler0_dart 1>;
 		clocks = <&peripheral_clocks 374>;
+		resets = <&ps_msr>;
 		status = "disabled";
 	};
 

@@ -17,44 +17,44 @@
 
 / {
 	reserved-memory {
-		dcpext0_text: dcpext0-text {
+		dcpext0_text: dcpext0-text@0 {
 			compatible = "apple,asc-mem";
-			size = <0x0 0x4000>; /* The loader supplies reg. */
+			reg = <0x0 0x0 0x0 0x4000>;
 			no-map;
 			status = "disabled";
 		};
 
-		dcpext0_data: dcpext0-data {
+		dcpext0_data: dcpext0-data@0 {
 			compatible = "apple,asc-mem";
-			size = <0x0 0x4000>; /* The loader supplies reg. */
+			reg = <0x0 0x0 0x0 0x4000>;
 			no-map;
 			status = "disabled";
 		};
 
-		dcpext0_heap: dcpext0-heap {
+		dcpext0_heap: dcpext0-heap@0 {
 			compatible = "apple,asc-mem";
-			size = <0x0 0x4000>; /* The loader supplies reg. */
+			reg = <0x0 0x0 0x0 0x4000>;
 			no-map;
 			status = "disabled";
 		};
 
-		dcpext1_text: dcpext1-text {
+		dcpext1_text: dcpext1-text@0 {
 			compatible = "apple,asc-mem";
-			size = <0x0 0x4000>; /* The loader supplies reg. */
+			reg = <0x0 0x0 0x0 0x4000>;
 			no-map;
 			status = "disabled";
 		};
 
-		dcpext1_data: dcpext1-data {
+		dcpext1_data: dcpext1-data@0 {
 			compatible = "apple,asc-mem";
-			size = <0x0 0x4000>; /* The loader supplies reg. */
+			reg = <0x0 0x0 0x0 0x4000>;
 			no-map;
 			status = "disabled";
 		};
 
-		dcpext1_heap: dcpext1-heap {
+		dcpext1_heap: dcpext1-heap@0 {
 			compatible = "apple,asc-mem";
-			size = <0x0 0x4000>; /* The loader supplies reg. */
+			reg = <0x0 0x0 0x0 0x4000>;
 			no-map;
 			status = "disabled";
 		};

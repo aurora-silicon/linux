@@ -88,6 +88,7 @@
 		iommus = <&scaler0_dart 0>,
 		         <&scaler0_dart 1>;
 		clocks = <&peripheral_clocks 417>;
+		resets = <&ps_msr0>;
 		status = "disabled";
 	};
 
@@ -181,6 +182,7 @@
 		interrupts = <AIC_IRQ 1960 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_scodec>;
 		iommus = <&apr0_dart 1>;
+		resets = <&ps_scodec>;
 		status = "disabled";
 	};
 
