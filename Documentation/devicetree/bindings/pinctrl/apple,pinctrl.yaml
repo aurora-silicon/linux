@@ -22,25 +22,25 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,pinctrl"
-              - "apple,s5l8960x-pinctrl"
-              - "apple,s8000-pinctrl"
-              - "apple,t6000-pinctrl"
-              - "apple,t6020-pinctrl"
-              - "apple,t6030-pinctrl"
-              - "apple,t6031-pinctrl"
-              - "apple,t6041-pinctrl"
-              - "apple,t7000-pinctrl"
-              - "apple,t8010-pinctrl"
-              - "apple,t8015-pinctrl"
-              - "apple,t8103-pinctrl"
-              - "apple,t8112-pinctrl"
-              - "apple,t8122-pinctrl"
-              - "apple,t8132-pinctrl"
-              - "apple,t8140-pinctrl"
-              - "apple,t8152-pinctrl"
+              - apple,pinctrl
+              - apple,s5l8960x-pinctrl
+              - apple,s8000-pinctrl
+              - apple,t6000-pinctrl
+              - apple,t6020-pinctrl
+              - apple,t6030-pinctrl
+              - apple,t6031-pinctrl
+              - apple,t6041-pinctrl
+              - apple,t7000-pinctrl
+              - apple,t8010-pinctrl
+              - apple,t8015-pinctrl
+              - apple,t8103-pinctrl
+              - apple,t8112-pinctrl
+              - apple,t8122-pinctrl
+              - apple,t8132-pinctrl
+              - apple,t8140-pinctrl
+              - apple,t8152-pinctrl
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
@@ -48,14 +48,14 @@ select:
             -
               contains:
                 enum:
-                  - "apple,t8142-pinctrl"
-                  - "apple,t8152-pinctrl"
-                  - "apple,t6050-pinctrl"
+                  - apple,t8142-pinctrl
+                  - apple,t8152-pinctrl
+                  - apple,t6050-pinctrl
             -
               contains:
-                const: "apple,pinctrl"
+                const: apple,pinctrl
       required:
-        - "compatible"
+        - compatible
 allOf:
   -
     if:
@@ -67,14 +67,14 @@ allOf:
                 -
                   contains:
                     enum:
-                      - "apple,t8142-pinctrl"
-                      - "apple,t8152-pinctrl"
-                      - "apple,t6050-pinctrl"
+                      - apple,t8142-pinctrl
+                      - apple,t8152-pinctrl
+                      - apple,t6050-pinctrl
                 -
                   contains:
-                    const: "apple,pinctrl"
+                    const: apple,pinctrl
             status:
-              const: "disabled"
+              const: disabled
             gpio-ranges:
               maxItems: 1
             apple,npins:
@@ -85,32 +85,38 @@ allOf:
               maximum: 6
               description: First interrupt group owned by the application processor.
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
           not:
             required:
-              - "mboxes"
+              - mboxes
     then:
       oneOf:
         -
-          description: "Apple gpio register bank. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          type: object
+          description: |
+            Apple gpio register bank. Initial resource description for an unsupported firmware/backend
+            layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form
+            must stay disabled; it does not substitute for the enabled driver contract or supply
+            firmware, calibration, programming sequences or unresolved providers.
           properties:
             compatible:
               items:
                 -
                   enum:
-                    - "apple,t8142-pinctrl"
-                    - "apple,t8152-pinctrl"
-                    - "apple,t6050-pinctrl"
+                    - apple,t8142-pinctrl
+                    - apple,t8152-pinctrl
+                    - apple,t6050-pinctrl
                 -
-                  const: "apple,pinctrl"
+                  const: apple,pinctrl
             status:
-              const: "disabled"
+              const: disabled
             reg:
-              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              description: |
+                Register apertures of the complete hardware complex, in hardware interface order.
               maxItems: 1
             interrupts:
-              description: "Interrupt lines wired to the system interrupt controller."
+              description: Interrupt lines wired to the system interrupt controller.
               minItems: 1
               maxItems: 7
             "#address-cells":
@@ -122,19 +128,22 @@ allOf:
             "#interrupt-cells":
               const: 2
           required:
-            - "compatible"
-            - "reg"
-            - "status"
-            - "gpio-controller"
+            - compatible
+            - reg
+            - status
+            - gpio-controller
             - "#gpio-cells"
-            - "interrupt-controller"
+            - interrupt-controller
             - "#interrupt-cells"
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
 
+unevaluatedProperties: false
+
 $defs:
   legacy-driver:
+    type: object
     properties:
       compatible:
         oneOf:

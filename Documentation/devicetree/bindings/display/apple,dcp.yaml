@@ -22,26 +22,26 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,dcp"
-              - "apple,dcpext"
-              - "apple,t6000-dcp"
-              - "apple,t6000-dcpext"
-              - "apple,t6020-dcp"
-              - "apple,t6020-dcpext"
-              - "apple,t6041-dcp"
-              - "apple,t6041-dcpext"
-              - "apple,t8103-dcp"
-              - "apple,t8103-dcpext"
-              - "apple,t8112-dcp"
-              - "apple,t8112-dcpext"
-              - "apple,t8132-dcp"
-              - "apple,t8132-dcpext"
-              - "apple,t8132-dcpext-firmware-ready."
-              - "apple,t8140-dcp"
-              - "apple,t8140-dcpext"
-              - "apple,t8142-dcp"
+              - apple,dcp
+              - apple,dcpext
+              - apple,t6000-dcp
+              - apple,t6000-dcpext
+              - apple,t6020-dcp
+              - apple,t6020-dcpext
+              - apple,t6041-dcp
+              - apple,t6041-dcpext
+              - apple,t8103-dcp
+              - apple,t8103-dcpext
+              - apple,t8112-dcp
+              - apple,t8112-dcpext
+              - apple,t8132-dcp
+              - apple,t8132-dcpext
+              - apple,t8132-dcpext-firmware-ready.
+              - apple,t8140-dcp
+              - apple,t8140-dcpext
+              - apple,t8142-dcp
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
@@ -49,14 +49,14 @@ select:
             -
               contains:
                 enum:
-                  - "apple,t8142-dcp"
-                  - "apple,t8152-dcp"
-                  - "apple,t6050-dcp"
+                  - apple,t8142-dcp
+                  - apple,t8152-dcp
+                  - apple,t6050-dcp
             -
               contains:
-                const: "apple,dcp"
+                const: apple,dcp
       required:
-        - "compatible"
+        - compatible
 allOf:
   -
     if:
@@ -68,58 +68,67 @@ allOf:
                 -
                   contains:
                     enum:
-                      - "apple,t8142-dcp"
-                      - "apple,t8152-dcp"
-                      - "apple,t6050-dcp"
+                      - apple,t8142-dcp
+                      - apple,t8152-dcp
+                      - apple,t6050-dcp
                 -
                   contains:
-                    const: "apple,dcp"
+                    const: apple,dcp
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
           not:
             required:
-              - "mboxes"
+              - mboxes
     then:
       oneOf:
         -
-          description: "Apple display management coprocessor. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          type: object
+          description: |
+            Apple display management coprocessor. Initial resource description for an unsupported
+            firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver
+            exists. This form must stay disabled; it does not substitute for the enabled driver contract
+            or supply firmware, calibration, programming sequences or unresolved providers.
           properties:
             compatible:
               items:
                 -
                   enum:
-                    - "apple,t8142-dcp"
-                    - "apple,t8152-dcp"
-                    - "apple,t6050-dcp"
+                    - apple,t8142-dcp
+                    - apple,t8152-dcp
+                    - apple,t6050-dcp
                 -
-                  const: "apple,dcp"
+                  const: apple,dcp
             status:
-              const: "disabled"
+              const: disabled
             reg:
-              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              description: |
+                Register apertures of the complete hardware complex, in hardware interface order.
               minItems: 2
               maxItems: 4
             interrupts:
-              description: "Interrupt lines wired to the system interrupt controller."
+              description: Interrupt lines wired to the system interrupt controller.
               minItems: 3
               maxItems: 8
             iommus:
-              description: "DMA translation streams emitted by this hardware."
+              description: DMA translation streams emitted by this hardware.
               minItems: 1
               maxItems: 2
           required:
-            - "compatible"
-            - "reg"
-            - "status"
+            - compatible
+            - reg
+            - status
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
 
+unevaluatedProperties: false
+
 $defs:
   legacy-driver:
+    type: object
     properties:
       compatible:
         oneOf:

@@ -17,22 +17,22 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,agx-g13c"
-              - "apple,agx-g13d"
-              - "apple,agx-g13g"
-              - "apple,agx-g13s"
-              - "apple,agx-g14c"
-              - "apple,agx-g14d"
-              - "apple,agx-g14g"
-              - "apple,agx-g14s"
-              - "apple,agx-t6040"
-              - "apple,agx-t6041"
-              - "apple,agx-t8103"
-              - "apple,agx-t8112"
-              - "apple,agx-t8132"
-              - "apple,agx-t8140"
+              - apple,agx-g13c
+              - apple,agx-g13d
+              - apple,agx-g13g
+              - apple,agx-g13s
+              - apple,agx-g14c
+              - apple,agx-g14d
+              - apple,agx-g14g
+              - apple,agx-g14s
+              - apple,agx-t6040
+              - apple,agx-t6041
+              - apple,agx-t8103
+              - apple,agx-t8112
+              - apple,agx-t8132
+              - apple,agx-t8140
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
@@ -40,14 +40,14 @@ select:
             -
               contains:
                 enum:
-                  - "apple,t8142-gpu"
-                  - "apple,t8152-gpu"
-                  - "apple,t6050-gpu"
+                  - apple,t8142-gpu
+                  - apple,t8152-gpu
+                  - apple,t6050-gpu
             -
               contains:
-                const: "apple,gpu"
+                const: apple,gpu
       required:
-        - "compatible"
+        - compatible
 allOf:
   -
     if:
@@ -59,54 +59,63 @@ allOf:
                 -
                   contains:
                     enum:
-                      - "apple,t8142-gpu"
-                      - "apple,t8152-gpu"
-                      - "apple,t6050-gpu"
+                      - apple,t8142-gpu
+                      - apple,t8152-gpu
+                      - apple,t6050-gpu
                 -
                   contains:
-                    const: "apple,gpu"
+                    const: apple,gpu
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
           not:
             required:
-              - "mboxes"
+              - mboxes
     then:
       oneOf:
         -
-          description: "Apple graphics processor register complex. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          type: object
+          description: |
+            Apple graphics processor register complex. Initial resource description for an unsupported
+            firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver
+            exists. This form must stay disabled; it does not substitute for the enabled driver contract
+            or supply firmware, calibration, programming sequences or unresolved providers.
           properties:
             compatible:
               items:
                 -
                   enum:
-                    - "apple,t8142-gpu"
-                    - "apple,t8152-gpu"
-                    - "apple,t6050-gpu"
+                    - apple,t8142-gpu
+                    - apple,t8152-gpu
+                    - apple,t6050-gpu
                 -
-                  const: "apple,gpu"
+                  const: apple,gpu
             status:
-              const: "disabled"
+              const: disabled
             reg:
-              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              description: |
+                Register apertures of the complete hardware complex, in hardware interface order.
               minItems: 2
               maxItems: 2
             interrupts:
-              description: "Interrupt lines wired to the system interrupt controller."
+              description: Interrupt lines wired to the system interrupt controller.
               minItems: 8
               maxItems: 8
           required:
-            - "compatible"
-            - "reg"
-            - "status"
+            - compatible
+            - reg
+            - status
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
 
+unevaluatedProperties: false
+
 $defs:
   legacy-driver:
+    type: object
     properties:
       compatible:
         oneOf:

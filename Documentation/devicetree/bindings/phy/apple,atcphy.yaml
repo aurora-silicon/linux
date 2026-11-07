@@ -44,15 +44,15 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,t6000-atcphy"
-              - "apple,t6020-atcphy"
-              - "apple,t8103-atcphy"
-              - "apple,t8112-atcphy"
-              - "apple,t8132-atcphy"
-              - "apple,t8140-atcphy"
-              - "apple,t8142-atcphy"
+              - apple,t6000-atcphy
+              - apple,t6020-atcphy
+              - apple,t8103-atcphy
+              - apple,t8112-atcphy
+              - apple,t8132-atcphy
+              - apple,t8140-atcphy
+              - apple,t8142-atcphy
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
@@ -60,14 +60,14 @@ select:
             -
               contains:
                 enum:
-                  - "apple,t8142-atcphy"
-                  - "apple,t8152-atcphy"
-                  - "apple,t6050-atcphy"
+                  - apple,t8142-atcphy
+                  - apple,t8152-atcphy
+                  - apple,t6050-atcphy
             -
               contains:
-                const: "apple,atcphy"
+                const: apple,atcphy
       required:
-        - "compatible"
+        - compatible
 allOf:
   -
     if:
@@ -79,50 +79,58 @@ allOf:
                 -
                   contains:
                     enum:
-                      - "apple,t8142-atcphy"
-                      - "apple,t8152-atcphy"
-                      - "apple,t6050-atcphy"
+                      - apple,t8142-atcphy
+                      - apple,t8152-atcphy
+                      - apple,t6050-atcphy
                 -
                   contains:
-                    const: "apple,atcphy"
+                    const: apple,atcphy
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
           not:
             required:
-              - "mboxes"
+              - mboxes
     then:
       oneOf:
         -
-          description: "Apple type-c phy complex. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          type: object
+          description: |
+            Apple type-c phy complex. Initial resource description for an unsupported firmware/backend
+            layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form
+            must stay disabled; it does not substitute for the enabled driver contract or supply
+            firmware, calibration, programming sequences or unresolved providers.
           properties:
             compatible:
               items:
                 -
                   enum:
-                    - "apple,t8142-atcphy"
-                    - "apple,t8152-atcphy"
-                    - "apple,t6050-atcphy"
+                    - apple,t8142-atcphy
+                    - apple,t8152-atcphy
+                    - apple,t6050-atcphy
                 -
-                  const: "apple,atcphy"
+                  const: apple,atcphy
             status:
-              const: "disabled"
+              const: disabled
             reg:
-              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              description: |
+                Register apertures of the complete hardware complex, in hardware interface order.
               minItems: 4
               maxItems: 44
             power-domains:
-              description: "Power and combined clock gates required by this hardware."
+              description: Power and combined clock gates required by this hardware.
               maxItems: 1
           required:
-            - "compatible"
-            - "reg"
-            - "status"
+            - compatible
+            - reg
+            - status
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
+
+unevaluatedProperties: false
 
 $defs:
   apple,tunable:
@@ -140,6 +148,7 @@ $defs:
       Unless otherwise noted these tunables are always applied to the core
       register region.
   legacy-driver:
+    type: object
     allOf:
       - $ref: /schemas/usb/usb-switch.yaml#
       - if:

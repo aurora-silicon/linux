@@ -17,25 +17,25 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,s5l8960x-wdt"
-              - "apple,s8000-wdt"
-              - "apple,t6000-wdt"
-              - "apple,t6020-wdt"
-              - "apple,t6030-wdt"
-              - "apple,t6031-wdt"
-              - "apple,t6041-wdt"
-              - "apple,t6050-wdt"
-              - "apple,t7000-wdt"
-              - "apple,t8010-wdt"
-              - "apple,t8015-wdt"
-              - "apple,t8103-wdt"
-              - "apple,t8112-wdt"
-              - "apple,t8122-wdt"
-              - "apple,t8132-wdt"
-              - "apple,t8140-wdt"
-              - "apple,wdt"
+              - apple,s5l8960x-wdt
+              - apple,s8000-wdt
+              - apple,t6000-wdt
+              - apple,t6020-wdt
+              - apple,t6030-wdt
+              - apple,t6031-wdt
+              - apple,t6041-wdt
+              - apple,t6050-wdt
+              - apple,t7000-wdt
+              - apple,t8010-wdt
+              - apple,t8015-wdt
+              - apple,t8103-wdt
+              - apple,t8112-wdt
+              - apple,t8122-wdt
+              - apple,t8132-wdt
+              - apple,t8140-wdt
+              - apple,wdt
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
@@ -43,13 +43,13 @@ select:
             -
               contains:
                 enum:
-                  - "apple,t8142-wdt"
-                  - "apple,t8152-wdt"
+                  - apple,t8142-wdt
+                  - apple,t8152-wdt
             -
               contains:
-                const: "apple,wdt"
+                const: apple,wdt
       required:
-        - "compatible"
+        - compatible
 allOf:
   -
     if:
@@ -61,52 +61,61 @@ allOf:
                 -
                   contains:
                     enum:
-                      - "apple,t8142-wdt"
-                      - "apple,t8152-wdt"
+                      - apple,t8142-wdt
+                      - apple,t8152-wdt
                 -
                   contains:
-                    const: "apple,wdt"
+                    const: apple,wdt
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
           not:
             required:
-              - "mboxes"
+              - mboxes
     then:
       oneOf:
         -
-          description: "Apple watchdog and reset register complex. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          type: object
+          description: |
+            Apple watchdog and reset register complex. Initial resource description for an unsupported
+            firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver
+            exists. This form must stay disabled; it does not substitute for the enabled driver contract
+            or supply firmware, calibration, programming sequences or unresolved providers.
           properties:
             compatible:
               items:
                 -
                   enum:
-                    - "apple,t8142-wdt"
-                    - "apple,t8152-wdt"
+                    - apple,t8142-wdt
+                    - apple,t8152-wdt
                 -
-                  const: "apple,wdt"
+                  const: apple,wdt
             status:
-              const: "disabled"
+              const: disabled
             reg:
-              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              description: |
+                Register apertures of the complete hardware complex, in hardware interface order.
               minItems: 5
               maxItems: 5
             interrupts:
-              description: "Interrupt lines wired to the system interrupt controller."
+              description: Interrupt lines wired to the system interrupt controller.
               minItems: 2
               maxItems: 2
           required:
-            - "compatible"
-            - "reg"
-            - "status"
+            - compatible
+            - reg
+            - status
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
 
+unevaluatedProperties: false
+
 $defs:
   legacy-driver:
+    type: object
     allOf:
       - $ref: watchdog.yaml#
     properties:

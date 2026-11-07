@@ -23,16 +23,16 @@ select:
         compatible:
           contains:
             enum:
-              - "apple,t6000-pmp-v2"
-              - "apple,t6020-pmp-v2"
-              - "apple,t6030-pmp-v2"
-              - "apple,t6031-pmp-v2"
-              - "apple,t6041-pmp-v2"
-              - "apple,t8122-pmp-v2"
-              - "apple,t8132-pmp-v2"
-              - "apple,t8140-pmp-v2"
+              - apple,t6000-pmp-v2
+              - apple,t6020-pmp-v2
+              - apple,t6030-pmp-v2
+              - apple,t6031-pmp-v2
+              - apple,t6041-pmp-v2
+              - apple,t8122-pmp-v2
+              - apple,t8132-pmp-v2
+              - apple,t8140-pmp-v2
       required:
-        - "compatible"
+        - compatible
     -
       properties:
         compatible:
@@ -40,14 +40,14 @@ select:
             -
               contains:
                 enum:
-                  - "apple,t8142-pmp"
-                  - "apple,t8152-pmp"
-                  - "apple,t6050-pmp"
+                  - apple,t8142-pmp
+                  - apple,t8152-pmp
+                  - apple,t6050-pmp
             -
               contains:
-                const: "apple,pmp"
+                const: apple,pmp
       required:
-        - "compatible"
+        - compatible
 allOf:
   -
     if:
@@ -59,61 +59,70 @@ allOf:
                 -
                   contains:
                     enum:
-                      - "apple,t8142-pmp"
-                      - "apple,t8152-pmp"
-                      - "apple,t6050-pmp"
+                      - apple,t8142-pmp
+                      - apple,t8152-pmp
+                      - apple,t6050-pmp
                 -
                   contains:
-                    const: "apple,pmp"
+                    const: apple,pmp
             status:
-              const: "disabled"
+              const: disabled
           required:
-            - "compatible"
-            - "status"
+            - compatible
+            - status
           not:
             required:
-              - "mboxes"
+              - mboxes
     then:
       oneOf:
         -
-          description: "Apple power management processor. Initial resource description for an unsupported firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver exists. This form must stay disabled; it does not substitute for the enabled driver contract or supply firmware, calibration, programming sequences or unresolved providers."
+          type: object
+          description: |
+            Apple power management processor. Initial resource description for an unsupported
+            firmware/backend layout. Register, IRQ and DMA topology can be recorded before a driver
+            exists. This form must stay disabled; it does not substitute for the enabled driver contract
+            or supply firmware, calibration, programming sequences or unresolved providers.
           properties:
             compatible:
               items:
                 -
                   enum:
-                    - "apple,t8142-pmp"
-                    - "apple,t8152-pmp"
-                    - "apple,t6050-pmp"
+                    - apple,t8142-pmp
+                    - apple,t8152-pmp
+                    - apple,t6050-pmp
                 -
-                  const: "apple,pmp"
+                  const: apple,pmp
             status:
-              const: "disabled"
+              const: disabled
             reg:
-              description: "Register apertures of the complete hardware complex, in hardware interface order."
+              description: |
+                Register apertures of the complete hardware complex, in hardware interface order.
               minItems: 4
               maxItems: 5
             interrupts:
-              description: "Interrupt lines wired to the system interrupt controller."
+              description: Interrupt lines wired to the system interrupt controller.
               minItems: 3
               maxItems: 4
             iommus:
-              description: "DMA translation streams emitted by this hardware."
+              description: DMA translation streams emitted by this hardware.
               maxItems: 1
             power-domains:
-              description: "Power and combined clock gates required by this hardware."
+              description: Power and combined clock gates required by this hardware.
               minItems: 2
               maxItems: 2
           required:
-            - "compatible"
-            - "reg"
-            - "status"
+            - compatible
+            - reg
+            - status
           additionalProperties: false
     else:
       $ref: "#/$defs/legacy-driver"
 
+unevaluatedProperties: false
+
 $defs:
   legacy-driver:
+    type: object
     properties:
       compatible:
         oneOf:
