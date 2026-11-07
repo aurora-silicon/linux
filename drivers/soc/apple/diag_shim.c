@@ -116,7 +116,7 @@ static DEVICE_ATTR_RO(protocol);
 static ssize_t xart_show(struct device *dev, struct device_attribute *attr,
 			 char *buf)
 {
-	return sysfs_emit(buf, "%s\n", sep_diag.xart ? "enabled" : "disabled");
+	return sysfs_emit(buf, "%s\n", READ_ONCE(sep_diag.xart) ? "enabled" : "disabled");
 }
 static DEVICE_ATTR_RO(xart);
 
@@ -499,10 +499,20 @@ void sep_diag_xart_guard_refused(int matching)
  * and it is not repeated. Whatever it left undecided is final for this boot:
  * the key store stays closed and Touch ID cannot start.
  */
-void sep_diag_bringup_ended(void)
+void sep_diag_set_xart(bool writable)
+{
+	WRITE_ONCE(sep_diag.xart, writable);
+}
+
+void sep_diag_keystore_ended(void)
 {
 	atomic_cmpxchg(&sep_diag.keystore, SEP_DIAG_KEYSTORE_UNKNOWN,
 		       SEP_DIAG_KEYSTORE_CLOSED);
+}
+
+void sep_diag_bringup_ended(void)
+{
+	sep_diag_keystore_ended();
 	atomic_cmpxchg(&sep_diag.touchid, SEP_DIAG_TOUCHID_PENDING,
 		       SEP_DIAG_TOUCHID_UNAVAILABLE);
 }

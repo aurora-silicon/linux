@@ -14,6 +14,28 @@ use kernel::sync::atomic::Relaxed;
 pub(crate) const REFKEY_ENVELOPE_VERSION: u32 = 2;
 
 impl SepData {
+    /// Keep only decoded bytes across switch-root, never an open initrd file.
+    fn with_identity_keybag<T>(
+        &self,
+        f: impl FnOnce(&keybag::StoredKeyBag) -> Result<T>,
+    ) -> Result<T> {
+        let mut cache = self.identity_keybag.lock();
+        if self.keystore_only.load(Relaxed) {
+            if cache.is_none() {
+                let keybag::State::Present(stored) = keybag::read(keybag::Slot::Identity)? else {
+                    return Err(ENODEV);
+                };
+                *cache = Some(stored);
+            }
+            return f(cache.as_ref().ok_or(ENODEV)?);
+        }
+        drop(cache);
+        let keybag::State::Present(stored) = keybag::read(keybag::Slot::Identity)? else {
+            return Err(ENODEV);
+        };
+        f(&stored)
+    }
+
     fn sks_req_refkey(&self, keybag: i32, der_set: &[u8]) -> Result<SksRequest> {
         let (keybag, envelope) = match self.profile.key_store {
             // The 13.5 operation envelope is 3. Use the designated identity
@@ -197,6 +219,10 @@ impl SepData {
             return;
         }
 
+        if self.keystore_only.load(Relaxed) {
+            // A missing initrd copy is never permission to replace an identity.
+            return;
+        }
         let Some(blob) = self.sks_create_refkey(handle, secret) else {
             dev_warn!(
                 self.dev,
@@ -234,12 +260,12 @@ impl SepData {
         if !self.sks_ready() {
             return Err(ENODEV);
         }
-        let keybag::State::Present(stored) = keybag::read(keybag::Slot::Identity)? else {
-            return Err(ENODEV);
-        };
-        let (handle, _uuid) = self.sks_recover(&stored).ok_or(EIO)?;
-        self.sks_machine_refkey(handle, stored.secret());
-        let _ = self.sks_send(self.sks_req_unload_keybag(handle));
+        self.with_identity_keybag(|stored| {
+            let (handle, _uuid) = self.sks_recover(stored).ok_or(EIO)?;
+            self.sks_machine_refkey(handle, stored.secret());
+            let _ = self.sks_send(self.sks_req_unload_keybag(handle));
+            Ok(())
+        })?;
         if self.machine_refkey.lock().is_some() {
             Ok(())
         } else {
@@ -269,6 +295,16 @@ impl SepData {
     }
 
     pub(crate) fn refkey_unseal_trusted(&self, sealed: &[u8]) -> Result<KVec<u8>> {
+        let refusals = self.keystore_write_refusals.load(Relaxed);
+        let recovered = self.refkey_unseal_cached(sealed)?;
+        if !crate::attach::unseal_allowed(refusals, self.keystore_write_refusals.load(Relaxed)) {
+            drop(crate::Secret(recovered));
+            return Err(EIO); // trusted.rs maps every unseal rejection to EBADMSG.
+        }
+        Ok(recovered)
+    }
+
+    fn refkey_unseal_cached(&self, sealed: &[u8]) -> Result<KVec<u8>> {
         self.wait_for_trusted_ready()?;
         self.ensure_machine_refkey()?;
         let blob = {
@@ -278,34 +314,36 @@ impl SepData {
             b.extend_from_slice(&mk.blob, GFP_KERNEL)?;
             b
         };
-        let keybag::State::Present(stored) = keybag::read(keybag::Slot::Identity)? else {
-            return Err(ENODEV);
-        };
-        let (handle, _uuid) = self.sks_recover(&stored).ok_or(EIO)?;
-        // The first unlock under a changed boot policy rewrites one session
-        // record; see crate::xart_guard.
-        let unlocked = crate::xart_guard::policy_window(|| {
-            if self.profile.key_store == profile::KeyStore::Variant5 {
-                if let Some(healthy) = self.sks_health_check(c"trusted-key unseal") {
-                    let _ = self.sks_send(self.sks_req_change_lock_state(
-                        handle,
-                        LockState::Unlocked,
-                        stored.secret(),
-                        healthy,
-                    ));
+        self.with_identity_keybag(|stored| {
+            let (handle, _uuid) = self.sks_recover(stored).ok_or(EIO)?;
+            // The first unlock under a changed boot policy rewrites one session
+            // record; see crate::xart_guard.
+            let unlock = || {
+                if self.profile.key_store == profile::KeyStore::Variant5 {
+                    if let Some(healthy) = self.sks_health_check(c"trusted-key unseal") {
+                        let _ = self.sks_send(self.sks_req_change_lock_state(
+                            handle,
+                            LockState::Unlocked,
+                            stored.secret(),
+                            healthy,
+                        ));
+                    }
+                    true
+                } else {
+                    self.sks_prepare_identity_refkey(handle, stored.secret())
                 }
                 true
             } else {
                 self.sks_prepare_identity_refkey(handle, stored.secret())
             }
-        });
-        if !unlocked {
+            let recovered = self.sks_refkey_unseal(handle, &blob, sealed);
             let _ = self.sks_send(self.sks_req_unload_keybag(handle));
             return Err(EIO);
         }
         let recovered = self.sks_refkey_unseal(handle, &blob, sealed);
         let _ = self.sks_send(self.sks_req_unload_keybag(handle));
         recovered.ok_or(EIO)
+        })
     }
 
     /// Op `osgn`: ECDSA-P256 over `challenge` as the pre-computed digest.

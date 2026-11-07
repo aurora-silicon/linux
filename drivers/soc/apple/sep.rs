@@ -9,6 +9,7 @@
 #[cfg(not(CONFIG_OF_DYNAMIC))]
 compile_error!("apple_sep requires CONFIG_OF_DYNAMIC: the SEP and DART nodes ship disabled and are enabled with a device-tree changeset");
 
+mod attach;
 mod bio;
 mod catacomb;
 mod control;
@@ -600,6 +601,14 @@ struct SepData {
 
     profile: &'static profile::PlatformProfile,
 
+    // Serialises completion, including concurrent sysfs writers and retries.
+    #[pin]
+    attach_phase: Mutex<attach::Phase>,
+    keystore_only: Atomic<bool>,
+    keystore_write_refusals: Atomic<u32>,
+    #[pin]
+    identity_keybag: Mutex<Option<keybag::StoredKeyBag>>,
+
     #[pin]
     fw_map: Mutex<Option<FirmwareMap>>,
 
@@ -924,7 +933,8 @@ impl SepData {
         )?;
         let dma_ring = dma::Coherent::<u8>::zeroed_slice(dev, DMA_RING_SIZE, GFP_KERNEL)?;
 
-        let xart_writes = module_parameters::xart_writes.value() != 0;
+        let keystore_only = attach::requested();
+        let xart_writes = !keystore_only && module_parameters::xart_writes.value() != 0;
         let xart_start = module_parameters::xart_start_sector.value();
         let xart_guard =
             xart_guard::level(module_parameters::xart_guard.value(), profile.xart_guard);
@@ -965,11 +975,15 @@ impl SepData {
             }
         };
 
-        let mut host_store = match store::Store::open() {
-            Ok(store) => Some(store),
-            Err(e) => {
-                dev_warn!(dev, "Linux host-state store unavailable: {:?}\n", e);
-                None
+        let mut host_store = if keystore_only {
+            None
+        } else {
+            match store::Store::open() {
+                Ok(store) => Some(store),
+                Err(e) => {
+                    dev_warn!(dev, "Linux host-state store unavailable: {:?}\n", e);
+                    None
+                }
             }
         };
 
@@ -983,6 +997,10 @@ impl SepData {
             try_pin_init!(SepData {
                 dev: ARef::<device::Device>::from(dev),
                 profile,
+                attach_phase <- new_mutex!(attach::Phase::new(keystore_only)),
+                keystore_only: Atomic::new(keystore_only),
+                keystore_write_refusals: Atomic::new(0),
+                identity_keybag <- new_mutex!(None),
                 fw_map <- new_mutex!(None),
                 mbox <- new_mutex!(None),
                 shmem <- new_mutex!(Some(buf)),
@@ -1714,6 +1732,13 @@ impl SepData {
             return;
         };
 
+        if !writable
+            && xarm::is_write(req.opcode)
+            && done.reply.status != xarm::STATUS_OK
+            && self.keystore_only.load(Relaxed)
+        {
+            self.keystore_write_refusals.fetch_add(1, Relaxed);
+        }
         if !writable
             && xarm::is_write(req.opcode)
             && done.reply.status != xarm::STATUS_OK
@@ -2471,8 +2496,13 @@ impl SepData {
             }
         }
 
-        this.run_bringup();
-        diag::bringup_ended();
+        if this.keystore_only.load(Relaxed) {
+            this.run_keystore_bringup();
+            diag::keystore_ended();
+        } else {
+            this.run_bringup();
+            diag::bringup_ended();
+        }
         this.finish_bringup();
         Self::arm_settle(this);
     }
@@ -2483,6 +2513,73 @@ impl SepData {
         let _guard = self.endpoints.lock();
         self.phase.store(PHASE_READY, Relaxed);
         self.trusted_ready.notify_all();
+    }
+
+    /// Completes the original attach without sending a second registration.
+    fn complete_attach(&self) -> Result<()> {
+        let mut phase = self.attach_phase.lock();
+        if !phase.needs_completion()? {
+            return Ok(());
+        }
+        self.wait_for_trusted_ready()?;
+        if module_parameters::provision_keybag.value() != 0
+            && module_parameters::xart_writes.value() == 0
+        {
+            return Err(EINVAL);
+        }
+
+        // Wait out a cached-keybag consumer before enabling persistent writes.
+        // All opens below resolve against PID 1's current (real) root.
+        let mut cached = self.identity_keybag.lock();
+        let mut host = store::Store::open()?;
+        let index = bio::IdentityIndex::load(&mut host)?;
+        let mut store = self.store.lock();
+        // Drop the read-only block handle before reopening the owner writable.
+        // Failure leaves a usable read-only store when it can be reopened.
+        *store = None;
+        let reopened = (|| {
+            let mut new = xart_store::Store::open_owner(
+                module_parameters::xart_writes.value() != 0,
+                module_parameters::xart_start_sector.value(),
+            )?;
+            if new.writes_enabled() {
+                if let Some(level) = xart_guard::level(
+                    module_parameters::xart_guard.value(),
+                    self.profile.xart_guard,
+                ) {
+                    new.set_guard(level)?;
+                }
+            }
+            Ok(new)
+        })();
+        let new = match reopened {
+            Ok(new) => new,
+            Err(e) => {
+                *store = xart_store::Store::open_owner(
+                    false,
+                    module_parameters::xart_start_sector.value(),
+                )
+                .ok();
+                return Err(e);
+            }
+        };
+        let writable = new.writes_enabled();
+        let guard = new.guard_state();
+        *store = Some(new);
+        drop(store);
+        *self.host_store.lock() = Some(host);
+        *self.bio_index.lock() = index;
+        diag::xart_state(writable, guard);
+        self.keystore_only.store(false, Relaxed);
+        *cached = None;
+        drop(cached);
+
+        // The default path's ordering stays in run_bringup. SKS has already
+        // been initialised, so completion resumes immediately after that step.
+        self.finish_keystore_bringup();
+        diag::bringup_ended();
+        phase.completed();
+        Ok(())
     }
 
     /// Trusted-key callbacks can run as soon as probe publishes the source,
@@ -2880,7 +2977,7 @@ impl WorkItem<VERIFY_WORK_ID> for SepData {
 }
 
 
-struct SepDriver(Arc<SepData>);
+struct SepDriver(Arc<SepData>, attach::Attribute);
 
 // Deliberately not exported as a module alias: udev must not load the driver
 // on its own. The loader service loads it once the iBoot system container's
@@ -2900,7 +2997,8 @@ impl platform::Driver for SepDriver {
         _info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let dev: &device::Device<device::Core<'_>> = pdev.as_ref();
-        if module_parameters::provision_keybag.value() != 0
+        if !attach::requested()
+            && module_parameters::provision_keybag.value() != 0
             && module_parameters::xart_writes.value() == 0
         {
             dev_err!(dev, "provision_keybag=1 requires xart_writes=1\n");
@@ -2957,12 +3055,20 @@ impl platform::Driver for SepDriver {
             SepData::arm_settle(&data);
         }
 
-        Ok(SepDriver(data))
+        let attribute = match attach::Attribute::register(data.clone()) {
+            Ok(attribute) => attribute,
+            Err(e) => {
+                data.remove();
+                return Err(e);
+            }
+        };
+        Ok(SepDriver(data, attribute))
     }
 }
 
 impl Drop for SepDriver {
     fn drop(&mut self) {
+        self.1.unregister();
         self.0.remove();
     }
 }
