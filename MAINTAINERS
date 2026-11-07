@@ -2844,6 +2844,14 @@ S:	Maintained
 F:	Documentation/devicetree/bindings/spi/apple,qspi.yaml
 F:	drivers/spi/spi-apple-qspi.c
 
+ARM/APPLE SCALER DRIVER
+M:	Ryan Murray <ryan@aurorasilicon.org>
+L:	linux-media@vger.kernel.org
+S:	Maintained
+W:	https://aurora-silicon.github.io
+F:	Documentation/devicetree/bindings/media/apple,scaler.yaml
+F:	drivers/media/platform/apple/scaler/
+
 ARM/ARTPEC MACHINE SUPPORT
 M:	Jesper Nilsson <jesper.nilsson@axis.com>
 M:	Lars Persson <lars.persson@axis.com>
