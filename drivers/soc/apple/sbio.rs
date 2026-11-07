@@ -28,9 +28,47 @@ const LOCKOUT_LOCKED: u32 = 1;
 const SBIO_NOTIFY_LOCK_STATE: u8 = 0x01;
 /// The lock-state bit that is set while the enclave refuses matches.
 const LOCK_STATE_LOCKOUT: u16 = 0x40;
-/// Failed matches in a row after which Touch ID asks for the password, the
-/// limit macOS LocalAuthentication applies in a Touch ID prompt.
-const VERIFY_RETRY_LIMIT: u32 = 3;
+/// Failed matches in one prompt after which the prompt's match operation
+/// ends: macOS LocalAuthentication stops a Touch ID prompt after three NoMatch
+/// and offers the password, while the enclave stays unlocked and the next
+/// prompt offers Touch ID again.
+const PROMPT_RETRY_LIMIT: u32 = 3;
+/// Failed matches since the last match or password re-arm after which Touch
+/// ID is locked until a password authentication: the enclave's own limit
+/// (a macOS lock screen got five completed no-matches, then the user's lock
+/// state gained the lockout bit) and the documented "five unsuccessful
+/// attempts to match".
+const VERIFY_RETRY_LIMIT: u32 = 5;
+
+/// What a verify's outcome does to the prompt's match operation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PromptStep {
+    /// The prompt continues: its match operation stays open for the next touch.
+    KeepOpen,
+    /// The prompt is over (a match, an error, or its retry limit): end the
+    /// match operation.
+    End,
+}
+
+/// Decides the prompt's next step. `no_match` and `capture_retry` describe
+/// this touch (a compared no-match; a touch that gave no usable frame);
+/// `prompt_misses` and `total_misses` already count it.
+fn prompt_step(
+    no_match: bool,
+    capture_retry: bool,
+    prompt_misses: u32,
+    total_misses: u32,
+) -> PromptStep {
+    if capture_retry {
+        // Nothing was compared: macOS keeps imaging in the same operation.
+        return PromptStep::KeepOpen;
+    }
+    if no_match && prompt_misses < PROMPT_RETRY_LIMIT && total_misses < VERIFY_RETRY_LIMIT {
+        PromptStep::KeepOpen
+    } else {
+        PromptStep::End
+    }
+}
 /// Further frames of a no-match touch relayed before the retry pass ends.
 const NOMATCH_EXTRA_FRAMES: u32 = 3;
 /// How long the no-match tail waits for each extra frame of the same touch.
@@ -78,6 +116,26 @@ fn lockout_record_locked(raw: &[u8; LOCKOUT_RECORD_LEN]) -> bool {
 #[::kernel::macros::kunit_tests(apple_sep_touchid_lockout)]
 mod lockout_tests {
     use super::*;
+
+    #[test]
+    fn prompt_limit_ends_the_operation_not_touch_id() {
+        assert_eq!(prompt_step(true, false, 1, 1), PromptStep::KeepOpen);
+        assert_eq!(prompt_step(true, false, 2, 2), PromptStep::KeepOpen);
+        assert_eq!(prompt_step(true, false, 3, 3), PromptStep::End);
+        // A new prompt after three misses offers Touch ID again ...
+        assert_eq!(prompt_step(true, false, 1, 4), PromptStep::KeepOpen);
+        // ... until the fifth miss since the last match or password.
+        assert_eq!(prompt_step(true, false, 2, 5), PromptStep::End);
+        assert!(VERIFY_RETRY_LIMIT > PROMPT_RETRY_LIMIT);
+    }
+
+    #[test]
+    fn unusable_touch_keeps_the_prompt() {
+        assert_eq!(prompt_step(false, true, 0, 0), PromptStep::KeepOpen);
+        assert_eq!(prompt_step(false, true, 2, 4), PromptStep::KeepOpen);
+        // A match or an error ends it.
+        assert_eq!(prompt_step(false, false, 0, 0), PromptStep::End);
+    }
 
     #[test]
     fn record_round_trips() {
@@ -2339,11 +2397,16 @@ impl SepData {
                 *self.match_context.lock() = Some(evaluation);
                 self.match_scope_gen.store(open_gen, Relaxed);
                 self.match_scope_touches.store(1, Relaxed);
+                self.match_scope_misses.store(0, Relaxed);
                 evaluation
             }
         };
 
         let mut outcome = self.verify_one_image();
+        // A retry straight from the capture (no finger in time, partial
+        // contact, a damaged frame) compared nothing and needs no new
+        // bring-up; the touch is simply taken again in the same prompt.
+        let capture_retry = matches!(outcome, bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY));
         let touched_at = shim::boottime_ns();
         // The touch's frames are taken: stop imaging but keep watching the
         // finger, as macOS does right after the image cleanup. The next
@@ -2358,11 +2421,30 @@ impl SepData {
             outcome,
             bio::VerifyOutcome::Matched(_) | bio::VerifyOutcome::NoMatch
         );
-        // A no-match below the retry limit keeps the prompt open for its next
-        // touch; anything else ends the prompt's match operation.
-        let keep_open = matches!(outcome, bio::VerifyOutcome::NoMatch)
-            && self.bio_nomatch_streak.load(Relaxed).saturating_add(1) < VERIFY_RETRY_LIMIT
-            && !self.enclave_reports_lockout();
+        // A no-match below the prompt's and the overall retry limits, or a
+        // touch that gave no usable frame, keeps the prompt open for its next
+        // touch, as macOS keeps the match operation until LocalAuthentication
+        // ends the prompt; anything else ends the prompt's match operation.
+        let no_match = matches!(outcome, bio::VerifyOutcome::NoMatch);
+        let miss = u32::from(no_match);
+        let prompt_misses = self.match_scope_misses.load(Relaxed).saturating_add(miss);
+        let total_misses = self.bio_nomatch_streak.load(Relaxed).saturating_add(miss);
+        self.match_scope_misses.store(prompt_misses, Relaxed);
+        let step = prompt_step(no_match, capture_retry, prompt_misses, total_misses);
+        let keep_open = !self.enclave_reports_lockout() && step == PromptStep::KeepOpen;
+        if no_match
+            && !keep_open
+            && prompt_misses >= PROMPT_RETRY_LIMIT
+            && total_misses < VERIFY_RETRY_LIMIT
+        {
+            dev_info!(
+                self.dev,
+                "verify: {} failed matches in this authentication; ending its match operation as macOS ends a Touch ID prompt. Touch ID stays available ({} of {} failed attempts before a password is required)\n",
+                prompt_misses,
+                total_misses,
+                VERIFY_RETRY_LIMIT
+            );
+        }
         // macOS hands a no-match to LocalAuthentication as soon as the touch
         // is finished (MATCH_POLICY and the image cleanup done), and saves the
         // lockout record and collects the background result after it, while
@@ -2375,7 +2457,8 @@ impl SepData {
         if keep_open {
             dev_info!(
                 self.dev,
-                "verify: no match; the match operation stays open for the next touch of this authentication\n"
+                "verify: {}; the match operation stays open for the next touch of this authentication\n",
+                if no_match { "no match" } else { "no usable frame" }
             );
         } else {
             match self.sbio_call(&crate::sbio::sbio_match_cancel()) {
@@ -2426,11 +2509,13 @@ impl SepData {
             }
         }
         // Keep the sensor up for the next verify unless the sensor itself
-        // failed; then the next verify brings it up from a power cycle.
-        if matches!(
-            outcome,
-            bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR) | bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY)
-        ) {
+        // failed or the retry came after the capture; then the next verify
+        // brings it up from a power cycle. A capture retry keeps it: the
+        // prompt's match operation is still open, and a new registration
+        // would clear the sensor state under it.
+        if matches!(outcome, bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR))
+            || (matches!(outcome, bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY)) && !capture_retry)
+        {
             self.sensor_kept.store(false, Relaxed);
             self.forget_finger_lift();
             sensor::power(false);
@@ -2450,9 +2535,10 @@ impl SepData {
         {
             let _ = self.enter_lockout();
         }
-        // The retry limit is the host's, as on macOS: LocalAuthentication
-        // stops offering Touch ID after three failed matches and asks for the
-        // password, while the enclave itself stays unlocked.
+        // Five failed matches since the last match or password lock Touch ID
+        // until a password authentication, as the enclave itself does on
+        // macOS. Recorded on the host too, so the lockout holds even if the
+        // enclave's own announcement is missed, and across a restart.
         if matches!(outcome, bio::VerifyOutcome::NoMatch)
             && !self.bio_lockout.load(Relaxed)
             && self.bio_nomatch_streak.load(Relaxed) >= VERIFY_RETRY_LIMIT
@@ -4564,13 +4650,14 @@ impl SepData {
             && (last as u16) & LOCK_STATE_LOCKOUT != 0
     }
 
-    /// Locks Touch ID on the host after `VERIFY_RETRY_LIMIT` failed matches in
-    /// a row. A password authentication re-arms it, and the record keeps the
-    /// lock across a restart, as for the enclave's own lockout.
+    /// Locks Touch ID on the host after `VERIFY_RETRY_LIMIT` failed matches
+    /// since the last match or re-arm. A password authentication re-arms it,
+    /// and the record keeps the lock across a restart, as for the enclave's
+    /// own lockout.
     fn enter_retry_limit(&self) {
         dev_info!(
             self.dev,
-            "verify: {} failed attempts in a row; Touch ID is locked until a password authentication (the retry limit)\n",
+            "verify: {} failed attempts since the last match or password; Touch ID is locked until a password authentication (the retry limit)\n",
             self.bio_nomatch_streak.load(Relaxed)
         );
         self.bio_lockout.store(true, Relaxed);

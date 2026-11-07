@@ -776,7 +776,7 @@ struct SepData {
     // The refusal of a verify during a lockout has been logged.
     bio_lockout_logged: Atomic<bool>,
 
-    // Failed matches since the last match or re-arm, for the log.
+    // Failed matches since the last match or re-arm, across prompts.
     bio_nomatch_streak: Atomic<u32>,
 
     // Opens of the Touch ID device. One open is one prompt: fprintd claims
@@ -789,6 +789,9 @@ struct SepData {
 
     // Touches in that prompt so far.
     match_scope_touches: Atomic<u32>,
+
+    // Failed matches in that prompt so far.
+    match_scope_misses: Atomic<u32>,
 
     // The enclave's most recent biometric lock-state notification: the
     // state in bits 0-15 and the user in bits 16-47, or 0 before the first.
@@ -1052,6 +1055,7 @@ impl SepData {
                 bio_open_gen: Atomic::new(0),
                 match_scope_gen: Atomic::new(0),
                 match_scope_touches: Atomic::new(0),
+                match_scope_misses: Atomic::new(0),
                 bio_lock_state: Atomic::new(0),
                 bio_lock_state_seq: Atomic::new(0),
                 store <- new_mutex!(store),
