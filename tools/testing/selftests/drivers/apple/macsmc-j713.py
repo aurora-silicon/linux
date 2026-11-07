@@ -91,21 +91,32 @@ static int apple_smc_write_u64(struct apple_smc *smc, smc_key key, u64 value)
     return write_result;
 }
 ''']
-    for name in ("macsmc_gpio_is_j700_pcio", "macsmc_gpio_is_j713_reg_on", "macsmc_gpio_key",
+    for name in ("macsmc_gpio_is_j700_pcio", "macsmc_gpio_has_output_template",
+                 "macsmc_gpio_is_j713_reg_on", "macsmc_gpio_key",
                  "macsmc_gpio_get_direction", "macsmc_gpio_get", "macsmc_gpio_set"):
         marker = re.search(r"^static [^\n]+\b" + name + r"\(", source, re.M).group()
         parts.append(block(source, marker))
     # Compile the actual probe assignments, so the test also checks board selection.
     assignments = re.search(r"\tsmcgp->j713 = [^;]+;\n\tmutex_init\([^;]+;", source).group()
     parts += [r'''
-static const char *const boards[] = { NULL, "apple,j713", "apple,j715" };
+/* No board, then every M4 Mac with the Airs' radio port. */
+static const char *const boards[] = {
+    NULL, "apple,j713", "apple,j715", "apple,j604", "apple,j623", "apple,j624",
+    "apple,j773g",
+};
+#define NUM_BOARDS (sizeof(boards) / sizeof(*boards))
 static unsigned int board;
 static bool of_machine_is_compatible(const char *name)
 {
-    assert(!strcmp(name, "apple,j713") || !strcmp(name, "apple,j715"));
+    bool known = false;
+    for (unsigned int i = 1; i < NUM_BOARDS; i++)
+        known |= !strcmp(name, boards[i]);
+    assert(known);
     return board && !strcmp(name, boards[board]);
 }
-''', block(t8132, "static inline bool apple_t8132_air("), r'''
+''', block(t8132, "static inline bool apple_t8132_air("),
+        block(t8132, "static inline bool apple_t8132_pro_mini_imac("),
+        block(t8132, "static inline bool apple_t8132_managed_radio("), r'''
 static void profile_init(struct macsmc_gpio *smcgp)
 {
 ''', assignments, r'''
@@ -153,7 +164,7 @@ int main(void)
     CHECK(!g.j713_reg_on_lock.held && rw_count == 0 && writes64 == 0);
 
     /* Every other board/namespace/line retains the generic GPIO operations. */
-    for (unsigned int b = 0; b < 3; b++)
+    for (unsigned int b = 0; b < NUM_BOARDS; b++)
         for (unsigned int lower = 0; lower < 2; lower++)
             for (unsigned int line = 0; line < MAX_GPIO; line++) {
                 reset(&g, b, lower ? _SMC_KEY("gp\0\0") : _SMC_KEY("gP\0\0"));

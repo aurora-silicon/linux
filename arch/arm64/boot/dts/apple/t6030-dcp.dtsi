@@ -1,16 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * T6030 internal display and the first external display processor.
- *
- * Every new device node stays status = "disabled". The display gate enables
- * the internal DCP, its mailbox, the two display DARTs and the display
- * subsystem only after the bootloader has set apple,t6030-handoff = <1>.
- * The external processor stays disabled until its own handoff check passes.
- * Compatibles are t6030-specific, so a kernel that does not know them leaves
- * the nodes unbound.
- *
- * Register values are the ones in the tested j516s boot device tree.
- * The panel child is board-specific and is added by the board file.
+ * T6030 internal display and the first external display processor, from
+ * the tested J516S ADT. Every node stays disabled until the display gate
+ * takes them over after the boot loader's handoff (apple,t6030-handoff).
  */
 
 / {
@@ -103,7 +95,6 @@
 		};
 	};
 
-
 	dcpext_dart: iommu@2d130c000 {
 		compatible = "apple,t6030-dart", "apple,t8110-dart";
 		reg = <0x2 0xd130c000 0x0 0x4000>;
@@ -161,12 +152,7 @@
 		ranges;
 		status = "disabled";
 
-		/*
-		 * A route stays disabled until the display gate enables it
-		 * together with this processor. An available route with no
-		 * registered mode switch would make the Type-C port wait for
-		 * one forever.
-		 */
+		/* Enabled with the processor; until then a port would wait for it. */
 		typec-routes {
 			#address-cells = <1>;
 			#size-cells = <0>;
