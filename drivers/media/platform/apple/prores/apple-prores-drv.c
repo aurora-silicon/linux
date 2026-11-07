@@ -658,7 +658,8 @@ static void apr_device_run(void *priv)
 	 * The engine's ring wrap protocol is not known, so start again at the
 	 * beginning of the ring instead of wrapping. The engine is idle here.
 	 */
-	if (!apr->ring_ready || apr->head + apr->variant->desc_bytes > apr->variant->ring_bytes)
+	if (!apr->ring_ready ||
+	    apr->head + apr->variant->desc_bytes > apr->variant->ring_bytes)
 		apr_hw_init(apr);
 	ret = apr->variant->build_desc(&f, apr->ring + apr->head);
 	if (ret) {
@@ -1180,7 +1181,7 @@ static int apr_probe(struct platform_device *pdev)
 
 	for (i = 0; i < apr->variant->num_regs; i++) {
 		regs[i] = devm_platform_ioremap_resource_byname(pdev,
-						apr->variant->reg_names[i]);
+							     apr->variant->reg_names[i]);
 		if (IS_ERR(regs[i]))
 			return PTR_ERR(regs[i]);
 	}

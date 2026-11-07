@@ -76,7 +76,8 @@ allOf:
   - if:
       properties:
         compatible:
-          const: apple,t6000-prores
+          contains:
+            const: apple,t6000-prores
     then:
       properties:
         interrupts:
