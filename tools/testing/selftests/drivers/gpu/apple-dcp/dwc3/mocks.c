@@ -192,6 +192,12 @@ static bool of_machine_is_compatible(const char *name)
 {
 	return !strcmp(name, "apple,t8140");
 }
+/* As in <linux/soc/apple/t8132.h>. */
+static inline bool apple_t8132_air(void)
+{
+	return of_machine_is_compatible("apple,j713") ||
+	       of_machine_is_compatible("apple,j715");
+}
 
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(p, v) ((p) = (v))
