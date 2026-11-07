@@ -86,6 +86,9 @@ ASAHI_TESTS = {
     'brcmf-assoc-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('short-ie', 'header-length', 'skb-capacity', 'cmplt-header'), out('--output')),
     'brcmf-bss-tests.py': [(out(), PASS)],
+    # The old revision reports a failed join against the last associated BSS.
+    'brcmf-join-bssid-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('stale-target', 'zero-named', 'no-call'), out()),
     'brcmf-pcie-dma-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('narrow-stream', 'ignore-aperture', 'revision-wide'), out('--output')),
     'brcmf-roam-tests.py': [(out(), PASS)],
@@ -114,8 +117,8 @@ ASAHI_TESTS = {
     'g15-stats-drain-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
     'g15-zero-words-tests.py': [([], PASS), (['--mutations'], PASS)],
     'g17-telemetry-integration-tests.py': [(out(), PASS)]
-        + mutations('--mutation', ('fields', 'range', 'timestamp', 'age',
-                                   'quarantine', 'epoch', 'legacy-format'), out()),
+        + mutations('--mutation', ('fields', 'range', 'timestamp', 'age', 'delivery',
+                                   'quarantine', 'epoch', 'cutoff', 'whole-batch', 'legacy-format'), out()),
     'g17-admission-deadline-tests.py': [([], PASS)],
     'g17-admission-order-tests.py': [([], PASS)],
     'g17-capacity-fault-tests.py': [([], PASS)],
@@ -149,7 +152,8 @@ ASAHI_TESTS = {
     'pmp-j613-hwmon-tests.py': [([], PASS)],
     'pmu-rtc-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('ack-clobber', 'arm-ack', 'offset-seconds',
-                                   'offset-sign', 'event-bit', 'wrong-base'), out()),
+                                   'offset-sign', 'event-bit', 'wrong-control',
+                                   'maverick-event', 'stowe-offset'), out()),
     'qspi-nvram-tests.py': [(out('--output'), PASS)],
     'rtkit-oslog-tests.py': [(out(), PASS)]
         + mutations('--mutate', ('admission', 'channel', 'counter', 'reset', 'buffer'), out()),
@@ -176,7 +180,7 @@ ASAHI_RUST = ['m3-batching-tests.rs', 'm3-runtime-tests.rs', 'pmp-bootargs-tests
 ASAHI_SHELL = ['g17-ray-query-timeout-tests.sh']
 
 # Production G17 decoder vectors also build directly with rustc --test.
-ASAHI_RUST.append('g17-telemetry-tests.rs')
+ASAHI_RUST += ['g17-telemetry-tests.rs', 'legacy-frequency-tests.rs']
 
 # Python that runs on the host but imports its neighbours, so it keeps the
 # script directory on sys.path (-E -s instead of -I).

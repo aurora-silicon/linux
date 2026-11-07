@@ -11,6 +11,7 @@
 #include <linux/iopoll.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
@@ -18,6 +19,8 @@
 #include <linux/mfd/syscon.h>
 #include <linux/reset-controller.h>
 #include <linux/module.h>
+#include <linux/soc/apple/pmgr-pwrstate.h>
+#include <linux/soc/apple/t8132.h>
 
 #define APPLE_PMGR_RESET        BIT(31)
 #define APPLE_PMGR_AUTO_ENABLE  BIT(28)
@@ -277,6 +280,62 @@ static int apple_pmgr_ps_power_off(struct generic_pm_domain *genpd)
 	return ret;
 }
 
+/**
+ * apple_pmgr_ps_cycle() - power gate a domain and turn it on again
+ * @np: the power state node, as named by a consumer's power-domains
+ *
+ * For a coprocessor that can stop in a state only a power-off of this domain
+ * clears, while other devices in the domain (its DARTs) hold it on at
+ * runtime. The caller owns every device in the domain and keeps them idle;
+ * every subdomain must already be off. genpd's view does not change: the
+ * domain is on before and after, as is its automatic power management.
+ *
+ * Return: 0, -EBUSY if a subdomain is on, -EPERM for a domain Linux does not
+ * own, -EINVAL if the domain is off, or the error of a failed transition.
+ */
+int apple_pmgr_ps_cycle(struct device_node *np)
+{
+	struct platform_device *pdev = of_find_device_by_node(np);
+	struct apple_pmgr_ps *ps;
+	struct gpd_link *link;
+	unsigned long flags;
+	int ret, on;
+
+	if (!pdev)
+		return -ENODEV;
+	ps = platform_get_drvdata(pdev);
+	if (!ps) {
+		ret = -EPROBE_DEFER;
+		goto out;
+	}
+	if (ps->firmware_owned || ps->inherited_on) {
+		ret = -EPERM;
+		goto out;
+	}
+
+	spin_lock_irqsave(&ps->genpd.slock, flags);
+	if (ps->genpd.status != GENPD_STATE_ON) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+	list_for_each_entry(link, &ps->genpd.parent_links, parent_node) {
+		if (link->child->status == GENPD_STATE_ON) {
+			ret = -EBUSY;
+			goto unlock;
+		}
+	}
+	ret = apple_pmgr_ps_set(&ps->genpd, APPLE_PMGR_PS_PWRGATE, false);
+	on = apple_pmgr_ps_set(&ps->genpd, APPLE_PMGR_PS_ACTIVE,
+			       !ps->no_auto_enable && !ps->no_auto_pm);
+	ret = ret ?: on;
+unlock:
+	spin_unlock_irqrestore(&ps->genpd.slock, flags);
+out:
+	put_device(&pdev->dev);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmgr_ps_cycle);
+
 static void apple_pmgr_ps_set_system_sleep(struct device *dev, bool sleep)
 {
 	struct apple_pmgr_ps *ps = dev_get_drvdata(dev);
@@ -473,14 +532,13 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 
 	t8132 = of_device_is_compatible(node, "apple,t8132-pmgr-pwrstate");
 	/*
-	 * The original J713 loader tree exposes domains Linux cannot access.
-	 * The early compatibility adapter supplies the board's explicit status
-	 * and ownership before population; fail closed if it was not enabled.
-	 * Other T8132 boards keep their own domain descriptions and behaviour.
+	 * On the M4 firmware path some domains are the firmware's, which Linux
+	 * cannot access. The early compatibility adapter supplies the explicit
+	 * status and ownership before population; fail closed if it was not
+	 * enabled. Other firmware keeps the tree's own domain descriptions.
 	 */
-	if (t8132 && of_machine_is_compatible("apple,j713") &&
-	    !of_property_present(node, "status"))
-		return dev_err_probe(dev, -ENODEV, "missing J713 power-domain policy\n");
+	if (t8132 && apple_t8132_firmware_path() && !of_property_present(node, "status"))
+		return dev_err_probe(dev, -ENODEV, "missing M4 power-domain policy\n");
 
 	tvm = of_parse_phandle(node, "power-domains", 0);
 	if (t8132 && tvm)

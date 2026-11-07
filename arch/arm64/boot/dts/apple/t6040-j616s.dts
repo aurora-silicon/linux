@@ -26,6 +26,30 @@
 	brcm,board-type = "apple,hostomel";
 };
 
+&smc {
+	smc_gpio_low: gpio-low {
+		compatible = "apple,smc-low-gpio";
+		gpio-controller;
+		#gpio-cells = <2>;
+		apple,output-templates = <0xe 0x00800000>;
+	};
+};
+
+&aop_spmi0 {
+	status = "okay";
+
+	stockholm: nfc@9 {
+		compatible = "apple,stockholm-nci";
+		reg = <9 SPMI_USID>;
+		interrupt-parent = <&aop_spmi0>;
+		interrupts = <229 IRQ_TYPE_EDGE_RISING>,
+			     <230 IRQ_TYPE_EDGE_RISING>,
+			     <227 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "host-wake", "data-ready", "error";
+		enable-gpios = <&smc_gpio_low 0xe GPIO_ACTIVE_HIGH>;
+	};
+};
+
 &panel {
 	compatible = "apple,panel-j616", "apple,panel-mini-led", "apple,panel";
 	width-mm = <345>;
@@ -57,4 +81,87 @@
  */
 &mesa {
 	firmware-name = "apple/mesacal-j616s.bin", "apple/msrk-j616s.bin";
+};
+
+&i2c4 {
+	sd_card_control: card-control@20 {
+		compatible = "apple,t6041-sd-card-control", "apple,sd-card-control";
+		reg = <0x20>;
+		status = "disabled";
+	};
+};
+
+&i2c8 {
+	display_pcon: display-converter@8 {
+		compatible = "apple,t6041-display-pcon", "apple,display-pcon";
+		reg = <0x8>;
+		status = "disabled";
+	};
+};
+
+&spi4 {
+	tcon: panel-controller@0 {
+		compatible = "parade,dp855";
+		reg = <0>;
+		status = "disabled";
+
+		/* ADT display-temp-sens1..3 are downstream of the TCON. */
+		i2c {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			temperature-sensor@70 {
+				compatible = "ti,tmp103";
+				reg = <0x70>;
+				status = "disabled";
+			};
+
+			temperature-sensor@71 {
+				compatible = "ti,tmp103";
+				reg = <0x71>;
+				status = "disabled";
+			};
+
+			temperature-sensor@72 {
+				compatible = "ti,tmp103";
+				reg = <0x72>;
+				status = "disabled";
+			};
+		};
+	};
+};
+
+&i2c6 {
+	retimer@18 {
+		compatible = "apple,t6041-atcrt", "apple,atcrt";
+		reg = <0x18>;
+		status = "disabled";
+	};
+	retimer@19 {
+		compatible = "apple,t6041-atcrt", "apple,atcrt";
+		reg = <0x19>;
+		status = "disabled";
+	};
+	retimer@1a {
+		compatible = "apple,t6041-atcrt", "apple,atcrt";
+		reg = <0x1a>;
+		status = "disabled";
+	};
+};
+
+/* Scaler/CSC (MSR) and its DART, proven on this board. */
+&ps_msr0 {
+	status = "okay";
+};
+
+&ps_msr0_ase_core {
+	status = "okay";
+};
+
+&scaler0_dart {
+	status = "okay";
+};
+
+&scaler0 {
+	status = "okay";
 };

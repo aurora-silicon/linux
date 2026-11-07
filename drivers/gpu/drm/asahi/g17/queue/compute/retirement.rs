@@ -6,7 +6,7 @@
 use crate::g17::initdata::{CompletionFold, ComputeCompletion};
 use kernel::prelude::*;
 
-pub(crate) const IN_FLIGHT: usize = 16;
+pub(crate) const IN_FLIGHT: usize = crate::hw::t8140::queues::COMPUTE_DEPTH;
 pub(crate) const RECORD_SLOTS: usize = 32;
 const QIDS: usize = 128;
 const TIME_MASK: u64 = 0x003f_ffff_ffff_ffff;
