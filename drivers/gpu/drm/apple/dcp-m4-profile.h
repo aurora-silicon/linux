@@ -9,6 +9,7 @@ struct dcp_m4_profile {
 	const char *name;
 	const char *machine;		/* machine compatible */
 	u32 panel_width, panel_height;
+	u32 notch_rows;			/* rows the boot loader may hide */
 	u32 boot_stride;		/* D101: inherited framebuffer stride */
 	u32 swap_size;			/* A407 input */
 	u32 swap_surface;		/* plane-0 surface */
@@ -40,7 +41,8 @@ static const u32 dcp_m4_timing_j713[2][8] = {
 
 static const struct dcp_m4_profile dcp_m4_profile_j713 = {
 	.name = "J713", .machine = "apple,j713",
-	.panel_width = 2560, .panel_height = 1664, .boot_stride = 10240,
+	.panel_width = 2560, .panel_height = 1664, .notch_rows = 64,
+	.boot_stride = 10240,
 	.swap_size = 0x1bd8, .swap_surface = 0x588, .swap_dva = 0xe38,
 	.swap_nullable = 0x1bcb, .swap_tail = 0x1bd6, .swap_nits = 0x35e,
 	.swap_intent = 0x17c,
@@ -60,7 +62,8 @@ static const u32 dcp_m4_timing_j715[2][8] = {
 /* The J715: the same firmware ABI with a 2880x1864 panel. */
 static const struct dcp_m4_profile dcp_m4_profile_j715 = {
 	.name = "J715", .machine = "apple,j715",
-	.panel_width = 2880, .panel_height = 1864, .boot_stride = 11520,
+	.panel_width = 2880, .panel_height = 1864, .notch_rows = 64,
+	.boot_stride = 11520,
 	.swap_size = 0x1bd8, .swap_surface = 0x588, .swap_dva = 0xe38,
 	.swap_nullable = 0x1bcb, .swap_tail = 0x1bd6, .swap_nits = 0x35e,
 	.swap_intent = 0x17c,
@@ -83,7 +86,8 @@ static const u32 dcp_m4_timing_j604[2][8] = {
  */
 static const struct dcp_m4_profile dcp_m4_profile_j604 = {
 	.name = "J604", .machine = "apple,j604",
-	.panel_width = 3024, .panel_height = 1964, .boot_stride = 12096,
+	.panel_width = 3024, .panel_height = 1964, .notch_rows = 74,
+	.boot_stride = 12096,
 	.swap_size = 0x1bd8, .swap_surface = 0x588, .swap_dva = 0xe38,
 	.swap_nullable = 0x1bcb, .swap_tail = 0x1bd6, .swap_nits = 0x35e,
 	.swap_intent = 0x17c,
