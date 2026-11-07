@@ -74,6 +74,12 @@
 	};
 };
 
+/* The full 3024x1964 panel including the notch rows, 254 ppi. */
+&dcp {
+	apple,panel-width-mm = <302>;
+	apple,panel-height-mm = <196>;
+};
+
 &sound_jack {
 	compatible = "apple,j604-macaudio-jack", "apple,macaudio";
 	model = "MacBook Pro J604 Jack";
