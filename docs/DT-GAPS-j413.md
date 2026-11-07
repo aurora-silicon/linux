@@ -1,5 +1,8 @@
 # J413 device-tree audit
 
+Status: partial offline audit; the task's exhaustive-property and installed-DTB
+acceptance criteria are not yet established.
+
 Audit date: 2026-11-07. Board: **J413, M2 MacBook Air, T8112**.
 Integration baseline: `43c790fed6bb57a12d7ee3df474a15da790b56e6`.
 
@@ -85,10 +88,10 @@ do not automatically replace that set. An ANE status-only edit within the
 old set is recorded separately. Therefore a baseline-source `disabled` value
 must not be presented as a fresh observation of the executing J413 tree.
 
-The appendix compares compiled source at
+The queued appendix comparison will compare compiled source at
 `04a63b11701363386e3691b7ffa7e64eef477fa7` and
 `43c790fed6bb57a12d7ee3df474a15da790b56e6`, resolving phandles to paths.
-This is the exact source delta, with an explicit installed-state limitation:
+The intended result is the exact source delta, with an installed-state limitation:
 no current `boot.bin` or live DTB was read in this offline task.
 
 Material changes missed by that baseline include five-cell display DART
@@ -104,8 +107,8 @@ accounts for every fallback kernel. No boot-chain change was made here.
 
 ## Verification and remaining acceptance work
 
-The result records controller buildbox receipts for binding and DT validation
-and generated resource/frozen-delta appendices. Whole-board schema diagnostics
+Controller buildbox binding/DT checks and resource/frozen-delta appendices
+are queued; no validation pass is claimed yet. Whole-board schema diagnostics
 must be reported independently of a focused binding pass: Kbuild's successful
 exit status does not establish a clean `dtbs_check` result.
 

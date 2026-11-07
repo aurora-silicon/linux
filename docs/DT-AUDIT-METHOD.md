@@ -81,7 +81,7 @@ property parity requires separate firmware/driver work.
 
 Both reference Macs are recorded as using the 7.1 DTB set with source baseline
 `04a63b11701363386e3691b7ffa7e64eef477fa7` inside `boot.bin`.
-The appendices compare compiled baseline and integration DTBs after resolving
+The queued appendix work compares compiled baseline and integration DTBs after resolving
 phandles to paths. They exclude phandle allocation and symbol-table churn.
 Node renames, additions, removals and changed properties remain visible.
 

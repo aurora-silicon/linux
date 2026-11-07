@@ -1,5 +1,8 @@
 # J316s device-tree audit
 
+Status: partial offline audit; the task's exhaustive-property and installed-DTB
+acceptance criteria are not yet established.
+
 Audit date: 2026-11-07. Integration baseline:
 `43c790fed6bb57a12d7ee3df474a15da790b56e6`.
 
@@ -90,7 +93,8 @@ uses five-cell DART IOMMU specifiers on display and other devices.
 The source comparison is **04a63b11701363386e3691b7ffa7e64eef477fa7 →
 43c790fed6bb57a12d7ee3df474a15da790b56e6**, with phandle numbering resolved
 to paths. The generated appendix lists the exact compiled property/node
-changes. It describes the frozen *source baseline*, not a newly read installed
+changes once the queued buildbox comparison completes. That result will
+describe the frozen *source baseline*, not a newly read installed
 `boot.bin`. Local status edits or loader fixups require an installed-DTB
 snapshot to establish the exact executing delta. No target was accessed.
 
@@ -104,7 +108,7 @@ The proposed motion and peripheral-bus nodes are additional to that baseline.
 ## Verification and remaining acceptance work
 
 Buildbox receipts and the generated resource/frozen-delta appendices are
-recorded with this audit's result. Hardware boot, sensor samples, NFC,
+pending in controller buildbox slots. Hardware boot, sensor samples, NFC,
 display routing, wake and audio behavior were not tested. Full board schema
 diagnostics must be distinguished from the focused binding check; a zero
 `make` exit status alone does not mean `dtbs_check` is clean.
