@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,t8152-jpeg-complex.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T8152 jpeg codec and shared register windows
+
+maintainers:
+  - Ryan Murray <ryan@aurorasilicon.org>
+
+description: |
+  JPEG codec and shared register windows on T8152. This describes the complete register complex,
+  including auxiliary control and status apertures shared with firmware.
+  It does not imply compatibility with an earlier generation's driver.
+  The node remains disabled until ownership of the register windows and
+  the firmware handoff have been established. Calibration, firmware and
+  programming sequences are supplied separately by the boot environment.
+
+select:
+  properties:
+    compatible:
+      contains:
+        const: apple,t8152-jpeg-complex
+  required:
+    - compatible
+
+properties:
+  compatible:
+    items:
+      - const: apple,t8152-jpeg-complex
+      - const: apple,jpeg-complex
+
+  reg:
+    description: Controller register apertures, in hardware interface order.
+    minItems: 2
+    maxItems: 2
+
+  interrupts:
+    description: Interrupt lines wired to the system interrupt controller.
+    minItems: 1
+    maxItems: 1
+
+  iommus:
+    description: DMA translation streams used by this controller.
+    minItems: 1
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false

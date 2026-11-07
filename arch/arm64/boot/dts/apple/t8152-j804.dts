@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/dts-v1/;
+
+#include "t8152.dtsi"
+#include "t8152-j804-peripherals.dtsi"
+
+/ {
+	model = "Apple MacBook Pro (J804)";
+	compatible = "apple,j804", "apple,t8152", "apple,arm-platform";
+};
+
+&smc {
+	status = "disabled";
+};
+
+&m6_e_cpufreq {
+	status = "disabled";
+};
+
+&m6_pm_cpufreq {
+	status = "disabled";
+};
