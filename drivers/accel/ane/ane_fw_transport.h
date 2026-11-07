@@ -311,7 +311,7 @@ static inline int ane_fw_transport_arm(struct ane_fw_transport *t)
 }
 
 /*
- * The H17 firmware's direct submission path reuses the engine's current BAR
+ * The H16/H17 firmware's direct submission path reuses the engine's current BAR
  * context. When that context came from a different program, a job (of a new
  * or previously loaded program, even after the earlier one was destroyed) can
  * write through the earlier program's output binding. Bit 0 of the request
@@ -319,8 +319,7 @@ static inline int ane_fw_transport_arm(struct ane_fw_transport *t)
  * installs a fresh BAR context. Queue the first EXECUTE after any change of program, process or
  * program lifetime; later jobs of the same process keep the direct path. This
  * lifts the one-program-per-firmware-session limit. Applies to the pool copy,
- * so every published EXECUTE follows the rule. H16 shares the firmware
- * architecture but has not executed under Linux yet; it is left unchanged.
+ * so every published EXECUTE follows the rule.
  */
 static inline void
 ane_fw_transport_bar_context(struct ane_fw_transport *t, u8 *copy, size_t size)
@@ -350,12 +349,11 @@ ane_fw_transport_bar_context(struct ane_fw_transport *t, u8 *copy, size_t size)
 
 /*
  * Whether one firmware session may run several programs: the transport
- * queues the first EXECUTE after every program change (H17, above). H16
- * shares the firmware design, but the rule is unconfirmed there.
+ * queues the first EXECUTE after every program change (above).
  */
 static inline bool ane_fw_transport_switch_safe(const struct ane_fw_transport *t)
 {
-	return t->soc->chip_family == 17;
+	return t->soc->chip_family == 16 || t->soc->chip_family == 17;
 }
 
 /* Commands are copied into a monotonic pool arena, never external DMA memory. */
