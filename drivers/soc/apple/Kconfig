@@ -79,6 +79,16 @@ config APPLE_CLUSTER_PWRGATE
 	  started and PMGR never powered on, such as the boot CPU, only
 	  clock-gates in WFI.
 
+config APPLE_T8140_SLEEP
+	bool "Apple T8140 system sleep at EL2"
+	depends on ARM64 && (ARCH_APPLE || COMPILE_TEST)
+	depends on HOTPLUG_CPU && SUSPEND
+	help
+	  Powers the secondary CPUs off and suspends the system to RAM on an
+	  Apple T8140 whose kernel runs directly at EL2, with no monitor to ask.
+	  It does nothing unless the boot object asks for it through
+	  /chosen/aurora,s2r-mailbox.
+
 config APPLE_RTKIT
 	tristate "Apple RTKit co-processor IPC protocol"
 	depends on APPLE_MAILBOX
