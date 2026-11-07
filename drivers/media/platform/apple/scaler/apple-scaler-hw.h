@@ -56,6 +56,7 @@ struct asc_csc {
  * @vsub: vertical chroma subsampling of plane 1
  * @yuv: Y'CbCr format (needs the CSC to pair with RGB)
  * @alpha: carries an alpha channel
+ * @wide: samples are 16 bits in memory (more than 8 significant bits)
  */
 struct asc_format {
 	u32 fourcc;
@@ -69,7 +70,49 @@ struct asc_format {
 	u8 vsub;
 	bool yuv;
 	bool alpha;
+	bool wide;
 };
+
+/* One register write: byte offset in the MSR aperture and value. */
+struct asc_reg {
+	u32 off;
+	u32 val;
+};
+
+#define ASC_MAX_PLANES		2
+#define ASC_JOB_MAX_WRITES	224
+
+/**
+ * struct asc_image - one side of a job
+ * @fmt: pixel format
+ * @width: width in pixels
+ * @height: height in pixels
+ * @dva: DMA address of each colour plane
+ * @stride: bytes per line of each colour plane
+ */
+struct asc_image {
+	const struct asc_format *fmt;
+	u32 width;
+	u32 height;
+	u64 dva[ASC_MAX_PLANES];
+	u32 stride[ASC_MAX_PLANES];
+};
+
+/**
+ * struct asc_job - a complete conversion
+ * @src: image read
+ * @dst: image written
+ * @csc: colour conversion, or NULL to pass components through
+ * @transform_id: tag the engine carries for this job
+ */
+struct asc_job {
+	struct asc_image src;
+	struct asc_image dst;
+	const struct asc_csc *csc;
+	u32 transform_id;
+};
+
+int asc_job_build(const struct asc_job *job, struct asc_reg *w, unsigned int max);
 
 const struct asc_format *asc_find_format(u32 fourcc);
 const struct asc_format *asc_format_by_index(unsigned int index);
