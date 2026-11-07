@@ -66,6 +66,8 @@ module_param(s2idle_keep_link, bool, 0644);
 MODULE_PARM_DESC(s2idle_keep_link, "Keep tunneled links up through suspend-to-idle");
 
 static int link_up_timeout = 500;
+/* Fundamental resets of a conventional port whose endpoint does not train. */
+#define LINK_RESET_RETRIES	2
 module_param(link_up_timeout, int, 0644);
 MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 
@@ -422,6 +424,8 @@ struct apple_pcie_port {
 	struct device_node	*np;
 	void __iomem		*base;
 	void __iomem		*phy;
+	/* PERST# of a conventional port with a single reset line. */
+	struct gpio_desc	*perst;
 	struct irq_domain	*domain;
 	struct list_head	entry;
 	unsigned long		*sid_map;
@@ -1612,6 +1616,8 @@ static int apple_pcie_setup_link(struct apple_pcie *pcie,
 		num_aux_resets++;
 	}
 	dev_info(pcie->dev, "Using %u auxiliary PERST#\n", num_aux_resets);
+	if (!num_aux_resets)
+		port->perst = reset;
 
 	pwren = devm_fwnode_gpiod_get(pcie->dev, of_fwnode_handle(np), "pwren",
 					    GPIOD_ASIS, "PWREN");
@@ -1688,6 +1694,45 @@ static int apple_pcie_setup_link(struct apple_pcie *pcie,
 	}
 
 	return 0;
+}
+
+/* DesignWare port logic, in the root port's configuration space. */
+#define DWC_PORT_DEBUG0			0x728
+#define   DWC_PORT_DEBUG0_LTSSM		GENMASK(5, 0)
+
+static u32 apple_pcie_port_ltssm(struct apple_pcie *pcie,
+				 struct apple_pcie_port *port)
+{
+	return FIELD_GET(DWC_PORT_DEBUG0_LTSSM,
+			 readl_relaxed(pcie->cfg->win + (port->idx << 15) +
+				       DWC_PORT_DEBUG0));
+}
+
+/*
+ * Give an endpoint that did not train another fundamental reset: stop the
+ * LTSSM, assert PERST#, and release it with the timing of the first bring-up
+ * (Tperst of at least 100 us, PCIe CEM r5.0 2.9.2; 100 ms before
+ * configuration, PCIe r5.0 6.6.1).
+ */
+static int apple_pcie_port_reset_endpoint(struct apple_pcie *pcie,
+					  struct apple_pcie_port *port)
+{
+	u32 stat;
+	int ret;
+
+	apple_pcie_port_rmw_clear(port, PORT_LTSSMCTL_START, PORT_LTSSMCTL);
+	rmw_clear(PORT_PERST_OFF, port->base + pcie->hw->port_perst);
+	ret = gpiod_set_value_cansleep(port->perst, 1);
+	if (ret)
+		return ret;
+	usleep_range(100, 200);
+	rmw_set(PORT_PERST_OFF, port->base + pcie->hw->port_perst);
+	ret = gpiod_set_value_cansleep(port->perst, 0);
+	if (ret)
+		return ret;
+	msleep(100);
+	return readl_relaxed_poll_timeout(port->base + PORT_STATUS, stat,
+					  stat & PORT_STATUS_READY, 100, 250000);
 }
 
 static int apple_pcie_setup_port(struct apple_pcie *pcie,
@@ -1903,16 +1948,46 @@ rid2sid_ready:
 				goto err_teardown;
 		}
 
+		/*
+		 * In about one boot in seven the J616s SD reader is detected
+		 * but sends no training sets after the first PERST# release,
+		 * and the LTSSM parks in Polling.Compliance. A Retrain Link
+		 * from the root port does not recover it; a new fundamental
+		 * reset does.
+		 */
+		if (!pcie->hw->tunneled && port->perst)
+			attempts = 1 + LINK_RESET_RETRIES;
+
 		timeout = link_up_timeout * HZ / 1000;
 		for (attempt = 0; attempt < attempts; attempt++) {
-			if (attempt)
+			if (attempt && pcie->hw->tunneled)
 				reinit_completion(&pcie->event);
 			apple_pcie_port_writel(port, PORT_LTSSMCTL_START,
 					       PORT_LTSSMCTL);
 			left = wait_for_completion_timeout(&pcie->event, timeout);
+			if (!left && (apple_pcie_port_readl(port, PORT_LINKSTS) &
+				      PORT_LINKSTS_UP))
+				left = 1;
 			if (left)
 				break;
-			dev_warn(pcie->dev, "%pOF link didn't come up\n", np);
+			if (pcie->hw->tunneled || attempt + 1 == attempts) {
+				dev_warn(pcie->dev,
+					 "%pOF link didn't come up (LTSSM %#x)\n",
+					 np, pcie->hw->tunneled ? 0 :
+					 apple_pcie_port_ltssm(pcie, port));
+				continue;
+			}
+			dev_info(pcie->dev,
+				 "%pOF link down after %dms (LTSSM %#x), resetting the endpoint\n",
+				 np, link_up_timeout, apple_pcie_port_ltssm(pcie, port));
+			/* A link-up during the reset must not be lost. */
+			reinit_completion(&pcie->event);
+			ret = apple_pcie_port_reset_endpoint(pcie, port);
+			if (ret) {
+				dev_warn(pcie->dev, "%pOF endpoint reset failed: %d\n",
+					 np, ret);
+				break;
+			}
 		}
 		if (left)
 			dev_info(pcie->dev, "%pOF link up after %ldms\n", np,
