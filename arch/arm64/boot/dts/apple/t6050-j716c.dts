@@ -221,3 +221,5 @@
 &smc_pcio {
 	apple,output-commands = /bits/ 64 <0x001a000000000000 0x000f000000800000 0x011c000000010000>;
 };
+
+#include "t6050-j716c-peripherals.dtsi"

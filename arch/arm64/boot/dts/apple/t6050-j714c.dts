@@ -221,3 +221,5 @@
 		};
 	};
 };
+
+#include "t6050-j714c-peripherals.dtsi"

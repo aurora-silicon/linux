@@ -476,6 +476,11 @@ properties:
         items:
           - enum:
               - apple,j714c # MacBook Pro (14-inch, M5 Max, 2026)
+              - apple,j714s # MacBook Pro (14-inch, M5 Pro)
+              - apple,j716c # MacBook Pro (16-inch, M5 Max)
+              - apple,j716s # MacBook Pro (16-inch, M5 Pro)
+              - apple,j775c # Mac Studio (J775c)
+              - apple,j873s # Mac mini (J873s)
               - apple,k114c # MacBook Pro (14-inch PROLED XDR, M5 Max, 2026)
               - apple,k114s # MacBook Pro (14-inch PROLED XDR, M5 Pro, 2026)
               - apple,k116c # MacBook Pro (16-inch PROLED XDR, M5 Max, 2026)
