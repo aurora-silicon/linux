@@ -74,6 +74,7 @@ jobs:
         env:
           BASE: ${{ steps.dt.outputs.base }}
         run: |
+          set -o pipefail
           python3 scripts/dtc/apple-adt-coverage-test.py
           for board in t6040-j616s t8140-j700 t6000-j316s t8112-j413; do
             test -s "arch/arm64/boot/dts/apple/adt-coverage/$board.txt"
