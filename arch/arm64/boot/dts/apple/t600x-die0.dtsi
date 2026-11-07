@@ -337,7 +337,7 @@
 			compatible = "apple,smc-hwmon";
 		};
 
-		rtc {
+		smc_rtc: rtc {
 			compatible = "apple,smc-rtc";
 			nvmem-cells = <&rtc_offset>;
 			nvmem-cell-names = "rtc_offset";
@@ -383,10 +383,23 @@
 		reg = <0x2 0x920a1300 0x0 0x100>;
 		#address-cells = <2>;
 		#size-cells = <0>;
+		#interrupt-cells = <2>;
+		interrupt-controller;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 636 IRQ_TYPE_LEVEL_HIGH>;
 
 		pmic1: pmic@f {
 			compatible = "apple,maverick-pmic", "apple,spmi-nvmem";
 			reg = <0xf SPMI_USID>;
+
+			pmu_rtc: rtc {
+				compatible = "apple,t6000-pmu-rtc";
+				interrupt-parent = <&nub_spmi0>;
+				interrupts = <2 IRQ_TYPE_EDGE_RISING>;
+				nvmem-cells = <&rtc_offset>;
+				nvmem-cell-names = "rtc_offset";
+				wakeup-source;
+			};
 
 			nvmem-layout {
 				compatible = "fixed-layout";
