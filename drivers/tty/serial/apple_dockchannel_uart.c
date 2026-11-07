@@ -97,10 +97,12 @@ static void dcuart_irq_disable(struct dcuart_port *dcuart, u32 bits)
 
 static void dcuart_putc(struct uart_port *port, unsigned char c)
 {
-	unsigned int retries = TX_RETRIES;
+	static bool no_reader;
+	unsigned int retries = no_reader ? 1 : TX_RETRIES;
 
 	while (readl(port->membase + DATA_TX_FREE) == 0 && --retries)
 		cpu_relax();
+	no_reader = !retries;
 	if (!retries)
 		return;
 

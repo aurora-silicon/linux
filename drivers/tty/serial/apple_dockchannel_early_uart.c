@@ -16,10 +16,12 @@
 
 static void dockchannel_uart_putc(struct uart_port *port, unsigned char c)
 {
-	unsigned int retries = DOCKCHANNEL_TX_RETRIES;
+	static bool no_reader;
+	unsigned int retries = no_reader ? 1 : DOCKCHANNEL_TX_RETRIES;
 
 	while (readl(port->membase + DOCKCHANNEL_TX_FREE) == 0 && --retries)
 		cpu_relax();
+	no_reader = !retries;
 	if (!retries)
 		return;
 

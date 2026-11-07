@@ -39,6 +39,10 @@ struct apple_rtkit_helper {
 	 * it does not list must not replace storage the firmware still owns.
 	 */
 	bool strict_buffers;
+	/* The firmware was told the AP is going to sleep. */
+	bool ap_idle;
+	/* It was told, gave no answer, and wasn't told otherwise. */
+	bool idle_unanswered;
 
 	void __iomem *asc_base;
 
@@ -380,13 +384,94 @@ static void apple_rtkit_helper_remove(struct platform_device *pdev)
 	writel_relaxed(0, helper->asc_base + APPLE_ASC_CPU_CONTROL);
 }
 
+static int apple_rtkit_helper_ap_power(struct apple_rtkit_helper *helper, bool on)
+{
+	int ret = apple_rtkit_ap_power(helper->rtk, on);
+
+	if (ret)
+		dev_err(helper->dev, "AP power notice (%s) not answered: %d\n",
+			on ? "on" : "idle", ret);
+	/*
+	 * Nothing is sent to undo an unanswered idle notice, which macOS never does:
+	 * .complete looks whether a late answer came, and only then sends AP on.
+	 */
+	if (ret && !on)
+		helper->idle_unanswered = true;
+	return ret;
+}
+
+static int apple_rtkit_helper_ap_idle(struct apple_rtkit_helper *helper)
+{
+	int ret;
+
+	if (helper->ap_idle)
+		return 0;
+	ret = apple_rtkit_helper_ap_power(helper, false);
+	if (ret)
+		return ret;
+	helper->ap_idle = true;
+	dev_dbg(helper->dev, "AP idle notice answered for a sleep\n");
+	return 0;
+}
+
+static void apple_rtkit_helper_ap_on(struct apple_rtkit_helper *helper)
+{
+	if (!helper->ap_idle)
+		return;
+	helper->ap_idle = false;
+	if (!apple_rtkit_helper_ap_power(helper, true))
+		dev_dbg(helper->dev, "AP on notice answered after a sleep\n");
+}
+
+/*
+ * macOS tells this coprocessor first of all. Told before any driver stops its own,
+ * an unanswered notice refuses a sleep that has stopped nothing yet.
+ */
+static int __maybe_unused apple_rtkit_helper_prepare(struct device *dev)
+{
+	if (!pm_suspend_via_firmware())
+		return 0;
+	return apple_rtkit_helper_ap_idle(dev_get_drvdata(dev));
+}
+
+/* A sleep refused before this device's .suspend never calls its .resume. */
+static void __maybe_unused apple_rtkit_helper_complete(struct device *dev)
+{
+	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
+
+	if (helper->idle_unanswered) {
+		bool late = !apple_rtkit_is_running(helper->rtk);
+
+		helper->idle_unanswered = false;
+		dev_info(dev, "after the unanswered idle notice: %s\n",
+			 late ? "its answer came late, sending AP on" :
+				"still no answer, nothing sent");
+		helper->ap_idle = late;
+	}
+	apple_rtkit_helper_ap_on(helper);
+}
+
 static int __maybe_unused apple_rtkit_helper_suspend(struct device *dev)
 {
 	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
 
+	/*
+	 * A firmware-driven suspend keeps this coprocessor running. It hears the
+	 * AP's power state and nothing else, so an adopted session stays live.
+	 * That is measured on T8140 and unverified on other SoCs.
+	 */
+	if (pm_suspend_via_firmware())
+		return apple_rtkit_helper_ap_idle(helper);
+
 	/* Only suspend-to-idle has a verified live-session retention contract. */
 	if (helper->adopted && pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
 		return -EBUSY;
+	return 0;
+}
+
+static int __maybe_unused apple_rtkit_helper_resume(struct device *dev)
+{
+	apple_rtkit_helper_ap_on(dev_get_drvdata(dev));
 	return 0;
 }
 
@@ -399,7 +484,10 @@ static int __maybe_unused apple_rtkit_helper_freeze(struct device *dev)
 }
 
 static const struct dev_pm_ops apple_rtkit_helper_pm_ops = {
+	.prepare = pm_sleep_ptr(apple_rtkit_helper_prepare),
+	.complete = pm_sleep_ptr(apple_rtkit_helper_complete),
 	.suspend = pm_sleep_ptr(apple_rtkit_helper_suspend),
+	.resume = pm_sleep_ptr(apple_rtkit_helper_resume),
 	.freeze = pm_sleep_ptr(apple_rtkit_helper_freeze),
 	.poweroff = pm_sleep_ptr(apple_rtkit_helper_freeze),
 };
