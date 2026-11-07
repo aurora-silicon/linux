@@ -2,6 +2,18 @@
 /* Restore disabled providers for the shared T604x resource descriptions. */
 
 &pmgr_aux {
+	ps_msr0: power-controller@470 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x470 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "msr0";
+		power-domains = <&ps_fab5_soc>;
+		status = "disabled";
+	};
+};
+
+&pmgr_aux {
 	ps_scodec: power-controller@328 {
 		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x328 4>;
@@ -14,12 +26,12 @@
 };
 
 / {
-	apciec0_dart: iommu@384000000 {
+	apcie1_dart: iommu@411000000 {
 		compatible = "apple,t6041-dart", "apple,t8110-dart";
-		reg = <0x3 0x84000000 0x0 0x20000>;
+		reg = <0x4 0x11000000 0x0 0x20000>;
 		#iommu-cells = <1>;
 		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1606 IRQ_TYPE_LEVEL_HIGH>;
+		interrupts = <AIC_IRQ 1733 IRQ_TYPE_LEVEL_HIGH>;
 		status = "disabled";
 	};
 };
@@ -37,24 +49,12 @@
 };
 
 / {
-	apcie1_dart: iommu@411000000 {
+	apciec0_dart: iommu@384000000 {
 		compatible = "apple,t6041-dart", "apple,t8110-dart";
-		reg = <0x4 0x11000000 0x0 0x20000>;
+		reg = <0x3 0x84000000 0x0 0x20000>;
 		#iommu-cells = <1>;
 		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1733 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
-	};
-};
-
-&pmgr_aux {
-	ps_msr0_ase_core: power-controller@478 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x478 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "msr0_ase_core";
-		power-domains = <&ps_msr0>;
+		interrupts = <AIC_IRQ 1606 IRQ_TYPE_LEVEL_HIGH>;
 		status = "disabled";
 	};
 };
@@ -72,18 +72,6 @@
 	};
 };
 
-&pmgr_aux {
-	ps_msr0: power-controller@470 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x470 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "msr0";
-		power-domains = <&ps_fab5_soc>;
-		status = "disabled";
-	};
-};
-
 &pmgr {
 	ps_aes: power-controller@1b0 {
 		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
@@ -92,6 +80,17 @@
 		#reset-cells = <0>;
 		label = "aes";
 		power-domains = <&ps_sio>;
+		status = "disabled";
+	};
+};
+
+&pmgr_aux {
+	ps_dwi: power-controller@108 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x108 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dwi";
 		status = "disabled";
 	};
 };
@@ -110,6 +109,29 @@
 };
 
 / {
+	apciec2_dart: iommu@394000000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x3 0x94000000 0x0 0x20000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1670 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+};
+
+&pmgr_aux {
+	ps_msr0_ase_core: power-controller@478 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x478 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "msr0_ase_core";
+		power-domains = <&ps_msr0>;
+		status = "disabled";
+	};
+};
+
+/ {
 	apr0_dart: iommu@301020000 {
 		compatible = "apple,t6041-dart", "apple,t8110-dart";
 		reg = <0x3 0x01020000 0x0 0xc000>;
@@ -118,28 +140,6 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1959 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_scodec>;
-		status = "disabled";
-	};
-};
-
-&pmgr_aux {
-	ps_dwi: power-controller@108 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x108 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "dwi";
-		status = "disabled";
-	};
-};
-
-/ {
-	apciec2_dart: iommu@394000000 {
-		compatible = "apple,t6041-dart", "apple,t8110-dart";
-		reg = <0x3 0x94000000 0x0 0x20000>;
-		#iommu-cells = <1>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1670 IRQ_TYPE_LEVEL_HIGH>;
 		status = "disabled";
 	};
 };
