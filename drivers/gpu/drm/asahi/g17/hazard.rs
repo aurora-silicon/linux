@@ -20,9 +20,8 @@ pub(crate) const WAIT_MS: u32 = 1000;
 /// Firmware barriers one render publication may add for same-VM overlaps,
 /// one per other pair.
 pub(crate) const PUBLICATION_BARRIERS: usize = 7;
-/// Render pairs one logical owner can hold ([`crate::hw::t8140::queues::RENDER_PAIRS_PER_OWNER`]
-/// bounds the number in use).
-pub(crate) const MAX_OWNER_PAIRS: usize = 2;
+/// Render pairs one logical owner can hold.
+pub(crate) const MAX_OWNER_PAIRS: usize = crate::hw::t8140::queues::RENDER_PAIRS_MAX;
 
 #[derive(Clone, Copy)]
 struct Span {

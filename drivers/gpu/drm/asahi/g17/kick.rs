@@ -56,7 +56,9 @@ const _: () = {
     assert!(queue_limit(0) == crate::mmu::MAX_EXECUTION_CONTEXTS);
     // Compute keeps this many channels even with every execution context open.
     assert!(QID_COUNT - FULL_RENDER_RESERVE >= 4);
-    assert!(crate::hw::t8140::queues::RENDER_PAIRS_PER_OWNER == 1);
+    // The reserve counts one pair per owner. A second pair of an owner comes
+    // only from surplus (g17::pairs), never from this reserve.
+    assert!(FULL_RENDER_RESERVE == 2 * crate::mmu::MAX_EXECUTION_CONTEXTS as usize + 2);
 };
 
 /// Stable physical-channel identity. The owner must not be reused within a

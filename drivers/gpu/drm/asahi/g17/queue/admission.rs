@@ -252,6 +252,8 @@ impl State {
     /// The device lock separately proves the physical graph was never published.
     /// An open owner keeps another usable pair. Exclude every live borrower,
     /// including off-lock sibling construction; a closed owner needs no spare.
+    /// A spare goes only to an owner without a pair: a second pair comes only
+    /// from surplus, through claim_sibling.
     fn reassign_unused_spare(
         &mut self,
         slot: u8,
@@ -263,8 +265,7 @@ impl State {
             || slot >= cfg::RENDER_SLOTS
             || owner.is_some_and(|owner| {
                 owner == 0
-                    || self.owners.iter().filter(|value| **value == owner).count()
-                        >= cfg::RENDER_PAIRS_PER_OWNER
+                    || self.owners.contains(&owner)
             })
         {
             return false;
@@ -1302,6 +1303,58 @@ mod owner_pair_tests {
         // Another owner's render is a barrier whatever the prefix.
         assert_eq!(pool.publication_barriers(3, 2, &footprint, Some(9), &mut barriers).unwrap(), 1);
         assert_eq!(pool.publication_barriers(3, 3, &footprint, Some(9), &mut barriers).unwrap(), 2);
+    }
+}
+
+#[kunit_tests(asahi_g17_two_pairs)]
+mod two_pair_tests {
+    use super::*;
+
+    #[test]
+    fn a_two_pair_owner_spreads_its_depth_over_a_surplus_sibling() {
+        let mut state = State::new();
+        let first = state.acquire(1, 2).unwrap();
+        // The sibling is claimed with the first pair, from surplus.
+        let sibling = (0..cfg::RENDER_SLOTS)
+            .find(|slot| *slot != usize::from(first) && state.owners[*slot] == 1)
+            .unwrap();
+        // With the first pair busy, the next render takes the idle sibling, then
+        // the least-loaded of the two.
+        assert_eq!(usize::from(state.acquire(1, 2).unwrap()), sibling);
+        let third = state.acquire(1, 2).unwrap();
+        assert!(third == first || usize::from(third) == sibling);
+        for _ in 3..2 * usize::from(cfg::RENDER_DEPTH) {
+            assert!(state.acquire(1, 2).is_some());
+        }
+        assert_eq!(state.refs[usize::from(first)], cfg::RENDER_DEPTH);
+        assert_eq!(state.refs[sibling], cfg::RENDER_DEPTH);
+        assert_eq!(state.acquire(1, 2), None);
+        assert_eq!(state.owners.iter().filter(|id| **id == 1).count(), 2);
+    }
+
+    #[test]
+    fn a_sibling_needs_room_to_build_and_never_takes_a_spare() {
+        let mut state = State::new();
+        state.build_room = false;
+        // A released pair of a closed owner is reused for the first pair; no
+        // other free slot is claimed without room to build.
+        state.owners[5] = 9;
+        state.released |= 1u64 << 5;
+        assert_eq!(state.acquire(1, 2), Some(5));
+        assert_eq!(state.owners.iter().filter(|id| **id == 1).count(), 1);
+        // An unused spare goes only to an owner without a pair.
+        state.owners[6] = 3;
+        state.released |= 1u64 << 6;
+        assert!(!state.reassign_unused_spare(6, Some(3), Some(1)));
+        assert!(state.reassign_unused_spare(6, Some(3), Some(2)));
+    }
+
+    #[test]
+    fn a_one_pair_owner_claims_no_sibling() {
+        let mut state = State::new();
+        let first = state.acquire(1, 1).unwrap();
+        assert_eq!(state.owners.iter().filter(|id| **id == 1).count(), 1);
+        assert_eq!(state.acquire(1, 1), Some(first));
     }
 }
 

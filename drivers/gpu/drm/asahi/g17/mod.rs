@@ -46,6 +46,7 @@ mod fence;
 mod freelist;
 pub(crate) mod fw;
 pub(crate) mod hazard;
+mod pairs;
 mod ids;
 mod initdata;
 mod job;
@@ -1501,6 +1502,7 @@ impl Gpu {
             }
             fw::m5::pool::select_render_pool(board);
             thermal::select_board(board);
+            pairs::select_board(board);
         }
 
         let geometry = mmu::UatGeometry {
@@ -2257,7 +2259,7 @@ impl gpu::Gpu for Gpu {
     fn queue_limits(&self) -> Option<uapi::drm_asahi_queue_limits> {
         Some(uapi::drm_asahi_queue_limits {
             max_queues: kick::queue_limit(self.shared.variant.qid_floor),
-            max_in_flight_per_queue: hw::t8140::queues::RENDER_PAIRS_PER_OWNER as u32,
+            max_in_flight_per_queue: pairs::per_owner().into(),
             ..Default::default()
         })
     }
