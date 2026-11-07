@@ -44,6 +44,10 @@ properties:
               - apple,t6022-event-log
           - const: apple,soc-event-log
 
+  power-domains:
+    maxItems: 1
+    description: Power domain needed for the associated error-source registers.
+
   interrupts:
     minItems: 9
     maxItems: 255
