@@ -35,6 +35,10 @@ const VERIFY_RETRY_LIMIT: u32 = 3;
 const NOMATCH_EXTRA_FRAMES: u32 = 3;
 /// How long the no-match tail waits for each extra frame of the same touch.
 const NOMATCH_FRAME_WAIT_MS: u64 = 500;
+/// How long the tail waits on a sensor armed for a finger: one still down is
+/// imaged within a frame period or two (~80 ms each, ~125 ms measured from a
+/// START_CAPTURE on Linux).
+const NOMATCH_ARMED_WAIT_MS: u64 = 250;
 /// Message tag of the enclave's "background operation result ready" notice.
 /// The host answers it with BG_OPS_RESULT (0x21); until it does, the result
 /// stays queued in the enclave.
@@ -499,14 +503,14 @@ impl SepData {
     /// prompts); the whole touch is one result.
     fn no_match_tail(&self) {
         let mut frames: u32 = 0;
+        let mut streamed: u32 = 0;
         while frames < NOMATCH_EXTRA_FRAMES {
-            if sensor::start_capture().is_err() {
+            let Some((advertised, from_stream)) = self.next_tail_frame() else {
                 break;
-            }
-            let advertised = match self.await_capture_within(NOMATCH_FRAME_WAIT_MS) {
-                CaptureWait::Ready(n) => n,
-                _ => break,
             };
+            if from_stream {
+                streamed += 1;
+            }
             let Ok(capture) = sensor::read_capture(advertised) else {
                 break;
             };
@@ -538,13 +542,42 @@ impl SepData {
         match self.sbio_transfer(&op) {
             Ok(done) => dev_info!(
                 self.dev,
-                "verify: no-match tail: {} further frame(s) relayed; {} answered status {}, {} bytes\n",
+                "verify: no-match tail: {} further frame(s) relayed ({} still streaming from the touch); {} answered status {}, {} bytes\n",
                 frames,
+                streamed,
                 op.name(),
                 done.status,
                 done.payload.len()
             ),
             Err(e) => dev_warn!(self.dev, "verify: no-match tail: {} failed ({:?})\n", op.name(), e),
+        }
+    }
+
+    /// The next frame of the touch for the no-match tail, and whether the
+    /// sensor was still imaging it. One START_CAPTURE on macOS yields a frame
+    /// every ~80 ms while the finger stays down, and the tail relays the
+    /// frames taken while MATCH_RESULT ran; take those first. Otherwise the
+    /// capture is started again: a sensor armed for a finger finds one still
+    /// down within a frame period or two, so it waits less for a lifted one.
+    fn next_tail_frame(&self) -> Option<(u32, bool)> {
+        let st = sensor::status().ok()?;
+        if let Some(n) = st.available().filter(|n| *n > 0) {
+            return Some((n, true));
+        }
+        let (wait_ms, streaming) = match st.state {
+            sensor::STATE_READING => (NOMATCH_FRAME_WAIT_MS, true),
+            sensor::STATE_ARMED => {
+                sensor::start_capture().ok()?;
+                (NOMATCH_ARMED_WAIT_MS, false)
+            }
+            _ => {
+                sensor::start_capture().ok()?;
+                (NOMATCH_FRAME_WAIT_MS, false)
+            }
+        };
+        match self.await_capture_within(wait_ms) {
+            CaptureWait::Ready(n) => Some((n, streaming)),
+            _ => None,
         }
     }
 
@@ -580,38 +613,112 @@ impl SepData {
         }
     }
 
-    fn note_capture_end(&self) {
-        self.last_capture_end_ns.store(shim::boottime_ns(), Relaxed);
+    /// Ends the imaging of a touch the way macOS does: PAUSE_CAPTURE stops
+    /// the frames but keeps the finger detector running, so the sensor falls
+    /// to idle at the moment the finger is lifted. The next capture is armed
+    /// then ([`Self::await_finger_lift`]), not after a fixed pause.
+    fn pause_after_touch(&self, what: &CStr) {
+        match sensor::pause_capture() {
+            Ok(()) => self.paused_at_ns.store(shim::boottime_ns().max(1), Relaxed),
+            Err(e) => {
+                dev_warn!(
+                    self.dev,
+                    "{}: PAUSE_CAPTURE failed ({:?}); idling the sensor\n",
+                    what,
+                    e
+                );
+                self.paused_at_ns.store(0, Relaxed);
+                let _ = sensor::idle();
+            }
+        }
     }
 
-    fn settle_before_capture(&self) {
-        let last = self.last_capture_end_ns.load(Relaxed);
-        if last == 0 {
-            return;
-        }
-        let elapsed_ms = shim::boottime_ns().saturating_sub(last) / 1_000_000;
-        if elapsed_ms >= u64::from(MATCH_SETTLE_MS) {
-            return;
-        }
-        let remaining = MATCH_SETTLE_MS - elapsed_ms as u32;
-        let _ = sensor::idle();
-        kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(remaining)));
+    /// Forgets a pending finger lift: the sensor was idled, powered off or is
+    /// brought up afresh, so it no longer reports one.
+    fn forget_finger_lift(&self) {
+        self.paused_at_ns.store(0, Relaxed);
     }
 
-    fn pace_between_captures(&self) {
-        let _ = sensor::idle();
-
-        if !self.await_sensor_state(sensor::STATE_IDLE, c"idle, between captures") {
-            dev_warn!(
-                self.dev,
-                "enrol: sensor did not idle within {} ms; continuing the reposition wait anyway (pause is for the person)\n",
-                ENROL_IDLE_TIMEOUT_MS
+    /// Waits until the finger of the last touch is off the sensor, so that the
+    /// next capture takes a new touch and not the resting finger. macOS arms
+    /// the next capture within 2 ms of the lift; a finger lifted before the
+    /// result came back costs nothing here. While the finger stays down the
+    /// person is told to lift it. Frames the sensor took before the pause took
+    /// effect are read and dropped, as macOS does. Returns false if the
+    /// operation was cancelled meanwhile.
+    fn await_finger_lift(&self, what: &CStr) -> bool {
+        let paused_at = self.paused_at_ns.load(Relaxed);
+        if paused_at == 0 {
+            return true;
+        }
+        let use_irq = sensor::irq_available();
+        if use_irq {
+            sensor::irq_arm();
+        }
+        let started = shim::boottime_ns();
+        let deadline = started.saturating_add(u64::from(LIFT_WAIT_MS) * 1_000_000);
+        let mut dropped: u32 = 0;
+        let mut told = false;
+        loop {
+            if !bio::capture_is_live(&self.bio_session.lock(), self.capture_epoch.load(Relaxed)) {
+                return false;
+            }
+            let Ok(st) = sensor::status() else {
+                // The capture that follows reports an unreadable sensor.
+                self.forget_finger_lift();
+                return true;
+            };
+            let lifted = matches!(
+                st.state,
+                sensor::STATE_IDLE | sensor::STATE_ARMED | sensor::STATE_NEEDS_PATCH
             );
+            if lifted {
+                self.forget_finger_lift();
+                let now = shim::boottime_ns();
+                dev_info!(
+                    self.dev,
+                    "{}: finger off the sensor {} ms after the last touch ended (waited {} ms, {} late frame(s) dropped); arming the capture\n",
+                    what,
+                    now.saturating_sub(paused_at) / 1_000_000,
+                    now.saturating_sub(started) / 1_000_000,
+                    dropped
+                );
+                return true;
+            }
+            if let Some(n) = st.available().filter(|n| *n > 0) {
+                if sensor::read_capture(n).is_ok() {
+                    dropped = dropped.saturating_add(1);
+                }
+            }
+            if !told {
+                told = true;
+                if bio::capture_guide(
+                    &mut self.bio_session.lock(),
+                    self.capture_epoch.load(Relaxed),
+                    bio::Guidance::Lift,
+                ) {
+                    self.bio_wake();
+                }
+            }
+            if shim::boottime_ns() >= deadline {
+                dev_warn!(
+                    self.dev,
+                    "{}: the finger stayed on the sensor for {} ms; arming the capture anyway\n",
+                    what,
+                    LIFT_WAIT_MS
+                );
+                self.forget_finger_lift();
+                let _ = sensor::idle();
+                return true;
+            }
+            if use_irq {
+                let _ = sensor::irq_wait(LIFT_POLL_MS);
+                sensor::irq_arm();
+            } else {
+                let poll = kernel::time::Delta::from_millis(i64::from(LIFT_POLL_MS));
+                kernel::time::delay::fsleep(poll);
+            }
         }
-
-        kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(
-            ENROL_REPOSITION_MS,
-        )));
     }
 
     fn stash_enrol_identity(&self, record: &[u8]) {
@@ -1423,8 +1530,8 @@ impl SepData {
         true
     }
 
-    fn save_after_match(&self, user: crate::sbio::UserId) -> bool {
-        if !self.save_lockout() {
+    fn save_after_match(&self, user: crate::sbio::UserId, lockout_saved: bool) -> bool {
+        if !lockout_saved && !self.save_lockout() {
             dev_err!(
                 self.dev,
                 "verify: post-match lockout persistence failed; refusing to claim the AP and SEP anti-replay state are synchronized\n"
@@ -2136,7 +2243,14 @@ impl SepData {
             return;
         };
 
-        self.settle_before_capture();
+        // Arm the capture once the last touch's finger is off the sensor, as
+        // macOS does; a sensor brought up afresh has no touch to wait out.
+        if !self.sensor_kept.load(Relaxed) {
+            self.forget_finger_lift();
+        } else if !self.await_finger_lift(c"verify") {
+            self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR), token_bytes);
+            return;
+        }
 
         // macOS registers the sensor once and keeps it for later matches: no
         // power cycle, CLEAR_STATE or re-registration per touch. Do the same
@@ -2222,20 +2336,34 @@ impl SepData {
         };
 
         let mut outcome = self.verify_one_image();
-        // macOS saves the enclave's lockout record after every answered
-        // result (SAVE_LOCKOUT, kept on disk for the boot's LOAD_LOCKOUT).
-        if matches!(outcome, bio::VerifyOutcome::Matched(_) | bio::VerifyOutcome::NoMatch) {
-            if self.save_lockout() {
-                dev_info!(self.dev, "verify: lockout record saved after the result (SAVE_LOCKOUT)\n");
-            } else {
-                dev_warn!(self.dev, "verify: the lockout record was not saved after the result\n");
-            }
+        let touched_at = shim::boottime_ns();
+        // The touch's frames are taken: stop imaging but keep watching the
+        // finger, as macOS does right after the image cleanup. The next
+        // capture is armed when it is lifted.
+        if matches!(outcome, bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR)) {
+            self.forget_finger_lift();
+            let _ = sensor::idle();
+        } else {
+            self.pause_after_touch(c"verify");
         }
+        let answered = matches!(
+            outcome,
+            bio::VerifyOutcome::Matched(_) | bio::VerifyOutcome::NoMatch
+        );
         // A no-match below the retry limit keeps the prompt open for its next
         // touch; anything else ends the prompt's match operation.
         let keep_open = matches!(outcome, bio::VerifyOutcome::NoMatch)
             && self.bio_nomatch_streak.load(Relaxed).saturating_add(1) < VERIFY_RETRY_LIMIT
             && !self.enclave_reports_lockout();
+        // macOS hands a no-match to LocalAuthentication as soon as the touch
+        // is finished (MATCH_POLICY and the image cleanup done), and saves the
+        // lockout record and collects the background result after it, while
+        // the person lifts the finger. Do the same: the next verify waits for
+        // this worker, so the bookkeeping below still precedes its capture.
+        let reported_early = matches!(outcome, bio::VerifyOutcome::NoMatch);
+        if reported_early {
+            self.finish_verify(bio::VerifyOutcome::NoMatch, token_bytes);
+        }
         if keep_open {
             dev_info!(
                 self.dev,
@@ -2261,7 +2389,21 @@ impl SepData {
             self.match_scope_gen.store(0, Relaxed);
             self.close_unlock_evaluation(&evaluation);
         }
-        let _ = sensor::idle();
+        // macOS saves the enclave's lockout record once after every answered
+        // result (SAVE_LOCKOUT, kept on disk for the boot's LOAD_LOCKOUT),
+        // after MATCH_CANCEL when the prompt ends there and before it collects
+        // the background result.
+        let lockout_saved = answered && self.save_lockout();
+        if answered {
+            if lockout_saved {
+                dev_info!(
+                    self.dev,
+                    "verify: lockout record saved after the result (SAVE_LOCKOUT)\n"
+                );
+            } else {
+                dev_warn!(self.dev, "verify: the lockout record was not saved after the result\n");
+            }
+        }
         if matches!(
             outcome,
             bio::VerifyOutcome::Matched(_) | bio::VerifyOutcome::NoMatch | bio::VerifyOutcome::Failed(ENROL_STATUS_LOCKOUT)
@@ -2282,9 +2424,9 @@ impl SepData {
             bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR) | bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY)
         ) {
             self.sensor_kept.store(false, Relaxed);
+            self.forget_finger_lift();
             sensor::power(false);
         }
-        self.note_capture_end();
         match &outcome {
             bio::VerifyOutcome::Matched(_) => self.bio_nomatch_streak.store(0, Relaxed),
             bio::VerifyOutcome::NoMatch => {
@@ -2316,21 +2458,34 @@ impl SepData {
         );
         if definitive {
             let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
-                self.finish_verify(
-                    bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE),
-                    token_bytes,
-                );
+                if !reported_early {
+                    let failed = bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
+                    self.finish_verify(failed, token_bytes);
+                }
                 return;
             };
-            if !self.save_after_match(user) {
-                self.finish_verify(
-                    bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE),
-                    token_bytes,
-                );
+            if !self.save_after_match(user, lockout_saved) {
+                if reported_early {
+                    dev_err!(
+                        self.dev,
+                        "verify: the state after the reported no-match was not persisted; the next verify persists it first\n"
+                    );
+                    self.persistence_owed.store(true, Relaxed);
+                } else {
+                    let failed = bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
+                    self.finish_verify(failed, token_bytes);
+                }
                 return;
             }
         }
-        self.finish_verify(outcome, token_bytes);
+        dev_info!(
+            self.dev,
+            "verify: post-result steps done {} ms after the touch was finished\n",
+            shim::boottime_ns().saturating_sub(touched_at) / 1_000_000
+        );
+        if !reported_early {
+            self.finish_verify(outcome, token_bytes);
+        }
     }
 
     // Every exit that fails a live verify logs why: userspace sees only a bare
@@ -2635,10 +2790,15 @@ impl SepData {
                 ImageOutcome::Failed(status) => break Some(Err(status)),
             }
 
-            // A spent budget ends the run at the top of the loop; don't make
-            // the person wait out a reposition pause first.
+            // Each enrolment touch is a new placement: stop imaging and arm
+            // the next capture when the finger is lifted, as macOS does, not
+            // after a fixed pause. A spent budget ends the run at the top of
+            // the loop without waiting for the lift.
             if counter < ENROL_MAX_CAPTURES {
-                self.pace_between_captures();
+                self.pause_after_touch(c"enrol");
+                if !self.await_finger_lift(c"enrol") {
+                    break None;
+                }
             }
         };
 
@@ -2669,8 +2829,8 @@ impl SepData {
 
         let _ = sensor::idle();
         self.sensor_kept.store(false, Relaxed);
+        self.forget_finger_lift();
         sensor::power(false);
-        self.note_capture_end();
 
         if let Some(result) = outcome {
             let filed = match (result, identity, enrolment_persisted) {

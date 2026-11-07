@@ -127,6 +127,10 @@ const CMD_LEN: usize = 7;
 const CMD_GET_STATUS: [u8; CMD_LEN] = [0x80, 0x10, 0x00, 0x07, 0x00, 0x00, 0x00];
 const CMD_IDLE: [u8; CMD_LEN] = [0x80, 0x30, 0x00, 0x07, 0x00, 0x00, 0x00];
 const CMD_START_CAPTURE: [u8; CMD_LEN] = [0x80, 0x40, 0x00, 0x07, 0x00, 0x00, 0x00];
+// Stops imaging but keeps the finger detector running: the sensor falls to
+// idle (state 0) when the finger is lifted. macOS sends it after the frames of
+// a touch are taken and arms the next capture when the sensor reports idle.
+const CMD_PAUSE_CAPTURE: [u8; CMD_LEN] = [0x80, 0x41, 0x00, 0x07, 0x00, 0x00, 0x00];
 // Precedes the patch blob.
 const CMD_SETUP_PATCH_ENABLE: [u8; CMD_LEN] = [0x80, 0x60, 0x00, 0x07, 0x00, 0x00, 0x00];
 const CMD_GET_SENSOR_SERIAL: [u8; CMD_LEN] = [0x80, 0x70, 0x00, 0x07, 0x00, 0x00, 0x00];
@@ -151,6 +155,7 @@ static_assert!(STATUS_STATE >= STATUS_AT && STATUS_STATE < STATUS_AT + STATUS_LE
 static_assert!(STATUS_COUNT >= STATUS_AT && STATUS_COUNT + 4 <= STATUS_AT + STATUS_LEN);
 
 pub(crate) const STATE_DATA_READY: u8 = 7;
+// A finger is on the sensor and it is imaging; frames follow as state 7.
 pub(crate) const STATE_READING: u8 = 19;
 pub(crate) const STATE_IDLE: u8 = 0;
 pub(crate) const STATE_ARMED: u8 = 17;
@@ -282,6 +287,10 @@ pub(crate) fn idle() -> Result<()> {
 
 pub(crate) fn start_capture() -> Result<()> {
     command(&CMD_START_CAPTURE)
+}
+
+pub(crate) fn pause_capture() -> Result<()> {
+    command(&CMD_PAUSE_CAPTURE)
 }
 
 pub(crate) fn setup_patch_enable() -> Result<()> {
