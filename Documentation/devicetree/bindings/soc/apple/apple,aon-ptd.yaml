@@ -22,6 +22,10 @@ properties:
       - items:
           - const: apple,t8140-aon-ptd
           - const: apple,aon-ptd
+      - items:
+          - enum:
+              - apple,t6031-aon-ptd
+          - const: apple,aon-ptd
 
   reg:
     minItems: 4
