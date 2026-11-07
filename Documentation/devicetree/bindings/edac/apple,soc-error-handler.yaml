@@ -79,6 +79,94 @@ allOf:
         - reg
         - interrupts
 
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t8122-error-handler
+          then:
+            properties:
+              reg:
+                minItems: 19
+                maxItems: 19
+              interrupts:
+                minItems: 39
+                maxItems: 39
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6030-error-handler
+          then:
+            properties:
+              reg:
+                minItems: 26
+                maxItems: 26
+              interrupts:
+                minItems: 54
+                maxItems: 54
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6031-error-handler
+          then:
+            oneOf:
+              - properties:
+                  reg:
+                    minItems: 123
+                    maxItems: 123
+                  interrupts:
+                    minItems: 159
+                    maxItems: 159
+              - properties:
+                  reg:
+                    minItems: 113
+                    maxItems: 113
+                  interrupts:
+                    minItems: 141
+                    maxItems: 141
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t8122-event-log
+          then:
+            properties:
+              reg:
+                minItems: 13
+                maxItems: 13
+              interrupts:
+                minItems: 13
+                maxItems: 13
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6030-event-log
+          then:
+            properties:
+              reg:
+                minItems: 26
+                maxItems: 26
+              interrupts:
+                minItems: 26
+                maxItems: 26
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6031-event-log
+          then:
+            properties:
+              reg:
+                minItems: 25
+                maxItems: 25
+              interrupts:
+                minItems: 26
+                maxItems: 26
+
       additionalProperties: false
     else:
       properties:
