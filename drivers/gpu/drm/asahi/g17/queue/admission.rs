@@ -164,6 +164,24 @@ impl State {
         if owner == 0 {
             return None;
         }
+        // A shallow queue stays on its busy pair: a second pair pays off only
+        // once the first has a backlog (at depth 2 a switch on every render
+        // cost a 1080p fill about 45 us a submit on M5 Ultra).
+        if pairs > 1 {
+            let busy = (0..cfg::RENDER_SLOTS)
+                .filter(|slot| {
+                    self.owners[*slot] == owner
+                        && self.refs[*slot] != 0
+                        && self.active & (1u64 << slot) != 0
+                        && self.usable(owner, *slot)
+                })
+                .min_by_key(|slot| (self.refs[*slot], u64::MAX - self.epochs[*slot]));
+            if let Some(slot) = busy.filter(|slot| self.refs[*slot] <= crate::g17::pairs::sibling_backlog()) {
+                self.refs[slot] += 1;
+                self.advance(slot);
+                return Some(slot as u8);
+            }
+        }
         // Prefer the owner's idle pair. A missing sibling can be claimed
         // only while this owner has no live kick, before constructing it.
         let idle = (0..cfg::RENDER_SLOTS)
@@ -1317,6 +1335,7 @@ mod two_pair_tests {
 
     #[test]
     fn a_two_pair_owner_spreads_its_depth_over_a_surplus_sibling() {
+        crate::g17::pairs::set_sibling_backlog(0);
         let mut state = State::new();
         let first = state.acquire(1, 2).unwrap();
         // The sibling is claimed with the first pair, from surplus.
@@ -1335,6 +1354,24 @@ mod two_pair_tests {
         assert_eq!(state.refs[sibling], cfg::RENDER_DEPTH);
         assert_eq!(state.acquire(1, 2), None);
         assert_eq!(state.owners.iter().filter(|id| **id == 1).count(), 2);
+        crate::g17::pairs::set_sibling_backlog(1);
+    }
+
+    #[test]
+    fn a_shallow_two_pair_queue_stays_on_its_busy_pair() {
+        crate::g17::pairs::set_sibling_backlog(1);
+        let mut state = State::new();
+        let first = state.acquire(1, 2).unwrap();
+        // At depth 2 the second render stacks on the busy pair.
+        assert_eq!(state.acquire(1, 2), Some(first));
+        // With a backlog there, the third takes the idle sibling.
+        let third = state.acquire(1, 2).unwrap();
+        assert_ne!(third, first);
+        assert_eq!(state.owners[usize::from(third)], 1);
+        // Retired back to one render, the pair keeps the next one.
+        state.release(first);
+        state.release(third);
+        assert_eq!(state.acquire(1, 2), Some(first));
     }
 
     #[test]

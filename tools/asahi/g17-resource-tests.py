@@ -23,6 +23,7 @@ def admission_tests(root, source):
     pairs=(source/'g17/pairs.rs').read_text()
     assert 'const G17D_PAIRS: u8 = RENDER_PAIRS_MAX as u8;' in pairs
     assert 'PAIRS.store(if board.g17d_forms() { G17D_PAIRS } else { 1 }, Relaxed);' in pairs
+    at=pairs.index('const SIBLING_BACKLOG');backlog=pairs[at:pairs.index('\n}\n',pairs.index('fn sibling_backlog',at))+3]
     mmu=(source/'mmu.rs').read_text()
     limits='\n'.join(re.search(r'const '+name+r': [^;]+;',mmu).group(0) for name in ['EXECUTION_CONTEXT_MASK','MAX_EXECUTION_CONTEXTS'])
     header='''#![allow(dead_code, unused_macros)]
@@ -30,13 +31,15 @@ def admission_tests(root, source):
     mod g17 { pub mod trace { pub fn teardown(_:u8,_:u64,_:u64,_:u64) {} } pub mod capacity {
         pub enum Site { RenderSlots, LogicalQueues, ComputeReserve, PhysicalQids }
         pub fn refused(_: Site) -> i32 { -28 }
+    } pub mod pairs { use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+    '''+backlog+'''
     }}
 
     const ENOSPC:i32=-28; const EIO:i32=-5;
     macro_rules! resource_exhausted { ($s:literal)=>{ENOSPC}; }
     type KVec<T> = Vec<T>; struct InFlight;
     mod cfg {\n'''+constants+'}\n'+limits+'\n'
-    methods=['const fn new','fn exhausted','fn owner_quarantine','fn refusal','fn advance','fn take_idle','fn acquire','fn claim_sibling','fn reassign_unused_spare','fn warmable_sibling','fn borrow_warm_sibling','fn cancel_empty_slot','fn release']
+    methods=['const fn new','fn exhausted','fn owner_quarantine','fn refusal','fn advance','fn take_idle','fn acquire','fn usable','fn claim_sibling','fn reassign_unused_spare','fn warmable_sibling','fn borrow_warm_sibling','fn cancel_empty_slot','fn release']
     code=header+item('struct State')+'\nimpl State {\n'+re.search(r'    const MASK: u64 = .*;',s).group(0)+'\n'+'\n'.join(item(n) for n in methods)+'\n}\n'+'''
     // A queue holds g17::pairs::per_owner() pairs (Backend::pairs): one, or
     // RENDER_PAIRS_MAX on G17D. Both admissions run.
@@ -119,8 +122,13 @@ def admission_tests(root, source):
      assert_eq!(recency.epochs[2],0);assert_eq!(recency.epochs[9],epoch);
      recency.release(2);recency.release(9);
      for _ in 0..32 {let slot=recency.acquire(1,pairs).unwrap();assert_eq!(slot,9);recency.release(slot);}
-     let a=recency.acquire(1,pairs).unwrap();let b=recency.acquire(1,pairs).unwrap();assert_ne!(a,b);
-     recency.release(b);recency.released|=1u64<<b;
+     // A busy pair takes sibling_backlog() more renders before the idle sibling.
+     let backlog=crate::g17::pairs::sibling_backlog();
+     let a=recency.acquire(1,pairs).unwrap();
+     for _ in 0..backlog {assert_eq!(recency.acquire(1,pairs),Some(a));}
+     let b=recency.acquire(1,pairs).unwrap();assert_ne!(a,b);
+     for _ in 0..backlog {recency.release(a);}
+     recency.release(b);assert_eq!(recency.warmable_sibling(1,a),Some(b));recency.released|=1u64<<b;
      assert_eq!(recency.borrow_warm_sibling(1,a),None,"never reopen a closed sibling while warming");
      recency.release(a);
      let mut empty=State::new();let slot=empty.acquire(1,pairs).unwrap();
