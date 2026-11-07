@@ -9,6 +9,9 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 636 IRQ_TYPE_LEVEL_HIGH>;
 		apple,controller = <&nub_spmi0>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <0>;
 		status = "disabled";
 	};
 
@@ -48,5 +51,14 @@
 			reg = <0xf SPMI_USID>;
 			status = "disabled";
 		};
+	};
+};
+
+&pmic1 {
+	battery_monitor: battery-monitor {
+		compatible = "apple,t6000-battery-monitor", "apple,battery-monitor";
+		interrupt-parent = <&primary_spmi_monitor>;
+		interrupts = <62 IRQ_TYPE_NONE>;
+		status = "disabled";
 	};
 };

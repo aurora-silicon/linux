@@ -18,7 +18,9 @@ description: |
 properties:
   compatible:
     items:
-      - const: apple,t6000-spmi-monitor
+      - enum:
+          - apple,t8103-spmi-monitor
+          - apple,t6000-spmi-monitor
       - const: apple,spmi-monitor
 
   reg:
@@ -28,6 +30,14 @@ properties:
 
   interrupts:
     maxItems: 1
+
+  interrupt-controller: true
+
+  "#interrupt-cells":
+    const: 2
+
+  "#address-cells":
+    const: 0
 
   apple,controller:
     $ref: /schemas/types.yaml#/definitions/phandle

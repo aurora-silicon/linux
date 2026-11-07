@@ -16,3 +16,11 @@
 		status = "disabled";
 	};
 };
+
+&spi2 {
+	usb3hub_flash: flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		status = "disabled";
+	};
+};
