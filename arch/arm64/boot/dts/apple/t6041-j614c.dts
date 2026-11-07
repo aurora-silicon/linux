@@ -1,0 +1,93 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple MacBook Pro (14-inch, M4 Max, 2024)
+ *
+ * target-type: J614c
+ *
+ * The J616c's T6041 wiring with the 14-inch chassis of the J614s. There is
+ * no J614c ADT yet: its CPU limits and operating points, trackpad and
+ * keyboard wiring and panel brightness are the J616c's (guessed), and its
+ * Wi-Fi island the J614s's (guessed).
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include "t6041.dtsi"
+#include "t6041-j614-j616-j575-scaler.dtsi"
+#include "t6041-j614c-j616c.dtsi"
+
+/ {
+	compatible = "apple,j614c", "apple,t6041", "apple,arm-platform";
+	model = "Apple MacBook Pro (14-inch, M4 Max, 2024)";
+};
+
+&mtp_hid {
+	multi-touch {
+		firmware-name = "apple/tpmtfw-j614c.bin";
+	};
+};
+
+&wifi0 {
+	brcm,board-type = "apple,mriya";
+};
+
+&bluetooth0 {
+	brcm,board-type = "apple,mriya";
+};
+
+/* The J614s panel. */
+&panel {
+	compatible = "apple,panel-j614", "apple,panel-mini-led", "apple,panel";
+	width-mm = <302>;
+	height-mm = <196>;
+	adj-height-mm = <189>;
+};
+
+/*
+ * The J614s speakers: no bring-up and no protection profile yet, so the
+ * card and the six amps stay disabled, as on the J614s.
+ */
+&sound {
+	compatible = "apple,j614-macaudio", "apple,macaudio";
+	model = "MacBook Pro J614";
+	status = "disabled";
+};
+
+&speaker_left_woof1 {
+	status = "disabled";
+};
+
+&speaker_left_woof2 {
+	status = "disabled";
+};
+
+&speaker_left_tweet {
+	status = "disabled";
+};
+
+&speaker_right_woof1 {
+	status = "disabled";
+};
+
+&speaker_right_woof2 {
+	status = "disabled";
+};
+
+&speaker_right_tweet {
+	status = "disabled";
+};
+
+&sound_jack {
+	compatible = "apple,j614-macaudio-jack", "apple,macaudio";
+	model = "MacBook Pro J614 Jack";
+};
+
+&aop_audio {
+	apple,chassis-name = "J614";
+};
+
+&mesa {
+	firmware-name = "apple/mesacal-j614c.bin", "apple/msrk-j614c.bin";
+};

@@ -10,50 +10,17 @@
 /dts-v1/;
 
 #include "t8122.dtsi"
-#include "t8122-usbpd-spmi.dtsi"
-#include "t8122-jxxx.dtsi"
-#include <dt-bindings/leds/common.h>
+#include "t8122-j613-j615.dtsi"
 #include <dt-bindings/thermal/thermal.h>
 
 / {
 	compatible = "apple,j613", "apple,t8122", "apple,arm-platform";
 	model = "Apple MacBook Air (13-inch, M3, 2024)";
-	chassis-type = "laptop";
-
-	aliases {
-		sep = &sep;
-	};
-
-	led-controller {
-		compatible = "pwm-leds";
-		led-0 {
-			pwms = <&fpwm1 0 40000>;
-			label = "kbd_backlight";
-			function = LED_FUNCTION_KBD_BACKLIGHT;
-			color = <LED_COLOR_ID_WHITE>;
-			max-brightness = <255>;
-			default-state = "keep";
-		};
-	};
 
 	/*
-	 * The J613 is fanless: the CPUs are the only cooling devices. As on
-	 * the J700, every die sensor gets a zone that throttles both clusters,
-	 * since they share one die and one heat spreader, and the power
-	 * allocator splits the budget by the energy models, with the E cluster
-	 * weighted three to one. The E maps stop at cooling state 3 (2004 MHz):
-	 * the E cluster adds at most about 2 W, and the governor would
-	 * otherwise send an idle E cluster to its lowest state.
-	 *
-	 * The trips are the J700's: switch-on 58 C (idle is 43-52 C), control
-	 * 95 C, critical 110 C. sustainable-power comes from load tests with the
-	 * gains derived from it: with the four P cores busy, the J700's 1.5 W
-	 * held the hottest sensor at 72 C and the P cores at 2.1 GHz; 6 W held
-	 * 90-95 C at 2.6-3.0 GHz (one 96.5 C peak); 7.5 W swung between 2.2 and
-	 * 3.6 GHz with peaks of 98 C. With 6 W, all eight cores busy settled at
-	 * 92 C with the P cores at 2.2-2.4 GHz and the E cores at full clock;
-	 * the P cores with the GPU busy at 618 MHz peaked at 97 C (the GPU is
-	 * not a cooling device here).
+	 * Fanless: every die sensor throttles both clusters, E weighted 3:1
+	 * and capped at state 3. Trips as on the J700; sustainable-power from
+	 * J613 load tests.
 	 */
 	thermal-zones {
 		cpu-e0-thermal {
@@ -355,27 +322,12 @@
 &dcp {
 	panel: panel {
 		compatible = "apple,panel-j613", "apple,panel";
-		/*
-		 * 2560x1664 at 224 ppi; 181 mm high without the 64 notch rows,
-		 * as on the J413.
-		 */
+		/* 2560x1664 at 224 ppi; 64 notch rows above the desktop. */
 		width-mm = <290>;
 		height-mm = <189>;
 		adj-height-mm = <181>;
-		/* The backlight's maximum: 525 nits. */
 		apple,max-brightness = <525>;
 	};
-};
-
-/*
- * The boot framebuffer is the same panel: with its physical size simpledrm
- * reports 224 dpi instead of assuming 96, so early users (Plymouth, fbcon)
- * pick the same HiDPI scale as the display driver does later. As on the
- * J413 and J313.
- */
-&framebuffer0 {
-	panel = <&panel>;
-	post-init-providers = <&panel>;
 };
 
 &wifi0 {
@@ -386,25 +338,8 @@
 	brcm,board-type = "apple,dnieper";
 };
 
-&aop_mbox {
-	status = "okay";
-};
-
-&aop_dart {
-	status = "okay";
-};
-
-&aop_admac {
-	status = "okay";
-};
-
-&aop {
-	status = "okay";
-};
-
 &aop_audio {
 	apple,chassis-name = "J613";
-	apple,machine-kind = "MacBook Air";
 };
 
 &i2c1 {
@@ -453,15 +388,6 @@
 		ti,imon-slot-no = <12>;
 		ti,vmon-slot-no = <14>;
 	};
-
-	jack_codec: codec@4b {
-		compatible = "cirrus,cs42l84";
-		reg = <0x4b>;
-		reset-gpios = <&pinctrl_nub 17 GPIO_ACTIVE_HIGH>;
-		#sound-dai-cells = <0>;
-		interrupts-extended = <&pinctrl_ap 173 IRQ_TYPE_LEVEL_LOW>;
-		sound-name-prefix = "Jack";
-	};
 };
 
 / {
@@ -498,181 +424,11 @@
 	};
 };
 
-&fpwm1 {
-	status = "okay";
-};
-
-&mtp {
-	status = "okay";
-};
-
-&mtp_mbox {
-	status = "okay";
-};
-
-&mtp_dart {
-	status = "okay";
-};
-
-&mtp_dockchannel {
-	status = "okay";
-};
-
-&mtp_hid {
-	apple,afe-reset-gpios = <&smc_gpio 8 GPIO_ACTIVE_LOW>;
-	apple,stm-reset-gpios = <&smc_gpio 24 GPIO_ACTIVE_LOW>;
-
-	multi-touch {
-		firmware-name = "apple/tpmtfw-j613.bin";
-	};
-
-	keyboard: keyboard {
-		hid-country-code = <0>;
-		apple,keyboard-layout-id = <0>;
-	};
-
-	stm {
-	};
-
-	actuator {
-	};
-
-	tp_accel {
-	};
-};
-
-#include "isp-imx558-cfg0.dtsi"
-
-&isp {
-	apple,platform-id = <18>;
-	apple,temporal-filter = <1>;
-};
-
-/*
- * Mesa fingerprint sensor on spi2 (J613 ADT /arm-io/spi2/mesa): power on
- * NUB GPIO 29, active high. The data-ready line (AP GPIO 199) is left out,
- * so the driver polls until its trigger is confirmed. Native chip select only.
- */
-&spi2 {
-	status = "okay";
+&mtp_mt {
+	firmware-name = "apple/tpmtfw-j613.bin";
 };
 
 &mesa {
-	status = "okay";
-	enable-gpios = <&pinctrl_nub 29 GPIO_ACTIVE_HIGH>;
-	spi-cs-setup-delay-ns = <20>;
-	spi-cs-hold-delay-ns = <20>;
 	/* Per-device factory data from this Mac's own iBoot system container. */
 	firmware-name = "apple/mesacal-j613.bin";
-};
-
-#include "hwmon-laptop.dtsi"
-
-/*
- * External display on both USB-C ports: left-back (typec0, ATC0) and
- * left-front (typec1, ATC1). In the J613 ADT dcpext is display-crossbar
- * ufp1, port 0, which is crossbar state 2 (dispext1,0) in the T602x model,
- * on either ATC's crossbar. The DPTX target is the ADT's DFP index of the
- * ATC (atc0 = 0, atc1 = 1), as in the M1/M2 dcpext routes. dcpext has one
- * DPTX link, so one external display at a time: the display fabric gives
- * the pipeline to the first port that asks, and the other port keeps USB.
- *
- * dcpext, its routes, its DARTs, its mailbox and both crossbars stay
- * disabled here, like the internal DCP. The boot loader finds dcpext
- * through the "dcpext" alias, reserves its firmware and marks it
- * apple,t8122-dcpext-firmware-ready; the kernel's display gate then enables
- * all of them after the internal display was handed over, and keeps the
- * common power state of both ATCs on (apple,always-on), as for DP alt mode
- * on the M1/M2 laptops. The routes stay disabled until then, as on T6030:
- * an available route with no registered mode switch would make the Type-C
- * port wait for one forever. A kernel or boot loader without dcpext
- * support therefore sees nothing new.
- *
- * The display subsystem's iommus are left alone: the display gate accepts
- * exactly one entry there (disp0_dart stream 0) before it enables the
- * internal display, and adds <&dispext0_dart 0> itself when it enables
- * dcpext, as it does for the T6030 external processors.
- */
-/ {
-	aliases {
-		dcpext = &dcpext;
-	};
-};
-
-&dcpext {
-	apple,connector-type = "USB-C";
-	phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>;
-	phy-names = "typec0", "typec1";
-	mux-controls = <&atcphy0_xbar 0>, <&atcphy1_xbar 0>;
-	mux-control-names = "typec0", "typec1";
-	apple,typec-mux-indices = <2 2>;
-	apple,typec-dptx-phys = <0 1>;
-	/* RTKit quirks of AsahiLinux/linux#607 (syslog/ioreport acks, kdebug). */
-	apple,sync-syslog-ack;
-
-	typec-routes {
-		#address-cells = <1>;
-		#size-cells = <0>;
-
-		route@0 {
-			reg = <0>;
-			mode-switch;
-			status = "disabled";
-
-			port {
-				dcpext_typec0: endpoint {
-					remote-endpoint = <&typec0_dcpext>;
-				};
-			};
-		};
-
-		route@1 {
-			reg = <1>;
-			mode-switch;
-			status = "disabled";
-
-			port {
-				dcpext_typec1: endpoint {
-					remote-endpoint = <&typec1_dcpext>;
-				};
-			};
-		};
-	};
-};
-
-&typec0 {
-	ports {
-		port@3 {
-			reg = <3>;
-
-			typec0_dcpext: endpoint {
-				remote-endpoint = <&dcpext_typec0>;
-			};
-		};
-	};
-};
-
-&typec1 {
-	ports {
-		port@3 {
-			reg = <3>;
-
-			typec1_dcpext: endpoint {
-				remote-endpoint = <&dcpext_typec1>;
-			};
-		};
-	};
-};
-
-/*
- * The base M3 has no Tf keys. With only the GPU busy, the six Tg keys below
- * rose by about 50 C, the most of any key, and each has a twin about 4.5 C
- * lower; they read 0 C or slightly below while the GPU is powered off. The
- * others are the CPU die keys of the thermal zones above (the E-cluster
- * groups and one per P core), so the zone also follows a hot CPU.
- */
-&smc_hwmon {
-	apple,soc-die-keys = "Tg0D", "Tg0P", "Tg0X", "Tg0b", "Tg0j", "Tg0v",
-			     "Te05", "Te0P", "Tp05", "Tp0L", "Tp0b", "Tp0r";
-	apple,thermal-pressure-key = "mTPL";
 };

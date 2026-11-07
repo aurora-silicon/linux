@@ -1,0 +1,65 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The third port of the T8132 built-in PCIe controller (ADT apcie
+ * pci-bridge2, with its own DART dart-apcie2): the J604 SD card reader
+ * and the J773g Ethernet. Values from the J604 and J773g ADTs.
+ *
+ * The controller runs the managed radio contract, which admits port 0
+ * only, so the port and its DART stay disabled until it admits a second
+ * port and its stream.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+&soc {
+	dart_apcie2: iommu@492000000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x4 0x92000000 0x0 0x20000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1250 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+};
+
+&pcie0 {
+	reg = <0x1c 0xb0000000 0x0 0x10000000>, /* config */
+	      <0x4 0x94000000 0x0 0x4000>,     /* common */
+	      <0x4 0x90028000 0x0 0x8000>,     /* port 0 */
+	      <0x4 0x97020000 0x0 0x4000>,     /* port 0 PHY glue */
+	      <0x4 0x92028000 0x0 0x8000>,     /* port 2 */
+	      <0x4 0x97028000 0x0 0x4000>;     /* port 2 PHY glue */
+	reg-names = "config", "rc", "port0", "phy0", "port2", "phy2";
+
+	/* One per port, in port order; port 1 is unused. */
+	interrupts = <AIC_IRQ 1231 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 1240 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 1249 IRQ_TYPE_LEVEL_HIGH>;
+
+	bus-range = <0 2>;
+
+	port02: pci@2,0 {
+		device_type = "pci";
+		reg = <0x1000 0x0 0x0 0x0 0x0>;
+		bus-range = <2 2>;
+		/* ADT pci-bridge2 function-perst */
+		reset-gpios = <&pinctrl_ap 165 GPIO_ACTIVE_LOW>;
+
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupt-map-mask = <0 0 0 7>;
+		interrupt-map = <0 0 0 1 &port02 0 0 0 0>,
+				<0 0 0 2 &port02 0 0 0 1>,
+				<0 0 0 3 &port02 0 0 0 2>,
+				<0 0 0 4 &port02 0 0 0 3>;
+		status = "disabled";
+	};
+};

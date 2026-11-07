@@ -13,28 +13,126 @@ description: |
   PCIe tunnel auxiliary DMA register banks and completion interrupt. Its
   stream is distinct from the tunnel endpoint streams in the same DART.
 
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6000-pciec-piodma
+          - apple,t6020-pciec-piodma
+          - apple,t6021-pciec-piodma
+          - apple,t6022-pciec-piodma
+          - apple,t6030-pciec-piodma
+          - apple,t6031-pciec-piodma
+          - apple,t6032-pciec-piodma
+          - apple,t6041-pciec-piodma
+          - apple,t8103-pciec-piodma
+          - apple,t8112-pciec-piodma
+          - apple,t8122-pciec-piodma
+          - apple,t8132-pciec-piodma
+  required:
+    - compatible
+
 properties:
-  compatible:
-    oneOf:
-      - items:
-          - const: apple,t6041-pciec-piodma
-          - const: apple,pciec-piodma
+  compatible: true
 
-  reg:
-    minItems: 4
-    maxItems: 4
-    description: Register apertures in hardware-description order.
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8132-pciec-piodma
+      required:
+        - compatible
+    then:
+      properties:
+        compatible:
+          items:
+            - enum:
+                - apple,t8132-pciec-piodma
+            - const: apple,pciec-piodma
 
-  interrupts:
-    maxItems: 1
+        reg:
+          minItems: 4
+          maxItems: 4
 
-  iommus:
-    maxItems: 1
+        interrupts:
+          maxItems: 1
 
-required:
-  - compatible
-  - reg
-  - interrupts
-  - iommus
+        iommus:
+          maxItems: 1
 
-additionalProperties: false
+      required:
+        - compatible
+        - reg
+        - interrupts
+        - iommus
+    else:
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t6032-pciec-piodma
+            required:
+              - compatible
+          then:
+            properties:
+              compatible:
+                items:
+                  - const: apple,t6032-pciec-piodma
+                  - const: apple,pciec-piodma
+
+              reg:
+                minItems: 4
+                maxItems: 4
+
+              interrupts:
+                maxItems: 1
+
+              iommus:
+                maxItems: 1
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+          else:
+            properties:
+              compatible:
+                items:
+                  - enum:
+                      - apple,t6000-pciec-piodma
+                      - apple,t6020-pciec-piodma
+                      - apple,t6021-pciec-piodma
+                      - apple,t6022-pciec-piodma
+                      - apple,t6030-pciec-piodma
+                      - apple,t6031-pciec-piodma
+                      - apple,t6041-pciec-piodma
+                      - apple,t8103-pciec-piodma
+                      - apple,t8112-pciec-piodma
+                      - apple,t8122-pciec-piodma
+                  - const: apple,pciec-piodma
+
+              reg:
+                minItems: 4
+                maxItems: 4
+                description: Register apertures in hardware-description order.
+
+              interrupts:
+                maxItems: 1
+
+              iommus:
+                maxItems: 1
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - iommus
+
+            additionalProperties: false
+
+unevaluatedProperties: false

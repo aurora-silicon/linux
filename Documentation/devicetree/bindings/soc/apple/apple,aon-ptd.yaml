@@ -13,39 +13,139 @@ description: |
   Always-on power telemetry register banks and upstream interrupts. The
   firmware owns the telemetry data and interrupt routing at boot.
 
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6031-aon-ptd
+          - apple,t6032-aon-ptd
+          - apple,t6041-aon-ptd
+          - apple,t8132-aon-ptd
+          - apple,t8140-aon-ptd
+  required:
+    - compatible
+
 properties:
-  compatible:
-    oneOf:
-      - items:
-          - const: apple,t6041-aon-ptd
-          - const: apple,aon-ptd
-      - items:
-          - const: apple,t8140-aon-ptd
-          - const: apple,aon-ptd
+  compatible: true
 
-  reg:
-    minItems: 4
-    maxItems: 4
-    description: Register apertures in hardware-description order.
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8132-aon-ptd
+      required:
+        - compatible
+    then:
+      properties:
+        compatible:
+          items:
+            - enum:
+                - apple,t8132-aon-ptd
+            - const: apple,aon-ptd
 
-  interrupts:
-    minItems: 32
-    maxItems: 32
+        reg:
+          minItems: 4
+          maxItems: 4
 
-  interrupt-controller: true
+        interrupts:
+          minItems: 32
+          maxItems: 32
 
-  '#interrupt-cells':
-    description: Firmware telemetry source identifier, plus flags on T8140.
-    enum: [1, 2]
+        '#address-cells':
+          const: 0
+        '#interrupt-cells':
+          const: 1
+        interrupt-controller: true
 
-  '#address-cells':
-    const: 0
+      required:
+        - compatible
+        - reg
+        - interrupts
+        - interrupt-controller
+        - '#interrupt-cells'
+        - '#address-cells'
+    else:
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t6032-aon-ptd
+            required:
+              - compatible
+          then:
+            properties:
+              compatible:
+                items:
+                  - enum:
+                      - apple,t6032-aon-ptd
+                  - const: apple,aon-ptd
 
-required:
-  - compatible
-  - reg
-  - interrupts
-  - interrupt-controller
-  - '#interrupt-cells'
+              reg:
+                minItems: 4
+                maxItems: 4
 
-additionalProperties: false
+              interrupts:
+                minItems: 32
+                maxItems: 32
+
+              '#address-cells':
+                const: 0
+              '#interrupt-cells':
+                const: 1
+              interrupt-controller: true
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - interrupt-controller
+              - '#interrupt-cells'
+              - '#address-cells'
+          else:
+            properties:
+              compatible:
+                oneOf:
+                  - items:
+                      - const: apple,t6041-aon-ptd
+                      - const: apple,aon-ptd
+                  - items:
+                      - const: apple,t8140-aon-ptd
+                      - const: apple,aon-ptd
+                  - items:
+                      - enum:
+                          - apple,t6031-aon-ptd
+                      - const: apple,aon-ptd
+
+              reg:
+                minItems: 4
+                maxItems: 4
+                description: Register apertures in hardware-description order.
+
+              interrupts:
+                minItems: 32
+                maxItems: 32
+
+              interrupt-controller: true
+
+              '#interrupt-cells':
+                description: Firmware telemetry source identifier, plus flags on T8140.
+                enum: [1, 2]
+
+              '#address-cells':
+                const: 0
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - interrupt-controller
+              - '#interrupt-cells'
+
+            additionalProperties: false
+
+unevaluatedProperties: false

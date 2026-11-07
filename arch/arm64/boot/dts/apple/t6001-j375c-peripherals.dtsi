@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Disabled resource descriptions for T6001. */
+
+&{/soc} {
+	atc3_dpin0: displayport@1301e50000 {
+		compatible = "apple,t6000-dpin", "apple,dpin";
+		reg = <0x13 0x01e50000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1450 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	atc3_dpin1: displayport@1301e58000 {
+		compatible = "apple,t6000-dpin", "apple,dpin";
+		reg = <0x13 0x01e58000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1451 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	apciec3_piodma: dma-controller@1322000000 {
+		compatible = "apple,t6000-pciec-piodma", "apple,pciec-piodma";
+		reg = <0x13 0x22000000 0x0 0x4000>,
+		      <0x13 0x22004000 0x0 0x4000>,
+		      <0x13 0x22008000 0x0 0x4000>,
+		      <0x13 0x20008000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1250 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&apciec3_dart 15>;
+		status = "disabled";
+	};
+};

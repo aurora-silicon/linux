@@ -19,7 +19,15 @@ allOf:
 
 properties:
   compatible:
-    const: apple,dockchannel-uart
+    oneOf:
+      - const: apple,dockchannel-uart
+      - items:
+          - enum:
+              - apple,t8112-dockchannel-uart
+              - apple,t6020-dockchannel-uart
+              - apple,t6021-dockchannel-uart
+              - apple,t6022-dockchannel-uart
+          - const: apple,dockchannel-uart
 
   reg:
     items:
