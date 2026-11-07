@@ -63,12 +63,21 @@ impl InitData {
         if !self.m5 { return Err(EINVAL); }
         let private = self.object(self.cluster)?;
         let base = self.m5_layout.private.status_config;
+        let field = |offset| {
+            self.m5_status_config
+                .relocate(offset)
+                .map(|at| base + at)
+                .ok_or(EINVAL)
+        };
+        let history = field(m::M5_STATUS_CONFIG_HISTORY)?;
+        let generation_at = field(m::M5_STATUS_CONFIG_HISTORY_GENERATION)?;
+        let slots = field(m::M5_STATUS_CONFIG_HISTORY_SLOTS)?;
         for _ in 0..64 {
-            let generation = private.word(base + 0x74c)?.load(Ordering::Acquire);
+            let generation = private.word(generation_at)?.load(Ordering::Acquire);
             if generation & 1 != 0 { core::hint::spin_loop(); continue; }
-            let config = private.read_words::<4>(base + 0x73c)?;
+            let config = private.read_words::<4>(history)?;
             fence(Ordering::Acquire);
-            if generation != private.word(base + 0x74c)?.load(Ordering::Acquire) {
+            if generation != private.word(generation_at)?.load(Ordering::Acquire) {
                 core::hint::spin_loop(); continue;
             }
             let period = u64::from(config[0]) | u64::from(config[1]) << 32;
@@ -79,7 +88,7 @@ impl InitData {
             // One slot per 25000 ticks of the period.
             let index = (ticks % period) / 25_000;
             if index >= count { return Err(ERANGE); }
-            let byte = private.pointer(base + 0x750 + index as usize, 1)?;
+            let byte = private.pointer(slots + index as usize, 1)?;
             // SAFETY: retained, bounds-checked WC byte, written as a single byte
             // after reading the even, stable generation, as the firmware expects.
             unsafe {
