@@ -753,6 +753,9 @@ pub(super) struct Backend {
     /// The render pair this owner last published to without the device mutex
     /// (zero for none): a hint, revalidated by every lend.
     direct_slot: core::sync::atomic::AtomicU32,
+    /// Render pairs this owner may hold, fixed at creation with its scheduler's
+    /// credits and its render pool's sizing.
+    pairs: u8,
 }
 
 impl Backend {
@@ -875,6 +878,7 @@ impl Backend {
                     outer_render <- kernel::new_mutex!(None, "g17::Backend::outer_render"),
                     admission,
                     direct_slot: core::sync::atomic::AtomicU32::new(0),
+                    pairs: crate::hw::t8140::queues::RENDER_PAIRS_PER_OWNER as u8,
                 }),
                 GFP_KERNEL,
             )?,
@@ -2807,7 +2811,7 @@ mod shared_capacity_tests {
         assert!(matches!(registry.reserve_compute(1000), Err(EAGAIN)));
         assert!(registry.qids.render_fits(slots.len()));
         for owner in 1..=u64::from(crate::mmu::MAX_EXECUTION_CONTEXTS) {
-            let lease = registry.admission.acquire_render(owner, None, u64::MAX, || Ok(())).unwrap();
+            let lease = registry.admission.acquire_render(owner, 1, None, u64::MAX, || Ok(())).unwrap();
             registry.ensure_render_ids(lease.slot(), owner).unwrap();
             leases.push(lease, GFP_KERNEL).unwrap();
         }
@@ -2830,7 +2834,7 @@ mod shared_capacity_tests {
         let mut leases = KVec::with_capacity(limit as usize, GFP_KERNEL).unwrap();
         for owner in 1..=u64::from(limit) {
             slots.push(registry.admission.reserve_queue().unwrap(), GFP_KERNEL).unwrap();
-            let lease = registry.admission.acquire_render(owner, None, u64::MAX, || Ok(())).unwrap();
+            let lease = registry.admission.acquire_render(owner, 1, None, u64::MAX, || Ok(())).unwrap();
             registry.ensure_render_ids(lease.slot(), owner).unwrap();
             leases.push(lease, GFP_KERNEL).unwrap();
         }
@@ -2849,7 +2853,7 @@ mod shared_capacity_tests {
         for client in 0..4u64 {
             for queue in 0..9u64 {
                 let owner = 1 + client * 9 + queue;
-                let lease = registry.admission.acquire_render(owner, None, u64::MAX, || Ok(())).unwrap();
+                let lease = registry.admission.acquire_render(owner, 1, None, u64::MAX, || Ok(())).unwrap();
                 registry.ensure_render_ids(lease.slot(), owner).unwrap();
                 leases.push(lease, GFP_KERNEL).unwrap();
             }

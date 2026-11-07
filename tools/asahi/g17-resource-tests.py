@@ -36,42 +36,44 @@ def admission_tests(root, source):
     methods=['const fn new','fn exhausted','fn owner_quarantine','fn refusal','fn advance','fn take_idle','fn acquire','fn claim_sibling','fn reassign_unused_spare','fn warmable_sibling','fn borrow_warm_sibling','fn cancel_empty_slot','fn release']
     code=header+item('struct State')+'\nimpl State {\n'+re.search(r'    const MASK: u64 = .*;',s).group(0)+'\n'+'\n'.join(item(n) for n in methods)+'\n}\n'+'''
     fn main(){
+     // The render pairs a queue may hold (Backend::pairs).
+     let pairs=cfg::RENDER_PAIRS_PER_OWNER;
      if cfg::RENDER_PAIRS_PER_OWNER == 1 {
       let mut state=State::new();
       let mut slots=Vec::new();
       for owner in 1..=u64::from(MAX_EXECUTION_CONTEXTS) {
-       let slot=state.acquire(owner).expect("every logical owner must fit");slots.push(slot);
+       let slot=state.acquire(owner,pairs).expect("every logical owner must fit");slots.push(slot);
        assert_eq!(state.owners.iter().filter(|id|**id==owner).count(),1);
       }
       for slot in slots {state.release(slot);}
-      let mut state=State::new();let first=state.acquire(1).unwrap();
-      for _ in 1..cfg::RENDER_DEPTH {assert_eq!(state.acquire(1),Some(first));}
-      assert_eq!(state.acquire(1),None);state.release(first);assert_eq!(state.acquire(1),Some(first));
+      let mut state=State::new();let first=state.acquire(1,pairs).unwrap();
+      for _ in 1..cfg::RENDER_DEPTH {assert_eq!(state.acquire(1,pairs),Some(first));}
+      assert_eq!(state.acquire(1,pairs),None);state.release(first);assert_eq!(state.acquire(1,pairs),Some(first));
       println!("shared render admission: all58 owners fit; depth16 waits for exact retirement without consuming a spare");
       return;
      }
      let mut state=State::new();
      for owner in 1..=32 {
       assert!(state.refusal(owner).is_ok());
-      let slot=state.acquire(owner).expect("existing owner fits");
+      let slot=state.acquire(owner,pairs).expect("existing owner fits");
       state.release(slot);
      }
      assert_eq!(state.active,0,"all submitted work retired");
      let retained=state.owners.iter().filter(|o|**o!=0).count();
      assert_eq!(retained,63);
      assert_eq!(state.refusal(33),Err(ENOSPC));
-     assert!(state.acquire(33).is_none());
+     assert!(state.acquire(33,pairs).is_none());
      println!("confirmed: 32 open idle owners retain all 63 usable pairs; owner33 receives ENOSPC");
      // Yield one unused spare for each additional logical owner. The runtime
      // separately proves that these physical graphs have never been published.
      for owner in 33..=u64::from(MAX_EXECUTION_CONTEXTS) {
       let slot=(1..cfg::RENDER_SLOTS).find(|slot|state.reassign_unused_spare(*slot as u8,None,Some(owner))).unwrap();
-      assert_eq!(state.acquire(owner),Some(slot as u8));state.release(slot as u8);
+      assert_eq!(state.acquire(owner,pairs),Some(slot as u8));state.release(slot as u8);
      }
-     for owner in 1..=u64::from(MAX_EXECUTION_CONTEXTS) {let slot=state.acquire(owner).unwrap();state.release(slot);}
+     for owner in 1..=u64::from(MAX_EXECUTION_CONTEXTS) {let slot=state.acquire(owner,pairs).unwrap();state.release(slot);}
      assert!(state.owners.iter().all(|owner|*owner<=u64::from(MAX_EXECUTION_CONTEXTS)));
      println!("fixed: all{} logical owners render and resume without reducing slot count or depth",MAX_EXECUTION_CONTEXTS);
-     let mut guarded=State::new();let first=guarded.acquire(1).unwrap();guarded.release(first);
+     let mut guarded=State::new();let first=guarded.acquire(1,pairs).unwrap();guarded.release(first);
      let spare=guarded.owners.iter().enumerate().find(|(s,o)|**o==1&&*s!=first as usize).unwrap().0;
      guarded.take_idle(spare,1);
      assert!(!guarded.reassign_unused_spare(spare as u8,Some(1),Some(2)),"warm borrower excludes reclamation");
@@ -86,10 +88,10 @@ def admission_tests(root, source):
      assert!(!guarded.reassign_unused_spare(64,None,Some(3)));
      guarded.released |= 1u64<<first;
      assert!(guarded.reassign_unused_spare(first,Some(1),None),"closed owner's unused last slot can be freed for compute");
-     let second=guarded.acquire(3).unwrap();guarded.release(second);
+     let second=guarded.acquire(3,pairs).unwrap();guarded.release(second);
      let spare3=guarded.owners.iter().enumerate().find(|(s,o)|**o==3&&*s!=second as usize).unwrap().0;
      assert!(guarded.reassign_unused_spare(spare3 as u8,Some(3),Some(2)));
-     let fourth=guarded.acquire(4).unwrap();guarded.release(fourth);
+     let fourth=guarded.acquire(4,pairs).unwrap();guarded.release(fourth);
      let spare4=guarded.owners.iter().enumerate().find(|(s,o)|**o==4&&*s!=fourth as usize).unwrap().0;
      assert!(!guarded.reassign_unused_spare(spare4 as u8,Some(4),Some(2)),"destination retains at most two channels");
      let mut recency=State::new();recency.owners[9]=1;recency.owners[2]=1;
@@ -97,12 +99,12 @@ def admission_tests(root, source):
      assert_eq!(recency.borrow_warm_sibling(1,9),Some(2));
      assert_eq!(recency.epochs[2],0);assert_eq!(recency.epochs[9],epoch);
      recency.release(2);recency.release(9);
-     for _ in 0..32 {let slot=recency.acquire(1).unwrap();assert_eq!(slot,9);recency.release(slot);}
-     let a=recency.acquire(1).unwrap();let b=recency.acquire(1).unwrap();assert_ne!(a,b);
+     for _ in 0..32 {let slot=recency.acquire(1,pairs).unwrap();assert_eq!(slot,9);recency.release(slot);}
+     let a=recency.acquire(1,pairs).unwrap();let b=recency.acquire(1,pairs).unwrap();assert_ne!(a,b);
      recency.release(b);recency.released|=1u64<<b;
      assert_eq!(recency.borrow_warm_sibling(1,a),None,"never reopen a closed sibling while warming");
      recency.release(a);
-     let mut empty=State::new();let slot=empty.acquire(1).unwrap();
+     let mut empty=State::new();let slot=empty.acquire(1,pairs).unwrap();
      assert!(!empty.cancel_empty_slot(slot,2));
      empty.refs[slot as usize]+=1;assert!(!empty.cancel_empty_slot(slot,1));empty.release(slot);
      assert!(empty.cancel_empty_slot(slot,1));empty.release(slot);
@@ -110,14 +112,14 @@ def admission_tests(root, source):
      println!("recency: serial work keeps its used pair; overlapping work retains both channels; warm close and empty-reservation races protected");
      println!("guards: live warming, expected owner, remaining usable pair, existing destination, and reserved slots");
      let mut state=State::new();
-     for owner in 1..=32 {let slot=state.acquire(owner).unwrap();state.release(slot);}
+     for owner in 1..=32 {let slot=state.acquire(owner,pairs).unwrap();state.release(slot);}
      // Every existing owner still resumes, so this is held capacity, not live GPU work.
-     for owner in 1..=32 {let slot=state.acquire(owner).unwrap();state.release(slot);}
+     for owner in 1..=32 {let slot=state.acquire(owner,pairs).unwrap();state.release(slot);}
      // Logical close makes the retained pair eligible; no firmware behavior modeled.
      let slot=state.owners.iter().position(|o|*o==1).unwrap();
      state.released |= 1u64<<slot;
      assert!(state.refusal(33).is_ok());
-     assert_eq!(state.acquire(33),Some(slot as u8));
+     assert_eq!(state.acquire(33,pairs),Some(slot as u8));
      println!("control: explicitly released idle ownership admits a new owner");
     }
     '''

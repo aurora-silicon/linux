@@ -160,7 +160,7 @@ impl State {
         self.advance(slot);
         slot as u8
     }
-    fn acquire(&mut self, owner: u64) -> Option<u8> {
+    fn acquire(&mut self, owner: u64, pairs: usize) -> Option<u8> {
         if owner == 0 {
             return None;
         }
@@ -177,7 +177,7 @@ impl State {
             if !(0..cfg::RENDER_SLOTS)
                 .any(|other| self.owners[other] == owner && self.refs[other] != 0)
             {
-                self.claim_sibling(owner);
+                self.claim_sibling(owner, pairs);
             }
             return Some(self.take_idle(slot, owner));
         }
@@ -216,11 +216,12 @@ impl State {
             })
             .or_else(unowned)?;
         let first = self.take_idle(slot, owner);
-        self.claim_sibling(owner);
+        self.claim_sibling(owner, pairs);
         Some(first)
     }
-    fn claim_sibling(&mut self, owner: u64) {
-        if self.owners.iter().filter(|id| **id == owner).count() >= cfg::RENDER_PAIRS_PER_OWNER {
+    /// Claims another pair for an owner that may hold `pairs`.
+    fn claim_sibling(&mut self, owner: u64, pairs: usize) {
+        if self.owners.iter().filter(|id| **id == owner).count() >= pairs {
             return;
         }
         // A speculative sibling never takes a killed context's pair.
@@ -366,9 +367,9 @@ impl State {
         }
     }
 
-    fn pick(&mut self, owner: u64, plan: Plan) -> Option<u8> {
+    fn pick(&mut self, owner: u64, pairs: usize, plan: Plan) -> Option<u8> {
         match plan {
-            Plan::Any => self.acquire(owner),
+            Plan::Any => self.acquire(owner, pairs),
             Plan::Wait => None,
             Plan::Pair(slot) => self.join(owner, usize::from(slot)),
             // The preferred pair, else the owner's least-loaded other pair:
@@ -524,9 +525,11 @@ impl Pool {
         self.state.lock().owner_quarantine(owner) == Some(true)
     }
 
+    /// For an owner that may hold `pairs` render pairs.
     pub(crate) fn acquire_render(
         self: &Arc<Self>,
         owner: u64,
+        pairs: usize,
         request: Option<Request<'_>>,
         deadline_ns: u64,
         check: impl Fn() -> Result,
@@ -575,7 +578,7 @@ impl Pool {
             } else {
                 state.plan(owner, request, ticket)
             };
-            if let Some(slot) = state.pick(owner, plan) {
+            if let Some(slot) = state.pick(owner, pairs, plan) {
                 state.forget_waiter(ticket.take());
                 let record =
                     request.and_then(|request| state.record(owner, Some(slot), 0, request));
@@ -618,6 +621,7 @@ impl Pool {
     pub(crate) fn try_acquire_render(
         self: &Arc<Self>,
         owner: u64,
+        pairs: usize,
         request: Option<Request<'_>>,
     ) -> Result<Option<RenderLease>> {
         if owner == 0 {
@@ -628,7 +632,7 @@ impl Pool {
             return Ok(None);
         }
         let plan = state.plan(owner, request, None);
-        let Some(slot) = state.pick(owner, plan) else {
+        let Some(slot) = state.pick(owner, pairs, plan) else {
             return Ok(None);
         };
         let record = request.and_then(|request| state.record(owner, Some(slot), 0, request));
@@ -735,7 +739,7 @@ mod accounting_tests {
     fn every_logical_owner_fits_without_speculative_spares() {
         let mut state = State::new();
         for owner in 1..=u64::from(MAX_EXECUTION_CONTEXTS) {
-            let slot = state.acquire(owner).unwrap();
+            let slot = state.acquire(owner, 1).unwrap();
             assert_eq!(state.owners.iter().filter(|id| **id == owner).count(), 1);
             state.release(slot);
         }
@@ -746,7 +750,7 @@ mod accounting_tests {
     #[test]
     fn close_does_not_reuse_an_active_lease() {
         let mut state = State::new();
-        let slot = state.acquire(1).unwrap();
+        let slot = state.acquire(1, 1).unwrap();
         state.released |= 1u64 << slot;
         assert!(!state.reassign_unused_spare(slot, Some(1), None));
         state.release(slot);
@@ -759,7 +763,7 @@ mod accounting_tests {
     #[test]
     fn warming_quarantine_and_exit_hold_exclude_reassignment() {
         let mut state = State::new();
-        let primary = state.acquire(1).unwrap();
+        let primary = state.acquire(1, 1).unwrap();
         // A retained legacy sibling still obeys all quarantine/kill guards.
         state.owners[2] = 1;
         let spare = state.borrow_warm_sibling(1, primary).unwrap();
@@ -1070,7 +1074,7 @@ mod fault_capacity_tests {
     fn a_guilty_failure_makes_a_spared_quarantine_guilty() {
         let pool = Pool::new(MAX_EXECUTION_CONTEXTS).unwrap();
         let queue = pool.reserve_queue().unwrap();
-        let lease = pool.acquire_render(1, None, u64::MAX, || Ok(())).unwrap();
+        let lease = pool.acquire_render(1, 1, None, u64::MAX, || Ok(())).unwrap();
         let bit = 1u64 << lease.slot();
         assert!(!pool.spared_quarantined(1));
         lease.quarantine(true);
@@ -1096,7 +1100,7 @@ mod fault_capacity_tests {
         let pool = Pool::new(MAX_EXECUTION_CONTEXTS).unwrap();
         for owner in 1..=512 {
             let queue = pool.reserve_queue().unwrap();
-            let lease = pool.acquire_render(owner, None, u64::MAX, || Ok(())).unwrap();
+            let lease = pool.acquire_render(owner, 1, None, u64::MAX, || Ok(())).unwrap();
             lease.quarantine(false);
             pool.release_owner(owner);
             let bit = 1u64 << lease.slot();
@@ -1117,7 +1121,7 @@ mod fault_capacity_tests {
     #[test]
     fn published_exit_kill_holds_survive_close_and_drain() {
         let pool = Pool::new(MAX_EXECUTION_CONTEXTS).unwrap();
-        let lease = pool.acquire_render(1, None, u64::MAX, || Ok(())).unwrap();
+        let lease = pool.acquire_render(1, 1, None, u64::MAX, || Ok(())).unwrap();
         let bit = 1u64 << lease.slot();
         pool.release_owner(1);
         drop(lease);
@@ -1132,7 +1136,7 @@ mod fault_capacity_tests {
     #[test]
     fn consumed_scheduler_release_ends_the_kill_hold() {
         let pool = Pool::new(MAX_EXECUTION_CONTEXTS).unwrap();
-        let lease = pool.acquire_render(1, None, u64::MAX, || Ok(())).unwrap();
+        let lease = pool.acquire_render(1, 1, None, u64::MAX, || Ok(())).unwrap();
         let slot = lease.slot();
         let bit = 1u64 << slot;
         pool.release_owner(1);
@@ -1146,7 +1150,7 @@ mod fault_capacity_tests {
         // The killed context's pair is never reassigned as a spare, and a new owner takes
         // a new graph before it.
         assert!(!pool.reassign_unused_spare(slot, Some(1), Some(2)));
-        let next = pool.acquire_render(2, None, u64::MAX, || Ok(())).unwrap();
+        let next = pool.acquire_render(2, 1, None, u64::MAX, || Ok(())).unwrap();
         assert_ne!(next.slot(), slot);
         drop(next);
         pool.release_retained_owners_after_processor_stop();
@@ -1167,9 +1171,9 @@ mod fault_capacity_tests {
             // One pair released without a kill.
             state.killed &= !(1u64 << 7);
         }
-        let first = pool.acquire_render(1, None, u64::MAX, || Ok(())).unwrap();
+        let first = pool.acquire_render(1, 1, None, u64::MAX, || Ok(())).unwrap();
         assert_eq!(first.slot(), 7);
-        let second = pool.acquire_render(2, None, u64::MAX, || Ok(())).unwrap();
+        let second = pool.acquire_render(2, 1, None, u64::MAX, || Ok(())).unwrap();
         assert_eq!(usize::from(second.slot()), cfg::RENDER_SLOTS - 1);
         assert_eq!(pool.state.lock().killed & (1u64 << second.slot()), 0);
     }
@@ -1187,11 +1191,11 @@ mod fault_capacity_tests {
             }
         }
         // With room in the queue table a new owner builds a pair in an unowned slot.
-        let built = pool.acquire_render(1, None, u64::MAX, || Ok(())).unwrap();
+        let built = pool.acquire_render(1, 1, None, u64::MAX, || Ok(())).unwrap();
         assert!(usize::from(built.slot()) >= 8);
         // Without room it takes the killed pair released longest ago.
         pool.note_build_room(false);
-        let reused = pool.acquire_render(2, None, u64::MAX, || Ok(())).unwrap();
+        let reused = pool.acquire_render(2, 1, None, u64::MAX, || Ok(())).unwrap();
         assert_eq!(reused.slot(), 7);
         assert_eq!(pool.state.lock().killed & (1u64 << 7), 0);
         // It claims no sibling: neither another killed pair nor an unowned slot.
@@ -1216,12 +1220,12 @@ mod shared_depth_tests {
     #[test]
     fn a_full_pair_waits_for_retirement_instead_of_allocating_a_spare() {
         let mut state = State::new();
-        let first = state.acquire(1).unwrap();
-        for _ in 1..cfg::RENDER_DEPTH { assert_eq!(state.acquire(1), Some(first)); }
-        assert_eq!(state.acquire(1), None);
+        let first = state.acquire(1, 1).unwrap();
+        for _ in 1..cfg::RENDER_DEPTH { assert_eq!(state.acquire(1, 1), Some(first)); }
+        assert_eq!(state.acquire(1, 1), None);
         assert_eq!(state.owners.iter().filter(|id| **id == 1).count(), 1);
         state.release(first);
-        assert_eq!(state.acquire(1), Some(first));
+        assert_eq!(state.acquire(1, 1), Some(first));
     }
 }
 
@@ -1240,16 +1244,16 @@ mod owner_pair_tests {
         state.owners[1] = 1;
         state.owners[2] = 1;
         for _ in 0..cfg::RENDER_DEPTH {
-            assert_eq!(state.pick(1, Plan::Pair(1)), Some(1));
+            assert_eq!(state.pick(1, 1, Plan::Pair(1)), Some(1));
         }
         assert!(!state.can_pick(1, Plan::Pair(1)));
-        assert_eq!(state.pick(1, Plan::Pair(1)), None);
+        assert_eq!(state.pick(1, 1, Plan::Pair(1)), None);
         assert!(state.can_pick(1, Plan::Join(1)));
-        assert_eq!(state.pick(1, Plan::Join(1)), Some(2));
+        assert_eq!(state.pick(1, 1, Plan::Join(1)), Some(2));
         // With one pair a preference is the pair.
         state.owners[2] = 0;
         assert!(!state.can_pick(1, Plan::Join(1)));
-        assert_eq!(state.pick(1, Plan::Join(1)), None);
+        assert_eq!(state.pick(1, 1, Plan::Join(1)), None);
     }
 
     #[test]
@@ -1323,7 +1327,7 @@ mod deadline_tests {
             state.active = State::MASK;
         }
         let start = crate::g17::now_ns();
-        let result = pool.acquire_render(1, None, start + 20_000_000, || Ok(()));
+        let result = pool.acquire_render(1, 1, None, start + 20_000_000, || Ok(()));
         assert!(matches!(result, Err(error) if error == EBUSY));
         assert!(crate::g17::now_ns() - start < 500_000_000);
         assert!(pool.state.lock().footprints.is_empty());
@@ -1341,7 +1345,7 @@ mod deadline_tests {
             state.active = State::MASK;
         }
         let start = crate::g17::now_ns();
-        let result = pool.acquire_render(1, None, start + 2_000_000_000, || {
+        let result = pool.acquire_render(1, 1, None, start + 2_000_000_000, || {
             if crate::g17::now_ns() - start >= 10_000_000 { Err(ECANCELED) } else { Ok(()) }
         });
         assert!(matches!(result, Err(error) if error == ECANCELED));
@@ -1352,7 +1356,7 @@ mod deadline_tests {
     #[test]
     fn cancellation_precedes_available_capacity() {
         let pool = Pool::new(MAX_EXECUTION_CONTEXTS).unwrap();
-        assert!(matches!(pool.acquire_render(1, None, u64::MAX, || Err(ECANCELED)),
+        assert!(matches!(pool.acquire_render(1, 1, None, u64::MAX, || Err(ECANCELED)),
                          Err(error) if error == ECANCELED));
         assert_eq!(pool.state.lock().active, 0);
     }
