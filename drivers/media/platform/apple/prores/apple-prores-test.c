@@ -336,6 +336,152 @@ static void apr_test_output(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apr_check_output(out, SZ_4K, &bytes), -EIO);
 }
 
+static void apr_test_decode_desc(struct kunit *test)
+{
+	struct apr_decode_frame f = {
+		.width = 320, .height = 240, .output = APR_INPUT_422_16,
+		.luma_stride = 640, .chroma_stride = 640,
+		.input = 0x10000100000ULL, .luma = 0x10000200000ULL,
+		.chroma = 0x10000300000ULL, .job_id = 0x1234,
+	};
+	u8 *d = kunit_kmalloc(test, APR_DECODE_DESC_BYTES + 1, GFP_KERNEL);
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, d);
+	memset(d, 0xa5, APR_DECODE_DESC_BYTES + 1);
+	KUNIT_ASSERT_EQ(test, apr_build_decode_desc(&f, d), 0);
+	KUNIT_EXPECT_EQ(test, d[APR_DECODE_DESC_BYTES], 0xa5);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(d), 0x1234120b);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 4), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 8), f.input);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x14), 320);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x16), 240);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x1c), 320);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x1e), 240);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x20), 10);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x22), 10);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x28), f.luma);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x30), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x38), f.chroma);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x40), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x48), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 0x90), 3);
+	for (i = 0x94; i < APR_DECODE_DESC_BYTES; i++)
+		KUNIT_EXPECT_EQ_MSG(test, d[i], 0, "reserved byte %#x", i);
+
+	f.output = APR_INPUT_444_16;
+	f.chroma_stride = 1280;
+	f.bottom_field_first = true;
+	KUNIT_ASSERT_EQ(test, apr_build_decode_desc(&f, d), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(d), 0x1234520f);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x22), 20);
+	f.luma_stride = 600;
+	KUNIT_EXPECT_EQ(test, apr_build_decode_desc(&f, d), -EINVAL);
+}
+
+static u8 *apr_test_bitstream(struct kunit *test, bool interlaced, size_t *bytes)
+{
+	u32 slices = interlaced ? 24 : 45;
+	u32 picture_size = 8 + 2 * slices + 6 * slices;
+	u32 pictures = interlaced ? 2 : 1;
+	u32 frame_size = 28 + pictures * picture_size;
+	u8 *frame = kunit_kzalloc(test, frame_size, GFP_KERNEL);
+	u32 offset = 28;
+	unsigned int i, p;
+
+	if (!frame)
+		return NULL;
+	put_unaligned_be32(frame_size, frame);
+	memcpy(frame + 4, "icpf", 4);
+	put_unaligned_be16(20, frame + 8);
+	put_unaligned_be16(0, frame + 10);
+	memcpy(frame + 12, "kunt", 4);
+	put_unaligned_be16(320, frame + 16);
+	put_unaligned_be16(240, frame + 18);
+	frame[20] = 2 << 6 | (interlaced ? 1 << 2 : 0);
+	frame[22] = 1;
+	frame[23] = 1;
+	frame[24] = 1;
+	for (p = 0; p < pictures; p++) {
+		u8 *picture = frame + offset;
+
+		picture[0] = 8 << 3;
+		put_unaligned_be32(picture_size, picture + 1);
+		put_unaligned_be16(slices, picture + 5);
+		picture[7] = 3 << 4;
+		for (i = 0; i < slices; i++)
+			put_unaligned_be16(6, picture + 8 + 2 * i);
+		offset += picture_size;
+	}
+	*bytes = frame_size;
+	return frame;
+}
+
+static void apr_test_parse_frame(struct kunit *test)
+{
+	struct apr_prores_info info;
+	size_t bytes;
+	u8 *frame = apr_test_bitstream(test, false, &bytes);
+
+	KUNIT_ASSERT_NOT_NULL(test, frame);
+	KUNIT_ASSERT_EQ(test, apr_parse_frame(frame, bytes, &info), 0);
+	KUNIT_EXPECT_EQ(test, info.frame_size, (u32)bytes);
+	KUNIT_EXPECT_EQ(test, info.width, 320U);
+	KUNIT_EXPECT_EQ(test, info.height, 240U);
+	KUNIT_EXPECT_EQ(test, info.chroma, (u8)2);
+	KUNIT_EXPECT_EQ(test, info.pictures, (u8)1);
+	KUNIT_EXPECT_EQ(test, info.slices[0], 45U);
+	KUNIT_EXPECT_EQ(test, info.picture_offset[0], 28U);
+
+	put_unaligned_be32(bytes - 1, frame);
+	KUNIT_EXPECT_EQ(test, apr_parse_frame(frame, bytes, &info), -EINVAL);
+	put_unaligned_be32(bytes, frame);
+	frame[4] = 'x';
+	KUNIT_EXPECT_EQ(test, apr_parse_frame(frame, bytes, &info), -EINVAL);
+}
+
+static void apr_test_parse_interlaced(struct kunit *test)
+{
+	struct apr_prores_info info;
+	size_t bytes;
+	u8 *frame = apr_test_bitstream(test, true, &bytes);
+
+	KUNIT_ASSERT_NOT_NULL(test, frame);
+	KUNIT_ASSERT_EQ(test, apr_parse_frame(frame, bytes, &info), 0);
+	KUNIT_EXPECT_EQ(test, info.frame_type, (u8)1);
+	KUNIT_EXPECT_EQ(test, info.pictures, (u8)2);
+	KUNIT_EXPECT_EQ(test, info.slices[0], 24U);
+	KUNIT_EXPECT_EQ(test, info.slices[1], 24U);
+	KUNIT_EXPECT_EQ(test, info.picture_offset[1],
+			info.picture_offset[0] + info.picture_size[0]);
+}
+
+static void apr_test_ring_accounting(struct kunit *test)
+{
+	u8 *ring = kunit_kzalloc(test, APR_RING_BYTES, GFP_KERNEL);
+	u8 *desc = kunit_kmalloc(test, APR_ENCODE_DESC_BYTES, GFP_KERNEL);
+	u32 ptr = APR_RING_BYTES - 0x100;
+	u32 next;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, ring);
+	KUNIT_ASSERT_NOT_NULL(test, desc);
+	next = apr_ring_advance(0, APR_DECODE_DESC_BYTES, APR_RING_BYTES);
+	KUNIT_EXPECT_EQ(test, next, 0x100U);
+	next = apr_ring_advance(0x100, APR_ENCODE_DESC_BYTES, APR_RING_BYTES);
+	KUNIT_EXPECT_EQ(test, next, 0x280U);
+	next = apr_ring_advance(ptr, APR_ENCODE_DESC_BYTES, APR_RING_BYTES);
+	KUNIT_EXPECT_EQ(test, next, APR_RING_GENERATION | 0x80U);
+	next = apr_ring_advance(APR_RING_GENERATION | APR_RING_BYTES - 0x80,
+				APR_DECODE_DESC_BYTES, APR_RING_BYTES);
+	KUNIT_EXPECT_EQ(test, next, 0x80U);
+	for (i = 0; i < APR_ENCODE_DESC_BYTES; i++)
+		desc[i] = i;
+	apr_ring_write(ring, APR_RING_BYTES, ptr, desc, APR_ENCODE_DESC_BYTES);
+	KUNIT_EXPECT_MEMEQ(test, ring + ptr, desc, 0x100);
+	KUNIT_EXPECT_MEMEQ(test, ring, desc + 0x100, 0x80);
+}
+
 static struct kunit_case apr_test_cases[] = {
 	KUNIT_CASE(apr_test_qmat_regs),
 	KUNIT_CASE(apr_test_dc_scale),
@@ -348,6 +494,10 @@ static struct kunit_case apr_test_cases[] = {
 	KUNIT_CASE(apr_test_budgets),
 	KUNIT_CASE(apr_test_slices),
 	KUNIT_CASE(apr_test_output),
+	KUNIT_CASE(apr_test_decode_desc),
+	KUNIT_CASE(apr_test_parse_frame),
+	KUNIT_CASE(apr_test_parse_interlaced),
+	KUNIT_CASE(apr_test_ring_accounting),
 	{}
 };
 
@@ -357,6 +507,6 @@ static struct kunit_suite apr_test_suite = {
 };
 kunit_test_suite(apr_test_suite);
 
-MODULE_DESCRIPTION("KUnit tests for the Apple ProRes encoder");
+MODULE_DESCRIPTION("KUnit tests for the Apple ProRes codec");
 MODULE_LICENSE("GPL");
 MODULE_IMPORT_NS("EXPORTED_FOR_KUNIT_TESTING");

@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Apple ProRes (APR) V4L2 memory-to-memory encoder.
+ * Apple ProRes (APR) V4L2 memory-to-memory codec.
  *
  * One job runs at a time. The driver writes a descriptor into a 128 KiB DMA
  * ring, advances the producer head and waits for the completion interrupt.
- * Raw frames come in on the OUTPUT queue as semi-planar 4:2:2 or 4:4:4 (8 or
- * 16 bits per sample) and complete ProRes frames go out on CAPTURE.
+ * The encoder consumes semi-planar 4:2:2 or 4:4:4 frames and produces one
+ * complete ProRes frame per buffer. The decoder exposes a second stateful
+ * node with the queue directions reversed and linear color output.
  *
  * Based on Acelogic's J700 ProRes diagnostic, which first encoded on this
  * engine under Linux, and on the m1n1 proxyclient ProRes experiment (MIT).
@@ -42,8 +43,9 @@
 #define APR_NAME		"apple-prores"
 #define APR_MIN_W		16
 #define APR_MIN_H		16
-#define APR_MAX_W		8192
-#define APR_MAX_H		8192
+#define APR_MAX_W		U16_MAX
+#define APR_MAX_H		U16_MAX
+#define APR_MAX_PIXELS		0x10000000
 #define APR_TIMEOUT_MS		1000
 #define APR_POLL_MS		4
 #define APR_AUTOSUSPEND_MS	500
@@ -256,6 +258,7 @@ struct apr_stats_regs {
 /* Selected only by the DT compatible, before mapping any resources. */
 struct apr_variant {
 	int (*build_desc)(const struct apr_frame *f, u8 *desc);
+	bool has_decoder;
 	struct apr_stats_regs stats[2];
 	const struct apr_tunable *engine_tunables;
 	size_t num_engine_tunables;
@@ -265,11 +268,12 @@ struct apr_variant {
 	unsigned int num_regs;
 	unsigned int num_irqs;
 	u32 ring_bytes;
-	u32 desc_bytes;
+	u32 encode_desc_bytes;
 };
 
 static const struct apr_variant apr_t8140 = {
 	.build_desc = apr_build_desc,
+	.has_decoder = true,
 	.stats = {
 		{ APR_REG_STATS0_LO, APR_REG_STATS0_HI, APR_REG_STATS0_SIZE },
 		{ APR_REG_STATS1_LO, APR_REG_STATS1_HI, APR_REG_STATS1_SIZE },
@@ -282,11 +286,12 @@ static const struct apr_variant apr_t8140 = {
 	.num_regs = 2,
 	.num_irqs = 2,
 	.ring_bytes = APR_RING_BYTES,
-	.desc_bytes = APR_DESC_BYTES,
+	.encode_desc_bytes = APR_ENCODE_DESC_BYTES,
 };
 
 static const struct apr_variant apr_t6000 = {
 	.build_desc = apr_build_desc_v0,
+	.has_decoder = true,
 	.stats = { { 0x278, 0x27c, 0x280 }, { 0x358, 0x35c, 0x360 } },
 	.engine_tunables = apr_t6000_engine_tunables,
 	.num_engine_tunables = ARRAY_SIZE(apr_t6000_engine_tunables),
@@ -294,7 +299,7 @@ static const struct apr_variant apr_t6000 = {
 	.num_regs = 2,
 	.num_irqs = 1,
 	.ring_bytes = APR_RING_BYTES,
-	.desc_bytes = APR_DESC_BYTES,
+	.encode_desc_bytes = APR_ENCODE_DESC_BYTES,
 };
 
 struct apr_dev {
@@ -307,7 +312,8 @@ struct apr_dev {
 	int irq[2];
 
 	struct v4l2_device v4l2_dev;
-	struct video_device vdev;
+	struct video_device enc_vdev;
+	struct video_device dec_vdev;
 	struct v4l2_m2m_dev *m2m_dev;
 	struct mutex vdev_lock;	/* serialises ioctls and queue state */
 
@@ -336,6 +342,10 @@ struct apr_ctx {
 	struct v4l2_pix_format_mplane src_fmt;
 	struct v4l2_pix_format_mplane dst_fmt;
 	const struct apr_fmt *raw;
+	bool decode;
+	bool source_valid;
+	bool decode_444;
+	bool cancelled;
 	enum apr_profile stream_profile;	/* fixed while OUTPUT streams */
 	u32 sequence;
 };
@@ -488,6 +498,57 @@ static void apr_fill_frame(struct apr_ctx *ctx, struct vb2_v4l2_buffer *src,
 	};
 }
 
+static int apr_parse_src(struct vb2_v4l2_buffer *src,
+			 struct apr_prores_info *info)
+{
+	struct vb2_buffer *vb = &src->vb2_buf;
+	u32 payload = vb2_get_plane_payload(vb, 0);
+	u32 offset = vb->planes[0].data_offset;
+	u8 *data = vb2_plane_vaddr(vb, 0);
+
+	if (!data || offset > payload)
+		return -EINVAL;
+	return apr_parse_frame(data + offset, payload - offset, info);
+}
+
+static int apr_fill_decode_frame(struct apr_ctx *ctx,
+				 struct vb2_v4l2_buffer *src,
+				 struct vb2_v4l2_buffer *dst,
+				 struct apr_decode_frame *f)
+{
+	const struct v4l2_pix_format_mplane *d = &ctx->dst_fmt;
+	struct apr_prores_info info;
+	dma_addr_t output;
+	u32 luma_stride;
+	int ret;
+
+	ret = apr_parse_src(src, &info);
+	if (ret)
+		return ret;
+	/* The non-RAW descriptor accepts one picture; field repacking is later. */
+	if (info.pictures != 1)
+		return -EOPNOTSUPP;
+	if (info.width != d->width || info.height != d->height ||
+	    info.chroma == 3 != ctx->raw->is444)
+		return -EINVAL;
+
+	luma_stride = d->plane_fmt[0].bytesperline;
+	output = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 0);
+	*f = (struct apr_decode_frame){
+		.width = info.width,
+		.height = info.height,
+		.output = ctx->raw->input,
+		.luma_stride = luma_stride,
+		.chroma_stride = luma_stride * (ctx->raw->is444 ? 2 : 1),
+		.input = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0) +
+			 src->vb2_buf.planes[0].data_offset,
+		.luma = output,
+		.chroma = output + (u64)luma_stride * d->height,
+		.job_id = ctx->sequence,
+	};
+	return 0;
+}
+
 static void apr_finish_job(struct apr_dev *apr, struct apr_ctx *ctx, int err)
 {
 	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
@@ -499,7 +560,7 @@ static void apr_finish_job(struct apr_dev *apr, struct apr_ctx *ctx, int err)
 	if (WARN_ON(!src || !dst))
 		goto out;
 
-	if (!err) {
+	if (!err && !ctx->decode) {
 		u8 *out = vb2_plane_vaddr(&dst->vb2_buf, 0);
 
 		/* The engine wrote the frame through the DART; see it now. */
@@ -508,6 +569,11 @@ static void apr_finish_job(struct apr_dev *apr, struct apr_ctx *ctx, int err)
 					     &bytes) : -EIO;
 		if (err)
 			dev_err_ratelimited(apr->dev, "engine returned no frame\n");
+	}
+	if (!err && ctx->decode) {
+		/* The ACK and tail read complete before output ownership returns. */
+		dma_rmb();
+		bytes = ctx->dst_fmt.plane_fmt[0].sizeimage;
 	}
 	vb2_set_plane_payload(&dst->vb2_buf, 0, err ? 0 : bytes);
 	v4l2_m2m_buf_copy_metadata(src, dst);
@@ -535,23 +601,37 @@ out:
 static struct apr_ctx *apr_take_done(struct apr_dev *apr, int *err)
 {
 	struct apr_ctx *ctx = apr->active;
-	u32 status, tail;
+	u32 status, tail, st0, st1, st2;
+	u32 detail[6];
 
 	if (!ctx)
 		return NULL;
 	status = apr_read(apr, APR_REG_IRQ_STATUS);
-	if (!status)
+	if (!(status & (APR_IRQ_DONE | APR_IRQ_ERROR)))
 		return NULL;
+	st0 = apr_read(apr, APR_REG_ST0);
+	st1 = apr_read(apr, APR_REG_ST1);
+	st2 = apr_read(apr, APR_REG_ST2);
+	detail[0] = apr_read(apr, APR_REG_DETAIL0);
+	detail[1] = apr_read(apr, APR_REG_DETAIL1_LO);
+	detail[2] = apr_read(apr, APR_REG_DETAIL1_HI);
+	detail[3] = apr_read(apr, APR_REG_DETAIL2_LO);
+	detail[4] = apr_read(apr, APR_REG_DETAIL2_HI);
+	detail[5] = apr_read(apr, APR_REG_DETAIL3);
 	apr_write(apr, APR_REG_IRQ_STATUS, status);
+	/* The tail read flushes the posted W1C before buffers are released. */
 	tail = apr_read(apr, APR_REG_RING_TAIL) & APR_RING_PTR_MASK;
 	*err = 0;
-	if (status != APR_IRQ_DONE || tail != apr->head) {
+	if (!(status & APR_IRQ_DONE) || status & APR_IRQ_ERROR || tail != apr->head) {
 		dev_err_ratelimited(apr->dev,
-				    "job failed: status %#x tail %#x head %#x st %#x/%#x\n",
-				    status, tail, apr->head,
-				    apr_read(apr, APR_REG_ST0), apr_read(apr, APR_REG_ST1));
+				    "job failed: irq %#x tail %#x head %#x st %#x/%#x/%#x detail %#x/%#x/%#x/%#x/%#x/%#x\n",
+				    status, tail, apr->head, st0, st1, st2,
+				    detail[0], detail[1], detail[2], detail[3],
+				    detail[4], detail[5]);
 		*err = -EIO;
 	}
+	if (ctx->cancelled)
+		*err = -ECANCELED;
 	apr->active = NULL;
 	return ctx;
 }
@@ -626,6 +706,9 @@ static void apr_device_run(void *priv)
 	struct apr_dev *apr = ctx->apr;
 	struct vb2_v4l2_buffer *src, *dst;
 	struct apr_frame f;
+	struct apr_decode_frame decode;
+	u8 desc[APR_ENCODE_DESC_BYTES];
+	u32 desc_bytes;
 	unsigned long flags;
 	void *out;
 	int ret;
@@ -639,14 +722,24 @@ static void apr_device_run(void *priv)
 		apr_finish_job(apr, ctx, ret);
 		return;
 	}
-	apr_fill_frame(ctx, src, dst, &f);
-	/* Mark the output invalid so a frame the engine never wrote is caught. */
-	out = vb2_plane_vaddr(&dst->vb2_buf, 0);
-	if (!out) {
-		apr_finish_job(apr, ctx, -EINVAL);
+	if (ctx->decode) {
+		ret = apr_fill_decode_frame(ctx, src, dst, &decode);
+		desc_bytes = APR_DECODE_DESC_BYTES;
+	} else {
+		apr_fill_frame(ctx, src, dst, &f);
+		ret = 0;
+		desc_bytes = apr->variant->encode_desc_bytes;
+		/* Mark output invalid so a frame the engine never wrote is caught. */
+		out = vb2_plane_vaddr(&dst->vb2_buf, 0);
+		if (!out)
+			ret = -EINVAL;
+		else
+			memset(out, 0, 8);
+	}
+	if (ret) {
+		apr_finish_job(apr, ctx, ret);
 		return;
 	}
-	memset(out, 0, 8);
 
 	spin_lock_irqsave(&apr->hw_lock, flags);
 	if (apr->broken) {
@@ -654,21 +747,21 @@ static void apr_device_run(void *priv)
 		apr_finish_job(apr, ctx, -EIO);
 		return;
 	}
-	/*
-	 * The engine's ring wrap protocol is not known, so start again at the
-	 * beginning of the ring instead of wrapping. The engine is idle here.
-	 */
-	if (!apr->ring_ready ||
-	    apr->head + apr->variant->desc_bytes > apr->variant->ring_bytes)
+	if (!apr->ring_ready)
 		apr_hw_init(apr);
-	ret = apr->variant->build_desc(&f, apr->ring + apr->head);
+	ret = ctx->decode ? apr_build_decode_desc(&decode, desc) :
+			    apr->variant->build_desc(&f, desc);
 	if (ret) {
 		spin_unlock_irqrestore(&apr->hw_lock, flags);
 		apr_finish_job(apr, ctx, ret);
 		return;
 	}
-	apr->head += apr->variant->desc_bytes;
+	apr_ring_write(apr->ring, apr->variant->ring_bytes, apr->head,
+		       desc, desc_bytes);
+	apr->head = apr_ring_advance(apr->head, desc_bytes,
+				     apr->variant->ring_bytes);
 	apr->active = ctx;
+	ctx->cancelled = false;
 	apr->started = jiffies;
 	/* Descriptor and buffers must be visible before the head moves. */
 	dma_wmb();
@@ -677,8 +770,39 @@ static void apr_device_run(void *priv)
 	schedule_delayed_work(&apr->watchdog, msecs_to_jiffies(APR_POLL_MS));
 }
 
+static int apr_job_ready(void *priv)
+{
+	struct apr_ctx *ctx = priv;
+	struct vb2_v4l2_buffer *src;
+	struct apr_prores_info info;
+
+	if (!ctx->decode)
+		return 1;
+	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
+	if (!src || apr_parse_src(src, &info))
+		return 1;
+	return info.width == ctx->dst_fmt.width &&
+	       info.height == ctx->dst_fmt.height &&
+	       (info.chroma == 3) == ctx->raw->is444;
+}
+
+static void apr_job_abort(void *priv)
+{
+	struct apr_ctx *ctx = priv;
+	struct apr_dev *apr = ctx->apr;
+	unsigned long flags;
+
+	/* There is no decode- or encode-specific cancellation opcode. */
+	spin_lock_irqsave(&apr->hw_lock, flags);
+	if (apr->active == ctx)
+		ctx->cancelled = true;
+	spin_unlock_irqrestore(&apr->hw_lock, flags);
+}
+
 static const struct v4l2_m2m_ops apr_m2m_ops = {
 	.device_run = apr_device_run,
+	.job_ready = apr_job_ready,
+	.job_abort = apr_job_abort,
 };
 
 /* ---- formats ----------------------------------------------------------- */
@@ -700,11 +824,21 @@ static const struct apr_fmt *apr_find_raw(u32 fourcc)
  */
 static void apr_fill_raw(struct v4l2_pix_format_mplane *pix, const struct apr_fmt *fmt)
 {
-	u32 width = clamp_t(u32, ALIGN(pix->width, 2), APR_MIN_W, APR_MAX_W);
+	u32 width = clamp_t(u32, pix->width, APR_MIN_W, APR_MAX_W);
 	u32 height = clamp_t(u32, pix->height, APR_MIN_H, APR_MAX_H);
-	u32 min_stride = ALIGN(width * fmt->bytes, 64);
-	u32 stride = ALIGN(pix->plane_fmt[0].bytesperline, 64);
+	u32 stride_align;
+	u32 min_stride;
+	u32 stride;
 	u32 cstride;
+
+	if (!fmt->is444)
+		width = min_t(u32, ALIGN(width, 2), APR_MAX_W - 1);
+	if ((u64)width * height > APR_MAX_PIXELS)
+		height = APR_MAX_PIXELS / width;
+	/* An odd row count needs a 128-byte stride to align plane 1. */
+	stride_align = height & 1 ? 128 : 64;
+	min_stride = ALIGN(width * fmt->bytes, stride_align);
+	stride = ALIGN(pix->plane_fmt[0].bytesperline, stride_align);
 
 	/* Accept padding up to one extra row width, as other drivers do. */
 	if (stride < min_stride || stride > 2 * min_stride)
@@ -740,25 +874,62 @@ static void apr_fill_coded(struct v4l2_pix_format_mplane *dst,
 	dst->plane_fmt[0].sizeimage = apr_coded_size(src->width, src->height, is444);
 }
 
+static void apr_fill_decode_coded(struct v4l2_pix_format_mplane *pix)
+{
+	u32 size = pix->plane_fmt[0].sizeimage;
+
+	pix->width = clamp_t(u32, pix->width, APR_MIN_W, APR_MAX_W);
+	pix->height = clamp_t(u32, pix->height, APR_MIN_H, APR_MAX_H);
+	if ((u64)pix->width * pix->height > APR_MAX_PIXELS)
+		pix->height = APR_MAX_PIXELS / pix->width;
+	pix->pixelformat = V4L2_PIX_FMT_PRORES;
+	pix->field = V4L2_FIELD_NONE;
+	pix->num_planes = 1;
+	pix->flags = 0;
+	memset(pix->reserved, 0, sizeof(pix->reserved));
+	memset(pix->plane_fmt, 0, sizeof(pix->plane_fmt));
+	pix->plane_fmt[0].sizeimage = clamp_t(u32, size, SZ_4K, SZ_256M);
+}
+
 static void apr_reset_fmts(struct apr_ctx *ctx)
 {
-	ctx->raw = &apr_raw_fmts[0];
+	ctx->raw = ctx->decode ? &apr_raw_fmts[1] : &apr_raw_fmts[0];
 	memset(&ctx->src_fmt, 0, sizeof(ctx->src_fmt));
 	ctx->src_fmt.width = 1920;
 	ctx->src_fmt.height = 1080;
-	apr_fill_raw(&ctx->src_fmt, ctx->raw);
-	apr_fill_coded(&ctx->dst_fmt, &ctx->src_fmt, ctx->raw->is444);
+	if (ctx->decode) {
+		ctx->src_fmt.plane_fmt[0].sizeimage =
+			apr_coded_size(1920, 1080, false);
+		apr_fill_decode_coded(&ctx->src_fmt);
+		ctx->dst_fmt = ctx->src_fmt;
+		apr_fill_raw(&ctx->dst_fmt, ctx->raw);
+	} else {
+		apr_fill_raw(&ctx->src_fmt, ctx->raw);
+		apr_fill_coded(&ctx->dst_fmt, &ctx->src_fmt, ctx->raw->is444);
+	}
 }
 
 static int apr_querycap(struct file *file, void *priv, struct v4l2_capability *cap)
 {
+	struct apr_ctx *ctx = apr_file_to_ctx(file);
+
 	strscpy(cap->driver, APR_NAME, sizeof(cap->driver));
-	strscpy(cap->card, "Apple ProRes encoder", sizeof(cap->card));
+	strscpy(cap->card, ctx->decode ? "Apple ProRes decoder" :
+					  "Apple ProRes encoder", sizeof(cap->card));
 	return 0;
 }
 
 static int apr_enum_fmt_out(struct file *file, void *priv, struct v4l2_fmtdesc *f)
 {
+	struct apr_ctx *ctx = apr_file_to_ctx(file);
+
+	if (ctx->decode) {
+		if (f->index)
+			return -EINVAL;
+		f->pixelformat = V4L2_PIX_FMT_PRORES;
+		f->flags = V4L2_FMT_FLAG_COMPRESSED;
+		return 0;
+	}
 	if (f->index >= ARRAY_SIZE(apr_raw_fmts))
 		return -EINVAL;
 	f->pixelformat = apr_raw_fmts[f->index].fourcc;
@@ -767,6 +938,14 @@ static int apr_enum_fmt_out(struct file *file, void *priv, struct v4l2_fmtdesc *
 
 static int apr_enum_fmt_cap(struct file *file, void *priv, struct v4l2_fmtdesc *f)
 {
+	struct apr_ctx *ctx = apr_file_to_ctx(file);
+
+	if (ctx->decode) {
+		if (f->index >= ARRAY_SIZE(apr_raw_fmts))
+			return -EINVAL;
+		f->pixelformat = apr_raw_fmts[f->index].fourcc;
+		return 0;
+	}
 	if (f->index)
 		return -EINVAL;
 	f->pixelformat = V4L2_PIX_FMT_PRORES;
@@ -777,12 +956,15 @@ static int apr_enum_fmt_cap(struct file *file, void *priv, struct v4l2_fmtdesc *
 static int apr_enum_framesizes(struct file *file, void *priv,
 			       struct v4l2_frmsizeenum *fs)
 {
+	const struct apr_fmt *fmt = apr_find_raw(fs->pixel_format);
+
 	if (fs->index || (fs->pixel_format != V4L2_PIX_FMT_PRORES &&
-			  !apr_find_raw(fs->pixel_format)))
+			  !fmt))
 		return -EINVAL;
 	fs->type = V4L2_FRMSIZE_TYPE_STEPWISE;
 	fs->stepwise = (struct v4l2_frmsize_stepwise){
-		APR_MIN_W, APR_MAX_W, 2, APR_MIN_H, APR_MAX_H, 1,
+		APR_MIN_W, APR_MAX_W, fmt && !fmt->is444 ? 2 : 1,
+		APR_MIN_H, APR_MAX_H, 1,
 	};
 	return 0;
 }
@@ -801,8 +983,13 @@ static int apr_g_fmt_cap(struct file *file, void *priv, struct v4l2_format *f)
 
 static int apr_try_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
 {
+	struct apr_ctx *ctx = apr_file_to_ctx(file);
 	const struct apr_fmt *fmt = apr_find_raw(f->fmt.pix_mp.pixelformat);
 
+	if (ctx->decode) {
+		apr_fill_decode_coded(&f->fmt.pix_mp);
+		return 0;
+	}
 	apr_fill_raw(&f->fmt.pix_mp, fmt ?: &apr_raw_fmts[0]);
 	return 0;
 }
@@ -811,7 +998,17 @@ static int apr_try_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
 static int apr_try_fmt_cap(struct file *file, void *priv, struct v4l2_format *f)
 {
 	struct apr_ctx *ctx = apr_file_to_ctx(file);
+	const struct apr_fmt *fmt;
 
+	if (ctx->decode) {
+		fmt = apr_find_raw(f->fmt.pix_mp.pixelformat);
+		if (!fmt || (ctx->source_valid && fmt->is444 != ctx->decode_444))
+			fmt = &apr_raw_fmts[ctx->decode_444 ? 3 : 1];
+		f->fmt.pix_mp.width = ctx->src_fmt.width;
+		f->fmt.pix_mp.height = ctx->src_fmt.height;
+		apr_fill_raw(&f->fmt.pix_mp, fmt);
+		return 0;
+	}
 	apr_fill_coded(&f->fmt.pix_mp, &ctx->src_fmt, ctx->raw->is444);
 	return 0;
 }
@@ -826,6 +1023,8 @@ static int apr_s_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
 		return -EBUSY;
 	apr_try_fmt_out(file, priv, f);
 	ctx->src_fmt = f->fmt.pix_mp;
+	if (ctx->decode)
+		return 0;
 	ctx->raw = apr_find_raw(ctx->src_fmt.pixelformat);
 	apr_fill_coded(&ctx->dst_fmt, &ctx->src_fmt, ctx->raw->is444);
 	/* Keep the profile consistent with the chroma format. */
@@ -844,6 +1043,8 @@ static int apr_s_fmt_cap(struct file *file, void *priv, struct v4l2_format *f)
 		return -EBUSY;
 	apr_try_fmt_cap(file, priv, f);
 	ctx->dst_fmt = f->fmt.pix_mp;
+	if (ctx->decode)
+		ctx->raw = apr_find_raw(ctx->dst_fmt.pixelformat);
 	return 0;
 }
 
@@ -851,6 +1052,8 @@ static int apr_subscribe_event(struct v4l2_fh *fh, const struct v4l2_event_subsc
 {
 	if (sub->type == V4L2_EVENT_EOS)
 		return v4l2_event_subscribe(fh, sub, 0, NULL);
+	if (sub->type == V4L2_EVENT_SOURCE_CHANGE)
+		return v4l2_src_change_event_subscribe(fh, sub);
 	return v4l2_ctrl_subscribe_event(fh, sub);
 }
 
@@ -878,6 +1081,35 @@ static const struct v4l2_ioctl_ops apr_ioctl_ops = {
 
 	.vidioc_try_encoder_cmd = v4l2_m2m_ioctl_try_encoder_cmd,
 	.vidioc_encoder_cmd = v4l2_m2m_ioctl_encoder_cmd,
+
+	.vidioc_subscribe_event = apr_subscribe_event,
+	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
+};
+
+static const struct v4l2_ioctl_ops apr_decoder_ioctl_ops = {
+	.vidioc_querycap = apr_querycap,
+	.vidioc_enum_fmt_vid_out = apr_enum_fmt_out,
+	.vidioc_enum_fmt_vid_cap = apr_enum_fmt_cap,
+	.vidioc_enum_framesizes = apr_enum_framesizes,
+	.vidioc_g_fmt_vid_out_mplane = apr_g_fmt_out,
+	.vidioc_g_fmt_vid_cap_mplane = apr_g_fmt_cap,
+	.vidioc_try_fmt_vid_out_mplane = apr_try_fmt_out,
+	.vidioc_try_fmt_vid_cap_mplane = apr_try_fmt_cap,
+	.vidioc_s_fmt_vid_out_mplane = apr_s_fmt_out,
+	.vidioc_s_fmt_vid_cap_mplane = apr_s_fmt_cap,
+
+	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
+	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
+	.vidioc_qbuf = v4l2_m2m_ioctl_qbuf,
+	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
+	.vidioc_prepare_buf = v4l2_m2m_ioctl_prepare_buf,
+	.vidioc_create_bufs = v4l2_m2m_ioctl_create_bufs,
+	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
+	.vidioc_streamon = v4l2_m2m_ioctl_streamon,
+	.vidioc_streamoff = v4l2_m2m_ioctl_streamoff,
+
+	.vidioc_try_decoder_cmd = v4l2_m2m_ioctl_try_decoder_cmd,
+	.vidioc_decoder_cmd = v4l2_m2m_ioctl_decoder_cmd,
 
 	.vidioc_subscribe_event = apr_subscribe_event,
 	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
@@ -912,12 +1144,60 @@ static int apr_buf_prepare(struct vb2_buffer *vb)
 	if (vb2_plane_size(vb, 0) < size)
 		return -EINVAL;
 	if (V4L2_TYPE_IS_OUTPUT(vb->type)) {
-		/* The engine always reads the whole padded surface. */
-		vb2_set_plane_payload(vb, 0, size);
+		if (ctx->decode) {
+			u32 payload = vb2_get_plane_payload(vb, 0);
+
+			if (payload < 28 || vb->planes[0].data_offset > payload)
+				return -EINVAL;
+		} else {
+			/* The encoder always reads the whole padded surface. */
+			vb2_set_plane_payload(vb, 0, size);
+		}
 	} else {
 		vb2_set_plane_payload(vb, 0, 0);
 	}
 	return 0;
+}
+
+static void apr_decode_source_change(struct apr_ctx *ctx,
+				     struct vb2_v4l2_buffer *vbuf)
+{
+	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
+	struct apr_prores_info info;
+	bool changed;
+	unsigned int i;
+
+	if (apr_parse_src(vbuf, &info))
+		return;
+	changed = !ctx->source_valid || ctx->src_fmt.width != info.width ||
+		  ctx->src_fmt.height != info.height ||
+		  ctx->decode_444 != (info.chroma == 3);
+	if (!changed)
+		return;
+	ctx->source_valid = true;
+	ctx->decode_444 = info.chroma == 3;
+	ctx->src_fmt.width = info.width;
+	ctx->src_fmt.height = info.height;
+	if (!vb2_is_busy(v4l2_m2m_get_dst_vq(m2m))) {
+		for (i = 0; i < ARRAY_SIZE(apr_raw_fmts); i++) {
+			if (apr_raw_fmts[i].is444 == ctx->decode_444 &&
+			    apr_raw_fmts[i].bytes == ctx->raw->bytes) {
+				ctx->raw = &apr_raw_fmts[i];
+				break;
+			}
+		}
+		ctx->dst_fmt.width = info.width;
+		ctx->dst_fmt.height = info.height;
+		apr_fill_raw(&ctx->dst_fmt, ctx->raw);
+	}
+	{
+		const struct v4l2_event event = {
+			.type = V4L2_EVENT_SOURCE_CHANGE,
+			.u.src_change.changes = V4L2_EVENT_SRC_CH_RESOLUTION,
+		};
+
+		v4l2_event_queue_fh(&ctx->fh, &event);
+	}
 }
 
 static void apr_buf_queue(struct vb2_buffer *vb)
@@ -925,6 +1205,8 @@ static void apr_buf_queue(struct vb2_buffer *vb)
 	struct apr_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
 
+	if (ctx->decode && V4L2_TYPE_IS_OUTPUT(vb->type))
+		apr_decode_source_change(ctx, vbuf);
 	if (!V4L2_TYPE_IS_OUTPUT(vb->type) &&
 	    vb2_is_streaming(vb->vb2_queue) &&
 	    v4l2_m2m_dst_buf_is_last(ctx->fh.m2m_ctx)) {
@@ -940,7 +1222,7 @@ static int apr_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct apr_ctx *ctx = vb2_get_drv_priv(q);
 
-	if (V4L2_TYPE_IS_OUTPUT(q->type)) {
+	if (V4L2_TYPE_IS_OUTPUT(q->type) && !ctx->decode) {
 		if (ctx->raw->is444 != apr_profile_is_444(v4l2_ctrl_g_ctrl(ctx->profile))) {
 			struct vb2_v4l2_buffer *vbuf;
 
@@ -970,7 +1252,7 @@ static void apr_stop_streaming(struct vb2_queue *q)
 		v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_ERROR);
 	}
 	v4l2_m2m_update_stop_streaming_state(ctx->fh.m2m_ctx, q);
-	if (V4L2_TYPE_IS_OUTPUT(q->type))
+	if (V4L2_TYPE_IS_OUTPUT(q->type) && !ctx->decode)
 		v4l2_ctrl_grab(ctx->profile, false);
 	if (V4L2_TYPE_IS_OUTPUT(q->type) && v4l2_m2m_has_stopped(ctx->fh.m2m_ctx)) {
 		static const struct v4l2_event eos = { .type = V4L2_EVENT_EOS };
@@ -1033,7 +1315,11 @@ static int apr_init_ctrls(struct apr_ctx *ctx)
 {
 	struct v4l2_ctrl_handler *hdl = &ctx->hdl;
 
-	v4l2_ctrl_handler_init(hdl, 1);
+	v4l2_ctrl_handler_init(hdl, ctx->decode ? 0 : 1);
+	if (ctx->decode) {
+		ctx->fh.ctrl_handler = hdl;
+		return 0;
+	}
 	/* The profile must match the raw format's chroma; checked at STREAMON. */
 	ctx->profile = v4l2_ctrl_new_std_menu(hdl, &apr_ctrl_ops,
 					      V4L2_CID_MPEG_VIDEO_PRORES_PROFILE,
@@ -1059,6 +1345,7 @@ static int apr_open(struct file *file)
 	if (!ctx)
 		return -ENOMEM;
 	ctx->apr = apr;
+	ctx->decode = video_devdata(file) == &apr->dec_vdev;
 	apr_reset_fmts(ctx);
 	v4l2_fh_init(&ctx->fh, video_devdata(file));
 	ret = apr_init_ctrls(ctx);
@@ -1264,10 +1551,10 @@ static int apr_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, -EINVAL, "statistics area larger than %zu bytes\n",
 				     apr->stats_size);
 	}
-	dev_info(dev, "ProRes encoder, id %#x\n", apr_read(apr, APR_REG_ID));
+	dev_info(dev, "ProRes codec, id %#x\n", apr_read(apr, APR_REG_ID));
 	pm_runtime_put_autosuspend(dev);
 
-	vdev = &apr->vdev;
+	vdev = &apr->enc_vdev;
 	strscpy(vdev->name, APR_NAME, sizeof(vdev->name));
 	vdev->fops = &apr_fops;
 	vdev->ioctl_ops = &apr_ioctl_ops;
@@ -1277,14 +1564,33 @@ static int apr_probe(struct platform_device *pdev)
 	vdev->vfl_dir = VFL_DIR_M2M;
 	vdev->device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING;
 	video_set_drvdata(vdev, apr);
-	return video_register_device(vdev, VFL_TYPE_VIDEO, -1);
+	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
+	if (ret || !apr->variant->has_decoder)
+		return ret;
+
+	vdev = &apr->dec_vdev;
+	strscpy(vdev->name, APR_NAME "-decode", sizeof(vdev->name));
+	vdev->fops = &apr_fops;
+	vdev->ioctl_ops = &apr_decoder_ioctl_ops;
+	vdev->release = video_device_release_empty;
+	vdev->lock = &apr->vdev_lock;
+	vdev->v4l2_dev = &apr->v4l2_dev;
+	vdev->vfl_dir = VFL_DIR_M2M;
+	vdev->device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING;
+	video_set_drvdata(vdev, apr);
+	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
+	if (ret)
+		video_unregister_device(&apr->enc_vdev);
+	return ret;
 }
 
 static void apr_remove(struct platform_device *pdev)
 {
 	struct apr_dev *apr = platform_get_drvdata(pdev);
 
-	video_unregister_device(&apr->vdev);
+	if (apr->variant->has_decoder)
+		video_unregister_device(&apr->dec_vdev);
+	video_unregister_device(&apr->enc_vdev);
 }
 
 static const struct of_device_id apr_of_match[] = {
@@ -1305,5 +1611,5 @@ static struct platform_driver apr_driver = {
 };
 module_platform_driver(apr_driver);
 
-MODULE_DESCRIPTION("Apple ProRes encoder");
+MODULE_DESCRIPTION("Apple ProRes codec");
 MODULE_LICENSE("GPL");
