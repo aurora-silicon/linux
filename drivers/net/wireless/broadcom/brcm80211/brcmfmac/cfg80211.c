@@ -4725,6 +4725,7 @@ static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
 	struct net_device *ndev = cfg_to_ndev(cfg);
 	struct brcmf_if *ifp = netdev_priv(ndev);
+	s32 err = 0;
 
 	brcmf_dbg(TRACE, "Enter\n");
 
@@ -4732,7 +4733,8 @@ static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 		if (cfg->wowl.lpas) {
 			cfg80211_report_wowlan_wakeup(&ifp->vif->wdev, NULL,
 						GFP_KERNEL);
-			return brcmf_restore_lpas(cfg, ifp);
+			err = brcmf_restore_lpas(cfg, ifp);
+			goto out;
 		}
 		brcmf_report_wowl_wakeind(wiphy, ifp);
 		brcmf_fil_iovar_int_set(ifp, "wowl_clear", 0);
@@ -4751,9 +4753,10 @@ static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 			cfg->wowl.nd_enabled = false;
 		}
 	}
+out:
 	cfg->suspended = false;
 	brcmf_cfg80211_update_country(cfg);
-	return 0;
+	return err;
 }
 
 static int brcmf_keepalive_start(struct brcmf_if *ifp,
