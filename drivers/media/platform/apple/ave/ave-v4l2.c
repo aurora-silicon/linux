@@ -462,6 +462,9 @@ static int ave_s_ctrl(struct v4l2_ctrl *ctrl)
 	case V4L2_CID_MPEG_VIDEO_HEVC_PROFILE:
 		ctx->hevc_profile = ctrl->val;
 		break;
+	case V4L2_CID_APPLE_AVE_PRIORITIZE_SPEED:
+		ctx->prioritize_speed = ctrl->val;
+		break;
 	case V4L2_CID_MPEG_VIDEO_HEADER_MODE:
 	case V4L2_CID_MIN_BUFFERS_FOR_OUTPUT:
 		break;
@@ -475,13 +478,22 @@ static const struct v4l2_ctrl_ops ave_ctrl_ops = {
 	.s_ctrl = ave_s_ctrl,
 };
 
+static const struct v4l2_ctrl_config ave_ctrl_prioritize_speed = {
+	.ops = &ave_ctrl_ops,
+	.id = V4L2_CID_APPLE_AVE_PRIORITIZE_SPEED,
+	.name = "Prioritize Speed Over Quality",
+	.type = V4L2_CTRL_TYPE_BOOLEAN,
+	.max = 1,
+	.step = 1,
+};
+
 static int ave_init_ctrls(struct ave_ctx *ctx)
 {
 	struct v4l2_ctrl_handler *hdl = &ctx->hdl;
 	const struct v4l2_ctrl_ops *ops = &ave_ctrl_ops;
 	struct v4l2_ctrl *c;
 
-	v4l2_ctrl_handler_init(hdl, 18);
+	v4l2_ctrl_handler_init(hdl, 19);
 
 	v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
 			       V4L2_MPEG_VIDEO_BITRATE_MODE_CQ, 0,
@@ -533,6 +545,9 @@ static int ave_init_ctrls(struct ave_ctx *ctx)
 			       V4L2_MPEG_VIDEO_HEVC_LEVEL_1);
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_HEVC_MIN_QP, 0, 51, 1, 0);
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP, 0, 51, 1, 51);
+
+	/* Off by default: macOS also codes for quality unless asked. */
+	v4l2_ctrl_new_custom(hdl, &ave_ctrl_prioritize_speed, NULL);
 
 	/* The firmware holds up to five frames; one more keeps it fed. */
 	c = v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MIN_BUFFERS_FOR_OUTPUT, 1, 32, 1,
