@@ -3444,3 +3444,5 @@
 	power-domain-names = "sys", "cpu", "mpm", "td", "base", "perf";
 	status = "okay";
 };
+
+#include "t604x-j614-j616-usb4.dtsi"

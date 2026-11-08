@@ -977,7 +977,7 @@ static u64 ane_h16_now(void *ctx)
  * sleeps. A fixed 1 ms sleep made each of the four waits of an EXECUTE cost
  * at least a millisecond.
  */
-static void ane_h16_relax(void *ctx, u64 waited_ns)
+static void ane_h16_service(void *ctx)
 {
 	struct ane_h16_device *h = ctx;
 	int ret;
@@ -986,6 +986,11 @@ static void ane_h16_relax(void *ctx, u64 waited_ns)
 	ret = ane_h16_faults(&h->boot, false);
 	if (ret)
 		ane_fw_transport_fail(&h->boot.transport, ret);
+}
+
+static void ane_h16_relax(void *ctx, u64 waited_ns)
+{
+	ane_h16_service(ctx);
 	ane_fw_poll_pause(waited_ns);
 }
 
@@ -1106,6 +1111,7 @@ static const struct ane_fw_transport_ops ane_h16_transport_ops = {
 	.write32 = ane_h16_engine_write,
 	.now_ns = ane_h16_now,
 	.relax = ane_h16_relax,
+	.service = ane_h16_service,
 	.alloc = ane_h16_alloc_shared,
 	.refused = ane_h16_refused,
 	.shared_note = ane_h16_shared_note,

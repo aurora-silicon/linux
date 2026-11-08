@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 #include <kunit/test.h>
 #include <linux/module.h>
+#include <linux/completion.h>
+#include <linux/delay.h>
+#include <linux/kthread.h>
 #include <linux/mutex.h>
 
 #include "ane_h16_boot.h"
@@ -27,6 +30,8 @@ enum fw_mode {
 	FW_REPORT_STALL,
 	/* State 0 at once, then states 3 and 1 after late_polls sleeps. */
 	FW_REPORT_LATE,
+	/* Reports and the clock are driven by the test under the session mutex. */
+	FW_REPORT_PIPELINE,
 };
 
 /* A synchronous fake firmware that answers on each doorbell. */
@@ -55,6 +60,8 @@ struct prog_fw {
 	u8 exec[0xd00];
 	size_t exec_length;
 	u32 exec_flags[32];
+	struct ane_h16_request_key exec_keys[32];
+	wait_queue_head_t pipeline_wake;
 	unsigned int execs;
 	u8 load[ANE_H16_LOAD_SIZE];
 	unsigned int maps, writable_maps;
@@ -125,10 +132,17 @@ static void fw_execute(struct prog_fw *f, const u8 *cmd)
 	u64 uuid = get_unaligned_le64(cmd + 0x20);
 	u32 program = get_unaligned_le32(cmd + 8), process = get_unaligned_le32(cmd + 0xc);
 
-	if (f->execs < ARRAY_SIZE(f->exec_flags))
+	if (f->execs < ARRAY_SIZE(f->exec_flags)) {
 		f->exec_flags[f->execs] = get_unaligned_le32(cmd + ANE_H16_EXECUTE_FLAGS);
+		f->exec_keys[f->execs] = (struct ane_h16_request_key) {
+			.uuid = uuid, .program = program, .process = process,
+		};
+	}
 	f->execs++;
+	wake_up_all(&f->pipeline_wake);
 	switch (f->mode) {
+	case FW_REPORT_PIPELINE:
+		break;
 	case FW_REPORT_FOREIGN_UUID:
 		fw_report(f, uuid + 100, program, process, 0);
 		fw_report(f, uuid + 100, program, process, 1);
@@ -258,6 +272,10 @@ static void fw_relax(void *ctx, u64 waited_ns)
 {
 	struct prog_fw *f = ctx;
 
+	if (f->mode == FW_REPORT_PIPELINE) {
+		usleep_range(50, 100);
+		return;
+	}
 	f->now += 10;
 	if (f->late_uuid && !--f->late_polls) {
 		fw_report(f, f->late_uuid, f->late_program, f->late_process, 3);
@@ -382,6 +400,7 @@ static struct prog_fw *fw_create_family(struct kunit *test, unsigned int family)
 	if (!f)
 		return NULL;
 	f->test = test;
+	init_waitqueue_head(&f->pipeline_wake);
 	f->soc.chip_family = family;
 	f->soc.hwx_subtype = family == 17 ? ANE_HWX_SUBTYPE_H17 : ANE_HWX_SUBTYPE_H16;
 	f->soc.doorbell = 0x1884000;
@@ -991,7 +1010,7 @@ static void program_session_test(struct kunit *test)
 	};
 	static const u32 gates[] = { 0, 0, 0, 0, 1, 0, 0, 1 };
 	struct prog_fw *f = fw_create(test);
-	struct ane_h16_program *p = NULL, *second = NULL, *third = NULL;
+	struct ane_h16_program *p = NULL, *second = NULL;
 	unsigned int i;
 
 	KUNIT_ASSERT_NOT_NULL(test, f);
@@ -1036,11 +1055,6 @@ static void program_session_test(struct kunit *test)
 	/* Later requests of the same program take the direct path. */
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), 0);
 
-	/* A second LOAD while the first is loaded refuses, before any traffic. */
-	i = f->count;
-	KUNIT_EXPECT_EQ(test, fw_load_program(f, &second), -EBUSY);
-	KUNIT_EXPECT_EQ(test, f->count, i);
-	KUNIT_EXPECT_PTR_EQ(test, second, NULL);
 
 	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
 	KUNIT_EXPECT_TRUE(test, p->closed);
@@ -1064,10 +1078,7 @@ static void program_session_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), ANE_H16_EXECUTE_FLAG_QUEUED);
 	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, second), 0);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), 0);
-	i = f->count;
-	KUNIT_EXPECT_EQ(test, fw_load_program(f, &third), -EBUSY);
-	KUNIT_EXPECT_EQ(test, f->count, i);
-	KUNIT_EXPECT_PTR_EQ(test, third, NULL);
+
 	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, second), 0);
 	/* Closing the first program's file late is harmless. */
 	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
@@ -1236,6 +1247,41 @@ static void program_bad_load_test(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, f->count, modes[i] == FW_CREATE_BODY ? 2 : 1);
 		KUNIT_EXPECT_EQ(test, fw_load_program(f, &p), -EIO);
 	}
+}
+
+/*
+ * A LOAD whose process descriptors do not validate is refused before any
+ * mapping or firmware traffic, and it must not block the next LOAD.
+ */
+static void program_bad_operation_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_hwx_snapshot *snapshot;
+	struct ane_h16_program *p = NULL;
+	struct ane_h16_hwx hwx;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	snapshot = fw_snapshot(test, false, false);
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(snapshot->bytes, snapshot->size, &hwx), 0);
+	test_aux_size[ANE_H16_AUX_GENERIC] =
+		generic_fill(test_aux[ANE_H16_AUX_GENERIC], &hwx, TEST_GENERIC_BASE);
+	test_aux_size[ANE_H16_AUX_OPERATION] =
+		operation_fill(test_aux[ANE_H16_AUX_OPERATION], snapshot, &hwx,
+			       TEST_GENERIC_BASE);
+	/* One record more than the section carries. */
+	put_unaligned_le32(get_unaligned_le32(test_aux[ANE_H16_AUX_OPERATION]) + 1,
+			   test_aux[ANE_H16_AUX_OPERATION]);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_load(&f->s, snapshot, test_aux_ptr,
+						   test_aux_size, &p), -ENOEXEC);
+	KUNIT_EXPECT_PTR_EQ(test, p, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, f->s.program, NULL);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+	KUNIT_EXPECT_EQ(test, f->count, 0);
+	/* The refused LOAD left nothing behind: a valid one still works. */
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
 }
 
 static void program_bad_report_test(struct kunit *test)
@@ -1700,7 +1746,7 @@ static void program_h17_mobilenet_test(struct kunit *test)
 /*
  * An H17 session switches between programs: a second LOAD succeeds, and
  * every EXECUTE that follows a different program, a LOAD or a CREATE is
- * queued. H16 keeps one program lifetime, and a program built for the other
+ * queued. A program built for the other
  * engine is refused before any traffic.
  */
 static void program_h17_switch_test(struct kunit *test)
@@ -2224,7 +2270,412 @@ static void program_sleep_replay_deferred_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
 }
 
+/* Real concurrent callers; the fake firmware alone decides completion order. */
+struct pipeline_thread {
+	struct prog_fw *fw;
+	struct ane_h16_program *program;
+	struct task_struct *task;
+	struct completion entered;
+	struct completion done;
+	bool sleep;
+	int result;
+};
+
+static int pipeline_thread_run(void *arg)
+{
+	struct pipeline_thread *t = arg;
+	struct ane_h16_session *s = &t->fw->s;
+
+	complete(&t->entered);
+	if (t->sleep) {
+		ane_h16_session_sleep(s, true);
+	} else {
+		mutex_lock(s->lock);
+		t->result = ane_h16_session_execute(s, t->program);
+		mutex_unlock(s->lock);
+	}
+	complete(&t->done);
+	/* Keep the task alive until the cleanup action calls kthread_stop(). */
+	set_current_state(TASK_INTERRUPTIBLE);
+	while (!kthread_should_stop()) {
+		schedule();
+		set_current_state(TASK_INTERRUPTIBLE);
+	}
+	__set_current_state(TASK_RUNNING);
+	return 0;
+}
+
+/* Also recovers a failed assertion, before KUnit releases the fake's memory. */
+static void pipeline_thread_stop(void *arg)
+{
+	struct pipeline_thread *t = arg;
+	struct ane_h16_session *s = &t->fw->s;
+
+	mutex_lock(s->lock);
+	if (s->active) {
+		s->quarantined = true;
+		s->error = -ECANCELED;
+		ane_h16_pending_fail_all(&s->pending, -ECANCELED);
+	}
+	s->asleep = false;
+	wake_up_all(&s->wake);
+	mutex_unlock(s->lock);
+	kthread_stop(t->task);
+	cancel_delayed_work_sync(&s->gate_work);
+}
+
+static struct pipeline_thread *pipeline_start(struct kunit *test, struct prog_fw *f,
+					      struct ane_h16_program *p)
+{
+	struct pipeline_thread *t = kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
+
+	if (!t)
+		return NULL;
+	t->fw = f;
+	t->program = p;
+	t->sleep = !p;
+	init_completion(&t->entered);
+	init_completion(&t->done);
+	t->task = kthread_run(pipeline_thread_run, t, "ane-pipeline-test");
+	if (IS_ERR(t->task))
+		return NULL;
+	if (kunit_add_action_or_reset(test, pipeline_thread_stop, t))
+		return NULL;
+	if (!wait_for_completion_timeout(&t->entered, HZ))
+		return NULL;
+	return t;
+}
+
+static struct prog_fw *pipeline_create(struct kunit *test, unsigned int family,
+				       struct ane_h16_program **a,
+				       struct ane_h16_program **b)
+{
+	struct prog_fw *f = fw_create_family(test, family);
+	struct mutex *lock = kunit_kzalloc(test, sizeof(*lock), GFP_KERNEL);
+	const void *aux[ANE_H16_AUX_COUNT];
+	size_t sizes[ANE_H16_AUX_COUNT];
+	int ret;
+
+	if (!f || !lock)
+		return NULL;
+	if (family == 16) {
+		ret = fw_load_program(f, a);
+		if (!ret)
+			ret = fw_load_program(f, b);
+	} else {
+		mobilenet_sections(test, aux, sizes);
+		ret = ane_h16_session_load(&f->s, mobilenet_snapshot(test), aux, sizes, a);
+		if (!ret)
+			ret = ane_h16_session_load(&f->s, mobilenet_snapshot(test), aux, sizes, b);
+	}
+	if (ret)
+		return NULL;
+	mutex_init(lock);
+	f->s.lock = lock;
+	f->s.timeout_ns = NSEC_PER_SEC;
+	f->mode = FW_REPORT_PIPELINE;
+	return f;
+}
+
+static bool pipeline_submitted(struct prog_fw *f, unsigned int count)
+{
+	return wait_event_timeout(f->pipeline_wake, READ_ONCE(f->execs) >= count, HZ);
+}
+
+static void pipeline_complete(struct prog_fw *f, unsigned int index, u32 state)
+{
+	const struct ane_h16_request_key *key = &f->exec_keys[index];
+
+	mutex_lock(f->s.lock);
+	fw_report(f, key->uuid, key->program, key->process, state);
+	mutex_unlock(f->s.lock);
+}
+
+static void pipeline_expect_empty(struct kunit *test, struct prog_fw *f)
+{
+	unsigned int i;
+
+	KUNIT_EXPECT_EQ(test, f->s.active, 0U);
+	KUNIT_EXPECT_EQ(test, f->s.running, 0U);
+	KUNIT_EXPECT_EQ(test, f->busy_on, 1U);
+	KUNIT_EXPECT_EQ(test, f->busy_off, 1U);
+	KUNIT_EXPECT_EQ(test, f->busy_depth, 0);
+	for (i = 0; i < ANE_H16_PENDING_MAX; i++)
+		KUNIT_EXPECT_PTR_EQ(test, f->s.pending.slots[i], NULL);
+}
+
+/* B completes while A remains pending; neither its arena nor gate is released. */
+static void program_pipeline_out_of_order_test(struct kunit *test)
+{
+	unsigned int family;
+
+	for (family = 16; family <= 17; family++) {
+		struct ane_h16_program *a, *b;
+		struct prog_fw *f = pipeline_create(test, family, &a, &b);
+		struct pipeline_thread *ta, *tb;
+		size_t mark, used;
+
+		KUNIT_ASSERT_NOT_NULL(test, f);
+		mark = f->t.pool_used;
+		ta = pipeline_start(test, f, a);
+		KUNIT_ASSERT_NOT_NULL(test, ta);
+		KUNIT_ASSERT_TRUE(test, pipeline_submitted(f, 1));
+		tb = pipeline_start(test, f, b);
+		KUNIT_ASSERT_NOT_NULL(test, tb);
+		KUNIT_ASSERT_TRUE(test, pipeline_submitted(f, 2));
+		mutex_lock(f->s.lock);
+		used = f->t.pool_used;
+		KUNIT_EXPECT_EQ(test, f->s.active, 2U);
+		KUNIT_EXPECT_EQ(test, f->busy_on, 1U);
+		KUNIT_EXPECT_EQ(test, f->busy_off, 0U);
+		KUNIT_EXPECT_EQ(test, ane_h16_session_gate_expire(&f->s), -EAGAIN);
+		mutex_unlock(f->s.lock);
+		KUNIT_EXPECT_NE(test, f->exec_keys[0].uuid, f->exec_keys[1].uuid);
+		KUNIT_EXPECT_EQ(test, f->exec_flags[1], ANE_H16_EXECUTE_FLAG_QUEUED);
+		pipeline_complete(f, 1, 1);
+		KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&tb->done, HZ), 0UL);
+		KUNIT_EXPECT_EQ(test, tb->result, 0);
+		KUNIT_EXPECT_FALSE(test, completion_done(&ta->done));
+		mutex_lock(f->s.lock);
+		KUNIT_EXPECT_TRUE(test, f->s.gate_held);
+		KUNIT_EXPECT_EQ(test, f->t.pool_used, used);
+		KUNIT_EXPECT_EQ(test, f->busy_off, 0U);
+		mutex_unlock(f->s.lock);
+		pipeline_complete(f, 0, 1);
+		KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&ta->done, HZ), 0UL);
+		KUNIT_EXPECT_EQ(test, ta->result, 0);
+		pipeline_expect_empty(test, f);
+		KUNIT_EXPECT_EQ(test, f->t.pool_used, mark);
+		KUNIT_EXPECT_FALSE(test, f->s.gate_held);
+		/* Completion order invalidates the speculative direct BAR context. */
+		KUNIT_EXPECT_FALSE(test, f->t.bar_known);
+	}
+}
+
+/* A second user of the same surfaces cannot publish until the first returns. */
+static void program_pipeline_same_program_test(struct kunit *test)
+{
+	struct ane_h16_program *a, *b;
+	struct prog_fw *f = pipeline_create(test, 16, &a, &b);
+	struct pipeline_thread *ta, *tb;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	ta = pipeline_start(test, f, a);
+	KUNIT_ASSERT_NOT_NULL(test, ta);
+	KUNIT_ASSERT_TRUE(test, pipeline_submitted(f, 1));
+	tb = pipeline_start(test, f, a);
+	KUNIT_ASSERT_NOT_NULL(test, tb);
+	KUNIT_EXPECT_EQ(test, wait_event_timeout(f->pipeline_wake,
+						 READ_ONCE(f->execs) >= 2,
+						 msecs_to_jiffies(20)), 0L);
+	KUNIT_EXPECT_FALSE(test, completion_done(&tb->done));
+	pipeline_complete(f, 0, 1);
+	KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&ta->done, HZ), 0UL);
+	KUNIT_ASSERT_TRUE(test, pipeline_submitted(f, 2));
+	pipeline_complete(f, 1, 1);
+	KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&tb->done, HZ), 0UL);
+	KUNIT_EXPECT_EQ(test, ta->result, 0);
+	KUNIT_EXPECT_EQ(test, tb->result, 0);
+	KUNIT_EXPECT_EQ(test, f->busy_max, 1);
+	KUNIT_EXPECT_EQ(test, f->s.active, 0U);
+}
+
+/* A third, distinct program waits for a slot, then overlaps the survivor. */
+static void program_pipeline_bound_test(struct kunit *test)
+{
+	struct ane_h16_program *a, *b, *c = NULL;
+	struct prog_fw *f = pipeline_create(test, 16, &a, &b);
+	struct pipeline_thread *ta, *tb, *tc;
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	mutex_lock(f->s.lock);
+	ret = fw_load_program(f, &c);
+	mutex_unlock(f->s.lock);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	ta = pipeline_start(test, f, a);
+	KUNIT_ASSERT_NOT_NULL(test, ta);
+	KUNIT_ASSERT_TRUE(test, pipeline_submitted(f, 1));
+	tb = pipeline_start(test, f, b);
+	KUNIT_ASSERT_NOT_NULL(test, tb);
+	KUNIT_ASSERT_TRUE(test, pipeline_submitted(f, 2));
+	tc = pipeline_start(test, f, c);
+	KUNIT_ASSERT_NOT_NULL(test, tc);
+	KUNIT_EXPECT_EQ(test, wait_event_timeout(f->pipeline_wake,
+						 READ_ONCE(f->execs) >= 3,
+						 msecs_to_jiffies(20)), 0L);
+	KUNIT_EXPECT_FALSE(test, completion_done(&tc->done));
+	pipeline_complete(f, 1, 1);
+	KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&tb->done, HZ), 0UL);
+	KUNIT_ASSERT_TRUE(test, pipeline_submitted(f, 3));
+	KUNIT_EXPECT_FALSE(test, completion_done(&ta->done));
+	pipeline_complete(f, 2, 1);
+	KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&tc->done, HZ), 0UL);
+	pipeline_complete(f, 0, 1);
+	KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&ta->done, HZ), 0UL);
+	KUNIT_EXPECT_EQ(test, ta->result, 0);
+	KUNIT_EXPECT_EQ(test, tb->result, 0);
+	KUNIT_EXPECT_EQ(test, tc->result, 0);
+	pipeline_expect_empty(test, f);
+}
+
+/* Arena pressure drains a batch rather than failing a long-running pipeline. */
+static void program_pipeline_arena_pressure_test(struct kunit *test)
+{
+	struct ane_h16_program *a, *b;
+	struct prog_fw *f = pipeline_create(test, 16, &a, &b);
+	struct pipeline_thread *ta, *tb;
+	size_t mark;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	mark = f->t.pool_used;
+	/* Room for one sequence and its teardown, but not a second command. */
+	f->t.pool.size = mark + 0xe00;
+	ta = pipeline_start(test, f, a);
+	KUNIT_ASSERT_NOT_NULL(test, ta);
+	KUNIT_ASSERT_TRUE(test, pipeline_submitted(f, 1));
+	tb = pipeline_start(test, f, b);
+	KUNIT_ASSERT_NOT_NULL(test, tb);
+	KUNIT_EXPECT_EQ(test, wait_event_timeout(f->pipeline_wake,
+						 READ_ONCE(f->execs) >= 2,
+						 msecs_to_jiffies(20)), 0L);
+	pipeline_complete(f, 0, 1);
+	KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&ta->done, HZ), 0UL);
+	KUNIT_ASSERT_TRUE(test, pipeline_submitted(f, 2));
+	pipeline_complete(f, 1, 1);
+	KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&tb->done, HZ), 0UL);
+	KUNIT_EXPECT_EQ(test, ta->result, 0);
+	KUNIT_EXPECT_EQ(test, tb->result, 0);
+	KUNIT_EXPECT_EQ(test, f->s.active, 0U);
+	KUNIT_EXPECT_EQ(test, f->t.pool_used, mark);
+	KUNIT_EXPECT_EQ(test, f->busy_on, 2U);
+	KUNIT_EXPECT_EQ(test, f->busy_off, 2U);
+}
+
+/* Copy-out retains ownership after the terminal report and busy vote end. */
+static void program_pipeline_surface_owner_test(struct kunit *test)
+{
+	struct ane_h16_program *a, *b;
+	struct prog_fw *f = pipeline_create(test, 16, &a, &b);
+	struct pipeline_thread *t;
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	/* Emulate the ioctl between its acquire and run, before copy-in. */
+	mutex_lock(f->s.lock);
+	ret = ane_h16_session_acquire(&f->s, a);
+	mutex_unlock(f->s.lock);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	t = pipeline_start(test, f, a);
+	KUNIT_ASSERT_NOT_NULL(test, t);
+	KUNIT_EXPECT_EQ(test, wait_event_timeout(f->pipeline_wake,
+						 READ_ONCE(f->execs) >= 1,
+						 msecs_to_jiffies(20)), 0L);
+	/* Copy-out uses the same ownership; no firmware need be running. */
+	mutex_lock(f->s.lock);
+	KUNIT_EXPECT_EQ(test, f->s.running, 0U);
+	ane_h16_session_release(&f->s, a);
+	mutex_unlock(f->s.lock);
+	KUNIT_ASSERT_TRUE(test, pipeline_submitted(f, 1));
+	pipeline_complete(f, 0, 1);
+	KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&t->done, HZ), 0UL);
+	KUNIT_EXPECT_EQ(test, t->result, 0);
+	pipeline_expect_empty(test, f);
+}
+
+/* A timeout or malformed report fails both waiters and retains the whole arena. */
+static void program_pipeline_fault(struct kunit *test, bool timeout)
+{
+	struct ane_h16_program *a, *b;
+	struct prog_fw *f = pipeline_create(test, 16, &a, &b);
+	struct pipeline_thread *ta, *tb;
+	size_t mark;
+	int error = timeout ? -ETIMEDOUT : -EPROTO;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	mark = f->t.pool_used;
+	ta = pipeline_start(test, f, a);
+	KUNIT_ASSERT_NOT_NULL(test, ta);
+	KUNIT_ASSERT_TRUE(test, pipeline_submitted(f, 1));
+	/* Only A expires; B's deadline remains a full second later. */
+	mutex_lock(f->s.lock);
+	f->now += NSEC_PER_MSEC;
+	mutex_unlock(f->s.lock);
+	tb = pipeline_start(test, f, b);
+	KUNIT_ASSERT_NOT_NULL(test, tb);
+	KUNIT_ASSERT_TRUE(test, pipeline_submitted(f, 2));
+	mutex_lock(f->s.lock);
+	if (timeout) {
+		f->now = NSEC_PER_SEC;
+	} else {
+		const struct ane_h16_request_key *key = &f->exec_keys[0];
+
+		fw_report(f, key->uuid, key->program, key->process + 1, 1);
+	}
+	mutex_unlock(f->s.lock);
+	KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&ta->done, HZ), 0UL);
+	KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&tb->done, HZ), 0UL);
+	KUNIT_EXPECT_EQ(test, ta->result, error);
+	KUNIT_EXPECT_EQ(test, tb->result, error);
+	KUNIT_EXPECT_TRUE(test, f->s.quarantined);
+	KUNIT_EXPECT_GT(test, f->t.pool_used, mark);
+	pipeline_expect_empty(test, f);
+}
+
+static void program_pipeline_timeout_test(struct kunit *test)
+{
+	program_pipeline_fault(test, true);
+}
+
+static void program_pipeline_quarantine_test(struct kunit *test)
+{
+	program_pipeline_fault(test, false);
+}
+
+/* Sleep closes admission, then waits for both callers before closing the gate. */
+static void program_pipeline_sleep_test(struct kunit *test)
+{
+	struct ane_h16_program *a, *b;
+	struct prog_fw *f = pipeline_create(test, 16, &a, &b);
+	struct pipeline_thread *ta, *tb, *sleep;
+	unsigned int tries;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	ta = pipeline_start(test, f, a);
+	KUNIT_ASSERT_NOT_NULL(test, ta);
+	KUNIT_ASSERT_TRUE(test, pipeline_submitted(f, 1));
+	tb = pipeline_start(test, f, b);
+	KUNIT_ASSERT_NOT_NULL(test, tb);
+	KUNIT_ASSERT_TRUE(test, pipeline_submitted(f, 2));
+	sleep = pipeline_start(test, f, NULL);
+	KUNIT_ASSERT_NOT_NULL(test, sleep);
+	for (tries = 0; tries < 100 && !READ_ONCE(f->s.asleep); tries++)
+		usleep_range(100, 200);
+	KUNIT_ASSERT_TRUE(test, READ_ONCE(f->s.asleep));
+	KUNIT_EXPECT_FALSE(test, completion_done(&sleep->done));
+	pipeline_complete(f, 0, 1);
+	KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&ta->done, HZ), 0UL);
+	KUNIT_EXPECT_FALSE(test, completion_done(&sleep->done));
+	pipeline_complete(f, 1, 1);
+	KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&tb->done, HZ), 0UL);
+	KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&sleep->done, HZ), 0UL);
+	KUNIT_EXPECT_EQ(test, ta->result, 0);
+	KUNIT_EXPECT_EQ(test, tb->result, 0);
+	KUNIT_EXPECT_TRUE(test, f->s.asleep);
+	KUNIT_EXPECT_FALSE(test, f->s.gate_held);
+	pipeline_expect_empty(test, f);
+	ane_h16_session_sleep(&f->s, false);
+}
+
 static struct kunit_case program_cases[] = {
+	KUNIT_CASE(program_pipeline_out_of_order_test),
+	KUNIT_CASE(program_pipeline_same_program_test),
+	KUNIT_CASE(program_pipeline_bound_test),
+	KUNIT_CASE(program_pipeline_arena_pressure_test),
+	KUNIT_CASE(program_pipeline_surface_owner_test),
+	KUNIT_CASE(program_pipeline_timeout_test),
+	KUNIT_CASE(program_pipeline_quarantine_test),
+	KUNIT_CASE(program_pipeline_sleep_test),
 	KUNIT_CASE(program_sleep_replay_test),
 	KUNIT_CASE(program_sleep_nonblock_test),
 	KUNIT_CASE(program_sleep_replay_failure_test),
@@ -2249,6 +2700,7 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_gate_hold_test),
 	KUNIT_CASE(program_scratch_test),
 	KUNIT_CASE(program_bad_load_test),
+	KUNIT_CASE(program_bad_operation_test),
 	KUNIT_CASE(program_bad_report_test),
 	KUNIT_CASE(program_stall_trace_test),
 	KUNIT_CASE(program_timing_test),

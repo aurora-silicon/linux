@@ -19,6 +19,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
@@ -46,7 +47,6 @@
 #define APR_TIMEOUT_MS		1000
 #define APR_POLL_MS		4
 #define APR_AUTOSUSPEND_MS	500
-#define APR_RING_ENTRIES	(APR_RING_BYTES / APR_DESC_BYTES)
 
 struct apr_fmt {
 	u32 fourcc;
@@ -191,7 +191,114 @@ static const struct apr_tunable apr_t8140_wrapper_tunables[] = {
 	{ 0x401c, 0x00000001, 0x00000001 },
 };
 
+/*
+ * T6000 constants: Copyright The Asahi Linux Contributors.
+ * MIT license: see m1n1-LICENSE.
+ * MIT m1n1 f3ac615eb1376d3bbba24cd84c414b9e41892adb,
+ * proxyclient/experiments/prores.py:42-89, in the published order.
+ * APR a0 has no wrapper or SCODEC-system initialization table.
+ */
+static const struct apr_tunable apr_t6000_engine_tunables[] = {
+	{ 0x118, 0x07ff07ff, 0x00000600 },
+	{ 0x148, 0x00000001, 0x00000001 },
+	{ 0x160, 0x800f3fff, 0x800a04ff },
+	{ 0x164, 0x07ff07ff, 0x07800080 },
+	{ 0x170, 0x800f3fff, 0x800404ff },
+	{ 0x174, 0x07ff07ff, 0x06000080 },
+	{ 0x180, 0x800f3fff, 0x800504ff },
+	{ 0x184, 0x07ff07ff, 0x06800080 },
+	{ 0x190, 0x800f3fff, 0x800004ff },
+	{ 0x194, 0x000000ff, 0x00000040 },
+	{ 0x1a0, 0x800f3fff, 0x800104ff },
+	{ 0x1a4, 0x000000ff, 0x00000080 },
+	{ 0x1b0, 0x800f3fff, 0x800204ff },
+	{ 0x1b4, 0x000000ff, 0x00000040 },
+	{ 0x1c0, 0x800f3fff, 0x800304ff },
+	{ 0x1c4, 0x000000ff, 0x00000040 },
+	{ 0x1d0, 0xbc00ff86, 0xa4000786 },
+	{ 0x1d4, 0x000000ff, 0x00000020 },
+	{ 0x1d8, 0x000000ff, 0x000000ff },
+	{ 0x1dc, 0x00ffffff, 0x00928170 },
+	{ 0x270, 0x800f3fff, 0x800b08ff },
+	{ 0x274, 0x07ff07ff, 0x07000080 },
+	{ 0x280, 0xffffffc0, 0x00180000 },
+	{ 0x290, 0x800f3fff, 0x800004ff },
+	{ 0x294, 0x000000ff, 0x00000080 },
+	{ 0x2a0, 0x800f3fff, 0x800104ff },
+	{ 0x2a4, 0x000000ff, 0x00000080 },
+	{ 0x2b0, 0x800f3fff, 0x800204ff },
+	{ 0x2b4, 0x000000ff, 0x00000040 },
+	{ 0x2c0, 0x800f3fff, 0x800304ff },
+	{ 0x2c4, 0x000000ff, 0x00000040 },
+	{ 0x2d0, 0x802ff04c, 0x80070040 },
+	{ 0x2d4, 0x00000001, 0x00000000 },
+	{ 0x2d8, 0xffff0003, 0x00ff0003 },
+	{ 0x2e0, 0x07ff07ff, 0x06000040 },
+	{ 0x2f8, 0x802ff04c, 0x80081040 },
+	{ 0x2fc, 0x00000001, 0x00000000 },
+	{ 0x300, 0xffff0003, 0x00ff0003 },
+	{ 0x308, 0x07ff07ff, 0x06400040 },
+	{ 0x320, 0x802ff04c, 0x80092040 },
+	{ 0x324, 0x00000001, 0x00000000 },
+	{ 0x328, 0xffff0003, 0x00ff0003 },
+	{ 0x330, 0x07ff07ff, 0x06800040 },
+	{ 0x350, 0x800f3fff, 0x800b08ff },
+	{ 0x354, 0x07ff07ff, 0x076000a0 },
+	{ 0x360, 0xffffffc0, 0x00180000 },
+	{ 0x370, 0x800f3fff, 0x800604ff },
+	{ 0x374, 0x07ff07ff, 0x06c000a0 },
+};
+
+struct apr_stats_regs {
+	u32 lo, hi, size;
+};
+
+/* Selected only by the DT compatible, before mapping any resources. */
+struct apr_variant {
+	int (*build_desc)(const struct apr_frame *f, u8 *desc);
+	struct apr_stats_regs stats[2];
+	const struct apr_tunable *engine_tunables;
+	size_t num_engine_tunables;
+	const struct apr_tunable *wrapper_tunables;
+	size_t num_wrapper_tunables;
+	const char *reg_names[2];
+	unsigned int num_regs;
+	unsigned int num_irqs;
+	u32 ring_bytes;
+	u32 desc_bytes;
+};
+
+static const struct apr_variant apr_t8140 = {
+	.build_desc = apr_build_desc,
+	.stats = {
+		{ APR_REG_STATS0_LO, APR_REG_STATS0_HI, APR_REG_STATS0_SIZE },
+		{ APR_REG_STATS1_LO, APR_REG_STATS1_HI, APR_REG_STATS1_SIZE },
+	},
+	.engine_tunables = apr_t8140_engine_tunables,
+	.num_engine_tunables = ARRAY_SIZE(apr_t8140_engine_tunables),
+	.wrapper_tunables = apr_t8140_wrapper_tunables,
+	.num_wrapper_tunables = ARRAY_SIZE(apr_t8140_wrapper_tunables),
+	.reg_names = { "core", "wrapper" },
+	.num_regs = 2,
+	.num_irqs = 2,
+	.ring_bytes = APR_RING_BYTES,
+	.desc_bytes = APR_DESC_BYTES,
+};
+
+static const struct apr_variant apr_t6000 = {
+	.build_desc = apr_build_desc_v0,
+	.stats = { { 0x278, 0x27c, 0x280 }, { 0x358, 0x35c, 0x360 } },
+	.engine_tunables = apr_t6000_engine_tunables,
+	.num_engine_tunables = ARRAY_SIZE(apr_t6000_engine_tunables),
+	.reg_names = { "core", "wrapper" },
+	.num_regs = 2,
+	.num_irqs = 1,
+	.ring_bytes = APR_RING_BYTES,
+	.desc_bytes = APR_DESC_BYTES,
+};
+
 struct apr_dev {
+	const struct apr_variant *variant;
 	struct device *dev;
 	void __iomem *regs;
 	void __iomem *wrapper;
@@ -265,23 +372,24 @@ static void apr_apply(void __iomem *base, const struct apr_tunable *t, size_t n)
 
 static void apr_hw_init(struct apr_dev *apr)
 {
+	const struct apr_variant *v = apr->variant;
 	unsigned int t, i;
 
 	apr_write(apr, APR_REG_MODE, APR_MODE_OFF);
 	apr_write(apr, APR_REG_IRQ_ENABLE, 0);
-	apr_apply(apr->regs, apr_t8140_engine_tunables, ARRAY_SIZE(apr_t8140_engine_tunables));
-	apr_apply(apr->wrapper, apr_t8140_wrapper_tunables,
-		  ARRAY_SIZE(apr_t8140_wrapper_tunables));
+	apr_apply(apr->regs, v->engine_tunables, v->num_engine_tunables);
+	if (v->num_wrapper_tunables)
+		apr_apply(apr->wrapper, v->wrapper_tunables, v->num_wrapper_tunables);
 	apr_write(apr, APR_REG_RING_HEAD, 0);
 	apr_write(apr, APR_REG_RING_TAIL, 0);
-	apr_write(apr, APR_REG_RING_SIZE, APR_RING_BYTES);
+	apr_write(apr, APR_REG_RING_SIZE, v->ring_bytes);
 	apr_write(apr, APR_REG_RING_LO, lower_32_bits(apr->ring_dma));
 	apr_write(apr, APR_REG_RING_HI, upper_32_bits(apr->ring_dma));
 	/* Both statistics consumers share one area. */
-	apr_write(apr, APR_REG_STATS0_LO, lower_32_bits(apr->stats_dma) & ~0x3fU);
-	apr_write(apr, APR_REG_STATS0_HI, upper_32_bits(apr->stats_dma) & 0x3ff);
-	apr_write(apr, APR_REG_STATS1_LO, lower_32_bits(apr->stats_dma) & ~0x3fU);
-	apr_write(apr, APR_REG_STATS1_HI, upper_32_bits(apr->stats_dma) & 0x3ff);
+	for (i = 0; i < ARRAY_SIZE(v->stats); i++) {
+		apr_write(apr, v->stats[i].lo, lower_32_bits(apr->stats_dma) & ~0x3fU);
+		apr_write(apr, v->stats[i].hi, upper_32_bits(apr->stats_dma) & 0x3ff);
+	}
 	apr_write(apr, APR_REG_MODE, APR_MODE_RUN);
 
 	for (t = 0; t < APR_QTABLES; t++) {
@@ -550,15 +658,16 @@ static void apr_device_run(void *priv)
 	 * The engine's ring wrap protocol is not known, so start again at the
 	 * beginning of the ring instead of wrapping. The engine is idle here.
 	 */
-	if (!apr->ring_ready || apr->head + APR_DESC_BYTES > APR_RING_BYTES)
+	if (!apr->ring_ready ||
+	    apr->head + apr->variant->desc_bytes > apr->variant->ring_bytes)
 		apr_hw_init(apr);
-	ret = apr_build_desc(&f, apr->ring + apr->head);
+	ret = apr->variant->build_desc(&f, apr->ring + apr->head);
 	if (ret) {
 		spin_unlock_irqrestore(&apr->hw_lock, flags);
 		apr_finish_job(apr, ctx, ret);
 		return;
 	}
-	apr->head += APR_DESC_BYTES;
+	apr->head += apr->variant->desc_bytes;
 	apr->active = ctx;
 	apr->started = jiffies;
 	/* Descriptor and buffers must be visible before the head moves. */
@@ -1053,6 +1162,7 @@ static int apr_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct video_device *vdev;
+	void __iomem *regs[2] = {};
 	struct apr_dev *apr;
 	unsigned int i;
 	int ret;
@@ -1061,17 +1171,22 @@ static int apr_probe(struct platform_device *pdev)
 	if (!apr)
 		return -ENOMEM;
 	apr->dev = dev;
+	apr->variant = of_device_get_match_data(dev);
+	if (!apr->variant)
+		return -ENODEV;
 	mutex_init(&apr->vdev_lock);
 	spin_lock_init(&apr->hw_lock);
 	INIT_DELAYED_WORK(&apr->watchdog, apr_watchdog);
 	platform_set_drvdata(pdev, apr);
 
-	apr->regs = devm_platform_ioremap_resource_byname(pdev, "core");
-	if (IS_ERR(apr->regs))
-		return PTR_ERR(apr->regs);
-	apr->wrapper = devm_platform_ioremap_resource_byname(pdev, "wrapper");
-	if (IS_ERR(apr->wrapper))
-		return PTR_ERR(apr->wrapper);
+	for (i = 0; i < apr->variant->num_regs; i++) {
+		regs[i] = devm_platform_ioremap_resource_byname(pdev,
+							     apr->variant->reg_names[i]);
+		if (IS_ERR(regs[i]))
+			return PTR_ERR(regs[i]);
+	}
+	apr->regs = regs[0];
+	apr->wrapper = regs[1];
 	/*
 	 * A second power domain, "perf", is the SoC performance request the
 	 * engine needs for full speed. With more than one domain the core
@@ -1098,7 +1213,7 @@ static int apr_probe(struct platform_device *pdev)
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(64));
 	if (ret)
 		return ret;
-	apr->ring = dmam_alloc_coherent(dev, APR_RING_BYTES, &apr->ring_dma,
+	apr->ring = dmam_alloc_coherent(dev, apr->variant->ring_bytes, &apr->ring_dma,
 					GFP_KERNEL);
 	if (!apr->ring)
 		return -ENOMEM;
@@ -1107,7 +1222,7 @@ static int apr_probe(struct platform_device *pdev)
 	if (!apr->stats)
 		return -ENOMEM;
 
-	for (i = 0; i < ARRAY_SIZE(apr->irq); i++) {
+	for (i = 0; i < apr->variant->num_irqs; i++) {
 		apr->irq[i] = platform_get_irq_optional(pdev, i);
 		if (apr->irq[i] == -ENXIO && i)
 			continue;
@@ -1142,7 +1257,8 @@ static int apr_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return ret;
 	/* The engine reports how much statistics space it writes. */
-	if (max(apr_read(apr, APR_REG_STATS0_SIZE), apr_read(apr, APR_REG_STATS1_SIZE)) >
+	if (max(apr_read(apr, apr->variant->stats[0].size),
+		apr_read(apr, apr->variant->stats[1].size)) >
 	    apr->stats_size) {
 		pm_runtime_put_autosuspend(dev);
 		return dev_err_probe(dev, -EINVAL, "statistics area larger than %zu bytes\n",
@@ -1172,7 +1288,8 @@ static void apr_remove(struct platform_device *pdev)
 }
 
 static const struct of_device_id apr_of_match[] = {
-	{ .compatible = "apple,t8140-prores" },
+	{ .compatible = "apple,t6000-prores", .data = &apr_t6000 },
+	{ .compatible = "apple,t8140-prores", .data = &apr_t8140 },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, apr_of_match);

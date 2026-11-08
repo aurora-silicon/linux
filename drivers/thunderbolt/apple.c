@@ -181,6 +181,16 @@ static const struct apple_cio_hw apple_cio_t8142_hw = {
 	.dp = &apple_dpin_disabled,
 };
 
+static const struct apple_cio_hw apple_cio_t6040_hw = {
+	.mxwrap = true,
+	.lstx_explicit = true,
+	.skip_run = true,
+	.lstx_after_boot = true,
+	.strict_fw_ready = true,
+	.no_host_clx = true,
+	.dp = &apple_dpin_disabled,
+};
+
 #define APPLE_CIO_NHI_HOP_COUNT 0x0
 #define APPLE_CIO_NHI_HOP_COUNT_MASK GENMASK(9, 0)
 
@@ -883,14 +893,20 @@ static void apple_cio_of_node_put(void *data)
 	of_node_put(data);
 }
 
+static bool apple_cio_pciec_eligible(const struct device_node *np)
+{
+	return of_device_is_compatible(np, "apple,t6040-pciec") ||
+	       of_device_is_compatible(np, "apple,t8103-pciec") ||
+	       of_device_is_compatible(np, "apple,t6000-pciec");
+}
+
 static bool
 apple_cio_pcie_tunnel_is_preinitialized(struct device_node *parent)
 {
 	for_each_available_child_of_node_scoped(parent, child) {
 		u32 status;
 
-		if (!of_device_is_compatible(child, "apple,t8103-pciec") &&
-		    !of_device_is_compatible(child, "apple,t6000-pciec"))
+		if (!apple_cio_pciec_eligible(child))
 			continue;
 
 		if (!of_property_read_u32(child, "apple,pciec-preinit-status",
@@ -919,8 +935,7 @@ static int apple_cio_get_pcie_reset(struct apple_cio *acio)
 	struct reset_control *rst = NULL;
 
 	for_each_available_child_of_node_scoped(acio->pcie_tunnel_np, child) {
-		if (!of_device_is_compatible(child, "apple,t8103-pciec") &&
-		    !of_device_is_compatible(child, "apple,t6000-pciec"))
+		if (!apple_cio_pciec_eligible(child))
 			continue;
 		if (!of_property_read_bool(child, "apple,pciec-kernel-init"))
 			break;
@@ -952,8 +967,7 @@ static int apple_cio_map_pcie_intr2axi(struct apple_cio *acio)
 	int index, ret;
 
 	for_each_available_child_of_node_scoped(acio->pcie_tunnel_np, child) {
-		if (!of_device_is_compatible(child, "apple,t8103-pciec") &&
-		    !of_device_is_compatible(child, "apple,t6000-pciec"))
+		if (!apple_cio_pciec_eligible(child))
 			continue;
 
 		index = of_property_match_string(child, "reg-names", "intr2axi");
@@ -1340,6 +1354,33 @@ static int apple_cio_pcie_tunnel_ready_locked(struct apple_cio *acio)
 	return ret;
 }
 
+/*
+ * PCIe-C is the only native port this host tunnels. Order it after the NHI,
+ * which rebuilds the tunnel underneath it at resume (the job of the ACPI
+ * device links on PC hosts). The link is stateless: it orders system sleep
+ * only and leaves probe and unbind alone, because apple_cio_remove_children()
+ * must stop the NHI while PCIe-C is still bound. Removing either device drops
+ * the link; both are removed together and PCIe-C is populated only once per
+ * NHI, so this runs once per pair.
+ */
+static void apple_cio_link_pcie_tunnel(struct apple_cio *acio)
+{
+	struct platform_device *nhi_pdev = READ_ONCE(acio->nhi_pdev);
+	struct platform_device *pcie_pdev;
+
+	lockdep_assert_held(&acio->pcie_tunnel_lock);
+	pcie_pdev = apple_cio_find_pcie_tunnel(acio);
+	if (!pcie_pdev)
+		return;
+	if (!nhi_pdev ||
+	    !device_link_add(&pcie_pdev->dev, &nhi_pdev->dev, DL_FLAG_STATELESS))
+		dev_warn(acio->dev, "PCIe-C: device link to the NHI failed\n");
+	else
+		dev_dbg(acio->dev, "PCIe-C: linked %s to %s\n",
+			dev_name(&pcie_pdev->dev), dev_name(&nhi_pdev->dev));
+	put_device(&pcie_pdev->dev);
+}
+
 static int apple_cio_activate_pcie_tunnel_locked(struct apple_cio *acio)
 {
 	int ret = 0;
@@ -1369,6 +1410,7 @@ static int apple_cio_activate_pcie_tunnel_locked(struct apple_cio *acio)
 				     "failed to populate tunneled PCIe controller\n");
 
 	acio->pcie_tunnel_populated = true;
+	apple_cio_link_pcie_tunnel(acio);
 	dev_info(acio->dev,
 		 "PCIe-C populated after USB4 PCIe tunnel adapter enable\n");
 	return apple_cio_pcie_tunnel_ready_locked(acio);
@@ -2001,7 +2043,18 @@ static bool apple_nhi_dp_tunnel_awaits_display(struct tb_nhi *nhi,
 	return apple_dpin_awaits_display(&c->state, c->acio->dp);
 }
 
+/*
+ * There are no firmware tables naming the tunneled ports: PCIe-C, when the
+ * port has one, is linked to the NHI as it is populated (see
+ * apple_cio_link_pcie_tunnel()). A port without PCIe-C tunnels no native port.
+ */
+static bool apple_nhi_add_links(struct tb_nhi *nhi)
+{
+	return true;
+}
+
 static const struct tb_nhi_ops apple_nhi_ops = {
+	.add_links = apple_nhi_add_links,
 	.request_ring_irq = apple_nhi_request_irq,
 	.release_ring_irq = apple_nhi_release_irq,
 	.ring_interrupt_active = apple_nhi_ring_interrupt_active,
@@ -2032,7 +2085,8 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	int ret = 0;
 
 	if (acio->type7 !=
-	    of_device_is_compatible(pdev->dev.of_node, "apple,t8142-usb4-nhi")) {
+	    (of_device_is_compatible(pdev->dev.of_node, "apple,t8142-usb4-nhi") ||
+	     of_device_is_compatible(pdev->dev.of_node, "apple,t6040-usb4-nhi"))) {
 		ret = dev_err_probe(&pdev->dev, -EINVAL, "ACIO/NHI generation mismatch\n");
 		goto err;
 	}
@@ -2459,6 +2513,9 @@ static const struct dev_pm_ops apple_nhi_pm_ops = {
 
 static const struct of_device_id apple_nhi_match[] = {
 	{
+		.compatible = "apple,t6040-usb4-nhi",
+	},
+	{
 		.compatible = "apple,t8142-usb4-nhi",
 	},
 	{
@@ -2486,8 +2543,7 @@ static struct platform_device *apple_cio_find_pcie_tunnel(struct apple_cio *acio
 		return NULL;
 
 	for_each_available_child_of_node_scoped(acio->pcie_tunnel_np, child) {
-		if (!of_device_is_compatible(child, "apple,t8103-pciec") &&
-		    !of_device_is_compatible(child, "apple,t6000-pciec"))
+		if (!apple_cio_pciec_eligible(child))
 			continue;
 
 		pdev = of_find_device_by_node(child);
@@ -3279,7 +3335,8 @@ static int apple_cio_probe(struct platform_device *pdev)
 	init_completion(&acio->nhi_boot_completion);
 	acio->dev = &pdev->dev;
 	acio->np = dev->of_node;
-	acio->type7 = of_device_is_compatible(acio->np, "apple,t8142-usb4-acio");
+	acio->type7 = of_device_is_compatible(acio->np, "apple,t8142-usb4-acio") ||
+		      of_device_is_compatible(acio->np, "apple,t6040-usb4-acio");
 	if (acio->type7 &&
 	    of_property_count_u32_elems(acio->np, "apple,tunable-rc") <= 0)
 		return dev_err_probe(dev, -EINVAL, "Missing bootloader RC tuning\n");
@@ -3487,6 +3544,10 @@ static void apple_cio_remove(struct platform_device *pdev)
 
 
 static const struct of_device_id apple_acio_match[] = {
+	{
+		.compatible = "apple,t6040-usb4-acio",
+		.data = &apple_cio_t6040_hw,
+	},
 	{
 		.compatible = "apple,t8142-usb4-acio",
 		.data = &apple_cio_t8142_hw,

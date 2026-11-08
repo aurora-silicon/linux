@@ -130,6 +130,35 @@ pub(crate) fn scrd_verify_touchid_enrollment(handle: &[u8; SCRD_ACM_HANDLE_LEN])
     }
 }
 
+const SCRD_CMD_VERIFY_ACL_CONSTRAINT: u8 = 0x20;
+const SCRD_ACL_VERSION: u8 = 2;
+
+/// Command 0x20: evaluate one operation's access-control constraint (a DER
+/// set, as in a key's ACL) on the context, as LocalAuthentication does before
+/// and after a Touch ID match for a key operation. Laid out as macOS sends it:
+/// header, context, u32 constraint length, constraint, u32 operation length,
+/// operation, a 1 byte, two zero u32 words.
+pub(crate) fn scrd_verify_acl_constraint(
+    handle: &[u8; SCRD_ACM_HANDLE_LEN],
+    constraint: &[u8],
+    operation: &[u8],
+) -> Result<KVec<u8>> {
+    let mut out = KVec::new();
+    let mut header = [0u8; SCRD_MAX_LOGICAL];
+    scrd_header(&mut header, SCRD_CMD_VERIFY_ACL_CONSTRAINT, 0, SCRD_ACL_VERSION);
+    out.extend_from_slice(&header[..8], GFP_KERNEL)?;
+    out.extend_from_slice(handle, GFP_KERNEL)?;
+    let clen = u32::try_from(constraint.len()).map_err(|_| EINVAL)?;
+    out.extend_from_slice(&clen.to_le_bytes(), GFP_KERNEL)?;
+    out.extend_from_slice(constraint, GFP_KERNEL)?;
+    let olen = u32::try_from(operation.len()).map_err(|_| EINVAL)?;
+    out.extend_from_slice(&olen.to_le_bytes(), GFP_KERNEL)?;
+    out.extend_from_slice(operation, GFP_KERNEL)?;
+    out.push(1, GFP_KERNEL)?;
+    out.extend_from_slice(&[0u8; 8], GFP_KERNEL)?;
+    Ok(out)
+}
+
 /// The reference of a tracked context-create reply, or `None` for any
 /// other shape.
 pub(crate) fn tracked_create_reference(reply: &[u8]) -> Option<[u8; SCRD_ACM_HANDLE_LEN]> {

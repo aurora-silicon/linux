@@ -450,6 +450,8 @@ struct apple_dcp {
 	/* Bumped by every iomfb poweron; see afk_compact_slot(). */
 	u32 afk_power_gen;
 	bool external;
+	/* A desktop 26.x external processor (apple,t6041-dcpext) */
+	bool desktop_external;
 	/*
 	 * T8122 dcpext: the panel's DRM device never waits on this processor.
 	 * A probe or bind failure leaves it in the device as an unusable pipe

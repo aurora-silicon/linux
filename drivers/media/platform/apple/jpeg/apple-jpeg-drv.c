@@ -103,7 +103,8 @@ static int aj_reset(struct apple_jpeg *jpeg)
 	aj_write(jpeg, AJ_MODE, AJ_MODE_RESET);
 	aj_write(jpeg, AJ_MODE, AJ_MODE_SETUP);
 	aj_write(jpeg, AJ_MAIN_RUN, 0);
-	n = apple_jpeg_defaults(false, jpeg->writes, ARRAY_SIZE(jpeg->writes));
+	n = apple_jpeg_defaults(jpeg->variant->layout, false, jpeg->writes,
+				ARRAY_SIZE(jpeg->writes));
 	if (n < 0)
 		return n;
 	for (int i = 0; i < n; i++)
@@ -171,14 +172,15 @@ static irqreturn_t aj_irq(int irq, void *data)
 	jpeg->status = aj_read(jpeg, AJ_STATUS);
 	jpeg->int_status = aj_read(jpeg, AJ_INT_STATUS);
 	aj_read(jpeg, AJ_DEBUG_STATUS);
-	if (!(jpeg->int_status & AJ_INT_STATUS_DONE) && !(jpeg->status & AJ_STATUS_ERRORS)) {
+	if (!(jpeg->int_status & jpeg->variant->int_done_mask) &&
+	    !(jpeg->status & AJ_STATUS_ERRORS)) {
 		spin_unlock(&jpeg->hw_lock);
 		return IRQ_NONE;
 	}
 	aj_write(jpeg, AJ_INT_STATUS, 0);
 	aj_write(jpeg, AJ_MAIN_RUN, 0);
-	aj_write(jpeg, AJ_AXI_READ_PREFETCH, 0);
-	aj_write(jpeg, AJ_AXI_WRITE_PREFETCH, 0);
+	aj_write(jpeg, jpeg->variant->layout->prefetch_read, 0);
+	aj_write(jpeg, jpeg->variant->layout->prefetch_write, 0);
 	aj_write(jpeg, AJ_IRQ_MASK, 0);
 	aj_read(jpeg, AJ_BITSTREAM_CORRUPTION);
 	jpeg->bytes = aj_read(jpeg, AJ_COMPRESSED_BYTES);
@@ -186,7 +188,7 @@ static irqreturn_t aj_irq(int irq, void *data)
 	spin_unlock(&jpeg->hw_lock);
 
 	if (!(jpeg->status & AJ_STATUS_DONE) || (jpeg->status & AJ_STATUS_ERRORS) ||
-	    !(jpeg->int_status & AJ_INT_STATUS_DONE)) {
+	    !(jpeg->int_status & jpeg->variant->int_done_mask)) {
 		dev_err_ratelimited(jpeg->dev, "job failed: status %#x int %#x\n",
 				    jpeg->status, jpeg->int_status);
 		err = -EIO;
@@ -266,7 +268,8 @@ static void aj_device_run(void *priv)
 		aj_finish(jpeg, ctx, -EIO);
 		return;
 	}
-	n = apple_jpeg_build_job(&job, jpeg->writes, ARRAY_SIZE(jpeg->writes));
+	n = apple_jpeg_build_job(jpeg->variant->layout, &job, jpeg->writes,
+				 ARRAY_SIZE(jpeg->writes));
 	if (n < 0) {
 		spin_unlock_irqrestore(&jpeg->hw_lock, flags);
 		aj_finish(jpeg, ctx, n);
@@ -742,7 +745,7 @@ static int aj_identify(struct apple_jpeg *jpeg)
 	if (ret < 0)
 		return ret;
 	aj_write(jpeg, AJ_MODE, AJ_MODE_IDENTIFY);
-	hwrev = aj_read(jpeg, AJ_HWREV);
+	hwrev = aj_read(jpeg, jpeg->variant->layout->hwrev);
 	pm_runtime_put_sync_suspend(jpeg->dev);
 	if (!apple_jpeg_hwrev_supported(jpeg->variant, hwrev))
 		return dev_err_probe(jpeg->dev, -ENODEV, "unsupported HWREV %#x\n", hwrev);
@@ -765,6 +768,8 @@ static int aj_probe(struct platform_device *pdev)
 	jpeg->variant = of_device_get_match_data(dev);
 	if (!jpeg->variant || !jpeg->variant->hwrev)
 		return dev_err_probe(dev, -ENODEV, "engine layout not supported\n");
+	if (!jpeg->variant->layout->reset_complete)
+		return dev_err_probe(dev, -EOPNOTSUPP, "engine reset image incomplete\n");
 	mutex_init(&jpeg->lock);
 	spin_lock_init(&jpeg->hw_lock);
 	INIT_DELAYED_WORK(&jpeg->watchdog, aj_watchdog);
@@ -795,7 +800,7 @@ static int aj_probe(struct platform_device *pdev)
 	jpeg->regs = devm_ioremap_resource(dev, res);
 	if (IS_ERR(jpeg->regs))
 		return PTR_ERR(jpeg->regs);
-	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(64));
+	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(jpeg->variant->layout->dma_addr_bits));
 	if (ret)
 		return ret;
 
@@ -850,6 +855,8 @@ static void aj_remove(struct platform_device *pdev)
 }
 
 static const struct of_device_id aj_of_match[] = {
+	{ .compatible = "apple,t6000-jpeg", .data = &apple_jpeg_t6000 },
+	{ .compatible = "apple,t8112-jpeg", .data = &apple_jpeg_t8112 },
 	{ .compatible = "apple,t6041-jpeg", .data = &apple_jpeg_t6041 },
 	{ .compatible = "apple,t8140-jpeg", .data = &apple_jpeg_t8140 },
 	{ }

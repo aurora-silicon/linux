@@ -88,6 +88,48 @@ static int apple_pmgr_ps_wait_parent(struct apple_pmgr_ps *ps, u32 *cur)
 	return err ?: ret;
 }
 
+/*
+ * A power-on can stop with the actual state short of the target and bit 11
+ * latched: on the T8140 ANE_SYS after system sleep the word reads 0x2b4f
+ * (target 0xf, actual 0x4) and stays so. That is not a parent that comes up
+ * late: gated again, the domain reaches actual 0 at once, but bit 11 stays
+ * set and every later power-on stops the same way. Only a PS reset clears it.
+ * Power the domain off, pulse the PS reset while it is off (its devices lose
+ * their state there anyway), then request @reg, the on state, again.
+ * Domains whose bit 11 means a parent that is not up yet (wait_parent) and
+ * those with their own state contract are left alone.
+ */
+static int apple_pmgr_ps_clear_latch(struct apple_pmgr_ps *ps, u32 reg, u32 *cur)
+{
+	u32 off = (reg & ~APPLE_PMGR_PS_TARGET) | APPLE_PMGR_PS_PWRGATE;
+	int ret;
+
+	if (ps->wait_parent || ps->strict_state || ps->externally_clocked ||
+	    !(*cur & APPLE_PMGR_BUSY) ||
+	    FIELD_GET(APPLE_PMGR_PS_ACTUAL, *cur) == APPLE_PMGR_PS_ACTIVE)
+		return -ETIMEDOUT;
+
+	regmap_write(ps->regmap, ps->offset, off);
+	ret = regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, *cur,
+					      !FIELD_GET(APPLE_PMGR_PS_ACTUAL, *cur), 1,
+					      APPLE_PMGR_PS_SET_TIMEOUT);
+	if (ret)
+		return ret;
+	regmap_write(ps->regmap, ps->offset, off | APPLE_PMGR_PS_RESET);
+	ret = regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, *cur,
+					      !(*cur & APPLE_PMGR_BUSY), 1,
+					      APPLE_PMGR_PS_SET_TIMEOUT);
+	regmap_write(ps->regmap, ps->offset, off);
+	if (ret)
+		return ret;
+	regmap_write(ps->regmap, ps->offset, reg);
+	return regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, *cur,
+					       FIELD_GET(APPLE_PMGR_PS_ACTUAL, *cur) ==
+					       APPLE_PMGR_PS_ACTIVE &&
+					       !(*cur & APPLE_PMGR_BUSY), 1,
+					       APPLE_PMGR_PS_SET_TIMEOUT);
+}
+
 static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool auto_enable)
 {
 	int ret;
@@ -176,6 +218,17 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 			 pstate, reg, cur, ret);
 		if (ret)
 			return ret;
+	}
+
+	if (ret < 0 && pstate == APPLE_PMGR_PS_ACTIVE) {
+		u32 stalled = cur;
+
+		if (!apple_pmgr_ps_clear_latch(ps, reg, &cur)) {
+			dev_info_ratelimited(ps->dev,
+					     "PS %s: power-on stopped at 0x%x with bit 11 latched; cleared by a PS reset\n",
+					     genpd->name, stalled);
+			ret = 0;
+		}
 	}
 
 report:

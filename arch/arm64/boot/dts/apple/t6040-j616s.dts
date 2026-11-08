@@ -165,3 +165,47 @@
 &scaler0 {
 	status = "okay";
 };
+
+/*
+ * USB4/Thunderbolt on the left back port (typec0, ACIO0). The loader hands
+ * the router, adapter and NHI tuning and the DROM over. No PCIe tunnel yet:
+ * host-to-host (XDomain, thunderbolt-net) and USB4 links only.
+ */
+&pmgr_cio {
+	status = "okay";
+};
+
+&ps_atc0_cio {
+	status = "okay";
+};
+
+&ps_atc0_pcie {
+	status = "okay";
+};
+
+&ps_atc0_cio_pcie {
+	status = "okay";
+};
+
+&ps_atc0_cio_usb {
+	status = "okay";
+};
+
+&usb4_0_mbox {
+	status = "okay";
+};
+
+&usb4_0_acio {
+	/delete-property/ apple,pcie-tunnel;
+	status = "okay";
+};
+
+&usb4_0_dart {
+	/* ADT dart-acio0 vm-base: the NHI addresses its rings below 1 TiB + 4 GiB. */
+	apple,dma-range = <0x100 0x4000 0x0 0xffff0000>;
+	status = "okay";
+};
+
+&usb4_0_nhi {
+	status = "okay";
+};

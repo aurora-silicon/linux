@@ -93,3 +93,28 @@
 
 #include "t6000-peripherals.dtsi"
 #include "t6000-aux-spmi.dtsi"
+
+&apr0_dart {
+	status = "okay";
+};
+
+&apr0 {
+	status = "okay";
+};
+
+/* Both JPEG encoders are SoC blocks with no board wiring. */
+&jpeg0_dart {
+	status = "okay";
+};
+
+&jpeg0 {
+	status = "okay";
+};
+
+&jpeg1_dart {
+	status = "okay";
+};
+
+&jpeg1 {
+	status = "okay";
+};
