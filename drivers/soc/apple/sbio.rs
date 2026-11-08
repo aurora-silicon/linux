@@ -5079,6 +5079,11 @@ impl SepData {
         if self.shutting_down.load(Relaxed) {
             return Err(ENODEV);
         }
+        // The per-user key bag carries login passwords: root only, on this
+        // node, never on /dev/sep-bio, which fprintd holds.
+        if crate::userbag::is_ioctl(cmd) {
+            return self.userbag_ioctl(cmd, arg).map(|_| ());
+        }
         match cmd {
             bio::IOC_LOCKOUT_STATE => {
                 let locked = if self.touchid_started.load(Relaxed) {
@@ -5519,9 +5524,6 @@ impl SepData {
     pub(crate) fn bio_ioctl(&self, cmd: u32, arg: usize) -> Result<bio::Handled> {
         if self.shutting_down.load(Relaxed) {
             return Err(ENODEV);
-        }
-        if crate::userbag::is_ioctl(cmd) {
-            return self.userbag_ioctl(cmd, arg);
         }
         if cmd == bio::IOC_ATTEST {
             return self.bio_attest(arg);

@@ -1003,6 +1003,13 @@ impl crate::SepData {
     pub(crate) fn userbag_ioctl(&self, cmd: u32, arg: usize) -> Result<crate::bio::Handled> {
         crate::bio::require_admin()?;
         if self.profile.key_store != crate::profile::KeyStore::Variant5 {
+            // The user-bag layouts were captured on the variant-5 key store
+            // (macOS 26 on the Neo). The 13.x key store of M1/M2-generation
+            // Macs has not been captured, so nothing is sent there.
+            dev_info!(
+                self.dev,
+                "userbag: per-user key bags are not supported on this key store yet (only variant 5 has been captured)\n"
+            );
             return Err(EOPNOTSUPP);
         }
         let user_ptr = UserPtr::from_addr(arg);
