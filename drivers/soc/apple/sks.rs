@@ -548,13 +548,31 @@ impl SepData {
     }
 
     /// `0x02` copy the designated biometric identity bag.
-    fn sks_req_copy_keybag_special(&self, handle: crate::sks::SpecialHandle) -> Result<SksRequest> {
+    pub(crate) fn sks_req_copy_keybag_special(&self, handle: crate::sks::SpecialHandle) -> Result<SksRequest> {
         let op = crate::sks::sks_copy_keybag();
         let mut body = image::Body::new();
         body.put_u32(0)?;
         body.put_u64(crate::sks::SKS_CLIENT_ID)?;
         body.put_i32(handle.value())?;
         self.sks_seal(&op, &body)
+    }
+
+    /// Loads a wrapped bag (`0x03`) and returns its temporary handle. Used for
+    /// per-user bags, whose wrapped container userspace keeps.
+    pub(crate) fn sks_load_wrapped(&self, wrapped: &[u8]) -> Option<crate::sks::KeyBagHandle> {
+        let out = self.sks_send(self.sks_req_load_keybag(wrapped))?;
+        let body = self.sks_report_response(crate::sks::SKS_LOAD_NAME, &out)?;
+        if out.reply.status != 0 || body.len() != SKS_LOAD_REPLY_LEN {
+            dev_info!(self.dev, "sks: LOAD_KEYBAG (user bag): status {}, {} bytes\n", out.reply.status, body.len());
+            return None;
+        }
+        let status = i32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+        let handle = i32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+        if status != 0 || handle < 0 {
+            dev_info!(self.dev, "sks: LOAD_KEYBAG (user bag): operation status {}, handle {}\n", status, handle);
+            return None;
+        }
+        Some(crate::sks::KeyBagHandle::from_load_reply(handle))
     }
 
     /// `0x03` load key bag.

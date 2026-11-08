@@ -312,6 +312,9 @@ struct sep_key_public {
  * 10 (research): as 8, but the kernel also locks the bag for good and signs
  * with a stale, an empty and a fresh credential, then unlocks and signs
  * again; the results come back in 'digest' (see key.rs).
+ * 11 (research): make such a key under that uid's unlocked bag and return its
+ * record in 'handle'. 12: sign that record with a password credential from
+ * the bag; the password is the NUL-padded 'digest'.
  * 'result' is 0 when the enclave signed, else a negative errno.
  */
 struct sep_key_selftest {
@@ -388,5 +391,22 @@ struct sep_keybag_change {
 #define SEP_BIO_KEYBAG_LOCK   _IOW(SEP_BIO_IOC_MAGIC, 0x12, struct sep_keybag_lock)
 #define SEP_BIO_KEYBAG_CHANGE _IOW(SEP_BIO_IOC_MAGIC, 0x13, struct sep_keybag_change)
 #define SEP_BIO_KEYBAG_CREATE _IOW(SEP_BIO_IOC_MAGIC, 0x14, struct sep_keybag_unlock)
+
+/*
+ * A user's wrapped bag, for userspace to keep across reboots (as macOS
+ * saves it). It holds no secret: it opens only with the user's password,
+ * on this Mac. EXPORT copies the designated bag; IMPORT loads a saved one
+ * and designates it again, locked until SEP_BIO_KEYBAG_UNLOCK.
+ */
+#define SEP_KEYBAG_BLOB_MAX 1024
+
+struct sep_keybag_blob {
+	__u32 uid;
+	__u32 len;
+	__u8  data[SEP_KEYBAG_BLOB_MAX];
+};
+
+#define SEP_BIO_KEYBAG_EXPORT _IOWR(SEP_BIO_IOC_MAGIC, 0x15, struct sep_keybag_blob)
+#define SEP_BIO_KEYBAG_IMPORT _IOW(SEP_BIO_IOC_MAGIC, 0x16, struct sep_keybag_blob)
 
 #endif /* _UAPI_LINUX_APPLE_SEP_H */

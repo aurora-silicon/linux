@@ -200,6 +200,16 @@ pub(crate) const SELFTEST_USERBAG_KEY_ROOT: u32 = 9;
 /// signed, else the enclave status), the lock phase before the lock, after
 /// it and after the unlock.
 pub(crate) const SELFTEST_USERBAG_LOCKED: u32 = 10;
+/// Research: create a throwaway `.userPresence` key under the unlocked bag
+/// of the uid in `enclave_status` and return its record in the handle
+/// buffer (`handle_len`), so a later boot can use it after the bag is
+/// imported again.
+pub(crate) const SELFTEST_USERBAG_KEY_MAKE: u32 = 11;
+/// Research: sign the record in the handle buffer under the bag of the uid
+/// in `enclave_status`, with a password credential from that bag; the
+/// password is the NUL-padded `digest` (at most 32 bytes). `result` = the
+/// signature, `result2` = the verify-secret status.
+pub(crate) const SELFTEST_USERBAG_KEY_USE: u32 = 12;
 
 static_assert!(core::mem::size_of::<Info>() == 16);
 static_assert!(core::mem::size_of::<Create>() == 2124);
@@ -789,6 +799,57 @@ impl SepData {
         Ok((ctx, verify))
     }
 
+    fn key_userbag_record(&self, req: &mut Selftest) -> Result<()> {
+        let uid = req.enclave_status;
+        if uid < crate::sks::SKS_DESIGNATE_USER_MIN || uid == crate::SBIO_PROBE_USER_ID {
+            return Err(EINVAL);
+        }
+        let user = crate::sks::DesignateUser::new(uid).ok_or(EINVAL)?;
+        if req.mode == SELFTEST_USERBAG_KEY_MAKE {
+            let ed = presence_acl()?;
+            let blob = self.user_key_create_in_bag(user, Some(&ed))?;
+            if blob.len() > HANDLE_MAX {
+                return Err(E2BIG);
+            }
+            req.handle.fill(0);
+            req.handle[..blob.len()].copy_from_slice(&blob);
+            req.handle_len = blob.len() as u32;
+            req.result = 0;
+            dev_info!(self.dev, "sep-key: self-test 11: key under uid {}'s bag, record {} bytes\n", uid, blob.len());
+            return Ok(());
+        }
+        let len = req.handle_len as usize;
+        if len == 0 || len > HANDLE_MAX {
+            return Err(EINVAL);
+        }
+        let mut pw = req.digest;
+        req.digest.fill(0);
+        let plen = pw.iter().position(|&b| b == 0).unwrap_or(pw.len());
+        if plen == 0 {
+            return Err(EINVAL);
+        }
+        let mut record = KVec::new();
+        record.extend_from_slice(&req.handle[..len], GFP_KERNEL)?;
+        let made = self.key_context_for(uid, Some((user.special_handle(), &pw[..plen])));
+        pw.fill(0);
+        let (ctx, v) = made?;
+        req.result2 = v;
+        self.last_key_status.store(0, Relaxed);
+        let r = self.user_key_sign_in_bag(user, &record, &[0x5a; DIGEST_LEN], Some(&ctx));
+        self.close_unlock_evaluation(&ctx);
+        req.result = r.err().map(|e| e.to_errno()).unwrap_or(0);
+        req.enclave_status = self.last_key_status.load(Relaxed) as i32;
+        dev_info!(
+            self.dev,
+            "sep-key: self-test 12: saved key under uid {}'s bag: verify {} -> {} ({})\n",
+            uid,
+            v,
+            (if req.result == 0 { "SIGNED" } else { "refused" }),
+            req.enclave_status
+        );
+        Ok(())
+    }
+
     fn key_userbag_locked(&self, req: &mut Selftest) -> Result<()> {
         let uid = req.enclave_status;
         let len = req.handle_len as usize;
@@ -1023,6 +1084,9 @@ impl SepData {
         }
         if req.mode == SELFTEST_PRESENCE_OTHER_BAG {
             return self.key_presence_other_bag(req);
+        }
+        if req.mode == SELFTEST_USERBAG_KEY_MAKE || req.mode == SELFTEST_USERBAG_KEY_USE {
+            return self.key_userbag_record(req);
         }
         if req.mode == SELFTEST_USERBAG_LOCKED {
             return self.key_userbag_locked(req);
