@@ -43,12 +43,14 @@
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 #include <drm/drm_fixed.h>
+#include <linux/pm.h>
 
 #include "apple_boot_display.h"
 #include "apple_resume.h"
 #include "dcp.h"
 #include "plane.h"
 #include "iomfb_m4.h"
+#include "t8132_ext_drm.h"
 
 #define DRIVER_NAME     "apple"
 #define DRIVER_DESC     "Apple display controller DRM driver"
@@ -68,14 +70,17 @@ struct apple_drm_private {
 static DEFINE_MUTEX(apple_g15_display_lock);
 static struct device *apple_t6030_display;
 static struct device *apple_t6031_display;
+static struct device *apple_t8132_display;
 
-/* The publication slot of a G15 SoC's internal display subsystem, or NULL. */
+/* The publication slot of a G15/G16 SoC's internal display subsystem, or NULL. */
 static struct device **apple_g15_display_slot(struct device *dev)
 {
 	if (of_device_is_compatible(dev->of_node, "apple,t6030-display-subsystem"))
 		return &apple_t6030_display;
 	if (of_device_is_compatible(dev->of_node, "apple,t6031-display-subsystem"))
 		return &apple_t6031_display;
+	if (of_device_is_compatible(dev->of_node, "apple,t8132-display-subsystem"))
+		return &apple_t8132_display;
 	return NULL;
 }
 
@@ -108,7 +113,7 @@ static void apple_g15_display_withdraw(struct device *dev)
 	put_device(old);
 }
 
-/* Initial G15 firmware startup must follow successful native display setup.
+/* Initial G15/G16 firmware startup must follow successful native display setup.
  * The component's device lock does not serialize component bind/unbind, so
  * publish separately. This lock protects only publication and a device link;
  * no display calls or firmware RPC run while it is held.
@@ -142,6 +147,13 @@ int apple_drm_t6031_link_device(struct device *consumer)
 }
 EXPORT_SYMBOL_GPL(apple_drm_t6031_link_device);
 
+int apple_drm_t8132_link_device(struct device *consumer)
+{
+	return apple_g15_link_device(consumer, "apple,t8132", "apple,agx-t8132",
+				     &apple_t8132_display);
+}
+EXPORT_SYMBOL_GPL(apple_drm_t8132_link_device);
+
 DEFINE_DRM_GEM_DMA_FOPS(apple_fops);
 
 #define DART_PAGE_SIZE 16384
@@ -165,10 +177,15 @@ static int apple_drm_fbdev_probe(struct drm_fb_helper *helper,
 	drm_for_each_crtc(crtc, helper->dev) {
 		struct apple_dcp *dcp;
 
+		if (t8132_ext_crtc(crtc))
+			continue;
 		dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
-		if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
-		    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
-			/* H17P applies the stored fourth byte as straight alpha. */
+		if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+			/*
+			 * H17P applies the stored fourth byte as straight alpha,
+			 * the H17G (M5) profile too: an XRGB console with X = 0
+			 * stays black. ARGB makes fbcon write it opaque.
+			 */
 			sizes->surface_bpp = 32;
 			sizes->surface_depth = 32;
 			break;
@@ -562,9 +579,13 @@ static void apple_atomic_commit_tail(struct drm_atomic_commit *state)
 
 	/* Retain displaced scanout even when the CRTC stays inactive. */
 	for_each_oldnew_plane_in_state(state, plane, old, new, i) {
-		struct apple_plane_state *apple_state = to_apple_plane_state(new);
-		struct dcp_fb_reference *entry = apple_state->retirement;
+		struct apple_plane_state *apple_state;
+		struct dcp_fb_reference *entry;
 
+		if (t8132_ext_plane(plane))
+			continue;
+		apple_state = to_apple_plane_state(new);
+		entry = apple_state->retirement;
 		if (!entry)
 			continue;
 
@@ -572,7 +593,14 @@ static void apple_atomic_commit_tail(struct drm_atomic_commit *state)
 		dcp_retain_framebuffer(to_apple_crtc(old->crtc)->dcp, entry);
 	}
 
-	drm_atomic_helper_commit_tail_rpm(state);
+	drm_atomic_helper_commit_modeset_disables(state->dev, state);
+	drm_atomic_helper_commit_modeset_enables(state->dev, state);
+	drm_atomic_helper_commit_planes(state->dev, state,
+					DRM_PLANE_COMMIT_ACTIVE_ONLY);
+	drm_atomic_helper_fake_vblank(state);
+	drm_atomic_helper_commit_hw_done(state);
+	drm_atomic_helper_wait_for_flip_done(state->dev, state);
+	drm_atomic_helper_cleanup_planes(state->dev, state);
 }
 
 static const struct drm_mode_config_helper_funcs apple_mode_config_helpers = {
@@ -900,6 +928,8 @@ static int apple_probe_per_dcp(struct device *dev,
 			planes[zpos] = apple_plane_init(drm, 1U << num, surf,
 							supports_l10r,
 							supports_xrgb2101010,
+							dcp_data->hw.iomfb_method_profile ==
+								DCP_IOMFB_METHODS_H17G,
 							plane_type, interchange,
 							supports_premultiplied);
 		}
@@ -1187,6 +1217,9 @@ static void apple_drm_quiesce_connectors(struct drm_device *drm)
 	drm_for_each_connector_iter(connector, &iter) {
 		struct apple_connector *apple_connector = to_apple_connector(connector);
 
+		/* A T8132 external output quiesces on its own. */
+		if (t8132_ext_connector(connector))
+			continue;
 		/* DCP callbacks can still enqueue these until component unbind
 		 * has drained RTKit. Stop their users before releasing endpoints,
 		 * clocks and IOMMUs, and reject enqueues during that release.
@@ -1288,6 +1321,11 @@ static int apple_drm_init_dcp(struct device *dev)
 	ret = apple_probe_typec_ports(&apple->drm, dcp, crtc_mask, num_dcp);
 	if (ret)
 		return ret;
+
+	/* The J713 external outputs; the panel goes on without them. */
+	ret = t8132_ext_drm_init(&apple->drm);
+	if (ret)
+		dev_warn(dev, "T8132 external outputs not all registered: %d\n", ret);
 
 	for (i = 0; i < num_dcp; i++) {
 		connector_type[i] = dcp_get_connector_type(dcp[i]);
@@ -1420,7 +1458,8 @@ static int apple_drm_init(struct device *dev)
 	drm_mode_config_reset(&apple->drm);
 	if (IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)) {
 		drm_for_each_crtc(crtc, &apple->drm) {
-			if (iomfb_is_m4(platform_get_drvdata(to_apple_crtc(crtc)->dcp))) {
+			if (!t8132_ext_crtc(crtc) &&
+			    iomfb_is_m4(platform_get_drvdata(to_apple_crtc(crtc)->dcp))) {
 				retained_modeset = true;
 				break;
 			}
@@ -1441,6 +1480,8 @@ static int apple_drm_init(struct device *dev)
 	drm_for_each_crtc(crtc, &apple->drm) {
 		const char *reason = "none";
 
+		if (t8132_ext_crtc(crtc))
+			continue;
 		ret = dcp_takeover_trial(to_apple_crtc(crtc)->dcp, &reason);
 		if (!ret)
 			continue;
@@ -1454,8 +1495,11 @@ static int apple_drm_init(struct device *dev)
 		__module_get(THIS_MODULE);
 		drm_dev_get(&apple->drm);
 		drm_for_each_crtc(crtc, &apple->drm)
-			dcp_takeover_aborted(to_apple_crtc(crtc)->dcp);
+			if (!t8132_ext_crtc(crtc))
+				dcp_takeover_aborted(to_apple_crtc(crtc)->dcp);
 		apple->aborted = true;
+		/* No sleep handling for outputs of a device never registered. */
+		t8132_ext_drm_fini(&apple->drm);
 		return 0;
 	}
 
@@ -1474,9 +1518,12 @@ static int apple_drm_init(struct device *dev)
 		goto err_unlock;
 	if (retained_modeset) {
 		drm_for_each_crtc(crtc, &apple->drm) {
+			if (t8132_ext_crtc(crtc))
+				continue;
 			ret = dcp_activate(to_apple_crtc(crtc)->dcp);
 			if (ret) {
 				drm_modeset_unlock_all(&apple->drm);
+				t8132_ext_drm_fini(&apple->drm);
 				drm_dev_unregister(&apple->drm);
 				goto err_unbind;
 			}
@@ -1490,13 +1537,15 @@ static int apple_drm_init(struct device *dev)
 
 	/* A panel that publishes no level registers its backlight now. */
 	drm_for_each_crtc(crtc, &apple->drm)
-		dcp_backlight_takeover_registered(to_apple_crtc(crtc)->dcp);
+		if (!t8132_ext_crtc(crtc))
+			dcp_backlight_takeover_registered(to_apple_crtc(crtc)->dcp);
 
 	drm_client_setup_with_fourcc(&apple->drm, DRM_FORMAT_XRGB8888);
 
 	/* A subsequent successful platform probe retries deferred GPU probes. */
 	ret = apple_g15_display_publish(dev);
 	if (ret) {
+		t8132_ext_drm_fini(&apple->drm);
 		drm_dev_unregister(&apple->drm);
 		goto err_unbind;
 	}
@@ -1507,6 +1556,7 @@ err_unlock:
 	if (retained_modeset)
 		drm_modeset_unlock_all(&apple->drm);
 err_unbind:
+	t8132_ext_drm_fini(&apple->drm);
 	apple_drm_quiesce_connectors(&apple->drm);
 	component_unbind_all(dev, NULL);
 	dcp_unlink(&apple->drm);
@@ -1523,6 +1573,8 @@ static void apple_drm_uninit(struct device *dev)
 	if (apple->aborted)
 		return;
 
+	/* Before anything of the DRM device is torn down. */
+	t8132_ext_drm_fini(&apple->drm);
 	apple_drm_quiesce_connectors(&apple->drm);
 	drm_dev_unplug(&apple->drm);
 	drm_atomic_helper_shutdown(&apple->drm);
@@ -1598,18 +1650,29 @@ static int apple_platform_probe(struct platform_device *pdev)
 {
 	struct device *mdev = &pdev->dev;
 	struct component_match *match = NULL;
-	int num_dcp;
+	int num_dcp, ret;
 
 	/* add DCP components, handle less than 1 as probe error */
 	num_dcp = add_dcp_components(mdev, &match);
 	if (num_dcp < 1)
 		return -ENODEV;
 
-	return component_master_add_with_match(mdev, &apple_drm_ops, match);
+	ret = component_master_add_with_match(mdev, &apple_drm_ops, match);
+	if (ret)
+		return ret;
+
+	/*
+	 * The display restores its own state across system sleep, so the PM
+	 * core need not switch to the text console first (which flashes the
+	 * kernel log on screen on every suspend and resume).
+	 */
+	pm_vt_switch_required(mdev, false);
+	return 0;
 }
 
 static void apple_platform_remove(struct platform_device *pdev)
 {
+	pm_vt_switch_unregister(&pdev->dev);
 	component_master_del(&pdev->dev, &apple_drm_ops);
 }
 
@@ -1649,7 +1712,7 @@ static bool apple_drm_hold_resume_events(struct apple_drm_private *apple, u32 cr
 	bool held = true;
 
 	drm_for_each_crtc(crtc, &apple->drm) {
-		if (crtcs & drm_crtc_mask(crtc))
+		if ((crtcs & drm_crtc_mask(crtc)) && !t8132_ext_crtc(crtc))
 			held &= dcp_hold_resume_event(to_apple_crtc(crtc)->dcp);
 	}
 	return held;

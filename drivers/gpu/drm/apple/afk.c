@@ -126,6 +126,7 @@ struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 	}
 	INIT_WORK(&afkep->service_work, afk_service_worker);
 	INIT_LIST_HEAD(&afkep->compact_cmds);
+	init_waitqueue_head(&afkep->compact_orphan_wq);
 	mutex_init(&afkep->compact_tx_lock);
 	init_completion(&afkep->started);
 	init_completion(&afkep->stopped);
@@ -277,10 +278,15 @@ static void afk_getbuf(struct apple_dcp_afkep *ep, u64 message)
 	}
 
 	/* An unstopped adopted session owns this ring until the machine resets. */
-	if (READ_ONCE(ep->dcp->retain_dma))
+	if (ep->dcp->afk_alloc) {
+		ep->bfr = ep->dcp->afk_alloc(ep->dcp, size, &ep->bfr_dma);
+		if (IS_ERR(ep->bfr))
+			ep->bfr = NULL;
+	} else if (READ_ONCE(ep->dcp->retain_dma)) {
 		ep->bfr = dma_alloc_coherent(ep->dcp->dev, size, &ep->bfr_dma, GFP_KERNEL);
-	else
+	} else {
 		ep->bfr = dmam_alloc_coherent(ep->dcp->dev, size, &ep->bfr_dma, GFP_KERNEL);
+	}
 	if (!ep->bfr) {
 		dev_err(ep->dcp->dev, "Failed to allocate %d bytes buffer\n",
 			size);
@@ -447,11 +453,15 @@ struct afk_compact_cmd {
 	size_t copied;
 	u32 retcode;
 	int status;
+	/* timed out, kept until its late reply, see compact_keep_orphans */
+	bool orphan;
 };
 
 static bool afk_compact_capable(struct apple_dcp_afkep *ep)
 {
-	return ep->dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
+	/* An adopted J713 external DCP runs compact EPIC on its auxiliary endpoints too. */
+	return ep->dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+	       (ep->dcp->fw_compat == DCP_FIRMWARE_M4 && ep->dcp->afk_alloc);
 }
 
 static u32 afk_compact_next_status(struct apple_epic_service *service)
@@ -473,9 +483,58 @@ static void afk_fail_commands_locked(struct apple_dcp_afkep *ep, int error)
 
 	list_for_each_entry_safe(cmd, tmp, &ep->compact_cmds, node) {
 		list_del_init(&cmd->node);
+		/* Nobody waits for an orphan: it goes. */
+		if (cmd->orphan) {
+			WRITE_ONCE(ep->compact_orphans, ep->compact_orphans - 1);
+			kfree(cmd);
+			continue;
+		}
 		cmd->status = error;
 		complete(&cmd->done);
 	}
+	wake_up_all(&ep->compact_orphan_wq);
+}
+
+/*
+ * Wait up to @timeout for the late replies of every compact command
+ * that timed out on @ep (see compact_keep_orphans). False if some are still
+ * unanswered.
+ */
+bool afk_compact_orphans_wait(struct apple_dcp_afkep *ep, unsigned long timeout)
+{
+	return wait_event_timeout(ep->compact_orphan_wq, !READ_ONCE(ep->compact_orphans),
+				  timeout);
+}
+
+/* Give up on the late replies of @ep's timed-out compact commands. */
+unsigned int afk_compact_orphans_drop(struct apple_dcp_afkep *ep)
+{
+	struct afk_compact_cmd *cmd, *tmp;
+	unsigned int dropped = 0;
+	unsigned long flags;
+
+	spin_lock_irqsave(&ep->lock, flags);
+	list_for_each_entry_safe(cmd, tmp, &ep->compact_cmds, node) {
+		if (!cmd->orphan)
+			continue;
+		list_del_init(&cmd->node);
+		WRITE_ONCE(ep->compact_orphans, ep->compact_orphans - 1);
+		kfree(cmd);
+		dropped++;
+	}
+	spin_unlock_irqrestore(&ep->lock, flags);
+	wake_up_all(&ep->compact_orphan_wq);
+	if (dropped)
+		dev_warn(ep->dcp->dev,
+			 "AFK[ep:%02x]: %u timed-out command(s) still unanswered, dropped\n",
+			 ep->endpoint, dropped);
+	return dropped;
+}
+
+/* Whether a timed-out compact command of @ep still waits for its reply. */
+bool afk_compact_orphans_pending(struct apple_dcp_afkep *ep)
+{
+	return READ_ONCE(ep->compact_orphans);
 }
 
 void afk_cancel_commands(struct apple_dcp_afkep *ep)
@@ -927,6 +986,18 @@ static void afk_recv_handle_compact_reply(struct apple_dcp_afkep *ep,
 	}
 
 	list_del_init(&match->node);
+	/* The late reply of a timed-out command is its orphan's. */
+	if (match->orphan) {
+		WRITE_ONCE(ep->compact_orphans, ep->compact_orphans - 1);
+		spin_unlock_irqrestore(&ep->lock, flags);
+		dev_dbg(ep->dcp->dev,
+			"AFK[ep:%02x]: late reply to timed-out call group %u cmd %u on interface %u: status %#x\n",
+			ep->endpoint, match->group, match->command, channel,
+			le32_to_cpu(desc->status));
+		wake_up_all(&ep->compact_orphan_wq);
+		kfree(match);
+		return;
+	}
 	match->retcode = le32_to_cpu(desc->status);
 	match->status = 0;
 	if (call && le32_to_cpu(call->data_len) >
@@ -1185,7 +1256,7 @@ static int afk_send_compact_command(struct apple_epic_service *service, u8 type,
 {
 	struct apple_dcp_afkep *ep = service->ep;
 	const struct epic_service_call *call = payload;
-	struct afk_compact_cmd pending;
+	struct afk_compact_cmd pending, *orphan = NULL;
 	struct epic_compact_desc *desc;
 	size_t wire_size = max(payload_len, output_len);
 	unsigned long waited, flags;
@@ -1195,6 +1266,15 @@ static int afk_send_compact_command(struct apple_epic_service *service, u8 type,
 	wrapped = kvzalloc(sizeof(*desc) + wire_size, GFP_KERNEL);
 	if (!wrapped)
 		return -ENOMEM;
+	/* Ready to stand in for this command if it times out. */
+	if (READ_ONCE(ep->compact_keep_orphans)) {
+		orphan = kzalloc_obj(*orphan);
+		/* Without its orphan a timeout could not be kept apart: not sent. */
+		if (!orphan) {
+			kvfree(wrapped);
+			return -ENOMEM;
+		}
+	}
 	desc = wrapped;
 	desc->status = cpu_to_le32(request_status);
 	desc->length = cpu_to_le32(wire_size);
@@ -1235,7 +1315,26 @@ static int afk_send_compact_command(struct apple_epic_service *service, u8 type,
 	waited = wait_for_completion_timeout(&pending.done, timeout);
 	spin_lock_irqsave(&ep->lock, flags);
 	if (!waited && !list_empty(&pending.node)) {
-		list_del_init(&pending.node);
+		/*
+		 * An orphan takes the command's place, so that its late
+		 * reply never completes a later identical command.
+		 */
+		if (orphan) {
+			INIT_LIST_HEAD(&orphan->node);
+			init_completion(&orphan->done);
+			orphan->channel = pending.channel;
+			orphan->type = pending.type;
+			orphan->service_call = pending.service_call;
+			orphan->group = pending.group;
+			orphan->command = pending.command;
+			orphan->request_status = pending.request_status;
+			orphan->orphan = true;
+			list_replace_init(&pending.node, &orphan->node);
+			WRITE_ONCE(ep->compact_orphans, ep->compact_orphans + 1);
+			orphan = NULL;
+		} else {
+			list_del_init(&pending.node);
+		}
 		pending.status = -ETIMEDOUT;
 	}
 	ret = pending.status;
@@ -1252,6 +1351,7 @@ remove_pending:
 		list_del_init(&pending.node);
 	spin_unlock_irqrestore(&ep->lock, flags);
 out:
+	kfree(orphan);
 	kvfree(wrapped);
 	return ret;
 }
@@ -1391,13 +1491,23 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		}
 		ret = parse_epic_service_init(&ctx, &epic_name, &epic_class, &epic_unit,
 					      ep->dcp->fw_compat == DCP_FIRMWARE_H17P);
-		if (ret) {
+		if (ret == -ENOENT &&
+		    ep->dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G) {
+			/*
+			 * M5 (H17G) announces powerlog-service with only
+			 * ep-has-desc-mgr and interface-id; match it by the
+			 * announced name, as for props-less announces.
+			 */
+			epic_name = NULL;
+			epic_class = NULL;
+		} else if (ret) {
 			dev_err(ep->dcp->dev,
 				"AFK[ep:%02x]: failed to extract init props: %d\n",
 				ep->endpoint, ret);
 			return;
+		} else {
+			service_name = epic_class;
 		}
-		service_name = epic_class;
 	} else {
             service_name = name;
         }

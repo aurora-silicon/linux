@@ -94,10 +94,10 @@ struct Firmware{recovery:Recovery,init:Init,queues:Queues,port:()}
 impl Firmware{fn replay_compute(&mut self,_:&mut DeferredBatch)->Result{Ok(())}fn publish_compute(&mut self,_:u64,_:Arc<Packet>,_:&[()],_:&mut DeferredBatch)->Result{Err(EAGAIN)}}
 struct State(Mutex<Option<Box<Firmware>>>);impl State{fn lock(&self)->MutexGuard<'_,Option<Box<Firmware>>>{self.0.lock().unwrap()}}
 struct Available;impl Available{fn observe(&self)->u64{now_ns()}}
-struct Shared{preparations:Arc<Gate>,state:State,crashed:AtomicBool,active_cores:u32,progress:Available}impl Shared{fn queue_events(&self){}}
+struct Shared{preparations:Arc<Gate>,state:State,crashed:AtomicBool,compute_blocks:usize,active_cores:u32,progress:Available}impl Shared{fn queue_events(&self){}}
 struct ComputeDemand;impl ComputeDemand{fn new(_:&Shared)->Self{Self}}
 struct Backend{shared:Shared,owner:u64,context:Context}
-fn required_blocks(_:u32,_:u16)->Result<usize>{Ok(1)}
+fn required_blocks(_:usize,_:u32,_:u16)->Result<usize>{Ok(1)}
 impl Backend{
  fn compute_direct(&self,_:&Arc<Packet>,_:usize,_:&mut DeferredBatch)->Option<Result>{None}
  fn sources_published(&self,_:&Arc<Packet>)->Result<bool>{Ok(true)}
@@ -116,7 +116,7 @@ impl Backend{
 ''' + ensure + '\n' + packet + r'''
 }
 fn main(){
- let b=Backend{owner:1,context:Context,shared:Shared{active_cores:1,progress:Available,preparations:Arc::new(Gate{wait:Wait,changed:Changed}),state:State(Mutex::new(Some(Box::new(Firmware{recovery:Recovery,init:Init,queues:Queues,port:()})))),crashed:AtomicBool::new(false)}};
+ let b=Backend{owner:1,context:Context,shared:Shared{compute_blocks:21,active_cores:1,progress:Available,preparations:Arc::new(Gate{wait:Wait,changed:Changed}),state:State(Mutex::new(Some(Box::new(Firmware{recovery:Recovery,init:Init,queues:Queues,port:()})))),crashed:AtomicBool::new(false)}};
  let p=Arc::new(Packet{command:Validated::Compute{scratch:Scratch},completion:Completion});
  for mode in 0..4 {
   MODE.store(mode,Ordering::SeqCst);NOW.store(0,Ordering::SeqCst);CALLS.store(0,Ordering::SeqCst);

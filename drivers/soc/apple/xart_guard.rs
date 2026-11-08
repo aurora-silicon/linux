@@ -17,9 +17,10 @@
 //! then be unavailable, but no other OS's record changes.
 //!
 //! The parameter's default, -1, takes the platform profile's level: 1 on the
-//! M1, M2 and M3 Macs, whose enclave Linux shares with a macOS install, and
-//! 0 on the MacBook Neo, which already holds Linux records from before the
-//! list existed and would otherwise lose write access to them.
+//! M2 and M3 Macs, whose enclave Linux shares with a macOS install, and 0 on
+//! the M1 Macs, where setting up Touch ID has to rewrite a record from before
+//! Linux, and on the MacBook Neo, which already holds Linux records from
+//! before the list existed and would otherwise lose write access to them.
 //!
 //! The effective level, whether the list could be loaded and every refused
 //! write are reported in the driver's `diag` attributes, with what they make
@@ -1060,9 +1061,10 @@ mod tests {
     fn the_default_follows_the_platform() {
         use crate::profile;
 
+        // Off on M1, whose Touch ID setup rewrites a pre-Linux record.
+        assert_eq!(level(-1, profile::T8103.xart_guard), None);
+        assert_eq!(level(-1, profile::T6000.xart_guard), None);
         // On where Linux shares the enclave with macOS.
-        assert_eq!(level(-1, profile::T8103.xart_guard), Some(1));
-        assert_eq!(level(-1, profile::T6000.xart_guard), Some(1));
         assert_eq!(level(-1, profile::T6020.xart_guard), Some(1));
         assert_eq!(level(-1, profile::T6020_SEPOS13.xart_guard), Some(1));
         assert_eq!(level(-1, profile::T8112.xart_guard), Some(1));

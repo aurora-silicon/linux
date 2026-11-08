@@ -46,11 +46,6 @@
 		#address-cells = <2>;
 		#size-cells = <2>;
 		ranges;
-		/*
-		 * Normally replaced by the loader. With no console= named,
-		 * NULL_TTY_DEFAULT_CONSOLE makes the console ttynull.
-		 */
-		bootargs = "maxcpus=1 rdinit=/init";
 	};
 
 	/*
@@ -258,7 +253,6 @@
 		#sound-dai-cells = <0>;
 		ti,imon-slot-no = <2>;
 		ti,vmon-slot-no = <0>;
-		ti,bclk-ratio = <250>;
 	};
 };
 

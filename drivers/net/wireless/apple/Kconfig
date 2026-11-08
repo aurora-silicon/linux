@@ -2,18 +2,24 @@
 config WLAN_VENDOR_APPLE
 	bool "Apple wireless devices"
 	default y
+	help
+	  Support for Apple's wireless network devices.
 
 if WLAN_VENDOR_APPLE
 config APPLE_CENTAURI
-	tristate "Apple N1 Centauri firmware and IPC transport"
+	tristate "Apple N1 Centauri experimental J813 Wi-Fi"
 	depends on ARCH_APPLE || COMPILE_TEST
-	depends on PCI && CFG80211 && PCIE_APPLE_APIF
+	depends on PCI && CFG80211 && DEBUG_FS
 	select FW_LOADER
 	help
-	  Boot the shared N1 firmware and establish its PCI DMA contexts.
-	  Requires a preinitialized APIF host with the supported reset layout
-	  and DT-supplied personalized firmware name and platform identifier.
-	  The endpoint must start in the stopped ROM personality. Firmware
-	  and per-device calibration are external inputs and are not included.
+	  Experimental Apple N1 PCIe and ACIPC Wi-Fi support for the J813
+	  MacBook Air. Firmware boot, ring setup and connection setup currently
+	  use debugfs and the tools/aurora/j813 workbench. The tested single-link
+	  WPA2 setup completes DHCP and bidirectional traffic. Suspend/resume,
+	  roaming and automatic startup are not yet qualified.
 
+	  The firmware and per-device calibration are private external inputs.
+	  This driver does not include Bluetooth HCI support.
+
+	  To build as a module, choose M; the module is apple_centauri.
 endif

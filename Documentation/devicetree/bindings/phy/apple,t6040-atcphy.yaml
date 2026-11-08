@@ -109,6 +109,25 @@ properties:
       Link to the SuperSpeed lanes of the Type-C connector. Absent on a fixed
       DisplayPort PHY.
 
+  ports:
+    $ref: /schemas/graph.yaml#/properties/ports
+    description: >
+      USB and DisplayPort lane connections to the Type-C connector, and the
+      link to the USB3 controller, in place of port. Absent on a fixed
+      DisplayPort PHY.
+
+    properties:
+      port@0:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: The SuperSpeed lanes of the Type-C connector.
+
+      port@1:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: The SuperSpeed (PIPE) link to the USB controller.
+
+    required:
+      - port@0
+
   apple,tunable-axi2af:
     $ref: "#/$defs/apple,tunable"
     description: Tunables applied to the axi2af region.
@@ -161,6 +180,10 @@ required:
   - power-domains
 
 allOf:
+  - not:
+      required:
+        - port
+        - ports
   - if:
       properties:
         reg-names:
@@ -175,6 +198,7 @@ allOf:
         orientation-switch: false
         mode-switch: false
         port: false
+        ports: false
 
 additionalProperties: false
 

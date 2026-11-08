@@ -65,6 +65,7 @@ properties:
               - apple,t6030-pmgr-pwrstate
               - apple,t6031-pmgr-pwrstate
               - apple,t6041-pmgr-pwrstate
+              - apple,t6050-pmgr-pwrstate
               - apple,t8122-pmgr-pwrstate
               - apple,t8132-pmgr-pwrstate
               - apple,t8140-pmgr-pwrstate
@@ -95,6 +96,13 @@ properties:
   apple,always-on:
     description:
       Forces this power domain to always be powered up.
+    type: boolean
+
+  apple,externally-clocked:
+    description:
+      The domain's clock comes from outside the PMGR, such as an MCA
+      cluster clocked by its NCO. Until that clock runs the domain only
+      reaches the clock-gated state, which then counts as powered up.
     type: boolean
 
   apple,no-auto-pm:

@@ -8,7 +8,7 @@ Apple JPEG scaffold
 This driver provides a common platform and V4L2 memory-to-memory scaffold
 for the Apple T6041 and T8140 JPEG engines. Each DT platform device owns one
 independent m2m scheduler, with formats and VB2 queues allocated per open file.
-T6041's nodes reside in ``t6040.dtsi`` in this source tree. All JPEG engine
+T6041's nodes reside in ``t604x.dtsi`` in this source tree. All JPEG engine
 nodes and the new T8140 DART remain disabled. SoC DART defaults are disabled;
 existing board overrides are preserved. In particular, J700 already enables
 its first JPEG DART independently of the disabled codec engines.
