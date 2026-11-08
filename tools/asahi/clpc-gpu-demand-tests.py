@@ -37,6 +37,7 @@ def main():
         'static bool apple_clpc_gpu_limited(',
         'static void apple_clpc_gpu_floor_count(',
         'static bool apple_clpc_gpu_input_demand(',
+        'static bool apple_clpc_ane_input_demand(',
         'static void apple_clpc_sample('])
     code = r'''
 #include <assert.h>
@@ -64,6 +65,9 @@ static int warned;
 enum apple_clpc_rail { APPLE_CLPC_DCS, APPLE_CLPC_SOC, APPLE_CLPC_RAILS };
 ''' + types + r'''
 struct apple_clpc_gpu { bool active; u64 sequence; };
+struct apple_clpc_ane { int lock; bool active, pending; };
+#define spin_lock_irqsave(l, f) ((void)(l), (f) = 0)
+#define spin_unlock_irqrestore(l, f) ((void)(l), (void)(f))
 struct apple_clpc_cluster { unsigned int request[APPLE_CLPC_RAILS]; };
 struct apple_clpc {
  const struct apple_clpc_hw *hw;
@@ -82,6 +86,8 @@ struct apple_clpc {
  unsigned long gpu_streaming_samples, gpu_dense_samples;
  u64 last_vote_ns;
  struct apple_clpc_gpu *gpu;
+ struct apple_clpc_ane *ane;
+ unsigned int ane_states[APPLE_CLPC_RAILS];
 };
 static unsigned long jiffies;
 static u64 ktime_get_mono_fast_ns(void) { return jiffies * 1000000ull; }
@@ -104,6 +110,23 @@ static int apple_pmc_floor_update(void *pmc, unsigned int agent, u32 mask, u32 f
 }
 static void apple_clpc_queue(struct apple_clpc *c, bool idle) { (void)c; queued_idle=idle; }
 ''' + dense_samples + '\n' + tables + '\n' + methods + r'''
+// T8140 ANE work holds its DRAM and fabric states while it runs, a request
+// shorter than one sample is still seen once, and the hold then expires.
+static void check_t8140_ane(void) {
+ struct apple_clpc_ane ane={0};
+ struct apple_clpc c={.hw=&apple_clpc_hw_t8140,.agent=1,.mask=3,.ane=&ane};
+ c.ane_states[APPLE_CLPC_DCS]=c.hw->ane[APPLE_CLPC_DCS];
+ c.ane_states[APPLE_CLPC_SOC]=c.hw->ane[APPLE_CLPC_SOC];
+ read_error=vote_error=0; pmgr_status=0; pmp_floor=0; jiffies=1000; published=~0u;
+ apple_clpc_sample(&c); assert(published==0 && c.last_reason==0);
+ ane.active=true; jiffies=1004; apple_clpc_sample(&c);
+ assert(published==0x34 && c.last_reason==32);
+ ane.active=false; ane.pending=true; jiffies=1008; apple_clpc_sample(&c);
+ assert(published==0x34 && c.last_reason==32 && !ane.pending);
+ jiffies=1012; apple_clpc_sample(&c); assert(published==0x34 && c.last_reason==16);
+ jiffies=1040; apple_clpc_sample(&c); assert(published==0 && queued_idle);
+}
+
 // T8132's G16 firmware keeps graphics powered while the GPU idles: the
 // M5/F3 floor follows the work the GPU driver reports, as on T6040.
 static void check_t8132(void) {
@@ -205,7 +228,8 @@ int main(void) {
  check_read_error();
  check_t8140();
  check_t8140_dense();
- puts("PASS: T6040 and T8132 host demand; T8140 streaming, dense work, read errors and PMP backoff; idle release");
+ check_t8140_ane();
+ puts("PASS: T6040 and T8132 host demand; T8140 ANE, streaming, dense work, read errors and PMP backoff; idle release");
 }
 '''
     code = code.replace('#define APPLE_PMC_RAIL_SHIFT(r) ((r)*8)', rail_shift)
@@ -214,7 +238,9 @@ int main(void) {
         for name, text in [
             ('fixed', code),
             ('omit-host-demand', code.replace('if (apple_clpc_gpu_input_demand(clpc->hw, clpc->gpu, demand))',
-                                              'if (false && apple_clpc_gpu_input_demand(clpc->hw, clpc->gpu, demand))')),            ('omit-streaming-demand', code.replace('bool streaming = apple_clpc_gpu_streaming(clpc, now);',
+                                              'if (false && apple_clpc_gpu_input_demand(clpc->hw, clpc->gpu, demand))')),            ('omit-ane-demand', code.replace('if (apple_clpc_ane_input_demand(clpc, demand))',
+                                             'if (false && apple_clpc_ane_input_demand(clpc, demand))')),
+            ('omit-streaming-demand', code.replace('bool streaming = apple_clpc_gpu_streaming(clpc, now);',
                                                    'bool streaming = (apple_clpc_gpu_streaming(clpc, now), false);')),
             ('omit-dense-demand', code.replace('if (streaming || dense) {', 'if (streaming || (dense && false)) {')),
             ('dense-ignores-late', code.replace('if (!threshold || late || submissions < threshold)',

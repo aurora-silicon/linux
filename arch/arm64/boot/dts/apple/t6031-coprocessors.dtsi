@@ -1,0 +1,67 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Disabled coprocessor interfaces; firmware handoff remains a loader job. */
+
+&soc {
+	sep_dart: iommu@388ac0000 {
+		compatible = "apple,t6031-dart", "apple,t8110-dart";
+		reg = <0x3 0x88ac0000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 579 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	sep_mbox: mailbox@38a408000 {
+		compatible = "apple,t6031-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x8a408000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 573 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 574 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 575 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 576 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_sep>;
+		status = "disabled";
+	};
+
+	sep: sep@38a400000 {
+		compatible = "apple,t6031-sep", "apple,sep";
+		reg = <0x3 0x8a400000 0 0x6c000>,
+		      <0x3 0x8a050000 0 0x4000>;
+		mboxes = <&sep_mbox>;
+		mbox-names = "mbox";
+		iommus = <&sep_dart 0>;
+		power-domains = <&ps_sep>;
+		status = "disabled";
+	};
+
+	sio_mbox: mailbox@391c08000 {
+		compatible = "apple,t6031-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x91c08000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1343 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 1344 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 1345 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 0 1346 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_sio_cpu>;
+		status = "disabled";
+	};
+
+	sio: dma-controller@391c00000 {
+		compatible = "apple,t6031-sio", "apple,sio";
+		reg = <0x3 0x91c00000 0 0x6c000>,
+		      <0x3 0x91850000 0 0x4000>;
+		mboxes = <&sio_mbox>;
+		#dma-cells = <1>;
+		dma-channels = <128>;
+		iommus = <&sio_dart 0>;
+		power-domains = <&ps_sio_cpu>;
+		status = "disabled";
+	};
+
+};
