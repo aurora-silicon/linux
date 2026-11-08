@@ -159,6 +159,14 @@ fn lockout_record_failures(raw: &[u8; LOCKOUT_RECORD_LEN]) -> u32 {
     u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]).min(VERIFY_RETRY_LIMIT)
 }
 
+/// Whether a lockout follows too many failed matches: `VERIFY_RETRY_LIMIT`
+/// of them since the last match or password, or the enclave's own lockout
+/// after failed matches (which macOS can have caused). Otherwise the lockout
+/// needs the password for another reason, such as a lapsed match credential.
+fn lockout_after_failures(failures: u32, enclave_lockout: bool) -> bool {
+    failures >= VERIFY_RETRY_LIMIT || enclave_lockout
+}
+
 fn lockout_record_locked(raw: &[u8; LOCKOUT_RECORD_LEN]) -> bool {
     raw[..LOCKOUT_MAGIC.len()] == LOCKOUT_MAGIC
         && u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) == LOCKOUT_LOCKED
@@ -192,20 +200,43 @@ mod lockout_tests {
     #[test]
     fn after_boot_wait_reports_locked() {
         use crate::bio::{Lockout, LOCKOUT_FLAG_AFTER_BOOT, LOCKOUT_FLAG_EVERY_PASSWORD};
-        let plain = Lockout::new(false, false, 2);
+        let plain = Lockout::new(false, false, false, 2);
         assert_eq!(plain.locked, 0);
         assert_eq!(plain.failures, 2);
         assert_eq!(plain.flags, LOCKOUT_FLAG_EVERY_PASSWORD);
-        let waiting = Lockout::new(false, true, 0);
+        let waiting = Lockout::new(false, true, false, 0);
         assert_eq!(waiting.locked, 1);
         assert_eq!(waiting.flags, LOCKOUT_FLAG_EVERY_PASSWORD | LOCKOUT_FLAG_AFTER_BOOT);
         // A lockout and the wait together: one password ends both.
-        let both = Lockout::new(true, true, 5);
+        let both = Lockout::new(true, true, true, 5);
         assert_eq!(both.locked, 1);
         assert_ne!(both.flags & LOCKOUT_FLAG_AFTER_BOOT, 0);
-        let locked = Lockout::new(true, false, 5);
+        let locked = Lockout::new(true, false, true, 5);
         assert_eq!(locked.locked, 1);
         assert_eq!(locked.flags & LOCKOUT_FLAG_AFTER_BOOT, 0);
+    }
+
+    #[test]
+    fn lockout_names_failed_attempts() {
+        use crate::bio::{Lockout, LOCKOUT_FLAG_FAILED_ATTEMPTS};
+        // Five misses, on the host or in the enclave, are the real lockout.
+        assert!(lockout_after_failures(VERIFY_RETRY_LIMIT, false));
+        assert!(lockout_after_failures(0, true));
+        // Fewer misses and no lockout in the enclave: the password is needed
+        // for another reason (a lapsed credential, a refused match context).
+        assert!(!lockout_after_failures(0, false));
+        assert!(!lockout_after_failures(VERIFY_RETRY_LIMIT - 1, false));
+        let locked = Lockout::new(true, false, true, VERIFY_RETRY_LIMIT);
+        assert_ne!(locked.flags & LOCKOUT_FLAG_FAILED_ATTEMPTS, 0);
+        let lapsed = Lockout::new(true, false, false, 0);
+        assert_eq!(lapsed.locked, 1);
+        assert_eq!(lapsed.flags & LOCKOUT_FLAG_FAILED_ATTEMPTS, 0);
+        // Only a lockout carries the flag; failed matches alone do not.
+        let open = Lockout::new(false, false, true, VERIFY_RETRY_LIMIT - 1);
+        assert_eq!(open.flags & LOCKOUT_FLAG_FAILED_ATTEMPTS, 0);
+        // The wait after boot is not a lockout after failed matches.
+        let waiting = Lockout::new(false, true, false, 0);
+        assert_eq!(waiting.flags & LOCKOUT_FLAG_FAILED_ATTEMPTS, 0);
     }
 
     #[test]
@@ -5052,29 +5083,42 @@ impl SepData {
         Ok(())
     }
 
+    /// Reports the lockout, and why Touch ID needs the password, so that
+    /// login screens can say which. Read-only, on both nodes.
+    fn write_lockout_state(&self, arg: usize) -> Result<()> {
+        let (locked, failures) = if self.touchid_started.load(Relaxed) {
+            (
+                self.bio_lockout.load(Relaxed),
+                self.bio_nomatch_streak.load(Relaxed),
+            )
+        } else {
+            (self.read_lockout_record(), self.read_recorded_failures())
+        };
+        let failed_attempts = locked
+            && lockout_after_failures(
+                failures,
+                self.enclave_reports_state(LOCK_STATE_LOCKOUT | LOCK_STATE_BIO_LOCKOUT),
+            );
+        let state = bio::Lockout::new(
+            locked,
+            self.bio_after_boot.load(Relaxed),
+            failed_attempts,
+            failures,
+        );
+        kernel::uaccess::UserSlice::new(
+            kernel::uaccess::UserPtr::from_addr(arg),
+            core::mem::size_of::<bio::Lockout>(),
+        )
+        .writer()
+        .write(&state)
+    }
+
     pub(crate) fn rearm_ioctl(&self, cmd: u32, arg: usize) -> Result<()> {
         if self.shutting_down.load(Relaxed) {
             return Err(ENODEV);
         }
         match cmd {
-            bio::IOC_LOCKOUT_STATE => {
-                let locked = if self.touchid_started.load(Relaxed) {
-                    self.bio_lockout.load(Relaxed)
-                } else {
-                    self.read_lockout_record()
-                };
-                let state = bio::Lockout::new(
-                    locked,
-                    self.bio_after_boot.load(Relaxed),
-                    self.bio_nomatch_streak.load(Relaxed),
-                );
-                kernel::uaccess::UserSlice::new(
-                    kernel::uaccess::UserPtr::from_addr(arg),
-                    core::mem::size_of::<bio::Lockout>(),
-                )
-                .writer()
-                .write(&state)
-            }
+            bio::IOC_LOCKOUT_STATE => self.write_lockout_state(arg),
             bio::IOC_REARM => {
                 bio::require_admin()?;
                 let mut request: bio::Rearm = kernel::uaccess::UserSlice::new(
@@ -5529,6 +5573,12 @@ impl SepData {
         }
         if cmd == bio::IOC_PREPARE_ENROL {
             return self.bio_prepare_enrol(arg);
+        }
+        // fprintd holds this node, not the re-arm one: it reads here why a
+        // verify was refused, to tell the user.
+        if cmd == bio::IOC_LOCKOUT_STATE {
+            self.write_lockout_state(arg)?;
+            return bio::ok();
         }
         // With xART writes off the enclave cannot persist what an enrolment or
         // a match changes. It saves anti-replay state after every match, and a
