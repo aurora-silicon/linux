@@ -213,17 +213,25 @@ struct sep_bio_rearm {
  * file. Signing takes a 32-byte digest (for ES256/ecdsa-sha2-nistp256, the
  * SHA-256 of the message) and returns a DER ECDSA-Sig-Value.
  *
- * Interface version 1 has no access control: whoever can open the node and
- * holds a handle can sign with it. The node is created 0600; distributions
- * may grant a group. Every 'flags' and 'reserved' field must be zero; later
- * versions report what they accept in SEP_KEY_GET_INFO.
+ * A key made without flags has no access control: whoever can open the node
+ * and holds its handle can sign with it. A key made with
+ * SEP_KEY_CREATE_BIOMETRY_CURRENT_SET (version 2) carries an access-control
+ * list the enclave enforces: every signature needs a Touch ID match of a
+ * finger enrolled when the key was made. SEP_KEY_SIGN then waits (up to 30 s)
+ * for a touch; the kernel opens a credential context, runs the match in it,
+ * signs and deletes the context inside that one call. Enrolling or removing a
+ * finger makes the key unusable. The node is created 0600; distributions may
+ * grant a group. Unknown 'flags' bits and 'reserved' fields must be zero.
  *
  * Errors: EINVAL for a malformed request or handle, EKEYREJECTED when the
- * enclave refuses the key (for example a handle from another Mac or an
- * earlier Linux install), ENODEV/ETIMEDOUT while the key store is not up,
- * EIO for any other enclave failure.
+ * enclave refuses the key (a handle from another Mac or an earlier Linux
+ * install, or an access-control list not satisfied), EACCES when the touch
+ * did not match (or Touch ID is locked out), ETIMEDOUT when no finger came,
+ * ENODEV while the key store or Touch ID is not up, EIO for any other
+ * enclave failure.
  */
-#define SEP_KEY_IFACE_VERSION 1
+#define SEP_KEY_IFACE_VERSION 2
+#define SEP_KEY_CREATE_BIOMETRY_CURRENT_SET 0x1
 #define SEP_KEY_HANDLE_MAX 2048
 #define SEP_KEY_PUB_LEN    65  /* uncompressed point, 04 || X || Y */
 #define SEP_KEY_DIGEST_LEN 32
@@ -231,13 +239,13 @@ struct sep_bio_rearm {
 
 struct sep_key_info {
 	__u32 version;          /* SEP_KEY_IFACE_VERSION */
-	__u32 flags_supported;  /* 0 in version 1 */
+	__u32 flags_supported;  /* SEP_KEY_CREATE_* bits this kernel accepts */
 	__u32 handle_max;       /* SEP_KEY_HANDLE_MAX */
 	__u32 reserved;
 };
 
 struct sep_key_create {
-	__u32 flags;                            /* in: 0 */
+	__u32 flags;                            /* in: SEP_KEY_CREATE_* */
 	__u32 handle_len;                       /* out */
 	__u8  public_key[SEP_KEY_PUB_LEN];      /* out */
 	__u8  reserved[3];                      /* in: 0 */
@@ -265,5 +273,26 @@ struct sep_key_public {
 #define SEP_KEY_CREATE   _IOWR(SEP_BIO_IOC_MAGIC, 0x21, struct sep_key_create)
 #define SEP_KEY_SIGN     _IOWR(SEP_BIO_IOC_MAGIC, 0x22, struct sep_key_sign)
 #define SEP_KEY_PUBLIC   _IOWR(SEP_BIO_IOC_MAGIC, 0x23, struct sep_key_public)
+
+/*
+ * Test only, refused unless apple_sep.key_selftest=1, root: sign with a
+ * biometric key under a deliberately unsuitable credential context, to show
+ * the enclave refuses. Modes: 1 no context, 2 a context with no match,
+ * 3 a context holding only the key bag secret, 4 a deleted context, 5 one
+ * touch: sign in the matched context, delete it, sign again with it.
+ * 'result' is 0 when the enclave signed, else a negative errno.
+ */
+struct sep_key_selftest {
+	__u32 mode;
+	__u32 handle_len;
+	__u8  digest[SEP_KEY_DIGEST_LEN];
+	__s32 result;
+	__s32 enclave_status;
+	__s32 result2;          /* mode 5: the signature after the delete */
+	__s32 enclave_status2;
+	__u8  handle[SEP_KEY_HANDLE_MAX];
+};
+
+#define SEP_KEY_SELFTEST _IOWR(SEP_BIO_IOC_MAGIC, 0x24, struct sep_key_selftest)
 
 #endif /* _UAPI_LINUX_APPLE_SEP_H */
