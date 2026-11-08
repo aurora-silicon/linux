@@ -103,6 +103,7 @@ dtb-$(CONFIG_ARCH_APPLE) += t6041-j614c.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t6041-j616c.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t6050-j714c.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t6050-j716c.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t6050-j716s.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t6050-j775d.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t8112-j413.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t8112-j415.dtb
