@@ -76,6 +76,7 @@ parser=(A/'parser.c').read_text();afk=(A/'afk.c').read_text();dptx=(A/'dptxep.c'
 codec=re.sub(r'^#include[^\n]*\n','',(A/'afkv2-codec.h').read_text(),flags=re.M)
 identity=pre+codec+r'''
 #define DCP_FIRMWARE_H17P 1
+#define DCP_IOMFB_METHODS_H17G 2
 #define DCP_FIRMWARE_V_14_7 2
 #define AFK_MAX_CHANNEL 16
 #define SYSTEM_ENDPOINT 0x20
@@ -89,7 +90,7 @@ struct apple_epic_service;struct apple_dcp_afkep;
 struct apple_epic_service_ops {const char *name;bool reusable,optional;int (*prepare)(struct apple_epic_service *,const char *,const char *,s64);int (*revalidate)(struct apple_epic_service *,const char *,const char *,s64);void (*init)(struct apple_epic_service *,const char *,const char *,s64);void (*teardown)(struct apple_epic_service *);};
 struct apple_epic_service {struct apple_dcp_afkep *ep;const struct apple_epic_service_ops *ops;bool enabled,torndown,pending_open,defer_start;unsigned users;int lock;u32 channel;void *cookie;const char *pending_name,*pending_class;s64 pending_unit;int cmd_map[1];};
 struct dptx_port {struct apple_epic_service *service;s64 unit;bool enabled,connected;int enable_completion;};
-struct apple_dcp {bool native,ext26_services_open;int fw_compat,index,dptx_controller_ready;struct {unsigned num_dptx_ports;} hw;struct dptx_port dptxport[2];void *dev;struct apple_dcp_afkep *systemep,*ibootep,*dptx_controller_ep,*dcpavservep,*dptxep,*ext26_aux[3];};
+struct apple_dcp {bool native,ext26_services_open;int fw_compat,index,dptx_controller_ready;struct {unsigned num_dptx_ports;int iomfb_method_profile;} hw;struct dptx_port dptxport[2];void *dev;struct apple_dcp_afkep *systemep,*ibootep,*dptx_controller_ep,*dcpavservep,*dptxep,*ext26_aux[3];};
 struct apple_dcp_afkep {struct apple_dcp *dcp;u32 endpoint,num_channels;bool wire_v2,stopping,match_epic_name,compact;int lock;void *wq,*service_work;const struct apple_epic_service_ops *ops;struct apple_epic_service services[AFK_MAX_CHANNEL];};
 static bool dcp_is_ext26(struct apple_dcp *d){return d->native;}
 static bool dcp_fail_stop(struct apple_dcp *d){return d->native;}
