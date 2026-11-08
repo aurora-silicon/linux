@@ -49,9 +49,12 @@ pub(crate) enum Guidance {
     // The last touch's finger is still down; the next capture waits for it.
     Lift = 4,
     // A cause reported with a retry (an unusable capture): partial contact,
-    // rest more of the finger on the middle of the sensor. The UAPI also
-    // names TOO_FAST (6) and CLEAN (7) for the image-assessment feedback.
+    // rest more of the finger on the middle of the sensor.
     Center = 5,
+    // The finger moved during the capture: hold it still.
+    TooFast = 6,
+    // Dirt on the sensor or a wet finger: clean or dry it.
+    Clean = 7,
 }
 
 #[derive(Clone, Copy, Default)]
