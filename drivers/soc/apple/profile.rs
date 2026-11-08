@@ -745,6 +745,41 @@ mod tests {
         assert_eq!(picked(&[b"apple,j713", b"apple,t6041"]), None);
     }
 
+    /// Touch ID has one path for every Mac. The retry limits, the lock
+    /// states, the password re-arm and the lift-gated capture read nothing
+    /// from the profile; only the transport underneath (bus, nonce session,
+    /// key-store dialect) does. What the shared path needs is a sensor whose
+    /// status it decodes, so every Mac with a built-in sensor must select a
+    /// profile naming one of the known Mesa revisions.
+    #[test]
+    fn every_touch_id_mac_gets_a_sensor_the_shared_path_decodes() {
+        let macs: [&[&[u8]]; 14] = [
+            &[b"apple,j313", b"apple,t8103"],
+            &[b"apple,j316s", b"apple,t6000"],
+            &[b"apple,j316c", b"apple,t6001"],
+            &[b"apple,j414s", b"apple,t6020"],
+            &[b"apple,j414c", b"apple,t6021"],
+            &[b"apple,j413", b"apple,t8112"],
+            &[b"apple,j415", b"apple,t8112"],
+            &[b"apple,j613", b"apple,t8122"],
+            &[b"apple,j615", b"apple,t8122"],
+            &[b"apple,j614s", b"apple,t6040"],
+            &[b"apple,j616s", b"apple,t6040"],
+            &[b"apple,j616c", b"apple,t6041"],
+            &[b"apple,j713", b"apple,t8132"],
+            &[b"apple,j700", b"apple,t8140"],
+        ];
+        for compatibles in macs {
+            let has = |c: &[u8]| compatibles.iter().any(|x| *x == c);
+            let selected = select(&has, &|| &T6020);
+            assert!(selected.is_ok());
+            if let Ok(profile) = selected {
+                assert!(crate::sensor::KNOWN_IDENTIFIERS.contains(&profile.sensor.expected_id));
+            }
+        }
+        assert!(crate::sensor::KNOWN_IDENTIFIERS.contains(&T6020_SEPOS13.sensor.expected_id));
+    }
+
     #[test]
     fn j713_takes_the_v3_sensor_on_the_j613_soc_side() {
         assert!(T8132.sensor.expected_id == T8140.sensor.expected_id);
