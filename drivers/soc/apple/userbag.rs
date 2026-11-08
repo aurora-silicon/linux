@@ -971,6 +971,12 @@ impl crate::SepData {
         Ok(())
     }
 
+    /// The enclave's lock phase for `user`'s bag (0 unlocked, 1 locked,
+    /// 2 locking, 5 asleep in grace), for the key self-tests.
+    pub(crate) fn userbag_lock_phase(&self, user: crate::sks::DesignateUser) -> Result<u32> {
+        Ok(self.userbag_state(user)?.lock_phase)
+    }
+
     fn userbag_state(&self, user: crate::sks::DesignateUser) -> Result<GetState> {
         let handle = user.special_handle().value();
         let lock = self

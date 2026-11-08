@@ -189,6 +189,17 @@ pub(crate) const SELFTEST_USERBAG_KEY_SAME_BAG: u32 = 8;
 /// credential (what root holds) and `result2` with the handle buffer's
 /// password used as given (pass a wrong one).
 pub(crate) const SELFTEST_USERBAG_KEY_ROOT: u32 = 9;
+/// Research probe, no finger (T2: a locked bag refuses without its
+/// password): a throwaway `.userPresence` key under the unlocked bag of the
+/// uid in `enclave_status`, password in the handle buffer. The kernel signs
+/// (r0) with a context holding that bag's password credential, locks the bag
+/// for good (screen lock, grace expired now), then signs with the same, now
+/// stale, context (r1), with no credential (r2) and with a fresh password
+/// credential (r3), unlocks the bag with the password and signs with a fresh
+/// credential again (r4). The digest buffer returns, as LE i32: r0..r4 (0 =
+/// signed, else the enclave status), the lock phase before the lock, after
+/// it and after the unlock.
+pub(crate) const SELFTEST_USERBAG_LOCKED: u32 = 10;
 
 static_assert!(core::mem::size_of::<Info>() == 16);
 static_assert!(core::mem::size_of::<Create>() == 2124);
@@ -778,6 +789,63 @@ impl SepData {
         Ok((ctx, verify))
     }
 
+    fn key_userbag_locked(&self, req: &mut Selftest) -> Result<()> {
+        let uid = req.enclave_status;
+        let len = req.handle_len as usize;
+        if len == 0 || len > 256 || uid < crate::sks::SKS_DESIGNATE_USER_MIN || uid == crate::SBIO_PROBE_USER_ID {
+            return Err(EINVAL);
+        }
+        let mut pw = [0u8; 256];
+        pw[..len].copy_from_slice(&req.handle[..len]);
+        req.handle.fill(0);
+        let user = crate::sks::DesignateUser::new(uid).ok_or(EINVAL)?;
+        let out = (|| -> Result<[i32; 8]> {
+            let ed = presence_acl()?;
+            let blob = self.user_key_create_in_bag(user, Some(&ed))?;
+            let digest = [0x5au8; DIGEST_LEN];
+            let sign = |ctx: Option<&[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>| -> i32 {
+                self.last_key_status.store(0, Relaxed);
+                match self.user_key_sign_in_bag(user, &blob, &digest, ctx) {
+                    Ok(_) => 0,
+                    Err(_) => match self.last_key_status.load(Relaxed) as i32 {
+                        0 => -(EIO.to_errno()),
+                        s => s,
+                    },
+                }
+            };
+            let mut r = [0i32; 8];
+            r[5] = self.userbag_lock_phase(user).map(|p| p as i32).unwrap_or(-1);
+            let (stale, _) = self.key_context_for(uid, Some((user.special_handle(), &pw[..len])))?;
+            r[0] = sign(Some(&stale));
+            self.userbag_lock(user, true, true)?;
+            r[6] = self.userbag_lock_phase(user).map(|p| p as i32).unwrap_or(-1);
+            r[1] = sign(Some(&stale));
+            self.close_unlock_evaluation(&stale);
+            r[2] = sign(None);
+            let (fresh, v) = self.key_context_for(uid, Some((user.special_handle(), &pw[..len])))?;
+            r[3] = if v == 0 { sign(Some(&fresh)) } else { v };
+            self.close_unlock_evaluation(&fresh);
+            self.userbag_unlock(user, &pw[..len])?;
+            r[7] = self.userbag_lock_phase(user).map(|p| p as i32).unwrap_or(-1);
+            let (fresh2, v2) = self.key_context_for(uid, Some((user.special_handle(), &pw[..len])))?;
+            r[4] = if v2 == 0 { sign(Some(&fresh2)) } else { v2 };
+            self.close_unlock_evaluation(&fresh2);
+            Ok(r)
+        })();
+        pw.fill(0);
+        let r = out?;
+        for (i, v) in r.iter().enumerate() {
+            req.digest[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        req.result = 0;
+        dev_info!(
+            self.dev,
+            "sep-key: self-test 10, uid {}'s bag: phase {} -> sign {}; locked (phase {}): stale credential {}, none {}, fresh password credential {}; unlocked (phase {}): {}\n",
+            uid, r[5], r[0], r[6], r[1], r[2], r[3], r[7], r[4]
+        );
+        Ok(())
+    }
+
     fn key_userbag_probe(&self, req: &mut Selftest) -> Result<()> {
         let uid = req.enclave_status;
         let len = req.handle_len as usize;
@@ -929,6 +997,9 @@ impl SepData {
         }
         if req.mode == SELFTEST_PRESENCE_OTHER_BAG {
             return self.key_presence_other_bag(req);
+        }
+        if req.mode == SELFTEST_USERBAG_LOCKED {
+            return self.key_userbag_locked(req);
         }
         if req.mode == SELFTEST_USERBAG_KEY_SAME_BAG || req.mode == SELFTEST_USERBAG_KEY_ROOT {
             return self.key_userbag_probe(req);

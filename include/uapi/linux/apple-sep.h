@@ -309,6 +309,9 @@ struct sep_key_public {
  * credential (password in 'handle'), 'result2' = with no credential.
  * 9 (research): as 8, 'result' = with the identity bag's secret as the
  * credential, 'result2' = with the password given in 'handle'.
+ * 10 (research): as 8, but the kernel also locks the bag for good and signs
+ * with a stale, an empty and a fresh credential, then unlocks and signs
+ * again; the results come back in 'digest' (see key.rs).
  * 'result' is 0 when the enclave signed, else a negative errno.
  */
 struct sep_key_selftest {
