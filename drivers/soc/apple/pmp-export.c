@@ -201,9 +201,6 @@ static int apple_pmp_suspend_late(struct device *dev)
 
 	if (!pm_suspend_via_firmware())
 		return 0;
-	/* Retained power votes have no teardown. */
-	if (apple_pmp_display_retained_board())
-		return -EBUSY;
 
 	guard(mutex)(&pmp_lock);
 	if (pmp_device != dev || pmp_asleep)
