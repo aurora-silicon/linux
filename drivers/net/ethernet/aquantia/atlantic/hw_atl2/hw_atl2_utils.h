@@ -8,6 +8,13 @@
 
 #include "aq_hw.h"
 
+#define HW_ATL2_FW_VER_1_4_33 0x01040021U
+
+static inline bool hw_atl2_fw_needs_legacy_rx_filters(struct aq_hw_s *hw)
+{
+	return hw->fw_ver_actual == HW_ATL2_FW_VER_1_4_33;
+}
+
 /* Hardware tx launch time descriptor */
 struct hw_atl2_txts_s {
 	__le64 ts;

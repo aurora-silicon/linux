@@ -494,18 +494,24 @@ static void hw_atl2_hw_init_new_rx_filters(struct aq_hw_s *self)
 	 * REC entry is used for further processing. If multiple entries match,
 	 * the lowest REC entry, Action field will be selected.
 	 */
-	art_last_sec = min_t(u32,
-			     priv->art_base_index / 8 + priv->art_count / 8,
-			     16U);
-	art_first_sec = min_t(u32, priv->art_base_index / 8, 16U);
-	art_mask = (BIT(art_last_sec) - 1) - (BIT(art_first_sec) - 1);
-	if (!art_mask) {
-		/* ART base index is out of range, enabling all sections */
-		art_mask = 0xFFFF;
+	if (hw_atl2_fw_needs_legacy_rx_filters(self)) {
+		hw_atl2_rpf_act_rslvr_section_en_set(self, 0xFFFF);
+	} else {
+		art_last_sec = min_t(u32,
+				     priv->art_base_index / 8 + priv->art_count / 8,
+				     16U);
+		art_first_sec = min_t(u32, priv->art_base_index / 8, 16U);
+		art_mask = (BIT(art_last_sec) - 1) -
+			   (BIT(art_first_sec) - 1);
+		if (!art_mask) {
+			/* ART base index is out of range, enable all sections */
+			art_mask = 0xFFFF;
+		}
+		art_sections = hw_atl2_rpf_act_rslvr_section_en_get(self) |
+			       art_mask;
+		hw_atl2_rpf_act_rslvr_section_en_set(self, art_sections);
+		hw_atl2_rpf_l3_v6_v4_select_set(self, 1);
 	}
-	art_sections = hw_atl2_rpf_act_rslvr_section_en_get(self) | art_mask;
-	hw_atl2_rpf_act_rslvr_section_en_set(self, art_sections);
-	hw_atl2_rpf_l3_v6_v4_select_set(self, 1);
 	hw_atl2_rpfl2_uc_flr_tag_set(self, HW_ATL2_RPF_TAG_BASE_UC,
 				     priv->l2_filters_base_index);
 	hw_atl2_rpfl2_bc_flr_tag_set(self, HW_ATL2_RPF_TAG_BASE_UC);
