@@ -179,6 +179,16 @@ pub(crate) const SELFTEST_PRESENCE_PROBE: u32 = 6;
 /// verify-secret status, `result`/`enclave_status` = the signature. Shows
 /// whether a credential from one bag satisfies a key under another.
 pub(crate) const SELFTEST_PRESENCE_OTHER_BAG: u32 = 7;
+/// Research probe, no finger: a throwaway `.userPresence` key made under
+/// the (unlocked) bag of the user in `enclave_status` (outer handle -uid).
+/// `result`: signed with a context holding a passcode credential from that
+/// same bag (the password in the handle buffer). `result2`: signed with a
+/// fresh, unsatisfied context. Statuses in `enclave_status`/`2`.
+pub(crate) const SELFTEST_USERBAG_KEY_SAME_BAG: u32 = 8;
+/// As 8, but `result` signs with the Linux identity bag's secret as the
+/// credential (what root holds) and `result2` with the handle buffer's
+/// password used as given (pass a wrong one).
+pub(crate) const SELFTEST_USERBAG_KEY_ROOT: u32 = 9;
 
 static_assert!(core::mem::size_of::<Info>() == 16);
 static_assert!(core::mem::size_of::<Create>() == 2124);
@@ -739,6 +749,107 @@ impl SepData {
         Ok(handle)
     }
 
+    /// A fresh tracked context for `uid`; with `secret`, a passcode
+    /// credential from `bag`'s verify-secret is added. Returns the context
+    /// and the verify status (0 when none was asked).
+    fn key_context_for(
+        &self,
+        uid: i32,
+        cred: Option<(crate::sks::SpecialHandle, &[u8])>,
+    ) -> Result<([u8; crate::scrd::SCRD_ACM_HANDLE_LEN], i32)> {
+        let (status, _) = self.scrd_command(&crate::scrd::scrd_initialize()).ok_or(EIO)?;
+        if status != 0 {
+            return Err(EIO);
+        }
+        let (status, out) = self.scrd_command(&crate::scrd::scrd_context_create_tracked(uid)).ok_or(EIO)?;
+        let ctx = crate::scrd::tracked_create_reference(&out).filter(|_| status == 0).ok_or(EIO)?;
+        let (status, _) = self.scrd_command(&crate::scrd::scrd_context_externalize(&ctx)).ok_or(EIO)?;
+        if status != 0 {
+            self.close_unlock_evaluation(&ctx);
+            return Err(EIO);
+        }
+        let mut verify = 0;
+        if let Some((bag, secret)) = cred {
+            verify = match self.sks_send(self.sks_req_verify_secret(bag, secret, &ctx)) {
+                Some(out) => out.reply.status as i32,
+                None => -(EIO.to_errno()),
+            };
+        }
+        Ok((ctx, verify))
+    }
+
+    fn key_userbag_probe(&self, req: &mut Selftest) -> Result<()> {
+        let uid = req.enclave_status;
+        let len = req.handle_len as usize;
+        if len == 0 || len > 256 || uid < crate::sks::SKS_DESIGNATE_USER_MIN || uid == crate::SBIO_PROBE_USER_ID {
+            return Err(EINVAL);
+        }
+        let mut pw = [0u8; 256];
+        pw[..len].copy_from_slice(&req.handle[..len]);
+        req.handle.fill(0);
+        let user = crate::sks::DesignateUser::new(uid).ok_or(EINVAL)?;
+        let ed = presence_acl()?;
+        let made = self.user_key_create_in_bag(user, Some(&ed));
+        let blob = match made {
+            Ok(b) => b,
+            Err(e) => {
+                pw.fill(0);
+                dev_info!(self.dev, "sep-key: self-test: key under uid {}'s bag not created ({:?})\n", uid, e);
+                return Err(e);
+            }
+        };
+        let digest = req.digest;
+        let sign = |ctx: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]| -> (i32, i32) {
+            self.last_key_status.store(0, Relaxed);
+            let r = self.user_key_sign_in_bag(user, &blob, &digest, Some(ctx));
+            (r.err().map(|e| e.to_errno()).unwrap_or(0), self.last_key_status.load(Relaxed) as i32)
+        };
+        let first = if req.mode == SELFTEST_USERBAG_KEY_SAME_BAG {
+            self.key_context_for(uid, Some((user.special_handle(), &pw[..len])))
+        } else {
+            let du = crate::sks::DesignateUser::new(crate::SBIO_PROBE_USER_ID).ok_or(EINVAL)?;
+            match crate::keybag::read(crate::keybag::Slot::Identity) {
+                Ok(crate::keybag::State::Present(stored)) => {
+                    self.key_context_for(crate::SBIO_PROBE_USER_ID, Some((du.special_handle(), stored.secret())))
+                }
+                _ => Err(ENODEV),
+            }
+        };
+        let (ctx, v1) = match first {
+            Ok(c) => c,
+            Err(e) => {
+                pw.fill(0);
+                return Err(e);
+            }
+        };
+        (req.result, req.enclave_status) = sign(&ctx);
+        self.close_unlock_evaluation(&ctx);
+        let second = if req.mode == SELFTEST_USERBAG_KEY_SAME_BAG {
+            self.key_context_for(uid, None)
+        } else {
+            self.key_context_for(uid, Some((user.special_handle(), &pw[..len])))
+        };
+        pw.fill(0);
+        let (ctx2, v2) = second?;
+        (req.result2, req.enclave_status2) = sign(&ctx2);
+        self.close_unlock_evaluation(&ctx2);
+        dev_info!(
+            self.dev,
+            "sep-key: self-test {}: key under uid {}'s bag: first ({}) verify {} -> {} ({}); second ({}) verify {} -> {} ({})\n",
+            req.mode,
+            uid,
+            (if req.mode == SELFTEST_USERBAG_KEY_SAME_BAG { "same-bag password" } else { "identity-bag secret" }),
+            v1,
+            (if req.result == 0 { "SIGNED" } else { "refused" }),
+            req.enclave_status,
+            (if req.mode == SELFTEST_USERBAG_KEY_SAME_BAG { "unsatisfied" } else { "given password" }),
+            v2,
+            (if req.result2 == 0 { "SIGNED" } else { "refused" }),
+            req.enclave_status2
+        );
+        Ok(())
+    }
+
     fn key_presence_other_bag(&self, req: &mut Selftest) -> Result<()> {
         let uid = req.enclave_status;
         let len = req.handle_len as usize;
@@ -818,6 +929,9 @@ impl SepData {
         }
         if req.mode == SELFTEST_PRESENCE_OTHER_BAG {
             return self.key_presence_other_bag(req);
+        }
+        if req.mode == SELFTEST_USERBAG_KEY_SAME_BAG || req.mode == SELFTEST_USERBAG_KEY_ROOT {
+            return self.key_userbag_probe(req);
         }
         let (blob, flags) = decode_handle(&req.handle, req.handle_len)?;
         if flags & HANDLE_BIOMETRY == 0 {

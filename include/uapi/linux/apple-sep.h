@@ -304,6 +304,11 @@ struct sep_key_public {
  * credential comes from another user's key bag. In: 'enclave_status' = that
  * uid, 'handle'/'handle_len' = that bag's password. Out: 'result2' = the
  * verify-secret status, 'result'/'enclave_status' = the signature.
+ * 8 (research): a throwaway .userPresence key under the unlocked bag of the
+ * uid in 'enclave_status'; 'result' = signed with that bag's password
+ * credential (password in 'handle'), 'result2' = with no credential.
+ * 9 (research): as 8, 'result' = with the identity bag's secret as the
+ * credential, 'result2' = with the password given in 'handle'.
  * 'result' is 0 when the enclave signed, else a negative errno.
  */
 struct sep_key_selftest {
