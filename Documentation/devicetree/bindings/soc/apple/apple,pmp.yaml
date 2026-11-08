@@ -33,6 +33,9 @@ properties:
               - apple,t8140-pmp-v2
           - const: apple,t6000-pmp-v2
       - items:
+          - const: apple,t8142-pmp-v2
+          - const: apple,t8140-pmp-v2
+      - items:
           - const: apple,t8103-pmp
           - const: apple,pmp
 
