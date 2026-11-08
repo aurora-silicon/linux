@@ -13,6 +13,10 @@ const REGION_A: u64 = BASE + 0x1b_8000;
 const FWCTL: u64 = BASE + 0x1c_0000;
 const QOS: u64 = BASE + 0x1c_8000;
 const AON: u64 = BASE + 0x1d_0000;
+/// The always-on block the policy names, where macOS 27.0 keeps it on the J813: its policy's AON
+/// pointer (bundle +0xb858, read under aura) is the kernel window's 0xc07b_8000, right above the
+/// shared cluster. The 25G76 address, [`AON`], holds an empty page there.
+const COMMON26_AON: u64 = BASE + 0xc07b_8000;
 const KICK_SHARED: u64 = BASE + 0x1d_8000;
 const BUNDLE: u64 = BASE + 0xc078_8000;
 const COMPLETION_HIGH: u64 = BASE + 0xc080_0000;
@@ -132,7 +136,8 @@ impl InitData {
                 self.add(fixed_controller(address, FW_LOG_SIZE)?)?;
             }
         }
-        let aon = self.add(fixed_controller(AON, m::M5_AON_PTD_SIZE)?)?;
+        let aon_va = if common26 { COMMON26_AON } else { AON };
+        let aon = self.add(fixed_controller(aon_va, m::M5_AON_PTD_SIZE)?)?;
         self.bundle = self.add(fixed_controller(BUNDLE, shared.total)?)?;
         self.pb = self.add(fixed(PB, mmu::UAT_PGSZ, RW)?)?;
         self.page_pool = self.add(fixed(UMA, mmu::UAT_PGSZ, RW)?)?;
@@ -216,7 +221,7 @@ impl InitData {
             &mut self.object_mut(self.bundle)?.bytes_mut()[..m::M5_HW_DATA_SIZE], enabled_cores)
             .map_err(|_| EINVAL)?;
         let bindings = m::M5PolicyBindings {
-            state: PRIVATE + private.policy_state as u64, aon_ptd: AON, boot_timestamp: 0,
+            state: PRIVATE + private.policy_state as u64, aon_ptd: aon_va, boot_timestamp: 0,
         };
         if common26 {
             m::encode_common26_bundle_policy(board, bindings, self.object_mut(self.bundle)?.bytes_mut())
