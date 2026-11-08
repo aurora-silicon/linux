@@ -71,6 +71,10 @@ struct apple_pmgr_ps {
 	bool strict_state;
 	bool wait_parent;
 	u32 reset_time_us;
+	/* Off in genpd but on in hardware as the system slept: someone else raised it. */
+	bool sleep_raised_by_other;
+	/* That domain's target as the system slept. */
+	u32 sleep_target;
 };
 
 #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
@@ -418,6 +422,32 @@ static int apple_pmgr_ps_resume_early(struct device *dev)
 }
 
 /*
+ * By the noirq phase genpd has powered off what it is going to. A domain it has off
+ * whose target is still on was raised by a coprocessor's firmware: on T8140 the AOP
+ * raises audio domains of its own in the always-on PMGR, and the sleep keeps them.
+ */
+static int apple_pmgr_ps_suspend_noirq(struct device *dev)
+{
+	struct apple_pmgr_ps *ps = dev_get_drvdata(dev);
+	unsigned long flags;
+	u32 reg;
+
+	ps->sleep_raised_by_other = false;
+	if (ps->firmware_owned || ps->inherited_on)
+		return 0;
+
+	spin_lock_irqsave(&ps->genpd.slock, flags);
+	if (!regmap_read(ps->regmap, ps->offset, &reg)) {
+		ps->sleep_target = FIELD_GET(APPLE_PMGR_PS_TARGET, reg);
+		ps->sleep_raised_by_other = ps->genpd.status == GENPD_STATE_OFF &&
+					    ps->sleep_target != APPLE_PMGR_PS_PWRGATE;
+	}
+	spin_unlock_irqrestore(&ps->genpd.slock, flags);
+
+	return 0;
+}
+
+/*
  * A firmware-driven suspend powers the SoC down and its sleep engine leaves the
  * domains in states of its own: AUTO_ENABLE cleared, some at clock gating. genpd
  * only powers a domain back on if it turned it off itself, so its idea of a
@@ -427,7 +457,8 @@ static int apple_pmgr_ps_resume_early(struct device *dev)
  * 30 others (measured under aura). Which of them Linux needs isn't established,
  * so this follows genpd's books rather than a list. A domain whose driver took it
  * down for the sleep, as the USB host's PHY does, is that driver's to raise, in
- * its own order.
+ * its own order. A domain someone else raised before the sleep, and still at that
+ * target, stays theirs.
  */
 static int apple_pmgr_ps_resume_noirq(struct device *dev)
 {
@@ -444,7 +475,14 @@ static int apple_pmgr_ps_resume_noirq(struct device *dev)
 	ret = regmap_read(ps->regmap, ps->offset, &reg);
 	if (!ret) {
 		if (ps->genpd.status == GENPD_STATE_OFF) {
-			if (FIELD_GET(APPLE_PMGR_PS_TARGET, reg) != APPLE_PMGR_PS_PWRGATE)
+			u32 target = FIELD_GET(APPLE_PMGR_PS_TARGET, reg);
+
+			/*
+			 * Lowering an AOP-raised audio domain here leaves the internal
+			 * microphone array's data path dark: the AOP never raises it again.
+			 */
+			if (target != APPLE_PMGR_PS_PWRGATE &&
+			    !(ps->sleep_raised_by_other && target == ps->sleep_target))
 				ret = apple_pmgr_ps_set(&ps->genpd, APPLE_PMGR_PS_PWRGATE,
 							false);
 		} else {
@@ -846,7 +884,7 @@ MODULE_DEVICE_TABLE(of, apple_pmgr_ps_of_match);
 
 static const struct dev_pm_ops apple_pmgr_ps_pm_ops = {
 	LATE_SYSTEM_SLEEP_PM_OPS(apple_pmgr_ps_suspend_late, apple_pmgr_ps_resume_early)
-	NOIRQ_SYSTEM_SLEEP_PM_OPS(NULL, apple_pmgr_ps_resume_noirq)
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_pmgr_ps_suspend_noirq, apple_pmgr_ps_resume_noirq)
 };
 
 static struct platform_driver apple_pmgr_ps_driver = {
