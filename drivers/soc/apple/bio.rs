@@ -218,15 +218,27 @@ pub(crate) struct Lockout {
 pub(crate) const LOCKOUT_FLAG_EVERY_PASSWORD: u32 = 1;
 /// Touch ID waits for the first password since this boot.
 pub(crate) const LOCKOUT_FLAG_AFTER_BOOT: u32 = 2;
+/// The lockout follows too many failed matches.
+pub(crate) const LOCKOUT_FLAG_FAILED_ATTEMPTS: u32 = 4;
 
 impl Lockout {
-    /// `locked` is a lockout after failed matches (or one recorded before the
-    /// restart); `after_boot` is the wait for the first password since boot.
-    /// Either one refuses every verify.
-    pub(crate) fn new(locked: bool, after_boot: bool, failures: u32) -> Lockout {
+    /// `locked` is a lockout (or one recorded before the restart);
+    /// `after_boot` is the wait for the first password since boot. Either
+    /// one refuses every verify. `failed_attempts` says that the lockout
+    /// follows too many failed matches; without it, a lockout needs the
+    /// password for another reason, such as a lapsed match credential.
+    pub(crate) fn new(
+        locked: bool,
+        after_boot: bool,
+        failed_attempts: bool,
+        failures: u32,
+    ) -> Lockout {
         let mut flags = LOCKOUT_FLAG_EVERY_PASSWORD;
         if after_boot {
             flags |= LOCKOUT_FLAG_AFTER_BOOT;
+        }
+        if locked && failed_attempts {
+            flags |= LOCKOUT_FLAG_FAILED_ATTEMPTS;
         }
         Lockout {
             locked: u32::from(locked || after_boot),
