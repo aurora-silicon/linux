@@ -480,7 +480,9 @@ properties:
 
       - description: Apple M5 Max SoC based platforms
         items:
-          - const: apple,j714c  # MacBook Pro (14-inch, M5 Max, 2026)
+          - enum:
+              - apple,j714c # MacBook Pro (14-inch, M5 Max, 2026)
+              - apple,j716c # MacBook Pro (16-inch, M5 Max, 2026)
           - const: apple,t6050
           - const: apple,arm-platform
 
