@@ -298,6 +298,10 @@ const MSG_INITDATA: u64 = 0x81 << MSG_TYPE_SHIFT;
 const MSG_INITDATA_ADDR_MASK: u64 = (1 << 44) - 1;
 /// Firmware message acknowledging [`MSG_INITDATA`].
 const MSG_INITDATA_ACK: u64 = 0x09;
+/// Host message on the doorbell endpoint that answers [`MSG_INITDATA_ACK`]: the acknowledgement
+/// type with the host bit. macOS 27.0 on the J813 sends it to both roles a few milliseconds after
+/// it hands them their initialization root (aura's trace: 0x89000000000000 on endpoint 0x21).
+const MSG_INITDATA_DONE: u64 = 0x89 << MSG_TYPE_SHIFT;
 /// Firmware message announcing new records in the event and trace rings.
 const MSG_EVENTS: u64 = 0x42 << MSG_TYPE_SHIFT;
 /// Primary processor notification for newly published device-control records.
@@ -1802,6 +1806,23 @@ impl Gpu {
             uat.kernel_lower_dynamic_range(),
         ))
         .inspect_err(at("lower links"))?;
+        // The J813 in native order, from aura's trace of macOS 27.0 on that machine: the start
+        // control is written first (macOS does it at platform init), the coprocessors are started
+        // next, and the Fender gating is cleared only once both of them run -- not before them.
+        // The other boards prepare both after the coprocessor boot (prepare_m5_firmware).
+        if cfg.chip_id == 0x8142 {
+            regs.set_m5_start_control().inspect_err(at("M5 start control"))?;
+            // Bring-up trial: force the ps_gfx transition macOS performs from off (the domain
+            // is inherited on here), then re-apply the SGX preparation the cycle resets.
+            extern "C" {
+                fn asahi_j813_pmp_agx_power_cycle() -> core::ffi::c_int;
+            }
+            // SAFETY: the helper only ioremaps and pokes the PMGR GPU power-state register.
+            if unsafe { asahi_j813_pmp_agx_power_cycle() } != 0 {
+                dev_warn!(dev.as_ref(), "M5: GFX power cycle incomplete\n");
+            }
+            regs.set_m5_start_control().inspect_err(at("M5 start control after cycle"))?;
+        }
         let primary = Coprocessor::new(pdev, dev, cfg, &uat, shared, Role::Primary)
             .inspect_err(|e| dev_err!(dev.as_ref(), "Primary coprocessor setup failed: {:?}\n", e))?;
         let secondary = Coprocessor::new(pdev, dev, cfg, &uat, shared, Role::Secondary)
@@ -1874,6 +1895,15 @@ impl Gpu {
         session.primary.boot().inspect_err(at("primary boot"))?;
         let secondary = session.secondary.as_mut().ok_or(EINVAL)?;
         secondary.boot().inspect_err(at("secondary boot"))?;
+        // Both coprocessors run: clear the J813's Fender gating here, where macOS 27.0 clears it
+        // (it reads 0x6 and writes 0 after both ASCs are running and the first mailbox exchange).
+        if cfg.chip_id == 0x8142 {
+            session
+                .bridge
+                .regs
+                .enable_g17_gating()
+                .inspect_err(at("G17 gating after the coprocessor boot"))?;
+        }
         // The firmware built its root and kernel-window tables while booting.
         session.uat.invalidate_reserved_tables();
         let root_entries = session
@@ -1905,11 +1935,24 @@ impl Gpu {
             .confirm_firmware_root_entries(root_entries)
             .inspect_err(at("root confirmation"))?;
         session.uat.mirror_secondary_root().inspect_err(at("secondary root"))?;
-        session
-            .bridge
-            .regs
-            .prepare_m5_firmware()
-            .inspect_err(at("M5 preparation"))?;
+        if cfg.chip_id == 0x8142 {
+            // Bring-up trial: report AGX on through the PMP dashboard in native order (SGX
+            // start control and gating set, before InitData), as macOS does right after the
+            // platform power-on write.
+            extern "C" {
+                fn asahi_j813_pmp_report_agx(on: bool) -> core::ffi::c_int;
+            }
+            // SAFETY: the helper only ioremaps and pokes the mcc dashboard windows.
+            if unsafe { asahi_j813_pmp_report_agx(true) } != 0 {
+                dev_warn!(dev.as_ref(), "M5: PMP AGX report failed\n");
+            }
+        } else {
+            session
+                .bridge
+                .regs
+                .prepare_m5_firmware()
+                .inspect_err(at("M5 preparation"))?;
+        }
         let ack = shared.variant.init_ack;
         let primary_root = session.init.root_va(Role::Primary)?;
         let secondary_root = session.init.root_va(Role::Secondary)?;
@@ -1918,8 +1961,10 @@ impl Gpu {
         if cfg.chip_id == 0x8142 {
             let secondary = session.secondary.as_mut().ok_or(EINVAL)?;
             secondary.init(secondary_root, ack).inspect_err(at("secondary InitData"))?;
+            secondary.notify(MSG_INITDATA_DONE)?;
             dev_info!(dev.as_ref(), "M5 secondary initdata acknowledged\n");
             session.primary.init(primary_root, ack).inspect_err(at("primary InitData"))?;
+            session.primary.notify(MSG_INITDATA_DONE)?;
             dev_info!(dev.as_ref(), "M5 primary initdata acknowledged\n");
         } else {
             session.primary.init(primary_root, ack).inspect_err(at("primary InitData"))?;
