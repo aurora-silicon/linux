@@ -25,6 +25,8 @@
 
 &framebuffer0 {
 	power-domains = <&ps_disp_cpu>;
+	panel = <&panel>;
+	post-init-providers = <&panel>;
 };
 
 &mtp_mt {
@@ -75,7 +77,7 @@
 };
 
 &dcp {
-	panel {
+	panel: panel {
 		compatible = "apple,panel-j516", "apple,panel-mini-led", "apple,panel";
 		width-mm = <346>;
 		height-mm = <223>;
@@ -98,10 +100,19 @@
 	apple,platform-id = <16>;
 };
 
-&smc_hwmon {
-	/* M3-family die keys, not yet confirmed on J516s; absent keys are skipped. */
-	apple,soc-die-keys = "Tf04", "Tf09", "Tf0A", "Tf0B", "Tf0D",
-			     "Tf0E", "Tf14", "Tf18", "Tf19", "Tf1A",
-			     "Tf24", "Tf25", "Tf2A", "Tf2B";
-	apple,thermal-pressure-key = "mTPL";
+
+&i2c4 {
+	sd_card_control: card-control@20 {
+		compatible = "apple,t6030-sd-card-control", "apple,sd-card-control";
+		reg = <0x20>;
+		status = "disabled";
+	};
+};
+
+&i2c8 {
+	display_pcon: display-converter@8 {
+		compatible = "apple,t6030-display-pcon", "apple,display-pcon";
+		reg = <0x8>;
+		status = "disabled";
+	};
 };

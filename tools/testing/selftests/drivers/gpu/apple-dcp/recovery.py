@@ -368,6 +368,12 @@ def check(root, output):
     static void afk_send(struct apple_dcp_afkep *e,u64 m) { (void)e;(void)m;assert(!"compact ring message on H17P"); }
     static void afk_cancel_commands(struct apple_dcp_afkep *e) { assert(e && !e->compact); }
     '''+extract(af,'static bool afk_compact_capable(')+'\n'
+        if 'DCP_FIRMWARE_M4' in extract(af,'static bool afk_compact_capable('):
+            # Nor is it an adopted J713 (M4) external DCP: no AFK allocator, not M4.
+            assert queued.count('void *dev;int fw_compat;')==1
+            queued=queued.replace('void *dev;int fw_compat;','void *dev;int fw_compat;void *afk_alloc;',1)
+            queued=queued.replace('    #define FIELD_PREP(mask,val)',
+                                  '    #ifndef DCP_FIRMWARE_M4\n    #define DCP_FIRMWARE_M4 (DCP_FIRMWARE_H17P + 4)\n    #endif\n    #define FIELD_PREP(mask,val)',1)
     for signature in ['static inline unsigned int afk_ring_drain_budget(', 'static inline unsigned int afk_ring_drain(']:
         queued+=extract(afh,signature)+'\n'
     for signature in ['static bool afk_recv_entry(', 'static void afk_recv_drain(',

@@ -18,6 +18,10 @@
  *  - T6041: no test tree; a PMP that binds after the deadline still
  *    starts the external display power-up, and only a failed PMP or power-up
  *    leaves the internal panel alone.
+ *  - T6041 on the J616c (t6041-gate-test.dtso): no PMP; each external chain
+ *    is enabled once its processor has firmware memory, one without it or
+ *    already enabled stays as it is, and the display subsystem is never
+ *    written.
  * Included at the end of display-gate.c.
  *
  * The test trees are applied once and stay: the gate gives some properties
@@ -33,6 +37,8 @@ extern const u8 __dtbo_t6030_gate_test_begin[];
 extern const u8 __dtbo_t6030_gate_test_end[];
 extern const u8 __dtbo_t8122_gate_test_begin[];
 extern const u8 __dtbo_t8122_gate_test_end[];
+extern const u8 __dtbo_t6041_gate_test_begin[];
+extern const u8 __dtbo_t6041_gate_test_end[];
 
 /* One SoC's test tree and what the gate should make of it. */
 struct gt_soc {
@@ -136,6 +142,7 @@ static const struct gt_soc gt_t6030 __initconst = {
 static int gt_fixture_t6031 __initdata = -1;
 static int gt_fixture_t6030 __initdata = -1;
 static int gt_fixture_t8122 __initdata = -1;
+static int gt_fixture_t6041 __initdata = -1;
 
 /*
  * Whether the booted tree has its own /soc, checked before the first fixture
@@ -1016,6 +1023,220 @@ static struct kunit_suite gate_t6041_suite __refdata = {
 	.test_cases = gate_t6041_cases,
 };
 
+/*
+ * T6041 on the J616c. Its test tree is at the root, so it is applied only
+ * where there is no display subsystem; the chains are reverted after each
+ * case, the tree stays.
+ */
+static const struct gt_soc gt_t6041_max __initconst = {
+	.soc = &gate_t6041_max,
+	.fixture = __dtbo_t6041_gate_test_begin,
+	.fixture_end = __dtbo_t6041_gate_test_end,
+};
+
+static bool gt_max_live __initdata;
+static struct property *gt_max_display_status __initdata;
+
+static int __init gt_max_suite_init(struct kunit_suite *suite)
+{
+	struct device_node *np = of_find_node_by_path("/display-subsystem");
+
+	gt_max_live = !!np;
+	of_node_put(np);
+	if (gt_max_live)
+		return 0;
+	return of_overlay_fdt_apply(gt_t6041_max.fixture,
+				    gt_t6041_max.fixture_end - gt_t6041_max.fixture,
+				    &gt_fixture_t6041, NULL);
+}
+
+static int __init gt_max_init(struct kunit *test)
+{
+	int ret = gt_init(test, &gt_t6041_max);
+
+	if (!ret && gt_max_live)
+		kunit_skip(test, "the booted device tree has its own display subsystem");
+	return ret;
+}
+
+static void __init gt_max_exit(struct kunit *test)
+{
+	unsigned int i;
+
+	/* The later chain's iommus edit builds on the earlier one's. */
+	for (i = ARRAY_SIZE(t6041_max_cs); i--;) {
+		of_changeset_revert(&t6041_max_cs[i]);
+		of_changeset_destroy(&t6041_max_cs[i]);
+	}
+	gt_exit(test);
+}
+
+/* The test's edits, then the gate; the display subsystem's status property is noted before. */
+static void __init gt_max_run(struct kunit *test)
+{
+	struct gate_test *t = test->priv;
+	unsigned int i;
+
+	KUNIT_ASSERT_EQ(test, of_changeset_apply(&t->cs), 0);
+	for (i = 0; i < ARRAY_SIZE(t6041_max_cs); i++)
+		of_changeset_init(&t6041_max_cs[i]);
+	gt_max_display_status = of_find_property(gt_node(test, "/display-subsystem"), "status",
+						 NULL);
+	gate_t6041_max_run();
+}
+
+/* The processor's data and heap regions, as the boot loader fills them. */
+static void __init gt_max_fill(struct kunit *test, unsigned int i)
+{
+	char path[48];
+
+	snprintf(path, sizeof(path), "/reserved-memory/dcpext%u-data", i);
+	gt_set_string(test, path, "status", "okay");
+	snprintf(path, sizeof(path), "/reserved-memory/dcpext%u-heap", i);
+	gt_set_string(test, path, "status", "okay");
+}
+
+static void __init gt_max_expect_chain(struct kunit *test, unsigned int i, bool enabled)
+{
+	const struct gate_staged *st = &t6041_max_stages[i];
+	unsigned int n;
+
+	for (n = 0; n < st->nr; n++)
+		KUNIT_EXPECT_EQ_MSG(test, gt_okay(test, st->nodes[n]), enabled, "%s", st->nodes[n]);
+}
+
+/*
+ * The display subsystem keeps its status property (the gate never wrote it)
+ * and has the internal DART's entry, then the display DARTs of the chains in
+ * @mask, in order.
+ */
+static void __init gt_max_expect_display(struct kunit *test, unsigned int mask)
+{
+	struct device_node *display = gt_node(test, "/display-subsystem");
+	struct of_phandle_args args;
+	unsigned int i, entry = 1;
+
+	KUNIT_EXPECT_PTR_EQ(test, of_find_property(display, "status", NULL), gt_max_display_status);
+	KUNIT_EXPECT_TRUE(test, of_device_is_available(display));
+	KUNIT_EXPECT_EQ(test, of_count_phandle_with_args(display, "iommus", "#iommu-cells"),
+			1 + hweight32(mask));
+	for (i = 0; i < ARRAY_SIZE(t6041_max_stages); i++) {
+		if (!(mask & BIT(i)))
+			continue;
+		KUNIT_ASSERT_EQ(test, of_parse_phandle_with_args(display, "iommus", "#iommu-cells",
+								 entry++, &args), 0);
+		KUNIT_EXPECT_PTR_EQ(test, args.np, gt_node(test, t6041_max_stages[i].dart));
+		KUNIT_EXPECT_EQ(test, args.args[0], 0);
+		of_node_put(args.np);
+	}
+}
+
+/* Without a PMP, both chains whose processors have memory are enabled. */
+static void __init gate_t6041_max_enabled(struct kunit *test)
+{
+	struct device_node *pmp = of_find_node_by_path("/pmp@500700000");
+
+	KUNIT_EXPECT_NULL(test, pmp);
+	of_node_put(pmp);
+	gt_max_fill(test, 0);
+	gt_max_fill(test, 1);
+	gt_max_run(test);
+	gt_max_expect_chain(test, 0, true);
+	gt_max_expect_chain(test, 1, true);
+	gt_max_expect_display(test, BIT(0) | BIT(1));
+}
+
+/* A boot loader that fills nothing leaves everything as it is. */
+static void __init gate_t6041_max_no_memory(struct kunit *test)
+{
+	gt_max_run(test);
+	gt_max_expect_chain(test, 0, false);
+	gt_max_expect_chain(test, 1, false);
+	gt_max_expect_display(test, 0);
+}
+
+/* The other processor's chain does not wait for one that was refused. */
+static void __init gate_t6041_max_one_processor(struct kunit *test)
+{
+	gt_max_fill(test, 1);
+	gt_max_run(test);
+	gt_max_expect_chain(test, 0, false);
+	gt_max_expect_chain(test, 1, true);
+	gt_max_expect_display(test, BIT(1));
+}
+
+/* A region that is still a placeholder keeps the whole chain off. */
+static void __init gate_t6041_max_partial_memory(struct kunit *test)
+{
+	gt_max_fill(test, 1);
+	gt_set_string(test, "/reserved-memory/dcpext0-data", "status", "okay");
+	gt_max_run(test);
+	gt_max_expect_chain(test, 0, false);
+	gt_max_expect_chain(test, 1, true);
+	gt_max_expect_display(test, BIT(1));
+}
+
+/* A boot loader that enabled a chain itself is not enabled again, nor its DART added twice. */
+static void __init gate_t6041_max_enabled_by_loader(struct kunit *test)
+{
+	gt_max_fill(test, 0);
+	gt_max_fill(test, 1);
+	gt_set_string(test, t6041_max_hdmi_nodes[0], "status", "okay");
+	gt_set_string(test, t6041_max_usbc_nodes[0], "status", "okay");
+	gt_max_run(test);
+	KUNIT_EXPECT_TRUE(test, gt_okay(test, t6041_max_hdmi_nodes[0]));
+	KUNIT_EXPECT_FALSE(test, gt_okay(test, t6041_max_hdmi_nodes[1]));
+	KUNIT_EXPECT_TRUE(test, gt_okay(test, t6041_max_usbc_nodes[0]));
+	KUNIT_EXPECT_FALSE(test, gt_okay(test, t6041_max_usbc_nodes[1]));
+	gt_max_expect_display(test, 0);
+}
+
+/* A chain that is not all there is refused whole. */
+static void __init gate_t6041_max_missing_node(struct kunit *test)
+{
+	gt_max_fill(test, 0);
+	gt_max_fill(test, 1);
+	gt_detach(test, "/phy@39aa90000");
+	gt_max_run(test);
+	gt_max_expect_chain(test, 1, true);
+	gt_max_expect_display(test, BIT(1));
+	KUNIT_EXPECT_FALSE(test, gt_okay(test, t6041_max_hdmi_nodes[0]));
+}
+
+/* Without an enabled display subsystem nothing is enabled, and it stays as it was. */
+static void __init gate_t6041_max_no_display(struct kunit *test)
+{
+	struct device_node *display = gt_node(test, "/display-subsystem");
+
+	gt_max_fill(test, 0);
+	gt_max_fill(test, 1);
+	gt_set_string(test, "/display-subsystem", "status", "disabled");
+	gt_max_run(test);
+	gt_max_expect_chain(test, 0, false);
+	gt_max_expect_chain(test, 1, false);
+	KUNIT_EXPECT_FALSE(test, of_device_is_available(display));
+	KUNIT_EXPECT_EQ(test, of_count_phandle_with_args(display, "iommus", "#iommu-cells"), 1);
+}
+
+static struct kunit_case gate_t6041_max_cases[] __refdata = {
+	KUNIT_CASE(gate_t6041_max_enabled),
+	KUNIT_CASE(gate_t6041_max_no_memory),
+	KUNIT_CASE(gate_t6041_max_one_processor),
+	KUNIT_CASE(gate_t6041_max_partial_memory),
+	KUNIT_CASE(gate_t6041_max_enabled_by_loader),
+	KUNIT_CASE(gate_t6041_max_missing_node),
+	KUNIT_CASE(gate_t6041_max_no_display),
+	{}
+};
+
+static struct kunit_suite gate_t6041_max_suite __refdata = {
+	.name = "apple-display-gate-t6041-max",
+	.suite_init = gt_max_suite_init,
+	.init = gt_max_init,
+	.exit = gt_max_exit,
+	.test_cases = gate_t6041_max_cases,
+};
+
 /* T6030 first: the T6031 and T8122 trees describe a PMP, which it refuses. */
 kunit_test_init_section_suites(&gate_t6030_suite, &gate_t6031_suite, &gate_t8122_suite,
-			       &gate_t6041_suite);
+			       &gate_t6041_suite, &gate_t6041_max_suite);

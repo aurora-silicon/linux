@@ -1,5 +1,20 @@
 USB Type-C port devices (eg. /sys/class/typec/port0/)
 
+What:		/sys/class/typec/<port>/contaminant
+Date:		November 2026
+Contact:	Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+Description:
+		Shows the contaminant state of a connector whose port driver can
+		report contaminant detection. The attribute is notified when the
+		state changes so that poll(2) wakes up. A state change also generates
+		a KOBJ_CHANGE uevent on the port.
+
+		Valid values:
+
+		- "unknown" when the connector state cannot be determined
+		- "none" when no contaminant is detected
+		- "liquid" when liquid is detected
+
 What:		/sys/class/typec/<port>/data_role
 Date:		April 2017
 Contact:	Heikki Krogerus <heikki.krogerus@linux.intel.com>

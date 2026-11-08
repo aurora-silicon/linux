@@ -35,10 +35,12 @@
 #include <linux/pci-apple.h>
 #include <linux/soc/apple/pci-apple-piodma.h>
 #include <linux/pci-ecam.h>
+#include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/rcupdate.h>
 #include <linux/reset.h>
 #include <linux/soc/apple/dart.h>
+#include <linux/soc/apple/t8132.h>
 #include <linux/soc/apple/tunable.h>
 #include <linux/suspend.h>
 
@@ -65,6 +67,8 @@ module_param(s2idle_keep_link, bool, 0644);
 MODULE_PARM_DESC(s2idle_keep_link, "Keep tunneled links up through suspend-to-idle");
 
 static int link_up_timeout = 500;
+/* Fundamental resets of a conventional port whose endpoint does not train. */
+#define LINK_RESET_RETRIES	2
 module_param(link_up_timeout, int, 0644);
 MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 
@@ -87,6 +91,7 @@ MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 #define   PHY_LANE_CFG_REFCLK1REQ	BIT(1)
 #define   PHY_LANE_CFG_REFCLK0ACK	BIT(2)
 #define   PHY_LANE_CFG_REFCLK1ACK	BIT(3)
+#define   PHY_LANE_CFG_REFBUF_OFF	BIT(4)
 #define   PHY_LANE_CFG_REFCLKEN		(BIT(9) | BIT(10))
 #define   PHY_LANE_CFG_REFCLKCGEN	(BIT(30) | BIT(31))
 #define PHY_LANE_CTL			0x00004
@@ -171,6 +176,10 @@ MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 #define PORT_T602X_MSIADDR	0x016c
 #define PORT_T602X_MSIADDR_HI	0x0170
 #define PORT_T602X_PERST	0x082c
+/* T8152: lane PIPE reset is released by clearing this after PERST#. */
+#define   PORT_T8152_PIPE_RST	BIT(16)
+#define PORT_T8152_PIPE_RST_STS	0x00a8
+#define   PORT_T8152_PIPE_RST_STS_LANES	GENMASK(3, 0)
 #define PORT_T602X_RID2SID	0x3000
 #define PORT_T602X_MSIMAP	0x3800
 
@@ -192,6 +201,7 @@ struct hw_info {
 	u32 port_perst;
 	u32 port_rid2sid;
 	u32 port_msimap;
+	u32 port_tunctrl;
 	u32 max_rid2sid;
 	u32 pwren_off_ms;
 	u32 pwren_on_ms;
@@ -200,6 +210,20 @@ struct hw_info {
 	bool root_bus_only;
 	bool tunneled;
 	bool tunnel_intr2axi;
+	bool t8132_reset;
+	bool msimap_by_vector;
+	/*
+	 * In suspend-to-idle a tunnel host whose power domain is not always-on
+	 * keeps its link while the domain stays on, see apple_pcie_hold_domain().
+	 */
+	bool s2idle_hold_domain;
+	/* AppleT8152PCIePort::_initializeRefclkBuffer clears REFBUF_OFF. */
+	bool refbuf_off;
+	/*
+	 * APCIECoreRCGen5Port::enablePortHardware: after PERST#, wait for the
+	 * lane PIPE reset status, then release PORT_T8152_PIPE_RST.
+	 */
+	bool pipe_rst;
 };
 
 static const struct hw_info t8103_hw = {
@@ -243,6 +267,20 @@ static const struct hw_info t8140_hw = {
 	.root_bus_only		= true,
 };
 
+/* T8152 (M6) apcie: T602x port layout, refclk buffer powered down by iBoot. */
+static const struct hw_info t8152_hw = {
+	.phy_lane_ctl		= 0,
+	.port_msiaddr		= PORT_T602X_MSIADDR,
+	.port_msiaddr_hi	= PORT_T602X_MSIADDR_HI,
+	.port_refclk		= 0,
+	.port_perst		= PORT_T602X_PERST,
+	.port_rid2sid		= PORT_T602X_RID2SID,
+	.port_msimap		= PORT_T602X_MSIMAP,
+	.max_rid2sid		= 512,
+	.refbuf_off		= true,
+	.pipe_rst		= true,
+};
+
 static const struct hw_info t8103_pciec_hw = {
 	.port_msiaddr		= PORT_MSIADDR,
 	.port_perst		= PORT_PERST,
@@ -273,6 +311,29 @@ static const struct hw_info t8122_pciec_hw = {
 	.port_msimap		= PORT_T602X_MSIMAP,
 	.max_rid2sid		= 64,
 	.tunneled		= true,
+};
+
+/*
+ * T8132 PCIe-C has 256 RID2SID entries, which run over the old tunnel reset
+ * block: TUNCTRL/TUNSTAT move to 0x1088/0x108c. The MSI address takes its
+ * high word at 0x16c.
+ *
+ * apple,pciec-kernel-init brings its ports up with the t8103 sequence, the
+ * oe-fabric tunables included, so it is not a tunnel_intr2axi controller:
+ * its Intr2AXI bridge is only pulsed, by ACIO and around the port enable.
+ */
+static const struct hw_info t8132_pciec_hw = {
+	.port_msiaddr		= PORT_MSIADDR,
+	.port_msiaddr_hi	= PORT_MSIADDR + 4,
+	.port_perst		= PORT_PERST,
+	.port_rid2sid		= PORT_RID2SID,
+	.port_msimap		= PORT_T602X_MSIMAP,
+	.port_tunctrl		= 0x1088,
+	.max_rid2sid		= 256,
+	.tunneled		= true,
+	.t8132_reset		= true,
+	.msimap_by_vector	= true,
+	.s2idle_hold_domain	= true,
 };
 
 static const struct of_device_id apple_pcie_of_match[];
@@ -337,6 +398,10 @@ struct apple_pcie {
 	bool			bus_stopped;
 	bool			reset_on_resume;
 	bool			link_kept;
+	/* a power domain that is not always-on, held on for this sleep */
+	struct notifier_block	pd_nb;
+	bool			pd_held;
+	unsigned int		pd_vetoed;
 	bool			resume_failed; /* cleared only by teardown and reprobe */
 	struct reset_control	*reset;
 	u16			managed_sids;
@@ -360,6 +425,8 @@ struct apple_pcie_port {
 	struct device_node	*np;
 	void __iomem		*base;
 	void __iomem		*phy;
+	/* PERST# of a conventional port with a single reset line. */
+	struct gpio_desc	*perst;
 	struct irq_domain	*domain;
 	struct list_head	entry;
 	unsigned long		*sid_map;
@@ -481,9 +548,14 @@ static void apple_pcie_tunnel_apply_tunable(void __iomem *base,
 
 static void apple_msi_compose_msg(struct irq_data *data, struct msi_msg *msg)
 {
+	struct apple_pcie *pcie = data->domain->host_data;
+
 	msg->address_hi = upper_32_bits(DOORBELL_ADDR);
 	msg->address_lo = lower_32_bits(DOORBELL_ADDR);
 	msg->data = data->hwirq;
+	/* T8132 indexes its MSI map by the shared-window vector. */
+	if (pcie->hw->msimap_by_vector)
+		msg->data += pcie->msi_vector_base;
 }
 
 static struct irq_chip apple_msi_bottom_chip = {
@@ -721,7 +793,8 @@ static int apple_pcie_port_setup_irq(struct apple_pcie_port *port)
 			apple_pcie_port_writel(port,
 				FIELD_PREP(PORT_MSIMAP_TARGET, pcie->msi_vector_base + i) |
 				PORT_MSIMAP_ENABLE,
-				pcie->hw->port_msimap + 4 * i);
+				pcie->hw->port_msimap + 4 * (i +
+				(pcie->hw->msimap_by_vector ? pcie->msi_vector_base : 0)));
 	} else {
 		apple_pcie_port_writel(port, 0, PORT_MSIBASE);
 		val = ilog2(pcie->nvecs) << PORT_MSICFG_L2MSINUM_SHIFT;
@@ -853,6 +926,16 @@ static void apple_pcie_port_enable_irq(struct apple_pcie_port *port)
 static u32 apple_pcie_rid2sid_write(struct apple_pcie_port *port,
 				    int idx, u32 val);
 
+static u32 apple_pcie_port_tunctrl(struct apple_pcie_port *port)
+{
+	return port->pcie->hw->port_tunctrl ?: PORT_TUNCTRL;
+}
+
+static u32 apple_pcie_port_tunstat(struct apple_pcie_port *port)
+{
+	return apple_pcie_port_tunctrl(port) + PORT_TUNSTAT - PORT_TUNCTRL;
+}
+
 static int apple_pcie_tunnel_release_reset(struct apple_pcie_port *port)
 {
 	u32 stat;
@@ -863,12 +946,12 @@ static int apple_pcie_tunnel_release_reset(struct apple_pcie_port *port)
 	 * Releasing it means writing zero to PORT_TUNCTRL, waiting for the
 	 * reset-active indication to clear, and only then enabling the LTSSM.
 	 */
-	apple_pcie_port_writel(port, 0, PORT_TUNCTRL);
+	apple_pcie_port_writel(port, 0, apple_pcie_port_tunctrl(port));
 	ret = read_poll_timeout_atomic(apple_pcie_port_readl, stat,
 				       !(stat & PORT_TUNSTAT_PERST_ON),
 				       1000,
 				       port->pcie->kernel_init ? 250000 : 100000,
-				       false, port, PORT_TUNSTAT);
+				       false, port, apple_pcie_port_tunstat(port));
 	if (ret)
 		dev_err(port->pcie->dev,
 			"port %pOF tunnel reset release timed out\n", port->np);
@@ -920,11 +1003,28 @@ static void apple_pcie_tunnel_reset_hardware(struct apple_pcie_port *port)
 		if (port->pcie->kernel_init &&
 		    apple_pcie_tunnel_reset_regs[i].offset == 0x130)
 			value = 0;
+		if (port->pcie->hw->t8132_reset) {
+			/* T8132 has no 0x128 or 0x810, and new 0x124/0x130 values. */
+			switch (apple_pcie_tunnel_reset_regs[i].offset) {
+			case 0x128:
+			case 0x810:
+				continue;
+			case 0x124:
+				value = 0x100;
+				break;
+			case 0x130:
+				value = 0x03020208;
+				break;
+			}
+		}
 		apple_pcie_port_writel(port, value, apple_pcie_tunnel_reset_regs[i].offset);
 	}
 
 	for (i = 0; i < port->pcie->hw->max_rid2sid; i++)
 		apple_pcie_rid2sid_write(port, i, 0);
+	if (port->pcie->hw->t8132_reset)
+		for (i = 0; i < 256; i++)
+			apple_pcie_port_writel(port, 0, PORT_T602X_MSIMAP + 4 * i);
 }
 
 static int apple_pcie_tunnel_reinitialize(struct apple_pcie_port *port)
@@ -1073,7 +1173,7 @@ static int apple_pcie_tunnel_cold_init(struct apple_pcie_port *port)
 		 port->np,
 		 apple_pcie_port_readl(port, PORT_STATUS),
 		 apple_pcie_port_readl(port, PORT_LINKSTS),
-		 apple_pcie_port_readl(port, PORT_TUNSTAT));
+		 apple_pcie_port_readl(port, apple_pcie_port_tunstat(port)));
 	return 0;
 }
 
@@ -1097,7 +1197,8 @@ static void apple_pcie_tunnel_restore_irq_hw(struct apple_pcie_port *port)
 			apple_pcie_port_writel(port,
 				FIELD_PREP(PORT_MSIMAP_TARGET, pcie->msi_vector_base + i) |
 				PORT_MSIMAP_ENABLE,
-				pcie->hw->port_msimap + 4 * i);
+				pcie->hw->port_msimap + 4 * (i +
+				(pcie->hw->msimap_by_vector ? pcie->msi_vector_base : 0)));
 	} else {
 		apple_pcie_port_writel(port, 0, PORT_MSIBASE);
 		value = ilog2(pcie->nvecs) << PORT_MSICFG_L2MSINUM_SHIFT;
@@ -1289,10 +1390,12 @@ static bool apple_pcie_tunnel_transactions_idle(struct apple_pcie_port *port)
 	value = apple_pcie_port_readl(port, PORT_OUTS_NPREQS);
 	if (value & (PORT_OUTS_NPREQS_REQ | PORT_OUTS_NPREQS_CPL))
 		return false;
-	if (apple_pcie_port_readl(port, PORT_OUTS_PREQS_HDR) &
+	if (apple_pcie_port_readl(port, apple_pcie_port_tunctrl(port) -
+				  PORT_TUNCTRL + PORT_OUTS_PREQS_HDR) &
 	    PORT_OUTS_PREQS_HDR_MASK)
 		return false;
-	if (apple_pcie_port_readl(port, PORT_OUTS_PREQS_DATA) &
+	if (apple_pcie_port_readl(port, apple_pcie_port_tunctrl(port) -
+				  PORT_TUNCTRL + PORT_OUTS_PREQS_DATA) &
 	    PORT_OUTS_PREQS_DATA_MASK)
 		return false;
 	if (apple_pcie_port_readl(port, PORT_RXWR_FIFO) &
@@ -1333,10 +1436,11 @@ static int apple_pcie_tunnel_stop(struct apple_pcie_port *port)
 	 * tunneled reset request, and the root port must acknowledge it before
 	 * ACIO loses power. A cable disconnect requires that same ordering.
 	 */
-	apple_pcie_port_rmw_set(port, PORT_TUNCTRL_PERST_ON, PORT_TUNCTRL);
+	apple_pcie_port_rmw_set(port, PORT_TUNCTRL_PERST_ON, apple_pcie_port_tunctrl(port));
 	ret = read_poll_timeout_atomic(apple_pcie_port_readl, stat,
 				       stat & PORT_TUNSTAT_PERST_ON,
-				       1000, 100000, false, port, PORT_TUNSTAT);
+				       1000, 100000, false, port,
+				       apple_pcie_port_tunstat(port));
 	if (ret)
 		dev_warn(pcie->dev, "port %pOF tunnel reset assertion timed out\n",
 			 port->np);
@@ -1355,13 +1459,13 @@ static int apple_pcie_tunnel_stop(struct apple_pcie_port *port)
 	if (ret && !err)
 		err = ret;
 
-	apple_pcie_port_rmw_set(port, PORT_TUNCTRL_PERST_ACK_REQ, PORT_TUNCTRL);
+	apple_pcie_port_rmw_set(port, PORT_TUNCTRL_PERST_ACK_REQ, apple_pcie_port_tunctrl(port));
 	/* M1 reports an outstanding acknowledgment until ACK_PEND clears. */
 	ret = read_poll_timeout_atomic(apple_pcie_port_readl, stat,
 				       pcie->kernel_init ?
 				       !(stat & PORT_TUNSTAT_PERST_ACK_PEND) :
 				       stat & PORT_TUNSTAT_PERST_ACK_PEND,
-				       1000, 1000000, false, port, PORT_TUNSTAT);
+				       1000, 1000000, false, port, apple_pcie_port_tunstat(port));
 	if (ret) {
 		dev_warn(pcie->dev,
 			 "port %pOF tunnel reset acknowledgment timed out\n",
@@ -1377,7 +1481,7 @@ static int apple_pcie_tunnel_stop(struct apple_pcie_port *port)
 			err = ret;
 	}
 	apple_pcie_port_rmw_clear(port, PORT_TUNCTRL_PERST_ACK_REQ,
-				  PORT_TUNCTRL);
+				  apple_pcie_port_tunctrl(port));
 	WRITE_ONCE(port->started, false);
 	port->needs_stop = err || (apple_pcie_port_readl(port, PORT_STATUS) &
 				  PORT_STATUS_READY);
@@ -1448,6 +1552,11 @@ static int apple_pcie_setup_refclk(struct apple_pcie *pcie,
 	if (pcie->hw->phy_lane_ctl)
 		rmw_clear(PHY_LANE_CTL_CFGACC, port->phy + pcie->hw->phy_lane_ctl);
 
+	if (pcie->hw->refbuf_off) {
+		rmw_clear(PHY_LANE_CFG_REFBUF_OFF, port->phy + PHY_LANE_CFG);
+		udelay(1);
+	}
+
 	rmw_set(PHY_LANE_CFG_REFCLKEN, port->phy + PHY_LANE_CFG);
 
 	if (pcie->hw->port_refclk)
@@ -1508,6 +1617,8 @@ static int apple_pcie_setup_link(struct apple_pcie *pcie,
 		num_aux_resets++;
 	}
 	dev_info(pcie->dev, "Using %u auxiliary PERST#\n", num_aux_resets);
+	if (!num_aux_resets)
+		port->perst = reset;
 
 	pwren = devm_fwnode_gpiod_get(pcie->dev, of_fwnode_handle(np), "pwren",
 					    GPIOD_ASIS, "PWREN");
@@ -1562,6 +1673,17 @@ static int apple_pcie_setup_link(struct apple_pcie *pcie,
 	for (u32 idx = 0; idx < num_aux_resets; idx++)
 		gpiod_set_value_cansleep(aux_reset[idx], 0);
 
+	if (pcie->hw->pipe_rst) {
+		ret = readl_relaxed_poll_timeout(port->base + PORT_T8152_PIPE_RST_STS,
+						 stat, stat & PORT_T8152_PIPE_RST_STS_LANES,
+						 1, 20000);
+		if (ret < 0) {
+			dev_err(pcie->dev, "port %pOF lanes stuck in PIPE reset\n", np);
+			return ret;
+		}
+		rmw_clear(PORT_T8152_PIPE_RST, port->base + pcie->hw->port_perst);
+	}
+
 	/* Wait for 100ms after PERST# deassertion (PCIe r5.0, 6.6.1) */
 	msleep(100);
 
@@ -1573,6 +1695,45 @@ static int apple_pcie_setup_link(struct apple_pcie *pcie,
 	}
 
 	return 0;
+}
+
+/* DesignWare port logic, in the root port's configuration space. */
+#define DWC_PORT_DEBUG0			0x728
+#define   DWC_PORT_DEBUG0_LTSSM		GENMASK(5, 0)
+
+static u32 apple_pcie_port_ltssm(struct apple_pcie *pcie,
+				 struct apple_pcie_port *port)
+{
+	return FIELD_GET(DWC_PORT_DEBUG0_LTSSM,
+			 readl_relaxed(pcie->cfg->win + (port->idx << 15) +
+				       DWC_PORT_DEBUG0));
+}
+
+/*
+ * Give an endpoint that did not train another fundamental reset: stop the
+ * LTSSM, assert PERST#, and release it with the timing of the first bring-up
+ * (Tperst of at least 100 us, PCIe CEM r5.0 2.9.2; 100 ms before
+ * configuration, PCIe r5.0 6.6.1).
+ */
+static int apple_pcie_port_reset_endpoint(struct apple_pcie *pcie,
+					  struct apple_pcie_port *port)
+{
+	u32 stat;
+	int ret;
+
+	apple_pcie_port_rmw_clear(port, PORT_LTSSMCTL_START, PORT_LTSSMCTL);
+	rmw_clear(PORT_PERST_OFF, port->base + pcie->hw->port_perst);
+	ret = gpiod_set_value_cansleep(port->perst, 1);
+	if (ret)
+		return ret;
+	usleep_range(100, 200);
+	rmw_set(PORT_PERST_OFF, port->base + pcie->hw->port_perst);
+	ret = gpiod_set_value_cansleep(port->perst, 0);
+	if (ret)
+		return ret;
+	msleep(100);
+	return readl_relaxed_poll_timeout(port->base + PORT_STATUS, stat,
+					  stat & PORT_STATUS_READY, 100, 250000);
 }
 
 static int apple_pcie_setup_port(struct apple_pcie *pcie,
@@ -1788,16 +1949,46 @@ rid2sid_ready:
 				goto err_teardown;
 		}
 
+		/*
+		 * In about one boot in seven the J616s SD reader is detected
+		 * but sends no training sets after the first PERST# release,
+		 * and the LTSSM parks in Polling.Compliance. A Retrain Link
+		 * from the root port does not recover it; a new fundamental
+		 * reset does.
+		 */
+		if (!pcie->hw->tunneled && port->perst)
+			attempts = 1 + LINK_RESET_RETRIES;
+
 		timeout = link_up_timeout * HZ / 1000;
 		for (attempt = 0; attempt < attempts; attempt++) {
-			if (attempt)
+			if (attempt && pcie->hw->tunneled)
 				reinit_completion(&pcie->event);
 			apple_pcie_port_writel(port, PORT_LTSSMCTL_START,
 					       PORT_LTSSMCTL);
 			left = wait_for_completion_timeout(&pcie->event, timeout);
+			if (!left && (apple_pcie_port_readl(port, PORT_LINKSTS) &
+				      PORT_LINKSTS_UP))
+				left = 1;
 			if (left)
 				break;
-			dev_warn(pcie->dev, "%pOF link didn't come up\n", np);
+			if (pcie->hw->tunneled || attempt + 1 == attempts) {
+				dev_warn(pcie->dev,
+					 "%pOF link didn't come up (LTSSM %#x)\n",
+					 np, pcie->hw->tunneled ? 0 :
+					 apple_pcie_port_ltssm(pcie, port));
+				continue;
+			}
+			dev_info(pcie->dev,
+				 "%pOF link down after %dms (LTSSM %#x), resetting the endpoint\n",
+				 np, link_up_timeout, apple_pcie_port_ltssm(pcie, port));
+			/* A link-up during the reset must not be lost. */
+			reinit_completion(&pcie->event);
+			ret = apple_pcie_port_reset_endpoint(pcie, port);
+			if (ret) {
+				dev_warn(pcie->dev, "%pOF endpoint reset failed: %d\n",
+					 np, ret);
+				break;
+			}
 		}
 		if (left)
 			dev_info(pcie->dev, "%pOF link up after %ldms\n", np,
@@ -1858,10 +2049,11 @@ static const struct msi_parent_ops apple_msi_parent_ops = {
 };
 
 /* T6030 has one shared AIC MSI window, partitioned by its ADT bridges. */
-static bool apple_t6030_msi_slice_valid(u32 base, u32 count, u32 aic_irq)
+static bool apple_t6030_msi_slice_valid(u32 base, u32 count, u32 aic_irq,
+					u32 aic_base)
 {
-	return (base == 0x20 || base == 0x40 || base == 0x60) &&
-	       count == 32 && aic_irq == 1342 + base;
+	return base >= 0x20 && !(base & 0x1f) && base + count <= 256 &&
+	       count == 32 && aic_irq == aic_base + base;
 }
 
 static int apple_msi_init(struct apple_pcie *pcie)
@@ -1894,25 +2086,42 @@ static int apple_msi_init(struct apple_pcie *pcie)
 	 * 32-vector slice. Keep endpoint MSI data local, and route its table
 	 * entry to the corresponding shared-window vector.
 	 */
-	if (pcie->hw == &t8122_pciec_hw) {
+	if (pcie->hw == &t8122_pciec_hw || pcie->hw == &t8132_pciec_hw) {
 		struct resource ecam;
-		u32 expected_base;
+		u32 expected_base, aic_base;
 
-		/* These ECAM apertures identify the three T6030 ADT bridges. */
-		if (!of_machine_is_compatible("apple,t6030") ||
-		    of_address_to_resource(to_of_node(fwnode), 0, &ecam))
+		if (of_address_to_resource(to_of_node(fwnode), 0, &ecam))
 			goto invalid_slice;
-		switch (ecam.start) {
-		case 0x730000000ULL:
-			expected_base = 0x20;
-			break;
-		case 0xb30000000ULL:
-			expected_base = 0x40;
-			break;
-		case 0xf30000000ULL:
-			expected_base = 0x60;
-			break;
-		default:
+		/* These ECAM apertures identify the ADT bridges of each SoC. */
+		if (of_machine_is_compatible("apple,t6030")) {
+			aic_base = 1342;
+			switch (ecam.start) {
+			case 0x730000000ULL:
+				expected_base = 0x20;
+				break;
+			case 0xb30000000ULL:
+				expected_base = 0x40;
+				break;
+			case 0xf30000000ULL:
+				expected_base = 0x60;
+				break;
+			default:
+				goto invalid_slice;
+			}
+		} else if (of_machine_is_compatible("apple,t8132")) {
+			aic_base = 1506;
+			switch (ecam.start) {
+			/* The internal port's bridges own vectors 0..95. */
+			case 0x1c50000000ULL:
+				expected_base = 0x60;
+				break;
+			case 0x1c60000000ULL:
+				expected_base = 0x80;
+				break;
+			default:
+				goto invalid_slice;
+			}
+		} else {
 			goto invalid_slice;
 		}
 		if (args.args_count != 3 || args.args[0] != 0 ||
@@ -1923,7 +2132,7 @@ static int apple_msi_init(struct apple_pcie *pcie)
 					   &pcie->msi_vector_base);
 		if (!of_find_property(to_of_node(fwnode),
 				      "apple,msi-vector-base", NULL) &&
-		    args.args[1] == 1342 && pcie->nvecs == 512) {
+		    aic_base == 1342 && args.args[1] == 1342 && pcie->nvecs == 512) {
 			/*
 			 * Old experimental boot DTs exposed the global window to
 			 * each host. Correct it here so old recovery kernels can
@@ -1939,12 +2148,12 @@ static int apple_msi_init(struct apple_pcie *pcie)
 		}
 		if (pcie->msi_vector_base != expected_base ||
 		    !apple_t6030_msi_slice_valid(pcie->msi_vector_base,
-					pcie->nvecs, args.args[1]))
+					pcie->nvecs, args.args[1], aic_base))
 			goto invalid_slice;
 	}
 
 	/* Keep map targets within the supported 8-bit range. */
-	if (pcie->hw == &t8122_pciec_hw &&
+	if ((pcie->hw == &t8122_pciec_hw || pcie->hw == &t8132_pciec_hw) &&
 	    (!pcie->nvecs || pcie->nvecs > 256 ||
 	     pcie->msi_vector_base >
 	     FIELD_MAX(PORT_MSIMAP_TARGET) + 1 - pcie->nvecs)) {
@@ -2912,7 +3121,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 		int count = of_property_count_u32_elems(dev->of_node, "apple,managed-sids");
 
 		if (!of_device_is_compatible(dev->of_node, "apple,t8132-pcie") ||
-		    !of_machine_is_compatible("apple,j713") || count <= 0 || count > 15)
+		    !apple_t8132_managed_radio() || count <= 0 || count > 15)
 			return -EINVAL;
 		ret = of_property_read_u32_array(dev->of_node, "apple,managed-sids", ids, count);
 		if (!ret && (count != 2 || ids[0] != 1 || ids[1] != 2))
@@ -3580,20 +3789,87 @@ static bool apple_pcie_tunnel_link_healthy(struct apple_pcie *pcie)
 }
 
 /*
+ * genpd powers a domain off for system sleep once every device in it is
+ * through its noirq suspend. A host that keeps its link refuses that for
+ * the sleep: the domain stays on, and its parents with it. IRQ-safe domains
+ * call this in atomic context, so it only counts.
+ */
+static int apple_pcie_pd_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct apple_pcie *pcie = container_of(nb, struct apple_pcie, pd_nb);
+
+	if (action != GENPD_NOTIFY_PRE_OFF)
+		return NOTIFY_OK;
+	pcie->pd_vetoed++;
+	return notifier_from_errno(-EBUSY);
+}
+
+/*
+ * Hold a power domain that is not always-on through this sleep. ACIO keeps
+ * the domain of its PCIe-C host on for as long as a cable is connected (its
+ * power-domain devices are syscore devices, which system sleep leaves
+ * alone), so a host with a link up finds its domain on here, and the veto
+ * makes sure it stays on. A domain that is already off has no link to keep.
+ */
+static int apple_pcie_hold_domain(struct apple_pcie *pcie)
+{
+	int ret;
+
+	pcie->pd_vetoed = 0;
+	pcie->pd_nb.notifier_call = apple_pcie_pd_notify;
+	ret = dev_pm_genpd_add_notifier(pcie->dev, &pcie->pd_nb);
+	if (ret)
+		return ret;
+	if (!dev_pm_genpd_is_on(pcie->dev)) {
+		dev_pm_genpd_remove_notifier(pcie->dev);
+		return -ENODEV;
+	}
+	pcie->pd_held = true;
+	return 0;
+}
+
+static void apple_pcie_release_domain(struct apple_pcie *pcie)
+{
+	if (!pcie->pd_held)
+		return;
+	dev_pm_genpd_remove_notifier(pcie->dev);
+	pcie->pd_held = false;
+	dev_dbg(pcie->dev, "PCIe-C power domain released after suspend-to-idle (%u power-offs refused)\n",
+		pcie->pd_vetoed);
+}
+
+/*
  * In suspend-to-idle ACIO and the router links stay powered, so an up
  * tunnel can simply be left running. The functions below keep their state
  * and resume like any other PCIe device; nothing has to be re-trained.
+ * The host's power domain must stay on for that: an always-on one does;
+ * on a host that opts in (s2idle_hold_domain), any other is held on for the
+ * sleep (apple_pcie_hold_domain()).
  */
 static bool apple_pcie_keep_link(struct apple_pcie *pcie)
 {
+	int ret;
+
 	if (!READ_ONCE(s2idle_keep_link) || !pm_suspend_no_platform())
 		return false;
-	if (!(pcie->kernel_init || pcie->tunnel_cold_init) ||
-	    !pcie->power_retained)
+	if (!(pcie->kernel_init || pcie->tunnel_cold_init))
 		return false;
 	if (pcie->bus_stopped || pcie->resume_failed)
 		return false;
-	return apple_pcie_tunnel_link_healthy(pcie);
+	if (!pcie->power_retained) {
+		if (!pcie->hw->s2idle_hold_domain)
+			return false;
+		ret = apple_pcie_hold_domain(pcie);
+		if (ret) {
+			dev_dbg(pcie->dev, "PCIe-C power domain not held (%d): link not kept\n",
+				ret);
+			return false;
+		}
+	}
+	if (apple_pcie_tunnel_link_healthy(pcie))
+		return true;
+	apple_pcie_release_domain(pcie);
+	return false;
 }
 
 static void apple_pcie_stop_for_sleep(struct device *dev)
@@ -3638,8 +3914,12 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
 
+	/*
+	 * The managed radio has no suspend boundary of its own; suspend-to-idle
+	 * leaves it in place like any other internal port (no power domain).
+	 */
 	if (pcie->managed_sids)
-		return -EBUSY;
+		return pm_suspend_target_state == PM_SUSPEND_TO_IDLE ? 0 : -EBUSY;
 	if (!pcie->hw->tunneled)
 		return 0;
 	pcie->reset_on_resume = false;
@@ -3668,13 +3948,14 @@ static int apple_pcie_reset_for_resume(struct apple_pcie *pcie)
 
 		/* A failed cold setup still owns partially enabled hardware. */
 		port->needs_stop = true;
-		apple_pcie_port_writel(port, PORT_TUNCTRL_PERST_ON, PORT_TUNCTRL);
+		apple_pcie_port_writel(port, PORT_TUNCTRL_PERST_ON, apple_pcie_port_tunctrl(port));
 		ret = apple_pcie_tunnel_cold_init(port);
 		if (ret)
 			return ret;
 		ret = read_poll_timeout_atomic(apple_pcie_port_readl, stat,
 					       stat & PORT_TUNSTAT_PERST_ON,
-					       1000, 100000, false, port, PORT_TUNSTAT);
+					       1000, 100000, false, port,
+				       apple_pcie_port_tunstat(port));
 		if (ret)
 			return ret;
 		apple_pcie_tunnel_restore_irq_hw(port);
@@ -3697,6 +3978,8 @@ static int apple_pcie_resume_noirq(struct device *dev)
 
 	if (!pcie->hw->tunneled)
 		return 0;
+	/* The domain's hold for the sleep ends first, whatever follows. */
+	apple_pcie_release_domain(pcie);
 	if (pcie->resume_failed)
 		return -EIO;
 	/*
@@ -3769,12 +4052,14 @@ static const struct dev_pm_ops apple_pcie_pm_ops = {
 };
 
 static const struct of_device_id apple_pcie_of_match[] = {
+	{ .compatible = "apple,t8132-pciec",	.data = &t8132_pciec_hw },
 	{ .compatible = "apple,t8122-pciec",	.data = &t8122_pciec_hw },
 	{ .compatible = "apple,t8112-pciec",	.data = &t8112_pciec_hw },
 	{ .compatible = "apple,t8103-pciec",	.data = &t8103_pciec_hw },
 	{ .compatible = "apple,t6000-pciec",	.data = &t8112_pciec_hw },
 	/* T8132 currently inherits controller and PHY setup from m1n1. */
 	{ .compatible = "apple,t8132-pcie",	.data = &t602x_hw },
+	{ .compatible = "apple,t8152-pcie",	.data = &t8152_hw },
 	{ .compatible = "apple,t6020-pcie",	.data = &t602x_hw },
 	{ .compatible = "apple,t8140-pcie",	.data = &t8140_hw },
 	{ .compatible = "apple,pcie",		.data = &t8103_hw },

@@ -15,36 +15,109 @@ description:
   two apertures with two planes each and a multicast cache-enable register;
   its enabled cache is retained until a dirty-data drain is qualified.
 
-properties:
-  compatible:
-    oneOf:
-      - enum:
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6000-mcc
+          - apple,t6020-mcc
+          - apple,t6021-mcc
+          - apple,t6022-mcc
+          - apple,t6030-mcc
+          - apple,t6031-mcc
+          - apple,t6032-mcc
+          - apple,t6041-mcc
+          - apple,t6050-mcc
+          - apple,t8103-mcc
+          - apple,t8112-mcc
+          - apple,t8122-mcc
           - apple,t8132-mcc
           - apple,t8140-mcc
-      - items:
-          - const: apple,t6041-mcc
-          - const: apple,t8140-mcc
+  required:
+    - compatible
 
-  reg:
-    description: Per-plane blocks on T8140, or the two multicast apertures on T8132.
-    minItems: 1
-    maxItems: 16
-
-  nonposted-mmio: true
+properties:
+  compatible: true
 
   apple,boot-dma-devices:
     $ref: /schemas/types.yaml#/definitions/phandle-array
+    description: Shared hardware resource metadata.
     items:
       maxItems: 1
-    description:
-      Devices that take over DMA the bootloader left running. Cache allocation
-      is enabled only once each of them is bound to its driver.
 
-required:
-  - compatible
-  - reg
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t6032-mcc
+      required:
+        - compatible
+    then:
+      properties:
+        compatible:
+          items:
+            - const: apple,t6032-mcc
+            - const: apple,mcc
 
-additionalProperties: false
+        reg:
+          minItems: 20
+          maxItems: 20
+
+      required:
+        - compatible
+        - reg
+    else:
+      properties:
+        compatible:
+          oneOf:
+            - enum:
+                - apple,t6050-mcc
+                - apple,t8132-mcc
+                - apple,t8140-mcc
+            - items:
+                - enum:
+                    - apple,t6000-mcc
+                    - apple,t6020-mcc
+                    - apple,t6021-mcc
+                    - apple,t6022-mcc
+                    - apple,t6030-mcc
+                    - apple,t6031-mcc
+                    - apple,t8103-mcc
+                    - apple,t8112-mcc
+                    - apple,t8122-mcc
+                - const: apple,mcc
+            - items:
+                - enum:
+                    - apple,t6041-mcc
+                - const: apple,t8140-mcc
+
+        reg:
+          description:
+            Per-plane blocks or multicast memory-controller apertures. A two-die
+            T6050 lists both dies' planes.
+          minItems: 1
+          maxItems: 64
+
+        nonposted-mmio: true
+
+        apple,boot-dma-devices:
+          $ref: /schemas/types.yaml#/definitions/phandle-array
+          items:
+            maxItems: 1
+          description:
+            Devices that take over DMA the bootloader left running. Cache allocation
+            is enabled only once each of them is bound to its driver.
+
+      required:
+        - compatible
+        - reg
+
+      additionalProperties: false
+
+unevaluatedProperties: false
 
 examples:
   - |

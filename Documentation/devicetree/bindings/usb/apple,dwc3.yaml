@@ -46,8 +46,12 @@ properties:
           - enum:
               - apple,t6000-dwc3
               - apple,t6020-dwc3
+              - apple,t6030-dwc3
+              - apple,t6031-dwc3
               - apple,t6040-dwc3
+              - apple,t6050-dwc3
               - apple,t8112-dwc3
+              - apple,t8122-dwc3
               - apple,t8140-dwc3
               - apple,t8142-dwc3
           - const: apple,t8103-dwc3
@@ -99,6 +103,11 @@ properties:
   apple,tunable-link:
     $ref: "#/$defs/apple,tunable"
     description: Tunables applied to the link registers of the Apple region.
+
+  apple,tunable-cio:
+    $ref: "#/$defs/apple,tunable"
+    description:
+      Tunables applied to the CIO (USB4 tunnel) registers of the Apple region.
 
 required:
   - compatible

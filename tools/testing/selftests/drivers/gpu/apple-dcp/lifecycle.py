@@ -3,7 +3,7 @@
 """Actual disconnect authority, DWC3 teardown and firmware resource admission."""
 from pathlib import Path
 import re
-from common import block, apple_function, internal_inline, atc_mux_without_pm, source_defines, ATC_POST_TUNABLE, tipd_pm_header, firmware_lineage, atc_restore_helpers
+from common import block, apple_function, internal_inline, atc_mux_without_pm, source_defines, ATC_POST_TUNABLE, tipd_pm_header, firmware_lineage, atc_restore_helpers, atc_cio_helpers
 
 def disconnect(root):
     # Copyright 2026 Ryan Murray
@@ -27,6 +27,9 @@ def disconnect(root):
     # The retry of a change that a mux with transient timeouts held up
     held = [n for n in ('cd321x_mux_held', 'cd321x_mux_set', 'cd321x_mux_still_held',
                         'cd321x_retry_held_mux', 'cd321x_update_done')
+            if re.search(r'^static \w+ ' + n + r'\(', (r / core).read_text(), re.M)]
+    # Whether a partner identity has been received, when the update checks that
+    late = [n for n in ('cd321x_identity_known',)
             if re.search(r'^static \w+ ' + n + r'\(', (r / core).read_text(), re.M)]
     # The DisplayPort hotplug decisions live in cd321x-dp.h when present.
     dp_header = r / 'drivers/usb/typec/tipd/cd321x-dp.h'
@@ -59,6 +62,7 @@ def disconnect(root):
         *((core, n) for n in held),
         *((core, n) for n in ('cd321x_uses_dp_sid', 'cd321x_dp_hpd',
                               'cd321x_dp_sid_replay', 'cd321x_dp_release_first')),
+        *((core, n) for n in late),
         (core, 'cd321x_update_work')))
     prefix = r'''
 #include <assert.h>
@@ -186,6 +190,8 @@ enum usb_role { USB_ROLE_NONE, USB_ROLE_HOST, USB_ROLE_DEVICE };
 enum typec_pwr_opmode { TYPEC_PWR_MODE_USB, TYPEC_PWR_MODE_PD };
 enum typec_orientation { TYPEC_ORIENTATION_NONE, TYPEC_ORIENTATION_NORMAL, TYPEC_ORIENTATION_REVERSE };
 struct usb_pd_identity { int id; };
+static void * __attribute__((unused)) memchr_inv(const void *p, int c, size_t n)
+{ const unsigned char *b = p; for (size_t i = 0; i < n; i++) if (b[i] != (unsigned char)c) return (void *)(b + i); return NULL; }
 struct typec_mux_state { void *alt, *data; int mode; };
 struct typec_thunderbolt_switch_data { int state; };
 struct typec_partner_desc { bool usb_pd; int accessory; struct usb_pd_identity *identity; };
@@ -710,6 +716,18 @@ int main(void)
                      '/* Never reached: the H17P external link passes no session. */\n'
                      'static bool dcp_session_valid_locked(struct apple_dcp *d, struct dcp_fabric_session s, bool cable)\n'
                      '{ (void)d; (void)s; (void)cable; assert(!"session check for a sessionless link"); return false; }\n')
+    if 'dcp_is_t8132_ext(' in raw:
+        # An H17P display is not a T8132 dcpext: no compact teardown answers to wait for.
+        swap(' struct { bool active; } split;',
+             ' struct { bool active; } split;\n struct apple_dcp_afkep *dptxep; bool t8132_release_late;')
+        firmware += ('struct apple_dcp_afkep;\nstruct dcp_fabric_session;\n'
+                     'static bool dcp_is_t8132_ext(const struct apple_dcp *d) { (void)d; return false; }\n'
+                     'static bool afk_compact_orphans_pending(struct apple_dcp_afkep *ep)\n'
+                     '{ (void)ep; assert(!"T8132 dcpext teardown in an H17P scenario"); return false; }\n'
+                     'static int dcp_t8132_wait_teardown_answers(struct apple_dcp *d, u32 port,\n'
+                     '\tconst struct dcp_fabric_session *s, bool cable, bool recovery)\n'
+                     '{ (void)d; (void)port; (void)s; (void)cable; (void)recovery;\n'
+                     '  assert(!"T8132 dcpext teardown in an H17P scenario"); return -ENODEV; }\n')
     if 'static unsigned long jiffies;' not in unit:
         firmware += '\nstatic unsigned long jiffies;\n'
     # unless the update work already needed the clock
@@ -723,6 +741,7 @@ def poweroff_replug(root):
     """An old disconnect's CRTC-off must not release a replacement link."""
     poweroff = apple_function(root, 'dcp_poweroff')
     assert poweroff, 'dcp_poweroff'
+    panel_predicate = apple_function(root, 'dcp_h17g_panel') or ''
     iomfb = (root / 'drivers/gpu/drm/apple/iomfb.c').read_text()
     modeset = block(iomfb, iomfb.index('int dcp_crtc_atomic_modeset('))
     assert 'dcp->crtc_unplugs = dcp->typec_unplugs;' in modeset
@@ -746,7 +765,12 @@ struct delayed_work { bool pending; };
 struct completion { int done; };
 struct apple_connector { bool connected; };
 struct dptx_port { bool enabled, connected, available; void *service; };
+#define DCP_FIRMWARE_H17P 1
+#define DCP_IOMFB_METHODS_H17G 7
+#define DRM_MODE_CONNECTOR_eDP 14
 struct apple_dcp {
+ int fw_compat, connector_type;
+ struct { int iomfb_method_profile; } hw;
  void *dev, *avep, *hdmi_hpd;
  int external_lock, hpd_mutex;
  struct delayed_work typec_reconnect_wq, placeholder_edid_wq, swap_watchdog_wq;
@@ -768,6 +792,9 @@ static int dcp_external_stop_locked(struct apple_dcp *d, u64 generation)
 { (void)d; (void)generation; return 0; }
 static void dcp_external_crtc_released(struct apple_dcp *d) { (void)d; }
 static bool dcp_uses_soft_dpms(struct apple_dcp *d) { return d->soft_dpms; }
+static bool __attribute__((unused)) dcp_has_panel(struct apple_dcp *d) { return !d->typec_output; }
+static void __attribute__((unused)) iomfb_blank_h17p(struct apple_dcp *d)
+{ (void)d; assert(!"unexpected internal-panel blank in external-link test"); }
 static int dcp_backlight_dpms(struct apple_dcp *d, bool on)
 { (void)d; (void)on; return 0; }
 static void av_service_disconnect(struct apple_dcp *d)
@@ -784,7 +811,7 @@ static void dcp_external_retry(struct apple_dcp *d, const char *why, int error, 
 { (void)d; (void)why; (void)error; (void)delay; retries++; }
 static bool gpiod_get_value_cansleep(void *gpio) { (void)gpio; return false; }
 static void disconnected_hpd_event(struct apple_connector *connector) { (void)connector; }
-''' + poweroff + r'''
+''' + panel_predicate + '\n' + poweroff + r'''
 static struct apple_dcp dcp;
 static struct apple_connector connector;
 static struct platform_device pdev = { .data = &dcp };
@@ -1081,7 +1108,7 @@ def teardown(root):
     names = {n: tuple(name for name in group if re.search(r'^(?:static [^\n]*\b|(?:int|void) )' + name + r'\(', files[n], re.M))
              for n, group in names.items()}
     context = (fn('atc', 'core_read32') + '\n' + fn('atc', 'atcphy_get_mode_config') + '\n' + fn('atc', 'j700_field_update') + '\n' + files['dp'][files['dp'].index('/* Masks are the union'):files['dp'].index('/* Retry only the idle operations')])
-    functions = '\n\n'.join(fn(n, name) for n, group in names.items() for name in group)
+    functions = atc_cio_helpers(files['atc']) + '\n\n'.join(fn(n, name) for n, group in names.items() for name in group)
     definitions = []
     lines = iter(files['atc'].splitlines())
     for line in lines:
@@ -1469,6 +1496,8 @@ static void __attribute__((unused)) iomfb_v14_7_external_refuse(struct apple_dcp
 { (void)d; (void)why; assert(!"T6030 external processor in a J700 scenario"); }
 struct drm_device { int unused; };
 struct drm_encoder { int unused; };
+/* Not a J713: production registers no T8132 external outputs and returns 0. */
+static int __attribute__((unused)) t8132_ext_drm_init(struct drm_device *drm) { (void)drm; return 0; }
 struct apple_drm_private { struct drm_device drm; };
 struct component_match { bool includes[2]; };
 static struct device_node nodes[2];

@@ -1,0 +1,58 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple MacBook Pro (16-inch, M4 Max, 2024)
+ *
+ * target-type: J616c
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include "t6041.dtsi"
+#include "t6041-j614-j616-j575-scaler.dtsi"
+#include "t6041-j614c-j616c.dtsi"
+
+/ {
+	compatible = "apple,j616c", "apple,t6041", "apple,arm-platform";
+	model = "Apple MacBook Pro (16-inch, M4 Max)";
+};
+
+&mtp_hid {
+	multi-touch {
+		firmware-name = "apple/tpmtfw-j616c.bin";
+	};
+};
+
+&wifi0 {
+	brcm,board-type = "apple,hostomel";
+};
+
+&bluetooth0 {
+	brcm,board-type = "apple,hostomel";
+};
+
+&panel {
+	compatible = "apple,panel-j616", "apple,panel-mini-led", "apple,panel";
+	width-mm = <346>;
+	height-mm = <223>;
+	adj-height-mm = <216>;
+};
+
+&sound {
+	compatible = "apple,j616-macaudio", "apple,macaudio";
+	model = "MacBook Pro J616";
+};
+
+&sound_jack {
+	compatible = "apple,j616-macaudio-jack", "apple,macaudio";
+	model = "MacBook Pro J616 Jack";
+};
+
+&aop_audio {
+	apple,chassis-name = "J616";
+};
+
+&mesa {
+	firmware-name = "apple/mesacal-j616c.bin", "apple/msrk-j616c.bin";
+};
