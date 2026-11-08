@@ -31,6 +31,7 @@ properties:
       - const: apple,t8103-usb4-acio
       - const: apple,t8142-usb4-acio
       - const: apple,t6040-usb4-acio
+      - const: apple,t6050-usb4-acio
       - items:
           - enum:
               - apple,t6000-usb4-acio
@@ -54,12 +55,18 @@ properties:
       - description: MxWrap co-processor control registers
 
   reg-names:
-    minItems: 2
-    items:
-      - const: rc
-      - const: sram
-      - const: pcie-adapter
-      - const: cpu
+    oneOf:
+      - minItems: 2
+        items:
+          - const: rc
+          - const: sram
+          - const: pcie-adapter
+          - const: cpu
+      - description: T6050, which has no separate PCIe adapter window
+        items:
+          - const: rc
+          - const: sram
+          - const: cpu
 
   interrupts:
     maxItems: 1
@@ -85,6 +92,7 @@ properties:
       The first three domains power the ACIO co-processor complex. When
       apple,pcie-tunnel is present, the fourth domain powers its PCIe-C
       controller and is enabled only after the USB4 PCIe tunnel is active.
+      On T6050 the fourth domain is the routers' shared audio (AUSS) domain.
 
   thunderbolt-switch:
     type: boolean
