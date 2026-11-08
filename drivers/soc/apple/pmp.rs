@@ -670,6 +670,11 @@ enum Ep7 {
     Always,
 }
 
+// T6000 and T8112 (through the t6000-pmp-v2 fallback) use the original
+// below-4-GiB DART window and endpoint 0x20. Neither needs the later SoCs'
+// 42-bit DMA mask, mandatory v5 UUID header, or CoreAnalytics endpoint 7.
+// DCS state counts (four and five respectively) belong to the report/DRAM
+// description and do not change this RTKit transport configuration.
 const HW_CFG_DEFAULT: PmpHwConfig = PmpHwConfig {
     dma_mask: None,
     check_bootargs_uuid: false,
