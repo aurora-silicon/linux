@@ -128,6 +128,11 @@ const EPIC_SUBTYPE_ACCEL_REPORT: u16 = 0xc2;
 const EPIC_SUBTYPE_RETCODE: u16 = 0x84;
 const EPIC_SUBTYPE_RETCODE_PAYLOAD: u16 = 0xa0;
 const EPIC_SUBTYPE_STRING: u16 = 0x8a;
+/// Replies to the client-open (25) and client-close (26) commands. As with
+/// the other replies, the subtype is the request's with bit 7 set, and the
+/// body starts with the return code.
+const EPIC_SUBTYPE_CLIENT_OPEN_REPLY: u16 = 0x99;
+const EPIC_SUBTYPE_CLIENT_CLOSE_REPLY: u16 = 0x9a;
 const QE_MAGIC1: u32 = from_fourcc(b" POI");
 const QE_MAGIC2: u32 = from_fourcc(b" POA");
 /// Bound on the wait for the reply to an EPIC call. The firmware can stop
@@ -776,6 +781,8 @@ impl AFKEndpoint {
             if subtype == EPIC_SUBTYPE_RETCODE_PAYLOAD
                 || subtype == EPIC_SUBTYPE_RETCODE
                 || subtype == EPIC_SUBTYPE_STRING
+                || subtype == EPIC_SUBTYPE_CLIENT_OPEN_REPLY
+                || subtype == EPIC_SUBTYPE_CLIENT_CLOSE_REPLY
             {
                 if data.len() < mem::size_of::<u32>() {
                     return Err(EMSGSIZE);
@@ -1482,6 +1489,8 @@ impl AopData {
             b"als" => c_str!("als"),
             b"accel" => c_str!("accel"),
             b"gyro" => c_str!("gyro"),
+            b"devmotion6" => c_str!("devmotion6"),
+            b"als-temp" => c_str!("als-temp"),
             _ => {
                 return Ok(());
             }
