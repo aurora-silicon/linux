@@ -1345,6 +1345,8 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 	return 0;
 }
 
+static bool apple_t8132_main_external_present(void);
+
 static int apple_get_fb_resource(struct device *dev, const char *name,
 				 struct resource *fb_r)
 {
@@ -1364,7 +1366,9 @@ static int apple_get_fb_resource(struct device *dev, const char *name,
 		goto err;
 	}
 
-	if (!of_device_is_compatible(node, "framebuffer")) {
+	if (!of_device_is_compatible(node, "framebuffer") &&
+	    !(apple_t8132_main_external_present() &&
+	      of_device_is_compatible(node, "apple,asc-mem"))) {
 		dev_err(dev, "reserved-memory node '%s' is incompatible\n",
 			node->full_name);
 		goto err;
@@ -1425,6 +1429,16 @@ static const struct of_device_id apple_dcp_id_tbl[] = {
 	{},
 };
 
+static bool apple_t8132_main_external_present(void)
+{
+	struct device_node *np = of_find_compatible_node(NULL, NULL,
+							 "apple,t8132-dcp");
+	bool present = dcp_t8132_main_external(np) && of_device_is_available(np);
+
+	of_node_put(np);
+	return present;
+}
+
 /*
  * A supported firmware-described external provider participates in component
  * matching. A T6030 external display processor is a pipe of this DRM device
@@ -1433,7 +1447,7 @@ static const struct of_device_id apple_dcp_id_tbl[] = {
  */
 static bool apple_dcp_usable(struct device_node *np)
 {
-	return of_device_is_available(np) &&
+	return of_device_is_available(np) && !dcp_t8132_main_external(np) &&
 	       (!of_device_is_compatible(np, "apple,t6030-dcpext") ||
 		dcp_t6030_ext_native(np)) &&
 	       (!of_device_is_compatible(np, "apple,t8140-dcpext") ||
@@ -1486,6 +1500,15 @@ static void apple_dcp_start_fn(struct work_struct *work)
 		container_of(work, struct apple_dcp_start_work, work);
 
 	w->ret = dcp_start(w->dcp);
+}
+
+static bool apple_drm_has_output(struct drm_device *drm)
+{
+	struct drm_crtc *crtc;
+
+	drm_for_each_crtc(crtc, drm)
+		return true;
+	return false;
 }
 
 static int apple_drm_init_dcp(struct device *dev)
@@ -1545,8 +1568,17 @@ static int apple_drm_init_dcp(struct device *dev)
 		num_dcp++;
 	}
 
-	if (num_dcp < 1)
-		return -ENODEV;
+	if (num_dcp < 1) {
+		if (!apple_t8132_main_external_present())
+			return -ENODEV;
+		ret = t8132_ext_drm_init(&apple->drm);
+		if (ret)
+			dev_warn(dev, "T8132 main external output was not registered: %d\n",
+				 ret);
+		else if (!apple_drm_has_output(&apple->drm))
+			ret = -ENODEV;
+		return ret;
+	}
 
 	/*
 	 * Build the Type-C port connectors before starting any pipeline: a
@@ -1682,9 +1714,11 @@ static int apple_drm_init(struct device *dev)
 	apple->drm.mode_config.funcs = &apple_mode_config_funcs;
 	apple->drm.mode_config.helper_private = &apple_mode_config_helpers;
 
-	ret = component_bind_all(dev, apple);
-	if (ret)
-		return ret;
+	if (!apple_t8132_main_external_present()) {
+		ret = component_bind_all(dev, apple);
+		if (ret)
+			return ret;
+	}
 
 	ret = apple_drm_init_dcp(dev);
 	if (ret)
@@ -1802,7 +1836,8 @@ err_unlock:
 err_unbind:
 	t8132_ext_drm_fini(&apple->drm);
 	apple_drm_quiesce_connectors(&apple->drm);
-	component_unbind_all(dev, NULL);
+	if (!apple_t8132_main_external_present())
+		component_unbind_all(dev, NULL);
 	dcp_unlink(&apple->drm);
 	return ret;
 }
@@ -1825,7 +1860,8 @@ static void apple_drm_uninit(struct device *dev)
 	drm_dev_unplug(&apple->drm);
 	drm_atomic_helper_shutdown(&apple->drm);
 
-	component_unbind_all(dev, NULL);
+	if (!apple_t8132_main_external_present())
+		component_unbind_all(dev, NULL);
 
 	dcp_unlink(&apple->drm);
 	dev_set_drvdata(dev, NULL);
@@ -1900,10 +1936,14 @@ static int apple_platform_probe(struct platform_device *pdev)
 
 	/* add DCP components, handle less than 1 as probe error */
 	num_dcp = add_dcp_components(mdev, &match);
-	if (num_dcp < 1)
-		return -ENODEV;
-
-	ret = component_master_add_with_match(mdev, &apple_drm_ops, match);
+	if (num_dcp < 1) {
+		if (!apple_t8132_main_external_present())
+			return -ENODEV;
+		ret = apple_drm_init(mdev);
+	} else {
+		ret = component_master_add_with_match(mdev, &apple_drm_ops,
+						      match);
+	}
 	if (ret)
 		return ret;
 
@@ -1919,7 +1959,10 @@ static int apple_platform_probe(struct platform_device *pdev)
 static void apple_platform_remove(struct platform_device *pdev)
 {
 	pm_vt_switch_unregister(&pdev->dev);
-	component_master_del(&pdev->dev, &apple_drm_ops);
+	if (apple_t8132_main_external_present())
+		apple_drm_uninit(&pdev->dev);
+	else
+		component_master_del(&pdev->dev, &apple_drm_ops);
 }
 
 static const struct of_device_id of_match[] = {
