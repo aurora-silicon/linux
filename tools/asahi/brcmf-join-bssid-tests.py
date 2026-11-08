@@ -24,6 +24,7 @@ MUTATIONS = {
                    '\t\t\tconn_params.links[0].bssid = profile->bssid;\n',
                    '\t\tconn_params.links[0].bssid = profile->bssid;\n'),
     'no-call': ('\tbrcmf_connect_set_target(profile, params->bssid);\n', ''),
+    'lost-bss-success': ('\t\t\t\tcompleted = false;\n', '\t\t\t\t;\n'),
 }
 
 PREFIX = r'''
@@ -67,7 +68,14 @@ static int reported_status;
 static u8 reported_bssid[ETH_ALEN];
 static bool reported_none;
 static void brcmf_get_assoc_ies(struct brcmf_cfg80211_info *c, struct brcmf_if *i) { (void)c; (void)i; }
-static void brcmf_update_bss_info(struct brcmf_cfg80211_info *c, struct brcmf_if *i) { (void)c; (void)i; }
+#define BRCMF_C_DISASSOC 52
+static s32 bss_info_err;
+static bool bss_known = true;
+static int disassocs;
+static s32 brcmf_update_bss_info(struct brcmf_cfg80211_info *c, struct brcmf_if *i) { (void)c; (void)i; return bss_info_err; }
+static bool brcmf_bss_known(struct brcmf_cfg80211_info *c, const u8 *b) { (void)c; (void)b; return bss_known; }
+static s32 brcmf_fil_cmd_data_set(struct brcmf_if *i, u32 cmd, void *d, u32 l)
+{ (void)i; (void)d; (void)l; if (cmd == BRCMF_C_DISASSOC) disassocs++; return 0; }
 static void cfg80211_connect_done(struct net_device *n, struct cfg80211_connect_resp_params *p, int gfp)
 {
  (void)n; (void)gfp; reports++; reported_status = p->status;
@@ -139,6 +147,26 @@ int main(void)
  assert(!brcmf_is_linkup(&vif, &ssid) && brcmf_is_linkup(&vif, &psk));
  brcmf_bss_connect_done(&cfg, &ndev, &psk, true);
  assert(reports == 1 && !memcmp(reported_bssid, TRY24, ETH_ALEN) && authorized == 1);
+ controls++;
+
+ /* A link-up after the join was torn down: no BSS from the firmware or cfg80211. */
+ for (int fwsup = 0; fwsup <= BRCMF_PROFILE_FWSUP_SAE; fwsup++) {
+  start(TRY24, fwsup);
+  bss_info_err = -22; bss_known = false; disassocs = 0;
+  brcmf_bss_connect_done(&cfg, &ndev, &ssid, true);
+  assert(reports == 1 && reported_status == WLAN_STATUS_AUTH_TIMEOUT);
+  assert(!authorized && !test_bit(BRCMF_VIF_STATUS_CONNECTED, &vif.sme_state));
+  assert(disassocs == 1);
+  controls++;
+ }
+
+ /* The firmware lost the record but cfg80211 knows the BSS: still connected. */
+ start(TRY24, BRCMF_PROFILE_FWSUP_PSK);
+ bss_info_err = -22; bss_known = true; disassocs = 0;
+ brcmf_bss_connect_done(&cfg, &ndev, &psk, true);
+ assert(reports == 1 && reported_status == WLAN_STATUS_SUCCESS && authorized == 1);
+ assert(test_bit(BRCMF_VIF_STATUS_CONNECTED, &vif.sme_state) && !disassocs);
+ bss_info_err = 0;
  controls++;
 
  /* Only one report per join. */
