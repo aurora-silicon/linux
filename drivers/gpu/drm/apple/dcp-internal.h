@@ -45,6 +45,7 @@
 struct apple_dcp;
 struct iomfb_m4;
 struct apple_dcp_afkep;
+struct apple_smc;
 struct dcp_method_entry;
 
 /* Snapshot of a completed present, independent of the latest DRM state. */
@@ -281,6 +282,9 @@ struct dcp_desktop_state {
 	 */
 	struct apple_dcp_afkep *graph[0x20];
 	u32 graph_started, graph_skipped;
+	/* J616s firmware-declared dcp-2-smc route, published before IOMFB. */
+	struct apple_smc *smc;
+	struct apple_epic_service *smc_services[3];
 	/* DPAVCTRL (0x24): its two AV controllers and the deferred service. */
 	struct apple_epic_service *dpavctrl_av_controller[2];
 	struct apple_epic_service *dpavctrl_late_service;
