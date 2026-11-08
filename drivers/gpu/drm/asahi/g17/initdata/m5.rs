@@ -17,6 +17,10 @@ const KICK_SHARED: u64 = BASE + 0x1d_8000;
 const BUNDLE: u64 = BASE + 0xc078_8000;
 const COMPLETION_HIGH: u64 = BASE + 0xc080_0000;
 const COMPLETION_LOW: u64 = 0x70_0184_8000;
+/// The completion rings, where macOS 27.0 keeps them on the J813 (its own UAT, read under aura:
+/// four 0x20000 backings on this stride, the log buffers right above them).
+const COMMON26_COMPLETION_HIGH: u64 = BASE + 0xc07e_8000;
+const COMMON26_COMPLETION_LOW: u64 = 0x72_0184_8000;
 const COMPLETION_STRIDE: u64 = 0x2_8000;
 const PB: u64 = BASE + 0x15e_0000;
 const UMA: u64 = BASE + 0x15e_8000;
@@ -29,12 +33,14 @@ impl InitData {
     /// The kernel lower-root ranges a bare-metal M5 firmware reaches, whose top-level links must
     /// exist before it starts: entry 1, the descriptor tables and completion rings (entry 7) and
     /// the first page of the canonical arena (`canonical`, entry 8), where queues go later.
-    pub(in crate::g17) fn m5_lower_links(canonical: core::ops::Range<u64>)
+    pub(in crate::g17) fn m5_lower_links(canonical: core::ops::Range<u64>, graph: &m::Graph)
         -> [core::ops::Range<u64>; 8]
     {
         let page = |address: u64| address..address + mmu::UAT_PGSZ as u64;
-        let ring = |index: u64| page(COMPLETION_LOW + index * COMPLETION_STRIDE);
-        [page(BOOT_LINK), page(m::REGION_VIEW_LOW_ADDRS[0]), page(m::REGION_VIEW_LOW_ADDRS[1]),
+        let low = if graph.is_common26() { COMMON26_COMPLETION_LOW } else { COMPLETION_LOW };
+        let ring = |index: u64| page(low + index * COMPLETION_STRIDE);
+        let views = graph.profile.region_view_low_addrs();
+        [page(BOOT_LINK), page(views[0]), page(views[1]),
             ring(0), ring(1), ring(2), ring(3), page(canonical.start)]
     }
 
@@ -119,12 +125,18 @@ impl InitData {
                 Placement::In(uat.kernel_dynamic_range(), mmu::UAT_PGSZ as u64),
                 mmu::UAT_PGSZ, mmu::PROT_FW_SHARED_RW, CpuMap::WriteCombined)?)?;
         }
-        self.alias(self.pb, uat.kernel_lower_vm(), m::REGION_VIEW_LOW_ADDRS[0], GPU)?;
-        self.alias(self.page_pool, uat.kernel_lower_vm(), m::REGION_VIEW_LOW_ADDRS[1], GPU)?;
+        let views = board.graph.profile.region_view_low_addrs();
+        self.alias(self.pb, uat.kernel_lower_vm(), views[0], GPU)?;
+        self.alias(self.page_pool, uat.kernel_lower_vm(), views[1], GPU)?;
+        let (low, high) = if common26 {
+            (COMMON26_COMPLETION_LOW, COMMON26_COMPLETION_HIGH)
+        } else {
+            (COMPLETION_LOW, COMPLETION_HIGH)
+        };
         let mut completions = [m::G17PKsmCompletionAliases { low: 0, high: 0 }; m::M5_25G76_COMPLETION_QUEUE_COUNT];
         for (index, pair) in completions.iter_mut().enumerate() {
-            pair.low = COMPLETION_LOW + index as u64 * COMPLETION_STRIDE;
-            pair.high = COMPLETION_HIGH + index as u64 * COMPLETION_STRIDE;
+            pair.low = low + index as u64 * COMPLETION_STRIDE;
+            pair.high = high + index as u64 * COMPLETION_STRIDE;
             // After initialization the host only reads completion records.
             // Match the standard G17 completion ring's CPU write-back mapping;
             // keep firmware/GPU aliases, size and lifetime unchanged.

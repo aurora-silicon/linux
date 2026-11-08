@@ -1804,6 +1804,7 @@ impl Gpu {
         // link the tables of every lower range the M5 graph and its queues use first.
         uat.prepare_lower_tables(&initdata::InitData::m5_lower_links(
             uat.kernel_lower_dynamic_range(),
+            board.graph,
         ))
         .inspect_err(at("lower links"))?;
         // The J813 in native order, from aura's trace of macOS 27.0 on that machine: the start

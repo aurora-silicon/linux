@@ -96,6 +96,14 @@ impl RootProfile {
         }
     }
 
+    /// The GPU-visible aliases of the firmware's own tables the main config names.
+    pub(crate) const fn region_view_low_addrs(self) -> [u64; 2] {
+        match self {
+            Self::J873G18G26A428 => COMMON26_REGION_VIEW_LOW_ADDRS,
+            Self::J714G17S26A428 | Self::J700G17P | Self::J813G17G25G76 => REGION_VIEW_LOW_ADDRS,
+        }
+    }
+
     pub(crate) const fn repeated_region_bundle_offset(self) -> usize {
         match self {
             Self::J873G18G26A428 => COMMON26_SHARED_LAYOUT.block_88,
@@ -208,6 +216,9 @@ pub(crate) const BUNDLE_VIEW_OFFSETS: [usize; 5] = [0x2740, 0x3380, 0x4400, 0xbc
 pub(crate) const BUNDLE_VIEW_EXTENTS: [usize; 5] = [0x18c0, 0x0c80, 0x3c00, 0x3380, 0x3300];
 
 pub(crate) const REGION_VIEW_LOW_ADDRS: [u64; 2] = [0x70_0183_8000, 0x70_0184_0000];
+/// The GPU-visible aliases of the firmware's own tables on the J813: macOS 27.0 publishes them
+/// 8 GiB above where the 25G76 trace had them (the J813's own completion table, read under aura).
+pub(crate) const COMMON26_REGION_VIEW_LOW_ADDRS: [u64; 2] = [0x72_0183_8000, 0x72_0184_0000];
 
 pub(crate) const CHANNEL_TABLE_ENTRIES: usize = 17;
 
@@ -843,9 +854,9 @@ pub(crate) fn encode_main_config_for_profile(
             }
 
             put_u64(out, MAIN_REGION_VIEWS, views.sentinel_high);
-            put_u64(out, MAIN_REGION_VIEWS + 0x08, REGION_VIEW_LOW_ADDRS[0]);
+            put_u64(out, MAIN_REGION_VIEWS + 0x08, profile.region_view_low_addrs()[0]);
             put_u64(out, MAIN_REGION_VIEWS + 0x10, views.alias_high[0]);
-            put_u64(out, MAIN_REGION_VIEWS + 0x18, REGION_VIEW_LOW_ADDRS[1]);
+            put_u64(out, MAIN_REGION_VIEWS + 0x18, profile.region_view_low_addrs()[1]);
             put_u64(out, MAIN_REGION_VIEWS + 0x20, views.alias_high[1]);
             // J714's firmware takes both primary sentinels too; they are not
             // exclusive to the older J700 ABI.
@@ -859,8 +870,8 @@ pub(crate) fn encode_main_config_for_profile(
         }
         (InstanceRole::Secondary, _) => {
 
-            put_u64(out, MAIN_REGION_VIEWS + 0x08, REGION_VIEW_LOW_ADDRS[0]);
-            put_u64(out, MAIN_REGION_VIEWS + 0x18, REGION_VIEW_LOW_ADDRS[1]);
+            put_u64(out, MAIN_REGION_VIEWS + 0x08, profile.region_view_low_addrs()[0]);
+            put_u64(out, MAIN_REGION_VIEWS + 0x18, profile.region_view_low_addrs()[1]);
             put_u32(out, MAIN_SECONDARY_KIND, match profile {
                 RootProfile::J700G17P => MAIN_SECONDARY_KIND_VALUE,
                 RootProfile::J813G17G25G76 => 0xc,
