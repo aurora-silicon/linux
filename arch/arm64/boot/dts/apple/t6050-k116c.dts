@@ -19,3 +19,6 @@
 &mtp_multitouch {
 	firmware-name = "apple/tpmtfw-k116c.bin";
 };
+
+#define T6050_K116C
+#include "t6050-peripherals.dtsi"

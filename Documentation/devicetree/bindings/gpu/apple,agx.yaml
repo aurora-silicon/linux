@@ -19,6 +19,7 @@ properties:
           - apple,agx-g14s
           - apple,agx-t6040
           - apple,agx-t6041
+          - apple,agx-t6050
           - apple,agx-t8132
           - apple,agx-t8140
       - items:
@@ -46,6 +47,12 @@ properties:
 
   power-domains:
     maxItems: 1
+
+  interrupts:
+    maxItems: 8
+    description:
+      The GPU block's interrupt outputs, as the ADT lists them. Only
+      described on T6050, whose GPU is not driven from Linux yet.
 
   dma-noncoherent: true
 
@@ -204,10 +211,37 @@ properties:
 required:
   - compatible
   - reg
-  - mboxes
-  - memory-region
 
 allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,agx-t6050
+    then:
+      description:
+        The T6050 GPU block, described from the ADT /arm-io/sgx node. Its
+        firmware coprocessor is a separate node, and the GPU stays disabled
+        until the firmware handoff is supported.
+      properties:
+        reg:
+          items:
+            - description: GPU block MMIO registers
+            - description: GPU block secondary registers
+        interrupts:
+          minItems: 8
+        status:
+          const: disabled
+      required:
+        - interrupts
+        - power-domains
+        - status
+    else:
+      properties:
+        interrupts: false
+      required:
+        - mboxes
+        - memory-region
   - if:
       properties:
         compatible:

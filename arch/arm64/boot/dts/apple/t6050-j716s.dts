@@ -453,3 +453,6 @@
  *   2 afe-reset      (0x10000, 0x11c0000)
  */
 /delete-node/ &smc_pcio;
+
+#define T6050_J716S
+#include "t6050-peripherals.dtsi"

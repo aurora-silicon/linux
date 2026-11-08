@@ -19,3 +19,6 @@
 &mtp_multitouch {
 	firmware-name = "apple/tpmtfw-k114s.bin";
 };
+
+#define T6050_K114S
+#include "t6050-peripherals.dtsi"
