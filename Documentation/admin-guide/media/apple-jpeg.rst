@@ -35,10 +35,10 @@ testable without hardware, but probe refuses runtime use until that reset
 image is complete. Do not enable T6000 engine nodes for streaming yet.
 
 Each engine has a 16 KiB MMIO resource and a separate adjacent DART at SID 0.
-The engine's resource must not include the DART window. Both new T6000 and
-T8112 engine/DART pairs remain disabled in the SoC descriptions. Enabling
-nodes and changing installed boot DTBs requires board qualification. Existing
-power-domain and performance-provider nodes must also be available.
+The engine's resource must not include the DART window. Both T8112 engines
+and their DARTs are enabled in ``t8112.dtsi`` (qualified on the J413). The
+T6000 pairs stay disabled until the reset image is complete. Enabling nodes on
+another SoC requires qualifying both of its instances.
 
 KUnit
 -----
