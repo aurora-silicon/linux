@@ -9,7 +9,7 @@ config VIDEO_APPLE_PRORES
 	select VIDEOBUF2_DMA_CONTIG
 	help
 	  V4L2 memory-to-memory driver for the ProRes encoder engine (APR)
-	  in Apple A18 Pro (T8140) SoCs. It encodes 8 and 16 bit 4:2:2 and
+	  in Apple M1 Pro (T6000) and A18 Pro (T8140) SoCs. It encodes 8 and 16 bit 4:2:2 and
 	  4:4:4 frames to ProRes 422 Proxy, LT, 422, HQ, 4444 and 4444 XQ.
 
 	  To compile this driver as a module, choose M here: the module

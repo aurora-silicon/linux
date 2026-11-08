@@ -4388,6 +4388,12 @@ static bool tb_apple_add_links(struct tb_nhi *nhi)
 	return ret;
 }
 
+/* Hosts without ACPI tables may order their tunneled native ports themselves. */
+static bool tb_nhi_add_links(struct tb_nhi *nhi)
+{
+	return nhi->ops && nhi->ops->add_links && nhi->ops->add_links(nhi);
+}
+
 static void tb_cm_init(struct tb_cm *tcm)
 {
 	INIT_LIST_HEAD(&tcm->tunnel_list);
@@ -4425,7 +4431,8 @@ struct tb *tb_probe(struct tb_nhi *nhi)
 	 * before the PCIe/USB stack is resumed so complain here if we
 	 * found them missing.
 	 */
-	if (!tb_apple_add_links(nhi) && !tb_acpi_add_links(nhi))
+	if (!tb_nhi_add_links(nhi) && !tb_apple_add_links(nhi) &&
+	    !tb_acpi_add_links(nhi))
 		tb_warn(tb, "device links to tunneled native ports are missing!\n");
 
 	return tb;

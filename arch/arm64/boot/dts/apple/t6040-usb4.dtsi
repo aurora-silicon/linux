@@ -2,21 +2,20 @@
 /*
  * T6040 USB4/PCIe-C resource description.
  *
- * Every node remains disabled until the Type-C PHY transition, bootloader
- * tuning handoff, and dynamic PCIe RID-to-SID policy are qualified.
+ * Every node is disabled here; a board enables the routers it has qualified.
  */
 
 / {
 	aliases {
-		usb4-0-rc = &usb4_0_acio;
+		usb4-0-acio = &usb4_0_acio;
 		usb4-0-nhi = &usb4_0_nhi;
 		usb4-0-pcie = &usb4_0_pcie;
 		usb4-0-pcie-adapter = &usb4_0_acio;
-		usb4-1-rc = &usb4_1_acio;
+		usb4-1-acio = &usb4_1_acio;
 		usb4-1-nhi = &usb4_1_nhi;
 		usb4-1-pcie = &usb4_1_pcie;
 		usb4-1-pcie-adapter = &usb4_1_acio;
-		usb4-2-rc = &usb4_2_acio;
+		usb4-2-acio = &usb4_2_acio;
 		usb4-2-nhi = &usb4_2_nhi;
 		usb4-2-pcie = &usb4_2_pcie;
 		usb4-2-pcie-adapter = &usb4_2_acio;
@@ -33,7 +32,10 @@
 		interrupts = <AIC_IRQ 1791 IRQ_TYPE_LEVEL_HIGH>;
 		interrupt-names = "sram-parity";
 		mboxes = <&usb4_0_mbox>;
-		resets = <&ps_atc0_cio>;
+		resets = <&cio_reset 0>;
+		pinctrl-names = "lstx";
+		pinctrl-0 = <&usb4_0_lstx_pins>;
+		lstx-gpios = <&pinctrl_aop 49 GPIO_ACTIVE_HIGH>;
 		power-domains = <&ps_atc0_cio>, <&ps_atc0_cio_pcie>,
 				<&ps_atc0_cio_usb>, <&ps_atc0_pcie>;
 		thunderbolt-switch;
@@ -50,7 +52,7 @@
 
 			port@1 {
 				reg = <1>;
-				endpoint { };
+				usb4_0_acio_tbt: endpoint { };
 			};
 		};
 
@@ -127,7 +129,10 @@
 		interrupts = <AIC_IRQ 1839 IRQ_TYPE_LEVEL_HIGH>;
 		interrupt-names = "sram-parity";
 		mboxes = <&usb4_1_mbox>;
-		resets = <&ps_atc1_cio>;
+		resets = <&cio_reset 1>;
+		pinctrl-names = "lstx";
+		pinctrl-0 = <&usb4_1_lstx_pins>;
+		lstx-gpios = <&pinctrl_aop 51 GPIO_ACTIVE_HIGH>;
 		power-domains = <&ps_atc1_cio>, <&ps_atc1_cio_pcie>,
 				<&ps_atc1_cio_usb>, <&ps_atc1_pcie>;
 		thunderbolt-switch;
@@ -144,7 +149,7 @@
 
 			port@1 {
 				reg = <1>;
-				endpoint { };
+				usb4_1_acio_tbt: endpoint { };
 			};
 		};
 
@@ -221,7 +226,10 @@
 		interrupts = <AIC_IRQ 1887 IRQ_TYPE_LEVEL_HIGH>;
 		interrupt-names = "sram-parity";
 		mboxes = <&usb4_2_mbox>;
-		resets = <&ps_atc2_cio>;
+		resets = <&cio_reset 2>;
+		pinctrl-names = "lstx";
+		pinctrl-0 = <&usb4_2_lstx_pins>;
+		lstx-gpios = <&pinctrl_aop 53 GPIO_ACTIVE_HIGH>;
 		power-domains = <&ps_atc2_cio>, <&ps_atc2_cio_pcie>,
 				<&ps_atc2_cio_usb>, <&ps_atc2_pcie>;
 		thunderbolt-switch;
@@ -238,7 +246,7 @@
 
 			port@1 {
 				reg = <1>;
-				endpoint { };
+				usb4_2_acio_tbt: endpoint { };
 			};
 		};
 
@@ -515,5 +523,38 @@
 						<0 0 0 4 &usb4_2_pcie_port 0 0 0 3>;
 			};
 		};
+	};
+};
+
+/ {
+	/* ADT pmgr reg[44]: AppleT6041PMGR::enableCioReconfig at +0x2024. */
+	pmgr_cio: power-management@502820000 {
+		compatible = "apple,t6041-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		reg = <0x5 0x02820000 0 0x4000>;
+		/* Enabled together with the routers. */
+		status = "disabled";
+
+		cio_reset: reset-controller@2024 {
+			compatible = "apple,t6041-cio-reset", "apple,t6000-cio-reset";
+			reg = <0x2024 0x4>;
+			#reset-cells = <1>;
+		};
+	};
+};
+
+&pinctrl_aop {
+	/* ADT acioN gpio-lstx. */
+	usb4_0_lstx_pins: usb4-0-lstx-pins {
+		pinmux = <APPLE_PINMUX(49, 1)>;
+	};
+
+	usb4_1_lstx_pins: usb4-1-lstx-pins {
+		pinmux = <APPLE_PINMUX(51, 1)>;
+	};
+
+	usb4_2_lstx_pins: usb4-2-lstx-pins {
+		pinmux = <APPLE_PINMUX(53, 1)>;
 	};
 };

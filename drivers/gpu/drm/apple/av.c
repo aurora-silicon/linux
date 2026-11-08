@@ -260,7 +260,7 @@ bool dcp_audiosrv_native_link(struct device *dev)
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
 	return dcp_is_v14_7_external(dcp) ||
-	       (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->external);
+	       (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->desktop_external);
 }
 
 /* The 14.7 external role's audio service calls; KUnit stubs them. */
@@ -664,26 +664,50 @@ static void av_cec_teardown(struct apple_epic_service *service)
 #endif
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+static const struct apple_epic_service_ops av_desktop_ops[];
+
+/*
+ * The desktop 26.x external processors (T6041 DCPEXT) publish their audio
+ * interface on endpoint 0x2b as dcpav-audio-interface-epic, unit 0. With
+ * the role in front ("dispext0:") the announcement is longer than its
+ * field, so it arrives cut, without the unit: admit the cut too, as unit 0.
+ */
 static int av_desktop_audio_prepare(struct apple_epic_service *service, const char *name,
 				    const char *class, s64 unit)
 {
 	struct apple_dcp *dcp = service->ep->dcp;
 
-	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP || !dcp->external ||
-	    service->ep->endpoint != AV_AUDIO_ENDPOINT_DESKTOP ||
-	    !name || strcmp(name, "dcpav-audio-epic") || unit != 0)
+	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP || !dcp->desktop_external ||
+	    service->ep->endpoint != AV_AUDIO_ENDPOINT_DESKTOP || !name)
 		return -EINVAL;
-	return 0;
+	if (!strcmp(name, av_desktop_ops[0].name) && unit == 0)
+		return 0;
+	if (unit == -1 && afk_compact_cut_of(&av_desktop_ops[0], name))
+		return 0;
+	return -EINVAL;
 }
 
 static const struct apple_epic_service_ops av_desktop_ops[] = {
 	{
-		.name = "dcpav-audio-epic",
+		.name = "dcpav-audio-interface-epic",
+		.compact_full = "dcpav-audio-interface-epic:0",
 		.reusable = true,
 		.prepare = av_desktop_audio_prepare,
 		.init = av_audiosrv_init,
 		.report = av_audiosrv_report,
 		.teardown = av_audiosrv_teardown,
+	},
+	{
+		/*
+		 * The same endpoint also publishes the processor's CEC
+		 * interface, cut to "dcpav-cec-interface-ep" as above. The
+		 * host makes no use of CEC: take it and drop its reports.
+		 */
+		.name = "dcpav-cec-interface-epic",
+		.compact_full = "dcpav-cec-interface-epic:0",
+		.init = av_cec_init,
+		.report = av_cec_report,
+		.teardown = av_cec_teardown,
 	},
 	{}
 };
@@ -1032,7 +1056,7 @@ int avep_init(struct apple_dcp *dcp)
 
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
-		if (!dcp->external)
+		if (!dcp->desktop_external)
 			return -EOPNOTSUPP;
 		ops = av_desktop_ops;
 		av_endpoint = AV_AUDIO_ENDPOINT_DESKTOP;

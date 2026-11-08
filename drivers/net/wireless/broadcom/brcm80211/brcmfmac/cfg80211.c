@@ -5970,6 +5970,7 @@ static int brcmf_cfg80211_get_channel(struct wiphy *wiphy,
 	struct net_device *ndev = wdev->netdev;
 	struct brcmf_pub *drvr = cfg->pub;
 	struct brcmu_chan ch;
+	struct brcmf_if *ifp;
 	enum nl80211_band band = 0;
 	enum nl80211_chan_width width = 0;
 	u32 chanspec;
@@ -5978,7 +5979,17 @@ static int brcmf_cfg80211_get_channel(struct wiphy *wiphy,
 	if (!ndev || drvr->bus_if->state != BRCMF_BUS_UP)
 		return -ENODEV;
 
-	err = brcmf_fil_iovar_int_get(netdev_priv(ndev), "chanspec", &chanspec);
+	/* AWDL has no operating channel: the firmware moves the interface
+	 * through its availability-window channel sequence, and the AWDL
+	 * bsscfg rejects the chanspec query. Report no channel, as for an
+	 * interface that is not on one, rather than logging an error each
+	 * time nl80211 describes awdl0 (its removal notification does).
+	 */
+	ifp = netdev_priv(ndev);
+	if (ifp->is_awdl)
+		return -ENODATA;
+
+	err = brcmf_fil_iovar_int_get(ifp, "chanspec", &chanspec);
 	if (err) {
 		bphy_err(drvr, "chanspec failed (%d)\n", err);
 		return err;

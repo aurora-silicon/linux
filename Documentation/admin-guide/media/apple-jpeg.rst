@@ -2,53 +2,78 @@
 
 :orphan:
 
-Apple JPEG scaffold
-===================
+Apple JPEG encoder
+==================
 
-This driver provides a common platform and V4L2 memory-to-memory scaffold
-for the Apple T6041 and T8140 JPEG engines. Each DT platform device owns one
-independent m2m scheduler, with formats and VB2 queues allocated per open file.
-T6041's nodes reside in ``t604x.dtsi`` in this source tree. All JPEG engine
-nodes and the new T8140 DART remain disabled. SoC DART defaults are disabled;
-existing board overrides are preserved. In particular, J700 already enables
-its first JPEG DART independently of the disabled codec engines.
+The driver exposes one V4L2 memory-to-memory encoder per JPEG engine. It takes
+full-range single-buffer NV12 (4:2:0) or NV16 (4:2:2) input and produces
+baseline JPEG with the standard Huffman tables. Quality and restart interval are V4L2 controls.
+Decode is not exposed.
 
-No target HWREV is qualified. Runtime resume reads HWREV with the power domain
-active and returns ``-ENODEV`` for an unlisted revision, including zero and
-all-ones readbacks. Both per-compatible allow-lists are deliberately empty.
-The driver does not infer a revision from a compatible, an instance number,
-an ADT hw-type, or a revision observed on another SoC.
+The device compatible selects immutable register-layout and identity data:
 
-Identification precedes reset: the public reset sequence has not been qualified
-on these targets, so issuing it before admission would undermine the refusal
-boundary. There are no MMIO writes, interrupt requests, reset sequences or DMA
-jobs in this scaffold. Probe failure balances runtime PM and never registers
-a video node. The power domain and the IOMMU are managed by their normal kernel
-providers; the scaffold requires a SID-0 IOMMU attachment and the binding's
-exact high DMA window. This is a topology check, not proof of pointer aliasing.
+===================  =========  ========================
+Compatible           Layout     Masked HWREV
+===================  =========  ========================
+apple,t6000-jpeg      legacy32   0x0d0013
+apple,t6041-jpeg      wide64     0x100008
+apple,t8112-jpeg      wide64     0x0e0008
+apple,t8140-jpeg      wide64     0x110000
+===================  =========  ========================
 
-The future video node has JPEG/NV12M format negotiation for encode and decode,
-buffer allocation/import, and queue teardown. STREAMON returns ``-EOPNOTSUPP``
-and returns queued buffers according to the VB2 failure contract. The scheduler
-also refuses jobs. The advertised allocation dimensions and formats are draft
-API scaffolding, not a tested codec capability. Open video files retain the
-m2m/device allocation through final close after platform removal; they cannot
-access removed MMIO resources.
+Identification powers the domain, writes MODE=0x147 and reads the selected
+layout's HWREV register. The mask is 0xffff0fff: bits 12 through 15 are ignored.
+Zero, all-ones and other identities are refused. The legacy selector 0x0a0103
+is not a HWREV. The wide64 variants share register and reset data; legacy32
+uses compact 32-bit DMA addresses and a separate reset image. DMA addresses
+and inclusive boundaries must fit the selected address width. They are never
+truncated to fit a register.
 
-Before enabling nodes or adding a target revision, qualification must establish
-the revision, bounded reset/idle sequence, interrupt acknowledgment/deassertion,
-high DVA alias, timeout/recovery and supported geometry on both instances of
-each SoC. Filling an HWREV list alone does not implement streaming. Reset and
-job code must validate revisions again on every runtime resume, preserve the
-shared power-domain accounting, and return DMA buffers only after quiescing
-hardware. Encode/decode controls, JPEG header validation, media-controller
-topology and actual job programming belong to the subsequent codec work.
+The legacy32 reset image is complete: 111 static defaults, including the
+sparse scratch block, plus the tiling write the helper appends. Unlisted
+registers in that block are left unwritten. T6000 completes jobs with
+interrupt status bit 31.
 
-The HWREV register offset comes from the MIT-licensed m1n1 register
-description at commit ``f3ac615eb1376d3bbba24cd84c414b9e41892adb``:
+Each engine has a 16 KiB MMIO resource and a separate adjacent DART at SID 0.
+The engine's resource must not include the DART window. Both T8112 engines
+and their DARTs are enabled in ``t8112.dtsi`` (qualified on the J413), and
+both T6000 engines in ``t6000.dtsi`` (qualified on the J316s). T6001 and T6002
+stay disabled. Enabling nodes on another SoC requires qualifying both of its
+instances.
 
-https://github.com/aurora-silicon/m1n1/blob/f3ac615eb1376d3bbba24cd84c414b9e41892adb/proxyclient/m1n1/hw/jpeg.py
+KUnit
+-----
 
-The scaffold deliberately does not translate the experiment's unqualified
-reset or interrupt writes. ``VIDEO_APPLE_JPEG_KUNIT_TEST`` tests empty target
-allow-lists, invalid readbacks and exact matching with synthetic revisions.
+``VIDEO_APPLE_JPEG_KUNIT_TEST`` checks layout sharing, register offsets,
+HWREV admission, quantisation tables, 4:2:0 and 4:2:2 job programming, and
+address/capacity rejection. No JPEG hardware is needed. An arm64 QEMU run can
+use the configuration fragment next to the driver::
+
+  tools/testing/kunit/kunit.py run --arch=arm64 --make_options LLVM=1 \
+    --kunitconfig=drivers/media/platform/apple/jpeg/.kunitconfig \
+    --jobs=8 'apple-jpeg*'
+
+Qualification
+-------------
+
+Before enabling a new board, qualify both instances: record raw HWREV,
+terminal interrupt status (bit 30 or bit 31 for initial older-family
+qualification), reset/idle handshakes, runtime PM, geometry, output-capacity
+checks and error recovery. T8140 and T6000 use their qualified bit-31
+completion mask. The other variants accept bits 30 and 31; status/error and
+output-capacity checks still apply.
+
+Check each encoder's advertised formats and use its actual video node. For
+example, with a GStreamer V4L2 JPEG encoder element available::
+
+  gst-launch-1.0 -e videotestsrc num-buffers=1 ! \
+    'video/x-raw,format=NV12,width=640,height=480,colorimetry=1:4:5:4' ! \
+    v4l2jpegenc device=/dev/videoN ! filesink location=encoded.jpg
+  ffmpeg -v error -i encoded.jpg -frames:v 1 -f null -
+
+Repeat with both supported sampling formats, 1920x1080, non-MCU-aligned
+heights, consecutive jobs, quality/restart controls and undersized capture
+buffers. Record negotiated range/caps. Verify that failed reset polls and
+watchdog timeouts stop DMA authority before returning buffers. The current
+watchdog's stop-and-defer-reset behavior still needs a reset/power-cycle
+recovery implementation before new production enablement.

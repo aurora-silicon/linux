@@ -53,8 +53,6 @@
 			     <AIC_IRQ 184 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 181 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 182 IRQ_TYPE_LEVEL_HIGH>;
-		/* Not yet qualified on the J700. */
-		status = "disabled";
 	};
 	event-log-handler@300700000 {
 		compatible = "apple,t8140-event-log", "apple,soc-event-log";
@@ -79,8 +77,6 @@
 			     <AIC_IRQ 652 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 644 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 879 IRQ_TYPE_LEVEL_HIGH>;
-		/* Not yet qualified on the J700. */
-		status = "disabled";
 	};
 
 	/* ADT /arm-io/dwi. */
