@@ -3,9 +3,22 @@
 T6000 APR a0 qualification
 =========================
 
-This port describes an encoder, not a decoder. The APR and its DART remain
-disabled in the shipped DT. Compile and descriptor tests do not qualify
-silicon operation, DMA quiescence, output quality or rate control.
+This port describes an encoder, not a decoder. T6000 enables APR0 and its
+DART in ``t6000.dtsi``; T6001 and T6002 keep theirs disabled.
+
+Status
+------
+
+Run on a J316s (M1 Pro) on 2026-11-08 with the shipped node descriptions,
+without a performance request. The engine identifies as 0x10001. The
+four input formats and all six profiles were encoded at 1920x1080, plus
+Standard, HQ and 4444 at 3840x2160. ffmpeg decoded every frame at the
+expected size and chroma format. There were no DART faults, and the
+engine runtime-suspended with its power domain off afterwards.
+
+Not yet covered: cancellation, failed-reset retention (#925), system
+suspend, rate-control parity with macOS, and the SCODEC performance
+request below.
 
 Implementation sources
 ----------------------

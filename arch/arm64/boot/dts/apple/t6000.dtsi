@@ -93,3 +93,11 @@
 
 #include "t6000-peripherals.dtsi"
 #include "t6000-aux-spmi.dtsi"
+
+&apr0_dart {
+	status = "okay";
+};
+
+&apr0 {
+	status = "okay";
+};
