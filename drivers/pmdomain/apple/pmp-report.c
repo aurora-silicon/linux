@@ -373,8 +373,8 @@ static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 		seq_printf(s, "acknowledged: %#llx\n", readq(rep->base + offs->actual));
 	for (lane = 0; lane < ARRAY_SIZE(words); lane++)
 		if (dvfs_known & BIT_ULL(lane))
-			seq_printf(s, "dvfs_request@%x: %llu (host), word: %#llx\n",
-				   offs->dvfs_first + lane, words[lane] & 0x1f, words[lane]);
+			seq_printf(s, "dvfs_request@%x: word: %#llx (host)\n",
+				   offs->dvfs_first + lane, words[lane]);
 	/* T8112 SOC achieved-state edge packet, not a request entry. */
 	if (running && offs->dvfs_first == 0xb0 && offs->dvfs_count == 1)
 		seq_printf(s, "soc_dvfs_state: %#llx metadata: %#llx\n",
@@ -1566,11 +1566,12 @@ struct apple_pmp_report_entry {
 	bool released;
 	/*
 	 * With @dvfs, the SOC-DEV-DVFS entry this soc-device's performance
-	 * request lives in, and the request word written while powered.
+	 * request lives in, its request class and the level while powered.
 	 */
 	bool dvfs;
 	u32 dvfs_entry;
-	u64 dvfs_on;
+	u32 dvfs_request_class;
+	u32 dvfs_level;
 	bool removed;
 };
 
@@ -1671,11 +1672,50 @@ int apple_pmp_report_set_t6030_gfx(struct device *supplier, bool enable)
 EXPORT_SYMBOL_GPL(apple_pmp_report_set_t6030_gfx);
 /* SOC-DEV-DVFS request words carry a valid bit; level 0 is the floor. */
 #define PMP_DVFS_VALID		BIT_ULL(61)
+#define PMP_DVFS_DEFAULT_MASK	GENMASK_ULL(4, 0)
+#define PMP_DVFS_CLASS_25_MASK	GENMASK_ULL(51, 48)
+
+static u64 apple_pmp_report_dvfs_mask(u32 request_class)
+{
+	switch (request_class) {
+	case 0:
+		return PMP_DVFS_DEFAULT_MASK;
+	case 0x25:
+		return PMP_DVFS_CLASS_25_MASK;
+	default:
+		return 0;
+	}
+}
+
+static bool apple_pmp_report_dvfs_level_valid(u32 request_class, u32 level)
+{
+	switch (request_class) {
+	case 0:
+		return FIELD_FIT(PMP_DVFS_DEFAULT_MASK, level);
+	case 0x25:
+		return FIELD_FIT(PMP_DVFS_CLASS_25_MASK, level);
+	default:
+		return false;
+	}
+}
+
+static u64 apple_pmp_report_dvfs_field(u32 request_class, u32 level)
+{
+	switch (request_class) {
+	case 0:
+		return FIELD_PREP(PMP_DVFS_DEFAULT_MASK, level);
+	case 0x25:
+		return FIELD_PREP(PMP_DVFS_CLASS_25_MASK, level);
+	default:
+		return 0;
+	}
+}
 
 static bool apple_pmp_report_dvfs_valid(const struct apple_pmp_report_offsets *offs,
-					u32 entry, u32 level)
+					u32 entry, u32 level, u32 request_class)
 {
-	return offs->update && offs->dvfs_count <= 64 && level <= 0x1f &&
+	return offs->update && offs->dvfs_count <= 64 &&
+	       apple_pmp_report_dvfs_level_valid(request_class, level) &&
 	       entry >= offs->dvfs_first && entry - offs->dvfs_first < offs->dvfs_count;
 }
 
@@ -1684,15 +1724,17 @@ static bool apple_pmp_report_dvfs_valid(const struct apple_pmp_report_offsets *o
  * back after storing it: the read retires the pending PTD update before the
  * PMP handles it, and the request is lost.
  */
-static void apple_pmp_report_dvfs_write(struct apple_pmp_report *rep, u32 entry, u64 val)
+static void apple_pmp_report_dvfs_write(struct apple_pmp_report *rep, u32 entry,
+					u32 request_class, u32 level)
 {
 	unsigned int index = entry - rep->offsets->dvfs_first;
 	unsigned long flags;
+	u64 mask = apple_pmp_report_dvfs_mask(request_class);
 
 	spin_lock_irqsave(&rep->lock, flags);
-	/* This consumer owns only the default floor, not the other classes. */
-	rep->dvfs_words[index] &= ~GENMASK_ULL(4, 0);
-	rep->dvfs_words[index] |= PMP_DVFS_VALID | (val & 0x1f);
+	rep->dvfs_words[index] &= ~mask;
+	rep->dvfs_words[index] |= PMP_DVFS_VALID |
+				  apple_pmp_report_dvfs_field(request_class, level);
 	writeq(rep->dvfs_words[index], rep->base + rep->offsets->update + 8 * entry);
 	rep->dvfs_known |= BIT_ULL(index);
 	spin_unlock_irqrestore(&rep->lock, flags);
@@ -1719,10 +1761,13 @@ static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, boo
 		}
 		/* The device request is admitted first and the level dropped first. */
 		if (ent->dvfs && !enable)
-			apple_pmp_report_dvfs_write(rep, ent->dvfs_entry, PMP_DVFS_VALID);
+			apple_pmp_report_dvfs_write(rep, ent->dvfs_entry,
+						    ent->dvfs_request_class, 0);
 		ret = apple_pmp_report_set_state(rep, ent->id, enable, ent->no_ack);
 		if (ent->dvfs && enable && !ret)
-			apple_pmp_report_dvfs_write(rep, ent->dvfs_entry, ent->dvfs_on);
+			apple_pmp_report_dvfs_write(rep, ent->dvfs_entry,
+						    ent->dvfs_request_class,
+						    ent->dvfs_level);
 		break;
 	}
 	rcu_read_unlock();
@@ -1877,18 +1922,30 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	}
 	ent->sleep_release = of_property_read_bool(node, "apple,release-for-sleep");
 	if (of_property_present(node, "apple,dvfs")) {
+		u32 request_class = 0;
 		u32 dvfs[2];
 
+		if (of_property_present(node, "apple,dvfs-request-class")) {
+			ret = of_property_read_u32(node, "apple,dvfs-request-class",
+						   &request_class);
+			if (ret || request_class != 0x25) {
+				ret = dev_err_probe(dev, -EINVAL,
+						    "invalid apple,dvfs-request-class\n");
+				goto err_free;
+			}
+		}
 		ret = of_property_read_u32_array(node, "apple,dvfs", dvfs, 2);
 		if (ret || !rep || of_property_count_u32_elems(node, "apple,dvfs") != 2 ||
-		    !apple_pmp_report_dvfs_valid(rep->offsets, dvfs[0], dvfs[1]) ||
+		    !apple_pmp_report_dvfs_valid(rep->offsets, dvfs[0], dvfs[1],
+						 request_class) ||
 		    of_property_read_bool(node, "apple,no-ack")) {
 			ret = dev_err_probe(dev, -EINVAL, "invalid apple,dvfs\n");
 			goto err_free;
 		}
 		ent->dvfs = true;
 		ent->dvfs_entry = dvfs[0];
-		ent->dvfs_on = PMP_DVFS_VALID | dvfs[1];
+		ent->dvfs_request_class = request_class;
+		ent->dvfs_level = dvfs[1];
 	}
 
 	ret = of_property_read_string(node, "label", &name);

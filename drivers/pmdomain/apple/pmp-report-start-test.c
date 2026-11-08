@@ -423,20 +423,32 @@ static void pmp_t8112_encoding_test(struct kunit *test)
 	rep->offsets = o;
 	rep->base = (void __iomem *)mem;
 	spin_lock_init(&rep->lock);
-	KUNIT_EXPECT_TRUE(test, apple_pmp_report_dvfs_valid(o, 0xb0, 2));
-	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xaf, 2));
-	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xb1, 2));
-	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xa7, 2));
-	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xb8, 2));
-	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xb0, 32));
+	KUNIT_EXPECT_EQ(test, apple_pmp_report_dvfs_mask(0), PMP_DVFS_DEFAULT_MASK);
+	KUNIT_EXPECT_EQ(test, apple_pmp_report_dvfs_mask(0x25), PMP_DVFS_CLASS_25_MASK);
+	KUNIT_EXPECT_EQ(test, apple_pmp_report_dvfs_mask(0x24), 0ULL);
+	KUNIT_EXPECT_TRUE(test, apple_pmp_report_dvfs_valid(o, 0xb0, 2, 0x25));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xaf, 2, 0x25));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xb1, 2, 0x25));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xa7, 2, 0x25));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xb8, 2, 0x25));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xb0, 16, 0x25));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xb0, 2, 0x24));
 	KUNIT_EXPECT_EQ(test, o->update + 8 * 0xb0, 0x10580U);
-	apple_pmp_report_dvfs_write(rep, 0xb0, PMP_DVFS_VALID | 2);
+	/* Without a request class, retain the existing low-five-bit encoding. */
+	apple_pmp_report_dvfs_write(rep, 0xb0, 0, 2);
 	KUNIT_EXPECT_EQ(test, readq(rep->base + 0x10580), 0x2000000000000002ULL);
-	/* Another provider-owned class survives a default-floor update/release. */
-	rep->dvfs_words[0] |= other;
-	apple_pmp_report_dvfs_write(rep, 0xb0, PMP_DVFS_VALID);
-	KUNIT_EXPECT_EQ(test, readq(rep->base + 0x10580), PMP_DVFS_VALID | other);
-	KUNIT_EXPECT_EQ(test, rep->dvfs_words[0], PMP_DVFS_VALID | other);
+	/* Class 0x25 carries the T8112 AVD VMAX, VNOM and idle floors. */
+	rep->dvfs_words[0] = 0;
+	apple_pmp_report_dvfs_write(rep, 0xb0, 0x25, 2);
+	KUNIT_EXPECT_EQ(test, readq(rep->base + 0x10580), 0x2002000000000000ULL);
+	apple_pmp_report_dvfs_write(rep, 0xb0, 0x25, 1);
+	KUNIT_EXPECT_EQ(test, readq(rep->base + 0x10580), 0x2001000000000000ULL);
+	/* Other provider-owned classes survive the class-0x25 release. */
+	rep->dvfs_words[0] |= other | 2;
+	apple_pmp_report_dvfs_write(rep, 0xb0, 0x25, 0);
+	KUNIT_EXPECT_EQ(test, readq(rep->base + 0x10580),
+			PMP_DVFS_VALID | other | 2);
+	KUNIT_EXPECT_EQ(test, rep->dvfs_words[0], PMP_DVFS_VALID | other | 2);
 	KUNIT_EXPECT_EQ(test, rep->dvfs_known, 1ULL);
 }
 
@@ -464,7 +476,8 @@ static int pmp_dvfs_init(struct kunit *test)
 	t->ent.id = 10;
 	t->ent.dvfs = true;
 	t->ent.dvfs_entry = 0xb0;
-	t->ent.dvfs_on = PMP_DVFS_VALID | 2;
+	t->ent.dvfs_request_class = 0x25;
+	t->ent.dvfs_level = 2;
 	spin_lock_init(&t->rep.lock);
 	mutex_lock(&apple_pmp_reports_lock);
 	list_add_tail_rcu(&t->rep.list, &apple_pmp_reports);
@@ -514,10 +527,10 @@ static void pmp_t8112_active_release_test(struct kunit *test)
 	writeq(BIT_ULL(10), t->rep.base + 0xa40);
 	KUNIT_ASSERT_EQ(test, apple_pmp_report_entry_power_on(&t->ent.genpd), 0);
 	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10500), BIT_ULL(10));
-	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10580), PMP_DVFS_VALID | 2);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10580), 0x2002000000000000ULL);
 	/* ACK deliberately stays asserted: release is stored before ACK clear. */
 	KUNIT_EXPECT_EQ(test, apple_pmp_report_entry_power_off(&t->ent.genpd), -ETIMEDOUT);
-	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10580), PMP_DVFS_VALID);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10580), 0x2000000000000000ULL);
 	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10500), 0ULL);
 	writeq(0, t->rep.base + 0xa40);
 	KUNIT_EXPECT_EQ(test, apple_pmp_report_entry_power_off(&t->ent.genpd), 0);

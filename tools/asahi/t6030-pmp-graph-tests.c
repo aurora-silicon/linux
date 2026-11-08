@@ -203,9 +203,15 @@ struct apple_pmp_report_entry {
 	bool no_ack, dvfs, removed;
 	bool sleep_release, released;
 	u32 dvfs_entry;
-	u64 dvfs_on;
+	u32 dvfs_request_class, dvfs_level;
 };
 #define PMP_DVFS_VALID BIT_ULL(61)
+#define PMP_DVFS_DEFAULT_MASK GENMASK_ULL(4, 0)
+#define PMP_DVFS_CLASS_25_MASK GENMASK_ULL(51, 48)
+#define FIELD_FIT(mask, val) \
+	!((((u64)(val)) << __builtin_ctzll(mask)) & ~(mask))
+#define FIELD_PREP(mask, val) \
+	((((u64)(val)) << __builtin_ctzll(mask)) & (mask))
 #define genpd_to_apple_pmp_report_entry(p) \
 	container_of(p, struct apple_pmp_report_entry, genpd)
 struct of_phandle_iterator {

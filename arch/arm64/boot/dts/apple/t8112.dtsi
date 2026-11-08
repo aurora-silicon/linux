@@ -1216,6 +1216,7 @@
 				#power-domain-cells = <0>;
 				power-domains = <&ps_avd_sys>;
 				apple,dvfs = <0xb0 2>;
+				apple,dvfs-request-class = <0x25>;
 			};
 
 			pmp_report_msr: report@b {
