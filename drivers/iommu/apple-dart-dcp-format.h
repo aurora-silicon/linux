@@ -54,6 +54,8 @@ struct dcp_adt_instance {
 
 static const u32 dcp_adt_kinds_internal[] = {1, 0, 10, 2, 2, 2, 2};
 static const u32 dcp_adt_kinds_external[] = {1, 0, 10, 2};
+/* T8132 main external DCP (iop-dcp-nub lists six segments). */
+static const u32 dcp_adt_kinds_main_external[] = {1, 0, 10, 2, 2, 2};
 
 static const struct dcp_adt_instance dcp_adt_internal = {
 	.dart = "dart-dcp",
@@ -63,6 +65,17 @@ static const struct dcp_adt_instance dcp_adt_internal = {
 	.segment_names = "__TEXT;__DATA;__OS_LOG;unknown;unknown;unknown;unknown",
 	.kinds = dcp_adt_kinds_internal,
 	.num_segments = ARRAY_SIZE(dcp_adt_kinds_internal),
+};
+
+/* Main external DCP: internal node names and six firmware segments. */
+static const struct dcp_adt_instance dcp_adt_main_external = {
+	.dart = "dart-dcp",
+	.dcp = "dcp",
+	.nub = "iop-dcp-nub",
+	.disp = "dart-disp0",
+	.segment_names = "__TEXT;__DATA;__OS_LOG;unknown;unknown;unknown",
+	.kinds = dcp_adt_kinds_main_external,
+	.num_segments = ARRAY_SIZE(dcp_adt_kinds_main_external),
 };
 
 /* The external DCPs run the same firmware with a single extra segment. */
@@ -383,10 +396,12 @@ static inline int dcp_adt_parse_instance(const void *data, size_t size,
 
 /* Parse metadata only: live MMIO, RAM exclusion and page tables remain unproven. */
 static inline int dcp_adt_parse_frontend(const void *data, size_t size,
+					const struct dcp_adt_instance *inst,
 					struct dcp_adt_tables *firmware,
 					struct dcp_adt_frontend *frontend)
 {
-	int ret = dcp_adt_parse_common(data, size, &dcp_adt_internal, firmware, frontend);
+	int ret = dcp_adt_parse_common(data, size, inst ? inst : &dcp_adt_internal,
+				       firmware, frontend);
 
 	if (ret)
 		return ret;
