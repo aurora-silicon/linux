@@ -1547,6 +1547,44 @@ impl Pair {
         Ok(true)
     }
 
+    /// Evidence for a group whose watchdog expired: whether the firmware consumed its ring
+    /// entries (the cursors) and whether its halves ran (the pass record, which the tiler and
+    /// fragment processing write). It separates work the firmware never picked up from work it
+    /// started and never finished, which the error alone does not say. The first few groups of a
+    /// boot report; the rest would repeat them.
+    pub(crate) fn report_timeout(&self, stamps: [u32; 2], state: u32) {
+        static REPORTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        if REPORTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= 4 {
+            return;
+        }
+        let Some(front) = self.active.front() else {
+            return;
+        };
+        let ordinal = front.ticket.ordinal;
+        let Ok(snapshot) = observation::snapshot(&self.memory, ordinal) else {
+            pr_warn!(
+                "G17: render timeout slot {} ordinal {}: its graph could not be read\n",
+                self.slot,
+                ordinal
+            );
+            return;
+        };
+        pr_warn!(
+            "G17: render timeout slot {} ordinal {} qids {:?}: stamps [{:#x}, {:#x}], recovery state {}, pass [{:#x}, {:#x}], tiler {:?}, fragment {:?}, job list {}\n",
+            self.slot,
+            ordinal,
+            self.qids(),
+            stamps[0],
+            stamps[1],
+            state,
+            snapshot.pass[0],
+            snapshot.pass[1],
+            snapshot.cursors[0],
+            snapshot.cursors[1],
+            if snapshot.job_list_empty { "empty" } else { "not empty" }
+        );
+    }
+
     fn selected(&self, masks: Option<[u64; 2]>) -> bool {
         masks.is_none_or(|masks| completion_noted(self.qids(), masks))
     }

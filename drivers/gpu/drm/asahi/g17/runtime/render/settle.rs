@@ -90,6 +90,7 @@ impl crate::g17::Firmware {
                     .as_mut()
                     .and_then(|entry| entry.pair.as_mut())
                 {
+                    pair.report_timeout(stamps, state);
                     pair.expire_stamp_wait(packet, stamps, state)?;
                 }
             }
