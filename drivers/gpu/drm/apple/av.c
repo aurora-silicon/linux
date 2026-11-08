@@ -697,6 +697,18 @@ static const struct apple_epic_service_ops av_desktop_ops[] = {
 		.report = av_audiosrv_report,
 		.teardown = av_audiosrv_teardown,
 	},
+	{
+		/*
+		 * The same endpoint also publishes the processor's CEC
+		 * interface, cut to "dcpav-cec-interface-ep" as above. The
+		 * host makes no use of CEC: take it and drop its reports.
+		 */
+		.name = "dcpav-cec-interface-epic",
+		.compact_full = "dcpav-cec-interface-epic:0",
+		.init = av_cec_init,
+		.report = av_cec_report,
+		.teardown = av_cec_teardown,
+	},
 	{}
 };
 #endif

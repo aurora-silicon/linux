@@ -463,6 +463,9 @@ static void av_desktop_service_admission(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, afk_compact_cut_of(ops, "dcpav-audio-interface-epic:0"));
 	KUNIT_EXPECT_FALSE(test, afk_compact_cut_of(ops, "dcpav-audio-epic"));
 	KUNIT_EXPECT_FALSE(test, afk_compact_cut_of(&avep_ops[0], "DCPAVSimpleVideoInter"));
+	/* The CEC interface the same endpoint publishes, as it arrives on the J616s */
+	KUNIT_EXPECT_TRUE(test, afk_compact_cut_of(&av_desktop_ops[1], "dcpav-cec-interface-ep"));
+	KUNIT_EXPECT_FALSE(test, afk_compact_cut_of(&av_desktop_ops[0], "dcpav-cec-interface-ep"));
 	/* Only the desktop external processor's own flag admits it. */
 	t->dcp->desktop_external = false;
 	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, name, name, 0), -EINVAL);
