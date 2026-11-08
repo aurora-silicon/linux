@@ -146,9 +146,8 @@ Limits
 - ``Prioritize Speed Over Quality`` (driver-private boolean,
   ``V4L2_CID_APPLE_AVE_PRIORITIZE_SPEED`` = codec class base ``0x1200``, off by
   default) is VideoToolbox's PrioritizeEncodingSpeedOverQuality: it sets the
-  firmware's throughput mode to 5 instead of 3. It applies to 8-bit HEVC
-  above 1280x720 (Main 10 is not measured yet) and is read when streaming
-  starts. H.264 is not faster with it, on macOS either, so it has no effect
+  firmware's throughput mode to 5 instead of 3. It applies to HEVC (Main
+  and Main 10) above 1280x720 and is read when streaming starts. H.264 is not faster with it, on macOS either, so it has no effect
   there.
 - Either three B-frames or none (``B_FRAMES`` 3 or 0). H.264 Baseline and a
   GOP size of 1 never use them.

@@ -200,12 +200,12 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	p->slots = p->bframes ? 5 : 3;
 	/*
 	 * Speed over quality changes the firmware's throughput mode from 3 to
-	 * 5, as macOS does. It is measured for 8-bit HEVC above 720p on the
-	 * 9003 layout only; H.264 does not get faster from it (on macOS
-	 * either).
+	 * 5, as macOS does. It is measured for HEVC (Main and Main 10) above
+	 * 720p on the 9003 layout only; H.264 does not get faster from it (on
+	 * macOS either).
 	 */
 	p->speed = ctx->prioritize_speed && p->codec == AVE_CODEC_HEVC &&
-		   p->sample_bytes == 1 && !ctx->ave->layout->counted &&
+		   !ctx->ave->layout->counted &&
 		   p->width * p->height > 1280 * 720;
 	p->gop = ctx->gop_size ?: 120;
 
