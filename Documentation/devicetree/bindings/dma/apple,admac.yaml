@@ -2,13 +2,9 @@
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/dma/apple,admac.yaml#
-
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
 title: Apple Audio DMA Controller (ADMAC)
-
-maintainers:
-  - Martin Povišer <povik+lin@cutebit.org>
 
 description: |
   Apple's Audio DMA Controller (ADMAC) is used to fetch and store audio samples
@@ -18,46 +14,66 @@ description: |
   are TX-only, odd-numbered are RX-only. Individual channels are coupled to
   fixed device endpoints.
 
-select:
-  anyOf:
-    -
-      properties:
-        compatible:
-          contains:
-            enum:
-              - apple,admac
-              - apple,t6000-admac
-              - apple,t6020-admac
-              - apple,t6030-admac
-              - apple,t6031-admac
-              - apple,t6041-admac
-              - apple,t6050-admac
-              - apple,t8103-admac
-              - apple,t8112-admac
-              - apple,t8122-admac
-              - apple,t8132-admac
-              - apple,t8140-admac
-      required:
-        - compatible
-    -
-      properties:
-        compatible:
-          items:
-            -
-              const: apple,t6050-admac
-            -
-              const: apple,admac
-      required:
-        - compatible
+maintainers:
+  - Martin Povišer <povik+lin@cutebit.org>
+
+allOf:
+  - $ref: dma-controller.yaml#
 
 properties:
-  compatible: true
-  reg: true
-  "#dma-cells": true
+  compatible:
+    oneOf:
+      - items:
+          - const: apple,t6020-admac
+          - const: apple,t8103-admac
+      - items:
+          - enum:
+              # Do not add additional SoC to this list.
+              - apple,t6000-admac
+              - apple,t8103-admac
+              - apple,t8112-admac
+          - const: apple,admac
+      - items:
+          - enum:
+              - apple,t6030-admac
+              - apple,t6031-admac
+          - const: apple,t8122-admac
+      - const: apple,t8122-admac
+      - const: apple,t8140-admac
+      - const: apple,t8132-admac
+      - items:
+          - const: apple,t6041-admac
+          - const: apple,t8132-admac
+      - items:
+          - const: apple,t6050-admac
+          - const: apple,t8140-admac
+
+  reg:
+    maxItems: 1
+
+  '#dma-cells':
+    const: 1
+    description:
+      Clients specify a single cell with channel number. Logical IDs alternate
+      TX and RX, including T8132 controllers with separate register banks.
+
   dma-channels:
     maximum: 32
-  interrupts: true
-  iommus: true
+
+  interrupts:
+    minItems: 4
+    maxItems: 4
+    description:
+      Interrupts that correspond to the 4 IRQ outputs of the controller. Usually
+      only one of the controller outputs will be connected as an usable interrupt
+      source. The remaining interrupts will be left without a valid value, e.g.
+      in an interrupts-extended list the disconnected positions will contain
+      an empty phandle reference <0>.
+
+  iommus:
+    minItems: 1
+    maxItems: 2
+
   apple,dma-range:
     $ref: /schemas/types.yaml#/definitions/uint64-array
     minItems: 2
@@ -66,144 +82,23 @@ properties:
       Host DMA allocation window as a base and nonzero size. T8140 ADMAC
       instances share firmware-owned AOP DART roots and use windows assigned
       to their own streams. If absent, the DART allocation aperture applies.
+
   nonposted-mmio: true
-  power-domains: true
-  resets: true
-  clocks: true
-  status: true
 
-additionalProperties: true
+  power-domains:
+    maxItems: 1
 
-allOf:
-  - if:
-      anyOf:
-        -
-          properties:
-            compatible:
-              items:
-                -
-                  const: apple,t6050-admac
-                -
-                  const: apple,admac
-            status:
-              const: disabled
-          required:
-            - compatible
-            - status
-    then:
-      oneOf:
-        -
-          description: |
-            T6050 native resource description. Firmware ownership, backend support and enables require
-            separate qualification. This variant remains disabled and contains no programming sequences or
-            firmware data.
-          properties:
-            compatible:
-              items:
-                -
-                  const: apple,t6050-admac
-                -
-                  const: apple,admac
-            status:
-              const: disabled
-            reg:
-              minItems: 2
-              maxItems: 2
-              description: |
-                Native register apertures in hardware-interface order, including shared auxiliary views.
-            interrupts:
-              maxItems: 1
-            iommus:
-              maxItems: 1
-            "#dma-cells":
-              const: 1
-          required:
-            - compatible
-            - reg
-            - status
-            - interrupts
-            - "#dma-cells"
-          additionalProperties: false
-    else:
-      allOf:
-        - $ref: dma-controller.yaml#
-      properties:
-        compatible:
-          oneOf:
-            - items:
-                - const: apple,t6050-admac
-                - const: apple,t8140-admac
-            - items:
-                - const: apple,t6020-admac
-                - const: apple,t8103-admac
-            - items:
-                - enum:
-                    # Do not add additional SoC to this list.
-                    - apple,t6000-admac
-                    - apple,t8103-admac
-                    - apple,t8112-admac
-                - const: apple,admac
-            - items:
-                - enum:
-                    - apple,t6030-admac
-                    - apple,t6031-admac
-                - const: apple,t8122-admac
-            - const: apple,t8122-admac
-            - const: apple,t8140-admac
-            - const: apple,t8132-admac
-            - items:
-                - const: apple,t6041-admac
-                - const: apple,t8132-admac
+  resets:
+    maxItems: 1
 
-        reg:
-          maxItems: 1
+required:
+  - compatible
+  - reg
+  - '#dma-cells'
+  - dma-channels
+  - interrupts
 
-        '#dma-cells':
-          const: 1
-          description:
-            Clients specify a single cell with channel number. Logical IDs alternate
-            TX and RX, including T8132 controllers with separate register banks.
-
-        dma-channels:
-          maximum: 32
-
-        interrupts:
-          minItems: 4
-          maxItems: 4
-          description:
-            Interrupts that correspond to the 4 IRQ outputs of the controller. Usually
-            only one of the controller outputs will be connected as an usable interrupt
-            source. The remaining interrupts will be left without a valid value, e.g.
-            in an interrupts-extended list the disconnected positions will contain
-            an empty phandle reference <0>.
-
-        iommus:
-          minItems: 1
-          maxItems: 2
-
-        apple,dma-range:
-          $ref: /schemas/types.yaml#/definitions/uint64-array
-          minItems: 2
-          maxItems: 2
-          description:
-            Host DMA allocation window as a base and nonzero size. T8140 ADMAC
-            instances share firmware-owned AOP DART roots and use windows assigned
-            to their own streams. If absent, the DART allocation aperture applies.
-
-        nonposted-mmio: true
-
-        power-domains:
-          maxItems: 1
-
-        resets:
-          maxItems: 1
-      required:
-        - compatible
-        - reg
-        - '#dma-cells'
-        - dma-channels
-        - interrupts
-      additionalProperties: false
+additionalProperties: false
 
 examples:
   - |

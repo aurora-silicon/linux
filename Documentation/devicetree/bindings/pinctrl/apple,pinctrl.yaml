@@ -2,7 +2,6 @@
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/pinctrl/apple,pinctrl.yaml#
-
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
 title: Apple GPIO controller
@@ -15,71 +14,77 @@ description: |
   controller present on Apple ARM SoC platforms, including various
   iPhone and iPad devices and the "Apple Silicon" Macs.
 
-select:
-  anyOf:
-    -
-      properties:
-        compatible:
-          contains:
-            enum:
-              - apple,pinctrl
-              - apple,s5l8960x-pinctrl
-              - apple,s8000-pinctrl
-              - apple,t6000-pinctrl
+properties:
+  compatible:
+    oneOf:
+      - items:
+          - enum:
               - apple,t6020-pinctrl
               - apple,t6030-pinctrl
               - apple,t6031-pinctrl
               - apple,t6041-pinctrl
               - apple,t6050-pinctrl
-              - apple,t7000-pinctrl
-              - apple,t8010-pinctrl
-              - apple,t8015-pinctrl
-              - apple,t8103-pinctrl
-              - apple,t8112-pinctrl
               - apple,t8122-pinctrl
               - apple,t8132-pinctrl
               - apple,t8140-pinctrl
               - apple,t8152-pinctrl
-      required:
-        - compatible
-    -
-      properties:
-        compatible:
-          items:
-            -
-              const: apple,t6050-pinctrl
-            -
-              const: apple,t8103-pinctrl
-      required:
-        - compatible
+          - const: apple,t8103-pinctrl
+      - items:
+          - const: apple,t6050-pinctrl
+          - const: apple,t8132-pinctrl
+      - items:
+          # Do not add additional SoC to this list.
+          - enum:
+              - apple,s5l8960x-pinctrl
+              - apple,t7000-pinctrl
+              - apple,s8000-pinctrl
+              - apple,t8010-pinctrl
+              - apple,t8015-pinctrl
+              - apple,t8103-pinctrl
+              - apple,t8112-pinctrl
+              - apple,t6000-pinctrl
+          - const: apple,pinctrl
 
-properties:
-  compatible: true
-  reg: true
-  clocks: true
+  reg:
+    maxItems: 1
+
+  clocks:
+    maxItems: 1
+
   gpio-controller: true
-  "#gpio-cells": true
+
+  '#gpio-cells':
+    const: 2
+
   gpio-ranges:
     maxItems: 1
+
   apple,irq-group-base:
     $ref: /schemas/types.yaml#/definitions/uint32
     maximum: 6
     default: 0
-    description: |
-      First interrupt group owned by this host. Interrupts lists consecutive
-      groups starting at this index. The loader must preserve any groups
-      owned by resident firmware. The range must end before group seven.
+    description: First hardware interrupt group owned by the host.
+
   apple,npins:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: The number of pins in this GPIO controller.
+
   gpio-reserved-ranges: true
-  interrupts: true
+
+  interrupts:
+    description: One interrupt for each of the (up to 7) interrupt
+      groups supported by the controller sorted by interrupt group
+      number in ascending order.
+    minItems: 1
+    maxItems: 7
+
   interrupt-controller: true
-  "#interrupt-cells": true
-  power-domains: true
-  iommus: true
-  resets: true
-  status: true
+
+  '#interrupt-cells':
+    const: 2
+
+  power-domains:
+    maxItems: 1
 
 patternProperties:
   '-pins$':
@@ -98,154 +103,18 @@ patternProperties:
 
     additionalProperties: false
 
-additionalProperties: true
-
 allOf:
-  - if:
-      anyOf:
-        -
-          properties:
-            compatible:
-              items:
-                -
-                  const: apple,t6050-pinctrl
-                -
-                  const: apple,t8103-pinctrl
-            status:
-              const: disabled
-          required:
-            - compatible
-            - status
-    then:
-      oneOf:
-        -
-          description: |
-            T6050 native resource description. Firmware ownership, backend support and enables require
-            separate qualification. This variant remains disabled and contains no programming sequences or
-            firmware data.
-          properties:
-            compatible:
-              items:
-                -
-                  const: apple,t6050-pinctrl
-                -
-                  const: apple,t8103-pinctrl
-            status:
-              const: disabled
-            reg:
-              maxItems: 1
-              description: |
-                Native register apertures in hardware-interface order, including shared auxiliary views.
-            interrupts:
-              minItems: 7
-              maxItems: 7
-          required:
-            - compatible
-            - reg
-            - status
-            - interrupts
-          additionalProperties: false
-    else:
-      properties:
-        compatible:
-          oneOf:
-            - items:
-                - const: apple,t6050-pinctrl
-                - const: apple,t8132-pinctrl
-            - items:
-                - enum:
-                    - apple,t6020-pinctrl
-                    - apple,t6030-pinctrl
-                    - apple,t6031-pinctrl
-                    - apple,t6041-pinctrl
-                    - apple,t8122-pinctrl
-                    - apple,t8132-pinctrl
-                    - apple,t8140-pinctrl
-                    - apple,t8152-pinctrl
-                    - apple,t6050-pinctrl
-                - const: apple,t8103-pinctrl
-            - items:
-                # Do not add additional SoC to this list.
-                - enum:
-                    - apple,s5l8960x-pinctrl
-                    - apple,t7000-pinctrl
-                    - apple,s8000-pinctrl
-                    - apple,t8010-pinctrl
-                    - apple,t8015-pinctrl
-                    - apple,t8103-pinctrl
-                    - apple,t8112-pinctrl
-                    - apple,t6000-pinctrl
-                - const: apple,pinctrl
+  - $ref: pinctrl.yaml#
 
-        reg:
-          maxItems: 1
+required:
+  - compatible
+  - reg
+  - gpio-controller
+  - '#gpio-cells'
+  - gpio-ranges
+  - apple,npins
 
-        clocks:
-          maxItems: 1
-
-        gpio-controller: true
-
-        '#gpio-cells':
-          const: 2
-
-        gpio-ranges:
-          maxItems: 1
-
-        apple,irq-group-base:
-          $ref: /schemas/types.yaml#/definitions/uint32
-          maximum: 6
-          default: 0
-          description: |
-            First interrupt group owned by this host. Interrupts lists consecutive
-            groups starting at this index. The loader must preserve any groups
-            owned by resident firmware. The range must end before group seven.
-
-        apple,npins:
-          $ref: /schemas/types.yaml#/definitions/uint32
-          description: The number of pins in this GPIO controller.
-
-        gpio-reserved-ranges: true
-
-        interrupts:
-          description: One interrupt for each of the (up to 7) interrupt
-            groups supported by the controller sorted by interrupt group
-            number in ascending order.
-          minItems: 1
-          maxItems: 7
-
-        interrupt-controller: true
-
-        '#interrupt-cells':
-          const: 2
-
-        power-domains:
-          maxItems: 1
-      patternProperties:
-        '-pins$':
-          type: object
-          $ref: pinmux-node.yaml#
-
-          properties:
-            pinmux:
-              description:
-                Values are constructed from pin number and alternate function
-                configuration number using the APPLE_PINMUX() helper macro
-                defined in include/dt-bindings/pinctrl/apple.h.
-
-          required:
-            - pinmux
-
-          additionalProperties: false
-      allOf:
-        - $ref: pinctrl.yaml#
-      required:
-        - compatible
-        - reg
-        - gpio-controller
-        - '#gpio-cells'
-        - gpio-ranges
-        - apple,npins
-      additionalProperties: false
+additionalProperties: false
 
 examples:
   - |

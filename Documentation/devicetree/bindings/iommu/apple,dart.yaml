@@ -2,7 +2,6 @@
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/iommu/apple,dart.yaml#
-
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
 title: Apple DART IOMMU
@@ -21,45 +20,41 @@ description: |+
   This DART IOMMU also raises interrupts in response to various
   fault conditions.
 
-select:
-  anyOf:
-    -
-      properties:
-        compatible:
-          contains:
-            enum:
+properties:
+  compatible:
+    oneOf:
+      - items:
+          - const: apple,t6000-display-dart
+          - const: apple,t6000-dart
+          - const: apple,t8110-dart
+      - enum:
+          - apple,t8103-dart
+          - apple,t8103-usb4-dart
+          - apple,t8110-dart
+          - apple,t6000-dart
+      - items:
+          - const: apple,t8140-ane-dart
+          - const: apple,t8140-dart
+          - const: apple,t8110-dart
+      - items:
+          - enum:
               - apple,t6000-dart
-              - apple,t6000-display-dart
+              - apple,t8112-dart
+          - const: apple,t8110-dart
+      - items:
+          - enum:
               - apple,t6020-dart
               - apple,t6030-dart
               - apple,t6031-dart
               - apple,t6041-dart
               - apple,t6050-dart
-              - apple,t8103-dart
-              - apple,t8103-usb4-dart
-              - apple,t8110-dart
-              - apple,t8112-dart
               - apple,t8122-dart
               - apple,t8132-dart
-              - apple,t8140-ane-dart
               - apple,t8140-dart
               - apple,t8142-dart
               - apple,t8152-dart
-      required:
-        - compatible
-    -
-      properties:
-        compatible:
-          items:
-            -
-              const: apple,t6050-dart
-            -
-              const: apple,t8110-dart
-      required:
-        - compatible
+          - const: apple,t8110-dart
 
-properties:
-  compatible: true
   apple,managed-sids:
     $ref: /schemas/types.yaml#/definitions/uint32-array
     items:
@@ -76,13 +71,41 @@ properties:
       host describe the same two ordinary streams. Error reporting must
       already be unmasked at admission; the OS preserves the inherited global
       error-mask policy rather than changing it for these streams.
-  reg: true
-  reg-names: true
-  interrupts: true
-  clocks: true
-  "#iommu-cells": true
+
+  reg:
+    minItems: 1
+    items:
+      - description: DART registers
+      - description:
+          Address filter (DAPF) registers, which restrict the physical
+          addresses the DART lets its masters reach
+
+  reg-names:
+    minItems: 1
+    items:
+      - const: dart
+      - enum: [dapf, auxiliary]
+
+  interrupts:
+    maxItems: 1
+
+  clocks:
+    description:
+      Reference to the gate clock phandle if required for this IOMMU.
+      Optional since not all IOMMUs are attached to a clock gate.
+
+  '#iommu-cells':
+    enum: [1, 5]
+    description:
+      One cell describes the stream ID emitted by a master. Five cells
+      describe the stream ID followed by the 64-bit base and length of its
+      device-visible DMA window.
+
   nonposted-mmio: true
-  power-domains: true
+
+  power-domains:
+    maxItems: 1
+
   apple,dma-range:
     $ref: /schemas/types.yaml#/definitions/uint64-array
     minItems: 2
@@ -92,12 +115,14 @@ properties:
       IOMMU DMA allocator restricts mappings to this range; high address bits
       may select a firmware-visible alias of the translation aperture.
       A consumer may further specify its own aperture in its binding.
+
   apple,dma-offset:
     $ref: /schemas/types.yaml#/definitions/uint64
     description: >
       Offset added to device-visible DMA addresses when indexing the DART page
       tables. This models host bridges which alias a low PCI bus aperture into
       a high DART translation window.
+
   apple,firmware-root-handoff:
     $ref: /schemas/types.yaml#/definitions/uint32
     const: 1
@@ -106,6 +131,7 @@ properties:
       table pages as normal RAM and completed the display coprocessor power
       handoff. Linux retains occupied root slots and excludes their entire
       IOVA spans from allocation. This does not assert immutable descendants.
+
   apple,tunable:
     $ref: /schemas/types.yaml#/definitions/uint32-matrix
     items:
@@ -117,6 +143,7 @@ properties:
       List of (register offset, mask, value) tuples copied from Apple's Device
       Tree by the bootloader and required to initialize dynamically powered
       DART instances.
+
   apple,bypass-sids:
     $ref: /schemas/types.yaml#/definitions/uint32-array
     minItems: 1
@@ -124,23 +151,10 @@ properties:
     items:
       maximum: 255
     description:
-      Streams set to bypass after every reset of the DART, outside any domain.
-      On a USB4 PCIe tunnel DART, the reserved streams its PCIe-C port issues
+      Reserved streams of a USB4 PCIe tunnel DART that its PCIe-C port issues
       its own writes on, such as the interrupt controller writes its MSIs
-      turn into. On a T8110 DART that nothing initialises before Linux, such
-      as a USB4 router's, the streams its co-processor uses without
-      translation.
-  apple,full-error-reporting:
-    type: boolean
-    description:
-      Unmask every error and enable the error interrupt for every stream,
-      with the registers of the DART's revision, and leave the DART unlocked
-      on error. For a T8110 DART that nothing initialises before Linux.
-  apple,ctc-flush:
-    type: boolean
-    description:
-      Flush the DART's context cache after a stream flush, where the DART
-      has one. For a T8110 DART that nothing initialises before Linux.
+      turn into. They are set to bypass after every reset of the DART.
+
   apple,remap-streams:
     $ref: /schemas/types.yaml#/definitions/uint32-matrix
     minItems: 1
@@ -155,267 +169,36 @@ properties:
       T8110 stream remaps. A source uses the destination stream's translation
       and filtering state without a separate page-table root. Source and
       destination must differ, and both must exist on the controller.
-  iommus: true
-  resets: true
-  status: true
 
-additionalProperties: true
+required:
+  - compatible
+  - reg
+  - '#iommu-cells'
+  - interrupts
 
 allOf:
   - if:
-      anyOf:
-        -
-          properties:
-            compatible:
-              items:
-                -
-                  const: apple,t6050-dart
-                -
-                  const: apple,t8110-dart
-            status:
-              const: disabled
-          required:
-            - compatible
-            - status
-    then:
-      oneOf:
-        -
-          description: |
-            T6050 native resource description. Firmware ownership, backend support and enables require
-            separate qualification. This variant remains disabled and contains no programming sequences or
-            firmware data.
-          properties:
-            compatible:
-              items:
-                -
-                  const: apple,t6050-dart
-                -
-                  const: apple,t8110-dart
-            status:
-              const: disabled
-            reg:
-              minItems: 1
-              maxItems: 6
-              description: |
-                Native register apertures in hardware-interface order, including shared auxiliary views.
-            interrupts:
-              maxItems: 1
-            power-domains:
-              maxItems: 1
-            "#iommu-cells":
-              const: 1
-            apple,dma-range:
-              $ref: /schemas/types.yaml#/definitions/uint64-array
-              minItems: 2
-              maxItems: 2
-              description: Device-visible DMA base and size.
-            apple,dma-offset:
-              $ref: /schemas/types.yaml#/definitions/uint64
-              description: Offset of the device-visible translation window.
-            reg-names:
-              minItems: 1
-              maxItems: 5
-            nonposted-mmio: true
-          required:
-            - compatible
-            - reg
-            - status
-            - interrupts
-            - "#iommu-cells"
-          additionalProperties: false
-    else:
       properties:
         compatible:
-          oneOf:
-            - items:
-                - const: apple,t6000-display-dart
-                - const: apple,t6000-dart
-                - const: apple,t8110-dart
-            - enum:
-                - apple,t8103-dart
-                - apple,t8103-usb4-dart
-                - apple,t8110-dart
-                - apple,t6000-dart
-            - items:
-                - const: apple,t8140-ane-dart
-                - const: apple,t8140-dart
-                - const: apple,t8110-dart
-            - items:
-                - enum:
-                    - apple,t6000-dart
-                    - apple,t8112-dart
-                - const: apple,t8110-dart
-            - items:
-                - enum:
-                    - apple,t6020-dart
-                    - apple,t6030-dart
-                    - apple,t6031-dart
-                    - apple,t6041-dart
-                    - apple,t6050-dart
-                    - apple,t8122-dart
-                    - apple,t8132-dart
-                    - apple,t8140-dart
-                    - apple,t8142-dart
-                    - apple,t8152-dart
-                - const: apple,t8110-dart
-
-        apple,managed-sids:
-          $ref: /schemas/types.yaml#/definitions/uint32-array
-          items:
-            - const: 1
-            - const: 2
-          description: >
-            J713 radio ordinary stream ownership profile. Only these inactive
-            normal streams and their exact-RID entries may be adopted by the OS.
-            Other streams and RID entries remain inherited. The documented static
-            SID16 bypass role may be initialized only from a disabled stream with
-            no valid root; an existing bypass remains unchanged. PIODMA and other
-            reserved roles are not modified. This does not authorize a controller
-            reset or takeover of active page tables. Both the radio DART and PCI
-            host describe the same two ordinary streams. Error reporting must
-            already be unmasked at admission; the OS preserves the inherited global
-            error-mask policy rather than changing it for these streams.
-
+          contains:
+            const: apple,t6000-display-dart
+    then:
+      properties:
         reg:
-          minItems: 1
-          items:
-            - description: DART registers
-            - description:
-                Address filter (DAPF) registers, which restrict the physical
-                addresses the DART lets its masters reach
-
-        reg-names:
-          minItems: 1
-          items:
-            - const: dart
-            - enum: [dapf, auxiliary]
-
-        interrupts:
-          maxItems: 1
-
-        clocks:
-          description:
-            Reference to the gate clock phandle if required for this IOMMU.
-            Optional since not all IOMMUs are attached to a clock gate.
-
-        '#iommu-cells':
-          enum: [1, 5]
-          description:
-            One cell describes the stream ID emitted by a master. Five cells
-            describe the stream ID followed by the 64-bit base and length of its
-            device-visible DMA window.
-
-        nonposted-mmio: true
-
-        power-domains:
-          maxItems: 1
-
-        apple,dma-range:
-          $ref: /schemas/types.yaml#/definitions/uint64-array
           minItems: 2
-          maxItems: 2
-          description: >
-            Device-visible DMA aperture encoded as a base and a nonzero size. The
-            IOMMU DMA allocator restricts mappings to this range; high address bits
-            may select a firmware-visible alias of the translation aperture.
-            A consumer may further specify its own aperture in its binding.
-
-        apple,dma-offset:
-          $ref: /schemas/types.yaml#/definitions/uint64
-          description: >
-            Offset added to device-visible DMA addresses when indexing the DART page
-            tables. This models host bridges which alias a low PCI bus aperture into
-            a high DART translation window.
-
-        apple,firmware-root-handoff:
-          $ref: /schemas/types.yaml#/definitions/uint32
-          const: 1
-          description: >
-            The bootloader has reserved the actual three-level locked root and leaf
-            table pages as normal RAM and completed the display coprocessor power
-            handoff. Linux retains occupied root slots and excludes their entire
-            IOVA spans from allocation. This does not assert immutable descendants.
-
-        apple,tunable:
-          $ref: /schemas/types.yaml#/definitions/uint32-matrix
-          items:
-            items:
-              - description: Register offset
-              - description: Mask to be applied to the register value
-              - description: Bits to be set after applying the mask
-          description: >
-            List of (register offset, mask, value) tuples copied from Apple's Device
-            Tree by the bootloader and required to initialize dynamically powered
-            DART instances.
-
-        apple,bypass-sids:
-          $ref: /schemas/types.yaml#/definitions/uint32-array
-          minItems: 1
-          maxItems: 8
-          items:
-            maximum: 255
-          description:
-            Streams set to bypass after every reset of the DART, outside any domain.
-            On a USB4 PCIe tunnel DART, the reserved streams its PCIe-C port issues
-            its own writes on, such as the interrupt controller writes its MSIs
-            turn into. On a T8110 DART that nothing initialises before Linux, such
-            as a USB4 router's, the streams its co-processor uses without
-            translation.
-
-        apple,full-error-reporting:
-          type: boolean
-          description:
-            Unmask every error and enable the error interrupt for every stream,
-            with the registers of the DART's revision, and leave the DART unlocked
-            on error. For a T8110 DART that nothing initialises before Linux.
-
-        apple,ctc-flush:
-          type: boolean
-          description:
-            Flush the DART's context cache after a stream flush, where the DART
-            has one. For a T8110 DART that nothing initialises before Linux.
-
-        apple,remap-streams:
-          $ref: /schemas/types.yaml#/definitions/uint32-matrix
-          minItems: 1
-          maxItems: 256
-          items:
-            items:
-              - description: Source stream ID, unique within this list.
-                maximum: 255
-              - description: Destination stream ID, which must not itself be remapped.
-                maximum: 15
-          description:
-            T8110 stream remaps. A source uses the destination stream's translation
-            and filtering state without a separate page-table root. Source and
-            destination must differ, and both must exist on the controller.
       required:
-        - compatible
+        - reg-names
+  - if:
+      properties:
+        reg:
+          minItems: 2
+      required:
         - reg
-        - '#iommu-cells'
-        - interrupts
-      allOf:
-        - if:
-            properties:
-              compatible:
-                contains:
-                  const: apple,t6000-display-dart
-          then:
-            properties:
-              reg:
-                minItems: 2
-            required:
-              - reg-names
-        - if:
-            properties:
-              reg:
-                minItems: 2
-            required:
-              - reg
-          then:
-            required:
-              - reg-names
-      additionalProperties: false
+    then:
+      required:
+        - reg-names
+
+additionalProperties: false
 
 examples:
   - |+

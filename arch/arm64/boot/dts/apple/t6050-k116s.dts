@@ -1,12 +1,24 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
-/dts-v1/;
+/*
+ * MacBook Pro (16-inch PROLED XDR, M5 Pro, 2026)
+ *
+ * target-type: K116s (Mac17,12)
+ *
+ * Preliminary: described from the ADT only, not yet booted on the hardware.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
 
-#define T6050_K116S
-#include "t6050.dtsi"
-#include "t6050-peripherals.dtsi"
+#include "t6050-k114-k116.dtsi"
 
 / {
-	model = "Apple K116S";
 	compatible = "apple,k116s", "apple,t6050", "apple,arm-platform";
-	chassis-type = "laptop";
+	model = "Apple MacBook Pro (16-inch PROLED XDR, M5 Pro, 2026)";
 };
+
+&mtp_multitouch {
+	firmware-name = "apple/tpmtfw-k116s.bin";
+};
+
+#define T6050_K116S
+#include "t6050-peripherals.dtsi"

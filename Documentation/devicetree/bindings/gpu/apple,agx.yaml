@@ -2,7 +2,6 @@
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/gpu/apple,agx.yaml#
-
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
 title: Apple SoC GPU
@@ -10,57 +9,85 @@ title: Apple SoC GPU
 maintainers:
   - Sasha Finkelstein <k@chaosmail.tech>
 
-select:
-  anyOf:
-    -
-      properties:
-        compatible:
-          contains:
-            enum:
+properties:
+  compatible:
+    oneOf:
+      - enum:
+          - apple,agx-g13g
+          - apple,agx-g13s
+          - apple,agx-g14g
+          - apple,agx-g14s
+          - apple,agx-t6040
+          - apple,agx-t6041
+          - apple,agx-t8132
+          - apple,agx-t8140
+      - items:
+          - const: apple,agx-t8103
+          - const: apple,agx-g13g
+      - items:
+          - const: apple,agx-t8112
+          - const: apple,agx-g14g
+      - items:
+          - enum:
               - apple,agx-g13c
               - apple,agx-g13d
-              - apple,agx-g13g
-              - apple,agx-g13s
+          - const: apple,agx-g13s
+      - items:
+          - enum:
               - apple,agx-g14c
               - apple,agx-g14d
-              - apple,agx-g14g
-              - apple,agx-g14s
-              - apple,agx-t6040
-              - apple,agx-t6041
-              - apple,agx-t8103
-              - apple,agx-t8112
-              - apple,agx-t8132
-              - apple,agx-t8140
-      required:
-        - compatible
-    -
-      properties:
-        compatible:
-          items:
-            -
-              const: apple,t6050-gpu
-            -
-              const: apple,gpu
-      required:
-        - compatible
+          - const: apple,agx-g14s
 
-properties:
-  compatible: true
-  reg: true
-  reg-names: true
-  power-domains: true
+  reg:
+    maxItems: 2
+
+  reg-names:
+    maxItems: 2
+
+  power-domains:
+    maxItems: 1
+
   dma-noncoherent: true
+
   mboxes:
     minItems: 1
     maxItems: 2
-  memory-region: true
-  memory-region-names: true
+
+  memory-region:
+    minItems: 3
+    items:
+      - description: Region containing GPU MMU TTBs
+      - description: Region containing GPU MMU page tables
+      - description:
+          Region containing a shared handoff structure for VM
+          management coordination
+      - description:
+          Power calibration blob, firmware shared-L2 page or firmware data
+          segment
+      - description:
+          GPU calibration blob, preserved firmware text or firmware
+          kernel-window page tables
+      - description:
+          Shared global variables, preserved firmware data or text segment of
+          the loaded GPU firmware
+
+  memory-region-names:
+    minItems: 3
+    items:
+      - const: ttbs
+      - const: pagetables
+      - const: handoff
+      - enum: [hw-cal-a, shared-l2, fw-data]
+      - enum: [hw-cal-b, fw-text, l2-pagetables]
+      - enum: [globals, fw-data, fw-text]
+
   apple,clpc:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: |
       Host performance controller receiving GPU submission and idle demand.
       GFX supplier power cannot represent GPU work on firmware that keeps
       its coprocessor domain powered while the cores are idle.
+
   apple,idle-off-delay-ms:
     minimum: 2
     maximum: 1000
@@ -69,10 +96,13 @@ properties:
       Continuous idle time before GPU power-off, in milliseconds. The G17
       backend extends the firmware's native delay with its host idle-hold
       control; an absent property preserves the native policy.
+
   apple,pmp:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: PMP firmware provider owning the GPU power vote and telemetry
+
   operating-points-v2: true
+
   apple,firmware-version:
     $ref: /schemas/types.yaml#/definitions/uint32-array
     minItems: 3
@@ -81,73 +111,88 @@ properties:
       Reported macOS version (major, minor, patch) whose boot firmware loaded
       the GPU firmware. Filled in by the boot loader. This is a selection
       hint; the T6040 driver requires the exact loaded image identity.
+
   apple,cs-opp:
     $ref: /schemas/types.yaml#/definitions/phandle
     description:
       Operating-point table of the GPU's CS clock domain, one voltage cell per
       state.
+
   apple,afr-opp:
     $ref: /schemas/types.yaml#/definitions/phandle
     description:
       Operating-point table of the GPU's AFR clock domain, one voltage cell
       per state.
+
   apple,t6040-handoff-version:
     $ref: /schemas/types.yaml#/definitions/uint32
     const: 2
     description:
       Written last by the boot loader after it has filled the T6040 operating
       points, memory regions and per-chip calibration. Absent in the source DT.
+
   apple,core-mask:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Enabled cores in the two ten-core T6040 clusters, low cluster first
+
   apple,max-power-mw:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Per-chip maximum GPU power in milliwatts, calculated by the loader
+
   apple,perf-base-pstate:
     $ref: /schemas/types.yaml#/definitions/uint32
     description:
       Logical base state of the frequency-relative performance table. T6040
       supports the first active state, also used when its ADT omits the property.
+
   apple,perf-map-a:
     $ref: /schemas/types.yaml#/definitions/uint32-array
     description:
       All 16 A selector register fields, indexing raw ADT operating points.
       Eleven populated entries, including off, followed by five zeros.
+
   apple,perf-map-b:
     $ref: /schemas/types.yaml#/definitions/uint32-array
     description:
       All 16 B selector register fields, indexing raw ADT operating points.
       Eleven populated entries, including off, followed by five zeros.
+
   apple,perf-relative-a:
     $ref: /schemas/types.yaml#/definitions/uint32-array
     description:
       Per-chip relative power of each populated A selector, in percent,
       followed by zeros for the five unused selectors.
+
   apple,perf-relative-b:
     $ref: /schemas/types.yaml#/definitions/uint32-array
     description:
       Relative frequency of the populated A ladder above the base state,
       in percent, followed by zeros for the five unused selectors.
+
   apple,core-leak-coef:
     $ref: /schemas/types.yaml#/definitions/uint32-array
     description:
       GPU core leakage, one coefficient per cluster. Per-chip efuse values decoded by the boot loader,
       stored as IEEE-754 binary32 bit patterns in big-endian cells.
+
   apple,sram-leak-coef:
     $ref: /schemas/types.yaml#/definitions/uint32-array
     description:
       GPU SRAM leakage, one coefficient per cluster. Per-chip efuse values decoded by the boot loader,
       stored as IEEE-754 binary32 bit patterns in big-endian cells.
+
   apple,cs-leak-coef:
     $ref: /schemas/types.yaml#/definitions/uint32-array
     description:
       CS leakage. Per-chip efuse values decoded by the boot loader,
       stored as IEEE-754 binary32 bit patterns in big-endian cells.
+
   apple,afr-leak-coef:
     $ref: /schemas/types.yaml#/definitions/uint32-array
     description:
       AFR leakage. Per-chip efuse values decoded by the boot loader,
       stored as IEEE-754 binary32 bit patterns in big-endian cells.
+
   apple,firmware-abi:
     $ref: /schemas/types.yaml#/definitions/uint32-array
     minItems: 3
@@ -155,113 +200,143 @@ properties:
       macOS version the current firmware is paired with, used to pick
       the version of firmware ABI to be used.
       Bootloader will overwrite this
-  interrupts: true
-  iommus: true
-  clocks: true
-  resets: true
-  status: true
 
-additionalProperties: true
+required:
+  - compatible
+  - reg
+  - mboxes
+  - memory-region
 
 allOf:
   - if:
-      anyOf:
-        -
-          properties:
-            compatible:
-              items:
-                -
-                  const: apple,t6050-gpu
-                -
-                  const: apple,gpu
-            status:
-              const: disabled
-          required:
-            - compatible
-            - status
-    then:
-      oneOf:
-        -
-          description: |
-            T6050 native resource description. Firmware ownership, backend support and enables require
-            separate qualification. This variant remains disabled and contains no programming sequences or
-            firmware data.
-          properties:
-            compatible:
-              items:
-                -
-                  const: apple,t6050-gpu
-                -
-                  const: apple,gpu
-            status:
-              const: disabled
-            reg:
-              minItems: 2
-              maxItems: 2
-              description: |
-                Native register apertures in hardware-interface order, including shared auxiliary views.
-            interrupts:
-              minItems: 8
-              maxItems: 8
-            power-domains:
-              maxItems: 1
-            clocks:
-              maxItems: 1
-          required:
-            - compatible
-            - reg
-            - status
-            - interrupts
-            - power-domains
-            - clocks
-          additionalProperties: false
-    else:
       properties:
         compatible:
-          oneOf:
-            - enum:
-                - apple,agx-g13g
-                - apple,agx-g13s
-                - apple,agx-g14g
-                - apple,agx-g14s
-                - apple,agx-t6040
-                - apple,agx-t6041
-                - apple,agx-t8132
-                - apple,agx-t8140
-            - items:
-                - const: apple,agx-t8103
-                - const: apple,agx-g13g
-            - items:
-                - const: apple,agx-t8112
-                - const: apple,agx-g14g
-            - items:
-                - enum:
-                    - apple,agx-g13c
-                    - apple,agx-g13d
-                - const: apple,agx-g13s
-            - items:
-                - enum:
-                    - apple,agx-g14c
-                    - apple,agx-g14d
-                - const: apple,agx-g14s
-
+          contains:
+            const: apple,agx-t8132
+    then:
+      properties:
         reg:
-          maxItems: 2
-
-        reg-names:
-          maxItems: 2
-
-        power-domains:
-          maxItems: 1
-
-        dma-noncoherent: true
-
+          items:
+            - description: GPU coprocessor control registers
+            - description: GPU block MMIO registers
         mboxes:
-          minItems: 1
-          maxItems: 2
-
+          maxItems: 1
+        reg-names:
+          items:
+            - const: asc
+            - const: sgx
         memory-region:
-          minItems: 3
+          minItems: 6
+        memory-region-names:
+          items:
+            - const: ttbs
+            - const: pagetables
+            - const: handoff
+            - const: shared-l2
+            - const: fw-text
+            - const: fw-data
+      required:
+        - apple,pmp
+        - power-domains
+        - reg-names
+        - memory-region-names
+    else:
+      properties:
+        apple,pmp: false
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,agx-t8140
+    then:
+      properties:
+        reg:
+          items:
+            - description: GFX coprocessor control registers
+            - description: GPU block MMIO registers
+        reg-names:
+          items:
+            - const: asc
+            - const: sgx
+        mboxes:
+          items:
+            - description: GFX coprocessor mailbox
+            - description: GFX1 coprocessor mailbox
+        memory-region:
+          items:
+            - description: Region containing GPU MMU TTBs
+            - description: Region containing GPU MMU page tables
+            - description:
+                Region containing a shared handoff structure for VM
+                management coordination
+        memory-region-names:
+          items:
+            - const: ttbs
+            - const: pagetables
+            - const: handoff
+      required:
+        - power-domains
+        - operating-points-v2
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,agx-t6040
+    then:
+      properties:
+        apple,core-mask:
+          minimum: 1
+          maximum: 1048575
+        apple,max-power-mw:
+          minimum: 1
+          maximum: 200000
+        apple,perf-base-pstate:
+          const: 1
+        apple,perf-map-a:
+          minItems: 16
+          maxItems: 16
+        apple,perf-map-b:
+          minItems: 16
+          maxItems: 16
+        apple,perf-relative-a:
+          minItems: 16
+          maxItems: 16
+        apple,perf-relative-b:
+          minItems: 16
+          maxItems: 16
+        apple,core-leak-coef:
+          minItems: 2
+          maxItems: 2
+        apple,sram-leak-coef:
+          minItems: 2
+          maxItems: 2
+        apple,cs-leak-coef:
+          minItems: 1
+          maxItems: 1
+        apple,afr-leak-coef:
+          minItems: 1
+          maxItems: 1
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,agx-t6040
+              - apple,agx-t6041
+    then:
+      properties:
+        reg:
+          items:
+            - description: GFX coprocessor control registers
+            - description: GPU block MMIO registers
+        reg-names:
+          items:
+            - const: asc
+            - const: sgx
+        mboxes:
+          items:
+            - description: GFX coprocessor mailbox
+        memory-region:
           items:
             - description: Region containing GPU MMU TTBs
             - description: Region containing GPU MMU page tables
@@ -269,342 +344,63 @@ allOf:
                 Region containing a shared handoff structure for VM
                 management coordination
             - description:
-                Power calibration blob, firmware shared-L2 page or firmware data
-                segment
+                Data segment of the loaded GPU firmware, where the firmware
+                places its crash log
             - description:
-                GPU calibration blob, preserved firmware text or firmware
-                kernel-window page tables
+                Region in which the GPU firmware builds the page tables of
+                its kernel window
             - description:
-                Shared global variables, preserved firmware data or text segment of
-                the loaded GPU firmware
-
+                Text segment of the loaded GPU firmware, which identifies the
+                firmware build
         memory-region-names:
-          minItems: 3
           items:
             - const: ttbs
             - const: pagetables
             - const: handoff
-            - enum: [hw-cal-a, shared-l2, fw-data]
-            - enum: [hw-cal-b, fw-text, l2-pagetables]
-            - enum: [globals, fw-data, fw-text]
-
-        apple,clpc:
-          $ref: /schemas/types.yaml#/definitions/phandle
-          description: |
-            Host performance controller receiving GPU submission and idle demand.
-            GFX supplier power cannot represent GPU work on firmware that keeps
-            its coprocessor domain powered while the cores are idle.
-
-        apple,idle-off-delay-ms:
-          minimum: 2
-          maximum: 1000
-          default: 2
-          description:
-            Continuous idle time before GPU power-off, in milliseconds. The G17
-            backend extends the firmware's native delay with its host idle-hold
-            control; an absent property preserves the native policy.
-
-        apple,pmp:
-          $ref: /schemas/types.yaml#/definitions/phandle
-          description: PMP firmware provider owning the GPU power vote and telemetry
-
-        operating-points-v2: true
-
-        apple,firmware-version:
-          $ref: /schemas/types.yaml#/definitions/uint32-array
-          minItems: 3
-          maxItems: 3
-          description:
-            Reported macOS version (major, minor, patch) whose boot firmware loaded
-            the GPU firmware. Filled in by the boot loader. This is a selection
-            hint; the T6040 driver requires the exact loaded image identity.
-
-        apple,cs-opp:
-          $ref: /schemas/types.yaml#/definitions/phandle
-          description:
-            Operating-point table of the GPU's CS clock domain, one voltage cell per
-            state.
-
-        apple,afr-opp:
-          $ref: /schemas/types.yaml#/definitions/phandle
-          description:
-            Operating-point table of the GPU's AFR clock domain, one voltage cell
-            per state.
-
-        apple,t6040-handoff-version:
-          $ref: /schemas/types.yaml#/definitions/uint32
-          const: 2
-          description:
-            Written last by the boot loader after it has filled the T6040 operating
-            points, memory regions and per-chip calibration. Absent in the source DT.
-
-        apple,core-mask:
-          $ref: /schemas/types.yaml#/definitions/uint32
-          description: Enabled cores in the two ten-core T6040 clusters, low cluster first
-
-        apple,max-power-mw:
-          $ref: /schemas/types.yaml#/definitions/uint32
-          description: Per-chip maximum GPU power in milliwatts, calculated by the loader
-
-        apple,perf-base-pstate:
-          $ref: /schemas/types.yaml#/definitions/uint32
-          description:
-            Logical base state of the frequency-relative performance table. T6040
-            supports the first active state, also used when its ADT omits the property.
-
-        apple,perf-map-a:
-          $ref: /schemas/types.yaml#/definitions/uint32-array
-          description:
-            All 16 A selector register fields, indexing raw ADT operating points.
-            Eleven populated entries, including off, followed by five zeros.
-
-        apple,perf-map-b:
-          $ref: /schemas/types.yaml#/definitions/uint32-array
-          description:
-            All 16 B selector register fields, indexing raw ADT operating points.
-            Eleven populated entries, including off, followed by five zeros.
-
-        apple,perf-relative-a:
-          $ref: /schemas/types.yaml#/definitions/uint32-array
-          description:
-            Per-chip relative power of each populated A selector, in percent,
-            followed by zeros for the five unused selectors.
-
-        apple,perf-relative-b:
-          $ref: /schemas/types.yaml#/definitions/uint32-array
-          description:
-            Relative frequency of the populated A ladder above the base state,
-            in percent, followed by zeros for the five unused selectors.
-
-        apple,core-leak-coef:
-          $ref: /schemas/types.yaml#/definitions/uint32-array
-          description:
-            GPU core leakage, one coefficient per cluster. Per-chip efuse values decoded by the boot loader,
-            stored as IEEE-754 binary32 bit patterns in big-endian cells.
-
-        apple,sram-leak-coef:
-          $ref: /schemas/types.yaml#/definitions/uint32-array
-          description:
-            GPU SRAM leakage, one coefficient per cluster. Per-chip efuse values decoded by the boot loader,
-            stored as IEEE-754 binary32 bit patterns in big-endian cells.
-
-        apple,cs-leak-coef:
-          $ref: /schemas/types.yaml#/definitions/uint32-array
-          description:
-            CS leakage. Per-chip efuse values decoded by the boot loader,
-            stored as IEEE-754 binary32 bit patterns in big-endian cells.
-
-        apple,afr-leak-coef:
-          $ref: /schemas/types.yaml#/definitions/uint32-array
-          description:
-            AFR leakage. Per-chip efuse values decoded by the boot loader,
-            stored as IEEE-754 binary32 bit patterns in big-endian cells.
-
-        apple,firmware-abi:
-          $ref: /schemas/types.yaml#/definitions/uint32-array
-          minItems: 3
-          description:
-            macOS version the current firmware is paired with, used to pick
-            the version of firmware ABI to be used.
-            Bootloader will overwrite this
+            - const: fw-data
+            - const: l2-pagetables
+            - const: fw-text
       required:
-        - compatible
-        - reg
-        - mboxes
-        - memory-region
-      allOf:
-        - if:
-            properties:
-              compatible:
-                contains:
-                  const: apple,agx-t8132
-          then:
-            properties:
-              reg:
-                items:
-                  - description: GPU coprocessor control registers
-                  - description: GPU block MMIO registers
-              mboxes:
-                maxItems: 1
-              reg-names:
-                items:
-                  - const: asc
-                  - const: sgx
-              memory-region:
-                minItems: 6
-              memory-region-names:
-                items:
-                  - const: ttbs
-                  - const: pagetables
-                  - const: handoff
-                  - const: shared-l2
-                  - const: fw-text
-                  - const: fw-data
-            required:
-              - apple,pmp
-              - power-domains
-              - reg-names
-              - memory-region-names
-          else:
-            properties:
-              apple,pmp: false
-        - if:
-            properties:
-              compatible:
-                contains:
-                  const: apple,agx-t8140
-          then:
-            properties:
-              reg:
-                items:
-                  - description: GFX coprocessor control registers
-                  - description: GPU block MMIO registers
-              reg-names:
-                items:
-                  - const: asc
-                  - const: sgx
-              mboxes:
-                items:
-                  - description: GFX coprocessor mailbox
-                  - description: GFX1 coprocessor mailbox
-              memory-region:
-                items:
-                  - description: Region containing GPU MMU TTBs
-                  - description: Region containing GPU MMU page tables
-                  - description:
-                      Region containing a shared handoff structure for VM
-                      management coordination
-              memory-region-names:
-                items:
-                  - const: ttbs
-                  - const: pagetables
-                  - const: handoff
-            required:
-              - power-domains
-              - operating-points-v2
-        - if:
-            properties:
-              compatible:
-                contains:
-                  const: apple,agx-t6040
-          then:
-            properties:
-              apple,core-mask:
-                minimum: 1
-                maximum: 1048575
-              apple,max-power-mw:
-                minimum: 1
-                maximum: 200000
-              apple,perf-base-pstate:
-                const: 1
-              apple,perf-map-a:
-                minItems: 16
-                maxItems: 16
-              apple,perf-map-b:
-                minItems: 16
-                maxItems: 16
-              apple,perf-relative-a:
-                minItems: 16
-                maxItems: 16
-              apple,perf-relative-b:
-                minItems: 16
-                maxItems: 16
-              apple,core-leak-coef:
-                minItems: 2
-                maxItems: 2
-              apple,sram-leak-coef:
-                minItems: 2
-                maxItems: 2
-              apple,cs-leak-coef:
-                minItems: 1
-                maxItems: 1
-              apple,afr-leak-coef:
-                minItems: 1
-                maxItems: 1
-        - if:
-            properties:
-              compatible:
-                contains:
-                  enum:
-                    - apple,agx-t6040
-                    - apple,agx-t6041
-          then:
-            properties:
-              reg:
-                items:
-                  - description: GFX coprocessor control registers
-                  - description: GPU block MMIO registers
-              reg-names:
-                items:
-                  - const: asc
-                  - const: sgx
-              mboxes:
-                items:
-                  - description: GFX coprocessor mailbox
-              memory-region:
-                items:
-                  - description: Region containing GPU MMU TTBs
-                  - description: Region containing GPU MMU page tables
-                  - description:
-                      Region containing a shared handoff structure for VM
-                      management coordination
-                  - description:
-                      Data segment of the loaded GPU firmware, where the firmware
-                      places its crash log
-                  - description:
-                      Region in which the GPU firmware builds the page tables of
-                      its kernel window
-                  - description:
-                      Text segment of the loaded GPU firmware, which identifies the
-                      firmware build
-              memory-region-names:
-                items:
-                  - const: ttbs
-                  - const: pagetables
-                  - const: handoff
-                  - const: fw-data
-                  - const: l2-pagetables
-                  - const: fw-text
-            required:
-              - power-domains
-              - operating-points-v2
-              - apple,cs-opp
-              - apple,afr-opp
-        - if:
-            not:
-              properties:
-                compatible:
-                  contains:
-                    enum:
-                      - apple,agx-t6040
-                      - apple,agx-t6041
-                      - apple,agx-t8132
-                      - apple,agx-t8140
-          then:
-            properties:
-              reg:
-                items:
-                  - description: GPU coprocessor control registers
-                  - description: GPU block MMIO registers
-              reg-names:
-                items:
-                  - const: asc
-                  - const: sgx
-              mboxes:
-                maxItems: 1
-              memory-region:
-                minItems: 6
-              memory-region-names:
-                items:
-                  - const: ttbs
-                  - const: pagetables
-                  - const: handoff
-                  - const: hw-cal-a
-                  - const: hw-cal-b
-                  - const: globals
-            required:
-              - apple,firmware-abi
-      additionalProperties: false
+        - power-domains
+        - operating-points-v2
+        - apple,cs-opp
+        - apple,afr-opp
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              enum:
+                - apple,agx-t6040
+                - apple,agx-t6041
+                - apple,agx-t8132
+                - apple,agx-t8140
+    then:
+      properties:
+        reg:
+          items:
+            - description: GPU coprocessor control registers
+            - description: GPU block MMIO registers
+        reg-names:
+          items:
+            - const: asc
+            - const: sgx
+        mboxes:
+          maxItems: 1
+        memory-region:
+          minItems: 6
+        memory-region-names:
+          items:
+            - const: ttbs
+            - const: pagetables
+            - const: handoff
+            - const: hw-cal-a
+            - const: hw-cal-b
+            - const: globals
+      required:
+        - apple,firmware-abi
+
+additionalProperties: false
 
 examples:
   - |

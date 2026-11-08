@@ -180,7 +180,7 @@ description: |
 
 properties:
   $nodename:
-    const: /
+    const: "/"
   compatible:
     oneOf:
       - description: Apple A7 SoC based platforms
@@ -478,20 +478,31 @@ properties:
           - const: apple,t6041
           - const: apple,arm-platform
 
-      - description: Apple T6050 SoC based platforms
+      - description: Apple M5 Pro SoC based platforms
         items:
           - enum:
-              - apple,j714c
-              - apple,j714s
-              - apple,j716c
-              - apple,j716s
-              - apple,j775c
-              - apple,j775d
-              - apple,j873s
-              - apple,k114c
-              - apple,k114s
-              - apple,k116c
-              - apple,k116s
+              - apple,j714s # MacBook Pro (14-inch, M5 Pro, 2026)
+              - apple,j716s # MacBook Pro (16-inch, M5 Pro, 2026)
+              - apple,j873s # Mac mini (M5 Pro, 2026)
+              - apple,k114s # MacBook Pro (14-inch PROLED XDR, M5 Pro, 2026)
+              - apple,k116s # MacBook Pro (16-inch PROLED XDR, M5 Pro, 2026)
+          - const: apple,t6050
+          - const: apple,arm-platform
+
+      - description: Apple M5 Max SoC based platforms
+        items:
+          - enum:
+              - apple,j714c # MacBook Pro (14-inch, M5 Max, 2026)
+              - apple,j716c # MacBook Pro (16-inch, M5 Max, 2026)
+              - apple,j775c # Mac Studio (M5 Max, 2026)
+              - apple,k114c # MacBook Pro (14-inch PROLED XDR, M5 Max, 2026)
+              - apple,k116c # MacBook Pro (16-inch PROLED XDR, M5 Max, 2026)
+          - const: apple,t6050
+          - const: apple,arm-platform
+
+      - description: Apple M5 Ultra SoC based platforms
+        items:
+          - const: apple,j775d  # Mac Studio (M5 Ultra, 2026)
           - const: apple,t6050
           - const: apple,arm-platform
 

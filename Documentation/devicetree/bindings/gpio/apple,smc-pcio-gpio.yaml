@@ -29,12 +29,13 @@ properties:
     minItems: 1
     maxItems: 64
     uniqueItems: true
-    description: Unique command templates with low 16 bits clear, in GPIO order
+    description:
+      Unique command templates with low 16 bits clear, in GPIO order. A board
+      that uses none of the outputs leaves the list out.
 
 required:
   - compatible
   - gpio-controller
   - '#gpio-cells'
-  - apple,output-commands
 
 additionalProperties: false

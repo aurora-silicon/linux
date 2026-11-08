@@ -94,6 +94,17 @@
 		reg-names = "smc", "sram";
 		mboxes = <&smc_mbox>;
 
+		/*
+		 * The SMC's second GPIO bank: the lower-case gp keys (gp01 on), next to the
+		 * gP keys of the first, as on T6030/T6031. The J716s trackpad's AFE reset is
+		 * gp1c (line 28).
+		 */
+		smc_gpio_low: gpio-low {
+			compatible = "apple,smc-low-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
 		/* T8142's key discovery (every readable T* float key); boards add their fan and power keys. */
 		smc_hwmon: hwmon {
 			compatible = "apple,smc-hwmon";
@@ -685,6 +696,40 @@
 	};
 
 	/*
+	 * The three FPWM channels (ADT /arm-io/pwm0, pwm1, pwm2, "fpwm,s5l8920x") at
+	 * 0x305040000, 0x305044000 and 0x305048000, clock gates FPWM0..FPWM2. The boards say
+	 * what drives each one: on the MacBook Pros pwm0 is the keyboard backlight, and on the
+	 * PROLED models pwm1 is the rear Apple logo. pwm1's power state is left off unless a
+	 * board uses it, since J716c's ADT ties it to the indicator controller (eic).
+	 */
+	fpwm0: pwm@505040000 {
+		compatible = "apple,t6050-fpwm", "apple,s5l-fpwm";
+		reg = <0x5 0x05040000 0x0 0x4000>;
+		clocks = <&clkref>;
+		power-domains = <&ps_fpwm0>;
+		#pwm-cells = <2>;
+		status = "disabled";
+	};
+
+	fpwm1: pwm@505044000 {
+		compatible = "apple,t6050-fpwm", "apple,s5l-fpwm";
+		reg = <0x5 0x05044000 0x0 0x4000>;
+		clocks = <&clkref>;
+		power-domains = <&ps_fpwm1>;
+		#pwm-cells = <2>;
+		status = "disabled";
+	};
+
+	fpwm2: pwm@505048000 {
+		compatible = "apple,t6050-fpwm", "apple,s5l-fpwm";
+		reg = <0x5 0x05048000 0x0 0x4000>;
+		clocks = <&clkref>;
+		power-domains = <&ps_fpwm2>;
+		#pwm-cells = <2>;
+		status = "disabled";
+	};
+
+	/*
 	 * The boot NOR (ADT /arm-io/qspi, "qspi,qspimc"): P at 0x305118000 and C at P + 0x800,
 	 * each 0x4000 in the ADT; one resource for their union. Interrupt 1373, clock id 440
 	 * (/arm-io clock-frequencies[184], 405 MHz). spi-apple-qspi's T8140 policy: data
@@ -861,6 +906,33 @@
 };
 
 &pmgr1 {
+	ps_fpwm0: power-controller@2a8 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2a8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "fpwm0";
+	};
+
+	ps_fpwm1: power-controller@2b0 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2b0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "fpwm1";
+		/* On J716c the secure firmware's indicator controller names this state */
+		status = "disabled";
+	};
+
+	ps_fpwm2: power-controller@2b8 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2b8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "fpwm2";
+		status = "disabled";
+	};
+
 	ps_i2c1: power-controller@2c8 {
 		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x2c8 4>;

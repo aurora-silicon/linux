@@ -27,7 +27,6 @@ select:
           - apple,t6000-pmgr-clocks
           - apple,t6032-pmgr-clocks
           - apple,t6041-pmgr-clocks
-          - apple,t6050-pmgr-clocks
           - apple,t8103-pmgr-clocks
           - apple,t8132-pmgr-clocks
           - apple,t8140-pmgr-clocks
@@ -43,16 +42,6 @@ properties:
     description: Shared hardware resource metadata.
 
 allOf:
-  - if:
-      properties:
-        compatible:
-          contains:
-            const: apple,t6050-pmgr-clocks
-    then:
-      properties:
-        reg:
-          minItems: 60
-          maxItems: 60
   - if:
       properties:
         compatible:
@@ -104,7 +93,6 @@ allOf:
                   - enum:
                       - apple,t6000-pmgr-clocks
                       - apple,t6041-pmgr-clocks
-                      - apple,t6050-pmgr-clocks
                       - apple,t8103-pmgr-clocks
                       - apple,t8140-pmgr-clocks
                       - apple,t8142-pmgr-clocks

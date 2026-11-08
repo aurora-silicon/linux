@@ -2,7 +2,6 @@
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/media/apple,prores.yaml#
-
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
 title: Apple Silicon ProRes codec (APR)
@@ -16,134 +15,95 @@ description: |
   interrupt. It has no firmware. Its power domain also resets it.
 
 select:
-  anyOf:
-    -
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6000-prores
+          - apple,t6020-prores
+          - apple,t6021-prores
+          - apple,t6022-prores
+          - apple,t6030-prores
+          - apple,t6031-prores
+          - apple,t6032-prores
+          - apple,t6041-prores
+          - apple,t8112-prores
+          - apple,t8122-prores
+          - apple,t8132-prores
+          - apple,t8140-prores
+  required:
+    - compatible
+
+properties:
+  compatible: true
+
+allOf:
+  - if:
       properties:
         compatible:
           contains:
             enum:
-              - apple,t6000-prores
-              - apple,t6020-prores
-              - apple,t6021-prores
-              - apple,t6022-prores
-              - apple,t6030-prores
-              - apple,t6031-prores
-              - apple,t6032-prores
-              - apple,t6041-prores
-              - apple,t8112-prores
-              - apple,t8122-prores
               - apple,t8132-prores
-              - apple,t8140-prores
       required:
         - compatible
-    -
+    then:
       properties:
         compatible:
           items:
-            -
-              const: apple,t6050-prores
-            -
-              const: apple,prores
+            - enum:
+                - apple,t8132-prores
+            - const: apple,prores
+
+        reg:
+          minItems: 3
+          maxItems: 3
+
+        interrupts:
+          minItems: 2
+          maxItems: 2
+
+        power-domains:
+          maxItems: 1
+
+        iommus:
+          maxItems: 1
+
       required:
         - compatible
-
-properties:
-  compatible: true
-  reg: true
-  interrupts: true
-  iommus: true
-  power-domains: true
-  clocks: true
-  resets: true
-  status: true
-
-additionalProperties: true
-
-allOf:
-  - if:
-      anyOf:
-        -
-          properties:
-            compatible:
-              items:
-                -
-                  const: apple,t6050-prores
-                -
-                  const: apple,prores
-            status:
-              const: disabled
-          required:
-            - compatible
-            - status
-    then:
-      oneOf:
-        -
-          description: |
-            T6050 native resource description. Firmware ownership, backend support and enables require
-            separate qualification. This variant remains disabled and contains no programming sequences or
-            firmware data.
-          properties:
-            compatible:
-              items:
-                -
-                  const: apple,t6050-prores
-                -
-                  const: apple,prores
-            status:
-              const: disabled
-            reg:
-              minItems: 2
-              maxItems: 5
-              description: |
-                Native register apertures in hardware-interface order, including shared auxiliary views.
-            interrupts:
-              minItems: 2
-              maxItems: 2
-            iommus:
-              maxItems: 1
-            power-domains:
-              maxItems: 1
-          required:
-            - compatible
-            - reg
-            - status
-            - interrupts
-            - iommus
-            - power-domains
-          additionalProperties: false
+        - reg
+        - interrupts
+        - power-domains
+        - iommus
     else:
-      properties:
-        compatible: true
       allOf:
         - if:
             properties:
               compatible:
                 contains:
                   enum:
-                    - apple,t8132-prores
+                    - apple,t6032-prores
             required:
               - compatible
           then:
             properties:
               compatible:
                 items:
-                  - enum:
-                      - apple,t8132-prores
+                  - const: apple,t6032-prores
                   - const: apple,prores
 
               reg:
-                minItems: 3
+                minItems: 2
                 maxItems: 3
 
               interrupts:
-                minItems: 2
-                maxItems: 2
+                maxItems: 1
 
               power-domains:
                 maxItems: 1
 
               iommus:
-                maxItems: 1
+                minItems: 1
+                maxItems: 2
 
             required:
               - compatible
@@ -152,173 +112,137 @@ allOf:
               - power-domains
               - iommus
           else:
+            properties:
+              compatible:
+                oneOf:
+                  - const: apple,t8140-prores
+                  - items:
+                      - enum:
+                          - apple,t6000-prores
+                          - apple,t6020-prores
+                          - apple,t6021-prores
+                          - apple,t6022-prores
+                          - apple,t6030-prores
+                          - apple,t6031-prores
+                          - apple,t6041-prores
+                          - apple,t8112-prores
+                          - apple,t8122-prores
+                      - const: apple,prores
+
+              reg:
+                minItems: 2
+                maxItems: 3
+                description: Engine, wrapper and generation-specific auxiliary register windows.
+
+              reg-names:
+                minItems: 2
+                items:
+                  - const: core
+                  - const: wrapper
+                  - const: aux
+
+              interrupts:
+                minItems: 1
+                maxItems: 2
+
+              iommus:
+                minItems: 1
+                maxItems: 2
+
+              power-domains:
+                minItems: 1
+                items:
+                  - description: The engine's power domain
+                  - description: Performance request held while the engine works
+
+              power-domain-names:
+                minItems: 1
+                items:
+                  - const: core
+                  - const: perf
+
+              resets:
+                maxItems: 1
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - iommus
+              - power-domains
+
             allOf:
               - if:
                   properties:
                     compatible:
                       contains:
                         enum:
-                          - apple,t6032-prores
-                  required:
-                    - compatible
+                          - apple,t6030-prores
+                          - apple,t6031-prores
+                          - apple,t8122-prores
                 then:
                   properties:
-                    compatible:
-                      items:
-                        - const: apple,t6032-prores
-                        - const: apple,prores
-
                     reg:
                       minItems: 2
                       maxItems: 3
-
-                    interrupts:
-                      maxItems: 1
-
                     power-domains:
                       maxItems: 1
-
-                    iommus:
-                      minItems: 1
-                      maxItems: 2
-
-                  required:
-                    - compatible
-                    - reg
-                    - interrupts
-                    - power-domains
-                    - iommus
-                else:
+              - if:
                   properties:
                     compatible:
-                      oneOf:
-                        - const: apple,t8140-prores
-                        - items:
-                            - enum:
-                                - apple,t6000-prores
-                                - apple,t6020-prores
-                                - apple,t6021-prores
-                                - apple,t6022-prores
-                                - apple,t6030-prores
-                                - apple,t6031-prores
-                                - apple,t6041-prores
-                                - apple,t8112-prores
-                                - apple,t8122-prores
-                            - const: apple,prores
-
+                      contains:
+                        enum:
+                          - apple,t6020-prores
+                          - apple,t6021-prores
+                          - apple,t6022-prores
+                          - apple,t8112-prores
+                then:
+                  properties:
                     reg:
-                      minItems: 2
-                      maxItems: 3
-                      description: Engine, wrapper and generation-specific auxiliary register windows.
-
+                      maxItems: 2
                     reg-names:
-                      minItems: 2
-                      items:
-                        - const: core
-                        - const: wrapper
-                        - const: aux
-
+                      maxItems: 2
+              - if:
+                  properties:
+                    compatible:
+                      contains:
+                        enum:
+                          - apple,t6041-prores
+                then:
+                  properties:
+                    reg:
+                      minItems: 3
+                      maxItems: 3
+                    reg-names:
+                      minItems: 3
+                      maxItems: 3
                     interrupts:
-                      minItems: 1
-                      maxItems: 2
-
-                    iommus:
-                      minItems: 1
-                      maxItems: 2
-
-                    power-domains:
-                      minItems: 1
-                      items:
-                        - description: The engine's power domain
-                        - description: Performance request held while the engine works
-
-                    power-domain-names:
-                      minItems: 1
-                      items:
-                        - const: core
-                        - const: perf
-
-                    resets:
                       maxItems: 1
-
+                    iommus:
+                      maxItems: 1
                   required:
-                    - compatible
-                    - reg
-                    - interrupts
-                    - iommus
-                    - power-domains
+                    - resets
+                    - reg-names
+              - if:
+                  properties:
+                    compatible:
+                      contains:
+                        enum:
+                          - apple,t8140-prores
+                then:
+                  properties:
+                    reg:
+                      maxItems: 2
+                    reg-names:
+                      maxItems: 2
+                    iommus:
+                      maxItems: 1
+                  required:
+                    - reg-names
 
-                  allOf:
-                    - if:
-                        properties:
-                          compatible:
-                            contains:
-                              enum:
-                                - apple,t6030-prores
-                                - apple,t6031-prores
-                                - apple,t8122-prores
-                      then:
-                        properties:
-                          reg:
-                            minItems: 2
-                            maxItems: 3
-                          power-domains:
-                            maxItems: 1
-                    - if:
-                        properties:
-                          compatible:
-                            contains:
-                              enum:
-                                - apple,t6020-prores
-                                - apple,t6021-prores
-                                - apple,t6022-prores
-                                - apple,t8112-prores
-                      then:
-                        properties:
-                          reg:
-                            maxItems: 2
-                          reg-names:
-                            maxItems: 2
-                    - if:
-                        properties:
-                          compatible:
-                            contains:
-                              enum:
-                                - apple,t6041-prores
-                      then:
-                        properties:
-                          reg:
-                            minItems: 3
-                            maxItems: 3
-                          reg-names:
-                            minItems: 3
-                            maxItems: 3
-                          interrupts:
-                            maxItems: 1
-                          iommus:
-                            maxItems: 1
-                        required:
-                          - resets
-                          - reg-names
-                    - if:
-                        properties:
-                          compatible:
-                            contains:
-                              enum:
-                                - apple,t8140-prores
-                      then:
-                        properties:
-                          reg:
-                            maxItems: 2
-                          reg-names:
-                            maxItems: 2
-                          iommus:
-                            maxItems: 1
-                        required:
-                          - reg-names
+            additionalProperties: false
 
-                  additionalProperties: false
-      unevaluatedProperties: false
+unevaluatedProperties: false
 
 examples:
   - |

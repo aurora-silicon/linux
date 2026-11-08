@@ -2,7 +2,6 @@
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/phy/apple,dptx-phy.yaml#
-
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
 title: Apple DisplayPort transmitter PHY
@@ -18,226 +17,58 @@ description: |
   data are supplied by the boot firmware rather than this binding.
 
 select:
-  anyOf:
-    -
-      anyOf:
-        -
-          properties:
-            compatible:
-              contains:
-                enum:
-                  - apple,t8122-dptx-phy
-          required:
-            - compatible
-        -
-          properties:
-            compatible:
-              contains:
-                const: apple,t6050-dptx-phy
-          required:
-            - compatible
-    -
-      properties:
-        compatible:
-          items:
-            -
-              const: apple,t6050-dptx-phy
-            -
-              const: apple,dptx-phy
-      required:
-        - compatible
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6050-dptx-phy
+          - apple,t8122-dptx-phy
+  required:
+    - compatible
 
 properties:
-  compatible: true
-  reg: true
-  power-domains: true
-  "#phy-cells": true
-  reg-names: true
-  "#reset-cells": true
-  status: true
-  apple,pll-dcocfg:
-    $ref: /schemas/types.yaml#/definitions/uint32
-    description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
-  apple,pll-dtcvreg:
-    $ref: /schemas/types.yaml#/definitions/uint32
-    description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
-  apple,pll-dtccal:
-    $ref: /schemas/types.yaml#/definitions/uint32
-    description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
-  apple,pll-dcdadj:
-    $ref: /schemas/types.yaml#/definitions/uint32
-    description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
-  apple,pll-dlfcfg:
-    $ref: /schemas/types.yaml#/definitions/uint32
-    description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
-  apple,pclkdrv-select:
-    $ref: /schemas/types.yaml#/definitions/uint32
-    description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
+  compatible:
+    oneOf:
+      - items:
+          - enum:
+              - apple,t8122-dptx-phy
+          - const: apple,dptx-phy
+      - const: apple,t6050-dptx-phy
+
+  reg:
+    minItems: 2
+    maxItems: 2
+
+  reg-names:
+    items:
+      - const: core
+      - const: dptx
+
+  power-domains:
+    maxItems: 1
+
+  '#phy-cells':
+    const: 0
+
+  '#reset-cells':
+    const: 0
+
   apple,ufp-endpoint:
     $ref: /schemas/types.yaml#/definitions/uint32
-    description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
-  interrupts: true
-  iommus: true
-  clocks: true
-  resets: true
+    description:
+      The display crossbar's upstream-facing endpoint that feeds this PHY.
 
-additionalProperties: true
+patternProperties:
+  '^apple,(pll-(dcocfg|dtcvreg|dtccal|dcdadj|dlfcfg)|pclkdrv-select)$':
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      PLL and pixel clock driver settings the PHY is programmed with, as the
+      ADT's lpdptx-phy node gives them.
 
-allOf:
-  - if:
-      anyOf:
-        -
-          properties:
-            compatible:
-              items:
-                -
-                  const: apple,t6050-dptx-phy
-                -
-                  const: apple,dptx-phy
-            status:
-              const: disabled
-          required:
-            - compatible
-            - status
-    then:
-      oneOf:
-        -
-          description: |
-            T6050 native resource description. Firmware ownership, backend support and enables require
-            separate qualification. This variant remains disabled and contains no programming sequences or
-            firmware data.
-          properties:
-            compatible:
-              items:
-                -
-                  const: apple,t6050-dptx-phy
-                -
-                  const: apple,dptx-phy
-            status:
-              const: disabled
-            reg:
-              minItems: 2
-              maxItems: 2
-              description: |
-                Native register apertures in hardware-interface order, including shared auxiliary views.
-            power-domains:
-              maxItems: 1
-          required:
-            - compatible
-            - reg
-            - status
-            - power-domains
-          additionalProperties: false
-    else:
-      properties:
-        "compatible": true
-        "reg": true
-        "power-domains": true
-        "#phy-cells": true
-        reg-names: true
-        "#reset-cells": true
-        status: true
-        apple,pll-dcocfg:
-          $ref: /schemas/types.yaml#/definitions/uint32
-          description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
-        apple,pll-dtcvreg:
-          $ref: /schemas/types.yaml#/definitions/uint32
-          description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
-        apple,pll-dtccal:
-          $ref: /schemas/types.yaml#/definitions/uint32
-          description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
-        apple,pll-dcdadj:
-          $ref: /schemas/types.yaml#/definitions/uint32
-          description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
-        apple,pll-dlfcfg:
-          $ref: /schemas/types.yaml#/definitions/uint32
-          description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
-        apple,pclkdrv-select:
-          $ref: /schemas/types.yaml#/definitions/uint32
-          description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
-        apple,ufp-endpoint:
-          $ref: /schemas/types.yaml#/definitions/uint32
-          description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
-      additionalProperties: true
-      allOf:
-        - if:
-            properties:
-              compatible:
-                contains:
-                  const: apple,t6050-dptx-phy
-            required:
-              - compatible
-          then:
-            properties:
-              compatible:
-                const: apple,t6050-dptx-phy
-              reg:
-                minItems: 2
-                maxItems: 2
-              reg-names:
-                items:
-                  -
-                    const: core
-                  -
-                    const: dptx
-              power-domains:
-                maxItems: 1
-              "#phy-cells":
-                const: 0
-              "#reset-cells":
-                const: 0
-              status:
-                const: disabled
-              apple,pll-dcocfg:
-                $ref: /schemas/types.yaml#/definitions/uint32
-                description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
-              apple,pll-dtcvreg:
-                $ref: /schemas/types.yaml#/definitions/uint32
-                description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
-              apple,pll-dtccal:
-                $ref: /schemas/types.yaml#/definitions/uint32
-                description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
-              apple,pll-dcdadj:
-                $ref: /schemas/types.yaml#/definitions/uint32
-                description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
-              apple,pll-dlfcfg:
-                $ref: /schemas/types.yaml#/definitions/uint32
-                description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
-              apple,pclkdrv-select:
-                $ref: /schemas/types.yaml#/definitions/uint32
-                description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
-              apple,ufp-endpoint:
-                $ref: /schemas/types.yaml#/definitions/uint32
-                description: Boot-producer hardware configuration for the fixed DisplayPort PHY.
-            required:
-              - compatible
-              - reg
-              - reg-names
-              - power-domains
-              - "#phy-cells"
-              - "#reset-cells"
-              - status
-            additionalProperties: false
-          else:
-            properties:
-              compatible:
-                items:
-                  - enum:
-                      - apple,t8122-dptx-phy
-                  - const: apple,dptx-phy
+required:
+  - compatible
+  - reg
+  - power-domains
+  - '#phy-cells'
 
-              reg:
-                minItems: 2
-                maxItems: 2
-
-              power-domains:
-                maxItems: 1
-
-              '#phy-cells':
-                const: 0
-            required:
-              - compatible
-              - reg
-              - power-domains
-              - '#phy-cells'
-            additionalProperties: false
+additionalProperties: false
