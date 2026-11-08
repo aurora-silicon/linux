@@ -6643,10 +6643,11 @@ static int atcphy_probe(struct platform_device *pdev)
  * controller is brought to D0, and xHCI restores its own state.
  *
  * USB2 and USB3 qualify, without DisplayPort, whose link the common block's power-down
- * would end. With USB3 the halted controller's PIPE is parked on the dummy backend just
- * before the hibernation, as macOS locks and parks it when its host goes to Sleep
- * (setUSB3Mode, static), and the lanes are left as they are: the commit takes them down.
- * At the wake the lanes come back in USB3 and the PIPE is routed to them when the controller's
+ * would end. With USB3 the PIPE stays routed to the USB3 PHY, as macOS leaves it (measured):
+ * the halted controller doesn't acknowledge a PIPE lock, and the power control acknowledges
+ * its PHY lock at the wake only with the PIPE on the PHY. The lanes are left as they are: the
+ * commit takes them down. At the wake the common block is set up again under that lock, with
+ * the PIPE parked, and the PIPE is routed to the lanes when the controller's
  * core is set up, before xHCI starts, with no Type-C mode change and no SuperSpeed port power
  * cycle. macOS's raise from Sleep to its saved USB3 mode is also just a handshake and the USB3
  * PHY's power level (static, setUSB3Mode). macOS also stops its PHY's fabric traffic before
@@ -6678,26 +6679,6 @@ static bool atcphy_can_sleep_in_place(const struct apple_atcphy *atcphy)
 	       (atcphy->pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY ||
 		atcphy->pipe_state == pipe) && !atcphy->usb_off_pending &&
 	       !atcphy->dp_owned_pmas && !atcphy->aux_power_requested && !atcphy->tunnel_users;
-}
-
-/*
- * The halted controller's PIPE goes to the dummy backend for the hibernation. A lock it
- * doesn't acknowledge is only logged, as macOS's sleep only logs it too; the PIPE is then
- * parked unlocked, as for a stopped controller.
- */
-static int atcphy_sleep_park_pipe(struct apple_atcphy *atcphy)
-{
-	bool dirty = atcphy->mode_dirty;
-	int ret;
-
-	ret = atcphy_park_pipehandler(atcphy, false);
-	if (!ret)
-		return 0;
-
-	dev_warn(atcphy->dev, "PIPE lock not acknowledged for the sleep (%d): parking unlocked\n",
-		 ret);
-	atcphy->mode_dirty = dirty;
-	return atcphy_park_pipehandler(atcphy, true);
 }
 
 static void atcphy_usb2_sleep_enter(struct apple_atcphy *atcphy)
@@ -6895,13 +6876,17 @@ static int atcphy_sleep_power_down(struct apple_atcphy *atcphy)
  * USB3, without the controller's reset or a USB2 PHY power cycle: atcphy_configure() powers
  * the USB2 PHY on over the running one, which rewrites only what it holds, so the hub's link
  * stays. The host role goes in again as at probe, for a USB2 PHY that lost its registers
- * too. The PIPE stays parked until the controller's core is set up and routes it.
+ * too. The PIPE is parked first, unlocked as the controller's core is in reset, and stays
+ * parked until the core is set up and routes it.
  */
 static int atcphy_common_restore(struct apple_atcphy *atcphy)
 {
 	enum atcphy_mode mode = atcphy->mode;
 	int ret;
 
+	ret = atcphy_park_pipehandler(atcphy, true);
+	if (ret)
+		dev_warn(atcphy->dev, "PIPE not parked after the sleep: %d\n", ret);
 	atcphy_forget_common_state(atcphy);
 	ret = atcphy_power_off(atcphy);
 	if (ret)
@@ -6978,13 +6963,6 @@ static int atcphy_suspend_noirq(struct device *dev)
 		atcphy->sleep_ret = -EBUSY;
 		return -EBUSY;
 	}
-	ret = atcphy_sleep_park_pipe(atcphy);
-	if (ret) {
-		dev_err(dev, "PIPE not parked for the sleep: %d, refusing it\n", ret);
-		atcphy->sleep_ret = -EBUSY;
-		return -EBUSY;
-	}
-
 	ret = atcphy_controller_hibernate(atcphy);
 	if (ret)
 		return ret;
