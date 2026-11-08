@@ -83,6 +83,15 @@
 	status = "okay";
 };
 
+/* The enclave must take the sleep request, so its driver has to bind. */
+&sep_dart {
+	status = "okay";
+};
+
+&sep {
+	status = "okay";
+};
+
 /*
  * The four SN012776 speaker amps, held in hardware shutdown until the sound
  * card enables them (ADT /arm-io/i2c3/audio-speaker at 0x38 and its
