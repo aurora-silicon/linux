@@ -1432,6 +1432,8 @@
 			      <0x4 0x0aa80000 0x0 0x4000>;
 			reg-names = "core", "lpdptx", "axi2af", "usb2phy",
 				    "pipehandler", "usb2phy-reg", "pwrctl";
+			/* Bit 0 of both, around every ATC0_COMMON change on macOS. */
+			apple,axi2af-gate = <0x104 0x1>, <0x108 0x1>;
 
 			#phy-cells = <1>;
 			#reset-cells = <0>;
