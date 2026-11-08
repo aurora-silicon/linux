@@ -4653,6 +4653,59 @@ static void apple_pcie_stop_for_sleep(struct device *dev)
 		apple_pcie_tunnel_hierarchy_lost(dev);
 }
 
+/*
+ * The J716c radio drivers save PCI state without entering D3. The PCI core
+ * keeps the root port in D0 as well. Its host and DART have no switchable
+ * power domains, and the DART saves its live translations without stopping
+ * them. For s2idle, retain that running hierarchy instead of resetting it.
+ *
+ * Check hardware PMCSR rather than current_state: the PCI core may mark a
+ * driverless root port PCI_UNKNOWN even though its hardware remains in D0.
+ */
+static int apple_pcie_check_d0(struct pci_dev *pdev, void *data)
+{
+	int *error = data;
+	u16 value;
+
+	if (pci_read_config_word(pdev, PCI_VENDOR_ID, &value) ||
+	    value != pdev->vendor) {
+		*error = -ENODEV;
+	} else if (pdev->pm_cap &&
+		   (pci_read_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL, &value) ||
+		    (value & PCI_PM_CTRL_STATE_MASK) != PCI_D0)) {
+		*error = -EBUSY;
+	}
+	if (*error)
+		pci_err(pdev, "adopted link requires accessible D0 devices for s2idle\n");
+	return *error;
+}
+
+static int apple_pcie_check_adopted_s2idle(struct apple_pcie *pcie)
+{
+	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
+	struct apple_pcie_port *port;
+	int error = 0;
+
+	/* Other adopted platforms and deeper sleep remain unqualified. */
+	if (!of_machine_is_compatible("apple,j716c") || !pm_suspend_no_platform())
+		return -EBUSY;
+
+	if (!(readl(pcie->base + CORE_RC_CTL) & CORE_RC_CTL_RUN) ||
+	    !(readl(pcie->base + CORE_RC_STAT) & CORE_RC_STAT_READY))
+		return -ENOLINK;
+
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (READ_ONCE(port->link_failed) ||
+		    !(apple_pcie_port_readl(port, PORT_STATUS) & PORT_STATUS_READY) ||
+		    (apple_pcie_port_readl(port, PORT_LINKSTS) &
+		     (PORT_LINKSTS_UP | PORT_LINKSTS_BUSY)) != PORT_LINKSTS_UP ||
+		    (apple_pcie_port_readl(port, PORT_INTSTAT) & BIT(PORT_INT_LINK_DOWN)))
+			return -ENOLINK;
+	}
+	pci_walk_bus(bridge->bus, apple_pcie_check_d0, &error);
+	return error;
+}
+
 static int apple_pcie_suspend_noirq(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
@@ -4663,8 +4716,12 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 	 */
 	if (pcie->managed_sids)
 		return pm_suspend_target_state == PM_SUSPEND_TO_IDLE ? 0 : -EBUSY;
-	if (pcie->hw->adopt_link)
-		return -EBUSY;
+	if (pcie->hw->adopt_link) {
+		int ret = apple_pcie_check_adopted_s2idle(pcie);
+
+		pcie->link_kept = !ret;
+		return ret;
+	}
 	if (!pcie->hw->tunneled)
 		return 0;
 	pcie->reset_on_resume = false;
@@ -4721,6 +4778,19 @@ static int apple_pcie_resume_noirq(struct device *dev)
 	struct apple_pcie_port *port;
 	int ret;
 
+	if (pcie->hw->adopt_link) {
+		if (!pcie->link_kept)
+			return 0;
+		pcie->link_kept = false;
+		ret = apple_pcie_check_adopted_s2idle(pcie);
+		if (ret) {
+			/* Block downstream config access if the retained link was lost. */
+			list_for_each_entry(port, &pcie->ports, entry)
+				WRITE_ONCE(port->link_failed, true);
+			dev_err(dev, "adopted link lost during suspend-to-idle: %d\n", ret);
+		}
+		return ret;
+	}
 	if (!pcie->hw->tunneled)
 		return 0;
 	/* The domain's hold for the sleep ends first, whatever follows. */
