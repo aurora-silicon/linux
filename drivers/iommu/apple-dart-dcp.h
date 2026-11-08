@@ -994,10 +994,19 @@ static const struct attribute_group apple_dart_frontend_group = {
 	.attrs = apple_dart_frontend_attrs,
 };
 
+/* The inherited DCP layout is the 26.6.2 firmware's, on every M4 Mac. */
+static bool apple_dart_dcp_firmware(const struct device_node *np)
+{
+	u32 version[3];
+
+	return of_property_count_u32_elems(np, "apple,firmware-version") == 3 &&
+	       !of_property_read_u32_array(np, "apple,firmware-version", version, 3) &&
+	       version[0] == 26 && version[1] == 6 && version[2] == 2;
+}
+
 static int apple_dart_dcp_validate(struct apple_dart_dcp *dcp, struct device *dev)
 {
 	struct device_node *node;
-	const char *uuid;
 	unsigned int count = 0;
 	unsigned int oslogs = 0;
 	u32 seen = 0;
@@ -1018,8 +1027,7 @@ static int apple_dart_dcp_validate(struct apple_dart_dcp *dcp, struct device *de
 	if (!of_device_is_compatible(dev->of_node,
 				     dcp->dart->dcp_instance == &dcp_adt_internal ?
 				     "apple,t8132-dcp" : "apple,t8132-dcpext") ||
-	    of_property_read_string(dev->of_node, "apple,firmware-uuid", &uuid) ||
-	    strcmp(uuid, "81BAF476-679D-3CC0-8C6A-E6B6FA659D5E") ||
+	    !apple_dart_dcp_firmware(dev->of_node) ||
 	    (dcp->owner && dcp->owner != dev))
 		return -ENODEV;
 	/* Do not silently skip malformed ranges or allocation failures in a list helper. */

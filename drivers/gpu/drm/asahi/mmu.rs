@@ -1147,6 +1147,22 @@ impl ExecutionContext {
         self.root.release();
     }
 
+    /// Takes a hold on this context's identity for a firmware-visible record that names
+    /// it. `fence` reports the firmware progress to wait for once the last hold drops.
+    pub(crate) fn hold(&self, fence: fn() -> u64) -> Result<Arc<ContextHold>> {
+        let hold = Arc::new(
+            ContextHold {
+                inner: self.root.inner.clone(),
+                id: self.root.id,
+                seen: AtomicBool::new(false),
+                fence,
+            },
+            GFP_KERNEL,
+        )?;
+        self.root.inner.lock().context_holds[usize::from(self.root.id)] += 1;
+        Ok(hold)
+    }
+
     pub(crate) fn is_current(&self) -> bool {
         let inner = self.root.inner.lock();
         if self.root.released.load(Ordering::Acquire) {
@@ -1183,7 +1199,10 @@ impl ExecutionRoot {
             mem::sync();
             mem::tlbi_asid(self.id);
             mem::sync();
-            self.inner.lock().execution_contexts &= !(1u64 << id);
+            let mut inner = self.inner.lock();
+            inner.context_clock += 1;
+            inner.context_returns[id] = inner.context_clock;
+            inner.execution_contexts &= !(1u64 << id);
         } else {
             pr_err!(
                 "MMU: application context {} changed owners while leased\n",
@@ -1196,6 +1215,39 @@ impl ExecutionRoot {
 impl Drop for ExecutionRoot {
     fn drop(&mut self) {
         self.release();
+    }
+}
+
+/// A firmware-visible record (a queue record, a work list keyed by context) that names an
+/// application context. The TTBAT root goes with [`ExecutionContext::release`], but while a
+/// hold remains the identity is handed to a new owner only if no other context is free.
+/// Once the firmware saw the identity, the last hold fences it: it is reused only after the
+/// firmware shows the progress the hold's fence source reported when it dropped.
+pub(crate) struct ContextHold {
+    inner: Arc<UatInner>,
+    id: u8,
+    seen: AtomicBool,
+    fence: fn() -> u64,
+}
+
+impl ContextHold {
+    /// The firmware may have seen the identity.
+    pub(crate) fn mark_seen(&self) {
+        self.seen.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for ContextHold {
+    fn drop(&mut self) {
+        let fence = if self.seen.load(Ordering::Acquire) { (self.fence)() } else { 0 };
+        let id = usize::from(self.id);
+        let mut inner = self.inner.lock();
+        inner.context_holds[id] = inner.context_holds[id].saturating_sub(1);
+        inner.context_fences[id] = inner.context_fences[id].max(fence);
+        if inner.context_holds[id] == 0 && inner.execution_contexts & (1u64 << id) == 0 {
+            inner.context_clock += 1;
+            inner.context_returns[id] = inner.context_clock;
+        }
     }
 }
 
@@ -1795,6 +1847,16 @@ struct UatShared {
     kernel_ttb1: u64,
     execution_contexts: u64,
     context_generations: [u8; UAT_NUM_CTX],
+    /// When each application context was last returned, on `context_clock`. Allocation
+    /// takes the free context returned longest ago, as the VM slot allocator does.
+    context_returns: [u64; UAT_NUM_CTX],
+    /// Firmware progress each returned context waits for before it may name a new owner.
+    context_fences: [u64; UAT_NUM_CTX],
+    /// Firmware-visible records still naming each context (see [`ContextHold`]).
+    context_holds: [u32; UAT_NUM_CTX],
+    context_clock: u64,
+    /// Allocations that had to take a context still held or waiting for its fence.
+    context_fence_overruns: u64,
     /// Firmware-observed incarnations of application roots installed by the VM slot allocator.
     binding_generations: [u64; UAT_NUM_CTX],
     binding_published: [bool; UAT_NUM_CTX],
@@ -1810,6 +1872,17 @@ struct UatShared {
 }
 
 impl UatShared {
+    /// Context fences with every held context waiting indefinitely.
+    fn effective_fences(&self) -> [u64; UAT_NUM_CTX] {
+        let mut fences = self.context_fences;
+        for (fence, holds) in fences.iter_mut().zip(self.context_holds) {
+            if holds != 0 {
+                *fence = u64::MAX;
+            }
+        }
+        fences
+    }
+
     /// Takes the handoff lock, where this SoC uses it.
     fn handoff_lock(&self) {
         if self.quirks.handoff_lock {
@@ -3303,6 +3376,11 @@ impl Uat {
                         kernel_ttb1: regions.kernel_root,
                         execution_contexts: !EXECUTION_CONTEXT_MASK,
                         context_generations: [0; UAT_NUM_CTX],
+                        context_returns: [0; UAT_NUM_CTX],
+                        context_fences: [0; UAT_NUM_CTX],
+                        context_holds: [0; UAT_NUM_CTX],
+                        context_clock: 0,
+                        context_fence_overruns: 0,
                         binding_generations: [0; UAT_NUM_CTX],
                         binding_published: [false; UAT_NUM_CTX],
                         owned_user_roots: [0; UAT_NUM_CTX],
@@ -3585,7 +3663,17 @@ impl Uat {
 
     /// Allocates a stable application context without changing the VM bind slot.
     /// Both roots and the generation remain unchanged for the lease's lifetime.
-    pub(crate) fn new_execution_context(&self, vm: &Vm) -> Result<Arc<ExecutionContext>> {
+    ///
+    /// The firmware keys work by context, and installed records may still name a returned
+    /// context: a context is handed out again only once no [`ContextHold`] remains and the
+    /// firmware showed progress `witnessed` past its fence, and among those the one returned
+    /// longest ago is taken. Only when every free context still waits is the one with the
+    /// oldest fence taken (counted as an overrun) rather than failing a live client.
+    pub(crate) fn new_execution_context(
+        &self,
+        vm: &Vm,
+        witnessed: u64,
+    ) -> Result<Arc<ExecutionContext>> {
         // NoPeerRoots: T8152 publishes `t8152::G18ExecutionContext` leases (private empty upper
         // root) instead of kernel-root upper halves.
         if self.inner.firmware == UatFirmware::Handoff || self.inner.firmware.is_no_peer() {
@@ -3605,7 +3693,16 @@ impl Uat {
             if free == 0 {
                 return Err(ENOSPC);
             }
-            let id = free.trailing_zeros() as usize;
+            let fences = inner.effective_fences();
+            let candidates = (0..UAT_NUM_CTX).filter(|&id| free & (1u64 << id) != 0);
+            let id = match pick_returned(candidates, &inner.context_returns, &fences, witnessed) {
+                Some((id, true)) => id,
+                Some((id, false)) => {
+                    inner.context_fence_overruns += 1;
+                    id
+                }
+                None => return Err(ENOSPC),
+            };
             inner.execution_contexts |= 1u64 << id;
             inner.context_generations[id] = inner.context_generations[id].wrapping_add(1);
             (id, inner.context_generations[id])
@@ -3827,6 +3924,11 @@ impl Uat {
                             !EXECUTION_CONTEXT_MASK
                         },
                         context_generations: [0; UAT_NUM_CTX],
+                        context_returns: [0; UAT_NUM_CTX],
+                        context_fences: [0; UAT_NUM_CTX],
+                        context_holds: [0; UAT_NUM_CTX],
+                        context_clock: 0,
+                        context_fence_overruns: 0,
                         binding_generations: [0; UAT_NUM_CTX],
                         binding_published: [false; UAT_NUM_CTX],
                         owned_user_roots: [0; UAT_NUM_CTX],
@@ -4020,5 +4122,90 @@ impl Vm {
 impl Uat {
     pub(crate) fn execution_contexts_used(&self) -> u32 {
         (self.inner.lock().execution_contexts & EXECUTION_CONTEXT_MASK).count_ones()
+    }
+
+    /// Free application contexts still held or waiting for firmware progress `witnessed`,
+    /// and the allocations that had to take such a context.
+    pub(crate) fn execution_contexts_fenced(&self, witnessed: u64) -> (u32, u64) {
+        let inner = self.inner.lock();
+        let free = !inner.execution_contexts & EXECUTION_CONTEXT_MASK;
+        let fences = inner.effective_fences();
+        let waiting = (0..UAT_NUM_CTX)
+            .filter(|&id| free & (1u64 << id) != 0 && fences[id] > witnessed)
+            .count() as u32;
+        (waiting, inner.context_fence_overruns)
+    }
+}
+
+/// Picks a returned identity for a new owner, shared by the finite firmware identity
+/// spaces (application contexts here, the G17 QoS IDs): among `free`, the one returned
+/// longest ago whose fence `witnessed` meets; if none does, the one with the oldest fence.
+/// The flag says whether the fence was met. The slot allocator orders VM slots the same way.
+pub(crate) fn pick_returned(
+    free: impl Iterator<Item = usize>,
+    returns: &[u64],
+    fences: &[u64],
+    witnessed: u64,
+) -> Option<(usize, bool)> {
+    let mut best: Option<usize> = None;
+    let mut waiting: Option<usize> = None;
+    for id in free {
+        if fences[id] <= witnessed {
+            if best.is_none_or(|best| returns[id] < returns[best]) {
+                best = Some(id);
+            }
+        } else if waiting.is_none_or(|waiting| {
+            (fences[id], returns[id]) < (fences[waiting], returns[waiting])
+        }) {
+            waiting = Some(id);
+        }
+    }
+    best.map(|id| (id, true)).or(waiting.map(|id| (id, false)))
+}
+
+#[kernel::macros::kunit_tests(asahi_mmu_execution_context)]
+mod execution_context_tests {
+    use super::*;
+
+    const FREE: u64 = EXECUTION_CONTEXT_MASK;
+
+    fn pick(free: u64, returns: &[u64], fences: &[u64], witnessed: u64) -> (usize, bool) {
+        let candidates = (0..UAT_NUM_CTX).filter(|&id| free & (1u64 << id) != 0);
+        pick_returned(candidates, returns, fences, witnessed).unwrap()
+    }
+
+    #[test]
+    fn a_returned_context_goes_to_the_back_of_the_line() {
+        let mut returns = [0; UAT_NUM_CTX];
+        let fences = [0; UAT_NUM_CTX];
+        // Never-used contexts (return time 0) go first, lowest id among equals.
+        assert_eq!(pick(FREE, &returns, &fences, 0), (5, true));
+        // Context 5 was just returned: the next never-used one is taken instead.
+        returns[5] = 1;
+        assert_eq!(pick(FREE, &returns, &fences, 0), (6, true));
+        // Every context returned once: the one returned longest ago wins.
+        for (id, time) in returns.iter_mut().enumerate() {
+            *time = 100 - id as u64;
+        }
+        assert_eq!(pick(FREE, &returns, &fences, 0), (62, true));
+        assert_eq!(pick(FREE & !(1 << 62), &returns, &fences, 0), (61, true));
+    }
+
+    #[test]
+    fn a_fenced_context_waits_for_firmware_progress() {
+        let returns = [0; UAT_NUM_CTX];
+        let mut fences = [0; UAT_NUM_CTX];
+        let only = (1u64 << 7) | (1u64 << 9);
+        fences[7] = 10;
+        assert_eq!(pick(only, &returns, &fences, 9), (9, true));
+        assert_eq!(pick(1 << 7, &returns, &fences, 10), (7, true));
+        // Every free context waits: the oldest fence is taken and reported.
+        fences[9] = 12;
+        assert_eq!(pick(only, &returns, &fences, 9), (7, false));
+        assert_eq!(pick(only, &returns, &fences, 11), (7, true));
+        // A held context (fence u64::MAX) goes last.
+        fences[7] = u64::MAX;
+        assert_eq!(pick(only, &returns, &fences, 11), (9, false));
+        assert!(pick_returned(core::iter::empty(), &returns, &fences, 0).is_none());
     }
 }

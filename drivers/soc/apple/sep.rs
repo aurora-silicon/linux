@@ -789,6 +789,11 @@ struct SepData {
     // without a capture until a password authentication re-arms Touch ID.
     bio_lockout: Atomic<bool>,
 
+    // Touch ID waits for the first password since this boot
+    // (SEP_BIO_REQUIRE_PASSWORD): every verify is refused without a capture
+    // until a password authentication re-arms it. Never recorded.
+    bio_after_boot: Atomic<bool>,
+
     // The refusal of a verify during a lockout has been logged.
     bio_lockout_logged: Atomic<bool>,
 
@@ -1074,6 +1079,7 @@ impl SepData {
                 key_touch_active: Atomic::new(false),
                 last_key_status: Atomic::new(0),
                 bio_lockout: Atomic::new(false),
+                bio_after_boot: Atomic::new(false),
                 bio_lockout_logged: Atomic::new(false),
                 bio_nomatch_streak: Atomic::new(0),
                 enclave_failures_owed: Atomic::new(false),

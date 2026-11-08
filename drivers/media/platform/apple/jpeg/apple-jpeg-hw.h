@@ -10,6 +10,7 @@
 #define APPLE_JPEG_HW_H
 
 #include <linux/align.h>
+#include <linux/bits.h>
 #include <linux/limits.h>
 #include <linux/math.h>
 #include <linux/minmax.h>
@@ -51,25 +52,7 @@
 #define AJ_PX_PLANE1_TILE_H		0x080
 #define AJ_PX_PLANE1_TILE_V		0x084
 #define AJ_PX_PLANE1_STRIDE		0x088
-#define AJ_INPUT_PLANE0			0x090	/* low, high */
-#define AJ_INPUT_PLANE1			0x0a0
-#define AJ_INPUT_END			0x0b0
-#define AJ_ENCODE_PIPE_LIMIT0		0x0b8
-#define AJ_ENCODE_PIPE_LIMIT1		0x0bc
-#define AJ_OUTPUT_START0		0x0c0
-#define AJ_OUTPUT_START1		0x0d0
-#define AJ_OUTPUT_END			0x0e0
-#define AJ_ENCODE_PIXEL_FORMAT		0x13c
-#define  AJ_PIXEL_FORMAT_YUV_PLANES	4
-#define AJ_ENCODE_COMPONENT_POS(i)	(0x140 + 4 * (i))
-#define AJ_CONVERT_COLOR_SPACE		0x150
-#define AJ_AXI_READ_PREFETCH		0x154
-#define AJ_AXI_WRITE_PREFETCH		0x158
-#define AJ_TILING_ENABLE		0x19c
-#define AJ_TIMEOUT			0x1c0
-#define AJ_HWREV			0x1c4
-#define AJ_DMA_IMAGE_WIDTH		0x258
-#define AJ_DMA_IMAGE_HEIGHT		0x25c
+#define AJ_PIXEL_FORMAT_YUV_PLANES	4
 #define AJ_JPEG_IO_FLAGS		0x1000
 #define  AJ_IO_FLAGS_ORDER		(BIT(4) | BIT(5))
 #define  AJ_IO_FLAGS_422		1
@@ -94,24 +77,38 @@
 #define AJ_HWREV_T6041			0x100008
 #define AJ_HWREV_T8140			0x110000
 
+struct apple_jpeg_write {
+	u32 offset;
+	u32 value;
+};
+
+/* Only the control/geometry and JPEG blocks are common to both layouts. */
+struct apple_jpeg_reg_layout {
+	u16 input_plane0, input_plane1, input_end;
+	u16 pipe_limit0, pipe_limit1;
+	u16 output_start0, output_start1, output_end;
+	u16 matrix_base;
+	u16 encode_format, component_pos_base, convert_cs;
+	u16 prefetch_read, prefetch_write, tiling;
+	u16 timeout, hwrev, image_width, image_height;
+	u16 decode_block_base;
+	u8 dma_addr_bits;
+	bool reset_complete;
+	const struct apple_jpeg_write *defaults;
+	u16 num_defaults;
+};
+
 struct apple_jpeg_variant {
+	const struct apple_jpeg_reg_layout *layout;
 	u32 hwrev_mask;
 	u32 hwrev;
+	u32 int_done_mask;
 };
 
-/*
- * T6041 identifies as 0x101008 but uses the same 64-bit address layout and
- * encode programming as T8140.
- */
-static const struct apple_jpeg_variant apple_jpeg_t6041 = {
-	.hwrev_mask = AJ_HWREV_MASK,
-	.hwrev = AJ_HWREV_T6041,
-};
-
-static const struct apple_jpeg_variant apple_jpeg_t8140 = {
-	.hwrev_mask = AJ_HWREV_MASK,
-	.hwrev = AJ_HWREV_T8140,
-};
+extern const struct apple_jpeg_variant apple_jpeg_t6000;
+extern const struct apple_jpeg_variant apple_jpeg_t6041;
+extern const struct apple_jpeg_variant apple_jpeg_t8112;
+extern const struct apple_jpeg_variant apple_jpeg_t8140;
 
 static inline bool
 apple_jpeg_hwrev_supported(const struct apple_jpeg_variant *variant, u32 hwrev)
@@ -120,11 +117,6 @@ apple_jpeg_hwrev_supported(const struct apple_jpeg_variant *variant, u32 hwrev)
 		return false;
 	return (hwrev & variant->hwrev_mask) == variant->hwrev;
 }
-
-struct apple_jpeg_write {
-	u32 offset;
-	u32 value;
-};
 
 struct apple_jpeg_job {
 	u32 width;
@@ -188,8 +180,10 @@ static inline u32 apple_jpeg_coded_size(u32 width, u32 height, u32 keep)
 
 void apple_jpeg_quant_tables(u32 quality, u8 luma[64], u8 chroma[64]);
 u32 apple_jpeg_timeout(u32 width, u32 height);
-int apple_jpeg_defaults(bool encode, struct apple_jpeg_write *w, unsigned int max);
-int apple_jpeg_build_job(const struct apple_jpeg_job *job, struct apple_jpeg_write *w,
+int apple_jpeg_defaults(const struct apple_jpeg_reg_layout *layout, bool encode,
+			struct apple_jpeg_write *w, unsigned int max);
+int apple_jpeg_build_job(const struct apple_jpeg_reg_layout *layout,
+			 const struct apple_jpeg_job *job, struct apple_jpeg_write *w,
 			 unsigned int max);
 
 #endif /* APPLE_JPEG_HW_H */

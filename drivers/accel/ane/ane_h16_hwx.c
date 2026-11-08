@@ -206,25 +206,14 @@ static int hwx_segment(struct hwx_parser *p, const u8 *c, u32 length)
 	return 0;
 }
 
-static bool hwx_format(u32 code)
-{
-	static const u8 known[] = {
-		0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 15, 16, 17,
-		18, 20, 21, 23, 27, 30, 31, 36, 41, 43, 72, 145,
-	};
-	unsigned int i;
-
-	for (i = 0; i < ARRAY_SIZE(known); i++)
-		if (known[i] == code)
-			return true;
-	return false;
-}
-
 static int hwx_program(struct hwx_parser *p)
 {
 	const u8 *c = p->bytes + p->info.program_offset;
 	struct ane_h16_hwx *info = &p->info;
-	u32 length = get_unaligned_le32(c + 4), records, i;
+	u32 length = get_unaligned_le32(c + 4), records, record_limit, i;
+	u32 prologue = info->subtype == ANE_HWX_SUBTYPE_H17 ? 0 : 1;
+	size_t final_end = 0;
+	u64 work_limit = 0;
 	bool mixed = length == 0x8c0;
 	/* Nonzero cells only; every other byte is checked below. */
 	static const u16 common[] = {
@@ -249,8 +238,6 @@ static int hwx_program(struct hwx_parser *p)
 	    get_unaligned_le32(c + 0x848) != (mixed ? 0x8b8 : 0x898))
 		return -ENOEXEC;
 	records = get_unaligned_le32(c + 0x860);
-	if (records != 0x10 && records != 0x12 && records != 0x1f && records != 0x20)
-		return -ENOEXEC;
 	info->tasks = get_unaligned_le32(c + 0x830);
 	if (mixed) {
 		u32 usable = get_unaligned_le32(c + 0x858);
@@ -271,7 +258,14 @@ static int hwx_program(struct hwx_parser *p)
 		    get_unaligned_le64(c + 0x78 + i * 16))
 			return -ENOEXEC;
 	}
-	if (!hwx_format(get_unaligned_le32(c + (mixed ? 0x8b0 : 0x890))))
+	/*
+	 * Work hints scale with tensor size, rather than selecting a format.
+	 * Bound them by the total validated surface allocation in bytes; they
+	 * never authorize an allocation, mapping or task-stream extent.
+	 */
+	for (i = 0; i < info->surface_count; i++)
+		work_limit += info->surfaces[i].allocation;
+	if (get_unaligned_le32(c + (mixed ? 0x8b0 : 0x890)) > work_limit)
 		return -ENOEXEC;
 
 	/* Construct the exact fixed trailer and reserved-space expectation. */
@@ -301,10 +295,22 @@ static int hwx_program(struct hwx_parser *p)
 	}
 	memcpy(expected + (mixed ? 0x8b0 : 0x890), c + (mixed ? 0x8b0 : 0x890), 4);
 	memcpy(expected + (mixed ? 0x8b8 : 0x898), "main", 5);
-	if (!memcmp(c, expected, length))
-		ret = ane_hx_task_stream_validate(p->bytes + info->text.offset,
-						  info->text.size, info->tasks,
-						  info->subtype == ANE_HWX_SUBTYPE_H17 ? 0 : 1);
+	if (!memcmp(c, expected, length)) {
+		ret = ane_hx_task_stream_validate_limit(p->bytes + info->text.offset,
+							info->text.size, info->tasks, prologue,
+							&record_limit, &final_end);
+		/* This compiler hint need not equal the encoded record count. */
+		if (!ret && (!records || records > record_limit))
+			ret = -ENOEXEC;
+		/*
+		 * On H16 the final task must end the section: zero padding or
+		 * zero blocks after it leave the engine armed, and the next
+		 * EXECUTE on the device times out.
+		 */
+		if (!ret && info->subtype == ANE_HWX_SUBTYPE_H16 &&
+		    final_end != info->text.size)
+			ret = -ENOEXEC;
+	}
 	kfree(expected);
 	return ret;
 }
