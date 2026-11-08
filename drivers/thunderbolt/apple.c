@@ -217,6 +217,21 @@ static const struct apple_cio_hw apple_cio_t6040_hw = {
 #define APPLE_CIO_SLEEP_RESTART_FALLBACK_MS 10000
 /* How long a forced cable cycle may take before it no longer counts. */
 #define APPLE_CIO_RESUME_RECOVERY_WINDOW_MS 30000
+/* A started port with a USB4/TBT cable and no remote discovery by then is restarted. */
+#define APPLE_CIO_LINK_WATCH_MS 20000
+#define APPLE_CIO_LINK_WATCH_RESTARTS 5
+
+/*
+ * The router firmware gives up on a link whose sideband drops during
+ * training ("Dead End") and waits for the host to power the port off.
+ * A partner whose router is still recovering from our last disconnect
+ * (a reboot of this Mac, a sleep) does exactly that. Restart such a
+ * port a few times until a partner answers.
+ */
+static bool link_watch = true;
+module_param(link_watch, bool, 0644);
+MODULE_PARM_DESC(link_watch,
+		 "Restart a port that has a USB4/Thunderbolt cable but no link 20 s after start (default Y)");
 
 static bool resume_recovery;
 module_param(resume_recovery, bool, 0644);
@@ -325,6 +340,9 @@ struct apple_cio {
 	bool resume_recovery_failed; /* terminal recovery failure */
 	bool resume_link_failed; /* protected by lock */
 	bool resume_link_pending; /* set by NHI resume, consumed by ACIO complete */
+	struct delayed_work link_watch_work;
+	u64 link_watch_activity; /* protected by lock: remote activity at start */
+	unsigned int link_watch_restarts; /* protected by lock */
 	struct notifier_block pm_notifier;
 	struct delayed_work sleep_restart_work;
 	enum {
@@ -2617,6 +2635,59 @@ static int apple_cio_lstx_release(struct apple_cio *acio)
  * dropping the power-domain links. The Type-C PHY must remain configured
  * until this function returns. The caller must hold @acio->lock.
  */
+/* Remote discovery exchanges on this port's domain so far, or 0 without an NHI. */
+static u64 apple_cio_remote_activity(struct apple_cio *acio)
+{
+	struct platform_device *pdev = READ_ONCE(acio->nhi_pdev);
+	struct apple_nhi *anhi;
+	u64 activity = 0;
+
+	lockdep_assert_held(&acio->lock);
+	if (!pdev)
+		return 0;
+	device_lock(&pdev->dev);
+	anhi = platform_get_drvdata(pdev);
+	if (pdev->dev.driver && anhi && anhi->tb)
+		activity = atomic64_read(&anhi->tb->remote_activity);
+	device_unlock(&pdev->dev);
+	return activity;
+}
+
+static int apple_cio_start(struct apple_cio *acio);
+
+static void apple_cio_stop(struct apple_cio *acio);
+
+static void apple_cio_link_watch_work(struct work_struct *work)
+{
+	struct apple_cio *acio = container_of(to_delayed_work(work),
+					      struct apple_cio, link_watch_work);
+	int ret;
+
+	guard(mutex)(&acio->lock);
+	if (!READ_ONCE(link_watch) || acio->removing ||
+	    !acio->current_cable_info ||
+	    acio->current_cable_info != acio->target_cable_info ||
+	    acio->sleep_phase != APPLE_CIO_SLEEP_OPEN)
+		return;
+	if (apple_cio_remote_activity(acio) != acio->link_watch_activity) {
+		acio->link_watch_restarts = 0;
+		return;
+	}
+	if (acio->link_watch_restarts >= APPLE_CIO_LINK_WATCH_RESTARTS) {
+		dev_warn(acio->dev, "no USB4 link after %u port restarts, leaving the port as it is\n",
+			 acio->link_watch_restarts);
+		return;
+	}
+	acio->link_watch_restarts++;
+	dev_info(acio->dev, "no USB4 link %u s after start, restarting the port (%u/%u)\n",
+		 APPLE_CIO_LINK_WATCH_MS / 1000, acio->link_watch_restarts,
+		 APPLE_CIO_LINK_WATCH_RESTARTS);
+	apple_cio_stop(acio);
+	ret = apple_cio_start(acio);
+	if (ret)
+		dev_err(acio->dev, "port restart failed: %d\n", ret);
+}
+
 static void apple_cio_stop(struct apple_cio *acio)
 {
 	int ret, i;
@@ -2866,6 +2937,10 @@ static int apple_cio_start(struct apple_cio *acio)
 	}
 
 	acio->current_cable_info = acio->target_cable_info;
+	acio->link_watch_activity = apple_cio_remote_activity(acio);
+	if (READ_ONCE(link_watch))
+		mod_delayed_work(system_freezable_wq, &acio->link_watch_work,
+				 msecs_to_jiffies(APPLE_CIO_LINK_WATCH_MS));
 	return 0;
 
 err_depopulate:
@@ -3002,8 +3077,9 @@ static int apple_cio_prepare(struct device *dev)
 {
 	struct apple_cio *acio = dev_get_drvdata(dev);
 
-	/* Drain before taking lock; the worker acquires it to check the link. */
+	/* Drain before taking lock; the workers acquire it to check the link. */
 	cancel_delayed_work_sync(&acio->resume_link_work);
+	cancel_delayed_work_sync(&acio->link_watch_work);
 	scoped_guard(mutex, &acio->lock) {
 		WRITE_ONCE(acio->resume_link_pending, false);
 		acio->resume_link_failed = false;
@@ -3066,6 +3142,7 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 	switch (data->state) {
 	case TYPEC_THUNDERBOLT_SWITCH_OFF:
 		acio->target_cable_info = 0;
+		acio->link_watch_restarts = 0;
 		break;
 	case TYPEC_THUNDERBOLT_SWITCH_TBT:
 		acio->target_cable_info = TB_VSE_CAP_APPLE_CABLE_INFO_PRESENT;
@@ -3292,6 +3369,7 @@ static int apple_cio_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&acio->pcie_tunnel_work,
 			  apple_cio_pcie_tunnel_work);
 	INIT_DELAYED_WORK(&acio->resume_link_work, apple_cio_resume_link_work);
+	INIT_DELAYED_WORK(&acio->link_watch_work, apple_cio_link_watch_work);
 	INIT_DELAYED_WORK(&acio->sleep_restart_work, apple_cio_sleep_restart_work);
 	init_completion(&acio->nhi_boot_completion);
 	acio->dev = &pdev->dev;
@@ -3492,6 +3570,7 @@ static void apple_cio_remove(struct platform_device *pdev)
 	disable_delayed_work_sync(&acio->sleep_restart_work);
 
 	disable_delayed_work_sync(&acio->resume_link_work);
+	disable_delayed_work_sync(&acio->link_watch_work);
 	/* The worker can notify this switch; stop current and future enqueues. */
 	disable_delayed_work_sync(&acio->pcie_tunnel_work);
 	/* A set may hold the switch read lock while waiting for acio->lock. */
