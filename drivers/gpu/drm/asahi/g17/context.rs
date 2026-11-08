@@ -643,7 +643,7 @@ mod capacity_tests {
             assert!(matches!(ids.acquire(), Err(ENOSPC)));
             drop(clients);
             assert_eq!(ids.used(), 0);
-            assert_eq!(*ids.used.lock(), 3);
+            assert_eq!(ids.state.lock().used, 3);
         }
     }
 }
