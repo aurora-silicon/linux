@@ -3177,6 +3177,11 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 			goto rollback;
 		}
 		devinfo->irq_wake_enabled = true;
+		/* The firmware wakes the host with its ordinary D2H doorbell or
+		 * mailbox interrupt; it must not stay masked across host sleep.
+		 */
+		if (!brcmf_pcie_read_pcie32(devinfo, devinfo->reginfo->mailboxmask))
+			brcmf_pcie_intr_enable(devinfo);
 		/*
 		 * Firmware host sleep is distinct from PCI D3hot. An MSI wake
 		 * needs the function and its upstream bridges to remain in D0.

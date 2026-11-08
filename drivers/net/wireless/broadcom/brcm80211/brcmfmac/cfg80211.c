@@ -91,20 +91,12 @@
 #define BRCMF_PS_MAX_TIMEOUT_MS		2000
 
 #define BRCMF_LPAS_UNICAST_FILTER_ID	100
-#define BRCMF_LPAS_MAGIC_UDP4_FILTER_ID	101
-#define BRCMF_LPAS_MAGIC_UDP6_FILTER_ID	102
-#define BRCMF_LPAS_MAGIC_ETH_FILTER_ID	103
+#define BRCMF_LPAS_MAGIC_FILTER_ID	101
 /* Magic packet: six 0xff bytes, then the station address sixteen times. */
 #define BRCMF_LPAS_MAGIC_LEN		(ETH_ALEN * 17)
-/* Payload offsets of a magic packet in UDP over IPv4/IPv6 (no IP options)
- * and directly after the EtherType 0x0842 of a raw Ethernet frame.
- */
-#define BRCMF_LPAS_MAGIC_UDP4_OFFSET	(ETH_HLEN + 20 + 8)
-#define BRCMF_LPAS_MAGIC_UDP6_OFFSET	(ETH_HLEN + 40 + 8)
-#define BRCMF_LPAS_MAGIC_ETH_OFFSET	(ETH_HLEN - 2)
-#define BRCMF_LPAS_MAGIC_ETHERTYPE	0x0842
 #define BRCMF_LPAS_PKT_FILTER_MODE	1
-#define BRCMF_LPAS_PKT_FILTER_PATTERN	0
+#define BRCMF_LPAS_PKT_FILTER_PATTERN	0	/* fixed-offset pattern match */
+#define BRCMF_LPAS_PKT_FILTER_MAGIC	1	/* magic pattern, offset or later */
 
 /* Dump obss definitions */
 #define ACS_MSRMNT_DELAY		80
@@ -4394,8 +4386,9 @@ static int brcmf_lpas_eventmask_enable(u8 *mask, size_t mask_len,
 	return 0;
 }
 
-static int brcmf_lpas_filter_add(struct brcmf_if *ifp, u32 id, u32 offset,
-				 const u8 *mask, const u8 *pattern, size_t len)
+static int brcmf_lpas_filter_add(struct brcmf_if *ifp, u32 id, u32 type,
+				 u32 offset, const u8 *mask, const u8 *pattern,
+				 size_t len)
 {
 	struct brcmf_pkt_filter_le *filter;
 	size_t head = offsetof(struct brcmf_pkt_filter_le,
@@ -4407,7 +4400,7 @@ static int brcmf_lpas_filter_add(struct brcmf_if *ifp, u32 id, u32 offset,
 		return -ENOMEM;
 
 	filter->id = cpu_to_le32(id);
-	filter->type = cpu_to_le32(BRCMF_LPAS_PKT_FILTER_PATTERN);
+	filter->type = cpu_to_le32(type);
 	filter->negate_match = cpu_to_le32(0);
 	filter->u.pattern.offset = cpu_to_le32(offset);
 	filter->u.pattern.size_bytes = cpu_to_le32(len);
@@ -4444,13 +4437,13 @@ static int brcmf_lpas_filter_remove(struct brcmf_if *ifp, u32 id)
 }
 
 /* Install one filter and enable it; on failure leave nothing behind. */
-static int brcmf_lpas_filter_install(struct brcmf_if *ifp, u32 id, u32 offset,
-				     const u8 *mask, const u8 *pattern,
-				     size_t len)
+static int brcmf_lpas_filter_install(struct brcmf_if *ifp, u32 id, u32 type,
+				     u32 offset, const u8 *mask,
+				     const u8 *pattern, size_t len)
 {
 	int err;
 
-	err = brcmf_lpas_filter_add(ifp, id, offset, mask, pattern, len);
+	err = brcmf_lpas_filter_add(ifp, id, type, offset, mask, pattern, len);
 	if (err)
 		return err;
 	err = brcmf_lpas_filter_enable(ifp, id, true);
@@ -4461,9 +4454,7 @@ static int brcmf_lpas_filter_install(struct brcmf_if *ifp, u32 id, u32 offset,
 
 static const u32 brcmf_lpas_filter_ids[] = {
 	BRCMF_LPAS_UNICAST_FILTER_ID,
-	BRCMF_LPAS_MAGIC_UDP4_FILTER_ID,
-	BRCMF_LPAS_MAGIC_UDP6_FILTER_ID,
-	BRCMF_LPAS_MAGIC_ETH_FILTER_ID,
+	BRCMF_LPAS_MAGIC_FILTER_ID,
 };
 
 static int brcmf_lpas_filters_remove(struct brcmf_if *ifp, unsigned long *map)
@@ -4482,23 +4473,26 @@ static int brcmf_lpas_filters_remove(struct brcmf_if *ifp, unsigned long *map)
 
 /*
  * Forward-on-match filters decide which frames reach (and so wake) the
- * host while LPAS keeps the association. "any" passes every unicast frame,
- * as public DHD's minimal suspend policy does. A magic-packet trigger
- * passes only frames that carry the magic sequence for this interface's
- * address at the UDP payload start (IPv4 and IPv6) or after EtherType
- * 0x0842. ARP and neighbour discovery are answered by their offloads.
+ * host while LPAS keeps the association. "any" passes every unicast frame
+ * with a fixed-offset pattern filter, as public DHD's minimal suspend
+ * policy does. A magic-packet trigger uses the firmware's magic pattern
+ * filter, which matches the sequence at the given offset or anywhere later,
+ * so one filter from the start of the Ethernet payload covers UDP over IPv4
+ * and IPv6 and EtherType 0x0842. ARP and neighbour discovery are answered by
+ * their offloads.
  */
 static int brcmf_lpas_filters_install(struct brcmf_if *ifp,
 				      struct cfg80211_wowlan *trig,
 				      unsigned long *map)
 {
 	static const u8 ucast_mask[] = { 0x01 }, ucast_pattern[] = { 0x00 };
-	u8 mask[2 + BRCMF_LPAS_MAGIC_LEN], magic[2 + BRCMF_LPAS_MAGIC_LEN];
+	u8 mask[BRCMF_LPAS_MAGIC_LEN], magic[BRCMF_LPAS_MAGIC_LEN];
 	int i, err;
 
 	if (trig->any) {
 		err = brcmf_lpas_filter_install(ifp,
-						BRCMF_LPAS_UNICAST_FILTER_ID, 0,
+						BRCMF_LPAS_UNICAST_FILTER_ID,
+						BRCMF_LPAS_PKT_FILTER_PATTERN, 0,
 						ucast_mask, ucast_pattern, 1);
 		if (err)
 			return err;
@@ -4507,35 +4501,17 @@ static int brcmf_lpas_filters_install(struct brcmf_if *ifp,
 	}
 
 	memset(mask, 0xff, sizeof(mask));
-	magic[0] = BRCMF_LPAS_MAGIC_ETHERTYPE >> 8;
-	magic[1] = BRCMF_LPAS_MAGIC_ETHERTYPE & 0xff;
-	memset(magic + 2, 0xff, ETH_ALEN);
+	memset(magic, 0xff, ETH_ALEN);
 	for (i = 1; i <= 16; i++)
-		memcpy(magic + 2 + i * ETH_ALEN, ifp->ndev->dev_addr, ETH_ALEN);
+		memcpy(magic + i * ETH_ALEN, ifp->ndev->dev_addr, ETH_ALEN);
 
-	err = brcmf_lpas_filter_install(ifp, BRCMF_LPAS_MAGIC_UDP4_FILTER_ID,
-					BRCMF_LPAS_MAGIC_UDP4_OFFSET, mask,
-					magic + 2, BRCMF_LPAS_MAGIC_LEN);
+	err = brcmf_lpas_filter_install(ifp, BRCMF_LPAS_MAGIC_FILTER_ID,
+					BRCMF_LPAS_PKT_FILTER_MAGIC, ETH_HLEN,
+					mask, magic, sizeof(magic));
 	if (err)
-		goto fail;
+		return err;
 	__set_bit(1, map);
-	err = brcmf_lpas_filter_install(ifp, BRCMF_LPAS_MAGIC_UDP6_FILTER_ID,
-					BRCMF_LPAS_MAGIC_UDP6_OFFSET, mask,
-					magic + 2, BRCMF_LPAS_MAGIC_LEN);
-	if (err)
-		goto fail;
-	__set_bit(2, map);
-	err = brcmf_lpas_filter_install(ifp, BRCMF_LPAS_MAGIC_ETH_FILTER_ID,
-					BRCMF_LPAS_MAGIC_ETH_OFFSET, mask,
-					magic, sizeof(magic));
-	if (err)
-		goto fail;
-	__set_bit(3, map);
 	return 0;
-
-fail:
-	brcmf_lpas_filters_remove(ifp, map);
-	return err;
 }
 
 static void brcmf_lpas_restore_offloads(struct brcmf_if *ifp,
@@ -4675,14 +4651,23 @@ static int brcmf_configure_lpas(struct brcmf_cfg80211_info *cfg,
 	if (err)
 		goto rollback;
 
-	err = brcmf_lpas_filters_install(ifp, trig, &wowl->lpas_filters);
-	if (err)
-		goto rollback;
 	err = brcmf_fil_iovar_int_set(ifp, "pkt_filter_mode",
 					   BRCMF_LPAS_PKT_FILTER_MODE);
 	if (err)
 		goto rollback;
 	filter_mode_changed = true;
+
+	/* The firmware arms a sleep filter as a host-wake source only when it
+	 * is added and enabled while LPAS is already on.
+	 */
+	lpas_attempted = true;
+	err = brcmf_fil_iovar_int_set(ifp, "lpas", 1);
+	if (err)
+		goto rollback;
+
+	err = brcmf_lpas_filters_install(ifp, trig, &wowl->lpas_filters);
+	if (err)
+		goto rollback;
 
 	err = brcmf_fil_iovar_int_set(ifp, "nolinkup", 1);
 	if (err)
@@ -4692,11 +4677,6 @@ static int brcmf_configure_lpas(struct brcmf_cfg80211_info *cfg,
 	if (err)
 		goto rollback;
 	events_changed = true;
-
-	lpas_attempted = true;
-	err = brcmf_fil_iovar_int_set(ifp, "lpas", 1);
-	if (err)
-		goto rollback;
 
 	wowl->lpas_event_mask = saved_mask;
 	wowl->lpas_event_mask_len = mask_len;
