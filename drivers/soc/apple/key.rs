@@ -17,6 +17,18 @@
 //! handle to it ever reaches userspace, and every signature needs its own
 //! touch. The enclave refuses the signature for any other context; the
 //! header's flag only tells the kernel to ask for the touch.
+//!
+//! `CREATE_BIOMETRY_ANY` is macOS's `.biometryAny`: the same list without
+//! the enrolled-set hash, so any finger enrolled in this catacomb matches,
+//! including fingers enrolled after the key was made.
+//!
+//! macOS's `.userPresence` (Touch ID or the password) and `.devicePasscode`
+//! need a passcode credential the enclave checks against the user's own
+//! secret. On Linux the only passcode the enclave knows today is the identity
+//! key bag's secret, which root holds, so those policies would be
+//! root-satisfiable. Their `CREATE` bits are reserved and refused with
+//! `EOPNOTSUPP` until a per-user, password-keyed bag exists; they are never
+//! emulated in software.
 
 use crate::der::RefKeyValue as RV;
 use crate::SepData;
@@ -39,7 +51,36 @@ pub(crate) const SIG_MAX: usize = 72;
 /// `CREATE` flag: signing needs a Touch ID match of a currently enrolled
 /// finger, enforced by the enclave.
 pub(crate) const CREATE_BIOMETRY_CURRENT_SET: u32 = 1;
-const CREATE_FLAGS: u32 = CREATE_BIOMETRY_CURRENT_SET;
+/// `CREATE` flag: signing needs a Touch ID match of any finger enrolled in
+/// this catacomb, now or later, enforced by the enclave.
+pub(crate) const CREATE_BIOMETRY_ANY: u32 = 2;
+/// Reserved `CREATE` flags for macOS's `.userPresence` and `.devicePasscode`.
+/// Refused with `EOPNOTSUPP` until the enclave can check the user's own
+/// password (see the module comment).
+pub(crate) const CREATE_USER_PRESENCE: u32 = 4;
+pub(crate) const CREATE_DEVICE_PASSCODE: u32 = 8;
+const CREATE_FLAGS: u32 = CREATE_BIOMETRY_CURRENT_SET | CREATE_BIOMETRY_ANY;
+const CREATE_RESERVED: u32 = CREATE_USER_PRESENCE | CREATE_DEVICE_PASSCODE;
+
+/// The access policy a `CREATE` request asks for: at most one policy bit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Policy {
+    None,
+    BiometryCurrentSet,
+    BiometryAny,
+}
+
+pub(crate) fn create_policy(flags: u32) -> Result<Policy> {
+    if flags & !(CREATE_FLAGS | CREATE_RESERVED) != 0 || flags.count_ones() > 1 {
+        return Err(EINVAL);
+    }
+    match flags {
+        0 => Ok(Policy::None),
+        CREATE_BIOMETRY_CURRENT_SET => Ok(Policy::BiometryCurrentSet),
+        CREATE_BIOMETRY_ANY => Ok(Policy::BiometryAny),
+        _ => Err(EOPNOTSUPP),
+    }
+}
 
 /// A touch-gated `SIGN` asks for a finger again after a capture that saw
 /// none until this long has passed; one capture itself waits up to a minute.
@@ -52,6 +93,9 @@ const HANDLE_MAGIC: &[u8; 4] = b"SEPK";
 const HANDLE_VERSION: u8 = 1;
 /// Handle flag: the record carries a biometric access-control list.
 pub(crate) const HANDLE_BIOMETRY: u8 = 0x01;
+/// Handle flag, with `HANDLE_BIOMETRY` only: the list names no enrolled-set
+/// hash (biometry-any).
+pub(crate) const HANDLE_BIOMETRY_ANY: u8 = 0x02;
 pub(crate) const HANDLE_HEADER: usize = 12;
 /// The largest enclave record a handle can carry.
 pub(crate) const BLOB_MAX: usize = HANDLE_MAX - HANDLE_HEADER;
@@ -121,6 +165,13 @@ pub(crate) const SELFTEST_DELETED: u32 = 4;
 /// One touch: sign in the matched context, delete it, sign again with it
 /// (needs a finger).
 pub(crate) const SELFTEST_TOUCH_THEN_DELETED: u32 = 5;
+/// Research probe, no finger, ignores the handle: make a throwaway key with
+/// macOS's `.userPresence` list (`cpo` "DeviceOwnerAuthentication") and sign
+/// with a context holding only the key bag's secret (`result`) and with an
+/// unsatisfied context (`result2`). Shows whether the enclave enforces that
+/// policy and whether a root-held secret satisfies it; `CREATE` refuses the
+/// policy either way.
+pub(crate) const SELFTEST_PRESENCE_PROBE: u32 = 6;
 
 static_assert!(core::mem::size_of::<Info>() == 16);
 static_assert!(core::mem::size_of::<Create>() == 2124);
@@ -163,9 +214,14 @@ pub(crate) fn info() -> Info {
     }
 }
 
+/// No flags, biometry (current set), or biometry plus biometry-any.
+fn handle_flags_valid(flags: u8) -> bool {
+    matches!(flags, 0 | HANDLE_BIOMETRY | 0x03)
+}
+
 /// Writes the handle for `blob` with `flags` into `out`; returns its length.
 pub(crate) fn encode_handle(blob: &[u8], flags: u8, out: &mut [u8; HANDLE_MAX]) -> Result<usize> {
-    if blob.is_empty() || blob.len() > BLOB_MAX || flags & !HANDLE_BIOMETRY != 0 {
+    if blob.is_empty() || blob.len() > BLOB_MAX || !handle_flags_valid(flags) {
         return Err(EINVAL);
     }
     let len = u32::try_from(blob.len()).map_err(|_| EINVAL)?;
@@ -187,7 +243,7 @@ pub(crate) fn decode_handle(handle: &[u8; HANDLE_MAX], len: u32) -> Result<(&[u8
     if !(HANDLE_HEADER + 1..=HANDLE_MAX).contains(&len) {
         return Err(EINVAL);
     }
-    if &handle[..4] != HANDLE_MAGIC || handle[4] != HANDLE_VERSION || handle[5] & !HANDLE_BIOMETRY != 0 {
+    if &handle[..4] != HANDLE_MAGIC || handle[4] != HANDLE_VERSION || !handle_flags_valid(handle[5]) {
         return Err(EINVAL);
     }
     if handle[6] != 0 || handle[7] != 0 {
@@ -211,23 +267,43 @@ pub(crate) fn put_signature(sig: &[u8], out: &mut Sign) -> Result<()> {
     Ok(())
 }
 
+/// macOS's `.userPresence` list: every constrained operation names the
+/// `DeviceOwnerAuthentication` policy (Touch ID or the password). Used only
+/// by `SELFTEST_PRESENCE_PROBE`.
+pub(crate) fn presence_acl() -> Result<KVec<u8>> {
+    let constraint =
+        crate::der::encode_refkey_set(&[(b"cpo".as_slice(), RV::Utf8(b"DeviceOwnerAuthentication"))])?;
+    let acl = crate::der::encode_refkey_set(&[
+        (b"oa".as_slice(), RV::Bool(true)),
+        (b"ock".as_slice(), RV::Der(&constraint)),
+        (b"odel".as_slice(), RV::Bool(true)),
+        (b"okd".as_slice(), RV::Der(&constraint)),
+        (b"osgn".as_slice(), RV::Der(&constraint)),
+    ])?;
+    crate::der::encode_refkey_set(&[(b"acl".as_slice(), RV::Der(&acl))])
+}
+
 /// The access-control list of a biometry-current-set key, in the key
 /// store's DER, and the constraint its signing operation carries.
 ///
 /// As macOS writes it for `.privateKeyUsage | .biometryCurrentSet`: sign,
 /// key agreement (`ock`) and derivation (`okd`) need a biometric credential
 /// (`cbio`) for this catacomb (`pbioc`) and enrolled set (`pbioh`); delete
-/// (`odel`) and attest (`oa`) are free.
+/// (`odel`) and attest (`oa`) are free. With no `enrolled_hash` it is the
+/// `.biometryAny` list: `cbio` names the catacomb only.
 pub(crate) struct BioAcl {
     pub(crate) ed: KVec<u8>,
     pub(crate) constraint: KVec<u8>,
 }
 
-pub(crate) fn bio_acl(catacomb: &[u8; 16], enrolled_hash: &[u8; 32]) -> Result<BioAcl> {
-    let cbio = crate::der::encode_refkey_set(&[
-        (b"pbioc".as_slice(), RV::Octets(catacomb)),
-        (b"pbioh".as_slice(), RV::Octets(enrolled_hash)),
-    ])?;
+pub(crate) fn bio_acl(catacomb: &[u8; 16], enrolled_hash: Option<&[u8; 32]>) -> Result<BioAcl> {
+    let cbio = match enrolled_hash {
+        Some(hash) => crate::der::encode_refkey_set(&[
+            (b"pbioc".as_slice(), RV::Octets(catacomb)),
+            (b"pbioh".as_slice(), RV::Octets(hash)),
+        ])?,
+        None => crate::der::encode_refkey_set(&[(b"pbioc".as_slice(), RV::Octets(catacomb))])?,
+    };
     let constraint = crate::der::encode_refkey_set(&[(b"cbio".as_slice(), RV::Der(&cbio))])?;
     let acl = crate::der::encode_refkey_set(&[
         (b"oa".as_slice(), RV::Bool(true)),
@@ -354,14 +430,46 @@ mod tests {
         let n = encode_handle(&blob(), HANDLE_BIOMETRY, &mut h).unwrap() as u32;
         assert_eq!(decode_handle(&h, n).unwrap().1, HANDLE_BIOMETRY);
         assert!(encode_handle(&blob(), 0x02, &mut h).is_err());
+        assert!(encode_handle(&blob(), 0x04, &mut h).is_err());
         let mut bad = h;
         bad[5] = 0x02;
         assert!(decode_handle(&bad, n).is_err());
+        let n = encode_handle(&blob(), HANDLE_BIOMETRY | HANDLE_BIOMETRY_ANY, &mut h).unwrap() as u32;
+        assert_eq!(decode_handle(&h, n).unwrap().1, HANDLE_BIOMETRY | HANDLE_BIOMETRY_ANY);
+    }
+
+    #[test]
+    fn create_takes_one_policy_and_refuses_the_password_ones() {
+        assert_eq!(create_policy(0).unwrap(), Policy::None);
+        assert_eq!(create_policy(CREATE_BIOMETRY_CURRENT_SET).unwrap(), Policy::BiometryCurrentSet);
+        assert_eq!(create_policy(CREATE_BIOMETRY_ANY).unwrap(), Policy::BiometryAny);
+        assert_eq!(create_policy(CREATE_USER_PRESENCE).unwrap_err(), EOPNOTSUPP);
+        assert_eq!(create_policy(CREATE_DEVICE_PASSCODE).unwrap_err(), EOPNOTSUPP);
+        assert_eq!(create_policy(CREATE_BIOMETRY_CURRENT_SET | CREATE_BIOMETRY_ANY).unwrap_err(), EINVAL);
+        assert_eq!(create_policy(0x10).unwrap_err(), EINVAL);
+        assert_eq!(info().flags_supported, CREATE_BIOMETRY_CURRENT_SET | CREATE_BIOMETRY_ANY);
+    }
+
+    #[test]
+    fn biometry_any_list_names_the_catacomb_only() {
+        let acl = bio_acl(&[0x11; 16], None).unwrap();
+        // SET { SEQ { "cbio", SET { SEQ { "pbioc", OCTETS[16] } } } }
+        assert_eq!(acl.constraint.len(), 2 + 2 + 6 + 2 + (2 + 7 + 18));
+        assert!(!acl.ed.windows(5).any(|w| w == b"pbioh"));
+        assert!(acl.ed.windows(5).any(|w| w == b"pbioc"));
+    }
+
+    #[test]
+    fn presence_list_has_the_captured_shape() {
+        let ed = presence_acl().unwrap();
+        // macOS: each constrained op is SET(34) { SEQ { "cpo", "DeviceOwnerAuthentication" } }.
+        assert_eq!(ed.windows(2).filter(|w| *w == [0x31u8, 34].as_slice()).count(), 3);
+        assert_eq!(ed.windows(25).filter(|w| *w == b"DeviceOwnerAuthentication").count(), 3);
     }
 
     #[test]
     fn biometric_acl_has_the_key_store_shape() {
-        let acl = bio_acl(&[0x11; 16], &[0x22; 32]).unwrap();
+        let acl = bio_acl(&[0x11; 16], Some(&[0x22; 32])).unwrap();
         // SET { SEQ { "cbio", SET { SEQ { "pbioc", OCTETS[16] }, SEQ { "pbioh", OCTETS[32] } } } }
         assert_eq!(acl.constraint.len(), 2 + 2 + 6 + 2 + (2 + 7 + 18) + (2 + 7 + 34));
         assert_eq!(&acl.constraint[..2], &[0x31, 0x50]);
@@ -377,7 +485,7 @@ mod tests {
 
     #[test]
     fn acl_constraint_command_has_the_captured_layout() {
-        let acl = bio_acl(&[0x11; 16], &[0x22; 32]).unwrap();
+        let acl = bio_acl(&[0x11; 16], Some(&[0x22; 32])).unwrap();
         let cmd = crate::scrd::scrd_verify_acl_constraint(&[0x33; 16], &acl.constraint, b"ock").unwrap();
         // macOS: 138 bytes for a 94-byte constraint and "ock"; this one is 80 bytes.
         assert_eq!(cmd.len(), 8 + 16 + 4 + acl.constraint.len() + 4 + 3 + 1 + 8);
@@ -418,12 +526,12 @@ impl SepData {
             || crate::bio::capture_is_live(&self.bio_session.lock(), self.capture_epoch.load(Relaxed))
     }
 
-    fn key_bio_acl(&self) -> Result<BioAcl> {
+    fn key_bio_acl(&self, any: bool) -> Result<BioAcl> {
         if !self.touchid_started.load(Relaxed) {
             return Err(ENODEV);
         }
         let (catacomb, enrolled) = self.catacomb_binding()?;
-        bio_acl(&catacomb, &enrolled)
+        bio_acl(&catacomb, (!any).then_some(&enrolled))
     }
 
     /// Evaluates the signing constraint on the fresh context before the
@@ -533,8 +641,8 @@ impl SepData {
     /// A touch-gated signature: one fresh credential context, one Touch ID
     /// match in it, the signature, and the context deleted, all inside this
     /// call. Waits about a minute for a finger.
-    fn key_sign_with_touch(&self, blob: &[u8], digest: &[u8; DIGEST_LEN], again: bool) -> Result<KeyTouch> {
-        let acl = self.key_bio_acl()?;
+    fn key_sign_with_touch(&self, blob: &[u8], flags: u8, digest: &[u8; DIGEST_LEN], again: bool) -> Result<KeyTouch> {
+        let acl = self.key_bio_acl(flags & HANDLE_BIOMETRY_ANY != 0)?;
         let mut owned = KVec::new();
         owned.extend_from_slice(blob, GFP_KERNEL)?;
         // Serialises with /dev/sep-bio's enrol and verify work, as they do
@@ -624,11 +732,41 @@ impl SepData {
         Ok(handle)
     }
 
+    fn key_presence_probe(&self, req: &mut Selftest) -> Result<()> {
+        let ed = presence_acl()?;
+        let (blob, _) = self.user_key_create(Some(&ed))?;
+        let digest = req.digest;
+        let user = crate::sbio::UserId::new(crate::SBIO_PROBE_USER_ID).ok_or(EINVAL)?;
+        let record = |r: Result<KVec<u8>>, s: &SepData| -> (i32, i32) {
+            (r.err().map(|e| e.to_errno()).unwrap_or(0), s.last_key_status.load(Relaxed) as i32)
+        };
+        self.last_key_status.store(0, Relaxed);
+        let ctx = self.passcode_context()?;
+        (req.result, req.enclave_status) = record(self.user_key_sign(&blob, &digest, Some(&ctx)), self);
+        self.close_unlock_evaluation(&ctx);
+        self.last_key_status.store(0, Relaxed);
+        let ctx = self.open_unlock_evaluation(user).ok_or(EIO)?;
+        (req.result2, req.enclave_status2) = record(self.user_key_sign(&blob, &digest, Some(&ctx)), self);
+        self.close_unlock_evaluation(&ctx);
+        dev_info!(
+            self.dev,
+            "sep-key: self-test presence probe: bag-secret context {} (enclave status {}), unsatisfied context {} (enclave status {})\n",
+            (if req.result == 0 { "SIGNED" } else { "refused" }),
+            req.enclave_status,
+            (if req.result2 == 0 { "SIGNED" } else { "refused" }),
+            req.enclave_status2
+        );
+        Ok(())
+    }
+
     fn key_selftest(&self, req: &mut Selftest) -> Result<()> {
         if crate::module_parameters::key_selftest.value() == 0 {
             return Err(EPERM);
         }
         crate::bio::require_admin()?;
+        if req.mode == SELFTEST_PRESENCE_PROBE {
+            return self.key_presence_probe(req);
+        }
         let (blob, flags) = decode_handle(&req.handle, req.handle_len)?;
         if flags & HANDLE_BIOMETRY == 0 {
             return Err(EINVAL);
@@ -661,7 +799,7 @@ impl SepData {
                 record(self.user_key_sign(&owned, &digest, Some(&ctx)), self)
             }
             SELFTEST_TOUCH_THEN_DELETED => {
-                let job = self.key_sign_with_touch(&owned, &digest, true)?;
+                let job = self.key_sign_with_touch(&owned, flags, &digest, true)?;
                 req.result2 = errno_of(&job.again);
                 req.enclave_status2 = job.again_status;
                 (errno_of(&job.sig), job.status)
@@ -693,13 +831,15 @@ impl SepData {
                 let slice = UserSlice::new(user, core::mem::size_of::<Create>());
                 let (mut reader, mut writer) = slice.reader_writer();
                 let mut req: Create = reader.read()?;
-                if req.flags & !CREATE_FLAGS != 0 || req.reserved != [0; 3] {
+                if req.reserved != [0; 3] {
                     return Err(EINVAL);
                 }
-                let biometry = req.flags & CREATE_BIOMETRY_CURRENT_SET != 0;
-                let acl = if biometry { Some(self.key_bio_acl()?) } else { None };
+                let (acl, flags) = match create_policy(req.flags)? {
+                    Policy::None => (None, 0),
+                    Policy::BiometryCurrentSet => (Some(self.key_bio_acl(false)?), HANDLE_BIOMETRY),
+                    Policy::BiometryAny => (Some(self.key_bio_acl(true)?), HANDLE_BIOMETRY | HANDLE_BIOMETRY_ANY),
+                };
                 let (blob, point) = self.user_key_create(acl.as_ref().map(|a| &a.ed[..]))?;
-                let flags = if biometry { HANDLE_BIOMETRY } else { 0 };
                 req.handle_len = encode_handle(&blob, flags, &mut req.handle)? as u32;
                 req.public_key = point;
                 writer.write(&req)
@@ -715,7 +855,7 @@ impl SepData {
                     let (blob, flags) = decode_handle(&req.handle, req.handle_len)?;
                     if flags & HANDLE_BIOMETRY != 0 {
                         let digest = req.digest;
-                        let job = self.key_sign_with_touch(blob, &digest, false)?;
+                        let job = self.key_sign_with_touch(blob, flags, &digest, false)?;
                         job.sig.ok_or(EIO)??
                     } else {
                         self.user_key_sign(blob, &req.digest, None)?

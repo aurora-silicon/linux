@@ -220,18 +220,35 @@ struct sep_bio_rearm {
  * finger enrolled when the key was made. SEP_KEY_SIGN then waits (about a minute)
  * for a touch; the kernel opens a credential context, runs the match in it,
  * signs and deletes the context inside that one call. Enrolling or removing a
- * finger makes the key unusable. The node is created 0600; distributions may
- * grant a group. Unknown 'flags' bits and 'reserved' fields must be zero.
+ * finger makes the key unusable (macOS .biometryCurrentSet).
+ * SEP_KEY_CREATE_BIOMETRY_ANY is macOS .biometryAny: the same, but any finger
+ * enrolled on this install matches, including ones enrolled later. At most one
+ * policy bit may be set; flags_supported lists the ones this kernel accepts.
+ *
+ * SEP_KEY_CREATE_USER_PRESENCE (.userPresence: Touch ID or the password) and
+ * SEP_KEY_CREATE_DEVICE_PASSCODE (.devicePasscode) are reserved. They need
+ * the enclave to check the user's own password; on Linux today the enclave's
+ * only passcode is a key bag secret root holds, so CREATE refuses them with
+ * EOPNOTSUPP rather than check a password in software.
+ *
+ * Keep a second key (a backup) wherever a biometric key is trusted, as with
+ * hardware security keys: no key can be exported or recovered.
+ *
+ * The node is created 0600; distributions may grant a group. Unknown 'flags'
+ * bits and 'reserved' fields must be zero.
  *
  * Errors: EINVAL for a malformed request or handle, EKEYREJECTED when the
  * enclave refuses the key (a handle from another Mac or an earlier Linux
  * install, or an access-control list not satisfied), EACCES when the touch
  * did not match (or Touch ID is locked out), ETIMEDOUT when no finger came,
- * ENODEV while the key store or Touch ID is not up, EIO for any other
- * enclave failure.
+ * ENODEV while the key store or Touch ID is not up, EOPNOTSUPP for a
+ * reserved policy, EIO for any other enclave failure.
  */
 #define SEP_KEY_IFACE_VERSION 2
 #define SEP_KEY_CREATE_BIOMETRY_CURRENT_SET 0x1
+#define SEP_KEY_CREATE_BIOMETRY_ANY         0x2
+#define SEP_KEY_CREATE_USER_PRESENCE        0x4  /* reserved: EOPNOTSUPP */
+#define SEP_KEY_CREATE_DEVICE_PASSCODE      0x8  /* reserved: EOPNOTSUPP */
 #define SEP_KEY_HANDLE_MAX 2048
 #define SEP_KEY_PUB_LEN    65  /* uncompressed point, 04 || X || Y */
 #define SEP_KEY_DIGEST_LEN 32
@@ -280,6 +297,9 @@ struct sep_key_public {
  * the enclave refuses. Modes: 1 no context, 2 a context with no match,
  * 3 a context holding only the key bag secret, 4 a deleted context, 5 one
  * touch: sign in the matched context, delete it, sign again with it.
+ * 6 (handle ignored): make a throwaway key with the .userPresence list and
+ * sign with a key-bag-secret context ('result') and with a context with no
+ * match ('result2').
  * 'result' is 0 when the enclave signed, else a negative errno.
  */
 struct sep_key_selftest {
