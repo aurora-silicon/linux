@@ -30,6 +30,7 @@ properties:
       - enum:
           - apple,t8103-cio-reset
           - apple,t8142-cio-reset
+          - apple,t6050-cio-reset
           - apple,t6000-cio-reset
       - items:
           - const: apple,t8112-cio-reset

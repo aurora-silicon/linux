@@ -67,6 +67,7 @@ properties:
           - const: apple,t6020-pcie-ge
           - const: apple,t6020-pcie
       - const: apple,t8140-pcie
+      - const: apple,t6050-pcie
       - const: apple,t8152-pcie
       - const: apple,t8132-pcie
       - const: apple,t8103-pciec
@@ -97,11 +98,11 @@ properties:
 
   reg:
     minItems: 3
-    maxItems: 10
+    maxItems: 11
 
   reg-names:
     minItems: 3
-    maxItems: 10
+    maxItems: 11
 
   ranges:
     minItems: 2
@@ -118,6 +119,8 @@ properties:
     maxItems: 6
 
   msi-parent: true
+
+  nonposted-mmio: true
 
   msi-ranges:
     maxItems: 1
@@ -186,6 +189,13 @@ patternProperties:
         maxItems: 1
 
       interrupt-controller: true
+
+      apple,link-trained-by-bootloader:
+        type: boolean
+        description:
+          The boot loader trained this port's link and handed it over up. The
+          driver adopts the link as it is instead of resetting the port, so
+          the port needs no PERST# line.
 
       apple,tunable:
         $ref: '#/$defs/tunable'
@@ -375,40 +385,65 @@ allOf:
               properties:
                 compatible:
                   contains:
-                    const: apple,t8152-pcie
+                    const: apple,t6050-pcie
             then:
               properties:
                 reg:
-                  minItems: 4
-                  maxItems: 8
+                  minItems: 5
+                  maxItems: 11
                 reg-names:
-                  minItems: 4
-                  maxItems: 8
+                  minItems: 5
+                  maxItems: 11
                   items:
-                    enum: [config, rc, port0, phy0, port1, phy1, port2, phy2]
+                    enum: [config, rc, port0, phy0, intr2axi0, port1, phy1,
+                           intr2axi1, port2, phy2, intr2axi2, port3, phy3,
+                           intr2axi3]
                 interrupts:
-                  maxItems: 3
+                  maxItems: 4
             else:
-              properties:
-                reg-names:
-                  minItems: 3
-                  items:
-                    - const: config
-                    - const: rc
-                    - const: port0
-                    - const: port1
-                    - const: port2
-                    - const: port3
-                    - const: phy0
-                    - const: phy1
-                    - const: phy2
-                    - const: phy3
+              if:
+                properties:
+                  compatible:
+                    contains:
+                      const: apple,t8152-pcie
+              then:
+                properties:
+                  reg:
+                    minItems: 4
+                    maxItems: 8
+                  reg-names:
+                    minItems: 4
+                    maxItems: 8
+                    items:
+                      enum: [config, rc, port0, phy0, port1, phy1, port2, phy2]
+                  interrupts:
+                    maxItems: 3
+              else:
+                properties:
+                  reg-names:
+                    minItems: 3
+                    items:
+                      - const: config
+                      - const: rc
+                      - const: port0
+                      - const: port1
+                      - const: port2
+                      - const: port3
+                      - const: phy0
+                      - const: phy1
+                      - const: phy2
+                      - const: phy3
       patternProperties:
         "^pci@":
           properties:
             apple,tunable: false
-          required:
-            - reset-gpios
+          if:
+            not:
+              required:
+                - apple,link-trained-by-bootloader
+          then:
+            required:
+              - reset-gpios
 
 examples:
   - |

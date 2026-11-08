@@ -18,6 +18,7 @@ properties:
     oneOf:
       - description: T8152 SMC with read-only hardware monitoring.
         const: apple,t8152-smc
+      - const: apple,t6050-smc
       - items:
           - enum:
               - apple,t6020-smc
@@ -51,7 +52,9 @@ properties:
     maxItems: 1
 
   gpio:
-    $ref: /schemas/gpio/apple,smc-gpio.yaml
+    oneOf:
+      - $ref: /schemas/gpio/apple,smc-gpio.yaml
+      - $ref: /schemas/gpio/apple,smc-pcio-gpio.yaml
 
   gpio-low:
     $ref: /schemas/gpio/apple,smc-gpio.yaml
