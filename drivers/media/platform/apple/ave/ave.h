@@ -128,6 +128,16 @@ enum ave_opcode {
 
 #include "ave-layout.h"
 
+/*
+ * Driver-private codec-class controls.
+ *
+ * PRIORITIZE_SPEED is VideoToolbox's PrioritizeEncodingSpeedOverQuality:
+ * off (the default) codes for quality, on trades some compression
+ * efficiency for encoding speed. It is read when streaming starts.
+ */
+#define V4L2_CID_APPLE_AVE_BASE (V4L2_CTRL_CLASS_CODEC | 0x1200)
+#define V4L2_CID_APPLE_AVE_PRIORITIZE_SPEED (V4L2_CID_APPLE_AVE_BASE + 0)
+
 /* The firmware build whose command layouts the driver generates */
 #define AVE_FW_TEXT_CRC_9003_78_0 0x69c54454
 /* The M4 Pro (T6040) build of the same 25G83 firmware. */
@@ -263,6 +273,7 @@ struct ave_params {
 	u32 coded_cap;
 	u32 bit_depth; /* zero also means the existing 8-bit API */
 	u32 initial_qp; /* CQ only; bit-rate modes use 26 */
+	bool speed; /* prioritize encoding speed over quality */
 };
 
 struct ave_slot {
@@ -332,6 +343,7 @@ struct ave_ctx {
 	struct delayed_work poll_work;
 
 	u32 bitrate_mode;
+	u32 quality; /* V4L2 constant quality, 0..100 */
 	u32 bitrate;
 	u32 bitrate_peak;
 	u32 gop_size;
@@ -345,6 +357,7 @@ struct ave_ctx {
 	u32 hevc_min_qp;
 	u32 hevc_max_qp;
 	bool force_key_frame;
+	bool prioritize_speed;
 
 	struct ave_session *sess;
 	atomic_t ready; /* outputs waiting for a CAPTURE buffer */
@@ -433,6 +446,7 @@ struct ave_vb2_mem *ave_vb2_get(struct vb2_buffer *vb);
 void ave_vb2_put(void *buf_priv);
 
 /* ave-sess.c */
+u32 ave_cq_initial_qp(u32 quality);
 struct ave_session *ave_sess_create(struct ave_ctx *ctx);
 void ave_sess_destroy(struct ave_ctx *ctx);
 void ave_sess_reap(struct ave_dev *ave);

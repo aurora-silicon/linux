@@ -153,6 +153,10 @@ void ave_stamp_command(const struct ave_fw_abi *abi, u8 *cmd, u64 timeout,
 	ave_put64(cmd, abi->created_offset, created);
 }
 
+/* Throughput modes: 3 codes for quality, 5 prioritizes speed (as macOS) */
+#define AVE_THROUGHPUT_QUALITY 3
+#define AVE_THROUGHPUT_SPEED 5
+
 #define AVE_START_ARRAY_LEN 30
 #define AVE_START_INIT_QP_VALUE 26
 
@@ -306,9 +310,11 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd,
 	ave_start_put32(cmd, l->ref_depth, p->bframes ? 3 : 1);
 	ave_start_put32(cmd, l->idr_interval, p->gop);
 
-	/* Picture size */
+	/* Picture size class, which is also the throughput mode */
 	ave_start_put32(cmd, l->size_class,
-			p->width * p->height > 1280 * 720 ? 3 : 1);
+			p->speed ? AVE_THROUGHPUT_SPEED :
+			p->width * p->height > 1280 * 720 ? AVE_THROUGHPUT_QUALITY :
+							    1);
 	ave_start_put32(cmd, l->coded_w, p->cw);
 	ave_start_put32(cmd, l->coded_h, p->ch);
 	ave_start_put32(cmd, l->coded_h2, p->ch);
