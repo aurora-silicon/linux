@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * MSI controller for one Apple PCIe port whose link the bootloader trained.
+ * MSI controller for Apple PCIe ports whose links the bootloader trained.
  *
  * pcie-apple owns the port when Linux brings the link up itself. On T8142
  * (J813) the bootloader trains apcie port 0 and Linux drives the root port as
  * a generic ECAM host, which has no MSI support. The port still turns writes
  * to the MSI doorbell into AIC interrupts through its MSI map; this driver
  * programs that map and provides the parent domain, as pcie-apple does.
+ *
+ * The map's entries name AIC interrupts from one range that all ports of the
+ * root complex share, so the ports of one host use a single controller that
+ * programs each port's map from one allocator.
  */
 
 #include <linux/bitmap.h>
@@ -120,7 +124,8 @@ static int apple_msi_probe(struct platform_device *pdev)
 		.ops		= &apple_msi_domain_ops,
 	};
 	struct apple_msi *msi;
-	void __iomem *port;
+	void __iomem **ports;
+	unsigned int nports;
 	int ret;
 	u32 i;
 
@@ -129,9 +134,18 @@ static int apple_msi_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	mutex_init(&msi->lock);
 
-	port = devm_platform_ioremap_resource(pdev, 0);
-	if (IS_ERR(port))
-		return PTR_ERR(port);
+	for (nports = 0; platform_get_resource(pdev, IORESOURCE_MEM, nports); nports++)
+		;
+	if (!nports)
+		return -EINVAL;
+	ports = devm_kcalloc(dev, nports, sizeof(*ports), GFP_KERNEL);
+	if (!ports)
+		return -ENOMEM;
+	for (i = 0; i < nports; i++) {
+		ports[i] = devm_platform_ioremap_resource(pdev, i);
+		if (IS_ERR(ports[i]))
+			return PTR_ERR(ports[i]);
+	}
 
 	ret = of_parse_phandle_with_args(dev->of_node, "msi-ranges",
 					 "#interrupt-cells", 0, &args);
@@ -157,11 +171,15 @@ static int apple_msi_probe(struct platform_device *pdev)
 	info.size = msi->nvecs;
 	info.host_data = msi;
 
-	/* MSI data N goes to the Nth interrupt of msi-ranges. */
-	writel(lower_32_bits(DOORBELL_ADDR), port + PORT_MSIADDR);
-	for (i = 0; i < msi->nvecs; i++)
-		writel(PORT_MSIMAP_ENABLE | i, port + PORT_MSIMAP + 4 * i);
-	writel(readl(port + PORT_MSICFG) | PORT_MSICFG_EN, port + PORT_MSICFG);
+	/* On every port, MSI data N goes to the Nth interrupt of msi-ranges. */
+	while (nports--) {
+		void __iomem *port = ports[nports];
+
+		writel(lower_32_bits(DOORBELL_ADDR), port + PORT_MSIADDR);
+		for (i = 0; i < msi->nvecs; i++)
+			writel(PORT_MSIMAP_ENABLE | i, port + PORT_MSIMAP + 4 * i);
+		writel(readl(port + PORT_MSICFG) | PORT_MSICFG_EN, port + PORT_MSICFG);
+	}
 
 	if (!msi_create_parent_irq_domain(&info, &apple_msi_parent_ops))
 		return -ENOMEM;

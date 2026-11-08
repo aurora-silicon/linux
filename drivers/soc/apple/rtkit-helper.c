@@ -15,6 +15,7 @@
 #include <linux/platform_device.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/rtkit-helper.h>
+#include <linux/soc/apple/t8132.h>
 #include <linux/string.h>
 #include <linux/suspend.h>
 
@@ -275,15 +276,15 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 		count = apple_rtkit_helper_inherit_buffers(helper, buffers);
 		if (count < 0)
 			return dev_err_probe(dev, count, "Invalid inherited RTKit buffers\n");
-		if ((of_machine_is_compatible("apple,j713") &&
+		if ((apple_t8132_live_mtp() &&
 		     of_device_is_compatible(dev->of_node, "apple,t8132-mtp")) ||
 		    (of_machine_is_compatible("apple,j614s") &&
-		     of_device_is_compatible(dev->of_node, "apple,t6041-mtp")))
+		     of_device_is_compatible(dev->of_node, "apple,t6041-mtp")) ||
+		    of_device_is_compatible(dev->of_node, "apple,t8142-mtp"))
 			helper->preserved = true;
 	}
 
-	if (!live && of_machine_is_compatible("apple,j713") &&
-	    of_machine_is_compatible("apple,t8132")) {
+	if (!live && apple_t8132_live_mtp() && of_machine_is_compatible("apple,t8132")) {
 		struct property *prop;
 		u32 inherited;
 		int len;

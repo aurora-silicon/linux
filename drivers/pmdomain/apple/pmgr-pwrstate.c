@@ -20,6 +20,7 @@
 #include <linux/reset-controller.h>
 #include <linux/module.h>
 #include <linux/soc/apple/pmgr-pwrstate.h>
+#include <linux/soc/apple/t8132.h>
 
 #define APPLE_PMGR_RESET        BIT(31)
 #define APPLE_PMGR_AUTO_ENABLE  BIT(28)
@@ -531,14 +532,13 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 
 	t8132 = of_device_is_compatible(node, "apple,t8132-pmgr-pwrstate");
 	/*
-	 * The original J713 loader tree exposes domains Linux cannot access.
-	 * The early compatibility adapter supplies the board's explicit status
-	 * and ownership before population; fail closed if it was not enabled.
-	 * Other T8132 boards keep their own domain descriptions and behaviour.
+	 * On the M4 firmware path some domains are the firmware's, which Linux
+	 * cannot access. The early compatibility adapter supplies the explicit
+	 * status and ownership before population; fail closed if it was not
+	 * enabled. Other firmware keeps the tree's own domain descriptions.
 	 */
-	if (t8132 && of_machine_is_compatible("apple,j713") &&
-	    !of_property_present(node, "status"))
-		return dev_err_probe(dev, -ENODEV, "missing J713 power-domain policy\n");
+	if (t8132 && apple_t8132_firmware_path() && !of_property_present(node, "status"))
+		return dev_err_probe(dev, -ENODEV, "missing M4 power-domain policy\n");
 
 	tvm = of_parse_phandle(node, "power-domains", 0);
 	if (t8132 && tvm)

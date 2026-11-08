@@ -24,6 +24,17 @@ allOf:
     then:
       required:
         - power-domains
+  - if:
+      not:
+        properties:
+          status:
+            const: disabled
+        required:
+          - status
+    then:
+      required:
+        - resets
+        - usb-role-switch
 
 $defs:
   apple,tunable:
@@ -49,6 +60,7 @@ properties:
               - apple,t6030-dwc3
               - apple,t6031-dwc3
               - apple,t6040-dwc3
+              - apple,t6050-dwc3
               - apple,t8112-dwc3
               - apple,t8122-dwc3
               - apple,t8140-dwc3
@@ -103,14 +115,17 @@ properties:
     $ref: "#/$defs/apple,tunable"
     description: Tunables applied to the link registers of the Apple region.
 
+  apple,tunable-cio:
+    $ref: "#/$defs/apple,tunable"
+    description:
+      Tunables applied to the CIO (USB4 tunnel) registers of the Apple region.
+
 required:
   - compatible
   - reg
   - reg-names
   - interrupts
   - iommus
-  - resets
-  - usb-role-switch
 
 unevaluatedProperties: false
 

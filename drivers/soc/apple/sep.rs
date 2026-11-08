@@ -18,6 +18,7 @@ mod dt;
 mod fv;
 mod hwrng;
 mod image;
+mod key;
 mod keybag;
 mod keybag_identity;
 mod os_identity;
@@ -354,7 +355,8 @@ enum ImageOutcome {
         complete: bool,
         has_template: bool,
     },
-    Retry,
+    // The capture did not count; the guidance says why.
+    Retry(bio::Guidance),
     NoFinger,
     Failed(u32),
 }
@@ -419,6 +421,7 @@ static_assert!(ENROL_STATUS_UNFILED != ENROL_STATUS_TIMEOUT);
 static_assert!(ENROL_STATUS_UNFILED != ENROL_STATUS_TOO_MANY);
 
 const ENROL_STATUS_RETRY: u32 = 5;
+static_assert!(bio::ENROL_POLL_RETRY == ENROL_STATUS_RETRY);
 // 7 is SEP_BIO_STATUS_REJECTED in libfprint's aurora driver.
 // The enclave stopped matching after too many failed attempts. Only a
 // password authentication, through /dev/sep-bio-rearm, makes it match again.
@@ -446,11 +449,13 @@ const ENROL_CAPTURE_TIMEOUT_MS: u32 = 60_000;
 const ENROL_POLL_ATTEMPTS: u32 = ENROL_CAPTURE_TIMEOUT_MS / ENROL_POLL_MS;
 static_assert!(ENROL_POLL_ATTEMPTS * ENROL_POLL_MS == ENROL_CAPTURE_TIMEOUT_MS);
 
-const ENROL_REPOSITION_MS: u32 = 1800;
+// How long the next capture waits for the last touch's finger to be lifted
+// before it arms anyway: as long as a capture waits for a finger.
+const LIFT_WAIT_MS: u32 = ENROL_CAPTURE_TIMEOUT_MS;
 
-const MATCH_SETTLE_MS: u32 = ENROL_REPOSITION_MS;
-
-const ENROL_IDLE_TIMEOUT_MS: u32 = 2000;
+// The backstop interval of that wait. The sensor's interrupt wakes it at the
+// lift; this bounds a missed edge (macOS arms within 2 ms of the lift).
+const LIFT_POLL_MS: u32 = 20;
 
 const PATCH_POLL_MS: u32 = 20;
 const PATCH_POLL_ATTEMPTS: u32 = 250;
@@ -704,7 +709,10 @@ struct SepData {
     #[pin]
     enrol_identity_candidates: Mutex<KVec<[u8; bio::UUID_LEN]>>,
 
-    last_capture_end_ns: Atomic<u64>,
+    // Boot-time clock when the sensor was paused after a touch whose finger
+    // may still be down, or 0. The next capture is armed once the sensor
+    // reports the finger lifted, as macOS does, instead of after a fixed pause.
+    paused_at_ns: Atomic<u64>,
 
     // Boot-time clock at the start of the last sensor power cycle, for
     // reporting how far into a bring-up a step failed.
@@ -763,16 +771,38 @@ struct SepData {
     #[pin]
     rearm_dev: Mutex<Option<shim::BioChardev>>,
 
+    // /dev/sep-key: P-256 keys created inside the SEP (see `key`).
+    #[pin]
+    key_dev: Mutex<Option<shim::BioChardev>>,
+
+    // /dev/sep-key: the signature a touch-gated SEP_KEY_SIGN is waiting for.
+    // Set only for the length of that ioctl; while set, a verify run belongs
+    // to it and not to /dev/sep-bio's session.
+    #[pin]
+    key_touch: Mutex<Option<crate::key::KeyTouch>>,
+    key_touch_active: Atomic<bool>,
+    // The enclave status of the last /dev/sep-key signature (self-test).
+    last_key_status: Atomic<u32>,
+
     // The enclave refused to match (MATCH_RESULT answered 0x1) after failed
     // attempts, or the lockout survived a restart. Every verify is refused
     // without a capture until a password authentication re-arms Touch ID.
     bio_lockout: Atomic<bool>,
 
+    // Touch ID waits for the first password since this boot
+    // (SEP_BIO_REQUIRE_PASSWORD): every verify is refused without a capture
+    // until a password authentication re-arms it. Never recorded.
+    bio_after_boot: Atomic<bool>,
+
     // The refusal of a verify during a lockout has been logged.
     bio_lockout_logged: Atomic<bool>,
 
-    // Failed matches since the last match or re-arm, for the log.
+    // Failed matches since the last match or re-arm, across prompts.
     bio_nomatch_streak: Atomic<u32>,
+
+    // A password cleared the failed attempts while a capture held the sensor
+    // lock; the enclave's own count is cleared at the next authentication.
+    enclave_failures_owed: Atomic<bool>,
 
     // Opens of the Touch ID device. One open is one prompt: fprintd claims
     // the device for one PAM authentication.
@@ -784,6 +814,9 @@ struct SepData {
 
     // Touches in that prompt so far.
     match_scope_touches: Atomic<u32>,
+
+    // Failed matches in that prompt so far.
+    match_scope_misses: Atomic<u32>,
 
     // The enclave's most recent biometric lock-state notification: the
     // state in bits 0-15 and the user in bits 16-47, or 0 before the first.
@@ -1019,7 +1052,7 @@ impl SepData {
                 bg_ops_ready: Atomic::new(false),
                 persistence_owed: Atomic::new(false),
                 enrol_identity_candidates <- new_mutex!(KVec::new()),
-                last_capture_end_ns: Atomic::new(0),
+                paused_at_ns: Atomic::new(0),
                 sensor_power_ns: Atomic::new(0),
                 device_view_synced: Atomic::new(false),
                 phase: Atomic::new(PHASE_ATTACH),
@@ -1041,12 +1074,19 @@ impl SepData {
                 bio_index <- new_mutex!(bio_index),
                 bio_dev <- new_mutex!(None),
                 rearm_dev <- new_mutex!(None),
+                key_dev <- new_mutex!(None),
+                key_touch <- new_mutex!(None),
+                key_touch_active: Atomic::new(false),
+                last_key_status: Atomic::new(0),
                 bio_lockout: Atomic::new(false),
+                bio_after_boot: Atomic::new(false),
                 bio_lockout_logged: Atomic::new(false),
                 bio_nomatch_streak: Atomic::new(0),
+                enclave_failures_owed: Atomic::new(false),
                 bio_open_gen: Atomic::new(0),
                 match_scope_gen: Atomic::new(0),
                 match_scope_touches: Atomic::new(0),
+                match_scope_misses: Atomic::new(0),
                 bio_lock_state: Atomic::new(0),
                 bio_lock_state_seq: Atomic::new(0),
                 store <- new_mutex!(store),
@@ -2619,6 +2659,8 @@ impl SepData {
         drop(dev);
         let dev = self.rearm_dev.lock().take();
         drop(dev);
+        let dev = self.key_dev.lock().take();
+        drop(dev);
 
         self.rng_shutdown.store(true, Relaxed);
         self.control_wq.notify_all();
@@ -3052,6 +3094,10 @@ module! {
         probe_owner_export: u8 {
             default: 0,
             description: "Opt-in J414s diagnostic: with zero live identities, select the system context and try saving the missing owner Catacomb",
+        },
+        key_selftest: u8 {
+            default: 0,
+            description: "Test only: let root run SEP_KEY_SELFTEST, which signs with an access-controlled /dev/sep-key key under deliberately unsuitable credential contexts to show the enclave refuses",
         },
         refkey_v2: u8 {
             default: 0,

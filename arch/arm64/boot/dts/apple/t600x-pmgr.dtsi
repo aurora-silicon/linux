@@ -1925,8 +1925,7 @@
 		power-domains = <&DIE_NODE(ps_afnc5_lw0)>, <&DIE_NODE(ps_afr)>;
 	};
 
-	/* Seems to be disabled on shipping hardware */
-#if 0
+	/* Unqualified secondary ANE power states are described but remain off. */
 	DIE_NODE(ps_ane1_sys): power-controller@268 {
 		compatible = "apple,t6000-pmgr-pwrstate", "apple,pmgr-pwrstate";
 		reg = <0x268 4>;
@@ -1934,6 +1933,7 @@
 		#reset-cells = <0>;
 		label = DIE_LABEL(ane1_sys);
 		power-domains = <&DIE_NODE(ps_afnc5_lw0)>;
+		status = "disabled";
 	};
 
 	DIE_NODE(ps_ane1_sys_cpu): power-controller@270 {
@@ -1943,8 +1943,8 @@
 		#reset-cells = <0>;
 		label = DIE_LABEL(ane1_sys_cpu);
 		power-domains = <&DIE_NODE(ps_ane1_sys)>;
+		status = "disabled";
 	};
-#endif
 
 	DIE_NODE(ps_venc1_dma): power-controller@8000 {
 		compatible = "apple,t6000-pmgr-pwrstate", "apple,pmgr-pwrstate";

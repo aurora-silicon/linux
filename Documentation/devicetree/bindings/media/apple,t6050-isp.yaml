@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/apple,t6050-isp.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T6050 image signal processor
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description:
+  The camera image signal processor of the T6050 MacBook Pros (ADT isp0).
+  Unlike earlier generations its ADT node lists the coprocessor window and
+  two PMGR windows rather than mailbox and handshake windows inside the ISP
+  block. Its buffers go through the three instances of the ISP DART. It is
+  described from the ADT so the device tree lists all of the SoC's
+  hardware; no driver supports this generation yet and the node stays
+  disabled.
+
+select:
+  properties:
+    compatible:
+      contains:
+        const: apple,t6050-isp
+  required:
+    - compatible
+
+properties:
+  compatible:
+    items:
+      - const: apple,t6050-isp
+      - const: apple,isp
+
+  reg:
+    items:
+      - description: Coprocessor registers
+      - description: The ISP's PMGR control window
+      - description: The ISP's PMGR power-state window
+
+  interrupts:
+    minItems: 5
+    maxItems: 5
+
+  iommus:
+    items:
+      - description: Stream 0 of the first ISP DART
+      - description: Stream 0 of the second ISP DART
+      - description: Stream 0 of the third ISP DART
+
+  power-domains:
+    items:
+      - description: ISP system domain
+      - description: Camera sensor domain
+
+  clocks:
+    maxItems: 2
+
+  status:
+    const: disabled
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - iommus
+  - power-domains
+  - status
+
+additionalProperties: false

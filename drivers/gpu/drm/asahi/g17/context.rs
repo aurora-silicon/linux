@@ -23,39 +23,81 @@ use kernel::{
     sync::{Arc, Mutex},
 };
 
-/// QoS IDs belong to one device; the two lowest values are reserved.
+const QOS_IDS: usize = 128;
+
+struct QosState {
+    used: u128,
+    /// When each ID was last returned; reuse takes the one returned longest ago.
+    returns: [u64; QOS_IDS],
+    /// Firmware progress a returned ID waits for (see `channel::control_fence`).
+    fences: [u64; QOS_IDS],
+    clock: u64,
+}
+
+/// QoS IDs belong to one device; the two lowest values are reserved. Queue records name a
+/// published context by its QoS ID, so an ID follows the context's execution identity:
+/// held while any record names it, then fenced and reused oldest first.
 #[pin_data]
 pub(crate) struct QosIds {
     #[pin]
-    used: Mutex<u128>,
+    state: Mutex<QosState>,
 }
 impl QosIds {
     pub(crate) fn new() -> Result<Arc<Self>> {
         Arc::pin_init(
-            pin_init!(Self { used <- new_mutex!(3, "G17 QoS IDs") }),
+            pin_init!(Self {
+                state <- new_mutex!(
+                    QosState { used: 3, returns: [0; QOS_IDS], fences: [0; QOS_IDS], clock: 0 },
+                    "G17 QoS IDs"
+                )
+            }),
             GFP_KERNEL,
         )
     }
-    fn acquire(self: &Arc<Self>) -> Result<QosLease> {
-        let mut used = self.used.lock();
-        let id = used.trailing_ones();
-        if id == 128 {
-            return Err(super::capacity::refused(super::capacity::Site::QosIds));
-        }
-        *used |= 1u128 << id;
-        Ok(QosLease {
-            ids: self.clone(),
-            id: id as u8,
-        })
+    fn acquire(self: &Arc<Self>) -> Result<Arc<QosLease>> {
+        let witnessed = super::channel::control_witnessed();
+        let id = {
+            let mut state = self.state.lock();
+            let used = state.used;
+            let free = (0..QOS_IDS).filter(|&id| used & (1u128 << id) == 0);
+            let Some((id, _)) = mmu::pick_returned(free, &state.returns, &state.fences, witnessed)
+            else {
+                return Err(super::capacity::refused(super::capacity::Site::QosIds));
+            };
+            state.used |= 1u128 << id;
+            id
+        };
+        // Drop returns the ID if the allocation fails.
+        Ok(Arc::new(
+            QosLease {
+                ids: self.clone(),
+                id: id as u8,
+                seen: AtomicBool::new(false),
+            },
+            GFP_KERNEL,
+        )?)
     }
 }
+/// Held by the context and by every retained queue record that names it.
 struct QosLease {
     ids: Arc<QosIds>,
     id: u8,
+    /// The firmware may have seen this ID.
+    seen: AtomicBool,
 }
 impl Drop for QosLease {
     fn drop(&mut self) {
-        *self.ids.used.lock() &= !(1u128 << self.id);
+        let fence = if self.seen.load(Ordering::Acquire) {
+            super::channel::control_fence()
+        } else {
+            0
+        };
+        let mut state = self.ids.state.lock();
+        let id = usize::from(self.id);
+        state.clock += 1;
+        state.returns[id] = state.clock;
+        state.fences[id] = fence;
+        state.used &= !(1u128 << id);
     }
 }
 
@@ -120,10 +162,15 @@ impl WorkStorage {
 pub(crate) struct FirmwarePages {
     _scheduler: Arc<KernelObject>,
     _work: Arc<Mutex<WorkStorage>>,
+    /// The queue record still names the context's execution identity and QoS ID.
+    _hold: Arc<mmu::ContextHold>,
+    _qos: Arc<QosLease>,
 }
 
 pub(crate) struct Context {
     execution: Arc<ExecutionContext>,
+    /// This context's own hold on its execution identity, cloned by retained queue records.
+    hold: Arc<mmu::ContextHold>,
     status: Arc<VmStatus>,
     scheduler: Arc<KernelObject>,
     scheduler_generation: u32,
@@ -136,7 +183,7 @@ pub(crate) struct Context {
     compute_binding_hint: AtomicBool,
     /// Mixed-engine contexts keep the original inline publication path.
     render_seen: AtomicBool,
-    qos: QosLease,
+    qos: Arc<QosLease>,
     owner_pid: u32,
     states: WorkStates,
     /// Signalled when a work state returns; publishers that found none wait on it.
@@ -172,6 +219,7 @@ impl Context {
         compute_returns: Arc<super::availability::Availability>,
     ) -> Result<Self> {
         let status = execution.vm().status().ok_or(EINVAL)?.clone();
+        let hold = execution.hold(super::channel::control_fence)?;
         let qos = qos.acquire()?;
         let mut scheduler = alloc.kernel(
             UAT_PGSZ,
@@ -222,6 +270,7 @@ impl Context {
             Arc::pin_init(new_mutex!(Order::new(), "G17 context admission order"), GFP_KERNEL)?;
         Ok(Self {
             execution,
+            hold,
             status,
             scheduler,
             scheduler_generation,
@@ -310,6 +359,8 @@ impl Context {
         FirmwarePages {
             _scheduler: self.scheduler.clone(),
             _work: self.work.clone(),
+            _hold: self.hold.clone(),
+            _qos: self.qos.clone(),
         }
     }
     /// Called once the firmware consumed this context's scheduler release. If its work list
@@ -362,6 +413,8 @@ impl Context {
         self.published.load(Ordering::Acquire)
     }
     pub(crate) fn mark_published(&self) {
+        self.hold.mark_seen();
+        self.qos.seen.store(true, Ordering::Release);
         self.published.store(true, Ordering::Release);
     }
 
@@ -554,7 +607,7 @@ impl Context {
 
 impl QosIds {
     pub(crate) fn used(&self) -> u32 {
-        (*self.used.lock() & !3u128).count_ones()
+        (self.state.lock().used & !3u128).count_ones()
     }
 }
 
@@ -590,7 +643,7 @@ mod capacity_tests {
             assert!(matches!(ids.acquire(), Err(ENOSPC)));
             drop(clients);
             assert_eq!(ids.used(), 0);
-            assert_eq!(*ids.used.lock(), 3);
+            assert_eq!(ids.state.lock().used, 3);
         }
     }
 }

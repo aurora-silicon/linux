@@ -25,11 +25,13 @@
 struct ane_h16_accel {
 	struct drm_device drm;
 	struct ane_h16_session *session;
-	/* Serializes the session, every program and all firmware traffic. */
+	/* Serializes admission, transport traffic and completion dispatch. */
 	struct mutex lock;
 };
 
 struct ane_h16_accel_file {
+	/* Pins the program lifetime across LOAD and an EXECUTE's copy phases. */
+	struct mutex lock;
 	struct ane_h16_program *program;
 };
 
@@ -109,9 +111,12 @@ static int ane_h16_load_ioctl(struct drm_device *drm, void *data, struct drm_fil
 						     args->hwx_size, &snapshot);
 	if (ret)
 		goto out;
+	mutex_lock(&f->lock);
 	ret = ane_h16_session_enter(a->session, file->filp->f_flags & O_NONBLOCK);
-	if (ret)
+	if (ret) {
+		mutex_unlock(&f->lock);
 		goto out;
+	}
 	/* Lost across system sleep: release it, the caller is reloading. */
 	if (f->program && ane_h16_program_lost(a->session, f->program) &&
 	    !ane_h16_session_close(a->session, f->program)) {
@@ -123,9 +128,6 @@ static int ane_h16_load_ioctl(struct drm_device *drm, void *data, struct drm_fil
 	} else {
 		ret = ane_h16_session_load(a->session, &snapshot,
 					   (const void *const *)aux, aux_size, &program);
-		if (ret == -EBUSY)
-			/* The caller's own EBUSY, not a driver error. */
-			drm_dbg(drm, "another program is still loaded; close it first\n");
 		if (!ret)
 			f->program = program;
 	}
@@ -141,6 +143,7 @@ static int ane_h16_load_ioctl(struct drm_device *drm, void *data, struct drm_fil
 		}
 	}
 	mutex_unlock(&a->lock);
+	mutex_unlock(&f->lock);
 out:
 	/* A consumed snapshot was moved into the program and reads as empty. */
 	if (snapshot.bytes)
@@ -167,10 +170,12 @@ static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_fil
 			   array_size(args->count, sizeof(*buffers))))
 		return -EFAULT;
 	start = ktime_get_ns();
+	mutex_lock(&f->lock);
 	ret = ane_h16_session_enter(a->session, file->filp->f_flags & O_NONBLOCK);
-	if (ret)
+	if (ret) {
+		mutex_unlock(&f->lock);
 		return ret;
-	locked = ktime_get_ns();
+	}
 	p = f->program;
 	if (!p || p->closed || args->count != p->resource_count) {
 		ret = -EINVAL;
@@ -182,14 +187,18 @@ static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_fil
 			goto unlock;
 		}
 	}
-	/* The firmware is idle for this program, so its inputs may change now. */
+	ret = ane_h16_session_acquire(a->session, p);
+	if (ret)
+		goto unlock;
+	locked = ktime_get_ns();
+	/* This program's shared surfaces are ours through the final copy-out. */
 	for (i = 0; i < args->count; i++) {
 		void *cpu = p->surfaces[i]->cpu;
 
 		if (p->resources[i].permissions == 1) {
 			if (copy_from_user(cpu, u64_to_user_ptr(buffers[i].ptr), buffers[i].size)) {
 				ret = -EFAULT;
-				goto unlock;
+				goto release;
 			}
 		} else {
 			memset(cpu, 0xff, buffers[i].size);
@@ -197,9 +206,9 @@ static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_fil
 	}
 	ane_h16_session_sync(a->session, p, true);
 	copied = ktime_get_ns();
-	ret = ane_h16_session_execute(a->session, p);
+	ret = ane_h16_session_run(a->session, p);
 	if (ret)
-		goto unlock;
+		goto release;
 	done = ktime_get_ns();
 	ane_h16_session_sync(a->session, p, false);
 	for (i = 0; i < args->count; i++)
@@ -228,8 +237,11 @@ static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_fil
 			       div_u64(ns[ANE_H16_T_FIRMWARE], 1000),
 			       div_u64(end - start, 1000), a->session->timing.polls);
 	}
+release:
+	ane_h16_session_release(a->session, p);
 unlock:
 	mutex_unlock(&a->lock);
+	mutex_unlock(&f->lock);
 	return ret;
 }
 
@@ -239,6 +251,7 @@ static int ane_h16_open(struct drm_device *drm, struct drm_file *file)
 
 	if (!f)
 		return -ENOMEM;
+	mutex_init(&f->lock);
 	file->driver_priv = f;
 	return 0;
 }
@@ -270,6 +283,7 @@ static void ane_h16_postclose(struct drm_device *drm, struct drm_file *file)
 			ane_h16_session_put(a->session, f->program);
 	}
 	mutex_unlock(&a->lock);
+	mutex_destroy(&f->lock);
 	kfree(f);
 }
 

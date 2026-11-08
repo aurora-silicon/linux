@@ -117,7 +117,7 @@ ASAHI_TESTS = {
     'g15-zero-words-tests.py': [([], PASS), (['--mutations'], PASS)],
     'g17-telemetry-integration-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('fields', 'range', 'timestamp', 'age', 'delivery',
-                                   'quarantine', 'epoch', 'cutoff', 'whole-batch', 'legacy-format'), out()),
+                                   'quarantine', 'epoch', 'cutoff', 'whole-batch', 'legacy-format', 'read-drain'), out()),
     'g17-admission-deadline-tests.py': [([], PASS)],
     'g17-admission-order-tests.py': [([], PASS)],
     'g17-capacity-fault-tests.py': [([], PASS)],
@@ -151,7 +151,8 @@ ASAHI_TESTS = {
     'pmp-j613-hwmon-tests.py': [([], PASS)],
     'pmu-rtc-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('ack-clobber', 'arm-ack', 'offset-seconds',
-                                   'offset-sign', 'event-bit', 'wrong-base'), out()),
+                                   'offset-sign', 'event-bit', 'wrong-control',
+                                   'maverick-event', 'stowe-offset'), out()),
     'qspi-nvram-tests.py': [(out('--output'), PASS)],
     'rtkit-oslog-tests.py': [(out(), PASS)]
         + mutations('--mutate', ('admission', 'channel', 'counter', 'reset', 'buffer'), out()),

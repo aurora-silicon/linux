@@ -157,7 +157,13 @@ static inline int dcp_adt_value(struct dcp_adt_tables *out,
 
 	if (kind == 1 && !strcmp(name, "target-type")) {
 		bit = 1;
-		if (length != 5 || memcmp(value, "J713", 5))
+		/* Every M4 Mac shares the retained display handoff. */
+		if (!(length == 5 && (!memcmp(value, "J713", 5) ||
+				      !memcmp(value, "J715", 5) ||
+				      !memcmp(value, "J604", 5) ||
+				      !memcmp(value, "J623", 5) ||
+				      !memcmp(value, "J624", 5))) &&
+		    !(length == 6 && !memcmp(value, "J773g", 6)))
 			return -ENODEV;
 	} else if (kind == 3 && !strcmp(name, "compatible")) {
 		bit = 2;
@@ -194,11 +200,10 @@ static inline int dcp_adt_value(struct dcp_adt_tables *out,
 			seg->kind = get_unaligned_le32(record + 28);
 		}
 	} else if (kind == 6 && !strcmp(name, "uuid")) {
-		static const char uuid[] = "81BAF476-679D-3CC0-8C6A-E6B6FA659D5E";
-
+		/* Any image: the firmware version gates the layout. */
 		bit = 64;
-		if (length != sizeof(uuid) || memcmp(value, uuid, sizeof(uuid)))
-			return -ENODEV;
+		if (length != 37 || value[36])
+			return -EINVAL;
 	} else if (kind == 6 && !strcmp(name, "segment-names")) {
 		size_t names = strlen(inst->segment_names) + 1;
 

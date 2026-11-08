@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/apple,t8152-aop-audio.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T8152-generation AOP audio
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description:
+  The audio service of the T8142, T8152 and T6050 Always-On Processor, a
+  child of the AOP node. It names the ADMAC channels of the headset jack, the
+  speaker and the speaker amplifiers' voltage and current sense, and where
+  the board has one the high-quality microphone array, plus the power
+  domains the host enables while they run.
+
+allOf:
+  - $ref: dai-common.yaml#
+
+properties:
+  compatible:
+    oneOf:
+      - items:
+          - const: apple,t8142-aop-audio
+          - const: apple,t8152-aop-audio
+      - const: apple,t6050-aop-audio
+
+  dmas:
+    minItems: 4
+    items:
+      - description: Headset jack output
+      - description: Headset microphone input
+      - description: Internal speaker output
+      - description: Speaker amplifier sense input
+      - description: High-quality microphone array input
+
+  dma-names:
+    minItems: 4
+    items:
+      - const: cout
+      - const: cin
+      - const: spkr
+      - const: sense
+      - const: hpai
+
+  power-domains:
+    minItems: 1
+    maxItems: 9
+
+  power-domain-names:
+    minItems: 1
+    maxItems: 9
+
+  '#sound-dai-cells':
+    const: 1
+
+  apple,chassis-name:
+    $ref: /schemas/types.yaml#/definitions/string
+    description: Board name used for the microphone card identity.
+
+  apple,machine-kind:
+    $ref: /schemas/types.yaml#/definitions/string
+    description: Machine family used for the sound card identity.
+
+required:
+  - compatible
+  - dmas
+  - dma-names
+  - '#sound-dai-cells'
+
+unevaluatedProperties: false

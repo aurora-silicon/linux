@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * MacBook Pro (14-inch, M5 Pro, 2026)
+ *
+ * target-type: J714s
+ *
+ * One T6050 die (t6050-max.dtsi). Nobody has booted Linux on this board
+ * yet: beyond the SoC this file only adds the board's hardware inventory
+ * (t6050-peripherals.dtsi), all of it disabled, from the board's ADT.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include "t6050-max.dtsi"
+
+/ {
+	compatible = "apple,j714s", "apple,t6050", "apple,arm-platform";
+	model = "Apple MacBook Pro (14-inch, M5 Pro, 2026)";
+	chassis-type = "laptop";
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>; /* To be filled by the loader */
+			/* Format properties will be added by the loader */
+			status = "disabled";
+		};
+	};
+};
+
+/* PCIe port 0 is not described for this board yet */
+&pcie0 {
+	status = "disabled";
+};
+
+#define T6050_J714S
+#include "t6050-peripherals.dtsi"

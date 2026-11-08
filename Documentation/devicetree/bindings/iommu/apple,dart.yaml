@@ -23,6 +23,10 @@ description: |+
 properties:
   compatible:
     oneOf:
+      - items:
+          - const: apple,t6000-display-dart
+          - const: apple,t6000-dart
+          - const: apple,t8110-dart
       - enum:
           - apple,t8103-dart
           - apple,t8103-usb4-dart
@@ -43,6 +47,7 @@ properties:
               - apple,t6030-dart
               - apple,t6031-dart
               - apple,t6041-dart
+              - apple,t6050-dart
               - apple,t8122-dart
               - apple,t8132-dart
               - apple,t8140-dart
@@ -79,7 +84,7 @@ properties:
     minItems: 1
     items:
       - const: dart
-      - const: dapf
+      - enum: [dapf, auxiliary]
 
   interrupts:
     maxItems: 1
@@ -172,6 +177,17 @@ required:
   - interrupts
 
 allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6000-display-dart
+    then:
+      properties:
+        reg:
+          minItems: 2
+      required:
+        - reg-names
   - if:
       properties:
         reg:

@@ -1,0 +1,165 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/clock/apple,pmgr-clocks.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple PMGR peripheral clock selectors
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  Peripheral input clocks managed by the SoC power manager. The clock
+  specifier is the SoC clock selector from the hardware description. It is
+  separate from a PMGR device/power-gate ID. Rates may change with performance
+  state and must not be represented as fixed clocks sampled at one boot.
+  The provider remains disabled until a generation-specific clock driver
+  can resolve selectors and coordinate ownership with firmware.
+  Selectors are scoped by the referenced PMGR; a dual-die platform has
+  one provider per die.
+
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6000-pmgr-clocks
+          - apple,t6032-pmgr-clocks
+          - apple,t6041-pmgr-clocks
+          - apple,t6050-pmgr-clocks
+          - apple,t8103-pmgr-clocks
+          - apple,t8132-pmgr-clocks
+          - apple,t8140-pmgr-clocks
+          - apple,t8142-pmgr-clocks
+  required:
+    - compatible
+
+properties:
+  compatible: true
+
+  apple,pmgr:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Shared hardware resource metadata.
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8132-pmgr-clocks
+      required:
+        - compatible
+    then:
+      properties:
+        compatible:
+          items:
+            - const: apple,t8132-pmgr-clocks
+            - const: apple,pmgr-clocks
+
+        '#clock-cells':
+          const: 1
+
+      required:
+        - compatible
+        - '#clock-cells'
+    else:
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t6032-pmgr-clocks
+            required:
+              - compatible
+          then:
+            properties:
+              compatible:
+                items:
+                  - const: apple,t6032-pmgr-clocks
+                  - const: apple,pmgr-clocks
+
+              '#clock-cells':
+                const: 1
+
+            required:
+              - compatible
+              - '#clock-cells'
+          else:
+            properties:
+              compatible:
+                items:
+                  - enum:
+                      - apple,t6000-pmgr-clocks
+                      - apple,t6041-pmgr-clocks
+                      - apple,t6050-pmgr-clocks
+                      - apple,t8103-pmgr-clocks
+                      - apple,t8140-pmgr-clocks
+                      - apple,t8142-pmgr-clocks
+                  - const: apple,pmgr-clocks
+
+              reg:
+                description: PMGR control apertures in hardware-description order.
+                minItems: 44
+                maxItems: 63
+
+              '#clock-cells':
+                const: 1
+
+              apple,pmgr:
+                $ref: /schemas/types.yaml#/definitions/phandle
+                description: Primary PMGR syscon. Additional control banks are described by reg.
+
+            required:
+              - reg
+              - compatible
+              - '#clock-cells'
+              - apple,pmgr
+
+            allOf:
+              - if:
+                  properties:
+                    compatible:
+                      contains:
+                        const: apple,t8142-pmgr-clocks
+                then:
+                  properties:
+                    reg:
+                      minItems: 54
+                      maxItems: 54
+              - if:
+                  properties:
+                    compatible:
+                      contains:
+                        const: apple,t6041-pmgr-clocks
+                then:
+                  properties:
+                    reg:
+                      minItems: 63
+                      maxItems: 63
+              - if:
+                  properties:
+                    compatible:
+                      contains:
+                        const: apple,t6050-pmgr-clocks
+                then:
+                  properties:
+                    reg:
+                      minItems: 60
+                      maxItems: 60
+              - if:
+                  properties:
+                    compatible:
+                      contains:
+                        const: apple,t8140-pmgr-clocks
+                then:
+                  properties:
+                    reg:
+                      minItems: 44
+                      maxItems: 44
+
+            additionalProperties: false
+
+unevaluatedProperties: false

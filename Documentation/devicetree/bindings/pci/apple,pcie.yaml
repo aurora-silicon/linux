@@ -67,6 +67,7 @@ properties:
           - const: apple,t6020-pcie-ge
           - const: apple,t6020-pcie
       - const: apple,t8140-pcie
+      - const: apple,t6050-pcie
       - const: apple,t8152-pcie
       - const: apple,t8132-pcie
       - const: apple,t8103-pciec
@@ -78,6 +79,7 @@ properties:
           - const: apple,t8132-pciec
           - const: apple,t8122-pciec
           - const: apple,t8103-pciec
+      - const: apple,t6040-pciec
 
   apple,managed-sids:
     $ref: /schemas/types.yaml#/definitions/uint32-array
@@ -96,11 +98,11 @@ properties:
 
   reg:
     minItems: 3
-    maxItems: 10
+    maxItems: 11
 
   reg-names:
     minItems: 3
-    maxItems: 10
+    maxItems: 11
 
   ranges:
     minItems: 2
@@ -110,9 +112,15 @@ properties:
     description:
       Interrupt specifiers, one for each root port.
     minItems: 1
-    maxItems: 4
+    maxItems: 6
+
+  interrupt-names:
+    minItems: 1
+    maxItems: 6
 
   msi-parent: true
+
+  nonposted-mmio: true
 
   msi-ranges:
     maxItems: 1
@@ -182,6 +190,13 @@ patternProperties:
 
       interrupt-controller: true
 
+      apple,link-trained-by-bootloader:
+        type: boolean
+        description:
+          The boot loader trained this port's link and handed it over up. The
+          driver adopts the link as it is instead of resetting the port, so
+          the port needs no PERST# line.
+
       apple,tunable:
         $ref: '#/$defs/tunable'
         description: Initialization tuples relative to this port's registers.
@@ -211,7 +226,9 @@ allOf:
       properties:
         compatible:
           contains:
-            const: apple,t8132-pciec
+            enum:
+              - apple,t8132-pciec
+              - apple,t6040-pciec
     then:
       required:
         - apple,msi-vector-base
@@ -255,6 +272,7 @@ allOf:
             enum:
               - apple,t8103-pciec
               - apple,t6000-pciec
+              - apple,t6040-pciec
     then:
       properties:
         reg:
@@ -286,11 +304,49 @@ allOf:
                 - const: ltssm
                 - const: intr2axi
                 - const: oe-fabric
+            - items:
+                - const: config
+                - const: rc
+                - const: port0
+                - const: fabric
+                - const: debug
+                - const: ioa
+                - const: ltssm
+                - const: intr2axi
         interrupts:
-          maxItems: 1
+          maxItems: 6
         ranges:
           minItems: 3
           maxItems: 3
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6040-pciec
+          then:
+            properties:
+              reg:
+                minItems: 8
+                maxItems: 8
+              interrupts:
+                minItems: 6
+                maxItems: 6
+              interrupt-names:
+                items:
+                  - const: port
+                  - const: intx-a
+                  - const: intx-b
+                  - const: intx-c
+                  - const: intx-d
+                  - const: parity
+            required:
+              - interrupt-names
+          else:
+            properties:
+              interrupts:
+                maxItems: 1
+              interrupt-names: false
     else:
       properties:
         resets: false
@@ -329,40 +385,65 @@ allOf:
               properties:
                 compatible:
                   contains:
-                    const: apple,t8152-pcie
+                    const: apple,t6050-pcie
             then:
               properties:
                 reg:
-                  minItems: 4
-                  maxItems: 8
+                  minItems: 5
+                  maxItems: 11
                 reg-names:
-                  minItems: 4
-                  maxItems: 8
+                  minItems: 5
+                  maxItems: 11
                   items:
-                    enum: [config, rc, port0, phy0, port1, phy1, port2, phy2]
+                    enum: [config, rc, port0, phy0, intr2axi0, port1, phy1,
+                           intr2axi1, port2, phy2, intr2axi2, port3, phy3,
+                           intr2axi3]
                 interrupts:
-                  maxItems: 3
+                  maxItems: 4
             else:
-              properties:
-                reg-names:
-                  minItems: 3
-                  items:
-                    - const: config
-                    - const: rc
-                    - const: port0
-                    - const: port1
-                    - const: port2
-                    - const: port3
-                    - const: phy0
-                    - const: phy1
-                    - const: phy2
-                    - const: phy3
+              if:
+                properties:
+                  compatible:
+                    contains:
+                      const: apple,t8152-pcie
+              then:
+                properties:
+                  reg:
+                    minItems: 4
+                    maxItems: 8
+                  reg-names:
+                    minItems: 4
+                    maxItems: 8
+                    items:
+                      enum: [config, rc, port0, phy0, port1, phy1, port2, phy2]
+                  interrupts:
+                    maxItems: 3
+              else:
+                properties:
+                  reg-names:
+                    minItems: 3
+                    items:
+                      - const: config
+                      - const: rc
+                      - const: port0
+                      - const: port1
+                      - const: port2
+                      - const: port3
+                      - const: phy0
+                      - const: phy1
+                      - const: phy2
+                      - const: phy3
       patternProperties:
         "^pci@":
           properties:
             apple,tunable: false
-          required:
-            - reset-gpios
+          if:
+            not:
+              required:
+                - apple,link-trained-by-bootloader
+          then:
+            required:
+              - reset-gpios
 
 examples:
   - |

@@ -24,6 +24,7 @@ properties:
               - apple,t6000-dcp
               - apple,t6020-dcp
               - apple,t6041-dcp
+              - apple,t6050-dcp
               - apple,t8140-dcp
               - apple,t8142-dcp
           - const: apple,dcp
@@ -34,6 +35,7 @@ properties:
               - apple,t6000-dcpext
               - apple,t6020-dcpext
               - apple,t6041-dcpext
+              - apple,t6050-dcpext
           - const: apple,dcpext
       - items:
           - const: apple,t8140-dcpext
@@ -49,10 +51,14 @@ properties:
           reserves their firmware memory, publishes the firmware identity and
           sets apple,t8132-dcpext-firmware-ready.
         const: apple,t8132-dcpext
+      - description:
+          T6031 (M3 Max) internal display controller. The display gate enables
+          it after the boot loader has handed the running display over.
+        const: apple,t6031-dcp
 
   reg:
     minItems: 2
-    maxItems: 7
+    maxItems: 8
 
   reg-names:
     minItems: 2
@@ -63,7 +69,13 @@ properties:
       - enum: [disp-2, iop-vbar]
       - enum: [disp-3, iop-vbar]
       - enum: [disp-4, iop-vbar]
+      - enum: [disp-5, iop-vbar, coproc-aux]
       - const: iop-vbar
+
+  interrupts:
+    minItems: 7
+    maxItems: 16
+    description: Optional host display-engine interrupt sources.
 
   mboxes:
     maxItems: 1
@@ -352,19 +364,6 @@ properties:
       apple,max-brightness:
         $ref: /schemas/types.yaml#/definitions/uint32
         description: Maximum firmware backlight level.
-      apple,color-gamut:
-        $ref: /schemas/types.yaml#/definitions/string
-        enum:
-          - srgb
-          - display-p3
-        description:
-          Standard colour space the panel is calibrated to by default, as
-          named in the product's published specifications. srgb has the
-          IEC 61966-2-1 primaries, display-p3 the SMPTE EG 432-1 primaries;
-          both have a D65 white and a nominal gamma of 2.2. Factory
-          calibration of the individual unit is applied by the display
-          coprocessor and is not described here. Colour data reported by
-          the firmware takes precedence.
     required:
       - compatible
     additionalProperties: false
@@ -408,13 +407,14 @@ required:
 
 allOf:
   - if:
-      properties:
-        compatible:
-          contains:
-            enum: ['apple,t6030-dcpext', 'apple,t8132-dcpext']
-      required:
-        - compatible
-    else:
+      not:
+        properties:
+          compatible:
+            contains:
+              enum: ['apple,t6030-dcpext', 'apple,t8132-dcpext']
+        required:
+          - compatible
+    then:
       properties:
         mux-controls:
           maxItems: 8
@@ -423,11 +423,18 @@ allOf:
           items:
             pattern: '^(dp-xbar|typec[0-9]+)$'
   - if:
-      not:
-        properties:
-          compatible:
-            contains:
-              enum: ['apple,t8132-dcp', 'apple,t8132-dcpext']
+      allOf:
+        - not:
+            properties:
+              compatible:
+                contains:
+                  enum: ['apple,t6031-dcp', 'apple,t8132-dcp', 'apple,t8132-dcpext']
+        - not:
+            properties:
+              status:
+                const: disabled
+            required:
+              - status
     then:
       required:
         - apple,bw-scratch

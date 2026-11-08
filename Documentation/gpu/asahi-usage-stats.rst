@@ -68,6 +68,91 @@ per stage; commands without application timestamps also execute two existing
 timestamp microsequence operations per stage. Reading fdinfo loads three counters
 and does not traverse queues, wait for fences or access hardware.
 
+G16S and G17P device utilisation
+------------------------------
+
+The shared G17 backend also exposes device-wide utilisation through the existing
+``agx_stats`` sysfs attribute. Both firmware graphs use the same decoder for
+statistics tag ``0x13``: words 3, 4 and 6 are tiler, renderer and device
+percentages. Each complete record contributes one equally weighted sample to
+three bounded sums and a common count. Device utilisation is independent of the
+two engine percentages; it is not their sum.
+
+Reading ``agx_stats`` drains the statistics rings of both firmware roles under
+the device mutex, even without an event notification. The reader observes power
+epochs before and after draining and retains the transport's copy-before-consume,
+suspension, queued-prefix discard and quarantine rules. It does not wake the GPU
+or send a firmware command. Event service continues to drain the same rings.
+
+``utilisation_status`` distinguishes valid, stale and unavailable samples.
+Numeric ``util_tiler_percent``, ``util_renderer_percent`` and
+``util_device_percent`` values appear only for valid samples, including valid
+zero samples. The existing ``unsupported`` value placeholder is retained for
+other statuses; consult ``utilisation_status`` for the reason. The source,
+sample count and newest host receive timestamp are reported as
+``utilisation_source``, ``utilisation_samples`` and ``utilisation_host_ns``.
+The averaging/freshness policy is selected by firmware graph: two nominal
+periods (16 ms or 32 ms), with the existing measured delivery slack for batched
+packets. Suspend, recovery, GPU power epochs and ring quarantine invalidate the
+snapshot; old samples cannot become a new epoch's baseline.
+
+The firmware power-gates the GPU cores a few milliseconds after the last work
+completes and emits no utilisation record while they are gated. A power gate
+therefore ends the averaging epoch but is not a loss of knowledge: the last
+sample stays valid until it ages out, after which the gated GPU reads as a valid
+zero for every utilisation value until it powers up again. Waking starts a new
+epoch, stale until its first record arrives.
+
+These samples have neither a qualified duration nor a client identity. They do
+not change ``busy_ns`` or fdinfo's per-client ``drm-engine-*`` counters. A quiet
+ring on powered cores becomes stale rather than fabricating a zero-utilisation
+sample; only gated cores read as zero. Readers
+must not convert these percentages into engine nanoseconds or cycles.
+
+Deferred shared power telemetry
+------------------------------
+
+Current pstate and requested/achieved frequency remain unsupported for these
+firmware graphs. The shared-power snapshot ABI is not sufficiently specified
+to implement a read-only reader. For **each** of G16S and G17P, it still needs:
+
+* The firmware-version-to-layout mapping, containing allocation and bounds,
+  offsets, widths and stride of the generation/seqlock word, live pstate,
+  performance-table selector, residency/throttle counters and PI-controller
+  effective-frequency field.
+* The generation word's stable/odd/update protocol, including its relation to
+  reset and power epochs and the order required for a coherent snapshot.
+* The exact selector bit/encoding for performance table A versus B, and the
+  valid live pstate range in that table.
+* Effective-frequency units, scaling, valid range and overflow rules for both
+  layouts, qualified against an independent frequency measurement; G17P's
+  units in particular remain unresolved.
+* Counter units, wrap/regression/reset semantics, and whether controller fields
+  remain valid while the GPU is power-gated.
+
+A future implementation needs bounded seqlock retries and lifecycle invalidation
+before publishing these fields. Tag ``0x10`` remains decoded for diagnostics but
+is not emitted by the currently qualified firmware graphs. A dormant pstate
+record, a host request or a command timer cannot provide achieved frequency.
+``drm-curfreq-gpu`` must wait for a qualified shared snapshot.
+
+Hardware acceptance
+-------------------
+
+Validate the same candidate on J616s (G16S) and Neo (G17P), retaining the known
+boot fallback. Record the firmware graph, ``aurora-diag gpu``, ``agx_stats``,
+the load client's fdinfo and the initial kernel warning count. Poll statistics
+at 4--10 Hz through 60 seconds idle, at least 60 seconds of ``glmark2``, then
+60 seconds idle. Require utilisation to rise under load and return to fresh
+zero samples at idle, with every value in 0--100 and zero new kernel warnings.
+Stale or unavailable samples do not satisfy the idle-zero check.
+
+Repeat ten idle/load transitions, suspend/resume and a normal GPU power epoch.
+Require no ring quarantine or cross-epoch accumulation, renewed valid samples
+after each boundary and no rendering/recovery regression. Confirm only the
+submitting client's fdinfo engine counters increase. These checks are runtime
+acceptance criteria; host decoder tests alone do not establish a hardware pass.
+
 Host arithmetic tests
 ---------------------
 
