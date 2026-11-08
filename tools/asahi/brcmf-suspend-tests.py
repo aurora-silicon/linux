@@ -65,7 +65,7 @@ struct pci_dev { struct device dev; int irq; bool state_saved; };
 struct brcmf_pciedev_info { bool mbdata_completed, intr, ready, timer;
  bool wowl_irq, wowl_enabled, irq_wake_enabled;
  int state, mbdata_resp_wait; void *ci; struct pci_dev *pdev;
- struct { int intmask; } *reginfo; };
+ struct { int intmask, mailboxmask; } *reginfo; };
 struct pcie_priv { struct brcmf_pciedev_info *devinfo; };
 struct brcmf_bus { enum brcmf_bus_state state; struct brcmf_pub *drvr; bool wowl_transport, wowl_wake;
  struct { struct pcie_priv *pcie; } bus_priv; };
