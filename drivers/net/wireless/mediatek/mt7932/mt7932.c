@@ -7,6 +7,7 @@
 #include <linux/soc/apple/pci-apple-piodma.h>
 
 #include "mt7932.h"
+#include "wow.h"
 
 #include <linux/pm_wakeup.h>
 #include <linux/suspend.h>
@@ -165,6 +166,11 @@ static void mt_receive(struct mt7932 *m, const u8 *packet, size_t length)
 		mt_bss_presence(m, &event);
 		goto unlock;
 	}
+	/* Unsolicited; never the answer to a waiting command. */
+	if (event.eid == MT7932_EVENT_WOW_REASON && !(m->waiting && event.seq == m->waiting)) {
+		mt_wow_event_locked(m, &event);
+		goto unlock;
+	}
 	if (event.eid == 0xd6) {
 		ret = mt7932_cal_null(&m->cal_state, packet + 36,
 				     event.length >= 36 ? event.length - 36 : 0,
@@ -209,6 +215,14 @@ static void mt_receive(struct mt7932 *m, const u8 *packet, size_t length)
 		memcpy(m->reply, packet, event.length);
 		m->reply_length = event.length;
 		complete(&m->response);
+	} else if (event.eid == 0xf6) {
+		/* HIF control result: host interface type, TX and RX traffic state. */
+		dev_dbg(&m->pdev->dev, "WOW_HIF_EVENT: len=%zu type=%u tx=%u rx=%u\n", event.length,
+			 event.length > 38 ? packet[36] : 0, event.length > 38 ? packet[37] : 0,
+			 event.length > 38 ? packet[38] : 0);
+	} else if (m->waiting && event.seq == m->waiting) {
+		dev_dbg(&m->pdev->dev, "REPLY_MISMATCH: eid=%02x seq=%u option=%02x len=%zu wanted=%d\n",
+			event.eid, event.seq, event.option, event.length, m->waiting_eid);
 	} else {
 		dev_dbg_ratelimited(&m->pdev->dev, "event eid=%02x seq=%u option=%02x len=%zu\n",
 				     event.eid, event.seq, event.option, event.length);
@@ -230,6 +244,11 @@ static void mt_rx_drain(struct mt7932 *m, struct mt7932_ring *q)
 		dma_rmb();
 		length = (ctrl >> 16) & 0x3fff;
 		m->rx_ring_records[q - m->rx]++;
+		if (READ_ONCE(m->wake_irq_armed))
+			dev_dbg_ratelimited(&m->pdev->dev, "WOW_ARMED_RX: ring=%td length=%u word0=%08x eid=%02x\n",
+					     q - m->rx, length,
+					     get_unaligned_le32(q->buffers + q->tail * RX_STRIDE),
+					     q->buffers[q->tail * RX_STRIDE + 28]);
 		if (length <= MT7932_RX_CAPACITY && (ctrl & BIT(30)))
 			mt_receive(m, q->buffers + q->tail * RX_STRIDE, length);
 		else
@@ -283,6 +302,9 @@ static void mt_service(struct mt7932 *m)
 	 * cause. Record them so a test can see such a source.
 	 */
 	m->irq_passes++;
+	if (READ_ONCE(m->wake_irq_armed))
+		dev_dbg_ratelimited(&m->pdev->dev, "WOW_ARMED_IRQ: raw=%08x mask=%08x sw=%08x\n",
+				     raw, m->irq_mask, mt_read(m, W + 0x1f0));
 	if ((raw & ~m->irq_mask) && raw != U32_MAX) {
 		m->irq_unmasked |= raw & ~m->irq_mask;
 		m->irq_unmasked_passes++;
@@ -1207,6 +1229,7 @@ static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	init_completion(&m->response);
 	init_completion(&m->cal_response);
 	init_completion(&m->reset_retry);
+	init_completion(&m->wow_event);
 	mutex_init(&m->command_mutex);
 	spin_lock_init(&m->response_lock);
 	ret = mt_ownership(m);
@@ -1267,6 +1290,15 @@ static int mt_suspend(struct device *dev)
 		return -EOPNOTSUPP;
 	pci_save_state(to_pci_dev(dev));
 	device_set_awake_path(dev);
+	/* The wiphy, a child, has suspended first and sent any WoWLAN START. */
+	mt_wow_arm_irq(dev_get_drvdata(dev));
+	return 0;
+}
+
+/* Disarm before the wiphy resumes and sends its STOP. */
+static int mt_resume_noirq(struct device *dev)
+{
+	mt_wow_disarm_irq(dev_get_drvdata(dev));
 	return 0;
 }
 
@@ -1286,6 +1318,7 @@ static int mt_freeze(struct device *dev)
 
 static const struct dev_pm_ops mt_pm_ops = {
 	.suspend = mt_suspend,
+	.resume_noirq = mt_resume_noirq,
 	.freeze = mt_freeze,
 	.poweroff = mt_freeze,
 };

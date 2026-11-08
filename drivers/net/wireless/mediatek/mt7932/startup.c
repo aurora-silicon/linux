@@ -804,6 +804,11 @@ static const struct cfg80211_ops mt_cfg_ops = {
 	.dump_station = mt_dump_station,
 	.set_power_mgmt = mt_set_power_mgmt,
 	.set_cqm_rssi_config = mt_set_cqm_rssi_config,
+#ifdef CONFIG_PM_SLEEP
+	.suspend = mt_wow_suspend,
+	.resume = mt_wow_resume,
+	.set_wakeup = mt_wow_set_wakeup,
+#endif
 };
 
 int mt_register_regulatory_gate(struct mt7932 *m)
@@ -934,6 +939,8 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 			m->wiphy->flags |= WIPHY_FLAG_SPLIT_SCAN_6GHZ;
 		}
 	}
+	/* Firmware is running and nothing else issues commands yet. */
+	mt_wow_init(m);
 	ret = wiphy_register(m->wiphy);
 	if (ret) {
 		wiphy_free(m->wiphy);

@@ -124,6 +124,8 @@ static void mt_scan_event(struct mt7932*m,const struct mt7932_event*e){}
 static void mt_bss_presence(struct mt7932*m,const struct mt7932_event*e){}
 static void mt_data_complete(struct mt7932*m,const u8*p,size_t n){}
 static void mt_packet_receive(struct mt7932*m,const u8*p,size_t n){}
+#define MT7932_EVENT_WOW_REASON 0x62
+static void mt_wow_event_locked(struct mt7932*m,const struct mt7932_event*e){}
 static void mt_rf_fail_locked(struct mt7932*m,int e){m->rf_ready=false;m->link_failed=true;m->cal_state.error=e;m->cal_state.active=false;m->connect_error=e;complete_all(&m->assoc_done);complete_all(&m->cal_response);}
 CHANNEL
 LINK

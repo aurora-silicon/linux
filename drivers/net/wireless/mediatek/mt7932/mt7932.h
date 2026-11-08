@@ -229,6 +229,14 @@ struct mt7932 {
 	bool bss_absent;
 	u8 bss_quota;
 	u32 irq_mask;
+	/* Wake on WLAN; see wow.c. wow_supported is set once at probe, the
+	 * armed states under command_mutex or in the PM callbacks, and
+	 * wow_reason (a reason, or -ENODATA) under response_lock.
+	 */
+	bool wow_supported, wow_acked, wow_armed, wake_irq_armed;
+	int wow_reason;
+	bool wow_fw_own;
+	struct completion wow_event;
 	void *ipc, *aux;
 	dma_addr_t ipc_dma, aux_dma;
 };
@@ -344,5 +352,19 @@ int mt_set_power_mgmt(struct wiphy *wiphy, struct net_device *netdev,
 		      bool enabled, int timeout);
 void mt_power_work(struct work_struct *work);
 int mt_power_init(struct mt7932 *m);
+#ifdef CONFIG_PM_SLEEP
+void mt_wow_init(struct mt7932 *m);
+void mt_wow_event_locked(struct mt7932 *m, const struct mt7932_event *event);
+int mt_wow_suspend(struct wiphy *wiphy, struct cfg80211_wowlan *wow);
+int mt_wow_resume(struct wiphy *wiphy);
+void mt_wow_set_wakeup(struct wiphy *wiphy, bool enabled);
+void mt_wow_arm_irq(struct mt7932 *m);
+void mt_wow_disarm_irq(struct mt7932 *m);
+#else
+static inline void mt_wow_init(struct mt7932 *m) {}
+static inline void mt_wow_event_locked(struct mt7932 *m, const struct mt7932_event *event) {}
+static inline void mt_wow_arm_irq(struct mt7932 *m) {}
+static inline void mt_wow_disarm_irq(struct mt7932 *m) {}
+#endif
 
 #endif
