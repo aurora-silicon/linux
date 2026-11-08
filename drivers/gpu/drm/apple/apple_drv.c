@@ -652,7 +652,7 @@ static int apple_wait_for_fences(struct drm_device *dev,
 
 		WARN_ON(!new_plane_state->fb);
 
-		left = time_before(jiffies, deadline) ? deadline - jiffies : 0;
+		left = max_t(long, (long)(deadline - jiffies), 0);
 		ret = dma_fence_wait_timeout(fence, pre_swap, left);
 		if (ret < 0)
 			return ret;

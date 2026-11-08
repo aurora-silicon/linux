@@ -649,6 +649,12 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 	if (!dcp_desktop_present_complete(dcp, resp->swap_id))
 		return;
 	dcp_backlight_desktop_finish(dcp, resp->swap_id, false, true);
+#else
+	/* Nor can a lost flip's on firmware that does not track its presents. */
+	if ((!DCP_FW_H17(DCP_FW_VER) ||
+	     dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G) &&
+	    dcp_swap_lost(dcp, resp->swap_id))
+		return;
 #endif
 	trace_iomfb_swap_complete(dcp, resp->swap_id);
 	dcp->last_swap_id = resp->swap_id;
@@ -2088,6 +2094,7 @@ static void dcp_swap_clear_started(struct apple_dcp *dcp, void *data,
 		dcp_prepare_clear_swap(dcp, &DCP_FW_SWAP(dcp));
 #endif
 	DCP_FW_SWAP(dcp).swap.swap_id = resp->swap_id;
+	WRITE_ONCE(dcp->started_swap_id, resp->swap_id);
 	if (dcp_present_retires(dcp))
 		dcp_arm_retained_framebuffers(dcp, resp->swap_id);
 
@@ -2943,6 +2950,7 @@ static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 		return;
 	}
 	DCP_FW_SWAP(dcp).swap.swap_id = resp->swap_id;
+	WRITE_ONCE(dcp->started_swap_id, resp->swap_id);
 	if (dcp_present_retires(dcp))
 		dcp_arm_retained_framebuffers(dcp, resp->swap_id);
 
