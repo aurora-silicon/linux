@@ -300,6 +300,10 @@ struct sep_key_public {
  * 6 (handle ignored): make a throwaway key with the .userPresence list and
  * sign with a key-bag-secret context ('result') and with a context with no
  * match ('result2').
+ * 7 (research): the same throwaway key signed with a context whose passcode
+ * credential comes from another user's key bag. In: 'enclave_status' = that
+ * uid, 'handle'/'handle_len' = that bag's password. Out: 'result2' = the
+ * verify-secret status, 'result'/'enclave_status' = the signature.
  * 'result' is 0 when the enclave signed, else a negative errno.
  */
 struct sep_key_selftest {

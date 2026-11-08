@@ -172,6 +172,13 @@ pub(crate) const SELFTEST_TOUCH_THEN_DELETED: u32 = 5;
 /// policy and whether a root-held secret satisfies it; `CREATE` refuses the
 /// policy either way.
 pub(crate) const SELFTEST_PRESENCE_PROBE: u32 = 6;
+/// Research probe, no finger: the `.userPresence` throwaway key (identity
+/// bag) signed with a context whose passcode credential came from another
+/// user's bag. In: `enclave_status` = that user's uid, the handle buffer =
+/// that user's bag password (`handle_len` bytes). Out: `result2` = the
+/// verify-secret status, `result`/`enclave_status` = the signature. Shows
+/// whether a credential from one bag satisfies a key under another.
+pub(crate) const SELFTEST_PRESENCE_OTHER_BAG: u32 = 7;
 
 static_assert!(core::mem::size_of::<Info>() == 16);
 static_assert!(core::mem::size_of::<Create>() == 2124);
@@ -732,6 +739,48 @@ impl SepData {
         Ok(handle)
     }
 
+    fn key_presence_other_bag(&self, req: &mut Selftest) -> Result<()> {
+        let uid = req.enclave_status;
+        let len = req.handle_len as usize;
+        if len == 0 || len > 256 || uid < crate::sks::SKS_DESIGNATE_USER_MIN || uid == crate::SBIO_PROBE_USER_ID {
+            return Err(EINVAL);
+        }
+        let du = crate::sks::DesignateUser::new(uid).ok_or(EINVAL)?;
+        let ed = presence_acl()?;
+        let (blob, _) = self.user_key_create(Some(&ed))?;
+        let digest = req.digest;
+        let (status, _) = self.scrd_command(&crate::scrd::scrd_initialize()).ok_or(EIO)?;
+        if status != 0 {
+            return Err(EIO);
+        }
+        let (status, out) = self.scrd_command(&crate::scrd::scrd_context_create_tracked(uid)).ok_or(EIO)?;
+        let ctx = crate::scrd::tracked_create_reference(&out).filter(|_| status == 0).ok_or(EIO)?;
+        let verify = (|| -> Option<i32> {
+            let (status, _) = self.scrd_command(&crate::scrd::scrd_context_externalize(&ctx))?;
+            if status != 0 {
+                return None;
+            }
+            let out = self.sks_send(self.sks_req_verify_secret(du.special_handle(), &req.handle[..len], &ctx))?;
+            Some(out.reply.status as i32)
+        })();
+        req.handle.fill(0);
+        req.result2 = verify.unwrap_or(-(EIO.to_errno()));
+        self.last_key_status.store(0, Relaxed);
+        let r = self.user_key_sign(&blob, &digest, Some(&ctx));
+        req.result = r.err().map(|e| e.to_errno()).unwrap_or(0);
+        req.enclave_status = self.last_key_status.load(Relaxed) as i32;
+        self.close_unlock_evaluation(&ctx);
+        dev_info!(
+            self.dev,
+            "sep-key: self-test presence key with a credential from uid {}'s bag: verify status {}, signature {} (enclave status {})\n",
+            uid,
+            req.result2,
+            (if req.result == 0 { "SIGNED" } else { "refused" }),
+            req.enclave_status
+        );
+        Ok(())
+    }
+
     fn key_presence_probe(&self, req: &mut Selftest) -> Result<()> {
         let ed = presence_acl()?;
         let (blob, _) = self.user_key_create(Some(&ed))?;
@@ -766,6 +815,9 @@ impl SepData {
         crate::bio::require_admin()?;
         if req.mode == SELFTEST_PRESENCE_PROBE {
             return self.key_presence_probe(req);
+        }
+        if req.mode == SELFTEST_PRESENCE_OTHER_BAG {
+            return self.key_presence_other_bag(req);
         }
         let (blob, flags) = decode_handle(&req.handle, req.handle_len)?;
         if flags & HANDLE_BIOMETRY == 0 {
