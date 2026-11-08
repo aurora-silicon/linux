@@ -21,6 +21,7 @@
 #include <linux/reset-controller.h>
 #include <linux/module.h>
 #include <linux/soc/apple/pmgr-pwrstate.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/soc/apple/t8132.h>
 
 #define APPLE_PMGR_RESET        BIT(31)
@@ -371,7 +372,9 @@ static int apple_pmgr_ps_resume_early(struct device *dev)
  *
  * On T8140 macOS re-raises 22 domains in the first 5 ms after a wake and lowers
  * 30 others (measured under aura). Which of them Linux needs isn't established,
- * so this follows genpd's books rather than a list.
+ * so this follows genpd's books rather than a list. A domain whose driver took it
+ * down for the sleep, as the USB host's PHY does, is that driver's to raise, in
+ * its own order.
  */
 static int apple_pmgr_ps_resume_noirq(struct device *dev)
 {
@@ -381,7 +384,7 @@ static int apple_pmgr_ps_resume_noirq(struct device *dev)
 	int ret;
 
 	if (!pm_resume_via_firmware() || ps->firmware_owned || ps->inherited_on ||
-	    ps->sleep_driver_owned)
+	    ps->sleep_driver_owned || apple_sleep_domain_is_down(dev->of_node))
 		return 0;
 
 	spin_lock_irqsave(&ps->genpd.slock, flags);
