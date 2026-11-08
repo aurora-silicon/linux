@@ -41,8 +41,6 @@
 		#address-cells = <2>;
 		#size-cells = <2>;
 		ranges;
-		/* Normally replaced by the loader */
-		bootargs = "maxcpus=1";
 
 		framebuffer0: framebuffer@0 {
 			compatible = "apple,simple-framebuffer", "simple-framebuffer";
