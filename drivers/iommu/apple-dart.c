@@ -5101,7 +5101,9 @@ static int apple_dart_probe(struct platform_device *pdev)
 			return PTR_ERR(dart->gapf);
 		dart->gapf_boot = readl(dart->gapf);
 	}
-	if (platform_get_resource_byname(pdev, IORESOURCE_MEM, "dapf")) {
+	/* T8132's ISP DART names its DAPF page but has no ranges to restore. */
+	if (platform_get_resource_byname(pdev, IORESOURCE_MEM, "dapf") &&
+	    of_property_present(pdev->dev.of_node, "apple,dapf-ranges")) {
 		ret = apple_dart_dapf_parse(pdev, dart);
 		if (ret)
 			return ret;
