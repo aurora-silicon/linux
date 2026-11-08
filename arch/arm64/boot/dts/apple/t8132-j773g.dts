@@ -34,13 +34,50 @@
 	};
 };
 
-/*
- * iBoot scans out through dispext0 to the HDMI port (dptx-phy and a
- * DP-to-HDMI converter at i2c0 0x08, hot-plug on AOP GPIO 41): keep the
- * power domains used for it on.
- */
-&framebuffer0 {
-	power-domains = <&ps_dispext0_fe>, <&ps_dptx_phy>;
+&soc {
+	dptx_phy: phy@39a700000 {
+		compatible = "apple,t8122-dptx-phy", "apple,dptx-phy";
+		reg = <0x3 0x9a700000 0x0 0x4000>,
+		      <0x3 0x9a740000 0x0 0x10000>;
+		reg-names = "core", "dptx";
+		power-domains = <&ps_dptx_phy>;
+		#phy-cells = <0>;
+		status = "okay";
+	};
+};
+
+&dcp_mbox {
+	/* iBoot leaves DISP_CPU in auto mode; Linux must not switch it. */
+	/delete-property/ power-domains;
+	status = "okay";
+};
+
+&dcp_dart {
+	status = "okay";
+};
+
+&disp0_dart {
+	status = "okay";
+};
+
+&dcp {
+	/* iBoot leaves DISP_CPU in auto mode; Linux must not switch it. */
+	/delete-property/ power-domains;
+	apple,connector-type = "HDMI-A";
+	apple,dptx-phy = <4>;
+	phys = <&dptx_phy>;
+	phy-names = "dp-phy";
+	hdmi-pwren-gpios = <&smc_gpio 15 GPIO_ACTIVE_HIGH>;
+	dp2hdmi-pwren-gpios = <&smc_gpio 26 GPIO_ACTIVE_HIGH>;
+	status = "okay";
+};
+
+&disp0_piodma {
+	status = "okay";
+};
+
+&display {
+	status = "okay";
 };
 
 /*
