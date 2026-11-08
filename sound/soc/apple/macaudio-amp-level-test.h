@@ -56,8 +56,8 @@ static void macaudio_level_no_table(struct kunit *test)
 	const struct macaudio_platform_cfg *cfgs[] = {
 		&macaudio_j180_cfg, &macaudio_j314_cfg, &macaudio_j316_cfg,
 		&macaudio_j37x_j47x_cfg, &macaudio_j413_cfg, &macaudio_j415_cfg,
-		&macaudio_j493_cfg, &macaudio_j614_cfg, &macaudio_j616_cfg,
-		&macaudio_j713_cfg,
+		&macaudio_j493_cfg, &macaudio_j575c_j773_cfg, &macaudio_j614_cfg,
+		&macaudio_j616_cfg, &macaudio_j713_cfg, &macaudio_j715_cfg,
 	};
 	unsigned int i;
 

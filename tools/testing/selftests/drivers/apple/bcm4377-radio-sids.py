@@ -300,7 +300,7 @@ static u32 apple_pcie_port_readl(struct apple_pcie_port *p, unsigned o)
     code += definition(pci, 'static int apple_pcie_radio_check_cold(struct apple_pcie_port *port)\n{') + '\n'
     code += definition(dart, 'static int apple_dart_retain_radio(') + '\n'
     probe = definition(dart, 'static int apple_dart_probe(struct platform_device *pdev)\n{')
-    start = probe.index('\tif (dart->managed_sids) {', probe.index('Retaining the live J713 MTP bypass'))
+    start = probe.index('\tif (dart->managed_sids) {', probe.index('Retaining the live T8132 MTP bypass'))
     end = probe.index('\n\t} else if (!dart->locked', start)
     cleanup = probe[probe.index('err_clk_disable:'):probe.index('\n\tclk_bulk_disable_unprepare', probe.index('err_clk_disable:'))]
     code += 'static int test_probe_start(struct apple_dart *dart) { int ret; void *dev=dart->dev;\n' + probe[start:end] + '\n\t}\nreturn 0;\n' + cleanup + '\nreturn ret; }\n'

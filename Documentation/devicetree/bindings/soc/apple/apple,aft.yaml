@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,aft.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple fabric trace controller
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  The fabric trace controller exposes a register aperture used by the
+  processor debug infrastructure. Trace programs and debug sequences are
+  firmware policy and are not part of this hardware description.
+
+select:
+  properties:
+    compatible:
+      contains:
+        enum: ['apple,t8103-aft', 'apple,t8112-aft']
+  required:
+    - compatible
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t8103-aft
+          - apple,t8112-aft
+      - const: apple,aft
+
+  reg:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false

@@ -50,3 +50,20 @@
 #undef DIE
 #undef DIE_NO
 #undef SOC_NODE
+
+#include "t6031-peripherals.dtsi"
+
+#include "t6031-peripheral-buses.dtsi"
+
+#include "t6031-coprocessors.dtsi"
+
+#include "t6031-misc-interfaces.dtsi"
+
+&smc_hwmon {
+	/* M3 Max die keys; absent firmware keys are skipped. */
+	apple,soc-die-keys = "Tf04", "Tf06", "Tf09", "Tf0A", "Tf0B",
+			     "Tf14", "Tf16", "Tf19", "Tf1A", "Tf1B",
+			     "Tf24", "Tf26", "Tf29", "Tf2A", "Tf2B",
+			     "Tf34", "Tf36", "Tf39", "Tf3A", "Tf3B",
+			     "Tf44", "Tf46", "Tf49", "Tf4A", "Tf4B";
+};

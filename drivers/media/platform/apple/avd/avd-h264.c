@@ -224,6 +224,31 @@ static void stream_scaling(struct avd_ctx *ctx, struct avd_h264_run *run)
 	}
 }
 
+/*
+ * A scaling matrix whose used lists are all 16 is Flat_4x4_16/Flat_8x8_16,
+ * which is what the decoder applies when no list is loaded (H.264 7.4.2.1.1).
+ * FFmpeg and the VA path always hand one over, so loading it per picture
+ * costs PP time for nothing; macOS leaves the list section empty here.
+ */
+VISIBLE_IF_KUNIT bool
+avd_h264_scaling_is_flat(const struct v4l2_ctrl_h264_pps *pps,
+			 const struct v4l2_ctrl_h264_scaling_matrix *scaling)
+{
+	for (int i = 0; i < 6; i++)
+		for (int j = 0; j < 16; j++)
+			if (scaling->scaling_list_4x4[i][j] != 16)
+				return false;
+
+	if (pps->flags & V4L2_H264_PPS_FLAG_TRANSFORM_8X8_MODE)
+		for (int i = 0; i < 2; i++)
+			for (int j = 0; j < 64; j++)
+				if (scaling->scaling_list_8x8[i][j] != 16)
+					return false;
+
+	return true;
+}
+EXPORT_SYMBOL_IF_KUNIT(avd_h264_scaling_is_flat);
+
 static bool avd_h264_intra_header(const struct avd_h264_run *run)
 {
 	/*
@@ -336,7 +361,8 @@ static void stream_hdr(struct avd_ctx *ctx, struct avd_h264_run *run)
 	if (!intra_header)
 		stream_refs(ctx, run);
 
-	if (pps->flags & V4L2_H264_PPS_FLAG_SCALING_MATRIX_PRESENT)
+	if ((pps->flags & V4L2_H264_PPS_FLAG_SCALING_MATRIX_PRESENT) &&
+	    !avd_h264_scaling_is_flat(pps, run->scaling_matrix))
 		stream_scaling(ctx, run);
 	else
 		push(0, "cm3_mark_end_section_scl");
@@ -541,6 +567,7 @@ static void stream_slice(struct avd_ctx *ctx, struct avd_h264_run *run)
 	push(AVD_OP_SL_REF | AVD_OP_SL_REF_FLAG_CABAC(sl->cabac_init_idc == 1) |
 		     AVD_OP_SL_REF_FLAG1(sl->cabac_init_idc == 2) |
 		     AVD_OP_SL_REF_FLAG2(
+			     sl->slice_type == V4L2_H264_SLICE_TYPE_B &&
 			     !(sl->flags &
 			       V4L2_H264_SLICE_FLAG_DIRECT_SPATIAL_MV_PRED)) |
 		     AVD_OP_SL_REF_NUM_L0(sl->num_ref_idx_l0_active_minus1) |
