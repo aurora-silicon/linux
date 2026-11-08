@@ -137,6 +137,15 @@
 	apple,panel-height-mm = <188>;
 };
 
+/* The enclave must take the sleep request, so its driver has to bind. */
+&sep_dart {
+	status = "okay";
+};
+
+&sep {
+	status = "okay";
+};
+
 /* External displays: both pipes, routed to either USB-C port. */
 &dcpext0_mbox {
 	status = "okay";
