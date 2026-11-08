@@ -145,6 +145,11 @@ static void cancel_work_sync(struct work_struct *w) {
  assert(msgbuf.tx_suspended);w->queued=false;cancels++;
 }
 static void brcmf_pcie_fwcon_timer(struct brcmf_pciedev_info *d,bool on) {d->timer=on;}
+static void brcmf_fw_crashed(struct device *d) {(void)d;}
+static int brcmf_pcie_ds_prepare_suspend(struct brcmf_pciedev_info *d) {(void)d;return 0;}
+static void brcmf_pcie_ds_suspend_abort(struct brcmf_pciedev_info *d) {(void)d;}
+static void brcmf_pcie_ds_resume_start(struct brcmf_pciedev_info *d) {(void)d;}
+static void brcmf_pcie_ds_resume_complete(struct brcmf_pciedev_info *d) {(void)d;}
 #define PM_SUSPEND_TO_IDLE 1
 static int pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
 static bool device_may_wakeup(struct device *d) {(void)d;return true;}

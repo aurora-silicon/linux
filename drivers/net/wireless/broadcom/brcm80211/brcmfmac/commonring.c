@@ -17,13 +17,17 @@ void brcmf_commonring_register_cb(struct brcmf_commonring *commonring,
 				  int (*cr_update_rptr)(void *ctx),
 				  int (*cr_update_wptr)(void *ctx),
 				  int (*cr_write_rptr)(void *ctx),
-				  int (*cr_write_wptr)(void *ctx), void *ctx)
+				  int (*cr_write_wptr)(void *ctx),
+				  int (*cr_prepare_write)(void *ctx),
+				  void (*cr_finish_write)(void *ctx), void *ctx)
 {
 	commonring->cr_ring_bell = cr_ring_bell;
 	commonring->cr_update_rptr = cr_update_rptr;
 	commonring->cr_update_wptr = cr_update_wptr;
 	commonring->cr_write_rptr = cr_write_rptr;
 	commonring->cr_write_wptr = cr_write_wptr;
+	commonring->cr_prepare_write = cr_prepare_write;
+	commonring->cr_finish_write = cr_finish_write;
 	commonring->cr_ctx = ctx;
 }
 
@@ -62,6 +66,20 @@ void brcmf_commonring_unlock(struct brcmf_commonring *commonring)
 		__releases(&commonring->lock)
 {
 	spin_unlock_irqrestore(&commonring->lock, commonring->flags);
+}
+
+int brcmf_commonring_prepare_write(struct brcmf_commonring *commonring)
+{
+	if (commonring->cr_prepare_write)
+		return commonring->cr_prepare_write(commonring->cr_ctx);
+
+	return 0;
+}
+
+void brcmf_commonring_finish_write(struct brcmf_commonring *commonring)
+{
+	if (commonring->cr_finish_write)
+		commonring->cr_finish_write(commonring->cr_ctx);
 }
 
 

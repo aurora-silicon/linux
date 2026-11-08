@@ -52,6 +52,18 @@ enum brcmf_pcie_state {
 	BRCMFMAC_PCIE_STATE_UP
 };
 
+enum brcmf_pcie_ds_state {
+	BRCMF_PCIE_DS_ACTIVE,
+	BRCMF_PCIE_DS_SLEEP_PENDING,
+	BRCMF_PCIE_DS_SLEEP,
+	BRCMF_PCIE_DS_WAKE_WAIT,
+	BRCMF_PCIE_DS_AWAKE,
+	BRCMF_PCIE_DS_HOST_SLEEP_WAIT,
+	BRCMF_PCIE_DS_HOST_SLEEP,
+	BRCMF_PCIE_DS_HOST_WAKE_WAIT,
+	BRCMF_PCIE_DS_ERROR,
+};
+
 BRCMF_FW_DEF(43602, "brcmfmac43602-pcie");
 BRCMF_FW_DEF(4350, "brcmfmac4350-pcie");
 BRCMF_FW_DEF(4350C, "brcmfmac4350c2-pcie");
@@ -326,12 +338,16 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 #define BRCMF_D2H_DEV_D3_ACK			0x00000001
 #define BRCMF_D2H_DEV_DS_ENTER_REQ		0x00000002
 #define BRCMF_D2H_DEV_DS_EXIT_NOTE		0x00000004
+#define BRCMF_D2H_DEV_HOST_SLEEP_EXIT_ACK	0x00000008
 #define BRCMF_D2H_DEV_FWHALT			0x10000000
 
 #define BRCMF_H2D_HOST_D3_INFORM		0x00000001
 #define BRCMF_H2D_HOST_DS_ACK			0x00000002
+#define BRCMF_H2D_HOST_DS_NAK			0x00000004
 #define BRCMF_H2D_HOST_D0_INFORM_IN_USE		0x00000008
 #define BRCMF_H2D_HOST_D0_INFORM		0x00000010
+#define BRCMF_H2D_DEVICE_WAKE_DEASSERT		0x00000020
+#define BRCMF_H2D_DEVICE_WAKE_ASSERT		0x00000040
 
 #define BRCMF_PCIE_MBDATA_TIMEOUT		msecs_to_jiffies(2000)
 
@@ -418,6 +434,13 @@ struct brcmf_pciedev_info {
 	struct brcmf_pcie_shared_info shared;
 	wait_queue_head_t mbdata_resp_wait;
 	bool mbdata_completed;
+	bool inband_ds;
+	bool skip_ds_ack;
+	enum brcmf_pcie_ds_state ds_state;
+	unsigned int host_active;
+	/* Serializes DS mailbox state with H2D ring publication and suspend. */
+	struct mutex ds_lock;
+	wait_queue_head_t ds_wait;
 	bool irq_allocated;
 	bool irq_ready;
 	bool have_msi;
@@ -931,18 +954,307 @@ brcmf_pcie_send_mb_data(struct brcmf_pciedev_info *devinfo, u32 htod_mb_data)
 	return 0;
 }
 
+static int
+brcmf_pcie_ds_send_locked(struct brcmf_pciedev_info *devinfo, u32 data)
+{
+	int ret;
+
+	lockdep_assert_held(&devinfo->ds_lock);
+
+	ret = brcmf_pcie_send_mb_data(devinfo, data);
+	if (ret) {
+		devinfo->ds_state = BRCMF_PCIE_DS_ERROR;
+		wake_up_all(&devinfo->ds_wait);
+	}
+
+	return ret;
+}
+
+static int brcmf_pcie_ds_begin(struct brcmf_pciedev_info *devinfo)
+{
+	bool failed = false;
+	bool wait = false;
+	long timeout;
+	int ret = 0;
+
+	if (!READ_ONCE(devinfo->inband_ds))
+		return 0;
+
+	mutex_lock(&devinfo->ds_lock);
+	if (devinfo->skip_ds_ack ||
+	    devinfo->ds_state == BRCMF_PCIE_DS_HOST_SLEEP_WAIT ||
+	    devinfo->ds_state == BRCMF_PCIE_DS_HOST_SLEEP ||
+	    devinfo->ds_state == BRCMF_PCIE_DS_HOST_WAKE_WAIT ||
+	    devinfo->ds_state == BRCMF_PCIE_DS_ERROR) {
+		ret = -EIO;
+		goto out_unlock;
+	}
+
+	devinfo->host_active++;
+	if (devinfo->ds_state == BRCMF_PCIE_DS_SLEEP) {
+		devinfo->ds_state = BRCMF_PCIE_DS_WAKE_WAIT;
+		ret = brcmf_pcie_ds_send_locked(
+			devinfo, BRCMF_H2D_DEVICE_WAKE_ASSERT);
+		if (ret) {
+			devinfo->host_active--;
+			failed = true;
+			goto out_unlock;
+		}
+		wait = true;
+	} else if (devinfo->ds_state == BRCMF_PCIE_DS_WAKE_WAIT) {
+		wait = true;
+	}
+out_unlock:
+	mutex_unlock(&devinfo->ds_lock);
+
+	if (failed) {
+		brcmf_fw_crashed(&devinfo->pdev->dev);
+		return ret;
+	}
+	if (!wait)
+		return ret;
+
+	timeout = wait_event_timeout(
+		devinfo->ds_wait,
+		READ_ONCE(devinfo->ds_state) != BRCMF_PCIE_DS_WAKE_WAIT,
+		BRCMF_PCIE_MBDATA_TIMEOUT);
+
+	mutex_lock(&devinfo->ds_lock);
+	if (!timeout || devinfo->ds_state != BRCMF_PCIE_DS_AWAKE) {
+		if (devinfo->ds_state == BRCMF_PCIE_DS_WAKE_WAIT)
+			devinfo->ds_state = BRCMF_PCIE_DS_ERROR;
+		devinfo->host_active--;
+		wake_up_all(&devinfo->ds_wait);
+		failed = true;
+		ret = timeout ? -EIO : -ETIMEDOUT;
+	}
+	mutex_unlock(&devinfo->ds_lock);
+
+	if (failed)
+		brcmf_fw_crashed(&devinfo->pdev->dev);
+
+	return ret;
+}
+
+static void brcmf_pcie_ds_end(struct brcmf_pciedev_info *devinfo)
+{
+	bool failed = false;
+
+	if (!READ_ONCE(devinfo->inband_ds))
+		return;
+
+	mutex_lock(&devinfo->ds_lock);
+	if (WARN_ON(!devinfo->host_active))
+		goto out_unlock;
+
+	devinfo->host_active--;
+	if (devinfo->host_active)
+		goto out_unlock;
+
+	if (devinfo->ds_state == BRCMF_PCIE_DS_SLEEP_PENDING &&
+	    !devinfo->skip_ds_ack) {
+		devinfo->ds_state = BRCMF_PCIE_DS_SLEEP;
+		failed = brcmf_pcie_ds_send_locked(
+			devinfo, BRCMF_H2D_HOST_DS_ACK);
+	} else if (devinfo->ds_state == BRCMF_PCIE_DS_AWAKE) {
+		failed = brcmf_pcie_ds_send_locked(
+			devinfo, BRCMF_H2D_DEVICE_WAKE_DEASSERT);
+		if (!failed)
+			devinfo->ds_state = BRCMF_PCIE_DS_ACTIVE;
+	}
+	wake_up_all(&devinfo->ds_wait);
+
+out_unlock:
+	mutex_unlock(&devinfo->ds_lock);
+	if (failed)
+		brcmf_fw_crashed(&devinfo->pdev->dev);
+}
+
+static int brcmf_pcie_ds_prepare_suspend(struct brcmf_pciedev_info *devinfo)
+{
+	bool failed = false;
+	bool wait = false;
+	long timeout;
+	int ret = 0;
+
+	if (!READ_ONCE(devinfo->inband_ds))
+		return 0;
+
+	mutex_lock(&devinfo->ds_lock);
+	devinfo->skip_ds_ack = true;
+	mutex_unlock(&devinfo->ds_lock);
+
+	timeout = wait_event_timeout(
+		devinfo->ds_wait, READ_ONCE(devinfo->host_active) == 0,
+		BRCMF_PCIE_MBDATA_TIMEOUT);
+	if (!timeout) {
+		ret = -EBUSY;
+		goto fail_clear_skip;
+	}
+
+	mutex_lock(&devinfo->ds_lock);
+	if (devinfo->ds_state == BRCMF_PCIE_DS_ERROR) {
+		ret = -EIO;
+		goto fail_unlock;
+	}
+	if (devinfo->ds_state == BRCMF_PCIE_DS_SLEEP) {
+		devinfo->ds_state = BRCMF_PCIE_DS_WAKE_WAIT;
+		ret = brcmf_pcie_ds_send_locked(
+			devinfo, BRCMF_H2D_DEVICE_WAKE_ASSERT);
+		if (ret) {
+			failed = true;
+			goto fail_unlock;
+		}
+		wait = true;
+	} else if (devinfo->ds_state == BRCMF_PCIE_DS_WAKE_WAIT) {
+		wait = true;
+	}
+	mutex_unlock(&devinfo->ds_lock);
+
+	if (wait) {
+		timeout = wait_event_timeout(
+			devinfo->ds_wait,
+			READ_ONCE(devinfo->ds_state) != BRCMF_PCIE_DS_WAKE_WAIT,
+			BRCMF_PCIE_MBDATA_TIMEOUT);
+		mutex_lock(&devinfo->ds_lock);
+		if (!timeout || devinfo->ds_state != BRCMF_PCIE_DS_AWAKE) {
+			if (devinfo->ds_state == BRCMF_PCIE_DS_WAKE_WAIT)
+				devinfo->ds_state = BRCMF_PCIE_DS_ERROR;
+			wake_up_all(&devinfo->ds_wait);
+			failed = true;
+			ret = timeout ? -EIO : -ETIMEDOUT;
+			goto fail_unlock;
+		}
+		mutex_unlock(&devinfo->ds_lock);
+	}
+
+	mutex_lock(&devinfo->ds_lock);
+	if (devinfo->ds_state == BRCMF_PCIE_DS_AWAKE) {
+		ret = brcmf_pcie_ds_send_locked(
+			devinfo, BRCMF_H2D_DEVICE_WAKE_DEASSERT);
+		if (ret) {
+			failed = true;
+			goto fail_unlock;
+		}
+	}
+	devinfo->ds_state = BRCMF_PCIE_DS_HOST_SLEEP_WAIT;
+	mutex_unlock(&devinfo->ds_lock);
+	return 0;
+
+fail_unlock:
+	devinfo->skip_ds_ack = false;
+	mutex_unlock(&devinfo->ds_lock);
+	if (failed)
+		brcmf_fw_crashed(&devinfo->pdev->dev);
+	return ret;
+
+fail_clear_skip:
+	mutex_lock(&devinfo->ds_lock);
+	devinfo->skip_ds_ack = false;
+	mutex_unlock(&devinfo->ds_lock);
+	return ret;
+}
+
+static void brcmf_pcie_ds_suspend_abort(struct brcmf_pciedev_info *devinfo)
+{
+	if (!READ_ONCE(devinfo->inband_ds))
+		return;
+
+	mutex_lock(&devinfo->ds_lock);
+	devinfo->skip_ds_ack = false;
+	devinfo->host_active = 0;
+	if (devinfo->ds_state != BRCMF_PCIE_DS_ERROR)
+		devinfo->ds_state = BRCMF_PCIE_DS_ACTIVE;
+	wake_up_all(&devinfo->ds_wait);
+	mutex_unlock(&devinfo->ds_lock);
+}
+
+static void brcmf_pcie_ds_resume_start(struct brcmf_pciedev_info *devinfo)
+{
+	if (!READ_ONCE(devinfo->inband_ds))
+		return;
+
+	mutex_lock(&devinfo->ds_lock);
+	devinfo->ds_state = BRCMF_PCIE_DS_HOST_WAKE_WAIT;
+	mutex_unlock(&devinfo->ds_lock);
+}
+
+static void brcmf_pcie_ds_resume_complete(struct brcmf_pciedev_info *devinfo)
+{
+	if (!READ_ONCE(devinfo->inband_ds))
+		return;
+
+	mutex_lock(&devinfo->ds_lock);
+	devinfo->skip_ds_ack = false;
+	devinfo->host_active = 0;
+	devinfo->ds_state = BRCMF_PCIE_DS_ACTIVE;
+	wake_up_all(&devinfo->ds_wait);
+	mutex_unlock(&devinfo->ds_lock);
+}
+
 static void brcmf_pcie_handle_mb_data(struct brcmf_pciedev_info *devinfo, u32 data)
 {
+	bool failed = false;
+
 	brcmf_dbg(PCIE, "D2H_MB_DATA: 0x%04x\n", data);
 	if (data & BRCMF_D2H_DEV_DS_ENTER_REQ)  {
 		brcmf_dbg(PCIE, "D2H_MB_DATA: DEEP SLEEP REQ\n");
-		brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_DS_ACK);
-		brcmf_dbg(PCIE, "D2H_MB_DATA: sent DEEP SLEEP ACK\n");
+		if (!devinfo->inband_ds) {
+			brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_DS_ACK);
+			brcmf_dbg(PCIE, "D2H_MB_DATA: sent DEEP SLEEP ACK\n");
+		} else {
+			mutex_lock(&devinfo->ds_lock);
+			if (!devinfo->skip_ds_ack &&
+			    devinfo->ds_state == BRCMF_PCIE_DS_ACTIVE) {
+				devinfo->ds_state = BRCMF_PCIE_DS_SLEEP_PENDING;
+				if (!devinfo->host_active) {
+					devinfo->ds_state = BRCMF_PCIE_DS_SLEEP;
+					failed = brcmf_pcie_ds_send_locked(
+						devinfo, BRCMF_H2D_HOST_DS_ACK);
+				}
+			}
+			mutex_unlock(&devinfo->ds_lock);
+		}
 	}
-	if (data & BRCMF_D2H_DEV_DS_EXIT_NOTE)
+	if (data & BRCMF_D2H_DEV_DS_EXIT_NOTE) {
 		brcmf_dbg(PCIE, "D2H_MB_DATA: DEEP SLEEP EXIT\n");
+		if (devinfo->inband_ds) {
+			mutex_lock(&devinfo->ds_lock);
+			if (devinfo->ds_state == BRCMF_PCIE_DS_WAKE_WAIT) {
+				devinfo->ds_state = BRCMF_PCIE_DS_AWAKE;
+				wake_up_all(&devinfo->ds_wait);
+			} else if (devinfo->ds_state == BRCMF_PCIE_DS_SLEEP) {
+				devinfo->ds_state = BRCMF_PCIE_DS_AWAKE;
+				if (!devinfo->host_active) {
+					failed = brcmf_pcie_ds_send_locked(
+						devinfo,
+						BRCMF_H2D_DEVICE_WAKE_DEASSERT);
+					if (!failed)
+						devinfo->ds_state = BRCMF_PCIE_DS_ACTIVE;
+				}
+			}
+			mutex_unlock(&devinfo->ds_lock);
+		}
+	}
+	if (data & BRCMF_D2H_DEV_HOST_SLEEP_EXIT_ACK) {
+		brcmf_dbg(PCIE, "D2H_MB_DATA: HOST SLEEP EXIT ACK\n");
+		if (devinfo->inband_ds) {
+			mutex_lock(&devinfo->ds_lock);
+			if (devinfo->ds_state == BRCMF_PCIE_DS_HOST_WAKE_WAIT) {
+				devinfo->ds_state = BRCMF_PCIE_DS_ACTIVE;
+				wake_up_all(&devinfo->ds_wait);
+			}
+			mutex_unlock(&devinfo->ds_lock);
+		}
+	}
 	if (data & BRCMF_D2H_DEV_D3_ACK) {
 		brcmf_dbg(PCIE, "D2H_MB_DATA: D3 ACK\n");
+		if (devinfo->inband_ds) {
+			mutex_lock(&devinfo->ds_lock);
+			if (devinfo->ds_state == BRCMF_PCIE_DS_HOST_SLEEP_WAIT)
+				devinfo->ds_state = BRCMF_PCIE_DS_HOST_SLEEP;
+			mutex_unlock(&devinfo->ds_lock);
+		}
 		devinfo->mbdata_completed = true;
 		wake_up(&devinfo->mbdata_resp_wait);
 	}
@@ -950,6 +1262,8 @@ static void brcmf_pcie_handle_mb_data(struct brcmf_pciedev_info *devinfo, u32 da
 		brcmf_dbg(PCIE, "D2H_MB_DATA: FW HALT\n");
 		brcmf_fw_crashed(&devinfo->pdev->dev);
 	}
+	if (failed)
+		brcmf_fw_crashed(&devinfo->pdev->dev);
 }
 
 
@@ -1222,6 +1536,20 @@ static void brcmf_pcie_release_irq(struct brcmf_pciedev_info *devinfo)
 	devinfo->irq_allocated = false;
 }
 
+static int brcmf_pcie_ring_prepare_write(void *ctx)
+{
+	struct brcmf_pcie_ringbuf *ring = ctx;
+
+	return brcmf_pcie_ds_begin(ring->devinfo);
+}
+
+static void brcmf_pcie_ring_finish_write(void *ctx)
+{
+	struct brcmf_pcie_ringbuf *ring = ctx;
+
+	brcmf_pcie_ds_end(ring->devinfo);
+}
+
 
 static int brcmf_pcie_ring_mb_write_rptr(void *ctx)
 {
@@ -1379,7 +1707,9 @@ brcmf_pcie_alloc_dma_and_ring(struct brcmf_pciedev_info *devinfo, u32 ring_id,
 				     brcmf_pcie_ring_mb_update_rptr,
 				     brcmf_pcie_ring_mb_update_wptr,
 				     brcmf_pcie_ring_mb_write_rptr,
-				     brcmf_pcie_ring_mb_write_wptr, ring);
+				     brcmf_pcie_ring_mb_write_wptr,
+				     brcmf_pcie_ring_prepare_write,
+				     brcmf_pcie_ring_finish_write, ring);
 
 	return (ring);
 }
@@ -1572,6 +1902,8 @@ static int brcmf_pcie_init_ringbuffers(struct brcmf_pciedev_info *devinfo)
 					     brcmf_pcie_ring_mb_update_wptr,
 					     brcmf_pcie_ring_mb_write_rptr,
 					     brcmf_pcie_ring_mb_write_wptr,
+					     brcmf_pcie_ring_prepare_write,
+					     brcmf_pcie_ring_finish_write,
 					     ring);
 		ring->w_idx_addr = h2d_w_idx_ptr;
 		ring->r_idx_addr = h2d_r_idx_ptr;
@@ -1907,8 +2239,16 @@ brcmf_pcie_init_share_ram_info(struct brcmf_pciedev_info *devinfo,
 	if (shared->flags & BRCMF_PCIE_SHARED_DAR)
 		host_cap |= BRCMF_HOSTCAP_H2D_DAR;
 
-	/* Disable DS: this is not currently properly supported */
+	devinfo->inband_ds = false;
+	devinfo->skip_ds_ack = false;
+	devinfo->ds_state = BRCMF_PCIE_DS_ACTIVE;
+	devinfo->host_active = 0;
 	host_cap |= BRCMF_HOSTCAP_DS_NO_OOB_DW;
+	if (shared->flags & BRCMF_PCIE_SHARED_INBAND_DS) {
+		host_cap |= BRCMF_HOSTCAP_DS_INBAND_DW;
+		devinfo->inband_ds = true;
+		devinfo->ds_state = BRCMF_PCIE_DS_ACTIVE;
+	}
 
 	brcmf_pcie_write_tcm32(devinfo, sharedram_addr +
 			       BRCMF_SHARED_HOST_CAP_OFFSET, host_cap);
@@ -2947,6 +3287,9 @@ brcmf_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		return ret;
 
 	devinfo->pdev = pdev;
+	mutex_init(&devinfo->ds_lock);
+	init_waitqueue_head(&devinfo->ds_wait);
+	devinfo->ds_state = BRCMF_PCIE_DS_ACTIVE;
 	pcie_bus_dev = NULL;
 	devinfo->ci = brcmf_chip_attach(devinfo, pdev->device,
 					&brcmf_pcie_buscore_ops);
@@ -3153,19 +3496,30 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	}
 	brcmf_msgbuf_suspend(bus->drvr);
 	brcmf_pcie_fwcon_timer(devinfo, false);
+	ret = brcmf_pcie_ds_prepare_suspend(devinfo);
+	if (ret) {
+		brcmf_err(bus, "Failed to prepare in-band deep sleep: %d\n", ret);
+		goto restore_active;
+	}
 	brcmf_bus_change_state(bus, BRCMF_BUS_DOWN);
 
 	devinfo->mbdata_completed = false;
-	brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_D3_INFORM);
+	ret = brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_D3_INFORM);
+	if (ret) {
+		brcmf_err(bus, "Failed to send D3 inform: %d\n", ret);
+		goto restore_active;
+	}
 
 	wait_event_timeout(devinfo->mbdata_resp_wait, devinfo->mbdata_completed,
 			   BRCMF_PCIE_MBDATA_TIMEOUT);
 	if (!devinfo->mbdata_completed) {
 		brcmf_err(bus, "Timeout on response for entering D3 substate\n");
-		brcmf_bus_change_state(bus, BRCMF_BUS_UP);
-		brcmf_msgbuf_resume(bus->drvr);
-		brcmf_pcie_fwcon_timer(devinfo, true);
-		return -EIO;
+		brcmf_pcie_ds_resume_start(devinfo);
+		if (brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_D0_INFORM))
+			brcmf_fw_crashed(dev);
+		brcmf_pcie_hostready(devinfo);
+		ret = -EIO;
+		goto restore_active;
 	}
 
 	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
@@ -3195,6 +3549,13 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	}
 
 	return 0;
+
+restore_active:
+	brcmf_pcie_ds_suspend_abort(devinfo);
+	brcmf_bus_change_state(bus, BRCMF_BUS_UP);
+	brcmf_msgbuf_resume(bus->drvr);
+	brcmf_pcie_fwcon_timer(devinfo, true);
+	return ret;
 
 rollback:
 	/*
@@ -3229,12 +3590,14 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 		brcmf_dbg(PCIE, "Try to wakeup device....\n");
 		/* Set the device up, so we can write the MB data message in ring mode */
 		devinfo->state = BRCMFMAC_PCIE_STATE_UP;
+		brcmf_pcie_ds_resume_start(devinfo);
 		if (brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_D0_INFORM))
 			goto cleanup;
 		brcmf_dbg(PCIE, "Hot resume, continue....\n");
 		brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
 		brcmf_pcie_intr_enable(devinfo);
 		brcmf_pcie_hostready(devinfo);
+		brcmf_pcie_ds_resume_complete(devinfo);
 		brcmf_bus_change_state(bus, BRCMF_BUS_UP);
 		brcmf_msgbuf_resume(bus->drvr);
 		brcmf_pcie_fwcon_timer(devinfo, true);
@@ -3242,6 +3605,7 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 	}
 
 cleanup:
+	brcmf_pcie_ds_suspend_abort(devinfo);
 	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
 	brcmf_chip_detach(devinfo->ci);
 	devinfo->ci = NULL;
