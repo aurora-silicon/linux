@@ -81,7 +81,9 @@ struct avd_h264_ctx {
 		struct avd_buf lf_above;
 		struct avd_buf ip_above;
 		struct avd_buf mv_above_info;
+		struct avd_buf coded_pool;
 	} bufs;
+	size_t coded_used;
 };
 
 /* ffmpeg submits wrong timestamp, use first_mb_in_slice as a workaround */
@@ -104,6 +106,8 @@ static inline u32 mv_color_size(u32 w, u32 h)
 {
 	return (DIV_ROUND_UP(w, 16) + 1) * (DIV_ROUND_UP(h, 16) + 1) * 64;
 }
+
+static size_t avd_h264_slice_budget(size_t decoded_size);
 
 /* sorry for the formatting */
 
@@ -542,6 +546,7 @@ static int avd_h264_alloc_bufs(struct avd_ctx *ctx)
 {
 	struct avd_dev *dev = ctx->dev;
 	struct avd_h264_ctx *h264_ctx = ctx->priv;
+	size_t coded_size;
 	int ret, w, bit_depth, mb;
 	w = fmt_width(ctx);
 	bit_depth = (ctx->image_fmt == AVD_IMG_FMT_420_10BIT ||
@@ -581,6 +586,11 @@ static int avd_h264_alloc_bufs(struct avd_ctx *ctx)
 		return ret;
 
 	ret = avd_buf_alloc(dev, &h264_ctx->bufs.mv_above_info, 32 * mb);
+	if (ret)
+		return ret;
+
+	coded_size = avd_h264_slice_budget(ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].sizeimage);
+	ret = avd_buf_alloc(dev, &h264_ctx->bufs.coded_pool, coded_size);
 	if (ret)
 		return ret;
 
@@ -625,10 +635,11 @@ static void avd_h264_drop_slices(struct avd_ctx *ctx)
 {
 	struct avd_h264_ctx *h264_ctx = ctx->priv;
 
-	for (size_t i = 0; i < h264_ctx->slice_num; i++)
-		avd_buf_free(ctx->dev, &h264_ctx->slices[i]);
+	memset(h264_ctx->slices, 0,
+	       sizeof(*h264_ctx->slices) * h264_ctx->slice_num);
 	h264_ctx->slice_num = 0;
 	h264_ctx->slice_bytes = 0;
+	h264_ctx->coded_used = 0;
 }
 
 static void avd_h264_stop(struct avd_ctx *ctx)
@@ -646,6 +657,7 @@ static void avd_h264_stop(struct avd_ctx *ctx)
 	avd_buf_free(dev, &h264_ctx->bufs.lf_above);
 	avd_buf_free(dev, &h264_ctx->bufs.ip_above);
 	avd_buf_free(dev, &h264_ctx->bufs.mv_above_info);
+	avd_buf_free(dev, &h264_ctx->bufs.coded_pool);
 
 	avd_h264_drop_slices(ctx);
 	kfree(h264_ctx->slices);
@@ -893,10 +905,14 @@ static int avd_h264_run(struct avd_ctx *ctx)
 	}
 
 	h264_ctx->active_slice = &h264_ctx->slices[h264_ctx->slice_num];
-	ret = avd_buf_alloc(ctx->dev, h264_ctx->active_slice, payload_len);
-	if (ret)
-		goto err_free_jobs;
+	h264_ctx->coded_used = ALIGN(h264_ctx->coded_used, AVD_ALIGN);
+	h264_ctx->active_slice->cpu = (u8 *)h264_ctx->bufs.coded_pool.cpu +
+				       h264_ctx->coded_used;
+	h264_ctx->active_slice->addr = h264_ctx->bufs.coded_pool.addr +
+					h264_ctx->coded_used;
+	h264_ctx->active_slice->size = payload_len;
 	memcpy(h264_ctx->active_slice->cpu, data, payload_len);
+	h264_ctx->coded_used += payload_len;
 	h264_ctx->slice_num++;
 	h264_ctx->slice_bytes += PAGE_ALIGN((size_t)payload_len);
 	h264_ctx->monochrome = run.sps->chroma_format_idc == 0;
