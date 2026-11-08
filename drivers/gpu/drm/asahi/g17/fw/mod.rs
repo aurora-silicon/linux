@@ -19,6 +19,7 @@ pub(crate) mod context;
 pub(crate) mod freelist;
 pub(crate) mod initdata;
 pub(crate) mod kick;
+pub(crate) mod power;
 pub(crate) mod queue;
 pub(crate) mod render;
 pub(crate) mod render_rt;
