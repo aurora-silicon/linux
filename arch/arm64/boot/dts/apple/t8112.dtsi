@@ -505,9 +505,9 @@
 		/* Required to get >32-bit DMA via DARTs */
 		dma-ranges = <0 0 0 0 0xffffffff 0xffffc000>;
 
-		ave_dart0: iommu@67030000 {
+		ave_dart0: iommu@267030000 {
 			compatible = "apple,t8112-dart", "apple,t8110-dart";
-			reg = <0 0x67030000 0 0x4000>;
+			reg = <0x2 0x67030000 0 0x4000>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 689 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_venc_sys>;
@@ -515,9 +515,9 @@
 			status = "disabled";
 		};
 
-		ave_dart1: iommu@67040000 {
+		ave_dart1: iommu@267040000 {
 			compatible = "apple,t8112-dart", "apple,t8110-dart";
-			reg = <0 0x67040000 0 0x4000>;
+			reg = <0x2 0x67040000 0 0x4000>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 689 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_venc_sys>;
@@ -525,11 +525,11 @@
 			status = "disabled";
 		};
 
-		ave: video-codec@67100000 {
+		ave: video-codec@267100000 {
 			compatible = "apple,t8112-ave";
-			reg = <0 0x67100000 0 0x45c000>,
-			      <0 0x67050000 0 0x8000>,
-			      <0 0x67800000 0 0x800000>;
+			reg = <0x2 0x67100000 0 0x45c000>,
+			      <0x2 0x67050000 0 0x8000>,
+			      <0x2 0x67800000 0 0x800000>;
 			reg-names = "codec", "mailbox", "coproc";
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 692 IRQ_TYPE_LEVEL_HIGH>,
@@ -961,6 +961,18 @@
 			status = "disabled"; /* only used in J493 */
 		};
 
+		spi4: spi@235110000 {
+			compatible = "apple,t8112-spi", "apple,t8103-spi";
+			reg = <0x2 0x35110000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 752 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>;
+			power-domains = <&ps_spi4>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
 		serial0: serial@235200000 {
 			compatible = "apple,s5l-uart";
 			reg = <0x2 0x35200000 0x0 0x1000>;
@@ -1035,7 +1047,6 @@
 			dmas = <&sio 0x64>;
 			dma-names = "tx";
 			power-domains = <&ps_dpa0>;
-			reset-domains = <&ps_dpa0>;
 			status = "disabled";
 
 			ports {
@@ -1056,7 +1067,6 @@
 			dmas = <&sio 0x66>;
 			dma-names = "tx";
 			power-domains = <&ps_dpa1>;
-			reset-domains = <&ps_dpa1>;
 			status = "disabled";
 
 			ports {
@@ -1432,10 +1442,23 @@
 			reg = <0x2 0x3d714000 0x0 0x100>;
 			#address-cells = <2>;
 			#size-cells = <0>;
+			#interrupt-cells = <2>;
+			interrupt-controller;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 384 IRQ_TYPE_LEVEL_HIGH>;
 
 			pmic1: pmic@e {
 				compatible = "apple,stowe-pmic", "apple,spmi-nvmem";
 				reg = <0xe SPMI_USID>;
+
+				pmu_rtc: rtc {
+					compatible = "apple,t8112-pmu-rtc";
+					interrupt-parent = <&nub_spmi>;
+					interrupts = <2 IRQ_TYPE_EDGE_RISING>;
+					nvmem-cells = <&rtc_offset>;
+					nvmem-cell-names = "rtc_offset";
+					wakeup-source;
+				};
 
 				nvmem-layout {
 					compatible = "fixed-layout";
@@ -1484,6 +1507,14 @@
 			};
 		};
 
+		nub_spmi1: spmi@23d794000 {
+			compatible = "apple,t8112-spmi", "apple,t8103-spmi";
+			reg = <0x2 0x3d794000 0x0 0x100>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
 		smc: smc@23e400000 {
 			compatible = "apple,t8112-smc", "apple,smc";
 			reg = <0x2 0x3e400000 0x0 0x4000>,
@@ -1509,7 +1540,7 @@
 				compatible = "apple,smc-hwmon";
 			};
 
-			rtc {
+			smc_rtc: rtc {
 				compatible = "apple,smc-rtc";
 				nvmem-cells = <&rtc_offset>;
 				nvmem-cell-names = "rtc_offset";
@@ -1599,6 +1630,22 @@
 			#iommu-cells = <1>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 338 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		aop_spmi0: spmi@24a894000 {
+			compatible = "apple,t8112-spmi", "apple,t8103-spmi";
+			reg = <0x2 0x4a894000 0x0 0x100>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		aop_spmi1: spmi@24a8d4000 {
+			compatible = "apple,t8112-spmi", "apple,t8103-spmi";
+			reg = <0x2 0x4a8d4000 0x0 0x100>;
+			#address-cells = <2>;
+			#size-cells = <0>;
 			status = "disabled";
 		};
 
@@ -1770,6 +1817,7 @@
 				<0x2 0x69100000 0x0 0x10000>;
 			reg-names = "code", "sram", "mbox", "ctrl";
 			iommus = <&avd_dart 0>;
+			dma-coherent;
 		};
 
 		avd_dart: iommu@269010000 {
@@ -2601,3 +2649,5 @@
 	apple,peak-bandwidth-bytes-per-second = /bits/ 64 <102400000000>;
 	apple,bandwidth-class-bytes-per-second = /bits/ 64 <100000000000>;
 };
+
+#include "t8112-peripherals.dtsi"

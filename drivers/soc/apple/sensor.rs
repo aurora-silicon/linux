@@ -951,4 +951,31 @@ mod status_tests {
         }
         assert_eq!(lifts, 3);
     }
+
+    // Touch ID's lift detector is not the J700's alone. It reads the state
+    // byte and the finger bit, nothing that names the part, so a status from
+    // any Mesa revision a profile names decodes to the same verdict: 0x3352
+    // (M1, M1 Pro/Max, M2, M2 Pro/Max, M3) as well as 0x3356 (J700, J616s,
+    // J616c, J713). The idle status carries the revision, and it reads back.
+    #[test]
+    fn lift_detection_is_the_same_for_every_sensor_revision() {
+        for id in KNOWN_IDENTIFIERS {
+            let [lo, hi] = id.to_le_bytes();
+            let ident = [lo, hi, 0x02, 0x02];
+            let idle = Status::parse(&rx(0x00, 0x00, 0x0c, ident));
+            assert_eq!(idle.identifier_to_register().map(|i| i.value()), Some(id));
+            for (bytes, off) in [
+                (rx(0x00, 0x00, 0x0c, ident), true),
+                (rx(0x00, 0x00, 0x5c, ident), true),
+                (rx(0x00, 0x00, 0x0e, ident), false),
+                (rx(0x11, 0x06, 0x0c, [0, 0, 0, 0]), true),
+                (rx(0x11, 0x02, 0x0e, [0x80, 0, 0, 0x80]), false),
+                (rx(0x13, 0x00, 0x0e, [0, 0, 0, 0]), false),
+                (rx(0x07, 0x00, 0x8e, [0, 0x72, 0, 0]), false),
+                (rx(STATE_NEEDS_PATCH, 0x00, 0x0c, [0, 0, 0, 0]), true),
+            ] {
+                assert_eq!(Status::parse(&bytes).finger_off(), off);
+            }
+        }
+    }
 }

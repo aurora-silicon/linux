@@ -25,6 +25,7 @@
 		atcphy1 = &atcphy1;
 		atcphy2 = &atcphy2;
 		bluetooth0 = &bluetooth0;
+		keyboard = &keyboard;
 		serial0 = &serial0;
 		wifi0 = &wifi0;
 
@@ -642,3 +643,12 @@
 #include "hwmon-common.dtsi"
 #include "hwmon-fan-dual.dtsi"
 #include "hwmon-laptop.dtsi"
+
+/* Panel control remains firmware-owned until the host transport is supported. */
+&spi4 {
+	tcon: panel-controller@0 {
+		compatible = "parade,dp855";
+		reg = <0>;
+		status = "disabled";
+	};
+};

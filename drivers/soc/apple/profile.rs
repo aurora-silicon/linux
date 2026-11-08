@@ -468,9 +468,9 @@ pub(crate) const T6041: PlatformProfile = PlatformProfile {
 /// calibration is an FSC2 image. So it takes J700's SPI mode 2 and nonce
 /// session; its device tree names its signed root key. J713 on OS firmware
 /// 26.6.2 provisions its keybag, enrols, matches and restores the enrolment
-/// after a reboot.
+/// after a reboot. The J715 ADT describes the same sensor, wiring and SEP.
 pub(crate) const T8132: PlatformProfile = PlatformProfile {
-    name: "T8132/J713",
+    name: "T8132/J713/J715",
     sensor: SensorProfile {
         controller_base: 0x3_ad10_8000,
         mode: SpiMode::Mode2,
@@ -663,8 +663,8 @@ fn select(
     if has(b"apple,t6041") && has(b"apple,j616c") {
         return Ok(&T6041);
     }
-    // Only J713: the other T8132 Macs are unread.
-    if has(b"apple,t8132") && has(b"apple,j713") {
+    // Only the M4 MacBook Airs: the other T8132 Macs are unread.
+    if has(b"apple,t8132") && (has(b"apple,j713") || has(b"apple,j715")) {
         return Ok(&T8132);
     }
     Err(ENODEV)
@@ -731,8 +731,10 @@ mod tests {
     }
 
     #[test]
-    fn t8132_selection_is_limited_to_j713() {
+    fn t8132_selection_is_limited_to_the_m4_airs() {
         assert_eq!(picked(&[b"apple,j713", b"apple,t8132"]), Some(T8132.name));
+        assert_eq!(picked(&[b"apple,j715", b"apple,t8132"]), Some(T8132.name));
+        assert_eq!(picked(&[b"apple,j604", b"apple,t8132"]), None);
         assert_eq!(picked(&[b"apple,t8132"]), None);
         assert_eq!(picked(&[b"apple,j613", b"apple,t8132"]), None);
         assert_eq!(picked(&[b"apple,j713", b"apple,t8122"]), None);
@@ -743,6 +745,41 @@ mod tests {
         assert_eq!(picked(&[b"apple,j614s", b"apple,t6040"]), Some(T6040.name));
         assert_eq!(picked(&[b"apple,j616c", b"apple,t6041"]), Some(T6041.name));
         assert_eq!(picked(&[b"apple,j713", b"apple,t6041"]), None);
+    }
+
+    /// Touch ID has one path for every Mac. The retry limits, the lock
+    /// states, the password re-arm and the lift-gated capture read nothing
+    /// from the profile; only the transport underneath (bus, nonce session,
+    /// key-store dialect) does. What the shared path needs is a sensor whose
+    /// status it decodes, so every Mac with a built-in sensor must select a
+    /// profile naming one of the known Mesa revisions.
+    #[test]
+    fn every_touch_id_mac_gets_a_sensor_the_shared_path_decodes() {
+        let macs: [&[&[u8]]; 14] = [
+            &[b"apple,j313", b"apple,t8103"],
+            &[b"apple,j316s", b"apple,t6000"],
+            &[b"apple,j316c", b"apple,t6001"],
+            &[b"apple,j414s", b"apple,t6020"],
+            &[b"apple,j414c", b"apple,t6021"],
+            &[b"apple,j413", b"apple,t8112"],
+            &[b"apple,j415", b"apple,t8112"],
+            &[b"apple,j613", b"apple,t8122"],
+            &[b"apple,j615", b"apple,t8122"],
+            &[b"apple,j614s", b"apple,t6040"],
+            &[b"apple,j616s", b"apple,t6040"],
+            &[b"apple,j616c", b"apple,t6041"],
+            &[b"apple,j713", b"apple,t8132"],
+            &[b"apple,j700", b"apple,t8140"],
+        ];
+        for compatibles in macs {
+            let has = |c: &[u8]| compatibles.iter().any(|x| *x == c);
+            let selected = select(&has, &|| &T6020);
+            assert!(selected.is_ok());
+            if let Ok(profile) = selected {
+                assert!(crate::sensor::KNOWN_IDENTIFIERS.contains(&profile.sensor.expected_id));
+            }
+        }
+        assert!(crate::sensor::KNOWN_IDENTIFIERS.contains(&T6020_SEPOS13.sensor.expected_id));
     }
 
     #[test]

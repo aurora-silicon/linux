@@ -793,8 +793,9 @@ def adt_identity(root):
 #include <stddef.h>
 #include <string.h>
 #include <errno.h>
-typedef uint8_t u8;typedef uint32_t u32;
+typedef uint8_t u8;typedef uint32_t u32;typedef int32_t s32;typedef int64_t s64;
 #define U16_MAX UINT16_MAX
+#define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
 #define SZ_16M (16U<<20)
 #define ALIGN(x,n) (((x)+(n)-1)&~((n)-1))
 #define ERR_PTR(x) ((void *)(intptr_t)(x))
@@ -802,7 +803,9 @@ typedef uint8_t u8;typedef uint32_t u32;
 #define IS_ERR(x) ((uintptr_t)(x)>(uintptr_t)-4096)
 static u32 get_unaligned_le32(const void *p) {u32 n;memcpy(&n,p,4);return n;}
 '''
-    code+=block((base/'dcp-display-metadata.h').read_text(),'struct dcp_display_metadata {')+';\n'
+    metadata=(base/'dcp-display-metadata.h').read_text()
+    code+=block(metadata,'struct dcp_display_metadata {')+';\n'
+    code+=block(metadata,'enum dcp_panel_gamut {')+';\n'
     code+=block(header,'struct dcp_panel_adt {')+';\n'+source
     code+='static const u8 fixture[]={'+','.join(map(str,data))+'};\n'
     return code+r'''

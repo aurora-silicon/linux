@@ -84,6 +84,7 @@ def main():
         ('m4', 'm4-producer-retirement', m4.prepare, ((),), ('-Wno-unused-function',)),
         ('m4', 'm4-dpms-retirement', m4.blank, ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
         ('m4', 'm4-dart-consumer', m4.dart, ((),), ('-Wno-unused-function',)),
+        ('m4', 'm4-panel-timing', m4.timing, ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
         ('boot', 'oslog-events', boot.oslog, ((),), ()),
         ('boot', 'syslog-policy', boot.syslog, ((),), ()),
         ('edid', 'dpavserv-start', edid.startup, ((),), ()),

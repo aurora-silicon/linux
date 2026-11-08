@@ -263,9 +263,6 @@ impl<F: StoreIo> Store<F> {
             pr_info!("created a new host-state store\n");
             return Ok(store);
         }
-        if size < STORE_SIZE as u64 {
-            return Err(store.refuse(Damage::Size));
-        }
 
         let mut sb = KVec::with_capacity(BLOCK_SIZE, GFP_KERNEL)?;
         sb.resize(BLOCK_SIZE, 0, GFP_KERNEL)?;
