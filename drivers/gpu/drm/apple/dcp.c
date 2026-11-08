@@ -531,6 +531,24 @@ void dcp_drm_crtc_error(struct apple_crtc *crtc,
 	spin_unlock_irqrestore(&drm->event_lock, flags);
 }
 
+/*
+ * The flip of the commit whose flip_done is @flip_done never completed: send
+ * its still pending event as failed. Only that commit's event is sent; a newer
+ * commit's stays for its own swap.
+ */
+void dcp_drm_crtc_flip_lost(struct apple_crtc *crtc,
+			    struct completion *flip_done, int error)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&crtc->base.dev->event_lock, flags);
+	if (crtc->event && crtc->event->base.completion == flip_done) {
+		dcp_failed_page_flip(crtc, crtc->event, error);
+		crtc->event = NULL;
+	}
+	spin_unlock_irqrestore(&crtc->base.dev->event_lock, flags);
+}
+
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now)
 {
 	unsigned long flags;
