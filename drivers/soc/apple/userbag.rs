@@ -834,7 +834,19 @@ impl crate::SepData {
     }
 
     fn userbag_body<'a>(&self, name: &CStr, out: &'a crate::SksOutcome) -> Result<&'a [u8]> {
-        self.sks_report_response(name, out).ok_or(EPROTO)
+        let body = self.sks_report_response(name, out);
+        if body.is_none() {
+            dev_info!(self.dev, "userbag: {}: no usable response (status {})\n", name, out.reply.status);
+        }
+        body.ok_or(EPROTO)
+    }
+
+    /// Logs a reply the decoders refused: which step, its length and its
+    /// first bytes. Replies to these queries carry no secret.
+    fn userbag_refused(&self, step: &str, body: &[u8]) -> Error {
+        let n = body.len().min(96);
+        dev_info!(self.dev, "userbag: {}: reply refused, {} bytes: {:02x?}\n", step, body.len(), &body[..n]);
+        EPROTO
     }
 
     fn userbag_transition(
@@ -966,7 +978,7 @@ impl crate::SepData {
             })
             .ok_or(EACCES)?;
         let lock_body = self.userbag_body(crate::sks::SKS_LOCK_STATE_NAME, &lock)?;
-        let _lock_state = decode_lock_query_reply(lock_body).ok_or(EPROTO)?;
+        let _lock_state = decode_lock_query_reply(lock_body).ok_or_else(|| self.userbag_refused("lock-state query", lock_body))?;
 
         let state = self
             .sks_step(crate::sks::SKS_GET_DEVICE_STATE_NAME, |_healthy| {
@@ -978,9 +990,10 @@ impl crate::SepData {
             })
             .ok_or(EACCES)?;
         let body = self.userbag_body(crate::sks::SKS_GET_DEVICE_STATE_NAME, &state)?;
-        let state = decode_get_state_reply(body).ok_or(EPROTO)?;
+        let state = decode_get_state_reply(body).ok_or_else(|| self.userbag_refused("device state", body))?;
         if state.handle != handle {
-            return Err(EPROTO);
+            dev_info!(self.dev, "userbag: device state names bag handle {}, asked about {}\n", state.handle, handle);
+            return Err(self.userbag_refused("device state (handle)", body));
         }
         Ok(state)
     }
@@ -997,7 +1010,7 @@ impl crate::SepData {
             })
             .ok_or(EACCES)?;
         let body = self.userbag_body(crate::sks::SKS_GET_CONFIGURATION_NAME, &out)?;
-        decode_get_configuration_reply(body).ok_or(EPROTO)
+        decode_get_configuration_reply(body).ok_or_else(|| self.userbag_refused("configuration", body))
     }
 
     pub(crate) fn userbag_ioctl(&self, cmd: u32, arg: usize) -> Result<crate::bio::Handled> {
@@ -1064,6 +1077,7 @@ impl crate::SepData {
                 let state = self.userbag_state(user)?;
                 let configuration = self.userbag_configuration(user)?;
                 if state.attempt_limit != configuration.attempt_limit {
+                    dev_info!(self.dev, "userbag: attempt limit {} in the state, {} in the configuration\n", state.attempt_limit, configuration.attempt_limit);
                     return Err(EPROTO);
                 }
                 reply.bag_state = match state.lock_phase {
