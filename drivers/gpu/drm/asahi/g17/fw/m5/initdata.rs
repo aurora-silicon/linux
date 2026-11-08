@@ -2126,6 +2126,9 @@ pub(crate) struct Board {
     aux_perf_states: Option<&'static [M5AuxPerfState; 14]>,
     /// The relative-frequency curve of [`Board::perf_states`].
     relative_frequency: [u32; 16],
+    /// Each state's relative performance in percent (IEEE single), as the board's own firmware
+    /// data has it; without one, the frequency ratio in whole percent.
+    relative_power: Option<&'static [u32; 14]>,
     /// Rows of the board's AON table the firmware reads.
     aon_records: &'static [[u32; 3]],
     /// Register windows the firmware maps, in device-VA order.
@@ -2177,6 +2180,7 @@ pub(crate) const J714: Board = Board {
     perf_tables: 2,
     aux_perf_states: Some(&J714_AUX_PERF_STATES),
     relative_frequency: relative_frequency(&J714_GPU_PERF_STATES, 1),
+    relative_power: None,
     aon_records: &J714_AON_RECORDS,
     register_windows: &J714_REGISTER_WINDOWS,
     register_slot_flags: None,
@@ -2206,6 +2210,7 @@ pub(crate) const J716C: Board = Board {
     perf_tables: 4,
     aux_perf_states: Some(&J716C_AUX_PERF_STATES),
     relative_frequency: relative_frequency(&J716C_GPU_PERF_STATES, 1),
+    relative_power: None,
     aon_records: &J716C_AON_RECORDS,
     register_windows: &J716C_REGISTER_WINDOWS,
     register_slot_flags: None,
@@ -2242,6 +2247,7 @@ pub(crate) const J775D: Board = Board {
     perf_tables: 8,
     aux_perf_states: Some(&J775D_AUX_PERF_STATES),
     relative_frequency: relative_frequency(&J775D_GPU_PERF_STATES, J775D_PERF_FLOOR),
+    relative_power: None,
     aon_records: &J775D_AON_RECORDS,
     register_windows: &J775D_REGISTER_WINDOWS,
     register_slot_flags: None,
@@ -2283,6 +2289,7 @@ pub(crate) const J813: Board = Board {
     perf_tables: 1,
     aux_perf_states: None,
     relative_frequency: relative_frequency(&J813_GPU_PERF_STATES, 1),
+    relative_power: Some(&J813_GPU_RELATIVE_POWER),
     aon_records: &J813_AON_RECORDS,
     register_windows: &J813_REGISTER_WINDOWS,
     register_slot_flags: Some(&J813_HW_REGISTER_SLOT_FLAGS),
@@ -2391,6 +2398,14 @@ const fn one_table(states: [(u32, u32, u32); 14]) -> [M5PerfState; 14] {
 // J813 ADT sgx perf-states and perf-states-sram (MHz, mV): twelve states after the off state.
 // The encoder's table has fourteen; the last repeats the top state, which the HW data's count
 // of twelve leaves out.
+/// The J813's per-state relative performance, read out of macOS 27.0's own hardware data under
+/// aura (bundle +0x19e4): 19.4 % at the lowest state up to 100 % at the top, state 13 unused.
+/// It is neither the frequency ratio nor f*V or f*V^2: characterization data.
+const J813_GPU_RELATIVE_POWER: [u32; 14] = [
+    0, 0x419b_36eb, 0x41d0_6202, 0x4205_907a, 0x4227_4b32, 0x4247_eae1, 0x426b_0873,
+    0x428a_5bac, 0x42a4_5b3f, 0x42ab_4981, 0x42b0_3cd5, 0x42bb_20f3, 0x42c8_0000, 0,
+];
+
 pub(crate) const J813_GPU_PERF_STATES: [M5PerfState; 14] = one_table([
     (0, 125, 770), (338, 660, 770), (486, 675, 770), (636, 690, 770),
     (796, 705, 770), (888, 735, 770), (988, 760, 770), (1084, 790, 790),
@@ -2786,11 +2801,18 @@ pub(crate) fn encode_m5_hw_data(
     put_u32(g18, 0x283a, 1);
     put_u32(g18, 0x283e, 1);
     let states = board.perf_states;
-    for (state, &(frequency, core, sram)) in states.iter().enumerate() {
+    // Off and the board's `perf_state_count` states: the rows above them stay zero, as in macOS
+    // 27.0's J813 bundle, whose twelve states leave state 13 empty where the padded table repeats
+    // its top state. (Every other board has 13 states, so all fourteen rows.)
+    let used = board.perf_state_count as usize + 1;
+    for (state, &(frequency, core, sram)) in states.iter().enumerate().take(used) {
         put_u32(g18, COMMON26_HW_PERF_FREQUENCY + state * 4, frequency);
         put_u32(g18, COMMON26_HW_PERF_SCALE + state * 4, COMMON26_PERF_SCALE_VALUE);
 
-        let relative = frequency * 100 / states[13].0;
+        let relative = match board.relative_power {
+            Some(table) => table[state],
+            None => frequency * 100 / states[13].0,
+        };
         put_u32(g18, COMMON26_HW_PERF_RELATIVE_A + state * 4, relative);
         for lane in 0..COMMON26_HW_PERF_LANES {
             let row = state * COMMON26_HW_PERF_ROW_STRIDE + lane * 4;
@@ -2801,9 +2823,10 @@ pub(crate) fn encode_m5_hw_data(
     }
     for index in 0..COMMON26_HW_PERF_ROWS {
         put_u32(g18, COMMON26_HW_PERF_INDEX_MAP + index * 4, index as u32);
-        put_u32(g18, COMMON26_HW_PERF_RELATIVE_B + index * 4, board.relative_frequency[index]);
+        let relative = if index < used { board.relative_frequency[index] } else { 0 };
+        put_u32(g18, COMMON26_HW_PERF_RELATIVE_B + index * 4, relative);
         if board.aux_perf_states.is_some() {
-            put_u32(g18, M5_HW_AUX_RELATIVE_FREQUENCY + index * 4, board.relative_frequency[index]);
+            put_u32(g18, M5_HW_AUX_RELATIVE_FREQUENCY + index * 4, relative);
         }
     }
     encode_m5_aux_perf_states(board, g18);
