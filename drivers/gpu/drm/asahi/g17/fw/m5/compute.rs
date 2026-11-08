@@ -437,6 +437,8 @@ pub(crate) struct DescriptorArgs {
     pub(crate) event_metadata: [u8; 16],
     pub(crate) usage_fw_va: u64,
     pub(crate) completion_identity: u64,
+    /// The common 26A428 firmware's tail ([`Descriptor::tail`]).
+    pub(crate) common26_tail: bool,
 }
 
 /// The M5 descriptor has a shorter reserved region before shared-control
@@ -473,22 +475,24 @@ pub(crate) struct Descriptor {
     status_va: [u64; 2],
     timestamp_va: [u64; 2],
     reserved_f9c: [u8; 0x10],
-    shared_control_va: u64,
-    shared_control_enabled: u8,
-    event_metadata: [u8; 16],
-    usage_fw_va: u64,
-    completion_identity: u64,
-    reserved_fd5: [u8; 0x2b],
+    /// From 0xfac: the shared-control pointer and its enable byte, the event metadata, the usage
+    /// object and the completion identity, packed in that order. The common 26A428 firmware (the
+    /// J813's) reads them [`COMMON26_TAIL_INSERT`] bytes later: it keeps a count at 0xfac of the
+    /// shared-control bytes it is yet to account for, which it rounds up to eight, adds to the
+    /// shared-control object's own total and clears (gfx 0x100c4..0x10110 use 0xfac, 0xfb2 and
+    /// 0xfcb there, never 0xfc5 or 0xfcd).
+    tail: [u8; DESCRIPTOR_PREFIX_BYTES - 0xfac],
 }
+
+/// The bytes the common 26A428 firmware inserts before a compute descriptor's tail.
+const COMMON26_TAIL_INSERT: usize = 6;
 
 static_assert!(size_of::<Descriptor>() == DESCRIPTOR_PREFIX_BYTES);
 static_assert!(core::mem::offset_of!(Descriptor, registers) == 0x40);
 static_assert!(core::mem::offset_of!(Descriptor, alternate) == 0x760);
 static_assert!(core::mem::offset_of!(Descriptor, stamp_va) == 0xf40);
 static_assert!(core::mem::offset_of!(Descriptor, completion_ordinal) == 0xf70);
-static_assert!(core::mem::offset_of!(Descriptor, shared_control_va) == 0xfac);
-static_assert!(core::mem::offset_of!(Descriptor, usage_fw_va) == 0xfc5);
-static_assert!(core::mem::offset_of!(Descriptor, completion_identity) == 0xfcd);
+static_assert!(core::mem::offset_of!(Descriptor, tail) == 0xfac);
 
 // SAFETY: Every field consists only of integer values and their arrays.
 unsafe impl Zeroable for Descriptor {}
@@ -539,11 +543,14 @@ impl Descriptor {
         self.completion_ordinal = args.completion_ordinal;
         self.status_va = args.status_va;
         self.timestamp_va = args.timestamp_va;
-        self.shared_control_va = args.shared_control_va;
-        self.shared_control_enabled = u8::from(args.shared_control_va != 0);
-        self.event_metadata = args.event_metadata;
-        self.usage_fw_va = args.usage_fw_va;
-        self.completion_identity = args.completion_identity;
+        let mut at = if args.common26_tail { COMMON26_TAIL_INSERT } else { 0 };
+        for field in [&args.shared_control_va.to_le_bytes()[..],
+            &[u8::from(args.shared_control_va != 0)], &args.event_metadata,
+            &args.usage_fw_va.to_le_bytes(), &args.completion_identity.to_le_bytes()]
+        {
+            self.tail[at..at + field.len()].copy_from_slice(field);
+            at += field.len();
+        }
         Ok(())
     }
 }

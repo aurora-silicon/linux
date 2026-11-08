@@ -2653,6 +2653,7 @@ impl Queue {
                 dispatch_control: crate::g17::fw::m5::compute::dispatch_control(board, tuple.dispatch_base),
                 auxiliary_control: tuple.auxiliary_control,
             },
+            common26_tail: board.graph.is_common26(),
             descriptor_va: descriptor_low,
             // M5 Pro's descriptors carry the ordinal as the submission sequence too, as macOS's do.
             submit_sequence: if board.completion_inputs() { u64::from(self.ordinal) } else { 0 },
