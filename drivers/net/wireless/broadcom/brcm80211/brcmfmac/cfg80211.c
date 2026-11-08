@@ -90,6 +90,10 @@
 
 #define BRCMF_PS_MAX_TIMEOUT_MS		2000
 
+#define BRCMF_LPAS_UNICAST_FILTER_ID	100
+#define BRCMF_LPAS_PKT_FILTER_MODE	1
+#define BRCMF_LPAS_PKT_FILTER_PATTERN	0
+
 /* Dump obss definitions */
 #define ACS_MSRMNT_DELAY		80
 #define CHAN_NOISE_DUMMY		(-80)
@@ -4310,6 +4314,321 @@ static s32 brcmf_wowl_nd_results(struct brcmf_if *ifp,
 
 #ifdef CONFIG_PM
 
+static int brcmf_lpas_eventmask_get(struct brcmf_if *ifp, u8 *mask,
+				    size_t mask_len)
+{
+	struct brcmf_eventmsgs_ext_le *eventmsgs;
+	size_t size;
+	int err;
+
+	if (!brcmf_feat_is_enabled(ifp, BRCMF_FEAT_EVENT_MSGS_EXT))
+		return brcmf_fil_iovar_data_get(ifp, "event_msgs", mask,
+						 mask_len);
+
+	size = sizeof(*eventmsgs) + mask_len;
+	eventmsgs = kzalloc(size, GFP_KERNEL);
+	if (!eventmsgs)
+		return -ENOMEM;
+
+	eventmsgs->version = EVENTMSGS_VER;
+	eventmsgs->command = EVENTMSGS_NONE;
+	eventmsgs->len = mask_len;
+	eventmsgs->maxgetsize = mask_len;
+	err = brcmf_fil_iovar_data_get(ifp, "event_msgs_ext", eventmsgs,
+					      size);
+	if (!err && eventmsgs->len < mask_len)
+		err = -EMSGSIZE;
+	if (!err)
+		memcpy(mask, eventmsgs->mask, mask_len);
+
+	kfree(eventmsgs);
+	return err;
+}
+
+static int brcmf_lpas_eventmask_set(struct brcmf_if *ifp, const u8 *mask,
+				    size_t mask_len)
+{
+	struct brcmf_eventmsgs_ext_le *eventmsgs;
+	size_t size;
+	int err;
+
+	if (!brcmf_feat_is_enabled(ifp, BRCMF_FEAT_EVENT_MSGS_EXT))
+		return brcmf_fil_iovar_data_set(ifp, "event_msgs", mask,
+						 mask_len);
+
+	size = sizeof(*eventmsgs) + mask_len;
+	eventmsgs = kzalloc(size, GFP_KERNEL);
+	if (!eventmsgs)
+		return -ENOMEM;
+
+	eventmsgs->version = EVENTMSGS_VER;
+	eventmsgs->command = EVENTMSGS_SET_MASK;
+	eventmsgs->len = mask_len;
+	memcpy(eventmsgs->mask, mask, mask_len);
+	err = brcmf_fil_iovar_data_set(ifp, "event_msgs_ext", eventmsgs,
+					      size);
+
+	kfree(eventmsgs);
+	return err;
+}
+
+static int brcmf_lpas_eventmask_enable(u8 *mask, size_t mask_len,
+				       enum brcmf_fweh_event_code event)
+{
+	if (event / 8 >= mask_len)
+		return -EOVERFLOW;
+
+	setbit(mask, event);
+	return 0;
+}
+
+static int brcmf_lpas_filter_add(struct brcmf_if *ifp)
+{
+	static const u8 mask_and_pattern[] = { 0x01, 0x00 };
+	struct brcmf_pkt_filter_le *filter;
+	size_t size;
+	int err;
+
+	/* Public DHD's minimal suspend policy passes unicast packets. ARP and
+	 * neighbour discovery remain handled by their dedicated offload engines.
+	 */
+	size = offsetof(struct brcmf_pkt_filter_le,
+			u.pattern.mask_and_pattern) + 2;
+	filter = kzalloc(size, GFP_KERNEL);
+	if (!filter)
+		return -ENOMEM;
+
+	filter->id = cpu_to_le32(BRCMF_LPAS_UNICAST_FILTER_ID);
+	filter->type = cpu_to_le32(BRCMF_LPAS_PKT_FILTER_PATTERN);
+	filter->negate_match = cpu_to_le32(0);
+	filter->u.pattern.offset = cpu_to_le32(0);
+	filter->u.pattern.size_bytes = cpu_to_le32(1);
+	/* mask_and_pattern[1] is the protocol's variable-length wire tail. */
+	memcpy((u8 *)filter + offsetof(struct brcmf_pkt_filter_le,
+					     u.pattern.mask_and_pattern),
+	       mask_and_pattern, sizeof(mask_and_pattern));
+
+	err = brcmf_fil_iovar_data_set(ifp, "pkt_filter_add", filter, size);
+	kfree(filter);
+	return err;
+}
+
+static int brcmf_lpas_filter_enable(struct brcmf_if *ifp, bool enable)
+{
+	struct brcmf_pkt_filter_enable_le filter = {
+		.id = cpu_to_le32(BRCMF_LPAS_UNICAST_FILTER_ID),
+		.enable = cpu_to_le32(enable),
+	};
+
+	return brcmf_fil_iovar_data_set(ifp, "pkt_filter_enable", &filter,
+					 sizeof(filter));
+}
+
+static void brcmf_lpas_restore_offloads(struct brcmf_if *ifp,
+					struct brcmf_cfg80211_wowl *wowl)
+{
+	brcmf_fil_iovar_int_set(ifp, "ndoe", wowl->pre_ndoe);
+	brcmf_fil_iovar_int_set(ifp, "arpoe", wowl->pre_arpoe);
+	brcmf_fil_iovar_int_set(ifp, "arp_ol", wowl->pre_arp_ol);
+}
+
+static int brcmf_restore_lpas(struct brcmf_cfg80211_info *cfg,
+			      struct brcmf_if *ifp)
+{
+	struct brcmf_cfg80211_wowl *wowl = &cfg->wowl;
+	int err, ret = 0;
+
+#define BRCMF_LPAS_RESTORE(_expr) do { \
+	err = (_expr); \
+	if (err && !ret) \
+		ret = err; \
+} while (0)
+
+	BRCMF_LPAS_RESTORE(brcmf_fil_iovar_int_set(ifp, "lpas", 0));
+	BRCMF_LPAS_RESTORE(brcmf_lpas_eventmask_set(ifp,
+						    wowl->lpas_event_mask,
+						    wowl->lpas_event_mask_len));
+	BRCMF_LPAS_RESTORE(brcmf_fil_iovar_int_set(ifp, "nolinkup",
+						      wowl->pre_nolinkup));
+	BRCMF_LPAS_RESTORE(brcmf_fil_iovar_int_set(ifp, "pkt_filter_mode",
+						      wowl->pre_pkt_filter_mode));
+	BRCMF_LPAS_RESTORE(brcmf_lpas_filter_enable(ifp, false));
+	BRCMF_LPAS_RESTORE(brcmf_fil_iovar_int_set(ifp, "pkt_filter_delete",
+						      BRCMF_LPAS_UNICAST_FILTER_ID));
+	BRCMF_LPAS_RESTORE(brcmf_fil_iovar_int_set(ifp, "ndoe",
+						      wowl->pre_ndoe));
+	BRCMF_LPAS_RESTORE(brcmf_fil_iovar_int_set(ifp, "arpoe",
+						      wowl->pre_arpoe));
+	BRCMF_LPAS_RESTORE(brcmf_fil_iovar_int_set(ifp, "arp_ol",
+						      wowl->pre_arp_ol));
+	BRCMF_LPAS_RESTORE(brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM,
+						    wowl->pre_pmmode));
+
+#undef BRCMF_LPAS_RESTORE
+
+	brcmf_bus_wowl_config(cfg->pub->bus_if, false);
+	kfree(wowl->lpas_event_mask);
+	wowl->lpas_event_mask = NULL;
+	wowl->lpas_event_mask_len = 0;
+	wowl->lpas = false;
+	wowl->active = false;
+
+	if (ret)
+		bphy_err(cfg->pub, "LPAS restore failed (%d)\n", ret);
+	return ret;
+}
+
+static int brcmf_configure_lpas(struct brcmf_cfg80211_info *cfg,
+				struct brcmf_if *ifp)
+{
+	struct brcmf_cfg80211_wowl *wowl = &cfg->wowl;
+	u8 *saved_mask = NULL, *sleep_mask = NULL;
+	size_t mask_len = cfg->pub->fweh->event_mask_len;
+	bool offloads_changed = false;
+	bool filter_added = false;
+	bool filter_enabled = false;
+	bool filter_mode_changed = false;
+	bool nolinkup_changed = false;
+	bool events_changed = false;
+	bool pm_changed = false;
+	bool lpas_attempted = false;
+	int err;
+
+	if (!test_bit(BRCMF_VIF_STATUS_CONNECTED, &ifp->vif->sme_state)) {
+		err = -ENOTCONN;
+		goto fail;
+	}
+	if (brcmf_is_apmode_operating(cfg->wiphy)) {
+		err = -EOPNOTSUPP;
+		goto fail;
+	}
+
+	err = brcmf_fil_cmd_int_get(ifp, BRCMF_C_GET_PM, &wowl->pre_pmmode);
+	if (err)
+		goto fail;
+	err = brcmf_fil_iovar_int_get(ifp, "arp_ol", &wowl->pre_arp_ol);
+	if (err)
+		goto fail;
+	err = brcmf_fil_iovar_int_get(ifp, "arpoe", &wowl->pre_arpoe);
+	if (err)
+		goto fail;
+	err = brcmf_fil_iovar_int_get(ifp, "ndoe", &wowl->pre_ndoe);
+	if (err)
+		goto fail;
+	err = brcmf_fil_iovar_int_get(ifp, "nolinkup", &wowl->pre_nolinkup);
+	if (err)
+		goto fail;
+	err = brcmf_fil_iovar_int_get(ifp, "pkt_filter_mode",
+					&wowl->pre_pkt_filter_mode);
+	if (err)
+		goto fail;
+
+	saved_mask = kzalloc(mask_len, GFP_KERNEL);
+	sleep_mask = kzalloc(mask_len, GFP_KERNEL);
+	if (!saved_mask || !sleep_mask) {
+		err = -ENOMEM;
+		goto fail;
+	}
+	err = brcmf_lpas_eventmask_get(ifp, saved_mask, mask_len);
+	if (err)
+		goto fail;
+	memcpy(sleep_mask, saved_mask, mask_len);
+
+	err = brcmf_lpas_eventmask_enable(sleep_mask, mask_len, BRCMF_E_LINK);
+	if (err)
+		goto fail;
+	err = brcmf_lpas_eventmask_enable(sleep_mask, mask_len,
+					  BRCMF_E_DEAUTH);
+	if (err)
+		goto fail;
+	err = brcmf_lpas_eventmask_enable(sleep_mask, mask_len,
+					  BRCMF_E_DEAUTH_IND);
+	if (err)
+		goto fail;
+	err = brcmf_lpas_eventmask_enable(sleep_mask, mask_len,
+					  BRCMF_E_DISASSOC_IND);
+	if (err)
+		goto fail;
+	err = brcmf_lpas_eventmask_enable(sleep_mask, mask_len,
+					  BRCMF_E_PSK_SUP);
+	if (err)
+		goto fail;
+
+	err = brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM, PM_MAX);
+	if (err)
+		goto fail;
+	pm_changed = true;
+
+	offloads_changed = true;
+	err = brcmf_configure_arp_nd_offload(ifp, true);
+	if (err)
+		goto rollback;
+
+	err = brcmf_lpas_filter_add(ifp);
+	if (err)
+		goto rollback;
+	filter_added = true;
+	err = brcmf_lpas_filter_enable(ifp, true);
+	if (err)
+		goto rollback;
+	filter_enabled = true;
+	err = brcmf_fil_iovar_int_set(ifp, "pkt_filter_mode",
+					   BRCMF_LPAS_PKT_FILTER_MODE);
+	if (err)
+		goto rollback;
+	filter_mode_changed = true;
+
+	err = brcmf_fil_iovar_int_set(ifp, "nolinkup", 1);
+	if (err)
+		goto rollback;
+	nolinkup_changed = true;
+	err = brcmf_lpas_eventmask_set(ifp, sleep_mask, mask_len);
+	if (err)
+		goto rollback;
+	events_changed = true;
+
+	lpas_attempted = true;
+	err = brcmf_fil_iovar_int_set(ifp, "lpas", 1);
+	if (err)
+		goto rollback;
+
+	wowl->lpas_event_mask = saved_mask;
+	wowl->lpas_event_mask_len = mask_len;
+	wowl->lpas = true;
+	wowl->active = true;
+	brcmf_bus_wowl_config(cfg->pub->bus_if, true);
+	kfree(sleep_mask);
+	return 0;
+
+rollback:
+	if (lpas_attempted)
+		brcmf_fil_iovar_int_set(ifp, "lpas", 0);
+	if (events_changed)
+		brcmf_lpas_eventmask_set(ifp, saved_mask, mask_len);
+	if (nolinkup_changed)
+		brcmf_fil_iovar_int_set(ifp, "nolinkup", wowl->pre_nolinkup);
+	if (filter_mode_changed)
+		brcmf_fil_iovar_int_set(ifp, "pkt_filter_mode",
+					wowl->pre_pkt_filter_mode);
+	if (filter_enabled)
+		brcmf_lpas_filter_enable(ifp, false);
+	if (filter_added)
+		brcmf_fil_iovar_int_set(ifp, "pkt_filter_delete",
+					BRCMF_LPAS_UNICAST_FILTER_ID);
+	if (offloads_changed)
+		brcmf_lpas_restore_offloads(ifp, wowl);
+	if (pm_changed)
+		brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM, wowl->pre_pmmode);
+fail:
+	kfree(sleep_mask);
+	kfree(saved_mask);
+	wowl->lpas = false;
+	wowl->active = false;
+	bphy_err(cfg->pub, "LPAS setup failed (%d), using disconnect fallback\n",
+		 err);
+	return err;
+}
+
 static void brcmf_report_wowl_wakeind(struct wiphy *wiphy, struct brcmf_if *ifp)
 {
 	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
@@ -4381,6 +4700,18 @@ static void brcmf_report_wowl_wakeind(struct wiphy *wiphy, struct brcmf_if *ifp)
 
 #else
 
+static int brcmf_restore_lpas(struct brcmf_cfg80211_info *cfg,
+			      struct brcmf_if *ifp)
+{
+	return -EOPNOTSUPP;
+}
+
+static int brcmf_configure_lpas(struct brcmf_cfg80211_info *cfg,
+				struct brcmf_if *ifp)
+{
+	return -EOPNOTSUPP;
+}
+
 static void brcmf_report_wowl_wakeind(struct wiphy *wiphy, struct brcmf_if *ifp)
 {
 }
@@ -4398,6 +4729,11 @@ static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 	brcmf_dbg(TRACE, "Enter\n");
 
 	if (cfg->wowl.active) {
+		if (cfg->wowl.lpas) {
+			cfg80211_report_wowlan_wakeup(&ifp->vif->wdev, NULL,
+						GFP_KERNEL);
+			return brcmf_restore_lpas(cfg, ifp);
+		}
 		brcmf_report_wowl_wakeind(wiphy, ifp);
 		brcmf_fil_iovar_int_set(ifp, "wowl_clear", 0);
 		brcmf_config_wowl_pattern(ifp, "clr", NULL, 0, NULL, 0);
@@ -4601,13 +4937,24 @@ static s32 brcmf_cfg80211_suspend(struct wiphy *wiphy,
 		/* Configure MPC */
 		brcmf_set_mpc(ifp, 1);
 
-	} else {
+	} else if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL)) {
 		/* Configure WOWL parameters */
 		err = brcmf_configure_wowl(cfg, ifp, wowl);
 		if (err) {
 			cfg->scan_status = 0;
 			return 1;
 		}
+	} else if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_LPAS) &&
+		   cfg->pub->bus_if->wowl_transport &&
+		   cfg->pub->bus_if->wowl_wake && wowl->any) {
+		err = brcmf_configure_lpas(cfg, ifp);
+		if (err) {
+			cfg->scan_status = 0;
+			return 1;
+		}
+	} else {
+		cfg->scan_status = 0;
+		return 1;
 	}
 
 exit:
@@ -7303,6 +7650,8 @@ static void brcmf_deinit_priv_mem(struct brcmf_cfg80211_info *cfg)
 	cfg->wowl.nd = NULL;
 	kfree(cfg->wowl.nd_info);
 	cfg->wowl.nd_info = NULL;
+	kfree(cfg->wowl.lpas_event_mask);
+	cfg->wowl.lpas_event_mask = NULL;
 	kfree(cfg->escan_info.escan_buf);
 	cfg->escan_info.escan_buf = NULL;
 }
@@ -8308,6 +8657,10 @@ static const struct wiphy_wowlan_support brcmf_wowlan_support = {
 	.pattern_min_len = 1,
 	.max_pkt_offset = 1500,
 };
+
+static const struct wiphy_wowlan_support brcmf_lpas_wowlan_support = {
+	.flags = WIPHY_WOWLAN_ANY,
+};
 #endif
 
 static void brcmf_wiphy_wowl_params(struct wiphy *wiphy, struct brcmf_if *ifp)
@@ -8316,6 +8669,11 @@ static void brcmf_wiphy_wowl_params(struct wiphy *wiphy, struct brcmf_if *ifp)
 	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
 	struct brcmf_pub *drvr = cfg->pub;
 	struct wiphy_wowlan_support *wowl;
+
+	if (!brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL)) {
+		wiphy->wowlan = &brcmf_lpas_wowlan_support;
+		return;
+	}
 
 	wowl = kmemdup(&brcmf_wowlan_support, sizeof(brcmf_wowlan_support),
 		       GFP_KERNEL);
@@ -8435,7 +8793,10 @@ static int brcmf_setup_wiphy(struct wiphy *wiphy, struct brcmf_if *ifp)
 				   BRCMF_VNDR_CMDS_LAST - 1 :
 				   BRCMF_VNDR_CMDS_AWDL - 1;
 
-	if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL))
+	if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL) ||
+	    (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_LPAS) &&
+	     ifp->drvr->bus_if->wowl_transport &&
+	     ifp->drvr->bus_if->wowl_wake))
 		brcmf_wiphy_wowl_params(wiphy, ifp);
 	err = brcmf_fil_cmd_data_get(ifp, BRCMF_C_GET_BANDLIST, &bandlist,
 				     sizeof(bandlist));
@@ -9067,7 +9428,8 @@ static void brcmf_free_wiphy(struct wiphy *wiphy)
 		kfree(wiphy->bands[NL80211_BAND_6GHZ]);
 	}
 #if IS_ENABLED(CONFIG_PM)
-	if (wiphy->wowlan != &brcmf_wowlan_support)
+	if (wiphy->wowlan != &brcmf_wowlan_support &&
+	    wiphy->wowlan != &brcmf_lpas_wowlan_support)
 		kfree(wiphy->wowlan);
 #endif
 }

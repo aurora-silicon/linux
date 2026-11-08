@@ -60,7 +60,8 @@ static const struct brcmf_feat_fwcap brcmf_fwcap_map[] = {
 	{ BRCMF_FEAT_SAE, "sae" },
 	{ BRCMF_FEAT_FWAUTH, "idauth" },
 	{ BRCMF_FEAT_SAE_EXT, "sae_ext" },
-	{ BRCMF_FEAT_GCMP, "gcmp"}
+	{ BRCMF_FEAT_GCMP, "gcmp" },
+	{ BRCMF_FEAT_LPAS, "lpas" },
 };
 
 #ifdef DEBUG
