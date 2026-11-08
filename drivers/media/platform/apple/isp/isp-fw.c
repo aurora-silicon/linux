@@ -251,7 +251,7 @@ static irqreturn_t apple_isp_isr_thread(int irq, void *dev)
 static void isp_disable_irq(struct apple_isp *isp)
 {
 	isp_mbox_write32(isp, isp->hw->mbox_irq_enable, 0x0);
-	if (isp->hw->mbox_irq_route) {
+	if (isp->hw->mbox_irq_route || isp->hw->mbox_extra_enables) {
 		isp_mbox_write32(isp, ISP_MBOX_IRQ_ENABLE1_T8140, 0x0);
 		isp_mbox_write32(isp, ISP_MBOX_IRQ_ENABLE2_T8140, 0x0);
 	}
@@ -273,13 +273,14 @@ static int isp_enable_irq(struct apple_isp *isp)
 	isp_dbg(isp, "about to enable interrupts...\n");
 
 	isp_mbox_write32(isp, isp->hw->mbox_irq_enable, 0xf);
-	if (isp->hw->mbox_irq_route) {
+	if (isp->hw->mbox_irq_route || isp->hw->mbox_extra_enables) {
 		isp_mbox_write32(isp, ISP_MBOX_IRQ_ENABLE1_T8140,
 				 ISP_MBOX_IRQ_ENABLE1_T8140_VAL);
 		isp_mbox_write32(isp, ISP_MBOX_IRQ_ENABLE2_T8140,
 				 ISP_MBOX_IRQ_ENABLE2_T8140_VAL);
-		isp_mbox_write32(isp, ISP_MBOX_IRQ_ROUTE_T8140,
-				 ISP_MBOX_IRQ_ROUTE_T8140_VAL);
+		if (isp->hw->mbox_irq_route)
+			isp_mbox_write32(isp, ISP_MBOX_IRQ_ROUTE_T8140,
+					 ISP_MBOX_IRQ_ROUTE_T8140_VAL);
 	}
 
 	return 0;
@@ -934,12 +935,13 @@ static int isp_set_dsid_clr(struct apple_isp *isp)
 		unsigned int slots = max_t(unsigned int, hw->dsid_count,
 					   hw->dsid_slots);
 
-		if (WARN_ON(hw->dsid_count > ARRAY_SIZE(used) ||
+		if (WARN_ON((!hw->dsid_clr_bases && hw->dsid_count > ARRAY_SIZE(used)) ||
 			    slots > ARRAY_SIZE(bases)))
 			return -EINVAL;
 
 		for (unsigned int i = 0; i < slots; i++)
-			bases[i] = i < hw->dsid_count ? used[i] : U64_MAX;
+			bases[i] = i < hw->dsid_count ?
+				(hw->dsid_clr_bases ? hw->dsid_clr_bases[i] : used[i]) : U64_MAX;
 
 		return isp_cmd_set_dsid_clr_multi_bc(isp, bases, slots,
 						     hw->dsid_clr_range0);
