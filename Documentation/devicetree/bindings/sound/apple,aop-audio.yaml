@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/apple,aop-audio.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple AOP audio service
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  The service is supplied by the parent Always-On Processor. Firmware and
+  calibration handoff determine its availability. It has no independent
+  application-processor register window or interrupt.
+
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6020-aop-audio
+          - apple,t8112-aop-audio
+  required:
+    - compatible
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t6020-aop-audio
+          - apple,t8112-aop-audio
+      - const: apple,aop-audio
+
+  dmas:
+    maxItems: 1
+
+  dma-names:
+    const: dma
+
+  apple,chassis-name:
+    $ref: /schemas/types.yaml#/definitions/string
+    description: Board family used to identify the audio configuration.
+
+  apple,machine-kind:
+    $ref: /schemas/types.yaml#/definitions/string
+    description: Machine family used for the sound card identity.
+
+required:
+  - compatible
+  - dmas
+  - dma-names
+
+additionalProperties: false

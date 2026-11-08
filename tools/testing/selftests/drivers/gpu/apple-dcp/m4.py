@@ -5,8 +5,10 @@ The immutable request fixture is generated from the previous working C driver,
 not the implementation under test. Transport, MMIO and DRM core are not emulated.
 """
 import base64
+import copy
 import hashlib
 import json
+import struct
 import subprocess
 import zlib
 from pathlib import Path
@@ -58,7 +60,8 @@ def header_body(source):
 
 
 def production(root):
-    return PREFIX + ''.join(header_body((root / APPLE / p).read_text()) for p in HEADERS)
+    return (PREFIX + ''.join(header_body((root / APPLE / p).read_text()) for p in HEADERS) +
+            'const struct dcp_m4_profile *dcp_m4_pf = &dcp_m4_profile_j713;\n')
 
 
 def request_golden(root, output):
@@ -644,3 +647,212 @@ int main(void)
     return 0;
 }
 '''
+
+
+# macOS's preferred internal-panel timings (ID 2), horizontal then vertical, in
+# the profile's field order. The J604's also come from its fixture report.
+TIMING_FIELDS = ('Active', 'Total', 'FrontPorch', 'SyncWidth', 'BackPorch',
+                 'PreciseSyncRate', 'SyncPolarity', 'PixelRepetition')
+PANEL_TIMINGS = {
+    'j713': ((2560, 2640, 8, 32, 40, 6877358, 1, 0), (1664, 1749, 33, 8, 44, 3932166, 1, 0)),
+    'j715': ((2880, 2960, 8, 32, 40, 7710975, 1, 0), (1864, 1961, 47, 8, 42, 3932165, 1, 0)),
+    'j604': ((3024, 3104, 8, 32, 40, 16986999, 1, 0), (1964, 2160, 102, 8, 86, 7864351, 1, 0)),
+}
+# hdisplay, hsync_start, hsync_end, htotal, vdisplay, vsync_start, vsync_end,
+# vtotal, clock_khz, refresh_16_16
+PANEL_MODES = {
+    'j713': (2560, 2568, 2600, 2640, 1664, 1697, 1705, 1749, 277042, 3932166),
+    'j715': (2880, 2888, 2920, 2960, 1864, 1911, 1919, 1961, 348274, 3932165),
+    'j604': (3024, 3032, 3064, 3104, 1964, 2066, 2074, 2160, 804560, 7864351),
+}
+
+TIMING_SHIMS = r'''
+#include <stdlib.h>
+#define GFP_KERNEL 0
+static void *kzalloc(size_t size, int flags) { (void)flags; return calloc(1, size); }
+static void kfree(void *p) { free(p); }
+static inline u64 get_unaligned_le64(const void *p) {
+    const u8 *b = p; u64 v = 0;
+    for (unsigned i = 0; i < 8; i++) v |= (u64)b[i] << (8 * i);
+    return v;
+}
+'''
+
+TIMING_MAIN = r'''
+struct timing_case {
+    const char *name;
+    const struct dcp_m4_profile *profile;
+    const u8 *data;
+    size_t size;
+    int expect;
+    u32 mode[10];
+};
+static const struct timing_case cases[] = {
+%s
+};
+int main(void)
+{
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const struct timing_case *c = &cases[i];
+        struct dcp_m4_timing t;
+        int ret;
+        memset(&t, 0xa5, sizeof(t));
+        dcp_m4_pf = c->profile;
+        ret = dcp_m4_parse_timing(c->data, c->size, &t);
+        if (ret != c->expect) {
+            printf("FAIL %%s: %%d, expected %%d\n", c->name, ret, c->expect);
+            return 1;
+        }
+        if (!ret) {
+            const u32 got[10] = {t.hdisplay, t.hsync_start, t.hsync_end, t.htotal,
+                t.vdisplay, t.vsync_start, t.vsync_end, t.vtotal, t.clock_khz, t.refresh_16_16};
+            if (t.id != 2 || t.color_id != 1 || memcmp(got, c->mode, sizeof(got))) {
+                printf("FAIL %%s: wrong mode\n", c->name);
+                return 1;
+            }
+        }
+        printf("PASS %%s: %%s\n", c->name, ret ? "refused" : "adopted");
+    }
+    return 0;
+}
+'''
+
+
+def serialize(elements):
+    """The DCP's binary dictionary encoding of a TimingElements array."""
+    out = bytearray(struct.pack('<I', 0xd3))
+
+    def put(kind, count, payload=b''):
+        out.extend(bytes(-len(out) % 4))
+        out.extend(struct.pack('<I', kind << 24 | count) + payload)
+
+    def emit(value):
+        if isinstance(value, bool):
+            put(11, int(value))
+        elif isinstance(value, int):
+            put(4, 64, struct.pack('<Q', value))
+        elif isinstance(value, str):
+            put(9, len(value), value.encode())
+        elif isinstance(value, bytes):
+            put(10, len(value), value)
+        elif isinstance(value, list):
+            put(2, len(value))
+            for item in value:
+                emit(item)
+        else:
+            put(1, len(value))
+            for key, item in value.items():
+                emit(key)
+                emit(item)
+
+    emit(elements)
+    return bytes(out)
+
+
+def timing_report():
+    def load(value):
+        if isinstance(value, dict) and list(value) == ['data']:
+            return bytes.fromhex(value['data'])
+        if isinstance(value, dict):
+            return {k: load(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [load(v) for v in value]
+        return value
+    fixture = json.loads((HERE / 'm4-fixtures/timing-elements.json').read_text())
+    return load(fixture['j604'])
+
+
+def edit(elements, index, change):
+    elements = copy.deepcopy(elements)
+    change(elements[index])
+    return elements
+
+
+def setter(*path, value):
+    def change(element):
+        for key in path[:-1]:
+            element = element[key]
+        element[path[-1]] = value
+    return change
+
+
+def timing_cases():
+    """(name, profile, report, adopted mode or None) for the panel timing parser."""
+    j604 = timing_report()
+    assert [e['ID'] for e in j604] == [2, 3, 4, 5, 6, 7]
+    assert [e['IsPreferred'] for e in j604] == [True] + [False] * 5
+    axes = ('HorizontalAttributes', 'VerticalAttributes')
+    for axis, name in enumerate(axes):
+        assert tuple(j604[0][name][f] for f in TIMING_FIELDS) == PANEL_TIMINGS['j604'][axis]
+
+    def panel(board):
+        element = copy.deepcopy(j604[0])
+        for axis, name in enumerate(axes):
+            element[name].update(zip(TIMING_FIELDS, PANEL_TIMINGS[board][axis]))
+        return [element]
+
+    cases = []
+
+    def case(name, profile, report, mode=None):
+        cases.append((name, profile, report, mode))
+
+    def perturbed(name, profile, report):
+        for axis in axes:
+            for field in TIMING_FIELDS:
+                case('%s %s %s changed' % (name, axis, field), profile,
+                     edit(report, 0, setter(axis, field, value=report[0][axis][field] + 1)))
+
+    j713, j715 = panel('j713'), panel('j715')
+    case('J713 single element', 'j713', j713, 'j713')
+    case('J715 single element', 'j715', j715, 'j715')
+    case('J713 report on the J715', 'j715', j713)
+    case('J715 report on the J713', 'j713', j715)
+    case('J713 with a second, 60 Hz element', 'j713', j713 + [j604[1]])
+    case('J713 without ID 2', 'j713', edit(j713, 0, setter('ID', value=3)))
+    case('J713 element not preferred', 'j713', edit(j713, 0, setter('IsPreferred', value=False)))
+    case('J713 empty report', 'j713', [])
+    perturbed('J713', 'j713', j713)
+    perturbed('J715', 'j715', j715)
+
+    case('J604 six elements', 'j604', j604, 'j604')
+    case('J604 six elements, ID 2 last', 'j604', j604[1:] + j604[:1], 'j604')
+    case('J604 preferred element only', 'j604', j604[:1], 'j604')
+    case('J604 changed non-preferred timing', 'j604',
+         edit(j604, 1, setter('VerticalAttributes', 'PreciseSyncRate', value=3932161)), 'j604')
+    perturbed('J604', 'j604', j604)
+    for field, value in (('IsVirtual', True), ('IsInterlaced', True), ('IsSplit', True),
+                         ('IsOverscanned', True), ('TimingType', 4),
+                         ('MinimumVariableRefreshRate', 48 << 16),
+                         ('MaximumVariableRefreshRate', 120 << 16)):
+        case('J604 %s changed' % field, 'j604', edit(j604, 0, setter(field, value=value)))
+    case('J604 color depth changed', 'j604',
+         edit(j604, 0, setter('ColorModes', 0, 'Depth', value=10)))
+    case('J604 second color mode', 'j604',
+         edit(j604, 0, lambda e: e['ColorModes'].append(dict(e['ColorModes'][0], ID=2))))
+    case('J604 without ID 2 (renumbered)', 'j604', edit(j604, 0, setter('ID', value=8)))
+    case('J604 without ID 2 (removed)', 'j604', j604[1:])
+    case('J604 with two ID 2 elements', 'j604', edit(j604, 1, setter('ID', value=2)))
+    case('J604 with a second preferred element', 'j604',
+         edit(j604, 1, setter('IsPreferred', value=True)))
+    case('J604 element without IsPreferred', 'j604', edit(j604, 1, lambda e: e.pop('IsPreferred')))
+    case('J604 element without an ID', 'j604', edit(j604, 1, lambda e: e.pop('ID')))
+    case('J604 element that is not a dictionary', 'j604', j604[:1] + [7] + j604[2:])
+    case('J604 seven elements', 'j604', j604 + [dict(j604[5], ID=9)])
+    case('J604 report on the J713', 'j713', j604)
+    case('J604 preferred element on the J713', 'j713', j604[:1])
+    case('J713 report on the J604', 'j604', j713)
+    case('J604 report on the J715', 'j715', j604)
+    return cases
+
+
+def timing(root):
+    arrays, rows = [], []
+    for index, (name, profile, report, mode) in enumerate(timing_cases()):
+        data = serialize(report)
+        arrays.append('static const u8 report_%d[] = {%s};' % (index, ','.join(map(str, data))))
+        expected = ','.join(map(str, PANEL_MODES[mode])) if mode else '0'
+        rows.append('    {"%s", &dcp_m4_profile_%s, report_%d, sizeof(report_%d), %s, {%s}},' % (
+            name, profile, index, index, '0' if mode else '-EINVAL', expected))
+    return (production(root) + TIMING_SHIMS +
+            header_body((root / APPLE / 'dcp-m4-timing.h').read_text()) +
+            '\n'.join(arrays) + TIMING_MAIN % '\n'.join(rows))

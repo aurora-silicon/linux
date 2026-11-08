@@ -70,14 +70,17 @@ struct apple_drm_private {
 static DEFINE_MUTEX(apple_g15_display_lock);
 static struct device *apple_t6030_display;
 static struct device *apple_t6031_display;
+static struct device *apple_t8132_display;
 
-/* The publication slot of a G15 SoC's internal display subsystem, or NULL. */
+/* The publication slot of a G15/G16 SoC's internal display subsystem, or NULL. */
 static struct device **apple_g15_display_slot(struct device *dev)
 {
 	if (of_device_is_compatible(dev->of_node, "apple,t6030-display-subsystem"))
 		return &apple_t6030_display;
 	if (of_device_is_compatible(dev->of_node, "apple,t6031-display-subsystem"))
 		return &apple_t6031_display;
+	if (of_device_is_compatible(dev->of_node, "apple,t8132-display-subsystem"))
+		return &apple_t8132_display;
 	return NULL;
 }
 
@@ -110,7 +113,7 @@ static void apple_g15_display_withdraw(struct device *dev)
 	put_device(old);
 }
 
-/* Initial G15 firmware startup must follow successful native display setup.
+/* Initial G15/G16 firmware startup must follow successful native display setup.
  * The component's device lock does not serialize component bind/unbind, so
  * publish separately. This lock protects only publication and a device link;
  * no display calls or firmware RPC run while it is held.
@@ -143,6 +146,13 @@ int apple_drm_t6031_link_device(struct device *consumer)
 				     &apple_t6031_display);
 }
 EXPORT_SYMBOL_GPL(apple_drm_t6031_link_device);
+
+int apple_drm_t8132_link_device(struct device *consumer)
+{
+	return apple_g15_link_device(consumer, "apple,t8132", "apple,agx-t8132",
+				     &apple_t8132_display);
+}
+EXPORT_SYMBOL_GPL(apple_drm_t8132_link_device);
 
 DEFINE_DRM_GEM_DMA_FOPS(apple_fops);
 

@@ -10,7 +10,7 @@
 /* This chip is just a cut down version of t6001, so include it and disable the missing parts */
 
 #define GPU_REPEAT(x) <x x>
-
+#define APPLE_T6000_SUBSET
 #include "t6001.dtsi"
 
 / {
@@ -90,3 +90,6 @@
 	power-domains = <&ps_ane_sys_cpu>, <&ps_ane_set1>,
 		<&ps_ane_set2>, <&ps_ane_set3>, <&ps_ane_set4>, <&ps_pms_sram>;
 };
+
+#include "t6000-peripherals.dtsi"
+#include "t6000-aux-spmi.dtsi"

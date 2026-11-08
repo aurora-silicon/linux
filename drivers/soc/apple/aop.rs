@@ -170,6 +170,8 @@ const SETUP_BUFFER_ENTRY_SIZE: usize = 16;
 /// them have theirs.
 const SETUP_ENDPOINTS: [u8; 5] = [0x20, 0x21, 0x23, 0x30, 0x32];
 const SETUP_BOOT_TIMEOUT_MS: u32 = 15000;
+/// How long the AP power request waits for the last endpoint map fragment.
+const SETUP_MAP_TIMEOUT_MS: u32 = 1000;
 // A request to a service endpoint: the payload goes into the endpoint's
 // message page, (3 << 60) | length announces it, the firmware answers with a
 // result word after writing a status byte at the start of the reply window,
@@ -2469,7 +2471,15 @@ impl AopData {
     /// buffers.
     fn setup_finish_boot(&self) -> Result<()> {
         let mut st = self.setup.lock();
-        if !st.map_done {
+        // The firmware sends the endpoint map right after HELLO, normally
+        // before RTKit reaches AP power on, but on some boots its last
+        // fragment arrives a few milliseconds later. Request AP power only
+        // once the map is complete, and warn only if it never completes.
+        if !st.map_done
+            && self
+                .setup_wait(&mut st, SETUP_MAP_TIMEOUT_MS, |s| s.map_done)
+                .is_err()
+        {
             dev_warn!(
                 self.dev,
                 "setup port: endpoint map incomplete before the AP power request"

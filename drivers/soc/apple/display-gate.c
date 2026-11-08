@@ -107,6 +107,7 @@
 #include <linux/printk.h>
 #include <linux/slab.h>
 #include <linux/sizes.h>
+#include <linux/soc/apple/t8132.h>
 #include <linux/string.h>
 #include <linux/stringify.h>
 #include <linux/types.h>
@@ -3068,9 +3069,9 @@ static void __init gate_t6041_max_run(void)
 }
 
 /*
- * J713: the dcpext Type-C routes are disabled in the device tree, as on
- * J613, because a USB-C port controller waits for the mode switch of every
- * available route. Enable them only for a dcpext the boot loader handed
+ * M4: the dcpext Type-C routes are disabled in the device tree,
+ * as on J613, because a USB-C port controller waits for the mode switch of
+ * every available route. Enable them only for a dcpext the boot loader handed
  * over (apple,t8132-dcpext-firmware-ready = 1). A handed-over dcpext that is
  * not adopted then disables them again, see dcp_platform_probe_t8132_ext().
  * Only the device tree changes here; no register is touched.
@@ -3114,7 +3115,7 @@ static int __init apple_display_gate(void)
 {
 	int i;
 
-	if (of_machine_is_compatible("apple,j713")) {
+	if (apple_t8132_firmware_path()) {
 		gate_j713_dcpext_routes();
 		return 0;
 	}
