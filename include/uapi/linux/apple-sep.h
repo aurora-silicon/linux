@@ -217,7 +217,7 @@ struct sep_bio_rearm {
  * and holds its handle can sign with it. A key made with
  * SEP_KEY_CREATE_BIOMETRY_CURRENT_SET (version 2) carries an access-control
  * list the enclave enforces: every signature needs a Touch ID match of a
- * finger enrolled when the key was made. SEP_KEY_SIGN then waits (up to 30 s)
+ * finger enrolled when the key was made. SEP_KEY_SIGN then waits (about a minute)
  * for a touch; the kernel opens a credential context, runs the match in it,
  * signs and deletes the context inside that one call. Enrolling or removing a
  * finger makes the key unusable. The node is created 0600; distributions may

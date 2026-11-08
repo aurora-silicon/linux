@@ -41,8 +41,9 @@ pub(crate) const SIG_MAX: usize = 72;
 pub(crate) const CREATE_BIOMETRY_CURRENT_SET: u32 = 1;
 const CREATE_FLAGS: u32 = CREATE_BIOMETRY_CURRENT_SET;
 
-/// How long a touch-gated `SIGN` waits for a finger in all.
-const TOUCH_WAIT_MS: u64 = 30_000;
+/// A touch-gated `SIGN` asks for a finger again after a capture that saw
+/// none until this long has passed; one capture itself waits up to a minute.
+const TOUCH_WAIT_MS: u64 = 60_000;
 
 const MAGIC: u32 = 0xB1;
 
@@ -531,7 +532,7 @@ impl SepData {
 
     /// A touch-gated signature: one fresh credential context, one Touch ID
     /// match in it, the signature, and the context deleted, all inside this
-    /// call. Waits up to `TOUCH_WAIT_MS` for a finger.
+    /// call. Waits about a minute for a finger.
     fn key_sign_with_touch(&self, blob: &[u8], digest: &[u8; DIGEST_LEN], again: bool) -> Result<KeyTouch> {
         let acl = self.key_bio_acl()?;
         let mut owned = KVec::new();
@@ -551,7 +552,7 @@ impl SepData {
             again_status: 0,
         });
         self.key_touch_active.store(true, Relaxed);
-        dev_info!(self.dev, "sep-key: waiting for a Touch ID match to sign (up to {} s)\n", TOUCH_WAIT_MS / 1000);
+        dev_info!(self.dev, "sep-key: waiting for a Touch ID match to sign\n");
         let deadline = crate::shim::boottime_ns().saturating_add(TOUCH_WAIT_MS * 1_000_000);
         let ended = loop {
             if self.shutting_down.load(Relaxed) {
