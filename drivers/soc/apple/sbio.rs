@@ -1588,7 +1588,7 @@ impl SepData {
             {
                 // Not a restore: the enclave did not take the record (macOS
                 // discards such a record). The host record keeps the count.
-                dev_warn!(
+                dev_info!(
                     self.dev,
                     "sbio: LOAD_LOCKOUT refused the saved lockout record (0x8002, it does not match the restored catacombs); the failed-attempt count comes from the host record\n"
                 );
