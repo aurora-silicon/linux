@@ -12,6 +12,7 @@
  */
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
+#include <linux/firmware.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iommu.h>
@@ -67,12 +68,6 @@ static const struct apr_fmt apr_raw_fmts[] = {
  * Settings the engine and its AXI-to-fabric bridge need before the first
  * job, as read-modify-write (offset, mask, value), in order. T8140 values.
  */
-struct apr_tunable {
-	u32 offset;
-	u32 mask;
-	u32 value;
-};
-
 static const struct apr_tunable apr_t8140_engine_tunables[] = {
 	{ 0x008, 0x00000008, 0x00000008 },
 	{ 0x118, 0x0fff0fff, 0x00000280 },
@@ -261,11 +256,12 @@ struct apr_variant {
 	size_t num_engine_tunables;
 	const struct apr_tunable *wrapper_tunables;
 	size_t num_wrapper_tunables;
-	const char *reg_names[2];
+	const char *reg_names[3];
 	unsigned int num_regs;
 	unsigned int num_irqs;
 	u32 ring_bytes;
 	u32 desc_bytes;
+	const char *firmware_name;
 };
 
 static const struct apr_variant apr_t8140 = {
@@ -297,11 +293,27 @@ static const struct apr_variant apr_t6000 = {
 	.desc_bytes = APR_DESC_BYTES,
 };
 
+static const struct apr_variant apr_t6041 = {
+	.build_desc = apr_build_desc,
+	.stats = {
+		{ APR_REG_STATS0_LO, APR_REG_STATS0_HI, APR_REG_STATS0_SIZE },
+		{ APR_REG_STATS1_LO, APR_REG_STATS1_HI, APR_REG_STATS1_SIZE },
+	},
+	.reg_names = { "core", "wrapper", "aux" },
+	.num_regs = 3,
+	.num_irqs = 1,
+	.ring_bytes = APR_RING_BYTES,
+	.desc_bytes = APR_DESC_BYTES,
+	.firmware_name = APRI_T6041_FIRMWARE_NAME,
+};
+
 struct apr_dev {
 	const struct apr_variant *variant;
 	struct device *dev;
 	void __iomem *regs;
 	void __iomem *wrapper;
+	void __iomem *aux;
+	struct apr_init_data init;
 	struct reset_control *reset;
 	struct dev_pm_domain_list *pd_list;
 	int irq[2];
@@ -377,9 +389,19 @@ static void apr_hw_init(struct apr_dev *apr)
 
 	apr_write(apr, APR_REG_MODE, APR_MODE_OFF);
 	apr_write(apr, APR_REG_IRQ_ENABLE, 0);
-	apr_apply(apr->regs, v->engine_tunables, v->num_engine_tunables);
-	if (v->num_wrapper_tunables)
-		apr_apply(apr->wrapper, v->wrapper_tunables, v->num_wrapper_tunables);
+	if (v->firmware_name) {
+		apr_apply(apr->aux, apr->init.blocks[APRI_SYSTEM_BLOCK].entries,
+			  apr->init.blocks[APRI_SYSTEM_BLOCK].count);
+		apr_apply(apr->regs, apr->init.blocks[APRI_CORE_BLOCK].entries,
+			  apr->init.blocks[APRI_CORE_BLOCK].count);
+		apr_apply(apr->wrapper, apr->init.blocks[APRI_WRAPPER_BLOCK].entries,
+			  apr->init.blocks[APRI_WRAPPER_BLOCK].count);
+	} else {
+		apr_apply(apr->regs, v->engine_tunables, v->num_engine_tunables);
+		if (v->num_wrapper_tunables)
+			apr_apply(apr->wrapper, v->wrapper_tunables,
+				  v->num_wrapper_tunables);
+	}
 	apr_write(apr, APR_REG_RING_HEAD, 0);
 	apr_write(apr, APR_REG_RING_TAIL, 0);
 	apr_write(apr, APR_REG_RING_SIZE, v->ring_bytes);
@@ -1161,8 +1183,9 @@ static void apr_cleanup(void *data)
 static int apr_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	const struct firmware *firmware;
 	struct video_device *vdev;
-	void __iomem *regs[2] = {};
+	void __iomem *regs[3] = {};
 	struct apr_dev *apr;
 	unsigned int i;
 	int ret;
@@ -1174,6 +1197,17 @@ static int apr_probe(struct platform_device *pdev)
 	apr->variant = of_device_get_match_data(dev);
 	if (!apr->variant)
 		return -ENODEV;
+	if (apr->variant->firmware_name) {
+		ret = request_firmware(&firmware, apr->variant->firmware_name, dev);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "required initialization firmware unavailable\n");
+		ret = apr_parse_t6041_init(firmware->data, firmware->size, &apr->init);
+		release_firmware(firmware);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "invalid initialization firmware\n");
+	}
 	mutex_init(&apr->vdev_lock);
 	spin_lock_init(&apr->hw_lock);
 	INIT_DELAYED_WORK(&apr->watchdog, apr_watchdog);
@@ -1187,6 +1221,7 @@ static int apr_probe(struct platform_device *pdev)
 	}
 	apr->regs = regs[0];
 	apr->wrapper = regs[1];
+	apr->aux = regs[2];
 	/*
 	 * A second power domain, "perf", is the SoC performance request the
 	 * engine needs for full speed. With more than one domain the core
@@ -1289,6 +1324,7 @@ static void apr_remove(struct platform_device *pdev)
 
 static const struct of_device_id apr_of_match[] = {
 	{ .compatible = "apple,t6000-prores", .data = &apr_t6000 },
+	{ .compatible = "apple,t6041-prores", .data = &apr_t6041 },
 	{ .compatible = "apple,t8140-prores", .data = &apr_t8140 },
 	{ }
 };
@@ -1307,3 +1343,4 @@ module_platform_driver(apr_driver);
 
 MODULE_DESCRIPTION("Apple ProRes encoder");
 MODULE_LICENSE("GPL");
+MODULE_FIRMWARE(APRI_T6041_FIRMWARE_NAME);
