@@ -323,6 +323,7 @@ struct brcmf_cfg80211_vif_event {
  * @pre_ndoe: neighbour-discovery offload enable at entering suspend.
  * @pre_nolinkup: link-up event suppression at entering suspend.
  * @pre_pkt_filter_mode: packet-filter master mode at entering suspend.
+ * @lpas_filters: LPAS packet filters installed for this sleep (bit per id).
  * @lpas_event_mask: firmware event mask saved across associated sleep.
  * @lpas_event_mask_len: size of @lpas_event_mask.
  * @nd: net dectect data.
@@ -340,6 +341,7 @@ struct brcmf_cfg80211_wowl {
 	u32 pre_ndoe;
 	u32 pre_nolinkup;
 	u32 pre_pkt_filter_mode;
+	unsigned long lpas_filters;
 	u8 *lpas_event_mask;
 	size_t lpas_event_mask_len;
 	struct cfg80211_wowlan_nd_match *nd;

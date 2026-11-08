@@ -179,13 +179,13 @@ CALLBACK_STUBS = r'''
 #define WLAN_REASON_UNSPECIFIED 1
 #define test_bit(i,p) ((*(p)&BIT(i))!=0)
 #define list_for_each_entry(v,h,m) for ((v)=(h)->first;(v);(v)=(v)->next)
-struct cfg80211_wowlan {bool any;};
+struct cfg80211_wowlan {bool any, magic_pkt;};
 #define BRCMF_FEAT_WOWL 3
 #define BRCMF_FEAT_LPAS 4
 #define GFP_KERNEL 0
 static unsigned lpas_restores, wake_reports;
 static void cfg80211_report_wowlan_wakeup(int *w,void *i,int g) {(void)w;(void)i;(void)g;wake_reports++;}
-static int brcmf_configure_lpas(struct brcmf_cfg80211_info *c,struct brcmf_if *i) {(void)c;(void)i;can_command();return 0;}
+static int brcmf_configure_lpas(struct brcmf_cfg80211_info *c,struct brcmf_if *i,struct cfg80211_wowlan *w) {(void)c;(void)i;(void)w;can_command();return 0;}
 static int brcmf_restore_lpas(struct brcmf_cfg80211_info *c,struct brcmf_if *i) {
  (void)i;assert(bus.state==BRCMF_BUS_UP);lpas_restores++;c->wowl.lpas=c->wowl.active=false;return failure==4?-EIO:0;
 }
