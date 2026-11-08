@@ -143,7 +143,8 @@ properties:
         - description: Value
     description:
       Register writes before a consumer that gates itself is told about a
-      firmware-driven system suspend. Needs apple,sleep-restore.
+      firmware-driven system suspend, after the DART's state is saved. Streams
+      they stop are started again at the restore. Needs apple,sleep-restore.
 
   apple,sleep-restore:
     $ref: /schemas/types.yaml#/definitions/uint32-matrix
