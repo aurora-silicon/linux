@@ -36,6 +36,8 @@ struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables;
     struct { void *usb3_dp; } tunables;
+    /* A sleep took the USB host's domains down; never set here. */
+    bool sleep_dead;
 
     const struct atcphy_hw *hw;
     struct { unsigned char *core, *lpdptx, *pipehandler, *usb2phy; } regs;

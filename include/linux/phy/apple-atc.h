@@ -15,9 +15,9 @@ struct phy;
 /*
  * For a firmware-driven system sleep, before any device suspends and without the
  * controller's locks held. 0 means the PHY takes the controller through hibernation after
- * xHCI has saved its state and brings it back before xHCI resumes, so the host can stay
- * up; with USB3 its PIPE is parked for it. Otherwise the controller has to be stopped for
- * the sleep.
+ * xHCI has saved its state, then its DARTs and power domains down, and brings all of it
+ * back before xHCI resumes, so the host can stay up; with USB3 its PIPE is parked for it.
+ * Otherwise the controller has to be stopped for the sleep.
  */
 int apple_atcphy_sleep_prepare(struct phy *usb2_phy);
 

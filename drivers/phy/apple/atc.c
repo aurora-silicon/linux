@@ -39,6 +39,7 @@
 #include <linux/pm.h>
 #include <linux/pm_domain.h>
 #include <linux/reset-controller.h>
+#include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/soc/apple/tunable.h>
@@ -578,6 +579,9 @@ enum atcphy_lane_mode {
 #define AUSBC_PWR_EVENT_WAKE GENMASK(3, 2)
 #define AUSBC_PWR_TIMEOUT_US 200000
 
+/* The controller's DARTs the PHY saves and restores around its power for a sleep */
+#define ATCPHY_SLEEP_DARTS 4
+
 enum atcphy_generation {
 	ATCPHY_GENERATION_T8103,
 	ATCPHY_GENERATION_T8122,
@@ -888,6 +892,23 @@ struct apple_atcphy {
 	int sleep_ret;
 	/* Going through hibernation failed on this boot: the controller stops from now on. */
 	bool sleep_no_keep;
+	/*
+	 * What macOS's controller driver takes down after the hibernation and brings up at
+	 * the wake: the controller's DARTs, the PHY's power domain and that domain's parent,
+	 * and the fabric bridge bits around the parent. Found at probe; this sleep took them
+	 * down.
+	 */
+	bool sleep_power;
+	bool sleep_powered_down;
+	/* They didn't come back on: nothing in them may be touched until a reboot. */
+	bool sleep_dead;
+	struct device *sleep_darts[ATCPHY_SLEEP_DARTS];
+	unsigned int sleep_ndarts;
+	struct device_node *pd_usb, *pd_common;
+	u32 *bridge_gate;
+	u32 *bridge_saved;
+	unsigned int bridge_count;
+	bool bridge_gated;
 	bool usb3_port_off;
 	struct delayed_work usb3_port_work;
 	unsigned int usb3_port_retries;
@@ -4135,6 +4156,8 @@ static void _atcphy_dwc3_reset_assert(struct apple_atcphy *atcphy);
  */
 static int atcphy_rpm_get(struct apple_atcphy *atcphy)
 {
+	if (READ_ONCE(atcphy->sleep_dead))
+		return -ENODEV;
 	if (!atcphy->idle_rpm)
 		return 0;
 	return pm_runtime_resume_and_get(atcphy->dev);
@@ -6270,6 +6293,87 @@ static bool atcphy_usb2_behind_fixed_hub(struct apple_atcphy *atcphy)
 	return hub;
 }
 
+static void atcphy_put_node(void *np)
+{
+	of_node_put(np);
+}
+
+static void atcphy_put_device(void *dev)
+{
+	put_device(dev);
+}
+
+/*
+ * The pieces of a sleep that keeps the controller's power, from the device tree: the
+ * bridge bits (apple,axi2af-gate), the PHY's power domain and its parent, and the
+ * controller's DARTs (its iommus). Without all of them the controller stops for a sleep.
+ */
+static int atcphy_probe_sleep_power(struct apple_atcphy *atcphy)
+{
+	struct device *dev = atcphy->dev;
+	struct device_node *ep __free(device_node) =
+		of_graph_get_endpoint_by_regs(atcphy->np, 1, -1);
+	struct device_node *ctrl __free(device_node) =
+		ep ? of_graph_get_remote_port_parent(ep) : NULL;
+	int i, n, ret;
+
+	if (!atcphy->regs.pwrctl || !atcphy->res.axi2af || !ctrl)
+		return 0;
+
+	n = of_property_count_u32_elems(atcphy->np, "apple,axi2af-gate");
+	if (n <= 0)
+		return 0;
+	if (n % 2)
+		return dev_err_probe(dev, -EINVAL, "apple,axi2af-gate: not offset and bit pairs\n");
+	atcphy->bridge_gate = devm_kcalloc(dev, n, sizeof(u32), GFP_KERNEL);
+	atcphy->bridge_saved = devm_kcalloc(dev, n / 2, sizeof(u32), GFP_KERNEL);
+	if (!atcphy->bridge_gate || !atcphy->bridge_saved)
+		return -ENOMEM;
+	ret = of_property_read_u32_array(atcphy->np, "apple,axi2af-gate", atcphy->bridge_gate, n);
+	if (ret)
+		return ret;
+	for (i = 0; i < n; i += 2)
+		if (atcphy->bridge_gate[i] % 4 ||
+		    atcphy->bridge_gate[i] + 4 > resource_size(atcphy->res.axi2af))
+			return dev_err_probe(dev, -EINVAL, "apple,axi2af-gate: bad offset %#x\n",
+					     atcphy->bridge_gate[i]);
+	atcphy->bridge_count = n / 2;
+
+	atcphy->pd_usb = of_parse_phandle(atcphy->np, "power-domains", 0);
+	ret = devm_add_action_or_reset(dev, atcphy_put_node, atcphy->pd_usb);
+	if (ret)
+		return ret;
+	atcphy->pd_common = of_parse_phandle(atcphy->pd_usb, "power-domains", 0);
+	ret = devm_add_action_or_reset(dev, atcphy_put_node, atcphy->pd_common);
+	if (ret)
+		return ret;
+	if (!atcphy->pd_common)
+		return 0;
+
+	n = of_count_phandle_with_args(ctrl, "iommus", "#iommu-cells");
+	if (n <= 0 || n > ATCPHY_SLEEP_DARTS)
+		return 0;
+	for (i = 0; i < n; i++) {
+		struct of_phandle_args args;
+		struct platform_device *pdev;
+
+		if (of_parse_phandle_with_args(ctrl, "iommus", "#iommu-cells", i, &args))
+			return 0;
+		pdev = of_find_device_by_node(args.np);
+		of_node_put(args.np);
+		if (!pdev)
+			return 0;
+		ret = devm_add_action_or_reset(dev, atcphy_put_device, &pdev->dev);
+		if (ret)
+			return ret;
+		atcphy->sleep_darts[i] = &pdev->dev;
+	}
+	atcphy->sleep_ndarts = n;
+	atcphy->sleep_power = true;
+
+	return 0;
+}
+
 /*
  * A DisplayPort-only instance has no USB controller to reset and no PIPE: put
  * the PHY in its off state and register the mux, switch and DP PHY.
@@ -6486,6 +6590,11 @@ static int atcphy_probe(struct platform_device *pdev)
 	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
 	atcphy->fixed_usb2 = atcphy_usb2_behind_fixed_hub(atcphy);
 	atcphy->typec_mode = APPLE_ATCPHY_MODE_USB2;
+	if (atcphy->fixed_usb2) {
+		ret = atcphy_probe_sleep_power(atcphy);
+		if (ret)
+			return ret;
+	}
 	followed = atcphy_probe_pd_notifier(atcphy);
 
 	/*
@@ -6517,11 +6626,14 @@ static int atcphy_probe(struct platform_device *pdev)
  * the controller is its consumer. The PHY then takes the controller's core into
  * hibernation through its power control, holds the core's reset without the clamp, and
  * puts the eUSB2 PHY in its sleep state: reference clock gated, APB in reset, the link
- * left as it is. The sleep's commit lowers ATC0_USB and ATC0_COMMON and keeps
- * ATC0_USB_AON, which holds the power control, the PIPE handler and the USB2 PHY.
+ * left as it is. Then, as macOS's controller driver does next (measured), it saves
+ * and stops the controller's DARTs, lowers ATC0_USB, gates the fabric bridge and lowers
+ * ATC0_COMMON. ATC0_USB_AON stays on with the power control, the PIPE handler and the
+ * USB2 PHY.
  *
- * At the wake ATC0_COMMON is back with the common block at its reset values. It's set up
- * in the mode it had again, the controller is brought to D0, and xHCI restores its own state.
+ * At the wake ATC0_COMMON comes back, the bridge, ATC0_USB and the DARTs after it, with
+ * the common block at its reset values. It's set up in the mode it had again, the
+ * controller is brought to D0, and xHCI restores its own state.
  *
  * USB2 and USB3 qualify, without DisplayPort, whose link the common block's power-down
  * would end. With USB3 the halted controller's PIPE is parked on the dummy backend just
@@ -6533,12 +6645,27 @@ static int atcphy_probe(struct platform_device *pdev)
  * PHY's power level (static, setUSB3Mode). macOS also stops its PHY's fabric traffic before
  * the clock gate; that block isn't known here, and a halted controller has none.
  */
+/*
+ * The DARTs' own callbacks leave them to the PHY once it saved them, and the sleep driver
+ * knows the domains' words.
+ */
+static bool atcphy_sleep_power_ready(const struct apple_atcphy *atcphy)
+{
+	unsigned int i;
+
+	for (i = 0; i < atcphy->sleep_ndarts; i++)
+		if (!apple_dart_sleep_listed(atcphy->sleep_darts[i]))
+			return false;
+	return !apple_sleep_domain_check(atcphy->pd_usb) &&
+	       !apple_sleep_domain_check(atcphy->pd_common);
+}
+
 static bool atcphy_can_sleep_in_place(const struct apple_atcphy *atcphy)
 {
 	enum atcphy_pipehandler_state pipe = atcphy_pipe_state_for(atcphy, atcphy->mode);
 
-	return atcphy->hw->has_t8140_dp && atcphy->fixed_usb2 && atcphy->regs.pwrctl &&
-	       !atcphy->sleep_no_keep && atcphy->host_active &&
+	return atcphy->hw->has_t8140_dp && atcphy->fixed_usb2 && atcphy->sleep_power &&
+	       atcphy_sleep_power_ready(atcphy) && !atcphy->sleep_no_keep && atcphy->host_active &&
 	       (atcphy->mode == APPLE_ATCPHY_MODE_USB2 || atcphy->mode == APPLE_ATCPHY_MODE_USB3) &&
 	       !atcphy->mode_dirty && !atcphy->pipe_pending &&
 	       (atcphy->pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY ||
@@ -6657,6 +6784,102 @@ static int atcphy_controller_hibernate(struct apple_atcphy *atcphy)
 }
 
 /*
+ * The fabric bridge bits, cleared before ATC0_COMMON goes off. The wake sets those that
+ * were set, as the bridge comes back at its reset values.
+ */
+static void atcphy_bridge_gate(struct apple_atcphy *atcphy, bool open)
+{
+	unsigned int i;
+
+	if (open && !atcphy->bridge_gated)
+		return;
+	atcphy->bridge_gated = !open;
+	for (i = 0; i < atcphy->bridge_count; i++) {
+		void __iomem *reg = atcphy->regs.axi2af + atcphy->bridge_gate[2 * i];
+		u32 bits = atcphy->bridge_gate[2 * i + 1];
+
+		if (open) {
+			if (atcphy->bridge_saved[i])
+				set32(reg, atcphy->bridge_saved[i]);
+			continue;
+		}
+		atcphy->bridge_saved[i] = readl(reg) & bits;
+		if (atcphy->bridge_saved[i])
+			clear32(reg, bits);
+	}
+}
+
+/*
+ * Back up in macOS's order: ATC0_COMMON, the bridge, ATC0_USB, then the DARTs. -ENODEV if
+ * a domain didn't come on, when nothing in it may be touched.
+ */
+static int atcphy_sleep_power_up(struct apple_atcphy *atcphy)
+{
+	unsigned int i;
+	int ret;
+
+	atcphy->sleep_powered_down = false;
+	ret = apple_sleep_domain_set(atcphy->pd_common, true);
+	if (!ret) {
+		atcphy_bridge_gate(atcphy, true);
+		ret = apple_sleep_domain_set(atcphy->pd_usb, true);
+	}
+	if (ret) {
+		dev_err(atcphy->dev, "USB host's power domains not back on: %d, USB off until a reboot\n",
+			ret);
+		WRITE_ONCE(atcphy->sleep_dead, true);
+		atcphy->sleep_no_keep = true;
+		return -ENODEV;
+	}
+	for (i = 0; i < atcphy->sleep_ndarts; i++)
+		apple_dart_sleep_restore_lost(atcphy->sleep_darts[i], true);
+
+	return 0;
+}
+
+/*
+ * What macOS's controller driver does right after the hibernation: the DARTs saved and
+ * stopped, ATC0_USB off, the bridge gated, ATC0_COMMON off, 0.7 to 1.7 s before the CPUs
+ * stop. A failure leaves everything up again.
+ */
+static int atcphy_sleep_power_down(struct apple_atcphy *atcphy)
+{
+	char bridge[48] = "";
+	unsigned int i, n;
+	int ret = 0, len = 0;
+
+	for (n = 0; n < atcphy->sleep_ndarts; n++) {
+		ret = apple_dart_sleep_prepare(atcphy->sleep_darts[n]);
+		if (ret)
+			break;
+	}
+	if (ret) {
+		while (n--)
+			apple_dart_sleep_restore_lost(atcphy->sleep_darts[n], false);
+		dev_err(atcphy->dev, "USB host's DARTs not saved for the sleep: %d\n", ret);
+		return ret;
+	}
+
+	atcphy->sleep_powered_down = true;
+	ret = apple_sleep_domain_set(atcphy->pd_usb, false);
+	if (!ret) {
+		for (i = 0; i < atcphy->bridge_count; i++)
+			len += scnprintf(bridge + len, sizeof(bridge) - len, " %#x",
+					 readl(atcphy->regs.axi2af + atcphy->bridge_gate[2 * i]));
+		atcphy_bridge_gate(atcphy, false);
+		ret = apple_sleep_domain_set(atcphy->pd_common, false);
+	}
+	if (ret) {
+		dev_err(atcphy->dev, "USB host's power domains not off for the sleep: %d\n", ret);
+		return ret;
+	}
+	dev_info(atcphy->dev, "USB host's power domains off for the sleep, fabric bridge was%s\n",
+		 bridge);
+
+	return 0;
+}
+
+/*
  * The common block went off with ATC0_COMMON. Set it up again in the mode it had, USB2 or
  * USB3, without the controller's reset or a USB2 PHY power cycle: atcphy_configure() powers
  * the USB2 PHY on over the running one, which rewrites only what it holds, so the hub's link
@@ -6683,6 +6906,26 @@ static int atcphy_common_restore(struct apple_atcphy *atcphy)
 	dev_warn(atcphy->dev, "mode %d not set up again after the sleep (%d): USB2 for now\n",
 		 mode, ret);
 	return atcphy_configure(atcphy, APPLE_ATCPHY_MODE_USB2);
+}
+
+/*
+ * The wake's path, and that of an entry that failed after the hibernation: the domains,
+ * the USB2 PHY, the common block if it went off, then D0. See atcphy_controller_d0().
+ */
+static int atcphy_sleep_come_back(struct apple_atcphy *atcphy, bool common_lost, bool went_off)
+{
+	int ret = 0;
+
+	if (atcphy->sleep_powered_down && atcphy_sleep_power_up(atcphy))
+		return -ENODEV;
+	atcphy_usb2_sleep_exit(atcphy);
+	if (common_lost) {
+		ret = atcphy_common_restore(atcphy);
+		if (ret)
+			dev_err(atcphy->dev, "PHY not set up again after the sleep: %d\n", ret);
+	}
+
+	return atcphy_controller_d0(atcphy, went_off) ?: ret;
 }
 
 static int atcphy_suspend_noirq(struct device *dev)
@@ -6712,6 +6955,15 @@ static int atcphy_suspend_noirq(struct device *dev)
 	if (ret)
 		return ret;
 	atcphy->hibernated = true;
+	ret = atcphy_sleep_power_down(atcphy);
+	if (ret) {
+		/* No resume callback follows a failed suspend: back now, and stop from now on. */
+		atcphy->sleep_no_keep = true;
+		atcphy->sleep_ret = atcphy_sleep_come_back(atcphy, atcphy->sleep_powered_down,
+							   true);
+		atcphy->hibernated = false;
+		return ret;
+	}
 	apple_sleep_usb_set_asleep(true);
 
 	return 0;
@@ -6736,7 +6988,6 @@ static void atcphy_sleep_lost_dp(struct apple_atcphy *atcphy)
 static int atcphy_resume_noirq(struct device *dev)
 {
 	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
-	int ret = 0;
 
 	guard(mutex)(&atcphy->lock);
 	if (!atcphy->hibernated) {
@@ -6744,15 +6995,8 @@ static int atcphy_resume_noirq(struct device *dev)
 		return 0;
 	}
 	apple_sleep_usb_set_asleep(false);
-
-	atcphy_usb2_sleep_exit(atcphy);
-	/* Only a sleep that reached the commit lowered ATC0_COMMON. */
-	if (pm_resume_via_firmware()) {
-		ret = atcphy_common_restore(atcphy);
-		if (ret)
-			dev_err(dev, "PHY not set up again after the sleep: %d\n", ret);
-	}
-	atcphy->sleep_ret = atcphy_controller_d0(atcphy, false) ?: ret;
+	/* The PHY took ATC0_COMMON down itself, so this goes for a refused sleep too. */
+	atcphy->sleep_ret = atcphy_sleep_come_back(atcphy, true, false);
 	atcphy->hibernated = false;
 	if (!atcphy->sleep_ret) {
 		dev_dbg(dev, "USB controller back in D0 after the sleep, PHY in mode %d\n",
@@ -6786,7 +7030,7 @@ static void atcphy_sleep_ss_up(struct apple_atcphy *atcphy)
 	int ret;
 
 	scoped_guard(mutex, &atcphy->lock) {
-		if (!atcphy->sleep_ss_down)
+		if (!atcphy->sleep_ss_down || atcphy->sleep_dead)
 			return;
 		atcphy->sleep_ss_down = false;
 		mode = atcphy->typec_mode;
