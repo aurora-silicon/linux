@@ -1090,7 +1090,7 @@ int t8132_ext_drm_init(struct drm_device *drm)
 	bool mine, reg;
 	int ret = 0;
 
-	if (!apple_t8132_air())
+	if (!apple_t8132_firmware_path())
 		return 0;
 	/* Sleep handling for the outputs of one DRM device only. */
 	mutex_lock(&t8132_ext_reg_lock);

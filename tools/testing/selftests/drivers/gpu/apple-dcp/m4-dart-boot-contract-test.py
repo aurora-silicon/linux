@@ -87,6 +87,11 @@ static bool of_machine_is_compatible(const char *s) {
         !strcmp(s,"apple,j624") || !strcmp(s,"apple,j773g")) return false;
     assert(!strcmp(s,"apple,t8132")); return soc;
 }
+/* No /chosen: the qualified-firmware term is off and the Air gates decide. */
+static struct device_node *of_chosen;
+static int of_property_read_string(const struct device_node *n,const char *p,const char **out) {
+    (void)n;(void)p;(void)out;return -22;
+}
 AIR_HELPER
 static bool of_device_is_compatible(const struct device_node *n,const char *s) {
     for(unsigned int i=0;i<n->count;i++) if(!strcmp(n->compatible[i],s))return true;
