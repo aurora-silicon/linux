@@ -775,6 +775,15 @@ struct SepData {
     #[pin]
     key_dev: Mutex<Option<shim::BioChardev>>,
 
+    // /dev/sep-key: the signature a touch-gated SEP_KEY_SIGN is waiting for.
+    // Set only for the length of that ioctl; while set, a verify run belongs
+    // to it and not to /dev/sep-bio's session.
+    #[pin]
+    key_touch: Mutex<Option<crate::key::KeyTouch>>,
+    key_touch_active: Atomic<bool>,
+    // The enclave status of the last /dev/sep-key signature (self-test).
+    last_key_status: Atomic<u32>,
+
     // The enclave refused to match (MATCH_RESULT answered 0x1) after failed
     // attempts, or the lockout survived a restart. Every verify is refused
     // without a capture until a password authentication re-arms Touch ID.
@@ -1061,6 +1070,9 @@ impl SepData {
                 bio_dev <- new_mutex!(None),
                 rearm_dev <- new_mutex!(None),
                 key_dev <- new_mutex!(None),
+                key_touch <- new_mutex!(None),
+                key_touch_active: Atomic::new(false),
+                last_key_status: Atomic::new(0),
                 bio_lockout: Atomic::new(false),
                 bio_lockout_logged: Atomic::new(false),
                 bio_nomatch_streak: Atomic::new(0),
@@ -3076,6 +3088,10 @@ module! {
         probe_owner_export: u8 {
             default: 0,
             description: "Opt-in J414s diagnostic: with zero live identities, select the system context and try saving the missing owner Catacomb",
+        },
+        key_selftest: u8 {
+            default: 0,
+            description: "Test only: let root run SEP_KEY_SELFTEST, which signs with an access-controlled /dev/sep-key key under deliberately unsuitable credential contexts to show the enclave refuses",
         },
         refkey_v2: u8 {
             default: 0,
