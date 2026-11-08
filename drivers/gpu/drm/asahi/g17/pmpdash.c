@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * Bring-up only: PMP helpers for the J813 GPU.
- *
- * report: report the AGX device state to the T8142 PMP over the mcc dashboard
- * (SOC-DEV-PS-REQ idx 0x27, SOC-DEV-PS-ACK idx 0x2f), the way macOS ApplePMGR
- * does in native order right after the platform power-on write.
- *
- * power_cycle: force the ps_gfx power transition macOS performs from off.  The
- * M5's domain is inherited on (0x1f0023ff), so Linux's genpd never transitions
- * it; macOS writes target 0xf with auto-PM off, then auto-PM on, around the PMP
- * report.  A transition edge may be what makes the PMP enable the sgx node's
- * power/clock gates 515 (GFX-SGX) and 516 (GFX-BUSY).
+ * GFX power for the J813 (T8142): hold the power domain and keep ps_gfx at its
+ * top state for the firmware session.
  */
 
 #include <linux/bitfield.h>
@@ -18,19 +9,10 @@
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/ktime.h>
+#include <linux/pm_runtime.h>
 
-int asahi_j813_pmp_report_agx(bool on);
-int asahi_j813_pmp_agx_power_cycle(void);
-
-#define PTD_DB_BASE	0x3803c0000ULL
-#define PTD_UPD_BASE	0x3803d0000ULL
-#define PTD_WIN_SIZE	0x4000
-
-#define PTD_PS_REQ	0x27
-#define PTD_PS_ACK	0x2f
-#define PTD_META_FRESH	BIT_ULL(1)
-
-#define AGX_BIT		12
+int asahi_j813_hold_power(struct device *dev);
+int asahi_j813_power_on_gfx(void);
 
 #define SGX_PS_BASE	0x580e80000ULL
 #define SGX_PS_REG	0x110
@@ -44,65 +26,6 @@ int asahi_j813_pmp_agx_power_cycle(void);
 #define PS_RESET	BIT(12)
 #define PS_AUTO_ENABLE	BIT(28)
 #define PS_FLAGS	(PS_WAS_PWRGATED | PS_WAS_CLKGATED)
-
-static u64 ptd_read(void __iomem *db, u32 idx, u64 *meta)
-{
-	u64 v = readq(db + 16 * idx);
-
-	*meta = readq(db + 16 * idx + 8);
-	return v;
-}
-
-int asahi_j813_pmp_report_agx(bool on)
-{
-	u64 req, ack, meta, pre_ack, pre_meta, want;
-	ktime_t t0;
-	void __iomem *db, *upd;
-	bool fresh = false;
-	int ret = 0;
-
-	db = ioremap(PTD_DB_BASE, PTD_WIN_SIZE);
-	upd = ioremap(PTD_UPD_BASE, PTD_WIN_SIZE);
-	if (!db || !upd) {
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	req = ptd_read(db, PTD_PS_REQ, &meta);
-	pre_ack = ptd_read(db, PTD_PS_ACK, &pre_meta);
-	want = on ? req | BIT_ULL(AGX_BIT) : req & ~BIT_ULL(AGX_BIT);
-	pr_info("asahi: PMP AGX %s: PS-REQ %#llx -> %#llx (pre-ACK %#llx meta %#llx)\n",
-		on ? "on" : "off", req, want, pre_ack, pre_meta);
-	writeq(want, upd + 8 * PTD_PS_REQ);
-
-	t0 = ktime_get();
-	for (;;) {
-		ack = ptd_read(db, PTD_PS_ACK, &meta);
-		if (meta & PTD_META_FRESH)
-			fresh = true;
-		if (!((ack ^ want) & BIT_ULL(AGX_BIT)) &&
-		    (fresh || ack != pre_ack)) {
-			pr_info("asahi: PMP AGX %s ACKed in %lld us (ACK %#llx meta %#llx fresh=%u)\n",
-				on ? "on" : "off",
-				ktime_us_delta(ktime_get(), t0), ack, meta, fresh);
-			break;
-		}
-		if (ktime_us_delta(ktime_get(), t0) > 15000000) {
-			pr_warn("asahi: PMP AGX %s NOT acked in 15 s (ACK %#llx meta %#llx fresh=%u)\n",
-				on ? "on" : "off", ack, meta, fresh);
-			ret = -ETIMEDOUT;
-			break;
-		}
-		usleep_range(100, 200);
-	}
-
-out:
-	if (upd)
-		iounmap(upd);
-	if (db)
-		iounmap(db);
-	return ret;
-}
 
 static u32 ptd_ps_write(void __iomem *ps, u32 pstate, bool auto_enable)
 {
@@ -136,7 +59,37 @@ static int ptd_ps_wait(void __iomem *ps, u32 pstate, u32 *out)
 	return 0;
 }
 
-int asahi_j813_pmp_agx_power_cycle(void)
+/*
+ * hold_power: keep the GFX power domain up for the firmware session, as the G15
+ * and G16 paths do for theirs (asahi_g15_hold_power).  Nothing held it on the
+ * J813: the domain is inherited on from the boot loader, genpd gates it when it
+ * finds no active consumer, and ps_gfx then reads target 0xf with actual 0 while
+ * the coprocessors run out of their own always-on island.  Returns an error when
+ * the device has no power domain to hold.
+ */
+int asahi_j813_hold_power(struct device *dev)
+{
+	int ret;
+
+	pm_runtime_get_noresume(dev);
+	ret = pm_runtime_set_active(dev);
+	if (ret)
+		return ret;
+	pm_runtime_enable(dev);
+	return dev->pm_domain ? 0 : -EINVAL;
+}
+
+/*
+ * power_on: bring the GFX domain to its top power state and leave it there for
+ * the firmware session.  The domain is gated by the time this driver probes
+ * (genpd finds no active consumer, and marking the device active does not
+ * request a transition), so ps_gfx reads target 0xf with actual 0 while the
+ * coprocessors run out of their own always-on island and the GPU's cores can
+ * never come up.  Auto power management is left off, so nothing gates the
+ * domain again while the session holds it; macOS re-enables it because its own
+ * stack keeps a demand on the domain.
+ */
+int asahi_j813_power_on_gfx(void)
 {
 	void __iomem *ps;
 	u32 val, cur;
@@ -145,32 +98,19 @@ int asahi_j813_pmp_agx_power_cycle(void)
 	ps = ioremap(SGX_PS_BASE, 0x1000);
 	if (!ps)
 		return -ENOMEM;
-
 	cur = readl(ps + SGX_PS_REG);
-	pr_info("asahi: GFX ps before cycle: %#x\n", cur);
-
-	val = ptd_ps_write(ps + SGX_PS_REG, 0, false);
-	if (ptd_ps_wait(ps + SGX_PS_REG, 0, &cur)) {
-		pr_warn("asahi: GFX ps did not power-gate (wrote %#x, now %#x)\n",
-			val, cur);
-		ret = -EIO;
-	} else {
-		pr_info("asahi: GFX ps powered off (wrote %#x, now %#x)\n", val, cur);
+	if (FIELD_GET(PS_ACTUAL, cur) == 0xf && !(cur & PS_AUTO_ENABLE)) {
+		pr_info("asahi: GFX ps already held on (%#x)\n", cur);
+		iounmap(ps);
+		return 0;
 	}
-
 	val = ptd_ps_write(ps + SGX_PS_REG, 0xf, false);
 	if (ptd_ps_wait(ps + SGX_PS_REG, 0xf, &cur)) {
-		pr_warn("asahi: GFX ps did not power on (wrote %#x, now %#x)\n",
-			val, cur);
+		pr_warn("asahi: GFX ps did not power on (wrote %#x, now %#x)\n", val, cur);
 		ret = -EIO;
 	} else {
-		pr_info("asahi: GFX ps powered on, auto-PM off (wrote %#x, now %#x)\n",
-			val, cur);
+		pr_info("asahi: GFX ps held on (wrote %#x, now %#x)\n", val, cur);
 	}
-
-	val = ptd_ps_write(ps + SGX_PS_REG, 0xf, true);
-	pr_info("asahi: GFX ps auto-PM on (wrote %#x)\n", val);
-
 	iounmap(ps);
 	return ret;
 }

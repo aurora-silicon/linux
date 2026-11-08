@@ -1516,6 +1516,26 @@ impl Gpu {
         let m5 = cfg.profile.is_m5();
         if m5 {
             let board = cfg.m5.ok_or(EINVAL)?;
+            // Hold the J813's GFX power domain for the session, as the G15 and G16 paths do
+            // for theirs. Without a hold genpd gates it once it finds no active consumer, and
+            // the GPU's cores can never come up: ps_gfx reads target 0xf with actual 0 while
+            // the coprocessors run out of their own always-on island and report the GPU busy.
+            if cfg.chip_id == 0x8142 {
+                extern "C" {
+                    fn asahi_j813_hold_power(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+                    fn asahi_j813_power_on_gfx() -> core::ffi::c_int;
+                }
+                // SAFETY: `dev` is this probe's device; runtime-PM accounting has no other
+                // requirement.
+                kernel::error::to_result(unsafe {
+                    asahi_j813_hold_power(pdev.as_ref().as_raw().cast())
+                })
+                .inspect_err(|e| dev_err!(dev.as_ref(), "M5: no GFX power hold: {:?}\n", e))?;
+                // SAFETY: the helper only ioremaps and pokes the T8142 PMGR GPU power-state
+                // register.
+                kernel::error::to_result(unsafe { asahi_j813_power_on_gfx() })
+                    .inspect_err(|e| dev_err!(dev.as_ref(), "M5: GFX domain not powered: {:?}\n", e))?;
+            }
             // The M5 layouts are sized for every core slot of the board, fused-off cores
             // included, so the GPU is matched on clusters and slots, not on enabled cores.
             if id.num_clusters != board.clusters || id.num_clusters * id.num_cores != board.gpu_cores
@@ -1846,16 +1866,6 @@ impl Gpu {
         // The other boards prepare both after the coprocessor boot (prepare_m5_firmware).
         if cfg.chip_id == 0x8142 {
             regs.set_m5_start_control().inspect_err(at("M5 start control"))?;
-            // Bring-up trial: force the ps_gfx transition macOS performs from off (the domain
-            // is inherited on here), then re-apply the SGX preparation the cycle resets.
-            extern "C" {
-                fn asahi_j813_pmp_agx_power_cycle() -> core::ffi::c_int;
-            }
-            // SAFETY: the helper only ioremaps and pokes the PMGR GPU power-state register.
-            if unsafe { asahi_j813_pmp_agx_power_cycle() } != 0 {
-                dev_warn!(dev.as_ref(), "M5: GFX power cycle incomplete\n");
-            }
-            regs.set_m5_start_control().inspect_err(at("M5 start control after cycle"))?;
         }
         let primary = Coprocessor::new(pdev, dev, cfg, &uat, shared, Role::Primary)
             .inspect_err(|e| dev_err!(dev.as_ref(), "Primary coprocessor setup failed: {:?}\n", e))?;
