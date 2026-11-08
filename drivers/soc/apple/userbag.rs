@@ -395,10 +395,15 @@ fn decode_get_state_request(body: &[u8]) -> Option<i32> {
     Some(handle)
 }
 
+/// A DER-dictionary reply: `u32 0`, then the dictionary as a blob (padded to
+/// 4), as the Neo's key store answered on Linux on 11-08.
 fn response_der(body: &[u8]) -> Option<&[u8]> {
-    let (der, at) = crate::image::read_blob(body, 0)?;
-    let mut c = Cursor { bytes: body, at };
-    if c.u32()? != 0 || !c.done() {
+    let mut c = Cursor::new(body);
+    if c.u32()? != 0 {
+        return None;
+    }
+    let der = c.blob()?;
+    if !c.done() {
         return None;
     }
     Some(der)
@@ -1268,8 +1273,8 @@ mod tests {
             0x0c, 0x02, b's', b's', 0x02, 0x04, 0x06, 0, 0, 0x15,
         ];
         let mut response = crate::image::Body::new();
-        response.put_blob(&der).unwrap();
         response.put_u32(0).unwrap();
+        response.put_blob(&der).unwrap();
         assert_eq!(
             decode_get_state_reply(response.as_slice()),
             Some(GetState {
@@ -1302,8 +1307,8 @@ mod tests {
             0x01, 0x2c, 0x30, 0x08, 0x0c, 0x03, b'm', b'u', b'a', 0x02, 0x01, 10,
         ];
         let mut response = crate::image::Body::new();
-        response.put_blob(&der).unwrap();
         response.put_u32(0).unwrap();
+        response.put_blob(&der).unwrap();
         assert_eq!(
             decode_get_configuration_reply(response.as_slice()),
             Some(Configuration {
