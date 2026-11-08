@@ -1394,7 +1394,9 @@ done:
  * can reach the host controller: a hub that does not pass one on from below
  * while it is suspended itself, a hub with wakeup enabled that does not signal
  * the changes of its own ports while it is suspended, and every device between
- * such a hub and the root hub, root hub included. This only works while the
+ * such a hub and the root hub, root hub included, and a device that wakes
+ * itself whenever it is suspended, which then wakes the system with its own
+ * input instead, as do the devices above it. This only works while the
  * host controller keeps running, so its interrupt reports the hub's status
  * change.
  *
@@ -1420,6 +1422,10 @@ VISIBLE_IF_KUNIT bool usb_stay_awake_for_wakeup(struct usb_device *udev, pm_mess
 
 	if ((udev->quirks & USB_QUIRK_HUB_NO_SUSPENDED_WAKEUP) &&
 	    usb_wakeup_reaches(udev))
+		return true;
+
+	if ((udev->quirks & USB_QUIRK_WAKES_ITSELF_WHEN_SUSPENDED) &&
+	    udev->do_remote_wakeup)
 		return true;
 
 	/* Children are done with their suspend before their parent starts */
