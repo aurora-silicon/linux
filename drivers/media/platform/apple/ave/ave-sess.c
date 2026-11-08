@@ -124,6 +124,11 @@ static const u8 ave_cq_qp[101] = {
 
 #define AVE_CQ_MAX_QP 48
 
+u32 ave_cq_initial_qp(u32 quality)
+{
+	return ave_cq_qp[min(quality, 100U)];
+}
+
 static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 {
 	bool baseline = false;
@@ -193,6 +198,15 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	p->reorder_off = !ctx->b_frames;
 	p->refs = p->intra_only ? 1 : p->bframes ? 5 : 2;
 	p->slots = p->bframes ? 5 : 3;
+	/*
+	 * Speed over quality changes the firmware's throughput mode from 3 to
+	 * 5, as macOS does. It is measured for 8-bit HEVC above 720p on the
+	 * 9003 layout only; H.264 does not get faster from it (on macOS
+	 * either).
+	 */
+	p->speed = ctx->prioritize_speed && p->codec == AVE_CODEC_HEVC &&
+		   p->sample_bytes == 1 && !ctx->ave->layout->counted &&
+		   p->width * p->height > 1280 * 720;
 	p->gop = ctx->gop_size ?: 120;
 
 	p->bitrate = ctx->bitrate;
@@ -200,7 +214,7 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 		/* One QP for every frame, no data-rate limit, as macOS sets it. */
 		p->rc_mode = AVE_RC_CQ;
 		p->limit_bytes = 0;
-		p->initial_qp = ave_cq_qp[min(ctx->quality, 100U)];
+		p->initial_qp = ave_cq_initial_qp(ctx->quality);
 		p->max_qp = min_t(u32, p->max_qp, AVE_CQ_MAX_QP);
 		if (p->min_qp > (s32)p->max_qp)
 			p->min_qp = p->max_qp;
