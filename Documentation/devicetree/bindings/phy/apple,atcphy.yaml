@@ -448,6 +448,18 @@ properties:
       T8140, copied from Apple's Device Tree by the bootloader. Unlike the
       other tunables these are applied to the usb2phy-reg region.
 
+  apple,axi2af-gate:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: Register offset in the axi2af region
+        - description: Bits
+    description: >
+      The fabric bridge bits macOS clears, in this order, before the PHY's
+      common power domain goes off for a system sleep and sets again once it
+      is back. With pwrctl, the controller then keeps its power through the
+      sleep.
+
 patternProperties:
   "^apple,dp-training-table(-rbr|-hbr|-hbr2|-hbr3)?$":
     $ref: /schemas/types.yaml#/definitions/uint32-array
