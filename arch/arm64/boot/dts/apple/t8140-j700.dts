@@ -1799,7 +1799,11 @@
 	apple,debug-port = <&hpm0>;
 };
 
-/* USB PD controllers, on the nub SPMI A0 bus */
+/*
+ * USB PD controllers, on the nub SPMI A0 bus. macOS sends them SSPS 3 and 0 around a sleep
+ * and nothing else: no USBw, as the J700 ADT has no dock-remote-wake. A USB key press
+ * wakes the J700 through the host's own wake source.
+ */
 &nub_spmi_a0 {
 	status = "okay";
 
@@ -1807,7 +1811,6 @@
 		compatible = "apple,sn201202x";
 		reg = <0xa SPMI_USID>;
 		apple,sleep-ssps;
-		apple,usb-remote-wake;
 		interrupts = <37 IRQ_TYPE_EDGE_RISING>,
 			     <39 IRQ_TYPE_EDGE_RISING>,
 			     <43 IRQ_TYPE_EDGE_RISING>,
@@ -1834,7 +1837,6 @@
 		reg = <0xc SPMI_USID>;
 		apple,debug-lock-key = "007J";
 		apple,sleep-ssps;
-		apple,usb-remote-wake;
 		interrupts = <11 IRQ_TYPE_EDGE_RISING>,
 			     <13 IRQ_TYPE_EDGE_RISING>,
 			     <17 IRQ_TYPE_EDGE_RISING>,
