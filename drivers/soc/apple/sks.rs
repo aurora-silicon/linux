@@ -928,6 +928,31 @@ impl SepData {
         })
     }
 
+    /// `0x21` verify-secret (variant 1) in password-validation mode: the
+    /// designated user's own bag, that bag's secret, no auxiliary context.
+    /// This is the request that ends a biometric lockout.
+    pub(crate) fn sks_req_verify_password(
+        &self,
+        special: crate::sks::SpecialHandle,
+        secret: &[u8],
+    ) -> Result<SksRequest> {
+        let mut body = image::Body::new();
+        body.put_u32(crate::sks::SKS_VERIFY_SECRET_VARIANT)?;
+        body.put_u64(crate::sks::SKS_CLIENT_ID)?;
+        body.put_i32(special.value())?;
+        body.put_blob(secret)?;
+        body.put_blob(&[])?;
+        body.put_u64(crate::sks::SKS_VERIFY_SECRET_PASSWORD)?;
+        let img = image::build_request(self.sks_ipc_version(), self.sks_timestamp_us(), &body)?;
+        let len = self.sks_image_len(&img)?;
+        let msg = crate::sks::encode_sks_verify_secret(self.sks_next_seq(), len).ok_or(EINVAL)?;
+        Ok(SksRequest {
+            name: crate::sks::SKS_VERIFY_SECRET_NAME,
+            msg,
+            img,
+        })
+    }
+
     pub(crate) fn sks_step(
         &self,
         label: &CStr,
@@ -1230,8 +1255,14 @@ pub(crate) const SKS_NEW_PFK_NAME: &CStr = c"NEW_PFK";
 const OP_SKS_UNWRAP_MEDIA_KEY: u8 = 0x32;
 pub(crate) const SKS_UNWRAP_MEDIA_KEY_NAME: &CStr = c"UNWRAP_MEDIA_KEY";
 
+const OP_SKS_NEW_VEK: u8 = 0x40;
+pub(crate) const SKS_NEW_VEK_NAME: &CStr = c"FV_NEW_VEK";
+
 const OP_SKS_UNWRAP_VEK: u8 = 0x41;
 pub(crate) const SKS_UNWRAP_VEK_NAME: &CStr = c"FV_UNWRAP_VEK";
+
+const OP_SKS_NEW_KEK: u8 = 0x42;
+pub(crate) const SKS_NEW_KEK_NAME: &CStr = c"FV_NEW_KEK";
 
 const OP_SKS_SET_PROTECTION: u8 = 0x47;
 pub(crate) const SKS_SET_PROTECTION_NAME: &CStr = c"FV_SET_PROTECTION";
@@ -1255,6 +1286,14 @@ pub(crate) fn encode_sks_unwrap_media_key(seq: Sequence, len: ImageLen) -> Optio
 pub(crate) fn encode_sks_unwrap_vek(seq: Sequence, len: ImageLen) -> Option<Message> {
     let msg = encode_sks_raw(OP_SKS_UNWRAP_VEK, seq.value(), len.value());
     Some(msg)
+}
+
+pub(crate) fn encode_sks_new_vek(seq: Sequence, len: ImageLen) -> Message {
+    encode_sks_raw(OP_SKS_NEW_VEK, seq.value(), len.value())
+}
+
+pub(crate) fn encode_sks_new_kek(seq: Sequence, len: ImageLen) -> Message {
+    encode_sks_raw(OP_SKS_NEW_KEK, seq.value(), len.value())
 }
 
 pub(crate) fn encode_sks_unwrap_pfk(seq: Sequence, len: ImageLen) -> Message {
@@ -1329,6 +1368,23 @@ pub(crate) fn encode_sks_device_state_transition(seq: Sequence, len: ImageLen) -
 const OP_SKS_VERIFY_SECRET: u8 = 0x21;
 pub(crate) const SKS_VERIFY_SECRET_NAME: &CStr = c"VERIFY_SECRET";
 pub(crate) const SKS_VERIFY_SECRET_VARIANT: u32 = 1;
+/// Verify-secret flag word for a password validation.
+pub(crate) const SKS_VERIFY_SECRET_PASSWORD: u64 = 0x200;
+/// Its reply body: the variant, then a u64 of returned state flags.
+pub(crate) const SKS_VERIFY_SECRET_REPLY_LEN: usize = 12;
+
+/// The returned state flags of a variant-1 verify-secret reply body, or
+/// `None` for any other shape.
+pub(crate) fn verify_secret_reply_flags(body: &[u8]) -> Option<u64> {
+    if body.len() != SKS_VERIFY_SECRET_REPLY_LEN {
+        return None;
+    }
+    let variant = u32::from_le_bytes(body[0..4].try_into().ok()?);
+    if variant != SKS_VERIFY_SECRET_VARIANT {
+        return None;
+    }
+    Some(u64::from_le_bytes(body[4..12].try_into().ok()?))
+}
 
 pub(crate) fn encode_sks_verify_secret(seq: Sequence, len: ImageLen) -> Option<Message> {
     let msg = encode_sks_raw(OP_SKS_VERIFY_SECRET, seq.value(), len.value());

@@ -1502,22 +1502,32 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		ret = parse_epic_service_init(&ctx, &epic_name, &epic_class, &epic_unit,
 					      ep->dcp->fw_compat == DCP_FIRMWARE_H17P &&
 					      !dcp_is_ext26(ep->dcp));
-		if (ret) {
-			/* These native infrastructure reports have no EPIC identity. */
-			if (dcp_is_ext26(ep->dcp) && ret == -ENOENT &&
-			    (ep->endpoint == SYSTEM_ENDPOINT ||
-			     ep->endpoint == DISP0_ENDPOINT)) {
-				dev_dbg(ep->dcp->dev,
-					 "native26 AFK ep=%#x interface=%u report=%s has no EPIC identity; ignored\n",
-					 ep->endpoint, channel, name);
-				return;
-			}
+		/* These native infrastructure reports have no EPIC identity. */
+		if (dcp_is_ext26(ep->dcp) && ret == -ENOENT &&
+		    (ep->endpoint == SYSTEM_ENDPOINT ||
+		     ep->endpoint == DISP0_ENDPOINT)) {
+			dev_dbg(ep->dcp->dev,
+				 "native26 AFK ep=%#x interface=%u report=%s has no EPIC identity; ignored\n",
+				 ep->endpoint, channel, name);
+			return;
+		}
+		if (ret == -ENOENT &&
+		    ep->dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G) {
+			/*
+			 * M5 (H17G) announces powerlog-service with only
+			 * ep-has-desc-mgr and interface-id; match it by the
+			 * announced name, as for props-less announces.
+			 */
+			epic_name = NULL;
+			epic_class = NULL;
+		} else if (ret) {
 			dev_err(ep->dcp->dev,
 				"AFK[ep:%02x]: failed to extract init props: %d\n",
 				ep->endpoint, ret);
 			return;
+		} else {
+			service_name = epic_class;
 		}
-		service_name = epic_class;
 	} else {
             service_name = name;
         }

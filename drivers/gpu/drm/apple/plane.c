@@ -386,7 +386,7 @@ static u32 drm_format_to_dcp(u32 drm, enum drm_color_range range)
 static enum dcp_xfer_func get_xfer_func(bool is_yuv, enum drm_color_encoding enc)
 {
 	if (!is_yuv)
-		return DCP_XFER_FUNC_SDR;
+		return DCP_XFER_FUNC_SRGB;
 
 	switch (enc) {
 	case DRM_COLOR_YCBCR_BT601:
@@ -395,7 +395,7 @@ static enum dcp_xfer_func get_xfer_func(bool is_yuv, enum drm_color_encoding enc
 	case DRM_COLOR_YCBCR_BT2020:
 		return DCP_XFER_FUNC_BT1886;
 	default:
-		return DCP_XFER_FUNC_SDR;
+		return DCP_XFER_FUNC_SRGB;
 	}
 }
 
@@ -403,7 +403,7 @@ static enum dcp_colorspace get_colorspace(bool is_yuv,
 					  enum drm_color_encoding enc)
 {
 	if (!is_yuv)
-		return DCP_COLORSPACE_NATIVE;
+		return DCP_COLORSPACE_P3_D65;
 
 	switch (enc) {
 	case DRM_COLOR_YCBCR_BT601:
@@ -411,9 +411,9 @@ static enum dcp_colorspace get_colorspace(bool is_yuv,
 	case DRM_COLOR_YCBCR_BT709:
 		return DCP_COLORSPACE_BT709;
 	case DRM_COLOR_YCBCR_BT2020:
-		return DCP_COLORSPACE_BG_BT2020;
+		return DCP_COLORSPACE_BT2020;
 	default:
-		return DCP_COLORSPACE_NATIVE;
+		return DCP_COLORSPACE_P3_D65;
 	}
 }
 
@@ -765,6 +765,7 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 				   u32 iomfb_surf,
 				   bool supports_l10r,
 				   bool supports_xrgb2101010,
+				   bool xrgb_is_alpha,
 				   enum drm_plane_type type,
 				   bool interchange,
 				   bool premultiplied, bool native26)
@@ -781,6 +782,15 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 		if (native26) {
 			fmts = native_formats;
 			num_fmts = ARRAY_SIZE(native_formats);
+		} else if (xrgb_is_alpha) {
+			/*
+			 * The firmware blends the X byte as alpha and ignores the
+			 * opaque-X property: offer only formats with alpha, so that
+			 * compositors write it instead of leaving whatever the
+			 * renderer stored there.
+			 */
+			fmts = dcp_overlay_formats;
+			num_fmts = ARRAY_SIZE(dcp_overlay_formats);
 		} else if (supports_l10r && supports_xrgb2101010) {
 			fmts = dcp_primary_formats;
 			num_fmts = ARRAY_SIZE(dcp_primary_formats);

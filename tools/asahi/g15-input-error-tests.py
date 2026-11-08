@@ -40,9 +40,12 @@ macro_rules! pr_warn { ($($arg:tt)*)=>{{ let _=format_args!($($arg)*); }} }
 macro_rules! mod_pr_debug { ($($arg:tt)*)=>{{ let _=format_args!($($arg)*); }} }
 struct Mutex<T>(StdMutex<T>);impl<T> Mutex<T>{fn lock(&self)->MutexGuard<'_,T>{self.0.lock().unwrap()}}
 struct Mirror{word:*mut i32}
-struct VmStatus{error:AtomicI32,reported_error:AtomicI32,client_closed:AtomicBool,warned:AtomicBool,mirror:Mutex<Option<Mirror>>}
+struct BStr<'a>(&'a [u8]);
+impl<'a> BStr<'a>{fn from_bytes(b:&'a [u8])->Self{Self(b)}}
+impl std::fmt::Display for BStr<'_>{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{write!(f,"{}",String::from_utf8_lossy(self.0))}}
+struct VmStatus{error:AtomicI32,reported_error:AtomicI32,client_closed:AtomicBool,warned:AtomicBool,recovery_guilty:AtomicBool,tgid:i32,comm:[u8;16],mirror:Mutex<Option<Mirror>>}
 impl VmStatus {
- fn new(word:*mut i32)->Self{Self{error:AtomicI32::new(0),reported_error:AtomicI32::new(0),client_closed:AtomicBool::new(false),warned:AtomicBool::new(false),mirror:Mutex(StdMutex::new(Some(Mirror{word})))}}
+ fn new(word:*mut i32)->Self{Self{error:AtomicI32::new(0),reported_error:AtomicI32::new(0),client_closed:AtomicBool::new(false),warned:AtomicBool::new(false),recovery_guilty:AtomicBool::new(false),tgid:1,comm:*b"host-test\0\0\0\0\0\0\0",mirror:Mutex(StdMutex::new(Some(Mirror{word})))}}
 __STATUS__
 }
 mod g17 {use super::*;__POLICY__}

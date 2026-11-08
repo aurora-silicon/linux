@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/thermal/apple,die-temperature-sensor.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T8103 die temperature sensor registers
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  Each channel has a readback register and, where present, independent
+  control, accumulator and alarm registers. Channels share larger PMGR or
+  CPU apertures, so only their individual registers are described here.
+  Register addresses do not describe sensor calibration, alarm thresholds
+  or firmware control sequences. A driver needs a separate calibration
+  handoff before reporting temperatures.
+
+properties:
+  compatible:
+    items:
+      - const: apple,t8103-die-temperature-sensor
+      - const: apple,die-temperature-sensor
+
+  reg:
+    minItems: 2
+    maxItems: 17
+
+  reg-names:
+    minItems: 2
+    maxItems: 17
+    items:
+      enum:
+        - readbk
+        - readbk1
+        - readcnt
+        - readsum
+        - ctl0-clr
+        - ctl0-set
+        - ctl1
+        - ctl1-clr
+        - ctl1-set
+        - ctl2
+        - ctl2-clr
+        - ctl2-set
+        - ctl3-clr
+        - ctl3-set
+        - ctl4-clr
+        - ctl4-set
+        - alarm0
+        - alarm1
+        - alarm2
+        - alarm3
+        - status
+
+required:
+  - compatible
+  - reg
+  - reg-names
+
+additionalProperties: false

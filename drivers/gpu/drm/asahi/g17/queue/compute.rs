@@ -27,6 +27,9 @@ use crate::g17::now_ns;
 /// Descriptor slots per queue. A kick's descriptor is rewritten when the kick 32 slots later
 /// is published; with IN_FLIGHT kicks outstanding at most, that kick has completed by then.
 const DESCRIPTORS: usize = 32;
+// Descriptors and cached records are reused by slot, so both must outlast the in-flight window.
+const _: () =
+    assert!(retirement::IN_FLIGHT <= DESCRIPTORS && retirement::IN_FLIGHT <= RECORD_SLOTS);
 const GRAPH_SIZE: usize = 0x8000;
 const CONTEXT_SIZE: usize = 0x20000;
 const RECORD_STRIDE: usize = 0x1000;
@@ -379,17 +382,23 @@ use crate::g17::{
 use retirement::{Batch, Observation, Recordless, Ticket, IN_FLIGHT};
 
 struct Fifo<T> {
-    entries: [Option<T>; IN_FLIGHT],
+    // On the heap: inline, two windows of IN_FLIGHT entries made Queue's construction frames
+    // too large for the kernel stack.
+    entries: KVec<Option<T>>,
     head: usize,
     len: usize,
 }
 impl<T> Fifo<T> {
-    fn new() -> Self {
-        Self {
-            entries: core::array::from_fn(|_| None),
+    fn new() -> Result<Self> {
+        let mut entries = KVec::with_capacity(IN_FLIGHT, GFP_KERNEL)?;
+        for _ in 0..IN_FLIGHT {
+            entries.push_within_capacity(None).map_err(|_| ENOMEM)?;
+        }
+        Ok(Self {
+            entries,
             head: 0,
             len: 0,
-        }
+        })
     }
     fn front(&self) -> Option<&T> {
         self.entries[self.head].as_ref()
@@ -620,6 +629,7 @@ impl Queue {
         program: ComputeProgram,
     ) -> Result<Self> {
         let Backing { mut pool, mut kick } = backing;
+        let (active, replays) = (Fifo::new()?, Fifo::new()?);
         let mut graph = Graph::new(alloc, objects, &context, pointers, operand_state, program)?;
         let kick_alias = kick.map_client(context.vm())?;
         let pool_alias = pool.map_client(context.vm())?;
@@ -643,8 +653,8 @@ impl Queue {
             kick,
             pool,
             graph,
-            active: Fifo::new(),
-            replays: Fifo::new(),
+            active,
+            replays,
             replay_retirement: false,
             replay_error: None,
             replay_prepared: false,
@@ -1370,7 +1380,7 @@ mod admission_tests {
 
     #[test]
     fn retained_ring_pressure_waits_without_discarding_work() {
-        let mut active = Fifo::new();
+        let mut active = Fifo::new().unwrap();
         for sequence in 0..IN_FLIGHT {
             active.push(sequence).unwrap();
         }

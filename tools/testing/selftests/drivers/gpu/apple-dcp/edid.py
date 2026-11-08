@@ -62,6 +62,7 @@ static unsigned diagnostic_errors,diagnostic_information,legacy_publishes;
 #define DRM_CONNECTOR_REGISTERED 1
 #define DPAVSERV_ENDPOINT_V2 0x2a
 #define DCP_IOMFB_METHODS_H17P_EXTERNAL 2
+#define DCP_IOMFB_METHODS_H17G 7
 #define EPIC_SUBTYPE_STD_SERVICE 0xc0
 #define EPIC_SUBTYPE_ANNOUNCE_H17P 0x11
 #define to_platform_device(x) (x)

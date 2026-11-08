@@ -424,7 +424,9 @@ pub(crate) mod queues {
     // as many as a pair has command records (the render memory's RECORDS).
     pub(crate) const RENDER_PAIRS_PER_OWNER: usize = 1;
     pub(crate) const RENDER_DEPTH: u8 = 32;
-    pub(crate) const COMPUTE_DEPTH: usize = 16;
+    // The firmware stores an ioctl's compute completion stamps only once all of the ioctl's
+    // kicks finished, so finished commands hold their place until the ioctl's longest one ends.
+    pub(crate) const COMPUTE_DEPTH: usize = 32;
 }
 
 /// Read-only recovery evidence, sampled only for selected halted slots.

@@ -19,13 +19,23 @@ allOf:
 
 properties:
   compatible:
-    enum:
-      - apple,t8103-display-crossbar
-      - apple,t8112-display-crossbar
-      - apple,t6000-display-crossbar
-      - apple,t6020-display-crossbar
-      - apple,t6041-display-crossbar
-      - apple,t8132-display-crossbar
+    oneOf:
+      - enum:
+          - apple,t8103-display-crossbar
+          - apple,t8112-display-crossbar
+          - apple,t6000-display-crossbar
+          - apple,t6020-display-crossbar
+          - apple,t6041-display-crossbar
+          - apple,t8132-display-crossbar
+      - items:
+          - const: apple,t8112-display-crossbar
+          - const: apple,t8103-display-crossbar
+      - items:
+          - enum:
+              - apple,t6030-display-crossbar
+              - apple,t6031-display-crossbar
+              - apple,t8122-display-crossbar
+          - const: apple,t6020-display-crossbar
 
   reg:
     maxItems: 1
