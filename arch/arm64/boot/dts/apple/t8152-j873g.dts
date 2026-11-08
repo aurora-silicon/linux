@@ -373,12 +373,6 @@
 };
 
 /* Retain the register view published by this board's live hardware capture. */
-&dwc3_1_dart {
-	reg = <0x4 0xb020000 0x0 0xc000>,
-	      <0x4 0xb040000 0x0 0xc000>;
-};
-
-/* Retain the register view published by this board's live hardware capture. */
 &dwc3_3_dart {
 	reg = <0x4 0x13020000 0x0 0xc000>,
 	      <0x4 0x13040000 0x0 0xc000>;
@@ -500,18 +494,11 @@
 	      <0x3 0xa0000000 0x0 0x8000>;
 };
 
-/* Unexposed chassis port instances remain described and disabled. */
-
-/* Retain the register view published by this board's live hardware capture. */
-&dwc3_2_dart {
-	reg = <0x3 0x83020000 0x0 0xc000>,
-	      <0x3 0x83040000 0x0 0xc000>;
-};
-
 /*
  * The J873g fragments enable and refine nodes of t8152-peripherals.dtsi
- * (the apcie port 2 and dart-sbr DARTs), so they come after it.
+ * (the USB, apcie port 2 and dart-sbr DARTs), so they come after it.
  */
 #include "t8152-j873-nvme.dtsi"
+#include "t8152-j873-usb.dtsi"
 #include "t8152-j873-ethernet.dtsi"
 #include "t8152-j873-audio.dtsi"
