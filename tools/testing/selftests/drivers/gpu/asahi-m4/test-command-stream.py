@@ -73,6 +73,8 @@ const EOVERFLOW: i32 = -75;
 const E2BIG: i32 = -7;
 struct Error; impl Error { fn from_errno(error:i32)->i32 { error } }
 extern crate self as kernel;
+// The parser logs why it refuses a command; check the format arguments, print nothing.
+macro_rules! pr_warn { ($($arg:tt)*) => {{ let _ = format_args!($($arg)*); }}; }
 pub mod bindings { pub const EOPNOTSUPP:i32=95; }
 pub mod prelude { pub type Result<T=()> = core::result::Result<T,i32>; pub const E2BIG:i32=-7; }
 mod uapi { include!("FULL_UAPI"); }

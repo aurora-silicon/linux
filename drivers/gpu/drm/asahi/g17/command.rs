@@ -199,7 +199,34 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// A refused submission reaches userspace as EINVAL alone, which names neither the command
+    /// the parser stopped at nor what it holds. Name both, for the first few of a boot.
     pub(crate) fn next(&mut self) -> Result<Option<Command>> {
+        let head = self.bytes;
+        let result = self.next_parsed();
+        if let Err(error) = &result {
+            static REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            if REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
+                match Reader::new(head).read::<uapi::drm_asahi_cmd_header>() {
+                    Ok(header) => pr_warn!(
+                        "G17: refused a submission ({:?}) at its command of type {}, {} bytes, \
+                         barriers [{:#x}, {:#x}], with {} of the submission's bytes left\n",
+                        error, header.cmd_type, header.size, header.vdm_barrier,
+                        header.cdm_barrier, head.len()
+                    ),
+                    Err(_) => pr_warn!(
+                        "G17: refused a submission ({:?}): its remaining {} bytes are not a \
+                         command header\n",
+                        error,
+                        head.len()
+                    ),
+                }
+            }
+        }
+        result
+    }
+
+    fn next_parsed(&mut self) -> Result<Option<Command>> {
         while !self.bytes.is_empty() {
             let mut reader = Reader::new(self.bytes);
             let header: uapi::drm_asahi_cmd_header = reader.read()?;
@@ -284,6 +311,13 @@ impl<'a> Parser<'a> {
 
     pub(crate) fn finish(&self) -> Result {
         if !self.bytes.is_empty() || self.counts == [0; 2] {
+            pr_warn!(
+                "G17: refused a submission: {} bytes past its last command, {} renders and {} \
+                 dispatches\n",
+                self.bytes.len(),
+                self.counts[0],
+                self.counts[1]
+            );
             return Err(EINVAL);
         }
         Ok(())
@@ -494,7 +528,35 @@ impl Payload {
         }
     }
 
+    /// A refused submission reaches userspace as EINVAL alone, which names neither the command
+    /// nor the requirement it missed. Print the fields the requirements below are written in,
+    /// as userspace sent them, for the first few refusals of a boot.
     pub(crate) fn validate(
+        &self,
+        window: &UscWindow,
+        variant: &super::fw::Variant,
+        space: &impl AddressSpace,
+    ) -> Result<Validated> {
+        let result = self.validate_checked(window, variant, space);
+        if let (Err(error), Self::Render(cmd, ..)) = (&result, self) {
+            static REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            if REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 4 {
+                pr_warn!(
+                    "G17: refused a render ({:?}): {}x{} px, {} layers, {} samples, {} B/sample, \
+                     utile {}x{}, flags {:#x}, vdm {:#x}, scissor {:#x}, dbias {:#x}, oclqry {:#x}, \
+                     usc bg {:#x} eot {:#x} partial bg {:#x} eot {:#x}, samplers {} at {:#x}\n",
+                    error, cmd.width_px, cmd.height_px, cmd.layers, cmd.samples,
+                    cmd.sample_size_B, cmd.utile_width_px, cmd.utile_height_px, cmd.flags,
+                    cmd.vdm_ctrl_stream_base, cmd.isp_scissor_base, cmd.isp_dbias_base,
+                    cmd.isp_oclqry_base, cmd.bg.usc, cmd.eot.usc, cmd.partial_bg.usc,
+                    cmd.partial_eot.usc, cmd.sampler_count, cmd.sampler_heap
+                );
+            }
+        }
+        result
+    }
+
+    fn validate_checked(
         &self,
         window: &UscWindow,
         variant: &super::fw::Variant,
