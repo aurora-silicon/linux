@@ -668,25 +668,42 @@ static int h16_map(struct ane_h16_session *s, size_t size, bool write,
 	return 0;
 }
 
+struct h16_program_binds {
+	struct ane_h16_process_binding bindings[ANE_H16_SURFACES];
+	struct ane_h16_process_binding scratch;
+	unsigned int count;
+};
+
+/* Pure checks of the program and its process descriptors; nothing is mapped. */
+static int h16_program_bind(const struct ane_h16_program *p,
+			    const void *const aux[ANE_H16_AUX_COUNT],
+			    const size_t aux_size[ANE_H16_AUX_COUNT],
+			    struct h16_program_binds *b)
+{
+	int ret;
+
+	ret = ane_h16_process_bindings(&p->hwx, aux[ANE_H16_AUX_GENERIC],
+				       aux_size[ANE_H16_AUX_GENERIC], b->bindings,
+				       &b->count, &b->scratch);
+	if (!ret)
+		ret = ane_h16_operation_validate(&p->snapshot, &p->hwx,
+						 aux[ANE_H16_AUX_OPERATION],
+						 aux_size[ANE_H16_AUX_OPERATION],
+						 b->bindings, b->count, &b->scratch);
+	return ret;
+}
+
 static int h16_program_map(struct ane_h16_session *s, struct ane_h16_program *p,
 			   const void *const aux[ANE_H16_AUX_COUNT],
 			   const size_t aux_size[ANE_H16_AUX_COUNT],
+			   struct h16_program_binds *b,
 			   struct ane_h16_load_layout *layout)
 {
-	struct ane_h16_process_binding bindings[ANE_H16_SURFACES], scratch = {};
+	struct ane_h16_process_binding *bindings = b->bindings, scratch = b->scratch;
 	const struct ane_h16_hwx *hwx = &p->hwx;
-	unsigned int i, j, count;
+	unsigned int i, j, count = b->count;
 	int ret;
 
-	ret = ane_h16_process_bindings(hwx, aux[ANE_H16_AUX_GENERIC],
-				       aux_size[ANE_H16_AUX_GENERIC], bindings, &count,
-				       &scratch);
-	if (!ret)
-		ret = ane_h16_operation_validate(&p->snapshot, hwx, aux[ANE_H16_AUX_OPERATION],
-						 aux_size[ANE_H16_AUX_OPERATION], bindings,
-						 count, &scratch);
-	if (ret)
-		return ret;
 	for (i = 0; i < p->plan.count; i++) {
 		const struct ane_h16_hwx_region *r = &p->plan.regions[i];
 
@@ -787,6 +804,7 @@ int ane_h16_session_load(struct ane_h16_session *s,
 			 struct ane_h16_program **program)
 {
 	struct ane_h16_load_layout layout = {};
+	struct h16_program_binds binds = {};
 	struct ane_h16_program *p;
 	u8 *command;
 	const u8 *reply;
@@ -826,6 +844,14 @@ int ane_h16_session_load(struct ane_h16_session *s,
 		goto free;
 	p->snapshot = *snapshot;
 	/*
+	 * Refuse a program whose process descriptors do not validate before the
+	 * session owns it: nothing is mapped yet, so it can still be freed and
+	 * the next LOAD is not blocked by it.
+	 */
+	ret = h16_program_bind(p, aux, aux_size, &binds);
+	if (ret)
+		goto free;
+	/*
 	 * From the first mapping on, firmware-visible memory exists that is never
 	 * released before reset, so the program becomes the session's here and
 	 * is never freed.
@@ -837,11 +863,17 @@ int ane_h16_session_load(struct ane_h16_session *s,
 	memset(snapshot, 0, sizeof(*snapshot));
 	p->session = s;
 	s->program = p;
-	ret = h16_program_map(s, p, aux, aux_size, &layout);
+	ret = h16_program_map(s, p, aux, aux_size, &binds, &layout);
 	if (!ret)
 		ret = ane_h16_load_encode(command, ANE_H16_LOAD_SIZE, p->slots);
-	if (ret)
+	if (ret) {
+		/*
+		 * Firmware never saw this program. It keeps its mappings until
+		 * reset, but it must not hold the session against the next LOAD.
+		 */
+		p->closed = true;
 		goto out;
+	}
 	ret = h16_send(s, ANE_FW_IO, command, ANE_H16_LOAD_SIZE, &reply);
 	if (!ret)
 		ret = ane_h16_load_reply(reply, ANE_H16_LOAD_SIZE, command, &p->key.program);
