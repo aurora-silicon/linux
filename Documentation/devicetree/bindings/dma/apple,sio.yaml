@@ -22,16 +22,53 @@ allOf:
       properties:
         compatible:
           contains:
-            const: apple,t8140-sio
+            const: apple,t8132-sio
+      required:
+        - compatible
     then:
       properties:
         reg:
+          minItems: 2
+          maxItems: 2
+        clocks:
           minItems: 3
           maxItems: 3
+        status:
+          const: disabled
+      required:
+        - clocks
+        - status
     else:
-      properties:
-        reg:
-          maxItems: 1
+      required:
+        - dma-channels
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t8140-sio
+          then:
+            properties:
+              reg:
+                minItems: 3
+                maxItems: 3
+          else:
+            if:
+              properties:
+                compatible:
+                  contains:
+                    enum:
+                      - apple,t6031-sio
+                      - apple,t8122-sio
+            then:
+              properties:
+                reg:
+                  minItems: 2
+                  maxItems: 2
+            else:
+              properties:
+                reg:
+                  maxItems: 1
 
 properties:
   compatible:
@@ -41,8 +78,11 @@ properties:
               - apple,t6000-sio
               - apple,t6020-sio
               - apple,t6030-sio
+              - apple,t6031-sio
+              - apple,t8122-sio
               - apple,t8103-sio
               - apple,t8112-sio
+              - apple,t8132-sio
               - apple,t8140-sio
           - const: apple,sio
       - description: T6041 firmware requires a generation-specific backend.
@@ -59,6 +99,8 @@ properties:
   clocks:
     minItems: 1
     maxItems: 3
+
+  status: true
 
   '#dma-cells':
     const: 1
@@ -121,7 +163,6 @@ required:
   - compatible
   - reg
   - '#dma-cells'
-  - dma-channels
   - mboxes
   - iommus
   - power-domains

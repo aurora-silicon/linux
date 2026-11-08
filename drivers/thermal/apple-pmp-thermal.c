@@ -740,8 +740,8 @@ static int apple_pmp_thermal_probe(struct platform_device *pdev)
 {
 	const struct apple_pmp_sensor_data *sensors = dev_get_platdata(&pdev->dev);
 
-	/* Only the M4 Airs' sensor topology and operating policy are qualified. */
-	if (!apple_t8132_air())
+	/* The M4 PMP sensor records and the Airs' fanless policy are qualified. */
+	if (!apple_t8132_firmware_path())
 		return -ENODEV;
 	if (!sensors || !sensors->read || !sensors->dev)
 		return -EINVAL;

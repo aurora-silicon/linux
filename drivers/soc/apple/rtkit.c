@@ -118,6 +118,9 @@ enum {
 #define APPLE_RTKIT_MIN_SUPPORTED_VERSION 11
 #define APPLE_RTKIT_MAX_SUPPORTED_VERSION 12
 
+/* Default wait for each handshake reply, see apple_rtkit_set_handshake_timeout() */
+#define APPLE_RTKIT_HANDSHAKE_TIMEOUT_MS 1000
+
 struct apple_rtkit_rx_work {
 	struct apple_rtkit *rtk;
 	u8 ep;
@@ -1401,6 +1404,7 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 	rtk->dev = dev;
 	rtk->cookie = cookie;
 	rtk->ops = ops;
+	rtk->handshake_timeout_ms = APPLE_RTKIT_HANDSHAKE_TIMEOUT_MS;
 	rtk->sync_syslog_ack =
 		of_property_read_bool(dev->of_node, "apple,sync-syslog-ack");
 	INIT_KFIFO(rtk->sync_ack_fifo);
@@ -1480,7 +1484,8 @@ struct apple_rtkit *apple_rtkit_init_adopted(struct device *dev, void *cookie,
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init_adopted);
 
-static int apple_rtkit_wait_for_completion(struct completion *c);
+static int apple_rtkit_wait_for_completion(struct apple_rtkit *rtk,
+					   struct completion *c);
 
 /*
  * apple,sync-syslog-ack (AsahiLinux/linux#607): the mailbox can leave
@@ -1494,9 +1499,9 @@ static int apple_rtkit_wait(struct apple_rtkit *rtk, struct completion *c)
 	int ret;
 
 	if (!rtk->sync_syslog_ack)
-		return apple_rtkit_wait_for_completion(c);
+		return apple_rtkit_wait_for_completion(rtk, c);
 
-	timeout = jiffies + msecs_to_jiffies(1000);
+	timeout = jiffies + msecs_to_jiffies(rtk->handshake_timeout_ms);
 	do {
 		ret = apple_rtkit_poll(rtk);
 		if (ret < 0)
@@ -1524,12 +1529,13 @@ struct apple_rtkit *apple_rtkit_init_adopted_with_buffers(
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init_adopted_with_buffers);
 
-static int apple_rtkit_wait_for_completion(struct completion *c)
+static int apple_rtkit_wait_for_completion(struct apple_rtkit *rtk,
+					   struct completion *c)
 {
+	unsigned long timeout = msecs_to_jiffies(rtk->handshake_timeout_ms);
 	long t;
 
-	t = wait_for_completion_interruptible_timeout(c,
-						      msecs_to_jiffies(1000));
+	t = wait_for_completion_interruptible_timeout(c, timeout);
 	if (t < 0)
 		return t;
 	else if (t == 0)
@@ -1537,6 +1543,13 @@ static int apple_rtkit_wait_for_completion(struct completion *c)
 	else
 		return 0;
 }
+
+void apple_rtkit_set_handshake_timeout(struct apple_rtkit *rtk,
+				       unsigned int timeout_ms)
+{
+	rtk->handshake_timeout_ms = timeout_ms ?: APPLE_RTKIT_HANDSHAKE_TIMEOUT_MS;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_set_handshake_timeout);
 
 int apple_rtkit_reinit(struct apple_rtkit *rtk)
 {
@@ -1661,7 +1674,8 @@ static int apple_rtkit_boot_common(struct apple_rtkit *rtk, bool early_ap_power)
 	/* PMP waits for CoreAnalytics setup before acknowledging IOP power. */
 	if (apple_rtkit_needs_coreanalytics(rtk) &&
 	    test_bit(APPLE_RTKIT_EP_COREANALYTICS, rtk->endpoints)) {
-		ret = apple_rtkit_wait_for_completion(&rtk->coreanalytics_completion);
+		ret = apple_rtkit_wait_for_completion(rtk,
+						      &rtk->coreanalytics_completion);
 		if (ret) {
 			dev_err(rtk->dev, "RTKit: CoreAnalytics readiness failed: %d\n", ret);
 			return ret;

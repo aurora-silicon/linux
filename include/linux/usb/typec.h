@@ -90,6 +90,18 @@ enum typec_orientation {
 	TYPEC_ORIENTATION_REVERSE,
 };
 
+/**
+ * enum typec_contaminant - Type-C connector contaminant state
+ * @TYPEC_CONTAMINANT_UNKNOWN: The connector state could not be determined
+ * @TYPEC_CONTAMINANT_NONE: No contaminant was detected
+ * @TYPEC_CONTAMINANT_LIQUID: Liquid was detected in the connector
+ */
+enum typec_contaminant {
+	TYPEC_CONTAMINANT_UNKNOWN,
+	TYPEC_CONTAMINANT_NONE,
+	TYPEC_CONTAMINANT_LIQUID,
+};
+
 enum usb_mode {
 	USB_MODE_NONE,
 	USB_MODE_USB2,
@@ -291,6 +303,7 @@ enum usb_pd_svdm_ver {
  * @prefer_role: Initial role preference (DRP ports).
  * @accessory: Supported Accessory Modes
  * @usb_capability: Supported USB Modes
+ * @contaminant_detection: Connector contaminant state can be reported
  * @no_mode_control: Ability to manage Alternate Modes
  * @fwnode: Optional fwnode of the port
  * @driver_data: Private pointer for driver specific info
@@ -308,6 +321,7 @@ struct typec_capability {
 	int			prefer_role;
 	enum typec_accessory	accessory[TYPEC_MAX_ACCESSORY];
 	unsigned int		orientation_aware:1;
+	unsigned int		contaminant_detection:1;
 	u8			usb_capability;
 	bool			no_mode_control;
 
@@ -348,6 +362,8 @@ enum typec_data_role typec_get_data_role(struct typec_port *port);
 void typec_set_pwr_role(struct typec_port *port, enum typec_role role);
 void typec_set_vconn_role(struct typec_port *port, enum typec_role role);
 void typec_set_pwr_opmode(struct typec_port *port, enum typec_pwr_opmode mode);
+void typec_set_contaminant(struct typec_port *port,
+			   enum typec_contaminant contaminant);
 
 int typec_set_orientation(struct typec_port *port,
 			  enum typec_orientation orientation);

@@ -10,25 +10,12 @@
 /dts-v1/;
 
 #include "t8132.dtsi"
-#include "t8132-jxxx.dtsi"
+#include "t8132-j713-j715.dtsi"
 #include <dt-bindings/gpio/gpio.h>
 
 / {
 	compatible = "apple,j713", "apple,t8132", "apple,arm-platform";
 	model = "Apple MacBook Air (13-inch, M4, 2025)";
-	chassis-type = "laptop";
-
-	/*
-	 * The speaker amps' shared shutdown line (SDZ, AP GPIO 15, the ADT
-	 * function-reset; low = shutdown). One fixed regulator, the SDZ supply
-	 * of all four, so one amp's fault takes the whole group down.
-	 */
-	speaker_sdz: regulator-sn012776-sdz {
-		compatible = "regulator-fixed";
-		regulator-name = "sn012776-sdz";
-		gpios = <&pinctrl_ap 15 GPIO_ACTIVE_HIGH>;
-		enable-active-high;
-	};
 
 	/*
 	 * The AOP firmware runs the stream (MCA cluster 0, one serializer for
@@ -65,28 +52,19 @@
 	};
 
 	/*
-	 * The headphone jack: the AOP audio component's jack back-end (DAI 4)
-	 * to the CS42L84, as a card of its own.
+	 * Physical size of the firmware framebuffer's 2560x1600 area below the
+	 * notch (13.6" panel, 224 ppi), so simpledrm reports the real DPI.
 	 */
-	sound_jack: sound-jack {
-		compatible = "apple,j713-macaudio-jack", "apple,macaudio";
-		model = "MacBook Air J713 Jack";
-		#address-cells = <1>;
-		#size-cells = <0>;
-
-		dai-link@0 {
-			reg = <0>;
-			link-name = "Headphone Jack";
-
-			cpu {
-				sound-dai = <&aop_audio 4>;
-			};
-
-			codec {
-				sound-dai = <&jack_codec>;
-			};
-		};
+	fb_panel: panel {
+		width-mm = <290>;
+		height-mm = <181>;
+		status = "disabled";
 	};
+};
+
+&sound_jack {
+	compatible = "apple,j713-macaudio-jack", "apple,macaudio";
+	model = "MacBook Air J713 Jack";
 };
 
 &mtp_hid {
@@ -94,8 +72,6 @@
 		firmware-name = "apple/tpmtfw-j713.bin";
 	};
 };
-
-#include "t8132-j713-j715.dtsi"
 
 &aop_audio {
 	apple,chassis-name = "J713";
@@ -174,14 +150,3 @@
 	firmware-name = "apple/mesacal-j713.bin", "apple/msrk-j713.bin";
 };
 
-/ {
-	/*
-	 * Physical size of the firmware framebuffer's 2560x1600 area below the
-	 * notch (13.6" panel, 224 ppi), so simpledrm reports the real DPI.
-	 */
-	fb_panel: panel {
-		width-mm = <290>;
-		height-mm = <181>;
-		status = "disabled";
-	};
-};

@@ -27,6 +27,12 @@ properties:
           - apple,t8140-qspi
       - items:
           - enum:
+              - apple,t6030-qspi
+              - apple,t6031-qspi
+              - apple,t8122-qspi
+          - const: apple,qspi
+      - items:
+          - enum:
               - apple,t6050-qspi
               - apple,t8152-qspi
           - const: apple,t8140-qspi

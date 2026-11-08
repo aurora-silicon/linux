@@ -93,7 +93,8 @@
 	};
 
 	mtp: mtp@294600000 {
-		compatible = "apple,t6050-mtp", "apple,mtp", "apple,rtk-helper-asc4";
+		compatible = "apple,t6050-mtp", "apple,t6050-rtk-helper-asc4", "apple,mtp",
+			     "apple,rtk-helper-asc4";
 		reg = <0x2 0x94600000 0x0 0x4000>,
 		      <0x2 0x94c00000 0x0 0xc4000>;
 		reg-names = "asc", "sram";

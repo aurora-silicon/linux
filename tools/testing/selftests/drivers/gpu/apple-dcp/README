@@ -150,6 +150,15 @@ the real common backlight state/wrappers run with a bounded mock transport,
 covering DPMS-off before delayed work and retaining active plus uncertain
 framebuffers when one of the two required receipts never arrives.
 
+The m4-panel-timing case runs the actual internal-panel timing parser on
+encoded TimingElements reports. The J713 and J715 reports have one element.
+The J604 fixture is the six-element report from macOS 26B123: a preferred
+120 Hz element and five 48-60 Hz ones. Only the preferred ID 2 element is
+adopted, and only with the profile's exact values. The parser refuses a
+changed value, a missing or duplicated ID 2, a second preferred element and
+more elements than the profile allows. This does not show what the firmware
+reports on hardware.
+
 run-native-m4-kms.py defaults to dry run; --compile-only needs libdrm development
 headers and never opens DRM. Explicit --execute requires root, an exact fresh
 source/Image/boot identity, the common appledrm module, a stopped display
