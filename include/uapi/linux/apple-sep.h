@@ -179,4 +179,67 @@ struct sep_bio_rearm {
 
 #define SEP_BIO_REARM _IOW(SEP_BIO_IOC_MAGIC, 0x0f, struct sep_bio_rearm)
 
+/*
+ * /dev/sep-key: P-256 keys created inside the SEP.
+ *
+ * Each key is made by the enclave's key store and bound to this SEP and to
+ * the Linux identity key bag. The private key never leaves the enclave.
+ * Userspace holds only an opaque handle (at most SEP_KEY_HANDLE_MAX bytes)
+ * that works on the Mac that made it and nowhere else; keep it like a key
+ * file. Signing takes a 32-byte digest (for ES256/ecdsa-sha2-nistp256, the
+ * SHA-256 of the message) and returns a DER ECDSA-Sig-Value.
+ *
+ * Interface version 1 has no access control: whoever can open the node and
+ * holds a handle can sign with it. The node is created 0600; distributions
+ * may grant a group. Every 'flags' and 'reserved' field must be zero; later
+ * versions report what they accept in SEP_KEY_GET_INFO.
+ *
+ * Errors: EINVAL for a malformed request or handle, EKEYREJECTED when the
+ * enclave refuses the key (for example a handle from another Mac or an
+ * earlier Linux install), ENODEV/ETIMEDOUT while the key store is not up,
+ * EIO for any other enclave failure.
+ */
+#define SEP_KEY_IFACE_VERSION 1
+#define SEP_KEY_HANDLE_MAX 2048
+#define SEP_KEY_PUB_LEN    65  /* uncompressed point, 04 || X || Y */
+#define SEP_KEY_DIGEST_LEN 32
+#define SEP_KEY_SIG_MAX    72  /* DER SEQUENCE { INTEGER r, INTEGER s } */
+
+struct sep_key_info {
+	__u32 version;          /* SEP_KEY_IFACE_VERSION */
+	__u32 flags_supported;  /* 0 in version 1 */
+	__u32 handle_max;       /* SEP_KEY_HANDLE_MAX */
+	__u32 reserved;
+};
+
+struct sep_key_create {
+	__u32 flags;                            /* in: 0 */
+	__u32 handle_len;                       /* out */
+	__u8  public_key[SEP_KEY_PUB_LEN];      /* out */
+	__u8  reserved[3];                      /* in: 0 */
+	__u8  handle[SEP_KEY_HANDLE_MAX];       /* out */
+};
+
+struct sep_key_sign {
+	__u32 flags;                            /* in: 0 */
+	__u32 handle_len;                       /* in */
+	__u8  digest[SEP_KEY_DIGEST_LEN];       /* in */
+	__u32 sig_len;                          /* out */
+	__u8  signature[SEP_KEY_SIG_MAX];       /* out, zero-padded */
+	__u8  handle[SEP_KEY_HANDLE_MAX];       /* in */
+};
+
+struct sep_key_public {
+	__u32 flags;                            /* in: 0 */
+	__u32 handle_len;                       /* in */
+	__u8  public_key[SEP_KEY_PUB_LEN];      /* out */
+	__u8  reserved[3];                      /* in: 0 */
+	__u8  handle[SEP_KEY_HANDLE_MAX];       /* in */
+};
+
+#define SEP_KEY_GET_INFO _IOR(SEP_BIO_IOC_MAGIC, 0x20, struct sep_key_info)
+#define SEP_KEY_CREATE   _IOWR(SEP_BIO_IOC_MAGIC, 0x21, struct sep_key_create)
+#define SEP_KEY_SIGN     _IOWR(SEP_BIO_IOC_MAGIC, 0x22, struct sep_key_sign)
+#define SEP_KEY_PUBLIC   _IOWR(SEP_BIO_IOC_MAGIC, 0x23, struct sep_key_public)
+
 #endif /* _UAPI_LINUX_APPLE_SEP_H */
