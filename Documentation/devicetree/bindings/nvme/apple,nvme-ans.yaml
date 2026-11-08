@@ -117,7 +117,9 @@ allOf:
         compatible:
           not:
             contains:
-              const: apple,t8152-nvme-ans2
+              enum:
+                - apple,t6050-nvme-ans2
+                - apple,t8152-nvme-ans2
     then:
       required:
         - resets
@@ -195,11 +197,6 @@ allOf:
         resets: false
         power-domains: false
         power-domain-names: false
-    else:
-      required:
-        - resets
-        - power-domains
-        - power-domain-names
 
 required:
   - compatible
