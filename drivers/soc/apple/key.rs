@@ -817,7 +817,12 @@ impl SepData {
             r[5] = self.userbag_lock_phase(user).map(|p| p as i32).unwrap_or(-1);
             let (stale, _) = self.key_context_for(uid, Some((user.special_handle(), &pw[..len])))?;
             r[0] = sign(Some(&stale));
-            self.userbag_lock(user, true, true)?;
+            // Lock for good: the screen lock with an expired grace period.
+            // If the timer-fire answer is not understood, record it and still
+            // measure what the enclave now does with the bag.
+            if let Err(e) = self.userbag_lock(user, true, true) {
+                dev_info!(self.dev, "sep-key: self-test 10: lock returned {:?}\n", e);
+            }
             r[6] = self.userbag_lock_phase(user).map(|p| p as i32).unwrap_or(-1);
             r[1] = sign(Some(&stale));
             self.close_unlock_evaluation(&stale);

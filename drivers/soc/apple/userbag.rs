@@ -900,8 +900,10 @@ impl crate::SepData {
                 })
                 .ok_or(EACCES)?;
             let body = self.userbag_body(crate::sks::SKS_HANDLE_TIMER_FIRE_NAME, &out)?;
-            if decode_timer_fire_reply(body) != Some(user.special_handle().value()) {
-                return Err(EPROTO);
+            let fired = decode_timer_fire_reply(body);
+            if fired != Some(user.special_handle().value()) {
+                dev_info!(self.dev, "userbag: timer fire answered {:?}, expected {}\n", fired, user.special_handle().value());
+                return Err(self.userbag_refused("timer fire", body));
             }
         }
         Ok(())
