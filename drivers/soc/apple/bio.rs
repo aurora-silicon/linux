@@ -216,14 +216,23 @@ pub(crate) struct Lockout {
 /// The re-arm never waits for a capture while Touch ID is not locked, and
 /// it clears pending failed attempts: call it after every verified password.
 pub(crate) const LOCKOUT_FLAG_EVERY_PASSWORD: u32 = 1;
+/// Touch ID waits for the first password since this boot.
+pub(crate) const LOCKOUT_FLAG_AFTER_BOOT: u32 = 2;
 
 impl Lockout {
-    pub(crate) fn new(locked: bool, failures: u32) -> Lockout {
+    /// `locked` is a lockout after failed matches (or one recorded before the
+    /// restart); `after_boot` is the wait for the first password since boot.
+    /// Either one refuses every verify.
+    pub(crate) fn new(locked: bool, after_boot: bool, failures: u32) -> Lockout {
+        let mut flags = LOCKOUT_FLAG_EVERY_PASSWORD;
+        if after_boot {
+            flags |= LOCKOUT_FLAG_AFTER_BOOT;
+        }
         Lockout {
-            locked: u32::from(locked),
+            locked: u32::from(locked || after_boot),
             failures,
             reserved: 0,
-            flags: LOCKOUT_FLAG_EVERY_PASSWORD,
+            flags,
         }
     }
 }
@@ -287,6 +296,7 @@ pub(crate) const IOC_PREPARE_ENROL: u32 = _IOW::<EnrolStart>(MAGIC, 0x0d);
 // On /dev/sep-bio-rearm only.
 pub(crate) const IOC_LOCKOUT_STATE: u32 = _IOR::<Lockout>(MAGIC, 0x0e);
 pub(crate) const IOC_REARM: u32 = _IOW::<Rearm>(MAGIC, 0x0f);
+pub(crate) const IOC_REQUIRE_PASSWORD: u32 = _IO(MAGIC, 0x10);
 
 pub(crate) struct MatchEvidence {
     identity: [u8; UUID_LEN],
