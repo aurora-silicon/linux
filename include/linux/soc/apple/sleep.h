@@ -12,6 +12,7 @@
 #include <linux/types.h>
 
 struct device;
+struct device_node;
 
 #if IS_ENABLED(CONFIG_APPLE_T8140_SLEEP)
 /*
@@ -67,6 +68,18 @@ void apple_sleep_usb_set_asleep(bool asleep);
  * port n. The host that sleeps in place sets them before the freeze and clears them after.
  */
 void apple_sleep_usb_set_wake_ports(unsigned long ports);
+
+/*
+ * For a driver that takes its own power domain down for a sleep and up again, as macOS's USB
+ * host does: @pd is the domain's power controller node. Lowering waits until it reads off.
+ * 0, -ETIMEDOUT, -ENODEV without the sleep driver, or -EINVAL for another node, which leave
+ * the domain alone and which apple_sleep_domain_check() reports beforehand.
+ */
+int apple_sleep_domain_set(struct device_node *pd, bool on);
+int apple_sleep_domain_check(struct device_node *pd);
+
+/* For the PMGR's driver at the wake: a driver took @pd down and brings it up itself. */
+bool apple_sleep_domain_is_down(struct device_node *pd);
 
 /* For the port controller wired to the fixed hub's @port, as it arms USB wake. */
 bool apple_sleep_usb_port_can_wake(unsigned int port);
@@ -150,6 +163,21 @@ static inline void apple_sleep_usb_set_asleep(bool asleep)
 
 static inline void apple_sleep_usb_set_wake_ports(unsigned long ports)
 {
+}
+
+static inline int apple_sleep_domain_set(struct device_node *pd, bool on)
+{
+	return -ENODEV;
+}
+
+static inline int apple_sleep_domain_check(struct device_node *pd)
+{
+	return -ENODEV;
+}
+
+static inline bool apple_sleep_domain_is_down(struct device_node *pd)
+{
+	return false;
 }
 
 static inline bool apple_sleep_usb_port_can_wake(unsigned int port)

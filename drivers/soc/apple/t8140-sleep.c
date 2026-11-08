@@ -393,6 +393,10 @@ struct t8140_sleep {
 	int usb_down_ret;
 	/* Cut, or found already down, for this sleep. */
 	bool usb_down_ran;
+	/* The PMGR block "ps" maps, for the power controllers' nodes. */
+	struct resource ps_res;
+	/* Its words a driver took down with apple_sleep_domain_set() and hasn't raised. */
+	unsigned long *driver_down;
 	void __iomem *clk_mux;
 	void __iomem *mcc[MCC_CHANNELS];
 	void __iomem *ptd;
@@ -996,6 +1000,78 @@ static bool t8140_ps_on(struct t8140_sleep *s, u32 offset)
 {
 	return FIELD_GET(PS_ACTUAL, readl(s->ps + offset));
 }
+
+/* @pd's word in "ps": a power controller node, child of the PMGR that "ps" maps. */
+static int t8140_ps_offset(struct t8140_sleep *s, struct device_node *pd)
+{
+	struct device_node *pmgr __free(device_node) = of_get_parent(pd);
+	struct resource res;
+	u32 off;
+
+	if (!pmgr || of_address_to_resource(pmgr, 0, &res) || res.start != s->ps_res.start ||
+	    of_property_read_u32(pd, "reg", &off) || off % 4 ||
+	    off + 4 > resource_size(&s->ps_res))
+		return -EINVAL;
+
+	return off;
+}
+
+int apple_sleep_domain_check(struct device_node *pd)
+{
+	int off;
+
+	if (!t8140_sleep)
+		return -ENODEV;
+	off = t8140_ps_offset(t8140_sleep, pd);
+	return off < 0 ? off : 0;
+}
+EXPORT_SYMBOL_GPL(apple_sleep_domain_check);
+
+/*
+ * A power domain lowered or raised by its own driver for a sleep, before the commit or after
+ * a refused one, as macOS's drivers do through its PMGR. A lower waits for off. Until the
+ * driver raises it, the PMGR's driver leaves it alone at the wake.
+ */
+int apple_sleep_domain_set(struct device_node *pd, bool on)
+{
+	struct t8140_sleep *s = t8140_sleep;
+	int off, ret = 0;
+	u32 val;
+
+	if (!s)
+		return -ENODEV;
+	off = t8140_ps_offset(s, pd);
+	if (off < 0)
+		return off;
+
+	val = readl(s->ps + off);
+	if (on) {
+		if (FIELD_GET(PS_TARGET, val) != 0xf || FIELD_GET(PS_ACTUAL, val) != 0xf)
+			ret = t8140_ps_raise(s, off);
+		else if (!(val & PS_AUTO_ENABLE))
+			t8140_ps_raise_finish(s, off);
+		if (!ret)
+			clear_bit(off / 4, s->driver_down);
+		return ret;
+	}
+	set_bit(off / 4, s->driver_down);
+	if (FIELD_GET(PS_TARGET, val))
+		t8140_ps_lower(s, off);
+	return t8140_ps_wait_off(s, off);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_domain_set);
+
+bool apple_sleep_domain_is_down(struct device_node *pd)
+{
+	struct t8140_sleep *s = t8140_sleep;
+	int off;
+
+	if (!s)
+		return false;
+	off = t8140_ps_offset(s, pd);
+	return off >= 0 && test_bit(off / 4, s->driver_down);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_domain_is_down);
 
 /*
  * After a refused sleep, the sleep engine's own restart of a firmware's CPU whose domain shares
@@ -1899,11 +1975,14 @@ static int t8140_sleep_raise_apcie(struct t8140_sleep *s)
 static void t8140_sleep_lower_io(struct t8140_sleep *s)
 {
 	/*
-	 * USB's complex, deepest first: macOS has it off here, and its drivers don't lower it.
-	 * A host that sleeps in place keeps ATC0_USB_AON, as macOS's does.
+	 * USB's complex, deepest first. macOS's host lowers ATC0_USB and ATC0_COMMON in its own
+	 * suspend, so here they're only lowered for a host that didn't. A host that sleeps in
+	 * place keeps ATC0_USB_AON, as macOS's does.
 	 */
-	t8140_ps_lower(s, PS_ATC0_USB);
-	t8140_ps_lower(s, PS_ATC0_COMMON);
+	if (FIELD_GET(PS_TARGET, readl(s->ps + PS_ATC0_USB)))
+		t8140_ps_lower(s, PS_ATC0_USB);
+	if (FIELD_GET(PS_TARGET, readl(s->ps + PS_ATC0_COMMON)))
+		t8140_ps_lower(s, PS_ATC0_COMMON);
 	if (!READ_ONCE(t8140_usb_asleep))
 		t8140_ps_lower(s, PS_ATC0_USB_AON);
 	if (s->pcie_ans_stopped) {
@@ -3035,6 +3114,14 @@ static int t8140_sleep_probe(struct platform_device *pdev)
 	ret = t8140_sleep_map_regs(s);
 	if (ret)
 		return ret;
+	ret = of_address_to_resource(dev->of_node,
+				     of_property_match_string(dev->of_node, "reg-names", "ps"),
+				     &s->ps_res);
+	if (ret)
+		return ret;
+	s->driver_down = devm_bitmap_zalloc(dev, resource_size(&s->ps_res) / 4, GFP_KERNEL);
+	if (!s->driver_down)
+		return -ENOMEM;
 
 	ret = t8140_sleep_read_wake_sources(s);
 	if (ret)
