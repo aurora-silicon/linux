@@ -208,15 +208,22 @@ pub(crate) struct Lockout {
     pub(crate) locked: u32,
     /// Failed matches since the last match or re-arm.
     pub(crate) failures: u32,
-    pub(crate) reserved: [u32; 2],
+    pub(crate) reserved: u32,
+    /// `LOCKOUT_FLAG_*`: what this driver's re-arm does.
+    pub(crate) flags: u32,
 }
+
+/// The re-arm never waits for a capture while Touch ID is not locked, and
+/// it clears pending failed attempts: call it after every verified password.
+pub(crate) const LOCKOUT_FLAG_EVERY_PASSWORD: u32 = 1;
 
 impl Lockout {
     pub(crate) fn new(locked: bool, failures: u32) -> Lockout {
         Lockout {
             locked: u32::from(locked),
             failures,
-            reserved: [0; 2],
+            reserved: 0,
+            flags: LOCKOUT_FLAG_EVERY_PASSWORD,
         }
     }
 }

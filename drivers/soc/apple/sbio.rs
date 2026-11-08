@@ -1588,7 +1588,7 @@ impl SepData {
             {
                 // Not a restore: the enclave did not take the record (macOS
                 // discards such a record). The host record keeps the count.
-                dev_warn!(
+                dev_info!(
                     self.dev,
                     "sbio: LOAD_LOCKOUT refused the saved lockout record (0x8002, it does not match the restored catacombs); the failed-attempt count comes from the host record\n"
                 );
@@ -2457,6 +2457,12 @@ impl SepData {
             return;
         }
 
+        if self.match_scope_gen.load(Relaxed) != self.bio_open_gen.load(Relaxed) {
+            if let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) {
+                self.settle_owed_enclave_failures(user);
+            }
+        }
+
         let Some(token_bytes) = self.mint_token_bytes() else {
             dev_err!(self.dev, "verify: could not draw a result token\n");
             self.finish_verify(
@@ -2679,7 +2685,10 @@ impl SepData {
         }
         let streak_before = self.bio_nomatch_streak.load(Relaxed);
         match &outcome {
-            bio::VerifyOutcome::Matched(_) => self.bio_nomatch_streak.store(0, Relaxed),
+            bio::VerifyOutcome::Matched(_) => {
+                self.bio_nomatch_streak.store(0, Relaxed);
+                self.enclave_failures_owed.store(false, Relaxed);
+            }
             bio::VerifyOutcome::NoMatch => {
                 self.bio_nomatch_streak.fetch_add(1, Relaxed);
             }
@@ -5073,12 +5082,17 @@ impl SepData {
             return Ok(());
         }
         let user = crate::sbio::UserId::new(SBIO_PROBE_USER_ID).ok_or(EINVAL)?;
+        if !self.bio_lockout.load(Relaxed) {
+            self.clear_failures_after_password(user);
+            return Ok(());
+        }
         // Under the same lock as verify, enrolment and deletion, so the
         // credential never changes under a match.
         let rearmed = loop {
             self.wait_until_awake()?;
             let _writer = self.catacomb_writer.lock();
             if !self.bio_lockout.load(Relaxed) {
+                // Another re-arm got there first.
                 return Ok(());
             }
             if !self.capture_begin() {
@@ -5118,6 +5132,85 @@ impl SepData {
             );
         }
         Ok(())
+    }
+
+    /// A password authentication while Touch ID is not locked. On macOS the
+    /// password's verification of the user's key bag clears the enclave's
+    /// failed-attempt count, not only the prompt's: after a missed prompt
+    /// and a password, the next prompt again has five attempts. Clear the
+    /// host's count and record at once, then the enclave's with the same
+    /// key bag verification a re-arm does. A verify holds the sensor lock
+    /// for its whole wait for a touch, and a lock screen takes the password
+    /// while one waits, so never hold the password authentication up behind
+    /// it: when the lock is taken, the enclave's count is cleared at the
+    /// start of the next authentication instead.
+    fn clear_failures_after_password(&self, user: crate::sbio::UserId) {
+        let failures = self.bio_nomatch_streak.xchg(0, Relaxed);
+        if failures == 0 {
+            return;
+        }
+        if !self.write_lockout_record(false) {
+            dev_warn!(
+                self.dev,
+                "Touch ID: could not record the cleared failed attempts in {}\n",
+                LOCKOUT_RECORD
+            );
+        }
+        let Some(_writer) = self.catacomb_writer.try_lock() else {
+            self.enclave_failures_owed.store(true, Relaxed);
+            dev_info!(
+                self.dev,
+                "Touch ID: a password authentication cleared {} failed attempt(s); a capture is running, so the enclave's count is cleared at the start of the next authentication\n",
+                failures
+            );
+            return;
+        };
+        if !self.capture_begin() {
+            self.enclave_failures_owed.store(true, Relaxed);
+            dev_info!(
+                self.dev,
+                "Touch ID: a password authentication cleared {} failed attempt(s); suspending, so the enclave's count is cleared at the start of the next authentication\n",
+                failures
+            );
+            return;
+        }
+        self.enclave_failures_owed.store(false, Relaxed);
+        let cleared = self.clear_enclave_lockout(user).is_some();
+        self.capture_end();
+        self.report_enclave_failures_cleared(failures, cleared);
+    }
+
+    /// The enclave's count still owed a clear by a password that came while
+    /// a capture ran. Called at the start of an authentication, with the
+    /// sensor lock held.
+    fn settle_owed_enclave_failures(&self, user: crate::sbio::UserId) {
+        if !self.enclave_failures_owed.xchg(false, Relaxed) {
+            return;
+        }
+        let cleared = self.clear_enclave_lockout(user).is_some();
+        self.report_enclave_failures_cleared(0, cleared);
+    }
+
+    fn report_enclave_failures_cleared(&self, failures: u32, cleared: bool) {
+        if cleared {
+            if failures > 0 {
+                dev_info!(
+                    self.dev,
+                    "Touch ID: a password authentication cleared {} failed attempt(s), in the enclave too\n",
+                    failures
+                );
+            } else {
+                dev_info!(
+                    self.dev,
+                    "Touch ID: the enclave's failed attempts were cleared after the password that came during a capture\n"
+                );
+            }
+        } else {
+            dev_warn!(
+                self.dev,
+                "Touch ID: a password authentication cleared the host's failed attempts, but the enclave's verification did not complete; the enclave may still lock at its own count, and the next password then re-arms in full\n"
+            );
+        }
     }
 
     /// The enclave side of a re-arm. `Some(true)` when the enclave announced
