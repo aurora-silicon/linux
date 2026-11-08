@@ -53,6 +53,7 @@
 #include <linux/usb/usbnet.h>
 #include <linux/usb/cdc.h>
 #include <linux/usb/cdc_ncm.h>
+#include <linux/unaligned.h>
 
 #if IS_ENABLED(CONFIG_USB_NET_CDC_MBIM)
 static bool prefer_mbim = true;
@@ -133,7 +134,175 @@ static void cdc_ncm_get_strings(struct net_device __always_unused *netdev, u32 s
 
 static void cdc_ncm_update_rxtx_max(struct usbnet *dev, u32 new_rx, u32 new_tx);
 
+/*
+ * Wake-on-LAN through the Ethernet power management pattern filters of the
+ * CDC Ethernet functional descriptor (bNumberPowerFilters; requests
+ * SET/GET_ETHERNET_POWER_MANAGEMENT_PATTERN_FILTER, which NCM functions take
+ * over from ECM). While the function is suspended with remote wakeup
+ * enabled, it compares every received frame with the loaded patterns and
+ * wakes the host on a match.
+ *
+ * A pattern matches at fixed offsets from the destination address, so
+ * WAKE_MAGIC loads one pattern for each usual framing of a magic packet
+ * (6 bytes of 0xff, then the station address 16 times): UDP over IPv4
+ * without options, the Wake-on-LAN EtherType, and UDP over IPv6 without
+ * extension headers. The destination address is not compared, so broadcast
+ * and directed magic packets both match. Other traffic does not wake.
+ */
+#define CDC_NCM_WOL_PAYLOAD_LEN	(6 + 16 * ETH_ALEN)
+#define CDC_NCM_ETH_P_WOL	0x0842	/* EtherType of a bare magic packet */
+
+struct cdc_ncm_wol_frame {
+	__be16 proto;
+	u8 payload;
+	u8 nmatch;
+	struct {
+		u8 off;
+		u8 val;
+	} match[2];
+};
+
+static const struct cdc_ncm_wol_frame cdc_ncm_wol_frames[] = {
+	/* IPv4 header without options (version 4, IHL 5), protocol UDP */
+	{ cpu_to_be16(ETH_P_IP), ETH_HLEN + 20 + 8, 2,
+	  { { ETH_HLEN, 0x45 }, { ETH_HLEN + 9, IPPROTO_UDP } } },
+	{ cpu_to_be16(CDC_NCM_ETH_P_WOL), ETH_HLEN, 0 },
+	/* IPv6 next header UDP */
+	{ cpu_to_be16(ETH_P_IPV6), ETH_HLEN + 40 + 8, 1,
+	  { { ETH_HLEN + 6, IPPROTO_UDP } } },
+};
+
+static void cdc_ncm_wol_byte(u8 *mask, u8 *pattern, unsigned int off, u8 val)
+{
+	mask[off / 8] |= BIT(off % 8);
+	pattern[off] = val;
+}
+
+static int cdc_ncm_wol_load(struct usbnet *dev, u16 filter,
+			    const struct cdc_ncm_wol_frame *f)
+{
+	struct cdc_ncm_ctx *ctx = (struct cdc_ncm_ctx *)dev->data[0];
+	u16 ifnum = ctx->control->cur_altsetting->desc.bInterfaceNumber;
+	unsigned int len = f->payload + CDC_NCM_WOL_PAYLOAD_LEN;
+	unsigned int mask_size = DIV_ROUND_UP(len, 8);
+	unsigned int i, off;
+	u8 *buf, *mask, *pattern;
+	__le16 active = 0;
+	int ret;
+
+	/* MaskSize, Mask, then the frame bytes up to the last masked one */
+	buf = kzalloc(2 + mask_size + len, GFP_NOIO);
+	if (!buf)
+		return -ENOMEM;
+	put_unaligned_le16(mask_size, buf);
+	mask = buf + 2;
+	pattern = mask + mask_size;
+
+	cdc_ncm_wol_byte(mask, pattern, 12, be16_to_cpu(f->proto) >> 8);
+	cdc_ncm_wol_byte(mask, pattern, 13, be16_to_cpu(f->proto) & 0xff);
+	for (i = 0; i < f->nmatch; i++)
+		cdc_ncm_wol_byte(mask, pattern, f->match[i].off, f->match[i].val);
+	off = f->payload;
+	for (i = 0; i < 6; i++)
+		cdc_ncm_wol_byte(mask, pattern, off++, 0xff);
+	for (i = 0; i < 16 * ETH_ALEN; i++)
+		cdc_ncm_wol_byte(mask, pattern, off++, dev->net->dev_addr[i % ETH_ALEN]);
+
+	ret = usbnet_write_cmd_nopm(dev, USB_CDC_SET_ETHERNET_PM_PATTERN_FILTER,
+				    USB_TYPE_CLASS | USB_DIR_OUT | USB_RECIP_INTERFACE,
+				    filter, ifnum, buf, 2 + mask_size + len);
+	kfree(buf);
+	if (ret < 0)
+		return ret;
+
+	/* A pattern that does not fit leaves the filter inactive */
+	ret = usbnet_read_cmd_nopm(dev, USB_CDC_GET_ETHERNET_PM_PATTERN_FILTER,
+				   USB_TYPE_CLASS | USB_DIR_IN | USB_RECIP_INTERFACE,
+				   filter, ifnum, &active, sizeof(active));
+	if (ret < 0)
+		return ret;
+	if (ret != sizeof(active) || !le16_to_cpu(active))
+		return -ENOSPC;
+	return 0;
+}
+
+static void cdc_ncm_wol_clear(struct usbnet *dev)
+{
+	struct cdc_ncm_ctx *ctx = (struct cdc_ncm_ctx *)dev->data[0];
+	u16 ifnum = ctx->control->cur_altsetting->desc.bInterfaceNumber;
+	u16 filter;
+
+	/* wLength 0 removes the pattern of a filter */
+	for (filter = 0; filter < ctx->wol_loaded; filter++)
+		usbnet_write_cmd_nopm(dev, USB_CDC_SET_ETHERNET_PM_PATTERN_FILTER,
+				      USB_TYPE_CLASS | USB_DIR_OUT | USB_RECIP_INTERFACE,
+				      filter, ifnum, NULL, 0);
+	ctx->wol_loaded = 0;
+}
+
+/* Load the WAKE_MAGIC patterns before a system sleep that may wake us */
+static void cdc_ncm_wol_arm(struct usbnet *dev)
+{
+	struct cdc_ncm_ctx *ctx = (struct cdc_ncm_ctx *)dev->data[0];
+	u16 filter;
+	int ret;
+
+	if (!(ctx->wolopts & WAKE_MAGIC) || !device_may_wakeup(&dev->udev->dev))
+		return;
+
+	for (filter = 0; filter < ctx->wol_filters; filter++) {
+		ret = cdc_ncm_wol_load(dev, filter, &cdc_ncm_wol_frames[filter]);
+		if (ret)
+			netdev_warn(dev->net,
+				    "wake-on-lan pattern %u not loaded: %d\n",
+				    filter, ret);
+	}
+	ctx->wol_loaded = ctx->wol_filters;
+}
+
+static void cdc_ncm_get_wol(struct net_device *net, struct ethtool_wolinfo *wol)
+{
+	struct usbnet *dev = netdev_priv(net);
+	struct cdc_ncm_ctx *ctx = (struct cdc_ncm_ctx *)dev->data[0];
+
+	if (!ctx->wol_filters)
+		return;
+
+	wol->supported = WAKE_MAGIC;
+	if (device_may_wakeup(&dev->udev->dev))
+		wol->wolopts = ctx->wolopts;
+}
+
+static int cdc_ncm_set_wol(struct net_device *net, struct ethtool_wolinfo *wol)
+{
+	struct usbnet *dev = netdev_priv(net);
+	struct cdc_ncm_ctx *ctx = (struct cdc_ncm_ctx *)dev->data[0];
+
+	if (!ctx->wol_filters)
+		return -EOPNOTSUPP;
+	if (wol->wolopts & ~WAKE_MAGIC)
+		return -EINVAL;
+
+	ctx->wolopts = wol->wolopts;
+	return device_set_wakeup_enable(&dev->udev->dev, !!wol->wolopts);
+}
+
+static void cdc_ncm_wol_init(struct usbnet *dev)
+{
+	struct cdc_ncm_ctx *ctx = (struct cdc_ncm_ctx *)dev->data[0];
+	struct usb_host_config *config = dev->udev->actconfig;
+
+	if (!ctx->ether_desc || !ctx->ether_desc->bNumberPowerFilters ||
+	    !(config->desc.bmAttributes & USB_CONFIG_ATT_WAKEUP))
+		return;
+
+	ctx->wol_filters = min_t(unsigned int, ctx->ether_desc->bNumberPowerFilters,
+				 ARRAY_SIZE(cdc_ncm_wol_frames));
+}
+
 static const struct ethtool_ops cdc_ncm_ethtool_ops = {
+	.get_wol		= cdc_ncm_get_wol,
+	.set_wol		= cdc_ncm_set_wol,
 	.get_link		= usbnet_get_link,
 	.nway_reset		= usbnet_nway_reset,
 	.get_drvinfo		= usbnet_get_drvinfo,
@@ -1066,6 +1235,8 @@ EXPORT_SYMBOL_GPL(cdc_ncm_select_altsetting);
 
 static int cdc_ncm_bind(struct usbnet *dev, struct usb_interface *intf)
 {
+	int ret;
+
 	/* MBIM backwards compatible function? */
 	if (cdc_ncm_select_altsetting(intf) != CDC_NCM_COMM_ALTSETTING_NCM)
 		return -ENODEV;
@@ -1074,7 +1245,10 @@ static int cdc_ncm_bind(struct usbnet *dev, struct usb_interface *intf)
 	 * Additionally, generic NCM devices are assumed to accept arbitrarily
 	 * placed NDP.
 	 */
-	return cdc_ncm_bind_common(dev, intf, CDC_NCM_DATA_ALTSETTING_NCM, 0);
+	ret = cdc_ncm_bind_common(dev, intf, CDC_NCM_DATA_ALTSETTING_NCM, 0);
+	if (!ret)
+		cdc_ncm_wol_init(dev);
+	return ret;
 }
 
 static void cdc_ncm_align_tail(struct sk_buff *skb, size_t modulus, size_t remainder, size_t max)
@@ -2130,14 +2304,40 @@ static const struct usb_device_id cdc_devs[] = {
 };
 MODULE_DEVICE_TABLE(usb, cdc_devs);
 
+/*
+ * Both interfaces of the function come here; the patterns go with the
+ * control interface, which suspends after and resumes before the data one.
+ */
+static int cdc_ncm_suspend(struct usb_interface *intf, pm_message_t message)
+{
+	struct usbnet *dev = usb_get_intfdata(intf);
+	struct cdc_ncm_ctx *ctx = (struct cdc_ncm_ctx *)dev->data[0];
+
+	if (intf == ctx->control && !PMSG_IS_AUTO(message))
+		cdc_ncm_wol_arm(dev);
+
+	return usbnet_suspend(intf, message);
+}
+
+static int cdc_ncm_resume(struct usb_interface *intf)
+{
+	struct usbnet *dev = usb_get_intfdata(intf);
+	struct cdc_ncm_ctx *ctx = (struct cdc_ncm_ctx *)dev->data[0];
+
+	if (intf == ctx->control && ctx->wol_loaded)
+		cdc_ncm_wol_clear(dev);
+
+	return usbnet_resume(intf);
+}
+
 static struct usb_driver cdc_ncm_driver = {
 	.name = "cdc_ncm",
 	.id_table = cdc_devs,
 	.probe = usbnet_probe,
 	.disconnect = usbnet_disconnect,
-	.suspend = usbnet_suspend,
-	.resume = usbnet_resume,
-	.reset_resume =	usbnet_resume,
+	.suspend = cdc_ncm_suspend,
+	.resume = cdc_ncm_resume,
+	.reset_resume =	cdc_ncm_resume,
 	.supports_autosuspend = 1,
 	.disable_hub_initiated_lpm = 1,
 };

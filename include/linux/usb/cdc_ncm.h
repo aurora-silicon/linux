@@ -148,6 +148,11 @@ struct cdc_ncm_ctx {
 	u32 tx_reason_timeout;
 	u32 tx_reason_max_datagram;
 	u64 tx_overhead;
+
+	/* Wake-on-LAN through the CDC power management pattern filters */
+	u8 wol_filters;		/* patterns WAKE_MAGIC may load, 0 if none */
+	u8 wol_loaded;		/* filters to clear at resume */
+	u32 wolopts;
 	u64 tx_ntbs;
 	u64 rx_overhead;
 	u64 rx_ntbs;
