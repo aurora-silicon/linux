@@ -264,6 +264,11 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 			dev_dbg(dchid->dev, "No OF node for subdevice %s, ignoring\n", name);
 			return NULL;
 		}
+		if (!of_device_is_available(of_node)) {
+			dev_dbg(dchid->dev, "Subdevice %s is disabled, ignoring\n", name);
+			of_node_put(of_node);
+			return NULL;
+		}
 
 		of_property_read_u32(of_node, "apple,power-method", &power_method);
 		firmware_managed_reset =

@@ -480,7 +480,10 @@ properties:
 
       - description: Apple M5 Pro SoC based platforms
         items:
-          - const: apple,j716s  # MacBook Pro (16-inch, M5 Pro, 2026)
+          - enum:
+              - apple,j716s # MacBook Pro (16-inch, M5 Pro, 2026)
+              - apple,k114s # MacBook Pro (14-inch PROLED XDR, M5 Pro, 2026)
+              - apple,k116s # MacBook Pro (16-inch PROLED XDR, M5 Pro, 2026)
           - const: apple,t6050
           - const: apple,arm-platform
 
@@ -489,6 +492,8 @@ properties:
           - enum:
               - apple,j714c # MacBook Pro (14-inch, M5 Max, 2026)
               - apple,j716c # MacBook Pro (16-inch, M5 Max, 2026)
+              - apple,k114c # MacBook Pro (14-inch PROLED XDR, M5 Max, 2026)
+              - apple,k116c # MacBook Pro (16-inch PROLED XDR, M5 Max, 2026)
           - const: apple,t6050
           - const: apple,arm-platform
 

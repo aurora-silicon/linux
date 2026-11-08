@@ -60,17 +60,13 @@
 	};
 };
 
-/* Blocks t6050-die0.dtsi does not describe yet: the keyboard backlight PWM and the third HPM bus */
-&die0 {
-	/* ADT pwm0: 0x505040000, clock gate FPWM0 */
-	fpwm0: pwm@505040000 {
-		compatible = "apple,t6050-fpwm", "apple,s5l-fpwm";
-		reg = <0x5 0x05040000 0x0 0x4000>;
-		power-domains = <&ps_fpwm0>;
-		clocks = <&clkref>;
-		#pwm-cells = <2>;
-	};
+/* The keyboard backlight PWM (ADT pwm0) */
+&fpwm0 {
+	status = "okay";
+};
 
+/* A block t6050-die0.dtsi does not describe yet: the third HPM bus */
+&die0 {
 	/*
 	 * ADT nub-spmi-a1, the right-hand port's HPM bus (hpm2). Polled like a0:
 	 * the generation 4 driver takes no interrupt. pmgr NUB_SPMI_A1 is
@@ -81,17 +77,6 @@
 		reg = <0x2 0x8a1a8000 0x0 0x4000>;
 		#address-cells = <2>;
 		#size-cells = <0>;
-	};
-};
-
-/* pmgr FPWM0, group 1 + 0x2a8; its SIO parent is left undescribed, as for ps_i2c1/2 */
-&pmgr1 {
-	ps_fpwm0: power-controller@2a8 {
-		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x2a8 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "fpwm0";
 	};
 };
 
