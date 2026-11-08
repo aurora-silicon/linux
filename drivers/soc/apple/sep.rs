@@ -18,6 +18,7 @@ mod dt;
 mod fv;
 mod hwrng;
 mod image;
+mod key;
 mod keybag;
 mod keybag_identity;
 mod os_identity;
@@ -763,6 +764,10 @@ struct SepData {
     #[pin]
     rearm_dev: Mutex<Option<shim::BioChardev>>,
 
+    // /dev/sep-key: P-256 keys created inside the SEP (see `key`).
+    #[pin]
+    key_dev: Mutex<Option<shim::BioChardev>>,
+
     // The enclave refused to match (MATCH_RESULT answered 0x1) after failed
     // attempts, or the lockout survived a restart. Every verify is refused
     // without a capture until a password authentication re-arms Touch ID.
@@ -1041,6 +1046,7 @@ impl SepData {
                 bio_index <- new_mutex!(bio_index),
                 bio_dev <- new_mutex!(None),
                 rearm_dev <- new_mutex!(None),
+                key_dev <- new_mutex!(None),
                 bio_lockout: Atomic::new(false),
                 bio_lockout_logged: Atomic::new(false),
                 bio_nomatch_streak: Atomic::new(0),
@@ -2618,6 +2624,8 @@ impl SepData {
         let dev = self.bio_dev.lock().take();
         drop(dev);
         let dev = self.rearm_dev.lock().take();
+        drop(dev);
+        let dev = self.key_dev.lock().take();
         drop(dev);
 
         self.rng_shutdown.store(true, Relaxed);

@@ -1898,6 +1898,14 @@ impl SepData {
                 e
             );
         }
+        if let Err(e) = self.register_key() {
+            dev_err!(
+                self.dev,
+                "bringup: could not publish /dev/{}: {:?}\n",
+                crate::key::DEVICE_NAME,
+                e
+            );
+        }
     }
 
     fn activate_touchid(&self) -> Result<()> {

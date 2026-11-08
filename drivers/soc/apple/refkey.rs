@@ -309,37 +309,44 @@ impl SepData {
     }
 
     /// Op `osgn`: ECDSA-P256 over `challenge` as the pre-computed digest.
+    /// `EKEYREJECTED` when the enclave refuses the operation (for example a
+    /// ref-key record another SEP or another key bag made), `EIO` for no or
+    /// a malformed reply.
     fn sks_refkey_sign(
         &self,
         handle: crate::sks::KeyBagHandle,
         refkey_blob: &[u8],
         challenge: &[u8],
-    ) -> Option<KVec<u8>> {
+    ) -> Result<KVec<u8>> {
         use crate::der::RefKeyValue as RV;
         let mut items: KVec<(&[u8], RV<'_>)> = KVec::new();
-        items.push((b"o", RV::Utf8(b"osgn")), GFP_KERNEL).ok()?;
-        items.push((b"d", RV::Octets(challenge)), GFP_KERNEL).ok()?;
-        items.push((b"rk", RV::Der(refkey_blob)), GFP_KERNEL).ok()?;
-        let der = crate::der::encode_refkey_set(&items).ok()?;
-        let out = self.sks_send(self.sks_req_refkey(handle.value(), &der))?;
+        items.push((b"o", RV::Utf8(b"osgn")), GFP_KERNEL)?;
+        items.push((b"d", RV::Octets(challenge)), GFP_KERNEL)?;
+        items.push((b"rk", RV::Der(refkey_blob)), GFP_KERNEL)?;
+        let der = crate::der::encode_refkey_set(&items)?;
+        let out = self
+            .sks_send(self.sks_req_refkey(handle.value(), &der))
+            .ok_or(EIO)?;
         if out.reply.status != 0 {
             dev_warn!(
                 self.dev,
-                "sks: ref-key attest sign failed (status {})\n",
+                "sks: ref-key sign refused by the enclave (status {})\n",
                 out.reply.status
             );
-            return None;
+            return Err(EKEYREJECTED);
         }
-        let body = self.sks_report_response(crate::sks::SKS_PERFORM_OP_NAME, &out)?;
+        let body = self
+            .sks_report_response(crate::sks::SKS_PERFORM_OP_NAME, &out)
+            .ok_or(EIO)?;
         let mut f = proto::FieldCursor::new(body);
         let (Some(0), Some(sig)) = (f.i32(), f.blob()) else {
-            return None;
+            return Err(EIO);
         };
         // Enclave wraps the sig in OCTET STRING { SEQUENCE { r, s } }; strip to inner DER.
         let der_sig = crate::der::octet_string_body(sig).unwrap_or(sig);
         let mut owned: KVec<u8> = KVec::new();
-        owned.extend_from_slice(der_sig, GFP_KERNEL).ok()?;
-        Some(owned)
+        owned.extend_from_slice(der_sig, GFP_KERNEL)?;
+        Ok(owned)
     }
 
     /// Attestation of key possession by signing proof; op `oa` (attestation-chained)
@@ -371,7 +378,70 @@ impl SepData {
         });
         let sig = self.sks_refkey_sign(handle, &blob, challenge);
         let _ = self.sks_send(self.sks_req_unload_keybag(handle));
-        Ok((sig.ok_or(EIO)?, pubk))
+        Ok((sig?, pubk))
+    }
+
+    /// Runs `op` with the identity key bag loaded and unlocked, as a trusted
+    /// key unseal does, and unloads the bag afterwards whatever `op` returns.
+    fn with_identity_bag<T>(
+        &self,
+        op: impl FnOnce(crate::sks::KeyBagHandle, &[u8]) -> Result<T>,
+    ) -> Result<T> {
+        self.wait_for_trusted_ready()?;
+        let keybag::State::Present(stored) = keybag::read(keybag::Slot::Identity)? else {
+            return Err(ENODEV);
+        };
+        let (handle, _uuid) = self.sks_recover(&stored).ok_or(EIO)?;
+        let unlocked = crate::xart_guard::policy_window(|| {
+            if self.profile.key_store == profile::KeyStore::Variant5 {
+                if let Some(healthy) = self.sks_health_check(c"sep-key unlock") {
+                    let _ = self.sks_send(self.sks_req_change_lock_state(
+                        handle,
+                        LockState::Unlocked,
+                        stored.secret(),
+                        healthy,
+                    ));
+                }
+                true
+            } else {
+                self.sks_prepare_identity_refkey(handle, stored.secret())
+            }
+        });
+        let result = if unlocked {
+            op(handle, stored.secret())
+        } else {
+            Err(EIO)
+        };
+        let _ = self.sks_send(self.sks_req_unload_keybag(handle));
+        result
+    }
+
+    /// `/dev/sep-key` create: a new enclave P-256 ref-key under the identity
+    /// key bag. Returns its record and public point; the private half stays
+    /// in the enclave.
+    pub(crate) fn user_key_create(&self) -> Result<(KVec<u8>, [u8; refkey_seal::POINT_LEN])> {
+        let blob = self.with_identity_bag(|handle, secret| {
+            self.sks_create_refkey(handle, secret).ok_or(EIO)
+        })?;
+        let mut point = [0u8; refkey_seal::POINT_LEN];
+        point.copy_from_slice(Self::refkey_pub(&blob).ok_or(EIO)?);
+        Ok((blob, point))
+    }
+
+    /// The public point recorded in a ref-key record; no enclave round trip.
+    pub(crate) fn user_key_public(blob: &[u8]) -> Result<[u8; refkey_seal::POINT_LEN]> {
+        let mut point = [0u8; refkey_seal::POINT_LEN];
+        point.copy_from_slice(Self::refkey_pub(blob).ok_or(EINVAL)?);
+        Ok(point)
+    }
+
+    /// `/dev/sep-key` sign: the enclave's ECDSA-P256 over `digest` with the
+    /// key in `blob`. A record this SEP and key bag did not make is refused
+    /// by the enclave (`EKEYREJECTED`).
+    pub(crate) fn user_key_sign(&self, blob: &[u8], digest: &[u8; 32]) -> Result<KVec<u8>> {
+        // A record without a public point is not a ref-key record at all.
+        Self::refkey_pub(blob).ok_or(EINVAL)?;
+        self.with_identity_bag(|handle, _secret| self.sks_refkey_sign(handle, blob, digest))
     }
 
     /// Enclave ECIES-decrypt (o = "oecd"); takes the ephemeral from the front of `d`.
