@@ -17,6 +17,8 @@
 	aliases {
 		serial0 = &serial0;
 		serial1 = &dockchannel;
+		bluetooth0 = &bluetooth0;
+		wifi0 = &wifi0;
 	};
 
 	chosen {
@@ -316,5 +318,7 @@
 #include "t8142-j704-peripherals.dtsi"
 #include "t8142-j704-usb.dtsi"
 #include "t8142-j704-avd.dtsi"
+#include "t8142-j704-nvme.dtsi"
+#include "t8142-j704-pcie.dtsi"
 #include "t8142-j704-power.dtsi"
 #include "t8142-j704-hwmon.dtsi"
