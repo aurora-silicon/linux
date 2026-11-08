@@ -61,12 +61,13 @@ struct brcmf_cfg80211_vif { unsigned long sme_state; int wdev; struct brcmf_cfg8
 struct brcmf_if { struct brcmf_cfg80211_vif *vif; struct brcmf_pub *drvr; struct net_device *ndev;
  unsigned netif_stop; int netif_stop_lock, bsscfgidx; };
 struct device { void *data; };
-struct pci_dev { struct device dev; };
+struct pci_dev { struct device dev; int irq; bool state_saved; };
 struct brcmf_pciedev_info { bool mbdata_completed, intr, ready, timer;
+ bool wowl_irq, wowl_enabled, irq_wake_enabled;
  int state, mbdata_resp_wait; void *ci; struct pci_dev *pdev;
  struct { int intmask; } *reginfo; };
 struct pcie_priv { struct brcmf_pciedev_info *devinfo; };
-struct brcmf_bus { enum brcmf_bus_state state; struct brcmf_pub *drvr;
+struct brcmf_bus { enum brcmf_bus_state state; struct brcmf_pub *drvr; bool wowl_transport, wowl_wake;
  struct { struct pcie_priv *pcie; } bus_priv; };
 struct brcmf_proto { void *pd; };
 struct brcmf_pub { struct brcmf_bus *bus_if; struct brcmf_if *iflist[BRCMF_MAX_IFS];
@@ -75,7 +76,7 @@ struct brcmf_cfg80211_info { struct brcmf_pub *pub;
  bool suspended, country_pending, force_band_setup; char country_alpha2[2];
 unsigned long scan_status; struct wiphy *wiphy;
 struct {struct brcmf_cfg80211_vif *first;} vif_list;
-struct {bool active, nd_enabled; int pre_pmmode;} wowl; };
+struct {bool active, nd_enabled, lpas; int pre_pmmode;} wowl; };
 struct wiphy { struct brcmf_cfg80211_info *cfg; };
 struct regulatory_request { char alpha2[2]; int initiator; };
 struct brcmf_fil_country_le { char alpha2[2]; };
@@ -144,6 +145,14 @@ static void cancel_work_sync(struct work_struct *w) {
  assert(msgbuf.tx_suspended);w->queued=false;cancels++;
 }
 static void brcmf_pcie_fwcon_timer(struct brcmf_pciedev_info *d,bool on) {d->timer=on;}
+#define PM_SUSPEND_TO_IDLE 1
+static int pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
+static bool device_may_wakeup(struct device *d) {(void)d;return true;}
+static int enable_irq_wake(int irq) {(void)irq;return 0;}
+static int pci_save_state(struct pci_dev *p) {p->state_saved=true;return 0;}
+static void pci_restore_state(struct pci_dev *p) {p->state_saved=false;}
+static void brcmf_pcie_disable_irq_wake(struct brcmf_pciedev_info *d) {d->irq_wake_enabled=false;}
+static int brcmf_pcie_pm_leave_D3(struct device *dev);
 static int brcmf_pcie_send_mb_data(struct brcmf_pciedev_info *d,int mb) {
  if(mb==BRCMF_H2D_HOST_D3_INFORM) {
   assert(ndev[0].stopped && ndev[1].stopped && ndev[0].drains && ndev[1].drains);
@@ -170,7 +179,16 @@ CALLBACK_STUBS = r'''
 #define WLAN_REASON_UNSPECIFIED 1
 #define test_bit(i,p) ((*(p)&BIT(i))!=0)
 #define list_for_each_entry(v,h,m) for ((v)=(h)->first;(v);(v)=(v)->next)
-struct cfg80211_wowlan {int unused;};
+struct cfg80211_wowlan {bool any;};
+#define BRCMF_FEAT_WOWL 3
+#define BRCMF_FEAT_LPAS 4
+#define GFP_KERNEL 0
+static unsigned lpas_restores, wake_reports;
+static void cfg80211_report_wowlan_wakeup(int *w,void *i,int g) {(void)w;(void)i;(void)g;wake_reports++;}
+static int brcmf_configure_lpas(struct brcmf_cfg80211_info *c,struct brcmf_if *i) {(void)c;(void)i;can_command();return 0;}
+static int brcmf_restore_lpas(struct brcmf_cfg80211_info *c,struct brcmf_if *i) {
+ (void)i;assert(bus.state==BRCMF_BUS_UP);lpas_restores++;c->wowl.lpas=c->wowl.active=false;return failure==4?-EIO:0;
+}
 static bool vif_up;
 static struct net_device *cfg_to_ndev(struct brcmf_cfg80211_info *c) {return c->pub->iflist[0]->ndev;}
 static struct brcmf_if *netdev_priv(struct net_device *n) {return &ifp[n-ndev];}
@@ -189,7 +207,7 @@ static void brcmf_bus_wowl_config(struct brcmf_bus *b,bool e) {(void)b;(void)e;}
 static void brcmf_link_down(struct brcmf_cfg80211_vif *v,int r,bool b) {(void)v;(void)r;(void)b;can_command();}
 static void brcmf_delay(int t) {(void)t;}
 static void brcmf_set_mpc(struct brcmf_if *i,int v) {(void)i;(void)v;can_command();}
-static void brcmf_configure_wowl(struct brcmf_cfg80211_info *c,struct brcmf_if *i,struct cfg80211_wowlan *w) {(void)c;(void)i;(void)w;can_command();}
+static int brcmf_configure_wowl(struct brcmf_cfg80211_info *c,struct brcmf_if *i,struct cfg80211_wowlan *w) {(void)c;(void)i;(void)w;can_command();return 0;}
 static void brcmf_keepalive_start(struct brcmf_if *i,int n) {(void)i;(void)n;can_command();}
 '''
 
@@ -268,6 +286,16 @@ for(int up=0;up<2;up++)for(int fail=0;fail<2;fail++) {
   brcmf_msgbuf_txflow_worker(&msgbuf.txflow_work);
   assert(!msgbuf.pending && creates==1 && txflows==2 && !msgbuf.flow_map[0]);cases++;
  }
+ /* An LPAS resume restores firmware policy and still leaves the suspended
+  * state, so a country hint deferred across the sleep is applied. */
+ for(int fail=0;fail<2;fail++) {
+  reset();lpas_restores=wake_reports=0;static struct brcmf_cfg80211_vif lv;ifp[0].vif=&lv;assert(!brcmf_pcie_pm_enter_D3(&device));
+  cfg.suspended=cfg.wowl.active=cfg.wowl.lpas=true;hint("GB");assert(!country_gets && cfg.country_pending);
+  assert(!brcmf_pcie_pm_leave_D3(&device));failure=fail?4:0;
+  assert(brcmf_cfg80211_resume(&wiphy)==(fail?-EIO:0));
+  assert(lpas_restores==1 && wake_reports==1 && !cfg.suspended && !cfg.wowl.active);
+  assert(!cfg.country_pending && country_gets==1 && !memcmp(applied,"GB",2));cases++;
+ }
  reset();ack=false;assert(brcmf_pcie_pm_enter_D3(&device)==-EIO);
  assert(bus.state==BRCMF_BUS_UP && !msgbuf.tx_suspended && devinfo.timer && !ndev[0].stopped);cases++;
  for(int cold=0;cold<2;cold++)for(int fail=0;fail<2;fail++) {
@@ -285,7 +313,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--out', type=Path)
     parser.add_argument('--mutation', choices=['country-gate', 'queue-reasons', 'worker-gate',
-                                              'resume-order', 'tx-drain'])
+                                              'resume-order', 'tx-drain', 'lpas-resume'])
     args = parser.parse_args()
     sources = {name: (DRIVER / (name + '.c')).read_text()
                for name in ('cfg80211', 'core', 'pcie', 'msgbuf')}
@@ -312,6 +340,9 @@ def main():
     elif args.mutation == 'resume-order':
         body = body.replace('brcmf_pcie_intr_enable(devinfo);',
                             'brcmf_bus_change_state(bus, BRCMF_BUS_UP);\n\t\tbrcmf_pcie_intr_enable(devinfo);')
+    elif args.mutation == 'lpas-resume':
+        body = body.replace('err = brcmf_restore_lpas(cfg, ifp);\n\t\t\tgoto out;',
+                            'return brcmf_restore_lpas(cfg, ifp);')
     elif args.mutation == 'tx-drain':
         body = body.replace('netif_tx_disable(ifp->ndev);', '(void)ifp;')
     code = PREFIX.replace('/* STOP_REASONS */', reasons) + CALLBACK_STUBS + body + MAIN
