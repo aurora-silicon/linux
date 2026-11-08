@@ -164,7 +164,8 @@ static void apple_jpeg_layout_test(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, apple_jpeg_t6041.layout, wide);
 	KUNIT_EXPECT_PTR_NE(test, legacy, wide);
 	KUNIT_EXPECT_TRUE(test, wide->reset_complete);
-	KUNIT_EXPECT_FALSE(test, legacy->reset_complete);
+	KUNIT_EXPECT_TRUE(test, legacy->reset_complete);
+	KUNIT_EXPECT_EQ(test, legacy->num_defaults, 111);
 	KUNIT_EXPECT_EQ(test, wide->dma_addr_bits, 64);
 	KUNIT_EXPECT_EQ(test, legacy->dma_addr_bits, 32);
 	KUNIT_EXPECT_EQ(test, wide->input_plane0, 0x090);
@@ -209,7 +210,7 @@ static void apple_jpeg_layout_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, legacy->decode_block_base, 0x130);
 	KUNIT_EXPECT_EQ(test, apple_jpeg_t8140.int_done_mask, BIT(31));
 	KUNIT_EXPECT_EQ(test, apple_jpeg_t8112.int_done_mask, BIT(31) | BIT(30));
-	KUNIT_EXPECT_EQ(test, apple_jpeg_t6000.int_done_mask, BIT(31) | BIT(30));
+	KUNIT_EXPECT_EQ(test, apple_jpeg_t6000.int_done_mask, BIT(31));
 }
 
 static void apple_jpeg_older_hwrev_test(struct kunit *test)
@@ -328,6 +329,30 @@ static void apple_jpeg_defaults_test(struct kunit *test)
 	/* Wide reset literals must not leak into the legacy image. */
 	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, 0x280), 0xdeadbeef);
 	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, 0x2b0), 0xdeadbeef);
+	/* The sparse scratch block: one non-zero default, holes stay holes. */
+	KUNIT_EXPECT_EQ(test, n, 112);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, 0x234), 0x1f40);
+	for (u32 off = 0x1fc; off <= 0x25c; off += 4) {
+		if (off == 0x20c || off == 0x210 || off == 0x234 || off == 0x238 ||
+		    off == 0x24c)
+			continue;
+		KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, off), 0);
+	}
+	for (u32 off = 0x1a0; off <= 0x1d4; off += 4) {
+		if (off == 0x1a4 || off == 0x1b8)
+			continue;
+		KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, off), 0);
+	}
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, 0x1a4), 0xdeadbeef);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, 0x1b8), 0xdeadbeef);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, 0x20c), 0xdeadbeef);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, 0x210), 0xdeadbeef);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, 0x238), 0xdeadbeef);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, 0x24c), 0xdeadbeef);
+	n = apple_jpeg_defaults(legacy, false, w, APPLE_JPEG_MAX_WRITES);
+	KUNIT_EXPECT_EQ(test, n, 112);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, 0x160), 0);
+	KUNIT_EXPECT_EQ(test, apple_jpeg_defaults(legacy, true, w, 111), -ENOSPC);
 	KUNIT_EXPECT_EQ(test, apple_jpeg_defaults(wide, true, w, 1), -ENOSPC);
 	KUNIT_EXPECT_EQ(test, apple_jpeg_defaults(legacy, true, w, 1), -ENOSPC);
 }
