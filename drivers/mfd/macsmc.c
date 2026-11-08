@@ -63,9 +63,15 @@ static const struct mfd_cell apple_smc_devs[] = {
 static const struct mfd_cell apple_smc_low_gpio_dev =
 	MFD_CELL_OF("macsmc-low-gpio", NULL, NULL, 0, 0, "apple,smc-low-gpio");
 
-/* T8152 currently exposes read-only telemetry; firmware owns fan control. */
+/*
+ * T8152: temperatures and fans (hwmon; the fan keys are read-only unless the
+ * unsafe fan_control parameter is set) and power off/restart (reboot, which
+ * only writes the MBSE key). Notifications, GPIO and the power supply are not
+ * qualified there yet.
+ */
 static const struct mfd_cell apple_smc_telemetry_devs[] = {
 	MFD_CELL_OF("macsmc-hwmon", NULL, NULL, 0, 0, "apple,smc-hwmon"),
+	MFD_CELL_OF("macsmc-reboot", NULL, NULL, 0, 0, "apple,smc-reboot"),
 };
 
 static void apple_smc_read_sram(struct apple_smc *smc, void *buf, size_t size)
@@ -546,7 +552,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 		return dev_err_probe(smc->dev, ret, "Failed to get key count");
 	smc->key_count = be32_to_cpu(count);
 
-	/* Notifications, GPIO and power management are not qualified on T8152. */
+	/* T8152: key reads and writes are qualified; notifications and GPIO are not. */
 	if (of_device_is_compatible(dev->of_node, "apple,t8152-smc"))
 		return devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
 					    apple_smc_telemetry_devs,

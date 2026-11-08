@@ -1,0 +1,258 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J873g audio: the AOP (always-on processor) owns the audio fabric, as
+ * on T8140. iBoot loads the AOP firmware (j873gaop) and leaves the CPU
+ * stopped; Linux starts it. The jack codec (CS42L84) and the speaker amp
+ * (SN012776) are on AP I2C buses; their data goes through AOP services on
+ * the base-ns ADMAC. Resources are from the 26A434 ADT: aop, dart-sbr,
+ * admac-base-ns, iop-audio-controller, i2c1, i2c3, pmgr.
+ */
+#include <dt-bindings/gpio/gpio.h>
+
+/*
+ * ADT dart-sbr (sbr_dart in t8152-peripherals.dtsi), shared with the PMP:
+ * mapper-aop 0, mapper-admac-base-ns 42. iBoot leaves streams 0, 1 and 42
+ * translating (root slot 16 owned by the firmware) without setting the
+ * lock bit.
+ */
+&sbr_dart {
+	apple,retain-translation;
+	status = "okay";
+};
+
+/ {
+	soc {
+		/*
+		 * ADT aop: iop,ascwrap-v8, msgbox-mailbox-num 0, using-alias,
+		 * not post-office: mailbox 0, aperture 1 of the bank at reg[2]
+		 * (0x310740000) = 0x310740080. ADT interrupts [627, 626, 628];
+		 * the first two in the SMC order (send-empty, recv-not-empty).
+		 */
+		aop_mbox: mailbox@310740080 {
+			compatible = "apple,t8152-ascwrap-v8-mailbox";
+			reg = <0x3 0x10740080 0x0 0x80>;
+			interrupts = <AIC_IRQ 627 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 626 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+		};
+
+		/*
+		 * ADT admac-base-ns (admac-evolution,t8152): 13 TX and 13 RX
+		 * channels, interrupt destination 0, dart-sbr stream 42.
+		 */
+		admac_base_ns: dma-controller@313900000 {
+			compatible = "apple,t8152-admac";
+			reg = <0x3 0x13900000 0x0 0xb4000>;
+			dma-channels = <26>;
+			interrupts-extended = <&aic AIC_IRQ 640 IRQ_TYPE_LEVEL_HIGH>,
+					      <0>, <0>, <0>;
+			#dma-cells = <1>;
+			iommus = <&sbr_dart 42>;
+			/* slot 17: slot 16 of stream 42 belongs to the firmware */
+			apple,dma-range = <0x110 0x0 0x0 0x10000000>;
+		};
+
+		/*
+		 * The AOP's PMGR (ADT pmgr devices AUDIO_MCA0_M..AUDIO_MCA5_M at
+		 * 0x308284400 + 0x20 * N). Their parent audio_p is the
+		 * firmware's: it is up while a service is in pw0 or pwrd.
+		 */
+		pmgr_aop: power-management@308284000 {
+			compatible = "apple,t8152-pmgr", "apple,t8103-pmgr",
+				     "syscon", "simple-mfd";
+			#address-cells = <1>;
+			#size-cells = <1>;
+			reg = <0x3 0x08284000 0x0 0x1000>;
+
+			ps_audio_mca0_m: power-controller@400 {
+				compatible = "apple,t8152-pmgr-pwrstate",
+					     "apple,t8103-pmgr-pwrstate";
+				reg = <0x400 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "audio_mca0_m";
+			};
+
+			ps_audio_mca1_m: power-controller@420 {
+				compatible = "apple,t8152-pmgr-pwrstate",
+					     "apple,t8103-pmgr-pwrstate";
+				reg = <0x420 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "audio_mca1_m";
+			};
+
+			ps_audio_mca2_m: power-controller@440 {
+				compatible = "apple,t8152-pmgr-pwrstate",
+					     "apple,t8103-pmgr-pwrstate";
+				reg = <0x440 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "audio_mca2_m";
+			};
+
+			ps_audio_mca3_m: power-controller@460 {
+				compatible = "apple,t8152-pmgr-pwrstate",
+					     "apple,t8103-pmgr-pwrstate";
+				reg = <0x460 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "audio_mca3_m";
+			};
+
+			ps_audio_mca4_m: power-controller@480 {
+				compatible = "apple,t8152-pmgr-pwrstate",
+					     "apple,t8103-pmgr-pwrstate";
+				reg = <0x480 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "audio_mca4_m";
+			};
+
+			ps_audio_mca5_m: power-controller@4a0 {
+				compatible = "apple,t8152-pmgr-pwrstate",
+					     "apple,t8103-pmgr-pwrstate";
+				reg = <0x4a0 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "audio_mca5_m";
+			};
+		};
+
+		/* ADT i2c1: the CS42L84 jack codec (and the aqc NIC's EEPROM). */
+		i2c1: i2c@331014000 {
+			compatible = "apple,t8152-i2c", "apple,t8103-i2c";
+			reg = <0x3 0x31014000 0x0 0x4000>;
+			clocks = <&clkref>;
+			interrupts = <AIC_IRQ 1414 IRQ_TYPE_LEVEL_HIGH>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			power-domains = <&ps_i2c1>;
+
+			/*
+			 * ADT audio-codec-output: function-reset GPIO 0xcc,
+			 * interrupt on gpio0 pin 203.
+			 */
+			jack_codec: codec@4b {
+				compatible = "cirrus,cs42l84";
+				reg = <0x4b>;
+				reset-gpios = <&pinctrl_ap 204 GPIO_ACTIVE_HIGH>;
+				interrupts-extended = <&pinctrl_ap 203 IRQ_TYPE_LEVEL_LOW>;
+				#sound-dai-cells = <0>;
+				sound-name-prefix = "Jack";
+			};
+		};
+
+		/* ADT i2c3: the SN012776 speaker amplifier. */
+		i2c3: i2c@33101c000 {
+			compatible = "apple,t8152-i2c", "apple,t8103-i2c";
+			reg = <0x3 0x3101c000 0x0 0x4000>;
+			clocks = <&clkref>;
+			interrupts = <AIC_IRQ 1416 IRQ_TYPE_LEVEL_HIGH>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			power-domains = <&ps_i2c3>;
+
+			/*
+			 * ADT audio-speaker: function-reset GPIO 0xca, interrupt
+			 * on gpio0 pin 193, speaker-config rx_slot 0,
+			 * vsense_slot 0, isense_slot 2.
+			 */
+			speaker_amp: codec@38 {
+				compatible = "ti,sn012776", "ti,tas2764";
+				reg = <0x38>;
+				shutdown-gpios = <&pinctrl_ap 202 GPIO_ACTIVE_HIGH>;
+				interrupts-extended = <&pinctrl_ap 193 IRQ_TYPE_LEVEL_LOW>;
+				#sound-dai-cells = <0>;
+				ti,imon-slot-no = <2>;
+				ti,vmon-slot-no = <0>;
+				/* the AOP's speaker frame: 250 BCLKs at 12 MHz */
+				ti,bclk-ratio = <250>;
+			};
+		};
+
+		aop: aop@310c00000 {
+			compatible = "apple,t8152-aop";
+			reg = <0x3 0x10c00000 0x0 0x1e0000>,
+			      <0x3 0x10600000 0x0 0x4000>;
+			reg-names = "mmio", "asc";
+			mboxes = <&aop_mbox>;
+			mbox-names = "mbox";
+			iommus = <&sbr_dart 0>;
+			/* slot 17: slot 16 belongs to the firmware */
+			apple,dma-range = <0x110 0x0 0x10 0x0>;
+
+			/*
+			 * Bound by name to the firmware's "audio" EPIC service.
+			 * ADT iop-audio-controller: cout/cin on base-ns TX5/RX5,
+			 * spkr on TX1 with its sense data on RX1; Linux ADMAC
+			 * channel = 2 * N for TX N, 2 * N + 1 for RX N.
+			 */
+			aop_audio: audio {
+				compatible = "apple,t8152-aop-audio";
+				dmas = <&admac_base_ns 10>, <&admac_base_ns 11>,
+				       <&admac_base_ns 2>, <&admac_base_ns 3>;
+				dma-names = "cout", "cin", "spkr", "sense";
+				power-domains = <&ps_audio_mca0_m>, <&ps_audio_mca1_m>,
+						<&ps_audio_mca2_m>, <&ps_audio_mca3_m>,
+						<&ps_audio_mca4_m>, <&ps_audio_mca5_m>;
+				power-domain-names = "mca0", "mca1", "mca2",
+						     "mca3", "mca4", "mca5";
+				#sound-dai-cells = <1>;
+			};
+		};
+	};
+
+	sound {
+		compatible = "apple,j873-macaudio", "apple,macaudio";
+		model = "Mac mini J873";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&aop_audio 0>;
+			};
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+
+		dai-link@1 {
+			reg = <1>;
+			link-name = "Speaker";
+
+			cpu {
+				sound-dai = <&aop_audio 3>;
+			};
+			codec {
+				sound-dai = <&speaker_amp>;
+			};
+		};
+	};
+};
+
+/* The I2C power states (PMGR, parent SIO_CPU is always on). */
+&pmgr {
+	ps_i2c1: power-controller@cc0 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0xcc0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "i2c1";
+	};
+
+	ps_i2c3: power-controller@d00 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0xd00 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "i2c3";
+	};
+};

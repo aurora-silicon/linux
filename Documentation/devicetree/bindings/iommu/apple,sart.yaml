@@ -26,6 +26,9 @@ description:
   SART3, first seen in M1 Pro/Max, extends both the address space and filter
   entry size to 42 bit.
 
+  SART4, found in T8152 (M6), moves the configuration, address and size
+  registers into separate arrays.
+
 properties:
   compatible:
     oneOf:
@@ -45,6 +48,7 @@ properties:
           - apple,t6000-sart
           - apple,t8015-sart
           - apple,t8103-sart
+          - apple,t8152-sart
 
   reg:
     maxItems: 1

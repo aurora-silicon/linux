@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J873g ANS2 NVMe.
+ * iBoot leaves the ANS firmware running with the NVMe controller disabled;
+ * the driver wakes it with a fresh RTKit handshake (as m1n1 does). NVMe
+ * registers and NVMMU share the 0x325cc0000 window. The mailbox is the ANS
+ * post-office window (msgbox-mailbox-num 3, no alias: 0x316000000 +
+ * 0x10300). No PMGR power or reset yet.
+ * Resources are from the 26A434 ADT: ans, sart-ans.
+ */
+
+/ {
+	soc {
+		ans_mbox: mailbox@316010300 {
+			compatible = "apple,t8152-ans-mailbox";
+			reg = <0x3 0x16010300 0x0 0x80>;
+			#mbox-cells = <0>;
+		};
+
+		sart: iommu@325c50000 {
+			compatible = "apple,t8152-sart";
+			reg = <0x3 0x25c50000 0x0 0xc000>;
+		};
+
+		nvme: nvme@325cc0000 {
+			compatible = "apple,t8152-nvme-ans2";
+			reg = <0x3 0x25cc0000 0x0 0x60000>,
+			      <0x3 0x21600000 0x0 0x4000>;
+			reg-names = "nvme", "ans";
+			interrupts = <AIC_IRQ 1349 IRQ_TYPE_LEVEL_HIGH>;
+			mboxes = <&ans_mbox>;
+			apple,sart = <&sart>;
+		};
+	};
+};
