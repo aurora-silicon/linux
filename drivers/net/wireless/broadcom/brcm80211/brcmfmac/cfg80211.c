@@ -4358,6 +4358,7 @@ static int brcmf_lpas_eventmask_enable(u8 *mask, size_t mask_len,
 
 static int brcmf_lpas_filter_add(struct brcmf_if *ifp)
 {
+	static const u8 mask_and_pattern[] = { 0x01, 0x00 };
 	struct brcmf_pkt_filter_le *filter;
 	size_t size;
 	int err;
@@ -4376,8 +4377,9 @@ static int brcmf_lpas_filter_add(struct brcmf_if *ifp)
 	filter->negate_match = cpu_to_le32(0);
 	filter->u.pattern.offset = cpu_to_le32(0);
 	filter->u.pattern.size_bytes = cpu_to_le32(1);
-	filter->u.pattern.mask_and_pattern[0] = 0x01;
-	filter->u.pattern.mask_and_pattern[1] = 0x00;
+	memcpy((u8 *)filter + offsetof(struct brcmf_pkt_filter_le,
+					     u.pattern.mask_and_pattern),
+	       mask_and_pattern, sizeof(mask_and_pattern));
 
 	err = brcmf_fil_iovar_data_set(ifp, "pkt_filter_add", filter, size);
 	kfree(filter);
