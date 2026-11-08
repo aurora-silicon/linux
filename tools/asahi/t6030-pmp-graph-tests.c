@@ -22,6 +22,7 @@ typedef uint8_t u8;
 #define IS_ENABLED(x) (x)
 #define CONFIG_APPLE_T6030_GPU_PMP_LINK 1
 #define PMP_REPORT_READY 1
+#define PMP_DVFS_STATE_READY_TIMEOUT_US 50000
 #define GFP_KERNEL 0
 #define GENPD_FLAG_ACTIVE_WAKEUP 1
 #define GENPD_FLAG_IRQ_SAFE 2
@@ -101,6 +102,8 @@ struct generic_pm_domain {
 struct apple_pmp_report_offsets {
 	u32 tgt_read, tgt_write, actual, status, fast_die, fast_die_lanes;
 	u32 update, dvfs_first, dvfs_count;
+	u32 dvfs_state, dvfs_state_entry;
+	u64 dvfs_state_prime;
 	bool starts_pmp;
 	const char *name, *fallback, *pwrstate;
 	bool devices_ordered;
@@ -159,9 +162,13 @@ struct apple_pmp_report {
 	struct apple_pmp_start *start;
 	/* Requests held until the PMP runs; T6030 does not defer them. */
 	u64 shadow, known;
+	u64 request_word;
+	bool request_word_known;
 	/* Provider-owned whole-word DVFS shadows; unused by T6030. */
 	u64 dvfs_words[64];
 	u64 dvfs_known;
+	u64 dvfs_state_prime_word;
+	bool dvfs_state_prime_sent, dvfs_state_ready;
 	bool defer;
 	unsigned int polls;
 	struct delayed_work ready_work;
