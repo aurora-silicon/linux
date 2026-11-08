@@ -3683,6 +3683,7 @@ static const struct t8140_sleep_soc t8140_soc = {
 };
 
 static const struct t8140_sleep_soc t8132_soc = {
+	.aic_compat = "apple,t8132-aic3",
 	.regs = t8132_sleep_regs,
 	.n_regs = ARRAY_SIZE(t8132_sleep_regs),
 	.commit = t8132_sleep_commit,

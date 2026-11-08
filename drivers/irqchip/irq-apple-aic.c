@@ -1241,8 +1241,9 @@ static struct syscore aic_syscore = {
 
 static void __init aic_sleep_init(struct aic_irq_chip *irqc, struct device_node *node)
 {
-	/* The only Apple SoC with a suspend-to-RAM path. */
-	if (!of_device_is_compatible(node, "apple,t8140-aic3"))
+	/* The Apple SoCs with a suspend-to-RAM path. */
+	if (!of_device_is_compatible(node, "apple,t8140-aic3") &&
+	    !of_device_is_compatible(node, "apple,t8132-aic3"))
 		return;
 
 	aic_sleep.irq_cfg = kcalloc(irqc->nr_die * irqc->nr_irq, sizeof(u32), GFP_KERNEL);
