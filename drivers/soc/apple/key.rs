@@ -817,12 +817,33 @@ impl SepData {
             r[5] = self.userbag_lock_phase(user).map(|p| p as i32).unwrap_or(-1);
             let (stale, _) = self.key_context_for(uid, Some((user.special_handle(), &pw[..len])))?;
             r[0] = sign(Some(&stale));
-            // Lock for good: the screen lock with an expired grace period.
-            // If the timer-fire answer is not understood, record it and still
-            // measure what the enclave now does with the bag.
-            if let Err(e) = self.userbag_lock(user, true, true) {
-                dev_info!(self.dev, "sep-key: self-test 10: lock returned {:?}\n", e);
+            // Lock for good: the screen lock, then grace-timer fires (as the
+            // Mac's kernel sends them) until the store locks the bag, for at
+            // most LOCK_WAIT_S. The store sets the grace period itself.
+            const LOCK_WAIT_S: u64 = 330;
+            self.userbag_lock(user, true, false)?;
+            let start = crate::shim::boottime_ns();
+            let mut locked = false;
+            while crate::shim::boottime_ns() - start < LOCK_WAIT_S * 1_000_000_000 {
+                kernel::time::delay::fsleep(kernel::time::Delta::from_millis(5000));
+                match self.userbag_timer_fire(user) {
+                    Ok(true) => {
+                        locked = true;
+                        break;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        dev_info!(self.dev, "sep-key: self-test 10: timer fire returned {:?}\n", e);
+                        break;
+                    }
+                }
             }
+            dev_info!(
+                self.dev,
+                "sep-key: self-test 10: bag locked by the store: {} after {} s\n",
+                locked,
+                (crate::shim::boottime_ns() - start) / 1_000_000_000
+            );
             r[6] = self.userbag_lock_phase(user).map(|p| p as i32).unwrap_or(-1);
             r[1] = sign(Some(&stale));
             self.close_unlock_evaluation(&stale);

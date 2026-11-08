@@ -275,17 +275,18 @@ fn decode_timer_fire(body: &[u8]) -> bool {
     body == [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]
 }
 
+/// The grace-expiry answer, as the Neo's key store gave it on Linux on
+/// 11-09: `u32 0`, the handle whose grace period ended (0 when none has
+/// yet), the timer kind (1), `u32 0`, an opaque token, `u32 0`.
 fn decode_timer_fire_reply(body: &[u8]) -> Option<i32> {
     let mut c = Cursor::new(body);
+    let lead = c.u32()?;
     let handle = c.i32()?;
-    // The remaining captured words describe the fired timer. They are kept
-    // opaque until their meanings are known, but their fixed layout is checked.
     let kind = c.u32()?;
     let reserved = c.u32()?;
     let _token = c.u32()?;
-    let _generation = c.u32()?;
     let trailer = c.u32()?;
-    (handle < 0 && kind == 1 && reserved == 0 && trailer == 0 && c.done()).then_some(handle)
+    (lead == 0 && handle <= 0 && kind == 1 && reserved == 0 && trailer == 0 && c.done()).then_some(handle)
 }
 
 fn encode_change_secret(user_handle: i32, old: &[u8], new: &[u8]) -> Result<crate::image::Body> {
@@ -890,20 +891,8 @@ impl crate::SepData {
     ) -> Result<()> {
         self.userbag_transition(user, TransitionState::Locked, u64::from(screen_lock), &[])?;
         if expire_now {
-            let out = self
-                .sks_step(crate::sks::SKS_HANDLE_TIMER_FIRE_NAME, |_healthy| {
-                    self.userbag_request(
-                        crate::sks::SKS_HANDLE_TIMER_FIRE_NAME,
-                        encode_timer_fire()?,
-                        |seq, len| Ok(crate::sks::encode_sks_handle_timer_fire(seq, len)),
-                    )
-                })
-                .ok_or(EACCES)?;
-            let body = self.userbag_body(crate::sks::SKS_HANDLE_TIMER_FIRE_NAME, &out)?;
-            let fired = decode_timer_fire_reply(body);
-            if fired != Some(user.special_handle().value()) {
-                dev_info!(self.dev, "userbag: timer fire answered {:?}, expected {}\n", fired, user.special_handle().value());
-                return Err(self.userbag_refused("timer fire", body));
+            if !self.userbag_timer_fire(user)? {
+                return Err(EAGAIN);
             }
         }
         Ok(())
@@ -971,6 +960,30 @@ impl crate::SepData {
         // Copying the wrapped bag into a per-user durable store is phase 2.
         // Until then this ioctl establishes only the live designated bag.
         Ok(())
+    }
+
+    /// Tells the key store a grace timer is due (`0x2f`), as the Mac's own
+    /// kernel does. True when the store locked `user`'s bag; false while its
+    /// grace period has not ended (the store names no handle).
+    pub(crate) fn userbag_timer_fire(&self, user: crate::sks::DesignateUser) -> Result<bool> {
+        let out = self
+            .sks_step(crate::sks::SKS_HANDLE_TIMER_FIRE_NAME, |_healthy| {
+                self.userbag_request(
+                    crate::sks::SKS_HANDLE_TIMER_FIRE_NAME,
+                    encode_timer_fire()?,
+                    |seq, len| Ok(crate::sks::encode_sks_handle_timer_fire(seq, len)),
+                )
+            })
+            .ok_or(EACCES)?;
+        let body = self.userbag_body(crate::sks::SKS_HANDLE_TIMER_FIRE_NAME, &out)?;
+        match decode_timer_fire_reply(body) {
+            Some(0) => Ok(false),
+            Some(h) if h == user.special_handle().value() => Ok(true),
+            fired => {
+                dev_info!(self.dev, "userbag: timer fire answered {:?}, expected {}\n", fired, user.special_handle().value());
+                Err(self.userbag_refused("timer fire", body))
+            }
+        }
     }
 
     /// The enclave's lock phase for `user`'s bag (0 unlocked, 1 locked,
@@ -1216,10 +1229,15 @@ mod tests {
         assert_eq!(body.as_slice(), &golden);
         assert!(decode_timer_fire(body.as_slice()));
         let mut reply = [0u8; 24];
-        reply[0..4].copy_from_slice(&USER_HANDLE.to_le_bytes());
-        reply[4..8].copy_from_slice(&1u32.to_le_bytes());
-        reply[16..20].copy_from_slice(&3u32.to_le_bytes());
+        reply[4..8].copy_from_slice(&USER_HANDLE.to_le_bytes());
+        reply[8..12].copy_from_slice(&1u32.to_le_bytes());
+        reply[16..20].copy_from_slice(&0x027e_4cb2u32.to_le_bytes());
         assert_eq!(decode_timer_fire_reply(&reply), Some(USER_HANDLE));
+        // Before the grace period ends the store names no handle.
+        reply[4..8].copy_from_slice(&0i32.to_le_bytes());
+        assert_eq!(decode_timer_fire_reply(&reply), Some(0));
+        reply[0] = 1;
+        assert_eq!(decode_timer_fire_reply(&reply), None);
     }
 
     #[test]
