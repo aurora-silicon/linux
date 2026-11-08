@@ -100,11 +100,12 @@
  *
  * A deep sleep takes the controller's power domain away. Behind a fixed hub on T8140 the host
  * sleeps in place, as macOS's does: xHCI suspends and resumes as usual, and the PHY takes the
- * core through hibernation in between, so the hub and its devices stay. A core that comes
- * back without its registers is set up again in place and xHCI starts over, so the devices
- * reset-resume. Anywhere else, or when the PHY can't, the glue stops everything before the
- * freezer runs, the way a cable disconnect does, and brings it back once the system has
- * resumed. See dwc3_apple_pm_notify().
+ * core through hibernation in between, so the hub and its devices stay. The core comes back
+ * without its registers and is set up again in place. With its always-on side kept, xHCI
+ * restores its saved state and the hub resumes from U3, with no reset; without it xHCI starts
+ * over, and the devices reset-resume. Anywhere else, or when the PHY can't, the glue stops
+ * everything before the freezer runs, the way a cable disconnect does, and brings it back
+ * once the system has resumed. See dwc3_apple_pm_notify().
  *
  * Runtime PM (T6040 and T8132, see dwc3_apple_core_probe()): the glue holds a reference from
  * the reset deassert to the end of the shutdown, so with no cable the controller can
@@ -389,8 +390,8 @@ static void dwc3_apple_set_ptrcap(struct dwc3_apple *appledwc, u32 mode)
 /*
  * The core is powered but its registers are at their reset values. Set it up again the way
  * dwc3_apple_core_start() and dwc3_apple_set_role() do, in place: the PHYs and the xHCI
- * device stay, so xHCI only has to start over and its devices reset-resume. Runs in the
- * resume, while nothing else touches the core.
+ * device stay, so xHCI can restore its saved state, or start over. Runs in the resume,
+ * while nothing else touches the core.
  */
 static int dwc3_apple_core_reinit(struct dwc3_apple *appledwc)
 {
@@ -428,13 +429,15 @@ static int dwc3_apple_core_reinit(struct dwc3_apple *appledwc)
 /*
  * Runs before xHCI touches the core after a sleep in place. A core that may be unpowered must
  * be left alone, as an access could be an SError: dwc3_apple_sleep_kept() deals with it once
- * the system is back. A core that came back without its registers is set up again, and xHCI
- * is told it lost its state (a positive return). A sleep refused before the hibernation left
- * the core as it was.
+ * the system is back. A core that came back without its registers is set up again. xHCI then
+ * restores its saved state, as macOS's does, unless the always-on side lost power too: then
+ * it's told it lost its state (a positive return). A sleep refused before the hibernation
+ * left the core as it was.
  */
 static int dwc3_apple_pre_host_resume(struct dwc3 *dwc)
 {
 	struct dwc3_apple *appledwc = to_dwc3_apple(dwc);
+	bool lost;
 	u32 val;
 	int ret;
 
@@ -442,7 +445,8 @@ static int dwc3_apple_pre_host_resume(struct dwc3 *dwc)
 		return 0;
 
 	ret = apple_atcphy_sleep_result(appledwc->usb2_phy);
-	if (ret == -EBUSY || ret == APPLE_ATCPHY_SLEEP_POWER_LOST)
+	lost = ret == APPLE_ATCPHY_SLEEP_POWER_LOST;
+	if (ret == -EBUSY || lost)
 		ret = 0;
 	if (!ret && appledwc->drd_cfg &&
 	    readl_poll_timeout(appledwc->drd_cfg + DWC3_APPLE_CFG_STATUS, val,
@@ -451,10 +455,16 @@ static int dwc3_apple_pre_host_resume(struct dwc3 *dwc)
 		dev_warn(appledwc->dev, "PIPE PHY not ready after the sleep: %#x\n", val);
 	if (!ret && dwc3_readl(dwc, DWC3_GUID) != DWC3_APPLE_SLEEP_GUID) {
 		ret = dwc3_apple_core_reinit(appledwc);
+		if (!ret && !lost) {
+			appledwc->sleep_reinit = true;
+			dev_dbg(appledwc->dev,
+				"core lost its registers in the sleep: set up again, xHCI restores its state\n");
+			return 0;
+		}
 		if (!ret) {
 			appledwc->sleep_reinit = true;
 			dev_dbg(appledwc->dev,
-				"core lost its registers in the sleep: set up again, xHCI starts over\n");
+				"core and its always-on side lost power in the sleep: set up again, xHCI starts over\n");
 			return 1;
 		}
 	}
