@@ -50,9 +50,10 @@
  * @update: update aperture base offset (8 bytes per entry)
  * @dvfs_first: first qualified SOC-DEV-DVFS entry
  * @dvfs_count: number of qualified SOC-DEV-DVFS entries
- * @dvfs_state: SOC achieved-state report offset; 0 if no prime is needed
- * @dvfs_state_entry: PTD entry primed before the first DVFS request
- * @dvfs_state_prime: word written to @dvfs_state_entry to request a report
+ * @dvfs_ready_state: achieved-state report used by the DVFS ready gate
+ * @dvfs_ready_entry: PTD entry primed by the ready gate
+ * @dvfs_ready_prime: word written to @dvfs_ready_entry to request a report
+ * @soc_dvfs_state: SOC achieved-state report offset; 0 if not reported
  * @actual: power state acknowledgment
  * @status: PMP status; bit 0 is set while the PMP is running
  * @fast_die: 32-bit word holding the fast die-temperature effort of each
@@ -80,8 +81,9 @@ struct apple_pmp_report_offsets {
 	/* Update aperture of every entry (8 bytes each) and SOC-DEV-DVFS range. */
 	u32 update;
 	u32 dvfs_first, dvfs_count;
-	u32 dvfs_state, dvfs_state_entry;
-	u64 dvfs_state_prime;
+	u32 dvfs_ready_state, dvfs_ready_entry;
+	u64 dvfs_ready_prime;
+	u32 soc_dvfs_state;
 	bool running_any;
 	bool defer_requests;
 	bool starts_pmp;
@@ -114,9 +116,10 @@ struct apple_pmp_report {
 	/* Provider-owned words; never initialized by reading request entries. */
 	u64 dvfs_words[64];
 	u64 dvfs_known;
-	u64 dvfs_state_prime_word;
-	bool dvfs_state_prime_sent;
-	bool dvfs_state_ready;
+	u64 dvfs_ready_prime_word;
+	u64 dvfs_ready_achieved_word;
+	bool dvfs_ready_prime_sent;
+	bool dvfs_ready;
 	/* Requests are held in memory until the PMP runs (@defer_requests). */
 	bool defer;
 	unsigned int polls;
@@ -378,8 +381,8 @@ static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 	unsigned int lane;
 	unsigned long flags;
 	u64 known, shadow, request_word, dvfs_known, words[64];
-	u64 dvfs_state_prime_word;
-	bool request_word_known, dvfs_state_prime_sent, dvfs_state_ready;
+	u64 dvfs_ready_prime_word, dvfs_ready_achieved_word;
+	bool request_word_known, dvfs_ready_prime_sent, dvfs_ready;
 	u32 effort;
 
 	spin_lock_irqsave(&rep->lock, flags);
@@ -388,9 +391,10 @@ static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 	request_word = rep->request_word;
 	request_word_known = rep->request_word_known;
 	dvfs_known = rep->dvfs_known;
-	dvfs_state_prime_word = rep->dvfs_state_prime_word;
-	dvfs_state_prime_sent = rep->dvfs_state_prime_sent;
-	dvfs_state_ready = rep->dvfs_state_ready;
+	dvfs_ready_prime_word = rep->dvfs_ready_prime_word;
+	dvfs_ready_achieved_word = rep->dvfs_ready_achieved_word;
+	dvfs_ready_prime_sent = rep->dvfs_ready_prime_sent;
+	dvfs_ready = rep->dvfs_ready;
 	memcpy(words, rep->dvfs_words, sizeof(words));
 	spin_unlock_irqrestore(&rep->lock, flags);
 	seq_printf(s, "running: %u\n", running);
@@ -405,15 +409,19 @@ static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 			seq_printf(s, "dvfs_request@%x: offset: %#x word: %#llx (host)\n",
 				   offs->dvfs_first + lane,
 				   offs->update + 8 * (offs->dvfs_first + lane), words[lane]);
-	if (offs->dvfs_state_prime) {
-		seq_printf(s, "dvfs_state_prime@%x: offset: %#x word: %#llx (host) sent: %u ready: %u\n",
-			   offs->dvfs_state_entry,
-			   offs->update + 8 * offs->dvfs_state_entry,
-			   dvfs_state_prime_word, dvfs_state_prime_sent, dvfs_state_ready);
-		if (running)
-			seq_printf(s, "soc_dvfs_state: %#llx metadata: %#llx\n",
-				   readq(rep->base + offs->dvfs_state),
-				   readq(rep->base + offs->dvfs_state + 8));
+	if (offs->dvfs_ready_prime) {
+		seq_printf(s, "dvfs_ready_prime@%x: offset: %#x word: %#llx (host) sent: %u\n",
+			   offs->dvfs_ready_entry,
+			   offs->update + 8 * offs->dvfs_ready_entry,
+			   dvfs_ready_prime_word, dvfs_ready_prime_sent);
+		seq_printf(s, "dvfs_ready_achieved@%x: offset: %#x word: %#llx ready: %u\n",
+			   offs->dvfs_ready_entry, offs->dvfs_ready_state,
+			   dvfs_ready_achieved_word, dvfs_ready);
+		if (running && offs->soc_dvfs_state)
+			seq_printf(s, "soc_dvfs_state: offset: %#x word: %#llx metadata: %#llx\n",
+				   offs->soc_dvfs_state,
+				   readq(rep->base + offs->soc_dvfs_state),
+				   readq(rep->base + offs->soc_dvfs_state + 8));
 	}
 	if (rep->start)
 		apple_pmp_start_show(s, rep->start);
@@ -1478,10 +1486,11 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8112 = {
 	.tgt_read = 0xa00,
 	.tgt_write = 0x10500,
 	.update = 0x10000,
-	/* SOC is DVFS domain 2: range entry 8 plus its zero-based index. */
-	.dvfs_state = 0x90,
-	.dvfs_state_entry = 0x9,
-	.dvfs_state_prime = 1,
+	/* DVFS readiness belongs to range base entry 8, not SOC state entry 9. */
+	.dvfs_ready_state = 0x80,
+	.dvfs_ready_entry = 0x8,
+	.dvfs_ready_prime = 1,
+	.soc_dvfs_state = 0x90,
 	/* Only the qualified AVD SOC-DEV-DVFS request. */
 	.dvfs_first = 0xb0,
 	.dvfs_count = 1,
@@ -1760,10 +1769,10 @@ static bool apple_pmp_report_dvfs_valid(const struct apple_pmp_report_offsets *o
 }
 
 /*
- * A PMP-managed DVFS domain does not accept device constraints until its
- * achieved-state edge packet has been published. If the report is still
- * zero, prime that report through its PTD update entry and wait for the
- * firmware to publish a state before sending the first device request.
+ * T8112 does not accept device constraints until the DVFS range's ready-state
+ * report has been published. If the report is still zero, prime the range's
+ * base entry and wait for a nonzero achieved state before the first request.
+ * The range gate is distinct from the following per-domain SOC state entry.
  */
 static int apple_pmp_report_dvfs_prepare(struct apple_pmp_report *rep)
 {
@@ -1772,28 +1781,31 @@ static int apple_pmp_report_dvfs_prepare(struct apple_pmp_report *rep)
 	u64 state;
 	int ret;
 
-	if (!offs->dvfs_state_prime || READ_ONCE(rep->dvfs_state_ready))
+	if (!offs->dvfs_ready_prime || READ_ONCE(rep->dvfs_ready))
 		return 0;
 
-	state = readq(rep->base + offs->dvfs_state);
+	state = readq(rep->base + offs->dvfs_ready_state);
 	if (!state) {
 		spin_lock_irqsave(&rep->lock, flags);
-		if (!rep->dvfs_state_prime_sent) {
-			writeq(offs->dvfs_state_prime,
-			       rep->base + offs->update + 8 * offs->dvfs_state_entry);
-			rep->dvfs_state_prime_word = offs->dvfs_state_prime;
-			rep->dvfs_state_prime_sent = true;
+		if (!rep->dvfs_ready_prime_sent) {
+			writeq(offs->dvfs_ready_prime,
+			       rep->base + offs->update + 8 * offs->dvfs_ready_entry);
+			rep->dvfs_ready_prime_word = offs->dvfs_ready_prime;
+			rep->dvfs_ready_prime_sent = true;
 		}
 		spin_unlock_irqrestore(&rep->lock, flags);
 
-		ret = readq_poll_timeout_atomic(rep->base + offs->dvfs_state, state,
+		ret = readq_poll_timeout_atomic(rep->base + offs->dvfs_ready_state, state,
 						state, 100,
 						PMP_DVFS_STATE_READY_TIMEOUT_US);
 		if (ret)
 			return ret;
 	}
 
-	WRITE_ONCE(rep->dvfs_state_ready, true);
+	spin_lock_irqsave(&rep->lock, flags);
+	rep->dvfs_ready_achieved_word = state;
+	rep->dvfs_ready = true;
+	spin_unlock_irqrestore(&rep->lock, flags);
 	return 0;
 }
 

@@ -102,8 +102,9 @@ struct generic_pm_domain {
 struct apple_pmp_report_offsets {
 	u32 tgt_read, tgt_write, actual, status, fast_die, fast_die_lanes;
 	u32 update, dvfs_first, dvfs_count;
-	u32 dvfs_state, dvfs_state_entry;
-	u64 dvfs_state_prime;
+	u32 dvfs_ready_state, dvfs_ready_entry;
+	u64 dvfs_ready_prime;
+	u32 soc_dvfs_state;
 	bool starts_pmp;
 	const char *name, *fallback, *pwrstate;
 	bool devices_ordered;
@@ -167,8 +168,9 @@ struct apple_pmp_report {
 	/* Provider-owned whole-word DVFS shadows; unused by T6030. */
 	u64 dvfs_words[64];
 	u64 dvfs_known;
-	u64 dvfs_state_prime_word;
-	bool dvfs_state_prime_sent, dvfs_state_ready;
+	u64 dvfs_ready_prime_word;
+	u64 dvfs_ready_achieved_word;
+	bool dvfs_ready_prime_sent, dvfs_ready;
 	bool defer;
 	unsigned int polls;
 	struct delayed_work ready_work;

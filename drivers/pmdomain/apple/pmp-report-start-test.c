@@ -433,10 +433,11 @@ static void pmp_t8112_encoding_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xb8, 2, 0x25));
 	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xb0, 16, 0x25));
 	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xb0, 2, 0x24));
-	KUNIT_EXPECT_EQ(test, o->dvfs_state, 0x90U);
-	KUNIT_EXPECT_EQ(test, o->dvfs_state_entry, 0x9U);
-	KUNIT_EXPECT_EQ(test, o->update + 8 * o->dvfs_state_entry, 0x10048U);
-	KUNIT_EXPECT_EQ(test, o->dvfs_state_prime, 1ULL);
+	KUNIT_EXPECT_EQ(test, o->dvfs_ready_state, 0x80U);
+	KUNIT_EXPECT_EQ(test, o->dvfs_ready_entry, 0x8U);
+	KUNIT_EXPECT_EQ(test, o->update + 8 * o->dvfs_ready_entry, 0x10040U);
+	KUNIT_EXPECT_EQ(test, o->dvfs_ready_prime, 1ULL);
+	KUNIT_EXPECT_EQ(test, o->soc_dvfs_state, 0x90U);
 	KUNIT_EXPECT_EQ(test, o->update + 8 * 0xb0, 0x10580U);
 	/* Without a request class, retain the existing low-five-bit encoding. */
 	apple_pmp_report_dvfs_write(rep, 0xb0, 0, 2);
@@ -528,13 +529,14 @@ static void pmp_t8112_active_release_test(struct kunit *test)
 	struct pmp_dvfs_test *t = test->priv;
 
 	writeq(1, t->rep.base + 0x10);
-	writeq(2, t->rep.base + 0x90);
+	writeq(3, t->rep.base + 0x80);
 	writeq(BIT_ULL(10), t->rep.base + 0xa40);
 	KUNIT_ASSERT_EQ(test, apple_pmp_report_entry_power_on(&t->ent.genpd), 0);
 	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10500), BIT_ULL(10));
 	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10580), 0x2002000000000000ULL);
-	KUNIT_EXPECT_FALSE(test, t->rep.dvfs_state_prime_sent);
-	KUNIT_EXPECT_TRUE(test, t->rep.dvfs_state_ready);
+	KUNIT_EXPECT_FALSE(test, t->rep.dvfs_ready_prime_sent);
+	KUNIT_EXPECT_TRUE(test, t->rep.dvfs_ready);
+	KUNIT_EXPECT_EQ(test, t->rep.dvfs_ready_achieved_word, 3ULL);
 	/* ACK deliberately stays asserted: release is stored before ACK clear. */
 	KUNIT_EXPECT_EQ(test, apple_pmp_report_entry_power_off(&t->ent.genpd), -ETIMEDOUT);
 	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10580), 0x2000000000000000ULL);
@@ -549,24 +551,28 @@ static void pmp_t8112_state_prime_timeout_test(struct kunit *test)
 	struct pmp_dvfs_test *t = test->priv;
 
 	writeq(1, t->rep.base + 0x10);
+	/* A nonzero SOC state is not the separate range ready gate. */
+	writeq(2, t->rep.base + 0x90);
 	writeq(BIT_ULL(10), t->rep.base + 0xa40);
 	KUNIT_EXPECT_EQ(test, apple_pmp_report_entry_power_on(&t->ent.genpd),
 			-ETIMEDOUT);
-	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10048), 1ULL);
-	KUNIT_EXPECT_TRUE(test, t->rep.dvfs_state_prime_sent);
-	KUNIT_EXPECT_EQ(test, t->rep.dvfs_state_prime_word, 1ULL);
-	KUNIT_EXPECT_FALSE(test, t->rep.dvfs_state_ready);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10040), 1ULL);
+	KUNIT_EXPECT_TRUE(test, t->rep.dvfs_ready_prime_sent);
+	KUNIT_EXPECT_EQ(test, t->rep.dvfs_ready_prime_word, 1ULL);
+	KUNIT_EXPECT_FALSE(test, t->rep.dvfs_ready);
+	KUNIT_EXPECT_EQ(test, t->rep.dvfs_ready_achieved_word, 0ULL);
 	/* A floor is never sent, and failed admission is withdrawn. */
 	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10580), 0ULL);
 	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10500), 0ULL);
 	KUNIT_EXPECT_EQ(test, t->rep.shadow, 0ULL);
 	/* A later published state makes the same one-time prime recoverable. */
-	writeq(2, t->rep.base + 0x90);
+	writeq(2, t->rep.base + 0x80);
 	KUNIT_ASSERT_EQ(test, apple_pmp_report_entry_power_on(&t->ent.genpd), 0);
-	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10048), 1ULL);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10040), 1ULL);
 	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10580),
 			0x2002000000000000ULL);
-	KUNIT_EXPECT_TRUE(test, t->rep.dvfs_state_ready);
+	KUNIT_EXPECT_TRUE(test, t->rep.dvfs_ready);
+	KUNIT_EXPECT_EQ(test, t->rep.dvfs_ready_achieved_word, 2ULL);
 }
 
 static struct kunit_case pmp_dvfs_cases[] = {
