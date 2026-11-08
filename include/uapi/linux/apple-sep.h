@@ -186,6 +186,11 @@ struct sep_bio_lockout {
  * Without this flag, call it only while 'locked'.
  */
 #define SEP_BIO_LOCKOUT_FLAG_EVERY_PASSWORD 1
+/*
+ * Set while Touch ID waits for the first password since this boot
+ * (SEP_BIO_REQUIRE_PASSWORD); 'locked' is 1 then too.
+ */
+#define SEP_BIO_LOCKOUT_FLAG_AFTER_BOOT 2
 
 #define SEP_BIO_LOCKOUT_STATE _IOR(SEP_BIO_IOC_MAGIC, 0x0e, struct sep_bio_lockout)
 /*
@@ -202,5 +207,15 @@ struct sep_bio_rearm {
 };
 
 #define SEP_BIO_REARM _IOW(SEP_BIO_IOC_MAGIC, 0x0f, struct sep_bio_rearm)
+
+/*
+ * Touch ID refuses every verify, without a capture and with
+ * SEP_BIO_STATUS_LOCKOUT, until the next SEP_BIO_REARM: macOS's "Touch ID
+ * requires your password when the Mac restarts". A boot service calls it,
+ * before any login, when the administrator asks for that; without it Touch ID
+ * works from the first login. Nothing is recorded across a restart. Needs
+ * CAP_SYS_ADMIN; on /dev/sep-bio-rearm.
+ */
+#define SEP_BIO_REQUIRE_PASSWORD _IO(SEP_BIO_IOC_MAGIC, 0x10)
 
 #endif /* _UAPI_LINUX_APPLE_SEP_H */
