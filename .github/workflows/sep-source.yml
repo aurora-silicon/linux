@@ -73,3 +73,30 @@ jobs:
           grep -qx 'CONFIG_APPLE_SEP_KUNIT_TEST=y' .config
           make -j2 LLVM=1 ARCH=arm64 modules_prepare
           make -j2 LLVM=1 ARCH=arm64 drivers/soc/apple/apple-sep.o
+
+  kunit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Install kernel build and QEMU dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm libclang-dev libelf-dev libssl-dev \
+            flex bison bc pkg-config make perl qemu-system-arm
+          rustup component add rust-src
+      - name: Prepare the layout-corrected bindgen
+        env:
+          LIBCLANG_PATH: /usr/lib/llvm-18/lib
+        run: python3 tools/aurora-bindgen/build.py
+      # rust-build only compiles the tests; this runs them.
+      - name: Run the Apple SEP KUnit suites on arm64 QEMU
+        env:
+          LIBCLANG_PATH: /usr/lib/llvm-18/lib
+        run: |
+          ./tools/testing/kunit/kunit.py run --arch=arm64 \
+            --make_options LLVM=1 \
+            --kunitconfig=drivers/soc/apple/sep.kunitconfig \
+            --jobs="$(nproc)" --timeout=900 'apple_sep*'
