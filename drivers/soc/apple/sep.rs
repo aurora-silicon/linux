@@ -395,8 +395,6 @@ enum RestoreOutcome {
     AlreadyActive,
     NoStoredFile,
     Failed,
-    // 0x8002 cold-transition; tolerated only for the lockout record, never a catacomb
-    EmptyTolerated,
 }
 
 const PRIVATE_TYPE_CATACOMB_MASTER: u8 = 0xF2;
@@ -778,6 +776,11 @@ struct SepData {
     // The refusal of a verify during a lockout has been logged.
     bio_lockout_logged: Atomic<bool>,
 
+    // A cold LOAD_LOCKOUT is claimed exactly once, after password-mode first
+    // unlock, validated Catacombs and the stable sensor/device-view proof.
+    #[pin]
+    lockout_import: Mutex<sbio::LockoutImportState>,
+
     // Failed matches since the last match or re-arm, across prompts.
     bio_nomatch_streak: Atomic<u32>,
 
@@ -1057,6 +1060,7 @@ impl SepData {
                 rearm_dev <- new_mutex!(None),
                 bio_lockout: Atomic::new(false),
                 bio_lockout_logged: Atomic::new(false),
+                lockout_import <- new_mutex!(sbio::LockoutImportState::new()),
                 bio_nomatch_streak: Atomic::new(0),
                 enclave_failures_owed: Atomic::new(false),
                 bio_open_gen: Atomic::new(0),

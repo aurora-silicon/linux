@@ -24,6 +24,50 @@ const LOCKOUT_MAGIC: [u8; 8] = *b"SEPLOCK1";
 const LOCKOUT_RECORD_LEN: usize = 16;
 const LOCKOUT_LOCKED: u32 = 1;
 
+#[derive(Clone, Copy)]
+pub(super) enum LockoutImportEvent {
+    PasswordUnlocked,
+    CatacombsValidated,
+    SensorReady,
+}
+
+const LOCKOUT_IMPORT_PASSWORD: u8 = 1 << 0;
+const LOCKOUT_IMPORT_CATACOMBS: u8 = 1 << 1;
+const LOCKOUT_IMPORT_SENSOR: u8 = 1 << 2;
+const LOCKOUT_IMPORT_READY: u8 =
+    LOCKOUT_IMPORT_PASSWORD | LOCKOUT_IMPORT_CATACOMBS | LOCKOUT_IMPORT_SENSOR;
+
+/// Orders the cold lockout import without making any readiness event block.
+///
+/// The last prerequisite claims the only import attempt before doing I/O, so
+/// repeated notices or a later sensor retry cannot send `LOAD_LOCKOUT` twice.
+pub(super) struct LockoutImportState {
+    ready: u8,
+    attempted: bool,
+}
+
+impl LockoutImportState {
+    pub(super) const fn new() -> Self {
+        Self {
+            ready: 0,
+            attempted: false,
+        }
+    }
+
+    fn observe(&mut self, event: LockoutImportEvent) -> bool {
+        self.ready |= match event {
+            LockoutImportEvent::PasswordUnlocked => LOCKOUT_IMPORT_PASSWORD,
+            LockoutImportEvent::CatacombsValidated => LOCKOUT_IMPORT_CATACOMBS,
+            LockoutImportEvent::SensorReady => LOCKOUT_IMPORT_SENSOR,
+        };
+        if self.attempted || self.ready != LOCKOUT_IMPORT_READY {
+            return false;
+        }
+        self.attempted = true;
+        true
+    }
+}
+
 /// Message tag of the enclave's unsolicited biometric lock-state notification.
 const SBIO_NOTIFY_LOCK_STATE: u8 = 0x01;
 /// Bits of the user's biometric lock state, as the enclave announces it.
@@ -127,6 +171,19 @@ enum BgOps {
     Nothing,
     NotUpdated,
     TemplatesUpdated,
+    Failed,
+}
+
+enum PasswordUnlockAnswer {
+    Confirmed(u16),
+    AcceptedWithoutNotice,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LockoutRestoreOutcome {
+    Restored,
+    NoStoredFile,
+    Rejected(u32),
     Failed,
 }
 /// How long to wait after a background result for a component to need saving.
@@ -261,6 +318,41 @@ mod lockout_tests {
         assert_eq!(crate::sks::verify_secret_reply_flags(&wrong_variant), None);
         assert_eq!(crate::sks::verify_secret_reply_flags(&body[..8]), None);
         assert_eq!(crate::sks::verify_secret_reply_flags(&[1u8; 16]), None);
+    }
+
+    #[test]
+    fn lockout_import_waits_for_every_prerequisite() {
+        use LockoutImportEvent::*;
+
+        for order in [
+            [PasswordUnlocked, CatacombsValidated, SensorReady],
+            [PasswordUnlocked, SensorReady, CatacombsValidated],
+            [CatacombsValidated, PasswordUnlocked, SensorReady],
+            [CatacombsValidated, SensorReady, PasswordUnlocked],
+            [SensorReady, PasswordUnlocked, CatacombsValidated],
+            [SensorReady, CatacombsValidated, PasswordUnlocked],
+        ] {
+            let mut state = LockoutImportState::new();
+            assert!(!state.observe(order[0]));
+            assert!(!state.observe(order[1]));
+            assert!(state.observe(order[2]));
+            assert!(!state.observe(PasswordUnlocked));
+            assert!(!state.observe(CatacombsValidated));
+            assert!(!state.observe(SensorReady));
+        }
+    }
+
+    #[test]
+    fn duplicate_readiness_does_not_import_early() {
+        use LockoutImportEvent::*;
+
+        let mut state = LockoutImportState::new();
+        assert!(!state.observe(PasswordUnlocked));
+        assert!(!state.observe(PasswordUnlocked));
+        assert!(!state.observe(SensorReady));
+        assert!(!state.observe(SensorReady));
+        assert!(state.observe(CatacombsValidated));
+        assert!(!state.observe(CatacombsValidated));
     }
 
     #[test]
@@ -1358,7 +1450,6 @@ impl SepData {
     fn restore_all_components(&self) -> bool {
         // 0x6b is re-read before every component, not once up front.
         let user_id = SBIO_PROBE_USER_ID;
-        let mut any = false;
         let mut missing_files = false;
         let mut user_outcome = RestoreOutcome::NoStoredFile;
 
@@ -1391,9 +1482,10 @@ impl SepData {
                 outcome
             );
             match outcome {
-                RestoreOutcome::Restored | RestoreOutcome::AlreadyActive => any = true,
                 RestoreOutcome::NoStoredFile => missing_files = true,
-                RestoreOutcome::Failed | RestoreOutcome::EmptyTolerated => {}
+                RestoreOutcome::Restored
+                | RestoreOutcome::AlreadyActive
+                | RestoreOutcome::Failed => {}
             }
             if id == user_id {
                 user_outcome = outcome;
@@ -1404,27 +1496,15 @@ impl SepData {
             user_outcome,
             RestoreOutcome::Restored | RestoreOutcome::AlreadyActive
         );
-        let lockout_outcome = self.restore_lockout();
-        dev_info!(self.dev, "sbio: restore lockout outcome {:?}\n", lockout_outcome);
-        let lockout = match lockout_outcome {
-            RestoreOutcome::Restored | RestoreOutcome::AlreadyActive => true,
-            RestoreOutcome::EmptyTolerated => true,
-            RestoreOutcome::NoStoredFile => {
-                missing_files = true;
-                false
-            }
-            RestoreOutcome::Failed => false,
-        };
 
         if missing_files {
             dev_warn!(
                 self.dev,
-                "sbio: at least one catacomb/lockout file is absent; match readiness depends on the user restore and device-view proof\n"
+                "sbio: at least one Catacomb file is absent; match readiness depends on the user restore and device-view proof\n"
             );
         }
 
-        let _ = any;
-        user_ok && lockout
+        user_ok
     }
 
     fn read_component_states(&self) -> Option<KVec<u8>> {
@@ -1571,32 +1651,78 @@ impl SepData {
         }
     }
 
-    fn restore_lockout(&self) -> RestoreOutcome {
+    fn restore_lockout(&self) -> LockoutRestoreOutcome {
         let Some(blob) = self.read_stored(PRIVATE_TYPE_LOCKOUT, c"bio lockout record") else {
-            return RestoreOutcome::NoStoredFile;
+            return LockoutRestoreOutcome::NoStoredFile;
         };
+        // A rejected record is durably quarantined as an empty host-store
+        // value. It is no longer an import candidate on a later boot.
+        if blob.is_empty() {
+            return LockoutRestoreOutcome::NoStoredFile;
+        }
         let Some(request) = crate::sbio::SbioLoadLockout::new(&blob) else {
-            return RestoreOutcome::Failed;
+            return LockoutRestoreOutcome::Failed;
         };
         match self.sbio_transfer_raw(request.opcode(), request.name(), request.payload()) {
-            Ok(done) if done.status.is_ok() => RestoreOutcome::Restored,
-            Ok(done)
-                if matches!(
-                    done.status,
-                    transfer::DeviceStatus::Answered(crate::sbio::SBIO_STATUS_COLD_TRANSITION)
-                ) =>
-            {
-                // Not a restore: the enclave did not take the record (macOS
-                // discards such a record). The host record keeps the count.
+            Ok(done) if done.status.is_ok() => LockoutRestoreOutcome::Restored,
+            Ok(done) => match done.status.answered() {
+                Some(status)
+                    if status == crate::sbio::SBIO_STATUS_COLD_TRANSITION
+                        || status == crate::sbio::SBIO_STATUS_LOCKOUT_REJECTED =>
+                {
+                    LockoutRestoreOutcome::Rejected(status)
+                }
+                _ => LockoutRestoreOutcome::Failed,
+            },
+            Err(_) => LockoutRestoreOutcome::Failed,
+        }
+    }
+
+    fn quarantine_lockout(&self) -> bool {
+        matches!(
+            self.with_host_store(|store| {
+                store.write(&store::Key::root(PRIVATE_TYPE_LOCKOUT), &[])
+            }),
+            Some(Ok(()))
+        )
+    }
+
+    fn lockout_import_event(&self, event: LockoutImportEvent) {
+        if !self.lockout_import.lock().observe(event) {
+            return;
+        }
+
+        let outcome = self.restore_lockout();
+        match outcome {
+            LockoutRestoreOutcome::Restored => {
                 dev_info!(
                     self.dev,
-                    "sbio: LOAD_LOCKOUT refused the saved lockout record (0x8002, it does not match the restored catacombs); the failed-attempt count comes from the host record\n"
+                    "sbio: LOAD_LOCKOUT accepted after first unlock, Catacomb validation and sensor/device readiness\n"
                 );
-                RestoreOutcome::EmptyTolerated
             }
-            Ok(_) => RestoreOutcome::Failed,
-            Err(_) => RestoreOutcome::Failed,
+            LockoutRestoreOutcome::NoStoredFile => {
+                dev_info!(
+                    self.dev,
+                    "sbio: no saved enclave lockout record to import\n"
+                );
+            }
+            LockoutRestoreOutcome::Rejected(status) => {
+                let quarantined = self.quarantine_lockout();
+                dev_warn!(
+                    self.dev,
+                    "sbio: LOAD_LOCKOUT rejected the saved record with status {:#x}; enclave record quarantined {}, independent host failed-attempt count retained\n",
+                    status,
+                    quarantined
+                );
+            }
+            LockoutRestoreOutcome::Failed => {
+                dev_warn!(
+                    self.dev,
+                    "sbio: LOAD_LOCKOUT failed; independent host failed-attempt count retained\n"
+                );
+            }
         }
+        dev_info!(self.dev, "sbio: restore lockout outcome {:?}\n", outcome);
     }
 
     fn read_stored(&self, kind: u8, _what: &CStr) -> Option<KVec<u8>> {
@@ -1823,15 +1949,15 @@ impl SepData {
 
         match self.sbio_transfer(&crate::sbio::sbio_confirm_save(&selector)) {
             Ok(done) if done.status.is_ok() => {
-                // The master is saved last in every catacomb transaction. The
-                // enclave checks a reloaded lockout record against the
-                // catacombs, so one saved before this generation is refused
-                // at the next start (LOAD_LOCKOUT 0x8002): save it again.
+                // The master is saved last in every Catacomb transaction.
+                // Refresh the lockout snapshot after that transaction too;
+                // import admission also depends on first unlock and stable
+                // sensor/device readiness at the next start.
                 let master = who.value() == crate::sbio::CatacombUser::MASTER.value();
                 if master && !self.save_lockout() {
                     dev_warn!(
                         self.dev,
-                        "sbio: the lockout record was not saved again after the catacombs; the next start may refuse it\n"
+                        "sbio: the lockout record was not refreshed after the Catacombs\n"
                     );
                 }
                 true
@@ -2308,6 +2434,7 @@ impl SepData {
         diag::keybag(diag::Keybag::Present);
         self.sks_designate_user_keybag(handle, stored.secret());
         self.sks_machine_refkey(handle, stored.secret());
+        let first_unlocked = self.prepare_lockout_first_unlock();
         let prepared = self.cold_match_continue(handle, uuid, stored.uuid_provenance());
         self.ensure_restored_after(prepared);
         if self.attach_bringup() {
@@ -2317,6 +2444,12 @@ impl SepData {
         self.refresh_match_credential();
         self.restore_lockout_record();
         self.touchid_started.store(true, Relaxed);
+        if !first_unlocked {
+            dev_warn!(
+                self.dev,
+                "Touch ID: activation completed without a confirmed password-mode first unlock; the enclave lockout record was not imported\n"
+            );
+        }
         diag::touchid(true);
         Ok(())
     }
@@ -3629,6 +3762,8 @@ impl SepData {
                 self.log_protected_unlock();
                 self.probe_unlock_evaluation();
                 let _ = self.handle_bg_ops(c"after the restore");
+                self.lockout_import_event(LockoutImportEvent::CatacombsValidated);
+                self.lockout_import_event(LockoutImportEvent::SensorReady);
             }
         } else if !listed {
             dev_warn!(self.dev, "sbio: device-view synchronisation or match policy unavailable\n");
@@ -4284,6 +4419,112 @@ impl SepData {
             )));
             waited += LOCK_STATE_POLL_MS;
         }
+    }
+
+    fn verify_designated_bag_password(
+        &self,
+        user: crate::sbio::UserId,
+        purpose: &CStr,
+    ) -> Option<PasswordUnlockAnswer> {
+        let du = crate::sks::DesignateUser::new(user.value())?;
+        if !self.keybag_designated.load(Relaxed) || self.enrol_material.lock().is_none() {
+            dev_err!(
+                self.dev,
+                "Touch ID: {}: no user key bag is designated\n",
+                purpose
+            );
+            return None;
+        }
+        let stored = match keybag::read(keybag::Slot::Identity) {
+            Ok(keybag::State::Present(stored)) => stored,
+            Ok(keybag::State::Absent(_)) => {
+                dev_err!(
+                    self.dev,
+                    "Touch ID: {}: there is no stored identity key bag secret\n",
+                    purpose
+                );
+                return None;
+            }
+            Err(e) => {
+                dev_err!(
+                    self.dev,
+                    "Touch ID: {}: the identity key bag record is unreadable: {:?}\n",
+                    purpose,
+                    e
+                );
+                return None;
+            }
+        };
+        let notify_user = user.value() as u32;
+        let since = self.bio_lock_state_seq.load(Relaxed);
+        let Some(out) =
+            self.sks_send(self.sks_req_verify_password(du.special_handle(), stored.secret()))
+        else {
+            dev_err!(
+                self.dev,
+                "Touch ID: {}: the password-mode verification did not answer\n",
+                purpose
+            );
+            return None;
+        };
+        if out.reply.status != 0 {
+            dev_err!(
+                self.dev,
+                "Touch ID: {}: the password-mode verification answered SKS status {}\n",
+                purpose,
+                out.reply.status
+            );
+            return None;
+        }
+        let body = self.sks_report_response(crate::sks::SKS_VERIFY_SECRET_NAME, &out);
+        let Some(flags) = body.and_then(crate::sks::verify_secret_reply_flags) else {
+            dev_err!(
+                self.dev,
+                "Touch ID: {}: the password-mode verification reply is malformed ({} body bytes)\n",
+                purpose,
+                body.map_or(0, |b| b.len())
+            );
+            return None;
+        };
+        dev_info!(
+            self.dev,
+            "Touch ID: {}: password-mode verification of the designated bag answered status 0, returned flags {:#x}\n",
+            purpose,
+            flags
+        );
+        Some(
+            match self.await_lock_state(notify_user, since, LOCK_STATE_WAIT_MS) {
+                Some(state) => PasswordUnlockAnswer::Confirmed(state),
+                None => PasswordUnlockAnswer::AcceptedWithoutNotice,
+            },
+        )
+    }
+
+    fn prepare_lockout_first_unlock(&self) -> bool {
+        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+            return false;
+        };
+        let Some(PasswordUnlockAnswer::Confirmed(state)) =
+            self.verify_designated_bag_password(user, c"cold import first unlock")
+        else {
+            dev_err!(
+                self.dev,
+                "Touch ID: cold import first unlock was not confirmed by a fresh lock-state notice\n"
+            );
+            return false;
+        };
+        if state & LOCK_STATE_NEEDS_PASSWORD != 0
+            || state & (LOCK_STATE_PASSCODE_VALIDATED | LOCK_STATE_UNLOCK_TOKEN) == 0
+        {
+            dev_err!(
+                self.dev,
+                "Touch ID: cold import first unlock left an inadmissible lock state {:#06x}\n",
+                state
+            );
+            return false;
+        }
+        self.lockout_import_event(LockoutImportEvent::PasswordUnlocked);
+        true
     }
 
     /// Collects a background operation result the enclave announced, if
@@ -5218,57 +5459,8 @@ impl SepData {
     /// it accepted the password verification but announced nothing, `None`
     /// on any failure or when it still reports the lockout.
     fn clear_enclave_lockout(&self, user: crate::sbio::UserId) -> Option<bool> {
-        let du = crate::sks::DesignateUser::new(SBIO_PROBE_USER_ID)?;
-        if !self.keybag_designated.load(Relaxed) || self.enrol_material.lock().is_none() {
-            dev_err!(self.dev, "Touch ID: re-arm: no user key bag is designated\n");
-            return None;
-        }
-        let stored = match keybag::read(keybag::Slot::Identity) {
-            Ok(keybag::State::Present(stored)) => stored,
-            Ok(keybag::State::Absent(_)) => {
-                dev_err!(self.dev, "Touch ID: re-arm: there is no stored identity key bag secret\n");
-                return None;
-            }
-            Err(e) => {
-                dev_err!(
-                    self.dev,
-                    "Touch ID: re-arm: the identity key bag record is unreadable: {:?}\n",
-                    e
-                );
-                return None;
-            }
-        };
-        let notify_user = user.value() as u32;
-        let since = self.bio_lock_state_seq.load(Relaxed);
-        let Some(out) = self.sks_send(self.sks_req_verify_password(du.special_handle(), stored.secret()))
-        else {
-            dev_err!(self.dev, "Touch ID: re-arm: the password verification did not answer\n");
-            return None;
-        };
-        if out.reply.status != 0 {
-            dev_err!(
-                self.dev,
-                "Touch ID: re-arm: the password verification answered SKS status {}\n",
-                out.reply.status
-            );
-            return None;
-        }
-        let body = self.sks_report_response(crate::sks::SKS_VERIFY_SECRET_NAME, &out);
-        let Some(flags) = body.and_then(crate::sks::verify_secret_reply_flags) else {
-            dev_err!(
-                self.dev,
-                "Touch ID: re-arm: the password verification reply is malformed ({} body bytes)\n",
-                body.map_or(0, |b| b.len())
-            );
-            return None;
-        };
-        dev_info!(
-            self.dev,
-            "Touch ID: re-arm: password verification of the designated bag answered status 0, returned flags {:#x}\n",
-            flags
-        );
-        let confirmed = match self.await_lock_state(notify_user, since, LOCK_STATE_WAIT_MS) {
-            Some(state) if state & LOCK_STATE_NEEDS_PASSWORD != 0 => {
+        let confirmed = match self.verify_designated_bag_password(user, c"re-arm")? {
+            PasswordUnlockAnswer::Confirmed(state) if state & LOCK_STATE_NEEDS_PASSWORD != 0 => {
                 dev_err!(
                     self.dev,
                     "Touch ID: re-arm: the enclave still reports the lockout (state {:#06x})\n",
@@ -5276,8 +5468,8 @@ impl SepData {
                 );
                 return None;
             }
-            Some(_) => true,
-            None => false,
+            PasswordUnlockAnswer::Confirmed(_) => true,
+            PasswordUnlockAnswer::AcceptedWithoutNotice => false,
         };
         // The next verify opens a fresh unlock evaluation; nothing of the old
         // one is carried over.
@@ -6660,6 +6852,12 @@ impl SaveSelector {
 
 pub(crate) const SBIO_STATUS_COLD_TRANSITION: u32 = 0x8002;
 static_assert!(SBIO_STATUS_COLD_TRANSITION != 0);
+
+/// `LOAD_LOCKOUT` rejected a saved cold-import record. The host treats this
+/// the same as 0x8002: the enclave record is not active and must be retired.
+pub(crate) const SBIO_STATUS_LOCKOUT_REJECTED: u32 = 0x8003;
+static_assert!(SBIO_STATUS_LOCKOUT_REJECTED != 0);
+static_assert!(SBIO_STATUS_LOCKOUT_REJECTED != SBIO_STATUS_COLD_TRANSITION);
 
 // 0x101 from a 0x6d load = already active; a success answer, not an error
 pub(crate) const SBIO_STATUS_ALREADY_ACTIVE: u32 = 0x101;
