@@ -33,7 +33,8 @@ header = (AVD / 'avd.h').read_text()
 a = header.index('struct avd_av1_decoded_buffer_info {')
 b = header.index('\n};', a) + 3
 pre = pre.replace('struct avd_decoded_buffer {', header[a:b] + '\nstruct avd_decoded_buffer {')
-pre = pre.replace('struct avd_comp comp; unsigned int bank;', 'struct avd_comp comp; unsigned int bank; struct avd_av1_decoded_buffer_info av1;')
+pre = pre.replace('unsigned int bank; };',
+                  'unsigned int bank; struct avd_av1_decoded_buffer_info av1; };')
 pre = pre.replace('struct vb2_v4l2_buffer *dst; } bufs;', 'struct vb2_v4l2_buffer *src,*dst; } bufs;')
 pre = pre.replace('unsigned int fifo_idx, pp_total;', 'unsigned int fifo_idx, pp_total, max_frames; int ctrl_hdl;')
 pre = pre.replace('dma_addr_t comp_out, y_out, uv_out;', 'dma_addr_t comp_out, y_out, uv_out, coded_in;')

@@ -154,8 +154,10 @@ static void stream_refs(struct avd_ctx *ctx, struct avd_h264_run *run)
 
 		ref = avd_get_ref_buf(ctx, &dst->base.vb, dpb[i].reference_ts);
 
-		addr = vb2_dma_contig_plane_dma_addr(&ref->base.vb.vb2_buf, 0) +
-		       ref->comp.start_offset;
+		addr = ref->h264_comp ?
+			       ref->h264_comp->addr :
+			       vb2_dma_contig_plane_dma_addr(&ref->base.vb.vb2_buf, 0) +
+				       ref->comp.start_offset;
 
 		push(AVD_REF_NUM(run->num_valid - 1) | AVD_REF_FLAG_CONST |
 			     AVD_REF_FLAG_LONG(

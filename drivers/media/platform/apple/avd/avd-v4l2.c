@@ -833,6 +833,45 @@ static int avd_buf_prepare(struct vb2_buffer *vb)
 	return 0;
 }
 
+static int avd_buf_init(struct vb2_buffer *vb)
+{
+	struct avd_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
+	struct avd_decoded_buffer *buf;
+	int ret;
+
+	if (!V4L2_TYPE_IS_CAPTURE(vb->vb2_queue->type) ||
+	    ctx->coded_fmt.fmt.pix_mp.pixelformat != V4L2_PIX_FMT_H264_SLICE)
+		return 0;
+
+	buf = vb2_to_avd_decoded_buf(vb);
+	buf->h264_comp = kzalloc_obj(*buf->h264_comp);
+	if (!buf->h264_comp)
+		return -ENOMEM;
+
+	ret = avd_buf_alloc(ctx->dev, buf->h264_comp, ctx->comp.size);
+	if (ret) {
+		kfree(buf->h264_comp);
+		buf->h264_comp = NULL;
+	}
+	return ret;
+}
+
+static void avd_buf_cleanup(struct vb2_buffer *vb)
+{
+	struct avd_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
+	struct avd_decoded_buffer *buf;
+
+	if (!V4L2_TYPE_IS_CAPTURE(vb->vb2_queue->type))
+		return;
+
+	buf = vb2_to_avd_decoded_buf(vb);
+	if (!buf->h264_comp)
+		return;
+	avd_buf_free(ctx->dev, buf->h264_comp);
+	kfree(buf->h264_comp);
+	buf->h264_comp = NULL;
+}
+
 static void avd_buf_finish(struct vb2_buffer *vb)
 {
 	struct avd_decoded_buffer *buf;
@@ -968,6 +1007,8 @@ static void avd_stop_streaming(struct vb2_queue *q)
 
 const struct vb2_ops avd_queue_ops = {
 	.queue_setup = avd_queue_setup,
+	.buf_init = avd_buf_init,
+	.buf_cleanup = avd_buf_cleanup,
 	.buf_prepare = avd_buf_prepare,
 	.buf_finish = avd_buf_finish,
 	.buf_queue = avd_buf_queue,
@@ -1008,10 +1049,11 @@ void avd_run_preamble(struct avd_ctx *ctx, struct avd_run *run)
 		      ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline *
 			      ctx->decoded_fmt.fmt.pix_mp.height;
 
-	run->comp_out = run->y_out + ctx->comp.start_offset;
+	dst = vb2_to_avd_decoded_buf(&run->bufs.dst->vb2_buf);
+	run->comp_out = dst->h264_comp ? dst->h264_comp->addr :
+					  run->y_out + ctx->comp.start_offset;
 	ctx->decomp = true;
 
-	dst = vb2_to_avd_decoded_buf(&run->bufs.dst->vb2_buf);
 	memcpy(&dst->comp, &ctx->comp, sizeof(ctx->comp));
 
 	/* Apply request(s) controls if needed. */

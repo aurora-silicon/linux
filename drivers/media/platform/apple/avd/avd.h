@@ -60,6 +60,7 @@
 
 struct avd_ctx;
 struct avd_dev;
+struct avd_buf;
 
 /* Matches hdr mode (inst stream) and register layout */
 enum avd_codec {
@@ -129,6 +130,8 @@ struct avd_decoded_buffer {
 	struct v4l2_m2m_buffer base;
 
 	struct avd_comp comp;
+	/* H.264 compressed reference storage, separate from the raster plane. */
+	struct avd_buf *h264_comp;
 	/* Pending CPU fill, retained with the buffer until dequeue. */
 	size_t grey_chroma_offset;
 	bool grey_chroma_10bit;
