@@ -4377,6 +4377,7 @@ static int brcmf_lpas_filter_add(struct brcmf_if *ifp)
 	filter->negate_match = cpu_to_le32(0);
 	filter->u.pattern.offset = cpu_to_le32(0);
 	filter->u.pattern.size_bytes = cpu_to_le32(1);
+	/* mask_and_pattern[1] is the protocol's variable-length wire tail. */
 	memcpy((u8 *)filter + offsetof(struct brcmf_pkt_filter_le,
 					     u.pattern.mask_and_pattern),
 	       mask_and_pattern, sizeof(mask_and_pattern));
