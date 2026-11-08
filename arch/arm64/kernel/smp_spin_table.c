@@ -146,12 +146,18 @@ const struct cpu_operations smp_spin_table_ops = {
  * It is then started again at its reset vector. Stopping and starting a CPU is
  * SoC-specific, so a platform driver provides it. Until one has, CPU hotplug
  * fails cleanly, as on plain spin-table.
+ *
+ * A CPU left awake at the commit can hang the machine, and the commit can't be
+ * undone. So each parked CPU first answers a hold, while the suspend can still
+ * refuse, and only a held CPU stops.
  */
 #ifdef CONFIG_HOTPLUG_CPU
 static const struct spin_table_power_ops *spin_table_power __read_mostly;
 static struct cpumask spin_table_cpus_parked;
+static struct cpumask spin_table_cpus_held;
 static struct cpumask spin_table_cpus_unpark;
 static struct cpumask spin_table_cpus_off;
+static bool spin_table_hold_requested;
 static bool spin_table_stop_requested;
 static bool spin_table_stop_released;
 
@@ -162,9 +168,67 @@ int spin_table_set_power_ops(const struct spin_table_power_ops *ops)
 	return cmpxchg(&spin_table_power, NULL, ops) ? -EBUSY : 0;
 }
 
+/* A refused suspend: the held CPUs go back to the park. */
+void spin_table_unhold_parked(void)
+{
+	WRITE_ONCE(spin_table_hold_requested, false);
+	dsb(ish);
+	sev();
+}
+
 /*
- * For a caller about to suspend the system, interrupts off: parked CPUs stop and
- * wait for spin_table_release_stopped(). Returns -ETIMEDOUT if any didn't stop.
+ * Every CPU not online is held or off. One that is neither, parked or not (a start that
+ * failed, a CPU never started), may be awake anywhere.
+ */
+static bool spin_table_all_held(bool report)
+{
+	unsigned int cpu;
+	bool all = true;
+
+	for_each_present_cpu(cpu) {
+		if (cpu_online(cpu) || cpumask_test_cpu(cpu, &spin_table_cpus_held) ||
+		    cpumask_test_cpu(cpu, &spin_table_cpus_off))
+			continue;
+		if (!report)
+			return false;
+		pr_err("CPU%u did not answer the hold for a suspend\n", cpu);
+		all = false;
+	}
+
+	return all;
+}
+
+/*
+ * Before a suspend's last refusal, interrupts off, other CPUs offline: every parked CPU
+ * answers and waits, still parked, for spin_table_stop_parked() or
+ * spin_table_unhold_parked(). Nothing is written to the hardware. Returns -ETIMEDOUT,
+ * with the hold undone, if any CPU not online is neither held nor off.
+ */
+int spin_table_hold_parked(void)
+{
+	int us;
+
+	WRITE_ONCE(spin_table_hold_requested, true);
+	dsb(ish);
+	sev();
+
+	for (us = 0; us < SPIN_TABLE_WAIT_US; us++) {
+		if (spin_table_all_held(false))
+			return 0;
+		udelay(1);
+	}
+
+	if (spin_table_all_held(true))
+		return 0;
+	spin_table_unhold_parked();
+
+	return -ETIMEDOUT;
+}
+
+/*
+ * At the commit, after spin_table_hold_parked(): the held CPUs stop and wait for
+ * spin_table_release_stopped(). Returns -ETIMEDOUT if any didn't stop. The request
+ * stays up until the wake, so a late one still stops.
  */
 int spin_table_stop_parked(void)
 {
@@ -176,12 +240,11 @@ int spin_table_stop_parked(void)
 
 	for (us = 0; us < SPIN_TABLE_WAIT_US; us++) {
 		if (cpumask_empty(&spin_table_cpus_parked))
-			break;
+			return 0;
 		udelay(1);
 	}
-	WRITE_ONCE(spin_table_stop_requested, false);
 
-	return cpumask_empty(&spin_table_cpus_parked) ? 0 : -ETIMEDOUT;
+	return -ETIMEDOUT;
 }
 
 /* After the commit: the stopped CPUs take their last WFI. */
@@ -198,9 +261,12 @@ void spin_table_release_stopped(void)
  */
 void spin_table_stop_finished(void)
 {
+	WRITE_ONCE(spin_table_hold_requested, false);
+	WRITE_ONCE(spin_table_stop_requested, false);
 	WRITE_ONCE(spin_table_stop_released, false);
 	cpumask_or(&spin_table_cpus_off, &spin_table_cpus_off, &spin_table_cpus_parked);
 	cpumask_clear(&spin_table_cpus_parked);
+	cpumask_clear(&spin_table_cpus_held);
 	cpumask_clear(&spin_table_cpus_unpark);
 }
 
@@ -257,6 +323,28 @@ static void smp_rvbar_spin_table_restart(void)
 }
 #endif
 
+/* Held until the commit's stop, or until a refusal sends it back to the park. */
+static void smp_rvbar_spin_table_hold(unsigned int cpu, u64 mpidr)
+{
+	cpumask_set_cpu(cpu, &spin_table_cpus_held);
+
+	while (READ_ONCE(spin_table_hold_requested)) {
+		if (READ_ONCE(spin_table_stop_requested)) {
+			spin_table_power->cpu_stop(mpidr);
+			cpumask_set_cpu(cpu, &spin_table_cpus_off);
+			cpumask_clear_cpu(cpu, &spin_table_cpus_held);
+			cpumask_clear_cpu(cpu, &spin_table_cpus_parked);
+
+			while (!READ_ONCE(spin_table_stop_released))
+				wfe();
+			spin_table_power->cpu_off(mpidr);
+		}
+		wfe();
+	}
+
+	cpumask_clear_cpu(cpu, &spin_table_cpus_held);
+}
+
 static void smp_rvbar_spin_table_cpu_die(unsigned int cpu)
 {
 	u64 mpidr = cpu_logical_map(cpu);
@@ -270,15 +358,8 @@ static void smp_rvbar_spin_table_cpu_die(unsigned int cpu)
 	cpumask_set_cpu(cpu, &spin_table_cpus_parked);
 
 	while (!cpumask_test_cpu(cpu, &spin_table_cpus_unpark)) {
-		if (READ_ONCE(spin_table_stop_requested)) {
-			spin_table_power->cpu_stop(mpidr);
-			cpumask_set_cpu(cpu, &spin_table_cpus_off);
-			cpumask_clear_cpu(cpu, &spin_table_cpus_parked);
-
-			while (!READ_ONCE(spin_table_stop_released))
-				wfe();
-			spin_table_power->cpu_off(mpidr);
-		}
+		if (READ_ONCE(spin_table_hold_requested))
+			smp_rvbar_spin_table_hold(cpu, mpidr);
 		wfe();
 	}
 

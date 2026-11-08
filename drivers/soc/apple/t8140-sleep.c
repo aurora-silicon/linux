@@ -639,6 +639,21 @@ static int t8140_sleep_coprocs_check(struct t8140_sleep *s)
 	return 0;
 }
 
+/*
+ * The other cores stop at the commit, and one left awake there keeps the engine waiting
+ * until WD2 resets the SoC. Each answers here, before the display goes off, and waits for the
+ * stop or a refusal.
+ */
+static int t8140_sleep_cpus_hold(struct t8140_sleep *s)
+{
+	int ret = spin_table_hold_parked();
+
+	if (ret)
+		dev_err(s->dev, "refused: a CPU didn't answer the hold: %d\n", ret);
+
+	return ret;
+}
+
 /* Last of all the refusals: an enclave that gated comes back only through a real sleep. */
 static int t8140_sleep_enclave_tell(struct t8140_sleep *s)
 {
@@ -1958,7 +1973,10 @@ static int t8140_sleep_commit(unsigned long unused)
 	int plane, agent;
 	u32 val;
 
-	/* The other cores stop first, as on macOS. They stay coherent until the commit. */
+	/*
+	 * The other cores stop first, as on macOS. Each answered the hold in .enter, and they
+	 * stay coherent until the commit.
+	 */
 	s->siq_cfg = read_sysreg_s(SYS_APL_SIQ_CFG_EL1);
 	s->cpus_stop_ret = spin_table_stop_parked();
 
@@ -2101,13 +2119,16 @@ static int t8140_sleep_enter(suspend_state_t state)
 	ret = t8140_sleep_refuse(s);
 	if (ret)
 		return ret;
+	ret = t8140_sleep_cpus_hold(s);
 	/* As on macOS, the display goes off before the GPU. */
-	ret = t8140_display_off(s);
+	if (!ret)
+		ret = t8140_display_off(s);
 	if (!ret)
 		ret = t8140_sleep_coprocs_check(s);
 	if (!ret)
 		ret = t8140_sleep_enclave_tell(s);
 	if (ret) {
+		spin_table_unhold_parked();
 		t8140_sleep_stray_restore(s);
 		return ret;
 	}

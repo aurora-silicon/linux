@@ -66,11 +66,20 @@ struct spin_table_power_ops {
 
 #ifdef CONFIG_HOTPLUG_CPU
 int spin_table_set_power_ops(const struct spin_table_power_ops *ops);
+int spin_table_hold_parked(void);
+void spin_table_unhold_parked(void);
 int spin_table_stop_parked(void);
 void spin_table_release_stopped(void);
 void spin_table_stop_finished(void);
 bool spin_table_cpus_stuck(void);
 #else
+static inline int spin_table_hold_parked(void)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void spin_table_unhold_parked(void) {}
+
 static inline int spin_table_stop_parked(void)
 {
 	return -EOPNOTSUPP;
