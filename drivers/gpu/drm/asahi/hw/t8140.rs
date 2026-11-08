@@ -192,6 +192,12 @@ pub(crate) mod dynamic {
     /// Canonical low mappings shared by hardware queues and their clients.
     /// Client-private allocations start after this arena.
     pub(crate) const LOWER: core::ops::Range<u64> = 0x70_0400_0000..0x70_8000_0000;
+
+    /// Dynamic kernel objects in the upper window: from `KERNEL_OFFSET` up to the firmware
+    /// MMIO aperture. The firmware gives the addresses from there on a fixed meaning.
+    pub(crate) const fn upper(kernel: core::ops::Range<u64>) -> core::ops::Range<u64> {
+        kernel.start + KERNEL_OFFSET..super::MMIO_APERTURE
+    }
 }
 
 /// Fixed addresses in the firmware's context-0 and context-1 address spaces.
