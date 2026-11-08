@@ -1372,6 +1372,17 @@ impl TimestampVmap {
         self.0.owner().size()
     }
 
+    /// Reads the naturally aligned timestamp at byte `offset` of the GEM object.
+    pub(crate) fn read(&self, offset: usize) -> Option<u64> {
+        let end = offset.checked_add(size_of::<u64>())?;
+        if end > self.size() || offset % size_of::<u64>() != 0 {
+            return None;
+        }
+        // SAFETY: The complete aligned extent was checked above, inside this pinned vmap.
+        let source = unsafe { &*self.0.addr.cast::<u8>().add(offset).cast::<AtomicU64>() };
+        Some(u64::from_le(source.load(Ordering::Acquire)))
+    }
+
     /// Writes a timestamp at byte `offset` of the GEM object. Aligned results use a complete
     /// atomic store; byte stores support unaligned destinations without creating mutable
     /// aliases. An unaligned complete timestamp is not atomic. Out-of-range offsets are refused

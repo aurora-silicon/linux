@@ -193,6 +193,11 @@ pub(crate) mod dynamic {
     /// Client-private allocations start after this arena.
     pub(crate) const LOWER: core::ops::Range<u64> = 0x70_0400_0000..0x70_8000_0000;
 
+    /// The firmware timestamp window (gart range 11, `HwData.unk_28`): user timestamp buffers
+    /// are aliased here so that the firmware writes their stamps itself.
+    pub(crate) const TIMESTAMP_WINDOW: core::ops::Range<u64> =
+        0xffff_fc21_8140_0000..0xffff_fc21_8540_0000;
+
     /// Dynamic kernel objects in the upper window: from `KERNEL_OFFSET` up to the firmware
     /// MMIO aperture. The firmware gives the addresses from there on a fixed meaning.
     pub(crate) const fn upper(kernel: core::ops::Range<u64>) -> core::ops::Range<u64> {
