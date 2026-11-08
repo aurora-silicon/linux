@@ -24,6 +24,10 @@ const COMMON26_COMPLETION_LOW: u64 = 0x72_0184_8000;
 const COMPLETION_STRIDE: u64 = 0x2_8000;
 const PB: u64 = BASE + 0x15e_0000;
 const UMA: u64 = BASE + 0x15e_8000;
+/// The log buffer each J813 coprocessor is handed on the crashlog endpoint, by [`Role`]: the
+/// addresses and the size macOS 27.0 publishes there.
+const FW_LOG: [u64; 2] = [BASE + 0xc089_8000, BASE + 0xc088_8000];
+const FW_LOG_SIZE: usize = 0x8000;
 
 /// Lower-root entry 1 of the M5 layout (Mesa's driver window), linked before the firmware starts
 /// as the bare-metal J775D boot has always run.
@@ -91,6 +95,11 @@ impl InitData {
         Err(EBUSY)
     }
 
+    /// The address and size of a coprocessor's log buffer, for the message that publishes it.
+    pub(in crate::g17) fn fw_log(role: Role) -> (u64, usize) {
+        (FW_LOG[role as usize], FW_LOG_SIZE)
+    }
+
     pub(crate) fn build_m5(&mut self, dev: &AsahiDrmDevice, uat: &mmu::Uat,
         id: &crate::regs::G17Id, board: &m::Board) -> Result {
         use mmu::{PROT_FW_SHARED_RW as RW, PROT_FW_SHARED_RO as RO,
@@ -116,6 +125,13 @@ impl InitData {
         self.add(fixed(FWCTL, mmu::UAT_PGSZ, RW)?)?;
         self.qos = self.add(fixed(QOS, m::G17P_QOS_RESOURCE_SIZE, RW)?)?;
         self.add(fixed(KICK_SHARED, m::M5_KICK_SHARED_SIZE, mmu::PROT_GPU_FW_SHARED_RW)?)?;
+        // The J813's log buffers, which the firmware is told about once it runs (see
+        // `publish_log_buffer`); it reads and writes them through its own kernel window.
+        if common26 {
+            for address in FW_LOG {
+                self.add(fixed_controller(address, FW_LOG_SIZE)?)?;
+            }
+        }
         let aon = self.add(fixed_controller(AON, m::M5_AON_PTD_SIZE)?)?;
         self.bundle = self.add(fixed_controller(BUNDLE, shared.total)?)?;
         self.pb = self.add(fixed(PB, mmu::UAT_PGSZ, RW)?)?;

@@ -284,12 +284,24 @@ pub(super) enum Role {
     Secondary = 1,
 }
 
+/// RTKit's crash log endpoint, over which the host also publishes a log buffer of its own.
+const EP_CRASHLOG: u8 = 0x01;
 /// RTKit endpoint of firmware messages: initialization, its acknowledgement and event
 /// notifications.
 const EP_FIRMWARE: u8 = 0x20;
 /// RTKit endpoint of host notifications to the firmware.
 const EP_DOORBELL: u8 = 0x21;
 
+/// Host message on the crashlog endpoint that hands a coprocessor a log buffer of the host's
+/// own, which it reaches through its kernel window: the size in 4 KiB pages and the buffer's
+/// address, in the fields of a buffer request but under a type of its own. macOS 27.0 sends it
+/// to both coprocessors once they run, after RTKit has echoed each one's request for the buffer
+/// in its own data segment; without it the firmware asks for that buffer a second time.
+const MSG_LOG_BUFFER: u64 = 0x9 << 52;
+/// Bit position of [`MSG_LOG_BUFFER`]'s size, in 4 KiB pages.
+const MSG_LOG_BUFFER_PAGES_SHIFT: u32 = 44;
+/// Address bits of a buffer that [`MSG_LOG_BUFFER`] carries.
+const MSG_LOG_BUFFER_ADDR_MASK: u64 = (1 << 44) - 1;
 /// Bit position of the type field of firmware messages.
 const MSG_TYPE_SHIFT: u32 = 48;
 /// Host message handing a coprocessor the address of its initialization root.
@@ -621,6 +633,15 @@ impl Coprocessor {
     fn notify(&self, msg: u64) -> Result {
         trace::message(trace::MAILBOX, msg);
         self.rtkit.send(EP_DOORBELL, msg)
+    }
+
+    /// Hands the firmware the host's log buffer ([`MSG_LOG_BUFFER`]).
+    fn publish_log_buffer(&self, va: u64, size: usize) -> Result {
+        let msg = MSG_LOG_BUFFER
+            | (((size >> 12) as u64) << MSG_LOG_BUFFER_PAGES_SHIFT)
+            | (va & MSG_LOG_BUFFER_ADDR_MASK);
+        trace::message(trace::MAILBOX, msg);
+        self.rtkit.send(EP_CRASHLOG, msg)
     }
 
     /// Stops the CPU. The firmware keeps its state, but no longer runs.
@@ -1893,9 +1914,15 @@ impl Gpu {
         let session = &mut **retained;
         // M5 renders take 64-byte metrics records.
         session.queues.metrics = metrics_ids;
-        session.primary.boot().inspect_err(at("primary boot"))?;
-        let secondary = session.secondary.as_mut().ok_or(EINVAL)?;
-        secondary.boot().inspect_err(at("secondary boot"))?;
+        // The J813's macOS 27.0 starts GFX1's coprocessor first and GFX's 330 ms later (aura's
+        // trace), the same way round as the InitData it publishes below.
+        if cfg.chip_id == 0x8142 {
+            session.secondary.as_mut().ok_or(EINVAL)?.boot().inspect_err(at("secondary boot"))?;
+            session.primary.boot().inspect_err(at("primary boot"))?;
+        } else {
+            session.primary.boot().inspect_err(at("primary boot"))?;
+            session.secondary.as_mut().ok_or(EINVAL)?.boot().inspect_err(at("secondary boot"))?;
+        }
         // Both coprocessors run: clear the J813's Fender gating here, where macOS 27.0 clears it
         // (it reads 0x6 and writes 0 after both ASCs are running and the first mailbox exchange).
         if cfg.chip_id == 0x8142 {
@@ -1946,6 +1973,16 @@ impl Gpu {
             // SAFETY: the helper only ioremaps and pokes the mcc dashboard windows.
             if unsafe { asahi_j813_pmp_report_agx(true) } != 0 {
                 dev_warn!(dev.as_ref(), "M5: PMP AGX report failed\n");
+            }
+            // The J813's log buffers, GFX1's first and then GFX's, in macOS 27.0's order and
+            // before any endpoint of theirs is started.
+            for role in [Role::Secondary, Role::Primary] {
+                let (va, size) = initdata::InitData::fw_log(role);
+                let coprocessor = match role {
+                    Role::Primary => &session.primary,
+                    Role::Secondary => session.secondary.as_ref().ok_or(EINVAL)?,
+                };
+                coprocessor.publish_log_buffer(va, size).inspect_err(at("log buffer"))?;
             }
         } else {
             session
