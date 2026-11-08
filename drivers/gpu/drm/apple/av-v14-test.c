@@ -128,6 +128,7 @@ static struct av_v14_test *av_v14_setup(struct kunit *test)
 		DCP_FIRMWARE_V_26_6_DESKTOP : DCP_FIRMWARE_V_14_7;
 	t->dcp->external = true;
 	t->dcp->external_native = true;
+	t->dcp->desktop_external = true;
 
 	init_rwsem(&asrv->srv_rwsem);
 	mutex_init(&asrv->plug_lock);
@@ -429,8 +430,9 @@ static void av_native_link_payload_status(struct kunit *test)
 static void av_desktop_service_admission(struct kunit *test)
 {
 	struct av_v14_test *t = av_v14_setup(test);
-	const char *name = "dcpav-audio-epic";
+	const char *name = "dcpav-audio-interface-epic";
 	bool desktop = t->dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
+	const struct apple_epic_service_ops *ops;
 
 	KUNIT_EXPECT_TRUE(test, dcp_audiosrv_native_link(t->dcp->dev));
 	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, name, name, 0),
@@ -443,6 +445,27 @@ static void av_desktop_service_admission(struct kunit *test)
 			-EINVAL);
 	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, NULL, name, 0), -EINVAL);
 	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, name, name, 1), -EINVAL);
+	/* The provisional pre-capture name is no longer admitted. */
+	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, "dcpav-audio-epic",
+						       "dcpav-audio-epic", 0), -EINVAL);
+	/* "dispext0:dcpav-audio-interface-epic:0" cut to its 31-character field */
+	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, "dcpav-audio-interface-",
+						       "dcpav-audio-interface-", -1), 0);
+	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, "dcpav-audio-interface-",
+						       "dcpav-audio-interface-", 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, "dcpav-audio-i",
+						       "dcpav-audio-i", -1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, "dcpav-audio-interface-epix",
+						       "dcpav-audio-interface-epix", -1), -EINVAL);
+	ops = &av_desktop_ops[0];
+	KUNIT_EXPECT_TRUE(test, afk_compact_cut_of(ops, "dcpav-audio-interface-"));
+	KUNIT_EXPECT_TRUE(test, afk_compact_cut_of(ops, "dcpav-audio-interface-epic:"));
+	KUNIT_EXPECT_FALSE(test, afk_compact_cut_of(ops, "dcpav-audio-interface-epic:0"));
+	KUNIT_EXPECT_FALSE(test, afk_compact_cut_of(ops, "dcpav-audio-epic"));
+	KUNIT_EXPECT_FALSE(test, afk_compact_cut_of(&avep_ops[0], "DCPAVSimpleVideoInter"));
+	/* Only the desktop external processor's own flag admits it. */
+	t->dcp->desktop_external = false;
+	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, name, name, 0), -EINVAL);
 	t->dcp->external = false;
 	KUNIT_EXPECT_FALSE(test, dcp_audiosrv_native_link(t->dcp->dev));
 	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, name, name, 0), -EINVAL);
