@@ -1354,6 +1354,33 @@ static int apple_cio_pcie_tunnel_ready_locked(struct apple_cio *acio)
 	return ret;
 }
 
+/*
+ * PCIe-C is the only native port this host tunnels. Order it after the NHI,
+ * which rebuilds the tunnel underneath it at resume (the job of the ACPI
+ * device links on PC hosts). The link is stateless: it orders system sleep
+ * only and leaves probe and unbind alone, because apple_cio_remove_children()
+ * must stop the NHI while PCIe-C is still bound. Removing either device drops
+ * the link; both are removed together and PCIe-C is populated only once per
+ * NHI, so this runs once per pair.
+ */
+static void apple_cio_link_pcie_tunnel(struct apple_cio *acio)
+{
+	struct platform_device *nhi_pdev = READ_ONCE(acio->nhi_pdev);
+	struct platform_device *pcie_pdev;
+
+	lockdep_assert_held(&acio->pcie_tunnel_lock);
+	pcie_pdev = apple_cio_find_pcie_tunnel(acio);
+	if (!pcie_pdev)
+		return;
+	if (!nhi_pdev ||
+	    !device_link_add(&pcie_pdev->dev, &nhi_pdev->dev, DL_FLAG_STATELESS))
+		dev_warn(acio->dev, "PCIe-C: device link to the NHI failed\n");
+	else
+		dev_dbg(acio->dev, "PCIe-C: linked %s to %s\n",
+			dev_name(&pcie_pdev->dev), dev_name(&nhi_pdev->dev));
+	put_device(&pcie_pdev->dev);
+}
+
 static int apple_cio_activate_pcie_tunnel_locked(struct apple_cio *acio)
 {
 	int ret = 0;
@@ -1383,6 +1410,7 @@ static int apple_cio_activate_pcie_tunnel_locked(struct apple_cio *acio)
 				     "failed to populate tunneled PCIe controller\n");
 
 	acio->pcie_tunnel_populated = true;
+	apple_cio_link_pcie_tunnel(acio);
 	dev_info(acio->dev,
 		 "PCIe-C populated after USB4 PCIe tunnel adapter enable\n");
 	return apple_cio_pcie_tunnel_ready_locked(acio);
@@ -2015,7 +2043,18 @@ static bool apple_nhi_dp_tunnel_awaits_display(struct tb_nhi *nhi,
 	return apple_dpin_awaits_display(&c->state, c->acio->dp);
 }
 
+/*
+ * There are no firmware tables naming the tunneled ports: PCIe-C, when the
+ * port has one, is linked to the NHI as it is populated (see
+ * apple_cio_link_pcie_tunnel()). A port without PCIe-C tunnels no native port.
+ */
+static bool apple_nhi_add_links(struct tb_nhi *nhi)
+{
+	return true;
+}
+
 static const struct tb_nhi_ops apple_nhi_ops = {
+	.add_links = apple_nhi_add_links,
 	.request_ring_irq = apple_nhi_request_irq,
 	.release_ring_irq = apple_nhi_release_irq,
 	.ring_interrupt_active = apple_nhi_ring_interrupt_active,
