@@ -180,6 +180,8 @@ pub(super) struct InitData {
     _single_publisher: core::marker::PhantomData<core::cell::Cell<()>>,
     aliases: KVec<mmu::KernelMapping>,
     objects: KVec<KernelObject>,
+    /// The log buffers published to each [`Role`], for reading back what the firmware wrote.
+    fw_log_objects: [Option<usize>; 2],
     roots: usize,
     cluster: usize,
     bundle: usize,
@@ -291,6 +293,7 @@ impl InitData {
             _single_publisher: core::marker::PhantomData,
             aliases: KVec::new(),
             objects: KVec::new(),
+            fw_log_objects: [None; 2],
             roots: 0,
             cluster: 0,
             bundle: 0,

@@ -132,6 +132,55 @@ impl kernel::debugfs::Writer for PowerView {
     }
 }
 
+/// What each coprocessor has written into the log buffer the host published to it, which is
+/// where an M5 firmware records what it is doing when it never reports a crash.
+pub(super) struct FirmwareLogView(pub(super) kernel::sync::Arc<super::Shared>);
+
+impl kernel::debugfs::Writer for FirmwareLogView {
+    fn write(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        let state = self.0.state.lock();
+        let Some(firmware) = state.as_deref() else {
+            return writeln!(f, "online=0");
+        };
+        for role in [Role::Primary, Role::Secondary] {
+            let bytes = firmware.init.fw_log_bytes(role);
+            let used = bytes.iter().rposition(|byte| *byte != 0).map_or(0, |last| last + 1);
+            writeln!(f, "role={} size={:#x} used={:#x}", role as u32, bytes.len(), used)?;
+            for (index, line) in bytes[..used].chunks(32).enumerate() {
+                write!(f, "  {:#06x}:", index * 32)?;
+                for byte in line {
+                    write!(f, " {:02x}", byte)?;
+                }
+                writeln!(f)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The hardware-data bundle this driver built, for comparing it word for word with the bundle a
+/// machine's own firmware runs on.
+pub(super) struct HardwareDataView(pub(super) kernel::sync::Arc<super::Shared>);
+
+impl kernel::debugfs::Writer for HardwareDataView {
+    fn write(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        let state = self.0.state.lock();
+        let Some(firmware) = state.as_deref() else {
+            return writeln!(f, "online=0");
+        };
+        let bytes = firmware.init.hardware_data_bytes();
+        writeln!(f, "size={:#x}", bytes.len())?;
+        for (index, line) in bytes.chunks(32).enumerate() {
+            write!(f, "{:#06x}:", index * 32)?;
+            for byte in line {
+                write!(f, " {:02x}", byte)?;
+            }
+            writeln!(f)?;
+        }
+        Ok(())
+    }
+}
+
 #[kernel::macros::kunit_tests(asahi_g17_reports)]
 mod tests {
     use super::*;

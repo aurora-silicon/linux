@@ -104,6 +104,22 @@ impl InitData {
         (FW_LOG[role as usize], FW_LOG_SIZE)
     }
 
+    /// A coprocessor's log buffer, as the firmware has left it. Empty before the graph is built.
+    pub(in crate::g17) fn fw_log_bytes(&self, role: Role) -> &[u8] {
+        match self.fw_log_objects[role as usize].and_then(|index| self.object(index).ok()) {
+            Some(object) => object.bytes(),
+            None => &[],
+        }
+    }
+
+    /// The hardware-data bundle as this driver built it, for diffing against a machine's own.
+    pub(in crate::g17) fn hardware_data_bytes(&self) -> &[u8] {
+        match self.object(self.bundle) {
+            Ok(object) => object.bytes(),
+            Err(_) => &[],
+        }
+    }
+
     pub(crate) fn build_m5(&mut self, dev: &AsahiDrmDevice, uat: &mmu::Uat,
         id: &crate::regs::G17Id, board: &m::Board) -> Result {
         use mmu::{PROT_FW_SHARED_RW as RW, PROT_FW_SHARED_RO as RO,
@@ -132,8 +148,9 @@ impl InitData {
         // The J813's log buffers, which the firmware is told about once it runs (see
         // `publish_log_buffer`); it reads and writes them through its own kernel window.
         if common26 {
-            for address in FW_LOG {
-                self.add(fixed_controller(address, FW_LOG_SIZE)?)?;
+            for (role, address) in FW_LOG.into_iter().enumerate() {
+                let object = self.add(fixed_controller(address, FW_LOG_SIZE)?)?;
+                self.fw_log_objects[role] = Some(object);
             }
         }
         let aon_va = if common26 { COMMON26_AON } else { AON };

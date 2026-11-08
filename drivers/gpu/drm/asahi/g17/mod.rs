@@ -1468,6 +1468,8 @@ pub(crate) struct Gpu {
     _capacity: Pin<KBox<kernel::debugfs::File<capacity::View>>>,
     _reports: Pin<KBox<kernel::debugfs::File<reports::View>>>,
     _power: Pin<KBox<kernel::debugfs::File<reports::PowerView>>>,
+    _firmware_log: Pin<KBox<kernel::debugfs::File<reports::FirmwareLogView>>>,
+    _hardware_data: Pin<KBox<kernel::debugfs::File<reports::HardwareDataView>>>,
 }
 
 impl Gpu {
@@ -1659,6 +1661,14 @@ impl Gpu {
             directory.read_only_file(c"power", reports::PowerView(shared.clone())),
             GFP_KERNEL,
         )?;
+        let firmware_log = KBox::pin_init(
+            directory.read_only_file(c"firmware_log", reports::FirmwareLogView(shared.clone())),
+            GFP_KERNEL,
+        )?;
+        let hardware_data = KBox::pin_init(
+            directory.read_only_file(c"hardware_data", reports::HardwareDataView(shared.clone())),
+            GFP_KERNEL,
+        )?;
         let stats = Arc::new(
             crate::stats::StatsSnapshot {
                 g17_reader: Some(stats::Reader(shared.clone())),
@@ -1678,6 +1688,8 @@ impl Gpu {
                 _capacity: capacity,
                 _reports: reports,
                 _power: power,
+                _firmware_log: firmware_log,
+                _hardware_data: hardware_data,
             },
             GFP_KERNEL,
         )?;
@@ -1964,16 +1976,6 @@ impl Gpu {
             .inspect_err(at("root confirmation"))?;
         session.uat.mirror_secondary_root().inspect_err(at("secondary root"))?;
         if cfg.chip_id == 0x8142 {
-            // Bring-up trial: report AGX on through the PMP dashboard in native order (SGX
-            // start control and gating set, before InitData), as macOS does right after the
-            // platform power-on write.
-            extern "C" {
-                fn asahi_j813_pmp_report_agx(on: bool) -> core::ffi::c_int;
-            }
-            // SAFETY: the helper only ioremaps and pokes the mcc dashboard windows.
-            if unsafe { asahi_j813_pmp_report_agx(true) } != 0 {
-                dev_warn!(dev.as_ref(), "M5: PMP AGX report failed\n");
-            }
             // The J813's log buffers, GFX1's first and then GFX's, in macOS 27.0's order and
             // before any endpoint of theirs is started.
             for role in [Role::Secondary, Role::Primary] {
