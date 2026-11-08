@@ -58,6 +58,20 @@ static const struct dcp_m4_profile dcp_m4_profile_j713 = {
 	.timing = dcp_m4_timing_j713, .timing_elements = 1,
 };
 
+/* The J773g uses the shared firmware ABI for an external output, not a panel. */
+static const struct dcp_m4_profile dcp_m4_profile_j773g = {
+	.name = "J773g", .machine = "apple,j773g",
+	.panel_width = 2560, .panel_height = 1664, .notch_rows = 64,
+	.boot_stride = 10240,
+	.swap_size = 0x1bd8, .swap_surface = 0x588, .swap_dva = 0xe38,
+	.swap_nullable = 0x1bcb, .swap_tail = 0x1bd6, .swap_nits = 0x35e,
+	.swap_intent = 0x17c,
+	.disabled_color = 0xff000000,
+	.done_method = 590, .done_size = 0x730, .open_method = 457,
+	.brightness_max = 500, .brightness_default = 120,
+	.width_mm = 0, .height_mm = 0,
+};
+
 /* The J715's panel timing, as macOS reports it (TimingElements, ID 2). */
 static const u32 dcp_m4_timing_j715[2][8] = {
 	{ 2880, 2960, 8, 32, 40, 7710975, 1, 0 },
@@ -106,6 +120,7 @@ static const struct dcp_m4_profile dcp_m4_profile_j604 = {
 
 static const struct dcp_m4_profile *const dcp_m4_profiles[] = {
 	&dcp_m4_profile_j713,
+	&dcp_m4_profile_j773g,
 	&dcp_m4_profile_j715,
 	&dcp_m4_profile_j604,
 };
