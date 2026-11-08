@@ -442,7 +442,7 @@ static int dwc3_apple_pre_host_resume(struct dwc3 *dwc)
 		return 0;
 
 	ret = apple_atcphy_sleep_result(appledwc->usb2_phy);
-	if (ret == -EBUSY)
+	if (ret == -EBUSY || ret == APPLE_ATCPHY_SLEEP_POWER_LOST)
 		ret = 0;
 	if (!ret && appledwc->drd_cfg &&
 	    readl_poll_timeout(appledwc->drd_cfg + DWC3_APPLE_CFG_STATUS, val,
@@ -1175,7 +1175,7 @@ static bool dwc3_apple_sleep_kept(struct dwc3_apple *appledwc)
 		dwc3_apple_check_hub_later(appledwc);
 		return true;
 	}
-	if (!ret || ret == -EBUSY) {
+	if (!ret || ret == -EBUSY || ret == APPLE_ATCPHY_SLEEP_POWER_LOST) {
 		guid = dwc3_readl(dwc, DWC3_GUID);
 		if (guid == DWC3_APPLE_SLEEP_GUID) {
 			dwc3_writel(dwc, DWC3_GUID, appledwc->sleep_guid);

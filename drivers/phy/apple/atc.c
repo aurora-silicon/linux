@@ -578,6 +578,13 @@ enum atcphy_lane_mode {
 #define AUSBC_PWR_EVENT_VDD_OFF BIT(1)
 #define AUSBC_PWR_EVENT_WAKE GENMASK(3, 2)
 #define AUSBC_PWR_TIMEOUT_US 200000
+/*
+ * Held around the PHY's USB3 setup at a sleep's entry and wake, with the controller's
+ * always-on side up: set, acknowledged at once, cleared (measured).
+ */
+#define AUSBC_PWR_PHY_LOCK 0x18
+#define AUSBC_PWR_PHY_LOCK_ACK 0x1c
+#define AUSBC_PWR_PHY_LOCK_US 10000
 
 /* The controller's DARTs the PHY saves and restores around its power for a sleep */
 #define ATCPHY_SLEEP_DARTS 4
@@ -6707,7 +6714,8 @@ static void atcphy_usb2_sleep_exit(struct apple_atcphy *atcphy)
 
 /*
  * macOS's raise from Sleep: D0 asked for, the core's reset released, D0_ON awaited. Returns
- * -ENODEV only if the core may be unpowered, when touching its registers would be an SError.
+ * APPLE_ATCPHY_SLEEP_POWER_LOST for a block that lost power, and -ENODEV only if the core
+ * may be unpowered, when touching its registers would be an SError.
  * With @went_off the core's rail is known to have gone off, so only D0_ON will do. Otherwise
  * a core no longer reporting SLEEP has left hibernation, and the event alone is missing.
  */
@@ -6719,6 +6727,9 @@ static int atcphy_controller_d0(struct apple_atcphy *atcphy, bool went_off)
 
 	/* All zeros: the block lost power in the sleep and was reset, so no D0_ON will come. */
 	status = readl(pc + AUSBC_PWR_STATUS);
+	val = readl(pc + AUSBC_PWR_EVENTS);
+	if (!went_off && (val & AUSBC_PWR_EVENT_WAKE))
+		dev_dbg(atcphy->dev, "USB controller's wake event up at the wake: %#x\n", val);
 	mask32(pc + AUSBC_PWR_ENABLE, AUSBC_PWR_EVENT_MASK, 0);
 	clear32(pc + AUSBC_PWR_CFG, AUSBC_PWR_CFG_STATE_REQ);
 	/* As the reset's release does: a block that lost its state may have the clamp on. */
@@ -6727,7 +6738,7 @@ static int atcphy_controller_d0(struct apple_atcphy *atcphy, bool went_off)
 	set32(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N);
 	if (!went_off && !status) {
 		dev_dbg(atcphy->dev, "USB controller lost its power state in the sleep\n");
-		return 0;
+		return APPLE_ATCPHY_SLEEP_POWER_LOST;
 	}
 	ret = readl_poll_timeout(pc + AUSBC_PWR_EVENTS, val, val & AUSBC_PWR_EVENT_D0_ON, 100,
 				 AUSBC_PWR_TIMEOUT_US);
@@ -6912,20 +6923,43 @@ static int atcphy_common_restore(struct apple_atcphy *atcphy)
  * The wake's path, and that of an entry that failed after the hibernation: the domains,
  * the USB2 PHY, the common block if it went off, then D0. See atcphy_controller_d0().
  */
+static void atcphy_phy_lock(struct apple_atcphy *atcphy, bool lock)
+{
+	void __iomem *pc = atcphy->regs.pwrctl;
+	u32 val;
+
+	writel(lock, pc + AUSBC_PWR_PHY_LOCK);
+	if (readl_poll_timeout(pc + AUSBC_PWR_PHY_LOCK_ACK, val, !!(val & BIT(0)) == lock, 10,
+			       AUSBC_PWR_PHY_LOCK_US))
+		dev_warn(atcphy->dev, "PHY lock %s not acknowledged: %#x\n",
+			 lock ? "request" : "release", val);
+}
+
 static int atcphy_sleep_come_back(struct apple_atcphy *atcphy, bool common_lost, bool went_off)
 {
-	int ret = 0;
+	bool kept;
+	int ret = 0, d0;
 
 	if (atcphy->sleep_powered_down && atcphy_sleep_power_up(atcphy))
 		return -ENODEV;
 	atcphy_usb2_sleep_exit(atcphy);
-	if (common_lost) {
+	/* Not all zeros: the always-on side kept power, and the link with it. */
+	kept = readl(atcphy->regs.pwrctl + AUSBC_PWR_STATUS);
+	if (common_lost && kept && atcphy->mode == APPLE_ATCPHY_MODE_USB2) {
+		/* As macOS: USB2 needs nothing of the core, which a mode change sets up. */
+		atcphy_forget_common_state(atcphy);
+	} else if (common_lost) {
+		if (kept)
+			atcphy_phy_lock(atcphy, true);
 		ret = atcphy_common_restore(atcphy);
+		if (kept)
+			atcphy_phy_lock(atcphy, false);
 		if (ret)
 			dev_err(atcphy->dev, "PHY not set up again after the sleep: %d\n", ret);
 	}
 
-	return atcphy_controller_d0(atcphy, went_off) ?: ret;
+	d0 = atcphy_controller_d0(atcphy, went_off);
+	return d0 < 0 ? d0 : ret ?: d0;
 }
 
 static int atcphy_suspend_noirq(struct device *dev)
@@ -6998,13 +7032,16 @@ static int atcphy_resume_noirq(struct device *dev)
 	/* The PHY took ATC0_COMMON down itself, so this goes for a refused sleep too. */
 	atcphy->sleep_ret = atcphy_sleep_come_back(atcphy, true, false);
 	atcphy->hibernated = false;
-	if (!atcphy->sleep_ret) {
-		dev_dbg(dev, "USB controller back in D0 after the sleep, PHY in mode %d\n",
+	if (!atcphy->sleep_ret)
+		dev_dbg(dev, "USB controller back in D0 after the sleep, always-on side kept, PHY in mode %d\n",
+			atcphy->mode);
+	if (atcphy->sleep_ret == APPLE_ATCPHY_SLEEP_POWER_LOST) {
+		dev_dbg(dev, "USB controller back in D0 after the sleep, always-on side lost, PHY in mode %d\n",
 			atcphy->mode);
 		/*
-		 * The APB reset may have taken the secondary bank's defaults. That bank is next
-		 * to the core and macOS's PHY exit doesn't touch it, so it may be under the core's
-		 * rail, and an access to it with the rail off would be an SError: only now.
+		 * The secondary bank may have lost its defaults. It's next to the core, maybe
+		 * under the core's rail, and an access with the rail off would be an SError:
+		 * only now. macOS writes nothing there at a wake that kept the always-on side.
 		 */
 		apple_tunable_apply(atcphy->regs.usb2phy_reg, atcphy->tunables.usb2phy_reg_dflt);
 	}
@@ -7093,7 +7130,7 @@ void apple_atcphy_sleep_finish(struct phy *usb2_phy, bool kept)
 	if (!atcphy)
 		return;
 	scoped_guard(mutex, &atcphy->lock) {
-		if (!kept && atcphy->sleep_ret && atcphy->sleep_ret != -EBUSY)
+		if (!kept && atcphy->sleep_ret < 0 && atcphy->sleep_ret != -EBUSY)
 			atcphy->sleep_no_keep = true;
 		atcphy->sleep_in_place = false;
 		atcphy->sleep_ret = 0;

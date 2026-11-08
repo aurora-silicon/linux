@@ -21,9 +21,13 @@ struct phy;
  */
 int apple_atcphy_sleep_prepare(struct phy *usb2_phy);
 
+/* In D0 after the sleep, but its always-on side lost power, so xHCI's saved state is gone. */
+#define APPLE_ATCPHY_SLEEP_POWER_LOST	1
+
 /*
- * After the sleep: 0 if the controller is in D0. -ENODEV if it may be unpowered, so that its
- * registers must not be touched. Any other error: it's in D0, but the PHY isn't set up for it.
+ * After the sleep: 0 if the controller is in D0 and its always-on side kept power, or
+ * APPLE_ATCPHY_SLEEP_POWER_LOST. -ENODEV if it may be unpowered, so that its registers must
+ * not be touched. Any other error: it's in D0, but the PHY isn't set up for it.
  */
 int apple_atcphy_sleep_result(struct phy *usb2_phy);
 
