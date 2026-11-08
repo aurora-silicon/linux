@@ -159,6 +159,7 @@ static inline int apple_dart_host_resume(struct device *dev) { return -EOPNOTSUP
 
 /* For a consumer whose firmware gates itself around a firmware-driven suspend. */
 #if IS_REACHABLE(CONFIG_APPLE_DART)
+bool apple_dart_sleep_listed(struct device *dev);
 int apple_dart_sleep_prepare(struct device *dev);
 void apple_dart_sleep_restore(struct device *dev);
 /* A display DART's streams around a display power cycle, see the DART driver. */
@@ -170,7 +171,13 @@ void apple_dart_power_dark(struct device *dev, bool dark);
 /* A DART's state kept across its consumer's own power cycle, outside a system sleep. */
 int apple_dart_state_save(struct device *dev);
 int apple_dart_state_restore(struct device *dev);
+void apple_dart_sleep_restore_lost(struct device *dev, bool lost);
 #else
+static inline bool apple_dart_sleep_listed(struct device *dev)
+{
+	return false;
+}
+
 static inline int apple_dart_sleep_prepare(struct device *dev)
 {
 	return -ENODEV;
@@ -203,6 +210,10 @@ static inline int apple_dart_state_save(struct device *dev)
 static inline int apple_dart_state_restore(struct device *dev)
 {
 	return -ENODEV;
+}
+
+static inline void apple_dart_sleep_restore_lost(struct device *dev, bool lost)
+{
 }
 #endif
 

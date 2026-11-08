@@ -325,6 +325,8 @@ struct apple_dart {
 	u32 power_retained : 1;
 	/* State a consumer saved for a firmware-driven suspend and will restore. */
 	u32 sleep_saved : 1;
+	/* Its prepare list stopped the streams, and TLB commands wait for the restore. */
+	u32 sleep_gated : 1;
 	/* Locked roots may hold firmware slots that mirror Linux mappings. */
 	u32 fw_mirror : 1;
 	u32 fw_handoff : 1;
@@ -5292,6 +5294,35 @@ static void apple_dart_sleep_wait_tlb(struct apple_dart *dart)
 		dev_err(dart->dev, "TLB command still busy around a sleep: %#x\n", status);
 }
 
+/* Whether a sleep list stops streams, which the restore then has to start again. */
+static bool apple_dart_sleep_list_stops_streams(struct apple_dart *dart,
+						const struct apple_dart_sleep_list *list)
+{
+	unsigned int i;
+
+	if (dart->hw->type != DART_T8110)
+		return false;
+	for (i = 0; i < list->count; i++)
+		if (list->pairs[2 * i] >= DART_T8110_DISABLE_STREAMS &&
+		    list->pairs[2 * i] < DART_T8110_DISABLE_STREAMS + 0x20)
+			return true;
+	return false;
+}
+
+/**
+ * apple_dart_sleep_listed() - Whether a DART's consumer saves and restores it for a sleep
+ * @dev: the DART
+ *
+ * Return: true if its node has apple,sleep-restore and the DART driver is bound.
+ */
+bool apple_dart_sleep_listed(struct device *dev)
+{
+	struct apple_dart *dart = dev_get_drvdata(dev);
+
+	return dart && dart->sleep_restore.count;
+}
+EXPORT_SYMBOL_GPL(apple_dart_sleep_listed);
+
 /**
  * apple_dart_sleep_prepare() - Save a DART whose consumer is about to gate itself
  * @dev: the DART
@@ -5300,7 +5331,8 @@ static void apple_dart_sleep_wait_tlb(struct apple_dart *dart)
  * telling its firmware to sleep, while the DART's state can be read, and
  * apple_dart_sleep_restore() before starting that firmware again. The DART's own
  * callbacks then leave it alone. Without the property nothing happens here, and
- * they do what they always do.
+ * they do what they always do. The state is saved before apple,sleep-prepare is
+ * written, so that list may stop the streams.
  *
  * Return: 0, or -ENODEV if the DART driver isn't bound.
  */
@@ -5317,11 +5349,17 @@ int apple_dart_sleep_prepare(struct device *dev)
 
 	apple_dart_sleep_cfg_read(dart, dart->sleep_cfg);
 	spin_lock_irqsave(&dart->lock, flags);
-	apple_dart_sleep_write(dart, &dart->sleep_prepare);
-	apple_dart_sleep_wait_tlb(dart);
 	apple_dart_save_state(dart);
 	for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
 		dart->sleep_enable[i] = apple_dart_readl(dart, dart->hw->enable_streams + 4 * i);
+	apple_dart_sleep_write(dart, &dart->sleep_prepare);
+	apple_dart_sleep_wait_tlb(dart);
+	/* Flushed with no stream left to fill it: nothing may reach a DART whose power goes. */
+	if (apple_dart_sleep_list_stops_streams(dart, &dart->sleep_prepare) &&
+	    !dart->commands_gated) {
+		WRITE_ONCE(dart->commands_gated, true);
+		dart->sleep_gated = true;
+	}
 	dart->sleep_saved = true;
 	spin_unlock_irqrestore(&dart->lock, flags);
 
@@ -5330,13 +5368,14 @@ int apple_dart_sleep_prepare(struct device *dev)
 EXPORT_SYMBOL_GPL(apple_dart_sleep_prepare);
 
 /**
- * apple_dart_sleep_restore() - Put back a DART saved by apple_dart_sleep_prepare()
+ * apple_dart_sleep_restore_lost() - Put back a DART saved by apple_dart_sleep_prepare()
  * @dev: the DART
+ * @lost: its power went off since, so its registers are at their reset values
  *
- * A real sleep loses the DART's registers. A suspend that was refused lost nothing,
- * so nothing is written then.
+ * A DART that kept its registers only gets back what its prepare list stopped: the late
+ * list and the streams.
  */
-void apple_dart_sleep_restore(struct device *dev)
+void apple_dart_sleep_restore_lost(struct device *dev, bool lost)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
 	unsigned int sid, idx, i;
@@ -5347,7 +5386,7 @@ void apple_dart_sleep_restore(struct device *dev)
 
 	spin_lock_irqsave(&dart->lock, flags);
 	dart->sleep_saved = false;
-	if (pm_resume_via_firmware()) {
+	if (lost) {
 		apple_dart_sleep_write_kept(dart, &dart->sleep_restore);
 		for (sid = 0; sid < dart->num_streams; sid++) {
 			if (!dart->save_tcr[sid] && !dart->save_ttbr[sid][0])
@@ -5357,13 +5396,32 @@ void apple_dart_sleep_restore(struct device *dev)
 				apple_dart_writel(dart, dart->save_ttbr[sid][idx],
 						  DART_TTBR(dart, sid, idx));
 		}
+	}
+	if (lost || dart->sleep_gated) {
 		apple_dart_sleep_write_kept(dart, &dart->sleep_restore_late);
 		for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
 			apple_dart_writel(dart, dart->sleep_enable[i],
 					  dart->hw->enable_streams + 4 * i);
 		apple_dart_sleep_wait_tlb(dart);
 	}
+	if (dart->sleep_gated) {
+		dart->sleep_gated = false;
+		WRITE_ONCE(dart->commands_gated, false);
+	}
 	spin_unlock_irqrestore(&dart->lock, flags);
+}
+EXPORT_SYMBOL_GPL(apple_dart_sleep_restore_lost);
+
+/**
+ * apple_dart_sleep_restore() - The same, for a consumer whose DART loses its registers
+ * only in a real sleep
+ * @dev: the DART
+ *
+ * A suspend that was refused lost nothing, so nothing is written then.
+ */
+void apple_dart_sleep_restore(struct device *dev)
+{
+	apple_dart_sleep_restore_lost(dev, pm_resume_via_firmware());
 }
 EXPORT_SYMBOL_GPL(apple_dart_sleep_restore);
 
