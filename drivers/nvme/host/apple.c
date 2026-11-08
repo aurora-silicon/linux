@@ -14,6 +14,7 @@
 #include <linux/blk-crypto-profile.h>
 #include <linux/blkdev.h>
 #include <linux/blk-mq.h>
+#include <linux/crash_dump.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
@@ -1612,6 +1613,38 @@ static void apple_nvme_wait_freeze(struct apple_nvme *anv)
 	}
 }
 
+/*
+ * Stop the pre-M4 ANS session a crashed kernel left running, so that the
+ * reset path restarts the coprocessor from scratch. Each step is best effort:
+ * if the old session does not answer, the PMGR reset still stops it.
+ */
+static void apple_nvme_stop_crashed_session(struct apple_nvme *anv)
+{
+	int ret;
+
+	anv->ctrl.cap = readq(anv->mmio_nvme + NVME_REG_CAP);
+	anv->ctrl.ctrl_config = readl(anv->mmio_nvme + NVME_REG_CC);
+	dev_info(anv->dev,
+		 "crash kernel: ANS still running (CC=%#x CSTS=%#x), restarting it\n",
+		 anv->ctrl.ctrl_config, readl(anv->mmio_nvme + NVME_REG_CSTS));
+
+	ret = apple_rtkit_adopt_running(anv->rtk);
+	if (!ret && (anv->ctrl.ctrl_config & NVME_CC_ENABLE))
+		ret = nvme_disable_ctrl(&anv->ctrl, false);
+	if (!ret)
+		ret = apple_rtkit_shutdown(anv->rtk);
+	if (ret) {
+		dev_warn(anv->dev,
+			 "crash kernel: old ANS session did not stop (%d), resetting it\n",
+			 ret);
+		/* Forget the old session; the reset below discards it. */
+		apple_rtkit_reinit(anv->rtk);
+	}
+
+	writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
+	anv->ctrl.ctrl_config = 0;
+}
+
 static void apple_nvme_reset_work(struct work_struct *work)
 {
 	unsigned int nr_io_queues = 1;
@@ -1677,6 +1710,17 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		}
 		goto rtkit_ready;
 	}
+
+	/*
+	 * A crashed kernel never stops ANS, so on pre-M4 the crash kernel finds
+	 * the coprocessor still running the old kernel's RTKit session. That
+	 * session does not repeat HELLO and EPMAP, so a wake cannot work. Take
+	 * the session over, stop it and restart ANS through the cold path below.
+	 */
+	if (inherited && !anv->hw->needs_ioq_registers && is_kdump_kernel() &&
+	    (readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
+	     APPLE_ANS_COPROC_CPU_CONTROL_RUN))
+		apple_nvme_stop_crashed_session(anv);
 
 	/*
 	 * RTKit must be shut down cleanly for the (soft)-reset to work, except
