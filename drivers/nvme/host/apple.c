@@ -1621,6 +1621,7 @@ static void apple_nvme_reset_work(struct work_struct *work)
 	struct apple_nvme *anv =
 		container_of(work, struct apple_nvme, ctrl.reset_work);
 	enum nvme_ctrl_state state = nvme_ctrl_state(&anv->ctrl);
+	bool inherited = !anv->owns_rtkit;
 
 	if (anv->hw->needs_ioq_registers) {
 		mutex_lock(&anv->disable_lock);
@@ -1771,6 +1772,24 @@ rtkit_ready:
 	}
 
 	dev_dbg(anv->dev, "ANS booted successfully.");
+
+	/*
+	 * Pre-M4 ANS keeps running across a kexec, and a crashed kernel hands
+	 * it to the crash kernel with the controller still enabled on its own
+	 * queues. Woken this way, it would ignore the queue registers below,
+	 * which may only change while CC.EN is clear. Disable it first.
+	 */
+	if (inherited && !anv->hw->needs_ioq_registers) {
+		anv->ctrl.cap = readq(anv->mmio_nvme + NVME_REG_CAP);
+		anv->ctrl.ctrl_config = readl(anv->mmio_nvme + NVME_REG_CC);
+		if (anv->ctrl.ctrl_config & NVME_CC_ENABLE) {
+			dev_info(anv->dev,
+				 "controller handed over enabled, disabling it\n");
+			ret = nvme_disable_ctrl(&anv->ctrl, false);
+			if (ret)
+				goto out;
+		}
+	}
 
 	/*
 	 * Limit the max command size to prevent iod->sg allocations going
