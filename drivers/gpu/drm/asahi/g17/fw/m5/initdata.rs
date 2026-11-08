@@ -1791,6 +1791,19 @@ pub(crate) const M5_HW_DATA_INSERT: usize = 0x267c;
 
 pub(crate) const M5_HW_DATA_INSERT_LEN: usize = 8;
 
+/// The HW data word that bounds how long the GPU may take to pause scheduling, us. The M5
+/// encoding holds the inherited fixed word (150) there: [`COMMON26_HW_FIXED_WORD_OFFSET`] moved
+/// by the M5 insert. Measured on a J716s under a ten-minute mixed client load: with 150 here, three
+/// GPU recoveries occurred, all with firmware reason 5 (a scheduling pause that timed out); with
+/// 2000 here, the same load produced none. One run each. This is the M5 Pro's offset; a board
+/// without the insert has the word eight bytes lower ([`hw_offset`]).
+pub(crate) const M5_HW_PAUSE_TIMEOUT_US: usize = 0x271c;
+
+const _: () = assert!(
+    M5_HW_DATA_INSERT < COMMON26_HW_FIXED_WORD_OFFSET
+        && COMMON26_HW_FIXED_WORD_OFFSET + M5_HW_DATA_INSERT_LEN == M5_HW_PAUSE_TIMEOUT_US
+);
+
 /// The common 26A428 private cluster (J873, J813): status config 0x6d0 bytes, the secondary
 /// root's second extra 0x60.
 pub(crate) const COMMON26_PRIVATE_LAYOUT: PrivateClusterLayout =
