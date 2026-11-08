@@ -200,11 +200,10 @@ static inline int dcp_adt_value(struct dcp_adt_tables *out,
 			seg->kind = get_unaligned_le32(record + 28);
 		}
 	} else if (kind == 6 && !strcmp(name, "uuid")) {
-		static const char uuid[] = "81BAF476-679D-3CC0-8C6A-E6B6FA659D5E";
-
+		/* Any image: the firmware version gates the layout. */
 		bit = 64;
-		if (length != sizeof(uuid) || memcmp(value, uuid, sizeof(uuid)))
-			return -ENODEV;
+		if (length != 37 || value[36])
+			return -EINVAL;
 	} else if (kind == 6 && !strcmp(name, "segment-names")) {
 		size_t names = strlen(inst->segment_names) + 1;
 

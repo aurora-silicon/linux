@@ -96,6 +96,9 @@ allOf:
             - items:
                 - const: apple,t6041-avd
                 - const: apple,t8132-avd
+            - items:
+                - const: apple,t6050-avd
+                - const: apple,t8142-avd
             - enum:
                 - apple,t8103-avd
                 - apple,t6000-avd

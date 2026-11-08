@@ -8,12 +8,47 @@
 //! propagate to the device owner. Device-control publication reserves one
 //! empty slot and orders the record, power tally and producer together.
 
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{fence, AtomicU64, Ordering};
 use kernel::{device::Device, prelude::*};
 
 use super::fw::{channels::*, initdata::status};
 use super::initdata::InitData;
 use super::Role;
+
+/// Device-control records published since the driver loaded. Counted across firmware
+/// restarts, so it only grows.
+static CONTROL_PUBLISHED: AtomicU64 = AtomicU64::new(0);
+/// The largest count of published records the firmware is known to have consumed.
+static CONTROL_CONSUMED: AtomicU64 = AtomicU64::new(0);
+
+/// Firmware progress fences for host identities and storage that the firmware may still
+/// name after their owner let go of them.
+///
+/// The firmware consumes device-control records in order. Once it has consumed a record
+/// published after an owner released something, it has finished with every record before
+/// that one, including the release that retired the owner. [`fence`](control_fence) is that
+/// next record; [`witnessed`](control_witnessed) says how far the firmware got. A fence of
+/// zero is always met.
+pub(crate) fn control_fence() -> u64 {
+    CONTROL_PUBLISHED.load(Ordering::Acquire) + 1
+}
+
+/// The control-ring progress the firmware has shown so far (see [`control_fence`]).
+pub(crate) fn control_witnessed() -> u64 {
+    CONTROL_CONSUMED.load(Ordering::Acquire)
+}
+
+/// Records how far the firmware consumed the control ring. Call under the device mutex,
+/// which also serializes publication, with cursors read after any publication by the caller.
+/// A restarted firmware has nothing pending, so everything published so far counts.
+pub(crate) fn observe_control(consumer: u32, producer: u32) {
+    if consumer >= DEVICE_CONTROL_SLOTS || producer >= DEVICE_CONTROL_SLOTS {
+        return;
+    }
+    let pending = u64::from(producer.wrapping_sub(consumer) & (DEVICE_CONTROL_SLOTS - 1));
+    let consumed = CONTROL_PUBLISHED.load(Ordering::Acquire).saturating_sub(pending);
+    CONTROL_CONSUMED.fetch_max(consumed, Ordering::AcqRel);
+}
 
 /// Firmware rings whose contents do not affect host scheduling.
 #[derive(Copy, Clone, Debug)]
@@ -282,6 +317,8 @@ impl Rings {
             record.opcode().asserts_gpu_power(),
             next,
         )?;
+        CONTROL_PUBLISHED.fetch_add(1, Ordering::AcqRel);
+        observe_control(consumer, next);
         super::trace::message(super::trace::CONTROL, record.opcode() as u64);
         Ok(next)
     }

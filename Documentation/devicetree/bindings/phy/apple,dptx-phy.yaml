@@ -21,26 +21,49 @@ select:
     compatible:
       contains:
         enum:
+          - apple,t6050-dptx-phy
           - apple,t8122-dptx-phy
   required:
     - compatible
 
 properties:
   compatible:
-    items:
-      - enum:
-          - apple,t8122-dptx-phy
-      - const: apple,dptx-phy
+    oneOf:
+      - items:
+          - enum:
+              - apple,t8122-dptx-phy
+          - const: apple,dptx-phy
+      - const: apple,t6050-dptx-phy
 
   reg:
     minItems: 2
     maxItems: 2
+
+  reg-names:
+    items:
+      - const: core
+      - const: dptx
 
   power-domains:
     maxItems: 1
 
   '#phy-cells':
     const: 0
+
+  '#reset-cells':
+    const: 0
+
+  apple,ufp-endpoint:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      The display crossbar's upstream-facing endpoint that feeds this PHY.
+
+patternProperties:
+  '^apple,(pll-(dcocfg|dtcvreg|dtccal|dcdadj|dlfcfg)|pclkdrv-select)$':
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      PLL and pixel clock driver settings the PHY is programmed with, as the
+      ADT's lpdptx-phy node gives them.
 
 required:
   - compatible

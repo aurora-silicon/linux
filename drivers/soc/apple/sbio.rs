@@ -190,6 +190,25 @@ mod lockout_tests {
     }
 
     #[test]
+    fn after_boot_wait_reports_locked() {
+        use crate::bio::{Lockout, LOCKOUT_FLAG_AFTER_BOOT, LOCKOUT_FLAG_EVERY_PASSWORD};
+        let plain = Lockout::new(false, false, 2);
+        assert_eq!(plain.locked, 0);
+        assert_eq!(plain.failures, 2);
+        assert_eq!(plain.flags, LOCKOUT_FLAG_EVERY_PASSWORD);
+        let waiting = Lockout::new(false, true, 0);
+        assert_eq!(waiting.locked, 1);
+        assert_eq!(waiting.flags, LOCKOUT_FLAG_EVERY_PASSWORD | LOCKOUT_FLAG_AFTER_BOOT);
+        // A lockout and the wait together: one password ends both.
+        let both = Lockout::new(true, true, 5);
+        assert_eq!(both.locked, 1);
+        assert_ne!(both.flags & LOCKOUT_FLAG_AFTER_BOOT, 0);
+        let locked = Lockout::new(true, false, 5);
+        assert_eq!(locked.locked, 1);
+        assert_eq!(locked.flags & LOCKOUT_FLAG_AFTER_BOOT, 0);
+    }
+
+    #[test]
     fn record_round_trips() {
         assert!(lockout_record_locked(&lockout_record(true, 5)));
         assert!(!lockout_record_locked(&lockout_record(false, 0)));
@@ -2412,6 +2431,22 @@ impl SepData {
     }
 
     pub(crate) fn run_verify(&self) {
+        // Asked to wait for the first password since boot, as macOS does
+        // after a restart: nothing is wrong with the finger or the enclave,
+        // so refuse at once, before any capture.
+        if self.bio_after_boot.load(Relaxed) {
+            if !self.bio_lockout_logged.xchg(true, Relaxed) {
+                dev_info!(
+                    self.dev,
+                    "verify: Touch ID waits for the first password since this boot; refusing without a capture until a password authentication\n"
+                );
+            }
+            self.finish_verify(
+                bio::VerifyOutcome::Failed(ENROL_STATUS_LOCKOUT),
+                [0u8; bio::TOKEN_LEN],
+            );
+            return;
+        }
         // A capture now would only be refused at MATCH_RESULT again, so do
         // not ask the user to touch the sensor for it.
         if self.bio_lockout.load(Relaxed) {
@@ -5028,7 +5063,11 @@ impl SepData {
                 } else {
                     self.read_lockout_record()
                 };
-                let state = bio::Lockout::new(locked, self.bio_nomatch_streak.load(Relaxed));
+                let state = bio::Lockout::new(
+                    locked,
+                    self.bio_after_boot.load(Relaxed),
+                    self.bio_nomatch_streak.load(Relaxed),
+                );
                 kernel::uaccess::UserSlice::new(
                     kernel::uaccess::UserPtr::from_addr(arg),
                     core::mem::size_of::<bio::Lockout>(),
@@ -5055,6 +5094,17 @@ impl SepData {
                 copied?;
                 self.rearm_after_password(crate::Secret(bytes))
             }
+            bio::IOC_REQUIRE_PASSWORD => {
+                bio::require_admin()?;
+                if !self.bio_after_boot.xchg(true, Relaxed) {
+                    self.bio_lockout_logged.store(false, Relaxed);
+                    dev_info!(
+                        self.dev,
+                        "Touch ID: waits for the first password since this boot (as macOS after a restart); every verify is refused until then\n"
+                    );
+                }
+                Ok(())
+            }
             _ => Err(ENOTTY),
         }
     }
@@ -5066,6 +5116,15 @@ impl SepData {
     /// ends the enclave's lockout. A new SCRD match context is then set up and
     /// the enclave's lockout record is saved.
     fn rearm_after_password(&self, _password: crate::Secret) -> Result<()> {
+        // The first password since boot is all the after-boot wait needs;
+        // a lockout or failed matches are handled below as for any password.
+        if self.bio_after_boot.xchg(false, Relaxed) {
+            self.bio_lockout_logged.store(false, Relaxed);
+            dev_info!(
+                self.dev,
+                "Touch ID: armed by the first password since this boot\n"
+            );
+        }
         if !self.touchid_started.load(Relaxed) {
             // Activation sets up a fresh match credential; only the record of
             // a lockout from before the restart is left to clear.

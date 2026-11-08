@@ -20,7 +20,9 @@ properties:
           - const: apple,t8152-secure-mailbox
           - const: apple,secure-mailbox
       - items:
-          - const: apple,t8142-secure-mailbox
+          - enum:
+              - apple,t6050-secure-mailbox
+              - apple,t8142-secure-mailbox
           - const: apple,secure-mailbox
       - items:
           - const: apple,t8140-secure-mailbox
