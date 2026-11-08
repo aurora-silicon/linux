@@ -122,7 +122,7 @@ static struct hwx_fixture *fixture_create(struct kunit *test, bool mixed, bool k
 	put_unaligned_le32(U32_MAX, c + 0x83c);
 	put_unaligned_le32(0xffff, c + 0x844);
 	put_unaligned_le32(mixed ? 0x8b8 : 0x898, c + 0x848);
-	put_unaligned_le32(0x10, c + 0x860);
+	put_unaligned_le32(1, c + 0x860);
 	put_unaligned_le32(4, c + 0x868);
 	put_unaligned_le32(mixed ? 4 : 2, c + 0x870);
 	put_unaligned_le32(mixed ? 2 : 7, c + 0x878);
