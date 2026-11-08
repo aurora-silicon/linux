@@ -88,12 +88,18 @@ struct dwc3_apple {
 	/* Stopped for a deep sleep, and the state to bring back. */
 	bool sleep_stopped;
 	enum dwc3_apple_state sleep_state;
+	/* Votes sleep DDR while the host is up; the fixtures leave it off. */
+	bool sleep_ddr;
 	bool rpm_held, host_only;
 	/* T8132 only: runtime PM before the first core probe; never set here. */
 	bool pre_core_rpm;
 	bool dt_dis_u3_susphy;
 	unsigned long usb2_power_off_pending, usb3_power_off_pending;
 };
+static void __attribute__((unused)) apple_sleep_usb_slp_ddr(bool on)
+{
+	(void)on;
+}
 static unsigned int polls, fail_poll, reset_calls, reset_writes, core_writes;
 static unsigned int host_exits, clocks_disabled, callback_calls;
 static unsigned int gadget_exits, event_cleanups, legacy_suspends,

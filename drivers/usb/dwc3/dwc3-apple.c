@@ -143,6 +143,7 @@
  * @rpm_held: The glue holds a runtime PM reference for the running core
  * @pre_core_rpm: Runtime PM is the glue's own until the first core bring-up
  * @dt_dis_u3_susphy: The device tree keeps USB3 PHY suspend off itself
+ * @sleep_ddr: The host votes for DRAM in a sleep while it runs (apple,sleep-ddr)
  * @drd_cfg: The controller's configuration block (optional, for its tunable)
  * @tunables: Controller tunables from the device tree, see dwc3_apple_tunable_list
  */
@@ -175,6 +176,7 @@ struct dwc3_apple {
 	bool rpm_held;
 	bool pre_core_rpm;
 	bool dt_dis_u3_susphy;
+	bool sleep_ddr;
 	struct notifier_block pm_nb;
 	/* Kept through a deep sleep, with the PHY's hibernation, and the GUID it had. */
 	bool sleep_in_place;
@@ -863,6 +865,9 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 	}
 
 	appledwc->state = state;
+	/* macOS votes USB_SLP_DDR from here until the host's Off, through every sleep. */
+	if (state == DWC3_APPLE_HOST && appledwc->sleep_ddr)
+		apple_sleep_usb_slp_ddr(true);
 	/*
 	 * A connected cable leaves the Apple DWC3 core and its PHY as one live,
 	 * stateful unit.  The glue driver tears that unit down explicitly on a
@@ -1048,6 +1053,8 @@ static int dwc3_apple_exit(struct dwc3_apple *appledwc)
 		appledwc->dwc.dis_u3_susphy_quirk = appledwc->dt_dis_u3_susphy;
 		dwc3_host_exit(&appledwc->dwc);
 		appledwc->state = DWC3_APPLE_NO_CABLE;
+		if (appledwc->sleep_ddr)
+			apple_sleep_usb_slp_ddr(false);
 		break;
 	}
 
@@ -1353,6 +1360,7 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	appledwc->fixed_hub = dwc3_apple_has_fixed_hub(dev, &appledwc->hub_port);
 	appledwc->host_only = dwc3_apple_host_only(dev);
 	appledwc->dt_dis_u3_susphy = device_property_read_bool(dev, "snps,dis_u3_susphy_quirk");
+	appledwc->sleep_ddr = device_property_read_bool(dev, "apple,sleep-ddr");
 	/* The PHY driver and the DARTs follow runtime PM on these SoCs. */
 	appledwc->idle_rpm = of_device_is_compatible(dev->of_node, "apple,t6040-dwc3") ||
 			     of_device_is_compatible(dev->of_node, "apple,t8132-dwc3");

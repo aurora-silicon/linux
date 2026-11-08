@@ -48,6 +48,7 @@
 #include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/soc/apple/tunable.h>
+#include <linux/spinlock.h>
 #include <linux/suspend.h>
 #include <clocksource/arm_arch_timer.h>
 #include <dt-bindings/gpio/gpio.h>
@@ -215,8 +216,12 @@ struct t8140_s2r_mailbox {
 #define DCS_STEP_STATE		6
 #define DCS_TIMEOUT_US		5000
 
-/* Word 0 of the wake block. macOS clears it at boot, and sets it only for a device's DDR use. */
+/*
+ * Word 0 of the wake block. Bit 0 lets the sleep keep DRAM for the USB host's always-on side.
+ * macOS sets it from the host's start to its stop, not at the commit.
+ */
 #define WAKE_SLP_DDR		0x00
+#define WAKE_SLP_DDR_USB	BIT(0)
 
 /*
  * AMCC error enables. Any error enabled and pending at the commit turns the
@@ -535,6 +540,32 @@ bool apple_sleep_usb_port_can_wake(unsigned int port)
 	return port < BITS_PER_LONG && (READ_ONCE(t8140_usb_wake_ports) & BIT(port));
 }
 EXPORT_SYMBOL_GPL(apple_sleep_usb_port_can_wake);
+
+/* The USB host's vote, kept until the word is mapped. Only bit 0 is touched, as on macOS. */
+static DEFINE_SPINLOCK(t8140_slp_ddr_lock);
+static bool t8140_slp_ddr_usb;
+static void __iomem *t8140_slp_ddr_word;
+
+static void t8140_slp_ddr_write(void)
+{
+	u32 val;
+
+	lockdep_assert_held(&t8140_slp_ddr_lock);
+	if (!t8140_slp_ddr_word)
+		return;
+	val = readl(t8140_slp_ddr_word) & ~WAKE_SLP_DDR_USB;
+	if (t8140_slp_ddr_usb)
+		val |= WAKE_SLP_DDR_USB;
+	writel(val, t8140_slp_ddr_word);
+}
+
+void apple_sleep_usb_slp_ddr(bool up)
+{
+	guard(spinlock_irqsave)(&t8140_slp_ddr_lock);
+	t8140_slp_ddr_usb = up;
+	t8140_slp_ddr_write();
+}
+EXPORT_SYMBOL_GPL(apple_sleep_usb_slp_ddr);
 
 static bool t8140_debug_link_cut;
 
@@ -2646,8 +2677,6 @@ static int t8140_sleep_enter(suspend_state_t state)
 	t8140_wake_arm(s);
 	t8140_sleep_match(s);
 
-	if (readl(s->wake + WAKE_SLP_DDR))
-		writel(0, s->wake + WAKE_SLP_DDR);
 	/* Acknowledge a leftover done flag, as the DCS word has none on macOS. */
 	if (readl(s->cluster_dcs) & CLUSTER_UP_DONE)
 		writel(readl(s->cluster_dcs), s->cluster_dcs);
@@ -3122,6 +3151,10 @@ static int t8140_sleep_probe(struct platform_device *pdev)
 	s->driver_down = devm_bitmap_zalloc(dev, resource_size(&s->ps_res) / 4, GFP_KERNEL);
 	if (!s->driver_down)
 		return -ENOMEM;
+	scoped_guard(spinlock_irqsave, &t8140_slp_ddr_lock) {
+		t8140_slp_ddr_word = s->wake + WAKE_SLP_DDR;
+		t8140_slp_ddr_write();
+	}
 
 	ret = t8140_sleep_read_wake_sources(s);
 	if (ret)

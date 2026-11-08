@@ -64,6 +64,12 @@ bool apple_sleep_coproc_stopped(struct device *dev);
 void apple_sleep_usb_set_asleep(bool asleep);
 
 /*
+ * The USB host is up, as macOS's USB_SLP_DDR vote has it: from the host's start to its stop,
+ * awake and asleep. It sets bit 0 of the wake block's word 0 for every sleep in between.
+ */
+void apple_sleep_usb_slp_ddr(bool up);
+
+/*
  * The fixed hub's ports with a device at or below them that can wake the system, bit n for
  * port n. The host that sleeps in place sets them before the freeze and clears them after.
  */
@@ -158,6 +164,10 @@ static inline bool apple_sleep_coproc_stopped(struct device *dev)
 }
 
 static inline void apple_sleep_usb_set_asleep(bool asleep)
+{
+}
+
+static inline void apple_sleep_usb_slp_ddr(bool up)
 {
 }
 
