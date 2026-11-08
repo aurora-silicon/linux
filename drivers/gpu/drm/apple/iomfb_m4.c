@@ -2635,9 +2635,11 @@ int iomfb_m4_init(struct apple_dcp *owner)
 	u32 ready = 0;
 	int ret;
 	/* An external DCP the boot loader handed over: same firmware, no panel. */
-	bool external = of_device_is_compatible(dev->of_node, "apple,t8132-dcpext");
+	bool dcpext = of_device_is_compatible(dev->of_node, "apple,t8132-dcpext");
+	bool main_external = dcp_t8132_main_external(dev->of_node);
+	bool external = dcpext || main_external;
 
-	if (external &&
+	if (dcpext &&
 	    (of_property_read_u32(dev->of_node, "apple,t8132-dcpext-firmware-ready", &ready) ||
 	     ready != 1))
 		return dev_err_probe(dev, -ENODEV, "external DCP not handed over\n");
@@ -2657,10 +2659,14 @@ int iomfb_m4_init(struct apple_dcp *owner)
 	if (ret)
 		return ret;
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "coproc");
-	if (!res || resource_size(res) != SZ_16K ||
-	    (external ? res->start != 0x286e00000ULL && res->start != 0x48ae00000ULL :
+	if (!res)
+		return dev_err_probe(dev, -ENODEV, "missing coproc resource\n");
+	if (resource_size(res) != SZ_16K ||
+	    (dcpext ? res->start != 0x286e00000ULL && res->start != 0x48ae00000ULL :
 			res->start != 0x30ae00000ULL))
-		return -ENODEV;
+		return dev_err_probe(dev, -ENODEV,
+				     "unqualified %s DCP coproc resource %pa-%pa\n",
+				     dcpext ? "external" : "main", &res->start, &res->end);
 	/* Resolve the fallible supplier before creating a mailbox owner. */
 	ret = external ? 0 : apple_pmp_j713_display_prepare(dev);
 	if (ret)
