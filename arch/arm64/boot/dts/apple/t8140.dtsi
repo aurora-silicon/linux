@@ -1369,6 +1369,8 @@
 			resets = <&atcphy0>;
 			phys = <&atcphy0 PHY_TYPE_USB2>, <&atcphy0 PHY_TYPE_USB3>;
 			phy-names = "usb2-phy", "usb3-phy";
+			/* usb-drd's USB_SLP_DDR-V clock gate in the ADT */
+			apple,sleep-ddr;
 			status = "disabled";
 		};
 
