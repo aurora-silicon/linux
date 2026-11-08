@@ -34,6 +34,7 @@ properties:
               - apple,t6000-dcpext
               - apple,t6020-dcpext
               - apple,t6041-dcpext
+              - apple,t6050-dcpext
           - const: apple,dcpext
       - items:
           - const: apple,t8140-dcpext
@@ -43,10 +44,20 @@ properties:
           session uses IOMFB 26.6.2. The loader publishes the firmware identity,
           reserved memory and validated display DART mappings.
         const: apple,t8132-dcp
+      - description:
+          J713 external display coprocessors (T8132), running the internal
+          DCP's firmware. The boot loader can hand them over running; it then
+          reserves their firmware memory, publishes the firmware identity and
+          sets apple,t8132-dcpext-firmware-ready.
+        const: apple,t8132-dcpext
+      - description:
+          T6031 (M3 Max) internal display controller. The display gate enables
+          it after the boot loader has handed the running display over.
+        const: apple,t6031-dcp
 
   reg:
     minItems: 2
-    maxItems: 7
+    maxItems: 8
 
   reg-names:
     minItems: 2
@@ -57,7 +68,13 @@ properties:
       - enum: [disp-2, iop-vbar]
       - enum: [disp-3, iop-vbar]
       - enum: [disp-4, iop-vbar]
+      - enum: [disp-5, iop-vbar, coproc-aux]
       - const: iop-vbar
+
+  interrupts:
+    minItems: 7
+    maxItems: 16
+    description: Optional host display-engine interrupt sources.
 
   mboxes:
     maxItems: 1
@@ -113,7 +130,10 @@ properties:
           - description: Index into the provider's reg property.
           - description: Index in the firmware display register table.
           - description: Byte offset of the scratch register within the resource.
-    description: PMGR bandwidth scratch resource, display index and offset.
+    description: |
+      PMGR bandwidth scratch resource, display index and offset. On the T8132
+      external DCPs it is the pipe's 8-byte realtime bandwidth request slot,
+      which lies inside the display register window the index names (disp-4).
 
   apple,bw-doorbell:
     $ref: /schemas/types.yaml#/definitions/phandle-array
@@ -209,6 +229,14 @@ properties:
     maxItems: 5
     description: Loader-provided firmware ABI version used for IOMFB selection.
 
+  apple,t8132-dcpext-firmware-ready:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    enum: [0, 1]
+    description:
+      Set to 1 by the boot loader once it has handed a T8132 external display
+      coprocessor over running, with its firmware memory reserved. Without
+      it the coprocessor is left alone.
+
   apple,connector-type:
     enum: [HDMI-A, DP, USB-C]
 
@@ -268,8 +296,9 @@ properties:
     minItems: 1
     maxItems: 10
     description: |
-      T6030 external DCPs may also name the two DP IN tunnel states of each
-      Type-C crossbar, in addition to the fixed output and Type-C routes.
+      T6030 and T8132 external DCPs may also name the two DP IN tunnel states
+      of each Type-C crossbar, in addition to the fixed output and Type-C
+      routes.
 
   mux-control-names:
     minItems: 1
@@ -377,13 +406,14 @@ required:
 
 allOf:
   - if:
-      properties:
-        compatible:
-          contains:
-            const: apple,t6030-dcpext
-      required:
-        - compatible
-    else:
+      not:
+        properties:
+          compatible:
+            contains:
+              enum: ['apple,t6030-dcpext', 'apple,t8132-dcpext']
+        required:
+          - compatible
+    then:
       properties:
         mux-controls:
           maxItems: 8
@@ -392,11 +422,18 @@ allOf:
           items:
             pattern: '^(dp-xbar|typec[0-9]+)$'
   - if:
-      not:
-        properties:
-          compatible:
-            contains:
-              const: apple,t8132-dcp
+      allOf:
+        - not:
+            properties:
+              compatible:
+                contains:
+                  enum: ['apple,t6031-dcp', 'apple,t8132-dcp', 'apple,t8132-dcpext']
+        - not:
+            properties:
+              status:
+                const: disabled
+            required:
+              - status
     then:
       required:
         - apple,bw-scratch

@@ -20,8 +20,11 @@
 
 / {
 	/*
-	 * Six cores in each cluster. The sixth of each comes after the others, so that the
-	 * first fifteen CPUs are numbered as on a part with five cores in each cluster.
+	 * Six cores in each cluster, in the order of the ADT's /cpus (cpu0-17). m1n1
+	 * matches the CPU nodes to the cores it started by position (dt_set_cpus(): node
+	 * N against the ADT's cpu N), prunes the nodes of cores that are not alive and
+	 * stops the boot at the first MPIDR that differs, so the nodes must keep the
+	 * ADT's order; the labels already follow it.
 	 */
 	cpus {
 		T6050_M_CPU(cpu0, 40000, cpufreq_mc0);
@@ -29,20 +32,18 @@
 		T6050_M_CPU(cpu2, 40002, cpufreq_mc0);
 		T6050_M_CPU(cpu3, 40003, cpufreq_mc0);
 		T6050_M_CPU(cpu4, 40004, cpufreq_mc0);
+		T6050_M_CPU(cpu5, 40005, cpufreq_mc0);
 		T6050_M_CPU(cpu6, 40100, cpufreq_mc1);
 		T6050_M_CPU(cpu7, 40101, cpufreq_mc1);
 		T6050_M_CPU(cpu8, 40102, cpufreq_mc1);
 		T6050_M_CPU(cpu9, 40103, cpufreq_mc1);
 		T6050_M_CPU(cpu10, 40104, cpufreq_mc1);
+		T6050_M_CPU(cpu11, 40105, cpufreq_mc1);
 		T6050_P_CPU(cpu12, 10200, cpufreq_pc);
 		T6050_P_CPU(cpu13, 10201, cpufreq_pc);
 		T6050_P_CPU(cpu14, 10202, cpufreq_pc);
 		T6050_P_CPU(cpu15, 10203, cpufreq_pc);
 		T6050_P_CPU(cpu16, 10204, cpufreq_pc);
-
-		/* The sixth core of each cluster */
-		T6050_M_CPU(cpu5, 40005, cpufreq_mc0);
-		T6050_M_CPU(cpu11, 40105, cpufreq_mc1);
 		T6050_P_CPU(cpu17, 10205, cpufreq_pc);
 	};
 };
@@ -92,7 +93,8 @@
 	};
 
 	mtp: mtp@294600000 {
-		compatible = "apple,t6050-mtp", "apple,mtp", "apple,rtk-helper-asc4";
+		compatible = "apple,t6050-mtp", "apple,t6050-rtk-helper-asc4", "apple,mtp",
+			     "apple,rtk-helper-asc4";
 		reg = <0x2 0x94600000 0x0 0x4000>,
 		      <0x2 0x94c00000 0x0 0xc4000>;
 		reg-names = "asc", "sram";

@@ -997,3 +997,7 @@
 &pmp_report_isp_sys {
 	status = "okay";
 };
+
+#ifdef APPLE_T600X_NON_ULTRA
+#include "t600x-j314-j316-control.dtsi"
+#endif

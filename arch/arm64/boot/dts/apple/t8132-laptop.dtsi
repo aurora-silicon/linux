@@ -1,0 +1,153 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple M4 MacBook Air and MacBook Pro (2024/2025)
+ *
+ * This file contains parts common to the T8132 laptops.
+ *
+ * target-type: J604, J713, J715
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+#include "t8132-jxxx.dtsi"
+#include "t8132-isp.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/leds/common.h>
+
+/ {
+	chassis-type = "laptop";
+
+	aliases {
+		keyboard = &keyboard;
+		disp0_piodma = &disp0_piodma;
+	};
+
+	chosen {
+		linux-enablement-mac,dapf-handoff = "/arm-io/aop", "/arm-io/mtp",
+			"/arm-io/pmp";
+	};
+
+	/*
+	 * The speaker amps' shared shutdown line (SDZ, AP GPIO 15, low =
+	 * shutdown): one amp's fault takes the whole group down.
+	 */
+	speaker_sdz: regulator-sn012776-sdz {
+		compatible = "regulator-fixed";
+		regulator-name = "sn012776-sdz";
+		gpios = <&pinctrl_ap 15 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+
+	/* The headphone jack: the AOP audio jack back-end (DAI 4) to the CS42L84. */
+	sound_jack: sound-jack {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&aop_audio 4>;
+			};
+
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+	};
+
+	led-controller {
+		compatible = "pwm-leds";
+
+		led-0 {
+			pwms = <&fpwm1 0 40000>;
+			label = "kbd_backlight";
+			function = LED_FUNCTION_KBD_BACKLIGHT;
+			color = <LED_COLOR_ID_WHITE>;
+			max-brightness = <255>;
+			default-state = "keep";
+		};
+	};
+};
+
+&framebuffer0 {
+	panel = <&fb_panel>;
+};
+
+/*
+ * Internal display: the loader enables disp0_dart, piodma and the display
+ * subsystem once it has validated the inherited frontend mappings. Each
+ * board gives its panel's physical size.
+ */
+&dcp_mbox {
+	status = "okay";
+};
+
+&dcp_dart {
+	status = "okay";
+};
+
+&dcp {
+	apple,j713-native-piodma;
+	apple,j713-native-scanout;
+	status = "okay";
+};
+
+&aop_audio {
+	/* Microphones on LEAP; speakers and sense on TX0/RX0; the jack on TX2/RX2. */
+	dmas = <&admac0 1>, <&admac1 0>, <&admac1 1>, <&admac1 4>, <&admac1 5>;
+	dma-names = "dma", "spkr", "sense", "cout", "cin";
+};
+
+&fpwm1 {
+	status = "okay";
+};
+
+&mtp {
+	status = "okay";
+};
+
+&mtp_mbox {
+	status = "okay";
+};
+
+&mtp_dart {
+	status = "okay";
+};
+
+&mtp_dockchannel {
+	status = "okay";
+};
+
+/* ADT function-afe-reset gP1c and function-stm-reset gP1d. */
+&mtp_hid {
+	apple,afe-reset-gpios = <&smc_gpio 28 GPIO_ACTIVE_LOW>;
+	apple,stm-reset-gpios = <&smc_gpio 29 GPIO_ACTIVE_LOW>;
+
+	multi-touch {
+		apple,power-method = <2>;
+	};
+
+	keyboard: keyboard {
+		hid-country-code = <0>;
+		apple,keyboard-layout-id = <0>;
+	};
+
+	stm {
+	};
+};
+
+/* Mesa fingerprint sensor: power on nub GPIO 28, data-ready on AP GPIO 199. */
+&spi2 {
+	status = "okay";
+};
+
+&mesa {
+	enable-gpios = <&pinctrl_nub 28 GPIO_ACTIVE_HIGH>;
+	interrupt-parent = <&pinctrl_ap>;
+	interrupts = <199 IRQ_TYPE_EDGE_RISING>;
+	spi-cs-setup-delay-ns = <20>;
+	spi-cs-hold-delay-ns = <20>;
+	status = "okay";
+};

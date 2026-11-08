@@ -18,18 +18,30 @@ description: |
 properties:
   compatible:
     oneOf:
+      - items:
+          - const: apple,t6020-pmp-v2
+          - const: apple,t6000-pmp-v2
       - const: apple,t6000-pmp-v2
       - items:
           - enum:
+              - apple,t6030-pmp-v2
+              - apple,t6031-pmp-v2
               - apple,t6041-pmp-v2
+              - apple,t8122-pmp-v2
               - apple,t8132-pmp-v2
               - apple,t8140-pmp-v2
           - const: apple,t6000-pmp-v2
+      - items:
+          - const: apple,t8103-pmp
+          - const: apple,pmp
 
   reg:
-    items:
-      - description: Firmware SRAM
-      - description: ASC control registers
+    minItems: 2
+    maxItems: 37
+    description:
+      Coprocessor and peripheral register views. First-generation firmware
+      views include shared apertures; a driver must coordinate ownership
+      rather than claim every view as an exclusive resource.
 
   reg-names:
     items:
@@ -46,7 +58,8 @@ properties:
     maxItems: 1
 
   power-domains:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
 
   apple,pmp-report:
     $ref: /schemas/types.yaml#/definitions/phandle
@@ -99,10 +112,34 @@ patternProperties:
 required:
   - compatible
   - reg
-  - reg-names
+  - iommus
   - mboxes
   - mbox-names
-  - iommus
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8103-pmp
+    then:
+      properties:
+        reg:
+          minItems: 37
+        power-domains:
+          minItems: 2
+      required:
+        - power-domains
+    else:
+      properties:
+        reg:
+          maxItems: 2
+        power-domains:
+          maxItems: 1
+      required:
+        - reg-names
+        - mboxes
+        - mbox-names
 
 additionalProperties: false
 
