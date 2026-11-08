@@ -433,7 +433,20 @@ impl<B: Backend> Queue<B> {
         bytes: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result<ValidatedBatch> {
-        let parse_guard = self.context.vm().retain_first_job()?;
+        // A refused submission reaches userspace as EINVAL alone, so name the step that
+        // refused it: the command's own requirements are only one of several.
+        let refused = |step: &str, error: kernel::error::Error| {
+            static REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            if REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
+                pr_warn!("G17: refused a submission at {}: {:?}\n", step, error);
+            }
+            error
+        };
+        let parse_guard = self
+            .context
+            .vm()
+            .retain_first_job()
+            .map_err(|error| refused("pinning the VM", error))?;
         let mut parser = Parser::new(bytes);
         // All historical ordinals use the same entry counters; publication
         // starts only after the entire ioctl has been validated and pinned.
@@ -441,36 +454,47 @@ impl<B: Backend> Queue<B> {
         let mut preceding = [0; 2];
         let mut pending = KVec::with_capacity(1, GFP_KERNEL)?;
         while let Some(command) = parser.next()? {
-            let mut payload = self.proof.validate(
-                self.context.vm(),
-                self.range.clone(),
-                &self.window,
-                self.variant,
-                &command.payload,
-            )?;
+            let mut payload = self
+                .proof
+                .validate(
+                    self.context.vm(),
+                    self.range.clone(),
+                    &self.window,
+                    self.variant,
+                    &command.payload,
+                )
+                .map_err(|error| refused("the command's requirements", error))?;
             let engine = match &payload {
                 Validated::Render { .. } => Engine::Render,
                 Validated::Compute { .. } => Engine::Compute,
             };
             if !self.backend.supports_engine(engine) { return Err(ENOTSUPP); }
-            self.backend.prepare_command(&mut payload)?;
+            self.backend
+                .prepare_command(&mut payload)
+                .map_err(|error| refused("preparing the command", error))?;
             let mut order = Order::new(
                 base,
                 preceding,
                 command.barriers,
                 command.payload.prior(),
                 engine,
-            )?;
+            )
+            .map_err(|error| refused("its barriers and priors", error))?;
             if let Some((barriers, prior)) = command.payload.tiling_prefixes() {
-                order.narrow_tiling(&Order::new(base, preceding, barriers, prior, engine)?)?;
+                let tiling = Order::new(base, preceding, barriers, prior, engine)
+                    .map_err(|error| refused("its tiling prefixes", error))?;
+                order
+                    .narrow_tiling(&tiling)
+                    .map_err(|error| refused("narrowing to its tiling prefixes", error))?;
             }
             preceding[engine.index()] += 1;
             let destinations = match &payload {
-                Validated::Render { timestamps, .. } => Destinations::resolve(objects, timestamps)?,
+                Validated::Render { timestamps, .. } => Destinations::resolve(objects, timestamps),
                 Validated::Compute { timestamps, .. } => {
-                    Destinations::resolve(objects, core::slice::from_ref(timestamps))?
+                    Destinations::resolve(objects, core::slice::from_ref(timestamps))
                 }
-            };
+            }
+            .map_err(|error| refused("its timestamp destinations", error))?;
             pending.push((payload, order, destinations), GFP_KERNEL)?;
         }
         parser.finish()?;
