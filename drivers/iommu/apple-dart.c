@@ -4097,6 +4097,36 @@ static void apple_dart_free_irq(struct apple_dart *dart)
 			apple_dart_display_irq_peers[i] = NULL;
 }
 
+/*
+ * Whether an available coprocessor that translates through @np was handed
+ * over running by the boot loader ("mtp-live-v1"), with its DART streams left
+ * in bypass. Resetting the DART would cut that live session off.
+ */
+static bool apple_dart_has_live_rtkit_client(struct device_node *np)
+{
+	struct of_phandle_args args;
+	struct device_node *client;
+	const char *handoff;
+	bool match;
+
+	for_each_node_with_property(client, "apple,rtkit-handoff") {
+		if (!of_device_is_available(client) ||
+		    of_property_read_string(client, "apple,rtkit-handoff", &handoff) ||
+		    strcmp(handoff, "mtp-live-v1"))
+			continue;
+		if (of_parse_phandle_with_args(client, "iommus", "#iommu-cells",
+					       0, &args))
+			continue;
+		match = args.np == np;
+		of_node_put(args.np);
+		if (match) {
+			of_node_put(client);
+			return true;
+		}
+	}
+	return false;
+}
+
 static int apple_dart_probe(struct platform_device *pdev)
 {
 	int ret, sid;
@@ -4549,6 +4579,23 @@ params_done:
 	    apple_dart_streams_bypassed(dart)) {
 		dart->retained_mtp = true;
 		dev_info(dev, "Retaining the live T8132 MTP bypass\n");
+	}
+	if (!dart->retained_mtp &&
+	    of_device_is_compatible(dev->of_node, "apple,t8142-dart") &&
+	    apple_dart_has_live_rtkit_client(dev->of_node)) {
+		/*
+		 * The T8142 TCR bypass bits do not read back, so the loader's
+		 * bypass cannot be confirmed from the registers; trust the
+		 * handoff, and refuse only a DART that cannot bypass at all.
+		 */
+		if (dart->hw->type != DART_T8110 || dart->locked || tunneled ||
+		    !dart->supports_bypass) {
+			dev_err(dev, "Refusing a live coprocessor handoff on a DART that cannot bypass\n");
+			ret = -EINVAL;
+			goto err_clk_disable;
+		}
+		dart->retained_mtp = true;
+		dev_info(dev, "Retaining the live coprocessor bypass\n");
 	}
 	if (dart->preserve_display) {
 		if (dart->hw->type != DART_T8110 || !bitmap_empty(dart->remapped, DART_MAX_STREAMS)) {

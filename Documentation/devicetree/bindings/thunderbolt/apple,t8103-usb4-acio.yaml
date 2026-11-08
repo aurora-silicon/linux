@@ -207,7 +207,9 @@ allOf:
       properties:
         compatible:
           contains:
-            const: apple,t8132-usb4-acio
+            enum:
+              - apple,t6040-usb4-acio
+              - apple,t8132-usb4-acio
     then:
       properties:
         reg:

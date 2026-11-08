@@ -46,6 +46,7 @@ properties:
               - apple,t6030-cluster-cpufreq
               - apple,t6031-cluster-cpufreq
               - apple,t6041-cluster-cpufreq
+              - apple,t6050-cluster-cpufreq
               - apple,t8122-cluster-cpufreq
           - const: apple,t8112-cluster-cpufreq
 

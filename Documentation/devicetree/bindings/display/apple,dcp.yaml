@@ -24,6 +24,7 @@ properties:
               - apple,t6000-dcp
               - apple,t6020-dcp
               - apple,t6041-dcp
+              - apple,t6050-dcp
               - apple,t8140-dcp
               - apple,t8142-dcp
           - const: apple,dcp

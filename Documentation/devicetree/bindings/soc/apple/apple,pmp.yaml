@@ -27,6 +27,7 @@ properties:
               - apple,t6030-pmp-v2
               - apple,t6031-pmp-v2
               - apple,t6041-pmp-v2
+              - apple,t6050-pmp-v2
               - apple,t8122-pmp-v2
               - apple,t8132-pmp-v2
               - apple,t8140-pmp-v2
@@ -53,6 +54,10 @@ properties:
 
   mbox-names:
     const: mbox
+
+  interrupts:
+    maxItems: 4
+    description: Coprocessor mailbox and status interrupts, on T6050 in ADT order.
 
   iommus:
     maxItems: 1
@@ -91,6 +96,8 @@ properties:
       PMGR PMC configuration word from the Apple device tree. Bits 0 and 3
       are passed as the boot arguments PMCV and PMCB.
 
+  status: true
+
   apple,pmc-msg-disabled:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Boot argument PMCX, from the Apple device tree.
@@ -113,8 +120,6 @@ required:
   - compatible
   - reg
   - iommus
-  - mboxes
-  - mbox-names
 
 allOf:
   - if:
@@ -130,16 +135,44 @@ allOf:
           minItems: 2
       required:
         - power-domains
-    else:
-      properties:
-        reg:
-          maxItems: 2
-        power-domains:
-          maxItems: 1
-      required:
-        - reg-names
         - mboxes
         - mbox-names
+    else:
+      if:
+        properties:
+          compatible:
+            contains:
+              const: apple,t6050-pmp-v2
+      then:
+        description:
+          The T6050 PMP is described from the ADT and stays disabled until its
+          firmware handoff is supported; its mailbox is not described yet.
+        properties:
+          reg:
+            minItems: 4
+            maxItems: 4
+          interrupts:
+            minItems: 4
+            maxItems: 4
+          power-domains:
+            minItems: 2
+          status:
+            const: disabled
+        required:
+          - interrupts
+          - power-domains
+          - status
+      else:
+        properties:
+          reg:
+            maxItems: 2
+          power-domains:
+            maxItems: 1
+          interrupts: false
+        required:
+          - reg-names
+          - mboxes
+          - mbox-names
 
 additionalProperties: false
 

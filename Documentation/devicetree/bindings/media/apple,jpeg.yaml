@@ -37,6 +37,7 @@ select:
           - apple,t8112-jpeg
           - apple,t8122-jpeg
           - apple,t8132-jpeg
+          - apple,t6050-jpeg
           - apple,t8140-jpeg
   required:
     - compatible
@@ -55,6 +56,7 @@ allOf:
           contains:
             enum:
               - apple,t8132-jpeg
+              - apple,t6050-jpeg
       required:
         - compatible
     then:
@@ -63,6 +65,7 @@ allOf:
           items:
             - enum:
                 - apple,t8132-jpeg
+                - apple,t6050-jpeg
             - const: apple,jpeg
 
         reg:
