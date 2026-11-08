@@ -110,9 +110,16 @@ impl Firmware {
                 self.with_render(slot, |pair, _| pair.finish_replay(&packet))?;
                 Ok(true)
             }
-            Err(error) if error == EBUSY || error == EAGAIN => Ok(false),
             Err(error) => {
                 self.with_render(slot, |pair, _| {
+                    // A refusal before publication leaves the descriptor prepared; the next
+                    // pass prepares the group again, which it cannot while that one is held.
+                    if !packet.is_published() {
+                        pair.discard_prepared(&packet)?;
+                    }
+                    if error == EBUSY || error == EAGAIN {
+                        return Ok(());
+                    }
                     pair.fail_replay(error, &mut |event| deferred.push(event))
                 })?;
                 Ok(false)

@@ -1778,6 +1778,17 @@ impl Pair {
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result {
         self.replay_since = None;
+        // A descriptor prepared for the front and never published goes with it, or the pair
+        // would take no work again.
+        if let Some(front) = self.replay.front().cloned() {
+            if self
+                .prepared
+                .as_ref()
+                .is_some_and(|prepared| Arc::ptr_eq(&prepared.packet, &front))
+            {
+                self.discard_prepared(&front)?;
+            }
+        }
         while let Some(packet) = self.replay.pop() {
             defer(Deferred::Retired(packet.completion.clone(), Err(error)))?;
         }

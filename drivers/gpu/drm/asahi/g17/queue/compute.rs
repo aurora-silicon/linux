@@ -468,7 +468,8 @@ struct Active {
     failure_deferred: bool,
     qos_pending: bool,
     /// Spared because it came back unexecuted after a recovery ([`Queue::classify_unexecuted`]),
-    /// not by the recovery's own attribution. A later fault report on the queue makes it guilty.
+    /// not by the recovery's own attribution, or a replay of spared work, which runs again from
+    /// the start. A later fault report on the queue makes it guilty.
     spared_as_dropped: bool,
 }
 struct Previous<B = Binding, C = Arc<Context>> {
@@ -702,8 +703,9 @@ impl Queue {
             self.fault_stamp = Some(stamp);
         }
         // The report can arrive after the queue's unexecuted commands were spared as dropped by
-        // a recovery: the failed command is among them. They are guilty, as without the
-        // recovery: the VM fails, and the queue is neither replayed nor returned to service.
+        // a recovery, or while replays of spared work run: the failed command is among them.
+        // They are guilty, as without the recovery: the VM fails, and the queue is neither
+        // replayed nor returned to service.
         let mut guilty = None;
         for active in self.active.iter_mut().filter(|active| active.spared_as_dropped) {
             active.spared_as_dropped = false;
@@ -2399,7 +2401,8 @@ impl Queue {
                 observed_at: None,
                 failure_deferred: false,
                 qos_pending: false,
-                spared_as_dropped: false,
+                // A replay keeps its spared class: its own fault must still make it guilty.
+                spared_as_dropped: packet.completion.spared(),
             })
             .map_err(|_| EBUSY)?;
         self.retirement_ready = false;
