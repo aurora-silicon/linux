@@ -35,6 +35,12 @@ static const char * const typec_accessory_modes[] = {
 	[TYPEC_ACCESSORY_DEBUG]		= "debug",
 };
 
+static const char * const typec_contaminants[] = {
+	[TYPEC_CONTAMINANT_UNKNOWN]	= "unknown",
+	[TYPEC_CONTAMINANT_NONE]	= "none",
+	[TYPEC_CONTAMINANT_LIQUID]	= "liquid",
+};
+
 /* Product types defined in USB PD Specification R3.0 V2.0 */
 static const char * const product_type_ufp[8] = {
 	[IDH_PTYPE_NOT_UFP]		= "not_ufp",
@@ -2109,7 +2115,17 @@ static ssize_t orientation_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(orientation);
 
+static ssize_t contaminant_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct typec_port *port = to_typec_port(dev);
+
+	return sysfs_emit(buf, "%s\n", typec_contaminants[port->contaminant]);
+}
+static DEVICE_ATTR_RO(contaminant);
+
 static struct attribute *typec_attrs[] = {
+	&dev_attr_contaminant.attr,
 	&dev_attr_data_role.attr,
 	&dev_attr_power_operation_mode.attr,
 	&dev_attr_power_role.attr,
@@ -2154,6 +2170,9 @@ static umode_t typec_attr_is_visible(struct kobject *kobj,
 		if (port->cap->orientation_aware)
 			return 0444;
 		return 0;
+	} else if (attr == &dev_attr_contaminant.attr) {
+		if (!port->cap->contaminant_detection)
+			return 0;
 	} else if (attr == &dev_attr_usb_capability.attr) {
 		if (!port->cap->usb_capability)
 			return 0;
@@ -2382,6 +2401,26 @@ void typec_set_pwr_opmode(struct typec_port *port,
 	}
 }
 EXPORT_SYMBOL_GPL(typec_set_pwr_opmode);
+
+/**
+ * typec_set_contaminant - Report connector contaminant state
+ * @port: The USB Type-C port whose connector state changed
+ * @contaminant: The new connector contaminant state
+ *
+ * This routine is used by port drivers with connector contaminant detection.
+ */
+void typec_set_contaminant(struct typec_port *port,
+			   enum typec_contaminant contaminant)
+{
+	if (WARN_ON(contaminant > TYPEC_CONTAMINANT_LIQUID) ||
+	    port->contaminant == contaminant)
+		return;
+
+	port->contaminant = contaminant;
+	sysfs_notify(&port->dev.kobj, NULL, "contaminant");
+	kobject_uevent(&port->dev.kobj, KOBJ_CHANGE);
+}
+EXPORT_SYMBOL_GPL(typec_set_contaminant);
 
 /**
  * typec_find_pwr_opmode - Get the typec power operation mode capability

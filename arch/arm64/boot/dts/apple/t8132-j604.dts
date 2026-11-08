@@ -74,6 +74,12 @@
 	};
 };
 
+/* The full 3024x1964 panel including the notch rows, 254 ppi. */
+&dcp {
+	apple,panel-width-mm = <302>;
+	apple,panel-height-mm = <196>;
+};
+
 &sound_jack {
 	compatible = "apple,j604-macaudio-jack", "apple,macaudio";
 	model = "MacBook Pro J604 Jack";
@@ -312,3 +318,19 @@
 #include "hwmon-common.dtsi"
 #include "hwmon-laptop.dtsi"
 #include "hwmon-fan-dual.dtsi"
+
+/*
+ * The PMGR domains of the USB-C ports this board wires beyond ATC0/ATC1, as
+ * the M4 firmware path's policy enables ATC0/ATC1's.
+ */
+&ps_atc3_common {
+	status = "okay";
+};
+
+&ps_atc3_usb_aon {
+	status = "okay";
+};
+
+&ps_atc3_usb {
+	status = "okay";
+};

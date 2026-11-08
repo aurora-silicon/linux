@@ -3,6 +3,7 @@
 #define _LINUX_SOC_APPLE_T8132_H
 
 #include <linux/of.h>
+#include <linux/string.h>
 #include <linux/types.h>
 
 /*
@@ -28,6 +29,29 @@ static inline bool apple_t8132_pro_mini_imac(void)
 	       of_machine_is_compatible("apple,j623") ||
 	       of_machine_is_compatible("apple,j624") ||
 	       of_machine_is_compatible("apple,j773g");
+}
+
+/*
+ * The OS firmware the M4 PMP, PMGR ownership, display and GPU paths are
+ * qualified on, as the boot loader reports it: macOS 26.6.2 (iBoot
+ * mBoot-18000.161.10). These paths depend on the firmware, not the board.
+ */
+static inline bool apple_t8132_qualified_firmware(void)
+{
+	const char *version;
+
+	return of_machine_is_compatible("apple,t8132") &&
+	       !of_property_read_string(of_chosen, "asahi,os-fw-version", &version) &&
+	       !strcmp(version, "26.6.2");
+}
+
+/*
+ * The firmware-dependent M4 paths: every M4 Mac on the qualified firmware,
+ * and the Airs on any firmware, as before.
+ */
+static inline bool apple_t8132_firmware_path(void)
+{
+	return apple_t8132_air() || apple_t8132_qualified_firmware();
 }
 
 /*

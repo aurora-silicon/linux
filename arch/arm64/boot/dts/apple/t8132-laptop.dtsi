@@ -19,6 +19,7 @@
 
 	aliases {
 		keyboard = &keyboard;
+		disp0_piodma = &disp0_piodma;
 	};
 
 	chosen {
@@ -72,6 +73,25 @@
 
 &framebuffer0 {
 	panel = <&fb_panel>;
+};
+
+/*
+ * Internal display: the loader enables disp0_dart, piodma and the display
+ * subsystem once it has validated the inherited frontend mappings. Each
+ * board gives its panel's physical size.
+ */
+&dcp_mbox {
+	status = "okay";
+};
+
+&dcp_dart {
+	status = "okay";
+};
+
+&dcp {
+	apple,j713-native-piodma;
+	apple,j713-native-scanout;
+	status = "okay";
 };
 
 &aop_audio {

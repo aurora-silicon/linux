@@ -13,12 +13,6 @@
 #include "t8132-j713-pmgr.dtsi"
 #include <dt-bindings/phy/phy.h>
 
-/ {
-	aliases {
-		disp0_piodma = &disp0_piodma;
-	};
-};
-
 /* The J713 loader tree has these placeholders. */
 &gpu_ttbs {
 	reg = <0 0 0 0>;
@@ -132,50 +126,15 @@
 	};
 };
 
-/* GPU: the outer TVM gate is the parent of the GFX domain. */
-&gfx_tvm {
-	status = "okay";
-};
-
-&gpu {
-	status = "okay";
-};
-
-&agx_mbox {
-	status = "okay";
-};
-
+/* The GPU itself is described for every M4 Mac in t8132-gpu.dtsi. */
 &ps_gfx {
-	power-domains = <&gfx_tvm>;
-	/* The G16 firmware stays live across suspend-to-idle. */
-	apple,sleep-retained;
 	status = "okay";
 };
 
-/* The report provider owns readiness for shared PMP commands. */
-&pmp {
-	apple,pmp-report = <&pmp_report>;
-};
-
-/*
- * Internal display: the loader enables disp0_dart, piodma and the display
- * subsystem once it has validated the inherited frontend mappings.
- */
-&dcp_mbox {
-	status = "okay";
-};
-
-&dcp_dart {
-	status = "okay";
-};
-
+/* The J713's full 2560x1664 panel including the notch rows, 224 ppi. */
 &dcp {
-	apple,j713-native-piodma;
-	apple,j713-native-scanout;
-	/* Full 2560x1664 panel including the notch rows, 224 ppi. */
 	apple,panel-width-mm = <290>;
 	apple,panel-height-mm = <188>;
-	status = "okay";
 };
 
 /* External displays: both pipes, routed to either USB-C port. */
