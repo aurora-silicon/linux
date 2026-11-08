@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/usb/apple,usb-auss.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple AUSS USB controller
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description:
+  The USB controller in the AUSS block that the T6050 Type-C routers share
+  (ADT usb-auss0), separate from the per-port controllers. It is described
+  from the ADT so the device tree lists all of the SoC's hardware; no driver
+  uses it yet and the node stays disabled.
+
+properties:
+  compatible:
+    const: apple,t6050-usb-auss
+
+  reg:
+    minItems: 10
+    maxItems: 10
+    description: Register windows in the ADT's order.
+
+  interrupts:
+    minItems: 4
+    maxItems: 4
+
+  iommus:
+    maxItems: 1
+
+  power-domains:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - iommus
+  - power-domains
+
+additionalProperties: false
