@@ -295,9 +295,9 @@ static int hwx_program(struct hwx_parser *p)
 	memcpy(expected + (mixed ? 0x8b8 : 0x898), "main", 5);
 	if (!memcmp(c, expected, length)) {
 		ret = ane_hx_task_stream_validate_limit(p->bytes + info->text.offset,
-						  info->text.size, info->tasks,
-						  info->subtype == ANE_HWX_SUBTYPE_H17 ? 0 : 1,
-						  &record_limit);
+							info->text.size, info->tasks,
+							info->subtype == ANE_HWX_SUBTYPE_H17 ? 0 : 1,
+							&record_limit);
 		/* This compiler hint need not equal the encoded record count. */
 		if (!ret && (!records || records > record_limit))
 			ret = -ENOEXEC;
