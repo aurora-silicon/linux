@@ -227,10 +227,15 @@ static void ave_9003_hevc_main10(struct kunit *test)
 
 /* One 1080p HEVC Start or first Process image, with speed mode @speed. */
 static void ave_speed_image(struct kunit *test, struct ave_ctx *ctx,
-			    enum ave_image image, bool bframes, bool speed,
-			    u8 *cmd, size_t len)
+			    enum ave_image image, bool bframes, bool main10,
+			    bool speed, u8 *cmd, size_t len)
 {
 	ave_test_session(ctx->sess, AVE_CODEC_HEVC, 1920, 1080, bframes);
+	if (main10) {
+		ctx->sess->p.min_qp = -12;
+		ctx->sess->p.profile = 2;
+		ctx->sess->p.bit_depth = 10;
+	}
 	ctx->sess->p.speed = speed;
 	memset(cmd, 0, len);
 	if (image == AVE_IMAGE_START)
@@ -244,7 +249,8 @@ static void ave_speed_image(struct kunit *test, struct ave_ctx *ctx,
 
 /*
  * Speed over quality on 9003: HEVC Start changes only the throughput mode
- * (+0x320, 3 -> 5); Process stays the same, with and without B-frames.
+ * (+0x320, 3 -> 5); Process stays the same, with and without B-frames, for
+ * Main and Main 10.
  */
 static void ave_9003_speed(struct kunit *test)
 {
@@ -263,14 +269,15 @@ static void ave_9003_speed(struct kunit *test)
 	ctx->ave = ave;
 	ctx->sess = sess;
 
-	for (unsigned int i = 0; i < 4; i++) {
+	for (unsigned int i = 0; i < 8; i++) {
 		enum ave_image image = i & 1 ? AVE_IMAGE_PROCESS : AVE_IMAGE_START;
-		bool bframes = i & 2;
+		bool bframes = i & 2, main10 = i & 4;
 		size_t len = ave->layout->bytes[AVE_CODEC_HEVC - 1][image];
 		u32 changed = image == AVE_IMAGE_START ? 0x320 : 0;
 
-		ave_speed_image(test, ctx, image, bframes, false, quality, len);
-		ave_speed_image(test, ctx, image, bframes, true, speed, len);
+		ave_speed_image(test, ctx, image, bframes, main10, false, quality,
+				len);
+		ave_speed_image(test, ctx, image, bframes, main10, true, speed, len);
 		if (changed) {
 			KUNIT_EXPECT_EQ(test, get_unaligned_le32(quality + changed), 3);
 			KUNIT_EXPECT_EQ(test, get_unaligned_le32(speed + changed), 5);
