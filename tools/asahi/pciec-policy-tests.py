@@ -144,7 +144,7 @@ def main():
     args = parser.parse_args()
     pci = (ROOT / 'drivers/pci/controller/pcie-apple.c').read_text()
     acio = (ROOT / 'drivers/thunderbolt/apple.c').read_text()
-    defines = '\n'.join(re.findall(r'^#define .*$', pci, re.M))
+    defines = '\n'.join(re.findall(r'^#define (?:[^\n]*\\\n)*[^\n]*$', pci, re.M))
     info = pci[pci.index('struct hw_info {'):pci.index('static const struct of_device_id apple_pcie_of_match[];')]
     matches = re.search(r'static const struct of_device_id apple_pcie_of_match\[\] = \{.*?\n\};', pci, re.S)[0]
     production = '\n'.join((defines, info, matches,
