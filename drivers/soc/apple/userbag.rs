@@ -277,7 +277,8 @@ fn decode_timer_fire(body: &[u8]) -> bool {
 
 /// The grace-expiry answer, as the Neo's key store gave it on Linux on
 /// 11-09: `u32 0`, the handle whose grace period ended (0 when none has
-/// yet), the timer kind (1), `u32 0`, an opaque token, `u32 0`.
+/// yet), the timer kind (1), `u32 0`, then two opaque words (a token, and a
+/// small counter that was 0 while grace ran and 3 when the bag locked).
 fn decode_timer_fire_reply(body: &[u8]) -> Option<i32> {
     let mut c = Cursor::new(body);
     let lead = c.u32()?;
@@ -285,8 +286,8 @@ fn decode_timer_fire_reply(body: &[u8]) -> Option<i32> {
     let kind = c.u32()?;
     let reserved = c.u32()?;
     let _token = c.u32()?;
-    let trailer = c.u32()?;
-    (lead == 0 && handle <= 0 && kind == 1 && reserved == 0 && trailer == 0 && c.done()).then_some(handle)
+    let _count = c.u32()?;
+    (lead == 0 && handle <= 0 && kind == 1 && reserved == 0 && c.done()).then_some(handle)
 }
 
 fn encode_change_secret(user_handle: i32, old: &[u8], new: &[u8]) -> Result<crate::image::Body> {
@@ -1236,6 +1237,10 @@ mod tests {
         // Before the grace period ends the store names no handle.
         reply[4..8].copy_from_slice(&0i32.to_le_bytes());
         assert_eq!(decode_timer_fire_reply(&reply), Some(0));
+        // When the bag locks, the store names it and the last word is not 0.
+        reply[4..8].copy_from_slice(&USER_HANDLE.to_le_bytes());
+        reply[20..24].copy_from_slice(&3u32.to_le_bytes());
+        assert_eq!(decode_timer_fire_reply(&reply), Some(USER_HANDLE));
         reply[0] = 1;
         assert_eq!(decode_timer_fire_reply(&reply), None);
     }
