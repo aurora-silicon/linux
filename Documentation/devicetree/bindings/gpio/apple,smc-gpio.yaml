@@ -23,6 +23,18 @@ properties:
   '#gpio-cells':
     const: 2
 
+  apple,output-templates:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 2
+    maxItems: 128
+    description: Pairs of GPIO number and native four-byte output template.
+
+  apple,pcio-templates:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 3
+    maxItems: 192
+    description: Triples of GPIO number and native pcIO low/high word templates.
+
 required:
   - compatible
   - gpio-controller

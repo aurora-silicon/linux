@@ -45,7 +45,9 @@ def parser_fixture(root):
     source = (base / 'parser.c').read_text()
     parser = source[source.index('#define DCP_PARSE_HEADER'):source.index('int parse_epic_service_init(')]
     metadata = (base / 'dcp-display-metadata.h').read_text()
-    metadata = block(metadata, 'struct dcp_display_metadata {') + ';\n'
+    metadata = (block(metadata, 'struct dcp_display_metadata {') + ';\n' +
+                block(metadata, 'enum dcp_panel_gamut {') + ';\n' +
+                block(metadata, 'struct dcp_color_space {') + ';\n')
     header = (base / 'parser.h').read_text()
     header = header[header.index('struct apple_dcp;'):header.index('int parse(')]
     refresh = (base / 'dcp-refresh.h').read_text().replace('#include <linux/types.h>', '')
@@ -556,6 +558,8 @@ struct apple_dcp {
     struct dcp_display_mode *modes;
     struct { bool holding, stopped; } announce;
     bool ext_backlight, has_panel;
+    /* External pipes carry no internal panel identity. */
+    void *panel_identity;
 };
 struct rate_guard { bool *lock; };
 static struct rate_guard rate_lock(bool *p) { assert(!*p);*p=true;return (struct rate_guard){p}; }
@@ -1184,6 +1188,10 @@ u32 lane_count, link_rate;''')
 #define LINK_RATE_HBR2 0x14
 #define PHY_MODE_DP 1
 #define trace_dptxport_call_set_link_rate(...) ((void)0)
+/* Not a T8132 dcpext: its DRM outputs never follow this link. */
+static bool dcp_is_t8132_ext(const struct apple_dcp *d) { (void)d; return false; }
+struct device;
+static void t8132_ext_drm_hotplug(struct device *dcpext) { (void)dcpext; assert(!"T8132 dcpext hotplug in an H17P scenario"); }
 static unsigned phy_capacity=2, phy_calls, hardware_rate, hardware_lanes;
 static int validate_error;
 static int phy_validate(void *phy,int mode,int submode,union phy_configure_opts *o) {

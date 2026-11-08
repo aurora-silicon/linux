@@ -48,6 +48,8 @@ properties:
   mbox-names:
     const: mbox
 
+  nonposted-mmio: true
+
   iommus:
     maxItems: 1
 

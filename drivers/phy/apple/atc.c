@@ -803,6 +803,7 @@ enum atcphy_t8132_cio_tunable {
  * @phys.usb2: USB2 PHY instance
  * @phys.usb3: USB3 PHY instance
  * @phys.dp: DisplayPort PHY instance
+ * @usb2_repeater: Optional external eUSB2 to USB 2.0 repeater
  * @phy_provider: PHY provider instance
  * @rcdev: Reset controller device
  * @sw: Type-C switch instance
@@ -911,6 +912,7 @@ struct apple_atcphy {
 		struct phy *usb3;
 		struct phy *dp;
 	} phys;
+	struct phy *usb2_repeater;
 	struct phy_provider *phy_provider;
 
 	struct reset_controller_dev rcdev;
@@ -2843,7 +2845,10 @@ static void atc_t8122_tunnel_pclk(struct apple_atcphy *atcphy,
 			   FIELD_PREP(DPTX_PCLK1_SELECT, selector);
 
 	lockdep_assert_held(&atcphy->lock);
-	/* PCLK1 is also DPIN1's prerequisite: retuning DPIN0 must not gate it. */
+	/*
+	 * PCLK1 is also DPIN1's prerequisite, on T6030 and T8132 alike (see
+	 * apple_dp_tunnel_pclks()): retuning DPIN0 must not gate it.
+	 */
 	if (!pclk && (atcphy->tunnel_users & BIT(1)))
 		value |= DPTX_PCLK1_ENABLE;
 	core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
@@ -2898,7 +2903,9 @@ static int atc_t8122_tunnel_start(struct apple_atcphy *atcphy,
 	    ((saved_tx & T8122_PCLK_ENABLES) && (saved_tx & 0xffff) != 0xe001))
 		return -EBUSY;
 
-	/* Inactive slots use selector zero; all gates stay off during PLL setup. */
+	/*
+	 * Inactive slots use selector zero; all gates stay off during PLL setup.
+	 */
 	core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, GENMASK(15, 4),
 		    FIELD_PREP(DPTX_PCLK1_SELECT, selector) |
 		    (pclk ? FIELD_PREP(DPTX_PCLK2_SELECT, selector) : 0));
@@ -3417,11 +3424,25 @@ static int atc_tunnel_set_t602x(struct apple_atcphy *atcphy, unsigned int dpin,
 	return 0;
 }
 
-/* T6030 (M3 Pro) uses T8122-generation PHYs for both DP IN clock outputs. */
-static bool apple_atc_tunnel_is_t6030(struct apple_atcphy *atcphy)
+/*
+ * T6030 (M3 Pro) uses T8122-generation PHYs for both DP IN clock outputs.
+ * The T8132 (M4) PHY has the same tunnel clock: AUSPLL descriptor, APB
+ * handshake, lock bit and TX_DP_CTRL0 selects are at the same offsets.
+ */
+static bool apple_atc_tunnel_t8122_clock(struct apple_atcphy *atcphy)
 {
-	return of_machine_is_compatible("apple,t6030") &&
-	       atcphy->hw->gen == ATCPHY_GENERATION_T8122;
+	return (of_machine_is_compatible("apple,t6030") &&
+		atcphy->hw->gen == ATCPHY_GENERATION_T8122) ||
+	       atcphy->hw->gen == ATCPHY_GENERATION_T8132;
+}
+
+/* Which pixel clock (0: PCLK1, 1: PCLK2) source @source uses for DP IN @dpin. */
+static int apple_atc_tunnel_pclk(struct apple_atcphy *atcphy, unsigned int source,
+				 unsigned int dpin)
+{
+	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132)
+		return apple_dp_tunnel_t8132_pclk(source, dpin);
+	return apple_dp_tunnel_t6030_pclk(source, dpin);
 }
 
 /*
@@ -3815,6 +3836,10 @@ static int atcphy_configure_t8132(struct apple_atcphy *atcphy, enum atcphy_mode 
 
 	if (atcphy->t8132_common_owned && atcphy->host_active)
 		return -EBUSY;
+	/* The PHY stop below takes a DP tunnel pixel clock's PLL with it. */
+	ret = atc_t8122_tunnel_stop(atcphy);
+	if (ret)
+		return ret;
 	atcphy->mode_dirty = true;
 	if (atcphy->t8132_common_owned) {
 		if (atcphy->mode == APPLE_ATCPHY_MODE_USB3_DP)
@@ -4520,8 +4545,29 @@ static const struct phy_ops apple_atc_usb3_phy_ops = {
 	.set_mode = atcphy_rpm_usb3_set_mode,
 };
 
+/*
+ * The T8132 PHY has no DisplayPort alternate mode: its DP PHY only exists so
+ * that a DisplayPort tunnel can get its pixel clock, see
+ * apple_atc_dp_tunnel_rate_source(). DCP's DPTX Activate and Deactivate
+ * name a DP mode or none while a tunnel runs; that is a no-op as long as the
+ * PHY is in USB4/Thunderbolt mode. Anything else is refused, and nothing here
+ * touches a register.
+ */
+static int atcphy_dpphy_set_mode_t8132(struct apple_atcphy *atcphy, enum phy_mode mode)
+{
+	guard(mutex)(&atcphy->lock);
+	if ((mode == PHY_MODE_DP || mode == PHY_MODE_INVALID) &&
+	    (atcphy->mode == APPLE_ATCPHY_MODE_USB4 || atcphy->mode == APPLE_ATCPHY_MODE_TBT))
+		return 0;
+	return -EOPNOTSUPP;
+}
+
 static int atcphy_dpphy_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 {
+	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
+
+	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132)
+		return atcphy_dpphy_set_mode_t8132(atcphy, mode);
 	/* Nothing to do here since the setup already happened in mux_set */
 	if (mode == PHY_MODE_DP && submode == 0)
 		return 0;
@@ -4579,6 +4625,9 @@ static int atcphy_dpphy_configure(struct phy *phy, union phy_configure_opts *opt
 	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
 	enum atcphy_dp_link_rate link_rate;
 
+	/* No DP alternate mode: a tunnel sets its rate through its own call. */
+	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132)
+		return -EOPNOTSUPP;
 	if (atcphy->hw->has_t8140_dp)
 		return j700_dp_configure(atcphy, opts);
 
@@ -4642,15 +4691,33 @@ int apple_atc_dp_tunnel_rate_source(struct phy *phy, unsigned int source,
 				    unsigned int dpin, u8 rate)
 {
 	struct apple_atcphy *atcphy;
+	unsigned int gates;
 	int pclk, ret;
 
 	if (!phy || phy->ops != &apple_atc_dp_phy_ops || dpin > 1)
 		return -EINVAL;
 	atcphy = phy_get_drvdata(phy);
-	pclk = apple_dp_tunnel_t6030_pclk(source, dpin);
-	if (!apple_atc_tunnel_is_t6030(atcphy) || pclk < 0)
+	pclk = apple_atc_tunnel_pclk(atcphy, source, dpin);
+	if (!apple_atc_tunnel_t8122_clock(atcphy) || pclk < 0)
 		return -EOPNOTSUPP;
 	guard(mutex)(&atcphy->lock);
+	/*
+	 * The T8132 ATC domain goes off at runtime unless the PHY is in a CIO
+	 * mode, and leaving one stops the tunnel clock (atcphy_configure_t8132()):
+	 * outside one there is nothing to stop and no register to touch.
+	 */
+	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132 &&
+	    atcphy->mode != APPLE_ATCPHY_MODE_USB4 &&
+	    atcphy->mode != APPLE_ATCPHY_MODE_TBT) {
+		if (rate)
+			return -EBUSY;
+		if ((atcphy->tunnel_users & BIT(dpin)) &&
+		    atcphy->tunnel_source[dpin] != source)
+			return -ESTALE;
+		atcphy->tunnel_users &= ~BIT(dpin);
+		atcphy->tunnel_dpin_rate[dpin] = 0;
+		return 0;
+	}
 	atcphy_restore_after_pd_off(atcphy);
 	/* A stale source must not retune or stop another source's clock. */
 	if ((atcphy->tunnel_users & BIT(dpin)) &&
@@ -4661,10 +4728,17 @@ int apple_atc_dp_tunnel_rate_source(struct phy *phy, unsigned int source,
 			return 0;
 		if (!(atcphy->tunnel_users & ~BIT(dpin)))
 			return atc_t8122_tunnel_stop(atcphy);
-		/* Release only this stream; the other stream keeps its PLL and gates. */
-		if (pclk)
+		/*
+		 * Release only this stream; the other stream keeps its PLL and the
+		 * gates it needs: a DP IN 1 stream keeps PCLK1 too.
+		 */
+		gates = apple_dp_tunnel_pclks(atcphy->tunnel_users & ~BIT(dpin));
+		if (!(gates & APPLE_DP_TUNNEL_PCLK2))
 			core_clear32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
 				     DPTX_PCLK2_ENABLE);
+		if (!(gates & APPLE_DP_TUNNEL_PCLK1))
+			core_clear32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+				     DPTX_PCLK1_ENABLE);
 		atcphy->tunnel_users &= ~BIT(dpin);
 		atcphy->tunnel_dpin_rate[dpin] = 0;
 		return 0;
@@ -4681,6 +4755,22 @@ int apple_atc_dp_tunnel_rate_source(struct phy *phy, unsigned int source,
 	if ((atcphy->tunnel_users & BIT(dpin)) &&
 	    atcphy->tunnel_dpin_rate[dpin] == rate && atcphy->tunnel_rate)
 		return 0;
+	/*
+	 * The DP IN 1 stream of a T8132 PHY only shows with both pixel clocks
+	 * at its own rate: refuse a stream at another rate than the one
+	 * running, before anything is programmed.
+	 */
+	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132) {
+		u8 other = atcphy->tunnel_users & BIT(1 - dpin) ?
+			   atcphy->tunnel_dpin_rate[1 - dpin] : 0;
+
+		ret = apple_dp_tunnel_t8132_rate_ok(rate, other);
+		if (ret) {
+			dev_warn(atcphy->dev, "DP tunnel dpin%u at rate 0x%x refused: dpin%u runs at 0x%x\n",
+				 dpin, rate, 1 - dpin, other);
+			return ret;
+		}
+	}
 	atcphy->tunnel_source[dpin] = source;
 	ret = atc_t8122_tunnel_start(atcphy, pclk, rate);
 	if (!ret || (atcphy->tunnel_clock_on && !atcphy->tunnel_rate)) {
@@ -4703,8 +4793,11 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 	if (!phy || phy->ops != &apple_atc_dp_phy_ops || dpin > 1)
 		return -EINVAL;
 	atcphy = phy_get_drvdata(phy);
-	/* Keep each supported SoC on its qualified clock sequence. */
-	if (apple_atc_tunnel_is_t6030(atcphy))
+	/*
+	 * Keep each supported SoC on its qualified clock sequence. Source 0
+	 * is no T8132 source, so this refuses there: T8132 callers name theirs.
+	 */
+	if (apple_atc_tunnel_t8122_clock(atcphy))
 		return apple_atc_dp_tunnel_rate_source(phy, 0, dpin, rate);
 	if (!apple_atc_tunnel_is_t8103_style()) {
 		bool valid_core = apple_atc_t602x_core_valid(atcphy->np, atcphy->res.core->start,
@@ -4804,10 +4897,14 @@ static int atcphy_probe_phy(struct apple_atcphy *atcphy)
 		{ &atcphy->phys.dp, &apple_atc_dp_phy_ops },
 	};
 
+	/*
+	 * A T8132 PHY with its USB3/USB4 banks gets a DP PHY for DisplayPort
+	 * tunnels only (see atcphy_dpphy_set_mode_t8132()); creating it does
+	 * not touch the hardware.
+	 */
 	for (int i = 0; i < ARRAY_SIZE(phys); i++) {
 		if ((atcphy->dp_only && phys[i].phy != &atcphy->phys.dp) ||
-		    (atcphy_usb2_only(atcphy) && i != 0) ||
-		    (atcphy->hw->gen == ATCPHY_GENERATION_T8132 && i == 2))
+		    (atcphy_usb2_only(atcphy) && i != 0))
 			continue;
 		*phys[i].phy = devm_phy_create(atcphy->dev, NULL, phys[i].ops);
 		if (IS_ERR(*phys[i].phy))
@@ -6226,6 +6323,11 @@ static void atcphy_pd_notifier_remove(void *data)
 	dev_pm_genpd_remove_notifier(data);
 }
 
+static void atcphy_usb2_repeater_exit(void *data)
+{
+	phy_exit(data);
+}
+
 /* Returns whether the PHY follows its power domain. */
 static bool atcphy_probe_pd_notifier(struct apple_atcphy *atcphy)
 {
@@ -6288,6 +6390,20 @@ static int atcphy_probe(struct platform_device *pdev)
 	ret = atcphy_load_tunables(atcphy);
 	if (ret)
 		return ret;
+
+	atcphy->usb2_repeater = devm_phy_optional_get(dev, "eusb2-repeater");
+	if (IS_ERR(atcphy->usb2_repeater))
+		return dev_err_probe(dev, PTR_ERR(atcphy->usb2_repeater),
+				     "Failed to get eUSB2 repeater\n");
+	if (atcphy->usb2_repeater) {
+		ret = phy_init(atcphy->usb2_repeater);
+		if (ret)
+			return dev_err_probe(dev, ret, "Failed to initialize eUSB2 repeater\n");
+		ret = devm_add_action_or_reset(dev, atcphy_usb2_repeater_exit,
+					       atcphy->usb2_repeater);
+		if (ret)
+			return ret;
+	}
 
 	atcphy->mode = APPLE_ATCPHY_MODE_OFF;
 	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
@@ -6357,6 +6473,10 @@ static int atcphy_resume(struct device *dev)
 	if (atcphy->t8132_common_owned && atcphy->host_active &&
 	    READ_ONCE(atcphy->pd_was_off))
 		dev_warn(dev, "power domain went off under an active USB3 link\n");
+	/* DP tunnel pixel clocks are then set up again at their next rate change. */
+	if (atcphy->tunnel_users && READ_ONCE(atcphy->pd_was_off))
+		dev_dbg(dev, "power domain went off across sleep under DP tunnel clocks (users %#x)\n",
+			atcphy->tunnel_users);
 	/*
 	 * A suspended PHY holds nothing, and its domain may drop again once system
 	 * resume completes: leave the restore to its next operation.

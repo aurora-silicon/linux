@@ -19,6 +19,8 @@ typedef uint64_t u64;
 #define dev_dbg(...) ((void)0)
 #define dev_warn(...) ((void)0)
 #define dev_err(...) ((void)0)
+#define READ_ONCE(x) (x)
+#define WRITE_ONCE(x, v) ((x) = (v))
 #define EXPORT_SYMBOL_GPL(x)
 #define APPLE_ATCPHY_MODE_USB4 1
 #define APPLE_ATCPHY_MODE_TBT 2
@@ -54,7 +56,7 @@ struct apple_dcp_typec_route {
 struct apple_dcp {
 	int tb_lock;
 	void *dev;
-	bool dptx_tunnel, tb_clock_ok;
+	bool dptx_tunnel, tb_clock_ok, tb_clock_refused;
 	unsigned dptx_dfp_port;
 	u64 tb_generation;
 	struct apple_dcp_typec_route *active_typec_route;
@@ -114,6 +116,28 @@ static void core_mask32(struct apple_atcphy *p, unsigned off, u32 mask, u32 v)
 	       p->regs.core + off);
 }
 static int apple_atc_dp_tunnel_rate(struct phy *p, unsigned dpin, u8 rate)
+{
+	abort();
+}
+/*
+ * Production: of_device_is_compatible(dcp->dev->of_node, "apple,t8132-dcpext").
+ * These are T6030 DCPs: the T8132 dcpext paths must never be taken.
+ */
+static bool dcp_is_t8132_ext(const struct apple_dcp *dcp)
+{
+	return false;
+}
+static bool dcp_t8132_late_release(struct apple_dcp *dcp, const char *what)
+{
+	abort();
+}
+static int dcp_t8132_crossbar_down_locked(struct apple_dcp *dcp,
+					  struct apple_dcp_typec_route *route,
+					  const char *why)
+{
+	abort();
+}
+static void t8132_ext_drm_hotplug(void *dev)
 {
 	abort();
 }

@@ -143,6 +143,78 @@ static int dcp_metadata_color(struct edid *edid, const struct dcp_display_metada
 	return 0;
 }
 
+/*
+ * CIE x/y given in 1/10000, as published, rounded to 1/65536. Plain
+ * arithmetic: DIV_ROUND_CLOSEST() is not a constant expression.
+ */
+#define DCP_CIE(v)	(((v) * 65536U + 5000) / 10000)
+/* Nominal SDR gamma 2.2 in 16.16. */
+#define DCP_GAMMA_2_2	((22U * 65536 + 5) / 10)
+
+/*
+ * Standard primaries and D65 white of IEC 61966-2-1 (sRGB) and SMPTE EG 432-1
+ * (Display P3). These name the panel's calibrated default target; per-unit
+ * factory calibration is applied by the DCP and never reported here.
+ */
+static const struct dcp_color_space dcp_color_spaces[] = {
+	{
+		.name = "srgb",
+		.chromaticity = {
+			{ DCP_CIE(6400), DCP_CIE(3300) },
+			{ DCP_CIE(3000), DCP_CIE(6000) },
+			{ DCP_CIE(1500), DCP_CIE(600) },
+		},
+		.white = { DCP_CIE(3127), DCP_CIE(3290) },
+		.gamma = DCP_GAMMA_2_2,
+	}, {
+		.name = "display-p3",
+		.chromaticity = {
+			{ DCP_CIE(6800), DCP_CIE(3200) },
+			{ DCP_CIE(2650), DCP_CIE(6900) },
+			{ DCP_CIE(1500), DCP_CIE(600) },
+		},
+		.white = { DCP_CIE(3127), DCP_CIE(3290) },
+		.gamma = DCP_GAMMA_2_2,
+	},
+};
+
+const struct dcp_color_space *dcp_color_space_lookup(const char *name)
+{
+	for (unsigned int i = 0; name && i < ARRAY_SIZE(dcp_color_spaces); i++)
+		if (!strcmp(name, dcp_color_spaces[i].name))
+			return &dcp_color_spaces[i];
+	return ERR_PTR(-EINVAL);
+}
+
+const struct dcp_color_space *dcp_panel_gamut_color_space(enum dcp_panel_gamut gamut)
+{
+	switch (gamut) {
+	case DCP_PANEL_GAMUT_SRGB:
+		return dcp_color_space_lookup("srgb");
+	case DCP_PANEL_GAMUT_DISPLAY_P3:
+		return dcp_color_space_lookup("display-p3");
+	default:
+		return NULL;
+	}
+}
+
+/*
+ * Firmware chromaticities win. Without a complete, valid set, use the panel's
+ * named target. Without either the block keeps its nominal white only.
+ */
+static void dcp_panel_color(struct edid *edid, const struct dcp_display_metadata *metadata,
+			    const struct dcp_color_space *target)
+{
+	struct dcp_display_metadata named = {};
+
+	if (!dcp_metadata_color(edid, metadata) || !target)
+		return;
+	memcpy(named.chromaticity, target->chromaticity, sizeof(named.chromaticity));
+	memcpy(named.white, target->white, sizeof(named.white));
+	named.gamma = target->gamma;
+	dcp_metadata_color(edid, &named);
+}
+
 /* Build only a base block: the authoritative firmware mode list stays separate. */
 static int dcp_metadata_block(struct edid *edid, const struct dcp_display_metadata *metadata,
 			      const struct drm_display_mode *mode)
@@ -334,6 +406,7 @@ static int dcp_panel_range_byte(u32 limit, u8 *out, u8 *offsets, u8 flag)
  * conformity. DRM still enumerates TimingElements, never these rounded bytes.
  */
 const struct drm_edid *dcp_panel_edid(const struct dcp_display_metadata *metadata,
+				      const struct dcp_color_space *target,
 				      const struct dcp_display_mode *modes, unsigned int count,
 				      u32 width_mm, u32 height_mm)
 {
@@ -417,7 +490,7 @@ const struct drm_edid *dcp_panel_edid(const struct dcp_display_metadata *metadat
 	block.white_y = 337 >> 2;
 	block.blue_white_lo = (320 & 3) << 2 | (337 & 3);
 	/* Missing or malformed optional colour data leaves the identity usable. */
-	dcp_metadata_color(&block, metadata);
+	dcp_panel_color(&block, metadata, target);
 	block.features = DRM_EDID_FEATURE_PREFERRED_TIMING;
 	memset(block.standard_timings, 1, sizeof(block.standard_timings));
 	snprintf(name, sizeof(name), "%.3s %04x", metadata->manufacturer, metadata->product);

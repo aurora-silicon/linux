@@ -40,7 +40,7 @@ const struct ane_fw_platform ane_h16_platform = {
 	.dapf_dart = 0,
 	.dapf_offset = 0x10000,
 	.dapf_size = SZ_16K,
-	/* The DT compatible is t6041; the physical M4 Pro is T6040. */
+	/* The DT compatible is t6041 on the M4 Max and the M4 Pro (T6040) alike. */
 	.soc = 0x6040,
 	.chip_family = 16,
 	.ane_type = 0x110,

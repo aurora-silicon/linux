@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/phy/apple,ausb-usb3-phy.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T6000 shared AUSB USB3 PHY
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  The shared AUSB USB3 PHY exposes control and analogue apertures.
+  It supplies the two AUSB port PHYs and has separate USB and always-on gates.
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t6000-ausb-usb3-phy
+      - const: apple,ausb-usb3-phy
+
+  reg:
+    minItems: 21
+    maxItems: 21
+
+  power-domains:
+    minItems: 2
+    maxItems: 2
+
+  '#phy-cells':
+    const: 0
+
+required:
+  - compatible
+  - reg
+  - power-domains
+  - '#phy-cells'
+
+additionalProperties: false
