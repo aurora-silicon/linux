@@ -55,8 +55,6 @@
 	width-mm = <345>;
 	height-mm = <223>;
 	adj-height-mm = <216>;
-	/* "Wide color (P3)" in the Apple technical specifications */
-	apple,color-gamut = "display-p3";
 };
 
 &aop_audio {
@@ -84,27 +82,6 @@
 &mesa {
 	firmware-name = "apple/mesacal-j616s.bin", "apple/msrk-j616s.bin";
 };
-
-&ps_jpg {
-	status = "okay";
-};
-
-&jpeg0_dart {
-	status = "okay";
-};
-
-&jpeg0 {
-	status = "okay";
-};
-
-&jpeg1_dart {
-	status = "okay";
-};
-
-&jpeg1 {
-	status = "okay";
-};
-
 
 &i2c4 {
 	sd_card_control: card-control@20 {
@@ -152,4 +129,39 @@
 			};
 		};
 	};
+};
+
+&i2c6 {
+	retimer@18 {
+		compatible = "apple,t6041-atcrt", "apple,atcrt";
+		reg = <0x18>;
+		status = "disabled";
+	};
+	retimer@19 {
+		compatible = "apple,t6041-atcrt", "apple,atcrt";
+		reg = <0x19>;
+		status = "disabled";
+	};
+	retimer@1a {
+		compatible = "apple,t6041-atcrt", "apple,atcrt";
+		reg = <0x1a>;
+		status = "disabled";
+	};
+};
+
+/* Scaler/CSC (MSR) and its DART, proven on this board. */
+&ps_msr0 {
+	status = "okay";
+};
+
+&ps_msr0_ase_core {
+	status = "okay";
+};
+
+&scaler0_dart {
+	status = "okay";
+};
+
+&scaler0 {
+	status = "okay";
 };

@@ -469,6 +469,11 @@ static inline bool apple_t8132_air(void)
 	return of_machine_is_compatible("apple,j713") ||
 	       of_machine_is_compatible("apple,j715");
 }
+/* The qualified-firmware term: these harnesses model no /chosen. */
+static inline bool apple_t8132_firmware_path(void)
+{
+	return apple_t8132_air();
+}
 static bool of_property_read_bool(const struct device_node *n, const char *p)
 {
 	if (!strcmp(p, "apple,always-on"))

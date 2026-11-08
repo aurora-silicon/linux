@@ -2270,17 +2270,16 @@ static int dcp_m4_boot_framebuffer_check(void)
 		if (!of_device_is_available(np))
 			continue;
 		found++;
-		/* The inherited console may exclude the notch (64 lines on J713). */
+		/* The inherited console may exclude the panel's notch rows. */
 		if (of_property_read_u32(np, "width", &width) ||
 		    of_property_read_u32(np, "height", &height) ||
 		    of_property_read_u32(np, "stride", &stride) ||
 		    width != dcp_m4_pf->panel_width || stride != dcp_m4_pf->boot_stride ||
 		    (height != dcp_m4_pf->panel_height &&
-		     height != dcp_m4_pf->panel_height - 64)) {
+		     height != dcp_m4_pf->panel_height - dcp_m4_pf->notch_rows)) {
 			of_node_put(np);
 			return -EINVAL;
 		}
-		/* The inherited console can exclude the 64-line notch region. */
 		ret = 0;
 	}
 	return found > 1 ? -EINVAL : ret;

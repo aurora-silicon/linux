@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * Apple MacBook Air (13-inch, M4) G16 GPU resources.
- *
- * Node structure follows the J713 ADT; values match the cleanroom J713 live
- * device tree. The Rust Asahi G16 backend is loaded explicitly after the
- * native display and GFX TVM supplier are ready. m1n1 fills the inherited UAT
- * and firmware ranges below, sets them okay, and publishes the firmware
- * segment layout on the gpu node; Asahi validates this handoff before boot.
+ * The T8132 G16 GPU, its ASC mailbox and the outer GFX power gate (TVM),
+ * as on the J713. The GPU depends on the 26.6.2 firmware, not the board: the
+ * boot loader fills the inherited UAT and firmware ranges (reg), enables
+ * them and publishes the handoff, or disables the GPU.
  *
  * Copyright The Asahi Linux Contributors
  */
+
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
 
 / {
 	aliases {
@@ -18,37 +18,31 @@
 
 	reserved-memory {
 		gpu_ttbs: uat-ttbs {
-			reg = <0 0 0 0>;
 			no-map;
 			status = "disabled";
 		};
 
 		gpu_pagetables: uat-pagetables {
-			reg = <0 0 0 0>;
 			no-map;
 			status = "disabled";
 		};
 
 		gpu_handoff: uat-handoff {
-			reg = <0 0 0 0>;
 			no-map;
 			status = "disabled";
 		};
 
 		gpu_shared_l2: uat-shared-l2 {
-			reg = <0 0 0 0>;
 			no-map;
 			status = "disabled";
 		};
 
 		gpu_fw_text: gpu-fw-text {
-			reg = <0 0 0 0>;
 			no-map;
 			status = "disabled";
 		};
 
 		gpu_fw_data: gpu-fw-data {
-			reg = <0 0 0 0>;
 			no-map;
 			status = "disabled";
 		};
@@ -80,7 +74,6 @@
 	};
 
 	agx_mbox: mailbox@302608000 {
-		/* ASCWrap v6 contains the same mailbox aperture used by ASC v4. */
 		compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
 		reg = <0x3 0x02608000 0x0 0x4000>;
 		/* Idle ring-service kicks need not wake the system. */
@@ -96,9 +89,8 @@
 	};
 };
 
-/* The outer TVM gate is the parent of the GFX PMGR domain on J713. */
+/* The outer TVM gate is the parent of the GFX PMGR domain. */
 &ps_gfx {
-	status = "okay";
 	power-domains = <&gfx_tvm>;
 	/* The G16 firmware stays live across suspend-to-idle. */
 	apple,sleep-retained;

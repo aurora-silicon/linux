@@ -3069,7 +3069,7 @@ static void __init gate_t6041_max_run(void)
 }
 
 /*
- * J713 and J715: the dcpext Type-C routes are disabled in the device tree,
+ * M4: the dcpext Type-C routes are disabled in the device tree,
  * as on J613, because a USB-C port controller waits for the mode switch of
  * every available route. Enable them only for a dcpext the boot loader handed
  * over (apple,t8132-dcpext-firmware-ready = 1). A handed-over dcpext that is
@@ -3115,7 +3115,7 @@ static int __init apple_display_gate(void)
 {
 	int i;
 
-	if (apple_t8132_air()) {
+	if (apple_t8132_firmware_path()) {
 		gate_j713_dcpext_routes();
 		return 0;
 	}
