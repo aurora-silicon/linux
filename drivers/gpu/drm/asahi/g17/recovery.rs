@@ -11,7 +11,7 @@ mod attribution;
 mod slot;
 mod safety;
 pub(crate) use safety::{note_retired, since_retired};
-pub(crate) use attribution::{Sources, PAGE_FAULT};
+pub(crate) use attribution::{Record, Sources, PAGE_FAULT};
 use attribution::Attribution;
 
 pub(super) fn slot_key(slot: usize, slot_keys: Option<u64>) -> Option<u64> {
@@ -47,6 +47,8 @@ pub(super) struct Entries {
     pub(super) fallback: u32,
     /// QIDs with a listed command found by its exact stamp: that command was dropped.
     exact_qids: u128,
+    /// QIDs with a valid record.
+    queues: u128,
 }
 
 impl Entries {
@@ -64,6 +66,7 @@ impl Entries {
         if flags & u32::from(CANCELLED) != 0 {
             self.cancelled |= bit;
         }
+        self.queues |= bit;
         self.listed += 1;
         true
     }
@@ -264,7 +267,8 @@ pub(super) fn service<H: Host>(
         host.clear_timestamps()?;
     }
     let mut sources = host.fault_sources()?;
-    sources.report(request.generation, super::queue::compute::retirement::stampless_total());
+    sources.report(request.generation, super::queue::compute::retirement::stampless_total(),
+        request.blamed);
     host.report_mmu_fault();
     if let Some(qid) = request.blamed {
         host.report_blamed_render(qid);
@@ -307,6 +311,7 @@ pub(super) fn service<H: Host>(
         return Err(EIO);
     }
     host.recovery_mut().pending = None;
+    report_clients(host, request.generation, &entries, request.blamed);
 
     let (listed, exact, fallback) = (entries.listed, entries.exact, entries.fallback);
     let (cancelled, blame, leftover) = classify(host, entries, request.blamed, attribution);
@@ -328,7 +333,7 @@ pub(super) fn service<H: Host>(
     if let Some(qid) = request.blamed {
         pr_warn!(
             "G17: GPU recovery (reason {:?}): firmware blamed queue {}, {}\n",
-            sources.reason,
+            sources.firmware_reason(),
             qid,
             if blame { "failing its oldest render" } else { "attribution cleared it; spared" }
         );
@@ -342,6 +347,44 @@ pub(super) fn service<H: Host>(
     let scan_error = host.rescan_compute().err();
     host.release_retired_compute();
     Ok(ServiceResult { scan_error, target_error, leftover })
+}
+
+/// Names the client of each queue the recovery table lists, and of the blamed queue, before any
+/// classification changes: every recovery then says whose work was in flight. Diagnostics only.
+fn report_clients<Q: Queues>(queues: &Q, generation: u64, entries: &Entries, blamed: Option<u8>) {
+    let named = entries.queues | blamed.map_or(0, |qid| 1u128 << qid);
+    for qid in (0..QIDS).filter(|qid| named & (1u128 << qid) != 0) {
+        let bit = 1u128 << qid;
+        let mut first: Option<Arc<VmStatus>> = None;
+        let (mut commands, mut others) = (0u32, 0u32);
+        queues.visit_owners(qid, &mut |status| {
+            commands += 1;
+            match first.as_ref().map(|known| Arc::ptr_eq(known, status)) {
+                None => first = Some(status.clone()),
+                Some(false) => others += 1,
+                Some(true) => {}
+            }
+        });
+        let flags = (
+            if blamed == Some(qid) { " blamed" } else { "" },
+            if entries.guilty & bit != 0 { " guilty" } else { "" },
+            if entries.cancelled & bit != 0 { " cancelled" } else { "" },
+        );
+        match first {
+            Some(status) => {
+                let (name, tgid) = status.client();
+                let shared = if others != 0 { " and other clients" } else { "" };
+                pr_warn!(
+                    "G17: recovery gen {} queue {}{}{}{}: {} retained commands, client {}[{}]{}\n",
+                    generation, qid, flags.0, flags.1, flags.2, commands, name, tgid, shared
+                );
+            }
+            None => pr_warn!(
+                "G17: recovery gen {} queue {}{}{}{}: no retained commands\n",
+                generation, qid, flags.0, flags.1, flags.2
+            ),
+        }
+    }
 }
 
 /// Walks the recovery table. G17P's is a packed list: records after its first invalid one are

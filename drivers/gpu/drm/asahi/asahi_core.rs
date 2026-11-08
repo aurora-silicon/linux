@@ -143,6 +143,10 @@ module! {
             default: 1,
             description: "Enable single-layer D32 compressed 2x/4x ZLS admission",
         },
+        m5_recovery_reason_blame: u32 {
+            default: 0,
+            description: "M5: let the firmware's recovery reason steer blame as on G17P (1); 0 only logs it",
+        },
         debug_flags: u64 {
             default: 0,
             // permissions: 0o644,
