@@ -334,7 +334,8 @@ struct sep_key_selftest {
  * DESIGN DRAFT, not a stable ABI: the per-user key bag whose secret is the
  * login password. Root only, on the re-arm node, never on /dev/sep-bio. The
  * password passes through once per call and the kernel keeps no copy.
- * 0x0e and 0x0f are taken by the lockout re-arm.
+ * 0x0e/0x0f are the lockout re-arm and 0x10 SEP_BIO_REQUIRE_PASSWORD; these
+ * use 0x30-0x36.
  */
 #define SEP_KEYBAG_SECRET_MAX 256
 
@@ -386,11 +387,11 @@ struct sep_keybag_change {
 	__u8  new_secret[SEP_KEYBAG_SECRET_MAX];
 };
 
-#define SEP_BIO_KEYBAG_STATE  _IOWR(SEP_BIO_IOC_MAGIC, 0x10, struct sep_keybag_state)
-#define SEP_BIO_KEYBAG_UNLOCK _IOW(SEP_BIO_IOC_MAGIC, 0x11, struct sep_keybag_unlock)
-#define SEP_BIO_KEYBAG_LOCK   _IOW(SEP_BIO_IOC_MAGIC, 0x12, struct sep_keybag_lock)
-#define SEP_BIO_KEYBAG_CHANGE _IOW(SEP_BIO_IOC_MAGIC, 0x13, struct sep_keybag_change)
-#define SEP_BIO_KEYBAG_CREATE _IOW(SEP_BIO_IOC_MAGIC, 0x14, struct sep_keybag_unlock)
+#define SEP_BIO_KEYBAG_STATE  _IOWR(SEP_BIO_IOC_MAGIC, 0x30, struct sep_keybag_state)
+#define SEP_BIO_KEYBAG_UNLOCK _IOW(SEP_BIO_IOC_MAGIC, 0x31, struct sep_keybag_unlock)
+#define SEP_BIO_KEYBAG_LOCK   _IOW(SEP_BIO_IOC_MAGIC, 0x32, struct sep_keybag_lock)
+#define SEP_BIO_KEYBAG_CHANGE _IOW(SEP_BIO_IOC_MAGIC, 0x33, struct sep_keybag_change)
+#define SEP_BIO_KEYBAG_CREATE _IOW(SEP_BIO_IOC_MAGIC, 0x34, struct sep_keybag_unlock)
 
 /*
  * A user's wrapped bag, for userspace to keep across reboots (as macOS
@@ -406,7 +407,7 @@ struct sep_keybag_blob {
 	__u8  data[SEP_KEYBAG_BLOB_MAX];
 };
 
-#define SEP_BIO_KEYBAG_EXPORT _IOWR(SEP_BIO_IOC_MAGIC, 0x15, struct sep_keybag_blob)
-#define SEP_BIO_KEYBAG_IMPORT _IOW(SEP_BIO_IOC_MAGIC, 0x16, struct sep_keybag_blob)
+#define SEP_BIO_KEYBAG_EXPORT _IOWR(SEP_BIO_IOC_MAGIC, 0x35, struct sep_keybag_blob)
+#define SEP_BIO_KEYBAG_IMPORT _IOW(SEP_BIO_IOC_MAGIC, 0x36, struct sep_keybag_blob)
 
 #endif /* _UAPI_LINUX_APPLE_SEP_H */

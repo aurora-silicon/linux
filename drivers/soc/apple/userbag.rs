@@ -744,13 +744,13 @@ unsafe impl kernel::transmute::FromBytes for ChangeRequest {}
 unsafe impl kernel::transmute::AsBytes for StateReply {}
 
 const IOC_MAGIC: u32 = 0xB1;
-pub(crate) const IOC_STATE: u32 = kernel::ioctl::_IOWR::<StateReply>(IOC_MAGIC, 0x10);
-pub(crate) const IOC_UNLOCK: u32 = kernel::ioctl::_IOW::<UnlockRequest>(IOC_MAGIC, 0x11);
-pub(crate) const IOC_LOCK: u32 = kernel::ioctl::_IOW::<LockRequest>(IOC_MAGIC, 0x12);
-pub(crate) const IOC_CHANGE: u32 = kernel::ioctl::_IOW::<ChangeRequest>(IOC_MAGIC, 0x13);
-pub(crate) const IOC_CREATE: u32 = kernel::ioctl::_IOW::<UnlockRequest>(IOC_MAGIC, 0x14);
-pub(crate) const IOC_EXPORT: u32 = kernel::ioctl::_IOWR::<BagBlob>(IOC_MAGIC, 0x15);
-pub(crate) const IOC_IMPORT: u32 = kernel::ioctl::_IOW::<BagBlob>(IOC_MAGIC, 0x16);
+pub(crate) const IOC_STATE: u32 = kernel::ioctl::_IOWR::<StateReply>(IOC_MAGIC, 0x30);
+pub(crate) const IOC_UNLOCK: u32 = kernel::ioctl::_IOW::<UnlockRequest>(IOC_MAGIC, 0x31);
+pub(crate) const IOC_LOCK: u32 = kernel::ioctl::_IOW::<LockRequest>(IOC_MAGIC, 0x32);
+pub(crate) const IOC_CHANGE: u32 = kernel::ioctl::_IOW::<ChangeRequest>(IOC_MAGIC, 0x33);
+pub(crate) const IOC_CREATE: u32 = kernel::ioctl::_IOW::<UnlockRequest>(IOC_MAGIC, 0x34);
+pub(crate) const IOC_EXPORT: u32 = kernel::ioctl::_IOWR::<BagBlob>(IOC_MAGIC, 0x35);
+pub(crate) const IOC_IMPORT: u32 = kernel::ioctl::_IOW::<BagBlob>(IOC_MAGIC, 0x36);
 
 /// The largest wrapped user bag `EXPORT`/`IMPORT` carry.
 pub(crate) const BAG_BLOB_MAX: usize = 1024;
