@@ -1249,6 +1249,41 @@ static void program_bad_load_test(struct kunit *test)
 	}
 }
 
+/*
+ * A LOAD whose process descriptors do not validate is refused before any
+ * mapping or firmware traffic, and it must not block the next LOAD.
+ */
+static void program_bad_operation_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_hwx_snapshot *snapshot;
+	struct ane_h16_program *p = NULL;
+	struct ane_h16_hwx hwx;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	snapshot = fw_snapshot(test, false, false);
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(snapshot->bytes, snapshot->size, &hwx), 0);
+	test_aux_size[ANE_H16_AUX_GENERIC] =
+		generic_fill(test_aux[ANE_H16_AUX_GENERIC], &hwx, TEST_GENERIC_BASE);
+	test_aux_size[ANE_H16_AUX_OPERATION] =
+		operation_fill(test_aux[ANE_H16_AUX_OPERATION], snapshot, &hwx,
+			       TEST_GENERIC_BASE);
+	/* One record more than the section carries. */
+	put_unaligned_le32(get_unaligned_le32(test_aux[ANE_H16_AUX_OPERATION]) + 1,
+			   test_aux[ANE_H16_AUX_OPERATION]);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_load(&f->s, snapshot, test_aux_ptr,
+						   test_aux_size, &p), -ENOEXEC);
+	KUNIT_EXPECT_PTR_EQ(test, p, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, f->s.program, NULL);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+	KUNIT_EXPECT_EQ(test, f->count, 0);
+	/* The refused LOAD left nothing behind: a valid one still works. */
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+}
+
 static void program_bad_report_test(struct kunit *test)
 {
 	static const enum fw_mode modes[] = {
@@ -2665,6 +2700,7 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_gate_hold_test),
 	KUNIT_CASE(program_scratch_test),
 	KUNIT_CASE(program_bad_load_test),
+	KUNIT_CASE(program_bad_operation_test),
 	KUNIT_CASE(program_bad_report_test),
 	KUNIT_CASE(program_stall_trace_test),
 	KUNIT_CASE(program_timing_test),
