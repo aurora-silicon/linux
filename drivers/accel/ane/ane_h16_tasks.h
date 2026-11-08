@@ -42,10 +42,10 @@ static inline bool ane_h16_register_valid(u32 word)
  */
 static inline int
 ane_hx_task_stream_validate_limit(const void *text, size_t size, u32 expected_tasks,
-				  u32 prologue, u32 *record_limit)
+				  u32 prologue, u32 *record_limit, size_t *final_end)
 {
 	const u8 *p = text;
-	size_t pos = 16;
+	size_t pos = 16, last = 0;
 	u32 tasks = 0, limit = 0;
 
 	if (!p || !expected_tasks || size < 16 || size > ANE_H16_TASK_MAX ||
@@ -103,6 +103,7 @@ ane_hx_task_stream_validate_limit(const void *text, size_t size, u32 expected_ta
 		padded = end == size ? end : ALIGN(end, 16);
 		if (padded > size || memchr_inv(p + end, 0, padded - end))
 			return -ENOEXEC;
+		last = end;
 		pos = padded;
 		if (++tasks > expected_tasks)
 			return -ENOEXEC;
@@ -111,13 +112,16 @@ ane_hx_task_stream_validate_limit(const void *text, size_t size, u32 expected_ta
 		return -ENOEXEC;
 	if (record_limit)
 		*record_limit = limit;
+	if (final_end)
+		*final_end = last;
 	return 0;
 }
 
 static inline int
 ane_hx_task_stream_validate(const void *text, size_t size, u32 expected_tasks, u32 prologue)
 {
-	return ane_hx_task_stream_validate_limit(text, size, expected_tasks, prologue, NULL);
+	return ane_hx_task_stream_validate_limit(text, size, expected_tasks, prologue, NULL,
+						 NULL);
 }
 
 static inline int

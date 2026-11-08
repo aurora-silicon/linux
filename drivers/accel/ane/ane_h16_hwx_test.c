@@ -301,6 +301,41 @@ static void hwx_staged_counts_test(struct kunit *test)
 	}
 }
 
+/*
+ * Trailing zero bytes after the last H16 task leave the engine armed, and the
+ * next EXECUTE times out. The final task must end the section exactly.
+ */
+static void hwx_final_task_end_test(struct kunit *test)
+{
+	static const u32 tails[] = { 4, 8, 12, 12 + 16 };
+	struct ane_h16_hwx info;
+	unsigned int form, i;
+
+	for (form = 0; form < 2; form++) {
+		struct hwx_fixture *f = fixture_create(test, form, false);
+		u8 *section, *program;
+		u64 end;
+
+		KUNIT_ASSERT_NOT_NULL(test, f);
+		/* One task with two records ends at 68; __const starts at 128. */
+		fixture_tasks(f, 1, 2);
+		section = f->bytes + f->text_command + 72;
+		program = f->bytes + f->program;
+		end = get_unaligned_le64(section + 40);
+		KUNIT_ASSERT_EQ(test, end, 68ULL);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+		for (i = 0; i < ARRAY_SIZE(tails); i++) {
+			put_unaligned_le64(end + tails[i], section + 40);
+			put_unaligned_le32((end + tails[i]) / 4, program + 0x824);
+			KUNIT_EXPECT_EQ_MSG(test, ane_h16_hwx_validate(f->bytes, f->size, &info),
+					    -ENOEXEC, "form %u tail %u", form, tails[i]);
+		}
+		put_unaligned_le64(end, section + 40);
+		put_unaligned_le32(end / 4, program + 0x824);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	}
+}
+
 static void hwx_geometry_test(struct kunit *test)
 {
 	struct hwx_fixture *f = fixture_create(test, false, false);
@@ -569,6 +604,7 @@ static struct kunit_case hwx_cases[] = {
 	KUNIT_CASE(hwx_surface_order_test),
 	KUNIT_CASE(hwx_program_test),
 	KUNIT_CASE(hwx_staged_counts_test),
+	KUNIT_CASE(hwx_final_task_end_test),
 	KUNIT_CASE(hwx_geometry_test),
 	KUNIT_CASE(hwx_symbols_test),
 	KUNIT_CASE(hwx_relocations_test),

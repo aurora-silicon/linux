@@ -212,6 +212,7 @@ static int hwx_program(struct hwx_parser *p)
 	struct ane_h16_hwx *info = &p->info;
 	u32 length = get_unaligned_le32(c + 4), records, record_limit, i;
 	u32 prologue = info->subtype == ANE_HWX_SUBTYPE_H17 ? 0 : 1;
+	size_t final_end = 0;
 	u64 work_limit = 0;
 	bool mixed = length == 0x8c0;
 	/* Nonzero cells only; every other byte is checked below. */
@@ -297,9 +298,17 @@ static int hwx_program(struct hwx_parser *p)
 	if (!memcmp(c, expected, length)) {
 		ret = ane_hx_task_stream_validate_limit(p->bytes + info->text.offset,
 							info->text.size, info->tasks, prologue,
-							&record_limit);
+							&record_limit, &final_end);
 		/* This compiler hint need not equal the encoded record count. */
 		if (!ret && (!records || records > record_limit))
+			ret = -ENOEXEC;
+		/*
+		 * On H16 the final task must end the section: zero padding or
+		 * zero blocks after it leave the engine armed, and the next
+		 * EXECUTE on the device times out.
+		 */
+		if (!ret && info->subtype == ANE_HWX_SUBTYPE_H16 &&
+		    final_end != info->text.size)
 			ret = -ENOEXEC;
 	}
 	kfree(expected);
