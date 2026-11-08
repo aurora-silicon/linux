@@ -1766,6 +1766,23 @@ pub(crate) const M5_HOST_RECOVERY: usize = 0x4af0;
 pub(crate) const M5_RECOVERY_INFO: usize = 0x4298;
 pub(crate) const M5_RECOVERY_SLOT_MASK: usize = 0x4ab8;
 
+/// The rest of the M5 firmware's recovery record in the primary status B, beside the slot mask,
+/// read while the firmware waits in recovery state 1:
+///
+/// - +0x4aa0: the number of busy slots the firmware walked;
+/// - +0x4aa8: a word describing the slot the record names, or 0 without one;
+/// - +0x4aac: the recovery reason (`recovery::cause`); 5 was read here from every recovery of a
+///   ten-minute mixed client load on a J716s with the 27.3 beta 1 firmware;
+/// - +0x4ab0: a u64 the reason's raiser leaves (for a page fault, its latched MMU fault status).
+///
+/// A record that reads all zero, slot mask included, is logged as none recorded. Only the reason
+/// has been read from a running firmware; the other words and their meanings are
+/// not yet confirmed from captured InitData.
+pub(crate) const M5_RECOVERY_SLOTS_WALKED: usize = 0x4aa0;
+pub(crate) const M5_RECOVERY_SLOT_WORD: usize = 0x4aa8;
+pub(crate) const M5_RECOVERY_REASON: usize = 0x4aac;
+pub(crate) const M5_RECOVERY_DETAIL: usize = 0x4ab0;
+
 pub(crate) const M5_STATUS_CONFIG_LINK_WORD: usize = 0x774;
 
 pub(crate) const M5_STATUS_CONFIG_LINK_PTR: usize = 0x778;

@@ -1973,6 +1973,25 @@ impl InitData {
     }
 }
 
+impl InitData {
+    /// The M5 firmware's recovery record, read in recovery state 1 like the slot mask.
+    fn m5_recovery_record(&self) -> Result<super::recovery::Record> {
+        use super::fw::m5::initdata as m5;
+        let base = self.graph.private.status_b;
+        let object = self.object(self.cluster)?;
+        let word = |offset: usize| -> Result<u32> {
+            Ok(object.word(base + offset)?.load(Ordering::Relaxed))
+        };
+        fence(Ordering::Acquire);
+        Ok(super::recovery::Record {
+            reason: word(m5::M5_RECOVERY_REASON)?,
+            slots_walked: word(m5::M5_RECOVERY_SLOTS_WALKED)?,
+            slot_word: word(m5::M5_RECOVERY_SLOT_WORD)?,
+            detail: object.dword(base + m5::M5_RECOVERY_DETAIL)?.load(Ordering::Relaxed),
+        })
+    }
+}
+
 impl super::recovery::Memory for InitData {
     fn is_m5(&self) -> bool {
         self.m5
@@ -1990,9 +2009,13 @@ impl super::recovery::Memory for InitData {
             .load(Ordering::Relaxed);
         // M5's slot-identity storage is not available through this mapping.
         // Keep firmware's explicit blame when attribution evidence is missing,
-        // while still allowing the recovery handshake to complete.
+        // while still allowing the recovery handshake to complete. Its firmware's
+        // recovery record names the cause in the log only: it does not steer
+        // blame, since the M5 reasons are not yet proven to mean what G17P's do.
         if self.m5 {
-            return Ok(super::recovery::Sources::sample(mask as u32, |_| None));
+            let mut sources = super::recovery::Sources::sample(mask as u32, |_| None);
+            sources.record = self.m5_recovery_record().ok();
+            return Ok(sources);
         }
         let mut sources = super::recovery::Sources::sample(mask as u32, |slot| {
             // Progress is independently available even when this firmware's key
