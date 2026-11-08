@@ -2130,6 +2130,10 @@ pub(crate) struct Board {
     pub(crate) calibration: Option<[u32; 3]>,
     /// The policy controllers' configuration, where the board has one.
     pub(crate) controller_defaults: Option<fn(&mut [u8]) -> Result<(), InitdataError>>,
+
+    /// The flag of every register-map slot, whether or not a window uses it. Only boards whose
+    /// own firmware's map has been read carry one.
+    pub(crate) register_slot_flags: Option<&'static [u32; COMMON26_HW_REGISTER_MAP_SLOTS]>,
     /// Region C's idle standby timer where the board's differs from the image's 1500 us, us.
     pub(crate) idle_standby_us: Option<u32>,
     /// The active memory cache controller mask, where it differs from the inherited 0xf.
@@ -2164,6 +2168,7 @@ pub(crate) const J714: Board = Board {
     relative_frequency: relative_frequency(&J714_GPU_PERF_STATES, 1),
     aon_records: &J714_AON_RECORDS,
     register_windows: &J714_REGISTER_WINDOWS,
+    register_slot_flags: None,
     min_parameter_buffer: 0x0020_0000,
     render_pool: (0x40_0000, 1 << 32),
     calibration: Some([0xd2035701, 0xac3a1280, 0x0a281d81]),
@@ -2192,6 +2197,7 @@ pub(crate) const J716C: Board = Board {
     relative_frequency: relative_frequency(&J716C_GPU_PERF_STATES, 1),
     aon_records: &J716C_AON_RECORDS,
     register_windows: &J716C_REGISTER_WINDOWS,
+    register_slot_flags: None,
     min_parameter_buffer: 0x0030_0000,
     render_pool: (0x80_0000, 1 << 33),
     // Its own controller configuration, for a part with this calibration.
@@ -2227,6 +2233,7 @@ pub(crate) const J775D: Board = Board {
     relative_frequency: relative_frequency(&J775D_GPU_PERF_STATES, J775D_PERF_FLOOR),
     aon_records: &J775D_AON_RECORDS,
     register_windows: &J775D_REGISTER_WINDOWS,
+    register_slot_flags: None,
     // The minimum parameter buffer for eight clusters.
     min_parameter_buffer: 0x0050_0000,
     // 16 MiB render blocks in a 16 GiB inventory.
@@ -2267,6 +2274,7 @@ pub(crate) const J813: Board = Board {
     relative_frequency: relative_frequency(&J813_GPU_PERF_STATES, 1),
     aon_records: &J813_AON_RECORDS,
     register_windows: &J813_REGISTER_WINDOWS,
+    register_slot_flags: Some(&J813_HW_REGISTER_SLOT_FLAGS),
     min_parameter_buffer: (super::target::min_parameter_buffer_pages(1) << 15) as u32,
     // Half J714's: 2 MiB render blocks in a 2 GiB inventory.
     render_pool: (0x20_0000, 1 << 31),
@@ -2275,9 +2283,11 @@ pub(crate) const J813: Board = Board {
     idle_standby_us: None,
     // One memory cache controller (/arm-io/sgx active-mcc-bit-vector; 25G76 +0xf8c = 1).
     mcc_mask: Some(0x1),
-    // The J813's 25G76 HW data has 6 at +0xf28 (J714's 12), common 26A428 +0x1044.
     topology_words: None,
-    hw_words: &[(0x1044, 6)],
+    // Words of macOS 27.0's own hardware data on this machine, read out of its bundle under
+    // aura, that the inherited 25G76 template and the generic encoding leave different.
+    hw_words: &[(0x0fa8, 0x8000), (0x0fb4, 2), (0x0fb8, 0), (0x1044, 0xc), (0x10a4, 0xa),
+                (0x10d4, 0x17), (0x1118, 0), (0x2660, 4), (0x2720, 1), (0x2724, 0)],
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
     completion_inputs: false,
@@ -2506,44 +2516,43 @@ const J714_REGISTER_WINDOWS: [M5RegisterWindowSpec; 30] = {
 /// (J873, same GPU base): slot 17 0x36000, DPEP (29) and ADCLK (30), and slot 32, the J813's
 /// 25G76 slot 27, which J714's list lacks.
 const J813_GPU_BASE: u64 = 0x5_8000_0000;
-const J813_REGISTER_WINDOWS: [M5RegisterWindowSpec; 32] = {
+/// The J813's windows, read out of macOS 27.0's own hardware-data bundle under aura (its live
+/// UAT maps exactly these, at exactly the device VAs [`m5_register_windows`] computes).
+const J813_REGISTER_WINDOWS: [M5RegisterWindowSpec; 22] = {
     const G: u64 = J813_GPU_BASE;
     [
         jw(0, &[0x3_8101_4000], 0x4000, 0, 2),
         jw(3, &[0x2_2010_4000], 0x18000, 0, 2),
-        jw(4, &[0x3_8106_8000], 0x4000, 0, 0),
+        jw(8, &[0x3_a135_0000], 0x4000, 0, 2),
         jw(9, &[0x3_803d_0000], 0x4000, 0, 2),
         jw(10, &[0x3_803c_0000], 0x4000, 0, 0),
-        jw(11, &[0x3_803d_8000], 0x4000, 0, 2),
         jw(12, &[0x4_2165_c000], 0x4000, 0, 2),
         jw(14, &[0x3_8028_0000], 0x8000, 0, 0),
         jw(15, &[0x3_8c84_0000], 0x24000, 0, 2),
-        // 25G76 maps 0x21400, the common 26A428 map 0x36000.
-        jw(17, &[G], 0x36000, 0, 2),
-        jw(18, &[G + 0xeb_4000], 0x4000, 0, 2),
+        // Ends right above the KSM block the firmware programs, as on 25G76.
+        jw(17, &[G], 0x21400, 0, 2),
         jw(22, &[G + 0x100_0000], 0x8000, 0, 2),
-        jw(23, &[G + 0xf0_0000], 0x10000, 0, 2),
         jw(24, &[G + 0xec_0000], 0x10000, 0, 2),
-        jw(29, &[G + 0x1800], 0x27f8, 0, 0),
-        jw(30, &[G + 0xec_2200], 0xfc, 0, 0),
         jw(31, &[G + 0xd0_4000], 0x8000, 0xd0_4000, 2),
         jw(32, &[G + 0xd0_d000], 0x1000, 0xd0_d000, 2),
         jw(33, &[G + 0xd5_0000], 0x10000, 0xd5_0000, 2),
         jw(34, &[G + 0xd1_0000], 0x4000, 0xd1_0000, 2),
         jw(36, &[G + 0xd4_0000], 0x4000, 0xd4_0000, 2),
         jw(37, &[G + 0xd6_0000], 0x8000, 0xd6_0000, 2),
-        jw(38, &[G + 0xd4_4000], 0x4000, 0xd4_4000, 2),
-        jw(39, &[G + 0xd4_c000], 0x200, 0xd4_c000, 2),
         jw(40, &[G + 0xe0_0000], 0x4000, 0xe0_0000, 2),
-        jw(42, &[G + 0xe4_0000], 0x4000, 0xe4_0000, 2),
         jw(44, &[G + 0xe0_8000, G + 0xe1_0000], 0x8000, 0, 2),
         jw(46, &[G + 0xe3_3800], 0x4000, 0, 2),
-        jw(48, &[G + 0xe6_0000], 0x58, 0xe6_0000, 2),
-        jw(52, &[G + 0xe4_8000], 0x8000, 0, 2),
-        jw(53, &[G + 0x2_3d00], 0x200, 0x2_3d00, 2),
-        jw(58, &[G + 0xe7_3800], 0x4000, 0, 2),
+        jw(47, &[G + 0xe3_5000], 0x4000, 0, 2),
+        jw(56, &[G + 0x1_4400], 0x400, 0x1_4400, 0),
     ]
 };
+
+/// The flag every one of the J813's slots carries, used or not, from macOS 27.0's own bundle; a
+/// used slot's own flag agrees with it.
+const J813_HW_REGISTER_SLOT_FLAGS: [u32; COMMON26_HW_REGISTER_MAP_SLOTS] = [
+    2, 0, 2, 2, 0, 2, 2, 2, 2, 2, 0, 0, 2, 0, 0, 2, 0, 2, 0, 0, 0, 0, 2, 0, 2, 2, 2, 2, 0, 0, 0, 2,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 0, 2, 2, 2, 2, 2, 2, 2, 0, 0, 0, 2, 2, 2, 2, 0, 0, 2, 0,
+];
 
 /// J714 with all eight AMCCs in slot 3 (J716c amcc-enable-mask 0xff, MCC
 /// reg[14..21] + 0x104000) and four instances, one per cluster, in slots 20 and
@@ -2653,7 +2662,7 @@ impl Board {
 
     /// The board's register windows: the first [`Board::register_window_count`] entries.
     pub(crate) fn register_windows(&self) -> [M5RegisterWindow; M5_MAX_REGISTER_WINDOWS] {
-        m5_register_windows(self.register_windows)
+        m5_register_windows(self.register_windows, self.graph.is_common26())
     }
 
     /// Register windows of the board.
@@ -2662,7 +2671,7 @@ impl Board {
     }
 }
 
-fn m5_register_windows(specs: &'static [M5RegisterWindowSpec])
+fn m5_register_windows(specs: &'static [M5RegisterWindowSpec], common26: bool)
     -> [M5RegisterWindow; M5_MAX_REGISTER_WINDOWS]
 {
     let mask = UAT_PAGE_SIZE as u64 - 1;
@@ -2671,7 +2680,8 @@ fn m5_register_windows(specs: &'static [M5RegisterWindowSpec])
     let mut next: u64 = 0;
     for (window, spec) in out.iter_mut().zip(specs) {
         let va = next + (spec.instances[0] & mask);
-        let span = spec.instances.len() as u64 * ((spec.size as u64 + mask) & !mask);
+        let size = if common26 { spec.size as u64 } else { (spec.size as u64 + mask) & !mask };
+        let span = spec.instances.len() as u64 * size;
         *window = M5RegisterWindow {
             slot: spec.slot,
             device_va: HW_REGISTER_APERTURE.start + va,
@@ -2680,7 +2690,11 @@ fn m5_register_windows(specs: &'static [M5RegisterWindowSpec])
             unk_18: spec.unk_18,
             flag: spec.flag,
         };
-        let end = (va + span + mask) & !mask;
+        // In the common 26A428 bundle the guard page follows the window's own bytes, before
+        // either is rounded up: a window whose size is not a whole number of pages does not push
+        // the next one past its page (macOS 27.0's J813 bundle, where slot 32's 0x1000 bytes
+        // leave the next window at the end of its own page).
+        let end = if common26 { va + span } else { (va + span + mask) & !mask };
         next = (end + UAT_PAGE_SIZE as u64 + 0x7fff) & !0x7fff;
     }
     out
@@ -2695,6 +2709,11 @@ pub(crate) fn encode_m5_register_map(
         return Err(InitdataError::BufferSize);
     }
     out.fill(0);
+    if let Some(flags) = board.register_slot_flags {
+        for (slot, flag) in flags.iter().enumerate() {
+            put_u32(out, slot * HW_REGISTER_MAP_ENTRY_SIZE + 0x20, *flag);
+        }
+    }
     for (index, window) in windows.iter().enumerate() {
         let spec = board.register_windows.get(index).ok_or(InitdataError::RegisterWindow)?;
         if window.slot >= COMMON26_HW_REGISTER_MAP_SLOTS
