@@ -91,6 +91,7 @@ struct t8140_s2r_mailbox {
 #define PS_ATC0_USB_AON		0x3e0
 #define PS_ATC0_COMMON		0x3e8
 #define PS_ATC0_USB		0x3f0
+#define PS_AP_TMM		0x1a0
 
 /* CPU start block, as aura's smp_start_cpu() uses it */
 #define CPU_START_STOP		0x0
@@ -490,6 +491,8 @@ struct t8140_sleep {
 	int radio_perst;
 	bool radio_perst_low;
 	bool returned;
+	/* This return was the first from the deep path: later sleeps keep DRAM up. */
+	bool slp_ddr_now_ready;
 	/* This sleep's wake came from the SMC's sources alone. */
 	bool smc_woke_alone;
 };
@@ -546,6 +549,13 @@ static DEFINE_SPINLOCK(t8140_slp_ddr_lock);
 static bool t8140_slp_ddr_usb;
 static void __iomem *t8140_slp_ddr_word;
 
+/*
+ * The SLP_DDR wake runs on the SoC-side state the system left. After a Linux boot it stalls in
+ * the sleep engine, and once one deep sleep has rebuilt that state it gets through every time.
+ * So the word stays clear, whatever the host votes, until a wake shows the deep path ran.
+ */
+static bool t8140_slp_ddr_ready;
+
 static void t8140_slp_ddr_write(void)
 {
 	u32 val;
@@ -554,7 +564,7 @@ static void t8140_slp_ddr_write(void)
 	if (!t8140_slp_ddr_word)
 		return;
 	val = readl(t8140_slp_ddr_word) & ~WAKE_SLP_DDR_USB;
-	if (t8140_slp_ddr_usb)
+	if (t8140_slp_ddr_usb && t8140_slp_ddr_ready)
 		val |= WAKE_SLP_DDR_USB;
 	writel(val, t8140_slp_ddr_word);
 }
@@ -2138,6 +2148,14 @@ static int t8140_ps_restore(void __iomem *reg, u32 saved)
 	return ret;
 }
 
+/* Whether the domain at @offset was on as the wake found it. */
+static bool t8140_ps_woke_on(u32 offset)
+{
+	int i = t8140_ps_find(t8140_ps_all, ARRAY_SIZE(t8140_ps_all), offset);
+
+	return i >= 0 && FIELD_GET(PS_ACTUAL, t8140_ps_woke[i]);
+}
+
 /* Linux had it on and the wake left it otherwise. With AUTO_ENABLE, off is allowed. */
 static bool t8140_ps_dropped(u32 saved, u32 woke)
 {
@@ -2616,6 +2634,15 @@ static void t8140_sleep_return(struct t8140_sleep *s)
 
 	t8140_ps_rewake(s);
 
+	/* Only C2S turns AP_TMM on: the deep path ran, so the held vote applies from now on. */
+	if (!t8140_slp_ddr_ready && t8140_ps_woke_on(PS_AP_TMM)) {
+		scoped_guard(spinlock_irqsave, &t8140_slp_ddr_lock) {
+			t8140_slp_ddr_ready = true;
+			t8140_slp_ddr_write();
+		}
+		s->slp_ddr_now_ready = true;
+	}
+
 	val = readl(s->ps + PS_SEP);
 	if (val & PS_DEV_DISABLE)
 		writel(val & ~PS_DEV_DISABLE, s->ps + PS_SEP);
@@ -2798,6 +2825,10 @@ static void t8140_sleep_report(void)
 
 	dev_info(s->dev, "back from sleep, boot object resumes %llu -> %llu\n",
 		 s->resumes_before, s->resumes_after);
+	if (s->slp_ddr_now_ready) {
+		s->slp_ddr_now_ready = false;
+		dev_info(s->dev, "the deep path ran: later sleeps keep DRAM up for the USB host\n");
+	}
 	for (i = 0; i < ARRAY_SIZE(t8140_wake_names); i++) {
 		u32 id = t8140_wake_names[i].id;
 
