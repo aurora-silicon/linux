@@ -9,6 +9,17 @@
  */
 #include <dt-bindings/gpio/gpio.h>
 
+/*
+ * ADT dart-sbr (sbr_dart in t8152-peripherals.dtsi), shared with the PMP:
+ * mapper-aop 0, mapper-admac-base-ns 42. iBoot leaves streams 0, 1 and 42
+ * translating (root slot 16 owned by the firmware) without setting the
+ * lock bit.
+ */
+&sbr_dart {
+	apple,retain-translation;
+	status = "okay";
+};
+
 / {
 	soc {
 		/*
@@ -24,20 +35,6 @@
 				     <AIC_IRQ 626 IRQ_TYPE_LEVEL_HIGH>;
 			interrupt-names = "send-empty", "recv-not-empty";
 			#mbox-cells = <0>;
-		};
-
-		/*
-		 * ADT dart-sbr, shared with the PMP: mapper-aop 0,
-		 * mapper-admac-base-ns 42. iBoot leaves streams 0, 1 and 42
-		 * translating (root slot 16 owned by the firmware) without
-		 * setting the lock bit.
-		 */
-		sbr_dart: iommu@318100000 {
-			compatible = "apple,t8152-dart", "apple,t8110-dart";
-			reg = <0x3 0x18100000 0x0 0xc000>;
-			#iommu-cells = <1>;
-			interrupts = <AIC_IRQ 207 IRQ_TYPE_LEVEL_HIGH>;
-			apple,retain-translation;
 		};
 
 		/*

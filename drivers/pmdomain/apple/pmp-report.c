@@ -487,7 +487,7 @@ int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int t
 	struct platform_device *pdev;
 	struct apple_pmp_report *rep;
 	u64 status;
-	bool t8132 = apple_t8132_air() &&
+	bool t8132 = apple_t8132_firmware_path() &&
 		of_device_is_compatible(supplier->of_node, "apple,t8132-pmp-v2");
 	int ret;
 

@@ -16,15 +16,16 @@
 	aliases {
 		ethernet0 = &ethernet0;
 	};
+};
 
-	soc {
-		pcie2_dart: iommu@38a000000 {
-			compatible = "apple,t8152-dart", "apple,t8110-dart";
-			reg = <0x3 0x8a000000 0x0 0xc000>;
-			#iommu-cells = <1>;
-			interrupts = <AIC_IRQ 1588 IRQ_TYPE_LEVEL_HIGH>;
-		};
-	};
+/*
+ * dart-apcie2, described in t8152-peripherals.dtsi. The ADT window is
+ * 0x20000; keep the 0xc000 this port was brought up with, the size that
+ * pcie0_dart has in t8152-j873-n1.dtsi.
+ */
+&pcie2_dart {
+	reg = <0x3 0x8a000000 0x0 0xc000>;
+	status = "okay";
 };
 
 &pcie {
