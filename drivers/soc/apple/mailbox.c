@@ -1764,6 +1764,8 @@ static const struct apple_mbox_hw apple_mbox_t8152_ans_hw = {
 
 static const struct of_device_id apple_mbox_of_match[] = {
 	{ .compatible = "apple,t8152-smc-mailbox", .data = &apple_mbox_t8152_smc_hw },
+	/* The AOP's ASC wrapper mailbox has the SMC mailbox's counted FIFOs. */
+	{ .compatible = "apple,t8152-ascwrap-v8-mailbox", .data = &apple_mbox_t8152_smc_hw },
 	{ .compatible = "apple,t8152-ans-mailbox", .data = &apple_mbox_t8152_ans_hw },
 	{ .compatible = "apple,t6031-agx-asc-mailbox", .data = &apple_mbox_asc_hw },
 	{ .compatible = "apple,t8122-agx-asc-mailbox", .data = &apple_mbox_asc_hw },
