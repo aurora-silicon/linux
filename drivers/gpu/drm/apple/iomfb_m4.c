@@ -2538,7 +2538,6 @@ int iomfb_m4_init(struct apple_dcp *owner)
 	struct iomfb_m4 *dcp;
 	struct resource *res;
 	const struct dcp_m4_profile *pf = dcp_m4_machine_profile();
-	const char *uuid;
 	u32 ready = 0;
 	int ret;
 	/* An external DCP the boot loader handed over: same firmware, no panel. */
@@ -2551,9 +2550,7 @@ int iomfb_m4_init(struct apple_dcp *owner)
 	if (!pf ||
 	    (!external && !of_device_is_compatible(dev->of_node, "apple,t8132-dcp")) ||
 	    !iomfb_m4_firmware_property(dev->of_node, "apple,firmware-version") ||
-	    !iomfb_m4_firmware_property(dev->of_node, "apple,firmware-compat") ||
-	    of_property_read_string(dev->of_node, "apple,firmware-uuid", &uuid) ||
-	    strcmp(uuid, "81BAF476-679D-3CC0-8C6A-E6B6FA659D5E"))
+	    !iomfb_m4_firmware_property(dev->of_node, "apple,firmware-compat"))
 		return dev_err_probe(dev, -ENODEV, "unqualified firmware 26.6.2 handoff\n");
 	/* Refuse before any message, so the boot framebuffer stays. */
 	if (!external && !pf->timing)

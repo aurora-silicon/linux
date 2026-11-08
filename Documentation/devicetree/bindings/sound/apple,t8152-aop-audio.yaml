@@ -4,54 +4,29 @@
 $id: http://devicetree.org/schemas/sound/apple,t8152-aop-audio.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple T8142 and T8152 AOP audio
+title: Apple T8152-generation AOP audio
 
 maintainers:
-  - Thomas Glanzmann <thomas@glanzmann.de>
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
 
 description:
-  Audio services of the T8152 Always-On Processor firmware, a child of the
-  AOP node. The firmware owns the audio fabric; the host feeds and drains the
-  serializers through ADMAC channels.
+  The audio service of the T8142, T8152 and T6050 Always-On Processor, a
+  child of the AOP node. It names the ADMAC channels of the headset jack, the
+  speaker and the speaker amplifiers' voltage and current sense, and where
+  the board has one the high-quality microphone array, plus the power
+  domains the host enables while they run.
 
 allOf:
   - $ref: dai-common.yaml#
-  - if:
-      properties:
-        compatible:
-          contains:
-            const: apple,t8142-aop-audio
-    then:
-      properties:
-        dmas:
-          minItems: 5
-        dma-names:
-          minItems: 5
-        power-domains:
-          minItems: 9
-        power-domain-names:
-          minItems: 9
-      required:
-        - apple,chassis-name
-        - apple,machine-kind
-    else:
-      properties:
-        dmas:
-          maxItems: 4
-        dma-names:
-          maxItems: 4
-        power-domains:
-          maxItems: 6
-        power-domain-names:
-          maxItems: 6
 
 properties:
   compatible:
     oneOf:
-      - const: apple,t8152-aop-audio
       - items:
           - const: apple,t8142-aop-audio
           - const: apple,t8152-aop-audio
+      - const: apple,t6050-aop-audio
+      - const: apple,t8152-aop-audio
 
   dmas:
     minItems: 4
@@ -59,8 +34,8 @@ properties:
       - description: Headset jack output
       - description: Headset microphone input
       - description: Internal speaker output
-      - description: Speaker sense input
-      - description: Internal microphone array input
+      - description: Speaker amplifier sense input
+      - description: High-quality microphone array input
 
   dma-names:
     minItems: 4
@@ -72,63 +47,28 @@ properties:
       - const: hpai
 
   power-domains:
-    minItems: 6
-    items:
-      - description: Serializer 0
-      - description: Serializer 1
-      - description: Serializer 2
-      - description: Serializer 3
-      - description: Serializer 4
-      - description: Serializer 5
-      - description: Secure LEAP ADMAC
-      - description: LEAP receive channel 0
-      - description: LEAP serializer
+    minItems: 1
+    maxItems: 9
 
   power-domain-names:
-    minItems: 6
-    items:
-      - const: mca0
-      - const: mca1
-      - const: mca2
-      - const: mca3
-      - const: mca4
-      - const: mca5
-      - const: leap_s_a
-      - const: leap_rx0
-      - const: leap_mca
+    minItems: 1
+    maxItems: 9
+
+  '#sound-dai-cells':
+    const: 1
 
   apple,chassis-name:
     $ref: /schemas/types.yaml#/definitions/string
-    description: Chassis identifier used to name the microphone card
+    description: Board name used for the microphone card identity.
 
   apple,machine-kind:
     $ref: /schemas/types.yaml#/definitions/string
-    description: Human-readable machine family used to name the microphone card
-
-  "#sound-dai-cells":
-    const: 1
-    description:
-      AOP audio DAI identifier. 0 is the headset back-end, 3 the speaker
-      back-end.
+    description: Machine family used for the sound card identity.
 
 required:
   - compatible
   - dmas
   - dma-names
-  - power-domains
-  - power-domain-names
-  - "#sound-dai-cells"
+  - '#sound-dai-cells'
 
 unevaluatedProperties: false
-
-examples:
-  - |
-    audio {
-      compatible = "apple,t8152-aop-audio";
-      dmas = <&admac 10>, <&admac 11>, <&admac 2>, <&admac 3>;
-      dma-names = "cout", "cin", "spkr", "sense";
-      power-domains = <&ps_mca0>, <&ps_mca1>, <&ps_mca2>,
-                      <&ps_mca3>, <&ps_mca4>, <&ps_mca5>;
-      power-domain-names = "mca0", "mca1", "mca2", "mca3", "mca4", "mca5";
-      #sound-dai-cells = <1>;
-    };

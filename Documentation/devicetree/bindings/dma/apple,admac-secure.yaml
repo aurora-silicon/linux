@@ -19,11 +19,24 @@ description: |
 
 allOf:
   - $ref: dma-controller.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8140-admac-secure
+    then:
+      required:
+        - dma-channels
+        - interrupts
+        - iommus
+        - power-domains
 
 properties:
   compatible:
     items:
-      - const: apple,t8140-admac-secure
+      - enum:
+          - apple,t6050-admac-secure
+          - apple,t8140-admac-secure
       - const: apple,admac-secure
 
   reg:
@@ -48,9 +61,5 @@ required:
   - compatible
   - reg
   - '#dma-cells'
-  - dma-channels
-  - interrupts
-  - iommus
-  - power-domains
 
 additionalProperties: false

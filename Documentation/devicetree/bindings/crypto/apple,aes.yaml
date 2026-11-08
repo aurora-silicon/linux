@@ -26,6 +26,7 @@ select:
           - apple,t6031-aes
           - apple,t6032-aes
           - apple,t6041-aes
+          - apple,t6050-aes
           - apple,t8103-aes
           - apple,t8112-aes
           - apple,t8122-aes
@@ -121,6 +122,7 @@ allOf:
                       - apple,t6030-aes
                       - apple,t6031-aes
                       - apple,t6041-aes
+                      - apple,t6050-aes
                       - apple,t8103-aes
                       - apple,t8112-aes
                       - apple,t8122-aes

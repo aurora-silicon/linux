@@ -279,7 +279,8 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 		if ((apple_t8132_live_mtp() &&
 		     of_device_is_compatible(dev->of_node, "apple,t8132-mtp")) ||
 		    (of_machine_is_compatible("apple,j614s") &&
-		     of_device_is_compatible(dev->of_node, "apple,t6041-mtp")))
+		     of_device_is_compatible(dev->of_node, "apple,t6041-mtp")) ||
+		    of_device_is_compatible(dev->of_node, "apple,t8142-mtp"))
 			helper->preserved = true;
 	}
 

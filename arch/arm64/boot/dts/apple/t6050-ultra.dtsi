@@ -1,0 +1,502 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple T6050 "M5 Ultra" SoC: two dies
+ *
+ * Die 0 and die 1 each get the per-die template (t6050-dieX.dtsi); the
+ * blocks used from die 0 only are in t6050-die0.dtsi. The video decoders,
+ * the memory cache controllers and the display subsystem are so far
+ * described for the two-die part only, as are die 1's ATC0 port and its
+ * DisplayPort PHY.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/phy/phy.h>
+#include <dt-bindings/spmi/spmi.h>
+
+#include "multi-die-cpp.h"
+
+#include "t6050-base.dtsi"
+
+/ {
+	/*
+	 * Five cores in each cluster, die 0's first, so that nr_cpus= brings the CPUs up in that
+	 * order.
+	 */
+	cpus {
+		T6050_M_CPU(cpu0, 40000, cpufreq_mc0);
+		T6050_M_CPU(cpu1, 40001, cpufreq_mc0);
+		T6050_M_CPU(cpu2, 40002, cpufreq_mc0);
+		T6050_M_CPU(cpu3, 40003, cpufreq_mc0);
+		T6050_M_CPU(cpu4, 40004, cpufreq_mc0);
+		T6050_M_CPU(cpu6, 40100, cpufreq_mc1);
+		T6050_M_CPU(cpu7, 40101, cpufreq_mc1);
+		T6050_M_CPU(cpu8, 40102, cpufreq_mc1);
+		T6050_M_CPU(cpu9, 40103, cpufreq_mc1);
+		T6050_M_CPU(cpu10, 40104, cpufreq_mc1);
+		T6050_P_CPU(cpu12, 10200, cpufreq_pc);
+		T6050_P_CPU(cpu13, 10201, cpufreq_pc);
+		T6050_P_CPU(cpu14, 10202, cpufreq_pc);
+		T6050_P_CPU(cpu15, 10203, cpufreq_pc);
+		T6050_P_CPU(cpu16, 10204, cpufreq_pc);
+		T6050_M_CPU(cpu18, 41000, cpufreq_mc0_die1);
+		T6050_M_CPU(cpu19, 41001, cpufreq_mc0_die1);
+		T6050_M_CPU(cpu20, 41002, cpufreq_mc0_die1);
+		T6050_M_CPU(cpu21, 41003, cpufreq_mc0_die1);
+		T6050_M_CPU(cpu22, 41004, cpufreq_mc0_die1);
+		T6050_M_CPU(cpu24, 41100, cpufreq_mc1_die1);
+		T6050_M_CPU(cpu25, 41101, cpufreq_mc1_die1);
+		T6050_M_CPU(cpu26, 41102, cpufreq_mc1_die1);
+		T6050_M_CPU(cpu27, 41103, cpufreq_mc1_die1);
+		T6050_M_CPU(cpu28, 41104, cpufreq_mc1_die1);
+		T6050_P_CPU(cpu30, 11200, cpufreq_pc_die1);
+		T6050_P_CPU(cpu31, 11201, cpufreq_pc_die1);
+		T6050_P_CPU(cpu32, 11202, cpufreq_pc_die1);
+		T6050_P_CPU(cpu33, 11203, cpufreq_pc_die1);
+		T6050_P_CPU(cpu34, 11204, cpufreq_pc_die1);
+	};
+
+	/* Die 1 MMIO. The boot loader needs each die's bus. */
+	die1: soc@4200000000 {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges = <0x42 0x0 0x42 0x0 0x3 0xc0000000>;
+		nonposted-mmio;
+	};
+};
+
+#define DIE
+#define DIE_NO 0
+#define DIE_UNIT_PREFIX
+#define DIE_ATC1 atc1
+#define SOC_NODE die0
+
+#include "t6050-dieX.dtsi"
+#include "t6050-die0.dtsi"
+
+#undef DIE
+#undef DIE_NO
+#undef DIE_UNIT_PREFIX
+#undef DIE_ATC1
+#undef SOC_NODE
+
+#define DIE _die1
+#define DIE_NO 1
+#define DIE_UNIT_PREFIX 4
+#define DIE_ATC1 atc5
+#define SOC_NODE die1
+
+#include "t6050-dieX.dtsi"
+
+#undef DIE
+#undef DIE_NO
+#undef DIE_UNIT_PREFIX
+#undef DIE_ATC1
+#undef SOC_NODE
+
+/*
+ * Die 1's ATC0, as its ATC1 (ADT /arm-io/atc-phy4, acio-phy-cpu4, usb-drd4, dart-usb4). Die 0's
+ * ATC0 is not described: it carries the DFU and debug link (usb-drd0), which stays the boot
+ * loader's.
+ */
+&pmgr0_die1 {
+	/* die 1 ATC0_COMMON (gate 55) */
+	ps_atc4_common: power-controller@208 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x208 4>;
+		label = "atc4_common";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+	};
+};
+
+&pmgr2_die1 {
+	/* die 1 ATC0: gates 260, 261, 262 */
+	ps_atc4_usb_aon: power-controller@148 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x148 4>;
+		label = "atc4_usb_aon";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+	};
+
+	ps_atc4_usb: power-controller@150 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x150 4>;
+		label = "atc4_usb";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc4_common>, <&ps_atc4_usb_aon>;
+	};
+
+	ps_atc4_phymxwrap: power-controller@158 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x158 4>;
+		label = "atc4_phymxwrap";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc4_common>, <&ps_atc4_usb_aon>;
+	};
+};
+
+/*
+ * Die 1's DisplayPort PHY (ADT /arm-io/lpdptx-phy1, dptx-phy,t6050) and its power gate (DPTX_PHY
+ * at 0x3f8 of die 1's G1 PMGR group, no parent domains).
+ */
+&pmgr1_die1 {
+	ps_dptx_phy_die1: power-controller@3f8 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3f8 4>;
+		label = "die1_dptx_phy";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+	};
+};
+
+&die1 {
+	/* /arm-io/acio-phy-cpu4 reg[0]: the PHY firmware's mailbox */
+	atc4_phy_mbox: mailbox@42a3148000 {
+		compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x42 0xa3148000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 1 841 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1 842 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1 843 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1 844 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+
+	/* /arm-io/atc-phy4 regs [2] [0] usb-drd4[4] [39] [40] [41] [42] [43] [38] [37] usb-drd4[3] */
+	atc4_phy: phy@42a3000000 {
+		compatible = "apple,t6050-combo-phy";
+		reg = <0x42 0xa3000000 0x0 0x2c000>,
+		      <0x42 0xa2a90000 0x0 0x4000>,
+		      <0x42 0xa2800000 0x0 0x4000>,
+		      <0x42 0xa3200000 0x0 0x4000>,
+		      <0x42 0xa3244000 0x0 0x4000>,
+		      <0x42 0xa0000000 0x0 0x8000>,
+		      <0x42 0xa0020000 0x0 0x4000>,
+		      <0x42 0xa3250000 0x0 0x4000>,
+		      <0x42 0xa3140000 0x0 0x4000>,
+		      <0x42 0xa30c0000 0x0 0x10000>,
+		      <0x42 0xa2a84000 0x0 0x4000>;
+		reg-names = "core", "usb2phy", "usb2-digital", "reset", "fabric", "axi2af", "lioa",
+			    "common-cfg", "usb-control", "firmware-data", "pipehandler";
+		#phy-cells = <1>;
+		#reset-cells = <1>;
+		apple,port-index = <4>;
+		apple,guest-port-reserved;
+		mode-switch;
+		orientation-switch;
+		mboxes = <&atc4_phy_mbox>;
+		power-domains = <&ps_atc4_usb_aon>, <&ps_atc4_common>, <&ps_atc4_phymxwrap>,
+				<&ps_atc4_usb>;
+		power-domain-names = "usb-aon", "common", "wrapper", "usb";
+	};
+
+	/* /arm-io/usb-drd4: reg[0] (core and Apple regions), reg[1] (drd-cfg), interrupt 4523; ATC1's tunables */
+	usb_drd4: usb@42a2280000 {
+		compatible = "apple,t6050-dwc3", "apple,t8103-dwc3";
+		reg = <0x42 0xa2280000 0x0 0xcd00>,
+		      <0x42 0xa228cd00 0x0 0x4b00>,
+		      <0x42 0xa2200000 0x0 0x4000>;
+		reg-names = "dwc3-core", "dwc3-apple", "drd-cfg";
+		interrupts = <AIC_IRQ 1 1419 IRQ_TYPE_LEVEL_HIGH>;
+		dr_mode = "otg";
+		usb-role-switch;
+		role-switch-default-mode = "host";
+		iommus = <&usb_drd4_dart_0 0>, <&usb_drd4_dart_1 1>;
+		power-domains = <&ps_atc4_usb>;
+		resets = <&atc4_phy 0>;
+		phys = <&atc4_phy PHY_TYPE_USB2>, <&atc4_phy PHY_TYPE_USB3>;
+		phy-names = "usb2-phy", "usb3-phy";
+		apple,tunable-gbl-default = <0x64 0x2 0x0>, <0x10 0xfff80000 0x00680000>;
+		apple,tunable-gbl-host = <0x4 0x0001ef00 0x00002f00>, <0x1c 0x00000100 0x0>,
+			<0x2c 0x000a07ff 0x000800c8>, <0x100 0x02000100 0x02000100>,
+			<0x504 0x00001000 0x0>, <0x528 0xff0000ff 0x06000006>,
+			<0x52c 0xff0000ff 0x08000008>, <0x580 0xffffffff 0x6f000006>,
+			<0x584 0xffffffff 0x00060000>;
+		apple,tunable-dbg = <0x0 0x8 0x8>;
+		apple,tunable-cfg-host = <0x20 0xff 0x1b>;
+		apple,tunable-link = <0x10 0xff000000 0xff000000>, <0x20 0x7ff00000 0x4e900000>,
+			<0x24 0x001f8000 0x000b8000>, <0x60 0x0003ffff 0x00000600>;
+		apple,tunable-cio = <0x20 0x00ff0000 0x001e0000>;
+	};
+
+	/* /arm-io/dart-usb4 reg[0] and reg[1], interrupt 4527; vm-base 0x10000004000 +0xffff0000 */
+	usb_drd4_dart_0: iommu@42a2f00000 {
+		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		reg = <0x42 0xa2f00000 0x0 0xc000>;
+		interrupts = <AIC_IRQ 1 1423 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_atc4_usb>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x4000 0x0 0xffff0000>;
+	};
+
+	usb_drd4_dart_1: iommu@42a2f80000 {
+		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		reg = <0x42 0xa2f80000 0x0 0xc000>;
+		interrupts = <AIC_IRQ 1 1423 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_atc4_usb>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x4000 0x0 0xffff0000>;
+	};
+
+	/*
+	 * The PLL core calibration is the ADT node's DCOCFG, DTCVREG, DTCCAL, DCDADJ and DLFCFG
+	 * (RODCOROLEAKCOMP is absent there), with its pclkdrv-select. Disabled: Aura enables it with
+	 * the display engine it hands off. The power gate stays enabled (with no consumer it stays
+	 * off).
+	 */
+	lpdptx_phy1: phy@429c200000 {
+		compatible = "apple,t6050-dptx-phy";
+		reg = <0x42 0x9c200000 0x0 0x4000>,
+		      <0x42 0x9c240000 0x0 0x10000>;
+		reg-names = "core", "dptx";
+		power-domains = <&ps_dptx_phy_die1>;
+		#phy-cells = <0>;
+		#reset-cells = <0>;
+		apple,pll-dcocfg = <3>;
+		apple,pll-dtcvreg = <15>;
+		apple,pll-dtccal = <2>;
+		apple,pll-dcdadj = <16>;
+		apple,pll-dlfcfg = <3>;
+		apple,pclkdrv-select = <1>;
+		/* dcpext4's route: the die-1 crossbar's ufp endpoint 0 (source select 1) */
+		apple,ufp-endpoint = <0>;
+		/* Aura enables it with dcpext4. */
+		status = "disabled";
+	};
+};
+
+/ {
+	/*
+	 * Die 0's video decoder (ADT /arm-io/avd0, avd-version 4, the T8142 generation): reg[0]
+	 * 0x2308000000 + 0x1404000 through arm-io's ranges, windows in the T8142/T6041 layout (CM3 code
+	 * and SRAM 0x14000 each at +0x1080000, mailbox +0x10a8000, decode control +0x1100000); ADT
+	 * interrupts 2417, 2418 (die 0 IRQs 2417, 2418). dart-avd0 at +0x1020000,
+	 * interrupt 2424 (die 0 2424), SIDs 0-2 (mapper, piodma, adsbuf). Power: the clock
+	 * gates AVD_SYS_V and AVD_SOC_DART have no PS register; both hang off AVD_SYS (PMGR block
+	 * 0x2380600000 + 0x1d8, also the ARST reset), whose parent FAB1_SOC (+0x1b0) is critical.
+	 */
+	soc@2308000000 {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges = <0x23 0x08000000 0x23 0x08000000 0x0 0x1404000>,
+			 <0x23 0x80600000 0x23 0x80600000 0x0 0xc000>;
+		nonposted-mmio;
+
+		pmgr4: power-management@2380600000 {
+			compatible = "apple,t6050-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+			reg = <0x23 0x80600000 0x0 0xc000>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			ps_fab1_soc: power-controller@1b0 {
+				compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+				reg = <0x1b0 4>;
+				label = "fab1_soc";
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				apple,always-on;
+			};
+
+			ps_avd_sys: power-controller@1d8 {
+				compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+				reg = <0x1d8 4>;
+				label = "avd_sys";
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				power-domains = <&ps_fab1_soc>;
+			};
+		};
+
+		avd: avd@2309080000 {
+			compatible = "apple,t6050-avd", "apple,t8142-avd";
+			reg = <0x23 0x09080000 0x0 0x14000>,
+			      <0x23 0x09094000 0x0 0x14000>,
+			      <0x23 0x090a8000 0x0 0x4000>,
+			      <0x23 0x09100000 0x0 0x10000>;
+			reg-names = "code", "sram", "mbox", "ctrl";
+			interrupts = <AIC_IRQ 0 2417 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 2418 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_avd_sys>;
+			resets = <&ps_avd_sys>;
+			iommus = <&avd_dart 0>, <&avd_dart 1>, <&avd_dart 2>;
+		};
+
+		avd_dart: iommu@2309020000 {
+			compatible = "apple,t6050-dart", "apple,t8110-dart";
+			reg = <0x23 0x09020000 0x0 0x20000>;
+			#iommu-cells = <1>;
+			interrupts = <AIC_IRQ 0 2424 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_avd_sys>;
+		};
+	};
+
+	/*
+	 * Die 1's video decoder (ADT /arm-io/avd1, avd-version 4, the T8142 generation): reg[0]
+	 * 0x6308000000 + 0x1404000 through arm-io's ranges, windows in the T8142/T6041 layout (CM3 code
+	 * and SRAM 0x14000 each at +0x1080000, mailbox +0x10a8000, decode control +0x1100000); ADT
+	 * interrupts 5521, 5522 (die 1 IRQs 2417, 2418). dart-avd1 at +0x1020000,
+	 * interrupt 5528 (die 1 2424), SIDs 0-2 (mapper, piodma, adsbuf). Power: the clock
+	 * gates AVD_SYS_V and AVD_SOC_DART have no PS register; both hang off AVD_SYS (PMGR block
+	 * 0x6380600000 + 0x1d8, also the ARST reset), whose parent FAB1_SOC (+0x1b0) is critical.
+	 */
+	soc@6308000000 {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges = <0x63 0x08000000 0x63 0x08000000 0x0 0x1404000>,
+			 <0x63 0x80600000 0x63 0x80600000 0x0 0xc000>;
+		nonposted-mmio;
+
+		pmgr4_die1: power-management@6380600000 {
+			compatible = "apple,t6050-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+			reg = <0x63 0x80600000 0x0 0xc000>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			ps_fab1_soc_die1: power-controller@1b0 {
+				compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+				reg = <0x1b0 4>;
+				label = "fab1_soc_die1";
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				apple,always-on;
+			};
+
+			ps_avd_sys_die1: power-controller@1d8 {
+				compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+				reg = <0x1d8 4>;
+				label = "avd_sys_die1";
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				power-domains = <&ps_fab1_soc_die1>;
+			};
+		};
+
+		avd_die1: avd@6309080000 {
+			compatible = "apple,t6050-avd", "apple,t8142-avd";
+			reg = <0x63 0x09080000 0x0 0x14000>,
+			      <0x63 0x09094000 0x0 0x14000>,
+			      <0x63 0x090a8000 0x0 0x4000>,
+			      <0x63 0x09100000 0x0 0x10000>;
+			reg-names = "code", "sram", "mbox", "ctrl";
+			interrupts = <AIC_IRQ 1 2417 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1 2418 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_avd_sys_die1>;
+			resets = <&ps_avd_sys_die1>;
+			iommus = <&avd_dart_die1 0>, <&avd_dart_die1 1>, <&avd_dart_die1 2>;
+		};
+
+		avd_dart_die1: iommu@6309020000 {
+			compatible = "apple,t6050-dart", "apple,t8110-dart";
+			reg = <0x63 0x09020000 0x0 0x20000>;
+			#iommu-cells = <1>;
+			interrupts = <AIC_IRQ 1 2424 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_avd_sys_die1>;
+		};
+	};
+
+	/*
+	 * The DRM master: scanout buffers map through dart-dispext0 SID 0. Aura enables it with
+	 * dcpext0, and appends each other engine's display DART (SID 0) as it hands that engine
+	 * off: dcpext4's for the HDMI port. A disabled DART listed here would leave it no IOMMU.
+	 */
+	display: display-subsystem {
+		compatible = "apple,display-subsystem";
+		iommus = <&dart_dispext0 0>;
+		status = "disabled";
+	};
+
+	/*
+	 * The memory cache controllers: eight AMCCs of four planes on each die (ADT /arm-io/mcc:
+	 * amcc-count 8, dcs-count-per-amcc 4, die-enable-mask 3, AMCC a of die d at 0x2220000000 +
+	 * d * 0x4000000000 + a * 0x2000000 through arm-io's ranges), one 16 KiB block per plane.
+	 * The boot loader leaves every plane's ways enabled and powered with allocation disabled, so
+	 * the system level cache holds no data until apple-mcc allows it.
+	 */
+	soc@2220000000 {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges = <0x22 0x20000000 0x22 0x20000000 0x0 0x10000000>,
+			 <0x62 0x20000000 0x62 0x20000000 0x0 0x10000000>;
+		nonposted-mmio;
+
+		mcc: memory-controller@2220000000 {
+			compatible = "apple,t6050-mcc";
+			reg = <0x22 0x20000000 0x0 0x4000>,
+			      <0x22 0x20040000 0x0 0x4000>,
+			      <0x22 0x20080000 0x0 0x4000>,
+			      <0x22 0x200c0000 0x0 0x4000>,
+			      <0x22 0x22000000 0x0 0x4000>,
+			      <0x22 0x22040000 0x0 0x4000>,
+			      <0x22 0x22080000 0x0 0x4000>,
+			      <0x22 0x220c0000 0x0 0x4000>,
+			      <0x22 0x24000000 0x0 0x4000>,
+			      <0x22 0x24040000 0x0 0x4000>,
+			      <0x22 0x24080000 0x0 0x4000>,
+			      <0x22 0x240c0000 0x0 0x4000>,
+			      <0x22 0x26000000 0x0 0x4000>,
+			      <0x22 0x26040000 0x0 0x4000>,
+			      <0x22 0x26080000 0x0 0x4000>,
+			      <0x22 0x260c0000 0x0 0x4000>,
+			      <0x22 0x28000000 0x0 0x4000>,
+			      <0x22 0x28040000 0x0 0x4000>,
+			      <0x22 0x28080000 0x0 0x4000>,
+			      <0x22 0x280c0000 0x0 0x4000>,
+			      <0x22 0x2a000000 0x0 0x4000>,
+			      <0x22 0x2a040000 0x0 0x4000>,
+			      <0x22 0x2a080000 0x0 0x4000>,
+			      <0x22 0x2a0c0000 0x0 0x4000>,
+			      <0x22 0x2c000000 0x0 0x4000>,
+			      <0x22 0x2c040000 0x0 0x4000>,
+			      <0x22 0x2c080000 0x0 0x4000>,
+			      <0x22 0x2c0c0000 0x0 0x4000>,
+			      <0x22 0x2e000000 0x0 0x4000>,
+			      <0x22 0x2e040000 0x0 0x4000>,
+			      <0x22 0x2e080000 0x0 0x4000>,
+			      <0x22 0x2e0c0000 0x0 0x4000>,
+			      <0x62 0x20000000 0x0 0x4000>,
+			      <0x62 0x20040000 0x0 0x4000>,
+			      <0x62 0x20080000 0x0 0x4000>,
+			      <0x62 0x200c0000 0x0 0x4000>,
+			      <0x62 0x22000000 0x0 0x4000>,
+			      <0x62 0x22040000 0x0 0x4000>,
+			      <0x62 0x22080000 0x0 0x4000>,
+			      <0x62 0x220c0000 0x0 0x4000>,
+			      <0x62 0x24000000 0x0 0x4000>,
+			      <0x62 0x24040000 0x0 0x4000>,
+			      <0x62 0x24080000 0x0 0x4000>,
+			      <0x62 0x240c0000 0x0 0x4000>,
+			      <0x62 0x26000000 0x0 0x4000>,
+			      <0x62 0x26040000 0x0 0x4000>,
+			      <0x62 0x26080000 0x0 0x4000>,
+			      <0x62 0x260c0000 0x0 0x4000>,
+			      <0x62 0x28000000 0x0 0x4000>,
+			      <0x62 0x28040000 0x0 0x4000>,
+			      <0x62 0x28080000 0x0 0x4000>,
+			      <0x62 0x280c0000 0x0 0x4000>,
+			      <0x62 0x2a000000 0x0 0x4000>,
+			      <0x62 0x2a040000 0x0 0x4000>,
+			      <0x62 0x2a080000 0x0 0x4000>,
+			      <0x62 0x2a0c0000 0x0 0x4000>,
+			      <0x62 0x2c000000 0x0 0x4000>,
+			      <0x62 0x2c040000 0x0 0x4000>,
+			      <0x62 0x2c080000 0x0 0x4000>,
+			      <0x62 0x2c0c0000 0x0 0x4000>,
+			      <0x62 0x2e000000 0x0 0x4000>,
+			      <0x62 0x2e040000 0x0 0x4000>,
+			      <0x62 0x2e080000 0x0 0x4000>,
+			      <0x62 0x2e0c0000 0x0 0x4000>;
+			apple,boot-dma-devices = <&display>;
+		};
+	};
+};
