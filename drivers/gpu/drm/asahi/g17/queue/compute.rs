@@ -785,9 +785,13 @@ impl Queue {
                     && active.packet.command.long_job()
             })
     }
-    /// Quarantines without a pending witness no longer describe live pipe order.
+    /// Quarantines without a pending witness no longer describe live pipe order. Spared work
+    /// whose fences still wait (`spared_deferred`) does, whether or not every entry holds a
+    /// ticket: it holds the GPU until the firmware drains it or this queue's watchdog settles it
+    /// ([`Self::timeout`]), so other VMs' watchdogs see it as a failed blocker and defer to it
+    /// within their bounded renewals instead of failing their own work at once.
     pub(crate) fn timeout_head(&self) -> Option<crate::g17::timeout::Head> {
-        if self.quarantined && !self.awaiting_witness {
+        if self.quarantined && !self.awaiting_witness && !self.spared_deferred {
             return None;
         }
         self.active.front().map(|active| crate::g17::timeout::Head {
@@ -998,6 +1002,19 @@ impl Queue {
         self.failure_status_pending = false;
         self.awaiting_witness =
             self.active.len != 0 && self.active.iter().all(|a| a.ticket.is_some());
+        // Spared work waits for its retirement witness to replay or fail. An entry without a
+        // ticket never gives one (release_witnessed() validates every ticket), and an
+        // unpublished entry's own watchdog does nothing, so nothing would bound that wait. Fail
+        // it now instead: ENODATA, which stays out of the VM status.
+        if self.spared_deferred && !self.awaiting_witness {
+            for active in self.active.iter_mut() {
+                if !active.failure_deferred {
+                    defer(Deferred::FailedOwned(active.packet.completion.clone(), ENODATA))?;
+                    active.failure_deferred = true;
+                }
+            }
+            self.spared_deferred = false;
+        }
         Ok(terminal)
     }
 
@@ -2001,6 +2018,11 @@ impl Queue {
 
     /// A watchdog settles spared, deferred waiters without changing their VM status.
     /// Fully ticketed spared work can still return this queue after its drain witness.
+    ///
+    /// Spared, deferred work is work a recovery dropped before it ran (the quarantine's
+    /// ENODATA) whose witness did not come before this queue's job watchdog expired: it fails
+    /// with ENODATA too. ETIMEDOUT would reach the client as a lost device (`fail_while_owned`
+    /// reports every error but ENODATA and ECANCELED), for work it never got to run.
     pub(crate) fn timeout(
         &mut self,
         defer: &mut impl FnMut(Deferred) -> Result,
@@ -2016,7 +2038,7 @@ impl Queue {
                 if !active.failure_deferred {
                     defer(Deferred::FailedOwned(
                         active.packet.completion.clone(),
-                        ETIMEDOUT,
+                        ENODATA,
                     ))?;
                     active.failure_deferred = true;
                 }

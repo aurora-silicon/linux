@@ -1784,6 +1784,28 @@ impl Pair {
         Ok(())
     }
 
+    /// The parked groups did not publish within the replay bound
+    /// ([`crate::g17::timeout::background_stalled`], 10 s after they were parked). They are
+    /// groups a restart dropped before they ran, which `replay::decide` parks only for innocent
+    /// VMs: like `fail_dropped`'s, they fail with ENODATA without poisoning their VM, instead of
+    /// the replay pass failing the whole device.
+    pub(crate) fn fail_stalled_replay(
+        &mut self,
+        defer: &mut impl FnMut(Deferred) -> Result,
+    ) -> Result {
+        pr_warn!(
+            "G17: render slot {}: replay of {} parked groups stalled; failing them\n",
+            self.slot,
+            self.replay.len()
+        );
+        for packet in self.replay.iter() {
+            if !packet.completion.guilty() {
+                packet.completion.classify(recovery::Class::Spared);
+            }
+        }
+        self.fail_replay(ENODATA, defer)
+    }
+
     /// A closed preparation epoch invalidates only this unpublished descriptor.
     /// Its completion remains available for a retry under the next epoch.
     pub(crate) fn discard_prepared(&mut self, packet: &Arc<Packet>) -> Result {

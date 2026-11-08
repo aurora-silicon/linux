@@ -55,7 +55,12 @@ impl Firmware {
             return Ok(false);
         };
         if stalled {
-            return Err(ETIMEDOUT);
+            // The parked groups' fences must signal; a stalled replay is no reason to lose
+            // every client's device.
+            self.with_render(slot, |pair, _| {
+                pair.fail_stalled_replay(&mut |event| deferred.push(event))
+            })?;
+            return Ok(false);
         }
         if busy {
             return Ok(false);
