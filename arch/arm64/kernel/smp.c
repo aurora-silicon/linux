@@ -924,6 +924,9 @@ void __noreturn arm64_nmi_cpu_stop(struct pt_regs *regs, bool die_on_crash)
 
 	sdei_mask_local_cpu();
 
+	/* Under a CTXR window, CPU 0 may have to start the crash kernel. */
+	arm64_crash_handoff_wait();
+
 	if (crash && die_on_crash)
 		__cpu_try_die(cpu);
 

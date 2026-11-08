@@ -104,6 +104,12 @@ int machine_kexec_post_load(struct kimage *image);
 #define machine_kexec_post_load machine_kexec_post_load
 #endif
 
+#if defined(CONFIG_CRASH_DUMP) && defined(CONFIG_ARM64_CTXR_EXECMEM)
+void arm64_crash_handoff_wait(void);
+#else
+static inline void arm64_crash_handoff_wait(void) {}
+#endif
+
 #define ARCH_HAS_KIMAGE_ARCH
 
 struct kimage_arch {
