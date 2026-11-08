@@ -7,7 +7,7 @@ use super::super::kick::{KickTimestamp, RegisterWrite, RegisterArrayBinding};
 
 use super::render_tail::{self as tail, RenderStage, RenderTail};
 
-pub(crate) const M5_TA_COMMAND_BYTES: usize = 0x990;
+pub(crate) const M5_TA_COMMAND_BYTES: usize = 0x9a0;
 pub(crate) const M5_3D_COMMAND_BYTES: usize = 0x2240;
 pub(crate) const M5_TA_SELECTOR: u32 = 0;
 pub(crate) const M5_3D_SELECTOR: u32 = 1;

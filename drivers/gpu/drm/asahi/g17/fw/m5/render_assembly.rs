@@ -70,6 +70,11 @@ pub(crate) fn encode_into(storage: &mut [u8], low: u64,
     ta.fill(0); fragment.fill(0);
     let fragment_rce = cmd::encode_m5_3d_command(fragment, fragment_low, inputs, &fragment_programs).map_err(|_| EINVAL)?;
     let ta_rce = cmd::encode_m5_ta_command(ta, low, inputs, &ta_program).map_err(|_| EINVAL)?;
+    if controls.board.graph.is_common26() {
+        use super::render_tail::{common26_layout, RenderStage};
+        common26_layout(ta, RenderStage::Tiling).ok_or(EINVAL)?;
+        common26_layout(fragment, RenderStage::Fragment).ok_or(EINVAL)?;
+    }
     let (ta_storage, fragment_storage) = storage.split_at_mut(FRAGMENT_OFFSET);
     ta_storage[..cmd::M5_TA_COMMAND_BYTES].copy_from_slice(ta);
     fragment_storage[..cmd::M5_3D_COMMAND_BYTES].copy_from_slice(fragment);
