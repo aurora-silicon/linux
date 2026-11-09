@@ -655,6 +655,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "smc_i2cm1";
+		power-domains = <&ps_smc_fabric>;
 		apple,always-on; /* used by the SMC firmware */
 	};
 
@@ -664,6 +665,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "smc_i2cm2";
+		power-domains = <&ps_smc_fabric>;
 		apple,always-on; /* used by the SMC firmware */
 	};
 
