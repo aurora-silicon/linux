@@ -57,3 +57,5 @@ apple-mcc-y := mcc.o
 obj-$(CONFIG_APPLE_CLPC) += clpc.o
 
 obj-$(CONFIG_APPLE_SART_APIF) += apple-sart-apif.o
+
+obj-$(CONFIG_APPLE_AURORA_BOOT_SECURITY) += aurora-boot-security.o
