@@ -440,8 +440,10 @@
 	status = "disabled";
 };
 
+/* Only named: the sleep's last refusal reads its state to see the enclave gate. */
 &ps_sep {
-	status = "disabled";
+	apple,firmware-owned;
+	status = "okay";
 };
 
 &ps_isp_cpu {

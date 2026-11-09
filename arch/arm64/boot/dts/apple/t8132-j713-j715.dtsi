@@ -142,12 +142,6 @@
 	status = "okay";
 };
 
-/* Only named: the sleep's last refusal reads its state to see the enclave gate. */
-&ps_sep {
-	apple,firmware-owned;
-	status = "okay";
-};
-
 &sep {
 	/*
 	 * Without a domain the driver tells the enclave at .suspend, and a sleep
