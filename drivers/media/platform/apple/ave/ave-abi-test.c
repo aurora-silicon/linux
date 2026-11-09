@@ -515,8 +515,8 @@ static void ave_6070_variants(struct kunit *test)
 {
 	const struct ave_fw_transport *t = ave_abi_6070.transport;
 
-	KUNIT_EXPECT_EQ(test, ave_t6000.boot_device_id, 11U);
-	KUNIT_EXPECT_EQ(test, ave_t6000.device_type, 9U);
+	KUNIT_EXPECT_EQ(test, ave_t6000.boot_device_id, 14U);
+	KUNIT_EXPECT_EQ(test, ave_t6000.device_type, 11U);
 	KUNIT_EXPECT_EQ(test, ave_t6000.boot_arg_value, 0x400U);
 	KUNIT_EXPECT_EQ(test, ave_t6000.timebase_multiplier, 1000000U);
 	KUNIT_EXPECT_EQ(test, ave_t6000.text_crc, 0x460c7a7cU);
