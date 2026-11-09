@@ -475,6 +475,7 @@ int ave_build_start(struct ave_ctx *ctx, u8 *cmd, size_t len);
 int ave_build_process(struct ave_ctx *ctx, u8 *cmd, size_t len,
 		      unsigned int slot, dma_addr_t input, u32 bitrate,
 		      bool force_key);
+int ave_init_codec_state(struct ave_session *sess);
 
 /* ave-cmd.c */
 int ave_cmd_config(struct ave_dev *ave);

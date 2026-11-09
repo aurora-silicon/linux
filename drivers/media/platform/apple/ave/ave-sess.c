@@ -333,6 +333,14 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 			kfree(r);
 			return -ENOMEM;
 		}
+		ret = ave_init_codec_state(sess);
+		if (ret) {
+			kfree(sess->codec_state);
+			sess->codec_state = NULL;
+			sess->codec_state_bytes = 0;
+			kfree(r);
+			return ret;
+		}
 	}
 
 	ref_a = ALIGN(w, 32) * ALIGN(h + 16, 32);

@@ -392,9 +392,68 @@ static void ave_start_put64(u8 *cmd, u32 off, u64 val)
 		ave_put64(cmd, off, val);
 }
 
+static void ave_start_put8(u8 *cmd, u32 off, u8 val)
+{
+	if (off)
+		cmd[off] = val;
+}
+
+/* 6070 Process state copied from the session's codec object. */
+#define AVE_6070_AVC_STATE_BYTES	0x984
+#define AVE_6070_HEVC_SLICE_BYTES	0x5570
+#define AVE_6070_HEVC_STATE_BYTES	0x5884
+
+int ave_init_codec_state(struct ave_session *sess)
+{
+	u8 *state = sess->codec_state;
+
+	if (!state)
+		return -EINVAL;
+
+	memset(state, 0, sess->codec_state_bytes);
+	if (sess->p.codec == AVE_CODEC_H264) {
+		if (sess->codec_state_bytes != AVE_6070_AVC_STATE_BYTES)
+			return -EINVAL;
+
+		/*
+		 * The AVC object contains slice syntax, not SPS or PPS state. These
+		 * are its first-picture defaults and retained control values.
+		 */
+		ave_put32(state, 0x000, AVE_6070_AVC_STATE_BYTES);
+		ave_put32(state, 0x004, 1); /* reference NAL */
+		ave_put32(state, 0x010, 2); /* I slice */
+		ave_put32(state, 0x024, 1); /* initial IDR picture id */
+		state[0x03c] = 1; /* spatial direct prediction default */
+		ave_put32(state, 0x980, U32_MAX); /* automatic variance */
+		return 0;
+	}
+
+	if (sess->p.codec != AVE_CODEC_HEVC ||
+	    sess->codec_state_bytes != AVE_6070_HEVC_STATE_BYTES)
+		return -EINVAL;
+
+	/*
+	 * HEVC keeps a slice object followed by short- and long-term RPS
+	 * tails. The first IDR uses no RPS; the session's VPS/SPS owns the
+	 * reference count.  Header destinations are slot-specific and are
+	 * added while building Process.
+	 */
+	ave_put32(state, 0x000, AVE_6070_HEVC_SLICE_BYTES);
+	state[0x00c] = 1; /* first slice segment in picture */
+	state[0x1aa] = 1; /* collocated picture comes from list 0 */
+	ave_put32(state, 0x3d4, 3); /* five minus maximum merge candidates */
+	ave_put32(state, 0x54c, U32_MAX); /* no slice-segment limit */
+	ave_put32(state, 0x550, U32_MAX); /* no dependent-segment limit */
+	return 0;
+}
+
 static void ave_start_config(const struct ave_params *p, u8 *cmd,
 			     const struct ave_fw_layout *fw)
 {
+	static const u8 h264_level_idc[] = {
+		10, 9, 11, 12, 13, 20, 21, 22, 30,
+		31, 32, 40, 41, 42, 50, 51, 52,
+	};
 	bool hevc = p->codec == AVE_CODEC_HEVC;
 	bool cq = p->rc_mode == 3;
 	u32 rc_mode;
@@ -475,28 +534,26 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd,
 	ave_start_put32(cmd, l->coded_h2, p->ch);
 	ave_start_put32(cmd, l->codec_flags, hevc ? 0x2000002 : 2);
 	ave_start_put32(cmd, l->bit_depth, depth);
+	ave_start_put8(cmd, l->ref_compression, 1);
 
 	if (!hevc) {
+		u32 profile_idc = p->high ? 100 : (p->profile == 2 ? 66 : 77);
+		u32 level_idc = h264_level_idc[p->level - 1];
+
 		ave_start_put32(cmd, l->h264_384,
 				p->width * p->height <= 320 * 240 ? 0x40 :
 								    0x10);
 		ave_start_put32(cmd, l->codec_2588, p->high ? 2 : 0);
-		ave_start_put32(cmd, l->h264_profile, p->profile);
-		ave_start_put32(cmd, l->h264_level, p->level);
+		ave_start_put32(cmd, l->h264_profile,
+				fw->kind == AVE_LAYOUT_6070 ? profile_idc : p->profile);
+		ave_start_put32(cmd, l->h264_level,
+				fw->kind == AVE_LAYOUT_6070 ? level_idc : p->level);
 		ave_start_put32(cmd, l->h264_max_refs,
 				(p->refs - 1) |
 					(fw->counted ? (p->cw / 16) << 16 : 0));
 		if (fw->counted) {
-			static const u8 level_idc[] = {
-				10, 9,	11, 12, 13, 20, 21, 22, 30,
-				31, 32, 40, 41, 42, 50, 51, 52,
-			};
-
-			ave_put32(cmd, l->profile_idc,
-				  p->high	  ? 100 :
-				  p->profile == 2 ? 66 :
-						    77);
-			ave_put32(cmd, l->level_idc, level_idc[p->level - 1]);
+			ave_put32(cmd, l->profile_idc, profile_idc);
+			ave_put32(cmd, l->level_idc, level_idc);
 			put_unaligned_le16(p->refs - 1, cmd + l->max_refs_copy);
 			ave_put32(cmd, l->mb_size,
 				  ((p->ch / 16 - 1) << 16) | (p->cw / 16 - 1));
@@ -511,15 +568,36 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd,
 			cmd[l->cabac_copy] = p->profile != 2;
 			cmd[l->transform_copy] = p->high;
 		}
+		ave_start_put32(cmd, l->h264_sps_id, 0);
+		ave_start_put32(cmd, l->h264_chroma, 1);
+		ave_start_put32(cmd, l->h264_depth_luma, 0);
+		ave_start_put32(cmd, l->h264_depth_chroma, 0);
+		ave_start_put32(cmd, l->h264_frame_num_bits, 0);
+		ave_start_put32(cmd, l->h264_poc_type, p->bframes ? 0 : 2);
+		ave_start_put32(cmd, l->h264_poc_bits, p->bframes ? 4 : 0);
+		ave_start_put8(cmd, l->h264_gaps, 0);
 		ave_start_put32(cmd, l->h264_width_mbs, p->cw / 16 - 1);
 		ave_start_put32(cmd, l->h264_height_mbs, p->ch / 16 - 1);
-		ave_start_put32(cmd, l->h264_crop, crop);
+		ave_start_put32(cmd, l->h264_frame_only, 1);
+		ave_start_put32(cmd, l->h264_direct, 1);
+		ave_start_put8(cmd, l->h264_vui, 0);
+		ave_start_put8(cmd, l->h264_crop, crop);
 		ave_start_put32(cmd, l->h264_crop_left, 0);
 		ave_start_put32(cmd, l->h264_crop_right, crop_r);
 		ave_start_put32(cmd, l->h264_crop_top, 0);
 		ave_start_put32(cmd, l->h264_crop_bottom, crop_b);
+		ave_start_put8(cmd, l->h264_fw_header, 1);
+		ave_start_put32(cmd, l->h264_header_len, 0);
+		ave_start_put32(cmd, l->h264_pps_id, 0);
+		ave_start_put32(cmd, l->h264_pps_sps_id, 0);
 		ave_start_put32(cmd, l->h264_cabac, p->profile != 2);
-		cmd[l->h264_8x8] = p->high;
+		ave_start_put32(cmd, l->h264_slice_groups, 0);
+		ave_start_put32(cmd, l->h264_pic_init_qp, 0);
+		ave_start_put8(cmd, l->h264_deblock, 1);
+		ave_start_put8(cmd, l->h264_constrained, 0);
+		ave_start_put8(cmd, l->h264_redundant, 0);
+		ave_start_put8(cmd, l->h264_8x8, p->high);
+		ave_start_put8(cmd, l->h264_pps_fw_header, 1);
 		return;
 	}
 
