@@ -299,6 +299,8 @@
 			reg-names = "asc", "sgx";
 			mboxes = <&gfx_mbox>, <&gfx1_mbox>;
 			power-domains = <&ps_gfx>;
+			/* Raises the DRAM and fabric floors while GPU work is in flight */
+			apple,clpc = <&clpc>;
 			memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>,
 					<&gpu_fw_data>, <&uat_l2_pagetables>, <&gpu_fw_text>;
 			memory-region-names = "ttbs", "pagetables", "handoff", "fw-data",
