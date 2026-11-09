@@ -155,14 +155,6 @@ patternProperties:
           through 0x25 use four-bit lanes at bits 35:32 through 51:48. If
           absent, apple,dvfs retains the default bits 4:0 encoding.
 
-      apple,dvfs-request-class:
-        $ref: /schemas/types.yaml#/definitions/uint32
-        enum: [0x21, 0x22, 0x23, 0x24, 0x25]
-        description:
-          Request class holding the level. Classes 0x21 through
-          0x25 occupy the four-bit fields at bits 35:32 through 51:48. If
-          absent, apple,dvfs uses the default five-bit field at bits 4:0.
-
       apple,always-on:
         type: boolean
         description: Report the device as on from probe.
