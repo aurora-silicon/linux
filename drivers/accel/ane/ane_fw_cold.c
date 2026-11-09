@@ -20,6 +20,7 @@
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/clpc.h>
+#include <linux/soc/apple/pmgr-pwrstate.h>
 #include <linux/suspend.h>
 
 #include "ane_fw_cold.h"
@@ -78,6 +79,7 @@ struct ane_fw_backend {
 	/* The last cold boot after sleep: firmware ready, first replay, count. */
 	u64 resume_ready_ns, resume_first_ns;
 	unsigned int resume_replayed;
+	unsigned int resume_recoveries;
 	/*
 	 * EXCLAVE_MODE_STOP completed in this firmware boot: the warm boots
 	 * keep the firmware out of Exclave mode. Cleared by every cold boot.
@@ -824,6 +826,46 @@ static int ane_fw_genpd_event(struct notifier_block *nb, unsigned long action, v
 	return NOTIFY_OK;
 }
 
+/*
+ * In system sleep ANE_SYS powers on from genpd's noirq resume. A power-on
+ * that latches there is left failed (the PMGR cannot run its PS reset
+ * recovery in that phase), genpd carries on as if the domain were on, and
+ * the boot after sleep fails. Here, in process context after the thaw, put
+ * the engine down, power cycle ANE_SYS through the PMGR (which clears a
+ * latched power-on outside system sleep) and boot once more.
+ */
+static int ane_fw_resume_retry(struct ane_fw_backend *b, int error)
+{
+	struct device_node *np;
+	int ret;
+
+	dev_warn(&b->pdev->dev, "H17 ANE: resume failed (%d); power cycling ANE_SYS and booting again\n",
+		 error);
+	if (b->powered) {
+		ret = ane_fw_power_down(b);
+		if (ret)
+			return ret;
+	} else if (b->power_ref) {
+		b->power_ref = false;
+		pm_runtime_put_sync(b->power);
+	}
+	np = of_parse_phandle(b->pdev->dev.of_node, "power-domains", 0);
+	if (!np)
+		return -ENODEV;
+	/* -EINVAL: genpd turned ANE_SYS off, so the next power-on is a fresh one. */
+	ret = apple_pmgr_ps_cycle(np);
+	of_node_put(np);
+	if (ret && ret != -EINVAL)
+		return ret;
+	ret = ane_fw_cold_cycle_boot(b);
+	if (!ret) {
+		b->resume_recoveries++;
+		dev_info(&b->pdev->dev, "H17 ANE: recovered after a failed resume (%u so far)\n",
+			 b->resume_recoveries);
+	}
+	return ret;
+}
+
 static void ane_fw_sleep_resume(struct ane_fw_backend *b)
 {
 	s64 ready, first;
@@ -847,6 +889,8 @@ static void ane_fw_sleep_resume(struct ane_fw_backend *b)
 		if (!ret)
 			ret = ane_fw_cold_cycle_boot(b);
 	}
+	if (ret)
+		ret = ane_fw_resume_retry(b, ret);
 	if (ret) {
 		/* Every mapping and backing stays for diagnosis. */
 		ane_fw_quarantine(b, ret);
