@@ -219,6 +219,9 @@ struct apple_soc_cpufreq_info {
 
 struct apple_cpu_priv {
 	struct apple_fast_die *fast_die;
+	struct device_node *pmp_report;
+	unsigned int pmp_entry;
+	unsigned int pmp_max_freq;
 	struct device *cpu_dev;
 	void __iomem *reg_base;
 	const struct apple_soc_cpufreq_info *info;
@@ -389,6 +392,27 @@ static u32 apple_soc_cpufreq_timeout(const struct apple_soc_cpufreq_info *info)
 	return info->transition_timeout_us ?: APPLE_DVFS_TRANSITION_TIMEOUT;
 }
 
+/*
+ * T8112 CLPC presents memory and fabric constraints as classed lanes in the
+ * cluster's SOC-DEV-DVFS word. Linux uses the cpufreq request as its demand
+ * signal: the lowest quartile releases both floors, and the upper quartiles
+ * rise conservatively to the qualified DCS 4 / SoC 2 maxima.
+ */
+static void apple_soc_cpufreq_pmp_vote(struct apple_cpu_priv *priv,
+				       unsigned int freq)
+{
+	static const u8 dcs[] = { 0, 1, 3, 4 };
+	static const u8 soc[] = { 0, 0, 1, 2 };
+	unsigned int q;
+
+	if (!priv->pmp_report || !priv->pmp_max_freq)
+		return;
+	q = min(freq * ARRAY_SIZE(dcs) / priv->pmp_max_freq,
+		(unsigned int)ARRAY_SIZE(dcs) - 1);
+	/* The CPU transition remains usable when PMP is stopped or starts late. */
+	apple_pmp_report_t8112_clpc_request(priv->pmp_report, priv->pmp_entry, dcs[q], soc[q]);
+}
+
 static unsigned int apple_soc_cpufreq_get_rate(unsigned int cpu)
 {
 	struct cpufreq_policy *policy;
@@ -500,12 +524,17 @@ static int apple_soc_cpufreq_request(struct cpufreq_policy *policy,
 {
 	struct apple_cpu_priv *priv = policy->driver_data;
 	unsigned int pstate = policy->freq_table[index].driver_data;
+	int ret;
 
 	/* OPP level is a hardware ID, not the frequency-table array index. */
 	if (pstate < priv->info->min_pstate || pstate > priv->info->max_pstate)
 		return -EINVAL;
 
-	return apple_soc_cpufreq_set_pstate(priv, pstate);
+	ret = apple_soc_cpufreq_set_pstate(priv, pstate);
+	if (ret)
+		return ret;
+	apple_soc_cpufreq_pmp_vote(priv, policy->freq_table[index].frequency);
+	return 0;
 }
 
 /*
@@ -1338,6 +1367,7 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 	const struct apple_soc_cpufreq_info *info;
 	struct cpufreq_frequency_table *freq_table;
 	struct device_node *cluster;
+	struct of_phandle_args pmp_args;
 
 	cpu_dev = get_cpu_device(policy->cpu);
 	if (!cpu_dev) {
@@ -1353,6 +1383,18 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 	if (ret) {
 		dev_err(cpu_dev, "%s: failed to get cluster info: %d\n", __func__, ret);
 		goto out_free_priv;
+	}
+	ret = of_parse_phandle_with_fixed_args(cluster, "apple,pmp-memory-vote", 1, 0, &pmp_args);
+	if (!ret) {
+		if (pmp_args.args[0] != 0xa8 && pmp_args.args[0] != 0xa9) {
+			ret = -EINVAL;
+			of_node_put(pmp_args.np);
+			goto out_iounmap;
+		}
+		priv->pmp_report = pmp_args.np;
+		priv->pmp_entry = pmp_args.args[0];
+	} else if (ret != -ENOENT) {
+		goto out_iounmap;
 	}
 
 	ret = dev_pm_opp_of_cpumask_add_table(policy->cpus);
@@ -1384,6 +1426,7 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 			goto out_free_cpufreq_table;
 		}
 		freq_table[i].driver_data = dev_pm_opp_get_level(opp);
+		priv->pmp_max_freq = max(priv->pmp_max_freq, freq_table[i].frequency);
 		dev_pm_opp_put(opp);
 		if (freq_table[i].driver_data < info->min_pstate ||
 		    freq_table[i].driver_data > info->max_pstate) {
@@ -1487,6 +1530,7 @@ out_iounmap:
 	iounmap(reg_base);
 	of_node_put(cluster);
 out_free_priv:
+	of_node_put(priv->pmp_report);
 	kfree(priv);
 	return ret;
 }
@@ -1515,6 +1559,10 @@ static void apple_soc_cpufreq_exit(struct cpufreq_policy *policy)
 	 * ->exit(), so remove the tables of every CPU the policy covered.
 	 */
 	dev_pm_opp_of_cpumask_remove_table(policy->related_cpus);
+	if (priv->pmp_report) {
+		apple_pmp_report_t8112_clpc_request(priv->pmp_report, priv->pmp_entry, 0, 0);
+		of_node_put(priv->pmp_report);
+	}
 	iounmap(priv->reg_base);
 	kfree(priv);
 }
