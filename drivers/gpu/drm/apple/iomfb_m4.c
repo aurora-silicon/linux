@@ -2367,6 +2367,7 @@ static int dcp_m4_startup(struct iomfb_m4 *dcp)
 	}
 	/* An external firmware's D451 requests are not qualified as such. */
 	dcp->memory->relaxed = dcp->external;
+	dcp->memory->page_align = !dcp->external && dcp_m4_pf->alloc_page_align;
 	/* An external display DART counts as off until a D572(1). */
 	WRITE_ONCE(dcp->ext_dart_down, dcp->external);
 	r->properties = kzalloc(sizeof(*r->properties), GFP_KERNEL);
