@@ -3490,3 +3490,7 @@ static struct platform_driver apple_sleep_driver = {
 	.probe = apple_sleep_probe,
 };
 builtin_platform_driver(apple_sleep_driver);
+
+#if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP_KUNIT_TEST)
+#include "sleep-test.c"
+#endif
