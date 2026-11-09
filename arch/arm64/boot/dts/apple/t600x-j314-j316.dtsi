@@ -744,6 +744,15 @@
 	status = "disabled";
 };
 
+/* ATC3 has no USB4/Thunderbolt, so there is no PCIe-C tunnel behind it either */
+&apciec3_dart {
+	status = "disabled";
+};
+
+&apciec3 {
+	status = "disabled";
+};
+
 &dwc3_3 {
 	status = "disabled";
 };
