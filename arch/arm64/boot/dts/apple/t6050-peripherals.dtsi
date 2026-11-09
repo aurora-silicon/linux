@@ -2176,18 +2176,30 @@
 		status = "disabled";
 	};
 
+	/* ADT pmp0 reg[2] (firmware SRAM) and reg[0] (ASC); iBoot loads the firmware, the OS starts it */
 	pmp0: pmp@284e00000 {
 		compatible = "apple,t6050-pmp-v2", "apple,t6000-pmp-v2";
-		reg = <0x2 0x84e00000 0x0 0x88000>,
-		      <0x2 0x84850000 0x0 0x4000>,
-		      <0x2 0x84500000 0x0 0x100000>,
-		      <0x2 0x84250000 0x0 0x4000>;
-		interrupts = <AIC_IRQ 0 397 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 0 396 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 0 399 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 0 398 IRQ_TYPE_LEVEL_HIGH>;
+		reg = <0x2 0x84500000 0x0 0x100000>,
+		      <0x2 0x84e00000 0x0 0x4000>;
+		reg-names = "pmp", "asc";
+		mboxes = <&pmp0_mbox>;
+		mbox-names = "mbox";
 		iommus = <&pmp0_dart 0>;
 		power-domains = <&ps_pmp>, <&ps_pms_sram>;
+		status = "disabled";
+	};
+
+	pmp0_mbox: mailbox@284e08000 {
+		compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x2 0x84e08000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 396 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 397 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 398 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 399 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_pmp>;
 		status = "disabled";
 	};
 
@@ -2197,6 +2209,9 @@
 		      <0x2 0x841b0000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 371 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		/* ADT dart-pmp0 vm-base, vm-size */
+		apple,dma-range = /bits/ 64 <0x10000000000 0x1000000000>;
+		power-domains = <&ps_pmp>;
 		status = "disabled";
 	};
 
