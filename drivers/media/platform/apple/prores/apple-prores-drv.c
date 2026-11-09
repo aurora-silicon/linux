@@ -29,8 +29,10 @@
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/string.h>
 #include <linux/workqueue.h>
 
+#include <kunit/visibility.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-event.h>
@@ -246,6 +248,77 @@ static const struct apr_tunable apr_t6000_engine_tunables[] = {
 	{ 0x374, 0x07ff07ff, 0x06c000a0 },
 };
 
+/*
+ * Fixed T8112 hardware initialization, selected solely by the SoC. There is
+ * no per-unit calibration input and this generation selects no wrapper table.
+ */
+static const struct apr_tunable apr_t8112_engine_tunables[] = {
+	{ 0x008, 0x00000008, 0x00000008 },
+	{ 0x118, 0x07ff07ff, 0x00000600 },
+	{ 0x148, 0x00000001, 0x00000001 },
+	{ 0x180, 0x8fff3fff, 0x800a04ff },
+	{ 0x184, 0x000000ff, 0x00000001 },
+	{ 0x188, 0x07ff07ff, 0x07c00040 },
+	{ 0x1c0, 0x8fff3fff, 0x800404ff },
+	{ 0x1c4, 0x000000ff, 0x00000003 },
+	{ 0x1c8, 0x07ff07ff, 0x060000c0 },
+	{ 0x200, 0x8fff3fff, 0x800504ff },
+	{ 0x204, 0x000000ff, 0x00000002 },
+	{ 0x208, 0x07ff07ff, 0x06c000c0 },
+	{ 0x240, 0x8fff3fff, 0x800004ff },
+	{ 0x244, 0x000000ff, 0x00000007 },
+	{ 0x248, 0x000000ff, 0x00000040 },
+	{ 0x280, 0x8fff3fff, 0x800104ff },
+	{ 0x284, 0x000000ff, 0x00000006 },
+	{ 0x288, 0x000000ff, 0x00000080 },
+	{ 0x2c0, 0x8fff3fff, 0x800204ff },
+	{ 0x2c4, 0x000000ff, 0x00000005 },
+	{ 0x2c8, 0x000000ff, 0x00000040 },
+	{ 0x300, 0x8fff3fff, 0x800304ff },
+	{ 0x304, 0x000000ff, 0x00000004 },
+	{ 0x308, 0x000000ff, 0x00000040 },
+	{ 0x340, 0xbfffff86, 0x81070786 },
+	{ 0x344, 0xffffffff, 0x0b0a0908 },
+	{ 0x348, 0x000000ff, 0x00000020 },
+	{ 0x34c, 0x000000ff, 0x000000ff },
+	{ 0x350, 0x00ffffff, 0x00928170 },
+	{ 0x380, 0x8fff3fff, 0x800b08ff },
+	{ 0x384, 0x000000ff, 0x0000000c },
+	{ 0x388, 0x07ff07ff, 0x07800040 },
+	{ 0x394, 0xffffffc0, 0x00180000 },
+	{ 0x500, 0x800f3fff, 0x80060480 },
+	{ 0x504, 0x000000ff, 0x0000000d },
+	{ 0x508, 0x07ff07ff, 0x06c000a0 },
+	{ 0x540, 0x800f3fff, 0x80000480 },
+	{ 0x544, 0x000000ff, 0x00000011 },
+	{ 0x548, 0x000000ff, 0x00000080 },
+	{ 0x580, 0x800f3fff, 0x80010480 },
+	{ 0x584, 0x000000ff, 0x00000010 },
+	{ 0x588, 0x000000ff, 0x00000080 },
+	{ 0x5c0, 0x800f3fff, 0x80020480 },
+	{ 0x5c4, 0x000000ff, 0x0000000f },
+	{ 0x5c8, 0x000000ff, 0x00000040 },
+	{ 0x600, 0x800f3fff, 0x80030480 },
+	{ 0x604, 0x000000ff, 0x0000000e },
+	{ 0x608, 0x000000ff, 0x00000040 },
+	{ 0x640, 0x802ff040, 0x80070040 },
+	{ 0x644, 0x0000ffff, 0x00001716 },
+	{ 0x648, 0xffff0003, 0x00ff0003 },
+	{ 0x650, 0x07ff07ff, 0x06000040 },
+	{ 0x680, 0x802ff040, 0x80081040 },
+	{ 0x684, 0x0000ffff, 0x00001514 },
+	{ 0x688, 0xffff0003, 0x00ff0003 },
+	{ 0x690, 0x07ff07ff, 0x06400040 },
+	{ 0x6c0, 0x802ff040, 0x80092040 },
+	{ 0x6c4, 0x0000ffff, 0x00001312 },
+	{ 0x6c8, 0xffff0003, 0x00ff0003 },
+	{ 0x6d0, 0x07ff07ff, 0x06800040 },
+	{ 0x700, 0x800f3fff, 0x800b0880 },
+	{ 0x704, 0x000000ff, 0x00000018 },
+	{ 0x708, 0x07ff07ff, 0x076000a0 },
+	{ 0x714, 0xffffffc0, 0x00180000 },
+};
+
 struct apr_stats_regs {
 	u32 lo, hi, size;
 };
@@ -262,6 +335,8 @@ struct apr_variant {
 	const char *reg_names[3];
 	unsigned int num_regs;
 	unsigned int num_irqs;
+	unsigned int num_required_irqs;
+	unsigned int num_completion_irqs;
 	u32 ring_bytes;
 	u32 encode_desc_bytes;
 	const char *firmware_name;
@@ -281,6 +356,8 @@ static const struct apr_variant apr_t8140 = {
 	.reg_names = { "core", "wrapper" },
 	.num_regs = 2,
 	.num_irqs = 2,
+	.num_required_irqs = 1,
+	.num_completion_irqs = 2,
 	.ring_bytes = APR_RING_BYTES,
 	.encode_desc_bytes = APR_ENCODE_DESC_BYTES,
 };
@@ -294,6 +371,26 @@ static const struct apr_variant apr_t6000 = {
 	.reg_names = { "core", "wrapper" },
 	.num_regs = 2,
 	.num_irqs = 1,
+	.num_required_irqs = 1,
+	.num_completion_irqs = 1,
+	.ring_bytes = APR_RING_BYTES,
+	.encode_desc_bytes = APR_ENCODE_DESC_BYTES,
+};
+
+static const struct apr_variant apr_t8112 = {
+	.build_desc = apr_build_desc,
+	.has_decoder = true,
+	.stats = {
+		{ APR_REG_STATS0_LO, APR_REG_STATS0_HI, APR_REG_STATS0_SIZE },
+		{ APR_REG_STATS1_LO, APR_REG_STATS1_HI, APR_REG_STATS1_SIZE },
+	},
+	.engine_tunables = apr_t8112_engine_tunables,
+	.num_engine_tunables = ARRAY_SIZE(apr_t8112_engine_tunables),
+	.reg_names = { "core", "wrapper" },
+	.num_regs = 2,
+	.num_irqs = 2,
+	.num_required_irqs = 2,
+	.num_completion_irqs = 1,
 	.ring_bytes = APR_RING_BYTES,
 	.encode_desc_bytes = APR_ENCODE_DESC_BYTES,
 };
@@ -307,6 +404,8 @@ static const struct apr_variant apr_t6041 = {
 	.reg_names = { "core", "wrapper", "aux" },
 	.num_regs = 3,
 	.num_irqs = 1,
+	.num_required_irqs = 1,
+	.num_completion_irqs = 1,
 	.ring_bytes = APR_RING_BYTES,
 	.encode_desc_bytes = APR_ENCODE_DESC_BYTES,
 	.firmware_name = APRI_T6041_FIRMWARE_NAME,
@@ -1546,10 +1645,13 @@ static int apr_probe(struct platform_device *pdev)
 
 	for (i = 0; i < apr->variant->num_irqs; i++) {
 		apr->irq[i] = platform_get_irq_optional(pdev, i);
-		if (apr->irq[i] == -ENXIO && i)
+		if (apr->irq[i] == -ENXIO && i >= apr->variant->num_required_irqs)
 			continue;
 		if (apr->irq[i] < 0)
 			return apr->irq[i];
+		/* A bandwidth-request IRQ is not a frame completion source. */
+		if (i >= apr->variant->num_completion_irqs)
+			continue;
 		ret = devm_request_irq(dev, apr->irq[i], apr_irq, 0,
 				       dev_name(dev), apr);
 		if (ret)
@@ -1631,10 +1733,53 @@ static void apr_remove(struct platform_device *pdev)
 static const struct of_device_id apr_of_match[] = {
 	{ .compatible = "apple,t6000-prores", .data = &apr_t6000 },
 	{ .compatible = "apple,t6041-prores", .data = &apr_t6041 },
+	{ .compatible = "apple,t8112-prores", .data = &apr_t8112 },
 	{ .compatible = "apple,t8140-prores", .data = &apr_t8140 },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, apr_of_match);
+
+int apr_variant_test_info(const char *compatible,
+			  struct apr_variant_test_info *info)
+{
+	const struct of_device_id *match;
+	const struct apr_variant *variant = NULL;
+
+	if (!compatible || !info)
+		return -EINVAL;
+	for (match = apr_of_match; match->compatible[0]; match++) {
+		if (!strcmp(match->compatible, compatible)) {
+			variant = match->data;
+			break;
+		}
+	}
+	if (!variant)
+		return -ENOENT;
+
+	*info = (struct apr_variant_test_info) {
+		.encode_v1 = variant->build_desc == apr_build_desc,
+		.has_decoder = variant->has_decoder,
+		.stats = {
+			variant->stats[0].lo,
+			variant->stats[0].hi,
+			variant->stats[0].size,
+			variant->stats[1].lo,
+			variant->stats[1].hi,
+			variant->stats[1].size,
+		},
+		.num_engine_tunables = variant->num_engine_tunables,
+		.num_wrapper_tunables = variant->num_wrapper_tunables,
+		.num_regs = variant->num_regs,
+		.num_irqs = variant->num_irqs,
+		.num_required_irqs = variant->num_required_irqs,
+		.num_completion_irqs = variant->num_completion_irqs,
+		.ring_bytes = variant->ring_bytes,
+		.encode_desc_bytes = variant->encode_desc_bytes,
+		.has_firmware = !!variant->firmware_name,
+	};
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(apr_variant_test_info);
 
 static struct platform_driver apr_driver = {
 	.probe = apr_probe,

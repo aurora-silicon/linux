@@ -623,6 +623,33 @@ static void apr_test_ring_accounting(struct kunit *test)
 	KUNIT_EXPECT_MEMEQ(test, ring, desc + 0x100, 0x80);
 }
 
+static void apr_test_t8112_variant(struct kunit *test)
+{
+	struct apr_variant_test_info info;
+	static const u32 stats[] = {
+		APR_REG_STATS0_LO, APR_REG_STATS0_HI, APR_REG_STATS0_SIZE,
+		APR_REG_STATS1_LO, APR_REG_STATS1_HI, APR_REG_STATS1_SIZE,
+	};
+
+	KUNIT_ASSERT_EQ(test,
+			apr_variant_test_info("apple,t8112-prores", &info), 0);
+	KUNIT_EXPECT_TRUE(test, info.encode_v1);
+	KUNIT_EXPECT_TRUE(test, info.has_decoder);
+	KUNIT_EXPECT_MEMEQ(test, info.stats, stats, sizeof(stats));
+	KUNIT_EXPECT_EQ(test, info.num_engine_tunables, (size_t)64);
+	KUNIT_EXPECT_EQ(test, info.num_wrapper_tunables, (size_t)0);
+	KUNIT_EXPECT_EQ(test, info.num_regs, 2U);
+	KUNIT_EXPECT_EQ(test, info.num_irqs, 2U);
+	KUNIT_EXPECT_EQ(test, info.num_required_irqs, 2U);
+	KUNIT_EXPECT_EQ(test, info.num_completion_irqs, 1U);
+	KUNIT_EXPECT_EQ(test, info.ring_bytes, (u32)APR_RING_BYTES);
+	KUNIT_EXPECT_EQ(test, info.encode_desc_bytes,
+			(u32)APR_ENCODE_DESC_BYTES);
+	KUNIT_EXPECT_FALSE(test, info.has_firmware);
+	KUNIT_EXPECT_EQ(test,
+			apr_variant_test_info("apple,not-prores", &info), -ENOENT);
+}
+
 static struct kunit_case apr_test_cases[] = {
 	KUNIT_CASE(apr_test_qmat_regs),
 	KUNIT_CASE(apr_test_dc_scale),
@@ -643,6 +670,7 @@ static struct kunit_case apr_test_cases[] = {
 	KUNIT_CASE(apr_test_parse_frame),
 	KUNIT_CASE(apr_test_parse_interlaced),
 	KUNIT_CASE(apr_test_ring_accounting),
+	KUNIT_CASE(apr_test_t8112_variant),
 	{}
 };
 
