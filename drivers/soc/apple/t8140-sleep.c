@@ -1029,6 +1029,16 @@ static int t8140_ps_raise(struct t8140_sleep *s, u32 offset)
 	return ret;
 }
 
+/* A domain the hardware idled under AUTO_ENABLE comes back once that's cleared. */
+static bool t8140_ps_wait_on(struct t8140_sleep *s, u32 offset, u32 val)
+{
+	if (!FIELD_GET(PS_TARGET, val))
+		return false;
+
+	return !readl_poll_timeout_atomic(s->ps + offset, val, FIELD_GET(PS_ACTUAL, val), 1,
+					  PS_OFF_TIMEOUT_US);
+}
+
 static int t8140_ps_wait_off(struct t8140_sleep *s, u32 offset)
 {
 	u32 val;
@@ -1901,8 +1911,13 @@ static void t8140_sleep_lower_apcie(struct t8140_sleep *s)
 	t8140_ps_lower(s, PS_APCIE_SYS_ST);
 	t8140_ps_lower(s, PS_APCIE_ST);
 
+	/*
+	 * The AXI enables are the block's link into the fabric. macOS reads the domain on
+	 * before clearing them: powered off with them set, SoC NI 1 latches a PCIe receive
+	 * link error once the block's last domain goes off.
+	 */
 	val = t8140_ps_lower_start(s, PS_APCIE_SYS_GP);
-	if (s->apcie_axi && t8140_ps_on(s, PS_APCIE_SYS_GP)) {
+	if (s->apcie_axi && t8140_ps_wait_on(s, PS_APCIE_SYS_GP, val)) {
 		writel(readl(s->apcie_axi + APCIE_AXI_EN0) & ~BIT(0), s->apcie_axi + APCIE_AXI_EN0);
 		writel(readl(s->apcie_axi + APCIE_AXI_EN1) & ~BIT(0), s->apcie_axi + APCIE_AXI_EN1);
 	}
