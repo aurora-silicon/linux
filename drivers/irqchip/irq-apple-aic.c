@@ -284,6 +284,8 @@ struct aic_info {
 	 * comes online.
 	 */
 	bool siq_cfg_routing;
+	/* A firmware-driven suspend powers the controller down: aic_syscore_ops keep it. */
+	bool fw_suspend;
 };
 
 static const struct aic_info aic1_info __initconst = {
@@ -336,6 +338,7 @@ static const struct aic_info aic3_t8140_info __initconst = {
 	.fast_ipi = true,
 	.local_fast_ipi = true,
 	.siq_cfg_routing = true,
+	.fw_suspend = true,
 };
 
 static const struct aic_info aic3_t8142_info __initconst = {
@@ -1131,7 +1134,7 @@ static void build_fiq_affinity(struct aic_irq_chip *ic, struct device_node *aff)
 
 #ifdef CONFIG_PM_SLEEP
 /*
- * T8140's firmware-driven suspend powers the controller down and back up. How
+ * A firmware-driven suspend powers the controller down and back up. How
  * much it keeps isn't measured, and macOS saves and restores it in software. So
  * mask everything before the commit, so that no line can end the final WFI, and
  * put it all back after. Linux never writes IRQ_CFG or these global registers
@@ -1239,10 +1242,9 @@ static struct syscore aic_syscore = {
 	.ops = &aic_syscore_ops,
 };
 
-static void __init aic_sleep_init(struct aic_irq_chip *irqc, struct device_node *node)
+static void __init aic_sleep_init(struct aic_irq_chip *irqc)
 {
-	/* The only Apple SoC with a suspend-to-RAM path. */
-	if (!of_device_is_compatible(node, "apple,t8140-aic3"))
+	if (!irqc->info.fw_suspend)
 		return;
 
 	aic_sleep.irq_cfg = kcalloc(irqc->nr_die * irqc->nr_irq, sizeof(u32), GFP_KERNEL);
@@ -1252,7 +1254,7 @@ static void __init aic_sleep_init(struct aic_irq_chip *irqc, struct device_node 
 	register_syscore(&aic_syscore);
 }
 #else
-static void __init aic_sleep_init(struct aic_irq_chip *irqc, struct device_node *node)
+static void __init aic_sleep_init(struct aic_irq_chip *irqc)
 {
 }
 #endif
@@ -1398,7 +1400,7 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 			  "irqchip/apple-aic/ipi:starting",
 			  aic_init_cpu, NULL);
 
-	aic_sleep_init(irqc, node);
+	aic_sleep_init(irqc);
 
 	if (is_kernel_in_hyp_mode()) {
 		struct irq_fwspec mi = {
