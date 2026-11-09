@@ -92,6 +92,8 @@ struct audiosrv_data {
 	struct mutex open_lock;
 	struct apple_epic_service *open_srv;
 	u64 open_gen;
+	/* Woken when gen changes: an Open waits there for a replacement. */
+	wait_queue_head_t gen_wq;
 	/* The instance the link was last prepared on (open_lock) */
 	u64 link_gen;
 #endif
@@ -155,6 +157,9 @@ static void av_audiosrv_init(struct apple_epic_service *service, const char *nam
 #endif
 	queue_start = !asrv->reports_stopped;
 	up_write(&asrv->srv_rwsem);
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	wake_up_all(&asrv->gen_wq);
+#endif
 	if (old)
 		afk_service_put(old);
 
@@ -280,6 +285,9 @@ static int av_audiosrv_call(struct apple_epic_service *srv, u32 command, const v
 	return afk_service_call(srv, 0, command, body, body_len, body_pad, reply, reply_len, 0);
 }
 
+/* How long an Open refused by an instance being replaced waits for the next one */
+#define AV_AUDIOSRV_REPLACE_MS	1000
+
 /*
  * The 14.7 external role: the service is open while a PCM is (see
  * av_service_connect()). The instance the PCM opened is kept under open_lock,
@@ -308,11 +316,11 @@ int dcp_audiosrv_open(struct device *dev)
 	 * A display that wakes up (DPMS on) reports its sink on the audio
 	 * interface it had, and the firmware replaces that instance a few
 	 * hundred milliseconds later: an Open sent in between is refused
-	 * with a reply that matches no call, and times out. The Open that
-	 * follows the replacement is answered, so try the instance published
-	 * by then once more. Userspace drops an output whose first open
-	 * fails, so this is the difference between a display with and
-	 * without audio after it wakes up.
+	 * (kIOReturnOffline). The Open that follows the replacement is
+	 * answered, so wait for that instance and try it once more.
+	 * Userspace drops an output whose first open fails, so this is the
+	 * difference between a display with and without audio after it
+	 * wakes up.
 	 */
 	for (int attempt = 0; ; attempt++) {
 		scoped_guard(rwsem_read, &asrv->srv_rwsem) {
@@ -344,6 +352,14 @@ int dcp_audiosrv_open(struct device *dev)
 		afk_service_put(srv);
 		if (attempt)
 			return ret;
+		/*
+		 * The instance refused it as offline: its successor is on the
+		 * way (published within some 200 ms on the J616s), wait for it.
+		 */
+		if (ret == -ENODEV)
+			wait_event_timeout(asrv->gen_wq,
+					   READ_ONCE(asrv->srv) && READ_ONCE(asrv->gen) != gen,
+					   msecs_to_jiffies(AV_AUDIOSRV_REPLACE_MS));
 		scoped_guard(rwsem_read, &asrv->srv_rwsem)
 			replaced = asrv->srv && asrv->gen != gen;
 		if (!replaced)
@@ -1176,6 +1192,7 @@ int avep_init(struct apple_dcp *dcp)
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
 	INIT_WORK(&audiosrv_data->terminate_wq, av_work_service_terminate);
 	mutex_init(&audiosrv_data->open_lock);
+	init_waitqueue_head(&audiosrv_data->gen_wq);
 #endif
 	audiosrv_data->works_live = true;
 	dcp->audiosrv = audiosrv_data;
