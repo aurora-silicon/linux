@@ -16,6 +16,8 @@ pub(crate) mod storage;
 
 use kernel::prelude::*;
 
+use crate::module_parameters;
+
 use super::kick::{
     KickTimestamp, McacheClass, McacheRange, McacheTable, RegisterArray, RegisterArrayBinding,
     RegisterWrite, WriteRange, MCACHE_INLINE_RANGES,
@@ -84,6 +86,19 @@ pub(crate) enum RegisterPrograms {
     /// The 25G83 build's: other tiling and fragment arrays, another tile-state base, and the
     /// tiler parameter sub-buffers in the TPC object.
     V25G83,
+}
+
+/// Whether one tiling descriptor requests an immediate completion drain.
+///
+/// The shipped 25G83 path requests one for every pass. The test arm retains
+/// the installing pass's drain and lets later tiling completions remain in the
+/// paired render pipeline; fragment completion is still the retirement edge.
+fn tiling_completion_drain(programs: RegisterPrograms, ordinal: u64, arm: u32) -> u32 {
+    if programs != RegisterPrograms::V25G83 || arm != 1 {
+        u32::from(programs == RegisterPrograms::V25G83 || ordinal == 0)
+    } else {
+        u32::from(ordinal == 0)
+    }
 }
 
 /// The 25G83 tiling and main fragment arrays.
@@ -1068,11 +1083,9 @@ pub(crate) struct TaDescriptor {
     /// QID of the tiling queue.
     pub(crate) qid: u32,
     pub(crate) unk_8be: u32,
-    /// Non-zero on the first kick of a queue pair, like the fragment descriptor's word at the
-    /// same position. Set on every kick, the firmware also notifies the host of each pass's
-    /// tiling completion, which no retirement needs. The 25G83 firmware keeps it set on every
-    /// kick until this is measured there.
-    pub(crate) first_kick: u32,
+    /// Requests an immediate tiling-completion drain. The fragment completion
+    /// remains the render pair's retirement notification.
+    pub(crate) completion_drain: u32,
     /// Completion value of the tiling kick (see
     /// [`KickTimestamp::completion_value`]).
     pub(crate) completion: u64,
@@ -1176,10 +1189,11 @@ impl TaDescriptor {
         self.aux_stamp_va = args.ta.aux_stamp_va;
         self.stamp_value_2 = stamp_value;
         self.qid = args.ta.qid.into();
-        self.first_kick = match args.programs == RegisterPrograms::V25G83 {
-            true => 1,
-            false => u32::from(args.ordinal == 0),
-        };
+        self.completion_drain = tiling_completion_drain(
+            args.programs,
+            args.ordinal,
+            module_parameters::g16_test_tiling_drain.value(),
+        );
         self.current_id = resources.ta_ids.current.into();
         self.ordinal = args.ordinal as u32;
         self.timestamp_start_va = resources.timestamp_va;
@@ -1607,6 +1621,42 @@ impl FragmentSlot {
             *range = McacheRange::new(attachment, McacheClass::Attachment, context)?;
         }
         Ok(Some(table))
+    }
+}
+
+#[kunit_tests(asahi_g17_tiling_completion_drain)]
+mod tiling_completion_drain_tests {
+    use super::*;
+
+    #[test]
+    fn shipped_and_invalid_arms_keep_every_25g83_drain() {
+        for arm in [0, 2, u32::MAX] {
+            for ordinal in [0, 1, 255] {
+                assert_eq!(
+                    tiling_completion_drain(RegisterPrograms::V25G83, ordinal, arm),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_arm_keeps_installing_drain_only() {
+        assert_eq!(tiling_completion_drain(RegisterPrograms::V25G83, 0, 1), 1);
+        for ordinal in [1, 2, u32::MAX as u64 + 1] {
+            assert_eq!(
+                tiling_completion_drain(RegisterPrograms::V25G83, ordinal, 1),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn test_arm_does_not_change_other_firmware() {
+        for arm in [0, 1, 2, u32::MAX] {
+            assert_eq!(tiling_completion_drain(RegisterPrograms::G17P, 0, arm), 1);
+            assert_eq!(tiling_completion_drain(RegisterPrograms::G17P, 1, arm), 0);
+        }
     }
 }
 

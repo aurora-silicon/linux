@@ -239,5 +239,9 @@ module! {
             default: 0,
             description: "G16 TEST ONLY: arm (0=A, 101=stream, 2/4/8=one, 102/104/108=count-N)",
         },
+        g16_test_tiling_drain: u32 {
+            default: 0,
+            description: "G16 TEST ONLY: tiling completion drain (0=A, 1=later drains off)",
+        },
     },
 }
