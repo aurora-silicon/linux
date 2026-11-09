@@ -575,7 +575,7 @@ impl Completion {
 
     /// Whether the fence has been signalled (completed or failed).
     pub(crate) fn signalled(&self) -> bool {
-        self.signalled.load(Ordering::Acquire)
+        self.signalled.load(Ordering::Acquire) != 0
     }
 
     /// Whether this failure makes the VM unusable. Spared work, interrupted
