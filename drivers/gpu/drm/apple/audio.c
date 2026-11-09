@@ -1306,8 +1306,24 @@ static void dcpaud_report_hotplug(struct dcp_audio *dcpaud, bool connected,
 {
 	struct snd_pcm_substream *substream = dcpaud->substream;
 
-	if (!dcpaud->card || dcpaud->connected == connected) {
+	if (!dcpaud->card) {
 		mutex_unlock(&dcpaud->data_lock);
+		return;
+	}
+	/*
+	 * A sink the firmware reports before its EDID is read (a display
+	 * plugged in, or brought up on another processor) is connected again
+	 * once the mode is set: its ELD then has the monitor name.
+	 */
+	if (dcpaud->connected == connected) {
+		bool changed = connected && eld && memcmp(dcpaud->eld, eld, DCPAUD_ELD_SIZE);
+
+		if (changed)
+			memcpy(dcpaud->eld, eld, DCPAUD_ELD_SIZE);
+		mutex_unlock(&dcpaud->data_lock);
+		if (changed)
+			snd_ctl_notify(dcpaud->card, SNDRV_CTL_EVENT_MASK_VALUE,
+				       &dcpaud->eld_ctl->id);
 		return;
 	}
 
