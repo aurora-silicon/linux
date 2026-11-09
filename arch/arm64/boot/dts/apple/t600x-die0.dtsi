@@ -230,7 +230,9 @@
 			label = "pmp-jpg";
 			#power-domain-cells = <0>;
 			power-domains = <&ps_jpg>;
+#ifndef APPLE_USE_PMP
 			status = "disabled";
+#endif
 		};
 
 		pmp_report_scodec: report@14 {
