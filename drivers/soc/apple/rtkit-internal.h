@@ -23,6 +23,8 @@
 #define APPLE_RTKIT_APP_ENDPOINT_START 0x20
 #define APPLE_RTKIT_MAX_ENDPOINTS 0x100
 #define APPLE_RTKIT_CRASHLOG_HEADER_FOURCC 0x434c4845
+/* A container of crashlogs (one per task or core): 'CLGH'. */
+#define APPLE_RTKIT_CRASHLOG_CONTAINER_FOURCC 0x434c4748
 
 struct apple_rtkit_crashlog_header {
 	u32 fourcc;
@@ -93,9 +95,16 @@ struct apple_rtkit {
 	bool crashlog_inherited;
 	bool oslog_inherited;
 
+	/* A crash reported before the crashlog buffer was mapped: the log is
+	 * read once the co-processor has written it. */
+	struct delayed_work crashlog_late_work;
+	unsigned int crashlog_late_polls;
+
 	struct workqueue_struct *wq;
 };
 
 void apple_rtkit_crashlog_dump(struct apple_rtkit *rtk, u8 *bfr, size_t size);
+int apple_rtkit_crashlog_locate(const u8 *bfr, size_t size, size_t *log_offset,
+				u32 *log_id, unsigned int *depth);
 
 #endif

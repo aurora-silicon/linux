@@ -20,6 +20,11 @@
 	model = "Apple MacBook Pro (14-inch, M5 Pro, 2026)";
 	chassis-type = "laptop";
 
+	aliases {
+		/* the boot loader reserves the SEP firmware and adds its manifests through this alias */
+		sep = &sep;
+	};
+
 	chosen {
 		#address-cells = <2>;
 		#size-cells = <2>;
