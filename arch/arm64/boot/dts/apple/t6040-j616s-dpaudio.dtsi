@@ -86,7 +86,19 @@
 	};
 };
 
+/*
+ * The SIO firmware drives the SPI, UART and DP audio shims, so keep their
+ * parents on while it runs, as on T6000, T8112 and T8140. The ADT lists
+ * only SIO as SIO_CPU's parent. Without this, SPI_P stays on only because
+ * the QSPI controller never runtime-suspends, and UART_P is left as iBoot
+ * set it; a T8140 SIO with SPI_P/UART_P off crashes at boot.
+ */
 &ps_sio_cpu {
+	power-domains = <&ps_sio>, <&ps_spi_p>, <&ps_uart_p>, <&ps_dpa_p>;
+	status = "okay";
+};
+
+&ps_uart_p {
 	status = "okay";
 };
 
