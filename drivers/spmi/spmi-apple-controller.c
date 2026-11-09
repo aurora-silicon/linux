@@ -100,6 +100,8 @@ struct apple_spmi {
 	struct irq_domain *irqd;
 	raw_spinlock_t irq_mask_lock;
 	DECLARE_BITMAP(irq_mask_cache, SPMI_MAX_PERIPHERAL_IRQS);
+	/* The sources a driver uses, enabled or not. */
+	DECLARE_BITMAP(irq_used, SPMI_MAX_PERIPHERAL_IRQS);
 	int irq;
 	bool notify_irq;
 	bool notify_parked;
@@ -344,8 +346,11 @@ static struct irq_chip apple_spmi_irq_chip = {
 static int apple_spmi_irq_domain_map(struct irq_domain *irqd,
 					unsigned int irq, irq_hw_number_t hw)
 {
+	struct apple_spmi *spmi = irqd->host_data;
+
 	irq_domain_set_info(irqd, irq, hw, &apple_spmi_irq_chip, irqd->host_data,
 				handle_edge_irq, NULL, NULL);
+	set_bit(hw, spmi->irq_used);
 	return 0;
 }
 
@@ -399,7 +404,9 @@ static void apple_spmi_irq_domain_free(struct irq_domain *irqd, unsigned int vir
 
 	for (i = 0; i < nr_irqs; i++) {
 		struct irq_data *d = irq_domain_get_irq_data(irqd, virq + i);
+		struct apple_spmi *spmi = irqd->host_data;
 
+		clear_bit(d->hwirq, spmi->irq_used);
 		irq_set_handler(virq + i, NULL);
 		irq_domain_reset_irq_data(d);
 	}
@@ -416,7 +423,7 @@ static void apple_spmi_irq_handler(struct irq_desc *desc)
 	struct apple_spmi *spmi = irq_desc_get_handler_data(desc);
 	struct irq_chip *chip = irq_desc_get_chip(desc);
 	u32 notify = spmi->hw->num_irqs;
-	bool handled = false;
+	bool handled = false, held = false;
 	unsigned long val, offset, bit;
 
 	chained_irq_enter(chip, desc);
@@ -426,9 +433,32 @@ static void apple_spmi_irq_handler(struct irq_desc *desc)
 		complete(&spmi->fifo_rx);
 		handled = true;
 	}
+	/* Other queues' responses, such as the sleep's own commands at the debug link's cut. */
+	if (val & ~BIT(notify % 32)) {
+		writel(val & ~BIT(notify % 32), spmi->regs + SPMI_IRQ_ACK_BASE + (notify / 32) * 4);
+		handled = true;
+	}
 
 	for (offset = 0; offset < notify / 8; offset += sizeof(val)) {
+		unsigned long stray;
+
 		val = readq(spmi->regs + SPMI_IRQ_ACK_BASE + offset);
+		/*
+		 * After a real sleep, sources no driver uses come up pending (on the Neo the
+		 * USB-PD controllers' even lines, latched by the debug link's cut), and the
+		 * interrupt fires for them with nothing of ours to run. Clear them, as probe does.
+		 * A used source that is masked, as all are until the resume enables them, stays
+		 * pending for its unmask: it isn't a bad interrupt either.
+		 */
+		stray = val & ~spmi->irq_used[offset / sizeof(val)];
+		if (stray) {
+			writel(lower_32_bits(stray), spmi->regs + SPMI_IRQ_ACK_BASE + offset);
+			writel(upper_32_bits(stray), spmi->regs + SPMI_IRQ_ACK_BASE + offset + 4);
+			handled = true;
+		}
+		if (val & spmi->irq_used[offset / sizeof(val)] &
+		    ~spmi->irq_mask_cache[offset / sizeof(val)])
+			held = true;
 		/**
 		 * because of other masters in the bus, we're going to get a multitude of
 		 * interrupts we're not interested in. irq_resolve_mapping isn't very
@@ -441,7 +471,7 @@ static void apple_spmi_irq_handler(struct irq_desc *desc)
 			handled = true;
 		}
 	}
-	if (!handled)
+	if (!handled && !held)
 		handle_bad_irq(desc);
 	chained_irq_exit(chip, desc);
 }
