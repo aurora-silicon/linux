@@ -60,6 +60,68 @@ static struct apple_mcc_test *apple_mcc_test_alloc(struct kunit *test)
 	return ctx;
 }
 
+static void apple_mcc_test_set_stream_field(u8 *record, size_t field, u32 value)
+{
+	put_unaligned_le32(value, record + field);
+}
+
+#define MCC_TEST_SET_FIELD(record, field, value)				\
+	apple_mcc_test_set_stream_field((record),				\
+		offsetof(struct apple_mcc_mcache_stream_record, field), (value))
+
+static void apple_mcc_test_valid_stream(u8 *record, u32 dsid)
+{
+	MCC_TEST_SET_FIELD(record, stream_id, MCC_GPU_PARAMETER_BUFFER_STREAM_ID);
+	MCC_TEST_SET_FIELD(record, first_quota_group, 1);
+	MCC_TEST_SET_FIELD(record, last_quota_group, 1);
+	MCC_TEST_SET_FIELD(record, first_dsid, dsid);
+	MCC_TEST_SET_FIELD(record, last_dsid, dsid);
+	MCC_TEST_SET_FIELD(record, allocation_policy,
+			   MCC_MCACHE_POLICY_PMP_DYNAMIC_QUOTA);
+	MCC_TEST_SET_FIELD(record, default_requested_bytes,
+			   MCC_MCACHE_DEFAULT_REQUESTED_BYTES);
+}
+
+static void apple_mcc_test_stream_selection(struct kunit *test)
+{
+	u8 records[2 * sizeof(struct apple_mcc_mcache_stream_record)] = {};
+	u8 *target = records + sizeof(struct apple_mcc_mcache_stream_record);
+	u32 dsid = U32_MAX;
+
+	MCC_TEST_SET_FIELD(records, stream_id, 1);
+	apple_mcc_test_valid_stream(target, 7);
+
+	KUNIT_EXPECT_EQ(test,
+			apple_mcc_parse_stream_dsid(records, sizeof(records), &dsid), 0);
+	KUNIT_EXPECT_EQ(test, dsid, 7U);
+}
+
+static void apple_mcc_test_stream_refusal(struct kunit *test)
+{
+	u8 records[2 * sizeof(struct apple_mcc_mcache_stream_record)] = {};
+	u8 *duplicate = records + sizeof(struct apple_mcc_mcache_stream_record);
+	size_t record_size = sizeof(struct apple_mcc_mcache_stream_record);
+	u32 dsid;
+
+	apple_mcc_test_valid_stream(records, 7);
+	MCC_TEST_SET_FIELD(records, last_quota_group, 2);
+	KUNIT_EXPECT_EQ(test,
+			apple_mcc_parse_stream_dsid(records, record_size, &dsid),
+			-EINVAL);
+
+	apple_mcc_test_valid_stream(records, 7);
+	MCC_TEST_SET_FIELD(records, default_requested_bytes, 1);
+	KUNIT_EXPECT_EQ(test,
+			apple_mcc_parse_stream_dsid(records, record_size, &dsid),
+			-EINVAL);
+
+	apple_mcc_test_valid_stream(records, 7);
+	apple_mcc_test_valid_stream(duplicate, 7);
+	KUNIT_EXPECT_EQ(test,
+			apple_mcc_parse_stream_dsid(records, sizeof(records), &dsid),
+			-EINVAL);
+}
+
 static void apple_mcc_test_partial_enable(struct kunit *test)
 {
 	struct apple_mcc_test *ctx = apple_mcc_test_alloc(test);
@@ -104,6 +166,8 @@ static void apple_mcc_test_not_ready(struct kunit *test)
 }
 
 static struct kunit_case apple_mcc_test_cases[] = {
+	KUNIT_CASE(apple_mcc_test_stream_selection),
+	KUNIT_CASE(apple_mcc_test_stream_refusal),
 	KUNIT_CASE(apple_mcc_test_partial_enable),
 	KUNIT_CASE(apple_mcc_test_quiesce),
 	KUNIT_CASE(apple_mcc_test_not_ready),

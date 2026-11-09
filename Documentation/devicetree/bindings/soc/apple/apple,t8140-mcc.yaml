@@ -13,7 +13,8 @@ description:
   The memory cache controller holds the system level cache in front of DRAM.
   T8140 exposes per-plane allocation and flush controls. T8132 instead has
   two apertures with two planes each and a multicast cache-enable register;
-  its enabled cache is retained until a dirty-data drain is qualified.
+  its enabled cache is retained until a dirty-data drain is qualified. T6041
+  additionally exposes a per-DSID action table in each 256 KiB plane aperture.
 
 select:
   properties:
@@ -102,6 +103,11 @@ allOf:
           maxItems: 64
 
         nonposted-mmio: true
+
+        apple,pmp:
+          $ref: /schemas/types.yaml#/definitions/phandle
+          description:
+            PMP node containing the copied memory-cache stream records used on T6041.
 
         apple,boot-dma-devices:
           $ref: /schemas/types.yaml#/definitions/phandle-array
