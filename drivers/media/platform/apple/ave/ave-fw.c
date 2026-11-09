@@ -136,11 +136,11 @@ int ave_fw_text_id_crc(const void *text, size_t size, u32 cell_off,
 	if (cell_off > size || size - cell_off < sizeof(zero))
 		return -EINVAL;
 	/*
-	 * The cell holds the firmware's own alias of DATA, which has DATA's
-	 * DART address in its low 32 bits.
+	 * The cell holds the firmware's own alias of DATA, which has the low
+	 * 32 bits of DATA's DART address.
 	 */
 	cell = get_unaligned_le64(text + cell_off);
-	if (cell && lower_32_bits(cell) != data_iova)
+	if (cell && lower_32_bits(cell) != lower_32_bits(data_iova))
 		return -ENODEV;
 	*crc = crc32_le(~0U, text, cell_off);
 	*crc = crc32_le(*crc, zero, sizeof(zero));
@@ -205,10 +205,16 @@ int ave_fw_probe(struct ave_dev *ave)
 			dev, -EIO,
 			"firmware is not mapped where it was loaded\n");
 
+	/*
+	 * TEXT starts the DART window: at address 0 on T6000, at the DART's
+	 * vm-base (0x800000000) on T8112, where iBoot points the code base.
+	 * DATA follows TEXT.
+	 */
 	if (ave->variant->text_link_cell &&
-	    (ave->text.iova || ave->data.iova != ave->text.size))
+	    (lower_32_bits(ave->text.iova) ||
+	     ave->data.iova != ave->text.iova + ave->text.size))
 		return dev_err_probe(dev, -EINVAL,
-				     "firmware must sit at DART address 0 (TEXT %#llx, DATA %#llx)\n",
+				     "firmware must start its DART window (TEXT %#llx, DATA %#llx)\n",
 				     (u64)ave->text.iova, (u64)ave->data.iova);
 
 	ret = ave_fw_crc(&ave->text, &text_crc, NULL);
