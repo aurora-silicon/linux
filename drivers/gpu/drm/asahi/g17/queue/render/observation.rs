@@ -53,8 +53,14 @@ impl Pair {
         let armed = crate::g17::stamp_complete::enabled();
         let tracing = crate::g17::trace::hold_enabled();
         if !armed && !tracing { return Ok(()); }
+        // Output stays in pair order: once an unsettled render cannot be output
+        // early, no later render of this pair may overtake it.
+        let mut blocked = false;
         for active in self.active.iter() {
-            if !active.outer_published { continue; }
+            if !active.outer_published {
+                blocked |= !active.packet.completion.output_settled();
+                continue;
+            }
             let ticket = &active.ticket;
             if !self.memory.owns(ticket.ordinal)
                 || !Arc::ptr_eq(&active.packet.context, &self.memory.context)
@@ -63,6 +69,7 @@ impl Pair {
                     crate::g17::trace::hold(crate::g17::trace::RENDER, self.qids()[1],
                         ticket.ordinal, active.packet.context.id(), active.packet.order.sequence, 8, 0);
                 }
+                blocked |= !active.packet.completion.output_settled();
                 continue;
             }
             let published = ticket.ordinal.checked_add(1).ok_or(EOVERFLOW)?;
@@ -70,8 +77,11 @@ impl Pair {
                 .all(|stamp| retirement::stamp_covers(stamp, published));
             // Refresh after the stamp loads, never export a pre-stamp snapshot.
             fence(Ordering::Acquire);
-            let Ok(ticks) = self.memory.pass(ticket.ordinal) else { continue; };
             let completion = &active.packet.completion;
+            let Ok(ticks) = self.memory.pass(ticket.ordinal) else {
+                blocked |= !completion.output_settled();
+                continue;
+            };
             let healthy = state == 0 && !self.quarantined && self.prepared.is_none()
                 && !active.failed && completion.stamp_eligible();
             if tracing {
@@ -90,10 +100,12 @@ impl Pair {
                     published, active.packet.context.id(), active.packet.order.sequence,
                     known, value);
             }
-            if armed && healthy {
+            if completion.output_settled() || blocked { continue; }
+            if !armed || !healthy { blocked = true; continue; }
+            {
                 let Ok(Some([start, end])) = retirement::stamp_pass(published, stamps,
-                    || self.memory.pass(ticket.ordinal)) else { continue; };
-                if completion.retain_stamp_work().is_err() { continue; }
+                    || self.memory.pass(ticket.ordinal)) else { blocked = true; continue; };
+                if completion.retain_stamp_work().is_err() { blocked = true; continue; }
                 defer(crate::g17::completion::Deferred::Stamped(completion.clone(),
                     [start, start, start, end]))?;
                 crate::g17::trace::complete(crate::g17::trace::RENDER, self.qids()[1],

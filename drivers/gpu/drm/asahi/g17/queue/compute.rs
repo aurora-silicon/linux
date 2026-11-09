@@ -953,6 +953,9 @@ impl Queue {
         if (!armed && !tracing) || self.active.len == 0 { return Ok(()); }
         let Ok(stamp) = self.graph.stamp() else { return Ok(()); };
         core::sync::atomic::fence(Ordering::Acquire);
+        // Output stays in queue order: once an unsettled command cannot be
+        // output early, no later command of this queue may overtake it.
+        let mut blocked = false;
         for active in self.active.iter() {
             let Some(ticket) = active.ticket else { break; };
             if self.valid_ticket(active, &ticket).is_err() {
@@ -960,13 +963,17 @@ impl Queue {
                     crate::g17::trace::hold(crate::g17::trace::COMPUTE, ticket.qid,
                         ticket.kick, ticket.context_id, ticket.submission, 8, 0);
                 }
+                blocked |= !active.packet.completion.output_settled();
                 continue;
             }
             let completion = &active.packet.completion;
             let covered = retirement::stamp_covers(stamp, ticket.kick);
             let healthy = !self.quarantined && recovery_state == 0 && ticket.epoch == epoch
                 && !active.failure_deferred && completion.stamp_eligible();
-            let Ok(ticks) = completion.compute_words() else { continue; };
+            let Ok(ticks) = completion.compute_words() else {
+                blocked |= !completion.output_settled();
+                continue;
+            };
             if tracing {
                 let cursors = self.graph.cursors()
                     .and_then(|c| c.consumed(ticket.item_producer, ticket.item_count));
@@ -983,14 +990,13 @@ impl Queue {
                 crate::g17::trace::hold(crate::g17::trace::COMPUTE, ticket.qid, ticket.kick,
                     ticket.context_id, ticket.submission, known, value);
             }
-            if let Some([start, end]) = crate::g17::stamp_complete::timestamps(
-                u32::from(armed), healthy, covered, ticks)
-            {
-                if completion.retain_stamp_work().is_err() { continue; }
-                defer(Deferred::Stamped(completion.clone(), [start, end, 0, 0]))?;
-                crate::g17::trace::complete(crate::g17::trace::COMPUTE, ticket.qid,
-                    ticket.ordinal, &active.packet, [start, end]);
-            }
+            if completion.output_settled() || blocked { continue; }
+            let Some([start, end]) = crate::g17::stamp_complete::timestamps(
+                u32::from(armed), healthy, covered, ticks) else { blocked = true; continue; };
+            if completion.retain_stamp_work().is_err() { blocked = true; continue; }
+            defer(Deferred::Stamped(completion.clone(), [start, end, 0, 0]))?;
+            crate::g17::trace::complete(crate::g17::trace::COMPUTE, ticket.qid,
+                ticket.ordinal, &active.packet, [start, end]);
         }
         Ok(())
     }
