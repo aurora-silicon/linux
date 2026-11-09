@@ -70,15 +70,16 @@ struct ane_h16_device {
 	int irq;
 	/*
 	 * The channel IRQ (ANE_FW_IRQ_CHANNELS) as a wakeup for the polled
-	 * waits once the firmware is up: relax() arms it before sleeping and
+	 * waits once the firmware is up: pause() arms it before sleeping and
 	 * the handler disables it again. The transport still reads,
-	 * acknowledges and drains every ring itself, as before.
+	 * acknowledges and drains every ring itself, as before. irq_seq
+	 * counts IRQs, so concurrent waiters each see their own wakeup.
 	 */
 	spinlock_t irq_lock;
 	wait_queue_head_t irq_wq;
 	bool irq_wait;
 	bool irq_armed;
-	bool irq_fired;
+	unsigned long irq_seq;
 	u64 irq_wakeups;
 	u64 irq_timeouts;
 	struct ane_fw_rtk rtk;
@@ -210,19 +211,22 @@ static void ane_h16_sleep_trace(struct ane_h16_device *h, const char *when);
  */
 static void ane_h16_irq_wait_set(struct ane_h16_device *h, bool on)
 {
-	bool disarm = false;
-
 	if (h->irq < 0 || h->boot.soc->irq_role != ANE_FW_IRQ_CHANNELS)
 		return;
+	/*
+	 * Arming and disarming both happen under irq_lock, so a pause racing
+	 * with power down either armed before this (and is disarmed here) or
+	 * sees irq_wait clear and polls.
+	 */
 	scoped_guard(spinlock_irqsave, &h->irq_lock) {
 		WRITE_ONCE(h->irq_wait, on);
 		if (!on && h->irq_armed) {
 			h->irq_armed = false;
-			disarm = true;
+			disable_irq_nosync(h->irq);
 		}
 	}
-	if (disarm)
-		disable_irq(h->irq);
+	if (!on)
+		synchronize_irq(h->irq);
 }
 
 static int ane_h16_suspend_firmware(struct ane_h16_device *h)
@@ -392,8 +396,10 @@ static int ane_h16_warm_boot(struct ane_h16_device *h)
 		return ret;
 	ret = ane_fw_transport_check(&b->transport);
 	h->resume_ready_ns = ktime_get_ns();
-	if (!ret)
+	if (!ret) {
+		ane_h16_irq_wait_set(h, true);
 		dev_info(h->dev, "H16 ANE: firmware resumed (warm boot); programs kept\n");
+	}
 	return ret;
 }
 
@@ -1026,17 +1032,26 @@ static u64 ane_h16_now(void *ctx)
 static void ane_h16_irq_pause(struct ane_h16_device *h, u64 waited_ns)
 {
 	unsigned int min_us, max_us;
+	unsigned long seq = 0;
+	bool armed = false;
 	long ret;
 
 	min_us = ane_fw_poll_sleep_us(waited_ns, &max_us);
 	scoped_guard(spinlock_irqsave, &h->irq_lock) {
-		h->irq_fired = false;
-		if (!h->irq_armed) {
-			h->irq_armed = true;
-			enable_irq(h->irq);
+		if (h->irq_wait) {
+			seq = h->irq_seq;
+			if (!h->irq_armed) {
+				h->irq_armed = true;
+				enable_irq(h->irq);
+			}
+			armed = true;
 		}
 	}
-	ret = wait_event_hrtimeout(h->irq_wq, READ_ONCE(h->irq_fired),
+	if (!armed) {
+		ane_fw_poll_pause(waited_ns);
+		return;
+	}
+	ret = wait_event_hrtimeout(h->irq_wq, READ_ONCE(h->irq_seq) != seq,
 				   us_to_ktime(min_us));
 	scoped_guard(spinlock_irqsave, &h->irq_lock) {
 		if (ret)
@@ -1278,7 +1293,7 @@ static irqreturn_t ane_h16_irq(int irq, void *data)
 			disable_irq_nosync(irq);
 			h->irq_armed = false;
 		}
-		WRITE_ONCE(h->irq_fired, true);
+		WRITE_ONCE(h->irq_seq, h->irq_seq + 1);
 	}
 	wake_up(&h->irq_wq);
 	return IRQ_HANDLED;
