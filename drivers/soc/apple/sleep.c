@@ -1859,13 +1859,19 @@ static int sleep_hpm_wait_contract(struct apple_sleep *s)
 	return -ETIMEDOUT;
 }
 
+/* A live debug link holds the debug switch domain on. */
+static bool sleep_debug_link_up(struct apple_sleep *s)
+{
+	return s->hpm_spmi &&
+	       FIELD_GET(PS_ACTUAL, readl(s->ps_aon + s->soc->ps_aon_debug_switch));
+}
+
 /*
  * The debug link stays up with the ATC0 domains off, and it holds the debug domains
  * active, which macOS has idle. The only known way to end it is the port controller's
- * cold reset. To the SMC that's a cable pulled: it queues the port's events and records
- * them as wake reasons. So it has to come before the SMC's AP idle notice, not after, or
- * SMC.OutboxNotEmpty is up at the commit, and so does the partner's new contract.
- * tipd rearms the link after a refusal.
+ * cold reset. To the SMC that's a cable pulled: it records the port's events as wake
+ * reasons once it has been warned of the sleep, and wakes the AP right after the commit.
+ * So the SMC's driver warns it only after this. tipd rearms the link after a refusal.
  */
 static bool apple_sleep_usb_down(struct apple_sleep *s)
 {
@@ -1877,8 +1883,7 @@ static bool apple_sleep_usb_down(struct apple_sleep *s)
 		return false;
 	s->usb_down_ran = true;
 
-	if (!s->hpm_spmi ||
-	    !FIELD_GET(PS_ACTUAL, readl(s->ps_aon + s->soc->ps_aon_debug_switch)))
+	if (!sleep_debug_link_up(s))
 		return false;
 
 	dev_info(s->dev, "debug link: cutting it for the sleep\n");
@@ -1917,6 +1922,14 @@ bool apple_sleep_debug_link_cut(void)
 	return apple_sleep ? apple_sleep_usb_down(apple_sleep) : false;
 }
 EXPORT_SYMBOL_GPL(apple_sleep_debug_link_cut);
+
+bool apple_sleep_debug_link_up(void)
+{
+	struct apple_sleep *s = apple_sleep;
+
+	return s && !s->usb_down_ran && sleep_debug_link_up(s);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_debug_link_up);
 
 /*
  * macOS takes the wake for a lid closing during the sleep as a dark one: every driver wakes,

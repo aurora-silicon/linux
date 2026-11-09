@@ -246,6 +246,30 @@ static void macsmc_sleep_order_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ctx->seen[6], SMC_KEY(waka));
 }
 
+static void macsmc_test_outbox_poll(struct apple_smc *smc, const char *after,
+				    unsigned int min_ms, unsigned int quiet_ms)
+{
+}
+
+static void macsmc_sleep_warn_late_test(struct kunit *test)
+{
+	struct macsmc_test_context *ctx = test->priv;
+
+	kunit_activate_static_stub(test, apple_smc_ap_power, macsmc_test_ap_power);
+	kunit_activate_static_stub(test, apple_smc_outbox_poll, macsmc_test_outbox_poll);
+	ctx->result = 8;
+
+	/* A sleep that cuts the debug link: slpw comes at the noirq suspend, before slpa. */
+	ctx->smc.sleep_warn_late = true;
+	KUNIT_EXPECT_EQ(test, apple_smc_sleep_enter(&ctx->smc), 0);
+	KUNIT_EXPECT_FALSE(test, ctx->smc.sleep_warn_late);
+	KUNIT_EXPECT_TRUE(test, ctx->smc.sleep_warned);
+	KUNIT_ASSERT_EQ(test, ctx->seen_count, 3U);
+	KUNIT_EXPECT_EQ(test, ctx->seen[0], SMC_KEY(slpw));
+	KUNIT_EXPECT_EQ(test, ctx->seen[1], SMC_KEY(slpa));
+	KUNIT_EXPECT_EQ(test, ctx->seen[2], (u32)MACSMC_TEST_AP_IDLE);
+}
+
 static void macsmc_sleep_refused_test(struct kunit *test)
 {
 	struct macsmc_test_context *ctx = test->priv;
@@ -343,6 +367,7 @@ static struct kunit_case macsmc_parser_cases[] = {
 	KUNIT_CASE(macsmc_sram_value_test),
 	KUNIT_CASE(macsmc_key_info_test),
 	KUNIT_CASE(macsmc_sleep_order_test),
+	KUNIT_CASE(macsmc_sleep_warn_late_test),
 	KUNIT_CASE(macsmc_sleep_refused_test),
 	KUNIT_CASE(macsmc_notice_test),
 	KUNIT_CASE(macsmc_lid_wake_test),

@@ -108,6 +108,9 @@ bool apple_sleep_debug_link_cut_peek(struct device *dev);
  */
 bool apple_sleep_debug_link_cut(void);
 
+/* This sleep will end the debug link: for the SMC's driver, which warns the SMC after it. */
+bool apple_sleep_debug_link_up(void);
+
 /*
  * From the SMC's driver, in its noirq resume: the SMC woke the AP for the lid alone, and the
  * lid reads closed. If nothing else woke the SoC, the PM core goes back to sleep once every
@@ -223,6 +226,11 @@ static inline bool apple_sleep_debug_link_cut_peek(struct device *dev)
 }
 
 static inline bool apple_sleep_debug_link_cut(void)
+{
+	return false;
+}
+
+static inline bool apple_sleep_debug_link_up(void)
 {
 	return false;
 }

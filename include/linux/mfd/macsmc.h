@@ -116,6 +116,8 @@ struct apple_smc {
 	bool ap_notified;
 	/* Told of a coming sleep, and not yet of its end. */
 	bool sleep_warned;
+	/* To be told at the noirq suspend, after the debug link's cut. */
+	bool sleep_warn_late;
 	/* In a noirq phase: replies are polled for. */
 	bool polled;
 	/* MBSW at the last wake: what the SMC had woken the AP for. */

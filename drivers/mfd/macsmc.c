@@ -672,19 +672,21 @@ MODULE_DEVICE_TABLE(of, apple_smc_of_match);
  * from their letters.
  *
  * SMC.OutboxNotEmpty wakes the SoC while anything waits in the outbox. An event that arrives
- * during the sleep's entry (the lid, a key) is left there, so the sleep returns at once. The
- * debug link's cut fills it too, and the SMC counts what it reports after the notice as wake
- * reasons, so the cut comes before the notice.
+ * during the sleep's entry (the lid, a key) is left there, so the sleep returns at once.
+ *
+ * The debug link's cut, on a debug cable only, makes the SMC see a cable pulled and plugged
+ * back. With the cut after slpw, the SMC woke the AP right after the commit, for USB-C_plug
+ * or acdetach, in every such sleep (J700, 223 of 223), even with its outbox quiet for 500 ms
+ * before the notice. A sleep that cuts the link warns the SMC only after the cut.
  */
 
 /* The gaps macOS leaves before the AP idle notice and after it. */
 #define SMC_SLEEP_ARM_MS	6
 #define SMC_SLEEP_IDLE_MS	30
+/* The shortest gap macOS left between slpw and slpa, in two traced sleeps. */
+#define SMC_SLEEP_WARN_MS	770
 
-/*
- * After the debug link's cut. Its port and charger events keep coming for over a second,
- * and any that lands after the AP idle notice wakes the SoC at once.
- */
+/* After the debug link's cut. Its port and charger events keep coming for over a second. */
 #define SMC_OUTBOX_QUIET_MS	500
 #define SMC_OUTBOX_SETTLE_MS	5000
 
@@ -864,7 +866,11 @@ static int apple_smc_prepare(struct device *dev)
 {
 	struct apple_smc *smc = dev_get_drvdata(dev);
 
-	if (pm_suspend_via_firmware())
+	if (!pm_suspend_via_firmware())
+		return 0;
+	if (apple_sleep_debug_link_up())
+		smc->sleep_warn_late = true;
+	else
 		apple_smc_sleep_warn(smc);
 
 	return 0;
@@ -875,19 +881,27 @@ static void apple_smc_complete(struct device *dev)
 {
 	struct apple_smc *smc = dev_get_drvdata(dev);
 
+	smc->sleep_warn_late = false;
 	if (smc->sleep_warned) {
 		apple_smc_write_mbse(smc, SMC_KEY(waka));
 		smc->sleep_warned = false;
 	}
 }
 
-/* The events go to their handlers as usual, through the RTKit worker. */
-static void apple_smc_outbox_settle(struct apple_smc *smc)
+/*
+ * For at least @min_ms, then until the outbox is quiet for @quiet_ms. The events go to their
+ * handlers as usual, through the RTKit worker.
+ */
+static void apple_smc_outbox_poll(struct apple_smc *smc, const char *after,
+				  unsigned int min_ms, unsigned int quiet_ms)
 {
 	unsigned int ms, quiet = 0, count = 0, last = 0;
 	int ret;
 
-	for (ms = 0; ms < SMC_OUTBOX_SETTLE_MS && quiet < SMC_OUTBOX_QUIET_MS; ms++) {
+	if (IS_ENABLED(CONFIG_MFD_MACSMC_KUNIT_TEST))
+		KUNIT_STATIC_STUB_REDIRECT(apple_smc_outbox_poll, smc, after, min_ms, quiet_ms);
+
+	for (ms = 0; ms < SMC_OUTBOX_SETTLE_MS && (ms < min_ms || quiet < quiet_ms); ms++) {
 		ret = apple_rtkit_poll(smc->rtk);
 		if (ret > 0) {
 			count += ret;
@@ -898,8 +912,23 @@ static void apple_smc_outbox_settle(struct apple_smc *smc)
 		}
 		usleep_range(1000, 1200);
 	}
-	dev_dbg(smc->dev, "debug link cut: %u messages, the last at %u ms, %s after %u ms\n",
-		count, last, quiet >= SMC_OUTBOX_QUIET_MS ? "quiet" : "still busy", ms);
+	/* A debug cable only. */
+	dev_info(smc->dev, "%s: %u messages in %u ms, the last at %u ms%s\n", after, count, ms,
+		 last, ms >= SMC_OUTBOX_SETTLE_MS ? ", still busy" : "");
+}
+
+/* The noirq suspend's part, polled: the cut, a late warning, the commit's notices. */
+static int apple_smc_sleep_enter(struct apple_smc *smc)
+{
+	if (apple_sleep_debug_link_cut())
+		apple_smc_outbox_poll(smc, "debug link cut", 0, SMC_OUTBOX_QUIET_MS);
+	if (smc->sleep_warn_late) {
+		smc->sleep_warn_late = false;
+		apple_smc_sleep_warn(smc);
+		apple_smc_outbox_poll(smc, "late sleep warning", SMC_SLEEP_WARN_MS, 0);
+	}
+
+	return apple_smc_sleep_commit(smc);
 }
 
 static int apple_smc_suspend_noirq(struct device *dev)
@@ -907,13 +936,11 @@ static int apple_smc_suspend_noirq(struct device *dev)
 	struct apple_smc *smc = dev_get_drvdata(dev);
 	int ret;
 
-	if (!smc->sleep_warned)
+	if (!smc->sleep_warned && !smc->sleep_warn_late)
 		return 0;
 
 	apple_smc_set_polled(smc, true);
-	if (apple_sleep_debug_link_cut())
-		apple_smc_outbox_settle(smc);
-	ret = apple_smc_sleep_commit(smc);
+	ret = apple_smc_sleep_enter(smc);
 	apple_smc_set_polled(smc, false);
 
 	return ret;
