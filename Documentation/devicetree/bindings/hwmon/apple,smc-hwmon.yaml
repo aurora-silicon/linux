@@ -34,7 +34,7 @@ $defs:
         description: Human-readable name for the sensor
 
       apple,no-data-below-millicelsius:
-        $ref: /schemas/types.yaml#/definitions/int32
+        maxItems: 1
         description:
           The SMC publishes a placeholder below this temperature, in
           millidegrees Celsius, while the sensor is powered down (the GPU
