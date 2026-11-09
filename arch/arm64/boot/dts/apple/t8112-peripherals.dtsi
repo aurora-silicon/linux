@@ -84,7 +84,54 @@
 	m2_aic_timebase: timer@23b0dc000 {
 		compatible = "apple,t8112-aic-timebase", "apple,aic-timebase";
 		reg = <0x2 0x3b0dc000 0x0 0x1000>;
-		status = "disabled";
+	};
+
+	cpu_e0_coresight: cpu-debug@210010000 {
+		compatible = "apple,t8112-cpu-coresight", "apple,cpu-coresight";
+		reg = <0x2 0x10010000 0x0 0x300c8>;
+		cpu = <&cpu_e0>;
+	};
+
+	cpu_e1_coresight: cpu-debug@210110000 {
+		compatible = "apple,t8112-cpu-coresight", "apple,cpu-coresight";
+		reg = <0x2 0x10110000 0x0 0x300c8>;
+		cpu = <&cpu_e1>;
+	};
+
+	cpu_e2_coresight: cpu-debug@210210000 {
+		compatible = "apple,t8112-cpu-coresight", "apple,cpu-coresight";
+		reg = <0x2 0x10210000 0x0 0x300c8>;
+		cpu = <&cpu_e2>;
+	};
+
+	cpu_e3_coresight: cpu-debug@210310000 {
+		compatible = "apple,t8112-cpu-coresight", "apple,cpu-coresight";
+		reg = <0x2 0x10310000 0x0 0x300c8>;
+		cpu = <&cpu_e3>;
+	};
+
+	cpu_p0_coresight: cpu-debug@211010000 {
+		compatible = "apple,t8112-cpu-coresight", "apple,cpu-coresight";
+		reg = <0x2 0x11010000 0x0 0x300c8>;
+		cpu = <&cpu_p0>;
+	};
+
+	cpu_p1_coresight: cpu-debug@211110000 {
+		compatible = "apple,t8112-cpu-coresight", "apple,cpu-coresight";
+		reg = <0x2 0x11110000 0x0 0x300c8>;
+		cpu = <&cpu_p1>;
+	};
+
+	cpu_p2_coresight: cpu-debug@211210000 {
+		compatible = "apple,t8112-cpu-coresight", "apple,cpu-coresight";
+		reg = <0x2 0x11210000 0x0 0x300c8>;
+		cpu = <&cpu_p2>;
+	};
+
+	cpu_p3_coresight: cpu-debug@211310000 {
+		compatible = "apple,t8112-cpu-coresight", "apple,cpu-coresight";
+		reg = <0x2 0x11310000 0x0 0x300c8>;
+		cpu = <&cpu_p3>;
 	};
 
 	m2_dwi: dwi@23b200000 {
@@ -142,7 +189,6 @@
 			<0x2 0x3d10c000 0x0 0x1000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 368 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 		apple,sw-drain;
 	};
 
