@@ -558,16 +558,16 @@ static void ave_6070_text_id(struct kunit *test)
 	memset(text + off, 0, 8);
 	image = crc32_le(~0U, text, size) ^ ~0U;
 
-	KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, off, 0x8000d0000ULL, &crc), 0);
+	KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, off, 0xd0000ULL, &crc), 0);
 	KUNIT_EXPECT_EQ(test, crc, image);
 	put_unaligned_le64(0x8000d0000ULL, text + off);
 	KUNIT_EXPECT_NE(test, crc32_le(~0U, text, size) ^ ~0U, image);
 	crc = 0;
-	KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, off, 0x8000d0000ULL, &crc), 0);
+	KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, off, 0xd0000ULL, &crc), 0);
 	KUNIT_EXPECT_EQ(test, crc, image);
 	/* Any other address in the cell is a different TEXT. */
 	put_unaligned_le64(0x8000d4000ULL, text + off);
-	KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, off, 0x8000d0000ULL, &crc), -ENODEV);
+	KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, off, 0xd0000ULL, &crc), -ENODEV);
 	KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, size - 4, 0, &crc), -EINVAL);
 }
 

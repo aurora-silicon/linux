@@ -135,8 +135,12 @@ int ave_fw_text_id_crc(const void *text, size_t size, u32 cell_off,
 
 	if (cell_off > size || size - cell_off < sizeof(zero))
 		return -EINVAL;
+	/*
+	 * The cell holds the firmware's own alias of DATA, which has DATA's
+	 * DART address in its low 32 bits.
+	 */
 	cell = get_unaligned_le64(text + cell_off);
-	if (cell && cell != data_iova)
+	if (cell && lower_32_bits(cell) != data_iova)
 		return -ENODEV;
 	*crc = crc32_le(~0U, text, cell_off);
 	*crc = crc32_le(*crc, zero, sizeof(zero));
@@ -200,6 +204,12 @@ int ave_fw_probe(struct ave_dev *ave)
 		return dev_err_probe(
 			dev, -EIO,
 			"firmware is not mapped where it was loaded\n");
+
+	if (ave->variant->text_link_cell &&
+	    (ave->text.iova || ave->data.iova != ave->text.size))
+		return dev_err_probe(dev, -EINVAL,
+				     "firmware must sit at DART address 0 (TEXT %#llx, DATA %#llx)\n",
+				     (u64)ave->text.iova, (u64)ave->data.iova);
 
 	ret = ave_fw_crc(&ave->text, &text_crc, NULL);
 	if (ret)
