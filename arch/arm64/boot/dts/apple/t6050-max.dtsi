@@ -16,6 +16,9 @@
 
 #include "multi-die-cpp.h"
 
+/* t6050-peripherals.dtsi leaves out its inventory copies of the nodes this file describes. */
+#define T6050_MAX_DTSI
+
 #include "t6050-base.dtsi"
 
 / {
