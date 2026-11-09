@@ -982,6 +982,55 @@ static void sn201202x_ldcm_read_failure_with_result_test(struct kunit *test)
 	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
 }
 
+struct sn201202x_ldcm_stop_test {
+	struct sn201202x sn;
+	atomic_t runs;
+};
+
+static void sn201202x_ldcm_test_work(struct work_struct *work)
+{
+	struct sn201202x *sn = container_of(to_delayed_work(work),
+					  struct sn201202x, ldcm_work);
+	struct sn201202x_ldcm_stop_test *t = container_of(sn,
+					struct sn201202x_ldcm_stop_test, sn);
+
+	atomic_inc(&t->runs);
+}
+
+static void sn201202x_ldcm_test_cancel(void *data)
+{
+	cancel_delayed_work_sync(data);
+}
+
+static void sn201202x_ldcm_stop_requeue_test(struct kunit *test)
+{
+	struct sn201202x_ldcm_stop_test *t;
+	struct tps6598x *tps;
+	int ret;
+
+	t = kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, t);
+	tps = &t->sn.cd.tps;
+	mutex_init(&tps->lock);
+	atomic_set(&t->runs, 0);
+	INIT_DELAYED_WORK(&t->sn.ldcm_work, sn201202x_ldcm_test_work);
+	ret = kunit_add_action_or_reset(test, sn201202x_ldcm_test_cancel, &t->sn.ldcm_work);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	/* Removal must cancel a pending retry and prevent later producers. */
+	mod_delayed_work(system_freezable_wq, &t->sn.ldcm_work, 60 * HZ);
+	sn201202x_contaminant_ops.stop(tps);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&t->sn.ldcm_work));
+
+	/* Reset recovery can still invalidate the detector before it is drained. */
+	mutex_lock(&tps->lock);
+	sn201202x_contaminant_ops.invalidate(tps);
+	mutex_unlock(&tps->lock);
+	flush_delayed_work(&t->sn.ldcm_work);
+	KUNIT_EXPECT_EQ(test, atomic_read(&t->runs), 0);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&t->sn.ldcm_work));
+}
+
 static struct kunit_case sn201202x_pm_cases[] = {
 	KUNIT_CASE(sn201202x_sleep_cycle_test),
 	KUNIT_CASE(sn201202x_failed_wakeup_test),
@@ -1003,6 +1052,7 @@ static struct kunit_case sn201202x_pm_cases[] = {
 	KUNIT_CASE(sn201202x_ldcm_busy_keeps_result_test),
 	KUNIT_CASE(sn201202x_ldcm_busy_without_result_test),
 	KUNIT_CASE(sn201202x_ldcm_read_failure_with_result_test),
+	KUNIT_CASE(sn201202x_ldcm_stop_requeue_test),
 	KUNIT_CASE(sn201202x_idle_sleep_test),
 	KUNIT_CASE(sn201202x_atomic_access_test),
 	KUNIT_CASE(sn201202x_idle_sleep_retry_test),
