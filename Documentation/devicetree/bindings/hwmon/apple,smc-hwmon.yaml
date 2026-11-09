@@ -33,6 +33,15 @@ $defs:
       label:
         description: Human-readable name for the sensor
 
+      apple,no-data-below-millicelsius:
+        $ref: /schemas/types.yaml#/definitions/int32
+        description:
+          The SMC publishes a placeholder below this temperature, in
+          millidegrees Celsius, while the sensor is powered down (the GPU
+          temperature sensors of the M4 Pro read -4 to 4 C while the GPU is
+          off). Such readings are reported as no data instead of as a
+          temperature, and a thermal zone on the sensor skips them.
+
     required:
       - apple,key-id
 
