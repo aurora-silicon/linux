@@ -181,6 +181,12 @@ struct t8140_s2r_mailbox {
 #define HPM_CMD_COLD_RESET	0x64696147
 #define HPM_SSPS_S3		3
 #define HPM_RESET_MS		1000
+#define HPM_PAGE_POWER_STATUS	0x3f
+#define HPM_POWER_CONNECTED	BIT(0)
+#define HPM_POWER_TYPEC_MODE	GENMASK(3, 2)
+#define HPM_POWER_TYPEC_PD	3
+#define HPM_CONTRACT_MS		5000
+#define HPM_RESET_TRIES		3
 
 /* A PMU register write on the sleep's SPMI bus */
 #define SPMI_CMD_WRITE		(BIT(15) | (0xe << 8) | 0x30)
@@ -1737,17 +1743,45 @@ static int t8140_hpm_sleep(struct t8140_sleep *s)
 }
 
 /*
+ * The partner takes the reset as an unplug, attaches again and renegotiates its contract.
+ * Left to finish across the commit, that sometimes failed: neither side had a contract or
+ * saw the other, and no VDM got through until a replug. Returns the ms it took.
+ */
+static int t8140_hpm_wait_contract(struct t8140_sleep *s)
+{
+	bool wake = true;
+	u32 val = 0;
+	int ms, ret;
+
+	for (ms = 0; ms < HPM_CONTRACT_MS; ms += 10) {
+		ret = wake ? t8140_hpm_cmd(s, SPMI_OP_WAKEUP, 0, NULL, NULL) : 0;
+		if (!ret)
+			ret = t8140_hpm_select(s, HPM_PAGE_POWER_STATUS);
+		if (!ret)
+			ret = t8140_hpm_cmd(s, SPMI_OP_EXT_READ(4), HPM_REG_DATA, NULL, &val);
+		if (!ret && (val & HPM_POWER_CONNECTED) &&
+		    FIELD_GET(HPM_POWER_TYPEC_MODE, val) == HPM_POWER_TYPEC_PD)
+			return ms;
+		wake = ret;
+		mdelay(10);
+	}
+
+	return -ETIMEDOUT;
+}
+
+/*
  * The debug link stays up with the ATC0 domains off, and it holds the debug domains
  * active, which macOS has idle. The only known way to end it is the port controller's
  * cold reset. To the SMC that's a cable pulled: it queues the port's events and records
  * them as wake reasons. So it has to come before the SMC's AP idle notice, not after, or
- * SMC.OutboxNotEmpty is up at the commit. tipd rearms the link after a refusal.
+ * SMC.OutboxNotEmpty is up at the commit, and so does the partner's new contract.
+ * tipd rearms the link after a refusal.
  */
 static bool t8140_sleep_usb_down(struct t8140_sleep *s)
 {
 	u32 cmd = HPM_CMD_COLD_RESET;
 	u32 enable;
-	int ret;
+	int i, ret, ms;
 
 	if (s->usb_down_ran)
 		return false;
@@ -1759,16 +1793,27 @@ static bool t8140_sleep_usb_down(struct t8140_sleep *s)
 	dev_info(s->dev, "debug link: cutting it for the sleep\n");
 	enable = readl(s->hpm_spmi + SPMI_NOTIFY_ENABLE);
 	writel(enable & ~SPMI_NOTIFY_REPLY, s->hpm_spmi + SPMI_NOTIFY_ENABLE);
-	ret = t8140_hpm_cmd(s, SPMI_OP_WAKEUP, 0, NULL, NULL);
-	if (!ret)
-		ret = t8140_hpm_select(s, HPM_PAGE_CMD1);
-	if (!ret)
-		ret = t8140_hpm_cmd(s, SPMI_OP_EXT_WRITE(4), HPM_REG_DATA, &cmd, NULL);
-	if (!ret) {
+	/* A reset that the partner doesn't come back from is done again. */
+	for (i = 1; i <= HPM_RESET_TRIES; i++) {
+		ret = t8140_hpm_cmd(s, SPMI_OP_WAKEUP, 0, NULL, NULL);
+		if (!ret)
+			ret = t8140_hpm_select(s, HPM_PAGE_CMD1);
+		if (!ret)
+			ret = t8140_hpm_cmd(s, SPMI_OP_EXT_WRITE(4), HPM_REG_DATA, &cmd, NULL);
+		if (ret)
+			break;
 		WRITE_ONCE(t8140_debug_link_cut, true);
 		mdelay(HPM_RESET_MS);
-		ret = t8140_hpm_sleep(s);
+		ms = t8140_hpm_wait_contract(s);
+		if (ms >= 0) {
+			dev_info(s->dev, "debug link: contract back %d ms after reset %d\n",
+				 HPM_RESET_MS + ms, i);
+			break;
+		}
+		dev_warn(s->dev, "debug link: no contract with the partner after reset %d\n", i);
 	}
+	if (!ret)
+		ret = t8140_hpm_sleep(s);
 	writel(1, s->hpm_spmi + SPMI_NOTIFY_ACK);
 	writel(enable, s->hpm_spmi + SPMI_NOTIFY_ENABLE);
 	s->usb_down_ret = ret;
