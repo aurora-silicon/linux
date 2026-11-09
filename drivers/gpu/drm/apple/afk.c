@@ -783,7 +783,27 @@ afk_compact_match_service(struct apple_dcp_afkep *ep, const char *name)
 		return ops;
 	}
 
+	/* An announcement that filled its field may have lost its end. */
+	if (strlen(name) < AFK_COMPACT_NAME_LEN - 1)
+		return NULL;
+	for (ops = ep->ops; ops->name[0]; ops++)
+		if (afk_compact_cut_of(ops, service_name))
+			return ops;
+
 	return NULL;
+}
+
+/*
+ * Whether @service_name, the part after the role of an announcement that
+ * filled its field, is the firmware's cut of @ops's long name.
+ */
+bool afk_compact_cut_of(const struct apple_epic_service_ops *ops, const char *service_name)
+{
+	size_t len = strlen(service_name);
+
+	return ops->compact_full && len >= AFK_COMPACT_CUT_MIN &&
+	       len < strlen(ops->compact_full) &&
+	       !strncmp(ops->compact_full, service_name, len);
 }
 
 /* A free slot for a newly announced service, or the one it replaces. */
@@ -872,8 +892,8 @@ static void afk_recv_handle_compact_init(struct apple_dcp_afkep *ep,
 			 ep->endpoint, channel);
 		return;
 	}
-	memcpy(wire_name, payload, 32);
-	wire_name[32] = '\0';
+	memcpy(wire_name, payload, AFK_COMPACT_NAME_LEN);
+	wire_name[AFK_COMPACT_NAME_LEN] = '\0';
 	name = strchr(wire_name, ':');
 	name = name ? name + 1 : wire_name;
 	strscpy(service_name, name, sizeof(service_name));

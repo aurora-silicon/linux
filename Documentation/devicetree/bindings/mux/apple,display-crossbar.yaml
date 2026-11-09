@@ -28,6 +28,7 @@ properties:
           - apple,t6041-display-crossbar
           - apple,t8132-display-crossbar
           - apple,t8142-display-crossbar
+          - apple,t6050-display-crossbar
       - items:
           - const: apple,t6050-display-crossbar
           - const: apple,t8142-display-crossbar

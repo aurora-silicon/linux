@@ -15,6 +15,9 @@ struct pmgr_ps_test_reg {
 	bool parent_read_error;
 	unsigned int busy_writes;
 	unsigned int auto_writes;	/* writes that enabled automatic PM */
+	bool latched;		/* bit 11 latched: on stops at clock-gated, off still reaches 0 */
+	bool latch_sticky;	/* not even a PS reset clears it */
+	unsigned int reset_writes;	/* writes with the PS reset bit */
 };
 
 static int pmgr_ps_test_read(void *ctx, unsigned int reg, unsigned int *val)
@@ -43,6 +46,19 @@ static int pmgr_ps_test_write(void *ctx, unsigned int reg, unsigned int val)
 	u32 parent = r->val & APPLE_PMGR_BUSY;
 	u32 actual;
 
+	if (val & APPLE_PMGR_PS_RESET) {
+		r->reset_writes++;
+		if (r->latched && !r->latch_sticky) {
+			r->latched = false;
+			parent = 0;
+		}
+	}
+	if (r->latched) {
+		actual = FIELD_GET(APPLE_PMGR_PS_TARGET, val) ? APPLE_PMGR_PS_CLKGATE : 0;
+		r->val = (val & ~(APPLE_PMGR_PS_ACTUAL | APPLE_PMGR_BUSY)) | APPLE_PMGR_BUSY |
+			 FIELD_PREP(APPLE_PMGR_PS_ACTUAL, actual);
+		return 0;
+	}
 	if (FIELD_GET(APPLE_PMGR_PS_TARGET, val) == APPLE_PMGR_PS_ACTIVE &&
 	    (r->parent_stuck || r->parent_reads))
 		parent = APPLE_PMGR_BUSY;
@@ -261,6 +277,73 @@ static void pmgr_ps_power_on_sleep_stuck_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_PMGR_PS_TARGET, r->val), APPLE_PMGR_PS_ACTIVE);
 }
 
+/*
+ * A latched bit 11 (T8140 ANE_SYS after sleep: 0x2b4f) is cleared by a PS reset
+ * while the domain is off, and the power-on then completes.
+ */
+static void pmgr_ps_power_on_latch_cleared_test(struct kunit *test)
+{
+	struct pmgr_ps_test_reg *r;
+	struct apple_pmgr_ps *ps;
+
+	ps = pmgr_ps_test_domain(test, APPLE_PMGR_PS_PWRGATE, false, &r);
+	r->latched = true;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_power_on(&ps->genpd), 0);
+	KUNIT_EXPECT_EQ(test, r->reset_writes, 1U);
+	KUNIT_EXPECT_FALSE(test, r->val & (APPLE_PMGR_BUSY | APPLE_PMGR_PS_RESET));
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_PMGR_PS_TARGET, r->val), APPLE_PMGR_PS_ACTIVE);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_PMGR_PS_ACTUAL, r->val), APPLE_PMGR_PS_ACTIVE);
+	KUNIT_EXPECT_EQ(test, r->auto_writes, 1U);
+}
+
+/* The same in the noirq phase of a system sleep, where genpd ignores errors. */
+static void pmgr_ps_power_on_latch_sleep_test(struct kunit *test)
+{
+	struct pmgr_ps_test_reg *r;
+	struct apple_pmgr_ps *ps;
+
+	ps = pmgr_ps_test_domain(test, APPLE_PMGR_PS_PWRGATE, true, &r);
+	ps->system_sleep = true;
+	r->latched = true;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_power_on(&ps->genpd), 0);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_PMGR_PS_ACTUAL, r->val), APPLE_PMGR_PS_ACTIVE);
+	KUNIT_EXPECT_EQ(test, r->auto_writes, 0U);
+}
+
+/* A latch the reset does not clear still fails, and the domain is requested off. */
+static void pmgr_ps_power_on_latch_sticky_test(struct kunit *test)
+{
+	struct pmgr_ps_test_reg *r;
+	struct apple_pmgr_ps *ps;
+
+	ps = pmgr_ps_test_domain(test, APPLE_PMGR_PS_PWRGATE, true, &r);
+	r->latched = true;
+	r->latch_sticky = true;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_power_on(&ps->genpd), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, r->reset_writes, 1U);
+	KUNIT_EXPECT_FALSE(test, r->val & APPLE_PMGR_PS_RESET);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_PMGR_PS_TARGET, r->val), APPLE_PMGR_PS_PWRGATE);
+	KUNIT_EXPECT_EQ(test, r->auto_writes, 0U);
+}
+
+/* No PS reset where bit 11 means a parent not up yet, nor on a plain stall. */
+static void pmgr_ps_power_on_no_reset_test(struct kunit *test)
+{
+	struct pmgr_ps_test_reg *r;
+	struct apple_pmgr_ps *ps;
+
+	ps = pmgr_ps_test_domain(test, APPLE_PMGR_PS_PWRGATE, false, &r);
+	ps->wait_parent = true;
+	r->latched = true;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_power_on(&ps->genpd), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, r->reset_writes, 0U);
+
+	ps = pmgr_ps_test_domain(test, APPLE_PMGR_PS_PWRGATE, true, &r);
+	r->stuck = true;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_power_on(&ps->genpd), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, r->reset_writes, 0U);
+}
+
 static struct kunit_case pmgr_ps_test_cases[] = {
 	KUNIT_CASE(pmgr_ps_power_on_test),
 	KUNIT_CASE(pmgr_ps_power_off_undo_test),
@@ -272,6 +355,10 @@ static struct kunit_case pmgr_ps_test_cases[] = {
 	KUNIT_CASE(pmgr_ps_power_on_parent_only_test),
 	KUNIT_CASE(pmgr_ps_power_on_parent_read_error_test),
 	KUNIT_CASE(pmgr_ps_power_on_sleep_stuck_test),
+	KUNIT_CASE(pmgr_ps_power_on_latch_cleared_test),
+	KUNIT_CASE(pmgr_ps_power_on_latch_sleep_test),
+	KUNIT_CASE(pmgr_ps_power_on_latch_sticky_test),
+	KUNIT_CASE(pmgr_ps_power_on_no_reset_test),
 	{}
 };
 

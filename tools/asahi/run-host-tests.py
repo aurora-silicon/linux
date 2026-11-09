@@ -87,7 +87,7 @@ ASAHI_TESTS = {
     'brcmf-bss-tests.py': [(out(), PASS)],
     # The old revision reports a failed join against the last associated BSS.
     'brcmf-join-bssid-tests.py': [(out(), PASS)]
-        + mutations('--mutation', ('stale-target', 'zero-named', 'no-call'), out()),
+        + mutations('--mutation', ('stale-target', 'zero-named', 'no-call', 'lost-bss-success'), out()),
     'brcmf-pcie-dma-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('narrow-stream', 'ignore-aperture', 'revision-wide'), out('--output')),
     'brcmf-roam-tests.py': [(out(), PASS)],

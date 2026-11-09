@@ -13,6 +13,7 @@
 #include <linux/kref.h>
 #include <linux/module.h>
 #include <linux/of_device.h>
+#include <linux/power_supply.h>
 #include <linux/ratelimit.h>
 #include <linux/slab.h>
 #include <linux/sched.h>
@@ -47,6 +48,63 @@ struct dcp_identity_trace {
 	struct apple_dcp *dcp;
 	atomic_t *count;
 };
+
+/*
+ * DCP asks the AP for "PMUS"/"Temperature" once at start-up and uses it as
+ * the initial panel temperature when no 2D panel temperature has been set.
+ * macOS answers with the system battery's gas gauge temperature in units of
+ * 0.1 K (the AppleSmartBattery "Temperature" property, the SMC B0AT key);
+ * the firmware takes off 273.2 K itself. Observed on the J700 under macOS
+ * 26.6: a reply of 2997 gave an InitialPanelTemperature of 26.5 C, equal to
+ * the battery temperature at that boot.
+ *
+ * Linux power supplies report temperature in 0.1 C, so add the 273.2 K back.
+ */
+struct dcp_battery_temp {
+	u64 value;
+	bool found;
+};
+
+static int dcp_battery_temp_cb(struct power_supply *psy, void *data)
+{
+	struct dcp_battery_temp *bt = data;
+	union power_supply_propval val;
+
+	if (psy->desc->type != POWER_SUPPLY_TYPE_BATTERY)
+		return 0;
+	if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_SCOPE, &val) &&
+	    val.intval == POWER_SUPPLY_SCOPE_DEVICE)
+		return 0;
+	if (power_supply_get_property(psy, POWER_SUPPLY_PROP_TEMP, &val))
+		return 0;
+	if (val.intval <= -2732)
+		return 0;
+
+	bt->value = val.intval + 2732;
+	bt->found = true;
+	return 1;
+}
+
+u64 dcp_pmu_temperature(struct device *dev)
+{
+	struct dcp_battery_temp bt = { 0 };
+
+	if (IS_REACHABLE(CONFIG_POWER_SUPPLY))
+		power_supply_for_each_psy(&bt, dcp_battery_temp_cb);
+
+	if (bt.found) {
+		dev_dbg(dev, "PMU temperature from the battery: %llu (0.1 K)\n",
+			bt.value);
+		return bt.value;
+	}
+
+	/*
+	 * No system battery (desktops, or the battery driver is not bound):
+	 * keep the reply Linux has always sent, 302.9 K.
+	 */
+	dev_dbg(dev, "no system battery, PMU temperature fallback\n");
+	return DCP_PMU_TEMPERATURE_FALLBACK;
+}
 
 /*
  * set_matrix coefficients for @ctm, the identity when @ctm is NULL. DRM
@@ -939,6 +997,34 @@ void dcp_push(struct apple_dcp *dcp, bool oob,
 
 	dcp_push_context(dcp, dcp_call_context(dcp, oob), call,
 			 in_len, out_len, data, cb, cookie);
+}
+
+/*
+ * Push one command on the independent OOB command stream while a transaction
+ * on the command stream is still pending (dcp_push() would queue it behind
+ * that transaction). For queries the firmware serves concurrently, such as a
+ * paired modeset's DSC handoff while the primary's A413 waits for its peer.
+ */
+int dcp_push_oob_concurrent(struct apple_dcp *dcp, const struct dcp_method_entry *call,
+			    u32 in_len, u32 out_len, void *data, dcp_callback_t cb,
+			    void *cookie)
+{
+	int ret = 0;
+
+	mutex_lock(&dcp->iomfb.lock);
+	if (READ_ONCE(dcp->crashed) || dcp->iomfb.stopped) {
+		ret = -ESHUTDOWN;
+	} else if (dcp->ch_oobcmd.depth || dcp->ch_oobcb.depth || dcp->ch_oobasync.depth ||
+		   READ_ONCE(dcp->iomfb.owner)) {
+		ret = -EBUSY;
+	} else {
+		WRITE_ONCE(dcp->iomfb.owner, current);
+		dcp_push_context(dcp, dcp_call_context(dcp, true), call,
+				 in_len, out_len, data, cb, cookie);
+		WRITE_ONCE(dcp->iomfb.owner, NULL);
+	}
+	mutex_unlock(&dcp->iomfb.lock);
+	return ret;
 }
 
 /* A nested query must return on the firmware-initiated stream it answers. */

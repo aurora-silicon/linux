@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: GPL-2.0-only OR MIT */
 
-/* Bring-up gate until the framebuffer merge lifecycle is implemented. This
- * only reserves an otherwise unrouted DCP; it never replaces a physical route.
+/* Logical peer allocation for a merged mode. This only reserves an otherwise
+ * unrouted DCP; it never replaces a physical route.
  */
-static bool peer_allocation_probe;
+static bool peer_allocation_probe = true;
 module_param(peer_allocation_probe, bool, 0444);
-MODULE_PARM_DESC(peer_allocation_probe, "Test firmware27 logical peer allocation (merge bring-up)");
+MODULE_PARM_DESC(peer_allocation_probe, "Firmware27 logical peer allocation for merged modes (default: on)");
 
 bool dcp_peer_tiling_state_v27(struct apple_dcp *dcp, bool write,
 			      u32 event, u32 param, u32 *value)

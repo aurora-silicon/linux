@@ -18,9 +18,19 @@ static int combo_poll(void *ctx, unsigned int bank, unsigned int offset,
 {
 	struct t6050_dp *dp = ctx;
 	u32 value;
-	return readl_poll_timeout(dp->banks[bank] + offset, value,
+	int ret = readl_poll_timeout(dp->banks[bank] + offset, value,
 		(value & mask) == expected,
 		(bank == 44 || bank == 35 || usec <= 1000) ? 1 : 1000, usec);
+
+	/* The PIPE switch carries on without the lock ACK; say so. */
+	if (ret && bank == 44 && offset == 0x14 && usec == 6000)
+		dev_warn(dp->dev,
+			 "PIPE %slock not acknowledged; continuing (override=%x values=%x mux=%x req=%x ack=%x aon=%x nonsel=%x)\n",
+			 expected ? "" : "un", readl(dp->banks[44]),
+			 readl(dp->banks[44] + 4), readl(dp->banks[44] + 0xc),
+			 readl(dp->banks[44] + 0x10), value,
+			 readl(dp->banks[44] + 0x1c), readl(dp->banks[44] + 0x20));
+	return ret;
 }
 static void combo_delay(void *ctx, unsigned int usec) { udelay(usec); }
 static void combo_pause(void *ctx, unsigned int nsec) { ndelay(nsec); }
@@ -44,6 +54,11 @@ static int combo_tunable(void *ctx, unsigned int bank, const char *name)
 		{8, 8, "tunable_AUSPLL_CORE"}, {5, 9, "tunable_AUS40CMN_SHM"},
 		{10, 10, "tunable_CIO4PLL_CORE"},
 	};
+	static const struct { u8 bank, index; const char *name; } cio[] = {
+		{3, 0, "tunable_UC_REGS_CIO_DFLT"}, {16, 1, "tunable_LN0_RX_TOP_CIO_DFLT"},
+		{25, 2, "tunable_LN1_RX_TOP_CIO_DFLT"}, {18, 3, "tunable_LN0_RX_EQ_CIO_DFLT"},
+		{27, 4, "tunable_LN1_RX_EQ_CIO_DFLT"},
+	};
 	struct t6050_dp *dp = ctx;
 
 	if (bank == 0 && !strcmp(name, "tunable_USB2PHY_DFLT")) {
@@ -59,6 +74,12 @@ static int combo_tunable(void *ctx, unsigned int bank, const char *name)
 			apple_tunable_apply(dp->banks[bank], dp->tunables[common[i].index]);
 			return 0;
 		}
+	/* A missing CIO80 tunable is skipped. */
+	for (unsigned int i = 0; i < ARRAY_SIZE(cio); i++)
+		if (bank == cio[i].bank && !strcmp(name, cio[i].name)) {
+			apple_tunable_apply(dp->banks[bank], dp->cio_tunables[cio[i].index]);
+			return 0;
+		}
 	return -EINVAL;
 }
 
@@ -71,6 +92,10 @@ static int combo_quiesce(void *ctx)
 		ret = APPLE_T6050_USB_RUN(&dp->usb_platform, apple_t6050_usb3_shutdown);
 		if (!ret)
 			dp->usb_prepared = false;
+	} else if (dp->cio_prepared) {
+		ret = APPLE_T6050_USB_RUN(&dp->usb_platform, apple_t6050_cio_shutdown);
+		if (!ret)
+			dp->cio_prepared = false;
 	} else if (dp->enabled) {
 		/* Multifunction has a distinct native shutdown; never run the
 		 * USB-only analog sequence over live DisplayPort lane state. */
@@ -97,6 +122,8 @@ static int combo_stop(struct t6050_dp *dp)
 	lockdep_assert_held(&dp->lock);
 	if (dp->faulted)
 		return -EIO;
+	/* No tunnel clock outlives USB4 mode. */
+	atc_dp_tunnels_stop(dp);
 	if (dp->controller_active || dp->pipe_active)
 		return -EBUSY;
 	ret = combo_quiesce(dp);
@@ -148,6 +175,21 @@ static int combo_start(struct t6050_dp *dp, enum combo_mode mode)
 			APPLE_T6050_USB_RUN(&dp->usb_platform, apple_t6050_usb3_init_normal);
 		if (!ret)
 			dp->usb_prepared = true;
+	} else if (!ret && mode == COMBO_CIO) {
+		ktime_t start = ktime_get();
+
+		/* USB2 stays native beside a USB4/TBT link; USB3 comes tunnelled. */
+		ret = dp->reverse ?
+			APPLE_T6050_USB_RUN(&dp->usb_platform, apple_t6050_cio_init_reverse) :
+			APPLE_T6050_USB_RUN(&dp->usb_platform, apple_t6050_cio_init_normal);
+		if (!ret) {
+			dp->cio_prepared = true;
+			atc_dp_tunnels_park(dp);
+		}
+		dev_info(dp->dev, "CIO mode %s (%d), %s orientation, %lld ms\n",
+			 ret ? "failed" : "up: UC_TNBL_DONE", ret,
+			 dp->reverse ? "reverse" : "normal",
+			 ktime_ms_delta(ktime_get(), start));
 	} else if (!ret) {
 		dp->multifunction = mode == COMBO_DP2;
 		ret = atc_start(dp);
@@ -191,6 +233,11 @@ static int combo_mux(struct t6050_dp *dp, struct typec_mux_state *state)
 		mode = COMBO_SAFE;
 	else if (state->mode == TYPEC_STATE_USB && !state->alt)
 		mode = COMBO_USB;
+	else if (!state->alt && state->mode == TYPEC_MODE_USB4)
+		mode = COMBO_CIO;
+	else if (state->alt && state->alt->svid == USB_TYPEC_TBT_SID &&
+		 state->mode == TYPEC_TBT_MODE)
+		mode = COMBO_CIO;
 	else if (state->alt && state->alt->svid == USB_TYPEC_DP_SID) {
 		switch (state->mode) {
 		case TYPEC_DP_STATE_C:
@@ -205,7 +252,7 @@ static int combo_mux(struct t6050_dp *dp, struct typec_mux_state *state)
 	if (dp->faulted)
 		return -EIO;
 	if (mode == dp->combo_mode &&
-	    (mode == COMBO_SAFE || dp->usb_prepared || dp->enabled))
+	    (mode == COMBO_SAFE || dp->usb_prepared || dp->cio_prepared || dp->enabled))
 		return 0;
 	if (mode != COMBO_SAFE && dp->orientation == TYPEC_ORIENTATION_NONE)
 		return -ENOLINK;
@@ -225,7 +272,7 @@ static int combo_usb2_mode(struct phy *phy, enum phy_mode mode, int submode)
 		return -EIO;
 	if (mode != PHY_MODE_USB_HOST)
 		return -EOPNOTSUPP;
-	if (!dp->usb_prepared && !dp->enabled)
+	if (!dp->usb_prepared && !dp->cio_prepared && !dp->enabled)
 		return -ENOLINK;
 	if (dp->usb2_active)
 		return 0;
@@ -255,6 +302,34 @@ static int combo_usb2_reset(struct phy *phy)
 	return ret ? -EIO : 0;
 }
 
+/* A tunnelled PIPE leaves the CIO PHY to the router: nothing to quiesce on the PHY side. */
+static int combo_pipe_keep(void *ctx)
+{
+	return 0;
+}
+
+/*
+ * In CIO mode the lanes carry USB4/TBT and USB3 reaches DWC3 through the router's USB3 adapter:
+ * move DWC3 from its dummy PIPE producer to the tunnel producer, as is done on the older PHYs.
+ */
+static int combo_pipe_tunnel(struct t6050_dp *dp)
+{
+	int ret;
+
+	lockdep_assert_held(&dp->lock);
+	if (dp->pipe_active)
+		return dp->pipe_tunnel ? 0 : -EBUSY;
+	ret = apple_t6050_usb3_pipe_tunnel(&dp->usb_io);
+	if (ret) {
+		combo_pipe_fault(dp, "USB3 tunnel PIPE switch", ret);
+		return -EIO;
+	}
+	dp->pipe_active = true;
+	dp->pipe_tunnel = true;
+	dev_info(dp->dev, "USB3 PIPE on the USB4 tunnel\n");
+	return 0;
+}
+
 static int combo_usb3_mode(struct phy *phy, enum phy_mode mode, int submode)
 {
 	struct t6050_dp *dp = phy_get_drvdata(phy);
@@ -271,6 +346,8 @@ static int combo_usb3_mode(struct phy *phy, enum phy_mode mode, int submode)
 	 * uses its independent D+/D- PHY. Do not switch USB3 onto DP lanes. */
 	if (dp->combo_mode == COMBO_DP4 && dp->enabled)
 		return 0;
+	if (dp->combo_mode == COMBO_CIO && dp->cio_prepared)
+		return combo_pipe_tunnel(dp);
 	if (!dp->usb_prepared && !(dp->combo_mode == COMBO_DP2 && dp->enabled))
 		return -ENOLINK;
 	if (dp->pipe_active)
@@ -300,7 +377,10 @@ static int combo_usb3_poweroff(struct phy *phy)
 	/* DWC3 calls power_off only after host/gadget shutdown and SUSPHY.
 	 * PIPE must select its dummy producer before the controller is reset. */
 	if (dp->pipe_active) {
-		ret = apple_t6050_usb3_pipe_stop(&dp->usb_io, combo_quiesce, dp);
+		ret = apple_t6050_usb3_pipe_stop(&dp->usb_io,
+						 dp->pipe_tunnel ? combo_pipe_keep : combo_quiesce, dp);
+		if (!ret)
+			dp->pipe_tunnel = false;
 		if (!ret)
 			dp->pipe_active = false;
 	}
@@ -380,6 +460,12 @@ static struct phy *combo_xlate(struct device *dev, const struct of_phandle_args 
 
 static int combo_setup(struct platform_device *pdev, struct t6050_dp *dp)
 {
+	/* Same order as the cio[] table in combo_tunable(). */
+	static const struct { u8 bank; const char *name; } cio_tunables[] = {
+		{3, "apple,tunable-uc-regs-cio"}, {16, "apple,tunable-lane0-rx-top-cio"},
+		{25, "apple,tunable-lane1-rx-top-cio"}, {18, "apple,tunable-lane0-rx-eq-cio"},
+		{27, "apple,tunable-lane1-rx-eq-cio"},
+	};
 	static const struct { u8 bank; u32 minimum; const char *name; } extra[] = {
 		{0, 0x20, "usb2phy"}, {1, 0x24, "usb2-digital"}, {44, 0x48, "pipehandler"},
 	};
@@ -407,6 +493,14 @@ static int combo_setup(struct platform_device *pdev, struct t6050_dp *dp)
 		"apple,tunable-pipe-default", &dp->resources[44]);
 	if (IS_ERR(dp->pipe_default))
 		return PTR_ERR(dp->pipe_default);
+	for (unsigned int i = 0; i < ARRAY_SIZE(cio_tunables); i++) {
+		struct apple_tunable *t = devm_apple_tunable_parse(dev, dev->of_node,
+			cio_tunables[i].name, &dp->resources[cio_tunables[i].bank]);
+
+		if (IS_ERR(t) && PTR_ERR(t) != -ENOENT)
+			return PTR_ERR(t);
+		dp->cio_tunables[i] = IS_ERR(t) ? NULL : t;
+	}
 	dp->usb_io = (struct apple_t6050_usb_io) {
 		.context = dp, .read = combo_read, .write = combo_write,
 		.poll = combo_poll, .delay = combo_delay,
@@ -430,3 +524,4 @@ static int combo_setup(struct platform_device *pdev, struct t6050_dp *dp)
 	}
 	return 0;
 }
+

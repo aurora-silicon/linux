@@ -100,6 +100,11 @@ struct tb_nhi_ring_layout {
  *			      meanwhile, so the tunnel is kept instead of being
  *			      torn down at the DPRX timeout. Called with the
  *			      domain lock held.
+ * @add_links: NHI specific hook that makes the native ports tunneled
+ *	       through this host (PCIe) resume after the NHI, like the device
+ *	       links tb_acpi_add_links() creates from firmware tables. Returns
+ *	       %true if the host orders all of its tunneled native ports, so
+ *	       none is left without a link.
  * @is_present: Whether the device is currently present on the parent bus
  * @init_interrupts: NHI specific interrupt initialization hook
  * @reset_interface: Resets the host interface
@@ -127,6 +132,7 @@ struct tb_nhi_ops {
 				       struct tb_port *out, u64 generation);
 	void (*dp_tunnel_deactivate)(struct tb_nhi *nhi, struct tb_port *in,
 				     struct tb_port *out, u64 generation);
+	bool (*add_links)(struct tb_nhi *nhi);
 	bool (*is_present)(struct tb_nhi *nhi);
 	void (*dp_tunnel_changed)(struct tb_nhi *nhi, u8 in_port, u64 generation, bool active);
 	bool (*dp_tunnel_awaits_display)(struct tb_nhi *nhi, struct tb_port *in);
@@ -216,6 +222,15 @@ struct tb_nhi_ops {
 #define QUIRK_KEEP_TUNNELS				BIT(7)
 /* The links of the host router must not enter CL states. */
 #define QUIRK_NO_HOST_CLX				BIT(8)
+/* The links of the domain must stay symmetric. */
+#define QUIRK_NO_ASYM					BIT(9)
+/* Gen4 links of the domain run with link recovery enabled on both ends. */
+#define QUIRK_GEN4_LINK_RECOVERY			BIT(10)
+/*
+ * The host router's firmware runs its TMU, and enhanced uni-directional
+ * mode takes the host's own constants, see tmu.c.
+ */
+#define QUIRK_HOST_TMU					BIT(11)
 
 /* Host display policies are independent of which optional hooks are installed. */
 #define TB_HOST_DP_NOTIFY		BIT(0)
