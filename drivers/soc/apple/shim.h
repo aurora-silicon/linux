@@ -31,6 +31,7 @@ int sep_pm_register(void *dev, void (*event)(bool entering), int (*sleep)(void),
 void sep_pm_unregister(void);
 int sep_pm_keep_domains(void *dev);
 int sep_pm_wait_gated(void *dev, unsigned int timeout_ms);
+int sep_pm_wait_off(void *dev, unsigned int timeout_ms);
 int sep_pm_clear_dev_disable(void *dev);
 int sep_pm_dart_prepare(void *dev);
 void sep_pm_dart_restore(void *dev);

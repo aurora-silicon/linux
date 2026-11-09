@@ -1408,8 +1408,18 @@ impl SepData {
             return Err(EBUSY);
         }
 
-        if self.sleep_leave_for_commit() {
-            return Ok(());
+        match self.sleep_leave_for_commit() {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => {
+                dev_err!(
+                    self.dev,
+                    "sleep refused: its last refusal could not be armed ({:?})\n",
+                    e
+                );
+                self.set_sleep_gate(pm::SleepGate::Open);
+                return Err(e);
+            }
         }
 
         if let Err(e) = pm::dart_prepare(&self.dev) {
@@ -1439,10 +1449,10 @@ impl SepData {
     }
 
     /// Where the sleep driver takes it, the request goes out as its very last refusal, with
-    /// interrupts off: a gated enclave comes back only through a real sleep, so any earlier
-    /// refusal has to find it never told. Its answer is polled there, so the receive
+    /// interrupts off: a gated enclave has to be started again, so any earlier refusal should
+    /// find it never told. Its answer is polled there, so the receive
     /// interrupt is held from now on. The gate stays at draining until the wake.
-    fn sleep_leave_for_commit(&self) -> bool {
+    fn sleep_leave_for_commit(&self) -> Result<bool> {
         let request = proto::encode_control(&proto::op_sleep(), proto::TAG_SLEEP);
         let left = match self.mbox.lock().as_ref() {
             Some(mbox) => pm::leave_for_commit(
@@ -1452,13 +1462,13 @@ impl SepData {
                 proto::SLEEP_REPLY,
                 proto::SLEEP_REPLY_MASK,
             ),
-            None => false,
-        };
+            None => Err(ENODEV),
+        }?;
         if left {
             self.sleep_hold_rx();
             dev_dbg!(self.dev, "the sleep request is left for the sleep's last refusal\n");
         }
-        left
+        Ok(left)
     }
 
     /// Holds off the receive interrupt, whose handler reads the mailbox.
@@ -1481,12 +1491,12 @@ impl SepData {
     /// Back from a sleep, or a suspend that was aborted. The enclave has kept
     /// its state and takes no new endpoint setup.
     ///
-    /// Reading the mailbox of a gated enclave can stall the CPU for good, so only
-    /// the power cycle of a real sleep ends one. A sleep refused after the request,
-    /// which only the request itself can do where the sleep driver sends it, leaves
-    /// the enclave asleep, and requests fail until the next real sleep or a reboot.
-    /// If it never gated it was never stopped, and a doorbell would reach an
-    /// endpoint: ask it something instead.
+    /// Reading the mailbox of a gated enclave can stall the CPU for good, so it's
+    /// touched only once the enclave is started again. macOS starts an enclave that
+    /// took its sleep request the same way whether the system slept or not, so a
+    /// sleep refused after the enclave gated starts it as a real sleep does, once its
+    /// domain reads off. If it never gated it was never stopped, and a doorbell would
+    /// reach an endpoint: ask it something instead.
     pub(crate) fn sleep_exit(&self) {
         // Left to the sleep's last refusal: told only if it went out.
         match pm::commit_finish(&self.dev) {
@@ -1509,17 +1519,16 @@ impl SepData {
         }
         let answered = if real {
             self.sleep_kick()
-        } else if pm::wait_gated(&self.dev) {
-            self.sleep_hold_rx();
-            self.set_sleep_gate(pm::SleepGate::Lost);
-            dev_warn!(
-                self.dev,
-                "the enclave stays asleep until the next real sleep or a reboot\n"
-            );
-            return;
         } else {
-            dev_warn!(self.dev, "the enclave never gated its power domain\n");
-            self.sleep_probe()
+            match pm::wait_gated(&self.dev) {
+                Ok(true) => self.sleep_restart(),
+                Ok(false) => {
+                    dev_warn!(self.dev, "the enclave did not gate within the timeout\n");
+                    self.sleep_probe()
+                }
+                // Without a domain observation, do not touch the mailbox.
+                Err(e) => Err(e),
+            }
         };
         match answered {
             Ok(()) => {
@@ -1528,11 +1537,25 @@ impl SepData {
                 dev_info!(self.dev, "the enclave is back from its sleep request\n");
             }
             Err(e) => {
-                dev_err!(self.dev, "the enclave did not come back ({:?}); it stays unused\n", e);
+                dev_err!(
+                    self.dev,
+                    "the enclave did not come back ({:?}); it stays unused until the next real sleep or a reboot\n",
+                    e
+                );
                 self.sleep_hold_rx();
                 self.set_sleep_gate(pm::SleepGate::Lost);
             }
         }
+    }
+
+    /// Starts an enclave that gated in a sleep that was refused, once its domain is off.
+    fn sleep_restart(&self) -> Result<()> {
+        if !pm::wait_off(&self.dev)? {
+            dev_warn!(self.dev, "the enclave gated, but its domain stayed on\n");
+            return Err(ETIMEDOUT);
+        }
+        dev_info!(self.dev, "the sleep was refused after the enclave gated: starting it again\n");
+        self.sleep_kick()
     }
 
     /// Starts a gated enclave and waits for the messages that say it's up.

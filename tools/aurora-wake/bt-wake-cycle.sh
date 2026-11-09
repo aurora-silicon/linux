@@ -17,9 +17,21 @@
 
 set -u
 
+# The PMU RTC, which can wake the system: rtc0 on J700, rtc1 on others.
+pmu_rtc() {
+	local name
+	for name in /sys/class/rtc/rtc*/name; do
+		[[ $(cat "$name" 2> /dev/null) == apple-pmu-rtc* ]] || continue
+		name=${name%/name}
+		echo "${name##*/}"
+		return
+	done
+	echo rtc0
+}
+
 mode=
 secs=120
-rtc=rtc1
+rtc=$(pmu_rtc)
 addr=
 out=/var/tmp/bt-wake/cycle-$(date +%Y%m%d-%H%M%S)
 bdf=0000:01:00.1

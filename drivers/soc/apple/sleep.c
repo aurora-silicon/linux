@@ -863,6 +863,12 @@ bool apple_sleep_coproc_stopped(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_coproc_stopped);
 
+bool apple_sleep_commit_stops_coprocs(void)
+{
+	return READ_ONCE(t8140_sleep) && pm_suspend_via_firmware();
+}
+EXPORT_SYMBOL_GPL(apple_sleep_commit_stops_coprocs);
+
 /*
  * The last thing that can fail on the way to the commit: no CPU but this one is up and
  * interrupts are off, so no lock can be held. A coprocessor stopped here comes back only
@@ -930,7 +936,7 @@ static int apple_sleep_cpus_hold(struct apple_sleep *s)
 	return ret;
 }
 
-/* Last of all the refusals: an enclave that gated comes back only through a real sleep. */
+/* Last of all the refusals: an enclave that gated has to be started again. */
 static int apple_sleep_enclave_tell(struct apple_sleep *s)
 {
 	int ret;

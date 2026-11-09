@@ -325,6 +325,12 @@ err:
 	return ERR_PTR(ret);
 }
 
+/* Whether only the sleep's commit may stop the GPU: then nothing else may. */
+bool asahi_g17_commit_required(void)
+{
+	return apple_sleep_commit_stops_coprocs();
+}
+
 /*
  * After the sleep, refused or not: whether the commit stopped the GPU, and in @saved the
  * domain's word from before, if it did. Frees @c.

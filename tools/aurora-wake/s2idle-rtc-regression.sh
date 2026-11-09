@@ -3,7 +3,7 @@
 #
 # Unattended suspend-to-idle regression test for Apple silicon (J700 and others).
 #
-# Suspends with an RTC alarm (rtc1, apple-pmu-rtc, by default) several times and
+# Suspends with an RTC alarm (apple-pmu-rtc by default) several times and
 # checks after every resume that:
 #  - the time actually spent suspended (CLOCK_BOOTTIME minus CLOCK_MONOTONIC)
 #    lasted until the alarm: no spurious wakeup, e.g. from a running xHC,
@@ -24,9 +24,21 @@
 
 set -u
 
+# The PMU RTC, which can wake the system: rtc0 on J700, rtc1 on others.
+pmu_rtc() {
+	local name
+	for name in /sys/class/rtc/rtc*/name; do
+		[[ $(cat "$name" 2> /dev/null) == apple-pmu-rtc* ]] || continue
+		name=${name%/name}
+		echo "${name##*/}"
+		return
+	done
+	echo rtc0
+}
+
 cycles=3
 secs=20
-rtc=rtc1
+rtc=$(pmu_rtc)
 out=
 ignore=
 dry_run=0

@@ -209,6 +209,11 @@ static int apple_pmp_suspend_late(struct device *dev)
 	if (pmp_device != dev || pmp_asleep)
 		return 0;
 	at_commit = apple_pmp_commit_available(dev);
+	/* Idled any earlier, a refusal after it would leave it stopped. */
+	if (!at_commit && apple_sleep_commit_stops_coprocs()) {
+		dev_err(dev, "no stop at the sleep's commit: refusing the sleep\n");
+		return -EBUSY;
+	}
 	apple_pmp_report_sleep(dev, at_commit);
 	ret = at_commit ? apple_pmp_commit_prepare(dev) : apple_pmp_sleep(pmp_data);
 	if (ret) {

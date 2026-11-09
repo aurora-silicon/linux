@@ -113,7 +113,8 @@ int main(void) {
               'static inline int apple_sleep_coproc_register(struct device *d, void __iomem *a, bool p,\n'
               '\t\t\t\t\t      int (*f)(void *), void *x) { assert(!"no system sleep here"); return -EIO; }\n'
               'static inline void apple_sleep_coproc_set_ready(struct device *d, bool r) { assert(!"no system sleep here"); }\n'
-              'static inline bool apple_sleep_coproc_stopped(struct device *d) { assert(!"no system sleep here"); return false; }\n')
+              'static inline bool apple_sleep_coproc_stopped(struct device *d) { assert(!"no system sleep here"); return false; }\n'
+              'static inline bool apple_sleep_commit_stops_coprocs(void) { assert(!"no system sleep here"); return false; }\n')
         write(tmp, 'linux/soc/apple/pmp-display.h', '#include <stdbool.h>\nbool apple_pmp_display_retained_board(void);\n')
         write(tmp, 'mock.h', '''#pragma once
 #include <assert.h>
