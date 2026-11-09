@@ -195,7 +195,7 @@ lifecycle, with a separate compact service binding on endpoint 0x2b. Endpoint
 service; the internal panel does not acquire an audio client. With its role
 prefix the compact announcement does not fit its 32-byte field and arrives cut
 to 31 characters without the unit; such a cut of at least 20 characters is
-admitted as unit zero. The existing ``hdmi_audio`` opt-in still controls
+admitted as unit zero. ``hdmi_audio`` (on by default; 0 turns it off) controls
 service startup.
 
 A PCM opens and pins one service instance. Prepare, Start, Stop and Complete

@@ -8,7 +8,7 @@
  * firmware, and the boot loader enables the node once it has reserved that
  * firmware and published the T6041 boot tables (it finds it by the alias).
  * Without a T6041-aware loader DPA1 waits for its DMA channel and nothing
- * else changes. The DCP side starts only with appledrm.hdmi_audio=1.
+ * else changes. The DCP side starts unless appledrm.hdmi_audio=0.
  * DPA2 (DCPEXT1, SIO channel 0x68) stays disabled until it is qualified.
  */
 

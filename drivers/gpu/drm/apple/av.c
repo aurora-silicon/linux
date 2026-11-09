@@ -1069,7 +1069,7 @@ int avep_init(struct apple_dcp *dcp)
 	 * Only a processor whose port@0 links an audio device has DP/HDMI
 	 * audio to start. Look before the firmware: a processor without one
 	 * (an internal panel's, or one whose firmware has no audio service
-	 * here, such as H17P) stays as it is without hdmi_audio, quietly.
+	 * here, such as H17P) stays as it is, quietly.
 	 */
 	endpoint = of_graph_get_endpoint_by_regs(dev->of_node, 0, 0);
 	if (endpoint) {
