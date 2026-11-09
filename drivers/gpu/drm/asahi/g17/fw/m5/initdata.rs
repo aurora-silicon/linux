@@ -2681,6 +2681,12 @@ impl Board {
         self.completion_inputs
     }
 
+    /// Whether this is the J813, whose register programs macOS 27.0 writes in the common 26A428
+    /// forms rather than the M5 Pro's (read out of its own kicks under aura).
+    pub(crate) const fn j813_forms(&self) -> bool {
+        self.chip_id == 0x8142
+    }
+
     /// The board's `index`th register window.
     pub(crate) fn register_window_spec(&self, index: usize) -> Option<&'static M5RegisterWindowSpec> {
         self.register_windows.get(index)

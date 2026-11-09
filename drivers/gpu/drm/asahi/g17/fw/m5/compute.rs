@@ -32,9 +32,17 @@ pub(crate) const COMPUTE_PIPELINED_DEPENDENCY: u8 = 2;
 /// The completion class, which holds a kick until the kick it names has completed.
 pub(crate) const COMPLETION_DEPENDENCY: u8 = 1;
 
-/// Dependency class of an explicit dependency of a compute kick on `board`.
+/// Dependency class of an explicit dependency of a compute kick on `board`: the completion class
+/// where explicit waits take it ([`Board::completion_inputs`]) and on the J813, where macOS 27.0
+/// gives every dependency of every kick class 1, two bits each at kick+0x180 (0x01, 0x05, 0x15,
+/// 0x55 for one to four), in its TA, 3D and compute kicks alike. Otherwise it is the pipelined
+/// class.
 pub(crate) fn explicit_dependency(board: &Board) -> u8 {
-    if board.completion_inputs() { COMPLETION_DEPENDENCY } else { COMPUTE_PIPELINED_DEPENDENCY }
+    if board.completion_inputs() || board.j813_forms() {
+        COMPLETION_DEPENDENCY
+    } else {
+        COMPUTE_PIPELINED_DEPENDENCY
+    }
 }
 
 /// Dependency class of a compute kick's implicit parent (the previous kick of its queue) on
@@ -53,10 +61,21 @@ pub(crate) fn parent_dependency(board: &Board, parent_retired: bool) -> u8 {
 }
 
 /// Whether compute kicks on `board` count their completion ordinal and hold for their parent:
-/// with the G17D forms, and on boards whose explicit waits take the completion class
-/// ([`Board::completion_inputs`]), as macOS encodes M5 Pro compute.
+/// with the G17D forms, on boards whose explicit waits take the completion class
+/// ([`Board::completion_inputs`]), as macOS encodes M5 Pro compute, and on the J813, whose
+/// macOS 27.0 compute descriptors count it (+0xf70 runs 0x341c, 0x341d, ...).
 pub(crate) fn counted_forms(board: &Board) -> bool {
-    board.g17d_forms() || board.completion_inputs()
+    board.g17d_forms() || board.completion_inputs() || board.j813_forms()
+}
+
+/// The descriptor's completion identity and event metadata on `board`. macOS 27.0 on the J813
+/// writes the same two values into every compute descriptor it kicks.
+pub(crate) fn completion_forms(board: &Board) -> (u64, [u8; 16]) {
+    if board.j813_forms() {
+        (0x0400_0000_0000_0002, [0, 0, 0x55, 0x01, 0, 0, 0, 0, 0, 0, 0x85, 0, 0, 0, 0, 0])
+    } else {
+        (1, [0; 16])
+    }
 }
 
 /// The completion ordinal of a compute command on `board`. With the counted forms
@@ -79,10 +98,18 @@ const ENTRY_GATE_EVENT: u32 = 254;
 /// The event mask of a compute kick of context `context_id` on `board`, published with its
 /// current-kick notification. With the G17D forms ([`Board::g17d_forms`]) the kick waits on its
 /// own context's pool event (64 x 2 + the context), which the firmware holds while it processes
-/// that pool's dependencies, and on the entry-signal gate; a context of 64 or more is EINVAL. With
-/// the other counted forms ([`counted_forms`]) it is the pool event alone. Otherwise it is the
-/// fixed `[0, 0, 8, 0]` (event 131, context 3's pool event, without the gate).
+/// that pool's dependencies, and on the entry-signal gate; a context of 64 or more is EINVAL.
+/// On the J813 it is event 64 + the context, in word 1, without the gate, as macOS 27.0 kicks it
+/// there (WindowServer's context 1 kicks with 0x2 in word 1 and nothing else). With the other
+/// counted forms ([`counted_forms`]) it is the pool event alone. Otherwise it is the fixed
+/// `[0, 0, 8, 0]` (event 131, context 3's pool event, without the gate).
 pub(crate) fn kick_event_mask(board: &Board, context_id: u32) -> Result<[u64; 4]> {
+    if board.j813_forms() {
+        if context_id >= POOL_EVENT_CONTEXTS {
+            return Err(EINVAL);
+        }
+        return Ok([0, 1u64 << context_id, 0, 0]);
+    }
     if !counted_forms(board) {
         return Ok([0, 0, 8, 0]);
     }
@@ -116,13 +143,22 @@ pub(crate) const NORMAL_TUPLE: KickTuple =
 pub(crate) const QUALIFIED_TUPLE: KickTuple =
     KickTuple { preempt_state_offset: 0x1480, dispatch_base: 0x10c0_8860, auxiliary_control: 0 };
 
-/// The DRM compute tuple of `board` ([`Board::g17d_forms`]) for a kick whose parent takes class
-/// `parent_class`. Where explicit waits take the completion class ([`Board::completion_inputs`])
-/// it is macOS's M5 Pro form: the J714 preemption offset with the qualified dispatch base, and the
-/// auxiliary control set only when the kick's parent is pipelined.
+/// The tuple macOS 27.0 kicks the J813's compute with: the qualified preemption-state offset and
+/// auxiliary control with the normal dispatch base (0x1a4d0 = preempt + 0x1480, 0x1a458 =
+/// 0x14c08a60, 0xa731 = 0 in every WindowServer compute descriptor).
+pub(crate) const J813_TUPLE: KickTuple =
+    KickTuple { preempt_state_offset: 0x1480, dispatch_base: 0x14c0_8a60, auxiliary_control: 0 };
+
+/// The DRM compute tuple of `board` ([`Board::g17d_forms`], [`Board::j813_forms`]) for a kick
+/// whose parent takes class `parent_class`. Where explicit waits take the completion class
+/// ([`Board::completion_inputs`]) it is macOS's M5 Pro form: the J714 preemption offset with the
+/// qualified dispatch base, and the auxiliary control set only when the kick's parent is
+/// pipelined.
 pub(crate) fn kick_tuple(board: &Board, parent_class: u8) -> KickTuple {
     if board.g17d_forms() {
         QUALIFIED_TUPLE
+    } else if board.j813_forms() {
+        J813_TUPLE
     } else if board.completion_inputs() {
         KickTuple {
             preempt_state_offset: NORMAL_TUPLE.preempt_state_offset,
