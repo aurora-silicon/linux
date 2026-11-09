@@ -235,6 +235,14 @@ int apple_rtkit_wake(struct apple_rtkit *rtk);
 int apple_rtkit_wake_early_ap(struct apple_rtkit *rtk);
 
 /*
+ * Wake a co-processor stopped after apple_rtkit_idle() with its firmware,
+ * endpoints and buffers kept: restore the mailbox, resume RX, call @start to
+ * start its CPU, then complete HELLO, the endpoint map (with the started
+ * endpoints, no INIT and no new endpoint start) and IOP/AP ON.
+ */
+int apple_rtkit_wake_retained(struct apple_rtkit *rtk, int (*start)(void *), void *ctx);
+
+/*
  * Shutdown the co-processor
  */
 int apple_rtkit_shutdown(struct apple_rtkit *rtk);
