@@ -268,7 +268,7 @@ static u64 fw_now(void *ctx)
 	return ((struct prog_fw *)ctx)->now;
 }
 
-static void fw_relax(void *ctx, u64 waited_ns)
+static void fw_relax(void *ctx, u64 waited_ns, u64 spin_ns)
 {
 	struct prog_fw *f = ctx;
 

@@ -976,9 +976,9 @@ static u64 ane_h16_now(void *ctx)
 
 /*
  * The channel IRQ stays masked, so every wait polls, with the shared pacing
- * (see ane_fw_poll_sleep_us()): busy steps for the first 30 us, then short
- * sleeps. A fixed 1 ms sleep made each of the four waits of an EXECUTE cost
- * at least a millisecond.
+ * (see ane_fw_poll_sleep_us()): busy steps through the caller's short fast
+ * window, then short sleeps. A fixed 1 ms sleep made each of the four waits
+ * of an EXECUTE cost at least a millisecond.
  */
 static void ane_h16_service(void *ctx)
 {
@@ -991,10 +991,10 @@ static void ane_h16_service(void *ctx)
 		ane_fw_transport_fail(&h->boot.transport, ret);
 }
 
-static void ane_h16_relax(void *ctx, u64 waited_ns)
+static void ane_h16_relax(void *ctx, u64 waited_ns, u64 spin_ns)
 {
 	ane_h16_service(ctx);
-	ane_fw_poll_pause(waited_ns);
+	ane_fw_poll_pause(waited_ns, spin_ns);
 }
 
 static int ane_h16_alloc_shared(void *ctx, size_t size, u32 tag, struct ane_fw_surface *out)
