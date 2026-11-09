@@ -214,7 +214,7 @@ struct hw_info {
 	bool msimap_by_vector;
 	/*
 	 * In suspend-to-idle a tunnel host whose power domain is not always-on
-	 * keeps its link while the domain stays on, see apple_pcie_hold_domain().
+	 * keeps its link while the domain stays on, see apple_pcie_hold_domains().
 	 */
 	bool s2idle_hold_domain;
 	/* AppleT8152PCIePort::_initializeRefclkBuffer clears REFBUF_OFF. */
@@ -391,6 +391,12 @@ bool apple_pcie_tunnel_needs_cold_init(struct device_node *np)
 }
 EXPORT_SYMBOL_GPL(apple_pcie_tunnel_needs_cold_init);
 
+struct apple_pcie_pd {
+	struct device		*dev;
+	struct notifier_block	nb;
+	unsigned int		vetoed;
+};
+
 struct apple_pcie {
 	struct mutex		lock;
 	struct device		*dev;
@@ -413,10 +419,10 @@ struct apple_pcie {
 	bool			bus_stopped;
 	bool			reset_on_resume;
 	bool			link_kept;
-	/* a power domain that is not always-on, held on for this sleep */
-	struct notifier_block	pd_nb;
-	bool			pd_held;
-	unsigned int		pd_vetoed;
+	struct dev_pm_domain_list *pd_list;
+	struct apple_pcie_pd	*pds;
+	unsigned int		num_pds;
+	unsigned int		pd_held;
 	bool			resume_failed; /* cleared only by teardown and reprobe */
 	struct reset_control	*reset;
 	u16			managed_sids;
@@ -3101,6 +3107,42 @@ out:
 	return ret;
 }
 
+static int apple_pcie_attach_domains(struct apple_pcie *pcie)
+{
+	struct device *dev = pcie->dev;
+	struct dev_pm_domain_attach_data data = {
+		.pd_flags = PD_FLAG_DEV_LINK_ON,
+	};
+	int count, ret, i;
+
+	if (!of_property_present(dev->of_node, "power-domains"))
+		return 0;
+
+	count = of_count_phandle_with_args(dev->of_node, "power-domains",
+					 "#power-domain-cells");
+	if (count < 0)
+		return count;
+	if (count > 1) {
+		ret = devm_pm_domain_attach_list(dev, &data, &pcie->pd_list);
+		if (ret < 0)
+			return ret;
+		if (ret != count)
+			return -ENODEV;
+	} else if (!dev->pm_domain) {
+		return 0;
+	}
+
+	/* A single domain is already attached by the platform bus. */
+	pcie->pds = devm_kcalloc(dev, count, sizeof(*pcie->pds), GFP_KERNEL);
+	if (!pcie->pds)
+		return -ENOMEM;
+	pcie->num_pds = count;
+	for (i = 0; i < count; i++)
+		pcie->pds[i].dev = pcie->pd_list ? pcie->pd_list->pd_devs[i] : dev;
+
+	return 0;
+}
+
 static int apple_pcie_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -3148,6 +3190,10 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	pcie = pci_host_bridge_priv(bridge);
 	pcie->dev = dev;
 	pcie->hw = hw;
+	ret = apple_pcie_attach_domains(pcie);
+	if (ret)
+		return dev_err_probe(dev, ret, "Failed to attach power domains\n");
+
 	if (of_property_present(dev->of_node, "apple,managed-sids")) {
 		u32 ids[15];
 		int count = of_property_count_u32_elems(dev->of_node, "apple,managed-sids");
@@ -3828,46 +3874,63 @@ static bool apple_pcie_tunnel_link_healthy(struct apple_pcie *pcie)
  */
 static int apple_pcie_pd_notify(struct notifier_block *nb, unsigned long action, void *data)
 {
-	struct apple_pcie *pcie = container_of(nb, struct apple_pcie, pd_nb);
+	struct apple_pcie_pd *pd = container_of(nb, struct apple_pcie_pd, nb);
 
 	if (action != GENPD_NOTIFY_PRE_OFF)
 		return NOTIFY_OK;
-	pcie->pd_vetoed++;
+	pd->vetoed++;
 	return notifier_from_errno(-EBUSY);
 }
 
+static void apple_pcie_release_domains(struct apple_pcie *pcie)
+{
+	unsigned int vetoed = 0;
+	struct apple_pcie_pd *pd;
+
+	if (!pcie->pd_held)
+		return;
+	while (pcie->pd_held) {
+		pd = &pcie->pds[--pcie->pd_held];
+		dev_pm_genpd_remove_notifier(pd->dev);
+		vetoed += pd->vetoed;
+	}
+	dev_dbg(pcie->dev, "PCIe power domains released after suspend-to-idle (%u power-offs refused)\n",
+		vetoed);
+}
+
 /*
- * Hold a power domain that is not always-on through this sleep. ACIO keeps
+ * Hold every attached domain through this sleep. Internal links are left
+ * running and cannot be retrained after a power cycle. ACIO keeps
  * the domain of its PCIe-C host on for as long as a cable is connected (its
  * power-domain devices are syscore devices, which system sleep leaves
  * alone), so a host with a link up finds its domain on here, and the veto
  * makes sure it stays on. A domain that is already off has no link to keep.
  */
-static int apple_pcie_hold_domain(struct apple_pcie *pcie)
+static int apple_pcie_hold_domains(struct apple_pcie *pcie)
 {
+	struct apple_pcie_pd *pd;
 	int ret;
 
-	pcie->pd_vetoed = 0;
-	pcie->pd_nb.notifier_call = apple_pcie_pd_notify;
-	ret = dev_pm_genpd_add_notifier(pcie->dev, &pcie->pd_nb);
-	if (ret)
-		return ret;
-	if (!dev_pm_genpd_is_on(pcie->dev)) {
-		dev_pm_genpd_remove_notifier(pcie->dev);
+	if (!pcie->num_pds)
 		return -ENODEV;
+	while (pcie->pd_held < pcie->num_pds) {
+		pd = &pcie->pds[pcie->pd_held];
+		pd->vetoed = 0;
+		pd->nb.notifier_call = apple_pcie_pd_notify;
+		ret = dev_pm_genpd_add_notifier(pd->dev, &pd->nb);
+		if (ret)
+			goto err_release;
+		pcie->pd_held++;
+		if (!dev_pm_genpd_is_on(pd->dev)) {
+			ret = -ENODEV;
+			goto err_release;
+		}
 	}
-	pcie->pd_held = true;
 	return 0;
-}
 
-static void apple_pcie_release_domain(struct apple_pcie *pcie)
-{
-	if (!pcie->pd_held)
-		return;
-	dev_pm_genpd_remove_notifier(pcie->dev);
-	pcie->pd_held = false;
-	dev_dbg(pcie->dev, "PCIe-C power domain released after suspend-to-idle (%u power-offs refused)\n",
-		pcie->pd_vetoed);
+err_release:
+	apple_pcie_release_domains(pcie);
+	return ret;
 }
 
 /*
@@ -3876,7 +3939,7 @@ static void apple_pcie_release_domain(struct apple_pcie *pcie)
  * and resume like any other PCIe device; nothing has to be re-trained.
  * The host's power domain must stay on for that: an always-on one does;
  * on a host that opts in (s2idle_hold_domain), any other is held on for the
- * sleep (apple_pcie_hold_domain()).
+ * sleep (apple_pcie_hold_domains()).
  */
 static bool apple_pcie_keep_link(struct apple_pcie *pcie)
 {
@@ -3891,7 +3954,7 @@ static bool apple_pcie_keep_link(struct apple_pcie *pcie)
 	if (!pcie->power_retained) {
 		if (!pcie->hw->s2idle_hold_domain)
 			return false;
-		ret = apple_pcie_hold_domain(pcie);
+		ret = apple_pcie_hold_domains(pcie);
 		if (ret) {
 			dev_dbg(pcie->dev, "PCIe-C power domain not held (%d): link not kept\n",
 				ret);
@@ -3900,7 +3963,7 @@ static bool apple_pcie_keep_link(struct apple_pcie *pcie)
 	}
 	if (apple_pcie_tunnel_link_healthy(pcie))
 		return true;
-	apple_pcie_release_domain(pcie);
+	apple_pcie_release_domains(pcie);
 	return false;
 }
 
@@ -3948,12 +4011,15 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 
 	/*
 	 * The managed radio has no suspend boundary of its own; suspend-to-idle
-	 * leaves it in place like any other internal port (no power domain).
+	 * leaves it in place like any other internal port.
 	 */
-	if (pcie->managed_sids)
-		return pm_suspend_target_state == PM_SUSPEND_TO_IDLE ? 0 : -EBUSY;
-	if (!pcie->hw->tunneled)
+	if (pcie->managed_sids && pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
+		return -EBUSY;
+	if (!pcie->hw->tunneled) {
+		if (pm_suspend_no_platform() && pcie->num_pds)
+			return apple_pcie_hold_domains(pcie);
 		return 0;
+	}
 	pcie->reset_on_resume = false;
 	pcie->link_kept = apple_pcie_keep_link(pcie);
 	if (!pcie->link_kept)
@@ -4008,10 +4074,10 @@ static int apple_pcie_resume_noirq(struct device *dev)
 	struct apple_pcie_port *port;
 	int ret;
 
+	/* The domain's hold for the sleep ends first, whatever follows. */
+	apple_pcie_release_domains(pcie);
 	if (!pcie->hw->tunneled)
 		return 0;
-	/* The domain's hold for the sleep ends first, whatever follows. */
-	apple_pcie_release_domain(pcie);
 	if (pcie->resume_failed)
 		return -EIO;
 	/*
