@@ -362,9 +362,15 @@
 	};
 };
 
+/* NFC controller (Stockholm): identified once, then kept off. */
+&smc_gpio {
+	apple,output-templates = <0xf 0x00800000>;
+};
+
 &aop_spmi1 {
 	interrupt-controller;
 	#interrupt-cells = <2>;
+	status = "okay";
 
 	nfc@c {
 		compatible = "apple,t8112-stockholm-spmi", "apple,stockholm-spmi";
@@ -377,7 +383,9 @@
 			     <164 IRQ_TYPE_NONE>,
 			     <165 IRQ_TYPE_NONE>,
 			     <166 IRQ_TYPE_NONE>;
-		status = "disabled";
+		interrupt-names = "event0", "event1", "event2", "error",
+				  "event4", "host-wake", "data-ready";
+		enable-gpios = <&smc_gpio 15 GPIO_ACTIVE_HIGH>;
 	};
 };
 
