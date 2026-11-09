@@ -306,11 +306,12 @@
 };
 
 &nub_spmi1 {
+	status = "okay";
+
 	pmic@e {
 		compatible = "apple,vale-pmic", "apple,spmi-nvmem";
 		reg = <0xe SPMI_USID>;
 		read-only;
-		status = "disabled";
 	};
 };
 
@@ -350,10 +351,13 @@
 };
 
 &aop_spmi0 {
+	status = "okay";
+
 	radio-pmu@e {
-		compatible = "apple,t8112-wifibt-pmu", "apple,radio-pmu";
+		compatible = "apple,t8112-wifibt-pmu", "apple,radio-pmu",
+			     "apple,spmi-nvmem";
 		reg = <0xe SPMI_USID>;
-		status = "disabled";
+		read-only;
 	};
 };
 
