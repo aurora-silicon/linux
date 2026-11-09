@@ -7484,6 +7484,19 @@ out:
 }
 
 /*
+ * A firmware stopped while crashed is about to start over: forget the calls and the
+ * transaction the old one left unanswered, and let the new one's messages through. A failed
+ * start marks it crashed again.
+ */
+static void dcp_s2r_forget_crash(struct apple_dcp *dcp)
+{
+	if (!READ_ONCE(dcp->crashed))
+		return;
+	iomfb_reset_transport(dcp);
+	WRITE_ONCE(dcp->crashed, false);
+}
+
+/*
  * DCPEXT back after a real sleep, the same way in every macOS wake measured: its domains,
  * its DART's streams, and a warm restart, with no secure port and no display-on call. After
  * its own power cycle the start is the same, with its display DART lit again.
@@ -7493,6 +7506,7 @@ static int dcp_s2r_ext_start(struct apple_dcp *dcp, bool cycled)
 	void __iomem *control = dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL;
 	int ret;
 
+	dcp_s2r_forget_crash(dcp);
 	if (!dcp->s2r_dcp_dart)
 		return -ENODEV;
 	ret = apple_dart_gapf_ready(dcp->s2r_dcp_dart);
@@ -7635,6 +7649,7 @@ static int dcp_s2r_warm_restart(struct apple_dcp *dcp)
 {
 	int ret;
 
+	dcp_s2r_forget_crash(dcp);
 	ret = dcp_s2r_domains_on(dcp);
 	if (ret)
 		return ret;
