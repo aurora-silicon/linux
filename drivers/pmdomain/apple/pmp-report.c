@@ -119,8 +119,6 @@ struct apple_pmp_report {
 	/* Provider-owned words; never initialized by reading request entries. */
 	u64 dvfs_words[64];
 	u64 dvfs_known;
-	/* CLPC votes own these SOC-DEV-PS request bits while their lanes are live. */
-	u64 clpc_ps_owned;
 	u64 dvfs_ready_prime_word;
 	u64 dvfs_ready_achieved_word;
 	bool dvfs_ready_prime_sent;
@@ -398,7 +396,7 @@ static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 	bool running = apple_pmp_report_running(rep);
 	unsigned int lane;
 	unsigned long flags;
-	u64 known, shadow, request_word, dvfs_known, clpc_ps_owned, words[64];
+	u64 known, shadow, request_word, dvfs_known, words[64];
 	u64 dvfs_ready_prime_word, dvfs_ready_achieved_word;
 	bool request_word_known, dvfs_ready_prime_sent, dvfs_ready;
 	u32 effort;
@@ -409,7 +407,6 @@ static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 	request_word = rep->request_word;
 	request_word_known = rep->request_word_known;
 	dvfs_known = rep->dvfs_known;
-	clpc_ps_owned = rep->clpc_ps_owned;
 	dvfs_ready_prime_word = rep->dvfs_ready_prime_word;
 	dvfs_ready_achieved_word = rep->dvfs_ready_achieved_word;
 	dvfs_ready_prime_sent = rep->dvfs_ready_prime_sent;
@@ -418,8 +415,6 @@ static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 	spin_unlock_irqrestore(&rep->lock, flags);
 	seq_printf(s, "running: %u\n", running);
 	seq_printf(s, "requests_known: %#llx\nrequests_on: %#llx\n", known, shadow);
-	if (clpc_ps_owned)
-		seq_printf(s, "clpc_residency_owned: %#llx\n", clpc_ps_owned);
 	if (request_word_known)
 		seq_printf(s, "request_write: offset: %#x word: %#llx (host)\n",
 			   offs->tgt_write, request_word);
@@ -2077,17 +2072,6 @@ int apple_pmp_report_set_request(const struct device_node *report_np, unsigned i
 }
 EXPORT_SYMBOL_GPL(apple_pmp_report_set_request);
 
-/*
- * T8112 SOC-DEV-DVFS entries are indexed by soc-device ID from a base of
- * 0xa5, so EACC0 (soc-device 3), PACC0 (4) and ANE0 (6) are 0xa8, 0xa9 and
- * 0xab. Their PTD request bit is the soc-device ID - 1, as for report entries.
- */
-#define PMP_T8112_DVFS_SOC_DEV_BASE	0xa5
-#define PMP_T8112_DVFS_SOC_DEV(entry)	((entry) - PMP_T8112_DVFS_SOC_DEV_BASE)
-#define PMP_T8112_DVFS_EACC0		(PMP_T8112_DVFS_SOC_DEV_BASE + 3)
-#define PMP_T8112_DVFS_PACC0		(PMP_T8112_DVFS_SOC_DEV_BASE + 4)
-#define PMP_T8112_DVFS_ANE0		(PMP_T8112_DVFS_SOC_DEV_BASE + 6)
-
 /**
  * apple_pmp_report_t8112_clpc_request() - set a T8112 CLPC memory/fabric vote
  * @np: PMP report provider
@@ -2105,21 +2089,13 @@ int apple_pmp_report_t8112_clpc_request(const struct device_node *np,
 {
 	struct apple_pmp_report *rep;
 	unsigned long flags;
-	unsigned int index, ps_id;
-	u64 ps_bit;
+	unsigned int index;
 	u64 dcs_word, soc_word;
-	bool active, owned;
 	int ret = -EPROBE_DEFER;
 
-	if (!np || (entry != PMP_T8112_DVFS_EACC0 &&
-		    entry != PMP_T8112_DVFS_PACC0 &&
-		    entry != PMP_T8112_DVFS_ANE0) ||
+	if (!np || (entry != 0xa8 && entry != 0xa9 && entry != 0xab) ||
 	    dcs > 4 || soc > 2)
 		return -EINVAL;
-	/* The constraint entry and the PS request bit both follow the soc-device ID. */
-	ps_id = PMP_T8112_DVFS_SOC_DEV(entry) - 1;
-	ps_bit = BIT_ULL(ps_id);
-	active = dcs || soc;
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
@@ -2141,28 +2117,6 @@ int apple_pmp_report_t8112_clpc_request(const struct device_node *np,
 		/* The provider owns the whole word: both lanes in one store. */
 		apple_pmp_dvfs_word(0x21, dcs, &dcs_word);
 		apple_pmp_dvfs_word(0x25, soc, &soc_word);
-		/*
-		 * A SOC-DEV-DVFS constraint belongs to a resident soc-device. Admit
-		 * the virtual ACC/ANE device and wait for its ACK before publishing
-		 * a nonzero word. If another report domain already owns the bit (the
-		 * ANE case), borrow it and leave its lifetime to that owner.
-		 */
-		spin_lock_irqsave(&rep->lock, flags);
-		owned = rep->clpc_ps_owned & ps_bit;
-		spin_unlock_irqrestore(&rep->lock, flags);
-		if (active && !(READ_ONCE(rep->shadow) & ps_bit)) {
-			ret = apple_pmp_report_set_state(rep, ps_id, true, false);
-			if (ret) {
-				/* A timed-out admission must not become a later false owner. */
-				apple_pmp_report_set_state(rep, ps_id, false, true);
-				break;
-			}
-			spin_lock_irqsave(&rep->lock, flags);
-			rep->clpc_ps_owned |= ps_bit;
-			spin_unlock_irqrestore(&rep->lock, flags);
-			owned = true;
-		}
-		/* Release the constraint before withdrawing its residency. */
 		spin_lock_irqsave(&rep->lock, flags);
 		rep->dvfs_words[index] = dcs_word | soc_word;
 		writeq(rep->dvfs_words[index],
@@ -2170,14 +2124,6 @@ int apple_pmp_report_t8112_clpc_request(const struct device_node *np,
 		rep->dvfs_known |= BIT_ULL(index);
 		spin_unlock_irqrestore(&rep->lock, flags);
 		ret = 0;
-		if (!active && owned) {
-			ret = apple_pmp_report_set_state(rep, ps_id, false, false);
-			if (!ret) {
-				spin_lock_irqsave(&rep->lock, flags);
-				rep->clpc_ps_owned &= ~ps_bit;
-				spin_unlock_irqrestore(&rep->lock, flags);
-			}
-		}
 		break;
 	}
 	rcu_read_unlock();
