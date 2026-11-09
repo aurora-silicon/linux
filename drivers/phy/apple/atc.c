@@ -2006,6 +2006,8 @@ static void atcphy_setup_pipehandler(struct apple_atcphy *atcphy)
 					   PIPEHANDLER_MUX_CTRL_CLK_DUMMY);
 		atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
 		atcphy->pipe_pending = false;
+		/* iBoot leaves it set; a deep sleep resets it, and USB3's PIPE lock needs it. */
+		atcphy_enable_dummy_phy(atcphy);
 		return;
 	}
 
@@ -3911,9 +3913,21 @@ static int atcphy_configure_t8132(struct apple_atcphy *atcphy, enum atcphy_mode 
 		goto done;
 	}
 
+	/* A deep sleep took the block's power: it comes back at reset values, clamp not set yet. */
+	if (!core_read32(atcphy, ATCPHY_POWER_CTRL) && !core_read32(atcphy, ATCPHY_POWER_STAT) &&
+	    !(core_read32(atcphy, ATCPHY_MISC) & ~ATCPHY_MISC_LANE_SWAP)) {
+		dev_info(atcphy->dev, "bringup: PHY at reset values, setting the clamp\n");
+		core_set32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_CLAMP_EN);
+		udelay(1);
+	}
 	/* Never reset an inherited common-power epoch to manufacture a cold state. */
-	if (!atcphy_t8132_cold(atcphy))
+	if (!atcphy_t8132_cold(atcphy)) {
+		dev_err(atcphy->dev, "bringup: not cold: ctrl %#x stat %#x misc %#x\n",
+			core_read32(atcphy, ATCPHY_POWER_CTRL),
+			core_read32(atcphy, ATCPHY_POWER_STAT),
+			core_read32(atcphy, ATCPHY_MISC));
 		return -EBUSY;
+	}
 	atcphy_usb2_power_on(atcphy);
 	ndelay(500);
 	/* A touched failure retains this epoch without guessing a rollback. */
@@ -6748,6 +6762,9 @@ static int atcphy_resume_noirq(struct device *dev)
 	int ret = 0;
 
 	guard(mutex)(&atcphy->lock);
+	/* A real sleep took T8132's PHY state behind its power domain's back. */
+	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132 && pm_resume_via_firmware())
+		WRITE_ONCE(atcphy->pd_was_off, true);
 	if (!atcphy->hibernated) {
 		atcphy_sleep_lost_dp(atcphy);
 		return 0;
