@@ -37,49 +37,24 @@ static int mt_wow_retired(struct mt7932 *m)
 }
 
 /* command_mutex held, or probe before the wiphy exists. */
-static int mt_wow_send(struct mt7932 *m, u8 command, u8 triggers, bool ack)
+static int mt_wow_send(struct mt7932 *m, u8 command, u8 triggers)
 {
 	u8 param[MT7932_WOW_PARAM_LEN];
 	int ret;
 
 	mt7932_wow_param(param, command, triggers);
-	ret = mt_request(m, MT7932_CMD_SET_WOWLAN, true, true, ack, param, sizeof(param));
+	ret = mt_request(m, MT7932_CMD_SET_WOWLAN, true, true, false, param, sizeof(param));
 	if (!ret)
-		ret = ack ? mt7932_wow_ack(m->reply, m->reply_length) : mt_wow_retired(m);
-	dev_dbg(&m->pdev->dev, "WOW_%s: triggers=%02x ack=%u status=%d eid=%02x length=%zu\n",
-		command == MT7932_WOW_START ? "START" : "STOP", triggers, ack, ret,
-		ack && m->reply_length > 28 ? m->reply[28] : 0, ack ? m->reply_length : 0);
+		ret = mt_wow_retired(m);
+	dev_dbg(&m->pdev->dev, "WOW_%s: triggers=%02x status=%d\n",
+		command == MT7932_WOW_START ? "START" : "STOP", triggers, ret);
 	return ret;
 }
 
-/*
- * Advertise WoWLAN only after the firmware has acknowledged a STOP. With no
- * wake state armed a STOP changes nothing, unlike a START, which would
- * change packet delivery. A firmware that does not answer keeps the station
- * without WoWLAN, as before.
- */
+/* This driver binds only the hardware and firmware family qualified for WoW. */
 void mt_wow_init(struct mt7932 *m)
 {
-	int ret;
-
 	m->wow_reason = -ENODATA;
-	ret = mt_wow_send(m, MT7932_WOW_STOP, 0, true);
-	if (ret == -ETIMEDOUT && !mt_wow_retired(m)) {
-		/* UNQUALIFIED: the firmware retires the SET without answering it.
-		 * Accepting that lets the sequence be qualified on hardware; it is
-		 * not capability proof, and this series stays a draft until the
-		 * wake itself is proven.
-		 */
-		dev_info(&m->pdev->dev, "WoWLAN STOP retired without a reply\n");
-		ret = 0;
-	} else if (!ret) {
-		m->wow_acked = true;
-	}
-	if (ret) {
-		dev_info(&m->pdev->dev, "WoWLAN unavailable: firmware did not acknowledge STOP: %d\n",
-			 ret);
-		return;
-	}
 	m->wow_supported = true;
 	m->wiphy->wowlan = &mt_wowlan_support;
 	device_set_wakeup_capable(&m->pdev->dev, true);
@@ -105,40 +80,54 @@ void mt_wow_event_locked(struct mt7932 *m, const struct mt7932_event *event)
  * for a settled association; a failed one is undone with a STOP.
  */
 /*
- * Quiet the firmware for host sleep: CID 58 (public CMD_ID_SET_SUSPEND_MODE,
- * BSS 0, enable) and CID c5 (public CMD_ID_FW_LOG_2_HOST, 0 = off while
- * armed, back to the driver's startup value 2 after). Without the log off,
- * firmware debug events (EVENT_ID_DEBUG_MSG) end the sleep at once.
+ * Select the per-BSS WoW DTIM policy before START, and clear the BSS suspend
+ * state on resume while preserving the selector in the fixed public shape.
  */
-static void mt_wow_quiet(struct mt7932 *m, bool enable)
+static int mt_wow_suspend_mode(struct mt7932 *m, bool enable)
 {
-	u8 body[68] = {};
-	int a, b;
+	u8 body[MT7932_SUSPEND_PARAM_LEN];
+	int ret;
 
-	body[1] = enable;
-	a = mt_request(m, 0x58, true, true, false, body, 68);
-	if (!a)
-		a = mt_wow_retired(m);
-	memset(body, 0, 4);
-	body[0] = enable ? 0 : 2;
-	b = mt_request(m, 0xc5, true, true, false, body, 4);
-	if (!b)
-		b = mt_wow_retired(m);
-	dev_dbg(&m->pdev->dev, "WOW_QUIET: enable=%u suspend-mode=%d fw-log=%d\n", enable, a, b);
+	mt7932_suspend_param(body, enable);
+	ret = mt_request(m, MT7932_CMD_SUSPEND_MODE, true, true, false,
+			 body, sizeof(body));
+	if (!ret)
+		ret = mt_wow_retired(m);
+	dev_dbg(&m->pdev->dev, "WOW_SUSPEND_MODE: enable=%u status=%d\n", enable, ret);
+	return ret;
 }
 
-/*
- * Public legacy CMD_ID_HIF_CTRL (0xf6): PCIe, TX and RX, stop or restart.
- * The firmware answers with event 0xf6 reporting both directions idle.
- */
-static void mt_wow_hif(struct mt7932 *m, bool stop)
+/* Firmware debug events would otherwise wake the host immediately. */
+static int mt_wow_log(struct mt7932 *m, bool quiet)
 {
-	u8 body[36] = { 2, 3, stop };
-	int ret = mt_request(m, 0xf6, true, true, false, body, sizeof(body));
+	u8 body[4] = { quiet ? 0 : 2 };
+	int ret = mt_request(m, 0xc5, true, true, false, body, sizeof(body));
 
 	if (!ret)
 		ret = mt_wow_retired(m);
+	dev_dbg(&m->pdev->dev, "WOW_LOG: quiet=%u status=%d\n", quiet, ret);
+	return ret;
+}
+
+/*
+ * Public legacy CMD_ID_HIF_CTRL (0xf6): PCIe, TX, stop or restart. This is
+ * the bounded transition gate: entering sleep requires its event to report
+ * both TX and RX idle.
+ */
+static int mt_wow_hif(struct mt7932 *m, bool stop)
+{
+	struct mt7932_event event;
+	u8 body[MT7932_HIF_PARAM_LEN];
+	int ret;
+
+	mt7932_hif_param(body, stop);
+	ret = mt_request(m, MT7932_CMD_HIF_CTRL, true, true, true, body, sizeof(body));
+	if (!ret)
+		ret = mt7932_event_parse(m->reply, m->reply_length, &event);
+	if (!ret)
+		ret = stop ? mt7932_hif_idle(&event) : mt7932_hif_event(&event);
 	dev_dbg(&m->pdev->dev, "WOW_HIF: stop=%u status=%d\n", stop, ret);
+	return ret;
 }
 
 int mt_wow_suspend(struct wiphy *wiphy, struct cfg80211_wowlan *wow)
@@ -179,16 +168,25 @@ int mt_wow_suspend(struct wiphy *wiphy, struct cfg80211_wowlan *wow)
 		m->power_applied_valid = false;
 		dev_dbg(&m->pdev->dev, "WOW_PS: mode=2 status=%d\n", r);
 	}
-	mt_wow_quiet(m, true);
-	ret = mt_wow_send(m, MT7932_WOW_START, triggers, m->wow_acked);
+	ret = mt_wow_log(m, true);
+	if (!ret)
+		ret = mt_wow_suspend_mode(m, true);
+	if (!ret)
+		ret = mt_wow_send(m, MT7932_WOW_START, triggers);
+	if (!ret)
+		ret = mt_wow_hif(m, true);
 	if (ret) {
-		mt_wow_send(m, MT7932_WOW_STOP, 0, m->wow_acked);
-		mt_wow_quiet(m, false);
+		mt_wow_hif(m, false);
+		mt_wow_suspend_mode(m, false);
+		mt_wow_send(m, MT7932_WOW_STOP, 0);
+		mt_wow_log(m, false);
+		schedule_work(&m->power_work);
 		mutex_unlock(&m->command_mutex);
-		dev_warn(&m->pdev->dev, "WoWLAN START failed: %d; suspending without WoWLAN\n", ret);
+		dev_warn(&m->pdev->dev, "WoWLAN transition failed: %d; suspending without WoWLAN\n",
+			 ret);
 		return 1;
 	}
-	mt_wow_hif(m, true);
+	m->wow_wake_signal = false;
 	m->wow_armed = true;
 	mutex_unlock(&m->command_mutex);
 	return 0;
@@ -211,11 +209,16 @@ int mt_wow_resume(struct wiphy *wiphy)
 	 * already be in, or arrive around the STOP. Do not wait for one that
 	 * a wake from another source never brings beyond a short bound.
 	 */
-	mt_wow_hif(m, false);
-	ret = mt_wow_send(m, MT7932_WOW_STOP, 0, m->wow_acked);
+	ret = mt_wow_hif(m, false);
+	if (ret)
+		dev_err(&m->pdev->dev, "WoWLAN HIF resume failed: %d\n", ret);
+	ret = mt_wow_suspend_mode(m, false);
+	if (ret)
+		dev_err(&m->pdev->dev, "WoWLAN suspend-policy clear failed: %d\n", ret);
+	ret = mt_wow_send(m, MT7932_WOW_STOP, 0);
 	if (ret)
 		dev_err(&m->pdev->dev, "WoWLAN STOP failed: %d\n", ret);
-	mt_wow_quiet(m, false);
+	mt_wow_log(m, false);
 	schedule_work(&m->power_work);
 	wait_for_completion_timeout(&m->wow_event, msecs_to_jiffies(MT7932_WOW_REASON_WAIT_MS));
 	spin_lock_irqsave(&m->response_lock, flags);
@@ -225,7 +228,8 @@ int mt_wow_resume(struct wiphy *wiphy)
 	mutex_unlock(&m->command_mutex);
 
 	if (reason < 0) {
-		dev_dbg(&m->pdev->dev, "WOW_RESUME: no WLAN wake reason\n");
+		dev_dbg(&m->pdev->dev, "WOW_RESUME: signal=%u, no WLAN wake reason\n",
+			m->wow_wake_signal);
 		cfg80211_report_wowlan_wakeup(&m->wdev, NULL, GFP_KERNEL);
 		return 0;
 	}
@@ -257,6 +261,9 @@ void mt_wow_arm_irq(struct mt7932 *m)
 		return;
 	}
 	m->wake_irq_armed = true;
+	/* Only the MCU command interrupt may wake the sleeping host. */
+	mt_write(m, W + 0x204, MT7932_MCU_CMD_IRQ);
+	mt_write(m, W + 0x1f4, MT7932_MCU_WAKE_RX_PCIE);
 	/* Quiesce host DMA (WFDMA TX/RX enable off), then hand the function to
 	 * the firmware (connac FW_OWN, as mt76 does before PCIe sleep), so that
 	 * it does the matching itself.
@@ -269,11 +276,31 @@ void mt_wow_arm_irq(struct mt7932 *m)
 		 m->wow_fw_own, mt_read(m, W + 0x208));
 }
 
+void mt_wow_irq(struct mt7932 *m, u32 cause, u32 software)
+{
+	if (READ_ONCE(m->wake_irq_armed) && mt7932_wow_wake_signal(cause, software))
+		WRITE_ONCE(m->wow_wake_signal, true);
+}
+
 /* The PCI resume callback, before the wiphy's STOP. */
 void mt_wow_disarm_irq(struct mt7932 *m)
 {
+	u32 cause, software = 0;
+
 	if (!m->wake_irq_armed)
 		return;
+	/* The wake IRQ may not have run its thread while noirq was suspended.
+	 * Decode and acknowledge the same W1C pair here before normal causes
+	 * and DMA are restored.
+	 */
+	cause = mt_read(m, W + 0x200);
+	if (cause & MT7932_MCU_CMD_IRQ) {
+		software = mt_read(m, W + 0x1f0);
+		mt_wow_irq(m, cause, software);
+		mt_write(m, W + 0x1f0, software);
+		mt_write(m, W + 0x200, MT7932_MCU_CMD_IRQ);
+		mt_read(m, W + 0x200);
+	}
 	{
 		int own = -1;
 
@@ -283,9 +310,13 @@ void mt_wow_disarm_irq(struct mt7932 *m)
 			m->wow_fw_own = false;
 		}
 		mt_rmw(m, W + 0x208, 0, BIT(0) | BIT(2));
-		dev_dbg(&m->pdev->dev, "WOW_WAKE: driver-own=%d glo=%08x raw=%08x\n", own,
-			 mt_read(m, W + 0x208), mt_read(m, W + 0x200));
+		dev_dbg(&m->pdev->dev,
+			"WOW_WAKE: driver-own=%d signal=%u cause=%08x sw=%08x glo=%08x raw=%08x\n",
+			own, m->wow_wake_signal, cause, software, mt_read(m, W + 0x208),
+			mt_read(m, W + 0x200));
 	}
 	disable_irq_wake(pci_irq_vector(m->pdev, 0));
 	m->wake_irq_armed = false;
+	mt_write(m, W + 0x1f4, 0xffff);
+	mt_write(m, W + 0x204, m->irq_mask);
 }

@@ -18,9 +18,13 @@
  * scenario, no port list, and only the first of the two wake-HIF records.
  */
 #define MT7932_CMD_SET_WOWLAN		0x4a
-#define MT7932_EVENT_CMD_RESULT		0x01
+#define MT7932_CMD_SUSPEND_MODE		0x58
+#define MT7932_CMD_HIF_CTRL		0xf6
 #define MT7932_EVENT_WOW_REASON		0x62
+#define MT7932_EVENT_HIF_CTRL		0xf6
 #define MT7932_WOW_PARAM_LEN		228
+#define MT7932_SUSPEND_PARAM_LEN		68
+#define MT7932_HIF_PARAM_LEN		36
 #define MT7932_WOW_START		1
 #define MT7932_WOW_STOP			2
 /* Trigger bitmap of the CONNAC2 family. */
@@ -41,6 +45,9 @@
 #define MT7932_EVENT_PAYLOAD		36
 #define MT7932_WOW_REASON_MAGIC		0
 #define MT7932_WOW_REASON_DISCONNECT	8
+#define MT7932_MCU_CMD_IRQ		BIT(29)
+#define MT7932_MCU_WAKE_RX_PCIE		BIT(0)
+#define MT7932_HIF_TRAFFIC_IDLE		2
 
 /*
  * A lost association can surface as an explicit disconnect or as beacon
@@ -65,19 +72,55 @@ static inline void mt7932_wow_param(u8 *out, u8 command, u8 triggers)
 }
 
 /*
- * The WoWLAN SET is acknowledged by sequence; the event that answers it is
- * not documented. A generic command result naming the SET carries its
- * status, and a nonzero status is a rejection.
+ * Legacy per-BSS suspend policy. The formerly reserved fourth byte is the
+ * public connac wow_suspend selector: one changes the DTIM policy to WoW.
  */
-static inline int mt7932_wow_ack(const u8 *reply, size_t length)
+static inline void mt7932_suspend_param(u8 *out, bool enable)
 {
-	if (length < 32)
+	memset(out, 0, MT7932_SUSPEND_PARAM_LEN);
+	out[0] = 0;		/* BSS 0 */
+	out[1] = enable;
+	out[2] = 1;		/* mdtim */
+	out[3] = 1;		/* wow_suspend */
+}
+
+/* Public legacy HIF control: PCIe, TX, stop/resume. */
+static inline void mt7932_hif_param(u8 *out, bool stop)
+{
+	memset(out, 0, MT7932_HIF_PARAM_LEN);
+	out[0] = MT7932_WOW_HIF_PCIE;
+	out[1] = 1;		/* TX direction */
+	out[2] = stop;
+}
+
+static inline int mt7932_hif_event(const struct mt7932_event *event)
+{
+	if (event->eid != MT7932_EVENT_HIF_CTRL)
+		return -ENOMSG;
+	if (event->length < MT7932_EVENT_PAYLOAD + 3)
+		return -EMSGSIZE;
+	if (event->packet[MT7932_EVENT_PAYLOAD] != MT7932_WOW_HIF_PCIE)
 		return -EPROTO;
-	if (reply[28] == MT7932_EVENT_CMD_RESULT && length >= MT7932_EVENT_PAYLOAD + 2 &&
-	    reply[MT7932_EVENT_PAYLOAD] == MT7932_CMD_SET_WOWLAN &&
-	    reply[MT7932_EVENT_PAYLOAD + 1])
-		return -EREMOTEIO;
 	return 0;
+}
+
+/* Both directions must be idle before ownership can pass to firmware. */
+static inline int mt7932_hif_idle(const struct mt7932_event *event)
+{
+	int ret = mt7932_hif_event(event);
+
+	if (ret)
+		return ret;
+	if (event->packet[MT7932_EVENT_PAYLOAD + 1] != MT7932_HIF_TRAFFIC_IDLE ||
+	    event->packet[MT7932_EVENT_PAYLOAD + 2] != MT7932_HIF_TRAFFIC_IDLE)
+		return -EBUSY;
+	return 0;
+}
+
+static inline bool mt7932_wow_wake_signal(u32 cause, u32 software)
+{
+	return (cause & MT7932_MCU_CMD_IRQ) &&
+	       (software & MT7932_MCU_WAKE_RX_PCIE);
 }
 
 /* The firmware's wake reason, or a negative error for any other event. */

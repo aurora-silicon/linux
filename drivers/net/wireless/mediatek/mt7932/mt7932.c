@@ -322,6 +322,7 @@ static void mt_service(struct mt7932 *m)
 	if (causes & BIT(29)) {
 		u32 sw = mt_read(m, W + 0x1f0);
 
+		mt_wow_irq(m, causes, sw);
 		mt_write(m, W + 0x1f0, sw);
 	}
 	mt_write(m, W + 0x200, causes);

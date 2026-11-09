@@ -233,7 +233,7 @@ struct mt7932 {
 	 * armed states under command_mutex or in the PM callbacks, and
 	 * wow_reason (a reason, or -ENODATA) under response_lock.
 	 */
-	bool wow_supported, wow_acked, wow_armed, wake_irq_armed;
+	bool wow_supported, wow_armed, wake_irq_armed, wow_wake_signal;
 	int wow_reason;
 	bool wow_fw_own;
 	struct completion wow_event;
@@ -360,11 +360,13 @@ int mt_wow_resume(struct wiphy *wiphy);
 void mt_wow_set_wakeup(struct wiphy *wiphy, bool enabled);
 void mt_wow_arm_irq(struct mt7932 *m);
 void mt_wow_disarm_irq(struct mt7932 *m);
+void mt_wow_irq(struct mt7932 *m, u32 cause, u32 software);
 #else
 static inline void mt_wow_init(struct mt7932 *m) {}
 static inline void mt_wow_event_locked(struct mt7932 *m, const struct mt7932_event *event) {}
 static inline void mt_wow_arm_irq(struct mt7932 *m) {}
 static inline void mt_wow_disarm_irq(struct mt7932 *m) {}
+static inline void mt_wow_irq(struct mt7932 *m, u32 cause, u32 software) {}
 #endif
 
 #endif

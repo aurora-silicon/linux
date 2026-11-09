@@ -36,6 +36,9 @@ PREFIX = r'''
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
+#ifndef EREMOTEIO
+#define EREMOTEIO 121
+#endif
 enum nl80211_band { NL80211_BAND_2GHZ, NL80211_BAND_5GHZ, NL80211_BAND_6GHZ=3, NUM_NL80211_BANDS=6 };
 enum nl80211_mfp { NL80211_MFP_NO, NL80211_MFP_REQUIRED, NL80211_MFP_OPTIONAL };
 enum nl80211_sae_pwe_mechanism { NL80211_SAE_PWE_UNSPECIFIED, NL80211_SAE_PWE_HUNT_AND_PECK, NL80211_SAE_PWE_HASH_TO_ELEMENT, NL80211_SAE_PWE_BOTH };
@@ -60,6 +63,7 @@ struct element {u8 id,datalen,data[];};
 #define dev_info(...) ((void)0)
 #define dev_dbg_ratelimited(...) ((void)0)
 #define dev_dbg(...) ((void)0)
+#define dev_warn_ratelimited(...) ((void)0)
 #define spin_lock_irqsave(l,f) ((void)(l),(f)=0)
 #define spin_unlock_irqrestore(l,f) ((void)(l),(void)(f))
 #define msecs_to_jiffies(x) (x)
@@ -96,6 +100,7 @@ struct mt7932 {
  struct mt7932_cal_completion cal_state;
  u8 cal_requests[32][16],cal_request_seq[32];unsigned cal_request_head,cal_request_count;
  u8 reply[MT7932_RX_CAPACITY];size_t reply_length;u64 packets;
+ int wow_reason;struct completion wow_event;
 };
 static int ieee80211_channel_to_frequency(int ch,enum nl80211_band band){return (band==NL80211_BAND_2GHZ?2407:band==NL80211_BAND_5GHZ?5000:5950)+5*ch;}
 static bool usable=true;
@@ -124,8 +129,7 @@ static void mt_scan_event(struct mt7932*m,const struct mt7932_event*e){}
 static void mt_bss_presence(struct mt7932*m,const struct mt7932_event*e){}
 static void mt_data_complete(struct mt7932*m,const u8*p,size_t n){}
 static void mt_packet_receive(struct mt7932*m,const u8*p,size_t n){}
-#define MT7932_EVENT_WOW_REASON 0x62
-static void mt_wow_event_locked(struct mt7932*m,const struct mt7932_event*e){}
+WOW_EVENT
 static void mt_rf_fail_locked(struct mt7932*m,int e){m->rf_ready=false;m->link_failed=true;m->cal_state.error=e;m->cal_state.active=false;m->connect_error=e;complete_all(&m->assoc_done);complete_all(&m->cal_response);}
 CHANNEL
 LINK
@@ -226,6 +230,15 @@ int main(void){struct mt7932 m;unsigned cases=0;
  assert(!m.connect_error&&m.assoc_request_seen&&m.assoc_request_ie_len==28&&!memcmp(m.assoc_request_ies,ies+4,28)&&ht_lookups==1&&ht_found==m.assoc_request_ies);cases++;
  reset(&m,SUCCESS);ies[5]=25;ht_lookups=0;receive(&m,0xee,0,ies,sizeof(ies),0x5e);
  assert(m.connect_error==-EPROTO&&!m.assoc_request_seen&&!ht_lookups&&m.assoc_start.done&&m.assoc_done.done);cases++;
+ // Event 0x62 is unsolicited and caches its first payload byte as the reason.
+ reset(&m,SUCCESS);m.wow_reason=-ENODATA;u8 wow[4]={8};receive(&m,0x62,0,wow,sizeof(wow),0);
+ assert(m.wow_reason==8&&m.wow_event.done==1);cases++;
+ // A validated event without a reason byte is ignored, not read out of bounds.
+ reset(&m,SUCCESS);m.wow_reason=-ENODATA;receive(&m,0x62,0,wow,0,0);
+ assert(m.wow_reason==-ENODATA&&!m.wow_event.done);cases++;
+ // Wake is specifically MSI cause 29 carrying MCU software bit 0.
+ assert(!mt7932_wow_wake_signal(0,0));assert(!mt7932_wow_wake_signal(BIT(29),0));
+ assert(!mt7932_wow_wake_signal(0,BIT(0)));assert(mt7932_wow_wake_signal(BIT(29),BIT(0)));cases++;
  printf("PASS %u association event/wait/calibration ownership controls\n",cases);
 }
 '''
@@ -239,12 +252,14 @@ def main():
     args=parser.parse_args()
     root=args.source_root;out=args.out;out.mkdir(parents=True,exist_ok=True)
     link=(root/DRIVER/"link.c").read_text();rx=(root/DRIVER/"mt7932.c").read_text()
-    parts={"CHANNEL":function(link,"mt_channel_event"),"LINK":function(link,"mt_link_event"),"RECEIVE":function(rx,"mt_receive")}
+    wow=(root/DRIVER/"wow.c").read_text()
+    parts={"CHANNEL":function(link,"mt_channel_event"),"LINK":function(link,"mt_link_event"),
+           "RECEIVE":function(rx,"mt_receive"),"WOW_EVENT":function(wow,"mt_wow_event_locked")}
     worker=function(link,"mt_connect_attempt")
     start=worker.index("\t/* Genuine D7 requests")
     parts["WAIT"]=worker[start:worker.index("\nout:",start)]
     headers=[]
-    for n in ["protocol.h","channels.h","bandwidth.h","association.h"]:
+    for n in ["protocol.h","wow.h","channels.h","bandwidth.h","association.h"]:
         header = re.sub(r"^#include .*\n", "", (root/DRIVER/n).read_text(), flags=re.M)
         if n == "association.h":
             # These event fixtures do not use the sleeping crypto/admission helpers.
@@ -261,6 +276,7 @@ def main():
     bad=dict(parts);bad["LINK"]=parts["LINK"].replace("!m->connecting || m->disconnecting || m->connect_error","!m->connecting");candidates["mutant-late-result"]=bad
     bad=dict(parts);bad["LINK"]=parts["LINK"].replace("!mt7932_assoc_resources(","false && !mt7932_assoc_resources(");candidates["mutant-peer-ownership"]=bad
     bad=dict(parts);bad["RECEIVE"]=parts["RECEIVE"].replace("event.eid == 0xd6","event.eid == 0xff");candidates["mutant-d6-ownership"]=bad
+    bad=dict(parts);bad["RECEIVE"]=parts["RECEIVE"].replace("event.eid == MT7932_EVENT_WOW_REASON","event.eid == 0x63");candidates["mutant-wow-event"]=bad
     bad=dict(parts);bad["WAIT"]=parts["WAIT"].replace("10000","20000");candidates["mutant-deadline"]=bad
     results={}
     for name,content in candidates.items():

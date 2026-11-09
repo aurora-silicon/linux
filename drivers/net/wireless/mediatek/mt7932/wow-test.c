@@ -50,7 +50,28 @@ static void mt7932_wow_param_test(struct kunit *test)
 	wow_expect_zero(test, p, 9, MT7932_WOW_PARAM_LEN);
 }
 
-/* The SET travels in the ordinary runtime envelope, with a reply requested. */
+static void mt7932_suspend_param_test(struct kunit *test)
+{
+	u8 p[MT7932_SUSPEND_PARAM_LEN + 1];
+
+	memset(p, 0xa5, sizeof(p));
+	mt7932_suspend_param(p, true);
+	KUNIT_EXPECT_EQ(test, p[0], 0);
+	KUNIT_EXPECT_EQ(test, p[1], 1);
+	KUNIT_EXPECT_EQ(test, p[2], 1);
+	KUNIT_EXPECT_EQ(test, p[3], 1);
+	wow_expect_zero(test, p, 4, MT7932_SUSPEND_PARAM_LEN);
+	KUNIT_EXPECT_EQ(test, p[MT7932_SUSPEND_PARAM_LEN], 0xa5);
+
+	mt7932_suspend_param(p, false);
+	KUNIT_EXPECT_EQ(test, p[0], 0);
+	KUNIT_EXPECT_EQ(test, p[1], 0);
+	KUNIT_EXPECT_EQ(test, p[2], 1);
+	KUNIT_EXPECT_EQ(test, p[3], 1);
+	wow_expect_zero(test, p, 4, MT7932_SUSPEND_PARAM_LEN);
+}
+
+/* START and STOP are no-response SETs in the ordinary runtime envelope. */
 static void mt7932_wow_envelope_test(struct kunit *test)
 {
 	u8 p[MT7932_WOW_PARAM_LEN], out[MT7932_ENVELOPE + MT7932_WOW_PARAM_LEN];
@@ -58,34 +79,15 @@ static void mt7932_wow_envelope_test(struct kunit *test)
 
 	mt7932_wow_param(p, MT7932_WOW_START, MT7932_WOW_MAGIC);
 	total = mt7932_envelope(out, sizeof(out), MT7932_CMD_SET_WOWLAN, 0, 7, true, true,
-				true, p, sizeof(p));
+				false, p, sizeof(p));
 	KUNIT_ASSERT_EQ(test, total, MT7932_ENVELOPE + MT7932_WOW_PARAM_LEN);
 	KUNIT_EXPECT_EQ(test, out[36], 0x4a);
 	KUNIT_EXPECT_EQ(test, out[38], 1);
 	KUNIT_EXPECT_EQ(test, out[39], 7);
-	KUNIT_EXPECT_EQ(test, out[43], 1);
+	KUNIT_EXPECT_EQ(test, out[43], 0);
 	KUNIT_EXPECT_EQ(test, out[MT7932_ENVELOPE], 1);
 	KUNIT_EXPECT_EQ(test, out[MT7932_ENVELOPE + 1], 1);
 	KUNIT_EXPECT_EQ(test, out[MT7932_ENVELOPE + 8], 2);
-}
-
-static void mt7932_wow_ack_test(struct kunit *test)
-{
-	u8 r[48] = {};
-
-	KUNIT_EXPECT_EQ(test, mt7932_wow_ack(r, 31), -EPROTO);
-	r[28] = 0x4a;
-	KUNIT_EXPECT_EQ(test, mt7932_wow_ack(r, 40), 0);
-	/* Generic result for the SET: status 0 accepts, nonzero rejects. */
-	r[28] = MT7932_EVENT_CMD_RESULT;
-	r[36] = MT7932_CMD_SET_WOWLAN;
-	KUNIT_EXPECT_EQ(test, mt7932_wow_ack(r, 40), 0);
-	r[37] = 3;
-	KUNIT_EXPECT_EQ(test, mt7932_wow_ack(r, 40), -EREMOTEIO);
-	/* A result naming another command, or too short to name one, has no status for us. */
-	KUNIT_EXPECT_EQ(test, mt7932_wow_ack(r, 37), 0);
-	r[36] = 0x05;
-	KUNIT_EXPECT_EQ(test, mt7932_wow_ack(r, 40), 0);
 }
 
 static int wow_event(u8 *packet, size_t size, u8 eid, size_t payload, struct mt7932_event *e)
@@ -97,6 +99,45 @@ static int wow_event(u8 *packet, size_t size, u8 eid, size_t payload, struct mt7
 	put_unaligned_le16(total - 24, packet + 24);
 	packet[28] = eid;
 	return mt7932_event_parse(packet, total, e);
+}
+
+static void mt7932_hif_test(struct kunit *test)
+{
+	struct mt7932_event e;
+	u8 packet[64], p[MT7932_HIF_PARAM_LEN + 1];
+
+	memset(p, 0xa5, sizeof(p));
+	mt7932_hif_param(p, true);
+	KUNIT_EXPECT_EQ(test, p[0], 2);
+	KUNIT_EXPECT_EQ(test, p[1], 1);
+	KUNIT_EXPECT_EQ(test, p[2], 1);
+	wow_expect_zero(test, p, 3, MT7932_HIF_PARAM_LEN);
+	KUNIT_EXPECT_EQ(test, p[MT7932_HIF_PARAM_LEN], 0xa5);
+
+	KUNIT_ASSERT_EQ(test, wow_event(packet, sizeof(packet), 0xf6, 3, &e), 0);
+	packet[36] = 2;
+	packet[37] = 2;
+	packet[38] = 2;
+	KUNIT_EXPECT_EQ(test, mt7932_hif_event(&e), 0);
+	KUNIT_EXPECT_EQ(test, mt7932_hif_idle(&e), 0);
+	packet[38] = 1;
+	KUNIT_EXPECT_EQ(test, mt7932_hif_idle(&e), -EBUSY);
+	packet[36] = 1;
+	KUNIT_EXPECT_EQ(test, mt7932_hif_event(&e), -EPROTO);
+	KUNIT_ASSERT_EQ(test, wow_event(packet, sizeof(packet), 0xf6, 2, &e), 0);
+	KUNIT_EXPECT_EQ(test, mt7932_hif_event(&e), -EMSGSIZE);
+	KUNIT_ASSERT_EQ(test, wow_event(packet, sizeof(packet), 0x62, 3, &e), 0);
+	KUNIT_EXPECT_EQ(test, mt7932_hif_event(&e), -ENOMSG);
+}
+
+static void mt7932_wow_wake_signal_test(struct kunit *test)
+{
+	KUNIT_EXPECT_FALSE(test, mt7932_wow_wake_signal(0, 0));
+	KUNIT_EXPECT_FALSE(test, mt7932_wow_wake_signal(BIT(29), 0));
+	KUNIT_EXPECT_FALSE(test, mt7932_wow_wake_signal(0, BIT(0)));
+	KUNIT_EXPECT_TRUE(test, mt7932_wow_wake_signal(BIT(29), BIT(0)));
+	KUNIT_EXPECT_TRUE(test,
+			  mt7932_wow_wake_signal(BIT(29) | BIT(31), BIT(0) | BIT(4)));
 }
 
 static void mt7932_wow_reason_test(struct kunit *test)
@@ -131,8 +172,10 @@ static void mt7932_wow_reason_test(struct kunit *test)
 static struct kunit_case mt7932_wow_test_cases[] = {
 	KUNIT_CASE(mt7932_wow_triggers_test),
 	KUNIT_CASE(mt7932_wow_param_test),
+	KUNIT_CASE(mt7932_suspend_param_test),
 	KUNIT_CASE(mt7932_wow_envelope_test),
-	KUNIT_CASE(mt7932_wow_ack_test),
+	KUNIT_CASE(mt7932_hif_test),
+	KUNIT_CASE(mt7932_wow_wake_signal_test),
 	KUNIT_CASE(mt7932_wow_reason_test),
 	{}
 };
