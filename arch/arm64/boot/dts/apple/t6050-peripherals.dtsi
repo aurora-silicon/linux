@@ -2200,17 +2200,30 @@
 		status = "disabled";
 	};
 
+	/* iBoot hands over a running SEP; apple_sep enables it and its DART when it loads. */
 	sep: sep@502600000 {
 		compatible = "apple,t6050-sep", "apple,sep";
 		reg = <0x5 0x2600000 0x0 0x88000>,
 		      <0x5 0x2050000 0x0 0x4000>;
-		interrupts = <AIC_IRQ 0 534 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 0 533 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 0 536 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 0 535 IRQ_TYPE_LEVEL_HIGH>;
+		mboxes = <&sep_mbox>;
+		mbox-names = "mbox";
 		iommus = <&sep_dart 0>;
 		power-domains = <&ps_sep>;
 		clocks = <&peripheral_clocks 447>;
+		status = "disabled";
+	};
+
+	/* The ASC v4 mailbox at sep + 0x8000; the first four ADT interrupts in mailbox order */
+	sep_mbox: mailbox@502608000 {
+		compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x5 0x2608000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 533 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 534 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 535 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 536 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
 		status = "disabled";
 	};
 
@@ -2219,6 +2232,12 @@
 		reg = <0x5 0xb80000 0x0 0x20000>;
 		interrupts = <AIC_IRQ 0 543 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		/*
+		 * The window iBoot programmed (ADT dart-sep vm-base-0, vm-size-0), which
+		 * already carries the BIT(40) alias the DART translates.
+		 */
+		apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
+		apple,dma-offset = /bits/ 64 <0x0>;
 		status = "disabled";
 	};
 
