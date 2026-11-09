@@ -58,6 +58,7 @@ const struct ave_variant ave_t6000 = {
 	.boot_arg_value = 0x400,
 	.timebase_multiplier = 1000000,
 	.text_link_cell = 0x423c,
+	.mbox_idle = 0x38,
 
 	.extra0_size = 0x24,
 	.boot_qualified = true,
