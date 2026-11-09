@@ -61,5 +61,3 @@ obj-$(CONFIG_APPLE_CLPC) += clpc.o
 
 obj-$(CONFIG_APPLE_REGVIEW) += apple-regview.o
 apple-regview-y := regview.o
-
-obj-$(CONFIG_APPLE_SART_APIF) += apple-sart-apif.o

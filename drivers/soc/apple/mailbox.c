@@ -1688,15 +1688,6 @@ static const struct apple_mbox_ascwrap_v6_role_desc apple_mbox_t6050_j775d_ascwr
 	  APPLE_J775D_GFX1_WRAPPER_BASE, APPLE_J775D_GFX1_IOP_VBAR_BASE },
 };
 
-static const struct apple_mbox_ascwrap_v6_role_desc apple_mbox_t6050_apif_ascwrap_v6_roles[] = {
-	{ "GFX", APPLE_MBOX_ASCWRAP_V6_ROLE_GFX,
-	  APPLE_T8140_GFX_WRAPPER_BASE,
-	  APPLE_T8140_GFX_IOP_VBAR_BASE + APPLE_T6050_ASCWRAP_BASE_DELTA },
-	{ "GFX1", APPLE_MBOX_ASCWRAP_V6_ROLE_GFX1,
-	  APPLE_T8140_GFX1_WRAPPER_BASE,
-	  APPLE_T8140_GFX1_IOP_VBAR_BASE + APPLE_T6050_ASCWRAP_BASE_DELTA },
-};
-
 static const struct apple_mbox_hw apple_mbox_t6050_ascwrap_v6_hw = {
 	.reg_offset = APPLE_ASCWRAP_V6_MBOX_OFFSET,
 	.is_ascwrap_v6 = true,
@@ -1718,23 +1709,6 @@ static const struct apple_mbox_hw apple_mbox_t6050_j775d_ascwrap_v6_hw = {
 	.is_ascwrap_v6 = true,
 	.ascwrap_v6_roles = apple_mbox_t6050_j775d_ascwrap_v6_roles,
 	.num_ascwrap_v6_roles = ARRAY_SIZE(apple_mbox_t6050_j775d_ascwrap_v6_roles),
-	.control_full = APPLE_ASC_MBOX_CONTROL_FULL,
-	.control_empty = APPLE_ASC_MBOX_CONTROL_EMPTY,
-	.a2i_control = APPLE_ASC_MBOX_A2I_CONTROL,
-	.a2i_send0 = APPLE_ASC_MBOX_A2I_SEND0,
-	.a2i_send1 = APPLE_ASC_MBOX_A2I_SEND1,
-	.i2a_control = APPLE_ASC_MBOX_I2A_CONTROL,
-	.i2a_recv0 = APPLE_ASC_MBOX_I2A_RECV0,
-	.i2a_recv1 = APPLE_ASC_MBOX_I2A_RECV1,
-	.has_irq_controls = false,
-};
-
-/* Retained compatibility profile: unshifted wrapper aliases, native VBAR. */
-static const struct apple_mbox_hw apple_mbox_t6050_apif_ascwrap_v6_hw = {
-	.reg_offset = APPLE_ASCWRAP_V6_MBOX_OFFSET,
-	.is_ascwrap_v6 = true,
-	.ascwrap_v6_roles = apple_mbox_t6050_apif_ascwrap_v6_roles,
-	.num_ascwrap_v6_roles = ARRAY_SIZE(apple_mbox_t6050_apif_ascwrap_v6_roles),
 	.control_full = APPLE_ASC_MBOX_CONTROL_FULL,
 	.control_empty = APPLE_ASC_MBOX_CONTROL_EMPTY,
 	.a2i_control = APPLE_ASC_MBOX_A2I_CONTROL,
@@ -1771,7 +1745,6 @@ static const struct of_device_id apple_mbox_of_match[] = {
 	{ .compatible = "apple,t6040-ascwrap-v6", .data = &apple_mbox_t6040_ascwrap_v6_hw },
 	{ .compatible = "apple,t8140-ascwrap-v6", .data = &apple_mbox_t8140_ascwrap_v6_hw },
 	{ .compatible = "apple,t8142-ascwrap-v6", .data = &apple_mbox_t8142_ascwrap_v6_hw },
-	{ .compatible = "apple,t6050-apif-ascwrap-v6", .data = &apple_mbox_t6050_apif_ascwrap_v6_hw },
 	{ .compatible = "apple,t6050-ascwrap-v6", .data = &apple_mbox_t6050_ascwrap_v6_hw },
 	{ .compatible = "apple,t6050-x1n1-ascwrap-v6", .data = &apple_mbox_t6050_ascwrap_v6_hw },
 	{ .compatible = "apple,t6050-j775d-ascwrap-v6",
