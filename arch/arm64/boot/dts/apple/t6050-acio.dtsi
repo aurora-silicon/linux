@@ -1,0 +1,345 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Die-0 T6050 USB4 routers. Resources follow the shared ATC2 driver
+ * layout; ATC0/1/3 addresses and interrupts are from the J775c ADT.
+ * Boards supply tunables, DROMs, PD graphs and enable policy.
+ */
+
+&pinctrl_aop {
+	acio0_lstx_pins: acio0-lstx-pins {
+		pinmux = <0x1004d>;
+	};
+	acio1_lstx_pins: acio1-lstx-pins {
+		pinmux = <0x1004f>;
+	};
+	acio3_lstx_pins: acio3-lstx-pins {
+		pinmux = <0x10053>;
+	};
+};
+
+&die0 {
+	acio0_mbox: mailbox@2a1108000 {
+		compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x2 0xa1108000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 837 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 838 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 839 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 840 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	acio0: acio@2a1ac0000 {
+		compatible = "apple,t6050-usb4-acio";
+		reg = <0x2 0xa1ac0000 0x0 0xc000>,
+		      <0x2 0xa1080000 0x0 0x26000>,
+		      <0x2 0xa1e44000 0x0 0x4000>,
+		      <0x2 0xa1100000 0x0 0x4000>,
+		      <0x2 0xa1c80000 0x0 0x4000>;
+		reg-names = "rc", "sram", "pcie-adapter", "cpu", "router-ap-fw";
+		mboxes = <&acio0_mbox>;
+		resets = <&cio_reconfig0 0>;
+		power-domains = <&ps_atc0_cio>, <&ps_atc0_cio_pcie>,
+				<&ps_atc0_cio_usb>, <&ps_atc0_cio_auss>;
+		thunderbolt-switch;
+		status = "disabled";
+		pinctrl-0 = <&acio0_lstx_pins>;
+		pinctrl-names = "lstx";
+		lstx-gpios = <&pinctrl_aop 77 GPIO_ACTIVE_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges = <0x0 0x2 0xa1000000 0x1000000>;
+		nonposted-mmio;
+		acio0_dart: iommu@a80000 {
+			compatible = "apple,t6050-dart", "apple,t8110-dart";
+			reg = <0xa80000 0xc000>;
+			interrupts = <AIC_IRQ 0 1606 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_atc0_cio>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x4000 0x0 0xffff0000>;
+			apple,bypass-sids = <15>;
+			apple,full-error-reporting;
+			apple,ctc-flush;
+		};
+		acio0_nhi: nhi@f00000 {
+			compatible = "apple,t6050-usb4-nhi";
+			reg = <0xf00000 0x100000>;
+			reg-names = "nhi";
+			interrupts = <AIC_IRQ 0 1579 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1580 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1581 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1582 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1583 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1584 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1585 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1586 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1587 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1588 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1589 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1590 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1591 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1592 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1593 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1594 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1595 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1596 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1597 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1598 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1599 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1600 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1601 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1602 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1608 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "txring0", "txring1", "txring2", "txring3",
+					  "txring4", "txring5", "txring6", "txring7",
+					  "txring8", "txring9", "txring10", "txring11",
+					  "rxring0", "rxring1", "rxring2", "rxring3",
+					  "rxring4", "rxring5", "rxring6", "rxring7",
+					  "rxring8", "rxring9", "rxring10", "rxring11",
+					  "parity";
+			iommus = <&acio0_dart 0>,
+				 <&acio0_dart 1>,
+				 <&acio0_dart 2>,
+				 <&acio0_dart 3>,
+				 <&acio0_dart 4>,
+				 <&acio0_dart 5>,
+				 <&acio0_dart 6>,
+				 <&acio0_dart 7>,
+				 <&acio0_dart 8>,
+				 <&acio0_dart 9>,
+				 <&acio0_dart 10>,
+				 <&acio0_dart 11>,
+				 <&acio0_dart 16>,
+				 <&acio0_dart 17>,
+				 <&acio0_dart 18>,
+				 <&acio0_dart 19>,
+				 <&acio0_dart 20>,
+				 <&acio0_dart 21>,
+				 <&acio0_dart 22>,
+				 <&acio0_dart 23>,
+				 <&acio0_dart 24>,
+				 <&acio0_dart 25>,
+				 <&acio0_dart 26>,
+				 <&acio0_dart 27>;
+		};
+	};
+
+	acio1_mbox: mailbox@2a9108000 {
+		compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x2 0xa9108000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 847 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 848 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 849 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 850 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	acio1: acio@2a9ac0000 {
+		compatible = "apple,t6050-usb4-acio";
+		reg = <0x2 0xa9ac0000 0x0 0xc000>,
+		      <0x2 0xa9080000 0x0 0x26000>,
+		      <0x2 0xa9e44000 0x0 0x4000>,
+		      <0x2 0xa9100000 0x0 0x4000>,
+		      <0x2 0xa9c80000 0x0 0x4000>;
+		reg-names = "rc", "sram", "pcie-adapter", "cpu", "router-ap-fw";
+		mboxes = <&acio1_mbox>;
+		resets = <&cio_reconfig0 1>;
+		power-domains = <&ps_atc1_cio>, <&ps_atc1_cio_pcie>,
+				<&ps_atc1_cio_usb>, <&ps_atc1_cio_auss>;
+		thunderbolt-switch;
+		status = "disabled";
+		pinctrl-0 = <&acio1_lstx_pins>;
+		pinctrl-names = "lstx";
+		lstx-gpios = <&pinctrl_aop 79 GPIO_ACTIVE_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges = <0x0 0x2 0xa9000000 0x1000000>;
+		nonposted-mmio;
+		acio1_dart: iommu@a80000 {
+			compatible = "apple,t6050-dart", "apple,t8110-dart";
+			reg = <0xa80000 0xc000>;
+			interrupts = <AIC_IRQ 0 1638 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_atc1_cio>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x4000 0x0 0xffff0000>;
+			apple,bypass-sids = <15>;
+			apple,full-error-reporting;
+			apple,ctc-flush;
+		};
+		acio1_nhi: nhi@f00000 {
+			compatible = "apple,t6050-usb4-nhi";
+			reg = <0xf00000 0x100000>;
+			reg-names = "nhi";
+			interrupts = <AIC_IRQ 0 1611 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1612 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1613 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1614 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1615 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1616 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1617 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1618 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1619 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1620 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1621 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1622 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1623 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1624 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1625 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1626 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1627 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1628 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1629 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1630 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1631 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1632 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1633 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1634 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1640 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "txring0", "txring1", "txring2", "txring3",
+					  "txring4", "txring5", "txring6", "txring7",
+					  "txring8", "txring9", "txring10", "txring11",
+					  "rxring0", "rxring1", "rxring2", "rxring3",
+					  "rxring4", "rxring5", "rxring6", "rxring7",
+					  "rxring8", "rxring9", "rxring10", "rxring11",
+					  "parity";
+			iommus = <&acio1_dart 0>,
+				 <&acio1_dart 1>,
+				 <&acio1_dart 2>,
+				 <&acio1_dart 3>,
+				 <&acio1_dart 4>,
+				 <&acio1_dart 5>,
+				 <&acio1_dart 6>,
+				 <&acio1_dart 7>,
+				 <&acio1_dart 8>,
+				 <&acio1_dart 9>,
+				 <&acio1_dart 10>,
+				 <&acio1_dart 11>,
+				 <&acio1_dart 16>,
+				 <&acio1_dart 17>,
+				 <&acio1_dart 18>,
+				 <&acio1_dart 19>,
+				 <&acio1_dart 20>,
+				 <&acio1_dart 21>,
+				 <&acio1_dart 22>,
+				 <&acio1_dart 23>,
+				 <&acio1_dart 24>,
+				 <&acio1_dart 25>,
+				 <&acio1_dart 26>,
+				 <&acio1_dart 27>;
+		};
+	};
+
+	acio3_mbox: mailbox@389108000 {
+		compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x89108000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 867 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 868 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 869 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 870 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	acio3: acio@389ac0000 {
+		compatible = "apple,t6050-usb4-acio";
+		reg = <0x3 0x89ac0000 0x0 0xc000>,
+		      <0x3 0x89080000 0x0 0x26000>,
+		      <0x3 0x89e44000 0x0 0x4000>,
+		      <0x3 0x89100000 0x0 0x4000>,
+		      <0x3 0x89c80000 0x0 0x4000>;
+		reg-names = "rc", "sram", "pcie-adapter", "cpu", "router-ap-fw";
+		mboxes = <&acio3_mbox>;
+		resets = <&cio_reconfig0 3>;
+		power-domains = <&ps_atc3_cio>, <&ps_atc3_cio_pcie>,
+				<&ps_atc3_cio_usb>, <&ps_atc3_cio_auss>;
+		thunderbolt-switch;
+		status = "disabled";
+		pinctrl-0 = <&acio3_lstx_pins>;
+		pinctrl-names = "lstx";
+		lstx-gpios = <&pinctrl_aop 83 GPIO_ACTIVE_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges = <0x0 0x3 0x89000000 0x1000000>;
+		nonposted-mmio;
+		acio3_dart: iommu@a80000 {
+			compatible = "apple,t6050-dart", "apple,t8110-dart";
+			reg = <0xa80000 0xc000>;
+			interrupts = <AIC_IRQ 0 1702 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_atc3_cio>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x4000 0x0 0xffff0000>;
+			apple,bypass-sids = <15>;
+			apple,full-error-reporting;
+			apple,ctc-flush;
+		};
+		acio3_nhi: nhi@f00000 {
+			compatible = "apple,t6050-usb4-nhi";
+			reg = <0xf00000 0x100000>;
+			reg-names = "nhi";
+			interrupts = <AIC_IRQ 0 1675 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1676 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1677 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1678 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1679 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1680 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1681 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1682 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1683 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1684 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1685 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1686 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1687 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1688 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1689 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1690 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1691 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1692 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1693 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1694 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1695 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1696 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1697 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1698 IRQ_TYPE_LEVEL_HIGH>,
+						     <AIC_IRQ 0 1704 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "txring0", "txring1", "txring2", "txring3",
+					  "txring4", "txring5", "txring6", "txring7",
+					  "txring8", "txring9", "txring10", "txring11",
+					  "rxring0", "rxring1", "rxring2", "rxring3",
+					  "rxring4", "rxring5", "rxring6", "rxring7",
+					  "rxring8", "rxring9", "rxring10", "rxring11",
+					  "parity";
+			iommus = <&acio3_dart 0>,
+				 <&acio3_dart 1>,
+				 <&acio3_dart 2>,
+				 <&acio3_dart 3>,
+				 <&acio3_dart 4>,
+				 <&acio3_dart 5>,
+				 <&acio3_dart 6>,
+				 <&acio3_dart 7>,
+				 <&acio3_dart 8>,
+				 <&acio3_dart 9>,
+				 <&acio3_dart 10>,
+				 <&acio3_dart 11>,
+				 <&acio3_dart 16>,
+				 <&acio3_dart 17>,
+				 <&acio3_dart 18>,
+				 <&acio3_dart 19>,
+				 <&acio3_dart 20>,
+				 <&acio3_dart 21>,
+				 <&acio3_dart 22>,
+				 <&acio3_dart 23>,
+				 <&acio3_dart 24>,
+				 <&acio3_dart 25>,
+				 <&acio3_dart 26>,
+				 <&acio3_dart 27>;
+		};
+	};
+
+};

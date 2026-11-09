@@ -33,8 +33,8 @@
 		atcphy4 = &atc4_phy;
 		atcphy5 = &atc1_phy_die1;
 		/* Aura's ACIO tunable copy fills rear port 4's router (/arm-io/acio3) through these. */
-		usb4-3-acio = &usb4_3_acio;
-		usb4-3-nhi = &usb4_3_nhi;
+		usb4-3-acio = &acio3;
+		usb4-3-nhi = &acio3_nhi;
 		/* asahi-bless and the boot loader's dt_set_nvram find the partition by this alias */
 		nvram = &nvram;
 	};
@@ -435,7 +435,7 @@
 	};
 };
 
-&usb4_3_acio {
+&acio3 {
 	ports {
 		#address-cells = <1>;
 		#size-cells = <0>;
