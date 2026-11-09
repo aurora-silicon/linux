@@ -33,7 +33,9 @@ static int macaudio_test_vol_info(struct snd_kcontrol *kctl, struct snd_ctl_elem
 {
 	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
 	uinfo->count = 1;
-	uinfo->value.integer.max = macaudio_test_vol(kctl)->mc.max;
+	/* As snd_soc_info_volsw(): a limit is the top of the range */
+	uinfo->value.integer.max = macaudio_test_vol(kctl)->mc.platform_max ?:
+				   macaudio_test_vol(kctl)->mc.max;
 	return 0;
 }
 
@@ -98,7 +100,20 @@ struct macaudio_test_spk {
 	/* "Speaker Protection Crossover" */
 	struct snd_kcontrol *xover;
 	struct snd_ctl_file *owner;
+	/* The codec the speaker volumes belong to */
+	struct snd_soc_component component;
 };
+
+/* The card's control named @name */
+static struct snd_kcontrol_new macaudio_test_control(const char *name)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(macaudio_controls); i++)
+		if (macaudio_controls[i].name && !strcmp(macaudio_controls[i].name, name))
+			return macaudio_controls[i];
+	return (struct snd_kcontrol_new){};
+}
 
 static struct snd_kcontrol *macaudio_test_add_kctl(struct kunit *test, struct snd_card *card,
 						   const struct snd_kcontrol_new *tmpl,
@@ -118,7 +133,7 @@ static struct snd_kcontrol *macaudio_test_add_kctl(struct kunit *test, struct sn
 static void macaudio_test_spk_card(struct kunit *test, struct macaudio_test_spk *t,
 				   const struct macaudio_platform_cfg *cfg, long max)
 {
-	struct snd_kcontrol_new spk = macaudio_controls[ARRAY_SIZE(macaudio_controls) - 1];
+	struct snd_kcontrol_new spk = macaudio_test_control("Speaker Protection");
 	struct macaudio_snd_data *ma;
 	struct snd_card *card;
 	struct device *dev;
@@ -148,7 +163,14 @@ static void macaudio_test_spk_card(struct kunit *test, struct macaudio_test_spk 
 	ma->cfg = cfg;
 	ma->has_speakers = true;
 	mutex_init(&ma->spk_mutex);
+	mutex_init(&ma->volume_lock_mutex);
+	INIT_DELAYED_WORK(&ma->lock_timeout_work, macaudio_vlimit_timeout_work);
+	INIT_WORK(&ma->lock_fail_work, macaudio_lock_fail_work);
+	INIT_WORK(&ma->sw_gain_stop_work, macaudio_sw_gain_stop_work);
+	/* The lease is the interface, as after "Speaker Protection Interface" */
+	ma->spk_iface = MACAUDIO_SPK_IFACE_LEASE;
 	KUNIT_ASSERT_EQ(test, macaudio_spk_init(ma), 0);
+	t->component.card = &ma->card;
 
 	t->ma = ma;
 	t->spk = macaudio_test_add_kctl(test, card, &spk, &ma->card);
@@ -170,7 +192,7 @@ static void macaudio_test_spk_card(struct kunit *test, struct macaudio_test_spk 
 		if (cfg->amp == AMP_MAX98360A && i < MACAUDIO_TEST_NR_SPK)
 			tmpl.name = macaudio_test_sw_vol_names[i];
 		tmpl.private_value = (unsigned long)&vol->mc;
-		t->vols[i] = macaudio_test_add_kctl(test, card, &tmpl, NULL);
+		t->vols[i] = macaudio_test_add_kctl(test, card, &tmpl, &t->component);
 	}
 	t->xover = macaudio_test_add_kctl(test, card, &macaudio_spk_xover_control, &ma->card);
 
@@ -266,9 +288,8 @@ static void macaudio_spk_floor_from_binding(struct kunit *test)
 
 	/* Userspace can read the speaker volumes but never write them */
 	for (i = 0; i < MACAUDIO_TEST_NR_SPK; i++)
-		KUNIT_EXPECT_FALSE(test, t.vols[i]->vd[0].access & SNDRV_CTL_ELEM_ACCESS_WRITE);
-	KUNIT_EXPECT_TRUE(test, t.vols[MACAUDIO_TEST_NR_SPK]->vd[0].access &
-			  SNDRV_CTL_ELEM_ACCESS_WRITE);
+		KUNIT_EXPECT_EQ(test, t.vols[i]->write_check(t.vols[i], NULL), -EPERM);
+	KUNIT_EXPECT_NULL(test, t.vols[MACAUDIO_TEST_NR_SPK]->write_check);
 }
 
 static void macaudio_spk_grant_needs_owner_and_valid_lease(struct kunit *test)
@@ -703,7 +724,10 @@ static void macaudio_spk_regrant_waits_for_the_stop(struct kunit *test)
 	macaudio_test_expect_vols(test, &t, SN012776_0DB);
 }
 
-/* "Amp Gain Volume": held at the configured gain, readable, not writable */
+/*
+ * "Amp Gain Volume": limited at the configured gain, fixed at it while
+ * leased and not writable then, the amp's own under the volume lock.
+ */
 static void macaudio_spk_amp_gain_is_fixed(struct kunit *test)
 {
 	static const char *const names[] = {
@@ -715,6 +739,7 @@ static void macaudio_spk_amp_gain_is_fixed(struct kunit *test)
 	struct macaudio_test_spk t;
 	const int level = 15;
 	unsigned int i;
+	int ret;
 
 	macaudio_test_spk_card(test, &t, &macaudio_j316_cfg, SN012776_0DB);
 	for (i = 0; i < ARRAY_SIZE(names); i++) {
@@ -731,25 +756,35 @@ static void macaudio_spk_amp_gain_is_fixed(struct kunit *test)
 		KUNIT_ASSERT_NOT_NULL(test, vols[i]);
 		vols[i]->mc.max = 20;
 		tmpl.private_value = (unsigned long)&vols[i]->mc;
-		kctls[i] = macaudio_test_add_kctl(test, t.ma->card.snd_card, &tmpl, NULL);
+		kctls[i] = macaudio_test_add_kctl(test, t.ma->card.snd_card, &tmpl,
+						  &t.component);
 	}
 	/* Above the amp level (any level the ADT gives), and below it */
 	vols[0]->value = 20;
 	vols[1]->value = 5;
 
-	KUNIT_EXPECT_EQ(test, macaudio_set_fixed_volume(&t.ma->card, "* Amp Gain Volume",
-							level), 2);
+	KUNIT_EXPECT_EQ(test, snd_soc_limit_volume(&t.ma->card, "* Amp Gain Volume", level), 2);
+	KUNIT_EXPECT_EQ(test, vols[0]->value, (long)level);
+	KUNIT_EXPECT_EQ(test, vols[1]->value, 5L);
+	KUNIT_ASSERT_EQ(test, macaudio_spk_take_amp_gains(t.ma), 0);
+	KUNIT_EXPECT_EQ(test, t.ma->spk_nr_amp_gains, (unsigned int)ARRAY_SIZE(names));
+
+	mutex_lock(&t.ma->spk_mutex);
+	ret = macaudio_spk_fix_amp_gains(t.ma);
+	mutex_unlock(&t.ma->spk_mutex);
+	KUNIT_EXPECT_EQ(test, ret, 0);
 	for (i = 0; i < ARRAY_SIZE(names); i++) {
 		KUNIT_EXPECT_EQ(test, vols[i]->value, (long)level);
 		KUNIT_EXPECT_EQ(test, vols[i]->mc.platform_max, level);
-		KUNIT_EXPECT_TRUE(test, kctls[i]->vd[0].access & SNDRV_CTL_ELEM_ACCESS_READ);
-		KUNIT_EXPECT_FALSE(test, kctls[i]->vd[0].access & SNDRV_CTL_ELEM_ACCESS_WRITE);
+		KUNIT_EXPECT_EQ(test, kctls[i]->write_check(kctls[i], NULL), -EPERM);
 	}
 	/* The speaker volumes and the headphone volume are not amp gains */
-	KUNIT_EXPECT_TRUE(test, t.vols[MACAUDIO_TEST_NR_SPK]->vd[0].access &
-			  SNDRV_CTL_ELEM_ACCESS_WRITE);
-	KUNIT_EXPECT_EQ(test, macaudio_set_fixed_volume(&t.ma->card, "* Missing Volume", 15),
-			-EINVAL);
+	KUNIT_EXPECT_NULL(test, t.vols[MACAUDIO_TEST_NR_SPK]->write_check);
+
+	/* Under the volume lock they are the amp's again */
+	WRITE_ONCE(t.ma->spk_iface, MACAUDIO_SPK_IFACE_UNLOCK);
+	for (i = 0; i < ARRAY_SIZE(names); i++)
+		KUNIT_EXPECT_EQ(test, kctls[i]->write_check(kctls[i], NULL), 0);
 }
 
 struct macaudio_test_sleep {
