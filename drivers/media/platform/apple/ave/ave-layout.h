@@ -21,6 +21,12 @@ struct ave_reply {
 	u32 subtype, status, raw_status, bytes;
 };
 
+enum ave_layout_kind {
+	AVE_LAYOUT_9003,
+	AVE_LAYOUT_26A428,
+	AVE_LAYOUT_6070,
+};
+
 struct ave_fw_transport {
 	u32 ipc_bytes;
 	u32 command_offset, command_bytes, scalar_offset;
@@ -56,11 +62,46 @@ struct ave_surface_layout {
 	u32 address_stride, size_stride;
 };
 
+#define AVE_OFFSET_ABSENT U32_MAX
+
 #define AVE_SURFACE(off, stride)      \
 	{ .address = (off),           \
 	  .size = (off) + 8,          \
 	  .address_stride = (stride), \
 	  .size_stride = (stride) }
+
+#define AVE_ADDRESS_BANK(off, stride)          \
+	{ .address = (off),                     \
+	  .size = AVE_OFFSET_ABSENT,             \
+	  .address_stride = (stride),            \
+	  .size_stride = 0 }
+
+/* A fixed-capacity bank of addresses, optionally repeated by the ABI. */
+struct ave_address_bank_layout {
+	u32 address;
+	u16 entries, banks;
+	u16 entry_stride, bank_stride;
+	u8 values; /* consecutive u64 values in each entry */
+};
+
+/* Four 6070 entropy sets are interleaved by set inside each entry. */
+struct ave_entropy_layout {
+	u32 address, size;
+	u16 entries, sets;
+	u16 address_entry_stride, address_set_stride;
+	u16 size_entry_stride, size_set_stride;
+};
+
+struct ave_rational_layout {
+	u32 numerator, denominator;
+};
+
+/* A session-owned codec-state span copied into each Process command. */
+struct ave_retained_partition {
+	u32 command_offset, state_offset, bytes;
+};
+
+#define AVE_MAX_RETAINED_PARTITIONS 3
 
 /* Zero offsets denote fields absent from a firmware's wire format. */
 struct ave_start_layout {
@@ -68,18 +109,21 @@ struct ave_start_layout {
 	struct ave_surface_layout ref_a, ref_b, ref_c, ref_c_alias, ref_d;
 	struct ave_surface_layout ref_e, ref_f;
 	struct ave_surface_layout mb, coded, meta, row_a, row_b, fixed,
-		hevc_extra;
+		neighbour_fw, hevc_extra;
 	struct ave_surface_layout tiles[8];
+	struct ave_address_bank_layout recon, colocated, lfs, lfs_result;
+	struct ave_entropy_layout entropy;
 	u32 refs_count, work_count, lfs_count, slots_count, meta_count;
 	u32 mb_count, row_a_count, row_b_count, fixed_count, tiles_count;
 	u32 codec;
 	u32 flag_8bit;
 	u32 const_214;
 	u32 const_218;
-	u32 fps;
+	struct ave_rational_layout fps;
 	u32 rc_mode;
 	u32 bitrate;
 	u32 init_qp;
+	u8 init_qp_words; /* zero preserves the older three-word representation */
 	u32 limits;
 	u32 limit_bytes;
 	u32 limit_secs;
@@ -155,8 +199,9 @@ struct ave_start_layout {
 };
 
 struct ave_proc_layout {
+	u32 pic_size;
 	u32 first_frame;
-	u32 y, uv; /* {u64 address, u32 size, u32 stride} */
+	u32 y, uv; /* ABI-specific plane entry; 6070 is {address, stride, zero} */
 	u32 in_w, in_h;
 	u32 coded_cap;
 	u32 fps_int;
@@ -176,11 +221,14 @@ struct ave_proc_layout {
 	u32 crop; /* HEVC only */
 	u32 meta_size, extra, frame_size;
 	u32 low_delay; /* HEVC only: 3 with reordering off */
+	struct ave_retained_partition retained[AVE_MAX_RETAINED_PARTITIONS];
+	u8 retained_count;
 };
 
 struct ave_fw_layout {
 	const char *name;
 	const struct ave_fw_abi *abi;
+	enum ave_layout_kind kind;
 	bool encode_ready;
 	size_t bytes[2][AVE_IMAGE_COUNT];
 	struct ave_start_layout start[2];
@@ -188,6 +236,8 @@ struct ave_fw_layout {
 	u32 hdr_bytes, meta_bytes;
 	u32 process_timeout_us;
 	u8 process_subtype, max_slots, mcc_dsid;
+	u8 max_sessions;
+	u32 codec_state_bytes[2];
 	bool counted;
 };
 
