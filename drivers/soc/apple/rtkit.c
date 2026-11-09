@@ -13,6 +13,7 @@
 #include <linux/of.h>
 #include <linux/overflow.h>
 #include <linux/sizes.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/suspend.h>
 
 enum {
@@ -837,6 +838,7 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 			ret ? "not mapped" : "mapped, waiting for its log", ret);
 		if (!rtk->crashed) {
 			rtk->crashed = true;
+			apple_sleep_coproc_crashed(rtk->dev);
 			if (rtk->ops->crashed)
 				rtk->ops->crashed(rtk->cookie, NULL, 0);
 		}
@@ -877,6 +879,7 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 				"RTKit: firmware-owned crash log at DVA %pad (0x%zx bytes)\n",
 				&rtk->crashlog_buffer.iova, rtk->crashlog_buffer.size);
 		rtk->crashed = true;
+		apple_sleep_coproc_crashed(rtk->dev);
 		if (rtk->ops->crashed)
 			rtk->ops->crashed(rtk->cookie, NULL, 0);
 		return;
@@ -901,6 +904,7 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 	if (rtk->crashed)
 		return;
 	rtk->crashed = true;
+	apple_sleep_coproc_crashed(rtk->dev);
 	if (rtk->ops->crashed)
 		rtk->ops->crashed(rtk->cookie, bfr, bfr ? rtk->crashlog_buffer.size : 0);
 	return;
@@ -911,6 +915,7 @@ unmapped:
 		return;
 	dev_err(rtk->dev, "RTKit: adopted co-processor crashed without a readable log\n");
 	rtk->crashed = true;
+	apple_sleep_coproc_crashed(rtk->dev);
 	if (rtk->ops->crashed)
 		rtk->ops->crashed(rtk->cookie, NULL, 0);
 }

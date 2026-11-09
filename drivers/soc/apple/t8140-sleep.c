@@ -562,6 +562,13 @@ static void __iomem *t8140_slp_ddr_word;
  */
 static bool t8140_slp_ddr_ready;
 
+/*
+ * A coprocessor that runs through a sleep crashed. The AOP is the always-on master SLP_DDR keeps
+ * DRAM up for: after its firmware crashed, the next SLP_DDR wake stalled in the sleep engine,
+ * while the deep path doesn't need it. Nothing restarts it short of a reboot.
+ */
+static bool t8140_slp_ddr_crashed;
+
 static void t8140_slp_ddr_write(void)
 {
 	u32 val;
@@ -570,7 +577,7 @@ static void t8140_slp_ddr_write(void)
 	if (!t8140_slp_ddr_word)
 		return;
 	val = readl(t8140_slp_ddr_word) & ~WAKE_SLP_DDR_USB;
-	if (t8140_slp_ddr_usb && t8140_slp_ddr_ready)
+	if (t8140_slp_ddr_usb && t8140_slp_ddr_ready && !t8140_slp_ddr_crashed)
 		val |= WAKE_SLP_DDR_USB;
 	writel(val, t8140_slp_ddr_word);
 }
@@ -582,6 +589,26 @@ void apple_sleep_usb_slp_ddr(bool up)
 	t8140_slp_ddr_write();
 }
 EXPORT_SYMBOL_GPL(apple_sleep_usb_slp_ddr);
+
+/*
+ * From RTKit, for every firmware crash. One this driver stops and restarts around each sleep
+ * doesn't run through it; for any other, every later sleep takes the deep path. It may come
+ * from a poll with interrupts off, so the table is read without its lock: entries only change
+ * at registration.
+ */
+void apple_sleep_coproc_crashed(struct device *dev)
+{
+	if (!t8140_sleep || t8140_sleep_coproc_find(dev))
+		return;
+	scoped_guard(spinlock_irqsave, &t8140_slp_ddr_lock) {
+		if (t8140_slp_ddr_crashed)
+			return;
+		t8140_slp_ddr_crashed = true;
+		t8140_slp_ddr_write();
+	}
+	dev_warn(t8140_sleep->dev, "%s crashed: later sleeps take the deep path\n", dev_name(dev));
+}
+EXPORT_SYMBOL_GPL(apple_sleep_coproc_crashed);
 
 static bool t8140_debug_link_cut;
 

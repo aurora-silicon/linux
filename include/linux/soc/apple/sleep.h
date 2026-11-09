@@ -112,6 +112,9 @@ void apple_sleep_lid_closed_wake(void);
 /* The radio's host has its port back after a real sleep, so the next commit may stop it. */
 void apple_sleep_radio_port_up(void);
 
+/* From RTKit: this coprocessor's firmware crashed. */
+void apple_sleep_coproc_crashed(struct device *dev);
+
 /* After a deep sleep, put back the pins it reset. ANS's driver calls it before the run bit. */
 void apple_sleep_restore_pins(void);
 
@@ -215,6 +218,10 @@ static inline void apple_sleep_lid_closed_wake(void)
 }
 
 static inline void apple_sleep_radio_port_up(void)
+{
+}
+
+static inline void apple_sleep_coproc_crashed(struct device *dev)
 {
 }
 
