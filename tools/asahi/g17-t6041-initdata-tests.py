@@ -102,6 +102,7 @@ SOC_ITEMS = [
 ]
 
 T6041_ITEMS = SOC_ITEMS + [
+    "pub(crate) const REGISTER_WINDOWS_25G83",
     "const RESERVED_SLOTS",
     "const MAX_POWER_MW",
     "const CHIP: ",
@@ -190,9 +191,20 @@ fn main() {
         &t6041::RESERVED_SLOTS, &t6041::PERF, &T6041_OPPS, &T6041_AUX, &t6041::CHIP,
         &t6041::REGION_C, 40);
     println!("T6041 initialization objects built");
-    std::fs::write(format!("{}/t6041-hwdata.bin", out), hw).unwrap();
-    std::fs::write(format!("{}/t6041-power-config.bin", out), power).unwrap();
-    std::fs::write(format!("{}/t6041-region-c.bin", out), region).unwrap();
+    std::fs::write(format!("{}/t6041-hwdata.bin", out), &hw).unwrap();
+    std::fs::write(format!("{}/t6041-power-config.bin", out), &power).unwrap();
+    std::fs::write(format!("{}/t6041-region-c.bin", out), &region).unwrap();
+    // 25G83: the same configuration with its own register map.
+    let (hw_g83, power_g83, region_g83) = build(t6041::CHIP_ID, &t6041::REGISTER_WINDOWS_25G83,
+        &[], &t6041::PERF, &T6041_OPPS, &T6041_AUX, &t6041::CHIP, &t6041::REGION_C, 40);
+    println!("T6041 25G83 initialization objects built");
+    assert_eq!(power_g83, power, "the register map changes only the hardware data");
+    assert_eq!(region_g83, region, "the register map changes only the hardware data");
+    let map = 0x640..0x640 + REGISTER_MAP_SLOTS * core::mem::size_of::<RegisterMapEntry>();
+    let outside = |a: &[u8], b: &[u8]| a.iter().zip(b).enumerate()
+        .filter(|(i, (x, y))| x != y && !map.contains(i)).count();
+    assert_eq!(outside(&hw_g83, &hw), 0, "the 25G83 hardware data differs only in its register map");
+    std::fs::write(format!("{}/t6041-25g83-hwdata.bin", out), &hw_g83).unwrap();
 }
 """
 

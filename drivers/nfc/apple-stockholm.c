@@ -20,6 +20,7 @@
 #include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/of.h>
 #include <linux/property.h>
 #include <linux/spmi.h>
 #include <linux/unaligned.h>
@@ -61,6 +62,20 @@ static const struct stockholm_model stockholm_model96 = {
 	.follower_id = 0x19,
 	.irq_base = 0xe0,
 	.standby_off = 0x14,
+	.startup_delay_us = 10000,
+};
+
+/* M1/M2 generation (T6000, T8112): the legacy follower, same map. */
+static const struct stockholm_model stockholm_model_b2 = {
+	.tx_reg = 0x1000,
+	.rx_reg = 0x80,
+	.id_reg = 0x100,
+	.irq_reg = 0x105,
+	.standby_reg = 0x0,
+	.follower_id = 0x1c,
+	.irq_base = 0xa0,
+	.standby_off = 0x14,
+	/* Commands are not acknowledged until about 10 ms after VEN rises. */
 	.startup_delay_us = 10000,
 };
 
@@ -408,6 +423,24 @@ static int stockholm_probe(struct spmi_device *sdev)
 		return dev_err_probe(dev, PTR_ERR(st->enable_gpio),
 				     "failed to get VEN GPIO\n");
 
+	/*
+	 * The T8112 AOP SPMI controller has no AP interrupt, so its followers
+	 * have none either. Check that the controller answers and park it.
+	 */
+	if (!of_property_present(sdev->ctrl->dev.of_node, "interrupts")) {
+		ret = stockholm_power_on(st);
+		if (ret)
+			return dev_err_probe(dev, ret, "failed to raise VEN\n");
+		ret = stockholm_check_follower(st);
+		err = stockholm_park(st);
+		if (err)
+			return dev_err_probe(dev, err, "failed to park VEN low\n");
+		if (!ret)
+			dev_info(dev, "follower %#04x present, no interrupt path; parked off\n",
+				 st->model->follower_id);
+		return ret;
+	}
+
 	st->data_irq = stockholm_request_irq(st, "data-ready",
 					     stockholm_data_irq);
 	if (st->data_irq < 0)
@@ -442,6 +475,8 @@ static int stockholm_probe(struct spmi_device *sdev)
 
 static const struct of_device_id stockholm_of_match[] = {
 	{ .compatible = "apple,stockholm-nci", .data = &stockholm_model96 },
+	{ .compatible = "apple,t6000-stockholm-spmi", .data = &stockholm_model_b2 },
+	{ .compatible = "apple,t8112-stockholm-spmi", .data = &stockholm_model_b2 },
 	{}
 };
 MODULE_DEVICE_TABLE(of, stockholm_of_match);
