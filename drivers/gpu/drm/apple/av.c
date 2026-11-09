@@ -591,6 +591,30 @@ int dcp_audiosrv_get_product_attrs(struct device *dev, void *attrs, size_t maxsi
 	return ret;
 }
 
+/*
+ * The ELD of the display this processor drives, as drm builds it from the
+ * connector's EDID: monitor name, vendor and product codes, connection type
+ * and the audio descriptors of a CTA-861 audio block, if there is one.
+ * Zeroes without a connector or EDID.
+ */
+int dcp_audio_sink_eld(struct device *dev, u8 *eld, size_t size)
+{
+	struct apple_dcp *dcp;
+	struct apple_connector *connector;
+
+	KUNIT_STATIC_STUB_REDIRECT(dcp_audio_sink_eld, dev, eld, size);
+	memset(eld, 0, size);
+	dcp = dev_get_drvdata(dev);
+	if (!dcp)
+		return -ENODEV;
+	connector = READ_ONCE(dcp->connector);
+	if (!connector)
+		return -ENODEV;
+	guard(mutex)(&connector->base.eld_mutex);
+	memcpy(eld, connector->base.eld, min(size, sizeof(connector->base.eld)));
+	return 0;
+}
+
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
 /* A DCPAV report (group 2) with command 1: Terminate. */
 static bool av_report_terminate(const void *data, size_t size)
