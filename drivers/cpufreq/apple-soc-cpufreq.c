@@ -226,6 +226,8 @@ struct apple_cpu_priv {
 	unsigned int pmp_max_freq;
 	atomic_t pmp_vote;
 	bool pmp_stale;
+	bool pmp_disabled;
+	unsigned long pmp_retry_at;
 	struct irq_work pmp_irq_work;
 	struct work_struct pmp_work;
 	struct device *cpu_dev;
@@ -416,10 +418,20 @@ static void apple_soc_cpufreq_pmp_work(struct work_struct *work)
 	ret = apple_pmp_set_device_constraint(priv->pmp_device,
 					      FIELD_GET(APPLE_PMP_VOTE_DCS, vote),
 					      FIELD_GET(APPLE_PMP_VOTE_SOC, vote));
-	if (ret && ret != -ENODEV && ret != -EPROBE_DEFER && ret != -EAGAIN)
-		dev_warn_once(priv->cpu_dev, "PMP memory/fabric command failed: %d\n", ret);
-	/* A failed command (PMP not up yet) is retried on the next request. */
-	WRITE_ONCE(priv->pmp_stale, ret != 0);
+	if (ret == -ENODEV || ret == -EPROBE_DEFER || ret == -EAGAIN) {
+		/* The PMP is not up yet: retry at most once a second. */
+		WRITE_ONCE(priv->pmp_retry_at, jiffies + HZ);
+		WRITE_ONCE(priv->pmp_stale, true);
+		return;
+	}
+	WRITE_ONCE(priv->pmp_stale, false);
+	if (ret) {
+		/* A rejected or lost command stops the votes for this policy. */
+		WRITE_ONCE(priv->pmp_disabled, true);
+		dev_warn(priv->cpu_dev, "PMP memory/fabric command failed: %d; votes stopped\n",
+			 ret);
+		return;
+	}
 	/* A request which arrived during the exchange must not be lost. */
 	if (vote != atomic_read(&priv->pmp_vote))
 		schedule_work(&priv->pmp_work);
@@ -446,14 +458,15 @@ static void apple_soc_cpufreq_pmp_vote(struct apple_cpu_priv *priv,
 	unsigned int q;
 	int vote;
 
-	if (!priv->pmp_report || !priv->pmp_max_freq)
+	if (!priv->pmp_report || !priv->pmp_max_freq || READ_ONCE(priv->pmp_disabled))
 		return;
 	q = min(freq * ARRAY_SIZE(dcs) / priv->pmp_max_freq,
 		(unsigned int)ARRAY_SIZE(dcs) - 1);
 	vote = FIELD_PREP(APPLE_PMP_VOTE_DCS, dcs[q]) |
 	       FIELD_PREP(APPLE_PMP_VOTE_SOC, soc[q]);
 	/* Firmware commands sleep for their reply; fast-switch only queues work. */
-	if (atomic_xchg(&priv->pmp_vote, vote) != vote || READ_ONCE(priv->pmp_stale))
+	if (atomic_xchg(&priv->pmp_vote, vote) != vote ||
+	    (READ_ONCE(priv->pmp_stale) && time_after(jiffies, READ_ONCE(priv->pmp_retry_at))))
 		irq_work_queue(&priv->pmp_irq_work);
 }
 
