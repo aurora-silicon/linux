@@ -163,6 +163,7 @@
 		reg = <0x7 0x01e50000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1306 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_atc0_cio>;
 		status = "disabled";
 	};
 
@@ -171,6 +172,7 @@
 		reg = <0x7 0x01e58000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1307 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_atc0_cio>;
 		status = "disabled";
 	};
 
@@ -191,6 +193,7 @@
 		reg = <0xb 0x01e50000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1354 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_atc1_cio>;
 		status = "disabled";
 	};
 
@@ -199,6 +202,7 @@
 		reg = <0xb 0x01e58000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1355 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_atc1_cio>;
 		status = "disabled";
 	};
 
@@ -219,6 +223,7 @@
 		reg = <0xf 0x01e50000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1402 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_atc2_cio>;
 		status = "disabled";
 	};
 
@@ -227,6 +232,7 @@
 		reg = <0xf 0x01e58000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1403 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_atc2_cio>;
 		status = "disabled";
 	};
 
