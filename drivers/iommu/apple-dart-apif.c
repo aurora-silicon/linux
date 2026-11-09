@@ -1548,6 +1548,66 @@ apple_dart_apif_domain_alloc_paging(struct device *dev)
 	return &dom->domain;
 }
 
+/*
+ * The core attaches this before release_device(), so a released device no
+ * longer uses the domain that is about to be freed. Its SIDs leave that
+ * domain disabled, with the domain's mappings undone, as an attach unwind
+ * does. Without it the SIDs stayed enabled on the freed domain's tables, and
+ * the next attach of the same SIDs met that stale state. Retained SIDs keep
+ * their current handling.
+ */
+static int apple_dart_apif_release_attach(struct iommu_domain *domain,
+					  struct device *dev,
+					  struct iommu_domain *old)
+{
+	struct apple_dart_apif_master *master = dev_iommu_priv_get(dev);
+	struct apple_dart_apif_domain *prior;
+	unsigned long flags;
+	unsigned int sid;
+
+	if (!master || !old || old->owner != &apple_dart_apif_ops ||
+	    old->ops != apple_dart_apif_ops.default_domain_ops)
+		return 0;
+	prior = to_apif_domain(old);
+	mutex_lock(&prior->lock);
+	write_lock_irqsave(&prior->streams_lock, flags);
+	for (unsigned int i = 0; i < master->num_darts; i++) {
+		struct apple_dart_apif *dart = master->streams[i].dart;
+		struct apif_stream_map *before = apif_find_stream(prior, dart);
+
+		if (!before)
+			continue;
+		spin_lock(&dart->batch_lock);
+		for_each_set_bit(sid, master->streams[i].sids,
+				 dart->num_streams) {
+			if (dart->retained[sid] || !test_bit(sid, before->sids))
+				continue;
+			dart->batch->count = 1;
+			dart->batch->op[0] = (struct apif_op){
+				.op = APIF_DART_DISABLE,
+				.arg = { sid },
+			};
+			if (apif_ring(dart))
+				dev_err(dart->dev,
+					"failed to disable SID %u at release\n",
+					sid);
+			apif_undo_replay(prior, before, sid, U64_MAX);
+			clear_bit(sid, before->sids);
+		}
+		spin_unlock(&dart->batch_lock);
+	}
+	write_unlock_irqrestore(&prior->streams_lock, flags);
+	mutex_unlock(&prior->lock);
+	return 0;
+}
+
+static struct iommu_domain apple_dart_apif_release_domain = {
+	.type = IOMMU_DOMAIN_BLOCKED,
+	.ops = &(const struct iommu_domain_ops){
+		.attach_dev = apple_dart_apif_release_attach,
+	},
+};
+
 static struct iommu_device *apple_dart_apif_probe_device(struct device *dev)
 {
 	struct apple_dart_apif_master *master = dev_iommu_priv_get(dev);
@@ -1808,6 +1868,7 @@ static const struct iommu_ops apple_dart_apif_ops = {
 	.domain_alloc_paging = apple_dart_apif_domain_alloc_paging,
 	.probe_device = apple_dart_apif_probe_device,
 	.release_device = apple_dart_apif_release_device,
+	.release_domain = &apple_dart_apif_release_domain,
 	.device_group = apple_dart_apif_device_group,
 	.of_xlate = apple_dart_apif_of_xlate,
 	.owner = THIS_MODULE,

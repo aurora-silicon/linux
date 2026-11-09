@@ -510,6 +510,17 @@ void tb_domain_remove(struct tb *tb)
 
 	flush_workqueue(tb->wq);
 
+	/*
+	 * Stopping the connection manager removed the XDomains from the
+	 * topology and marked them unplugged, but they are still on the bus
+	 * with their service drivers bound. Unregister them now: a service
+	 * driver keeps its protocol handler registered until it is unbound
+	 * and would otherwise keep answering XDomain requests through
+	 * tb->ctl after the domain is gone. The control channel is stopped,
+	 * so whatever the service drivers send while unbinding fails at once.
+	 */
+	tb_domain_unregister_unplugged_xdomains(tb);
+
 	if (tb->cm_ops->deinit)
 		tb->cm_ops->deinit(tb);
 
