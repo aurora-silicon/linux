@@ -40,6 +40,8 @@
 #include <linux/rcupdate.h>
 #include <linux/reset.h>
 #include <linux/soc/apple/dart.h>
+#include <linux/soc/apple/dart-sleep.h>
+#include <linux/soc/apple/radio-sleep.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/soc/apple/t8132.h>
 #include <linux/soc/apple/tunable.h>
@@ -472,6 +474,8 @@ bool apple_pcie_tunnel_needs_cold_init(struct device_node *np)
 }
 EXPORT_SYMBOL_GPL(apple_pcie_tunnel_needs_cold_init);
 
+struct apple_radio_sleep;
+
 struct apple_pcie {
 	struct mutex		lock;
 	struct device		*dev;
@@ -501,6 +505,9 @@ struct apple_pcie {
 	bool			resume_failed; /* cleared only by teardown and reprobe */
 	struct reset_control	*reset;
 	u16			managed_sids;
+	struct apple_radio_sleep *radio;
+	unsigned int radio_writers;
+	bool radio_closed;
 	bool			neo_config_ready;
 	u8			neo_secondary_bus;
 	struct device		*piodma_supplier;
@@ -556,6 +563,10 @@ struct apple_pcie_port {
 	u8			adopted_bus;	/* adopt_link: the secondary bus */
 	unsigned long		adopted_slots;	/* adopt_link: RID2SID slots routed (slot == SID) */
 };
+
+static bool apple_radio_writer_closed(struct apple_pcie *pcie);
+static bool apple_radio_config_allowed(struct apple_pcie *pcie);
+static void __noreturn apple_radio_terminal(void);
 
 static int apple_pcie_managed_admit(struct apple_pcie_port *port);
 static struct apple_pcie *apple_pcie_lookup(struct device *dev);
@@ -693,14 +704,21 @@ static int apple_msi_domain_alloc(struct irq_domain *domain, unsigned int virq,
 	int ret, hwirq;
 
 	mutex_lock(&pcie->lock);
+	if (apple_radio_writer_closed(pcie)) {
+		mutex_unlock(&pcie->lock);
+		return -EBUSY;
+	}
+	pcie->radio_writers++;
 
 	hwirq = bitmap_find_free_region(pcie->bitmap, pcie->nvecs,
 					order_base_2(nr_irqs));
 
 	mutex_unlock(&pcie->lock);
 
-	if (hwirq < 0)
-		return -ENOSPC;
+	if (hwirq < 0) {
+		ret = -ENOSPC;
+		goto done;
+	}
 
 	fwspec.param[fwspec.param_count - 2] += hwirq;
 
@@ -710,7 +728,7 @@ static int apple_msi_domain_alloc(struct irq_domain *domain, unsigned int virq,
 		bitmap_release_region(pcie->bitmap, hwirq,
 				      order_base_2(nr_irqs));
 		mutex_unlock(&pcie->lock);
-		return ret;
+		goto done;
 	}
 
 	for (i = 0; i < nr_irqs; i++) {
@@ -718,7 +736,12 @@ static int apple_msi_domain_alloc(struct irq_domain *domain, unsigned int virq,
 					      &apple_msi_bottom_chip, pcie);
 	}
 
-	return 0;
+	ret = 0;
+done:
+	mutex_lock(&pcie->lock);
+	pcie->radio_writers--;
+	mutex_unlock(&pcie->lock);
+	return ret;
 }
 
 static void apple_msi_domain_free(struct irq_domain *domain, unsigned int virq,
@@ -728,6 +751,8 @@ static void apple_msi_domain_free(struct irq_domain *domain, unsigned int virq,
 	struct apple_pcie *pcie = domain->host_data;
 
 	mutex_lock(&pcie->lock);
+	if (apple_radio_writer_closed(pcie))
+		apple_radio_terminal();
 
 	bitmap_release_region(pcie->bitmap, d->hwirq, order_base_2(nr_irqs));
 
@@ -3246,6 +3271,10 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 		return err;
 	}
 	mutex_lock(&port->pcie->lock);
+	if (apple_radio_writer_closed(port->pcie)) {
+		mutex_unlock(&port->pcie->lock);
+		return -EBUSY;
+	}
 
 	if (port->pcie->managed_sids || port->pcie->hw->sid_indexed_rid2sid) {
 		if (sid >= port->sid_map_sz ||
@@ -3315,6 +3344,8 @@ static void apple_pcie_disable_device(struct pci_host_bridge *bridge, struct pci
 		return;
 
 	mutex_lock(&port->pcie->lock);
+	if (apple_radio_writer_closed(port->pcie))
+		apple_radio_terminal();
 
 	for_each_set_bit(idx, port->sid_map, port->sid_map_sz) {
 		u32 val;
@@ -3378,6 +3409,8 @@ static void __iomem *apple_pcie_map_bus(struct pci_bus *bus,
 	struct apple_pcie *pcie = apple_pcie_lookup(cfg->parent);
 	struct apple_pcie_port *port;
 
+	if (!apple_radio_config_allowed(pcie))
+		return NULL;
 	if (pcie->hw->adopt_link) {
 		/* Only adopted ports' root ports, and the endpoint behind each. */
 		list_for_each_entry(port, &pcie->ports, entry) {
@@ -4352,6 +4385,8 @@ absent:
 	dev_warn(dev, "no deep sleep: the loader didn't publish what this host needs\n");
 }
 
+#include "pcie-apple-radio.c"
+
 static int apple_pcie_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -4571,6 +4606,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	if (pcie->hw->tunneled)
 		pci_walk_bus(bridge->bus, apple_pcie_tunnel_keep_d0, NULL);
 
+	apple_radio_register(pdev, pcie);
 	return 0;
 }
 
@@ -5310,12 +5346,11 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 	}
 
 	/*
-	 * The managed radio has no suspend boundary of its own; suspend-to-idle
-	 * leaves it in place like any other internal port (no power domain).
+	 * The managed J713 radio has a native port/DART recovery transaction.
+	 * Suspend-to-idle leaves its link in place (no power domain).
 	 */
 	if (pcie->managed_sids)
-		return pm_suspend_target_state == PM_SUSPEND_TO_IDLE ||
-		       bringup_no_radio_refuse ? 0 : -EBUSY;
+		return apple_radio_suspend_noirq(pcie);
 	if (pcie->hw->adopt_link) {
 		int ret = apple_pcie_check_adopted_s2idle(pcie);
 
@@ -5696,6 +5731,8 @@ static int apple_pcie_resume_noirq(struct device *dev)
 	struct apple_pcie_port *port;
 	int ret;
 
+	if (pcie->managed_sids)
+		return apple_radio_resume_noirq(pcie);
 	if (pcie->neo_sleep_armed)
 		return apple_pcie_neo_resume_noirq(pcie);
 	if (pcie->hw->adopt_link) {
@@ -5782,6 +5819,8 @@ failed:
 }
 
 static const struct dev_pm_ops apple_pcie_pm_ops = {
+	.prepare = apple_radio_prepare,
+	.complete = apple_radio_complete,
 	.suspend_noirq = apple_pcie_suspend_noirq,
 	.resume_noirq = apple_pcie_resume_noirq,
 };
