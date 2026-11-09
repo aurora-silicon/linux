@@ -39,9 +39,6 @@ void apple_pmp_agx_activity_begin(void);
 void apple_pmp_agx_activity_end(void);
 void apple_pmp_agx_activity_release(void);
 void apple_pmp_agx_activity_resume(void);
-int apple_pmp_report_t8112_clpc_request(const struct device_node *np,
-					unsigned int entry,
-					unsigned int dcs, unsigned int soc);
 #else
 static inline int apple_pmp_report_ane_available(const struct device_node *np)
 {
@@ -105,13 +102,6 @@ static inline int apple_pmp_report_set_request(const struct device_node *report_
 	return -ENODEV;
 }
 
-static inline int apple_pmp_report_t8112_clpc_request(const struct device_node *np,
-						unsigned int entry,
-						unsigned int dcs,
-						unsigned int soc)
-{
-	return -ENODEV;
-}
 #endif
 
 #endif /* _LINUX_SOC_APPLE_PMP_REPORT_H_ */

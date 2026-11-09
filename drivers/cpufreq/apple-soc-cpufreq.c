@@ -28,6 +28,7 @@
 #include <linux/pm_qos.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/cpufreq-thermal.h>
+#include <linux/soc/apple/pmp.h>
 #include <linux/soc/apple/pmp-report.h>
 #include <linux/spinlock.h>
 #include <linux/tick.h>
@@ -220,8 +221,10 @@ struct apple_soc_cpufreq_info {
 struct apple_cpu_priv {
 	struct apple_fast_die *fast_die;
 	struct device_node *pmp_report;
-	unsigned int pmp_entry;
+	unsigned int pmp_device;
 	unsigned int pmp_max_freq;
+	atomic_t pmp_vote;
+	struct work_struct pmp_work;
 	struct device *cpu_dev;
 	void __iomem *reg_base;
 	const struct apple_soc_cpufreq_info *info;
@@ -398,19 +401,42 @@ static u32 apple_soc_cpufreq_timeout(const struct apple_soc_cpufreq_info *info)
  * signal: the lowest quartile releases both floors, and the upper quartiles
  * rise conservatively to the qualified DCS 4 / SoC 2 maxima.
  */
+#define APPLE_PMP_VOTE_DCS	GENMASK(2, 0)
+#define APPLE_PMP_VOTE_SOC	GENMASK(9, 8)
+
+static void apple_soc_cpufreq_pmp_work(struct work_struct *work)
+{
+	struct apple_cpu_priv *priv = container_of(work, struct apple_cpu_priv, pmp_work);
+	int vote = atomic_read(&priv->pmp_vote);
+	int ret;
+
+	ret = apple_pmp_set_device_constraint(priv->pmp_device,
+					      FIELD_GET(APPLE_PMP_VOTE_DCS, vote),
+					      FIELD_GET(APPLE_PMP_VOTE_SOC, vote));
+	if (ret && ret != -ENODEV && ret != -EPROBE_DEFER && ret != -EAGAIN)
+		dev_warn_once(priv->cpu_dev, "PMP memory/fabric command failed: %d\n", ret);
+	/* A request which arrived during the exchange must not be lost. */
+	if (vote != atomic_read(&priv->pmp_vote))
+		schedule_work(&priv->pmp_work);
+}
+
 static void apple_soc_cpufreq_pmp_vote(struct apple_cpu_priv *priv,
 				       unsigned int freq)
 {
 	static const u8 dcs[] = { 0, 1, 3, 4 };
 	static const u8 soc[] = { 0, 0, 1, 2 };
 	unsigned int q;
+	int vote;
 
 	if (!priv->pmp_report || !priv->pmp_max_freq)
 		return;
 	q = min(freq * ARRAY_SIZE(dcs) / priv->pmp_max_freq,
 		(unsigned int)ARRAY_SIZE(dcs) - 1);
-	/* The CPU transition remains usable when PMP is stopped or starts late. */
-	apple_pmp_report_t8112_clpc_request(priv->pmp_report, priv->pmp_entry, dcs[q], soc[q]);
+	vote = FIELD_PREP(APPLE_PMP_VOTE_DCS, dcs[q]) |
+	       FIELD_PREP(APPLE_PMP_VOTE_SOC, soc[q]);
+	/* Firmware commands sleep for their reply; fast-switch only queues work. */
+	atomic_set(&priv->pmp_vote, vote);
+	schedule_work(&priv->pmp_work);
 }
 
 static unsigned int apple_soc_cpufreq_get_rate(unsigned int cpu)
@@ -1378,6 +1404,8 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 	priv = kzalloc_obj(*priv);
 	if (!priv)
 		return -ENOMEM;
+	INIT_WORK(&priv->pmp_work, apple_soc_cpufreq_pmp_work);
+	atomic_set(&priv->pmp_vote, 0);
 
 	ret = apple_soc_cpufreq_find_cluster(policy, &reg_base, &info, &cluster);
 	if (ret) {
@@ -1392,7 +1420,7 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 			goto out_iounmap;
 		}
 		priv->pmp_report = pmp_args.np;
-		priv->pmp_entry = pmp_args.args[0];
+		priv->pmp_device = pmp_args.args[0] == 0xa8 ? 3 : 4;
 	} else if (ret != -ENOENT) {
 		goto out_iounmap;
 	}
@@ -1560,7 +1588,9 @@ static void apple_soc_cpufreq_exit(struct cpufreq_policy *policy)
 	 */
 	dev_pm_opp_of_cpumask_remove_table(policy->related_cpus);
 	if (priv->pmp_report) {
-		apple_pmp_report_t8112_clpc_request(priv->pmp_report, priv->pmp_entry, 0, 0);
+		atomic_set(&priv->pmp_vote, 0);
+		cancel_work_sync(&priv->pmp_work);
+		apple_pmp_set_device_constraint(priv->pmp_device, 0, 0);
 		of_node_put(priv->pmp_report);
 	}
 	iounmap(priv->reg_base);

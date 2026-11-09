@@ -2072,65 +2072,6 @@ int apple_pmp_report_set_request(const struct device_node *report_np, unsigned i
 }
 EXPORT_SYMBOL_GPL(apple_pmp_report_set_request);
 
-/**
- * apple_pmp_report_t8112_clpc_request() - set a T8112 CLPC memory/fabric vote
- * @np: PMP report provider
- * @entry: EACC0 (0xa8), PACC0 (0xa9), or ANE0 (0xab)
- * @dcs: DCS state in class 0x21
- * @soc: SoC fabric state in class 0x25
- *
- * The two constraints share one provider-owned SOC-DEV-DVFS word. This is a
- * request, not a measured state; entry 9 remains the firmware's achieved SoC
- * state. The caller may use this from an atomic cpufreq transition.
- */
-int apple_pmp_report_t8112_clpc_request(const struct device_node *np,
-					unsigned int entry,
-					unsigned int dcs, unsigned int soc)
-{
-	struct apple_pmp_report *rep;
-	unsigned long flags;
-	unsigned int index;
-	u64 dcs_word, soc_word;
-	int ret = -EPROBE_DEFER;
-
-	if (!np || (entry != 0xa8 && entry != 0xa9 && entry != 0xab) ||
-	    dcs > 4 || soc > 2)
-		return -EINVAL;
-
-	rcu_read_lock();
-	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
-		if (rep->dev->of_node != np)
-			continue;
-		if (rep->offsets != &apple_pmp_offsets_t8112) {
-			ret = -EOPNOTSUPP;
-			break;
-		}
-		if (READ_ONCE(rep->defer) || !apple_pmp_report_running(rep)) {
-			ret = -EAGAIN;
-			break;
-		}
-		ret = apple_pmp_report_dvfs_prepare(rep);
-		if (ret)
-			break;
-
-		index = entry - rep->offsets->dvfs_first;
-		/* The provider owns the whole word: both lanes in one store. */
-		apple_pmp_dvfs_word(0x21, dcs, &dcs_word);
-		apple_pmp_dvfs_word(0x25, soc, &soc_word);
-		spin_lock_irqsave(&rep->lock, flags);
-		rep->dvfs_words[index] = dcs_word | soc_word;
-		writeq(rep->dvfs_words[index],
-		       rep->base + rep->offsets->update + 8 * entry);
-		rep->dvfs_known |= BIT_ULL(index);
-		spin_unlock_irqrestore(&rep->lock, flags);
-		ret = 0;
-		break;
-	}
-	rcu_read_unlock();
-	return ret;
-}
-EXPORT_SYMBOL_GPL(apple_pmp_report_t8112_clpc_request);
-
 static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, bool enable)
 {
 	struct apple_pmp_report_entry *ent = genpd_to_apple_pmp_report_entry(genpd);

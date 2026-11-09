@@ -14,11 +14,11 @@ pub(crate) enum Command {
 }
 
 impl Command {
-    pub(crate) fn begin(&mut self, command: u8) -> bool {
-        if *self != Self::Idle || !matches!(command, 0x0e | 0x0f) {
+    pub(crate) fn begin(&mut self, command: u8, reply_payload: u64) -> bool {
+        if *self != Self::Idle || !matches!(command, 0x0c | 0x0e | 0x0f) {
             return false;
         }
-        *self = Self::Pending(MARKER | ((u64::from(command) + 1) << SHIFT));
+        *self = Self::Pending(MARKER | ((u64::from(command) + 1) << SHIFT) | reply_payload);
         true
     }
 
@@ -32,15 +32,15 @@ impl Command {
     }
 }
 
-#[cfg(test)]
+#[kernel::macros::kunit_tests(apple_pmp_command)]
 mod tests {
     use super::*;
 
     #[test]
     fn observed_gfx_reply_completes_only_an_outstanding_request() {
         let mut state = Command::Idle;
-        assert!(state.begin(0x0f));
-        assert!(!state.begin(0x0f));
+        assert!(state.begin(0x0f, 0));
+        assert!(!state.begin(0x0f, 0));
         state.reply(0x0021000000000000);
         assert_eq!(state, Command::Complete);
         state.reply(0x0021000000000000);
@@ -48,11 +48,19 @@ mod tests {
     }
 
     #[test]
+    fn device_constraint_reply_uses_the_same_untagged_sequence() {
+        let mut state = Command::Idle;
+        assert!(state.begin(0x0c, 0x0000030200000000));
+        state.reply(0x0020d30200000000);
+        assert_eq!(state, Command::Complete);
+    }
+
+    #[test]
     fn late_ack_cannot_complete_a_new_command_after_timeout() {
         let mut state = Command::Idle;
-        assert!(state.begin(0x0f));
+        assert!(state.begin(0x0f, 0));
         state = Command::Failed;
-        assert!(!state.begin(0x0f));
+        assert!(!state.begin(0x0f, 0));
         state.reply(0x0021000000000000);
         assert_eq!(state, Command::Failed);
     }
@@ -61,7 +69,7 @@ mod tests {
     fn wrong_opcode_or_nonzero_reply_payload_is_not_success() {
         for reply in [0x0020f00000000000, 0x0021000000000001] {
             let mut state = Command::Idle;
-            assert!(state.begin(0x0f));
+            assert!(state.begin(0x0f, 0));
             state.reply(reply);
             assert_eq!(state, Command::Failed);
         }

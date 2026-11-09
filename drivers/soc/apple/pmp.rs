@@ -74,6 +74,10 @@ const BOOTARGS_SIZE: usize = 0x230;
 const PMP_ENDPOINT: u8 = 0x20;
 const PM_COMMAND_MARKER: u64 = pmp_power::MARKER;
 const PM_COMMAND_SHIFT: u32 = pmp_power::SHIFT;
+const PM_DEVICE_SHIFT: u32 = 40;
+const PM_ARGUMENT_SHIFT: u32 = 32;
+const PM_VALUE_SHIFT: u32 = 16;
+const PM_DEVICE_CONSTRAINT: u8 = 0x0c;
 const OPC_GET_IOVA_TABLE: u64 = 0x10;
 const OPC_MALLOC: u64 = 0x12;
 const OPC_FREE: u64 = 0x14;
@@ -440,13 +444,15 @@ impl PmpData {
     }
     fn recv_message(&self, msg: u64) -> Result<()> {
         let pm_command = (msg >> PM_COMMAND_SHIFT) & 0xff;
-        if msg & PM_COMMAND_MARKER != 0 && (pm_command == 0x0f || pm_command == 0x10) {
+        if msg & PM_COMMAND_MARKER != 0
+            && (pm_command == 0x0d || pm_command == 0x0f || pm_command == 0x10)
+        {
             let mut state = self.power_command.lock();
             state.reply(msg);
             if *state == Command::Failed {
                 dev_err!(
                     self.dev,
-                    "Unexpected PMP device-state reply {:#018x}; power commands disabled",
+                    "Unexpected PMP command reply {:#018x}; commands disabled",
                     msg
                 );
                 drop(state);
@@ -534,27 +540,16 @@ unsafe extern "C" fn apple_pmp_display_bound_owner(
 unsafe impl Send for PmpData {}
 unsafe impl Sync for PmpData {}
 
-/// Send a power request while the C bridge serializes the untagged reply stream.
-/// A lost reply disables further requests until the PMP session is recreated.
-///
-/// # Safety
-/// `data` must point to the live PmpData registered by PmpDriver.
-#[export]
-pub unsafe extern "C" fn apple_pmp_send_power_command(
-    data: *const core::ffi::c_void,
+fn send_pm_command(
+    data: &PmpData,
     command: u8,
-    device_id: u16,
-    enabled: u32,
+    message: u64,
+    reply_payload: u64,
+    name: &'static CStr,
 ) -> i32 {
-    // SAFETY: The C bridge serializes calls against unregister in Drop.
-    let data = unsafe { &*data.cast::<PmpData>() };
-    let message = PM_COMMAND_MARKER
-        | (u64::from(command) << PM_COMMAND_SHIFT)
-        | (u64::from(device_id) << 40)
-        | (u64::from(enabled) << 32);
     {
         let mut state = data.power_command.lock();
-        if !state.begin(command) {
+        if !state.begin(command, reply_payload) {
             return EIO.to_errno();
         }
     }
@@ -584,7 +579,8 @@ pub unsafe extern "C" fn apple_pmp_send_power_command(
                     *state = Command::Failed;
                     dev_err!(
                         data.dev,
-                        "PMP device-power request {:#018x} did not complete",
+                        "PMP {:?} {:#018x} did not complete",
+                        name,
                         message
                     );
                     drop(state);
@@ -600,11 +596,78 @@ pub unsafe extern "C" fn apple_pmp_send_power_command(
         return EIO.to_errno();
     }
     *state = Command::Idle;
+    0
+}
+
+/// Send a power request while the C bridge serializes the untagged reply stream.
+/// A lost reply disables further requests until the PMP session is recreated.
+///
+/// # Safety
+/// `data` must point to the live PmpData registered by PmpDriver.
+#[export]
+pub unsafe extern "C" fn apple_pmp_send_power_command(
+    data: *const core::ffi::c_void,
+    command: u8,
+    device_id: u16,
+    enabled: u32,
+) -> i32 {
+    // SAFETY: The C bridge serializes calls against unregister in Drop.
+    let data = unsafe { &*data.cast::<PmpData>() };
+    let message = PM_COMMAND_MARKER
+        | (u64::from(command) << PM_COMMAND_SHIFT)
+        | (u64::from(device_id) << PM_DEVICE_SHIFT)
+        | (u64::from(enabled) << PM_ARGUMENT_SHIFT);
+    let ret = send_pm_command(data, command, message, 0, c"device-power request");
+    if ret != 0 {
+        return ret;
+    }
     dev_dbg!(
         data.dev,
         "PMP device={} enabled={} acknowledged",
         device_id,
         enabled
+    );
+    0
+}
+
+/// Send a firmware-owned SOC-device constraint request.
+///
+/// # Safety
+/// `data` must point to the live PmpData registered by PmpDriver. The C
+/// bridge serializes this untagged request stream against power commands.
+#[export]
+pub unsafe extern "C" fn apple_pmp_send_constraint_command(
+    data: *const core::ffi::c_void,
+    device_id: u8,
+    domain: u8,
+    level: u16,
+) -> i32 {
+    // SAFETY: The C bridge serializes calls against unregister in Drop.
+    let data = unsafe { &*data.cast::<PmpData>() };
+    let command = PM_DEVICE_CONSTRAINT;
+    let message = PM_COMMAND_MARKER
+        | (u64::from(command) << PM_COMMAND_SHIFT)
+        | (u64::from(device_id) << PM_DEVICE_SHIFT)
+        | (u64::from(domain) << PM_ARGUMENT_SHIFT)
+        | (u64::from(level) << PM_VALUE_SHIFT);
+    let reply_payload =
+        (u64::from(device_id) << PM_DEVICE_SHIFT) | (u64::from(domain) << PM_ARGUMENT_SHIFT);
+    let ret = send_pm_command(
+        data,
+        command,
+        message,
+        reply_payload,
+        c"device-constraint request",
+    );
+    if ret != 0 {
+        return ret;
+    }
+    dev_dbg!(
+        data.dev,
+        "PMP device={} domain={} level={} acknowledged",
+        device_id,
+        domain,
+        level
     );
     0
 }
