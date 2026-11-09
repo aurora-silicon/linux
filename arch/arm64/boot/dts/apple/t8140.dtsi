@@ -830,7 +830,7 @@
 			reg = <0x3 0x082b0000 0x0 0x4000>;
 			clocks = <&clkref>;
 			interrupt-parent = <&aic>;
-			interrupts = <AIC_IRQ 507 IRQ_TYPE_LEVEL_HIGH>;
+			interrupts = <AIC_IRQ 481 IRQ_TYPE_LEVEL_HIGH>;
 		};
 
 		nub_spmi0: spmi@308714000 {
