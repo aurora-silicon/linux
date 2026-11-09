@@ -53,6 +53,7 @@ def mutations(flag, names, base, expect=KILL):
 
 # test file -> [(arguments, expectation)]. '{out}' is a fresh directory.
 ASAHI_TESTS = {
+    'j613-mtp-s2idle-tests.py': [([], PASS)],
     # The old revision reports a DART fault that clears before the second latch read as success.
     'ane-tm-transient-fault-tests.py': [([], PASS),
                                         (['--old-ref', 'b50066848322c6799c1433ee3a358aab2e9faabb'], PASS)],
@@ -203,7 +204,7 @@ def jobs(work, conf, dtc):
              if re.search(r'-tests\.(py|rs|sh)$', p.name) and p.name != Path(__file__).name}
     known = set(ASAHI_TESTS) | set(ASAHI_RUST) | set(ASAHI_SHELL)
     missing = sorted(found - known)
-    gone = sorted(known - found)
+    gone = sorted(name for name in known if not (ASAHI / name).is_file())
     if missing or gone:
         for name in missing:
             print(f'not registered in {Path(__file__).name}: tools/asahi/{name}', file=sys.stderr)
