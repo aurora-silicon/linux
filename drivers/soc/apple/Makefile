@@ -2,6 +2,9 @@
 
 obj-$(CONFIG_APPLE_SIO_AES) += apple-sio-aes.o
 
+obj-$(CONFIG_APPLE_DBGVIEW) += apple-dbgview.o
+apple-dbgview-y = dbgview.o
+
 obj-$(CONFIG_APPLE_DOCKCHANNEL) += apple-dockchannel.o
 apple-dockchannel-y = dockchannel.o
 

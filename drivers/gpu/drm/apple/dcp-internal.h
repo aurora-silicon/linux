@@ -73,6 +73,7 @@ struct apple_dcp_typec_port;
 
 void dcp_swap_watchdog_arm(struct apple_dcp *dcp);
 void dcp_swap_watchdog_complete(struct apple_dcp *dcp);
+bool dcp_swap_lost(struct apple_dcp *dcp, u32 swap_id);
 void dcp_retry_placeholder_edid(struct apple_dcp *dcp,
 				const struct drm_edid *drm_edid);
 bool dcp_typec_relink(struct apple_dcp *dcp);
@@ -575,6 +576,15 @@ struct apple_dcp {
 	u32 last_swap_id;
 	/* last_swap_id is only meaningful after the first swap completes */
 	bool have_swap_complete;
+	/* swap id of the last started swap */
+	u32 started_swap_id;
+	/*
+	 * A started swap whose flip a commit gave up on
+	 * (dcp_drm_crtc_flip_lost()); event_lock. Firmware that does not track
+	 * its presents ignores its completion, see dcp_swap_lost().
+	 */
+	u32 lost_swap_id;
+	bool swap_lost;
 	ktime_t swap_start;
 	u64 swap_submit_timestamp;
 

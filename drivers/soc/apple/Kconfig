@@ -18,6 +18,18 @@ config APPLE_SIO_AES
 	  register crypto algorithms or provide a device node. Keep the DT
 	  node disabled except during an explicitly enabled diagnostic boot.
 
+config APPLE_DBGVIEW
+	tristate "Apple SoC read-only debug register views"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on ARM64 && OF && DEBUG_FS
+	help
+	  Root-only debugfs views of Apple SoC debug register blocks: the
+	  interrupt controller timebase and the debug dock connection
+	  status. The driver only reads registers, and only when a debugfs
+	  file is read.
+
+	  Say m here if you debug an Apple SoC.
+
 config APPLE_DOCKCHANNEL
 	tristate "Apple DockChannel FIFO"
 	depends on ARCH_APPLE || COMPILE_TEST

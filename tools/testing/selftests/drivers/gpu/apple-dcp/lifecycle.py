@@ -1091,7 +1091,7 @@ def teardown(root):
                 'atcphy_usb2_init', 'atcphy_usb3_power_off',
                 'atcphy_usb3_route', 'atcphy_usb3_set_mode', 'atcphy_usb2_power_off',
                 '_atcphy_dwc3_reset_assert', 'atcphy_dwc3_reset_assert', 'atcphy_mux_set'),
-        'phy': ('phy_init', 'phy_exit', 'phy_power_on', 'phy_power_off'),
+        'phy': ('phy_init', 'phy_exit', 'phy_reset', 'phy_power_on', 'phy_power_off'),
         'core': ('dwc3_phy_power_on', 'dwc3_phy_power_off', 'dwc3_phy_exit', 'dwc3_core_exit'),
         'apple': ('dwc3_apple_host_before_core_init', 'dwc3_apple_core_stop', 'dwc3_apple_core_init', 'dwc3_apple_core_start',
                   'dwc3_apple_init', 'dwc3_apple_exit', 'dwc3_usb_role_switch_set'),
