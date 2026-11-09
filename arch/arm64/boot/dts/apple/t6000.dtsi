@@ -114,6 +114,15 @@
 #include "t6000-peripherals.dtsi"
 #include "t6000-aux-spmi.dtsi"
 
+/* Platform error and event-log interrupt groups (apple_soc_edac). */
+&soc_errors {
+	status = "okay";
+};
+
+&soc_events {
+	status = "okay";
+};
+
 &apr0_dart {
 	status = "okay";
 };
