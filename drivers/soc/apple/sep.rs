@@ -2942,6 +2942,13 @@ impl platform::Driver for SepDriver {
         _info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let dev: &device::Device<device::Core<'_>> = pdev.as_ref();
+        // The xART policy of this load, for the boot log.
+        dev_info!(
+            dev,
+            "xart_writes={} provision_keybag={}\n",
+            module_parameters::xart_writes.value(),
+            module_parameters::provision_keybag.value()
+        );
         if module_parameters::provision_keybag.value() != 0
             && module_parameters::xart_writes.value() == 0
         {
