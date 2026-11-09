@@ -321,6 +321,146 @@
 		apple,no-data-below-millicelsius = <10000>;
 	};
 };
+
+/*
+ * The other CPU temperatures, read-only, after the GPU channels. Each
+ * sensor site has a reading, the same plus a fixed offset and a hotspot
+ * estimate; the zones above use the offset keys of four P sites and Te05.
+ * Te04-Te06 follow the E cluster, every Tp key the P cluster, TCMz is the
+ * hottest hotspot key and TCMb the hottest offset key.
+ */
+&smc_hwmon {
+	temperature-TCMb {
+		apple,key-id = "TCMb";
+		label = "SoC Die TCMb";
+	};
+
+	temperature-Te04 {
+		apple,key-id = "Te04";
+		label = "E-cluster Te04";
+	};
+
+	temperature-Te06 {
+		apple,key-id = "Te06";
+		label = "E-cluster Te06";
+	};
+
+	temperature-Tp00 {
+		apple,key-id = "Tp00";
+		label = "P-cluster Tp00";
+	};
+
+	temperature-Tp02 {
+		apple,key-id = "Tp02";
+		label = "P-cluster Tp02";
+	};
+
+	temperature-Tp04 {
+		apple,key-id = "Tp04";
+		label = "P-cluster Tp04";
+	};
+
+	temperature-Tp06 {
+		apple,key-id = "Tp06";
+		label = "P-cluster Tp06";
+	};
+
+	temperature-Tp08 {
+		apple,key-id = "Tp08";
+		label = "P-cluster Tp08";
+	};
+
+	temperature-Tp0A {
+		apple,key-id = "Tp0A";
+		label = "P-cluster Tp0A";
+	};
+
+	temperature-Tp0C {
+		apple,key-id = "Tp0C";
+		label = "P-cluster Tp0C";
+	};
+
+	temperature-Tp0E {
+		apple,key-id = "Tp0E";
+		label = "P-cluster Tp0E";
+	};
+
+	temperature-Tp0a {
+		apple,key-id = "Tp0a";
+		label = "P-cluster Tp0a";
+	};
+
+	temperature-Tp0b {
+		apple,key-id = "Tp0b";
+		label = "P-cluster Tp0b";
+	};
+
+	temperature-Tp0c {
+		apple,key-id = "Tp0c";
+		label = "P-cluster Tp0c";
+	};
+
+	temperature-Tp0e {
+		apple,key-id = "Tp0e";
+		label = "P-cluster Tp0e";
+	};
+
+	temperature-Tp0f {
+		apple,key-id = "Tp0f";
+		label = "P-cluster Tp0f";
+	};
+
+	temperature-Tp0g {
+		apple,key-id = "Tp0g";
+		label = "P-cluster Tp0g";
+	};
+
+	temperature-Tp0i {
+		apple,key-id = "Tp0i";
+		label = "P-cluster Tp0i";
+	};
+
+	temperature-Tp0j {
+		apple,key-id = "Tp0j";
+		label = "P-cluster Tp0j";
+	};
+
+	temperature-Tp0k {
+		apple,key-id = "Tp0k";
+		label = "P-cluster Tp0k";
+	};
+
+	temperature-Tp0m {
+		apple,key-id = "Tp0m";
+		label = "P-cluster Tp0m";
+	};
+
+	temperature-Tp0n {
+		apple,key-id = "Tp0n";
+		label = "P-cluster Tp0n";
+	};
+
+	temperature-Tp0o {
+		apple,key-id = "Tp0o";
+		label = "P-cluster Tp0o";
+	};
+
+	temperature-Tp0q {
+		apple,key-id = "Tp0q";
+		label = "P-cluster Tp0q";
+	};
+
+	temperature-Tp0r {
+		apple,key-id = "Tp0r";
+		label = "P-cluster Tp0r";
+	};
+
+	temperature-Tp0s {
+		apple,key-id = "Tp0s";
+		label = "P-cluster Tp0s";
+	};
+};
+
 /*
  * Mesa fingerprint sensor on spi2. The J413 platform device tree
  * (/arm-io/spi2/mesa) describes it as J415's does: power on AP GPIO 178,
