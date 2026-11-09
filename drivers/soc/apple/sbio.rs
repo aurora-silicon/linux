@@ -2913,7 +2913,7 @@ impl SepData {
         let advertised = match self.await_capture() {
             CaptureWait::Ready(n) => n,
             CaptureWait::Timeout => {
-                dev_warn!(self.dev, "verify: the capture ended without a frame\n");
+                dev_info!(self.dev, "verify: the capture ended without a frame\n");
                 // No finger came: nothing was compared, so ask again rather
                 // than report an error. PLACE names the cause.
                 self.retry_cause(bio::Guidance::Place);
@@ -4024,7 +4024,7 @@ impl SepData {
         let available = match self.await_capture() {
             CaptureWait::Ready(n) => n,
             CaptureWait::Timeout => {
-                dev_warn!(self.dev, "enrol: capture {} ended without a frame\n", counter);
+                dev_info!(self.dev, "enrol: capture {} ended without a frame\n", counter);
                 return ImageOutcome::NoFinger;
             }
             CaptureWait::Fault(state) => {
