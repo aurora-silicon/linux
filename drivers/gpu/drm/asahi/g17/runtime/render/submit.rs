@@ -16,6 +16,25 @@ use kernel::{prelude::*, sync::Arc};
 pub(in crate::g17::runtime) const FALLBACK: Error = EINPROGRESS;
 
 impl Backend {
+    /// The first render of a quiet queue keeps the low-latency ioctl path. A
+    /// count-N test arm sends followers of firmware-visible work through the
+    /// scheduler so several already accepted packets can be prepared before
+    /// the final tag-14 announcement and doorbell.
+    fn defer_inline_render_follower(&self) -> bool {
+        let v25g83 = matches!(
+            self.shared.variant.graph,
+            crate::g17::fw::variant::InitGraph::V25G83
+        );
+        if !crate::g17::queue::publication_burst::defer_inline_follower(v25g83, true) {
+            return false;
+        }
+        self.shared
+            .state
+            .lock()
+            .as_deref()
+            .is_some_and(|firmware| firmware.queues.render_owner_in_flight(self.owner))
+    }
+
     /// The submitting ioctl holds the logical queue's mutex and never sleeps
     /// for contention or a closed preparation gate: it returns FALLBACK, and
     /// the scheduler's worker publishes the command and owns the waits.
@@ -510,7 +529,10 @@ impl Backend {
     }
 
     pub(in crate::g17) fn try_render_early(&self, packet: &Arc<Packet>) -> bool {
-        if self.backlog.load(Ordering::Acquire) != 0 || packet.has_dependencies() {
+        if self.backlog.load(Ordering::Acquire) != 0
+            || packet.has_dependencies()
+            || self.defer_inline_render_follower()
+        {
             return false;
         }
         let admission = match self.admission.try_acquire_render(self.owner, Request::of(packet)) {

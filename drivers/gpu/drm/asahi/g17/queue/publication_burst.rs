@@ -5,8 +5,9 @@
 //! The default publishes one tag-14 announcement and one doorbell per kick. B1
 //! keeps one announcement per kick but coalesces the doorbell. B2 commits the
 //! same consecutive kick entries and replaces their announcements with one
-//! count-N announcement. A tail is published immediately; this policy never
-//! waits for work which was not already accepted by the logical scheduler.
+//! count-N announcement. Count-N keeps the first command inline and moves
+//! followers of running work to the scheduler, where the burst consumes only
+//! already accepted packets. A tail is published immediately.
 
 use crate::module_parameters;
 use kernel::prelude::*;
@@ -43,6 +44,19 @@ impl Arm {
             _ => Self::DEFAULT,
         }
     }
+
+    const fn defers_inline_follower(self, in_flight: bool) -> bool {
+        in_flight && matches!(self.encoding, Encoding::CountN)
+    }
+}
+
+/// Count-N needs accepted followers to reach the scheduler before the first
+/// follower finishes its private command preparation. Keep the first command
+/// inline (and therefore depth-one latency unchanged), but move followers of
+/// running work to the scheduler when this test arm is active.
+pub(in crate::g17) fn defer_inline_follower(v25g83: bool, in_flight: bool) -> bool {
+    v25g83 && Arm::parse(module_parameters::g16_test_burst_publication.value())
+        .defers_inline_follower(in_flight)
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -139,6 +153,15 @@ mod tests {
         for value in [0, 1, 3, 16, 101, 103, 116] {
             assert_eq!(Arm::parse(value), Arm::DEFAULT);
         }
+    }
+
+    #[test]
+    fn only_count_n_defers_an_in_flight_follower() {
+        assert!(!defer_inline_follower(false, true));
+        assert!(!defer_inline_follower(true, false));
+        assert!(!Arm::parse(0).defers_inline_follower(true));
+        assert!(!Arm::parse(8).defers_inline_follower(true));
+        assert!(Arm::parse(108).defers_inline_follower(true));
     }
 
     #[test]

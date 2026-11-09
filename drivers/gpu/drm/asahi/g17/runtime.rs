@@ -685,6 +685,22 @@ pub(super) struct Backend {
 }
 
 impl Backend {
+    fn defer_inline_compute_follower(&self) -> bool {
+        let v25g83 = matches!(
+            self.shared.variant.graph,
+            super::fw::variant::InitGraph::V25G83
+        );
+        if !super::queue::publication_burst::defer_inline_follower(v25g83, true) {
+            return false;
+        }
+        self.shared
+            .state
+            .lock()
+            .as_deref()
+            .and_then(|firmware| firmware.queues.compute(self.owner))
+            .is_some_and(|queue| queue.in_flight())
+    }
+
     pub(super) fn new(
         shared: &Arc<super::Shared>,
         vm: &crate::mmu::Vm,
@@ -1963,7 +1979,10 @@ impl Backend {
     /// its queue is already bound and nothing has to wait, as renders do. Any
     /// wait leaves the command, unpublished, to its scheduler.
     pub(super) fn try_compute_early(&self, packet: &Arc<super::job::Packet>) -> bool {
-        if self.compute_backlog.load(Ordering::Acquire) != 0 || packet.has_dependencies() {
+        if self.compute_backlog.load(Ordering::Acquire) != 0
+            || packet.has_dependencies()
+            || self.defer_inline_compute_follower()
+        {
             return false;
         }
         if !packet.begin_publication() {

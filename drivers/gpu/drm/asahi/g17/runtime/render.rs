@@ -362,6 +362,17 @@ impl Registry {
             .any(|(slot, entry)| entry.is_some() && self.admission.owns_slot(owner, slot))
     }
 
+    /// Whether `owner` has work on a pair which has reached firmware. A pair
+    /// lent to command preparation retains this fact in `borrowed_active`.
+    fn render_owner_in_flight(&self, owner: u64) -> bool {
+        self.render.entries.iter().flatten().any(|entry| {
+            entry.reservation.owner == owner
+                && entry.pair.as_ref().map_or(entry.borrowed_active, |pair| {
+                    pair.published_in_flight()
+                })
+        })
+    }
+
     /// Tell admission whether another render pair can still be built.
     pub(super) fn note_build_room(&self) {
         self.admission.note_build_room(self.qids.render_pair_fits());

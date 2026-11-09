@@ -237,7 +237,7 @@ module! {
         },
         g16_test_burst_publication: u32 {
             default: 0,
-            description: "G16 TEST ONLY: publication arm (0=A; 2/4/8=B1 count-one; 102/104/108=B2 count-N)",
+            description: "G16 TEST ONLY: publication arm (0=A; 2/4/8=count-one; 102/104/108=count-N with follower scheduling)",
         },
     },
 }
