@@ -3,7 +3,7 @@
  * The caller owns the port, has powered the PHY/firmware for native USB3,
  * completed DWC3 core init and enabled SUSPHY, and has valid DART mappings.
  * Bank 35 is T6050's ADT PHY reg[35]. Bank 44 is usb-drdN reg[3].
- * The first left/debug port must never reach this backend.
+ * Only ports explicitly handed over to Linux may use this backend.
  */
 #ifndef APPLE_T6050_USB3_PIPE_H
 #define APPLE_T6050_USB3_PIPE_H
