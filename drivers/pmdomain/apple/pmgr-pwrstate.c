@@ -134,6 +134,22 @@ static int apple_pmgr_ps_wait_parent(struct apple_pmgr_ps *ps, u32 *cur)
  * power-on then fails as it did before, and genpd, which ignores errors in
  * that phase, keeps the domain requested on.
  */
+/* Pulse the PS reset of a domain that is off with BUSY latched; it stays off. */
+static void apple_pmgr_ps_unlatch_off(struct apple_pmgr_ps *ps, u32 *cur)
+{
+	u32 off = *cur & ~(APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS | APPLE_PMGR_BUSY |
+			   APPLE_PMGR_PS_RESET | APPLE_PMGR_DEV_DISABLE | APPLE_PMGR_PS_TARGET);
+
+	regmap_write(ps->regmap, ps->offset, off | APPLE_PMGR_PS_RESET);
+	regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, *cur,
+					!(*cur & APPLE_PMGR_BUSY), 1, APPLE_PMGR_PS_SET_TIMEOUT);
+	regmap_write(ps->regmap, ps->offset, off);
+	regmap_read(ps->regmap, ps->offset, cur);
+	if (*cur & APPLE_PMGR_BUSY)
+		dev_warn_ratelimited(ps->dev, "PS %s: off with BUSY latched: %#x\n",
+				     ps->genpd.name, *cur);
+}
+
 static int apple_pmgr_ps_clear_latch(struct apple_pmgr_ps *ps, u32 reg, u32 *cur)
 {
 	u32 off = (reg & ~APPLE_PMGR_PS_TARGET) | APPLE_PMGR_PS_PWRGATE;
@@ -265,6 +281,19 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 			ret = 0;
 		}
 	}
+
+	/*
+	 * A domain can reach off with BUSY latched: on T8140 both ISP CPU cores do,
+	 * every time they go down under Linux. macOS leaves them off with it clear,
+	 * and the sleep engine, which powers them up itself in a wake that keeps DRAM
+	 * up, stalls on a latched one until its watchdog resets the SoC. Only a PS
+	 * reset clears it, and the domain is off, so pulse one as on the power-on
+	 * path (not in a system sleep transition, see apple_pmgr_ps_clear_latch()).
+	 */
+	if (!ret && pstate != APPLE_PMGR_PS_ACTIVE && (cur & APPLE_PMGR_BUSY) &&
+	    !FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) && !ps->system_sleep &&
+	    !ps->wait_parent && !ps->strict_state && !ps->externally_clocked)
+		apple_pmgr_ps_unlatch_off(ps, &cur);
 
 report:
 	if (ret < 0)
