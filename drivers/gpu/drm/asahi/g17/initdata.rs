@@ -420,6 +420,17 @@ impl InitData {
     /// One M5 page-pool row: the pool's eight descriptor words at its 64-byte slot.
     fn set_m5_uma(&self, slot: u16, words: [u64; 8]) -> Result {
         let object = self.object(self.page_pool)?;
+        if super::fw::m5::pool::j813_pools() {
+            // The J813's rows are the descriptor's first four words, 0x20 apart.
+            const ROW: usize = super::fw::m5::pool::J813_ROW_WORDS * 8;
+            let offset = usize::from(slot) * ROW;
+            object.pointer(offset, ROW)?;
+            for (index, word) in words.into_iter().take(ROW / 8).enumerate() {
+                object.dword(offset + index * 8)?.store(word, Ordering::Relaxed);
+            }
+            fence(Ordering::SeqCst);
+            return Ok(());
+        }
         let offset = usize::from(slot) * core::mem::size_of::<[u64; 8]>();
         // Check the full row before the first store.
         object.pointer(offset, core::mem::size_of::<[u64; 8]>())?;

@@ -2,7 +2,7 @@
 //! M5 private-memory allocation encodings.
 #![allow(dead_code)]
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use super::initdata::{Board, J714};
 
@@ -19,7 +19,26 @@ pub(crate) fn select_render_pool(board: &Board) {
     let (block, pool) = board.render_pool;
     RENDER_BLOCK_BYTES.store(block, Ordering::Relaxed);
     POOL_BYTES.store(pool, Ordering::Relaxed);
+    J813_POOLS.store(board.j813_forms(), Ordering::Relaxed);
 }
+
+/// macOS 27.0 on the J813 (common 26A428) keeps its pools in the G17P form: a 0x68-byte
+/// control (run cursor +0x48, state +0x4c, completed +0x54, class +0x60), a run list of
+/// 0x40-byte slots, and four-word page-pool rows on a 0x20 stride.
+static J813_POOLS: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn j813_pools() -> bool {
+    J813_POOLS.load(Ordering::Relaxed)
+}
+
+/// Offset of the firmware-completed counter in this board's pool control.
+pub(crate) fn completed_offset() -> usize {
+    if j813_pools() { J813_COMPLETED } else { COMPLETED }
+}
+
+const J813_COMPLETED: usize = 0x54;
+/// Words of one J813 page-pool row: the first four words of the M5 descriptor.
+pub(crate) const J813_ROW_WORDS: usize = 4;
 
 pub(crate) fn render_block_bytes() -> usize {
     RENDER_BLOCK_BYTES.load(Ordering::Relaxed)
@@ -68,7 +87,8 @@ impl PoolState {
             words[1] >> 32 & 0x0fff_ffff, words[2] & 0x0fff_ffff,
             words[5] & 0x0fff_ffff, words[6] & 0xffff,
             words[7] & 0x0fff_ffff, words[7] >> 32 & 0xffff];
-        for (offset, value) in SAVED_FIELDS.into_iter().zip(values) {
+        let fields = if j813_pools() { 4 } else { SAVED_FIELDS.len() };
+        for (offset, value) in SAVED_FIELDS.into_iter().zip(values).take(fields) {
             self.0[offset..offset + 4].copy_from_slice(&(value as u32).to_le_bytes());
         }
     }
@@ -135,7 +155,7 @@ impl PoolGeometry {
     }
 
     pub(crate) fn g17s_render(blocks: usize, directory_entries: u32) -> Result<Self, PoolError> {
-        Self::with_kind(blocks, directory_entries, true)
+        Self::with_kind(blocks, directory_entries, !j813_pools())
     }
 
     pub(crate) fn block_bytes(self) -> usize {
@@ -264,9 +284,32 @@ pub(crate) fn encode_state(p: PoolLayout, submitted: u64, out: &mut [u8])
     Ok(())
 }
 
+/// The J813's G17P-form pool control, as macOS 27.0 leaves it on that machine.
+fn encode_j813_state(p: PoolLayout, submitted: u64, out: &mut [u8], compute: bool)
+    -> Result<(), PoolError>
+{
+    validate_layout(p)?;
+    if submitted == 0 || submitted & 3 != 0 { return Err(PoolError::Address); }
+    if out.len() < STATE_BYTES { return Err(PoolError::Buffer); }
+    out[..STATE_BYTES].fill(0);
+    // Run-list qwords in use: one 0x40-byte slot per block.
+    let run_qwords = if p.geometry.g17s_render_blocks { 1 } else { 8 };
+    for (offset, value) in [(0, if compute { 3 } else { 1 }), (8, p.hardware_id), (0x10, 1),
+        (0x1c, p.geometry.directory_entries), (0x24, p.geometry.pages),
+        (0x2c, p.geometry.pages), (0x48, (p.geometry.blocks * run_qwords) as u32),
+        (0x5c, u32::from(compute)), (0x60, if compute { 1 } else { 2 })] {
+        out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    for (offset, value) in [(0x14, p.directory), (0x30, p.freelist), (0x4c, submitted)] {
+        out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    Ok(())
+}
+
 pub(crate) fn encode_g17s_render_state(p: PoolLayout, submitted: u64, out: &mut [u8])
     -> Result<(), PoolError>
 {
+    if j813_pools() { return encode_j813_state(p, submitted, out, false); }
     encode_state(p, submitted, out)?;
     out[0x80..0x84].copy_from_slice(&4u32.to_le_bytes());
     Ok(())
@@ -275,6 +318,7 @@ pub(crate) fn encode_g17s_render_state(p: PoolLayout, submitted: u64, out: &mut 
 pub(crate) fn encode_g17s_compute_state(p: PoolLayout, submitted: u64, out: &mut [u8])
     -> Result<(), PoolError>
 {
+    if j813_pools() { return encode_j813_state(p, submitted, out, true); }
     if !p.geometry.g17s_render_blocks { return Err(PoolError::Geometry); }
     encode_state(p, submitted, out)?;
     out[0x7c..0x80].copy_from_slice(&1u32.to_le_bytes());
