@@ -23,9 +23,6 @@
 /delete-node/ &jpeg0_dart;
 /delete-node/ &jpeg1_dart;
 /delete-node/ &scaler0_dart;
-/delete-node/ &usb4_0_mbox;
-/delete-node/ &usb4_1_mbox;
-/delete-node/ &usb4_2_mbox;
 /delete-node/ &sio_mbox;
 /delete-node/ &pinctrl_smc;
 /delete-node/ &ps_gpx;
@@ -128,19 +125,7 @@
 /delete-node/ &ps_dispext0_fe;
 /delete-node/ &ps_dispext0_cpu;
 /delete-node/ &ps_pcpu0_3;
-/delete-node/ &ps_atc0_cio;
-/delete-node/ &ps_atc0_pcie;
-/delete-node/ &ps_atc0_cio_pcie;
-/delete-node/ &ps_atc0_cio_usb;
-/delete-node/ &ps_atc1_cio;
-/delete-node/ &ps_atc1_pcie;
-/delete-node/ &ps_atc1_cio_pcie;
-/delete-node/ &ps_atc1_cio_usb;
-/delete-node/ &ps_atc2_cio;
-/delete-node/ &ps_atc2_pcie;
-/delete-node/ &ps_atc2_cio_pcie;
 /delete-node/ &ps_pcpu0_4;
-/delete-node/ &ps_atc2_cio_usb;
 /delete-node/ &ps_atc3_cio;
 /delete-node/ &ps_atc3_pcie;
 /delete-node/ &ps_atc3_cio_pcie;
@@ -357,6 +342,60 @@
 /delete-node/ &gfx_mbox;
 /delete-node/ &opp_p0;
 /delete-node/ &opp_p1;
+
+#include "t6040-usb4.dtsi"
+
+/ {
+	/* ADT pmgr reg[44]: AppleT6041PMGR::enableCioReconfig at +0x2024. */
+	pmgr_cio: power-management@502820000 {
+		compatible = "apple,t6041-pmgr-cio", "syscon", "simple-mfd";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		reg = <0x5 0x02820000 0 0x4000>;
+
+		cio_reset: reset-controller@2024 {
+			compatible = "apple,t6041-cio-reset", "apple,t6000-cio-reset";
+			reg = <0x2024 0x4>;
+			#reset-cells = <1>;
+		};
+	};
+};
+
+&pinctrl_aop {
+	/* ADT acioN gpio-lstx. */
+	usb4_0_lstx_pins: usb4-0-lstx-pins {
+		pinmux = <APPLE_PINMUX(49, 1)>;
+	};
+
+	usb4_1_lstx_pins: usb4-1-lstx-pins {
+		pinmux = <APPLE_PINMUX(51, 1)>;
+	};
+
+	usb4_2_lstx_pins: usb4-2-lstx-pins {
+		pinmux = <APPLE_PINMUX(53, 1)>;
+	};
+};
+
+&usb4_0_acio {
+	resets = <&cio_reset 0>;
+	pinctrl-names = "lstx";
+	pinctrl-0 = <&usb4_0_lstx_pins>;
+	lstx-gpios = <&pinctrl_aop 49 GPIO_ACTIVE_HIGH>;
+};
+
+&usb4_1_acio {
+	resets = <&cio_reset 1>;
+	pinctrl-names = "lstx";
+	pinctrl-0 = <&usb4_1_lstx_pins>;
+	lstx-gpios = <&pinctrl_aop 51 GPIO_ACTIVE_HIGH>;
+};
+
+&usb4_2_acio {
+	resets = <&cio_reset 2>;
+	pinctrl-names = "lstx";
+	pinctrl-0 = <&usb4_2_lstx_pins>;
+	lstx-gpios = <&pinctrl_aop 53 GPIO_ACTIVE_HIGH>;
+};
 
 / {
 	opp_p0: opp-table-p0 {
