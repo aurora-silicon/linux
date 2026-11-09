@@ -135,6 +135,26 @@ The same kernel, under the old policy, unlocked the keybag without any
 session record write. Linux had never created a record there: the guard
 ran from Linux's first boot and its list stayed empty.
 
+Touch ID can use the keybag first instead. When fprintd opens the sensor
+before any trusted key is unsealed (a login screen that offers Touch ID,
+for example), the first use of the keybag under the new policy is the
+`DESIGNATE_KEYBAG` in `activate_touchid` (`sbio.rs`), and the enclave asks
+for the rewrite there, after LOAD_KEYBAG has answered. The guard refuses
+it, and the designate is never answered:
+
+    xART guard: refused to rewrite kind-4 record <id>, which this Linux install did not create
+    sks: DESIGNATE_KEYBAG got no reply after 2037 ms
+    sks: DESIGNATE_KEYBAG did not complete; enrolment will refuse
+    hwrng: read produced nothing (ETIMEDOUT)
+    matching unavailable this boot: ...
+
+Touch ID and the enclave's RNG stay down for that boot, and the refusal
+repeats on every boot until the record is allowed. This was seen on the
+MacBook Air M3 (T8122, J613) on 2026-11-07, after a change from a raw
+m1n1 Stage 1 to a Mach-O one, and on a J616s after every Recovery
+enrolment of a Stage 1 that day (https://github.com/aurora-silicon/linux/issues/1190). The window below opens only for
+the unlock, so this case needs `aurora-sep-policy-change`.
+
 Under an unchanged policy that first unlock rewrites no session record at
 all (every J616s boot before the change). So the driver treats a rewrite
 inside it as the policy change and lets exactly one through, by itself, on
@@ -160,8 +180,12 @@ boot:
   run it with no arguments. It takes the session id from the refusal.
 - Before a planned change, run it with `--expect`. The record cannot be
   named in advance, so the allowance covers the first existing kind-4
-  record the enclave asks to rewrite. The identity unlock is the first
-  thing that asks.
+  record the enclave asks to rewrite. The keybag's first use, Touch ID's
+  designate or the first unlock, is the first thing that asks. See
+  "Changing Stage 1 on purpose" below.
+- On a kernel whose refusal line names no session id (one from before the
+  allowance code), the tool with no arguments finds nothing to allow. Use
+  `--expect` there, and boot a kernel with the allowance code next.
 
 Either way it first copies the whole 6 MiB gigalocker extent, the driver's
 host files and `/var/lib/fprint` to
@@ -174,6 +198,30 @@ log names the record either way. `--status`
 shows what is armed and what this boot refused; `--cancel` removes an
 allowance that was not used yet.
 
+#### Changing Stage 1 on purpose
+
+Arm the allowance before the change, so the first boot under the new
+policy keeps Touch ID:
+
+1. On the Linux install, run `aurora-sep-policy-change --expect` as root.
+   The running kernel only has to load the driver, which logs where the
+   gigalocker is; it need not have the allowance code.
+2. Change Stage 1 (for example, enrol it from 1TR).
+3. Make the first boot afterwards a kernel with the allowance code, the
+   one that reads `/var/lib/aurora-sep-xart-allow-once.bin`. It empties
+   the file at probe and logs "this boot may rewrite the first existing
+   kind-4 record the enclave asks for, once", then "allowed one rewrite of
+   kind-4 record ... for a boot policy change" when the enclave asks.
+   A kernel without that code does not read the file. With the guard on,
+   it refuses the rewrite as above and leaves the allowance for a later
+   boot; with the guard off, it lets the rewrite through without saving
+   the previous value.
+4. Later boots under the same policy need nothing, on either kernel.
+
+If the first boot was the wrong kernel, Touch ID is down for that boot
+only: boot one with the allowance code next, and it uses the allowance
+still in the file.
+
 `aurora-sep-load` recognises a refusal and stops at once with a message
 that points here, instead of retrying for two minutes.
 
@@ -181,6 +229,15 @@ On the J616s the first such update (2026-10-28, Stage 1 window change)
 rewrote one kind-4 record and one shared root. The other six kind-4
 records and the kind-3 record kept their revisions, Ryan's enrolled
 finger matched afterwards, and it kept matching across later reboots.
+
+On the J613 (2026-11-07) the tool with no arguments armed the record the
+designate refusal named. The next boot logged "allowed one rewrite of
+kind-4 record ... for a boot policy change", restored the Catacomb and the
+enrolment ("Touch ID: restored 1 enrolled identity/identities; enrolment
+survived reboot"), and a kernel without the allowance code brought Touch
+ID up on later boots. A second Stage 1 change on that Mac (2026-11-08),
+armed beforehand as in "Changing Stage 1 on purpose", kept Touch ID on
+the first boot with no refusal.
 
 The copy of the gigalocker is evidence and a last resort, not an undo:
 writing an old copy back does not roll back the enclave's anti-replay
