@@ -281,7 +281,9 @@ afk_service_reinit(struct apple_epic_service *service,
 		service->ep = ep;
 		service->channel = channel;
 		service->cookie = NULL;
+#ifdef CONFIG_DRM_APPLE_DCP_SMC
 		service->local = false;
+#endif
 		/* Keep legacy slot history; AFKV2 history belongs to the interface. */
 	}
 	spin_unlock_irqrestore(&service->lock, flags);

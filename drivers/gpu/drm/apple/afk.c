@@ -927,7 +927,9 @@ static void afk_recv_handle_compact_init(struct apple_dcp_afkep *ep,
 	service->unit = unit;
 	service->defer_start = false;
 	service->started = false;
+#ifdef CONFIG_DRM_APPLE_DCP_SMC
 	service->local = false;
+#endif
 	service->torndown = false;
 	/* A service with an admission step is published once admitted. */
 	service->enabled = !ops->prepare;
@@ -1269,6 +1271,7 @@ static void afk_recv_compact_message(struct apple_dcp_afkep *ep, u16 intf_id,
 		afk_recv_handle_compact_init(ep, intf_id, payload, payload_size);
 		return;
 	}
+#ifdef CONFIG_DRM_APPLE_DCP_SMC
 	if (sub->category == 0 && sub->type == 0x12) {
 		service = afk_service_get(afk_epic_find_service(ep, intf_id));
 		if (service && service->local) {
@@ -1292,6 +1295,7 @@ static void afk_recv_compact_message(struct apple_dcp_afkep *ep, u16 intf_id,
 			afk_service_put(service);
 		return;
 	}
+#endif
 	if (sub->category == 1 && sub->type == EPIC_SUBTYPE_STD_SERVICE) {
 		afk_recv_handle_compact_call(ep, intf_id, payload, payload_size);
 		return;
