@@ -46,3 +46,6 @@
 
 #define T6050_J714S
 #include "t6050-peripherals.dtsi"
+
+/* The same T6050 camera as J716c (J714sAP ADT); the loader sets the J714s sensor type. */
+#include "t6050-j716c-isp.dtsi"
