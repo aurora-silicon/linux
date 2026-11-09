@@ -37,6 +37,10 @@ int apple_atcphy_sleep_result(struct phy *usb2_phy);
  * controller stop for later sleeps.
  */
 void apple_atcphy_sleep_finish(struct phy *usb2_phy, bool kept);
+
+/* The same from the PHY's work, for after a wake; the flush waits for it. */
+void apple_atcphy_sleep_finish_async(struct phy *usb2_phy, bool kept);
+void apple_atcphy_sleep_finish_flush(struct phy *usb2_phy);
 #else
 static inline int apple_atcphy_sleep_prepare(struct phy *usb2_phy)
 {
@@ -49,6 +53,14 @@ static inline int apple_atcphy_sleep_result(struct phy *usb2_phy)
 }
 
 static inline void apple_atcphy_sleep_finish(struct phy *usb2_phy, bool kept)
+{
+}
+
+static inline void apple_atcphy_sleep_finish_async(struct phy *usb2_phy, bool kept)
+{
+}
+
+static inline void apple_atcphy_sleep_finish_flush(struct phy *usb2_phy)
 {
 }
 #endif

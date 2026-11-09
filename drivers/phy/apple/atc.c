@@ -788,6 +788,8 @@ enum atcphy_t8132_cio_tunable {
  *                 off for a PIPE or lane change and is not powered on again yet
  * @usb3_port_work: Retries the power-on of @usb3_port_off after a USB failure
  * @usb3_port_retries: Retries left for @usb3_port_work
+ * @sleep_finish_work: Ends a sleep for the controller, outside its device lock
+ * @sleep_finish_kept: Whether the controller kept its state, for @sleep_finish_work
  * @mode: Current PHY operating mode
  * @swap_lanes: True if lanes must be swapped due to cable orientation
  * @dp_link_rate: DisplayPort link rate
@@ -919,6 +921,8 @@ struct apple_atcphy {
 	bool usb3_port_off;
 	struct delayed_work usb3_port_work;
 	unsigned int usb3_port_retries;
+	struct work_struct sleep_finish_work;
+	bool sleep_finish_kept;
 	enum atcphy_mode mode;
 	int dp_link_rate;
 	bool swap_lanes;
@@ -6547,6 +6551,8 @@ static bool atcphy_has_t8103_usb3_workaround(const struct atcphy_hw *hw,
 	       of_device_is_compatible(root, "apple,t8103");
 }
 
+static void atcphy_sleep_finish_work(struct work_struct *work);
+
 static int atcphy_probe(struct platform_device *pdev)
 {
 	struct apple_atcphy *atcphy;
@@ -6569,6 +6575,9 @@ static int atcphy_probe(struct platform_device *pdev)
 	mutex_init(&atcphy->lock);
 	platform_set_drvdata(pdev, atcphy);
 	ret = devm_delayed_work_autocancel(dev, &atcphy->usb3_port_work, atcphy_usb3_port_work);
+	if (ret)
+		return ret;
+	ret = devm_work_autocancel(dev, &atcphy->sleep_finish_work, atcphy_sleep_finish_work);
 	if (ret)
 		return ret;
 
@@ -7101,12 +7110,8 @@ EXPORT_SYMBOL_GPL(apple_atcphy_sleep_result);
  * again. Only the PHY's own failures stop it for the later sleeps; a sleep refused for a
  * USB change doesn't.
  */
-void apple_atcphy_sleep_finish(struct phy *usb2_phy, bool kept)
+static void atcphy_sleep_finish(struct apple_atcphy *atcphy, bool kept)
 {
-	struct apple_atcphy *atcphy = atcphy_from_usb2_phy(usb2_phy);
-
-	if (!atcphy)
-		return;
 	scoped_guard(mutex, &atcphy->lock) {
 		if (!kept && atcphy->sleep_ret < 0 && atcphy->sleep_ret != -EBUSY)
 			atcphy->sleep_no_keep = true;
@@ -7115,7 +7120,46 @@ void apple_atcphy_sleep_finish(struct phy *usb2_phy, bool kept)
 	}
 	atcphy_sleep_ss_up(atcphy);
 }
+
+void apple_atcphy_sleep_finish(struct phy *usb2_phy, bool kept)
+{
+	struct apple_atcphy *atcphy = atcphy_from_usb2_phy(usb2_phy);
+
+	if (atcphy)
+		atcphy_sleep_finish(atcphy, kept);
+}
 EXPORT_SYMBOL_GPL(apple_atcphy_sleep_finish);
+
+static void atcphy_sleep_finish_work(struct work_struct *work)
+{
+	struct apple_atcphy *atcphy = container_of(work, struct apple_atcphy, sleep_finish_work);
+
+	atcphy_sleep_finish(atcphy, READ_ONCE(atcphy->sleep_finish_kept));
+}
+
+/*
+ * The SuperSpeed side may wait for the controller's device lock, which an unbind of the
+ * controller holds while it cancels the controller's own work: so this work is the PHY's.
+ */
+void apple_atcphy_sleep_finish_async(struct phy *usb2_phy, bool kept)
+{
+	struct apple_atcphy *atcphy = atcphy_from_usb2_phy(usb2_phy);
+
+	if (!atcphy)
+		return;
+	WRITE_ONCE(atcphy->sleep_finish_kept, kept);
+	queue_work(system_unbound_wq, &atcphy->sleep_finish_work);
+}
+EXPORT_SYMBOL_GPL(apple_atcphy_sleep_finish_async);
+
+void apple_atcphy_sleep_finish_flush(struct phy *usb2_phy)
+{
+	struct apple_atcphy *atcphy = atcphy_from_usb2_phy(usb2_phy);
+
+	if (atcphy)
+		flush_work(&atcphy->sleep_finish_work);
+}
+EXPORT_SYMBOL_GPL(apple_atcphy_sleep_finish_flush);
 
 static int atcphy_suspend(struct device *dev)
 {

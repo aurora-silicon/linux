@@ -185,8 +185,6 @@ struct dwc3_apple {
 	bool sleep_reinit;
 	/* Looks for the fixed hub once a host restarted after a sleep has had time to find it. */
 	struct delayed_work hub_check;
-	struct work_struct sleep_finish;
-	bool sleep_finish_kept;
 	/* The core didn't come back from a sleep, and nothing may touch it until a reboot. */
 	bool sleep_dead;
 	/* Stopped for a deep sleep: the state to come back to, and the wakeup setting. */
@@ -1295,7 +1293,7 @@ static int dwc3_apple_pm_notify(struct notifier_block *nb, unsigned long action,
 	 * check takes the glue's lock, and has nothing to look at until the sleep is over.
 	 */
 	if (action == PM_SUSPEND_PREPARE) {
-		flush_work(&appledwc->sleep_finish);
+		apple_atcphy_sleep_finish_flush(appledwc->usb2_phy);
 		cancel_delayed_work_sync(&appledwc->hub_check);
 	}
 	if (action == PM_SUSPEND_PREPARE && !pm_suspend_default_s2idle()) {
@@ -1308,22 +1306,16 @@ static int dwc3_apple_pm_notify(struct notifier_block *nb, unsigned long action,
 	scoped_guard(mutex, &appledwc->lock)
 		ret = dwc3_apple_pm_notify_locked(appledwc, action, in_place, &finish, &kept);
 
-	/* After a wake, user space doesn't wait for SuperSpeed: it comes back in the background. */
-	if (finish && action == PM_POST_SUSPEND) {
-		WRITE_ONCE(appledwc->sleep_finish_kept, kept);
-		queue_work(system_unbound_wq, &appledwc->sleep_finish);
-	} else if (finish) {
+	/*
+	 * After a wake, user space doesn't wait for SuperSpeed: it comes back in the background,
+	 * from the PHY's work, which an unbind of this device doesn't wait for under its lock.
+	 */
+	if (finish && action == PM_POST_SUSPEND)
+		apple_atcphy_sleep_finish_async(appledwc->usb2_phy, kept);
+	else if (finish)
 		apple_atcphy_sleep_finish(appledwc->usb2_phy, kept);
-	}
 
 	return ret;
-}
-
-static void dwc3_apple_sleep_finish(struct work_struct *work)
-{
-	struct dwc3_apple *appledwc = container_of(work, struct dwc3_apple, sleep_finish);
-
-	apple_atcphy_sleep_finish(appledwc->usb2_phy, READ_ONCE(appledwc->sleep_finish_kept));
 }
 
 static void dwc3_apple_pm_notifier_remove(void *data)
@@ -1430,9 +1422,6 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	 */
 	appledwc->state = DWC3_APPLE_PROBE_PENDING;
 	ret = devm_delayed_work_autocancel(dev, &appledwc->hub_check, dwc3_apple_hub_check);
-	if (ret)
-		return ret;
-	ret = devm_work_autocancel(dev, &appledwc->sleep_finish, dwc3_apple_sleep_finish);
 	if (ret)
 		return ret;
 	appledwc->pm_nb.notifier_call = dwc3_apple_pm_notify;
