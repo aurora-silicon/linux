@@ -238,6 +238,19 @@ config APPLE_T8132_PLATFORM_KUNIT_TEST
 	  tree without enabling any Apple hardware drivers. These tests only
 	  read metadata and never access the described MMIO resources.
 
+config APPLE_REGVIEW
+	tristate "Apple SoC read-only register views"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on OF && DEBUG_FS
+	help
+	  Exposes fixed lists of registers of Apple SoC blocks that have no
+	  functional driver, such as the memory cache controller and the
+	  DisplayPort tunnel ingress, as read-only files under
+	  /sys/kernel/debug/apple-regview. The driver never writes to these
+	  blocks. Only registers known to be safe to read are listed.
+
+	  This is a development aid. If unsure, say 'n'.
+
 config APPLE_CLPC
 	tristate "Apple host performance controller floors"
 	depends on ARCH_APPLE || COMPILE_TEST
