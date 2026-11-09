@@ -611,12 +611,18 @@
 			compatible = "apple,t8112-cluster-cpufreq", "apple,cluster-cpufreq";
 			reg = <0x2 0x10e20000 0 0x1000>;
 			#performance-domain-cells = <0>;
+			#ifdef APPLE_USE_PMP
+			apple,pmp-memory-vote = <&pmp_report 0xa8>;
+			#endif
 		};
 
 		cpufreq_p: cpufreq@211e20000 {
 			compatible = "apple,t8112-cluster-cpufreq", "apple,cluster-cpufreq";
 			reg = <0x2 0x11e20000 0 0x1000>;
 			#performance-domain-cells = <0>;
+			#ifdef APPLE_USE_PMP
+			apple,pmp-memory-vote = <&pmp_report 0xa9>;
+			#endif
 		};
 
 		display_dfr: display-pipe@228200000 {
@@ -1166,7 +1172,11 @@
 				label = "pmp-ane-sys";
 				#power-domain-cells = <0>;
 				power-domains = <&ps_ane_sys>;
+				#ifdef APPLE_USE_PMP
+				status = "okay";
+				#else
 				status = "disabled";
+				#endif
 			};
 
 			pmp_report_isp_sys: report@6 {
@@ -1236,6 +1246,8 @@
 				label = "pmp-jpg";
 				#power-domain-cells = <0>;
 				power-domains = <&ps_jpg>;
+				apple,dvfs = <0xb2 2>;
+				apple,dvfs-request-class = <0x21>;
 				status = "disabled";
 			};
 
@@ -1838,7 +1850,14 @@
 			iommus = <&ane_dart0 0>, <&ane_dart1 0>, <&ane_dart2 0>;
 			power-domains = <&ps_ane_sys_cpu>, <&ps_ane_td>,
 				<&ps_ane_base>, <&ps_ane_set1>, <&ps_ane_set2>,
-				<&ps_ane_set3>, <&ps_ane_set4>;
+				<&ps_ane_set3>, <&ps_ane_set4>
+				#ifdef APPLE_USE_PMP
+				, <&pmp_report_ane_sys>
+				#endif
+				;
+			#ifdef APPLE_USE_PMP
+			apple,performance-controller = <&pmp_report>;
+			#endif
 			mboxes = <&ane_mbox>;
 		};
 
