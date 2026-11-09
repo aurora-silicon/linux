@@ -141,6 +141,11 @@ static const struct apple_soc_edac_hw t6000_event_hw = {
 	.event_log = true,
 };
 
+static const struct apple_soc_edac_hw t8112_event_hw = {
+	.num_irqs = 16,
+	.event_log = true,
+};
+
 static const struct apple_soc_edac_hw t6041_event_hw = {
 	.num_irqs = 21,
 	.event_log = true,
@@ -388,6 +393,7 @@ static const struct of_device_id apple_soc_edac_of_match[] = {
 	{ .compatible = "apple,t8140-error-handler", .data = &t8140_error_hw },
 	{ .compatible = "apple,t6000-event-log", .data = &t6000_event_hw },
 	{ .compatible = "apple,t6041-event-log", .data = &t6041_event_hw },
+	{ .compatible = "apple,t8112-event-log", .data = &t8112_event_hw },
 	{ .compatible = "apple,t8140-event-log", .data = &t8140_event_hw },
 	{ }
 };
