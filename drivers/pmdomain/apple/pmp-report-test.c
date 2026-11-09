@@ -24,6 +24,31 @@ static void pmp_ranges_t6030(struct kunit *test)
 							0x1000, 0x10800, 0x1080));
 }
 
+/* Older PMPs have distinct PTD apertures; neither uses the M3 layout. */
+static void pmp_ranges_t6000(struct kunit *test)
+{
+	u8 table[2 * PMP_PTD_RANGE_SIZE];
+
+	pmp_range(table, PMP_PTD_RANGE_REQUEST, 0xf8, 8);
+	pmp_range(table + PMP_PTD_RANGE_SIZE, PMP_PTD_RANGE_ACK, 0x100, 8);
+	KUNIT_EXPECT_TRUE(test, apple_pmp_ranges_valid(table, sizeof(table),
+						       0xf80, 0x107c0, 0x1000));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_ranges_valid(table, sizeof(table),
+							0xa00, 0x10500, 0xa40));
+}
+
+static void pmp_ranges_t8112(struct kunit *test)
+{
+	u8 table[2 * PMP_PTD_RANGE_SIZE];
+
+	pmp_range(table, PMP_PTD_RANGE_REQUEST, 0xa0, 4);
+	pmp_range(table + PMP_PTD_RANGE_SIZE, PMP_PTD_RANGE_ACK, 0xa4, 4);
+	KUNIT_EXPECT_TRUE(test, apple_pmp_ranges_valid(table, sizeof(table),
+						       0xa00, 0x10500, 0xa40));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_ranges_valid(table, sizeof(table),
+							0xf80, 0x107c0, 0x1000));
+}
+
 static void pmp_ranges_t8122(struct kunit *test)
 {
 	u8 table[2 * PMP_PTD_RANGE_SIZE];
@@ -255,6 +280,8 @@ static void pmp_bootargs_reject_integer_width(struct kunit *test)
 }
 
 static struct kunit_case apple_pmp_report_cases[] = {
+	KUNIT_CASE(pmp_ranges_t6000),
+	KUNIT_CASE(pmp_ranges_t8112),
 	KUNIT_CASE(pmp_ranges_t6030),
 	KUNIT_CASE(pmp_ranges_t8122),
 	KUNIT_CASE(pmp_ranges_t6031),
