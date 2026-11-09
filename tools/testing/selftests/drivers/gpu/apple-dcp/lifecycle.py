@@ -1200,6 +1200,7 @@ struct apple_dcp_hw_data {
     int iomfb_method_profile,firmware_compat;
     const struct resource *firmware_clock;
     u32 firmware_display_windows,firmware_scratch,firmware_request;
+    bool s2r,s2r_ext;
 };
 struct apple_dcp {
     struct device *dev; struct apple_dcp_hw_data hw;

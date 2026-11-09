@@ -260,6 +260,13 @@ struct apple_dcp_hw_data {
 	 * (desktop 26.x), see dcp_sink_metadata().
 	 */
 	bool sink_metadata_edid;
+	/*
+	 * With H17P firmware: a firmware-driven system sleep stops the internal processor's
+	 * firmware and powers it down, as DPMS off does, then restarts it warm, see
+	 * dcp_s2r_suspend(). @s2r_ext: the same for an external one, see dcp_s2r_ext_suspend().
+	 */
+	bool s2r;
+	bool s2r_ext;
 };
 
 enum dcp_test_point {
@@ -631,7 +638,7 @@ struct apple_dcp {
 	/* Messages from the coprocessor are held in the mailbox for sleep. */
 	bool rx_held;
 
-	/* T8140 suspend-to-RAM stops the firmware, see dcp_s2r_suspend(). */
+	/* A firmware-driven suspend stops the firmware, see dcp_s2r_suspend(). */
 	bool s2r_active;
 	bool s2r_stopped;
 	/* DPMS off stopped the firmware and lowered the domains; DPMS on brings them back. */

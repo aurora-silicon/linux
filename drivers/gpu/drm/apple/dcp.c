@@ -4476,7 +4476,7 @@ void dcp_poweroff(struct platform_device *pdev)
 	cancel_delayed_work(&dcp->swap_watchdog_wq);
 
 	/*
-	 * Internal H17P DPMS is a brightness present, never a pipe stop. On T8140 the
+	 * Internal H17P DPMS is a brightness present, never a pipe stop. With hw.s2r the
 	 * display then powers off as well, after the backlight.
 	 */
 	if (dcp_uses_soft_dpms(dcp)) {
@@ -5573,8 +5573,7 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	if (ret)
 		goto err_piodma;
 	/* After a warm restart its log counters need echoing, or it refuses its next idle. */
-	if (of_device_is_compatible(dev->of_node, "apple,t8140-dcp") ||
-	    of_device_is_compatible(dev->of_node, "apple,t8140-dcpext"))
+	if (dcp->hw.s2r || dcp->hw.s2r_ext)
 		apple_rtkit_set_oslog_echo(dcp->rtk, true);
 	ret = dcp_secure_port_init(dcp);
 	if (ret)
@@ -6839,8 +6838,8 @@ static void dcp_platform_complete(struct device *dev)
 }
 
 /*
- * T8140 suspend-to-RAM: the sleep engine waits for the DCP's domain to be off, so
- * the firmware has to stop first. Measured from macOS, in order:
+ * Suspend-to-RAM with hw.s2r: the sleep engine waits for the DCP's domain to be off, so
+ * the firmware has to stop first. Measured from macOS on T8140, in order:
  *
  *  1. A414(0), A478 x2, A476(1), A478, A412, A473(0).
  *  2. D572(0) from the firmware: the display DART's streams go off.
@@ -6910,8 +6909,7 @@ void dcp_s2r_dart_power(struct apple_dcp *dcp, u32 on)
 
 static bool dcp_s2r_capable(struct apple_dcp *dcp)
 {
-	return dcp->fw_compat == DCP_FIRMWARE_H17P &&
-	       of_device_is_compatible(dcp->dev->of_node, "apple,t8140-dcp");
+	return dcp->fw_compat == DCP_FIRMWARE_H17P && dcp->hw.s2r;
 }
 
 static void dcp_s2r_cpu_stop(struct apple_dcp *dcp)
@@ -7101,8 +7099,7 @@ static int dcp_s2r_stop_firmware(struct apple_dcp *dcp)
  */
 static bool dcp_s2r_ext_capable(struct apple_dcp *dcp)
 {
-	return dcp->fw_compat == DCP_FIRMWARE_H17P &&
-	       of_device_is_compatible(dcp->dev->of_node, "apple,t8140-dcpext");
+	return dcp->fw_compat == DCP_FIRMWARE_H17P && dcp->hw.s2r_ext;
 }
 
 /*
@@ -7883,7 +7880,7 @@ static void dcp_s2r_restart_failed_stop(struct apple_dcp *dcp)
 }
 
 /*
- * DPMS on the internal T8140 panel as macOS does a display sleep: the backlight to 0,
+ * DPMS on an internal panel with hw.s2r as macOS does a display sleep: the backlight to 0,
  * then the firmware stopped and the display domains off, and the reverse on wake. Not
  * during a system sleep: that path stops the firmware itself.
  */
@@ -8152,6 +8149,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8140 = {
 	.firmware_display_windows = 5,
 	.firmware_scratch = 0x20000,
 	.firmware_request = 0x68000,
+	.s2r = true,
 };
 
 /* Separate from the established internal-panel H17P profile. */
@@ -8165,6 +8163,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8140_external = {
 	/* Native PMGR BWR agent 2 and boost agent 3 for DISPEXT0. */
 	.firmware_scratch = 0x28000,
 	.firmware_request = 0x70000,
+	.s2r_ext = true,
 };
 
 /*
