@@ -711,6 +711,7 @@ impl Firmware {
 
     /// Called at actual submission publication, not while a queued job is merely being built.
     fn note_submission(&mut self) -> Result {
+        self.rings.statistics_host_idle(false);
         self.port.note_gpu_activity();
         self.effort.submit();
         self.apply_effort(power::FULL_EFFORT)
@@ -758,6 +759,7 @@ impl Firmware {
         if submitted {
             self.effort.submit();
         }
+        self.rings.statistics_host_idle(!(in_flight || submitted));
         let effort = match self.effort.idle(now_ns, in_flight || submitted) {
             power::IdleAction::None => None,
             power::IdleAction::Clear => {

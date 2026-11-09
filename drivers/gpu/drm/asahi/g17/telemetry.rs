@@ -49,6 +49,11 @@ pub(super) struct Telemetry {
     /// gates them a few milliseconds after the last work completes and emits no
     /// utilisation record while gated, so a gated GPU is idle, not unknown.
     gated: bool,
+    /// The host had no work queued or running at its last idle check. The
+    /// firmware emits no utilisation record while the GPU has no work, also
+    /// when the cores stay powered (an idle hold, or a firmware build whose
+    /// temperature sensors need the GPU powered), so this is idle too.
+    host_idle: bool,
 }
 
 impl Telemetry {
@@ -67,6 +72,14 @@ impl Telemetry {
         self.delivery_ns = None;
         self.delivery_intervals = [None; 2];
         self.gated = false;
+        self.host_idle = false;
+    }
+
+    /// Records whether the host has any work queued or running. Set from the
+    /// idle check, cleared at every submission. An epoch boundary clears it,
+    /// so suspend, crash and quarantine still read stale until the next check.
+    pub(super) fn set_host_idle(&mut self, idle: bool) {
+        self.host_idle = idle;
     }
 
     /// The cores were observed power-gated. End the averaging epoch exactly as
@@ -160,8 +173,11 @@ impl Telemetry {
         let expired = |received| now_ns < received || now_ns - received >= limit;
         // The oldest contributing sample bounds the whole averaging window,
         // measured against the next expected delivery plus the host policy.
-        if self.gated && (view.util_status != VALID || expired(self.window_ns)) {
-            // No work can run on gated cores: idle is a measurement here.
+        if (self.gated || self.host_idle)
+            && (view.util_status != VALID || expired(self.window_ns))
+        {
+            // No work can run on gated cores, and none was given to powered
+            // ones: idle is a measurement here.
             view.util_status = VALID;
             view.tiler = 0;
             view.renderer = 0;
@@ -359,5 +375,23 @@ mod tests {
             stats.record(&words, 1, AGE);
         }
         assert_eq!(stats.read(1, AGE), Readout::default());
+    }
+
+    #[test]
+    fn a_powered_gpu_with_no_host_work_reads_idle() {
+        let mut stats = Telemetry::default();
+        stats.record(&U1, 100, AGE);
+        // Busy, then the host has no work: the last sample stays until it ages out.
+        stats.set_host_idle(true);
+        assert_eq!(stats.read(101, AGE).device, 50);
+        let view = stats.read(100 + AGE, AGE);
+        assert_eq!((view.util_status, view.device), (VALID, 0));
+        // A submission ends it: an aged sample is stale again until a record arrives.
+        stats.set_host_idle(false);
+        assert_eq!(stats.read(100 + AGE, AGE).util_status, STALE);
+        // An epoch boundary is never idle.
+        stats.set_host_idle(true);
+        stats.invalidate();
+        assert_eq!(stats.read(u64::MAX, AGE).util_status, STALE);
     }
 }

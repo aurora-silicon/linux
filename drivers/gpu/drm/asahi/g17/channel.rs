@@ -122,6 +122,11 @@ impl Rings {
         self.suspended
     }
 
+    /// See [`super::telemetry::Telemetry::set_host_idle`].
+    pub(super) fn statistics_host_idle(&mut self, idle: bool) {
+        self.telemetry.set_host_idle(idle);
+    }
+
     pub(super) fn observe_statistics_power(
         &mut self,
         dev: &Device,
