@@ -121,7 +121,7 @@ mod output_tests {
         let c = Completion::new(std::sync::Arc::new(()), std::sync::Arc::new(()));
         c.complete_stamp([10, 20, 0, 0]);
         assert_eq!(c.feed.as_ref().unwrap().0.get(), 0); assert!(!c.released.get());
-        c.complete(Ok([10, 20, 0, 0]));
+        c.complete(Ok([10, 20, 0, 0])); c.complete(Ok([10, 20, 0, 0]));
         assert_eq!(c.feed.as_ref().unwrap().0.get(), 1);
         assert_eq!(c.output.calls.get(), 1); assert!(!c.released.get());
         let normal = Completion::new(std::sync::Arc::new(()), std::sync::Arc::new(()));

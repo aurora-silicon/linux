@@ -257,8 +257,8 @@ pub(crate) struct Completion {
     // Keep that ioctl node owned until physical retirement, including render.
     #[pin]
     stamp_work: Mutex<Option<Arc<WorkStateLease>>>,
-    // 0 pending, 1 ordinary/failure output, 2 successful stamp output.
-    // One atomic claim lets late accounting distinguish early success from error.
+    // 0 pending, 1 ordinary/failure output, 2 successful stamp output,
+    // 3 stamp output with retirement accounting claimed. Both claims are once-only.
     signalled: AtomicU8,
     retirement_queued: AtomicBool,
     stamp_queued: AtomicBool,
@@ -691,7 +691,9 @@ impl Completion {
         if let Err(state) = self.signalled.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
             // Only a successful stamp output defers pass accounting here. A
             // queued candidate vetoed by failure must not account as success.
-            if state == 2 {
+            if state == 2
+                && self.signalled.compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire).is_ok()
+            {
                 if let Ok(ticks) = result { self.note_pass(ticks); }
             }
             return;
