@@ -79,9 +79,9 @@ properties:
   apple,pmp-memory-vote:
     $ref: /schemas/types.yaml#/definitions/phandle-array
     description: |
-      PMP report region and the cluster's SOC-DEV-DVFS entry. The cpufreq
-      request supplies a clean host DCS and SoC-fabric constraint while the
-      PMP owns those clocks.
+      PMP report region and the cluster's SOC-DEV-DVFS entry. The entry
+      identifies the firmware SOC-device constraint target; cpufreq queues
+      DCS and SoC-fabric commands to the PMP without waiting in fast-switch.
     items:
       - items:
           - description: PMP report region
