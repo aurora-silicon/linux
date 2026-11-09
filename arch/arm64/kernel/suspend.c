@@ -42,9 +42,15 @@ void __init cpu_suspend_set_dbg_restorer(int (*hw_bp_restore)(unsigned int))
 	hw_breakpoint_restore = hw_bp_restore;
 }
 
+/* Bring-up: set by the sleep driver, for progress that survives a reset. */
+void (*pm_bringup_cpu_mark)(u32 step);
+
 void notrace __cpu_suspend_exit(void)
 {
 	unsigned int cpu = smp_processor_id();
+
+	if (pm_bringup_cpu_mark)
+		pm_bringup_cpu_mark(7);
 
 	mte_suspend_exit();
 
@@ -159,8 +165,14 @@ int cpu_suspend(unsigned long arg, int (*fn)(unsigned long))
 
 		ct_cpuidle_exit();
 	} else {
+		if (pm_bringup_cpu_mark)
+			pm_bringup_cpu_mark(0x61);
 		ct_cpuidle_exit();
+		if (pm_bringup_cpu_mark)
+			pm_bringup_cpu_mark(0x62);
 		__cpu_suspend_exit();
+		if (pm_bringup_cpu_mark)
+			pm_bringup_cpu_mark(8);
 	}
 
 	unpause_graph_tracing();

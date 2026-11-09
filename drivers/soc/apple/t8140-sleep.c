@@ -49,8 +49,18 @@
 #include <linux/of_device.h>
 #include <linux/of_irq.h>
 #include <linux/of_platform.h>
+#include <linux/panic_notifier.h>
+#include <linux/kdebug.h>
+#include <linux/percpu.h>
+#include <linux/sched/task_stack.h>
+#include <linux/kallsyms.h>
+#include <linux/stacktrace.h>
+#include <asm/sections.h>
+#include <asm/smp_plat.h>
+#include <asm/suspend.h>
 #include <linux/platform_device.h>
 #include <linux/smp.h>
+#include <linux/spinlock.h>
 #include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/soc/apple/tunable.h>
@@ -83,6 +93,10 @@ struct t8140_s2r_mailbox {
 #define PS_FLAGS		GENMASK(9, 8)
 #define PS_ACTUAL		GENMASK(7, 4)
 #define PS_TARGET		GENMASK(3, 0)
+
+/* Clock protection, per slice: its control word, and the bit that guards the slice's range. */
+#define PS_PROT_SLICE(n)	(0x100 + 0x40 * (n))
+#define PS_PROT_SLICE_ON	BIT(4)
 #define PS_OFF_TIMEOUT_US	5000
 
 #define PS_DISP_CPU		0x10000
@@ -197,6 +211,8 @@ struct t8140_s2r_mailbox {
 #define T8132_PMU_OP_WRITE(n)		(0x30 + (n) - 1)
 #define T8132_PMU_OP_READ(n)		(0x38 + (n) - 1)
 #define T8132_PMU_SECONDS		0x2008
+#define T8132_PMU_RTC_NOW		0x2004
+#define T8132_PMU_RTC_EVENT		BIT(1)
 #define T8132_PMU_SLEEP_CTL		0x2000
 #define T8132_PMU_SLEEP_CTL_HIB		0x41
 #define T8132_PMU_SLEEP_ARG		0x200e
@@ -358,6 +374,16 @@ static struct {
 #define IPI_SR_PENDING		BIT(0)
 #define SYS_APL_SIQ_CFG_EL1	sys_reg(3, 4, 15, 10, 4)
 
+/* S2R bring-up: the watchdog at the commit, and one wake source alone (-1: all of them). */
+static unsigned int bringup_wd2_s = WDT_SLEEP_SECS;
+module_param(bringup_wd2_s, uint, 0644);
+static int bringup_wake_only = -1;
+module_param(bringup_wake_only, int, 0644);
+
+/* Every source in the ADT's ap-wake-sources, which is what macOS leaves open. */
+static bool bringup_wake_all;
+module_param(bringup_wake_all, bool, 0644);
+
 struct t8140_sleep;
 
 /* A power word with a name, for the log. */
@@ -393,6 +419,8 @@ struct t8140_sleep_reg {
 struct t8140_sleep_display {
 	u32 ps[3];
 	u32 gate[2];
+	/* The clock-protection slice guarding the CPU word, 0 if none has to be cleared here. */
+	u8 prot_slice;
 };
 
 /* What differs between the SoCs this driver handles. */
@@ -418,6 +446,7 @@ struct t8140_sleep_soc {
 	u32 pwrgate_cpm_1;
 	const struct t8140_sleep_display *displays;
 	unsigned int n_displays;
+	bool lower_unbound_displays;
 	/* Which display to lower next, in macOS's order: index into @displays. */
 	const u8 *display_order;
 	const u32 *ps_all, *ps_aon_all, *ps_macos_on, *ps_macos_off, *ps_aon_macos_off;
@@ -491,6 +520,7 @@ struct t8140_sleep {
 	void __iomem *wake;
 	void __iomem *amcc[4];
 	void __iomem *pmc_dcp;
+	void __iomem *ps_prot;
 	void __iomem *spmi;
 	void __iomem *pmc_voters;
 	void __iomem *dcs;
@@ -538,6 +568,8 @@ struct t8140_sleep {
 	bool dvfm_parked;
 	u64 resumes_before;
 	u64 resumes_after;
+	/* T8132: ATC0's words as they were before the commit path lowered them. */
+	u32 atc0_saved[3];
 	int cluster_e_ret;
 	int cluster_ave_ret;
 	int cluster_ave_commit_ret;
@@ -1507,7 +1539,11 @@ static void t8140_wake_masks(struct t8140_sleep *s, u32 *val)
 	for (i = 0; i < WAKE_WORDS; i++)
 		val[i] = i == WAKE_WORDS - 1 ? WAKE_WORD7_ALL : U32_MAX;
 	for (i = 0; i < s->wake_enable_count; i++)
-		t8140_wake_unmask(val, s->wake_enable[i]);
+		if (bringup_wake_only < 0 || s->wake_enable[i] == bringup_wake_only)
+			t8140_wake_unmask(val, s->wake_enable[i]);
+	if (READ_ONCE(bringup_wake_all) && bringup_wake_only < 0)
+		for (i = 0; i < s->soc->n_wake_names; i++)
+			t8140_wake_unmask(val, s->soc->wake_names[i].id);
 }
 
 /* The last checks, then the stray words lowered: what has stopped may not return until a wake. */
@@ -1644,9 +1680,17 @@ static int t8140_display_off(struct t8140_sleep *s)
 		i = s->soc->display_order[j];
 		asc = s->display[i].asc;
 
-		/* The engine doesn't wait for the external displays. */
-		if (i != 0 && !s->display[i].bound)
-			continue;
+		/* T8140's engine doesn't wait for its external display. T8132's macOS has them all off. */
+		if (i != 0 && !s->display[i].bound) {
+			if (!s->soc->lower_unbound_displays)
+				continue;
+			/* Otherwise writing its CPU word faults. */
+			if (s->ps_prot && d[i].prot_slice) {
+				void __iomem *slice = s->ps_prot + PS_PROT_SLICE(d[i].prot_slice);
+
+				writel(readl(slice) & ~PS_PROT_SLICE_ON, slice);
+			}
+		}
 
 		if (t8140_ps_on(s, d[i].ps[0]) && asc &&
 		    (readl(asc + ASC_CPU_CONTROL) & ASC_CPU_CONTROL_RUN)) {
@@ -1671,7 +1715,7 @@ static int t8140_display_off(struct t8140_sleep *s)
 	for (i = 0; i < n; i++) {
 		int err;
 
-		if (i != 0 && !s->display[i].bound)
+		if (i != 0 && !s->display[i].bound && !s->soc->lower_unbound_displays)
 			continue;
 
 		err = t8140_ps_wait_off(s, d[i].ps[0]);
@@ -2360,6 +2404,11 @@ static const u32 t8140_ps_aon_macos_no_auto[] = {
  * have their own stop (display, ANS, APCIE, SEP, GFX, SIO_CPU), or macOS leaves them to
  * AUTO_ENABLE with the target at f: the AFISOCNI words and NUB_SRAM.
  */
+/* What macOS has at f at the commit that idles lower. T8140's list has DWI too. */
+static const u32 t8132_ps_macos_on[] = {
+	0x2f8, 0x310, 0x318, 0x320, 0x348, 0x358, 0x368, 0x118,
+};
+
 static const u32 t8132_ps_macos_off[] = {
 	0xc018, 0xc010, 0xc008, 0xc000, 0x8020, 0x8018, 0x8010, 0x8008, 0x8000, 0x4018,
 	0x4010, 0x4008, 0x4000, 0x580, 0x578, 0x570, 0x568, 0x560, 0x530, 0x4b8,
@@ -2515,7 +2564,7 @@ static void t8140_sleep_match_undo(struct t8140_sleep *s)
 static void t8140_sleep_arm_wd2(struct t8140_sleep *s)
 {
 	writel(0, s->wdt + WDT_WD0_CTL);
-	t8140_sleep_set_wd2(s, WDT_SLEEP_SECS);
+	t8140_sleep_set_wd2(s, READ_ONCE(bringup_wd2_s));
 	writel(0, s->aon_misc + AON_AP_DEADLINE);
 }
 
@@ -2621,6 +2670,53 @@ static void t8140_sleep_wait_still_on(struct t8140_sleep *s)
 	for (i = 0; i < ARRAY_SIZE(words); i++)
 		t8140_ps_wait_off(s, words[i]);
 }
+
+/*
+ * Bring-up: the first thing Linux runs after a wake, MMU off and no stack. The last wake program
+ * leaves WD2 running for 5 s: restart it for 60 s, in the order t8140_sleep_set_wd2() uses. No
+ * SPMI here: macOS leaves that bus alone for a long time after a wake.
+ */
+asm(
+"	.pushsection .text, \"ax\"\n"
+"	.type	t8132_resume_stub, %function\n"
+"t8132_resume_stub:\n"
+"	movz	x9, #0x882b, lsl #16\n"
+"	movk	x9, #0x3, lsl #32\n"
+"	str	wzr, [x9, #0x2c]\n"
+"	str	wzr, [x9, #0x20]\n"
+"	movz	w10, #0xa800\n"
+"	movk	w10, #0x55d4, lsl #16\n"
+"	str	w10, [x9, #0x28]\n"
+"	mov	w10, #1\n"
+"	str	w10, [x9, #0x2c]\n"
+"	b	cpu_resume\n"
+"	.size	t8132_resume_stub, . - t8132_resume_stub\n"
+"	.popsection\n"
+);
+extern char t8132_resume_stub[];
+
+static bool bringup_resume_stub = true;
+module_param(bringup_resume_stub, bool, 0644);
+
+/* Arm the RTC alarm in .enter, as rtcwake does on T8140, not after the commit as macOS does. */
+static bool bringup_wake_early = true;
+module_param(bringup_wake_early, bool, 0644);
+
+/* Write what the wake reads back from the caches before the commit: are dirty lines lost? */
+static bool bringup_clean_ram = true;
+module_param(bringup_clean_ram, bool, 0644);
+
+/* SPMI markers before the driver's return path is done. */
+static bool bringup_early_marks = true;
+module_param(bringup_early_marks, bool, 0444);
+
+/* The marks live in the PMU's RTC alarm register: off when the alarm is the RTC driver's. */
+static bool bringup_marks;
+module_param(bringup_marks, bool, 0644);
+
+/* For sleep.S and __cpu_suspend_exit(): progress before this driver runs again. */
+u64 t8132_spmi_va;
+extern void (*pm_bringup_cpu_mark)(u32 step);
 
 /* aura reads this with the MMU off. */
 static void t8140_sleep_arm_mailbox(struct t8140_sleep *s)
@@ -2770,6 +2866,9 @@ static void t8132_aon_lower(struct t8140_sleep *s, u32 offset)
 
 static void t8132_sleep_lower_io(struct t8140_sleep *s)
 {
+	s->atc0_saved[0] = readl(s->ps_aon + T8132_PS_AON_ATC0_USB);
+	s->atc0_saved[1] = readl(s->ps_aon + T8132_PS_AON_ATC0_USB_AON);
+	s->atc0_saved[2] = readl(s->ps + T8132_PS_ATC0_COMMON);
 	t8132_aon_lower(s, T8132_PS_AON_ATC0_USB);
 	if (!READ_ONCE(t8140_usb_asleep))
 		t8132_aon_lower(s, T8132_PS_AON_ATC0_USB_AON);
@@ -2825,34 +2924,227 @@ static int t8132_pmu_cmd(struct t8140_sleep *s, u32 cmd, const u32 *tx, u32 *rx,
  * it back now and write the same. Last of the refusals, so a read that can't happen stops the
  * sleep with nothing stopped yet.
  */
+/* S2R bring-up: wake by the PMU's RTC this long after the sleep's last refusal. */
+static unsigned int bringup_wake_s;
+module_param(bringup_wake_s, uint, 0644);
+
 static int t8132_sleep_last_refusal(struct t8140_sleep *s)
 {
 	u32 enable, rx[2];
 	int ret;
 
 	enable = readl(s->spmi + SPMI_NOTIFY_ENABLE);
-	ret = t8132_pmu_cmd(s, T8132_PMU_CMD(T8132_PMU_SECONDS, T8132_PMU_OP_READ(4)), NULL,
+	ret = t8132_pmu_cmd(s, T8132_PMU_CMD(T8132_PMU_RTC_NOW, T8132_PMU_OP_READ(4)), NULL,
 			    rx, ARRAY_SIZE(rx), SPMI_POLL_US);
 	writel(enable, s->spmi + SPMI_NOTIFY_ENABLE);
 	if (!ret && rx[0] != T8132_PMU_REPLY_READ4) {
-		dev_err(s->dev, "refused: PMU 0x2008 replied with header %#x\n", rx[0]);
+		dev_err(s->dev, "refused: PMU RTC replied with header %#x\n", rx[0]);
 		return -EIO;
 	}
 	if (ret) {
-		dev_err(s->dev, "refused: can't read PMU 0x2008: %d\n", ret);
+		dev_err(s->dev, "refused: can't read PMU RTC: %d\n", ret);
 		return ret;
 	}
-	s->pmu_seconds = rx[1];
+	s->pmu_seconds = rx[1] + READ_ONCE(bringup_wake_s);
 
 	return 0;
 }
 
 /* macOS's commands after the commit: PMU's 0x2008 back, 0x200e cleared, then "go hib". */
+/* Progress for bring-up, read back after a reset: the PMU keeps this register across one. */
+#define T8132_MARK(n)	(0x53320000 | (n))
+
+static int t8132_sleep_commit(unsigned long unused);
+
+static DEFINE_RAW_SPINLOCK(t8132_mark_lock);
+static u32 t8132_last_mark;
+
+/* The early alarm lives in the marker register: nothing else may write it until the wake. */
+static bool t8132_marks_quiet;
+
+static void t8132_mark_write(struct t8140_sleep *s, u32 data)
+{
+	u32 rx;
+
+	if (!READ_ONCE(bringup_marks))
+		return;
+	t8132_pmu_cmd(s, T8132_PMU_CMD(T8132_PMU_SECONDS, T8132_PMU_OP_WRITE(4)), &data, &rx, 1,
+		      T8132_PMU_POST_POLL_US);
+}
+
+static void t8132_mark_value(struct t8140_sleep *s, u32 data)
+{
+	unsigned long flags;
+
+	if (s->soc->commit != t8132_sleep_commit)
+		return;
+	raw_spin_lock_irqsave(&t8132_mark_lock, flags);
+	WRITE_ONCE(t8132_last_mark, data);
+	if (!READ_ONCE(t8132_marks_quiet))
+		t8132_mark_write(s, data);
+	raw_spin_unlock_irqrestore(&t8132_mark_lock, flags);
+}
+
+/* 0xD2SSTTTT: step S after a wake, T the low bits of the PMU's seconds when it was written. */
+static void t8132_mark_t(struct t8140_sleep *s, u32 n)
+{
+	unsigned long flags;
+	u32 rx[2] = {};
+
+	if (s->soc->commit != t8132_sleep_commit)
+		return;
+	WRITE_ONCE(t8132_last_mark, T8132_MARK(n));
+	if (!bringup_early_marks && n < 0x36)
+		return;
+	raw_spin_lock_irqsave(&t8132_mark_lock, flags);
+	t8132_pmu_cmd(s, T8132_PMU_CMD(T8132_PMU_RTC_NOW, T8132_PMU_OP_READ(4)), NULL, rx,
+		      ARRAY_SIZE(rx), T8132_PMU_POST_POLL_US);
+	t8132_mark_write(s, 0xd2000000 | (n & 0xff) << 16 | (rx[1] & 0xffff));
+	raw_spin_unlock_irqrestore(&t8132_mark_lock, flags);
+}
+
+static void t8132_cpu_mark(u32 step)
+{
+	t8132_mark_write(t8140_sleep, 0xd1000000 | step);
+}
+
+static void t8132_mark(struct t8140_sleep *s, u32 n)
+{
+	t8132_mark_value(s, T8132_MARK(n));
+}
+
+/* FNV-1a, folded. The reader hashes the names in sysfs to find the device. */
+static u32 t8132_mark_hash(const char *name)
+{
+	u32 h = 0x811c9dc5;
+
+	for (; *name; name++) {
+		h ^= (u8)*name;
+		h *= 0x01000193;
+	}
+	return h ^ (h >> 16);
+}
+
+/* 0x4P00HHHH: phase P of the suspend, H the hash of the device's name. */
+extern void (*pm_bringup_dev_mark)(struct device *dev, unsigned int phase);
+
+static void t8132_dev_mark(struct device *dev, unsigned int phase)
+{
+	u32 hash = dev ? t8132_mark_hash(dev_name(dev)) & 0xffff : 0;
+
+	if (t8140_sleep)
+		t8132_mark_value(t8140_sleep, 0x40000000 | (phase & 0xf) << 24 | hash);
+}
+
+/*
+ * 0x5PMMHHHH after a device mark, 0x60MMNNNN after one of this driver's: the
+ * panic was in that step, MM the hash of its message.
+ */
+static unsigned long t8132_die_pc;
+
+static int t8132_die_mark(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct die_args *args = data;
+
+	if (action == DIE_OOPS && args->regs && !READ_ONCE(t8132_die_pc))
+		WRITE_ONCE(t8132_die_pc, instruction_pointer(args->regs));
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block t8132_die_nb = {
+	.notifier_call = t8132_die_mark,
+};
+
+/* Where the panic came from: an oops's pc if there was one, or else panic()'s caller. */
+static unsigned long t8132_panic_origin(void)
+{
+	unsigned long entries[24], pc = READ_ONCE(t8132_die_pc);
+	char name[KSYM_SYMBOL_LEN];
+	unsigned int n, i;
+
+	if (pc)
+		return pc;
+	n = stack_trace_save(entries, ARRAY_SIZE(entries), 0);
+	for (i = 0; i + 1 < n; i++) {
+		sprint_symbol_no_offset(name, entries[i]);
+		if (!strcmp(name, "panic") || !strcmp(name, "vpanic"))
+			pc = entries[i + 1];
+	}
+	return pc;
+}
+
+/*
+ * 0xESPPPPPP: S the low five bits of the last step (bits 27:23), P the panic's origin, its
+ * offset from _text over 4. 0xFMMOOOOO: in a module, M its name's hash, O the offset in its text.
+ */
+static void t8132_panic_mark_origin(u32 last)
+{
+	unsigned long pc = t8132_panic_origin();
+	struct module *mod;
+
+	if (!pc)
+		return;
+	if (core_kernel_text(pc)) {
+		t8132_mark_write(t8140_sleep, 0xe0000000 | (last & 0x1f) << 23 |
+				 (((pc - (unsigned long)_text) >> 2) & 0x7fffff));
+		return;
+	}
+	mod = __module_address(pc);
+	if (mod)
+		t8132_mark_write(t8140_sleep, 0xf0000000 |
+				 (t8132_mark_hash(mod->name) & 0xff) << 20 |
+				 (((pc - (unsigned long)mod->mem[MOD_TEXT].base) >> 2) & 0xfffff));
+}
+
+static int t8132_panic_mark(struct notifier_block *nb, unsigned long action, void *msg)
+{
+	u32 last = READ_ONCE(t8132_last_mark), hash = t8132_mark_hash(msg ?: "") & 0xff;
+	static bool tried;
+
+	if (last >> 28 == 0x4)
+		t8132_mark_write(t8140_sleep, 0x50000000 | (last & 0x0f00ffff) | hash << 16);
+	else
+		t8132_mark_write(t8140_sleep, 0x60000000 | (last & 0xffff) | hash << 16);
+
+	/*
+	 * 0x7PAAHHHH: A the failing physical address's bits 27:20, 0x8P00HHHH: none
+	 * recorded. Aura doesn't read this on M4 and it may trap, so it comes after
+	 * the mark above, and a second panic doesn't try again.
+	 */
+	if (!tried && msg && !strcmp(msg, "Asynchronous SError Interrupt")) {
+		u64 adr;
+
+		tried = true;
+		adr = read_sysreg_s(sys_reg(3, 3, 15, 9, 0));
+		if (last >> 28 == 0x4)
+			t8132_mark_write(t8140_sleep,
+					 (adr ? 0x70000000 | ((adr >> 20) & 0xff) << 16 : 0x80000000) |
+					 (last & 0x0f00ffff));
+		else
+			/* 0xAxxAAASS: after this driver's step S, bits 31:20 of the address (x at 39:32). */
+			t8132_mark_write(t8140_sleep, 0xa0000000 | ((adr >> 32) & 0xff) << 20 |
+					 ((adr >> 20) & 0xfff) << 8 | (last & 0xff));
+	} else if (!tried) {
+		tried = true;
+		t8132_panic_mark_origin(last);
+	}
+
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block t8132_panic_nb = {
+	.notifier_call = t8132_panic_mark,
+};
+
 static void t8132_pmu_go_hib(struct t8140_sleep *s)
 {
 	u32 data, rx[2];
 
 	t8132_pmu_cmd(s, T8132_PMU_CMD(T8132_PMU_SLEEP_CTL, T8132_PMU_OP_READ(1)), NULL, rx, 2,
+		      T8132_PMU_POST_POLL_US);
+	/* The event is W1C, and an old one raises the wake line as soon as the alarm is armed. */
+	data = (rx[1] & 0xff) | T8132_PMU_RTC_EVENT;
+	t8132_pmu_cmd(s, T8132_PMU_CMD(T8132_PMU_SLEEP_CTL, T8132_PMU_OP_WRITE(1)), &data, rx, 1,
 		      T8132_PMU_POST_POLL_US);
 	data = s->pmu_seconds;
 	t8132_pmu_cmd(s, T8132_PMU_CMD(T8132_PMU_SECONDS, T8132_PMU_OP_WRITE(4)), &data, rx, 1,
@@ -2919,6 +3211,134 @@ static void t8132_sleep_mcc_stop(struct t8140_sleep *s)
 				      ARRAY_SIZE(stages));
 }
 
+/* S2R bring-up: the words macOS has off at the commit, from its traced snapshot. */
+static const u32 t8132_bringup_off[] = {
+	0x168, 0x170, 0x188, 0x190, 0x1b0, 0x1b8, 0x1d0, 0x1d8,
+	0x1e0, 0x1e8, 0x228, 0x230, 0x238, 0x240, 0x248, 0x250,
+	0x268, 0x278, 0x288, 0x290, 0x298, 0x2a0, 0x2a8, 0x2e8,
+	0x2f0, 0x300, 0x308, 0x370, 0x380, 0x388, 0x390, 0x398,
+	0x3a0, 0x3a8, 0x3b0, 0x3b8, 0x3c0, 0x3c8, 0x420, 0x428,
+	0x430, 0x438, 0x440, 0x448, 0x450, 0x458, 0x460, 0x468,
+	0x478, 0x480, 0x498, 0x4a0, 0x4b0, 0x4b8, 0x4c8, 0x4d0,
+	0x4d8, 0x4e0, 0x4e8, 0x4f0, 0x530, 0x538, 0x540, 0x548,
+	0x550, 0x558, 0x560, 0x568, 0x570, 0x578, 0x580, 0xc00,
+	0x4000, 0x4008, 0x4010, 0x4018, 0x8000, 0x8008, 0x8010, 0x8018,
+	0x8020, 0xc000, 0xc008, 0xc010, 0xc018, 0x10000,
+};
+static const u32 t8132_bringup_aon_off[] = {
+	0xa0, 0xb8, 0xc8, 0xd0, 0xd8, 0xe0, 0xe8, 0x4020,
+	0x4090, 0x40b8, 0x40d8, 0x40e8, 0x4160,
+};
+
+/* 0x9NIIJJKK: N domains on that macOS has off (capped at 15), and the first three, by index. */
+static u32 __maybe_unused t8132_ps_summary(struct t8140_sleep *s)
+{
+	u32 ids = 0;
+	int i, n = 0;
+
+	for (i = 0; i < ARRAY_SIZE(t8132_bringup_off); i++) {
+		if (!t8140_ps_on(s, t8132_bringup_off[i]))
+			continue;
+		if (n < 3)
+			ids |= (u32)i << (16 - n * 8);
+		n++;
+	}
+	for (i = 0; i < ARRAY_SIZE(t8132_bringup_aon_off); i++) {
+		if (!FIELD_GET(PS_ACTUAL, readl(s->ps_aon + t8132_bringup_aon_off[i])))
+			continue;
+		if (n < 3)
+			ids |= (u32)(i + ARRAY_SIZE(t8132_bringup_off)) << (16 - n * 8);
+		n++;
+	}
+
+	return 0x90000000 | min(n, 15) << 24 | ids;
+}
+
+/* S2R bring-up: every power word as macOS leaves it at the commit (trace go-run10). */
+static const struct { u16 off; u8 aon, state; } t8132_bringup_ps[] = {
+	{ 0x0, 0, 0xf }, { 0x8, 0, 0xf }, { 0x10, 0, 0xf }, { 0x18, 0, 0xf },
+	{ 0x20, 0, 0xf }, { 0x28, 0, 0xf }, { 0x30, 0, 0xf }, { 0x38, 0, 0xf },
+	{ 0x40, 0, 0xf }, { 0x48, 0, 0xf }, { 0x50, 0, 0xf }, { 0x58, 0, 0xf },
+	{ 0x100, 0, 0xf }, { 0x108, 0, 0x4 }, { 0x110, 0, 0xf }, { 0x118, 0, 0xf },
+	{ 0x120, 0, 0xf }, { 0x128, 0, 0xf }, { 0x130, 0, 0xf }, { 0x138, 0, 0x4 },
+	{ 0x140, 0, 0x4 }, { 0x148, 0, 0x4 }, { 0x150, 0, 0x4 }, { 0x158, 0, 0x4 },
+	{ 0x160, 0, 0x4 }, { 0x168, 0, 0x0 }, { 0x170, 0, 0x0 }, { 0x178, 0, 0xf },
+	{ 0x180, 0, 0x4 }, { 0x188, 0, 0x0 }, { 0x190, 0, 0x0 }, { 0x198, 0, 0xf },
+	{ 0x1a0, 0, 0xf }, { 0x1a8, 0, 0x4 }, { 0x1b0, 0, 0x0 }, { 0x1b8, 0, 0x0 },
+	{ 0x1c0, 0, 0xf }, { 0x1c8, 0, 0xf }, { 0x1d0, 0, 0x0 }, { 0x1d8, 0, 0x0 },
+	{ 0x1e0, 0, 0x0 }, { 0x1e8, 0, 0x0 }, { 0x228, 0, 0x0 }, { 0x230, 0, 0x0 },
+	{ 0x238, 0, 0x0 }, { 0x240, 0, 0x0 }, { 0x248, 0, 0x0 }, { 0x250, 0, 0x0 },
+	{ 0x258, 0, 0xf }, { 0x260, 0, 0x4 }, { 0x268, 0, 0x0 }, { 0x270, 0, 0x4 },
+	{ 0x278, 0, 0x0 }, { 0x280, 0, 0x4 }, { 0x288, 0, 0x0 }, { 0x290, 0, 0x0 },
+	{ 0x298, 0, 0x0 }, { 0x2a0, 0, 0x0 }, { 0x2a8, 0, 0x0 }, { 0x2b0, 0, 0x4 },
+	{ 0x2b8, 0, 0x4 }, { 0x2c0, 0, 0x4 }, { 0x2c8, 0, 0x4 }, { 0x2d0, 0, 0xf },
+	{ 0x2d8, 0, 0xf }, { 0x2e0, 0, 0xf }, { 0x2e8, 0, 0x0 }, { 0x2f0, 0, 0x0 },
+	{ 0x2f8, 0, 0xf }, { 0x300, 0, 0x0 }, { 0x308, 0, 0x0 }, { 0x310, 0, 0xf },
+	{ 0x318, 0, 0xf }, { 0x320, 0, 0xf }, { 0x328, 0, 0x4 }, { 0x330, 0, 0x4 },
+	{ 0x338, 0, 0x4 }, { 0x340, 0, 0x4 }, { 0x348, 0, 0xf }, { 0x350, 0, 0x4 },
+	{ 0x358, 0, 0xf }, { 0x360, 0, 0x4 }, { 0x368, 0, 0xf }, { 0x370, 0, 0x0 },
+	{ 0x378, 0, 0xf }, { 0x380, 0, 0x0 }, { 0x388, 0, 0x0 }, { 0x390, 0, 0x0 },
+	{ 0x398, 0, 0x0 }, { 0x3a0, 0, 0x0 }, { 0x3a8, 0, 0x0 }, { 0x3b0, 0, 0x0 },
+	{ 0x3b8, 0, 0x0 }, { 0x3c0, 0, 0x0 }, { 0x3c8, 0, 0x0 }, { 0x3d0, 0, 0xf },
+	{ 0x3d8, 0, 0xf }, { 0x3e0, 0, 0xf }, { 0x3e8, 0, 0xf }, { 0x3f0, 0, 0xf },
+	{ 0x3f8, 0, 0x4 }, { 0x400, 0, 0x4 }, { 0x408, 0, 0x4 }, { 0x410, 0, 0x4 },
+	{ 0x418, 0, 0x4 }, { 0x420, 0, 0x0 }, { 0x428, 0, 0x0 }, { 0x430, 0, 0x0 },
+	{ 0x438, 0, 0x0 }, { 0x440, 0, 0x0 }, { 0x448, 0, 0x0 }, { 0x450, 0, 0x0 },
+	{ 0x458, 0, 0x0 }, { 0x460, 0, 0x0 }, { 0x468, 0, 0x0 }, { 0x470, 0, 0x4 },
+	{ 0x478, 0, 0x0 }, { 0x480, 0, 0x0 }, { 0x488, 0, 0xf }, { 0x490, 0, 0xf },
+	{ 0x498, 0, 0x0 }, { 0x4a0, 0, 0x0 }, { 0x4a8, 0, 0x4 }, { 0x4b0, 0, 0x0 },
+	{ 0x4b8, 0, 0x0 }, { 0x4c0, 0, 0x4 }, { 0x4c8, 0, 0x0 }, { 0x4d0, 0, 0x0 },
+	{ 0x4d8, 0, 0x0 }, { 0x4e0, 0, 0x0 }, { 0x4e8, 0, 0x0 }, { 0x4f0, 0, 0x0 },
+	{ 0x530, 0, 0x0 }, { 0x538, 0, 0x0 }, { 0x540, 0, 0x0 }, { 0x548, 0, 0x0 },
+	{ 0x550, 0, 0x0 }, { 0x558, 0, 0x0 }, { 0x560, 0, 0x0 }, { 0x568, 0, 0x0 },
+	{ 0x570, 0, 0x0 }, { 0x578, 0, 0x0 }, { 0x580, 0, 0x0 }, { 0xc00, 0, 0x0 },
+	{ 0x4000, 0, 0x0 }, { 0x4008, 0, 0x0 }, { 0x4010, 0, 0x0 }, { 0x4018, 0, 0x0 },
+	{ 0x8000, 0, 0x0 }, { 0x8008, 0, 0x0 }, { 0x8010, 0, 0x0 }, { 0x8018, 0, 0x0 },
+	{ 0x8020, 0, 0x0 }, { 0xc000, 0, 0x0 }, { 0xc008, 0, 0x0 }, { 0xc010, 0, 0x0 },
+	{ 0xc018, 0, 0x0 }, { 0x10000, 0, 0x0 }, { 0x0, 1, 0xf }, { 0x58, 1, 0x4 },
+	{ 0x60, 1, 0x4 }, { 0x68, 1, 0xf }, { 0x70, 1, 0xf }, { 0x78, 1, 0xf },
+	{ 0x80, 1, 0x4 }, { 0x88, 1, 0x4 }, { 0x90, 1, 0xf }, { 0x98, 1, 0xf },
+	{ 0xa0, 1, 0x0 }, { 0xa8, 1, 0xf }, { 0xb0, 1, 0xf }, { 0xb8, 1, 0x0 },
+	{ 0xc0, 1, 0xf }, { 0xc8, 1, 0x0 }, { 0xd0, 1, 0x0 }, { 0xd8, 1, 0x0 },
+	{ 0xe0, 1, 0x0 }, { 0xe8, 1, 0x0 }, { 0x4020, 1, 0x0 }, { 0x4090, 1, 0x0 },
+	{ 0x40b8, 1, 0x0 }, { 0x40c0, 1, 0x4 }, { 0x40c8, 1, 0x4 }, { 0x40d0, 1, 0x4 },
+	{ 0x40d8, 1, 0x0 }, { 0x40e0, 1, 0x4 }, { 0x40e8, 1, 0x0 }, { 0x40f0, 1, 0x4 },
+	{ 0x40f8, 1, 0x4 }, { 0x4100, 1, 0x4 }, { 0x4108, 1, 0x4 }, { 0x4110, 1, 0x4 },
+	{ 0x4118, 1, 0x4 }, { 0x4120, 1, 0x4 }, { 0x4128, 1, 0x4 }, { 0x4130, 1, 0x4 },
+	{ 0x4138, 1, 0x4 }, { 0x4140, 1, 0x4 }, { 0x4148, 1, 0x4 }, { 0x4150, 1, 0x4 },
+	{ 0x4158, 1, 0x4 }, { 0x4160, 1, 0x0 }, { 0x4168, 1, 0x4 }, { 0x8028, 1, 0xf },
+	{ 0x8030, 1, 0xf }, { 0x8038, 1, 0xf }, { 0x8040, 1, 0xf }, { 0x8048, 1, 0xf },
+	{ 0x8080, 1, 0xf }, { 0x8088, 1, 0xf },
+};
+
+/*
+ * 0xCLHIIJJ0: L words below macOS's state here and H above it (each capped at 15), and the
+ * first two of the former, by index. A state below is one macOS keeps up that this sleep doesn't.
+ */
+static unsigned int bringup_cmp_skip;
+module_param(bringup_cmp_skip, uint, 0644);
+
+static u32 t8132_ps_compare(struct t8140_sleep *s)
+{
+	u32 ids = 0;
+	int i, below = 0, above = 0, shown = 0;
+
+	for (i = 0; i < ARRAY_SIZE(t8132_bringup_ps); i++) {
+		void __iomem *base = t8132_bringup_ps[i].aon ? s->ps_aon : s->ps;
+		unsigned int now = FIELD_GET(PS_ACTUAL, readl(base + t8132_bringup_ps[i].off));
+
+		if (now > t8132_bringup_ps[i].state) {
+			above++;
+		} else if (now < t8132_bringup_ps[i].state) {
+			if (below >= bringup_cmp_skip && shown < 2)
+				ids |= (u32)i << (12 - shown++ * 8);
+			below++;
+		}
+	}
+
+	return 0xc0000000 | min(below, 15) << 24 | min(above, 15) << 20 | ids;
+}
+
 /*
  * T8132's last mile, in macOS's order: the cores stopped, ANS and APCIE lowered, WD2, the
  * memory controller, the gates, the clusters, the clock muxes, the commit. Measured from a
@@ -2931,17 +3351,49 @@ static void t8132_sleep_mcc_stop(struct t8140_sleep *s)
  *
  * A hang from here ends at the watchdog, as on T8140.
  */
+/* The kernel's writable image, the per-CPU areas and where cpu_resume finds its context. */
+static void t8132_clean_ram(void)
+{
+	unsigned long base = (unsigned long)sleep_save_stash;
+	unsigned int cpu;
+
+	dcache_clean_poc((unsigned long)_sdata, (unsigned long)_end);
+	for_each_possible_cpu(cpu) {
+		unsigned long area = (unsigned long)__per_cpu_start + per_cpu_offset(cpu);
+
+		dcache_clean_poc(area, area + (__per_cpu_end - __per_cpu_start));
+	}
+	dcache_clean_poc(base, base + mpidr_hash_size() * sizeof(*sleep_save_stash));
+	dsb(sy);
+}
+
 static int t8132_sleep_commit(unsigned long unused)
 {
 	struct t8140_sleep *s = t8140_sleep;
+	u32 summary;
 	int i;
 
+	t8132_mark(s, 0x20);
 	s->siq_cfg = read_sysreg_s(SYS_APL_SIQ_CFG_EL1);
 	s->cpus_stop_ret = spin_table_stop_parked();
 
+	if (READ_ONCE(bringup_clean_ram))
+		t8132_clean_ram();
+	t8132_mark(s, 0x21);
 	t8132_sleep_lower_io(s);
+	t8132_mark(s, 0x22);
 	t8140_sleep_arm_wd2(s);
+	/*
+	 * macOS has the SoC at its sleep perf state and DCS at state 4 by now. Its firmware
+	 * does that, with no write from the CPU. T8140's way gets the same states here.
+	 */
+	if (t8140_perf_wait(s->clk_perf + CLK_PERF_SOC, SOC_SLEEP_STATE)) {
+		writel(SOC_SLEEP_STATE, s->clk_perf + CLK_PERF_SOC);
+		t8140_perf_wait(s->clk_perf + CLK_PERF_SOC, SOC_SLEEP_STATE);
+	}
+	t8140_sleep_dcs_down(s);
 	t8132_sleep_mcc_stop(s);
+	t8132_mark(s, 0x23);
 
 	/* Gates twice, the fourth voter, gates. On macOS the voter reads 0 already. */
 	for (i = 0; i < 2; i++) {
@@ -2969,7 +3421,23 @@ static int t8132_sleep_commit(unsigned long unused)
 	writel(CLK_MUX_PARKED, s->clk_mux + T8132_CLK_MUX_44);
 
 	t8140_ps_save(s);
+	/* macOS leaves this one to AUTO_ENABLE at the commit. */
+	writel((readl(s->ps_aon + 0xa0) & ~PS_FLAGS) | PS_AUTO_ENABLE, s->ps_aon + 0xa0);
+	summary = t8132_ps_compare(s);
 	t8140_sleep_arm_mailbox(s);
+	if (READ_ONCE(bringup_resume_stub)) {
+		WRITE_ONCE(s->mbox->resume_pa, __pa_symbol(t8132_resume_stub));
+		dcache_clean_poc((unsigned long)s->mbox, (unsigned long)(s->mbox + 1));
+		dsb(sy);
+	}
+	/* What this path has dirtied since the sweep. */
+	if (READ_ONCE(bringup_clean_ram)) {
+		dcache_clean_poc((unsigned long)task_stack_page(current),
+				 (unsigned long)task_stack_page(current) + THREAD_SIZE);
+		dcache_clean_poc((unsigned long)s, (unsigned long)(s + 1));
+		dsb(sy);
+	}
+	t8132_mark(s, 0x24);
 
 	writel(1, s->commit);
 
@@ -2979,7 +3447,11 @@ static int t8132_sleep_commit(unsigned long unused)
 	/* Each core's deep WFI comes after the commit, this one last, after its PMU commands. */
 	spin_table_release_stopped();
 	mdelay(T8132_PMU_POST_COMMIT_MS);
-	t8132_pmu_go_hib(s);
+	/* Without a wake alarm the register is free to carry the summary through the reset. */
+	if (!READ_ONCE(bringup_wake_s))
+		t8132_mark_value(s, summary);
+	else if (!READ_ONCE(bringup_wake_early))
+		t8132_pmu_go_hib(s);
 	t8140_boot_wfi(s);
 }
 
@@ -2993,6 +3465,8 @@ static void t8140_sleep_return(struct t8140_sleep *s)
 	 * The reset leaves the timer control at its EL2 default, without the event stream
 	 * or EL0's counter. The timer driver's CPU PM exit puts it back too, later.
 	 */
+	WRITE_ONCE(t8132_marks_quiet, false);
+	t8132_mark_t(s, 0x30);
 	write_sysreg(s->cntkctl, cntkctl_el1);
 	isb();
 
@@ -3001,6 +3475,7 @@ static void t8140_sleep_return(struct t8140_sleep *s)
 
 	spin_table_stop_finished();
 	aic_sleep_restore();
+	t8132_mark_t(s, 0x31);
 
 	writel(CLUSTER_ON, s->cluster + CLUSTER_E);
 	s->cluster_e_ret = readl_poll_timeout_atomic(s->cluster + CLUSTER_E, val,
@@ -3008,10 +3483,21 @@ static void t8140_sleep_return(struct t8140_sleep *s)
 						     CLUSTER_TIMEOUT_US);
 	writel(CLUSTER_ON, s->cluster + CLUSTER_P);
 
+	t8132_mark_t(s, 0x32);
 	writel(PWRGATE_ON, s->pwrgate + PWRGATE_WAKE_0);
 	writel(PWRGATE_ON, s->pwrgate + s->soc->pwrgate_wake_1);
 
 	t8140_ps_rewake(s);
+	/*
+	 * The commit saved these already lowered, so the restore above skips them, and their
+	 * domains still count as on: nothing else would raise them. Reverse of the lowering.
+	 */
+	if (s->soc->commit == t8132_sleep_commit) {
+		t8140_ps_restore(s->ps + T8132_PS_ATC0_COMMON, s->atc0_saved[2]);
+		t8140_ps_restore(s->ps_aon + T8132_PS_AON_ATC0_USB_AON, s->atc0_saved[1]);
+		t8140_ps_restore(s->ps_aon + T8132_PS_AON_ATC0_USB, s->atc0_saved[0]);
+	}
+	t8132_mark_t(s, 0x33);
 
 	val = readl(s->ps + PS_SEP);
 	if (val & PS_DEV_DISABLE)
@@ -3028,9 +3514,11 @@ static void t8140_sleep_return(struct t8140_sleep *s)
 	writel(PWRGATE_ON, s->pwrgate + s->soc->pwrgate_cpm_1);
 
 	t8140_dvfm_unpark(s);
+	t8132_mark_t(s, 0x34);
 
 	/* macOS stops it here. Keep a longer one over device resume, until .end. */
 	t8140_sleep_set_wd2(s, WDT_SUSPEND_SECS);
+	t8132_mark_t(s, 0x35);
 
 	/*
 	 * What the commit lowered for a driver comes back before anything uses it, in
@@ -3055,26 +3543,39 @@ static int t8140_sleep_enter(suspend_state_t state)
 	struct t8140_sleep *s = t8140_sleep;
 	int ret;
 
+	t8132_mark(s, 0x10);
 	ret = t8140_sleep_refuse(s);
 	if (ret)
 		return ret;
+	t8132_mark(s, 0x11);
 	ret = t8140_sleep_cpus_hold(s);
+	t8132_mark(s, 0x12);
 	/* As on macOS, the display goes off before the GPU. */
 	if (!ret)
 		ret = t8140_display_off(s);
+	t8132_mark(s, 0x13);
 	if (!ret)
 		ret = t8140_sleep_coprocs_check(s);
+	t8132_mark(s, 0x14);
 	if (!ret)
 		ret = t8140_sleep_enclave_tell(s);
+	t8132_mark(s, 0x15);
 	if (ret) {
 		spin_table_unhold_parked();
 		t8140_sleep_stray_restore(s);
 		return ret;
 	}
+	if (s->soc->commit == t8132_sleep_commit && READ_ONCE(bringup_wake_s) &&
+	    READ_ONCE(bringup_wake_early)) {
+		t8132_pmu_go_hib(s);
+		WRITE_ONCE(t8132_marks_quiet, true);
+	}
 	t8140_sleep_coprocs_stop(s, true);
+	t8132_mark(s, 0x16);
 
 	t8140_wake_arm(s);
 	t8140_sleep_match(s);
+	t8132_mark(s, 0x17);
 
 	if (readl(s->wake + WAKE_SLP_DDR))
 		writel(0, s->wake + WAKE_SLP_DDR);
@@ -3087,13 +3588,18 @@ static int t8140_sleep_enter(suspend_state_t state)
 
 	s->cntkctl = read_sysreg(cntkctl_el1);
 	pm_set_resume_via_firmware();
+	t8132_mark(s, 0x18);
 	ret = cpu_suspend(0, s->soc->commit);
 	if (!ret)
 		t8140_sleep_return(s);
 
+	t8132_mark_t(s, 0x36);
 	t8140_sleep_match_undo(s);
+	t8132_mark_t(s, 0x37);
 	t8140_sleep_stray_restore(s);
+	t8132_mark_t(s, 0x38);
 	t8140_wake_restore(s);
+	t8132_mark_t(s, 0x39);
 
 	return ret;
 }
@@ -3101,6 +3607,8 @@ static int t8140_sleep_enter(suspend_state_t state)
 /* From here to .end a hang resets the machine. Nobody has to be there to recover it. */
 static int t8140_sleep_begin(suspend_state_t state)
 {
+	if (t8140_sleep)
+		t8132_mark(t8140_sleep, 0x01);
 	/* The last sleep's cut is its port controller's to take, by its .complete. */
 	WRITE_ONCE(t8140_debug_link_cut, false);
 	if (t8140_sleep) {
@@ -3142,6 +3650,7 @@ static int t8140_sleep_prepare(void)
 	struct t8140_sleep *s = t8140_sleep;
 	int i;
 
+	t8132_mark(s, 0x02);
 	if (s->soc->has_ave)
 		t8140_sleep_ave_off(s);
 
@@ -3343,6 +3852,7 @@ static const struct t8140_sleep_reg t8132_sleep_regs[] = {
 	{ "aon-misc", offsetof(struct t8140_sleep, aon_misc) },
 	{ "wake", offsetof(struct t8140_sleep, wake) },
 	{ "pmc-dcp", offsetof(struct t8140_sleep, pmc_dcp) },
+	{ "ps-prot", offsetof(struct t8140_sleep, ps_prot) },
 	{ "spmi", offsetof(struct t8140_sleep, spmi) },
 	{ "pmc-voters", offsetof(struct t8140_sleep, pmc_voters) },
 	{ "dcs", offsetof(struct t8140_sleep, dcs) },
@@ -3619,6 +4129,15 @@ static int t8140_sleep_probe(struct platform_device *pdev)
 
 	/* Last: the exported helpers take it as a probed driver, and a failure frees s. */
 	t8140_sleep = s;
+	if (s->soc->commit == t8132_sleep_commit) {
+		pm_bringup_dev_mark = t8132_dev_mark;
+		atomic_notifier_chain_register(&panic_notifier_list, &t8132_panic_nb);
+		register_die_notifier(&t8132_die_nb);
+		if (bringup_early_marks) {
+			WRITE_ONCE(t8132_spmi_va, (u64)s->spmi);
+			pm_bringup_cpu_mark = t8132_cpu_mark;
+		}
+	}
 	/* Deep becomes the default sleep state, unless mem_sleep_default= chose another. */
 	suspend_set_ops(&t8140_sleep_ops);
 	/* Not when every real sleep would refuse because ANS couldn't come back. */
@@ -3645,8 +4164,8 @@ static const struct t8140_sleep_display t8140_displays[] = {
 /* DCP, DISPEXT0, DISPEXT1, each with its own pwrgate pair, measured in macOS's trace. */
 static const struct t8140_sleep_display t8132_displays[] = {
 	{ .ps = { 0x10000, 0x248, 0x240 }, .gate = { 0x104c, 0x1070 } },
-	{ .ps = { 0x1e8, 0x1e0, 0x1d8 }, .gate = { 0x16cc, 0x16f0 } },
-	{ .ps = { 0x4f0, 0x4e8, 0x4e0 }, .gate = { 0x1b4c, 0x1b70 } },
+	{ .ps = { 0x1e8, 0x1e0, 0x1d8 }, .gate = { 0x16cc, 0x16f0 }, .prot_slice = 5 },
+	{ .ps = { 0x4f0, 0x4e8, 0x4e0 }, .gate = { 0x1b4c, 0x1b70 }, .prot_slice = 30 },
 };
 
 static const struct t8140_sleep_soc t8140_soc = {
@@ -3691,8 +4210,6 @@ static const struct t8140_sleep_soc t8132_soc = {
 	.pmu_boot_stage = T8132_PMU_BOOT_STAGE,
 	.cpu_p_first_bit = 6,
 	.wake_optional = true,
-	/* Refuses until aic_sleep_init() covers T8132's AIC too. */
-	.aic_compat = "apple,t8140-aic3",
 	.apcie = { .ans = 0x538, .gp = 0x4d0, .sys_gp = 0x4d8, .st = 0x540, .sys_st = 0x548,
 		   .phy_sw = 0x550 },
 	.pwrgate_wake_1 = T8132_PWRGATE_WAKE_1,
@@ -3700,9 +4217,11 @@ static const struct t8140_sleep_soc t8132_soc = {
 	.pwrgate_cpm_1 = T8132_PWRGATE_CPM_1,
 	.displays = t8132_displays,
 	.n_displays = ARRAY_SIZE(t8132_displays),
+	.lower_unbound_displays = true,
 	.display_order = t8132_display_order,
 	.ps_all = t8132_ps_all, .n_ps_all = ARRAY_SIZE(t8132_ps_all),
 	.ps_aon_all = t8132_ps_aon_all, .n_ps_aon_all = ARRAY_SIZE(t8132_ps_aon_all),
+	.ps_macos_on = t8132_ps_macos_on, .n_ps_macos_on = ARRAY_SIZE(t8132_ps_macos_on),
 	.ps_macos_off = t8132_ps_macos_off, .n_ps_macos_off = ARRAY_SIZE(t8132_ps_macos_off),
 	.ps_aon_macos_off = t8132_ps_aon_macos_off,
 	.n_ps_aon_macos_off = ARRAY_SIZE(t8132_ps_aon_macos_off),

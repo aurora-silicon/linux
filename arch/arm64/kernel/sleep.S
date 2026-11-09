@@ -6,6 +6,14 @@
 #include <asm/smp.h>
 
 	.text
+
+	/* Bring-up: PMU 0x2008 = 0xd1000000 | step, where a reset keeps it. Clobbers x9-x12. */
+	.macro	bringup_mark, fn, step
+	movz	w12, #\step
+	movk	w12, #0xd100, lsl #16
+	bl	\fn
+	.endm
+
 /*
  * Implementation of MPIDR_EL1 hash algorithm through shifting
  * and OR'ing.
@@ -98,6 +106,26 @@ SYM_FUNC_START(__cpu_suspend_enter)
 SYM_FUNC_END(__cpu_suspend_enter)
 
 	.pushsection ".idmap.text", "a"
+/* The MMU's off: the SPMI block at its physical address. */
+SYM_CODE_START_LOCAL(bringup_pa_mark)
+	movz	x9, #0x4000
+	movk	x9, #0x8871, lsl #16
+	movk	x9, #0x3, lsl #32
+	movz	w10, #0x8e33
+	movk	w10, #0x2008, lsl #16
+	str	w10, [x9, #0x4]
+	str	w12, [x9, #0x4]
+	movz	x11, #0x10, lsl #16
+1:	ldr	w10, [x9]
+	tbz	w10, #24, 2f
+	subs	x11, x11, #1
+	b.ne	1b
+2:	ldr	w10, [x9, #0x8]
+	mov	w10, #1
+	str	w10, [x9, #0x80]
+	ret
+SYM_CODE_END(bringup_pa_mark)
+
 SYM_CODE_START(cpu_resume)
 	mov	x0, xzr
 #ifdef CONFIG_ARM64_CTXR_EXECMEM
@@ -116,9 +144,30 @@ SYM_CODE_END(cpu_resume)
 	.ltorg
 	.popsection
 
+/* The MMU's on: the driver's mapping of the same block. */
+SYM_FUNC_START_LOCAL(bringup_va_mark)
+	ldr_l	x9, t8132_spmi_va
+	cbz	x9, 3f
+	movz	w10, #0x8e33
+	movk	w10, #0x2008, lsl #16
+	str	w10, [x9, #0x4]
+	str	w12, [x9, #0x4]
+	movz	x11, #0x10, lsl #16
+1:	ldr	w10, [x9]
+	tbz	w10, #24, 2f
+	subs	x11, x11, #1
+	b.ne	1b
+2:	ldr	w10, [x9, #0x8]
+	mov	w10, #1
+	str	w10, [x9, #0x80]
+3:	ret
+SYM_FUNC_END(bringup_va_mark)
+
 SYM_FUNC_START(_cpu_resume)
+	bringup_mark bringup_va_mark, 4
 	mov	x0, x19
 	bl	finalise_el2
+	bringup_mark bringup_va_mark, 5
 
 	mrs	x1, mpidr_el1
 	adr_l	x8, mpidr_hash		// x8 = struct mpidr_hash virt address
@@ -141,6 +190,7 @@ SYM_FUNC_START(_cpu_resume)
 	 * cpu_do_resume expects x0 to contain context address pointer
 	 */
 	bl	cpu_do_resume
+	bringup_mark bringup_va_mark, 6
 
 #if defined(CONFIG_KASAN) && defined(CONFIG_KASAN_STACK)
 	mov	x0, sp

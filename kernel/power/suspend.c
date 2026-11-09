@@ -34,6 +34,8 @@
 
 #include "power.h"
 
+extern void (*pm_bringup_dev_mark)(struct device *dev, unsigned int phase);
+
 const char * const pm_labels[] = {
 	[PM_SUSPEND_TO_IDLE] = "freeze",
 	[PM_SUSPEND_STANDBY] = "standby",
@@ -450,16 +452,22 @@ static int suspend_enter(suspend_state_t state, bool *wakeup)
 		goto Platform_wake;
 	}
 
+	if (pm_bringup_dev_mark)
+		pm_bringup_dev_mark(NULL, 5);
 	error = pm_sleep_disable_secondary_cpus();
 	if (error || suspend_test(TEST_CPUS))
 		goto Enable_cpus;
 
+	if (pm_bringup_dev_mark)
+		pm_bringup_dev_mark(NULL, 6);
 	arch_suspend_disable_irqs();
 	BUG_ON(!irqs_disabled());
 
 	system_state = SYSTEM_SUSPEND;
 
 	error = syscore_suspend();
+	if (pm_bringup_dev_mark)
+		pm_bringup_dev_mark(NULL, 7);
 	if (!error) {
 		*wakeup = pm_wakeup_pending();
 		if (!(suspend_test(TEST_CORE) || *wakeup)) {
