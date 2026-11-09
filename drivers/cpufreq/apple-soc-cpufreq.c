@@ -25,6 +25,7 @@
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/pm_opp.h>
+#include <linux/irq_work.h>
 #include <linux/pm_qos.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/cpufreq-thermal.h>
@@ -224,6 +225,8 @@ struct apple_cpu_priv {
 	unsigned int pmp_device;
 	unsigned int pmp_max_freq;
 	atomic_t pmp_vote;
+	bool pmp_stale;
+	struct irq_work pmp_irq_work;
 	struct work_struct pmp_work;
 	struct device *cpu_dev;
 	void __iomem *reg_base;
@@ -415,9 +418,24 @@ static void apple_soc_cpufreq_pmp_work(struct work_struct *work)
 					      FIELD_GET(APPLE_PMP_VOTE_SOC, vote));
 	if (ret && ret != -ENODEV && ret != -EPROBE_DEFER && ret != -EAGAIN)
 		dev_warn_once(priv->cpu_dev, "PMP memory/fabric command failed: %d\n", ret);
+	/* A failed command (PMP not up yet) is retried on the next request. */
+	WRITE_ONCE(priv->pmp_stale, ret != 0);
 	/* A request which arrived during the exchange must not be lost. */
 	if (vote != atomic_read(&priv->pmp_vote))
 		schedule_work(&priv->pmp_work);
+}
+
+/*
+ * Fast-switch runs from the scheduler with a runqueue lock held, where
+ * queueing a work item could wake a worker on that runqueue and deadlock.
+ * An irq_work hops out of that context first, as schedutil itself does.
+ */
+static void apple_soc_cpufreq_pmp_irq_work(struct irq_work *irq_work)
+{
+	struct apple_cpu_priv *priv = container_of(irq_work, struct apple_cpu_priv,
+						   pmp_irq_work);
+
+	schedule_work(&priv->pmp_work);
 }
 
 static void apple_soc_cpufreq_pmp_vote(struct apple_cpu_priv *priv,
@@ -435,8 +453,8 @@ static void apple_soc_cpufreq_pmp_vote(struct apple_cpu_priv *priv,
 	vote = FIELD_PREP(APPLE_PMP_VOTE_DCS, dcs[q]) |
 	       FIELD_PREP(APPLE_PMP_VOTE_SOC, soc[q]);
 	/* Firmware commands sleep for their reply; fast-switch only queues work. */
-	atomic_set(&priv->pmp_vote, vote);
-	schedule_work(&priv->pmp_work);
+	if (atomic_xchg(&priv->pmp_vote, vote) != vote || READ_ONCE(priv->pmp_stale))
+		irq_work_queue(&priv->pmp_irq_work);
 }
 
 static unsigned int apple_soc_cpufreq_get_rate(unsigned int cpu)
@@ -1404,6 +1422,7 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 	priv = kzalloc_obj(*priv);
 	if (!priv)
 		return -ENOMEM;
+	init_irq_work(&priv->pmp_irq_work, apple_soc_cpufreq_pmp_irq_work);
 	INIT_WORK(&priv->pmp_work, apple_soc_cpufreq_pmp_work);
 	atomic_set(&priv->pmp_vote, 0);
 
@@ -1591,6 +1610,7 @@ static void apple_soc_cpufreq_exit(struct cpufreq_policy *policy)
 	dev_pm_opp_of_cpumask_remove_table(policy->related_cpus);
 	if (priv->pmp_report) {
 		atomic_set(&priv->pmp_vote, 0);
+		irq_work_sync(&priv->pmp_irq_work);
 		cancel_work_sync(&priv->pmp_work);
 		apple_pmp_set_device_constraint(priv->pmp_device, 0, 0);
 		of_node_put(priv->pmp_report);
