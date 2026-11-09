@@ -17,6 +17,20 @@
 	compatible = "apple,t6000", "apple,arm-platform";
 };
 
+&{/soc} {
+	aes: crypto@39b060000 {
+		compatible = "apple,t6000-aes", "apple,aes-s8000";
+		reg = <0x3 0x9b060000 0x0 0x4000>,
+		      <0x2 0x922d0000 0x0 0x8000>;
+		reg-names = "engine", "key-disable";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1117 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_aes>;
+		iommus = <&sio_dart_0 1>, <&sio_dart_1 1>;
+		status = "disabled";
+	};
+};
+
 /delete-node/ &pmgr_south;
 /delete-node/ &pmp_report_dispext2;
 /delete-node/ &pmp_report_dispext3;

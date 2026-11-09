@@ -784,6 +784,18 @@
 			phandle = <&display>;
 		};
 
+		aes: crypto@23500c000 {
+			compatible = "apple,t8112-aes", "apple,aes-s8000";
+			reg = <0x2 0x3500c000 0x0 0x4000>,
+			      <0x2 0x3d2dc000 0x0 0x8000>;
+			reg-names = "engine", "key-disable";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 759 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_aes>;
+			iommus = <&sio_dart 1>;
+			status = "disabled";
+		};
+
 		sio_dart: iommu@235004000 {
 			compatible = "apple,t8110-dart";
 			reg = <0x2 0x35004000 0x0 0x4000>;
