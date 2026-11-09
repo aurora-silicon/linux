@@ -111,6 +111,11 @@
 	status = "disabled";
 };
 
+/* The video decoder is IO-coherent in both directions. */
+&avd {
+	dma-coherent;
+};
+
 #include "t6000-peripherals.dtsi"
 #include "t6000-aux-spmi.dtsi"
 
