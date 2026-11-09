@@ -110,7 +110,7 @@ struct ave_retained_partition {
 
 /* Zero offsets denote fields absent from a firmware's wire format. */
 struct ave_start_layout {
-	struct ave_surface_layout header, secondary;
+	struct ave_surface_layout header, secondary, param_sets;
 	struct ave_surface_layout ref_a, ref_b, ref_c, ref_c_alias, ref_d;
 	struct ave_surface_layout ref_e, ref_f;
 	struct ave_surface_layout mb, coded, meta, row_a, row_b, fixed,

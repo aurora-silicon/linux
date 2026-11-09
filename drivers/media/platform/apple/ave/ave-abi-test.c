@@ -53,6 +53,7 @@ static void ave_test_session(struct ave_session *sess, enum ave_codec codec,
 	sess->token = 400;
 	sess->client = 10;
 	ave_test_buf(&sess->hdr, &index);
+	ave_test_buf(&sess->param_sets, &index);
 	for (unsigned int i = 0; i < AVE_MAX_REFS; i++) {
 		ave_test_buf(&sess->ref_a[i], &index);
 		ave_test_buf(&sess->ref_b[i], &index);
@@ -511,6 +512,12 @@ static void ave_6070_start_process_fields(struct kunit *test)
 			KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + 0x48),
 					ave->layout->hdr_bytes);
 			KUNIT_EXPECT_EQ(test,
+					get_unaligned_le64(start + sl->param_sets.address),
+					sess->param_sets.dma);
+			KUNIT_EXPECT_EQ(test,
+					get_unaligned_le32(start + sl->param_sets.size),
+					sess->param_sets.size);
+			KUNIT_EXPECT_EQ(test,
 					get_unaligned_le32(start + sl->fps.denominator), 1U);
 			KUNIT_EXPECT_EQ(test,
 					get_unaligned_le32(start + sl->fps.numerator), 30U);
@@ -646,6 +653,16 @@ static void ave_6070_alignment_refusal(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cmd[0], 0xa5);
 	KUNIT_EXPECT_EQ(test, sess->token, 400ULL);
 	sess->row_a[2].dma -= 4;
+	sess->param_sets.dma = 0;
+	memset(cmd, 0xa5, 0x10e10);
+	KUNIT_EXPECT_EQ(test, ave_build_start(ctx, cmd, 0x10e10), -EINVAL);
+	KUNIT_EXPECT_EQ(test, cmd[0], 0xa5);
+	sess->param_sets.dma = 0x822000000ULL;
+	sess->param_sets.size = 0;
+	memset(cmd, 0xa5, 0x10e10);
+	KUNIT_EXPECT_EQ(test, ave_build_start(ctx, cmd, 0x10e10), -EINVAL);
+	KUNIT_EXPECT_EQ(test, cmd[0], 0xa5);
+	sess->param_sets.size = 2 * SZ_16K;
 	memset(cmd, 0xa5, 0x1940);
 	KUNIT_EXPECT_EQ(test,
 			ave_build_process(ctx, cmd, 0x1940, 0, 0x8f0000004ULL,
