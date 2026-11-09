@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config VIDEO_APPLE_JPEG
+	tristate "Apple Silicon JPEG encoder"
+	depends on VIDEO_DEV
+	depends on ARCH_APPLE || (COMPILE_TEST && 64BIT)
+	depends on OF_ADDRESS && IOMMU_API && PM
+	select V4L2_MEM2MEM_DEV
+	select VIDEOBUF2_DMA_CONTIG
+	help
+	  V4L2 memory-to-memory baseline JPEG encoder for the JPEG engine
+	  in T6000, T6041, T8112 and T8140 SoCs. It takes full-range NV12
+	  (4:2:0) or NV16 (4:2:2) frames. The device compatible selects the
+	  register layout and address width; unrecognized revisions are refused.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called apple-jpeg.
+
+config VIDEO_APPLE_JPEG_KUNIT_TEST
+	tristate "KUnit tests for the Apple JPEG encoder" if !KUNIT_ALL_TESTS
+	depends on KUNIT && VIDEO_APPLE_JPEG
+	default KUNIT_ALL_TESTS
+	help
+	  Check engine identification, the quantisation tables and every
+	  register write of 4:2:0 and 4:2:2 encode jobs. No hardware is
+	  needed.

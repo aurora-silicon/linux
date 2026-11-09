@@ -18,16 +18,35 @@ description:
 
 properties:
   compatible:
-    const: apple,sep
+    oneOf:
+      - const: apple,sep
+      - items:
+          - enum:
+              - apple,t6030-sep
+              - apple,t6031-sep
+              - apple,t6050-sep
+          - const: apple,sep
 
   reg:
-    maxItems: 1
+    minItems: 1
+    items:
+      - description: Coprocessor control registers
+      - description: Coprocessor boot interface
 
   mboxes:
     maxItems: 1
 
   mbox-names:
     const: mbox
+
+  interrupts:
+    maxItems: 4
+    description:
+      The coprocessor's mailbox interrupts, on a SoC whose SEP mailbox is not
+      described as a separate node.
+
+  clocks:
+    maxItems: 1
 
   iommus:
     maxItems: 1
@@ -58,12 +77,40 @@ properties:
       The signed local boot policy of the running boot, added by the
       bootloader, for the same purpose.
 
+  status: true
+
 required:
   - compatible
   - reg
-  - mboxes
-  - mbox-names
   - iommus
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6050-sep
+    then:
+      description:
+        The T6050 SEP is described from the ADT and stays disabled until its
+        mailbox and firmware handoff are supported.
+      properties:
+        reg:
+          minItems: 2
+        interrupts:
+          minItems: 4
+        status:
+          const: disabled
+      required:
+        - interrupts
+        - status
+    else:
+      properties:
+        interrupts: false
+        clocks: false
+      required:
+        - mboxes
+        - mbox-names
 
 additionalProperties: false
 

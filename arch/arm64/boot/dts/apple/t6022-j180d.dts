@@ -1004,6 +1004,7 @@
 				apple,antenna-sku = "XX";
 				/* To be filled by the loader */
 				local-mac-address = [00 10 18 00 00 10];
+				brcm,ccode-map-trivial;
 			};
 
 			bluetooth0: network@0,1 {
@@ -1232,3 +1233,7 @@
 };
 
 #include "spi1-nvram.dtsi"
+
+#include "t6022-peripherals.dtsi"
+
+#include "t6022-j180d-peripherals.dtsi"

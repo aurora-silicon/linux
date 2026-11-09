@@ -41,6 +41,8 @@
 #include "version_utils.h"
 
 #define DCP_MAX_PLANES 4
+/* Bounds the CRTC power cycles a rebuilt T6020 tunnel may trigger. */
+#define DCP_TUNNEL_POWER_CYCLES 2
 
 struct apple_dcp;
 struct iomfb_m4;
@@ -97,6 +99,8 @@ enum {
 	DPAVSERV_ENDPOINT = 0x28,
 	DPAVSERV_ENDPOINT_V2 = 0x2a,
 	AV_ENDPOINT = 0x29,
+	/* Desktop 26.x separates the audio service from AV device control. */
+	AV_AUDIO_ENDPOINT_DESKTOP = 0x2b,
 	DPTX_ENDPOINT = 0x2a,
 	DPTX_ENDPOINT_V2 = 0x2c,
 	HDCP_ENDPOINT = 0x2b,
@@ -175,6 +179,16 @@ struct dcp_brightness {
 	bool update;
 	/* A level was written through the backlight device (desktop 26.x). */
 	bool requested;
+	/*
+	 * Fade between levels where the firmware takes a DAC value in each
+	 * swap.  level is the one set last, in nits; crtc mutex.
+	 */
+	struct delayed_work fade_work;
+	unsigned long fade_start;
+	u32 level;
+	u32 fade_from;
+	u32 fade_to;
+	bool fading;
 };
 
 struct audiosrv_data;
@@ -189,6 +203,26 @@ struct dcp_panel {
 	bool has_mini_led;
 	/// peak panel luminance in nits, for EDR (desktop 26.x; 0 if unknown)
 	u32 peak_nits;
+	/// EDR headroom ceiling x1000 from the ADT (desktop 26.x; 0 if none)
+	u32 edr_ceiling;
+	/// calibrated colour target from the raw ADT; NULL if not given
+	const struct dcp_color_space *color_target;
+};
+
+/*
+ * Identity of a fixed internal panel, for the EDID published on its
+ * connector.  Any processor with an internal panel allocates it; the boot
+ * loader's ADT supplies the fallback, and firmware metadata or a raw panel
+ * EDID replace that when the firmware reports one.  metadata.lock.
+ */
+struct dcp_panel_identity {
+	/* Identity supplied by this fixed panel, independent of optional color data. */
+	struct dcp_display_metadata metadata;
+	struct dcp_display_metadata adt;
+	u64 generation;
+	bool metadata_valid;
+	u8 raw_edid[4096];
+	size_t raw_edid_size;
 };
 
 enum dcp_iomfb_method_profile {
@@ -253,19 +287,32 @@ struct dcp_desktop_state {
 	 * element before the real one is selected.
 	 */
 	bool mode_live;
-	/* Identity supplied by this fixed panel, independent of optional color data. */
-	struct dcp_display_metadata panel_metadata;
-	struct dcp_display_metadata panel_adt_identity;
-	u64 panel_metadata_generation;
-	bool panel_metadata_valid;
 	atomic_t identity_log_count[4];
-	u8 panel_raw_edid[4096];
-	size_t panel_raw_edid_size;
 	/* RX records an unsupported callback until the modeset RPC has drained. */
 	bool modeset_active;
 	bool modeset_callback_error;
 	/* An adaptive swap that timed out keeps fixed refresh until the next boot. */
 	bool vrr_failed;
+	/*
+	 * Adaptive sync of a VRR timing installed by this pipe alone: the
+	 * minimum rates for VRR_ENABLED on and off (16.16 Hz), and the one
+	 * the firmware was last given.  Zero when not installed that way.
+	 */
+	u32 vrr_min_on, vrr_min_off, vrr_min_sent;
+	/* The frame's colour matrix, sent after an adaptive sync update. */
+	struct iomfb_set_matrix_req matrix;
+	/*
+	 * HDR10 static metadata (external processors): the pinned
+	 * dcpav-service-epic service, the Type 1 body last sent on this link
+	 * (taken or refused), if any, and whether the firmware took one, so
+	 * that the link carries a Dynamic Range and Mastering InfoFrame.
+	 * hdr_lock protects all of them.
+	 */
+	spinlock_t hdr_lock;
+	struct apple_epic_service *av_service;
+	u8 hdr_sent[24];
+	bool hdr_sent_valid;
+	bool hdr_infoframe;
 	u32 present_id;
 	bool present_pending;
 	/*
@@ -319,6 +366,11 @@ struct apple_dcp {
 	struct iomfb_m4 *v26_6;
 	/* An adopted session has no confirmed firmware DMA stop boundary. */
 	bool retain_dma;
+	/*
+	 * Allocates AFK rings where the DMA API cannot, on an adopted
+	 * J713 external DCP whose DART only takes the retained allocator.
+	 */
+	void *(*afk_alloc)(struct apple_dcp *dcp, size_t size, dma_addr_t *dva);
 	bool quiescing;
 	bool drm_retained;
 	/* vblank_wq and swap_watchdog_wq disabled by the last unbind */
@@ -392,7 +444,11 @@ struct apple_dcp {
 
 	/* firmware version and compatible firmware version */
 	enum dcp_firmware_version fw_compat;
+	/* Bumped by every iomfb poweron; see afk_compact_slot(). */
+	u32 afk_power_gen;
 	bool external;
+	/* A desktop 26.x external processor (apple,t6041-dcpext) */
+	bool desktop_external;
 	/*
 	 * T8122 dcpext: the panel's DRM device never waits on this processor.
 	 * A probe or bind failure leaves it in the device as an unusable pipe
@@ -524,6 +580,8 @@ struct apple_dcp {
 
 	/* Current display mode */
 	struct dcp_mode_state mode_state;
+	/* hotplug worker: power cycles since the mode was last valid */
+	unsigned int tunnel_power_cycles;
 	/* One HPD pulse after a placeholder EDID, per Type-C connection. */
 	bool placeholder_retried;
 	u64 typec_generation;	/* hpd_mutex: identifies the current connection */
@@ -550,6 +608,14 @@ struct apple_dcp {
 	bool output_pq;
 	bool output_edr;
 	bool edr_sent;
+	/*
+	 * EDR headroom the panel was last given, x1000 (0: not in use), the
+	 * SDR white in nits it was given for, and a power off since, after
+	 * which the ramp starts again from 1.0 (see dcp_edr_prepare()).
+	 */
+	u32 edr_hm;
+	u32 edr_sdr;
+	bool edr_restart;
 	struct dcp_set_digital_out_mode_req mode;
 
 	/* completion for active turning true */
@@ -661,6 +727,11 @@ struct apple_dcp {
 	u32 nr_typec_routes;
 	bool phy_managed_by_typec;
 	bool typec_cable_connected;
+	/*
+	 * T8132 dcpext: a teardown call timed out; the firmware's late
+	 * Activate/Deactivate belong to it until its answer is in.
+	 */
+	bool t8132_release_late;
 	/* DPTX feeds a Thunderbolt DP IN adapter, not the Type-C PHY lanes */
 	bool dptx_tunnel;
 	/* DFP port in the DPTX target: 0 = dpphy, 1 = dpin0, 2 = dpin1 */
@@ -676,6 +747,12 @@ struct apple_dcp {
 	 */
 	struct mutex tb_lock;
 	bool tb_clock_ok;
+	/*
+	 * T8132 dcpext: its tunnel pixel clock was refused (the PHY runs the
+	 * other DP IN at another link rate), so the tunnel cannot show.
+	 * tb_lock to set; read anywhere.
+	 */
+	bool tb_clock_refused;
 	/* tb_lock: the direct DP PHY crossbar output whose clocks run (T6030). */
 	struct mux_control *direct_xbar_up;
 	/*
@@ -801,6 +878,8 @@ struct apple_dcp {
 
 	/* Kept last: the template instances share the layout above. */
 	struct dcp_desktop_state *desktop;
+	/* Internal panel identity; NULL without an internal panel. */
+	struct dcp_panel_identity *panel_identity;
 };
 
 /* T8132 firmware uses its own wire codec, with the common DRM/KMS owner. */
@@ -882,6 +961,7 @@ static inline void dcp_test_point(struct apple_dcp *dcp, enum dcp_test_point poi
 }
 
 #if IS_ENABLED(CONFIG_KUNIT)
+void dcp_work_register_backlight(struct work_struct *work);
 void dcp_comp_unbind(struct device *dev, struct device *main, void *data);
 void dcp_platform_shutdown(struct platform_device *pdev);
 void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable);
@@ -897,6 +977,17 @@ int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
 s32 dcp_ext_backlight_value(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
+
+/*
+ * The desktop 26.6 panel takes VRR_ENABLED on its live mode, through the
+ * adaptive sync minimum rate (see dcp_vrr_update()).  The external
+ * processors ignore a new minimum on a live mode.
+ */
+static inline bool dcp_vrr_live(struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->main_display &&
+	       dcp_has_panel(dcp);
+}
 
 /*
  * Does @dcp's firmware speak the 14.7 AFK, DPTX and DPAV endpoint protocol,

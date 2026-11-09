@@ -195,6 +195,16 @@
 #define ARM_SMCCC_KVM_FUNC_PKVM_RESV_62		62
 #define ARM_SMCCC_KVM_FUNC_PKVM_RESV_63		63
 /* End of pKVM hypercall range */
+/*
+ * Aurora: feature bits, not callable functions. KVM sets them when it
+ * emulates guest accesses to Apple's IMPLEMENTATION DEFINED registers that
+ * HCR_EL2.TIDCP traps: AMX_CTL_EL1/AMX_STATE_T and the AMX register file
+ * (93), ASPSR_EL1 (94) and AFPCR_EL0 (95).
+ */
+#define ARM_SMCCC_KVM_FUNC_AURORA_APPLE_AMX	93
+#define ARM_SMCCC_KVM_FUNC_AURORA_APPLE_ASPSR	94
+#define ARM_SMCCC_KVM_FUNC_AURORA_APPLE_AFPCR	95
+
 #define ARM_SMCCC_KVM_FUNC_DISCOVER_IMPL_VER	64
 #define ARM_SMCCC_KVM_FUNC_DISCOVER_IMPL_CPUS	65
 

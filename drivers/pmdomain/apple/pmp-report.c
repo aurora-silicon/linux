@@ -26,12 +26,17 @@
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/pmp-report.h>
+#include <linux/soc/apple/t8132.h>
 #include <linux/string.h>
+#include <linux/suspend.h>
 #include <linux/unaligned.h>
 #include <linux/uuid.h>
 #include <linux/workqueue.h>
 
+#include "pmp-agx-vote.h"
 #include "pmp-report-validation.h"
+#include "pmp-dram.h"
+#include "pmp-ane.h"
 
 #define PMP_REPORT_READY 0x1
 
@@ -68,6 +73,9 @@ struct apple_pmp_report_offsets {
 	u32 status;
 	u32 fast_die;
 	u32 fast_die_lanes;
+	/* Update aperture of every entry (8 bytes each) and SOC-DEV-DVFS range. */
+	u32 update;
+	u32 dvfs_first, dvfs_count;
 	bool running_any;
 	bool defer_requests;
 	bool starts_pmp;
@@ -81,6 +89,9 @@ struct apple_pmp_start;
 
 struct apple_pmp_report {
 	struct device *dev;
+	struct apple_pmp_dram dram;
+	struct apple_pmp_ane ane;
+	struct device *ane_owner;
 	const struct apple_pmp_report_offsets *offsets;
 	void __iomem *base;
 	/* Protects the request word, @shadow, @known and @defer. */
@@ -105,11 +116,196 @@ static bool apple_pmp_report_running(const struct apple_pmp_report *rep)
 	return rep->offsets->running_any ? status : status & PMP_REPORT_READY;
 }
 
+static ssize_t type_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct apple_pmp_report *rep = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%s\n", rep->dram.type);
+}
+static DEVICE_ATTR_RO(type);
+
+#define APPLE_PMP_DRAM_ATTR(_name, _field, _format) \
+static ssize_t _name##_show(struct device *dev, struct device_attribute *attr, char *buf) \
+{ \
+	struct apple_pmp_report *rep = dev_get_drvdata(dev); \
+	return sysfs_emit(buf, _format "\n", rep->dram._field); \
+} \
+static DEVICE_ATTR_RO(_name)
+
+APPLE_PMP_DRAM_ATTR(data_bus_width, width, "%u");
+APPLE_PMP_DRAM_ATTR(state_count, state_count, "%u");
+APPLE_PMP_DRAM_ATTR(max_data_rate, max_rate, "%llu");
+APPLE_PMP_DRAM_ATTR(peak_bandwidth, peak_bandwidth, "%llu");
+APPLE_PMP_DRAM_ATTR(bandwidth_class, bandwidth_class, "%llu");
+
+static struct attribute *apple_pmp_dram_attrs[] = {
+	&dev_attr_type.attr,
+	&dev_attr_data_bus_width.attr,
+	&dev_attr_state_count.attr,
+	&dev_attr_max_data_rate.attr,
+	&dev_attr_peak_bandwidth.attr,
+	&dev_attr_bandwidth_class.attr,
+	NULL,
+};
+
+static const struct attribute_group apple_pmp_dram_group = {
+	.name = "dram",
+	.attrs = apple_pmp_dram_attrs,
+};
+
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t6030;
+static const struct apple_pmp_report_offsets apple_pmp_offsets_t600x;
+
+/* T6001 AGX request (see the engine below set_state): AGX is soc-device record 9 on the T6001. */
+#define APPLE_PMP_T6001_AGX_ID 9
+static bool agx_vote = true;
+static struct agx_vote apple_pmp_agx_vote_state = {.idle_ms = AGX_VOTE_IDLE_MS_DEFAULT};
+static DEFINE_SPINLOCK(apple_pmp_agx_vote_lock);
+/* Serializes the vote work, the unbind release and the report's removal. */
+static DEFINE_MUTEX(apple_pmp_agx_vote_mutex);
+static void apple_pmp_agx_vote_fn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(apple_pmp_agx_vote_work, apple_pmp_agx_vote_fn);
+static void apple_pmp_agx_vote_stop(void);
+static void apple_pmp_agx_vote_stop_new(void);
 
 /* Bound report regions, protected by RCU until managed teardown drains readers. */
 static LIST_HEAD(apple_pmp_reports);
 static DEFINE_MUTEX(apple_pmp_reports_lock);
+
+/* The report lock also protects ANE_SYS against a genpd owner appearing. */
+static int apple_pmp_ane_request(void *ctx, bool enable)
+{
+	struct apple_pmp_report *rep = ctx;
+	struct apple_pmp_ane *ane = &rep->ane;
+	const u64 bit = BIT_ULL(PMP_ANE_ID);
+	unsigned long flags;
+	u64 val;
+
+	spin_lock_irqsave(&rep->lock, flags);
+	val = readq(rep->base + rep->offsets->tgt_read);
+	if (enable) {
+		if ((rep->known | val) & bit) {
+			spin_unlock_irqrestore(&rep->lock, flags);
+			return -EBUSY;
+		}
+		ane->owned = true;
+		val |= bit;
+	} else {
+		val &= ~bit;
+	}
+	writeq(val, rep->base + rep->offsets->tgt_write);
+	spin_unlock_irqrestore(&rep->lock, flags);
+	if (!enable) {
+		int ret = readq_poll_timeout(rep->base + rep->offsets->actual, val,
+					    !(val & bit), 200, 50000);
+
+		if (!ret) {
+			spin_lock_irqsave(&rep->lock, flags);
+			ane->owned = false;
+			spin_unlock_irqrestore(&rep->lock, flags);
+		}
+		return ret;
+	}
+	return readq_poll_timeout(rep->base + rep->offsets->actual, val,
+				 val & bit, 200, 50000);
+}
+
+/* Probe-time availability check: deliberately no MMIO while the ANE is off. */
+int apple_pmp_report_ane_available(const struct device_node *np)
+{
+	struct apple_pmp_report *rep;
+	int ret = -EPROBE_DEFER;
+
+	mutex_lock(&apple_pmp_reports_lock);
+	list_for_each_entry(rep, &apple_pmp_reports, list) {
+		if (rep->dev->of_node != np)
+			continue;
+		ret = !rep->ane.dvfs ? -EOPNOTSUPP :
+		      (rep->ane_owner || rep->ane.reserved) ? -EBUSY : 0;
+		break;
+	}
+	mutex_unlock(&apple_pmp_reports_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_ane_available);
+
+/**
+ * apple_pmp_report_ane_perf() - request a T600x ANE performance level
+ * @np: report provider node
+ * @owner: ANE device holding the request
+ * @level: 0 to release, 1 through 5 to request a level
+ * @held: whether the caller still owns a request, including failed rollback
+ *
+ * The caller must keep its engine and the report SRAM powered throughout
+ * the request, and link itself to the report supplier. Other generations
+ * and reports without an ANE DVFS resource are unsupported. The returned
+ * level is a firmware request, not a measured frequency.
+ *
+ * Context: Process context. May sleep.
+ * Return: 0 on success, or a negative errno. Ownership and ACK failures
+ * are returned to the submitter; no CPU frequency request is substituted.
+ */
+int apple_pmp_report_ane_perf(const struct device_node *np,
+			      struct device *owner, unsigned int level, bool *held)
+{
+	struct apple_pmp_report *rep;
+	int ret = -EPROBE_DEFER;
+
+	if (!np || !owner || !held)
+		return -EINVAL;
+	*held = false;
+	mutex_lock(&apple_pmp_reports_lock);
+	list_for_each_entry(rep, &apple_pmp_reports, list) {
+		if (rep->dev->of_node != np)
+			continue;
+		if (!rep->ane.dvfs) {
+			ret = -EOPNOTSUPP;
+			break;
+		}
+		if (rep->ane_owner && rep->ane_owner != owner) {
+			ret = -EBUSY;
+			break;
+		}
+		if (level && !apple_pmp_report_running(rep)) {
+			ret = -EAGAIN;
+			break;
+		}
+		/* Claim before touching DVFS, and exclude genpd for the whole cycle. */
+		if (level && !rep->ane.reserved) {
+			unsigned long flags;
+			u64 req;
+
+			spin_lock_irqsave(&rep->lock, flags);
+			req = readq(rep->base + rep->offsets->tgt_read);
+			if ((rep->known | req) & BIT_ULL(PMP_ANE_ID)) {
+				spin_unlock_irqrestore(&rep->lock, flags);
+				ret = -EBUSY;
+				break;
+			}
+			rep->ane.reserved = true;
+			spin_unlock_irqrestore(&rep->lock, flags);
+		}
+		ret = apple_pmp_ane_set(&rep->ane, level, apple_pmp_ane_request, rep);
+		if (!rep->ane.level && !rep->ane.owned) {
+			unsigned long flags;
+
+			spin_lock_irqsave(&rep->lock, flags);
+			rep->ane.reserved = false;
+			spin_unlock_irqrestore(&rep->lock, flags);
+		}
+		/* Failed rollback retains ownership until a successful retry. */
+		if (rep->ane.level || rep->ane.owned)
+			rep->ane_owner = owner;
+		else
+			rep->ane_owner = NULL;
+		*held = rep->ane_owner == owner;
+		break;
+	}
+	mutex_unlock(&apple_pmp_reports_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_ane_perf);
+
 static struct dentry *apple_pmp_report_debugfs;
 
 /**
@@ -195,6 +391,12 @@ static void apple_pmp_report_release(void *data)
 	cancel_delayed_work_sync(&rep->ready_work);
 	/* Withdraw child providers while their power callbacks can still use MMIO. */
 	of_platform_depopulate(rep->dev);
+	if (rep->offsets == &apple_pmp_offsets_t600x) {
+		apple_pmp_agx_vote_stop_new();
+		cancel_delayed_work_sync(&apple_pmp_agx_vote_work);
+		guard(mutex)(&apple_pmp_agx_vote_mutex);
+		apple_pmp_agx_vote_stop();
+	}
 	mutex_lock(&apple_pmp_reports_lock);
 	if (!list_empty(&rep->list))
 		list_del_rcu(&rep->list);
@@ -306,7 +508,7 @@ int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int t
 	struct platform_device *pdev;
 	struct apple_pmp_report *rep;
 	u64 status;
-	bool t8132 = of_machine_is_compatible("apple,j713") &&
+	bool t8132 = apple_t8132_firmware_path() &&
 		of_device_is_compatible(supplier->of_node, "apple,t8132-pmp-v2");
 	int ret;
 
@@ -1143,9 +1345,35 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	if (IS_ERR(rep->base))
 		return PTR_ERR(rep->base);
 	rep->offsets = of_device_get_match_data(dev);
+	if (of_property_match_string(np, "reg-names", "ane-dvfs") >= 0) {
+		struct resource *res;
+
+		if (!of_device_is_compatible(np, "apple,t6000-pmp-v2-report"))
+			return -EINVAL;
+		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+		if (!res || resource_size(res) != SZ_128K)
+			return -EINVAL;
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "ane-dvfs");
+		if (!res || resource_size(res) != SZ_16K)
+			return -EINVAL;
+		rep->ane.dvfs = devm_ioremap_resource(dev, res);
+		if (IS_ERR(rep->ane.dvfs))
+			return PTR_ERR(rep->ane.dvfs);
+		rep->ane.report = rep->base;
+	}
+
 	rep->defer = rep->offsets->defer_requests;
 	INIT_DELAYED_WORK(&rep->ready_work, apple_pmp_report_ready_work);
 	platform_set_drvdata(pdev, rep);
+
+	ret = apple_pmp_dram_parse(dev_fwnode(dev), &rep->dram);
+	if (ret && ret != -ENODATA)
+		return dev_err_probe(dev, ret, "invalid DRAM description\n");
+	if (!ret) {
+		ret = devm_device_add_group(dev, &apple_pmp_dram_group);
+		if (ret)
+			return ret;
+	}
 
 	INIT_LIST_HEAD(&rep->list);
 	ret = devm_add_action_or_reset(dev, apple_pmp_report_release, rep);
@@ -1162,6 +1390,10 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	mutex_lock(&apple_pmp_reports_lock);
 	list_add_tail_rcu(&rep->list, &apple_pmp_reports);
 	mutex_unlock(&apple_pmp_reports_lock);
+
+	/* A report that comes back (rebind) takes votes again; its removal refused them. */
+	if (rep->offsets == &apple_pmp_offsets_t600x)
+		apple_pmp_agx_activity_resume();
 
 	if (rep->offsets->fast_die || rep->start)
 		rep->debugfs = debugfs_create_file(dev_name(dev), 0400,
@@ -1183,6 +1415,9 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t600x = {
 	.tgt_read = 0xf80,
 	.tgt_write = 0x107c0,
+	.update = 0x10000,
+	.dvfs_first = 0x108,
+	.dvfs_count = 0x28,
 	.actual = 0x1000,
 	.status = 0x10,
 };
@@ -1260,6 +1495,9 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t6031 = {
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t8140 = {
 	.tgt_read = 0x1880,
 	.tgt_write = 0x10c40,
+	.update = 0x10000,
+	.dvfs_first = 0x190,
+	.dvfs_count = 16,
 	.actual = 0x18c0,
 	.status = 0x10,
 	.fast_die = 0x1c10,
@@ -1323,6 +1561,17 @@ struct apple_pmp_report_entry {
 	u32 id;
 	/* The PMP does not acknowledge this request (a started PMP only). */
 	bool no_ack;
+	/* Withdrawn for system sleep (apple,release-for-sleep), and now so. */
+	bool sleep_release;
+	bool released;
+	/*
+	 * With @dvfs, the SOC-DEV-DVFS entry this soc-device's performance
+	 * request lives in, and the request word written while powered.
+	 */
+	bool dvfs;
+	u32 dvfs_entry;
+	u64 dvfs_off;
+	u64 dvfs_on;
 	bool removed;
 };
 
@@ -1338,6 +1587,10 @@ static int apple_pmp_report_set_state(struct apple_pmp_report *rep, u32 id,
 	bool ready;
 
 	spin_lock_irqsave(&rep->lock, flags);
+	if (id == PMP_ANE_ID && rep->ane.reserved) {
+		spin_unlock_irqrestore(&rep->lock, flags);
+		return -EBUSY;
+	}
 	rep->known |= bit_val;
 	if (enable)
 		rep->shadow |= bit_val;
@@ -1362,6 +1615,337 @@ static int apple_pmp_report_set_state(struct apple_pmp_report *rep, u32 id,
 		50000);
 }
 
+/*
+ * T6001 AGX request. T2 showed that setting PS-REQ bit 9 (AGX, soc-device record 9) lifts the GPU read roof from 241 to 368 GB/s: the PMP
+ * leaves memory at its idle floor for a GPU that is busy but has not asked. The GPU driver reports operations in flight
+ * (apple_pmp_agx_activity_begin/end); the request is set while any operation runs and cleared agx_vote_idle_ms after the last one ends, at
+ * GPU unbind and when this report goes away. The decisions are in pmp-agx-vote.h (unit tested); this is the glue.
+ * On by default (pmp_report.agx_vote): it only writes while the PMP runs, so a board that leaves the PMP off is unchanged; with it off
+ * nothing is written. T6000 has the same record and bit (soc-device 10, PS-REQ bit 9) as T6001.
+ */
+static unsigned int agx_vote_idle_ms = AGX_VOTE_IDLE_MS_DEFAULT;
+
+static agx_ms_t apple_pmp_agx_now_ms(void)
+{
+	return jiffies_to_msecs(jiffies);
+}
+
+/*
+ * Queue the reconcile step. agx_vote=1 on the kernel command line runs the parameter setter from parse_args(), before workqueue_init_early() has
+ * created system_dfl_wq; queueing on the NULL workqueue would oops in start_kernel(). Nothing is owed then: begin() and the work function read the
+ * parameter themselves, so the first GPU operation kicks.
+ */
+static void apple_pmp_agx_vote_kick(unsigned long delay_ms)
+{
+	struct workqueue_struct *wq = READ_ONCE(system_dfl_wq);
+
+	if (!wq)
+		return;
+	mod_delayed_work(wq, &apple_pmp_agx_vote_work, msecs_to_jiffies(delay_ms));
+}
+
+static int apple_pmp_agx_vote_param_set(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_bool(val, kp);
+
+	if (!ret)
+		apple_pmp_agx_vote_kick(0);	/* switching off clears at once, switching on votes if the GPU is busy */
+	return ret;
+}
+
+static const struct kernel_param_ops apple_pmp_agx_vote_ops = {
+	.set = apple_pmp_agx_vote_param_set,
+	.get = param_get_bool,
+};
+module_param_cb(agx_vote, &apple_pmp_agx_vote_ops, &agx_vote, 0644);
+MODULE_PARM_DESC(agx_vote, "T6000/T6001: set the AGX power request in the PMP report while the GPU has work in flight (default: on)");
+module_param(agx_vote_idle_ms, uint, 0644);
+MODULE_PARM_DESC(agx_vote_idle_ms, "Keep the AGX request this many ms after the last GPU operation ends (default: 250)");
+
+/* Write the AGX request of the bound T6000/T6001 report: -ENODEV without one, -EAGAIN (nothing written) when the PMP does not run. */
+static int apple_pmp_agx_write(bool enable, bool no_ack)
+{
+	struct apple_pmp_report *rep;
+	int ret = -ENODEV;
+
+	if (!of_machine_is_compatible("apple,t6000") && !of_machine_is_compatible("apple,t6001"))
+		return ret;
+	rcu_read_lock();
+	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
+		if (rep->offsets != &apple_pmp_offsets_t600x)
+			continue;
+		if (enable && !(readq(rep->base + rep->offsets->status) & PMP_REPORT_READY))
+			ret = -EAGAIN;
+		else
+			ret = apple_pmp_report_set_state(rep, APPLE_PMP_T6001_AGX_ID, enable, no_ack);
+		break;
+	}
+	rcu_read_unlock();
+	return ret;
+}
+
+/* Refuse new votes (the stopped flag), without writing anything. */
+static void apple_pmp_agx_vote_stop_new(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&apple_pmp_agx_vote_lock, flags);
+	agx_vote_refuse(&apple_pmp_agx_vote_state);
+	spin_unlock_irqrestore(&apple_pmp_agx_vote_lock, flags);
+}
+
+/* Clear a request that is still set. Caller holds apple_pmp_agx_vote_mutex. */
+static void apple_pmp_agx_vote_stop(void)
+{
+	unsigned long flags;
+	bool voted;
+
+	spin_lock_irqsave(&apple_pmp_agx_vote_lock, flags);
+	voted = agx_vote_release(&apple_pmp_agx_vote_state);
+	spin_unlock_irqrestore(&apple_pmp_agx_vote_lock, flags);
+	if (voted)
+		apple_pmp_agx_write(false, true);
+}
+
+static void apple_pmp_agx_vote_fn(struct work_struct *work)
+{
+	struct agx_vote *v = &apple_pmp_agx_vote_state;
+	enum agx_vote_action act;
+	unsigned long flags;
+	agx_ms_t now, next = 0;
+	int ret = 0;
+
+	guard(mutex)(&apple_pmp_agx_vote_mutex);
+	spin_lock_irqsave(&apple_pmp_agx_vote_lock, flags);
+	v->enabled = READ_ONCE(agx_vote);
+	v->idle_ms = READ_ONCE(agx_vote_idle_ms);
+	now = apple_pmp_agx_now_ms();
+	act = agx_vote_decide(v, now);
+	if (act == AGX_VOTE_NONE && v->failures && !v->users && !v->voted &&
+	    agx_vote_retry_reached(v, now))
+		v->failures = 0;	/* the backoff fired with nobody waiting: it is spent */
+	spin_unlock_irqrestore(&apple_pmp_agx_vote_lock, flags);
+
+	if (act != AGX_VOTE_NONE) {
+		const bool set = act == AGX_VOTE_SET;
+
+		ret = apple_pmp_agx_write(set, false);
+		if (ret == -ETIMEDOUT) {
+			pr_err("pmp_report: AGX request %s not acknowledged, clearing\n", set ? "set" : "clear");
+			apple_pmp_agx_write(false, true);
+		}
+		if (!set)
+			ret = 0;	/* a clear is final: the state is "not voted" whatever happened */
+		spin_lock_irqsave(&apple_pmp_agx_vote_lock, flags);
+		agx_vote_applied(v, act, ret, now);
+		next = agx_vote_next(v, apple_pmp_agx_now_ms());
+		spin_unlock_irqrestore(&apple_pmp_agx_vote_lock, flags);
+	} else {
+		spin_lock_irqsave(&apple_pmp_agx_vote_lock, flags);
+		next = agx_vote_next(v, now);
+		spin_unlock_irqrestore(&apple_pmp_agx_vote_lock, flags);
+	}
+	if (next)
+		apple_pmp_agx_vote_kick(next);
+}
+
+void apple_pmp_agx_activity_begin(void)
+{
+	struct agx_vote *v = &apple_pmp_agx_vote_state;
+	unsigned long flags;
+	agx_ms_t delay;
+
+	spin_lock_irqsave(&apple_pmp_agx_vote_lock, flags);
+	v->enabled = READ_ONCE(agx_vote);
+	delay = agx_vote_begin(v, apple_pmp_agx_now_ms());
+	spin_unlock_irqrestore(&apple_pmp_agx_vote_lock, flags);
+	if (delay)
+		apple_pmp_agx_vote_kick(delay);
+}
+EXPORT_SYMBOL_GPL(apple_pmp_agx_activity_begin);
+
+void apple_pmp_agx_activity_end(void)
+{
+	struct agx_vote *v = &apple_pmp_agx_vote_state;
+	unsigned long flags;
+	agx_ms_t delay;
+
+	spin_lock_irqsave(&apple_pmp_agx_vote_lock, flags);
+	v->enabled = READ_ONCE(agx_vote);
+	v->idle_ms = READ_ONCE(agx_vote_idle_ms);
+	delay = agx_vote_end(v, apple_pmp_agx_now_ms());
+	spin_unlock_irqrestore(&apple_pmp_agx_vote_lock, flags);
+	if (delay)
+		apple_pmp_agx_vote_kick(delay);
+}
+EXPORT_SYMBOL_GPL(apple_pmp_agx_activity_end);
+
+/*
+ * The GPU driver unbinds: clear the request now instead of waiting out the idle time, so it is never left set past the GPU's
+ * power-domain release (the T6030 fix clears before it releases its vote). Process context.
+ */
+void apple_pmp_agx_activity_release(void)
+{
+	/* Stop first so that a begin() from now on cannot queue a set, then wait out a work item that already decided, then clear what it set. */
+	apple_pmp_agx_vote_stop_new();
+	cancel_delayed_work_sync(&apple_pmp_agx_vote_work);
+	guard(mutex)(&apple_pmp_agx_vote_mutex);
+	apple_pmp_agx_vote_stop();
+}
+EXPORT_SYMBOL_GPL(apple_pmp_agx_activity_release);
+
+/* The GPU probes again, the report comes back or the system resumes: allow votes, and vote now if operations are already in flight. Process context. */
+void apple_pmp_agx_activity_resume(void)
+{
+	struct agx_vote *v = &apple_pmp_agx_vote_state;
+	unsigned long flags;
+	bool kick;
+
+	spin_lock_irqsave(&apple_pmp_agx_vote_lock, flags);
+	v->enabled = READ_ONCE(agx_vote);
+	kick = agx_vote_resume(v);
+	spin_unlock_irqrestore(&apple_pmp_agx_vote_lock, flags);
+	if (kick)
+		apple_pmp_agx_vote_kick(0);
+}
+EXPORT_SYMBOL_GPL(apple_pmp_agx_activity_resume);
+
+/*
+ * System sleep: withdraw the request before the devices suspend and decide again after resume. Whether bit 9 held through s2idle costs power is not
+ * measured (a held display request cost about 0.25 W on J514S), and the PMP may drop the word across sleep, which would leave voted true with nothing
+ * on the wire. Clearing and re-voting covers both.
+ */
+static int apple_pmp_agx_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	switch (action) {
+	case PM_SUSPEND_PREPARE:
+	case PM_HIBERNATION_PREPARE:
+		apple_pmp_agx_activity_release();
+		break;
+	case PM_POST_SUSPEND:
+	case PM_POST_HIBERNATION:
+		apple_pmp_agx_activity_resume();
+		break;
+	}
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block apple_pmp_agx_pm_nb = {
+	.notifier_call = apple_pmp_agx_pm_notify,
+};
+
+/* Find and check the report before taking the GPU vote; optionally update it. */
+static int apple_pmp_report_t6030_gfx(struct device *supplier, const bool *enable)
+{
+	struct apple_pmp_report *rep, *found = NULL;
+	struct device_node *pmp;
+	const u8 *table;
+	int len = 0, ret = -ENODEV;
+
+	if (!IS_ENABLED(CONFIG_APPLE_T6030_GPU_PMP_LINK) ||
+	    !of_machine_is_compatible("apple,t6030") ||
+	    !of_device_is_compatible(supplier->of_node, "apple,t6030-pmp-v2"))
+		return -ENODEV;
+
+	/* T6030's ordered soc-device ID 5 is the acknowledged AGX request. */
+	table = of_get_property(supplier->of_node, "apple,tunable-soc-device", &len);
+	if (!apple_pmp_devices_valid(table, len, BIT_ULL(4), BIT_ULL(4), true) ||
+	    memcmp(table + 4 * PMP_SOC_DEVICE_SIZE + 116, "AGX\0\0\0\0\0", 8))
+		return -EINVAL;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
+		if (rep->offsets != &apple_pmp_offsets_t6030)
+			continue;
+		pmp = of_parse_phandle(rep->dev->of_node, "apple,pmp", 0);
+		if (pmp == supplier->of_node) {
+			of_node_put(pmp);
+			if (found)
+				goto out;
+			found = rep;
+		} else {
+			of_node_put(pmp);
+		}
+	}
+	if (found) {
+		if (readq(found->base + found->offsets->status) != PMP_REPORT_READY)
+			ret = -EAGAIN;
+		else
+			ret = enable ? apple_pmp_report_set_state(found, 4, *enable, false) : 0;
+	}
+out:
+	rcu_read_unlock();
+	return ret;
+}
+int apple_pmp_report_check_t6030_gfx(struct device *supplier)
+{
+	return apple_pmp_report_t6030_gfx(supplier, NULL);
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_check_t6030_gfx);
+
+/* The RTKit AGX vote alone does not enable PMP's GPU bandwidth controllers. */
+int apple_pmp_report_set_t6030_gfx(struct device *supplier, bool enable)
+{
+	return apple_pmp_report_t6030_gfx(supplier, &enable);
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_set_t6030_gfx);
+/*
+ * One 64-bit store of the whole request word. Never read a request entry
+ * back after storing it: the read retires the pending PTD update before the
+ * PMP handles it, and the request is lost.
+ */
+static void apple_pmp_report_dvfs_write(struct apple_pmp_report *rep, u32 entry, u64 val)
+{
+	writeq(val, rep->base + rep->offsets->update + 8 * entry);
+}
+
+/**
+ * apple_pmp_report_set_request() - set or clear one bit of the PMP power request word of a bound report
+ * @report_np: device tree node of the report region (compatible apple,t6000-pmp-v2-report and its
+ *	siblings)
+ * @id: bit number of the request, the index of the soc-device record, 0 to 63 (ANE0 is 10 and AGX
+ *	is 9 on the T6001)
+ * @enable: set or clear the bit
+ * @no_ack: do not wait for the acknowledge
+ *
+ * One read-modify-write of the word, made under the report's lock: the same lock every report
+ * entry and the AGX vote take, so requests for different bits cannot lose each other. Unless
+ * @no_ack, waits (atomic poll, at most 50 ms) until the acknowledge word shows the bit as
+ * requested. A PMP that does not run has nothing to acknowledge: the request is written and 0 is
+ * returned, as for a report entry.
+ *
+ * The caller owns the bit it requests; this function does not arbitrate between callers of the
+ * same bit. On the T6001 bit 9 belongs to the AGX vote (pmp_report.agx_vote) and is refused here
+ * with -EBUSY. After -ETIMEDOUT the request was written but not acknowledged and stays in the
+ * word: the caller must clear it (@enable false, @no_ack true) before giving up.
+ *
+ * Context: process context (the acknowledge wait is a busy poll of up to 50 ms).
+ * Return: 0, -ENODEV if no report is bound to @report_np, -EINVAL if @id is out of range,
+ * -EBUSY for the T6001 AGX bit, -ETIMEDOUT if the acknowledge did not follow.
+ */
+int apple_pmp_report_set_request(const struct device_node *report_np, unsigned int id,
+				bool enable, bool no_ack)
+{
+	struct apple_pmp_report *rep;
+	int ret = -ENODEV;
+
+	if (id > 63)
+		return -EINVAL;
+	rcu_read_lock();
+	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
+		if (rep->dev->of_node == report_np) {
+			if (id == APPLE_PMP_T6001_AGX_ID && rep->offsets == &apple_pmp_offsets_t600x)
+				ret = -EBUSY;	/* the AGX vote owns this bit */
+			else
+				ret = apple_pmp_report_set_state(rep, id, enable, no_ack);
+			break;
+		}
+	}
+	rcu_read_unlock();
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_set_request);
+
 static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, bool enable)
 {
 	struct apple_pmp_report_entry *ent = genpd_to_apple_pmp_report_entry(genpd);
@@ -1373,14 +1957,93 @@ static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, boo
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
-		if (rep->dev->of_node == ent->report_node) {
-			ret = apple_pmp_report_set_state(rep, ent->id, enable, ent->no_ack);
-			break;
-		}
+		if (rep->dev->of_node != ent->report_node)
+			continue;
+		/* The device request is admitted first and the level dropped first. */
+		if (ent->dvfs && !enable)
+			apple_pmp_report_dvfs_write(rep, ent->dvfs_entry, ent->dvfs_off);
+		ret = apple_pmp_report_set_state(rep, ent->id, enable, ent->no_ack);
+		if (ent->dvfs && enable && !ret)
+			apple_pmp_report_dvfs_write(rep, ent->dvfs_entry, ent->dvfs_on);
+		break;
 	}
 	rcu_read_unlock();
 	return ret;
 }
+
+/*
+ * System sleep. An external display processor's request keeps the PMP's
+ * external display state up while nothing is shown, about 0.25 W in
+ * suspend-to-idle on J514S. By the noirq phase every display processor has
+ * suspended, its displays off and its links released or idle: withdraw such a
+ * request if it is acknowledged, with one replacement write as macOS releases
+ * its display requests, and assert it again before the processors resume.
+ */
+static int apple_pmp_report_entry_sleep(struct apple_pmp_report_entry *ent, bool release)
+{
+	struct apple_pmp_report *rep;
+	int ret = -ENODEV;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
+		if (rep->dev->of_node != ent->report_node)
+			continue;
+		if (release && (!(readq(rep->base + rep->offsets->status) & PMP_REPORT_READY) ||
+				!(readq(rep->base + rep->offsets->actual) & BIT_ULL(ent->id))))
+			ret = -EALREADY;
+		else
+			ret = apple_pmp_report_set_state(rep, ent->id, !release, ent->no_ack);
+		break;
+	}
+	rcu_read_unlock();
+	return ret;
+}
+
+static int apple_pmp_report_entry_suspend_noirq(struct device *dev)
+{
+	struct apple_pmp_report_entry *ent = dev_get_drvdata(dev);
+	int ret;
+
+	if (!ent || !ent->sleep_release || READ_ONCE(ent->removed))
+		return 0;
+	ret = apple_pmp_report_entry_sleep(ent, true);
+	if (ret == -EALREADY)
+		return 0;
+	/* A withdrawal that was not acknowledged is asserted again all the same. */
+	if (ret)
+		dev_warn(dev, "request %u not withdrawn for sleep: %d\n", ent->id, ret);
+	ent->released = true;
+	return 0;
+}
+
+static int apple_pmp_report_entry_resume_noirq(struct device *dev)
+{
+	struct apple_pmp_report_entry *ent = dev_get_drvdata(dev);
+	int ret, tries = 0;
+
+	if (!ent || !ent->released)
+		return 0;
+	ent->released = false;
+	/*
+	 * Without the request the external display stays dark until reboot:
+	 * write it again, three times at most, while the PMP does not
+	 * acknowledge it in time.
+	 */
+	do {
+		ret = apple_pmp_report_entry_sleep(ent, false);
+	} while (ret == -ETIMEDOUT && ++tries < 3);
+	if (ret)
+		dev_err(dev, "request %u not asserted after sleep: %d\n", ent->id, ret);
+	else if (tries)
+		dev_warn(dev, "request %u asserted after sleep on write %d\n", ent->id,
+			 tries + 1);
+	return ret;
+}
+
+static const struct dev_pm_ops apple_pmp_report_entry_pm_ops = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_pmp_report_entry_suspend_noirq,
+				  apple_pmp_report_entry_resume_noirq)
+};
 
 static int apple_pmp_report_entry_power_on(struct generic_pm_domain *genpd)
 {
@@ -1453,6 +2116,31 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 			goto err_free;
 		}
 		ent->no_ack = of_property_read_bool(node, "apple,no-ack");
+	}
+	ent->sleep_release = of_property_read_bool(node, "apple,release-for-sleep");
+	if (of_property_present(node, "apple,dvfs")) {
+		u32 request_class = 0;
+		u32 dvfs[2];
+
+		if (of_property_read_u32(node, "apple,dvfs-request-class",
+					 &request_class) &&
+		    of_property_present(node, "apple,dvfs-request-class")) {
+			ret = dev_err_probe(dev, -EINVAL,
+					    "invalid apple,dvfs-request-class\n");
+			goto err_free;
+		}
+		ret = of_property_read_u32_array(node, "apple,dvfs", dvfs, 2);
+		if (ret || of_property_count_u32_elems(node, "apple,dvfs") != 2 ||
+		    !rep || !rep->offsets->update ||
+		    dvfs[0] < rep->offsets->dvfs_first ||
+		    dvfs[0] >= rep->offsets->dvfs_first + rep->offsets->dvfs_count ||
+		    !apple_pmp_dvfs_word(request_class, 0, &ent->dvfs_off) ||
+		    !apple_pmp_dvfs_word(request_class, dvfs[1], &ent->dvfs_on)) {
+			ret = dev_err_probe(dev, -EINVAL, "invalid apple,dvfs\n");
+			goto err_free;
+		}
+		ent->dvfs = true;
+		ent->dvfs_entry = dvfs[0];
 	}
 
 	ret = of_property_read_string(node, "label", &name);
@@ -1542,6 +2230,7 @@ static struct platform_driver apple_pmp_report_entry_driver = {
 	.driver = {
 		.name = "apple-pmp-report-entry",
 		.of_match_table = apple_pmp_report_entry_of_match,
+		.pm = pm_sleep_ptr(&apple_pmp_report_entry_pm_ops),
 		/* Power-domain providers are not intended for manual unbinding. */
 		.suppress_bind_attrs = true,
 	},
@@ -1552,6 +2241,7 @@ MODULE_DEVICE_TABLE(of, apple_pmp_report_entry_of_match);
 
 static int __init apple_pmp_report_init(void)
 {
+	register_pm_notifier(&apple_pmp_agx_pm_nb);
 	apple_pmp_report_debugfs = debugfs_create_dir("apple-pmp-report", NULL);
 	platform_driver_register(&apple_pmp_report_entry_driver);
 	platform_driver_register(&apple_pmp_report_driver);
@@ -1560,6 +2250,7 @@ static int __init apple_pmp_report_init(void)
 
 static void __exit apple_pmp_report_exit(void)
 {
+	unregister_pm_notifier(&apple_pmp_agx_pm_nb);
 	debugfs_remove_recursive(apple_pmp_report_debugfs);
 	platform_driver_unregister(&apple_pmp_report_entry_driver);
 	platform_driver_unregister(&apple_pmp_report_driver);

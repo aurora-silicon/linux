@@ -314,11 +314,14 @@ static inline unsigned int cd321x_pm_mux_held(struct cd321x_pm_state *pm,
 		pm->attempts_left = 0;
 		return 0;
 	}
-	if (pm->phase == CD321X_PM_RUNNING)
-		pm->attempts_left = CD321X_RESUME_ATTEMPTS;
-	else
-		pm->attempts_left++;
-	pm->phase = CD321X_PM_REVALIDATE;
+	/* A probe-time SAFE timeout joins this series without enabling workers. */
+	if (pm->phase != CD321X_PM_INITIALIZING) {
+		if (pm->phase == CD321X_PM_RUNNING)
+			pm->attempts_left = CD321X_RESUME_ATTEMPTS;
+		else
+			pm->attempts_left++;
+		pm->phase = CD321X_PM_REVALIDATE;
+	}
 	pm->mux_retries++;
 	pm->mux_retry_ms = clamp(2 * pm->mux_retry_ms, CD321X_MUX_RETRY_MS,
 				 CD321X_MUX_RETRY_MAX_MS);
@@ -354,13 +357,21 @@ static inline void cd321x_pm_remove(struct cd321x_pm_state *pm)
 
 /*
  * A display mux reports -ENOSPC when every display pipeline is driving
- * another port.  That lasts until the other display goes away, so the port's
- * USB path is set up without the display and nothing is retried.  Any other
- * error, such as -EBUSY from a PHY in the middle of a transition, is retried.
+ * another port, on every SoC: the DCP route returns it whenever a port finds
+ * no free pipeline (dcp_typec_route_set()).  That lasts until the other
+ * display goes away, so the port's USB path is set up without the display
+ * and nothing is retried; the DCP route hands the display a pipeline when
+ * one frees.  Any other error, such as -EBUSY from a PHY in the middle of a
+ * transition, is retried.
+ *
+ * Taking only -EBUSY as a taken display on SoCs other than T8140 and T8142
+ * failed an M1 or M2 dock's whole Type-C connection when a monitor on the
+ * other port held the one external pipeline: the dock's USB devices and
+ * network never came up.
  */
-static inline bool cd321x_display_taken(int ret, bool enospc)
+static inline bool cd321x_display_taken(int ret)
 {
-	return ret == (enospc ? -ENOSPC : -EBUSY);
+	return ret == -ENOSPC;
 }
 
 enum cd321x_dp_send {

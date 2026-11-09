@@ -1,0 +1,140 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/dma/apple,pcie-piodma.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple PCIe PIODMA engine
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  PCIe auxiliary DMA register banks and completion interrupt. The stream
+  is distinct from the PCIe endpoint streams in the same DART.
+
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6020-pcie-piodma
+          - apple,t6021-pcie-piodma
+          - apple,t6022-pcie-piodma
+          - apple,t6030-pcie-piodma
+          - apple,t6031-pcie-piodma
+          - apple,t6032-pcie-piodma
+          - apple,t6041-pcie-piodma
+          - apple,t8112-pcie-piodma
+          - apple,t8122-pcie-piodma
+          - apple,t8132-pcie-piodma
+          - apple,t8142-pcie-piodma
+          - apple,t6050-pcie-piodma
+          - apple,t8152-pcie-piodma
+  required:
+    - compatible
+
+properties:
+  compatible: true
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8132-pcie-piodma
+      required:
+        - compatible
+    then:
+      properties:
+        compatible:
+          items:
+            - enum:
+                - apple,t8132-pcie-piodma
+            - const: apple,pcie-piodma
+
+        reg:
+          minItems: 3
+          maxItems: 3
+
+        interrupts:
+          maxItems: 1
+
+        iommus:
+          maxItems: 1
+
+      required:
+        - compatible
+        - reg
+        - interrupts
+        - iommus
+    else:
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t6032-pcie-piodma
+            required:
+              - compatible
+          then:
+            properties:
+              compatible:
+                items:
+                  - const: apple,t6032-pcie-piodma
+                  - const: apple,pcie-piodma
+
+              reg:
+                minItems: 3
+                maxItems: 3
+
+              interrupts:
+                maxItems: 1
+
+              iommus:
+                maxItems: 1
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+          else:
+            properties:
+              compatible:
+                items:
+                  - enum:
+                      - apple,t6020-pcie-piodma
+                      - apple,t6021-pcie-piodma
+                      - apple,t6022-pcie-piodma
+                      - apple,t6030-pcie-piodma
+                      - apple,t6031-pcie-piodma
+                      - apple,t6041-pcie-piodma
+                      - apple,t8112-pcie-piodma
+                      - apple,t8122-pcie-piodma
+                      - apple,t8142-pcie-piodma
+                      - apple,t6050-pcie-piodma
+                      - apple,t8152-pcie-piodma
+                  - const: apple,pcie-piodma
+
+              reg:
+                minItems: 3
+                maxItems: 3
+                description: Register apertures in hardware-description order.
+
+              interrupts:
+                maxItems: 1
+
+              iommus:
+                maxItems: 1
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - iommus
+
+            additionalProperties: false
+
+unevaluatedProperties: false

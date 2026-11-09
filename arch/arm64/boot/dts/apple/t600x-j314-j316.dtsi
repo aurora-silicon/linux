@@ -568,6 +568,7 @@
 		/* To be filled by the loader */
 		local-mac-address = [00 10 18 00 00 10];
 		apple,antenna-sku = "XX";
+		brcm,ccode-map-trivial;
 	};
 
 	bluetooth0: bluetooth@0,1 {
@@ -740,6 +741,15 @@
 };
 
 &dwc3_3_dart_1 {
+	status = "disabled";
+};
+
+/* ATC3 has no USB4/Thunderbolt, so there is no PCIe-C tunnel behind it either */
+&apciec3_dart {
+	status = "disabled";
+};
+
+&apciec3 {
 	status = "disabled";
 };
 
@@ -987,6 +997,37 @@
 #include "spi1-nvram.dtsi"
 #include "hwmon-laptop.dtsi"
 #include "hwmon-fan-dual.dtsi"
+
+/*
+ * GPU temperatures. The SMC publishes them only while the GPU is powered:
+ * with the GPU off, Tg04/Tg0C read 0 C and Tg05/Tg0D read 9.2 C (they
+ * track Tg04/Tg0C plus a fixed 9.2 C). Those placeholders are no data.
+ */
+&smc_hwmon {
+	temperature-Tg04 {
+		apple,key-id = "Tg04";
+		label = "GPU Tg04";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg05 {
+		apple,key-id = "Tg05";
+		label = "GPU Tg05";
+		apple,no-data-below-millicelsius = <15000>;
+	};
+
+	temperature-Tg0C {
+		apple,key-id = "Tg0C";
+		label = "GPU Tg0C";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0D {
+		apple,key-id = "Tg0D";
+		label = "GPU Tg0D";
+		apple,no-data-below-millicelsius = <15000>;
+	};
+};
 #include "isp-imx558.dtsi"
 
 &isp {
@@ -996,3 +1037,7 @@
 &pmp_report_isp_sys {
 	status = "okay";
 };
+
+#ifdef APPLE_T600X_NON_ULTRA
+#include "t600x-j314-j316-control.dtsi"
+#endif

@@ -100,6 +100,11 @@ struct tb_nhi_ring_layout {
  *			      meanwhile, so the tunnel is kept instead of being
  *			      torn down at the DPRX timeout. Called with the
  *			      domain lock held.
+ * @add_links: NHI specific hook that makes the native ports tunneled
+ *	       through this host (PCIe) resume after the NHI, like the device
+ *	       links tb_acpi_add_links() creates from firmware tables. Returns
+ *	       %true if the host orders all of its tunneled native ports, so
+ *	       none is left without a link.
  * @is_present: Whether the device is currently present on the parent bus
  * @init_interrupts: NHI specific interrupt initialization hook
  * @reset_interface: Resets the host interface
@@ -127,6 +132,7 @@ struct tb_nhi_ops {
 				       struct tb_port *out, u64 generation);
 	void (*dp_tunnel_deactivate)(struct tb_nhi *nhi, struct tb_port *in,
 				     struct tb_port *out, u64 generation);
+	bool (*add_links)(struct tb_nhi *nhi);
 	bool (*is_present)(struct tb_nhi *nhi);
 	void (*dp_tunnel_changed)(struct tb_nhi *nhi, u8 in_port, u64 generation, bool active);
 	bool (*dp_tunnel_awaits_display)(struct tb_nhi *nhi, struct tb_port *in);
@@ -214,6 +220,8 @@ struct tb_nhi_ops {
  * PCIe host kept its link up: the tunnels are still active on resume.
  */
 #define QUIRK_KEEP_TUNNELS				BIT(7)
+/* The links of the host router must not enter CL states. */
+#define QUIRK_NO_HOST_CLX				BIT(8)
 
 /* Host display policies are independent of which optional hooks are installed. */
 #define TB_HOST_DP_NOTIFY		BIT(0)
@@ -222,6 +230,13 @@ struct tb_nhi_ops {
 #define TB_HOST_DP_KEEP_DPRX_TIMEOUT	BIT(3)
 #define TB_HOST_DP_ADAPTER_QUIRKS		BIT(4)
 #define TB_HOST_DP_INITIAL_BW_GRANT	BIT(5)
+/*
+ * Both DP IN streams of a host PHY must run at one link rate. A DP tunnel
+ * alone on the host router offers up to HBR3; when more are needed, all of
+ * them offer HBR2 at most (two 4K60 streams fit), a tunnel up above that
+ * being set up again at HBR2 first.
+ */
+#define TB_HOST_DP_SHARED_RATE		BIT(6)
 
 /*
  * Minimal number of vectors when we use MSI-X. Two for control channel

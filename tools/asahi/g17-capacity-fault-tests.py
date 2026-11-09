@@ -7,6 +7,7 @@ predicate is compiled too; allocation and asynchronous notification are stubs.
 """
 from pathlib import Path
 import os
+import re
 import subprocess
 import tempfile
 
@@ -278,13 +279,18 @@ def main():
     fault_fix = 'Previous::retire_witnessed(&mut self.previous);'
     assert source.count(idle_fix) == 1
     assert source.count(fault_fix) == 2
+    def mutate(pattern, replacement):
+        changed, count = re.subn(pattern, replacement, source)
+        assert count == 1, (pattern, count)
+        return changed
+
     controls = [('fixed', source, True),
                 ('missing-idle-close', source.replace(idle_fix, ''), False),
                 ('missing-fault-release', source.replace(fault_fix, '', 1), False),
                 ('missing-kill-release', source.replace('Previous::retire_witnessed(&mut self.previous);\n        self.exit', 'self.exit'), False),
                 ('missing-reclaim-wake', source.replace('self.queue_events();', ''), False),
-                ('share-before-retirement', source.replace('&& self.owner.is_some() && self.retirement_ready', '&& self.owner.is_some()'), False),
-                ('share-during-kill', source.replace('&& self.exit.is_none() && self.active.len', '&& self.active.len'), False)]
+                ('share-before-retirement', mutate(r'(&&\s*self\.owner\.is_some\(\))\s*&&\s*self\.retirement_ready', r'\1'), False),
+                ('share-during-kill', mutate(r'&&\s*self\.exit\.is_none\(\)\s*(?=&&\s*self\.active\.len)', ''), False)]
     with tempfile.TemporaryDirectory(prefix='g17-capacity-') as tmp:
         for name, rust, passes in controls:
             path = Path(tmp) / (name + '.rs')

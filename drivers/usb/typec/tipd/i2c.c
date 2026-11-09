@@ -58,18 +58,39 @@ static void tps6598x_remove_i2c(struct i2c_client *client)
 	tipd_remove(tps);
 }
 
+/*
+ * The I2C adapter suspends right after its clients and resumes right before
+ * them, and cannot transfer in between. Keep the event handler out of that
+ * window: a partner such as a USB4 host can keep the shared level interrupt
+ * asserted through system sleep, and every pass of the handler would then fail
+ * its bus reads and leave it asserted. An event that arrives meanwhile is
+ * handled once the interrupt is enabled again on resume.
+ */
 static int __maybe_unused tps6598x_suspend(struct device *dev)
 {
 	struct tps6598x *tps = dev_get_drvdata(dev);
+	int ret;
 
-	return tipd_suspend(tps);
+	if (tps->irq)
+		disable_irq(tps->irq);
+
+	ret = tipd_suspend(tps);
+	if (ret && tps->irq)
+		enable_irq(tps->irq);
+
+	return ret;
 }
 
 static int __maybe_unused tps6598x_resume(struct device *dev)
 {
 	struct tps6598x *tps = dev_get_drvdata(dev);
+	int ret;
 
-	return tipd_resume(tps);
+	ret = tipd_resume(tps);
+	if (tps->irq)
+		enable_irq(tps->irq);
+
+	return ret;
 }
 
 static const struct dev_pm_ops tps6598x_pm_ops = {

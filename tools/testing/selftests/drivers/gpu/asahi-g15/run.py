@@ -102,6 +102,7 @@ pub mod prelude {
     pub type Result<T = ()> = std::result::Result<T, Error>;
     pub const EINVAL: Error = -22;
     pub const EFAULT: Error = -14;
+    pub const ENOSPC: Error = -28;
     pub use crate::{pr_warn, static_assert};
 }
 #[macro_export]
@@ -113,6 +114,7 @@ pub mod mmu {
     pub const UAT_PGSZ: usize = 0x4000;
     pub const UAT_PGMSK: usize = UAT_PGSZ - 1;
     pub struct Vm(pub Vec<u8>);
+    pub type VmReadGuard = Vm;
     impl Vm {
         pub fn read_user(&self, va: u64, out: &mut [u8]) -> Result {
             let start = usize::try_from(va).map_err(|_| EFAULT)?;
@@ -124,8 +126,19 @@ pub mod mmu {
 }
 mod command {
     use crate::{mmu, prelude::*};
+    use std::cell::Cell;
     pub const USC_WINDOW: u64 = 1 << 32;
-    pub fn cover(vm: &mmu::Vm, start: u64, end: u64, _: bool, _: bool) -> Result {
+    /// Addresses from here on are mapped and readable without backing in the mock VM.
+    pub const SYNTHETIC: u64 = 1 << 40;
+    thread_local! {
+        /// cover() calls: the page checks the walk made.
+        pub static COVERS: Cell<u32> = Cell::new(0);
+    }
+    pub fn cover(vm: &mut mmu::VmReadGuard, start: u64, end: u64, _: bool, _: bool) -> Result {
+        COVERS.with(|c| c.set(c.get() + 1));
+        if start >= SYNTHETIC {
+            return Ok(());
+        }
         let mut bytes = vec![0; usize::try_from(end - start).map_err(|_| EINVAL)?];
         vm.read_user(start, &mut bytes)
     }
@@ -144,28 +157,100 @@ mod gate_regressions {
     }
     #[test]
     fn terminator_and_known_barrier() {
-        assert_eq!(gate::cdm(&vm(&[0x40000000]), 0, 0), Ok(()));
-        assert_eq!(gate::cdm(&vm(&[0x60000160, 0x40000000]), 0, 0), Ok(()));
+        assert_eq!(gate::cdm(&mut vm(&[0x40000000]), 0, 0), Ok(()));
+        assert_eq!(gate::cdm(&mut vm(&[0x60000160, 0x40000000]), 0, 0), Ok(()));
     }
     #[test]
     fn cyclic_links_are_rejected() {
-        assert_eq!(gate::cdm(&vm(&[0x20000000, 0]), 0, 0), Err(EINVAL));
+        assert_eq!(gate::cdm(&mut vm(&[0x20000000, 0]), 0, 0), Err(EINVAL));
     }
+    /// Words of 4 bytes that fill the byte budget: the root block and one per link.
+    const BUDGET_WORDS: usize = 65 * 0x10000 / 4;
     #[test]
-    fn record_budget_requires_a_terminator() {
-        assert_eq!(gate::cdm(&vm(&vec![0x60000160; 8192]), 0, 0), Err(EINVAL));
+    fn byte_budget_requires_a_terminator() {
+        assert_eq!(gate::cdm(&mut vm(&vec![0x60000160; BUDGET_WORDS + 1]), 0, 0), Err(EINVAL));
     }
     #[test]
     fn final_record_may_terminate() {
-        let mut words = vec![0x60000160; 8192];
-        words[8191] = 0x40000000;
-        assert_eq!(gate::cdm(&vm(&words), 0, 0), Ok(()));
+        let mut words = vec![0x60000160; BUDGET_WORDS + 1];
+        words[BUDGET_WORDS - 1] = 0x40000000;
+        assert_eq!(gate::cdm(&mut vm(&words), 0, 0), Ok(()));
+        words[BUDGET_WORDS - 1] = 0x60000160;
+        words[BUDGET_WORDS] = 0x40000000;
+        assert_eq!(gate::cdm(&mut vm(&words), 0, 0), Err(EINVAL));
+    }
+    #[test]
+    fn more_than_8192_records_are_admitted() {
+        // 1024 draws of ten records each, as a tessellated multi-draw writes them.
+        let mut words = vec![0x60000160; 10240];
+        words.push(0x40000000);
+        assert_eq!(gate::cdm(&mut vm(&words), 0, 0), Ok(()));
+    }
+    #[test]
+    fn link_budget_still_bounds_the_walk() {
+        // 65 links, each to the next: the 65th is refused.
+        let mut words = Vec::new();
+        for i in 0..65u32 {
+            words.extend([0x20000000, (i + 1) * 8]);
+        }
+        words.push(0x40000000);
+        assert_eq!(gate::cdm(&mut vm(&words), 0, 0), Err(EINVAL));
+        let mut words = Vec::new();
+        for i in 0..64u32 {
+            words.extend([0x20000000, (i + 1) * 8]);
+        }
+        words.push(0x40000000);
+        assert_eq!(gate::cdm(&mut vm(&words), 0, 0), Ok(()));
+    }
+    /// The USC window of these cases and its first program, both in the mock's mapped range.
+    const USC: u64 = crate::command::SYNTHETIC;
+    /// A 24-byte indirect launch of the window's first program with its arguments at `args`.
+    fn indirect(args: u64) -> [u32; 6] {
+        [0x10080000, ((USC >> 38) as u32) << 22, (USC >> 6) as u32,
+         0x40000000 | ((USC >> 40) & 0xff) as u32, (args >> 32) as u32 & 0xffff, args as u32]
+    }
+    /// `n` indirect launches, launch `i` with its arguments at `args(i)`, then TERMINATE.
+    fn launches(n: usize, args: impl Fn(usize) -> u64) -> Vec<u32> {
+        let mut words: Vec<u32> = (0..n).flat_map(|i| indirect(args(i))).collect();
+        words.push(0x40000000);
+        words
+    }
+    fn covers(words: &[u32]) -> (Result, u32) {
+        crate::command::COVERS.with(|c| c.set(0));
+        let r = gate::cdm(&mut vm(words), USC, 0);
+        (r, crate::command::COVERS.with(|c| c.get()))
+    }
+    const PAGE: u64 = mmu::UAT_PGSZ as u64;
+    #[test]
+    fn repeated_argument_pages_are_checked_once() {
+        // 1000 launches with their arguments in one page: the program page and that page.
+        let base = 2 * USC;
+        assert_eq!(covers(&launches(1000, |i| base + (i as u64 % 100) * 12)), (Ok(()), 2));
+        // Alternating between two pages: one check per change of page.
+        assert_eq!(covers(&launches(10, |i| base + (i as u64 % 2) * PAGE)), (Ok(()), 11));
+        // Arguments that cross a page are checked each time.
+        assert_eq!(covers(&launches(3, |_| base + PAGE - 8)), (Ok(()), 4));
+    }
+    #[test]
+    fn page_check_budget_bounds_the_walk() {
+        let base = 2 * USC;
+        // The program page and 16383 argument pages: 16384 checks, admitted.
+        assert_eq!(covers(&launches(16383, |i| base + i as u64 * PAGE)), (Ok(()), 16384));
+        // One more page: refused at the 16385th check, which is not made.
+        assert_eq!(covers(&launches(16384, |i| base + i as u64 * PAGE)), (Err(EINVAL), 16384));
+    }
+    #[test]
+    fn a_large_stream_of_reused_pages_is_admitted() {
+        // 170000 launches (4 MB, inside the byte budget) over 16 argument pages.
+        let base = 2 * USC;
+        let words = launches(170000, |i| base + (i as u64 / 10625) * PAGE + (i as u64 % 1000) * 12);
+        assert_eq!(covers(&words), (Ok(()), 17));
     }
     #[test]
     fn malformed_and_unreadable_streams_are_rejected() {
-        assert_eq!(gate::cdm(&vm(&[0xffffffff]), 0, 0), Err(EINVAL));
-        assert_eq!(gate::cdm(&vm(&[0x20000000, 2]), 0, 0), Err(EINVAL));
-        assert_eq!(gate::cdm(&mmu::Vm(vec![]), 0, 0), Err(EFAULT));
+        assert_eq!(gate::cdm(&mut vm(&[0xffffffff]), 0, 0), Err(EINVAL));
+        assert_eq!(gate::cdm(&mut vm(&[0x20000000, 2]), 0, 0), Err(EINVAL));
+        assert_eq!(gate::cdm(&mut mmu::Vm(vec![]), 0, 0), Err(EFAULT));
     }
 }
 '''
@@ -213,13 +298,44 @@ def main():
                         str(Path(__file__).with_name("pmp-bridge.c")), "-o", str(output)], check=True)
         subprocess.run([str(output)], check=True)
 
+        owner = (ROOT / "drivers/soc/apple/pmp-export.c").read_text()
+        start = owner.index("int apple_pmp_set_device_power(")
+        end = owner.index("\n}", start) + 2
+        vote = owner[start:end]
+        start = owner.index("int apple_pmp_t6030_gpu_ready(")
+        end = owner.index("\n}", start) + 2
+        (temp / "pmp-vote-production.h").write_text(vote + "\n" + owner[start:end])
+        output = temp / "pmp-vote"
+        subprocess.run([os.environ.get("HOSTCC", "cc"), "-std=c11", "-Wall", "-Wextra",
+                        "-Werror", "-I", str(temp),
+                        str(Path(__file__).with_name("pmp-vote.c")), "-o", str(output)], check=True)
+        subprocess.run([str(output)], check=True)
+
         # Native wire layout is a private per-backend facade. Its independent host test
         # checks that canonical normal/G17 UAPI remains unchanged; there is no global
         # Rust bindgen header selector in this integration.
         harness = RUST_PREFIX + f'\n#[path = "{G15 / "gate.rs"}"] mod gate;\n'
+        encode = (G15 / "encode.rs").read_text()
+        start = encode.index("pub(crate) const fn stamp_seed(")
+        end = encode.index("\n}", start) + 2
+        harness += encode[start:end] + '''
+#[test]
+fn firmware_stamp_wrap() {
+    for seed in [0xc1000000u32, 0x7a000000, 0x3d000000] {
+        let wrap = ((1u64 << 32) - seed as u64) / 0x100;
+        assert_eq!(stamp_seed(seed, 0), seed);
+        assert_eq!(stamp_seed(seed, wrap - 1), 0xffffff00);
+        assert_eq!(stamp_seed(seed, wrap), 0);
+        assert_eq!(stamp_seed(seed, wrap + 1), 0x100);
+        assert_eq!(stamp_seed(seed, 1 << 24), seed);
+        assert_eq!(stamp_seed(seed, u64::MAX), seed.wrapping_sub(0x100));
+    }
+}
+'''
         harness += f'#[path = "{G15 / "recovery/logic.rs"}"] mod recovery;\n'
         harness += f'#[path = "{G15 / "power/idle.rs"}"] mod idle;\n'
         harness += f'#[path = "{G15 / "power/pstate.rs"}"] mod pstate;\n'
+        harness += f'#[path = "{G15 / "retain.rs"}"] mod retain;\n'
         harness += ("mod firmware_identity {\n" +
                     f'#[path = "{G15 / "identity/matching.rs"}"] pub mod matching;\n' +
                     f'#[path = "{G15 / "identity/lookup.rs"}"] pub mod lookup;\n' + "}\n")

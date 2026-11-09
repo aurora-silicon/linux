@@ -40,6 +40,7 @@ obj-$(CONFIG_PCIE_BRCMSTB) += pcie-brcmstb.o
 obj-$(CONFIG_PCI_LOONGSON) += pci-loongson.o
 obj-$(CONFIG_PCIE_HISI_ERR) += pcie-hisi-error.o
 obj-$(CONFIG_PCIE_APPLE) += pcie-apple.o
+obj-$(CONFIG_PCIE_APPLE_MSI) += pcie-apple-msi.o
 obj-$(CONFIG_PCIE_MT7621) += pcie-mt7621.o
 obj-$(CONFIG_PCIE_ASPEED) += pcie-aspeed.o
 
@@ -67,4 +68,5 @@ obj-$(CONFIG_ARM64) += pci-xgene.o
 endif
 endif
 
-obj-$(CONFIG_PCIE_APPLE_PIODMA_DIAG) += pcie-apple-piodma-diag.o
+obj-$(CONFIG_PCIE_APPLE_T8140_BOOTSTRAP) += pcie-apple-t8140-bootstrap.o
+obj-$(CONFIG_PCIE_APPLE_T8140_BOOTSTRAP_KUNIT_TEST) += pcie-apple-t8140-bootstrap-test.o

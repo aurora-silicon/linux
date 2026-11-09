@@ -13,6 +13,7 @@
 #include <linux/io.h>
 #include <linux/ioport.h>
 #include <linux/iopoll.h>
+#include <linux/ktime.h>
 #include <linux/math.h>
 #include <linux/mfd/core.h>
 #include <linux/mfd/macsmc.h>
@@ -46,6 +47,8 @@
 #define SMC_RESULT			SMC_MSG
 
 #define SMC_TIMEOUT_MS		500
+/* Restart and power-off go through atomic writes; give the SMC time. */
+#define SMC_ATOMIC_TIMEOUT_MS	5000
 
 static const struct mfd_cell apple_smc_devs[] = {
 	MFD_CELL_NAME("macsmc-input"),
@@ -59,6 +62,11 @@ static const struct mfd_cell apple_smc_devs[] = {
 /* The second GPIO bank ('gp' keys) only exists on some SMCs. */
 static const struct mfd_cell apple_smc_low_gpio_dev =
 	MFD_CELL_OF("macsmc-low-gpio", NULL, NULL, 0, 0, "apple,smc-low-gpio");
+
+/* T8152 currently exposes read-only telemetry; firmware owns fan control. */
+static const struct mfd_cell apple_smc_telemetry_devs[] = {
+	MFD_CELL_OF("macsmc-hwmon", NULL, NULL, 0, 0, "apple,smc-hwmon"),
+};
 
 static void apple_smc_read_sram(struct apple_smc *smc, void *buf, size_t size)
 {
@@ -283,6 +291,8 @@ int apple_smc_write_atomic(struct apple_smc *smc, smc_key key, const void *buf, 
 	u8 result;
 	int ret, poll_ret;
 	u64 msg;
+	ktime_t t0;
+	s64 us;
 
 	if (size > SMC_MAX_SIZE || size == 0)
 		return -EINVAL;
@@ -296,9 +306,17 @@ int apple_smc_write_atomic(struct apple_smc *smc, smc_key key, const void *buf, 
 	 * release its SRAM. Its late reply does: take it if it has arrived.
 	 */
 	if (smc->atomic_pending) {
-		ret = apple_rtkit_poll(smc->rtk);
-		if (ret < 0 || smc->atomic_pending)
+		/* Wait for the earlier command's late reply instead of giving up. */
+		ret = read_poll_timeout_atomic(apple_rtkit_poll, poll_ret,
+					       poll_ret < 0 || !smc->atomic_pending,
+					       100, SMC_ATOMIC_TIMEOUT_MS * USEC_PER_MSEC,
+					       false, smc->rtk);
+		if (poll_ret < 0 || smc->atomic_pending) {
+			dev_err(smc->dev, "atomic: earlier command still pending (%d/%d)\n",
+				ret, poll_ret);
 			return -EBUSY;
+		}
+		dev_warn(smc->dev, "atomic: earlier command's reply arrived late\n");
 	}
 
 	memcpy_toio(smc->shmem.iomem, buf, size);
@@ -317,10 +335,15 @@ int apple_smc_write_atomic(struct apple_smc *smc, smc_key key, const void *buf, 
 		return ret;
 	}
 
+	t0 = ktime_get();
 	ret = read_poll_timeout_atomic(apple_rtkit_poll, poll_ret,
 				       poll_ret < 0 || !smc->atomic_pending,
-				       100, SMC_TIMEOUT_MS * USEC_PER_MSEC,
+				       100, SMC_ATOMIC_TIMEOUT_MS * USEC_PER_MSEC,
 				       false, smc->rtk);
+	us = ktime_us_delta(ktime_get(), t0);
+	if (us > 100 * USEC_PER_MSEC || ret < 0 || smc->atomic_pending)
+		dev_warn(smc->dev, "atomic: key %p4ch reply after %lld us (ret %d)\n",
+			 &key, us, ret);
 	if (poll_ret < 0) {
 		dev_err(smc->dev, "RTKit poll failed (%llx)", msg);
 		return poll_ret;
@@ -523,6 +546,13 @@ static int apple_smc_probe(struct platform_device *pdev)
 		return dev_err_probe(smc->dev, ret, "Failed to get key count");
 	smc->key_count = be32_to_cpu(count);
 
+	/* Notifications, GPIO and power management are not qualified on T8152. */
+	if (of_device_is_compatible(dev->of_node, "apple,t8152-smc"))
+		return devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
+					    apple_smc_telemetry_devs,
+					    ARRAY_SIZE(apple_smc_telemetry_devs),
+					    NULL, 0, NULL);
+
 	/* Enable notifications */
 	apple_smc_write_flag(smc, SMC_KEY(NTAP), true);
 	ret = devm_add_action_or_reset(dev, apple_smc_disable_notifications, smc);
@@ -554,6 +584,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_smc_of_match[] = {
+	{ .compatible = "apple,t8152-smc" },
 	{ .compatible = "apple,t8103-smc" },
 	{ .compatible = "apple,smc" },
 	{},

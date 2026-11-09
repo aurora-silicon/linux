@@ -34,7 +34,7 @@ const _: () = assert!(core::mem::offset_of!(SubmitRecord, new_queue) == 0x17);
 
 impl SubmitRecord {
     /// The little-endian record bytes.
-    pub(crate) fn to_bytes(&self) -> [u8; 0x18] {
+    pub(crate) fn to_bytes(self) -> [u8; 0x18] {
         let mut b = [0u8; 0x18];
         b[0..8].copy_from_slice(&self.unk_0.to_le_bytes());
         b[8..16].copy_from_slice(&self.qinfo.to_le_bytes());
@@ -80,7 +80,7 @@ impl DevCtl {
     }
 
     /// The little-endian record bytes.
-    pub(crate) fn to_bytes(&self) -> [u8; 0x40] {
+    pub(crate) fn to_bytes(self) -> [u8; 0x40] {
         let mut b = [0u8; 0x40];
         for (i, w) in self.words.iter().enumerate() {
             b[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());

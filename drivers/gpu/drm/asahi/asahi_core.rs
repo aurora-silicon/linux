@@ -4,6 +4,7 @@
 //! Driver for the Apple AGX GPUs found in Apple Silicon SoCs.
 
 mod alloc;
+mod binding;
 mod buffer;
 mod channel;
 mod cleanup;
@@ -12,21 +13,25 @@ mod driver;
 mod event;
 mod file;
 mod float;
-mod fwid;
 mod fw;
-mod gem;
-mod g17;
+mod fwid;
 #[cfg(CONFIG_DRM_ASAHI_G15)]
 mod g15;
+mod g17;
+mod gem;
 
 #[cfg(CONFIG_DRM_ASAHI_G16)]
 mod g16;
+#[cfg(CONFIG_DRM_ASAHI_G18)]
+mod g18;
+#[cfg(CONFIG_DRM_ASAHI_M5)]
+mod m5;
 mod gpu;
 mod hw;
 mod initdata;
+mod m3;
 mod mem;
 mod memacct;
-mod m3;
 mod microseq;
 mod mmu;
 mod object;
@@ -35,8 +40,11 @@ mod queue;
 mod regs;
 mod slotalloc;
 mod stats;
+mod stats_busy;
+mod stats_raw;
 mod sysfs_exports;
 mod timestamp;
+mod usage;
 mod util;
 #[cfg(CONFIG_DRM_ASAHI_MAPLE_TREE)]
 mod vm;
@@ -75,6 +83,9 @@ struct DriverModule {
     _g15: G15Registration,
     // Field drop order unregisters/joins driver producers before queue teardown.
     _g16: Option<Pin<KBox<G16Registration>>>,
+    #[cfg(CONFIG_DRM_ASAHI_G18)]
+    #[pin]
+    _g18: kernel::driver::Registration<kernel::platform::Adapter<g18::probe::Driver>>,
     #[pin]
     _driver: kernel::driver::Registration<kernel::platform::Adapter<driver::AsahiPlatformDriver>>,
     _cleanup: cleanup::QueueOwner,
@@ -84,16 +95,20 @@ struct DriverModule {
 
 impl kernel::InPlaceModule for DriverModule {
     fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
+        // SAFETY: Module init runs once, before either adapter is registered below.
+        unsafe { binding::init() };
         try_pin_init!(Self {
             // Initialize the queue first, before registration can invoke probe.
             _cleanup: cleanup::QueueOwner::new()?,
             #[cfg(CONFIG_DRM_ASAHI_G15)]
-            _g15 <- kernel::driver::Registration::new(c"asahi-g15", module),
+            _g15 <- kernel::driver::Registration::new(c"aurora-g15", module),
             _driver <- kernel::driver::Registration::new(
                 <Self as kernel::ModuleMetadata>::NAME,
                 module,
             ),
             _g16: register_g16(module)?,
+            #[cfg(CONFIG_DRM_ASAHI_G18)]
+            _g18 <- kernel::driver::Registration::new(g18::probe::DRIVER_NAME, module),
             // All fallible fields are initialized. This final unit initializer cannot fail.
             #[cfg(CONFIG_DRM_ASAHI_G15)]
             _g15_ready: g15::activate(),
@@ -103,9 +118,10 @@ impl kernel::InPlaceModule for DriverModule {
 
 module! {
     type: DriverModule,
-    name: "asahi",
+    name: "aurora",
     description: "AGX GPU driver for Apple silicon SoCs",
     license: "Dual MIT/GPL",
+    alias: ["asahi"],
     params: {
         debug_flags: u64 {
             default: 0,
@@ -165,7 +181,7 @@ module! {
         },
         g15_pb_max_blocks: u32 {
             default: 3072,
-            description: "G15: parameter-buffer growth maximum given to the firmware, blocks of 128 KiB (1024..4095 in effect; the blocks above it, up to 4095, answer partial renders; the 512 MiB heap is allocated either way)",
+            description: "G15: PB growth maximum given to the firmware, 128 KiB blocks (64..4095)",
         },
         g15_early_tiling: u32 {
             default: 0,
@@ -191,6 +207,10 @@ module! {
         oom_attribution: u8 {
             default: 1,
             description: "Count held GPU memory in its creator's RSS for the OOM killer (1 = on)",
+        },
+        m5_fw_trace: u32 {
+            default: 0,
+            description: "M5: firmware trace classes (power bit 0, submission bit 1, recovery classifier bit 9)",
         },
         g16_deadline_ms: u32 {
             default: 5000,

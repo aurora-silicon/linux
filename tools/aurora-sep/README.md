@@ -102,6 +102,26 @@ and starts a match again by itself. When the kernel ends an enrolment because
 too many captures in a row were unusable (`SEP_BIO_STATUS_REJECTED`), the
 enrolment fails with that reason in fprintd's log, and fprintd reports
 `enroll-unknown-error`. Kernels from before these statuses never send them.
+
+Interface version 5 requires a resolved Unix uid, a known finger, the selected
+Linux SEP OS identity, a live identity count below three, a bound identity bag,
+and readable, writable owner/user/master Catacomb files before ENROL_START can
+schedule enclave capture. On an empty Linux lane, the driver prepares the owner
+context after libfprint validates the account; the user/master Catacombs are
+saved at the first completed enrolment. The matching aurora libfprint build
+rejects a missing passwd entry before either ioctl. A missing persistence file
+for an existing identity is an admission error; repair the binding rather than
+retrying a capture against unbound state.
+
+`sep-bio-identities` is the recovery interface for a print with no fprintd
+record. As root, run `sep-bio-identities` to list only the selected Linux OS
+identity's built-in SEP user context. Use `sep-bio-identities --delete-orphan
+UUID --keep GOOD_UUID` when another identity must remain. The kernel index may
+still hold a UUID whose fprintd record was lost, so compare the IDs carefully.
+The utility does not expose DELETE_ALL. Record the list and
+backup of any known-good print before deletion, and confirm the deleted UUID
+stays absent after a reboot. This path must be tested on the affected hardware
+before treating a deletion as a successful recovery.
 The device-specific `apple/mesa_calibration.bin` on m2 was recovered using
 the bundled [`extract-mesa-calibration.py`](extract-mesa-calibration.py), copied
 from [Gist revision `eb079a8007985d04e75182f20994f1a1c496f12e`](https://gist.github.com/DjDeveloperr/867a1961b861c570442724f48f770158/eb079a8007985d04e75182f20994f1a1c496f12e),
@@ -177,6 +197,26 @@ On Omarchy, run `omarchy-apply-lock` once after enrollment. The Quickshell
 lock screen then selects `omarchy-lock-fingerprint` automatically and accepts
 Touch ID through fprintd. Hyprlock's separate fingerprint switch is not used
 by the Quickshell lock screen.
+
+## Checking the SEP state
+
+`aurora-sep status` prints every state the driver reports, one line each
+with PASS, WARN, FAIL or INFO: the attach, the twelve endpoints by name
+(macOS lists the same twelve as `sep-endpoint,<name>` services), the
+bring-up time, the key store and identity keybag, xART, the OS identity
+(and the os_uuid pin on the MacBook Neo), the hwrng, Touch ID, the sensor,
+the fingerprint restore and matching, the xART guard, failed xART
+requests, unhandled messages, sleep, `aurora-sep-ready.service` and the
+apple_sep error and warning lines of this boot. It exits 1 if anything
+FAILed. `--summary` prints only the last line, `--quiet` hides PASS and
+INFO lines and `--json` prints the report as JSON.
+
+It only reads: it never opens `/dev/sep-bio`, since that activates Touch
+ID. Run as root and with the enclave as the current hwrng, it reads 32
+bytes from `/dev/hwrng`, which shows that the enclave still answers, also
+after a resume; `--no-live` skips that. The kernel log check needs root.
+Older kernels without some of the diag attributes are checked on what
+they have (the endpoint count instead of the names, for example).
 
 ## Packages
 

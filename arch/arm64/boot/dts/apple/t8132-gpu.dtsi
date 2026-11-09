@@ -1,0 +1,102 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The T8132 G16 GPU, its ASC mailbox and the outer GFX power gate (TVM),
+ * as on the J713. The GPU depends on the 26.6.2 firmware, not the board: the
+ * boot loader fills the inherited UAT and firmware ranges (reg), enables
+ * them and publishes the handoff, or disables the GPU.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+	aliases {
+		gpu = &gpu;
+	};
+
+	reserved-memory {
+		gpu_ttbs: uat-ttbs {
+			no-map;
+			status = "disabled";
+		};
+
+		gpu_pagetables: uat-pagetables {
+			no-map;
+			status = "disabled";
+		};
+
+		gpu_handoff: uat-handoff {
+			no-map;
+			status = "disabled";
+		};
+
+		gpu_shared_l2: uat-shared-l2 {
+			no-map;
+			status = "disabled";
+		};
+
+		gpu_fw_text: gpu-fw-text {
+			no-map;
+			status = "disabled";
+		};
+
+		gpu_fw_data: gpu-fw-data {
+			no-map;
+			status = "disabled";
+		};
+	};
+};
+
+&soc {
+	gfx_tvm: power-controller@380760800 {
+		compatible = "apple,t8132-gfx-tvm";
+		reg = <0x3 0x80760800 0x0 0x4>;
+		#power-domain-cells = <0>;
+	};
+
+	gpu: gpu@302600000 {
+		compatible = "apple,agx-t8132";
+		reg = <0x3 0x02600000 0x0 0x4000>,
+		      <0x3 0x00000000 0x0 0x4000000>;
+		reg-names = "asc", "sgx";
+		mboxes = <&agx_mbox>;
+		power-domains = <&ps_gfx>;
+		/* G16 is admitted on non-coherent DMA only. */
+		dma-noncoherent;
+		apple,pmp = <&pmp>;
+		apple,clpc = <&clpc>;
+		memory-region = <&gpu_ttbs>, <&gpu_pagetables>, <&gpu_handoff>,
+				<&gpu_shared_l2>, <&gpu_fw_text>, <&gpu_fw_data>;
+		memory-region-names = "ttbs", "pagetables", "handoff",
+				      "shared-l2", "fw-text", "fw-data";
+	};
+
+	agx_mbox: mailbox@302608000 {
+		compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x02608000 0x0 0x4000>;
+		/* Idle ring-service kicks need not wake the system. */
+		apple,hold-rx-in-sleep;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 993 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 994 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 995 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 996 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+};
+
+/* The outer TVM gate is the parent of the GFX PMGR domain. */
+&ps_gfx {
+	power-domains = <&gfx_tvm>;
+	/* The G16 firmware stays live across suspend-to-idle. */
+	apple,sleep-retained;
+};
+
+/* The existing report provider owns readiness for shared PMP commands. */
+&pmp {
+	apple,pmp-report = <&pmp_report>;
+};

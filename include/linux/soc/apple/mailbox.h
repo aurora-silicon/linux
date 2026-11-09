@@ -64,6 +64,8 @@ struct apple_mbox {
 	bool active;
 	bool ascwrap_v6_cpu_running;
 	bool removing;
+	/* apple,hold-rx-in-sleep: receive IRQ masked across system sleep */
+	bool hold_rx_in_sleep;
 
 	int irq_recv_not_empty;
 	int irq_send_empty; /* < 0: no send-empty IRQ, TX polls */

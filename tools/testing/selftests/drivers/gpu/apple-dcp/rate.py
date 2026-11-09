@@ -45,7 +45,9 @@ def parser_fixture(root):
     source = (base / 'parser.c').read_text()
     parser = source[source.index('#define DCP_PARSE_HEADER'):source.index('int parse_epic_service_init(')]
     metadata = (base / 'dcp-display-metadata.h').read_text()
-    metadata = block(metadata, 'struct dcp_display_metadata {') + ';\n'
+    metadata = (block(metadata, 'struct dcp_display_metadata {') + ';\n' +
+                block(metadata, 'enum dcp_panel_gamut {') + ';\n' +
+                block(metadata, 'struct dcp_color_space {') + ';\n')
     header = (base / 'parser.h').read_text()
     header = header[header.index('struct apple_dcp;'):header.index('int parse(')]
     refresh = (base / 'dcp-refresh.h').read_text().replace('#include <linux/types.h>', '')
@@ -556,6 +558,8 @@ struct apple_dcp {
     struct dcp_display_mode *modes;
     struct { bool holding, stopped; } announce;
     bool ext_backlight, has_panel;
+    /* External pipes carry no internal panel identity. */
+    void *panel_identity;
 };
 struct rate_guard { bool *lock; };
 static struct rate_guard rate_lock(bool *p) { assert(!*p);*p=true;return (struct rate_guard){p}; }
@@ -1105,6 +1109,65 @@ static void failed_replacements(void) {
         unit=re.sub(r'\blookup_mode\((&d,&[\w.\[\]]+)\)', r'lookup_mode(\1,NULL)', unit)
     return {**locals(), "block": block}
 
+
+def panel_dimensions(root):
+    n = publication(root)
+    unit, block = n['unit'], n['block']
+    unit = unit.replace('bool modes_lock,modes_admitted,',
+                        'bool external_physically_absent,modes_lock,modes_admitted,', 1)
+    # The connector's physical size, which DRM keeps in display_info.
+    old = 'struct { struct { unsigned min_vfreq,max_vfreq; } monitor_range; } display_info;'
+    assert unit.count(old) == 1
+    unit = unit.replace(old, 'struct { struct { unsigned min_vfreq,max_vfreq; } monitor_range; '
+                        'int width_mm,height_mm; } display_info;')
+    dcp = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
+    unit = unit.replace(block(unit, 'static bool __attribute__((unused)) dcp_has_panel('),
+                        block(dcp, 'bool dcp_has_panel('))
+    unit = unit.replace(block(unit, 'static void dcp_update_connector_dimensions('),
+                        block(dcp, 'void dcp_update_connector_dimensions('))
+    # Ordinary panel modes do not take the 180 Hz exception's metadata lock.
+    unit = unit.replace('probing->dcpavserv.lock && probing->metadata.lock',
+                        'probing->dcpavserv.lock && '
+                        '(!probing->modes[0].automatic_rgb8_quirk || probing->metadata.lock)')
+    # Model DRM's display_info reset and the absence of an internal AV EDID.
+    unit = unit.replace(block(unit, 'static int drm_edid_connector_update('), r"""
+static int drm_edid_connector_update(struct drm_connector *c,const struct drm_edid *e) {
+    assert(c->dev->mode_config.mutex);
+    c->display_info.width_mm=e ? 600 : 0;
+    c->display_info.height_mm=e ? 330 : 0;
+    return fail_update ? -EIO : 0;
+}
+""")
+    unit = unit.replace('if(!d->dcpavserv.enabled || !d->dcpavserv.service',
+                        'if(dcp_has_panel(d)) return ERR_PTR(-ENODEV);\n'
+                        '    if(!d->dcpavserv.enabled || !d->dcpavserv.service')
+    checks = r"""
+static void panel_dimension_probes(void) {
+    reset();callbacks(false);callbacks(true);timings();admit(0);probe(true);
+    assert(con.base.display_info.width_mm==600 && con.base.display_info.height_mm==330);
+    d.panel.width_mm=302;d.panel.height_mm=196;d.width_mm=0;d.height_mm=0;
+    d.modes[0].automatic_rgb8_quirk=false;
+    con.edid_invalidation_pending=true;probe(true);
+    assert(!con.drm_edid);
+    assert(con.base.display_info.width_mm==302 && con.base.display_info.height_mm==196);
+    con.edid_invalidation_pending=true;probe(true);
+    assert(con.base.display_info.width_mm==302 && con.base.display_info.height_mm==196);
+    d.width_mm=300;d.height_mm=190;con.edid_invalidation_pending=true;probe(true);
+    assert(con.base.display_info.width_mm==300 && con.base.display_info.height_mm==190);
+    d.width_mm=0;d.height_mm=190;con.edid_invalidation_pending=true;probe(true);
+    assert(con.base.display_info.width_mm==302 && con.base.display_info.height_mm==196);
+    cleanup();
+    reset();callbacks(false);callbacks(true);timings();admit(0);probe(true);
+    assert(con.base.display_info.width_mm==600 && con.base.display_info.height_mm==330);
+    cleanup();
+    puts("PASS: internal panel dimensions survive repeated EDID clears; firmware size and DT fallback; external EDID size preserved");
+}
+"""
+    unit = unit.replace('int main(int argc,char **argv) {',
+                        checks + 'int main(int argc,char **argv) {')
+    return unit.replace('    transport_edid=raw;',
+                        '    transport_edid=raw;panel_dimension_probes();', 1)
+
 def hotplug(root):
     n = publication(root)
     unit = n['unit']
@@ -1125,6 +1188,10 @@ u32 lane_count, link_rate;''')
 #define LINK_RATE_HBR2 0x14
 #define PHY_MODE_DP 1
 #define trace_dptxport_call_set_link_rate(...) ((void)0)
+/* Not a T8132 dcpext: its DRM outputs never follow this link. */
+static bool dcp_is_t8132_ext(const struct apple_dcp *d) { (void)d; return false; }
+struct device;
+static void t8132_ext_drm_hotplug(struct device *dcpext) { (void)dcpext; assert(!"T8132 dcpext hotplug in an H17P scenario"); }
 static unsigned phy_capacity=2, phy_calls, hardware_rate, hardware_lanes;
 static int validate_error;
 static int phy_validate(void *phy,int mode,int submode,union phy_configure_opts *o) {

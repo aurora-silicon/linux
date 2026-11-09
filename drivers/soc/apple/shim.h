@@ -44,6 +44,7 @@ void sep_hwrng_unregister(void *mem);
 void *sep_store_open(const char *path);
 void *sep_store_open_host(const char *path, bool *created);
 void *sep_store_open_trunc(const char *path);
+void *sep_store_open_writable_existing(const char *path);
 void *sep_store_open_ro(const char *path);
 void *sep_store_open_block(const char *path, int writable);
 void sep_store_close(void *handle);
@@ -174,6 +175,16 @@ int sep_sensor_irq_wait(unsigned int timeout_ms);
 #define SEP_DIAG_MATCHING_UNVERIFIED	2
 #define SEP_DIAG_MATCHING_BLOCKED	3
 
+/* Mirrored by diag.rs (OsIdentity). */
+#define SEP_DIAG_OS_IDENTITY_UNKNOWN		0
+#define SEP_DIAG_OS_IDENTITY_EXPLICIT		1
+#define SEP_DIAG_OS_IDENTITY_CHOSEN		2
+#define SEP_DIAG_OS_IDENTITY_UNAVAILABLE	3
+
+#define SEP_DIAG_HWRNG_PENDING		0
+#define SEP_DIAG_HWRNG_REGISTERED	1
+#define SEP_DIAG_HWRNG_FAILED		2
+
 struct device;
 
 int sep_diag_register(struct device *dev, const char *profile,
@@ -193,6 +204,13 @@ void sep_diag_set_xart_guard(unsigned int level, bool list_loaded,
 			     int matching);
 void sep_diag_xart_guard_refused(int matching);
 void sep_diag_bringup_ended(void);
+void sep_diag_set_endpoint(u8 id, u32 name);
+void sep_diag_set_os_identity(int source);
+void sep_diag_set_hwrng(bool registered);
+unsigned int sep_diag_xarm_failed(void);
+unsigned int sep_diag_unhandled(void);
+void sep_diag_sleep(bool entering);
+void sep_diag_log_summary(struct device *dev);
 
 /* -- bio_shim.c --------------------------------------------------------- */
 

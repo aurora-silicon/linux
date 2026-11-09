@@ -152,7 +152,8 @@ def arm(data):
         os.close(fd)
     os.rename(tmp, ALLOW)
     fsync_dir(os.path.dirname(ALLOW))
-    subprocess.run(["restorecon", ALLOW], check=False, capture_output=True)
+    if shutil.which("restorecon"):  # absent on distros without SELinux (Arch)
+        subprocess.run(["restorecon", ALLOW], check=False, capture_output=True)
 
 
 def status(log):

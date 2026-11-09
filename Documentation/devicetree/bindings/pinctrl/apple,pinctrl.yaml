@@ -23,10 +23,15 @@ properties:
               - apple,t6030-pinctrl
               - apple,t6031-pinctrl
               - apple,t6041-pinctrl
+              - apple,t6050-pinctrl
               - apple,t8122-pinctrl
               - apple,t8132-pinctrl
               - apple,t8140-pinctrl
+              - apple,t8152-pinctrl
           - const: apple,t8103-pinctrl
+      - items:
+          - const: apple,t6050-pinctrl
+          - const: apple,t8132-pinctrl
       - items:
           # Do not add additional SoC to this list.
           - enum:

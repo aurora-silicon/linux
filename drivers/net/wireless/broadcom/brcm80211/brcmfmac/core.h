@@ -226,11 +226,13 @@ struct brcmf_fws_mac_descriptor;
  *	netif stopped due to flowring full.
  * @BRCMF_NETIF_STOP_REASON_DISCONNECTED:
  *	netif stopped due to not being connected (STA mode).
+ * @BRCMF_NETIF_STOP_REASON_BUS: bus is unavailable for transmission.
  */
 enum brcmf_netif_stop_reason {
 	BRCMF_NETIF_STOP_REASON_FWS_FC = BIT(0),
 	BRCMF_NETIF_STOP_REASON_FLOW = BIT(1),
-	BRCMF_NETIF_STOP_REASON_DISCONNECTED = BIT(2)
+	BRCMF_NETIF_STOP_REASON_DISCONNECTED = BIT(2),
+	BRCMF_NETIF_STOP_REASON_BUS = BIT(3)
 };
 
 /**
@@ -281,6 +283,7 @@ char *brcmf_ifname(struct brcmf_if *ifp);
 struct brcmf_if *brcmf_get_ifp(struct brcmf_pub *drvr, int ifidx);
 void brcmf_configure_arp_nd_offload(struct brcmf_if *ifp, bool enable);
 int brcmf_net_attach(struct brcmf_if *ifp, bool locked);
+bool brcmf_has_awdl_interface(struct brcmf_pub *drvr);
 struct brcmf_if *brcmf_add_if(struct brcmf_pub *drvr, s32 bsscfgidx, s32 ifidx,
 			      bool is_p2pdev, const char *name, u8 *mac_addr);
 void brcmf_remove_interface(struct brcmf_if *ifp, bool locked);
