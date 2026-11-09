@@ -36,6 +36,13 @@
 #include "../../../arch/arm64/boot/dts/apple/t8132-j713-pmgr.dtsi"
 #include "../../../arch/arm64/boot/dts/apple/t8132-memory.dtsi"
 
+/* The J713's SEP domain, for its deep sleep: every other board keeps it off. */
+&ps_sep {
+	apple,firmware-owned;
+	status = "okay";
+	apple,policy-machine = "apple,j713";
+};
+
 &mcc {
 	apple,boot-dma-devices = <&pmp>;
 };
