@@ -91,11 +91,29 @@
 };
 
 &nub_spmi1 {
+	status = "okay";
+
 	pmic@e {
 		compatible = "apple,maverick-pmic", "apple,spmi-nvmem";
 		reg = <0xe SPMI_USID>;
 		read-only;
-		status = "disabled";
+		status = "okay";
+	};
+
+	spmi-device@d {
+		status = "okay";
+	};
+};
+
+&aop_spmi0 {
+	status = "okay";
+
+	spmi-device@e {
+		status = "okay";
+	};
+
+	spmi-device@f {
+		status = "okay";
 	};
 };
 

@@ -40,8 +40,10 @@
 		status = "disabled";
 	};
 	spmi-device@d {
-		compatible = "apple,t6000-viper-spmi", "apple,viper-spmi";
+		compatible = "apple,t6000-viper-spmi", "apple,viper-spmi",
+			     "apple,spmi-nvmem";
 		reg = <0xd SPMI_USID>;
+		read-only;
 		status = "disabled";
 	};
 };
@@ -103,13 +105,17 @@
 	interrupt-controller;
 	#interrupt-cells = <2>;
 	spmi-device@e {
-		compatible = "apple,t6000-wifibt-pmu", "apple,radio-pmu";
+		compatible = "apple,t6000-wifibt-pmu", "apple,radio-pmu",
+			     "apple,spmi-nvmem";
 		reg = <0xe SPMI_USID>;
+		read-only;
 		status = "disabled";
 	};
 	spmi-device@f {
-		compatible = "apple,t6000-uwb-pmu", "apple,radio-pmu";
+		compatible = "apple,t6000-uwb-pmu", "apple,radio-pmu",
+			     "apple,spmi-nvmem";
 		reg = <0xf SPMI_USID>;
+		read-only;
 		status = "disabled";
 	};
 };
