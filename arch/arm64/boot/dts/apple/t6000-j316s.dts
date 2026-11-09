@@ -126,6 +126,11 @@
 	};
 };
 
+/* No ADT device behind i2c5; enabled for bus scans. */
+&i2c5 {
+	status = "okay";
+};
+
 &sound {
 	compatible = "apple,j316-macaudio", "apple,macaudio";
 	model = "MacBook Pro J316";
