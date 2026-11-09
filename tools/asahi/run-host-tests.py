@@ -57,6 +57,10 @@ ASAHI_TESTS = {
     # The old revision reports a DART fault that clears before the second latch read as success.
     'ane-tm-transient-fault-tests.py': [([], PASS),
                                         (['--old-ref', 'b50066848322c6799c1433ee3a358aab2e9faabb'], PASS)],
+    'queue-priority-tests.py': [([], PASS)],
+    'test-m3-power.py': [([], PASS)],
+    'test-m3-uapi.py': [([], PASS)],
+    'test-m3-mailbox.py': [([], PASS)],
     'test-j613-dcp-power.py': [([], PASS)],
     'aop-als-channel-tests.py': [([], PASS)],
     'aop-bootargs-tests.py': [([], PASS)],
@@ -187,6 +191,7 @@ ASAHI_SHELL = ['g17-ray-query-timeout-tests.sh']
 
 # Production G17 decoder vectors also build directly with rustc --test.
 ASAHI_RUST += ['g17-telemetry-tests.rs', 'legacy-frequency-tests.rs']
+ASAHI_RUST.append('m3-firmware-tests.rs')
 
 # Python that runs on the host but imports its neighbours, so it keeps the
 # script directory on sys.path (-E -s instead of -I).
@@ -203,6 +208,9 @@ SUITES = [
 def jobs(work, conf, dtc):
     found = {p.name for p in ASAHI.iterdir()
              if re.search(r'-tests\.(py|rs|sh)$', p.name) and p.name != Path(__file__).name}
+    # This Rust fixture is compiled and executed by the paired-header wrapper.
+    if 'test-m3-uapi.py' in ASAHI_TESTS:
+        found.discard('m3-uapi-tests.rs')
     known = set(ASAHI_TESTS) | set(ASAHI_RUST) | set(ASAHI_SHELL)
     missing = sorted(found - known)
     gone = sorted(name for name in known if not (ASAHI / name).is_file())

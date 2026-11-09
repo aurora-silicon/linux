@@ -361,6 +361,14 @@ pub(crate) trait Gpu: Send + Sync {
     fn base_clock_hz(&self) -> u32;
     /// Return the GPU address space geometry.
     fn uat_geometry(&self) -> mmu::UatGeometry;
+    /// Admit a client's parameter ABI before creating its VM.
+    fn admit_vm(&self, _dev: &kernel::device::Device, _params_size: u64, _flags: u32) -> Result {
+        Ok(())
+    }
+    /// GPU VA of each VM's dummy page, which must match the address the firmware was given.
+    fn unknown_page(&self) -> u64 {
+        self.uat_geometry().unk_page()
+    }
     /// Create a new `Vm` with the given range reserved for kernel-managed objects.
     fn new_vm(&self, kernel_range: Range<u64>) -> Result<mmu::Vm>;
     /// Create a VM charged to a DRM file when the backend bounds retained bindings.

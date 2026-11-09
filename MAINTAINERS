@@ -2794,9 +2794,11 @@ F:	tools/asahi/apple-pwm-pm-tests.py
 F:	drivers/reset/reset-apple-cio.c
 F:	drivers/rtc/rtc-macsmc.c
 F:	drivers/soc/apple/*
+F:	tools/asahi/m3-uapi-*
 F:	drivers/soc/apple/clpc.kunitconfig
 F:	tools/asahi/pmp-bootargs-tests.rs
 F:	drivers/spi/spi-apple-test.c
+F:	tools/asahi/test-m3-uapi.py
 F:	drivers/spi/spi-apple.c
 F:	drivers/spmi/spmi-apple-controller.c
 F:	drivers/thermal/apple-pmp*
