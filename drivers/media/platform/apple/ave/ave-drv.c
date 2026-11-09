@@ -20,6 +20,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/soc/apple/tunable.h>
 
 #include "ave.h"
 #include "ave-regs.h"
@@ -59,9 +60,58 @@ const struct ave_variant ave_t6000 = {
 	.timebase_multiplier = 1000000,
 	.vcbar_mask = 0x0000000ffffff800ULL,
 	.vcbar_flags = 0x0102000000000000ULL,
+	.text_link_cell = 0x423c,
+	.zero_based_firmware = true,
 
 	.extra0_size = 0x24,
 	.boot_qualified = true,
+};
+
+/*
+ * T8112 DPE cold defaults (CAT at codec +0xdc000, CAC at +0xdc400). The
+ * encoder powers up with the QoS arbiter unprogrammed and the 6070
+ * firmware idles before its first hello until these are set.
+ */
+#define AVE_T8112_CAT	0xdc000
+#define AVE_T8112_CAC	0xdc400
+
+static const u16 ave_t8112_cac_levels[] = {
+	/* CAC +0x0a8 */
+	0x01, 0x01, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01,
+	0x04, 0x03, 0x00, 0x00, 0x02, 0x02, 0x01, 0x00,
+	/* CAC +0x0e8 */
+	0x02, 0x02, 0x04, 0x03, 0x06, 0x04, 0x02, 0x02,
+	0x03, 0x02, 0x01, 0x01, 0x02, 0x02, 0x01, 0x01,
+	/* CAC +0x128 */
+	0x00, 0x00, 0x07, 0x07, 0x0c, 0x0c, 0x09, 0x09,
+	0x03, 0x02, 0x04, 0x04, 0x06, 0x05, 0x01, 0x01,
+	/* CAC +0x168 */
+	0x01, 0x01, 0x04, 0x03, 0x06, 0x05, 0x04, 0x04,
+	0x05, 0x05, 0x0a, 0x09, 0x0a, 0x09, 0x10, 0x10,
+	/* CAC +0x1a8 */
+	0x10, 0x10, 0x22, 0x12, 0x22, 0x12, 0x02, 0x02,
+	0x24, 0x17, 0x3a, 0x22, 0x03, 0x03, 0x10, 0x0d,
+	/* CAC +0x1e8 */
+	0x00, 0x00,
+};
+
+static const struct ave_dpe_rmw ave_t8112_dpe_rows[] = {
+	{ AVE_T8112_CAT + 0x004, 0xffffffff, 0x00001000, 1 },
+	{ AVE_T8112_CAC + 0x000, 0x01ff0000, 0x00030000, 1 },
+	{ AVE_T8112_CAC + 0x004, 0x00000001, 1, 40 },
+	{ AVE_T8112_CAC + 0x0a4, 0x00000001, 0, 1 },
+	{ AVE_T8112_CAC + 0x0a8, 0x000001ff, 0,
+	  ARRAY_SIZE(ave_t8112_cac_levels), ave_t8112_cac_levels },
+	/* Bit 1 is a command and reads back 0. */
+	{ AVE_T8112_CAC + 0x000, 0x00000003, 0x00000003, 1, NULL, 0x00000001 },
+	{ AVE_T8112_CAT + 0x000, 0x00000001, 0x00000001, 1 },
+};
+
+static const struct ave_dpe_table ave_t8112_dpe = {
+	.rows = ave_t8112_dpe_rows,
+	.count = ARRAY_SIZE(ave_t8112_dpe_rows),
+	.cat = AVE_T8112_CAT,
+	.cac = AVE_T8112_CAC,
 };
 
 const struct ave_variant ave_t8112 = {
@@ -76,6 +126,11 @@ const struct ave_variant ave_t8112 = {
 	.timebase_multiplier = 1,
 	.vcbar_mask = 0x000003fffffff800ULL,
 	.vcbar_flags = 0x0102000000000000ULL,
+	.text_link_cell = 0x423c,
+	.mbox_idle = 0x38,
+	.restore_data_first = true,
+	.zero_based_firmware = true,
+	.dpe = &ave_t8112_dpe,
 
 	.extra0_size = 0x4000,
 	.boot_qualified = true,
@@ -218,6 +273,7 @@ static const char *const ave_pd_names[] = { "dma", "pipe4", "pipe5", "me0",
 static int ave_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	struct resource *pio_res;
 	bool perf = of_property_match_string(dev->of_node, "power-domain-names",
 					     "perf") >= 0;
 	const struct dev_pm_domain_attach_data pd_data = {
@@ -247,6 +303,21 @@ static int ave_probe(struct platform_device *pdev)
 	ave->coproc = devm_platform_ioremap_resource_byname(pdev, "coproc");
 	if (IS_ERR(ave->coproc))
 		return PTR_ERR(ave->coproc);
+	if (of_property_present(dev->of_node, "apple,tunable-axi2af")) {
+		pio_res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "pio");
+		if (!pio_res)
+			return dev_err_probe(dev, -EINVAL,
+					     "AXI2AF tunables need a pio resource\n");
+		ave->pio = devm_platform_ioremap_resource_byname(pdev, "pio");
+		if (IS_ERR(ave->pio))
+			return PTR_ERR(ave->pio);
+		ave->axi2af = devm_apple_tunable_parse(dev, dev->of_node,
+						       "apple,tunable-axi2af",
+						       pio_res);
+		if (IS_ERR(ave->axi2af))
+			return dev_err_probe(dev, PTR_ERR(ave->axi2af),
+					     "invalid AXI2AF tunables\n");
+	}
 
 	ave->domain = iommu_get_domain_for_dev(dev);
 	if (!ave->domain || !(ave->domain->type & __IOMMU_DOMAIN_PAGING))

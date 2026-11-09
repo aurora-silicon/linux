@@ -30,6 +30,7 @@ struct debugfs_blob_wrapper;
 struct dentry;
 struct dev_pm_domain_list;
 struct iommu_domain;
+struct apple_tunable;
 struct ave_vb2_mem;
 
 /* Frames the firmware can hold at once per session (Process "slots"). */
@@ -156,6 +157,30 @@ struct ave_coproc_regs {
 	u32 keep_mappings;
 };
 
+/*
+ * One row of masked 32-bit read-modify-writes in the DPE, at codec resource
+ * offsets: new = (old & ~mask) | value. A row covers count consecutive
+ * registers 4 bytes apart; values, when set, gives each register its own
+ * value in place of value.
+ */
+struct ave_dpe_rmw {
+	u32 offset;
+	u32 mask;
+	u32 value;
+	u32 count;
+	const u16 *values;
+	/* Bits that keep their value; 0 means all of mask. */
+	u32 retained;
+};
+
+struct ave_dpe_table {
+	const struct ave_dpe_rmw *rows;
+	unsigned int count;
+	/* CAT and CAC block bases, for the read-only hello-timeout snapshot. */
+	u32 cat;
+	u32 cac;
+};
+
 struct ave_variant {
 	const struct ave_coproc_regs *regs;
 	u32 fw_text_size;
@@ -168,6 +193,22 @@ struct ave_variant {
 	u32 timebase_multiplier;
 	u64 vcbar_mask;
 	u64 vcbar_flags;
+	/*
+	 * TEXT offset of the 64-bit cell the loader fills with the DATA
+	 * address; it is zero in the firmware image. 0 when there is none.
+	 */
+	u32 text_link_cell;
+	/*
+	 * Mailbox offset of the SVE idle (clock gating) word that must read 0
+	 * before the firmware starts, or 0 when the variant has none.
+	 */
+	u32 mbox_idle;
+	/* Restore DATA from the boot snapshot before every start, the first included. */
+	bool restore_data_first;
+	/* Preloaded TEXT starts at DART address zero and DATA follows it. */
+	bool zero_based_firmware;
+	/* DPE defaults applied before every cold firmware start, or NULL. */
+	const struct ave_dpe_table *dpe;
 
 	size_t extra0_size;
 	/* Register sequence and boot/hello configuration have been qualified. */
@@ -181,6 +222,8 @@ struct ave_dev {
 	void __iomem *codec;
 	void __iomem *mbox;
 	void __iomem *coproc;
+	void __iomem *pio;
+	struct apple_tunable *axi2af;
 	struct dev_pm_domain_list *pd_list;
 	struct iommu_domain *domain;
 
@@ -382,6 +425,11 @@ extern const struct ave_variant ave_t6000, ave_t8112;
 /* ave-fw.c */
 u64 ave_fw_vcbar(const struct ave_variant *variant, u64 text_iova);
 int ave_fw_probe(struct ave_dev *ave);
+int ave_fw_text_id_crc(const void *text, size_t size, u32 cell_off,
+		       u64 data_iova, u32 *crc);
+void ave_dpe_apply(void __iomem *codec, const struct ave_dpe_table *t);
+unsigned int ave_dpe_check(void __iomem *codec, const struct ave_dpe_table *t,
+			   struct device *dev);
 void ave_fw_remove(struct ave_dev *ave);
 int ave_fw_ensure_running(struct ave_dev *ave);
 void ave_fw_halt(struct ave_dev *ave);

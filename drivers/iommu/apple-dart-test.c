@@ -418,6 +418,97 @@ static struct apple_dart *apple_dart_test_tunnel(struct kunit *test)
 	return dart;
 }
 
+static void apple_dart_test_set_tunable(struct kunit *test,
+					struct apple_dart *dart, u32 offset,
+					u32 mask, u32 value)
+{
+	struct apple_tunable *tunable;
+
+	tunable = kunit_kzalloc(test, struct_size(tunable, values, 1),
+				GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, tunable);
+	tunable->sz = 1;
+	tunable->values[0].offset = offset;
+	tunable->values[0].mask = mask;
+	tunable->values[0].value = value;
+	dart->tunables = tunable;
+}
+
+static void apple_dart_test_tunable_field_mask(struct kunit *test)
+{
+	struct apple_dart *dart = apple_dart_test_tunnel(test);
+
+	dart->tunneled = false;
+	dart->hw = &apple_dart_hw_t8103;
+	apple_dart_test_set_tunable(test, dart, 0x68, 0x0000ff00, 0x00004200);
+	writel(0xa5a500f0, dart->regs + 0x68);
+
+	apple_dart_apply_checked_tunables(dart);
+
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + 0x68), 0xa5a542f0U);
+	KUNIT_EXPECT_FALSE(test, dart->tunable_mismatch_reported);
+}
+
+static void apple_dart_test_tunable_locked_readback(struct kunit *test)
+{
+	struct apple_dart *dart = apple_dart_test_tunnel(test);
+
+	dart->tunneled = false;
+	dart->hw = &apple_dart_hw_t8103;
+	apple_dart_test_set_tunable(test, dart, 0x68, 0x0000ff00, 0x00004200);
+	writel(0xa5a500f0, dart->regs + 0x68);
+	dart->locked = true;
+
+	apple_dart_apply_checked_tunables(dart);
+
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + 0x68), 0xa5a500f0U);
+	KUNIT_EXPECT_TRUE(test, dart->tunable_mismatch_reported);
+
+	/* The live lock bit is authoritative even before dart->locked is set. */
+	dart->locked = false;
+	dart->tunable_mismatch_reported = false;
+	writel(dart->hw->lock_bit, dart->regs + dart->hw->lock);
+	apple_dart_apply_checked_tunables(dart);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + 0x68), 0xa5a500f0U);
+	KUNIT_EXPECT_TRUE(test, dart->tunable_mismatch_reported);
+}
+
+static void apple_dart_test_drop_tunable_write(struct apple_dart *dart,
+					       u32 value, u32 offset)
+{
+}
+
+static void apple_dart_test_tunable_readback_mismatch(struct kunit *test)
+{
+	struct apple_dart *dart = apple_dart_test_tunnel(test);
+
+	dart->tunneled = false;
+	dart->hw = &apple_dart_hw_t8103;
+	apple_dart_test_set_tunable(test, dart, 0x68, 0x0000ff00, 0x00004200);
+	writel(0xa5a500f0, dart->regs + 0x68);
+	kunit_activate_static_stub(test, apple_dart_writel,
+				   apple_dart_test_drop_tunable_write);
+
+	apple_dart_apply_checked_tunables(dart);
+
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + 0x68), 0xa5a500f0U);
+	KUNIT_EXPECT_TRUE(test, dart->tunable_mismatch_reported);
+	kunit_deactivate_static_stub(test, apple_dart_writel);
+}
+
+static void apple_dart_test_tunable_tunnel_unchanged(struct kunit *test)
+{
+	struct apple_dart *dart = apple_dart_test_tunnel(test);
+
+	apple_dart_test_set_tunable(test, dart, 0x68, 0x0000ff00, 0x00004200);
+	writel(0xa5a500f0, dart->regs + 0x68);
+
+	apple_dart_apply_probe_tunables(dart);
+
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + 0x68), 0xa5a542f0U);
+	KUNIT_EXPECT_FALSE(test, dart->tunable_mismatch_reported);
+}
+
 static void apple_dart_test_tunnel_restore(struct kunit *test)
 {
 	struct apple_dart *dart = apple_dart_test_tunnel(test);
@@ -682,7 +773,18 @@ static struct apple_dart *apple_dart_test_sleeping(struct kunit *test)
 static void apple_dart_test_resume_retained(struct kunit *test)
 {
 	struct apple_dart *dart = apple_dart_test_sleeping(test);
+	struct apple_tunable *tunable;
 	u32 enable = dart->hw->enable_streams;
+
+	tunable = kunit_kzalloc(test, struct_size(tunable, values, 1),
+				GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, tunable);
+	tunable->sz = 1;
+	tunable->values[0].offset = 0x60;
+	tunable->values[0].mask = 0xff;
+	tunable->values[0].value = 0x42;
+	dart->tunables = tunable;
+	writel(0x77, dart->regs + 0x60);
 
 	/* The domain stayed on and a consumer may still be doing DMA: no reset. */
 	writel(0, dart->regs + enable);
@@ -691,15 +793,27 @@ static void apple_dart_test_resume_retained(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TCR(dart, 2)), 0x82U);
 	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TTBR(dart, 2, 0)),
 			dart->hw->ttbr_valid | 0x1000);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + 0x60), 0x77U);
 }
 
 static void apple_dart_test_resume_lost(struct kunit *test)
 {
 	struct apple_dart *dart = apple_dart_test_sleeping(test);
+	struct apple_tunable *tunable;
 
-	/* Power was cut: reset and restore the saved translations. */
+	tunable = kunit_kzalloc(test, struct_size(tunable, values, 1),
+				GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, tunable);
+	tunable->sz = 1;
+	tunable->values[0].offset = 0x60;
+	tunable->values[0].mask = 0xff;
+	tunable->values[0].value = 0x42;
+	dart->tunables = tunable;
+
+	/* Power was cut: reapply tunables, reset, and restore translations. */
 	memset_io(dart->regs, 0, APPLE_DART_TEST_REGS_SIZE);
 	KUNIT_EXPECT_EQ(test, apple_dart_resume(dart->dev), 0);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + 0x60), 0x42U);
 	KUNIT_EXPECT_EQ(test, readl(dart->regs + dart->hw->enable_streams), U32_MAX);
 	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TCR(dart, 2)), 0x82U);
 	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TTBR(dart, 2, 0)),
@@ -974,6 +1088,10 @@ static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_unmap_flush_after_publish_failure),
 	KUNIT_CASE(apple_dart_test_gated_commands),
 	KUNIT_CASE(apple_dart_test_resume_commands_failure),
+	KUNIT_CASE(apple_dart_test_tunable_field_mask),
+	KUNIT_CASE(apple_dart_test_tunable_locked_readback),
+	KUNIT_CASE(apple_dart_test_tunable_readback_mismatch),
+	KUNIT_CASE(apple_dart_test_tunable_tunnel_unchanged),
 	KUNIT_CASE(apple_dart_test_tunnel_restore),
 	KUNIT_CASE(apple_dart_test_tunnel_reject_unsafe),
 	KUNIT_CASE(apple_dart_test_tunnel_reset_failure),

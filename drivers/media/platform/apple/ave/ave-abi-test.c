@@ -2,6 +2,7 @@
 /* Byte equality against the pre-ABI-refactor 9003 command builders. */
 #include <kunit/test.h>
 #include <linux/module.h>
+#include <linux/crc32.h>
 #include <linux/errno.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
@@ -524,10 +525,12 @@ static void ave_6070_variants(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ave_t8112.boot_arg_value, 0x10000U);
 	KUNIT_EXPECT_EQ(test, ave_t8112.timebase_multiplier, 1U);
 	KUNIT_EXPECT_EQ(test, ave_t8112.text_crc, 0x25bfd039U);
-	KUNIT_EXPECT_EQ(test, ave_fw_vcbar(&ave_t6000, 0x10000b28000ULL),
-			0x0102000000b28000ULL);
-	KUNIT_EXPECT_EQ(test, ave_fw_vcbar(&ave_t8112, 0x800000000ULL),
-			0x0102000800000000ULL);
+	KUNIT_EXPECT_TRUE(test, ave_t6000.zero_based_firmware);
+	KUNIT_EXPECT_TRUE(test, ave_t8112.zero_based_firmware);
+	KUNIT_EXPECT_EQ(test, ave_fw_vcbar(&ave_t6000, 0),
+			0x0102000000000000ULL);
+	KUNIT_EXPECT_EQ(test, ave_fw_vcbar(&ave_t8112, 0),
+			0x0102000000000000ULL);
 	KUNIT_EXPECT_EQ(test, ave_t6000.regs->ctrl, 0x400044U);
 	KUNIT_EXPECT_EQ(test, ave_t8112.regs->timebase, 0x178000U);
 	KUNIT_EXPECT_GE(test, t->command_bytes, 0x32dc8U);
@@ -542,13 +545,107 @@ static void ave_6070_variants(struct kunit *test)
 		t->ipc_bytes);
 }
 
+/* The loader's TEXT->DATA link cell does not change the image identity. */
+static void ave_6070_text_id(struct kunit *test)
+{
+	const u32 off = ave_t8112.text_link_cell, size = off + 0x100;
+	u8 *text = kunit_kzalloc(test, size, GFP_KERNEL);
+	u32 image, crc;
+
+	KUNIT_ASSERT_NOT_NULL(test, text);
+	KUNIT_EXPECT_EQ(test, off, 0x423cU);
+	KUNIT_EXPECT_EQ(test, ave_t6000.text_link_cell, 0x423cU);
+	for (u32 i = 0; i < size; i++)
+		text[i] = i * 7 + 3;
+	memset(text + off, 0, 8);
+	image = crc32_le(~0U, text, size) ^ ~0U;
+
+	KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, off, 0x8000d0000ULL, &crc), 0);
+	KUNIT_EXPECT_EQ(test, crc, image);
+	put_unaligned_le64(0x8000d0000ULL, text + off);
+	KUNIT_EXPECT_NE(test, crc32_le(~0U, text, size) ^ ~0U, image);
+	crc = 0;
+	KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, off, 0x8000d0000ULL, &crc), 0);
+	KUNIT_EXPECT_EQ(test, crc, image);
+	/* Any other address in the cell is a different TEXT. */
+	put_unaligned_le64(0x8000d4000ULL, text + off);
+	KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, off, 0x8000d0000ULL, &crc), -ENODEV);
+	KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, size - 4, 0, &crc), -EINVAL);
+}
+
+/*
+ * The T8112 DPE cold defaults: 7 steps, masked so unrelated bits survive,
+ * and only T8112 has a table.
+ */
+static void ave_t8112_dpe_defaults(struct kunit *test)
+{
+	static const u8 levels[] = {
+		0x01, 0x01, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x04, 0x03,
+		0x00, 0x00, 0x02, 0x02, 0x01, 0x00, 0x02, 0x02, 0x04, 0x03,
+		0x06, 0x04, 0x02, 0x02, 0x03, 0x02, 0x01, 0x01, 0x02, 0x02,
+		0x01, 0x01, 0x00, 0x00, 0x07, 0x07, 0x0c, 0x0c, 0x09, 0x09,
+		0x03, 0x02, 0x04, 0x04, 0x06, 0x05, 0x01, 0x01, 0x01, 0x01,
+		0x04, 0x03, 0x06, 0x05, 0x04, 0x04, 0x05, 0x05, 0x0a, 0x09,
+		0x0a, 0x09, 0x10, 0x10, 0x10, 0x10, 0x22, 0x12, 0x22, 0x12,
+		0x02, 0x02, 0x24, 0x17, 0x3a, 0x22, 0x03, 0x03, 0x10, 0x0d,
+		0x00, 0x00,
+	};
+	const struct ave_dpe_table *dpe = ave_t8112.dpe;
+	const u32 junk = 0xa5a5a5a5;
+	u32 *buf, *cat, *cac;
+	unsigned int i;
+
+	KUNIT_EXPECT_NULL(test, ave_t6000.dpe);
+	KUNIT_ASSERT_NOT_NULL(test, dpe);
+	KUNIT_EXPECT_EQ(test, dpe->count, 7U);
+	KUNIT_EXPECT_EQ(test, dpe->cat, 0xdc000U);
+	KUNIT_EXPECT_EQ(test, dpe->cac, 0xdc400U);
+
+	buf = kunit_kzalloc(test, 0xdc600, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	cat = buf + 0xdc000 / 4;
+	cac = buf + 0xdc400 / 4;
+	for (i = 0; i < 2; i++)
+		cat[i] = junk;
+	for (i = 0; i < 0x200 / 4; i++)
+		cac[i] = junk;
+
+	KUNIT_EXPECT_GT(test, ave_dpe_check((void __iomem *)buf, dpe, NULL), 0U);
+	ave_dpe_apply((void __iomem *)buf, dpe);
+	KUNIT_EXPECT_EQ(test, ave_dpe_check((void __iomem *)buf, dpe, NULL), 0U);
+
+	/* Steps 1 and 7 on CAT: full word, then bit 0 (already set). */
+	KUNIT_EXPECT_EQ(test, cat[1], 0x00001000U);
+	KUNIT_EXPECT_EQ(test, cat[0], junk | 1);
+	/* Steps 2 and 6 on CAC +0x000. */
+	KUNIT_EXPECT_EQ(test, cac[0], (junk & ~0x01ff0003U) | 0x00030003U);
+	/* CAC +0x000 bit 1 is a command and reads back 0 on hardware. */
+	cac[0] &= ~BIT(1);
+	KUNIT_EXPECT_EQ(test, ave_dpe_check((void __iomem *)buf, dpe, NULL), 0U);
+	/* Step 3: CAC +0x004..+0x0a0 bit 0 set. */
+	for (i = 1; i <= 0xa0 / 4; i++)
+		KUNIT_EXPECT_EQ(test, cac[i], junk | 1);
+	/* Step 4: CAC +0x0a4 bit 0 clear. */
+	KUNIT_EXPECT_EQ(test, cac[0xa4 / 4], junk & ~1U);
+	/* Step 5: the level vector in the low 9 bits of +0x0a8..+0x1ec. */
+	KUNIT_ASSERT_EQ(test, ARRAY_SIZE(levels), (0x1ec - 0xa8) / 4 + 1);
+	for (i = 0; i < ARRAY_SIZE(levels); i++)
+		KUNIT_EXPECT_EQ(test, cac[0xa8 / 4 + i],
+				(junk & ~0x1ffU) | levels[i]);
+	/* Nothing past the table. */
+	KUNIT_EXPECT_EQ(test, cac[0x1f0 / 4], junk);
+	KUNIT_EXPECT_EQ(test, cat[2], 0U);
+}
+
 static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_9003_byte_equality), KUNIT_CASE(ave_9003_hevc_main10),
 	KUNIT_CASE(ave_9003_speed),	    KUNIT_CASE(ave_cq_table),
 	KUNIT_CASE(ave_6070_images),
 	KUNIT_CASE(ave_6070_replies),	    KUNIT_CASE(ave_6070_split_surfaces),
 	KUNIT_CASE(ave_6070_gate),	    KUNIT_CASE(ave_6070_channels),
-	KUNIT_CASE(ave_6070_variants),	    {}
+	KUNIT_CASE(ave_6070_variants),	    KUNIT_CASE(ave_6070_text_id),
+	KUNIT_CASE(ave_t8112_dpe_defaults),
+	{}
 };
 
 static struct kunit_suite ave_abi_suite = {

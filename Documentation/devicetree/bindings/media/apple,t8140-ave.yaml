@@ -39,6 +39,18 @@ select:
 properties:
   compatible: true
 
+  apple,tunable-axi2af:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: Register offset in the PIO/fabric resource
+        - description: Mask to clear before applying the value
+        - description: Bits to set after applying the mask
+    description: >
+      Machine-selected AXI-to-fabric register settings copied from the
+      boot-time hardware description. An empty list explicitly selects no
+      writes for this SoC.
+
 allOf:
   - if:
       properties:
@@ -230,7 +242,6 @@ allOf:
                       contains:
                         enum:
                           - apple,t6041-ave
-                          - apple,t8112-ave
                           - apple,t8140-ave
                 then:
                   properties:

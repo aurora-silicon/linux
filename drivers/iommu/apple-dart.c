@@ -309,6 +309,7 @@ struct apple_dart {
 	/* Resume restored the translations, but the last steps of its reset failed. */
 	bool reset_incomplete;
 	struct apple_tunable *tunables;
+	bool tunable_mismatch_reported;
 	u16 version;
 
 	/* J713 internal display DARTs, borrowed from the running DCP. */
@@ -581,6 +582,50 @@ static void apple_dart_apply_tunables(struct apple_dart *dart)
 			apple_dart_writel(dart, value,
 					   dart->tunables->values[i].offset);
 	}
+}
+
+/*
+ * An ordinary DART may already be locked by firmware.  Its tunables still
+ * describe the state Linux expects, but its tunable registers must not be
+ * changed.  An unlocked DART gets a field-mask RMW followed by a readback of
+ * the fields we own.
+ */
+static void apple_dart_apply_checked_tunables(struct apple_dart *dart)
+{
+	bool locked = dart->locked ||
+		(apple_dart_readl(dart, dart->hw->lock) & dart->hw->lock_bit);
+	size_t i, mismatches = 0;
+
+	for (i = 0; i < dart->tunables->sz; ++i) {
+		u32 mask = dart->tunables->values[i].mask;
+		u32 value = dart->tunables->values[i].value;
+		u32 offset = dart->tunables->values[i].offset;
+		u32 old_value, new_value, readback;
+
+		old_value = apple_dart_readl(dart, offset);
+		new_value = (old_value & ~mask) | value;
+		if (!locked && new_value != old_value)
+			apple_dart_writel(dart, new_value, offset);
+		readback = apple_dart_readl(dart, offset);
+		if ((readback & mask) != value)
+			mismatches++;
+	}
+
+	if (mismatches && !dart->tunable_mismatch_reported) {
+		const char *suffix = locked ? " (firmware-locked; read-only)" : "";
+
+		dart->tunable_mismatch_reported = true;
+		dev_info_ratelimited(dart->dev, "%zu DART tunable fields did not match on readback%s\n",
+				     mismatches, suffix);
+	}
+}
+
+static void apple_dart_apply_probe_tunables(struct apple_dart *dart)
+{
+	if (dart->tunneled)
+		apple_dart_apply_tunables(dart);
+	else
+		apple_dart_apply_checked_tunables(dart);
 }
 
 /*
@@ -4304,24 +4349,16 @@ static int apple_dart_probe(struct platform_device *pdev)
 		dev_err(dev, "MMIO region too small (%pr)\n", res);
 		return -EINVAL;
 	}
-	if (tunneled) {
-		dart->tunables = devm_apple_tunable_parse(dev, dev->of_node,
-							  "apple,tunable", res);
-		if (IS_ERR(dart->tunables)) {
-			/*
-			 * T8110 publishes tunables and the driver requires them.
-			 * A t8103 PCIe-C DART may omit them. Its values include
-			 * the configuration lock, which has to be written after
-			 * the translation context is programmed, so leave them
-			 * off until that ordering exists.
-			 */
-			if (PTR_ERR(dart->tunables) == -ENOENT &&
-			    dart->hw->type != DART_T8110) {
-				dart->tunables = NULL;
-			} else {
-				return dev_err_probe(dev, PTR_ERR(dart->tunables),
-						     "failed to parse PCIe-C DART tunables\n");
-			}
+	dart->tunables = devm_apple_tunable_parse(dev, dev->of_node,
+						  "apple,tunable", res);
+	if (IS_ERR(dart->tunables)) {
+		/* T8110 PCIe-C publishes a table, including an explicit empty one. */
+		if (PTR_ERR(dart->tunables) == -ENOENT &&
+		    (!tunneled || dart->hw->type != DART_T8110)) {
+			dart->tunables = NULL;
+		} else {
+			return dev_err_probe(dev, PTR_ERR(dart->tunables),
+					     "failed to parse DART tunables\n");
 		}
 	}
 
@@ -4368,9 +4405,9 @@ static int apple_dart_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_clk_disable;
 	if (tunneled && dart->tunables) {
-		dev_dbg(dev, "applying %zu PCIe-C DART tunables\n",
+		dev_dbg(dev, "applying %zu DART tunables\n",
 			dart->tunables->sz);
-		apple_dart_apply_tunables(dart);
+		apple_dart_apply_probe_tunables(dart);
 	}
 
 	if (tunneled) {
@@ -4534,6 +4571,12 @@ params_done:
 		dart->locked = false;
 	else
 		dart->locked = apple_dart_is_locked(dart);
+	if (!tunneled && dart->tunables) {
+		dev_dbg(dev, "%s %zu DART tunables\n",
+			dart->locked ? "checking" : "applying",
+			dart->tunables->sz);
+		apple_dart_apply_probe_tunables(dart);
+	}
 	/* Reserved table-page lifetime requires the matched three-level loader. */
 	dart->fw_handoff = apple_dart_fw_handoff_enabled(dart);
 	/* Preserve our retained-root path when no reserved-table handoff exists. */
@@ -5226,6 +5269,8 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 		return ret;
 	}
 
+	if (dart->tunables)
+		apple_dart_apply_checked_tunables(dart);
 	ret = apple_dart_hw_reset(dart);
 
 	/*

@@ -24,6 +24,8 @@
 #include <linux/pm_runtime.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/tunable.h>
+#include <linux/unaligned.h>
 #include <linux/vmalloc.h>
 
 #include "ave.h"
@@ -121,6 +123,48 @@ static int ave_fw_crc(const struct ave_fw_segment *seg, u32 *crc, void *copy)
 }
 
 /*
+ * The firmware build is identified by its image CRC. The loader links TEXT
+ * to DATA by writing the DATA address into one cell that is zero in the
+ * image, so hash TEXT with that cell as the image has it. Any other value
+ * in the cell means TEXT is not the build this variant expects.
+ */
+int ave_fw_text_id_crc(const void *text, size_t size, u32 cell_off,
+		       u64 data_iova, u32 *crc)
+{
+	static const u8 zero[sizeof(u64)];
+	u64 cell;
+
+	if (cell_off > size || size - cell_off < sizeof(zero))
+		return -EINVAL;
+	cell = get_unaligned_le64(text + cell_off);
+	if (cell && cell != data_iova)
+		return -ENODEV;
+	*crc = crc32_le(~0U, text, cell_off);
+	*crc = crc32_le(*crc, zero, sizeof(zero));
+	*crc = crc32_le(*crc, text + cell_off + sizeof(zero),
+			size - cell_off - sizeof(zero));
+	*crc ^= ~0U;
+	return 0;
+}
+
+static int ave_fw_text_id(struct ave_dev *ave, u32 *crc)
+{
+	void *va;
+	int ret;
+
+	if (!ave->variant->text_link_cell)
+		return 0;
+	va = memremap(ave->text.phys, ave->text.size, MEMREMAP_WB);
+	if (!va)
+		return -ENOMEM;
+	ret = ave_fw_text_id_crc(va, ave->text.size,
+				 ave->variant->text_link_cell, ave->data.iova,
+				 crc);
+	memunmap(va);
+	return ret;
+}
+
+/*
  * Find the firmware, check that it is a build we speak to and that DATA is
  * still as the bootloader left it, and keep a copy of DATA for restarts.
  */
@@ -151,6 +195,10 @@ int ave_fw_probe(struct ave_dev *ave)
 	     ave->data.iova < ave->text.iova + ave->text.size))
 		return dev_err_probe(dev, -EINVAL,
 				     "overlapping firmware segments\n");
+	if (ave->variant->zero_based_firmware &&
+	    (ave->text.iova || ave->data.iova != ave->text.size))
+		return dev_err_probe(dev, -EINVAL,
+				     "firmware must be mapped contiguously from IOVA zero\n");
 
 	if (ave_fw_check_mapping(ave, &ave->text) ||
 	    ave_fw_check_mapping(ave, &ave->data))
@@ -165,6 +213,10 @@ int ave_fw_probe(struct ave_dev *ave)
 	if (ret || text_crc != want)
 		return dev_err_probe(dev, -ENODEV,
 				     "firmware text differs from loader CRC\n");
+	ret = ave_fw_text_id(ave, &text_crc);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "firmware text link cell is not the DATA address\n");
 	for (unsigned int i = 0; i < ARRAY_SIZE(ave_known_text_crc); i++)
 		known |= text_crc == ave_known_text_crc[i];
 	if (!known ||
@@ -217,7 +269,7 @@ static int ave_fw_restore_data(struct ave_dev *ave)
 {
 	void *va;
 
-	if (!ave->data_dirty)
+	if (!ave->data_dirty && !ave->variant->restore_data_first)
 		return 0;
 	va = memremap(ave->data.phys, ave->data.size, MEMREMAP_WC);
 	if (!va)
@@ -353,6 +405,79 @@ u64 ave_fw_vcbar(const struct ave_variant *variant, u64 text_iova)
 	return (text_iova & variant->vcbar_mask) | variant->vcbar_flags;
 }
 
+void ave_dpe_apply(void __iomem *codec, const struct ave_dpe_table *t)
+{
+	for (unsigned int i = 0; i < t->count; i++) {
+		const struct ave_dpe_rmw *r = &t->rows[i];
+
+		for (u32 j = 0; j < r->count; j++) {
+			void __iomem *reg = codec + r->offset + 4 * j;
+			u32 value = r->values ? r->values[j] : r->value;
+
+			writel((readl(reg) & ~r->mask) | value, reg);
+		}
+	}
+	/* The settings must have landed before the coprocessor runs. */
+	wmb();
+}
+
+/* Count (and log, given a device) registers whose masked field differs. */
+unsigned int ave_dpe_check(void __iomem *codec, const struct ave_dpe_table *t,
+			   struct device *dev)
+{
+	unsigned int bad = 0;
+
+	for (unsigned int i = 0; i < t->count; i++) {
+		const struct ave_dpe_rmw *r = &t->rows[i];
+
+		for (u32 j = 0; j < r->count; j++) {
+			u32 off = r->offset + 4 * j;
+			u32 keep = r->retained ? r->retained : r->mask;
+			u32 want = (r->values ? r->values[j] : r->value) & keep;
+			u32 got = readl(codec + off);
+
+			if ((got & keep) == want)
+				continue;
+			bad++;
+			if (dev)
+				dev_warn(dev, "DPE %#x reads %#x, field %#x wants %#x\n",
+					 off, got, keep, want);
+		}
+	}
+	return bad;
+}
+
+/*
+ * Read-only state after a 6070 start that posted no hello: coprocessor
+ * control and CPU status, the mailbox set aliases, pending words and
+ * scratch0..3, and the DPE words the cold defaults touch.
+ */
+static void ave_fw_hello_snapshot(struct ave_dev *ave)
+{
+	const struct ave_coproc_regs *r = ave->variant->regs;
+	const struct ave_dpe_table *dpe = ave->variant->dpe;
+
+	dev_err(ave->dev,
+		"no hello: ctrl %#x cpu %#x mbox %#x %#x %#x %#x scratch %#x %#x %#x %#x\n",
+		readl(ave->coproc + r->ctrl), readl(ave->coproc + r->status),
+		readl(ave->mbox + 0x08), readl(ave->mbox + 0x0c),
+		readl(ave->mbox + AVE_MBOX_STATUS), readl(ave->mbox + 0x14),
+		readl(ave->mbox + AVE_MBOX_SCRATCH(0)),
+		readl(ave->mbox + AVE_MBOX_SCRATCH(1)),
+		readl(ave->mbox + AVE_MBOX_SCRATCH(2)),
+		readl(ave->mbox + AVE_MBOX_SCRATCH(3)));
+	if (!dpe)
+		return;
+	dev_err(ave->dev,
+		"no hello: DPE cat %#x %#x cac %#x %#x %#x %#x %#x, %u fields differ\n",
+		readl(ave->codec + dpe->cat), readl(ave->codec + dpe->cat + 0x004),
+		readl(ave->codec + dpe->cac), readl(ave->codec + dpe->cac + 0x004),
+		readl(ave->codec + dpe->cac + 0x0a4),
+		readl(ave->codec + dpe->cac + 0x0a8),
+		readl(ave->codec + dpe->cac + 0x1ec),
+		ave_dpe_check(ave->codec, dpe, NULL));
+}
+
 static bool ave_fw_idle(struct ave_dev *ave)
 {
 	if (readq(ave->coproc + ave->variant->regs->vcbar) !=
@@ -469,6 +594,36 @@ static int ave_fw_boot(struct ave_dev *ave)
 		return -EIO;
 	}
 
+	/* Clear the SVE idle word first: the codec clocks stay gated otherwise. */
+	if (ave->variant->mbox_idle) {
+		writel(0, ave->mbox + ave->variant->mbox_idle);
+		if (readl(ave->mbox + ave->variant->mbox_idle)) {
+			dev_err(ave->dev, "SVE idle word did not clear\n");
+			return -EIO;
+		}
+		wmb();
+	}
+
+	/*
+	 * The coprocessor is in reset here: never started, or halted and then
+	 * power cycled (ave_fw_prepare_restart() refuses otherwise), so the
+	 * DPE has lost its settings too. Program its defaults before RUN.
+	 */
+	if (ave->variant->dpe) {
+		ave_dpe_apply(ave->codec, ave->variant->dpe);
+		if (ave_dpe_check(ave->codec, ave->variant->dpe, ave->dev))
+			dev_warn(ave->dev, "DPE defaults did not all read back\n");
+		else
+			dev_dbg(ave->dev, "DPE defaults applied\n");
+	}
+	if (ave->axi2af) {
+		apple_tunable_apply(ave->pio, ave->axi2af);
+		/* Finish fabric writes before restoring DATA and starting the IOP. */
+		wmb();
+		dev_dbg(ave->dev, "applied %zu AXI2AF tunables\n",
+			ave->axi2af->sz);
+	}
+
 	memset(ave->ring, 0, sizeof(ave->ring));
 	ave->unacked = 0;
 	memset(ave->want, 0, sizeof(ave->want));
@@ -514,13 +669,17 @@ static int ave_fw_boot(struct ave_dev *ave)
 		       ave->mbox + AVE_MBOX_SCRATCH(2));
 	}
 	if (!t->boot_config) {
+		/*
+		 * Written once in its encoded form, as macOS does. The register
+		 * reads back decoded (the code base with bit 0 set), so a
+		 * readback never equals the write; the first hello is the
+		 * confirmation.
+		 */
 		writeq(ave_fw_vcbar(ave->variant, ave->text.iova),
 		       ave->coproc + ave->variant->regs->vcbar);
-		if (readq(ave->coproc + ave->variant->regs->vcbar) !=
-		    ave_fw_vcbar(ave->variant, ave->text.iova))
-			return -EIO;
-		dev_dbg(ave->dev, "VCBAR %#llx boot argument %#x\n",
+		dev_dbg(ave->dev, "VCBAR %#llx (reads %#llx) boot argument %#x\n",
 			ave_fw_vcbar(ave->variant, ave->text.iova),
+			readq(ave->coproc + ave->variant->regs->vcbar),
 			ave->variant->boot_arg_value);
 	}
 
@@ -542,6 +701,8 @@ static int ave_fw_boot(struct ave_dev *ave)
 	if (ret) {
 		dev_err(ave->dev, "firmware did not answer (status %#x)\n",
 			readl(ave->coproc + ave->variant->regs->status));
+		if (!t->boot_config)
+			ave_fw_hello_snapshot(ave);
 		return ret;
 	}
 	for (unsigned int i = 0; i < 4; i++)
