@@ -689,6 +689,12 @@ impl Completion {
         self.stamp_queued.load(Ordering::Acquire)
     }
 
+    /// This command's public output is signalled or queued, so a later kick of
+    /// the same queue may follow it without reordering the scheduler fences.
+    pub(crate) fn output_settled(&self) -> bool {
+        self.signalled.load(Ordering::Acquire) != 0 || self.stamp_queued()
+    }
+
     /// A real post-maintenance stamp permits output, but not ring/lease reuse.
     pub(crate) fn stamp_eligible(&self) -> bool {
         self.signalled.load(Ordering::Acquire) == 0
