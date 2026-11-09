@@ -74,6 +74,9 @@ struct macsmc_hwmon_sensor {
 	u32 attrs;
 	/* Part of the SoC die temperature zone. */
 	bool die;
+	/* Readings below no_data_below are powered-down placeholders, not temperatures. */
+	bool has_no_data_below;
+	s32 no_data_below;
 };
 
 struct macsmc_hwmon_fan {
@@ -616,10 +619,15 @@ static int macsmc_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 	int ret = 0;
 
 	switch (type) {
-	case hwmon_temp:
-		ret = macsmc_hwmon_read_key(hwmon->smc,
-					    &hwmon->temp.sensors[channel], 1000, val);
+	case hwmon_temp: {
+		struct macsmc_hwmon_sensor *sensor = &hwmon->temp.sensors[channel];
+
+		ret = macsmc_hwmon_read_key(hwmon->smc, sensor, 1000, val);
+		/* A powered-down sensor's placeholder is not a temperature. */
+		if (!ret && sensor->has_no_data_below && *val < sensor->no_data_below)
+			ret = -ENODATA;
 		break;
+	}
 	case hwmon_in:
 		ret = macsmc_hwmon_read_key(hwmon->smc,
 					    &hwmon->volt.sensors[channel], 1000, val);
@@ -777,6 +785,10 @@ static int macsmc_hwmon_create_sensor(struct device *dev, struct apple_smc *smc,
 		dev_dbg(dev, "No label found for sensor %s\n", key);
 	else
 		strscpy_pad(sensor->label, label, sizeof(sensor->label));
+
+	sensor->has_no_data_below =
+		!of_property_read_s32(sensor_node, "apple,no-data-below-millicelsius",
+				      &sensor->no_data_below);
 
 	return 0;
 }

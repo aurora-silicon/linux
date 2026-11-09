@@ -1507,35 +1507,42 @@
 	temperature-Tg05 {
 		apple,key-id = "Tg05";
 		label = "GPU Tg05";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg0S {
 		apple,key-id = "Tg0S";
 		label = "GPU Tg0S";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg0Y {
 		apple,key-id = "Tg0Y";
 		label = "GPU Tg0Y";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg0k {
 		apple,key-id = "Tg0k";
 		label = "GPU Tg0k";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg0z {
 		apple,key-id = "Tg0z";
 		label = "GPU Tg0z";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg1V {
 		apple,key-id = "Tg1V";
 		label = "GPU Tg1V";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg1l {
 		apple,key-id = "Tg1l";
 		label = "GPU Tg1l";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 };
