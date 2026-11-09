@@ -108,6 +108,8 @@ struct apple_dpxbar_hw {
 	bool no_tunable;
 	/* power domain held only while an output is selected */
 	bool runtime_pm;
+	/* T8142 layout: a connection status still busy after its poll is only logged */
+	bool status_log_only;
 };
 
 struct apple_dpxbar {
@@ -901,9 +903,33 @@ static const u8 t8142_dest_shift[T8142_MUX_MAX] = { 8, 0, 4, 12, 16 };
 static const u8 t8142_select_shift[T8142_MUX_MAX] = { 8, 0, 4, 24, 0 };
 static const u8 t8142_select_shift2[T8142_MUX_MAX] = { 20, 12, 16, 28, 4 };
 
+/*
+ * Wait up to 1 ms for @mask to clear in status word @reg. Where the hardware
+ * only reports these bits (T6050), one still set is logged and the change
+ * goes on; elsewhere the crossbar is taken as faulted.
+ */
+static int t8142_settle(struct apple_dpxbar *xbar, unsigned int reg, u32 mask,
+			unsigned int index, const char *what)
+{
+	u32 value;
+	int ret;
+
+	ret = readl_poll_timeout_atomic(xbar->regs + reg, value, !(value & mask), 1, 1000);
+	if (!ret)
+		return 0;
+	if (xbar->hw->status_log_only) {
+		dev_warn_ratelimited(xbar->dev,
+				     "output %u %s: status +%#x = %#x, %#x still set; going on\n",
+				     index, what, reg, value, mask);
+		return 0;
+	}
+	xbar->faulted = true;
+	return ret;
+}
+
 static int t8142_link_down(struct apple_dpxbar *xbar, unsigned int index)
 {
-	u32 src, dst, clock, value;
+	u32 src, dst, clock;
 	int ret;
 
 	if (!xbar->enabled[index])
@@ -917,24 +943,13 @@ static int t8142_link_down(struct apple_dpxbar *xbar, unsigned int index)
 	dpxbar_clear32(xbar, 0x0c + 4 * clock, src);
 	dpxbar_clear32(xbar, 0x24 + 4 * clock, dst);
 	udelay(1);
-	ret = readl_poll_timeout_atomic(xbar->regs + 0x800, value,
-					!(value & src), 1, 1000);
-	if (ret) {
-		xbar->faulted = true;
+	ret = t8142_settle(xbar, 0x800, src, index, "link down");
+	if (!ret)
+		ret = t8142_settle(xbar, 0x808 + 4 * clock, src, index, "link down");
+	if (!ret)
+		ret = t8142_settle(xbar, 0x81c + 4 * clock, dst, index, "link down");
+	if (ret)
 		return ret;
-	}
-	ret = readl_poll_timeout_atomic(xbar->regs + 0x808 + 4 * clock, value,
-					!(value & src), 1, 1000);
-	if (ret) {
-		xbar->faulted = true;
-		return ret;
-	}
-	ret = readl_poll_timeout_atomic(xbar->regs + 0x81c + 4 * clock, value,
-					!(value & dst), 1, 1000);
-	if (ret) {
-		xbar->faulted = true;
-		return ret;
-	}
 	dpxbar_clear32(xbar, 0x08, src);
 	dpxbar_clear32(xbar, 0x20, 7 << (3 * xbar->selected_dispext[index]));
 	dpxbar_clear32(xbar, 0x38, 7 << t8142_dest_shift[index]);
@@ -948,7 +963,7 @@ static int t8142_link_down(struct apple_dpxbar *xbar, unsigned int index)
 static int t8142_link_up(struct apple_dpxbar *xbar, unsigned int index)
 {
 	int state = xbar->selected_dispext[index];
-	u32 clock, select, src, dst, value;
+	u32 clock, select, src, dst;
 	int ret;
 
 	if (state < 0)
@@ -973,24 +988,13 @@ static int t8142_link_up(struct apple_dpxbar *xbar, unsigned int index)
 	dpxbar_clear32(xbar, 0x1c, src);
 	dpxbar_clear32(xbar, 0x34, dst);
 	udelay(1);
-	ret = readl_poll_timeout_atomic(xbar->regs + 0x804, value,
-					!(value & src), 1, 1000);
-	if (ret) {
-		xbar->faulted = true;
+	ret = t8142_settle(xbar, 0x804, src, index, "link up");
+	if (!ret)
+		ret = t8142_settle(xbar, 0x818, src, index, "link up");
+	if (!ret)
+		ret = t8142_settle(xbar, 0x82c, dst, index, "link up");
+	if (ret)
 		return ret;
-	}
-	ret = readl_poll_timeout_atomic(xbar->regs + 0x818, value,
-					!(value & src), 1, 1000);
-	if (ret) {
-		xbar->faulted = true;
-		return ret;
-	}
-	ret = readl_poll_timeout_atomic(xbar->regs + 0x82c, value,
-					!(value & dst), 1, 1000);
-	if (ret) {
-		xbar->faulted = true;
-		return ret;
-	}
 	dpxbar_set32(xbar, 0x08, src);
 	dpxbar_mask32(xbar, 0x20, 7 << (3 * state), select << (3 * state));
 	dpxbar_mask32(xbar, 0x38, 7 << t8142_dest_shift[index],
@@ -1466,8 +1470,16 @@ static const struct apple_dpxbar_hw apple_dpxbar_hw_t8142 = {
 	.ops = &apple_dpxbar_t8142_ops,
 };
 
+/* T6050: the T8142 layout; a status that stays busy is logged after settling. */
+static const struct apple_dpxbar_hw apple_dpxbar_hw_t6050 = {
+	.n_mux = T8142_MUX_MAX,
+	.n_ufp = 8,
+	.ops = &apple_dpxbar_t8142_ops,
+	.status_log_only = true,
+};
+
 static const struct of_device_id apple_dpxbar_ids[] = {
-	{ .compatible = "apple,t6050-display-crossbar", .data = &apple_dpxbar_hw_t8142 },
+	{ .compatible = "apple,t6050-display-crossbar", .data = &apple_dpxbar_hw_t6050 },
 	{ .compatible = "apple,t8142-display-crossbar", .data = &apple_dpxbar_hw_t8142 },
 	{
 		.compatible = "apple,t8103-display-crossbar",
