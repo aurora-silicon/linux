@@ -334,6 +334,13 @@ void apple_clpc_ane_put(struct apple_clpc_ane *ane)
 }
 EXPORT_SYMBOL_GPL(apple_clpc_ane_put);
 
+/* SoCs whose CLPC takes ANE input; each SoC has exactly one CLPC. */
+static const struct of_device_id apple_clpc_ane_providers[] = {
+	{ .compatible = "apple,t6041-clpc" },
+	{ .compatible = "apple,t8140-clpc" },
+	{}
+};
+
 int apple_clpc_ane_get(struct device *dev, struct apple_clpc_ane **out)
 {
 	struct device_node *np;
@@ -345,10 +352,10 @@ int apple_clpc_ane_get(struct device *dev, struct apple_clpc_ane **out)
 		return 0;
 	np = of_parse_phandle(dev->of_node, "apple,clpc", 0);
 	if (!np && !of_find_property(dev->of_node, "apple,clpc", NULL))
-		np = of_find_compatible_node(NULL, NULL, "apple,t8140-clpc");
+		np = of_find_matching_node(NULL, apple_clpc_ane_providers);
 	if (!np)
 		return 0;
-	if (!of_device_is_compatible(np, "apple,t8140-clpc")) {
+	if (!of_match_node(apple_clpc_ane_providers, np)) {
 		of_node_put(np);
 		return 0;
 	}
@@ -1181,6 +1188,13 @@ static const struct apple_clpc_hw apple_clpc_hw_t6040 = {
 	.sustain = 3,
 	.gpu_demand = false,
 	.gpu_input = true,
+	/*
+	 * The ANE's own floor (PMC SoC-max) holds only the fabric. ResNet-50
+	 * streams about 50 MB of weights per inference, and with DRAM left at
+	 * DCS 0 an EXECUTE takes 0.9-2.0 ms (p50 1.43 ms) instead of 0.9 ms.
+	 * Hold the same qualified DCS 5 / fabric 2 a busy CPU cluster gets.
+	 */
+	.ane = { [APPLE_CLPC_DCS] = 5, [APPLE_CLPC_SOC] = 2 },
 };
 
 /*
@@ -1393,6 +1407,9 @@ static void apple_clpc_ane_demand_hold_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, apple_clpc_ane_input_demand(clpc, demand));
 	KUNIT_EXPECT_GT(test, ane.updated_ns, 0ull);
 	KUNIT_EXPECT_EQ(test, ane.sequence, 4ull);
+	/* T6040 holds its top qualified DCS and fabric states for the ANE. */
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t6040.ane[APPLE_CLPC_DCS], 5);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t6040.ane[APPLE_CLPC_SOC], 2);
 }
 
 static void apple_clpc_ane_states_test(struct kunit *test)
@@ -1435,7 +1452,6 @@ static void apple_clpc_ane_no_provider_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, apple_clpc_ane_input_demand(clpc, demand));
 	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_DCS], 0u);
 	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_SOC], 0u);
-	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t6040.ane[APPLE_CLPC_DCS], 0);
 	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.ane[APPLE_CLPC_DCS], 0);
 	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8142.ane[APPLE_CLPC_DCS], 0);
 }
