@@ -93,3 +93,73 @@ impl kernel::debugfs::Writer for View {
         Ok(())
     }
 }
+
+// GPULOST diagnostic (test kernel only): where a publication's EBUSY came from.
+const BUSY_SLOTS: usize = 256;
+const BUSY_DEPTH: usize = 4;
+struct BusySlot {
+    pid: core::sync::atomic::AtomicI32,
+    begin: AtomicU64,
+    next: core::sync::atomic::AtomicUsize,
+    at: [core::sync::atomic::AtomicPtr<core::panic::Location<'static>>; BUSY_DEPTH],
+    ns: [AtomicU64; BUSY_DEPTH],
+}
+static BUSY: [BusySlot; BUSY_SLOTS] = [const { BusySlot {
+    pid: core::sync::atomic::AtomicI32::new(0),
+    begin: AtomicU64::new(0),
+    next: core::sync::atomic::AtomicUsize::new(0),
+    at: [const { core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()) }; BUSY_DEPTH],
+    ns: [const { AtomicU64::new(0) }; BUSY_DEPTH],
+} }; BUSY_SLOTS];
+static BUSY_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+fn busy_slot() -> (&'static BusySlot, i32) {
+    let pid = kernel::current!().pid();
+    (&BUSY[(pid as usize) % BUSY_SLOTS], pid)
+}
+
+/// Every EBUSY produced in g17 comes from here in the diagnostic kernel.
+#[track_caller]
+pub(crate) fn busy() -> Error {
+    BUSY_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let (slot, pid) = busy_slot();
+    if slot.pid.load(Ordering::Relaxed) == pid {
+        let i = slot.next.fetch_add(1, Ordering::Relaxed) % BUSY_DEPTH;
+        let at = core::panic::Location::caller() as *const _ as *mut core::panic::Location<'static>;
+        slot.at[i].store(at, Ordering::Relaxed);
+        slot.ns[i].store(super::now_ns(), Ordering::Relaxed);
+    }
+    EBUSY
+}
+
+/// Start of one scheduler publication by this task.
+pub(crate) fn busy_begin() {
+    let (slot, pid) = busy_slot();
+    slot.pid.store(pid, Ordering::Relaxed);
+    slot.begin.store(super::now_ns(), Ordering::Relaxed);
+    slot.next.store(0, Ordering::Relaxed);
+    for a in slot.at.iter() { a.store(core::ptr::null_mut(), Ordering::Relaxed); }
+}
+
+/// An unpublished packet failed with EBUSY: print its recorded origins (newest first).
+pub(crate) fn busy_report(what: &str, error: Error) {
+    let (slot, pid) = busy_slot();
+    let now = super::now_ns();
+    let begin = slot.begin.load(Ordering::Relaxed);
+    let waited_us = if slot.pid.load(Ordering::Relaxed) == pid && begin != 0 { (now - begin) / 1000 } else { 0 };
+    let next = slot.next.load(Ordering::Relaxed);
+    let mut sites: [(&str, u32, u64); BUSY_DEPTH] = [("-", 0, 0); BUSY_DEPTH];
+    for k in 0..BUSY_DEPTH.min(next) {
+        let i = (next - 1 - k) % BUSY_DEPTH;
+        let at = slot.at[i].load(Ordering::Relaxed);
+        if at.is_null() { continue; }
+        // SAFETY: only &'static Location values are stored.
+        let at: &'static core::panic::Location<'static> = unsafe { &*at };
+        let ago = now.saturating_sub(slot.ns[i].load(Ordering::Relaxed)) / 1000;
+        sites[k] = (at.file().rsplit("asahi/").next().unwrap_or(at.file()), at.line(), ago);
+    }
+    pr_warn!("GPULOST {} {:?} pid={} waited_us={} busy_total={} n={} origin={}:{}(-{}us) prev={}:{}(-{}us) {}:{}(-{}us) {}:{}(-{}us)\n",
+        what, error, pid, waited_us, BUSY_TOTAL.load(Ordering::Relaxed), next,
+        sites[0].0, sites[0].1, sites[0].2, sites[1].0, sites[1].1, sites[1].2,
+        sites[2].0, sites[2].1, sites[2].2, sites[3].0, sites[3].1, sites[3].2);
+}

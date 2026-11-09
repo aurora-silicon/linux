@@ -198,7 +198,7 @@ impl Port {
         {
             Ok(())
         } else {
-            Err(EBUSY)
+            Err(crate::g17::capacity::busy())
         }
     }
 
@@ -387,7 +387,7 @@ impl Port {
         let (fragment_ring, tiling_ring) = self.render_rings(room.priority)?;
         for (producer, next) in room.producers.into_iter().zip(next) {
             if next != (producer + 1) % WORK_RING_SLOTS {
-                return Err(EBUSY);
+                return Err(crate::g17::capacity::busy());
             }
         }
         fence(Ordering::SeqCst);

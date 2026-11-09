@@ -174,7 +174,7 @@ impl VmStatus {
         let word = unsafe { base.add(offset) }.cast::<i32>();
         let mut mirror = self.mirror.lock();
         if mirror.is_some() {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         // No reporter runs while the mutex is held, so the word holds the first
         // reported error (or zero) when it becomes visible.

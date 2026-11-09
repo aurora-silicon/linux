@@ -111,17 +111,17 @@ impl RenderState {
                 continue;
             }
             if entry.preparing.is_some() || entry.growing || entry.parked.is_some() {
-                return Err(EBUSY);
+                return Err(crate::g17::capacity::busy());
             }
             if let Some(pair) = entry.pair.as_ref() {
                 if !pair.can_park(context)? {
-                    return Err(EBUSY);
+                    return Err(crate::g17::capacity::busy());
                 }
                 count += 1;
             }
         }
         if !out.has_room(count, 1) {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         let linked = context.firmware_may_link();
         for entry in self.entries.iter_mut().flatten() {

@@ -87,7 +87,7 @@ impl Firmware {
         let uat = self.uat.clone();
         let prepared = self.with_render(slot, |pair, _| {
             if !pair.room() {
-                return Err(EBUSY);
+                return Err(crate::g17::capacity::busy());
             }
             let alloc = Allocator {
                 dev: &dev,

@@ -181,7 +181,7 @@ impl RenderState {
             || entry.pending_error.is_some()
             || entry.pending_timeout
         {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         let pair = entry.pair.as_ref().ok_or(EIO)?;
         if !pair.matches(owner, &packet.context)? {
@@ -447,7 +447,7 @@ impl Registry {
             || entry.preparing.is_some()
             || entry.growing
         {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         // Construction keeps identities reserved. Publication pins them at the
         // first firmware-visible command, so unused warming can still yield.
@@ -699,7 +699,7 @@ impl crate::g17::Firmware {
             .get_mut(slot)
             .and_then(Option::as_mut)
             .and_then(|entry| entry.pair.take())
-            .ok_or(EBUSY)?;
+            .ok_or_else(|| crate::g17::capacity::busy())?;
         let mut host = Host {
             firmware: self,
             registration_powered: false,

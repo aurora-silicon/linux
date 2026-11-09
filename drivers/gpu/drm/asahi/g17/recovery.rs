@@ -200,7 +200,7 @@ impl State {
         };
         if let Some(pending) = self.pending.as_mut() {
             if pending.generation != generation {
-                return Err(EBUSY);
+                return Err(crate::g17::capacity::busy());
             }
             pending.blamed = pending.blamed.or(blamed);
         } else {

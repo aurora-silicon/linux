@@ -244,7 +244,7 @@ impl Target {
     pub(crate) fn prepare(&mut self, ordinal: u64, layout: &Layout) -> Result<Addresses> {
         let slot = ordinal as usize % DEPTH;
         if self.slots[slot].is_some_and(|owner| owner != ordinal) {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         if layout.used > self.stride {
             return Err(ERANGE);

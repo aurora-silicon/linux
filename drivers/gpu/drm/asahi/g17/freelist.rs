@@ -588,7 +588,7 @@ impl ComputePool {
     /// over so it stays consistent with the host submitted counter in `state`.
     pub(crate) fn rearm(&mut self, pages: Pages) -> Result {
         if self.pages.is_some() {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         self.write_pages(&pages)?;
         self.pages = Some(pages);
@@ -725,7 +725,7 @@ impl Lease {
             };
         let reacquire = previous.reacquirable();
         if !overlapping && !reacquire {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         let references = previous.references.checked_add(3).ok_or(EOVERFLOW)?;
         let commands = previous.commands.checked_add(2).ok_or(EOVERFLOW)?;

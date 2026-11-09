@@ -22,7 +22,7 @@ impl Pair {
             .into_iter()
             .any(|cursor| cursor.done != 0 || cursor.read != 0 || cursor.write != 0)
         {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         let mut blocks = [core::ptr::null::<PointerBlock>(); 2];
         for (block, offset) in blocks.iter_mut().zip(memory::POINTERS) {

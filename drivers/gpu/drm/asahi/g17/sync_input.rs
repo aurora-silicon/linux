@@ -106,7 +106,7 @@ impl ReaderHint {
         self.possible && count.load(Ordering::Acquire) != 0
     }
     pub(super) fn reset_for_owner(&mut self, count: &AtomicU32) -> Result {
-        if self.has_readers(count) { return Err(EBUSY); }
+        if self.has_readers(count) { return Err(crate::g17::capacity::busy()); }
         self.possible = false;
         Ok(())
     }

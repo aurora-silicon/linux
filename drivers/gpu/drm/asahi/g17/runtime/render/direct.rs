@@ -311,9 +311,9 @@ impl Backend {
             pair.prepare(&alloc, packet, loan.addresses)?;
             let render = port.render_lock();
             if !lease.is_current() {
-                return Err(EBUSY);
+                return Err(crate::g17::capacity::busy());
             }
-            let room = port.observe_render_room(&render, priority)?.ok_or(EBUSY)?;
+            let room = port.observe_render_room(&render, priority)?.ok_or_else(|| crate::g17::capacity::busy())?;
             let mut dependencies = pair.own_dependencies(self.owner, packet)?;
             if let Some(footprint) = packet.footprint.as_ref() {
                 dependencies.hazard_count = self.admission.publication_barriers(

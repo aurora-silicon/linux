@@ -84,7 +84,7 @@ impl ReclaimBatch {
         self.bindings
             .iter_mut()
             .find(|slot| slot.is_none())
-            .ok_or(EBUSY)
+            .ok_or_else(|| crate::g17::capacity::busy())
     }
 
     fn context(&mut self, context: &Arc<Context>) -> Result {
@@ -92,7 +92,7 @@ impl ReclaimBatch {
             .contexts
             .iter_mut()
             .find(|slot| slot.is_none())
-            .ok_or(EBUSY)?;
+            .ok_or_else(|| crate::g17::capacity::busy())?;
         *slot = Some(context.clone());
         Ok(())
     }

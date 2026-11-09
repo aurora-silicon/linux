@@ -379,7 +379,7 @@ impl InitData {
     /// the first descriptor graph so later construction failure does not allocate it again.
     pub(super) fn install_compute_scheduler(&mut self, scheduler: ComputeScheduler) -> Result {
         if self.compute_scheduler.is_some() {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         self.compute_scheduler = Some(scheduler);
         Ok(())
@@ -659,7 +659,7 @@ impl InitData {
         let current = producer.load(Ordering::Relaxed);
         if current >= channels::WORK_RING_SLOTS || next != (current + 1) % channels::WORK_RING_SLOTS
         {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         let destination = self.object(self.bundle)?.pointer(
             abi::work_ring_offset(channel) + current as usize * core::mem::size_of_val(record),
@@ -1642,7 +1642,7 @@ impl super::recovery::Memory for InitData {
             .word(self.status_b + abi::PrimaryStatusB::RECOVERY_STATE)?;
         fence(Ordering::Acquire);
         if state.load(Ordering::Relaxed) != expected {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         fence(Ordering::SeqCst);
         state.store(next, Ordering::Relaxed);

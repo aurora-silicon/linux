@@ -56,7 +56,7 @@ const QUARANTINE_WAIT_MS: u32 = 1000;
 fn wait_slice_ms(deadline_ns: u64, now_ns: u64) -> Result<u32> {
     let remaining = deadline_ns.saturating_sub(now_ns);
     if remaining == 0 {
-        return Err(EBUSY);
+        return Err(crate::g17::capacity::busy());
     }
     Ok(remaining.div_ceil(1_000_000).min(10) as u32)
 }
@@ -910,7 +910,7 @@ impl Pool {
                     }
                 }
                 // Admission bounds the pairs; see hazard::plan.
-                None if count == hazard::PUBLICATION_BARRIERS => return Err(EBUSY),
+                None if count == hazard::PUBLICATION_BARRIERS => return Err(crate::g17::capacity::busy()),
                 None => {
                     slots[count] = other;
                     barriers[count] = fragment;

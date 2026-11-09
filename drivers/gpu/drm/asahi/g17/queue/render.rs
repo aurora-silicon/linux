@@ -373,7 +373,7 @@ impl Pair {
             || !Arc::ptr_eq(&self.memory.context, &packet.context)
             || !packet.context.is_current()
         {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         let Validated::Render {
             pass,
@@ -691,7 +691,7 @@ impl Pair {
         });
         let cursors = self.memory.graph.cursors()?;
         if cursors[0].write != self.cursors[0] || cursors[1].write != self.cursors[1] {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         let queues = qids.map(|qid| {
             self.memory.graph.queues.gpu_va()
@@ -830,7 +830,7 @@ impl Pair {
                 abandoned_since: None,
                 stamp_wait_since: None,
             })
-            .map_err(|_| EBUSY)?;
+            .map_err(|_| crate::g17::capacity::busy())?;
         self.prepared = None;
         packet.mark_published();
         lanes[1].publish_prefix();
@@ -934,7 +934,7 @@ impl Pair {
         host: &mut impl Host,
     ) -> Result<(u64, Option<McacheTable>, crate::g17::fw::queue::Policy)> {
         if self.pending_aliases.is_some() || self.kick_aliases.is_some() {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         let (epoch, recovery_state) = host.epoch()?;
         if recovery_state != 0
@@ -942,7 +942,7 @@ impl Pair {
             || !self.active.room()
             || packet.completion.render_slot() != Some(self.slot)
         {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         let prepared = self.prepared.as_ref().ok_or(EINVAL)?;
         if !Arc::ptr_eq(&prepared.packet, packet)
@@ -1232,7 +1232,7 @@ impl Pair {
             return Ok(None);
         }
         if !self.idle_for_context(self.context())? {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         let feedback = if self.ordinal != 0 {
             self.memory.manager.automatic_target()?.unwrap_or(0)
@@ -1824,7 +1824,7 @@ impl Pair {
             return Ok(());
         };
         if !Arc::ptr_eq(&prepared.packet, packet) {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         self.memory.retire(prepared.ordinal)?;
         self.prepared = None;
@@ -2385,7 +2385,7 @@ impl Pair {
             || !Arc::ptr_eq(&context, &first.context)
             || !context.is_current()
         {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         alloc.uat.vm_context_mask(context.vm())?;
         let same_vm = Arc::ptr_eq(self.context().status(), context.status());
@@ -2446,7 +2446,7 @@ impl Pair {
             || !Arc::ptr_eq(&binding.previous_context, self.context())
             || !binding.context.is_current()
         {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         let foreign = binding.memory.is_some();
         if let Some(memory) = binding.memory.as_mut() {

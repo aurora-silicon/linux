@@ -146,7 +146,7 @@ impl ParkedPair {
         if owner == 0 || !Arc::ptr_eq(&context, &first.context) || !context.is_current() {
             return Err(EINVAL);
         }
-        let kicks = self.kicks.as_ref().ok_or(EBUSY)?;
+        let kicks = self.kicks.as_ref().ok_or_else(|| crate::g17::capacity::busy())?;
         let Validated::Render { pass, .. } = &first.command else {
             return Err(EINVAL);
         };
@@ -207,7 +207,7 @@ impl ParkedPair {
     ) -> Result<KBox<Pair>> {
         let candidate = prepared.as_ref().ok_or(EINVAL)?;
         if !candidate.installed || !self.matches(candidate) {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         let kicks = self.kicks.take().ok_or(EIO)?;
         // The candidate was validated above and cannot change through the exclusive borrow.
@@ -266,7 +266,7 @@ impl Prepared {
         descriptors: &KernelObject,
     ) -> Result {
         if !parked.matches(self) {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         install_memory(
             alloc,

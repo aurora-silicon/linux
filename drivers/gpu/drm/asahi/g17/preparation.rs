@@ -48,7 +48,7 @@ impl<'a> Admission<'a> {
 
     pub(super) fn check(&self) -> Result {
         (self.check)()?;
-        if super::now_ns() >= self.deadline.get() { return Err(EBUSY); }
+        if super::now_ns() >= self.deadline.get() { return Err(crate::g17::capacity::busy()); }
         Ok(())
     }
 
@@ -56,7 +56,7 @@ impl<'a> Admission<'a> {
     pub(super) fn slice_ms(&self) -> Result<u32> {
         self.check()?;
         let remaining = self.deadline.get().saturating_sub(super::now_ns());
-        if remaining == 0 { return Err(EBUSY); }
+        if remaining == 0 { return Err(crate::g17::capacity::busy()); }
         Ok(remaining.div_ceil(1_000_000).min(10) as u32)
     }
 }

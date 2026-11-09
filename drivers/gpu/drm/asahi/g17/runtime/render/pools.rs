@@ -87,7 +87,7 @@ impl Pools {
         let owner = Self::owner(pool);
         let previous = self.leases[slot];
         if previous.is_some_and(|lease| lease.owner() != owner && !lease.released()) {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         // Pools arrive fully populated. There is no asynchronous initial grow.
         let next = Lease::acquire(previous.as_ref(), owner)?;
@@ -115,7 +115,7 @@ impl Pools {
             return Ok(());
         }
         if previous.is_some_and(|lease| !lease.released()) {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         Lease::acquire(previous.as_ref(), owner)?;
         self.stage(init, pool)

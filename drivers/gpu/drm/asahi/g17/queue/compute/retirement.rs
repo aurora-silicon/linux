@@ -324,7 +324,7 @@ impl Batch {
         }
         let slot = self.slots.get_mut(ticket.qid as usize).ok_or(EINVAL)?;
         if slot.1 != 0 && self.open != Some(ticket.qid) {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         if slot.1 >= IN_FLIGHT {
             return Err(ENOSPC);

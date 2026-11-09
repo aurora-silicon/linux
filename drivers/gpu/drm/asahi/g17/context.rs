@@ -430,7 +430,7 @@ impl Context {
         Ok(result)
     }
     pub(crate) fn reserve_render_blocks(&self, blocks: usize) -> Result {
-        if self.is_published() || self.render.lock().is_some() { return Err(EBUSY); }
+        if self.is_published() || self.render.lock().is_some() { return Err(crate::g17::capacity::busy()); }
         self.render_blocks.store(blocks, Ordering::Release);
         Ok(())
     }
@@ -510,10 +510,10 @@ impl WorkStateLease {
         }
         let mut order = self.context.order.lock();
         if !order.admits(self.ordinal) {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         let engine = engine.index();
-        let candidate = self.context.states.allocate(engine).ok_or(EBUSY)?;
+        let candidate = self.context.states.allocate(engine).ok_or_else(|| crate::g17::capacity::busy())?;
         if let Err(error) = work.initialize(candidate) {
             self.context.release_state(candidate, engine);
             return Err(error);

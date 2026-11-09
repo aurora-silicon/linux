@@ -26,7 +26,7 @@ pub(crate) const PRODUCER_FAILED: Error = ECANCELED;
 /// A replay's original host inputs must still be signalled. Treat an unmet
 /// input as a failed replay, never as a wait under the device mutex.
 pub(crate) fn replay_status(status: i32) -> Result {
-    if status == 0 { Err(EBUSY) }
+    if status == 0 { Err(crate::g17::capacity::busy()) }
     else if status < 0 { Err(PRODUCER_FAILED) }
     else { Ok(()) }
 }

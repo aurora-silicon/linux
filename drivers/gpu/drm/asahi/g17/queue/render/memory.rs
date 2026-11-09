@@ -225,7 +225,7 @@ impl Graph {
     pub(super) fn claim(&mut self, ordinal: u64) -> Result {
         let owner = &mut self.owners[ordinal as usize % RECORDS];
         if owner.is_some_and(|old| old != ordinal) {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         *owner = Some(ordinal);
         Ok(())
@@ -328,7 +328,7 @@ impl Generation {
         viewport: bool,
     ) -> Result {
         if self.ordinal.is_some_and(|old| old != ordinal) {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         let viewport = match viewport {
             true => Some(storage::Viewport::new(pass.width, pass.height)?),

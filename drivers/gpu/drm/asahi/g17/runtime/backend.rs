@@ -74,6 +74,10 @@ impl Backend {
                 <Self as job::Backend>::fail_vm(self, error);
             }
             deferred.finish();
+            if !packet.is_published() && error != ECANCELED {
+                crate::g17::capacity::busy_report(
+                    if packet.engine() == Engine::Compute { "compute" } else { "render" }, error);
+            }
             if !packet.is_published() {
                 if packet.engine() == Engine::Compute {
                     if self.rollback_unpublished_compute().is_err() {
@@ -229,6 +233,7 @@ impl job::Backend for Backend {
         if let Some(result) = packet.early_result() {
             return result.map(|()| packet.completion.scheduler_fence());
         }
+        crate::g17::capacity::busy_begin();
         let mut deferred = match DeferredBatch::publication() {
             Ok(batch) => batch,
             Err(error) => {

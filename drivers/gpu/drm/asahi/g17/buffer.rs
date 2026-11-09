@@ -959,7 +959,7 @@ impl Manager {
     ) -> Result<Option<[u32; 4]>> {
         let candidate = prepared.as_mut().ok_or(EINVAL)?;
         if self.graph.gpu_va() != candidate.owner || self.blocks() != candidate.previous {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         let firmware_request = candidate.descriptor.is_none();
         let base = self.graph.pointer(0, fw::SIZE)?.cast::<u32>();

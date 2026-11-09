@@ -101,10 +101,10 @@ impl super::super::Backend {
                 if let Some(entry) = firmware.queues.render.entries[usize::from(slot)].as_ref() {
                     if entry.pending_error.is_some() || entry.pending_timeout {
                         self.shared.queue_events();
-                        return Err(EBUSY);
+                        return Err(crate::g17::capacity::busy());
                     }
                     if entry.constructing || entry.preparing.is_some() || entry.growing {
-                        return Err(EBUSY);
+                        return Err(crate::g17::capacity::busy());
                     }
                     if entry.parked.is_some() {
                         let metrics = resources.metrics()?;
@@ -129,7 +129,7 @@ impl super::super::Backend {
                             metrics,
                         )
                     } else {
-                        let pair = entry.pair.as_ref().ok_or(EBUSY)?;
+                        let pair = entry.pair.as_ref().ok_or_else(|| crate::g17::capacity::busy())?;
                         if pair.matches(self.owner, &self.context)? {
                             if !pair.pool().vacant() {
                                 return Ok(());
@@ -143,14 +143,14 @@ impl super::super::Backend {
                             return pool.ensure_backing(&alloc, &resources.global, self.context.vm());
                         }
                         if !pair.reusable()? {
-                            return Err(EBUSY);
+                            return Err(crate::g17::capacity::busy());
                         }
                         // The release of the pair's scheduler is armed or still being
                         // consumed: the firmware may process it against these queues.
                         // The teardown parks the pair once the release is witnessed;
                         // the new owner then installs it with fresh queue records.
                         if firmware.queues.teardown.releasing(pair.context()) {
-                            return Err(EBUSY);
+                            return Err(crate::g17::capacity::busy());
                         }
                         let foreign = !Arc::ptr_eq(pair.context().status(), self.context.status());
                         if foreign {
@@ -492,7 +492,7 @@ impl super::super::Backend {
                 }
                 // That owner may have closed while this binding was prepared.
                 if firmware.queues.teardown.releasing(pair.context()) {
-                    return Err(EBUSY);
+                    return Err(crate::g17::capacity::busy());
                 }
                 if firmware.queues.render.retired.len()
                     == firmware.queues.render.retired.capacity()
@@ -640,7 +640,7 @@ impl super::super::Backend {
                 .entry(slot)?
                 .pair
                 .as_ref()
-                .ok_or(EBUSY)?
+                .ok_or_else(|| crate::g17::capacity::busy())?
                 .qids();
             let addresses = RenderAddresses {
                 stamps: [
@@ -722,7 +722,7 @@ impl super::super::Backend {
                 // Final timeout observations can settle unrelated queues. The
                 // event worker owns the full collector needed for that sweep.
                 self.shared.queue_events();
-                return Err(EBUSY);
+                return Err(crate::g17::capacity::busy());
             }
             if !lease.is_current()
                 || firmware.recovery.pending()

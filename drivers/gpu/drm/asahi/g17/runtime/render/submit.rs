@@ -67,7 +67,7 @@ impl Backend {
                 if deadline_ns < recovery_deadline_ns && self.waiting_for_recovery()? {
                     deadline_ns = recovery_deadline_ns;
                 } else {
-                    return Err(EBUSY);
+                    return Err(crate::g17::capacity::busy());
                 }
             }
             if packet.cancel_requested() {
@@ -298,7 +298,7 @@ impl Backend {
             .wait_deadline(clock, super::super::WORK_RING_WAIT_NS)?
             .saturating_sub(super::super::now_ns());
         if remaining == 0 {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         self.shared
             .renders
@@ -679,7 +679,7 @@ impl crate::g17::Firmware {
         if !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Fragment)?
             || !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Tiling)?
         {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         if let Some(footprint) = packet.footprint.as_ref() {
             dependencies.hazard_count = self.queues.admission.publication_barriers(
@@ -696,7 +696,7 @@ impl crate::g17::Firmware {
             .owner_switch_from(&packet.context)
             .is_some_and(|scheduler| self.queues.teardown.releasing_scheduler(scheduler))
         {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         let pool = pair.pool().clone();
         let buffer_id = pair.buffer_id();

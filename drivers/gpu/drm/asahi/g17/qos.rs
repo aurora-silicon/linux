@@ -161,7 +161,7 @@ impl Accounting {
             if self.in_flight[qid] != 0
                 && (rows[index][0] != owner.qos || self.dm_by_qid[qid] != owner.data_master)
             {
-                return Err(EBUSY);
+                return Err(crate::g17::capacity::busy());
             }
         }
         let time = if busy {

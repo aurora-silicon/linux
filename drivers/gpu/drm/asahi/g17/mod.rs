@@ -1785,7 +1785,7 @@ impl gpu::Gpu for Gpu {
                     let waited = now_ns().saturating_sub(admission_started);
                     let limit = u64::from(job::TIMEOUT_MS) * 1_000_000;
                     if waited >= limit {
-                        return Err(EBUSY);
+                        return Err(crate::g17::capacity::busy());
                     }
                     self.shared.queue_events();
                     // A returned queue slot or reclaimed context wakes this.

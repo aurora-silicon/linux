@@ -69,7 +69,7 @@ impl Firmware {
                 let result = if !outer_ready {
                     // This replay has no live firmware ownership. Persistent
                     // backpressure uses the existing failed-replay retirement.
-                    Err(EBUSY)
+                    Err(crate::g17::capacity::busy())
                 } else { (|| {
                     self.queues.compute[index]
                         .as_mut()

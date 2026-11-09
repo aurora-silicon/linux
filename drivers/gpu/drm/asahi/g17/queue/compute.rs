@@ -318,7 +318,7 @@ impl Graph {
     }
     fn rearm_ring(&mut self, ring: DescriptorRing) -> Result {
         if self.ring.is_some() {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         self.ring = Some(ring);
         Ok(())
@@ -1383,7 +1383,7 @@ fn retained_capacity(
     replay_front: bool,
 ) -> Result {
     if quarantined || released {
-        return Err(EBUSY);
+        return Err(crate::g17::capacity::busy());
     }
     if active >= IN_FLIGHT || (replays != 0 && !replay_front) {
         return Err(EAGAIN);
@@ -1477,7 +1477,7 @@ mod admission_tests {
         for (quarantined, released) in [(true, false), (false, true), (true, true)] {
             assert_eq!(
                 retained_capacity(quarantined, released, 0, 1, true),
-                Err(EBUSY)
+                Err(crate::g17::capacity::busy())
             );
         }
     }
@@ -1637,7 +1637,7 @@ impl Queue {
     }
     pub(crate) fn bind_owner(&mut self, owner: u64, context: Arc<Context>) -> Result {
         if !self.reusable() {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         self.source_hint.reset_for_owner(&self.source_readers)?;
         if !context.is_current() {
@@ -1848,7 +1848,7 @@ impl Queue {
     /// device mutex and rings the control doorbell afterwards.
     pub(crate) fn vacate(&mut self, init: &crate::g17::initdata::InitData) -> Result {
         if !self.vacate_candidate() {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         let record =
             ControlRecord::FreeListRelease(self.pool.release_record(self.free_list_generation));
@@ -2203,16 +2203,16 @@ impl Graph {
             || cursors.count != ITEM_RING_ENTRIES
             || expected >= ITEM_RING_ENTRIES
         {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         let next = (expected + 1) % ITEM_RING_ENTRIES;
         if next == cursors.consumer {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         let slot = self.graph.dword(ITEMS + expected as usize * 8)?;
         let producer = self.graph.word(CURSORS + self.pointers.producer)?;
         if slot.load(Ordering::Relaxed) != 0 {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         before_publish();
         slot.store(address, Ordering::Relaxed);
@@ -2404,7 +2404,7 @@ impl Queue {
                 // A replay keeps its spared class: its own fault must still make it guilty.
                 spared_as_dropped: packet.completion.spared(),
             })
-            .map_err(|_| EBUSY)?;
+            .map_err(|_| crate::g17::capacity::busy())?;
         self.retirement_ready = false;
         let mut visible = false;
         let mut accounted = false;
@@ -2634,7 +2634,7 @@ impl Queue {
     ) -> Result<(u64, BindingAddresses)> {
         let (epoch, state) = host.epoch()?;
         if state != 0 {
-            return Err(EBUSY);
+            return Err(crate::g17::capacity::busy());
         }
         let replay_front = self
             .replays
