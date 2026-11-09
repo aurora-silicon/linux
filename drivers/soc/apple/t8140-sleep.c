@@ -802,6 +802,12 @@ bool apple_sleep_coproc_stopped(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_coproc_stopped);
 
+bool apple_sleep_commit_stops_coprocs(void)
+{
+	return READ_ONCE(t8140_sleep) && pm_suspend_via_firmware();
+}
+EXPORT_SYMBOL_GPL(apple_sleep_commit_stops_coprocs);
+
 /*
  * The last thing that can fail on the way to the commit: no CPU but this one is up and
  * interrupts are off, so no lock can be held. A coprocessor stopped here comes back only

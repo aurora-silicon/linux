@@ -57,6 +57,12 @@ void apple_sleep_coproc_set_ready(struct device *dev, bool ready);
 bool apple_sleep_coproc_stopped(struct device *dev);
 
 /*
+ * Whether this sleep's commit stops the registered coprocessors. Then one that can't be
+ * registered refuses the sleep: stopped any earlier, a later refusal would strand it.
+ */
+bool apple_sleep_commit_stops_coprocs(void);
+
+/*
  * The USB host sleeps in place for this sleep, as macOS's does: its always-on domain stays
  * up through the commit. Its PHY sets it once the controller is in its hibernation state,
  * and clears it at the wake.
@@ -159,6 +165,11 @@ static inline void apple_sleep_coproc_set_ready(struct device *dev, bool ready)
 }
 
 static inline bool apple_sleep_coproc_stopped(struct device *dev)
+{
+	return false;
+}
+
+static inline bool apple_sleep_commit_stops_coprocs(void)
 {
 	return false;
 }
