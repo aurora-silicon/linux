@@ -11,10 +11,20 @@ maintainers:
 
 description: |
   SPMI radio power-management follower. The firmware controls its power
-  policy; this node only describes its address on the SPMI bus.
+  policy. With the apple,spmi-nvmem fallback the follower register space is
+  also exported as a read-only NVMEM device for inspection.
+
+select:
+  properties:
+    compatible:
+      contains:
+        const: apple,radio-pmu
+  required:
+    - compatible
 
 properties:
   compatible:
+    minItems: 2
     items:
       - enum:
           - apple,t6041-radio-pmu
@@ -22,6 +32,7 @@ properties:
           - apple,t6000-uwb-pmu
           - apple,t8112-wifibt-pmu
       - const: apple,radio-pmu
+      - const: apple,spmi-nvmem
 
   reg:
     maxItems: 1
@@ -30,4 +41,15 @@ required:
   - compatible
   - reg
 
-additionalProperties: false
+allOf:
+  - $ref: /schemas/nvmem/nvmem.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,spmi-nvmem
+    then:
+      required:
+        - read-only
+
+unevaluatedProperties: false

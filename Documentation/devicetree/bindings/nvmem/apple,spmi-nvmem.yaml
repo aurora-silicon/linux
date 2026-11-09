@@ -14,6 +14,24 @@ maintainers:
 allOf:
   - $ref: nvmem.yaml#
 
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,abbey-pmic
+          - apple,baku-pmic
+          - apple,chapel-pmic
+          - apple,maverick-pmic
+          - apple,mirabeau-pmic
+          - apple,monaco-pmic
+          - apple,sera-pmic
+          - apple,simetra-pmic
+          - apple,stowe-pmic
+          - apple,vale-pmic
+  required:
+    - compatible
+
 properties:
   compatible:
     items:

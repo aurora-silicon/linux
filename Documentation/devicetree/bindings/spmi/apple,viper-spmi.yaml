@@ -11,7 +11,17 @@ maintainers:
 
 description: |
   A Viper endpoint on an auxiliary SPMI bus. Its register protocol and
-  firmware ownership are separate from those of the primary PMIC.
+  firmware ownership are separate from those of the primary PMIC. With the
+  apple,spmi-nvmem fallback its register space is also exported as a
+  read-only NVMEM device for inspection.
+
+select:
+  properties:
+    compatible:
+      contains:
+        const: apple,viper-spmi
+  required:
+    - compatible
 
 properties:
   compatible:
@@ -19,6 +29,10 @@ properties:
       - items:
           - const: apple,t6000-viper-spmi
           - const: apple,viper-spmi
+      - items:
+          - const: apple,t6000-viper-spmi
+          - const: apple,viper-spmi
+          - const: apple,spmi-nvmem
 
   reg:
     maxItems: 1
@@ -27,4 +41,15 @@ required:
   - compatible
   - reg
 
-additionalProperties: false
+allOf:
+  - $ref: /schemas/nvmem/nvmem.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,spmi-nvmem
+    then:
+      required:
+        - read-only
+
+unevaluatedProperties: false
