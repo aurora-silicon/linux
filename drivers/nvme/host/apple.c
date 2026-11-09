@@ -3125,6 +3125,11 @@ static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 	.needs_ioq_registers = true,
 	.cold_reset = true,
 	.max_queue_depth = 64,
+	/* T8140's values: T8132's sleep path hasn't been traced. */
+	.sleep_traced = true,
+	.sleep_epmap_last_mask = BIT(0),
+	.sleep_flush_max_nsid = 1,
+	.sleep_shn = NVME_CC_SHN_MASK,
 	/* Explicit flushes are required for writes to survive a reset on J713. */
 	.quirks = NVME_QUIRK_BROKEN_FUA,
 };
