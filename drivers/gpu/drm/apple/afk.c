@@ -966,6 +966,27 @@ static void afk_recv_handle_compact_init(struct apple_dcp_afkep *ep,
 	}
 }
 
+/* IOReturn values of a refused call (IOKit's sys_iokit error space) */
+#define AFK_IORETURN_NO_DEVICE	0xe00002c0
+#define AFK_IORETURN_OFFLINE	0xe00002d7
+#define AFK_IORETURN_NOT_READY	0xe00002d8
+
+/*
+ * An interface that is offline or not there (yet) is -ENODEV, as a call to
+ * an interface already gone is; anything else the firmware refused, -EREMOTEIO.
+ */
+static int afk_compact_refusal_errno(u32 ioreturn)
+{
+	switch (ioreturn) {
+	case AFK_IORETURN_NO_DEVICE:
+	case AFK_IORETURN_OFFLINE:
+	case AFK_IORETURN_NOT_READY:
+		return -ENODEV;
+	default:
+		return -EREMOTEIO;
+	}
+}
+
 static void afk_recv_handle_compact_reply(struct apple_dcp_afkep *ep,
 					  u16 channel, u8 type,
 					  const void *payload,
@@ -976,6 +997,7 @@ static void afk_recv_handle_compact_reply(struct apple_dcp_afkep *ep,
 	struct afk_compact_cmd *pending, *match = NULL;
 	unsigned long flags;
 	size_t copy_size;
+	bool refused;
 
 	if (payload_size < sizeof(*desc)) {
 		dev_err(ep->dcp->dev,
@@ -990,13 +1012,22 @@ static void afk_recv_handle_compact_reply(struct apple_dcp_afkep *ep,
 			call = NULL;
 	}
 
+	/*
+	 * A call the firmware refuses is answered with its descriptor alone:
+	 * the request's status, and an IOReturn where the length goes (an
+	 * audio interface the firmware is replacing answers an Open with
+	 * kIOReturnOffline). It carries no call header, so it matches by its
+	 * status only.
+	 */
+	refused = payload_size == sizeof(*desc);
+
 	spin_lock_irqsave(&ep->lock, flags);
 	list_for_each_entry(pending, &ep->compact_cmds, node) {
 		if (pending->channel != channel || pending->type != type)
 			continue;
 		if (pending->request_status != le32_to_cpu(desc->status))
 			continue;
-		if (pending->service_call &&
+		if (pending->service_call && !refused &&
 		    (!call || pending->group != le16_to_cpu(call->group) ||
 		     pending->command != le32_to_cpu(call->command)))
 			continue;
@@ -1028,6 +1059,18 @@ static void afk_recv_handle_compact_reply(struct apple_dcp_afkep *ep,
 			le32_to_cpu(desc->status));
 		wake_up_all(&ep->compact_orphan_wq);
 		kfree(match);
+		return;
+	}
+	if (refused && match->service_call) {
+		u32 ioreturn = le32_to_cpu(desc->length);
+
+		match->retcode = ioreturn;
+		match->status = afk_compact_refusal_errno(ioreturn);
+		complete(&match->done);
+		spin_unlock_irqrestore(&ep->lock, flags);
+		dev_dbg(ep->dcp->dev,
+			"AFK[ep:%02x]: call group %u cmd %u on interface %u refused: %#x\n",
+			ep->endpoint, match->group, match->command, channel, ioreturn);
 		return;
 	}
 	match->retcode = le32_to_cpu(desc->status);
