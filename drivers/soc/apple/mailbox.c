@@ -962,25 +962,10 @@ static void apple_mbox_v8_rx_stop(struct apple_mbox *mbox)
 	cancel_delayed_work_sync(&priv->rx_poll_work);
 }
 
-int apple_mbox_start(struct apple_mbox *mbox)
+/* The mailbox-level enables, which the mailbox's power domain does not keep. */
+static void apple_mbox_enable_hw(struct apple_mbox *mbox)
 {
 	u32 control;
-	int ret = 0;
-
-	mutex_lock(&mbox->lifecycle_lock);
-	if (mbox->removing) {
-		ret = -ENODEV;
-		goto out_unlock;
-	}
-	if (mbox->active)
-		goto out_unlock;
-
-	ret = pm_runtime_resume_and_get(mbox->dev);
-	if (ret) {
-		dev_err(mbox->dev, "mailbox start: runtime resume failed: %d\n", ret);
-		apple_mbox_clear_resume_error(mbox);
-		goto out_unlock;
-	}
 
 	if (mbox->hw->ap_initializes_mailboxes) {
 		/* The primary T8140 outbox requires its enable bit before use. */
@@ -1001,6 +986,28 @@ int apple_mbox_start(struct apple_mbox *mbox)
 				       mbox->hw->irq_bit_send_empty,
 			       mbox->regs + mbox->hw->irq_enable);
 	}
+}
+
+int apple_mbox_start(struct apple_mbox *mbox)
+{
+	int ret = 0;
+
+	mutex_lock(&mbox->lifecycle_lock);
+	if (mbox->removing) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
+	if (mbox->active)
+		goto out_unlock;
+
+	ret = pm_runtime_resume_and_get(mbox->dev);
+	if (ret) {
+		dev_err(mbox->dev, "mailbox start: runtime resume failed: %d\n", ret);
+		apple_mbox_clear_resume_error(mbox);
+		goto out_unlock;
+	}
+
+	apple_mbox_enable_hw(mbox);
 
 	if (apple_mbox_has_rx_poller(mbox)) {
 		WRITE_ONCE(mbox->active, true);
@@ -1040,6 +1047,25 @@ void apple_mbox_stop(struct apple_mbox *mbox)
 	mutex_unlock(&mbox->lifecycle_lock);
 }
 EXPORT_SYMBOL(apple_mbox_stop);
+
+/*
+ * The mailbox's power domain was off while it stayed started (its consumer
+ * powered its co-processor down and up again around it): set the
+ * mailbox-level enables again before the co-processor runs.
+ */
+int apple_mbox_restore(struct apple_mbox *mbox)
+{
+	int ret = 0;
+
+	mutex_lock(&mbox->lifecycle_lock);
+	if (mbox->removing || !mbox->active)
+		ret = -ENODEV;
+	else
+		apple_mbox_enable_hw(mbox);
+	mutex_unlock(&mbox->lifecycle_lock);
+	return ret;
+}
+EXPORT_SYMBOL(apple_mbox_restore);
 
 void apple_mbox_hold_rx(struct apple_mbox *mbox)
 {

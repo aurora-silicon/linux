@@ -566,7 +566,7 @@
 /arm-io/smc/iop-smc-nub/smc-charger-util - -> /soc/smc@290400000
 /arm-io/uart0 0x39b200000 -> /soc/serial@39b200000
 /arm-io/uart0/debug-console - -> /soc/serial@39b200000
-/arm-io/dockchannel-uart 0x29250c000 -> /soc/fifo@29250c000
+/arm-io/dockchannel-uart 0x29250c000 -> /soc/serial@29252c000
 /arm-io/spi1 0x39b104000 -> /soc/spi@39b104000
 /arm-io/spi1/spinor /arm-io/spi1@0x0 -> /soc/spi@39b104000/flash@0
 /arm-io/spi1/spinor/firmware - -> WAIVED: Firmware flash partition; parent flash hardware is inventoried separately.

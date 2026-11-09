@@ -168,6 +168,11 @@
 	status = "okay";
 };
 
+/* A spare PWM channel for developers; no consumer is known. */
+&fpwm0 {
+	status = "okay";
+};
+
 &fpwm1 {
 	status = "okay";
 };
@@ -272,6 +277,50 @@
 };
 
 #include "hwmon-laptop.dtsi"
+
+/*
+ * GPU temperatures, after the channels the thermal zones index. The SMC
+ * publishes them only while the GPU is powered: with the GPU off, Tg0e,
+ * Tg0m and Tg0q read 0 C and Tg0f, Tg0n and Tg0r 4.6 C (they track the
+ * first three plus a fixed 4.6 C). Those placeholders are no data.
+ */
+&smc_hwmon {
+	temperature-Tg0e {
+		apple,key-id = "Tg0e";
+		label = "GPU Tg0e";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0f {
+		apple,key-id = "Tg0f";
+		label = "GPU Tg0f";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0m {
+		apple,key-id = "Tg0m";
+		label = "GPU Tg0m";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0n {
+		apple,key-id = "Tg0n";
+		label = "GPU Tg0n";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0q {
+		apple,key-id = "Tg0q";
+		label = "GPU Tg0q";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0r {
+		apple,key-id = "Tg0r";
+		label = "GPU Tg0r";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+};
 /*
  * Mesa fingerprint sensor on spi2. The J413 platform device tree
  * (/arm-io/spi2/mesa) describes it as J415's does: power on AP GPIO 178,
@@ -306,11 +355,12 @@
 };
 
 &nub_spmi1 {
+	status = "okay";
+
 	pmic@e {
 		compatible = "apple,vale-pmic", "apple,spmi-nvmem";
 		reg = <0xe SPMI_USID>;
 		read-only;
-		status = "disabled";
 	};
 };
 
@@ -357,9 +407,15 @@
 	};
 };
 
+/* NFC controller (Stockholm): identified once, then kept off. */
+&smc_gpio {
+	apple,output-templates = <0xf 0x00800000>;
+};
+
 &aop_spmi1 {
 	interrupt-controller;
 	#interrupt-cells = <2>;
+	status = "okay";
 
 	nfc@c {
 		compatible = "apple,t8112-stockholm-spmi", "apple,stockholm-spmi";
@@ -372,7 +428,9 @@
 			     <164 IRQ_TYPE_NONE>,
 			     <165 IRQ_TYPE_NONE>,
 			     <166 IRQ_TYPE_NONE>;
-		status = "disabled";
+		interrupt-names = "event0", "event1", "event2", "error",
+				  "event4", "host-wake", "data-ready";
+		enable-gpios = <&smc_gpio 15 GPIO_ACTIVE_HIGH>;
 	};
 };
 

@@ -2926,7 +2926,7 @@ impl SepData {
         let advertised = match self.await_capture() {
             CaptureWait::Ready(n) => n,
             CaptureWait::Timeout => {
-                dev_warn!(self.dev, "verify: the capture ended without a frame\n");
+                dev_info!(self.dev, "verify: the capture ended without a frame\n");
                 // No finger came: nothing was compared, so ask again rather
                 // than report an error. PLACE names the cause.
                 self.retry_cause(bio::Guidance::Place);
@@ -4037,7 +4037,7 @@ impl SepData {
         let available = match self.await_capture() {
             CaptureWait::Ready(n) => n,
             CaptureWait::Timeout => {
-                dev_warn!(self.dev, "enrol: capture {} ended without a frame\n", counter);
+                dev_info!(self.dev, "enrol: capture {} ended without a frame\n", counter);
                 return ImageOutcome::NoFinger;
             }
             CaptureWait::Fault(state) => {
@@ -4372,26 +4372,62 @@ impl SepData {
     fn on_lock_state_notification(&self, word: u64) {
         let state = (word >> proto::MSG_TYPE_SHIFT) as u16;
         let user = (word >> proto::MSG_DATA_SHIFT) as u32;
-        self.bio_lock_state
-            .store(u64::from(state) | (u64::from(user) << 16), Relaxed);
+        let word = u64::from(state) | (u64::from(user) << 16);
+        self.bio_lock_state.store(word, Relaxed);
         self.bio_lock_state_seq.fetch_add(1, Relaxed);
         let lockout = if state & LOCK_STATE_NEEDS_PASSWORD != 0 { "set" } else { "clear" };
         let n = lock_state_names(state);
-        dev_info!(
-            self.dev,
-            "sbio: lock state of user {} is {:#06x} (lockout {}:{}{}{}{}{}{}{})\n",
-            user,
-            state,
-            lockout,
-            n[0],
-            n[1],
-            n[2],
-            n[3],
-            n[4],
-            n[5],
-            n[6]
-        );
+        // The enclave repeats a user's state after each query; log each
+        // user's state when it changes, and a repeat only at debug level.
+        if self.lock_state_changed(word) {
+            dev_info!(
+                self.dev,
+                "sbio: lock state of user {} is {:#06x} (lockout {}:{}{}{}{}{}{}{})\n",
+                user,
+                state,
+                lockout,
+                n[0],
+                n[1],
+                n[2],
+                n[3],
+                n[4],
+                n[5],
+                n[6]
+            );
+        } else {
+            dev_dbg!(
+                self.dev,
+                "sbio: lock state of user {} is still {:#06x}\n",
+                user,
+                state
+            );
+        }
         self.sbio_wq.notify_all();
+    }
+
+    /// Records `word` (state and user, as in `bio_lock_state`) as the last
+    /// lock state logged for its user. Returns false if it is that user's
+    /// last logged state already. A user not in the table takes the slot of
+    /// one that is, in turn, so a new user is always logged.
+    fn lock_state_changed(&self, word: u64) -> bool {
+        let user = word >> 16;
+        let slots = &self.bio_lock_logged;
+        let mut free = None;
+        for (i, slot) in slots.iter().enumerate() {
+            let seen = slot.load(Relaxed);
+            if seen == 0 {
+                free.get_or_insert(i);
+            } else if seen >> 16 == user {
+                if seen == word {
+                    return false;
+                }
+                slot.store(word, Relaxed);
+                return true;
+            }
+        }
+        let i = free.unwrap_or_else(|| (self.bio_lock_state_seq.load(Relaxed) as usize) % slots.len());
+        slots[i].store(word, Relaxed);
+        true
     }
 
     /// Waits up to `timeout_ms` for a lock-state notification for `user`
