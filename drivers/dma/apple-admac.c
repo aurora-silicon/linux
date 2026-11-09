@@ -715,7 +715,11 @@ static int admac_resume(struct dma_chan *chan)
 	if (adchan->current_tx && adchan->current_tx->error) {
 		ret = -EIO;
 	} else if (adchan->lost && adchan->current_tx) {
-		/* The rings went with the registers: start from the top. */
+		struct admac_tx *tx = adchan->current_tx;
+
+		/* The rings went with the registers: start again from the last period reclaimed. */
+		tx->submitted_pos = tx->reclaimed_pos;
+		tx->nperiods_outstanding = 0;
 		adchan->nperiod_acks = 0;
 		admac_start_current_tx(adchan);
 	} else {
