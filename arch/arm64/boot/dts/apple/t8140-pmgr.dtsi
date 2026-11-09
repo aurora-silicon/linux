@@ -844,12 +844,27 @@
 		status = "okay";
 	};
 
+	/*
+	 * The SIO block itself (ADT power state SIO, off at boot): the parent
+	 * of its CPU and of DPA_P. Its DMA shims sit behind it, and the SIO
+	 * firmware takes an SError when it commits the shim table without it.
+	 */
+	ps_sio: power-controller@260 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x260 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "sio";
+		status = "okay";
+	};
+
 	ps_sio_cpu: power-controller@2a8 {
 		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x2a8 4>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "sio_cpu";
+		power-domains = <&ps_sio>;
 		status = "okay";
 	};
 
@@ -931,6 +946,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "dpa_p";
+		power-domains = <&ps_sio>;
 		apple,always-on;
 		status = "okay";
 	};
