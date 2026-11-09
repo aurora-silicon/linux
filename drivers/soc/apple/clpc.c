@@ -265,6 +265,7 @@ int apple_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu **out)
 	if (!np)
 		return of_find_property(dev->of_node, "apple,clpc", NULL) ? -EINVAL : 0;
 	if (!of_device_is_compatible(np, "apple,t6041-clpc") &&
+	    !of_device_is_compatible(np, "apple,t6050-clpc") &&
 	    !of_device_is_compatible(np, "apple,t8132-clpc") &&
 	    !of_device_is_compatible(np, "apple,t8140-clpc") &&
 	    !of_device_is_compatible(np, "apple,t8142-clpc")) {
@@ -1669,7 +1670,27 @@ static const struct apple_clpc_hw apple_clpc_hw_t8152 = {
 	},
 };
 
+/*
+ * T6050 (M5 Pro/Max): DCS states 0-6 on rail 0, fabric states 0-3 on rail 1.
+ * The boot loader enables no agent on either rail, so without this floor
+ * the DRAM controller and the fabric stay at state 0: CPU memcpy caps at
+ * about 34 GB/s on the M5 Pro. A busy cluster in the upper half of its range
+ * asks for the top states; three busy samples in a row (12 ms) are needed,
+ * as on T6040. The GPU driver reports its work in flight and gets the top
+ * of the map while it has some.
+ */
+static const struct apple_clpc_hw apple_clpc_hw_t6050 = {
+	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
+	.map = {
+		[APPLE_CLPC_DCS] = { 2, 4, 6, 6 },
+		[APPLE_CLPC_SOC] = { 1, 2, 3, 3 },
+	},
+	.sustain = 3,
+	.gpu_input = true,
+};
+
 static const struct of_device_id apple_clpc_of_match[] = {
+	{ .compatible = "apple,t6050-clpc", .data = &apple_clpc_hw_t6050 },
 	{ .compatible = "apple,t8132-clpc", .data = &apple_clpc_hw_t8132 },
 	{ .compatible = "apple,t8140-clpc", .data = &apple_clpc_hw_t8140 },
 	{ .compatible = "apple,t8142-clpc", .data = &apple_clpc_hw_t8142 },

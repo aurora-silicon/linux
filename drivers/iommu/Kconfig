@@ -319,6 +319,7 @@ config APPLE_DART
 config APPLE_DART_J713_DCP
 	bool "Retained J713 display DART support"
 	depends on APPLE_DART=y && ARM64_16K_PAGES
+	select MFD_SYSCON
 	help
 	  Adopt the qualified running J713 internal display DARTs. Their
 	  firmware-visible allocations, page tables and noncoherent CPU
