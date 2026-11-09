@@ -189,12 +189,10 @@
 
 	accel {
 		compatible = "apple,t8112-aop-accel", "apple,aop-accel";
-		status = "disabled";
 	};
 
 	gyro {
 		compatible = "apple,t8112-aop-gyro", "apple,aop-gyro";
-		status = "disabled";
 	};
 };
 
