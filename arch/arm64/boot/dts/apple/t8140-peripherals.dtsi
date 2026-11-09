@@ -507,14 +507,49 @@
 		status = "disabled";
 	};
 
-	/* ADT /dock-connect; no qualified host transport/ownership contract. */
+	/* ADT /dock-connect: debug dock connection status, read only. */
 	debug_dock: debug-dock@3082d8008 {
 		compatible = "apple,t8140-debug-dock", "apple,debug-dock";
 		reg = <0x3 0x082d8008 0x0 0x4>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 303 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 304 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
+	};
+
+	cpu_e0_coresight: cpu-debug@210010000 {
+		compatible = "apple,t8140-cpu-coresight", "apple,cpu-coresight";
+		reg = <0x2 0x10010000 0x0 0x300c8>;
+		cpu = <&cpu_e0>;
+	};
+
+	cpu_e1_coresight: cpu-debug@210110000 {
+		compatible = "apple,t8140-cpu-coresight", "apple,cpu-coresight";
+		reg = <0x2 0x10110000 0x0 0x300c8>;
+		cpu = <&cpu_e1>;
+	};
+
+	cpu_e2_coresight: cpu-debug@210210000 {
+		compatible = "apple,t8140-cpu-coresight", "apple,cpu-coresight";
+		reg = <0x2 0x10210000 0x0 0x300c8>;
+		cpu = <&cpu_e2>;
+	};
+
+	cpu_e3_coresight: cpu-debug@210310000 {
+		compatible = "apple,t8140-cpu-coresight", "apple,cpu-coresight";
+		reg = <0x2 0x10310000 0x0 0x300c8>;
+		cpu = <&cpu_e3>;
+	};
+
+	cpu_p0_coresight: cpu-debug@211010000 {
+		compatible = "apple,t8140-cpu-coresight", "apple,cpu-coresight";
+		reg = <0x2 0x11010000 0x0 0x300c8>;
+		cpu = <&cpu_p0>;
+	};
+
+	cpu_p1_coresight: cpu-debug@211110000 {
+		compatible = "apple,t8140-cpu-coresight", "apple,cpu-coresight";
+		reg = <0x2 0x11110000 0x0 0x300c8>;
+		cpu = <&cpu_p1>;
 	};
 
 	/* ADT /arm-io/eic named MMIO apertures are absolute addresses. */
