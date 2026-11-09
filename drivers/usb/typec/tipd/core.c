@@ -3078,8 +3078,9 @@ int tipd_init(struct tps6598x *tps)
 	if (tps->contaminant_ops) {
 		ret = tps->contaminant_ops->update(tps);
 		if (ret) {
-			dev_warn(tps->dev,
-				 "connector contaminant state unavailable: %d\n", ret);
+			if (ret != -EINPROGRESS)
+				dev_warn(tps->dev,
+					 "connector contaminant state unavailable: %d\n", ret);
 			ret = 0;
 		}
 	}
