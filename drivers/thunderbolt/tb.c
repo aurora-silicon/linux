@@ -3161,11 +3161,21 @@ static int tb_approve_xdomain_paths(struct tb *tb, struct tb_xdomain *xd,
 	struct tb_switch *sw;
 	int ret;
 
+	mutex_lock(&tb->lock);
+
+	/*
+	 * A service driver can still ask for paths after the XDomain was
+	 * unplugged or while the domain is being stopped, when the router
+	 * may already be gone and tb->root_switch is NULL.
+	 */
+	if (xd->is_unplugged || !tb->root_switch) {
+		mutex_unlock(&tb->lock);
+		return -ENODEV;
+	}
+
 	sw = tb_to_switch(xd->dev.parent);
 	dst_port = tb_port_at(xd->route, sw);
 	nhi_port = tb_switch_find_port(tb->root_switch, TB_TYPE_NHI);
-
-	mutex_lock(&tb->lock);
 
 	/*
 	 * When tunneling DMA paths the link should not enter CL states
