@@ -168,8 +168,6 @@ pub(crate) enum FirmwareProfile {
     /// The firmware publishes its kernel roots and the driver owns the page tables (A18 Pro,
     /// M4 Pro).
     PublishedRoots,
-    /// An M5 board without bare-metal GPU tables yet: probe refuses it.
-    M5NoBareMetalTables,
     /// The M5 firmware on bare metal: both roles publish their kernel roots
     /// ([`mmu::UatFirmware::PublishedRoots`]) and the driver owns the page tables.
     M5PublishedRoots,
@@ -195,7 +193,7 @@ impl Config {
 impl FirmwareProfile {
     /// The M5 firmware's protocol (26A428 InitData graph, queues and submission).
     pub(crate) const fn is_m5(self) -> bool {
-        matches!(self, Self::M5NoBareMetalTables | Self::M5PublishedRoots)
+        matches!(self, Self::M5PublishedRoots)
     }
 }
 
