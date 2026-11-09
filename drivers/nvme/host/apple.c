@@ -2942,6 +2942,8 @@ static int apple_nvme_suspend(struct device *dev)
 	int ret;
 
 	if (anv->hw->needs_ioq_registers) {
+		/* A sleep right after a wake, as from a dark wake: let that reset finish first. */
+		flush_work(&anv->ctrl.reset_work);
 		anv->sleep_stop = apple_nvme_sleep_wanted(anv);
 		anv->sleep_idled = false;
 		anv->sleep_failed = false;
