@@ -4359,25 +4359,36 @@ impl SepData {
     fn on_lock_state_notification(&self, word: u64) {
         let state = (word >> proto::MSG_TYPE_SHIFT) as u16;
         let user = (word >> proto::MSG_DATA_SHIFT) as u32;
-        self.bio_lock_state
-            .store(u64::from(state) | (u64::from(user) << 16), Relaxed);
+        let word = u64::from(state) | (u64::from(user) << 16);
+        let previous = self.bio_lock_state.xchg(word, Relaxed);
         self.bio_lock_state_seq.fetch_add(1, Relaxed);
         let lockout = if state & LOCK_STATE_NEEDS_PASSWORD != 0 { "set" } else { "clear" };
         let n = lock_state_names(state);
-        dev_info!(
-            self.dev,
-            "sbio: lock state of user {} is {:#06x} (lockout {}:{}{}{}{}{}{}{})\n",
-            user,
-            state,
-            lockout,
-            n[0],
-            n[1],
-            n[2],
-            n[3],
-            n[4],
-            n[5],
-            n[6]
-        );
+        // The enclave repeats the same state after each query; log a change
+        // once, and a repeat of the last notification only at debug level.
+        if previous != word {
+            dev_info!(
+                self.dev,
+                "sbio: lock state of user {} is {:#06x} (lockout {}:{}{}{}{}{}{}{})\n",
+                user,
+                state,
+                lockout,
+                n[0],
+                n[1],
+                n[2],
+                n[3],
+                n[4],
+                n[5],
+                n[6]
+            );
+        } else {
+            dev_dbg!(
+                self.dev,
+                "sbio: lock state of user {} is still {:#06x}\n",
+                user,
+                state
+            );
+        }
         self.sbio_wq.notify_all();
     }
 
