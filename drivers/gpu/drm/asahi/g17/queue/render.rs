@@ -1660,7 +1660,12 @@ impl Pair {
         } else {
             0
         };
-        let required = required.max(feedback);
+        // The estimate is an upper bound from the tile count, and the buffer's capacity was
+        // fixed when it was created for this pair's first render. Grow as far as it goes, as the
+        // firmware's own requests do (firmware_target), instead of failing the render with
+        // ERANGE: a 16384x16384 no-attachment render after smaller ones lost the device
+        // (dEQP-GLES31.functional.fbo.no_attachments.maximums.*).
+        let required = required.max(feedback).min(self.memory.manager.max_blocks());
         Ok((required > self.memory.manager.blocks()).then_some(required))
     }
 

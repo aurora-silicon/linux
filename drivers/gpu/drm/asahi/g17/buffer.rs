@@ -845,6 +845,10 @@ impl Manager {
     pub(crate) fn firmware_target(&self) -> usize {
         self.blocks().saturating_add(fw::GROW_BLOCKS).min(self.tvb.geometry.max_blocks())
     }
+    /// The most blocks this buffer's geometry can hold.
+    pub(crate) fn max_blocks(&self) -> usize {
+        self.tvb.geometry.max_blocks()
+    }
     /// Read-only diagnostic while firmware is halted. In particular this
     /// does not reset the high-water counter as automatic_target() does.
     pub(crate) fn report_recovery(&self) {
