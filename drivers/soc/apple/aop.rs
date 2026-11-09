@@ -1651,6 +1651,13 @@ impl AopData {
                 if len > mem::size_of::<u64>() {
                     return Err(EINVAL);
                 }
+                let mut cur = [0u8; 8];
+                cur[..len].copy_from_slice(&arg_bytes[idx..idx + len]);
+                let cur = u64::from_le_bytes(cur);
+                dev_info!(self.dev, "GAPS10 trial: bootarg {:#010x} firmware {:#x} wanted {:#x}\n", key, cur, *v);
+                if *v == u64::MAX {
+                    break;
+                }
                 arg_bytes[idx..idx + len].copy_from_slice(&v.to_le_bytes()[..len]);
                 break;
             }
@@ -2602,7 +2609,7 @@ const HW_CFG_T8103: AopHwConfig = AopHwConfig {
 };
 const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
-    ncal: 0,
+    ncal: u64::MAX,
     aopt: 0,
     alig: 128,
     patch_bootargs: true,
@@ -2616,7 +2623,7 @@ const HW_CFG_T8112: AopHwConfig = AopHwConfig {
 };
 const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
-    ncal: 0,
+    ncal: u64::MAX,
     aopt: 0,
     alig: 64,
     patch_bootargs: true,
