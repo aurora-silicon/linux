@@ -342,7 +342,28 @@ static bool dcp_typec_port_follows(struct apple_dcp_typec_port *port)
 static bool dcp_typec_narrows(struct apple_dcp *dcp)
 {
 	/* This tree narrows on dual-stream machines too. */
-	return !dcp_typec_follows_crtc(dcp);
+	return !dcp_typec_fixed_crtcs() && !dcp_typec_follows_crtc(dcp);
+}
+
+/*
+ * T6050 establishes a tunnel on a processor before KMS sees its monitor.
+ * Give each port/pipeline pair a connector whose capabilities stay fixed,
+ * rather than publishing the current tunnel owner in possible_crtcs.
+ */
+bool dcp_typec_fixed_crtcs(void)
+{
+	KUNIT_STATIC_STUB_REDIRECT(dcp_typec_fixed_crtcs);
+
+	return of_machine_is_compatible("apple,t6050");
+}
+
+static struct apple_connector *
+dcp_typec_route_connector(struct apple_dcp_typec_route *route, bool tunnel)
+{
+	if (dcp_typec_fixed_crtcs())
+		return route->connector;
+	return tunnel && dcp_fabric_dpin_slot(route->tunnel_dpin) ?
+		route->port->secondary_connector : route->port->connector;
 }
 
 bool dcp_is_typec_only(struct platform_device *pdev)
@@ -506,8 +527,7 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 {
 	struct apple_dcp *dcp = route->dcp;
 	struct apple_connector *connector =
-		xbar != route->xbar && dcp_fabric_dpin_slot(route->tunnel_dpin) ?
-		route->port->secondary_connector : route->port->connector;
+		dcp_typec_route_connector(route, xbar != route->xbar);
 	int ret;
 
 	dcp_tb_events_retire(dcp);
@@ -756,7 +776,7 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 		schedule_work(&connector->bl_sync_wq);
 
 		/* Unrouted: the port could go to any of its pipelines again. */
-		if (connector->port_encoder)
+		if (connector->port_encoder && !dcp_typec_fixed_crtcs())
 			connector->port_encoder->possible_crtcs =
 				connector->candidate_crtcs;
 	}
@@ -4203,19 +4223,25 @@ bool dcp_typec_port_unusable(unsigned int idx)
 	return true;
 }
 
-void dcp_typec_port_set_connector(unsigned int idx, bool secondary,
-				  struct apple_connector *connector)
+static void dcp_typec_port_bind_connector(struct apple_dcp_typec_port *port,
+					  bool secondary,
+					  struct apple_connector *connector,
+					  struct platform_device *pipeline)
 {
-	struct apple_dcp_typec_port *port;
 	struct apple_dcp_typec_route *owner;
 
-	guard(mutex)(&dcp_typec_fabric_lock);
+	lockdep_assert_held(&dcp_typec_fabric_lock);
 
-	port = dcp_typec_port_by_index(idx);
-	if (!port)
-		return;
+	if (pipeline) {
+		struct apple_dcp *dcp = platform_get_drvdata(pipeline);
+		struct apple_dcp_typec_route *route = dcp_typec_port_route(port, dcp);
 
-	if (secondary) {
+		if (WARN_ON(!route))
+			return;
+		route->connector = connector;
+		owner = route == port->owner || route == port->secondary_owner ?
+			route : NULL;
+	} else if (secondary) {
 		port->secondary_connector = connector;
 		owner = port->secondary_owner;
 	} else {
@@ -4244,6 +4270,18 @@ void dcp_typec_port_set_connector(unsigned int idx, bool secondary,
 		dcp->connector = connector;
 		dcp->connector_type = DRM_MODE_CONNECTOR_USB;
 	}
+}
+
+void dcp_typec_port_set_connector(unsigned int idx, bool secondary,
+				  struct apple_connector *connector,
+				  struct platform_device *pipeline)
+{
+	struct apple_dcp_typec_port *port;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+	port = dcp_typec_port_by_index(idx);
+	if (port)
+		dcp_typec_port_bind_connector(port, secondary, connector, pipeline);
 }
 
 static void dcp_typec_route_unregister(void *data)
@@ -5131,6 +5169,21 @@ void dcp_link(struct platform_device *pdev, struct apple_crtc *crtc,
 		WRITE_ONCE(connector->connected, !iomfb_m4_error(dcp) && dcp->active);
 }
 
+static void dcp_typec_port_unlink(struct apple_dcp_typec_port *port,
+				  struct drm_device *drm)
+{
+	struct apple_dcp_typec_route *route;
+
+	lockdep_assert_held(&dcp_typec_fabric_lock);
+	list_for_each_entry(route, &port->routes, port_link)
+		if (route->connector && route->connector->base.dev == drm)
+			route->connector = NULL;
+	if (port->connector && port->connector->base.dev == drm)
+		port->connector = NULL;
+	if (port->secondary_connector && port->secondary_connector->base.dev == drm)
+		port->secondary_connector = NULL;
+}
+
 /* Called after component unbind has drained all firmware callbacks. The
  * platform devices and their Type-C muxes can outlive this DRM instance.
  */
@@ -5141,13 +5194,8 @@ void dcp_unlink(struct drm_device *drm)
 
 	guard(mutex)(&dcp_typec_fabric_lock);
 
-	list_for_each_entry(port, &dcp_typec_ports, link) {
-		if (port->connector && port->connector->base.dev == drm)
-			port->connector = NULL;
-		if (port->secondary_connector &&
-		    port->secondary_connector->base.dev == drm)
-			port->secondary_connector = NULL;
-	}
+	list_for_each_entry(port, &dcp_typec_ports, link)
+		dcp_typec_port_unlink(port, drm);
 
 	drm_for_each_crtc(crtc, drm) {
 		struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
@@ -5198,3 +5246,7 @@ int dcp_typec_test_link(struct platform_device *pdev, bool enabled)
 	return enabled ? dcp_dptx_connect_oob(pdev, 0) :
 			 dcp_dptx_disconnect_oob(pdev, 0);
 }
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_KUNIT_TEST)
+#include "dcp-fabric-topology-test.c"
+#endif
