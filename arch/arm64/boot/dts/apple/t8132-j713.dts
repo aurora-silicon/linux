@@ -83,12 +83,28 @@
 	status = "okay";
 };
 
+/* Deep sleep needs both CPU clusters' power gates; iBoot enables E's only. */
+&cluster_pwrgate {
+	status = "okay";
+};
+
 /* The enclave must take the sleep request, so its driver has to bind. */
 &sep_dart {
 	status = "okay";
 };
 
+/* Only named: the sleep's last refusal reads its state to see the enclave gate. */
+&ps_sep {
+	apple,firmware-owned;
+	status = "okay";
+};
+
 &sep {
+	/*
+	 * Without a domain the driver tells the enclave at .suspend, and a sleep
+	 * refused after that finds it gated with its mailbox gone.
+	 */
+	power-domains = <&ps_sep>, <&ps_gpio>;
 	status = "okay";
 };
 

@@ -512,6 +512,10 @@
 			reg = <0x0 0x0 0x0 0x1000>; /* To be filled by loader */
 			#address-cells = <2>;
 			#size-cells = <0>;
+			#interrupt-cells = <2>;
+			interrupt-controller;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 513 IRQ_TYPE_LEVEL_HIGH>;
 			status = "disabled";
 		};
 
@@ -575,6 +579,18 @@
 			/* child nodes are added in t8132-pmgr.dtsi */
 		};
 
+		/*
+		 * The CPU clusters' power-gate enables, in /arm-io/pmgr reg[34]:
+		 * cluster-id 0 (E) at +0x0, 1 (P) at +0x60. iBoot sets E's only; a
+		 * board that sleeps enables this.
+		 */
+		cluster_pwrgate: power-gate@380724000 {
+			compatible = "apple,t8132-cluster-pwrgate", "apple,cluster-pwrgate";
+			reg = <0x3 0x80724000 0x0 0x4>,
+			      <0x3 0x80724060 0x0 0x4>;
+			status = "disabled";
+		};
+
 		sleep: sleep-controller@380700000 {
 			compatible = "apple,t8132-sleep";
 			reg = <0x3 0x80700000 0x0 0x18000>,
@@ -601,13 +617,14 @@
 			      <0x2 0x20800580 0x0 0x10>,
 			      <0x3 0x803d0bc8 0x0 0x10>,
 			      <0x3 0x80058000 0x0 0x10004>,
-			      <0x3 0x80780010 0x0 0x4>;
+			      <0x3 0x80780010 0x0 0x4>,
+			      <0x3 0x8079c000 0x0 0x4000>;
 			reg-names = "ps", "pwrgate", "cpu-start", "cllt", "cluster",
 				    "commit", "wdt", "aon-misc", "wake",
 				    "amcc0", "amcc1", "pmc-dcp",
 				    "dvfm-e", "dvfm-p", "spmi", "pmc-voters", "dcs",
 				    "ps-aon", "spmi-a0", "clk-mux", "mcc0", "mcc1",
-				    "ptd", "clk-perf", "cluster-dcs";
+				    "ptd", "clk-perf", "cluster-dcs", "ps-prot";
 			/*
 			 * The same sources as T8140's, by name, from the J713 ADT's
 			 * /arm-io/pmgr ap-wake-sources: NUB.SPMI0.SW3, ATC0.USBWakeup,
@@ -616,6 +633,9 @@
 			 */
 			apple,wake-enable = <145 69 161 183 85 104>;
 			apple,display-coprocessors = <&dcp>, <&dcpext0>, <&dcpext1>;
+			apple,apcie = <&pcie0>;
+			/* The ADT has no no-restore-gpio-pins here: every pin goes back. */
+			apple,pinctrl = <&pinctrl_ap>;
 			status = "disabled";
 		};
 
@@ -1117,7 +1137,7 @@
 
 	pmp: pmp@380500000 {
 		compatible = "apple,t8132-pmp-v2", "apple,t6000-pmp-v2";
-		reg = <0x3 0x80500000 0x0 0x80000>,
+		reg = <0x3 0x80500000 0x0 0xc0000>,
 		      <0x3 0x80e00000 0x0 0x4000>;
 		reg-names = "pmp", "asc";
 		mboxes = <&pmp_mbox>;
@@ -1363,8 +1383,14 @@
 		reg = <0x1c 0xb0000000 0x0 0x10000000>, /* config */
 		      <0x4 0x94000000 0x0 0x4000>,     /* common */
 		      <0x4 0x90028000 0x0 0x8000>,     /* port 0 */
-		      <0x4 0x97020000 0x0 0x4000>;     /* port 0 PHY glue */
-		reg-names = "config", "rc", "port0", "phy0";
+		      <0x4 0x97020000 0x0 0x4000>,     /* port 0 PHY glue */
+		      <0x4 0x96000000 0x0 0x1000000>,
+		      <0x4 0x95046200 0x0 0x4000>,
+		      <0x4 0x95044000 0x0 0x4000>,
+		      <0x4 0x97000000 0x0 0x40000>,
+		      <0x4 0x97040000 0x0 0x20000>;
+		reg-names = "config", "rc", "port0", "phy0",
+			    "axi2af", "cio3pll", "clkgen", "phy-block", "phy-ip";
 
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1231 IRQ_TYPE_LEVEL_HIGH>;
