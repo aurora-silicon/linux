@@ -2047,6 +2047,34 @@
 	pcie0_clkreq: pcie0-clkreq-pins {
 		pinmux = <APPLE_PINMUX(101, 2)>;
 	};
+
+	uart4_rx: uart4-rx-pins {
+		pinmux = <APPLE_PINMUX(85, 2)>;
+	};
+
+	uart5_rx: uart5-rx-pins {
+		pinmux = <APPLE_PINMUX(169, 3)>;
+	};
+};
+
+/*
+ * Wi-Fi (uart4) and Bluetooth (uart5) firmware debug output. Only the
+ * receive line is routed; the ports stay closed unless a user opens them.
+ */
+&uart4 {
+	pinctrl-0 = <&uart4_rx>;
+	pinctrl-names = "default";
+	/* The PMGR clock provider is not enabled on this SoC yet. */
+	clocks = <&clkref>, <&clkref>;
+	status = "okay";
+};
+
+&uart5 {
+	pinctrl-0 = <&uart5_rx>;
+	pinctrl-names = "default";
+	/* The PMGR clock provider is not enabled on this SoC yet. */
+	clocks = <&clkref>, <&clkref>;
+	status = "okay";
 };
 
 /* SID17 bootstrap; the arena stays owned until a full reset. */
