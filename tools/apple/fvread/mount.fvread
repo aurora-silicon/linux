@@ -1,0 +1,21 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+set -eu
+
+if [ "$#" -ne 3 ]; then
+	echo "usage: mount.fvread BLOCKDEV DATA-VOLUME-UUID TARGET" >&2
+	exit 2
+fi
+
+device=$1
+volume_uuid=$2
+target=$3
+reader=${FVREAD_APFS_READER:-/sbin/mount.apfs-fvread}
+
+if [ ! -x "$reader" ]; then
+	echo "fvread: no key-aware read-only APFS consumer at $reader" >&2
+	exit 95
+fi
+
+exec fvreadctl --device "$device" --volume "$volume_uuid" --exec \
+	"$reader" --control-fd 3 --options ro,norecovery --target "$target"
