@@ -91,6 +91,14 @@ int apple_atc_dp_tunnel_rate_source(struct phy *phy, unsigned int source,
 				    unsigned int dpin, u8 rate);
 
 /*
+ * T6050 ATC PHY in USB4/TBT mode: run tunnel pixel clock @clock (1-4, which
+ * feeds the display crossbar's pixel clock @clock) at DP link rate code @rate
+ * (0x06 RBR, 0x0a HBR, 0x14 HBR2, 0x1e HBR3, 0x81 UHBR10, 0x82 UHBR20), or
+ * stop it (@rate == 0). A running clock holds its clock gate.
+ */
+int apple_t6050_dp_tunnel_clock(struct phy *phy, unsigned int clock, u8 rate);
+
+/*
  * ATC PHY: wake the DP clock path of a PHY in Thunderbolt/USB4 mode ahead of
  * apple_atc_dp_tunnel_rate(), before DCP is told about the display.
  * -EOPNOTSUPP where the rate call does all of it (everything but t600x).
