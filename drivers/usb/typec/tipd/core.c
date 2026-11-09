@@ -2940,8 +2940,13 @@ static int cd321x_reset_inherited_connection(struct tps6598x *tps, u32 *status)
 		goto relock;
 	}
 
-	/* Nonzero DISC delay restores normal CC detection automatically. */
-	ret = tps6598x_exec_cmd(tps, "DISC", sizeof(delay), &delay, 0, NULL);
+	/*
+	 * Nonzero DISC delay restores normal CC detection automatically. The
+	 * task can take more than a second to acknowledge at boot; wait for it
+	 * before issuing LOCK, which a still-busy controller would reject.
+	 */
+	ret = tps6598x_exec_cmd_tmo(tps, "DISC", sizeof(delay), &delay, 0, NULL,
+				  5000, 0);
 	if (!ret) {
 		msleep(5100);
 		timeout = jiffies + msecs_to_jiffies(2000);
