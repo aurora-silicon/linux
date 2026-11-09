@@ -24,6 +24,10 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/suspend.h>
+#include <drm/drm_connector.h>
+#include <drm/drm_eld.h>
+#include <linux/hdmi.h>
+#include <sound/control.h>
 #include <sound/dmaengine_pcm.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
@@ -37,6 +41,7 @@
 
 #define DCPAUD_ELEMENTS_MAXSIZE		16384
 #define DCPAUD_PRODUCTATTRS_MAXSIZE	1024
+#define DCPAUD_ELD_SIZE			MAX_ELD_BYTES
 /* The native element catalog capacity (14.7 external role). */
 #define DCPAUD_ELEMENTS_V14_7		SZ_256K
 
@@ -71,6 +76,7 @@ struct dcp_audio {
 	struct dma_chan *chan;
 	struct snd_card *card;
 	struct snd_jack *jack;
+	struct snd_kcontrol *eld_ctl;
 	struct snd_pcm_substream *substream;
 	unsigned int open_cookie;
 	bool open_unplugged;
@@ -79,6 +85,8 @@ struct dcp_audio {
 	bool dcp_connected; /// dcp status keep for delayed initialization
 	bool connected;
 	unsigned int connection_cookie;
+	/* The connected sink's ELD, zero while none is; data_lock */
+	u8 eld[DCPAUD_ELD_SIZE];
 	/* When the sink was last connected */
 	ktime_t connected_at;
 
@@ -1262,8 +1270,39 @@ static int dcpaud_create_pcm(struct dcp_audio *dcpaud)
 	return 0;
 }
 
+/*
+ * The sink's ELD, so that userspace names the output after the display, as
+ * macOS does, and sees its formats. drm builds it from the EDID. An EDID
+ * without a CTA-861 audio block (the firmware may provide one rebuilt from
+ * its display metadata, which has none) gets the basic audio CTA-861 makes
+ * every sink with audio take: two-channel LPCM at 32, 44.1 and 48 kHz. A
+ * sink is connected here only once the firmware reports it takes audio.
+ */
+static void dcpaud_build_eld(struct dcp_audio *dcpaud, u8 *eld)
+{
+	u8 *sad;
+
+	if (dcp_audio_sink_eld(dcpaud->dcp_dev, eld, DCPAUD_ELD_SIZE) ||
+	    !eld[DRM_ELD_VER]) {
+		memset(eld, 0, DCPAUD_ELD_SIZE);
+		eld[DRM_ELD_VER] = DRM_ELD_VER_CEA861D;
+	}
+	if (!drm_eld_sad_count(eld)) {
+		sad = eld + DRM_ELD_CEA_SAD(drm_eld_mnl(eld), 0);
+		sad[0] = (HDMI_AUDIO_CODING_TYPE_PCM << 3) | (2 - 1);
+		sad[1] = BIT(0) | BIT(1) | BIT(2);	/* 32, 44.1, 48 kHz */
+		sad[2] = BIT(0) | BIT(1) | BIT(2);	/* 16, 20, 24 bits */
+		eld[DRM_ELD_SAD_COUNT_CONN_TYPE] |= 1 << DRM_ELD_SAD_COUNT_SHIFT;
+		if (!(eld[DRM_ELD_SPEAKER] & DRM_ELD_SPEAKER_MASK))
+			eld[DRM_ELD_SPEAKER] = DRM_ELD_SPEAKER_FLR;
+	}
+	eld[DRM_ELD_BASELINE_ELD_LEN] =
+		DIV_ROUND_UP(drm_eld_calc_baseline_block_size(eld), 4);
+}
+
 /* expects to be called with data_lock locked and unlocks it */
-static void dcpaud_report_hotplug(struct dcp_audio *dcpaud, bool connected)
+static void dcpaud_report_hotplug(struct dcp_audio *dcpaud, bool connected,
+				  const u8 *eld)
 {
 	struct snd_pcm_substream *substream = dcpaud->substream;
 
@@ -1277,8 +1316,14 @@ static void dcpaud_report_hotplug(struct dcp_audio *dcpaud, bool connected)
 		dcpaud->connection_cookie++;
 		dcpaud->connected_at = ktime_get();
 	}
+	if (connected && eld)
+		memcpy(dcpaud->eld, eld, DCPAUD_ELD_SIZE);
+	else
+		memset(dcpaud->eld, 0, DCPAUD_ELD_SIZE);
 	mutex_unlock(&dcpaud->data_lock);
 
+	/* The name first: the jack makes the output available. */
+	snd_ctl_notify(dcpaud->card, SNDRV_CTL_EVENT_MASK_VALUE, &dcpaud->eld_ctl->id);
 	snd_jack_report(dcpaud->jack, connected ? SND_JACK_AVOUT : 0);
 
 	if (!connected) {
@@ -1288,6 +1333,42 @@ static void dcpaud_report_hotplug(struct dcp_audio *dcpaud, bool connected)
 			snd_pcm_stop(substream, SNDRV_PCM_STATE_DISCONNECTED);
 		snd_pcm_stream_unlock(substream);
 	}
+}
+
+static int dcpaud_eld_info(struct snd_kcontrol *kcontrol,
+			   struct snd_ctl_elem_info *uinfo)
+{
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_BYTES;
+	uinfo->count = DCPAUD_ELD_SIZE;
+	return 0;
+}
+
+static int dcpaud_eld_get(struct snd_kcontrol *kcontrol,
+			  struct snd_ctl_elem_value *ucontrol)
+{
+	struct dcp_audio *dcpaud = snd_kcontrol_chip(kcontrol);
+
+	guard(mutex)(&dcpaud->data_lock);
+	memcpy(ucontrol->value.bytes.data, dcpaud->eld, DCPAUD_ELD_SIZE);
+	return 0;
+}
+
+/* The ELD control of HDMI codecs, which PipeWire and PulseAudio read. */
+static int dcpaud_create_eld_ctl(struct dcp_audio *dcpaud)
+{
+	struct snd_kcontrol_new tmpl = {
+		.access = SNDRV_CTL_ELEM_ACCESS_READ | SNDRV_CTL_ELEM_ACCESS_VOLATILE,
+		.iface = SNDRV_CTL_ELEM_IFACE_PCM,
+		.name = "ELD",
+		.device = dcpaud->substream->pcm->device,
+		.info = dcpaud_eld_info,
+		.get = dcpaud_eld_get,
+	};
+
+	dcpaud->eld_ctl = snd_ctl_new1(&tmpl, dcpaud);
+	if (!dcpaud->eld_ctl)
+		return -ENOMEM;
+	return snd_ctl_add(dcpaud->card, dcpaud->eld_ctl);
 }
 
 static int dcpaud_create_jack(struct dcp_audio *dcpaud)
@@ -1324,6 +1405,17 @@ static void dcpaud_expose_debugfs_blob(struct dcp_audio *dcpaud, const char *nam
 
 extern bool hdmi_audio;
 
+/*
+ * The DCPs probe before the built-in audio (speakers, headphone jack,
+ * microphones), and a display card in the first free slot would move
+ * those. Display cards take the slots from DCPAUD_FIRST_SLOT up, so the
+ * built-in cards keep their numbers whether or not display audio is on.
+ * A negative index is a mask of acceptable slots, see snd_card_new().
+ */
+#define DCPAUD_FIRST_SLOT	8
+#define DCPAUD_CARD_SLOTS	(SNDRV_CARDS > DCPAUD_FIRST_SLOT ? \
+				 (int)~(BIT(DCPAUD_FIRST_SLOT) - 1) : SNDRV_DEFAULT_IDX1)
+
 static int dcpaud_init_snd_card(struct dcp_audio *dcpaud)
 {
 	int ret;
@@ -1331,7 +1423,7 @@ static int dcpaud_init_snd_card(struct dcp_audio *dcpaud)
 		return -ENODEV;
 
 
-	ret = snd_card_new(dcpaud->dev, SNDRV_DEFAULT_IDX1, SNDRV_DEFAULT_STR1,
+	ret = snd_card_new(dcpaud->dev, DCPAUD_CARD_SLOTS, SNDRV_DEFAULT_STR1,
 			   THIS_MODULE, 0, &dcpaud->card);
 	if (ret)
 		return ret;
@@ -1343,6 +1435,10 @@ static int dcpaud_init_snd_card(struct dcp_audio *dcpaud)
 		goto err_free_card;
 
 	ret = dcpaud_create_chmap_ctl(dcpaud);
+	if (ret)
+		goto err_free_card;
+
+	ret = dcpaud_create_eld_ctl(dcpaud);
 	if (ret)
 		goto err_free_card;
 
@@ -1365,10 +1461,16 @@ err_free_card:
 void dcpaud_connect(struct platform_device *pdev, bool connected)
 {
 	struct dcp_audio *dcpaud = platform_get_drvdata(pdev);
+	u8 eld[DCPAUD_ELD_SIZE];
+
+	if (connected && dcpaud->dcp_dev)
+		dcpaud_build_eld(dcpaud, eld);
+	else
+		memset(eld, 0, sizeof(eld));
 
 	mutex_lock(&dcpaud->data_lock);
 
-	dcpaud_report_hotplug(dcpaud, connected);
+	dcpaud_report_hotplug(dcpaud, connected, eld);
 }
 
 void dcpaud_disconnect(struct platform_device *pdev)
@@ -1379,7 +1481,7 @@ void dcpaud_disconnect(struct platform_device *pdev)
 	dcpaud = platform_get_drvdata(pdev);
 	mutex_lock(&dcpaud->data_lock);
 
-	dcpaud_report_hotplug(dcpaud, false);
+	dcpaud_report_hotplug(dcpaud, false, NULL);
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
 	/* The service may go without a release, and a held link with it. */
 	if (dcpaud->native_link)
