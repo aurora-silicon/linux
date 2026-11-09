@@ -325,6 +325,8 @@ struct ave_slot {
 
 #define AVE_MAX_REFS 5
 #define AVE_TILE_BUFS 8
+#define AVE_ENTROPY_SETS 4
+#define AVE_NEIGHBOUR_SETS 4
 
 struct ave_session {
 	struct ave_session *failed_next;
@@ -338,10 +340,15 @@ struct ave_session {
 	struct ave_buf ref_f[AVE_MAX_REFS];
 	struct ave_buf mb;
 	struct ave_buf mb_extra[2];
-	struct ave_buf row_a, row_b, fixed;
-	struct ave_buf tile[AVE_TILE_BUFS];
-	struct ave_buf tile_aux[AVE_TILE_BUFS];
+	struct ave_buf row_a[AVE_NEIGHBOUR_SETS];
+	struct ave_buf row_b[AVE_NEIGHBOUR_SETS];
+	struct ave_buf fixed[AVE_NEIGHBOUR_SETS];
+	struct ave_buf neighbour_fw[AVE_NEIGHBOUR_SETS];
+	struct ave_buf tile[AVE_ENTROPY_SETS][AVE_TILE_BUFS];
+	struct ave_buf tile_aux[AVE_ENTROPY_SETS][AVE_TILE_BUFS];
 	struct ave_buf hevc_extra[2];
+	u8 *codec_state;
+	size_t codec_state_bytes;
 	struct ave_slot slot[AVE_MAX_SLOTS];
 	u8 done_fifo[AVE_MAX_SLOTS];
 	unsigned int done_head;
@@ -476,6 +483,7 @@ int ave_cmd_process(struct ave_ctx *ctx, unsigned int slot,
 		    struct vb2_v4l2_buffer *src, dma_addr_t input, u32 bitrate,
 		    bool force_key);
 int ave_cmd_complete(struct ave_ctx *ctx, unsigned int count);
+int ave_cmd_flush(struct ave_ctx *ctx);
 int ave_cmd_close(struct ave_ctx *ctx);
 
 /* ave-vb2.c */

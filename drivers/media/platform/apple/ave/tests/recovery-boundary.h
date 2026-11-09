@@ -198,6 +198,11 @@ static int ave_cmd_complete(struct ave_ctx *ctx, unsigned int n)
 	return 0;
 }
 
+static int ave_cmd_flush(struct ave_ctx *ctx)
+{
+	return 0;
+}
+
 static int ave_ipc_settle(struct ave_dev *ave, unsigned int ms)
 {
 	return 0;
