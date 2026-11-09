@@ -24,6 +24,9 @@ int apple_pmp_report_set_t6030_gfx(struct device *supplier, bool enable);
 int apple_pmp_report_wait_ready(struct device_node *entry, unsigned long timeout);
 int apple_pmp_report_fast_die_effort(const struct device_node *np,
 				     unsigned int lane, u8 *effort);
+int apple_pmp_report_t8112_clpc_request(const struct device_node *np,
+					unsigned int entry,
+					unsigned int dcs, unsigned int soc);
 #else
 static inline int apple_pmp_report_ane_available(const struct device_node *np)
 {
@@ -61,6 +64,14 @@ static inline int apple_pmp_report_wait_ready(struct device_node *entry,
 
 static inline int apple_pmp_report_fast_die_effort(const struct device_node *np,
 						   unsigned int lane, u8 *effort)
+{
+	return -ENODEV;
+}
+
+static inline int apple_pmp_report_t8112_clpc_request(const struct device_node *np,
+						unsigned int entry,
+						unsigned int dcs,
+						unsigned int soc)
 {
 	return -ENODEV;
 }

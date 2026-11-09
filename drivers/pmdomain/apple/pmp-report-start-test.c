@@ -416,6 +416,8 @@ static void pmp_t8112_encoding_test(struct kunit *test)
 	const struct apple_pmp_report_offsets *o = &apple_pmp_offsets_t8112;
 	struct apple_pmp_report *rep = kunit_kzalloc(test, sizeof(*rep), GFP_KERNEL);
 	void *mem = kunit_kzalloc(test, 0x20000, GFP_KERNEL);
+	unsigned int avd = 0xb0 - o->dvfs_first;
+	unsigned int jpg = 0xb2 - o->dvfs_first;
 	u64 other = 3ULL << 36;
 
 	KUNIT_ASSERT_NOT_NULL(test, rep);
@@ -424,15 +426,17 @@ static void pmp_t8112_encoding_test(struct kunit *test)
 	rep->base = (void __iomem *)mem;
 	spin_lock_init(&rep->lock);
 	KUNIT_EXPECT_EQ(test, apple_pmp_report_dvfs_mask(0), PMP_DVFS_DEFAULT_MASK);
-	KUNIT_EXPECT_EQ(test, apple_pmp_report_dvfs_mask(0x25), PMP_DVFS_CLASS_25_MASK);
-	KUNIT_EXPECT_EQ(test, apple_pmp_report_dvfs_mask(0x24), 0ULL);
+	KUNIT_EXPECT_EQ(test, apple_pmp_report_dvfs_mask(0x21), GENMASK_ULL(35, 32));
+	KUNIT_EXPECT_EQ(test, apple_pmp_report_dvfs_mask(0x25), GENMASK_ULL(51, 48));
+	KUNIT_EXPECT_EQ(test, apple_pmp_report_dvfs_mask(0x26), 0ULL);
 	KUNIT_EXPECT_TRUE(test, apple_pmp_report_dvfs_valid(o, 0xb0, 2, 0x25));
-	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xaf, 2, 0x25));
-	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xb1, 2, 0x25));
+	KUNIT_EXPECT_TRUE(test, apple_pmp_report_dvfs_valid(o, 0xb2, 2, 0x21));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xa8, 4, 0x21));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xaa, 2, 0));
 	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xa7, 2, 0x25));
-	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xb8, 2, 0x25));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xb3, 2, 0x25));
 	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xb0, 16, 0x25));
-	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xb0, 2, 0x24));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xb0, 2, 0x26));
 	KUNIT_EXPECT_EQ(test, o->dvfs_ready_state, 0x80U);
 	KUNIT_EXPECT_EQ(test, o->dvfs_ready_entry, 0x8U);
 	KUNIT_EXPECT_EQ(test, o->update + 8 * o->dvfs_ready_entry, 0x10040U);
@@ -443,18 +447,23 @@ static void pmp_t8112_encoding_test(struct kunit *test)
 	apple_pmp_report_dvfs_write(rep, 0xb0, 0, 2);
 	KUNIT_EXPECT_EQ(test, readq(rep->base + 0x10580), 0x2000000000000002ULL);
 	/* Class 0x25 carries the T8112 AVD VMAX, VNOM and idle floors. */
-	rep->dvfs_words[0] = 0;
+	rep->dvfs_words[avd] = 0;
 	apple_pmp_report_dvfs_write(rep, 0xb0, 0x25, 2);
 	KUNIT_EXPECT_EQ(test, readq(rep->base + 0x10580), 0x2002000000000000ULL);
 	apple_pmp_report_dvfs_write(rep, 0xb0, 0x25, 1);
 	KUNIT_EXPECT_EQ(test, readq(rep->base + 0x10580), 0x2001000000000000ULL);
 	/* Other provider-owned classes survive the class-0x25 release. */
-	rep->dvfs_words[0] |= other | 2;
+	rep->dvfs_words[avd] |= other | 2;
 	apple_pmp_report_dvfs_write(rep, 0xb0, 0x25, 0);
 	KUNIT_EXPECT_EQ(test, readq(rep->base + 0x10580),
 			PMP_DVFS_VALID | other | 2);
-	KUNIT_EXPECT_EQ(test, rep->dvfs_words[0], PMP_DVFS_VALID | other | 2);
-	KUNIT_EXPECT_EQ(test, rep->dvfs_known, 1ULL);
+	KUNIT_EXPECT_EQ(test, rep->dvfs_words[avd], PMP_DVFS_VALID | other | 2);
+	/* JPEG uses the class-0x21 lane in its own entry. */
+	apple_pmp_report_dvfs_write(rep, 0xb2, 0x21, 2);
+	KUNIT_EXPECT_EQ(test, readq(rep->base + 0x10590),
+			0x2000000200000000ULL);
+	KUNIT_EXPECT_EQ(test, rep->dvfs_words[jpg], 0x2000000200000000ULL);
+	KUNIT_EXPECT_EQ(test, rep->dvfs_known, BIT_ULL(avd) | BIT_ULL(jpg));
 }
 
 struct pmp_dvfs_test {
@@ -575,12 +584,37 @@ static void pmp_t8112_state_prime_timeout_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, t->rep.dvfs_ready_achieved_word, 2ULL);
 }
 
+static void pmp_t8112_clpc_vote_test(struct kunit *test)
+{
+	struct pmp_dvfs_test *t = test->priv;
+	int ret;
+
+	writeq(1, t->rep.base + 0x10);
+	writeq(1, t->rep.base + 0x80);
+	ret = apple_pmp_report_t8112_clpc_request(t->rep.dev->of_node,
+						  0xa8, 4, 2);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10540),
+			0x2002000400000000ULL);
+	ret = apple_pmp_report_t8112_clpc_request(t->rep.dev->of_node,
+						  0xa8, 0, 0);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10540), PMP_DVFS_VALID);
+	ret = apple_pmp_report_t8112_clpc_request(t->rep.dev->of_node,
+						  0xaa, 4, 2);
+	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+	ret = apple_pmp_report_t8112_clpc_request(t->rep.dev->of_node,
+						  0xab, 5, 2);
+	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+}
+
 static struct kunit_case pmp_dvfs_cases[] = {
 	KUNIT_CASE(pmp_t8112_encoding_test),
 	KUNIT_CASE(pmp_t8112_stopped_test),
 	KUNIT_CASE(pmp_t8112_ack_timeout_test),
 	KUNIT_CASE(pmp_t8112_active_release_test),
 	KUNIT_CASE(pmp_t8112_state_prime_timeout_test),
+	KUNIT_CASE(pmp_t8112_clpc_vote_test),
 	{}
 };
 

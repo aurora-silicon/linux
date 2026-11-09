@@ -1491,9 +1491,9 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8112 = {
 	.dvfs_ready_entry = 0x8,
 	.dvfs_ready_prime = 1,
 	.soc_dvfs_state = 0x90,
-	/* Only the qualified AVD SOC-DEV-DVFS request. */
-	.dvfs_first = 0xb0,
-	.dvfs_count = 1,
+	/* EACC0 through JPEG; individual consumers are still allow-listed. */
+	.dvfs_first = 0xa8,
+	.dvfs_count = 0xb3 - 0xa8,
 	.actual = 0xa40,
 	.status = 0x10,
 };
@@ -1722,17 +1722,23 @@ EXPORT_SYMBOL_GPL(apple_pmp_report_set_t6030_gfx);
 /* SOC-DEV-DVFS request words carry a valid bit; level 0 is the floor. */
 #define PMP_DVFS_VALID		BIT_ULL(61)
 #define PMP_DVFS_DEFAULT_MASK	GENMASK_ULL(4, 0)
-#define PMP_DVFS_CLASS_25_MASK	GENMASK_ULL(51, 48)
+#define PMP_DVFS_CLASS_FIRST	0x21
+#define PMP_DVFS_CLASS_LAST	0x25
+
+static unsigned int apple_pmp_report_dvfs_shift(u32 request_class)
+{
+	return 32 + 4 * (request_class - PMP_DVFS_CLASS_FIRST);
+}
 
 static u64 apple_pmp_report_dvfs_mask(u32 request_class)
 {
 	switch (request_class) {
 	case 0:
 		return PMP_DVFS_DEFAULT_MASK;
-	case 0x25:
-		return PMP_DVFS_CLASS_25_MASK;
 	default:
-		return 0;
+		return request_class >= PMP_DVFS_CLASS_FIRST &&
+		       request_class <= PMP_DVFS_CLASS_LAST ?
+		       0xfULL << apple_pmp_report_dvfs_shift(request_class) : 0;
 	}
 }
 
@@ -1741,10 +1747,9 @@ static bool apple_pmp_report_dvfs_level_valid(u32 request_class, u32 level)
 	switch (request_class) {
 	case 0:
 		return FIELD_FIT(PMP_DVFS_DEFAULT_MASK, level);
-	case 0x25:
-		return FIELD_FIT(PMP_DVFS_CLASS_25_MASK, level);
 	default:
-		return false;
+		return request_class >= PMP_DVFS_CLASS_FIRST &&
+		       request_class <= PMP_DVFS_CLASS_LAST && level <= 0xf;
 	}
 }
 
@@ -1753,16 +1758,21 @@ static u64 apple_pmp_report_dvfs_field(u32 request_class, u32 level)
 	switch (request_class) {
 	case 0:
 		return FIELD_PREP(PMP_DVFS_DEFAULT_MASK, level);
-	case 0x25:
-		return FIELD_PREP(PMP_DVFS_CLASS_25_MASK, level);
 	default:
-		return 0;
+		return request_class >= PMP_DVFS_CLASS_FIRST &&
+		       request_class <= PMP_DVFS_CLASS_LAST ?
+		       (u64)level << apple_pmp_report_dvfs_shift(request_class) : 0;
 	}
 }
 
 static bool apple_pmp_report_dvfs_valid(const struct apple_pmp_report_offsets *offs,
 					u32 entry, u32 level, u32 request_class)
 {
+	if (offs == &apple_pmp_offsets_t8112 &&
+	    !((entry == 0xb0 && request_class == 0x25 && level == 2) ||
+	      (entry == 0xb2 && request_class == 0x21 && level == 2)))
+		return false;
+
 	return offs->update && offs->dvfs_count <= 64 &&
 	       apple_pmp_report_dvfs_level_valid(request_class, level) &&
 	       entry >= offs->dvfs_first && entry - offs->dvfs_first < offs->dvfs_count;
@@ -1829,6 +1839,67 @@ static void apple_pmp_report_dvfs_write(struct apple_pmp_report *rep, u32 entry,
 	rep->dvfs_known |= BIT_ULL(index);
 	spin_unlock_irqrestore(&rep->lock, flags);
 }
+
+/**
+ * apple_pmp_report_t8112_clpc_request() - set a T8112 CLPC memory/fabric vote
+ * @np: PMP report provider
+ * @entry: EACC0 (0xa8), PACC0 (0xa9), or ANE0 (0xab)
+ * @dcs: DCS state in class 0x21
+ * @soc: SoC fabric state in class 0x25
+ *
+ * The two constraints share one provider-owned SOC-DEV-DVFS word. This is a
+ * request, not a measured state; entry 9 remains the firmware's achieved SoC
+ * state. The caller may use this from an atomic cpufreq transition.
+ */
+int apple_pmp_report_t8112_clpc_request(const struct device_node *np,
+					unsigned int entry,
+					unsigned int dcs, unsigned int soc)
+{
+	struct apple_pmp_report *rep;
+	unsigned long flags;
+	unsigned int index;
+	u64 mask, word;
+	int ret = -EPROBE_DEFER;
+
+	if (!np || (entry != 0xa8 && entry != 0xa9 && entry != 0xab) ||
+	    dcs > 4 || soc > 2)
+		return -EINVAL;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
+		if (rep->dev->of_node != np)
+			continue;
+		if (rep->offsets != &apple_pmp_offsets_t8112) {
+			ret = -EOPNOTSUPP;
+			break;
+		}
+		if (READ_ONCE(rep->defer) || !apple_pmp_report_running(rep)) {
+			ret = -EAGAIN;
+			break;
+		}
+		ret = apple_pmp_report_dvfs_prepare(rep);
+		if (ret)
+			break;
+
+		index = entry - rep->offsets->dvfs_first;
+		mask = apple_pmp_report_dvfs_mask(0x21) |
+		       apple_pmp_report_dvfs_mask(0x25);
+		word = apple_pmp_report_dvfs_field(0x21, dcs) |
+		       apple_pmp_report_dvfs_field(0x25, soc);
+		spin_lock_irqsave(&rep->lock, flags);
+		rep->dvfs_words[index] &= ~mask;
+		rep->dvfs_words[index] |= PMP_DVFS_VALID | word;
+		writeq(rep->dvfs_words[index],
+		       rep->base + rep->offsets->update + 8 * entry);
+		rep->dvfs_known |= BIT_ULL(index);
+		spin_unlock_irqrestore(&rep->lock, flags);
+		ret = 0;
+		break;
+	}
+	rcu_read_unlock();
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_t8112_clpc_request);
 
 static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, bool enable)
 {
