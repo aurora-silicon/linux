@@ -6718,10 +6718,13 @@ static void dcp_drain_for_sleep(struct apple_dcp *dcp)
  */
 static void dcp_hold_for_sleep(struct apple_dcp *dcp)
 {
-	/* A failed component bind leaves no coprocessor session to hold. */
+	/*
+	 * A failed component bind leaves no coprocessor session to hold. Firmware that DPMS
+	 * stopped sends nothing, and its presentation stays paused until DPMS restarts it.
+	 */
 	if (IS_ERR_OR_NULL(dcp->rtk) ||
 	    !dcp_uses_soft_dpms(dcp) || !dcp_presents_nits(dcp) ||
-	    READ_ONCE(dcp->crashed))
+	    READ_ONCE(dcp->crashed) || READ_ONCE(dcp->s2r_fw_down))
 		return;
 
 	iomfb_pause_presentation(dcp, true);
