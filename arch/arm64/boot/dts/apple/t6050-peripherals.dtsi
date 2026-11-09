@@ -545,6 +545,7 @@
 		power-domains = <&ps_fab8_soc>;
 		status = "disabled";
 	};
+	/* The enclave runs from iBoot and gates its own domain: never Linux's to change. */
 	ps_sep: power-controller@298 {
 		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x298 4>;
@@ -552,6 +553,7 @@
 		#reset-cells = <0>;
 		label = "sep";
 		power-domains = <&ps_fab8_soc>;
+		apple,firmware-owned;
 		status = "disabled";
 	};
 	ps_sio_cpu: power-controller@2a0 {
