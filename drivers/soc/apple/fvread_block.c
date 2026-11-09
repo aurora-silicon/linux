@@ -12,6 +12,8 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 
+#include "fvread_block.h"
+
 #define FVREAD_BLOCK_SIZE	4096
 #define FVREAD_MAX_BLOCKS	16
 
