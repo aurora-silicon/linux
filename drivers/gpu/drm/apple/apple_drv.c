@@ -1135,11 +1135,23 @@ static int apple_probe_per_dcp(struct device *dev,
 			interchange = supports_interchange &&
 				      (zpos <= 1 || surf != top_surf);
 
+			/*
+			 * The T8142 runs macOS 27.0's DCP firmware as firmware
+			 * 27, outside the H17G profile, and blends XRGB's X
+			 * byte as alpha all the same (GPU-rendered alacritty
+			 * showed wrong colours on the panel).
+			 */
+			bool xrgb_is_alpha =
+				dcp_data->hw.iomfb_method_profile ==
+					DCP_IOMFB_METHODS_H17G ||
+				(dcp_data->fw_compat == DCP_FIRMWARE_V_27_0 &&
+				 of_device_is_compatible(dcp_data->dev->of_node,
+							 "apple,t8142-dcp"));
+
 			planes[zpos] = apple_plane_init(drm, 1U << num, surf,
 							supports_l10r,
 							supports_xrgb2101010,
-							dcp_data->hw.iomfb_method_profile ==
-								DCP_IOMFB_METHODS_H17G,
+							xrgb_is_alpha,
 							plane_type, interchange,
 							supports_premultiplied);
 		}
