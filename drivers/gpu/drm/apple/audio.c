@@ -1323,6 +1323,17 @@ static void dcpaud_expose_debugfs_blob(struct dcp_audio *dcpaud, const char *nam
 
 extern bool hdmi_audio;
 
+/*
+ * The DCPs probe before the built-in audio (speakers, headphone jack,
+ * microphones), and a display card in the first free slot would move
+ * those. Display cards take the slots from DCPAUD_FIRST_SLOT up, so the
+ * built-in cards keep their numbers whether or not display audio is on.
+ * A negative index is a mask of acceptable slots, see snd_card_new().
+ */
+#define DCPAUD_FIRST_SLOT	8
+#define DCPAUD_CARD_SLOTS	(SNDRV_CARDS > DCPAUD_FIRST_SLOT ? \
+				 (int)~(BIT(DCPAUD_FIRST_SLOT) - 1) : SNDRV_DEFAULT_IDX1)
+
 static int dcpaud_init_snd_card(struct dcp_audio *dcpaud)
 {
 	int ret;
@@ -1330,7 +1341,7 @@ static int dcpaud_init_snd_card(struct dcp_audio *dcpaud)
 		return -ENODEV;
 
 
-	ret = snd_card_new(dcpaud->dev, SNDRV_DEFAULT_IDX1, SNDRV_DEFAULT_STR1,
+	ret = snd_card_new(dcpaud->dev, DCPAUD_CARD_SLOTS, SNDRV_DEFAULT_STR1,
 			   THIS_MODULE, 0, &dcpaud->card);
 	if (ret)
 		return ret;
