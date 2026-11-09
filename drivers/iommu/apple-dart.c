@@ -33,6 +33,7 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/soc/apple/dart.h>
+#include <linux/soc/apple/dart-sleep.h>
 #include <linux/soc/apple/t8132.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -156,6 +157,7 @@
 #define DART_T8110_ERROR_FLAG BIT(31)
 
 #define DART_T8110_ERROR_MASK 0x104
+#define DART_T8110_V2_ERROR_MASK 0x4060
 
 #define DART_T8110_ERROR_READ_FAULT BIT(5)
 #define DART_T8110_ERROR_WRITE_FAULT BIT(4)
@@ -490,6 +492,9 @@ struct apple_dart {
 	bool managed_failed;
 	/* Serialize owned TCR publication against IRQ quarantine. */
 	spinlock_t managed_lock;
+	struct apple_dart_sleep *sleep_record;
+	unsigned int sleep_writers;
+	bool sleep_closed;
 
 	DECLARE_BITMAP(remapped, DART_MAX_STREAMS);
 	u8 remap_target[DART_MAX_STREAMS];
@@ -527,6 +532,10 @@ struct apple_dart {
 	 */
 	int locked_retire_err[DART_MAX_STREAMS];
 };
+
+static int apple_dart_sleep_writer_get(struct apple_dart *dart);
+static void apple_dart_sleep_writer_put(struct apple_dart *dart);
+static void __noreturn apple_dart_sleep_release_failed(void);
 
 #ifndef MODULE
 static struct kexec_blocker apple_dart_radio_kexec = {
@@ -2525,8 +2534,11 @@ static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
 			err = err ?: ret;
 			continue;
 		}
+		if (apple_dart_sleep_writer_get(stream.dart))
+			apple_dart_sleep_release_failed();
 		ret = pm_runtime_resume_and_get(stream.dart->dev);
 		if (ret < 0) {
+			apple_dart_sleep_writer_put(stream.dart);
 			dev_err_ratelimited(stream.dart->dev,
 				"failed to power DART for TLB synchronization: %d\n", ret);
 			err = err ?: ret;
@@ -2553,6 +2565,7 @@ static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
 		if (ret && stream.dart->managed_sids)
 			apple_dart_managed_quarantine(stream.dart);
 		pm_runtime_put(stream.dart->dev);
+		apple_dart_sleep_writer_put(stream.dart);
 		err = err ?: ret;
 	}
 	return err;
@@ -2821,7 +2834,7 @@ static phys_addr_t apple_dart_iova_to_phys(struct iommu_domain *domain,
 	return apple_dart_inherited_phys(dart_domain, address);
 }
 
-static int apple_dart_map_pages(struct iommu_domain *domain, unsigned long iova,
+static int apple_dart_map_pages_unguarded(struct iommu_domain *domain, unsigned long iova,
 				phys_addr_t paddr, size_t pgsize,
 				size_t pgcount, int prot, gfp_t gfp,
 				size_t *mapped)
@@ -2855,7 +2868,26 @@ static int apple_dart_map_pages(struct iommu_domain *domain, unsigned long iova,
 			      mapped);
 }
 
-static size_t apple_dart_unmap_pages(struct iommu_domain *domain,
+static int apple_dart_map_pages(struct iommu_domain *domain, unsigned long iova,
+		phys_addr_t paddr, size_t pgsize, size_t pgcount, int prot,
+		gfp_t gfp, size_t *mapped)
+{
+	struct apple_dart_domain *cfg = to_dart_domain(domain);
+	struct apple_dart *dart = cfg->stream_maps[0].dart;
+	int result;
+	int gate;
+
+	gate = dart ? apple_dart_sleep_writer_get(dart) : 0;
+	if (gate)
+		return gate;
+	result = apple_dart_map_pages_unguarded(domain, iova, paddr, pgsize, pgcount,
+						prot, gfp, mapped);
+	if (dart)
+		apple_dart_sleep_writer_put(dart);
+	return result;
+}
+
+static size_t apple_dart_unmap_pages_unguarded(struct iommu_domain *domain,
 				     unsigned long iova, size_t pgsize,
 				     size_t pgcount,
 				     struct iommu_iotlb_gather *gather)
@@ -2869,6 +2901,23 @@ static size_t apple_dart_unmap_pages(struct iommu_domain *domain,
 				(iova + dart_domain->dma_offset) &
 				dart_domain->mask, pgsize, pgcount,
 				gather);
+}
+
+static size_t apple_dart_unmap_pages(struct iommu_domain *domain, unsigned long iova,
+		size_t pgsize, size_t pgcount, struct iommu_iotlb_gather *gather)
+{
+	struct apple_dart_domain *cfg = to_dart_domain(domain);
+	struct apple_dart *dart = cfg->stream_maps[0].dart;
+	size_t result;
+	int gate;
+
+	gate = dart ? apple_dart_sleep_writer_get(dart) : 0;
+	if (gate)
+		apple_dart_sleep_release_failed();
+	result = apple_dart_unmap_pages_unguarded(domain, iova, pgsize, pgcount, gather);
+	if (dart)
+		apple_dart_sleep_writer_put(dart);
+	return result;
 }
 
 static int
@@ -3145,7 +3194,7 @@ static int apple_dart_domain_add_streams(struct apple_dart_domain *domain,
 				      true);
 }
 
-static int apple_dart_attach_dev_paging(struct iommu_domain *domain,
+static int apple_dart_attach_dev_paging_unguarded(struct iommu_domain *domain,
 					struct device *dev,
 					struct iommu_domain *old)
 {
@@ -3209,7 +3258,24 @@ err:
 	return ret;
 }
 
-static int apple_dart_attach_dev_identity(struct iommu_domain *domain,
+static int apple_dart_attach_dev_paging(struct iommu_domain *domain, struct device *dev,
+		struct iommu_domain *old)
+{
+	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
+	struct apple_dart *dart = cfg->stream_maps[0].dart;
+	int result;
+	int gate;
+
+	gate = dart ? apple_dart_sleep_writer_get(dart) : 0;
+	if (gate)
+		return gate;
+	result = apple_dart_attach_dev_paging_unguarded(domain, dev, old);
+	if (dart)
+		apple_dart_sleep_writer_put(dart);
+	return result;
+}
+
+static int apple_dart_attach_dev_identity_unguarded(struct iommu_domain *domain,
 					  struct device *dev,
 					  struct iommu_domain *old)
 {
@@ -3235,6 +3301,23 @@ static int apple_dart_attach_dev_identity(struct iommu_domain *domain,
 	return 0;
 }
 
+static int apple_dart_attach_dev_identity(struct iommu_domain *domain, struct device *dev,
+		struct iommu_domain *old)
+{
+	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
+	struct apple_dart *dart = cfg->stream_maps[0].dart;
+	int result;
+	int gate;
+
+	gate = dart ? apple_dart_sleep_writer_get(dart) : 0;
+	if (gate)
+		return gate;
+	result = apple_dart_attach_dev_identity_unguarded(domain, dev, old);
+	if (dart)
+		apple_dart_sleep_writer_put(dart);
+	return result;
+}
+
 static const struct iommu_domain_ops apple_dart_identity_ops = {
 	.attach_dev = apple_dart_attach_dev_identity,
 };
@@ -3244,7 +3327,7 @@ static struct iommu_domain apple_dart_identity_domain = {
 	.ops = &apple_dart_identity_ops,
 };
 
-static int apple_dart_attach_dev_blocked(struct iommu_domain *domain,
+static int apple_dart_attach_dev_blocked_unguarded(struct iommu_domain *domain,
 					 struct device *dev,
 					 struct iommu_domain *old)
 {
@@ -3268,6 +3351,23 @@ static int apple_dart_attach_dev_blocked(struct iommu_domain *domain,
 	for_each_stream_map(i, cfg, stream_map)
 		pm_runtime_put(stream_map->dart->dev);
 	return 0;
+}
+
+static int apple_dart_attach_dev_blocked(struct iommu_domain *domain, struct device *dev,
+		struct iommu_domain *old)
+{
+	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
+	struct apple_dart *dart = cfg->stream_maps[0].dart;
+	int result;
+	int gate;
+
+	gate = dart ? apple_dart_sleep_writer_get(dart) : 0;
+	if (gate)
+		return gate;
+	result = apple_dart_attach_dev_blocked_unguarded(domain, dev, old);
+	if (dart)
+		apple_dart_sleep_writer_put(dart);
+	return result;
 }
 
 static const struct iommu_domain_ops apple_dart_blocked_ops = {
@@ -3318,6 +3418,8 @@ static void apple_dart_release_device(struct device *dev)
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
 
 	for_each_stream_map(j, cfg, stream_map) {
+		if (READ_ONCE(stream_map->dart->sleep_record))
+			apple_dart_sleep_release_failed();
 		/* Borrowed display roots stay exactly as the DCP left them. */
 		if (!stream_map->dart->locked || apple_dart_has_borrowed(stream_map->dart))
 			continue;
@@ -3391,7 +3493,7 @@ static void apple_dart_domain_free(struct iommu_domain *domain)
 		return;
 	}
 	for_each_stream_map(i, dart_domain, map) {
-		if (map->dart->managed_sids)
+		if (map->dart->managed_sids || READ_ONCE(map->dart->sleep_record))
 			return;
 		if (!map->dart->locked)
 			continue;
@@ -5899,6 +6001,8 @@ static const struct apple_dart_hw apple_dart_hw_t8110 = {
 	.ttbr_count = 1,
 };
 
+#include "apple-dart-sleep.c"
+
 static void apple_dart_save_state(struct apple_dart *dart)
 {
 	unsigned int sid, idx;
@@ -6097,6 +6201,9 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 	/* Runtime PM may not stop the live MTP; system sleep uses its own callbacks. */
 	if (dart->live_mtp)
 		return -EBUSY;
+	/* Native radio owner restores before the PCI functions resume. */
+	if (dart->managed_sids && READ_ONCE(dart->sleep_record))
+		return 0;
 
 	dart->tunnel_state_restored = false;
 	/* Its consumer saved this already and restores it: see apple_dart_sleep_prepare(). */
@@ -6248,6 +6355,10 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	unsigned int sid, idx;
 	int ret;
 
+	/* Native radio owner restores before the PCI functions resume. */
+	if (dart->managed_sids && READ_ONCE(dart->sleep_record))
+		return 0;
+
 	/* No reset or restore: see apple_dart_suspend(). */
 	if (dart->cold_ane || dart->live_mtp || dart->sleep_saved)
 		return 0;
@@ -6358,6 +6469,10 @@ static __maybe_unused int apple_dart_resume_noirq(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
 	int ret;
+
+	/* Its host restores every register after the native port clocks return. */
+	if (dart->managed_sids && READ_ONCE(dart->sleep_record))
+		return pm_runtime_force_resume(dev);
 
 	/*
 	 * After a real sleep a DART clocked by its host's port reads nothing until the host
