@@ -74,8 +74,10 @@ struct macaudio_snd_data {
  struct snd_ctl_file *spk_owner; struct snd_soc_card card;
  struct snd_kcontrol **spk_hpfs; unsigned int *spk_hpf_granted;
  unsigned int spk_nr_hpfs, spk_hpf_safe; struct snd_ctl_elem_value *spk_uval;
- bool spk_granted;
+ bool spk_granted; int spk_iface;
 };
+/* MACAUDIO_SPK_IFACE_LEASE: the sense switches are the lease owner's */
+static bool macaudio_spk_leased(const struct macaudio_snd_data *ma) { return ma->spk_iface == 1; }
 #define GFP_KERNEL 0
 #define devm_kcalloc(d, n, s, g) calloc(n, s)
 #define kzalloc_obj(o) calloc(1, sizeof(o))
@@ -112,8 +114,8 @@ static struct snd_soc_component *snd_kcontrol_chip(struct snd_kcontrol *k) { ret
 static unsigned int snd_soc_enum_item_to_val(struct soc_enum *e, unsigned int item) { return item; }
 static int snd_soc_component_update_bits(struct snd_soc_component *c, unsigned int r, unsigned int m, unsigned int v)
 { unsigned int old = c->reg; c->writes++; c->reg = (old & ~m) | (v & m); return old != c->reg; }
-/* Amp gain is a fixed volume (KUnit apple-speaker-protection), not a fixed enum. */
-static int macaudio_set_fixed_volume(struct snd_soc_card *c, const char *n, int v) { return 1; }
+/* Amp gain is volume-limited (KUnit apple-speaker-protection), not a fixed enum. */
+static int snd_soc_limit_volume(struct snd_soc_card *c, const char *n, int v) { return 1; }
 static int enum_info(struct snd_kcontrol *k, struct snd_ctl_elem_info *i)
 {
  struct soc_enum *e = (void *)k->private_value;
@@ -211,7 +213,10 @@ static void sense_scenario(void)
   v.id.index = j;
   ma.spk_owner = NULL;
   check(snd_ctl_elem_write(&card, &other, &v) == 0, "unowned writable", names[i]);
-  ma.spk_owner = &owner;
+  /* Under the volume lock a lease owner owns nothing */
+  ma.spk_owner = &owner; ma.spk_iface = 0;
+  check(snd_ctl_elem_write(&card, &other, &v) == 0, "lease owner without the lease", names[i]);
+  ma.spk_iface = 1;
   unsigned int before = regs[i].writes;
   int rc = snd_ctl_elem_write(&card, &other, &v);
   check(rc == (i < 6 ? -EPERM : 0), "other file during ownership", names[i]);
@@ -223,7 +228,7 @@ static void sense_scenario(void)
   controls[i].vd[j].owner = NULL;
   ma.spk_owner = NULL;
   check(snd_ctl_elem_write(&card, &other, &v) == 0, "after owner close", names[i]);
-  attempts += 5;
+  attempts += 6;
  }
 }
 /* The speaker route is fixed while protection is granted, for every file. */
