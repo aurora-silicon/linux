@@ -73,12 +73,18 @@ mod g17 {
             pub struct ControlRecord;
             #[derive(Clone, Copy)]
             pub enum Opcode { Dummy }
+            pub type DeviceControlOp = Opcode;
             impl Opcode { pub fn asserts_gpu_power(self)->bool { false } }
             impl ControlRecord {
                 pub fn bytes(&self)->&[u8] { &[] }
                 pub fn opcode(&self)->Opcode { Opcode::Dummy }
                 pub fn asserts_gpu_power(&self)->bool { false }
             }
+        }
+        // M5's statistics tags and power rule, as the family methods below read them.
+        pub mod m5 {
+            M5_STATISTICS_TYPES
+            pub mod power { M5_ASSERTS_GPU_POWER }
         }
         pub mod initdata { pub mod status {
             pub const TRACE_STATE:u32=0;
@@ -94,9 +100,11 @@ mod g17 {
         pub struct InitData {
             pub cursors:[[AtomicU32;2];2],
             pub slots:RefCell<[[[u32;18];8];2]>,
+            pub m5:bool,
         }
         impl InitData {
-            pub fn new()->Self { Self { cursors:std::array::from_fn(|_|std::array::from_fn(|_|AtomicU32::new(0))), slots:RefCell::new([[[0;18];8];2]) } }
+            pub fn new()->Self { Self { cursors:std::array::from_fn(|_|std::array::from_fn(|_|AtomicU32::new(0))), slots:RefCell::new([[[0;18];8];2]), m5:false } }
+            INITDATA_FAMILY
             pub fn push(&self,role:Role,words:[u32;18]) {
                 use std::sync::atomic::Ordering::Relaxed;
                 let producer=self.cursors[role as usize][1].load(Relaxed);
@@ -667,8 +675,20 @@ fn write_power(_: &super::Firmware, f:&mut kernel::fmt::Formatter<'_>)->kernel::
     policy = '\n'.join(item(stats_rs, signature) for signature in
                        ['pub(super) const fn max_age_ns', 'pub(super) const fn reports_pstate',
                         'pub(super) fn qualify('])
+    # The rings take the family's statistics tags and control power rule from
+    # InitData; build those production methods into the fixture's InitData.
+    initdata = (DRIVER / 'g17/initdata.rs').read_text()
+    family = '\n'.join(item(initdata, signature).replace('pub(super) ', 'pub ', 1) for signature in
+                       ['pub(super) fn statistics_types(', 'pub(super) fn control_asserts_gpu_power('])
+    m5 = (DRIVER / 'g17/fw/m5/mod.rs').read_text()
+    m5_types = next(x for x in m5.splitlines() if 'const STATISTICS_TYPES:' in x).replace('pub(crate)', 'pub')
+    m5_power = item((DRIVER / 'g17/fw/m5/power.rs').read_text(),
+                    'pub(crate) const fn asserts_gpu_power(').replace('pub(crate)', 'pub', 1)
+    header = (RUST_HEADER.replace('M5_STATISTICS_TYPES', m5_types).replace('M5_ASSERTS_GPU_POWER', m5_power)
+              .replace('INITDATA_FAMILY', family))
+
     reader_rs = 'pub(crate) struct Reader(pub(super) Arc<Shared>);\n' + item(stats_rs, 'impl Reader')
-    (work / 'rings.rs').write_text(RUST_HEADER + 'mod stats { use super::{fw::variant::InitGraph, telemetry::Readout, Shared};\n'
+    (work / 'rings.rs').write_text(header + 'mod stats { use super::{fw::variant::InitGraph, telemetry::Readout, Shared};\n'
                                   + 'use std::sync::{Arc,atomic::Ordering};\n' + reader_rs + '\n'
                                   + policy + '\n}\nmod telemetry;\nmod channel;\n' + RUST_TESTS)
     # Rust resolves child modules relative to the inline parent's directory.

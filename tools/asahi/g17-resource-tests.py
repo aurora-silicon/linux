@@ -19,7 +19,11 @@ def admission_tests(root, source):
      while depth:
       depth+=(s[end]=='{')-(s[end]=='}');end+=1
      return s[at:end]
-    constants='\n'.join(re.search(r'pub\(crate\) const '+name+r': [^;]+;',cfg).group(0) for name in ['RENDER_SLOTS','RENDER_PAIRS_PER_OWNER','RENDER_DEPTH'])
+    constants='\n'.join(re.search(r'pub\(crate\) const '+name+r': [^;]+;',cfg).group(0) for name in ['RENDER_SLOTS','RENDER_PAIRS_MAX','RENDER_DEPTH'])
+    pairs=(source/'g17/pairs.rs').read_text()
+    assert 'const G17D_PAIRS: u8 = RENDER_PAIRS_MAX as u8;' in pairs
+    assert 'PAIRS.store(if board.g17d_forms() { G17D_PAIRS } else { 1 }, Relaxed);' in pairs
+    at=pairs.index('const SIBLING_BACKLOG');backlog=pairs[at:pairs.index('\n}\n',pairs.index('fn sibling_backlog',at))+3]
     mmu=(source/'mmu.rs').read_text()
     limits='\n'.join(re.search(r'const '+name+r': [^;]+;',mmu).group(0) for name in ['EXECUTION_CONTEXT_MASK','MAX_EXECUTION_CONTEXTS'])
     header='''#![allow(dead_code, unused_macros)]
@@ -27,51 +31,67 @@ def admission_tests(root, source):
     mod g17 { pub mod trace { pub fn teardown(_:u8,_:u64,_:u64,_:u64) {} } pub mod capacity {
         pub enum Site { RenderSlots, LogicalQueues, ComputeReserve, PhysicalQids }
         pub fn refused(_: Site) -> i32 { -28 }
+    } pub mod pairs { use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+    '''+backlog+'''
     }}
 
     const ENOSPC:i32=-28; const EIO:i32=-5;
     macro_rules! resource_exhausted { ($s:literal)=>{ENOSPC}; }
     type KVec<T> = Vec<T>; struct InFlight;
     mod cfg {\n'''+constants+'}\n'+limits+'\n'
-    methods=['const fn new','fn exhausted','fn refusal','fn advance','fn take_idle','fn acquire','fn claim_sibling','fn reassign_unused_spare','fn warmable_sibling','fn borrow_warm_sibling','fn cancel_empty_slot','fn release']
+    methods=['const fn new','fn exhausted','fn owner_quarantine','fn refusal','fn advance','fn take_idle','fn acquire','fn usable','fn claim_sibling','fn reassign_unused_spare','fn warmable_sibling','fn borrow_warm_sibling','fn cancel_empty_slot','fn release']
     code=header+item('struct State')+'\nimpl State {\n'+re.search(r'    const MASK: u64 = .*;',s).group(0)+'\n'+'\n'.join(item(n) for n in methods)+'\n}\n'+'''
+    // A queue holds g17::pairs::per_owner() pairs (Backend::pairs): one, or
+    // RENDER_PAIRS_MAX on G17D. Both admissions run.
     fn main(){
-     if cfg::RENDER_PAIRS_PER_OWNER == 1 {
+     one_pair(1);
+     two_pairs(cfg::RENDER_PAIRS_MAX);
+    }
+    fn one_pair(pairs:usize){
       let mut state=State::new();
       let mut slots=Vec::new();
       for owner in 1..=u64::from(MAX_EXECUTION_CONTEXTS) {
-       let slot=state.acquire(owner).expect("every logical owner must fit");slots.push(slot);
+       let slot=state.acquire(owner,pairs).expect("every logical owner must fit");slots.push(slot);
        assert_eq!(state.owners.iter().filter(|id|**id==owner).count(),1);
       }
       for slot in slots {state.release(slot);}
-      let mut state=State::new();let first=state.acquire(1).unwrap();
-      for _ in 1..cfg::RENDER_DEPTH {assert_eq!(state.acquire(1),Some(first));}
-      assert_eq!(state.acquire(1),None);state.release(first);assert_eq!(state.acquire(1),Some(first));
+      let mut state=State::new();let first=state.acquire(1,pairs).unwrap();
+      for _ in 1..cfg::RENDER_DEPTH {assert_eq!(state.acquire(1,pairs),Some(first));}
+      assert_eq!(state.acquire(1,pairs),None);state.release(first);assert_eq!(state.acquire(1,pairs),Some(first));
       println!("shared render admission: all58 owners fit; depth16 waits for exact retirement without consuming a spare");
-      return;
-     }
+    }
+    fn two_pairs(pairs:usize){
+     // 32 owners fill the 63 usable slots: 31 with a sibling, the last without.
+     assert_eq!(pairs,2);
      let mut state=State::new();
      for owner in 1..=32 {
       assert!(state.refusal(owner).is_ok());
-      let slot=state.acquire(owner).expect("existing owner fits");
+      let slot=state.acquire(owner,pairs).expect("existing owner fits");
       state.release(slot);
      }
      assert_eq!(state.active,0,"all submitted work retired");
      let retained=state.owners.iter().filter(|o|**o!=0).count();
      assert_eq!(retained,63);
      assert_eq!(state.refusal(33),Err(ENOSPC));
-     assert!(state.acquire(33).is_none());
+     assert!(state.acquire(33,pairs).is_none());
      println!("confirmed: 32 open idle owners retain all 63 usable pairs; owner33 receives ENOSPC");
      // Yield one unused spare for each additional logical owner. The runtime
      // separately proves that these physical graphs have never been published.
      for owner in 33..=u64::from(MAX_EXECUTION_CONTEXTS) {
       let slot=(1..cfg::RENDER_SLOTS).find(|slot|state.reassign_unused_spare(*slot as u8,None,Some(owner))).unwrap();
-      assert_eq!(state.acquire(owner),Some(slot as u8));state.release(slot as u8);
+      assert_eq!(state.acquire(owner,pairs),Some(slot as u8));state.release(slot as u8);
      }
-     for owner in 1..=u64::from(MAX_EXECUTION_CONTEXTS) {let slot=state.acquire(owner).unwrap();state.release(slot);}
+     for owner in 1..=u64::from(MAX_EXECUTION_CONTEXTS) {let slot=state.acquire(owner,pairs).unwrap();state.release(slot);}
      assert!(state.owners.iter().all(|owner|*owner<=u64::from(MAX_EXECUTION_CONTEXTS)));
      println!("fixed: all{} logical owners render and resume without reducing slot count or depth",MAX_EXECUTION_CONTEXTS);
-     let mut guarded=State::new();let first=guarded.acquire(1).unwrap();guarded.release(first);
+     let mut depth=State::new();let first=depth.acquire(1,pairs).unwrap();
+     for _ in 1..pairs*usize::from(cfg::RENDER_DEPTH) {assert!(depth.acquire(1,pairs).is_some());}
+     assert_eq!(depth.acquire(1,pairs),None);
+     let held:Vec<_>=(0..cfg::RENDER_SLOTS).filter(|slot|depth.owners[*slot]==1).collect();
+     assert_eq!(held.len(),pairs);assert!(held.iter().all(|slot|depth.refs[*slot]==cfg::RENDER_DEPTH));
+     depth.release(first);assert_eq!(depth.acquire(1,pairs),Some(first));
+     println!("two pairs: depth {} over both pairs, then waits for exact retirement",pairs*usize::from(cfg::RENDER_DEPTH));
+     let mut guarded=State::new();let first=guarded.acquire(1,pairs).unwrap();guarded.release(first);
      let spare=guarded.owners.iter().enumerate().find(|(s,o)|**o==1&&*s!=first as usize).unwrap().0;
      guarded.take_idle(spare,1);
      assert!(!guarded.reassign_unused_spare(spare as u8,Some(1),Some(2)),"warm borrower excludes reclamation");
@@ -86,23 +106,32 @@ def admission_tests(root, source):
      assert!(!guarded.reassign_unused_spare(64,None,Some(3)));
      guarded.released |= 1u64<<first;
      assert!(guarded.reassign_unused_spare(first,Some(1),None),"closed owner's unused last slot can be freed for compute");
-     let second=guarded.acquire(3).unwrap();guarded.release(second);
+     let second=guarded.acquire(3,pairs).unwrap();guarded.release(second);
      let spare3=guarded.owners.iter().enumerate().find(|(s,o)|**o==3&&*s!=second as usize).unwrap().0;
-     assert!(guarded.reassign_unused_spare(spare3 as u8,Some(3),Some(2)));
-     let fourth=guarded.acquire(4).unwrap();guarded.release(fourth);
+     // A spare goes only to an owner without a pair: a second pair comes only from surplus.
+     assert!(!guarded.reassign_unused_spare(spare3 as u8,Some(3),Some(2)),"an owner with a pair takes no spare");
+     assert!(guarded.reassign_unused_spare(spare3 as u8,Some(3),Some(5)));
+     let fourth=guarded.acquire(4,pairs).unwrap();guarded.release(fourth);
      let spare4=guarded.owners.iter().enumerate().find(|(s,o)|**o==4&&*s!=fourth as usize).unwrap().0;
-     assert!(!guarded.reassign_unused_spare(spare4 as u8,Some(4),Some(2)),"destination retains at most two channels");
+     assert!(!guarded.reassign_unused_spare(spare4 as u8,Some(4),Some(5)),"destination retains at most two channels");
+     assert!(guarded.reassign_unused_spare(spare4 as u8,Some(4),Some(6)));
+     assert!((1..=6).all(|owner|guarded.owners.iter().filter(|o|**o==owner).count()<=pairs));
      let mut recency=State::new();recency.owners[9]=1;recency.owners[2]=1;
      recency.take_idle(9,1);let epoch=recency.epochs[9];
      assert_eq!(recency.borrow_warm_sibling(1,9),Some(2));
      assert_eq!(recency.epochs[2],0);assert_eq!(recency.epochs[9],epoch);
      recency.release(2);recency.release(9);
-     for _ in 0..32 {let slot=recency.acquire(1).unwrap();assert_eq!(slot,9);recency.release(slot);}
-     let a=recency.acquire(1).unwrap();let b=recency.acquire(1).unwrap();assert_ne!(a,b);
-     recency.release(b);recency.released|=1u64<<b;
+     for _ in 0..32 {let slot=recency.acquire(1,pairs).unwrap();assert_eq!(slot,9);recency.release(slot);}
+     // A busy pair takes sibling_backlog() more renders before the idle sibling.
+     let backlog=crate::g17::pairs::sibling_backlog();
+     let a=recency.acquire(1,pairs).unwrap();
+     for _ in 0..backlog {assert_eq!(recency.acquire(1,pairs),Some(a));}
+     let b=recency.acquire(1,pairs).unwrap();assert_ne!(a,b);
+     for _ in 0..backlog {recency.release(a);}
+     recency.release(b);assert_eq!(recency.warmable_sibling(1,a),Some(b));recency.released|=1u64<<b;
      assert_eq!(recency.borrow_warm_sibling(1,a),None,"never reopen a closed sibling while warming");
      recency.release(a);
-     let mut empty=State::new();let slot=empty.acquire(1).unwrap();
+     let mut empty=State::new();let slot=empty.acquire(1,pairs).unwrap();
      assert!(!empty.cancel_empty_slot(slot,2));
      empty.refs[slot as usize]+=1;assert!(!empty.cancel_empty_slot(slot,1));empty.release(slot);
      assert!(empty.cancel_empty_slot(slot,1));empty.release(slot);
@@ -110,14 +139,14 @@ def admission_tests(root, source):
      println!("recency: serial work keeps its used pair; overlapping work retains both channels; warm close and empty-reservation races protected");
      println!("guards: live warming, expected owner, remaining usable pair, existing destination, and reserved slots");
      let mut state=State::new();
-     for owner in 1..=32 {let slot=state.acquire(owner).unwrap();state.release(slot);}
+     for owner in 1..=32 {let slot=state.acquire(owner,pairs).unwrap();state.release(slot);}
      // Every existing owner still resumes, so this is held capacity, not live GPU work.
-     for owner in 1..=32 {let slot=state.acquire(owner).unwrap();state.release(slot);}
+     for owner in 1..=32 {let slot=state.acquire(owner,pairs).unwrap();state.release(slot);}
      // Logical close makes the retained pair eligible; no firmware behavior modeled.
      let slot=state.owners.iter().position(|o|*o==1).unwrap();
      state.released |= 1u64<<slot;
      assert!(state.refusal(33).is_ok());
-     assert_eq!(state.acquire(33),Some(slot as u8));
+     assert_eq!(state.acquire(33,pairs),Some(slot as u8));
      println!("control: explicitly released idle ownership admits a new owner");
     }
     '''

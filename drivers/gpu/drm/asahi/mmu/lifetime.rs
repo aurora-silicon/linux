@@ -28,6 +28,10 @@ struct PoolMappings {
     mappings: KVec<KernelMapping>,
 }
 
+/// A graph's pool mappings moved out of a VM slot (see
+/// Vm::take_render_pool_mappings). Dropping it unmaps them.
+pub(crate) struct RenderPoolMappings(PoolMappings);
+
 impl DriverMappings {
     fn ranges(&self) -> impl Iterator<Item = Range<u64>> + '_ {
         Iterator::chain(
@@ -168,6 +172,51 @@ impl Vm {
             driver.mappings.push(mapping, GFP_KERNEL)?;
         }
         Ok(())
+    }
+
+    /// Move a drained graph's pool mappings for `slot` out of this VM
+    /// (so another graph of the same VM can install there); `put` returns them
+    /// if that install fails. Only the exact owner identity is taken.
+    pub(crate) fn take_render_pool_mappings(&self, slot: u8, id: u64) -> Option<RenderPoolMappings> {
+        if id == 0 {
+            return None;
+        }
+        let lifetime = self.lifetime.as_ref()?;
+        let mut driver = lifetime.driver.lock();
+        Option::as_mut(&mut *driver)?
+            .render
+            .get_mut(usize::from(slot))?
+            .take_if(|pool| pool.id == id)
+            .map(RenderPoolMappings)
+    }
+    pub(crate) fn put_render_pool_mappings(&self, slot: u8, mappings: RenderPoolMappings) -> Result {
+        let lifetime = self.lifetime.as_ref().ok_or(EINVAL)?;
+        let mut driver = lifetime.driver.lock();
+        let driver = Option::as_mut(&mut *driver).ok_or(EINVAL)?;
+        let pool = driver.render.get_mut(usize::from(slot)).ok_or(EINVAL)?;
+        if pool.is_some() {
+            return Err(EBUSY);
+        }
+        *pool = Some(mappings.0);
+        Ok(())
+    }
+
+    /// The graph identity whose pool mappings occupy `slot` in this
+    /// VM (0 when free). A second graph cannot install there until it leaves.
+    pub(crate) fn render_pool_owner(&self, slot: u8) -> u64 {
+        self.lifetime
+            .as_ref()
+            .and_then(|lifetime| {
+                lifetime
+                    .driver
+                    .lock()
+                    .as_ref()?
+                    .render
+                    .get(usize::from(slot))?
+                    .as_ref()
+                    .map(|pool| pool.id)
+            })
+            .unwrap_or(0)
     }
 
     pub(crate) fn render_pool_tvb_blocks(&self, slot: u8, id: u64) -> Option<usize> {
@@ -650,6 +699,31 @@ impl Drop for VmJobGuard {
         let mut state = lifetime.state.lock();
         state.active -= 1;
         if state.active != 0 {
+            return;
+        }
+        // Healthy last-job release need not close mapping/job admission when
+        // there is no accepted cleanup to drain. Keep every recovery, close,
+        // in-progress commit and failed-cleanup path on the existing drain.
+        // M5 only: other G17 GPUs keep the drain on every last release.
+        if self.vm.m5
+            && !state.blocked
+            && !state.quarantined
+            && !state.draining
+            && !state.closed
+            && !state.cleanup_failed
+            && state.commits == 0
+            && state.close_ranges.is_none()
+            && state.unmaps.is_empty()
+            && state.objects.is_empty()
+            && self.vm.status.as_ref().is_some_and(|status| {
+                status.get() == 0 && status.reported_error() == 0
+            })
+        {
+            drop(state);
+            // The C deferred list is independent of the queues above. Its
+            // GEM puts may sleep/reenter; run after unlocking, while this
+            // job guard still retains the VM and its residency lease.
+            self.vm.bo_deferred_cleanup();
             return;
         }
         state.draining = true;

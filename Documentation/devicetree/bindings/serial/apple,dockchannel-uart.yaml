@@ -54,12 +54,6 @@ properties:
       bits 2n (TX) and 2n + 1 (RX) of the shared interrupt mask and flag
       registers.
 
-  apple,tx-never-wait:
-    type: boolean
-    description:
-      Transmit completes without waiting for a reader to drain the channel,
-      so a console with nobody attached does not stall.
-
   apple,sw-drain:
     type: boolean
     description:
@@ -67,6 +61,16 @@ properties:
       FIFO is drained in software instead. This mirrors the enable-sw-drain
       property of the channel's Apple device tree node. The interrupt, if
       described, is not used.
+
+  apple,tx-never-wait:
+    type: boolean
+    description:
+      Output never waits for the host to read the channel. The channel drains
+      only while a debug USB host reads it, so with none attached its TX FIFO
+      stays full. Console writes send what fits and drop the rest, a closing
+      port does not wait for its output, and output queued with no room for
+      two drain ticks is dropped. For boards that boot unattended with nothing
+      reading the channel.
 
 required:
   - compatible

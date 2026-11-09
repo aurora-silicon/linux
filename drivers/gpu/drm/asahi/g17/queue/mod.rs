@@ -149,10 +149,10 @@ impl<B: Backend> Queue<B> {
         })
     }
 
-    fn ensure_compute(&mut self, scs_pages: u16) -> Result {
+    fn ensure_compute(&mut self, command: &Validated) -> Result {
         // Validate every request, including an existing scheduler. Physical
         // admission happens after its DRM dependencies, in backend publication.
-        self.backend.ensure_compute(scs_pages)?;
+        self.backend.ensure_compute(command)?;
         if self.compute.is_none() {
             self.compute = Some(Scheduler::new(
                 &self.dev,
@@ -218,10 +218,7 @@ impl<B: Backend> Queue<B> {
         self.prune_frontier(index);
         self.frontiers[index].reserve(1, GFP_KERNEL)?;
         if engine == Engine::Compute {
-            let Validated::Compute { scratch, .. } = &command else {
-                return Err(EINVAL);
-            };
-            self.ensure_compute(scratch.pages())?;
+            self.ensure_compute(&command)?;
         }
         // Only convert inputs when no independent host-prefix wait could keep
         // the retained source bookkeeping queued behind an external signal.
@@ -298,8 +295,14 @@ impl<B: Backend> Queue<B> {
             &[]
         };
         let count = frontier.len();
+        // Only a command that copies or resets queries can observe timestamps the
+        // host has not yet published for its predecessors.
+        let query_access = match &command {
+            Validated::Compute { query_access, .. } => *query_access,
+            Validated::Render { .. } => true,
+        };
         let timestamp_prefix = order.wait_through[index];
-        let timestamps = if engine == Engine::Compute && timestamp_prefix.is_some() {
+        let timestamps = if engine == Engine::Compute && query_access && timestamp_prefix.is_some() {
             let frontier = self.frontiers[index].as_slice();
             let end = frontier
                 .partition_point(|(sequence, _)| Order::contains(timestamp_prefix, *sequence));
@@ -419,7 +422,7 @@ impl<B: Backend> Queue<B> {
         let mut preceding = [0; 2];
         let mut pending = KVec::with_capacity(1, GFP_KERNEL)?;
         while let Some(command) = parser.next()? {
-            let payload = self.proof.validate(
+            let mut payload = self.proof.validate(
                 self.context.vm(),
                 self.range.clone(),
                 &self.window,
@@ -430,13 +433,18 @@ impl<B: Backend> Queue<B> {
                 Validated::Render { .. } => Engine::Render,
                 Validated::Compute { .. } => Engine::Compute,
             };
-            let order = Order::new(
+            if !self.backend.supports_engine(engine) { return Err(ENOTSUPP); }
+            self.backend.prepare_command(&mut payload)?;
+            let mut order = Order::new(
                 base,
                 preceding,
                 command.barriers,
                 command.payload.prior(),
                 engine,
             )?;
+            if let Some((barriers, prior)) = command.payload.tiling_prefixes() {
+                order.narrow_tiling(&Order::new(base, preceding, barriers, prior, engine)?)?;
+            }
             preceding[engine.index()] += 1;
             let destinations = match &payload {
                 Validated::Render { timestamps, .. } => Destinations::resolve(objects, timestamps)?,
@@ -482,6 +490,9 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
     ) -> Result {
         let mut outputs = Outputs::new(&self.fences, syncs, input_count, &self.allocation_failure)?;
         let result = (|| {
+            if !self.backend.supports_submission() {
+                return Err(ENOTSUPP);
+            }
             if self.context.status().get() != 0 {
                 return Err(EIO);
             }

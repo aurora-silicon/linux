@@ -52,10 +52,12 @@ properties:
   interrupts:
     description:
       One interrupt for each of the 12 transmit rings followed by one for each
-      of the 12 receive rings.
-    maxItems: 24
+      of the 12 receive rings. On T6050 an SRAM parity interrupt follows them.
+    minItems: 24
+    maxItems: 25
 
   interrupt-names:
+    minItems: 24
     items:
       - const: txring0
       - const: txring1
@@ -81,6 +83,7 @@ properties:
       - const: rxring9
       - const: rxring10
       - const: rxring11
+      - const: parity
 
   iommus:
     minItems: 1
@@ -176,5 +179,18 @@ allOf:
         properties:
           iommus:
             maxItems: 1
+
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              const: apple,t6050-usb4-nhi
+    then:
+      properties:
+        interrupts:
+          maxItems: 24
+        interrupt-names:
+          maxItems: 24
 
 additionalProperties: false
