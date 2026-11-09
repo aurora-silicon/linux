@@ -2,6 +2,10 @@
 /*
  * GL9755 board power sequencing core. No hardware adapter is enabled until an
  * always-on insertion wake source and config-access exclusion are available.
+ *
+ * Card detection must never use the unidentified I2C4 client at address 0x20
+ * (the board "sd-card" node): no probe, scan, quick command or read of it.
+ * Insertion comes from the SMC helper interrupt or the GL9755 itself.
  */
 #include <linux/errno.h>
 #include <linux/lockdep.h>
