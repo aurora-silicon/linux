@@ -540,6 +540,16 @@
 				label = "nvram";
 				reg = <0x24000 0x1d0000>;
 			};
+
+			/*
+			 * syscfg factory data. Listed after nvram so the nvram
+			 * MTD index stays the same.
+			 */
+			partition@0 {
+				label = "syscfg";
+				reg = <0x0 0x24000>;
+				read-only;
+			};
 		};
 	};
 };
