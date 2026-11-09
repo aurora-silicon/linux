@@ -284,6 +284,14 @@ properties:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Height in pixels reserved for the display notch.
 
+  apple,pmc-interface:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The PMC interface enables of this coprocessor's display pipe, an
+      apple,consumer-switched interface node. The coprocessor clears them
+      before it powers its display domains down while the display is off,
+      and restores them after it powers them up again.
+
   apple,pmp-report:
     $ref: /schemas/types.yaml#/definitions/phandle
     description:

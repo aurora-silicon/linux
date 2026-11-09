@@ -20,6 +20,11 @@
 	model = "Apple MacBook Pro (14-inch, M5 Pro, 2026)";
 	chassis-type = "laptop";
 
+	aliases {
+		/* the boot loader reserves the SEP firmware and adds its manifests through this alias */
+		sep = &sep;
+	};
+
 	chosen {
 		#address-cells = <2>;
 		#size-cells = <2>;
@@ -41,3 +46,6 @@
 
 #define T6050_J714S
 #include "t6050-peripherals.dtsi"
+
+/* The same T6050 camera as J716c (J714sAP ADT); the loader sets the J714s sensor type. */
+#include "t6050-j716c-isp.dtsi"
