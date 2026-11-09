@@ -295,7 +295,8 @@ int dcp_audiosrv_open(struct device *dev)
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	struct audiosrv_data *asrv = dcp->audiosrv;
 	struct apple_epic_service *srv;
-	u8 reply[32] = {};
+	u8 reply[32];
+	bool replaced;
 	u64 gen;
 	int ret;
 
@@ -303,32 +304,51 @@ int dcp_audiosrv_open(struct device *dev)
 		return -ENODEV;
 
 	guard(mutex)(&asrv->open_lock);
-	scoped_guard(rwsem_read, &asrv->srv_rwsem) {
-		srv = afk_service_get(asrv->srv);
-		gen = asrv->gen;
-	}
-	if (!srv)
-		return -ENODEV;
-	if (asrv->open_srv) {
-		if (asrv->open_gen == gen) {
-			afk_service_put(srv);
-			return 0;
+	/*
+	 * A display that wakes up (DPMS on) reports its sink on the audio
+	 * interface it had, and the firmware replaces that instance a few
+	 * hundred milliseconds later: an Open sent in between is refused
+	 * with a reply that matches no call, and times out. The Open that
+	 * follows the replacement is answered, so try the instance published
+	 * by then once more. Userspace drops an output whose first open
+	 * fails, so this is the difference between a display with and
+	 * without audio after it wakes up.
+	 */
+	for (int attempt = 0; ; attempt++) {
+		scoped_guard(rwsem_read, &asrv->srv_rwsem) {
+			srv = afk_service_get(asrv->srv);
+			gen = asrv->gen;
 		}
-		/* An earlier instance's open went with that instance. */
-		afk_service_put(asrv->open_srv);
-		asrv->open_srv = NULL;
-	}
+		if (!srv)
+			return -ENODEV;
+		if (asrv->open_srv) {
+			if (asrv->open_gen == gen) {
+				afk_service_put(srv);
+				return 0;
+			}
+			/* An earlier instance's open went with that instance. */
+			afk_service_put(asrv->open_srv);
+			asrv->open_srv = NULL;
+		}
 
-	/* Open: a zero body; status at +0, the opened Boolean at +16. */
-	ret = av_audiosrv_call(srv, asrv->cmds.open, NULL, 0, 32, reply, sizeof(reply));
-	if (!ret && (get_unaligned_le32(reply) || !get_unaligned_le64(reply + 16))) {
-		dev_err(dev, "audiosrv: open answered %#x, opened %llu\n",
-			get_unaligned_le32(reply), get_unaligned_le64(reply + 16));
-		ret = -EIO;
-	}
-	if (ret) {
+		/* Open: a zero body; status at +0, the opened Boolean at +16. */
+		memset(reply, 0, sizeof(reply));
+		ret = av_audiosrv_call(srv, asrv->cmds.open, NULL, 0, 32, reply, sizeof(reply));
+		if (!ret && (get_unaligned_le32(reply) || !get_unaligned_le64(reply + 16))) {
+			dev_err(dev, "audiosrv: open answered %#x, opened %llu\n",
+				get_unaligned_le32(reply), get_unaligned_le64(reply + 16));
+			ret = -EIO;
+		}
+		if (!ret)
+			break;
 		afk_service_put(srv);
-		return ret;
+		if (attempt)
+			return ret;
+		scoped_guard(rwsem_read, &asrv->srv_rwsem)
+			replaced = asrv->srv && asrv->gen != gen;
+		if (!replaced)
+			return ret;
+		dev_dbg(dev, "audiosrv: open on a replaced instance failed (%d), retrying\n", ret);
 	}
 	asrv->open_srv = srv;
 	asrv->open_gen = gen;
