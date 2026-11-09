@@ -11,18 +11,21 @@
 		usb4_0_rc = &usb4_0_acio;
 		usb4_0_nhi = &usb4_0_nhi;
 		usb4_0_pcie = &usb4_0_pcie;
+		usb4-0-pcie-adapter = &usb4_0_acio;
 		usb4_1_rc = &usb4_1_acio;
 		usb4_1_nhi = &usb4_1_nhi;
 		usb4_1_pcie = &usb4_1_pcie;
+		usb4-1-pcie-adapter = &usb4_1_acio;
 		usb4_2_rc = &usb4_2_acio;
 		usb4_2_nhi = &usb4_2_nhi;
 		usb4_2_pcie = &usb4_2_pcie;
+		usb4-2-pcie-adapter = &usb4_2_acio;
 	};
 
 	usb4_0_acio: cio@381ac0000 {
 		compatible = "apple,t6040-usb4-acio";
 		reg = <0x3 0x81ac0000 0x0 0xc000>,
-		      <0x3 0x81108000 0x0 0x4000>,
+		      <0x3 0x81080000 0x0 0x26000>,
 		      <0x3 0x81e44000 0x0 0x4000>,
 		      <0x3 0x81100000 0x0 0x4000>;
 		reg-names = "rc", "sram", "pcie-adapter", "cpu";
@@ -65,19 +68,7 @@
 			reg = <0x1f00000 0x100000>;
 			reg-names = "nhi";
 			interrupt-parent = <&aic>;
-			interrupts = <AIC_IRQ 1774 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1775 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1776 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1777 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1778 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1779 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1780 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1781 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1782 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1783 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1784 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1785 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1762 IRQ_TYPE_LEVEL_HIGH>,
+			interrupts = <AIC_IRQ 1762 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 1763 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 1764 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 1765 IRQ_TYPE_LEVEL_HIGH>,
@@ -88,7 +79,19 @@
 				     <AIC_IRQ 1770 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 1771 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 1772 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1773 IRQ_TYPE_LEVEL_HIGH>;
+				     <AIC_IRQ 1773 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1774 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1775 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1776 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1777 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1778 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1779 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1780 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1781 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1782 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1783 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1784 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1785 IRQ_TYPE_LEVEL_HIGH>;
 			interrupt-names = "txring0", "txring1", "txring2", "txring3",
 					  "txring4", "txring5", "txring6", "txring7",
 					  "txring8", "txring9", "txring10", "txring11",
@@ -116,7 +119,7 @@
 	usb4_1_acio: cio@389ac0000 {
 		compatible = "apple,t6040-usb4-acio";
 		reg = <0x3 0x89ac0000 0x0 0xc000>,
-		      <0x3 0x89108000 0x0 0x4000>,
+		      <0x3 0x89080000 0x0 0x26000>,
 		      <0x3 0x89e44000 0x0 0x4000>,
 		      <0x3 0x89100000 0x0 0x4000>;
 		reg-names = "rc", "sram", "pcie-adapter", "cpu";
@@ -159,19 +162,7 @@
 			reg = <0x1f00000 0x100000>;
 			reg-names = "nhi";
 			interrupt-parent = <&aic>;
-			interrupts = <AIC_IRQ 1822 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1823 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1824 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1825 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1826 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1827 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1828 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1829 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1830 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1831 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1832 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1833 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1810 IRQ_TYPE_LEVEL_HIGH>,
+			interrupts = <AIC_IRQ 1810 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 1811 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 1812 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 1813 IRQ_TYPE_LEVEL_HIGH>,
@@ -182,7 +173,19 @@
 				     <AIC_IRQ 1818 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 1819 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 1820 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1821 IRQ_TYPE_LEVEL_HIGH>;
+				     <AIC_IRQ 1821 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1822 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1823 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1824 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1825 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1826 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1827 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1828 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1829 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1830 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1831 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1832 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1833 IRQ_TYPE_LEVEL_HIGH>;
 			interrupt-names = "txring0", "txring1", "txring2", "txring3",
 					  "txring4", "txring5", "txring6", "txring7",
 					  "txring8", "txring9", "txring10", "txring11",
@@ -210,7 +213,7 @@
 	usb4_2_acio: cio@391ac0000 {
 		compatible = "apple,t6040-usb4-acio";
 		reg = <0x3 0x91ac0000 0x0 0xc000>,
-		      <0x3 0x91108000 0x0 0x4000>,
+		      <0x3 0x91080000 0x0 0x26000>,
 		      <0x3 0x91e44000 0x0 0x4000>,
 		      <0x3 0x91100000 0x0 0x4000>;
 		reg-names = "rc", "sram", "pcie-adapter", "cpu";
@@ -253,19 +256,7 @@
 			reg = <0x1f00000 0x100000>;
 			reg-names = "nhi";
 			interrupt-parent = <&aic>;
-			interrupts = <AIC_IRQ 1870 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1871 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1872 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1873 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1874 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1875 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1876 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1877 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1878 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1879 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1880 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1881 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1858 IRQ_TYPE_LEVEL_HIGH>,
+			interrupts = <AIC_IRQ 1858 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 1859 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 1860 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 1861 IRQ_TYPE_LEVEL_HIGH>,
@@ -276,7 +267,19 @@
 				     <AIC_IRQ 1866 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 1867 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 1868 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1869 IRQ_TYPE_LEVEL_HIGH>;
+				     <AIC_IRQ 1869 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1870 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1871 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1872 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1873 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1874 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1875 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1876 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1877 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1878 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1879 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1880 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1881 IRQ_TYPE_LEVEL_HIGH>;
 			interrupt-names = "txring0", "txring1", "txring2", "txring3",
 					  "txring4", "txring5", "txring6", "txring7",
 					  "txring8", "txring9", "txring10", "txring11",
