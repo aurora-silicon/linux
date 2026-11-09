@@ -301,13 +301,16 @@ static bool smp_rvbar_spin_table_cpu_can_disable(unsigned int cpu)
 
 static int smp_rvbar_spin_table_cpu_disable(unsigned int cpu)
 {
-	if (!IS_ENABLED(CONFIG_KEXEC_CORE))
-		return -EOPNOTSUPP;
-
 	return READ_ONCE(spin_table_power) ? 0 : -EOPNOTSUPP;
 }
 
-#ifdef CONFIG_KEXEC_CORE
+/* S2R bring-up: built without KEXEC_CORE until boards/j713/pkgs/kernel.config has it. */
+#if 1
+#ifndef CONFIG_KEXEC_CORE
+void cpu_soft_restart(unsigned long el2_switch, unsigned long entry,
+		      unsigned long arg0, unsigned long arg1,
+		      unsigned long arg2);
+#endif
 static void smp_rvbar_spin_table_restart(void)
 {
 	typeof(cpu_soft_restart) *restart;
@@ -350,7 +353,7 @@ static void smp_rvbar_spin_table_cpu_die(unsigned int cpu)
 	u64 mpidr = cpu_logical_map(cpu);
 
 	/* The early-boot and crash paths get here without hotplug support. */
-	if (!READ_ONCE(spin_table_power) || !IS_ENABLED(CONFIG_KEXEC_CORE)) {
+	if (!READ_ONCE(spin_table_power)) {
 		while (1)
 			wfe();
 	}

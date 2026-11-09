@@ -67,6 +67,10 @@ static bool s2idle_keep_link = true;
 module_param(s2idle_keep_link, bool, 0644);
 MODULE_PARM_DESC(s2idle_keep_link, "Keep tunneled links up through suspend-to-idle");
 
+/* S2R bring-up on the Air, where nothing drives the radio yet. */
+static bool bringup_no_radio_refuse;
+module_param(bringup_no_radio_refuse, bool, 0644);
+
 static int link_up_timeout = 500;
 /* Fundamental resets of a conventional port whose endpoint does not train. */
 #define LINK_RESET_RETRIES	2
@@ -5310,7 +5314,8 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 	 * leaves it in place like any other internal port (no power domain).
 	 */
 	if (pcie->managed_sids)
-		return pm_suspend_target_state == PM_SUSPEND_TO_IDLE ? 0 : -EBUSY;
+		return pm_suspend_target_state == PM_SUSPEND_TO_IDLE ||
+		       bringup_no_radio_refuse ? 0 : -EBUSY;
 	if (pcie->hw->adopt_link) {
 		int ret = apple_pcie_check_adopted_s2idle(pcie);
 

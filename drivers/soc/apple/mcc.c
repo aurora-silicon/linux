@@ -54,6 +54,10 @@ static void apple_mcc_writel(struct apple_mcc *mcc, unsigned int plane,
 	writel(value, mcc->planes[plane] + offset);
 }
 
+/* Bring-up: nothing drains T8132's cache before a deep sleep, so don't let it fill. */
+static bool bringup_t8132_slc_off = true;
+module_param(bringup_t8132_slc_off, bool, 0444);
+
 /* T8132 powers the whole cache through two multicast apertures. Unlike
  * T8140 allocation control, its dirty-data drain is not qualified yet.
  */
@@ -74,6 +78,11 @@ static int apple_mcc_enable_t8132(struct apple_mcc *mcc)
 		off &= !control[p] && !status[p];
 		on &= control[p] == 1 && (status[p] & 0x3ff0) == 0x2100;
 	}
+	dev_info(mcc->dev, "bringup: at probe control %#x %#x %#x %#x status %#x %#x %#x %#x\n",
+		 control[0], control[1], control[2], control[3],
+		 status[0], status[1], status[2], status[3]);
+	if (bringup_t8132_slc_off)
+		return -EBUSY;
 	if (on)
 		return 0;
 	if (!off)

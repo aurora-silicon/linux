@@ -166,3 +166,12 @@
 &dcp {
 	apple,pmc-interface = <&pmc_disp0>;
 };
+
+/* Bring-up: nothing brings the radio's PCIe port back after a deep sleep yet. */
+&pcie0 {
+	status = "disabled";
+};
+
+&dart_apcie0 {
+	status = "disabled";
+};
