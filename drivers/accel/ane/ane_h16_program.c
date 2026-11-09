@@ -1097,10 +1097,10 @@ static int h16_report(struct ane_h16_session *s, const u8 *report, size_t size)
 
 /* Wait for this request, serving all keys under the session mutex. */
 static int h16_wait_report(struct ane_h16_session *s, struct ane_h16_pending *request,
-			   u64 deadline, struct h16_execute_trace *trace)
+			   u64 deadline, u64 submit_ns, struct h16_execute_trace *trace)
 {
 	struct ane_fw_transport *t = s->transport;
-	u64 start = h16_now(s), now;
+	u64 now;
 	u8 *report;
 	int ret;
 
@@ -1160,14 +1160,16 @@ static int h16_wait_report(struct ane_h16_session *s, struct ane_h16_pending *re
 		if (s->lock && t->ops->service) {
 			t->ops->service(t->ctx);
 			mutex_unlock(s->lock);
-			ane_fw_poll_pause(now - start);
+			ane_fw_poll_pause(now - submit_ns, ANE_FW_POLL_EXECUTE_SPIN_NS);
 			mutex_lock(s->lock);
 		} else if (s->lock) {
 			mutex_unlock(s->lock);
-			t->ops->relax(t->ctx, now - start);
+			t->ops->relax(t->ctx, now - submit_ns,
+				      ANE_FW_POLL_EXECUTE_SPIN_NS);
 			mutex_lock(s->lock);
 		} else {
-			t->ops->relax(t->ctx, now - start);
+			t->ops->relax(t->ctx, now - submit_ns,
+				      ANE_FW_POLL_EXECUTE_SPIN_NS);
 		}
 	}
 	kfree(report);
@@ -1293,7 +1295,7 @@ static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 	if (!ret) {
 		trace->step = H16_STEP_REPORT;
 		t2 = h16_now(s);
-		ret = h16_wait_report(s, request, deadline, trace);
+		ret = h16_wait_report(s, request, deadline, t1, trace);
 	}
 	if (ret) {
 		if (request->active)

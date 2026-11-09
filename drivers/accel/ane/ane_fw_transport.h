@@ -34,21 +34,28 @@ struct ane_fw_surface {
 
 /*
  * Pacing between two polls of one wait. A command reply arrives within tens
- * of microseconds, so the first ANE_FW_POLL_SPIN_NS of a wait polls in 2 us
- * busy steps and sees it without a sleep and its wakeup latency. Up to 5 ms
+ * of microseconds, so the first spin_ns of a wait polls in 2 us busy steps
+ * and sees it without a sleep and its wakeup latency. Up to 5 ms
  * (a whole inference) each step sleeps 20-50 us; long waits (firmware
  * startup, a stalled request) back off to 250 us and, after 50 ms, to the
  * 1 ms cadence, so they cost no more CPU than a fixed 1 ms poll did.
  * Returns the sleep in microseconds, or 0 for a busy step.
  */
 #define ANE_FW_POLL_SPIN_NS (30ULL * 1000)
+/*
+ * The H16 EXECUTE reply and first report straddle the default sleep boundary.
+ * Keep their combined short preamble in the polling window; completion waits
+ * that outlive it still use the normal backoff below.
+ */
+#define ANE_FW_POLL_EXECUTE_SPIN_NS (200ULL * 1000)
 #define ANE_FW_POLL_SPIN_STEP_US 2
 #define ANE_FW_POLL_FINE_NS (5ULL * 1000 * 1000)
 #define ANE_FW_POLL_MEDIUM_NS (50ULL * 1000 * 1000)
 
-static inline unsigned int ane_fw_poll_sleep_us(u64 waited_ns, unsigned int *max_us)
+static inline unsigned int
+ane_fw_poll_sleep_us(u64 waited_ns, u64 spin_ns, unsigned int *max_us)
 {
-	unsigned int us = waited_ns < ANE_FW_POLL_SPIN_NS ? 0 :
+	unsigned int us = waited_ns < spin_ns ? 0 :
 			  waited_ns < ANE_FW_POLL_FINE_NS ? 20 :
 			  waited_ns < ANE_FW_POLL_MEDIUM_NS ? 250 : 1000;
 
@@ -57,11 +64,11 @@ static inline unsigned int ane_fw_poll_sleep_us(u64 waited_ns, unsigned int *max
 }
 
 /* One pacing step of a wait that began waited_ns ago (process context). */
-static inline void ane_fw_poll_pause(u64 waited_ns)
+static inline void ane_fw_poll_pause(u64 waited_ns, u64 spin_ns)
 {
 	unsigned int min_us, max_us;
 
-	min_us = ane_fw_poll_sleep_us(waited_ns, &max_us);
+	min_us = ane_fw_poll_sleep_us(waited_ns, spin_ns, &max_us);
 	if (min_us)
 		usleep_range(min_us, max_us);
 	else
@@ -84,8 +91,8 @@ struct ane_fw_transport_ops {
 	/* Complete/order an irq_ack write before subsequent coherent ring reads. */
 	void (*write32)(void *ctx, u32 reg, u32 value);
 	u64 (*now_ns)(void *ctx);
-	/* Wait before the next poll of a wait that began waited_ns ago. */
-	void (*relax)(void *ctx, u64 waited_ns);
+	/* Wait before the next poll, busy-polling for the first spin_ns. */
+	void (*relax)(void *ctx, u64 waited_ns, u64 spin_ns);
 	/*
 	 * Optional: the non-waiting half of relax() (drain the mailbox, check
 	 * faults). It touches shared transport state, so callers that drop
@@ -881,13 +888,14 @@ static inline int ane_fw_transport_settle(struct ane_fw_transport *t, u64 quiet_
 		if (now - last >= quiet_ns || now - start >= limit_ns)
 			return served;
 		t->polls++;
-		t->ops->relax(t->ctx, now - last);
+		t->ops->relax(t->ctx, now - last, ANE_FW_POLL_SPIN_NS);
 	}
 }
 
 static inline int ane_fw_transport_wait(struct ane_fw_transport *t, unsigned int ch)
 {
 	u64 start = t->ops->now_ns(t->ctx), now;
+	u64 spin_ns;
 	u32 pending;
 	int ret;
 
@@ -909,7 +917,9 @@ static inline int ane_fw_transport_wait(struct ane_fw_transport *t, unsigned int
 		if (now >= t->pending[ch].deadline_ns)
 			return ane_fw_transport_fail(t, -ETIMEDOUT);
 		t->polls++;
-		t->ops->relax(t->ctx, now - start);
+		spin_ns = t->pending[ch].id == ANE_H16_EXECUTE ?
+			  ANE_FW_POLL_EXECUTE_SPIN_NS : ANE_FW_POLL_SPIN_NS;
+		t->ops->relax(t->ctx, now - start, spin_ns);
 	}
 }
 

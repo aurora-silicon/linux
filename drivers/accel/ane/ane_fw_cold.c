@@ -388,7 +388,7 @@ static int ane_fw_suspend_wait(struct ane_fw_backend *b)
 			break;
 		}
 		t->polls++;
-		t->ops->relax(t->ctx, now - start);
+		t->ops->relax(t->ctx, now - start, ANE_FW_POLL_SPIN_NS);
 	}
 	dev_info(&b->pdev->dev,
 		 "H17 ANE: SUSPEND wait %d after %llu us: %u reports, %u allocations, irq seen %#x\n",
@@ -1041,12 +1041,12 @@ static u64 ane_fw_now(void *ctx)
 
 /*
  * Every wait polls, with the shared pacing (see ane_fw_poll_sleep_us()):
- * busy steps for the first 30 us, then short sleeps, backing off for long
- * waits such as a stalled request.
+ * busy steps through the caller's short fast window, then short sleeps,
+ * backing off for long waits such as a stalled request.
  */
-static void ane_fw_relax(void *ctx, u64 waited_ns)
+static void ane_fw_relax(void *ctx, u64 waited_ns, u64 spin_ns)
 {
-	ane_fw_poll_pause(waited_ns);
+	ane_fw_poll_pause(waited_ns, spin_ns);
 }
 
 static void ane_fw_refused(void *ctx, u64 word0, u64 word1, u64 word2, int error)

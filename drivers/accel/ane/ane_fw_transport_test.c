@@ -31,6 +31,7 @@ struct ane_transport_test {
 	u64 now;
 	u64 alloc_time;
 	u64 waited;
+	u64 spin_ns;
 	u64 next_dva;
 	u32 irq;
 	u32 last_reg;
@@ -102,11 +103,12 @@ static u64 ane_test_now(void *ctx)
 	return ((struct ane_transport_test *)ctx)->now;
 }
 
-static void ane_test_relax(void *ctx, u64 waited_ns)
+static void ane_test_relax(void *ctx, u64 waited_ns, u64 spin_ns)
 {
 	struct ane_transport_test *f = ctx;
 
 	f->waited = waited_ns;
+	f->spin_ns = spin_ns;
 	f->now++;
 }
 
@@ -542,6 +544,7 @@ static void ane_transport_refusal_test(struct kunit *test)
 {
 	struct ane_transport_test *f = test->priv;
 	u8 *command;
+	int ret;
 
 	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
 	KUNIT_ASSERT_EQ(test, ane_test_publish(f, ANE_FW_IO), 0);
@@ -1461,22 +1464,59 @@ static void ane_transport_wait_polls_test(struct kunit *test)
 
 static void ane_transport_poll_sleep_test(struct kunit *test)
 {
-	unsigned int max_us;
+	unsigned int max_us, sleep_us;
 
 	/* A reply within the first 30 us is caught by busy steps, no sleep. */
-	KUNIT_EXPECT_EQ(test, ane_fw_poll_sleep_us(0, &max_us), 0U);
+	sleep_us = ane_fw_poll_sleep_us(0, ANE_FW_POLL_SPIN_NS, &max_us);
+	KUNIT_EXPECT_EQ(test, sleep_us, 0U);
 	KUNIT_EXPECT_EQ(test, max_us, 0U);
-	KUNIT_EXPECT_EQ(test, ane_fw_poll_sleep_us(ANE_FW_POLL_SPIN_NS - 1, &max_us), 0U);
-	KUNIT_EXPECT_EQ(test, ane_fw_poll_sleep_us(ANE_FW_POLL_SPIN_NS, &max_us), 20U);
+	sleep_us = ane_fw_poll_sleep_us(ANE_FW_POLL_SPIN_NS - 1,
+					ANE_FW_POLL_SPIN_NS, &max_us);
+	KUNIT_EXPECT_EQ(test, sleep_us, 0U);
+	sleep_us = ane_fw_poll_sleep_us(ANE_FW_POLL_SPIN_NS,
+					ANE_FW_POLL_SPIN_NS, &max_us);
+	KUNIT_EXPECT_EQ(test, sleep_us, 20U);
 	KUNIT_EXPECT_EQ(test, max_us, 50U);
-	KUNIT_EXPECT_EQ(test, ane_fw_poll_sleep_us(ANE_FW_POLL_FINE_NS - 1, &max_us), 20U);
+	sleep_us = ane_fw_poll_sleep_us(ANE_FW_POLL_FINE_NS - 1,
+					ANE_FW_POLL_SPIN_NS, &max_us);
+	KUNIT_EXPECT_EQ(test, sleep_us, 20U);
 	KUNIT_EXPECT_EQ(test, max_us, 50U);
-	KUNIT_EXPECT_EQ(test, ane_fw_poll_sleep_us(ANE_FW_POLL_FINE_NS, &max_us), 250U);
+	sleep_us = ane_fw_poll_sleep_us(ANE_FW_POLL_FINE_NS,
+					ANE_FW_POLL_SPIN_NS, &max_us);
+	KUNIT_EXPECT_EQ(test, sleep_us, 250U);
 	KUNIT_EXPECT_EQ(test, max_us, 300U);
-	KUNIT_EXPECT_EQ(test, ane_fw_poll_sleep_us(ANE_FW_POLL_MEDIUM_NS - 1, &max_us), 250U);
-	KUNIT_EXPECT_EQ(test, ane_fw_poll_sleep_us(ANE_FW_POLL_MEDIUM_NS, &max_us), 1000U);
+	sleep_us = ane_fw_poll_sleep_us(ANE_FW_POLL_MEDIUM_NS - 1,
+					ANE_FW_POLL_SPIN_NS, &max_us);
+	KUNIT_EXPECT_EQ(test, sleep_us, 250U);
+	sleep_us = ane_fw_poll_sleep_us(ANE_FW_POLL_MEDIUM_NS,
+					ANE_FW_POLL_SPIN_NS, &max_us);
+	KUNIT_EXPECT_EQ(test, sleep_us, 1000U);
 	KUNIT_EXPECT_EQ(test, max_us, 1050U);
-	KUNIT_EXPECT_EQ(test, ane_fw_poll_sleep_us(U64_MAX, &max_us), 1000U);
+	sleep_us = ane_fw_poll_sleep_us(U64_MAX, ANE_FW_POLL_SPIN_NS, &max_us);
+	KUNIT_EXPECT_EQ(test, sleep_us, 1000U);
+	sleep_us = ane_fw_poll_sleep_us(ANE_FW_POLL_EXECUTE_SPIN_NS - 1,
+					ANE_FW_POLL_EXECUTE_SPIN_NS, &max_us);
+	KUNIT_EXPECT_EQ(test, sleep_us, 0U);
+	sleep_us = ane_fw_poll_sleep_us(ANE_FW_POLL_EXECUTE_SPIN_NS,
+					ANE_FW_POLL_EXECUTE_SPIN_NS, &max_us);
+	KUNIT_EXPECT_EQ(test, sleep_us, 20U);
+}
+
+static void ane_transport_execute_spin_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	u8 *command;
+
+	command = kunit_kzalloc(test, ANE_H16_EXECUTE_BASE_SIZE, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, command);
+	put_unaligned_le16(ANE_H16_EXECUTE, command + 4);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	ret = ane_fw_transport_publish(&f->t, ANE_FW_DATA_CHAIN, command,
+				       ANE_H16_EXECUTE_BASE_SIZE, TEST_DEADLINE);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	f->now = TEST_DEADLINE - 1;
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_DATA_CHAIN), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, f->spin_ns, ANE_FW_POLL_EXECUTE_SPIN_NS);
 }
 
 static void ane_transport_terminal_ack_test(struct kunit *test)
@@ -1588,6 +1628,7 @@ static struct kunit_case ane_transport_cases[] = {
 	KUNIT_CASE(ane_transport_wait_test),
 	KUNIT_CASE(ane_transport_wait_polls_test),
 	KUNIT_CASE(ane_transport_poll_sleep_test),
+	KUNIT_CASE(ane_transport_execute_spin_test),
 	{}
 };
 
