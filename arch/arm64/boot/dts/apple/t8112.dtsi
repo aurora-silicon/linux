@@ -529,8 +529,10 @@
 			compatible = "apple,t8112-ave";
 			reg = <0x2 0x67100000 0 0x45c000>,
 			      <0x2 0x67050000 0 0x8000>,
-			      <0x2 0x67800000 0 0x800000>;
-			reg-names = "codec", "mailbox", "coproc";
+			      <0x2 0x67800000 0 0x800000>,
+			      <0x2 0x3b708000 0 0x4000>,
+			      <0x2 0x66000000 0 0x1000000>;
+			reg-names = "codec", "mailbox", "coproc", "pmgr", "pio";
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 692 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 686 IRQ_TYPE_LEVEL_HIGH>,
