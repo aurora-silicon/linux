@@ -67,6 +67,11 @@
 #define APPLE_T6040_GFX_WRAPPER_BASE 0x28a600000ULL
 #define APPLE_T6040_GFX_IOP_VBAR_BASE 0x28a050000ULL
 #define APPLE_T6050_ASCWRAP_BASE_DELTA 0x380000000ULL
+/* T6050 on bare metal: the ADT gfx-asc and gfx1-asc windows. */
+#define APPLE_T6050_GFX_WRAPPER_BASE 0x2302600000ULL
+#define APPLE_T6050_GFX_IOP_VBAR_BASE 0x2302050000ULL
+#define APPLE_T6050_GFX1_WRAPPER_BASE 0x2302e00000ULL
+#define APPLE_T6050_GFX1_IOP_VBAR_BASE 0x2302850000ULL
 /* T8142 (M5) moves T8140's 0x4... GPU ASC bank to 0x5.... */
 #define APPLE_T8142_ASCWRAP_BASE_DELTA 0x100000000ULL
 
@@ -1290,6 +1295,7 @@ static int apple_mbox_probe(struct platform_device *pdev)
 	const char *firmware_role;
 	const struct apple_mbox_ascwrap_v6_role_desc *role;
 	unsigned int i;
+	bool named = false;
 	struct apple_mbox_priv *priv;
 	struct apple_mbox *mbox;
 	struct device *dev = &pdev->dev;
@@ -1329,19 +1335,23 @@ static int apple_mbox_probe(struct platform_device *pdev)
 			return dev_err_probe(dev, ret,
 					     "missing ASCWrap v6 firmware role\n");
 
+		/* A role can have more than one set of windows (T6050). */
 		for (i = 0; i < mbox->hw->num_ascwrap_v6_roles; i++) {
 			role = &mbox->hw->ascwrap_v6_roles[i];
-			if (!strcmp(firmware_role, role->name))
+			if (strcmp(firmware_role, role->name))
+				continue;
+			named = true;
+			if (res->start == role->wrapper_base &&
+			    iop_vbar_res->start == role->iop_vbar_base)
 				break;
 		}
-		if (i == mbox->hw->num_ascwrap_v6_roles)
+		if (!named)
 			return dev_err_probe(dev, -EINVAL,
 					     "invalid ASCWrap v6 firmware role\n");
-		if (res->start != role->wrapper_base ||
-		    iop_vbar_res->start != role->iop_vbar_base)
+		if (i == mbox->hw->num_ascwrap_v6_roles)
 			return dev_err_probe(dev, -EINVAL,
 					     "%s ASCWrap v6 resources do not match the SoC\n",
-					     role->name);
+					     firmware_role);
 		mbox->ascwrap_v6.role = role->role;
 
 		mbox->ascwrap_v6.wrapper_start = res->start;
@@ -1637,7 +1647,8 @@ static const struct apple_mbox_hw apple_mbox_t8152_gfx_ascwrap_v8_hw = {
 static_assert(0x20 + sizeof(u32) <= APPLE_ASCWRAP_V8_MBOX_SIZE);
 
 /* T6050's native ASCWrap v6 uses the same RUN/stop sequence. Aura grants
- * these complete wrapper/VBAR windows in the retained GPU aperture. */
+ * these complete wrapper/VBAR windows in the retained GPU aperture; on bare
+ * metal each role is at its ADT windows instead. */
 static const struct apple_mbox_ascwrap_v6_role_desc apple_mbox_t6050_ascwrap_v6_roles[] = {
 	{ "GFX", APPLE_MBOX_ASCWRAP_V6_ROLE_GFX,
 	  APPLE_T8140_GFX_WRAPPER_BASE + APPLE_T6050_ASCWRAP_BASE_DELTA,
@@ -1645,6 +1656,10 @@ static const struct apple_mbox_ascwrap_v6_role_desc apple_mbox_t6050_ascwrap_v6_
 	{ "GFX1", APPLE_MBOX_ASCWRAP_V6_ROLE_GFX1,
 	  APPLE_T8140_GFX1_WRAPPER_BASE + APPLE_T6050_ASCWRAP_BASE_DELTA,
 	  APPLE_T8140_GFX1_IOP_VBAR_BASE + APPLE_T6050_ASCWRAP_BASE_DELTA },
+	{ "GFX", APPLE_MBOX_ASCWRAP_V6_ROLE_GFX,
+	  APPLE_T6050_GFX_WRAPPER_BASE, APPLE_T6050_GFX_IOP_VBAR_BASE },
+	{ "GFX1", APPLE_MBOX_ASCWRAP_V6_ROLE_GFX1,
+	  APPLE_T6050_GFX1_WRAPPER_BASE, APPLE_T6050_GFX1_IOP_VBAR_BASE },
 };
 
 static const struct apple_mbox_ascwrap_v6_role_desc apple_mbox_t6050_apif_ascwrap_v6_roles[] = {
