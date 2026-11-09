@@ -12,6 +12,7 @@
 #include <linux/of_platform.h>
 #include <linux/rwsem.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/rtkit.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
@@ -259,13 +260,24 @@ int dcp_audiosrv_unprepare(struct device *dev)
 }
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+/*
+ * The external processors whose audio service is the desktop 26.x one:
+ * dcpav-audio-interface-epic on endpoint 0x2b, compact EPIC. The T6041
+ * DCPEXTs, and the J700 (T8140, H17P firmware) DCPEXT, whose service macOS
+ * 26.6 drives with the same methods and link data.
+ */
+static bool av_desktop_audio_role(struct apple_dcp *dcp)
+{
+	return (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->desktop_external) ||
+	       dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL;
+}
+
 /* Native audio links are selected from the firmware role, before service start. */
 bool dcp_audiosrv_native_link(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
-	return dcp_is_v14_7_external(dcp) ||
-	       (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->desktop_external);
+	return dcp_is_v14_7_external(dcp) || av_desktop_audio_role(dcp);
 }
 
 /* The 14.7 external role's audio service calls; KUnit stubs them. */
@@ -737,7 +749,7 @@ static int av_desktop_audio_prepare(struct apple_epic_service *service, const ch
 {
 	struct apple_dcp *dcp = service->ep->dcp;
 
-	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP || !dcp->desktop_external ||
+	if (!av_desktop_audio_role(dcp) ||
 	    service->ep->endpoint != AV_AUDIO_ENDPOINT_DESKTOP || !name)
 		return -EINVAL;
 	if (!strcmp(name, av_desktop_ops[0].name) && unit == 0)
@@ -1126,9 +1138,10 @@ int avep_init(struct apple_dcp *dcp)
 	u32 av_endpoint = AV_ENDPOINT;
 	int ret;
 
-	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL) {
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
-		if (!dcp->desktop_external)
+		if (!av_desktop_audio_role(dcp))
 			return -EOPNOTSUPP;
 		ops = av_desktop_ops;
 		av_endpoint = AV_AUDIO_ENDPOINT_DESKTOP;
@@ -1166,6 +1179,12 @@ int avep_init(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_V_12_3:
 		audiosrv_data->cmds = dcp_av_audio_cmds_v12_3;
 		break;
+	case DCP_FIRMWARE_H17P:
+		/* The J700 DCPEXT numbers its audio methods as 13.5 does. */
+		if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17P_EXTERNAL)
+			goto unsupported;
+		audiosrv_data->cmds = dcp_av_audio_cmds_v13_5;
+		break;
 	case DCP_FIRMWARE_V_13_5:
 	case DCP_FIRMWARE_V_14_7_TEMPLATE:
 	case DCP_FIRMWARE_V_26_6_DESKTOP:
@@ -1183,6 +1202,7 @@ int avep_init(struct apple_dcp *dcp)
 			break;
 		}
 #endif
+unsupported:
 		of_node_put(audio_node);
 		dev_err(dcp->dev, "Audio not supported for firmware\n");
 		return -ENODEV;
@@ -1207,6 +1227,13 @@ int avep_init(struct apple_dcp *dcp)
 
 	device_link_add(&audio_pdev->dev, dev,
 			DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME);
+
+	/* The J700 DCPEXT: start the audio endpoint only if the firmware has it. */
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL &&
+	    !apple_rtkit_has_endpoint(dcp->rtk, av_endpoint)) {
+		dev_info(dev, "no DP/HDMI audio endpoint\n");
+		return av_audiosrv_register_cleanup(dcp, audiosrv_data, NULL);
+	}
 
 	dcp->avep = afk_init(dcp, av_endpoint, ops);
 	if (IS_ERR(dcp->avep)) {

@@ -1175,6 +1175,9 @@ static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 		if (ep)
 			return ep;
 	}
+	/* The J700 DCPEXT's audio service sits on endpoint 0x2b, not AV 0x29. */
+	if (!IS_ERR_OR_NULL(dcp->avep) && endpoint == dcp->avep->endpoint)
+		return dcp->avep;
 	/* DPAV 0x2a on H17P overlaps the legacy DPTX endpoint number. */
 	if (dcp->dcpavservep && endpoint == dcp->dcpavservep->endpoint)
 		return dcp->dcpavservep;
