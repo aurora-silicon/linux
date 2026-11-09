@@ -43,6 +43,8 @@ struct apple_rtkit_helper {
 	bool ap_idle;
 	/* It was told, gave no answer, and wasn't told otherwise. */
 	bool idle_unanswered;
+	/* Ends a sleep whose .prepare failed, which gets no .complete. */
+	struct notifier_block pm_nb;
 
 	void __iomem *asc_base;
 
@@ -241,6 +243,8 @@ static int apple_rtkit_helper_inherit_buffers(
 	return count;
 }
 
+static int apple_rtkit_helper_pm_register(struct apple_rtkit_helper *helper);
+
 static int apple_rtkit_helper_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -343,6 +347,9 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 					       helper->rtk);
 		if (ret)
 			return ret;
+		ret = apple_rtkit_helper_pm_register(helper);
+		if (ret)
+			return ret;
 
 		/* There is no safe module-unload boundary for the retained session. */
 		__module_get(THIS_MODULE);
@@ -367,7 +374,7 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 	if (ret != 0)
 		return dev_err_probe(dev, ret, "Failed to wake up coprocessor\n");
 
-	return 0;
+	return apple_rtkit_helper_pm_register(helper);
 }
 
 static void apple_rtkit_helper_remove(struct platform_device *pdev)
@@ -393,7 +400,7 @@ static int apple_rtkit_helper_ap_power(struct apple_rtkit_helper *helper, bool o
 			on ? "on" : "idle", ret);
 	/*
 	 * Nothing is sent to undo an unanswered idle notice, which macOS never does:
-	 * .complete looks whether a late answer came, and only then sends AP on.
+	 * the end of the sleep looks whether a late answer came, and only then sends AP on.
 	 */
 	if (ret && !on)
 		helper->idle_unanswered = true;
@@ -434,21 +441,53 @@ static int __maybe_unused apple_rtkit_helper_prepare(struct device *dev)
 	return apple_rtkit_helper_ap_idle(dev_get_drvdata(dev));
 }
 
-/* A sleep refused before this device's .suspend never calls its .resume. */
-static void __maybe_unused apple_rtkit_helper_complete(struct device *dev)
+static void apple_rtkit_helper_sleep_end(struct apple_rtkit_helper *helper)
 {
-	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
-
 	if (helper->idle_unanswered) {
 		bool late = !apple_rtkit_is_running(helper->rtk);
 
 		helper->idle_unanswered = false;
-		dev_info(dev, "after the unanswered idle notice: %s\n",
+		dev_info(helper->dev, "after the unanswered idle notice: %s\n",
 			 late ? "its answer came late, sending AP on" :
 				"still no answer, nothing sent");
 		helper->ap_idle = late;
 	}
 	apple_rtkit_helper_ap_on(helper);
+}
+
+/* A sleep refused before this device's .suspend never calls its .resume. */
+static void __maybe_unused apple_rtkit_helper_complete(struct device *dev)
+{
+	apple_rtkit_helper_sleep_end(dev_get_drvdata(dev));
+}
+
+/* The PM core calls no .complete after a failed .prepare: end that sleep here. */
+static int apple_rtkit_helper_pm_notify(struct notifier_block *nb, unsigned long action,
+					void *data)
+{
+	struct apple_rtkit_helper *helper = container_of(nb, struct apple_rtkit_helper, pm_nb);
+
+	if (action == PM_POST_SUSPEND && helper->idle_unanswered)
+		apple_rtkit_helper_sleep_end(helper);
+	return NOTIFY_DONE;
+}
+
+static void apple_rtkit_helper_pm_unregister(void *data)
+{
+	struct apple_rtkit_helper *helper = data;
+
+	unregister_pm_notifier(&helper->pm_nb);
+}
+
+static int apple_rtkit_helper_pm_register(struct apple_rtkit_helper *helper)
+{
+	int ret;
+
+	helper->pm_nb.notifier_call = apple_rtkit_helper_pm_notify;
+	ret = register_pm_notifier(&helper->pm_nb);
+	if (ret)
+		return ret;
+	return devm_add_action_or_reset(helper->dev, apple_rtkit_helper_pm_unregister, helper);
 }
 
 static int __maybe_unused apple_rtkit_helper_suspend(struct device *dev)
