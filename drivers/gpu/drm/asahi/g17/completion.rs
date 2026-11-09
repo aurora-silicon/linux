@@ -564,9 +564,21 @@ impl Completion {
         self.interrupted.load(Ordering::Acquire)
     }
 
-    /// Whether this failure makes the VM unusable. Spared work, and interrupted
-    /// work no recovery found guilty, fail without poisoning it.
+    /// Whether the fence has been signalled (completed or failed).
+    pub(crate) fn signalled(&self) -> bool {
+        self.signalled.load(Ordering::Acquire)
+    }
+
+    /// Whether this failure makes the VM unusable. Spared work, interrupted
+    /// work no recovery found guilty, and work that never ran (ENODATA) fail
+    /// without poisoning it.
     pub(crate) fn poisons(&self, error: Error) -> bool {
+        // A command that never ran cannot have faulted the GPU. The queue's own failed
+        // command also comes back as ENODATA (a zero-duration record); it is classified
+        // guilty before it fails, by the firmware's fault report or by a recovery.
+        if error == ENODATA && !self.guilty() {
+            return false;
+        }
         let interrupted = self.interrupted();
         (error != ECANCELED || interrupted) && !self.spared() && !(interrupted && !self.guilty())
     }
