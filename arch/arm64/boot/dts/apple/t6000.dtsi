@@ -87,12 +87,18 @@
 
 #ifdef APPLE_USE_PMP
 /*
- * AVD also sends the PMP a performance request while it is powered: level 2
- * (VMAX) in request class 0x21 of its SOC-DEV-DVFS entry 0x112. The PMP then
- * holds the SoC rail and fabric up for it.
+ * AVD and the JPEG codecs (one soc-device for both) also send the PMP a
+ * performance request while they are powered, in request class 0x21 of
+ * their SOC-DEV-DVFS entries: AVD level 2 (VMAX) at 0x112, JPEG level 1
+ * (VNOM) at 0x114. The PMP then holds the SoC rail and fabric up for them.
  */
 &pmp_report_avd_sys {
 	apple,dvfs = <0x112 2>;
+	apple,dvfs-request-class = <0x21>;
+};
+
+&pmp_report_jpg {
+	apple,dvfs = <0x114 1>;
 	apple,dvfs-request-class = <0x21>;
 };
 #endif
@@ -123,8 +129,22 @@
 	status = "disabled";
 };
 
+/* The video decoder is IO-coherent in both directions. */
+&avd {
+	dma-coherent;
+};
+
 #include "t6000-peripherals.dtsi"
 #include "t6000-aux-spmi.dtsi"
+
+/* Platform error and event-log interrupt groups (apple_soc_edac). */
+&soc_errors {
+	status = "okay";
+};
+
+&soc_events {
+	status = "okay";
+};
 
 &apr0_dart {
 	status = "okay";
