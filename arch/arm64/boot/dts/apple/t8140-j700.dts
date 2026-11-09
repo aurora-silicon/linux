@@ -699,6 +699,30 @@
 	status = "okay";
 };
 
+/*
+ * The AOP's GPIO bank. The AOP keeps interrupt groups 0-3; the AP's are 4-6
+ * (AIC 384-386). No consumer requests a line yet.
+ */
+&pinctrl_aop {
+	interrupts = <AIC_IRQ 384 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 385 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 386 IRQ_TYPE_LEVEL_HIGH>;
+	apple,irq-group-base = <4>;
+	status = "okay";
+};
+
+/*
+ * The always-on GPIO bank, as on the J616s: the AP takes none of its
+ * interrupts. Line 20 is the secure-repair enable and is never requested.
+ */
+&pinctrl_nub {
+	gpio-reserved-ranges = <20 1>;
+	status = "okay";
+	/delete-property/ interrupt-controller;
+	/delete-property/ #interrupt-cells;
+	/delete-property/ interrupts;
+};
+
 &smc_gpio {
 	apple,pcio-templates = <10 0x800000 0xa0000>;
 };
