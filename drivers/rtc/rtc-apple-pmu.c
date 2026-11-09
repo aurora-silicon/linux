@@ -31,6 +31,7 @@ struct apple_pmu_rtc_hw {
 	u16 mask;
 	u16 event;
 	u8 event_bit;
+	u8 control_event_bit;
 	u8 monitor_bit;
 	bool offset_in_seconds;
 	/* How far ahead an alarm may be, in seconds */
@@ -80,6 +81,7 @@ static const struct apple_pmu_rtc_hw apple_pmu_rtc_maverick = {
 	.mask = 0x14c2,
 	.event = 0x14c0,
 	.event_bit = BIT(0),
+	.control_event_bit = BIT(1),
 	.monitor_bit = BIT(0),
 	.max_delay = APPLE_PMU_RTC_MAX_DELAY,
 };
@@ -210,6 +212,8 @@ static int apple_pmu_rtc_arm(struct apple_pmu_rtc *rtc, bool enable)
 	/* Do not acknowledge a shared W1C event as a side effect of RMW. */
 	if (rtc->hw->event == rtc->hw->control)
 		control &= ~rtc->hw->event_bit;
+	/* Maverick clears its additional fired latch when this bit is zero. */
+	control &= ~rtc->hw->control_event_bit;
 	control &= ~APPLE_PMU_RTC_ARM;
 	if (enable)
 		control |= APPLE_PMU_RTC_ARM;

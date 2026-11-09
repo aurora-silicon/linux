@@ -1741,6 +1741,12 @@ static int sleep_hpm_select(struct apple_sleep *s, u32 page)
 		ret = sleep_hpm_cmd(s, SPMI_OP_EXT_READ(1), HPM_REG_SELECT, NULL, &val);
 		if (!ret && (val & 0xff) == page)
 			return 0;
+		/* A select it dropped, waking, is sent again. page | 0x80 is one in progress. */
+		if (!ret && (val & 0xff) != (page | 0x80) && i % 20 == 19) {
+			ret = t8140_hpm_cmd(s, SPMI_OP_WAKEUP, 0, NULL, NULL);
+			if (!ret)
+				ret = t8140_hpm_cmd(s, SPMI_OP_ZERO_WRITE, page << 8, NULL, NULL);
+		}
 		udelay(10);
 	}
 

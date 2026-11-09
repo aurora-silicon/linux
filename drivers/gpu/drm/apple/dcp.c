@@ -669,6 +669,63 @@ void dcp_drm_crtc_error(struct apple_crtc *crtc,
 	spin_unlock_irqrestore(&drm->event_lock, flags);
 }
 
+/*
+ * The flip of the commit whose flip_done is @flip_done never completed: send
+ * its still pending event as failed. Only that commit's event is sent; a newer
+ * commit's stays for its own swap.
+ *
+ * The swap started last is that flip's. Its displaced framebuffers are
+ * unarmed, as the swap watchdog does, so that the next swap arms them and its
+ * completion releases them. Its completion may still come, after the next
+ * commit installed its event: firmware that does not track its presents
+ * ignores it (dcp_swap_lost()), so that it does not retire the newer flip.
+ */
+void dcp_drm_crtc_flip_lost(struct apple_crtc *crtc,
+			    struct completion *flip_done, int error)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(crtc->dcp);
+	unsigned long flags;
+	bool lost = false;
+	u32 swap_id = 0;
+
+	spin_lock_irqsave(&crtc->base.dev->event_lock, flags);
+	if (crtc->event && crtc->event->base.completion == flip_done) {
+		dcp_failed_page_flip(crtc, crtc->event, error);
+		crtc->event = NULL;
+		swap_id = READ_ONCE(dcp->started_swap_id);
+		dcp->lost_swap_id = swap_id;
+		dcp->swap_lost = true;
+		lost = true;
+	}
+	spin_unlock_irqrestore(&crtc->base.dev->event_lock, flags);
+
+	if (lost)
+		dcp_unarm_retained_framebuffers(dcp, swap_id);
+}
+
+/*
+ * Is @swap_id the swap whose flip dcp_drm_crtc_flip_lost() gave up on? On
+ * firmware that does not track its presents, its completion would retire
+ * whichever flip is pending; it is ignored instead. Swaps complete in order,
+ * so once another swap completed, the lost one will not.
+ */
+bool dcp_swap_lost(struct apple_dcp *dcp, u32 swap_id)
+{
+	unsigned long flags;
+	bool lost;
+
+	spin_lock_irqsave(&dcp->crtc->base.dev->event_lock, flags);
+	lost = dcp->swap_lost && dcp->lost_swap_id == swap_id;
+	dcp->swap_lost = false;
+	spin_unlock_irqrestore(&dcp->crtc->base.dev->event_lock, flags);
+
+	if (lost)
+		dev_warn_ratelimited(dcp->dev,
+				     "completion for lost present %u ignored\n",
+				     swap_id);
+	return lost;
+}
+
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now)
 {
 	unsigned long flags;
@@ -7986,7 +8043,9 @@ static int dcp_platform_suspend(struct device *dev)
 
 	/*
 	 * T8132: setPowerState powers the display down; the coprocessor keeps
-	 * running and its power domains stay on, as below.
+	 * running and its power domains stay on, as below, unless the internal
+	 * display is blanked with appledrm.power_gate_ms set: then the
+	 * coprocessor and its domains are powered down too (iomfb_m4_suspend()).
 	 */
 	if (iomfb_is_m4(dcp)) {
 		int ret = iomfb_m4_suspend(dcp);

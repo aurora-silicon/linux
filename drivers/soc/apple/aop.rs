@@ -1780,7 +1780,7 @@ impl AopData {
     fn patch_bootargs(
         &self,
         aop_mmio: &Mmio<'_, Region<AOP_MMIO_SIZE>>,
-        patches: &[(u32, u64)],
+        patches: &[(u32, Option<u64>)],
         word_access: bool,
     ) -> Result<()> {
         let offset = aop_mmio.read32(BOOTARGS_OFFSET) as usize;
@@ -1824,6 +1824,10 @@ impl AopData {
                 if *k != key {
                     continue;
                 }
+                // `None` keeps the value the firmware image carries.
+                let Some(v) = v else {
+                    break;
+                };
                 if len > mem::size_of::<u64>() {
                     return Err(EINVAL);
                 }
@@ -2753,8 +2757,8 @@ struct AopDriver(Arc<dyn AOP>);
 
 struct AopHwConfig {
     ec0p: u64,
-    /// The `nCal` boot argument.
-    ncal: u64,
+    /// The `nCal` boot argument, or `None` to keep the firmware's own value.
+    ncal: Option<u64>,
     alig: u64,
     aopt: u64,
     /// Complete the firmware's boot arguments before starting it.
@@ -2783,7 +2787,7 @@ struct AopHwConfig {
 
 const HW_CFG_T8103: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
-    ncal: 0,
+    ncal: Some(0),
     aopt: 1,
     alig: 128,
     patch_bootargs: true,
@@ -2797,9 +2801,11 @@ const HW_CFG_T8103: AopHwConfig = AopHwConfig {
     bootargs_word_access: false,
     halt_on_failed_start: false,
 };
+/// `nCal` keeps the firmware's own value, as on T6040: the J413 image carries 1,
+/// and with 0 the firmware never announces its accelerometer and gyroscope.
 const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
-    ncal: 0,
+    ncal: None,
     aopt: 0,
     alig: 128,
     patch_bootargs: true,
@@ -2813,9 +2819,10 @@ const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     bootargs_word_access: false,
     halt_on_failed_start: false,
 };
+/// `nCal` keeps the firmware's own value, as on T8112.
 const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
-    ncal: 0,
+    ncal: None,
     aopt: 0,
     alig: 64,
     patch_bootargs: true,
@@ -2831,7 +2838,7 @@ const HW_CFG_T6000: AopHwConfig = AopHwConfig {
 };
 const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     ec0p: 0x0100_00000000,
-    ncal: 0,
+    ncal: Some(0),
     aopt: 0,
     alig: 64,
     patch_bootargs: true,
@@ -2852,7 +2859,7 @@ const HW_CFG_T6020: AopHwConfig = AopHwConfig {
 /// and report interval but never send a report.
 const HW_CFG_T6040: AopHwConfig = AopHwConfig {
     ec0p: 0x0100_00000000,
-    ncal: 1,
+    ncal: Some(1),
     aopt: 0,
     alig: 64,
     patch_bootargs: true,
@@ -2877,7 +2884,7 @@ const HW_CFG_T8132: AopHwConfig = HW_CFG_T6040;
 /// are started if they will.
 const HW_CFG_T8140: AopHwConfig = AopHwConfig {
     ec0p: 0,
-    ncal: 0,
+    ncal: Some(0),
     aopt: 0,
     alig: 0,
     patch_bootargs: false,
@@ -2992,10 +2999,10 @@ impl platform::Driver for AopDriver {
             data.patch_bootargs(
                 &aop_mmio,
                 &[
-                    (from_fourcc(b"EC0p"), cfg.ec0p),
+                    (from_fourcc(b"EC0p"), Some(cfg.ec0p)),
                     (from_fourcc(b"nCal"), cfg.ncal),
-                    (from_fourcc(b"alig"), cfg.alig),
-                    (from_fourcc(b"AOPt"), cfg.aopt),
+                    (from_fourcc(b"alig"), Some(cfg.alig)),
+                    (from_fourcc(b"AOPt"), Some(cfg.aopt)),
                 ],
                 cfg.bootargs_word_access,
             )?;

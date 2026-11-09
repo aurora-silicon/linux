@@ -2163,7 +2163,14 @@ static int cd321x_switch_power_state(struct tps6598x *tps, u8 target_state)
 	if (state == target_state)
 		return 0;
 
-	ret = tps6598x_exec_cmd(tps, "SSPS", sizeof(u8), &target_state, 0, NULL);
+	/* SN201202x can still be negotiating an attached dock while waking. */
+	if (target_state == TPS_SYSTEM_POWER_STATE_S0 &&
+	    device_is_compatible(tps->dev, "apple,sn201202x"))
+		ret = tps6598x_exec_cmd_tmo(tps, "SSPS", sizeof(target_state),
+					  &target_state, 0, NULL, 5000, 0);
+	else
+		ret = tps6598x_exec_cmd(tps, "SSPS", sizeof(target_state),
+				      &target_state, 0, NULL);
 	if (ret)
 		return ret;
 
@@ -3053,6 +3060,66 @@ static int cd321x_remove(struct tps6598x *tps)
 	return 0;
 }
 
+static int cd321x_reset_inherited_connection(struct tps6598x *tps, u32 *status)
+{
+	/* J716c's port-controller key is the reversed target identifier J716. */
+	static const u8 key[] = { '6', '1', '7', 'J' };
+	static const u8 locked[4];
+	u8 delay = 5, result;
+	unsigned long timeout;
+	int ret, lock_ret, mode;
+
+	if (!device_property_read_bool(tps->dev, "apple,reset-inherited-usb2-connection") ||
+	    !of_machine_is_compatible("apple,j716c") ||
+	    !device_is_compatible(tps->dev, "apple,sn201202x") ||
+	    tps->dbma_at_probe || !(*status & TPS_STATUS_PLUG_PRESENT) ||
+	    !TPS_STATUS_TO_TYPEC_DATAROLE(*status))
+		return 0;
+	mode = tps6598x_check_mode(tps);
+	if (mode != TPS_MODE_APP && mode != TPS_MODE_APP1)
+		return 0;
+
+	/* All suppliers are available, but no USB or router session has started. */
+	ret = tps6598x_exec_cmd(tps, "LOCK", sizeof(key), key, sizeof(result), &result);
+	if (ret)
+		return ret;
+	if (result) {
+		ret = -EIO;
+		goto relock;
+	}
+
+	/*
+	 * Nonzero DISC delay restores normal CC detection automatically. The
+	 * task can take more than a second to acknowledge at boot; wait for it
+	 * before issuing LOCK, which a still-busy controller would reject.
+	 */
+	ret = tps6598x_exec_cmd_tmo(tps, "DISC", sizeof(delay), &delay, 0, NULL,
+				  5000, 0);
+	if (!ret) {
+		msleep(5100);
+		timeout = jiffies + msecs_to_jiffies(2000);
+		do {
+			mode = tps6598x_check_mode(tps);
+			if (mode == TPS_MODE_APP || mode == TPS_MODE_APP1)
+				break;
+			msleep(20);
+		} while (time_before(jiffies, timeout));
+		if (mode != TPS_MODE_APP && mode != TPS_MODE_APP1)
+			ret = mode < 0 ? mode : -ETIMEDOUT;
+	}
+relock:
+	/* CC/PD negotiation may still be finishing when application mode returns. */
+	lock_ret = tps6598x_exec_cmd_tmo(tps, "LOCK", sizeof(locked), locked, 0, NULL,
+				       5000, 0);
+	if (ret || lock_ret)
+		return ret ?: lock_ret;
+	if (!tps6598x_read_status(tps, status))
+		return -EIO;
+	tps->status = *status;
+	dev_info(tps->dev, "reinitialized inherited USB2 connection\n");
+	return 0;
+}
+
 int tipd_init(struct tps6598x *tps)
 {
 	struct fwnode_handle *fwnode;
@@ -3159,11 +3226,16 @@ int tipd_init(struct tps6598x *tps)
 	if (tps->contaminant_ops) {
 		ret = tps->contaminant_ops->update(tps);
 		if (ret) {
-			dev_warn(tps->dev,
-				 "connector contaminant state unavailable: %d\n", ret);
+			if (ret != -EINPROGRESS)
+				dev_warn(tps->dev,
+					 "connector contaminant state unavailable: %d\n", ret);
 			ret = 0;
 		}
 	}
+
+	ret = cd321x_reset_inherited_connection(tps, &status);
+	if (ret)
+		goto err_disconnect;
 
 	if (status & TPS_STATUS_PLUG_PRESENT) {
 		ret = -EINVAL;
