@@ -214,11 +214,27 @@ patternProperties:
         maximum: 31
         description: Bit of the pipe in the boost interface enable word.
 
+      apple,consumer-switched:
+        type: boolean
+        description: |
+          Not a power domain. The pipe's power is firmware-owned, and the
+          display coprocessor that refers to this node (apple,pmc-interface)
+          clears the bits before it powers the pipe down and gives them back
+          the values they had after it powers the pipe up again.
+
     required:
-      - '#power-domain-cells'
-      - power-domains
       - apple,bwr-bit
       - apple,boost-bit
+
+    oneOf:
+      - required:
+          - '#power-domain-cells'
+          - power-domains
+      - required:
+          - apple,consumer-switched
+        properties:
+          '#power-domain-cells': false
+          power-domains: false
 
   '^performance-controller@[0-9a-f]+$':
     type: object

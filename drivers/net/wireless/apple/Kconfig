@@ -22,4 +22,23 @@ config APPLE_CENTAURI
 	  This driver does not include Bluetooth HCI support.
 
 	  To build as a module, choose M; the module is apple_centauri.
+
+config APPLE_CENTAURI_T6050
+	tristate "Apple N1 Centauri T6050 firmware and IPC transport"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on PCI && CFG80211 && PCIE_APPLE
+	select FW_LOADER
+	help
+	  Boot the N1 firmware on a T6050 host that provides root-port reset.
+	  The transport starts automatically from its device-tree firmware,
+	  platform and protocol properties. It binds only behind a T6050 host;
+	  the J813/J873 transport remains available independently.
+
+config APPLE_CENTAURI_T6050_WIFI
+	bool "T6050 N1 Centauri cfg80211 station interface"
+	depends on APPLE_CENTAURI_T6050
+	default y
+	help
+	  Add scanning and station connections for the T6050 protocol profile.
+
 endif

@@ -85,20 +85,20 @@ t6000-j316s /arm-io/pmgr/power-devices/DISP0_GP1 | Virtual PMGR vote; no indepen
 t6000-j316s /arm-io/pmgr/power-devices/DISP0_PPP | Virtual PMGR vote; no independent power-state register.
 t6000-j316s /arm-io/pmgr/power-devices/DISP0_SPI | Virtual PMGR vote; no independent power-state register.
 t6000-j316s /arm-io/pmgr/power-devices/DISP0_SPMI | Virtual PMGR vote; no independent power-state register.
-t6000-j316s /arm-io/pmgr/power-devices/DISPEXT0_BE | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT0_BE | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
 t6000-j316s /arm-io/pmgr/power-devices/DISPEXT0_CPU0-V | Virtual PMGR vote; no independent power-state register.
-t6000-j316s /arm-io/pmgr/power-devices/DISPEXT0_DP | Virtual PMGR vote; no independent power-state register.
-t6000-j316s /arm-io/pmgr/power-devices/DISPEXT0_DSC | Virtual PMGR vote; no independent power-state register.
-t6000-j316s /arm-io/pmgr/power-devices/DISPEXT0_GP0 | Virtual PMGR vote; no independent power-state register.
-t6000-j316s /arm-io/pmgr/power-devices/DISPEXT0_GP1 | Virtual PMGR vote; no independent power-state register.
-t6000-j316s /arm-io/pmgr/power-devices/DISPEXT0_PPP | Virtual PMGR vote; no independent power-state register.
-t6000-j316s /arm-io/pmgr/power-devices/DISPEXT1_BE | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT0_DP | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT0_DSC | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT0_GP0 | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT0_GP1 | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT0_PPP | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT1_BE | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
 t6000-j316s /arm-io/pmgr/power-devices/DISPEXT1_CPU0-V | Virtual PMGR vote; no independent power-state register.
-t6000-j316s /arm-io/pmgr/power-devices/DISPEXT1_DP | Virtual PMGR vote; no independent power-state register.
-t6000-j316s /arm-io/pmgr/power-devices/DISPEXT1_DSC | Virtual PMGR vote; no independent power-state register.
-t6000-j316s /arm-io/pmgr/power-devices/DISPEXT1_GP0 | Virtual PMGR vote; no independent power-state register.
-t6000-j316s /arm-io/pmgr/power-devices/DISPEXT1_GP1 | Virtual PMGR vote; no independent power-state register.
-t6000-j316s /arm-io/pmgr/power-devices/DISPEXT1_PPP | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT1_DP | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT1_DSC | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT1_GP0 | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT1_GP1 | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT1_PPP | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
 t6000-j316s /arm-io/pmgr/power-devices/DP0-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
 t6000-j316s /arm-io/pmgr/power-devices/DP1-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
 t6000-j316s /arm-io/pmgr/power-devices/DP2-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
@@ -135,7 +135,7 @@ t6000-j316s /arm-io/pmgr/power-devices/SCODEC-SOC-VNOM | Virtual PMGR vote; no i
 t6000-j316s /arm-io/pmgr/power-devices/SCODEC-V | Virtual PMGR vote; no independent power-state register.
 t6000-j316s /arm-io/pmgr/power-devices/SEP-PEARL-V | Virtual PMGR vote; no independent power-state register.
 t6000-j316s /arm-io/pmgr/power-devices/SEP-V | Virtual PMGR vote; no independent power-state register.
-t6000-j316s /arm-io/pmgr/power-devices/SEP_EISP | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SEP_EISP | Power state with a register, switched by the SEP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
 t6000-j316s /arm-io/pmgr/power-devices/SIO-CPU-V | Virtual PMGR vote; no independent power-state register.
 t6000-j316s /arm-io/pmgr/power-devices/SIO-DART | Virtual PMGR vote; no independent power-state register.
 t6000-j316s /arm-io/pmgr/power-devices/SMC_AON | Virtual PMGR vote; no independent power-state register.
@@ -410,7 +410,6 @@ t6040-j616s /arm-io/pmgr/power-devices/VENC1-SYS-V | Virtual PMGR vote; no indep
 t6040-j616s /sacm | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
 t8112-j413 /arm-io/pmgr/power-devices/ANE-SYS-DART | Virtual PMGR vote; no independent power-state register.
 t8112-j413 /arm-io/pmgr/power-devices/ANE-SYS-V | Virtual PMGR vote; no independent power-state register.
-t8112-j413 /arm-io/pmgr/power-devices/ANE_CPU | Virtual PMGR vote; no independent power-state register.
 t8112-j413 /arm-io/pmgr/power-devices/AOP_ADMA0 | Virtual PMGR vote; no independent power-state register.
 t8112-j413 /arm-io/pmgr/power-devices/AOP_AUDIO_ADMA0 | Virtual PMGR vote; no independent power-state register.
 t8112-j413 /arm-io/pmgr/power-devices/AOP_AUDIO_SHIM | Virtual PMGR vote; no independent power-state register.
@@ -474,28 +473,28 @@ t8112-j413 /arm-io/pmgr/power-devices/DFR-MIE-DPB | Virtual PMGR vote; no indepe
 t8112-j413 /arm-io/pmgr/power-devices/DISP-CARVE-OUT | Virtual PMGR vote; no independent power-state register.
 t8112-j413 /arm-io/pmgr/power-devices/DISP-FB-ACTIVE | Virtual PMGR vote; no independent power-state register.
 t8112-j413 /arm-io/pmgr/power-devices/DISP-MIE-DPB | Virtual PMGR vote; no independent power-state register.
-t8112-j413 /arm-io/pmgr/power-devices/DISP0_BE | Virtual PMGR vote; no independent power-state register.
-t8112-j413 /arm-io/pmgr/power-devices/DISP0_BLC | Virtual PMGR vote; no independent power-state register.
-t8112-j413 /arm-io/pmgr/power-devices/DISP0_BRC | Virtual PMGR vote; no independent power-state register.
-t8112-j413 /arm-io/pmgr/power-devices/DISP0_GP0 | Virtual PMGR vote; no independent power-state register.
-t8112-j413 /arm-io/pmgr/power-devices/DISP0_GP1 | Virtual PMGR vote; no independent power-state register.
-t8112-j413 /arm-io/pmgr/power-devices/DISP0_GP2 | Virtual PMGR vote; no independent power-state register.
-t8112-j413 /arm-io/pmgr/power-devices/DISP0_PPP | Virtual PMGR vote; no independent power-state register.
-t8112-j413 /arm-io/pmgr/power-devices/DISP0_SPI | Virtual PMGR vote; no independent power-state register.
-t8112-j413 /arm-io/pmgr/power-devices/DISP0_SPMI | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/DISP0_BE | Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISP0_BLC | Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISP0_BRC | Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISP0_GP0 | Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISP0_GP1 | Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISP0_GP2 | Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISP0_PPP | Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISP0_SPI | Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISP0_SPMI | Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
 t8112-j413 /arm-io/pmgr/power-devices/DISPDFR-V | Virtual PMGR vote; no independent power-state register.
-t8112-j413 /arm-io/pmgr/power-devices/DISPEXT_BE | Virtual PMGR vote; no independent power-state register.
-t8112-j413 /arm-io/pmgr/power-devices/DISPEXT_DSC | Virtual PMGR vote; no independent power-state register.
-t8112-j413 /arm-io/pmgr/power-devices/DISPEXT_GP0 | Virtual PMGR vote; no independent power-state register.
-t8112-j413 /arm-io/pmgr/power-devices/DISPEXT_GP1 | Virtual PMGR vote; no independent power-state register.
-t8112-j413 /arm-io/pmgr/power-devices/DISPEXT_GP2 | Virtual PMGR vote; no independent power-state register.
-t8112-j413 /arm-io/pmgr/power-devices/DISPEXT_PPP | Virtual PMGR vote; no independent power-state register.
-t8112-j413 /arm-io/pmgr/power-devices/DP | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/DISPEXT_BE | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISPEXT_DSC | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISPEXT_GP0 | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISPEXT_GP1 | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISPEXT_GP2 | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISPEXT_PPP | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DP | Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
 t8112-j413 /arm-io/pmgr/power-devices/DP-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
 t8112-j413 /arm-io/pmgr/power-devices/DP0_VMAX-V | Virtual PMGR vote; no independent power-state register.
 t8112-j413 /arm-io/pmgr/power-devices/DP1_VMAX-V | Virtual PMGR vote; no independent power-state register.
-t8112-j413 /arm-io/pmgr/power-devices/DPEXT | Virtual PMGR vote; no independent power-state register.
-t8112-j413 /arm-io/pmgr/power-devices/DPTX_PHY | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/DPEXT | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DPTX_PHY | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
 t8112-j413 /arm-io/pmgr/power-devices/ECPM_NRG | Virtual PMGR vote; no independent power-state register.
 t8112-j413 /arm-io/pmgr/power-devices/ECPU0_SRAM | Virtual PMGR vote; no independent power-state register.
 t8112-j413 /arm-io/pmgr/power-devices/ECPU1_SRAM | Virtual PMGR vote; no independent power-state register.
@@ -510,8 +509,6 @@ t8112-j413 /arm-io/pmgr/power-devices/ISP-SOC-VMAX | Virtual PMGR vote; no indep
 t8112-j413 /arm-io/pmgr/power-devices/ISP-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
 t8112-j413 /arm-io/pmgr/power-devices/ISP-SYS-DART | Virtual PMGR vote; no independent power-state register.
 t8112-j413 /arm-io/pmgr/power-devices/ISP-SYS-V | Virtual PMGR vote; no independent power-state register.
-t8112-j413 /arm-io/pmgr/power-devices/ISP_CPU_CORE0 | Virtual PMGR vote; no independent power-state register.
-t8112-j413 /arm-io/pmgr/power-devices/ISP_CPU_CORE1 | Virtual PMGR vote; no independent power-state register.
 t8112-j413 /arm-io/pmgr/power-devices/JPG-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
 t8112-j413 /arm-io/pmgr/power-devices/JPG-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
 t8112-j413 /arm-io/pmgr/power-devices/JPG0-DART | Virtual PMGR vote; no independent power-state register.
@@ -544,7 +541,7 @@ t8112-j413 /arm-io/pmgr/power-devices/SCDC_VNOM-V | Virtual PMGR vote; no indepe
 t8112-j413 /arm-io/pmgr/power-devices/SDEC-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
 t8112-j413 /arm-io/pmgr/power-devices/SDEC-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
 t8112-j413 /arm-io/pmgr/power-devices/SEP-PEARL-V | Virtual PMGR vote; no independent power-state register.
-t8112-j413 /arm-io/pmgr/power-devices/SEP_EISP | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/SEP_EISP | Power state with a register, switched by the SEP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
 t8112-j413 /arm-io/pmgr/power-devices/SIO-CPU-DART | Virtual PMGR vote; no independent power-state register.
 t8112-j413 /arm-io/pmgr/power-devices/SIO-CPU-V | Virtual PMGR vote; no independent power-state register.
 t8112-j413 /arm-io/pmgr/power-devices/SMC_AON | Virtual PMGR vote; no independent power-state register.

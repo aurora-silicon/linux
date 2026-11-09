@@ -102,6 +102,7 @@ int apple_mbox_start(struct apple_mbox *mbox);
 void apple_mbox_stop(struct apple_mbox *mbox);
 /* For a caller with interrupts off, where apple_mbox_send()'s own deadline can't pass. */
 bool apple_mbox_send_ready(struct apple_mbox *mbox);
+int apple_mbox_restore(struct apple_mbox *mbox);
 int apple_mbox_poll(struct apple_mbox *mbox);
 /* Bit 0 of the receive control word, for firmware that powers itself down. */
 void apple_mbox_set_recv_enabled(struct apple_mbox *mbox, bool enabled);
