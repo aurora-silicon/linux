@@ -144,15 +144,16 @@ patternProperties:
           device request it writes level 0. On T8112, only the AVD request at
           entry 0xb0 is qualified; level 2 requests SOC VMAX. The provider
           owns the whole request word and preserves other software-owned
-          request classes.
+          request classes. T8112 also qualifies JPEG entry 0xb2, class 0x21,
+          level 2.
 
       apple,dvfs-request-class:
         $ref: /schemas/types.yaml#/definitions/uint32
-        const: 0x25
+        enum: [0x21, 0x22, 0x23, 0x24, 0x25]
         description:
-          Request class containing the performance level. Class 0x25 uses
-          bits 51:48. If absent, apple,dvfs retains the default bits 4:0
-          encoding.
+          Request class containing the performance level. Classes 0x21
+          through 0x25 use four-bit lanes at bits 35:32 through 51:48. If
+          absent, apple,dvfs retains the default bits 4:0 encoding.
 
       apple,always-on:
         type: boolean
@@ -188,11 +189,21 @@ patternProperties:
           required:
             - apple,dvfs
         then:
-          properties:
-            apple,dvfs:
-              items:
-                - const: 0xb0
-                - const: 2
+          oneOf:
+            - properties:
+                apple,dvfs:
+                  items:
+                    - const: 0xb0
+                    - const: 2
+                apple,dvfs-request-class:
+                  const: 0x25
+            - properties:
+                apple,dvfs:
+                  items:
+                    - const: 0xb2
+                    - const: 2
+                apple,dvfs-request-class:
+                  const: 0x21
           required:
             - apple,dvfs-request-class
 

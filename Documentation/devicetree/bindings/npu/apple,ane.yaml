@@ -53,8 +53,9 @@ properties:
     $ref: /schemas/types.yaml#/definitions/phandle
     description:
       PMP report provider that owns the ANE clock-level request interface.
-      Only supported on T6000. The ANE and report SRAM must remain powered
-      while the driver holds a request.
+      On T6000 this owns the ANE clock-level interface. On T8112 it owns the
+      job-scoped DCS and SoC-fabric constraints. The ANE and report SRAM must
+      remain powered while the driver holds a request.
 
   interconnects:
     maxItems: 1
@@ -194,12 +195,19 @@ allOf:
       required:
         - apple,performance-controller
     then:
-      properties:
-        compatible:
-          const: apple,t6000-ane
-        power-domains:
-          minItems: 6
-          maxItems: 6
+      oneOf:
+        - properties:
+            compatible:
+              const: apple,t6000-ane
+            power-domains:
+              minItems: 6
+              maxItems: 6
+        - properties:
+            compatible:
+              const: apple,t8112-ane
+            power-domains:
+              minItems: 8
+              maxItems: 8
 
   - if:
       properties:
@@ -390,7 +398,7 @@ allOf:
           minItems: 4
         power-domains:
           minItems: 7
-          maxItems: 7
+          maxItems: 8
         resets: false
         memory-region: false
       required:

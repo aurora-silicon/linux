@@ -66,6 +66,18 @@ properties:
               E, 1 for P0, 2 for P1 on T6041)
             enum: [0, 1, 2]
 
+  apple,pmp-memory-vote:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    description: |
+      PMP report region and the cluster's SOC-DEV-DVFS entry. The cpufreq
+      request supplies a clean host DCS and SoC-fabric constraint while the
+      PMP owns those clocks.
+    items:
+      - items:
+          - description: PMP report region
+          - description: EACC0 or PACC0 SOC-DEV-DVFS entry on T8112
+            enum: [0xa8, 0xa9]
+
   '#performance-domain-cells':
     const: 0
 
