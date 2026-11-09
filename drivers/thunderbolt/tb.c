@@ -3258,6 +3258,15 @@ static int tb_disconnect_xdomain_paths(struct tb *tb, struct tb_xdomain *xd,
 
 /* hotplug handling */
 
+/* The partner on a host router lane adapter went away */
+static void tb_host_link_lost(struct tb *tb, struct tb_port *port)
+{
+	if (tb_route(port->sw) || !tb_port_is_null(port))
+		return;
+	if (tb->nhi->ops && tb->nhi->ops->link_lost)
+		tb->nhi->ops->link_lost(tb->nhi);
+}
+
 /*
  * tb_handle_hotplug() - handle hotplug event
  *
@@ -3322,6 +3331,7 @@ static void tb_handle_hotplug(struct work_struct *work)
 			tb_recalc_estimated_bandwidth(tb);
 			tb_tunnel_dp(tb);
 			tb_dp_host_tunnel_gone(tb, dp_up);
+			tb_host_link_lost(tb, port);
 		} else if (port->xdomain) {
 			struct tb_xdomain *xd = tb_xdomain_get(port->xdomain);
 
@@ -3339,6 +3349,7 @@ static void tb_handle_hotplug(struct work_struct *work)
 			__tb_disconnect_xdomain_paths(tb, xd, -1, -1, -1, -1);
 			tb_xdomain_put(xd);
 			tb_port_unconfigure_xdomain(port);
+			tb_host_link_lost(tb, port);
 		} else if (tb_port_is_dpout(port) || tb_port_is_dpin(port)) {
 			tb_dp_resource_unavailable(tb, port, "adapter unplug");
 			/* A display went: the DP tunnel left may take a higher rate. */
