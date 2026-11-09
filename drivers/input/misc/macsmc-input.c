@@ -270,10 +270,14 @@ static int macsmc_input_pm_prepare(struct device *dev)
 static void macsmc_input_pm_complete(struct device *dev)
 {
 	struct macsmc_input *smcin = dev_get_drvdata(dev);
+	u8 lid;
 
-	/* Still armed: a lid opened or a button pressed before the next .prepare wakes. */
+	/*
+	 * Still armed: a lid opened or a button pressed before the next .prepare wakes. A dark
+	 * wake with the lid already open (for the debug link's cut) has no lid to open.
+	 */
 	if (pm_dark_wake()) {
-		smcin->dark = true;
+		smcin->dark = apple_smc_read_u8(smcin->smc, SMC_KEY(MSLD), &lid) < 0 || lid;
 		return;
 	}
 	smcin->wakeup_mode = false;
