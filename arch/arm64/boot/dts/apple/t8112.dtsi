@@ -731,7 +731,9 @@
 				<&ps_isp_set4>, <&ps_isp_set5>, <&ps_isp_set6>,
 				<&ps_isp_set7>, <&ps_isp_set8>, <&ps_isp_set9>,
 				<&ps_isp_set10>, <&ps_isp_set11>,
-				<&ps_isp_set12>;
+				<&ps_isp_set12>, <&ps_ispsens0>,
+				<&ps_ispsens1>, <&ps_ispsens2>,
+				<&ps_ispsens3>;
 
 			apple,dart-vm-size = <0x0 0xa0000000>;
 			status = "disabled";
