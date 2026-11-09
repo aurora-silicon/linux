@@ -15,6 +15,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/soc/apple/clpc.h>
 #include <linux/soc/apple/pmgr-pwrstate.h>
 #include <linux/scatterlist.h>
 #include <linux/seq_file.h>
@@ -50,6 +51,8 @@ struct ane_h16_device {
 	/* Optional "perf" floor, voted only while an EXECUTE is in flight. */
 	struct device *perf;
 	bool perf_held;
+	/* Optional CLPC input: DRAM and fabric floors while an EXECUTE is in flight. */
+	struct apple_clpc_ane *clpc;
 	struct device *dart[3];
 	u32 powered;
 	u32 darts_powered;
@@ -1171,6 +1174,8 @@ static void ane_h16_release(struct ane_h16_device *h)
 		dev_pm_domain_detach(h->perf, false);
 		h->perf = NULL;
 	}
+	apple_clpc_ane_put(h->clpc);
+	h->clpc = NULL;
 	while (h->powered) {
 		struct device *pd = h->power[--h->powered];
 
@@ -1216,6 +1221,7 @@ static void ane_h16_busy(void *ctx, bool busy)
 {
 	struct ane_h16_device *h = ctx;
 
+	apple_clpc_ane_set_active(h->clpc, busy);
 	if (!h->perf)
 		return;
 	if (busy) {
@@ -1292,6 +1298,10 @@ static int ane_h16_acquire(struct platform_device *pdev, struct ane_h16_device *
 		if (ret)
 			return ret;
 	}
+	/* Optional: success with no input when the SoC's CLPC takes none. */
+	ret = apple_clpc_ane_get(h->dev, &h->clpc);
+	if (ret)
+		return ret;
 	for (i = 0; i < ARRAY_SIZE(names); i++) {
 		struct resource *r = platform_get_resource_byname(pdev, IORESOURCE_MEM, names[i]);
 
@@ -1448,6 +1458,9 @@ static int ane_h16_program_stage(struct ane_h16_device *h)
 {
 	int ret;
 
+	/* Before the node exists: the CLPC may have bound after acquire. */
+	if (!h->clpc && apple_clpc_ane_get(h->dev, &h->clpc))
+		h->clpc = NULL;
 	ret = ane_h16_session_init(&h->session, &h->boot.transport, &ane_h16_session_ops, h,
 				   h->boot.build->command_timeout_ns);
 	if (!ret) {
@@ -1460,8 +1473,8 @@ static int ane_h16_program_stage(struct ane_h16_device *h)
 		return ret;
 	}
 	h->program_ready = true;
-	dev_info(h->dev, "H16 stage 5 program window %llx..%llx\n", h->program_next,
-		 h->program_end - 1);
+	dev_info(h->dev, "H16 stage 5 program window %llx..%llx%s\n", h->program_next,
+		 h->program_end - 1, h->clpc ? ", CLPC input attached" : "");
 	return 0;
 }
 
