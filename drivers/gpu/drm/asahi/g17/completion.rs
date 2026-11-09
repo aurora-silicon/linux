@@ -724,7 +724,19 @@ impl Completion {
         self.output.finish(Ok(ticks));
     }
 
+    /// Per-client usage and the feed pass for one successful command, charged
+    /// once by whichever of ordinary or stamp output claimed it.
     fn note_pass(&self, ticks: [u64; 4]) {
+        use crate::usage::Engine;
+        let hz = cfg::COMMAND_TIMESTAMP_HZ as u32;
+        if self.compute.is_some() {
+            self.usage.add(Engine::Compute, ticks[0], ticks[1], hz);
+        } else {
+            self.usage.add(Engine::Vertex, ticks[0], ticks[1], hz);
+            self.usage.add(Engine::Fragment, ticks[2], ticks[3], hz);
+        }
+        // Compute reports its dispatch envelope in the first pair, a
+        // render its fragment pass in the second.
         if let Some(feed) = &self.feed {
             if self.compute.is_some() { feed.note_pass(ticks[0], ticks[1]); }
             else { feed.note_pass(ticks[2], ticks[3]); }
@@ -753,24 +765,8 @@ impl Completion {
         if result.is_ok() && self.interrupted() {
             result = Err(ECANCELED);
         }
-        if let Ok(ticks) = &result {
-            use crate::usage::Engine;
-            let hz = cfg::COMMAND_TIMESTAMP_HZ as u32;
-            if self.compute.is_some() {
-                self.usage.add(Engine::Compute, ticks[0], ticks[1], hz);
-            } else {
-                self.usage.add(Engine::Vertex, ticks[0], ticks[1], hz);
-                self.usage.add(Engine::Fragment, ticks[2], ticks[3], hz);
-            }
-        }
-        if let (Some(feed), Ok(ticks)) = (&self.feed, &result) {
-            // Compute reports its dispatch envelope in the first pair, a
-            // render its fragment pass in the second.
-            if self.compute.is_some() {
-                feed.note_pass(ticks[0], ticks[1]);
-            } else {
-                feed.note_pass(ticks[2], ticks[3]);
-            }
+        if let Ok(ticks) = result {
+            self.note_pass(ticks);
         }
         if let Err(error) = result {
             // Spared work cancelled after another VM's recovery is not this client's device loss.
