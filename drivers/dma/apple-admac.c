@@ -715,7 +715,11 @@ static int admac_resume(struct dma_chan *chan)
 	if (adchan->current_tx && adchan->current_tx->error) {
 		ret = -EIO;
 	} else if (adchan->lost && adchan->current_tx) {
-		/* The rings went with the registers: start from the top. */
+		struct admac_tx *tx = adchan->current_tx;
+
+		/* The rings went with the registers: start again from the last period reclaimed. */
+		tx->submitted_pos = tx->reclaimed_pos;
+		tx->nperiods_outstanding = 0;
 		adchan->nperiod_acks = 0;
 		admac_start_current_tx(adchan);
 	} else {
@@ -1116,9 +1120,9 @@ static int admac_runtime_resume(struct device *dev)
 }
 
 /*
- * A system sleep that reached the hardware takes the registers of a channel a
- * client still holds, and its client won't configure it again: only a new
- * hw_params does that.
+ * A firmware-driven sleep, refused or not, takes the registers of a channel a
+ * client still holds (genpd gates the domain at noirq), and its client won't
+ * configure it again: only a new hw_params does that.
  */
 static int __maybe_unused admac_resume_early(struct device *dev)
 {
@@ -1126,7 +1130,7 @@ static int __maybe_unused admac_resume_early(struct device *dev)
 	unsigned long flags;
 	int i;
 
-	if (!pm_resume_via_firmware())
+	if (!pm_suspend_via_firmware())
 		return 0;
 
 	mutex_lock(&ad->cache_alloc_lock);

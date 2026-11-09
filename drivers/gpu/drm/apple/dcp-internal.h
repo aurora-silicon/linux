@@ -74,6 +74,7 @@ struct apple_dcp_typec_port;
 
 void dcp_swap_watchdog_arm(struct apple_dcp *dcp);
 void dcp_swap_watchdog_complete(struct apple_dcp *dcp);
+bool dcp_swap_lost(struct apple_dcp *dcp, u32 swap_id);
 void dcp_retry_placeholder_edid(struct apple_dcp *dcp,
 				const struct drm_edid *drm_edid);
 bool dcp_typec_relink(struct apple_dcp *dcp);
@@ -260,6 +261,13 @@ struct apple_dcp_hw_data {
 	 * (desktop 26.x), see dcp_sink_metadata().
 	 */
 	bool sink_metadata_edid;
+	/*
+	 * With H17P firmware: a firmware-driven system sleep stops the internal processor's
+	 * firmware and powers it down, as DPMS off does, then restarts it warm, see
+	 * dcp_s2r_suspend(). @s2r_ext: the same for an external one, see dcp_s2r_ext_suspend().
+	 */
+	bool s2r;
+	bool s2r_ext;
 };
 
 enum dcp_test_point {
@@ -578,6 +586,15 @@ struct apple_dcp {
 	u32 last_swap_id;
 	/* last_swap_id is only meaningful after the first swap completes */
 	bool have_swap_complete;
+	/* swap id of the last started swap */
+	u32 started_swap_id;
+	/*
+	 * A started swap whose flip a commit gave up on
+	 * (dcp_drm_crtc_flip_lost()); event_lock. Firmware that does not track
+	 * its presents ignores its completion, see dcp_swap_lost().
+	 */
+	u32 lost_swap_id;
+	bool swap_lost;
 	ktime_t swap_start;
 	u64 swap_submit_timestamp;
 
@@ -631,7 +648,7 @@ struct apple_dcp {
 	/* Messages from the coprocessor are held in the mailbox for sleep. */
 	bool rx_held;
 
-	/* T8140 suspend-to-RAM stops the firmware, see dcp_s2r_suspend(). */
+	/* A firmware-driven suspend stops the firmware, see dcp_s2r_suspend(). */
 	bool s2r_active;
 	bool s2r_stopped;
 	/* DPMS off stopped the firmware and lowered the domains; DPMS on brings them back. */
@@ -967,6 +984,7 @@ int iomfb_configure_backlight_h17p(struct apple_dcp *dcp, u32 maximum,
 				   bool default_valid, u32 default_nits);
 void iomfb_queue_init(struct apple_dcp *dcp);
 void iomfb_queue_stop(struct apple_dcp *dcp);
+void iomfb_reset_transport(struct apple_dcp *dcp);
 bool iomfb_queue_drain(struct apple_dcp *dcp, unsigned long timeout);
 int iomfb_queue_settle(struct apple_dcp *dcp, unsigned long timeout);
 void iomfb_pause_presentation(struct apple_dcp *dcp, bool pause);

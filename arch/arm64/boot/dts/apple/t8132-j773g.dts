@@ -44,6 +44,15 @@
 };
 
 /*
+ * Without this, the PMP firmware faults in the PMC block (0x382800000)
+ * shortly after it starts on this board. J713 keeps ps_pmc out of Linux
+ * in its PMGR policy; this board has none yet.
+ */
+&ps_pmc {
+	apple,always-on;
+};
+
+/*
  * The AOP audio component always runs a microphone stream, and this Mac
  * has no microphones (ADT iop-audio-controller has no audio-hp) and no
  * speaker sense, so it has no sound card yet. The AOP registers its audio
@@ -166,12 +175,31 @@
 };
 
 /*
- * The two front USB-C ports: an on-board hub behind ATC2 (ADT usb-drd2,
- * hub firmware on spi3), with no port controller. The PHY only enters
- * USB3 mode from a Type-C mode switch, so the hub runs at high speed.
+ * The two front USB-C ports: an on-board USB2 hub (Apple 05ac:800b, firmware
+ * on spi3) on raw USB2 root port 1 of ATC2's controller (ADT usb-drd2), with
+ * no port controller. The PHY only enters USB3 mode from a Type-C mode
+ * switch, so the hub runs at high speed. The hub child tells dwc3-apple the
+ * controller is a host from probe on; the graph link from the PHY's USB3 port
+ * to the controller's SuperSpeed port is how the PHY finds that fixed hub
+ * and keeps its USB2 path up without a cable event (no SuperSpeed data path
+ * is described). The hub's reset and SPI-flash output-enable lines (ADT
+ * usb3hub_rst, usb3hub_flash_oe) are AP GPIOs; the boot loader leaves both
+ * high, as does macOS, and the hub runs with them high.
  */
 &atcphy2 {
 	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@1 {
+			reg = <1>;
+			atcphy2_usb: endpoint {
+				remote-endpoint = <&dwc3_2_ss>;
+			};
+		};
+	};
 };
 
 &dwc3_2_dart_0 {
@@ -184,7 +212,43 @@
 
 &dwc3_2 {
 	dr_mode = "host";
+	#address-cells = <1>;
+	#size-cells = <0>;
 	status = "okay";
+
+	hub@1 {
+		compatible = "usb5ac,800b";
+		reg = <1>;
+	};
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* Raw xHCI port 1 is USB2; raw port 2 is SuperSpeed. */
+		port@2 {
+			reg = <2>;
+			dwc3_2_ss: endpoint {
+				remote-endpoint = <&atcphy2_usb>;
+			};
+		};
+	};
+};
+
+&pinctrl_ap {
+	usb3hub-flash-oe-hog {
+		gpio-hog;
+		gpios = <101 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "usb3hub-flash-oe";
+	};
+
+	usb3hub-reset-hog {
+		gpio-hog;
+		gpios = <198 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "usb3hub-reset";
+	};
 };
 
 &wifi0 {

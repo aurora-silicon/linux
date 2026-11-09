@@ -47,6 +47,7 @@ unsafe extern "C" {
         bridge: bool,
     ) -> *mut core::ffi::c_void;
     fn asahi_g17_commit_finish(commit: *mut core::ffi::c_void, saved: *mut u32) -> bool;
+    fn asahi_g17_commit_required() -> bool;
 }
 
 /// What `.complete` does after a sleep whose stop was left to the commit.
@@ -427,13 +428,24 @@ impl Shared {
         true
     }
 
-    /// Leaves the stop to the commit. False, with the reason logged, if it can't be.
-    fn sleep_leave_for_commit(&self, firmware: &mut Firmware) -> bool {
+    /// Leaves the stop to the commit. False, with the reason logged, if it can't be. Where only
+    /// the commit may stop it, that refuses the sleep instead: a refusal after an earlier stop
+    /// would leave it stopped.
+    fn sleep_leave_for_commit(&self, firmware: &mut Firmware) -> Result<bool> {
         match firmware.leave_for_commit() {
             Ok(commit) => {
                 self.sleep_commit.store(commit, Ordering::Release);
                 dev_dbg!(self.dev.as_ref(), "GPU firmware left running for the sleep's commit\n");
-                true
+                Ok(true)
+            }
+            // SAFETY: Reads the sleep driver's state.
+            Err(error) if unsafe { asahi_g17_commit_required() } => {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "no GPU stop at the commit ({:?}): refusing the sleep\n",
+                    error
+                );
+                Err(EBUSY)
             }
             Err(error) => {
                 dev_warn!(
@@ -441,7 +453,7 @@ impl Shared {
                     "no GPU stop at the commit ({:?}): stopping it now\n",
                     error
                 );
-                false
+                Ok(false)
             }
         }
     }
@@ -490,7 +502,7 @@ impl Shared {
                 if !firmware.sleep_quiet(super::now_ns())? {
                     return Err(EBUSY);
                 }
-                if self.sleep_leave_for_commit(firmware) {
+                if self.sleep_leave_for_commit(firmware)? {
                     return Ok(());
                 }
                 down(firmware)

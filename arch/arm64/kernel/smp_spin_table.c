@@ -397,15 +397,13 @@ const struct cpu_operations smp_rvbar_spin_table_ops = {
 };
 
 /*
- * Parking CPUs leave the kernel only through a platform's power ops. Until one
- * registers, kexec has to take them as stuck, as on plain spin-table.
+ * An offlined parking CPU waits in this kernel's text and stack, which a kexec or a
+ * hibernation restore overwrites: it is stuck for those, power ops or not.
  */
 bool spin_table_cpus_stuck(void)
 {
 	unsigned int cpu;
 
-	if (READ_ONCE(spin_table_power))
-		return false;
 	for_each_possible_cpu(cpu)
 		if (get_cpu_ops(cpu) == &smp_rvbar_spin_table_ops)
 			return true;

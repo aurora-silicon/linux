@@ -27,8 +27,9 @@
 		sep = &sep;
 		serial0 = &serial0;
 		pmp = &pmp;
-		rtc0 = &smc_rtc;
-		rtc1 = &pmu_rtc;
+		/* First the RTC that can wake the system */
+		rtc0 = &pmu_rtc;
+		rtc1 = &smc_rtc;
 		wifi0 = &wifi0;
 		/* used by the loader to hand over the display */
 		dcp = &dcp;
@@ -575,6 +576,16 @@
 				label = "nvram";
 				reg = <0x24000 0x1d0000>;
 			};
+
+			/*
+			 * syscfg factory data. Listed after nvram so the nvram
+			 * MTD index stays the same.
+			 */
+			partition@0 {
+				label = "syscfg";
+				reg = <0x0 0x24000>;
+				read-only;
+			};
 		};
 	};
 };
@@ -744,8 +755,37 @@
 	};
 };
 
+/* A spare PWM channel for developers; no consumer is known. */
+&fpwm0 {
+	status = "okay";
+};
+
 &smc {
 	status = "okay";
+};
+
+/*
+ * The AOP's GPIO bank. The AOP keeps interrupt groups 0-3; the AP's are 4-6
+ * (AIC 384-386). No consumer requests a line yet.
+ */
+&pinctrl_aop {
+	interrupts = <AIC_IRQ 384 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 385 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 386 IRQ_TYPE_LEVEL_HIGH>;
+	apple,irq-group-base = <4>;
+	status = "okay";
+};
+
+/*
+ * The always-on GPIO bank, as on the J616s: the AP takes none of its
+ * interrupts. Line 20 is the secure-repair enable and is never requested.
+ */
+&pinctrl_nub {
+	gpio-reserved-ranges = <20 1>;
+	status = "okay";
+	/delete-property/ interrupt-controller;
+	/delete-property/ #interrupt-cells;
+	/delete-property/ interrupts;
 };
 
 &smc_gpio {
@@ -1165,6 +1205,59 @@
 	temperature-Tsx1 {
 		apple,key-id = "Tsx1";
 		label = "SMC Tsx1";
+	};
+
+	/*
+	 * GPU temperatures, last so the indexed channels above keep their
+	 * numbers. The SMC publishes them only while the GPU is powered; with
+	 * the GPU off they read -4.0 to 0.2 C placeholders, which are no data.
+	 */
+	temperature-Tg04 {
+		apple,key-id = "Tg04";
+		label = "GPU Tg04";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg05 {
+		apple,key-id = "Tg05";
+		label = "GPU Tg05";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0C {
+		apple,key-id = "Tg0C";
+		label = "GPU Tg0C";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0D {
+		apple,key-id = "Tg0D";
+		label = "GPU Tg0D";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0K {
+		apple,key-id = "Tg0K";
+		label = "GPU Tg0K";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0L {
+		apple,key-id = "Tg0L";
+		label = "GPU Tg0L";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0d {
+		apple,key-id = "Tg0d";
+		label = "GPU Tg0d";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0e {
+		apple,key-id = "Tg0e";
+		label = "GPU Tg0e";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	/*

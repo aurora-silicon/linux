@@ -17,6 +17,7 @@
 #define APPLE_PMU_RTC_ARM		BIT(6)
 #define APPLE_PMU_RTC_ALARM		BIT(0)
 #define APPLE_PMU_RTC_HZ_SHIFT	16
+/* The suspend-to-idle limit, where the alarm is all that wakes the system. */
 #define APPLE_PMU_RTC_MAX_DELAY	3600
 
 /*
@@ -30,8 +31,11 @@ struct apple_pmu_rtc_hw {
 	u16 mask;
 	u16 event;
 	u8 event_bit;
+	u8 control_event_bit;
 	u8 monitor_bit;
 	bool offset_in_seconds;
+	/* How far ahead an alarm may be, in seconds */
+	u32 max_delay;
 };
 
 static const struct apple_pmu_rtc_hw apple_pmu_rtc_baku = {
@@ -42,6 +46,8 @@ static const struct apple_pmu_rtc_hw apple_pmu_rtc_baku = {
 	.event = 0xf80c,
 	.event_bit = BIT(0),
 	.offset_in_seconds = true,
+	/* As far as the comparator reaches: macOS's own deep-sleep wakes use it. */
+	.max_delay = U32_MAX,
 };
 
 static const struct apple_pmu_rtc_hw apple_pmu_rtc_abbey = {
@@ -52,6 +58,7 @@ static const struct apple_pmu_rtc_hw apple_pmu_rtc_abbey = {
 	.event = 0x2000,
 	.event_bit = BIT(1),
 	.monitor_bit = BIT(0),
+	.max_delay = APPLE_PMU_RTC_MAX_DELAY,
 };
 
 /* M2 (t8112): Baku's register block with the offset in 1/32768 s. */
@@ -63,6 +70,7 @@ static const struct apple_pmu_rtc_hw apple_pmu_rtc_stowe = {
 	.event = 0xf80c,
 	.event_bit = BIT(0),
 	.monitor_bit = BIT(0),
+	.max_delay = APPLE_PMU_RTC_MAX_DELAY,
 };
 
 /* M1 Pro, Max and Ultra (t600x), offset in 1/32768 s */
@@ -73,7 +81,9 @@ static const struct apple_pmu_rtc_hw apple_pmu_rtc_maverick = {
 	.mask = 0x14c2,
 	.event = 0x14c0,
 	.event_bit = BIT(0),
+	.control_event_bit = BIT(1),
 	.monitor_bit = BIT(0),
+	.max_delay = APPLE_PMU_RTC_MAX_DELAY,
 };
 
 struct apple_pmu_rtc {
@@ -147,6 +157,31 @@ static int apple_pmu_rtc_read_time(struct device *dev, struct rtc_time *time)
 	return 0;
 }
 
+/*
+ * Baku's offset is in whole seconds, and this sets it as the SMC RTC does: the
+ * counter rounded to the nearest second, so the clock is at most half a second off.
+ */
+static int apple_pmu_rtc_set_time(struct device *dev, struct rtc_time *time)
+{
+	struct apple_pmu_rtc *rtc = dev_get_drvdata(dev);
+	__le64 value;
+	u64 counter;
+	s64 offset;
+	int error;
+
+	guard(mutex)(&rtc->transaction);
+	error = apple_pmu_rtc_counter(rtc, &counter);
+	if (error)
+		return error;
+	offset = rtc_tm_to_time64(time) -
+		 (s64)((counter + BIT(APPLE_PMU_RTC_HZ_SHIFT - 1)) >> APPLE_PMU_RTC_HZ_SHIFT);
+	if (offset < 0 || offset > RTC_TIMESTAMP_END_9999 - U32_MAX)
+		return -ERANGE;
+	value = cpu_to_le64(offset);
+	error = nvmem_cell_write(rtc->offset, &value, sizeof(value));
+	return error < 0 ? error : 0;
+}
+
 /* All comparator/control accesses are serialized with the IRQ thread. */
 static int apple_pmu_rtc_ack_alarm(struct apple_pmu_rtc *rtc)
 {
@@ -177,6 +212,8 @@ static int apple_pmu_rtc_arm(struct apple_pmu_rtc *rtc, bool enable)
 	/* Do not acknowledge a shared W1C event as a side effect of RMW. */
 	if (rtc->hw->event == rtc->hw->control)
 		control &= ~rtc->hw->event_bit;
+	/* Maverick clears its additional fired latch when this bit is zero. */
+	control &= ~rtc->hw->control_event_bit;
 	control &= ~APPLE_PMU_RTC_ARM;
 	if (enable)
 		control |= APPLE_PMU_RTC_ARM;
@@ -224,7 +261,7 @@ static int apple_pmu_rtc_validate_alarm(struct apple_pmu_rtc *rtc, u64 comparato
 	counter >>= APPLE_PMU_RTC_HZ_SHIFT;
 	if (comparator <= counter)
 		return -ETIME;
-	if (comparator - counter > APPLE_PMU_RTC_MAX_DELAY)
+	if (comparator - counter > rtc->hw->max_delay)
 		return -ERANGE;
 	return 0;
 }
@@ -371,8 +408,17 @@ static int apple_pmu_rtc_init_alarm(struct apple_pmu_rtc *rtc)
 	return apple_pmu_rtc_stop_alarm(rtc);
 }
 
+/* The others' offsets are set through the SMC RTC. */
 static const struct rtc_class_ops apple_pmu_rtc_ops = {
 	.read_time = apple_pmu_rtc_read_time,
+	.read_alarm = apple_pmu_rtc_read_alarm,
+	.set_alarm = apple_pmu_rtc_set_alarm,
+	.alarm_irq_enable = apple_pmu_rtc_alarm_enable,
+};
+
+static const struct rtc_class_ops apple_pmu_rtc_seconds_ops = {
+	.read_time = apple_pmu_rtc_read_time,
+	.set_time = apple_pmu_rtc_set_time,
 	.read_alarm = apple_pmu_rtc_read_alarm,
 	.set_alarm = apple_pmu_rtc_set_alarm,
 	.alarm_irq_enable = apple_pmu_rtc_alarm_enable,
@@ -437,10 +483,11 @@ static int apple_pmu_rtc_probe(struct platform_device *pdev)
 	rtc->clock = devm_rtc_allocate_device(dev);
 	if (IS_ERR(rtc->clock))
 		return PTR_ERR(rtc->clock);
-	rtc->clock->ops = &apple_pmu_rtc_ops;
+	rtc->clock->ops = rtc->hw->offset_in_seconds ? &apple_pmu_rtc_seconds_ops :
+						       &apple_pmu_rtc_ops;
 	rtc->clock->range_min = 0;
 	rtc->clock->range_max = RTC_TIMESTAMP_END_9999;
-	rtc->clock->alarm_offset_max = APPLE_PMU_RTC_MAX_DELAY;
+	rtc->clock->alarm_offset_max = rtc->hw->max_delay;
 	clear_bit(RTC_FEATURE_UPDATE_INTERRUPT, rtc->clock->features);
 	error = device_init_wakeup(dev, true);
 	if (error)

@@ -1614,6 +1614,9 @@ fn pcm_open_dmaengine(
     if hw.formats == 0 {
         return EINVAL.to_errno();
     }
+    // A system sleep stops the services, and only a prepare starts them all again. Offer
+    // neither resume nor pause: a transfer paused by the suspend would block the next start.
+    hw.info &= !(bindings::SNDRV_PCM_INFO_PAUSE | bindings::SNDRV_PCM_INFO_RESUME);
     // SAFETY: the substream's runtime exists for the op's duration; the
     // dmaengine open attaches `chan` to it on success.
     unsafe {

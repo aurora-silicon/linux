@@ -582,6 +582,38 @@ void iomfb_queue_init(struct apple_dcp *dcp)
 	atomic_set(&dcp->iomfb.opaque_x_state, IOMFB_OPAQUE_X_WAITING);
 }
 
+/*
+ * For firmware stopped cold and started again: the calls and the transaction the old
+ * one never answered went with it, and would hold the channels and the queue forever.
+ */
+void iomfb_reset_transport(struct apple_dcp *dcp)
+{
+	struct iomfb_transaction *transaction;
+
+	if (!iomfb_uses_queue(dcp))
+		return;
+
+	cancel_delayed_work_sync(&dcp->iomfb.timeout);
+	mutex_lock(&dcp->iomfb.lock);
+	transaction = dcp->iomfb.active;
+	dcp->iomfb.active = NULL;
+	if (transaction) {
+		if (transaction->brightness_only)
+			dcp->iomfb.backlight_queued = false;
+		transaction->release(transaction);
+	}
+	iomfb_discard_pending(dcp);
+	dcp->ch_cmd.depth = 0;
+	dcp->ch_oobcmd.depth = 0;
+	dcp->ch_cb.depth = 0;
+	dcp->ch_oobcb.depth = 0;
+	dcp->ch_async.depth = 0;
+	dcp->ch_oobasync.depth = 0;
+	dcp->present_state_h17p.pending = false;
+	dcp->present_state_h17p.accepted = false;
+	mutex_unlock(&dcp->iomfb.lock);
+}
+
 void iomfb_queue_stop(struct apple_dcp *dcp)
 {
 	if (!iomfb_uses_queue(dcp))

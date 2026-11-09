@@ -14,7 +14,7 @@
 struct device;
 struct device_node;
 
-#if IS_ENABLED(CONFIG_APPLE_T8140_SLEEP)
+#if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP)
 /*
  * A coprocessor that can't be stopped until a sleep is certain, and can't be
  * restarted without one. While one is registered and not ready, a suspend is
@@ -43,7 +43,7 @@ void apple_sleep_coproc_unregister(struct device *dev);
 int apple_sleep_coproc_set_last_check(struct device *dev, int (*last_check)(void *data));
 
 /*
- * The enclave's sleep request, which it comes back from only through a real sleep: @tell
+ * The enclave's sleep request, after which it has to be started again: @tell
  * runs with interrupts off as the very last refusal, after every other one and before any
  * coprocessor stops. Nonzero refuses the sleep.
  */
@@ -55,6 +55,12 @@ void apple_sleep_coproc_set_ready(struct device *dev, bool ready);
 
 /* Whether the last step stopped it: after a refused sleep, false means it still runs. */
 bool apple_sleep_coproc_stopped(struct device *dev);
+
+/*
+ * Whether this sleep's commit stops the registered coprocessors. Then one that can't be
+ * registered refuses the sleep: stopped any earlier, a later refusal would strand it.
+ */
+bool apple_sleep_commit_stops_coprocs(void);
 
 /*
  * The USB host sleeps in place for this sleep, as macOS's does: its always-on domain stays
@@ -165,6 +171,11 @@ static inline void apple_sleep_coproc_set_ready(struct device *dev, bool ready)
 }
 
 static inline bool apple_sleep_coproc_stopped(struct device *dev)
+{
+	return false;
+}
+
+static inline bool apple_sleep_commit_stops_coprocs(void)
 {
 	return false;
 }

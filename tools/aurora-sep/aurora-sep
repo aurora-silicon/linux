@@ -1,0 +1,363 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: GPL-2.0-only
+"""aurora-sep: report the Secure Enclave (SEP) state on an Aurora kernel.
+
+  aurora-sep status [--json] [--summary] [--no-live] [--quiet]
+
+`status` checks every state the apple_sep driver reports and prints one
+line per check: PASS, WARN, FAIL or INFO, the value, and what it means.
+It reads the driver's diag attributes, the device nodes, the hwrng and
+the kernel log. It never opens /dev/sep-bio (that activates Touch ID)
+and never writes anything. With root and the enclave as the current
+hwrng it reads 32 random bytes from /dev/hwrng, which proves the enclave
+still answers (after a resume, too); --no-live skips that.
+
+Exit status: 0 when nothing FAILed, 1 when something did, 2 when this is
+not a Mac with a SEP driver.
+
+Environment, for tests: AURORA_SEP_SYSFS (default /sys/bus/platform/devices),
+AURORA_SEP_ROOT (prefix for /proc, /dev and /sys/class paths, default ""),
+AURORA_SEP_NO_SYSTEM=1 (skip systemctl and the kernel log).
+"""
+
+import json
+import os
+import subprocess
+import sys
+
+SYSFS = os.environ.get("AURORA_SEP_SYSFS", "/sys/bus/platform/devices")
+ROOT = os.environ.get("AURORA_SEP_ROOT", "")
+# Tests set this to keep systemctl and the journal of the machine out of it.
+NO_SYSTEM = os.environ.get("AURORA_SEP_NO_SYSTEM") == "1"
+
+# The endpoints every supported SEP advertises. macOS lists the same twelve
+# (ioreg: sep-endpoint,<name> under AppleSEPManager) on M1 Pro, M2 and later.
+EXPECTED_ENDPOINTS = ["cntl", "hdcp", "hibe", "pnon", "sbio", "scrd",
+                      "skdl", "sks", "sse", "stac", "xarm", "xars"]
+# The ones the driver serves itself; the rest have no Linux client yet.
+SERVED = {"cntl": "control, hwrng", "xarm": "xART store", "sks": "key store",
+          "sbio": "Touch ID", "scrd": "credentials"}
+
+# A bring-up slower than this is reported (the driver waits up to 90 s).
+READY_WARN_MS = 15000
+
+PASS, WARN, FAIL, INFO = "PASS", "WARN", "FAIL", "INFO"
+
+
+def path(p):
+    return ROOT + p
+
+
+def read(p):
+    try:
+        with open(p, encoding="ascii", errors="replace") as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+class Report:
+    def __init__(self):
+        self.rows = []
+
+    def add(self, verdict, name, value, why=""):
+        self.rows.append({"check": name, "verdict": verdict,
+                          "value": "" if value is None else str(value),
+                          "detail": why})
+
+    def count(self, verdict):
+        return sum(1 for r in self.rows if r["verdict"] == verdict)
+
+
+def find_sep():
+    try:
+        names = sorted(os.listdir(SYSFS))
+    except OSError:
+        return None
+    for n in names:
+        if n.endswith(".sep"):
+            return os.path.join(SYSFS, n)
+    return None
+
+
+def compatible():
+    raw = None
+    try:
+        with open(path("/proc/device-tree/compatible"), "rb") as f:
+            raw = f.read()
+    except OSError:
+        return []
+    return [c.decode("ascii", "replace") for c in raw.split(b"\0") if c]
+
+
+def kernel_log_levels():
+    """(err, warning) apple_sep line counts, or None."""
+    res = []
+    for prio in ("err", "warning"):
+        try:
+            out = subprocess.run(["journalctl", "-k", "-b", "-p", prio, "-o",
+                                  "cat", "--no-pager", "-q"],
+                                 capture_output=True, text=True, timeout=20,
+                                 check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if out.returncode != 0:
+            return None
+        res.append([l for l in out.stdout.splitlines()
+                    if "apple_sep" in l or "sep sensor" in l])
+    return res
+
+
+def status(live=True):
+    r = Report()
+    dev = find_sep()
+    if dev is None:
+        r.add(FAIL, "sep-device", "absent",
+              "no <unit>.sep platform device: not an Apple silicon Mac, or the DT has no SEP node")
+        return r, 2
+    drv = os.path.basename(os.path.realpath(os.path.join(dev, "driver"))) \
+        if os.path.exists(os.path.join(dev, "driver")) else None
+    if drv != "apple_sep":
+        r.add(FAIL, "driver", drv or "unbound",
+              "apple_sep is not bound to the SEP (module not loaded, or probe failed)")
+        return r, 1
+    r.add(PASS, "driver", "apple_sep bound to " + os.path.basename(dev))
+
+    diag = os.path.join(dev, "diag")
+    if not os.path.isdir(diag):
+        r.add(FAIL, "diag", "absent", "this kernel has no diag attributes; too old to check")
+        return r, 1
+
+    def d(name):
+        return read(os.path.join(diag, name))
+
+    r.add(INFO, "profile", d("profile"), "platform profile the driver chose")
+    r.add(INFO, "bootstrap", d("boot"), "cold: the driver boots the SEP; warm: iBoot left it running")
+    r.add(INFO, "protocol", d("protocol"), "key-store protocol")
+
+    attach = d("attach")
+    if attach == "attached":
+        r.add(PASS, "attach", attach, "the SEP advertised its endpoints")
+    elif attach == "pending":
+        r.add(FAIL, "attach", attach, "the SEP has not answered the driver")
+    else:
+        r.add(FAIL, "attach", attach, "the SEP advertised no endpoint")
+
+    names = d("endpoint_names")
+    count = d("endpoints")
+    if names is not None:
+        have = names.split()
+        missing = [e for e in EXPECTED_ENDPOINTS if e not in have]
+        extra = [e for e in have if e not in EXPECTED_ENDPOINTS]
+        if missing:
+            r.add(FAIL, "endpoints", "%d: %s" % (len(have), names),
+                  "missing " + " ".join(missing))
+        else:
+            r.add(PASS, "endpoints", "%d: %s" % (len(have), names),
+                  "all %d expected endpoints, as macOS lists them" % len(EXPECTED_ENDPOINTS)
+                  + ("; also " + " ".join(extra) if extra else ""))
+        unserved = [e for e in have if e not in SERVED]
+        r.add(INFO, "endpoint-clients",
+              ", ".join("%s=%s" % (e, SERVED[e]) for e in have if e in SERVED),
+              "no Linux client yet: " + " ".join(unserved) if unserved else "")
+    elif count is not None:
+        n = int(count) if count.isdigit() else 0
+        r.add(PASS if n >= len(EXPECTED_ENDPOINTS) else FAIL, "endpoints", n,
+              "expected %d (this kernel does not list names)" % len(EXPECTED_ENDPOINTS))
+
+    for name, why in (("attach_ms", "probe to attach"),
+                      ("ready_ms", "probe to the end of the bring-up")):
+        v = d(name)
+        if v is None:
+            continue
+        ms = int(v) if v.isdigit() else 0
+        if ms == 0:
+            r.add(WARN, name, v, why + ": not decided yet")
+        elif name == "ready_ms" and ms > READY_WARN_MS:
+            r.add(WARN, name, v, why + ": slow (over %d ms)" % READY_WARN_MS)
+        else:
+            r.add(INFO, name, v, why)
+
+    ks = d("keystore")
+    r.add(PASS if ks == "open" else FAIL, "keystore", ks,
+          {"open": "key store open", "closed": "the bring-up ended without the key store",
+           "unknown": "bring-up still running"}.get(ks, ""))
+
+    kb = d("keybag")
+    xart = d("xart")
+    if kb == "present":
+        r.add(PASS, "keybag", kb, "identity keybag present")
+    elif kb == "missing":
+        r.add(WARN, "keybag", kb, "no identity keybag: Touch ID is not provisioned on this install")
+    else:
+        r.add(FAIL, "keybag", kb, "identity keybag failed or undecided")
+
+    if xart == "enabled":
+        r.add(PASS, "xart", xart, "the enclave's state writes reach the disk")
+    else:
+        r.add(WARN, "xart", xart, "xART writes are off (xart_writes=0): enrol and verify are refused")
+
+    osid = d("os_identity")
+    if osid is not None:
+        if osid in ("explicit", "chosen"):
+            r.add(PASS, "os-identity", osid, "the xART exchange has an OS identity")
+        else:
+            r.add(FAIL, "os-identity", osid, "no OS identity: the enclave cannot find this OS's xART records")
+    comp = compatible()
+    cmdline = read(path("/proc/cmdline")) or ""
+    if "apple,j700" in comp:
+        pinned = "apple_sep.os_uuid_hi=" in cmdline and "apple_sep.os_uuid_lo=" in cmdline
+        r.add(PASS if pinned else FAIL, "os-uuid-pin", "present" if pinned else "missing",
+              "the MacBook Neo needs the os_uuid pin on every boot entry")
+    for p in ("xarm_trace", "sensor_trace"):
+        if "apple_sep.%s=1" % p in cmdline:
+            r.add(WARN, "cmdline-" + p, "on", "debug tracing is on in the boot entry (log noise)")
+
+    hw = d("hwrng")
+    cur = read(path("/sys/class/misc/hw_random/rng_current"))
+    avail = read(path("/sys/class/misc/hw_random/rng_available")) or ""
+    if hw is not None:
+        r.add(PASS if hw == "registered" else (WARN if hw == "pending" else FAIL),
+              "hwrng", hw, "the enclave's random source")
+    elif "apple-sep" in avail.split():
+        r.add(PASS, "hwrng", "registered", "apple-sep is an available hwrng")
+    else:
+        r.add(FAIL, "hwrng", "absent", "apple-sep is not an hwrng")
+    if live:
+        if cur == "apple-sep" and os.access(path("/dev/hwrng"), os.R_OK):
+            try:
+                with open(path("/dev/hwrng"), "rb", buffering=0) as f:
+                    got = f.read(32)
+                ok = len(got) == 32 and any(got)
+                r.add(PASS if ok else FAIL, "live", "%d bytes" % len(got),
+                      "the enclave answered an entropy request now" if ok
+                      else "the enclave did not answer an entropy request")
+            except OSError as e:
+                r.add(FAIL, "live", "error", "reading /dev/hwrng: %s" % e.strerror)
+        elif cur == "apple-sep":
+            r.add(INFO, "live", "skipped", "needs root to read /dev/hwrng")
+        else:
+            r.add(INFO, "live", "skipped", "the current hwrng is %s, not apple-sep" % (cur or "none"))
+
+    for node, why in (("/dev/sep-bio", "Touch ID"), ("/dev/sep-key", "enclave keys")):
+        if os.path.exists(path(node)):
+            r.add(PASS, "node" + node[4:], "present", why)
+        else:
+            r.add(WARN if ks != "open" else FAIL, "node" + node[4:], "absent", why)
+
+    tid = d("touchid")
+    sensor = d("sensor")
+    sattach = d("sensor_attach")
+    restore = d("restore")
+    match = d("matching")
+    if tid == "ready":
+        r.add(PASS, "touchid", tid, "Touch ID activated and the sensor online")
+    elif tid == "unknown":
+        r.add(WARN, "touchid", tid, "not activated yet (aurora-sep-ready.service opens /dev/sep-bio at boot)")
+    elif tid == "failed" and kb == "missing":
+        r.add(WARN, "touchid", tid, "not provisioned (no identity keybag)")
+    else:
+        r.add(FAIL, "touchid", tid, "Touch ID cannot work this boot")
+    r.add(PASS if sensor == "online" else (WARN if sensor in ("bound", "unbound") and tid != "ready" else FAIL),
+          "sensor", sensor, "fingerprint sensor on SPI")
+    if sattach is not None:
+        r.add(PASS if sattach == "attached" else (WARN if sattach in ("unknown", "retrying") else FAIL),
+              "sensor-attach", sattach, "")
+    if restore is not None:
+        r.add(PASS if restore in ("restored", "empty") else (WARN if restore == "unknown" else FAIL),
+              "restore", restore, {"restored": "enrolled fingerprints restored",
+                                   "empty": "no fingerprint enrolled",
+                                   "unproven": "fingerprints listed but not proven: matching refused"}.get(restore, ""))
+    if match is not None:
+        r.add({"usable": PASS, "unverified": PASS, "blocked": FAIL}.get(match, WARN),
+              "matching", match,
+              {"usable": "a match can save its state",
+               "unverified": "the xART guard runs and has refused nothing",
+               "blocked": "a match cannot save its state; see XART-SAFETY.md"}.get(match, ""))
+
+    refusals = d("xart_guard_refusals")
+    failures = d("xarm_failures")
+    ref = int(refusals) if refusals and refusals.isdigit() else 0
+    if refusals is not None:
+        r.add(PASS if ref == 0 else WARN, "xart-guard-refusals", refusals,
+              "xART guard level %s" % d("xart_guard"))
+    if failures is not None:
+        fail = int(failures) if failures.isdigit() else 0
+        r.add(PASS if fail <= ref else FAIL, "xarm-failures", failures,
+              "xART requests the driver failed (guard refusals included)")
+    unh = d("unhandled_messages")
+    if unh is not None:
+        r.add(PASS if unh == "0" else WARN, "unhandled-messages", unh,
+              "messages on endpoints without a handler")
+
+    sl = d("sleep")
+    if sl is not None:
+        r.add(PASS if sl == "awake" else WARN, "sleep", sl, "sleep cycles since probe: %s" % d("sleeps"))
+
+    if NO_SYSTEM:
+        return r, (1 if r.count(FAIL) else 0)
+
+    unit = None
+    try:
+        out = subprocess.run(["systemctl", "show", "-p", "Result", "-p", "ActiveState",
+                              "-p", "LoadState", "aurora-sep-ready.service"],
+                             capture_output=True, text=True, timeout=10, check=False)
+        props = dict(l.split("=", 1) for l in out.stdout.splitlines() if "=" in l)
+        if props.get("LoadState") == "loaded":
+            unit = props.get("Result"), props.get("ActiveState")
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    if unit and unit[1]:
+        r.add(PASS if unit[0] == "success" else FAIL, "aurora-sep-ready",
+              "%s/%s" % (unit[1], unit[0]), "boot-time Touch ID activation")
+
+    levels = kernel_log_levels()
+    if levels is None:
+        r.add(INFO, "kernel-log", "unreadable", "run as root to check the kernel log")
+    else:
+        errs, warns = levels
+        r.add(PASS if not errs else FAIL, "log-errors", len(errs),
+              errs[0][:160] if errs else "no apple_sep error lines this boot")
+        r.add(PASS if not warns else WARN, "log-warnings", len(warns),
+              warns[0][:160] if warns else "no apple_sep warning lines this boot")
+
+    return r, (1 if r.count(FAIL) else 0)
+
+
+def main(argv):
+    args = argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0 if args else 2
+    if args[0] != "status":
+        print("aurora-sep: unknown command %r (try: aurora-sep status)" % args[0], file=sys.stderr)
+        return 2
+    opts = set(args[1:])
+    unknown = opts - {"--json", "--summary", "--no-live", "--quiet"}
+    if unknown:
+        print("aurora-sep: unknown option %s" % " ".join(sorted(unknown)), file=sys.stderr)
+        return 2
+    rep, rc = status(live="--no-live" not in opts)
+    totals = {v: rep.count(v) for v in (PASS, WARN, FAIL, INFO)}
+    if "--json" in opts:
+        json.dump({"result": "FAIL" if rep.count(FAIL) else "PASS",
+                   "totals": totals, "checks": rep.rows}, sys.stdout, indent=1)
+        print()
+        return rc
+    if "--summary" not in opts:
+        for row in rep.rows:
+            if "--quiet" in opts and row["verdict"] in (PASS, INFO):
+                continue
+            line = "%-4s %-20s %s" % (row["verdict"], row["check"], row["value"])
+            if row["detail"]:
+                line += "  (" + row["detail"] + ")"
+            print(line)
+    bad = [row["check"] for row in rep.rows if row["verdict"] == FAIL]
+    print("aurora-sep: %s  pass %d warn %d fail %d%s" % (
+        "FAIL" if bad else "PASS", totals[PASS], totals[WARN], totals[FAIL],
+        ("  [" + " ".join(bad) + "]") if bad else ""))
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

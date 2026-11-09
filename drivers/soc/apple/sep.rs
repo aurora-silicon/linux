@@ -93,6 +93,12 @@ use kernel::{
 };
 
 const SETTLE_MS: time::Msecs = 200;
+/// Messages on an endpoint without a handler are logged this many times per
+/// boot; diag/unhandled_messages counts them all.
+const UNHANDLED_LOG_LIMIT: u32 = 4;
+/// Users whose last logged lock state is remembered (a Mac has the system
+/// user 501 and one or two Linux users).
+pub(crate) const LOCK_STATE_LOG_USERS: usize = 4;
 const FIRST_RESPONSE_MS: time::Msecs = 3000;
 const RNG_SURVEY_ATTEMPTS: u32 = 5;
 
@@ -832,6 +838,10 @@ struct SepData {
     // from a stale one.
     bio_lock_state: Atomic<u64>,
     bio_lock_state_seq: Atomic<u32>,
+    // The last state logged for each of the most recent users, in the same
+    // layout, so a repeated notification is not logged again. Notifications
+    // are handled one at a time, on the receive path.
+    bio_lock_logged: [Atomic<u64>; LOCK_STATE_LOG_USERS],
 
     #[pin]
     store: Mutex<Option<xart_store::Store>>,
@@ -1099,6 +1109,7 @@ impl SepData {
                 match_scope_misses: Atomic::new(0),
                 bio_lock_state: Atomic::new(0),
                 bio_lock_state_seq: Atomic::new(0),
+                bio_lock_logged: [Atomic::new(0), Atomic::new(0), Atomic::new(0), Atomic::new(0)],
                 store <- new_mutex!(store),
                 host_store <- new_mutex!(host_store),
                 xarm <- new_mutex!(XarmState::new()),
@@ -1408,8 +1419,18 @@ impl SepData {
             return Err(EBUSY);
         }
 
-        if self.sleep_leave_for_commit() {
-            return Ok(());
+        match self.sleep_leave_for_commit() {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => {
+                dev_err!(
+                    self.dev,
+                    "sleep refused: its last refusal could not be armed ({:?})\n",
+                    e
+                );
+                self.set_sleep_gate(pm::SleepGate::Open);
+                return Err(e);
+            }
         }
 
         if let Err(e) = pm::dart_prepare(&self.dev) {
@@ -1439,10 +1460,10 @@ impl SepData {
     }
 
     /// Where the sleep driver takes it, the request goes out as its very last refusal, with
-    /// interrupts off: a gated enclave comes back only through a real sleep, so any earlier
-    /// refusal has to find it never told. Its answer is polled there, so the receive
+    /// interrupts off: a gated enclave has to be started again, so any earlier refusal should
+    /// find it never told. Its answer is polled there, so the receive
     /// interrupt is held from now on. The gate stays at draining until the wake.
-    fn sleep_leave_for_commit(&self) -> bool {
+    fn sleep_leave_for_commit(&self) -> Result<bool> {
         let request = proto::encode_control(&proto::op_sleep(), proto::TAG_SLEEP);
         let left = match self.mbox.lock().as_ref() {
             Some(mbox) => pm::leave_for_commit(
@@ -1452,13 +1473,13 @@ impl SepData {
                 proto::SLEEP_REPLY,
                 proto::SLEEP_REPLY_MASK,
             ),
-            None => false,
-        };
+            None => Err(ENODEV),
+        }?;
         if left {
             self.sleep_hold_rx();
             dev_dbg!(self.dev, "the sleep request is left for the sleep's last refusal\n");
         }
-        left
+        Ok(left)
     }
 
     /// Holds off the receive interrupt, whose handler reads the mailbox.
@@ -1481,12 +1502,12 @@ impl SepData {
     /// Back from a sleep, or a suspend that was aborted. The enclave has kept
     /// its state and takes no new endpoint setup.
     ///
-    /// Reading the mailbox of a gated enclave can stall the CPU for good, so only
-    /// the power cycle of a real sleep ends one. A sleep refused after the request,
-    /// which only the request itself can do where the sleep driver sends it, leaves
-    /// the enclave asleep, and requests fail until the next real sleep or a reboot.
-    /// If it never gated it was never stopped, and a doorbell would reach an
-    /// endpoint: ask it something instead.
+    /// Reading the mailbox of a gated enclave can stall the CPU for good, so it's
+    /// touched only once the enclave is started again. macOS starts an enclave that
+    /// took its sleep request the same way whether the system slept or not, so a
+    /// sleep refused after the enclave gated starts it as a real sleep does, once its
+    /// domain reads off. If it never gated it was never stopped, and a doorbell would
+    /// reach an endpoint: ask it something instead.
     pub(crate) fn sleep_exit(&self) {
         // Left to the sleep's last refusal: told only if it went out.
         match pm::commit_finish(&self.dev) {
@@ -1509,17 +1530,16 @@ impl SepData {
         }
         let answered = if real {
             self.sleep_kick()
-        } else if pm::wait_gated(&self.dev) {
-            self.sleep_hold_rx();
-            self.set_sleep_gate(pm::SleepGate::Lost);
-            dev_warn!(
-                self.dev,
-                "the enclave stays asleep until the next real sleep or a reboot\n"
-            );
-            return;
         } else {
-            dev_warn!(self.dev, "the enclave never gated its power domain\n");
-            self.sleep_probe()
+            match pm::wait_gated(&self.dev) {
+                Ok(true) => self.sleep_restart(),
+                Ok(false) => {
+                    dev_warn!(self.dev, "the enclave did not gate within the timeout\n");
+                    self.sleep_probe()
+                }
+                // Without a domain observation, do not touch the mailbox.
+                Err(e) => Err(e),
+            }
         };
         match answered {
             Ok(()) => {
@@ -1528,11 +1548,25 @@ impl SepData {
                 dev_info!(self.dev, "the enclave is back from its sleep request\n");
             }
             Err(e) => {
-                dev_err!(self.dev, "the enclave did not come back ({:?}); it stays unused\n", e);
+                dev_err!(
+                    self.dev,
+                    "the enclave did not come back ({:?}); it stays unused until the next real sleep or a reboot\n",
+                    e
+                );
                 self.sleep_hold_rx();
                 self.set_sleep_gate(pm::SleepGate::Lost);
             }
         }
+    }
+
+    /// Starts an enclave that gated in a sleep that was refused, once its domain is off.
+    fn sleep_restart(&self) -> Result<()> {
+        if !pm::wait_off(&self.dev)? {
+            dev_warn!(self.dev, "the enclave gated, but its domain stayed on\n");
+            return Err(ETIMEDOUT);
+        }
+        dev_info!(self.dev, "the sleep was refused after the enclave gated: starting it again\n");
+        self.sleep_kick()
     }
 
     /// Starts a gated enclave and waits for the messages that say it's up.
@@ -1835,11 +1869,14 @@ impl SepData {
         };
         this.rng_survey_attempts.store(attempt, Relaxed);
         match next {
-            control::Survey::Registered => dev_info!(
-                this.dev,
-                "hwrng: registered after ready-phase survey (attempt {})\n",
-                attempt
-            ),
+            control::Survey::Registered => {
+                diag::hwrng(true);
+                dev_info!(
+                    this.dev,
+                    "hwrng: registered after ready-phase survey (attempt {})\n",
+                    attempt
+                )
+            }
             // Asleep, or holding back after a request that went unanswered:
             // this attempt did not ask the enclave anything.
             control::Survey::Held => Self::arm_settle(this),
@@ -1847,12 +1884,15 @@ impl SepData {
                 dev_warn!(this.dev, "hwrng: survey attempt {} failed ({:?}); retrying\n", attempt, e);
                 Self::arm_settle(this);
             }
-            control::Survey::GiveUp(e) => dev_err!(
-                this.dev,
-                "hwrng: survey failed after {} attempts ({:?})\n",
-                attempt,
-                e
-            ),
+            control::Survey::GiveUp(e) => {
+                diag::hwrng(false);
+                dev_err!(
+                    this.dev,
+                    "hwrng: survey failed after {} attempts ({:?})\n",
+                    attempt,
+                    e
+                )
+            }
         }
     }
 
@@ -1966,14 +2006,17 @@ impl SepData {
         match os_identity::select(hi, lo, dt::preboot_uuid) {
             os_identity::Selection::Explicit(uuid) => {
                 self.xarm.lock().os_uuid = Some(uuid);
+                diag::os_identity(diag::OsIdentity::Explicit);
                 dev_info!(self.dev, "xART: using explicit OS identity\n");
             }
             os_identity::Selection::Chosen(uuid) => {
                 self.xarm.lock().os_uuid = Some(uuid);
+                diag::os_identity(diag::OsIdentity::Chosen);
                 dev_info!(self.dev, "xART: using /chosen/apfs-preboot-uuid\n");
             }
             os_identity::Selection::Unavailable => {
                 self.xarm.lock().os_uuid = None;
+                diag::os_identity(diag::OsIdentity::Unavailable);
                 dev_warn!(self.dev, "xART: /chosen/apfs-preboot-uuid is unavailable\n");
             }
         }
@@ -2174,6 +2217,15 @@ impl SepData {
     }
 
     fn send_xarm_reply(&self, reply: &crate::xarm::XarmReply) {
+        // Each of these used to fail the enclave's request without a trace.
+        // Count them all and log the first, so a refusal is never silent.
+        if reply.status == xarm::STATUS_FAILED && diag::xarm_failed() == 1 {
+            dev_warn!(
+                self.dev,
+                "xART: answered a request (tag {:#04x}) with the failure status; diag/xarm_failures counts them\n",
+                reply.tag
+            );
+        }
         let msg = crate::xarm::encode_xarm_reply(reply);
         let _ = self.send_reply(msg);
     }
@@ -2802,6 +2854,7 @@ impl SepData {
 
         this.run_bringup();
         diag::bringup_ended();
+        diag::log_summary(&this.dev);
         this.finish_bringup();
         Self::arm_settle(this);
     }
@@ -2874,7 +2927,13 @@ impl SepData {
 
             proto::EP_BOOT => self.on_boot(msg),
 
-            ep => dev_info!(self.dev, "rx: unhandled endpoint {:#04x} (msg0 {:#018x})\n", ep, msg.msg0),
+            ep => {
+                // Counted in diag/unhandled_messages; logged the first few
+                // times only, so a chatty endpoint cannot flood the log.
+                if diag::unhandled() <= UNHANDLED_LOG_LIMIT {
+                    dev_info!(self.dev, "rx: unhandled endpoint {:#04x} (msg0 {:#018x})\n", ep, msg.msg0);
+                }
+            }
         }
     }
 
@@ -2912,7 +2971,13 @@ impl SepData {
             proto::DISCOVER_TYPE_DESCRIPTOR | proto::DISCOVER_TYPE_CONFIG => {
                 let _ = table.slot(f.param);
                 diag::endpoints(table.eps.len());
-                dev_info!(
+                if f.ty == proto::DISCOVER_TYPE_DESCRIPTOR {
+                    diag::endpoint(f.param, (msg.msg0 >> 32) as u32);
+                }
+                // One summary line follows at the end of the bring-up, and
+                // diag/endpoint_names lists them; keep the per-message trace
+                // at debug level.
+                dev_dbg!(
                     self.dev,
                     "discover: endpoint {:#04x} (type {}, msg0 {:#018x}); {} known\n",
                     f.param,
@@ -2921,7 +2986,7 @@ impl SepData {
                     table.eps.len()
                 );
             }
-            ty => dev_info!(self.dev, "discover: other type {} (msg0 {:#018x})\n", ty, msg.msg0),
+            ty => dev_dbg!(self.dev, "discover: other type {} (msg0 {:#018x})\n", ty, msg.msg0),
         }
     }
 

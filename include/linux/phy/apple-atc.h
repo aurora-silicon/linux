@@ -32,11 +32,21 @@ int apple_atcphy_sleep_prepare(struct phy *usb2_phy);
 int apple_atcphy_sleep_result(struct phy *usb2_phy);
 
 /*
+ * For a controller that may be unpowered after a sleep: power cycles it, as macOS's Off
+ * and cold start do. APPLE_ATCPHY_SLEEP_POWER_LOST once it's back, reset, or -ENODEV.
+ */
+int apple_atcphy_sleep_recover(struct phy *usb2_phy);
+
+/*
  * Ends a sleep that prepare took on, with the SuperSpeed side back as the mux wants it.
  * Without @kept the host was restarted; only a failure of the PHY's own then makes the
  * controller stop for later sleeps.
  */
 void apple_atcphy_sleep_finish(struct phy *usb2_phy, bool kept);
+
+/* The same from the PHY's work, for after a wake; the flush waits for it. */
+void apple_atcphy_sleep_finish_async(struct phy *usb2_phy, bool kept);
+void apple_atcphy_sleep_finish_flush(struct phy *usb2_phy);
 #else
 static inline int apple_atcphy_sleep_prepare(struct phy *usb2_phy)
 {
@@ -48,7 +58,20 @@ static inline int apple_atcphy_sleep_result(struct phy *usb2_phy)
 	return -EOPNOTSUPP;
 }
 
+static inline int apple_atcphy_sleep_recover(struct phy *usb2_phy)
+{
+	return -EOPNOTSUPP;
+}
+
 static inline void apple_atcphy_sleep_finish(struct phy *usb2_phy, bool kept)
+{
+}
+
+static inline void apple_atcphy_sleep_finish_async(struct phy *usb2_phy, bool kept)
+{
+}
+
+static inline void apple_atcphy_sleep_finish_flush(struct phy *usb2_phy)
 {
 }
 #endif

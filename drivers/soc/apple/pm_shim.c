@@ -27,10 +27,19 @@
 #include <linux/soc/apple/sleep.h>
 #include <linux/suspend.h>
 
+#include <asm/virt.h>
+
 #include "shim.h"
 
 /* The state word of a PMGR power domain, as pmgr-pwrstate has it. */
 #define SEP_PS_DEV_DISABLE	BIT(10)
+#define SEP_PS_ACTUAL		GENMASK(7, 4)
+
+/* Test only, one sleep: refuse it at its last step once the enclave has gated. */
+static bool sleep_refuse_after_gate;
+module_param(sleep_refuse_after_gate, bool, 0644);
+MODULE_PARM_DESC(sleep_refuse_after_gate,
+		 "Test only: refuse the next deep sleep after the enclave gated, to show it comes back");
 
 static void (*sep_pm_event)(bool entering);
 static int (*sep_pm_sleep)(void);
@@ -51,12 +60,14 @@ static int sep_pm_notify(struct notifier_block *nb, unsigned long action,
 	case PM_SUSPEND_PREPARE:
 	case PM_HIBERNATION_PREPARE:
 	case PM_RESTORE_PREPARE:
+		sep_diag_sleep(true);
 		event(true);
 		return NOTIFY_OK;
 	case PM_POST_SUSPEND:
 	case PM_POST_HIBERNATION:
 	case PM_POST_RESTORE:
 		event(false);
+		sep_diag_sleep(false);
 		return NOTIFY_OK;
 	default:
 		return NOTIFY_DONE;
@@ -87,23 +98,49 @@ static int sep_pm_domain(struct device *dev, struct regmap **regmap, u32 *offset
 }
 
 /*
- * Returns 0 once the enclave has gated itself, which shows as DEV_DISABLE, and
- * -ENOENT if there is no domain to read. The actual state is no guide: a running
- * enclave idles at 0 with auto-enable on.
+ * Returns 0 once the enclave has gated itself, 1 if the deadline expired, or a
+ * negative observation error (including -ENOENT if there is no domain to read).
+ * Keep a read's -ETIMEDOUT distinct from the polling deadline. DEV_DISABLE is
+ * the evidence: a running enclave idles at actual state 0 with auto-enable on.
  */
 int sep_pm_wait_gated(void *ptr, unsigned int timeout_ms)
 {
 	struct regmap *regmap;
 	u32 offset, val;
-	int ret;
+	int ret, poll_ret;
 
 	ret = sep_pm_domain(ptr, &regmap, &offset);
 	if (ret)
 		return ret;
 
-	return regmap_read_poll_timeout(regmap, offset, val,
-					val & SEP_PS_DEV_DISABLE,
-					1000, timeout_ms * USEC_PER_MSEC);
+	poll_ret = read_poll_timeout(regmap_read, ret, ret || (val & SEP_PS_DEV_DISABLE),
+				     1000, timeout_ms * USEC_PER_MSEC, false,
+				     regmap, offset, &val);
+	if (ret)
+		return ret;
+
+	return !!poll_ret;
+}
+
+/* As sep_pm_wait_gated(), until the gated domain also reads off. */
+int sep_pm_wait_off(void *ptr, unsigned int timeout_ms)
+{
+	struct regmap *regmap;
+	u32 offset, val;
+	int ret, poll_ret;
+
+	ret = sep_pm_domain(ptr, &regmap, &offset);
+	if (ret)
+		return ret;
+
+	poll_ret = read_poll_timeout(regmap_read, ret,
+				     ret || ((val & SEP_PS_DEV_DISABLE) && !(val & SEP_PS_ACTUAL)),
+				     1000, timeout_ms * USEC_PER_MSEC, false,
+				     regmap, offset, &val);
+	if (ret)
+		return ret;
+
+	return !!poll_ret;
 }
 
 int sep_pm_clear_dev_disable(void *ptr)
@@ -166,8 +203,8 @@ void sep_pm_dart_restore(void *ptr)
 
 /*
  * The sleep request, sent by the sleep driver as its very last refusal, with interrupts off:
- * an enclave that gated doesn't come back with its power kept, so a sleep refused anywhere
- * before must find it never told. The driver hands over the request and its answer's match
+ * an enclave that gated has to be started again, so a sleep refused anywhere before should
+ * find it never told. The driver hands over the request and its answer's match
  * at .suspend, with its receive interrupt held.
  */
 static struct sep_pm_commit {
@@ -265,6 +302,10 @@ out:
 		apple_mbox_set_recv_enabled(c->mbox, false);
 	c->gate_ret = readl_poll_timeout_atomic(c->ps, c->state, c->state & SEP_PS_DEV_DISABLE,
 						SEP_PM_POLL_US, SEP_PM_TIMEOUT_US);
+	if (!c->gate_ret && READ_ONCE(sleep_refuse_after_gate)) {
+		WRITE_ONCE(sleep_refuse_after_gate, false);
+		return -EAGAIN;
+	}
 
 	return c->gate_ret;
 }
@@ -283,7 +324,9 @@ int sep_pm_commit_prepare(void *ptr, void *mbox, u64 msg0, u32 msg1, u64 reply, 
 	u32 offset;
 	int ret;
 
-	if (!READ_ONCE(sep_pm_suspending))
+	/* Check capability before resources that legacy providers need not have. */
+	if (!READ_ONCE(sep_pm_suspending) || !IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) ||
+	    !is_kernel_in_hyp_mode())
 		return -EOPNOTSUPP;
 	if (c->registered)
 		return -EBUSY;
@@ -385,6 +428,8 @@ static int __maybe_unused sep_pm_suspend_noirq(struct device *dev)
 		return 0;
 
 	ret = sep_pm_wait_gated(dev, 5000);
+	if (ret > 0)
+		ret = -ETIMEDOUT;
 	if (ret == -ENOENT)
 		return 0;
 	if (ret) {

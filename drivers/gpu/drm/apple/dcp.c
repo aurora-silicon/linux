@@ -669,6 +669,63 @@ void dcp_drm_crtc_error(struct apple_crtc *crtc,
 	spin_unlock_irqrestore(&drm->event_lock, flags);
 }
 
+/*
+ * The flip of the commit whose flip_done is @flip_done never completed: send
+ * its still pending event as failed. Only that commit's event is sent; a newer
+ * commit's stays for its own swap.
+ *
+ * The swap started last is that flip's. Its displaced framebuffers are
+ * unarmed, as the swap watchdog does, so that the next swap arms them and its
+ * completion releases them. Its completion may still come, after the next
+ * commit installed its event: firmware that does not track its presents
+ * ignores it (dcp_swap_lost()), so that it does not retire the newer flip.
+ */
+void dcp_drm_crtc_flip_lost(struct apple_crtc *crtc,
+			    struct completion *flip_done, int error)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(crtc->dcp);
+	unsigned long flags;
+	bool lost = false;
+	u32 swap_id = 0;
+
+	spin_lock_irqsave(&crtc->base.dev->event_lock, flags);
+	if (crtc->event && crtc->event->base.completion == flip_done) {
+		dcp_failed_page_flip(crtc, crtc->event, error);
+		crtc->event = NULL;
+		swap_id = READ_ONCE(dcp->started_swap_id);
+		dcp->lost_swap_id = swap_id;
+		dcp->swap_lost = true;
+		lost = true;
+	}
+	spin_unlock_irqrestore(&crtc->base.dev->event_lock, flags);
+
+	if (lost)
+		dcp_unarm_retained_framebuffers(dcp, swap_id);
+}
+
+/*
+ * Is @swap_id the swap whose flip dcp_drm_crtc_flip_lost() gave up on? On
+ * firmware that does not track its presents, its completion would retire
+ * whichever flip is pending; it is ignored instead. Swaps complete in order,
+ * so once another swap completed, the lost one will not.
+ */
+bool dcp_swap_lost(struct apple_dcp *dcp, u32 swap_id)
+{
+	unsigned long flags;
+	bool lost;
+
+	spin_lock_irqsave(&dcp->crtc->base.dev->event_lock, flags);
+	lost = dcp->swap_lost && dcp->lost_swap_id == swap_id;
+	dcp->swap_lost = false;
+	spin_unlock_irqrestore(&dcp->crtc->base.dev->event_lock, flags);
+
+	if (lost)
+		dev_warn_ratelimited(dcp->dev,
+				     "completion for lost present %u ignored\n",
+				     swap_id);
+	return lost;
+}
+
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now)
 {
 	unsigned long flags;
@@ -4476,7 +4533,7 @@ void dcp_poweroff(struct platform_device *pdev)
 	cancel_delayed_work(&dcp->swap_watchdog_wq);
 
 	/*
-	 * Internal H17P DPMS is a brightness present, never a pipe stop. On T8140 the
+	 * Internal H17P DPMS is a brightness present, never a pipe stop. With hw.s2r the
 	 * display then powers off as well, after the backlight.
 	 */
 	if (dcp_uses_soft_dpms(dcp)) {
@@ -5573,8 +5630,7 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	if (ret)
 		goto err_piodma;
 	/* After a warm restart its log counters need echoing, or it refuses its next idle. */
-	if (of_device_is_compatible(dev->of_node, "apple,t8140-dcp") ||
-	    of_device_is_compatible(dev->of_node, "apple,t8140-dcpext"))
+	if (dcp->hw.s2r || dcp->hw.s2r_ext)
 		apple_rtkit_set_oslog_echo(dcp->rtk, true);
 	ret = dcp_secure_port_init(dcp);
 	if (ret)
@@ -6718,10 +6774,13 @@ static void dcp_drain_for_sleep(struct apple_dcp *dcp)
  */
 static void dcp_hold_for_sleep(struct apple_dcp *dcp)
 {
-	/* A failed component bind leaves no coprocessor session to hold. */
+	/*
+	 * A failed component bind leaves no coprocessor session to hold. Firmware that DPMS
+	 * stopped sends nothing, and its presentation stays paused until DPMS restarts it.
+	 */
 	if (IS_ERR_OR_NULL(dcp->rtk) ||
 	    !dcp_uses_soft_dpms(dcp) || !dcp_presents_nits(dcp) ||
-	    READ_ONCE(dcp->crashed))
+	    READ_ONCE(dcp->crashed) || READ_ONCE(dcp->s2r_fw_down))
 		return;
 
 	iomfb_pause_presentation(dcp, true);
@@ -6836,8 +6895,8 @@ static void dcp_platform_complete(struct device *dev)
 }
 
 /*
- * T8140 suspend-to-RAM: the sleep engine waits for the DCP's domain to be off, so
- * the firmware has to stop first. Measured from macOS, in order:
+ * Suspend-to-RAM with hw.s2r: the sleep engine waits for the DCP's domain to be off, so
+ * the firmware has to stop first. Measured from macOS on T8140, in order:
  *
  *  1. A414(0), A478 x2, A476(1), A478, A412, A473(0).
  *  2. D572(0) from the firmware: the display DART's streams go off.
@@ -6907,8 +6966,7 @@ void dcp_s2r_dart_power(struct apple_dcp *dcp, u32 on)
 
 static bool dcp_s2r_capable(struct apple_dcp *dcp)
 {
-	return dcp->fw_compat == DCP_FIRMWARE_H17P &&
-	       of_device_is_compatible(dcp->dev->of_node, "apple,t8140-dcp");
+	return dcp->fw_compat == DCP_FIRMWARE_H17P && dcp->hw.s2r;
 }
 
 static void dcp_s2r_cpu_stop(struct apple_dcp *dcp)
@@ -7098,8 +7156,7 @@ static int dcp_s2r_stop_firmware(struct apple_dcp *dcp)
  */
 static bool dcp_s2r_ext_capable(struct apple_dcp *dcp)
 {
-	return dcp->fw_compat == DCP_FIRMWARE_H17P &&
-	       of_device_is_compatible(dcp->dev->of_node, "apple,t8140-dcpext");
+	return dcp->fw_compat == DCP_FIRMWARE_H17P && dcp->hw.s2r_ext;
 }
 
 /*
@@ -7481,6 +7538,19 @@ out:
 }
 
 /*
+ * A firmware stopped while crashed is about to start over: forget the calls and the
+ * transaction the old one left unanswered, and let the new one's messages through. A failed
+ * start marks it crashed again.
+ */
+static void dcp_s2r_forget_crash(struct apple_dcp *dcp)
+{
+	if (!READ_ONCE(dcp->crashed))
+		return;
+	iomfb_reset_transport(dcp);
+	WRITE_ONCE(dcp->crashed, false);
+}
+
+/*
  * DCPEXT back after a real sleep, the same way in every macOS wake measured: its domains,
  * its DART's streams, and a warm restart, with no secure port and no display-on call. After
  * its own power cycle the start is the same, with its display DART lit again.
@@ -7490,6 +7560,7 @@ static int dcp_s2r_ext_start(struct apple_dcp *dcp, bool cycled)
 	void __iomem *control = dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL;
 	int ret;
 
+	dcp_s2r_forget_crash(dcp);
 	if (!dcp->s2r_dcp_dart)
 		return -ENODEV;
 	ret = apple_dart_gapf_ready(dcp->s2r_dcp_dart);
@@ -7632,6 +7703,7 @@ static int dcp_s2r_warm_restart(struct apple_dcp *dcp)
 {
 	int ret;
 
+	dcp_s2r_forget_crash(dcp);
 	ret = dcp_s2r_domains_on(dcp);
 	if (ret)
 		return ret;
@@ -7865,7 +7937,7 @@ static void dcp_s2r_restart_failed_stop(struct apple_dcp *dcp)
 }
 
 /*
- * DPMS on the internal T8140 panel as macOS does a display sleep: the backlight to 0,
+ * DPMS on an internal panel with hw.s2r as macOS does a display sleep: the backlight to 0,
  * then the firmware stopped and the display domains off, and the reverse on wake. Not
  * during a system sleep: that path stops the firmware itself.
  */
@@ -7971,7 +8043,9 @@ static int dcp_platform_suspend(struct device *dev)
 
 	/*
 	 * T8132: setPowerState powers the display down; the coprocessor keeps
-	 * running and its power domains stay on, as below.
+	 * running and its power domains stay on, as below, unless the internal
+	 * display is blanked with appledrm.power_gate_ms set: then the
+	 * coprocessor and its domains are powered down too (iomfb_m4_suspend()).
 	 */
 	if (iomfb_is_m4(dcp)) {
 		int ret = iomfb_m4_suspend(dcp);
@@ -8134,6 +8208,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8140 = {
 	.firmware_display_windows = 5,
 	.firmware_scratch = 0x20000,
 	.firmware_request = 0x68000,
+	.s2r = true,
 };
 
 /* Separate from the established internal-panel H17P profile. */
@@ -8147,6 +8222,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8140_external = {
 	/* Native PMGR BWR agent 2 and boost agent 3 for DISPEXT0. */
 	.firmware_scratch = 0x28000,
 	.firmware_request = 0x70000,
+	.s2r_ext = true,
 };
 
 /*

@@ -467,6 +467,10 @@ struct Active {
     observed_at: Option<u64>,
     failure_deferred: bool,
     qos_pending: bool,
+    /// Spared because it came back unexecuted after a recovery ([`Queue::classify_unexecuted`]),
+    /// not by the recovery's own attribution, or a replay of spared work, which runs again from
+    /// the start. A later fault report on the queue makes it guilty.
+    spared_as_dropped: bool,
 }
 struct Previous<B = Binding, C = Arc<Context>> {
     binding: Option<B>,
@@ -698,6 +702,24 @@ impl Queue {
         {
             self.fault_stamp = Some(stamp);
         }
+        // The report can arrive after the queue's unexecuted commands were spared as dropped by
+        // a recovery, or while replays of spared work run: the failed command is among them.
+        // They are guilty, as without the recovery: the VM fails, and the queue is neither
+        // replayed nor returned to service.
+        let mut guilty = None;
+        for active in self.active.iter_mut().filter(|active| active.spared_as_dropped) {
+            active.spared_as_dropped = false;
+            if !active.packet.completion.signalled() {
+                active.packet.completion.classify(recovery::Class::Guilty);
+                guilty.get_or_insert_with(|| active.packet.completion.status().clone());
+            }
+        }
+        if let Some(status) = guilty {
+            self.spared_quarantine = false;
+            if self.terminal.is_none() {
+                self.terminal = Some((status, ENODATA));
+            }
+        }
     }
 
     /// The firmware failed a command of this quarantined queue, and the queue still waits for
@@ -765,9 +787,13 @@ impl Queue {
                     && active.packet.command.long_job()
             })
     }
-    /// Quarantines without a pending witness no longer describe live pipe order.
+    /// Quarantines without a pending witness no longer describe live pipe order. Spared work
+    /// whose fences still wait (`spared_deferred`) does, whether or not every entry holds a
+    /// ticket: it holds the GPU until the firmware drains it or this queue's watchdog settles it
+    /// ([`Self::timeout`]), so other VMs' watchdogs see it as a failed blocker and defer to it
+    /// within their bounded renewals instead of failing their own work at once.
     pub(crate) fn timeout_head(&self) -> Option<crate::g17::timeout::Head> {
-        if self.quarantined && !self.awaiting_witness {
+        if self.quarantined && !self.awaiting_witness && !self.spared_deferred {
             return None;
         }
         self.active.front().map(|active| crate::g17::timeout::Head {
@@ -978,6 +1004,19 @@ impl Queue {
         self.failure_status_pending = false;
         self.awaiting_witness =
             self.active.len != 0 && self.active.iter().all(|a| a.ticket.is_some());
+        // Spared work waits for its retirement witness to replay or fail. An entry without a
+        // ticket never gives one (release_witnessed() validates every ticket), and an
+        // unpublished entry's own watchdog does nothing, so nothing would bound that wait. Fail
+        // it now instead: ENODATA, which stays out of the VM status.
+        if self.spared_deferred && !self.awaiting_witness {
+            for active in self.active.iter_mut() {
+                if !active.failure_deferred {
+                    defer(Deferred::FailedOwned(active.packet.completion.clone(), ENODATA))?;
+                    active.failure_deferred = true;
+                }
+            }
+            self.spared_deferred = false;
+        }
         Ok(terminal)
     }
 
@@ -999,6 +1038,7 @@ impl Queue {
         let mut oldest = true;
         while let Some(front) = self.active.front() {
             let mut restart = None;
+            let mut crossed = false;
             let result = (|| {
                 let ticket = front.ticket.ok_or(EIO)?;
                 self.valid_ticket(front, &ticket)?;
@@ -1006,6 +1046,7 @@ impl Queue {
                     return Err(EAGAIN);
                 }
                 let recordless = if epoch != ticket.epoch {
+                    crossed = true;
                     Recordless::CrossedRecovery
                 } else if masks.is_none() || (finished_before && oldest) {
                     Recordless::Allowed
@@ -1097,12 +1138,39 @@ impl Queue {
                     break;
                 }
                 Err(error) => {
+                    if error == ENODATA {
+                        self.classify_unexecuted(crossed);
+                    }
                     self.terminal = self.quarantine(error, defer)?.map(|status| (status, error));
                     return Ok(());
                 }
             }
         }
         Ok(())
+    }
+
+    /// The front command came back unexecuted (ENODATA from [`retirement::poll`]), and every
+    /// later command of the queue is ordered behind it, so none of them ran either. After a
+    /// recovery (`crossed`) the recovery dropped them: they cannot have faulted the GPU and are
+    /// spared, as the render groups a restart drops are, so they fail or replay without
+    /// poisoning their VM. Without a recovery in between, or once the firmware reported a fault
+    /// on this queue ([`Self::note_fault`]), the zero-duration record is the firmware's report
+    /// of the queue's own failed command: the work is guilty and fails its VM as before. Work a
+    /// recovery already classified keeps its class.
+    fn classify_unexecuted(&mut self, crossed: bool) {
+        let dropped = crossed && self.fault_stamp.is_none();
+        for active in self.active.iter_mut() {
+            let completion = &active.packet.completion;
+            if completion.spared() || completion.guilty() {
+                continue;
+            }
+            if dropped {
+                completion.classify(recovery::Class::Spared);
+                active.spared_as_dropped = true;
+            } else {
+                completion.classify(recovery::Class::Guilty);
+            }
+        }
     }
 
     /// Exact terminal witness releases command pins, not installed graph ownership. Spared
@@ -1952,6 +2020,11 @@ impl Queue {
 
     /// A watchdog settles spared, deferred waiters without changing their VM status.
     /// Fully ticketed spared work can still return this queue after its drain witness.
+    ///
+    /// Spared, deferred work is work a recovery dropped before it ran (the quarantine's
+    /// ENODATA) whose witness did not come before this queue's job watchdog expired: it fails
+    /// with ENODATA too. ETIMEDOUT would reach the client as a lost device (`fail_while_owned`
+    /// reports every error but ENODATA and ECANCELED), for work it never got to run.
     pub(crate) fn timeout(
         &mut self,
         defer: &mut impl FnMut(Deferred) -> Result,
@@ -1967,7 +2040,7 @@ impl Queue {
                 if !active.failure_deferred {
                     defer(Deferred::FailedOwned(
                         active.packet.completion.clone(),
-                        ETIMEDOUT,
+                        ENODATA,
                     ))?;
                     active.failure_deferred = true;
                 }
@@ -2328,6 +2401,8 @@ impl Queue {
                 observed_at: None,
                 failure_deferred: false,
                 qos_pending: false,
+                // A replay keeps its spared class: its own fault must still make it guilty.
+                spared_as_dropped: packet.completion.spared(),
             })
             .map_err(|_| EBUSY)?;
         self.retirement_ready = false;
