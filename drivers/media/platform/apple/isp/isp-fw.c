@@ -475,7 +475,13 @@ static void isp_firmware_shutdown_stage1(struct apple_isp *isp)
 		dev_warn(isp->dev, "coproc not in WFI before power-down (status 0x%x)\n",
 			 val);
 
-	isp_coproc_write32(isp, isp_coproc_control(isp), 0x0);
+	/*
+	 * macOS powers T8140's ISP off from WFI with the run bit still set. The sleep
+	 * engine's own restore of the ISP in a wake that kept DRAM up depends on it:
+	 * with the bit cleared that wake stalls until the SoC's watchdog resets it.
+	 */
+	if (isp->hw->gen != ISP_GEN_T8140)
+		isp_coproc_write32(isp, isp_coproc_control(isp), 0x0);
 
 	if (started) {
 		/* The request bit alone asks for it, and reads back once done */
@@ -1299,7 +1305,8 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
 	if (err) {
 		dev_err(isp->dev, "failed to boot firmware: %d\n", err);
 		pm_runtime_put_sync(isp->dev);
-		if (isp->hw->resident_fw)
+		/* Firmware that starts again can be tried again at the next open. */
+		if (isp->hw->resident_fw && !isp->hw->fw_restart)
 			isp->fw_state = ISP_FW_DEAD;
 		return err;
 	}
@@ -1326,6 +1333,14 @@ void apple_isp_firmware_shutdown(struct apple_isp *isp)
 	if (isp->fw_state == ISP_FW_RUNNING)
 		synchronize_irq(isp->irq);
 	isp_free_released_surfaces(isp);
+
+	/*
+	 * Firmware that starts again goes down with the stream, as macOS's camera close
+	 * takes it, and boots again for the next one. A system sleep then finds it off:
+	 * stopped on the way into a sleep that keeps DRAM up, the SoC doesn't wake.
+	 */
+	if (isp->hw->fw_restart)
+		apple_isp_firmware_halt(isp);
 }
 
 /* Stop the firmware; resident firmware without hw->fw_restart stays down. */

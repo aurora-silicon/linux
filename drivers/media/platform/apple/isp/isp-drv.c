@@ -969,6 +969,8 @@ static const struct apple_isp_hw apple_isp_hw_t8140 = {
 	.capture_meta_size = ISP_CAPTURE_META_SIZE_T8140,
 	.resident_fw = true,
 	.fw_restart = true,
+	/* As on macOS, the firmware first starts when a client opens the camera. */
+	.deferred_start = true,
 	.meta_exposure = true,
 };
 

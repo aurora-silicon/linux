@@ -587,11 +587,14 @@ int apple_isp_detect_camera(struct apple_isp *isp)
 
 	err = isp_detect_camera(isp);
 
-	/* Resident firmware stays up; the channel is set up per stream. */
+	/*
+	 * Resident firmware stays up, the channel set up per stream, unless it starts
+	 * again: then it's off until the first stream, as on macOS.
+	 */
 	if (isp->hw->resident_fw) {
-		if (err)
+		if (err || isp->hw->fw_restart)
 			apple_isp_firmware_halt(isp);
-		else
+		if (!err)
 			isp->camera_detected = true;
 		return err;
 	}
