@@ -105,7 +105,8 @@ def main():
     for board, soc, pmp, report in (
             ('t8112-j413', 't8112', 0x23b500000, 0x23b3c0000),
             ('t6000-j316s', 't6000', 0x28e700000, 0x28e3c0000)):
-        for trial in (False, True):
+        # The J316s ships with PMP on, so its source has no PMP-off profile.
+        for trial in ((True,) if board == 't6000-j316s' else (False, True)):
             check(args.tree.resolve(), args.output, args.dtc, board, soc, pmp, report, trial)
         if soc == 't8112':
             check(args.tree.resolve(), args.output, args.dtc, board, soc, pmp, report, True, True)

@@ -53,6 +53,7 @@ static void *kunit_kzalloc(struct kunit *test, size_t len, int flags)
 #define KUNIT_EXPECT_TRUE(t, x) do { (void)(t); assert(x); } while (0)
 #define KUNIT_EXPECT_FALSE(t, x) KUNIT_EXPECT_TRUE(t, !(x))
 #define KUNIT_ASSERT_NOT_NULL(t, x) KUNIT_EXPECT_TRUE(t, (x) != NULL)
+#define KUNIT_ASSERT_TRUE(t, x) KUNIT_EXPECT_TRUE(t, x)
 #define KUNIT_EXPECT_EQ(t, x, y) KUNIT_EXPECT_TRUE(t, (x) == (y))
 struct kunit_case { void (*run)(struct kunit *); const char *name; };
 #define KUNIT_CASE(f) {f, #f}
