@@ -834,6 +834,10 @@ static int ane_fw_genpd_event(struct notifier_block *nb, unsigned long action, v
  * the engine down, power cycle ANE_SYS through the PMGR (which clears a
  * latched power-on outside system sleep) and boot once more.
  */
+static unsigned int ane4_fail_resume_every;
+module_param(ane4_fail_resume_every, uint, 0644);
+static unsigned int ane4_resumes;
+
 static int ane_fw_resume_retry(struct ane_fw_backend *b, int error)
 {
 	struct device_node *np;
@@ -888,6 +892,11 @@ static void ane_fw_sleep_resume(struct ane_fw_backend *b)
 		ret = b->powered ? ane_fw_power_down(b) : 0;
 		if (!ret)
 			ret = ane_fw_cold_cycle_boot(b);
+	}
+	/* TEST ONLY (ANE4): fail every Nth resume once, after the boot, to drive the retry path. */
+	if (!ret && ane4_fail_resume_every && ++ane4_resumes % ane4_fail_resume_every == 0) {
+		dev_warn(&b->pdev->dev, "H17 ANE: ANE4 TEST injected resume failure\n");
+		ret = -ETIMEDOUT;
 	}
 	if (ret)
 		ret = ane_fw_resume_retry(b, ret);
