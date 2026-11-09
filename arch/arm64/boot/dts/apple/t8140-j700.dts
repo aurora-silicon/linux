@@ -595,6 +595,11 @@
  * rather than by a GPIO; the rail words are given in power-on order.  The
  * calibration file is per-device factory data and is not redistributable.
  */
+/* No ADT device behind spi3; the controller probes with no children. */
+&spi3 {
+	status = "okay";
+};
+
 &spi2 {
 	status = "okay";
 
