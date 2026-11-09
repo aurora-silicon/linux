@@ -135,7 +135,6 @@
 		clocks = <&peripheral_clocks 356>;
 		iommus = <&scaler0_dart 0>, <&scaler0_dart 1>;
 		resets = <&ps_msr0>;
-		status = "disabled";
 	};
 
 	scaler0_dart: iommu@40b200000 {
@@ -145,7 +144,6 @@
 		interrupts = <AIC_IRQ 0 1086 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_msr0>;
 		#iommu-cells = <1>;
-		status = "disabled";
 	};
 
 	ave0_dma: dma-controller@40d020000 {
