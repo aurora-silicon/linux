@@ -571,6 +571,8 @@ static int apple_pmp_report_wait_t6030_14(struct device *supplier, unsigned int 
 /* The native 25G83 PMP starts through its supplier topology, after requests
  * are seeded. Its report is pinned against removal while readiness is read.
  */
+static int apple_pmp_report_dvfs_prepare(struct apple_pmp_report *rep);
+
 int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int timeout_ms)
 {
 	struct device_node *np = of_parse_phandle(supplier->of_node, "apple,pmp-report", 0);
@@ -579,13 +581,16 @@ int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int t
 	u64 status;
 	bool t8132 = apple_t8132_firmware_path() &&
 		of_device_is_compatible(supplier->of_node, "apple,t8132-pmp-v2");
+	bool t8112 = of_device_is_compatible(supplier->of_node, "apple,t8112-pmp-v2");
+	bool running;
 	int ret;
 
 	/* A declared report always takes the existing native25 path below. */
 	if (!np && !of_property_present(supplier->of_node, "apple,pmp-report"))
 		return apple_pmp_report_wait_t6030_14(supplier, timeout_ms);
-	if (!np || !of_device_is_compatible(np, t8132 ?
-		"apple,t8132-pmp-v2-report" : "apple,j613-25g83-pmp-report")) {
+	if (!np || !of_device_is_compatible(np, t8112 ? "apple,t8112-pmp-v2-report" :
+					     t8132 ? "apple,t8132-pmp-v2-report" :
+					     "apple,j613-25g83-pmp-report")) {
 		of_node_put(np);
 		return -ENODEV;
 	}
@@ -599,12 +604,23 @@ int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int t
 		return -EPROBE_DEFER;
 	}
 	rep = device_is_bound(&pdev->dev) ? platform_get_drvdata(pdev) : NULL;
-	if (!rep)
+	if (!rep) {
 		ret = -EPROBE_DEFER;
-	else
+	} else if (t8112) {
+		/*
+		 * T8112 constraint commands need a running report whose
+		 * SOC-DEV-DVFS range is ready (entry 8). Both are sticky once
+		 * reached, so later callers return at once.
+		 */
+		ret = read_poll_timeout(apple_pmp_report_running, running, running,
+					1000, timeout_ms * 1000, false, rep);
+		if (!ret)
+			ret = apple_pmp_report_dvfs_prepare(rep);
+	} else {
 		ret = readq_poll_timeout(rep->base + rep->offsets->status, status,
 					t8132 ? (status & PMP_REPORT_READY) : status == PMP_REPORT_READY,
 					1000, timeout_ms * 1000);
+	}
 	device_unlock(&pdev->dev);
 	put_device(&pdev->dev);
 	return ret;
