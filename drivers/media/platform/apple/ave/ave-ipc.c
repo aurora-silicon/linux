@@ -684,7 +684,8 @@ int ave_ipc_submit(struct ave_dev *ave, unsigned int buf, size_t len,
 	    (reply && op >= ARRAY_SIZE(ave->want)))
 		return -EINVAL;
 
-	if (!abi->transport->boot_config && reply && ave->want[op])
+	if (!abi->transport->boot_config && reply && ave->want[op] &&
+	    op != AVE_OP_COMPLETE)
 		return -EBUSY;
 	if (abi->transport->sync_host_clock) {
 		created = div_u64(ktime_get_ns(), NSEC_PER_USEC);

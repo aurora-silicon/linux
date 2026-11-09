@@ -180,6 +180,8 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	     ctx->hevc_profile == V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10) !=
 	    (p->sample_bytes == 2))
 		return -EINVAL;
+	if (ctx->ave->layout->kind == AVE_LAYOUT_6070 && p->sample_bytes != 1)
+		return -EOPNOTSUPP;
 	if (p->sample_bytes == 2) {
 		/* Only the 9003 layout's Main 10 fields are mapped. */
 		if (ctx->ave->layout->counted)
@@ -204,6 +206,8 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	 * 720p on the 9003 layout only; H.264 does not get faster from it (on
 	 * macOS either).
 	 */
+	if (ctx->ave->layout->kind == AVE_LAYOUT_6070 && ctx->prioritize_speed)
+		return -EOPNOTSUPP;
 	p->speed = ctx->prioritize_speed && p->codec == AVE_CODEC_HEVC &&
 		   !ctx->ave->layout->counted &&
 		   p->width * p->height > 1280 * 720;
@@ -231,6 +235,8 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 		p->limit_bytes = (ctx->bitrate_peak ? max(ctx->bitrate_peak, ctx->bitrate) :
 				  2ULL * ctx->bitrate) / 8;
 	}
+	if (ctx->ave->layout->kind == AVE_LAYOUT_6070 && p->rc_mode != AVE_RC_CQ)
+		return -EOPNOTSUPP;
 
 	level = ave_pick_level(p, p->codec == AVE_CODEC_H264 ? ctx->h264_level :
 							       ctx->hevc_level);
@@ -274,7 +280,8 @@ struct ave_buf_req {
 };
 
 #define AVE_MAX_BUF_REQS \
-	(1 + 6 * AVE_MAX_REFS + 6 + 2 * AVE_TILE_BUFS + 2 + 4 * AVE_MAX_SLOTS)
+	(1 + 6 * AVE_MAX_REFS + 3 + 4 * AVE_NEIGHBOUR_SETS + \
+	 2 * AVE_ENTROPY_SETS * AVE_TILE_BUFS + 2 + 4 * AVE_MAX_SLOTS)
 
 static int ave_buf_req_cmp(const void *a, const void *b)
 {
@@ -303,11 +310,14 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 	const struct ave_params *p = &sess->p;
 	const struct ave_fw_layout *fw = ave->layout;
 	bool hevc = p->codec == AVE_CODEC_HEVC;
+	bool fw6070 = fw->kind == AVE_LAYOUT_6070;
+	unsigned int entropy_sets = fw6070 ? AVE_ENTROPY_SETS : 1;
+	unsigned int neighbour_sets = fw6070 ? AVE_NEIGHBOUR_SETS : 1;
 	u32 w = p->width, h = p->height;
 	u32 w16 = DIV_ROUND_UP(w, 16), w32 = DIV_ROUND_UP(w, 32);
 	u32 h32 = DIV_ROUND_UP(h, 32), h64 = DIV_ROUND_UP(h, 64);
 	const unsigned long nomap = DMA_ATTR_NO_KERNEL_MAPPING;
-	size_t ref_a, ref_b, ref_c, ref_d, tile, mapped = 0;
+	size_t ref_a, ref_b, ref_c, ref_d, row_a, row_b, tile, mapped = 0;
 	struct ave_buf_req *r;
 	unsigned int n = 0;
 	int ret = 0;
@@ -315,6 +325,14 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 	r = kcalloc(AVE_MAX_BUF_REQS, sizeof(*r), GFP_KERNEL);
 	if (!r)
 		return -ENOMEM;
+	sess->codec_state_bytes = fw->codec_state_bytes[p->codec - 1];
+	if (sess->codec_state_bytes) {
+		sess->codec_state = kzalloc(sess->codec_state_bytes, GFP_KERNEL);
+		if (!sess->codec_state) {
+			kfree(r);
+			return -ENOMEM;
+		}
+	}
 
 	ref_a = ALIGN(w, 32) * ALIGN(h + 16, 32);
 	if (p->bit_depth == 10)
@@ -323,6 +341,10 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 	ref_c = ave_lfs_ref_size(w, h, hevc, ave->variant->lfs_ref_scale);
 	ref_d = ALIGN(hevc ? 64 * w32 * h32 : 128 * p->mbs, SZ_16K);
 	tile = hevc ? 2304 * w32 * h64 : ALIGN(w, 16) * ALIGN(h, 64);
+	row_a = ALIGN(hevc ? max_t(u32, 0x180 * DIV_ROUND_UP(w, 64), SZ_16K) :
+				   256 * w16,
+		      SZ_16K);
+	row_b = ALIGN(hevc ? 768 * w32 : 1024 * w16, SZ_16K);
 	if (p->bit_depth == 10)
 		tile *= 2;
 
@@ -337,20 +359,27 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 			ave_req(r, &n, &sess->ref_f[i], ref_b / 4, 0, nomap);
 		}
 	}
-	ave_req(r, &n, &sess->mb, ALIGN(82 * p->mbs, SZ_16K), 0, nomap);
+	if (!fw6070)
+		ave_req(r, &n, &sess->mb, ALIGN(82 * p->mbs, SZ_16K), 0,
+			nomap);
 	if (fw->counted && p->rc_mode == 3)
 		for (unsigned int i = 0; i < 2; i++)
 			ave_req(r, &n, &sess->mb_extra[i], ALIGN(82 * p->mbs, SZ_16K), 0, nomap);
 	/* HEVC: one 0x180-byte neighbour record per 64 pixels, at least 16 KiB. */
-	ave_req(r, &n, &sess->row_a,
-		ALIGN(hevc ? max_t(u32, 0x180 * DIV_ROUND_UP(w, 64), SZ_16K) : 256 * w16, SZ_16K),
-		0, nomap);
-	ave_req(r, &n, &sess->row_b, ALIGN(hevc ? 768 * w32 : 1024 * w16, SZ_16K), 0, nomap);
-	ave_req(r, &n, &sess->fixed, SZ_16K, 0, nomap);
-	for (unsigned int i = 0; i < (hevc ? 4 : AVE_TILE_BUFS); i++) {
-		ave_req(r, &n, &sess->tile[i], tile, 0, nomap);
-		ave_req(r, &n, &sess->tile_aux[i], ALIGN(h, 128), 0, nomap);
+	for (unsigned int set = 0; set < neighbour_sets; set++) {
+		ave_req(r, &n, &sess->row_a[set], row_a, 0, nomap);
+		ave_req(r, &n, &sess->row_b[set], row_b, 0, nomap);
+		ave_req(r, &n, &sess->fixed[set], SZ_16K, 0, nomap);
+		if (fw6070)
+			ave_req(r, &n, &sess->neighbour_fw[set], SZ_16K, 0,
+				nomap);
 	}
+	for (unsigned int set = 0; set < entropy_sets; set++)
+		for (unsigned int i = 0; i < (hevc ? 4 : AVE_TILE_BUFS); i++) {
+			ave_req(r, &n, &sess->tile[set][i], tile, 0, nomap);
+			ave_req(r, &n, &sess->tile_aux[set][i], ALIGN(h, 128), 0,
+				nomap);
+		}
 	if (hevc)
 		for (unsigned int i = 0; i < 2; i++)
 			ave_req(r, &n, &sess->hevc_extra[i], ALIGN(w * h32, SZ_16K), 0, nomap);
@@ -363,6 +392,10 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 			if (!hevc && p->rc_mode != 3)
 				ave_req(r, &n, &sess->slot[s].aux,
 					ALIGN(432 * p->mbs, SZ_16K), 0, nomap);
+		} else if (fw6070) {
+			ave_req(r, &n, &sess->slot[s].aux,
+				hevc ? AVE_SHDR_BYTES : ALIGN(82 * p->mbs, SZ_16K),
+				0, hevc ? 0 : nomap);
 		} else {
 			ave_req(r, &n, &sess->slot[s].aux,
 				hevc ? AVE_SHDR_BYTES : ALIGN(432 * p->mbs, SZ_16K), 0,
@@ -399,13 +432,17 @@ static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
 	ave_free(ave, &sess->mb);
 	for (unsigned int i = 0; i < 2; i++)
 		ave_free(ave, &sess->mb_extra[i]);
-	ave_free(ave, &sess->row_a);
-	ave_free(ave, &sess->row_b);
-	ave_free(ave, &sess->fixed);
-	for (unsigned int i = 0; i < AVE_TILE_BUFS; i++) {
-		ave_free(ave, &sess->tile[i]);
-		ave_free(ave, &sess->tile_aux[i]);
+	for (unsigned int set = 0; set < AVE_NEIGHBOUR_SETS; set++) {
+		ave_free(ave, &sess->row_a[set]);
+		ave_free(ave, &sess->row_b[set]);
+		ave_free(ave, &sess->fixed[set]);
+		ave_free(ave, &sess->neighbour_fw[set]);
 	}
+	for (unsigned int set = 0; set < AVE_ENTROPY_SETS; set++)
+		for (unsigned int i = 0; i < AVE_TILE_BUFS; i++) {
+			ave_free(ave, &sess->tile[set][i]);
+			ave_free(ave, &sess->tile_aux[set][i]);
+		}
 	for (unsigned int i = 0; i < 2; i++)
 		ave_free(ave, &sess->hevc_extra[i]);
 	for (unsigned int s = 0; s < AVE_MAX_SLOTS; s++) {
@@ -417,6 +454,9 @@ static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
 		ave_vb2_put(sess->slot[s].input_mem);
 		sess->slot[s].input_mem = NULL;
 	}
+	kfree(sess->codec_state);
+	sess->codec_state = NULL;
+	sess->codec_state_bytes = 0;
 }
 
 static void ave_note_copy(struct ave_ctx *ctx, u32 stride, const char *how)
@@ -508,9 +548,12 @@ static void ave_sess_log_map(struct ave_dev *ave, struct ave_session *sess)
 {
 	ave_log_buf(ave, "hdr", 0, &sess->hdr);
 	ave_log_buf(ave, "mb", 0, &sess->mb);
-	ave_log_buf(ave, "row_a", 0, &sess->row_a);
-	ave_log_buf(ave, "row_b", 0, &sess->row_b);
-	ave_log_buf(ave, "fixed", 0, &sess->fixed);
+	for (int set = 0; set < AVE_NEIGHBOUR_SETS; set++) {
+		ave_log_buf(ave, "row_a", set, &sess->row_a[set]);
+		ave_log_buf(ave, "row_b", set, &sess->row_b[set]);
+		ave_log_buf(ave, "fixed", set, &sess->fixed[set]);
+		ave_log_buf(ave, "neighbour_fw", set, &sess->neighbour_fw[set]);
+	}
 	for (int i = 0; i < 2; i++)
 		ave_log_buf(ave, "hevc_extra", i, &sess->hevc_extra[i]);
 	for (int i = 0; i < AVE_MAX_REFS; i++) {
@@ -519,10 +562,13 @@ static void ave_sess_log_map(struct ave_dev *ave, struct ave_session *sess)
 		ave_log_buf(ave, "ref_c", i, &sess->ref_c[i]);
 		ave_log_buf(ave, "ref_d", i, &sess->ref_d[i]);
 	}
-	for (int i = 0; i < AVE_TILE_BUFS; i++) {
-		ave_log_buf(ave, "tile", i, &sess->tile[i]);
-		ave_log_buf(ave, "tile_aux", i, &sess->tile_aux[i]);
-	}
+	for (int set = 0; set < AVE_ENTROPY_SETS; set++)
+		for (int i = 0; i < AVE_TILE_BUFS; i++) {
+			ave_log_buf(ave, "tile", set * AVE_TILE_BUFS + i,
+				    &sess->tile[set][i]);
+			ave_log_buf(ave, "tile_aux", set * AVE_TILE_BUFS + i,
+				    &sess->tile_aux[set][i]);
+		}
 	for (int i = 0; i < AVE_MAX_SLOTS; i++) {
 		ave_log_buf(ave, "coded", i, &sess->slot[i].coded);
 		ave_log_buf(ave, "meta", i, &sess->slot[i].meta);
