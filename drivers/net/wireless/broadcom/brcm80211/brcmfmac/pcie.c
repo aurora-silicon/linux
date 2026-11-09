@@ -8,6 +8,7 @@
 #include <linux/of.h>
 #include <linux/firmware.h>
 #include <linux/pci.h>
+#include <linux/soc/apple/radio-sleep.h>
 #include <linux/vmalloc.h>
 #include <linux/delay.h>
 #include <linux/interrupt.h>
@@ -398,6 +399,10 @@ struct brcmf_otp_params {
 
 struct brcmf_pciedev_info {
 	enum brcmf_pcie_state state;
+	/* Published only after the asynchronous firmware setup has completed. */
+	bool setup_complete;
+	/* This binding blocked reset work for the active radio transaction. */
+	bool sleep_reset_blocked;
 	bool in_irq;
 	struct pci_dev *pdev;
 	char fw_name[BRCMF_FW_NAME_LEN];
@@ -1717,6 +1722,10 @@ static int brcmf_pcie_reset(struct device *dev)
 	struct brcmf_fw_request *fwreq;
 	int err;
 
+	if (apple_radio_sleep_owned(dev))
+		return -EBUSY;
+
+	WRITE_ONCE(devinfo->setup_complete, false);
 	brcmf_pcie_intr_disable(devinfo);
 
 	brcmf_pcie_bus_console_read(devinfo, true);
@@ -2594,6 +2603,8 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 	brcmf_pcie_bus_console_read(devinfo, false);
 
 	brcmf_pcie_fwcon_timer(devinfo, true);
+	/* Publish completed firmware setup before suspend admission. */
+	smp_store_release(&devinfo->setup_complete, true);
 
 	return;
 
@@ -3071,18 +3082,55 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 
 #ifdef CONFIG_PM
 
+static struct pci_driver brcmf_pciedrvr;
+
+static void brcmf_pcie_sleep_finish(struct device *dev)
+{
+	struct brcmf_pciedev_info *devinfo;
+	struct brcmf_bus *bus;
+
+	/* Async setup failure may unbind us after suspend refused admission. */
+	device_lock(dev);
+	if (dev->driver != &brcmf_pciedrvr.driver)
+		goto unlock;
+	bus = dev_get_drvdata(dev);
+	if (!bus)
+		goto unlock;
+	devinfo = bus->bus_priv.pcie->devinfo;
+	/* A replacement binding has no cleanup pending from this transaction. */
+	if (!devinfo->sleep_reset_blocked)
+		goto unlock;
+	devinfo->sleep_reset_blocked = false;
+	brcmf_bus_allow_reset_work(bus);
+unlock:
+	device_unlock(dev);
+}
+
+static int brcmf_pcie_pm_leave_D3(struct device *dev);
 
 static int brcmf_pcie_pm_enter_D3(struct device *dev)
 {
 	struct brcmf_pciedev_info *devinfo;
 	struct brcmf_bus *bus;
 	struct brcmf_if *ifp;
-	int ifidx;
+	int ifidx, ret;
 
 	brcmf_dbg(PCIE, "Enter\n");
 
 	bus = dev_get_drvdata(dev);
 	devinfo = bus->bus_priv.pcie->devinfo;
+
+	ret = apple_radio_sleep_endpoint_prepare(dev, brcmf_pcie_sleep_finish);
+	if (ret)
+		return ret;
+	/* Drain a recovery already running when the platform acquired its lease. */
+	if (apple_radio_sleep_owned(dev)) {
+		brcmf_bus_cancel_reset_work(bus);
+		devinfo->sleep_reset_blocked = true;
+		/* A reset can have returned while firmware loading is still async. */
+		if (!smp_load_acquire(&devinfo->setup_complete))
+			return -EBUSY;
+	}
 
 	/* Stop new packets and drain ndo_start_xmit before taking the bus down.
 	 * The BUS reason prevents completion flow control from waking the queue.
@@ -3112,8 +3160,10 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	}
 
 	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
-
-	return 0;
+	ret = apple_radio_sleep_endpoint_suspended(dev);
+	if (ret)
+		brcmf_pcie_pm_leave_D3(dev);
+	return ret;
 }
 
 
@@ -3124,6 +3174,9 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 	struct pci_dev *pdev;
 	int err;
 
+	err = apple_radio_sleep_endpoint_resume(dev);
+	if (err)
+		return err;
 	brcmf_dbg(PCIE, "Enter\n");
 
 	bus = dev_get_drvdata(dev);
@@ -3144,11 +3197,17 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 		brcmf_bus_change_state(bus, BRCMF_BUS_UP);
 		brcmf_msgbuf_resume(bus->drvr);
 		brcmf_pcie_fwcon_timer(devinfo, true);
+		apple_radio_sleep_endpoint_resumed(dev, 0);
 		return 0;
 	}
 
 cleanup:
 	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
+	if (apple_radio_sleep_owned(dev)) {
+		/* Lost firmware/rings violate retention; reset/reprobe is not recovery. */
+		apple_radio_sleep_endpoint_resumed(dev, -EUCLEAN);
+		return -EUCLEAN;
+	}
 	brcmf_chip_detach(devinfo->ci);
 	devinfo->ci = NULL;
 	pdev = devinfo->pdev;
