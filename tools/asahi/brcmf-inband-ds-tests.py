@@ -69,6 +69,8 @@ static struct brcmf_pciedev_info *wait_dev;
 static bool deliver_exit;
 static bool mailbox_db1;
 static bool fw_asleep;
+static bool fw_wakeable;
+static bool attach_complete;
 static u32 sent[32];
 static unsigned sent_count, crashes;
 static u32 fail_message;
@@ -79,8 +81,10 @@ static void wait_step(void) {
 #define wait_event_timeout(q,c,t) (wait_step(), (c) ? 1L : 0L)
 static int brcmf_pcie_send_mb_data(struct brcmf_pciedev_info *d, u32 data) {
  (void)d;sent[sent_count++]=data;
- if (data==BRCMF_H2D_HOST_DS_ACK) fw_asleep=true;
- if (data==BRCMF_H2D_DEVICE_WAKE_ASSERT && fw_asleep && mailbox_db1)
+ if (data==BRCMF_H2D_HOST_DS_ACK) {
+  fw_asleep=true;fw_wakeable=attach_complete;
+ }
+ if (data==BRCMF_H2D_DEVICE_WAKE_ASSERT && fw_asleep && fw_wakeable && mailbox_db1)
   deliver_exit=true;
  return data == fail_message ? -EIO : 0;
 }
@@ -92,21 +96,30 @@ MAIN = r'''
 static void reset(struct brcmf_pciedev_info *d, struct pci_dev *p, bool capable) {
  memset(d,0,sizeof(*d));memset(p,0,sizeof(*p));memset(sent,0,sizeof(sent));
  d->pdev=p;d->inband_ds=capable;d->ds_state=BRCMF_PCIE_DS_ACTIVE;
- wait_dev=d;deliver_exit=false;mailbox_db1=SOURCE_MAILBOX_DB1;fw_asleep=false;
+ wait_dev=d;deliver_exit=false;mailbox_db1=SOURCE_MAILBOX_DB1;
+ fw_asleep=fw_wakeable=false;attach_complete=true;
  sent_count=crashes=0;fail_message=0xffffffff;
 }
 int main(void) {
  struct brcmf_pciedev_info d;struct pci_dev p;unsigned cases=0;
- assert(SOURCE_RING_FENCE);assert(SOURCE_D3_ORDER);
- assert(SOURCE_SETUP_ERROR_SAFE);cases+=3;
+ assert(SOURCE_RING_FENCE);assert(SOURCE_D3_ORDER);assert(SOURCE_ATTACH_RELEASE);
+ assert(SOURCE_SETUP_ERROR_SAFE);assert(SOURCE_CANCEL_RESET_SAFE);cases+=5;
 
  reset(&d,&p,false);d.inband_ds=d.skip_ds_ack=true;d.host_active=3;
  d.ds_state=BRCMF_PCIE_DS_ERROR;
  assert(negotiate(&d,0)==BRCMF_HOSTCAP_DS_NO_OOB_DW && !d.inband_ds &&
         !d.skip_ds_ack && !d.host_active && d.ds_state==BRCMF_PCIE_DS_ACTIVE);
+ attach_complete=false;
  assert(negotiate(&d,BRCMF_PCIE_SHARED_INBAND_DS)==
         (BRCMF_HOSTCAP_DS_NO_OOB_DW|BRCMF_HOSTCAP_DS_INBAND_DW));
- assert(d.inband_ds && d.ds_state==BRCMF_PCIE_DS_ACTIVE);cases++;
+ assert(d.inband_ds && d.ds_state==BRCMF_PCIE_DS_ACTIVE && d.host_active==1);
+ brcmf_pcie_handle_mb_data(&d,BRCMF_D2H_DEV_DS_ENTER_REQ);
+ assert(d.ds_state==BRCMF_PCIE_DS_SLEEP_PENDING && !sent_count);
+ assert(!brcmf_pcie_ds_begin(&d));brcmf_pcie_ds_end(&d);
+ assert(d.host_active==1 && !sent_count);
+ attach_complete=true;brcmf_pcie_ds_end(&d);
+ assert(d.ds_state==BRCMF_PCIE_DS_SLEEP && !d.host_active && fw_wakeable &&
+        sent_count==1 && sent[0]==BRCMF_H2D_HOST_DS_ACK);cases++;
 
  reset(&d,&p,false);brcmf_pcie_handle_mb_data(&d,BRCMF_D2H_DEV_DS_ENTER_REQ);
  assert(sent_count==1 && sent[0]==BRCMF_H2D_HOST_DS_ACK &&
@@ -119,8 +132,8 @@ int main(void) {
  assert(d.ds_state==BRCMF_PCIE_DS_SLEEP && !d.host_active &&
         sent_count==1 && sent[0]==BRCMF_H2D_HOST_DS_ACK);cases++;
 
- /* Model the observed attach failure: firmware accepts DS_ACK and then only
-  * consumes DEVICE_WAKE_ASSERT when its TCM mailbox is notified through DB1.
+ /* Model the corrected post-attach cycle: only an ACK sent after attach makes
+  * firmware's subsequent DB1 DEVICE_WAKE_ASSERT path usable.
   */
  reset(&d,&p,true);
  brcmf_pcie_handle_mb_data(&d,BRCMF_D2H_DEV_DS_ENTER_REQ);
@@ -166,7 +179,7 @@ int main(void) {
 '''
 
 
-def mutate(source, msgbuf, name):
+def mutate(source, msgbuf, core, name):
     if name == 'capability-gate':
         source = source.replace('if (shared->flags & BRCMF_PCIE_SHARED_INBAND_DS) {',
                                 'if (true) {', 1)
@@ -201,7 +214,19 @@ def mutate(source, msgbuf, name):
     elif name == 'setup-error-reset':
         source = source.replace('\tdevice_release_driver(dev);',
                                 '\tbrcmf_fw_crashed(dev);\n\tdevice_release_driver(dev);', 1)
-    return source, msgbuf
+    elif name == 'attach-hold':
+        source = source.replace('\t\tdevinfo->host_active = 1;',
+                                '\t\tdevinfo->host_active = 0;', 1)
+    elif name == 'attach-release':
+        source = source.replace('\tbrcmf_pcie_ds_end(devinfo);', '', 1)
+    elif name == 'cancel-reset-lock':
+        core = core.replace('\tmutex_unlock(&bus_if->bus_reset_lock);\n\n'
+                            '\t/* The reset callback can reach teardown.',
+                            '\t/* The reset callback can reach teardown.', 1)
+        core = core.replace('\tif (work)\n\t\tcancel_work_sync(work);',
+                            '\tif (work)\n\t\tcancel_work_sync(work);\n'
+                            '\tmutex_unlock(&bus_if->bus_reset_lock);', 1)
+    return source, msgbuf, core
 
 
 def main():
@@ -210,12 +235,14 @@ def main():
     parser.add_argument('--mutation', choices=('capability-gate', 'early-ack', 'exit-note',
                                                'wake-timeout', 'd3-race', 'unwind',
                                                'ring-fence', 'd3-order', 'mailbox-db1',
-                                               'setup-error-reset'))
+                                               'setup-error-reset', 'attach-hold',
+                                               'attach-release', 'cancel-reset-lock'))
     args = parser.parse_args()
     source = (DRIVER / 'pcie.c').read_text()
     msgbuf = (DRIVER / 'msgbuf.c').read_text()
+    core = (DRIVER / 'core.c').read_text()
     if args.mutation:
-        source, msgbuf = mutate(source, msgbuf, args.mutation)
+        source, msgbuf, core = mutate(source, msgbuf, core, args.mutation)
 
     enum = re.search(r'enum brcmf_pcie_ds_state \{.*?\};', source, re.S)[0]
     init = function(source, 'brcmf_pcie_init_share_ram_info')
@@ -239,6 +266,12 @@ def main():
     setup = function(source, 'brcmf_pcie_setup')
     setup_fail = setup[setup.rindex('\nfail:'):]
     setup_error_safe = 'brcmf_fw_crashed' not in setup_fail
+    attach_release = ('brcmf_pcie_ds_end(devinfo)' in setup and
+                      setup.index('brcmf_attach') <
+                      setup.index('brcmf_pcie_ds_end(devinfo)'))
+    cancel_reset = function(core, 'brcmf_bus_cancel_reset_work')
+    cancel_reset_safe = (cancel_reset.index('mutex_unlock') <
+                         cancel_reset.index('cancel_work_sync'))
 
     tx_ioctl = function(msgbuf, 'brcmf_msgbuf_tx_ioctl')
     ring_fence = 'brcmf_commonring_prepare_write' in tx_ioctl
@@ -262,7 +295,9 @@ def main():
             '\n' + PREFIX + negotiate + body +
             f'\n#define SOURCE_RING_FENCE {int(ring_fence)}\n'
             f'#define SOURCE_D3_ORDER {int(d3_order)}\n'
-            f'#define SOURCE_SETUP_ERROR_SAFE {int(setup_error_safe)}\n' + MAIN)
+            f'#define SOURCE_ATTACH_RELEASE {int(attach_release)}\n'
+            f'#define SOURCE_SETUP_ERROR_SAFE {int(setup_error_safe)}\n'
+            f'#define SOURCE_CANCEL_RESET_SAFE {int(cancel_reset_safe)}\n' + MAIN)
 
     def run(out):
         out.mkdir(parents=True, exist_ok=True)

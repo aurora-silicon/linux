@@ -89,7 +89,8 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('capability-gate', 'early-ack', 'exit-note',
                                    'wake-timeout', 'd3-race', 'unwind',
                                    'ring-fence', 'd3-order', 'mailbox-db1',
-                                   'setup-error-reset'), out()),
+                                   'setup-error-reset', 'attach-hold',
+                                   'attach-release', 'cancel-reset-lock'), out()),
     # The old revision reports a failed join against the last associated BSS.
     'brcmf-join-bssid-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('stale-target', 'zero-named', 'no-call'), out()),

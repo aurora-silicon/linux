@@ -2257,6 +2257,8 @@ brcmf_pcie_init_share_ram_info(struct brcmf_pciedev_info *devinfo,
 		host_cap |= BRCMF_HOSTCAP_DS_INBAND_DW;
 		devinfo->inband_ds = true;
 		devinfo->ds_state = BRCMF_PCIE_DS_ACTIVE;
+		/* Keep firmware awake until HOSTREADY and initial DCMDs finish. */
+		devinfo->host_active = 1;
 	}
 
 	brcmf_pcie_write_tcm32(devinfo, sharedram_addr +
@@ -2986,6 +2988,10 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 	ret = brcmf_attach(&devinfo->pdev->dev);
 	if (ret)
 		goto fail;
+	/* Drop the attach-time active reference.  A deferred DS request can only
+	 * be acknowledged after HOSTREADY, CLM and the initial ring work.
+	 */
+	brcmf_pcie_ds_end(devinfo);
 
 	brcmf_pcie_bus_console_read(devinfo, false);
 
