@@ -876,6 +876,61 @@ impl Queue {
         }
         Ok(())
     }
+    /// Stamp output uses the stored page-A word, never a reported fault stamp.
+    /// Active retains descriptors, the work-state lease, timestamp page and pins.
+    pub(crate) fn observe_stamp_outputs(
+        &self,
+        epoch: u64,
+        recovery_state: u32,
+        defer: &mut impl FnMut(Deferred) -> Result,
+    ) -> Result {
+        let armed = crate::g17::stamp_complete::enabled();
+        let tracing = crate::g17::trace::hold_enabled();
+        if (!armed && !tracing) || self.active.len == 0 { return Ok(()); }
+        let Ok(stamp) = self.graph.stamp() else { return Ok(()); };
+        core::sync::atomic::fence(Ordering::Acquire);
+        for active in self.active.iter() {
+            let Some(ticket) = active.ticket else { break; };
+            if self.valid_ticket(active, &ticket).is_err() {
+                if tracing {
+                    crate::g17::trace::hold(crate::g17::trace::COMPUTE, ticket.qid,
+                        ticket.kick, ticket.context_id, ticket.submission, 8, 0);
+                }
+                continue;
+            }
+            let completion = &active.packet.completion;
+            let covered = retirement::stamp_covers(stamp, ticket.kick);
+            let healthy = !self.quarantined && recovery_state == 0 && ticket.epoch == epoch
+                && !active.failure_deferred && completion.stamp_eligible();
+            let Ok(ticks) = completion.compute_words() else { continue; };
+            if tracing {
+                let cursors = self.graph.cursors()
+                    .and_then(|c| c.consumed(ticket.item_producer, ticket.item_count));
+                let mut known = 0x7d;
+                let mut value = u32::from(covered)
+                    | (u32::from(active.observed.is_some()) << 2)
+                    | (u32::from(ticks[0] != 0 && ticks[1] > ticks[0]) << 4)
+                    | (u32::from(healthy) << 5)
+                    | (u32::from(completion.stamp_queued()) << 6);
+                if let Ok(consumed) = cursors {
+                    known |= 2;
+                    value |= u32::from(consumed) << 1;
+                }
+                crate::g17::trace::hold(crate::g17::trace::COMPUTE, ticket.qid, ticket.kick,
+                    ticket.context_id, ticket.submission, known, value);
+            }
+            if let Some([start, end]) = crate::g17::stamp_complete::timestamps(
+                u32::from(armed), healthy, covered, ticks)
+            {
+                if completion.retain_stamp_work().is_err() { continue; }
+                defer(Deferred::Stamped(completion.clone(), [start, end, 0, 0]))?;
+                crate::g17::trace::complete(crate::g17::trace::COMPUTE, ticket.qid,
+                    ticket.ordinal, &active.packet, [start, end]);
+            }
+        }
+        Ok(())
+    }
+
     fn front_finished(&self) -> bool {
         self.active.front().is_some_and(|active| {
             active.observed.is_some()
@@ -1029,8 +1084,12 @@ impl Queue {
                     let front = self.active.front().ok_or(EIO)?;
                     if let Some(ticket) = front.ticket {
                         crate::g17::recovery::note_retired();
-                        crate::g17::trace::complete(crate::g17::trace::COMPUTE, ticket.qid,
+                        crate::g17::trace::retire(crate::g17::trace::COMPUTE, ticket.qid,
                             ticket.ordinal, &front.packet, [timestamps[0], timestamps[1]]);
+                        if !front.packet.completion.stamp_queued() {
+                            crate::g17::trace::complete(crate::g17::trace::COMPUTE, ticket.qid,
+                                ticket.ordinal, &front.packet, [timestamps[0], timestamps[1]]);
+                        }
                     }
                     self.retire_pending = true;
                     defer(Deferred::Retired(

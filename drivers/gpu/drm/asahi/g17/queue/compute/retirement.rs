@@ -499,6 +499,24 @@ mod tests {
     }
 
     #[test]
+    fn stamp_output_does_not_retire_without_records_or_consumed_items() {
+        let ticket = ticket();
+        let stamp = own(KICK);
+        assert_eq!(crate::g17::stamp_complete::timestamps(1, true,
+            stamp_covers(stamp, ticket.kick), [10, 20]), Some([10, 20]));
+        let busy = Cursors { producer: 4, consumer: 2, count: 64 };
+        assert_eq!(poll(&ticket, None, busy, stamp, Recordless::NotYet,
+            0, None, false), Ok(None));
+        assert_eq!(poll(&ticket, None, consumed(), stamp, Recordless::NotYet,
+            0, None, false), Ok(None));
+        assert_eq!(poll(&ticket, Some(Observation { timestamps: [10, 20] }),
+            consumed(), stamp, Recordless::NotYet, 0, None, false), Ok(Some([10, 20])));
+        // No record or other QID lends coverage to a kick not covered by its own stamp.
+        assert_eq!(crate::g17::stamp_complete::timestamps(1, true,
+            stamp_covers(own(KICK - 1), ticket.kick), [10, 20]), None);
+    }
+
+    #[test]
     fn a_late_stamp_is_waited_for() {
         // Under games on J700 the stamp lands up to about 4 ms after the record while the
         // rest of the command's ioctl runs: the command keeps its mappings until then.

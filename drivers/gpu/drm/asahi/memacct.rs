@@ -498,6 +498,7 @@ mod tests {
         drop(charge);
     }
 
+    #[cfg(not(MODULE))]
     static MM: Ledger = Ledger::new();
 
     // `mm_alloc()` is only exported to modules in the KUnit namespace.
