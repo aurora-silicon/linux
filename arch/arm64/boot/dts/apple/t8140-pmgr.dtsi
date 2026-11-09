@@ -1070,7 +1070,8 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "dpa1";
-		power-domains = <&ps_dpa_p>;
+		/* ADT: DPA1's parents are ANS and APCIE_ST; DPA_P is DPA0's. */
+		power-domains = <&ps_ans>, <&ps_apcie_st>;
 		status = "okay";
 	};
 
