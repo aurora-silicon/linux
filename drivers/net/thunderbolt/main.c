@@ -1521,8 +1521,16 @@ static void tbnet_remove(struct tb_service *svc)
 {
 	struct tbnet *net = tb_service_get_drvdata(svc);
 
-	unregister_netdev(net->dev);
+	/*
+	 * Take the protocol handler off the list before the interface goes
+	 * down, so that ThunderboltIP packets arriving during the teardown
+	 * no longer reach this device and queue new login, connect or
+	 * disconnect work for it.
+	 */
 	tb_unregister_protocol_handler(&net->handler);
+	unregister_netdev(net->dev);
+	/* A logout received while the interface was down queued this. */
+	cancel_work_sync(&net->disconnect_work);
 	free_netdev(net->dev);
 }
 
