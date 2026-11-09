@@ -85,12 +85,18 @@ ASAHI_TESTS = {
     'brcmf-assoc-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('short-ie', 'header-length', 'skb-capacity', 'cmplt-header'), out('--output')),
     'brcmf-bss-tests.py': [(out(), PASS)],
+    'brcmf-cipher-tests.py': [(out(), PASS)]
+        + [(out() + ['--ref', '33bec4016c466985bfbb5ff4c2089fcab8242dcf'], KILL)],
     # The old revision reports a failed join against the last associated BSS.
     'brcmf-join-bssid-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('stale-target', 'zero-named', 'no-call', 'lost-bss-success'), out()),
+    'brcmf-join-scan-tests.py': [(out(), PASS)]
+        + [(out() + ['--ref', '33bec4016c466985bfbb5ff4c2089fcab8242dcf'], KILL)],
     'brcmf-pcie-dma-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('narrow-stream', 'ignore-aperture', 'revision-wide'), out('--output')),
     'brcmf-roam-tests.py': [(out(), PASS)],
+    'brcmf-sae-vendor-tests.py': [(out(), PASS)]
+        + [(out() + ['--ref', '9260e1f021e075713931f3c23c0a5fa1da936b0b'], KILL)],
     'brcmf-suspend-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('country-gate', 'queue-reasons', 'worker-gate',
                                    'resume-order', 'tx-drain'), out()),
