@@ -1183,6 +1183,9 @@
 				label = "pmp-gfx";
 				#power-domain-cells = <0>;
 				power-domains = <&ps_gfx>;
+				#ifdef APPLE_USE_PMP
+				apple,always-on;
+				#endif
 			};
 
 			pmp_report_ane_sys: report@5 {

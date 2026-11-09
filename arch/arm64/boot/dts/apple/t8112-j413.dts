@@ -9,6 +9,13 @@
 
 /dts-v1/;
 
+/*
+ * The PMP manages system power states: the CPU clusters, ANE, GPU, AVD and
+ * JPEG send it their memory, fabric and performance requests, and the board
+ * idles lower.
+ */
+#define APPLE_USE_PMP
+
 #include "t8112.dtsi"
 #include "t8112-jxxx.dtsi"
 #include <dt-bindings/leds/common.h>

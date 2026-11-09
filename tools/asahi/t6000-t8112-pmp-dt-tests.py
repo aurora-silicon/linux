@@ -113,13 +113,15 @@ def main():
     parser.add_argument('--dtc', required=True)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    for board, soc, pmp, report in (
-            ('t8112-j413', 't8112', 0x23b500000, 0x23b3c0000),
-            ('t6000-j316s', 't6000', 0x28e700000, 0x28e3c0000)):
-        # The J316s ships with PMP on, so its source has no PMP-off profile.
-        for trial in ((True,) if board == 't6000-j316s' else (False, True)):
+    # The J413 and J316s ship with PMP on, so their sources have no PMP-off
+    # profile; the J493 (same T8112 graph, PMP off) is the baseline.
+    for board, soc, pmp, report, trials in (
+            ('t8112-j493', 't8112', 0x23b500000, 0x23b3c0000, (False,)),
+            ('t8112-j413', 't8112', 0x23b500000, 0x23b3c0000, (True,)),
+            ('t6000-j316s', 't6000', 0x28e700000, 0x28e3c0000, (True,))):
+        for trial in trials:
             check(args.tree.resolve(), args.output, args.dtc, board, soc, pmp, report, trial)
-        if soc == 't8112':
+        if board == 't8112-j413':
             check(args.tree.resolve(), args.output, args.dtc, board, soc, pmp, report, True, True)
 
 
