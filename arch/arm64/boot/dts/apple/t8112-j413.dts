@@ -168,6 +168,11 @@
 	status = "okay";
 };
 
+/* A spare PWM channel for developers; no consumer is known. */
+&fpwm0 {
+	status = "okay";
+};
+
 &fpwm1 {
 	status = "okay";
 };
