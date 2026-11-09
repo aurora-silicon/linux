@@ -582,15 +582,13 @@ static int ave_fw_boot(struct ave_dev *ave)
 	}
 	if (!t->boot_config) {
 		/*
-		 * Written once in its encoded form, as macOS does. The register
-		 * reads back decoded (the code base with bit 0 set), so a
-		 * readback never equals the write; the first hello is the
-		 * confirmation.
+		 * The bootloader preloads the 6070 firmware and sets its code
+		 * base. Leave that register alone: any write to it, even of
+		 * the value it already holds, lets the core build its boot
+		 * page tables and then stop before the first device access,
+		 * so it never answers.
 		 */
-		writeq(ave_fw_vcbar(ave->variant, ave->text.iova),
-		       ave->coproc + ave->variant->regs->vcbar);
-		dev_dbg(ave->dev, "VCBAR %#llx (reads %#llx) boot argument %#x\n",
-			ave_fw_vcbar(ave->variant, ave->text.iova),
+		dev_dbg(ave->dev, "code base %#llx (bootloader) boot argument %#x\n",
 			readq(ave->coproc + ave->variant->regs->vcbar),
 			ave->variant->boot_arg_value);
 	}

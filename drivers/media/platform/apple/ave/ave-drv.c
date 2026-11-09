@@ -57,8 +57,6 @@ const struct ave_variant ave_t6000 = {
 	.text_crc = 0x460c7a7c,
 	.boot_arg_value = 0x400,
 	.timebase_multiplier = 1000000,
-	.vcbar_mask = 0x0000000ffffff800ULL,
-	.vcbar_flags = 0x0102000000000000ULL,
 	.text_link_cell = 0x423c,
 
 	.extra0_size = 0x24,
@@ -75,8 +73,6 @@ const struct ave_variant ave_t8112 = {
 	.text_crc = 0x25bfd039,
 	.boot_arg_value = 0x10000,
 	.timebase_multiplier = 1,
-	.vcbar_mask = 0x000003fffffff800ULL,
-	.vcbar_flags = 0x0102000000000000ULL,
 	.text_link_cell = 0x423c,
 	.mbox_idle = 0x38,
 	.restore_data_first = true,
