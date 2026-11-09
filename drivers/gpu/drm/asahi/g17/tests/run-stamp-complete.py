@@ -75,8 +75,11 @@ mod output_tests {
     } }
     struct Feed(Cell<u32>);
     impl Feed { fn note_pass(&self, _: u64, _: u64) { self.0.set(self.0.get()+1); } }
+    mod cfg { pub const COMMAND_TIMESTAMP_HZ: u64 = 24_000_000; }
+    struct Usage(Cell<u32>);
+    impl Usage { fn add(&self, _: crate::usage::Engine, _: u64, _: u64, _: u32) { self.0.set(self.0.get()+1); } }
     struct Completion {
-        feed: Option<Feed>, compute: Option<()>, released: Cell<bool>, reported: RefCell<Vec<i32>>,
+        feed: Option<Feed>, usage: Usage, compute: Option<()>, released: Cell<bool>, reported: RefCell<Vec<i32>>,
         signalled: AtomicU8, timeout_error: AtomicI32, status: Status,
         interrupted: Cell<bool>, blamed: Cell<bool>, input_error: Cell<Option<i32>>,
         output: Output, terminal: Cell<u32>, failures: RefCell<Vec<i32>>,
@@ -85,7 +88,7 @@ mod output_tests {
     }
     impl Completion {
         fn new(physical: std::sync::Arc<()>, work: std::sync::Arc<()>) -> Self {
-            Self { feed: Some(Feed(Cell::new(0))), compute: Some(()),
+            Self { feed: Some(Feed(Cell::new(0))), usage: Usage(Cell::new(0)), compute: Some(()),
                 released: Cell::new(false), reported: RefCell::new(vec![]),
                 signalled: AtomicU8::new(0), timeout_error: AtomicI32::new(0),
                 status: Status(Cell::new(0)), interrupted: Cell::new(false), blamed: Cell::new(false),
@@ -121,12 +124,13 @@ mod output_tests {
         let c = Completion::new(std::sync::Arc::new(()), std::sync::Arc::new(()));
         c.complete_stamp([10, 20, 0, 0]);
         assert_eq!(c.feed.as_ref().unwrap().0.get(), 0); assert!(!c.released.get());
+        assert_eq!(c.usage.0.get(), 0);
         c.complete(Ok([10, 20, 0, 0])); c.complete(Ok([10, 20, 0, 0]));
-        assert_eq!(c.feed.as_ref().unwrap().0.get(), 1);
+        assert_eq!(c.feed.as_ref().unwrap().0.get(), 1); assert_eq!(c.usage.0.get(), 1);
         assert_eq!(c.output.calls.get(), 1); assert!(!c.released.get());
         let normal = Completion::new(std::sync::Arc::new(()), std::sync::Arc::new(()));
         normal.complete(Ok([30, 40, 0, 0]));
-        assert_eq!(normal.feed.as_ref().unwrap().0.get(), 1);
+        assert_eq!(normal.feed.as_ref().unwrap().0.get(), 1); assert_eq!(normal.usage.0.get(), 1);
         assert!(normal.released.get()); assert_eq!(normal.output.calls.get(), 1);
     }
     #[test]
@@ -135,6 +139,7 @@ mod output_tests {
         c.signalled.store(1, Ordering::Release); // An ordinary failure won first.
         c.complete_stamp([10, 20, 0, 0]); c.complete(Ok([10, 20, 0, 0]));
         assert_eq!(c.feed.as_ref().unwrap().0.get(), 0); assert_eq!(c.output.calls.get(), 0);
+        assert_eq!(c.usage.0.get(), 0);
     }
     #[test]
     fn queued_timeout_recovery_and_vm_error_keep_original_attribution() {
@@ -163,6 +168,7 @@ mod output_tests {
 asahi = g17.parents[0]
 hw = (asahi / 'hw/t8140.rs').read_text()
 depth = re.search(r'const RENDER_DEPTH: u8 = (\d+);', hw).group(1)
+compute_depth = re.search(r'const COMPUTE_DEPTH: usize = (\d+);', hw).group(1)
 timeout = (g17 / 'timeout.rs').read_text()
 poll_ms = re.search(r'const POLL_MS: [^=]+ = (\d+);', timeout).group(1)
 harness = r'''
@@ -179,7 +185,10 @@ mod module_parameters {
     impl Param { pub fn value(&self) -> u32 { 0 } }
     #[allow(non_upper_case_globals)] pub static g17_stamp_complete_arm: Param = Param;
 }
-mod hw { pub mod t8140 { pub mod queues { pub const RENDER_DEPTH: u8 = __DEPTH__; } } }
+mod hw { pub mod t8140 { pub mod queues {
+    pub const RENDER_DEPTH: u8 = __DEPTH__; pub const COMPUTE_DEPTH: usize = __CDEPTH__;
+} } }
+mod usage { pub enum Engine { Compute, Vertex, Fragment } }
 mod g17 {
     pub mod job { pub const TIMEOUT_MS: u32 = __TIMEOUT__; }
     #[path = "__POLICY__"] pub(crate) mod stamp_complete;
@@ -188,7 +197,7 @@ mod g17 {
         #[path = "__COMPUTE__"] pub(crate) mod compute;
     }
 }
-'''.replace('__DEPTH__', depth).replace('__TIMEOUT__', poll_ms)
+'''.replace('__DEPTH__', depth).replace('__CDEPTH__', compute_depth).replace('__TIMEOUT__', poll_ms)
 for name in ['policy', 'render', 'compute']:
     harness = harness.replace('__' + name.upper() + '__', str(out / (name + '.rs')))
 unit = out / 'stamp-complete.rs'
