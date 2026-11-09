@@ -152,16 +152,19 @@ Touch ID and the enclave's RNG stay down for that boot, and the refusal
 repeats on every boot until the record is allowed. This was seen on the
 MacBook Air M3 (T8122, J613) on 2026-11-07, after a change from a raw
 m1n1 Stage 1 to a Mach-O one, and on a J616s after every Recovery
-enrolment of a Stage 1 that day (https://github.com/aurora-silicon/linux/issues/1190). The window below opens only for
-the unlock, so this case needs `aurora-sep-policy-change`.
+enrolment of a Stage 1 that day (https://github.com/aurora-silicon/linux/issues/1190). Kernels from before that
+designate ran in the window below need `aurora-sep-policy-change` for this
+case.
 
-Under an unchanged policy that first unlock rewrites no session record at
-all (every J616s boot before the change). So the driver treats a rewrite
-inside it as the policy change and lets exactly one through, by itself, on
-the first boot after the change:
+Under an unchanged policy neither that first unlock nor that designate
+rewrites an existing session record (every J616s boot before the change,
+and every guarded Touch ID boot on the J613 and J616s). So the driver
+treats a rewrite inside them as the policy change and lets exactly one
+through, by itself, on the first boot after the change:
 
-- only during the first unlock of an identity keybag that already existed,
-  once per boot; a keybag or ref-key created this boot closes the window;
+- only during the first unlock or Touch ID designate of an identity keybag
+  that already existed, whichever comes first, once per boot; a keybag or
+  ref-key created this boot closes the window;
 - only one kind-4 session record, only a rewrite, never a delete or a
   shared root, and the record is not added to Linux's list;
 - only once the record's previous value is durable in
