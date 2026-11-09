@@ -3591,7 +3591,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	dcp->output_pq = dcp->pq_requested && mode->pq.score >= 0;
 
 	/* Built-in ProMotion panels require timestamps even in fixed-120 mode. */
-	dcp->use_timestamps = mode->vrr && dcp->main_display;
+	dcp->use_timestamps = mode->needs_timestamps && dcp->main_display;
 
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie) {
