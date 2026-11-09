@@ -300,9 +300,13 @@ static int sn201202x_ldcm_set_mitigation(void *ctx, bool enable)
 	if (sn->ldcm_mitigation_known && sn->ldcm_mitigated == enable)
 		return 0;
 
-	/* Successful task completion is the controller's mitigation ACK. */
+	/*
+	 * Successful task completion is the controller's mitigation ACK.
+	 * Startup commands can take more than a second on SN201202x. Wait for
+	 * completion before a retry can request the opposite mitigation state.
+	 */
 	ret = tps6598x_exec_cmd_tmo(tps, "LDCM", sizeof(command), &command,
-				   0, NULL, 1000, 0);
+				   0, NULL, 5000, 0);
 	sn->ldcm_mitigation_known = !ret;
 	if (!ret)
 		sn->ldcm_mitigated = enable;
@@ -354,6 +358,16 @@ sn201202x_ldcm_update_state(void *ctx, const struct sn201202x_ldcm_ops *ops,
 
 	/* Do not report dry if liquid appeared while mitigation was removed. */
 	read_ret = ops->read(ctx, &contaminant);
+	if (!read_ret && contaminant == TYPEC_CONTAMINANT_UNKNOWN) {
+		/*
+		 * Removing mitigation can start another measurement. The dry
+		 * snapshot above is still the latest result; preserve it just
+		 * as we preserve a previously published result at entry. Forcing
+		 * mitigation back on here can prevent the measurement finishing.
+		 */
+		ops->publish(ctx, TYPEC_CONTAMINANT_NONE);
+		return -EINPROGRESS;
+	}
 	if (read_ret || contaminant != TYPEC_CONTAMINANT_NONE) {
 		ret = ops->set_mitigation(ctx, true);
 		if (ret) {

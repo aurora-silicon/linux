@@ -826,6 +826,57 @@ static void sn201202x_ldcm_dry_order_test(struct kunit *test)
 	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
 }
 
+static void sn201202x_ldcm_dry_then_busy_test(struct kunit *test)
+{
+	static const enum typec_contaminant last[] = {
+		TYPEC_CONTAMINANT_UNKNOWN,
+		TYPEC_CONTAMINANT_NONE,
+		TYPEC_CONTAMINANT_LIQUID,
+	};
+	const enum sn201202x_ldcm_test_action actions[] = {
+		LDCM_TEST_READ,
+		LDCM_TEST_MITIGATE_OFF,
+		LDCM_TEST_READ,
+		LDCM_TEST_PUBLISH_NONE,
+	};
+	unsigned int i;
+
+	/* Removing mitigation can start a measurement after a fresh dry result. */
+	for (i = 0; i < ARRAY_SIZE(last); i++) {
+		struct sn201202x_ldcm_test t = {
+			.reads = { TYPEC_CONTAMINANT_NONE, TYPEC_CONTAMINANT_UNKNOWN },
+		};
+
+		KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+								  &sn201202x_ldcm_test_ops,
+								  last[i]),
+				-EINPROGRESS);
+		sn201202x_ldcm_test_actions(test, &t, actions,
+					    ARRAY_SIZE(actions));
+	}
+}
+
+static void sn201202x_ldcm_dry_then_read_failure_test(struct kunit *test)
+{
+	const enum sn201202x_ldcm_test_action actions[] = {
+		LDCM_TEST_READ,
+		LDCM_TEST_MITIGATE_OFF,
+		LDCM_TEST_READ,
+		LDCM_TEST_MITIGATE_ON,
+		LDCM_TEST_PUBLISH_UNKNOWN,
+	};
+	struct sn201202x_ldcm_test t = {
+		.reads = { TYPEC_CONTAMINANT_NONE, TYPEC_CONTAMINANT_UNKNOWN },
+		.read_rets = { 0, -EIO },
+	};
+
+	/* A failed second read must still mitigate, even after a dry result. */
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_update_state(&t,
+							  &sn201202x_ldcm_test_ops,
+							  TYPEC_CONTAMINANT_UNKNOWN), -EIO);
+	sn201202x_ldcm_test_actions(test, &t, actions, ARRAY_SIZE(actions));
+}
+
 static void sn201202x_ldcm_dry_race_test(struct kunit *test)
 {
 	const enum sn201202x_ldcm_test_action actions[] = {
@@ -945,6 +996,8 @@ static struct kunit_case sn201202x_pm_cases[] = {
 	KUNIT_CASE(sn201202x_ldcm_read_failure_order_test),
 	KUNIT_CASE(sn201202x_ldcm_mitigation_failure_order_test),
 	KUNIT_CASE(sn201202x_ldcm_dry_order_test),
+	KUNIT_CASE(sn201202x_ldcm_dry_then_busy_test),
+	KUNIT_CASE(sn201202x_ldcm_dry_then_read_failure_test),
 	KUNIT_CASE(sn201202x_ldcm_dry_race_test),
 	KUNIT_CASE(sn201202x_ldcm_dry_race_mitigation_failure_test),
 	KUNIT_CASE(sn201202x_ldcm_busy_keeps_result_test),
