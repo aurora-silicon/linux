@@ -838,6 +838,19 @@ static unsigned int apple_soc_cpufreq_pstate_freq(struct cpufreq_policy *policy,
 static int apple_soc_cpufreq_suspend(struct cpufreq_policy *policy)
 {
 	struct apple_cpu_priv *priv = policy->driver_data;
+	struct apple_fast_die *fd = priv->fast_die;
+
+	/*
+	 * A firmware-driven sleep stops the PMP, and its driver starts it again only after the
+	 * CPUs are back: the first samples after the wake find it down. Give it the same time to
+	 * come back as at boot. Jiffies don't count the sleep.
+	 */
+	if (fd && fd->report && pm_suspend_via_firmware()) {
+		spin_lock_bh(&fd->lock);
+		fd->start = jiffies;
+		fd->warned = false;
+		spin_unlock_bh(&fd->lock);
+	}
 
 	if (priv->info->lazy_verify) {
 		int pstate = apple_soc_cpufreq_drain(priv);
