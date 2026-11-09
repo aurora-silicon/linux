@@ -2131,9 +2131,14 @@
 			interrupt-parent = <&aic>;
 			/* ADT [323 324 325 326 336]; 323 carries the IPC mailbox */
 			interrupts = <AIC_IRQ 323 IRQ_TYPE_LEVEL_HIGH>;
+			/*
+			 * In macOS's order: the camera sensor domains come up
+			 * after ISP_FE and before the rest of the pipeline.
+			 */
 			power-domains = <&ps_isp_sys>, <&ps_isp_cpu>,
 					<&ps_isp_cpu_core0>, <&ps_isp_cpu_core1>,
-					<&ps_isp_fe>, <&ps_isp_dprx>, <&ps_isp_secure>,
+					<&ps_isp_fe>, <&ps_ispsens0>, <&ps_ispsens1>,
+					<&ps_isp_dprx>, <&ps_isp_secure>,
 					<&ps_isp_sts0>, <&ps_isp_sts1>, <&ps_isp_pearl>,
 					<&ps_isp_be>, <&ps_isp_clr>, <&ps_isp_cvd>,
 					<&ps_isp_cvm>;

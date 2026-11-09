@@ -274,7 +274,8 @@
 	 * enables between ISP_FE and ISP_SECURE.  Plain power
 	 * gating only: a local domain parked with DEV_DISABLE (the t8112
 	 * apple,force-disable pattern) never reached ACTIVE again on J700
-	 * (isp_cpu_core0 stuck at ACTUAL=0 on the second firmware boot).
+	 * (isp_cpu_core0 stuck at ACTUAL=0 on the second firmware boot).  No
+	 * automatic power management either: macOS writes them exactly 0xf.
 	 */
 	ps_sep: power-controller@c00 {
 		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
@@ -290,6 +291,7 @@
 		reg = <0x4000 4>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
+		apple,no-auto-pm;
 		label = "isp_cpu";
 		power-domains = <&ps_isp_sys>;
 	};
@@ -299,6 +301,7 @@
 		reg = <0x4008 4>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
+		apple,no-auto-pm;
 		label = "isp_cpu_core0";
 		power-domains = <&ps_isp_cpu>;
 	};
@@ -308,6 +311,7 @@
 		reg = <0x4010 4>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
+		apple,no-auto-pm;
 		label = "isp_cpu_core1";
 		power-domains = <&ps_isp_cpu>;
 	};
@@ -317,6 +321,7 @@
 		reg = <0x4018 4>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
+		apple,no-auto-pm;
 		label = "isp_fe";
 		power-domains = <&ps_isp_sys>;
 	};
@@ -326,6 +331,7 @@
 		reg = <0x4020 4>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
+		apple,no-auto-pm;
 		label = "isp_dprx";
 		power-domains = <&ps_isp_fe>;
 	};
@@ -335,6 +341,7 @@
 		reg = <0x4028 4>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
+		apple,no-auto-pm;
 		label = "isp_secure";
 		power-domains = <&ps_isp_fe>;
 	};
@@ -344,6 +351,7 @@
 		reg = <0x4030 4>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
+		apple,no-auto-pm;
 		label = "isp_sts0";
 		power-domains = <&ps_isp_fe>;
 	};
@@ -353,6 +361,7 @@
 		reg = <0x4038 4>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
+		apple,no-auto-pm;
 		label = "isp_sts1";
 		power-domains = <&ps_isp_fe>;
 	};
@@ -362,6 +371,7 @@
 		reg = <0x4040 4>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
+		apple,no-auto-pm;
 		label = "isp_pearl";
 		power-domains = <&ps_isp_fe>;
 	};
@@ -371,6 +381,7 @@
 		reg = <0x4048 4>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
+		apple,no-auto-pm;
 		label = "isp_be";
 		power-domains = <&ps_isp_fe>;
 	};
@@ -380,6 +391,7 @@
 		reg = <0x4050 4>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
+		apple,no-auto-pm;
 		label = "isp_clr";
 		power-domains = <&ps_isp_be>;
 	};
@@ -389,6 +401,7 @@
 		reg = <0x4058 4>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
+		apple,no-auto-pm;
 		label = "isp_cvd";
 		power-domains = <&ps_isp_be>;
 	};
@@ -398,6 +411,7 @@
 		reg = <0x4060 4>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
+		apple,no-auto-pm;
 		label = "isp_cvm";
 		power-domains = <&ps_isp_cvd>;
 	};
