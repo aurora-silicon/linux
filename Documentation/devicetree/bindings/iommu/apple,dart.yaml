@@ -48,6 +48,7 @@ properties:
               - apple,t6031-dart
               - apple,t6041-dart
               - apple,t6050-dart
+              - apple,t6050-isp-dart
               - apple,t8122-dart
               - apple,t8132-dart
               - apple,t8140-dart
@@ -131,6 +132,19 @@ properties:
       table pages as normal RAM and completed the display coprocessor power
       handoff. Linux retains occupied root slots and excludes their entire
       IOVA spans from allocation. This does not assert immutable descendants.
+
+  apple,clock-protection:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      - items:
+          - description: PS_PROT (clock protection) register bank
+          - description: Index of this DART's slice in the bank
+    description: >
+      The clock protection slice that guards a power state register of the
+      power domain of this DART. Its consumer may power that domain down: the
+      DART's streams are then disabled and flushed, and the slice disabled,
+      before the domain powers off, and the slice is enabled again when it
+      powers up. Only the J713 internal display DARTs use it.
 
   apple,tunable:
     $ref: /schemas/types.yaml#/definitions/uint32-matrix

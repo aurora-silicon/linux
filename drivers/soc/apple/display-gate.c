@@ -78,11 +78,12 @@
  * driver of its own, t6041-display-gate.c, by Ryan Murray and František
  * Balázsy.
  *
- * On the M4 Max (J616c, apple,t6041) the PMP never runs: iBoot leaves the
- * external chains powered and the boot loader fills each external display
- * processor's firmware memory. The gate enables a chain once its processor has
- * that memory, before any device exists (see gate_t6041_max_run()), and never
- * touches the internal display.
+ * On the M4 Max (J614c and J616c, apple,t6041) the internal display is
+ * handed over and enabled as on the M4 Pro. The PMP never runs there: iBoot
+ * leaves the external chains powered and the boot loader fills each external
+ * display processor's firmware memory. The gate enables a chain once its
+ * processor has that memory and the display subsystem is enabled, before any
+ * device exists (see gate_t6041_max_run()).
  */
 
 #define pr_fmt(fmt) fmt
@@ -336,11 +337,17 @@ static const struct gate_soc gate_t6041 __initconst = {
 
 static void __init gate_t6041_max_run(void);
 
-/* T6041 (M4 Max): no PMP; the external chains follow the boot loader's firmware memory. */
+/*
+ * T6041 (M4 Max): the M4 Pro's internal display handoff; no PMP, so the
+ * external chains follow the boot loader's firmware memory.
+ */
 static const struct gate_soc gate_t6041_max __initconst = {
 	.machine = "apple,t6041",
 	.prefix = "apple-t6041-display: ",
 	.name = "T6041",
+	.dcp_compat = "apple,t6041-dcp",
+	.display_compat = "apple,display-subsystem",
+	.marker = "apple,t6041-handoff",
 	.run = gate_t6041_max_run,
 };
 
@@ -3030,12 +3037,13 @@ static int __init t6041_max_apply(unsigned int i, struct device_node *display)
 }
 
 /*
- * Each chain is enabled in one changeset, once its processor has firmware
- * memory. A chain that has none, or is not all there and disabled (a boot
- * loader that enabled it itself), stays as it is, and the other chain does not
- * depend on it. The display subsystem only gains the DART of an enabled chain:
- * its status is never written, so the internal display stays as the boot
- * loader left it whatever happens here.
+ * The internal display first, as on the M4 Pro: an accepted handoff enables
+ * the display subsystem with the DCP. Then each external chain is enabled in
+ * one changeset, once its processor has firmware memory. A chain that has
+ * none, or is not all there and disabled (a boot loader that enabled it
+ * itself), stays as it is, and the other chain does not depend on it. The
+ * chains need the display subsystem enabled, by the handoff or by the boot
+ * loader, and only add their DARTs to it: its status is not written here.
  */
 static void __init gate_t6041_max_run(void)
 {
@@ -3046,10 +3054,15 @@ static void __init gate_t6041_max_run(void)
 	if (IS_ENABLED(CONFIG_VIDEO) && video_firmware_drivers_only())
 		return;
 
+	gate_t6041_internal();
 	staged_prefix = gate_soc->prefix;
 	display = of_find_node_by_path("/display-subsystem");
-	if (!display || !of_device_is_available(display)) {
+	if (!display) {
 		staged_err("no display subsystem, nothing enabled\n");
+		return;
+	}
+	if (!of_device_is_available(display)) {
+		staged_info("display subsystem not enabled, external displays left off\n");
 		of_node_put(display);
 		return;
 	}

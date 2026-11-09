@@ -23,6 +23,8 @@
 	model = "Apple MacBook Pro (16-inch, M1 Pro, 2021)";
 
 	aliases {
+		rtc0 = &smc_rtc;
+		rtc1 = &pmu_rtc;
 		sep = &sep;
 	};
 };
@@ -81,12 +83,10 @@
 &aop {
 	accel {
 		compatible = "apple,t6000-aop-accel", "apple,aop-accel";
-		status = "disabled";
 	};
 
 	gyro {
 		compatible = "apple,t6000-aop-gyro", "apple,aop-gyro";
-		status = "disabled";
 	};
 };
 

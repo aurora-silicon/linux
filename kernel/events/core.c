@@ -7349,9 +7349,11 @@ static int perf_mmap_rb(struct vm_area_struct *vma, struct perf_event *event,
 		if (refcount_inc_not_zero(&event->rb->mmap_count)) {
 			/*
 			 * Success -- managed to mmap() the same buffer
-			 * multiple times.
+			 * multiple times. The alias shares the ring's
+			 * already-locked pages; the existing charge stays
+			 * as-is and is removed once, when the last mapping
+			 * closes.
 			 */
-			perf_mmap_account(vma, user_extra, extra);
 			refcount_inc(&event->mmap_count);
 			return 0;
 		}
@@ -7463,9 +7465,16 @@ static int perf_mmap_aux(struct vm_area_struct *vma, struct perf_event *event)
 
 		refcount_set(&rb->aux_mmap_count, 1);
 		rb->aux_mmap_locked = extra;
+
+		/*
+		 * Charge the AUX area once, at first allocation. The alias
+		 * branch above shares the already-locked pages and adds no
+		 * charge; the single charge is removed when the last AUX
+		 * mapping closes.
+		 */
+		perf_mmap_account(vma, user_extra, extra);
 	}
 
-	perf_mmap_account(vma, user_extra, extra);
 	refcount_inc(&event->mmap_count);
 
 	return 0;

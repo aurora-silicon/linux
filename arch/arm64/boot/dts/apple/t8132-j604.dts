@@ -80,6 +80,14 @@
 	apple,panel-height-mm = <196>;
 };
 
+/*
+ * The M4 PMGR policy disables ps_dptx_phy, which the shared boot
+ * framebuffer lists; as on the J713, the loader keeps the display on.
+ */
+&framebuffer0 {
+	/delete-property/ power-domains;
+};
+
 &sound_jack {
 	compatible = "apple,j604-macaudio-jack", "apple,macaudio";
 	model = "MacBook Pro J604 Jack";
