@@ -253,6 +253,7 @@ struct typec_thunderbolt_switch_desc {
 struct typec_thunderbolt_switch *
 fwnode_typec_thunderbolt_switch_get(struct fwnode_handle *fwnode);
 void typec_thunderbolt_switch_put(struct typec_thunderbolt_switch *sw);
+bool typec_thunderbolt_switch_is_live(struct typec_thunderbolt_switch *sw);
 int typec_thunderbolt_switch_set(struct typec_thunderbolt_switch *sw,
 				 const struct typec_thunderbolt_switch_data *data);
 int typec_thunderbolt_switch_register_notifier(struct typec_thunderbolt_switch *sw,
@@ -300,6 +301,12 @@ typec_thunderbolt_switch_register(struct device *parent,
 				  const struct typec_thunderbolt_switch_desc *desc)
 {
 	return ERR_PTR(-EOPNOTSUPP);
+}
+
+static inline bool
+typec_thunderbolt_switch_is_live(struct typec_thunderbolt_switch *sw)
+{
+	return false;
 }
 
 static inline int

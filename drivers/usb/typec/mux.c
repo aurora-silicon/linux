@@ -867,6 +867,26 @@ void typec_thunderbolt_switch_put(struct typec_thunderbolt_switch *sw)
 EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_put);
 
 /**
+ * typec_thunderbolt_switch_is_live - Whether the switch provider is still bound
+ * @sw: USB4/Thunderbolt switch
+ *
+ * A handle outlives the provider: once the provider unregisters its switch,
+ * typec_thunderbolt_switch_set() fails with -ENODEV. A provider that binds
+ * again registers a new switch, which must be looked up again.
+ *
+ * Return: %true if @sw is valid and its provider is still registered.
+ */
+bool typec_thunderbolt_switch_is_live(struct typec_thunderbolt_switch *sw)
+{
+	if (IS_ERR_OR_NULL(sw))
+		return false;
+
+	guard(rwsem_read)(&sw->sw_dev->set_lock);
+	return sw->sw_dev->set;
+}
+EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_is_live);
+
+/**
  * typec_thunderbolt_switch_set - Forward cable details to USB4/Thunderbolt switch
  * @sw: USB4/Thunderbolt switch
  * @data: Cable state and details

@@ -2235,26 +2235,38 @@ cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode,
 EXPORT_SYMBOL_IF_KUNIT(cd321x_tbt_switch_get);
 
 /*
- * Take a router that bound after the port gave up on it. An attached cable
- * raises no new event, so reapply it through the router as after system sleep.
+ * Take a router that bound after the port gave up on it, or that unbound and
+ * bound again. An attached cable raises no new event, so reapply it through
+ * the router as after system sleep.
  */
 static void cd321x_tbt_attach_work(struct work_struct *work)
 {
 	struct cd321x *cd321x = container_of(work, struct cd321x,
 					    tbt_attach_work);
 	struct tps6598x *tps = &cd321x->tps;
-	struct typec_thunderbolt_switch *sw;
+	struct typec_thunderbolt_switch *sw, *old;
 	int ret;
 
 	scoped_guard(mutex, &tps->lock) {
-		if (cd321x->tbt_switch || cd321x->pm.phase == CD321X_PM_REMOVED)
+		if (cd321x->pm.phase == CD321X_PM_REMOVED)
 			return;
+		/* The router this port uses is still bound. */
+		if (typec_thunderbolt_switch_is_live(cd321x->tbt_switch))
+			return;
+		old = cd321x->tbt_switch;
 	}
 
 	/* Another port's router, or this one is not usable yet: keep watching. */
 	sw = fwnode_typec_thunderbolt_switch_get(cd321x->tbt_fwnode);
 	if (IS_ERR_OR_NULL(sw))
 		return;
+
+	/* The router went away: its switch sends nothing more, stop listening. */
+	if (old && cd321x->tbt_notifier_registered) {
+		typec_thunderbolt_switch_unregister_notifier(old,
+							     &cd321x->tbt_notifier);
+		cd321x->tbt_notifier_registered = false;
+	}
 
 	ret = typec_thunderbolt_switch_register_notifier(sw,
 							 &cd321x->tbt_notifier);
@@ -2269,7 +2281,9 @@ static void cd321x_tbt_attach_work(struct work_struct *work)
 		cd321x->tbt_switch = sw;
 		cd321x->tbt_notifier_registered = true;
 	}
-	dev_info(tps->dev, "USB4/Thunderbolt router bound, reapplying the cable state\n");
+	typec_thunderbolt_switch_put(old);
+	dev_info(tps->dev, "USB4/Thunderbolt router bound%s, reapplying the cable state\n",
+		 old ? " again" : "");
 	atomic_set(&cd321x->restore_event, 1);
 	mod_delayed_work(system_freezable_wq, &cd321x->resume_work, 0);
 }
@@ -2396,8 +2410,13 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 		goto err_put_switch;
 	cd321x->tbt_notifier_registered = true;
 
-	/* Keep the port without the router rather than fail it: see above. */
-	if (tbt_late && cd321x_tbt_watch_late(cd321x, fwnode))
+	/*
+	 * Keep the port without the router rather than fail it: see above. A
+	 * router that is there can also unbind and bind again, which gives it
+	 * a new switch: watch for that as well.
+	 */
+	if ((tbt_late || cd321x->tbt_switch) &&
+	    cd321x_tbt_watch_late(cd321x, fwnode))
 		dev_warn(tps->dev, "cannot watch for the USB4/Thunderbolt router\n");
 
 	return 0;
