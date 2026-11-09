@@ -1695,14 +1695,65 @@ static void cd321x_rearm_debug_link(struct cd321x *cd321x)
 	cd321x->rearm_pending = false;
 }
 
+/* The cut's cold reset, and how it waits for the contract to come back, see apple_sleep_usb_down(). */
+#define CD321X_REARM_RESET_AFTER	4
+#define CD321X_REARM_RESETS		3
+#define CD321X_RESET_MS			1000
+#define CD321X_CONTRACT_MS		5000
+
+static bool cd321x_has_contract(struct tps6598x *tps)
+{
+	u16 pwr;
+
+	return !tps6598x_read16(tps, TPS_REG_POWER_STATUS, &pwr) &&
+	       TPS_POWER_STATUS_CONNECTION(pwr) &&
+	       TPS_POWER_STATUS_PWROPMODE(pwr) == TYPEC_PWR_MODE_PD;
+}
+
+/*
+ * The debug VDM needs a PD contract. After a cut whose sleep was refused, the partner was
+ * found to have dropped it, both ends at default USB power, and no try could rearm the link.
+ * Do what the cut does when the contract doesn't come back: reset the controller again and
+ * wait for it. The controller then needs setting up as after the cut.
+ */
+static void cd321x_rearm_recover_contract(struct cd321x *cd321x)
+{
+	struct tps6598x *tps = &cd321x->tps;
+	int ms, ret;
+
+	lockdep_assert_held(&tps->lock);
+	cd321x->rearm_resets++;
+	dev_warn(tps->dev, "debug link: no contract with the partner, reset %u\n",
+		 cd321x->rearm_resets);
+	ret = tps6598x_exec_cmd_tmo(tps, "Gaid", 0, NULL, 0, NULL, 2000, 0);
+	if (ret)
+		dev_dbg(tps->dev, "reset command: %d\n", ret);
+	msleep(CD321X_RESET_MS);
+	for (ms = 0; ms < CD321X_CONTRACT_MS && !cd321x_has_contract(tps); ms += 50)
+		msleep(50);
+	if (ms < CD321X_CONTRACT_MS)
+		dev_info(tps->dev, "debug link: contract back %d ms after reset %u\n",
+			 CD321X_RESET_MS + ms, cd321x->rearm_resets);
+	cd321x->pm.setup_pending = true;
+	cd321x->reset_by_cut = true;
+	cd321x->state_valid = false;
+	mod_delayed_work(system_freezable_wq, &cd321x->resume_work, 0);
+	cd321x->rearm_tries = 0;
+}
+
 static void cd321x_rearm_work(struct work_struct *work)
 {
 	struct cd321x *cd321x = container_of(to_delayed_work(work), struct cd321x, rearm_work);
+	struct tps6598x *tps = &cd321x->tps;
 
-	guard(mutex)(&cd321x->tps.lock);
-	if (cd321x->rearm_pending && cd321x->pm.phase != CD321X_PM_PREPARED &&
-	    cd321x->pm.phase != CD321X_PM_REMOVED)
-		cd321x_rearm_debug_link(cd321x);
+	guard(mutex)(&tps->lock);
+	if (!cd321x->rearm_pending || cd321x->pm.phase == CD321X_PM_PREPARED ||
+	    cd321x->pm.phase == CD321X_PM_REMOVED)
+		return;
+	if (cd321x->rearm_tries >= CD321X_REARM_RESET_AFTER &&
+	    cd321x->rearm_resets < CD321X_REARM_RESETS && !cd321x_has_contract(tps))
+		cd321x_rearm_recover_contract(cd321x);
+	cd321x_rearm_debug_link(cd321x);
 }
 
 static void cd321x_complete(struct tps6598x *tps)
@@ -1728,6 +1779,7 @@ static void cd321x_complete(struct tps6598x *tps)
 		cd321x->rearm_pending = true;
 	if (cd321x->rearm_pending && !pm_dark_wake()) {
 		cd321x->rearm_tries = 0;
+		cd321x->rearm_resets = 0;
 		cd321x_rearm_debug_link(cd321x);
 	}
 	if (cd321x_pm_resume(&cd321x->pm))

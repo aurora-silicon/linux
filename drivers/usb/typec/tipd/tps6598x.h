@@ -473,6 +473,8 @@ struct cd321x {
 	/* The debug link is still to be rearmed after a cut, and the tries so far */
 	bool rearm_pending;
 	unsigned int rearm_tries;
+	/* Resets taken since the cut for a contract the partner dropped, see cd321x_rearm_work() */
+	unsigned int rearm_resets;
 	bool dp_sink_reported;
 	bool dp_irq_hpd;
 
