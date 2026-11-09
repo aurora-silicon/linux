@@ -19,7 +19,9 @@ use crate::{
     hw::t8140::{dynamic, resources as cfg},
     mmu,
 };
-use core::sync::atomic::{fence as barrier, AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{
+    fence as barrier, AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering,
+};
 use kernel::{
     dma_fence::{Fence, FenceContexts, RawDmaFence, UserFence},
     new_mutex,
@@ -77,6 +79,7 @@ impl Destination {
         while self.buffer.read_timestamp(self.offset) != Some(ns) {
             if polls == WINDOW_POLLS {
                 WINDOW_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                WINDOW_MISSES.fetch_add(1, Ordering::Relaxed);
                 self.write(ticks);
                 return;
             }
@@ -84,6 +87,7 @@ impl Destination {
             polls += 1;
         }
         WINDOW_KEPT.fetch_add(1, Ordering::Relaxed);
+        WINDOW_MISSES.store(0, Ordering::Relaxed);
     }
 }
 
@@ -100,6 +104,11 @@ const WINDOW_POLLS: u32 = 40;
 const WINDOW_POLL_US: i64 = 5;
 static WINDOW_KEPT: AtomicU64 = AtomicU64::new(0);
 static WINDOW_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+/// Host fallbacks in a row. At [`WINDOW_GIVE_UP`] the firmware is taken not to write through
+/// the window at all (mapping refused, other firmware), and no render is handed a window
+/// address again, so none pays the full wait.
+static WINDOW_MISSES: AtomicU32 = AtomicU32::new(0);
+const WINDOW_GIVE_UP: u32 = 8;
 
 /// `capacity`: firmware-written end stamps kept, and those the host had to write.
 pub(crate) fn window_counters() -> [u64; 2] {
@@ -149,7 +158,7 @@ impl Destinations {
     /// Window addresses for a render's vertex and fragment start/end destinations: the fragment
     /// end's if it is mapped in the window, 0 for the others.
     fn window_vas(&self) -> [u64; 4] {
-        if !self.render {
+        if !self.render || WINDOW_MISSES.load(Ordering::Relaxed) >= WINDOW_GIVE_UP {
             return [0; 4];
         }
         let vas: [u64; 4] = core::array::from_fn(|i| {
