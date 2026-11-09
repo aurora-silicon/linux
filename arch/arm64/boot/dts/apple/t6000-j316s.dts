@@ -9,6 +9,12 @@
 
 /dts-v1/;
 
+/*
+ * PMP manages system power states, as on the J314s: the ANE, GPU, AVD and
+ * JPEG send it their performance requests, and the board idles lower.
+ */
+#define APPLE_USE_PMP
+
 #include "t6000.dtsi"
 #include "t600x-j314-j316.dtsi"
 
