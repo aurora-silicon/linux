@@ -101,6 +101,7 @@ static inline int apple_pmp_report_set_request(const struct device_node *report_
 {
 	return -ENODEV;
 }
+
 #endif
 
 #endif /* _LINUX_SOC_APPLE_PMP_REPORT_H_ */

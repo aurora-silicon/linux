@@ -10,6 +10,12 @@
 static DEFINE_MUTEX(pmp_lock);
 static const void *pmp_data;
 static struct device *pmp_device;
+static u16 constraint_known;
+static u8 constraint_dcs[16];
+static u8 constraint_soc[16];
+
+#define APPLE_PMP_CONSTRAINT_SOC 0
+#define APPLE_PMP_CONSTRAINT_DCS 2
 
 int apple_pmp_register(struct device *dev, const void *data)
 {
@@ -21,6 +27,7 @@ int apple_pmp_register(struct device *dev, const void *data)
 	else {
 		pmp_data = data;
 		pmp_device = dev;
+		constraint_known = 0;
 	}
 	return ret;
 }
@@ -31,6 +38,7 @@ void apple_pmp_unregister(const void *data)
 	if (pmp_data == data) {
 		pmp_data = NULL;
 		pmp_device = NULL;
+		constraint_known = 0;
 	}
 }
 
@@ -95,6 +103,64 @@ int apple_pmp_set_device_power(u8 command, u16 device_id, u32 enabled)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_pmp_set_device_power);
+
+/*
+ * T8112's control command owns constraint admission and the SOC-DEV-DVFS
+ * aggregation. Raise memory before fabric and lower fabric before memory so a
+ * partially completed exchange remains performance-safe. The firmware reply
+ * stream is untagged, hence the same lock as device-power commands.
+ */
+int apple_pmp_set_device_constraint(u8 device_id, u8 dcs, u8 soc)
+{
+	u8 old_dcs, old_soc;
+	int ret;
+
+	if ((device_id != APPLE_PMP_T8112_EACC0 && device_id != APPLE_PMP_T8112_PACC0 &&
+	     device_id != APPLE_PMP_T8112_ANE0) ||
+	    dcs > APPLE_PMP_T8112_DCS_MAX || soc > APPLE_PMP_T8112_SOC_MAX)
+		return -EINVAL;
+	guard(mutex)(&pmp_lock);
+	if (!pmp_data)
+		return -ENODEV;
+	ret = apple_pmp_report_wait_supplier_ready(pmp_device, 5000);
+	if (ret)
+		return ret;
+
+	/*
+	 * A target starts released. The cache records each acknowledged step,
+	 * so a partial exchange is retried from what the firmware accepted.
+	 */
+	if (!(constraint_known & (1U << device_id))) {
+		constraint_dcs[device_id] = 0;
+		constraint_soc[device_id] = 0;
+		constraint_known |= 1U << device_id;
+	}
+	old_dcs = constraint_dcs[device_id];
+	old_soc = constraint_soc[device_id];
+	if (dcs > old_dcs) {
+		ret = apple_pmp_send_constraint_command(pmp_data, device_id,
+							APPLE_PMP_CONSTRAINT_DCS, dcs);
+		if (ret)
+			return ret;
+		constraint_dcs[device_id] = dcs;
+	}
+	if (soc != old_soc) {
+		ret = apple_pmp_send_constraint_command(pmp_data, device_id,
+							APPLE_PMP_CONSTRAINT_SOC, soc);
+		if (ret)
+			return ret;
+		constraint_soc[device_id] = soc;
+	}
+	if (dcs < old_dcs) {
+		ret = apple_pmp_send_constraint_command(pmp_data, device_id,
+							APPLE_PMP_CONSTRAINT_DCS, dcs);
+		if (ret)
+			return ret;
+		constraint_dcs[device_id] = dcs;
+	}
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_set_device_constraint);
 
 /* Reassert after startup, including a report left set by an earlier failure. */
 int apple_pmp_t6030_gpu_ready(void)

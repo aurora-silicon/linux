@@ -44,11 +44,19 @@
 #define PMP_REPORT_POLL_MS	100
 #define PMP_REPORT_POLL_SLOW_MS	1000
 #define PMP_REPORT_FAST_POLLS	300
+#define PMP_DVFS_STATE_READY_TIMEOUT_US	50000
 
 /**
  * struct apple_pmp_report_offsets - per-SoC layout of the report region
  * @tgt_read: power state request, read side
  * @tgt_write: power state request, write side
+ * @update: update aperture base offset (8 bytes per entry)
+ * @dvfs_first: first qualified SOC-DEV-DVFS entry
+ * @dvfs_count: number of qualified SOC-DEV-DVFS entries
+ * @dvfs_ready_state: achieved-state report used by the DVFS ready gate
+ * @dvfs_ready_entry: PTD entry primed by the ready gate
+ * @dvfs_ready_prime: word written to @dvfs_ready_entry to request a report
+ * @soc_dvfs_state: SOC achieved-state report offset; 0 if not reported
  * @actual: power state acknowledgment
  * @status: PMP status; bit 0 is set while the PMP is running
  * @fast_die: 32-bit word holding the fast die-temperature effort of each
@@ -76,6 +84,9 @@ struct apple_pmp_report_offsets {
 	/* Update aperture of every entry (8 bytes each) and SOC-DEV-DVFS range. */
 	u32 update;
 	u32 dvfs_first, dvfs_count;
+	u32 dvfs_ready_state, dvfs_ready_entry;
+	u64 dvfs_ready_prime;
+	u32 soc_dvfs_state;
 	bool running_any;
 	bool defer_requests;
 	bool starts_pmp;
@@ -94,7 +105,7 @@ struct apple_pmp_report {
 	struct device *ane_owner;
 	const struct apple_pmp_report_offsets *offsets;
 	void __iomem *base;
-	/* Protects the request word, @shadow, @known and @defer. */
+	/* Protects residency and whole-word DVFS shadows, and @defer. */
 	spinlock_t lock;
 	struct list_head list;
 	struct dentry *debugfs;
@@ -103,6 +114,15 @@ struct apple_pmp_report {
 	/* Requests made through entries: bits requested on, all bits. */
 	u64 shadow;
 	u64 known;
+	u64 request_word;
+	bool request_word_known;
+	/* Provider-owned words; never initialized by reading request entries. */
+	u64 dvfs_words[64];
+	u64 dvfs_known;
+	u64 dvfs_ready_prime_word;
+	u64 dvfs_ready_achieved_word;
+	bool dvfs_ready_prime_sent;
+	bool dvfs_ready;
 	/* Requests are held in memory until the PMP runs (@defer_requests). */
 	bool defer;
 	unsigned int polls;
@@ -114,6 +134,14 @@ static bool apple_pmp_report_running(const struct apple_pmp_report *rep)
 	u64 status = readq(rep->base + rep->offsets->status);
 
 	return rep->offsets->running_any ? status : status & PMP_REPORT_READY;
+}
+
+/* The caller holds @rep->lock. Keep the complete last host store observable. */
+static void apple_pmp_report_write_request(struct apple_pmp_report *rep, u64 word)
+{
+	writeq(word, rep->base + rep->offsets->tgt_write);
+	rep->request_word = word;
+	rep->request_word_known = true;
 }
 
 static ssize_t type_show(struct device *dev, struct device_attribute *attr, char *buf)
@@ -193,7 +221,7 @@ static int apple_pmp_ane_request(void *ctx, bool enable)
 	} else {
 		val &= ~bit;
 	}
-	writeq(val, rep->base + rep->offsets->tgt_write);
+	apple_pmp_report_write_request(rep, val);
 	spin_unlock_irqrestore(&rep->lock, flags);
 	if (!enable) {
 		int ret = readq_poll_timeout(rep->base + rep->offsets->actual, val,
@@ -360,16 +388,57 @@ EXPORT_SYMBOL_GPL(apple_pmp_report_fast_die_effort);
 
 static void apple_pmp_start_show(struct seq_file *s, struct apple_pmp_start *st);
 
-/* Read only the documented status and fast-die entries, never the aperture. */
+/* Never read a DVFS request: show only the provider-owned shadow. */
 static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 {
 	struct apple_pmp_report *rep = s->private;
 	const struct apple_pmp_report_offsets *offs = rep->offsets;
 	bool running = apple_pmp_report_running(rep);
 	unsigned int lane;
+	unsigned long flags;
+	u64 known, shadow, request_word, dvfs_known, words[64];
+	u64 dvfs_ready_prime_word, dvfs_ready_achieved_word;
+	bool request_word_known, dvfs_ready_prime_sent, dvfs_ready;
 	u32 effort;
 
+	spin_lock_irqsave(&rep->lock, flags);
+	known = rep->known;
+	shadow = rep->shadow;
+	request_word = rep->request_word;
+	request_word_known = rep->request_word_known;
+	dvfs_known = rep->dvfs_known;
+	dvfs_ready_prime_word = rep->dvfs_ready_prime_word;
+	dvfs_ready_achieved_word = rep->dvfs_ready_achieved_word;
+	dvfs_ready_prime_sent = rep->dvfs_ready_prime_sent;
+	dvfs_ready = rep->dvfs_ready;
+	memcpy(words, rep->dvfs_words, sizeof(words));
+	spin_unlock_irqrestore(&rep->lock, flags);
 	seq_printf(s, "running: %u\n", running);
+	seq_printf(s, "requests_known: %#llx\nrequests_on: %#llx\n", known, shadow);
+	if (request_word_known)
+		seq_printf(s, "request_write: offset: %#x word: %#llx (host)\n",
+			   offs->tgt_write, request_word);
+	if (running)
+		seq_printf(s, "acknowledged: %#llx\n", readq(rep->base + offs->actual));
+	for (lane = 0; lane < ARRAY_SIZE(words); lane++)
+		if (dvfs_known & BIT_ULL(lane))
+			seq_printf(s, "dvfs_request@%x: offset: %#x word: %#llx (host)\n",
+				   offs->dvfs_first + lane,
+				   offs->update + 8 * (offs->dvfs_first + lane), words[lane]);
+	if (offs->dvfs_ready_prime) {
+		seq_printf(s, "dvfs_ready_prime@%x: offset: %#x word: %#llx (host) sent: %u\n",
+			   offs->dvfs_ready_entry,
+			   offs->update + 8 * offs->dvfs_ready_entry,
+			   dvfs_ready_prime_word, dvfs_ready_prime_sent);
+		seq_printf(s, "dvfs_ready_achieved@%x: offset: %#x word: %#llx ready: %u\n",
+			   offs->dvfs_ready_entry, offs->dvfs_ready_state,
+			   dvfs_ready_achieved_word, dvfs_ready);
+		if (running && offs->soc_dvfs_state)
+			seq_printf(s, "soc_dvfs_state: offset: %#x word: %#llx metadata: %#llx\n",
+				   offs->soc_dvfs_state,
+				   readq(rep->base + offs->soc_dvfs_state),
+				   readq(rep->base + offs->soc_dvfs_state + 8));
+	}
 	if (rep->start)
 		apple_pmp_start_show(s, rep->start);
 	if (!running || !offs->fast_die)
@@ -431,7 +500,7 @@ static void apple_pmp_report_ready_work(struct work_struct *work)
 	spin_lock_irqsave(&rep->lock, flags);
 	val = readq(rep->base + offs->tgt_read);
 	val = (val & ~rep->known) | rep->shadow;
-	writeq(val, rep->base + offs->tgt_write);
+	apple_pmp_report_write_request(rep, val);
 	want = rep->shadow;
 	rep->defer = false;
 	spin_unlock_irqrestore(&rep->lock, flags);
@@ -1395,10 +1464,10 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	if (rep->offsets == &apple_pmp_offsets_t600x)
 		apple_pmp_agx_activity_resume();
 
-	if (rep->offsets->fast_die || rep->start)
-		rep->debugfs = debugfs_create_file(dev_name(dev), 0400,
-						   apple_pmp_report_debugfs, rep,
-						   &apple_pmp_report_status_fops);
+	/* Every provider has PMP-STATUS, including T6000/T8112 without sensors. */
+	rep->debugfs = debugfs_create_file(dev_name(dev), 0400,
+					   apple_pmp_report_debugfs, rep,
+					   &apple_pmp_report_status_fops);
 
 	/* Publish the region before child power callbacks start looking it up. */
 	ret = of_platform_populate(np, NULL, NULL, dev);
@@ -1445,6 +1514,15 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t6030 = {
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t8112 = {
 	.tgt_read = 0xa00,
 	.tgt_write = 0x10500,
+	.update = 0x10000,
+	/* DVFS readiness belongs to range base entry 8, not SOC state entry 9. */
+	.dvfs_ready_state = 0x80,
+	.dvfs_ready_entry = 0x8,
+	.dvfs_ready_prime = 1,
+	.soc_dvfs_state = 0x90,
+	/* EACC0 through JPEG; individual consumers are still allow-listed. */
+	.dvfs_first = 0xa8,
+	.dvfs_count = 0xb3 - 0xa8,
 	.actual = 0xa40,
 	.status = 0x10,
 };
@@ -1566,7 +1644,7 @@ struct apple_pmp_report_entry {
 	bool released;
 	/*
 	 * With @dvfs, the SOC-DEV-DVFS entry this soc-device's performance
-	 * request lives in, and the request word written while powered.
+	 * request lives in, its request class and the level while powered.
 	 */
 	bool dvfs;
 	u32 dvfs_entry;
@@ -1602,7 +1680,7 @@ static int apple_pmp_report_set_state(struct apple_pmp_report *rep, u32 id,
 		val &= ~bit_val;
 		if (enable)
 			val |= bit_val;
-		writeq(val, rep->base + rep->offsets->tgt_write);
+		apple_pmp_report_write_request(rep, val);
 	}
 	spin_unlock_irqrestore(&rep->lock, flags);
 	if (!ready || !apple_pmp_report_running(rep) || no_ack)
@@ -1890,13 +1968,61 @@ int apple_pmp_report_set_t6030_gfx(struct device *supplier, bool enable)
 }
 EXPORT_SYMBOL_GPL(apple_pmp_report_set_t6030_gfx);
 /*
+ * T8112 does not accept device constraints until the DVFS range's ready-state
+ * report has been published. If the report is still zero, prime the range's
+ * base entry and wait for a nonzero achieved state before the first request.
+ * The range gate is distinct from the following per-domain SOC state entry.
+ */
+static int apple_pmp_report_dvfs_prepare(struct apple_pmp_report *rep)
+{
+	const struct apple_pmp_report_offsets *offs = rep->offsets;
+	unsigned long flags;
+	u64 state;
+	int ret;
+
+	if (!offs->dvfs_ready_prime || READ_ONCE(rep->dvfs_ready))
+		return 0;
+
+	state = readq(rep->base + offs->dvfs_ready_state);
+	if (!state) {
+		spin_lock_irqsave(&rep->lock, flags);
+		if (!rep->dvfs_ready_prime_sent) {
+			writeq(offs->dvfs_ready_prime,
+			       rep->base + offs->update + 8 * offs->dvfs_ready_entry);
+			rep->dvfs_ready_prime_word = offs->dvfs_ready_prime;
+			rep->dvfs_ready_prime_sent = true;
+		}
+		spin_unlock_irqrestore(&rep->lock, flags);
+
+		ret = readq_poll_timeout_atomic(rep->base + offs->dvfs_ready_state, state,
+						state, 100,
+						PMP_DVFS_STATE_READY_TIMEOUT_US);
+		if (ret)
+			return ret;
+	}
+
+	spin_lock_irqsave(&rep->lock, flags);
+	rep->dvfs_ready_achieved_word = state;
+	rep->dvfs_ready = true;
+	spin_unlock_irqrestore(&rep->lock, flags);
+	return 0;
+}
+
+/*
  * One 64-bit store of the whole request word. Never read a request entry
  * back after storing it: the read retires the pending PTD update before the
  * PMP handles it, and the request is lost.
  */
 static void apple_pmp_report_dvfs_write(struct apple_pmp_report *rep, u32 entry, u64 val)
 {
+	unsigned int index = entry - rep->offsets->dvfs_first;
+	unsigned long flags;
+
+	spin_lock_irqsave(&rep->lock, flags);
+	rep->dvfs_words[index] = val;
 	writeq(val, rep->base + rep->offsets->update + 8 * entry);
+	rep->dvfs_known |= BIT_ULL(index);
+	spin_unlock_irqrestore(&rep->lock, flags);
 }
 
 /**
@@ -1959,12 +2085,25 @@ static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, boo
 	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
 		if (rep->dev->of_node != ent->report_node)
 			continue;
+		/* A ready-gated range takes requests only from a running PMP. */
+		if (ent->dvfs && rep->offsets->dvfs_ready_prime &&
+		    (READ_ONCE(rep->defer) || !apple_pmp_report_running(rep))) {
+			ret = -EAGAIN;
+			break;
+		}
 		/* The device request is admitted first and the level dropped first. */
 		if (ent->dvfs && !enable)
 			apple_pmp_report_dvfs_write(rep, ent->dvfs_entry, ent->dvfs_off);
 		ret = apple_pmp_report_set_state(rep, ent->id, enable, ent->no_ack);
-		if (ent->dvfs && enable && !ret)
+		if (ent->dvfs && enable && !ret) {
+			ret = apple_pmp_report_dvfs_prepare(rep);
+			if (ret) {
+				/* Do not leave an admitted device behind a failed floor. */
+				apple_pmp_report_set_state(rep, ent->id, false, true);
+				break;
+			}
 			apple_pmp_report_dvfs_write(rep, ent->dvfs_entry, ent->dvfs_on);
+		}
 		break;
 	}
 	rcu_read_unlock();
