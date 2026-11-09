@@ -115,6 +115,14 @@ mod tests {
         assert!(state.restart_limit(u64::MAX));
     }
     #[test]
+    fn restarts_with_work_retired_between_them_do_not_accumulate() {
+        let mut storm = Storm::new();
+        for n in 0..64 { assert!(!storm.note_unless_progress(0, n)); }
+        for _ in 1..LIMIT { assert!(!storm.note_unless_progress(0, 64)); }
+        assert!(storm.note_unless_progress(0, 64));
+        assert!(storm.note_unless_progress(0, 65));
+    }
+    #[test]
     fn separated_faults_do_not_accumulate_and_latched_loss_cannot_wrap() {
         let mut storm = Storm::new();
         for n in 0..64 { assert!(!storm.note(n * WINDOW_NS)); }
