@@ -142,6 +142,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "i2c0";
+		power-domains = <&ps_sio>;
 	};
 
 	ps_spi_p: power-controller@2f0 {
@@ -150,6 +151,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "spi_p";
+		power-domains = <&ps_sio>;
 		status = "okay";
 	};
 
@@ -879,6 +881,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "fpwm0";
+		power-domains = <&ps_sio>;
 		status = "okay";
 	};
 
@@ -888,6 +891,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "fpwm1";
+		power-domains = <&ps_sio>;
 		status = "okay";
 	};
 
@@ -897,6 +901,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "fpwm2";
+		power-domains = <&ps_sio>;
 		status = "okay";
 	};
 
@@ -906,6 +911,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "i2c1";
+		power-domains = <&ps_sio>;
 		status = "okay";
 	};
 
@@ -915,6 +921,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "i2c2";
+		power-domains = <&ps_sio>;
 		status = "okay";
 	};
 
@@ -924,6 +931,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "i2c3";
+		power-domains = <&ps_sio>;
 		status = "okay";
 	};
 
@@ -933,6 +941,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "i2c4";
+		power-domains = <&ps_sio>;
 		status = "okay";
 	};
 
@@ -942,6 +951,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "uart_p";
+		power-domains = <&ps_sio>;
 		status = "okay";
 	};
 
@@ -962,6 +972,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "aes";
+		power-domains = <&ps_sio>;
 		status = "okay";
 	};
 
