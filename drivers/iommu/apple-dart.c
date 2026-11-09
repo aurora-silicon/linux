@@ -299,6 +299,7 @@ struct apple_dart {
 	u32 locked : 1;
 	u32 tunneled : 1;
 	u32 per_stream : 1;
+	u32 isp_host : 1;
 	u32 power_retained : 1;
 	/* Locked roots may hold firmware slots that mirror Linux mappings. */
 	u32 fw_mirror : 1;
@@ -2001,11 +2002,45 @@ static void apple_dart_managed_quarantine(struct apple_dart *dart)
 	spin_unlock_irqrestore(&dart->managed_lock, flags);
 }
 
+/* ISP streams 4/5/8/9 belong to its secure core. Never reset those roots. */
+static int apple_dart_isp_host_reset(struct apple_dart *dart)
+{
+	const u32 host = BIT(0) | BIT(1) | BIT(6) | BIT(7) |
+			 BIT(10) | BIT(11) | BIT(12);
+	struct apple_dart_stream_map map = { .dart = dart };
+	unsigned int sid;
+	int ret;
+
+	if (dart->hw->type != DART_T8110 || dart->num_streams != 16 ||
+	    dart->locked || (apple_dart_readl(dart, DART_T8110_ERROR) & DART_T8110_ERROR_FLAG))
+		return -EBUSY;
+	for (sid = 0; sid < 16; sid++)
+		if (host & BIT(sid))
+			__set_bit(sid, map.sidmap);
+	apple_dart_hw_disable_dma(&map);
+	apple_dart_hw_clear_all_ttbrs(&map);
+	apple_dart_hw_apply_remaps(dart);
+	apple_dart_writel(dart, host, DART_T8110_ENABLE_STREAMS);
+	for (sid = 0; sid < 16; sid++) {
+		if (!(host & BIT(sid)))
+			continue;
+		bitmap_zero(map.sidmap, DART_MAX_STREAMS);
+		__set_bit(sid, map.sidmap);
+		ret = dart->hw->invalidate_tlb(&map);
+		if (ret)
+			return ret;
+	}
+	apple_dart_writel(dart, 0, DART_T8110_ERROR_MASK);
+	return 0;
+}
+
 static int apple_dart_hw_reset(struct apple_dart *dart)
 {
 	struct apple_dart_stream_map stream_map;
 	int i;
 
+	if (dart->isp_host)
+		return apple_dart_isp_host_reset(dart);
 	if (dart->managed_sids || dart->cold_ane)
 		return -EBUSY;
 	stream_map.dart = dart;
@@ -2990,6 +3025,8 @@ static int apple_dart_of_xlate(struct device *dev,
 		return i;
 
 	sid = args->args[0];
+	if (dart->isp_host && sid != 0 && sid != 12)
+		return -EINVAL;
 	if (dart->cold_ane && sid != 0)
 		return -EPERM;
 	if (dart->managed_sids &&
@@ -4243,7 +4280,10 @@ static int apple_dart_probe(struct platform_device *pdev)
 	dart->cold_ane = of_device_is_compatible(dev->of_node, "apple,t8140-ane-dart");
 	if (dart->cold_ane && !IS_BUILTIN(CONFIG_APPLE_DART))
 		return -EOPNOTSUPP;
-	dart->per_stream = of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
+	dart->isp_host = of_device_is_compatible(dev->of_node, "apple,t6050-isp-dart");
+	dart->power_retained = dart->isp_host;
+	dart->per_stream = dart->isp_host ||
+			   of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
 			   of_device_is_compatible(dev->of_node, "apple,t8142-dart");
 	if (of_property_present(dev->of_node, "apple,managed-sids")) {
 		u32 ids[2];
@@ -4534,6 +4574,10 @@ params_done:
 		dart->locked = false;
 	else
 		dart->locked = apple_dart_is_locked(dart);
+	if (dart->isp_host && dart->locked) {
+		ret = -EBUSY;
+		goto err_clk_disable;
+	}
 	/* Reserved table-page lifetime requires the matched three-level loader. */
 	dart->fw_handoff = apple_dart_fw_handoff_enabled(dart);
 	/* Preserve our retained-root path when no reserved-table handoff exists. */

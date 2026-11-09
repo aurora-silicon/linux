@@ -222,3 +222,5 @@
 
 #define T6050_J716C
 #include "t6050-peripherals.dtsi"
+
+#include "t6050-j716c-isp.dtsi"
