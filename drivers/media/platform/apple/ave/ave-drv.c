@@ -20,6 +20,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/soc/apple/tunable.h>
 
 #include "ave.h"
 #include "ave-regs.h"
@@ -59,6 +60,8 @@ const struct ave_variant ave_t6000 = {
 	.timebase_multiplier = 1000000,
 	.vcbar_mask = 0x0000000ffffff800ULL,
 	.vcbar_flags = 0x0102000000000000ULL,
+	.text_link_cell = 0x423c,
+	.zero_based_firmware = true,
 
 	.extra0_size = 0x24,
 	.boot_qualified = true,
@@ -126,6 +129,7 @@ const struct ave_variant ave_t8112 = {
 	.text_link_cell = 0x423c,
 	.mbox_idle = 0x38,
 	.restore_data_first = true,
+	.zero_based_firmware = true,
 	.dpe = &ave_t8112_dpe,
 
 	.extra0_size = 0x4000,
@@ -269,6 +273,7 @@ static const char *const ave_pd_names[] = { "dma", "pipe4", "pipe5", "me0",
 static int ave_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	struct resource *pio_res;
 	bool perf = of_property_match_string(dev->of_node, "power-domain-names",
 					     "perf") >= 0;
 	const struct dev_pm_domain_attach_data pd_data = {
@@ -298,6 +303,21 @@ static int ave_probe(struct platform_device *pdev)
 	ave->coproc = devm_platform_ioremap_resource_byname(pdev, "coproc");
 	if (IS_ERR(ave->coproc))
 		return PTR_ERR(ave->coproc);
+	if (of_property_present(dev->of_node, "apple,tunable-axi2af")) {
+		pio_res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "pio");
+		if (!pio_res)
+			return dev_err_probe(dev, -EINVAL,
+					     "AXI2AF tunables need a pio resource\n");
+		ave->pio = devm_platform_ioremap_resource_byname(pdev, "pio");
+		if (IS_ERR(ave->pio))
+			return PTR_ERR(ave->pio);
+		ave->axi2af = devm_apple_tunable_parse(dev, dev->of_node,
+						       "apple,tunable-axi2af",
+						       pio_res);
+		if (IS_ERR(ave->axi2af))
+			return dev_err_probe(dev, PTR_ERR(ave->axi2af),
+					     "invalid AXI2AF tunables\n");
+	}
 
 	ave->domain = iommu_get_domain_for_dev(dev);
 	if (!ave->domain || !(ave->domain->type & __IOMMU_DOMAIN_PAGING))

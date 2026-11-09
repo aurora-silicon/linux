@@ -30,6 +30,7 @@ struct debugfs_blob_wrapper;
 struct dentry;
 struct dev_pm_domain_list;
 struct iommu_domain;
+struct apple_tunable;
 struct ave_vb2_mem;
 
 /* Frames the firmware can hold at once per session (Process "slots"). */
@@ -204,6 +205,8 @@ struct ave_variant {
 	u32 mbox_idle;
 	/* Restore DATA from the boot snapshot before every start, the first included. */
 	bool restore_data_first;
+	/* Preloaded TEXT starts at DART address zero and DATA follows it. */
+	bool zero_based_firmware;
 	/* DPE defaults applied before every cold firmware start, or NULL. */
 	const struct ave_dpe_table *dpe;
 
@@ -219,6 +222,8 @@ struct ave_dev {
 	void __iomem *codec;
 	void __iomem *mbox;
 	void __iomem *coproc;
+	void __iomem *pio;
+	struct apple_tunable *axi2af;
 	struct dev_pm_domain_list *pd_list;
 	struct iommu_domain *domain;
 

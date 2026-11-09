@@ -24,6 +24,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/tunable.h>
 #include <linux/unaligned.h>
 #include <linux/vmalloc.h>
 
@@ -194,6 +195,10 @@ int ave_fw_probe(struct ave_dev *ave)
 	     ave->data.iova < ave->text.iova + ave->text.size))
 		return dev_err_probe(dev, -EINVAL,
 				     "overlapping firmware segments\n");
+	if (ave->variant->zero_based_firmware &&
+	    (ave->text.iova || ave->data.iova != ave->text.size))
+		return dev_err_probe(dev, -EINVAL,
+				     "firmware must be mapped contiguously from IOVA zero\n");
 
 	if (ave_fw_check_mapping(ave, &ave->text) ||
 	    ave_fw_check_mapping(ave, &ave->data))
@@ -610,6 +615,13 @@ static int ave_fw_boot(struct ave_dev *ave)
 			dev_warn(ave->dev, "DPE defaults did not all read back\n");
 		else
 			dev_dbg(ave->dev, "DPE defaults applied\n");
+	}
+	if (ave->axi2af) {
+		apple_tunable_apply(ave->pio, ave->axi2af);
+		/* Finish fabric writes before restoring DATA and starting the IOP. */
+		wmb();
+		dev_dbg(ave->dev, "applied %zu AXI2AF tunables\n",
+			ave->axi2af->sz);
 	}
 
 	memset(ave->ring, 0, sizeof(ave->ring));
