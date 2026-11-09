@@ -46,6 +46,11 @@
 #include "core.h"
 #include "common.h"
 
+static bool brcmf_pcie_inband_ds;
+module_param_named(inband_ds, brcmf_pcie_inband_ds, bool, 0444);
+MODULE_PARM_DESC(inband_ds,
+		 "Enable experimental PCIe in-band device wake after attach");
+
 
 enum brcmf_pcie_state {
 	BRCMFMAC_PCIE_STATE_DOWN,
@@ -350,6 +355,7 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 #define BRCMF_H2D_DEVICE_WAKE_ASSERT		0x00000040
 
 #define BRCMF_PCIE_MBDATA_TIMEOUT		msecs_to_jiffies(2000)
+#define BRCMF_PCIE_MBDATA_WORK_BUDGET		32
 
 #define BRCMF_PCIE_CFGREG_STATUS_CMD		0x4
 #define BRCMF_PCIE_CFGREG_PM_CSR		0x4C
@@ -441,6 +447,8 @@ struct brcmf_pciedev_info {
 	/* Serializes DS mailbox state with H2D ring publication and suspend. */
 	struct mutex ds_lock;
 	wait_queue_head_t ds_wait;
+	atomic_t mbdata_pending;
+	struct work_struct mbdata_work;
 	bool irq_allocated;
 	bool irq_ready;
 	bool have_msi;
@@ -920,6 +928,9 @@ brcmf_pcie_send_mb_data(struct brcmf_pciedev_info *devinfo, u32 htod_mb_data)
 		struct brcmf_bus *bus = dev_get_drvdata(&pdev->dev);
 		int ret;
 
+		if (READ_ONCE(devinfo->in_irq))
+			return -EBUSY;
+
 		ret = brcmf_msgbuf_h2d_mb_write(bus->drvr, htod_mb_data);
 		if (ret < 0)
 			brcmf_err(bus, "Failed to send H2D mailbox data (%d)\n",
@@ -933,6 +944,12 @@ brcmf_pcie_send_mb_data(struct brcmf_pciedev_info *devinfo, u32 htod_mb_data)
 	if (cur_htod_mb_data != 0)
 		brcmf_dbg(PCIE, "MB transaction is already pending 0x%04x\n",
 			  cur_htod_mb_data);
+	/* The threaded IRQ owns delivery of the message which may clear this
+	 * word.  Waiting here would keep the IRQ masked and can deadlock that
+	 * delivery, so IRQ-side sends are a single bounded attempt.
+	 */
+	if (cur_htod_mb_data != 0 && READ_ONCE(devinfo->in_irq))
+		return -EBUSY;
 
 	i = 0;
 	while (cur_htod_mb_data != 0) {
@@ -988,6 +1005,12 @@ static int brcmf_pcie_ds_begin(struct brcmf_pciedev_info *devinfo)
 
 	if (!READ_ONCE(devinfo->inband_ds))
 		return 0;
+	/* Ring completion and replenishment can run from the threaded IRQ.  A
+	 * wake wait there would prevent the same thread from consuming the
+	 * DS_EXIT_NOTE.  Let the caller retry after mailbox work advances DS.
+	 */
+	if (READ_ONCE(devinfo->in_irq))
+		return -EAGAIN;
 
 	mutex_lock(&devinfo->ds_lock);
 	if (devinfo->skip_ds_ack ||
@@ -1291,7 +1314,8 @@ static void brcmf_pcie_poll_mb_data(struct brcmf_pciedev_info *devinfo)
 
 	brcmf_pcie_write_tcm32(devinfo, addr, 0);
 
-	brcmf_pcie_handle_mb_data(devinfo, dtoh_mb_data);
+	atomic_or(dtoh_mb_data, &devinfo->mbdata_pending);
+	schedule_work(&devinfo->mbdata_work);
 }
 
 
@@ -1300,7 +1324,27 @@ static void brcmf_pcie_d2h_mb_rx(struct device *dev, u32 data)
 	struct brcmf_bus *bus_if = dev_get_drvdata(dev);
 	struct brcmf_pciedev *buspub = bus_if->bus_priv.pcie;
 
-	brcmf_pcie_handle_mb_data(buspub->devinfo, data);
+	atomic_or(data, &buspub->devinfo->mbdata_pending);
+	schedule_work(&buspub->devinfo->mbdata_work);
+}
+
+static void brcmf_pcie_mbdata_work(struct work_struct *work)
+{
+	struct brcmf_pciedev_info *devinfo;
+	unsigned int i;
+	u32 data;
+
+	devinfo = container_of(work, struct brcmf_pciedev_info, mbdata_work);
+	for (i = 0; i < BRCMF_PCIE_MBDATA_WORK_BUDGET; i++) {
+		data = atomic_xchg(&devinfo->mbdata_pending, 0);
+		if (!data)
+			return;
+		brcmf_pcie_handle_mb_data(devinfo, data);
+	}
+
+	/* Bound each run even if broken firmware raises an MSI storm. */
+	if (atomic_read(&devinfo->mbdata_pending))
+		schedule_work(&devinfo->mbdata_work);
 }
 
 
@@ -2253,13 +2297,6 @@ brcmf_pcie_init_share_ram_info(struct brcmf_pciedev_info *devinfo,
 	devinfo->ds_state = BRCMF_PCIE_DS_ACTIVE;
 	devinfo->host_active = 0;
 	host_cap |= BRCMF_HOSTCAP_DS_NO_OOB_DW;
-	if (shared->flags & BRCMF_PCIE_SHARED_INBAND_DS) {
-		host_cap |= BRCMF_HOSTCAP_DS_INBAND_DW;
-		devinfo->inband_ds = true;
-		devinfo->ds_state = BRCMF_PCIE_DS_ACTIVE;
-		/* Keep firmware awake until HOSTREADY and initial DCMDs finish. */
-		devinfo->host_active = 1;
-	}
 
 	brcmf_pcie_write_tcm32(devinfo, sharedram_addr +
 			       BRCMF_SHARED_HOST_CAP_OFFSET, host_cap);
@@ -2267,6 +2304,32 @@ brcmf_pcie_init_share_ram_info(struct brcmf_pciedev_info *devinfo,
 			       BRCMF_SHARED_HOST_CAP2_OFFSET, host_cap2);
 
 	return 0;
+}
+
+static void brcmf_pcie_enable_inband_ds(struct brcmf_pciedev_info *devinfo)
+{
+	u32 addr;
+	u32 host_cap;
+
+	/* Keep the default attach contract identical to hosts without in-band
+	 * device wake.  Publishing the capability before HOSTREADY, CLM and the
+	 * initial rings are complete lets firmware enter DS during attach.
+	 */
+	if (!brcmf_pcie_inband_ds ||
+	    !(devinfo->shared.flags & BRCMF_PCIE_SHARED_INBAND_DS))
+		return;
+
+	mutex_lock(&devinfo->ds_lock);
+	devinfo->skip_ds_ack = false;
+	devinfo->ds_state = BRCMF_PCIE_DS_ACTIVE;
+	devinfo->host_active = 0;
+	WRITE_ONCE(devinfo->inband_ds, true);
+	mutex_unlock(&devinfo->ds_lock);
+
+	addr = devinfo->shared.tcm_base_address + BRCMF_SHARED_HOST_CAP_OFFSET;
+	host_cap = brcmf_pcie_read_tcm32(devinfo, addr);
+	brcmf_pcie_write_tcm32(devinfo, addr,
+			       host_cap | BRCMF_HOSTCAP_DS_INBAND_DW);
 }
 
 struct brcmf_rtlv_footer {
@@ -2988,10 +3051,7 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 	ret = brcmf_attach(&devinfo->pdev->dev);
 	if (ret)
 		goto fail;
-	/* Drop the attach-time active reference.  A deferred DS request can only
-	 * be acknowledged after HOSTREADY, CLM and the initial ring work.
-	 */
-	brcmf_pcie_ds_end(devinfo);
+	brcmf_pcie_enable_inband_ds(devinfo);
 
 	brcmf_pcie_bus_console_read(devinfo, false);
 
@@ -3306,6 +3366,7 @@ brcmf_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	devinfo->pdev = pdev;
 	mutex_init(&devinfo->ds_lock);
 	init_waitqueue_head(&devinfo->ds_wait);
+	INIT_WORK(&devinfo->mbdata_work, brcmf_pcie_mbdata_work);
 	devinfo->ds_state = BRCMF_PCIE_DS_ACTIVE;
 	pcie_bus_dev = NULL;
 	devinfo->ci = brcmf_chip_attach(devinfo, pdev->device,
@@ -3449,6 +3510,8 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 	if (devinfo->irq_allocated)
 		synchronize_irq(pdev->irq);
 
+	/* Mailbox work can arm bus_reset, so drain it before closing that gate. */
+	cancel_work_sync(&devinfo->mbdata_work);
 	brcmf_bus_cancel_reset_work(bus);
 
 	brcmf_detach(&pdev->dev);
