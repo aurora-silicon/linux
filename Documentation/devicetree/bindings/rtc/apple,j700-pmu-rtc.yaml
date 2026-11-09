@@ -21,11 +21,15 @@ allOf:
 
 properties:
   compatible:
-    enum:
-      - apple,j700-pmu-rtc
-      - apple,t6000-pmu-rtc
-      - apple,t6041-pmu-rtc
-      - apple,t8112-pmu-rtc
+    oneOf:
+      - enum:
+          - apple,j700-pmu-rtc
+          - apple,t6000-pmu-rtc
+          - apple,t6041-pmu-rtc
+          - apple,t8112-pmu-rtc
+      - items:
+          - const: apple,t8132-pmu-rtc
+          - const: apple,t6041-pmu-rtc
 
   interrupts:
     maxItems: 1
