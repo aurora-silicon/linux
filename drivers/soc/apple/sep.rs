@@ -93,6 +93,12 @@ use kernel::{
 };
 
 const SETTLE_MS: time::Msecs = 200;
+/// Messages on an endpoint without a handler are logged this many times per
+/// boot; diag/unhandled_messages counts them all.
+const UNHANDLED_LOG_LIMIT: u32 = 4;
+/// Users whose last logged lock state is remembered (a Mac has the system
+/// user 501 and one or two Linux users).
+pub(crate) const LOCK_STATE_LOG_USERS: usize = 4;
 const FIRST_RESPONSE_MS: time::Msecs = 3000;
 const RNG_SURVEY_ATTEMPTS: u32 = 5;
 
@@ -832,6 +838,10 @@ struct SepData {
     // from a stale one.
     bio_lock_state: Atomic<u64>,
     bio_lock_state_seq: Atomic<u32>,
+    // The last state logged for each of the most recent users, in the same
+    // layout, so a repeated notification is not logged again. Notifications
+    // are handled one at a time, on the receive path.
+    bio_lock_logged: [Atomic<u64>; LOCK_STATE_LOG_USERS],
 
     #[pin]
     store: Mutex<Option<xart_store::Store>>,
@@ -1099,6 +1109,7 @@ impl SepData {
                 match_scope_misses: Atomic::new(0),
                 bio_lock_state: Atomic::new(0),
                 bio_lock_state_seq: Atomic::new(0),
+                bio_lock_logged: [Atomic::new(0), Atomic::new(0), Atomic::new(0), Atomic::new(0)],
                 store <- new_mutex!(store),
                 host_store <- new_mutex!(host_store),
                 xarm <- new_mutex!(XarmState::new()),
@@ -1835,11 +1846,14 @@ impl SepData {
         };
         this.rng_survey_attempts.store(attempt, Relaxed);
         match next {
-            control::Survey::Registered => dev_info!(
-                this.dev,
-                "hwrng: registered after ready-phase survey (attempt {})\n",
-                attempt
-            ),
+            control::Survey::Registered => {
+                diag::hwrng(true);
+                dev_info!(
+                    this.dev,
+                    "hwrng: registered after ready-phase survey (attempt {})\n",
+                    attempt
+                )
+            }
             // Asleep, or holding back after a request that went unanswered:
             // this attempt did not ask the enclave anything.
             control::Survey::Held => Self::arm_settle(this),
@@ -1847,12 +1861,15 @@ impl SepData {
                 dev_warn!(this.dev, "hwrng: survey attempt {} failed ({:?}); retrying\n", attempt, e);
                 Self::arm_settle(this);
             }
-            control::Survey::GiveUp(e) => dev_err!(
-                this.dev,
-                "hwrng: survey failed after {} attempts ({:?})\n",
-                attempt,
-                e
-            ),
+            control::Survey::GiveUp(e) => {
+                diag::hwrng(false);
+                dev_err!(
+                    this.dev,
+                    "hwrng: survey failed after {} attempts ({:?})\n",
+                    attempt,
+                    e
+                )
+            }
         }
     }
 
@@ -1966,14 +1983,17 @@ impl SepData {
         match os_identity::select(hi, lo, dt::preboot_uuid) {
             os_identity::Selection::Explicit(uuid) => {
                 self.xarm.lock().os_uuid = Some(uuid);
+                diag::os_identity(diag::OsIdentity::Explicit);
                 dev_info!(self.dev, "xART: using explicit OS identity\n");
             }
             os_identity::Selection::Chosen(uuid) => {
                 self.xarm.lock().os_uuid = Some(uuid);
+                diag::os_identity(diag::OsIdentity::Chosen);
                 dev_info!(self.dev, "xART: using /chosen/apfs-preboot-uuid\n");
             }
             os_identity::Selection::Unavailable => {
                 self.xarm.lock().os_uuid = None;
+                diag::os_identity(diag::OsIdentity::Unavailable);
                 dev_warn!(self.dev, "xART: /chosen/apfs-preboot-uuid is unavailable\n");
             }
         }
@@ -2174,6 +2194,15 @@ impl SepData {
     }
 
     fn send_xarm_reply(&self, reply: &crate::xarm::XarmReply) {
+        // Each of these used to fail the enclave's request without a trace.
+        // Count them all and log the first, so a refusal is never silent.
+        if reply.status == xarm::STATUS_FAILED && diag::xarm_failed() == 1 {
+            dev_warn!(
+                self.dev,
+                "xART: answered a request (tag {:#04x}) with the failure status; diag/xarm_failures counts them\n",
+                reply.tag
+            );
+        }
         let msg = crate::xarm::encode_xarm_reply(reply);
         let _ = self.send_reply(msg);
     }
@@ -2802,6 +2831,7 @@ impl SepData {
 
         this.run_bringup();
         diag::bringup_ended();
+        diag::log_summary(&this.dev);
         this.finish_bringup();
         Self::arm_settle(this);
     }
@@ -2874,7 +2904,13 @@ impl SepData {
 
             proto::EP_BOOT => self.on_boot(msg),
 
-            ep => dev_info!(self.dev, "rx: unhandled endpoint {:#04x} (msg0 {:#018x})\n", ep, msg.msg0),
+            ep => {
+                // Counted in diag/unhandled_messages; logged the first few
+                // times only, so a chatty endpoint cannot flood the log.
+                if diag::unhandled() <= UNHANDLED_LOG_LIMIT {
+                    dev_info!(self.dev, "rx: unhandled endpoint {:#04x} (msg0 {:#018x})\n", ep, msg.msg0);
+                }
+            }
         }
     }
 
@@ -2912,7 +2948,13 @@ impl SepData {
             proto::DISCOVER_TYPE_DESCRIPTOR | proto::DISCOVER_TYPE_CONFIG => {
                 let _ = table.slot(f.param);
                 diag::endpoints(table.eps.len());
-                dev_info!(
+                if f.ty == proto::DISCOVER_TYPE_DESCRIPTOR {
+                    diag::endpoint(f.param, (msg.msg0 >> 32) as u32);
+                }
+                // One summary line follows at the end of the bring-up, and
+                // diag/endpoint_names lists them; keep the per-message trace
+                // at debug level.
+                dev_dbg!(
                     self.dev,
                     "discover: endpoint {:#04x} (type {}, msg0 {:#018x}); {} known\n",
                     f.param,
@@ -2921,7 +2963,7 @@ impl SepData {
                     table.eps.len()
                 );
             }
-            ty => dev_info!(self.dev, "discover: other type {} (msg0 {:#018x})\n", ty, msg.msg0),
+            ty => dev_dbg!(self.dev, "discover: other type {} (msg0 {:#018x})\n", ty, msg.msg0),
         }
     }
 

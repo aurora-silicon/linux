@@ -378,7 +378,7 @@ int apple_dart_dcp_dispext_stream_ok(struct device *piodma, unsigned int sid)
 	if (apple_dart_dispext_retired(pio->dart))
 		return -EIO;
 	/* Its power not confirmed since sleep: usable later, not now. */
-	return apple_dart_dispext_unconfirmed(pio->dart) ? -EAGAIN : 0;
+	return apple_dart_pm_unconfirmed(pio->dart) ? -EAGAIN : 0;
 }
 EXPORT_SYMBOL_GPL(apple_dart_dcp_dispext_stream_ok);
 
@@ -807,7 +807,7 @@ unlock:
 
 /*
  * J713 external DCP: the external display DART operations above, each
- * inside one use of the DART's registers (apple_dart_dispext_get()): with
+ * inside one use of the DART's registers (apple_dart_pm_get()): with
  * its power not confirmed since sleep, -EAGAIN before any step, nothing
  * published, nothing retired. A sleep waits for a use under way to end, so
  * no step of it (its flushes included) runs unconfirmed.
@@ -824,12 +824,12 @@ static struct apple_dart *apple_dart_dcp_dispext_gate(struct device *piodma)
 		struct apple_dart *__gd = apple_dart_dcp_dispext_gate(piodma);	\
 		typeof(call) __ret;						\
 										\
-		if (__gd && !apple_dart_dispext_get(__gd)) {			\
+		if (__gd && !apple_dart_pm_get(__gd)) {			\
 			__ret = (typeof(call))-EAGAIN;				\
 		} else {							\
 			__ret = (call);						\
 			if (__gd)						\
-				apple_dart_dispext_put(__gd);			\
+				apple_dart_pm_put(__gd);			\
 		}								\
 		__ret;								\
 	})
@@ -863,11 +863,11 @@ void *apple_dart_dcp_dispext_scanout_alloc(struct device *piodma, size_t size, u
 	struct apple_dart *dart = apple_dart_dcp_dispext_gate(piodma);
 	void *ret;
 
-	if (dart && !apple_dart_dispext_get(dart))
+	if (dart && !apple_dart_pm_get(dart))
 		return ERR_PTR(-EAGAIN);
 	ret = __apple_dart_dcp_dispext_scanout_alloc(piodma, size, dva);
 	if (dart)
-		apple_dart_dispext_put(dart);
+		apple_dart_pm_put(dart);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_dart_dcp_dispext_scanout_alloc);

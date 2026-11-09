@@ -34,8 +34,10 @@ source=(load-driver
         README.md
         XART-SAFETY.md
         OS-IDENTITY.md
-        sep-bio-identities)
+        sep-bio-identities
+        aurora-sep)
 sha256sums=('SKIP'
+            'SKIP'
             'SKIP'
             'SKIP'
             'SKIP'
@@ -83,5 +85,6 @@ package() {
   install -Dm644 logind-aurora-sep.conf \
     "$pkgdir/usr/lib/systemd/logind.conf.d/50-aurora-sep.conf"
   install -Dm755 sep-bio-identities "$pkgdir/usr/bin/sep-bio-identities"
+  install -Dm755 aurora-sep "$pkgdir/usr/bin/aurora-sep"
   install -Dm644 -t "$pkgdir/usr/share/doc/$pkgname" README.md XART-SAFETY.md OS-IDENTITY.md
 }

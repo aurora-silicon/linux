@@ -24,6 +24,18 @@
 		 * boost interface enables. The PMC ignores a pipe's bandwidth
 		 * and display clock votes while they are clear.
 		 */
+		/*
+		 * The internal display pipe's enables. Its power states are
+		 * firmware-owned, so they are not a power domain: its DCP
+		 * clears them before powering the pipe down and restores them.
+		 */
+		pmc_disp0: interface-disp0 {
+			label = "disp0-interface";
+			apple,consumer-switched;
+			apple,bwr-bit = <0>;
+			apple,boost-bit = <0>;
+		};
+
 		pmc_dispext0: interface-dispext0 {
 			label = "dispext0-interface";
 			#power-domain-cells = <0>;
