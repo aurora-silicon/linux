@@ -565,6 +565,8 @@ const struct ave_fw_layout ave_layout_6070_11_1 = {
 				     .size_set_stride = 4 },
 			.fps = { .numerator = 0xff4c, .denominator = 0xff48 },
 			.rc_mode = 0xff50,
+			/* 6070 numbers constant QP 2, not 3. */
+			.rc_mode_fixed_qp = 2,
 			.bitrate = 0xff30,
 			.init_qp = 0xff34,
 			.init_qp_words = 1,
@@ -627,6 +629,8 @@ const struct ave_fw_layout ave_layout_6070_11_1 = {
 				     .size_set_stride = 4 },
 			.fps = { .numerator = 0xff4c, .denominator = 0xff48 },
 			.rc_mode = 0xff50,
+			/* The same rate-control numbering as H.264. */
+			.rc_mode_fixed_qp = 2,
 			.bitrate = 0xff30,
 			.init_qp = 0xff34,
 			.init_qp_words = 1,
@@ -672,6 +676,7 @@ const struct ave_fw_layout ave_layout_6070_11_1 = {
 	.process = {
 		[0] = {
 			.pic_size = 0x9c8,
+			.first_process = 0x10a0,
 			.y = 0x1288,
 			.uv = 0x1298,
 			.in_w = 0x132c,
@@ -698,6 +703,7 @@ const struct ave_fw_layout ave_layout_6070_11_1 = {
 		},
 		[1] = {
 			.pic_size = 0x55b0,
+			.first_process = 0x5c88,
 			.y = 0x5e70,
 			.uv = 0x5e80,
 			.in_w = 0x5f14,
