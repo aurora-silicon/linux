@@ -80,7 +80,7 @@ static int devm_request_threaded_irq(struct device*d,int irq,int(*h)(int,void*),
 enum dwc3_apple_state {DWC3_APPLE_PROBE_PENDING,DWC3_APPLE_NO_CABLE,DWC3_APPLE_HOST,DWC3_APPLE_DEVICE,DWC3_APPLE_SUSPENDED};
 #define DWC3_GCTL_PRTCAP_HOST 1
 struct dwc3 {int num_usb3_ports,num_usb2_ports;int usb3_generic_phy[2],usb2_generic_phy[2],usb3_phy,usb2_phy;int current_dr_role;bool dis_u3_susphy_quirk;};
-struct dwc3_apple {struct device*dev;struct dwc3 dwc;int lock,reset;enum dwc3_apple_state state;bool fixed_hub,host_only,rpm_held,core_active,core_exit_pending,reset_pending,dt_dis_u3_susphy;unsigned usb3_power_off_pending,usb2_power_off_pending;};
+struct dwc3_apple {struct device*dev;struct dwc3 dwc;int lock,reset;enum dwc3_apple_state state;bool fixed_hub,host_only,rpm_held,core_active,core_exit_pending,reset_pending,dt_dis_u3_susphy;unsigned usb3_power_off_pending,usb2_power_off_pending;int usb2_phy;};
 static int core_error,host_error,gadget_error,reset_error,role_error,start_role;
 static unsigned rpm_puts;
 /* A started core holds the glue runtime PM reference until core_stop drops it. */
@@ -98,6 +98,8 @@ static int reset_control_assert(int r){reset_calls++;return reset_error;}
 #define BIT(x) (1UL << (x))
 static void dwc3_event_buffers_cleanup(struct dwc3*d){}
 static int phy_power_off(int p){return 0;}
+/* Only the T6050 Type-C USB2 PHY has a port reset; for the PHYs here it is a no-op. */
+static int phy_reset(int p){return 0;}
 static void usb_phy_set_suspend(int p,int suspend){}
 static void dwc3_core_exit_after_phy_power_off(struct dwc3*d){core_exits++;}
 static u16 get_unaligned_le16(const u8*p){return p[0]|p[1]<<8;}

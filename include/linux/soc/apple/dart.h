@@ -38,6 +38,15 @@ int apple_dart_dcp_dispext_stream_ok(struct device *piodma, unsigned int sid);
 void *apple_dart_dcp_dispext_scanout_alloc(struct device *piodma, size_t size, u64 *dva);
 /* An adopted external display DART's state after its power-up; reads only. */
 int apple_dart_dcp_dispext_state(struct device_node *consumer);
+/*
+ * Internal display DART of a DCP consumer (the DCP or its PIODMA), around a
+ * power-down of the display domains by the DCP: streams off, flushed and
+ * clock protection cleared before; state checked and streams back after.
+ * The check says, changing nothing, whether the power-off can run now.
+ */
+int apple_dart_dcp_power_check(struct device *dev);
+int apple_dart_dcp_power_off(struct device *dev);
+int apple_dart_dcp_power_on(struct device *dev);
 
 /*
  * Remappable host windows in SID0 of an external display DART: one
@@ -56,6 +65,9 @@ void *apple_dart_dcp_scanout_alloc(struct device *dev, size_t size, dma_addr_t *
 
 #else
 static inline int apple_dart_dcp_check(struct device *dev) { return -EOPNOTSUPP; }
+static inline int apple_dart_dcp_power_check(struct device *dev) { return -EOPNOTSUPP; }
+static inline int apple_dart_dcp_power_off(struct device *dev) { return -EOPNOTSUPP; }
+static inline int apple_dart_dcp_power_on(struct device *dev) { return -EOPNOTSUPP; }
 static inline int apple_dart_dcp_check_buffer(struct device *dev, dma_addr_t iova, size_t size)
 {
 	return -EOPNOTSUPP;

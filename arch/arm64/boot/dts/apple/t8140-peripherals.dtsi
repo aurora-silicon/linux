@@ -161,7 +161,6 @@
 		         <&scaler0_dart 1>;
 		clocks = <&peripheral_clocks 374>;
 		resets = <&ps_msr>;
-		status = "disabled";
 	};
 
 	/* ADT /arm-io/aop2. */
@@ -427,7 +426,6 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1087 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_msr>;
-		status = "disabled";
 	};
 
 	/* ADT /arm-io/dart-rsm. */

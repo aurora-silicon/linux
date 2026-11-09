@@ -767,6 +767,27 @@ static const struct net_device_ops brcmf_netdev_ops_pri = {
 	.ndo_set_rx_mode = brcmf_netdev_set_multicast_list
 };
 
+bool brcmf_has_awdl_interface(struct brcmf_pub *drvr)
+{
+	struct net_device *ndev;
+	struct brcmf_if *ifp;
+	bool present = false;
+
+	rcu_read_lock();
+	for_each_netdev_rcu(wiphy_net(drvr->wiphy), ndev) {
+		if (ndev->netdev_ops != &brcmf_netdev_ops_awdl)
+			continue;
+		ifp = netdev_priv(ndev);
+		if (ifp->drvr == drvr) {
+			present = true;
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	return present;
+}
+
 int brcmf_net_attach(struct brcmf_if *ifp, bool locked)
 {
 	struct brcmf_pub *drvr = ifp->drvr;

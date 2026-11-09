@@ -26,7 +26,11 @@
 //!   derived from successive `Utilization` windows (busiest subqueue
 //!   percentage x window duration; the firmware timestamps are base-clock
 //!   ticks, 24 MHz, converted with `HwConfig::base_clock_hz`). Monotonic and
-//!   bounded by elapsed time. Saturates at u64::MAX.
+//!   bounded by elapsed time. Saturates at u64::MAX. A window only counts
+//!   while the GPU stayed powered: `PowerOff`/`PowerOn` drop the baseline,
+//!   so the idle gap before the first window after power-up is not credited
+//!   at that window's (busy) percentage. See
+//!   [`crate::stats_busy::BusyIntegrator`].
 //! - `jobs`: completed submissions since boot, counted at submission
 //!   completion (`JobFence::command_complete`).
 //!
