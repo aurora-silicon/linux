@@ -467,16 +467,18 @@ static void sn201202x_ldcm_invalidate(struct tps6598x *tps)
 
 static void sn201202x_ldcm_stop(struct tps6598x *tps)
 {
-	cancel_delayed_work_sync(&tps_to_sn(tps)->ldcm_work);
+	/* Reset recovery is drained later and may still try to queue an update. */
+	disable_delayed_work_sync(&tps_to_sn(tps)->ldcm_work);
 }
 
-static const struct tipd_contaminant_ops sn201202x_contaminant_ops = {
+VISIBLE_IF_KUNIT const struct tipd_contaminant_ops sn201202x_contaminant_ops = {
 	.update = sn201202x_ldcm_update,
 	.refresh = sn201202x_ldcm_refresh,
 	.event = sn201202x_ldcm_event,
 	.invalidate = sn201202x_ldcm_invalidate,
 	.stop = sn201202x_ldcm_stop,
 };
+EXPORT_SYMBOL_IF_KUNIT(sn201202x_contaminant_ops);
 
 static struct regmap *__devm_regmap_init_sn201202x(struct spmi_device *sdev,
 						   const struct regmap_config *config,
