@@ -248,6 +248,14 @@ static const struct apple_cio_hw apple_cio_t6040_hw = {
 #define APPLE_CIO_SLEEP_RESTART_FALLBACK_MS 10000
 /* How long a forced cable cycle may take before it no longer counts. */
 #define APPLE_CIO_RESUME_RECOVERY_WINDOW_MS 30000
+/*
+ * After a peer drops the link without the cable going away, the ACIO
+ * firmware parks the port and waits for the host to power it off. A peer
+ * that reboots or goes away electrically is reported as a cable change
+ * within about 0.5 s and restarts the port anyway.
+ */
+#define APPLE_CIO_LINK_LOST_MS 3000
+#define APPLE_CIO_LINK_LOST_CYCLES 3
 
 static bool resume_recovery;
 module_param(resume_recovery, bool, 0644);
@@ -364,6 +372,12 @@ struct apple_cio {
 	bool resume_recovery_failed; /* terminal recovery failure */
 	bool resume_link_failed; /* protected by lock */
 	bool resume_link_pending; /* set by NHI resume, consumed by ACIO complete */
+	struct delayed_work link_lost_work;
+	unsigned int start_gen; /* protected by lock: bumped by every start */
+	unsigned int link_lost_gen; /* start_gen when the peer went away */
+	unsigned int link_lost_cycles; /* protected by lock */
+	u64 link_lost_cycle_activity; /* remote activity at the last cycle */
+	bool link_lost_restart; /* protected by lock: cycle requested */
 	struct notifier_block pm_notifier;
 	struct delayed_work sleep_restart_work;
 	enum {
@@ -2097,8 +2111,27 @@ static bool apple_nhi_add_links(struct tb_nhi *nhi)
 	return true;
 }
 
+/*
+ * Called with the domain lock held when the peer on a host router lane
+ * adapter went away: only (re)arm the check.
+ */
+static void apple_nhi_link_lost(struct tb_nhi *nhi)
+{
+	struct apple_nhi *anhi = nhi_to_anhi(nhi);
+	struct apple_cio *acio = anhi->acio;
+	u64 activity = atomic64_read(&anhi->tb->remote_activity);
+
+	/* A peer was found since the last cycle: that cycle worked */
+	if (activity != READ_ONCE(acio->link_lost_cycle_activity))
+		WRITE_ONCE(acio->link_lost_cycles, 0);
+	WRITE_ONCE(acio->link_lost_gen, READ_ONCE(acio->start_gen));
+	mod_delayed_work(system_freezable_wq, &acio->link_lost_work,
+			 msecs_to_jiffies(APPLE_CIO_LINK_LOST_MS));
+}
+
 static const struct tb_nhi_ops apple_nhi_ops = {
 	.add_links = apple_nhi_add_links,
+	.link_lost = apple_nhi_link_lost,
 	.request_ring_irq = apple_nhi_request_irq,
 	.release_ring_irq = apple_nhi_release_irq,
 	.ring_interrupt_active = apple_nhi_ring_interrupt_active,
@@ -2771,6 +2804,7 @@ static void apple_cio_stop(struct apple_cio *acio)
 
 	acio->current_cable_info = 0;
 	acio->resume_link_failed = false;
+	acio->link_lost_restart = false;
 }
 
 /*
@@ -3011,6 +3045,7 @@ static int apple_cio_start(struct apple_cio *acio)
 	}
 
 	acio->current_cable_info = acio->target_cable_info;
+	acio->start_gen++;
 	return 0;
 
 err_depopulate:
@@ -3042,7 +3077,7 @@ static int apple_cio_check_connection(struct apple_cio *acio)
 
 	lockdep_assert_held(&acio->lock);
 	/* Ask CD321x to cycle ACIO and the PHY using a fresh cable snapshot. */
-	if (acio->resume_link_failed)
+	if (acio->resume_link_failed || acio->link_lost_restart)
 		return -ENOLINK;
 	guard(mutex)(&acio->pcie_tunnel_lock);
 	if (!READ_ONCE(acio->nhi_pdev) || acio->pcie_tunnel_stopping ||
@@ -3107,6 +3142,79 @@ unlock:
 	return verdict;
 }
 
+/* Whether a router or host is connected to a lane adapter of the host router */
+static bool apple_cio_has_peer(struct apple_cio *acio, u64 *activity)
+{
+	struct platform_device *pdev = READ_ONCE(acio->nhi_pdev);
+	struct apple_nhi *anhi;
+	struct tb_port *port;
+	bool peer = true;
+
+	lockdep_assert_held(&acio->lock);
+	if (!pdev)
+		return true;
+	device_lock(&pdev->dev);
+	anhi = platform_get_drvdata(pdev);
+	if (!pdev->dev.driver || !anhi || !anhi->tb)
+		goto unlock;
+
+	scoped_guard(mutex, &anhi->tb->lock) {
+		*activity = atomic64_read(&anhi->tb->remote_activity);
+		peer = false;
+		tb_switch_for_each_port(anhi->tb->root_switch, port) {
+			if (!tb_port_is_null(port))
+				continue;
+			if ((port->xdomain && !port->xdomain->is_unplugged) ||
+			    (port->remote && !port->remote->sw->is_unplugged))
+				peer = true;
+		}
+	}
+unlock:
+	device_unlock(&pdev->dev);
+	return peer;
+}
+
+/*
+ * The peer dropped the link but the cable is still attached and no cable
+ * change followed. The firmware leaves the port down until it is powered
+ * off, so have CD321x cycle it with a fresh cable snapshot, a few times.
+ */
+static void apple_cio_link_lost_work(struct work_struct *work)
+{
+	struct apple_cio *acio = container_of(to_delayed_work(work),
+					      struct apple_cio, link_lost_work);
+	u64 activity = 0;
+	bool notify = false;
+
+	scoped_guard(mutex, &acio->lock) {
+		if (acio->removing || !acio->current_cable_info ||
+		    !acio->target_cable_info ||
+		    acio->sleep_phase != APPLE_CIO_SLEEP_OPEN ||
+		    acio->resume_recovery_failed ||
+		    acio->start_gen != READ_ONCE(acio->link_lost_gen))
+			return;
+		if (apple_cio_has_peer(acio, &activity))
+			return;
+		if (acio->link_lost_cycles >= APPLE_CIO_LINK_LOST_CYCLES) {
+			dev_warn(acio->dev,
+				 "peer link still down after %u port restarts, leaving the port alone\n",
+				 acio->link_lost_cycles);
+			return;
+		}
+		acio->link_lost_cycles++;
+		WRITE_ONCE(acio->link_lost_cycle_activity, activity);
+		acio->link_lost_restart = true;
+		dev_info(acio->dev,
+			 "peer link lost with the cable attached, restarting the port (%u/%u)\n",
+			 acio->link_lost_cycles, APPLE_CIO_LINK_LOST_CYCLES);
+		notify = true;
+	}
+
+	/* CD321x may tear down the NHI: never notify under either driver lock. */
+	if (notify)
+		typec_thunderbolt_switch_notify(acio->tbt_switch);
+}
+
 static void apple_cio_resume_link_work(struct work_struct *work)
 {
 	struct apple_cio *acio = container_of(to_delayed_work(work),
@@ -3150,6 +3258,7 @@ static int apple_cio_prepare(struct device *dev)
 
 	/* Drain before taking lock; the worker acquires it to check the link. */
 	cancel_delayed_work_sync(&acio->resume_link_work);
+	cancel_delayed_work_sync(&acio->link_lost_work);
 	scoped_guard(mutex, &acio->lock) {
 		WRITE_ONCE(acio->resume_link_pending, false);
 		acio->resume_link_failed = false;
@@ -3447,6 +3556,7 @@ static int apple_cio_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&acio->pcie_tunnel_work,
 			  apple_cio_pcie_tunnel_work);
 	INIT_DELAYED_WORK(&acio->resume_link_work, apple_cio_resume_link_work);
+	INIT_DELAYED_WORK(&acio->link_lost_work, apple_cio_link_lost_work);
 	INIT_DELAYED_WORK(&acio->sleep_restart_work, apple_cio_sleep_restart_work);
 	init_completion(&acio->nhi_boot_completion);
 	acio->dev = &pdev->dev;
@@ -3675,6 +3785,7 @@ static void apple_cio_remove(struct platform_device *pdev)
 	disable_delayed_work_sync(&acio->sleep_restart_work);
 
 	disable_delayed_work_sync(&acio->resume_link_work);
+	disable_delayed_work_sync(&acio->link_lost_work);
 	/* The worker can notify this switch; stop current and future enqueues. */
 	disable_delayed_work_sync(&acio->pcie_tunnel_work);
 	/* A set may hold the switch read lock while waiting for acio->lock. */

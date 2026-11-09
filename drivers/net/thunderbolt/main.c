@@ -34,6 +34,7 @@
 
 #define TBNET_RING_SIZE		256
 #define TBNET_LOGIN_RETRIES	60
+#define TBNET_CONNECT_RETRIES	3
 #define TBNET_LOGOUT_RETRIES	10
 #define TBNET_THROTTLING	128000
 #define TBNET_E2E		BIT(0)
@@ -151,6 +152,22 @@ struct tbnet_ring {
 };
 
 /**
+ * struct tbnet_login_rx - Remote login request waiting for an answer
+ * @pending: A request has been received and not answered yet
+ * @route: Route the request came from
+ * @sequence: Sequence number of the request
+ * @command_id: Command ID of the request
+ * @transmit_path: HopID the remote host transmits on
+ */
+struct tbnet_login_rx {
+	bool pending;
+	u64 route;
+	u8 sequence;
+	u32 command_id;
+	int transmit_path;
+};
+
+/**
  * struct tbnet - ThunderboltIP network driver private data
  * @svc: XDomain service the driver is bound to
  * @xd: XDomain the service belongs to
@@ -171,7 +188,12 @@ struct tbnet_ring {
  * @connection_lock: Lock serializing login state, connection setup,
  *		     teardown and NAPI enable state.
  * @login_retries: Number of login retries currently done
+ * @connect_retries: Number of new logins started after the DMA paths
+ *		     could not be enabled
  * @login_work: Worker to send ThunderboltIP login packets
+ * @login_rx_lock: Protects @login_rx
+ * @login_rx: Latest remote login request that has not been answered yet
+ * @login_rx_work: Worker that answers @login_rx
  * @rx_refill_work: Worker to reschedule Rx polling after a refill failure
  * @connected_work: Worker that finalizes the ThunderboltIP connection
  *		    setup and enables DMA paths for high speed data
@@ -204,7 +226,11 @@ struct tbnet {
 	int remote_transmit_path;
 	struct mutex connection_lock;
 	int login_retries;
+	int connect_retries;
 	struct delayed_work login_work;
+	spinlock_t login_rx_lock;
+	struct tbnet_login_rx login_rx;
+	struct work_struct login_rx_work;
 	struct delayed_work rx_refill_work;
 	struct work_struct connected_work;
 	struct work_struct disconnect_work;
@@ -325,6 +351,7 @@ static void start_login(struct tbnet *net)
 	mutex_lock(&net->connection_lock);
 	net->login_sent = false;
 	net->login_received = false;
+	net->connect_retries = 0;
 	mutex_unlock(&net->connection_lock);
 
 	queue_delayed_work(system_long_wq, &net->login_work,
@@ -333,8 +360,14 @@ static void start_login(struct tbnet *net)
 
 static void stop_login(struct tbnet *net)
 {
+	cancel_work_sync(&net->login_rx_work);
+	spin_lock(&net->login_rx_lock);
+	net->login_rx.pending = false;
+	spin_unlock(&net->login_rx_lock);
 	cancel_delayed_work_sync(&net->login_work);
 	cancel_work_sync(&net->connected_work);
+	/* A failed connection attempt may have started another login */
+	cancel_delayed_work_sync(&net->login_work);
 
 	netdev_dbg(net->dev, "login stopped\n");
 }
@@ -484,29 +517,27 @@ static int tbnet_handle_packet(const void *buf, size_t size, void *data)
 		if (!netif_running(net->dev))
 			break;
 
-		ret = tbnet_login_response(net, route, sequence,
-					   pkg->hdr.command_id);
-		if (!ret) {
-			netdev_dbg(net->dev, "remote login response sent\n");
+		/*
+		 * This runs in the control channel Rx path. Answering the
+		 * request and updating the login state needs
+		 * @connection_lock, which tbnet_connected_work() holds
+		 * while it programs the DMA paths through this same
+		 * control channel. Waiting for the lock here stalls the
+		 * channel, so those config space accesses time out. The
+		 * remote host can send a second login request while we
+		 * are connecting (both ends log in at once), so hand the
+		 * request to a worker. A newer request replaces one that
+		 * has not been answered yet.
+		 */
+		spin_lock(&net->login_rx_lock);
+		net->login_rx.route = route;
+		net->login_rx.sequence = sequence;
+		net->login_rx.command_id = command_id;
+		net->login_rx.transmit_path = pkg->transmit_path;
+		net->login_rx.pending = true;
+		spin_unlock(&net->login_rx_lock);
 
-			mutex_lock(&net->connection_lock);
-			net->login_received = true;
-			net->remote_transmit_path = pkg->transmit_path;
-
-			/* If we reached the number of max retries or
-			 * previous logout, schedule another round of
-			 * login retries
-			 */
-			if (net->login_retries >= TBNET_LOGIN_RETRIES ||
-			    !net->login_sent) {
-				net->login_retries = 0;
-				queue_delayed_work(system_long_wq,
-						   &net->login_work, 0);
-			}
-			mutex_unlock(&net->connection_lock);
-
-			queue_work(system_long_wq, &net->connected_work);
-		}
+		queue_work(system_long_wq, &net->login_rx_work);
 		break;
 
 	case TBIP_LOGOUT:
@@ -655,6 +686,21 @@ static void tbnet_connect_failed_locked(struct tbnet *net)
 	/* Leave login_received set: only the peer can make it true again. */
 	lockdep_assert_held(&net->connection_lock);
 	net->login_sent = false;
+
+	/*
+	 * The remote end may already consider the connection up and then
+	 * never logs in again, so nothing would retry. Start a new login
+	 * after a delay, a few times.
+	 */
+	if (netif_running(net->dev) &&
+	    net->connect_retries < TBNET_CONNECT_RETRIES) {
+		net->connect_retries++;
+		netdev_dbg(net->dev, "connection failed, new login in %u ms (%d/%d)\n",
+			   TBNET_LOGIN_DELAY, net->connect_retries,
+			   TBNET_CONNECT_RETRIES);
+		queue_delayed_work(system_long_wq, &net->login_work,
+				   msecs_to_jiffies(TBNET_LOGIN_DELAY));
+	}
 }
 
 static void tbnet_connected_work(struct work_struct *work)
@@ -714,6 +760,7 @@ static void tbnet_connected_work(struct work_struct *work)
 		goto err_stop_rings;
 	}
 
+	net->connect_retries = 0;
 	netif_carrier_on(net->dev);
 	netif_start_queue(net->dev);
 
@@ -731,6 +778,53 @@ err_stop_rings:
 	tbnet_connect_failed_locked(net);
 out_unlock:
 	mutex_unlock(&net->connection_lock);
+}
+
+static void tbnet_login_rx_work(struct work_struct *work)
+{
+	struct tbnet *net = container_of(work, typeof(*net), login_rx_work);
+	struct tbnet_login_rx req;
+	int ret;
+
+	spin_lock(&net->login_rx_lock);
+	req = net->login_rx;
+	net->login_rx.pending = false;
+	spin_unlock(&net->login_rx_lock);
+
+	if (!req.pending || !netif_running(net->dev))
+		return;
+
+	/*
+	 * Answer under @connection_lock so that the response does not go
+	 * out on the control channel while tbnet_connected_work() is
+	 * programming the DMA paths.
+	 */
+	mutex_lock(&net->connection_lock);
+	ret = tbnet_login_response(net, req.route, req.sequence,
+				   req.command_id);
+	if (ret) {
+		mutex_unlock(&net->connection_lock);
+		netdev_warn(net->dev, "failed to send ThunderboltIP response\n");
+		return;
+	}
+
+	netdev_dbg(net->dev, "remote login response sent\n");
+
+	net->login_received = true;
+	/* The Rx HopID in use is released at teardown, keep it until then */
+	if (!net->rings_started)
+		net->remote_transmit_path = req.transmit_path;
+
+	/* If we reached the number of max retries or previous logout,
+	 * schedule another round of login retries
+	 */
+	if (net->login_retries >= TBNET_LOGIN_RETRIES || !net->login_sent) {
+		net->login_retries = 0;
+		queue_delayed_work(system_long_wq, &net->login_work, 0);
+	}
+	mutex_unlock(&net->connection_lock);
+
+	queue_work(system_long_wq, &net->connected_work);
 }
 
 static void tbnet_login_work(struct work_struct *work)
@@ -1461,6 +1555,8 @@ static int tbnet_probe(struct tb_service *svc)
 	INIT_DELAYED_WORK(&net->login_work, tbnet_login_work);
 	INIT_DELAYED_WORK(&net->rx_refill_work, tbnet_rx_refill_work);
 	INIT_WORK(&net->connected_work, tbnet_connected_work);
+	INIT_WORK(&net->login_rx_work, tbnet_login_rx_work);
+	spin_lock_init(&net->login_rx_lock);
 	INIT_WORK(&net->disconnect_work, tbnet_disconnect_work);
 	mutex_init(&net->connection_lock);
 	spin_lock_init(&net->poll_lock);
@@ -1531,6 +1627,7 @@ static void tbnet_remove(struct tb_service *svc)
 	unregister_netdev(net->dev);
 	/* A logout received while the interface was down queued this. */
 	cancel_work_sync(&net->disconnect_work);
+	cancel_work_sync(&net->login_rx_work);
 	free_netdev(net->dev);
 }
 
@@ -1551,6 +1648,8 @@ static int tbnet_suspend(struct device *dev)
 	}
 
 	tb_unregister_protocol_handler(&net->handler);
+	/* A login request may have arrived before the handler went away */
+	cancel_work_sync(&net->login_rx_work);
 	return 0;
 }
 
