@@ -197,6 +197,8 @@ pub(crate) mod dynamic {
     /// are aliased here so that the firmware writes their stamps itself.
     pub(crate) const TIMESTAMP_WINDOW: core::ops::Range<u64> =
         0xffff_fc21_8140_0000..0xffff_fc21_8540_0000;
+    // `HwData::init` (initdata.rs and v25g83.rs) writes this start as a literal.
+    const _: () = assert!(TIMESTAMP_WINDOW.start == 0xffff_fc21_8140_0000);
 
     /// Dynamic kernel objects in the upper window: from `KERNEL_OFFSET` up to the firmware
     /// MMIO aperture. The firmware gives the addresses from there on a fixed meaning.
