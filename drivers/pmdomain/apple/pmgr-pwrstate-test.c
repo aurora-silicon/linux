@@ -296,7 +296,11 @@ static void pmgr_ps_power_on_latch_cleared_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, r->auto_writes, 1U);
 }
 
-/* The same in the noirq phase of a system sleep, where genpd ignores errors. */
+/*
+ * Not in the noirq phase of a system sleep (no PS reset there: it hangs the
+ * T8140). The power-on fails, which genpd ignores in that phase, and the
+ * domain stays requested on.
+ */
 static void pmgr_ps_power_on_latch_sleep_test(struct kunit *test)
 {
 	struct pmgr_ps_test_reg *r;
@@ -305,9 +309,18 @@ static void pmgr_ps_power_on_latch_sleep_test(struct kunit *test)
 	ps = pmgr_ps_test_domain(test, APPLE_PMGR_PS_PWRGATE, true, &r);
 	ps->system_sleep = true;
 	r->latched = true;
-	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_power_on(&ps->genpd), 0);
-	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_PMGR_PS_ACTUAL, r->val), APPLE_PMGR_PS_ACTIVE);
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_power_on(&ps->genpd), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, r->reset_writes, 0U);
+	KUNIT_EXPECT_FALSE(test, r->val & APPLE_PMGR_PS_RESET);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_PMGR_PS_TARGET, r->val), APPLE_PMGR_PS_ACTIVE);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_PMGR_PS_ACTUAL, r->val), APPLE_PMGR_PS_CLKGATE);
 	KUNIT_EXPECT_EQ(test, r->auto_writes, 0U);
+
+	/* The same domain after the sleep: the recovery runs again. */
+	ps->system_sleep = false;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_power_on(&ps->genpd), 0);
+	KUNIT_EXPECT_EQ(test, r->reset_writes, 1U);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_PMGR_PS_ACTUAL, r->val), APPLE_PMGR_PS_ACTIVE);
 }
 
 /* A latch the reset does not clear still fails, and the domain is requested off. */
