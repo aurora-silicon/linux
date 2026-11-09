@@ -111,6 +111,9 @@ pub(super) struct Hold {
     active: bool,
     seen: u64,
     since: Option<u64>,
+    pinned: bool,
+    /// A pinned assertion failed and was logged; cleared when one succeeds.
+    failed: bool,
 }
 
 impl Hold {
@@ -119,7 +122,29 @@ impl Hold {
             active: false,
             seen: 0,
             since: None,
+            pinned: false,
+            failed: false,
         }
+    }
+
+    /// A hold that keeps the GPU powered for as long as the driver is bound, for a firmware
+    /// build that powers the GPU temperature sensors down with the GPU
+    /// ([`super::fw::Variant::thermal_source_needs_power`]). It asserts whenever it is not
+    /// active and never releases; [`Self::released`] after a firmware restart re-arms it.
+    pub(super) const fn pinned() -> Self {
+        Self {
+            pinned: true,
+            ..Self::new()
+        }
+    }
+
+    pub(super) fn is_pinned(&self) -> bool {
+        self.pinned
+    }
+
+    /// Notes a failed pinned assertion; true the first time, so it is logged once.
+    pub(super) fn pin_failed(&mut self) -> bool {
+        !core::mem::replace(&mut self.failed, true)
     }
 
     pub(super) fn active(&self) -> bool {
@@ -133,6 +158,14 @@ impl Hold {
         submissions: u64,
         hold_ms: u32,
     ) -> HoldAction {
+        if self.pinned {
+            self.seen = submissions;
+            return if self.active {
+                HoldAction::None
+            } else {
+                HoldAction::Assert
+            };
+        }
         let enabled = hold_ms > FIRMWARE_IDLE_OFF_MS;
         let fresh = submissions != self.seen;
         self.seen = submissions;
@@ -161,6 +194,7 @@ impl Hold {
 
     pub(super) fn asserted(&mut self) {
         self.active = true;
+        self.failed = false;
     }
 
     pub(super) fn released(&mut self) {
@@ -298,6 +332,19 @@ mod tests {
         assert_eq!(hold.step(0, true, 2, 10), HoldAction::Assert);
         hold.asserted();
         assert_eq!(hold.step(1, false, 2, FIRMWARE_IDLE_OFF_MS), HoldAction::Release);
+    }
+
+    #[test]
+    fn pinned_hold_never_releases() {
+        let mut hold = Hold::pinned();
+        assert_eq!(hold.step(0, false, 0, FIRMWARE_IDLE_OFF_MS), HoldAction::Assert);
+        hold.asserted();
+        for now in [1, 1_000_000_000, 60_000_000_000] {
+            assert_eq!(hold.step(now, false, 0, 16), HoldAction::None);
+        }
+        // A firmware restart forgets the policy: the hold asserts again.
+        hold.released();
+        assert_eq!(hold.step(61_000_000_000, false, 3, 16), HoldAction::Assert);
     }
 }
 

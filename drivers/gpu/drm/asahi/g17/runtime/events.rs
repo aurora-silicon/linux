@@ -443,6 +443,11 @@ impl crate::g17::Shared {
         if recover {
             firmware.service_runtime_recovery(deferred)?;
             if !firmware.recovery.pending() {
+                // The restarted firmware may have dropped the idle policy: the pinned hold
+                // asserts it again in this pass's idle check.
+                if firmware.hold.is_pinned() {
+                    firmware.hold.released();
+                }
                 if !self.preparations.reopen() {
                     return Ok(());
                 }

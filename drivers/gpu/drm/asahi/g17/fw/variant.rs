@@ -77,6 +77,11 @@ pub(crate) struct Variant {
     pub(crate) compute: super::compute::ComputeProgram,
     pub(crate) opening_record: bool,
     pub(crate) split_firmware_area: bool,
+    /// The SMC reads the GPU temperature sensors (`Tg*`) only while the GPU is powered: with this
+    /// build the firmware powers the sensors down with the GPU, and every GPU temperature then
+    /// reads a placeholder (-4 to 4 C), so the GPU thermal zones see nothing. The host keeps the
+    /// GPU powered while the driver is bound ([`super::super::power::Hold::pinned`]).
+    pub(crate) thermal_source_needs_power: bool,
 }
 
 /// A firmware build a SoC supports, identified by its loaded TEXT.
@@ -121,6 +126,7 @@ pub(crate) const V26A428: Variant = Variant {
     compute: super::compute::ComputeProgram::G17P,
     opening_record: true,
     split_firmware_area: false,
+    thermal_source_needs_power: false,
 };
 
 /// The M4 Pro firmware (25G83, `mBoot-18000.161.10`).
@@ -152,6 +158,9 @@ pub(crate) const V25G83: Variant = Variant {
     compute: super::compute::ComputeProgram::G17P,
     opening_record: true,
     split_firmware_area: false,
+    // Measured on a J616s: Tg* real under load, placeholders on the first SMC tick after
+    // idle power-off.
+    thermal_source_needs_power: true,
 };
 
 pub(crate) const V25F84: Variant = Variant {
@@ -160,6 +169,8 @@ pub(crate) const V25F84: Variant = Variant {
     compute: super::compute::ComputeProgram::V25F84,
     opening_record: false,
     split_firmware_area: true,
+    // Not measured on this build; it keeps the firmware's idle power-off.
+    thermal_source_needs_power: false,
     ..V25G83
 };
 

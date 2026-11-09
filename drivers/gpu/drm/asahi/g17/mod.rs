@@ -784,6 +784,7 @@ impl Firmware {
     /// refused control (recovery in progress) is retried on a later check.
     fn idle_hold(&mut self, now_ns: u64, in_flight: bool) -> Option<u64> {
         const RETRY_NS: u64 = 1_000_000;
+        const PIN_RETRY_NS: u64 = 100_000_000;
         let hold_ms = power::IDLE_HOLD_MS.load(Ordering::Relaxed);
         for _ in 0..2 {
             match self
@@ -792,6 +793,22 @@ impl Firmware {
             {
                 power::HoldAction::None => return None,
                 power::HoldAction::Recheck(delay) => return Some(delay),
+                power::HoldAction::Assert if self.hold.is_pinned() => {
+                    // Wait for the powered witness: until it holds, the GPU thermal zones read
+                    // placeholders.
+                    if let Err(error) = power::acquire(self) {
+                        if self.hold.pin_failed() {
+                            dev_err!(
+                                self.primary.state.shared.dev.as_ref(),
+                                "Failed to keep the GPU powered for its temperature sensors: {:?}\n",
+                                error
+                            );
+                        }
+                        return Some(PIN_RETRY_NS);
+                    }
+                    self.hold.asserted();
+                    return None;
+                }
                 power::HoldAction::Assert => {
                     if self.set_idle_control(false).is_err() {
                         return None;
@@ -1468,7 +1485,10 @@ impl Gpu {
                 rings: channel::Rings::new(shared.variant.graph)?,
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
-                hold: power::Hold::new(),
+                hold: match shared.variant.thermal_source_needs_power {
+                    true => power::Hold::pinned(),
+                    false => power::Hold::new(),
+                },
                 registration_power_release_pending: false,
                 variant: shared.variant,
                 queues <- runtime::Registry::with_waiters(
@@ -1562,6 +1582,21 @@ impl Gpu {
         session
             .uat
             .activate_render_context(&session._render_global)?;
+        if session.hold.is_pinned() {
+            // A thermal zone that reads placeholders cannot trip: refuse to run without power.
+            power::acquire(session).inspect_err(|error| {
+                dev_err!(
+                    dev.as_ref(),
+                    "Failed to keep the GPU powered for its temperature sensors: {:?}\n",
+                    error
+                )
+            })?;
+            session.hold.asserted();
+            dev_info!(
+                dev.as_ref(),
+                "GPU kept powered while bound: this firmware powers its temperature sensors down with it\n"
+            );
+        }
         dev_dbg!(dev.as_ref(), "bring-up: firmware running\n");
         Ok(firmware)
     }
