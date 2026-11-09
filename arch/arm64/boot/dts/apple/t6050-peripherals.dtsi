@@ -2249,6 +2249,20 @@
 			apple,always-on;
 		};
 
+		/*
+		 * The GPU (AGX), on the GPU's own power state, so the PMP is told the GPU is on only
+		 * while it is powered (a request with the GPU off crashes the T6041 PMP). The GPU takes
+		 * this domain on a board that enables the report.
+		 */
+		pmp0_gfx: report@f {
+			compatible = "apple,t6050-pmp-v2-report-entry",
+				     "apple,t6000-pmp-v2-report-entry";
+			reg = <0xf>;
+			label = "pmp-gfx";
+			#power-domain-cells = <0>;
+			power-domains = <&ps_gfx>;
+		};
+
 		/* The internal display (DISPINT) */
 		report@12 {
 			compatible = "apple,t6050-pmp-v2-report-entry",
