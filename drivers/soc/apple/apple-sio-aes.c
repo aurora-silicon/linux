@@ -62,11 +62,11 @@ static void apple_sio_aes_debugfs_remove(void *dir)
 }
 
 static void __iomem *apple_sio_aes_map(struct platform_device *pdev,
-				       const char *name, resource_size_t min_size)
+				       unsigned int index, resource_size_t min_size)
 {
 	struct resource *res;
 
-	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
+	res = platform_get_resource(pdev, IORESOURCE_MEM, index);
 	if (!res || resource_size(res) < min_size)
 		return IOMEM_ERR_PTR(-EINVAL);
 
@@ -99,10 +99,11 @@ static int apple_sio_aes_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	aes->data = data;
 
-	engine = apple_sio_aes_map(pdev, "engine", APPLE_SIO_AES_READINESS + 4);
+	/* apple,aes orders the banks as engine, key-disable, then optional DKEY. */
+	engine = apple_sio_aes_map(pdev, 0, APPLE_SIO_AES_READINESS + 4);
 	if (IS_ERR(engine))
 		return dev_err_probe(dev, PTR_ERR(engine), "Invalid engine aperture\n");
-	disable = apple_sio_aes_map(pdev, "key-disable", data->gid1_offset + 4);
+	disable = apple_sio_aes_map(pdev, 1, data->gid1_offset + 4);
 	if (IS_ERR(disable))
 		return dev_err_probe(dev, PTR_ERR(disable), "Invalid key-disable aperture\n");
 
@@ -189,5 +190,5 @@ static struct platform_driver apple_sio_aes_driver = {
 module_platform_driver(apple_sio_aes_driver);
 
 MODULE_DESCRIPTION("Apple SIO AES probe-time read-only diagnostics");
-MODULE_AUTHOR("Ryan Murray <ryan@aurorasilicon.org>");
+MODULE_AUTHOR("Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>");
 MODULE_LICENSE("GPL");
