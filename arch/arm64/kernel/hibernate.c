@@ -19,6 +19,7 @@
 
 #include <asm/barrier.h>
 #include <asm/cacheflush.h>
+#include <asm/cpu_ops.h>
 #include <asm/cputype.h>
 #include <asm/daifflags.h>
 #include <asm/irqflags.h>
@@ -336,7 +337,7 @@ int swsusp_arch_suspend(void)
 	unsigned long flags;
 	struct sleep_stack_data state;
 
-	if (cpus_are_stuck_in_kernel()) {
+	if (cpus_are_stuck_in_kernel() || spin_table_cpus_stuck()) {
 		pr_err("Can't hibernate: no mechanism to offline secondary CPUs.\n");
 		return -EBUSY;
 	}
