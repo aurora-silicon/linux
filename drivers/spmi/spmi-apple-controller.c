@@ -30,6 +30,8 @@
 #define SPMI_STATUS_REG 0
 #define SPMI_CMD_REG 0x4
 #define SPMI_RSP_REG 0x8
+/* Queue control word; cleared while the AP queues are reset, then restored */
+#define SPMI_QUEUE_CTRL_REG 0xa0
 #define SPMI_ACT_REG 0xa4
 
 #define SPMI_IRQ_MASK_BASE 0x20
@@ -47,8 +49,16 @@
 #define SPMI_REPLY_SLAVE_ID GENMASK(14, 8)
 #define SPMI_REPLY_CMD GENMASK(7, 0)
 
+/* SPMI_ACT_REG: flush the AP request queue, self-clears when done */
 #define SPMI_ACT_FIFO_FLUSH BIT(0)
+/* SPMI_STATUS_REG: AP request (TX) and response (RX) queues are empty */
+#define SPMI_TX_FIFO_EMPTY BIT(8)
 #define SPMI_RX_FIFO_EMPTY BIT(24)
+
+/* Both AP queues are 256 words deep */
+#define SPMI_FIFO_DEPTH 256
+#define SPMI_FLUSH_POLL_US 50
+#define SPMI_FLUSH_TIMEOUT_US 50000
 
 #define REG_POLL_INTERVAL_US 10000
 #define REG_POLL_TIMEOUT_US (REG_POLL_INTERVAL_US * 5)
@@ -60,6 +70,8 @@ struct apple_spmi_hw {
 	u32 rx_empty;
 	bool legacy_irqs;
 	u32 num_irqs;
+	/* Reset the AP queues before the first command and after a failure */
+	bool queue_reset;
 };
 
 static const struct apple_spmi_hw apple_spmi_gen1 = {
@@ -79,6 +91,7 @@ static const struct apple_spmi_hw apple_spmi_t6000 = {
 	.rx_empty = SPMI_RX_FIFO_EMPTY,
 	.legacy_irqs = true,
 	.num_irqs = 192,
+	.queue_reset = true,
 };
 
 static const struct apple_spmi_hw apple_spmi_gen4 = {
@@ -156,6 +169,56 @@ static inline u32 apple_spmi_pack_cmd(u8 opc, u8 sid, u16 param)
 	return opc | sid << 8 | (u32)param << 16 | (1 << 15);
 }
 
+/*
+ * Bring the AP request and response queues to a known empty state: hold the
+ * queue control word at zero, drain stale reply words, flush pending request
+ * words and wait for the flush to finish, then restore the control word.
+ * Only the AP side of the controller is touched; no bus command is sent.
+ */
+static int apple_spmi_reset_queue(struct apple_spmi *spmi, struct device *dev)
+{
+	const u32 empty = SPMI_TX_FIFO_EMPTY | spmi->hw->rx_empty;
+	u32 ctrl, status, act, status0;
+	unsigned int drained = 0;
+	bool flushed = false;
+	int ret = 0;
+
+	ctrl = readl(spmi->regs + SPMI_QUEUE_CTRL_REG);
+	writel(0, spmi->regs + SPMI_QUEUE_CTRL_REG);
+
+	status0 = readl(spmi->regs + spmi->hw->status);
+	status = status0;
+	while (!(status & spmi->hw->rx_empty) && drained < SPMI_FIFO_DEPTH) {
+		readl(spmi->regs + spmi->hw->reply);
+		drained++;
+		status = readl(spmi->regs + spmi->hw->status);
+	}
+
+	if (!(status & SPMI_TX_FIFO_EMPTY)) {
+		writel(SPMI_ACT_FIFO_FLUSH, spmi->regs + SPMI_ACT_REG);
+		flushed = true;
+		ret = readl_poll_timeout(spmi->regs + SPMI_ACT_REG, act,
+					 !(act & SPMI_ACT_FIFO_FLUSH),
+					 SPMI_FLUSH_POLL_US,
+					 SPMI_FLUSH_TIMEOUT_US);
+		status = readl(spmi->regs + spmi->hw->status);
+	}
+
+	writel(ctrl, spmi->regs + SPMI_QUEUE_CTRL_REG);
+
+	if (!ret && (status & empty) != empty)
+		ret = -EIO;
+
+	if (ret || drained || flushed)
+		dev_info(dev,
+			 "queue reset: status %#x -> %#x, drained %u, flush %s, control %#x: %d\n",
+			 status0, status, drained, flushed ? "yes" : "no", ctrl, ret);
+	else
+		dev_dbg(dev, "queue reset: status %#x, control %#x\n", status0, ctrl);
+
+	return ret;
+}
+
 /* Wait for Rx FIFO to have something */
 static int apple_spmi_wait_rx_not_empty(struct spmi_controller *ctrl)
 {
@@ -203,7 +266,13 @@ static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid, u16 param,
 		/* Do not consume a late reply as the reply to a new command. */
 		if (!spmi->hw->legacy_irqs)
 			return -EIO;
-		writel(SPMI_ACT_FIFO_FLUSH, spmi->regs + SPMI_ACT_REG);
+		if (spmi->hw->queue_reset) {
+			ret = apple_spmi_reset_queue(spmi, &ctrl->dev);
+			if (ret)
+				return ret;
+		} else {
+			writel(SPMI_ACT_FIFO_FLUSH, spmi->regs + SPMI_ACT_REG);
+		}
 		apple_spmi_irq_ack_raw(spmi, spmi->hw->num_irqs);
 		spmi->prev_fail = false;
 	}
@@ -506,6 +575,13 @@ static int apple_spmi_probe(struct platform_device *pdev)
 	spmi->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(spmi->regs))
 		return PTR_ERR(spmi->regs);
+
+	if (spmi->hw->queue_reset) {
+		ret = apple_spmi_reset_queue(spmi, &pdev->dev);
+		if (ret)
+			return dev_err_probe(&pdev->dev, ret,
+					     "AP queues did not reset\n");
+	}
 
 	ctrl->dev.of_node = pdev->dev.of_node;
 
