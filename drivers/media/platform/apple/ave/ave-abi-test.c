@@ -668,8 +668,8 @@ static void ave_6070_variants(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ave_t6000.boot_arg_value, 0x400U);
 	KUNIT_EXPECT_EQ(test, ave_t6000.timebase_multiplier, 1000000U);
 	KUNIT_EXPECT_EQ(test, ave_t6000.text_crc, 0x460c7a7cU);
-	KUNIT_EXPECT_EQ(test, ave_t8112.boot_device_id, 15U);
-	KUNIT_EXPECT_EQ(test, ave_t8112.device_type, 13U);
+	KUNIT_EXPECT_EQ(test, ave_t8112.boot_device_id, 18U);
+	KUNIT_EXPECT_EQ(test, ave_t8112.device_type, 15U);
 	KUNIT_EXPECT_EQ(test, ave_t8112.boot_arg_value, 0x10000U);
 	KUNIT_EXPECT_EQ(test, ave_t8112.timebase_multiplier, 1U);
 	KUNIT_EXPECT_EQ(test, ave_t8112.text_crc, 0x25bfd039U);
