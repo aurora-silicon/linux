@@ -118,6 +118,7 @@ static void apple_sleep_test_ops(struct kunit *test)
 		KUNIT_EXPECT_NOT_NULL(test, ops->deep_wfi_arm);
 		KUNIT_EXPECT_NOT_NULL(test, ops->lower_io);
 		KUNIT_EXPECT_NOT_NULL(test, ops->last_mile);
+		KUNIT_EXPECT_NOT_NULL(test, ops->resume);
 		KUNIT_EXPECT_NOT_NULL(test, ops->wake);
 		KUNIT_EXPECT_NOT_NULL(test, ops->aic_mask_all);
 		KUNIT_EXPECT_NOT_NULL(test, ops->aic_ack);
