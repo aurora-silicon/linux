@@ -1720,10 +1720,13 @@ static void cd321x_complete(struct tps6598x *tps)
 	}
 	if (pm_suspend_via_firmware() && device_property_read_bool(tps->dev, "apple,sleep-ssps"))
 		tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
-	/* A link still down from an earlier sleep isn't cut again, so it stays pending. */
+	/*
+	 * A link still down from an earlier sleep isn't cut again, so it stays pending. A dark
+	 * wake sleeps again at once: the link stays down for it, and the full wake rearms it.
+	 */
 	if (apple_sleep_debug_link_was_cut(tps->dev))
 		cd321x->rearm_pending = true;
-	if (cd321x->rearm_pending) {
+	if (cd321x->rearm_pending && !pm_dark_wake()) {
 		cd321x->rearm_tries = 0;
 		cd321x_rearm_debug_link(cd321x);
 	}
