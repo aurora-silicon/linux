@@ -169,14 +169,31 @@ int ave_ipc_parse_channels(struct ave_dev *ave)
 			if (ave_rings_overlap(&ave->ring[a], &ave->ring[b]))
 				return -EPROTO;
 
-	/* Hand every host-to-firmware slot to the host; ownership is bit 0. */
-	for (unsigned int i = 0; i < ave->ring[AVE_RING_IO].slots; i++) {
-		__le64 *slot = ave->ipc.cpu + ave->ring[AVE_RING_IO].offset +
-			       i * AVE_RING_SLOT_BYTES;
+	/*
+	 * Hand every slot of every host-to-firmware ring to the host, the ones
+	 * the host never uses too: ownership is bit 0, and a slot left at zero
+	 * reads to the firmware as a message posted to it.
+	 */
+	for (unsigned int i = 0; i < ave->layout->abi->transport->descriptors;
+	     i++) {
+		u8 *desc = ave->ipc.cpu + AVE_IPC_CHANNEL_OFF +
+			   i * AVE_CHAN_DESC_STRIDE;
+		u32 slots = get_unaligned_le32(desc + AVE_CHAN_DESC_SLOTS);
+		u32 offset;
 
-		slot[0] = cpu_to_le64(1);
-		slot[1] = 0;
-		slot[2] = 0;
+		if (get_unaligned_le32(desc + AVE_CHAN_DESC_DIR))
+			continue;
+		/* Checked above. */
+		ave_fw_offset(ave, get_unaligned_le64(desc + AVE_CHAN_DESC_ADDR),
+			      (size_t)slots * AVE_RING_SLOT_BYTES, &offset);
+		for (unsigned int n = 0; n < slots; n++) {
+			__le64 *slot = ave->ipc.cpu + offset +
+				       n * AVE_RING_SLOT_BYTES;
+
+			slot[0] = cpu_to_le64(1);
+			slot[1] = 0;
+			slot[2] = 0;
+		}
 	}
 	dma_wmb();
 	return 0;

@@ -757,10 +757,14 @@ static void ave_6070_channels(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ave->ring[AVE_RING_LOG].slots, 512U);
 	KUNIT_EXPECT_EQ(test, ave->ring[AVE_RING_LOG].offset,
 			AVE_IPC_CHANNEL_OFF + 0x700);
-	/* Every IO slot starts with the host. */
-	KUNIT_EXPECT_EQ(test, get_unaligned_le64(ave->ipc.cpu +
-						 AVE_IPC_CHANNEL_OFF + 0x8700),
-			1ULL);
+	/* Every host-to-firmware slot starts with the host, used or not. */
+	for (unsigned int i = 0; i < ARRAY_SIZE(ave_6070_desc); i++)
+		for (unsigned int n = 0; n < ave_6070_desc[i].slots; n++)
+			KUNIT_EXPECT_EQ(test,
+					get_unaligned_le64(ave->ipc.cpu + AVE_IPC_CHANNEL_OFF +
+							   ave_6070_desc[i].offset +
+							   n * AVE_RING_SLOT_BYTES),
+					ave_6070_desc[i].dir ? 0ULL : 1ULL);
 
 	/* The old reading: the reply ring at SHAREDMALLOC's place. */
 	ave_6070_write_desc(ave, 5, "IO_T2H");
