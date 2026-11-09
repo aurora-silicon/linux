@@ -43,6 +43,25 @@ pub(crate) enum Placement {
     At(u64),
     /// Anywhere in this range, at this alignment, followed by an unmapped guard page.
     In(Range<u64>, u64),
+    /// As `In`, from the bottom of the range up: free-list backings in the lower window.
+    InLow(Range<u64>, u64),
+    /// As `In`, from the top of the range down: small objects in the lower window.
+    InHigh(Range<u64>, u64),
+}
+
+/// The lower window holds every free-list backing (tens to hundreds of MiB each) next to
+/// small queue objects (kick rings, descriptor rings, contexts) that outlive many backings.
+/// Best-fit placement put small objects into the holes freed backings left, and the
+/// window fragmented until a large backing no longer fitted with most of it free.
+/// Backings are placed from the bottom up and every small object from the top down.
+fn lower_mode(placement: &Placement) -> Option<(Range<u64>, u64, kernel::drm::mm::InsertMode)> {
+    use kernel::drm::mm::InsertMode;
+    match placement {
+        Placement::In(range, align) => Some((range.clone(), *align, InsertMode::Best)),
+        Placement::InLow(range, align) => Some((range.clone(), *align, InsertMode::Low)),
+        Placement::InHigh(range, align) => Some((range.clone(), *align, InsertMode::High)),
+        Placement::At(_) => None,
+    }
 }
 
 /// A zero-initialized kernel object mapped into a GPU address space and the kernel.
@@ -76,16 +95,23 @@ impl KernelObject {
         cpu: CpuMap,
     ) -> Result<Self> {
         let mut this = Self::backing(dev, size, cpu)?;
-        let mapping = match placement {
-            Placement::At(addr) => this.obj.map_at(vm, addr, prot, false)?,
-            Placement::In(range, align) => {
+        let mapping = match lower_mode(&placement) {
+            None => {
+                let Placement::At(addr) = placement else { return Err(EINVAL); };
+                this.obj.map_at(vm, addr, prot, false)?
+            }
+            Some((range, align, mode)) => {
                 let site = if range.start >= crate::hw::t8140::dynamic::LOWER.start
                     && range.end <= crate::hw::t8140::dynamic::LOWER.end {
                     super::capacity::Site::LowerVa
                 } else {
                     super::capacity::Site::UpperVa
                 };
-                this.obj.map_into_range(vm, range, align, prot, true).map_err(|error| {
+                use kernel::drm::gem::BaseObject;
+                let size = this.obj.gem.size();
+                vm.map_in_range_with_mode(
+                    &this.obj.gem, 0..size, align, range, prot, mmu::UAT_PGSZ, mode,
+                ).map_err(|error| {
                     if error == ENOSPC { super::capacity::refused(site) } else { error }
                 })?
             }
@@ -177,6 +203,23 @@ impl KernelObject {
             } else { error })
     }
 
+    /// As `alias_in`, from the top of `range` down (small objects in the lower window).
+    pub(crate) fn alias_in_highest(
+        &self,
+        vm: &mmu::Vm,
+        range: Range<u64>,
+        align: u64,
+        prot: mmu::Prot,
+    ) -> Result<mmu::KernelMapping> {
+        use kernel::drm::gem::BaseObject;
+        vm.map_in_range_with_mode(
+            &self.obj.gem, 0..self.obj.gem.size(), align, range, prot, 0,
+            kernel::drm::mm::InsertMode::High,
+        ).map_err(|error| if error == ENOSPC {
+            super::capacity::refused(super::capacity::Site::AliasVa)
+        } else { error })
+    }
+
     fn alias_in_lowest(
         &self,
         vm: &mmu::Vm,
@@ -186,6 +229,21 @@ impl KernelObject {
         guard_size: usize,
     ) -> Result<mmu::KernelMapping> {
         vm.map_in_range_lowest(&self.obj.gem, 0..self.size, align, range, prot, guard_size)
+    }
+
+    /// As `map_range`, from the top of `range` down (small objects in the lower window).
+    pub(crate) fn map_range_highest(
+        &self,
+        vm: &mmu::Vm,
+        source: Range<usize>,
+        range: Range<u64>,
+        align: u64,
+        prot: mmu::Prot,
+        guard_size: usize,
+    ) -> Result<mmu::KernelMapping> {
+        vm.map_in_range_with_mode(
+            &self.obj.gem, source, align, range, prot, guard_size, kernel::drm::mm::InsertMode::High,
+        )
     }
 
     /// Maps an exact backing subrange, retaining an explicit unmapped guard.
@@ -350,8 +408,9 @@ impl Allocator<'_> {
         )
     }
 
-    /// Allocates a canonical low mapping, which can be aliased at the same
+    /// Allocates a small canonical low mapping, which can be aliased at the same
     /// address into an execution context without overlapping client objects.
+    /// Placed from the top of the lower window down (see `lower_mode`).
     pub(crate) fn lower(
         &self,
         size: usize,
@@ -362,7 +421,25 @@ impl Allocator<'_> {
         KernelObject::new(
             self.dev,
             self.uat.kernel_lower_vm(),
-            Placement::In(crate::hw::t8140::dynamic::LOWER, align),
+            Placement::InHigh(crate::hw::t8140::dynamic::LOWER, align),
+            size,
+            prot,
+            cpu,
+        )
+    }
+
+    /// As `lower`, for a free-list backing: placed from the bottom of the lower window up.
+    pub(crate) fn lower_backing(
+        &self,
+        size: usize,
+        align: u64,
+        prot: mmu::Prot,
+        cpu: CpuMap,
+    ) -> Result<KernelObject> {
+        KernelObject::new(
+            self.dev,
+            self.uat.kernel_lower_vm(),
+            Placement::InLow(crate::hw::t8140::dynamic::LOWER, align),
             size,
             prot,
             cpu,
@@ -387,17 +464,12 @@ impl Allocator<'_> {
         let mut range = crate::hw::t8140::dynamic::LOWER;
         let mut searching = false;
         loop {
-            // Keep ordinary best-fit placement on the uncontended path. A
-            // collision starts a lowest-address search over the whole arena.
-            let mapping = (if searching {
-                object.alias_in_lowest(
-                    self.uat.kernel_lower_vm(), range.clone(), align, prot, mmu::UAT_PGSZ,
-                )
-            } else {
-                object.obj.map_into_range(
-                    self.uat.kernel_lower_vm(), range.clone(), align, prot, true,
-                )
-            }).map_err(|error| if error == ENOSPC {
+            // Free-list backings are placed from the bottom of the window up
+            // (see `lower_mode`); a collision continues the lowest-address search
+            // above the colliding address.
+            let mapping = object.alias_in_lowest(
+                self.uat.kernel_lower_vm(), range.clone(), align, prot, mmu::UAT_PGSZ,
+            ).map_err(|error| if error == ENOSPC {
                 crate::g17::capacity::refused(crate::g17::capacity::Site::LowerVa)
             } else { error })?;
             let address = mapping.iova();

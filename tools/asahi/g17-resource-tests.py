@@ -428,12 +428,12 @@ fn main() {
  case(&[],None,256,Err(ENOSPC),1);
  case(&[],None,0,Err(EINVAL),0);
  case(&[],None,15,Err(EINVAL),0);
- // Best-fit initially selects the small late hole, occupied in the client.
- // The larger earlier canonical hole must remain eligible after that collision.
- case(&[(0,128,16),(2,144,112)],None,64,Ok(0),2);
+ // Free-list backings are placed from the bottom up: the earlier canonical hole wins
+ // at once although a smaller late hole exists (that one is occupied in the client).
+ case(&[(0,128,16),(2,144,112)],None,64,Ok(0),1);
  case(&[(1,0,256)],None,64,Err(ENOSPC),1);
  case(&[(0,128,128),(2,0,128)],None,64,Err(ENOSPC),2);
- println!("shared aliases: 16 best-fit, collision, rollback, lifetime, backing-reuse, guard and error controls pass");
+ println!("shared aliases: 16 bottom-up, collision, rollback, lifetime, backing-reuse, guard and error controls pass");
  exhaustive_common_holes();
 }
 ''')

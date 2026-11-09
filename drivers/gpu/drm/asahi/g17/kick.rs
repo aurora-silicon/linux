@@ -600,23 +600,22 @@ impl Queue {
             mmu::PROT_GPU_FW_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
+        // Small lower objects are placed from the top of the window down; a
+        // collision in the client VM continues the search below it.
         let mut range = t8140::dynamic::LOWER;
         let (low, client) = loop {
-            let low = high.alias_in(
+            let low = high.alias_in_highest(
                 alloc.uat.kernel_lower_vm(),
                 range.clone(),
                 mmu::UAT_PGSZ as u64,
                 mmu::PROT_GPU_SHARED_RW,
             )?;
-            let end = low
-                .iova()
-                .checked_add(KICK_RING_SIZE as u64)
-                .ok_or(EOVERFLOW)?;
-            match high.map_alias(client, low.iova(), mmu::PROT_GPU_SHARED_RW) {
+            let start = low.iova();
+            match high.map_alias(client, start, mmu::PROT_GPU_SHARED_RW) {
                 Ok(client) => break (low, client),
-                Err(error) if error == ENOSPC && end < range.end => {
+                Err(error) if error == ENOSPC && start > range.start => {
                     drop(low);
-                    range.start = end;
+                    range.end = start;
                 }
                 Err(error) => return Err(error),
             }

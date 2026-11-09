@@ -116,7 +116,7 @@ impl DescriptorRing {
             mmu::PROT_GPU_FW_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
-        let low = object.alias_in(
+        let low = object.alias_in_highest(
             alloc.uat.kernel_lower_vm(),
             dynamic::LOWER,
             mmu::UAT_PGSZ as u64,

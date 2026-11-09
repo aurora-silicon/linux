@@ -137,7 +137,7 @@ impl Pages {
     fn new(alloc: &Allocator<'_>, blocks: usize, layout: RunLayout) -> Result<Self> {
         let size = TABLE_SIZE + blocks * FREE_LIST_BLOCK_SIZE;
         let backing = place_lower(size, || {
-            alloc.lower(
+            alloc.lower_backing(
                 size,
                 mmu::UAT_PGSZ as u64,
                 mmu::PROT_GPU_SHARED_RW,

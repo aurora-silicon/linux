@@ -50,12 +50,14 @@ impl Aliases {
         vm: &mmu::Vm,
         source: core::ops::Range<usize>,
     ) -> Result<Self> {
+        // Small lower objects are placed from the top of the window down; a
+        // collision in the client VM continues the search below it.
         let mut range = dynamic::LOWER;
         let size = (source.end - source.start) as u64;
         loop {
             // Descriptor aliases are read-only to GPU consumers; the canonical
             // firmware mapping remains writable for command state updates.
-            let global = object.map_range(
+            let global = object.map_range_highest(
                 alloc.uat.kernel_lower_vm(),
                 source.clone(),
                 range.clone(),
@@ -79,9 +81,9 @@ impl Aliases {
                         _global: global,
                     })
                 }
-                Err(error) if error == ENOSPC && end < range.end => {
+                Err(error) if error == ENOSPC && address > range.start => {
                     drop(global);
-                    range.start = end;
+                    range.end = address;
                 }
                 Err(error) => return Err(error),
             }

@@ -2611,7 +2611,7 @@ impl Vm {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn map_in_range_with_mode(
+    pub(crate) fn map_in_range_with_mode(
         &self,
         gem: &gem::Object,
         object_range: Range<usize>,
