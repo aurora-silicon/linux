@@ -701,6 +701,14 @@ const HW_CFG_T8142: PmpHwConfig = PmpHwConfig {
     coreanalytics: Ep7::Always,
 };
 
+/// T6050: the DART window starts at 1 TiB (ADT dart-pmp0 vm-base) and spans
+/// 64 GiB, as on T8142. Its firmware never readies endpoint 7 (-ETIME).
+const HW_CFG_T6050: PmpHwConfig = PmpHwConfig {
+    dma_mask: Some(DmaMask::new::<42>()),
+    check_bootargs_uuid: false,
+    coreanalytics: Ep7::No,
+};
+
 const HW_CFG_T8132: PmpHwConfig = PmpHwConfig {
     dma_mask: None,
     check_bootargs_uuid: false,
@@ -722,6 +730,7 @@ kernel::of_device_table!(
         (of::DeviceId::new(c"apple,t8140-pmp-v2"), &HW_CFG_T8140),
         (of::DeviceId::new(c"apple,t8142-pmp-v2"), &HW_CFG_T8142),
         (of::DeviceId::new(c"apple,t6041-pmp-v2"), &HW_CFG_T6041),
+        (of::DeviceId::new(c"apple,t6050-pmp-v2"), &HW_CFG_T6050),
         (of::DeviceId::new(c"apple,t6000-pmp-v2"), &HW_CFG_DEFAULT),
     ]
 );
