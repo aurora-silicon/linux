@@ -136,6 +136,15 @@ properties:
       The last word of each filter entry, one per range in apple,dapf-ranges.
       1 where absent.
 
+  apple,restore-on-power-up:
+    type: boolean
+    description:
+      Reset and restore the DART, and write its address filter back, every
+      time it powers up, even where its registers still read as they were
+      left. For a DART that keeps its values through a sleep in which the
+      SoC's sleep engine runs its consumer, but whose address filter only
+      takes effect once written again.
+
   apple,sleep-prepare:
     $ref: /schemas/types.yaml#/definitions/uint32-matrix
     items:

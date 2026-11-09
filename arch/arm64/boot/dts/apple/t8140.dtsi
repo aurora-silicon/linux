@@ -2056,6 +2056,12 @@
 			interrupts = <AIC_IRQ 341 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_isp_sys>;
 			/*
+			 * It keeps Linux's values through a wake that kept DRAM up,
+			 * where the sleep engine runs the ISP through it, but its
+			 * address filter works again only once written.
+			 */
+			apple,restore-on-power-up;
+			/*
 			 * 3-level tables (ias <= 36) as iBoot and the native host
 			 * ran them: the ISP fetches at vm-base 0x10000000000 and the
 			 * walk ignores the high bits; 32 GiB keeps the DAPF MMIO
