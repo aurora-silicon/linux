@@ -1268,7 +1268,11 @@
 				power-domains = <&ps_jpg>;
 				apple,dvfs = <0xb2 2>;
 				apple,dvfs-request-class = <0x21>;
+				#ifdef APPLE_USE_PMP
+				status = "okay";
+				#else
 				status = "disabled";
+				#endif
 			};
 
 			pmp_report_scodec: report@d {
@@ -2738,6 +2742,10 @@
 };
 
 &m2_jpeg0 {
+	#ifdef APPLE_USE_PMP
+	power-domains = <&ps_jpg>, <&pmp_report_jpg>;
+	power-domain-names = "core", "perf";
+	#endif
 	status = "okay";
 };
 
@@ -2746,5 +2754,9 @@
 };
 
 &m2_jpeg1 {
+	#ifdef APPLE_USE_PMP
+	power-domains = <&ps_jpg>, <&pmp_report_jpg>;
+	power-domain-names = "core", "perf";
+	#endif
 	status = "okay";
 };

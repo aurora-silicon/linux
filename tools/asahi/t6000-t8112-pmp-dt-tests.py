@@ -68,15 +68,23 @@ def check(tree, output, dtc, board, soc, pmp_addr, report_addr, trial, avd_vmax=
         assert get(dtb, pmp, 'apple,pio-ranges', 'x', default=[]) == []
     # All existing macro-selected consumers must use report domains together.
     # A status-only change would miss these edges.
-    for device, entry in (('dcp', 'pmp_report_disp0'), ('avd', 'pmp_report_avd_sys')):
+    consumers = [('dcp', 'pmp_report_disp0'), ('avd', 'pmp_report_avd_sys')]
+    if soc == 't8112' and not avd_vmax:
+        consumers += [('m2_jpeg0', 'pmp_report_jpg'),
+                      ('m2_jpeg1', 'pmp_report_jpg')]
+    for device, entry in consumers:
         device_path = get(dtb, '/__symbols__', device)[0]
         entry_path = get(dtb, '/__symbols__', entry)[0]
         power = get(dtb, device_path, 'power-domains', 'x')
         expected = get(dtb, entry_path, 'phandle', 'x')[0]
         uses_report = trial and not (avd_vmax and device == 'avd')
-        if soc == 't8112' and device == 'avd' and trial and not avd_vmax:
-            core = get(dtb, device_path, 'resets', 'x')
-            assert power == [core[0], expected]
+        if (soc == 't8112' and device in ('avd', 'm2_jpeg0', 'm2_jpeg1') and
+                trial and not avd_vmax):
+            if device == 'avd':
+                core = get(dtb, device_path, 'resets', 'x')
+                assert power == [core[0], expected]
+            else:
+                assert len(power) == 2 and power[1] == expected
             assert get(dtb, device_path, 'power-domain-names') == ['core', 'perf']
         else:
             assert (int(power[0], 16) == int(expected, 16)) == uses_report
