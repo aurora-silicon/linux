@@ -1933,7 +1933,7 @@
 					<&ps_isp_fe>, <&ps_isp_dprx>, <&ps_isp_secure>,
 					<&ps_isp_sts0>, <&ps_isp_sts1>, <&ps_isp_pearl>,
 					<&ps_isp_be>, <&ps_isp_clr>, <&ps_isp_cvd>,
-					<&ps_isp_cvm>;
+					<&ps_isp_cvm>, <&ps_ispsens0>, <&ps_ispsens1>;
 			apple,dart-vm-size = <0x0 0xa0000000>;
 			status = "disabled";
 		};
