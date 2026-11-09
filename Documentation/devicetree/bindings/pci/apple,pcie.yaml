@@ -135,7 +135,13 @@ properties:
   iommu-map-mask: true
 
   power-domains:
-    maxItems: 1
+    description:
+      The power domains the controller needs. Internal controllers on some
+      SoCs sit behind two separate domain chains (for example the PCIe
+      system and PHY domains), all of which must stay on while the links
+      are up.
+    minItems: 1
+    maxItems: 2
 
   resets:
     description:
