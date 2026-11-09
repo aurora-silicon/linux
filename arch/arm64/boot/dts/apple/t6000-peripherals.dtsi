@@ -164,7 +164,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1306 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_atc0_cio>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	atc0_dpin1: displayport@701e58000 {
@@ -173,7 +173,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1307 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_atc0_cio>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	apciec0_piodma: dma-controller@722000000 {
@@ -194,7 +194,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1354 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_atc1_cio>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	atc1_dpin1: displayport@b01e58000 {
@@ -203,7 +203,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1355 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_atc1_cio>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	apciec1_piodma: dma-controller@b22000000 {
@@ -224,7 +224,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1402 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_atc2_cio>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	atc2_dpin1: displayport@f01e58000 {
@@ -233,7 +233,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1403 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_atc2_cio>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	apciec2_piodma: dma-controller@f22000000 {
@@ -257,7 +257,7 @@
 		      <0x2 0x01000000 0x0 0x1000000>,
 		      <0x2 0x02000000 0x0 0x1000000>,
 		      <0x2 0x03000000 0x0 0x1000000>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	soc_events: event-log@28e080000 {

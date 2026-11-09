@@ -52,7 +52,7 @@
 			<0x2 0x1000000 0x0 0x2000000>,
 			<0x2 0xf00000 0x0 0x100000>,
 			<0x2 0x3b3c0000 0x0 0x20000>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	m2_aft: fabric-tracker@200110000 {
@@ -330,7 +330,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1062 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_atc0_cio>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	m2_atc0_dpin1: displayport-input@381e58000 {
@@ -339,7 +339,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1063 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_atc0_cio>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	m2_apciec0_piodma: dma-controller@3a2000000 {
@@ -360,7 +360,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1143 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_atc1_cio>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	m2_atc1_dpin1: displayport-input@501e58000 {
@@ -369,7 +369,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1144 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_atc1_cio>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	m2_apciec1_piodma: dma-controller@522000000 {
