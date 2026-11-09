@@ -33,7 +33,7 @@ struct apple_dcp_typec_route {
 	struct list_head port_link;
 	struct phy *phy;
 	struct mux_control *xbar;
-	struct mux_control *dpin[2];
+	struct mux_control *dpin[DCP_FABRIC_DPIN_MAX];
 	bool dual_stream;
 	struct typec_mux_dev *typec_mux;
 	u32 dptx_phy;
@@ -43,6 +43,8 @@ struct apple_dcp_typec_route {
 	bool phy_powered;
 	/* crossbar output actually selected: xbar (dpphy) or a Thunderbolt dpin */
 	unsigned int tunnel_dpin;
+	/* T6050: DP link rate code the tunnel's pixel clock runs at, 0 if stopped */
+	u8 tunnel_rate;
 	u64 tunnel_generation;
 	struct mux_control *active_xbar;
 	bool tunnel;
