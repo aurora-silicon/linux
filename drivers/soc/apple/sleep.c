@@ -865,7 +865,7 @@ EXPORT_SYMBOL_GPL(apple_sleep_coproc_stopped);
 
 bool apple_sleep_commit_stops_coprocs(void)
 {
-	return READ_ONCE(t8140_sleep) && pm_suspend_via_firmware();
+	return READ_ONCE(apple_sleep) && pm_suspend_via_firmware();
 }
 EXPORT_SYMBOL_GPL(apple_sleep_commit_stops_coprocs);
 

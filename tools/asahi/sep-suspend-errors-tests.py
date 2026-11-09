@@ -49,7 +49,7 @@ typedef uint32_t u32; typedef uint64_t u64; typedef long long ktime_t;
 #define USEC_PER_MSEC 1000
 #define READ_ONCE(x) (x)
 #define IS_ENABLED(x) (config_enabled)
-#define CONFIG_APPLE_T8140_SLEEP 1
+#define CONFIG_APPLE_SOC_SLEEP 1
 #define __maybe_unused
 #define dev_err(...) ((void)0)
 #define dev_dbg(...) ((void)0)
@@ -378,7 +378,7 @@ def main():
     if args.mutation == 'off-ignores-actual':
         shim = shim.replace('((val & SEP_PS_DEV_DISABLE) && !(val & SEP_PS_ACTUAL))', '(val & SEP_PS_DEV_DISABLE)')
     if args.mutation == 'no-capability-check':
-        shim = shim.replace(' || !IS_ENABLED(CONFIG_APPLE_T8140_SLEEP) ||\n\t    !is_kernel_in_hyp_mode()', '')
+        shim = shim.replace(' || !IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) ||\n\t    !is_kernel_in_hyp_mode()', '')
     iopoll = (contracts / 'include/linux/iopoll.h').read_text()
     regmap = (contracts / 'include/linux/regmap.h').read_text()
     c = C_PREFIX + '\n' + '\n'.join([macro(iopoll, 'poll_timeout_us'), macro(iopoll, 'read_poll_timeout'), macro(regmap, 'regmap_read_poll_timeout')])
