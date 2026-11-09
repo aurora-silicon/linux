@@ -118,6 +118,10 @@ static int apple_pmgr_ps_clear_latch(struct apple_pmgr_ps *ps, u32 reg, u32 *cur
 	regmap_write(ps->regmap, ps->offset, off);
 	if (ret)
 		return ret;
+	/* NEOHANG debug (nhang3): stop after the reset pulse, leave the domain off. */
+	dev_info(ps->dev, "PS %s: NEOHANG nhang3: PS reset pulse done (now 0x%x); left off\n",
+		 ps->genpd.name, *cur);
+	return -ETIMEDOUT;
 	regmap_write(ps->regmap, ps->offset, reg);
 	return regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, *cur,
 					       FIELD_GET(APPLE_PMGR_PS_ACTUAL, *cur) ==
