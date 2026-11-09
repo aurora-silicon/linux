@@ -1342,9 +1342,12 @@ static int dcp_v14_callback(void *cookie, u32 tag, const void *input, u32 in_siz
 	}
 	/* Unsigned property read. */
 	if (tag == D(401) && SHAPE(80, 12)) {
-		/* The PMU temperature: the battery temperature in 0.1 K. */
+		/*
+		 * The PMU temperature the M1/M2 mini-LED hosts report: a fixed
+		 * placeholder in centidegrees, not a measurement.
+		 */
 		if (!memcmp(in, "SUMP", 4) && !strncmp(in + 4, "Temperature", 64)) {
-			put_unaligned_le64(dcp_pmu_temperature(v14->dev), out);
+			put_unaligned_le64(3029, out);
 			out[8] = 1;
 			return 0;
 		}

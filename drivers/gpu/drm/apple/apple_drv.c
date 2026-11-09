@@ -1806,7 +1806,5 @@ MODULE_LICENSE("Dual MIT/GPL");
  * crossbar. Without this, initramfs generators leave it out, it loads only
  * from the root filesystem, and a DCP probe that waits past the deferred
  * probe timeout (an encrypted root's passphrase prompt) gives up its routes.
- * DCP also asks for the battery temperature once while it starts (see
- * dcp_pmu_temperature()), so have the SMC battery registered by then.
  */
-MODULE_SOFTDEP("pre: mux-apple-display-crossbar macsmc-power");
+MODULE_SOFTDEP("pre: mux-apple-display-crossbar");
