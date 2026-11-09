@@ -263,7 +263,7 @@ static void sio_t6041_match_test(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, id->data, (const void *)&sio_hw_t8140);
 	KUNIT_EXPECT_EQ(test, sio_hw_t8140.protocol, 10U);
 	KUNIT_EXPECT_PTR_EQ(test, sio_hw_t8140.arrays, &sio_t6041_arrays);
-	KUNIT_EXPECT_TRUE(test, sio_hw_t8140.check_boot_tables == sio_t6041_check_boot_tables);
+	KUNIT_EXPECT_TRUE(test, sio_hw_t8140.check_boot_tables == sio_t8140_check_boot_tables);
 	KUNIT_EXPECT_EQ(test, sio_hw_t6041.protocol, 10U);
 	KUNIT_EXPECT_TRUE(test, sio_hw_t6041.clear_period_desc);
 	KUNIT_EXPECT_PTR_EQ(test, sio_hw_t6041.arrays, &sio_t6041_arrays);
@@ -277,6 +277,37 @@ static void sio_t6041_match_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, sizeof(struct sio_coproc_desc), 4U * SIO_T6041_SEGMENT_SIZE);
 }
 
+/* T8140 starts only with its MISC and native shim ranges mapped 1:1 (J700 ADT). */
+static void sio_t8140_native_mmio_test(struct kunit *test)
+{
+	static const struct sio_t6030_window j700[] = {
+		{ 0x385000000, 0x4000 },	/* MISC */
+		{ 0x385100000, 0x100000 },	/* SSPI */
+		{ 0x385200000, 0x100000 },	/* SUAR */
+		{ 0x386000000, 0x100000 },	/* SAUD */
+	};
+	struct sio_t6030_window w[ARRAY_SIZE(j700)];
+
+	KUNIT_EXPECT_TRUE(test, sio_hw_t8140.check_boot_tables == sio_t8140_check_boot_tables);
+	KUNIT_EXPECT_TRUE(test, sio_hw_t6041.check_boot_tables == sio_t6041_check_boot_tables);
+	KUNIT_EXPECT_EQ(test, sio_native_mmio_check(j700, ARRAY_SIZE(j700)), 0);
+	/* A loader that maps none of them (aura before the fix) */
+	KUNIT_EXPECT_EQ(test, sio_native_mmio_check(j700, 0), -ENOENT);
+
+	memcpy(w, j700, sizeof(w));
+	w[0].size = 0x2000;			/* not a whole DART page */
+	KUNIT_EXPECT_EQ(test, sio_native_mmio_check(w, ARRAY_SIZE(w)), -EINVAL);
+	memcpy(w, j700, sizeof(w));
+	w[2].start = 0x385180000;		/* overlaps SSPI */
+	KUNIT_EXPECT_EQ(test, sio_native_mmio_check(w, ARRAY_SIZE(w)), -EINVAL);
+	memcpy(w, j700, sizeof(w));
+	w[3].start = SIO_T6030_IOVA_LIMIT - 0x4000;	/* past the DART's reach */
+	KUNIT_EXPECT_EQ(test, sio_native_mmio_check(w, ARRAY_SIZE(w)), -EINVAL);
+	memcpy(w, j700, sizeof(w));
+	w[1].size = 0;
+	KUNIT_EXPECT_EQ(test, sio_native_mmio_check(w, ARRAY_SIZE(w)), -EINVAL);
+}
+
 static struct kunit_case sio_t6041_test_cases[] = {
 	KUNIT_CASE(sio_t6041_order_test),
 	KUNIT_CASE(sio_t6041_optional_test),
@@ -285,6 +316,7 @@ static struct kunit_case sio_t6041_test_cases[] = {
 	KUNIT_CASE(sio_t6041_arrays_test),
 	KUNIT_CASE(sio_t6041_config_test),
 	KUNIT_CASE(sio_t6041_match_test),
+	KUNIT_CASE(sio_t8140_native_mmio_test),
 	{}
 };
 
