@@ -158,7 +158,11 @@ impl Hold {
         submissions: u64,
         hold_ms: u32,
     ) -> HoldAction {
-        if self.pinned {
+        // TEST ONLY (GPUTEMP power A/B, never in a PR): idle_off_delay_ms = 999 bypasses the
+        // pinned hold and runs the normal 16 ms hold of the J616s device tree instead.
+        let bypass = self.pinned && hold_ms == 999;
+        let hold_ms = if bypass { 16 } else { hold_ms };
+        if self.pinned && !bypass {
             self.seen = submissions;
             return if self.active {
                 HoldAction::None
