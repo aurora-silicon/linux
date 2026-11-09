@@ -118,6 +118,12 @@ bool apple_sleep_debug_link_up(void);
  */
 void apple_sleep_lid_closed_wake(void);
 
+/*
+ * From the SMC's driver, in its noirq resume: the SMC woke the AP for the port alone. If
+ * this sleep cut the debug link and nothing else woke the SoC, it's a dark wake.
+ */
+void apple_sleep_debug_link_cut_wake(void);
+
 /* The radio's host has its port back after a real sleep, so the next commit may stop it. */
 void apple_sleep_radio_port_up(void);
 
@@ -236,6 +242,10 @@ static inline bool apple_sleep_debug_link_up(void)
 }
 
 static inline void apple_sleep_lid_closed_wake(void)
+{
+}
+
+static inline void apple_sleep_debug_link_cut_wake(void)
 {
 }
 

@@ -851,12 +851,30 @@ static void apple_smc_lid_wake(struct apple_smc *smc)
 		apple_sleep_lid_closed_wake();
 }
 
+/* Only what a cable pulled and plugged back reports: what the debug link's cut makes. */
+static bool apple_smc_port_reasons_only(u64 record)
+{
+	static const char * const names[] = { "acattach", "acdetach", "USB-C_plug" };
+	u64 port = 0;
+	int i, bit;
+
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		bit = apple_smc_wake_reason_bit(names[i]);
+		if (bit >= 0)
+			port |= BIT_ULL(bit);
+	}
+
+	return record && !(record & ~port);
+}
+
 static void apple_smc_sleep_wake(struct apple_smc *smc)
 {
 	apple_smc_notice_on(smc);
 	apple_smc_write_mbse(smc, SMC_KEY(waka));
 	smc->sleep_warned = false;
 	apple_smc_lid_wake(smc);
+	if (apple_smc_port_reasons_only(smc->wake_record))
+		apple_sleep_debug_link_cut_wake();
 	/* A dark wake isn't one: with wakeup_count in use, it would abort the sleep after it. */
 	if (smc->wake_record && !pm_dark_wake())
 		pm_wakeup_event(smc->dev, 0);

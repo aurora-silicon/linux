@@ -356,6 +356,19 @@ static void macsmc_wake_reason_test(struct kunit *test)
 	KUNIT_EXPECT_STREQ(test, names, "wifibt USB-C_plug");
 }
 
+static void macsmc_port_reasons_test(struct kunit *test)
+{
+	/* The debug link's cut: USB-C_plug, acdetach, or both. */
+	KUNIT_EXPECT_TRUE(test, apple_smc_port_reasons_only(BIT_ULL(42)));
+	KUNIT_EXPECT_TRUE(test, apple_smc_port_reasons_only(BIT_ULL(41) | BIT_ULL(42)));
+	/* Anything else, with it or alone, is a real wake. */
+	KUNIT_EXPECT_FALSE(test, apple_smc_port_reasons_only(0));
+	KUNIT_EXPECT_FALSE(test, apple_smc_port_reasons_only(BIT_ULL(42) | BIT_ULL(0)));
+	KUNIT_EXPECT_FALSE(test, apple_smc_port_reasons_only(BIT_ULL(42) | BIT_ULL(10)));
+	KUNIT_EXPECT_FALSE(test, apple_smc_port_reasons_only(BIT_ULL(23)));
+	KUNIT_EXPECT_FALSE(test, apple_smc_port_reasons_only(BIT_ULL(43)));
+}
+
 static struct kunit_case macsmc_parser_cases[] = {
 	KUNIT_CASE(macsmc_key_info_lock_test),
 	KUNIT_CASE(macsmc_key_index_test),
@@ -372,6 +385,7 @@ static struct kunit_case macsmc_parser_cases[] = {
 	KUNIT_CASE(macsmc_notice_test),
 	KUNIT_CASE(macsmc_lid_wake_test),
 	KUNIT_CASE(macsmc_wake_reason_test),
+	KUNIT_CASE(macsmc_port_reasons_test),
 	{}
 };
 

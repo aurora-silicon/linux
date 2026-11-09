@@ -1947,6 +1947,22 @@ void apple_sleep_lid_closed_wake(void)
 EXPORT_SYMBOL_GPL(apple_sleep_lid_closed_wake);
 
 /*
+ * The SMC woke the AP for the port alone, and this sleep cut the debug link: the cut's own
+ * events. Sleep again. The link stays down until tipd rearms it at a full wake, so the next
+ * entry doesn't cut it.
+ */
+void apple_sleep_debug_link_cut_wake(void)
+{
+	struct apple_sleep *s = apple_sleep;
+
+	if (!s || !s->smc_woke_alone || !READ_ONCE(sleep_debug_link_cut))
+		return;
+	dev_info(s->dev, "debug link: its cut woke the sleep: dark wake\n");
+	pm_set_dark_wake();
+}
+EXPORT_SYMBOL_GPL(apple_sleep_debug_link_cut_wake);
+
+/*
  * The radio's link and the engine that starts it, in macOS's order, measured on one
  * sleep: the link into L2, the engine stopped, PERST# asserted, the PHY's clocks off.
  * macOS does it 40 ms before ANS's idle. Here it follows, so that a refused sleep finds
