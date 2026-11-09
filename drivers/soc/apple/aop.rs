@@ -766,6 +766,7 @@ impl AFKEndpoint {
                 let name = &data[..EPIC_ANNOUNCE_NAME_LEN];
                 let name = &name[..name.iter().position(|x| *x == 0).unwrap_or(name.len())];
                 let chan = le_u32(data, EPIC_ANNOUNCE_CHANNEL_OFFSET);
+                dev_info!(client.dev, "GAPS10 trial: ep {:#04x} announces {:?} chan {:?}\n", self.index, kernel::str::BStr::from_bytes(name), chan);
                 return Into::<Arc<_>>::into(client).register_service(self, chan, name);
             } else if subtype == EPIC_SUBTYPE_FAKEHID_REPORT
                 || subtype == EPIC_SUBTYPE_GYRO_REPORT
