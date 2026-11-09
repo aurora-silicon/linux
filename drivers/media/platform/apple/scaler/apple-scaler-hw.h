@@ -110,6 +110,7 @@ struct asc_job {
 	struct asc_image dst;
 	const struct asc_csc *csc;
 	u32 transform_id;
+	bool msr20;	/* engine has the MSR20-generation control block */
 };
 
 int asc_job_build(const struct asc_job *job, struct asc_reg *w, unsigned int max);

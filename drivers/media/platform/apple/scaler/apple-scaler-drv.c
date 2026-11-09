@@ -54,15 +54,18 @@
  * struct apple_scaler_variant - per-SoC engine description
  * @hw_version: MSR hardware-version of this SoC (from the hardware description)
  * @num_reg: number of register apertures the binding describes
+ * @msr20: the engine has the MSR20-generation control block
  */
 struct apple_scaler_variant {
 	u32 hw_version;
 	unsigned int num_reg;
+	bool msr20;
 };
 
 struct apple_scaler {
 	struct device *dev;
 	void __iomem *regs;
+	resource_size_t regs_size;
 	const struct apple_scaler_variant *variant;
 	struct dev_pm_domain_list *pd_list;
 	struct reset_control *rst;
@@ -105,6 +108,7 @@ static void asc_write(struct apple_scaler *asc, u32 reg, u32 val)
 }
 
 /* ---- hardware --------------------------------------------------------- */
+
 
 /*
  * After power-up or a failed job: wait for idle, pulse the engine reset
@@ -293,11 +297,22 @@ static void asc_device_run(void *priv)
 	spin_lock_irqsave(&asc->hw_lock, flags);
 	/* Job tags as the engine is driven on macOS: a counter above bit 3, bit 2 set. */
 	job.transform_id = (++asc->transform_id << 3) | BIT(2);
+	job.msr20 = asc->variant->msr20;
 	n = asc_job_build(&job, asc->writes, ARRAY_SIZE(asc->writes));
 	if (n < 0) {
 		spin_unlock_irqrestore(&asc->hw_lock, flags);
 		asc_finish(asc, ctx, n);
 		return;
+	}
+	/* The job list must fit this engine's register aperture. */
+	for (int i = 0; i < n; i++) {
+		if (asc->writes[i].off + sizeof(u32) > asc->regs_size) {
+			spin_unlock_irqrestore(&asc->hw_lock, flags);
+			dev_err_ratelimited(asc->dev, "job register %#x is outside the aperture\n",
+					    asc->writes[i].off);
+			asc_finish(asc, ctx, -EINVAL);
+			return;
+		}
 	}
 	asc->active = ctx;
 	/* Buffers must be visible to the engine before START, the last write. */
@@ -754,6 +769,7 @@ static int asc_probe(struct platform_device *pdev)
 	asc->regs = devm_ioremap_resource(dev, res);
 	if (IS_ERR(asc->regs))
 		return PTR_ERR(asc->regs);
+	asc->regs_size = resource_size(res);
 
 	asc->rst = devm_reset_control_get_optional_exclusive(dev, NULL);
 	if (IS_ERR(asc->rst))
@@ -814,17 +830,31 @@ static void asc_remove(struct platform_device *pdev)
 	video_unregister_device(&asc->vdev);
 }
 
+static const struct apple_scaler_variant apple_scaler_t6000 = {
+	.hw_version = 12,
+	.num_reg = 3,
+};
+
+static const struct apple_scaler_variant apple_scaler_t8112 = {
+	.hw_version = 13,
+	.num_reg = 3,
+};
+
 static const struct apple_scaler_variant apple_scaler_t6041 = {
 	.hw_version = 21,
 	.num_reg = 4,
+	.msr20 = true,
 };
 
 static const struct apple_scaler_variant apple_scaler_t8140 = {
 	.hw_version = 22,
 	.num_reg = 4,
+	.msr20 = true,
 };
 
 static const struct of_device_id asc_of_match[] = {
+	{ .compatible = "apple,t6000-scaler", .data = &apple_scaler_t6000 },
+	{ .compatible = "apple,t8112-scaler", .data = &apple_scaler_t8112 },
 	{ .compatible = "apple,t6041-scaler", .data = &apple_scaler_t6041 },
 	{ .compatible = "apple,t8140-scaler", .data = &apple_scaler_t8140 },
 	{ }

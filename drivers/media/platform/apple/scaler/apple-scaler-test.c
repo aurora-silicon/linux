@@ -405,6 +405,7 @@ static void asc_test_job(struct kunit *test)
 					      job.src.fmt->yuv, &csc), 0);
 	job.csc = &csc;
 	job.transform_id = asc_expect_get(c, ASC_TRANSFORM_ID);
+	job.msr20 = true;	/* traced on the J616s (MSR21) */
 
 	n = asc_job_build(&job, w, ASC_JOB_MAX_WRITES);
 	KUNIT_ASSERT_GT(test, n, 0);

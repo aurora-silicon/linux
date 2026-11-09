@@ -375,9 +375,18 @@ static const struct asc_reg asc_job_fixed[] = {
 	{ 0x16084, 0x0b710367 }, { 0x16088, 0x00000128 }, { 0x16504, 0x02000500 },
 	{ 0x16508, 0x00003200 }, { 0x1651c, 0x00851400 }, { 0x16534, 0x00000008 },
 	{ 0x16568, 0x00250500 }, { 0x16588, 0x00496513 }, { 0x16600, 0x00000015 },
-	{ 0x16800, 0x00000000 }, { 0x25080, 0x00000000 }, { 0x2e300, 0x03804038 },
-	{ 0x2e304, 0xa0a0a0a0 }, { 0x2e308, 0x02550000 }, { 0x2e30c, 0x02550255 },
-	{ 0x2e310, 0x00000000 }, { 0x2e314, 0x00100008 }, { 0x2e318, 0x02550000 },
+	{ 0x16800, 0x00000000 }, { 0x25080, 0x00000000 },
+};
+
+/*
+ * The MSR20 generation (M4, M4 Pro/Max, A18 Pro) has a control block at
+ * 0x2e300 beyond the 0x28000 aperture of older engines. Engines without
+ * it run the same jobs with only the common words above.
+ */
+static const struct asc_reg asc_job_fixed_msr20[] = {
+	{ 0x2e300, 0x03804038 }, { 0x2e304, 0xa0a0a0a0 }, { 0x2e308, 0x02550000 },
+	{ 0x2e30c, 0x02550255 }, { 0x2e310, 0x00000000 }, { 0x2e314, 0x00100008 },
+	{ 0x2e318, 0x02550000 },
 };
 
 /**
@@ -414,6 +423,9 @@ int asc_job_build(const struct asc_job *job, struct asc_reg *w, unsigned int max
 		asc_emit_csc(&e, job->csc);
 	for (i = 0; i < ARRAY_SIZE(asc_job_fixed); i++)
 		asc_emit(&e, asc_job_fixed[i].off, asc_job_fixed[i].val);
+	if (job->msr20)
+		for (i = 0; i < ARRAY_SIZE(asc_job_fixed_msr20); i++)
+			asc_emit(&e, asc_job_fixed_msr20[i].off, asc_job_fixed_msr20[i].val);
 	asc_emit(&e, 0x110, job->transform_id);
 	asc_emit(&e, 0x098, 0xfffffffe);
 	asc_emit(&e, 0x080, 1);
