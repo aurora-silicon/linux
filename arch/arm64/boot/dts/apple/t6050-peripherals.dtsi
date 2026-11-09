@@ -2249,6 +2249,20 @@
 			apple,always-on;
 		};
 
+		/*
+		 * The GPU (AGX), on the GPU's own power state, so the PMP is told the GPU is on only
+		 * while it is powered (a request with the GPU off crashes the T6041 PMP). The GPU takes
+		 * this domain on a board that enables the report.
+		 */
+		pmp0_gfx: report@f {
+			compatible = "apple,t6050-pmp-v2-report-entry",
+				     "apple,t6000-pmp-v2-report-entry";
+			reg = <0xf>;
+			label = "pmp-gfx";
+			#power-domain-cells = <0>;
+			power-domains = <&ps_gfx>;
+		};
+
 		/* The internal display (DISPINT) */
 		report@12 {
 			compatible = "apple,t6050-pmp-v2-report-entry",
@@ -2272,8 +2286,10 @@
 
 	pmp0_dart: iommu@2841a0000 {
 		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		/* ADT dart-pmp0 instance: DART, then DAPF */
 		reg = <0x2 0x841a0000 0x0 0xc000>,
 		      <0x2 0x841b0000 0x0 0x4000>;
+		reg-names = "dart", "dapf";
 		interrupts = <AIC_IRQ 0 371 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		/* ADT dart-pmp0 vm-base, vm-size */

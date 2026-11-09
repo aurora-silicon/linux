@@ -114,8 +114,14 @@ properties:
     minItems: 2
     description: Host physical address and size pairs mapped into firmware PIO space.
 
+  apple,tunable-segment-names:
+    $ref: /schemas/types.yaml#/definitions/string
+    description:
+      The firmware's segment names from the Apple device tree, separated by
+      semicolons. The firmware reads them as the raw string.
+
 patternProperties:
-  '^apple,tunable-':
+  '^apple,tunable-(?!segment-names$)':
     $ref: /schemas/types.yaml#/definitions/uint8-array
     description: Opaque firmware calibration copied from the Apple device tree.
 
