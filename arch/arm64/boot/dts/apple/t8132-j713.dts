@@ -150,3 +150,19 @@
 	firmware-name = "apple/mesacal-j713.bin", "apple/msrk-j713.bin";
 };
 
+/*
+ * The DCP powers its display domains down while blanked
+ * (appledrm.power_gate_ms): the clock protection slices of its DARTs, as the
+ * ADT has them, and the internal pipe's PMC interface.
+ */
+&dcp_dart {
+	apple,clock-protection = <&ps_prot 42>;
+};
+
+&disp0_dart {
+	apple,clock-protection = <&ps_prot 8>;
+};
+
+&dcp {
+	apple,pmc-interface = <&pmc_disp0>;
+};

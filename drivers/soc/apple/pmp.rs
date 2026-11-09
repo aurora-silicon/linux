@@ -606,6 +606,8 @@ unsafe extern "C" fn display_send(cookie: *const kernel::ffi::c_void, word: u64)
     match word {
         0x0020f50100000000 => unsafe { bindings::apple_pmp_set_device_power(0x0f, 5, 1) },
         0x0020f80100000000 => unsafe { bindings::apple_pmp_set_device_power(0x0f, 8, 1) },
+        // DISP released while its DCP has powered the display domains down.
+        0x0020f80000000000 => unsafe { bindings::apple_pmp_set_device_power(0x0f, 8, 0) },
         _ => EINVAL.to_errno(),
     }
 }
@@ -879,6 +881,15 @@ const HW_CFG_T8142: PmpHwConfig = PmpHwConfig {
     sram_backup: None,
 };
 
+/// T6050: the DART window starts at 1 TiB (ADT dart-pmp0 vm-base) and spans
+/// 64 GiB, as on T8142. Its firmware never readies endpoint 7 (-ETIME).
+const HW_CFG_T6050: PmpHwConfig = PmpHwConfig {
+    dma_mask: Some(DmaMask::new::<42>()),
+    check_bootargs_uuid: false,
+    coreanalytics: Ep7::No,
+    sram_backup: None,
+};
+
 const HW_CFG_T8132: PmpHwConfig = PmpHwConfig {
     dma_mask: None,
     check_bootargs_uuid: false,
@@ -901,6 +912,7 @@ kernel::of_device_table!(
         (of::DeviceId::new(c"apple,t8140-pmp-v2"), &HW_CFG_T8140),
         (of::DeviceId::new(c"apple,t8142-pmp-v2"), &HW_CFG_T8142),
         (of::DeviceId::new(c"apple,t6041-pmp-v2"), &HW_CFG_T6041),
+        (of::DeviceId::new(c"apple,t6050-pmp-v2"), &HW_CFG_T6050),
         (of::DeviceId::new(c"apple,t6000-pmp-v2"), &HW_CFG_DEFAULT),
     ]
 );
