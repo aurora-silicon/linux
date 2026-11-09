@@ -575,21 +575,42 @@ static void pmp_t8112_clpc_vote_test(struct kunit *test)
 
 	writeq(1, t->rep.base + 0x10);
 	writeq(1, t->rep.base + 0x80);
+	writeq(BIT_ULL(2), t->rep.base + 0xa40);
 	ret = apple_pmp_report_t8112_clpc_request(t->rep.dev->of_node,
 						  0xa8, 4, 2);
 	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10500), BIT_ULL(2));
 	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10540),
 			0x2002000400000000ULL);
+	writeq(0, t->rep.base + 0xa40);
 	ret = apple_pmp_report_t8112_clpc_request(t->rep.dev->of_node,
 						  0xa8, 0, 0);
 	KUNIT_ASSERT_EQ(test, ret, 0);
 	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10540), PMP_DVFS_VALID);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10500), 0ULL);
+	KUNIT_EXPECT_EQ(test, t->rep.clpc_ps_owned, 0ULL);
 	ret = apple_pmp_report_t8112_clpc_request(t->rep.dev->of_node,
 						  0xaa, 4, 2);
 	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
 	ret = apple_pmp_report_t8112_clpc_request(t->rep.dev->of_node,
 						  0xab, 5, 2);
 	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+}
+
+static void pmp_t8112_clpc_ack_timeout_test(struct kunit *test)
+{
+	struct pmp_dvfs_test *t = test->priv;
+	int ret;
+
+	writeq(1, t->rep.base + 0x10);
+	writeq(1, t->rep.base + 0x80);
+	ret = apple_pmp_report_t8112_clpc_request(t->rep.dev->of_node,
+						  0xa9, 4, 2);
+	KUNIT_EXPECT_EQ(test, ret, -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10500), 0ULL);
+	KUNIT_EXPECT_EQ(test, t->rep.shadow, 0ULL);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10548), 0ULL);
+	KUNIT_EXPECT_EQ(test, t->rep.clpc_ps_owned, 0ULL);
 }
 
 static struct kunit_case pmp_dvfs_cases[] = {
@@ -599,6 +620,7 @@ static struct kunit_case pmp_dvfs_cases[] = {
 	KUNIT_CASE(pmp_t8112_active_release_test),
 	KUNIT_CASE(pmp_t8112_state_prime_timeout_test),
 	KUNIT_CASE(pmp_t8112_clpc_vote_test),
+	KUNIT_CASE(pmp_t8112_clpc_ack_timeout_test),
 	{}
 };
 
