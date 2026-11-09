@@ -1629,13 +1629,18 @@ mod ta_mode_tests {
         }
     }
 
-    /// The variants of the builds T6041 admits: 25F84, then 25G83.
+    /// The variants of the builds T6041 admits: 25F84, then 25G83, which the 40- and the
+    /// 32-core configurations run with the same rules.
     fn t6041_variants() -> [&'static Variant; 2] {
         let Firmware::Identified(builds) = crate::hw::t6041::CONFIG.firmware else {
             panic!("T6041 must identify its loaded firmware");
         };
-        assert_eq!(builds.len(), 2);
-        [builds[0].variant, builds[1].variant]
+        assert_eq!(builds.len(), 3);
+        let (g83, g83_32) = (builds[1].variant, builds[2].variant);
+        assert_eq!(g83.ta_mode_1, g83_32.ta_mode_1);
+        assert_eq!(g83.compute, g83_32.compute);
+        assert_eq!(g83.programs, g83_32.programs);
+        [builds[0].variant, g83]
     }
 
     /// The TA mode of every admitted T6041 build.

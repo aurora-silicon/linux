@@ -9,9 +9,9 @@ use crate::hw::{GpuGen, GpuVariant};
 use super::t604x::{instances, window};
 use crate::mmu::UatQuirks;
 
-/// What the configurations of both firmware builds share: the 40-core M4 Max measured with
-/// 25F84. Only the register map is the build's own.
-const BASE: Config = Config {
+/// What the configurations of the firmware builds share: the 40-core M4 Max measured with
+/// 25F84. The 40-core 25G83 configuration only has its own register map.
+pub(super) const BASE: Config = Config {
     chip_id: CHIP_ID,
     identity: Identity {
         family: 0xa,
@@ -58,16 +58,24 @@ const BASE: Config = Config {
     },
 };
 
-/// The 40-core M4 Max. 25F84 runs this configuration; 25G83 runs [`CONFIG_25G83`].
+/// The 40-core M4 Max. 25F84 runs this configuration; 25G83 runs [`CONFIG_25G83`], or
+/// [`super::t6041_25g83::CONFIG`] on a 32-core part.
 pub(crate) const CONFIG: Config = Config {
     firmware: fw::variant::Firmware::Identified(&BUILDS),
     ..BASE
 };
 
-const BUILDS: [fw::variant::Build; 2] = [
+/// The 25G83 image is admitted twice, with the configuration of each measured core layout;
+/// the one that matches the probed cores is used.
+const BUILDS: [fw::variant::Build; 3] = [
     BUILD_25F84,
     fw::variant::Build {
         config: Some(&CONFIG_25G83),
+        ..BUILD_25G83
+    },
+    fw::variant::Build {
+        name: "macOS 26.6.2 (25G83, iBoot mBoot-18000.161.10), 32 cores",
+        config: Some(&super::t6041_25g83::CONFIG),
         ..BUILD_25G83
     },
 ];
@@ -96,9 +104,9 @@ const BUILD_25F84: fw::variant::Build = fw::variant::Build {
 
 /// The macOS 26.6.2 boot firmware (iBoot mBoot-18000.161.10) loads the 25G83 build the M4 Pro
 /// runs. iBoot fills part of the loaded TEXT for each Mac, so each admitted image is a
-/// measurement. The one listed is the only T6041 image measured so far, on a 32-core J616C
-/// (linux#1050); there the core count check of [`CONFIG_25G83`] refuses the GPU.
-const BUILD_25G83: fw::variant::Build = fw::variant::Build {
+/// measurement. The one listed is the only T6041 image measured so far, on a 32-core J616C,
+/// which runs it with [`super::t6041_25g83::CONFIG`].
+pub(super) const BUILD_25G83: fw::variant::Build = fw::variant::Build {
     os_version: [26, 6, 2],
     name: "macOS 26.6.2 (25G83, iBoot mBoot-18000.161.10)",
     images: &[crate::fwid::FirmwareBuild {
@@ -252,7 +260,7 @@ const _: () = {
 
 const MAX_POWER_MW: u32 = 129_702;
 
-const REGION_C: RegionCConfig = RegionCConfig {
+pub(super) const REGION_C: RegionCConfig = RegionCConfig {
     unk_54: 0x0fa0,
     unk_78: [1, 0, 0],
     max_power_mw: MAX_POWER_MW,
