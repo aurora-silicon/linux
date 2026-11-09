@@ -17,9 +17,9 @@ pub(in crate::g17::runtime) const FALLBACK: Error = EINPROGRESS;
 
 impl Backend {
     /// The first render of a quiet queue keeps the low-latency ioctl path. A
-    /// count-N test arm sends followers of firmware-visible work through the
-    /// scheduler so several already accepted packets can be prepared before
-    /// the final tag-14 announcement and doorbell.
+    /// streaming or count-N test arm sends followers of firmware-visible work
+    /// through the scheduler. Streaming preserves ordinary count-one records;
+    /// count-N prepares several accepted packets before the final announcement.
     fn defer_inline_render_follower(&self) -> bool {
         let v25g83 = matches!(
             self.shared.variant.graph,

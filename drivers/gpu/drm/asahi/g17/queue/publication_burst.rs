@@ -2,12 +2,14 @@
 
 //! Test-only G16S publication arms.
 //!
-//! The default publishes one tag-14 announcement and one doorbell per kick. B1
-//! keeps one announcement per kick but coalesces the doorbell. B2 commits the
-//! same consecutive kick entries and replaces their announcements with one
-//! count-N announcement. Count-N keeps the first command inline and moves
-//! followers of running work to the scheduler, where the burst consumes only
-//! already accepted packets. A tail is published immediately.
+//! The default publishes one tag-14 announcement and one doorbell per kick. The
+//! stream arm preserves those records and notifications but moves followers of
+//! running work to the scheduler. That lets already accepted followers extend
+//! the ordinary outer-record stream without closing count-N groups. B1 keeps
+//! one announcement per kick but coalesces the doorbell. B2 commits the same
+//! consecutive kick entries and replaces their announcements with one count-N
+//! announcement. Grouped arms consume only already accepted packets, and a
+//! tail is published immediately.
 
 use crate::module_parameters;
 use kernel::prelude::*;
@@ -15,6 +17,7 @@ use kernel::prelude::*;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Encoding {
     Immediate,
+    Stream,
     CountOne,
     CountN,
 }
@@ -33,6 +36,10 @@ impl Arm {
 
     fn parse(value: u32) -> Self {
         match value {
+            101 => Self {
+                encoding: Encoding::Stream,
+                limit: 1,
+            },
             2 | 4 | 8 => Self {
                 encoding: Encoding::CountOne,
                 limit: value as u16,
@@ -46,14 +53,14 @@ impl Arm {
     }
 
     const fn defers_inline_follower(self, in_flight: bool) -> bool {
-        in_flight && matches!(self.encoding, Encoding::CountN)
+        in_flight && matches!(self.encoding, Encoding::Stream | Encoding::CountN)
     }
 }
 
-/// Count-N needs accepted followers to reach the scheduler before the first
-/// follower finishes its private command preparation. Keep the first command
-/// inline (and therefore depth-one latency unchanged), but move followers of
-/// running work to the scheduler when this test arm is active.
+/// Streaming and count-N need accepted followers to reach the scheduler before
+/// the first follower finishes its private command preparation. Keep the first
+/// command inline (and therefore depth-one latency unchanged), but move
+/// followers of running work to the scheduler when either test arm is active.
 pub(in crate::g17) fn defer_inline_follower(v25g83: bool, in_flight: bool) -> bool {
     v25g83 && Arm::parse(module_parameters::g16_test_burst_publication.value())
         .defers_inline_follower(in_flight)
@@ -88,7 +95,7 @@ impl State {
     /// `more` means the same logical engine already has another accepted packet;
     /// `force` keeps first installation and recovery-sensitive publications on A.
     fn advance(&mut self, more: bool, force: bool) -> Plan {
-        if force || self.arm.encoding == Encoding::Immediate {
+        if force || matches!(self.arm.encoding, Encoding::Immediate | Encoding::Stream) {
             let announce = match self.arm.encoding {
                 Encoding::CountN if self.pending != 0 => Some(self.pending.saturating_add(1)),
                 _ => Some(1),
@@ -103,7 +110,7 @@ impl State {
         let count = self.pending.saturating_add(1);
         let finish = !more || count >= self.arm.limit;
         let announce = match self.arm.encoding {
-            Encoding::Immediate | Encoding::CountOne => Some(1),
+            Encoding::Immediate | Encoding::Stream | Encoding::CountOne => Some(1),
             Encoding::CountN if finish => Some(count),
             Encoding::CountN => None,
         };
@@ -150,18 +157,27 @@ mod tests {
 
     #[test]
     fn invalid_values_keep_the_shipped_default() {
-        for value in [0, 1, 3, 16, 101, 103, 116] {
+        for value in [0, 1, 3, 16, 100, 103, 116] {
             assert_eq!(Arm::parse(value), Arm::DEFAULT);
         }
     }
 
     #[test]
-    fn only_count_n_defers_an_in_flight_follower() {
+    fn stream_and_count_n_defer_an_in_flight_follower() {
         assert!(!defer_inline_follower(false, true));
         assert!(!defer_inline_follower(true, false));
         assert!(!Arm::parse(0).defers_inline_follower(true));
         assert!(!Arm::parse(8).defers_inline_follower(true));
+        assert!(Arm::parse(101).defers_inline_follower(true));
         assert!(Arm::parse(108).defers_inline_follower(true));
+    }
+
+    #[test]
+    fn stream_arm_keeps_ordinary_records_and_notifications() {
+        let plans = run(101, 8);
+        for plan in plans {
+            assert_eq!(plan, Plan { announce: Some(1), notify: true });
+        }
     }
 
     #[test]
