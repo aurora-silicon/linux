@@ -89,7 +89,6 @@
 	m2_aic_timebase: timer@23b0dc000 {
 		compatible = "apple,t8112-aic-timebase", "apple,aic-timebase";
 		reg = <0x2 0x3b0dc000 0x0 0x1000>;
-		status = "disabled";
 	};
 
 	m2_dwi: dwi@23b200000 {
@@ -147,7 +146,6 @@
 			<0x2 0x3d10c000 0x0 0x1000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 368 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 		apple,sw-drain;
 	};
 
