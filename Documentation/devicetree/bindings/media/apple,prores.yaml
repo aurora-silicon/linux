@@ -12,7 +12,9 @@ maintainers:
 description: |
   The APR is a directly programmed ProRes engine with its own DART. Jobs are
   descriptors in a DMA ring; the engine signals completion with an
-  interrupt. It has no firmware. Its power domain also resets it.
+  interrupt. T6041 requires a per-machine initialization table installed as
+  apple/prores-t6041-init.bin. Other supported variants have no firmware.
+  The engine's power domain also resets it.
 
 select:
   properties:
@@ -131,7 +133,9 @@ allOf:
             properties:
               compatible:
                 oneOf:
-                  - const: apple,t8140-prores
+                  - enum:
+                      - apple,t8112-prores
+                      - apple,t8140-prores
                   - items:
                       - enum:
                           - apple,t6000-prores
@@ -141,7 +145,6 @@ allOf:
                           - apple,t6030-prores
                           - apple,t6031-prores
                           - apple,t6041-prores
-                          - apple,t8112-prores
                           - apple,t8122-prores
                       - const: apple,prores
 
@@ -211,13 +214,40 @@ allOf:
                           - apple,t6020-prores
                           - apple,t6021-prores
                           - apple,t6022-prores
-                          - apple,t8112-prores
                 then:
                   properties:
                     reg:
                       maxItems: 2
                     reg-names:
                       maxItems: 2
+              - if:
+                  properties:
+                    compatible:
+                      contains:
+                        const: apple,t8112-prores
+                then:
+                  properties:
+                    reg:
+                      minItems: 2
+                      maxItems: 2
+                    reg-names:
+                      minItems: 2
+                      maxItems: 2
+                    interrupts:
+                      minItems: 2
+                      maxItems: 2
+                    iommus:
+                      maxItems: 1
+                    power-domains:
+                      minItems: 2
+                      maxItems: 2
+                    power-domain-names:
+                      minItems: 2
+                      maxItems: 2
+                  required:
+                    - reg-names
+                    - power-domain-names
+                    - resets
               - if:
                   properties:
                     compatible:

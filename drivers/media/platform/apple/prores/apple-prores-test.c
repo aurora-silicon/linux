@@ -336,6 +336,320 @@ static void apr_test_output(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apr_check_output(out, SZ_4K, &bytes), -EIO);
 }
 
+static const size_t apri_test_block_headers[APRI_BLOCK_COUNT] = {
+	[APRI_SYSTEM_BLOCK] = 16,
+	[APRI_CORE_BLOCK] = 16 + 8 + APRI_SYSTEM_COUNT * 12,
+	[APRI_WRAPPER_BLOCK] = 16 + 8 + APRI_SYSTEM_COUNT * 12 +
+			       8 + APRI_CORE_COUNT * 12,
+};
+
+static const size_t apri_test_entry_bases[APRI_BLOCK_COUNT] = {
+	[APRI_SYSTEM_BLOCK] = 16 + 8,
+	[APRI_CORE_BLOCK] = 16 + 8 + APRI_SYSTEM_COUNT * 12 + 8,
+	[APRI_WRAPPER_BLOCK] = 16 + 8 + APRI_SYSTEM_COUNT * 12 +
+			     8 + APRI_CORE_COUNT * 12 + 8,
+};
+
+static void apri_test_build_fixture(u8 *data)
+{
+	static const u32 counts[APRI_BLOCK_COUNT] = {
+		[APRI_SYSTEM_BLOCK] = APRI_SYSTEM_COUNT,
+		[APRI_CORE_BLOCK] = APRI_CORE_COUNT,
+		[APRI_WRAPPER_BLOCK] = APRI_WRAPPER_COUNT,
+	};
+	u32 block, entry;
+
+	memset(data, 0, APRI_T6041_FIRMWARE_SIZE);
+	memcpy(data, "APRI", 4);
+	put_unaligned_le32(1, data + 4);
+	put_unaligned_le32(0x6041, data + 8);
+	put_unaligned_le32(APRI_BLOCK_COUNT, data + 12);
+	for (block = 0; block < APRI_BLOCK_COUNT; block++) {
+		put_unaligned_le32(block + 1, data + apri_test_block_headers[block]);
+		put_unaligned_le32(counts[block], data + apri_test_block_headers[block] + 4);
+		for (entry = 0; entry < counts[block]; entry++) {
+			size_t pos = apri_test_entry_bases[block] + entry * 12;
+
+			put_unaligned_le32(entry * 4, data + pos);
+			put_unaligned_le32(0xff, data + pos + 4);
+			put_unaligned_le32(entry & 0xff, data + pos + 8);
+		}
+	}
+}
+
+static void apr_test_apri_valid(struct kunit *test)
+{
+	struct apr_init_data *init = kunit_kzalloc(test, sizeof(*init), GFP_KERNEL);
+	u8 *data = kunit_kmalloc(test, APRI_T6041_FIRMWARE_SIZE, GFP_KERNEL);
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, init);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	apri_test_build_fixture(data);
+	ret = apr_parse_t6041_init(data, APRI_T6041_FIRMWARE_SIZE, init);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, init->blocks[APRI_SYSTEM_BLOCK].count,
+			(u32)APRI_SYSTEM_COUNT);
+	KUNIT_EXPECT_EQ(test, init->blocks[APRI_CORE_BLOCK].count,
+			(u32)APRI_CORE_COUNT);
+	KUNIT_EXPECT_EQ(test, init->blocks[APRI_WRAPPER_BLOCK].count,
+			(u32)APRI_WRAPPER_COUNT);
+	KUNIT_EXPECT_EQ(test,
+			init->blocks[APRI_WRAPPER_BLOCK].entries[61].offset,
+			(u32)61 * 4);
+}
+
+static void apri_test_expect_rejected(struct kunit *test, const u8 *data,
+				      size_t size, struct apr_init_data *init)
+{
+	KUNIT_EXPECT_EQ(test, apr_parse_t6041_init(data, size, init), -EINVAL);
+}
+
+static void apr_test_apri_header_rejects(struct kunit *test)
+{
+	struct apr_init_data *init = kunit_kzalloc(test, sizeof(*init), GFP_KERNEL);
+	u8 *data = kunit_kmalloc(test, APRI_T6041_FIRMWARE_SIZE, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, init);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	apri_test_build_fixture(data);
+	data[0] = 'X';
+	apri_test_expect_rejected(test, data, APRI_T6041_FIRMWARE_SIZE, init);
+	apri_test_build_fixture(data);
+	put_unaligned_le32(2, data + 4);
+	apri_test_expect_rejected(test, data, APRI_T6041_FIRMWARE_SIZE, init);
+	apri_test_build_fixture(data);
+	put_unaligned_le32(0x6040, data + 8);
+	apri_test_expect_rejected(test, data, APRI_T6041_FIRMWARE_SIZE, init);
+	apri_test_build_fixture(data);
+	put_unaligned_le32(4, data + 12);
+	apri_test_expect_rejected(test, data, APRI_T6041_FIRMWARE_SIZE, init);
+	apri_test_build_fixture(data);
+	apri_test_expect_rejected(test, data, APRI_T6041_FIRMWARE_SIZE - 1, init);
+	apri_test_expect_rejected(test, data, APRI_T6041_FIRMWARE_SIZE + 1, init);
+}
+
+static void apr_test_apri_shape_rejects(struct kunit *test)
+{
+	struct apr_init_data *init = kunit_kzalloc(test, sizeof(*init), GFP_KERNEL);
+	u8 *data = kunit_kmalloc(test, APRI_T6041_FIRMWARE_SIZE, GFP_KERNEL);
+	u8 *core_count;
+
+	KUNIT_ASSERT_NOT_NULL(test, init);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	apri_test_build_fixture(data);
+	put_unaligned_le32(1, data + apri_test_block_headers[APRI_CORE_BLOCK]);
+	apri_test_expect_rejected(test, data, APRI_T6041_FIRMWARE_SIZE, init);
+	apri_test_build_fixture(data);
+	put_unaligned_le32(4, data + apri_test_block_headers[APRI_CORE_BLOCK]);
+	apri_test_expect_rejected(test, data, APRI_T6041_FIRMWARE_SIZE, init);
+	apri_test_build_fixture(data);
+	core_count = data + apri_test_block_headers[APRI_CORE_BLOCK] + 4;
+	put_unaligned_le32(APRI_CORE_COUNT - 1, core_count);
+	apri_test_expect_rejected(test, data, APRI_T6041_FIRMWARE_SIZE, init);
+}
+
+static void apr_test_apri_rows_reject(struct kunit *test, u32 block,
+				      u32 entry, u32 field, u32 value)
+{
+	struct apr_init_data *init = kunit_kzalloc(test, sizeof(*init), GFP_KERNEL);
+	u8 *data = kunit_kmalloc(test, APRI_T6041_FIRMWARE_SIZE, GFP_KERNEL);
+	size_t pos;
+
+	KUNIT_ASSERT_NOT_NULL(test, init);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	apri_test_build_fixture(data);
+	pos = apri_test_entry_bases[block] + entry * 12 + field;
+	put_unaligned_le32(value, data + pos);
+	apri_test_expect_rejected(test, data, APRI_T6041_FIRMWARE_SIZE, init);
+}
+
+static void apr_test_apri_row_rejects(struct kunit *test)
+{
+	apr_test_apri_rows_reject(test, APRI_SYSTEM_BLOCK, 0, 0, 2);
+	apr_test_apri_rows_reject(test, APRI_SYSTEM_BLOCK, 1, 0, 0);
+	apr_test_apri_rows_reject(test, APRI_SYSTEM_BLOCK, 0, 0, 0x4000);
+	apr_test_apri_rows_reject(test, APRI_CORE_BLOCK, 0, 0, 0x4000);
+	apr_test_apri_rows_reject(test, APRI_WRAPPER_BLOCK, 0, 0, 0x1000000);
+	apr_test_apri_rows_reject(test, APRI_SYSTEM_BLOCK, 0, 4, 0);
+	apr_test_apri_rows_reject(test, APRI_SYSTEM_BLOCK, 2, 4, 1);
+	/* A value bit outside its mask. */
+	apr_test_apri_rows_reject(test, APRI_SYSTEM_BLOCK, 0, 8, 0x100);
+}
+
+static void apr_test_decode_desc(struct kunit *test)
+{
+	struct apr_decode_frame f = {
+		.width = 320, .height = 240, .output = APR_INPUT_422_16,
+		.luma_stride = 640, .chroma_stride = 640,
+		.input = 0x10000100000ULL, .luma = 0x10000200000ULL,
+		.chroma = 0x10000300000ULL, .job_id = 0x1234,
+	};
+	u8 *d = kunit_kmalloc(test, APR_DECODE_DESC_BYTES + 1, GFP_KERNEL);
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, d);
+	memset(d, 0xa5, APR_DECODE_DESC_BYTES + 1);
+	KUNIT_ASSERT_EQ(test, apr_build_decode_desc(&f, d), 0);
+	KUNIT_EXPECT_EQ(test, d[APR_DECODE_DESC_BYTES], 0xa5);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(d), 0x1234120b);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 4), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 8), f.input);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x14), 320);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x16), 240);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x1c), 320);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x1e), 240);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x20), 10);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x22), 10);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x28), f.luma);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x30), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x38), f.chroma);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x40), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x48), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 0x90), 3);
+	for (i = 0x94; i < APR_DECODE_DESC_BYTES; i++)
+		KUNIT_EXPECT_EQ_MSG(test, d[i], 0, "reserved byte %#x", i);
+
+	f.output = APR_INPUT_444_16;
+	f.chroma_stride = 1280;
+	f.bottom_field_first = true;
+	KUNIT_ASSERT_EQ(test, apr_build_decode_desc(&f, d), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(d), 0x1234520f);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x22), 20);
+	f.luma_stride = 600;
+	KUNIT_EXPECT_EQ(test, apr_build_decode_desc(&f, d), -EINVAL);
+}
+
+static u8 *apr_test_bitstream(struct kunit *test, bool interlaced, size_t *bytes)
+{
+	u32 slices = interlaced ? 24 : 45;
+	u32 picture_size = 8 + 2 * slices + 6 * slices;
+	u32 pictures = interlaced ? 2 : 1;
+	u32 frame_size = 28 + pictures * picture_size;
+	u8 *frame = kunit_kzalloc(test, frame_size, GFP_KERNEL);
+	u32 offset = 28;
+	unsigned int i, p;
+
+	if (!frame)
+		return NULL;
+	put_unaligned_be32(frame_size, frame);
+	memcpy(frame + 4, "icpf", 4);
+	put_unaligned_be16(20, frame + 8);
+	put_unaligned_be16(0, frame + 10);
+	memcpy(frame + 12, "kunt", 4);
+	put_unaligned_be16(320, frame + 16);
+	put_unaligned_be16(240, frame + 18);
+	frame[20] = 2 << 6 | (interlaced ? 1 << 2 : 0);
+	frame[22] = 1;
+	frame[23] = 1;
+	frame[24] = 1;
+	for (p = 0; p < pictures; p++) {
+		u8 *picture = frame + offset;
+
+		picture[0] = 8 << 3;
+		put_unaligned_be32(picture_size, picture + 1);
+		put_unaligned_be16(slices, picture + 5);
+		picture[7] = 3 << 4;
+		for (i = 0; i < slices; i++)
+			put_unaligned_be16(6, picture + 8 + 2 * i);
+		offset += picture_size;
+	}
+	*bytes = frame_size;
+	return frame;
+}
+
+static void apr_test_parse_frame(struct kunit *test)
+{
+	struct apr_prores_info info;
+	size_t bytes;
+	u8 *frame = apr_test_bitstream(test, false, &bytes);
+
+	KUNIT_ASSERT_NOT_NULL(test, frame);
+	KUNIT_ASSERT_EQ(test, apr_parse_frame(frame, bytes, &info), 0);
+	KUNIT_EXPECT_EQ(test, info.frame_size, (u32)bytes);
+	KUNIT_EXPECT_EQ(test, info.width, 320U);
+	KUNIT_EXPECT_EQ(test, info.height, 240U);
+	KUNIT_EXPECT_EQ(test, info.chroma, (u8)2);
+	KUNIT_EXPECT_EQ(test, info.pictures, (u8)1);
+	KUNIT_EXPECT_EQ(test, info.slices[0], 45U);
+	KUNIT_EXPECT_EQ(test, info.picture_offset[0], 28U);
+
+	put_unaligned_be32(bytes - 1, frame);
+	KUNIT_EXPECT_EQ(test, apr_parse_frame(frame, bytes, &info), -EINVAL);
+	put_unaligned_be32(bytes, frame);
+	frame[4] = 'x';
+	KUNIT_EXPECT_EQ(test, apr_parse_frame(frame, bytes, &info), -EINVAL);
+}
+
+static void apr_test_parse_interlaced(struct kunit *test)
+{
+	struct apr_prores_info info;
+	size_t bytes;
+	u8 *frame = apr_test_bitstream(test, true, &bytes);
+
+	KUNIT_ASSERT_NOT_NULL(test, frame);
+	KUNIT_ASSERT_EQ(test, apr_parse_frame(frame, bytes, &info), 0);
+	KUNIT_EXPECT_EQ(test, info.frame_type, (u8)1);
+	KUNIT_EXPECT_EQ(test, info.pictures, (u8)2);
+	KUNIT_EXPECT_EQ(test, info.slices[0], 24U);
+	KUNIT_EXPECT_EQ(test, info.slices[1], 24U);
+	KUNIT_EXPECT_EQ(test, info.picture_offset[1],
+			info.picture_offset[0] + info.picture_size[0]);
+}
+
+static void apr_test_ring_accounting(struct kunit *test)
+{
+	u8 *ring = kunit_kzalloc(test, APR_RING_BYTES, GFP_KERNEL);
+	u8 *desc = kunit_kmalloc(test, APR_ENCODE_DESC_BYTES, GFP_KERNEL);
+	u32 ptr = APR_RING_BYTES - 0x100;
+	u32 next;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, ring);
+	KUNIT_ASSERT_NOT_NULL(test, desc);
+	next = apr_ring_advance(0, APR_DECODE_DESC_BYTES, APR_RING_BYTES);
+	KUNIT_EXPECT_EQ(test, next, 0x100U);
+	next = apr_ring_advance(0x100, APR_ENCODE_DESC_BYTES, APR_RING_BYTES);
+	KUNIT_EXPECT_EQ(test, next, 0x280U);
+	next = apr_ring_advance(ptr, APR_ENCODE_DESC_BYTES, APR_RING_BYTES);
+	KUNIT_EXPECT_EQ(test, next, APR_RING_GENERATION | 0x80U);
+	next = apr_ring_advance(APR_RING_GENERATION | APR_RING_BYTES - 0x80,
+				APR_DECODE_DESC_BYTES, APR_RING_BYTES);
+	KUNIT_EXPECT_EQ(test, next, 0x80U);
+	for (i = 0; i < APR_ENCODE_DESC_BYTES; i++)
+		desc[i] = i;
+	apr_ring_write(ring, APR_RING_BYTES, ptr, desc, APR_ENCODE_DESC_BYTES);
+	KUNIT_EXPECT_MEMEQ(test, ring + ptr, desc, 0x100);
+	KUNIT_EXPECT_MEMEQ(test, ring, desc + 0x100, 0x80);
+}
+
+static void apr_test_t8112_variant(struct kunit *test)
+{
+	struct apr_variant_test_info info;
+	static const u32 stats[] = {
+		APR_REG_STATS0_LO, APR_REG_STATS0_HI, APR_REG_STATS0_SIZE,
+		APR_REG_STATS1_LO, APR_REG_STATS1_HI, APR_REG_STATS1_SIZE,
+	};
+
+	KUNIT_ASSERT_EQ(test,
+			apr_variant_test_info("apple,t8112-prores", &info), 0);
+	KUNIT_EXPECT_TRUE(test, info.encode_v1);
+	KUNIT_EXPECT_TRUE(test, info.has_decoder);
+	KUNIT_EXPECT_MEMEQ(test, info.stats, stats, sizeof(stats));
+	KUNIT_EXPECT_EQ(test, info.num_engine_tunables, (size_t)64);
+	KUNIT_EXPECT_EQ(test, info.num_wrapper_tunables, (size_t)0);
+	KUNIT_EXPECT_EQ(test, info.num_regs, 2U);
+	KUNIT_EXPECT_EQ(test, info.num_irqs, 2U);
+	KUNIT_EXPECT_EQ(test, info.num_required_irqs, 2U);
+	KUNIT_EXPECT_EQ(test, info.num_completion_irqs, 1U);
+	KUNIT_EXPECT_EQ(test, info.ring_bytes, (u32)APR_RING_BYTES);
+	KUNIT_EXPECT_EQ(test, info.encode_desc_bytes,
+			(u32)APR_ENCODE_DESC_BYTES);
+	KUNIT_EXPECT_FALSE(test, info.has_firmware);
+	KUNIT_EXPECT_EQ(test,
+			apr_variant_test_info("apple,not-prores", &info), -ENOENT);
+}
+
 static struct kunit_case apr_test_cases[] = {
 	KUNIT_CASE(apr_test_qmat_regs),
 	KUNIT_CASE(apr_test_dc_scale),
@@ -348,6 +662,15 @@ static struct kunit_case apr_test_cases[] = {
 	KUNIT_CASE(apr_test_budgets),
 	KUNIT_CASE(apr_test_slices),
 	KUNIT_CASE(apr_test_output),
+	KUNIT_CASE(apr_test_apri_valid),
+	KUNIT_CASE(apr_test_apri_header_rejects),
+	KUNIT_CASE(apr_test_apri_shape_rejects),
+	KUNIT_CASE(apr_test_apri_row_rejects),
+	KUNIT_CASE(apr_test_decode_desc),
+	KUNIT_CASE(apr_test_parse_frame),
+	KUNIT_CASE(apr_test_parse_interlaced),
+	KUNIT_CASE(apr_test_ring_accounting),
+	KUNIT_CASE(apr_test_t8112_variant),
 	{}
 };
 
@@ -357,6 +680,6 @@ static struct kunit_suite apr_test_suite = {
 };
 kunit_test_suite(apr_test_suite);
 
-MODULE_DESCRIPTION("KUnit tests for the Apple ProRes encoder");
+MODULE_DESCRIPTION("KUnit tests for the Apple ProRes codec");
 MODULE_LICENSE("GPL");
 MODULE_IMPORT_NS("EXPORTED_FOR_KUNIT_TESTING");
