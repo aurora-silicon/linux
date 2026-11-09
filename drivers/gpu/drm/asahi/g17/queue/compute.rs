@@ -2794,6 +2794,11 @@ impl Queue {
                     })?;
                 visible = true;
                 self.unpublished_binding = false;
+                // The J813 (common 26A428) reads the descriptor from the item ring, after
+                // the configuration, as macOS 27.0's compute ring has it.
+                if crate::g17::J813_FORMS.load(Ordering::Relaxed) {
+                    producer = self.graph.append(producer, descriptor_high, || {})?;
+                }
                 // This Active and its Packet pins now own all visible records.
                 if let Some(configuration) = self.configuration.take() { configuration.release(); }
             } else if first {
@@ -2881,7 +2886,7 @@ impl Queue {
             }
             prepared_kick.commit();
             self.submitted = self.submitted.checked_add(1).ok_or(EOVERFLOW)?;
-            let announce_va = if self.graph.m5 {
+            let announce_va = if self.graph.m5 && !crate::g17::J813_FORMS.load(Ordering::Relaxed) {
                 self.graph.record(record_slot, ANNOUNCE, 0x40,
                     crate::g17::fw::m5::queue::notification(qid, kick_timestamp)?)?
             } else { self.graph.record(record_slot, ANNOUNCE, 0x40, announce)? };

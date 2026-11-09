@@ -318,6 +318,15 @@ const MSG_INITDATA_DONE: u64 = 0x89 << MSG_TYPE_SHIFT;
 const MSG_EVENTS: u64 = 0x42 << MSG_TYPE_SHIFT;
 /// Primary processor notification for newly published device-control records.
 const MSG_CONTROL_NOTIFY: u64 = (0x84 << MSG_TYPE_SHIFT) | 0x11;
+
+/// The board is the J813 ([`fw::m5::initdata::Board::j813_forms`]), whose firmware (common
+/// 26A428) takes work in the G17P forms. macOS 27.0 there submits through the doorbell alone: it
+/// never writes the M5 Pro's host port (sgx+0x4090/0x4098) or the KSM queue registers
+/// (sgx+0x21068..0x21080), and rings render doorbells as 0x83 | priority << 2 (0 and 8 in its
+/// trace; compute is | 2).
+pub(crate) static J813_FORMS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Host message, sent to both coprocessors once both are initialized, ending the power-on
 /// transition. The firmware then retires the opening device-control records.
 const MSG_POWER_ON_DONE: u64 = 0x89 << MSG_TYPE_SHIFT;
@@ -1516,6 +1525,7 @@ impl Gpu {
         let m5 = cfg.profile.is_m5();
         if m5 {
             let board = cfg.m5.ok_or(EINVAL)?;
+            J813_FORMS.store(board.j813_forms(), core::sync::atomic::Ordering::Relaxed);
             // Hold the J813's GFX power domain for the session, as the G15 and G16 paths do
             // for theirs. Without a hold genpd gates it once it finds no active consumer, and
             // the GPU's cores can never come up: ps_gfx reads target 0xf with actual 0 while

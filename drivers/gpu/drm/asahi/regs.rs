@@ -631,6 +631,9 @@ impl G17Resources {
         &self,
         submission: &crate::g17::fw::m5::queue::HardwareSubmission,
     ) -> Result {
+        if crate::g17::J813_FORMS.load(core::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         let sgx = (&*sgx).as_view();
         for &(offset, value) in submission.writes() {

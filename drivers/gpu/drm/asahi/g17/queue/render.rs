@@ -839,7 +839,11 @@ impl Pair {
                     crate::g17::fw::m5::queue::ConfigProfile {
                         soft_fault_enabled: true,
                         extended: false,
-                        parameter_manager: (stage == 0).then(|| u32::from(self.buffer_id())),
+                        // macOS 27.0's J813 TA configuration names the paired 3D queue at
+                        // +0x82 (qid 1 beside pb_slot 0), not the parameter manager.
+                        parameter_manager: (stage == 0
+                            && !crate::g17::J813_FORMS.load(Ordering::Relaxed))
+                        .then(|| u32::from(self.buffer_id())),
                     },
                 )?
             } else {
@@ -847,7 +851,10 @@ impl Pair {
             });
         }
         let configs = [configs[0].ok_or(EIO)?, configs[1].ok_or(EIO)?];
-        if m5 && self.registered.is_none() {
+        // The J813's (common 26A428) items carry configuration, descriptor and announcement in
+        // one publication; macOS 27.0 never publishes a configuration alone there.
+        let j813 = crate::g17::J813_FORMS.load(Ordering::Relaxed);
+        if m5 && !j813 && self.registered.is_none() {
             if self.installed == [true; 2] {
                 // The cold-install configuration pair must be consumed first.
                 let cursors = self.memory.graph.cursors()?;
@@ -883,7 +890,10 @@ impl Pair {
                 config.completion_seed_valid = 0;
                 config.completion_seed = 0;
             }
-            publication::required(cache[stage], config)
+            // macOS 27.0 sends a configuration with every J813 kick, so the firmware always
+            // runs a kick under the context its own record names; leaving it out let a fragment
+            // run under another client's (or no) context under parallel load.
+            j813 || publication::required(cache[stage], config)
         });
         let cursors = self.memory.graph.cursors()?;
         if cursors[0].write != self.cursors[0] || cursors[1].write != self.cursors[1] {
@@ -941,8 +951,9 @@ impl Pair {
                 },
             },
             mcache,
-            // M5 tiling kicks also retain the last event of the mask.
-            event_mask: if m5 && stage == 0 {
+            // M5 tiling kicks also retain the last event of the mask, except on the J813, whose
+            // macOS 27.0 TA and 3D kicks name no event at all.
+            event_mask: if m5 && stage == 0 && !j813 {
                 [0, 0, 0, 1u64 << 62]
             } else {
                 abi::RENDER_KICK_EVENT_MASK
