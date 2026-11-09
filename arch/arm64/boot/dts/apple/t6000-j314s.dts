@@ -9,13 +9,6 @@
 
 /dts-v1/;
 
-/*
- * PMP manages system power states; with pmgr-misc leaving DCS to it and
- * lowering only the fabric for sleep, this board resumes from s2idle and
- * idles about 0.8 W lower.
- */
-#define APPLE_USE_PMP
-
 #include "t6000.dtsi"
 #include "t600x-j314-j316.dtsi"
 
