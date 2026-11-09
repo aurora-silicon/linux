@@ -3115,6 +3115,8 @@ static int apple_pcie_attach_domains(struct apple_pcie *pcie)
 	};
 	int count, ret, i;
 
+	if (!IS_ENABLED(CONFIG_PM))
+		return 0;
 	if (!of_property_present(dev->of_node, "power-domains"))
 		return 0;
 
