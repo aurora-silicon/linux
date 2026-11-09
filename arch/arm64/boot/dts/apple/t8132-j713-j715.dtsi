@@ -142,7 +142,18 @@
 	status = "okay";
 };
 
+/* Only named: the sleep's last refusal reads its state to see the enclave gate. */
+&ps_sep {
+	apple,firmware-owned;
+	status = "okay";
+};
+
 &sep {
+	/*
+	 * Without a domain the driver tells the enclave at .suspend, and a sleep
+	 * refused after that finds it gated with its mailbox gone.
+	 */
+	power-domains = <&ps_sep>, <&ps_gpio>;
 	status = "okay";
 };
 
@@ -326,5 +337,6 @@
 };
 
 #include "t8132-j713-atcphy-tunables.dtsi"
+#include "t8132-j713-apcie-tunables.dtsi"
 #include "t8132-j713-usb4.dtsi"
 #include "t8132-j713-usb4-tunables.dtsi"
