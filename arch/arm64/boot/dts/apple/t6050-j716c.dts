@@ -632,3 +632,6 @@
 	apple,tunable = <0x140 0x1 0x1>,
 			<0x2a0 0x7e 0xa>;
 };
+
+#include "t6050-j716c-display.dtsi"
+#include "t6050-j716c-left-usb4.dtsi"
