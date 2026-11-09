@@ -376,6 +376,8 @@ struct apple_dart {
 	u32 tunnel_state_restored : 1;
 	/* Clocked by its host's port: the host resumes it after a real sleep. */
 	u32 host_resumes : 1;
+	/* Powered down by its DCP across a real sleep: see apple_dart_host_power_on(). */
+	u32 host_off_slept : 1;
 	bool commands_gated;
 	/* Resume restored the translations, but the last steps of its reset failed. */
 	bool reset_incomplete;
@@ -793,6 +795,10 @@ static bool apple_dart_fault_pending(struct apple_dart *dart);
 
 /* READY bring-up only: userspace must arm its watchdog before probing SID23. */
 static bool apple_dart_dcp_enabled;
+/* S2R bring-up on the Air: retained radio and external display DMA doesn't refuse a deep sleep. */
+static bool bringup_no_refuse;
+module_param(bringup_no_refuse, bool, 0644);
+
 module_param_named(j713_dcp, apple_dart_dcp_enabled, bool, 0600);
 MODULE_PARM_DESC(j713_dcp, "Enable explicit J713 DCP DART probe after arming watchdog");
 
@@ -5663,7 +5669,7 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 	 * again.
 	 */
 	if (dart->dispext) {
-		if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
+		if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE && !bringup_no_refuse)
 			return -EBUSY;
 		if (apple_dart_has_borrowed(dart))
 			apple_dart_pm_invalidate(dart, true);
@@ -5676,8 +5682,13 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 	 * registers are saved only for resume to check.
 	 */
 	if (dart->managed_sids || dart->preserve_display || apple_dart_has_borrowed(dart)) {
-		if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
-			return -EBUSY;
+		if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE) {
+			/* Powered down by its DCP, which restores it at power-up. */
+			if (READ_ONCE(dart->host_off))
+				return 0;
+			if (!bringup_no_refuse)
+				return -EBUSY;
+		}
 		apple_dart_save_state(dart);
 		dart->s2idle_kept = true;
 		return 0;
@@ -5709,8 +5720,12 @@ static bool apple_dart_state_retained(struct apple_dart *dart)
 	for (sid = 0; sid < dart->num_streams; sid++) {
 		u32 tcr = apple_dart_readl(dart, DART_TCR(dart, sid));
 
-		if (tcr != dart->save_tcr[sid])
+		if (tcr != dart->save_tcr[sid]) {
+			if (dart->host_off_slept)
+				dev_info(dart->dev, "SID%u TCR %08x, had %08x\n", sid, tcr,
+					 dart->save_tcr[sid]);
 			return false;
+		}
 		/* An identity domain bypasses the DART without any page table. */
 		if (dart->supports_bypass && dart->hw->tcr_bypass && tcr == dart->hw->tcr_bypass)
 			live = true;
@@ -5718,8 +5733,12 @@ static bool apple_dart_state_retained(struct apple_dart *dart)
 		for (idx = 0; idx < dart->hw->ttbr_count; idx++) {
 			u32 ttbr = apple_dart_readl(dart, DART_TTBR(dart, sid, idx));
 
-			if (ttbr != dart->save_ttbr[sid][idx])
+			if (ttbr != dart->save_ttbr[sid][idx]) {
+				if (dart->host_off_slept)
+					dev_info(dart->dev, "SID%u TTBR%u %08x, had %08x\n", sid, idx, ttbr,
+						 dart->save_ttbr[sid][idx]);
 				return false;
+			}
 			if (ttbr & dart->hw->ttbr_valid)
 				live = true;
 		}
@@ -5789,8 +5808,10 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	if (dart->host_resumes && READ_ONCE(dart->commands_gated))
 		return 0;
 	/* Powered down by its DCP, which restores it at power-up. */
-	if (READ_ONCE(dart->host_off))
+	if (READ_ONCE(dart->host_off)) {
+		dart->host_off_slept = pm_resume_via_firmware();
 		return 0;
+	}
 	/*
 	 * An adopted external display DART may be off now, its display with it,
 	 * and nothing confirms otherwise: no register of it is read or written
@@ -6218,11 +6239,19 @@ static int apple_dart_host_power_on(struct apple_dart *dart)
 		goto fail;
 	why = "state lost";
 	ret = -EIO;
-	if (readl(dart->regs + DART_T8110_ENABLE_STREAMS) ||
+	/* The sleep engine rebuilt it as iBoot set it up, its streams already on. */
+	if (dart->host_off_slept)
+		dev_info(dart->dev, "power-up after a sleep: streams %08x, had %08x; protect %08x, had %08x; lock %08x, had %08x; retained %d\n",
+			 readl(dart->regs + DART_T8110_ENABLE_STREAMS), dart->off_streams,
+			 readl(dart->regs + DART_T8110_PROTECT), dart->off_protect,
+			 readl(dart->regs + DART_T8110_PROTECT_LOCK), dart->off_lock,
+			 apple_dart_state_retained(dart));
+	if ((!dart->host_off_slept && readl(dart->regs + DART_T8110_ENABLE_STREAMS)) ||
 	    readl(dart->regs + DART_T8110_PROTECT) != dart->off_protect ||
 	    readl(dart->regs + DART_T8110_PROTECT_LOCK) != dart->off_lock ||
 	    !apple_dart_state_retained(dart))
 		goto fail;
+	dart->host_off_slept = false;
 	why = "commands";
 	ret = apple_dart_resume_commands(dart->dev);
 	if (ret)
