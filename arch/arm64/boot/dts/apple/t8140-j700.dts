@@ -695,6 +695,11 @@
 	};
 };
 
+/* A spare PWM channel for developers; no consumer is known. */
+&fpwm0 {
+	status = "okay";
+};
+
 &smc {
 	status = "okay";
 };

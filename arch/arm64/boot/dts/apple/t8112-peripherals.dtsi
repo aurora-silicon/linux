@@ -72,12 +72,18 @@
 		status = "disabled";
 	};
 
-	m2_pwm: pwm@235040000 {
-		compatible = "apple,t8112-pwm", "apple,pwm";
+	/*
+	 * The FPWM0 instance, next to the keyboard backlight's FPWM1. No board
+	 * wires it to anything known: a spare PWM channel with no consumer.
+	 */
+	fpwm0: pwm@235040000 {
+		compatible = "apple,t8112-fpwm", "apple,s5l-fpwm";
 		reg = <0x2 0x35040000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 766 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_fpwm0>;
+		clocks = <&clkref>;
+		#pwm-cells = <2>;
 		status = "disabled";
 	};
 
