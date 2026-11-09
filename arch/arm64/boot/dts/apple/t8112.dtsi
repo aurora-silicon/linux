@@ -75,6 +75,7 @@
 			next-level-cache = <&l2_cache_0>;
 			i-cache-size = <0x20000>;
 			d-cache-size = <0x10000>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_e1: cpu@1 {
@@ -89,6 +90,7 @@
 			next-level-cache = <&l2_cache_0>;
 			i-cache-size = <0x20000>;
 			d-cache-size = <0x10000>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_e2: cpu@2 {
@@ -103,6 +105,7 @@
 			next-level-cache = <&l2_cache_0>;
 			i-cache-size = <0x20000>;
 			d-cache-size = <0x10000>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_e3: cpu@3 {
@@ -117,6 +120,7 @@
 			next-level-cache = <&l2_cache_0>;
 			i-cache-size = <0x20000>;
 			d-cache-size = <0x10000>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p0: cpu@10100 {
@@ -131,6 +135,7 @@
 			next-level-cache = <&l2_cache_1>;
 			i-cache-size = <0x30000>;
 			d-cache-size = <0x20000>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p1: cpu@10101 {
@@ -145,6 +150,7 @@
 			next-level-cache = <&l2_cache_1>;
 			i-cache-size = <0x30000>;
 			d-cache-size = <0x20000>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p2: cpu@10102 {
@@ -159,6 +165,7 @@
 			next-level-cache = <&l2_cache_1>;
 			i-cache-size = <0x30000>;
 			d-cache-size = <0x20000>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p3: cpu@10103 {
@@ -173,6 +180,7 @@
 			next-level-cache = <&l2_cache_1>;
 			i-cache-size = <0x30000>;
 			d-cache-size = <0x20000>;
+			#cooling-cells = <2>;
 		};
 
 		l2_cache_0: l2-cache-0 {
@@ -1540,6 +1548,44 @@
 
 			smc_hwmon: hwmon {
 				compatible = "apple,smc-hwmon";
+				#thermal-sensor-cells = <1>;
+				/*
+				 * The GPU keys read a fixed low value while the GPU
+				 * is idle, then the CPU die keys.
+				 */
+				apple,soc-die-keys = "Tg0f", "Tg0n", "Tg0r", "Te05",
+						     "Tp01", "Tp05", "Tp09", "Tp0D";
+
+				/* SoC die temperatures, first: thermal zones index them. */
+				temperature-TCMz {
+					apple,key-id = "TCMz";
+					label = "SoC Die Temperature";
+				};
+
+				temperature-Te05 {
+					apple,key-id = "Te05";
+					label = "E-cluster Temperature";
+				};
+
+				temperature-Tp01 {
+					apple,key-id = "Tp01";
+					label = "P-core 0 Temperature";
+				};
+
+				temperature-Tp05 {
+					apple,key-id = "Tp05";
+					label = "P-core 1 Temperature";
+				};
+
+				temperature-Tp09 {
+					apple,key-id = "Tp09";
+					label = "P-core 2 Temperature";
+				};
+
+				temperature-Tp0D {
+					apple,key-id = "Tp0D";
+					label = "P-core 3 Temperature";
+				};
 			};
 
 			smc_rtc: rtc {
