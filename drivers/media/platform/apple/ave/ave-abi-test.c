@@ -715,6 +715,10 @@ static void ave_6070_text_id(struct kunit *test)
 	crc = 0;
 	KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, off, 0xd0000ULL, &crc), 0);
 	KUNIT_EXPECT_EQ(test, crc, image);
+	/* T8112 hands the firmware over at the DART vm-base. */
+	crc = 0;
+	KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, off, 0x8000d0000ULL, &crc), 0);
+	KUNIT_EXPECT_EQ(test, crc, image);
 	/* Any other address in the cell is a different TEXT. */
 	put_unaligned_le64(0x8000d4000ULL, text + off);
 	KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, off, 0xd0000ULL, &crc), -ENODEV);
