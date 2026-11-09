@@ -115,6 +115,12 @@ allOf:
               interrupts:
                 maxItems: 1
 
+              power-domains:
+                maxItems: 1
+                description:
+                  The USB4 controller power domain the ingress registers
+                  sit in.
+
             required:
               - compatible
               - reg
