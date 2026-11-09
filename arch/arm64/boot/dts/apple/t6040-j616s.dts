@@ -305,5 +305,5 @@
 };
 
 &pcie0 {
-	power-domains = <&ps_apcie_sys_gp>;
+	power-domains = <&ps_apcie_sys_gp>, <&ps_apcie_phy_sw>;
 };
