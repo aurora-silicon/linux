@@ -75,6 +75,7 @@
 			operating-points-v2 = <&icestorm_opp>;
 			capacity-dmips-mhz = <714>;
 			performance-domains = <&cpufreq_e>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_e01: cpu@1 {
@@ -89,6 +90,7 @@
 			operating-points-v2 = <&icestorm_opp>;
 			capacity-dmips-mhz = <714>;
 			performance-domains = <&cpufreq_e>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p00: cpu@10100 {
@@ -103,6 +105,7 @@
 			operating-points-v2 = <&firestorm_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p0>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p01: cpu@10101 {
@@ -117,6 +120,7 @@
 			operating-points-v2 = <&firestorm_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p0>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p02: cpu@10102 {
@@ -131,6 +135,7 @@
 			operating-points-v2 = <&firestorm_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p0>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p03: cpu@10103 {
@@ -145,6 +150,7 @@
 			operating-points-v2 = <&firestorm_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p0>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p10: cpu@10200 {
@@ -159,6 +165,7 @@
 			operating-points-v2 = <&firestorm_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p1>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p11: cpu@10201 {
@@ -173,6 +180,7 @@
 			operating-points-v2 = <&firestorm_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p1>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p12: cpu@10202 {
@@ -187,6 +195,7 @@
 			operating-points-v2 = <&firestorm_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p1>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p13: cpu@10203 {
@@ -201,6 +210,7 @@
 			operating-points-v2 = <&firestorm_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p1>;
+			#cooling-cells = <2>;
 		};
 
 		l2_cache_0: l2-cache-0 {
