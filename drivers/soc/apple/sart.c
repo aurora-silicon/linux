@@ -25,7 +25,6 @@
 #include <linux/platform_device.h>
 #include <linux/suspend.h>
 #include <linux/types.h>
-#include "sart-backend.h"
 
 #define APPLE_SART_MAX_ENTRIES 16
 
@@ -92,9 +91,6 @@ struct apple_sart {
 
 	unsigned long protected_entries;
 	unsigned long used_entries;
-	const struct apple_sart_backend *backend;
-	void *backend_data;
-
 	/* The registers as they stood before a firmware-driven suspend */
 	struct {
 		u8 flags;
@@ -105,29 +101,6 @@ struct apple_sart {
 	/* saved[] still holds the last sleep's entries, for apple_sart_replay() */
 	bool replay_valid;
 };
-
-struct apple_sart *apple_sart_create_backend(struct device *dev,
-		const struct apple_sart_backend *backend, void *data)
-{
-	struct apple_sart *sart;
-
-	if (!backend || !backend->add || !backend->remove)
-		return ERR_PTR(-EINVAL);
-	sart = devm_kzalloc(dev, sizeof(*sart), GFP_KERNEL);
-	if (!sart)
-		return ERR_PTR(-ENOMEM);
-	sart->dev = dev;
-	sart->backend = backend;
-	sart->backend_data = data;
-	return sart;
-}
-EXPORT_SYMBOL_GPL(apple_sart_create_backend);
-
-void *apple_sart_backend_data(struct apple_sart *sart)
-{
-	return sart->backend_data;
-}
-EXPORT_SYMBOL_GPL(apple_sart_backend_data);
 
 static void sart0_get_entry(struct apple_sart *sart, int index, u8 *flags,
 	phys_addr_t *paddr, size_t *size)
@@ -315,8 +288,6 @@ bool apple_sart_is_inherited_region(struct apple_sart *sart, phys_addr_t paddr,
 {
 	int i;
 
-	if (sart->backend)
-		return sart->backend->inherited && sart->backend->inherited(sart, paddr, size);
 	if (!size || paddr > PHYS_ADDR_MAX - (size - 1))
 		return false;
 	for (i = 0; i < APPLE_SART_MAX_ENTRIES; i++) {
@@ -359,8 +330,6 @@ int apple_sart_add_allowed_region(struct apple_sart *sart, phys_addr_t paddr,
 {
 	int i, ret;
 
-	if (sart->backend)
-		return sart->backend->add(sart, paddr, size);
 	for (i = 0; i < APPLE_SART_MAX_ENTRIES; ++i) {
 		if (test_bit(i, &sart->protected_entries))
 			continue;
@@ -395,8 +364,6 @@ int apple_sart_remove_allowed_region(struct apple_sart *sart, phys_addr_t paddr,
 {
 	int i;
 
-	if (sart->backend)
-		return sart->backend->remove(sart, paddr, size);
 	dev_dbg(sart->dev,
 		"will remove [paddr: %pa, size: 0x%zx] from allowed regions\n",
 		&paddr, size);
@@ -499,7 +466,7 @@ int apple_sart_replay(struct apple_sart *sart)
 {
 	int i, bad = 0;
 
-	if (sart->backend || sart->ops != &sart_ops_v3 || !sart->replay_valid)
+	if (sart->ops != &sart_ops_v3 || !sart->replay_valid)
 		return -EOPNOTSUPP;
 
 	for (i = 0; i < APPLE_SART_MAX_ENTRIES; i++) {
