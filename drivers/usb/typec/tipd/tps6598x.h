@@ -470,12 +470,16 @@ struct cd321x {
 	bool display_route_active;
 	/* The sleep's debug link cut reset this controller: its setup is expected. */
 	bool reset_by_cut;
+	/* The debug link is still to be rearmed after a cut, and the tries so far */
+	bool rearm_pending;
+	unsigned int rearm_tries;
 	bool dp_sink_reported;
 	bool dp_irq_hpd;
 
 	struct cd321x_status update_status;
 	struct delayed_work update_work;
 	struct delayed_work resume_work;
+	struct delayed_work rearm_work;
 	struct cd321x_pm_state pm;
 	struct usb_pd_identity cur_partner_identity;
 	bool cur_partner_is_pd;

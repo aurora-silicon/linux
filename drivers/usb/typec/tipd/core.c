@@ -9,6 +9,7 @@
 #include <kunit/static_stub.h>
 #include <kunit/visibility.h>
 #include <linux/i2c.h>
+#include <linux/iopoll.h>
 #include <linux/acpi.h>
 #include <linux/gpio/consumer.h>
 #include <linux/of.h>
@@ -1576,9 +1577,10 @@ static void cd321x_prepare(struct tps6598x *tps)
 		cd321x_pm_prepare(&cd321x->pm);
 		cd321x->state_valid = false;
 	}
-	/* Gate scheduling first; neither worker may be drained under its mutex. */
+	/* Gate scheduling first; no worker may be drained under its mutex. */
 	cancel_delayed_work_sync(&cd321x->resume_work);
 	cancel_delayed_work_sync(&cd321x->update_work);
+	cancel_delayed_work_sync(&cd321x->rearm_work);
 
 	/* As macOS does a second or so before the commit, measured on the same controller. */
 	if (pm_suspend_via_firmware() && device_property_read_bool(tps->dev, "apple,sleep-ssps")) {
@@ -1593,37 +1595,114 @@ static void cd321x_prepare(struct tps6598x *tps)
 	}
 }
 
+/* A try every 250 ms for 10 s */
+#define CD321X_REARM_TRIES	40
+#define CD321X_REARM_RETRY_MS	250
+
+static int cd321x_debug_cmd(struct tps6598x *tps, const char *cmd, size_t len, const u8 *in)
+{
+	u8 out = 0;
+	int ret;
+
+	ret = tps6598x_exec_cmd(tps, cmd, len, in, 1, &out);
+	return ret ?: (out & 0xf ? -EIO : 0);
+}
+
+/* The firmware rejects a command for the mode it is switching to until it has switched. */
+static int cd321x_wait_dbma(struct tps6598x *tps, bool on)
+{
+	u32 mode;
+	int ret, err;
+
+	err = read_poll_timeout(tps6598x_read32, ret,
+				ret || (!memcmp(&mode, modes[TPS_MODE_DBMA], 4) == on),
+				1000, 100000, false, tps, TPS_REG_MODE, &mode);
+	return ret ?: err;
+}
+
 /*
- * A sleep cut this port's debug link. Rearm it the way a boot loader does: unlock with
- * the board's key, debug mode on, enable the debug VDM, debug mode off, lock.
+ * The boot loader's sequence: unlock with the board's key, debug mode on, enable the debug
+ * VDM, debug mode off, lock. Debug mode is left and the lock set again after a failure too.
  */
-static void cd321x_rearm_debug_link(struct tps6598x *tps)
+static int cd321x_arm_debug_link(struct tps6598x *tps, const char *key, const char **step)
 {
 	static const u8 vdm[] = { 0x06, 0x46, 0x82, 0x01 };
 	static const u8 no_key[4];
-	const char *key;
-	u8 on = 1, off = 0, out = 0;
+	u8 on = 1, off = 0;
+	int ret, err;
+
+	*step = "unlock";
+	ret = cd321x_debug_cmd(tps, "LOCK", sizeof(no_key), (const u8 *)key);
+	if (ret)
+		return ret;
+
+	*step = "debug mode";
+	ret = cd321x_debug_cmd(tps, "DBMa", 1, &on);
+	if (!ret)
+		ret = cd321x_wait_dbma(tps, true);
+	if (!ret) {
+		*step = "debug VDM";
+		ret = cd321x_debug_cmd(tps, "DVEn", sizeof(vdm), vdm);
+	}
+
+	err = cd321x_debug_cmd(tps, "DBMa", 1, &off);
+	if (!err)
+		err = cd321x_wait_dbma(tps, false);
+	if (err && !ret) {
+		*step = "leaving debug mode";
+		ret = err;
+	}
+	err = cd321x_debug_cmd(tps, "LOCK", sizeof(no_key), no_key);
+	if (err && !ret) {
+		*step = "lock";
+		ret = err;
+	}
+	return ret;
+}
+
+/*
+ * A sleep cut this port's debug link. Right after the wake the controller can reject the
+ * sequence, so a failed try is repeated until the link is back.
+ */
+static void cd321x_rearm_debug_link(struct cd321x *cd321x)
+{
+	struct tps6598x *tps = &cd321x->tps;
+	const char *key, *step;
 	int ret;
 
+	lockdep_assert_held(&tps->lock);
 	if (device_property_read_string(tps->dev, "apple,debug-lock-key", &key) ||
-	    strlen(key) != sizeof(no_key) || !apple_sleep_debug_link_was_cut(tps->dev))
+	    strlen(key) != 4) {
+		cd321x->rearm_pending = false;
 		return;
+	}
 
-	ret = tps6598x_exec_cmd(tps, "LOCK", sizeof(no_key), (const u8 *)key, 1, &out);
-	if (!ret && !(out & 0xf))
-		ret = tps6598x_exec_cmd(tps, "DBMa", 1, &on, 1, &out);
-	if (!ret && !(out & 0xf))
-		ret = tps6598x_exec_cmd(tps, "DVEn", sizeof(vdm), vdm, 1, &out);
-	if (!ret && (out & 0xf))
-		ret = -EIO;
-	if (!ret)
-		ret = tps6598x_exec_cmd(tps, "DBMa", 1, &off, 0, NULL);
-	if (!ret)
-		ret = tps6598x_exec_cmd(tps, "LOCK", sizeof(no_key), no_key, 0, NULL);
-	if (ret)
-		dev_warn(tps->dev, "debug link not rearmed: %d\n", ret);
-	else
-		dev_dbg(tps->dev, "debug link rearmed\n");
+	ret = cd321x_arm_debug_link(tps, key, &step);
+	cd321x->rearm_tries++;
+	if (!ret) {
+		if (cd321x->rearm_tries > 1)
+			dev_info(tps->dev, "debug link rearmed, try %u\n", cd321x->rearm_tries);
+		cd321x->rearm_pending = false;
+		return;
+	}
+	if (cd321x->rearm_tries < CD321X_REARM_TRIES) {
+		mod_delayed_work(system_freezable_wq, &cd321x->rearm_work,
+				 msecs_to_jiffies(CD321X_REARM_RETRY_MS));
+		return;
+	}
+	dev_warn(tps->dev, "debug link not rearmed after %u tries: %s: %d\n",
+		 cd321x->rearm_tries, step, ret);
+	cd321x->rearm_pending = false;
+}
+
+static void cd321x_rearm_work(struct work_struct *work)
+{
+	struct cd321x *cd321x = container_of(to_delayed_work(work), struct cd321x, rearm_work);
+
+	guard(mutex)(&cd321x->tps.lock);
+	if (cd321x->rearm_pending && cd321x->pm.phase != CD321X_PM_PREPARED &&
+	    cd321x->pm.phase != CD321X_PM_REMOVED)
+		cd321x_rearm_debug_link(cd321x);
 }
 
 static void cd321x_complete(struct tps6598x *tps)
@@ -1641,7 +1720,13 @@ static void cd321x_complete(struct tps6598x *tps)
 	}
 	if (pm_suspend_via_firmware() && device_property_read_bool(tps->dev, "apple,sleep-ssps"))
 		tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
-	cd321x_rearm_debug_link(tps);
+	/* A link still down from an earlier sleep isn't cut again, so it stays pending. */
+	if (apple_sleep_debug_link_was_cut(tps->dev))
+		cd321x->rearm_pending = true;
+	if (cd321x->rearm_pending) {
+		cd321x->rearm_tries = 0;
+		cd321x_rearm_debug_link(cd321x);
+	}
 	if (cd321x_pm_resume(&cd321x->pm))
 		mod_delayed_work(system_freezable_wq, &cd321x->resume_work, 0);
 }
@@ -2259,6 +2344,7 @@ VISIBLE_IF_KUNIT void cd321x_stop_work(struct cd321x *cd321x)
 	}
 	cancel_delayed_work_sync(&cd321x->resume_work);
 	cancel_delayed_work_sync(&cd321x->update_work);
+	cancel_delayed_work_sync(&cd321x->rearm_work);
 }
 EXPORT_SYMBOL_IF_KUNIT(cd321x_stop_work);
 
@@ -2375,6 +2461,7 @@ VISIBLE_IF_KUNIT void cd321x_init_work(struct cd321x *cd321x)
 {
 	INIT_DELAYED_WORK(&cd321x->update_work, cd321x_update_work);
 	INIT_DELAYED_WORK(&cd321x->resume_work, cd321x_resume_work);
+	INIT_DELAYED_WORK(&cd321x->rearm_work, cd321x_rearm_work);
 	INIT_WORK(&cd321x->tbt_attach_work, cd321x_tbt_attach_work);
 	atomic_set(&cd321x->link_event, 0);
 	atomic_set(&cd321x->ready_event, 0);
