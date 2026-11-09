@@ -87,18 +87,12 @@
 
 #ifdef APPLE_USE_PMP
 /*
- * AVD and the JPEG codecs (one shared soc-device) also send the PMP a
- * performance request while they are powered: level 2 (VMAX) in request
- * class 0x21 of their SOC-DEV-DVFS entries, 0x112 and 0x114. The PMP then
- * holds the SoC rail and fabric up for them.
+ * AVD also sends the PMP a performance request while it is powered: level 2
+ * (VMAX) in request class 0x21 of its SOC-DEV-DVFS entry 0x112. The PMP then
+ * holds the SoC rail and fabric up for it.
  */
 &pmp_report_avd_sys {
 	apple,dvfs = <0x112 2>;
-	apple,dvfs-request-class = <0x21>;
-};
-
-&pmp_report_jpg {
-	apple,dvfs = <0x114 2>;
 	apple,dvfs-request-class = <0x21>;
 };
 #endif
