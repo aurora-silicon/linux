@@ -2132,7 +2132,7 @@ F:	drivers/phy/apple/atc-j700-dp.h
 F:	drivers/rtc/rtc-apple-pmu.c
 F:	drivers/soc/apple/aop.rs
 F:	drivers/soc/apple/mcc.c
-F:	drivers/soc/apple/t8140-sleep.c
+F:	drivers/soc/apple/sleep.c
 F:	drivers/tty/serial/apple_dockchannel*
 F:	include/linux/soc/apple/pci-apple-piodma.h
 F:	include/linux/soc/apple/sleep.h

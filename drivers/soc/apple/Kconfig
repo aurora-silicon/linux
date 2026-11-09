@@ -79,8 +79,9 @@ config APPLE_CLUSTER_PWRGATE
 	  started and PMGR never powered on, such as the boot CPU, only
 	  clock-gates in WFI.
 
-config APPLE_T8140_SLEEP
+config APPLE_SOC_SLEEP
 	bool "Apple T8140 system sleep at EL2"
+	default APPLE_T8140_SLEEP
 	depends on ARM64 && (ARCH_APPLE || COMPILE_TEST)
 	depends on HOTPLUG_CPU && SUSPEND
 	select APPLE_TUNABLE
@@ -351,3 +352,9 @@ config APPLE_DISPLAY_GATE_KUNIT_TEST
 endmenu
 
 endif
+
+config APPLE_T8140_SLEEP
+	bool
+	transitional
+	help
+	  Transitional config for APPLE_T8140_SLEEP to APPLE_SOC_SLEEP migration.

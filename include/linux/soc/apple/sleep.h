@@ -14,7 +14,7 @@
 struct device;
 struct device_node;
 
-#if IS_ENABLED(CONFIG_APPLE_T8140_SLEEP)
+#if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP)
 /*
  * A coprocessor that can't be stopped until a sleep is certain, and can't be
  * restarted without one. While one is registered and not ready, a suspend is
