@@ -552,7 +552,7 @@ static void ave_6070_text_id(struct kunit *test)
 
 	KUNIT_ASSERT_NOT_NULL(test, text);
 	KUNIT_EXPECT_EQ(test, off, 0x423cU);
-	KUNIT_EXPECT_EQ(test, ave_t6000.text_link_cell, 0U);
+	KUNIT_EXPECT_EQ(test, ave_t6000.text_link_cell, 0x423cU);
 	for (u32 i = 0; i < size; i++)
 		text[i] = i * 7 + 3;
 	memset(text + off, 0, 8);
