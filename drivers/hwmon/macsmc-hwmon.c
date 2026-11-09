@@ -990,6 +990,9 @@ static int macsmc_hwmon_discover_temperatures(struct macsmc_hwmon *hwmon)
 	if (!smc->key_count || smc->key_count > U16_MAX)
 		return -EINVAL;
 
+	ret = of_property_count_strings(hwmon->dev->of_node, "apple,soc-die-keys");
+	hwmon->die_listed = ret > 0 ? ret : 0;
+
 	hwmon->temp.sensors = devm_kcalloc(hwmon->dev, smc->key_count,
 					   sizeof(*sensor), GFP_KERNEL);
 	if (!hwmon->temp.sensors)
@@ -1023,6 +1026,12 @@ static int macsmc_hwmon_discover_temperatures(struct macsmc_hwmon *hwmon)
 		/* Key identity only: do not invent locations or calibration. */
 		snprintf(sensor->label, sizeof(sensor->label), "%c%c%c%c",
 			 key >> 24, (key >> 16) & 0xff, (key >> 8) & 0xff, key & 0xff);
+		/* A listed SoC die key keeps its discovered channel and joins the die zone. */
+		if (of_property_match_string(hwmon->dev->of_node, "apple,soc-die-keys",
+					     sensor->label) >= 0) {
+			sensor->die = true;
+			hwmon->die_count++;
+		}
 	}
 
 	return 0;
@@ -1206,7 +1215,11 @@ static int macsmc_hwmon_populate_sensors(struct macsmc_hwmon *hwmon,
 	for_each_child_of_node_with_prefix(hwmon_node, key_node, "temperature-") {
 		n_temperature++;
 	}
-	n_temperature += n_die_keys;
+	/* With discovery, listed die keys mark discovered channels instead (see there). */
+	if (!of_property_read_bool(hwmon_node, "apple,discover-temperatures"))
+		n_temperature += n_die_keys;
+	else
+		n_die_keys = 0;
 
 	if (n_temperature) {
 		hwmon->temp.sensors = devm_kcalloc(hwmon->dev, n_temperature,
