@@ -39,6 +39,7 @@ extern "C" {
     fn asahi_g16_cooling_sample(
         cooling: *mut c_void,
         now: u64,
+        idle: bool,
         temperature: *mut core::ffi::c_long,
         governor: *mut u32,
         power: *mut u32,
@@ -72,7 +73,7 @@ impl Cooling {
         })
     }
 
-    fn sample(&mut self, now: u64, power: &mut Sample) -> Result {
+    fn sample(&mut self, now: u64, idle: bool, power: &mut Sample) -> Result {
         let mut mc: core::ffi::c_long = 0;
         // SAFETY: The C allocation and PMP phandle outlive this call, all output
         // pointers are valid, and the caller holds the GPU device mutex.
@@ -80,6 +81,7 @@ impl Cooling {
             asahi_g16_cooling_sample(
                 self.inner.as_ptr(),
                 now,
+                idle,
                 &mut mc,
                 &mut power.governor,
                 &mut power.budget,
@@ -207,10 +209,10 @@ impl Power {
         }
     }
 
-    fn ceiling(&mut self, now: u64) -> (u32, bool) {
+    fn ceiling(&mut self, now: u64, idle: bool) -> (u32, bool) {
         if policy::read_due(self.last_sample_ns, now) {
             self.last_sample_ns = Some(now);
-            self.sensor_error = self.cooling.sample(now, &mut self.sample).err();
+            self.sensor_error = self.cooling.sample(now, idle, &mut self.sample).err();
             if self.sensor_error.is_some() {
                 self.sensor_errors += 1;
             }
@@ -248,7 +250,8 @@ impl Firmware {
             return Err(error);
         }
         let now = now_ns();
-        let (limit, decision) = self.power.ceiling(now);
+        let idle = self.engine.flights.is_empty();
+        let (limit, decision) = self.power.ceiling(now, idle);
         let target = self
             .power
             .utilization
