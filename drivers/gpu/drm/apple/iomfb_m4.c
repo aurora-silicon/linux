@@ -38,6 +38,7 @@
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/suspend.h>
 #include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/pmp-display.h>
@@ -101,7 +102,7 @@ static const struct kernel_param_ops power_gate_ms_ops = {
 
 module_param_cb(power_gate_ms, &power_gate_ms_ops, &power_gate_ms, 0644);
 MODULE_PARM_DESC(power_gate_ms,
-		 "J713: power the display coprocessor and its domains down after this many ms blanked, and before system sleep (0: never, at most 600000)");
+		 "J713: power the display coprocessor and its domains down after this many ms blanked, and before system sleep (0: only before a deep sleep, at most 600000)");
 
 /*
  * DCP CPU control and status, in the coprocessor's ASC block. The idle bit
@@ -5283,13 +5284,16 @@ int iomfb_m4_suspend(struct apple_dcp *owner)
 	} else if (dcp->display_off) {
 		/*
 		 * Already powered down by the blank; the next frame powers it up.
-		 * Power the DCP and its domains down too, if it may. That is an
-		 * extra saving, not a condition of sleep: a power-down that cannot
-		 * start leaves the display logically off, and one that fails has
-		 * failed the session already; neither refuses the sleep.
+		 * Power the DCP and its domains down too, if it may: a deep sleep
+		 * needs that whatever power_gate_ms says, or its display DARTs
+		 * refuse it, and elsewhere it is an extra saving. It is not a
+		 * condition of this step: a power-down that cannot start leaves the
+		 * display logically off, and one that fails has failed the session
+		 * already; neither refuses the sleep here.
 		 */
 		ret = 0;
-		if (dcp->gate_capable && READ_ONCE(power_gate_ms) && !dcp->gated)
+		if (dcp->gate_capable && !dcp->gated &&
+		    (READ_ONCE(power_gate_ms) || pm_suspend_via_firmware()))
 			iomfb_m4_power_gate(dcp);
 	} else {
 		ret = dcp_m4_set_power_state(dcp, false);
