@@ -197,6 +197,12 @@ static int centauri_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	dma_addr_t dma;
 	void *page;
 	int ret;
+	struct pci_host_bridge *bridge = pci_find_host_bridge(pdev->bus);
+
+	/* The T6050 transport owns every function behind an adopted host. */
+	if (bridge && bridge->dev.parent &&
+	    of_device_is_compatible(bridge->dev.parent->of_node, "apple,t6050-pcie"))
+		return -ENODEV;
 
 	c = devm_kzalloc(&pdev->dev, sizeof(*c), GFP_KERNEL);
 	if (!c)

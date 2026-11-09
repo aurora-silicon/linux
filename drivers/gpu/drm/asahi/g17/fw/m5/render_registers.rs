@@ -25,15 +25,19 @@ impl ContextStore {
         Self { auxiliary, stream, extent: stream + 0x680 * clusters + 0x800 }
     }
 
-    /// `board`'s store: laid out for the G17D's own cluster count with its forms; other boards
-    /// keep the two-cluster store.
+    /// The four-cluster Max and G17D use their physical cluster count for the
+    /// control words and state stream. Other boards keep the two-cluster store.
     pub(crate) const fn selected(board: &super::initdata::Board) -> Self {
-        Self::of(if board.g17d_forms() { board.clusters as usize } else { 2 })
+        Self::of(if board.g17d_forms() || board.clusters == 4 {
+            board.clusters as usize
+        } else { 2 })
     }
 }
 const _: () = {
     let two = ContextStore::of(2);
     assert!(two.auxiliary == 0xc0 && two.stream == 0x980 && two.extent == 0x1e80);
+    let max = ContextStore::selected(&super::initdata::J716C);
+    assert!(max.auxiliary == 0x140 && max.stream == 0xfc0 && max.extent == 0x31c0);
     let eight = ContextStore::of(8);
     assert!(eight.auxiliary == 0x240 && eight.stream == 0x1c40 && eight.extent == 0x5840);
 };

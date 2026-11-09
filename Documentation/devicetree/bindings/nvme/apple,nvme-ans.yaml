@@ -117,7 +117,6 @@ allOf:
           not:
             contains:
               enum:
-                - apple,t6050-nvme-ans2
                 - apple,t8132-nvme-ans2
                 - apple,t8140-nvme-ans2
     then:
