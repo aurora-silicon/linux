@@ -770,10 +770,87 @@ unsafe impl kernel::transmute::FromBytes for BagBlob {}
 // SAFETY: as above.
 unsafe impl kernel::transmute::AsBytes for BagBlob {}
 
+/// The largest sealing-key record `SEP_BIO_FDE_*` carry.
+pub(crate) const FDE_RECORD_MAX: usize = 2048;
+/// The largest volume secret the enclave seals (a LUKS2 key-slot secret).
+pub(crate) const FDE_SECRET_MAX: usize = 64;
+/// `ephemeral point (65) || ciphertext || tag (16)` for the largest secret.
+pub(crate) const FDE_SEALED_MAX: usize = 256;
+
+/// The UAPI `struct sep_fde_key`: a sealing key made under `uid`'s bag.
+#[repr(C)]
+pub(crate) struct FdeKey {
+    pub(crate) uid: u32,
+    pub(crate) record_len: u32,
+    pub(crate) record: [u8; FDE_RECORD_MAX],
+}
+
+/// The UAPI `struct sep_fde_seal`, for both SEAL and UNSEAL.
+#[repr(C)]
+pub(crate) struct FdeSeal {
+    pub(crate) uid: u32,
+    pub(crate) record_len: u32,
+    pub(crate) secret_len: u32,
+    pub(crate) sealed_len: u32,
+    pub(crate) secret: [u8; FDE_SECRET_MAX],
+    pub(crate) sealed: [u8; FDE_SEALED_MAX],
+    pub(crate) record: [u8; FDE_RECORD_MAX],
+}
+
+impl Drop for FdeSeal {
+    fn drop(&mut self) {
+        crate::image::wipe(&mut self.secret);
+    }
+}
+
+static_assert!(core::mem::size_of::<FdeKey>() == 8 + FDE_RECORD_MAX);
+static_assert!(
+    core::mem::size_of::<FdeSeal>() == 16 + FDE_SECRET_MAX + FDE_SEALED_MAX + FDE_RECORD_MAX
+);
+// SAFETY: C layout, no padding, every bit pattern valid.
+unsafe impl kernel::transmute::FromBytes for FdeKey {}
+// SAFETY: as above.
+unsafe impl kernel::transmute::AsBytes for FdeKey {}
+// SAFETY: as above.
+unsafe impl kernel::transmute::FromBytes for FdeSeal {}
+// SAFETY: as above.
+unsafe impl kernel::transmute::AsBytes for FdeSeal {}
+
+pub(crate) const IOC_FDE_CREATE: u32 = kernel::ioctl::_IOWR::<FdeKey>(IOC_MAGIC, 0x37);
+pub(crate) const IOC_FDE_SEAL: u32 = kernel::ioctl::_IOWR::<FdeSeal>(IOC_MAGIC, 0x38);
+pub(crate) const IOC_FDE_UNSEAL: u32 = kernel::ioctl::_IOWR::<FdeSeal>(IOC_MAGIC, 0x39);
+
+/// Checks a SEAL/UNSEAL request: the user, the record, and on SEAL the
+/// secret, on UNSEAL the sealed blob.
+pub(crate) fn parse_fde(req: &FdeSeal, seal: bool) -> Result<crate::sks::DesignateUser> {
+    let record_len = req.record_len as usize;
+    let secret_len = req.secret_len as usize;
+    let sealed_len = req.sealed_len as usize;
+    if req.uid < MIN_UID || req.uid > i32::MAX as u32 || record_len == 0 || record_len > FDE_RECORD_MAX {
+        return Err(EINVAL);
+    }
+    if seal && (secret_len == 0 || secret_len > FDE_SECRET_MAX || sealed_len != 0) {
+        return Err(EINVAL);
+    }
+    if !seal && (sealed_len == 0 || sealed_len > FDE_SEALED_MAX || secret_len != 0) {
+        return Err(EINVAL);
+    }
+    crate::sks::DesignateUser::new(req.uid as i32).ok_or(EINVAL)
+}
+
 pub(crate) fn is_ioctl(cmd: u32) -> bool {
     matches!(
         cmd,
-        IOC_STATE | IOC_UNLOCK | IOC_LOCK | IOC_CHANGE | IOC_CREATE | IOC_EXPORT | IOC_IMPORT
+        IOC_STATE
+            | IOC_UNLOCK
+            | IOC_LOCK
+            | IOC_CHANGE
+            | IOC_CREATE
+            | IOC_EXPORT
+            | IOC_IMPORT
+            | IOC_FDE_CREATE
+            | IOC_FDE_SEAL
+            | IOC_FDE_UNSEAL
     )
 }
 
@@ -1137,6 +1214,59 @@ impl crate::SepData {
                     return Err(EROFS);
                 }
                 self.userbag_import(user, &blob.data[..len])?;
+                crate::bio::ok()
+            }
+            IOC_FDE_CREATE => {
+                let mut key: FdeKey =
+                    UserSlice::new(user_ptr, core::mem::size_of::<FdeKey>()).reader().read()?;
+                if key.uid < MIN_UID || key.uid > i32::MAX as u32 {
+                    return Err(EINVAL);
+                }
+                let user = crate::sks::DesignateUser::new(key.uid as i32).ok_or(EINVAL)?;
+                let record = self.fde_key_create(user)?;
+                if record.len() > FDE_RECORD_MAX {
+                    return Err(E2BIG);
+                }
+                key.record.fill(0);
+                key.record[..record.len()].copy_from_slice(&record);
+                key.record_len = record.len() as u32;
+                UserSlice::new(user_ptr, core::mem::size_of::<FdeKey>()).writer().write(&key)?;
+                crate::bio::ok()
+            }
+            IOC_FDE_SEAL | IOC_FDE_UNSEAL => {
+                let seal = cmd == IOC_FDE_SEAL;
+                let mut req: FdeSeal =
+                    UserSlice::new(user_ptr, core::mem::size_of::<FdeSeal>()).reader().read()?;
+                let user = parse_fde(&req, seal)?;
+                let record_len = req.record_len as usize;
+                if seal {
+                    let sealed = self.fde_seal(
+                        user,
+                        &req.record[..record_len],
+                        &req.secret[..req.secret_len as usize],
+                    )?;
+                    if sealed.len() > FDE_SEALED_MAX {
+                        return Err(E2BIG);
+                    }
+                    req.sealed.fill(0);
+                    req.sealed[..sealed.len()].copy_from_slice(&sealed);
+                    req.sealed_len = sealed.len() as u32;
+                    crate::image::wipe(&mut req.secret);
+                    req.secret_len = 0;
+                } else {
+                    let secret = crate::Secret(self.fde_unseal(
+                        user,
+                        &req.record[..record_len],
+                        &req.sealed[..req.sealed_len as usize],
+                    )?);
+                    if secret.len() > FDE_SECRET_MAX {
+                        return Err(E2BIG);
+                    }
+                    req.secret.fill(0);
+                    req.secret[..secret.len()].copy_from_slice(&secret);
+                    req.secret_len = secret.len() as u32;
+                }
+                UserSlice::new(user_ptr, core::mem::size_of::<FdeSeal>()).writer().write(&req)?;
                 crate::bio::ok()
             }
             IOC_CREATE | IOC_UNLOCK => {
@@ -1627,5 +1757,46 @@ mod tests {
         assert_eq!(r.biometry, 0);
         assert_eq!(r.since_password_s, 5);
         assert_eq!(r.enclave_lock_state, 0);
+    }
+
+    fn fde_request(uid: u32, record_len: u32, secret_len: u32, sealed_len: u32) -> FdeSeal {
+        FdeSeal {
+            uid,
+            record_len,
+            secret_len,
+            sealed_len,
+            secret: [0; FDE_SECRET_MAX],
+            sealed: [0; FDE_SEALED_MAX],
+            record: [0; FDE_RECORD_MAX],
+        }
+    }
+
+    #[test]
+    fn fde_parse_bounds() {
+        let ok = MIN_UID + 1;
+        assert!(parse_fde(&fde_request(ok, 600, 32, 0), true).is_ok());
+        assert!(parse_fde(&fde_request(ok, 600, 0, 113), false).is_ok());
+        // SEAL needs a secret and no sealed blob, UNSEAL the reverse.
+        assert!(parse_fde(&fde_request(ok, 600, 0, 0), true).is_err());
+        assert!(parse_fde(&fde_request(ok, 600, 32, 113), true).is_err());
+        assert!(parse_fde(&fde_request(ok, 600, 32, 113), false).is_err());
+        assert!(parse_fde(&fde_request(ok, 600, 0, 0), false).is_err());
+        // Lengths past the arrays and system uids are refused.
+        assert!(parse_fde(&fde_request(ok, 600, FDE_SECRET_MAX as u32 + 1, 0), true).is_err());
+        assert!(parse_fde(&fde_request(ok, 600, 0, FDE_SEALED_MAX as u32 + 1), false).is_err());
+        assert!(parse_fde(&fde_request(ok, 0, 32, 0), true).is_err());
+        assert!(parse_fde(&fde_request(ok, FDE_RECORD_MAX as u32 + 1, 32, 0), true).is_err());
+        assert!(parse_fde(&fde_request(MIN_UID - 1, 600, 32, 0), true).is_err());
+        assert!(parse_fde(&fde_request(u32::MAX, 600, 32, 0), true).is_err());
+    }
+
+    #[test]
+    fn fde_ioctls_are_userbag_ioctls() {
+        assert!(is_ioctl(IOC_FDE_CREATE));
+        assert!(is_ioctl(IOC_FDE_SEAL));
+        assert!(is_ioctl(IOC_FDE_UNSEAL));
+        assert_ne!(IOC_FDE_SEAL, IOC_FDE_UNSEAL);
+        // The largest sealed secret fits: point || ciphertext || tag.
+        assert!(65 + FDE_SECRET_MAX + 16 <= FDE_SEALED_MAX);
     }
 }

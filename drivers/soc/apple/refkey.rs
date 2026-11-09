@@ -511,6 +511,58 @@ impl SepData {
         self.with_identity_bag(|handle, _secret| self.sks_refkey_sign(handle, blob, digest, acm))
     }
 
+    /// Volume-key sealing: a ref-key without an access-control list under
+    /// the designated user bag `user` (outer handle `-uid`), protection
+    /// class 9, so the enclave uses it only while that bag is unlocked. The
+    /// caller has unlocked the bag with the user's password. Variant-5 key
+    /// store only.
+    pub(crate) fn fde_key_create(&self, user: crate::sks::DesignateUser) -> Result<KVec<u8>> {
+        if self.profile.key_store != profile::KeyStore::Variant5 {
+            return Err(EOPNOTSUPP);
+        }
+        crate::xart_guard::close_policy_window();
+        let blob = self
+            .sks_create_refkey_at(user.special_handle().value(), 9, 5, None)
+            .ok_or(EACCES)?;
+        Self::refkey_pub(&blob).ok_or(EIO)?;
+        Ok(blob)
+    }
+
+    /// ECIES-encrypts `secret` to the sealing key in `record` and has the
+    /// enclave open the result once before returning it, so a sealed blob
+    /// this bag cannot open is never handed out.
+    pub(crate) fn fde_seal(
+        &self,
+        user: crate::sks::DesignateUser,
+        record: &[u8],
+        secret: &[u8],
+    ) -> Result<KVec<u8>> {
+        let sealed = refkey_seal::ecies_seal(Self::refkey_pub(record).ok_or(EINVAL)?, secret)?;
+        let recovered = crate::Secret(self.fde_unseal(user, record, &sealed)?);
+        if &*recovered != secret {
+            dev_err!(self.dev, "fde: refusing a sealed volume secret whose round trip failed\n");
+            return Err(EIO);
+        }
+        Ok(sealed)
+    }
+
+    /// Has the enclave open `sealed` with the sealing key in `record`. It
+    /// does so only on the Mac whose enclave made the key and only while
+    /// `user`'s bag is unlocked; any refusal is `EKEYREJECTED`.
+    pub(crate) fn fde_unseal(
+        &self,
+        user: crate::sks::DesignateUser,
+        record: &[u8],
+        sealed: &[u8],
+    ) -> Result<KVec<u8>> {
+        if self.profile.key_store != profile::KeyStore::Variant5 {
+            return Err(EOPNOTSUPP);
+        }
+        Self::refkey_pub(record).ok_or(EINVAL)?;
+        let handle = crate::sks::KeyBagHandle::from_load_reply(user.special_handle().value());
+        self.sks_refkey_unseal(handle, record, sealed).ok_or(EKEYREJECTED)
+    }
+
     /// Enclave ECIES-decrypt (o = "oecd"); takes the ephemeral from the front of `d`.
     fn sks_refkey_unseal(
         &self,
