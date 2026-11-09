@@ -573,6 +573,19 @@ static int apple_pmp_report_wait_t6030_14(struct device *supplier, unsigned int 
  */
 static int apple_pmp_report_dvfs_prepare(struct apple_pmp_report *rep);
 
+static int apple_pmp_report_wait_t8112_ready(struct apple_pmp_report *rep,
+					     unsigned int timeout_ms)
+{
+	bool running;
+	int ret;
+
+	ret = read_poll_timeout(apple_pmp_report_running, running, running,
+				1000, timeout_ms * 1000, false, rep);
+	if (ret)
+		return ret;
+	return apple_pmp_report_dvfs_prepare(rep);
+}
+
 int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int timeout_ms)
 {
 	struct device_node *np = of_parse_phandle(supplier->of_node, "apple,pmp-report", 0);
@@ -582,7 +595,6 @@ int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int t
 	bool t8132 = apple_t8132_firmware_path() &&
 		of_device_is_compatible(supplier->of_node, "apple,t8132-pmp-v2");
 	bool t8112 = of_device_is_compatible(supplier->of_node, "apple,t8112-pmp-v2");
-	bool running;
 	int ret;
 
 	/* A declared report always takes the existing native25 path below. */
@@ -612,10 +624,7 @@ int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int t
 		 * SOC-DEV-DVFS range is ready (entry 8). Both are sticky once
 		 * reached, so later callers return at once.
 		 */
-		ret = read_poll_timeout(apple_pmp_report_running, running, running,
-					1000, timeout_ms * 1000, false, rep);
-		if (!ret)
-			ret = apple_pmp_report_dvfs_prepare(rep);
+		ret = apple_pmp_report_wait_t8112_ready(rep, timeout_ms);
 	} else {
 		ret = readq_poll_timeout(rep->base + rep->offsets->status, status,
 					t8132 ? (status & PMP_REPORT_READY) : status == PMP_REPORT_READY,

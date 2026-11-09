@@ -506,6 +506,23 @@ static void pmp_t8112_stopped_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, t->rep.dvfs_known, 0ULL);
 }
 
+static void pmp_t8112_supplier_ready_test(struct kunit *test)
+{
+	struct pmp_dvfs_test *t = test->priv;
+
+	/* Entry 8 alone is insufficient: the PMP report must also be running. */
+	writeq(2, t->rep.base + 0x80);
+	KUNIT_EXPECT_EQ(test, apple_pmp_report_wait_t8112_ready(&t->rep, 1),
+			-ETIMEDOUT);
+	KUNIT_EXPECT_FALSE(test, t->rep.dvfs_ready);
+
+	writeq(1, t->rep.base + 0x10);
+	KUNIT_ASSERT_EQ(test, apple_pmp_report_wait_t8112_ready(&t->rep, 1), 0);
+	KUNIT_EXPECT_TRUE(test, t->rep.dvfs_ready);
+	KUNIT_EXPECT_EQ(test, t->rep.dvfs_ready_achieved_word, 2ULL);
+	KUNIT_EXPECT_FALSE(test, t->rep.dvfs_ready_prime_sent);
+}
+
 static void pmp_t8112_ack_timeout_test(struct kunit *test)
 {
 	struct pmp_dvfs_test *t = test->priv;
@@ -571,6 +588,7 @@ static void pmp_t8112_state_prime_timeout_test(struct kunit *test)
 static struct kunit_case pmp_dvfs_cases[] = {
 	KUNIT_CASE(pmp_t8112_encoding_test),
 	KUNIT_CASE(pmp_t8112_stopped_test),
+	KUNIT_CASE(pmp_t8112_supplier_ready_test),
 	KUNIT_CASE(pmp_t8112_ack_timeout_test),
 	KUNIT_CASE(pmp_t8112_active_release_test),
 	KUNIT_CASE(pmp_t8112_state_prime_timeout_test),
