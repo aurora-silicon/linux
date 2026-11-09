@@ -610,6 +610,25 @@ void apple_sleep_coproc_crashed(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_coproc_crashed);
 
+/*
+ * After the camera ran, the next SLP_DDR wake stalled in the sleep engine, 6 of 6 times, whether
+ * the ISP's firmware was stopped at the sleep or about 50 s before it; a deep sleep rebuilds
+ * what it leaves, as after boot. So from the ISP's start, the next sleep takes the deep path.
+ */
+void apple_sleep_next_deep(struct device *dev)
+{
+	if (!t8140_sleep)
+		return;
+	scoped_guard(spinlock_irqsave, &t8140_slp_ddr_lock) {
+		if (!t8140_slp_ddr_ready)
+			return;
+		t8140_slp_ddr_ready = false;
+		t8140_slp_ddr_write();
+	}
+	dev_info(t8140_sleep->dev, "%s ran: the next sleep takes the deep path\n", dev_name(dev));
+}
+EXPORT_SYMBOL_GPL(apple_sleep_next_deep);
+
 static bool t8140_debug_link_cut;
 
 /* Only the debug port's controller took the cold reset. */

@@ -13,6 +13,7 @@
 #include <linux/ktime.h>
 #include <linux/overflow.h>
 #include <linux/pm_runtime.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
 
@@ -1271,6 +1272,9 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
 				    "firmware was stopped and cannot be restarted before the next boot\n");
 		return -EIO;
 	}
+
+	/* A SLP_DDR wake after the ISP ran stalls, even after a failed start; a deep one doesn't. */
+	apple_sleep_next_deep(isp->dev);
 
 	/* The firmware starts with new rings. */
 	isp->ipc_stale = NULL;
