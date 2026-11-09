@@ -368,7 +368,7 @@ properties:
           - enum:
               - apple,j704 # MacBook Pro (14-inch, M5, 2025)
               - apple,j813 # MacBook Air (13-inch, M5, 2026)
-              - apple,j815 # MacBook Air (J815)
+              - apple,j815 # MacBook Air (15-inch, M5)
           - const: apple,t8142
           - const: apple,arm-platform
 

@@ -75,6 +75,7 @@ properties:
           - const: apple,t8112-pciec
           - const: apple,t8103-pciec
       - const: apple,t6000-pciec
+      - const: apple,t6050-pciec
       - items:
           - const: apple,t8132-pciec
           - const: apple,t8122-pciec
@@ -324,6 +325,7 @@ allOf:
               - apple,t8103-pciec
               - apple,t6000-pciec
               - apple,t6040-pciec
+              - apple,t6050-pciec
     then:
       properties:
         reg:

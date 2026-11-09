@@ -201,6 +201,21 @@ MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 #define   RC_T6050_DBI_RO_WR_EN		BIT(0)
 
 /*
+ * T6050 PCIe-C: the 256-entry RID2SID table runs over the T8103 tunnel block,
+ * which moves up by 0x700 (posted request counters, TUNCTRL and TUNSTAT).
+ */
+#define PORT_T6050_TUNCTRL	0x1088
+
+/* T6050 PCIe-C root port config space: the MPS-dependent link timers */
+#define PCIEC_RP_DEVCAP		0x074
+#define PCIEC_RP_DEVCTL		0x078
+#define PCIEC_RP_ACK_LATENCY	0x700
+#define PCIEC_RP_FC_TIMER	0x73c
+#define   PCIEC_RP_FC_TIMER_KEEP	0x6000ffff
+#define   PCIEC_RP_FC_TIMER_LIMIT	GENMASK(28, 16)
+#define   PCIEC_RP_FC_TIMER_EN		BIT(31)
+
+/*
  * The doorbell address must be in the bottom 4GB because the base register
  * is only 32 bits wide. Exclude it from the IOVA range and share the same
  * configured address with the DART driver.
@@ -239,6 +254,8 @@ struct hw_info {
 	 * lane PIPE reset status, then release PORT_T8152_PIPE_RST.
 	 */
 	bool pipe_rst;
+	bool no_port_reset;
+	bool mps_timers;
 };
 
 static const struct hw_info t8103_hw = {
@@ -382,6 +399,32 @@ static const struct hw_info t6040_pciec_hw = {
 	.t8132_reset		= true,
 	.msimap_by_vector	= true,
 	.s2idle_hold_domain	= true,
+};
+
+/*
+ * T6050 PCIe-C keeps the t8103 doorbell, PERST and RID2SID registers, with
+ * the doorbell's high word at 0x16c and 256 RID2SID entries. MSIs go through
+ * the t602x map, indexed by the vector the endpoint sends: the bridge's slice
+ * of the shared window, not a local index. The port has no reset sequence of
+ * its own, and the root port's ACK latency and flow control timers follow
+ * the max payload size.
+ *
+ * Nothing hands the port over: apple,pciec-kernel-init brings it up with the
+ * T600x Intr2AXI sequence.
+ */
+static const struct hw_info t6050_pciec_hw = {
+	.port_msiaddr		= PORT_MSIADDR,
+	.port_msiaddr_hi	= PORT_MSIADDR + 4,
+	.port_perst		= PORT_PERST,
+	.port_rid2sid		= PORT_RID2SID,
+	.port_msimap		= PORT_T602X_MSIMAP,
+	.port_tunctrl		= PORT_T6050_TUNCTRL,
+	.max_rid2sid		= 256,
+	.tunneled		= true,
+	.tunnel_intr2axi	= true,
+	.no_port_reset		= true,
+	.msimap_by_vector	= true,
+	.mps_timers		= true,
 };
 
 static const struct of_device_id apple_pcie_of_match[];
@@ -1082,6 +1125,10 @@ static void apple_pcie_tunnel_reset_hardware(struct apple_pcie_port *port)
 {
 	int i;
 
+	/* T6050 has no such sequence: only its RID2SID table is cleared. */
+	if (port->pcie->hw->no_port_reset)
+		goto clear_rid2sid;
+
 	for (i = 0; i < ARRAY_SIZE(apple_pcie_tunnel_reset_regs); i++) {
 		u32 value = apple_pcie_tunnel_reset_regs[i].value;
 
@@ -1109,6 +1156,7 @@ static void apple_pcie_tunnel_reset_hardware(struct apple_pcie_port *port)
 		apple_pcie_port_writel(port, value, apple_pcie_tunnel_reset_regs[i].offset);
 	}
 
+clear_rid2sid:
 	for (i = 0; i < port->pcie->hw->max_rid2sid; i++)
 		apple_pcie_rid2sid_write(port, i, 0);
 	if (port->pcie->hw->t8132_reset)
@@ -1181,8 +1229,8 @@ static int apple_pcie_tunnel_reinitialize(struct apple_pcie_port *port)
 
 /*
  * Bring up a port selected by apple,pciec-kernel-init that no firmware
- * handoff left running: tunables and the reset table, then PERST and APPCLK,
- * and only then the root-port config-space
+ * handoff left running: tunables and the reset table (T6050 has none),
+ * then PERST and APPCLK, and only then the root-port config-space
  * tunables. Stop before releasing the tunnel reset or starting link
  * training.
  */
@@ -1307,10 +1355,48 @@ static void apple_pcie_tunnel_restore_irq_hw(struct apple_pcie_port *port)
  */
 #define APPLE_PCIE_TUNNEL_READY_MS	1000
 
+/*
+ * The T6050 PCIe-C root port's ACK latency limit (0x700, low half) and flow
+ * control update timer (0x73c, bits 28:16) are sized for the max payload
+ * size. Each word holds both, for MPS 128, 256 and 512.
+ */
+static const u32 apple_pcie_mps_timers[] = {
+	0x003c003c, 0x005a005a, 0x006b006b,
+};
+
+static void apple_pcie_update_mps_timers(struct apple_pcie *pcie, u32 mps)
+{
+	void __iomem *rp = pcie->cfg->win;
+	u32 cap, word, val;
+
+	cap = apple_pcie_tunnel_readl(rp, PCIEC_RP_DEVCAP) & PCI_EXP_DEVCAP_PAYLOAD;
+	if (mps > cap || mps >= ARRAY_SIZE(apple_pcie_mps_timers)) {
+		dev_warn(pcie->dev, "no link timers for a %u-byte MPS\n", 128 << mps);
+		return;
+	}
+
+	word = apple_pcie_mps_timers[mps];
+	writew_relaxed(lower_16_bits(word), rp + PCIEC_RP_ACK_LATENCY);
+	/* Complete the write, as apple_pcie_tunnel_writel() does. */
+	mb();
+	isb();
+	val = apple_pcie_tunnel_readl(rp, PCIEC_RP_FC_TIMER);
+	val &= PCIEC_RP_FC_TIMER_KEEP;
+	val |= FIELD_PREP(PCIEC_RP_FC_TIMER_LIMIT, upper_16_bits(word)) |
+	       PCIEC_RP_FC_TIMER_EN;
+	apple_pcie_tunnel_writel(rp, val, PCIEC_RP_FC_TIMER);
+}
+
+/* Process context: the link of a tunnel came up. */
 static void apple_pcie_tunnel_link_up(struct apple_pcie *pcie)
 {
 	WRITE_ONCE(pcie->tunnel_ready_at,
 		   jiffies + msecs_to_jiffies(APPLE_PCIE_TUNNEL_READY_MS));
+	if (pcie->hw->mps_timers)
+		apple_pcie_update_mps_timers(pcie,
+			FIELD_GET(PCI_EXP_DEVCTL_PAYLOAD,
+				  apple_pcie_tunnel_readl(pcie->cfg->win,
+							  PCIEC_RP_DEVCTL)));
 }
 
 /* Call before scanning the bus behind a tunnel; elapsed time counts. */
@@ -2785,6 +2871,23 @@ static int apple_msi_init(struct apple_pcie *pcie)
 	}
 
 	/*
+	 * T6050's PCIe hosts share one MSI window, vector n at AIC 1824 + n.
+	 * The internal host's bridges own vectors 0..127 and each PCIe-C
+	 * bridge a 32-vector slice of the rest.
+	 */
+	if (pcie->hw == &t6050_pciec_hw) {
+		ret = of_property_read_u32(to_of_node(fwnode), "apple,msi-vector-base",
+					   &pcie->msi_vector_base);
+		if (ret || pcie->msi_vector_base < 128 || pcie->msi_vector_base % 32 ||
+		    pcie->nvecs != 32 ||
+		    pcie->msi_vector_base + pcie->nvecs > FIELD_MAX(PORT_MSIMAP_TARGET) + 1 ||
+		    args.args_count != 4 || args.args[0] != 0 || args.args[1] != 0 ||
+		    args.args[2] != 1824 + pcie->msi_vector_base ||
+		    args.args[3] != IRQ_TYPE_EDGE_RISING || DOORBELL_ADDR != 0xfffff000)
+			goto invalid_slice;
+	}
+
+	/*
 	 * The controller-wide ADT count (512) is not a per-host allocation.
 	 * Internal PCIe owns vectors 0..31. Each PCIe-C bridge owns a distinct
 	 * 32-vector slice. Keep endpoint MSI data local, and route its table
@@ -3300,11 +3403,17 @@ static int apple_pcie_config_write(struct pci_bus *bus, unsigned int devfn,
 	int ret;
 
 	ret = pci_generic_config_write(bus, devfn, where, size, val);
-	if (ret || !pcie || !pcie->kernel_init)
+	if (ret || !pcie)
 		return ret;
-	/* Root-port prefetchable window. The port block has to be told too. */
 	if (bus->number != cfg->busr.start || devfn)
 		return ret;
+	/* The root port's link timers follow its max payload size. */
+	if (pcie->hw->mps_timers && where == PCIEC_RP_DEVCTL)
+		apple_pcie_update_mps_timers(pcie,
+					     FIELD_GET(PCI_EXP_DEVCTL_PAYLOAD, val));
+	if (!pcie->kernel_init)
+		return ret;
+	/* Root-port prefetchable window. The port block has to be told too. */
 	if (where < 0x24 || where >= 0x30)
 		return ret;
 
@@ -4750,6 +4859,59 @@ static void apple_pcie_stop_for_sleep(struct device *dev)
 		apple_pcie_tunnel_hierarchy_lost(dev);
 }
 
+/*
+ * The J716c radio drivers save PCI state without entering D3. The PCI core
+ * keeps the root port in D0 as well. Its host and DART have no switchable
+ * power domains, and the DART saves its live translations without stopping
+ * them. For s2idle, retain that running hierarchy instead of resetting it.
+ *
+ * Check hardware PMCSR rather than current_state: the PCI core may mark a
+ * driverless root port PCI_UNKNOWN even though its hardware remains in D0.
+ */
+static int apple_pcie_check_d0(struct pci_dev *pdev, void *data)
+{
+	int *error = data;
+	u16 value;
+
+	if (pci_read_config_word(pdev, PCI_VENDOR_ID, &value) ||
+	    value != pdev->vendor) {
+		*error = -ENODEV;
+	} else if (pdev->pm_cap &&
+		   (pci_read_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL, &value) ||
+		    (value & PCI_PM_CTRL_STATE_MASK) != PCI_D0)) {
+		*error = -EBUSY;
+	}
+	if (*error)
+		pci_err(pdev, "adopted link requires accessible D0 devices for s2idle\n");
+	return *error;
+}
+
+static int apple_pcie_check_adopted_s2idle(struct apple_pcie *pcie)
+{
+	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
+	struct apple_pcie_port *port;
+	int error = 0;
+
+	/* Other adopted platforms and deeper sleep remain unqualified. */
+	if (!of_machine_is_compatible("apple,j716c") || !pm_suspend_no_platform())
+		return -EBUSY;
+
+	if (!(readl(pcie->base + CORE_RC_CTL) & CORE_RC_CTL_RUN) ||
+	    !(readl(pcie->base + CORE_RC_STAT) & CORE_RC_STAT_READY))
+		return -ENOLINK;
+
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (READ_ONCE(port->link_failed) ||
+		    !(apple_pcie_port_readl(port, PORT_STATUS) & PORT_STATUS_READY) ||
+		    (apple_pcie_port_readl(port, PORT_LINKSTS) &
+		     (PORT_LINKSTS_UP | PORT_LINKSTS_BUSY)) != PORT_LINKSTS_UP ||
+		    (apple_pcie_port_readl(port, PORT_INTSTAT) & BIT(PORT_INT_LINK_DOWN)))
+			return -ENOLINK;
+	}
+	pci_walk_bus(bridge->bus, apple_pcie_check_d0, &error);
+	return error;
+}
+
 static int apple_pcie_suspend_noirq(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
@@ -4760,8 +4922,12 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 	 */
 	if (pcie->managed_sids && pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
 		return -EBUSY;
-	if (!pcie->managed_sids && pcie->hw->adopt_link)
-		return -EBUSY;
+	if (!pcie->managed_sids && pcie->hw->adopt_link) {
+		int ret = apple_pcie_check_adopted_s2idle(pcie);
+
+		pcie->link_kept = !ret;
+		return ret;
+	}
 	if (!pcie->hw->tunneled) {
 		if (pm_suspend_no_platform() && pcie->num_pds)
 			return apple_pcie_hold_domains(pcie);
@@ -4823,6 +4989,19 @@ static int apple_pcie_resume_noirq(struct device *dev)
 
 	/* The domain's hold for the sleep ends first, whatever follows. */
 	apple_pcie_release_domains(pcie);
+	if (pcie->hw->adopt_link) {
+		if (!pcie->link_kept)
+			return 0;
+		pcie->link_kept = false;
+		ret = apple_pcie_check_adopted_s2idle(pcie);
+		if (ret) {
+			/* Block downstream config access if the retained link was lost. */
+			list_for_each_entry(port, &pcie->ports, entry)
+				WRITE_ONCE(port->link_failed, true);
+			dev_err(dev, "adopted link lost during suspend-to-idle: %d\n", ret);
+		}
+		return ret;
+	}
 	if (!pcie->hw->tunneled)
 		return 0;
 	if (pcie->resume_failed)
@@ -4898,6 +5077,7 @@ static const struct dev_pm_ops apple_pcie_pm_ops = {
 
 static const struct of_device_id apple_pcie_of_match[] = {
 	{ .compatible = "apple,t6040-pciec",	.data = &t6040_pciec_hw },
+	{ .compatible = "apple,t6050-pciec",	.data = &t6050_pciec_hw },
 	{ .compatible = "apple,t8132-pciec",	.data = &t8132_pciec_hw },
 	{ .compatible = "apple,t8122-pciec",	.data = &t8122_pciec_hw },
 	{ .compatible = "apple,t8112-pciec",	.data = &t8112_pciec_hw },
