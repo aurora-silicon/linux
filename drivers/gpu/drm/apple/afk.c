@@ -698,6 +698,12 @@ static int afk_send_compact(struct apple_dcp_afkep *ep, u16 intf_id, u8 type,
 	sub->unk = type == 0x12;
 	if (payload_size)
 		memcpy(sub + 1, payload, payload_size);
+	if (ep->endpoint == 0x2b) {	/* DPA3 PROBE */
+		dev_info(ep->dcp->dev, "DPA3 TX ep:%02x intf %u cat %u type %02x len %zu\n",
+			 ep->endpoint, intf_id, category, type, payload_size);
+		print_hex_dump(KERN_INFO, "DPA3 TX: ", DUMP_PREFIX_OFFSET, 16, 1, payload,
+			       min_t(size_t, payload_size, 96), false);
+	}
 
 	mutex_lock(&ep->compact_tx_lock);
 	deadline = jiffies + msecs_to_jiffies(5000);
@@ -998,7 +1004,13 @@ static void afk_recv_handle_compact_reply(struct apple_dcp_afkep *ep,
 		break;
 	}
 	if (!match) {
+		list_for_each_entry(pending, &ep->compact_cmds, node)	/* DPA3 PROBE */
+			dev_info(ep->dcp->dev, "DPA3 pending intf %u type %02x status %#x call %d %u:%u orphan %d\n",
+				 pending->channel, pending->type, pending->request_status,
+				 pending->service_call, pending->group, pending->command, pending->orphan);
 		spin_unlock_irqrestore(&ep->lock, flags);
+		print_hex_dump(KERN_INFO, "DPA3 unmatched: ", DUMP_PREFIX_OFFSET, 16, 1, payload,
+			       min_t(size_t, payload_size, 256), false);
 		dev_warn(ep->dcp->dev,
 			 "AFK[ep:%02x]: unexpected compact reply %02x on interface %u\n",
 			 ep->endpoint, type, channel);
@@ -1140,6 +1152,13 @@ static void afk_recv_compact_message(struct apple_dcp_afkep *ep, u16 intf_id,
 	struct apple_epic_service *service;
 	const void *payload = sub + 1;
 	size_t payload_size = size - 8 - sizeof(*sub);
+
+	if (ep->endpoint == 0x2b) {	/* DPA3 PROBE */
+		dev_info(ep->dcp->dev, "DPA3 RX ep:%02x intf %u cat %u type %02x len %zu\n",
+			 ep->endpoint, intf_id, sub->category, sub->type, payload_size);
+		print_hex_dump(KERN_INFO, "DPA3 RX: ", DUMP_PREFIX_OFFSET, 16, 1, payload,
+			       min_t(size_t, payload_size, 96), false);
+	}
 
 	if (sub->category == 0 && sub->type == 0x11) {
 		afk_recv_handle_compact_init(ep, intf_id, payload, payload_size);
