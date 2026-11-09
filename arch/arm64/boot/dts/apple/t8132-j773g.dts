@@ -44,6 +44,15 @@
 };
 
 /*
+ * Without this, the PMP firmware faults in the PMC block (0x382800000)
+ * shortly after it starts on this board. J713 keeps ps_pmc out of Linux
+ * in its PMGR policy; this board has none yet.
+ */
+&ps_pmc {
+	apple,always-on;
+};
+
+/*
  * The AOP audio component always runs a microphone stream, and this Mac
  * has no microphones (ADT iop-audio-controller has no audio-hp) and no
  * speaker sense, so it has no sound card yet. The AOP registers its audio
