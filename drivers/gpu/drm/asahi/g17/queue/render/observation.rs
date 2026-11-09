@@ -42,6 +42,67 @@ impl Pair {
         Ok(Some(front.packet.clone()))
     }
 
+    /// Output observation does not mutate tickets, generations, accounting or rings.
+    /// The caller owns the device mutex and a current preparation epoch.
+    pub(crate) fn observe_stamp_outputs(
+        &self,
+        stamps: [u32; 2],
+        state: u32,
+        defer: &mut impl FnMut(crate::g17::completion::Deferred) -> Result,
+    ) -> Result {
+        let armed = crate::g17::stamp_complete::enabled();
+        let tracing = crate::g17::trace::hold_enabled();
+        if !armed && !tracing { return Ok(()); }
+        for active in self.active.iter() {
+            if !active.outer_published { continue; }
+            let ticket = &active.ticket;
+            if !self.memory.owns(ticket.ordinal)
+                || !Arc::ptr_eq(&active.packet.context, &self.memory.context)
+            {
+                if tracing {
+                    crate::g17::trace::hold(crate::g17::trace::RENDER, self.qids()[1],
+                        ticket.ordinal, active.packet.context.id(), active.packet.order.sequence, 8, 0);
+                }
+                continue;
+            }
+            let published = ticket.ordinal.checked_add(1).ok_or(EOVERFLOW)?;
+            let covered = stamps.into_iter()
+                .all(|stamp| retirement::stamp_covers(stamp, published));
+            // Refresh after the stamp loads, never export a pre-stamp snapshot.
+            fence(Ordering::Acquire);
+            let Ok(ticks) = self.memory.pass(ticket.ordinal) else { continue; };
+            let completion = &active.packet.completion;
+            let healthy = state == 0 && !self.quarantined && self.prepared.is_none()
+                && !active.failed && completion.stamp_eligible();
+            if tracing {
+                let cursors = snapshot(&self.memory, ticket.ordinal)
+                    .and_then(|snapshot| retirement::observe(ticket, snapshot));
+                let mut known = 0x7d; // cursors filled only for a valid snapshot
+                let mut value = u32::from(covered) | (u32::from(ticks != [0, 0]) << 2)
+                    | (u32::from(ticks[0] != 0 && ticks[1] > ticks[0]) << 4)
+                    | (u32::from(healthy) << 5)
+                    | (u32::from(completion.stamp_queued()) << 6);
+                if let Ok(observation) = cursors {
+                    known |= 2;
+                    value |= u32::from(observation.retired) << 1;
+                }
+                crate::g17::trace::hold(crate::g17::trace::RENDER, self.qids()[1],
+                    published, active.packet.context.id(), active.packet.order.sequence,
+                    known, value);
+            }
+            if armed && healthy {
+                let Ok(Some([start, end])) = retirement::stamp_pass(published, stamps,
+                    || self.memory.pass(ticket.ordinal)) else { continue; };
+                if completion.retain_stamp_work().is_err() { continue; }
+                defer(crate::g17::completion::Deferred::Stamped(completion.clone(),
+                    [start, start, start, end]))?;
+                crate::g17::trace::complete(crate::g17::trace::RENDER, self.qids()[1],
+                    ticket.ordinal as u32, &active.packet, [start, end]);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn observe_front(&self) -> Result<Observed> {
         let front = self.active.front().ok_or(EIO)?;
         if !Arc::ptr_eq(&front.packet.context, &self.memory.context) {

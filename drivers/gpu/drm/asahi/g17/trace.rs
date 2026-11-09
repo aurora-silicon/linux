@@ -11,12 +11,34 @@ unsafe extern "C" {
         fence: *mut bindings::dma_fence);
     fn asahi_g17_trace_complete(engine: u8, qid: u8, ordinal: u32, ctx: u32, seq: u64,
         gpu_start: u64, gpu_end: u64);
+    fn asahi_g17_trace_retire(engine: u8, qid: u8, ordinal: u32, ctx: u32, seq: u64,
+        gpu_start: u64, gpu_end: u64);
     fn asahi_g17_trace_bind(engine: u8, qid: u8, ctx: u32, kind: u8);
     fn asahi_g17_trace_message(kind: u8, value: u64);
     fn asahi_g17_trace_doorbell_enabled() -> bool;
     fn asahi_g17_trace_doorbell(engine: u8, power: u32);
     fn asahi_g17_trace_event(phase: u8);
     fn asahi_g17_trace_teardown(kind: u8, a: u64, b: u64, c: u64);
+}
+
+unsafe extern "C" {
+    fn asahi_g17_trace_hold_enabled() -> bool;
+    fn asahi_g17_trace_hold(engine: u8, qid: u8, kick: u64, ctx: u32, seq: u64,
+        known: u32, value: u32);
+}
+
+pub(super) fn hold_enabled() -> bool {
+    // SAFETY: Pure static-key query.
+    unsafe { asahi_g17_trace_hold_enabled() }
+}
+
+/// Predicate bits: stamps, cursors, record, borrowed, timestamps, healthy,
+/// stamp output queued. `known` distinguishes unavailable from false.
+pub(super) fn hold(engine: u8, qid: u8, kick: u64, ctx: u32, seq: u64,
+    known: u32, value: u32)
+{
+    // SAFETY: Plain values only; no firmware or userspace addresses exported.
+    unsafe { asahi_g17_trace_hold(engine, qid, kick, ctx, seq, known, value) };
 }
 
 pub(super) const RENDER: u8 = 0;
@@ -36,13 +58,24 @@ pub(super) fn publish(engine: u8, qid: u8, ordinal: u32, packet: &Arc<super::job
     };
 }
 
-/// Called when exact completion with GPU timestamps is retired.
+/// Called when output completion is collected (stamp output when armed).
 pub(super) fn complete(engine: u8, qid: u8, ordinal: u32, packet: &super::job::Packet,
     gpu: [u64; 2])
 {
     // SAFETY: Plain values only.
     unsafe {
         asahi_g17_trace_complete(engine, qid, ordinal, packet.context.id(), packet.order.sequence,
+            gpu[0], gpu[1])
+    };
+}
+
+/// Original resource retirement and record timestamps, including armed commands.
+pub(super) fn retire(engine: u8, qid: u8, ordinal: u32, packet: &super::job::Packet,
+    gpu: [u64; 2])
+{
+    // SAFETY: Plain values only.
+    unsafe {
+        asahi_g17_trace_retire(engine, qid, ordinal, packet.context.id(), packet.order.sequence,
             gpu[0], gpu[1])
     };
 }

@@ -1242,14 +1242,20 @@ impl DeferredBatch {
         crate::hw::t8140::queues::COMPUTE_DEPTH
     };
 
+    /// The test arm may collect output, failure and retirement for one retained
+    /// command in the same transaction. Keep the baseline's allocation at arm 0.
+    fn events_per_command() -> usize {
+        if super::stamp_complete::enabled() { 3 } else { 2 }
+    }
+
     /// Reused by the sole event work item; no allocation on a completion pass.
     fn worker() -> Result<Self> {
-        Self::with_capacity(2 * QIDS * Self::DEPTH, QIDS)
+        Self::with_capacity(Self::events_per_command() * QIDS * Self::DEPTH, QIDS)
     }
     /// One publication can quarantine only its selected physical queue/pair.
     /// VM-wide settlement is a separate transaction before publishing its error.
     fn publication() -> Result<Self> {
-        Self::with_capacity(2 * Self::DEPTH, 0)
+        Self::with_capacity(Self::events_per_command() * Self::DEPTH, 0)
     }
     fn with_capacity(capacity: usize, detached: usize) -> Result<Self> {
         let render_slots = if detached != 0 {
@@ -1303,7 +1309,7 @@ impl DeferredBatch {
     /// Healthy submissions keep the small publication collector unchanged.
     fn reserve_replays(&mut self, commands: usize) -> Result {
         self.values
-            .reserve(2 * commands + 2 * Self::DEPTH, GFP_KERNEL)?;
+            .reserve(Self::events_per_command() * (commands + Self::DEPTH), GFP_KERNEL)?;
         Ok(())
     }
     pub(super) fn push(&mut self, value: super::completion::Deferred) -> Result {
@@ -1320,11 +1326,16 @@ impl DeferredBatch {
             Deferred::Retired(completion, Err(error)) | Deferred::Drained(completion, Err(error))
             | Deferred::FailedOwned(completion, error) | Deferred::Unpublished(completion, error) =>
                 { completion.note_input_error(*error); },
-            Deferred::Retired(completion, Ok(_)) | Deferred::Drained(completion, Ok(_)) =>
+            Deferred::Stamped(completion, _)
+            | Deferred::Retired(completion, Ok(_)) | Deferred::Drained(completion, Ok(_)) =>
                 completion.note_source_retired(),
             _ => {},
         }
         self.values.push_within_capacity(value).map_err(|_| EIO)?;
+        if let Some(Deferred::Stamped(completion, _)) = self.values.last() {
+            completion.note_stamp_queued();
+            self.has_source_completions |= completion.sources().is_some();
+        }
         // A later publisher can borrow this pair before finish signals its old
         // fence. Publish the exact completion's witness only after collection
         // succeeds; failure fences and rejected events are not retirement.
@@ -1350,7 +1361,8 @@ impl DeferredBatch {
             for _ in 0..self.values.len() {
                 let mut changed = false;
                 for value in &self.values {
-                    if let Deferred::Retired(completion, Ok(_))
+                    if let Deferred::Stamped(completion, _)
+                        | Deferred::Retired(completion, Ok(_))
                         | Deferred::Drained(completion, Ok(_)) = value
                     {
                         if let Err(error) = completion.check_source_inputs() {
@@ -1660,6 +1672,7 @@ impl super::Firmware {
     fn scan_compute(&mut self, masks: Option<[u64; 2]>, deferred: &mut DeferredBatch) -> Result {
         let state = super::recovery::Memory::recovery_state(&self.init)?;
         let generation = self.recovery.generation();
+        let stamp_state = if self.recovery.pending() { u32::MAX } else { state };
         let registry = &mut self.queues;
         registry.observations.clear();
         let mut requested = false;
@@ -1702,6 +1715,7 @@ impl super::Firmware {
         {
             let busy = !queue.channel_free();
             queue.latch_observations(&mut registry.observations)?;
+            queue.observe_stamp_outputs(generation, stamp_state, &mut |event| deferred.push(event))?;
             queue.retire(
                 masks,
                 generation,

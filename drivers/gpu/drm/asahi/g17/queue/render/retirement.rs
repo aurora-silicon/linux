@@ -241,6 +241,21 @@ pub(crate) const fn stamp_covers(stamp: u32, published: u64) -> bool {
     delta & 0xff == 0 && delta < 0x8000_0000
 }
 
+/// Output-only witness. The final per-kick pass is read after BOTH stage stamps.
+/// This deliberately supplies no cursor, ring reuse or accounting witness.
+pub(crate) fn stamp_pass(
+    published: u64,
+    stamps: [u32; 2],
+    read: impl FnOnce() -> Result<[u64; 2]>,
+) -> Result<Option<[u64; 2]>> {
+    if !stamps.into_iter().all(|stamp| stamp_covers(stamp, published)) {
+        return Ok(None);
+    }
+    fence(Ordering::Acquire);
+    let ticks = read()?;
+    Ok((ticks[0] != 0 && ticks[1] > ticks[0]).then_some(ticks))
+}
+
 fn visible(ticket: &Ticket, stamps: [u32; 2]) -> Result<bool> {
     let published = ticket.ordinal.checked_add(1).ok_or(EOVERFLOW)?;
     Ok(stamps
@@ -492,6 +507,33 @@ mod executed_tests {
             snapshot: Snapshot { cursors: [cursors; 2], job_list_empty: false, pass },
             stamps: [406 << 8; 2],
         }
+    }
+
+    #[test]
+    fn stamp_output_does_not_retire_unconsumed_rings() {
+        let mut ticket = stalled_ticket();
+        let mut memory = stalled([10, 20]);
+        memory.stamps = [407 << 8; 2];
+        memory.snapshot.cursors = [Cursors { done: 1097, read: 1099, write: 1099 }; 2];
+        let before = ticket;
+        assert_eq!(stamp_pass(407, memory.stamps, || Ok([10, 20])), Ok(Some([10, 20])));
+        assert_eq!(ticket, before);
+        assert!(matches!(poll(&mut ticket, &mut memory), Ok(Poll::Pending)));
+        memory.snapshot.cursors = [Cursors { done: 1099, read: 1099, write: 1099 }; 2];
+        assert!(matches!(poll(&mut ticket, &mut memory), Ok(Poll::Complete([10, 10, 10, 20]))));
+    }
+
+    #[test]
+    fn stamp_output_requires_both_exact_stages_and_final_pass() {
+        for stamps in [[406 << 8, 407 << 8], [407 << 8, 406 << 8], [407 << 8 | 1, 407 << 8]] {
+            assert_eq!(stamp_pass(407, stamps, || panic!("pre-stamp timestamp read")), Ok(None));
+        }
+        assert_eq!(stamp_pass(407, [407 << 8; 2], || Ok([10, 0])), Ok(None));
+        assert_eq!(stamp_pass(407, [407 << 8; 2], || Ok([10, 10])), Ok(None));
+        assert_eq!(stamp_pass(0x100_0000, [0; 2], || Ok([10, 20])), Ok(Some([10, 20])));
+        // Neither a different pair's later stamp nor an earlier kick's timestamp
+        // can provide the missing stage of this member.
+        assert_eq!(stamp_pass(408, [407 << 8, 409 << 8], || panic!("wrong kick")), Ok(None));
     }
 
     #[test]

@@ -7,6 +7,19 @@
 #define CREATE_TRACE_POINTS
 #include "trace.h"
 
+bool asahi_g17_trace_hold_enabled(void)
+{
+	return trace_asahi_g17_hold_enabled();
+}
+
+void asahi_g17_trace_hold(u8 engine, u8 qid, u64 kick, u32 ctx, u64 seq,
+                         u32 known, u32 value)
+{
+	if (trace_asahi_g17_hold_enabled())
+		trace_asahi_g17_hold(engine, qid, kick, ctx, seq, known, value,
+				     __arch_counter_get_cntvct());
+}
+
 bool asahi_g17_trace_publish_enabled(void)
 {
 	return trace_asahi_g17_publish_enabled();
@@ -26,6 +39,14 @@ void asahi_g17_trace_complete(u8 engine, u8 qid, u32 ordinal, u32 ctx, u64 seq,
 	if (trace_asahi_g17_complete_enabled())
 		trace_asahi_g17_complete(engine, qid, ordinal, ctx, seq, gpu_start,
 					 gpu_end, __arch_counter_get_cntvct());
+}
+
+void asahi_g17_trace_retire(u8 engine, u8 qid, u32 ordinal, u32 ctx, u64 seq,
+                           u64 gpu_start, u64 gpu_end)
+{
+	if (trace_asahi_g17_retire_enabled())
+		trace_asahi_g17_retire(engine, qid, ordinal, ctx, seq, gpu_start,
+				       gpu_end, __arch_counter_get_cntvct());
 }
 
 void asahi_g17_trace_bind(u8 engine, u8 qid, u32 ctx, u8 kind)

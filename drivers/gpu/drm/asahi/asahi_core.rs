@@ -128,6 +128,10 @@ module! {
             // permissions: 0o644,
             description: "Debug flags",
         },
+        g17_stamp_complete_arm: u32 {
+            default: 0,
+            description: "Test only: G17 stamp output completion (0: baseline, 1: armed; other values: baseline)",
+        },
         compute_preempt: i32 {
             default: -1,
             description: "Compute preemption (-1: M2 Max or Debug0; 0: off; nonzero: on)",
