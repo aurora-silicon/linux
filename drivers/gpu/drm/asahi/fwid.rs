@@ -495,7 +495,11 @@ mod tests {
 
     #[test]
     fn t6050_admits_only_its_pinned_image() {
-        for cfg in [&crate::hw::t6050::CONFIG_ULTRA, &crate::hw::t6050::CONFIG_MAX] {
+        for cfg in [
+            &crate::hw::t6050::CONFIG_ULTRA,
+            &crate::hw::t6050::CONFIG_MAX,
+            &crate::hw::t6050::CONFIG,
+        ] {
             let crate::g17::fw::variant::Firmware::Identified(builds) = cfg.firmware else {
                 panic!("an M5 board on bare metal must identify its loaded firmware");
             };
