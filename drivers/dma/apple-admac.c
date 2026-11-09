@@ -1116,9 +1116,9 @@ static int admac_runtime_resume(struct device *dev)
 }
 
 /*
- * A system sleep that reached the hardware takes the registers of a channel a
- * client still holds, and its client won't configure it again: only a new
- * hw_params does that.
+ * A firmware-driven sleep, refused or not, takes the registers of a channel a
+ * client still holds (genpd gates the domain at noirq), and its client won't
+ * configure it again: only a new hw_params does that.
  */
 static int __maybe_unused admac_resume_early(struct device *dev)
 {
@@ -1126,7 +1126,7 @@ static int __maybe_unused admac_resume_early(struct device *dev)
 	unsigned long flags;
 	int i;
 
-	if (!pm_resume_via_firmware())
+	if (!pm_suspend_via_firmware())
 		return 0;
 
 	mutex_lock(&ad->cache_alloc_lock);
