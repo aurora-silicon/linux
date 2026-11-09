@@ -111,6 +111,10 @@ static int dcpaud_link_test_call(struct device *dev, enum dcp_audio_link op,
 		dcpaud_link_record('P');
 	} else if (op == DCP_AUDIO_LINK_START) {
 		dcpaud_link_record('T');
+	} else if (op == DCP_AUDIO_LINK_DID_START) {
+		dcpaud_link_record('d');
+	} else if (op == DCP_AUDIO_LINK_WILL_STOP) {
+		dcpaud_link_record('w');
 	}
 	return 0;
 }
@@ -210,7 +214,7 @@ static void dcpaud_disconnect_sync_completes_live_owner(struct kunit *test)
 	audio->link_prepared = true;
 	audio->link_started = true;
 	KUNIT_ASSERT_EQ(test, dcp_pcm_native_sync_stop(sub), 0);
-	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "DSC");
+	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "DwSC");
 	KUNIT_EXPECT_FALSE(test, audio->link_prepared);
 	KUNIT_EXPECT_FALSE(test, audio->link_started);
 	dcpaud_release_link(pdev, NULL);
@@ -266,7 +270,7 @@ static void dcpaud_stop_holds_link(struct kunit *test)
 
 	/* The display goes off: the silence ends, then the link */
 	dcpaud_release_link(pdev, NULL);
-	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "IXDiDSC");
+	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "IXDiDwSC");
 	KUNIT_EXPECT_FALSE(test, audio->silence_running);
 	KUNIT_EXPECT_FALSE(test, audio->idle_set);
 	KUNIT_EXPECT_FALSE(test, audio->link_prepared);
@@ -366,7 +370,7 @@ static void dcpaud_start_replaces_held_link(struct kunit *test)
 	memset(&audio->link_cookie, 1, sizeof(audio->link_cookie));
 	memset(&audio->selected_cookie, 2, sizeof(audio->selected_cookie));
 	KUNIT_ASSERT_EQ(test, dcp_pcm_native_start(sub, SNDRV_PCM_TRIGGER_START), 0);
-	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "iSCGPQT");
+	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "iwSCGPQTd");
 	KUNIT_EXPECT_FALSE(test, audio->idle_set);
 	KUNIT_EXPECT_EQ(test, memcmp(&audio->link_cookie, &audio->selected_cookie,
 				     sizeof(audio->link_cookie)), 0);
@@ -383,7 +387,7 @@ static void dcpaud_start_after_held_link_went(struct kunit *test)
 	/* The held link's service went (unplug): the stream gets a link of its own */
 	dcpaud_link_current->link_live = false;
 	KUNIT_ASSERT_EQ(test, dcp_pcm_native_start(sub, SNDRV_PCM_TRIGGER_START), 0);
-	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "iGPQT");
+	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "iGPQTd");
 	KUNIT_EXPECT_FALSE(test, audio->silence_running);
 	KUNIT_EXPECT_TRUE(test, audio->link_started);
 	pm_runtime_put_noidle(audio->dev);

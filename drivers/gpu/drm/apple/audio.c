@@ -696,11 +696,12 @@ static int dcpaud_pin_rate_format(struct dcp_audio *dcpaud,
 				  struct snd_pcm_runtime *runtime)
 {
 	static const unsigned int rates[] = { 48000, 44100, 32000 };
+	/* The 24-bit element only: a 16-bit one would need a widening path (see open). */
 	static const snd_pcm_format_t formats[] = {
-		SNDRV_PCM_FORMAT_S24_LE, SNDRV_PCM_FORMAT_S16_LE,
+		SNDRV_PCM_FORMAT_S24_LE,
 	};
 	struct dcp_sound_format_mask sieve = {
-		.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE,
+		.formats = SNDRV_PCM_FMTBIT_S24_LE,
 		.rates = GENMASK(snd_pcm_known_rates.count - 1, 0),
 		.nchans = BIT(2),
 	};
@@ -867,6 +868,20 @@ static int dcp_pcm_native_open(struct snd_pcm_substream *substream)
 	}
 
 	ret = dcp_pcm_open(substream);
+	/*
+	 * The DPA takes one 32-bit entry per channel sample whatever the
+	 * link's sample size: packed S16_LE (one word per stereo frame) plays
+	 * as silence, so native links take 32-bit containers only.
+	 */
+	if (!ret) {
+		ret = snd_pcm_hw_constraint_mask64(substream->runtime, SNDRV_PCM_HW_PARAM_FORMAT,
+						   SNDRV_PCM_FMTBIT_S20_LE | SNDRV_PCM_FMTBIT_S24_LE |
+						   SNDRV_PCM_FMTBIT_S32_LE);
+		if (ret > 0)
+			ret = 0;
+		if (ret)
+			dcp_pcm_close(substream);
+	}
 	if (!ret && live && !dcpaud->open_unplugged) {
 		ret = dcpaud_pin_rate_format(dcpaud, substream->runtime);
 		if (!ret)
@@ -928,6 +943,11 @@ static void dcpaud_link_teardown(struct dcp_audio *dcpaud)
 	live = (dcpaud->link_prepared || dcpaud->link_started) &&
 	       dcp_audiosrv_link_live(dcpaud->dcp_dev);
 	if (dcpaud->link_started && live) {
+		/* As macOS: the stopping notification, then STOP, same link data. */
+		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_WILL_STOP,
+					&dcpaud->link_cookie);
+		if (ret && ret != -ENODEV)
+			dev_err(dcpaud->dev, "audio link will-stop failed: %d\n", ret);
 		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_STOP,
 					&dcpaud->link_cookie);
 		if (ret && ret != -ENODEV)
@@ -1079,8 +1099,18 @@ static int dcp_pcm_native_start(struct snd_pcm_substream *substream, int cmd)
 		return 0;
 	ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_START,
 				&dcpaud->link_cookie);
-	dcpaud->link_started = !ret;
-	return ret;
+	if (ret)
+		return ret;
+	/* As macOS: START, then the started notification with the same link data. */
+	ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_DID_START,
+				&dcpaud->link_cookie);
+	if (ret) {
+		dev_err(dcpaud->dev, "audio link did-start failed: %d\n", ret);
+		dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_STOP, &dcpaud->link_cookie);
+		return ret;
+	}
+	dcpaud->link_started = true;
+	return 0;
 }
 
 static int dcp_pcm_native_trigger(struct snd_pcm_substream *substream, int cmd)

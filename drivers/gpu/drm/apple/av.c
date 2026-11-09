@@ -30,6 +30,9 @@ struct dcp_av_audio_cmds {
 	u32 start_link;
 	u32 stop_link;
 	u32 unprepare;
+	/* after start_link and before stop_link; 0 where the firmware has none */
+	u32 did_start_link;
+	u32 will_stop_link;
 	/* commands in group 1*/
 	u32 get_elements;
 	u32 get_product_attrs;
@@ -53,6 +56,8 @@ static const struct dcp_av_audio_cmds dcp_av_audio_cmds_v13_5 = {
 	.start_link = 7,
 	.stop_link = 10,
 	.unprepare = 11,
+	.did_start_link = 8,
+	.will_stop_link = 9,
 	.get_elements = 16,
 	.get_product_attrs = 18,
 };
@@ -495,9 +500,17 @@ int dcp_audiosrv_link(struct device *dev, enum dcp_audio_link op,
 	case DCP_AUDIO_LINK_COMPLETE:
 		command = asrv->cmds.unprepare;
 		break;
+	case DCP_AUDIO_LINK_DID_START:
+		command = asrv->cmds.did_start_link;
+		break;
+	case DCP_AUDIO_LINK_WILL_STOP:
+		command = asrv->cmds.will_stop_link;
+		break;
 	default:
 		return -EINVAL;
 	}
+	if (!command)
+		return 0;
 	static_assert(sizeof(*cookie) == DCP_SOUND_COOKIE_SIZE_V14_7);
 	memcpy(body, cookie, sizeof(*cookie));
 

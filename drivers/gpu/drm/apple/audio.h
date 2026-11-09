@@ -25,6 +25,9 @@ enum dcp_audio_link {
 	DCP_AUDIO_LINK_START,
 	DCP_AUDIO_LINK_STOP,
 	DCP_AUDIO_LINK_COMPLETE,
+	/* The started and stopping notifications around START and STOP */
+	DCP_AUDIO_LINK_DID_START,
+	DCP_AUDIO_LINK_WILL_STOP,
 };
 
 bool dcp_audiosrv_native_link(struct device *dev);
