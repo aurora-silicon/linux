@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
-/* Disabled resource descriptions for T6000. */
+/* Additional T6000 hardware resources. Keep unqualified blocks disabled. */
 
 &{/soc} {
 	ane0_dma: dma-controller@285804000 {
@@ -14,7 +14,66 @@
 	aic_timebase: timer@28e148000 {
 		compatible = "apple,t6000-aic-timebase", "apple,aic-timebase";
 		reg = <0x2 0x8e148000 0x0 0x1000>;
-		status = "disabled";
+	};
+
+	cpu_e00_coresight: cpu-debug@210010000 {
+		compatible = "apple,t6000-cpu-coresight", "apple,cpu-coresight";
+		reg = <0x2 0x10010000 0x0 0x300c8>;
+		cpu = <&cpu_e00>;
+	};
+
+	cpu_e01_coresight: cpu-debug@210110000 {
+		compatible = "apple,t6000-cpu-coresight", "apple,cpu-coresight";
+		reg = <0x2 0x10110000 0x0 0x300c8>;
+		cpu = <&cpu_e01>;
+	};
+
+	cpu_p00_coresight: cpu-debug@211010000 {
+		compatible = "apple,t6000-cpu-coresight", "apple,cpu-coresight";
+		reg = <0x2 0x11010000 0x0 0x300c8>;
+		cpu = <&cpu_p00>;
+	};
+
+	cpu_p01_coresight: cpu-debug@211110000 {
+		compatible = "apple,t6000-cpu-coresight", "apple,cpu-coresight";
+		reg = <0x2 0x11110000 0x0 0x300c8>;
+		cpu = <&cpu_p01>;
+	};
+
+	cpu_p02_coresight: cpu-debug@211210000 {
+		compatible = "apple,t6000-cpu-coresight", "apple,cpu-coresight";
+		reg = <0x2 0x11210000 0x0 0x300c8>;
+		cpu = <&cpu_p02>;
+	};
+
+	cpu_p03_coresight: cpu-debug@211310000 {
+		compatible = "apple,t6000-cpu-coresight", "apple,cpu-coresight";
+		reg = <0x2 0x11310000 0x0 0x300c8>;
+		cpu = <&cpu_p03>;
+	};
+
+	cpu_p10_coresight: cpu-debug@212010000 {
+		compatible = "apple,t6000-cpu-coresight", "apple,cpu-coresight";
+		reg = <0x2 0x12010000 0x0 0x300c8>;
+		cpu = <&cpu_p10>;
+	};
+
+	cpu_p11_coresight: cpu-debug@212110000 {
+		compatible = "apple,t6000-cpu-coresight", "apple,cpu-coresight";
+		reg = <0x2 0x12110000 0x0 0x300c8>;
+		cpu = <&cpu_p11>;
+	};
+
+	cpu_p12_coresight: cpu-debug@212210000 {
+		compatible = "apple,t6000-cpu-coresight", "apple,cpu-coresight";
+		reg = <0x2 0x12210000 0x0 0x300c8>;
+		cpu = <&cpu_p12>;
+	};
+
+	cpu_p13_coresight: cpu-debug@212310000 {
+		compatible = "apple,t6000-cpu-coresight", "apple,cpu-coresight";
+		reg = <0x2 0x12310000 0x0 0x300c8>;
+		cpu = <&cpu_p13>;
 	};
 
 	dwi: bus-controller@28e208000 {
@@ -26,18 +85,16 @@
 		status = "disabled";
 	};
 
-	dockchannel_uart: fifo@29250c000 {
-		compatible = "apple,t6000-dockchannel", "apple,dockchannel";
-		reg = <0x2 0x9250c000 0x0 0x18>;
+	/* The DebugUSB DockChannel serial channel; RX is drained in software. */
+	dockchannel_uart: serial@29252c000 {
+		compatible = "apple,t6000-dockchannel-uart", "apple,dockchannel-uart";
+		reg = <0x2 0x9252c000 0x0 0x4000>,
+		      <0x2 0x92528000 0x0 0x4000>,
+		      <0x2 0x9250c000 0x0 0x18>;
+		reg-names = "data", "config", "irq";
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 620 IRQ_TYPE_LEVEL_HIGH>;
-		reg-names = "irq";
-		ranges = <0 0x2 0x92528000 0x10004>;
-		#address-cells = <1>;
-		#size-cells = <1>;
-		interrupt-controller;
-		#interrupt-cells = <2>;
-		status = "disabled";
+		apple,sw-drain;
 	};
 
 	apr0: video-codec@311000000 {
