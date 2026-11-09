@@ -753,6 +753,18 @@ static const struct apple_epic_service_ops av_desktop_ops[] = {
 		.report = av_cec_report,
 		.teardown = av_cec_teardown,
 	},
+	{
+		/*
+		 * And its video interface, cut to "dcpav-video-interface-" on
+		 * every display power-on. The video side runs through the
+		 * IOMFB endpoint; take it like the CEC interface.
+		 */
+		.name = "dcpav-video-interface-epic",
+		.compact_full = "dcpav-video-interface-epic:0",
+		.init = av_cec_init,
+		.report = av_cec_report,
+		.teardown = av_cec_teardown,
+	},
 	{}
 };
 #endif
