@@ -341,6 +341,12 @@ static int apple_pmgr_ps_power_off(struct generic_pm_domain *genpd)
 	/* A live coprocessor keeps this domain through system sleep. */
 	if (ps->sleep_retained && ps->system_sleep)
 		return -EBUSY;
+	/*
+	 * Its driver took it down for the sleep and raises it in its own order. Gating it
+	 * here would take its parents too, and genpd would raise them all first at the wake.
+	 */
+	if (ps->system_sleep && apple_sleep_domain_is_down(ps->dev->of_node))
+		return -EBUSY;
 
 	ret = apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_PWRGATE, false);
 	if (ret)
