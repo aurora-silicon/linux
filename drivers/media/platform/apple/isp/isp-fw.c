@@ -1282,9 +1282,6 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
 		return -EIO;
 	}
 
-	/* A SLP_DDR wake after the ISP ran stalls, even after a failed start; a deep one doesn't. */
-	apple_sleep_next_deep(isp->dev);
-
 	/* The firmware starts with new rings. */
 	isp->ipc_stale = NULL;
 	isp->ipc_failed = false;

@@ -121,9 +121,6 @@ void apple_sleep_radio_port_up(void);
 /* From RTKit: this coprocessor's firmware crashed. */
 void apple_sleep_coproc_crashed(struct device *dev);
 
-/* This device ran: the next sleep takes the deep path, as the first of a boot does. */
-void apple_sleep_next_deep(struct device *dev);
-
 /* After a deep sleep, put back the pins it reset. ANS's driver calls it before the run bit. */
 void apple_sleep_restore_pins(void);
 
@@ -236,10 +233,6 @@ static inline void apple_sleep_radio_port_up(void)
 }
 
 static inline void apple_sleep_coproc_crashed(struct device *dev)
-{
-}
-
-static inline void apple_sleep_next_deep(struct device *dev)
 {
 }
 
