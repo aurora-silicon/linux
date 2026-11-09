@@ -188,6 +188,8 @@ static int ave_start_validate_6070(const struct ave_session *sess)
 
 	if (ave_6070_check_buf(&sess->hdr))
 		return -EINVAL;
+	if (ave_6070_check_buf(&sess->param_sets) || !sess->param_sets.size)
+		return -EINVAL;
 	for (unsigned int i = 0; i < p->refs; i++)
 		if (ave_6070_check_buf(&sess->ref_a[i]) ||
 		    ave_6070_check_buf(&sess->ref_b[i]) ||
@@ -230,6 +232,8 @@ static int ave_start_surfaces_6070(struct ave_session *sess, u8 *cmd,
 
 	ave_put_buf(fw, cmd, &l->header, 0, &sess->hdr, fw->hdr_bytes);
 	ave_write_surface(fw, cmd, &l->secondary, 0, 0, 0);
+	ave_put_buf(fw, cmd, &l->param_sets, 0, &sess->param_sets,
+		    sess->param_sets.size);
 
 	for (unsigned int i = 0; i < p->refs; i++) {
 		ave_write_address_bank(cmd, &l->recon, i, sess->ref_a[i].dma,

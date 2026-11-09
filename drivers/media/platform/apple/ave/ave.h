@@ -332,6 +332,8 @@ struct ave_session {
 	struct ave_session *failed_next;
 	struct ave_params p;
 	struct ave_buf hdr;
+	/* 6070: per-session firmware-generated VPS/SPS/PPS output. */
+	struct ave_buf param_sets;
 	struct ave_buf ref_a[AVE_MAX_REFS];
 	struct ave_buf ref_b[AVE_MAX_REFS];
 	struct ave_buf ref_c[AVE_MAX_REFS];

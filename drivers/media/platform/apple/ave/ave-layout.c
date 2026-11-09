@@ -536,6 +536,8 @@ const struct ave_fw_layout ave_layout_6070_11_1 = {
 		[0] = {
 			.header = AVE_SURFACE(0x40, 0x10),
 			.secondary = AVE_SURFACE(0x50, 0x10),
+			/* Firmware-generated SPS/PPS output; mandatory on 6070.11.1. */
+			.param_sets = AVE_SURFACE(0xfb30, 0x10),
 			.coded = { .address = 0x4b8, .size = 0x558,
 				   .address_stride = 8, .size_stride = 4 },
 			.meta = { .address = 0x5c0, .size = 0x660,
@@ -595,6 +597,8 @@ const struct ave_fw_layout ave_layout_6070_11_1 = {
 		[1] = {
 			.header = AVE_SURFACE(0x40, 0x10),
 			.secondary = AVE_SURFACE(0x50, 0x10),
+			/* Firmware-generated VPS/SPS/PPS output; mandatory on 6070.11.1. */
+			.param_sets = AVE_SURFACE(0xfb30, 0x10),
 			.coded = { .address = 0x4b8, .size = 0x558,
 				   .address_stride = 8, .size_stride = 4 },
 			.meta = { .address = 0x5c0, .size = 0x660,

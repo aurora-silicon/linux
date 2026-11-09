@@ -50,6 +50,7 @@
 #define AVE_META_SCAN_FROM 0x200
 #define AVE_SHDR_BYTES (256 * 0x400)
 #define AVE_SHDR_ENTRY_BYTES 0x400
+#define AVE_PARAM_SETS_BYTES 0x1000
 #define AVE_CODED_MIN 0x3c000
 
 /* Level limits: max frame size, max rate, max bit rate (kbit/s, Main). */
@@ -280,7 +281,7 @@ struct ave_buf_req {
 };
 
 #define AVE_MAX_BUF_REQS \
-	(1 + 6 * AVE_MAX_REFS + 3 + 4 * AVE_NEIGHBOUR_SETS + \
+	(2 + 6 * AVE_MAX_REFS + 3 + 4 * AVE_NEIGHBOUR_SETS + \
 	 2 * AVE_ENTROPY_SETS * AVE_TILE_BUFS + 2 + 4 * AVE_MAX_SLOTS)
 
 static int ave_buf_req_cmp(const void *a, const void *b)
@@ -349,6 +350,8 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 		tile *= 2;
 
 	ave_req(r, &n, &sess->hdr, fw->hdr_bytes, 0, nomap);
+	if (fw6070)
+		ave_req(r, &n, &sess->param_sets, AVE_PARAM_SETS_BYTES, 0, 0);
 	for (unsigned int i = 0; i < p->refs; i++) {
 		ave_req(r, &n, &sess->ref_a[i], ref_a, ref_a * 3 / 2, nomap);
 		ave_req(r, &n, &sess->ref_b[i], ref_b, ref_b * 5 / 4, nomap);
@@ -421,6 +424,7 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
 {
 	ave_free(ave, &sess->hdr);
+	ave_free(ave, &sess->param_sets);
 	for (unsigned int i = 0; i < AVE_MAX_REFS; i++) {
 		ave_free(ave, &sess->ref_a[i]);
 		ave_free(ave, &sess->ref_b[i]);
@@ -547,6 +551,7 @@ static void ave_log_buf(struct ave_dev *ave, const char *name, int i, const stru
 static void ave_sess_log_map(struct ave_dev *ave, struct ave_session *sess)
 {
 	ave_log_buf(ave, "hdr", 0, &sess->hdr);
+	ave_log_buf(ave, "param_sets", 0, &sess->param_sets);
 	ave_log_buf(ave, "mb", 0, &sess->mb);
 	for (int set = 0; set < AVE_NEIGHBOUR_SETS; set++) {
 		ave_log_buf(ave, "row_a", set, &sess->row_a[set]);
