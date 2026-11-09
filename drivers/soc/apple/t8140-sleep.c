@@ -4002,7 +4002,7 @@ static void t8140_sleep_find_radio_perst(struct t8140_sleep *s, struct device_no
 	struct device_node *host, *port;
 	struct of_phandle_args args;
 
-	host = of_find_compatible_node(NULL, NULL, "apple,t8140-pcie");
+	host = of_parse_phandle(s->dev->of_node, "apple,apcie", 0);
 	if (!host)
 		return;
 	if (of_device_is_available(host)) {
