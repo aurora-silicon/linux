@@ -1312,6 +1312,7 @@
 			power-domains = <&ps_pmp>;
 			/* The bootloader supplies board/DRAM IDs and PMP calibration. */
 			#ifdef APPLE_USE_PMP
+			apple,pmp-report = <&pmp_report>;
 			status = "okay";
 			#else
 			status = "disabled";

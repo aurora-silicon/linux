@@ -66,6 +66,9 @@ def check(tree, output, dtc, board, soc, pmp_addr, report_addr, trial, avd_vmax=
         assert len(get(dtb, pmp, 'apple,pio-ranges', 'x')) == 7 * 4
     else:
         assert get(dtb, pmp, 'apple,pio-ranges', 'x', default=[]) == []
+        report_phandle = get(dtb, report, 'phandle', 'x')[0]
+        assert get(dtb, pmp, 'apple,pmp-report', 'x', default=[]) == (
+            [report_phandle] if trial else [])
     # All existing macro-selected consumers must use report domains together.
     # A status-only change would miss these edges.
     consumers = [('dcp', 'pmp_report_disp0'), ('avd', 'pmp_report_avd_sys')]
