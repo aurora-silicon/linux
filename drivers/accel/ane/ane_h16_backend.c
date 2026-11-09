@@ -1458,6 +1458,9 @@ static int ane_h16_program_stage(struct ane_h16_device *h)
 {
 	int ret;
 
+	/* Before the node exists: the CLPC may have bound after acquire. */
+	if (!h->clpc && apple_clpc_ane_get(h->dev, &h->clpc))
+		h->clpc = NULL;
 	ret = ane_h16_session_init(&h->session, &h->boot.transport, &ane_h16_session_ops, h,
 				   h->boot.build->command_timeout_ns);
 	if (!ret) {
@@ -1470,8 +1473,8 @@ static int ane_h16_program_stage(struct ane_h16_device *h)
 		return ret;
 	}
 	h->program_ready = true;
-	dev_info(h->dev, "H16 stage 5 program window %llx..%llx\n", h->program_next,
-		 h->program_end - 1);
+	dev_info(h->dev, "H16 stage 5 program window %llx..%llx%s\n", h->program_next,
+		 h->program_end - 1, h->clpc ? ", CLPC input attached" : "");
 	return 0;
 }
 

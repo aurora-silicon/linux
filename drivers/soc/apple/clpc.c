@@ -21,7 +21,6 @@
  */
 
 #include <linux/cpufreq.h>
-#include <linux/of_device.h>
 #include <linux/kref.h>
 #include <linux/ktime.h>
 #include <linux/of_platform.h>
@@ -85,6 +84,8 @@ enum apple_clpc_rail {
  *	speed follows
  * @ane_cluster_khz: minimum frequency of that cluster while ANE work is in
  *	flight; 0 for none
+ * @ane_cluster_machine: the machine compatible the cluster floor was
+ *	measured on; SoCs sharing this CLPC without it get no cluster floor
  * @gpu_input: the GPU driver reports its work in flight through
  *	apple_clpc_gpu_get(); while there is some, both rails go to the top
  *	of @map
@@ -103,6 +104,7 @@ struct apple_clpc_hw {
 	u8 ane[APPLE_CLPC_RAILS];
 	unsigned int ane_cluster;
 	unsigned int ane_cluster_khz;
+	const char *ane_cluster_machine;
 };
 
 struct apple_clpc_cluster {
@@ -174,6 +176,8 @@ struct apple_clpc {
 	struct freq_qos_request ane_qos;
 	unsigned int ane_qos_khz;
 	unsigned long ane_until;
+	struct notifier_block policy_nb;
+	bool policy_nb_added;
 	u32 last_floor;
 	u32 last_reason;
 	u64 last_vote_ns;
@@ -705,6 +709,8 @@ static void apple_clpc_ane_cluster(struct apple_clpc *clpc, bool active,
 		clpc->ane_until = now + msecs_to_jiffies(APPLE_CLPC_HOLD_MS);
 	if (time_before(now, clpc->ane_until))
 		khz = clpc->ane_cluster_khz;
+	else
+		clpc->ane_until = now;
 	if (khz && !freq_qos_request_active(&clpc->ane_qos) && clpc->ane_cpu >= 0) {
 		struct cpufreq_policy *policy = cpufreq_cpu_get(clpc->ane_cpu);
 
@@ -991,9 +997,32 @@ static void apple_clpc_stop(void *data)
 	apple_clpc_ane_detach(clpc->ane);
 	debugfs_remove_recursive(clpc->debugfs);
 	apple_clpc_halt(clpc);
+	if (clpc->policy_nb_added)
+		cpufreq_unregister_notifier(&clpc->policy_nb, CPUFREQ_POLICY_NOTIFIER);
 	if (freq_qos_request_active(&clpc->ane_qos))
 		freq_qos_remove_request(&clpc->ane_qos);
 	apple_clpc_free_clusters(clpc);
+}
+
+/*
+ * The cluster floor is a request on a cpufreq policy, which goes away with
+ * the cpufreq driver (a module). Withdraw it then; it is added again on the
+ * next ANE work once a policy covers the CPU.
+ */
+static int apple_clpc_policy_notify(struct notifier_block *nb, unsigned long event,
+				    void *data)
+{
+	struct apple_clpc *clpc = container_of(nb, struct apple_clpc, policy_nb);
+	struct cpufreq_policy *policy = data;
+
+	if (event != CPUFREQ_REMOVE_POLICY ||
+	    !cpumask_test_cpu(clpc->ane_cpu, policy->related_cpus))
+		return NOTIFY_DONE;
+	guard(mutex)(&clpc->sample_lock);
+	if (freq_qos_request_active(&clpc->ane_qos))
+		freq_qos_remove_request(&clpc->ane_qos);
+	clpc->ane_qos_khz = 0;
+	return NOTIFY_OK;
 }
 
 /* The first CPU of /cpus/cpu-map/cluster@index, or -ENODEV. */
@@ -1067,13 +1096,21 @@ static int apple_clpc_probe(struct platform_device *pdev)
 			clpc->ane_states[rail] = clpc->hw->ane[rail];
 	}
 	clpc->ane_cpu = -ENODEV;
-	if (clpc->ane && clpc->hw->ane_cluster_khz) {
+	clpc->ane_until = jiffies;
+	if (clpc->ane && clpc->hw->ane_cluster_khz &&
+	    of_machine_is_compatible(clpc->hw->ane_cluster_machine)) {
 		clpc->ane_cpu = apple_clpc_cluster_cpu(clpc->hw->ane_cluster);
-		if (clpc->ane_cpu >= 0)
-			clpc->ane_cluster_khz = clpc->hw->ane_cluster_khz;
-		else
-			dev_warn(dev, "no CPU in cpu-map cluster%u: no ANE cluster floor\n",
-				 clpc->hw->ane_cluster);
+		if (clpc->ane_cpu >= 0) {
+			clpc->policy_nb.notifier_call = apple_clpc_policy_notify;
+			if (!cpufreq_register_notifier(&clpc->policy_nb,
+						       CPUFREQ_POLICY_NOTIFIER)) {
+				clpc->policy_nb_added = true;
+				clpc->ane_cluster_khz = clpc->hw->ane_cluster_khz;
+			}
+		}
+		if (!clpc->ane_cluster_khz)
+			dev_dbg(dev, "no ANE cluster floor (cpu-map cluster%u)\n",
+				clpc->hw->ane_cluster);
 	}
 	/* The property is optional: without it, CPU demand alone sets the floors. */
 	if (clpc->hw->gpu_demand)
@@ -1295,6 +1332,7 @@ static const struct apple_clpc_hw apple_clpc_hw_t6040 = {
 	.ane = { [APPLE_CLPC_DCS] = 5, [APPLE_CLPC_SOC] = 2 },
 	.ane_cluster = 2,
 	.ane_cluster_khz = 3756000,
+	.ane_cluster_machine = "apple,t6040",
 };
 
 /*
