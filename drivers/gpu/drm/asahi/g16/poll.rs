@@ -68,6 +68,10 @@ fn stats_show(shared: &Arc<Shared>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 impl Shared {
     /// One poll pass (the poll work item).
     pub(crate) fn run_poll(self: Arc<Self>) {
+        // The domain may be off. The sleep's end queues a pass.
+        if self.sleeping.load(Ordering::Acquire) {
+            return;
+        }
         let signalling = kernel::dma_fence::SignallingGuard::new();
         let mut done = Completions::new();
         {
