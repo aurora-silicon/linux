@@ -478,11 +478,17 @@ static void ave_6070_channels(struct kunit *test)
 	ave->ipc_fw_base = 0x100000000ULL;
 	ave->channel_bytes = hello[1];
 	KUNIT_EXPECT_EQ(test, ave_ipc_check_hello(t, hello), 0);
-	for (unsigned int word = 0; word < 4; word++) {
+	for (unsigned int word = 0; word < 3; word++) {
 		hello[word]++;
 		KUNIT_EXPECT_EQ(test, ave_ipc_check_hello(t, hello), -EPROTO);
 		hello[word]--;
 	}
+	/* The T6000 firmware asks for a 768 KiB heap in the last word. */
+	hello[3] = 0xc0000;
+	KUNIT_EXPECT_EQ(test, ave_ipc_check_hello(t, hello), 0);
+	hello[3] = 4 * SZ_1M + 1;
+	KUNIT_EXPECT_EQ(test, ave_ipc_check_hello(t, hello), -EPROTO);
+	hello[3] = 0;
 	for (unsigned int i = 0; i < 7; i++) {
 		int id = i == 1 ? 0 : 1;
 		bool io = i == 1 || i == 5;

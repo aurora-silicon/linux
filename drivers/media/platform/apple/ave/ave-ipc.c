@@ -159,7 +159,8 @@ int ave_ipc_check_hello(const struct ave_fw_transport *t, const u32 hello[4])
 		return -EPROTO;
 	if (t->boot_config)
 		return !hello[3] || hello[3] > 4 * SZ_1M ? -EPROTO : 0;
-	return hello[1] != t->hello[1] || hello[3] != t->hello[3] ? -EPROTO : 0;
+	/* The 6070 firmware may ask for a heap too (0xc0000 on T6000). */
+	return hello[1] != t->hello[1] || hello[3] > 4 * SZ_1M ? -EPROTO : 0;
 }
 
 static int ave_iop_time_us(struct ave_dev *ave, u64 *us)
@@ -193,7 +194,7 @@ int ave_ipc_negotiate(struct ave_dev *ave, const u32 hello[4])
 			hello[1], hello[2], hello[3]);
 	ave->channel_bytes = hello[1];
 
-	if (t->boot_config) {
+	if (hello[3]) {
 		if (ave->heap.cpu && ave->heap.size != PAGE_ALIGN(hello[3]))
 			return -EPROTO;
 		if (!ave->heap.cpu) {
@@ -234,6 +235,8 @@ int ave_ipc_negotiate(struct ave_dev *ave, const u32 hello[4])
 				   hs + AVE_HS_SHARED);
 		put_unaligned_le32(AVE_IPC_SHARED_BYTES,
 				   hs + AVE_HS_SHARED_BYTES);
+	}
+	if (hello[3]) {
 		put_unaligned_le64(ave->heap.dma, hs + AVE_HS_HEAP);
 		put_unaligned_le32(hello[3], hs + AVE_HS_HEAP_BYTES);
 	}
