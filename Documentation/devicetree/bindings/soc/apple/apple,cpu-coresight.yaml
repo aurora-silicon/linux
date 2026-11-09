@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,cpu-coresight.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple CPU core CoreSight register window
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  Each CPU core of Apple SoCs has a memory-mapped debug window made of
+  64 KiB slots: the Arm external debug registers, the cross-trigger
+  interface, the performance monitor and, in the fourth slot, a debug
+  wrapper register that controls halting the core. One node describes the
+  window of one core.
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t6000-cpu-coresight
+          - apple,t8112-cpu-coresight
+          - apple,t8140-cpu-coresight
+      - const: apple,cpu-coresight
+
+  reg:
+    maxItems: 1
+    description: The external debug slot up to and including the debug
+      wrapper registers.
+
+  cpu:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: The CPU core this window belongs to.
+
+required:
+  - compatible
+  - reg
+  - cpu
+
+additionalProperties: false
+
+examples:
+  - |
+    cpus {
+        #address-cells = <2>;
+        #size-cells = <0>;
+
+        cpu_e0: cpu@0 {
+            compatible = "apple,blizzard";
+            device_type = "cpu";
+            reg = <0x0 0x0>;
+        };
+    };
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        cpu-debug@210010000 {
+            compatible = "apple,t8112-cpu-coresight", "apple,cpu-coresight";
+            reg = <0x2 0x10010000 0x0 0x300c8>;
+            cpu = <&cpu_e0>;
+        };
+    };
+...
