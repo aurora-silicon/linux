@@ -34,6 +34,7 @@
 
 #define TBNET_RING_SIZE		256
 #define TBNET_LOGIN_RETRIES	60
+#define TBNET_CONNECT_RETRIES	3
 #define TBNET_LOGOUT_RETRIES	10
 #define TBNET_THROTTLING	128000
 #define TBNET_E2E		BIT(0)
@@ -187,6 +188,8 @@ struct tbnet_login_rx {
  * @connection_lock: Lock serializing login state, connection setup,
  *		     teardown and NAPI enable state.
  * @login_retries: Number of login retries currently done
+ * @connect_retries: Number of new logins started after the DMA paths
+ *		     could not be enabled
  * @login_work: Worker to send ThunderboltIP login packets
  * @login_rx_lock: Protects @login_rx
  * @login_rx: Latest remote login request that has not been answered yet
@@ -223,6 +226,7 @@ struct tbnet {
 	int remote_transmit_path;
 	struct mutex connection_lock;
 	int login_retries;
+	int connect_retries;
 	struct delayed_work login_work;
 	spinlock_t login_rx_lock;
 	struct tbnet_login_rx login_rx;
@@ -347,6 +351,7 @@ static void start_login(struct tbnet *net)
 	mutex_lock(&net->connection_lock);
 	net->login_sent = false;
 	net->login_received = false;
+	net->connect_retries = 0;
 	mutex_unlock(&net->connection_lock);
 
 	queue_delayed_work(system_long_wq, &net->login_work,
@@ -361,6 +366,8 @@ static void stop_login(struct tbnet *net)
 	spin_unlock(&net->login_rx_lock);
 	cancel_delayed_work_sync(&net->login_work);
 	cancel_work_sync(&net->connected_work);
+	/* A failed connection attempt may have started another login */
+	cancel_delayed_work_sync(&net->login_work);
 
 	netdev_dbg(net->dev, "login stopped\n");
 }
@@ -679,6 +686,21 @@ static void tbnet_connect_failed_locked(struct tbnet *net)
 	/* Leave login_received set: only the peer can make it true again. */
 	lockdep_assert_held(&net->connection_lock);
 	net->login_sent = false;
+
+	/*
+	 * The remote end may already consider the connection up and then
+	 * never logs in again, so nothing would retry. Start a new login
+	 * after a delay, a few times.
+	 */
+	if (netif_running(net->dev) &&
+	    net->connect_retries < TBNET_CONNECT_RETRIES) {
+		net->connect_retries++;
+		netdev_dbg(net->dev, "connection failed, new login in %u ms (%d/%d)\n",
+			   TBNET_LOGIN_DELAY, net->connect_retries,
+			   TBNET_CONNECT_RETRIES);
+		queue_delayed_work(system_long_wq, &net->login_work,
+				   msecs_to_jiffies(TBNET_LOGIN_DELAY));
+	}
 }
 
 static void tbnet_connected_work(struct work_struct *work)
@@ -738,6 +760,7 @@ static void tbnet_connected_work(struct work_struct *work)
 		goto err_stop_rings;
 	}
 
+	net->connect_retries = 0;
 	netif_carrier_on(net->dev);
 	netif_start_queue(net->dev);
 
