@@ -256,8 +256,10 @@ int ave_ipc_negotiate(struct ave_dev *ave, const u32 hello[4])
 	ave_mbox_send(ave, lower_32_bits(ave->ipc.dma),
 		      upper_32_bits(ave->ipc.dma), ave->ipc.size, 0);
 	ret = ave_mbox_recv(ave, reply);
-	if (ret)
+	if (ret) {
+		dev_err(ave->dev, "no answer to the IPC window: %d\n", ret);
 		return ret;
+	}
 	ave->ipc_fw_base = (u64)reply[1] << 32 | reply[0];
 	if (!ave->ipc_fw_base || !IS_ALIGNED(ave->ipc_fw_base, SZ_16K) ||
 	    ave->ipc_fw_base > U64_MAX - ave->ipc.size)
@@ -286,8 +288,10 @@ int ave_ipc_negotiate(struct ave_dev *ave, const u32 hello[4])
 		      upper_32_bits(ave->ipc_fw_base + AVE_IPC_HANDSHAKE_OFF),
 		      0, 0);
 	ret = ave_mbox_recv(ave, reply);
-	if (ret)
+	if (ret) {
+		dev_err(ave->dev, "no answer to the handshake block: %d\n", ret);
 		return ret;
+	}
 	if (ave_fw_offset(ave, (u64)reply[1] << 32 | reply[0],
 			  ave->channel_bytes, &off) ||
 	    off != AVE_IPC_CHANNEL_OFF ||
@@ -301,7 +305,10 @@ int ave_ipc_negotiate(struct ave_dev *ave, const u32 hello[4])
 	memset(ave->smalloc, 0, sizeof(ave->smalloc));
 
 	writel(AVE_BOOT_MAGIC, ave->mbox + AVE_MBOX_READY);
-	return ave_ipc_wait_ready(ave);
+	ret = ave_ipc_wait_ready(ave);
+	if (ret)
+		dev_err(ave->dev, "firmware did not take the channels: %d\n", ret);
+	return ret;
 }
 
 static int ave_ring_send(struct ave_dev *ave, struct ave_ring *r, u64 addr, u32 len)
