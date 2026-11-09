@@ -162,6 +162,9 @@ ASAHI_TESTS = {
                                    'offset-sign', 'event-bit', 'wrong-control',
                                    'maverick-event', 'stowe-offset'), out()),
     'qspi-nvram-tests.py': [(out('--output'), PASS)],
+    'rtkit-crashlog-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('buffer-header', 'section-header', 'section-size', 'footer-room',
+                                   'mailbox-minimum', 'version-string', 'message-string'), out()),
     'rtkit-oslog-tests.py': [(out(), PASS)]
         + mutations('--mutate', ('admission', 'channel', 'counter', 'reset', 'buffer'), out()),
     'rtkit-retained-tests.py': [(out(), PASS)],
