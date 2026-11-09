@@ -397,6 +397,7 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd,
 {
 	bool hevc = p->codec == AVE_CODEC_HEVC;
 	bool cq = p->rc_mode == 3;
+	u32 rc_mode;
 	u32 depth = p->bit_depth ?: 8;
 	u32 crop_r = (p->cw - p->width) / 2, crop_b = (p->ch - p->height) / 2;
 	bool crop = crop_r || crop_b;
@@ -423,7 +424,13 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd,
 	}
 
 	/* Rate control */
-	ave_start_put32(cmd, l->rc_mode, p->rc_mode);
+	/*
+	 * Constant QP is mode 3 on 9003 and mode 2 on 6070. With 3 the 6070
+	 * firmware accepts Start but has no rate control for the session and
+	 * stops on the first Process.
+	 */
+	rc_mode = cq && l->rc_mode_fixed_qp ? l->rc_mode_fixed_qp : p->rc_mode;
+	ave_start_put32(cmd, l->rc_mode, rc_mode);
 	ave_start_put32(cmd, l->bitrate, p->bitrate);
 	for (unsigned int i = 0; i < (unsigned int)(l->init_qp_words ?: 3); i++)
 		ave_put32(cmd, (l->init_qp + 4 * i),
@@ -662,6 +669,8 @@ int ave_build_process(struct ave_ctx *ctx, u8 *cmd, size_t len,
 	/* This frame */
 	if (l->first_frame)
 		ave_put32(cmd, l->first_frame, sess->frames == 0);
+	if (l->first_process)
+		cmd[l->first_process] = sess->frames == 0;
 	ave_put32(cmd, l->slot, slot);
 	ave_put64(cmd, l->coded, s->coded.dma);
 	ave_put64(cmd, l->meta, s->meta.dma);

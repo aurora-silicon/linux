@@ -522,7 +522,8 @@ static void ave_6070_start_process_fields(struct kunit *test)
 			KUNIT_EXPECT_EQ(test,
 					get_unaligned_le32(start + sl->fps.numerator), 30U);
 			KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->rc_mode),
-					3U);
+					sl->rc_mode_fixed_qp);
+			KUNIT_EXPECT_EQ(test, sl->rc_mode_fixed_qp, 2U);
 			KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->bitrate),
 					4000000U);
 			KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->init_qp),
@@ -587,6 +588,7 @@ static void ave_6070_start_process_fields(struct kunit *test)
 					3360000ULL);
 			KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + pl->force_key),
 					1U);
+			KUNIT_EXPECT_EQ(test, process[pl->first_process], 0U);
 			if (codec == AVE_CODEC_H264) {
 				KUNIT_EXPECT_EQ(test,
 						get_unaligned_le64(process + pl->frame_buf),
@@ -603,6 +605,17 @@ static void ave_6070_start_process_fields(struct kunit *test)
 				KUNIT_EXPECT_EQ(test, process[0x6524],
 						sess->codec_state[0x5570]);
 			}
+
+			/* 6070 carries a byte flag on the first Process after Start. */
+			sess->frames = 0;
+			memset(process, 0, 0x6838);
+			KUNIT_ASSERT_EQ(test,
+					ave_build_process(ctx, process, process_len, 0,
+							  0x8f0000000ULL, 4000000, false),
+					0);
+			KUNIT_EXPECT_EQ(test, process[pl->first_process], 1U);
+			KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + pl->ordinal), 0U);
+			KUNIT_EXPECT_EQ(test, get_unaligned_le64(process + pl->pts), 0ULL);
 		}
 }
 

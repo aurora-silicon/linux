@@ -126,6 +126,8 @@ struct ave_start_layout {
 	u32 const_218;
 	struct ave_rational_layout fps;
 	u32 rc_mode;
+	/* Optional ABI-specific wire value for the driver's fixed-QP mode. */
+	u32 rc_mode_fixed_qp;
 	u32 bitrate;
 	u32 init_qp;
 	u8 init_qp_words; /* zero preserves the older three-word representation */
@@ -206,6 +208,7 @@ struct ave_start_layout {
 struct ave_proc_layout {
 	u32 pic_size;
 	u32 first_frame;
+	u32 first_process; /* u8: first Process command since Start */
 	u32 y, uv; /* ABI-specific plane entry; 6070 is {address, stride, zero} */
 	u32 in_w, in_h;
 	u32 coded_cap;
