@@ -80,16 +80,20 @@ config APPLE_CLUSTER_PWRGATE
 	  clock-gates in WFI.
 
 config APPLE_SOC_SLEEP
-	bool "Apple T8140 system sleep at EL2"
+	bool "Apple SoC system sleep at EL2"
 	default APPLE_T8140_SLEEP
 	depends on ARM64 && (ARCH_APPLE || COMPILE_TEST)
 	depends on HOTPLUG_CPU && SUSPEND
 	select APPLE_TUNABLE
 	help
 	  Powers the secondary CPUs off and suspends the system to RAM on an
-	  Apple T8140 whose kernel runs directly at EL2, with no monitor to ask.
+	  Apple SoC whose kernel runs directly at EL2, with no monitor to ask.
 	  It does nothing unless the boot object asks for it through
 	  /chosen/aurora,s2r-mailbox.
+
+	  Only SoCs whose sleep has been measured and tested are supported,
+	  each by its match data: today T8140. On every other SoC the driver
+	  doesn't bind, and s2idle stays the only system sleep.
 
 config APPLE_RTKIT
 	tristate "Apple RTKit co-processor IPC protocol"
