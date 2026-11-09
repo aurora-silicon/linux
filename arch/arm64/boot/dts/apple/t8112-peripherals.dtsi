@@ -180,7 +180,6 @@
 			<AIC_IRQ 735 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&m2_dart_scaler 0>, <&m2_dart_scaler 1>;
 		power-domains = <&ps_msr>, <&ps_msr_ase_core>;
-		status = "disabled";
 	};
 
 	m2_dart_scaler: iommu@263200000 {
@@ -190,7 +189,6 @@
 		interrupts = <AIC_IRQ 734 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_msr>;
 		#iommu-cells = <1>;
-		status = "disabled";
 	};
 
 	m2_jpeg0: jpeg@265000000 {
