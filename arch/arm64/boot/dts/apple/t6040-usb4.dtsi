@@ -537,7 +537,7 @@
 		status = "disabled";
 
 		cio_reset: reset-controller@2024 {
-			compatible = "apple,t6041-cio-reset", "apple,t6000-cio-reset";
+			compatible = "apple,t6041-cio-reset";
 			reg = <0x2024 0x4>;
 			#reset-cells = <1>;
 		};
