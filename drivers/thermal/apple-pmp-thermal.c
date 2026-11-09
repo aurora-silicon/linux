@@ -39,13 +39,6 @@
  */
 #define APPLE_PMP_HYST_MC		2000
 #define APPLE_PMP_POLL_MS		5
-/*
- * The firmware publishes a die sensor only while its cluster has power, so an idle
- * machine can have none valid for a moment (0.46 s the longest measured). Go on from the
- * last reading for this long, if it was this cool. Longer or hotter is a failed sensor.
- */
-#define APPLE_PMP_GATED_HOLD_NS	2000000000ULL
-#define APPLE_PMP_GATED_HOLD_MC	90000
 #define APPLE_PMP_GOVERNOR_NS	100000000ULL
 
 struct apple_pmp_cluster {

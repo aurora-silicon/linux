@@ -41,11 +41,14 @@ struct asahi_g16_cooling {
 	struct device_node *pmp_node;
 	struct apple_pmp_cooling policy;
 	struct thermal_cooling_device *cdev;
+	/* The last reading from a sensor that was valid, and when. */
+	u64 valid_ns;
+	long valid_mc;
 };
 
 struct asahi_g16_cooling *asahi_g16_cooling_register(struct device *dev);
 void asahi_g16_cooling_unregister(struct asahi_g16_cooling *cooling);
-int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now,
+int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now, bool idle,
 			    long *temperature, u32 *governor, u32 *power,
 			    u32 *backstop);
 int asahi_g16_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu **out);
@@ -131,8 +134,10 @@ void asahi_g16_cooling_unregister(struct asahi_g16_cooling *cooling)
 
 /* Serialized by the GPU owner. Provider lifetime and MMIO access stay with
  * PMP: this consumer owns no SRAM mapping and cannot restart its firmware.
+ * An idle GPU samples about twice a second and makes no heat, so with nothing
+ * in flight the last cool reading stands for as long as the sensors stay dark.
  */
-int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now,
+int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now, bool idle,
 			    long *temperature, u32 *governor, u32 *power,
 			    u32 *backstop)
 {
@@ -140,6 +145,18 @@ int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now,
 
 	*temperature = 0;
 	ret = apple_pmp_telemetry_get_hotspot(cooling->pmp_node, temperature);
+	if (!ret) {
+		cooling->valid_ns = now;
+		cooling->valid_mc = *temperature;
+	} else if (ret == -ENODATA && cooling->valid_ns &&
+		   (idle || now - cooling->valid_ns < APPLE_PMP_GATED_HOLD_NS) &&
+		   cooling->valid_mc < APPLE_PMP_GATED_HOLD_MC) {
+		*temperature = cooling->valid_mc;
+		/* Idle makes no heat: the 2 s with work in flight start with the work. */
+		if (idle)
+			cooling->valid_ns = now;
+		ret = 0;
+	}
 	apple_pmp_cooling_sample(&cooling->policy, now, *temperature, ret);
 	*governor = atomic_read(&cooling->state);
 	*power = apple_pmp_gpu_power_state(cooling->pmp);
