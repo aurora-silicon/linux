@@ -682,7 +682,18 @@ static struct apple_dart *apple_dart_test_sleeping(struct kunit *test)
 static void apple_dart_test_resume_retained(struct kunit *test)
 {
 	struct apple_dart *dart = apple_dart_test_sleeping(test);
+	struct apple_tunable *tunable;
 	u32 enable = dart->hw->enable_streams;
+
+	tunable = kunit_kzalloc(test, struct_size(tunable, values, 1),
+				GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, tunable);
+	tunable->sz = 1;
+	tunable->values[0].offset = 0x60;
+	tunable->values[0].mask = 0xff;
+	tunable->values[0].value = 0x42;
+	dart->tunables = tunable;
+	writel(0x77, dart->regs + 0x60);
 
 	/* The domain stayed on and a consumer may still be doing DMA: no reset. */
 	writel(0, dart->regs + enable);
@@ -691,15 +702,27 @@ static void apple_dart_test_resume_retained(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TCR(dart, 2)), 0x82U);
 	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TTBR(dart, 2, 0)),
 			dart->hw->ttbr_valid | 0x1000);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + 0x60), 0x77U);
 }
 
 static void apple_dart_test_resume_lost(struct kunit *test)
 {
 	struct apple_dart *dart = apple_dart_test_sleeping(test);
+	struct apple_tunable *tunable;
 
-	/* Power was cut: reset and restore the saved translations. */
+	tunable = kunit_kzalloc(test, struct_size(tunable, values, 1),
+				GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, tunable);
+	tunable->sz = 1;
+	tunable->values[0].offset = 0x60;
+	tunable->values[0].mask = 0xff;
+	tunable->values[0].value = 0x42;
+	dart->tunables = tunable;
+
+	/* Power was cut: reapply tunables, reset, and restore translations. */
 	memset_io(dart->regs, 0, APPLE_DART_TEST_REGS_SIZE);
 	KUNIT_EXPECT_EQ(test, apple_dart_resume(dart->dev), 0);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + 0x60), 0x42U);
 	KUNIT_EXPECT_EQ(test, readl(dart->regs + dart->hw->enable_streams), U32_MAX);
 	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TCR(dart, 2)), 0x82U);
 	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TTBR(dart, 2, 0)),

@@ -4304,24 +4304,16 @@ static int apple_dart_probe(struct platform_device *pdev)
 		dev_err(dev, "MMIO region too small (%pr)\n", res);
 		return -EINVAL;
 	}
-	if (tunneled) {
-		dart->tunables = devm_apple_tunable_parse(dev, dev->of_node,
-							  "apple,tunable", res);
-		if (IS_ERR(dart->tunables)) {
-			/*
-			 * T8110 publishes tunables and the driver requires them.
-			 * A t8103 PCIe-C DART may omit them. Its values include
-			 * the configuration lock, which has to be written after
-			 * the translation context is programmed, so leave them
-			 * off until that ordering exists.
-			 */
-			if (PTR_ERR(dart->tunables) == -ENOENT &&
-			    dart->hw->type != DART_T8110) {
-				dart->tunables = NULL;
-			} else {
-				return dev_err_probe(dev, PTR_ERR(dart->tunables),
-						     "failed to parse PCIe-C DART tunables\n");
-			}
+	dart->tunables = devm_apple_tunable_parse(dev, dev->of_node,
+						  "apple,tunable", res);
+	if (IS_ERR(dart->tunables)) {
+		/* T8110 PCIe-C publishes a table, including an explicit empty one. */
+		if (PTR_ERR(dart->tunables) == -ENOENT &&
+		    (!tunneled || dart->hw->type != DART_T8110)) {
+			dart->tunables = NULL;
+		} else {
+			return dev_err_probe(dev, PTR_ERR(dart->tunables),
+					     "failed to parse DART tunables\n");
 		}
 	}
 
@@ -4368,7 +4360,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_clk_disable;
 	if (tunneled && dart->tunables) {
-		dev_dbg(dev, "applying %zu PCIe-C DART tunables\n",
+		dev_dbg(dev, "applying %zu DART tunables\n",
 			dart->tunables->sz);
 		apple_dart_apply_tunables(dart);
 	}
@@ -4653,6 +4645,8 @@ params_done:
 		/* ENABLE is write-one-to-set; no foreign stream changes state. */
 		apple_dart_writel(dart, dart->managed_sids, dart->hw->enable_streams);
 	} else if (!dart->locked && !dart->retained_mtp && !dart->preserve_display) {
+		if (dart->tunables)
+			apple_dart_apply_tunables(dart);
 		ret = apple_dart_hw_reset(dart);
 		if (ret)
 			goto err_clk_disable;
@@ -5226,6 +5220,8 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 		return ret;
 	}
 
+	if (dart->tunables)
+		apple_dart_apply_tunables(dart);
 	ret = apple_dart_hw_reset(dart);
 
 	/*
