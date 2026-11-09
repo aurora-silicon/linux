@@ -2286,8 +2286,10 @@
 
 	pmp0_dart: iommu@2841a0000 {
 		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		/* ADT dart-pmp0 instance: DART, then DAPF */
 		reg = <0x2 0x841a0000 0x0 0xc000>,
 		      <0x2 0x841b0000 0x0 0x4000>;
+		reg-names = "dart", "dapf";
 		interrupts = <AIC_IRQ 0 371 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		/* ADT dart-pmp0 vm-base, vm-size */
