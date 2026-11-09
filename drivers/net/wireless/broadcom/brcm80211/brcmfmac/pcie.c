@@ -944,6 +944,15 @@ brcmf_pcie_send_mb_data(struct brcmf_pciedev_info *devinfo, u32 htod_mb_data)
 	}
 
 	brcmf_pcie_write_tcm32(devinfo, addr, htod_mb_data);
+	if (devinfo->inband_ds) {
+		/* The config-space mailbox cannot wake a sleeping dongle.  The
+		 * in-band DS protocol keeps its data in TCM, but signals it through
+		 * the enumeration-core DB1 register (not the DAR DB1 register).
+		 */
+		brcmf_pcie_write_pcie32(devinfo, BRCMF_PCIE_PCIE2REG_H2D_MAILBOX_1, 1);
+		return 0;
+	}
+
 	pci_write_config_dword(devinfo->pdev, BRCMF_PCIE_REG_SBMBX, 1);
 
 	/* Send mailbox interrupt twice as a hardware workaround */
@@ -2987,7 +2996,9 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 fail:
 	brcmf_err(bus, "Dongle setup failed\n");
 	brcmf_pcie_bus_console_read(devinfo, true);
-	brcmf_fw_crashed(dev);
+	/* Setup is already unwinding the driver.  Do not queue a reset which
+	 * device_release_driver() would immediately have to cancel.
+	 */
 	device_release_driver(dev);
 }
 

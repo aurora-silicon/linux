@@ -67,6 +67,8 @@ struct brcmf_pciedev_info {
 };
 static struct brcmf_pciedev_info *wait_dev;
 static bool deliver_exit;
+static bool mailbox_db1;
+static bool fw_asleep;
 static u32 sent[32];
 static unsigned sent_count, crashes;
 static u32 fail_message;
@@ -76,7 +78,11 @@ static void wait_step(void) {
 }
 #define wait_event_timeout(q,c,t) (wait_step(), (c) ? 1L : 0L)
 static int brcmf_pcie_send_mb_data(struct brcmf_pciedev_info *d, u32 data) {
- (void)d; sent[sent_count++]=data; return data == fail_message ? -EIO : 0;
+ (void)d;sent[sent_count++]=data;
+ if (data==BRCMF_H2D_HOST_DS_ACK) fw_asleep=true;
+ if (data==BRCMF_H2D_DEVICE_WAKE_ASSERT && fw_asleep && mailbox_db1)
+  deliver_exit=true;
+ return data == fail_message ? -EIO : 0;
 }
 static void brcmf_fw_crashed(struct device *d) {(void)d;crashes++;}
 '''
@@ -86,11 +92,13 @@ MAIN = r'''
 static void reset(struct brcmf_pciedev_info *d, struct pci_dev *p, bool capable) {
  memset(d,0,sizeof(*d));memset(p,0,sizeof(*p));memset(sent,0,sizeof(sent));
  d->pdev=p;d->inband_ds=capable;d->ds_state=BRCMF_PCIE_DS_ACTIVE;
- wait_dev=d;deliver_exit=false;sent_count=crashes=0;fail_message=0xffffffff;
+ wait_dev=d;deliver_exit=false;mailbox_db1=SOURCE_MAILBOX_DB1;fw_asleep=false;
+ sent_count=crashes=0;fail_message=0xffffffff;
 }
 int main(void) {
  struct brcmf_pciedev_info d;struct pci_dev p;unsigned cases=0;
- assert(SOURCE_RING_FENCE);assert(SOURCE_D3_ORDER);cases+=2;
+ assert(SOURCE_RING_FENCE);assert(SOURCE_D3_ORDER);
+ assert(SOURCE_SETUP_ERROR_SAFE);cases+=3;
 
  reset(&d,&p,false);d.inband_ds=d.skip_ds_ack=true;d.host_active=3;
  d.ds_state=BRCMF_PCIE_DS_ERROR;
@@ -111,13 +119,19 @@ int main(void) {
  assert(d.ds_state==BRCMF_PCIE_DS_SLEEP && !d.host_active &&
         sent_count==1 && sent[0]==BRCMF_H2D_HOST_DS_ACK);cases++;
 
- reset(&d,&p,true);d.ds_state=BRCMF_PCIE_DS_SLEEP;deliver_exit=true;
+ /* Model the observed attach failure: firmware accepts DS_ACK and then only
+  * consumes DEVICE_WAKE_ASSERT when its TCM mailbox is notified through DB1.
+  */
+ reset(&d,&p,true);
+ brcmf_pcie_handle_mb_data(&d,BRCMF_D2H_DEV_DS_ENTER_REQ);
+ assert(d.ds_state==BRCMF_PCIE_DS_SLEEP && fw_asleep && sent_count==1 &&
+        sent[0]==BRCMF_H2D_HOST_DS_ACK);
  assert(!brcmf_pcie_ds_begin(&d));
  assert(d.ds_state==BRCMF_PCIE_DS_AWAKE && d.host_active==1 &&
-        sent_count==1 && sent[0]==BRCMF_H2D_DEVICE_WAKE_ASSERT);
+        sent_count==2 && sent[1]==BRCMF_H2D_DEVICE_WAKE_ASSERT);
  brcmf_pcie_ds_end(&d);
  assert(d.ds_state==BRCMF_PCIE_DS_ACTIVE && !d.host_active &&
-        sent_count==2 && sent[1]==BRCMF_H2D_DEVICE_WAKE_DEASSERT);cases++;
+        sent_count==3 && sent[2]==BRCMF_H2D_DEVICE_WAKE_DEASSERT);cases++;
 
  reset(&d,&p,true);d.ds_state=BRCMF_PCIE_DS_SLEEP;
  assert(brcmf_pcie_ds_begin(&d)==-ETIMEDOUT);
@@ -181,6 +195,12 @@ def mutate(source, msgbuf, name):
     elif name == 'd3-order':
         source = source.replace('ret = brcmf_pcie_ds_prepare_suspend(devinfo);',
                                 'ret = 0;', 1)
+    elif name == 'mailbox-db1':
+        source = source.replace('BRCMF_PCIE_PCIE2REG_H2D_MAILBOX_1, 1);',
+                                'BRCMF_PCIE_REG_SBMBX, 1);', 1)
+    elif name == 'setup-error-reset':
+        source = source.replace('\tdevice_release_driver(dev);',
+                                '\tbrcmf_fw_crashed(dev);\n\tdevice_release_driver(dev);', 1)
     return source, msgbuf
 
 
@@ -189,7 +209,8 @@ def main():
     parser.add_argument('--out', type=Path)
     parser.add_argument('--mutation', choices=('capability-gate', 'early-ack', 'exit-note',
                                                'wake-timeout', 'd3-race', 'unwind',
-                                               'ring-fence', 'd3-order'))
+                                               'ring-fence', 'd3-order', 'mailbox-db1',
+                                               'setup-error-reset'))
     args = parser.parse_args()
     source = (DRIVER / 'pcie.c').read_text()
     msgbuf = (DRIVER / 'msgbuf.c').read_text()
@@ -210,6 +231,15 @@ def main():
              'brcmf_pcie_handle_mb_data')
     body = ''.join(function(source, name) for name in names)
 
+    send_mb = function(source, 'brcmf_pcie_send_mb_data')
+    mailbox_db1 = ('brcmf_pcie_write_tcm32' in send_mb and
+                   'BRCMF_PCIE_PCIE2REG_H2D_MAILBOX_1' in send_mb and
+                   send_mb.index('brcmf_pcie_write_tcm32') <
+                   send_mb.index('BRCMF_PCIE_PCIE2REG_H2D_MAILBOX_1'))
+    setup = function(source, 'brcmf_pcie_setup')
+    setup_fail = setup[setup.rindex('\nfail:'):]
+    setup_error_safe = 'brcmf_fw_crashed' not in setup_fail
+
     tx_ioctl = function(msgbuf, 'brcmf_msgbuf_tx_ioctl')
     ring_fence = 'brcmf_commonring_prepare_write' in tx_ioctl
     if ring_fence:
@@ -228,9 +258,11 @@ def main():
                 leave.index('brcmf_pcie_intr_enable') < leave.index('brcmf_pcie_hostready') <
                 leave.index('brcmf_pcie_ds_resume_complete') <
                 leave.index('brcmf_bus_change_state(bus, BRCMF_BUS_UP)'))
-    code = (enum + '\n' + PREFIX + negotiate + body +
+    code = (enum + '\n#define SOURCE_MAILBOX_DB1 ' + str(int(mailbox_db1)) +
+            '\n' + PREFIX + negotiate + body +
             f'\n#define SOURCE_RING_FENCE {int(ring_fence)}\n'
-            f'#define SOURCE_D3_ORDER {int(d3_order)}\n' + MAIN)
+            f'#define SOURCE_D3_ORDER {int(d3_order)}\n'
+            f'#define SOURCE_SETUP_ERROR_SAFE {int(setup_error_safe)}\n' + MAIN)
 
     def run(out):
         out.mkdir(parents=True, exist_ok=True)
