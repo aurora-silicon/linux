@@ -23,7 +23,9 @@ apple_t6050_usb3_pipe_cold_dummy(const struct apple_t6050_usb_io *io)
     if (io->read(io->context, 44, 0x1c) & 1)
         return -1;
     mux = io->read(io->context, 44, 0x0c) & 0x73;
-    if (mux != 0 && mux != 2 && mux != 0x42)
+    /* 0x22: the dummy producer with the older clock-field encoding, as aura's
+     * boot-time USB init leaves every port it touched. Re-encode it below. */
+    if (mux != 0 && mux != 2 && mux != 0x22 && mux != 0x42)
         return -1;
     if (mux == 0x42)
         return 0;
