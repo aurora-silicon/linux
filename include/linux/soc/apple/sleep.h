@@ -43,7 +43,7 @@ void apple_sleep_coproc_unregister(struct device *dev);
 int apple_sleep_coproc_set_last_check(struct device *dev, int (*last_check)(void *data));
 
 /*
- * The enclave's sleep request, which it comes back from only through a real sleep: @tell
+ * The enclave's sleep request, after which it has to be started again: @tell
  * runs with interrupts off as the very last refusal, after every other one and before any
  * coprocessor stops. Nonzero refuses the sleep.
  */

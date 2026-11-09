@@ -869,7 +869,7 @@ static int t8140_sleep_cpus_hold(struct t8140_sleep *s)
 	return ret;
 }
 
-/* Last of all the refusals: an enclave that gated comes back only through a real sleep. */
+/* Last of all the refusals: an enclave that gated has to be started again. */
 static int t8140_sleep_enclave_tell(struct t8140_sleep *s)
 {
 	int ret;

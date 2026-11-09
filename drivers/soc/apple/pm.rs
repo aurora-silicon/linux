@@ -37,6 +37,7 @@ extern "C" {
     fn sep_pm_unregister();
     fn sep_pm_keep_domains(dev: *mut c_void) -> c_int;
     fn sep_pm_wait_gated(dev: *mut c_void, timeout_ms: c_uint) -> c_int;
+    fn sep_pm_wait_off(dev: *mut c_void, timeout_ms: c_uint) -> c_int;
     fn sep_pm_clear_dev_disable(dev: *mut c_void) -> c_int;
     fn sep_pm_dart_prepare(dev: *mut c_void) -> c_int;
     fn sep_pm_dart_restore(dev: *mut c_void);
@@ -92,10 +93,26 @@ impl SleepGate {
     }
 }
 
-/// Whether the enclave gated itself within the bound.
-pub(crate) fn wait_gated(dev: &kernel::device::Device) -> bool {
+/// Whether the enclave gated itself within the bound. Observation errors are preserved.
+pub(crate) fn wait_gated(dev: &kernel::device::Device) -> Result<bool> {
     // SAFETY: `dev` is the bound SEP device.
-    unsafe { sep_pm_wait_gated(dev.as_raw().cast(), GATE_TIMEOUT_MS) == 0 }
+    let rc = unsafe { sep_pm_wait_gated(dev.as_raw().cast(), GATE_TIMEOUT_MS) };
+    match rc {
+        0 => Ok(true),
+        1 => Ok(false),
+        _ => Err(Error::from_errno(rc)),
+    }
+}
+
+/// Whether the gated enclave's domain also went off within the bound.
+pub(crate) fn wait_off(dev: &kernel::device::Device) -> Result<bool> {
+    // SAFETY: `dev` is the bound SEP device.
+    let rc = unsafe { sep_pm_wait_off(dev.as_raw().cast(), GATE_TIMEOUT_MS) };
+    match rc {
+        0 => Ok(true),
+        1 => Ok(false),
+        _ => Err(Error::from_errno(rc)),
+    }
 }
 
 /// Saves the enclave's DART while it can be read, before the enclave is told.
@@ -110,14 +127,14 @@ pub(crate) fn dart_prepare(dev: &kernel::device::Device) -> Result<()> {
 
 /// Leaves `request` to the sleep driver's last refusal, which sends it with interrupts off
 /// and saves the DART just before. Its answer is the message whose `mask` bits read `reply`.
-/// False where there's no such step, and the request goes now.
+/// `Ok(false)` where there's no such step, and the request goes now.
 pub(crate) fn leave_for_commit(
     dev: &kernel::device::Device,
     mbox: *mut kernel::bindings::apple_mbox,
     request: kernel::soc::apple::mailbox::Message,
     reply: u64,
     mask: u64,
-) -> bool {
+) -> Result<bool> {
     // SAFETY: `dev` is the bound SEP device and `mbox` its mailbox, which outlives the sleep:
     // `commit_finish` takes the request back at the resume.
     let rc = unsafe {
@@ -130,7 +147,15 @@ pub(crate) fn leave_for_commit(
             mask,
         )
     };
-    rc == 0
+    if rc == 0 {
+        Ok(true)
+    } else {
+        let err = Error::from_errno(rc);
+        match err {
+            EOPNOTSUPP | ENOSYS => Ok(false),
+            _ => Err(err),
+        }
+    }
 }
 
 /// After a sleep whose request was left to its last refusal: whether it went out. `None` if
