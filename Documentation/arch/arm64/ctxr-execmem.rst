@@ -80,11 +80,16 @@ How it works
 * If the window's pool is exhausted the allocation fails, exactly as a hardware
   CTXR fault would prevent executing from outside the window; there is no buddy
   fallback.
-* Code in the window can't execute at EL1 on a confined core. The boot CPU isn't
-  confined and enters as it always has, through EL1 and ``finalise_el2``. Once it
-  has reserved a window at EL2, it sets a flag that later entries read with the
-  MMU off, and those switch to VHE in ``init_kernel_el`` without running at EL1.
-  With no window, every core enters as it always has.
+* Code in the window can't execute at EL1 on a confined core. On an Apple core
+  with a part number from 0x50 that implements VHE, the boot CPU's first entry
+  switches to VHE in ``init_kernel_el`` without running at EL1, with or without a
+  window: the J616s (T6040) boot CPU doesn't survive the trip through EL1 inside a
+  window, and the kernel can't tell this early whether it is in one. Such a boot
+  CPU stays in VHE whatever ``kvm-arm.mode`` and ``id_aa64mmfr1.vh`` say. Any
+  other boot CPU enters as it always has, through EL1 and ``finalise_el2``. Once
+  the boot CPU has reserved a window at EL2, it sets a flag that later entries
+  read with the MMU off, and those switch to VHE the same way. With no window,
+  later entries go as they always have.
 
 Userspace
 =========
