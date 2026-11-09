@@ -41,7 +41,7 @@ int dcp_fabric_tunnel_request(const struct dcp_fabric_port *ports,
 	const struct dcp_fabric_port *port;
 
 	*found = NULL;
-	if (!key || dpin > 1)
+	if (!key || dpin >= DCP_FABRIC_DPIN_MAX)
 		return -EINVAL;
 	for (port = ports; port; port = port->next) {
 		if (port->key != key)
@@ -292,7 +292,7 @@ EXPORT_SYMBOL_GPL(dcp_fabric_plan);
 int dcp_fabric_tunnel_slot(const struct dcp_fabric_port *port,
 			   unsigned int dpin)
 {
-	const struct dcp_fabric_route *slot = port->owner[dpin];
+	const struct dcp_fabric_route *slot = port->owner[dcp_fabric_dpin_slot(dpin)];
 
 	if (slot)
 		return slot->tunnel && slot->dpin == dpin ? 1 : -EADDRINUSE;
@@ -313,7 +313,7 @@ dcp_fabric_tunnel_candidate(const struct dcp_fabric_port *port,
 	unsigned int best_score = UINT_MAX;
 	bool waiting = false, clock_blocked = false, clock_capable = false;
 
-	if (dpin > 1) {
+	if (dpin >= DCP_FABRIC_DPIN_MAX) {
 		*error = -EINVAL;
 		return NULL;
 	}
@@ -331,7 +331,7 @@ dcp_fabric_tunnel_candidate(const struct dcp_fabric_port *port,
 		    !dcp_fabric_available(pipeline, policy))
 			continue;
 		if (!dcp_fabric_fits(pipeline, policy,
-				     port->candidate_crtcs[dpin],
+				     port->candidate_crtcs[dcp_fabric_dpin_slot(dpin)],
 				     connector_present))
 			continue;
 		if (pipeline->terminal) {
@@ -343,7 +343,8 @@ dcp_fabric_tunnel_candidate(const struct dcp_fabric_port *port,
 			continue;
 		}
 		score = dcp_fabric_score(pipeline, policy);
-		if (policy->dual_stream && !dpin && !pipeline->has_fixed &&
+		if (policy->dual_stream && !dcp_fabric_dpin_slot(dpin) &&
+		    !pipeline->has_fixed &&
 		    score < UINT_MAX - 100)
 			score += 100;
 		if (score < best_score) {
@@ -384,10 +385,10 @@ dcp_fabric_follow(const struct dcp_fabric_route *from,
 		return DCP_FABRIC_FOLLOW_REFUSE;
 	if (from == to)
 		return DCP_FABRIC_FOLLOW_STAY;
-	if ((from->tunnel && (from->dpin > 1 ||
+	if ((from->tunnel && (from->dpin >= DCP_FABRIC_DPIN_MAX ||
 		(to->tunnel_clock_blocked & BIT(from->dpin)))) ||
 	    (holder && holder->tunnel && holder_back &&
-		(holder->dpin > 1 ||
+		(holder->dpin >= DCP_FABRIC_DPIN_MAX ||
 		 (holder_back->tunnel_clock_blocked & BIT(holder->dpin)))))
 		return DCP_FABRIC_FOLLOW_REFUSE;
 	pipeline = to->pipeline;

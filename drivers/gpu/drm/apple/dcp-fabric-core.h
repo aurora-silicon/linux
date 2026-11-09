@@ -5,6 +5,19 @@
 #include <linux/errno.h>
 #include <linux/types.h>
 
+/*
+ * A Thunderbolt DP tunnel enters through one of up to four DP IN adapters of
+ * the port's host router, each behind a crossbar output of its own. A port
+ * carries at most two streams, primary and secondary: DP IN n and n + 2 share
+ * a stream slot.
+ */
+#define DCP_FABRIC_DPIN_MAX	4
+
+static inline unsigned int dcp_fabric_dpin_slot(unsigned int dpin)
+{
+	return dpin & 1;
+}
+
 enum dcp_fabric_presence_state {
 	DCP_FABRIC_ABSENT,
 	DCP_FABRIC_SETTLING,

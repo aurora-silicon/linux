@@ -5104,6 +5104,12 @@ VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release
 	disable_delayed_work_sync(&dcp->hdmi_settle_wq);
 	disable_delayed_work_sync(&dcp->hdmi_recheck_wq);
 	disable_delayed_work_sync(&dcp->link_recovery_wq);
+	disable_work_sync(&dcp->tb_event_work);
+	scoped_guard(mutex, &dcp->tb_event_lock) {
+		dcp->tb_events = 0;
+		dcp->tb_event_route = NULL;
+		dcp->tb_event_generation = 0;
+	}
 	disable_delayed_work_sync(&dcp->hybrid_wq);
 	dcp_hdmi_disable(dcp);
 }
@@ -5119,6 +5125,7 @@ VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
 	enable_delayed_work(&dcp->hdmi_settle_wq);
 	enable_delayed_work(&dcp->hdmi_recheck_wq);
 	enable_delayed_work(&dcp->link_recovery_wq);
+	enable_work(&dcp->tb_event_work);
 	enable_delayed_work(&dcp->hybrid_wq);
 	dcp_hdmi_enable(dcp);
 	scoped_guard(mutex, &dcp->hpd_mutex)
@@ -6089,6 +6096,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&dcp->typec_reconnect_wq,
 			  dcp_typec_reconnect_work);
 	INIT_DELAYED_WORK(&dcp->link_recovery_wq, dcp_link_recovery_work);
+	mutex_init(&dcp->tb_event_lock);
+	INIT_WORK(&dcp->tb_event_work, dcp_tb_event_work);
 	INIT_DELAYED_WORK(&dcp->placeholder_edid_wq,
 			  dcp_placeholder_edid_work);
 	INIT_DELAYED_WORK(&dcp->typec_relink_wq, dcp_typec_relink_work);
@@ -6107,6 +6116,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	disable_delayed_work(&dcp->typec_relink_wq);
 	disable_delayed_work(&dcp->announce_wq);
 	disable_delayed_work(&dcp->link_recovery_wq);
+	disable_work(&dcp->tb_event_work);
 	dcp->announce.stopped = true;
 	/*
 	 * A native external pipe's bind enables these; firmware callbacks may
