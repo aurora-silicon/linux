@@ -42,7 +42,6 @@
 			<AIC_IRQ 242 IRQ_TYPE_LEVEL_HIGH>,
 			<AIC_IRQ 246 IRQ_TYPE_LEVEL_HIGH>,
 			<AIC_IRQ 250 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 	};
 
 	m2_mcc: memory-controller@200100000 {
