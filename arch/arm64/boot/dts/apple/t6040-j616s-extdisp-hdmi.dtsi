@@ -32,8 +32,9 @@
 	};
 };
 
+/* ADT DISPEXT0_SYS parents: FAB2_SOC and the DISPEXT rail (PMP request). */
 &ps_dispext0_sys {
-	power-domains = <&pmp_dispext0>;
+	power-domains = <&ps_fab2_soc>, <&pmp_dispext0>;
 };
 
 &ps_dispext0_cpu {
