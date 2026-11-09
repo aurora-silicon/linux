@@ -544,7 +544,6 @@ static void ane_transport_refusal_test(struct kunit *test)
 {
 	struct ane_transport_test *f = test->priv;
 	u8 *command;
-	int ret;
 
 	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
 	KUNIT_ASSERT_EQ(test, ane_test_publish(f, ANE_FW_IO), 0);
@@ -1506,6 +1505,7 @@ static void ane_transport_execute_spin_test(struct kunit *test)
 {
 	struct ane_transport_test *f = test->priv;
 	u8 *command;
+	int ret;
 
 	command = kunit_kzalloc(test, ANE_H16_EXECUTE_BASE_SIZE, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, command);
