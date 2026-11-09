@@ -115,7 +115,9 @@ int apple_pmp_set_device_constraint(u8 device_id, u8 dcs, u8 soc)
 	u8 old_dcs, old_soc;
 	int ret;
 
-	if ((device_id != 3 && device_id != 4 && device_id != 6) || dcs > 4 || soc > 2)
+	if ((device_id != APPLE_PMP_T8112_EACC0 && device_id != APPLE_PMP_T8112_PACC0 &&
+	     device_id != APPLE_PMP_T8112_ANE0) ||
+	    dcs > APPLE_PMP_T8112_DCS_MAX || soc > APPLE_PMP_T8112_SOC_MAX)
 		return -EINVAL;
 	guard(mutex)(&pmp_lock);
 	if (!pmp_data)
@@ -124,8 +126,17 @@ int apple_pmp_set_device_constraint(u8 device_id, u8 dcs, u8 soc)
 	if (ret)
 		return ret;
 
-	old_dcs = constraint_known & (1U << device_id) ? constraint_dcs[device_id] : 0;
-	old_soc = constraint_known & (1U << device_id) ? constraint_soc[device_id] : 0;
+	/*
+	 * A target starts released. The cache records each acknowledged step,
+	 * so a partial exchange is retried from what the firmware accepted.
+	 */
+	if (!(constraint_known & (1U << device_id))) {
+		constraint_dcs[device_id] = 0;
+		constraint_soc[device_id] = 0;
+		constraint_known |= 1U << device_id;
+	}
+	old_dcs = constraint_dcs[device_id];
+	old_soc = constraint_soc[device_id];
 	if (dcs > old_dcs) {
 		ret = apple_pmp_send_constraint_command(pmp_data, device_id,
 							APPLE_PMP_CONSTRAINT_DCS, dcs);
@@ -147,7 +158,6 @@ int apple_pmp_set_device_constraint(u8 device_id, u8 dcs, u8 soc)
 			return ret;
 		constraint_dcs[device_id] = dcs;
 	}
-	constraint_known |= 1U << device_id;
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_pmp_set_device_constraint);

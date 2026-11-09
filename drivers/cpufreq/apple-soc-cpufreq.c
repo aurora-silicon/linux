@@ -1414,13 +1414,15 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 	}
 	ret = of_parse_phandle_with_fixed_args(cluster, "apple,pmp-memory-vote", 1, 0, &pmp_args);
 	if (!ret) {
-		if (pmp_args.args[0] != 0xa8 && pmp_args.args[0] != 0xa9) {
+		if (pmp_args.args[0] != APPLE_PMP_T8112_DVFS_ENTRY(APPLE_PMP_T8112_EACC0) &&
+		    pmp_args.args[0] != APPLE_PMP_T8112_DVFS_ENTRY(APPLE_PMP_T8112_PACC0)) {
 			ret = -EINVAL;
 			of_node_put(pmp_args.np);
 			goto out_iounmap;
 		}
 		priv->pmp_report = pmp_args.np;
-		priv->pmp_device = pmp_args.args[0] == 0xa8 ? 3 : 4;
+		/* The DT names the cluster by its DVFS entry; commands use the ID. */
+		priv->pmp_device = pmp_args.args[0] - APPLE_PMP_T8112_DVFS_BASE;
 	} else if (ret != -ENOENT) {
 		goto out_iounmap;
 	}

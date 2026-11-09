@@ -4,6 +4,13 @@
 
 pub(crate) const MARKER: u64 = 1 << 53;
 pub(crate) const SHIFT: u32 = 44;
+/// Request fields below the command: target ID, argument (power state or
+/// performance domain) and, for constraints, the requested level.
+pub(crate) const DEVICE_SHIFT: u32 = 40;
+pub(crate) const ARGUMENT_SHIFT: u32 = 32;
+pub(crate) const VALUE_SHIFT: u32 = 16;
+/// Device-constraint request; its reply is the next opcode.
+pub(crate) const DEVICE_CONSTRAINT: u8 = 0x0c;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum Command {
@@ -15,7 +22,7 @@ pub(crate) enum Command {
 
 impl Command {
     pub(crate) fn begin(&mut self, command: u8, reply_payload: u64) -> bool {
-        if *self != Self::Idle || !matches!(command, 0x0c | 0x0e | 0x0f) {
+        if *self != Self::Idle || !matches!(command, DEVICE_CONSTRAINT | 0x0e | 0x0f) {
             return false;
         }
         *self = Self::Pending(MARKER | ((u64::from(command) + 1) << SHIFT) | reply_payload);
@@ -50,8 +57,10 @@ mod tests {
     #[test]
     fn device_constraint_reply_uses_the_same_untagged_sequence() {
         let mut state = Command::Idle;
-        assert!(state.begin(0x0c, 0x0000030200000000));
-        state.reply(0x0020d30200000000);
+        // EACC0 (SOC-device 3), DCS domain (2): the reply echoes both fields.
+        let payload = (3u64 << DEVICE_SHIFT) | (2u64 << ARGUMENT_SHIFT);
+        assert!(state.begin(DEVICE_CONSTRAINT, payload));
+        state.reply(MARKER | ((u64::from(DEVICE_CONSTRAINT) + 1) << SHIFT) | payload);
         assert_eq!(state, Command::Complete);
     }
 

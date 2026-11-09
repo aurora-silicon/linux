@@ -319,7 +319,7 @@ static void ane_t6021_pmp_release_work(struct work_struct *work)
 	struct ane_rtclient *ane = container_of(to_delayed_work(work),
 						 struct ane_rtclient, pmp_release);
 
-	apple_pmp_set_device_constraint(6, 0, 0);
+	apple_pmp_set_device_constraint(APPLE_PMP_T8112_ANE0, 0, 0);
 	WRITE_ONCE(ane->pmp_held, false);
 }
 
@@ -330,7 +330,9 @@ static void ane_t6021_pmp_begin(struct ane_rtclient *ane)
 	if (!ane->pmp_report)
 		return;
 	cancel_delayed_work_sync(&ane->pmp_release);
-	ret = apple_pmp_set_device_constraint(6, 4, 2);
+	ret = apple_pmp_set_device_constraint(APPLE_PMP_T8112_ANE0,
+					      APPLE_PMP_T8112_DCS_MAX,
+					      APPLE_PMP_T8112_SOC_MAX);
 	if (!ret)
 		WRITE_ONCE(ane->pmp_held, true);
 	else
@@ -350,7 +352,7 @@ static void ane_t6021_pmp_cleanup(void *data)
 
 	cancel_delayed_work_sync(&ane->pmp_release);
 	if (ane->pmp_report) {
-		apple_pmp_set_device_constraint(6, 0, 0);
+		apple_pmp_set_device_constraint(APPLE_PMP_T8112_ANE0, 0, 0);
 		of_node_put(ane->pmp_report);
 		ane->pmp_report = NULL;
 	}

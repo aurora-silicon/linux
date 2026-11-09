@@ -74,10 +74,10 @@ const BOOTARGS_SIZE: usize = 0x230;
 const PMP_ENDPOINT: u8 = 0x20;
 const PM_COMMAND_MARKER: u64 = pmp_power::MARKER;
 const PM_COMMAND_SHIFT: u32 = pmp_power::SHIFT;
-const PM_DEVICE_SHIFT: u32 = 40;
-const PM_ARGUMENT_SHIFT: u32 = 32;
-const PM_VALUE_SHIFT: u32 = 16;
-const PM_DEVICE_CONSTRAINT: u8 = 0x0c;
+const PM_DEVICE_SHIFT: u32 = pmp_power::DEVICE_SHIFT;
+const PM_ARGUMENT_SHIFT: u32 = pmp_power::ARGUMENT_SHIFT;
+const PM_VALUE_SHIFT: u32 = pmp_power::VALUE_SHIFT;
+const PM_DEVICE_CONSTRAINT: u8 = pmp_power::DEVICE_CONSTRAINT;
 const OPC_GET_IOVA_TABLE: u64 = 0x10;
 const OPC_MALLOC: u64 = 0x12;
 const OPC_FREE: u64 = 0x14;
@@ -445,7 +445,9 @@ impl PmpData {
     fn recv_message(&self, msg: u64) -> Result<()> {
         let pm_command = (msg >> PM_COMMAND_SHIFT) & 0xff;
         if msg & PM_COMMAND_MARKER != 0
-            && (pm_command == 0x0d || pm_command == 0x0f || pm_command == 0x10)
+            && (pm_command == u64::from(PM_DEVICE_CONSTRAINT) + 1
+                || pm_command == 0x0f
+                || pm_command == 0x10)
         {
             let mut state = self.power_command.lock();
             state.reply(msg);
