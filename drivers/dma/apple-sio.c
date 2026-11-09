@@ -630,14 +630,31 @@ static const struct sio_hw_data sio_hw_t6030 = {
 	.check_boot_tables = sio_t6030_check_boot_tables,
 };
 
-static const struct sio_hw_data sio_hw_t8140 = {
-	.firmware_only = true,
-};
-
+/*
+ * macOS 26.6 configures a T6041 DisplayPort audio channel with
+ * [2, 0, 0x800, 0x600, 0x800, 0]: the limit is 0x800, as on earlier SoCs;
+ * the 5 of the host's mailbox call timeout is not part of the record.
+ */
 static const struct sio_hw_data sio_hw_t6041 = {
 	.protocol = 10,
 	.fifo_threshold = 0x600,
-	.cfg_word4 = 5,		/* the host's default timeout */
+	.cfg_word4 = 0x800,
+	.cfg_six_words = true,
+	.clear_period_desc = true,
+	.arrays = &sio_t6041_arrays,
+	.check_boot_tables = sio_t6041_check_boot_tables,
+	.send_dt_params = sio_t6041_send_dt_params,
+};
+
+/*
+ * T8140 (MacBook Neo) firmware takes the T6041 boot tables (its ADT
+ * describes them alike); its DisplayPort audio channels refill at 0x800
+ * (ADT dp-audioN dma-channels): [2, 0, 0x800, 0x800, 0x800, 0].
+ */
+static const struct sio_hw_data sio_hw_t8140 = {
+	.protocol = 10,
+	.fifo_threshold = 0x800,
+	.cfg_word4 = 0x800,
 	.cfg_six_words = true,
 	.clear_period_desc = true,
 	.arrays = &sio_t6041_arrays,
@@ -647,8 +664,8 @@ static const struct sio_hw_data sio_hw_t6041 = {
 
 static const struct of_device_id sio_of_match[] = {
 	{ .compatible = "apple,t6041-sio", .data = &sio_hw_t6041 },
-	{ .compatible = "apple,t6030-sio", .data = &sio_hw_t6030 },
 	{ .compatible = "apple,t8140-sio", .data = &sio_hw_t8140 },
+	{ .compatible = "apple,t6030-sio", .data = &sio_hw_t6030 },
 	{ .compatible = "apple,sio", .data = &sio_hw_generic },
 	{ }
 };

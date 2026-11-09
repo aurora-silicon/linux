@@ -336,9 +336,15 @@ static bool show_notch;
 module_param(show_notch, bool, 0644);
 MODULE_PARM_DESC(show_notch, "Use the full display height and show the notch (also when /chosen/asahi,show-notch is \"1\")");
 
-bool hdmi_audio;
+/*
+ * DP/HDMI audio of external displays, on by default as on macOS: a display
+ * that takes audio, over HDMI or DisplayPort (USB-C alt mode included),
+ * is an audio output while it is connected. hdmi_audio=0 leaves the audio
+ * endpoints stopped and registers no sound cards.
+ */
+bool hdmi_audio = true;
 module_param(hdmi_audio, bool, 0644);
-MODULE_PARM_DESC(hdmi_audio, "Enable unstable HDMI audio support");
+MODULE_PARM_DESC(hdmi_audio, "DP/HDMI audio of external displays (default: on)");
 
 static bool unstable_edid = true;
 module_param(unstable_edid, bool, 0644);
@@ -4057,7 +4063,7 @@ int dcp_start(struct platform_device *pdev)
 
 /*
  * A native T6030 external processor: its DP/HDMI audio endpoint (EP 0x29)
- * on the driver's opt-in (hdmi_audio), as the other DCPs start it, for a
+ * unless hdmi_audio is off, as the other DCPs start it, for a
  * processor whose port@0 links an audio device; once per session, and after
  * the first display's EDID was read: with the endpoint's interfaces
  * published, an EDID copy (dcpavserv_copy_edid()) has the firmware rebuild

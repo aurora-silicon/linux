@@ -12,10 +12,12 @@
 #include "t8112.dtsi"
 #include "t8112-jxxx.dtsi"
 #include <dt-bindings/leds/common.h>
+#include <dt-bindings/thermal/thermal.h>
 
 / {
 	compatible = "apple,j413", "apple,t8112", "apple,arm-platform";
 	model = "Apple MacBook Air (13-inch, M2, 2022)";
+
 	chassis-type = "laptop";
 
 	aliases {
@@ -373,5 +375,230 @@
 			     <165 IRQ_TYPE_NONE>,
 			     <166 IRQ_TYPE_NONE>;
 		status = "disabled";
+	};
+};
+
+/ {
+	/*
+	 * Fanless: every die sensor throttles both clusters, E weighted 3:1
+	 * and capped at state 3, as on the J613, with its alert and control
+	 * trips. No critical trip: boot load bursts briefly read past 100 C,
+	 * and the SMC keeps its own protection.
+	 */
+	thermal-zones {
+		cpu-e0-thermal {
+			polling-delay-passive = <500>;
+			polling-delay = <500>;
+			thermal-sensors = <&smc_hwmon 1>;	/* Te05 */
+			sustainable-power = <6000>;
+
+			trips {
+				cpu_e0_alert: trip-alert {
+					temperature = <58000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_e0_control: trip-control {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_e0_control>;
+					cooling-device =
+						<&cpu_p0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <1024>;
+				};
+
+				map1 {
+					trip = <&cpu_e0_control>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT 3>,
+						<&cpu_e1 THERMAL_NO_LIMIT 3>,
+						<&cpu_e2 THERMAL_NO_LIMIT 3>,
+						<&cpu_e3 THERMAL_NO_LIMIT 3>;
+					contribution = <3072>;
+				};
+			};
+		};
+
+		cpu-p0-thermal {
+			polling-delay-passive = <500>;
+			polling-delay = <500>;
+			thermal-sensors = <&smc_hwmon 2>;	/* Tp01 */
+			sustainable-power = <6000>;
+
+			trips {
+				cpu_p0_alert: trip-alert {
+					temperature = <58000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p0_control: trip-control {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p0_control>;
+					cooling-device =
+						<&cpu_p0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <1024>;
+				};
+
+				map1 {
+					trip = <&cpu_p0_control>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT 3>,
+						<&cpu_e1 THERMAL_NO_LIMIT 3>,
+						<&cpu_e2 THERMAL_NO_LIMIT 3>,
+						<&cpu_e3 THERMAL_NO_LIMIT 3>;
+					contribution = <3072>;
+				};
+			};
+		};
+
+		cpu-p1-thermal {
+			polling-delay-passive = <500>;
+			polling-delay = <500>;
+			thermal-sensors = <&smc_hwmon 3>;	/* Tp05 */
+			sustainable-power = <6000>;
+
+			trips {
+				cpu_p1_alert: trip-alert {
+					temperature = <58000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p1_control: trip-control {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p1_control>;
+					cooling-device =
+						<&cpu_p0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <1024>;
+				};
+
+				map1 {
+					trip = <&cpu_p1_control>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT 3>,
+						<&cpu_e1 THERMAL_NO_LIMIT 3>,
+						<&cpu_e2 THERMAL_NO_LIMIT 3>,
+						<&cpu_e3 THERMAL_NO_LIMIT 3>;
+					contribution = <3072>;
+				};
+			};
+		};
+
+		cpu-p2-thermal {
+			polling-delay-passive = <500>;
+			polling-delay = <500>;
+			thermal-sensors = <&smc_hwmon 4>;	/* Tp09 */
+			sustainable-power = <6000>;
+
+			trips {
+				cpu_p2_alert: trip-alert {
+					temperature = <58000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p2_control: trip-control {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p2_control>;
+					cooling-device =
+						<&cpu_p0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <1024>;
+				};
+
+				map1 {
+					trip = <&cpu_p2_control>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT 3>,
+						<&cpu_e1 THERMAL_NO_LIMIT 3>,
+						<&cpu_e2 THERMAL_NO_LIMIT 3>,
+						<&cpu_e3 THERMAL_NO_LIMIT 3>;
+					contribution = <3072>;
+				};
+			};
+		};
+
+		cpu-p3-thermal {
+			polling-delay-passive = <500>;
+			polling-delay = <500>;
+			thermal-sensors = <&smc_hwmon 5>;	/* Tp0D */
+			sustainable-power = <6000>;
+
+			trips {
+				cpu_p3_alert: trip-alert {
+					temperature = <58000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p3_control: trip-control {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p3_control>;
+					cooling-device =
+						<&cpu_p0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <1024>;
+				};
+
+				map1 {
+					trip = <&cpu_p3_control>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT 3>,
+						<&cpu_e1 THERMAL_NO_LIMIT 3>,
+						<&cpu_e2 THERMAL_NO_LIMIT 3>,
+						<&cpu_e3 THERMAL_NO_LIMIT 3>;
+					contribution = <3072>;
+				};
+			};
+		};
 	};
 };

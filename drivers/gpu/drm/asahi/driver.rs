@@ -306,6 +306,9 @@ impl platform::Driver for AsahiPlatformDriver {
     }
 
     fn unbind<'bound>(_pdev: &'bound platform::Device<Core<'_>>, this: Pin<&Self::Data<'bound>>) {
+        // SAFETY: Takes no arguments, process context. Clears the T6001 AGX request in the PMP report if the pmp_report.agx_vote
+        // parameter set it; a no-op everywhere else.
+        unsafe { bindings::apple_pmp_agx_activity_release() };
         if let Some(gpu) = this.g17.as_ref() {
             // Driver data is dropped after devres, so CPU control must happen in unbind.
             gpu.shutdown();
@@ -320,6 +323,9 @@ impl platform::Driver for AsahiPlatformDriver {
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         debug::update_debug_flags();
         crate::memacct::LEDGER.configure();
+
+        // SAFETY: Takes no arguments, process context. Lets the T6001 AGX vote run again after an earlier unbind released it; a no-op everywhere else.
+        unsafe { bindings::apple_pmp_agx_activity_resume() };
 
         dev_info!(pdev.as_ref(), "Probing...\n");
 

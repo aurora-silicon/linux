@@ -78,7 +78,11 @@
 		reg = <0x4 0x09000000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1076 IRQ_TYPE_LEVEL_HIGH>;
+#ifdef APPLE_USE_PMP
+		power-domains = <&pmp_report_jpg>;
+#else
 		power-domains = <&ps_jpg>;
+#endif
 		clocks = <&peripheral_clocks 354>, <&peripheral_clocks 355>;
 		iommus = <&jpeg0_dart 0>;
 		status = "disabled";
@@ -99,7 +103,11 @@
 		reg = <0x4 0x09008000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1081 IRQ_TYPE_LEVEL_HIGH>;
+#ifdef APPLE_USE_PMP
+		power-domains = <&pmp_report_jpg>;
+#else
 		power-domains = <&ps_jpg>;
+#endif
 		clocks = <&peripheral_clocks 354>, <&peripheral_clocks 355>;
 		iommus = <&jpeg1_dart 0>;
 		status = "disabled";

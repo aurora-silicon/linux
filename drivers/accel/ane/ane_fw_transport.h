@@ -92,6 +92,12 @@ struct ane_fw_transport_ops {
 	 * their lock around the pause call it first, with the lock held.
 	 */
 	void (*service)(void *ctx);
+	/*
+	 * Optional: the waiting half of relax(), safe without the caller's
+	 * lock (it may end early on the channel IRQ). Default
+	 * ane_fw_poll_pause().
+	 */
+	void (*pause)(void *ctx, u64 waited_ns);
 	int (*alloc)(void *ctx, size_t size, u32 tag, struct ane_fw_surface *surface);
 	void (*refused)(void *ctx, u64 word0, u64 word1, u64 word2, int error);
 	/* Optional: a shared allocation was freed ("FREE") or served again ("reuse"). */
