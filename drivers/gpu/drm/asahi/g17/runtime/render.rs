@@ -573,8 +573,14 @@ impl crate::g17::queue::render::Host for Host<'_> {
     /// writes while several clients installed their first pairs at once.
     fn install_pair(&mut self, registration: &crate::g17::fw::kick::RenderRegistration) -> Result {
         use crate::g17::fw::variant::QueueRegistration;
+        // The 25G83 test arm also performs the powered MMIO pair registration that
+        // builds without it otherwise skip.
+        let exact_registration = self.firmware.variant.graph
+            == crate::g17::fw::variant::InitGraph::V25G83
+            && crate::g16::params::ksm_exact_registration();
         match self.firmware.variant.registration {
-            QueueRegistration::Firmware => return Ok(()),
+            QueueRegistration::Firmware if !exact_registration => return Ok(()),
+            QueueRegistration::Firmware => {}
             QueueRegistration::Mailbox => {
                 self.firmware.port.register_queues(registration.queues())?;
                 return Ok(());

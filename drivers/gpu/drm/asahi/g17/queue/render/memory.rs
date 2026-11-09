@@ -34,6 +34,9 @@ pub(super) const CONFIG_STRIDE: usize = 0x180;
 /// The lead command of a stage (InitBM before tiling), after the stage's configuration record
 /// in its slot ([`crate::g17::fw::Variant::lead_commands`]).
 pub(super) const LEAD: usize = 0xc0;
+/// Optional KSM predecessor record. It follows the lead command in the same
+/// per-ordinal configuration slot.
+pub(super) const PREDECESSOR: usize = 0xe0;
 const DEPTH: usize = queues::RENDER_DEPTH as usize;
 /// Offsets of the priority pair and the policy word in a queue record.
 const PRIORITY: usize = core::mem::offset_of!(queue::QueueRecord, priority);

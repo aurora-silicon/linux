@@ -239,5 +239,9 @@ module! {
             default: 1,
             description: "G16: validate CDM/VDM stream records",
         },
+        g16_ksm_exact_arm: u32 {
+            default: 0,
+            description: "G16 25G83 test: KSM both (1), events (2), registration (3)",
+        },
     },
 }

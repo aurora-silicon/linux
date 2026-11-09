@@ -48,6 +48,54 @@ pub(crate) fn stream_gate() -> bool {
     module_parameters::g16_stream_gate.value() != 0
 }
 
+/// Validated selector for the 25G83-only KSM comparison. Unknown values are
+/// the byte-identical production arm.
+pub(crate) const fn ksm_exact_selector(value: u32) -> u32 {
+    match value {
+        1..=3 => value,
+        _ => 0,
+    }
+}
+
+/// Whether the test arm uses the native per-kick event construction.
+pub(crate) fn ksm_exact_events() -> bool {
+    matches!(ksm_exact_selector(module_parameters::g16_ksm_exact_arm.value()), 1 | 2)
+}
+
+/// Whether the test arm installs render queues through the native MMIO ports.
+pub(crate) fn ksm_exact_registration() -> bool {
+    matches!(ksm_exact_selector(module_parameters::g16_ksm_exact_arm.value()), 1 | 3)
+}
+
+#[kernel::macros::kunit_tests(asahi_g16_ksm_exact_arm)]
+mod tests {
+    use super::ksm_exact_selector;
+
+    const fn events(value: u32) -> bool {
+        matches!(ksm_exact_selector(value), 1 | 2)
+    }
+
+    const fn registration(value: u32) -> bool {
+        matches!(ksm_exact_selector(value), 1 | 3)
+    }
+
+    #[test]
+    fn default_and_invalid_are_production() {
+        assert_eq!(ksm_exact_selector(0), 0);
+        assert_eq!(ksm_exact_selector(4), 0);
+        assert_eq!(ksm_exact_selector(u32::MAX), 0);
+        assert!(!events(0));
+        assert!(!registration(0));
+    }
+
+    #[test]
+    fn arms_are_isolated() {
+        assert!(events(1) && registration(1));
+        assert!(events(2) && !registration(2));
+        assert!(!events(3) && registration(3));
+    }
+}
+
 /// Fragment-only dependency publication has not been qualified on this backend.
 pub(crate) fn early_tiling() -> bool {
     false

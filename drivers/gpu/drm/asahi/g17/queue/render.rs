@@ -706,6 +706,12 @@ impl Pair {
         let own_tiling = KickDependency::new(qids[0], kicks[0]).ok_or(EINVAL)?;
         let barriers = render_barriers(pass.fragment_barriers, dependencies, own_tiling);
         let tiling_barriers = &barriers.tiling[..barriers.tiling_count];
+        let exact_events = self.variant.graph == crate::g17::fw::variant::InitGraph::V25G83
+            && crate::g16::params::ksm_exact_events();
+        let entry_signal = [
+            present[0] || !tiling_barriers.is_empty(),
+            present[1] || barriers.fragment_count != 0,
+        ];
         let args = |stage: usize, barriers, arrays, mcache| KickArgs {
             qid: qids[stage],
             timestamp: kicks[stage],
@@ -722,7 +728,15 @@ impl Pair {
                 },
             },
             mcache,
-            event_mask: abi::RENDER_KICK_EVENT_MASK,
+            event_mask: crate::g17::fw::kick::g16_event_mask(
+                abi::RENDER_KICK_EVENT_MASK,
+                exact_events.then_some(crate::g17::fw::kick::G16EventConditions {
+                    compute: None,
+                    entry_signal: entry_signal[stage],
+                    ksm_mode: false,
+                    all: false,
+                }),
+            ),
             register_arrays: arrays,
             scs_enabled: ray_query[stage].scratch.enabled(),
             priority: policy.priority(),
@@ -756,6 +770,12 @@ impl Pair {
         let tiling_kick = tiling_kick.prepare_entry(&ta_args)?;
         let fragment_kick = fragment_kick.prepare_entry(&fragment_args)?;
         let memory = &mut *self.memory;
+        let predecessors = [0, 1].map(|stage| {
+            (exact_events && entry_signal[stage])
+                .then(|| queue::KickPredecessor::new(qids[stage], parents[stage]))
+                .transpose()
+        });
+        let predecessors = [predecessors[0]?, predecessors[1]?];
         let lanes = [
             publication::Lane::new(
                 &memory.graph,
@@ -766,6 +786,7 @@ impl Pair {
                 present[0],
                 kicks[0],
                 leads[0],
+                predecessors[0],
             )?,
             publication::Lane::new(
                 &memory.graph,
@@ -776,6 +797,7 @@ impl Pair {
                 present[1],
                 kicks[1],
                 leads[1],
+                predecessors[1],
             )?,
         ];
         let windows = [lanes[0].window, lanes[1].window];

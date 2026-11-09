@@ -9,7 +9,7 @@ use core::sync::atomic::{fence, Ordering};
 use kernel::prelude::*;
 
 const DEPTH: usize = queues::RENDER_DEPTH as usize;
-const MAX_GROUP_ITEMS: u32 = 4;
+const MAX_GROUP_ITEMS: u32 = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Cursors {

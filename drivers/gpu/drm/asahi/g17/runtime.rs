@@ -1176,6 +1176,7 @@ impl Backend {
                     self.shared.variant.pointers,
                     self.shared.operand_state,
                     self.shared.variant.compute,
+                    self.shared.variant.graph == crate::g17::fw::variant::InitGraph::V25G83,
                 )?;
                 Ok(KBox::new(queue, GFP_KERNEL)?)
             })();

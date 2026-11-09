@@ -10,8 +10,8 @@
 //! defined here carry the others.
 //!
 //! One kick appends, in order, the work descriptor, a [`QueueConfig`], a
-//! [`KickAnnounce`] record and, when a compute queue is first installed or
-//! explicitly waits on another queue, a [`KickPredecessor`].
+//! [`KickAnnounce`] record and, when the queue's predecessor state needs an
+//! explicit record, a [`KickPredecessor`].
 //! Compute kicks always carry the [`QueueConfig`]. A render kick carries it
 //! only when it installs the queue, updates the context or QoS identity,
 //! carries a completion seed, or configures the queue differently from the
@@ -647,8 +647,7 @@ impl KickAnnounce {
     }
 }
 
-/// Names the kick of a compute queue that precedes the announced one
-/// (tag 16).
+/// Names the kick of a queue that precedes the announced one (tag 16).
 ///
 /// A record slot larger than this structure must be zero beyond it.
 #[repr(C, packed)]

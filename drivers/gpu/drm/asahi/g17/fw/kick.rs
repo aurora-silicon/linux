@@ -37,6 +37,56 @@ pub(crate) const QID_MAX: u8 = 0x7f;
 /// Highest UAT context ID.
 pub(crate) const CONTEXT_MAX: u8 = 0x3f;
 
+const G16_EVENT_CONTEXTS: u16 = CONTEXT_MAX as u16 + 1;
+const G16_DYNAMIC_EVENTS: u16 = 192;
+const G16_EVENT_KSM_MODE: u16 = 253;
+const G16_EVENT_ENTRY_SIGNAL: u16 = 254;
+const G16_EVENT_ALL: u16 = 255;
+
+/// Host conditions used by the G16 SKSM submitters to construct a kick mask.
+/// Normal user queues leave `ksm_mode` and `all` clear. `entry_signal` names
+/// the optional predecessor record, while compute also receives its context
+/// and priority event allocation.
+pub(crate) struct G16EventConditions {
+    pub(crate) compute: Option<(u8, u8)>,
+    pub(crate) entry_signal: bool,
+    pub(crate) ksm_mode: bool,
+    pub(crate) all: bool,
+}
+
+fn set_event(mask: &mut [u64; 4], event: u16) {
+    mask[usize::from(event / 64)] |= 1u64 << (event % 64);
+}
+
+/// Constructs the native G16 mask when `conditions` is present; otherwise
+/// returns the existing mask unchanged.
+pub(crate) fn g16_event_mask(
+    current: [u64; 4],
+    conditions: Option<G16EventConditions>,
+) -> [u64; 4] {
+    let Some(conditions) = conditions else {
+        return current;
+    };
+    let mut mask = [0; 4];
+    if let Some((context, priority_type)) = conditions.compute {
+        let event = u16::from(context)
+            .checked_add(u16::from(priority_type) * G16_EVENT_CONTEXTS);
+        if let Some(event) = event.filter(|event| *event < G16_DYNAMIC_EVENTS) {
+            set_event(&mut mask, event);
+        }
+    }
+    if conditions.entry_signal {
+        set_event(&mut mask, G16_EVENT_ENTRY_SIGNAL);
+    }
+    if conditions.ksm_mode {
+        set_event(&mut mask, G16_EVENT_KSM_MODE);
+    }
+    if conditions.all {
+        set_event(&mut mask, G16_EVENT_ALL);
+    }
+    mask
+}
+
 const KICK_TIMESTAMP_BITS: u32 = 40;
 const KICK_TIMESTAMP_MASK: u64 = (1 << KICK_TIMESTAMP_BITS) - 1;
 const KICK_SLOT_MASK: u64 = KICK_SLOTS as u64 - 1;
@@ -614,5 +664,64 @@ impl RenderRegistration {
 
     pub(crate) fn queues(&self) -> &[KsmQueue; 2] {
         &self.queues
+    }
+}
+
+#[kernel::macros::kunit_tests(asahi_g16_ksm_event_mask)]
+mod g16_event_mask_tests {
+    use super::{g16_event_mask, G16EventConditions};
+
+    #[test]
+    fn disabled_is_byte_identical() {
+        let current = [1, 2, 3, 4];
+        assert_eq!(g16_event_mask(current, None), current);
+    }
+
+    #[test]
+    fn normal_compute_is_dynamic() {
+        let mask = g16_event_mask(
+            [0, 0, 4, 0],
+            Some(G16EventConditions {
+                compute: Some((2, 2)),
+                entry_signal: false,
+                ksm_mode: false,
+                all: false,
+            }),
+        );
+        assert_eq!(mask, [0, 0, 4, 0]);
+        let moved = g16_event_mask(
+            [0, 0, 4, 0],
+            Some(G16EventConditions {
+                compute: Some((7, 2)),
+                entry_signal: true,
+                ksm_mode: false,
+                all: false,
+            }),
+        );
+        assert_eq!(moved, [0, 0, 1 << 7, 1 << 62]);
+    }
+
+    #[test]
+    fn optional_conditions_are_independent_and_bounded() {
+        let mask = g16_event_mask(
+            [u64::MAX; 4],
+            Some(G16EventConditions {
+                compute: Some((63, 2)),
+                entry_signal: true,
+                ksm_mode: true,
+                all: true,
+            }),
+        );
+        assert_eq!(mask, [0, 0, 1 << 63, 0xe000_0000_0000_0000]);
+        let invalid = g16_event_mask(
+            [0; 4],
+            Some(G16EventConditions {
+                compute: Some((0, 3)),
+                entry_signal: false,
+                ksm_mode: false,
+                all: false,
+            }),
+        );
+        assert_eq!(invalid, [0; 4]);
     }
 }
