@@ -1319,12 +1319,45 @@ static int tb_dp_bandwidth_alloc_mode_enable(struct tb_tunnel *tunnel)
 	return 0;
 }
 
+/*
+ * An Apple silicon host sets the SSC offset that the DP OUT adapter's
+ * stream clock recovery allows, the low half of TMU capability word 6, to
+ * 1500 before it touches the adapter otherwise. Docks come up with their
+ * own value (2500 on a Barlow Ridge dock).
+ */
+#define TB_DP_APPLE_SSC_OFFSET	1500
+
+static void tb_dp_apple_ssc_offset(struct tb_tunnel *tunnel)
+{
+	struct tb_port *out = tunnel->dst_port;
+	u32 v, old;
+
+	if (!tb_port_is_apple_host_dpin(tunnel->src_port) ||
+	    !tb_port_is_dpout(out) || !out->cap_tmu)
+		return;
+	/* Only inside the TMU capability: before its next-capability pointer. */
+	if (tb_port_read(out, &v, TB_CFG_PORT, out->cap_tmu, 1) ||
+	    ((v & 0xff) && (v & 0xff) <= out->cap_tmu + 6) ||
+	    tb_port_read(out, &v, TB_CFG_PORT, out->cap_tmu + 6, 1))
+		return;
+	old = v;
+	v = (v & ~GENMASK(15, 0)) | TB_DP_APPLE_SSC_OFFSET;
+	if (v != old &&
+	    tb_port_write(out, &v, TB_CFG_PORT, out->cap_tmu + 6, 1)) {
+		tb_port_warn(out, "cannot set the DP SSC offset\n");
+		return;
+	}
+	tb_port_dbg(out, "DP SSC offset %#x (was %#x)\n", v & 0xffff, old & 0xffff);
+}
+
 static int tb_dp_pre_activate(struct tb_tunnel *tunnel)
 {
 	struct tb_port *in = tunnel->src_port;
 	struct tb_switch *sw = in->sw;
 	struct tb *tb = in->sw->tb;
 	int ret;
+
+	tb_dp_apple_ssc_offset(tunnel);
 
 	ret = tb_dp_xchg_caps(tunnel);
 	if (ret)
@@ -1609,8 +1642,9 @@ static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 		/*
 		 * Apple silicon host: the sink link is trained by the
 		 * host's DPTX through the tunnel; keep this DP OUT adapter
-		 * from starting link training on its own, and hand it back
-		 * once the tunnel is gone.
+		 * from starting link training on its own. The bit is left
+		 * as it is when the tunnel goes: the next tunnel to this
+		 * adapter sets it again before enabling it.
 		 */
 		if (active && apple_dpin &&
 		    !tb_port_read(out, &v, TB_CFG_PORT, out->cap_adap + ADP_DP_CS_3, 1)) {
@@ -1619,13 +1653,6 @@ static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 				tb_port_warn(out, "Apple: cannot hold off DP link training\n");
 		}
 		ret = tb_dp_port_enable(out, active);
-		/* hand link training back even if the disable failed */
-		if (!active && apple_dpin &&
-		    !tb_port_read(out, &v, TB_CFG_PORT, out->cap_adap + ADP_DP_CS_3, 1)) {
-			v &= ~ADP_DP_CS_3_NO_AUTO_LT;
-			if (tb_port_write(out, &v, TB_CFG_PORT, out->cap_adap + ADP_DP_CS_3, 1))
-				tb_port_warn(out, "Apple: cannot restore DP link training\n");
-		}
 		if (ret && active)
 			return ret;
 	}
