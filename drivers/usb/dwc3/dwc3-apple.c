@@ -185,7 +185,7 @@ struct dwc3_apple {
 	bool sleep_reinit;
 	/* Looks for the fixed hub once a host restarted after a sleep has had time to find it. */
 	struct delayed_work hub_check;
-	/* The core didn't come back from a sleep, and nothing may touch it until a reboot. */
+	/* The core didn't come back from a sleep or a power cycle: nothing may touch it. */
 	bool sleep_dead;
 	/* Stopped for a deep sleep: the state to come back to, and the wakeup setting. */
 	bool sleep_stopped;
@@ -1164,12 +1164,42 @@ static int dwc3_apple_setup_role_switch(struct dwc3_apple *appledwc)
 }
 
 /*
+ * A core that may be unpowered gets one more power cycle, as macOS's Off and cold start, and
+ * the host starts over once it's back. Until then nothing may touch it, and every sleep is
+ * refused, as xHCI's suspend would touch it. Returns whether it's back.
+ */
+static bool dwc3_apple_recover(struct dwc3_apple *appledwc)
+{
+	int ret;
+
+	lockdep_assert_held(&appledwc->lock);
+	ret = apple_atcphy_sleep_recover(appledwc->usb2_phy);
+	if (ret < 0) {
+		if (!appledwc->sleep_dead)
+			dev_err(appledwc->dev,
+				"USB host unpowered after the sleep (%d): USB off, sleeps refused until it's back or a reboot\n",
+				ret);
+		appledwc->sleep_dead = true;
+		return false;
+	}
+	if (appledwc->sleep_dead)
+		dev_info(appledwc->dev, "USB host back after a power cycle: restarting it\n");
+	appledwc->sleep_dead = false;
+	ret = dwc3_apple_exit(appledwc);
+	if (ret)
+		dev_err(appledwc->dev, "Failed to stop after the power cycle, err=%d\n", ret);
+	else
+		dwc3_apple_start_after_sleep(appledwc, DWC3_APPLE_HOST);
+
+	return true;
+}
+
+/*
  * After a sleep in place: the PHY says whether the core came back to D0, and the GUID register
  * whether it kept its registers. A core set up again at the resume kept its host and devices,
  * which reset-resumed. Otherwise restart the host as after a stop, and the devices enumerate
- * again. With a core that may be unpowered even that would touch it, so USB stays off, and
- * later sleeps are refused, as xHCI's suspend would touch it too. Returns whether the host
- * was kept.
+ * again. A core that may be unpowered gets another power cycle first. Returns whether the
+ * host was kept.
  */
 static bool dwc3_apple_sleep_kept(struct dwc3_apple *appledwc)
 {
@@ -1180,8 +1210,7 @@ static bool dwc3_apple_sleep_kept(struct dwc3_apple *appledwc)
 	appledwc->sleep_in_place = false;
 	ret = apple_atcphy_sleep_result(appledwc->usb2_phy);
 	if (ret == -ENODEV) {
-		appledwc->sleep_dead = true;
-		dev_err(appledwc->dev, "the core didn't come back from the sleep: USB off until a reboot\n");
+		dwc3_apple_recover(appledwc);
 		return false;
 	}
 	if (appledwc->sleep_reinit) {
@@ -1227,14 +1256,16 @@ static int dwc3_apple_pm_notify_locked(struct dwc3_apple *appledwc, unsigned lon
 
 	switch (action) {
 	case PM_SUSPEND_PREPARE:
+		/* Any sleep: xHCI's suspend would touch a core that may be unpowered. */
+		if (appledwc->sleep_dead && !appledwc->shutting_down &&
+		    !dwc3_apple_recover(appledwc)) {
+			dev_err(dev, "refusing the sleep: the USB host is still unpowered\n");
+			return notifier_from_errno(-EIO);
+		}
 		if (pm_suspend_default_s2idle() || appledwc->shutting_down) {
 			*finish = in_place;
 			*kept = true;
 			break;
-		}
-		if (appledwc->sleep_dead) {
-			dev_err(dev, "refusing the sleep: the core is gone until a reboot\n");
-			return notifier_from_errno(-EIO);
 		}
 		/* xHCI suspends and resumes as usual, and the wakeup setting stays. */
 		if (in_place) {
