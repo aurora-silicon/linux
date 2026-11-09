@@ -56,6 +56,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "gfx";
+		power-domains = <&ps_afimccni0>, <&ps_piogw>;
 		/*
 		 * The GPU firmware keeps running across system sleep and
 		 * does not survive this state going off for long.
@@ -69,6 +70,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "venc0_sys";
+		power-domains = <&ps_afisocni0>;
 	};
 
 	ps_apcie_gp: power-controller@258 {
@@ -77,6 +79,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "apcie_gp";
+		power-domains = <&ps_afisocni1>;
 	};
 
 	ps_isp_sys: power-controller@268 {
@@ -85,6 +88,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_sys";
+		power-domains = <&ps_afisocni1>;
 	};
 
 	ps_avd_sys: power-controller@270 {
@@ -93,6 +97,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "avd_sys";
+		power-domains = <&ps_afisocni1>;
 	};
 
 	ps_ans: power-controller@278 {
@@ -101,6 +106,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "ans";
+		power-domains = <&ps_afisocni1>;
 		apple,always-on; /* handed over running, cannot be reset */
 	};
 
@@ -110,6 +116,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "disp_sys";
+		power-domains = <&ps_afisocni2>;
 	};
 
 	/*
@@ -124,6 +131,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "dispext0_sys";
+		power-domains = <&ps_afisocni2>;
 		status = "disabled";
 	};
 
@@ -250,7 +258,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "atc0_common";
-		power-domains = <&ps_atc0_usb_aon>;
+		power-domains = <&ps_afisocni2>, <&ps_atc0_usb_aon>;
 	};
 
 	ps_atc0_usb: power-controller@3f0 {
@@ -279,6 +287,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "sep";
+		power-domains = <&ps_afisocni0>;
 		apple,always-on;
 	};
 
@@ -288,6 +297,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_cpu";
+		power-domains = <&ps_isp_sys>;
 	};
 
 	ps_isp_cpu_core0: power-controller@4008 {
@@ -296,6 +306,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_cpu_core0";
+		power-domains = <&ps_isp_cpu>;
 	};
 
 	ps_isp_cpu_core1: power-controller@4010 {
@@ -304,6 +315,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_cpu_core1";
+		power-domains = <&ps_isp_cpu>;
 	};
 
 	ps_isp_fe: power-controller@4018 {
@@ -312,6 +324,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_fe";
+		power-domains = <&ps_isp_sys>;
 	};
 
 	ps_isp_dprx: power-controller@4020 {
@@ -320,6 +333,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_dprx";
+		power-domains = <&ps_isp_fe>;
 	};
 
 	ps_isp_secure: power-controller@4028 {
@@ -328,6 +342,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_secure";
+		power-domains = <&ps_isp_fe>;
 	};
 
 	ps_isp_sts0: power-controller@4030 {
@@ -336,6 +351,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_sts0";
+		power-domains = <&ps_isp_fe>;
 	};
 
 	ps_isp_sts1: power-controller@4038 {
@@ -344,6 +360,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_sts1";
+		power-domains = <&ps_isp_fe>;
 	};
 
 	ps_isp_pearl: power-controller@4040 {
@@ -352,6 +369,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_pearl";
+		power-domains = <&ps_isp_fe>;
 	};
 
 	ps_isp_be: power-controller@4048 {
@@ -360,6 +378,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_be";
+		power-domains = <&ps_isp_fe>;
 	};
 
 	ps_isp_clr: power-controller@4050 {
@@ -368,6 +387,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_clr";
+		power-domains = <&ps_isp_be>;
 	};
 
 	ps_isp_cvd: power-controller@4058 {
@@ -376,6 +396,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_cvd";
+		power-domains = <&ps_isp_be>;
 	};
 
 	ps_isp_cvm: power-controller@4060 {
@@ -384,6 +405,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_cvm";
+		power-domains = <&ps_isp_cvd>;
 	};
 	ps_disp_cpu: power-controller@10000 {
 		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
@@ -800,12 +822,76 @@
 		status = "okay";
 	};
 
+	/*
+	 * SoC fabric power states (ADT AFIMCCNI0, PIOGW, AFINS0, AFISOCNI0-2):
+	 * the parents of the blocks behind them. Kept on, like the fabric
+	 * states of T6041.
+	 */
+	ps_afimccni0: power-controller@198 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x198 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "afimccni0";
+		apple,always-on;
+	};
+
+	ps_piogw: power-controller@1a8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1a8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "piogw";
+		apple,always-on;
+	};
+
+	ps_afins0: power-controller@1e8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1e8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "afins0";
+		power-domains = <&ps_afimccni0>, <&ps_piogw>;
+		apple,always-on;
+	};
+
+	ps_afisocni0: power-controller@218 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x218 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "afisocni0";
+		power-domains = <&ps_afins0>, <&ps_piogw>;
+		apple,always-on;
+	};
+
+	ps_afisocni1: power-controller@220 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x220 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "afisocni1";
+		power-domains = <&ps_afins0>, <&ps_piogw>;
+		apple,always-on;
+	};
+
+	ps_afisocni2: power-controller@228 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x228 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "afisocni2";
+		power-domains = <&ps_afins0>, <&ps_piogw>;
+		apple,always-on;
+	};
+
 	ps_jpg: power-controller@230 {
 		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x230 4>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "jpg";
+		power-domains = <&ps_afisocni0>;
 		status = "okay";
 	};
 
@@ -815,6 +901,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "msr";
+		power-domains = <&ps_afisocni0>;
 		status = "okay";
 	};
 
@@ -824,6 +911,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "prores";
+		power-domains = <&ps_afisocni0>;
 		status = "okay";
 	};
 
@@ -833,6 +921,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "ane_sys";
+		power-domains = <&ps_afisocni2>;
 		status = "okay";
 	};
 
