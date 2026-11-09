@@ -118,6 +118,9 @@ enum {
 #define APPLE_RTKIT_MIN_SUPPORTED_VERSION 11
 #define APPLE_RTKIT_MAX_SUPPORTED_VERSION 12
 
+/* Default wait for each handshake reply, see apple_rtkit_set_handshake_timeout() */
+#define APPLE_RTKIT_HANDSHAKE_TIMEOUT_MS 1000
+
 struct apple_rtkit_rx_work {
 	struct apple_rtkit *rtk;
 	u8 ep;
@@ -151,6 +154,18 @@ static bool apple_rtkit_coproc_places_buffers(struct apple_rtkit *rtk)
 static bool apple_rtkit_needs_coreanalytics(struct apple_rtkit *rtk)
 {
 	return rtk->ops->flags & APPLE_RTKIT_NEEDS_COREANALYTICS;
+}
+
+static bool apple_rtkit_firmware_owns_crashlog(struct apple_rtkit *rtk)
+{
+	return rtk->ops->flags & APPLE_RTKIT_FIRMWARE_OWNED_CRASHLOG;
+}
+
+/* The crashlog endpoint is started while the endpoint map is handled. */
+static bool apple_rtkit_early_crashlog(struct apple_rtkit *rtk)
+{
+	return apple_rtkit_coproc_places_buffers(rtk) ||
+	       (rtk->ops->flags & APPLE_RTKIT_EARLY_CRASHLOG);
 }
 
 static int apple_rtkit_management_send(struct apple_rtkit *rtk, u8 type,
@@ -232,10 +247,11 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 	}
 
 	/*
-	 * For co-processors that place their own buffers, the crashlog
-	 * endpoint is started before the map is acknowledged.
+	 * Co-processors that place all buffers, and clients that explicitly
+	 * request early crashlog startup, need the endpoint before the map is
+	 * acknowledged: G17P can request its crash DVA right after.
 	 */
-	if (apple_rtkit_coproc_places_buffers(rtk) && base == 0 &&
+	if (apple_rtkit_early_crashlog(rtk) && base == 0 &&
 	    test_bit(APPLE_RTKIT_EP_CRASHLOG, &bitmap)) {
 		ret = apple_rtkit_start_ep(rtk, APPLE_RTKIT_EP_CRASHLOG);
 		if (ret) {
@@ -276,7 +292,7 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		case APPLE_RTKIT_EP_TRACEKIT:
 			/* already started while handling the map */
 			if (ep == APPLE_RTKIT_EP_CRASHLOG &&
-			    apple_rtkit_coproc_places_buffers(rtk))
+			    apple_rtkit_early_crashlog(rtk))
 				break;
 			dev_dbg(rtk->dev,
 				"RTKit: Starting system endpoint 0x%02x\n", ep);
@@ -410,6 +426,13 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 	dev_dbg(rtk->dev, "RTKit: buffer request for 0x%zx bytes at %pad\n",
 		request.size, &request.iova);
 
+	if ((rtk->ops->flags & APPLE_RTKIT_FIRMWARE_OWNED_CRASHLOG) &&
+	    ep == APPLE_RTKIT_EP_CRASHLOG && request.iova) {
+		*buffer = request;
+		buffer->is_mapped = true;
+		return apple_rtkit_send_message(rtk, ep, msg, NULL, false);
+	}
+
 	if (request.iova && !rtk->ops->shmem_setup && !rtk->ops->shmem_setup_ep) {
 		err = -EINVAL;
 		goto error;
@@ -440,7 +463,9 @@ reply:
 					    buffer->iova);
 		}
 		apple_rtkit_send_message(rtk, ep, reply, NULL, false);
-	} else if (apple_rtkit_coproc_places_buffers(rtk)) {
+	} else if (apple_rtkit_coproc_places_buffers(rtk) ||
+		   (apple_rtkit_firmware_owns_crashlog(rtk) &&
+		    ep == APPLE_RTKIT_EP_CRASHLOG)) {
 		/* acknowledge the co-processor's own buffer with its request */
 		apple_rtkit_send_message(rtk, ep, msg, NULL, false);
 	}
@@ -733,6 +758,18 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 	}
 
 	dev_err(rtk->dev, "RTKit: co-processor has crashed\n");
+
+	/* A firmware-owned crash buffer has no CPU mapping to read the log from. */
+	if (!rtk->crashlog_buffer.buffer && !rtk->crashlog_buffer.iomem) {
+		if (apple_rtkit_firmware_owns_crashlog(rtk))
+			dev_err(rtk->dev,
+				"RTKit: firmware-owned crash log at DVA %pad (0x%zx bytes)\n",
+				&rtk->crashlog_buffer.iova, rtk->crashlog_buffer.size);
+		rtk->crashed = true;
+		if (rtk->ops->crashed)
+			rtk->ops->crashed(rtk->cookie, NULL, 0);
+		return;
+	}
 
 	/*
 	 * create a shadow copy here to make sure the co-processor isn't able
@@ -1367,6 +1404,7 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 	rtk->dev = dev;
 	rtk->cookie = cookie;
 	rtk->ops = ops;
+	rtk->handshake_timeout_ms = APPLE_RTKIT_HANDSHAKE_TIMEOUT_MS;
 	rtk->sync_syslog_ack =
 		of_property_read_bool(dev->of_node, "apple,sync-syslog-ack");
 	INIT_KFIFO(rtk->sync_ack_fifo);
@@ -1446,7 +1484,8 @@ struct apple_rtkit *apple_rtkit_init_adopted(struct device *dev, void *cookie,
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init_adopted);
 
-static int apple_rtkit_wait_for_completion(struct completion *c);
+static int apple_rtkit_wait_for_completion(struct apple_rtkit *rtk,
+					   struct completion *c);
 
 /*
  * apple,sync-syslog-ack (AsahiLinux/linux#607): the mailbox can leave
@@ -1460,9 +1499,9 @@ static int apple_rtkit_wait(struct apple_rtkit *rtk, struct completion *c)
 	int ret;
 
 	if (!rtk->sync_syslog_ack)
-		return apple_rtkit_wait_for_completion(c);
+		return apple_rtkit_wait_for_completion(rtk, c);
 
-	timeout = jiffies + msecs_to_jiffies(1000);
+	timeout = jiffies + msecs_to_jiffies(rtk->handshake_timeout_ms);
 	do {
 		ret = apple_rtkit_poll(rtk);
 		if (ret < 0)
@@ -1490,12 +1529,13 @@ struct apple_rtkit *apple_rtkit_init_adopted_with_buffers(
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init_adopted_with_buffers);
 
-static int apple_rtkit_wait_for_completion(struct completion *c)
+static int apple_rtkit_wait_for_completion(struct apple_rtkit *rtk,
+					   struct completion *c)
 {
+	unsigned long timeout = msecs_to_jiffies(rtk->handshake_timeout_ms);
 	long t;
 
-	t = wait_for_completion_interruptible_timeout(c,
-						      msecs_to_jiffies(1000));
+	t = wait_for_completion_interruptible_timeout(c, timeout);
 	if (t < 0)
 		return t;
 	else if (t == 0)
@@ -1503,6 +1543,13 @@ static int apple_rtkit_wait_for_completion(struct completion *c)
 	else
 		return 0;
 }
+
+void apple_rtkit_set_handshake_timeout(struct apple_rtkit *rtk,
+				       unsigned int timeout_ms)
+{
+	rtk->handshake_timeout_ms = timeout_ms ?: APPLE_RTKIT_HANDSHAKE_TIMEOUT_MS;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_set_handshake_timeout);
 
 int apple_rtkit_reinit(struct apple_rtkit *rtk)
 {
@@ -1627,7 +1674,8 @@ static int apple_rtkit_boot_common(struct apple_rtkit *rtk, bool early_ap_power)
 	/* PMP waits for CoreAnalytics setup before acknowledging IOP power. */
 	if (apple_rtkit_needs_coreanalytics(rtk) &&
 	    test_bit(APPLE_RTKIT_EP_COREANALYTICS, rtk->endpoints)) {
-		ret = apple_rtkit_wait_for_completion(&rtk->coreanalytics_completion);
+		ret = apple_rtkit_wait_for_completion(rtk,
+						      &rtk->coreanalytics_completion);
 		if (ret) {
 			dev_err(rtk->dev, "RTKit: CoreAnalytics readiness failed: %d\n", ret);
 			return ret;

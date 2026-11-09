@@ -91,7 +91,7 @@ fn main(){
   assert!(NOW.load(Ordering::SeqCst)<=1_010_000_000,"quarantine budget extended");
   reset(mode);let pool=new_pool(false,2);pool.state.lock().spared=2;
   assert!(matches!(pool.acquire_render(1,None,2_000_000_000,||Ok(())),Err(EBUSY)));
-  assert!(NOW.load(Ordering::SeqCst)<=1_010_000_000,"spared quarantine budget extended");
+  assert!((2_000_000_000..=2_010_000_000).contains(&NOW.load(Ordering::SeqCst)),"a spared quarantine waits for the caller's deadline");
  }
  reset(2);let pool=new_pool(true,0);
  assert!(matches!(pool.acquire_render(1,Some(Request(&())),2_000_000_000,||Ok(())),Err(ERESTARTSYS)));

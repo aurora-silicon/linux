@@ -48,7 +48,7 @@ impl Queue {
 ''' + item(source,'pub(crate) fn release_owner(') + item(source,'pub(crate) fn reusable(') + '\n}\n'
     methods = '\n'.join(item(source, sig) for sig in ['pub(crate) fn begin_growth(', 'pub(crate) fn finish_growth(', 'pub(crate) fn growth_token(', 'pub(crate) fn abort_growth(', 'pub(crate) fn observe_vacancy('])
     replace = item((ROOT / 'freelist.rs').read_text(), 'pub(crate) fn replace_pages(')
-    observe = item((ROOT / 'runtime.rs').read_text(), 'pub(super) fn observe_pool_releases(').replace('pub(super) ', '').replace('super::initdata::', 'initdata::')
+    observe = item((ROOT / 'runtime.rs').read_text(), 'pub(super) fn observe_pool_releases(').replace('pub(super) ', '').replace('super::initdata::', 'initdata::').replace('super::channel::', 'g17::channel::')
     return text + r'''
 const EAGAIN:i32=-11;const EFAULT:i32=-14;
 static CONSUMER:AtomicU32=AtomicU32::new(0);
@@ -58,6 +58,7 @@ impl Pages {fn page_list_va(&self)->u64{self.0}}
 mod mmu {pub type KernelMapping=u64;}
 mod g17 {
  pub fn now_ns()->u64{crate::now_ns()}
+ pub mod channel {pub fn observe_control(_:u32,_:u32){}}
  pub mod freelist {pub(crate) use crate::Pages; pub fn control_consumed(c:u32,_:u32,t:u32)->crate::Result<bool>{Ok(c==t)}}
  pub mod initdata {
   pub struct InitData {pub fail:bool}

@@ -14,9 +14,9 @@
 //!
 //! # Plugging into the shared driver
 //!
-//! - [`Driver`] is a separate platform driver for `apple,agx-t8132` without a module alias, so
-//!   probing (which boots the firmware) happens when userspace loads the module after the native
-//!   display is up. It calls [`crate::driver::AsahiPlatformDriver::probe_g16`].
+//! - [`Driver`] is a separate platform driver for `apple,agx-t8132` with a module alias. Its
+//!   probe waits for the PMP supplier and the native display before booting firmware. It calls
+//!   [`crate::driver::AsahiPlatformDriver::probe_g16`].
 //! - [`Gpu`] implements [`crate::gpu::Gpu`]: GET_PARAMS identity, VM creation (`new_vm`),
 //!   queues (`new_queue`, see [`queue`]) and timestamp buffers.
 //! - User VMs are shared-layer [`mmu::Vm`]s on a [`mmu::Uat::new_adopted`] UAT with tracked
@@ -91,7 +91,7 @@ use crate::driver::{AsahiDrmDevice, AsahiPlatformDriver};
 use crate::{alloc, gem, gpu, mmu, regs as shared_regs};
 
 /// Name of the G16 platform driver.
-pub(crate) const DRIVER_NAME: &CStr = c_str!("asahi-g16");
+pub(crate) const DRIVER_NAME: &CStr = c_str!("aurora-g16");
 
 /// GPU generation reported to userspace.
 pub(crate) const GPU_GENERATION: u32 = 16;
@@ -118,15 +118,19 @@ pub(crate) struct Config {
 }
 
 /// OF match table of the G16 platform driver.
-///
-/// Deliberately not exported with `module_device_table!`: without a module alias, the asahi
-/// module is not loaded at boot for this GPU, and the firmware only starts when userspace loads
-/// the module after the native display is up (the J713 bring-up order).
 const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, &'static Config, 1> =
     kernel::device_id::IdArray::new([(
         of::DeviceId::new(c_str!("apple,agx-t8132")),
         &&hw::t8132::CONFIG,
     )]);
+
+// Probe admission waits for the PMP supplier and the native display before
+// firmware starts, so the module may be loaded at device creation.
+kernel::of_device_table!(
+    AUTOLOAD_OF_TABLE,
+    @none,
+    [of::DeviceId::new(c_str!("apple,agx-t8132"))]
+);
 
 /// The G16 platform driver: the shared [`AsahiPlatformDriver`] probed through
 /// [`AsahiPlatformDriver::probe_g16`].
@@ -171,6 +175,7 @@ impl platform::Driver for Driver {
             if let Some(gpu) = &driver.g16 {
                 gpu.retain();
             }
+            driver.close_binding();
         }
     }
 }
@@ -397,7 +402,7 @@ impl Gpu {
         *shared.state.lock() = Some(firmware);
         // The engine's statistics file (a debugfs failure does not fail the probe).
         if let Err(error) = shared.start_engine() {
-            dev_warn!(dev.as_ref(), "G16: no asahi-g16 debugfs ({:?})\n", error);
+            dev_warn!(dev.as_ref(), "G16: no aurora-g16 debugfs ({:?})\n", error);
         }
         let gpu = Arc::new(
             Gpu {
@@ -420,7 +425,8 @@ impl Gpu {
     /// RTKit callbacks hold [`Shared`], which holds the [`Firmware`] (or the [`boot::Orphan`] of a
     /// failed start) until reboot.
     pub(crate) fn retain(&self) {
-        boot::glue::retain_module();
+        // Admission already pinned the module, so this cannot fail.
+        let _ = boot::glue::retain_module();
     }
 }
 
@@ -616,9 +622,10 @@ impl gpu::Gpu for Gpu {
         _ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
         priority: u32,
         usc_exec_base: u64,
+        usage: Arc<crate::usage::Client>,
     ) -> Result<KBox<dyn crate::queue::Queue>> {
         Ok(KBox::new(
-            queue::Queue::new(self, vm, priority, usc_exec_base)?,
+            queue::Queue::new(self, vm, priority, usc_exec_base, usage)?,
             GFP_KERNEL,
         )?)
     }

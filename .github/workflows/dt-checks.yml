@@ -1,0 +1,101 @@
+name: Device tree checks
+
+# Every Apple device tree is validated against its dt-schema bindings (CHECK_DTBS) at the
+# base and at the head of the change; a warning the base does not have fails the job, and
+# every binding the change adds or edits must pass dt_binding_check. This keeps the
+# "describe every device" work from regressing while the existing warnings are burnt down.
+
+on:
+  pull_request:
+    branches: [integration/aurora, aurora-wip]
+    paths:
+      - 'arch/arm64/boot/dts/apple/**'
+      - 'Documentation/devicetree/bindings/**'
+      - 'include/dt-bindings/**'
+      - 'scripts/dtc/**'
+      - '.github/workflows/dt-checks.yml'
+  push:
+    branches: [integration/aurora]
+    paths:
+      - 'arch/arm64/boot/dts/apple/**'
+      - 'Documentation/devicetree/bindings/**'
+      - 'include/dt-bindings/**'
+      - 'scripts/dtc/**'
+      - '.github/workflows/dt-checks.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dt-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CLANG_VERSION: '18'
+
+jobs:
+  dt-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: tree:0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q flex bison bc libyaml-dev clang-$CLANG_VERSION lld-$CLANG_VERSION llvm-$CLANG_VERSION swig device-tree-compiler
+          echo "/usr/lib/llvm-$CLANG_VERSION/bin" >> "$GITHUB_PATH"
+          pip install --quiet dtschema yamllint pylibfdt
+
+      - name: CHECK_DTBS and dt_binding_check, base vs head
+        id: dt
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          head=$(git rev-parse HEAD)
+          # A pull request is checked out as its merge into the CURRENT base branch tip, which is
+          # HEAD^1 (pull_request.base.sha can be the stale tip from when the PR was opened).
+          if [ "$EVENT" = pull_request ]; then base=$(git rev-parse HEAD^1); else base=$BEFORE; fi
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then base=$(git rev-parse HEAD~1); fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          scripts/dtc/apple-dt-check.sh "$base" "$head" "$RUNNER_TEMP/dt"
+
+      - name: ADT coverage, base vs head
+        if: ${{ !cancelled() && steps.dt.outputs.base != '' }}
+        env:
+          BASE: ${{ steps.dt.outputs.base }}
+        run: |
+          set -o pipefail
+          python3 scripts/dtc/apple-adt-coverage-test.py
+          for board in t6040-j616s t8140-j700 t6000-j316s t8112-j413 t6050-j716s t6050-j873s; do
+            test -s "arch/arm64/boot/dts/apple/adt-coverage/$board.txt"
+          done
+          manifests=arch/arm64/boot/dts/apple/adt-coverage
+          mkdir -p "$RUNNER_TEMP/dt/manifests-base"
+          if git cat-file -e "$BASE:$manifests" 2>/dev/null; then
+            git archive "$BASE:$manifests" | tar -x -C "$RUNNER_TEMP/dt/manifests-base"
+          fi
+          python3 scripts/dtc/apple-adt-coverage.py \
+            --dtb-dir "$RUNNER_TEMP/dt/out-head/arch/arm64/boot/dts/apple" \
+            --baseline-dtb-dir "$RUNNER_TEMP/dt/out-base/arch/arm64/boot/dts/apple" \
+            --baseline-manifest-dir "$RUNNER_TEMP/dt/manifests-base" \
+            2>&1 | tee "$RUNNER_TEMP/dt/coverage.log"
+
+      - name: Keep the warning lists
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dt-check-warnings
+          path: |
+            ${{ runner.temp }}/dt/*.warn
+            ${{ runner.temp }}/dt/coverage.log
+          if-no-files-found: ignore

@@ -20,6 +20,7 @@ TARGETS += dax
 TARGETS += devices/error_logs
 TARGETS += devices/probe
 TARGETS += dmabuf-heaps
+TARGETS += drivers/ane
 TARGETS += drivers/apple
 TARGETS += drivers/dma-buf
 TARGETS += drivers/gpu/apple-afkv2

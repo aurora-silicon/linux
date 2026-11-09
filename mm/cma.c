@@ -28,6 +28,7 @@
 #include <linux/cma.h>
 #include <linux/highmem.h>
 #include <linux/io.h>
+#include <linux/execmem.h>
 #include <linux/kmemleak.h>
 #include <trace/events/cma.h>
 
@@ -138,12 +139,37 @@ bool cma_validate_zones(struct cma *cma)
 	return true;
 }
 
+/* CMA hands its pages to the page allocator, and window pages must stay out of it. */
+static bool __init cma_overlaps_exec_window(struct cma *cma)
+{
+	for (int r = 0; r < cma->nranges; r++) {
+		struct cma_memrange *cmr = &cma->ranges[r];
+
+		if (execmem_confine_overlaps(PFN_PHYS(cmr->base_pfn),
+					     PFN_PHYS(cmr->count)))
+			return true;
+	}
+
+	return false;
+}
+
 static void __init cma_activate_area(struct cma *cma)
 {
 	unsigned long pfn, end_pfn, early_pfn[CMA_MAX_RANGES];
-	int allocrange, r;
+	int allocrange = 0, r;
 	struct cma_memrange *cmr;
 	unsigned long bitmap_count, count;
+
+	/*
+	 * Check this before allocating anything: a bitmap-allocation failure
+	 * jumps to cleanup, which would free the pages to the buddy unless the
+	 * reserve-on-error bit is already set.
+	 */
+	if (cma_overlaps_exec_window(cma)) {
+		pr_err("CMA area %s overlaps the executable window\n", cma->name);
+		cma_reserve_pages_on_error(cma);
+		goto cleanup;
+	}
 
 	for (allocrange = 0; allocrange < cma->nranges; allocrange++) {
 		cmr = &cma->ranges[allocrange];

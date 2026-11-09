@@ -80,6 +80,7 @@
 #include <linux/bitfield.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
+#include <linux/gpio/consumer.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
@@ -93,6 +94,7 @@
 #include <linux/of_platform.h>
 #include <linux/notifier.h>
 #include <linux/pci-apple.h>
+#include <linux/pinctrl/consumer.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
@@ -132,7 +134,13 @@
 struct apple_cio_hw {
 	bool mxwrap;
 	bool lstx_explicit;
+	/* Leave MxWrap RUN alone: the CIO reconfig restarts the CPU. */
+	bool skip_run;
+	/* Hand LSTX to the router after RTKit boot, not before it. */
+	bool lstx_after_boot;
 	bool strict_fw_ready;
+	/* Keep the links of the host router out of CL states. */
+	bool no_host_clx;
 	const struct apple_dpin_policy *dp;
 };
 
@@ -151,8 +159,35 @@ static const struct apple_cio_hw apple_cio_t6030_hw = {
 	.dp = &apple_dpin_m3,
 };
 
+/*
+ * T8132 has the T6030 ACIO layout and MxWrap CPU block, but the CIO reconfig
+ * already starts the CPU from its preloaded SRAM: RUN is never written. LSTX
+ * is handed over once RTKit is up, followed by the LSTX pin. Its links can
+ * retrain shortly after CL states are enabled, so they stay in CL0. Its
+ * DP IN adapters take the M4 policy, see apple_dpin_m4.
+ */
+static const struct apple_cio_hw apple_cio_t8132_hw = {
+	.mxwrap = true,
+	.lstx_explicit = true,
+	.skip_run = true,
+	.lstx_after_boot = true,
+	.strict_fw_ready = true,
+	.no_host_clx = true,
+	.dp = &apple_dpin_m4,
+};
+
 /* Type 7 uses its existing ready-state check and has no qualified DP route. */
 static const struct apple_cio_hw apple_cio_t8142_hw = {
+	.dp = &apple_dpin_disabled,
+};
+
+static const struct apple_cio_hw apple_cio_t6040_hw = {
+	.mxwrap = true,
+	.lstx_explicit = true,
+	.skip_run = true,
+	.lstx_after_boot = true,
+	.strict_fw_ready = true,
+	.no_host_clx = true,
 	.dp = &apple_dpin_disabled,
 };
 
@@ -254,6 +289,11 @@ struct apple_cio {
 	struct device_node *np;
 	const struct apple_cio_hw *hw;
 	const struct apple_dpin_policy *dp;
+	struct pinctrl *pinctrl;
+	struct pinctrl_state *lstx_pins;
+	struct gpio_desc *lstx_gpio;
+	bool lstx_hold;
+	bool lstx_high;
 	void __iomem *cpu_base;
 	struct device_node *pcie_tunnel_np;
 	bool pcie_tunnel_preinitialized;
@@ -328,6 +368,7 @@ struct apple_cio {
 		struct apple_dpin_state state;
 		struct apple_dpin_tokens tokens;
 		struct apple_dpin_binding *binding; /* worker-owned, handed to DCP */
+		bool dcp_touched;	/* DCP ran the handshake on this mapping */
 	} dpin[2];
 };
 
@@ -376,6 +417,7 @@ static const struct of_device_id apple_dpin_qualified_soc[] = {
 	{ .compatible = "apple,t6020" },
 	{ .compatible = "apple,t6021" },
 	{ .compatible = "apple,t6030" },
+	{ .compatible = "apple,t8132" },
 	{},
 };
 
@@ -497,12 +539,19 @@ static void apple_dpin_request_inactive(void *data)
 {
 	struct apple_dpin_ctx *c = data;
 
+	/* Never woken by DCP: the block is still as the tunnel found it. */
+	if (c->acio->dp->lazy_idle && !c->dcp_touched)
+		return;
 	apple_dpin_set_active(c->acio, c->regs, c->idx, false);
 }
 
 static void apple_dpin_request_mask_irqs(void *data)
 {
 	struct apple_dpin_ctx *c = data;
+
+	/* Nothing to mask where the interrupts were never enabled. */
+	if (c->acio->dp->lazy_idle && !c->acio->dp->setup_irqs)
+		return;
 
 	writel(readl(c->regs + APPLE_DPIN_IRQ_ENABLE) & ~3,
 	       c->regs + APPLE_DPIN_IRQ_ENABLE);
@@ -533,6 +582,7 @@ static int apple_dpin_dcp_set_active(void *data, bool active)
 	/* the tunnel is being torn down: the block may already be off */
 	if (!c->state.alive || !c->regs)
 		return -ENODEV;
+	c->dcp_touched = true;
 	return apple_dpin_set_active(c->acio, c->regs, c->idx, active);
 }
 
@@ -705,6 +755,7 @@ static void apple_dpin_down(struct apple_dpin_ctx *c)
 	scoped_guard(mutex, &c->lock) {
 		regs = c->regs;
 		c->regs = NULL;
+		c->dcp_touched = false;
 		apple_dpin_step(&c->state, c->acio->dp, APPLE_DPIN_DROPPED, false, 0);
 	}
 	if (regs)
@@ -842,24 +893,26 @@ static void apple_cio_of_node_put(void *data)
 	of_node_put(data);
 }
 
+static bool apple_cio_pciec_eligible(const struct device_node *np)
+{
+	return of_device_is_compatible(np, "apple,t6040-pciec") ||
+	       of_device_is_compatible(np, "apple,t8103-pciec") ||
+	       of_device_is_compatible(np, "apple,t6000-pciec");
+}
+
 static bool
 apple_cio_pcie_tunnel_is_preinitialized(struct device_node *parent)
 {
 	for_each_available_child_of_node_scoped(parent, child) {
 		u32 status;
 
-		if (!of_device_is_compatible(child, "apple,t8103-pciec") &&
-		    !of_device_is_compatible(child, "apple,t6000-pciec"))
+		if (!apple_cio_pciec_eligible(child))
 			continue;
 
 		if (!of_property_read_u32(child, "apple,pciec-preinit-status",
 					  &status) && status == 1)
 			return true;
-		/* t8103 brings the port up itself. */
-		if (of_device_is_compatible(child, "apple,t8103-pciec") &&
-		    of_property_read_bool(child, "apple,pciec-kernel-init"))
-			return true;
-		/* T600x/T602x without a handoff, when opted in. */
+		/* Use the PCI driver's generation and DT admission checks. */
 		return apple_pcie_tunnel_needs_cold_init(child);
 	}
 
@@ -882,8 +935,7 @@ static int apple_cio_get_pcie_reset(struct apple_cio *acio)
 	struct reset_control *rst = NULL;
 
 	for_each_available_child_of_node_scoped(acio->pcie_tunnel_np, child) {
-		if (!of_device_is_compatible(child, "apple,t8103-pciec") &&
-		    !of_device_is_compatible(child, "apple,t6000-pciec"))
+		if (!apple_cio_pciec_eligible(child))
 			continue;
 		if (!of_property_read_bool(child, "apple,pciec-kernel-init"))
 			break;
@@ -915,8 +967,7 @@ static int apple_cio_map_pcie_intr2axi(struct apple_cio *acio)
 	int index, ret;
 
 	for_each_available_child_of_node_scoped(acio->pcie_tunnel_np, child) {
-		if (!of_device_is_compatible(child, "apple,t8103-pciec") &&
-		    !of_device_is_compatible(child, "apple,t6000-pciec"))
+		if (!apple_cio_pciec_eligible(child))
 			continue;
 
 		index = of_property_match_string(child, "reg-names", "intr2axi");
@@ -1303,6 +1354,33 @@ static int apple_cio_pcie_tunnel_ready_locked(struct apple_cio *acio)
 	return ret;
 }
 
+/*
+ * PCIe-C is the only native port this host tunnels. Order it after the NHI,
+ * which rebuilds the tunnel underneath it at resume (the job of the ACPI
+ * device links on PC hosts). The link is stateless: it orders system sleep
+ * only and leaves probe and unbind alone, because apple_cio_remove_children()
+ * must stop the NHI while PCIe-C is still bound. Removing either device drops
+ * the link; both are removed together and PCIe-C is populated only once per
+ * NHI, so this runs once per pair.
+ */
+static void apple_cio_link_pcie_tunnel(struct apple_cio *acio)
+{
+	struct platform_device *nhi_pdev = READ_ONCE(acio->nhi_pdev);
+	struct platform_device *pcie_pdev;
+
+	lockdep_assert_held(&acio->pcie_tunnel_lock);
+	pcie_pdev = apple_cio_find_pcie_tunnel(acio);
+	if (!pcie_pdev)
+		return;
+	if (!nhi_pdev ||
+	    !device_link_add(&pcie_pdev->dev, &nhi_pdev->dev, DL_FLAG_STATELESS))
+		dev_warn(acio->dev, "PCIe-C: device link to the NHI failed\n");
+	else
+		dev_dbg(acio->dev, "PCIe-C: linked %s to %s\n",
+			dev_name(&pcie_pdev->dev), dev_name(&nhi_pdev->dev));
+	put_device(&pcie_pdev->dev);
+}
+
 static int apple_cio_activate_pcie_tunnel_locked(struct apple_cio *acio)
 {
 	int ret = 0;
@@ -1332,6 +1410,7 @@ static int apple_cio_activate_pcie_tunnel_locked(struct apple_cio *acio)
 				     "failed to populate tunneled PCIe controller\n");
 
 	acio->pcie_tunnel_populated = true;
+	apple_cio_link_pcie_tunnel(acio);
 	dev_info(acio->dev,
 		 "PCIe-C populated after USB4 PCIe tunnel adapter enable\n");
 	return apple_cio_pcie_tunnel_ready_locked(acio);
@@ -1964,7 +2043,18 @@ static bool apple_nhi_dp_tunnel_awaits_display(struct tb_nhi *nhi,
 	return apple_dpin_awaits_display(&c->state, c->acio->dp);
 }
 
+/*
+ * There are no firmware tables naming the tunneled ports: PCIe-C, when the
+ * port has one, is linked to the NHI as it is populated (see
+ * apple_cio_link_pcie_tunnel()). A port without PCIe-C tunnels no native port.
+ */
+static bool apple_nhi_add_links(struct tb_nhi *nhi)
+{
+	return true;
+}
+
 static const struct tb_nhi_ops apple_nhi_ops = {
+	.add_links = apple_nhi_add_links,
 	.request_ring_irq = apple_nhi_request_irq,
 	.release_ring_irq = apple_nhi_release_irq,
 	.ring_interrupt_active = apple_nhi_ring_interrupt_active,
@@ -1995,7 +2085,8 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	int ret = 0;
 
 	if (acio->type7 !=
-	    of_device_is_compatible(pdev->dev.of_node, "apple,t8142-usb4-nhi")) {
+	    (of_device_is_compatible(pdev->dev.of_node, "apple,t8142-usb4-nhi") ||
+	     of_device_is_compatible(pdev->dev.of_node, "apple,t6040-usb4-nhi"))) {
 		ret = dev_err_probe(&pdev->dev, -EINVAL, "ACIO/NHI generation mismatch\n");
 		goto err;
 	}
@@ -2080,6 +2171,8 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	anhi->nhi.quirks = QUIRK_NO_DMA_PORT | QUIRK_NO_USB3_BW_ALLOC;
 	if (anhi->nhi.host_dp_policy)
 		anhi->nhi.quirks |= QUIRK_HOST_DP_NFC_CREDITS;
+	if (acio->hw->no_host_clx)
+		anhi->nhi.quirks |= QUIRK_NO_HOST_CLX;
 
 	anhi->nhi.hop_count = readl(anhi->nhi_base + APPLE_CIO_NHI_HOP_COUNT) &
 			      APPLE_CIO_NHI_HOP_COUNT_MASK;
@@ -2312,6 +2405,18 @@ static bool apple_nhi_pcie_link_kept(struct apple_cio *acio)
 	return kept;
 }
 
+/* Whether this port has a PCIe-C tunnel host at all. */
+static bool apple_nhi_has_pcie_tunnel(struct apple_cio *acio)
+{
+	struct platform_device *pcie_pdev;
+
+	guard(mutex)(&acio->pcie_tunnel_lock);
+	pcie_pdev = apple_cio_find_pcie_tunnel(acio);
+	if (pcie_pdev)
+		put_device(&pcie_pdev->dev);
+	return pcie_pdev;
+}
+
 static int apple_nhi_suspend_noirq(struct device *dev)
 {
 	struct apple_nhi *anhi = dev_get_drvdata(dev);
@@ -2322,6 +2427,27 @@ static int apple_nhi_suspend_noirq(struct device *dev)
 		/* PCIe-C suspends first; its tunnel must then survive resume. */
 		if (apple_nhi_pcie_link_kept(anhi->acio))
 			anhi->nhi.quirks |= QUIRK_KEEP_TUNNELS;
+		/*
+		 * A DP tunnel to an external display behind a dock is never
+		 * released here: that would have its DCP release the route (its
+		 * locks, AFK calls and waits) with the DCP already suspended. With
+		 * the routers awake every tunnel stays as it is: keep them all,
+		 * unless a PCIe-C tunnel's link is not kept (it is then rebuilt at
+		 * resume, which tears down the others too): refuse the sleep.
+		 */
+		if (!(anhi->nhi.quirks & QUIRK_KEEP_TUNNELS) &&
+		    tb_has_apple_host_dp_tunnel(anhi->tb)) {
+			if (apple_nhi_has_pcie_tunnel(anhi->acio)) {
+				dev_warn(dev, "refusing system sleep: a DP tunnel to an external display cannot be kept (the PCIe-C link is not kept)\n");
+				return -EBUSY;
+			}
+			anhi->nhi.quirks |= QUIRK_KEEP_TUNNELS;
+			dev_dbg(dev, "tunnels kept across sleep for an external display\n");
+		}
+	} else if (tb_has_apple_host_dp_tunnel(anhi->tb)) {
+		/* The routers sleep: the DP tunnels would go here, see above. */
+		dev_warn(dev, "refusing system sleep: a DP tunnel to an external display is up and router_sleep is set\n");
+		return -EBUSY;
 	}
 
 	return tb_domain_suspend_noirq(anhi->tb);
@@ -2387,6 +2513,9 @@ static const struct dev_pm_ops apple_nhi_pm_ops = {
 
 static const struct of_device_id apple_nhi_match[] = {
 	{
+		.compatible = "apple,t6040-usb4-nhi",
+	},
+	{
 		.compatible = "apple,t8142-usb4-nhi",
 	},
 	{
@@ -2414,8 +2543,7 @@ static struct platform_device *apple_cio_find_pcie_tunnel(struct apple_cio *acio
 		return NULL;
 
 	for_each_available_child_of_node_scoped(acio->pcie_tunnel_np, child) {
-		if (!of_device_is_compatible(child, "apple,t8103-pciec") &&
-		    !of_device_is_compatible(child, "apple,t6000-pciec"))
+		if (!apple_cio_pciec_eligible(child))
 			continue;
 
 		pdev = of_find_device_by_node(child);
@@ -2465,6 +2593,61 @@ static void apple_cio_remove_children(struct apple_cio *acio)
 	}
 }
 
+/*
+ * While the router is off, the AP holds LSTX at the level the router last
+ * drove. The pin goes back to the router once it is up again.
+ */
+static void apple_cio_lstx_hold(struct apple_cio *acio, bool high)
+{
+	struct gpio_desc *gpio;
+
+	if (!acio->lstx_hold)
+		return;
+	acio->lstx_high = high;
+
+	/* The pin controller is strict: release the router's mux first. */
+	if (acio->pinctrl) {
+		devm_pinctrl_put(acio->pinctrl);
+		acio->pinctrl = NULL;
+		acio->lstx_pins = NULL;
+	}
+	gpio = devm_gpiod_get(acio->dev, "lstx",
+			      high ? GPIOD_OUT_HIGH : GPIOD_OUT_LOW);
+	if (IS_ERR(gpio)) {
+		acio->lstx_high = false;
+		dev_warn(acio->dev, "failed to take the LSTX pin back: %ld\n",
+			 PTR_ERR(gpio));
+		return;
+	}
+	acio->lstx_gpio = gpio;
+}
+
+static int apple_cio_lstx_release(struct apple_cio *acio)
+{
+	writel(APPLE_CIO_LSTX_CTRL_ENABLE |
+	       (acio->lstx_high ? APPLE_CIO_LSTX_CTRL_LEVEL : 0),
+	       acio->rc_base + APPLE_CIO_M3_CTRL);
+	if (acio->lstx_gpio) {
+		devm_gpiod_put(acio->dev, acio->lstx_gpio);
+		acio->lstx_gpio = NULL;
+	}
+	if (!acio->pinctrl) {
+		struct pinctrl *pinctrl = devm_pinctrl_get(acio->dev);
+		struct pinctrl_state *state;
+
+		if (IS_ERR(pinctrl))
+			return PTR_ERR(pinctrl);
+		acio->pinctrl = pinctrl;
+		state = pinctrl_lookup_state(pinctrl, "lstx");
+		if (IS_ERR(state))
+			return PTR_ERR(state);
+		acio->lstx_pins = state;
+	}
+	if (!acio->lstx_pins)
+		return 0;
+	return pinctrl_select_state(acio->pinctrl, acio->lstx_pins);
+}
+
 /**
  * apple_cio_stop - Stop and power down the ACIO complex
  * @acio: ACIO complex to stop
@@ -2489,6 +2672,12 @@ static void apple_cio_stop(struct apple_cio *acio)
 			 "Failed to shutdown M3 RTKit, continuing ACIO shutdown anyway\n");
 	apple_rtkit_free(acio->rtk);
 	acio->rtk = NULL;
+
+	/* High only if the router left it driven high with the cable still in */
+	if (acio->hw->lstx_after_boot)
+		apple_cio_lstx_hold(acio, acio->target_cable_info &&
+				    (readl(acio->rc_base + APPLE_CIO_M3_CTRL) &
+				     APPLE_CIO_LSTX_CTRL_LEVEL));
 
 	/* Finally, remove the links to the PD domains to power everything off */
 	for (i = 0; i < acio->pd_list->num_pds; i++) {
@@ -2619,7 +2808,9 @@ static int apple_cio_start(struct apple_cio *acio)
 	 * remaining fields are undocumented, so preserve them rather than clearing
 	 * them with a bare store.
 	 */
-	if (acio->hw->lstx_explicit) {
+	if (acio->hw->lstx_after_boot) {
+		/* Written below, once RTKit is up. */
+	} else if (acio->hw->lstx_explicit) {
 		writel(APPLE_CIO_LSTX_CTRL_ENABLE | APPLE_CIO_LSTX_CTRL_LEVEL,
 		       acio->rc_base + APPLE_CIO_M3_CTRL);
 	} else {
@@ -2627,7 +2818,7 @@ static int apple_cio_start(struct apple_cio *acio)
 		writel(val | APPLE_CIO_M3_CTRL_START, acio->rc_base + APPLE_CIO_M3_CTRL);
 	}
 
-	if (acio->hw->mxwrap) {
+	if (acio->hw->mxwrap && !acio->hw->skip_run) {
 		apple_cio_log_state(acio, "before RUN");
 		val = readl(acio->cpu_base + APPLE_MXWRAP_CPU_CTRL);
 		writel(val | APPLE_MXWRAP_CPU_CTRL_RUN,
@@ -2646,6 +2837,18 @@ static int apple_cio_start(struct apple_cio *acio)
 		dev_err(acio->dev, "M3 RTKit failed to boot: %d\n", ret);
 		apple_cio_log_state(acio, "RTKit boot failed");
 		goto err_free_rtkit;
+	}
+
+	/*
+	 * The router takes LSTX over at the level it last drove, low after a
+	 * cold start, and then gets its pin back from the AOP GPIO controller.
+	 */
+	if (acio->hw->lstx_after_boot) {
+		ret = apple_cio_lstx_release(acio);
+		if (ret) {
+			dev_err(acio->dev, "failed to hand over the LSTX pin: %d\n", ret);
+			goto err_shutdown_rtkit;
+		}
 	}
 
 	if (acio->hw->strict_fw_ready)
@@ -2709,6 +2912,8 @@ err_depopulate:
 err_shutdown_rtkit:
 	/* Ignore errors here since we're about to cut power to the entire block anyway */
 	apple_rtkit_poweroff(acio->rtk);
+	if (acio->hw->lstx_after_boot)
+		apple_cio_lstx_hold(acio, false);
 err_free_rtkit:
 	apple_rtkit_free(acio->rtk);
 remove_links:
@@ -3130,7 +3335,8 @@ static int apple_cio_probe(struct platform_device *pdev)
 	init_completion(&acio->nhi_boot_completion);
 	acio->dev = &pdev->dev;
 	acio->np = dev->of_node;
-	acio->type7 = of_device_is_compatible(acio->np, "apple,t8142-usb4-acio");
+	acio->type7 = of_device_is_compatible(acio->np, "apple,t8142-usb4-acio") ||
+		      of_device_is_compatible(acio->np, "apple,t6040-usb4-acio");
 	if (acio->type7 &&
 	    of_property_count_u32_elems(acio->np, "apple,tunable-rc") <= 0)
 		return dev_err_probe(dev, -EINVAL, "Missing bootloader RC tuning\n");
@@ -3151,6 +3357,17 @@ static int apple_cio_probe(struct platform_device *pdev)
 			return dev_err_probe(dev, PTR_ERR(acio->cpu_base),
 					     "Unable to map MxWrap cpu regs\n");
 	}
+	if (acio->hw->lstx_after_boot) {
+		acio->pinctrl = devm_pinctrl_get(dev);
+		if (IS_ERR(acio->pinctrl))
+			return dev_err_probe(dev, PTR_ERR(acio->pinctrl),
+					     "Unable to get the LSTX pin\n");
+		acio->lstx_pins = pinctrl_lookup_state(acio->pinctrl, "lstx");
+		if (IS_ERR(acio->lstx_pins))
+			acio->lstx_pins = NULL;
+		acio->lstx_hold = acio->lstx_pins &&
+				  of_property_present(dev->of_node, "lstx-gpios");
+	}
 	acio->pcie_tunnel_np =
 		of_parse_phandle(dev->of_node, "apple,pcie-tunnel", 0);
 	if (acio->pcie_tunnel_np) {
@@ -3163,7 +3380,7 @@ static int apple_cio_probe(struct platform_device *pdev)
 			apple_cio_pcie_tunnel_is_preinitialized(
 				acio->pcie_tunnel_np);
 		if (!acio->pcie_tunnel_preinitialized) {
-			dev_warn(dev,
+			dev_info(dev,
 				 "PCIe-C tunnel disabled: not initialized by m1n1 or the kernel\n");
 		} else {
 			ret = apple_cio_map_pcie_intr2axi(acio);
@@ -3328,8 +3545,16 @@ static void apple_cio_remove(struct platform_device *pdev)
 
 static const struct of_device_id apple_acio_match[] = {
 	{
+		.compatible = "apple,t6040-usb4-acio",
+		.data = &apple_cio_t6040_hw,
+	},
+	{
 		.compatible = "apple,t8142-usb4-acio",
 		.data = &apple_cio_t8142_hw,
+	},
+	{
+		.compatible = "apple,t8132-usb4-acio",
+		.data = &apple_cio_t8132_hw,
 	},
 	{
 		.compatible = "apple,t6030-usb4-acio",

@@ -112,7 +112,7 @@ fn timestamps(
         put64(q, base + 0x24, if user { work + user_pair } else { 0 });
         put64(q, base + 0x2c, work + auxiliary);
         put64(q, base + 0x34, work + context);
-        put64(q, base + 0x44, uuid as u64);
+        put64(q, base + 0x44, u64::from(uuid));
     }
     put32(q, off + 0x4c, 1);
 }
@@ -160,7 +160,7 @@ pub(crate) fn encode_ta(
         compact(p.heap_gva) | 1 << 63,
         0x003a0012006b0003,
         1,
-        geo.utile_config as u64,
+        u64::from(geo.utile_config),
         u.ppp_multisamplectl,
         compact(p.pre_gva[0]),
         compact(p.pre_gva[0]),
@@ -179,18 +179,18 @@ pub(crate) fn encode_ta(
         0,
         0,
         0x8860,
-        geo.region_stride as u64,
-        geo.region_stride as u64,
+        u64::from(geo.region_stride),
+        u64::from(geo.region_stride),
         0x88,
-        (2 | (u.ppp_ctrl & 0x201)) as u64,
-        geo.pixels as u64,
-        geo.screen as u64,
+        u64::from(2 | (u.ppp_ctrl & 0x201)),
+        u64::from(geo.pixels),
+        u64::from(geo.screen),
         geo.x_blocks,
         geo.y_blocks,
-        geo.blocks as u64,
-        geo.tpc_stride as u64,
+        u64::from(geo.blocks),
+        u64::from(geo.tpc_stride),
         0x100,
-        geo.layer_mode as u64,
+        u64::from(geo.layer_mode),
         0,
         u64::MAX,
         u64::MAX,
@@ -207,15 +207,15 @@ pub(crate) fn encode_ta(
         0,
         8,
         0xff0000,
-        r.parameter_id as u64,
+        u64::from(r.parameter_id),
         compact(r.scene_list),
         compact(r.scene_list),
         scratch_word,
         0x6000400020,
         0x200000001,
-        r.uuid as u64,
-        r.uuid as u64,
-        r.uuid as u64,
+        u64::from(r.uuid),
+        u64::from(r.uuid),
+        u64::from(r.uuid),
         // USC base is a shared queue property carried by the render refs.
         r.usc_base,
     ];
@@ -307,33 +307,33 @@ pub(crate) fn encode_fs(
     q.fill(0);
     let val: [u64; 82] = [
         1,
-        geo.utile_config as u64,
+        u64::from(geo.utile_config),
         prog_rsrc(u, &u.eot, u.bg_eot_rsrc_spec_hi),
         prog_addr(usc, &u.eot),
         prog_rsrc(u, &u.bg, u.bg_rsrc_spec_hi),
         prog_addr(usc, &u.bg),
-        u.isp_merge_upper_x as u64,
-        u.isp_merge_upper_y as u64,
+        u64::from(u.isp_merge_upper_x),
+        u64::from(u.isp_merge_upper_y),
         0,
         0,
         0,
         0,
         u.ppp_multisamplectl,
-        geo.isp_blocks as u64,
-        geo.isp_blocks as u64,
-        geo.screen as u64,
+        u64::from(geo.isp_blocks),
+        u64::from(geo.isp_blocks),
+        u64::from(geo.screen),
         0,
         0xff0200,
         p.heap_gva & !63,
         u.isp_scissor_base & !3,
         u.isp_dbias_base & !3,
-        geo.isp_control as u64,
-        (u.height_px as u64) << 32 | u.width_px as u64,
+        u64::from(geo.isp_control),
+        u64::from(u.height_px) << 32 | u64::from(u.width_px),
         0x100000,
-        geo.tilebuffer_control as u64,
-        u.isp_zls_pixels as u64,
-        u.isp_bgobjdepth as u64,
-        u.isp_bgobjvals as u64,
+        u64::from(geo.tilebuffer_control),
+        u64::from(u.isp_zls_pixels),
+        u64::from(u.isp_bgobjdepth),
+        u64::from(u.isp_bgobjvals),
         u.isp_oclqry_base & !15,
         u.zls_ctrl,
         0x04040404,
@@ -346,10 +346,10 @@ pub(crate) fn encode_fs(
         0,
         0,
         0,
-        u.depth.stride as u64,
-        u.depth.stride as u64,
-        u.stencil.stride as u64,
-        u.stencil.stride as u64,
+        u64::from(u.depth.stride),
+        u64::from(u.depth.stride),
+        u64::from(u.stencil.stride),
+        u64::from(u.stencil.stride),
         0,
         0,
         0,
@@ -360,8 +360,8 @@ pub(crate) fn encode_fs(
         0,
         p.tilemap_gva,
         geo.layer_metadata,
-        (geo.region_stride as u64) << 26,
-        geo.tile_mode as u64,
+        u64::from(geo.region_stride) << 26,
+        u64::from(geo.tile_mode),
         0,
         0,
         0,
@@ -382,10 +382,10 @@ pub(crate) fn encode_fs(
         8,
         0x6000400020,
         0x200000001,
-        r.uuid as u64,
-        r.uuid as u64,
-        r.uuid as u64,
-        r.parameter_id as u64,
+        u64::from(r.uuid),
+        u64::from(r.uuid),
+        u64::from(r.uuid),
+        u64::from(r.parameter_id),
         compact(r.scene_list),
         usc,
     ];
@@ -423,18 +423,22 @@ pub(crate) fn encode_fs(
     put64(w, 0x938, u.zls_ctrl);
     put64(w, 0x940, 0x04040404);
     put64(w, 0x948, u.depth.base);
-    put64(w, 0x950, u.depth.stride as u64);
+    put64(w, 0x950, u64::from(u.depth.stride));
     put64(w, 0x960, u.depth.base);
     put64(w, 0x968, u.depth.base);
     put64(w, 0x978, u.stencil.base);
-    put64(w, 0x980, u.stencil.stride as u64);
+    put64(w, 0x980, u64::from(u.stencil.stride));
     put64(w, 0x990, u.stencil.base);
     put64(w, 0x998, u.stencil.base);
-    put64(w, 0x9b8, geo.tilebuffer_control as u64);
-    put64(w, 0x9c0, geo.isp_control as u64);
-    put64(w, 0x9c8, (u.height_px as u64) << 32 | u.width_px as u64);
+    put64(w, 0x9b8, u64::from(geo.tilebuffer_control));
+    put64(w, 0x9c0, u64::from(geo.isp_control));
+    put64(
+        w,
+        0x9c8,
+        u64::from(u.height_px) << 32 | u64::from(u.width_px),
+    );
     put64(w, 0x9d0, 0x100000);
-    put64(w, 0x9d8, geo.tile_mode as u64);
+    put64(w, 0x9d8, u64::from(geo.tile_mode));
     put64(w, 0x9f4, prog_rsrc(u, &u.eot, u.bg_eot_rsrc_spec_hi));
     put64(w, 0x9fc, prog_addr(usc, &u.eot));
     put64(
@@ -446,9 +450,9 @@ pub(crate) fn encode_fs(
     put64(
         w,
         0xa28,
-        (u.isp_bgobjvals as u64) << 32 | u.isp_bgobjdepth as u64,
+        u64::from(u.isp_bgobjvals) << 32 | u64::from(u.isp_bgobjdepth),
     );
-    put64(w, 0xa50, u.isp_zls_pixels as u64);
+    put64(w, 0xa50, u64::from(u.isp_zls_pixels));
     metadata(w, 0xbc0, r, 1, target);
     internal_pair(w, p, 1, ts_va);
     put64(w, 0xc46, r.uma_mgr[0]);

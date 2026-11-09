@@ -20,7 +20,7 @@ mm=(ROOT/'drivers/gpu/drm/asahi/mmu.rs').read_text();pt=(ROOT/'drivers/gpu/drm/a
 pre=r'''
 #![allow(dead_code,unused_variables)]
 use std::{cell::RefCell,rc::Rc,mem::{ManuallyDrop,size_of},ops::{Deref,DerefMut,Range},num::NonZeroUsize,sync::{Mutex as StdMutex,atomic::{AtomicBool as StdAtomicBool,AtomicU8,AtomicU32,AtomicU64,AtomicUsize,Ordering,fence}}};
-type Result<T=()> = std::result::Result<T,i32>;const EIO:i32=5;const ETIMEDOUT:i32=110;const EOVERFLOW:i32=75;
+type Result<T=()> = std::result::Result<T,i32>;const EIO:i32=5;const ETIMEDOUT:i32=110;const EOVERFLOW:i32=75;const ENOTSUPP:i32=524;
 static TRIP_LOAD:AtomicUsize=AtomicUsize::new(0);
 struct AtomicBool(StdAtomicBool);impl AtomicBool{fn new(v:bool)->Self{Self(StdAtomicBool::new(v))}fn store(&self,v:bool,o:Ordering){self.0.store(v,o);}fn load(&self,o:Ordering)->bool{let n=TRIP_LOAD.load(Ordering::Relaxed);if n!=0&&TRIP_LOAD.fetch_sub(1,Ordering::Relaxed)==1{self.0.store(true,Ordering::Release);}self.0.load(o)}}
 const UAT_NUM_CTX:usize=64;const UAT_USER_CTX_START:usize=1;const TTBR_VALID:u64=1;const TTBR_ASID_SHIFT:usize=48;const UAT_PGSZ:usize=0x4000;
@@ -34,6 +34,8 @@ mod mem{pub fn sync(){super::BARRIERS.fetch_add(1,super::Ordering::Relaxed);}pub
 #[derive(Clone,Copy,PartialEq,Eq)]enum UatFirmware{Handoff,PublishedRoots}
 struct Handoff{lock_ap:AtomicU8,lock_fw:AtomicU8,turn:AtomicU32,cur_slot:AtomicU32}impl Handoff{fn new()->Self{Self{lock_ap:AtomicU8::new(0),lock_fw:AtomicU8::new(0),turn:AtomicU32::new(0),cur_slot:AtomicU32::new(0xffff)}}
 '''
+# Keep the production firmware predicate in the legacy-firmware harness.
+pre=pre.replace('struct Handoff{', 'impl UatFirmware{'+body(mm,'const fn is_no_peer(')+'}\nstruct Handoff{', 1)
 handoff='\n'.join(body(mm,m) for m in ['fn lock(&self) {\n        self.lock_ap', 'fn unlock(&self) {\n        self.turn', 'fn current_slot('])
 mid=r'''
 }
@@ -70,7 +72,7 @@ impl UatPageTable{fn new()->Self{Self{retained:false,ttb_owned:true,ttb:0x804000
 bindings=r'''
 #[derive(Clone,Copy)]struct Token(u32);impl Token{fn last_slot(&self)->u32{self.0}}
 struct Slot;impl Slot{fn changed(&self)->bool{true}fn slot(&self)->u32{3}fn token(&self)->Token{Token(3)}}
-struct Allocator;impl Allocator{fn set_limit(&self,_l:Option<NonZeroUsize>){}fn get(&self,_t:Option<Token>)->Result<Slot>{Ok(Slot)}}
+struct Allocator;impl Allocator{fn set_limit(&self,_l:Option<NonZeroUsize>){}fn get(&self,_t:Option<Token>)->Result<Slot>{Ok(Slot)}fn try_get(&self,_t:Option<Token>)->Result<Slot>{Ok(Slot)}}
 struct VmBinding{active_users:usize,bind_token:Option<Token>,binding:Option<Slot>,generation:u8,ttb:u64}
 #[derive(Clone)]struct Vm{id:u64,binding:Rc<Mutex<VmBinding>>}
 struct VmBind(Vm,u32);
@@ -78,7 +80,8 @@ struct Uat{inner:Rc<UatInner>,slots:Allocator}
 mod module_parameters{pub struct Param;impl Param{pub fn value(&self)->u32{0}}pub static robust_isolation:Param=Param;}
 '''
 helpers='\n'.join(body(mm,m) for m in ['const fn binding_wire_generation(', 'const fn application_ttb1('])
-bind='impl Uat{'+body(mm,'pub(crate) fn bind(&self, vm: &Vm)')+'}\n'
+# bind() is the waiting form of bind_inner(); G15's try_bind() is the other.
+bind='impl Uat{'+body(mm,'pub(crate) fn bind(&self, vm: &Vm)')+'\n'+body(mm,'fn bind_inner(&self, vm: &Vm, wait: bool)')+'}\n'
 vm=r'''
 struct VmInner{id:u64,binding:Rc<Mutex<VmBinding>>,uat_inner:Rc<UatInner>,page_table:UatPageTable}
 impl VmInner{fn ttb(&self)->u64{self.page_table.ttb}}

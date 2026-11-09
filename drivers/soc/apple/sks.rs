@@ -15,8 +15,12 @@ struct KeybagCreateIntent<'a> {
 }
 
 impl<'a> KeybagCreateIntent<'a> {
-    fn new(dev: &'a device::Device, slot: keybag::Slot) -> Option<Self> {
-        if let Err(e) = keybag::write_intent(slot) {
+    fn new(
+        dev: &'a device::Device,
+        slot: keybag::Slot,
+        unfinished: crate::xart_guard::Unfinished,
+    ) -> Option<Self> {
+        if let Err(e) = keybag::write_intent(slot, unfinished) {
             dev_err!(dev, "sks: cannot persist keybag-create intent: {:?}\n", e);
             return None;
         }
@@ -626,10 +630,41 @@ impl SepData {
         }
     }
 
+    /// The no-bag proof for an unfinished create, if Linux's list shows it
+    /// left nothing behind.
+    fn sks_retry_unfinished_create(&self, slot: keybag::Slot) -> Option<keybag::NoStoredKeyBag> {
+        let unfinished = keybag::unfinished(slot).ok()?;
+        let listed = self
+            .with_store(|store| store.guard_listed_at_load())
+            .flatten();
+        if !crate::xart_guard::may_retry_create(unfinished, listed) {
+            dev_err!(
+                self.dev,
+                "sks: an earlier CREATE_KEYBAG never completed and may have left a bag (intent {:?}, xART guard list {:?}); not creating another\n",
+                unfinished,
+                listed
+            );
+            return None;
+        }
+        let proof = keybag::retry_unfinished(slot, unfinished).ok()?;
+        dev_notice!(
+            self.dev,
+            "sks: an earlier CREATE_KEYBAG never completed and left no record; creating the identity keybag again\n"
+        );
+        Some(proof)
+    }
+
     pub(crate) fn sks_provision_identity_keybag(&self) -> bool {
-        let proof = match keybag::read(keybag::Slot::Identity) {
+        let identity = keybag::Slot::Identity;
+        let proof = match keybag::read(identity) {
             Ok(keybag::State::Present(_)) => return true,
-            Ok(keybag::State::Absent(proof)) => proof,
+            Ok(keybag::State::Absent(proof)) => Ok(proof),
+            // An intent: a create was sent and never committed.
+            Err(e) if e == EEXIST => self.sks_retry_unfinished_create(identity).ok_or(e),
+            Err(e) => Err(e),
+        };
+        let proof = match proof {
+            Ok(proof) => proof,
             Err(e) => {
                 dev_err!(
                     self.dev,
@@ -640,7 +675,13 @@ impl SepData {
             }
         };
         let slot = proof.slot();
-        let mut intent = match KeybagCreateIntent::new(&self.dev, slot) {
+        // A later boot compares this with Linux's list to tell whether the
+        // create left anything.
+        let unfinished = match self.with_store(|store| store.guard_listed_now()).flatten() {
+            Some(entries) => crate::xart_guard::Unfinished::Guarded(entries),
+            None => crate::xart_guard::Unfinished::Unguarded,
+        };
+        let mut intent = match KeybagCreateIntent::new(&self.dev, slot, unfinished) {
             Some(intent) => intent,
             None => return false,
         };
@@ -670,7 +711,18 @@ impl SepData {
             }
         };
         intent.sending();
-        let Some(out) = self.sks_exchange(request.name, request.msg, &request.img) else {
+        // The window's host writes and flushes land inside this exchange, so
+        // it gets the 13.5 key store's longer wait.
+        let exchanged = crate::xart_guard::keybag_create_window(|| {
+            self.sks_exchange_patient(
+                request.name,
+                request.msg,
+                &request.img,
+                SKS_TIMEOUT_13_MS,
+                true,
+            )
+        });
+        let Some(out) = exchanged else {
             dev_err!(
                 self.dev,
                 "sks: CREATE_KEYBAG exchange did not complete (buffers unregistered, wedged, or OOL write failed)\n"
@@ -866,6 +918,31 @@ impl SepData {
         body.put_blob(secret)?;
         body.put_blob(acm_context)?;
         body.put_u64(0)?;
+        let img = image::build_request(self.sks_ipc_version(), self.sks_timestamp_us(), &body)?;
+        let len = self.sks_image_len(&img)?;
+        let msg = crate::sks::encode_sks_verify_secret(self.sks_next_seq(), len).ok_or(EINVAL)?;
+        Ok(SksRequest {
+            name: crate::sks::SKS_VERIFY_SECRET_NAME,
+            msg,
+            img,
+        })
+    }
+
+    /// `0x21` verify-secret (variant 1) in password-validation mode: the
+    /// designated user's own bag, that bag's secret, no auxiliary context.
+    /// This is the request that ends a biometric lockout.
+    pub(crate) fn sks_req_verify_password(
+        &self,
+        special: crate::sks::SpecialHandle,
+        secret: &[u8],
+    ) -> Result<SksRequest> {
+        let mut body = image::Body::new();
+        body.put_u32(crate::sks::SKS_VERIFY_SECRET_VARIANT)?;
+        body.put_u64(crate::sks::SKS_CLIENT_ID)?;
+        body.put_i32(special.value())?;
+        body.put_blob(secret)?;
+        body.put_blob(&[])?;
+        body.put_u64(crate::sks::SKS_VERIFY_SECRET_PASSWORD)?;
         let img = image::build_request(self.sks_ipc_version(), self.sks_timestamp_us(), &body)?;
         let len = self.sks_image_len(&img)?;
         let msg = crate::sks::encode_sks_verify_secret(self.sks_next_seq(), len).ok_or(EINVAL)?;
@@ -1178,8 +1255,14 @@ pub(crate) const SKS_NEW_PFK_NAME: &CStr = c"NEW_PFK";
 const OP_SKS_UNWRAP_MEDIA_KEY: u8 = 0x32;
 pub(crate) const SKS_UNWRAP_MEDIA_KEY_NAME: &CStr = c"UNWRAP_MEDIA_KEY";
 
+const OP_SKS_NEW_VEK: u8 = 0x40;
+pub(crate) const SKS_NEW_VEK_NAME: &CStr = c"FV_NEW_VEK";
+
 const OP_SKS_UNWRAP_VEK: u8 = 0x41;
 pub(crate) const SKS_UNWRAP_VEK_NAME: &CStr = c"FV_UNWRAP_VEK";
+
+const OP_SKS_NEW_KEK: u8 = 0x42;
+pub(crate) const SKS_NEW_KEK_NAME: &CStr = c"FV_NEW_KEK";
 
 const OP_SKS_SET_PROTECTION: u8 = 0x47;
 pub(crate) const SKS_SET_PROTECTION_NAME: &CStr = c"FV_SET_PROTECTION";
@@ -1203,6 +1286,14 @@ pub(crate) fn encode_sks_unwrap_media_key(seq: Sequence, len: ImageLen) -> Optio
 pub(crate) fn encode_sks_unwrap_vek(seq: Sequence, len: ImageLen) -> Option<Message> {
     let msg = encode_sks_raw(OP_SKS_UNWRAP_VEK, seq.value(), len.value());
     Some(msg)
+}
+
+pub(crate) fn encode_sks_new_vek(seq: Sequence, len: ImageLen) -> Message {
+    encode_sks_raw(OP_SKS_NEW_VEK, seq.value(), len.value())
+}
+
+pub(crate) fn encode_sks_new_kek(seq: Sequence, len: ImageLen) -> Message {
+    encode_sks_raw(OP_SKS_NEW_KEK, seq.value(), len.value())
 }
 
 pub(crate) fn encode_sks_unwrap_pfk(seq: Sequence, len: ImageLen) -> Message {
@@ -1277,6 +1368,23 @@ pub(crate) fn encode_sks_device_state_transition(seq: Sequence, len: ImageLen) -
 const OP_SKS_VERIFY_SECRET: u8 = 0x21;
 pub(crate) const SKS_VERIFY_SECRET_NAME: &CStr = c"VERIFY_SECRET";
 pub(crate) const SKS_VERIFY_SECRET_VARIANT: u32 = 1;
+/// Verify-secret flag word for a password validation.
+pub(crate) const SKS_VERIFY_SECRET_PASSWORD: u64 = 0x200;
+/// Its reply body: the variant, then a u64 of returned state flags.
+pub(crate) const SKS_VERIFY_SECRET_REPLY_LEN: usize = 12;
+
+/// The returned state flags of a variant-1 verify-secret reply body, or
+/// `None` for any other shape.
+pub(crate) fn verify_secret_reply_flags(body: &[u8]) -> Option<u64> {
+    if body.len() != SKS_VERIFY_SECRET_REPLY_LEN {
+        return None;
+    }
+    let variant = u32::from_le_bytes(body[0..4].try_into().ok()?);
+    if variant != SKS_VERIFY_SECRET_VARIANT {
+        return None;
+    }
+    Some(u64::from_le_bytes(body[4..12].try_into().ok()?))
+}
 
 pub(crate) fn encode_sks_verify_secret(seq: Sequence, len: ImageLen) -> Option<Message> {
     let msg = encode_sks_raw(OP_SKS_VERIFY_SECRET, seq.value(), len.value());

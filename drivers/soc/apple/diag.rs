@@ -90,7 +90,6 @@ pub(crate) fn register(
     // The facts `matching` is derived from, kept for the guard's refusals.
     // Probe runs before the guard can refuse anything.
     XART_WRITABLE.store(xart_writable, Relaxed);
-    COLD.store(cold, Relaxed);
     let (level, list_loaded) = guard.unwrap_or((0, false));
     GUARD_LEVEL.store(u32::from(level), Relaxed);
     GUARD_LIST.store(list_loaded, Relaxed);
@@ -177,7 +176,6 @@ pub(crate) fn restore(state: Restore) {
 }
 
 static XART_WRITABLE: Atomic<bool> = Atomic::new(false);
-static COLD: Atomic<bool> = Atomic::new(false);
 static GUARD_LEVEL: Atomic<u32> = Atomic::new(0);
 static GUARD_LIST: Atomic<bool> = Atomic::new(false);
 static REFUSALS: Atomic<u32> = Atomic::new(0);
@@ -188,7 +186,6 @@ fn matching() -> crate::xart_guard::Matching {
     let level = GUARD_LEVEL.load(Relaxed);
     MatchFacts {
         xart_writable: XART_WRITABLE.load(Relaxed),
-        cold: COLD.load(Relaxed),
         guard: (level != 0).then(|| {
             (
                 u8::try_from(level).unwrap_or(u8::MAX),

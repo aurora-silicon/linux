@@ -568,6 +568,7 @@
 		/* To be filled by the loader */
 		local-mac-address = [00 10 18 00 00 10];
 		apple,antenna-sku = "XX";
+		brcm,ccode-map-trivial;
 	};
 
 	bluetooth0: bluetooth@0,1 {
@@ -740,6 +741,15 @@
 };
 
 &dwc3_3_dart_1 {
+	status = "disabled";
+};
+
+/* ATC3 has no USB4/Thunderbolt, so there is no PCIe-C tunnel behind it either */
+&apciec3_dart {
+	status = "disabled";
+};
+
+&apciec3 {
 	status = "disabled";
 };
 
@@ -996,3 +1006,7 @@
 &pmp_report_isp_sys {
 	status = "okay";
 };
+
+#ifdef APPLE_T600X_NON_ULTRA
+#include "t600x-j314-j316-control.dtsi"
+#endif

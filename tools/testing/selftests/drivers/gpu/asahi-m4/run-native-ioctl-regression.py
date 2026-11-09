@@ -20,7 +20,11 @@ RELEASE = '7.1.12-m4_asahi_rust'
 UNPATCHED = {'78d2519c82fca4c0403315e040d595628bc5a4d6',
              'df583754ae2b3607af4155ba0442bc93077bdce8'}
 FAULT = re.compile(r'Kernel panic|BUG:|WARNING: CPU|SError|Oops:|Unable to handle kernel|'
-                   r'\b(?:asahi|G16|GPU|PPL)\b.*(?:fault|fail(?:ed|ure)?|timeout|timed out|quarantin)', re.I)
+                   r'\b(?:aurora|asahi|G16|GPU|PPL)\b.*(?:fault|fail(?:ed|ure)?|timeout|timed out|quarantin)', re.I)
+# The G16 platform driver and its debugfs directory; kernels before the Aurora
+# rename used the asahi-g16 name.
+G16_DRIVERS = ('aurora-g16', 'asahi-g16')
+G16_STATS = [Path('/sys/kernel/debug') / name / 'stats' for name in G16_DRIVERS]
 EXPECTED_REJECTION = re.compile(r'IOCTL: submit failed! \(submission ID: \d+ err: E2BIG\)\s*$')
 
 
@@ -41,7 +45,8 @@ def self_test():
                 'Kernel panic - not syncing: ' + expected,
                 expected + ' GPU fault bank 0',
                 expected.replace('err: E2BIG', 'err: EIO'),
-                'asahi-g16: GPU fault bank 0; ' + expected]
+                'asahi-g16: GPU fault bank 0; ' + expected,
+                'aurora-g16: GPU fault bank 0; ' + expected]
     for line in harmless:
         assert not kernel_fault(line), 'False fault match: ' + line
     for line in failures:
@@ -96,8 +101,9 @@ def preflight(args):
     if not stat.S_ISCHR(node.stat().st_mode):
         raise RuntimeError('Expected a DRM character device')
     device = Path('/sys/class/drm') / node.name / 'device'
-    if (device / 'driver').resolve(strict=True).name != 'asahi-g16':
-        raise RuntimeError('Rust asahi-g16 does not own the requested render node')
+    owner = (device / 'driver').resolve(strict=True).name
+    if owner not in G16_DRIVERS:
+        raise RuntimeError('The Rust G16 platform driver does not own the requested render node')
     if any((Path('/sys/module') / name).exists() for name in ['gpu_m4_drm', 'apple_gpu_m4_power']):
         raise RuntimeError('Legacy C GPU provider is loaded')
     active = root_json('/run/aurorasilicon/m4-asahi-rust.json')
@@ -118,7 +124,7 @@ def preflight(args):
         raise RuntimeError('Qualification marker already exists; rollback supervisor may disarm')
     return {'boot_id': boot, 'source_commit': args.expected_source, 'kernel_release': os.uname().release,
             'kernel_image_sha256': sha(image), 'asahi_module_sha256': sha(module),
-            'source_state_sha256': sha(source_path), 'render_node': str(node), 'owner': 'asahi-g16',
+            'source_state_sha256': sha(source_path), 'render_node': str(node), 'owner': owner,
             'rollback_guard': guard, 'activation': active}
 
 
@@ -149,7 +155,7 @@ def compile_helper(args, output):
 
 
 def snapshot():
-    stats = Path('/sys/kernel/debug/asahi-g16/stats').read_text()
+    stats = next(p for p in G16_STATS if p.exists()).read_text()
     published = re.search(r'^publications: compute (\d+) render (\d+)\s*$', stats, re.M)
     if not published:
         raise RuntimeError('Missing actual firmware-producer publication counters; refuse live regression')

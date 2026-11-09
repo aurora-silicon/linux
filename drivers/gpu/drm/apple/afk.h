@@ -76,6 +76,8 @@ struct apple_epic_service {
 	/* Compact EPIC (desktop 26.x): the announced identity and OPEN state. */
 	char name[33];
 	s64 unit;
+	/* DCP poweron generation that announced this compact service. */
+	u32 power_gen;
 	bool defer_start;
 	bool started;
 	bool local;
@@ -89,8 +91,20 @@ struct apple_epic_service {
 
 enum epic_subtype;
 
+/* A compact service announcement's name field, with its NUL */
+#define AFK_COMPACT_NAME_LEN	32
+/* The shortest cut of a long compact service name that still identifies it */
+#define AFK_COMPACT_CUT_MIN	20
+
 struct apple_epic_service_ops {
 	const char name[32];
+	/*
+	 * A compact service whose announcement does not fit the 32-byte field:
+	 * its full "<name>:<unit>". The firmware cuts the announcement to 31
+	 * characters, losing the end of the name and the unit; a cut of this
+	 * string, at least AFK_COMPACT_CUT_MIN characters of it, matches.
+	 */
+	const char *compact_full;
 	/* All retained pointers must be pinned before enabling slot reuse. */
 	bool reusable;
 	/* EOPNOTSUPP from prepare means intentional absence only for this role. */
@@ -116,6 +130,9 @@ struct apple_epic_service_ops {
 		      const void *data, size_t data_size);
 	void (*teardown)(struct apple_epic_service *service);
 };
+
+bool afk_compact_cut_of(const struct apple_epic_service_ops *ops, const char *service_name);
+
 
 static inline int afk_ring_stride(u32 total, u32 bufsz, u32 *stride)
 {
@@ -503,6 +520,14 @@ struct apple_dcp_afkep {
 	bool compact;
 	struct list_head compact_cmds;	/* lock */
 	bool compact_shutting_down;	/* lock */
+	/*
+	 * T8132 dcpext: a command that times out leaves an orphan in
+	 * compact_cmds, which takes its late reply, so that the reply never
+	 * completes a later identical command. Set once at init.
+	 */
+	bool compact_keep_orphans;
+	unsigned int compact_orphans;	/* lock */
+	wait_queue_head_t compact_orphan_wq;
 	/* A message went out in part; no further sends (lock). */
 	bool compact_tx_desync;
 	/* Replies to firmware calls, see afk_compact_reply_worker(). */
@@ -532,6 +557,9 @@ afk_publish_service(struct apple_dcp_afkep *ep, const char *name,
 int afk_wait_service_open(struct apple_epic_service *service,
 			  unsigned int timeout_ms);
 void afk_cancel_commands(struct apple_dcp_afkep *ep);
+bool afk_compact_orphans_wait(struct apple_dcp_afkep *ep, unsigned long timeout);
+unsigned int afk_compact_orphans_drop(struct apple_dcp_afkep *ep);
+bool afk_compact_orphans_pending(struct apple_dcp_afkep *ep);
 void afk_shutdown(struct apple_dcp_afkep *ep);
 void afk_quiesce(struct apple_dcp_afkep *ep);
 int afk_receive_message(struct apple_dcp_afkep *ep, u64 message);

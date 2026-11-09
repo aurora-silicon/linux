@@ -264,6 +264,11 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 			dev_dbg(dchid->dev, "No OF node for subdevice %s, ignoring\n", name);
 			return NULL;
 		}
+		if (!of_device_is_available(of_node)) {
+			dev_dbg(dchid->dev, "Subdevice %s is disabled, ignoring\n", name);
+			of_node_put(of_node);
+			return NULL;
+		}
 
 		of_property_read_u32(of_node, "apple,power-method", &power_method);
 		firmware_managed_reset =
@@ -535,7 +540,8 @@ static int dchid_register_ring(struct dockchannel_hid *dchid)
 /*
  * Power method 2: announce the transition, drive the AFE reset line to the
  * new state and confirm the transition. The reset is asserted for a power-off
- * and held for 50 ms, and released for a power-on.
+ * and held for 50 ms, and released for a power-on and given 50 ms to settle
+ * before the transition is confirmed.
  */
 static int dchid_pm2_set_power(struct dchid_iface *iface, u8 state)
 {
@@ -553,12 +559,23 @@ static int dchid_pm2_set_power(struct dchid_iface *iface, u8 state)
 		if (state == DCHID_POWER_STATE_ON)
 			fsleep(50 * USEC_PER_MSEC);
 	} else {
-		ret = gpiod_set_value_cansleep(dchid->afe_reset,
-					       state == DCHID_POWER_STATE_OFF);
-		if (ret < 0)
+		bool off = state == DCHID_POWER_STATE_OFF;
+
+		ret = gpiod_set_value_cansleep(dchid->afe_reset, off);
+		if (ret < 0) {
+			dev_err(dchid->dev, "%s: failed to %s the AFE reset: %d\n",
+				iface->name, off ? "assert" : "release", ret);
 			return ret;
-		if (state == DCHID_POWER_STATE_OFF)
-			fsleep(50 * USEC_PER_MSEC);
+		}
+		dev_dbg(dchid->dev, "%s: AFE reset %s\n", iface->name,
+			off ? "asserted" : "released");
+		/*
+		 * The sequence validated on J716s (M5 Pro, MTP firmware
+		 * 6320.86.1, "Touch MT ready" on 3 of 3 boots) also waits
+		 * 50 ms after the release before HasChanged, as the
+		 * firmware-managed path above does.
+		 */
+		fsleep(50 * USEC_PER_MSEC);
 	}
 
 	dchid_pm2_command(iface->index, state, true, msg);
@@ -1698,7 +1715,11 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 		if (!dchid->ring)
 			return -ENOMEM;
 	}
-	dchid->new_iface_wq = alloc_ordered_workqueue("dchid-new", 0);
+	/*
+	 * Freeze interface creation across system sleep so the HID devices
+	 * stay stable while the suspend and resume callbacks walk them.
+	 */
+	dchid->new_iface_wq = alloc_ordered_workqueue("dchid-new", WQ_FREEZABLE);
 	if (!dchid->new_iface_wq)
 		return -ENOMEM;
 
@@ -1755,17 +1776,50 @@ static void dockchannel_hid_remove(struct platform_device *pdev)
 static int dockchannel_hid_suspend(struct device *dev)
 {
 	struct dockchannel_hid *dchid = dev_get_drvdata(dev);
+	int i, ret;
 
+	/* HID drivers may still need the transport while preparing for sleep. */
+	for (i = 0; i < MAX_INTERFACES; i++) {
+		struct dchid_iface *iface = dchid->ifaces[i];
+
+		if (!iface || !iface->hid)
+			continue;
+		ret = hid_driver_suspend(iface->hid, PMSG_SUSPEND);
+		if (ret)
+			goto unwind;
+	}
 	WRITE_ONCE(dchid->suspended, true);
 	return 0;
+
+unwind:
+	/* PM does not call our resume when this callback fails. */
+	while (--i >= 0) {
+		struct dchid_iface *iface = dchid->ifaces[i];
+
+		if (iface && iface->hid)
+			hid_driver_resume(iface->hid);
+	}
+	return ret;
 }
 
 static int dockchannel_hid_resume(struct device *dev)
 {
 	struct dockchannel_hid *dchid = dev_get_drvdata(dev);
+	int i, ret = 0;
 
+	/* Allow feature requests again before notifying any HID driver. */
 	WRITE_ONCE(dchid->suspended, false);
-	return 0;
+	for (i = 0; i < MAX_INTERFACES; i++) {
+		struct dchid_iface *iface = dchid->ifaces[i];
+		int err;
+
+		if (!iface || !iface->hid)
+			continue;
+		err = hid_driver_resume(iface->hid);
+		if (!ret)
+			ret = err;
+	}
+	return ret;
 }
 
 static DEFINE_SIMPLE_DEV_PM_OPS(dockchannel_hid_pm_ops, dockchannel_hid_suspend,

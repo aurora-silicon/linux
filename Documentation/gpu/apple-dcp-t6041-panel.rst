@@ -140,8 +140,11 @@ programmed mode; the original DCP sync positions and mode IDs are unchanged.
 This also lets a 118-line porch and 82-line notch-expanded pulse publish an
 identity instead of failing the base EDID size check.
 The EDID records model year 2024 (not a manufacture date) and a nominal D65
-reference white point required by EDID parsing. No calibrated primaries, gamma,
-new mode or machine serial is claimed. The ADT reader,
+reference white point required by EDID parsing. When a complete valid optional
+firmware colour description is available, the shared encoder supplies its
+primaries, white and gamma instead; see :doc:`apple-dcp-panel-colorimetry`.
+Missing colour data does not imply calibrated primaries or gamma. No new mode
+or machine serial is claimed. The ADT reader,
 EDID fallback and real EDID setters are restricted to desktop 26.6; T8140
 continues to use its existing path.
 
@@ -180,3 +183,38 @@ A failed transaction must publish no partial handoff. Loader host tests should
 cover supported DT without the chosen property, an unsupported board/DT, and
 each failed validation, as well as unchanged other-SoC policy. No new policy
 flag or kernel bypass is needed. This kernel series does not replace Stage 2.
+
+
+Desktop external audio (draft)
+------------------------------
+
+The desktop audio integration uses the existing DCP PCM and native link
+lifecycle, with a separate compact service binding on endpoint 0x2b. Endpoint
+0x29 retains AV device control. Only the external processors
+(``apple,t6041-dcpext``) admit the ``dcpav-audio-interface-epic`` unit-zero
+service; the internal panel does not acquire an audio client. With its role
+prefix the compact announcement does not fit its 32-byte field and arrives cut
+to 31 characters without the unit; such a cut of at least 20 characters is
+admitted as unit zero. ``hdmi_audio`` (on by default; 0 turns it off) controls
+service startup.
+
+A PCM opens and pins one service instance. Prepare, Start, Stop and Complete
+use that instance's element link data. Sink termination disconnects the card,
+drains the DMA and completes its link before closing that instance. Replacement
+services cannot inherit an old instance's Close or link completion. Compact
+method replies must have the expected body length; serialized property replies
+must contain their declared used bytes within the actual received body.
+
+J616s DPA1 and DPA2 are described with SIO channels 0x66 and 0x68, connected
+bidirectionally to DCPEXT0 and DCPEXT1 port zero, respectively. DPA1 is
+enabled with the SIO DART, mailbox, CPU domain and the DPA power domains. The
+SIO node stays disabled in the device tree: the boot loader reserves the
+firmware iBoot preloaded, publishes the T6041 boot tables and enables the node
+(``apple,t6041-sio``, see the apple-sio driver). DPA2 stays disabled until it
+is qualified the same way.
+
+The desktop service name/unit, shared 13.5 command numbers and native 14.7 link
+and element layouts are provisional integration choices. Build and synthetic
+regression results cannot qualify them against firmware. Qualification must
+confirm those contracts and actual sink element catalogs before enabling these
+outputs. No sink-specific rates or capabilities are synthesized here.

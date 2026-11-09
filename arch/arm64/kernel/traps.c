@@ -30,6 +30,7 @@
 #include <linux/ubsan.h>
 #include <linux/cfi.h>
 
+#include <asm/apple_amx.h>
 #include <asm/atomic.h>
 #include <asm/bug.h>
 #include <asm/cpufeature.h>
@@ -889,6 +890,14 @@ const char *esr_get_class_string(unsigned long esr)
 void bad_el0_sync(struct pt_regs *regs, int reason, unsigned long esr)
 {
 	unsigned long pc = instruction_pointer(regs);
+	u32 insn;
+
+	/* Apple reports AMX instructions with AMX disabled as an IMPDEF EC */
+	if (IS_ENABLED(CONFIG_ARM64_APPLE_AMX) &&
+	    ESR_ELx_EC(esr) == ESR_ELx_EC_APPLE_IMPDEF &&
+	    (esr & ESR_ELx_ISS_MASK) == ESR_APPLE_ISS_AMX_DISABLED &&
+	    !user_insn_read(regs, &insn) && try_handle_apple_amx(regs, insn))
+		return;
 
 	current->thread.fault_address = 0;
 	current->thread.fault_code = esr;

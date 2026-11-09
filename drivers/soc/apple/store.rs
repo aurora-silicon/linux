@@ -359,6 +359,12 @@ impl<F: StoreIo> Store<F> {
         self.slots.iter().position(|s| !s.used)
     }
 
+    /// Admission check for the copy-on-write slot used by the next write.
+    /// Even replacing an existing key needs a free slot until commit.
+    pub(crate) fn can_write(&self, key: &Key, len: usize) -> bool {
+        valid_kind(key.kind) && len <= MAX_VALUE && self.find_free().is_some()
+    }
+
     fn block_offset(slot: usize) -> u64 {
         ((slot + 1) * BLOCK_SIZE) as u64
     }

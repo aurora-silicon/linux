@@ -1,0 +1,122 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * MacBook Pro (14-inch, M4 Pro)
+ *
+ * target-type: J614s
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include "t6040.dtsi"
+#include "t604x-j614-j616.dtsi"
+
+/ {
+	compatible = "apple,j614s", "apple,t6040", "apple,arm-platform";
+	model = "Apple MacBook Pro (14-inch, M4 Pro)";
+};
+
+/* ADT /arm-io/wlan module-instance */
+&wifi0 {
+	brcm,board-type = "apple,mriya";
+};
+
+&bluetooth0 {
+	brcm,board-type = "apple,mriya";
+};
+
+&panel {
+	compatible = "apple,panel-j614", "apple,panel-mini-led", "apple,panel";
+	width-mm = <302>;
+	height-mm = <196>;
+	adj-height-mm = <189>;
+};
+
+&aop_audio {
+	apple,chassis-name = "J614";
+};
+
+/*
+ * The speakers wait for their own bring-up and a J614 protection profile.
+ * Until then the speaker card and the six amps stay disabled, so nothing
+ * can drive them; the headphone jack card is unaffected.
+ */
+&sound {
+	compatible = "apple,j614-macaudio", "apple,macaudio";
+	model = "MacBook Pro J614";
+	status = "disabled";
+};
+
+&speaker_left_woof1 {
+	status = "disabled";
+};
+
+&speaker_left_woof2 {
+	status = "disabled";
+};
+
+&speaker_left_tweet {
+	status = "disabled";
+};
+
+&speaker_right_woof1 {
+	status = "disabled";
+};
+
+&speaker_right_woof2 {
+	status = "disabled";
+};
+
+&speaker_right_tweet {
+	status = "disabled";
+};
+
+&sound_jack {
+	compatible = "apple,j614-macaudio-jack", "apple,macaudio";
+	model = "MacBook Pro J614 Jack";
+};
+
+&mtp_mt {
+	firmware-name = "apple/tpmtfw-j614s.bin";
+};
+
+/*
+ * Per-device factory data from this Mac's own iBoot system container: the
+ * sealed calibration and the sealed root key.
+ */
+&mesa {
+	firmware-name = "apple/mesacal-j614s.bin", "apple/msrk-j614s.bin";
+};
+
+/* The loader reserves this boot's ISP firmware before enabling the camera. */
+&isp {
+	memory-region = <&isp_j614_text>, <&isp_j614_data>, <&isp_j614_heap>;
+	status = "disabled";
+};
+
+/delete-node/ &isp_fw_text;
+/delete-node/ &isp_fw_data;
+/delete-node/ &isp_heap;
+
+/ {
+	reserved-memory {
+		isp_j614_text: isp-firmware-text { };
+		isp_j614_data: isp-firmware-data { };
+		isp_j614_heap: isp-heap {
+			iommu-addresses = <&isp 0x100 0x0 0x0 0x2000000>;
+		};
+	};
+};
+
+&isp_dart0 {
+	status = "disabled";
+};
+
+&isp_dart1 {
+	status = "disabled";
+};
+
+&isp_dart2 {
+	status = "disabled";
+};
