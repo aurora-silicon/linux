@@ -342,6 +342,20 @@ impl InitData {
             mmu::UAT_PGSZ as u64, mmu::PROT_FW_SHARED_RW)?;
         self.metrics_fw_va = alias.iova();
         self.aliases.push(alias, GFP_KERNEL)?;
+        if super::J813_FORMS.load(Ordering::Relaxed) {
+            // The J813's firmware touches a render's metrics in context 0 (the kernel lower VM)
+            // at the client's compact-window address. Every client VM maps its metrics entry at
+            // the window's start plus the entry's offset (MetricsLease::map_client), so map the
+            // whole backing at the window's start here.
+            let start = super::buffer::BlockGeometry::M5_COMPACT.start;
+            let alias = metrics.alias_in(uat.kernel_lower_vm(),
+                start..start + metrics.size() as u64, mmu::UAT_PGSZ as u64,
+                mmu::PROT_GPU_SHARED_RW)?;
+            if alias.iova() != start {
+                return Err(EINVAL);
+            }
+            self.aliases.push(alias, GFP_KERNEL)?;
+        }
         Ok(())
     }
 

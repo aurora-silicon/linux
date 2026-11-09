@@ -1870,6 +1870,14 @@ impl Gpu {
             board.graph,
         ))
         .inspect_err(at("lower links"))?;
+        // The J813's firmware runs part of a render in context 0, whose user root is the kernel
+        // lower VM, and touches the render's metrics through their compact-window address
+        // there (InitData::bind_m5_metrics): link that window's table too.
+        if J813_FORMS.load(core::sync::atomic::Ordering::Relaxed) {
+            let compact = buffer::BlockGeometry::M5_COMPACT.start;
+            uat.prepare_lower_tables(&[compact..compact + mmu::UAT_PGSZ as u64])
+                .inspect_err(at("lower links"))?;
+        }
         // The J813 in native order, from aura's trace of macOS 27.0 on that machine: the start
         // control is written first (macOS does it at platform init), the coprocessors are started
         // next, and the Fender gating is cleared only once both of them run -- not before them.
