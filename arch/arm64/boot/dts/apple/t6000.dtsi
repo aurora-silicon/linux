@@ -91,6 +91,26 @@
 		<&ps_ane_set2>, <&ps_ane_set3>, <&ps_ane_set4>, <&ps_pms_sram>;
 };
 
+/*
+ * T6000 has no power state registers for the AFNC3 fabric controllers or
+ * the USB-A AON domain: they are always on without a PMGR switch.
+ */
+&ps_afnc3_ioa {
+	status = "disabled";
+};
+
+&ps_afnc3_ls {
+	status = "disabled";
+};
+
+&ps_afnc3_lw0 {
+	status = "disabled";
+};
+
+&ps_gp_usb_aon {
+	status = "disabled";
+};
+
 #include "t6000-peripherals.dtsi"
 #include "t6000-aux-spmi.dtsi"
 

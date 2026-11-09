@@ -97,14 +97,23 @@ static int apple_pmgr_ps_wait_parent(struct apple_pmgr_ps *ps, u32 *cur)
  * their state there anyway), then request @reg, the on state, again.
  * Domains whose bit 11 means a parent that is not up yet (wait_parent) and
  * those with their own state contract are left alone.
+ *
+ * Never during a system sleep transition: there the power-on comes from the
+ * genpd noirq resume, with the DARTs and the engine of the domain still in
+ * their noirq phase. On the T8140 a recovery at that point hangs the machine:
+ * in a suspend loop on the J700, kernels with it hung on 3 of 3 boots and came
+ * back only through the watchdog, while kernels without it hung on none of 6,
+ * two of which latched ANE_SYS and carried on with the ANE quarantined. The
+ * power-on then fails as it did before, and genpd, which ignores errors in
+ * that phase, keeps the domain requested on.
  */
 static int apple_pmgr_ps_clear_latch(struct apple_pmgr_ps *ps, u32 reg, u32 *cur)
 {
 	u32 off = (reg & ~APPLE_PMGR_PS_TARGET) | APPLE_PMGR_PS_PWRGATE;
 	int ret;
 
-	if (ps->wait_parent || ps->strict_state || ps->externally_clocked ||
-	    !(*cur & APPLE_PMGR_BUSY) ||
+	if (ps->system_sleep || ps->wait_parent || ps->strict_state ||
+	    ps->externally_clocked || !(*cur & APPLE_PMGR_BUSY) ||
 	    FIELD_GET(APPLE_PMGR_PS_ACTUAL, *cur) == APPLE_PMGR_PS_ACTIVE)
 		return -ETIMEDOUT;
 
