@@ -334,7 +334,7 @@ impl Backend {
                 packet.clone(),
                 &dependencies,
                 loan.lease,
-                self.backlog.load(Ordering::Acquire) > 1,
+                self.follower_ready(crate::g17::job::Engine::Render),
                 &mut host,
                 &mut |event| deferred.push(event),
             );

@@ -667,6 +667,11 @@ pub(super) struct Backend {
     owner: u64,
     backlog: core::sync::atomic::AtomicU32,
     compute_backlog: core::sync::atomic::AtomicU32,
+    /// Backlog packets which carried an unsignalled input or a firmware wait
+    /// at submission. While any is queued, a count-N group is not left open
+    /// for a follower: that follower may wait on the open group's own output.
+    waiting_backlog: core::sync::atomic::AtomicU32,
+    compute_waiting_backlog: core::sync::atomic::AtomicU32,
     closed: core::sync::atomic::AtomicBool,
     /// The cell of the compute queue this owner last published to under the device mutex,
     /// with the shared compute objects mapped into its VM. Direct publication revalidates the
@@ -811,6 +816,8 @@ impl Backend {
                     owner,
                     backlog: core::sync::atomic::AtomicU32::new(0),
                     compute_backlog: core::sync::atomic::AtomicU32::new(0),
+                    waiting_backlog: core::sync::atomic::AtomicU32::new(0),
+                    compute_waiting_backlog: core::sync::atomic::AtomicU32::new(0),
                     closed: core::sync::atomic::AtomicBool::new(false),
                     direct <- kernel::new_mutex!(None, "g17::Backend::direct"),
                     claimed <- kernel::new_mutex!(None, "g17::Backend::claimed"),
@@ -1859,7 +1866,7 @@ impl Backend {
             outer: Some(outer),
             generation: port.generation(),
         };
-        let more = self.compute_backlog.load(Ordering::Acquire) > 1;
+        let more = self.follower_ready(super::job::Engine::Compute);
         match queue.publish(packet.clone(), &[], more, &mut host, &mut |event| deferred.push(event)) {
             Err(error) if (error == EAGAIN || error == EBUSY) && !packet.is_published() => None,
             result => Some(result),
@@ -2074,7 +2081,7 @@ impl Backend {
             return Err(render::FALLBACK);
         }
         let dependencies = firmware.queues.render_prefix(self.owner, packet)?;
-        let more = self.compute_backlog.load(Ordering::Acquire) > 1;
+        let more = self.follower_ready(super::job::Engine::Compute);
         match firmware.publish_compute(
             self.owner,
             packet.clone(),
@@ -2218,7 +2225,7 @@ impl Backend {
                 self.owner,
                 packet.clone(),
                 dependencies.as_slice(),
-                self.compute_backlog.load(Ordering::Acquire) > 1,
+                self.follower_ready(super::job::Engine::Compute),
                 deferred,
             );
             if !packet.is_published()

@@ -13,8 +13,31 @@ use kernel::{dma_fence::Fence, drm::sched, prelude::*, sync::Arc};
 impl Backend {
     pub(super) fn release_backlog(&self, packet: &Packet) {
         if packet.take_backlog() {
+            if packet.has_dependencies() {
+                self.waiting_backlog_of(packet).fetch_sub(1, Ordering::AcqRel);
+            }
             self.backlog_of(packet).fetch_sub(1, Ordering::AcqRel);
         }
+    }
+
+    fn waiting_backlog_of(&self, packet: &Packet) -> &core::sync::atomic::AtomicU32 {
+        match packet.engine() {
+            Engine::Render => &self.waiting_backlog,
+            Engine::Compute => &self.compute_waiting_backlog,
+        }
+    }
+
+    /// Whether the publication in progress (itself still counted in the
+    /// backlog) is followed by an accepted packet which needs nothing else to
+    /// run. Only then may a count-N arm leave its tag-14 group open: a
+    /// follower waiting on a fence could be waiting on this very group, which
+    /// firmware cannot see until the group is announced.
+    pub(super) fn follower_ready(&self, engine: Engine) -> bool {
+        let (all, waiting) = match engine {
+            Engine::Render => (&self.backlog, &self.waiting_backlog),
+            Engine::Compute => (&self.compute_backlog, &self.compute_waiting_backlog),
+        };
+        waiting.load(Ordering::Acquire) == 0 && all.load(Ordering::Acquire) > 1
     }
 
     pub(super) fn backlog_of(&self, packet: &Packet) -> &core::sync::atomic::AtomicU32 {
@@ -363,6 +386,9 @@ impl job::Backend for Backend {
 
     fn count_backlog(&self, packet: &Packet) {
         packet.count_backlog();
+        if packet.has_dependencies() {
+            self.waiting_backlog_of(packet).fetch_add(1, Ordering::AcqRel);
+        }
         self.backlog_of(packet).fetch_add(1, Ordering::AcqRel);
     }
 }

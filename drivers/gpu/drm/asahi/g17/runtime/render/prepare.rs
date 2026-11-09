@@ -11,7 +11,6 @@ use crate::g17::{
     object::{Allocator, KernelObject, Pool},
     queue::render::{Pair, RenderAddresses},
 };
-use core::sync::atomic::Ordering;
 use kernel::{prelude::*, sync::Arc};
 
 struct BuildResources {
@@ -742,7 +741,7 @@ impl super::super::Backend {
                 self.owner,
                 slot,
                 packet,
-                self.backlog.load(Ordering::Acquire) > 1,
+                self.follower_ready(crate::g17::job::Engine::Render),
                 deferred,
             )
         })();
