@@ -49,6 +49,12 @@ pub(super) struct View(pub(super) kernel::sync::Arc<super::Shared>);
 
 impl kernel::debugfs::Writer for View {
     fn write(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        {
+            use super::freelist::{GL_LIVE, GL_BYTES, GL_MAX_BLOCKS};
+            writeln!(f, "gpulost_lower render_live={} render_bytes={} render_max_blocks={} compute_live={} compute_bytes={} compute_max_blocks={}",
+                GL_LIVE[0].load(Ordering::Relaxed), GL_BYTES[0].load(Ordering::Relaxed), GL_MAX_BLOCKS[0].load(Ordering::Relaxed),
+                GL_LIVE[1].load(Ordering::Relaxed), GL_BYTES[1].load(Ordering::Relaxed), GL_MAX_BLOCKS[1].load(Ordering::Relaxed))?;
+        }
         writeln!(f, "version=1 sampled_ns={} crashed={}", super::now_ns(),
                  u8::from(self.0.crashed.load(Ordering::Acquire)))?;
         let uat = {

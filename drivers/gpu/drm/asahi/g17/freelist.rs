@@ -131,6 +131,40 @@ pub(crate) struct Pages {
 impl Drop for Pages {
     fn drop(&mut self) {
         LOWER_FREED.fetch_add(1, Ordering::AcqRel);
+        let k = matches!(self.layout, RunLayout::Compute) as usize;
+        GL_LIVE[k].fetch_sub(1, Ordering::Relaxed);
+        GL_BYTES[k].fetch_sub((TABLE_SIZE + self.blocks * FREE_LIST_BLOCK_SIZE) as u64, Ordering::Relaxed);
+    }
+}
+
+// GPULOST diagnostic: live free-list backings in the lower window, by kind (0 render, 1 compute).
+pub(crate) static GL_LIVE: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+pub(crate) static GL_BYTES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+pub(crate) static GL_MAX_BLOCKS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static GL_FAILS: AtomicU64 = AtomicU64::new(0);
+fn gl_note(layout: RunLayout, blocks: usize, ok: bool) {
+    let k = matches!(layout, RunLayout::Compute) as usize;
+    let size = (TABLE_SIZE + blocks * FREE_LIST_BLOCK_SIZE) as u64;
+    let task = kernel::current!();
+    let tgid = task.group_leader().pid();
+    if ok {
+        GL_LIVE[k].fetch_add(1, Ordering::Relaxed);
+        GL_BYTES[k].fetch_add(size, Ordering::Relaxed);
+        GL_MAX_BLOCKS[k].fetch_max(blocks as u64, Ordering::Relaxed);
+        if blocks > [RENDER_BLOCKS, COMPUTE_BLOCKS][k] {
+            pr_info!("GPULOST lower alloc {} blocks={} MiB={} tgid={} live render={}/{}MiB compute={}/{}MiB\n",
+                ["render", "compute"][k], blocks, size >> 20, tgid,
+                GL_LIVE[0].load(Ordering::Relaxed), GL_BYTES[0].load(Ordering::Relaxed) >> 20,
+                GL_LIVE[1].load(Ordering::Relaxed), GL_BYTES[1].load(Ordering::Relaxed) >> 20);
+        }
+    } else {
+        let n = GL_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            pr_info!("GPULOST lower refused {} blocks={} MiB={} tgid={} fails={} live render={}/{}MiB compute={}/{}MiB\n",
+                ["render", "compute"][k], blocks, size >> 20, tgid, n,
+                GL_LIVE[0].load(Ordering::Relaxed), GL_BYTES[0].load(Ordering::Relaxed) >> 20,
+                GL_LIVE[1].load(Ordering::Relaxed), GL_BYTES[1].load(Ordering::Relaxed) >> 20);
+        }
     }
 }
 impl Pages {
@@ -143,10 +177,11 @@ impl Pages {
                 mmu::PROT_GPU_SHARED_RW,
                 CpuMap::WriteCombined,
             )
-        })?;
+        }).inspect_err(|_| gl_note(layout, blocks, false))?;
         Self::from_backing(backing, blocks, layout)
     }
     fn from_backing(mut backing: KernelObject, blocks: usize, layout: RunLayout) -> Result<Self> {
+        gl_note(layout, blocks, true);
         let base = backing.gpu_va();
         backing.initialize::<PoolTables>(0, |tables| tables.init(base, blocks, layout))?;
         Ok(Self {
@@ -218,7 +253,7 @@ impl RenderBacking {
                 CpuMap::WriteCombined,
                 [render_global, client],
             )
-        })?;
+        }).inspect_err(|_| gl_note(RunLayout::Render, blocks, false))?;
         let pages = Pages::from_backing(backing, blocks, RunLayout::Render)?;
         Ok(Self {
             _client: client,
