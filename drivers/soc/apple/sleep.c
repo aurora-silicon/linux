@@ -628,17 +628,17 @@ static bool sleep_slp_ddr_ready;
  * DRAM up for: after its firmware crashed, the next SLP_DDR wake stalled in the sleep engine,
  * while the deep path doesn't need it. Nothing restarts it short of a reboot.
  */
-static bool t8140_slp_ddr_crashed;
+static bool sleep_slp_ddr_crashed;
 
-static void t8140_slp_ddr_write(void)
+static void sleep_slp_ddr_write(void)
 {
 	u32 val;
 
 	lockdep_assert_held(&sleep_slp_ddr_lock);
 	if (!sleep_slp_ddr_word)
 		return;
-	val = readl(t8140_slp_ddr_word) & ~WAKE_SLP_DDR_USB;
-	if (t8140_slp_ddr_usb && t8140_slp_ddr_ready && !t8140_slp_ddr_crashed)
+	val = readl(sleep_slp_ddr_word) & ~WAKE_SLP_DDR_USB;
+	if (sleep_slp_ddr_usb && sleep_slp_ddr_ready && !sleep_slp_ddr_crashed)
 		val |= WAKE_SLP_DDR_USB;
 	writel(val, sleep_slp_ddr_word);
 }
@@ -659,15 +659,15 @@ EXPORT_SYMBOL_GPL(apple_sleep_usb_slp_ddr);
  */
 void apple_sleep_coproc_crashed(struct device *dev)
 {
-	if (!t8140_sleep || t8140_sleep_coproc_find(dev))
+	if (!apple_sleep || apple_sleep_coproc_find(dev))
 		return;
-	scoped_guard(spinlock_irqsave, &t8140_slp_ddr_lock) {
-		if (t8140_slp_ddr_crashed)
+	scoped_guard(spinlock_irqsave, &sleep_slp_ddr_lock) {
+		if (sleep_slp_ddr_crashed)
 			return;
-		t8140_slp_ddr_crashed = true;
-		t8140_slp_ddr_write();
+		sleep_slp_ddr_crashed = true;
+		sleep_slp_ddr_write();
 	}
-	dev_warn(t8140_sleep->dev, "%s crashed: later sleeps take the deep path\n", dev_name(dev));
+	dev_warn(apple_sleep->dev, "%s crashed: later sleeps take the deep path\n", dev_name(dev));
 }
 EXPORT_SYMBOL_GPL(apple_sleep_coproc_crashed);
 
@@ -678,19 +678,19 @@ EXPORT_SYMBOL_GPL(apple_sleep_coproc_crashed);
  */
 void apple_sleep_next_deep(struct device *dev)
 {
-	if (!t8140_sleep)
+	if (!apple_sleep)
 		return;
-	scoped_guard(spinlock_irqsave, &t8140_slp_ddr_lock) {
-		if (!t8140_slp_ddr_ready)
+	scoped_guard(spinlock_irqsave, &sleep_slp_ddr_lock) {
+		if (!sleep_slp_ddr_ready)
 			return;
-		t8140_slp_ddr_ready = false;
-		t8140_slp_ddr_write();
+		sleep_slp_ddr_ready = false;
+		sleep_slp_ddr_write();
 	}
-	dev_info(t8140_sleep->dev, "%s ran: the next sleep takes the deep path\n", dev_name(dev));
+	dev_info(apple_sleep->dev, "%s ran: the next sleep takes the deep path\n", dev_name(dev));
 }
 EXPORT_SYMBOL_GPL(apple_sleep_next_deep);
 
-static bool t8140_debug_link_cut;
+static bool sleep_debug_link_cut;
 
 /* Only the debug port's controller took the cold reset. */
 static bool sleep_debug_port_is(struct device *dev)
