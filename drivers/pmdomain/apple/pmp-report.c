@@ -2077,6 +2077,17 @@ int apple_pmp_report_set_request(const struct device_node *report_np, unsigned i
 }
 EXPORT_SYMBOL_GPL(apple_pmp_report_set_request);
 
+/*
+ * T8112 SOC-DEV-DVFS entries are indexed by soc-device ID from a base of
+ * 0xa5, so EACC0 (soc-device 3), PACC0 (4) and ANE0 (6) are 0xa8, 0xa9 and
+ * 0xab. Their PTD request bit is the soc-device ID - 1, as for report entries.
+ */
+#define PMP_T8112_DVFS_SOC_DEV_BASE	0xa5
+#define PMP_T8112_DVFS_SOC_DEV(entry)	((entry) - PMP_T8112_DVFS_SOC_DEV_BASE)
+#define PMP_T8112_DVFS_EACC0		(PMP_T8112_DVFS_SOC_DEV_BASE + 3)
+#define PMP_T8112_DVFS_PACC0		(PMP_T8112_DVFS_SOC_DEV_BASE + 4)
+#define PMP_T8112_DVFS_ANE0		(PMP_T8112_DVFS_SOC_DEV_BASE + 6)
+
 /**
  * apple_pmp_report_t8112_clpc_request() - set a T8112 CLPC memory/fabric vote
  * @np: PMP report provider
@@ -2100,11 +2111,13 @@ int apple_pmp_report_t8112_clpc_request(const struct device_node *np,
 	bool active, owned;
 	int ret = -EPROBE_DEFER;
 
-	if (!np || (entry != 0xa8 && entry != 0xa9 && entry != 0xab) ||
+	if (!np || (entry != PMP_T8112_DVFS_EACC0 &&
+		    entry != PMP_T8112_DVFS_PACC0 &&
+		    entry != PMP_T8112_DVFS_ANE0) ||
 	    dcs > 4 || soc > 2)
 		return -EINVAL;
-	/* EACC0, PACC0 and ANE0 are soc-devices 3, 4 and 6 respectively. */
-	ps_id = entry - 0xa6;
+	/* The constraint entry and the PS request bit both follow the soc-device ID. */
+	ps_id = PMP_T8112_DVFS_SOC_DEV(entry) - 1;
 	ps_bit = BIT_ULL(ps_id);
 	active = dcs || soc;
 
