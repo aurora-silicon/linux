@@ -69,6 +69,7 @@ ASAHI_TESTS = {
     'apple-m4-pmu-tests.py': [([], PASS)]
         + mutations('--mutation', ('m1-layout', 'cycles-anywhere', 'expose-8-9', 'flags-in-event'), []),
     'apple-dart-fw-tests.py': [(out(), PASS)],
+    'apple-dart-fw-harness-tests.py': [([], PASS)],
     'apple-dart-range-tests.py': [([], PASS)],
     'asahi-stats-raw-tests.py': [([], PASS)],
     'agx-stats-busy-tests.py': [([], PASS), (['--negative-control'], PASS)],
