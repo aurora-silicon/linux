@@ -2189,10 +2189,11 @@ static int apple_rtkit_sleep_idle(struct apple_rtkit *rtk, void __iomem *cpu_con
 	ret = readl_poll_timeout(cpu_control + APPLE_ASC_CPU_STATUS, status,
 				 (status & APPLE_ASC_CPU_STATUS_DOWN) == APPLE_ASC_CPU_STATUS_DOWN,
 				 100, 5000);
+	/* Both idles took, so it doesn't run on: stop it as if the status had shown it. */
 	if (ret)
-		dev_err(rtk->dev, "RTKit: idle, but not stopped: status %#x\n", status);
+		dev_warn(rtk->dev, "RTKit: idle, but not stopped: status %#x\n", status);
 
-	return ret;
+	return 0;
 }
 
 /* With interrupts off: room in the FIFO, then the message. */
@@ -2339,9 +2340,15 @@ int apple_rtkit_sleep_return(struct apple_rtkit *rtk, void __iomem *cpu_control)
 	 * No real sleep: a firmware that idled doesn't come back from that with its power kept,
 	 * and stays down until the next sleep restarts it. One whose idle failed still runs.
 	 */
-	if (!pm_resume_via_firmware())
-		return (readl(cpu_control) & APPLE_ASC_CPU_CONTROL_RUN) &&
-		       (rtk->iop_power_state & 0xff) == APPLE_RTKIT_PWR_STATE_ON ? 0 : -EAGAIN;
+	if (!pm_resume_via_firmware()) {
+		if (!(readl(cpu_control) & APPLE_ASC_CPU_CONTROL_RUN) ||
+		    (rtk->iop_power_state & 0xff) != APPLE_RTKIT_PWR_STATE_ON)
+			return -EAGAIN;
+		/* Its AP idle took and its IOP idle didn't: endpoints stay shut until AP on. */
+		if ((rtk->ap_power_state & 0xff) != APPLE_RTKIT_PWR_STATE_ON)
+			return apple_rtkit_ap_power(rtk, true);
+		return 0;
+	}
 
 	ret = apple_rtkit_warm_restart(rtk);
 	if (ret)

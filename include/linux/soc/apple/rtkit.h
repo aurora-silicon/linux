@@ -315,7 +315,7 @@ int apple_rtkit_sleep_stop(struct apple_rtkit *rtk, void __iomem *cpu_control);
  * then sets the AP state. Where it didn't, one that idled gets -EAGAIN: an idled
  * firmware doesn't wake with its power kept, so it stays down, and comes back the
  * same way after the next sleep that does reach the hardware. One whose idle
- * failed still runs, and gets 0.
+ * failed still runs, and gets 0 once its AP state is on again.
  *
  * @cpu_control: the ASC's CPU control register.
  */
