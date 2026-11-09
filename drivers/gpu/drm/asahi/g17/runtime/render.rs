@@ -1060,6 +1060,8 @@ impl Registry {
             // that arrived meanwhile waits for an unrelated later event or the
             // one-millisecond rescan.
             if hit && (entry.preparing.is_some() || entry.growing) {
+                crate::g17::trace::hold(crate::g17::trace::RENDER,
+                    entry.reservation.ids[1].qid(), 0, 0, 0, 8, 8);
                 entry.missed_event = true;
             }
         }

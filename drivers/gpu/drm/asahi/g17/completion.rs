@@ -269,8 +269,15 @@ pub(crate) struct Completion {
     vm_job: Mutex<Option<mmu::VmJobGuard>>,
     #[pin]
     render: Mutex<Option<super::queue::admission::RenderLease>>,
-    signalled: AtomicBool,
+    // Output aggregation may release its work-state reference at early signal.
+    // Keep that ioctl node owned until physical retirement, including render.
+    #[pin]
+    stamp_work: Mutex<Option<Arc<WorkStateLease>>>,
+    // 0 pending, 1 ordinary/failure output, 2 successful stamp output.
+    // One atomic claim lets late accounting distinguish early success from error.
+    signalled: AtomicU8,
     retirement_queued: AtomicBool,
+    stamp_queued: AtomicBool,
     accepted: AtomicBool,
     timeout_error: AtomicI32,
     replays: AtomicU8,
@@ -336,8 +343,10 @@ impl Completion {
                 sources,
                 vm_job <- new_mutex!(Some(vm_job), "G17 command VM pin"),
                 render <- new_mutex!(None, "G17 command render lease"),
-                signalled: AtomicBool::new(false),
+                stamp_work <- new_mutex!(None, "G17 stamp output work-state pin"),
+                signalled: AtomicU8::new(0),
                 retirement_queued: AtomicBool::new(false),
+                stamp_queued: AtomicBool::new(false),
                 accepted: AtomicBool::new(false),
                 timeout_error: AtomicI32::new(0),
                 replays: AtomicU8::new(0),
@@ -432,8 +441,8 @@ impl Completion {
         Ok(self.compute.as_ref().ok_or(EINVAL)?.page()?.mapping.iova())
     }
 
-    /// The caller has proved that firmware retired this command, or has
-    /// received its scheduler kill acknowledgement with recovery closed.
+    /// The caller has observed this command's real completion stamp, proved
+    /// retirement, or received its kill acknowledgement with recovery closed.
     /// These are the command's public timestamp words, not queue-private state.
     pub(crate) fn compute_words(&self) -> Result<[u64; 2]> {
         let object = &self.compute.as_ref().ok_or(EINVAL)?.page()?.object;
@@ -446,7 +455,7 @@ impl Completion {
     }
 
     pub(crate) fn replay_witness_words(&self) -> Option<[u64; 2]> {
-        if self.signalled.load(Ordering::Acquire) {
+        if self.signalled.load(Ordering::Acquire) != 0 {
             return None;
         }
         self.compute_words().ok()
@@ -481,12 +490,12 @@ impl Completion {
     }
 
     pub(crate) fn take_replay_timeout(&self) -> bool {
-        !self.signalled.load(Ordering::Acquire) && self.replay_timeout.swap(false, Ordering::AcqRel)
+        self.signalled.load(Ordering::Acquire) == 0 && self.replay_timeout.swap(false, Ordering::AcqRel)
     }
 
     /// Only a witnessed, retained command can be reset before republishing it.
     pub(crate) fn reset_for_replay(&self) -> Result {
-        if self.signalled.load(Ordering::Acquire) {
+        if self.signalled.load(Ordering::Acquire) != 0 {
             return Err(ECANCELED);
         }
         let object = &self.compute.as_ref().ok_or(EINVAL)?.page()?.object;
@@ -601,7 +610,7 @@ impl Completion {
         lease: super::queue::admission::RenderLease,
     ) -> Result {
         let mut render = self.render.lock();
-        if self.signalled.load(Ordering::Acquire) {
+        if self.signalled.load(Ordering::Acquire) != 0 {
             return Err(ECANCELED);
         }
         if render.is_some() {
@@ -641,9 +650,8 @@ impl Completion {
     /// An exact whole-pair drain or processor stop allows rehabilitation. The
     /// VM pin goes first; the still-held lease excludes reuse until both settle.
     pub(crate) fn release_after_retirement(&self) {
-        if let Some(sources) = &self.sources {
-            sources.release();
-        }
+        drop(self.stamp_work.lock().take());
+        if let Some(sources) = &self.sources { sources.release(); }
         drop(self.vm_job.lock().take());
         let lease = self.render.lock().take();
         if let Some(lease) = lease.as_ref() {
@@ -658,11 +666,63 @@ impl Completion {
     }
 
     fn release_healthy(&self) {
-        if let Some(sources) = &self.sources {
-            sources.release();
-        }
+        drop(self.stamp_work.lock().take());
+        if let Some(sources) = &self.sources { sources.release(); }
         drop(self.render.lock().take());
         drop(self.vm_job.lock().take());
+    }
+
+    /// Pin the ioctl work-state node before Output::publish can complete the
+    /// aggregate and drop its reference. This is not a drained-node witness.
+    pub(crate) fn retain_stamp_work(&self) -> Result {
+        let work = self.work_state()?;
+        *self.stamp_work.lock() = Some(work);
+        Ok(())
+    }
+
+    /// Called under the device mutex; never mark this as resource retirement.
+    pub(crate) fn note_stamp_queued(&self) {
+        self.stamp_queued.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn stamp_queued(&self) -> bool {
+        self.stamp_queued.load(Ordering::Acquire)
+    }
+
+    /// A real post-maintenance stamp permits output, but not ring/lease reuse.
+    pub(crate) fn stamp_eligible(&self) -> bool {
+        self.signalled.load(Ordering::Acquire) == 0
+            && !self.stamp_queued()
+            && !self.interrupted() && !self.blamed()
+            && self.timeout_error.load(Ordering::Acquire) == 0
+            && self.status.get() == 0
+    }
+
+    fn complete_stamp(&self, ticks: [u64; 4]) {
+        // Failure/recovery may have been attributed after collection, before this
+        // off-lock callback. Keep its exact error path and all physical pins.
+        if self.interrupted() || self.blamed() || self.status.get() != 0
+            || self.timeout_error.load(Ordering::Acquire) != 0
+        {
+            // Let the already attributed timeout/recovery/failure event publish
+            // its original errno. Do not synthesize a competing failure here.
+            return;
+        }
+        if self.check_source_inputs().is_err() {
+            // Keep native input failure on its existing retirement/failure path;
+            // an output witness is not permission to quarantine a physical queue.
+            return;
+        }
+        if self.signalled.compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire).is_err() { return; }
+        self.signal_terminal(Ok(ticks));
+        self.output.finish(Ok(ticks));
+    }
+
+    fn note_pass(&self, ticks: [u64; 4]) {
+        if let Some(feed) = &self.feed {
+            if self.compute.is_some() { feed.note_pass(ticks[0], ticks[1]); }
+            else { feed.note_pass(ticks[2], ticks[3]); }
+        }
     }
 
     /// Exact retirement permits the physical lease and VM pin to be released
@@ -674,7 +734,12 @@ impl Completion {
                 result = Err(error);
             }
         }
-        if self.signalled.swap(true, Ordering::AcqRel) {
+        if let Err(state) = self.signalled.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
+            // Only a successful stamp output defers pass accounting here. A
+            // queued candidate vetoed by failure must not account as success.
+            if state == 2 {
+                if let Ok(ticks) = result { self.note_pass(ticks); }
+            }
             return;
         }
         if result.is_ok() && self.interrupted() {
@@ -711,7 +776,7 @@ impl Completion {
     /// A rejected, never-published command cannot poison the VM for contention.
     #[track_caller]
     pub(crate) fn fail_unpublished(&self, error: Error) {
-        if self.signalled.swap(true, Ordering::AcqRel) {
+        if self.signalled.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return;
         }
         self.status.record_if_device_loss(error);
@@ -729,7 +794,7 @@ impl Completion {
     /// waking waiters, even if queue destruction requested cancellation.
     #[track_caller]
     pub(crate) fn fail_while_owned(&self, error: Error) {
-        if self.signalled.swap(true, Ordering::AcqRel) {
+        if self.signalled.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return;
         }
         if let Some(guard) = self.vm_job.lock().as_ref() {
@@ -756,6 +821,7 @@ fn discarded(error: Error) -> bool {
 /// Runtime queues establish the ownership witness before constructing `Retired`
 /// or `Release`; `FailedOwned` leaves their physical and VM ownership intact.
 pub(crate) enum Deferred {
+    Stamped(Arc<Completion>, [u64; 4]),
     Retired(Arc<Completion>, Result<[u64; 4]>),
     Drained(Arc<Completion>, Result<[u64; 4]>),
     FailedOwned(Arc<Completion>, Error),
@@ -766,6 +832,7 @@ pub(crate) enum Deferred {
 impl Deferred {
     pub(crate) fn finish(self) {
         match self {
+            Self::Stamped(completion, ticks) => completion.complete_stamp(ticks),
             Self::Retired(completion, result) => {
                 completion.complete(result);
                 // An earlier failure may already have signalled this fence while

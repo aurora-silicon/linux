@@ -28,6 +28,7 @@ mod channel;
 mod command;
 pub(crate) use command::Attachments;
 mod completion;
+mod stamp_complete;
 pub(crate) mod context;
 mod data_segment;
 mod dependency;

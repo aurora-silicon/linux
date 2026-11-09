@@ -78,6 +78,9 @@ impl crate::g17::Shared {
         masks: [u64; 2],
         deferred: &mut DeferredBatch,
     ) -> Result {
+        let stamp_epoch = if crate::g17::stamp_complete::enabled()
+            || crate::g17::trace::hold_enabled()
+        { self.preparations.try_enter().ok() } else { None };
         {
             let mut state = self.state.lock();
             let Some(firmware) = (*state).as_deref_mut() else {
@@ -99,7 +102,23 @@ impl crate::g17::Shared {
                     firmware.apply_render_deferred(slot as u8, deferred)?;
                 }
             }
+            if stamp_epoch.as_ref().is_some_and(|epoch| epoch.is_current())
+                && !firmware.recovery.pending() && !self.crashed.load(Ordering::Acquire)
+            {
+                let recovery = crate::g17::recovery::Memory::recovery_state(&firmware.init)?;
+                for entry in firmware.queues.render.entries.iter().flatten() {
+                    if entry.preparing.is_some() || entry.growing { continue; }
+                    let Some(pair) = entry.pair.as_ref() else { continue; };
+                    let qids = pair.qids();
+                    let stamps = [
+                        firmware.init.stamp(qids[0])?.load(Ordering::Relaxed),
+                        firmware.init.stamp(qids[1])?.load(Ordering::Relaxed),
+                    ];
+                    pair.observe_stamp_outputs(stamps, recovery, &mut |event| deferred.push(event))?;
+                }
+            }
         }
+        drop(stamp_epoch);
         deferred.finish();
         let mut cursor = 1;
         let mut remaining = crate::hw::t8140::queues::RENDER_DEPTH;

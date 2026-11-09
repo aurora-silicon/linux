@@ -13,6 +13,39 @@
 
 #include <linux/tracepoint.h>
 
+/* known/value bits: 0 stamps, 1 cursors, 2 record, 3 borrowed,
+ * 4 valid per-kick timestamps, 5 healthy, 6 stamp output queued.
+ * Unknown is distinct from false. Borrowed rows have ctx/seq/kick zero.
+ */
+TRACE_EVENT(asahi_g17_hold,
+	TP_PROTO(u8 engine, u8 qid, u64 kick, u32 ctx, u64 seq,
+		 u32 known, u32 value, u64 counter),
+	TP_ARGS(engine, qid, kick, ctx, seq, known, value, counter),
+	TP_STRUCT__entry(
+		__field(u8, engine)
+		__field(u8, qid)
+		__field(u64, kick)
+		__field(u32, ctx)
+		__field(u64, seq)
+		__field(u32, known)
+		__field(u32, value)
+		__field(u64, counter)
+	),
+	TP_fast_assign(
+		__entry->engine = engine;
+		__entry->qid = qid;
+		__entry->kick = kick;
+		__entry->ctx = ctx;
+		__entry->seq = seq;
+		__entry->known = known;
+		__entry->value = value;
+		__entry->counter = counter;
+	),
+	TP_printk("engine=%u qid=%u kick=%llu ctx=%u seq=%llu known=%#x value=%#x counter=%llu",
+		  __entry->engine, __entry->qid, __entry->kick, __entry->ctx,
+		  __entry->seq, __entry->known, __entry->value, __entry->counter)
+);
+
 TRACE_EVENT(asahi_g17_publish,
 	TP_PROTO(u8 engine, u8 qid, u32 ordinal, u32 ctx, u64 seq,
 		 u64 fence_context, u64 fence_seqno, u64 counter),
@@ -43,7 +76,7 @@ TRACE_EVENT(asahi_g17_publish,
 		  __entry->counter)
 );
 
-TRACE_EVENT(asahi_g17_complete,
+DECLARE_EVENT_CLASS(asahi_g17_completion,
 	TP_PROTO(u8 engine, u8 qid, u32 ordinal, u32 ctx, u64 seq,
 		 u64 gpu_start, u64 gpu_end, u64 counter),
 	TP_ARGS(engine, qid, ordinal, ctx, seq, gpu_start, gpu_end, counter),
@@ -70,6 +103,18 @@ TRACE_EVENT(asahi_g17_complete,
 	TP_printk("engine=%u qid=%u ordinal=%u ctx=%u seq=%llu gpu=%llu..%llu counter=%llu",
 		  __entry->engine, __entry->qid, __entry->ordinal, __entry->ctx,
 		  __entry->seq, __entry->gpu_start, __entry->gpu_end, __entry->counter)
+);
+
+/* `complete` selects output; `retire` always follows the original ownership path. */
+DEFINE_EVENT(asahi_g17_completion, asahi_g17_complete,
+	TP_PROTO(u8 engine, u8 qid, u32 ordinal, u32 ctx, u64 seq,
+		 u64 gpu_start, u64 gpu_end, u64 counter),
+	TP_ARGS(engine, qid, ordinal, ctx, seq, gpu_start, gpu_end, counter)
+);
+DEFINE_EVENT(asahi_g17_completion, asahi_g17_retire,
+	TP_PROTO(u8 engine, u8 qid, u32 ordinal, u32 ctx, u64 seq,
+		 u64 gpu_start, u64 gpu_end, u64 counter),
+	TP_ARGS(engine, qid, ordinal, ctx, seq, gpu_start, gpu_end, counter)
 );
 
 TRACE_EVENT(asahi_g17_bind,
