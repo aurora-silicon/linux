@@ -9,6 +9,17 @@
 #  - the battery energy used, when running on battery (energy_now).
 # Usage: bt-wake-power.sh [-s secs] [-n pairs] [-o outdir]
 set -u
+# The PMU RTC, which can wake the system: rtc0 on J700, rtc1 on others.
+pmu_rtc() {
+	local name
+	for name in /sys/class/rtc/rtc*/name; do
+		[[ $(cat "$name" 2> /dev/null) == apple-pmu-rtc* ]] || continue
+		name=${name%/name}
+		echo "${name##*/}"
+		return
+	done
+	echo rtc0
+}
 secs=300
 pairs=2
 out=/var/tmp/bt-wake/power-$(date +%Y%m%d-%H%M%S)
@@ -19,6 +30,7 @@ done
 dev=/sys/bus/pci/devices/0000:01:00.1
 bat=/sys/class/power_supply/macsmc-battery
 irq=$(awk -F: '/mt7932-bt/ { gsub(/ /, "", $1); print $1; exit }' /proc/interrupts)
+rtc=$(pmu_rtc)
 mkdir -p "$out"
 orig=$(cat "$dev/power/wakeup")
 trap 'echo "$orig" > "$dev/power/wakeup"' EXIT
@@ -42,7 +54,7 @@ for p in $(seq 1 "$pairs"); do
 		e0=$(cat "$bat/energy_now")
 		st=$(cat "$bat/status")
 		t0=$(date +%s.%N)
-		rtcwake -d rtc1 -m freeze -s "$secs" > /dev/null 2>&1
+		rtcwake -d "$rtc" -m freeze -s "$secs" > /dev/null 2>&1
 		t1=$(date +%s.%N)
 		b1=$(irq_sum "$irq"); a1=$(irq_sum all); e1=$(cat "$bat/energy_now")
 		dmesg > "$out/dmesg-$p-$mode.txt"
