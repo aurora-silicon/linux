@@ -85,6 +85,18 @@
 	reg-names = "report", "ane-dvfs";
 };
 
+#ifdef APPLE_USE_PMP
+/*
+ * AVD also sends the PMP a performance request while it is powered: level 2
+ * (VMAX) in request class 0x21 of its SOC-DEV-DVFS entry 0x112. The PMP then
+ * holds the SoC rail and fabric up for it.
+ */
+&pmp_report_avd_sys {
+	apple,dvfs = <0x112 2>;
+	apple,dvfs-request-class = <0x21>;
+};
+#endif
+
 &ane {
 	apple,performance-controller = <&pmp_report>;
 	power-domains = <&ps_ane_sys_cpu>, <&ps_ane_set1>,

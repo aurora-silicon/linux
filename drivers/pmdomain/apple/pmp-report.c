@@ -1521,6 +1521,9 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t600x = {
 	.tgt_read = 0xf80,
 	.tgt_write = 0x107c0,
+	.update = 0x10000,
+	.dvfs_first = 0x108,
+	.dvfs_count = 0x28,
 	.actual = 0x1000,
 	.status = 0x10,
 };
@@ -1673,6 +1676,7 @@ struct apple_pmp_report_entry {
 	 */
 	bool dvfs;
 	u32 dvfs_entry;
+	u64 dvfs_off;
 	u64 dvfs_on;
 	bool removed;
 };
@@ -1991,9 +1995,6 @@ int apple_pmp_report_set_t6030_gfx(struct device *supplier, bool enable)
 	return apple_pmp_report_t6030_gfx(supplier, &enable);
 }
 EXPORT_SYMBOL_GPL(apple_pmp_report_set_t6030_gfx);
-/* SOC-DEV-DVFS request words carry a valid bit; level 0 is the floor. */
-#define PMP_DVFS_VALID		BIT_ULL(61)
-
 /*
  * One 64-bit store of the whole request word. Never read a request entry
  * back after storing it: the read retires the pending PTD update before the
@@ -2072,7 +2073,7 @@ static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, boo
 			continue;
 		/* The device request is admitted first and the level dropped first. */
 		if (ent->dvfs && !enable)
-			apple_pmp_report_dvfs_write(rep, ent->dvfs_entry, PMP_DVFS_VALID);
+			apple_pmp_report_dvfs_write(rep, ent->dvfs_entry, ent->dvfs_off);
 		ret = apple_pmp_report_set_state(rep, ent->id, enable, ent->no_ack);
 		if (ent->dvfs && enable && !ret)
 			apple_pmp_report_dvfs_write(rep, ent->dvfs_entry, ent->dvfs_on);
@@ -2360,18 +2361,28 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	}
 	ent->sleep_release = of_property_read_bool(node, "apple,release-for-sleep");
 	if (of_property_present(node, "apple,dvfs")) {
+		u32 request_class = 0;
 		u32 dvfs[2];
 
+		if (of_property_read_u32(node, "apple,dvfs-request-class",
+					 &request_class) &&
+		    of_property_present(node, "apple,dvfs-request-class")) {
+			ret = dev_err_probe(dev, -EINVAL,
+					    "invalid apple,dvfs-request-class\n");
+			goto err_free;
+		}
 		ret = of_property_read_u32_array(node, "apple,dvfs", dvfs, 2);
-		if (ret || !rep || !rep->offsets->update || dvfs[1] > 0x1f ||
+		if (ret || of_property_count_u32_elems(node, "apple,dvfs") != 2 ||
+		    !rep || !rep->offsets->update ||
 		    dvfs[0] < rep->offsets->dvfs_first ||
-		    dvfs[0] >= rep->offsets->dvfs_first + rep->offsets->dvfs_count) {
+		    dvfs[0] >= rep->offsets->dvfs_first + rep->offsets->dvfs_count ||
+		    !apple_pmp_dvfs_word(request_class, 0, &ent->dvfs_off) ||
+		    !apple_pmp_dvfs_word(request_class, dvfs[1], &ent->dvfs_on)) {
 			ret = dev_err_probe(dev, -EINVAL, "invalid apple,dvfs\n");
 			goto err_free;
 		}
 		ent->dvfs = true;
 		ent->dvfs_entry = dvfs[0];
-		ent->dvfs_on = PMP_DVFS_VALID | dvfs[1];
 	}
 
 	ret = of_property_read_string(node, "label", &name);

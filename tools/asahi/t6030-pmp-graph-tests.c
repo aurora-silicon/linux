@@ -202,6 +202,7 @@ struct apple_pmp_report_entry {
 	bool no_ack, dvfs, removed;
 	bool sleep_release, released;
 	u32 dvfs_entry;
+	u64 dvfs_off;
 	u64 dvfs_on;
 };
 #define PMP_DVFS_VALID BIT_ULL(61)
