@@ -617,11 +617,11 @@ static bool sleep_slp_ddr_usb;
 static void __iomem *sleep_slp_ddr_word;
 
 /*
- * The SLP_DDR wake runs on the SoC-side state the system left. After a Linux boot it stalls in
- * the sleep engine, and once one deep sleep has rebuilt that state it gets through every time.
- * So the word stays clear, whatever the host votes, until a wake shows the deep path ran.
+ * The SLP_DDR wake runs on the SoC-side state the system left. The first one of a boot used to
+ * stall in the sleep engine, which came from the ISP's firmware boot at probe (see the ISP
+ * driver). Cleared while a deep path is owed, and set again by a wake that shows it ran.
  */
-static bool sleep_slp_ddr_ready;
+static bool sleep_slp_ddr_ready = true;
 
 /*
  * A coprocessor that runs through a sleep crashed. The AOP is the always-on master SLP_DDR keeps
