@@ -2161,14 +2161,15 @@ static __maybe_unused int sio_resume_early(struct device *dev)
 		dev_info(dev, "sleep refused: firmware back after a reset\n");
 		return 0;
 	}
-	sio->asleep = false;
-
 	/* Endpoints and parameters stay with the firmware: nothing is sent again. */
 	ret = apple_rtkit_sleep_return(sio->rtk, sio->base + REG_CPU_CONTROL);
-	if (ret)
+	if (ret) {
+		/* Still down: the next sleep restarts it, or resets it if refused. */
 		dev_err(dev, "firmware did not come back from sleep: %d\n", ret);
-	else
-		dev_dbg(dev, "firmware back from sleep\n");
+		return 0;
+	}
+	sio->asleep = false;
+	dev_dbg(dev, "firmware back from sleep\n");
 
 	return 0;
 }
