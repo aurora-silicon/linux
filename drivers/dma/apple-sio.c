@@ -517,12 +517,9 @@ static int sio_t6041_read_params(struct device_node *np, u32 *params, unsigned i
 	return nparams;
 }
 
-/* The table windows, and on T8140 the native MMIO ranges too */
-#define SIO_T6041_WINDOWS_MAX	16
-
 static int sio_t6041_check_node(struct device_node *np, u32 *addr, u32 *size)
 {
-	struct sio_t6030_window windows[SIO_T6041_WINDOWS_MAX];
+	struct sio_t6030_window windows[SIO_T6030_WINDOWS_MAX];
 	u32 params[2 * SIO_T6030_PARAMS_MAX];
 	int nparams, nwindows;
 
@@ -544,115 +541,6 @@ static int sio_t6041_check_boot_tables(struct device *dev)
 		dev_err(dev, "boot tables are not T6041 SIO tables; leaving the SIO stopped\n");
 		return -ENODEV;
 	}
-	return 0;
-}
-
-/*
- * The T8140 (MacBook Neo) firmware reaches its own MMIO, the MISC map range
- * and the native DMA shims, through the SIO DART at the physical addresses
- * in its records; unlike T6041's, that DART has no bypass stream for them.
- * The loader reserves each range as an apple,asc-mmio memory region that is
- * mapped 1:1 for this SIO, and the IOMMU core maps it before the probe.
- * Without them the firmware takes an SError when key 0x23 brings up its
- * shims, so the SIO is not started.
- */
-#define SIO_NATIVE_MMIO_MAX	4
-
-/* 0 when the ranges are present, 16K aligned, inside the DART's reach and disjoint */
-static int sio_native_mmio_check(const struct sio_t6030_window *w, unsigned int n)
-{
-	unsigned int i, j;
-
-	if (!n)
-		return -ENOENT;
-	for (i = 0; i < n; i++) {
-		u64 end;
-
-		if (!w[i].size || !IS_ALIGNED(w[i].start | w[i].size, SZ_16K) ||
-		    check_add_overflow(w[i].start, w[i].size, &end) ||
-		    end > SIO_T6030_IOVA_LIMIT)
-			return -EINVAL;
-		for (j = 0; j < i; j++)
-			if (w[i].start < w[j].start + w[j].size &&
-			    w[j].start < end)
-				return -EINVAL;
-	}
-	return 0;
-}
-
-/* The apple,asc-mmio regions of this node, each mapped for it at its own address */
-static int sio_native_mmio_windows(struct device_node *np, struct sio_t6030_window *windows,
-				   unsigned int max)
-{
-	struct of_phandle_iterator it;
-	unsigned int n = 0;
-	int err;
-
-	of_for_each_phandle(&it, err, np, "memory-region", NULL, 0) {
-		const __be32 *maps, *end;
-		struct resource res;
-		bool mapped = false;
-		int size;
-
-		if (!of_device_is_compatible(it.node, "apple,asc-mmio"))
-			continue;
-		maps = of_get_property(it.node, "iommu-addresses", &size);
-		if (!maps || size % sizeof(*maps) || of_address_to_resource(it.node, 0, &res)) {
-			of_node_put(it.node);
-			return -EINVAL;
-		}
-		end = maps + size / sizeof(*maps);
-		while (maps < end) {
-			struct device_node *owner __free(device_node) =
-				of_find_node_by_phandle(be32_to_cpup(maps++));
-			phys_addr_t iova;
-			size_t length;
-
-			if (!owner) {
-				of_node_put(it.node);
-				return -EINVAL;
-			}
-			maps = of_translate_dma_region_checked(owner, maps, end - maps, &iova,
-							       &length);
-			if (!maps) {
-				of_node_put(it.node);
-				return -EINVAL;
-			}
-			if (owner != np)
-				continue;
-			/* Only a 1:1 mapping of the whole range is one the firmware can use */
-			if (mapped || iova != res.start || length != resource_size(&res) ||
-			    n == max) {
-				of_node_put(it.node);
-				return -EINVAL;
-			}
-			windows[n].start = iova;
-			windows[n].size = length;
-			mapped = true;
-			n++;
-		}
-		if (!mapped) {
-			of_node_put(it.node);
-			return -EINVAL;
-		}
-	}
-	return err == -ENOENT ? n : err;
-}
-
-static int sio_t8140_check_boot_tables(struct device *dev)
-{
-	struct sio_t6030_window mmio[SIO_NATIVE_MMIO_MAX];
-	int err, n;
-
-	err = sio_t6041_check_boot_tables(dev);
-	if (err)
-		return err;
-	n = sio_native_mmio_windows(dev->of_node, mmio, ARRAY_SIZE(mmio));
-	if (n < 0 || sio_native_mmio_check(mmio, n)) {
-		dev_err(dev, "the loader did not map the SIO's own MMIO; leaving the SIO stopped\n");
-		return -ENODEV;
-	}
-	dev_dbg(dev, "%d native MMIO ranges mapped 1:1\n", n);
 	return 0;
 }
 
@@ -751,8 +639,7 @@ static const struct sio_hw_data sio_hw_t6041 = {
 
 /*
  * T8140 (MacBook Neo) firmware takes the T6041 boot tables (its ADT
- * describes them alike) once its own MMIO is mapped (sio_t8140_check_boot_tables());
- * its DisplayPort audio channels refill at 0x800
+ * describes them alike); its DisplayPort audio channels refill at 0x800
  * (ADT dp-audioN dma-channels): [2, 0, 0x800, 0x800, 0x800, 0].
  */
 static const struct sio_hw_data sio_hw_t8140 = {
@@ -762,7 +649,7 @@ static const struct sio_hw_data sio_hw_t8140 = {
 	.cfg_six_words = true,
 	.clear_period_desc = true,
 	.arrays = &sio_t6041_arrays,
-	.check_boot_tables = sio_t8140_check_boot_tables,
+	.check_boot_tables = sio_t6041_check_boot_tables,
 	.send_dt_params = sio_t6041_send_dt_params,
 };
 
