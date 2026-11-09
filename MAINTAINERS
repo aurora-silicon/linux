@@ -2068,7 +2068,10 @@ APPLE PCIE CONTROLLER DRIVER
 M:	Marc Zyngier <maz@kernel.org>
 L:	linux-pci@vger.kernel.org
 S:	Maintained
+F:	drivers/pci/controller/pcie-apple-radio.c
 F:	drivers/pci/controller/pcie-apple.c
+F:	include/linux/soc/apple/radio-sleep.h
+F:	tools/asahi/radio-*-tests.*
 
 APPLE SMC DRIVER
 M:	Henrik Rydberg <rydberg@bitmath.org>

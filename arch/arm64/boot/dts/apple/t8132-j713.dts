@@ -196,3 +196,16 @@
 &dcp {
 	apple,pmc-interface = <&pmc_disp0>;
 };
+
+/* Native radio recovery is required before admitting system sleep. */
+&pcie0 {
+	status = "okay";
+};
+
+&dart_apcie0 {
+	status = "okay";
+};
+
+&port00 {
+	clkreq-gpios = <&pinctrl_ap 160 GPIO_ACTIVE_LOW>;
+};
