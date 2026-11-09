@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Byte equality against the pre-ABI-refactor 9003 command builders. */
+#include <kunit/device.h>
 #include <kunit/test.h>
 #include <linux/module.h>
 #include <linux/crc32.h>
@@ -463,6 +464,32 @@ static void ave_6070_gate(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, sess->token, 0ULL);
 }
 
+/* The channel table the T6000 6070 firmware publishes, in its order. */
+static const struct {
+	const char *name;
+	u32 dir, doorbell, slots, offset;
+} ave_6070_desc[] = {
+	{ "TERMINAL", 2, 0, 512, 0x700 }, { "IO", 0, 1, 32, 0x8700 },
+	{ "DEBUG", 0, 1, 8, 0x8f00 },	  { "BUF_H2T", 0, 2, 1, 0x9100 },
+	{ "BUF_T2H", 1, 3, 1, 0x9140 },	  { "SHAREDMALLOC", 1, 3, 8, 0x9180 },
+	{ "IO_T2H", 1, 3, 32, 0x9380 },
+};
+
+static void ave_6070_write_desc(struct ave_dev *ave, unsigned int i,
+				const char *name)
+{
+	u8 *desc = ave->ipc.cpu + AVE_IPC_CHANNEL_OFF + i * 0x100;
+
+	memset(desc, 0, 0x100);
+	strscpy(desc, name, 0x40);
+	put_unaligned_le32(ave_6070_desc[i].dir, desc + 0x40);
+	put_unaligned_le32(ave_6070_desc[i].doorbell, desc + 0x44);
+	put_unaligned_le32(ave_6070_desc[i].slots, desc + 0x48);
+	put_unaligned_le64(ave->ipc_fw_base + AVE_IPC_CHANNEL_OFF +
+				   ave_6070_desc[i].offset,
+			   desc + 0x4c);
+}
+
 static void ave_6070_channels(struct kunit *test)
 {
 	const struct ave_fw_transport *t = ave_abi_6070.transport;
@@ -489,32 +516,147 @@ static void ave_6070_channels(struct kunit *test)
 	hello[3] = 4 * SZ_1M + 1;
 	KUNIT_EXPECT_EQ(test, ave_ipc_check_hello(t, hello), -EPROTO);
 	hello[3] = 0;
-	for (unsigned int i = 0; i < 7; i++) {
-		int id = i == 1 ? 0 : 1;
-		bool io = i == 1 || i == 5;
-		u64 address = ave->ipc_fw_base + AVE_IPC_CHANNEL_OFF +
-			      (io ? t->offsets[id] : 0x1000 + i * 0x400);
 
-		desc = ave->ipc.cpu + AVE_IPC_CHANNEL_OFF + i * 0x100;
-		strscpy(desc, io ? (id ? "IO_T2H" : "IO") : "UNUSED", 0x40);
-		put_unaligned_le32(io ? id : U32_MAX, desc + 0x40);
-		put_unaligned_le32(io ? t->doorbells[id] : U32_MAX,
-				   desc + 0x44);
-		put_unaligned_le32(io ? t->slots[id] : 4, desc + 0x48);
-		put_unaligned_le64(address, desc + 0x4c);
-	}
+	for (unsigned int i = 0; i < ARRAY_SIZE(ave_6070_desc); i++)
+		ave_6070_write_desc(ave, i, ave_6070_desc[i].name);
 	KUNIT_ASSERT_EQ(test, ave_ipc_parse_channels(ave), 0);
-	KUNIT_EXPECT_EQ(test, ave->ring[0].slots, 32U);
-	KUNIT_EXPECT_EQ(test, ave->ring[1].slots, 8U);
-	KUNIT_EXPECT_EQ(test, ave->ring[0].doorbell, 1U);
-	KUNIT_EXPECT_EQ(test, ave->ring[1].doorbell, 3U);
+	KUNIT_EXPECT_EQ(test, ave->ring[AVE_RING_IO].slots, 32U);
+	KUNIT_EXPECT_EQ(test, ave->ring[AVE_RING_IO].doorbell, 1U);
+	KUNIT_EXPECT_EQ(test, ave->ring[AVE_RING_IO].offset,
+			AVE_IPC_CHANNEL_OFF + 0x8700);
+	/* Replies come on IO_T2H, not on SHAREDMALLOC with the same doorbell. */
+	KUNIT_EXPECT_STREQ(test, ave->ring[AVE_RING_T2H].name, "IO_T2H");
+	KUNIT_EXPECT_EQ(test, ave->ring[AVE_RING_T2H].slots, 32U);
+	KUNIT_EXPECT_EQ(test, ave->ring[AVE_RING_T2H].doorbell, 3U);
+	KUNIT_EXPECT_EQ(test, ave->ring[AVE_RING_T2H].offset,
+			AVE_IPC_CHANNEL_OFF + 0x9380);
+	KUNIT_EXPECT_EQ(test, ave->ring[AVE_RING_SMALLOC].slots, 8U);
+	KUNIT_EXPECT_EQ(test, ave->ring[AVE_RING_SMALLOC].offset,
+			AVE_IPC_CHANNEL_OFF + 0x9180);
+	KUNIT_EXPECT_EQ(test, ave->ring[AVE_RING_LOG].slots, 512U);
+	KUNIT_EXPECT_EQ(test, ave->ring[AVE_RING_LOG].offset,
+			AVE_IPC_CHANNEL_OFF + 0x700);
+	/* Every IO slot starts with the host. */
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(ave->ipc.cpu +
+						 AVE_IPC_CHANNEL_OFF + 0x8700),
+			1ULL);
+
+	/* The old reading: the reply ring at SHAREDMALLOC's place. */
+	ave_6070_write_desc(ave, 5, "IO_T2H");
+	ave_6070_write_desc(ave, 6, "SHAREDMALLOC");
+	KUNIT_EXPECT_EQ(test, ave_ipc_parse_channels(ave), -EPROTO);
+	ave_6070_write_desc(ave, 5, "SHAREDMALLOC");
+	ave_6070_write_desc(ave, 6, "IO_T2H");
+	KUNIT_EXPECT_EQ(test, ave_ipc_parse_channels(ave), 0);
+
 	desc = ave->ipc.cpu + AVE_IPC_CHANNEL_OFF + 0x100;
 	put_unaligned_le32(33, desc + 0x48);
 	KUNIT_EXPECT_EQ(test, ave_ipc_parse_channels(ave), -EPROTO);
 	put_unaligned_le32(32, desc + 0x48);
+	/* SHAREDMALLOC must be a firmware-to-host ring. */
+	desc = ave->ipc.cpu + AVE_IPC_CHANNEL_OFF + 5 * 0x100;
+	put_unaligned_le32(0, desc + 0x40);
+	KUNIT_EXPECT_EQ(test, ave_ipc_parse_channels(ave), -EPROTO);
+	put_unaligned_le32(1, desc + 0x40);
+	/* Two rings may not share slots. */
+	put_unaligned_le64(ave->ipc_fw_base + AVE_IPC_CHANNEL_OFF + 0x9380,
+			   desc + 0x4c);
+	KUNIT_EXPECT_EQ(test, ave_ipc_parse_channels(ave), -EPROTO);
+	ave_6070_write_desc(ave, 5, "SHAREDMALLOC");
 	desc = ave->ipc.cpu + AVE_IPC_CHANNEL_OFF;
 	put_unaligned_le64(ave->ipc_fw_base + ave->ipc.size, desc + 0x4c);
 	KUNIT_EXPECT_EQ(test, ave_ipc_parse_channels(ave), -EPROTO);
+}
+
+/* Play the firmware: post one SHAREDMALLOC request in ring slot @i. */
+static void ave_6070_smalloc_ask(struct ave_dev *ave, unsigned int i,
+				 u64 addr, u32 bytes)
+{
+	__le64 *slot = ave->ipc.cpu + ave->ring[AVE_RING_SMALLOC].offset +
+		       i * AVE_RING_SLOT_BYTES;
+
+	slot[1] = cpu_to_le64(bytes);
+	slot[2] = 0;
+	slot[0] = cpu_to_le64(addr); /* bit 0 clear: the host's turn */
+}
+
+static void ave_6070_smalloc(struct kunit *test)
+{
+	struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
+	struct ave_fw_transport *t;
+	struct ave_fw_layout *layout;
+	struct ave_fw_abi *abi;
+	__le64 *slot;
+	u64 first, second, base;
+
+	KUNIT_ASSERT_NOT_NULL(test, ave);
+	/* The real window is 7 MiB; shrink the borrowed part for the test. */
+	t = kunit_kmalloc(test, sizeof(*t), GFP_KERNEL);
+	abi = kunit_kmalloc(test, sizeof(*abi), GFP_KERNEL);
+	layout = kunit_kmalloc(test, sizeof(*layout), GFP_KERNEL);
+	KUNIT_ASSERT_TRUE(test, t && abi && layout);
+	*t = *ave_abi_6070.transport;
+	*abi = ave_abi_6070;
+	*layout = ave_layout_6070_11_1;
+	t->smalloc_offset = 0x20000;
+	t->smalloc_bytes = 0x30000;
+	abi->transport = t;
+	layout->abi = abi;
+	ave->layout = layout;
+	ave->dev = kunit_device_register(test, "apple-ave-test");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(ave->dev));
+	ave->ipc.cpu = kunit_kzalloc(test, 0x50000, GFP_KERNEL);
+	ave->mbox = (void __iomem __force *)kunit_kzalloc(test, SZ_4K,
+							  GFP_KERNEL);
+	KUNIT_ASSERT_TRUE(test, ave->dev && ave->ipc.cpu && ave->mbox);
+	ave->ipc.size = 0x50000;
+	ave->ipc_fw_base = 0xffffffff80000000ULL;
+	ave->channel_bytes = 0x9bc0;
+	base = ave->ipc_fw_base + t->smalloc_offset;
+	for (unsigned int i = 0; i < ARRAY_SIZE(ave_6070_desc); i++)
+		ave_6070_write_desc(ave, i, ave_6070_desc[i].name);
+	KUNIT_ASSERT_EQ(test, ave_ipc_parse_channels(ave), 0);
+	/* The firmware creates the ring with every slot its own (bit 0 set). */
+	for (unsigned int i = 0; i < ave->ring[AVE_RING_SMALLOC].slots; i++)
+		*(__le64 *)(ave->ipc.cpu + ave->ring[AVE_RING_SMALLOC].offset +
+			    i * AVE_RING_SLOT_BYTES) = cpu_to_le64(1);
+
+	KUNIT_EXPECT_EQ(test, ave_ipc_serve_smalloc(ave), 0);
+	/* Two 64 KiB blocks, as the firmware asks before Config. */
+	memset(ave->ipc.cpu + t->smalloc_offset, 0xa5, SZ_64K);
+	ave_6070_smalloc_ask(ave, 0, 0, SZ_64K);
+	ave_6070_smalloc_ask(ave, 1, 0, SZ_64K);
+	KUNIT_EXPECT_EQ(test, ave_ipc_serve_smalloc(ave), 1);
+	slot = ave->ipc.cpu + ave->ring[AVE_RING_SMALLOC].offset;
+	first = le64_to_cpu(slot[0]);
+	KUNIT_EXPECT_EQ(test, first & 1, 1ULL);
+	first &= ~3ULL;
+	KUNIT_EXPECT_EQ(test, first, base);
+	KUNIT_EXPECT_EQ(test, le64_to_cpu(slot[1]), (u64)SZ_64K);
+	KUNIT_EXPECT_EQ(test, *(u8 *)(ave->ipc.cpu + t->smalloc_offset), 0);
+	slot += AVE_RING_SLOT_BYTES / sizeof(*slot);
+	second = le64_to_cpu(slot[0]) & ~3ULL;
+	KUNIT_EXPECT_EQ(test, second, base + SZ_64K);
+	/* The doorbell of the SHAREDMALLOC ring was rung. */
+	KUNIT_EXPECT_EQ(test, readl(ave->mbox + AVE_MBOX_DOORBELL), BIT(3));
+
+	/* Giving the first back frees it for the next request. */
+	ave_6070_smalloc_ask(ave, 2, first, 0);
+	KUNIT_EXPECT_EQ(test, ave_ipc_serve_smalloc(ave), 1);
+	slot = ave->ipc.cpu + ave->ring[AVE_RING_SMALLOC].offset +
+	       2 * AVE_RING_SLOT_BYTES;
+	KUNIT_EXPECT_EQ(test, le64_to_cpu(slot[0]) & ~3ULL, first);
+	KUNIT_EXPECT_EQ(test, le64_to_cpu(slot[1]), 0ULL);
+	ave_6070_smalloc_ask(ave, 3, 0, 100);
+	KUNIT_EXPECT_EQ(test, ave_ipc_serve_smalloc(ave), 1);
+	slot = ave->ipc.cpu + ave->ring[AVE_RING_SMALLOC].offset +
+	       3 * AVE_RING_SLOT_BYTES;
+	KUNIT_EXPECT_EQ(test, le64_to_cpu(slot[0]) & ~3ULL, first);
+	KUNIT_EXPECT_EQ(test, le64_to_cpu(slot[1]), 100ULL);
+
+	/* More than the pool holds is refused. */
+	ave_6070_smalloc_ask(ave, 4, 0, 2 * SZ_64K);
+	KUNIT_EXPECT_EQ(test, ave_ipc_serve_smalloc(ave), -ENOMEM);
 }
 
 static void ave_6070_variants(struct kunit *test)
@@ -542,7 +684,13 @@ static void ave_6070_variants(struct kunit *test)
 			t->process_offset);
 	KUNIT_EXPECT_LE(
 		test, t->process_offset + AVE_IPC_PROC_BUFS * t->process_bytes,
-		t->ipc_bytes);
+		t->smalloc_offset);
+	KUNIT_EXPECT_LE(test, t->smalloc_offset + t->smalloc_bytes,
+			t->ipc_bytes);
+	KUNIT_EXPECT_LE(test, t->smalloc_bytes,
+			AVE_SMALLOC_UNITS * AVE_SMALLOC_GRANULE);
+	KUNIT_EXPECT_TRUE(test,
+			  IS_ALIGNED(t->smalloc_offset, AVE_SMALLOC_GRANULE));
 }
 
 /* The loader's TEXT->DATA link cell does not change the image identity. */
@@ -580,6 +728,7 @@ static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_6070_replies),	    KUNIT_CASE(ave_6070_split_surfaces),
 	KUNIT_CASE(ave_6070_gate),	    KUNIT_CASE(ave_6070_channels),
 	KUNIT_CASE(ave_6070_variants),	    KUNIT_CASE(ave_6070_text_id),
+	KUNIT_CASE(ave_6070_smalloc),
 	{}
 };
 

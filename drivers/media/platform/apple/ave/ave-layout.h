@@ -30,6 +30,11 @@ struct ave_fw_transport {
 	u32 descriptors;
 	u32 io_index, t2h_index;
 	u32 slots[2], doorbells[2], offsets[2]; /* zero: discovered */
+	/*
+	 * Part of the IPC window the firmware may borrow over its
+	 * SHAREDMALLOC channel; zero when the firmware has no such channel.
+	 */
+	u32 smalloc_offset, smalloc_bytes;
 	bool boot_config;
 	bool sync_host_clock;
 	bool scratch_halt;

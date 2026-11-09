@@ -66,6 +66,23 @@ struct ave_vb2_mem;
 
 #define AVE_MSG_MAX SZ_4K
 
+/*
+ * Rings the host serves. IO and IO_T2H carry commands and answers on every
+ * firmware; the 6070 firmware also borrows shared memory (SHAREDMALLOC) and
+ * logs (TERMINAL) over rings of their own.
+ */
+enum {
+	AVE_RING_IO,
+	AVE_RING_T2H,
+	AVE_RING_SMALLOC,
+	AVE_RING_LOG,
+	AVE_RINGS,
+};
+
+#define AVE_SMALLOC_GRANULE SZ_4K
+#define AVE_SMALLOC_UNITS (SZ_4M / AVE_SMALLOC_GRANULE)
+#define AVE_SMALLOC_MAX 32
+
 enum ave_codec {
 	AVE_CODEC_H264 = 1,
 	AVE_CODEC_HEVC = 2,
@@ -228,7 +245,12 @@ struct ave_dev {
 	struct ave_reply expected[AVE_OP_COUNT];
 	u64 ipc_fw_base;
 	u32 channel_bytes;
-	struct ave_ring ring[2];
+	struct ave_ring ring[AVE_RINGS];
+	/* Shared memory lent to the firmware, in AVE_SMALLOC_GRANULE units. */
+	DECLARE_BITMAP(smalloc_map, AVE_SMALLOC_UNITS);
+	struct {
+		u32 first, units;
+	} smalloc[AVE_SMALLOC_MAX];
 	u32 next_client;
 	u32 unacked;
 	u8 want[AVE_OP_COUNT];
@@ -416,6 +438,8 @@ void ave_free(struct ave_dev *ave, struct ave_buf *b);
 /* ave-ipc.c */
 int ave_ipc_check_hello(const struct ave_fw_transport *t, const u32 hello[4]);
 int ave_ipc_parse_channels(struct ave_dev *ave);
+int ave_ipc_serve_smalloc(struct ave_dev *ave);
+void ave_ipc_drain_log(struct ave_dev *ave);
 int ave_ipc_negotiate(struct ave_dev *ave, const u32 hello[4]);
 void *ave_ipc_cmd(struct ave_dev *ave, unsigned int buf, size_t len);
 int ave_ipc_scalar_buf(struct ave_dev *ave);

@@ -32,10 +32,12 @@ static const struct ave_fw_transport ave_transport_6070 = {
 	.hello = { 7, 0x9bc0, 0x100, 0 },
 	.descriptors = 7,
 	.io_index = 1,
-	.t2h_index = 5,
-	.slots = { 32, 8 },
+	.t2h_index = 6,
+	.slots = { 32, 32 },
 	.doorbells = { 1, 3 },
-	.offsets = { 0x8700, 0x9180 },
+	.offsets = { 0x8700, 0x9380 },
+	.smalloc_offset = 0x400000,
+	.smalloc_bytes = 0x300000,
 	.scratch_halt = true,
 };
 
