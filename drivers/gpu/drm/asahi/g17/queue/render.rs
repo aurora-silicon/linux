@@ -614,6 +614,10 @@ struct RenderBarriers {
     fragment_types: [u8; 5 + crate::g17::hazard::PUBLICATION_BARRIERS],
 }
 
+/// The last fragment kick published on any pair: on the J813 the next tiling kick waits for it
+/// (see [`Pair::publish`]).
+static J813_LAST_FRAGMENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 fn render_barriers(
     fragment_stage: bool,
     stage_prefixes: bool,
@@ -907,9 +911,28 @@ impl Pair {
             return Err(EINVAL);
         };
         let own_tiling = KickDependency::new(qids[0], kicks[0]).ok_or(EINVAL)?;
-        let barriers =
+        let mut barriers =
             render_barriers(pass.fragment_barriers, pass.stage_prefixes, dependencies, own_tiling,
                 self.board.map_or(2, crate::g17::fw::m5::compute::explicit_dependency));
+        // On the J813 a tiling kick also waits for the last fragment kick published, on any
+        // pair, as macOS 27.0 orders them there: its TA kick for render n names render n - 1's
+        // 3D kick (every such dependency in its captured queues). Without it a TA ran beside
+        // another context's 3D, and that 3D fetched its own tile data (ISP parameter fetch,
+        // requestor 0x9a) through the TA's VM slot, or slot 0, and faulted.
+        if j813 {
+            let last = KickDependency::from_word(
+                J813_LAST_FRAGMENT.load(core::sync::atomic::Ordering::Acquire),
+            )
+            .filter(|d| d.word() != 0 && d.qid() != qids[0]);
+            if let Some(last) = last {
+                if barriers.tiling_count < barriers.tiling.len() {
+                    barriers.tiling[barriers.tiling_count] = last;
+                    barriers.tiling_types[barriers.tiling_count] = 2;
+                    barriers.tiling_count += 1;
+                    barriers.tiling_types[barriers.tiling_count] = 1;
+                }
+            }
+        }
         let tiling_barriers = &barriers.tiling[..barriers.tiling_count];
         // With the G17D forms a fragment kick with history also names its parent's
         // predecessor, in class 1, after the self-parent (classes [1, 3, 1] for a lone pass).
@@ -1181,6 +1204,7 @@ impl Pair {
         self.ordinal = next_ordinal;
         if let Some(fragment) = KickDependency::new(qids[1], kicks[1]) {
             packet.completion.note_render_publication(fragment);
+            J813_LAST_FRAGMENT.store(fragment.word(), core::sync::atomic::Ordering::Release);
         }
         self.cursors = windows.map(|window| window.target());
         for stage in 0..2 {
