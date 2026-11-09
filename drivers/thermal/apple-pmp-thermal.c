@@ -39,6 +39,13 @@
  */
 #define APPLE_PMP_HYST_MC		2000
 #define APPLE_PMP_POLL_MS		5
+/*
+ * The firmware publishes a die sensor only while its cluster has power, so an idle
+ * machine can have none valid for a moment (0.46 s the longest measured). Go on from the
+ * last reading for this long, if it was this cool. Longer or hotter is a failed sensor.
+ */
+#define APPLE_PMP_GATED_HOLD_NS	2000000000ULL
+#define APPLE_PMP_GATED_HOLD_MC	90000
 #define APPLE_PMP_GOVERNOR_NS	100000000ULL
 
 struct apple_pmp_cluster {
@@ -65,6 +72,9 @@ static struct {
 	bool enabled;
 	long cached_mc;
 	int cached_error;
+	/* The last reading from a sensor that was valid, and when. */
+	u64 valid_ns;
+	long valid_mc;
 	u64 governor_ns;
 	unsigned long long sample_count, governor_count;
 	struct apple_pmp_confirmation critical;
@@ -363,6 +373,15 @@ static int apple_pmp_sample(void)
 	old_level = pmp_thermal.guard_level;
 	old_reason = cooling->reason;
 	ret = apple_pmp_sample_all(&snapshot, &value);
+	if (!ret) {
+		pmp_thermal.valid_ns = snapshot.finished_ns;
+		pmp_thermal.valid_mc = value;
+	} else if (ret == -ENODATA && pmp_thermal.valid_ns &&
+		   snapshot.finished_ns - pmp_thermal.valid_ns < APPLE_PMP_GATED_HOLD_NS &&
+		   pmp_thermal.valid_mc < APPLE_PMP_GATED_HOLD_MC) {
+		value = pmp_thermal.valid_mc;
+		ret = 0;
+	}
 	was_confirmed = pmp_thermal.critical.confirmed;
 	apple_pmp_confirmation_sample(&pmp_thermal.critical, value, ret,
 				      snapshot.finished_ns);
@@ -748,6 +767,7 @@ static int apple_pmp_thermal_probe(struct platform_device *pdev)
 	pmp_thermal.sensors = sensors;
 	pmp_thermal.cached_error = -EAGAIN;
 	pmp_thermal.power_error = -EAGAIN;
+	pmp_thermal.valid_ns = 0;
 	pmp_thermal.critical = (struct apple_pmp_confirmation) {};
 	pmp_thermal.shutdown_requested = false;
 	pmp_thermal.critical_dumped = false;
