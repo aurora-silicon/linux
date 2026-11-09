@@ -249,7 +249,7 @@ asahi_of_device_table!(
 #[cfg(CONFIG_DRM_ASAHI_G15)]
 asahi_of_device_table!();
 
-struct SleepOps(bindings::dev_pm_ops);
+pub(crate) struct SleepOps(pub(crate) bindings::dev_pm_ops);
 
 // SAFETY: Immutable: the callbacks are plain functions.
 unsafe impl Sync for SleepOps {}

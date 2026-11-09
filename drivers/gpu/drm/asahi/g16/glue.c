@@ -7,6 +7,7 @@
 #include <linux/atomic.h>
 #include <linux/dma-map-ops.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/ioport.h>
 #include <linux/mm.h>
 #include <linux/mfd/syscon.h>
@@ -162,6 +163,40 @@ int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now, bool id
 	*power = apple_pmp_gpu_power_state(cooling->pmp);
 	apple_pmp_cooling_observe(&cooling->policy, now, *governor);
 	*backstop = apple_pmp_cooling_level(&cooling->policy);
+	return ret;
+}
+
+/*
+ * genpd never turned the GFX domain's TVM gate off, so a sleep that lost it goes
+ * unnoticed: the domain then doesn't come on. Enabled here if it's found clear.
+ */
+int asahi_g16_tvm_enable(struct device *dev);
+int asahi_g16_tvm_enable(struct device *dev)
+{
+	struct device_node *gfx, *tvm;
+	void __iomem *reg;
+	u32 val;
+	int ret = 0;
+
+	gfx = of_parse_phandle(dev->of_node, "power-domains", 0);
+	if (!gfx)
+		return -EINVAL;
+	tvm = of_parse_phandle(gfx, "power-domains", 0);
+	of_node_put(gfx);
+	if (!tvm)
+		return -EINVAL;
+	reg = of_iomap(tvm, 0);
+	of_node_put(tvm);
+	if (!reg)
+		return -ENOMEM;
+	val = readl(reg);
+	dev_dbg(dev, "GFX TVM gate after the sleep: %#x\n", val);
+	if (!(val & BIT(0))) {
+		writel(val | BIT(0), reg);
+		ret = readl_poll_timeout(reg, val, val & BIT(0), 1, 1000);
+	}
+	iounmap(reg);
+
 	return ret;
 }
 

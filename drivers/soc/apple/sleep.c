@@ -4494,7 +4494,7 @@ static const struct apple_sleep_gate_coproc t8132_gate_coprocs[] = {
 	{ "/soc/nvme@40000" },		{ "/soc/mtp@394600000" },
 	{ "/soc/aop@390600000" },	{ "/soc/smc@38c600000" },
 	{ "/soc/sep@3aa600000" },
-	/* No G16 last stop yet: a bound GPU still running refuses the sleep. */
+	/* Its driver's last stop lowers the domain. */
 	{ "/soc/gpu@302600000", true, 0x250 },
 };
 
