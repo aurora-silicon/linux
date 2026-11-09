@@ -277,7 +277,7 @@ impl Target {
         Ok(crate::g17::fw::m5::render_registers::TaExtra {
             gtp1: pointers[1], gtp2: pointers[2], gtp4: pointers[4], gtp5: pointers[5],
             gtp6: pointers[6], gtp7: pointers[7], segment_control: control[0], segment_index: control[1],
-            min_free_tvb_pages: control[2], scs_bracket: 0, matrix_bracket: 0,
+            min_free_tvb_pages: control[2], scs_bracket: 0, matrix_bracket: 0, j813: false,
         })
     }
 
