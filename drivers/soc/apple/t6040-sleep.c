@@ -990,6 +990,13 @@ bool apple_sleep_coproc_stopped(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_coproc_stopped);
 
+/* A real entry: its commit stops the registered coprocessors; a dry run's never does. */
+bool apple_sleep_commit_stops_coprocs(void)
+{
+	return READ_ONCE(t6040_sleep) && is_kernel_in_hyp_mode() && apple_sleep_power_loss();
+}
+EXPORT_SYMBOL_GPL(apple_sleep_commit_stops_coprocs);
+
 /*
  * What still keeps the commit unreachable. The SoC power-down and the
  * wake return are IMPLEMENTED from the entry as measured on the J616s and
