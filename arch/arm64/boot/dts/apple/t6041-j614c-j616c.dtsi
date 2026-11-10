@@ -75,20 +75,54 @@
 	};
 
 	thermal-zones {
+		/*
+		 * The PMP's fast die loop is off on these boards (no
+		 * apple,fast-die-effort), so this zone is the CPU's only
+		 * throttle. The ADT (temp-sensor, fast-die-ctrl-loop) gives the
+		 * J614c the M4 Pro's die limits: a 110 C target and a 125 C
+		 * maximum, the sochot level.
+		 *
+		 * - The power allocator switches on at 75 C and controls at the
+		 *   110 C target. The 1 s samples jump by about 10 C, so the zone
+		 *   is integral-led.
+		 * - The SMC fans follow a power-weighted hot spot (dDT*), not
+		 *   TCMz: they only ramp once the CPU runs near 110 C at high
+		 *   power, as on macOS. A lower control point holds the power
+		 *   below where the fans engage, and the CPU then settles lower.
+		 * - sustainable-power is what macOS sustained on a J614c under an
+		 *   all-core FMA load: 48-51 W, TCMz 105-110 C.
+		 * - Hot at 120 C only reports; critical is the sochot level, after
+		 *   three samples.
+		 */
 		cpu-die-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
-			thermal-sensors = <&smc_hwmon 0>;
+			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
+			sustainable-power = <48000>;
+			thermal-sensors = <&smc_hwmon 0>;	/* TCMz */
 
 			trips {
+				cpu_die_switch_on: cpu-die-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_die_passive: cpu-die-passive {
-					temperature = <113000>;
+					temperature = <110000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
 
+				cpu-die-hot {
+					temperature = <120000>;
+					hysteresis = <2000>;
+					type = "hot";
+				};
+
 				cpu-die-critical {
-					temperature = <118000>;
+					temperature = <125000>;
 					hysteresis = <0>;
 					type = "critical";
 				};
@@ -131,11 +165,9 @@
 		/*
 		 * GPU zones, with the M4 Pro's trips: the GPU firmware limits
 		 * itself from 101 C, where these shed CPU power (allocator on at
-		 * 90 C), and they shut down at 118 C after three samples. The
-		 * CPU OPPs have no opp-microwatt yet, so until they do the
-		 * passive trips have no power actors and shed nothing. Each zone
-		 * reads one of the GPU's hotter sensors; which cluster each sits
-		 * on is not known, and under load they read within 1 C.
+		 * 90 C), and they shut down at 118 C after three samples. Each
+		 * zone reads one of the GPU's hotter sensors; which cluster each
+		 * sits on is not known, and under load they read within 1 C.
 		 */
 		gpu0-thermal {
 			polling-delay-passive = <1000>;
