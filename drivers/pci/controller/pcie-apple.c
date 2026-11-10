@@ -553,6 +553,7 @@ struct apple_pcie_port {
 	u8			adopted_bus;	/* adopt_link: the secondary bus */
 	unsigned long		adopted_slots;	/* adopt_link: RID2SID slots routed (slot == SID) */
 	struct gpio_desc	*pwren;		/* adopt_link: endpoint power, if Linux trained */
+	bool			powered;	/* cold train: pwren raised, port not parked yet */
 };
 
 static int apple_pcie_managed_admit(struct apple_pcie_port *port);
@@ -2085,12 +2086,13 @@ static int apple_pcie_t6050_perst(struct apple_pcie_port *port, bool asserted)
 }
 
 /* Let the link go idle, hold the endpoint in reset and stop the port and its lane clocks */
-static int apple_pcie_t6050_port_disable(struct apple_pcie_port *port, struct pci_dev *rp)
+static int apple_pcie_t6050_port_disable(struct apple_pcie_port *port)
 {
+	void __iomem *dbi = apple_pcie_t6050_dbi(port);
 	void __iomem *perst = port->base + PORT_T602X_PERST;
 	void __iomem *lane = port->phy + PHY_LANE_CFG;
 	u32 stat;
-	int ret, err;
+	int ret;
 
 	if (!(readl(port->base + PORT_STATUS) & BIT(2))) {
 		ret = apple_pcie_t6050_wait(port, port->base, 0x820, BIT(2), BIT(2), 10000);
@@ -2105,12 +2107,12 @@ static int apple_pcie_t6050_port_disable(struct apple_pcie_port *port, struct pc
 	apple_pcie_t6050_rmw(port->base + 0x13c, 0, BIT(8));
 
 	/* The link out of L1 */
-	ret = read_poll_timeout_atomic(pci_read_config_dword, err,
-				       err || FIELD_GET(RC_T6050_LTSSM_STATE, stat) !=
+	ret = read_poll_timeout_atomic(readl, stat,
+				       FIELD_GET(RC_T6050_LTSSM_STATE, stat) !=
 					      RC_T6050_LTSSM_L1_IDLE,
-				       5, 5000, false, rp, RC_T6050_PORT_DEBUG0, &stat);
-	if (ret || err)
-		return ret ?: pcibios_err_to_errno(err);
+				       5, 5000, false, dbi + RC_T6050_PORT_DEBUG0);
+	if (ret)
+		return ret;
 
 	ret = apple_pcie_t6050_wait(port, port->base, 0xa8, BIT(0), BIT(0), 10000);
 	if (ret)
@@ -2234,9 +2236,9 @@ static int apple_pcie_t6050_port_configure(struct apple_pcie_port *port)
 }
 
 /* Disable, reset, enable and configure an adopted port whose endpoint is held in PERST# */
-static int apple_pcie_t6050_port_restart(struct apple_pcie_port *port, struct pci_dev *rp)
+static int apple_pcie_t6050_port_restart(struct apple_pcie_port *port)
 {
-	return apple_pcie_t6050_port_disable(port, rp) ?:
+	return apple_pcie_t6050_port_disable(port) ?:
 	       apple_pcie_t6050_port_enable(port) ?:
 	       apple_pcie_t6050_port_configure(port);
 }
@@ -2505,6 +2507,8 @@ static int apple_pcie_t6050_cold_train(struct apple_pcie_port *port)
 
 	/* The endpoint held, then powered: the boot loader leaves it off */
 	msleep(250);
+	/* From here the endpoint may be on, and a failure has to park the port */
+	port->powered = true;
 	ret = gpiod_set_value_cansleep(pwren, 1);
 	if (ret)
 		return ret;
@@ -2542,6 +2546,52 @@ static int apple_pcie_t6050_port_l2(struct apple_pcie_port *port)
 	ret2 = apple_pcie_t6050_wait(port, port->base, PORT_LINKSTS, PORT_LINKSTS_L2,
 				     PORT_LINKSTS_L2, 500000);
 	return ret ?: ret2;
+}
+
+/*
+ * Put a T6050 port back the way the boot stage leaves it on a cold start: link to L2
+ * (only for a link that is up: PME_Turn_Off has no one to answer on a link that never
+ * trained), PERST# asserted, lane clock request off, the port disabled and its clocks
+ * stopped, and the endpoint's power off if Linux raised it. Errors are ignored: each
+ * step is best effort and the rest still has to run. Config space is not touched.
+ */
+static void apple_pcie_t6050_port_park(struct apple_pcie_port *port, bool link_up)
+{
+	if (link_up)
+		apple_pcie_t6050_port_l2(port);
+	WRITE_ONCE(port->link_failed, true);
+	apple_pcie_t6050_perst(port, true);
+	writel(readl(port->phy) & ~PHY_LANE_CFG_REFCLKCGEN_B31, port->phy);
+	apple_pcie_t6050_port_disable(port);
+	/* An endpoint Linux powered goes off, so the next boot finds it cold */
+	if (port->pwren)
+		gpiod_set_value_cansleep(port->pwren, 0);
+	port->powered = false;
+}
+
+/*
+ * A port this driver cold-trained whose setup then failed: its link may be up and its
+ * endpoint is powered, and nothing else will stop them (the shutdown hook walks
+ * pcie->ports, which no longer holds this port). Called after apple_pcie_port_teardown(),
+ * which still needs the port's registers clocked. A failure before the endpoint was
+ * powered left nothing running: pwren was requested low and no port register was written.
+ */
+static void apple_pcie_t6050_cold_unwind(struct apple_pcie_port *port)
+{
+	bool link_up;
+
+	if (!port->powered)
+		return;
+	link_up = apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP;
+	/* The bus numbers cold_train wrote, as the shutdown hook clears them */
+	if (link_up) {
+		void __iomem *dbi = apple_pcie_t6050_dbi(port);
+
+		writel(readl(dbi + PCI_PRIMARY_BUS) & 0xff0000ff, dbi + PCI_PRIMARY_BUS);
+	}
+	apple_pcie_t6050_port_park(port, link_up);
+	dev_info(port->pcie->dev, "port %d parked after a failed setup, its endpoint powered off\n",
+		 port->idx);
 }
 
 /*
@@ -2588,7 +2638,7 @@ static int apple_pcie_t6050_reset_root_port(struct pci_host_bridge *bridge,
 	if (ret)
 		goto out;
 	writel(readl(port->phy) & ~PHY_LANE_CFG_REFCLKCGEN_B31, port->phy);
-	ret = apple_pcie_t6050_port_restart(port, rp);
+	ret = apple_pcie_t6050_port_restart(port);
 	if (ret)
 		goto out;
 
@@ -3069,6 +3119,7 @@ rid2sid_ready:
 
 err_teardown:
 	apple_pcie_port_teardown(port);
+	apple_pcie_t6050_cold_unwind(port);
 	return ret;
 }
 
@@ -4983,14 +5034,7 @@ static void apple_pcie_shutdown(struct platform_device *pdev)
 		pci_write_config_word(rp, PCI_COMMAND, 0);
 		if (!pci_read_config_dword(rp, PCI_PRIMARY_BUS, &value))
 			pci_write_config_dword(rp, PCI_PRIMARY_BUS, value & 0xff0000ff);
-		apple_pcie_t6050_port_l2(port);
-		WRITE_ONCE(port->link_failed, true);
-		apple_pcie_t6050_perst(port, true);
-		writel(readl(port->phy) & ~PHY_LANE_CFG_REFCLKCGEN_B31, port->phy);
-		apple_pcie_t6050_port_disable(port, rp);
-		/* An endpoint Linux powered goes off, so the next boot finds it cold */
-		if (port->pwren)
-			gpiod_set_value_cansleep(port->pwren, 0);
+		apple_pcie_t6050_port_park(port, true);
 		dev_info(pcie->dev, "port %d held for the restart%s\n", port->idx,
 			 port->pwren ? ", its endpoint powered off" : "");
 		pci_dev_put(rp);
