@@ -29,6 +29,7 @@ select:
           - apple,t8122-pcie-piodma
           - apple,t8132-pcie-piodma
           - apple,t8142-pcie-piodma
+          - apple,t6050-pcie-piodma
           - apple,t8152-pcie-piodma
   required:
     - compatible
@@ -113,6 +114,7 @@ allOf:
                       - apple,t8112-pcie-piodma
                       - apple,t8122-pcie-piodma
                       - apple,t8142-pcie-piodma
+                      - apple,t6050-pcie-piodma
                       - apple,t8152-pcie-piodma
                   - const: apple,pcie-piodma
 

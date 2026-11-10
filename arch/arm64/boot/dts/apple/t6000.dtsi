@@ -85,11 +85,88 @@
 	reg-names = "report", "ane-dvfs";
 };
 
+#ifdef APPLE_USE_PMP
+/*
+ * AVD and the JPEG codecs (one soc-device for both) also send the PMP a
+ * performance request while they are powered, in request class 0x21 of
+ * their SOC-DEV-DVFS entries: AVD level 2 (VMAX) at 0x112, JPEG level 1
+ * (VNOM) at 0x114. The PMP then holds the SoC rail and fabric up for them.
+ */
+&pmp_report_avd_sys {
+	apple,dvfs = <0x112 2>;
+	apple,dvfs-request-class = <0x21>;
+};
+
+&pmp_report_jpg {
+	apple,dvfs = <0x114 1>;
+	apple,dvfs-request-class = <0x21>;
+};
+#endif
+
 &ane {
 	apple,performance-controller = <&pmp_report>;
 	power-domains = <&ps_ane_sys_cpu>, <&ps_ane_set1>,
 		<&ps_ane_set2>, <&ps_ane_set3>, <&ps_ane_set4>, <&ps_pms_sram>;
 };
 
+/*
+ * T6000 has no power state registers for the AFNC3 fabric controllers or
+ * the USB-A AON domain: they are always on without a PMGR switch.
+ */
+&ps_afnc3_ioa {
+	status = "disabled";
+};
+
+&ps_afnc3_ls {
+	status = "disabled";
+};
+
+&ps_afnc3_lw0 {
+	status = "disabled";
+};
+
+&ps_gp_usb_aon {
+	status = "disabled";
+};
+
+/* The video decoder is IO-coherent in both directions. */
+&avd {
+	dma-coherent;
+};
+
 #include "t6000-peripherals.dtsi"
 #include "t6000-aux-spmi.dtsi"
+
+/* Platform error and event-log interrupt groups (apple_soc_edac). */
+&soc_errors {
+	status = "okay";
+};
+
+&soc_events {
+	status = "okay";
+};
+
+&apr0_dart {
+	status = "okay";
+};
+
+&apr0 {
+	status = "okay";
+};
+
+/* Both JPEG encoders are SoC blocks with no board wiring. */
+&jpeg0_dart {
+	status = "okay";
+};
+
+&jpeg0 {
+	status = "okay";
+};
+
+&jpeg1_dart {
+	status = "okay";
+};
+
+&jpeg1 {
+	status = "okay";
+};

@@ -2001,6 +2001,9 @@ brcmf_set_wsec_mode(struct net_device *ndev,
 			break;
 		case WLAN_CIPHER_SUITE_CCMP:
 			pval = AES_ENABLED;
+			/* SAE offload builds its own RSNE; select CCMP explicitly. */
+			algos = KEY_ALGO_MASK(CRYPTO_ALGO_AES_CCM);
+			mask = algos | KEY_ALGO_MASK(CRYPTO_ALGO_AES_GCM256);
 			break;
 		case WLAN_CIPHER_SUITE_AES_CMAC:
 			pval = AES_ENABLED;
@@ -2592,13 +2595,6 @@ brcmf_cfg80211_connect(struct wiphy *wiphy, struct net_device *ndev,
 			err = brcmf_set_pmk(ifp, params->crypto.psk,
 					    BRCMF_WSEC_MAX_PSK_LEN);
 		else if (profile->use_fwsup == BRCMF_PROFILE_FWSUP_SAE) {
-			/* clean up user-space RSNE */
-			if (brcmf_fil_iovar_data_set(ifp, "wpaie", NULL, 0)) {
-				bphy_err(
-					drvr,
-					"failed to clean up user-space RSNE\n");
-				goto done;
-			}
 			err = brcmf_fwvid_set_sae_password(ifp, &params->crypto);
 			if (!err && params->crypto.psk)
 				err = brcmf_set_pmk(ifp, params->crypto.psk,
@@ -5970,6 +5966,7 @@ static int brcmf_cfg80211_get_channel(struct wiphy *wiphy,
 	struct net_device *ndev = wdev->netdev;
 	struct brcmf_pub *drvr = cfg->pub;
 	struct brcmu_chan ch;
+	struct brcmf_if *ifp;
 	enum nl80211_band band = 0;
 	enum nl80211_chan_width width = 0;
 	u32 chanspec;
@@ -5978,7 +5975,17 @@ static int brcmf_cfg80211_get_channel(struct wiphy *wiphy,
 	if (!ndev || drvr->bus_if->state != BRCMF_BUS_UP)
 		return -ENODEV;
 
-	err = brcmf_fil_iovar_int_get(netdev_priv(ndev), "chanspec", &chanspec);
+	/* AWDL has no operating channel: the firmware moves the interface
+	 * through its availability-window channel sequence, and the AWDL
+	 * bsscfg rejects the chanspec query. Report no channel, as for an
+	 * interface that is not on one, rather than logging an error each
+	 * time nl80211 describes awdl0 (its removal notification does).
+	 */
+	ifp = netdev_priv(ndev);
+	if (ifp->is_awdl)
+		return -ENODATA;
+
+	err = brcmf_fil_iovar_int_get(ifp, "chanspec", &chanspec);
 	if (err) {
 		bphy_err(drvr, "chanspec failed (%d)\n", err);
 		return err;
@@ -6835,6 +6842,21 @@ done:
 	return err;
 }
 
+/* Whether cfg80211 has a BSS entry for @bssid (the firmware's may be gone). */
+static bool brcmf_bss_known(struct brcmf_cfg80211_info *cfg, const u8 *bssid)
+{
+	struct cfg80211_bss *bss;
+
+	if (is_zero_ether_addr(bssid))
+		return false;
+	bss = cfg80211_get_bss(cfg_to_wiphy(cfg), NULL, bssid, NULL, 0,
+			       IEEE80211_BSS_TYPE_ESS, IEEE80211_PRIVACY_ANY);
+	if (!bss)
+		return false;
+	cfg80211_put_bss(cfg_to_wiphy(cfg), bss);
+	return true;
+}
+
 static s32
 brcmf_bss_connect_done(struct brcmf_cfg80211_info *cfg,
 		       struct net_device *ndev, const struct brcmf_event_msg *e,
@@ -6853,7 +6875,25 @@ brcmf_bss_connect_done(struct brcmf_cfg80211_info *cfg,
 		memset(&conn_params, 0, sizeof(conn_params));
 		if (completed) {
 			brcmf_get_assoc_ies(cfg, ifp);
-			brcmf_update_bss_info(cfg, ifp);
+			if (brcmf_update_bss_info(cfg, ifp) &&
+			    !brcmf_bss_known(cfg, profile->bssid)) {
+				/*
+				 * A link-up that raced the join's teardown (a
+				 * disconnect for system sleep, say) leaves the
+				 * firmware with no BSS to report, and cfg80211
+				 * has none either: it would reject the success
+				 * with a WARN in __cfg80211_connect_result and
+				 * another in __cfg80211_port_authorized. Report
+				 * the join as failed and drop the firmware's
+				 * half-made association instead.
+				 */
+				brcmf_dbg(CONN, "connected BSS %pM unknown, join failed\n",
+					  profile->bssid);
+				brcmf_fil_cmd_data_set(ifp, BRCMF_C_DISASSOC, NULL, 0);
+				completed = false;
+			}
+		}
+		if (completed) {
 			set_bit(BRCMF_VIF_STATUS_CONNECTED,
 				&ifp->vif->sme_state);
 			conn_params.status = WLAN_STATUS_SUCCESS;

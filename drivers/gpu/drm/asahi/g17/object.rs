@@ -459,6 +459,11 @@ struct Retained {
     prefix: usize,
     cpu: CpuMap,
     poisoned: bool,
+    /// Return order: reuse takes the object returned longest ago.
+    order: u64,
+    /// Firmware progress after which the previous owner's references are gone
+    /// (see [`super::channel::control_fence`]).
+    fence: u64,
 }
 
 struct PoolInner {
@@ -472,6 +477,10 @@ struct PoolInner {
     kept_bytes: usize,
     /// Kept objects still owned by their users, whose list entries are reserved.
     kept_reserved: usize,
+    /// Objects returned so far, ordering the reuse cache.
+    returns: u64,
+    /// Reuses that had to take an object whose fence the firmware had not met yet.
+    fence_overruns: u64,
 }
 
 /// Retained objects past this many are still retained, with one warning.
@@ -554,7 +563,7 @@ impl Pool {
             pin_init!(Self {
                 inner <- kernel::new_mutex!(PoolInner {
                     returned, reserved: [0; POOL_FAMILIES], bytes: 0, stopped: false, kept: KVec::new(),
-                    kept_bytes: 0, kept_reserved: 0,
+                    kept_bytes: 0, kept_reserved: 0, returns: 0, fence_overruns: 0,
                 }, "g17::object::Pool"),
             }),
             GFP_KERNEL,
@@ -563,6 +572,12 @@ impl Pool {
 
     /// Allocates or reuses a matching object. Capacity pressure leaves a fresh
     /// mapping uncached, preserving allocation and submission concurrency.
+    ///
+    /// The firmware may still follow a previous owner's pointers into a returned object
+    /// until it has processed that owner's release. Reuse takes the matching object
+    /// returned longest ago once the firmware consumed a control record published after
+    /// its return; a younger one is reused only when the family has no room for a fresh
+    /// cached object, because an uncached one is unmapped as soon as its owner drops it.
     pub(crate) fn allocate(
         self: &kernel::sync::Arc<Self>,
         alloc: &Allocator<'_>,
@@ -574,22 +589,40 @@ impl Pool {
     ) -> Result<PooledObject> {
         let family_index = family as usize;
         let begin = family_index * POOL_SLOTS;
+        let witnessed = super::channel::control_witnessed();
         let reused = {
             let mut inner = self.inner.lock();
             if inner.stopped {
                 return Err(ENODEV);
             }
-            let slot = inner.returned[begin..begin + POOL_SLOTS]
-                .iter_mut()
-                .find(|entry| {
-                    entry.as_ref().is_some_and(|entry| {
-                        !entry.poisoned
-                            && entry.object.size() == size
-                            && entry.prefix == prefix
-                            && entry.cpu == cpu
-                    })
-                });
-            slot.and_then(Option::take)
+            let room = inner.reserved[family_index] < POOL_SLOTS
+                && inner.bytes.checked_add(size).is_some_and(|bytes| bytes <= POOL_BYTES);
+            let mut oldest: Option<(usize, u64, bool)> = None;
+            for (index, entry) in inner.returned[begin..begin + POOL_SLOTS].iter().enumerate() {
+                let Some(entry) = entry.as_ref().filter(|entry| {
+                    !entry.poisoned
+                        && entry.object.size() == size
+                        && entry.prefix == prefix
+                        && entry.cpu == cpu
+                }) else {
+                    continue;
+                };
+                let ready = entry.fence <= witnessed;
+                if oldest.is_none_or(|(_, order, best_ready)| {
+                    (ready && !best_ready) || (ready == best_ready && entry.order < order)
+                }) {
+                    oldest = Some((begin + index, entry.order, ready));
+                }
+            }
+            match oldest {
+                Some((index, _, ready)) if ready || !room => {
+                    if !ready {
+                        inner.fence_overruns += 1;
+                    }
+                    inner.returned[index].take()
+                }
+                _ => None,
+            }
         };
         let lease = || CacheLease {
             pool: self.clone(),
@@ -671,6 +704,9 @@ impl Pool {
             return;
         }
         let begin = family * POOL_SLOTS;
+        inner.returns += 1;
+        let order = inner.returns;
+        let fence = super::channel::control_fence();
         for slot in &mut inner.returned[begin..begin + POOL_SLOTS] {
             if slot.is_none() {
                 *slot = Some(Retained {
@@ -678,6 +714,8 @@ impl Pool {
                     prefix: lease.prefix,
                     cpu: lease.cpu,
                     poisoned: lease.poisoned,
+                    order,
+                    fence,
                 });
                 return;
             }
@@ -776,6 +814,10 @@ impl Pool {
                      entries.iter().flatten().filter(|entry| entry.poisoned).count())?;
         }
         writeln!(f, "cached_object_bytes used={} total={}", inner.bytes, POOL_BYTES)?;
+        let witnessed = super::channel::control_witnessed();
+        writeln!(f, "cached_objects_fenced waiting={} overruns={}",
+                 inner.returned.iter().flatten().filter(|entry| entry.fence > witnessed).count(),
+                 inner.fence_overruns)?;
         writeln!(f, "firmware_linked_objects kept={} bytes={}", inner.kept.len(), inner.kept_bytes)
     }
 }

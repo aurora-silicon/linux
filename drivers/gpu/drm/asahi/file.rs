@@ -33,6 +33,7 @@ use core::mem::MaybeUninit;
 use core::ops::Deref;
 use core::ops::Range;
 use core::ptr::addr_of_mut;
+use core::sync::atomic::{AtomicBool, Ordering};
 use kernel::bindings;
 use kernel::dma_fence::RawDmaFence;
 use kernel::drm::gem::BaseObject;
@@ -269,10 +270,12 @@ pub(crate) struct File {
     id: u64,
     /// Available VM range for the user
     user_range: Range<u64>,
-    // #[pin]
-    vms: xarray::XArray<KBox<Vm>>,
+    // Fields drop in order: the queues go first, so that a closing client's submitted work
+    // can finish before its VMs unmap the user ranges.
     // #[pin]
     queues: xarray::XArray<Arc<Mutex<KBox<dyn queue::Queue>>>>,
+    // #[pin]
+    vms: xarray::XArray<KBox<Vm>>,
     // #[pin]
     objects: xarray::XArray<KBox<Object>>,
     /// GPU memory this client created and holds.
@@ -282,6 +285,8 @@ pub(crate) struct File {
     /// Largest size this file has asked GET_PARAMS for the global parameters with
     /// ([`gpu::Gpu::admit_vm`]).
     params_size: core::sync::atomic::AtomicU64,
+    /// The queues were drained once for an exiting task.
+    drained: AtomicBool,
 }
 
 /// Convenience type alias for our DRM `File` type.
@@ -375,6 +380,7 @@ impl File {
                 addr_of_mut!((*slot).mem).write(mem);
                 addr_of_mut!((*slot).usage).write(usage);
                 addr_of_mut!((*slot).params_size).write(core::sync::atomic::AtomicU64::new(0));
+                addr_of_mut!((*slot).drained).write(AtomicBool::new(false));
                 Ok(())
             })
         }
@@ -1165,7 +1171,43 @@ impl File {
         Ok(0)
     }
 
+    /// Waits for the submitted work of every queue of `file`, once, when its task exits.
+    ///
+    /// An exiting or killed client's DRM file closes its GEM handles before the driver sees
+    /// the file go, and closing a handle unmaps the object at once from VMs that do not track
+    /// jobs (G13/G14). Work the client left running would then fault on the unmapped memory
+    /// and time out in the firmware. A live client unmaps only what its work no longer uses.
+    fn drain_queues_on_exit(file: &DrmFile) {
+        // SAFETY: `current` is valid for the running task.
+        let exiting =
+            unsafe { (*kernel::task::Task::current_raw()).flags } & bindings::PF_EXITING != 0;
+        if !exiting || file.inner().drained.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let mut index = 0;
+        loop {
+            // Clone since we can't hold the xarray spinlock while waiting.
+            let Some((idx, queue)) =
+                file.inner()
+                    .queues()
+                    .find(index, usize::MAX)
+                    .map(|(idx, guard)| {
+                        let queue: Arc<Mutex<KBox<dyn queue::Queue>>> = guard.borrow().into();
+                        (idx, queue)
+                    })
+            else {
+                break;
+            };
+            queue.lock().drain();
+            if idx == usize::MAX {
+                break;
+            }
+            index = idx + 1;
+        }
+    }
+
     pub(crate) fn unbind_gem_object(file: &DrmFile, bo: &gem::Object) -> Result {
+        Self::drain_queues_on_exit(file);
         // TODO: use iter()
         let mut index = 0;
         loop {

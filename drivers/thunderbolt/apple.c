@@ -83,6 +83,7 @@
 #include <linux/gpio/consumer.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/iommu.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -141,6 +142,17 @@ struct apple_cio_hw {
 	bool strict_fw_ready;
 	/* Keep the links of the host router out of CL states. */
 	bool no_host_clx;
+	/* Type 7 router: Enter_USB cable words, bootloader RC tuning, Type 7 NHI. */
+	bool type7;
+	/*
+	 * Release the CPU with a plain store of the RUN value rather than a
+	 * read-modify-write, and halt it again when the router stops.
+	 */
+	bool run_store;
+	/* Hold LSTX low as a GPIO from probe until the router first takes it. */
+	bool lstx_hold_from_probe;
+	/* The router trains Gen4 only on a cable word that says Gen4. */
+	bool gen4_cable;
 	const struct apple_dpin_policy *dp;
 };
 
@@ -178,6 +190,35 @@ static const struct apple_cio_hw apple_cio_t8132_hw = {
 
 /* Type 7 uses its existing ready-state check and has no qualified DP route. */
 static const struct apple_cio_hw apple_cio_t8142_hw = {
+	.type7 = true,
+	.dp = &apple_dpin_disabled,
+};
+
+/*
+ * T6050 is Type 7 with an MxWrap CPU wrapper that is only clocked once the
+ * CIO reset (the reconfig request) has run. Its CPU is released with a plain
+ * store of RUN; as on T8132 it takes LSTX over only once its RTKit is up, and
+ * the AP holds the pin while the router is off. DP tunnels stay off for now.
+ */
+static const struct apple_cio_hw apple_cio_t6050_hw = {
+	.mxwrap = true,
+	.type7 = true,
+	.run_store = true,
+	.lstx_after_boot = true,
+	.lstx_hold_from_probe = true,
+	.strict_fw_ready = true,
+	.gen4_cable = true,
+	.dp = &apple_dpin_disabled,
+};
+
+static const struct apple_cio_hw apple_cio_t6040_hw = {
+	.mxwrap = true,
+	.type7 = true,
+	.lstx_explicit = true,
+	.skip_run = true,
+	.lstx_after_boot = true,
+	.strict_fw_ready = true,
+	.no_host_clx = true,
 	.dp = &apple_dpin_disabled,
 };
 
@@ -207,6 +248,14 @@ static const struct apple_cio_hw apple_cio_t8142_hw = {
 #define APPLE_CIO_SLEEP_RESTART_FALLBACK_MS 10000
 /* How long a forced cable cycle may take before it no longer counts. */
 #define APPLE_CIO_RESUME_RECOVERY_WINDOW_MS 30000
+/*
+ * After a peer drops the link without the cable going away, the ACIO
+ * firmware parks the port and waits for the host to power it off. A peer
+ * that reboots or goes away electrically is reported as a cable change
+ * within about 0.5 s and restarts the port anyway.
+ */
+#define APPLE_CIO_LINK_LOST_MS 3000
+#define APPLE_CIO_LINK_LOST_CYCLES 3
 
 static bool resume_recovery;
 module_param(resume_recovery, bool, 0644);
@@ -246,6 +295,10 @@ MODULE_PARM_DESC(s2idle_teardown,
 #define TB_VSE_CAP_APPLE_CABLE_INFO_20_GBPS BIT(4)
 #define TB_VSE_CAP_APPLE_CABLE_INFO_LEGACY_ADAPTER BIT(9)
 #define TB_VSE_CAP_APPLE_CABLE_INFO_TBT2_3 BIT(10)
+#define TB_VSE_CAP_APPLE_CABLE_INFO_GEN4 BIT(11)
+
+/* Enter_USB cable speed: USB PD 3.2 adds USB4 Gen4 after Gen3. */
+#define APPLE_EUDO_CABLE_SPEED_USB4_GEN4 4
 
 static unsigned int dpin_mode_value = 8;
 module_param(dpin_mode_value, uint, 0644);
@@ -296,6 +349,10 @@ struct apple_cio {
 	struct apple_tunable *rc_tunable;
 	void __iomem *pcie_adapter_base;
 	struct apple_tunable *pcie_adapter_tunable;
+	void __iomem *router_ap_fw_base;
+	struct apple_tunable *router_ap_fw_tunable;
+	/* A run_store router CPU that apple_cio_start() released */
+	bool cpu_running;
 
 	struct resource *sram_res;
 	void __iomem *sram_base;
@@ -315,6 +372,12 @@ struct apple_cio {
 	bool resume_recovery_failed; /* terminal recovery failure */
 	bool resume_link_failed; /* protected by lock */
 	bool resume_link_pending; /* set by NHI resume, consumed by ACIO complete */
+	struct delayed_work link_lost_work;
+	unsigned int start_gen; /* protected by lock: bumped by every start */
+	unsigned int link_lost_gen; /* start_gen when the peer went away */
+	unsigned int link_lost_cycles; /* protected by lock */
+	u64 link_lost_cycle_activity; /* remote activity at the last cycle */
+	bool link_lost_restart; /* protected by lock: cycle requested */
 	struct notifier_block pm_notifier;
 	struct delayed_work sleep_restart_work;
 	enum {
@@ -883,14 +946,21 @@ static void apple_cio_of_node_put(void *data)
 	of_node_put(data);
 }
 
+static bool apple_cio_pciec_eligible(const struct device_node *np)
+{
+	return of_device_is_compatible(np, "apple,t6040-pciec") ||
+	       of_device_is_compatible(np, "apple,t8103-pciec") ||
+	       of_device_is_compatible(np, "apple,t6000-pciec") ||
+	       of_device_is_compatible(np, "apple,t6050-pciec");
+}
+
 static bool
 apple_cio_pcie_tunnel_is_preinitialized(struct device_node *parent)
 {
 	for_each_available_child_of_node_scoped(parent, child) {
 		u32 status;
 
-		if (!of_device_is_compatible(child, "apple,t8103-pciec") &&
-		    !of_device_is_compatible(child, "apple,t6000-pciec"))
+		if (!apple_cio_pciec_eligible(child))
 			continue;
 
 		if (!of_property_read_u32(child, "apple,pciec-preinit-status",
@@ -919,8 +989,7 @@ static int apple_cio_get_pcie_reset(struct apple_cio *acio)
 	struct reset_control *rst = NULL;
 
 	for_each_available_child_of_node_scoped(acio->pcie_tunnel_np, child) {
-		if (!of_device_is_compatible(child, "apple,t8103-pciec") &&
-		    !of_device_is_compatible(child, "apple,t6000-pciec"))
+		if (!apple_cio_pciec_eligible(child))
 			continue;
 		if (!of_property_read_bool(child, "apple,pciec-kernel-init"))
 			break;
@@ -952,8 +1021,7 @@ static int apple_cio_map_pcie_intr2axi(struct apple_cio *acio)
 	int index, ret;
 
 	for_each_available_child_of_node_scoped(acio->pcie_tunnel_np, child) {
-		if (!of_device_is_compatible(child, "apple,t8103-pciec") &&
-		    !of_device_is_compatible(child, "apple,t6000-pciec"))
+		if (!apple_cio_pciec_eligible(child))
 			continue;
 
 		index = of_property_match_string(child, "reg-names", "intr2axi");
@@ -1094,6 +1162,10 @@ static int apple_nhi_probe_irqs(struct apple_nhi *anhi)
 	n_irqs = platform_irq_count(anhi->pdev);
 	if (n_irqs < 0)
 		return dev_err_probe(anhi->dev, n_irqs, "platform_irq_count failed\n");
+	/* T6050 adds a named SRAM parity interrupt after the ring interrupts. */
+	if (n_irqs > 0 &&
+	    platform_get_irq_byname_optional(anhi->pdev, "parity") > 0)
+		n_irqs--;
 	if (n_irqs == 0) {
 		dev_err(anhi->dev, "No interrupts found\n");
 		return -EINVAL;
@@ -1340,6 +1412,33 @@ static int apple_cio_pcie_tunnel_ready_locked(struct apple_cio *acio)
 	return ret;
 }
 
+/*
+ * PCIe-C is the only native port this host tunnels. Order it after the NHI,
+ * which rebuilds the tunnel underneath it at resume (the job of the ACPI
+ * device links on PC hosts). The link is stateless: it orders system sleep
+ * only and leaves probe and unbind alone, because apple_cio_remove_children()
+ * must stop the NHI while PCIe-C is still bound. Removing either device drops
+ * the link; both are removed together and PCIe-C is populated only once per
+ * NHI, so this runs once per pair.
+ */
+static void apple_cio_link_pcie_tunnel(struct apple_cio *acio)
+{
+	struct platform_device *nhi_pdev = READ_ONCE(acio->nhi_pdev);
+	struct platform_device *pcie_pdev;
+
+	lockdep_assert_held(&acio->pcie_tunnel_lock);
+	pcie_pdev = apple_cio_find_pcie_tunnel(acio);
+	if (!pcie_pdev)
+		return;
+	if (!nhi_pdev ||
+	    !device_link_add(&pcie_pdev->dev, &nhi_pdev->dev, DL_FLAG_STATELESS))
+		dev_warn(acio->dev, "PCIe-C: device link to the NHI failed\n");
+	else
+		dev_dbg(acio->dev, "PCIe-C: linked %s to %s\n",
+			dev_name(&pcie_pdev->dev), dev_name(&nhi_pdev->dev));
+	put_device(&pcie_pdev->dev);
+}
+
 static int apple_cio_activate_pcie_tunnel_locked(struct apple_cio *acio)
 {
 	int ret = 0;
@@ -1369,6 +1468,7 @@ static int apple_cio_activate_pcie_tunnel_locked(struct apple_cio *acio)
 				     "failed to populate tunneled PCIe controller\n");
 
 	acio->pcie_tunnel_populated = true;
+	apple_cio_link_pcie_tunnel(acio);
 	dev_info(acio->dev,
 		 "PCIe-C populated after USB4 PCIe tunnel adapter enable\n");
 	return apple_cio_pcie_tunnel_ready_locked(acio);
@@ -2001,7 +2101,37 @@ static bool apple_nhi_dp_tunnel_awaits_display(struct tb_nhi *nhi,
 	return apple_dpin_awaits_display(&c->state, c->acio->dp);
 }
 
+/*
+ * There are no firmware tables naming the tunneled ports: PCIe-C, when the
+ * port has one, is linked to the NHI as it is populated (see
+ * apple_cio_link_pcie_tunnel()). A port without PCIe-C tunnels no native port.
+ */
+static bool apple_nhi_add_links(struct tb_nhi *nhi)
+{
+	return true;
+}
+
+/*
+ * Called with the domain lock held when the peer on a host router lane
+ * adapter went away: only (re)arm the check.
+ */
+static void apple_nhi_link_lost(struct tb_nhi *nhi)
+{
+	struct apple_nhi *anhi = nhi_to_anhi(nhi);
+	struct apple_cio *acio = anhi->acio;
+	u64 activity = atomic64_read(&anhi->tb->remote_activity);
+
+	/* A peer was found since the last cycle: that cycle worked */
+	if (activity != READ_ONCE(acio->link_lost_cycle_activity))
+		WRITE_ONCE(acio->link_lost_cycles, 0);
+	WRITE_ONCE(acio->link_lost_gen, READ_ONCE(acio->start_gen));
+	mod_delayed_work(system_freezable_wq, &acio->link_lost_work,
+			 msecs_to_jiffies(APPLE_CIO_LINK_LOST_MS));
+}
+
 static const struct tb_nhi_ops apple_nhi_ops = {
+	.add_links = apple_nhi_add_links,
+	.link_lost = apple_nhi_link_lost,
 	.request_ring_irq = apple_nhi_request_irq,
 	.release_ring_irq = apple_nhi_release_irq,
 	.ring_interrupt_active = apple_nhi_ring_interrupt_active,
@@ -2031,9 +2161,28 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	int cap_apple;
 	int ret = 0;
 
+	/* The T6050 router is the Type 7 one released by a RUN store. */
 	if (acio->type7 !=
-	    of_device_is_compatible(pdev->dev.of_node, "apple,t8142-usb4-nhi")) {
+	    (of_device_is_compatible(pdev->dev.of_node, "apple,t8142-usb4-nhi") ||
+	     of_device_is_compatible(pdev->dev.of_node, "apple,t6040-usb4-nhi") ||
+	     of_device_is_compatible(pdev->dev.of_node, "apple,t6050-usb4-nhi")) ||
+	    acio->hw->run_store !=
+	    !!of_device_is_compatible(pdev->dev.of_node, "apple,t6050-usb4-nhi")) {
 		ret = dev_err_probe(&pdev->dev, -EINVAL, "ACIO/NHI generation mismatch\n");
+		goto err;
+	}
+
+	/*
+	 * The rings must never run untranslated. The DART is populated with
+	 * the NHI, so it is normally bound first; but once the driver core
+	 * has stopped waiting for missing suppliers (DART driver not loaded
+	 * yet), the NHI would probe without its IOMMU. Defer, and fail the
+	 * ACIO start now instead of letting it wait for the NHI to time out.
+	 */
+	if (of_property_present(pdev->dev.of_node, "iommus") &&
+	    !device_iommu_mapped(&pdev->dev)) {
+		dev_warn(&pdev->dev, "DART not bound yet, not starting the NHI\n");
+		ret = -EPROBE_DEFER;
 		goto err;
 	}
 
@@ -2459,6 +2608,12 @@ static const struct dev_pm_ops apple_nhi_pm_ops = {
 
 static const struct of_device_id apple_nhi_match[] = {
 	{
+		.compatible = "apple,t6040-usb4-nhi",
+	},
+	{
+		.compatible = "apple,t6050-usb4-nhi",
+	},
+	{
 		.compatible = "apple,t8142-usb4-nhi",
 	},
 	{
@@ -2486,8 +2641,7 @@ static struct platform_device *apple_cio_find_pcie_tunnel(struct apple_cio *acio
 		return NULL;
 
 	for_each_available_child_of_node_scoped(acio->pcie_tunnel_np, child) {
-		if (!of_device_is_compatible(child, "apple,t8103-pciec") &&
-		    !of_device_is_compatible(child, "apple,t6000-pciec"))
+		if (!apple_cio_pciec_eligible(child))
 			continue;
 
 		pdev = of_find_device_by_node(child);
@@ -2592,6 +2746,22 @@ static int apple_cio_lstx_release(struct apple_cio *acio)
 	return pinctrl_select_state(acio->pinctrl, acio->lstx_pins);
 }
 
+/*
+ * Halt a run_store router CPU that apple_cio_start() released. Its wrapper is
+ * only clocked after the CIO reset, so never touch it otherwise.
+ */
+static void apple_cio_cpu_halt(struct apple_cio *acio)
+{
+	u32 val;
+
+	if (!acio->hw->run_store || !acio->cpu_running)
+		return;
+	acio->cpu_running = false;
+	val = readl(acio->cpu_base + APPLE_MXWRAP_CPU_CTRL);
+	writel(val & ~APPLE_MXWRAP_CPU_CTRL_RUN,
+	       acio->cpu_base + APPLE_MXWRAP_CPU_CTRL);
+}
+
 /**
  * apple_cio_stop - Stop and power down the ACIO complex
  * @acio: ACIO complex to stop
@@ -2616,6 +2786,7 @@ static void apple_cio_stop(struct apple_cio *acio)
 			 "Failed to shutdown M3 RTKit, continuing ACIO shutdown anyway\n");
 	apple_rtkit_free(acio->rtk);
 	acio->rtk = NULL;
+	apple_cio_cpu_halt(acio);
 
 	/* High only if the router left it driven high with the cable still in */
 	if (acio->hw->lstx_after_boot)
@@ -2633,11 +2804,18 @@ static void apple_cio_stop(struct apple_cio *acio)
 
 	acio->current_cable_info = 0;
 	acio->resume_link_failed = false;
+	acio->link_lost_restart = false;
 }
 
-/* Only called while the ACIO power domains are on. */
+/*
+ * Only called while the ACIO power domains are on. Neither a T6050 router's rc
+ * block nor its CPU wrapper is known to be readable while it starts (see
+ * apple_cio_start()), so log nothing for it.
+ */
 static void apple_cio_log_state(struct apple_cio *acio, const char *when)
 {
+	if (acio->hw->run_store)
+		return;
 	if (acio->cpu_base)
 		dev_info(acio->dev, "%s: LSTX 0x%08x, FW state 0x%08x, CPU ctrl 0x%08x, status 0x%08x\n",
 			 when, readl(acio->rc_base + APPLE_CIO_M3_CTRL),
@@ -2753,7 +2931,11 @@ static int apple_cio_start(struct apple_cio *acio)
 	 * them with a bare store.
 	 */
 	if (acio->hw->lstx_after_boot) {
-		/* Written below, once RTKit is up. */
+		/*
+		 * Written below, once RTKit is up. A T6050 CPU is started through
+		 * its wrapper below, and its rc block takes an external abort until
+		 * the CPU runs, so M3_CTRL is left alone here.
+		 */
 	} else if (acio->hw->lstx_explicit) {
 		writel(APPLE_CIO_LSTX_CTRL_ENABLE | APPLE_CIO_LSTX_CTRL_LEVEL,
 		       acio->rc_base + APPLE_CIO_M3_CTRL);
@@ -2764,9 +2946,21 @@ static int apple_cio_start(struct apple_cio *acio)
 
 	if (acio->hw->mxwrap && !acio->hw->skip_run) {
 		apple_cio_log_state(acio, "before RUN");
-		val = readl(acio->cpu_base + APPLE_MXWRAP_CPU_CTRL);
-		writel(val | APPLE_MXWRAP_CPU_CTRL_RUN,
-		       acio->cpu_base + APPLE_MXWRAP_CPU_CTRL);
+		if (acio->hw->run_store) {
+			/*
+			 * The CIO reset above clocks the wrapper; the CPU runs the
+			 * image the boot loader left in its SRAM once RUN is set.
+			 * The run value is stored outright, not merged.
+			 */
+			writel(APPLE_MXWRAP_CPU_CTRL_RUN,
+			       acio->cpu_base + APPLE_MXWRAP_CPU_CTRL);
+			acio->cpu_running = true;
+			apple_cio_log_state(acio, "after RUN");
+		} else {
+			val = readl(acio->cpu_base + APPLE_MXWRAP_CPU_CTRL);
+			writel(val | APPLE_MXWRAP_CPU_CTRL_RUN,
+			       acio->cpu_base + APPLE_MXWRAP_CPU_CTRL);
+		}
 	}
 
 	acio->rtk = apple_rtkit_init(acio->dev, acio, NULL, 0, &apple_cio_rtkit_ops);
@@ -2825,6 +3019,8 @@ static int apple_cio_start(struct apple_cio *acio)
 		apple_tunable_apply(acio->pcie_adapter_base,
 				    acio->pcie_adapter_tunable);
 	}
+	/* The router AP firmware tunable goes with the others once the firmware is ready. */
+	apple_tunable_apply(acio->router_ap_fw_base, acio->router_ap_fw_tunable);
 
 	/*
 	 * Bring up devices which are part of ACIO and are now accessible by the main SoC
@@ -2849,6 +3045,7 @@ static int apple_cio_start(struct apple_cio *acio)
 	}
 
 	acio->current_cable_info = acio->target_cable_info;
+	acio->start_gen++;
 	return 0;
 
 err_depopulate:
@@ -2862,6 +3059,7 @@ err_free_rtkit:
 	apple_rtkit_free(acio->rtk);
 remove_links:
 	acio->rtk = NULL;
+	apple_cio_cpu_halt(acio);
 	/* Cut power to reset the entire block  */
 	for (i = 0; i < acio->pd_list->num_pds; i++) {
 		if (acio->pd_list->pd_links[i])
@@ -2879,7 +3077,7 @@ static int apple_cio_check_connection(struct apple_cio *acio)
 
 	lockdep_assert_held(&acio->lock);
 	/* Ask CD321x to cycle ACIO and the PHY using a fresh cable snapshot. */
-	if (acio->resume_link_failed)
+	if (acio->resume_link_failed || acio->link_lost_restart)
 		return -ENOLINK;
 	guard(mutex)(&acio->pcie_tunnel_lock);
 	if (!READ_ONCE(acio->nhi_pdev) || acio->pcie_tunnel_stopping ||
@@ -2944,6 +3142,79 @@ unlock:
 	return verdict;
 }
 
+/* Whether a router or host is connected to a lane adapter of the host router */
+static bool apple_cio_has_peer(struct apple_cio *acio, u64 *activity)
+{
+	struct platform_device *pdev = READ_ONCE(acio->nhi_pdev);
+	struct apple_nhi *anhi;
+	struct tb_port *port;
+	bool peer = true;
+
+	lockdep_assert_held(&acio->lock);
+	if (!pdev)
+		return true;
+	device_lock(&pdev->dev);
+	anhi = platform_get_drvdata(pdev);
+	if (!pdev->dev.driver || !anhi || !anhi->tb)
+		goto unlock;
+
+	scoped_guard(mutex, &anhi->tb->lock) {
+		*activity = atomic64_read(&anhi->tb->remote_activity);
+		peer = false;
+		tb_switch_for_each_port(anhi->tb->root_switch, port) {
+			if (!tb_port_is_null(port))
+				continue;
+			if ((port->xdomain && !port->xdomain->is_unplugged) ||
+			    (port->remote && !port->remote->sw->is_unplugged))
+				peer = true;
+		}
+	}
+unlock:
+	device_unlock(&pdev->dev);
+	return peer;
+}
+
+/*
+ * The peer dropped the link but the cable is still attached and no cable
+ * change followed. The firmware leaves the port down until it is powered
+ * off, so have CD321x cycle it with a fresh cable snapshot, a few times.
+ */
+static void apple_cio_link_lost_work(struct work_struct *work)
+{
+	struct apple_cio *acio = container_of(to_delayed_work(work),
+					      struct apple_cio, link_lost_work);
+	u64 activity = 0;
+	bool notify = false;
+
+	scoped_guard(mutex, &acio->lock) {
+		if (acio->removing || !acio->current_cable_info ||
+		    !acio->target_cable_info ||
+		    acio->sleep_phase != APPLE_CIO_SLEEP_OPEN ||
+		    acio->resume_recovery_failed ||
+		    acio->start_gen != READ_ONCE(acio->link_lost_gen))
+			return;
+		if (apple_cio_has_peer(acio, &activity))
+			return;
+		if (acio->link_lost_cycles >= APPLE_CIO_LINK_LOST_CYCLES) {
+			dev_warn(acio->dev,
+				 "peer link still down after %u port restarts, leaving the port alone\n",
+				 acio->link_lost_cycles);
+			return;
+		}
+		acio->link_lost_cycles++;
+		WRITE_ONCE(acio->link_lost_cycle_activity, activity);
+		acio->link_lost_restart = true;
+		dev_info(acio->dev,
+			 "peer link lost with the cable attached, restarting the port (%u/%u)\n",
+			 acio->link_lost_cycles, APPLE_CIO_LINK_LOST_CYCLES);
+		notify = true;
+	}
+
+	/* CD321x may tear down the NHI: never notify under either driver lock. */
+	if (notify)
+		typec_thunderbolt_switch_notify(acio->tbt_switch);
+}
+
 static void apple_cio_resume_link_work(struct work_struct *work)
 {
 	struct apple_cio *acio = container_of(to_delayed_work(work),
@@ -2987,6 +3258,7 @@ static int apple_cio_prepare(struct device *dev)
 
 	/* Drain before taking lock; the worker acquires it to check the link. */
 	cancel_delayed_work_sync(&acio->resume_link_work);
+	cancel_delayed_work_sync(&acio->link_lost_work);
 	scoped_guard(mutex, &acio->lock) {
 		WRITE_ONCE(acio->resume_link_pending, false);
 		acio->resume_link_failed = false;
@@ -3075,7 +3347,16 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 		acio->target_cable_info = TB_VSE_CAP_APPLE_CABLE_INFO_PRESENT;
 		if (FIELD_GET(EUDO_CABLE_TYPE_MASK, data->usb4.eudo) != EUDO_CABLE_TYPE_PASSIVE)
 			acio->target_cable_info |= TB_VSE_CAP_APPLE_CABLE_INFO_ACTIVE_CABLE;
-		if (FIELD_GET(EUDO_CABLE_SPEED_MASK, data->usb4.eudo) >= EUDO_CABLE_SPEED_USB4_GEN3)
+		/*
+		 * The T6050 router firmware trains Gen4 only on a Gen4 cable, and
+		 * takes Gen4 alone: no 20 Gb/s bit beside it.
+		 */
+		if (acio->hw->gen4_cable &&
+		    FIELD_GET(EUDO_CABLE_SPEED_MASK, data->usb4.eudo) >=
+		    APPLE_EUDO_CABLE_SPEED_USB4_GEN4)
+			acio->target_cable_info |= TB_VSE_CAP_APPLE_CABLE_INFO_GEN4;
+		else if (FIELD_GET(EUDO_CABLE_SPEED_MASK, data->usb4.eudo) >=
+			 EUDO_CABLE_SPEED_USB4_GEN3)
 			acio->target_cable_info |= TB_VSE_CAP_APPLE_CABLE_INFO_20_GBPS;
 		if (data->orientation == TYPEC_ORIENTATION_REVERSE)
 			acio->target_cable_info |= TB_VSE_CAP_APPLE_CABLE_INFO_ORIENTATION_REVERSE;
@@ -3275,18 +3556,19 @@ static int apple_cio_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&acio->pcie_tunnel_work,
 			  apple_cio_pcie_tunnel_work);
 	INIT_DELAYED_WORK(&acio->resume_link_work, apple_cio_resume_link_work);
+	INIT_DELAYED_WORK(&acio->link_lost_work, apple_cio_link_lost_work);
 	INIT_DELAYED_WORK(&acio->sleep_restart_work, apple_cio_sleep_restart_work);
 	init_completion(&acio->nhi_boot_completion);
 	acio->dev = &pdev->dev;
 	acio->np = dev->of_node;
-	acio->type7 = of_device_is_compatible(acio->np, "apple,t8142-usb4-acio");
-	if (acio->type7 &&
-	    of_property_count_u32_elems(acio->np, "apple,tunable-rc") <= 0)
-		return dev_err_probe(dev, -EINVAL, "Missing bootloader RC tuning\n");
-
 	acio->hw = of_device_get_match_data(dev);
 	if (!acio->hw)
 		return -EINVAL;
+
+	acio->type7 = acio->hw->type7;
+	if (acio->type7 &&
+	    of_property_count_u32_elems(acio->np, "apple,tunable-rc") <= 0)
+		return dev_err_probe(dev, -EINVAL, "Missing bootloader RC tuning\n");
 
 	if (acio->hw->mxwrap) {
 		struct resource *cpu_res;
@@ -3310,6 +3592,9 @@ static int apple_cio_probe(struct platform_device *pdev)
 			acio->lstx_pins = NULL;
 		acio->lstx_hold = acio->lstx_pins &&
 				  of_property_present(dev->of_node, "lstx-gpios");
+		/* Hold the line low until the router first takes it. */
+		if (acio->hw->lstx_hold_from_probe)
+			apple_cio_lstx_hold(acio, false);
 	}
 	acio->pcie_tunnel_np =
 		of_parse_phandle(dev->of_node, "apple,pcie-tunnel", 0);
@@ -3378,6 +3663,32 @@ static int apple_cio_probe(struct platform_device *pdev)
 		}
 	}
 
+	{
+		struct resource *ap_fw;
+
+		ap_fw = platform_get_resource_byname(pdev, IORESOURCE_MEM, "router-ap-fw");
+		if (ap_fw) {
+			acio->router_ap_fw_base = devm_ioremap_resource(dev, ap_fw);
+			if (IS_ERR(acio->router_ap_fw_base))
+				return dev_err_probe(dev, PTR_ERR(acio->router_ap_fw_base),
+						     "Unable to map router AP firmware regs\n");
+			acio->router_ap_fw_tunable =
+				devm_apple_tunable_parse(dev, acio->np,
+							 "apple,tunable-router-ap-fw", ap_fw);
+			if (IS_ERR(acio->router_ap_fw_tunable)) {
+				if (PTR_ERR(acio->router_ap_fw_tunable) != -ENOENT)
+					return dev_err_probe(dev,
+							PTR_ERR(acio->router_ap_fw_tunable),
+							"Unable to load router AP firmware tunable\n");
+				acio->router_ap_fw_tunable = NULL;
+			}
+		}
+	}
+
+	/*
+	 * On T6050 this is the CIO reconfig request, which also clocks the
+	 * router CPU's wrapper: nothing may touch the wrapper before it.
+	 */
 	acio->reset = devm_reset_control_get_exclusive(dev, NULL);
 	if (IS_ERR(acio->reset))
 		return dev_err_probe(dev, PTR_ERR(acio->reset), "Unable to get CIO reset\n");
@@ -3474,6 +3785,7 @@ static void apple_cio_remove(struct platform_device *pdev)
 	disable_delayed_work_sync(&acio->sleep_restart_work);
 
 	disable_delayed_work_sync(&acio->resume_link_work);
+	disable_delayed_work_sync(&acio->link_lost_work);
 	/* The worker can notify this switch; stop current and future enqueues. */
 	disable_delayed_work_sync(&acio->pcie_tunnel_work);
 	/* A set may hold the switch read lock while waiting for acio->lock. */
@@ -3487,6 +3799,14 @@ static void apple_cio_remove(struct platform_device *pdev)
 
 
 static const struct of_device_id apple_acio_match[] = {
+	{
+		.compatible = "apple,t6040-usb4-acio",
+		.data = &apple_cio_t6040_hw,
+	},
+	{
+		.compatible = "apple,t6050-usb4-acio",
+		.data = &apple_cio_t6050_hw,
+	},
 	{
 		.compatible = "apple,t8142-usb4-acio",
 		.data = &apple_cio_t8142_hw,

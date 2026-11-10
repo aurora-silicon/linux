@@ -24,6 +24,7 @@ properties:
           - enum:
               - apple,t6030-sep
               - apple,t6031-sep
+              - apple,t6050-sep
           - const: apple,sep
 
   reg:
@@ -37,6 +38,9 @@ properties:
 
   mbox-names:
     const: mbox
+
+  clocks:
+    maxItems: 1
 
   iommus:
     maxItems: 1
@@ -67,12 +71,28 @@ properties:
       The signed local boot policy of the running boot, added by the
       bootloader, for the same purpose.
 
+  status: true
+
 required:
   - compatible
   - reg
+  - iommus
   - mboxes
   - mbox-names
-  - iommus
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6050-sep
+    then:
+      properties:
+        reg:
+          minItems: 2
+    else:
+      properties:
+        clocks: false
 
 additionalProperties: false
 

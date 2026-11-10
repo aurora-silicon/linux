@@ -151,10 +151,20 @@ struct sio_chan {
 
 typedef void (*sio_ack_callback)(struct sio_chan *, void *, bool);
 
+struct sio_data;
+struct sio_dma_arrays;
+
 struct sio_hw_data {
+	u32 protocol;		/* the only protocol STARTED may report, or 0 */
 	u32 fifo_threshold;
+	u32 cfg_word4;		/* configuration word 4 */
+	bool cfg_six_words;	/* the configuration ends in a zero sixth word */
 	bool clear_period_desc;
+	/* DMA arrays owned by the driver, if not protocol 9's */
+	const struct sio_dma_arrays *arrays;
 	int (*check_boot_tables)(struct device *dev);
+	/* The boot loader's tables in this firmware's order, if not as listed */
+	int (*send_dt_params)(struct sio_data *sio);
 };
 
 struct sio_data {
@@ -168,6 +178,7 @@ struct sio_data {
 	dma_addr_t shmem_iova;
 	void *responses;
 	dma_addr_t responses_iova;
+	const struct sio_dma_arrays *arrays;	/* when the driver owns them */
 	struct sio_coproc_desc *shmem_desc_base;
 	unsigned long *desc_allocated;
 
@@ -206,6 +217,7 @@ static int sio_send_siomsg_atomic(struct sio_data *sio, u64 msg,
 				  sio_ack_callback ack_callback,
 				  void *cookie);
 static int sio_call(struct sio_data *sio, u64 msg);
+static int sio_set_param(struct sio_data *sio, u32 key, u32 val);
 
 /*
  * Boot tables of the T6030 SIO firmware, protocol 10. The boot loader builds them from the ADT
@@ -363,17 +375,287 @@ static int sio_t6030_check_boot_tables(struct device *dev)
 	return 0;
 }
 
+/*
+ * The T6041 (M4 Pro/Max) SIO firmware. It reports protocol 10 as T6030's
+ * does, but its boot is a different contract, so the protocol number does
+ * not select it; the compatible does:
+ *
+ * - the control tables go in this order, a table's address (IOVA page)
+ *   then its size in bytes, which also completes it. Optional tables the
+ *   ADT does not describe are left out whole. Key 0x2a, after the register
+ *   tables, is a scalar: 0 leaves the SIO CPU's power gating off. The shim
+ *   size (0x23) comes before the device types and lets the firmware set up
+ *   its shims.
+ * - the segment array (keys 1, 2) and the response array (0x0b, 0x0c) are
+ *   published last, as entry counts: 0xaaa segments of 12 bytes and 0x1cc0
+ *   responses of 16 bytes (one per endpoint and tag). The ACK of 0x0c
+ *   brings up the DMA service. The driver owns both arrays.
+ * - a channel configuration is six words: data shape, timeout, FIFO size,
+ *   refill threshold, the host's default timeout (5) and a zero word.
+ *
+ * The boot loader builds the control tables from the ADT and maps them
+ * into the windows it lists in memory-region.
+ */
+#define SIO_T6041_SEGMENTS		0xaaa
+#define SIO_T6041_SEGMENT_SIZE		12
+#define SIO_T6041_RESPONSES		0x1cc0
+#define SIO_T6041_RESPONSE_SIZE		16
+#define SIO_T6041_KEY_CPU_POWER_GATE	0x2a
+
+enum sio_t6041_kind {
+	SIO_T6041_REQUIRED,	/* an address and its exact size */
+	SIO_T6041_OPTIONAL,	/* both or neither, any non-zero size */
+	SIO_T6041_SCALAR,	/* the driver's own value, never the loader's */
+};
+
+static const struct sio_t6041_param {
+	u16 key;
+	u8 kind;
+	u32 value;		/* the size of a required table, or a scalar */
+} sio_t6041_params[] = {
+	{ 0x0f, SIO_T6041_REQUIRED, 0x1e000 },	/* panic buffer */
+	{ 0x1a, SIO_T6041_REQUIRED, 4 * 16 },	/* map ranges */
+	{ 0x1e, SIO_T6041_REQUIRED, 0x30 },	/* ASC-wrapper tunables */
+	{ 0x20, SIO_T6041_OPTIONAL },		/* miscellaneous tunables */
+	{ 0x24, SIO_T6041_OPTIONAL },		/* power-state registers */
+	{ 0x28, SIO_T6041_OPTIONAL },		/* SIO registers */
+	{ SIO_T6041_KEY_CPU_POWER_GATE, SIO_T6041_SCALAR, 0 },
+	{ 0x22, SIO_T6041_REQUIRED, 6 * 36 },	/* DMA shims */
+	{ 0x1c, SIO_T6041_REQUIRED, 9 * 8 },	/* device types */
+	{ 0x30d, SIO_T6041_REQUIRED, 0x4000 },	/* performance endpoint */
+};
+
+/* Where a loader key goes in sio_t6041_params, or -1 */
+static int sio_t6041_param_index(u32 key, bool *size)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(sio_t6041_params); i++) {
+		const struct sio_t6041_param *p = &sio_t6041_params[i];
+
+		if (p->kind == SIO_T6041_SCALAR)
+			continue;
+		if (key == p->key || key == p->key + 1) {
+			*size = key == p->key + 1;
+			return i;
+		}
+	}
+	return -1;
+}
+
+/*
+ * Collect the loader's T6041 control tables into addr[]/size[] (indexed as
+ * sio_t6041_params), refusing anything not exactly the contract above: an
+ * unknown or repeated key, a scalar or a DMA array from the loader, a
+ * required table missing or of another size, half an optional table, or a
+ * table outside every window the loader mapped for this SIO.
+ */
+static int sio_t6041_collect(const u32 *params, unsigned int nparams,
+			     const struct sio_t6030_window *windows, unsigned int nwindows,
+			     u32 *addr, u32 *size)
+{
+	unsigned long seen = 0;
+	unsigned int i, j;
+
+	static_assert(2 * ARRAY_SIZE(sio_t6041_params) <= BITS_PER_LONG);
+	if (!nparams || nparams % 2 || nparams > 2 * SIO_T6030_PARAMS_MAX)
+		return -EINVAL;
+	for (i = 0; i < nparams; i += 2) {
+		bool is_size;
+		int idx = sio_t6041_param_index(params[i], &is_size);
+		unsigned int bit;
+
+		if (idx < 0)
+			return -EINVAL;
+		bit = 2 * idx + is_size;
+		if (seen & BIT(bit))
+			return -EINVAL;
+		seen |= BIT(bit);
+		(is_size ? size : addr)[idx] = params[i + 1];
+	}
+
+	for (i = 0; i < ARRAY_SIZE(sio_t6041_params); i++) {
+		const struct sio_t6041_param *p = &sio_t6041_params[i];
+		bool have_addr = seen & BIT(2 * i), have_size = seen & BIT(2 * i + 1);
+		bool inside = false;
+		u64 start, end;
+
+		if (p->kind == SIO_T6041_SCALAR)
+			continue;
+		if (have_addr != have_size)
+			return -EINVAL;
+		if (!have_addr) {
+			if (p->kind == SIO_T6041_REQUIRED)
+				return -EINVAL;
+			continue;
+		}
+		if (!size[i] || (p->kind == SIO_T6041_REQUIRED && size[i] != p->value))
+			return -EINVAL;
+		start = (u64)addr[i] << 12;
+		if (check_add_overflow(start, (u64)size[i], &end) || end > SIO_T6030_IOVA_LIMIT)
+			return -EINVAL;
+		for (j = 0; j < nwindows && !inside; j++) {
+			u64 window_end;
+
+			if (check_add_overflow(windows[j].start, windows[j].size, &window_end))
+				continue;
+			inside = start >= windows[j].start && end <= window_end;
+		}
+		if (!inside)
+			return -EINVAL;
+	}
+	return 0;
+}
+
+static int sio_t6041_read_params(struct device_node *np, u32 *params, unsigned int max)
+{
+	int nparams = of_property_count_u32_elems(np, "apple,sio-firmware-params");
+
+	if (nparams <= 0 || nparams > max ||
+	    of_property_read_u32_array(np, "apple,sio-firmware-params", params, nparams))
+		return -EINVAL;
+	return nparams;
+}
+
+static int sio_t6041_check_node(struct device_node *np, u32 *addr, u32 *size)
+{
+	struct sio_t6030_window windows[SIO_T6030_WINDOWS_MAX];
+	u32 params[2 * SIO_T6030_PARAMS_MAX];
+	int nparams, nwindows;
+
+	nparams = sio_t6041_read_params(np, params, ARRAY_SIZE(params));
+	if (nparams < 0)
+		return nparams;
+	nwindows = sio_t6030_windows(np, windows, ARRAY_SIZE(windows));
+	if (nwindows < 0)
+		return nwindows;
+	return sio_t6041_collect(params, nparams, windows, nwindows, addr, size);
+}
+
+static int sio_t6041_check_boot_tables(struct device *dev)
+{
+	u32 addr[ARRAY_SIZE(sio_t6041_params)] = {};
+	u32 size[ARRAY_SIZE(sio_t6041_params)] = {};
+
+	if (sio_t6041_check_node(dev->of_node, addr, size)) {
+		dev_err(dev, "boot tables are not T6041 SIO tables; leaving the SIO stopped\n");
+		return -ENODEV;
+	}
+	return 0;
+}
+
+/* Publish the collected control tables, and the scalar, in firmware order. */
+static int sio_t6041_send_params(struct sio_data *sio, const u32 *addr, const u32 *size,
+				 int (*set_param)(struct sio_data *, u32, u32))
+{
+	unsigned int i;
+	int err;
+
+	for (i = 0; i < ARRAY_SIZE(sio_t6041_params); i++) {
+		const struct sio_t6041_param *p = &sio_t6041_params[i];
+
+		if (p->kind == SIO_T6041_SCALAR) {
+			err = set_param(sio, p->key, p->value);
+			if (err)
+				return err;
+			continue;
+		}
+		if (!size[i])
+			continue;	/* an optional table the ADT does not have */
+		err = set_param(sio, p->key, addr[i]);
+		if (!err)
+			err = set_param(sio, p->key + 1, size[i]);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
+static int sio_t6041_send_dt_params(struct sio_data *sio)
+{
+	u32 addr[ARRAY_SIZE(sio_t6041_params)] = {};
+	u32 size[ARRAY_SIZE(sio_t6041_params)] = {};
+	int err;
+
+	/* Checked before the boot already; the property cannot have changed. */
+	err = sio_t6041_check_node(sio->dev->of_node, addr, size);
+	if (err)
+		return err;
+	return sio_t6041_send_params(sio, addr, size, sio_set_param);
+}
+
+/* The DMA arrays a protocol publishes as entry counts, after its control tables. */
+struct sio_dma_arrays {
+	u32 segments;
+	u32 segment_size;
+	u32 responses;
+	u32 response_size;
+};
+
+static const struct sio_dma_arrays sio_v9_arrays = {
+	.segments = SIO_V9_SEGMENTS,
+	.segment_size = SIO_V9_SEGMENT_SIZE,
+	.responses = SIO_V9_RESPONSES,
+	.response_size = SIO_V9_RESPONSE_SIZE,
+};
+
+static const struct sio_dma_arrays sio_t6041_arrays = {
+	.segments = SIO_T6041_SEGMENTS,
+	.segment_size = SIO_T6041_SEGMENT_SIZE,
+	.responses = SIO_T6041_RESPONSES,
+	.response_size = SIO_T6041_RESPONSE_SIZE,
+};
+
+static_assert(56 + SIO_NO_DESC_SLOTS * sizeof(struct sio_coproc_desc) <=
+	      SIO_T6041_SEGMENTS * SIO_T6041_SEGMENT_SIZE);
+
 static const struct sio_hw_data sio_hw_generic = {
 	.fifo_threshold = 0x800,
+	.cfg_word4 = 0x800,
 };
 
 static const struct sio_hw_data sio_hw_t6030 = {
 	.fifo_threshold = 0x600,
+	.cfg_word4 = 0x800,
 	.clear_period_desc = true,
 	.check_boot_tables = sio_t6030_check_boot_tables,
 };
 
+/*
+ * macOS 26.6 configures a T6041 DisplayPort audio channel with
+ * [2, 0, 0x800, 0x600, 0x800, 0]: the limit is 0x800, as on earlier SoCs;
+ * the 5 of the host's mailbox call timeout is not part of the record.
+ */
+static const struct sio_hw_data sio_hw_t6041 = {
+	.protocol = 10,
+	.fifo_threshold = 0x600,
+	.cfg_word4 = 0x800,
+	.cfg_six_words = true,
+	.clear_period_desc = true,
+	.arrays = &sio_t6041_arrays,
+	.check_boot_tables = sio_t6041_check_boot_tables,
+	.send_dt_params = sio_t6041_send_dt_params,
+};
+
+/*
+ * T8140 (MacBook Neo) firmware takes the T6041 boot tables (its ADT
+ * describes them alike); its DisplayPort audio channels refill at 0x800
+ * (ADT dp-audioN dma-channels): [2, 0, 0x800, 0x800, 0x800, 0].
+ */
+static const struct sio_hw_data sio_hw_t8140 = {
+	.protocol = 10,
+	.fifo_threshold = 0x800,
+	.cfg_word4 = 0x800,
+	.cfg_six_words = true,
+	.clear_period_desc = true,
+	.arrays = &sio_t6041_arrays,
+	.check_boot_tables = sio_t6041_check_boot_tables,
+	.send_dt_params = sio_t6041_send_dt_params,
+};
+
 static const struct of_device_id sio_of_match[] = {
+	{ .compatible = "apple,t6041-sio", .data = &sio_hw_t6041 },
+	{ .compatible = "apple,t8140-sio", .data = &sio_hw_t8140 },
 	{ .compatible = "apple,t6030-sio", .data = &sio_hw_t6030 },
 	{ .compatible = "apple,sio", .data = &sio_hw_generic },
 	{ }
@@ -1323,6 +1605,16 @@ static const struct apple_rtkit_ops sio_rtkit_ops = {
 	.recv_message = sio_recv_msg,
 };
 
+/* The configuration record CONFIGURE points the firmware at (handle 0) */
+static void sio_write_config(const struct sio_hw_data *hw, void *shmem,
+			     const struct sio_shmem_chan_config *cfg)
+{
+	memcpy(shmem, cfg, sizeof(*cfg));
+	/* T6041 takes a sixth configuration word, zero. */
+	if (hw->cfg_six_words)
+		memset(shmem + sizeof(*cfg), 0, sizeof(u32));
+}
+
 static int sio_device_config(struct dma_chan *chan,
 			     struct dma_slave_config *config)
 {
@@ -1355,7 +1647,7 @@ static int sio_device_config(struct dma_chan *chan,
 
 	cfg.timeout = 0;
 	cfg.fifo = 0x800;
-	cfg.limit = 0x800;
+	cfg.limit = sio->hw->cfg_word4;
 	/*
 	 * The ADT records each client's channel configuration with it (the
 	 * dp-audioN dma-channels: channel, data shape, timeout, FIFO size,
@@ -1390,7 +1682,7 @@ static int sio_device_config(struct dma_chan *chan,
 	if (siochan->configured && memcmp(&siochan->cfg, &cfg, sizeof(cfg)))
 		return -EBUSY;
 
-	*cfg_shmem = cfg;
+	sio_write_config(sio->hw, cfg_shmem, &cfg);
 	dma_wmb();
 
 	ret = sio_call(sio, FIELD_PREP(SIOMSG_TYPE, MSG_CONFIGURE) |
@@ -1497,9 +1789,9 @@ static void sio_free_v9_shmem(void *data)
 		dev_err(sio->dev, "SIO shutdown failed: %d; retaining DMA buffers\n", err);
 		return;
 	}
-	dma_free_coherent(sio->dev, SIO_V9_RESPONSES * SIO_V9_RESPONSE_SIZE,
+	dma_free_coherent(sio->dev, sio->arrays->responses * sio->arrays->response_size,
 			  sio->responses, sio->responses_iova);
-	dma_free_coherent(sio->dev, SIO_V9_SEGMENTS * SIO_V9_SEGMENT_SIZE,
+	dma_free_coherent(sio->dev, sio->arrays->segments * sio->arrays->segment_size,
 			  sio->shmem, sio->shmem_iova);
 }
 
@@ -1511,9 +1803,9 @@ static int sio_send_v9_shmem(struct sio_data *sio,
 		u32 value;
 	} params[] = {
 		{ 1, sio->shmem_iova >> 12 },
-		{ 2, SIO_V9_SEGMENTS },
+		{ 2, (sio->arrays ?: &sio_v9_arrays)->segments },
 		{ 0x0b, sio->responses_iova >> 12 },
-		{ 0x0c, SIO_V9_RESPONSES },
+		{ 0x0c, (sio->arrays ?: &sio_v9_arrays)->responses },
 	};
 	unsigned int i;
 	int err;
@@ -1528,9 +1820,20 @@ static int sio_send_v9_shmem(struct sio_data *sio,
 
 static int sio_alloc_shmem(struct sio_data *sio)
 {
-	bool v9 = sio->protocol == 9;
-	size_t size = v9 ? SIO_V9_SEGMENTS * SIO_V9_SEGMENT_SIZE : SIO_SHMEM_SIZE;
+	const struct sio_dma_arrays *arrays = sio->hw->arrays;
+	size_t size, responses_size = 0;
 	int err;
+
+	if (!arrays && sio->protocol == 9)
+		arrays = &sio_v9_arrays;
+	sio->arrays = arrays;
+	if (arrays &&
+	    (check_mul_overflow((size_t)arrays->segments, (size_t)arrays->segment_size, &size) ||
+	     check_mul_overflow((size_t)arrays->responses, (size_t)arrays->response_size,
+				&responses_size)))
+		return -EOVERFLOW;
+	if (!arrays)
+		size = SIO_SHMEM_SIZE;
 
 	sio->shmem = dma_alloc_coherent(sio->dev, size,
 					&sio->shmem_iova, GFP_KERNEL | __GFP_ZERO);
@@ -1545,9 +1848,8 @@ static int sio_alloc_shmem(struct sio_data *sio)
 		goto free_shmem;
 	}
 
-	if (v9) {
-		sio->responses = dma_alloc_coherent(sio->dev,
-						    SIO_V9_RESPONSES * SIO_V9_RESPONSE_SIZE,
+	if (arrays) {
+		sio->responses = dma_alloc_coherent(sio->dev, responses_size,
 						    &sio->responses_iova, GFP_KERNEL | __GFP_ZERO);
 		if (!sio->responses) {
 			err = -ENOMEM;
@@ -1576,6 +1878,9 @@ static int sio_send_dt_params(struct sio_data *sio)
 	struct device_node *np = sio->dev->of_node;
 	const char *propname = "apple,sio-firmware-params";
 	int nparams, err, i;
+
+	if (sio->hw->send_dt_params)
+		return sio->hw->send_dt_params(sio);
 
 	nparams = of_property_count_u32_elems(np, propname);
 	if (nparams < 0) {
@@ -1719,6 +2024,10 @@ static int sio_probe(struct platform_device *pdev)
 			err = -ENXIO;
 		return dev_err_probe(&pdev->dev, err, "starting SIO service\n");
 	}
+	if (hw->protocol && sio->protocol != hw->protocol)
+		return dev_err_probe(&pdev->dev, -ENODEV,
+				     "SIO firmware protocol %u, this SoC's is %u\n",
+				     sio->protocol, hw->protocol);
 
 	err = sio_send_dt_params(sio);
 	if (err < 0)
@@ -1784,6 +2093,10 @@ MODULE_LICENSE("Dual MIT/GPL");
 
 #if IS_ENABLED(CONFIG_APPLE_SIO_T6030_KUNIT_TEST)
 #include "apple-sio-test.c"
+#endif
+
+#if IS_ENABLED(CONFIG_APPLE_SIO_T6041_KUNIT_TEST)
+#include "apple-sio-t6041-test.c"
 #endif
 
 #if IS_ENABLED(CONFIG_APPLE_SIO_KUNIT_TEST)

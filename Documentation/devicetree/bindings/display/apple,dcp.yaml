@@ -24,6 +24,7 @@ properties:
               - apple,t6000-dcp
               - apple,t6020-dcp
               - apple,t6041-dcp
+              - apple,t6050-dcp
               - apple,t8140-dcp
               - apple,t8142-dcp
           - const: apple,dcp
@@ -34,6 +35,7 @@ properties:
               - apple,t6000-dcpext
               - apple,t6020-dcpext
               - apple,t6041-dcpext
+              - apple,t6050-dcpext
           - const: apple,dcpext
       - items:
           - const: apple,t8140-dcpext
@@ -271,6 +273,14 @@ properties:
   apple,notch-height:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Height in pixels reserved for the display notch.
+
+  apple,pmc-interface:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The PMC interface enables of this coprocessor's display pipe, an
+      apple,consumer-switched interface node. The coprocessor clears them
+      before it powers its display domains down while the display is off,
+      and restores them after it powers them up again.
 
   apple,pmp-report:
     $ref: /schemas/types.yaml#/definitions/phandle

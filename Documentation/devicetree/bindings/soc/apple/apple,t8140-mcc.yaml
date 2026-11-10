@@ -28,6 +28,7 @@ select:
           - apple,t6031-mcc
           - apple,t6032-mcc
           - apple,t6041-mcc
+          - apple,t6050-mcc
           - apple,t8103-mcc
           - apple,t8112-mcc
           - apple,t8122-mcc
@@ -73,6 +74,7 @@ allOf:
         compatible:
           oneOf:
             - enum:
+                - apple,t6050-mcc
                 - apple,t8132-mcc
                 - apple,t8140-mcc
             - items:
@@ -93,9 +95,11 @@ allOf:
                 - const: apple,t8140-mcc
 
         reg:
-          description: Per-plane blocks or multicast memory-controller apertures.
+          description:
+            Per-plane blocks or multicast memory-controller apertures. A two-die
+            T6050 lists both dies' planes.
           minItems: 1
-          maxItems: 32
+          maxItems: 64
 
         nonposted-mmio: true
 

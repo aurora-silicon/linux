@@ -16,6 +16,8 @@
 #define TBNET_RX_PAGE_SIZE (PAGE_SIZE<<TBNET_RX_PAGE_ORDER)
 #define MAX_SKB_FRAGS 17
 #define TBNET_LOGOUT_RETRIES 3
+#define TBNET_CONNECT_RETRIES 3
+#define TBNET_LOGIN_DELAY 4500
 #define TBNET_THROTTLING 5
 #define TBNET_MAX_MTU 65536
 #define RING_DESC_CRC_ERROR 1
@@ -69,7 +71,7 @@ struct sk_buff { struct page *head,*frags[MAX_SKB_FRAGS]; struct skb_shared_info
 struct tb { void *nhi; };
 struct tb_xdomain { struct tb *tb; };
 struct tb_service { struct tbnet *data; int prtcstns; };
-struct tbnet { struct net_device *dev; struct napi_struct napi; bool napi_enabled,rings_started; spinlock_t poll_lock; pthread_mutex_t connection_lock; struct sk_buff *skb; bool login_sent,login_received; int login_retries,local_transmit_path,remote_transmit_path; struct tbnet_ring rx_ring,tx_ring; struct tb_xdomain *xd; struct tb_service *svc; struct delayed_work rx_refill_work; struct work_struct connected_work,disconnect_work; struct thunderbolt_ip_frame_header rx_hdr; struct { unsigned int rx_packets,rx_bytes,rx_errors,rx_length_errors,rx_crc_errors,rx_over_errors,rx_missed_errors; } stats; int handler; };
+struct tbnet { struct net_device *dev; struct napi_struct napi; bool napi_enabled,rings_started; spinlock_t poll_lock; pthread_mutex_t connection_lock; struct sk_buff *skb; bool login_sent,login_received; int login_retries,local_transmit_path,remote_transmit_path; struct tbnet_ring rx_ring,tx_ring; struct tb_xdomain *xd; struct tb_service *svc; struct delayed_work rx_refill_work; struct work_struct connected_work,disconnect_work; struct thunderbolt_ip_frame_header rx_hdr; int connect_retries; struct delayed_work login_work; spinlock_t login_rx_lock; struct { bool pending; } login_rx; struct work_struct login_rx_work; struct { unsigned int rx_packets,rx_bytes,rx_errors,rx_length_errors,rx_crc_errors,rx_over_errors,rx_missed_errors; } stats; int handler; };
 struct page_pool_params { unsigned int order,pool_size,max_len,flags; int nid,dma_dir; struct device *dev; struct napi_struct *napi; struct net_device *netdev; };
 static pthread_mutex_t gate=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cv=PTHREAD_COND_INITIALIZER;
@@ -78,6 +80,8 @@ static bool tail_pending,setup_active,pool_alloc_active;
 static int schedule_calls,retry_queues,retry_delay;
 static bool cancel_waiting;
 static int system_dfl_wq;
+static int system_long_wq;
+static int login_queues;
 #define msecs_to_jiffies(x) (x)
 #define INIT_DELAYED_WORK(w,f) ((w)->work.fn=(f))
 static _Thread_local int heldmutex;
@@ -92,7 +96,7 @@ static bool fake_softirq;
 static bool in_softirq(void){return fake_softirq;}
 static int smp_processor_id(void){return 0;}
 static void schedule_work(struct work_struct *w){}
-static bool queue_delayed_work(int wq,struct delayed_work *w,unsigned long delay){assert(delay==100);pthread_mutex_lock(&gate);bool new=!w->pending;if(new){w->pending=true;retry_queues++;retry_delay=delay;}pthread_mutex_unlock(&gate);return new;}
+static bool queue_delayed_work(int wq,struct delayed_work *w,unsigned long delay){if(delay==TBNET_LOGIN_DELAY){assert(w==&container_of(w,struct tbnet,login_work)->login_work);login_queues++;return true;}assert(delay==100);pthread_mutex_lock(&gate);bool new=!w->pending;if(new){w->pending=true;retry_queues++;retry_delay=delay;}pthread_mutex_unlock(&gate);return new;}
 static void cancel_delayed_work_sync(struct delayed_work *w)
 {
 	pthread_mutex_lock(&gate);

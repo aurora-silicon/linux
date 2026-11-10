@@ -67,6 +67,7 @@ properties:
           - const: apple,t6020-pcie-ge
           - const: apple,t6020-pcie
       - const: apple,t8140-pcie
+      - const: apple,t6050-pcie
       - const: apple,t8152-pcie
       - const: apple,t8132-pcie
       - const: apple,t8103-pciec
@@ -74,6 +75,7 @@ properties:
           - const: apple,t8112-pciec
           - const: apple,t8103-pciec
       - const: apple,t6000-pciec
+      - const: apple,t6050-pciec
       - items:
           - const: apple,t8132-pciec
           - const: apple,t8122-pciec
@@ -97,11 +99,11 @@ properties:
 
   reg:
     minItems: 3
-    maxItems: 10
+    maxItems: 14
 
   reg-names:
     minItems: 3
-    maxItems: 10
+    maxItems: 14
 
   ranges:
     minItems: 2
@@ -119,20 +121,27 @@ properties:
 
   msi-parent: true
 
+  nonposted-mmio: true
+
   msi-ranges:
     maxItems: 1
 
   apple,msi-vector-base:
     $ref: /schemas/types.yaml#/definitions/uint32
     description:
-      First vector of this PCIe-C controller's slice of the MSI window it
-      shares with the internal PCIe controller.
+      First global vector targeted by this controller's local MSI map.
 
   iommu-map: true
   iommu-map-mask: true
 
   power-domains:
-    maxItems: 1
+    description:
+      The power domains the controller needs. Internal controllers on some
+      SoCs sit behind two separate domain chains (for example the PCIe
+      system and PHY domains), all of which must stay on while the links
+      are up.
+    minItems: 1
+    maxItems: 2
 
   resets:
     description:
@@ -187,6 +196,13 @@ patternProperties:
 
       interrupt-controller: true
 
+      apple,link-trained-by-bootloader:
+        type: boolean
+        description:
+          The boot loader trained this port's link and handed it over up. The
+          driver adopts the link as it is instead of resetting the port, so
+          the port needs no PERST# line.
+
       apple,tunable:
         $ref: '#/$defs/tunable'
         description: Initialization tuples relative to this port's registers.
@@ -228,6 +244,52 @@ allOf:
       properties:
         compatible:
           contains:
+            const: apple,t6050-pcie
+    then:
+      properties:
+        reg:
+          minItems: 5
+          maxItems: 14
+        reg-names:
+          description:
+            config and rc, then port<n>, phy<n> and intr2axi<n> for each
+            bootloader-trained root port 00:<n>.0.
+          minItems: 5
+          maxItems: 14
+          items:
+            pattern: "^(config|rc|(port|phy|intr2axi)[0-3])$"
+        interrupts:
+          maxItems: 4
+        interrupt-names:
+          items:
+            pattern: "^port[0-3]$"
+        apple,msi-vector-base:
+          const: 64
+        power-domains: false
+      required:
+        - interrupt-names
+        - apple,msi-vector-base
+        - iommu-map
+      patternProperties:
+        "^pci@":
+          properties:
+            reset-gpios:
+              description:
+                The PERST# line of a port whose endpoint needs a root-port
+                reset after the bootloader trained the link. Left as the
+                bootloader set it until that reset.
+            pwren-gpios: false
+          required:
+            - apple,link-trained-by-bootloader
+    else:
+      patternProperties:
+        "^pci@":
+          properties:
+            apple,link-trained-by-bootloader: false
+  - if:
+      properties:
+        compatible:
+          contains:
             const: apple,t8140-pcie
     then:
       properties:
@@ -263,6 +325,7 @@ allOf:
               - apple,t8103-pciec
               - apple,t6000-pciec
               - apple,t6040-pciec
+              - apple,t6050-pciec
     then:
       properties:
         reg:
@@ -375,40 +438,67 @@ allOf:
               properties:
                 compatible:
                   contains:
-                    const: apple,t8152-pcie
+                    const: apple,t6050-pcie
             then:
               properties:
                 reg:
-                  minItems: 4
-                  maxItems: 8
+                  minItems: 5
+                  maxItems: 14
                 reg-names:
-                  minItems: 4
-                  maxItems: 8
+                  minItems: 5
+                  maxItems: 14
                   items:
-                    enum: [config, rc, port0, phy0, port1, phy1, port2, phy2]
+                    enum: [config, rc, port0, phy0, intr2axi0, port1, phy1,
+                           intr2axi1, port2, phy2, intr2axi2, port3, phy3,
+                           intr2axi3]
                 interrupts:
-                  maxItems: 3
+                  maxItems: 4
             else:
-              properties:
-                reg-names:
-                  minItems: 3
-                  items:
-                    - const: config
-                    - const: rc
-                    - const: port0
-                    - const: port1
-                    - const: port2
-                    - const: port3
-                    - const: phy0
-                    - const: phy1
-                    - const: phy2
-                    - const: phy3
+              if:
+                properties:
+                  compatible:
+                    contains:
+                      const: apple,t8152-pcie
+              then:
+                properties:
+                  reg:
+                    minItems: 4
+                    maxItems: 8
+                  reg-names:
+                    minItems: 4
+                    maxItems: 8
+                    items:
+                      enum: [config, rc, port0, phy0, port1, phy1, port2, phy2]
+                  interrupts:
+                    maxItems: 3
+              else:
+                properties:
+                  reg:
+                    maxItems: 10
+                  reg-names:
+                    minItems: 3
+                    items:
+                      - const: config
+                      - const: rc
+                      - const: port0
+                      - const: port1
+                      - const: port2
+                      - const: port3
+                      - const: phy0
+                      - const: phy1
+                      - const: phy2
+                      - const: phy3
       patternProperties:
         "^pci@":
           properties:
             apple,tunable: false
-          required:
-            - reset-gpios
+          if:
+            not:
+              required:
+                - apple,link-trained-by-bootloader
+          then:
+            required:
+              - reset-gpios
 
 examples:
   - |

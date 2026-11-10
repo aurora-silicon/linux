@@ -27,10 +27,14 @@ properties:
               - apple,t6030-pmp-v2
               - apple,t6031-pmp-v2
               - apple,t6041-pmp-v2
+              - apple,t6050-pmp-v2
               - apple,t8122-pmp-v2
               - apple,t8132-pmp-v2
               - apple,t8140-pmp-v2
           - const: apple,t6000-pmp-v2
+      - items:
+          - const: apple,t8142-pmp-v2
+          - const: apple,t8140-pmp-v2
       - items:
           - const: apple,t8103-pmp
           - const: apple,pmp
@@ -53,6 +57,10 @@ properties:
 
   mbox-names:
     const: mbox
+
+  interrupts:
+    maxItems: 4
+    description: Coprocessor mailbox and status interrupts.
 
   iommus:
     maxItems: 1
@@ -91,6 +99,8 @@ properties:
       PMGR PMC configuration word from the Apple device tree. Bits 0 and 3
       are passed as the boot arguments PMCV and PMCB.
 
+  status: true
+
   apple,pmc-msg-disabled:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Boot argument PMCX, from the Apple device tree.
@@ -104,8 +114,14 @@ properties:
     minItems: 2
     description: Host physical address and size pairs mapped into firmware PIO space.
 
+  apple,tunable-segment-names:
+    $ref: /schemas/types.yaml#/definitions/string
+    description:
+      The firmware's segment names from the Apple device tree, separated by
+      semicolons. The firmware reads them as the raw string.
+
 patternProperties:
-  '^apple,tunable-':
+  '^apple,tunable-(?!segment-names$)':
     $ref: /schemas/types.yaml#/definitions/uint8-array
     description: Opaque firmware calibration copied from the Apple device tree.
 
@@ -113,8 +129,6 @@ required:
   - compatible
   - reg
   - iommus
-  - mboxes
-  - mbox-names
 
 allOf:
   - if:
@@ -130,16 +144,40 @@ allOf:
           minItems: 2
       required:
         - power-domains
-    else:
-      properties:
-        reg:
-          maxItems: 2
-        power-domains:
-          maxItems: 1
-      required:
-        - reg-names
         - mboxes
         - mbox-names
+    else:
+      if:
+        properties:
+          compatible:
+            contains:
+              const: apple,t6050-pmp-v2
+      then:
+        description:
+          The T6050 PMP's firmware SRAM and ASC views and its ASC mailbox. It
+          also holds the PMS SRAM's power domain.
+        properties:
+          reg:
+            maxItems: 2
+          power-domains:
+            minItems: 2
+          interrupts: false
+        required:
+          - reg-names
+          - mboxes
+          - mbox-names
+          - power-domains
+      else:
+        properties:
+          reg:
+            maxItems: 2
+          power-domains:
+            maxItems: 1
+          interrupts: false
+        required:
+          - reg-names
+          - mboxes
+          - mbox-names
 
 additionalProperties: false
 

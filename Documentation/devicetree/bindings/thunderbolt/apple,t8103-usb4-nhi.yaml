@@ -23,6 +23,7 @@ properties:
       - const: apple,t8103-usb4-nhi
       - const: apple,t8142-usb4-nhi
       - const: apple,t6040-usb4-nhi
+      - const: apple,t6050-usb4-nhi
       - items:
           - enum:
               - apple,t6000-usb4-nhi
@@ -51,10 +52,12 @@ properties:
   interrupts:
     description:
       One interrupt for each of the 12 transmit rings followed by one for each
-      of the 12 receive rings.
-    maxItems: 24
+      of the 12 receive rings. On T6050 an SRAM parity interrupt follows them.
+    minItems: 24
+    maxItems: 25
 
   interrupt-names:
+    minItems: 24
     items:
       - const: txring0
       - const: txring1
@@ -80,6 +83,7 @@ properties:
       - const: rxring9
       - const: rxring10
       - const: rxring11
+      - const: parity
 
   iommus:
     minItems: 1
@@ -90,7 +94,7 @@ properties:
       all other rings which are only used for XDomain connections to other
       hosts.
 
-      T8142 uses one DART stream per ring: TX streams 0-11 and RX streams 16-27.
+      T8142 and T6050 use one DART stream per ring: TX streams 0-11 and RX streams 16-27.
       T6030, T6031 and T8122 also use 24 entries. These are most likely one DART
       stream for each of the 12 transmit and 12 receive rings.
 
@@ -128,6 +132,7 @@ allOf:
             enum:
               - apple,t8142-usb4-nhi
               - apple,t6040-usb4-nhi
+              - apple,t6050-usb4-nhi
     then:
       properties:
         reg:
@@ -151,6 +156,7 @@ allOf:
               - apple,t8132-usb4-nhi
               - apple,t8142-usb4-nhi
               - apple,t6040-usb4-nhi
+              - apple,t6050-usb4-nhi
     then:
       properties:
         iommus:
@@ -173,5 +179,18 @@ allOf:
         properties:
           iommus:
             maxItems: 1
+
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              const: apple,t6050-usb4-nhi
+    then:
+      properties:
+        interrupts:
+          maxItems: 24
+        interrupt-names:
+          maxItems: 24
 
 additionalProperties: false

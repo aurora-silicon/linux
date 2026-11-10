@@ -27,12 +27,16 @@ properties:
           - apple,t6030-fpwm
           - apple,t6031-fpwm
           - apple,t6041-fpwm
+          - apple,t6050-fpwm
       - const: apple,s5l-fpwm
 
   reg:
     maxItems: 1
 
   clocks:
+    maxItems: 1
+
+  interrupts:
     maxItems: 1
 
   power-domains:

@@ -113,6 +113,7 @@
 #include <linux/soc/apple/pmp-display.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/pmp.h>
+#include <linux/soc/apple/pmp-report.h>
 #include <linux/suspend.h>
 #include <linux/sys_soc.h>
 #include <linux/task_work.h>
@@ -178,10 +179,13 @@ const u32 BINDINGS_IIO_LIGHT = IIO_LIGHT;
 const u32 BINDINGS_IIO_COLORTEMP = IIO_COLORTEMP;
 const u32 BINDINGS_IIO_ACCEL = IIO_ACCEL;
 const u32 BINDINGS_IIO_ANGL_VEL = IIO_ANGL_VEL;
+const u32 BINDINGS_IIO_ROT = IIO_ROT;
+const u32 BINDINGS_IIO_TEMP = IIO_TEMP;
 const u32 BINDINGS_IIO_TIMESTAMP = IIO_TIMESTAMP;
 const u32 BINDINGS_IIO_MOD_X = IIO_MOD_X;
 const u32 BINDINGS_IIO_MOD_Y = IIO_MOD_Y;
 const u32 BINDINGS_IIO_MOD_Z = IIO_MOD_Z;
+const u32 BINDINGS_IIO_MOD_QUATERNION = IIO_MOD_QUATERNION;
 const u32 BINDINGS_IIO_CHAN_INFO_SAMP_FREQ = IIO_CHAN_INFO_SAMP_FREQ;
 
 const xa_mark_t RUST_CONST_HELPER_XA_PRESENT = XA_PRESENT;

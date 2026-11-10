@@ -7,11 +7,37 @@
 #include <linux/types.h>
 #include <linux/unaligned.h>
 
+#define PMP_DVFS_VALID BIT_ULL(61)
+
 #define PMP_SOC_DEVICE_SIZE	0x7c
 #define PMP_SOC_DEVICE_ACK	BIT(1)
 #define PMP_PTD_RANGE_SIZE	32
 #define PMP_PTD_RANGE_REQUEST	10
 #define PMP_PTD_RANGE_ACK	11
+
+/*
+ * A SOC-DEV-DVFS request word: the valid bit, and the level either in the
+ * default five-bit lane at bits 4:0 or, for request classes 0x21 through
+ * 0x25, in the four-bit lane at bits 35:32 through 51:48.
+ */
+static inline bool apple_pmp_dvfs_word(u32 request_class, u32 level, u64 *word)
+{
+	u32 shift;
+
+	if (!word)
+		return false;
+	if (!request_class) {
+		if (level > 0x1f)
+			return false;
+		*word = PMP_DVFS_VALID | level;
+		return true;
+	}
+	if (request_class < 0x21 || request_class > 0x25 || level > 0xf)
+		return false;
+	shift = 32 + 4 * (request_class - 0x21);
+	*word = PMP_DVFS_VALID | (u64)level << shift;
+	return true;
+}
 
 /* The PTD request read, request update and acknowledgment apertures. */
 static inline bool apple_pmp_ranges_valid(const u8 *table, size_t len,

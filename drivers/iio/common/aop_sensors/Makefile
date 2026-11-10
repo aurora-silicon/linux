@@ -3,3 +3,5 @@
 obj-$(CONFIG_IIO_AOP_SENSOR_LAS) += aop_las.o
 obj-$(CONFIG_IIO_AOP_SENSOR_ALS) += aop_als.o
 obj-$(CONFIG_IIO_AOP_SENSOR_MOTION) += aop_motion.o
+obj-$(CONFIG_IIO_AOP_SENSOR_DEVMOTION) += aop_devmotion.o
+obj-$(CONFIG_IIO_AOP_SENSOR_TEMP) += aop_temp.o

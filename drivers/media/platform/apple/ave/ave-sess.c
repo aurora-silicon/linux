@@ -27,6 +27,7 @@
 
 #define AVE_RC_VBR 4
 #define AVE_RC_CBR 2
+#define AVE_RC_CQ 3
 
 /* Filler-data NAL unit types */
 #define AVE_H264_NAL_FILLER 12
@@ -106,6 +107,28 @@ static int ave_pick_level(const struct ave_params *p, u32 requested)
 	return -EINVAL;
 }
 
+/*
+ * Constant quality: the QP macOS 27.0 encodes with for VideoToolbox quality
+ * q = index / 100 (read from the slice QPs of its own H.264 and HEVC output on
+ * the M4 Pro; the J700 captures at 0.30, 0.60 and 0.90 agree). Every frame of
+ * a constant-quality session uses this one QP, and the QP never exceeds 48.
+ */
+static const u8 ave_cq_qp[101] = {
+	48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 47, 47, 47, 46, 46, 46, 45, 45, 44,
+	44, 44, 43, 43, 43, 42, 42, 42, 41, 41, 40, 40, 40, 39, 39, 39, 38, 38, 37, 37,
+	37, 36, 36, 35, 35, 35, 34, 34, 33, 33, 33, 32, 32, 31, 31, 30, 30, 29, 29, 29,
+	28, 28, 27, 27, 26, 26, 25, 25, 24, 24, 23, 23, 22, 22, 21, 21, 20, 20, 19, 18,
+	18, 17, 17, 16, 15, 15, 14, 13, 12, 11, 10, 9,	8,  7,	6,  5,	4,  3,	2,  1,
+	0,
+};
+
+#define AVE_CQ_MAX_QP 48
+
+u32 ave_cq_initial_qp(u32 quality)
+{
+	return ave_cq_qp[min(quality, 100U)];
+}
+
 static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 {
 	bool baseline = false;
@@ -175,10 +198,27 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	p->reorder_off = !ctx->b_frames;
 	p->refs = p->intra_only ? 1 : p->bframes ? 5 : 2;
 	p->slots = p->bframes ? 5 : 3;
+	/*
+	 * Speed over quality changes the firmware's throughput mode from 3 to
+	 * 5, as macOS does. It is measured for HEVC (Main and Main 10) above
+	 * 720p on the 9003 layout only; H.264 does not get faster from it (on
+	 * macOS either).
+	 */
+	p->speed = ctx->prioritize_speed && p->codec == AVE_CODEC_HEVC &&
+		   !ctx->ave->layout->counted &&
+		   p->width * p->height > 1280 * 720;
 	p->gop = ctx->gop_size ?: 120;
 
 	p->bitrate = ctx->bitrate;
-	if (ctx->bitrate_mode == V4L2_MPEG_VIDEO_BITRATE_MODE_CBR) {
+	if (ctx->bitrate_mode == V4L2_MPEG_VIDEO_BITRATE_MODE_CQ) {
+		/* One QP for every frame, no data-rate limit, as macOS sets it. */
+		p->rc_mode = AVE_RC_CQ;
+		p->limit_bytes = 0;
+		p->initial_qp = ave_cq_initial_qp(ctx->quality);
+		p->max_qp = min_t(u32, p->max_qp, AVE_CQ_MAX_QP);
+		if (p->min_qp > (s32)p->max_qp)
+			p->min_qp = p->max_qp;
+	} else if (ctx->bitrate_mode == V4L2_MPEG_VIDEO_BITRATE_MODE_CBR) {
 		p->rc_mode = AVE_RC_CBR;
 		p->limit_bytes = 0;
 	} else {
@@ -205,6 +245,9 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	/* 10-bit sessions get a quarter more, as macOS sizes them. */
 	if (p->bit_depth == 10)
 		p->coded_cap = ALIGN(p->coded_cap * 5 / 4, SZ_16K);
+	/* Constant quality can exceed the bit-rate modes' frame size; macOS sizes up to 2x. */
+	if (p->rc_mode == AVE_RC_CQ)
+		p->coded_cap = ALIGN(p->coded_cap * 2, SZ_16K);
 	p->coded_cap = max_t(u32, p->coded_cap, AVE_CODED_MIN);
 	if (ctx->ave->layout->counted &&
 	    (p->fps_num != 30ULL * p->fps_den ||

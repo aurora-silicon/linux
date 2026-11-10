@@ -1,0 +1,299 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Nodes common to every Apple T6050 (M5 Max, M5 Ultra) SoC
+ *
+ * A T6050 is one or two identical dies: t6050-max.dtsi describes the
+ * one-die part and t6050-ultra.dtsi the two-die one. Each includes this
+ * file, t6050-die0.dtsi (the blocks used on die 0 only) and, once per die,
+ * the per-die template t6050-dieX.dtsi. Die 0's MMIO window is
+ * 0x2_00000000 and die 1's 0x42_00000000 (die stride 0x40_00000000); each
+ * die has its own simple-bus, which the boot loader looks up by unit
+ * address. Unit addresses are CPU physical addresses. The boot loader
+ * starts the secondary CPUs and fills in their release addresses, the
+ * memory node and its own reservations.
+ *
+ * A smaller (binned) one-die part can build on t6050-max.dtsi, as
+ * t6034.dtsi does on t6031.dtsi: the boot loader removes the CPU nodes of
+ * the cores a part lacks.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/*
+ * The per-die template's addressing: before each inclusion of
+ * t6050-dieX.dtsi, the including file defines
+ *  DIE		the label suffix (empty for die 0, _die1 for die 1),
+ *  DIE_NO	the die number (the AIC's die cell),
+ *  DIE_UNIT_PREFIX	the die's MMIO offset as a unit-address prefix
+ *		(empty for die 0, 4 for die 1),
+ *  DIE_ATC1	the port name of the die's ATC1 (die d's ATCn is port 4d + n),
+ *  SOC_NODE	the die's bus.
+ * DIE_UNIT() and DIE_HI() then give a die-0 address on that die.
+ */
+#define DIE_UNIT(addr)		__concat(DIE_UNIT_PREFIX, addr)
+#define DIE_HI(hi)		((hi) + 0x40 * DIE_NO)
+#define DIE_ATC1_LABEL(suffix)	__stringify(__concat(DIE_ATC1, suffix))
+
+/*
+ * CPU nodes. Die d, cluster c, core n has MPIDR Aff2 4 for the two M-tier
+ * (apple,sawtooth) clusters and 1 for the P-tier (apple,everest) cluster,
+ * Aff1 0x10 * d + c and Aff0 n; the unit address is the MPIDR. Labels
+ * number the cores 18 * d + 6 * c + n. The boot loader removes the nodes of
+ * the cores it did not start.
+ */
+#define T6050_CPU(label, mpidr, type, opp, cluster, cpu_cap)	\
+	label: cpu@mpidr {					\
+		compatible = type;				\
+		device_type = "cpu";				\
+		reg = <0x0 0x ## mpidr>;			\
+		enable-method = "spin-table";			\
+		operating-points-v2 = <&opp>;			\
+		performance-domains = <&cluster>;		\
+		capacity-dmips-mhz = <cpu_cap>;		\
+		cpu-release-addr = <0 0>; /* to be filled by the loader */ \
+	}
+
+/*
+ * capacity-dmips-mhz from pinned single-thread throughput with every cluster at 4284 MHz (in
+ * both OPP tables), normalised by each core's measured clock (J714sAP): per MHz an M core runs
+ * zstd -3 compression at 0.736, decompression at 0.871 and a Python dict loop at 0.728 of a P
+ * core, geometric mean 0.776, so M 794 and P 1024. Small L1-resident loops run at 0.92-1.01.
+ */
+#define T6050_M_CPU(label, mpidr, cluster) \
+	T6050_CPU(label, mpidr, "apple,sawtooth", mcluster_opp, cluster, 794)
+#define T6050_P_CPU(label, mpidr, cluster) \
+	T6050_CPU(label, mpidr, "apple,everest", pcluster_opp, cluster, 1024)
+
+/ {
+	compatible = "apple,t6050", "apple,arm-platform";
+	#address-cells = <2>;
+	#size-cells = <2>;
+	interrupt-parent = <&aic>;
+
+	/* The boot loader replaces reg with the usable RAM. */
+	memory@10000000000 {
+		device_type = "memory";
+		reg = <0x100 0x0 0x0 0x0>;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		/* The boot loader adds its own reservations. */
+	};
+
+	/* The size's file lists its CPUs (T6050_M_CPU, T6050_P_CPU). */
+	cpus {
+		#address-cells = <2>;
+		#size-cells = <0>;
+	};
+
+	/*
+	 * CPU OPPs, from the ADT: /arm-io/pmgr acc-clusters maps clusters 0, 1 and 2 of each die to
+	 * voltage-states 22, 23 and 5, and their -sram tables give the frequencies (kHz). 22 and 23
+	 * list the same frequencies, so the two M clusters share one table. Levels are DVFS command
+	 * states: state 1 is 300 MHz and state k the table's (k-1)-th entry from state 2, as on T8142
+	 * (measured on J775D: every state's clock from a dependent-add chain). iBoot leaves M cluster
+	 * 0 of each die in state 6 (2652 MHz), the other clusters in state 2.
+	 *
+	 * Bring-up: the clusters' controllers (t6050-dieX.dtsi) assert apple,firmware-managed-thermal,
+	 * which the T6050 profile requires, before that ownership is qualified on this boot chain (no
+	 * Linux PMP driver runs; the SMC drives the fans). A qualification settles it: an all-core
+	 * load at the top states, watching TCMb, the fans and the measured clock.
+	 */
+	mcluster_opp: opp-table-mcluster {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp01 {
+			opp-hz = /bits/ 64 <300000000>;
+			opp-level = <1>;
+		};
+		opp02 {
+			opp-hz = /bits/ 64 <1344000000>;
+			opp-level = <2>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <1644000000>;
+			opp-level = <3>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <1992000000>;
+			opp-level = <4>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <2304000000>;
+			opp-level = <5>;
+		};
+		opp06 {
+			opp-hz = /bits/ 64 <2652000000>;
+			opp-level = <6>;
+		};
+		opp07 {
+			opp-hz = /bits/ 64 <2964000000>;
+			opp-level = <7>;
+		};
+		opp08 {
+			opp-hz = /bits/ 64 <3240000000>;
+			opp-level = <8>;
+		};
+		opp09 {
+			opp-hz = /bits/ 64 <3504000000>;
+			opp-level = <9>;
+		};
+		opp10 {
+			opp-hz = /bits/ 64 <3696000000>;
+			opp-level = <10>;
+		};
+		opp11 {
+			opp-hz = /bits/ 64 <3876000000>;
+			opp-level = <11>;
+		};
+		opp12 {
+			opp-hz = /bits/ 64 <4044000000>;
+			opp-level = <12>;
+		};
+		opp13 {
+			opp-hz = /bits/ 64 <4176000000>;
+			opp-level = <13>;
+		};
+		opp14 {
+			opp-hz = /bits/ 64 <4284000000>;
+			opp-level = <14>;
+		};
+		opp15 {
+			opp-hz = /bits/ 64 <4308000000>;
+			opp-level = <15>;
+		};
+		opp16 {
+			opp-hz = /bits/ 64 <4380000000>;
+			opp-level = <16>;
+		};
+	};
+
+	pcluster_opp: opp-table-pcluster {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp01 {
+			opp-hz = /bits/ 64 <300000000>;
+			opp-level = <1>;
+		};
+		opp02 {
+			opp-hz = /bits/ 64 <1308000000>;
+			opp-level = <2>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <1620000000>;
+			opp-level = <3>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <1980000000>;
+			opp-level = <4>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <2292000000>;
+			opp-level = <5>;
+		};
+		opp06 {
+			opp-hz = /bits/ 64 <2580000000>;
+			opp-level = <6>;
+		};
+		opp07 {
+			opp-hz = /bits/ 64 <2880000000>;
+			opp-level = <7>;
+		};
+		opp08 {
+			opp-hz = /bits/ 64 <3180000000>;
+			opp-level = <8>;
+		};
+		opp09 {
+			opp-hz = /bits/ 64 <3432000000>;
+			opp-level = <9>;
+		};
+		opp10 {
+			opp-hz = /bits/ 64 <3648000000>;
+			opp-level = <10>;
+		};
+		opp11 {
+			opp-hz = /bits/ 64 <3828000000>;
+			opp-level = <11>;
+		};
+		opp12 {
+			opp-hz = /bits/ 64 <3984000000>;
+			opp-level = <12>;
+		};
+		opp13 {
+			opp-hz = /bits/ 64 <4104000000>;
+			opp-level = <13>;
+		};
+		opp14 {
+			opp-hz = /bits/ 64 <4188000000>;
+			opp-level = <14>;
+		};
+		opp15 {
+			opp-hz = /bits/ 64 <4236000000>;
+			opp-level = <15>;
+		};
+		opp16 {
+			opp-hz = /bits/ 64 <4284000000>;
+			opp-level = <16>;
+		};
+		opp17 {
+			opp-hz = /bits/ 64 <4308000000>;
+			opp-level = <17>;
+		};
+		opp18 {
+			opp-hz = /bits/ 64 <4332000000>;
+			opp-level = <18>;
+		};
+		opp19 {
+			opp-hz = /bits/ 64 <4428000000>;
+			opp-level = <19>;
+		};
+		opp20 {
+			opp-hz = /bits/ 64 <4512000000>;
+			opp-level = <20>;
+		};
+		opp21 {
+			opp-hz = /bits/ 64 <4608000000>;
+			opp-level = <21>;
+		};
+	};
+
+	/* The 24 MHz reference clock of the watchdog */
+	clkref: clock-ref {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+		clock-output-names = "clkref";
+	};
+
+	/* The QSPI controller's input: ADT /arm-io/qspi clock-ids 440, /arm-io clock-frequencies[440 - 256] */
+	clk_405m: clock-405m {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <405000000>;
+		clock-output-names = "clk_405m";
+	};
+
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupt-parent = <&aic>;
+		interrupt-names = "phys", "virt", "hyp-phys", "hyp-virt";
+		interrupts = <AIC_FIQ 0 AIC_TMR_GUEST_PHYS IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ 0 AIC_TMR_GUEST_VIRT IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ 0 AIC_TMR_HV_PHYS IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ 0 AIC_TMR_HV_VIRT IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	/* Die 0 MMIO */
+	die0: soc@200000000 {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges = <0x2 0x0 0x2 0x0 0x3 0xc0000000>;
+		nonposted-mmio;
+	};
+};
