@@ -9273,6 +9273,44 @@ static void dcp_t6041_s2r_cpu_off(struct apple_dcp *dcp, u32 id)
 	iounmap(pmc);
 }
 
+static bool s2r_afk_pause = true;
+module_param(s2r_afk_pause, bool, 0644);
+MODULE_PARM_DESC(s2r_afk_pause, "T6040 S2R: pause the DCP's AFK endpoints before its idle and resume them after the wake, as macOS (bring-up)");
+
+#define DCP_S2R_AFK_TIMEOUT_MS	200
+
+/*
+ * As macOS around a DCP that idles for a sleep (the AFK endpoints' state machine on RTKit's
+ * power notifications): every AFK endpoint is paused, highest first, before the IOP
+ * idles, and resumed, lowest first, after its HELLO, before the display is powered.
+ * Without the resume the firmware never announces its AV services again, its video
+ * interface stays unplugged and every mode set is refused ("HPD is 0").
+ */
+static void dcp_t6041_s2r_afk(struct apple_dcp *dcp, bool resume)
+{
+	unsigned int i, n = ARRAY_SIZE(dcp->desktop->graph), done = 0, total = 0;
+	int ret;
+
+	if (!dcp->desktop || !READ_ONCE(s2r_afk_pause))
+		return;
+	for (i = 0; i < n; i++) {
+		struct apple_dcp_afkep *ep = READ_ONCE(dcp->desktop->graph[resume ? i : n - 1 - i]);
+
+		if (!ep)
+			continue;
+		total++;
+		ret = resume ? afk_resume(ep, DCP_S2R_AFK_TIMEOUT_MS) :
+			       afk_pause(ep, DCP_S2R_AFK_TIMEOUT_MS);
+		if (ret)
+			dev_warn(dcp->dev, "S2R: AFK endpoint %#x not %s: %d\n", ep->endpoint,
+				 resume ? "resumed" : "paused", ret);
+		else
+			done++;
+	}
+	dev_info(dcp->dev, "S2R: %u of %u AFK endpoints %s\n", done, total,
+		 resume ? "resumed" : "paused");
+}
+
 static int dcp_t6041_s2r_stop(struct apple_dcp *dcp)
 {
 	void __iomem *control = dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL;
@@ -9331,6 +9369,7 @@ static int dcp_t6041_s2r_stop(struct apple_dcp *dcp)
 		dev_err(dcp->dev, "no reply to A500: %d, the display stays off\n", ret);
 		goto lost;
 	}
+	dcp_t6041_s2r_afk(dcp, false);
 	/* The IOP may answer 0x201 with 1 or 2, asleep with its memory kept: -EINVAL is that. */
 	ret = apple_rtkit_idle(dcp->rtk);
 	apple_sleep_bringup_mark(DCP_S2R_MARK(id, 7));
@@ -10443,6 +10482,7 @@ static void dcp_t6041_s2r_warm_restart(struct apple_dcp *dcp)
 		dcp_hib_give_up(dcp, "warm-restart", ret);
 		return;
 	}
+	dcp_t6041_s2r_afk(dcp, true);
 
 	ret = dcp_hib_recommit(dcp);
 	if (ret) {

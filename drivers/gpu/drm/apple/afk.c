@@ -675,6 +675,85 @@ out_unlock:
 }
 
 /*
+ * AFK's internal packets, on interface 0 of a compact endpoint: a u32 whose low byte
+ * is the request. Around a sleep that idles the coprocessor, macOS pauses every AFK
+ * endpoint before the IOP goes idle and resumes it after the IOP's HELLO, before the
+ * display is powered again.
+ */
+#define AFK_INTERNAL_PAUSE	2
+#define AFK_INTERNAL_PAUSE_DONE	3
+#define AFK_INTERNAL_RESUME	4
+#define AFK_INTERNAL_RESUME_DONE 5
+
+static int afk_send_internal(struct apple_dcp_afkep *ep, u8 request)
+{
+	__le32 body = cpu_to_le32(request);
+	int ret;
+
+	mutex_lock(&ep->compact_tx_lock);
+	ret = afk_send_compact_fragment(ep, 0, &body, sizeof(body), sizeof(body));
+	mutex_unlock(&ep->compact_tx_lock);
+
+	return ret;
+}
+
+static void afk_recv_internal(struct apple_dcp_afkep *ep, u8 request)
+{
+	int ret;
+
+	switch (request) {
+	case AFK_INTERNAL_PAUSE_DONE:
+	case AFK_INTERNAL_RESUME_DONE:
+		if (READ_ONCE(ep->internal_wait) == request)
+			complete(&ep->internal_done);
+		else
+			dev_warn(ep->dcp->dev, "AFK[ep:%02x]: unexpected internal reply %u\n",
+				 ep->endpoint, request);
+		return;
+	case AFK_INTERNAL_PAUSE:
+	case AFK_INTERNAL_RESUME:
+		/* Either side may ask; the other answers. */
+		ret = afk_send_internal(ep, request + 1);
+		dev_info(ep->dcp->dev, "AFK[ep:%02x]: firmware asked to %s: answered (%d)\n",
+			 ep->endpoint, request == AFK_INTERNAL_PAUSE ? "pause" : "resume", ret);
+		return;
+	default:
+		dev_warn(ep->dcp->dev, "AFK[ep:%02x]: unknown internal packet %u\n",
+			 ep->endpoint, request);
+	}
+}
+
+static int afk_internal_request(struct apple_dcp_afkep *ep, u8 request,
+				unsigned int timeout_ms)
+{
+	int ret;
+
+	if (!READ_ONCE(ep->compact))
+		return -EOPNOTSUPP;
+	reinit_completion(&ep->internal_done);
+	WRITE_ONCE(ep->internal_wait, request + 1);
+	ret = afk_send_internal(ep, request);
+	if (!ret && !wait_for_completion_timeout(&ep->internal_done,
+						 msecs_to_jiffies(timeout_ms)))
+		ret = -ETIMEDOUT;
+	WRITE_ONCE(ep->internal_wait, 0);
+
+	return ret;
+}
+
+/* Before the coprocessor idles for a sleep, as macOS does on each AFK endpoint. */
+int afk_pause(struct apple_dcp_afkep *ep, unsigned int timeout_ms)
+{
+	return afk_internal_request(ep, AFK_INTERNAL_PAUSE, timeout_ms);
+}
+
+/* After the coprocessor's HELLO on the wake, before anything else is sent. */
+int afk_resume(struct apple_dcp_afkep *ep, unsigned int timeout_ms)
+{
+	return afk_internal_request(ep, AFK_INTERNAL_RESUME, timeout_ms);
+}
+
+/*
  * Send one complete message.  Fragments carry no offset or tag beyond the
  * repeated interface/length and the per-fragment sequence number, so the
  * fragments of one message must not interleave with another's.
@@ -1240,6 +1319,12 @@ static bool afk_recv_handle_compact(struct apple_dcp_afkep *ep, u32 channel,
 		return false;
 	total = le32_to_cpu(hdr->length);
 	intf_id = le16_to_cpu(hdr->intf_id);
+	/* Interface 0 carries AFK's own packets, a u32 each. */
+	if (!s->received && !intf_id && total == sizeof(u32) &&
+	    data_size == header_size + sizeof(u32)) {
+		afk_recv_internal(ep, get_unaligned_le32(data + header_size) & 0xff);
+		return true;
+	}
 retry:
 	offset = s->received;
 	/* Eight-byte empty control messages occur in the firmware's traffic. */
