@@ -87,7 +87,8 @@ static void buffer_failure(void)
 		submit_ctx = &ctx[i];
 		submit_slot = 0;
 		mutex_lock(&ave.hw_lock);
-		assert(!ave_cmd_process(&ctx[i], 0, &input[i][0], 0, 0, false));
+		assert(!ave_cmd_process(&ctx[i], 0, &input[i][0], 0, 0, false,
+					false));
 		mutex_unlock(&ave.hw_lock);
 		ctx[i].sess->slot[0].src = &input[i][0];
 		/* One idle owner and one with a firmware-owned frame. */
@@ -313,7 +314,7 @@ static void failed_submission(void)
 	submit_slot = 0;
 	submit_result = -EIO;
 	mutex_lock(&ave.hw_lock);
-	assert(ave_cmd_process(&ctx[0], 0, &input, 0, 0, false) == -EIO);
+	assert(ave_cmd_process(&ctx[0], 0, &input, 0, 0, false, false) == -EIO);
 	mutex_unlock(&ave.hw_lock);
 	assert(!ctx[0].sess->slot[0].src && ctx[0].sess->slot[0].input_mem);
 	ave_vb2_memops.put(mem); /* The caller returns this failed submission. */

@@ -121,6 +121,7 @@ struct ave_start_layout {
 	struct ave_surface_layout header, secondary, param_sets;
 	struct ave_surface_layout ref_a, ref_b, ref_c, ref_c_alias, ref_d;
 	struct ave_surface_layout ref_e, ref_f;
+	struct ave_surface_layout hevc_transcoded;
 	struct ave_surface_layout mb, coded, meta, row_a, row_b, fixed,
 		neighbour_fw, hevc_extra;
 	struct ave_surface_layout tiles[8];
@@ -218,6 +219,15 @@ struct ave_start_layout {
 	u32 h264_scaling_4x4;
 	u32 h264_scaling_8x8;
 	u32 h264_sve_count;
+	u32 h264_multi_me;
+	u32 h264_vui_restriction;
+	u32 h264_vui_mv_over_boundaries;
+	u32 h264_vui_max_bytes_denom;
+	u32 h264_vui_max_bits_denom;
+	u32 h264_vui_max_mv_h;
+	u32 h264_vui_max_mv_v;
+	u32 h264_vui_max_reorder;
+	u32 h264_vui_max_dec_buffering;
 	u32 hevc_pad;
 	u32 hevc_rc_270c;
 	u32 hevc_rc_9604;
@@ -246,6 +256,46 @@ struct ave_start_layout {
 	u32 hevc_dpb_minus1;
 	u32 hevc_reorder;
 	u32 hevc_reorder_on;
+	u32 hevc_input_format;
+	u32 hevc_pps_count;
+	u32 hevc_slice_map_count;
+	u32 hevc_slice_map_end;
+	u32 hevc_sao_config;
+	u32 hevc_sao_offsets;
+	u32 hevc_input_depth;
+	u32 hevc_num_views[2];
+	u32 hevc_sve_count;
+	u32 hevc_sve_index;
+	u32 hevc_vps_base_internal;
+	u32 hevc_vps_base_available;
+	u32 hevc_vps_temporal_nesting;
+	u32 hevc_vps_sublayer_info;
+	u32 hevc_vps_max_dec_buffering;
+	u32 hevc_vps_num_reorder;
+	u32 hevc_vps_max_latency;
+	u32 hevc_sps_temporal_nesting;
+	u32 hevc_sps_sublayer_info;
+	u32 hevc_sps_max_latency;
+	u32 hevc_sps_log2_min_cb;
+	u32 hevc_sps_log2_diff_cb;
+	u32 hevc_sps_log2_min_tb;
+	u32 hevc_sps_log2_diff_tb;
+	u32 hevc_sps_depth_inter;
+	u32 hevc_sps_depth_intra;
+	u32 hevc_sps_scaling_enabled;
+	u32 hevc_sps_sao;
+	u32 hevc_sps_tmvp;
+	u32 hevc_sps_fw_header;
+	u32 hevc_sps_header_len;
+	u32 hevc_pps_extra_slice_bits;
+	u32 hevc_pps_init_qp;
+	u32 hevc_pps_cu_qp_delta;
+	u32 hevc_pps_cu_qp_depth;
+	u32 hevc_pps_wpp;
+	u32 hevc_pps_deblock_present;
+	u32 hevc_pps_fw_header;
+	u32 hevc_pps_header_len;
+	u32 hevc_rps;
 	u32 geometry_mode, geometry_depth;
 	u32 profile_idc, level_idc, max_refs_copy, mb_size, mb_height;
 	u32 crop_copy, crop_right_copy, crop_bottom_copy;
@@ -267,6 +317,7 @@ struct ave_proc_layout {
 	u32 bitrate;
 	u32 limits, limit_bytes, limit_secs;
 	u32 const5;
+	u32 frame_type;
 	u32 fps; /* f64 */
 	u32 timescale; /* u64 */
 	u32 avg_variance;
@@ -285,8 +336,10 @@ struct ave_proc_layout {
 	u32 low_delay; /* HEVC only: 3 with reordering off */
 	/* Per-picture reconstruction and motion-search selections. */
 	struct ave_recon_selection_layout current_recon, list0_recon;
+	struct ave_recon_selection_layout list0_recon_second, list1_recon;
 	u32 current_colocated;
-	u32 current_lowres, list0_lowres;
+	u32 current_lowres, list0_lowres, list0_lowres_second;
+	u32 list1_lowres, list1_colocated;
 	u32 lowres_results;
 	u32 lrme_stats;
 	struct ave_retained_partition retained[AVE_MAX_RETAINED_PARTITIONS];
