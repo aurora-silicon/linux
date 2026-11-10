@@ -98,7 +98,7 @@ struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 				 const struct apple_epic_service_ops *ops)
 {
 	struct apple_dcp_afkep *afkep;
-	int ret, i;
+	int ret;
 
 	afkep = kzalloc_obj(*afkep);
 	if (!afkep)
@@ -125,14 +125,7 @@ struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 		}
 	}
 	INIT_WORK(&afkep->service_work, afk_service_worker);
-	INIT_LIST_HEAD(&afkep->compact_cmds);
-	init_waitqueue_head(&afkep->compact_orphan_wq);
-	mutex_init(&afkep->compact_tx_lock);
-	init_completion(&afkep->started);
-	init_completion(&afkep->stopped);
-	spin_lock_init(&afkep->lock);
-	for (i = 0; i < AFK_MAX_CHANNEL; i++)
-		spin_lock_init(&afkep->services[i].lock);
+	afk_ep_init_state(afkep);
 	ret = devm_add_action_or_reset(dcp->dev, afk_release_context, afkep);
 	if (ret)
 		return ERR_PTR(ret);
