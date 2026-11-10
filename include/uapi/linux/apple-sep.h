@@ -426,7 +426,7 @@ struct sep_keybag_change {
  * on this Mac. EXPORT copies the designated bag; IMPORT loads a saved one
  * and designates it again, locked until SEP_BIO_KEYBAG_UNLOCK.
  */
-#define SEP_KEYBAG_BLOB_MAX 1024
+#define SEP_KEYBAG_BLOB_MAX 4096
 
 struct sep_keybag_blob {
 	__u32 uid;

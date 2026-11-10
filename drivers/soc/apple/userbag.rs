@@ -752,13 +752,17 @@ pub(crate) const IOC_CREATE: u32 = kernel::ioctl::_IOW::<UnlockRequest>(IOC_MAGI
 pub(crate) const IOC_EXPORT: u32 = kernel::ioctl::_IOWR::<BagBlob>(IOC_MAGIC, 0x35);
 pub(crate) const IOC_IMPORT: u32 = kernel::ioctl::_IOW::<BagBlob>(IOC_MAGIC, 0x36);
 
-/// The largest wrapped user bag `EXPORT`/`IMPORT` carry.
-pub(crate) const BAG_BLOB_MAX: usize = 1024;
+/// The largest wrapped user bag `EXPORT`/`IMPORT` carry. A fresh variant-5
+/// user bag wraps to 1504 bytes; the bound leaves room for the class keys a
+/// bag gains as it is used.
+pub(crate) const BAG_BLOB_MAX: usize = 4096;
 
 /// The UAPI `struct sep_keybag_blob`: a user's wrapped bag. It holds no
 /// secret: the enclave wrapped it under a key entangled with its own UID
 /// key and the bag opens only with the user's password.
+/// Only its layout is used: the ioctl handlers copy it to the heap.
 #[repr(C)]
+#[allow(dead_code)]
 pub(crate) struct BagBlob {
     pub(crate) uid: u32,
     pub(crate) len: u32,
@@ -769,6 +773,15 @@ static_assert!(core::mem::size_of::<BagBlob>() == 8 + BAG_BLOB_MAX);
 unsafe impl kernel::transmute::FromBytes for BagBlob {}
 // SAFETY: as above.
 unsafe impl kernel::transmute::AsBytes for BagBlob {}
+
+/// `struct sep_keybag_blob`'s uid and len, read from a copy of the whole
+/// struct (the ioctl handlers keep the 4 KiB blob on the heap).
+fn blob_uid(blob: &[u8]) -> u32 {
+    u32::from_ne_bytes([blob[0], blob[1], blob[2], blob[3]])
+}
+fn blob_len(blob: &[u8]) -> usize {
+    u32::from_ne_bytes([blob[4], blob[5], blob[6], blob[7]]) as usize
+}
 
 /// The largest sealing-key record `SEP_BIO_FDE_*` carry.
 pub(crate) const FDE_RECORD_MAX: usize = 2048;
@@ -1191,29 +1204,36 @@ impl crate::SepData {
         }
         match cmd {
             IOC_EXPORT => {
-                let mut blob: BagBlob = UserSlice::new(user_ptr, core::mem::size_of::<BagBlob>()).reader().read()?;
-                let user = crate::sks::DesignateUser::new(i32::try_from(blob.uid).map_err(|_| EINVAL)?).ok_or(EINVAL)?;
-                if blob.uid < MIN_UID {
+                // The blob is 4 KiB: keep it off the kernel stack.
+                let (reader, mut writer) = UserSlice::new(user_ptr, core::mem::size_of::<BagBlob>()).reader_writer();
+                let mut blob = KVec::<u8>::with_capacity(core::mem::size_of::<BagBlob>(), GFP_KERNEL)?;
+                reader.read_all(&mut blob, GFP_KERNEL)?;
+                let uid = blob_uid(&blob);
+                let user = crate::sks::DesignateUser::new(i32::try_from(uid).map_err(|_| EINVAL)?).ok_or(EINVAL)?;
+                if uid < MIN_UID {
                     return Err(EINVAL);
                 }
                 let wrapped = self.userbag_export(user)?;
-                blob.data.fill(0);
-                blob.data[..wrapped.len()].copy_from_slice(&wrapped);
-                blob.len = wrapped.len() as u32;
-                UserSlice::new(user_ptr, core::mem::size_of::<BagBlob>()).writer().write(&blob)?;
+                blob.fill(0);
+                blob[..4].copy_from_slice(&uid.to_ne_bytes());
+                blob[4..8].copy_from_slice(&(wrapped.len() as u32).to_ne_bytes());
+                blob[8..8 + wrapped.len()].copy_from_slice(&wrapped);
+                writer.write_slice(&blob)?;
                 crate::bio::ok()
             }
             IOC_IMPORT => {
-                let blob: BagBlob = UserSlice::new(user_ptr, core::mem::size_of::<BagBlob>()).reader().read()?;
-                let len = blob.len as usize;
-                if blob.uid < MIN_UID || len == 0 || len > BAG_BLOB_MAX {
+                let mut blob = KVec::<u8>::with_capacity(core::mem::size_of::<BagBlob>(), GFP_KERNEL)?;
+                UserSlice::new(user_ptr, core::mem::size_of::<BagBlob>()).reader().read_all(&mut blob, GFP_KERNEL)?;
+                let uid = blob_uid(&blob);
+                let len = blob_len(&blob);
+                if uid < MIN_UID || len == 0 || len > BAG_BLOB_MAX {
                     return Err(EINVAL);
                 }
-                let user = crate::sks::DesignateUser::new(i32::try_from(blob.uid).map_err(|_| EINVAL)?).ok_or(EINVAL)?;
+                let user = crate::sks::DesignateUser::new(i32::try_from(uid).map_err(|_| EINVAL)?).ok_or(EINVAL)?;
                 if !self.xart_writable() {
                     return Err(EROFS);
                 }
-                self.userbag_import(user, &blob.data[..len])?;
+                self.userbag_import(user, &blob[8..8 + len])?;
                 crate::bio::ok()
             }
             IOC_FDE_CREATE => {
