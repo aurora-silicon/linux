@@ -92,6 +92,16 @@ struct apple_t8140_bootstrap {
 	struct kexec_blocker kexec_blocker;
 	struct delayed_work admission_retry;
 	struct device *retry_host;
+	/* The host stops the radios for a sleep that takes this engine's power. */
+	bool sleep_armed;
+	bool power_lost;
+	/* After a real sleep: read the engine once the host's port is up again. */
+	bool power_check;
+	bool irq_held;
+	int (*radio_stop)(struct pci_dev *pdev);
+	struct module *radio_stop_owner;
+	void (*radio_recover)(void *data);
+	void *radio_recover_data;
 };
 
 /* A successful supplier probe owns its unpublished arena until full reset. */
@@ -192,6 +202,8 @@ static int apple_piodma_pm_prepare(struct device *dev)
 	if (!bootstrap || !apple_piodma_guarded(apple_piodma_state(bootstrap)))
 		return 0;
 	if (apple_piodma_sleep_allowed(apple_piodma_state(bootstrap), pm_suspend_no_platform()))
+		return 0;
+	if (READ_ONCE(bootstrap->sleep_armed))
 		return 0;
 	/*
 	 * A /dev/snapshot file may have sent its PREPARE notifier before this
@@ -371,6 +383,10 @@ static irqreturn_t apple_t8140_bootstrap_irq(int irq, void *data)
 	struct apple_piodma_slot *slot;
 	u32 fabric, status, tag, active;
 	int count;
+
+	/* After a real sleep its block can't answer until the host's port is back. */
+	if (READ_ONCE(bootstrap->irq_held))
+		return IRQ_NONE;
 
 	/* Acknowledge order follows the attributed prior controller contract. */
 	fabric = readl(bootstrap->fabric);
@@ -744,6 +760,60 @@ int apple_piodma_bootstrap_prime(struct device *supplier, struct pci_dev *root)
 }
 EXPORT_SYMBOL_GPL(apple_piodma_bootstrap_prime);
 
+void apple_piodma_bootstrap_set_sleep(struct device *supplier, bool armed)
+{
+	struct apple_t8140_bootstrap *bootstrap = dev_get_drvdata(supplier);
+
+	WRITE_ONCE(bootstrap->sleep_armed, armed);
+	/* A check still pending means the block never came back, and stays unread. */
+	if (armed)
+		bootstrap->power_lost = false;
+}
+
+/* The next bootstrap starts as the first did, on the same retained memory. */
+int apple_piodma_bootstrap_power_lost(struct device *supplier)
+{
+	struct apple_t8140_bootstrap *bootstrap = dev_get_drvdata(supplier);
+	void *arena = bootstrap->arena;
+	int i;
+
+	/*
+	 * Everything reading as it did before the first command is what shows the sleep took
+	 * the engine's pointers with it. Read only now: the block answers once the host's
+	 * port is set up, after resume_noirq.
+	 */
+	if (bootstrap->power_check) {
+		bootstrap->power_check = false;
+		bootstrap->power_lost = !apple_t8140_bootstrap_idle(bootstrap);
+		if (!bootstrap->power_lost)
+			dev_err(supplier, "engine kept state across sleep; radios stay down\n");
+		WRITE_ONCE(bootstrap->irq_held, false);
+	}
+	if (!bootstrap->power_lost || READ_ONCE(bootstrap->irq_fault))
+		return -EIO;
+	bootstrap->power_lost = false;
+
+	memset(arena, 0, PIODMA_ARENA_SIZE);
+	for (i = 0; i < PIODMA_REQUEST_COUNT; i++) {
+		void *slot = arena + i * PIODMA_SLOT_SIZE;
+
+		memset(slot + PIODMA_DATA_OFFSET, 0xa5, PAGE_SIZE);
+		*(__le32 *)(slot + PIODMA_DATA_OFFSET) = cpu_to_le32(U32_MAX);
+		memset(bootstrap->slots[i].packet, 0, sizeof(bootstrap->slots[i].packet));
+		memset(bootstrap->slots[i].completion, 0, sizeof(bootstrap->slots[i].completion));
+		bootstrap->slots[i].result = 0;
+		WRITE_ONCE(bootstrap->slots[i].matched_status, 0);
+		bootstrap->slots[i].submitted = false;
+		bootstrap->slots[i].observed = false;
+		reinit_completion(&bootstrap->slots[i].event);
+	}
+	dma_wmb();
+	WRITE_ONCE(bootstrap->active_tag, 0);
+	atomic_set(&bootstrap->irq_count, 0);
+
+	return apple_piodma_transition(bootstrap, PIODMA_POWER_LOST);
+}
+
 bool apple_piodma_bootstrap_retained(struct device *supplier)
 {
 	struct apple_t8140_bootstrap *bootstrap = dev_get_drvdata(supplier);
@@ -752,6 +822,43 @@ bool apple_piodma_bootstrap_retained(struct device *supplier)
 	return apple_piodma_retained(apple_piodma_state(bootstrap));
 }
 EXPORT_SYMBOL_GPL(apple_piodma_bootstrap_retained);
+
+/* The stop and the module it's in, set and read together. */
+static DEFINE_SPINLOCK(radio_stop_lock);
+
+int apple_piodma_bootstrap_radio_stop(struct device *supplier, struct pci_dev *pdev)
+{
+	struct apple_t8140_bootstrap *bootstrap = dev_get_drvdata(supplier);
+	int (*stop)(struct pci_dev *pdev);
+	struct module *owner;
+	bool held;
+	int ret;
+
+	/* Its module stays while it runs. One that is unloading: its remove stops the radio. */
+	spin_lock(&radio_stop_lock);
+	stop = bootstrap->radio_stop;
+	owner = bootstrap->radio_stop_owner;
+	held = !stop || try_module_get(owner);
+	spin_unlock(&radio_stop_lock);
+	if (!held)
+		return -EBUSY;
+	if (!stop)
+		return 0;
+
+	ret = stop(pdev);
+	module_put(owner);
+
+	return ret;
+}
+
+void apple_piodma_bootstrap_set_recover(struct device *supplier, void (*recover)(void *data),
+					void *data)
+{
+	struct apple_t8140_bootstrap *bootstrap = dev_get_drvdata(supplier);
+
+	bootstrap->radio_recover_data = data;
+	WRITE_ONCE(bootstrap->radio_recover, recover);
+}
 
 void apple_piodma_bootstrap_admitted(struct device *supplier)
 {
@@ -790,6 +897,31 @@ int apple_piodma_radio_check(struct pci_dev *pdev)
 }
 EXPORT_SYMBOL_GPL(apple_piodma_radio_check);
 
+void apple_piodma_radio_recover(void)
+{
+	/* Pairs with the release at registration. */
+	struct apple_t8140_bootstrap *bootstrap = smp_load_acquire(&active_bootstrap);
+	void (*recover)(void *data) = bootstrap ? READ_ONCE(bootstrap->radio_recover) : NULL;
+
+	if (recover)
+		recover(bootstrap->radio_recover_data);
+}
+EXPORT_SYMBOL_GPL(apple_piodma_radio_recover);
+
+void __apple_piodma_radio_set_stop(int (*stop)(struct pci_dev *pdev), struct module *owner)
+{
+	/* Pairs with the release at registration. */
+	struct apple_t8140_bootstrap *bootstrap = smp_load_acquire(&active_bootstrap);
+
+	if (!bootstrap)
+		return;
+	spin_lock(&radio_stop_lock);
+	bootstrap->radio_stop = stop;
+	bootstrap->radio_stop_owner = owner;
+	spin_unlock(&radio_stop_lock);
+}
+EXPORT_SYMBOL_GPL(__apple_piodma_radio_set_stop);
+
 static int apple_t8140_bootstrap_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -822,7 +954,8 @@ static int apple_t8140_bootstrap_probe(struct platform_device *pdev)
 	ret = apple_t8140_bootstrap_resources(pdev, bootstrap);
 	if (ret)
 		goto err_arena;
-	ret = devm_request_irq(dev, bootstrap->irq, apple_t8140_bootstrap_irq, 0,
+	/* The host's resume_noirq waits for one completion, with device interrupts still off. */
+	ret = devm_request_irq(dev, bootstrap->irq, apple_t8140_bootstrap_irq, IRQF_EARLY_RESUME,
 			       dev_name(dev), bootstrap);
 	if (ret)
 		goto err_arena;
@@ -873,12 +1006,20 @@ static int apple_t8140_bootstrap_sleep_check(struct apple_t8140_bootstrap *boots
 static int apple_t8140_bootstrap_suspend_noirq(struct device *dev)
 {
 	struct apple_t8140_bootstrap *bootstrap = dev_get_drvdata(dev);
+	int ret;
 
 	if (!apple_piodma_retained(apple_piodma_state(bootstrap)))
 		return 0;
-	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
+	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE && !READ_ONCE(bootstrap->sleep_armed))
 		return -EOPNOTSUPP;
-	return apple_t8140_bootstrap_sleep_check(bootstrap);
+	/* Radios that failed to come back don't cost the machine a deep sleep. */
+	if (READ_ONCE(bootstrap->sleep_armed) &&
+	    (!apple_piodma_ready(apple_piodma_state(bootstrap)) || bootstrap->power_check))
+		return 0;
+	ret = apple_t8140_bootstrap_sleep_check(bootstrap);
+	if (!ret && READ_ONCE(bootstrap->sleep_armed))
+		WRITE_ONCE(bootstrap->irq_held, true);
+	return ret;
 }
 
 static int apple_t8140_bootstrap_resume_noirq(struct device *dev)
@@ -890,6 +1031,15 @@ static int apple_t8140_bootstrap_resume_noirq(struct device *dev)
 		return 0;
 	if (!apple_piodma_ready(apple_piodma_state(bootstrap)) || READ_ONCE(bootstrap->irq_fault))
 		return -EIO;
+	/*
+	 * Its block reads nothing until the host sets its port up again, so neither read it
+	 * nor take its interrupt until then: apple_piodma_bootstrap_power_lost() checks it.
+	 */
+	if (READ_ONCE(bootstrap->sleep_armed) && pm_resume_via_firmware()) {
+		bootstrap->power_check = true;
+		return 0;
+	}
+	WRITE_ONCE(bootstrap->irq_held, false);
 	/* Genpd may gate this island; restore configuration, never a command. */
 	ret = apple_t8140_bootstrap_initialize(bootstrap);
 	if (ret)

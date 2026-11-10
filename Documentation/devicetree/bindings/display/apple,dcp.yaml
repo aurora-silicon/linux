@@ -78,11 +78,14 @@ properties:
     description: Optional host display-engine interrupt sources.
 
   mboxes:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
 
   mbox-names:
+    minItems: 1
     items:
       - const: mbox
+      - const: secure
 
   iommus:
     maxItems: 1
@@ -141,6 +144,13 @@ properties:
     maxItems: 8
     items:
       pattern: '^(dp-phy|typec[0-9]+)$'
+
+  apple,display-power:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      A node whose ps, pwrgate and pmc-dcp registers hold the display power
+      words this coprocessor's driver writes around a firmware restart, such
+      as an apple,t8140-display-power node.
 
   apple,bw-scratch:
     $ref: /schemas/types.yaml#/definitions/phandle-array

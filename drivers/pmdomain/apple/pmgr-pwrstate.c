@@ -15,11 +15,13 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/suspend.h>
 #include <linux/regmap.h>
 #include <linux/mfd/syscon.h>
 #include <linux/reset-controller.h>
 #include <linux/module.h>
 #include <linux/soc/apple/pmgr-pwrstate.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/soc/apple/t8132.h>
 
 #define APPLE_PMGR_RESET        BIT(31)
@@ -67,6 +69,8 @@ struct apple_pmgr_ps {
 	bool firmware_owned;
 	/* apple,sleep-retained: kept on while the system sleeps */
 	bool sleep_retained;
+	/* apple,sleep-driver-owned: the driver behind it brings it back after a sleep */
+	bool sleep_driver_owned;
 	/* Never enable automatic power management (apple,no-auto-pm). */
 	bool no_auto_pm;
 	bool inherited_on;
@@ -75,6 +79,10 @@ struct apple_pmgr_ps {
 	bool strict_state;
 	bool wait_parent;
 	u32 reset_time_us;
+	/* Off in genpd but on in hardware as the system slept: someone else raised it. */
+	bool sleep_raised_by_other;
+	/* That domain's target as the system slept. */
+	u32 sleep_target;
 	/*
 	 * apple,consumer-switched: firmware-owned, but powered off and on by its
 	 * consumer (apple_pmgr_ps_consumer_off()). The state word before
@@ -126,6 +134,22 @@ static int apple_pmgr_ps_wait_parent(struct apple_pmgr_ps *ps, u32 *cur)
  * power-on then fails as it did before, and genpd, which ignores errors in
  * that phase, keeps the domain requested on.
  */
+/* Pulse the PS reset of a domain that is off with BUSY latched; it stays off. */
+static void apple_pmgr_ps_unlatch_off(struct apple_pmgr_ps *ps, u32 *cur)
+{
+	u32 off = *cur & ~(APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS | APPLE_PMGR_BUSY |
+			   APPLE_PMGR_PS_RESET | APPLE_PMGR_DEV_DISABLE | APPLE_PMGR_PS_TARGET);
+
+	regmap_write(ps->regmap, ps->offset, off | APPLE_PMGR_PS_RESET);
+	regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, *cur,
+					!(*cur & APPLE_PMGR_BUSY), 1, APPLE_PMGR_PS_SET_TIMEOUT);
+	regmap_write(ps->regmap, ps->offset, off);
+	regmap_read(ps->regmap, ps->offset, cur);
+	if (*cur & APPLE_PMGR_BUSY)
+		dev_warn_ratelimited(ps->dev, "PS %s: off with BUSY latched: %#x\n",
+				     ps->genpd.name, *cur);
+}
+
 static int apple_pmgr_ps_clear_latch(struct apple_pmgr_ps *ps, u32 reg, u32 *cur)
 {
 	u32 off = (reg & ~APPLE_PMGR_PS_TARGET) | APPLE_PMGR_PS_PWRGATE;
@@ -258,6 +282,19 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 		}
 	}
 
+	/*
+	 * A domain can reach off with BUSY latched: on T8140 both ISP CPU cores do,
+	 * every time they go down under Linux. macOS leaves them off with it clear,
+	 * and the sleep engine, which powers them up itself in a wake that keeps DRAM
+	 * up, stalls on a latched one until its watchdog resets the SoC. Only a PS
+	 * reset clears it, and the domain is off, so pulse one as on the power-on
+	 * path (not in a system sleep transition, see apple_pmgr_ps_clear_latch()).
+	 */
+	if (!ret && pstate != APPLE_PMGR_PS_ACTIVE && (cur & APPLE_PMGR_BUSY) &&
+	    !FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) && !ps->system_sleep &&
+	    !ps->wait_parent && !ps->strict_state && !ps->externally_clocked)
+		apple_pmgr_ps_unlatch_off(ps, &cur);
+
 report:
 	if (ret < 0)
 		dev_err_ratelimited(ps->dev,
@@ -355,6 +392,12 @@ static int apple_pmgr_ps_power_off(struct generic_pm_domain *genpd)
 	/* A live coprocessor keeps this domain through system sleep. */
 	if (ps->sleep_retained && ps->system_sleep)
 		return -EBUSY;
+	/*
+	 * Its driver took it down for the sleep and raises it in its own order. Gating it
+	 * here would take its parents too, and genpd would raise them all first at the wake.
+	 */
+	if (ps->system_sleep && apple_sleep_domain_is_down(ps->dev->of_node))
+		return -EBUSY;
 
 	ret = apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_PWRGATE, false);
 	if (ret)
@@ -440,6 +483,86 @@ static int apple_pmgr_ps_suspend_late(struct device *dev)
 static int apple_pmgr_ps_resume_early(struct device *dev)
 {
 	apple_pmgr_ps_set_system_sleep(dev, false);
+
+	return 0;
+}
+
+/*
+ * By the noirq phase genpd has powered off what it is going to. A domain it has off
+ * whose target is still on was raised by a coprocessor's firmware: on T8140 the AOP
+ * raises audio domains of its own in the always-on PMGR, and the sleep keeps them.
+ */
+static int apple_pmgr_ps_suspend_noirq(struct device *dev)
+{
+	struct apple_pmgr_ps *ps = dev_get_drvdata(dev);
+	unsigned long flags;
+	u32 reg;
+
+	ps->sleep_raised_by_other = false;
+	if (ps->firmware_owned || ps->inherited_on)
+		return 0;
+
+	spin_lock_irqsave(&ps->genpd.slock, flags);
+	if (!regmap_read(ps->regmap, ps->offset, &reg)) {
+		ps->sleep_target = FIELD_GET(APPLE_PMGR_PS_TARGET, reg);
+		ps->sleep_raised_by_other = ps->genpd.status == GENPD_STATE_OFF &&
+					    ps->sleep_target != APPLE_PMGR_PS_PWRGATE;
+	}
+	spin_unlock_irqrestore(&ps->genpd.slock, flags);
+
+	return 0;
+}
+
+/*
+ * A firmware-driven suspend powers the SoC down and its sleep engine leaves the
+ * domains in states of its own: AUTO_ENABLE cleared, some at clock gating. genpd
+ * only powers a domain back on if it turned it off itself, so its idea of a
+ * domain it left on is now wrong. Put each domain back where genpd thinks it is.
+ *
+ * On T8140 macOS re-raises 22 domains in the first 5 ms after a wake and lowers
+ * 30 others (measured under aura). Which of them Linux needs isn't established,
+ * so this follows genpd's books rather than a list. A domain whose driver took it
+ * down for the sleep, as the USB host's PHY does, is that driver's to raise, in
+ * its own order. A domain someone else raised before the sleep, and still at that
+ * target, stays theirs.
+ */
+static int apple_pmgr_ps_resume_noirq(struct device *dev)
+{
+	struct apple_pmgr_ps *ps = dev_get_drvdata(dev);
+	unsigned long flags;
+	u32 reg;
+	int ret;
+
+	if (!pm_resume_via_firmware() || ps->firmware_owned || ps->inherited_on ||
+	    ps->sleep_driver_owned || apple_sleep_domain_is_down(dev->of_node))
+		return 0;
+
+	spin_lock_irqsave(&ps->genpd.slock, flags);
+	ret = regmap_read(ps->regmap, ps->offset, &reg);
+	if (!ret) {
+		if (ps->genpd.status == GENPD_STATE_OFF) {
+			u32 target = FIELD_GET(APPLE_PMGR_PS_TARGET, reg);
+
+			/*
+			 * Lowering an AOP-raised audio domain here leaves the internal
+			 * microphone array's data path dark: the AOP never raises it again.
+			 */
+			if (target != APPLE_PMGR_PS_PWRGATE &&
+			    !(ps->sleep_raised_by_other && target == ps->sleep_target))
+				ret = apple_pmgr_ps_set(&ps->genpd, APPLE_PMGR_PS_PWRGATE,
+							false);
+		} else {
+			bool auto_enable = !ps->no_auto_enable && !ps->no_auto_pm;
+
+			if (FIELD_GET(APPLE_PMGR_PS_TARGET, reg) != APPLE_PMGR_PS_ACTIVE ||
+			    (auto_enable && !(reg & APPLE_PMGR_AUTO_ENABLE)))
+				ret = apple_pmgr_ps_set(&ps->genpd, APPLE_PMGR_PS_ACTIVE,
+							auto_enable);
+		}
+	}
+	spin_unlock_irqrestore(&ps->genpd.slock, flags);
+	if (ret)
+		dev_err(dev, "PS %s: resync after sleep failed: %d\n", ps->genpd.name, ret);
 
 	return 0;
 }
@@ -694,6 +817,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 				     "retention workaround needs a consumer switch\n");
 	}
 	ps->sleep_retained = of_property_read_bool(node, "apple,sleep-retained");
+	ps->sleep_driver_owned = of_property_read_bool(node, "apple,sleep-driver-owned");
 	/*
 	 * Only T8132 hands over inherited-on domains with this contract. Older
 	 * M3 device trees carry the property with another meaning; keep them
@@ -1087,6 +1211,7 @@ MODULE_DEVICE_TABLE(of, apple_pmgr_ps_of_match);
 
 static const struct dev_pm_ops apple_pmgr_ps_pm_ops = {
 	LATE_SYSTEM_SLEEP_PM_OPS(apple_pmgr_ps_suspend_late, apple_pmgr_ps_resume_early)
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_pmgr_ps_suspend_noirq, apple_pmgr_ps_resume_noirq)
 };
 
 static struct platform_driver apple_pmgr_ps_driver = {

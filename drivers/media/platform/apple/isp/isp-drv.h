@@ -10,6 +10,7 @@
 #include <linux/mutex.h>
 #include <linux/types.h>
 #include <linux/spinlock.h>
+#include <linux/workqueue.h>
 
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
@@ -241,11 +242,14 @@ struct apple_isp_hw {
 	bool fw_restore;
 
 	/*
-	 * The firmware can be started only once per system boot, so once
-	 * started it is kept running while the driver is bound. It starts at
-	 * probe, or at the first stream with deferred_start.
+	 * The firmware isn't started for each stream: once started it is kept
+	 * running while the driver is bound. It starts at probe, or at the
+	 * first stream with deferred_start.
 	 */
 	bool resident_fw;
+
+	/* Resident firmware that starts again after a stop, from its own memory */
+	bool fw_restart;
 
 	/*
 	 * Start the firmware, and detect the camera, at the first stream
@@ -393,6 +397,10 @@ struct apple_isp {
 		u64 heap_base;
 		u64 heap_top;
 		u64 data_top; /* 0 unless the bootloader loads the data */
+		/* the coprocessor's reset vector at the first start */
+		u64 entry;
+		/* the coprocessor has run since probe */
+		bool started;
 	} fw;
 	/* changes under video_lock once the video device is registered */
 	enum isp_fw_state fw_state;
@@ -400,6 +408,11 @@ struct apple_isp {
 	bool camera_detected;
 	/* configurations the firmware has, once a deferred start detected them */
 	u32 num_fw_presets;
+
+	/* stopped for system sleep, to start again on resume */
+	bool fw_sleep_stopped;
+	/* restarts a stream that ran across that sleep, see apple_isp_resume() */
+	struct work_struct resume_work;
 
 	struct isp_surf *ipc_surf;
 	struct isp_surf *extra_surf;

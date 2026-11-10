@@ -27,13 +27,16 @@
 		sep = &sep;
 		serial0 = &serial0;
 		pmp = &pmp;
-		rtc0 = &smc_rtc;
-		rtc1 = &pmu_rtc;
+		/* First the RTC that can wake the system */
+		rtc0 = &pmu_rtc;
+		rtc1 = &smc_rtc;
 		wifi0 = &wifi0;
 		/* used by the loader to hand over the display */
 		dcp = &dcp;
 		disp0 = &display;
 		disp0-piodma = &disp0_piodma;
+		/* and the SIO, with its firmware */
+		sio = &sio;
 	};
 
 	chosen {
@@ -411,20 +414,53 @@
 		regulator-name = "jack-codec";
 		regulator-always-on;
 	};
+
+	/*
+	 * The mic array's rail: SMC pcIO output 25, the ADT's
+	 * function-input_power_enable. macOS switches it around each capture.
+	 */
+	mic_array_supply: regulator-mic-array {
+		compatible = "regulator-fixed";
+		regulator-name = "mic-array";
+		gpio = <&smc_gpio 25 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
 };
 
 #include "isp-imx558.dtsi"
 
-&ave_dart0 {
-	status = "okay";
+/*
+ * The J700 has one video encoder, the ADT's ave1 at 0x289100000 under
+ * VENC1_SYS. Encoder 0, which t8140.dtsi describes, isn't there: the ADT has
+ * no node for it and VENC0_SYS refuses its target. Its DARTs and domains
+ * would wait forever on a domain that never rises.
+ */
+&pmp_report_ave0 {
+	status = "disabled";
 };
 
-&ave_dart1 {
-	status = "okay";
+&ps_venc0_sys {
+	status = "disabled";
 };
 
-&ave {
-	status = "okay";
+&ps_venc0_dma {
+	status = "disabled";
+};
+
+&ps_venc0_pipe4 {
+	status = "disabled";
+};
+
+&ps_venc0_pipe5 {
+	status = "disabled";
+};
+
+&ps_venc0_me0 {
+	status = "disabled";
+};
+
+&ps_venc0_me1 {
+	status = "disabled";
 };
 
 &serial0 {
@@ -558,6 +594,19 @@
 	status = "okay";
 };
 
+&dcp_secure_mbox {
+	status = "okay";
+};
+
+/* The SIO itself is enabled by the loader that hands it over. */
+&sio_dart {
+	status = "okay";
+};
+
+&sio_mbox {
+	status = "okay";
+};
+
 &dcp {
 	/* 2408x1506 at 219 ppi; 525 nits peak from the backlight node */
 	panel: panel {
@@ -652,6 +701,7 @@
 &aop_audio {
 	apple,chassis-name = "J700";
 	apple,machine-kind = "MacBook Neo";
+	mic-supply = <&mic_array_supply>;
 };
 
 &admac_leap_ns {
@@ -744,7 +794,8 @@
 };
 
 &smc_gpio {
-	apple,pcio-templates = <10 0x800000 0xa0000>;
+	apple,pcio-templates = <10 0x800000 0xa0000>,
+			       <25 0x0 0x190000>;
 };
 
 &aop_spmi0 {
@@ -1850,13 +1901,22 @@
 	};
 };
 
-/* USB PD controllers, on the nub SPMI A0 bus */
+&sleep {
+	apple,debug-port = <&hpm0>;
+};
+
+/*
+ * USB PD controllers, on the nub SPMI A0 bus. macOS sends them SSPS 3 and 0 around a sleep
+ * and nothing else: no USBw, as the J700 ADT has no dock-remote-wake. A USB key press
+ * wakes the J700 through the host's own wake source.
+ */
 &nub_spmi_a0 {
 	status = "okay";
 
 	hpm1: usb-pd@a {
 		compatible = "apple,sn201202x";
 		reg = <0xa SPMI_USID>;
+		apple,sleep-ssps;
 		interrupts = <37 IRQ_TYPE_EDGE_RISING>,
 			     <39 IRQ_TYPE_EDGE_RISING>,
 			     <43 IRQ_TYPE_EDGE_RISING>,
@@ -1881,6 +1941,8 @@
 	hpm0: usb-pd@c {
 		compatible = "apple,sn201202x";
 		reg = <0xc SPMI_USID>;
+		apple,debug-lock-key = "007J";
+		apple,sleep-ssps;
 		interrupts = <11 IRQ_TYPE_EDGE_RISING>,
 			     <13 IRQ_TYPE_EDGE_RISING>,
 			     <17 IRQ_TYPE_EDGE_RISING>,
@@ -2116,6 +2178,10 @@
 
 /* The loader publishes external resources after validating their firmware. */
 #include "t8140-j700-dcpext.dtsi"
+
+&sleep {
+	apple,display-coprocessors = <&dcp>, <&dcpext>;
+};
 
 &display {
 	iommus = <&disp0_dart 0>, <&dispext0_dart 0>;

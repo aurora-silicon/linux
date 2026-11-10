@@ -14,6 +14,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/suspend.h>
 #include <linux/workqueue.h>
 
 #include "isp-cam.h"
@@ -525,6 +526,17 @@ isp_check_firmware_version(struct apple_isp *isp)
 	return compat;
 }
 
+/* After a system sleep, see apple_isp_resume(). */
+static void apple_isp_resume_work(struct work_struct *work)
+{
+	struct apple_isp *isp = container_of(work, struct apple_isp, resume_work);
+
+	mutex_lock(&isp->video_lock);
+	isp->fw_sleep_stopped = false;
+	mutex_unlock(&isp->video_lock);
+	apple_isp_video_resume(isp);
+}
+
 static int apple_isp_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -647,6 +659,7 @@ static int apple_isp_probe(struct platform_device *pdev)
 	}
 
 	mutex_init(&isp->video_lock);
+	INIT_WORK(&isp->resume_work, apple_isp_resume_work);
 	spin_lock_init(&isp->buf_lock);
 	init_waitqueue_head(&isp->wait);
 	INIT_LIST_HEAD(&isp->gc);
@@ -723,6 +736,7 @@ static void apple_isp_remove(struct platform_device *pdev)
 {
 	struct apple_isp *isp = platform_get_drvdata(pdev);
 
+	cancel_work_sync(&isp->resume_work);
 	apple_isp_remove_video(isp);
 	/* Stop resident firmware before freeing what it may still use. */
 	apple_isp_firmware_halt(isp);
@@ -954,6 +968,9 @@ static const struct apple_isp_hw apple_isp_hw_t8140 = {
 	.boot_mode = 1,
 	.capture_meta_size = ISP_CAPTURE_META_SIZE_T8140,
 	.resident_fw = true,
+	.fw_restart = true,
+	/* As on macOS, the firmware first starts when a client opens the camera. */
+	.deferred_start = true,
 	.meta_exposure = true,
 };
 
@@ -1244,9 +1261,43 @@ static __maybe_unused int apple_isp_runtime_resume(struct device *dev)
 	return 0;
 }
 
+/*
+ * Stop resident firmware. For a system sleep it starts again on resume where
+ * it can; otherwise, or for hibernation, the camera is gone until the next
+ * boot.
+ */
+static void apple_isp_stop_resident(struct apple_isp *isp, bool sleep)
+{
+	bool restart = sleep && isp->hw->fw_restart;
+
+	if (!isp->hw->resident_fw)
+		return;
+
+	mutex_lock(&isp->video_lock);
+	if (isp->fw_state == ISP_FW_RUNNING) {
+		if (restart)
+			dev_dbg(isp->dev, "stopping the firmware for system sleep\n");
+		else
+			dev_warn(isp->dev, "stopping the firmware for %s, the camera is unavailable until the next boot\n",
+				 sleep ? "system sleep" : "hibernation");
+		isp->fw_sleep_stopped = restart;
+	}
+	apple_isp_firmware_halt(isp);
+	/* Hibernation resumes in another boot, where that memory isn't ours. */
+	if (!restart)
+		isp->fw_state = ISP_FW_DEAD;
+	mutex_unlock(&isp->video_lock);
+}
+
 static __maybe_unused int apple_isp_suspend(struct device *dev)
 {
 	struct apple_isp *isp = dev_get_drvdata(dev);
+	bool power_lost = isp->hw->resident_fw && pm_suspend_via_firmware();
+
+	/* A stream that couldn't restart on the other side keeps the system up. */
+	if (power_lost && !isp->hw->fw_restart &&
+	    test_bit(ISP_STATE_STREAMING, &isp->state))
+		return -EBUSY;
 
 	/* We must restore V4L2 context on system resume. If we were streaming
 	 * before, we (essentially) stop streaming and start streaming again.
@@ -1254,9 +1305,13 @@ static __maybe_unused int apple_isp_suspend(struct device *dev)
 	apple_isp_video_suspend(isp);
 
 	/*
-	 * Resident firmware stays up, idle, across suspend-to-idle and
-	 * suspend-to-RAM: its domains stay on, see apple_isp_attach_genpd().
+	 * Resident firmware stays up, idle, across suspend-to-idle: its domains
+	 * stay on, see apple_isp_attach_genpd(). A sleep that powers the SoC down
+	 * takes it anyway, so stop it first.
 	 */
+	if (power_lost)
+		apple_isp_stop_resident(isp, true);
+
 	return 0;
 }
 
@@ -1272,13 +1327,7 @@ static __maybe_unused int apple_isp_freeze(struct device *dev)
 	 * that started it. Stop it cleanly instead; if it ran, the camera is
 	 * then unavailable until the next system boot.
 	 */
-	if (isp->hw->resident_fw) {
-		mutex_lock(&isp->video_lock);
-		if (isp->fw_state == ISP_FW_RUNNING)
-			dev_warn(dev, "stopping the firmware for hibernation, the camera is unavailable until the next boot\n");
-		apple_isp_firmware_halt(isp);
-		mutex_unlock(&isp->video_lock);
-	}
+	apple_isp_stop_resident(isp, false);
 
 	return 0;
 }
@@ -1287,6 +1336,16 @@ static __maybe_unused int apple_isp_resume(struct device *dev)
 {
 	struct apple_isp *isp = dev_get_drvdata(dev);
 
+	/*
+	 * Firmware stopped for the sleep starts again in process context: its
+	 * handshake here held up the whole resume. A stream that ran across the
+	 * sleep restarts from a freezable work item, once tasks thaw; without one
+	 * the firmware starts at the next stream.
+	 */
+	if (isp->fw_sleep_stopped) {
+		queue_work(system_freezable_wq, &isp->resume_work);
+		return 0;
+	}
 	apple_isp_video_resume(isp);
 
 	return 0;

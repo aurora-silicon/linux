@@ -23,6 +23,7 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/suspend.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_eld.h>
 #include <linux/hdmi.h>
@@ -1692,7 +1693,23 @@ static __maybe_unused int dcpaud_resume(struct device *dev)
 	return 0;
 }
 
-static DEFINE_RUNTIME_DEV_PM_OPS(dcpaud_pm_ops, dcpaud_suspend, dcpaud_resume, NULL);
+/* The SIO channel and the sink's link both end in a sleep that reaches the hardware. */
+static __maybe_unused int dcpaud_system_suspend(struct device *dev)
+{
+	struct dcp_audio *dcpaud = dev_get_drvdata(dev);
+
+	if (pm_suspend_via_firmware() && dcpaud->substream && dcpaud->substream->ref_count) {
+		dev_err(dev, "a stream is open, refusing the sleep\n");
+		return -EBUSY;
+	}
+
+	return pm_runtime_force_suspend(dev);
+}
+
+static const struct dev_pm_ops dcpaud_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(dcpaud_system_suspend, pm_runtime_force_resume)
+	RUNTIME_PM_OPS(dcpaud_suspend, dcpaud_resume, NULL)
+};
 
 static const struct of_device_id dcpaud_of_match[] = {
 	{ .compatible = "apple,dpaudio" },

@@ -19,6 +19,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/reset.h>
 #include <linux/spinlock.h>
+#include <linux/suspend.h>
 #include <linux/interrupt.h>
 
 #include "dmaengine.h"
@@ -139,6 +140,12 @@ struct admac_chan {
 	struct list_head issued;
 
 	struct list_head to_free;
+
+	/* The client's last configuration, set up again after a system sleep. */
+	struct dma_slave_config cfg;
+	bool cfg_valid;
+	/* A system sleep took the channel's registers; set it up before a transfer. */
+	bool lost;
 };
 
 struct admac_sram {
@@ -629,11 +636,30 @@ static void admac_reset_rings(struct admac_chan *adchan)
 	writel_relaxed(0, ad->base + REG_CHAN_CTL(ad, adchan->no));
 }
 
+static int admac_device_config(struct dma_chan *chan, struct dma_slave_config *config);
+
+/* Registers can't be reached before a client powers the fabric, so this waits for it. */
+static void admac_restore_chan(struct admac_chan *adchan)
+{
+	struct admac_data *ad = adchan->host;
+
+	if (!adchan->lost)
+		return;
+	adchan->lost = false;
+
+	if (ad->split_channels)
+		writel_relaxed(0x18080001, ad->base + REG_CTL);
+	writel_relaxed(adchan->carveout, ad->base + REG_CHAN_SRAM_CARVEOUT(ad, adchan->no));
+	if (adchan->cfg_valid)
+		admac_device_config(&adchan->chan, &adchan->cfg);
+}
+
 static void admac_start_current_tx(struct admac_chan *adchan)
 {
 	struct admac_data *ad = adchan->host;
 	int ch = adchan->no;
 
+	admac_restore_chan(adchan);
 	admac_reset_rings(adchan);
 	writel_relaxed(0, ad->base + REG_CHAN_CTL(ad, ch));
 	if (ad->split_channels) {
@@ -686,10 +712,19 @@ static int admac_resume(struct dma_chan *chan)
 	int ret = 0;
 
 	spin_lock_irqsave(&adchan->lock, flags);
-	if (adchan->current_tx && adchan->current_tx->error)
+	if (adchan->current_tx && adchan->current_tx->error) {
 		ret = -EIO;
-	else
+	} else if (adchan->lost && adchan->current_tx) {
+		struct admac_tx *tx = adchan->current_tx;
+
+		/* The rings went with the registers: start again from the last period reclaimed. */
+		tx->submitted_pos = tx->reclaimed_pos;
+		tx->nperiods_outstanding = 0;
+		adchan->nperiod_acks = 0;
+		admac_start_current_tx(adchan);
+	} else {
 		admac_start_chan(adchan);
+	}
 	spin_unlock_irqrestore(&adchan->lock, flags);
 
 	return ret;
@@ -1052,6 +1087,9 @@ static int admac_device_config(struct dma_chan *chan,
 		       | FIELD_PREP(CHAN_FIFOCTL_THRESHOLD, 0x18 * wordsize),
 		       ad->base + REG_CHAN_FIFOCTL(ad, adchan->no));
 
+	adchan->cfg = *config;
+	adchan->cfg_valid = true;
+
 	return 0;
 }
 
@@ -1081,8 +1119,36 @@ static int admac_runtime_resume(struct device *dev)
 	return 0;
 }
 
+/*
+ * A firmware-driven sleep, refused or not, takes the registers of a channel a
+ * client still holds (genpd gates the domain at noirq), and its client won't
+ * configure it again: only a new hw_params does that.
+ */
+static int __maybe_unused admac_resume_early(struct device *dev)
+{
+	struct admac_data *ad = dev_get_drvdata(dev);
+	unsigned long flags;
+	int i;
+
+	if (!pm_suspend_via_firmware())
+		return 0;
+
+	mutex_lock(&ad->cache_alloc_lock);
+	ad->ctl_programmed = false;
+	mutex_unlock(&ad->cache_alloc_lock);
+
+	for (i = 0; i < ad->nchannels; i++) {
+		spin_lock_irqsave(&ad->channels[i].lock, flags);
+		ad->channels[i].lost = true;
+		spin_unlock_irqrestore(&ad->channels[i].lock, flags);
+	}
+
+	return 0;
+}
+
 /* Allocated channels must stay powered, including paused cyclic transfers. */
 static const struct dev_pm_ops admac_pm_ops = {
+	LATE_SYSTEM_SLEEP_PM_OPS(NULL, admac_resume_early)
 	RUNTIME_PM_OPS(admac_runtime_suspend, admac_runtime_resume, NULL)
 };
 

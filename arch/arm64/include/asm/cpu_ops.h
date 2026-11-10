@@ -7,6 +7,7 @@
 
 #include <linux/init.h>
 #include <linux/threads.h>
+#include <linux/types.h>
 
 /**
  * struct cpu_operations - Callback operations for hotplugging CPUs.
@@ -45,6 +46,58 @@ struct cpu_operations {
 	int		(*cpu_kill)(unsigned int cpu);
 #endif
 };
+
+/**
+ * struct spin_table_power_ops - Platform control of parking spin-table CPUs
+ * (smp_spin_table.c).
+ *
+ * @cpu_stop:	Tell the hardware the calling CPU is stopping. The CPU keeps
+ *		running, and stays coherent, until @cpu_off.
+ * @cpu_off:	Power off the calling CPU, which must not return.
+ * @cpu_on:	Start a CPU that @cpu_off powered off, at its reset vector.
+ *
+ * Each takes the CPU's MPIDR hardware ID.
+ */
+struct spin_table_power_ops {
+	void	(*cpu_stop)(u64 mpidr);
+	void	(*cpu_off)(u64 mpidr);
+	int	(*cpu_on)(u64 mpidr);
+};
+
+#ifdef CONFIG_HOTPLUG_CPU
+int spin_table_set_power_ops(const struct spin_table_power_ops *ops);
+int spin_table_hold_parked(void);
+void spin_table_unhold_parked(void);
+int spin_table_stop_parked(void);
+void spin_table_release_stopped(void);
+void spin_table_stop_finished(void);
+bool spin_table_cpus_stuck(void);
+#else
+static inline int spin_table_hold_parked(void)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void spin_table_unhold_parked(void) {}
+
+static inline int spin_table_stop_parked(void)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void spin_table_release_stopped(void) {}
+static inline void spin_table_stop_finished(void) {}
+
+static inline int spin_table_set_power_ops(const struct spin_table_power_ops *ops)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline bool spin_table_cpus_stuck(void)
+{
+	return false;
+}
+#endif
 
 int __init init_cpu_ops(int cpu);
 extern const struct cpu_operations *get_cpu_ops(int cpu);

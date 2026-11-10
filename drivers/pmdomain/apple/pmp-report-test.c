@@ -12,6 +12,16 @@ static void pmp_range(u8 *table, u32 id, u32 base, u32 count)
 	put_unaligned_le32(count, table + 8);
 }
 
+static void pmp_request_word_replay(struct kunit *test)
+{
+	/* A request an entry withdrew stays off; one nobody here owns stays on. */
+	KUNIT_EXPECT_EQ(test, apple_pmp_request_word(0x31, 0x03, 0x02), 0x32ULL);
+	/* The found word can be empty: only the requests come back. */
+	KUNIT_EXPECT_EQ(test, apple_pmp_request_word(0, 0x03, 0x01), 0x01ULL);
+	/* Nothing requested, nothing known. */
+	KUNIT_EXPECT_EQ(test, apple_pmp_request_word(0x10, 0, 0), 0x10ULL);
+}
+
 static void pmp_ranges_t6030(struct kunit *test)
 {
 	u8 table[2 * PMP_PTD_RANGE_SIZE];
@@ -277,6 +287,7 @@ static void pmp_dvfs_words(struct kunit *test)
 
 static struct kunit_case apple_pmp_report_cases[] = {
 	KUNIT_CASE(pmp_ranges_t6030),
+	KUNIT_CASE(pmp_request_word_replay),
 	KUNIT_CASE(pmp_ranges_t8122),
 	KUNIT_CASE(pmp_ranges_t6031),
 	KUNIT_CASE(pmp_ranges_reject_bad_records),

@@ -1110,6 +1110,28 @@ impl Registry {
         }
         Ok(())
     }
+    /// No graph is being built or grown.
+    pub(in crate::g17) fn render_settled(&self) -> bool {
+        self.render
+            .entries
+            .iter()
+            .flatten()
+            .all(|entry| entry.preparing.is_none() && !entry.growing)
+    }
+
+    /// The firmware restarted with no power on the cores: nothing it was told about a pair through
+    /// their registers can be relied on, so the next command installs it again.
+    pub(in crate::g17) fn forget_render_registrations(&mut self) {
+        for entry in self.render.entries.iter_mut().flatten() {
+            if let Some(pair) = entry.pair.as_mut() {
+                pair.forget_registration();
+            }
+            if let Some(parked) = entry.parked.as_mut() {
+                parked.forget_registration();
+            }
+        }
+    }
+
     pub(in crate::g17) fn render_in_flight(&self) -> bool {
         self.render.entries.iter().flatten().any(|entry| {
             entry.pair.as_ref().map_or(
