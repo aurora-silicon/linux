@@ -38,13 +38,18 @@ pub(crate) fn explicit_dependency(board: &Board) -> u8 {
 }
 
 /// Dependency class of a compute kick's implicit parent (the previous kick of its queue) on
-/// `board`. With the counted forms ([`counted_forms`]) it is derived as the kick-queue encoder
-/// derives it: the compute class only for a command whose pipeline dependency type is 1, which
-/// only a late-evaluated wait sets, and class 1 otherwise, which holds the kick until its parent
-/// has completed. No DRM compute kick is a late-evaluated wait. Otherwise it is the pipelined
-/// class, with which a kick may start while its parent still runs.
-pub(crate) fn parent_dependency(board: &Board, pipelined: bool) -> u8 {
-    if pipelined || !counted_forms(board) { COMPUTE_PIPELINED_DEPENDENCY } else { 1 }
+/// `board`. With the counted forms ([`counted_forms`]) it is class 1, which holds the kick until
+/// its parent has completed. On boards whose explicit waits take the completion class
+/// ([`Board::completion_inputs`]) a parent the host has already retired (`parent_retired`) takes
+/// the pipelined class instead, as macOS's late-published M5 Pro kicks do: there is nothing left
+/// to hold for. Otherwise it is the pipelined class, with which a kick may start while its parent
+/// still runs.
+pub(crate) fn parent_dependency(board: &Board, parent_retired: bool) -> u8 {
+    if !counted_forms(board) || (parent_retired && board.completion_inputs()) {
+        COMPUTE_PIPELINED_DEPENDENCY
+    } else {
+        COMPLETION_DEPENDENCY
+    }
 }
 
 /// Whether compute kicks on `board` count their completion ordinal and hold for their parent:
@@ -111,18 +116,18 @@ pub(crate) const NORMAL_TUPLE: KickTuple =
 pub(crate) const QUALIFIED_TUPLE: KickTuple =
     KickTuple { preempt_state_offset: 0x1480, dispatch_base: 0x10c0_8860, auxiliary_control: 0 };
 
-/// The DRM compute tuple of `board` ([`Board::g17d_forms`]). Where explicit waits take the
-/// completion class ([`Board::completion_inputs`]) it is macOS's M5 Pro form: the J714
-/// preemption offset with the qualified dispatch base, and the auxiliary control set only when
-/// the kick's parent is pipelined.
-pub(crate) fn kick_tuple(board: &Board) -> KickTuple {
+/// The DRM compute tuple of `board` ([`Board::g17d_forms`]) for a kick whose parent takes class
+/// `parent_class`. Where explicit waits take the completion class ([`Board::completion_inputs`])
+/// it is macOS's M5 Pro form: the J714 preemption offset with the qualified dispatch base, and the
+/// auxiliary control set only when the kick's parent is pipelined.
+pub(crate) fn kick_tuple(board: &Board, parent_class: u8) -> KickTuple {
     if board.g17d_forms() {
         QUALIFIED_TUPLE
     } else if board.completion_inputs() {
         KickTuple {
             preempt_state_offset: NORMAL_TUPLE.preempt_state_offset,
             dispatch_base: QUALIFIED_TUPLE.dispatch_base,
-            auxiliary_control: u64::from(parent_dependency(board, false) == COMPUTE_PIPELINED_DEPENDENCY),
+            auxiliary_control: u64::from(parent_class == COMPUTE_PIPELINED_DEPENDENCY),
         }
     } else {
         NORMAL_TUPLE
