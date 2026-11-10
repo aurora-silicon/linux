@@ -70,102 +70,122 @@
 		opp01 {
 			opp-hz = /bits/ 64 <1260000000>;
 			opp-level = <1>;
+			opp-microwatt = <513000>;
 			clock-latency-ns = <7200>;
 		};
 		opp02 {
 			opp-hz = /bits/ 64 <1512000000>;
 			opp-level = <2>;
+			opp-microwatt = <715000>;
 			clock-latency-ns = <19000>;
 		};
 		opp03 {
 			opp-hz = /bits/ 64 <1800000000>;
 			opp-level = <3>;
+			opp-microwatt = <907500>;
 			clock-latency-ns = <20000>;
 		};
 		opp04 {
 			opp-hz = /bits/ 64 <2088000000>;
 			opp-level = <4>;
+			opp-microwatt = <1158200>;
 			clock-latency-ns = <22000>;
 		};
 		opp05 {
 			opp-hz = /bits/ 64 <2352000000>;
 			opp-level = <5>;
+			opp-microwatt = <1494500>;
 			clock-latency-ns = <30000>;
 		};
 		opp06 {
 			opp-hz = /bits/ 64 <2616000000>;
 			opp-level = <6>;
+			opp-microwatt = <1782600>;
 			clock-latency-ns = <34000>;
 		};
 		opp07 {
 			opp-hz = /bits/ 64 <2868000000>;
 			opp-level = <7>;
+			opp-microwatt = <2209600>;
 			clock-latency-ns = <37000>;
 		};
 		opp08 {
 			opp-hz = /bits/ 64 <3096000000>;
 			opp-level = <8>;
+			opp-microwatt = <2636700>;
 			clock-latency-ns = <38000>;
 		};
 		opp09 {
 			opp-hz = /bits/ 64 <3300000000>;
 			opp-level = <9>;
+			opp-microwatt = <3247200>;
 			clock-latency-ns = <40000>;
 		};
 		opp10 {
 			opp-hz = /bits/ 64 <3468000000>;
 			opp-level = <10>;
+			opp-microwatt = <3668700>;
 			clock-latency-ns = <41000>;
 		};
 		opp11 {
 			opp-hz = /bits/ 64 <3624000000>;
 			opp-level = <11>;
+			opp-microwatt = <4128200>;
 			clock-latency-ns = <43000>;
 		};
 		opp12 {
 			opp-hz = /bits/ 64 <3756000000>;
 			opp-level = <12>;
+			opp-microwatt = <4819300>;
 			clock-latency-ns = <44000>;
 		};
 		opp13 {
 			opp-hz = /bits/ 64 <3828000000>;
 			opp-level = <13>;
+			opp-microwatt = <4938100>;
 			clock-latency-ns = <45000>;
 		};
 		opp14 {
 			opp-hz = /bits/ 64 <3888000000>;
 			opp-level = <14>;
+			opp-microwatt = <5146800>;
 			clock-latency-ns = <46000>;
 		};
 		opp15 {
 			opp-hz = /bits/ 64 <3948000000>;
 			opp-level = <15>;
+			opp-microwatt = <5402600>;
 			clock-latency-ns = <47000>;
 		};
 		opp16 {
 			opp-hz = /bits/ 64 <3996000000>;
 			opp-level = <16>;
+			opp-microwatt = <5575900>;
 			clock-latency-ns = <48000>;
 		};
 		opp17 {
 			opp-hz = /bits/ 64 <4044000000>;
 			opp-level = <17>;
+			opp-microwatt = <5773400>;
 			clock-latency-ns = <49000>;
 		};
 		opp18 {
 			opp-hz = /bits/ 64 <4104000000>;
 			opp-level = <18>;
+			opp-microwatt = <5969200>;
 			clock-latency-ns = <50000>;
 		};
 		opp19 {
 			opp-hz = /bits/ 64 <4416000000>;
 			opp-level = <19>;
+			opp-microwatt = <8274900>;
 			clock-latency-ns = <55000>;
 			turbo-mode;
 		};
 		opp20 {
 			opp-hz = /bits/ 64 <4512000000>;
 			opp-level = <20>;
+			opp-microwatt = <9256900>;
 			clock-latency-ns = <56000>;
 			turbo-mode;
 		};
@@ -178,102 +198,122 @@
 		opp01 {
 			opp-hz = /bits/ 64 <1260000000>;
 			opp-level = <1>;
+			opp-microwatt = <561800>;
 			clock-latency-ns = <7200>;
 		};
 		opp02 {
 			opp-hz = /bits/ 64 <1512000000>;
 			opp-level = <2>;
+			opp-microwatt = <772500>;
 			clock-latency-ns = <19000>;
 		};
 		opp03 {
 			opp-hz = /bits/ 64 <1800000000>;
 			opp-level = <3>;
+			opp-microwatt = <988900>;
 			clock-latency-ns = <20000>;
 		};
 		opp04 {
 			opp-hz = /bits/ 64 <2088000000>;
 			opp-level = <4>;
+			opp-microwatt = <1302300>;
 			clock-latency-ns = <22000>;
 		};
 		opp05 {
 			opp-hz = /bits/ 64 <2352000000>;
 			opp-level = <5>;
+			opp-microwatt = <1644100>;
 			clock-latency-ns = <30000>;
 		};
 		opp06 {
 			opp-hz = /bits/ 64 <2616000000>;
 			opp-level = <6>;
+			opp-microwatt = <2003700>;
 			clock-latency-ns = <34000>;
 		};
 		opp07 {
 			opp-hz = /bits/ 64 <2868000000>;
 			opp-level = <7>;
+			opp-microwatt = <2349000>;
 			clock-latency-ns = <37000>;
 		};
 		opp08 {
 			opp-hz = /bits/ 64 <3096000000>;
 			opp-level = <8>;
+			opp-microwatt = <2723000>;
 			clock-latency-ns = <38000>;
 		};
 		opp09 {
 			opp-hz = /bits/ 64 <3300000000>;
 			opp-level = <9>;
+			opp-microwatt = <3333200>;
 			clock-latency-ns = <40000>;
 		};
 		opp10 {
 			opp-hz = /bits/ 64 <3468000000>;
 			opp-level = <10>;
+			opp-microwatt = <3711900>;
 			clock-latency-ns = <41000>;
 		};
 		opp11 {
 			opp-hz = /bits/ 64 <3624000000>;
 			opp-level = <11>;
+			opp-microwatt = <4129900>;
 			clock-latency-ns = <43000>;
 		};
 		opp12 {
 			opp-hz = /bits/ 64 <3756000000>;
 			opp-level = <12>;
+			opp-microwatt = <4666300>;
 			clock-latency-ns = <44000>;
 		};
 		opp13 {
 			opp-hz = /bits/ 64 <3828000000>;
 			opp-level = <13>;
+			opp-microwatt = <4827300>;
 			clock-latency-ns = <45000>;
 		};
 		opp14 {
 			opp-hz = /bits/ 64 <3888000000>;
 			opp-level = <14>;
+			opp-microwatt = <5028800>;
 			clock-latency-ns = <46000>;
 		};
 		opp15 {
 			opp-hz = /bits/ 64 <3948000000>;
 			opp-level = <15>;
+			opp-microwatt = <5220000>;
 			clock-latency-ns = <47000>;
 		};
 		opp16 {
 			opp-hz = /bits/ 64 <3996000000>;
 			opp-level = <16>;
+			opp-microwatt = <5306500>;
 			clock-latency-ns = <48000>;
 		};
 		opp17 {
 			opp-hz = /bits/ 64 <4044000000>;
 			opp-level = <17>;
+			opp-microwatt = <5618900>;
 			clock-latency-ns = <49000>;
 		};
 		opp18 {
 			opp-hz = /bits/ 64 <4104000000>;
 			opp-level = <18>;
+			opp-microwatt = <5843100>;
 			clock-latency-ns = <50000>;
 		};
 		opp19 {
 			opp-hz = /bits/ 64 <4416000000>;
 			opp-level = <19>;
+			opp-microwatt = <8075300>;
 			clock-latency-ns = <55000>;
 			turbo-mode;
 		};
 		opp20 {
 			opp-hz = /bits/ 64 <4512000000>;
 			opp-level = <20>;
+			opp-microwatt = <8949200>;
 			clock-latency-ns = <56000>;
 			turbo-mode;
 		};
@@ -368,4 +408,40 @@
 	      <0x2 0x2a040000 0x0 0x4000>,
 	      <0x2 0x2a080000 0x0 0x4000>,
 	      <0x2 0x2a0c0000 0x0 0x4000>;
+};
+
+/*
+ * CPU energy model: the T6040 one (t6040.dtsi), measured on a J616s, which
+ * has the same E and P cores. Without opp-microwatt no energy model
+ * registers, power_allocator has no power actors and the CPU thermal zones
+ * never throttle. The P states T6040 lacks (3828, 3888, 3948 MHz) are
+ * interpolated in frequency between its neighbours.
+ */
+
+&{/opp-table-e/opp01} {
+	opp-microwatt = <81900>;
+};
+
+&{/opp-table-e/opp02} {
+	opp-microwatt = <133100>;
+};
+
+&{/opp-table-e/opp03} {
+	opp-microwatt = <209400>;
+};
+
+&{/opp-table-e/opp04} {
+	opp-microwatt = <301400>;
+};
+
+&{/opp-table-e/opp05} {
+	opp-microwatt = <383900>;
+};
+
+&{/opp-table-e/opp06} {
+	opp-microwatt = <478500>;
+};
+
+&{/opp-table-e/opp07} {
+	opp-microwatt = <531000>;
 };
