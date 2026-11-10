@@ -43,8 +43,34 @@ static void ave_lfs_ref_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ave_lfs_ref_size(c->width, c->height, true, 2), c->hevc_t8140);
 }
 
+static void ave_6070_working_sizes_test(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, ave_6070_colocated_size(1920, 1080, false), 0xff000U);
+	KUNIT_EXPECT_EQ(test, ave_6070_colocated_size(1920, 1080, true), 0x1fe00U);
+	KUNIT_EXPECT_EQ(test, ave_6070_lowres_result_size(1920, 1080), 0x20200U);
+	KUNIT_EXPECT_EQ(test, ave_6070_src_neighbor_info_size(1920, 1080, false),
+			0x8000U);
+	KUNIT_EXPECT_EQ(test, ave_6070_src_neighbor_pixel_size(1920, 1080, false),
+			0x20000U);
+	KUNIT_EXPECT_EQ(test, ave_6070_src_neighbor_info_size(1920, 1080, true),
+			0x30000U);
+	KUNIT_EXPECT_EQ(test, ave_6070_src_neighbor_pixel_size(1920, 1080, true),
+			0xb4000U);
+	KUNIT_EXPECT_EQ(test, ave_6070_src_neighbor_data_size(1920, false), 0x4000U);
+	KUNIT_EXPECT_EQ(test, ave_6070_src_neighbor_fw_size(1920, false), 0x4000U);
+	KUNIT_EXPECT_EQ(test, ave_6070_entropy_size(1920, 1080, false), 0x1fe000U);
+	KUNIT_EXPECT_EQ(test, ave_6070_entropy_size(1920, 1080, true), 0x23dc00U);
+	KUNIT_EXPECT_EQ(test, ave_6070_entropy_aux_size(1080), 0x480U);
+	KUNIT_EXPECT_EQ(test, ave_6070_mb_input_size(1920, 1080), 0x10000U);
+
+	/* Non-aligned dimensions exercise the formula rather than a size table. */
+	KUNIT_EXPECT_EQ(test, ave_6070_colocated_size(1922, 1090, false), 0x104e80U);
+	KUNIT_EXPECT_EQ(test, ave_6070_colocated_size(1922, 1090, true), 0x22500U);
+}
+
 static struct kunit_case ave_sizes_tests[] = {
 	KUNIT_CASE_PARAM(ave_lfs_ref_test, ave_size_gen_params),
+	KUNIT_CASE(ave_6070_working_sizes_test),
 	{ }
 };
 
