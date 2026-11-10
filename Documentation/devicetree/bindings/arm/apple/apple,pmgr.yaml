@@ -53,6 +53,8 @@ properties:
   reg:
     maxItems: 1
 
+  nonposted-mmio: true
+
   "#address-cells":
     const: 1
 

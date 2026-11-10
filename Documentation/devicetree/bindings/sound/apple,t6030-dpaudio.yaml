@@ -47,6 +47,8 @@ properties:
   power-domains:
     maxItems: 1
 
+  post-init-providers: true
+
   ports:
     $ref: /schemas/graph.yaml#/properties/ports
     properties:
