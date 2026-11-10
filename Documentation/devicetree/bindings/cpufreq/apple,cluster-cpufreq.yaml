@@ -80,8 +80,9 @@ properties:
     $ref: /schemas/types.yaml#/definitions/phandle-array
     description: |
       PMP report region and the cluster's SOC-DEV-DVFS entry. The entry
-      identifies the firmware SOC-device constraint target; cpufreq queues
-      DCS and SoC-fabric commands to the PMP without waiting in fast-switch.
+      identifies the host-published SOC-device constraint target; cpufreq
+      queues an irq_work hop and publishes the max-aggregated DCS and SoC
+      request with one PTD store outside fast-switch.
     items:
       - items:
           - description: PMP report region
