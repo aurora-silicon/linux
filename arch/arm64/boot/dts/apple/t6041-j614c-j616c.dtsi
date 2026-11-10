@@ -1763,6 +1763,13 @@
 						remote-endpoint = <&dwc3_0_hs>;
 					};
 				};
+
+				port@1 {
+					reg = <1>;
+					typec0_connector_ss: endpoint {
+						remote-endpoint = <&atcphy0_ss>;
+					};
+				};
 			};
 		};
 	};
@@ -1803,6 +1810,13 @@
 						remote-endpoint = <&dwc3_1_hs>;
 					};
 				};
+
+				port@1 {
+					reg = <1>;
+					typec1_connector_ss: endpoint {
+						remote-endpoint = <&atcphy1_ss>;
+					};
+				};
 			};
 		};
 	};
@@ -1836,14 +1850,46 @@
 						remote-endpoint = <&dwc3_2_hs>;
 					};
 				};
+
+				port@1 {
+					reg = <1>;
+					typec2_connector_ss: endpoint {
+						remote-endpoint = <&atcphy2_ss>;
+					};
+				};
 			};
 		};
 	};
 };
 
-/* The left-back port, USB 2 as the other two. */
+/*
+ * USB 3 on the three USB-C ports. The loader appends the PHY and controller
+ * tunables from the ADT, as on the M4 Pro, and disables a port it can't tune.
+ */
 &atcphy0 {
-	apple,tunable-usb2-host = <0x8 0x7003 0x3>;
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			atcphy0_ss: endpoint {
+				remote-endpoint = <&typec0_connector_ss>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			atcphy0_usb3: endpoint {
+				remote-endpoint = <&dwc3_0_ss>;
+			};
+		};
+	};
+};
+
+&atcphy0_mbox {
 	status = "okay";
 };
 
@@ -1856,15 +1902,6 @@
 };
 
 &dwc3_0 {
-	maximum-speed = "high-speed";
-	phys = <&atcphy0 PHY_TYPE_USB2>;
-	phy-names = "usb2-phy";
-	apple,tunable-gbl-host = <0x4 0x0001ef00 0x00002f00>, <0x1c 0x00000100 0x0>,
-		<0x2c 0x000a07ff 0x000800c8>, <0x100 0x02000100 0x02000100>,
-		<0x504 0x00001000 0x0>, <0x528 0xff0000ff 0x06000006>,
-		<0x52c 0xff0000ff 0x08000008>, <0x538 0x00000800 0x00000800>,
-		<0x580 0xffffffff 0x6f000006>;
-	apple,tunable-cfg-host = <0x20 0xff 0x1b>;
 	status = "okay";
 
 	ports {
@@ -1877,11 +1914,40 @@
 				remote-endpoint = <&typec0_connector_hs>;
 			};
 		};
+
+		port@1 {
+			reg = <1>;
+			dwc3_0_ss: endpoint {
+				remote-endpoint = <&atcphy0_usb3>;
+			};
+		};
 	};
 };
 
 &atcphy1 {
-	apple,tunable-usb2-host = <0x8 0x7003 0x3>;
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			atcphy1_ss: endpoint {
+				remote-endpoint = <&typec1_connector_ss>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			atcphy1_usb3: endpoint {
+				remote-endpoint = <&dwc3_1_ss>;
+			};
+		};
+	};
+};
+
+&atcphy1_mbox {
 	status = "okay";
 };
 
@@ -1894,15 +1960,6 @@
 };
 
 &dwc3_1 {
-	maximum-speed = "high-speed";
-	phys = <&atcphy1 PHY_TYPE_USB2>;
-	phy-names = "usb2-phy";
-	apple,tunable-gbl-host = <0x4 0x0001ef00 0x00002f00>, <0x1c 0x00000100 0x0>,
-		<0x2c 0x000a07ff 0x000800c8>, <0x100 0x02000100 0x02000100>,
-		<0x504 0x00001000 0x0>, <0x528 0xff0000ff 0x06000006>,
-		<0x52c 0xff0000ff 0x08000008>, <0x538 0x00000800 0x00000800>,
-		<0x580 0xffffffff 0x6f000006>;
-	apple,tunable-cfg-host = <0x20 0xff 0x1b>;
 	status = "okay";
 
 	ports {
@@ -1915,11 +1972,40 @@
 				remote-endpoint = <&typec1_connector_hs>;
 			};
 		};
+
+		port@1 {
+			reg = <1>;
+			dwc3_1_ss: endpoint {
+				remote-endpoint = <&atcphy1_usb3>;
+			};
+		};
 	};
 };
 
 &atcphy2 {
-	apple,tunable-usb2-host = <0x8 0x7003 0x3>;
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			atcphy2_ss: endpoint {
+				remote-endpoint = <&typec2_connector_ss>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			atcphy2_usb3: endpoint {
+				remote-endpoint = <&dwc3_2_ss>;
+			};
+		};
+	};
+};
+
+&atcphy2_mbox {
 	status = "okay";
 };
 
@@ -1932,15 +2018,6 @@
 };
 
 &dwc3_2 {
-	maximum-speed = "high-speed";
-	phys = <&atcphy2 PHY_TYPE_USB2>;
-	phy-names = "usb2-phy";
-	apple,tunable-gbl-host = <0x4 0x0001ef00 0x00002f00>, <0x1c 0x00000100 0x0>,
-		<0x2c 0x000a07ff 0x000800c8>, <0x100 0x02000100 0x02000100>,
-		<0x504 0x00001000 0x0>, <0x528 0xff0000ff 0x06000006>,
-		<0x52c 0xff0000ff 0x08000008>, <0x538 0x00000800 0x00000800>,
-		<0x580 0xffffffff 0x6f000006>;
-	apple,tunable-cfg-host = <0x20 0xff 0x1b>;
 	status = "okay";
 
 	ports {
@@ -1951,6 +2028,13 @@
 			reg = <0>;
 			dwc3_2_hs: endpoint {
 				remote-endpoint = <&typec2_connector_hs>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			dwc3_2_ss: endpoint {
+				remote-endpoint = <&atcphy2_usb3>;
 			};
 		};
 	};
