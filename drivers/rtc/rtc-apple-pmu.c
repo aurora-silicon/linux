@@ -8,6 +8,7 @@
 #include <linux/nvmem-consumer.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm_wakeirq.h>
 #include <linux/regmap.h>
 #include <linux/rtc.h>
 #include <linux/slab.h>
@@ -450,6 +451,7 @@ static void apple_pmu_rtc_release(void *context)
 	struct apple_pmu_rtc *rtc = dev_get_drvdata(dev);
 
 	disable_irq(rtc->interrupt);
+	dev_pm_clear_wake_irq(dev);
 	mutex_lock(&rtc->transaction);
 	if (apple_pmu_rtc_stop_alarm(rtc))
 		dev_err(dev, "cannot disable RTC alarm on removal\n");
@@ -493,14 +495,17 @@ static int apple_pmu_rtc_probe(struct platform_device *pdev)
 	if (error)
 		return error;
 	/*
-	 * This interrupt remains live during retained-power s2idle. The
-	 * thread uses the parent PMIC's SPMI regmap to acknowledge the alarm.
-	 * Off-domain wake routing is not established by this driver.
+	 * Let the IRQ core wake the system before the thread acknowledges the
+	 * alarm over the parent PMIC's SPMI regmap. Off-domain wake routing is
+	 * still supplied by the platform sleep implementation.
 	 */
 	error = devm_request_threaded_irq(dev, rtc->interrupt, NULL,
 					  apple_pmu_rtc_interrupt,
-					  IRQF_NO_AUTOEN | IRQF_NO_SUSPEND | IRQF_ONESHOT,
+					  IRQF_NO_AUTOEN | IRQF_ONESHOT,
 					  dev_name(dev), dev);
+	if (error)
+		goto disable_wakeup;
+	error = dev_pm_set_wake_irq(dev, rtc->interrupt);
 	if (error)
 		goto disable_wakeup;
 	error = apple_pmu_rtc_init_alarm(rtc);
@@ -516,6 +521,7 @@ static int apple_pmu_rtc_probe(struct platform_device *pdev)
 	return 0;
 
 disable_wakeup:
+	dev_pm_clear_wake_irq(dev);
 	device_init_wakeup(dev, false);
 	return error;
 }
