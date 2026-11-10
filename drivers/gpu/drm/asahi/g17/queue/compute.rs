@@ -524,6 +524,10 @@ struct Active {
     /// not by the recovery's own attribution, or a replay of spared work, which runs again from
     /// the start. A later fault report on the queue makes it guilty.
     spared_as_dropped: bool,
+    /// The command retired on its completion record without a completion stamp and its client
+    /// has its result, but the firmware may still store the stamp through its descriptor: the
+    /// descriptor stays held, and the command at the front, until the stamp covers it.
+    stamps_owed: bool,
 }
 struct Previous<B = Binding, C = Arc<Context>> {
     binding: Option<B>,
@@ -1150,6 +1154,15 @@ impl Queue {
                 if recovery_state != 0 {
                     return Err(EAGAIN);
                 }
+                if front.stamps_owed {
+                    // Already reported: only the descriptor waits for the stamp.
+                    let stamp = self.graph.stamp()?;
+                    return if retirement::stamp_covers(stamp, ticket.kick) {
+                        Ok(Some(([0; 2], false)))
+                    } else {
+                        Err(EAGAIN)
+                    };
+                }
                 let recordless = if epoch != ticket.epoch {
                     crossed = true;
                     Recordless::CrossedRecovery
@@ -1186,7 +1199,8 @@ impl Queue {
                     next_end,
                     record_aged && !self.graph.m5,
                 )?;
-                if timestamps.is_some() && !retirement::stamp_covers(stamp, ticket.kick) {
+                let stampless = !retirement::stamp_covers(stamp, ticket.kick);
+                if timestamps.is_some() && stampless {
                     retirement::note_stampless(self.qid(), ticket.kick);
                 }
                 if timestamps.is_some()
@@ -1196,11 +1210,22 @@ impl Queue {
                 {
                     return Err(EIO);
                 }
-                Ok(timestamps)
+                Ok(timestamps.map(|timestamps| (timestamps, stampless)))
             })();
             oldest = false;
             match result {
-                Ok(Some(timestamps)) => {
+                Ok(Some((_, _))) if self.active.front().is_some_and(|front| front.stamps_owed) => {
+                    // The stamp now covers the held command: release its descriptor.
+                    self.submitted = self.submitted.checked_sub(1).ok_or(EIO)?;
+                    self.active.pop().ok_or(EIO)?;
+                    drop(self.previous.take());
+                    self.retirement_ready = self.active.len == 0;
+                    if self.released && self.retirement_ready {
+                        self.owner = None;
+                        self.released_at = now_ns();
+                    }
+                }
+                Ok(Some((timestamps, stampless))) => {
                     let submitted = self.submitted.checked_sub(1).ok_or(EIO)?;
                     if front.qos_pending {
                         complete_qos(self.qos_owner())?;
@@ -1230,6 +1255,18 @@ impl Queue {
                         Err(error) => Deferred::Retired(completion, Err(error)),
                     })?;
                     self.retire_pending = false;
+                    if stampless {
+                        // A completion record is no witness that the firmware is done with the
+                        // descriptor: it can still store the stamp through it. Keep the command
+                        // (and its descriptor) at the front until the stamp covers it.
+                        let _ = submitted;
+                        let front = self.active.iter_mut().next().ok_or(EIO)?;
+                        front.stamps_owed = true;
+                        if front.observed.is_some() {
+                            self.last_end = self.last_end.max(timestamps[1]);
+                        }
+                        break;
+                    }
                     self.submitted = submitted;
                     let active = self.active.pop().ok_or(EIO)?;
                     if active.observed.is_some() {
@@ -2745,6 +2782,7 @@ impl Queue {
                 qos_pending: false,
                 // A replay keeps its spared class: its own fault must still make it guilty.
                 spared_as_dropped: packet.completion.spared(),
+                stamps_owed: false,
             })
             .map_err(|_| EBUSY)?;
         self.retirement_ready = false;
