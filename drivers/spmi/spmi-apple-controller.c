@@ -473,6 +473,12 @@ static void apple_spmi_irq_handler(struct irq_desc *desc)
 	}
 	if (!handled && !held)
 		handle_bad_irq(desc);
+	/*
+	 * The acks are posted writes: let them reach the controller before the parent is
+	 * unmasked, or it fires again for what was just cleared.
+	 */
+	if (handled)
+		readl(spmi->regs + SPMI_IRQ_ACK_BASE);
 	chained_irq_exit(chip, desc);
 }
 
