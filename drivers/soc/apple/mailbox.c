@@ -704,7 +704,8 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 		 * it unmasked for them. The handler masks it when it fires,
 		 * and removal masks it otherwise.
 		 */
-		t = wait_for_completion_interruptible_timeout(
+		/* Not for the freezer's signal: a message half sent can break a handshake. */
+		t = wait_for_completion_killable_timeout(
 			&mbox->tx_empty,
 			min(remaining, msecs_to_jiffies(APPLE_MBOX_TX_RECHECK_MS)));
 		if (t < 0)
