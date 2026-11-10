@@ -69,7 +69,7 @@ struct Cache;
 impl Cache {fn lock(&self)->Option<()>{None}}
 struct SepData {machine_refkey:Cache,creates:Cell<usize>}
 impl SepData {
- fn sks_create_refkey(&self,_:u32,_:&[u8])->Option<KVec<u8>>{self.creates.set(self.creates.get()+1);None}
+ fn sks_create_refkey(&self,_:u32,_:&[u8],_:Option<&[u8]>)->Option<KVec<u8>>{self.creates.set(self.creates.get()+1);None}
  fn cache_machine_refkey(&self,_:KVec<u8>)->bool{true}
  METHOD
 }
