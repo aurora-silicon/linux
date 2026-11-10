@@ -379,6 +379,10 @@
 	};
 };
 
+&cpuidle {
+	status = "okay";
+};
+
 &cpufreq_e {
 	/delete-property/ apple,fast-die-effort;
 };
