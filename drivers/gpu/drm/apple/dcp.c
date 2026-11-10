@@ -9394,6 +9394,7 @@ static int dcp_t6041_s2r_stop(struct apple_dcp *dcp)
 {
 	void __iomem *control = dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL;
 	u32 status, id = dcp_s2r_mark_id(dcp);
+	bool idle;
 	int ret;
 
 	apple_sleep_bringup_mark(DCP_S2R_MARK(id, 1));
@@ -9429,6 +9430,18 @@ static int dcp_t6041_s2r_stop(struct apple_dcp *dcp)
 	apple_sleep_bringup_mark(DCP_S2R_MARK(id, 4));
 	dcp_sleep(dcp);
 	apple_sleep_bringup_mark(DCP_S2R_MARK(id, 5));
+	/*
+	 * dcp_sleep() only warns when set_power_state(0) or a callback goes unanswered.
+	 * A firmware still waiting on a call is stuck there after the warm restart and
+	 * never lights the panel again: refuse the sleep instead.
+	 */
+	if (!READ_ONCE(dcp->crashed) &&
+	    read_poll_timeout(iomfb_channels_idle, idle, idle, 1000, 100000, false, dcp))
+		dev_err(dcp->dev, "calls in flight after the display sleep\n");
+	if (READ_ONCE(dcp->crashed) || !iomfb_channels_idle(dcp)) {
+		dev_err(dcp->dev, "the display sleep did not complete, the display stays off\n");
+		goto lost;
+	}
 	ret = iomfb_s2r_500_v26_6_desktop(dcp);
 	apple_sleep_bringup_mark(DCP_S2R_MARK(id, 6));
 	if (ret) {
