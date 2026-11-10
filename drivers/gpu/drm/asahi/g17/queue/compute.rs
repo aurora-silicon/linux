@@ -2408,7 +2408,17 @@ impl Graph {
         Ok(object.gpu_va() + start as u64)
     }
     fn append(&self, expected: u32, address: u64, before_publish: impl FnOnce()) -> Result<u32> {
-        let cursors = self.cursors()?;
+        self.append_to(self.cursors()?, expected, address, before_publish)
+    }
+    /// Appends against `cursors`: a fresh read, or an M5 publication's snapshot whose
+    /// producer the publication advanced itself (see `publish_with_native_waits`).
+    fn append_to(
+        &self,
+        cursors: Cursors,
+        expected: u32,
+        address: u64,
+        before_publish: impl FnOnce(),
+    ) -> Result<u32> {
         if cursors.producer != expected
             || cursors.count != ITEM_RING_ENTRIES
             || expected >= ITEM_RING_ENTRIES
@@ -2777,7 +2787,8 @@ impl Queue {
                         self.pool.cancel_unpublished(target)?; Err(error)
                     })?;
                 self.active.back_mut().ok_or(EIO)?.qos_pending = true;
-                producer = self.graph.append(cursors.producer, config_va.ok_or(EINVAL)?,
+                // `cursors` is this publication's snapshot: no second read of the ring.
+                producer = self.graph.append_to(cursors, cursors.producer, config_va.ok_or(EINVAL)?,
                     || packet.mark_published())
                     .or_else(|error| {
                         self.pool.cancel_unpublished(target)?;
@@ -2878,7 +2889,13 @@ impl Queue {
                 self.graph.record(record_slot, ANNOUNCE, 0x40,
                     crate::g17::fw::m5::queue::notification(qid, kick_timestamp)?)?
             } else { self.graph.record(record_slot, ANNOUNCE, 0x40, announce)? };
-            producer = self.graph.append(producer, announce_va, || {})?;
+            producer = match snapshot {
+                // The snapshot's consumer only lags the firmware's, and the free-room check
+                // above covered both M5 items; the producer is the one this publication set.
+                Some(snapshot) => self.graph.append_to(Cursors { producer, ..snapshot }, producer,
+                    announce_va, || {})?,
+                None => self.graph.append(producer, announce_va, || {})?,
+            };
             fence(Ordering::SeqCst);
             if entry_signal && !self.graph.m5 {
                 let predecessor_va =
