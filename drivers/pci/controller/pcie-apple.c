@@ -40,6 +40,7 @@
 #include <linux/rcupdate.h>
 #include <linux/reset.h>
 #include <linux/soc/apple/dart.h>
+#include <linux/soc/apple/dart-cio.h>
 #include <linux/soc/apple/dart-sleep.h>
 #include <linux/soc/apple/radio-sleep.h>
 #include <linux/soc/apple/sleep.h>
@@ -72,6 +73,11 @@ MODULE_PARM_DESC(s2idle_keep_link, "Keep tunneled links up through suspend-to-id
 /* S2R bring-up on the Air, where nothing drives the radio yet. */
 static bool bringup_no_radio_refuse;
 module_param(bringup_no_radio_refuse, bool, 0644);
+
+/* Opt-in until the NHI, PHY and DART power cycle is qualified together. */
+static bool cio_s2r;
+module_param(cio_s2r, bool, 0400);
+MODULE_PARM_DESC(cio_s2r, "Enable NHI-owned J713 PCIe-C system sleep");
 
 static int link_up_timeout = 500;
 /* Fundamental resets of a conventional port whose endpoint does not train. */
@@ -506,6 +512,10 @@ struct apple_pcie {
 	struct reset_control	*reset;
 	u16			managed_sids;
 	struct apple_radio_sleep *radio;
+	struct apple_dart_cio *cio_dart;
+	/* orders cio_changed against config cycles already past map_bus() */
+	raw_spinlock_t cio_cfg_lock;
+	bool cio_prepared, cio_changed, cio_stopped, cio_port_reset, cio_lost;
 	unsigned int radio_writers;
 	bool radio_closed;
 	bool			neo_config_ready;
@@ -3409,6 +3419,8 @@ static void __iomem *apple_pcie_map_bus(struct pci_bus *bus,
 	struct apple_pcie *pcie = apple_pcie_lookup(cfg->parent);
 	struct apple_pcie_port *port;
 
+	if (READ_ONCE(pcie->cio_changed))
+		return NULL;
 	if (!apple_radio_config_allowed(pcie))
 		return NULL;
 	if (pcie->hw->adopt_link) {
@@ -3457,15 +3469,39 @@ static void __iomem *apple_pcie_map_bus(struct pci_bus *bus,
 	return NULL;
 }
 
+static int apple_pcie_config_read(struct pci_bus *bus, unsigned int devfn,
+				  int where, int size, u32 *val)
+{
+	struct pci_config_window *cfg = bus->sysdata;
+	struct apple_pcie *pcie = apple_pcie_lookup(cfg->parent);
+	unsigned long flags;
+	int ret;
+
+	if (!pcie || !pcie->cio_dart)
+		return pci_generic_config_read(bus, devfn, where, size, val);
+	/* A deep-sleep stop closes config space under this lock. */
+	raw_spin_lock_irqsave(&pcie->cio_cfg_lock, flags);
+	ret = pci_generic_config_read(bus, devfn, where, size, val);
+	raw_spin_unlock_irqrestore(&pcie->cio_cfg_lock, flags);
+	return ret;
+}
+
 static int apple_pcie_config_write(struct pci_bus *bus, unsigned int devfn,
 				   int where, int size, u32 val)
 {
 	struct pci_config_window *cfg = bus->sysdata;
 	struct apple_pcie *pcie = apple_pcie_lookup(cfg->parent);
 	struct apple_pcie_port *port;
+	unsigned long flags;
 	int ret;
 
-	ret = pci_generic_config_write(bus, devfn, where, size, val);
+	if (pcie && pcie->cio_dart) {
+		raw_spin_lock_irqsave(&pcie->cio_cfg_lock, flags);
+		ret = pci_generic_config_write(bus, devfn, where, size, val);
+		raw_spin_unlock_irqrestore(&pcie->cio_cfg_lock, flags);
+	} else {
+		ret = pci_generic_config_write(bus, devfn, where, size, val);
+	}
 	if (ret || !pcie)
 		return ret;
 	if (bus->number != cfg->busr.start || devfn)
@@ -3542,7 +3578,7 @@ static const struct pci_ecam_ops apple_pcie_cfg_ecam_ops = {
 	.pci_ops	= {
 		.add_bus	= apple_pcie_add_bus,
 		.map_bus	= apple_pcie_map_bus,
-		.read		= pci_generic_config_read,
+		.read		= apple_pcie_config_read,
 		.write		= apple_pcie_config_write,
 	}
 };
@@ -3805,7 +3841,12 @@ static int apple_pcie_tunnel_add_links(struct apple_pcie *pcie)
 		return dev_err_probe(pcie->dev, -EPROBE_DEFER,
 				     "PCIe-C DART device is not ready\n");
 
-	ret = apple_pcie_tunnel_add_link(pcie, &dart_pdev->dev, pcie->dev);
+	raw_spin_lock_init(&pcie->cio_cfg_lock);
+	if (cio_s2r && pcie->hw == &t8132_pciec_hw &&
+	    of_machine_is_compatible("apple,j713"))
+		ret = apple_dart_cio_bind(pcie->dev, &dart_pdev->dev, &pcie->cio_dart);
+	else
+		ret = apple_pcie_tunnel_add_link(pcie, &dart_pdev->dev, pcie->dev);
 	put_device(&dart_pdev->dev);
 	if (ret)
 		return dev_err_probe(pcie->dev, ret,
@@ -5220,6 +5261,8 @@ static bool apple_pcie_keep_link(struct apple_pcie *pcie)
 	return false;
 }
 
+#include "pcie-apple-cio.c"
+
 static void apple_pcie_stop_for_sleep(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
@@ -5317,6 +5360,11 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
 
+	if (pcie->cio_prepared)
+		return apple_pcie_cio_suspend(pcie);
+	/* The reversed DART link is safe only with retained clocks or native PM. */
+	if (pcie->cio_dart && (!pm_suspend_no_platform() || !s2idle_keep_link))
+		return -EBUSY;
 	if (pcie->neo_sleep_armed) {
 		struct apple_pcie_port *port;
 
@@ -5361,8 +5409,11 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 		return 0;
 	pcie->reset_on_resume = false;
 	pcie->link_kept = apple_pcie_keep_link(pcie);
-	if (!pcie->link_kept)
+	if (!pcie->link_kept) {
+		if (pcie->cio_dart)
+			return -EBUSY;
 		apple_pcie_stop_for_sleep(dev);
+	}
 	return 0;
 }
 
@@ -5731,6 +5782,21 @@ static int apple_pcie_resume_noirq(struct device *dev)
 	struct apple_pcie_port *port;
 	int ret;
 
+	if (pcie->cio_prepared) {
+		ret = apple_pcie_cio_resume(pcie);
+		if (!ret)
+			return 0;
+		/*
+		 * A dock that left or lost power during the sleep. End like a
+		 * surprise removal: the port stays stopped and config space
+		 * closed, and the hierarchy is removed with the tunnel after
+		 * resume. The NHI still ends the DART transaction.
+		 */
+		dev_err(dev, "PCIe-C not back after deep sleep: %d\n", ret);
+		pcie->resume_failed = true;
+		apple_pcie_tunnel_hierarchy_gone(dev);
+		return ret;
+	}
 	if (pcie->managed_sids)
 		return apple_radio_resume_noirq(pcie);
 	if (pcie->neo_sleep_armed)
@@ -5818,8 +5884,26 @@ failed:
 	return ret;
 }
 
+static int apple_pcie_prepare(struct device *dev)
+{
+	struct apple_pcie *pcie = apple_pcie_lookup(dev);
+
+	/*
+	 * A host-owned PCIe-C DART sleeps only inside the NHI's deep-sleep
+	 * transaction, prepared before this, or with a kept s2idle link.
+	 * Refuse anything else now, before other devices suspend.
+	 */
+	if (pcie && pcie->cio_dart && !pcie->cio_prepared &&
+	    pm_suspend_target_state != PM_SUSPEND_ON &&
+	    (!pm_suspend_no_platform() || !s2idle_keep_link)) {
+		dev_warn(dev, "no CIO sleep transaction from the NHI; refusing sleep\n");
+		return -EBUSY;
+	}
+	return apple_radio_prepare(dev);
+}
+
 static const struct dev_pm_ops apple_pcie_pm_ops = {
-	.prepare = apple_radio_prepare,
+	.prepare = apple_pcie_prepare,
 	.complete = apple_radio_complete,
 	.suspend_noirq = apple_pcie_suspend_noirq,
 	.resume_noirq = apple_pcie_resume_noirq,
