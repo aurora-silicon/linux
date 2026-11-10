@@ -177,6 +177,8 @@
 #define T6040_CPU_MSG_POWER_DOWN	0x0100000000000000ULL
 
 #define T6040_RECOVERY_RETRIES		1
+#define T6040_RECOVERY_PM_RETRIES	5
+#define T6040_RECOVERY_PM_BACKOFF_US	2000
 /* DP's power-on waits this long for the wake of a host kept through a sleep */
 #define T6040_SLEEP_DP_WAIT_MS		2000
 
@@ -225,6 +227,23 @@ static void t6040_recovery_complete(struct t6040_recovery_state *state)
 static void __maybe_unused t6040_recovery_power_lost(struct t6040_recovery_state *state)
 {
 	state->cycle_pending = false;
+}
+
+enum t6040_recovery_pm_action {
+	T6040_RECOVERY_PM_SUSPEND,
+	T6040_RECOVERY_PM_RETRY,
+	T6040_RECOVERY_PM_FALLBACK,
+};
+
+static enum t6040_recovery_pm_action
+t6040_recovery_pm_action(int usage_count, int child_count,
+			 unsigned int attempt)
+{
+	if (!usage_count && !child_count)
+		return T6040_RECOVERY_PM_SUSPEND;
+	if (attempt < T6040_RECOVERY_PM_RETRIES)
+		return T6040_RECOVERY_PM_RETRY;
+	return T6040_RECOVERY_PM_FALLBACK;
 }
 
 enum t6040_usb3_region {
@@ -904,6 +923,62 @@ static int t6040_common_dp_force_resume(struct t6040_usb2_phy *tphy)
 }
 
 /*
+ * The RTKit transport owns one phymxwrap runtime reference while its mailbox
+ * is started. apple_rtkit_free() releases it before this function runs. Give
+ * an unrelated user or active child a bounded interval to become idle, but do
+ * not steal its reference: recovery can still make a clean firmware start
+ * without cycling a domain which is legitimately shared.
+ *
+ * Return 0 after a real suspend, 1 when the caller should use that normal-start
+ * fallback, and a negative error for a provider failure unrelated to a holder.
+ */
+static int t6040_usb3_suspend_mbox(struct t6040_usb2_phy *tphy)
+{
+	struct device *dev = tphy->mbox_dev;
+	unsigned int attempt;
+	int children, ret = -EBUSY, usage;
+
+	for (attempt = 0; attempt <= T6040_RECOVERY_PM_RETRIES; attempt++) {
+		enum t6040_recovery_pm_action action;
+
+		pm_runtime_barrier(dev);
+		usage = atomic_read(&dev->power.usage_count);
+		children = atomic_read(&dev->power.child_count);
+		dev_dbg(tphy->dev,
+			"USB3: phymxwrap recovery attempt %u: usage_count=%d child_count=%d\n",
+			attempt, usage, children);
+
+		action = t6040_recovery_pm_action(usage, children, attempt);
+		if (action == T6040_RECOVERY_PM_SUSPEND) {
+			ret = pm_runtime_suspend(dev);
+			if (ret >= 0 && pm_runtime_status_suspended(dev))
+				return 0;
+			if (ret >= 0)
+				ret = -EBUSY;
+			if (ret != -EAGAIN && ret != -EBUSY && ret != -EACCES)
+				return ret;
+		} else {
+			ret = usage ? -EAGAIN : -EBUSY;
+			if (action == T6040_RECOVERY_PM_FALLBACK)
+				break;
+		}
+
+		if (attempt < T6040_RECOVERY_PM_RETRIES) {
+			unsigned int delay = T6040_RECOVERY_PM_BACKOFF_US << attempt;
+
+			usleep_range(delay, delay + T6040_RECOVERY_PM_BACKOFF_US);
+		}
+	}
+
+	usage = atomic_read(&dev->power.usage_count);
+	children = atomic_read(&dev->power.child_count);
+	dev_warn(tphy->dev,
+		 "USB3: phymxwrap remains active (usage_count=%d child_count=%d, suspend %d); continuing with normal firmware start\n",
+		 usage, children, ret);
+	return 1;
+}
+
+/*
  * Drop both domains with RTKit fully detached. phymxwrap is the mailbox
  * provider's runtime domain; common_dp is this device's runtime domain. Force
  * common_dp through a balanced suspend/resume because the USB2 PHY and DWC3
@@ -915,22 +990,20 @@ static int t6040_usb3_hard_recover(struct t6040_usb2_phy *tphy)
 	unsigned int dwell = max(recovery_dwell_ms, 1U);
 	int ret, resume_ret;
 
-	if (WARN_ON(tphy->rtk))
-		t6040_rtkit_stop_transport(tphy);
+	/* This also releases the mailbox provider reference synchronously. */
+	t6040_rtkit_stop_transport(tphy);
 
 	ret = pm_runtime_force_suspend(tphy->dev);
 	if (ret < 0)
 		return ret;
 
-	pm_runtime_barrier(tphy->mbox_dev);
-	ret = pm_runtime_suspend(tphy->mbox_dev);
-	if (ret < 0 && ret != -EACCES) {
+	ret = t6040_usb3_suspend_mbox(tphy);
+	if (ret < 0) {
 		dev_err(tphy->dev, "USB3: phymxwrap suspend failed: %d\n", ret);
 		goto resume_phy;
 	}
-	if (!pm_runtime_status_suspended(tphy->mbox_dev)) {
-		ret = -EBUSY;
-		dev_err(tphy->dev, "USB3: phymxwrap did not power off\n");
+	if (ret > 0) {
+		ret = 0;
 		goto resume_phy;
 	}
 
