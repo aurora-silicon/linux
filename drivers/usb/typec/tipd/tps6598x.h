@@ -450,6 +450,9 @@ struct cd321x_status {
 };
 
 struct cd321x {
+	struct notifier_block session_pm;
+	bool session_pm_registered;
+	bool session_closed;
 	struct tps6598x tps;
 
 	struct tps6598x_dp_sid_status_reg dp_sid_status;
@@ -555,6 +558,7 @@ int tipd_init(struct tps6598x *tps);
 void tipd_remove(struct tps6598x *tps);
 bool tipd_replug_supported(struct tps6598x *tps);
 int tipd_replug_request(struct tps6598x *tps, u8 seconds);
+void tipd_shutdown(struct tps6598x *tps);
 int tipd_prepare(struct device *dev);
 void tipd_complete(struct device *dev);
 int tipd_suspend(struct tps6598x *tps);
