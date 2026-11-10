@@ -50,6 +50,17 @@ impl<'a> Admission<'a> {
         }
     }
 
+    /// Publication is closed across a hibernation: the budget restarts, so a packet that waited
+    /// for the freeze, the image and the republish still has the whole recovery allowance
+    /// once publication reopens.
+    pub(super) fn restart_for_hibernation(&self) {
+        let limit = super::now_ns()
+            .saturating_add(u64::from(super::timeout::RECOVERY_WAIT_MS) * 1_000_000);
+        if self.deadline.get() < limit {
+            self.deadline.set(limit);
+        }
+    }
+
     pub(super) fn check(&self) -> Result {
         (self.check)()?;
         if super::now_ns() >= self.deadline.get() { return Err(EBUSY); }
@@ -68,6 +79,8 @@ impl<'a> Admission<'a> {
 #[pin_data]
 pub(super) struct Gate {
     state: AtomicU64,
+    /// Closed by a hibernation freeze ([`Self::close_for_hibernation`]) until it reopens.
+    hibernating: core::sync::atomic::AtomicBool,
     #[pin]
     wait: Mutex<()>,
     #[pin]
@@ -89,6 +102,7 @@ impl Gate {
         Arc::pin_init(
             pin_init!(Self {
                 state: AtomicU64::new(EPOCH),
+                hibernating: core::sync::atomic::AtomicBool::new(false),
                 wait <- new_mutex!((), "g17::Gate::wait"),
                 changed <- new_condvar!("g17::Gate::changed"),
                 available,
@@ -160,14 +174,14 @@ impl Gate {
     pub(super) fn enter_until(self: &Arc<Self>, admission: &Admission<'_>) -> Result<Lease> {
         admission.check()?;
         match self.try_enter() {
-            Err(error) if error == EAGAIN => admission.extend_for_recovery(),
+            Err(error) if error == EAGAIN => self.extend(admission),
             result => return result,
         }
         let mut wait = self.wait.lock();
         loop {
             admission.check()?;
             match self.try_enter() {
-                Err(error) if error == EAGAIN => admission.extend_for_recovery(),
+                Err(error) if error == EAGAIN => self.extend(admission),
                 result => return result,
             }
             let _ = self.changed.wait_timeout(
@@ -195,6 +209,27 @@ impl Gate {
                 Err(current) => previous = current,
             }
         }
+    }
+
+    fn extend(&self, admission: &Admission<'_>) {
+        if self.hibernating.load(Ordering::Acquire) {
+            admission.restart_for_hibernation();
+        } else {
+            admission.extend_for_recovery();
+        }
+    }
+
+    /// Closes publication for a hibernation freeze; admissions waiting on it keep restarting
+    /// their budget until [`Self::reopen`].
+    pub(super) fn close_for_hibernation(&self) {
+        self.hibernating.store(true, Ordering::Release);
+        self.close();
+    }
+
+    /// Ends a hibernation closure that will not reopen (the device was lost meanwhile):
+    /// admissions stop restarting their budget, so they fail at their deadline.
+    pub(super) fn end_hibernation(&self) {
+        self.hibernating.store(false, Ordering::Release);
     }
 
     /// Also wakes publishers in wait_closure(); they then block in enter().
@@ -282,6 +317,7 @@ impl Gate {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
+                    self.hibernating.store(false, Ordering::Release);
                     self.changed.notify_all();
                     drop(wait);
                     self.wake_waiters();

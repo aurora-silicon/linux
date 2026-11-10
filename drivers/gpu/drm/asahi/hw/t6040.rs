@@ -58,7 +58,9 @@ pub(crate) const CONFIG: Config = Config {
     m5: None,
     adopt_root_entries: false,
     fabric_bridge: false,
-    sleep_restart: false,
+    // Same G17-family firmware and warm-restart-from-DRAM sleep model as T8140 (which sets this):
+    // the firmware keeps its rings and state in retained DRAM across an S2R and restarts warm.
+    sleep_restart: true,
     // The firmware's per-slot recovery keys are not known for this build; recovery relies on
     // the firmware's own blame.
     recovery_slot_keys: None,

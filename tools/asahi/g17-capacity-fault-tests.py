@@ -164,14 +164,20 @@ impl Reclaims { fn take_one(&mut self) -> Option<Reclaim> { self.0.pop() } }
 struct Mutex<T>(std::sync::Mutex<T>);
 impl<T> Mutex<T> { fn lock(&self) -> std::sync::MutexGuard<'_, T> { self.0.lock().unwrap() } }
 struct Available(AtomicUsize); impl Available {fn notify(&self){self.0.fetch_add(1, Ordering::SeqCst);}}
-struct Shared { reclaim: Mutex<Reclaims>, wakes: AtomicUsize, queues: Available }
+// The session a hibernation freezes: reclaims wait for its thaw.
+struct Firmware { frozen: bool }
+struct Shared { state: Mutex<Option<Box<Firmware>>>, reclaim: Mutex<Reclaims>, wakes: AtomicUsize, queues: Available }
 impl Shared {
     fn queue_events(&self) { self.wakes.fetch_add(1, Ordering::SeqCst); }
 ''' + drain + r'''
 }
 fn main() {
     let finished = Arc::new(AtomicUsize::new(0));
-    let shared = Arc::new(Shared { reclaim: Mutex(std::sync::Mutex::new(Reclaims(vec![Reclaim(finished.clone())]))), wakes: AtomicUsize::new(0), queues: Available(AtomicUsize::new(0)) });
+    let shared = Arc::new(Shared { state: Mutex(std::sync::Mutex::new(Some(Box::new(Firmware { frozen: true })))), reclaim: Mutex(std::sync::Mutex::new(Reclaims(vec![Reclaim(finished.clone())]))), wakes: AtomicUsize::new(0), queues: Available(AtomicUsize::new(0)) });
+    shared.drain_reclaims();
+    assert_eq!(finished.load(Ordering::SeqCst), 0);
+    assert_eq!(shared.wakes.load(Ordering::SeqCst), 0);
+    shared.state.lock().as_mut().unwrap().frozen = false;
     shared.drain_reclaims();
     assert_eq!(finished.load(Ordering::SeqCst), 1);
     assert_eq!(shared.wakes.load(Ordering::SeqCst), 1);

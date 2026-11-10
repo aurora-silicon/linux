@@ -267,6 +267,11 @@ impl CpuControl {
         to_result(unsafe { bindings::apple_mbox_ascwrap_v6_start_cpu(self.mbox) })
     }
 
+    /// Run request bit of the CPU control word read by [`Self::state`]
+    /// (`APPLE_ASCWRAP_V6_CPU_RUN` in the provider): set in [`Self::start`], cleared in
+    /// [`Self::stop`].
+    pub(crate) const CONTROL_RUN: u32 = 1 << 4;
+
     /// Stop before releasing the transport or any firmware-visible memory.
     pub(crate) fn stop(&self) {
         // SAFETY: The provider remains live during consumer teardown. Removal

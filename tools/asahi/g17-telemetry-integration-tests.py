@@ -38,6 +38,7 @@ mod prelude {
     impl<T> core::ops::DerefMut for KVec<T> { fn deref_mut(&mut self)->&mut [T] { &mut self.0 } }
 }
 mod sync { pub use std::sync::Arc; }
+mod error { pub use crate::prelude::Result; }
 mod debugfs {
     pub trait Writer { fn write(&self, f:&mut std::fmt::Formatter<'_>)->std::fmt::Result; }
 }
@@ -148,6 +149,11 @@ mod g17 {
     }
     struct Variant { graph:fw::variant::InitGraph }
     struct Shared { state:State, dev:crate::device::Device, variant:Variant, crashed:std::sync::atomic::AtomicBool }
+    // The device's hibernation drain and re-boot, which no telemetry test reaches.
+    impl Shared {
+        fn freeze_for_hibernation(&self)->crate::prelude::Result { unreachable!() }
+        fn thaw_after_hibernation(&self) { unreachable!() }
+    }
     mod reports;
 '''
 RUST_TESTS = r'''
@@ -493,13 +499,14 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 #define PAGE_SIZE 4096
 #define READ_ONCE(x) (x)
+#define WRITE_ONCE(x,v) ((x)=(v))
 #define container_of(ptr,type,member) ((type*)((char*)(ptr)-offsetof(type,member)))
 struct device {};
 struct device_attribute {
     struct { const char *name; unsigned mode; } attr;
     ssize_t (*show)(struct device*,struct device_attribute*,char*);
 };
-struct notifier_block { int (*notifier_call)(struct notifier_block*,unsigned long,void*); };
+struct notifier_block { int (*notifier_call)(struct notifier_block*,unsigned long,void*); int priority; };
 #define PM_SUSPEND_PREPARE 1
 #define PM_HIBERNATION_PREPARE 2
 #define PM_RESTORE_PREPARE 3
@@ -507,6 +514,8 @@ struct notifier_block { int (*notifier_call)(struct notifier_block*,unsigned lon
 #define PM_POST_HIBERNATION 5
 #define PM_POST_RESTORE 6
 #define NOTIFY_OK 1
+#define NOTIFY_STOP_MASK 0x8000
+static int notifier_from_errno(int err) { return err?NOTIFY_STOP_MASK|(NOTIFY_OK-err):NOTIFY_OK; }
 #define ENODEV 19
 #define ENOMEM 12
 #define BUILD_BUG_ON(x) _Static_assert(!(x),#x)
@@ -596,7 +605,7 @@ int main(void) {
     struct device dev;
     struct asahi_gpu_memory memory={0};
     void *handle=NULL;
-    assert(!asahi_sysfs_register(&dev,&snap,1,&memory,&handle,read_stats,suspend_stats,NULL));
+    assert(!asahi_sysfs_register(&dev,&snap,1,&memory,&handle,read_stats,suspend_stats,NULL,NULL));
     struct asahi_stats_attribute *registered_stats=handle;
     assert(registered==1 && removed==0);
     asahi_stats_pm_notify(&registered_stats->pm_notifier,PM_SUSPEND_PREPARE,NULL);
@@ -606,12 +615,12 @@ int main(void) {
     assert(removed==1);
     for(int failure=1;failure<=2;failure++) {
         created=0;fail_file=failure;handle=NULL;
-        assert(asahi_sysfs_register(&dev,&snap,1,&memory,&handle,read_stats,suspend_stats,NULL)==-12);
+        assert(asahi_sysfs_register(&dev,&snap,1,&memory,&handle,read_stats,suspend_stats,NULL,NULL)==-12);
         assert(registered==removed);
         assert(handle==NULL);
     }
     fail_file=0;fail_notifier=1;created=0;
-    assert(asahi_sysfs_register(&dev,&snap,1,&memory,&handle,read_stats,suspend_stats,NULL)==-12);
+    assert(asahi_sysfs_register(&dev,&snap,1,&memory,&handle,read_stats,suspend_stats,NULL,NULL)==-12);
     assert(created==0 && registered==removed);
     puts("PASS: 512 byte-identical legacy prefixes and frequency lookups, G17 capabilities, PM lifecycle and registration rollback");
 }
@@ -705,12 +714,14 @@ fn write_power(_: &super::Firmware, f:&mut kernel::fmt::Formatter<'_>)->kernel::
     pieces = [C_HEADER]
     for signature in ['struct asahi_qualified_stats']:
         pieces.append(item(header, signature) + ';')
-    pieces += [line for line in header.splitlines() if line.startswith('typedef')]
+    pieces += [line for line in header.splitlines() if line.startswith(('typedef', '#define ASAHI_HIBERNATE_'))]
     for signature in ['struct asahi_stats_snapshot', 'struct asahi_gpu_memory', 'struct asahi_stats_attribute']:
         pieces.append(item(source, signature) + ';')
     pieces.append(item(baseline, 'static ssize_t agx_stats_show').replace('agx_stats_show(', 'old_agx_stats_show(', 1))
-    for signature in ['static const char *asahi_stats_quality', 'static ssize_t agx_qualified_stats_show',
-                      'static int asahi_stats_pm_notify', 'static ssize_t agx_stats_show',
+    # No CONFIG_HIBERNATION here: the gate that counts the bound devices is built out.
+    for signature in ['static inline int asahi_hibernate_device_bound', 'static inline void asahi_hibernate_device_unbound',
+                      'static const char *asahi_stats_quality', 'static ssize_t agx_qualified_stats_show',
+                      'static int asahi_stats_pm_notify', 'static int asahi_stats_hib_notify', 'static ssize_t agx_stats_show',
                       'int asahi_sysfs_register(', 'void asahi_sysfs_unregister(']:
         pieces.append(item(source, signature))
     pieces.append(C_TESTS)
