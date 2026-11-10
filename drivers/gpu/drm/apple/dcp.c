@@ -10540,6 +10540,9 @@ static void dcp_t6041_s2r_warm_restart(struct apple_dcp *dcp)
 		return;
 	}
 	dcp_t6041_s2r_afk(dcp, true);
+	/* As macOS powers the framebuffer after the wake: the hard power state back on. */
+	ret = iomfb_system_power_v26_6_desktop(dcp, true);
+	dev_info(dcp->dev, "S2R resume: system power state 1: %d\n", ret);
 
 	ret = dcp_hib_recommit(dcp);
 	if (ret) {
