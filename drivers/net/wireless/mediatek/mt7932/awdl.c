@@ -489,14 +489,19 @@ int mt_awdl_add_station(struct wiphy *wiphy, struct wireless_dev *wdev,
 	int station, wtbl, ret = 0;
 	unsigned int i;
 
-	if (wdev != &m->awdl.wdev || !is_valid_ether_addr(mac))
-		return -ENODEV;
-	/* The clean tables do not identify the byte mapping of HE capabilities. */
-	if (params->link_sta_params.he_capa)
+	if (wdev != &m->awdl.wdev)
 		return -EOPNOTSUPP;
 	mutex_lock(&m->command_mutex);
-	if (!m->awdl.active) {
-		ret = -ENETDOWN;
+	ret = mt7932_awdl_station_route(&m->awdl, wdev);
+	if (ret)
+		goto out;
+	if (!is_valid_ether_addr(mac)) {
+		ret = -EINVAL;
+		goto out;
+	}
+	/* The clean tables do not identify the byte mapping of HE capabilities. */
+	if (params->link_sta_params.he_capa) {
+		ret = -EOPNOTSUPP;
 		goto out;
 	}
 	if (mt_awdl_find_peer(m, mac)) {
@@ -574,8 +579,11 @@ int mt_awdl_del_station(struct wiphy *wiphy, struct wireless_dev *wdev,
 	int ret = 0;
 
 	if (wdev != &m->awdl.wdev)
-		return -ENODEV;
+		return -EOPNOTSUPP;
 	mutex_lock(&m->command_mutex);
+	ret = mt7932_awdl_station_route(&m->awdl, wdev);
+	if (ret)
+		goto out;
 	for (i = 0; i < ARRAY_SIZE(m->awdl.peers); i++) {
 		struct mt7932_awdl_peer *peer = &m->awdl.peers[i];
 
@@ -586,6 +594,7 @@ int mt_awdl_del_station(struct wiphy *wiphy, struct wireless_dev *wdev,
 		if (ret || params->mac)
 			break;
 	}
+out:
 	mutex_unlock(&m->command_mutex);
 	return ret;
 }
@@ -600,12 +609,21 @@ int mt_awdl_change_station(struct wiphy *wiphy, struct wireless_dev *wdev,
 	unsigned long flags;
 	int ret = 0;
 
-	if (wdev != &m->awdl.wdev || !is_valid_ether_addr(mac))
-		return -ENODEV;
-	if (params->link_sta_params.he_capa)
+	if (wdev != &m->awdl.wdev)
 		return -EOPNOTSUPP;
-	mt_awdl_caps(&caps, params);
 	mutex_lock(&m->command_mutex);
+	ret = mt7932_awdl_station_route(&m->awdl, wdev);
+	if (ret)
+		goto out;
+	if (!is_valid_ether_addr(mac)) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (params->link_sta_params.he_capa) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+	mt_awdl_caps(&caps, params);
 	peer = mt_awdl_find_peer(m, mac);
 	if (!peer) {
 		ret = -ENOENT;
@@ -651,16 +669,20 @@ int mt_awdl_activate(struct mt7932 *m)
 		return wmm;
 	}
 	m->awdl.wmm = wmm;
+	/* BSS setters do not request replies, just like the managed BSS.
+	 * In particular EID 0x11 is an unsolicited presence indication, not
+	 * a CID 0x11 completion. Keep peer station completion waits separate.
+	 */
 	mt7932_awdl_build_queue(queue, 0, false, true);
-	ret = mt_request(m, 0x6b, true, true, true, queue, sizeof(queue));
+	ret = mt_request(m, 0x6b, true, true, false, queue, sizeof(queue));
 	if (!ret) {
 		mt7932_awdl_build_bss(bss, bmc, wmm, 0x7a,
 				      clamp_t(u8, m->phy_cap[4], 1, 2));
-		ret = mt_request(m, 0x12, true, true, true, bss, sizeof(bss));
+		ret = mt_request(m, 0x12, true, true, false, bss, sizeof(bss));
 	}
 	if (!ret) {
 		mt7932_awdl_build_bss_active(active, m->awdl.netdev->dev_addr, bmc, true);
-		ret = mt_request(m, 0x11, true, true, true, active, sizeof(active));
+		ret = mt_request(m, 0x11, true, true, false, active, sizeof(active));
 	}
 	ret = ret ?: mt_awdl_clear_template(m, 0x04);
 	ret = ret ?: mt_awdl_clear_template(m, 0x05);
@@ -681,16 +703,16 @@ int mt_awdl_activate(struct mt7932 *m)
 	}
 rollback:
 	mt7932_awdl_build_bss_active(active, m->awdl.netdev->dev_addr, bmc, false);
-	mt_request(m, 0x11, true, true, true, active, sizeof(active));
+	mt_request(m, 0x11, true, true, false, active, sizeof(active));
 	mt7932_awdl_build_queue(queue, 0, false, false);
-	mt_request(m, 0x6b, true, true, true, queue, sizeof(queue));
+	mt_request(m, 0x6b, true, true, false, queue, sizeof(queue));
 	__clear_bit(bmc, &m->wtbl_alloc);
 	__clear_bit(wmm, &m->wmm_alloc);
 	m->awdl.active = false;
 	return ret;
 }
 
-static int mt_awdl_deactivate(struct mt7932 *m)
+int mt_awdl_deactivate(struct mt7932 *m)
 {
 	u8 body[116], active[12], queue[32], enable[6] = {};
 	unsigned int i;
@@ -710,13 +732,13 @@ static int mt_awdl_deactivate(struct mt7932 *m)
 	ret = mt_awdl_send_tlv(m, 0x08, enable, sizeof(enable));
 	mt7932_awdl_build_bss_active(active, m->awdl.netdev->dev_addr,
 				       m->awdl.bmc_wtbl, false);
-	ret = ret ?: mt_request(m, 0x11, true, true, true, active, sizeof(active));
+	ret = ret ?: mt_request(m, 0x11, true, true, false, active, sizeof(active));
 	mt7932_awdl_build_bss(body, m->awdl.bmc_wtbl, m->awdl.wmm, 0x7a,
 			       clamp_t(u8, m->phy_cap[4], 1, 2));
 	body[1] = 0;
-	ret = ret ?: mt_request(m, 0x12, true, true, true, body, sizeof(body));
+	ret = ret ?: mt_request(m, 0x12, true, true, false, body, sizeof(body));
 	mt7932_awdl_build_queue(queue, 0, false, false);
-	ret = ret ?: mt_request(m, 0x6b, true, true, true, queue, sizeof(queue));
+	ret = ret ?: mt_request(m, 0x6b, true, true, false, queue, sizeof(queue));
 	if (!ret) {
 		__clear_bit(m->awdl.bmc_wtbl, &m->wtbl_alloc);
 		__clear_bit(m->awdl.wmm, &m->wmm_alloc);

@@ -39,6 +39,9 @@ config MT7932_AWDL
 	  firmware AWDL command records and routes BSS-1 RX records.  The option
 	  is deliberately off by default while firmware policy values and target
 	  validation remain incomplete.
+	  Systems using NetworkManager should install 80-mt7932-awdl.rules from
+	  this directory into /usr/lib/udev/rules.d/ before loading the driver,
+	  so only the AWDL controller brings awdl0 up.
 
 config MT7932_AWDL_KUNIT_TEST
 	bool "KUnit tests for MT7932 AWDL records and RX parsing" if !KUNIT_ALL_TESTS
@@ -47,6 +50,7 @@ config MT7932_AWDL_KUNIT_TEST
 	help
 	  Test every clean-room command-record builder, AWDL data framing and
 	  synthetic CONNAC2/event receive records without radio hardware.
+	  Check station routing and BSS activation/rollback command submission.
 
 config MT7932_RF_KUNIT_TEST
 	bool "KUnit tests for MT7932 terminal RF failure" if !KUNIT_ALL_TESTS

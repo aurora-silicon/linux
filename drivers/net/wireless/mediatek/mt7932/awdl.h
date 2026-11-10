@@ -73,6 +73,20 @@ struct mt7932_awdl {
 	u64 rx_data;
 };
 
+/* The station iftype is only a cfg80211 representation of AWDL. Never
+ * route the managed station (or an unrelated wdev) into BSS 1 peer ops.
+ * Caller serializes interface/firmware state with command_mutex.
+ */
+static inline int mt7932_awdl_station_route(const struct mt7932_awdl *awdl,
+					    const struct wireless_dev *wdev)
+{
+	if (wdev != &awdl->wdev)
+		return -EOPNOTSUPP;
+	if (!awdl->interface_up || !awdl->active)
+		return -ENETDOWN;
+	return 0;
+}
+
 int mt7932_awdl_build_queue(u8 out[MT7932_AWDL_QUEUE_RECORD_LEN],
 			    u8 station, bool peer, bool enable);
 int mt7932_awdl_build_bss_active(u8 out[12], const u8 *mac, u8 bmc_wtbl,
@@ -98,6 +112,7 @@ void mt_awdl_wiphy_setup(struct mt7932 *m);
 int mt_awdl_register(struct mt7932 *m);
 void mt_awdl_unregister(struct mt7932 *m);
 int mt_awdl_activate(struct mt7932 *m);
+int mt_awdl_deactivate(struct mt7932 *m);
 void mt_awdl_receive(struct mt7932 *m, const struct mt7932_rx_frame *frame);
 void mt_awdl_event(struct mt7932 *m, const struct mt7932_event *event);
 int mt_awdl_add_station(struct wiphy *wiphy, struct wireless_dev *wdev,

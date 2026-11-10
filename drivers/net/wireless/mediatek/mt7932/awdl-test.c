@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <kunit/test.h>
+#include <kunit/static_stub.h>
 
 #include "mt7932.h"
 
@@ -194,7 +195,207 @@ static void mt7932_awdl_event_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, mt7932_awdl_event_parse(&event, &info), -EMSGSIZE);
 }
 
+/* Capture the real AWDL control paths without a PCI device or DMA rings. */
+struct mt_awdl_control_test {
+	struct mt7932 m;
+	unsigned int requests;
+	u8 fail_cid;
+};
+
+static int mt_awdl_test_request(struct mt7932 *m, u8 cid, bool runtime,
+				bool set, bool wait, const void *payload,
+				size_t length)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct mt_awdl_control_test *ctx = test->priv;
+	const u8 *body = payload;
+
+	ctx->requests++;
+	KUNIT_EXPECT_PTR_EQ(test, m, &ctx->m);
+	KUNIT_EXPECT_TRUE(test, runtime);
+	KUNIT_EXPECT_TRUE(test, set);
+	switch (cid) {
+	case 0x6b:
+		KUNIT_EXPECT_EQ(test, length, (size_t)32);
+		if (body[2] == 1) {
+			KUNIT_EXPECT_FALSE(test, wait);
+			KUNIT_EXPECT_EQ(test, body[3], MT7932_AWDL_BSS_INDEX);
+		} else {
+			KUNIT_EXPECT_EQ(test, body[2], 5);
+			KUNIT_EXPECT_TRUE(test, wait);
+			KUNIT_EXPECT_NE(test, body[15], m->peer_ids.station[0]);
+		}
+		KUNIT_EXPECT_EQ(test, body[14], body[0] ? 1 : 0);
+		break;
+	case 0x11:
+	case 0x12:
+		KUNIT_EXPECT_FALSE(test, wait);
+		KUNIT_EXPECT_EQ(test, body[0], MT7932_AWDL_BSS_INDEX);
+		break;
+	case 0x13:
+		KUNIT_EXPECT_TRUE(test, wait);
+		KUNIT_EXPECT_EQ(test, body[12], MT7932_AWDL_BSS_INDEX);
+		KUNIT_EXPECT_NE(test, body[0], m->peer_ids.station[0]);
+		KUNIT_EXPECT_NE(test, body[54], m->peer_ids.wtbl[0]);
+		KUNIT_EXPECT_NE(test, body[54], m->awdl.bmc_wtbl);
+		break;
+	case 0xf7:
+		KUNIT_EXPECT_FALSE(test, wait);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(body + 12), 1U);
+		break;
+	default:
+		KUNIT_FAIL(test, "unexpected AWDL CID %02x", cid);
+	}
+	return cid == ctx->fail_cid ? -ENOSPC : 0;
+}
+
+static void mt_awdl_test_free_wiphy(void *data)
+{
+	wiphy_free(data);
+}
+
+static void mt_awdl_test_free_netdev(void *data)
+{
+	free_netdev(data);
+}
+
+static struct mt_awdl_control_test *mt_awdl_control_init(struct kunit *test)
+{
+	static const struct cfg80211_ops ops;
+	struct mt_awdl_control_test *ctx;
+	struct mt7932 *m;
+	int ret;
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	m = &ctx->m;
+	m->wiphy = wiphy_new_nm(&ops, sizeof(m), "mt7932-awdl-test");
+	KUNIT_ASSERT_NOT_NULL(test, m->wiphy);
+	ret = kunit_add_action_or_reset(test, mt_awdl_test_free_wiphy, m->wiphy);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	*(struct mt7932 **)wiphy_priv(m->wiphy) = m;
+	m->awdl.netdev = alloc_etherdev(0);
+	KUNIT_ASSERT_NOT_NULL(test, m->awdl.netdev);
+	ret = kunit_add_action_or_reset(test, mt_awdl_test_free_netdev, m->awdl.netdev);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	eth_hw_addr_set(m->awdl.netdev, test_mac);
+	m->wdev.iftype = NL80211_IFTYPE_STATION;
+	m->awdl.wdev.iftype = NL80211_IFTYPE_STATION;
+	mutex_init(&m->command_mutex);
+	spin_lock_init(&m->response_lock);
+	m->phy_cap[4] = 2;
+	/* Synthetic infrastructure ownership must survive all AWDL operations. */
+	m->peer_ids.station[0] = 1;
+	m->peer_ids.wtbl[0] = 3;
+	m->station_alloc = BIT(0) | BIT(1) | BIT(2);
+	m->wtbl_alloc = BIT(0) | BIT(3) | BIT(4) | BIT(5) | BIT(6);
+	m->wmm_alloc = BIT(0);
+	test->priv = ctx;
+	kunit_activate_static_stub(test, mt_request, mt_awdl_test_request);
+	return ctx;
+}
+
+static void mt7932_awdl_routing_test(struct kunit *test)
+{
+	struct mt_awdl_control_test *ctx = mt_awdl_control_init(test);
+	struct mt7932 *m = &ctx->m;
+	struct wireless_dev other = { .iftype = NL80211_IFTYPE_STATION };
+	struct wireless_dev *wdevs[] = { &m->wdev, &other, &m->awdl.wdev };
+	unsigned int state, i;
+
+	for (state = 0; state < 4; state++) {
+		m->awdl.interface_up = state & 1;
+		m->awdl.active = state & 2;
+		for (i = 0; i < ARRAY_SIZE(wdevs); i++) {
+			int expected = i < 2 ? -EOPNOTSUPP :
+				       state == 3 ? 0 : -ENETDOWN;
+			int ret;
+
+			KUNIT_EXPECT_EQ(test, mt7932_awdl_station_route(&m->awdl, wdevs[i]),
+					expected);
+			if (!expected)
+				continue;
+			/* NULL params catch any access before routing/admission. */
+			ret = mt_awdl_add_station(m->wiphy, wdevs[i], test_mac, NULL);
+			KUNIT_EXPECT_EQ(test, ret, expected);
+			ret = mt_awdl_change_station(m->wiphy, wdevs[i], test_mac, NULL);
+			KUNIT_EXPECT_EQ(test, ret, expected);
+			ret = mt_awdl_del_station(m->wiphy, wdevs[i], NULL);
+			KUNIT_EXPECT_EQ(test, ret, expected);
+		}
+	}
+	KUNIT_EXPECT_EQ(test, ctx->requests, 0U);
+}
+
+static void mt7932_awdl_lifecycle_test(struct kunit *test)
+{
+	struct mt_awdl_control_test *ctx = mt_awdl_control_init(test);
+	struct mt7932 *m = &ctx->m;
+	unsigned long station = m->station_alloc, wtbl = m->wtbl_alloc;
+	unsigned int cycle, before;
+
+	for (cycle = 0; cycle < 3; cycle++) {
+		before = ctx->requests;
+		KUNIT_ASSERT_EQ(test, mt_awdl_activate(m), 0);
+		KUNIT_EXPECT_EQ(test, ctx->requests, before);
+		KUNIT_EXPECT_EQ(test, m->wtbl_alloc, wtbl);
+		m->awdl.interface_up = true;
+		KUNIT_ASSERT_EQ(test, mt_awdl_activate(m), 0);
+		KUNIT_EXPECT_TRUE(test, m->awdl.active);
+		KUNIT_EXPECT_EQ(test, ctx->requests, before + 6);
+		KUNIT_EXPECT_EQ(test, m->station_alloc, station);
+		KUNIT_EXPECT_FALSE(test, m->awdl.sync_enabled);
+		KUNIT_ASSERT_EQ(test, mt_awdl_activate(m), 0);
+		KUNIT_EXPECT_EQ(test, ctx->requests, before + 6);
+		m->awdl.interface_up = false;
+		KUNIT_ASSERT_EQ(test, mt_awdl_deactivate(m), 0);
+		KUNIT_EXPECT_EQ(test, ctx->requests, before + 10);
+		KUNIT_EXPECT_FALSE(test, m->awdl.active);
+		KUNIT_EXPECT_EQ(test, m->station_alloc, station);
+		KUNIT_EXPECT_EQ(test, m->wtbl_alloc, wtbl);
+		KUNIT_EXPECT_EQ(test, m->wmm_alloc, BIT(0));
+	}
+	/* A failed submission still rolls BSS 1 back without touching BSS 0. */
+	ctx->fail_cid = 0x12;
+	m->awdl.interface_up = true;
+	before = ctx->requests;
+	KUNIT_EXPECT_EQ(test, mt_awdl_activate(m), -ENOSPC);
+	KUNIT_EXPECT_EQ(test, ctx->requests, before + 4);
+	KUNIT_EXPECT_FALSE(test, m->awdl.active);
+	KUNIT_EXPECT_EQ(test, m->station_alloc, station);
+	KUNIT_EXPECT_EQ(test, m->wtbl_alloc, wtbl);
+	KUNIT_EXPECT_EQ(test, m->wmm_alloc, BIT(0));
+}
+
+static void mt7932_awdl_peer_routing_test(struct kunit *test)
+{
+	struct mt_awdl_control_test *ctx = mt_awdl_control_init(test);
+	struct mt7932 *m = &ctx->m;
+	struct station_parameters params = {};
+	struct station_del_parameters del = { .mac = test_mac };
+	unsigned long station = m->station_alloc, wtbl = m->wtbl_alloc;
+
+	m->awdl.interface_up = true;
+	KUNIT_ASSERT_EQ(test, mt_awdl_activate(m), 0);
+	KUNIT_ASSERT_EQ(test, mt_awdl_add_station(m->wiphy, &m->awdl.wdev,
+						  test_mac, &params), 0);
+	KUNIT_EXPECT_EQ(test, ctx->requests, 8U);
+	KUNIT_EXPECT_TRUE(test, m->awdl.peers[0].live);
+	KUNIT_ASSERT_EQ(test, mt_awdl_change_station(m->wiphy, &m->awdl.wdev,
+						     test_mac, &params), 0);
+	KUNIT_EXPECT_EQ(test, ctx->requests, 8U);
+	KUNIT_ASSERT_EQ(test, mt_awdl_del_station(m->wiphy, &m->awdl.wdev, &del), 0);
+	KUNIT_EXPECT_EQ(test, ctx->requests, 10U);
+	KUNIT_EXPECT_EQ(test, m->station_alloc, station);
+	m->awdl.interface_up = false;
+	KUNIT_ASSERT_EQ(test, mt_awdl_deactivate(m), 0);
+	KUNIT_EXPECT_EQ(test, m->wtbl_alloc, wtbl);
+}
+
 static struct kunit_case mt7932_awdl_cases[] = {
+	KUNIT_CASE(mt7932_awdl_routing_test),
+	KUNIT_CASE(mt7932_awdl_lifecycle_test),
+	KUNIT_CASE(mt7932_awdl_peer_routing_test),
 	KUNIT_CASE(mt7932_awdl_queue_test),
 	KUNIT_CASE(mt7932_awdl_active_test),
 	KUNIT_CASE(mt7932_awdl_bss_test),
