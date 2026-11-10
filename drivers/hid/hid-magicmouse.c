@@ -1586,6 +1586,12 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 	int mt_flags = 0;
 	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
 
+	/*
+	 * The K114c descriptor puts a Digitizer-page field under a Mouse
+	 * application. hid-input takes that for a pen and sets DIRECT, which
+	 * makes udev call the pad a touchscreen. This is an indirect touchpad.
+	 */
+	__clear_bit(INPUT_PROP_DIRECT, input->propbit);
 	__set_bit(INPUT_PROP_BUTTONPAD, input->propbit);
 	/*
 	 * An MTP trackpad is a pointer, never a direct-touch surface. The K116s
