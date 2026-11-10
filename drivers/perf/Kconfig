@@ -6,6 +6,16 @@
 menu "Performance monitor support"
 	depends on PERF_EVENTS
 
+config APPLE_MCC_PMU
+	tristate "Apple T6000/T8112 MCC bandwidth PMU"
+	depends on (ARCH_APPLE || COMPILE_TEST) && 64BIT
+	depends on APPLE_REGVIEW
+	help
+	  Expose the programmable memory-controller DRAM byte counters on
+	  Apple T6000 and T8112 SoCs through perf. The driver owns selector,
+	  enable and clear state while events are active and restores it after
+	  system sleep. Probe does not write any MCC register.
+
 config ARM_CCI_PMU
 	tristate "ARM CCI PMU driver"
 	depends on (ARM && CPU_V7) || ARM64
@@ -326,3 +336,13 @@ config NVIDIA_TEGRA410_C2C_PMU
 	  Tegra410 SoC.
 
 endmenu
+
+config APPLE_MCC_PMU_KUNIT_TEST
+	tristate "KUnit tests for Apple MCC PMU encodings" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Check the named requester, requester-mask, direction and family field
+	  constructors used by the T6000 and T8112 MCC PMU driver. The tests are
+	  entirely synthetic and never map or access hardware. Enable this for
+	  development and continuous-integration builds.

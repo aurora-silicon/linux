@@ -14,6 +14,7 @@
  * Copyright The Asahi Linux Contributors
  */
 
+#include <linux/auxiliary_bus.h>
 #include <linux/debugfs.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
@@ -24,6 +25,7 @@
 #include <linux/platform_device.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/mcc_pmu.h>
 
 /* One run of 32-bit registers inside one DT reg entry. */
 struct apple_regview_range {
@@ -38,6 +40,7 @@ struct apple_regview_hw {
 	const struct apple_regview_range *ranges;
 	unsigned int nr_ranges;
 	unsigned int nr_regs;	/* reg entries the node must have */
+	enum apple_mcc_pmu_type mcc_pmu_type;
 };
 
 struct apple_regview_map {
@@ -46,6 +49,7 @@ struct apple_regview_map {
 };
 
 static struct dentry *apple_regview_root;
+static atomic_t apple_regview_mcc_pmu_id = ATOMIC_INIT(0);
 
 struct apple_regview {
 	struct device *dev;
@@ -75,7 +79,8 @@ static const struct apple_regview_range apple_regview_t8112_mcc[] = {
 static const struct apple_regview_hw apple_regview_t8112_mcc_hw = {
 	.ranges = apple_regview_t8112_mcc,
 	.nr_ranges = ARRAY_SIZE(apple_regview_t8112_mcc),
-	.nr_regs = 2,
+	.nr_regs = 3,
+	.mcc_pmu_type = APPLE_MCC_PMU_T8112,
 };
 
 /* T6000: one reg entry per controller, each with four planes at offset 0. */
@@ -93,7 +98,62 @@ static const struct apple_regview_hw apple_regview_t6000_mcc_hw = {
 	.ranges = apple_regview_t6000_mcc,
 	.nr_ranges = ARRAY_SIZE(apple_regview_t6000_mcc),
 	.nr_regs = 4,
+	.mcc_pmu_type = APPLE_MCC_PMU_T6000,
 };
+
+static void apple_regview_mcc_pmu_release(struct device *dev)
+{
+	struct auxiliary_device *auxdev = to_auxiliary_dev(dev);
+	struct apple_mcc_pmu_aux *aux;
+
+	aux = container_of(auxdev, struct apple_mcc_pmu_aux, auxdev);
+	kfree(aux);
+}
+
+static void apple_regview_mcc_pmu_delete(void *data)
+{
+	struct apple_mcc_pmu_aux *aux = data;
+
+	auxiliary_device_delete(&aux->auxdev);
+	auxiliary_device_uninit(&aux->auxdev);
+}
+
+static int apple_regview_add_mcc_pmu(struct apple_regview *rv)
+{
+	struct apple_mcc_pmu_aux *aux;
+	unsigned int i;
+	int ret;
+
+	aux = kzalloc_obj(*aux);
+	if (!aux)
+		return -ENOMEM;
+
+	aux->type = rv->hw->mcc_pmu_type;
+	aux->nr_maps = rv->hw->nr_regs;
+	for (i = 0; i < aux->nr_maps; i++) {
+		aux->maps[i].base = rv->maps[i].base;
+		aux->maps[i].size = rv->maps[i].size;
+	}
+	aux->auxdev.name = "mcc_pmu";
+	aux->auxdev.id = atomic_inc_return(&apple_regview_mcc_pmu_id) - 1;
+	aux->auxdev.dev.parent = rv->dev;
+	aux->auxdev.dev.release = apple_regview_mcc_pmu_release;
+
+	ret = auxiliary_device_init(&aux->auxdev);
+	if (ret) {
+		kfree(aux);
+		return ret;
+	}
+
+	ret = auxiliary_device_add(&aux->auxdev);
+	if (ret) {
+		auxiliary_device_uninit(&aux->auxdev);
+		return ret;
+	}
+
+	return devm_add_action_or_reset(rv->dev,
+					apple_regview_mcc_pmu_delete, aux);
+}
 
 static u32 apple_regview_stride(const struct apple_regview_range *r)
 {
@@ -195,8 +255,11 @@ static int apple_regview_probe(struct platform_device *pdev)
 	rv->dir = debugfs_create_dir(dev_name(dev), apple_regview_root);
 	debugfs_create_file("regs", 0400, rv->dir, rv, &apple_regview_fops);
 
-	return devm_add_action_or_reset(dev, apple_regview_remove_debugfs,
-					rv->dir);
+	ret = devm_add_action_or_reset(dev, apple_regview_remove_debugfs, rv->dir);
+	if (ret)
+		return ret;
+
+	return apple_regview_add_mcc_pmu(rv);
 }
 
 static const struct of_device_id apple_regview_of_match[] = {

@@ -1,0 +1,381 @@
+/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
+#ifndef _APPLE_MCC_PMU_INTERNAL_H
+#define _APPLE_MCC_PMU_INTERNAL_H
+
+#include <linux/bitfield.h>
+#include <linux/bits.h>
+
+/* Common perf config. */
+#define APPLE_MCC_CFG_AGENT GENMASK_ULL(7, 0)
+#define APPLE_MCC_CFG_WRITE BIT_ULL(8)
+#define APPLE_MCC_CFG_DCS BIT_ULL(9)
+
+enum apple_mcc_agent {
+	APPLE_MCC_AGENT_PCPU0,
+	APPLE_MCC_AGENT_PCPU1,
+	APPLE_MCC_AGENT_ECPU,
+	APPLE_MCC_AGENT_GFX,
+	APPLE_MCC_AGENT_ANE,
+	APPLE_MCC_AGENT_VDEC,
+	APPLE_MCC_AGENT_VENC,
+	APPLE_MCC_AGENT_DISPLAY,
+	APPLE_MCC_AGENT_EXT_DISPLAY,
+	APPLE_MCC_AGENT_CODEC,
+	APPLE_MCC_AGENT_ANS,
+	APPLE_MCC_AGENT_ISP,
+	APPLE_MCC_AGENT_JPEG,
+	APPLE_MCC_AGENT_MSR,
+	APPLE_MCC_AGENT_PCIE,
+	APPLE_MCC_AGENT_ATC0,
+	APPLE_MCC_AGENT_ATC1,
+	APPLE_MCC_AGENT_ATC2,
+	APPLE_MCC_AGENT_ATC3,
+	APPLE_MCC_AGENT_MAX,
+};
+
+/*
+ * T8112 selector word. REQUESTER is split into the fabric group and the
+ * member within that group. REQUESTER_MASK is a low-bit wildcard mask, so a
+ * range of four requesters is encoded as GENMASK(1, 0). SUBREQUEST further
+ * filters a requester's traffic classes. The byte counters use no subfilter.
+ */
+#define T8112_SEL_REQUESTER_MEMBER GENMASK_ULL(4, 0)
+#define T8112_SEL_REQUESTER_GROUP GENMASK_ULL(9, 5)
+#define T8112_SEL_REQUESTER GENMASK_ULL(9, 0)
+#define T8112_SEL_REQUESTER_MASK GENMASK_ULL(21, 12)
+#define T8112_SEL_SUBREQUEST GENMASK_ULL(42, 24)
+#define T8112_SEL_VALID BIT_ULL(48)
+#define T8112_SEL_FAMILY BIT_ULL(52)
+#define T8112_SEL_DIRECTION GENMASK_ULL(57, 56)
+
+#define T8112_REQUESTER(_group, _member)                         \
+	(FIELD_PREP_CONST(T8112_SEL_REQUESTER_GROUP, (_group)) | \
+	 FIELD_PREP_CONST(T8112_SEL_REQUESTER_MEMBER, (_member)))
+#define T8112_REQUESTER_RANGE(_count) ((_count) - 1)
+#define T8112_AGENT(_requester, _count)                                 \
+	((u64)(_requester) | FIELD_PREP_CONST(T8112_SEL_REQUESTER_MASK, \
+					      T8112_REQUESTER_RANGE(_count)))
+
+/* Fabric group numbers and member numbers recovered from the named rows. */
+enum t8112_requester_group {
+	T8112_REQ_GRP_CPU = 0x00,
+	T8112_REQ_GRP_GFX = 0x01,
+	T8112_REQ_GRP_ISP = 0x02,
+	T8112_REQ_GRP_DISPLAY = 0x03,
+	T8112_REQ_GRP_EXT_DISPLAY = 0x04,
+	T8112_REQ_GRP_JPEG = 0x06,
+	T8112_REQ_GRP_MSR = 0x07,
+	T8112_REQ_GRP_VIDEO = 0x08,
+	T8112_REQ_GRP_ACCEL_IO = 0x09,
+	T8112_REQ_GRP_ATC2 = 0x0b,
+	T8112_REQ_GRP_ATC3 = 0x0c,
+	T8112_REQ_GRP_ANS = 0x0d,
+	T8112_REQ_GRP_ATC0 = 0x0e,
+	T8112_REQ_GRP_ATC1 = 0x0f,
+	T8112_REQ_GRP_CODEC = 0x10,
+};
+
+enum t8112_requester_member {
+	T8112_REQ_MEMBER_BASE = 0x00,
+	T8112_REQ_MEMBER_ANS = 0x08,
+	T8112_REQ_MEMBER_ECPU = 0x10,
+	T8112_REQ_MEMBER_PCIE = 0x10,
+	T8112_REQ_MEMBER_VDEC = 0x10,
+	T8112_REQ_MEMBER_JPEG = 0x10,
+	T8112_REQ_MEMBER_PCPU = 0x14,
+};
+
+enum t8112_agent_selector {
+	T8112_AGENT_PCPU = T8112_AGENT(
+		T8112_REQUESTER(T8112_REQ_GRP_CPU, T8112_REQ_MEMBER_PCPU), 4),
+	T8112_AGENT_ECPU = T8112_AGENT(
+		T8112_REQUESTER(T8112_REQ_GRP_CPU, T8112_REQ_MEMBER_ECPU), 4),
+	T8112_AGENT_GFX = T8112_AGENT(
+		T8112_REQUESTER(T8112_REQ_GRP_GFX, T8112_REQ_MEMBER_BASE), 32),
+	T8112_AGENT_ANE = T8112_AGENT(
+		T8112_REQUESTER(T8112_REQ_GRP_ACCEL_IO,
+				T8112_REQ_MEMBER_BASE), 16),
+	T8112_AGENT_VDEC = T8112_AGENT(
+		T8112_REQUESTER(T8112_REQ_GRP_VIDEO, T8112_REQ_MEMBER_VDEC), 8),
+	T8112_AGENT_VENC = T8112_AGENT(
+		T8112_REQUESTER(T8112_REQ_GRP_VIDEO, T8112_REQ_MEMBER_BASE), 8),
+	T8112_AGENT_DISPLAY = T8112_AGENT(
+		T8112_REQUESTER(T8112_REQ_GRP_DISPLAY, T8112_REQ_MEMBER_BASE),
+		32),
+	T8112_AGENT_EXT_DISPLAY =
+		T8112_AGENT(T8112_REQUESTER(T8112_REQ_GRP_EXT_DISPLAY,
+					    T8112_REQ_MEMBER_BASE),
+			    64),
+	T8112_AGENT_CODEC = T8112_AGENT(T8112_REQUESTER(T8112_REQ_GRP_CODEC,
+							T8112_REQ_MEMBER_BASE),
+					64),
+	T8112_AGENT_ANS = T8112_AGENT(
+		T8112_REQUESTER(T8112_REQ_GRP_ANS, T8112_REQ_MEMBER_ANS), 8),
+	T8112_AGENT_ISP = T8112_AGENT(
+		T8112_REQUESTER(T8112_REQ_GRP_ISP, T8112_REQ_MEMBER_BASE), 32),
+	T8112_AGENT_JPEG = T8112_AGENT(
+		T8112_REQUESTER(T8112_REQ_GRP_JPEG, T8112_REQ_MEMBER_JPEG), 4),
+	T8112_AGENT_MSR = T8112_AGENT(
+		T8112_REQUESTER(T8112_REQ_GRP_MSR, T8112_REQ_MEMBER_BASE), 4),
+	T8112_AGENT_PCIE = T8112_AGENT(
+		T8112_REQUESTER(T8112_REQ_GRP_ACCEL_IO,
+				T8112_REQ_MEMBER_PCIE), 16),
+	T8112_AGENT_ATC0 = T8112_AGENT(
+		T8112_REQUESTER(T8112_REQ_GRP_ATC0, T8112_REQ_MEMBER_BASE), 32),
+	T8112_AGENT_ATC1 = T8112_AGENT(
+		T8112_REQUESTER(T8112_REQ_GRP_ATC1, T8112_REQ_MEMBER_BASE), 32),
+	T8112_AGENT_ATC2 = T8112_AGENT(
+		T8112_REQUESTER(T8112_REQ_GRP_ATC2, T8112_REQ_MEMBER_BASE), 32),
+	T8112_AGENT_ATC3 = T8112_AGENT(
+		T8112_REQUESTER(T8112_REQ_GRP_ATC3, T8112_REQ_MEMBER_BASE), 32),
+};
+
+enum t8112_direction {
+	T8112_DIRECTION_READ_BYTES = 1,
+	T8112_DIRECTION_WRITE_BYTES = 2,
+};
+
+static inline u64 t8112_control_word(u64 agent, bool write)
+{
+	return agent | T8112_SEL_VALID | T8112_SEL_FAMILY |
+	       FIELD_PREP(T8112_SEL_DIRECTION,
+			  write ? T8112_DIRECTION_WRITE_BYTES :
+				  T8112_DIRECTION_READ_BYTES);
+}
+
+/*
+ * The T8112 AMCC write counter is described by four adjacent DCS words.
+ * Word 0 enables the descriptor and its requester filter. Word 1 selects the
+ * write-byte event class. Word 2 carries requester ID/mask bits 21:0. Word 3
+ * marks all seven high requester-match bits as significant.
+ */
+#define T8112_WR_DESC0_ENABLE BIT(0)
+#define T8112_WR_DESC0_REQUESTER_FILTER BIT(5)
+#define T8112_WR_DESC1_EVENT_CLASS GENMASK(5, 1)
+#define T8112_WR_DESC1_WRITE_BYTES BIT(21)
+#define T8112_WR_DESC3_REQUESTER_HI_MASK GENMASK(31, 25)
+
+static inline u32 t8112_write_desc0(void)
+{
+	return T8112_WR_DESC0_ENABLE | T8112_WR_DESC0_REQUESTER_FILTER;
+}
+
+static inline u32 t8112_write_desc1(void)
+{
+	return FIELD_PREP(T8112_WR_DESC1_EVENT_CLASS,
+			  FIELD_MAX(T8112_WR_DESC1_EVENT_CLASS)) |
+	       T8112_WR_DESC1_WRITE_BYTES;
+}
+
+static inline u32 t8112_write_desc3(void)
+{
+	return T8112_WR_DESC3_REQUESTER_HI_MASK;
+}
+
+/* Shared write-counter gates. These are command words, not RMW registers. */
+#define T8112_WR_GLOBAL_EVENT_CLASS GENMASK(5, 1)
+#define T8112_WR_GLOBAL_ENABLE BIT(0)
+#define T8112_WR_AMCC_COMMIT BIT(0)
+
+static inline u32 t8112_write_global_event_class(void)
+{
+	return FIELD_PREP(T8112_WR_GLOBAL_EVENT_CLASS,
+			  FIELD_MAX(T8112_WR_GLOBAL_EVENT_CLASS));
+}
+
+/*
+ * T6000 requester ID is a fabric group byte plus a member byte. Bits 10:0 of
+ * REQUESTER_MASK are wildcard bits; bit 14 makes the requester comparator
+ * participate in the event selector. Bits 15 and 13:11 are left zero.
+ */
+#define T6000_SEL_REQUESTER_MEMBER GENMASK_ULL(7, 0)
+#define T6000_SEL_REQUESTER_GROUP GENMASK_ULL(15, 8)
+#define T6000_SEL_REQUESTER GENMASK_ULL(15, 0)
+#define T6000_SEL_REQUESTER_WILDCARDS GENMASK_ULL(26, 16)
+#define T6000_SEL_REQUESTER_MATCH BIT_ULL(30)
+#define T6000_SEL_REQUESTER_MASK GENMASK_ULL(31, 16)
+
+#define T6000_REQUESTER(_group, _member)                         \
+	(FIELD_PREP_CONST(T6000_SEL_REQUESTER_GROUP, (_group)) | \
+	 FIELD_PREP_CONST(T6000_SEL_REQUESTER_MEMBER, (_member)))
+#define T6000_REQUESTER_MASK(_wildcards) \
+	(T6000_SEL_REQUESTER_MATCH |     \
+	 FIELD_PREP_CONST(T6000_SEL_REQUESTER_WILDCARDS, (_wildcards)))
+#define T6000_AGENT(_requester, _wildcards) \
+	((u64)(_requester) | T6000_REQUESTER_MASK(_wildcards))
+
+enum t6000_requester_group {
+	T6000_REQ_GRP_ECPU = 0x00,
+	T6000_REQ_GRP_PCPU0 = 0x01,
+	T6000_REQ_GRP_PCPU1 = 0x02,
+	T6000_REQ_GRP_GFX = 0x08,
+	T6000_REQ_GRP_MEDIA0 = 0x10,
+	T6000_REQ_GRP_MEDIA1 = 0x11,
+	T6000_REQ_GRP_MEDIA3 = 0x13,
+};
+
+enum t6000_requester_member {
+	T6000_REQ_MEMBER_BASE = 0x00,
+	T6000_REQ_MEMBER_VDEC = 0x18,
+	T6000_REQ_MEMBER_ANE = 0x40,
+	T6000_REQ_MEMBER_JPEG = 0x09,
+	T6000_REQ_MEMBER_PCIE = 0xb4,
+};
+
+enum t6000_requester_wildcards {
+	T6000_REQ_EXACT = 0,
+	T6000_REQ_RANGE_4 = GENMASK(1, 0),
+	T6000_REQ_RANGE_16 = GENMASK(3, 0),
+	/* GFX spans four member bits and three requester-bank bits. */
+	T6000_REQ_GFX_BANKS = GENMASK(10, 8) | GENMASK(3, 0),
+};
+
+enum t6000_agent_selector {
+	T6000_AGENT_PCPU0 = T6000_AGENT(T6000_REQUESTER(T6000_REQ_GRP_PCPU0,
+							T6000_REQ_MEMBER_BASE),
+					T6000_REQ_RANGE_4),
+	T6000_AGENT_PCPU1 = T6000_AGENT(T6000_REQUESTER(T6000_REQ_GRP_PCPU1,
+							T6000_REQ_MEMBER_BASE),
+					T6000_REQ_RANGE_4),
+	T6000_AGENT_ECPU = T6000_AGENT(T6000_REQUESTER(T6000_REQ_GRP_ECPU,
+						       T6000_REQ_MEMBER_BASE),
+				       T6000_REQ_RANGE_4),
+	T6000_AGENT_GFX = T6000_AGENT(T6000_REQUESTER(T6000_REQ_GRP_GFX,
+						      T6000_REQ_MEMBER_BASE),
+				      T6000_REQ_GFX_BANKS),
+	T6000_AGENT_ANE = T6000_AGENT(T6000_REQUESTER(T6000_REQ_GRP_MEDIA0,
+						      T6000_REQ_MEMBER_ANE),
+				      T6000_REQ_RANGE_16),
+	T6000_AGENT_VDEC = T6000_AGENT(T6000_REQUESTER(T6000_REQ_GRP_MEDIA0,
+						       T6000_REQ_MEMBER_VDEC),
+				       T6000_REQ_RANGE_4),
+	T6000_AGENT_CODEC = T6000_AGENT(T6000_REQUESTER(T6000_REQ_GRP_MEDIA1,
+							T6000_REQ_MEMBER_BASE),
+					T6000_REQ_RANGE_16),
+	T6000_AGENT_MSR = T6000_AGENT(T6000_REQUESTER(T6000_REQ_GRP_MEDIA3,
+						      T6000_REQ_MEMBER_BASE),
+				      T6000_REQ_RANGE_4),
+	T6000_AGENT_JPEG = T6000_AGENT(T6000_REQUESTER(T6000_REQ_GRP_MEDIA3,
+						       T6000_REQ_MEMBER_JPEG),
+				       T6000_REQ_EXACT),
+	T6000_AGENT_PCIE = T6000_AGENT(T6000_REQUESTER(T6000_REQ_GRP_MEDIA1,
+						       T6000_REQ_MEMBER_PCIE),
+				       T6000_REQ_RANGE_4),
+};
+
+/*
+ * T6000 AMCC encodes direction as an event bank plus a transaction-type
+ * inclusion mask. The counter-class field selects the programmable byte
+ * counter family.
+ *
+ * The event-code bits are independent transaction-type includes, not an
+ * opaque event number. Ten types contribute bytes in both directions. Three
+ * further types contribute only to the read selection and three only to the
+ * write selection. The recovered interface identifies those types by their
+ * hardware bit number; assigning protocol opcode names not present in the
+ * evidence would be guesswork.
+ */
+#define T6000_AMCC_SEL_EVENT_CODE GENMASK_ULL(47, 32)
+#define T6000_AMCC_SEL_EVENT_BANK GENMASK_ULL(53, 48)
+#define T6000_AMCC_SEL_COUNTER_CLASS GENMASK_ULL(55, 54)
+
+enum t6000_amcc_transaction_type {
+	T6000_AMCC_TXN_READ_ONLY_TYPE0 = BIT(0),
+	T6000_AMCC_TXN_READ_ONLY_TYPE1 = BIT(1),
+	T6000_AMCC_TXN_WRITE_ONLY_TYPE2 = BIT(2),
+	T6000_AMCC_TXN_BIDIRECTIONAL_TYPE3 = BIT(3),
+	T6000_AMCC_TXN_BIDIRECTIONAL_TYPE4 = BIT(4),
+	T6000_AMCC_TXN_BIDIRECTIONAL_TYPE5 = BIT(5),
+	T6000_AMCC_TXN_WRITE_ONLY_TYPE6 = BIT(6),
+	T6000_AMCC_TXN_BIDIRECTIONAL_TYPE7 = BIT(7),
+	T6000_AMCC_TXN_BIDIRECTIONAL_TYPE8 = BIT(8),
+	T6000_AMCC_TXN_BIDIRECTIONAL_TYPE9 = BIT(9),
+	T6000_AMCC_TXN_BIDIRECTIONAL_TYPE10 = BIT(10),
+	T6000_AMCC_TXN_BIDIRECTIONAL_TYPE11 = BIT(11),
+	T6000_AMCC_TXN_READ_ONLY_TYPE12 = BIT(12),
+	T6000_AMCC_TXN_WRITE_ONLY_TYPE13 = BIT(13),
+	T6000_AMCC_TXN_BIDIRECTIONAL_TYPE14 = BIT(14),
+	T6000_AMCC_TXN_BIDIRECTIONAL_TYPE15 = BIT(15),
+};
+
+#define T6000_AMCC_TXN_BIDIRECTIONAL                                \
+	(T6000_AMCC_TXN_BIDIRECTIONAL_TYPE3 |                         \
+	 T6000_AMCC_TXN_BIDIRECTIONAL_TYPE4 |                         \
+	 T6000_AMCC_TXN_BIDIRECTIONAL_TYPE5 |                         \
+	 T6000_AMCC_TXN_BIDIRECTIONAL_TYPE7 |                         \
+	 T6000_AMCC_TXN_BIDIRECTIONAL_TYPE8 |                         \
+	 T6000_AMCC_TXN_BIDIRECTIONAL_TYPE9 |                         \
+	 T6000_AMCC_TXN_BIDIRECTIONAL_TYPE10 |                        \
+	 T6000_AMCC_TXN_BIDIRECTIONAL_TYPE11 |                        \
+	 T6000_AMCC_TXN_BIDIRECTIONAL_TYPE14 |                        \
+	 T6000_AMCC_TXN_BIDIRECTIONAL_TYPE15)
+
+#define T6000_AMCC_TXN_READ_ONLY                     \
+	(T6000_AMCC_TXN_READ_ONLY_TYPE0 |              \
+	 T6000_AMCC_TXN_READ_ONLY_TYPE1 |              \
+	 T6000_AMCC_TXN_READ_ONLY_TYPE12)
+
+#define T6000_AMCC_TXN_WRITE_ONLY                    \
+	(T6000_AMCC_TXN_WRITE_ONLY_TYPE2 |             \
+	 T6000_AMCC_TXN_WRITE_ONLY_TYPE6 |             \
+	 T6000_AMCC_TXN_WRITE_ONLY_TYPE13)
+
+/* Bit 3 selects the direct AMCC byte bank; bit 5 selects its write half. */
+enum t6000_amcc_event_bank {
+	T6000_AMCC_BANK_DIRECT_BYTES = BIT(3),
+	T6000_AMCC_BANK_WRITE = BIT(5),
+};
+
+enum t6000_amcc_counter_class {
+	T6000_AMCC_COUNTER_PROGRAMMABLE = 0x03,
+};
+
+static inline u16 t6000_amcc_transaction_mask(bool write)
+{
+	return T6000_AMCC_TXN_BIDIRECTIONAL |
+	       (write ? T6000_AMCC_TXN_WRITE_ONLY :
+			T6000_AMCC_TXN_READ_ONLY);
+}
+
+static inline u8 t6000_amcc_event_bank(bool write)
+{
+	return T6000_AMCC_BANK_DIRECT_BYTES |
+	       (write ? T6000_AMCC_BANK_WRITE : 0);
+}
+
+static inline u64 t6000_amcc_control_word(u64 agent, bool write)
+{
+	return agent |
+	       FIELD_PREP(T6000_AMCC_SEL_EVENT_BANK,
+			  t6000_amcc_event_bank(write)) |
+	       FIELD_PREP(T6000_AMCC_SEL_EVENT_CODE,
+			  t6000_amcc_transaction_mask(write)) |
+	       FIELD_PREP(T6000_AMCC_SEL_COUNTER_CLASS,
+			  T6000_AMCC_COUNTER_PROGRAMMABLE);
+}
+
+/* T6000 DCS uses a compact event-family field for read/write bytes. */
+#define T6000_DCS_SEL_EVENT GENMASK_ULL(50, 48)
+
+enum t6000_dcs_event {
+	T6000_DCS_EVENT_READ_BYTES = 1,
+	T6000_DCS_EVENT_WRITE_BYTES = 5,
+};
+
+static inline u64 t6000_dcs_control_word(u64 agent, bool write)
+{
+	return agent | FIELD_PREP(T6000_DCS_SEL_EVENT,
+				  write ? T6000_DCS_EVENT_WRITE_BYTES :
+					  T6000_DCS_EVENT_READ_BYTES);
+}
+
+/* T6000 AMCC command register: apply the mask, then clear the new slot. */
+#define T6000_AMCC_CMD_APPLY BIT(0)
+#define T6000_AMCC_CMD_CLEAR BIT(4)
+
+static inline u32 t6000_amcc_commit_word(void)
+{
+	return T6000_AMCC_CMD_APPLY | T6000_AMCC_CMD_CLEAR;
+}
+
+#endif

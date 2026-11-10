@@ -2076,6 +2076,12 @@ L:	linux-hwmon@vger.kernel.org
 S:	Odd fixes
 F:	drivers/hwmon/applesmc.c
 
+APPLE MEMORY CACHE CONTROLLER PMU DRIVER
+M:	Ryan Murray <ryan@aurorasilicon.org>
+S:	Maintained
+F:	drivers/perf/apple_mcc_pmu*
+F:	include/linux/soc/apple/mcc_pmu.h
+
 APPLE T8140 SOC AND J700 (MACBOOK NEO) SUPPORT
 M:	Ryan Murray <ryan@aurorasilicon.org>
 W:	https://aurora-silicon.github.io
