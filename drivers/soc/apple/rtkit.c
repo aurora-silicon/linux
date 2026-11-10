@@ -1641,6 +1641,63 @@ bool apple_rtkit_has_endpoint(struct apple_rtkit *rtk, u8 ep)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_has_endpoint);
 
+int apple_rtkit_describe_buffers(struct apple_rtkit *rtk,
+				 struct apple_rtkit_buffer_desc *desc,
+				 unsigned int max)
+{
+	const struct apple_rtkit_shmem *bufs[APPLE_RTKIT_BUF_COUNT] = {
+		[APPLE_RTKIT_BUF_IOREPORT] = &rtk->ioreport_buffer,
+		[APPLE_RTKIT_BUF_COREANALYTICS] = &rtk->coreanalytics_buffer,
+		[APPLE_RTKIT_BUF_CRASHLOG] = &rtk->crashlog_buffer,
+		[APPLE_RTKIT_BUF_OSLOG] = &rtk->oslog_buffer,
+		[APPLE_RTKIT_BUF_KDEBUG0] = &rtk->kdebug_buffer0,
+		[APPLE_RTKIT_BUF_KDEBUG1] = &rtk->kdebug_buffer1,
+		[APPLE_RTKIT_BUF_PMP_AUX] = &rtk->pmp_aux_buffer,
+		[APPLE_RTKIT_BUF_SYSLOG] = &rtk->syslog_buffer,
+	};
+	unsigned int i, n = 0;
+
+	for (i = 0; i < APPLE_RTKIT_BUF_COUNT; i++) {
+		if (!bufs[i]->size)
+			continue;
+		if (n == max)
+			return -ENOSPC;
+		desc[n].kind = i;
+		desc[n].is_mapped = bufs[i]->is_mapped;
+		desc[n].iova = bufs[i]->iova;
+		desc[n].size = bufs[i]->size;
+		n++;
+	}
+	return n;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_describe_buffers);
+
+int apple_rtkit_readopt(struct apple_rtkit *rtk)
+{
+	/*
+	 * Only a session that was running when it was left can be taken over:
+	 * its endpoint map, protocol version, syslog geometry and buffers then
+	 * describe the same firmware build and the same IOVAs as the instance
+	 * that runs now (the caller compared the buffers).
+	 */
+	if (READ_ONCE(rtk->shutting_down) || !apple_rtkit_is_running(rtk))
+		return -EINVAL;
+
+	apple_mbox_hold_rx(rtk->mbox);
+	/* Acknowledgments still queued belong to the instance that is gone. */
+	cancel_work_sync(&rtk->sync_ack_work);
+	flush_workqueue(rtk->wq);
+	kfifo_reset(&rtk->sync_ack_fifo);
+
+	reinit_completion(&rtk->iop_pwr_ack_completion);
+	reinit_completion(&rtk->ap_pwr_ack_completion);
+
+	/* Messages the other kernel left queued in the mailbox arrive now. */
+	apple_mbox_release_rx(rtk->mbox);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_readopt);
+
 int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
 {
 	u64 msg;
