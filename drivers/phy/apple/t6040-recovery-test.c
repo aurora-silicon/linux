@@ -35,10 +35,30 @@ static void t6040_recovery_retry_exhaustion_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, state.retries, (u8)T6040_RECOVERY_RETRIES);
 }
 
+static void t6040_recovery_held_reference_test(struct kunit *test)
+{
+	unsigned int attempt;
+
+	for (attempt = 0; attempt < T6040_RECOVERY_PM_RETRIES; attempt++)
+		KUNIT_EXPECT_EQ(test,
+				t6040_recovery_pm_action(1, 0, attempt),
+				T6040_RECOVERY_PM_RETRY);
+	KUNIT_EXPECT_EQ(test,
+			t6040_recovery_pm_action(1, 0, attempt),
+			T6040_RECOVERY_PM_FALLBACK);
+	KUNIT_EXPECT_EQ(test,
+			t6040_recovery_pm_action(0, 1, attempt),
+			T6040_RECOVERY_PM_FALLBACK);
+	KUNIT_EXPECT_EQ(test,
+			t6040_recovery_pm_action(0, 0, attempt),
+			T6040_RECOVERY_PM_SUSPEND);
+}
+
 static struct kunit_case t6040_recovery_test_cases[] = {
 	KUNIT_CASE(t6040_recovery_missed_ack_test),
 	KUNIT_CASE(t6040_recovery_failed_tune_test),
 	KUNIT_CASE(t6040_recovery_retry_exhaustion_test),
+	KUNIT_CASE(t6040_recovery_held_reference_test),
 	{}
 };
 
