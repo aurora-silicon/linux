@@ -3,6 +3,7 @@
 #define _APPLE_AVE_SIZES_H_
 
 #include <linux/align.h>
+#include <linux/log2.h>
 #include <linux/math.h>
 #include <linux/sizes.h>
 #include <linux/types.h>
@@ -19,25 +20,30 @@ struct ave_6070_avc_recon_layout {
 	u32 bytes;
 };
 
-/* Contiguous 8-bit 4:2:0 AVC reconstruction surface. */
+/*
+ * Contiguous 8-bit 4:2:0 AVC reconstruction surface, compressed in
+ * 32-pixel luma and 16-pixel chroma tile rows: luma metadata, chroma
+ * metadata, luma data, chroma data, in that order.
+ */
 static inline struct ave_6070_avc_recon_layout
 ave_6070_avc_recon_layout(u32 width, u32 height)
 {
 	struct ave_6070_avc_recon_layout l = { };
-	u32 mb_width = DIV_ROUND_UP(width, 16);
-	u32 mb_height = DIV_ROUND_UP(height, 16);
-	u32 metadata_rows = (DIV_ROUND_UP(height + 1, 8) + 7) / 8;
+	u32 luma_cols = DIV_ROUND_UP(width, 32);
+	u32 luma_rows = DIV_ROUND_UP(height + 4, 32);
+	u32 chroma_cols = DIV_ROUND_UP(width / 2, 16);
+	u32 chroma_rows = DIV_ROUND_UP(height / 2 + 4, 16);
 
-	l.luma_data = ALIGN(256 * mb_width * mb_height, 512);
-	l.chroma_data = 128 * mb_width * mb_height;
-	l.luma_metadata = ALIGN(ALIGN(32 * mb_width, 128) * metadata_rows, 512);
-	/* This form allocates no separate chroma-metadata bytes. */
-	l.chroma_metadata = 0;
+	l.luma_data = 1024 * luma_cols * luma_rows;
+	l.chroma_data = ALIGN(512 * chroma_cols * chroma_rows, 128);
+	l.luma_metadata = ALIGN(32 * roundup_pow_of_two(luma_cols) *
+				roundup_pow_of_two(luma_rows), 128);
+	l.chroma_metadata = ALIGN(8 * roundup_pow_of_two(chroma_cols) *
+				  roundup_pow_of_two(chroma_rows), 128);
 
-	/* Header regions precede the two picture-data regions. */
 	l.luma_metadata_offset = 0;
 	l.chroma_metadata_offset = l.luma_metadata;
-	l.luma_data_offset = l.luma_metadata + l.chroma_metadata;
+	l.luma_data_offset = l.chroma_metadata_offset + l.chroma_metadata;
 	l.chroma_data_offset = l.luma_data_offset + l.luma_data;
 	l.bytes = l.chroma_data_offset + l.chroma_data;
 	return l;

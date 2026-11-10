@@ -714,7 +714,7 @@ static void ave_6070_start_process_fields(struct kunit *test)
 				KUNIT_EXPECT_EQ(test, start[sl->ref_compression], 1U);
 				KUNIT_EXPECT_EQ(test,
 						get_unaligned_le64(start + sl->recon.address),
-						sess->ref_a[0].dma + 0x10000);
+						sess->ref_a[0].dma + 0x28000);
 				KUNIT_EXPECT_EQ(test,
 						get_unaligned_le64(start + sl->recon.address + 8),
 						sess->ref_a[0].dma);
