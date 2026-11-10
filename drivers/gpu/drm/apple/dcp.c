@@ -2586,6 +2586,15 @@ static int dcp_external_stop_locked(struct apple_dcp *dcp, u64 generation)
 		return dcp->external_error;
 	if (dcp->external_stopped && !READ_ONCE(dcp->dptxport[0].connected))
 		return 0;
+	/*
+	 * The sink's audio first, as around a 14.7 external mode set: a link
+	 * the audio client still holds when the pipe powers off and the DPTX
+	 * link is withdrawn left the next activation timing out (-ETIMEDOUT)
+	 * and the display dark. It comes back with the link
+	 * (dcp_dptx_connect_raw()), before the pipe is powered on again.
+	 */
+	if (dcp->avep)
+		av_service_disconnect(dcp);
 	iomfb_pause_presentation(dcp, true);
 	dcp->external_running = false;
 	/* Route setup can call this before IOMFB or its shared memory exists. */
@@ -2638,8 +2647,6 @@ release_link:
 	}
 	dcp->external_stopped = true;
 	WRITE_ONCE(dcp->typec_crtc_off, true);
-	if (dcp->avep)
-		av_service_disconnect(dcp);
 	return 0;
 failed:
 	/* A retry could race a late reply. Keep this session blocked and owned. */
