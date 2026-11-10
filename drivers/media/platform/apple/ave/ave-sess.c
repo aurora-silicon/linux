@@ -346,14 +346,24 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 	ref_a = ALIGN(w, 32) * ALIGN(h + 16, 32);
 	if (p->bit_depth == 10)
 		ref_a = ref_a * 5 / 4;
-	ref_b = roundup_pow_of_two(w) * roundup_pow_of_two(h) / 32;
+	ref_b = fw6070 ? ave_6070_colocated_size(w, h, hevc) :
+			   roundup_pow_of_two(w) * roundup_pow_of_two(h) / 32;
 	ref_c = ave_lfs_ref_size(w, h, hevc, ave->variant->lfs_ref_scale);
-	ref_d = ALIGN(hevc ? 64 * w32 * h32 : 128 * p->mbs, SZ_16K);
-	tile = hevc ? 2304 * w32 * h64 : ALIGN(w, 16) * ALIGN(h, 64);
-	row_a = ALIGN(hevc ? max_t(u32, 0x180 * DIV_ROUND_UP(w, 64), SZ_16K) :
-				   256 * w16,
-		      SZ_16K);
-	row_b = ALIGN(hevc ? 768 * w32 : 1024 * w16, SZ_16K);
+	ref_d = fw6070 ? ave_6070_lowres_result_size(w, h) :
+			   ALIGN(hevc ? 64 * w32 * h32 : 128 * p->mbs, SZ_16K);
+	if (fw6070) {
+		tile = ave_6070_entropy_size(w, h, hevc);
+		row_a = ave_6070_src_neighbor_info_size(w, h, hevc);
+		row_b = ave_6070_src_neighbor_pixel_size(w, h, hevc);
+	} else {
+		tile = hevc ? 2304 * w32 * h64 : ALIGN(w, 16) * ALIGN(h, 64);
+		if (hevc)
+			row_a = ALIGN(max_t(u32, 0x180 * DIV_ROUND_UP(w, 64), SZ_16K),
+				      SZ_16K);
+		else
+			row_a = ALIGN(256 * w16, SZ_16K);
+		row_b = ALIGN(hevc ? 768 * w32 : 1024 * w16, SZ_16K);
+	}
 	if (p->bit_depth == 10)
 		tile *= 2;
 
@@ -376,24 +386,30 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 	if (fw->counted && p->rc_mode == 3)
 		for (unsigned int i = 0; i < 2; i++)
 			ave_req(r, &n, &sess->mb_extra[i], ALIGN(82 * p->mbs, SZ_16K), 0, nomap);
-	/* HEVC: one 0x180-byte neighbour record per 64 pixels, at least 16 KiB. */
+	/* The split-bank generation has four independent neighbour sets. */
 	for (unsigned int set = 0; set < neighbour_sets; set++) {
 		ave_req(r, &n, &sess->row_a[set], row_a, 0, nomap);
 		ave_req(r, &n, &sess->row_b[set], row_b, 0, nomap);
-		ave_req(r, &n, &sess->fixed[set], SZ_16K, 0, nomap);
+		ave_req(r, &n, &sess->fixed[set],
+			fw6070 ? ave_6070_src_neighbor_data_size(w, hevc) : SZ_16K,
+			0, nomap);
 		if (fw6070)
-			ave_req(r, &n, &sess->neighbour_fw[set], SZ_16K, 0,
-				nomap);
+			ave_req(r, &n, &sess->neighbour_fw[set],
+				ave_6070_src_neighbor_fw_size(w, hevc), 0, nomap);
 	}
 	for (unsigned int set = 0; set < entropy_sets; set++)
 		for (unsigned int i = 0; i < (hevc ? 4 : AVE_TILE_BUFS); i++) {
 			ave_req(r, &n, &sess->tile[set][i], tile, 0, nomap);
-			ave_req(r, &n, &sess->tile_aux[set][i], ALIGN(h, 128), 0,
+			ave_req(r, &n, &sess->tile_aux[set][i],
+				fw6070 ? ave_6070_entropy_aux_size(h) : ALIGN(h, 128), 0,
 				nomap);
 		}
 	if (hevc)
 		for (unsigned int i = 0; i < 2; i++)
-			ave_req(r, &n, &sess->hevc_extra[i], ALIGN(w * h32, SZ_16K), 0, nomap);
+			ave_req(r, &n, &sess->hevc_extra[i],
+				fw6070 ? ave_6070_mb_input_size(w, h) :
+					 ALIGN(w * h32, SZ_16K),
+				0, nomap);
 	for (unsigned int s = 0; s < p->slots; s++) {
 		ave_req(r, &n, &sess->slot[s].coded, p->coded_cap, 0, 0);
 		ave_req(r, &n, &sess->slot[s].meta, fw->meta_bytes, 0, 0);

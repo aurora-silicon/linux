@@ -4,6 +4,7 @@
 
 #include <linux/align.h>
 #include <linux/math.h>
+#include <linux/sizes.h>
 #include <linux/types.h>
 
 /* Start +0x7d0 LFSRef: exact descriptor bytes, before DMA page rounding. */
@@ -16,6 +17,86 @@ static inline u32 ave_lfs_ref_size(u32 width, u32 height, bool hevc, u32 scale)
 	else
 		size = ALIGN(width, 64) * (ALIGN(height, 16) / 4 + 12);
 	return size * scale;
+}
+
+/* Working-buffer rules used by the split-bank 6070 command layout. */
+static inline u32 ave_6070_colocated_size(u32 width, u32 height, bool hevc)
+{
+	if (hevc)
+		return ALIGN(2 * width, 64) *
+		       ALIGN(DIV_ROUND_UP(height, 32), 2);
+
+	return ALIGN(8 * width, 128) * DIV_ROUND_UP(height, 16);
+}
+
+static inline u32 ave_6070_lowres_result_size(u32 width, u32 height)
+{
+	return ALIGN(4 * width, 128) * DIV_ROUND_UP(height, 64) + 1024;
+}
+
+static inline u32 ave_6070_src_neighbor_info_size(u32 width, u32 height,
+						  bool hevc)
+{
+	u32 raw;
+
+	if (hevc) {
+		u32 rows = DIV_ROUND_UP(DIV_ROUND_UP(height, 32), 2);
+
+		raw = 192 * DIV_ROUND_UP(width, 32) * (rows ? rows - 1 : 0);
+	} else {
+		raw = ALIGN(16 * width, 256);
+	}
+
+	return ALIGN(max_t(u32, raw, SZ_16K), SZ_16K);
+}
+
+static inline u32 ave_6070_src_neighbor_pixel_size(u32 width, u32 height,
+						   bool hevc)
+{
+	u32 raw;
+
+	if (hevc) {
+		u32 rows = DIV_ROUND_UP(DIV_ROUND_UP(height, 32), 2);
+
+		raw = 768 * DIV_ROUND_UP(width, 32) * (rows ? rows - 1 : 0);
+	} else {
+		raw = ALIGN(64 * width, 1024);
+	}
+
+	return ALIGN(max_t(u32, raw, SZ_16K), SZ_16K);
+}
+
+static inline u32 ave_6070_src_neighbor_data_size(u32 width, bool hevc)
+{
+	u32 raw = hevc ? ALIGN(width, 32) / 8 : 56 * DIV_ROUND_UP(width, 16);
+
+	return ALIGN(max_t(u32, raw, SZ_16K), SZ_16K);
+}
+
+static inline u32 ave_6070_src_neighbor_fw_size(u32 width, bool hevc)
+{
+	u32 raw = ALIGN((hevc ? 2 : 4) * width, 128);
+
+	return ALIGN(max_t(u32, raw, SZ_16K), SZ_16K);
+}
+
+static inline u32 ave_6070_entropy_size(u32 width, u32 height, bool hevc)
+{
+	if (hevc)
+		return 2304 * DIV_ROUND_UP(width, 32) * DIV_ROUND_UP(height, 64);
+
+	return ALIGN(64 * width, 1024) *
+	       max_t(u32, 8, DIV_ROUND_UP(height, 64));
+}
+
+static inline u32 ave_6070_entropy_aux_size(u32 height)
+{
+	return ALIGN(height, 128);
+}
+
+static inline u32 ave_6070_mb_input_size(u32 width, u32 height)
+{
+	return ALIGN(ALIGN(width, 32) * DIV_ROUND_UP(height, 32), 4096);
 }
 
 #endif
