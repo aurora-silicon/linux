@@ -236,5 +236,9 @@ module! {
             default: 1,
             description: "G16: validate CDM/VDM stream records",
         },
+        g16_test_outer_pace: u32 {
+            default: 0,
+            description: "G16 TEST ONLY: wait for same queue/pair outer records (0=A, 1=pace)",
+        },
     },
 }

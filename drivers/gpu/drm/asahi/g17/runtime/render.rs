@@ -603,6 +603,9 @@ impl crate::g17::queue::render::Host for Host<'_> {
     fn next_publication(&mut self) -> Result<u64> {
         Ok(self.firmware.port.next_publication())
     }
+    fn outer_pair_consumed(&mut self, priority: u8, targets: [u32; 2]) -> Result<bool> {
+        self.firmware.init.render_records_consumed(priority, targets)
+    }
     fn publish_outer_pair(
         &mut self,
         priority: u8,

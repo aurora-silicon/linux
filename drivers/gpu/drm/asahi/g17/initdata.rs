@@ -602,6 +602,22 @@ impl InitData {
         Ok(values)
     }
 
+    /// True once both firmware consumers have passed the named render records. A producer may
+    /// have advanced beyond `targets`; circular interval membership handles that case.
+    pub(super) fn render_records_consumed(
+        &self,
+        priority: u8,
+        targets: [u32; 2],
+    ) -> Result<bool> {
+        use super::fw::{channels::work_record_pending, queue::DataMaster};
+        let fragment = self.work_cursors(priority, DataMaster::Fragment)?;
+        let tiling = self.work_cursors(priority, DataMaster::Tiling)?;
+        Ok([fragment, tiling].into_iter().zip(targets).all(|(cursors, target)| {
+            !work_record_pending(cursors[0], cursors[2], target)
+                && !work_record_pending(cursors[1], cursors[2], target)
+        }))
+    }
+
     /// Validate both destinations before exposing fragment, then tiling. The accounting token
     /// is committed after copying fragment; late tiling state is published before its slot.
     /// Deferred pairs retain both slot bodies without exposing either producer.

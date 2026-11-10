@@ -48,6 +48,11 @@ pub(crate) fn stream_gate() -> bool {
     module_parameters::g16_stream_gate.value() != 0
 }
 
+/// Test-only 25G83 render pacing selector. Unknown values keep production behavior.
+pub(crate) fn outer_pace() -> bool {
+    module_parameters::g16_test_outer_pace.value() == 1
+}
+
 /// Fragment-only dependency publication has not been qualified on this backend.
 pub(crate) fn early_tiling() -> bool {
     false

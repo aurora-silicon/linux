@@ -617,6 +617,10 @@ pub(crate) struct Queue {
     retirement_proved: bool,
     source_readers: Arc<core::sync::atomic::AtomicU32>,
     source_hint: crate::g17::sync_input::ReaderHint,
+    /// This queue runs the identified 25G83 graph and may take its test arm.
+    v25g83: bool,
+    /// Last exposed outer record, retained only by the 25G83 pacing arm.
+    paced_outer: Option<(u64, u8, u32)>,
 }
 
 impl Queue {
@@ -631,6 +635,7 @@ impl Queue {
         pointers: PointerLayout,
         operand_state: &'static OperandState,
         program: ComputeProgram,
+        v25g83: bool,
     ) -> Result<Self> {
         let Backing { mut pool, mut kick } = backing;
         let (active, replays) = (Fifo::new()?, Fifo::new()?);
@@ -688,6 +693,8 @@ impl Queue {
             retirement_proved: false,
             source_readers: Arc::new(core::sync::atomic::AtomicU32::new(0), GFP_KERNEL)?,
             source_hint: crate::g17::sync_input::ReaderHint::new(),
+            v25g83,
+            paced_outer: None,
         })
     }
     /// The firmware failed the command whose completion stamp is `stamp`. It writes a
@@ -2237,7 +2244,12 @@ pub(crate) trait Host {
     fn qos_cancel(&mut self, publication: qos::Publication) -> Result;
     fn publish_qid(&mut self, id: kick::Id) -> Result;
     fn register_queue(&mut self, queue: &crate::g17::fw::kick::KsmQueue) -> Result;
-    fn publish_outer(&mut self, priority: u8, slot: &crate::g17::fw::channels::WorkSlot) -> Result;
+    fn outer_consumed(&mut self, priority: u8, target: u32) -> Result<bool>;
+    fn publish_outer(
+        &mut self,
+        priority: u8,
+        slot: &crate::g17::fw::channels::WorkSlot,
+    ) -> Result<u32>;
     fn notify(&mut self, message: u64) -> Result;
     fn note_submission(&mut self) -> Result;
 }
@@ -2556,7 +2568,7 @@ impl Queue {
                 self.graph.record_ends[slot] = Some(producer);
             }
             host.publish_qid(self.kick.id())?;
-            host.publish_outer(
+            let outer_target = host.publish_outer(
                 policy.priority(),
                 &WorkSlot::new(
                     DataMaster::Compute,
@@ -2566,6 +2578,9 @@ impl Queue {
                     self.outer_started & ring == 0,
                 )?,
             )?;
+            if self.v25g83 && crate::g16::outer_pace() {
+                self.paced_outer = Some((epoch, policy.priority(), outer_target));
+            }
             self.outer_started |= ring;
             self.installed = true;
             self.published_config = Some(identity);
@@ -2635,6 +2650,15 @@ impl Queue {
         let (epoch, state) = host.epoch()?;
         if state != 0 {
             return Err(EBUSY);
+        }
+        if self.v25g83 && crate::g16::outer_pace() {
+            if let Some((generation, priority, target)) = self.paced_outer {
+                if generation == epoch && !host.outer_consumed(priority, target)? {
+                    // Phase 7 is a test-arm refusal before any state becomes visible.
+                    crate::g17::trace::schedule(packet, 7, i32::from(priority));
+                    return Err(EAGAIN);
+                }
+            }
         }
         let replay_front = self
             .replays

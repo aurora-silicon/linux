@@ -48,6 +48,9 @@ impl crate::g17::queue::render::Host for DirectHost<'_> {
     fn next_publication(&mut self) -> Result<u64> {
         Ok(self.port.next_publication())
     }
+    fn outer_pair_consumed(&mut self, priority: u8, targets: [u32; 2]) -> Result<bool> {
+        self.port.render_records_consumed(self.render, priority, targets)
+    }
     fn epoch(&self) -> Result<(u64, u32)> {
         Ok((self.generation, self.port.recovery_state()?))
     }

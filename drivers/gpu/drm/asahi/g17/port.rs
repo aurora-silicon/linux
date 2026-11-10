@@ -251,6 +251,15 @@ impl Port {
         Ok(ring.free()? > reserved[index])
     }
 
+    /// True once both firmware consumers have passed the named compute record.
+    pub(super) fn compute_record_consumed(&self, priority: u8, target: u32) -> Result<bool> {
+        use super::fw::channels::work_record_pending;
+        let (_, ring) = self.ring(priority)?;
+        let cursors = ring.cursors()?;
+        Ok(!work_record_pending(cursors[0], cursors[2], target)
+            && !work_record_pending(cursors[1], cursors[2], target))
+    }
+
     /// Exposes `record` in its reserved slot. Inner queue records must be visible first. Returns
     /// the new producer, the retained consumer witness for this slot.
     pub(super) fn publish_compute(
@@ -300,6 +309,25 @@ impl Port {
             *views.fragment.get(index).ok_or(EINVAL)?,
             *views.tiling.get(index).ok_or(EINVAL)?,
         ))
+    }
+
+    /// True once both firmware consumers have passed the named render records. The render lock
+    /// excludes host producer movement while the two rings are sampled.
+    pub(super) fn render_records_consumed(
+        &self,
+        _guard: &MutexGuard<'_, ()>,
+        priority: u8,
+        targets: [u32; 2],
+    ) -> Result<bool> {
+        use super::fw::channels::work_record_pending;
+        let (fragment, tiling) = self.render_rings(priority)?;
+        Ok([fragment.cursors()?, tiling.cursors()?]
+            .into_iter()
+            .zip(targets)
+            .all(|(cursors, target)| {
+                !work_record_pending(cursors[0], cursors[2], target)
+                    && !work_record_pending(cursors[1], cursors[2], target)
+            }))
     }
 
     /// Reads both render work rings of `priority` once. Returns their producers if both have a

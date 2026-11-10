@@ -95,6 +95,8 @@ pub(crate) trait Host {
     fn publish_qid(&mut self, id: kick::Id) -> Result;
     /// The next publication number, shared with compute (timeout ordering).
     fn next_publication(&mut self) -> Result<u64>;
+    /// Whether both firmware work-ring consumers passed an earlier publication of this pair.
+    fn outer_pair_consumed(&mut self, priority: u8, targets: [u32; 2]) -> Result<bool>;
     fn publish_outer_pair(
         &mut self,
         priority: u8,
@@ -127,6 +129,13 @@ struct Prepared {
     ordinal: u64,
     mcache: Option<McacheTable>,
 }
+
+#[derive(Copy, Clone)]
+struct PacedOuter {
+    generation: u64,
+    priority: u8,
+    targets: [u32; 2],
+}
 struct Active {
     /// Publication number, shared with compute (crate::g17::timeout).
     published: u64,
@@ -158,6 +167,9 @@ pub(crate) struct Pair {
     kicks: [kick::Queue; 2],
     free_list: Arc<RenderPool>,
     pending_aliases: Option<KVec<mmu::KernelMapping>>,
+    /// Last exposed outer records. The 25G83 pacing arm admits the next record for this pair only
+    /// after both firmware consumers pass these cursors; unrelated pairs remain independent.
+    paced_outer: Option<PacedOuter>,
     prepared: Option<Prepared>,
     active: Tracker<Active>,
     slot: u8,
@@ -268,6 +280,7 @@ impl Pair {
             kicks: [tiling, fragment],
             free_list,
             pending_aliases: Some(aliases),
+            paced_outer: None,
             prepared: None,
             active: Tracker::new(),
             slot,
@@ -957,6 +970,19 @@ impl Pair {
             return Err(EIO);
         }
         let policy = packet.context.policy();
+        if self.variant.graph == crate::g17::fw::variant::InitGraph::V25G83
+            && crate::g16::outer_pace()
+        {
+            if let Some(outer) = self.paced_outer.filter(|outer| {
+                outer.generation == epoch && outer.priority == policy.priority()
+            }) {
+                if !host.outer_pair_consumed(outer.priority, outer.targets)? {
+                    // Phase 7 is a test-arm refusal before any state becomes visible.
+                    crate::g17::trace::schedule(packet, 7, i32::from(outer.priority));
+                    return Err(EAGAIN);
+                }
+            }
+        }
         // A registration of another class can only follow a rebind, which
         // requires the pair to have drained.
         if self
@@ -999,6 +1025,15 @@ impl Pair {
         let publish = (|| {
             host.activate_render_pool(self.free_list.id(), free_list_generation)?;
             host.publish_retained_pair(priority, fragment_slot, tiling_slot, outer_next)?;
+            if self.variant.graph == crate::g17::fw::variant::InitGraph::V25G83
+                && crate::g16::outer_pace()
+            {
+                self.paced_outer = Some(PacedOuter {
+                    generation: self.recovery_generation,
+                    priority,
+                    targets: outer_next,
+                });
+            }
             self.active.back_mut().ok_or(EIO)?.outer_published = true;
             host.notify_render(priority)?;
             crate::g17::trace::publish(

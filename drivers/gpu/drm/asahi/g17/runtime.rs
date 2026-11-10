@@ -1176,6 +1176,10 @@ impl Backend {
                     self.shared.variant.pointers,
                     self.shared.operand_state,
                     self.shared.variant.compute,
+                    matches!(
+                        self.shared.variant.graph,
+                        crate::g17::fw::variant::InitGraph::V25G83
+                    ),
                 )?;
                 Ok(KBox::new(queue, GFP_KERNEL)?)
             })();
@@ -1418,8 +1422,15 @@ impl compute::Host for ComputeHost<'_> {
     fn register_queue(&mut self, queue: &super::fw::kick::KsmQueue) -> Result {
         self.port.register_queues(core::slice::from_ref(queue))
     }
-    fn publish_outer(&mut self, _priority: u8, slot: &super::fw::channels::WorkSlot) -> Result {
-        self.port.publish_compute(self.outer.take().ok_or(EIO)?, slot).map(|_| ())
+    fn outer_consumed(&mut self, priority: u8, target: u32) -> Result<bool> {
+        self.port.compute_record_consumed(priority, target)
+    }
+    fn publish_outer(
+        &mut self,
+        _priority: u8,
+        slot: &super::fw::channels::WorkSlot,
+    ) -> Result<u32> {
+        self.port.publish_compute(self.outer.take().ok_or(EIO)?, slot)
     }
     fn notify(&mut self, message: u64) -> Result {
         self.port.notify(message)
@@ -1465,8 +1476,15 @@ impl compute::Host for DirectHost<'_> {
     fn register_queue(&mut self, _queue: &super::fw::kick::KsmQueue) -> Result {
         Err(EAGAIN)
     }
-    fn publish_outer(&mut self, _priority: u8, slot: &super::fw::channels::WorkSlot) -> Result {
-        self.port.publish_compute(self.outer.take().ok_or(EIO)?, slot).map(|_| ())
+    fn outer_consumed(&mut self, priority: u8, target: u32) -> Result<bool> {
+        self.port.compute_record_consumed(priority, target)
+    }
+    fn publish_outer(
+        &mut self,
+        _priority: u8,
+        slot: &super::fw::channels::WorkSlot,
+    ) -> Result<u32> {
+        self.port.publish_compute(self.outer.take().ok_or(EIO)?, slot)
     }
     fn notify(&mut self, message: u64) -> Result {
         self.port.notify(message)

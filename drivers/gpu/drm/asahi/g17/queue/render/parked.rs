@@ -227,6 +227,7 @@ impl ParkedPair {
             kicks,
             free_list: next.pool.clone(),
             pending_aliases: None,
+            paced_outer: None,
             prepared: None,
             active: Tracker::new(),
             slot: self.slot,

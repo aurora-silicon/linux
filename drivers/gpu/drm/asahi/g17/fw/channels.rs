@@ -476,6 +476,21 @@ pub(crate) const WORK_RING_SLOTS: u32 = 256;
 /// Number of engines with a work ring per priority.
 const WORK_RINGS_PER_PRIORITY: usize = 3;
 
+/// Whether the record exposed by `target` is still between a firmware consumer and the current
+/// producer. All cursors are positions between records in the circular work ring.
+pub(crate) const fn work_record_pending(consumer: u32, producer: u32, target: u32) -> bool {
+    if consumer >= WORK_RING_SLOTS
+        || producer >= WORK_RING_SLOTS
+        || target >= WORK_RING_SLOTS
+    {
+        return false;
+    }
+    let used = (producer + WORK_RING_SLOTS - consumer) % WORK_RING_SLOTS;
+    let record = (target + WORK_RING_SLOTS - 1) % WORK_RING_SLOTS;
+    let offset = (record + WORK_RING_SLOTS - consumer) % WORK_RING_SLOTS;
+    offset < used
+}
+
 /// Index in the channel table of the work ring for `data_master` at priority
 /// class `priority`, or `None` if `priority` is not a class.
 pub(crate) const fn work_ring_index(priority: u8, data_master: DataMaster) -> Option<usize> {
@@ -528,6 +543,28 @@ impl WorkSlot {
             qid,
             first: u8::from(first),
         })
+    }
+}
+
+#[cfg_attr(not(test), kernel::macros::kunit_tests(asahi_g17_work_record_pending))]
+mod work_record_pending_tests {
+    use super::work_record_pending;
+
+    #[test]
+    fn empty_and_consumed_are_clear() {
+        assert!(!work_record_pending(9, 9, 9));
+        assert!(!work_record_pending(12, 15, 12));
+        assert!(!work_record_pending(12, 15, 11));
+    }
+
+    #[test]
+    fn live_records_include_wrap() {
+        assert!(work_record_pending(12, 15, 13));
+        assert!(work_record_pending(12, 15, 15));
+        assert!(work_record_pending(254, 2, 255));
+        assert!(work_record_pending(254, 2, 0));
+        assert!(work_record_pending(254, 2, 2));
+        assert!(!work_record_pending(254, 2, 3));
     }
 }
 

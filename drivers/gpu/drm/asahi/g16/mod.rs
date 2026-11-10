@@ -60,6 +60,7 @@ mod initdata;
 mod job;
 mod object;
 mod params;
+pub(crate) use params::outer_pace;
 mod poll;
 mod pools;
 mod power;
