@@ -172,6 +172,29 @@
 	power-domains = <&pmp0_gfx>;
 };
 
+/*
+ * The SEP (ADT sep, dart-sep): its mailbox, and its power domain with the two
+ * fabric parents left to the firmware, which genpd votes on and never turns off.
+ * The boot loader enables the SEP itself through its alias.
+ */
+&sep_mbox {
+	status = "okay";
+};
+
+&ps_sep {
+	status = "okay";
+};
+
+&ps_fab8_soc {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_fab0_piogw {
+	apple,firmware-owned;
+	status = "okay";
+};
+
 #include "t6050-j714s-pmp-tunables.dtsi"
 
 /*
