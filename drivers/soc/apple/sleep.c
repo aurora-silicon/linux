@@ -2859,6 +2859,10 @@ static int apple_sleep_begin(suspend_state_t state)
 {
 	/* The last sleep's cut is its port controller's to take, by its .complete. */
 	WRITE_ONCE(sleep_debug_link_cut, false);
+	/* The PM core also calls .begin for s2idle when no s2idle ops are installed. */
+	if (state != PM_SUSPEND_MEM)
+		return 0;
+
 	if (apple_sleep) {
 		apple_sleep->apcie_port_stopped = false;
 		apple_sleep->usb_down_ran = false;
@@ -2873,7 +2877,8 @@ static int apple_sleep_begin(suspend_state_t state)
 
 static void apple_sleep_end(void)
 {
-	writel(0, apple_sleep->wdt + WDT_WD2_CTL);
+	if (pm_suspend_via_firmware())
+		writel(0, apple_sleep->wdt + WDT_WD2_CTL);
 }
 
 /*
