@@ -94,11 +94,19 @@ MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 #define   PHY_LANE_CFG_REFBUF_OFF	BIT(4)
 #define   PHY_LANE_CFG_REFCLKEN		(BIT(9) | BIT(10))
 #define   PHY_LANE_CFG_REFCLKCGEN	(BIT(30) | BIT(31))
+/* Bit 31 of the pair: the only one a trace of macOS shows cleared, after PERST# is asserted */
+#define   PHY_LANE_CFG_REFCLKCGEN_B31	BIT(31)
 #define PHY_LANE_CTL			0x00004
 #define   PHY_LANE_CTL_CFGACC		BIT(15)
 
 #define PORT_LTSSMCTL			0x00080
 #define   PORT_LTSSMCTL_START		BIT(0)
+/* T6050: a trace of macOS shows 0x11 written here to send PME_Turn_Off */
+#define PORT_PME_TURN_OFF		0x00088
+/* Reads back 0 within a few reads of the write (the trace reads 0x1, then 0x10) */
+#define   PORT_PME_TURN_OFF_SEND	BIT(0)
+/* Written with bit 0 and still set afterwards; meaning not known */
+#define   PORT_PME_TURN_OFF_BIT4	BIT(4)
 #define PORT_INTSTAT			0x00100
 #define   PORT_INT_TUNNEL_ERR		31
 #define   PORT_INT_CPL_TIMEOUT		23
@@ -127,6 +135,8 @@ MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 #define PORT_LINKSTS			0x00208
 #define   PORT_LINKSTS_UP		BIT(0)
 #define   PORT_LINKSTS_BUSY		BIT(2)
+/* In traces of macOS: 0x9b00134d for a port that reached L2, 0x9b001001 for one that did not */
+#define   PORT_LINKSTS_L2		BIT(6)
 #define PORT_LINKCMDSTS			0x00210
 #define PORT_OUTS_NPREQS		0x00284
 #define   PORT_OUTS_NPREQS_REQ		BIT(24)
@@ -2286,10 +2296,29 @@ static int apple_pcie_t6050_port_train(struct apple_pcie_port *port)
 #define T6050_PHY_CTRL_RESET_T8103	BIT(7)
 #define T6050_PHY_CTRL_LANES		GENMASK(9, 8)
 #define T6050_PHY_CFG			0x4
+/*
+ * Set before the PHY-IP tunables. A trace of macOS bringing the port up shows no
+ * access to this bit; meaning not known.
+ */
+#define T6050_PHY_CFG_BIT0		BIT(0)
+/*
+ * Set after the PHY-IP tunables. A trace of macOS shows it set too, after which
+ * T6050_PHY_STAT_BIT0 rises (the trace reads 0x10 seven times, then 0x11); meaning
+ * not known.
+ */
+#define T6050_PHY_CFG_BIT4		BIT(4)
 #define T6050_PHY_STAT			0x8
+/* Rises once T6050_PHY_CFG_BIT4 is set; polled by macOS and by m1n1; meaning not known */
+#define T6050_PHY_STAT_BIT0		BIT(0)
 #define T6050_PHYCMN_CLK		0x0
 #define T6050_PHYCMN_CLK_MODE		GENMASK(1, 0)
-#define CORE_RC_T6050_PRE_RUN		0x54	/* m1n1 writes 0x140 here before RUN */
+/*
+ * Written before CORE_RC_CTL_RUN: a trace of macOS shows 0x140 written here, and m1n1
+ * writes the same. Neither bit's meaning is known.
+ */
+#define CORE_RC_T6050_PRE_RUN		0x54
+#define   CORE_RC_T6050_PRE_RUN_BIT6	BIT(6)
+#define   CORE_RC_T6050_PRE_RUN_BIT8	BIT(8)
 
 static int apple_pcie_t6050_phy_wait(struct apple_pcie *pcie, u32 mask, u32 value)
 {
@@ -2394,15 +2423,15 @@ static int apple_pcie_t6050_shared_phy_on(struct apple_pcie *pcie)
 	ret = apple_pcie_t6050_phy_wait(pcie, T6050_PHY_CTRL_RESET_T8103, 0);
 	if (ret)
 		return ret;
-	apple_pcie_t6050_rmw(phy + T6050_PHY_CFG, 0, BIT(0));
+	apple_pcie_t6050_rmw(phy + T6050_PHY_CFG, 0, T6050_PHY_CFG_BIT0);
 	ret = apple_pcie_t6050_tune_host(pcie, "phy-ip-pll", "phy-ip") ?:
 	      apple_pcie_t6050_tune_host(pcie, "phy-ip-auspma", "phy-ip");
 	if (ret)
 		return ret;
-	apple_pcie_t6050_rmw(phy + T6050_PHY_CFG, 0, BIT(4));
+	apple_pcie_t6050_rmw(phy + T6050_PHY_CFG, 0, T6050_PHY_CFG_BIT4);
 	apple_pcie_t6050_rmw(cmn + T6050_PHYCMN_CLK, T6050_PHYCMN_CLK_MODE,
 			     FIELD_PREP(T6050_PHYCMN_CLK_MODE, 1));
-	if (readl_poll_timeout(phy + T6050_PHY_STAT, v, v & BIT(0), 10, 250000))
+	if (readl_poll_timeout(phy + T6050_PHY_STAT, v, v & T6050_PHY_STAT_BIT0, 10, 250000))
 		dev_info(pcie->dev, "shared PHY: clock status %#x\n", v);
 	apple_pcie_t6050_rmw(phy + T6050_PHY_CTRL, 0, T6050_PHY_CTRL_LANES);
 	return 0;
@@ -2457,7 +2486,8 @@ static int apple_pcie_t6050_cold_train(struct apple_pcie_port *port)
 	if (ret)
 		return ret;
 	if (!(readl(pcie->base + CORE_RC_CTL) & CORE_RC_CTL_RUN)) {
-		writel(0x140, pcie->base + CORE_RC_T6050_PRE_RUN);
+		writel(CORE_RC_T6050_PRE_RUN_BIT6 | CORE_RC_T6050_PRE_RUN_BIT8,
+		       pcie->base + CORE_RC_T6050_PRE_RUN);
 		writel(CORE_RC_CTL_RUN, pcie->base + CORE_RC_CTL);
 	}
 	ret = readl_poll_timeout(pcie->base + CORE_RC_STAT, v, v & CORE_RC_STAT_READY, 10, 250000);
@@ -2492,6 +2522,26 @@ static int apple_pcie_t6050_cold_train(struct apple_pcie_port *port)
 	writel(v | (bus << 8) | (bus << 16), dbi + PCI_PRIMARY_BUS);
 	dev_info(pcie->dev, "port %d: trained by Linux, the boot loader left it down\n", port->idx);
 	return 0;
+}
+
+/*
+ * PME_Turn_Off, then wait for L2: the clock gate disabled, the message sent, and the
+ * link reported in L2. Both waits are made even when the first fails (the N1 may
+ * clear the send bit and never reach L2, as under macOS); the first error is returned.
+ */
+static int apple_pcie_t6050_port_l2(struct apple_pcie_port *port)
+{
+	int ret, ret2;
+
+	apple_pcie_port_writel(port, apple_pcie_port_readl(port, PORT_APPCLK) | PORT_APPCLK_CGDIS,
+			       PORT_APPCLK);
+	apple_pcie_port_writel(port, PORT_PME_TURN_OFF_SEND | PORT_PME_TURN_OFF_BIT4,
+			       PORT_PME_TURN_OFF);
+	ret = apple_pcie_t6050_wait(port, port->base, PORT_PME_TURN_OFF, PORT_PME_TURN_OFF_SEND,
+				    0, 500000);
+	ret2 = apple_pcie_t6050_wait(port, port->base, PORT_LINKSTS, PORT_LINKSTS_L2,
+				     PORT_LINKSTS_L2, 500000);
+	return ret ?: ret2;
 }
 
 /*
@@ -2530,17 +2580,14 @@ static int apple_pcie_t6050_reset_root_port(struct pci_host_bridge *bridge,
 	if (ret)
 		goto out;
 	/* PME_Turn_Off, then L2 */
-	apple_pcie_port_writel(port, apple_pcie_port_readl(port, PORT_APPCLK) | 0x100, PORT_APPCLK);
-	apple_pcie_port_writel(port, 0x11, 0x88);
-	ret = apple_pcie_t6050_wait(port, port->base, 0x88, 1, 0, 500000) ?:
-	      apple_pcie_t6050_wait(port, port->base, PORT_LINKSTS, BIT(6), BIT(6), 500000);
+	ret = apple_pcie_t6050_port_l2(port);
 	if (ret)
 		goto out;
 	WRITE_ONCE(port->link_failed, true);
 	ret = apple_pcie_t6050_perst(port, true);
 	if (ret)
 		goto out;
-	writel(readl(port->phy) & ~BIT(31), port->phy);
+	writel(readl(port->phy) & ~PHY_LANE_CFG_REFCLKCGEN_B31, port->phy);
 	ret = apple_pcie_t6050_port_restart(port, rp);
 	if (ret)
 		goto out;
@@ -4936,14 +4983,10 @@ static void apple_pcie_shutdown(struct platform_device *pdev)
 		pci_write_config_word(rp, PCI_COMMAND, 0);
 		if (!pci_read_config_dword(rp, PCI_PRIMARY_BUS, &value))
 			pci_write_config_dword(rp, PCI_PRIMARY_BUS, value & 0xff0000ff);
-		apple_pcie_port_writel(port, apple_pcie_port_readl(port, PORT_APPCLK) | 0x100,
-				       PORT_APPCLK);
-		apple_pcie_port_writel(port, 0x11, 0x88);
-		apple_pcie_t6050_wait(port, port->base, 0x88, 1, 0, 500000);
-		apple_pcie_t6050_wait(port, port->base, PORT_LINKSTS, BIT(6), BIT(6), 500000);
+		apple_pcie_t6050_port_l2(port);
 		WRITE_ONCE(port->link_failed, true);
 		apple_pcie_t6050_perst(port, true);
-		writel(readl(port->phy) & ~BIT(31), port->phy);
+		writel(readl(port->phy) & ~PHY_LANE_CFG_REFCLKCGEN_B31, port->phy);
 		apple_pcie_t6050_port_disable(port, rp);
 		/* An endpoint Linux powered goes off, so the next boot finds it cold */
 		if (port->pwren)
