@@ -448,9 +448,13 @@
 	status = "okay";
 };
 
+/*
+ * As on the J616s, the display gate enables the display subsystem, the DCP,
+ * its DARTs, mailbox and panel once the boot loader has handed the internal
+ * display over (apple,t6041-handoff); otherwise the boot framebuffer stays.
+ */
 &display {
 	phandle = <&display>;
-	status = "okay";
 };
 
 &dcp {
@@ -459,6 +463,7 @@
 
 	panel: panel {
 		apple,max-brightness = <500>;
+		status = "disabled";
 	};
 };
 

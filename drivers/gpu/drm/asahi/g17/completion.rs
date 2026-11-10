@@ -19,7 +19,9 @@ use crate::{
     hw::t8140::{dynamic, resources as cfg},
     mmu,
 };
-use core::sync::atomic::{fence as barrier, AtomicBool, AtomicI32, AtomicU8, Ordering};
+use core::sync::atomic::{
+    fence as barrier, AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering,
+};
 use kernel::{
     dma_fence::{Fence, FenceContexts, RawDmaFence, UserFence},
     new_mutex,
@@ -35,6 +37,8 @@ struct Destination {
     // The buffer keeps its GPU alias and its CPU mapping alive.
     buffer: Arc<crate::timestamp::Buffer>,
     offset: usize,
+    /// The destination's address in the firmware timestamp window, if its buffer is mapped there.
+    window_va: Option<u64>,
 }
 
 impl Destination {
@@ -55,25 +59,81 @@ impl Destination {
         if offset.checked_add(size_of::<u64>()).ok_or(EINVAL)? > buffer.size() {
             return Err(ERANGE);
         }
+        let window_va = buffer.window_va(offset);
         let offset = buffer.timestamp_offset(offset)?;
-        Ok(Some(Self { buffer, offset }))
+        Ok(Some(Self { buffer, offset, window_va }))
     }
 
     fn write(&self, ticks: u64) {
-        const NSEC_PER_SEC: u64 = 1_000_000_000;
-        let ns = (ticks / cfg::COMMAND_TIMESTAMP_HZ)
-            .wrapping_mul(NSEC_PER_SEC)
-            .wrapping_add(
-                ticks % cfg::COMMAND_TIMESTAMP_HZ * NSEC_PER_SEC / cfg::COMMAND_TIMESTAMP_HZ,
-            );
-        self.buffer.write_timestamp(self.offset, ns);
+        self.buffer.write_timestamp(self.offset, ticks_to_ns(ticks));
         barrier(Ordering::Release);
     }
+
+    /// An end stamp the firmware writes itself, through the window, as the same nanoseconds the
+    /// host would write. Wait for it without writing: a host write, or a firmware write landing
+    /// after the fence, could undo a reset userspace may make once the fence has signalled. If
+    /// it does not land in time, the host writes the value, still before the fence.
+    fn write_window(&self, ticks: u64) {
+        let ns = ticks_to_ns(ticks);
+        let mut polls = 0;
+        while self.buffer.read_timestamp(self.offset) != Some(ns) {
+            if polls == WINDOW_POLLS {
+                WINDOW_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                WINDOW_MISSES.fetch_add(1, Ordering::Relaxed);
+                self.write(ticks);
+                return;
+            }
+            kernel::time::delay::udelay(kernel::time::Delta::from_micros(WINDOW_POLL_US));
+            polls += 1;
+        }
+        WINDOW_KEPT.fetch_add(1, Ordering::Relaxed);
+        WINDOW_MISSES.store(0, Ordering::Relaxed);
+    }
+}
+
+fn ticks_to_ns(ticks: u64) -> u64 {
+    const NSEC_PER_SEC: u64 = 1_000_000_000;
+    (ticks / cfg::COMMAND_TIMESTAMP_HZ)
+        .wrapping_mul(NSEC_PER_SEC)
+        .wrapping_add(ticks % cfg::COMMAND_TIMESTAMP_HZ * NSEC_PER_SEC / cfg::COMMAND_TIMESTAMP_HZ)
+}
+
+/// The firmware writes the stamp ~20 us after the pass ends; macOS saw it up to 36 us after the
+/// event ring. In practice it has always landed by retirement's first read.
+const WINDOW_POLLS: u32 = 40;
+const WINDOW_POLL_US: i64 = 5;
+static WINDOW_KEPT: AtomicU64 = AtomicU64::new(0);
+static WINDOW_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+/// Host fallbacks in a row. At [`WINDOW_GIVE_UP`] the firmware is taken not to write through
+/// the window at all (mapping refused, other firmware), and no render is handed a window
+/// address again, so none pays the full wait.
+static WINDOW_MISSES: AtomicU32 = AtomicU32::new(0);
+const WINDOW_GIVE_UP: u32 = 8;
+
+/// `capacity`: firmware-written end stamps kept, and those the host had to write.
+pub(crate) fn window_counters() -> [u64; 2] {
+    [WINDOW_KEPT.load(Ordering::Relaxed), WINDOW_FALLBACKS.load(Ordering::Relaxed)]
+}
+
+/// Only the fragment end stamp goes through the window (slots: vertex start, vertex end,
+/// fragment start, fragment end). The firmware latches a start stamp before the command's
+/// barriers resolve, so a reset of the same query ordered before the command can still land
+/// on top of it. A vertex end handed to the firmware never held the host's value by the end
+/// of the wait, so it would only cost every render that stamps it the full wait.
+const fn window_slot(index: usize) -> bool {
+    index == 3
 }
 
 /// Timestamp destinations resolved and retained before any command is enqueued. Dropping
 /// one releases only a buffer reference; the buffer defers its own mapping release.
-pub(crate) struct Destinations([Option<Destination>; 4]);
+pub(crate) struct Destinations {
+    stamps: [Option<Destination>; 4],
+    /// A render: the firmware gets its fragment end destination through the window. A compute
+    /// command's only stamp pair stays kernel-private (recovery trusts it).
+    render: bool,
+    /// The firmware was handed window destinations ([`Self::window_vas`]).
+    handed: AtomicBool,
+}
 
 impl Destinations {
     pub(crate) fn resolve(
@@ -88,15 +148,48 @@ impl Destinations {
             destinations[2 * index] = Destination::resolve(objects, timestamp.start)?;
             destinations[2 * index + 1] = Destination::resolve(objects, timestamp.end)?;
         }
-        Ok(Self(destinations))
+        Ok(Self {
+            stamps: destinations,
+            render: timestamps.len() == 2,
+            handed: AtomicBool::new(false),
+        })
+    }
+
+    /// Window addresses for a render's vertex and fragment start/end destinations: the fragment
+    /// end's if it is mapped in the window, 0 for the others.
+    fn window_vas(&self) -> [u64; 4] {
+        if !self.render || WINDOW_MISSES.load(Ordering::Relaxed) >= WINDOW_GIVE_UP {
+            return [0; 4];
+        }
+        let vas: [u64; 4] = core::array::from_fn(|i| {
+            let destination = self.stamps[i].as_ref().filter(|_| window_slot(i));
+            destination.and_then(|d| d.window_va).unwrap_or(0)
+        });
+        if vas.iter().any(|&va| va != 0) {
+            self.handed.store(true, Ordering::Release);
+        }
+        vas
     }
 
     pub(crate) fn has_outputs(&self) -> bool {
-        self.0.iter().any(Option::is_some)
+        self.stamps.iter().any(Option::is_some)
     }
 
     fn iter(&self) -> core::slice::Iter<'_, Option<Destination>> {
-        self.0.iter()
+        self.stamps.iter()
+    }
+
+    fn write(&self, ticks: [u64; 4]) {
+        let handed = self.handed.load(Ordering::Acquire);
+        for (index, (destination, ticks)) in self.stamps.iter().zip(ticks).enumerate() {
+            match destination {
+                Some(destination) if handed && window_slot(index) && destination.window_va.is_some() => {
+                    destination.write_window(ticks)
+                }
+                Some(destination) => destination.write(ticks),
+                None => {}
+            }
+        }
     }
 }
 
@@ -110,13 +203,7 @@ struct Output {
 impl Output {
     fn publish(&self, result: Result<[u64; 4]>) {
         match result {
-            Ok(ticks) => {
-                for (destination, ticks) in self.destinations.iter().zip(ticks) {
-                    if let Some(destination) = destination {
-                        destination.write(ticks);
-                    }
-                }
-            }
+            Ok(ticks) => self.destinations.write(ticks),
             Err(error) => self.fence.set_error(error),
         }
         self.fence.signal();
@@ -462,6 +549,11 @@ impl Completion {
             .any(Option::is_some)
     }
 
+    /// The firmware window addresses of a render's vertex and fragment start/end stamps.
+    pub(crate) fn window_vas(&self) -> [u64; 4] {
+        self.output.output().destinations.window_vas()
+    }
+
     pub(crate) fn compute_timestamp_va(&self) -> Result<u64> {
         if let Some(compute) = &self.compute { return Ok(compute.page()?.mapping.iova()); }
         let compute = self.m5_compute.lock();
@@ -503,10 +595,6 @@ impl Completion {
             return None;
         }
         self.compute_words().ok()
-    }
-
-    pub(crate) fn signalled(&self) -> bool {
-        self.signalled.load(Ordering::Acquire)
     }
 
     pub(crate) fn begin_replay(&self) -> bool {
@@ -624,9 +712,21 @@ impl Completion {
         self.interrupted.load(Ordering::Acquire)
     }
 
-    /// Whether this failure makes the VM unusable. Spared work, and interrupted
-    /// work no recovery found guilty, fail without poisoning it.
+    /// Whether the fence has been signalled (completed or failed).
+    pub(crate) fn signalled(&self) -> bool {
+        self.signalled.load(Ordering::Acquire)
+    }
+
+    /// Whether this failure makes the VM unusable. Spared work, interrupted
+    /// work no recovery found guilty, and work that never ran (ENODATA) fail
+    /// without poisoning it.
     pub(crate) fn poisons(&self, error: Error) -> bool {
+        // A command that never ran cannot have faulted the GPU. The queue's own failed
+        // command also comes back as ENODATA (a zero-duration record); it is classified
+        // guilty before it fails, by the firmware's fault report or by a recovery.
+        if error == ENODATA && !self.guilty() {
+            return false;
+        }
         let interrupted = self.interrupted();
         (error != ECANCELED || interrupted) && !self.spared() && !(interrupted && !self.guilty())
     }
@@ -850,5 +950,22 @@ impl Deferred {
             Self::Unpublished(completion, error) => completion.fail_unpublished(error),
             Self::Release(completion) => completion.release_after_retirement(),
         }
+    }
+}
+
+#[kernel::macros::kunit_tests(asahi_g17_timestamp_window)]
+mod window_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_fragment_end_goes_through_the_window() {
+        assert!(!window_slot(0) && !window_slot(1) && !window_slot(2) && window_slot(3));
+    }
+
+    #[test]
+    fn ticks_convert_to_nanoseconds_at_24_mhz() {
+        assert_eq!(ticks_to_ns(24_000_000), 1_000_000_000);
+        assert_eq!(ticks_to_ns(24), 1_000);
+        assert_eq!(ticks_to_ns(24_000_025), 1_000_001_041);
     }
 }

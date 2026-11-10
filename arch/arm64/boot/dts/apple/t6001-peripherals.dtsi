@@ -26,17 +26,16 @@
 		status = "disabled";
 	};
 
-	dockchannel_uart: fifo@29250c000 {
-		compatible = "apple,t6000-dockchannel", "apple,dockchannel";
-		reg = <0x2 0x9250c000 0x0 0x18>;
+	/* The DebugUSB DockChannel serial channel; RX is drained in software. */
+	dockchannel_uart: serial@29252c000 {
+		compatible = "apple,t6000-dockchannel-uart", "apple,dockchannel-uart";
+		reg = <0x2 0x9252c000 0x0 0x4000>,
+		      <0x2 0x92528000 0x0 0x4000>,
+		      <0x2 0x9250c000 0x0 0x18>;
+		reg-names = "data", "config", "irq";
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 620 IRQ_TYPE_LEVEL_HIGH>;
-		reg-names = "irq";
-		ranges = <0 0x2 0x92528000 0x10004>;
-		#address-cells = <1>;
-		#size-cells = <1>;
-		interrupt-controller;
-		#interrupt-cells = <2>;
+		apple,sw-drain;
 		status = "disabled";
 	};
 

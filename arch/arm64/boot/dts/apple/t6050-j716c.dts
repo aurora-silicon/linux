@@ -13,6 +13,7 @@
 
 /dts-v1/;
 
+#define T6050_J716C
 #include "t6050-max.dtsi"
 
 / {
@@ -220,5 +221,19 @@
 	apple,output-commands = /bits/ 64 <0x001a000000000000 0x000f000000800000 0x011c000000010000>;
 };
 
-#define T6050_J716C
 #include "t6050-peripherals.dtsi"
+
+#include "t6050-max-atc2.dtsi"
+
+/* This unit's host DROM (router UUID from an earlier boot) */
+&acio2_nhi {
+	apple,thunderbolt-drom = [ff 92 e6 6e ee 18 7c ac 05 90 19 c3 8c 00 5c 00
+			00 00 00 00 00 00 08 81 82 02 82 00 00 00 08 82
+			92 01 82 00 00 00 03 83 20 08 84 00 00 00 00 00
+			00 08 85 00 00 00 00 00 00 05 86 09 01 00 08 87
+			00 00 00 00 00 00 05 88 09 01 00 05 89 09 01 00
+			05 8a 09 01 00 0e 01 41 70 70 6c 65 2c 20 49 6e
+			63 2e 00 06 02 69 4f 53 00 00 00 00];
+};
+
+#include "t6050-j716c-isp.dtsi"

@@ -425,19 +425,25 @@ EXPORT_SYMBOL_IF_KUNIT(apr_build_desc);
  * Descriptor v0 (APR a0). Source: MIT m1n1 f3ac615eb137,
  * proxyclient/m1n1/hw/prores.py:7-111 and
  * proxyclient/experiments/prores.py:592-644. Only the input/output prefix
- * is shared with v1. The public experiment leaves both legacy limits at
- * 0xffff; their meaning is unqualified, so do not apply v1 budget formulas.
+ * is shared with v1. The rate-control block is v1's, 0x20 bytes earlier:
+ * the target and maximum Q3 bytes per macroblock at 0xf0/0xf2 take the same
+ * per-profile budgets, so every profile lands on its data rate. (The public
+ * experiment's 0xffff limits leave the engine unbudgeted.)
  */
 int apr_build_desc_v0(const struct apr_frame *f, u8 *desc)
 {
 	bool is444 = apr_input_is_444(f->input);
 	enum apr_qtable table = apr_profile_qtable(f->profile);
+	u32 slices, mbs, target, max;
 	unsigned int i;
 	int ret;
 
 	ret = apr_build_desc_common(f, desc);
 	if (ret)
 		return ret;
+	slices = apr_slice_count(f->width, f->height, APR_SLICE_LOG2);
+	mbs = DIV_ROUND_UP(f->width, 16) * DIV_ROUND_UP(f->height, 16);
+	apr_frame_budget(f->profile, f->width, f->height, &target, &max);
 
 	/* Frame header, including the legacy aspect/rate byte at 0x065. */
 	put_unaligned_be16(D_FH_BYTES, desc + 0x058);
@@ -454,8 +460,8 @@ int apr_build_desc_v0(const struct apr_frame *f, u8 *desc)
 	/* Deprecated slice count at 0x0ec stays zero, as in m1n1. */
 	desc[0x0ee] = APR_SLICE_LOG2 << 4;
 	desc[0x0ef] = apr_profile_policy[f->profile].quant_index;
-	put_unaligned_le16(0xffff, desc + 0x0f0);
-	put_unaligned_le16(0xffff, desc + 0x0f2);
+	put_unaligned_le16(apr_mb_budget(target, slices, mbs), desc + 0x0f0);
+	put_unaligned_le16(apr_mb_budget(max, slices, mbs), desc + 0x0f2);
 	put_unaligned_le64(APR_RC_THRESHOLDS, desc + 0x0f4);
 	put_unaligned_le32(0x2c8080, desc + 0x0fc);
 	for (i = 0; i < ARRAY_SIZE(apr_rc_beta); i++)

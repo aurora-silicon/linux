@@ -157,6 +157,9 @@ static struct av_life_test *av_life_setup(struct kunit *test, work_func_t owner_
 	spin_lock_init(&t->ep->lock);
 	INIT_LIST_HEAD(&t->ep->compact_cmds);
 	init_rwsem(&t->asrv->srv_rwsem);
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	init_waitqueue_head(&t->asrv->gen_wq);
+#endif
 	INIT_WORK(&t->asrv->start_av_service_wq, owner_fn);
 	INIT_WORK(&t->asrv->terminate_wq, owner_fn);
 	INIT_WORK(&t->dcp->external_audio_work, av_life_owner_fn);

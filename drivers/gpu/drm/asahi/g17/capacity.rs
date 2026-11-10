@@ -71,8 +71,9 @@ impl kernel::debugfs::Writer for View {
         writeln!(f, "execution_contexts used={} total={}", uat.execution_contexts_used(), crate::mmu::MAX_EXECUTION_CONTEXTS)?;
         let (fenced, overruns) = uat.execution_contexts_fenced(super::channel::control_witnessed());
         writeln!(f, "execution_contexts_fenced free_waiting={} overruns={}", fenced, overruns)?;
-        let mut upper = uat.geometry().kernel_range();
-        upper.start += crate::hw::t8140::dynamic::KERNEL_OFFSET;
+        let [kept, fallbacks] = super::completion::window_counters();
+        writeln!(f, "timestamp_window firmware={} host_fallbacks={}", kept, fallbacks)?;
+        let upper = uat.kernel_dynamic_range();
         for (name, vm, range) in [
             ("dynamic_lower_bytes", uat.kernel_lower_vm(), crate::hw::t8140::dynamic::LOWER),
             ("dynamic_upper_bytes", uat.kernel_vm(), upper),

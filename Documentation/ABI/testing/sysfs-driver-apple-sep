@@ -3,9 +3,10 @@ Date:		October 2026
 KernelVersion:	7.1
 Contact:	Chris Kearney <chris@kearneymail.com>
 Description:
-		(RO) Version of the diag interface: "2" for the attributes
+		(RO) Version of the diag interface: "3" for the attributes
 		and values described in this file. Version 2 added
-		sensor_attach and restore; version 1 had neither.
+		sensor_attach and restore; version 1 had neither. Version 3
+		adds the policy snapshot.
 
 		Within a version, attributes are only added, and an existing
 		attribute keeps its values and their meaning. A reader tests
@@ -19,7 +20,8 @@ Description:
 		bring-up got without reading the kernel log. It exists while
 		the driver is bound to the SEP: it is created at probe and
 		removed at unbind. Every attribute in it is read-only and
-		reads as one ASCII token followed by a newline.
+		reads as ASCII followed by a newline. The policy snapshot
+		contains space-separated key=value tokens.
 
 		Each value is the state the driver recorded when it made the
 		corresponding decision. Reading an attribute sends nothing
@@ -29,6 +31,26 @@ Description:
 		Touch ID is activated by the first open of /dev/sep-bio, not
 		by the boot-time bring-up, so the sensor and touchid
 		attributes only move on once something has opened it.
+
+		This deployment uses the existing T8122 profile and v4
+		/dev/sep-bio interface. It does not add a new sensor protocol.
+		OS firmware and system firmware are separate: qualify both.
+
+		For an existing bag, select xart_writes=1, provision_keybag=0,
+		xart_guard=1 and xarm_trace=1. trusted_keys=0 and
+		filevault_api=0 omit the optional kernel APIs; both default
+		to 1 to preserve existing deployments. There is no boot_uuid
+		parameter: the OS identity comes from /chosen/apfs-preboot-uuid.
+		Writable J613 26.6.2 attachment rejects a missing DT identity,
+		explicit UUID override or disabled guard before opening xART.
+		Host-store or identity-index read failure refuses attachment.
+
+		Preserve the current keybag, host store, reference key, three
+		Catacombs, ownership journal and fprint records. Different
+		Linux roots must share the same current files globally, before
+		module load; the kernel opens them from init_task's root.
+		Never replace them with a snapshot or enrol again to migrate.
+		Readiness diagnostics do not prove a successful finger match.
 
 What:		/sys/bus/platform/devices/<unit>.sep/diag/profile
 Date:		October 2026
@@ -359,3 +381,120 @@ Description:
 		tools/aurora-sep/XART-SAFETY.md. During a boot the value
 		can only move from "unverified" to "blocked", once the guard
 		refuses a write.
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/policy
+Date:		November 2026
+KernelVersion:	7.2
+Contact:	Satya Benson <satya@benson.earth>
+Description:
+		(RO, ABI 3) A space-separated key=value snapshot of the
+		driver policy selected at probe: xart_writes (effective store
+		writability), provision_keybag, xart_guard (effective level),
+		trusted_keys, filevault_api, xarm_trace, refkey_v2 and
+		identity_override (0 or 1). API flags describe the selected
+		policy, not successful registration if that API later fails.
+
+		identity_source is pending before the driver selects it, dt
+		for /chosen/apfs-preboot-uuid, override for explicit parameters,
+		or missing. It is updated at the actual identity decision.
+		No UUID value, state, identity or key bytes are exposed.
+		Reads only use cached facts and never contact the enclave.
+		Module-parameter sysfs files need not exist; their absence
+		is not evidence of a mismatched policy. Older diagnostic
+		ABIs retain xart/xart_guard and kernel decision messages.
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/attach_ms
+What:		/sys/bus/platform/devices/<unit>.sep/diag/ready_ms
+Date:		November 2026
+KernelVersion:	7.3
+Contact:	Ryan Murray <ryan@aurorasilicon.org>
+Description:
+		(RO) How long the bring-up took, as unsigned decimal
+		milliseconds counted from probe on the boot-time clock.
+		attach_ms is the time to the attach decision (see attach);
+		ready_ms is the time to the end of the boot-time bring-up,
+		when keystore is decided. Each reads "0" until its decision
+		is made. A large ready_ms with keystore "open" is an enclave
+		that was slow to advertise the key store; the driver waits
+		up to 90 s for it.
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/endpoint_names
+Date:		November 2026
+KernelVersion:	7.3
+Contact:	Ryan Murray <ryan@aurorasilicon.org>
+Description:
+		(RO) The endpoints the SEP has advertised, as the
+		four-character names their descriptors carry with trailing
+		spaces dropped, separated by single spaces, in endpoint
+		number order, for example "cntl sbio scrd sse hdcp xars sks
+		xarm hibe pnon skdl stac". A name that is not lower-case
+		letters and digits is shown as the endpoint number in two
+		hex digits. Empty until the first endpoint is advertised;
+		discovery goes on after the attach, so the list can still
+		grow, like endpoints.
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/os_identity
+Date:		November 2026
+KernelVersion:	7.3
+Contact:	Ryan Murray <ryan@aurorasilicon.org>
+Description:
+		(RO) Where the OS identity that the driver gives the
+		enclave's xART exchange came from. Decided at the attach.
+
+		===========	=========================================
+		unknown		Not decided yet.
+		explicit	The os_uuid_hi and os_uuid_lo parameters.
+		chosen		/chosen/apfs-preboot-uuid, as the boot
+				loader passed it.
+		unavailable	Neither; the enclave is told the identity
+				is unavailable and its xART records for
+				this OS cannot be found.
+		===========	=========================================
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/hwrng
+Date:		November 2026
+KernelVersion:	7.3
+Contact:	Ryan Murray <ryan@aurorasilicon.org>
+Description:
+		(RO) The enclave's random number source. "pending" until
+		the survey after the bring-up decides, then "registered"
+		(it is an hwrng, named apple-sep) or "failed" (the survey
+		gave up; the kernel log says why).
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/xarm_failures
+Date:		November 2026
+KernelVersion:	7.3
+Contact:	Ryan Murray <ryan@aurorasilicon.org>
+Description:
+		(RO) How many of the enclave's xART requests the driver has
+		answered with the failure status since probe, as an unsigned
+		decimal: a store read or write that failed, a bad checksum,
+		an unknown request, a buffer that was not ready, and the
+		writes the xART guard refused (also counted in
+		xart_guard_refusals). The first is logged; this counts them
+		all. Anything above xart_guard_refusals is a failure that
+		was not the guard's choice.
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/unhandled_messages
+Date:		November 2026
+KernelVersion:	7.3
+Contact:	Ryan Murray <ryan@aurorasilicon.org>
+Description:
+		(RO) How many messages arrived on an endpoint the driver has
+		no handler for, as an unsigned decimal. The first few are
+		logged. Normally 0.
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/sleep
+What:		/sys/bus/platform/devices/<unit>.sep/diag/sleeps
+Date:		November 2026
+KernelVersion:	7.3
+Contact:	Ryan Murray <ryan@aurorasilicon.org>
+Description:
+		(RO) The driver's view of system sleep. sleep reads "held"
+		from the PM notifier's prepare event to its post event,
+		while Touch ID captures and entropy requests are held, and
+		"awake" otherwise. sleeps counts completed prepare/post
+		pairs since probe, aborted suspends included. The enclave's
+		power domains stay on across sleep, so every other attribute
+		keeps its value over a suspend; a reader checking that the
+		enclave still answers after a resume reads the hwrng.

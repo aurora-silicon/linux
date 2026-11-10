@@ -347,6 +347,9 @@ pub(crate) struct RenderResources {
     pub(crate) aux_fb_va: u64,
     /// GPU address of the pass's start/end timestamp pair.
     pub(crate) timestamp_va: u64,
+    /// Firmware window addresses of the user's vertex and fragment start/end stamps
+    /// (the second pair at TA +0x90e and 3D +0x21a8), 0 for a stamp the firmware does not write.
+    pub(crate) timestamp_window: [u64; 4],
     /// Object IDs of the tiling stage.
     pub(crate) ta_ids: ObjectIds,
     /// Object IDs of the fragment stage.
@@ -1220,6 +1223,8 @@ static_assert!(core::mem::offset_of!(TaDescriptor, predecessor_id) == 0x86e);
 static_assert!(core::mem::offset_of!(TaDescriptor, stamp_va) == 0x8a6);
 static_assert!(core::mem::offset_of!(TaDescriptor, completion) == 0x8c6);
 static_assert!(core::mem::offset_of!(TaDescriptor, timestamp_start_va) == 0x8fe);
+// The firmware-sampled vertex start/end pair (macOS fills it with timestamp-window addresses).
+static_assert!(core::mem::offset_of!(TaDescriptor, unk_90e) == 0x90e);
 static_assert!(core::mem::offset_of!(TaDescriptor, free_list_control_va) == 0x934);
 static_assert!(core::mem::offset_of!(TaDescriptor, status_va) == 0x945);
 
@@ -1291,6 +1296,8 @@ impl TaDescriptor {
         self.current_id = resources.ta_ids.current.into();
         self.ordinal = args.ordinal as u32;
         self.timestamp_start_va = resources.timestamp_va;
+        self.unk_90e[..8].copy_from_slice(&resources.timestamp_window[0].to_le_bytes());
+        self.unk_90e[8..16].copy_from_slice(&resources.timestamp_window[1].to_le_bytes());
         self.unk_932 = match args.programs == RegisterPrograms::V25G83 {
             true => TA_SLOT_INDEX_25G83 + u8::from(scs_register),
             false => Self::UNK_932,
@@ -1505,6 +1512,8 @@ static_assert!(core::mem::offset_of!(FragmentDescriptor, unk_2104) == 0x2104);
 static_assert!(core::mem::offset_of!(FragmentDescriptor, stamp_va) == 0x2140);
 static_assert!(core::mem::offset_of!(FragmentDescriptor, completion) == 0x2160);
 static_assert!(core::mem::offset_of!(FragmentDescriptor, timestamp_start_va) == 0x2198);
+// The firmware-sampled fragment start/end pair.
+static_assert!(core::mem::offset_of!(FragmentDescriptor, unk_21a8) == 0x21a8);
 static_assert!(core::mem::offset_of!(FragmentDescriptor, free_list_control_va) == 0x21ce);
 static_assert!(core::mem::offset_of!(FragmentDescriptor, status_va) == 0x21d7);
 static_assert!(core::mem::offset_of!(FragmentDescriptor, unk_222d) == 0x222d);
@@ -1653,6 +1662,8 @@ impl FragmentSlot {
         desc.ordinal = args.ordinal as u32;
         desc.timestamp_start_va = resources.timestamp_va;
         desc.timestamp_end_va = timestamp_end_va;
+        desc.unk_21a8[..8].copy_from_slice(&resources.timestamp_window[2].to_le_bytes());
+        desc.unk_21a8[8..16].copy_from_slice(&resources.timestamp_window[3].to_le_bytes());
         desc.unk_21cc = match args.programs == RegisterPrograms::V25G83 {
             true => FRAGMENT_SLOT_INDEX_25G83 + u8::from(args.ray_query[1].scratch.enabled()),
             false => Self::UNK_21CC,
@@ -1737,14 +1748,43 @@ mod ta_mode_tests {
         }
     }
 
+    /// The variants of the builds T6041 admits: 25F84, then 25G83, which the 40- and the
+    /// 32-core configurations run with the same rules.
+    fn t6041_variants() -> [&'static Variant; 2] {
+        let Firmware::Identified(builds) = crate::hw::t6041::CONFIG.firmware else {
+            panic!("T6041 must identify its loaded firmware");
+        };
+        assert_eq!(builds.len(), 3);
+        let (g83, g83_32) = (builds[1].variant, builds[2].variant);
+        assert_eq!(g83.ta_mode_1, g83_32.ta_mode_1);
+        assert_eq!(g83.compute, g83_32.compute);
+        assert_eq!(g83.programs, g83_32.programs);
+        [builds[0].variant, g83]
+    }
+
+    /// The TA mode of every admitted T6041 build.
+    fn t6041_ta_mode_1() -> bool {
+        let [f84, g83] = t6041_variants();
+        assert_eq!(f84.ta_mode_1, g83.ta_mode_1);
+        f84.ta_mode_1
+    }
+
     #[test]
-    fn policy_is_local_to_the_admitted_t6041_build() {
-        let max = selected(&crate::hw::t6041::CONFIG.firmware);
+    fn policy_is_local_to_the_admitted_t6041_builds() {
+        let [f84, g83] = t6041_variants();
         let pro = selected(&crate::hw::t6040::CONFIG.firmware);
-        assert_eq!(max.compute, crate::g17::fw::compute::ComputeProgram::V25F84);
-        assert!(max.split_firmware_area);
-        assert_eq!(max.programs, RegisterPrograms::V25G83);
-        assert!(max.ta_mode_1);
+        assert_eq!(f84.compute, crate::g17::fw::compute::ComputeProgram::V25F84);
+        assert!(f84.split_firmware_area);
+        // 25G83 keeps the M4 Pro's queue and compute rules on the M4 Max.
+        assert_eq!(g83.compute, pro.compute);
+        assert_eq!(g83.split_firmware_area, pro.split_firmware_area);
+        assert_eq!(g83.opening_record, pro.opening_record);
+        assert_eq!(g83.qid_floor, pro.qid_floor);
+        assert_eq!(g83.registration, pro.registration);
+        for max in [f84, g83] {
+            assert_eq!(max.programs, RegisterPrograms::V25G83);
+            assert!(max.ta_mode_1);
+        }
         assert!(!pro.ta_mode_1);
         assert!(!V25F84.ta_mode_1);
         assert!(!V25G83.ta_mode_1);
@@ -1812,7 +1852,7 @@ mod ta_mode_tests {
             for scs in [false, true] {
                 let mut args = args(&pass, &resources, scs);
                 let (before, count) = ta_registers_25g83(&args, &geometry, &words).unwrap();
-                args.ta_mode_1 = selected(&crate::hw::t6041::CONFIG.firmware).ta_mode_1;
+                args.ta_mode_1 = t6041_ta_mode_1();
                 let (after, new_count) = ta_registers_25g83(&args, &geometry, &words).unwrap();
                 assert_eq!(count, 83 + usize::from(scs));
                 assert_eq!(new_count, count);

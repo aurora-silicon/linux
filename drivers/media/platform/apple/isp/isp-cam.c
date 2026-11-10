@@ -279,7 +279,7 @@ static int isp_ch_cache_sensor_configs(struct apple_isp *isp, u32 ch, u32 count)
 	if (!count || count > ISP_MAX_SENSOR_CONFIGS)
 		return -EINVAL;
 
-	presets = devm_kcalloc(isp->dev, num + count, sizeof(*presets), GFP_KERNEL);
+	presets = devm_kcalloc(isp->dev, num, sizeof(*presets), GFP_KERNEL);
 	if (!presets)
 		return -ENOMEM;
 	memcpy(presets, isp->presets, num * sizeof(*presets));
@@ -290,7 +290,6 @@ static int isp_ch_cache_sensor_configs(struct apple_isp *isp, u32 ch, u32 count)
 	for (u32 i = 0; i < count; i++) {
 		struct cmd_ch_camera_config *config = &args.config;
 		struct isp_sensor_config *cached = &configs[i];
-		bool duplicate = false;
 
 		err = isp_cmd_ch_camera_config_get(isp, ch, i, &args);
 		if (err)
@@ -335,27 +334,6 @@ static int isp_ch_cache_sensor_configs(struct apple_isp *isp, u32 ch, u32 count)
 			    preset->crop_size.y * preset->output_dim.x)
 				preset->p010 = preview || reported;
 		}
-		if (!cached->usable)
-			continue;
-
-		/* Keep the board's config-5 presets, including the default, first. */
-		for (unsigned int j = 0; j < num; j++) {
-			if (presets[j].output_dim.x == config->out_width &&
-			    presets[j].output_dim.y == config->out_height) {
-				duplicate = true;
-				break;
-			}
-		}
-		if (duplicate)
-			continue;
-
-		presets[num++] = (struct isp_preset){
-			.index = i,
-			.input_dim = cached->input_dim,
-			.output_dim = cached->output_dim,
-			.crop_size = cached->output_dim,
-			.p010 = true,
-		};
 	}
 	isp->sensor_configs = configs;
 	isp->num_sensor_configs = count;

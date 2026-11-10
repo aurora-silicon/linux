@@ -114,6 +114,7 @@ pub(crate) const CONFIG_MAX: Config = Config {
             },
         ],
         variant: &crate::g17::fw::variant::V26A428_M5,
+        config: None,
     }]),
     // Four clusters of ten cores. The buffers are sized for every core slot of the board, so the
     // board's cluster and slot counts admit the GPU, whichever cores are fused off.
@@ -196,6 +197,7 @@ pub(crate) const CONFIG_ULTRA: Config = Config {
             ],
         }],
         variant: &crate::g17::fw::variant::V26A428_M5,
+        config: None,
     }]),
     // Eight clusters of ten cores. M5 renders lay out their tiler context store themselves
     // (`fw::m5::render_registers`), so the deflake layout is the M5 Pro's. As on the M5 Pro, the

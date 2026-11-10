@@ -394,6 +394,38 @@ struct CpuRequest {
 // ceiling's lock.
 unsafe impl Send for CpuRequest {}
 
+/// Takes a counted reference on `cpu`'s cpufreq policy, or returns null where it has none.
+#[cfg(CONFIG_CPU_FREQ)]
+fn policy_get(cpu: u32) -> *mut bindings::cpufreq_policy {
+    // SAFETY: cpufreq_cpu_get accepts any CPU number and returns a counted reference or null.
+    unsafe { bindings::cpufreq_cpu_get(cpu) }
+}
+
+/// Without cpufreq no CPU has a policy, so the ceiling never takes a request.
+#[cfg(not(CONFIG_CPU_FREQ))]
+fn policy_get(_cpu: u32) -> *mut bindings::cpufreq_policy {
+    core::ptr::null_mut()
+}
+
+/// Drops a reference taken by [`policy_get`].
+///
+/// # Safety
+///
+/// `policy` must hold a reference from [`policy_get`] that has not been dropped yet.
+#[cfg(CONFIG_CPU_FREQ)]
+unsafe fn policy_put(policy: *mut bindings::cpufreq_policy) {
+    // SAFETY: the caller holds the reference.
+    unsafe { bindings::cpufreq_cpu_put(policy) }
+}
+
+/// Without cpufreq there is no reference to drop.
+///
+/// # Safety
+///
+/// None; unsafe only to match the cpufreq variant.
+#[cfg(not(CONFIG_CPU_FREQ))]
+unsafe fn policy_put(_policy: *mut bindings::cpufreq_policy) {}
+
 /// Shares the SoC's heat between the CPU and the GPU while the governor limits the GPU: when the
 /// GPU is budget-bound it lowers the maximum
 /// frequency of every CPU cluster one step at a time, and gives the steps back once the GPU no
@@ -427,9 +459,7 @@ impl CpuCeiling {
         // SAFETY: nr_cpu_ids is set once during early boot.
         let cpus = unsafe { bindings::nr_cpu_ids };
         for cpu in 0..cpus {
-            // SAFETY: cpufreq_cpu_get accepts any CPU number and returns a counted reference or
-            // null.
-            let policy = unsafe { bindings::cpufreq_cpu_get(cpu) };
+            let policy = policy_get(cpu);
             if policy.is_null() {
                 continue;
             }
@@ -444,7 +474,7 @@ impl CpuCeiling {
             let Some(mut request) = request.filter(|_| self.requests.reserve(1, GFP_KERNEL).is_ok())
             else {
                 // SAFETY: drops the reference taken above.
-                unsafe { bindings::cpufreq_cpu_put(policy) };
+                unsafe { policy_put(policy) };
                 continue;
             };
             // SAFETY: the policy outlives the request (the reference is held until removal) and
@@ -459,7 +489,7 @@ impl CpuCeiling {
             };
             if added < 0 {
                 // SAFETY: drops the reference taken above.
-                unsafe { bindings::cpufreq_cpu_put(policy) };
+                unsafe { policy_put(policy) };
                 continue;
             }
             // Capacity was reserved above, so this cannot fail.
@@ -474,7 +504,7 @@ impl CpuCeiling {
             // SAFETY: the request was added in acquire and the policy reference is still held.
             unsafe {
                 bindings::freq_qos_remove_request(&mut *entry.request);
-                bindings::cpufreq_cpu_put(entry.policy);
+                policy_put(entry.policy);
             }
         }
         self.level = 0;

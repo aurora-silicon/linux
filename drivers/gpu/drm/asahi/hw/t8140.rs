@@ -194,6 +194,19 @@ pub(crate) mod dynamic {
     /// Canonical low mappings shared by hardware queues and their clients.
     /// Client-private allocations start after this arena.
     pub(crate) const LOWER: core::ops::Range<u64> = 0x70_0400_0000..0x70_8000_0000;
+
+    /// The firmware timestamp window (gart range 11, `HwData.unk_28`): user timestamp buffers
+    /// are aliased here so that the firmware writes their stamps itself.
+    pub(crate) const TIMESTAMP_WINDOW: core::ops::Range<u64> =
+        0xffff_fc21_8140_0000..0xffff_fc21_8540_0000;
+    // `HwData::init` (initdata.rs and v25g83.rs) writes this start as a literal.
+    const _: () = assert!(TIMESTAMP_WINDOW.start == 0xffff_fc21_8140_0000);
+
+    /// Dynamic kernel objects in the upper window: from `KERNEL_OFFSET` up to the firmware
+    /// MMIO aperture. The firmware gives the addresses from there on a fixed meaning.
+    pub(crate) const fn upper(kernel: core::ops::Range<u64>) -> core::ops::Range<u64> {
+        kernel.start + KERNEL_OFFSET..super::MMIO_APERTURE
+    }
 }
 
 /// Fixed addresses in the firmware's context-0 and context-1 address spaces.
