@@ -20,6 +20,7 @@ select:
           - apple,t6030-rsm
           - apple,t6031-rsm
           - apple,t6032-rsm
+          - apple,t6050-rsm
           - apple,t8122-rsm
           - apple,t8140-rsm
           - apple,t8142-rsm
@@ -37,13 +38,16 @@ allOf:
           contains:
             enum:
               - apple,t6032-rsm
+              - apple,t6050-rsm
       required:
         - compatible
     then:
       properties:
         compatible:
           items:
-            - const: apple,t6032-rsm
+            - enum:
+                - apple,t6032-rsm
+                - apple,t6050-rsm
             - const: apple,rsm
 
         reg:

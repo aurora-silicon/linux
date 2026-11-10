@@ -6,6 +6,8 @@ config DRM_APPLE
 	depends on APPLE_RTKIT
 	depends on TYPEC || !TYPEC
 	depends on OF_ADDRESS
+	# The firmware-27 remote buffer path calls into the DART driver.
+	depends on APPLE_DART || !APPLE_DART
 	select APPLE_PMP_REPORT
 	select OF_DYNAMIC
 	select DRM_CLIENT_SELECTION

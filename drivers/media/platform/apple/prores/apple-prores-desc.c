@@ -322,15 +322,15 @@ u32 apr_slice_count(u32 width, u32 height, u32 log2_slice)
 }
 EXPORT_SYMBOL_IF_KUNIT(apr_slice_count);
 
-int apr_build_desc(const struct apr_frame *f, u8 *desc)
+static int apr_build_desc_common(const struct apr_frame *f, u8 *desc)
 {
 	bool is444 = apr_input_is_444(f->input);
 	bool deep = f->input == APR_INPUT_422_16 || f->input == APR_INPUT_444_16;
-	enum apr_qtable table = apr_profile_qtable(f->profile);
-	u32 min_luma, min_chroma, cmd, slices, mbs, target, max;
-	unsigned int i;
+	u32 min_luma, min_chroma, cmd, slices;
 
-	if (f->profile >= APR_PROFILES || is444 != apr_profile_is_444(f->profile))
+	if ((unsigned int)f->input > APR_INPUT_444_16 ||
+	    (unsigned int)f->profile >= APR_PROFILES ||
+	    is444 != apr_profile_is_444(f->profile))
 		return -EINVAL;
 	if (!f->width || !f->height || f->width > U16_MAX || f->height > U16_MAX ||
 	    f->width & 1)
@@ -346,8 +346,6 @@ int apr_build_desc(const struct apr_frame *f, u8 *desc)
 	slices = apr_slice_count(f->width, f->height, APR_SLICE_LOG2);
 	if (slices > U16_MAX)
 		return -EINVAL;
-	mbs = DIV_ROUND_UP(f->width, 16) * DIV_ROUND_UP(f->height, 16);
-	apr_frame_budget(f->profile, f->width, f->height, &target, &max);
 
 	memset(desc, 0, APR_DESC_BYTES);
 
@@ -369,6 +367,24 @@ int apr_build_desc(const struct apr_frame *f, u8 *desc)
 	put_unaligned_le64(f->luma, desc + D_LUMA);
 	put_unaligned_le64(f->chroma, desc + D_CHROMA);
 	put_unaligned_le64(0, desc + D_ALPHA);
+
+	return 0;
+}
+
+int apr_build_desc(const struct apr_frame *f, u8 *desc)
+{
+	bool is444 = apr_input_is_444(f->input);
+	enum apr_qtable table = apr_profile_qtable(f->profile);
+	u32 slices, mbs, target, max;
+	unsigned int i;
+	int ret;
+
+	ret = apr_build_desc_common(f, desc);
+	if (ret)
+		return ret;
+	slices = apr_slice_count(f->width, f->height, APR_SLICE_LOG2);
+	mbs = DIV_ROUND_UP(f->width, 16) * DIV_ROUND_UP(f->height, 16);
+	apr_frame_budget(f->profile, f->width, f->height, &target, &max);
 
 	put_unaligned_be16(slices, desc + D_SLICES);
 	desc[D_SLICE_LOG2] = APR_SLICE_LOG2 << 4;
@@ -402,6 +418,60 @@ int apr_build_desc(const struct apr_frame *f, u8 *desc)
 	return 0;
 }
 EXPORT_SYMBOL_IF_KUNIT(apr_build_desc);
+
+/*
+ * T6000 constants: Copyright The Asahi Linux Contributors.
+ * MIT license: see m1n1-LICENSE.
+ * Descriptor v0 (APR a0). Source: MIT m1n1 f3ac615eb137,
+ * proxyclient/m1n1/hw/prores.py:7-111 and
+ * proxyclient/experiments/prores.py:592-644. Only the input/output prefix
+ * is shared with v1. The rate-control block is v1's, 0x20 bytes earlier:
+ * the target and maximum Q3 bytes per macroblock at 0xf0/0xf2 take the same
+ * per-profile budgets, so every profile lands on its data rate. (The public
+ * experiment's 0xffff limits leave the engine unbudgeted.)
+ */
+int apr_build_desc_v0(const struct apr_frame *f, u8 *desc)
+{
+	bool is444 = apr_input_is_444(f->input);
+	enum apr_qtable table = apr_profile_qtable(f->profile);
+	u32 slices, mbs, target, max;
+	unsigned int i;
+	int ret;
+
+	ret = apr_build_desc_common(f, desc);
+	if (ret)
+		return ret;
+	slices = apr_slice_count(f->width, f->height, APR_SLICE_LOG2);
+	mbs = DIV_ROUND_UP(f->width, 16) * DIV_ROUND_UP(f->height, 16);
+	apr_frame_budget(f->profile, f->width, f->height, &target, &max);
+
+	/* Frame header, including the legacy aspect/rate byte at 0x065. */
+	put_unaligned_be16(D_FH_BYTES, desc + 0x058);
+	desc[0x05b] = is444 ? 1 : 0;
+	memcpy(desc + 0x05c, "aurr", 4);
+	put_unaligned_be16(f->width, desc + 0x060);
+	put_unaligned_be16(f->height, desc + 0x062);
+	desc[0x064] = (is444 ? 3 : 2) << 6;
+	desc[0x066] = f->primaries;
+	desc[0x067] = f->transfer;
+	desc[0x068] = f->matrix;
+	/* No alpha. Both quantisation matrices are included in the header. */
+	desc[0x06b] = 3;
+	/* Deprecated slice count at 0x0ec stays zero, as in m1n1. */
+	desc[0x0ee] = APR_SLICE_LOG2 << 4;
+	desc[0x0ef] = apr_profile_policy[f->profile].quant_index;
+	put_unaligned_le16(apr_mb_budget(target, slices, mbs), desc + 0x0f0);
+	put_unaligned_le16(apr_mb_budget(max, slices, mbs), desc + 0x0f2);
+	put_unaligned_le64(APR_RC_THRESHOLDS, desc + 0x0f4);
+	put_unaligned_le32(0x2c8080, desc + 0x0fc);
+	for (i = 0; i < ARRAY_SIZE(apr_rc_beta); i++)
+		put_unaligned_le32(apr_rc_beta[i], desc + 0x100 + 4 * i);
+	for (i = 0; i < 16; i++)
+		put_unaligned_le32(APR_RC_QUANT, desc + 0x110 + 4 * i);
+	put_unaligned_le32(table << 4 | 3, desc + 0x150);
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(apr_build_desc_v0);
 
 /*
  * A finished frame starts with its big-endian length, which counts the whole

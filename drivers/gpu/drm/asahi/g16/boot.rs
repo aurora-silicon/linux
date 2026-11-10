@@ -44,8 +44,6 @@ pub(crate) mod glue {
         fn asahi_g16_board() -> bool;
         fn asahi_g16_display_prepare(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
         fn asahi_g16_hold_power(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
-        fn asahi_g16_module_try_get() -> bool;
-        fn asahi_g16_module_put();
         fn asahi_g16_ram_disjoint(start: u64, size: u64) -> bool;
         fn asahi_g16_ioremap_wc(start: u64, size: usize) -> *mut core::ffi::c_void;
         fn asahi_g16_dma_unsupported(dev: *mut core::ffi::c_void) -> bool;
@@ -87,21 +85,10 @@ pub(crate) mod glue {
         RETAINED.load(Ordering::Acquire)
     }
 
-    /// Pins this module until reboot, once (`try_module_get(THIS_MODULE)`).
+    /// Pins this module until reboot, once (`try_module_get(THIS_MODULE)`, see `retain.rs`).
     /// ENODEV, with nothing pinned or marked, once the module's removal has begun.
     pub(crate) fn retain_module() -> Result {
-        if RETAINED.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        // SAFETY: Takes a reference to this module unless its removal has begun.
-        if !unsafe { asahi_g16_module_try_get() } {
-            return Err(ENODEV);
-        }
-        if RETAINED.swap(true, Ordering::AcqRel) {
-            // SAFETY: Drops only the reference this call took; the first one is never put.
-            unsafe { asahi_g16_module_put() };
-        }
-        Ok(())
+        crate::retain::retain_module(&RETAINED)
     }
 
     /// The physical range is disjoint from System RAM.
@@ -496,7 +483,8 @@ pub(crate) fn admit(
     }
     let regs = regs::Regs::new(pdev, res)?;
     // Once power admission starts, even a rejected cold check must not detach the GFX
-    // domain under an inherited firmware owner. Keep the module and platform binding.
+    // domain under an inherited firmware owner. Keep the module and platform binding; once
+    // the module's removal has begun nothing is held.
     glue::retain_module()?;
     glue::hold_power(dev)?;
     let (power_offset, power_state) = glue::power_domain_state(dev)?;
@@ -742,9 +730,12 @@ pub(crate) fn start(
         return Err(e);
     }
 
-    // From here on the firmware is touched: nothing it can reach is freed.
-    // Admission already pinned the module, so this cannot fail.
-    let _ = glue::retain_module();
+    // From here on the firmware is touched: nothing it can reach is freed. Admission pinned
+    // the module, so this only confirms it.
+    if let Err(e) = glue::retain_module() {
+        core::mem::forget(objects);
+        return Err(e);
+    }
     let rtkit = match Rtkit::new(&d, shared) {
         Ok(rtkit) => rtkit,
         Err(e) => {

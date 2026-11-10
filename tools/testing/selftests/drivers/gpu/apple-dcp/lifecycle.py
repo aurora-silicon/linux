@@ -1091,7 +1091,7 @@ def teardown(root):
                 'atcphy_usb2_init', 'atcphy_usb3_power_off',
                 'atcphy_usb3_route', 'atcphy_usb3_set_mode', 'atcphy_usb2_power_off',
                 '_atcphy_dwc3_reset_assert', 'atcphy_dwc3_reset_assert', 'atcphy_mux_set'),
-        'phy': ('phy_init', 'phy_exit', 'phy_power_on', 'phy_power_off'),
+        'phy': ('phy_init', 'phy_exit', 'phy_reset', 'phy_power_on', 'phy_power_off'),
         'core': ('dwc3_phy_power_on', 'dwc3_phy_power_off', 'dwc3_phy_exit', 'dwc3_core_exit'),
         'apple': ('dwc3_apple_host_before_core_init', 'dwc3_apple_core_stop', 'dwc3_apple_core_init', 'dwc3_apple_core_start',
                   'dwc3_apple_init', 'dwc3_apple_exit', 'dwc3_usb_role_switch_set'),
@@ -1200,9 +1200,17 @@ struct apple_dcp {
     struct device *dev; struct apple_dcp_hw_data hw;
     struct resource *disp_registers[10],disp_bw_scratch_res,disp_bw_doorbell_res;
     u32 disp_bw_scratch_index,disp_bw_scratch_offset,disp_bw_doorbell_index,nr_disp_registers;
+    u64 disp_firmware_base[MAX_DISP_REGISTERS];
 };
+#define IS_ALIGNED(x, a) (((x) & ((a) - 1)) == 0)
+#define U64_MAX UINT64_MAX
 static bool of_property_present(struct device_node *n,const char *name)
 { return !strcmp(name,"reg-names") && n->named; }
+/* Firmware-physical windows follow the pmgr scratch lookup, which fails here. */
+static int of_property_count_u64_elems(struct device_node *n,const char *name)
+{ (void)n;(void)name;assert(!"firmware-physical-regs outside the T8140 profiles");return -EINVAL; }
+static int of_property_read_u64_array(struct device_node *n,const char *name,u64 *v,unsigned count)
+{ (void)n;(void)name;(void)v;(void)count;assert(!"firmware-physical-regs outside the T8140 profiles");return -EINVAL; }
 static int of_property_count_strings(struct device_node *n,const char *name)
 { assert(!strcmp(name,"reg-names"));return n->count+1; }
 static int of_property_read_string_index(struct device_node *n,const char *name,int i,const char **v)
@@ -1979,6 +1987,7 @@ typedef uint64_t u64;
 #define WRITE_ONCE(x,v) ((x)=(v))
 #define DCP_FIRMWARE_H17P 1
 #define DCP_FIRMWARE_V_26_6_DESKTOP 5
+#define DCP_FIRMWARE_V_27_0 6
 #define DCP_IOMFB_METHODS_H17P_EXTERNAL 2
 #define DCP_IOMFB_METHODS_H17G 3
 #define DCP_MAX_CALL_DEPTH 8
@@ -2015,6 +2024,9 @@ static bool of_device_is_compatible(struct device_node *n, const char *s)
 { (void)s; return n->external; }
 static bool iomfb_check_callback_h17p(struct apple_dcp *d, int t, u32 i, u32 o)
 { (void)d; (void)t; (void)i; (void)o; return true; }
+/* Only handled callbacks are size-checked; this fixture registers none. */
+static bool iomfb_v27_callback_size_valid(unsigned t, u32 i, u32 o)
+{ (void)t; (void)i; (void)o; assert(false); return false; }
 static bool iomfb_uses_queue(struct apple_dcp *d) { (void)d; return false; }
 static bool test_and_set_bit(int t, unsigned long *b) { (void)t; (void)b; return false; }
 static void complete(int *p) { *p = 1; }

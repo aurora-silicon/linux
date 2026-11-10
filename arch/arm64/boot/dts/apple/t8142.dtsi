@@ -213,6 +213,7 @@
 		compatible = "apple,t8142-dart", "apple,t8110-dart";
 		reg = <0x3 0x94800000 0x0 0xc000>,
 		      <0x3 0x94810000 0x0 0x4000>;
+		reg-names = "dart", "dapf";
 		interrupts = <AIC_IRQ 1275 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		status = "disabled";

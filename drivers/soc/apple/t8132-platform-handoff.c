@@ -201,6 +201,86 @@ put_pmgr:
 	return ret;
 }
 
+/*
+ * A boot framebuffer must not wait on a domain the policy keeps from Linux:
+ * that provider never registers, so the consumer only defers until the
+ * timeout. Linux never switches such a domain; it stays as the loader left it.
+ */
+static int __init t8132_framebuffer_domains(void)
+{
+	struct device_node *fb;
+	int ret = 0;
+
+	for_each_compatible_node(fb, NULL, "simple-framebuffer") {
+		struct of_phandle_args args;
+		struct property *prop;
+		__be32 *cells;
+		int count, len, kept = 0, domains = 0;
+
+		if (!of_find_property(fb, "power-domains", &len) || len <= 0)
+			continue;
+		count = of_count_phandle_with_args(fb, "power-domains", "#power-domain-cells");
+		if (count <= 0)
+			continue;
+		cells = kmalloc(len, GFP_KERNEL);
+		if (!cells) {
+			ret = -ENOMEM;
+			goto put_fb;
+		}
+		for (int i = 0; i < count; i++) {
+			bool available;
+
+			ret = of_parse_phandle_with_args(fb, "power-domains", "#power-domain-cells",
+							 i, &args);
+			if (ret)
+				break;
+			available = of_device_is_available(args.np);
+			if (available && kept + 1 + args.args_count <= len / 4) {
+				domains++;
+				cells[kept++] = cpu_to_be32(args.np->phandle);
+				for (int j = 0; j < args.args_count; j++)
+					cells[kept++] = cpu_to_be32(args.args[j]);
+			}
+			of_node_put(args.np);
+		}
+		/* Leave a list it cannot read, or one with nothing to drop, as it is. */
+		if (ret || kept * 4 == len) {
+			kfree(cells);
+			ret = 0;
+			continue;
+		}
+		prop = kzalloc_obj(*prop);
+		if (!prop) {
+			kfree(cells);
+			ret = -ENOMEM;
+			goto put_fb;
+		}
+		prop->name = kstrdup("power-domains", GFP_KERNEL);
+		prop->value = cells;
+		prop->length = kept * 4;
+		if (!prop->name) {
+			kfree(cells);
+			kfree(prop);
+			ret = -ENOMEM;
+			goto put_fb;
+		}
+		of_property_set_flag(prop, OF_DYNAMIC);
+		ret = of_update_property(fb, prop);
+		if (ret) {
+			kfree(prop->name);
+			kfree(cells);
+			kfree(prop);
+			goto put_fb;
+		}
+		pr_info("t8132-platform-handoff: %pOF keeps %d of %d power domains\n",
+			fb, domains, count);
+	}
+	return 0;
+put_fb:
+	of_node_put(fb);
+	return ret;
+}
+
 /* Follow the shared DTS reference instead of interpreting a magic PMGR offset. */
 static struct device_node *__init t8132_find_gfx(void)
 {
@@ -275,10 +355,12 @@ destroy:
 	if (ret) {
 		of_changeset_destroy(cs);
 		kfree(cs);
-	} else if (added || changed) {
-		/* The applied node/property storage lives until reboot. */
-		pr_info("t8132-platform-handoff: supplied %u platform nodes, %u PMGR policy properties\n",
-			added, changed);
+	} else {
+		if (added || changed)
+			/* The applied node/property storage lives until reboot. */
+			pr_info("t8132-platform-handoff: supplied %u platform nodes, %u PMGR policy properties\n",
+				added, changed);
+		ret = t8132_framebuffer_domains();
 	}
 out:
 	of_node_put(gfx);

@@ -58,6 +58,19 @@ void dcp_poweroff(struct platform_device *pdev);
 int dcp_typec_prepare_route(struct apple_dcp *dcp);
 void dcp_poweron(struct platform_device *pdev);
 void dcp_external_recover(struct platform_device *pdev);
+int dcp_peer_hints_v27(struct apple_dcp *dcp, struct dptx_port *port,
+		      const void *data, size_t size, void *reply, size_t reply_size);
+bool dcp_peer_tiling_state_v27(struct apple_dcp *dcp, bool write,
+			      u32 event, u32 param, u32 *value);
+void dcp_peer_display_ids_v27(struct apple_dcp *dcp, u32 own, u32 related);
+int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, bool vrr);
+int dcp_peer_color_v27(struct apple_dcp *dcp, struct iomfb_set_matrix_req *matrix);
+int dcp_peer_stop_v27(struct apple_dcp *dcp);
+struct apple_dcp *dcp_peer_scanout_v27(struct apple_dcp *dcp);
+void dcp_peer_swap_armed_v27(struct apple_dcp *dcp, u32 id);
+void dcp_peer_swap_failed_v27(struct apple_dcp *dcp);
+bool dcp_peer_swap_complete_v27(struct apple_dcp *dcp, u32 id, ktime_t now,
+		void (*report)(struct apple_dcp *, u32, ktime_t));
 int dcp_set_crc(struct drm_crtc *crtc, bool enabled);
 int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commit);
 int dcp_get_connector_type(struct platform_device *pdev);
@@ -79,6 +92,7 @@ int dcp_ext26_layout_stop(struct apple_dcp *dcp);
 int dcp_wait_ready(struct platform_device *pdev, u64 timeout);
 void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit);
 bool dcp_hdr_metadata_live(struct platform_device *pdev);
+bool dcp_edr_live(struct platform_device *pdev);
 void dcp_retain_framebuffer(struct platform_device *pdev,
 			    struct dcp_fb_reference *entry);
 void dcp_arm_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id);
@@ -90,6 +104,8 @@ void apple_crtc_vblank(struct apple_crtc *apple);
 void dcp_drm_crtc_vblank(struct apple_crtc *crtc);
 void dcp_drm_crtc_error(struct apple_crtc *crtc,
 			struct drm_crtc_state *state, int error);
+void dcp_drm_crtc_flip_lost(struct apple_crtc *crtc,
+			    struct completion *flip_done, int error);
 int dcp_get_modes(struct drm_connector *connector);
 enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 				    const struct drm_display_mode *mode);

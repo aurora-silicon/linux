@@ -8,12 +8,47 @@
 //! propagate to the device owner. Device-control publication reserves one
 //! empty slot and orders the record, power tally and producer together.
 
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{fence, AtomicU64, Ordering};
 use kernel::{device::Device, prelude::*};
 
 use super::fw::{channels::*, initdata::status};
 use super::initdata::InitData;
 use super::Role;
+
+/// Device-control records published since the driver loaded. Counted across firmware
+/// restarts, so it only grows.
+static CONTROL_PUBLISHED: AtomicU64 = AtomicU64::new(0);
+/// The largest count of published records the firmware is known to have consumed.
+static CONTROL_CONSUMED: AtomicU64 = AtomicU64::new(0);
+
+/// Firmware progress fences for host identities and storage that the firmware may still
+/// name after their owner let go of them.
+///
+/// The firmware consumes device-control records in order. Once it has consumed a record
+/// published after an owner released something, it has finished with every record before
+/// that one, including the release that retired the owner. [`fence`](control_fence) is that
+/// next record; [`witnessed`](control_witnessed) says how far the firmware got. A fence of
+/// zero is always met.
+pub(crate) fn control_fence() -> u64 {
+    CONTROL_PUBLISHED.load(Ordering::Acquire) + 1
+}
+
+/// The control-ring progress the firmware has shown so far (see [`control_fence`]).
+pub(crate) fn control_witnessed() -> u64 {
+    CONTROL_CONSUMED.load(Ordering::Acquire)
+}
+
+/// Records how far the firmware consumed the control ring. Call under the device mutex,
+/// which also serializes publication, with cursors read after any publication by the caller.
+/// A restarted firmware has nothing pending, so everything published so far counts.
+pub(crate) fn observe_control(consumer: u32, producer: u32) {
+    if consumer >= DEVICE_CONTROL_SLOTS || producer >= DEVICE_CONTROL_SLOTS {
+        return;
+    }
+    let pending = u64::from(producer.wrapping_sub(consumer) & (DEVICE_CONTROL_SLOTS - 1));
+    let consumed = CONTROL_PUBLISHED.load(Ordering::Acquire).saturating_sub(pending);
+    CONTROL_CONSUMED.fetch_max(consumed, Ordering::AcqRel);
+}
 
 /// Firmware rings whose contents do not affect host scheduling.
 #[derive(Copy, Clone, Debug)]
@@ -23,19 +58,20 @@ enum ReportRing {
 }
 
 impl ReportRing {
-    fn geometry(self) -> (usize, usize, u32, u32) {
+    /// State and entry offsets, capacity and the record tags the family allows.
+    fn geometry(self, init: &InitData) -> (usize, usize, u32, u64) {
         match self {
             Self::Trace => (
                 status::TRACE_STATE as usize,
                 status::TRACE_RING as usize,
                 TRACE_SLOTS,
-                TRACE_TYPES,
+                u64::from(TRACE_TYPES),
             ),
             Self::Statistics => (
                 status::STATS_STATE as usize,
                 status::STATS_RING as usize,
                 STATISTICS_SLOTS,
-                STATISTICS_TYPES,
+                init.statistics_types(),
             ),
         }
     }
@@ -96,7 +132,11 @@ impl Rings {
         epoch: u64,
     ) {
         if !powered || !self.statistics_powered || epoch != self.statistics_epoch {
-            self.telemetry.invalidate();
+            if powered {
+                self.telemetry.invalidate();
+            } else {
+                self.telemetry.gate();
+            }
             // End the queued prefix *now*, not at the next drain. A boolean
             // discard-next-batch also throws away records produced after this
             // observation, even if the queue was empty at the boundary.
@@ -204,7 +244,7 @@ impl Rings {
         accept_statistics: bool,
         statistics_cutoff: &mut Option<u32>,
     ) -> Result {
-        let (state, entries, capacity, allowed_types) = ring.geometry();
+        let (state, entries, capacity, allowed_types) = ring.geometry(init);
         let consumer_word = init.status_word(role, state)?;
         let producer_word = init.status_word(role, state + RX_PRODUCER_OFFSET)?;
         fence(Ordering::Acquire);
@@ -233,12 +273,12 @@ impl Rings {
             let words = init.status_read_words::<EVENT_WORDS>(role, offset)?;
             super::trace::report(role as u8, ring as u8, &words);
             let tag = words[0];
-            if tag >= u32::BITS || allowed_types & (1 << tag) == 0 {
+            if tag >= u64::BITS || allowed_types & (1u64 << tag) == 0 {
                 return Err(EIO);
             }
             if matches!(ring, ReportRing::Statistics) {
                 let admitted = accept_statistics && statistics_cutoff.is_none();
-                reports.record(role, words, host_ns, admitted);
+                reports.record(role, words, host_ns, allowed_types, admitted);
                 if admitted {
                     telemetry.record(&words, host_ns, max_age_ns);
                 }
@@ -279,9 +319,11 @@ impl Rings {
         init.publish_control(
             producer,
             record.bytes(),
-            record.opcode().asserts_gpu_power(),
+            init.control_asserts_gpu_power(record.opcode()),
             next,
         )?;
+        CONTROL_PUBLISHED.fetch_add(1, Ordering::AcqRel);
+        observe_control(consumer, next);
         super::trace::message(super::trace::CONTROL, record.opcode() as u64);
         Ok(next)
     }
@@ -344,7 +386,7 @@ impl Events {
             let words = init.status_read_words(role, offset)?;
             super::trace::report(role as u8, 2, &words);
             let record = EventRecord::from_words(words);
-            let event = record.decode_for(self.graph);
+            let event = record.decode_for(self.graph, init.is_m5());
             fence(Ordering::SeqCst);
             consumer_word.store((consumer + 1) & (EVENT_SLOTS - 1), Ordering::Relaxed);
             fence(Ordering::SeqCst);

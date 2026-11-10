@@ -202,6 +202,7 @@ struct apple_pmp_report_entry {
 	bool no_ack, dvfs, removed;
 	bool sleep_release, released;
 	u32 dvfs_entry;
+	u64 dvfs_off;
 	u64 dvfs_on;
 	struct apple_pmp_report *native_owner;
 };
@@ -750,6 +751,10 @@ static int apple_pmp_native_records(struct apple_pmp_report *rep)
 	return 0;
 }
 
+/* The extracted probe compares rep->offsets with the T6001 table and tells the AGX vote that a report came back. This harness has neither: the table is empty and
+ * never matches, and the call does nothing. */
+static const struct apple_pmp_report_offsets apple_pmp_offsets_t600x;
+static void apple_pmp_agx_activity_resume(void) {}
 #include "production.h"
 #if HOST_HAS_DRAM
 static int devm_device_add_group(struct device *dev, const struct attribute_group *group)

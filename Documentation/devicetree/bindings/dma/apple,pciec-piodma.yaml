@@ -31,6 +31,7 @@ select:
           - apple,t8122-pciec-piodma
           - apple,t8132-pciec-piodma
           - apple,t8142-pciec-piodma
+          - apple,t6050-pciec-piodma
           - apple,t8152-pciec-piodma
   required:
     - compatible
@@ -117,6 +118,7 @@ allOf:
                       - apple,t8112-pciec-piodma
                       - apple,t8122-pciec-piodma
                       - apple,t8142-pciec-piodma
+                      - apple,t6050-pciec-piodma
                       - apple,t8152-pciec-piodma
                   - const: apple,pciec-piodma
 

@@ -3,6 +3,7 @@
 """Execute the production native26 encoder against independent byte fixtures."""
 import ctypes as C
 import os
+import re
 from pathlib import Path
 import struct
 import subprocess
@@ -10,7 +11,10 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-SIZE = 0x1BD8
+HEADER = (ROOT / 'drivers/gpu/drm/apple/dcpext26-wire.h').read_text()
+WIRE = {name: int(value, 0) for name, value in
+        re.findall(r'^#define DCPEXT26_(\w+) (0x[0-9a-fA-F]+|[0-9]+)$', HEADER, re.M)}
+SIZE = WIRE['SUBMIT_BYTES']
 
 
 class Primary(C.Structure):
@@ -20,29 +24,29 @@ class Primary(C.Structure):
 
 def fixture(layer, address, width, height, pitch, swap_id=17):
     """Byte schema, including every zero byte, independent of C field writes."""
-    fields = {0x98: struct.pack('<I', swap_id),
-              0x14C: struct.pack('<II', 0x80000007, 0x80000007),
-              0x154: struct.pack('<I', 0xFF000000),
-              0x1BCB: bytes([1] * 10), 0x1BD6: b'\1\1'}
+    fields = {WIRE['SWAP_ID']: struct.pack('<I', swap_id),
+              WIRE['SWAP_ENABLED']: struct.pack('<II', 0x80000007, 0x80000007),
+              WIRE['BG_COLOR']: struct.pack('<I', 0xFF000000),
+              WIRE['SURF_NULL']: bytes([1] * 10), WIRE['POINTER_NULL']: b'\1\1'}
     if address:
-        base = 0x588 + layer * 0x22C
-        groups = {2: b'\1', 3: struct.pack('<II', 1, 1), 11: b'ARGB',
-                  0x13: b'\15\14', 0x19: b'\1\0\1\1',
-                  0x15: struct.pack('<I', pitch),
-                  0x21: struct.pack('<III', width, height, pitch * height),
-                  0x35: struct.pack('<I', 1), 0x51: struct.pack('<QII', 1, width, height),
-                  0x69: struct.pack('<IIHBB', pitch, pitch * height, 4, 1, 1),
-                  0x149: struct.pack('<Q', 1)}
+        base = WIRE['SURFACES'] + layer * WIRE['SURFACE_BYTES']
+        groups = {WIRE['SURF_PREMULTIPLIED']: b'\1', WIRE['SURF_PLANE_COUNT']: struct.pack('<II', 1, 1), WIRE['SURF_FORMAT']: b'ARGB',
+                  WIRE['SURF_XFER_FUNC']: b'\15\14', WIRE['SURF_PIX_SIZE']: b'\1\0\1\1',
+                  WIRE['SURF_STRIDE']: struct.pack('<I', pitch),
+                  WIRE['SURF_WIDTH']: struct.pack('<III', width, height, pitch * height),
+                  WIRE['SURF_SURFACE_ID']: struct.pack('<I', 1), WIRE['SURF_HAS_COMP']: struct.pack('<QII', 1, width, height),
+                  WIRE['SURF_PLANE_STRIDE']: struct.pack('<IIHBB', pitch, pitch * height, 4, 1, 1),
+                  WIRE['SURF_HAS_PLANES']: struct.pack('<Q', 1)}
         fields.update({base + off: value for off, value in groups.items()})
-        fields[0x9C + 4 * layer] = struct.pack('<I', 1)
-        fields[0xE38 + 8 * layer] = struct.pack('<Q', address)
-        for base in (0xAC, 0x10C):
+        fields[WIRE['SURF_IDS'] + 4 * layer] = struct.pack('<I', 1)
+        fields[WIRE['SURF_IOVA'] + 8 * layer] = struct.pack('<Q', address)
+        for base in (WIRE['SRC_RECT'], WIRE['DST_RECT']):
             fields[base + 16 * layer] = struct.pack('<IIII', 0, 0, width, height)
     wire = bytearray(SIZE)
     for off, value in fields.items():
         wire[off:off + len(value)] = value
     if address:
-        wire[0x1BCB + layer] = 0
+        wire[WIRE['SURF_NULL'] + layer] = 0
     return wire
 
 
@@ -111,8 +115,8 @@ int submit(const void *r,size_t n) { return dcpext26_submit_reply(r,n); }
 
     def test_invalid_inputs_preserve_buffer(self):
         good = (0x100000, 33177600, 3840, 2160, 15360)
-        cases = [(0, *good[1:]), (good[0], 4, *good[2:]),
-                 (*good[:2], 0, *good[3:]), (*good[:3], 0, good[4]),
+        cases = [(0, *good[1:]), (good[0], 4, *good[WIRE['SURF_PREMULTIPLIED']:]),
+                 (*good[:2], 0, *good[WIRE['SURF_PLANE_COUNT']:]), (*good[:3], 0, good[4]),
                  (*good[:4], 15359), (*good[:4], 16),
                  (2**64-4, *good[1:]), (good[0], 2**64-1, 1, 2**32-1, 8)]
         for values in cases:

@@ -128,4 +128,6 @@ int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port);
 bool dcp_is_external_h17p(struct apple_dcp *dcp);
 bool dcp_is_retained_external(struct apple_dcp *dcp);
 
+int dcp_typec_test_link(struct platform_device *pdev, bool enabled);
+
 #endif /* __APPLE_DCP_FABRIC_H__ */

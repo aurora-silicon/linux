@@ -89,8 +89,20 @@ struct apple_epic_service {
 
 enum epic_subtype;
 
+/* A compact service announcement's name field, with its NUL */
+#define AFK_COMPACT_NAME_LEN	32
+/* The shortest cut of a long compact service name that still identifies it */
+#define AFK_COMPACT_CUT_MIN	20
+
 struct apple_epic_service_ops {
 	const char name[32];
+	/*
+	 * A compact service whose announcement does not fit the 32-byte field:
+	 * its full "<name>:<unit>". The firmware cuts the announcement to 31
+	 * characters, losing the end of the name and the unit; a cut of this
+	 * string, at least AFK_COMPACT_CUT_MIN characters of it, matches.
+	 */
+	const char *compact_full;
 	/* All retained pointers must be pinned before enabling slot reuse. */
 	bool reusable;
 	/* EOPNOTSUPP from prepare means intentional absence only for this role. */
@@ -107,6 +119,9 @@ struct apple_epic_service_ops {
 			  const char *class, s64 unit);
 	void (*init)(struct apple_epic_service *service, const char *name,
 			      const char *class, s64 unit);
+	/* Consumed synchronously before init publishes service readiness. */
+	void (*init_props)(struct apple_epic_service *service, s64 unit,
+			   const void *props, size_t size);
 	int (*call)(struct apple_epic_service *service, u32 idx,
 		    const void *data, size_t data_size, void *reply,
 		    size_t reply_size);
@@ -116,6 +131,9 @@ struct apple_epic_service_ops {
 		      const void *data, size_t data_size);
 	void (*teardown)(struct apple_epic_service *service);
 };
+
+bool afk_compact_cut_of(const struct apple_epic_service_ops *ops, const char *service_name);
+
 
 static inline int afk_ring_stride(u32 total, u32 bufsz, u32 *stride)
 {
@@ -528,6 +546,24 @@ struct apple_dcp_afkep {
 
 	bool match_epic_name;
 };
+
+/*
+ * The locks, lists and wait queues of an endpoint, before anything may use
+ * them. afk_init() starts from it, and so does any endpoint built without it.
+ */
+static inline void afk_ep_init_state(struct apple_dcp_afkep *ep)
+{
+	u32 i;
+
+	spin_lock_init(&ep->lock);
+	INIT_LIST_HEAD(&ep->compact_cmds);
+	init_waitqueue_head(&ep->compact_orphan_wq);
+	mutex_init(&ep->compact_tx_lock);
+	init_completion(&ep->started);
+	init_completion(&ep->stopped);
+	for (i = 0; i < AFK_MAX_CHANNEL; i++)
+		spin_lock_init(&ep->services[i].lock);
+}
 
 struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 				 const struct apple_epic_service_ops *ops);

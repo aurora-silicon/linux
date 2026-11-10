@@ -1727,6 +1727,30 @@ static void tb_xdomain_failed(struct tb_xdomain *xd)
 			   msecs_to_jiffies(XDOMAIN_DEFAULT_TIMEOUT));
 }
 
+/*
+ * Whether the lanes to @xd are bonded already. A handshake restarted on
+ * system resume, with the routers kept awake through the sleep, finds the
+ * link as it left it. Redoing lane bonding there makes both hosts walk the
+ * link width again while the services (thunderbolt-net) set up their paths
+ * at the same time, and on Apple ACIO v2 routers that can leave the local
+ * router's control port unresponsive.
+ */
+static bool tb_xdomain_lanes_bonded(struct tb_xdomain *xd)
+{
+	struct tb_port *port = tb_xdomain_downstream_port(xd);
+	int width;
+
+	if (!port->dual_link_port || !port->bonded)
+		return false;
+
+	width = tb_port_get_link_width(port);
+	if (width < 0)
+		return false;
+
+	return width & (TB_LINK_WIDTH_DUAL | TB_LINK_WIDTH_ASYM_TX |
+			TB_LINK_WIDTH_ASYM_RX);
+}
+
 static void tb_xdomain_state_work(struct work_struct *work)
 {
 	struct tb_xdomain *xd = container_of(work, typeof(*xd), state_work.work);
@@ -1756,7 +1780,7 @@ static void tb_xdomain_state_work(struct work_struct *work)
 			tb_xdomain_failed(xd);
 		} else {
 			tb_xdomain_queue_properties_changed(xd);
-			if (xd->bonding_possible)
+			if (xd->bonding_possible && !tb_xdomain_lanes_bonded(xd))
 				tb_xdomain_queue_link_status(xd);
 			else
 				tb_xdomain_queue_properties(xd);

@@ -7349,9 +7349,11 @@ static int perf_mmap_rb(struct vm_area_struct *vma, struct perf_event *event,
 		if (refcount_inc_not_zero(&event->rb->mmap_count)) {
 			/*
 			 * Success -- managed to mmap() the same buffer
-			 * multiple times.
+			 * multiple times. The alias shares the ring's
+			 * already-locked pages; the existing charge stays
+			 * as-is and is removed once, when the last mapping
+			 * closes.
 			 */
-			perf_mmap_account(vma, user_extra, extra);
 			refcount_inc(&event->mmap_count);
 			return 0;
 		}
@@ -7463,10 +7465,25 @@ static int perf_mmap_aux(struct vm_area_struct *vma, struct perf_event *event)
 
 		refcount_set(&rb->aux_mmap_count, 1);
 		rb->aux_mmap_locked = extra;
+
+		/*
+		 * Charge the AUX area once, at first allocation. The alias
+		 * branch above shares the already-locked pages and adds no
+		 * charge; the single charge is removed when the last AUX
+		 * mapping closes.
+		 */
+		perf_mmap_account(vma, user_extra, extra);
 	}
 
-	perf_mmap_account(vma, user_extra, extra);
-	refcount_inc(&event->mmap_count);
+	/*
+	 * A redirected event has mmap_count == 0 here; refcount_inc()
+	 * from zero would WARN and saturate it.  As in perf_mmap_rb(),
+	 * the first mmap() sets the count, aliases increment it.
+	 */
+	if (!refcount_read(&event->mmap_count))
+		refcount_set(&event->mmap_count, 1);
+	else
+		refcount_inc(&event->mmap_count);
 
 	return 0;
 }
@@ -7560,8 +7577,14 @@ static int perf_mmap(struct file *file, struct vm_area_struct *vma)
 		 * Make sure to remove event->rb before releasing
 		 * event->mmap_mutex, such that any concurrent mmap() will not
 		 * attempt use this failed buffer.
+		 *
+		 * The minimal close only fits the base ring mmap() that
+		 * created the rb: a redirected event's first AUX mmap()
+		 * also sees mmap_count == 1, but shares another event's rb
+		 * and needs the full perf_mmap_close().
 		 */
-		if (refcount_read(&event->mmap_count) == 1) {
+		if (!perf_mmap_offset(vma) &&
+		    refcount_read(&event->mmap_count) == 1) {
 			/*
 			 * Minimal perf_mmap_close(); there can't be AUX or
 			 * other events on account of this being the first.

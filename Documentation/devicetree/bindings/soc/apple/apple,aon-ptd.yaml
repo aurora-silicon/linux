@@ -25,6 +25,7 @@ select:
           - apple,t8140-aon-ptd
           - apple,t8142-aon-ptd
           - apple,t8152-aon-ptd
+          - apple,t6050-aon-ptd
   required:
     - compatible
 
@@ -118,6 +119,7 @@ allOf:
                       - apple,t8140-aon-ptd
                       - apple,t8142-aon-ptd
                       - apple,t8152-aon-ptd
+                      - apple,t6050-aon-ptd
                   - const: apple,aon-ptd
 
               reg:

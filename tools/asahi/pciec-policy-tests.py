@@ -38,7 +38,7 @@ struct device_node {
 struct of_device_id { const char *compatible; const void *data; };
 struct of_phandle_args { struct device_node *np; };
 static int maps;
-static bool of_device_is_compatible(struct device_node *np, const char *compat)
+static bool of_device_is_compatible(const struct device_node *np, const char *compat)
 {
     for (int i = 0; np && i < 3 && np->compat[i]; i++)
         if (!strcmp(np->compat[i], compat))
@@ -144,11 +144,12 @@ def main():
     args = parser.parse_args()
     pci = (ROOT / 'drivers/pci/controller/pcie-apple.c').read_text()
     acio = (ROOT / 'drivers/thunderbolt/apple.c').read_text()
-    defines = '\n'.join(re.findall(r'^#define .*$', pci, re.M))
+    defines = '\n'.join(re.findall(r'^#define (?:[^\n]*\\\n)*[^\n]*$', pci, re.M))
     info = pci[pci.index('struct hw_info {'):pci.index('static const struct of_device_id apple_pcie_of_match[];')]
     matches = re.search(r'static const struct of_device_id apple_pcie_of_match\[\] = \{.*?\n\};', pci, re.S)[0]
     production = '\n'.join((defines, info, matches,
                             function(pci, 'apple_pcie_tunnel_needs_cold_init'),
+                            function(acio, 'apple_cio_pciec_eligible'),
                             function(acio, 'apple_cio_pcie_tunnel_is_preinitialized')))
     code = FIXTURE.replace('/* PRODUCTION */', production)
     with tempfile.TemporaryDirectory(prefix='pciec-policy-') as tmp:

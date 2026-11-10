@@ -27,6 +27,7 @@ select:
           - apple,t6000-pmgr-clocks
           - apple,t6032-pmgr-clocks
           - apple,t6041-pmgr-clocks
+          - apple,t6050-pmgr-clocks
           - apple,t8103-pmgr-clocks
           - apple,t8132-pmgr-clocks
           - apple,t8140-pmgr-clocks
@@ -93,6 +94,7 @@ allOf:
                   - enum:
                       - apple,t6000-pmgr-clocks
                       - apple,t6041-pmgr-clocks
+                      - apple,t6050-pmgr-clocks
                       - apple,t8103-pmgr-clocks
                       - apple,t8140-pmgr-clocks
                       - apple,t8142-pmgr-clocks
@@ -137,6 +139,16 @@ allOf:
                     reg:
                       minItems: 63
                       maxItems: 63
+              - if:
+                  properties:
+                    compatible:
+                      contains:
+                        const: apple,t6050-pmgr-clocks
+                then:
+                  properties:
+                    reg:
+                      minItems: 60
+                      maxItems: 60
               - if:
                   properties:
                     compatible:

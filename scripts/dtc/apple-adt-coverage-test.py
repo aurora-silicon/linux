@@ -160,6 +160,19 @@ class CoverageTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("new absent DT path", result.stderr)
 
+    def test_bootstrap_of_a_new_board_needs_no_base_dtb(self):
+        directory = self.root / "baseline"
+        directory.mkdir()
+        absent = self.root / "base-dtbs"
+        absent.mkdir()
+        args = ("--baseline-manifest-dir", str(directory), "--baseline-dtb-dir", str(absent))
+        result = self.run_check("/x - -> MISSING\n/y - -> /soc\n", *args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("new board, no base DTB", result.stdout)
+        result = self.run_check("/x - -> /never-existed\n", *args)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("new absent DT path", result.stderr)
+
     def test_ratchet_validates_baseline_and_options(self):
         args = self.baseline("invalid\n")
         self.assertEqual(self.run_check("/x - -> /soc\n", *args).returncode, 1)

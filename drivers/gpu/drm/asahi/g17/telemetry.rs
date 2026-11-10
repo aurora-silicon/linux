@@ -45,6 +45,10 @@ pub(super) struct Telemetry {
     delivery_ns: Option<u64>,
     /// The last two intervals between utilisation deliveries in this epoch.
     pub(super) delivery_intervals: [Option<u64>; 2],
+    /// The GPU cores were power-gated at the last observation. The firmware
+    /// gates them a few milliseconds after the last work completes and emits no
+    /// utilisation record while gated, so a gated GPU is idle, not unknown.
+    gated: bool,
 }
 
 impl Telemetry {
@@ -62,6 +66,18 @@ impl Telemetry {
         self.delta_ticks = None;
         self.delivery_ns = None;
         self.delivery_intervals = [None; 2];
+        self.gated = false;
+    }
+
+    /// The cores were observed power-gated. End the averaging epoch exactly as
+    /// any other boundary does, but keep the last published utilisation until
+    /// it ages out: it describes the work that ran just before the gate. After
+    /// that the GPU reads as idle (0%) for as long as it stays gated.
+    pub(super) fn gate(&mut self) {
+        let view = self.view;
+        self.invalidate();
+        self.view.util_status = view.util_status;
+        self.gated = true;
     }
 
     /// The firmware may publish several records per producer update: V25G83
@@ -144,7 +160,14 @@ impl Telemetry {
         let expired = |received| now_ns < received || now_ns - received >= limit;
         // The oldest contributing sample bounds the whole averaging window,
         // measured against the next expected delivery plus the host policy.
-        if view.util_status == VALID && expired(self.window_ns) {
+        if self.gated && (view.util_status != VALID || expired(self.window_ns)) {
+            // No work can run on gated cores: idle is a measurement here.
+            view.util_status = VALID;
+            view.tiler = 0;
+            view.renderer = 0;
+            view.device = 0;
+            view.util_samples = 0;
+        } else if view.util_status == VALID && expired(self.window_ns) {
             view.util_status = STALE;
         }
         // A pstate report describes a state transition, with no qualified
@@ -253,6 +276,32 @@ mod tests {
         stats.record(&zero, 102 + AGE, AGE);
         assert_eq!(stats.read(102 + AGE, AGE).pstate, 0);
         assert_eq!(stats.read(102 + AGE, AGE).pstate_status, VALID);
+    }
+
+    #[test]
+    fn a_gated_gpu_reads_idle_after_its_last_sample_ages_out() {
+        let mut stats = Telemetry::default();
+        // Gated before any record (idle since boot): idle, not unknown.
+        stats.gate();
+        let view = stats.read(0, AGE);
+        assert_eq!(view.util_status, VALID);
+        assert_eq!((view.tiler, view.renderer, view.device), (0, 0, 0));
+        // Busy, then gated: the last sample stays until it ages out.
+        stats.invalidate();
+        stats.record(&U1, 100, AGE);
+        stats.gate();
+        let view = stats.read(100 + AGE - 1, AGE);
+        assert_eq!((view.util_status, view.device), (VALID, 50));
+        let view = stats.read(100 + AGE, AGE);
+        assert_eq!((view.util_status, view.tiler, view.renderer, view.device), (VALID, 0, 0, 0));
+        // The gate ends the averaging epoch: the next record starts a new window.
+        stats.record(&U2, 200 + AGE, AGE);
+        let view = stats.read(200 + AGE, AGE);
+        assert_eq!((view.device, view.util_samples), (65, 1));
+        // A non-power boundary (suspend, crash, quarantine) is stale, never idle.
+        stats.gate();
+        stats.invalidate();
+        assert_eq!(stats.read(u64::MAX, AGE).util_status, STALE);
     }
 
     #[test]

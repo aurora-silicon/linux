@@ -162,9 +162,9 @@ struct ane_h16_session_ops {
 	 */
 	void (*sync)(void *ctx, const struct ane_fw_surface *surface, bool for_device);
 	/*
-	 * Optional. Called with true before an EXECUTE touches the firmware
-	 * and with false after it ended, successful or not, so a backend can
-	 * hold a performance vote only while work is in flight.
+	 * Optional. Called with true before the first EXECUTE touches firmware
+	 * and false after the last one ends, successful or not. A backend can
+	 * hold a performance vote while any request is in flight.
 	 */
 	void (*busy)(void *ctx, bool busy);
 };
@@ -194,6 +194,8 @@ struct ane_h16_program {
 	/* Session-local identity; firmware program IDs are reused after UNLOAD. */
 	u64 generation;
 	struct ane_h16_request_key key;
+	/* Owns the shared surfaces from copy-in through copy-out. */
+	bool executing;
 	bool created;
 	bool closed;
 	/* Torn down cleanly: its memory went back to the session's spares. */
@@ -248,8 +250,7 @@ void ane_h16_exec_stats_add(struct ane_h16_exec_stats *st,
 			    const struct ane_h16_exec_sample *x);
 
 /*
- * Programs of one firmware session: one loaded at a time, any number per
- * boot; a switch-safe transport may hold several. See ane_h16_session_load().
+ * Programs of one firmware session, with private surfaces for each program.
  */
 /*
  * Program memory given back by a program that the firmware unloaded. It
@@ -298,13 +299,21 @@ struct ane_h16_session {
 	u64 executed;
 	u32 dsid;
 	int error;
+	/* All admission, transport and completion state is under lock. */
+	unsigned int depth;
+	unsigned int active;
+	unsigned int running;
+	unsigned int draining;
+	bool pipelined;
+	/* Reclaim a batch of command buffers only after its last caller ends. */
+	size_t execute_mark;
 	/* Firmware log lines printed after the last failed EXECUTE. */
 	unsigned int fwlog_lines;
 	bool quarantined;
 	/*
 	 * Dynamic power gating (0x002d) held off across back-to-back requests.
-	 * With gate_hold_ns zero every EXECUTE opens and closes the gate itself.
-	 * Otherwise the first EXECUTE opens it, later ones find it open, and it
+	 * The first EXECUTE opens it and the last one closes it. With a nonzero
+	 * gate_hold_ns, back-to-back requests find it open instead, and it
 	 * closes gate_hold_ns after the last one ended (gate_work, serialized on
 	 * lock), before TERMINATE, and before system sleep.
 	 */
@@ -327,6 +336,10 @@ int ane_h16_session_load(struct ane_h16_session *s,
 			 const void *const aux[ANE_H16_AUX_COUNT],
 			 const size_t aux_size[ANE_H16_AUX_COUNT],
 			 struct ane_h16_program **program);
+/* Caller holds s->lock; acquire may drop it while waiting. */
+int ane_h16_session_acquire(struct ane_h16_session *s, struct ane_h16_program *p);
+void ane_h16_session_release(struct ane_h16_session *s, struct ane_h16_program *p);
+int ane_h16_session_run(struct ane_h16_session *s, struct ane_h16_program *p);
 int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p);
 int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p);
 void ane_h16_session_put(struct ane_h16_session *s, struct ane_h16_program *p);

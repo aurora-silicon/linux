@@ -355,6 +355,64 @@ static void apple_pmc_test_interface_stuck(struct kunit *test)
 	test->priv = NULL;
 }
 
+/*
+ * The internal display's consumer-switched interface (BWR and boost bit 0):
+ * off clears its bits only, on gives back the values they had, whether the
+ * boot loader left both set or only the boost enable.
+ */
+static void apple_pmc_test_interface_consumer(struct kunit *test)
+{
+	struct apple_pmc *pmc = apple_pmc_test_alloc(test);
+	struct apple_pmc_domain dom = {
+		.pmc = pmc, .interface = true, .bwr_bit = 0, .boost_bit = 0,
+		.consumer_switched = true,
+	};
+	const struct apple_pmc_hw *hw = &apple_pmc_hw_t8132;
+
+	pmc->hw = hw;
+	/* As Linux finds them: the boost enable only, next to dispext0's. */
+	writel(BIT(0) | BIT(1), pmc->rails + hw->boost_enable);
+	KUNIT_EXPECT_EQ(test, apple_pmc_interface_consumer_set(&dom, true), -EALREADY);
+	KUNIT_ASSERT_EQ(test, apple_pmc_interface_consumer_set(&dom, false), 0);
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->bwr_enable), 0U);
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->boost_enable), BIT(1));
+	KUNIT_EXPECT_EQ(test, apple_pmc_interface_consumer_set(&dom, false), -EALREADY);
+	KUNIT_ASSERT_EQ(test, apple_pmc_interface_consumer_set(&dom, true), 0);
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->bwr_enable), 0U);
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->boost_enable), BIT(0) | BIT(1));
+
+	/* As macOS keeps them while the display is on: both set. */
+	writel(BIT(0), pmc->rails + hw->bwr_enable);
+	KUNIT_ASSERT_EQ(test, apple_pmc_interface_consumer_set(&dom, false), 0);
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->bwr_enable), 0U);
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->boost_enable), BIT(1));
+	KUNIT_ASSERT_EQ(test, apple_pmc_interface_consumer_set(&dom, true), 0);
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->bwr_enable), BIT(0));
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->boost_enable), BIT(0) | BIT(1));
+}
+
+/* A BWR enable that does not clear: the boost enable goes back, still on. */
+static void apple_pmc_test_interface_consumer_stuck(struct kunit *test)
+{
+	struct apple_pmc *pmc = apple_pmc_test_alloc(test);
+	struct apple_pmc_domain dom = {
+		.pmc = pmc, .interface = true, .bwr_bit = 0, .boost_bit = 0,
+		.consumer_switched = true,
+	};
+	const struct apple_pmc_hw *hw = &apple_pmc_hw_t8132;
+	struct apple_pmc_test_stuck stuck = { .offset = hw->bwr_enable, .value = BIT(0) };
+
+	pmc->hw = hw;
+	writel(BIT(0), pmc->rails + hw->boost_enable);
+	test->priv = &stuck;
+	kunit_activate_static_stub(test, apple_pmc_interface_read, apple_pmc_test_stuck_read);
+	KUNIT_EXPECT_EQ(test, apple_pmc_interface_consumer_set(&dom, false), -EIO);
+	KUNIT_EXPECT_FALSE(test, dom.consumer_off);
+	KUNIT_EXPECT_EQ(test, apple_pmc_interface_read(pmc, hw->boost_enable), BIT(0));
+	kunit_deactivate_static_stub(test, apple_pmc_interface_read);
+	test->priv = NULL;
+}
+
 static void apple_pmc_test_genpd_remove(void *genpd)
 {
 	pm_genpd_remove(genpd);
@@ -497,6 +555,8 @@ static struct kunit_case apple_pmc_test_cases[] = {
 	KUNIT_CASE(apple_pmc_test_floor_pending_timeout),
 	KUNIT_CASE(apple_pmc_test_interface),
 	KUNIT_CASE(apple_pmc_test_interface_stuck),
+	KUNIT_CASE(apple_pmc_test_interface_consumer),
+	KUNIT_CASE(apple_pmc_test_interface_consumer_stuck),
 	KUNIT_CASE(apple_pmc_test_interface_genpd),
 	KUNIT_CASE(apple_pmc_test_interface_boot_state),
 	{}

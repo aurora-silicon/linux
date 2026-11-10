@@ -17,7 +17,9 @@ properties:
   compatible:
     oneOf:
       - items:
-          - const: apple,t8140-aop2
+          - enum:
+              - apple,t6050-aop2
+              - apple,t8140-aop2
           - const: apple,aop2
 
   reg:
@@ -39,7 +41,16 @@ required:
   - compatible
   - reg
   - interrupts
-  - power-domains
   - iommus
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8140-aop2
+    then:
+      required:
+        - power-domains
 
 additionalProperties: false

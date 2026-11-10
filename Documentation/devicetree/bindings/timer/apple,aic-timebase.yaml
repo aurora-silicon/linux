@@ -21,6 +21,7 @@ properties:
           - apple,t6021-aic-timebase
           - apple,t6022-aic-timebase
           - apple,t6041-aic-timebase
+          - apple,t6050-aic-timebase
           - apple,t8103-aic-timebase
           - apple,t8112-aic-timebase
           - apple,t8142-aic-timebase

@@ -57,7 +57,7 @@ properties:
 
   power-domains:
     minItems: 7
-    maxItems: 16
+    maxItems: 18
     description: Register-backed power domains required by the ISP.
 
   memory-region:

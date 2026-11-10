@@ -8,6 +8,7 @@ use kernel::prelude::*;
 const TAG_SET: u8 = 0x31;
 const TAG_SEQUENCE: u8 = 0x30;
 const TAG_UTF8: u8 = 0x0c;
+const TAG_BOOLEAN: u8 = 0x01;
 pub(crate) const TAG_INTEGER: u8 = 0x02;
 pub(crate) const TAG_OCTET_STRING: u8 = 0x04;
 
@@ -51,6 +52,8 @@ pub(crate) enum RefKeyValue<'a> {
     Integer(u32),
     Octets(&'a [u8]),
     Der(&'a [u8]),
+    /// BOOLEAN, encoded as the key store writes it (true = 0x01).
+    Bool(bool),
 }
 
 /// Canonical DER `SET OF SEQUENCE`, members sorted by key — the shape the
@@ -85,6 +88,10 @@ pub(crate) fn encode_refkey_set(items: &[(&[u8], RefKeyValue<'_>)]) -> Result<KV
                 inner.extend_from_slice(b, GFP_KERNEL)?;
             }
             RefKeyValue::Der(d) => inner.extend_from_slice(d, GFP_KERNEL)?,
+            RefKeyValue::Bool(b) => {
+                put_header(&mut inner, TAG_BOOLEAN, 1)?;
+                inner.push(u8::from(*b), GFP_KERNEL)?;
+            }
         }
         let mut seq = KVec::new();
         put_header(&mut seq, TAG_SEQUENCE, inner.len())?;

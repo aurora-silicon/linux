@@ -76,7 +76,7 @@ jobs:
         run: |
           set -o pipefail
           python3 scripts/dtc/apple-adt-coverage-test.py
-          for board in t6040-j616s t8140-j700 t6000-j316s t8112-j413; do
+          for board in t6040-j616s t8140-j700 t6000-j316s t8112-j413 t6050-j716s t6050-j873s; do
             test -s "arch/arm64/boot/dts/apple/adt-coverage/$board.txt"
           done
           manifests=arch/arm64/boot/dts/apple/adt-coverage

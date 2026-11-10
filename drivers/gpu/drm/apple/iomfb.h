@@ -4,6 +4,8 @@
 #ifndef __APPLE_DCPEP_H__
 #define __APPLE_DCPEP_H__
 
+#include <linux/build_bug.h>
+#include <linux/string.h>
 #include <linux/types.h>
 
 #include "version_utils.h"
@@ -15,6 +17,7 @@
 enum dcp_context_id {
 	/* Callback */
 	DCP_CONTEXT_CB = 0,
+	DCP_CONTEXT_ASYNC_CB = 1,
 
 	/* Command */
 	DCP_CONTEXT_CMD = 2,
@@ -24,6 +27,7 @@ enum dcp_context_id {
 
 	/* Out-of-band callback */
 	DCP_CONTEXT_OOBCB = 4,
+	DCP_CONTEXT_OOBASYNC_CB = 5,
 
 	/* Out-of-band command */
 	DCP_CONTEXT_OOBCMD = 6,
@@ -184,6 +188,8 @@ enum dcpep_method {
 	 * H17P pipe-configuration calls made before the first swap.  Most
 	 * names are unknown; they are identified by method number.
 	 */
+	dcpep_pipe_query_353,
+	dcpep_pipe_set_352,
 	dcpep_pipe_cfg_415,
 	dcpep_pipe_cfg_031,
 	dcpep_pipe_cfg_414,
@@ -396,6 +402,11 @@ struct iomfb_set_matrix_req {
 	u8 padding[3];
 } __packed;
 
+/* "PMUS"/"Temperature" reply in 0.1 K: the battery temperature, as macOS. */
+#define DCP_PMU_TEMPERATURE_FALLBACK 3029
+struct device;
+u64 dcp_pmu_temperature(struct device *dev);
+
 struct drm_color_ctm;
 void dcp_ctm_to_fw(u64 fw[9], const struct drm_color_ctm *ctm);
 
@@ -475,6 +486,44 @@ struct dcp_hotplug_req_v26_6 {
 struct dcp_hotplug_resp_v26_6 {
 	u8 opaque[0x4c];
 } __packed;
+
+/*
+ * A name and a serialized dictionary: the firmware's analytics event
+ * (D113 on 27.x, D114 on desktop 26.6).
+ */
+struct dcp_dict_passthrough_req {
+	u8 key[0x40];
+	u8 value[0x1000];
+	u8 value_null;
+	u8 padding[3];
+} __packed;
+
+struct dcp_dict_passthrough_resp {
+	u8 value[0x1000];
+	u8 ret;
+	u8 padding[3];
+} __packed;
+
+static_assert(sizeof(struct dcp_dict_passthrough_req) == 0x1044);
+static_assert(sizeof(struct dcp_dict_passthrough_resp) == 0x1004);
+
+/*
+ * The analytics event passes its dictionary by pointer, so the firmware
+ * deserializes the reply's copy when the call returns, and stops if that
+ * fails. Return the dictionary as it came, and report the event not sent.
+ * A zeroed reply is not a dictionary.
+ */
+static inline void
+dcp_dict_passthrough_reply(const struct dcp_dict_passthrough_req *req,
+			   struct dcp_dict_passthrough_resp *resp)
+{
+	if (req->value_null)
+		memset(resp->value, 0, sizeof(resp->value));
+	else
+		memcpy(resp->value, req->value, sizeof(resp->value));
+	resp->ret = false;
+	memset(resp->padding, 0, sizeof(resp->padding));
+}
 
 /* A boolean argument, padded to four bytes. */
 struct dcp_bool_arg {

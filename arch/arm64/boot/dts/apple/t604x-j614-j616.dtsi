@@ -176,6 +176,16 @@
 
 / {
 	/*
+	 * The boot NOR runs from a PMU rail that is on whenever the SoC is
+	 * and that no OS switches. The ADT gives the flash no supply.
+	 */
+	nor_flash_vcc: regulator-nor-flash-vcc {
+		compatible = "regulator-fixed";
+		regulator-name = "nor-flash-vcc";
+		regulator-always-on;
+	};
+
+	/*
 	 * The speaker amps' shared shutdown line (SDZ, AP pin 54, low =
 	 * shutdown). One fixed regulator, the SDZ supply of all six, not
 	 * per-amp shutdown-gpios: with GPIO_SHARED six references become a
@@ -306,6 +316,7 @@
 		spi-max-frequency = <10000000>;
 		spi-rx-bus-width = <1>;
 		spi-tx-bus-width = <1>;
+		vcc-supply = <&nor_flash_vcc>;
 
 		partitions {
 			compatible = "fixed-partitions";
@@ -1011,76 +1022,91 @@
 	temperature-Tg04 {
 		apple,key-id = "Tg04";
 		label = "GPU Tg04";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg0K {
 		apple,key-id = "Tg0K";
 		label = "GPU Tg0K";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg0L {
 		apple,key-id = "Tg0L";
 		label = "GPU Tg0L";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg0R {
 		apple,key-id = "Tg0R";
 		label = "GPU Tg0R";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg0X {
 		apple,key-id = "Tg0X";
 		label = "GPU Tg0X";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg0d {
 		apple,key-id = "Tg0d";
 		label = "GPU Tg0d";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg0e {
 		apple,key-id = "Tg0e";
 		label = "GPU Tg0e";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg0j {
 		apple,key-id = "Tg0j";
 		label = "GPU Tg0j";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg0y {
 		apple,key-id = "Tg0y";
 		label = "GPU Tg0y";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg1E {
 		apple,key-id = "Tg1E";
 		label = "GPU Tg1E";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg1F {
 		apple,key-id = "Tg1F";
 		label = "GPU Tg1F";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg1U {
 		apple,key-id = "Tg1U";
 		label = "GPU Tg1U";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg1c {
 		apple,key-id = "Tg1c";
 		label = "GPU Tg1c";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg1d {
 		apple,key-id = "Tg1d";
 		label = "GPU Tg1d";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg1k {
 		apple,key-id = "Tg1k";
 		label = "GPU Tg1k";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tp00 {
@@ -3444,3 +3470,5 @@
 	power-domain-names = "sys", "cpu", "mpm", "td", "base", "perf";
 	status = "okay";
 };
+
+#include "t604x-j614-j616-usb4.dtsi"

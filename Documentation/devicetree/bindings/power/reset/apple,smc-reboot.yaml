@@ -23,18 +23,22 @@ properties:
           - const: apple,smc-reboot
 
   nvmem-cells:
+    minItems: 4
     items:
       - description: Flag indicating shutdown (as opposed to reboot)
       - description: Stage at which the boot process stopped (0x30 for normal boot)
       - description: Counter for boot errors
       - description: Counter for system panics
+      - description: The PMU's power-on policy (after a power loss, at power connect)
 
   nvmem-cell-names:
+    minItems: 4
     items:
       - const: shutdown_flag
       - const: boot_stage
       - const: boot_error_count
       - const: panic_count
+      - const: pm_setting
 
 required:
   - compatible

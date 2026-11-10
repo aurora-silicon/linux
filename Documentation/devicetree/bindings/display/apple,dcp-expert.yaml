@@ -20,6 +20,7 @@ select:
       contains:
         enum:
           - apple,t6041-dcp-expert
+          - apple,t6050-dcp-expert
           - apple,t8132-dcp-expert
           - apple,t8140-dcp-expert
   required:
@@ -58,7 +59,9 @@ allOf:
         compatible:
           oneOf:
             - items:
-                - const: apple,t6041-dcp-expert
+                - enum:
+                    - apple,t6041-dcp-expert
+                    - apple,t6050-dcp-expert
                 - const: apple,dcp-expert
             - items:
                 - const: apple,t8140-dcp-expert

@@ -87,7 +87,8 @@ static struct hwx_fixture *fixture_create(struct kunit *test, bool mixed, bool k
 	f->text_command = f->cursor;
 	text_section = fixture_segment(f, "__TEXT", text, SZ_32K, SZ_16K, 5,
 				       mixed ? 4 : 0, 2);
-	fixture_section(text_section, "__TEXT", "__text", text, 64, SZ_16K,
+	/* The one task ends the section: H16 refuses bytes after the last task. */
+	fixture_section(text_section, "__TEXT", "__text", text, 60, SZ_16K,
 			14, kernel ? 0x128 : 0x28);
 	fixture_section(text_section + 80, "__TEXT", "__const", text + 64,
 			SZ_16K, SZ_16K + 64, 6, 0x26);
@@ -116,13 +117,13 @@ static struct hwx_fixture *fixture_create(struct kunit *test, bool mixed, bool k
 		put_unaligned_le64(kern, c + 0x90);
 	put_unaligned_le64(text, c + 0x810);
 	put_unaligned_le32(4, c + 0x820);
-	put_unaligned_le32(16, c + 0x824);
+	put_unaligned_le32(15, c + 0x824);
 	put_unaligned_le32(1, c + 0x830);
 	put_unaligned_le32(U32_MAX, c + 0x838);
 	put_unaligned_le32(U32_MAX, c + 0x83c);
 	put_unaligned_le32(0xffff, c + 0x844);
 	put_unaligned_le32(mixed ? 0x8b8 : 0x898, c + 0x848);
-	put_unaligned_le32(0x10, c + 0x860);
+	put_unaligned_le32(1, c + 0x860);
 	put_unaligned_le32(4, c + 0x868);
 	put_unaligned_le32(mixed ? 4 : 2, c + 0x870);
 	put_unaligned_le32(mixed ? 2 : 7, c + 0x878);

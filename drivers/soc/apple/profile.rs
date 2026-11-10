@@ -26,6 +26,8 @@
 //!   the T8140 SEP DART aperture above 4 GiB.
 //! * `T6040` / J616s (MacBook Pro 16", M4 Pro): iBoot boots sepOS, so the
 //!   driver uses the warm registration path; the sensor is the J700 part.
+//! * `T6050` / J714s (MacBook Pro 14", M5 Pro): T6040's SEP and sensor, with
+//!   the sensor's bus at its own address.
 
 // The boot handshake, identity source, sensor and DART fields are consumed by
 // the boot-endpoint, identity and sensor-transport paths.
@@ -450,10 +452,27 @@ pub(crate) const T6040: PlatformProfile = PlatformProfile {
     ..T8140
 };
 
-/// MacBook Pro 16" M4 Max (J616c). Its ADT describes the SEP and the sensor as
-/// J616s's does.
+/// MacBook Pro 14" and 16" M4 Max (J614c, J616c). Their ADTs describe the SEP
+/// and the sensor as J616s's does: on the J614c (26.6.2) an `iop-sep,ascwrap-v6`
+/// SEP with `sepfw-booted`, and the Mesa sensor (`sensor-id` 0x3356) on spi2 at
+/// `0x429108000`, 8 MHz, powered by NUB GPIO 53 with data-ready on AP GPIO 116.
 pub(crate) const T6041: PlatformProfile = PlatformProfile {
-    name: "T6041/J616c",
+    name: "T6041/J614c, J616c",
+    ..T6040
+};
+
+/// MacBook Pro 14" M5 Pro (J714s). The J714sAP ADT (26A428) records a
+/// pre-booted SEP (`sepfw-booted`), an `iop-sep,ascwrap-v6` SEP whose DART
+/// aperture starts at the BIT(40) alias (`vm-base-0` 0x10000004000,
+/// `vm-size-0` 0xffff0000), and the Mesa sensor J700 carries (`sensor-id`
+/// 0x3356) on spi2 at `0x505108000`, 8 MHz, chip select 0. That is J616s's
+/// SEP, so T6040's profile with this sensor bus.
+pub(crate) const T6050: PlatformProfile = PlatformProfile {
+    name: "T6050/J714s",
+    sensor: SensorProfile {
+        controller_base: 0x5_0510_8000,
+        ..T6040.sensor
+    },
     ..T6040
 };
 
@@ -660,8 +679,11 @@ fn select(
     if has(b"apple,t6040") && (has(b"apple,j616s") || has(b"apple,j614s")) {
         return Ok(&T6040);
     }
-    if has(b"apple,t6041") && has(b"apple,j616c") {
+    if has(b"apple,t6041") && (has(b"apple,j616c") || has(b"apple,j614c")) {
         return Ok(&T6041);
+    }
+    if has(b"apple,t6050") && has(b"apple,j714s") {
+        return Ok(&T6050);
     }
     // Only the M4 MacBook Airs: the other T8132 Macs are unread.
     if has(b"apple,t8132") && (has(b"apple,j713") || has(b"apple,j715")) {
@@ -744,7 +766,47 @@ mod tests {
         assert_eq!(picked(&[b"apple,t6040"]), None);
         assert_eq!(picked(&[b"apple,j614s", b"apple,t6040"]), Some(T6040.name));
         assert_eq!(picked(&[b"apple,j616c", b"apple,t6041"]), Some(T6041.name));
+        assert_eq!(picked(&[b"apple,j614c", b"apple,t6041"]), Some(T6041.name));
+        assert_eq!(picked(&[b"apple,t6041"]), None);
         assert_eq!(picked(&[b"apple,j713", b"apple,t6041"]), None);
+        assert_eq!(picked(&[b"apple,j714s", b"apple,t6050"]), Some(T6050.name));
+        assert_eq!(picked(&[b"apple,t6050"]), None);
+    }
+
+    /// Touch ID has one path for every Mac. The retry limits, the lock
+    /// states, the password re-arm and the lift-gated capture read nothing
+    /// from the profile; only the transport underneath (bus, nonce session,
+    /// key-store dialect) does. What the shared path needs is a sensor whose
+    /// status it decodes, so every Mac with a built-in sensor must select a
+    /// profile naming one of the known Mesa revisions.
+    #[test]
+    fn every_touch_id_mac_gets_a_sensor_the_shared_path_decodes() {
+        let macs: [&[&[u8]]; 15] = [
+            &[b"apple,j313", b"apple,t8103"],
+            &[b"apple,j316s", b"apple,t6000"],
+            &[b"apple,j316c", b"apple,t6001"],
+            &[b"apple,j414s", b"apple,t6020"],
+            &[b"apple,j414c", b"apple,t6021"],
+            &[b"apple,j413", b"apple,t8112"],
+            &[b"apple,j415", b"apple,t8112"],
+            &[b"apple,j613", b"apple,t8122"],
+            &[b"apple,j615", b"apple,t8122"],
+            &[b"apple,j614s", b"apple,t6040"],
+            &[b"apple,j616s", b"apple,t6040"],
+            &[b"apple,j616c", b"apple,t6041"],
+            &[b"apple,j713", b"apple,t8132"],
+            &[b"apple,j700", b"apple,t8140"],
+            &[b"apple,j714s", b"apple,t6050"],
+        ];
+        for compatibles in macs {
+            let has = |c: &[u8]| compatibles.iter().any(|x| *x == c);
+            let selected = select(&has, &|| &T6020);
+            assert!(selected.is_ok());
+            if let Ok(profile) = selected {
+                assert!(crate::sensor::KNOWN_IDENTIFIERS.contains(&profile.sensor.expected_id));
+            }
+        }
+        assert!(crate::sensor::KNOWN_IDENTIFIERS.contains(&T6020_SEPOS13.sensor.expected_id));
     }
 
     #[test]
@@ -794,10 +856,38 @@ mod dart_window_tests {
             &T8122,
             &T6040,
             &T6041,
+            &T6050,
             &T8132,
         ] {
             assert_eq!(offset(profile.dart_window), 1 << 40);
             assert_eq!(range(profile.dart_window), (0, 1 << 32));
+        }
+    }
+}
+
+/// The owner-qualified J613 OS-firmware lane; system firmware may differ.
+pub(crate) fn j613_26_6_2() -> bool {
+    machine_has(b"apple,j613")
+        && chosen_string(c"asahi,os-fw-version")
+            .as_deref()
+            .is_some_and(os_firmware_26_6_2)
+}
+
+fn os_firmware_26_6_2(raw: &[u8]) -> bool {
+    raw == b"26.6.2" || raw == b"26.6.2\0"
+}
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[kernel::macros::kunit_tests(apple_sep_j613_firmware)]
+mod j613_firmware_tests {
+    use super::*;
+
+    #[test]
+    fn exact_os_firmware_only() {
+        assert!(os_firmware_26_6_2(b"26.6.2"));
+        assert!(os_firmware_26_6_2(b"26.6.2\0"));
+        for raw in [&b"14.8.3"[..], &b"26.6.20"[..], &b"27.0"[..], &b""[..]] {
+            assert!(!os_firmware_26_6_2(raw));
         }
     }
 }

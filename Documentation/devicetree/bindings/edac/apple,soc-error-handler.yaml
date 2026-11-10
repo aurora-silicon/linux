@@ -37,6 +37,8 @@ select:
           - apple,t6031-event-log
           - apple,t6041-error-handler
           - apple,t6041-event-log
+          - apple,t6050-error-handler
+          - apple,t6050-event-log
           - apple,t8103-error-handler
           - apple,t8103-event-log
           - apple,t8112-error-handler
@@ -129,6 +131,7 @@ allOf:
                     - apple,t6030-error-handler
                     - apple,t6031-error-handler
                     - apple,t6041-error-handler
+                    - apple,t6050-error-handler
                     - apple,t8103-error-handler
                     - apple,t8112-error-handler
                     - apple,t8122-error-handler
@@ -147,6 +150,7 @@ allOf:
                     - apple,t6030-event-log
                     - apple,t6031-event-log
                     - apple,t6041-event-log
+                    - apple,t6050-event-log
                     - apple,t8103-event-log
                     - apple,t8112-event-log
                     - apple,t8122-event-log
@@ -249,6 +253,36 @@ allOf:
               reg:
                 minItems: 25
                 maxItems: 25
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6050-error-handler
+          then:
+            properties:
+              interrupts:
+                minItems: 105
+                maxItems: 105
+              reg:
+                minItems: 214
+                maxItems: 214
+            required:
+              - reg
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6050-event-log
+          then:
+            properties:
+              interrupts:
+                minItems: 23
+                maxItems: 23
+              reg:
+                minItems: 141
+                maxItems: 141
             required:
               - reg
         - if:

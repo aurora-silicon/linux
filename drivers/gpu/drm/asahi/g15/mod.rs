@@ -45,7 +45,6 @@
 mod adt;
 mod board;
 mod boot;
-mod retain;
 
 // One admission rule for the generation mappings and shared adopted UAT.
 pub(crate) use boot::glue::memory_mode;

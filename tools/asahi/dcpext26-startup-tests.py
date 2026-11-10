@@ -76,8 +76,11 @@ parser=(A/'parser.c').read_text();afk=(A/'afk.c').read_text();dptx=(A/'dptxep.c'
 codec=re.sub(r'^#include[^\n]*\n','',(A/'afkv2-codec.h').read_text(),flags=re.M)
 identity=pre+codec+r'''
 #define DCP_FIRMWARE_H17P 1
+#define DCP_FIRMWARE_V_27_0 27
 #define DCP_IOMFB_METHODS_H17G 2
+#define DCP_IOMFB_METHODS_H17P_EXTERNAL 3
 #define DCP_FIRMWARE_V_14_7 2
+#define DCP_FIRMWARE_V_27_0 27
 #define AFK_MAX_CHANNEL 16
 #define SYSTEM_ENDPOINT 0x20
 #define DISP0_ENDPOINT 0x23
@@ -87,7 +90,7 @@ identity=pre+codec+r'''
 #define MAX_PENDING_CMDS 16
 struct dcp_parse_ctx {void *dcp;const void *blob;u32 pos,len;};
 struct apple_epic_service;struct apple_dcp_afkep;
-struct apple_epic_service_ops {const char *name;bool reusable,optional;int (*prepare)(struct apple_epic_service *,const char *,const char *,s64);int (*revalidate)(struct apple_epic_service *,const char *,const char *,s64);void (*init)(struct apple_epic_service *,const char *,const char *,s64);void (*teardown)(struct apple_epic_service *);};
+struct apple_epic_service_ops {const char *name;bool reusable,optional;int (*prepare)(struct apple_epic_service *,const char *,const char *,s64);int (*revalidate)(struct apple_epic_service *,const char *,const char *,s64);void (*init)(struct apple_epic_service *,const char *,const char *,s64);void (*teardown)(struct apple_epic_service *);void (*init_props)(struct apple_epic_service *,s64,const void *,size_t);};
 struct apple_epic_service {struct apple_dcp_afkep *ep;const struct apple_epic_service_ops *ops;bool enabled,torndown,pending_open,defer_start;unsigned users;int lock;u32 channel;void *cookie;const char *pending_name,*pending_class;s64 pending_unit;int cmd_map[1];};
 struct dptx_port {struct apple_epic_service *service;s64 unit;bool enabled,connected;int enable_completion;};
 struct apple_dcp {bool native,ext26_services_open;int fw_compat,index,dptx_controller_ready;struct {unsigned num_dptx_ports;int iomfb_method_profile;} hw;struct dptx_port dptxport[2];void *dev;struct apple_dcp_afkep *systemep,*ibootep,*dptx_controller_ep,*dcpavservep,*dptxep,*ext26_aux[3];};
@@ -122,6 +125,7 @@ for name in ['afk_match_service','afk_epic_find_service','afk_discard_pending_op
 service=(A/'dptx-service.h').read_text()
 for name in ['dptx_service_port','dptx_service_bind','dptx_service_publish']:
     identity+=fn(service,name)+'\n'
+identity+=fn(dcp,'dcp_is_external_h17p')+'\n'
 identity+=fn(dptx,'dptxport_prepare')+'\n'+fn(dcp,'dcp_ext26_open_services')+'\n'+fn(afk,'afk_recv_handle_init')+r'''
 static void port_init(struct apple_epic_service *s,const char *n,const char *c,s64 u){dptx_service_publish(s);published++;}
 static const struct apple_epic_service_ops port_ops[]={{.name="AppleDCPDPTXRemotePort",.prepare=dptxport_prepare,.init=port_init},{0}};
@@ -174,13 +178,13 @@ int main(void){
  struct blob short_b={0};short_b.n=1;announce(d.dptxep,7,short_b);assert(!opened[0x2a][7]);
  // Panel aliases retain their existing meaning; native explicit EPIC keys do not consume interface-id.
  struct blob b=description("dcpdptx-port-epic","AppleDCPDPTXRemotePort",0,3,false);struct dcp_parse_ctx ctx;const char *n,*c;s64 u=-1;
- assert(!parse(b.p+32,b.n-32,&ctx));assert(!parse_epic_service_init(&ctx,&n,&c,&u,false)&&u==0);free((void *)n);free((void *)c);
- assert(!parse(b.p+32,b.n-32,&ctx));assert(!parse_epic_service_init(&ctx,&n,&c,&u,true)&&u==3);free((void *)n);free((void *)c);
+ assert(!parse(b.p+32,b.n-32,&ctx));assert(!parse_epic_service_init(&ctx,&n,&c,&u,false,false)&&u==0);free((void *)n);free((void *)c);
+ assert(!parse(b.p+32,b.n-32,&ctx));assert(!parse_epic_service_init(&ctx,&n,&c,&u,true,false)&&u==3);free((void *)n);free((void *)c);
  // Preserve panel-only lowercase aliases, which native26 intentionally does not accept.
  struct blob panel={0};put_unaligned_le32(0xd3,panel.p);panel.n=4;tag(&panel,1,3);
  text(&panel,"compartment");text(&panel,"system");text(&panel,"name");text(&panel,"system");text(&panel,"interface-id");number(&panel,1);
- assert(!parse(panel.p,panel.n,&ctx));assert(!parse_epic_service_init(&ctx,&n,&c,&u,true)&&u==1&&!strcmp(n,"system"));free((void *)n);free((void *)c);
- assert(!parse(panel.p,panel.n,&ctx));assert(parse_epic_service_init(&ctx,&n,&c,&u,false)==-ENOENT);
+ assert(!parse(panel.p,panel.n,&ctx));assert(!parse_epic_service_init(&ctx,&n,&c,&u,true,false)&&u==1&&!strcmp(n,"system"));free((void *)n);free((void *)c);
+ assert(!parse(panel.p,panel.n,&ctx));assert(parse_epic_service_init(&ctx,&n,&c,&u,false,false)==-ENOENT);
  // A failed OPEN cannot publish a prepared port; closed workqueues are never retried.
  struct apple_dcp_afkep failed={.dcp=&d,.endpoint=0x2a,.wire_v2=true,.ops=port_ops};failed.wq=&failed;
  d.dptxport[0].service=NULL;d.dptxport[0].enabled=false;open_error=-EIO;announce(&failed,1,description("dcpdptx-port-epic","AppleDCPDPTXRemotePort",0,1,false));assert(!d.dptxport[0].service&&!failed.services[0].enabled);
@@ -196,6 +200,7 @@ run('native AFK announcements through deferred OPEN',identity)
 iom=(A/'iomfb.c').read_text();native=(A/'iomfb_h17p.c').read_text();ih=(A/'iomfb.h').read_text();internal=(A/'dcp-internal.h').read_text()
 transport=pre+r'''
 #define DCP_FIRMWARE_H17P 1
+#define DCP_FIRMWARE_V_27_0 27
 #define DCP_IOMFB_METHODS_H17G 2
 #define DCP_IOMFB_METHODS_H17P_EXTERNAL 3
 #define DCP_MAX_CALL_DEPTH 8
@@ -235,7 +240,7 @@ static void dcp_push(struct apple_dcp *,bool,const struct dcp_method_entry *,u32
 static void boot_done(struct apple_dcp *,void *,void *);
 static unsigned commands,callback_acks;static int bad_status,corrupt;static bool byte_reply;static u8 memory[0x100000];
 '''
-for name in ['dcp_tx_offset','dcp_call_context','dcp_get_channel','dcp_packet_start','dcp_push_depth','dcp_pop_depth','dcpep_msg','dcpep_ack','dcp_push','dcp_ack','dcpep_handle_ack']:
+for name in ['dcp_tx_offset','dcp_call_context','dcp_get_channel','dcp_packet_start','dcp_push_depth','dcp_pop_depth','dcpep_msg','dcpep_ack','dcp_push_context','dcp_push','dcp_ack','dcpep_handle_ack']:
     code=fn(iom,name)
     if name in ['dcp_push','dcp_ack']:code='static '+code
     transport+=code+'\n'

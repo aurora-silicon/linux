@@ -52,6 +52,11 @@ def parser_fixture(root):
     header = header[header.index('struct apple_dcp;'):header.index('int parse(')]
     refresh = (base / 'dcp-refresh.h').read_text().replace('#include <linux/types.h>', '')
     header = refresh + '\n' + header
+    # parse_dptx_caps() fills the firmware-27 DPTX capabilities parser.c
+    # takes from dcp-peer-v27.h.
+    peer_v27 = base / 'dcp-peer-v27.h'
+    if peer_v27.exists():
+        header += block(peer_v27.read_text(), 'struct dcp_dptx_caps {') + ';\n'
     # Header helpers stay header-like: unused here, as in any includer.
     header = header.replace('static inline ', 'static inline __attribute__((unused)) ')
     edid_header = (root / 'include/drm/drm_edid.h').read_text()
@@ -775,6 +780,9 @@ static void afk_service_retire(struct apple_epic_service *s) { assert(!*hpd_lock
 static bool cancel_work_sync(struct work_struct *w) { assert(!w->scheduled); return false; }
 /* Native audio is out of scope: reject entry instead of silently queueing it. */
 static void dcp_external_audio_start(struct apple_dcp *d) { assert(!d->external_native); }
+/* The stubbed read always carries an EDID: nothing asks for a re-probe. */
+static bool dcpavserv_edid_retry(struct apple_dcp *d,u64 e) { (void)d;(void)e;assert(0);return false; }
+static void dcpavserv_edid_retry_reset(struct apple_dcp *d) { assert(d->dcpavserv.lock); }
 static void dpavservep_detach(struct apple_dcp *d);
 static struct apple_dcp *probing;
 static struct drm_edid transport_edid;
@@ -1190,6 +1198,8 @@ u32 lane_count, link_rate;''')
 #define trace_dptxport_call_set_link_rate(...) ((void)0)
 /* Not a T8132 dcpext: its DRM outputs never follow this link. */
 static bool dcp_is_t8132_ext(const struct apple_dcp *d) { (void)d; return false; }
+/* The J700 lane policy keys on the external H17P profile, not the AFK v2 codec. */
+static bool dcp_is_external_h17p(struct apple_dcp *d) { return d->hw.iomfb_method_profile==2; }
 struct device;
 static void t8132_ext_drm_hotplug(struct device *dcpext) { (void)dcpext; assert(!"T8132 dcpext hotplug in an H17P scenario"); }
 static unsigned phy_capacity=2, phy_calls, hardware_rate, hardware_lanes;
@@ -1229,10 +1239,11 @@ static int dcp_tunnel_set_rate(struct apple_dcp *d,void *phy,...) {
     bool external_physically_absent,main_display,typec_crtc_off,external_cable,external_error,external_power_attempted,external_stopped;
     bool external_hotplug_pending,external_hotplug_connected,typec_poweron_hpd;
     u64 external_stop_generation,external_rx_generation,external_crtc_generation;
-    unsigned swap_watchdog_retrains;int typec_iomfb_hpd_ready;''')
+    unsigned swap_watchdog_retrains;int typec_iomfb_hpd_ready,typec_display_ready;''')
     stubs = r'''
 #define DCP_HOTPLUG_NOTIFY 1
-static bool dcp_is_external_h17p(struct apple_dcp *d) { return d->hw.iomfb_method_profile==2; }
+/* Firmware 27's resume readiness; this H17P display never runs it. */
+#define DCP_FIRMWARE_V_27_0 (DCP_FIRMWARE_H17P + 5)
 static bool dcp_is_typec_output(struct apple_dcp *d) { (void)d;return true; }
 static void complete_all(int *p) { (*p)++; }
 #define dcp_mode_invalidate(s) ((s)->valid=false)
@@ -1285,6 +1296,7 @@ static bool dcp_typec_relink(struct apple_dcp *d) { (void)d;return false; }
     connected=0;d.typec_crtc_off=true;dcpep_cb_hotplug(&d,&connected);assert(d.rate_proof.sequence==sequence);
     d.typec_crtc_off=false;d.iomfb.presentation_paused=true;dcpep_cb_hotplug(&d,&connected);
     assert(d.rate_proof.sequence==sequence && !con.edid_invalidation_pending);d.iomfb.lock=false;probe(true);
+    assert(!d.typec_display_ready);
     dcpavserv_teardown(&av_services[0]);cleanup();
     puts("PASS: actual RX HPD loss immediately denies getter/lookup before deferred work; 24 fresh-proof recovery orders need only one rate/lane callback; bootstrap/power/paused suppression preserved");
 }""".replace('MAIN_PREFIX',n['main_prefix'])

@@ -23,6 +23,7 @@ properties:
       - const: apple,dockchannel-uart
       - items:
           - enum:
+              - apple,t6000-dockchannel-uart
               - apple,t8112-dockchannel-uart
               - apple,t6020-dockchannel-uart
               - apple,t6021-dockchannel-uart
@@ -53,6 +54,12 @@ properties:
       Index of this channel within its DockChannel block. Channel n owns
       bits 2n (TX) and 2n + 1 (RX) of the shared interrupt mask and flag
       registers.
+
+  apple,tx-never-wait:
+    type: boolean
+    description:
+      Transmit completes without waiting for a reader to drain the channel,
+      so a console with nobody attached does not stall.
 
   apple,sw-drain:
     type: boolean

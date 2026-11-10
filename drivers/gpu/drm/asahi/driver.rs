@@ -147,6 +147,8 @@ impl drm::driver::Driver for AsahiDrmDriver {
 pub(crate) enum ProbeConfig {
     Legacy(&'static hw::HwConfig),
     G17(&'static g17::Config),
+    /// M5 Pro, Max and Ultra: the ID registers select the configuration.
+    G17M5,
     M3(crate::m3::Chip),
     /// The M5 (T8142) backend, refused unless it is built.
     M5,
@@ -176,6 +178,14 @@ macro_rules! asahi_of_device_table {
                 (
                     of::DeviceId::new(c"apple,agx-t8142"),
                     ProbeConfig::M5
+                ),
+                (
+                    of::DeviceId::new(c"gpu,t6050"),
+                    ProbeConfig::G17M5
+                ),
+                (
+                    of::DeviceId::new(c"apple,agx-g17s"),
+                    ProbeConfig::G17M5
                 ),
                 (
                     of::DeviceId::new(c"apple,agx-t8103"),
@@ -244,6 +254,9 @@ impl platform::Driver for AsahiPlatformDriver {
     type Data<'bound> = AsahiPlatformDriverData<'bound>;
 
     fn unbind<'bound>(_pdev: &'bound platform::Device<Core<'_>>, this: Pin<&Self::Data<'bound>>) {
+        // SAFETY: Takes no arguments, process context. Clears the T6001 AGX request in the PMP report if the pmp_report.agx_vote
+        // parameter set it; a no-op everywhere else.
+        unsafe { bindings::apple_pmp_agx_activity_release() };
         if let Some(gpu) = this.g17.as_ref() {
             // Driver data is dropped after devres, so CPU control must happen in unbind.
             gpu.shutdown();
@@ -263,11 +276,17 @@ impl platform::Driver for AsahiPlatformDriver {
         debug::update_debug_flags();
         crate::memacct::LEDGER.configure();
 
+        // SAFETY: Takes no arguments, process context. Lets the T6001 AGX vote run again after an earlier unbind released it; a no-op everywhere else.
+        unsafe { bindings::apple_pmp_agx_activity_resume() };
+
         dev_info!(pdev.as_ref(), "Probing...\n");
 
         let cfg = match info.ok_or(ENODEV)? {
             ProbeConfig::Legacy(cfg) => *cfg,
-            ProbeConfig::G17(cfg) => return AsahiPlatformDriver::probe_g17(pdev, cfg),
+            ProbeConfig::G17(cfg) => {
+                return AsahiPlatformDriver::probe_g17(pdev, regs::G17Resources::new(pdev)?, cfg)
+            }
+            ProbeConfig::G17M5 => return AsahiPlatformDriver::probe_g17_m5(pdev),
             #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
             ProbeConfig::M3(crate::m3::Chip::T8122) => return AsahiPlatformDriver::probe_t8122(pdev),
             ProbeConfig::M3(chip) => return Err(crate::m3::refuse_probe(pdev, *chip)),
@@ -444,14 +463,28 @@ impl AsahiPlatformDriver {
         })
     }
 
+    fn probe_g17_m5<'bound>(
+        pdev: &'bound platform::Device<Core<'_>>,
+    ) -> Result<AsahiPlatformDriverData<'bound>> {
+        // Every T6050 board binds gpu,t6050. Let the ID registers choose the configuration.
+        let res = regs::G17Resources::new(pdev)?;
+        let id = res.get_g17_id()?;
+        let cfg = hw::t6050::config(&id).ok_or_else(|| {
+            dev_err!(pdev.as_ref(), "No M5 configuration for GPU variant {:#x} with {} dies\n",
+                id.variant, id.num_dies);
+            ENODEV
+        })?;
+        Self::probe_g17(pdev, res, cfg)
+    }
+
     fn probe_g17<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,
+        res: regs::G17Resources,
         cfg: &'static g17::Config,
     ) -> Result<AsahiPlatformDriverData<'bound>> {
         // SAFETY: The GPU performs DMA through a UAT whose output width is part of the SoC config.
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
         let resources = regs::Resources::new(pdev)?;
-        let res = regs::G17Resources::new(pdev)?;
         let drm = drm::UnregisteredDevice::<AsahiDrmDriver>::new(pdev, Ok(()))?;
         // SAFETY: Every adapter calls close_binding in unbind before devres;
         // probe errors drop this local owner while the bound callback is live.

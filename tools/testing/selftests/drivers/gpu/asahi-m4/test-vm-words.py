@@ -81,7 +81,7 @@ lock_source = r'''
 use std::{cell::Cell, rc::Rc, ops::{Range,Deref}};use std::sync::atomic::{AtomicBool,Ordering};
 macro_rules! dev_err { ($($arg:tt)*) => {}; }
 type Result<T=()> = std::result::Result<T,u32>;
-const EOVERFLOW:u32=75;
+const EOVERFLOW:u32=75;const EBUSY:u32=16;
 #[derive(Clone,Copy)]struct Prot;
 struct KernelMappingInner{mapped_size:usize}
 mod mm {
@@ -95,16 +95,18 @@ struct Lease(Rc<Uat>);impl Drop for Lease{fn drop(&mut self){assert!(self.0.held
 impl Uat{
     fn lock_m4_upper(self:&Rc<Self>,upper:bool)->Result<Lease>{assert!(upper);assert!(!self.held.replace(true),"recursive shared-UAT lock");Ok(Lease(self.clone()))}
 }
-struct Table{uat:Rc<Uat>,rolled_back:Cell<bool>}
+struct Table{uat:Rc<Uat>,rolled_back:Cell<bool>,busy:bool}
 impl Table{
     fn prepare_map(&mut self,_r:Range<u64>)->Result{assert!(!self.uat.held.get(),"allocation under PPL");Ok(())}
     fn discard_partial_map(&mut self,_r:Range<u64>)->Result{assert!(self.uat.held.get(),"rollback outside PPL");self.rolled_back.set(true);Ok(())}
+    // Another mapping's live leaves in the range refuse the map before any store.
+    fn ensure_unmapped(&mut self,_r:Range<u64>)->Result{assert!(self.uat.held.get(),"live-leaf check outside PPL");if self.busy{Err(EBUSY)}else{Ok(())}}
 }
-struct Owner{uat_inner:Rc<Uat>,page_table:Table,is_kernel:bool,fail:bool,invalidations:Cell<u32>}
+struct Owner{uat_inner:Rc<Uat>,page_table:Table,is_kernel:bool,fail:bool,invalidations:Cell<u32>,stores:Cell<u32>}
 impl Owner{
     fn mapping_mutation(&mut self){}
     fn map_node_prepared(&mut self,_n:&mm::Node<(),KernelMappingInner>,_p:Prot)->Result{
-        assert!(self.uat_inner.held.get(),"live leaf stores outside PPL");if self.fail{Err(5)}else{Ok(())}
+        assert!(self.uat_inner.held.get(),"live leaf stores outside PPL");self.stores.set(self.stores.get()+1);if self.fail{Err(5)}else{Ok(())}
     }
     fn tlbi_contexts_naming_root(&self,_va:u64,_size:usize){assert!(!self.uat_inner.held.get(),"naming-root lookup recursively locks UatShared");self.invalidations.set(self.invalidations.get()+1);}
     fn finish_failed_map(&self,va:u64,size:usize){self.tlbi_contexts_naming_root(va,size);}
@@ -113,11 +115,19 @@ impl Owner{
 #[test]fn success_and_rollback_release_ppl_before_root_lookup(){
     for fail in [false,true]{
         let uat=Rc::new(Uat{held:Cell::new(false),m4_adopted:true,failed:AtomicBool::new(false)});
-        let mut owner=Owner{uat_inner:uat.clone(),page_table:Table{uat:uat.clone(),rolled_back:Cell::new(false)},is_kernel:true,fail,invalidations:Cell::new(0)};
+        let mut owner=Owner{uat_inner:uat.clone(),page_table:Table{uat:uat.clone(),rolled_back:Cell::new(false),busy:false},is_kernel:true,fail,invalidations:Cell::new(0),stores:Cell::new(0)};
         let node=mm::Node{start:0xfffffc2000000000,inner:KernelMappingInner{mapped_size:0x4000},marker:core::marker::PhantomData};
         assert_eq!(owner.map_node(&node,Prot),if fail{Err(5)}else{Ok(())});
         assert!(!uat.held.get());assert_eq!(owner.page_table.rolled_back.get(),fail);assert_eq!(owner.invalidations.get(),1);
     }
+}
+#[test]fn a_live_range_is_refused_before_any_store_and_releases_ppl(){
+    let uat=Rc::new(Uat{held:Cell::new(false),m4_adopted:true,failed:AtomicBool::new(false)});
+    let mut owner=Owner{uat_inner:uat.clone(),page_table:Table{uat:uat.clone(),rolled_back:Cell::new(false),busy:true},is_kernel:true,fail:false,invalidations:Cell::new(0),stores:Cell::new(0)};
+    let node=mm::Node{start:0xfffffc2000000000,inner:KernelMappingInner{mapped_size:0x4000},marker:core::marker::PhantomData};
+    assert_eq!(owner.map_node(&node,Prot),Err(EBUSY));
+    assert!(!uat.held.get());assert_eq!(owner.stores.get(),0);assert!(!owner.page_table.rolled_back.get());
+    assert_eq!(owner.invalidations.get(),0);assert!(!uat.failed.load(Ordering::Acquire));
 }
 '''.replace('__MAP_TRANSACTION__',map_transaction)
 lock_unit=OUT/'map-node-lock.rs';lock_unit.write_text(lock_source)

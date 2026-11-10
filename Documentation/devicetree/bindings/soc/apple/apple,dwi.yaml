@@ -12,6 +12,8 @@ maintainers:
 description: |
   DWI hardware register window and interrupt. Register programming and
   firmware ownership must be qualified before enabling the controller.
+  On T6000, T8112 and T8140 the panel backlight does not use DWI, and the
+  node is bound by a read-only register view.
 
 select:
   properties:

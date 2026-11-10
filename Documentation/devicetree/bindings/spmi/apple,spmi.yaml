@@ -25,6 +25,9 @@ properties:
               - apple,t8112-spmi
           - const: apple,spmi
       - items:
+          - const: apple,t6050-spmi
+          - const: apple,t8142-spmi
+      - items:
           - enum:
               - apple,t6000-spmi
               - apple,t6020-spmi
@@ -50,7 +53,12 @@ properties:
     maxItems: 1
     description: Optional, operates in polled mode if not present
 
-  interrupt-controller: true
+  interrupt-controller:
+    description:
+      The controller demultiplexes follower interrupts. Some instances (the
+      T8112 AOP controllers) have no interrupt line to the AP. Follower
+      interrupts are then described but cannot be delivered, and drivers
+      fall back to polling or stay idle.
 
   "#interrupt-cells":
     const: 2
@@ -65,7 +73,6 @@ required:
 dependentRequired:
   interrupt-controller:
     - "#interrupt-cells"
-    - interrupts
 
 unevaluatedProperties: false
 

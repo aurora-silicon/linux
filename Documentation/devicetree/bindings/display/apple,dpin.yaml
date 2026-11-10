@@ -25,6 +25,7 @@ select:
           - apple,t6031-dpin
           - apple,t6032-dpin
           - apple,t6041-dpin
+          - apple,t6050-dpin
           - apple,t8103-dpin
           - apple,t8112-dpin
           - apple,t8122-dpin
@@ -101,6 +102,7 @@ allOf:
                       - apple,t6030-dpin
                       - apple,t6031-dpin
                       - apple,t6041-dpin
+                      - apple,t6050-dpin
                       - apple,t8103-dpin
                       - apple,t8112-dpin
                       - apple,t8122-dpin
