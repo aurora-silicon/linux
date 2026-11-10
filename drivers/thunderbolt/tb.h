@@ -1617,4 +1617,6 @@ static inline int tb_configfs_init(void) { return 0; }
 static inline void tb_configfs_exit(void) { }
 #endif
 
+int tb_apple_sleep_quiesce(struct tb *tb);
+
 #endif

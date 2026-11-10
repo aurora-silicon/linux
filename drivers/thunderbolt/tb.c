@@ -3802,6 +3802,29 @@ static void tb_handle_event(struct tb *tb, enum tb_cfg_pkg_type type,
 	tb_queue_hotplug(tb, route, pkg->port, pkg->unplug);
 }
 
+/* Called before the freezer. Close discovery and inspect in one transaction. */
+int tb_apple_sleep_quiesce(struct tb *tb)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+	struct tb_port *port;
+	struct tb_tunnel *tunnel;
+
+	if (!tb->root_switch || !tb->cm_ops)
+		return -EBUSY;
+	scoped_guard(mutex, &tb->lock) {
+		tb_switch_for_each_port(tb->root_switch, port)
+			if (port->remote)
+				return -EBUSY;
+		list_for_each_entry(tunnel, &tcm->tunnel_list, list)
+			if (!tb_tunnel_is_dma(tunnel))
+				return -EBUSY;
+		tcm->hotplug_active = false;
+	}
+	/* No topology worker can now publish a router after the inspection. */
+	flush_workqueue(tb->wq);
+	return 0;
+}
+
 static void tb_stop(struct tb *tb)
 {
 	struct tb_cm *tcm = tb_priv(tb);
