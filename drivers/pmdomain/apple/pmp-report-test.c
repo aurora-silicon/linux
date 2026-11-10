@@ -254,6 +254,27 @@ static void pmp_bootargs_reject_integer_width(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, apple_pmp_bootargs_valid(args, 29));
 }
 
+static void pmp_dvfs_words(struct kunit *test)
+{
+	u64 word;
+
+	KUNIT_ASSERT_TRUE(test, apple_pmp_dvfs_word(0, 2, &word));
+	KUNIT_EXPECT_EQ(test, word, 0x2000000000000002ULL);
+	KUNIT_ASSERT_TRUE(test, apple_pmp_dvfs_word(0x21, 0, &word));
+	KUNIT_EXPECT_EQ(test, word, 0x2000000000000000ULL);
+	KUNIT_ASSERT_TRUE(test, apple_pmp_dvfs_word(0x21, 1, &word));
+	KUNIT_EXPECT_EQ(test, word, 0x2000000100000000ULL);
+	KUNIT_ASSERT_TRUE(test, apple_pmp_dvfs_word(0x21, 2, &word));
+	KUNIT_EXPECT_EQ(test, word, 0x2000000200000000ULL);
+	KUNIT_ASSERT_TRUE(test, apple_pmp_dvfs_word(0x25, 2, &word));
+	KUNIT_EXPECT_EQ(test, word, 0x2002000000000000ULL);
+	KUNIT_EXPECT_FALSE(test, apple_pmp_dvfs_word(0x20, 1, &word));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_dvfs_word(0x26, 1, &word));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_dvfs_word(0x21, 0x10, &word));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_dvfs_word(0, 0x20, &word));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_dvfs_word(0x21, 1, NULL));
+}
+
 static struct kunit_case apple_pmp_report_cases[] = {
 	KUNIT_CASE(pmp_ranges_t6030),
 	KUNIT_CASE(pmp_ranges_t8122),
@@ -267,6 +288,7 @@ static struct kunit_case apple_pmp_report_cases[] = {
 	KUNIT_CASE(pmp_bootargs_valid_ids),
 	KUNIT_CASE(pmp_bootargs_reject_truncation),
 	KUNIT_CASE(pmp_bootargs_reject_integer_width),
+	KUNIT_CASE(pmp_dvfs_words),
 	{}
 };
 

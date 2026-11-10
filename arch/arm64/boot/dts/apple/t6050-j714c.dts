@@ -14,6 +14,7 @@
 
 /dts-v1/;
 
+#define T6050_J714C
 #include "t6050-max.dtsi"
 
 / {
@@ -220,5 +221,70 @@
 	};
 };
 
-#define T6050_J714C
 #include "t6050-peripherals.dtsi"
+
+/*
+ * The PMP (ADT pmp0, /chosen, /arm-io/pmgr), as on the J714s. iBoot loads its firmware and the
+ * driver starts it with these boot arguments and the firmware properties below. Its report
+ * tells it which devices are on; it then votes DCS and the fabric for GPU load itself, and the
+ * PMC honours that next to the CLPC. The report, the PMP's vote and the GPU's request are
+ * enabled together, so the GPU never waits on a disabled report.
+ */
+&ps_pms {
+	status = "okay";
+};
+
+&ps_pmp {
+	status = "okay";
+};
+
+&ps_pms_sram {
+	status = "okay";
+};
+
+&pmp0_dart {
+	status = "okay";
+};
+
+&pmp0_mbox {
+	status = "okay";
+};
+
+&pmp0 {
+	/* The J714c's board ID (0x0a, as in the N1 platform ID above) and the dram-vendor-id a J716c reports */
+	apple,board-id = <10>;
+	apple,dram-vendor-id = <255>;
+	/* ADT /arm-io/pmgr pmc, pmc-pmgr, as read on a J716c */
+	apple,pmc = <1>;
+	apple,pmc-pmgr = <63>;
+	status = "okay";
+};
+
+&pmp0_report {
+	status = "okay";
+};
+
+&pmc {
+	/* PMP, CLPC and AP agents, once the PMP runs */
+	apple,static-voters = <0 1 3>;
+	apple,pmp = <&pmp0>;
+};
+
+&sgx {
+	power-domains = <&pmp0_gfx>;
+};
+
+#include "t6050-max-pmp-tunables.dtsi"
+
+#include "t6050-max-atc2.dtsi"
+
+/* The host DROM from the J714cAP ADT (/arm-io/acio2 thunderbolt-drom); the boot loader replaces it */
+&acio2_nhi {
+	apple,thunderbolt-drom = [fd 02 00 00 00 00 00 00 00 90 19 c3 8c 00 5c 00
+			00 00 00 00 00 00 08 81 82 02 82 00 00 00 08 82
+			92 01 82 00 00 00 03 83 20 08 84 00 00 00 00 00
+			00 08 85 00 00 00 00 00 00 05 86 09 01 00 08 87
+			00 00 00 00 00 00 05 88 09 01 00 05 89 09 01 00
+			05 8a 09 01 00 0e 01 41 70 70 6c 65 2c 20 49 6e
+			63 2e 00 06 02 69 4f 53 00 00 00 00];
+};

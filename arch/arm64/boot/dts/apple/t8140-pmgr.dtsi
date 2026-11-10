@@ -290,6 +290,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_cpu";
+		power-domains = <&ps_isp_sys>;
 	};
 
 	ps_isp_cpu_core0: power-controller@4008 {
@@ -298,6 +299,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_cpu_core0";
+		power-domains = <&ps_isp_cpu>;
 	};
 
 	ps_isp_cpu_core1: power-controller@4010 {
@@ -306,6 +308,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_cpu_core1";
+		power-domains = <&ps_isp_cpu>;
 	};
 
 	ps_isp_fe: power-controller@4018 {
@@ -314,6 +317,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_fe";
+		power-domains = <&ps_isp_sys>;
 	};
 
 	ps_isp_dprx: power-controller@4020 {
@@ -322,6 +326,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_dprx";
+		power-domains = <&ps_isp_fe>;
 	};
 
 	ps_isp_secure: power-controller@4028 {
@@ -330,6 +335,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_secure";
+		power-domains = <&ps_isp_fe>;
 	};
 
 	ps_isp_sts0: power-controller@4030 {
@@ -338,6 +344,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_sts0";
+		power-domains = <&ps_isp_fe>;
 	};
 
 	ps_isp_sts1: power-controller@4038 {
@@ -346,6 +353,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_sts1";
+		power-domains = <&ps_isp_fe>;
 	};
 
 	ps_isp_pearl: power-controller@4040 {
@@ -354,6 +362,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_pearl";
+		power-domains = <&ps_isp_fe>;
 	};
 
 	ps_isp_be: power-controller@4048 {
@@ -362,6 +371,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_be";
+		power-domains = <&ps_isp_fe>;
 	};
 
 	ps_isp_clr: power-controller@4050 {
@@ -370,6 +380,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_clr";
+		power-domains = <&ps_isp_be>;
 	};
 
 	ps_isp_cvd: power-controller@4058 {
@@ -378,6 +389,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_cvd";
+		power-domains = <&ps_isp_be>;
 	};
 
 	ps_isp_cvm: power-controller@4060 {
@@ -386,6 +398,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_cvm";
+		power-domains = <&ps_isp_cvd>;
 	};
 	ps_disp_cpu: power-controller@10000 {
 		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
@@ -657,6 +670,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "smc_i2cm1";
+		power-domains = <&ps_smc_fabric>;
 		apple,always-on; /* used by the SMC firmware */
 	};
 
@@ -666,6 +680,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "smc_i2cm2";
+		power-domains = <&ps_smc_fabric>;
 		apple,always-on; /* used by the SMC firmware */
 	};
 

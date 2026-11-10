@@ -255,6 +255,7 @@ static int apple_isp_map_dapf(struct apple_isp *isp)
 int apple_isp_program_dapf(struct apple_isp *isp)
 {
 	const struct apple_isp_hw *hw = isp->hw;
+	u32 sidmask = hw->dapf_sidmask ?: DAPF_CTRL2_ISP;
 	void __iomem *w;
 	unsigned int i;
 
@@ -264,7 +265,7 @@ int apple_isp_program_dapf(struct apple_isp *isp)
 		writeq(hw->dapf[i].start, w + DAPF_START);
 		writeq(hw->dapf[i].end, w + DAPF_END);
 		writel(DAPF_CTRL0_ISP, w + DAPF_CTRL0);
-		writel(DAPF_CTRL2_ISP, w + DAPF_CTRL2);
+		writel(sidmask, w + DAPF_CTRL2);
 	}
 
 	/* Only bits 7:0 of CTRL0 and bits 63:2 of END read back. */
@@ -274,7 +275,7 @@ int apple_isp_program_dapf(struct apple_isp *isp)
 		    readq(w + DAPF_START) != hw->dapf[i].start ||
 		    (readq(w + DAPF_END) | 3) != (hw->dapf[i].end | 3) ||
 		    (readl(w + DAPF_CTRL0) & 0xff) != DAPF_CTRL0_ISP ||
-		    readl(w + DAPF_CTRL2) != DAPF_CTRL2_ISP) {
+		    readl(w + DAPF_CTRL2) != sidmask) {
 			dev_err(isp->dev, "DAPF window %u (0x%llx-0x%llx) failed readback\n",
 				i, hw->dapf[i].start, hw->dapf[i].end);
 			return -EIO;
@@ -1141,7 +1142,82 @@ static const struct apple_isp_hw apple_isp_hw_t8142 = {
 	.setfile_stride_fixup = true,
 };
 
+/* T6050 ISP17c: CPU-visible firmware MMIO windows and DART filters. */
+static const struct isp_mmio_window apple_isp_fw_mmio_t6050[] = {
+	{ 0x280680000, 0x8000 },
+	{ 0x280900000, 0x4000 },
+	{ 0x284240000, 0x28000 },
+	{ 0x284e3c000, 0x4000 },
+	{ 0x286724000, 0x4000 },
+	{ 0x29062c000, 0x20000 },
+	{ 0x509660000, 0x4000 },
+	{ 0x2220004000, 0x14000 },
+	{ 0x2222004000, 0x14000 },
+	{ 0x2224004000, 0x14000 },
+	{ 0x2226004000, 0x14000 },
+	{ 0x2228004000, 0x14000 },
+	{ 0x222a004000, 0x14000 },
+	{ 0x222c004000, 0x14000 },
+	{ 0x222e004000, 0x14000 },
+};
+
+static const struct isp_dapf_window apple_isp_dapf_t6050[] = {
+	{ 0x2809003b0, 0x2809003f3 },
+	{ 0x280680000, 0x280687fff },
+	{ 0x284e3c000, 0x284e3c003 },
+	{ 0x29062c000, 0x290648003 },
+	{ 0x509660000, 0x509660003 },
+	{ 0x286724000, 0x286724004 },
+	{ 0x284240000, 0x284264000 },
+	{ 0x2220004000, 0x22200162fc },
+	{ 0x2222004000, 0x22220162fc },
+	{ 0x2224004000, 0x22240162fc },
+	{ 0x2226004000, 0x22260162fc },
+	{ 0x2228004000, 0x22280162fc },
+	{ 0x222a004000, 0x222a0162fc },
+	{ 0x222c004000, 0x222c0162fc },
+	{ 0x222e004000, 0x222e0162fc },
+};
+
+static const u64 apple_isp_dsid_t6050[] = {
+	0x2220016000,
+	0x2222016000,
+	0x2224016000,
+	0x2226016000,
+	0x2228016000,
+	0x222a016000,
+	0x222c016000,
+	0x222e016000,
+};
+
+static const struct apple_isp_hw apple_isp_hw_t6050 = {
+	.gen = ISP_GEN_T6040,
+	.fw_abi = ISP_FW_ABI_H17,
+	.dsid_count = ARRAY_SIZE(apple_isp_dsid_t6050),
+	.dsid_clr_bases = apple_isp_dsid_t6050,
+	.dsid_clr_range0 = 0x2fc,
+	.mbox_irq_enable = ISP_MBOX_IRQ_ENABLE_T6031,
+	.mbox_extra_enables = true,
+	.scl1 = true,
+	.meta_size = ISP_META_SIZE_T8140,
+	.capture_meta_size = ISP_CAPTURE_META_SIZE_T8140,
+	.fw_mmio = apple_isp_fw_mmio_t6050,
+	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t6050),
+	.dapf = apple_isp_dapf_t6050,
+	.num_dapf = ARRAY_SIZE(apple_isp_dapf_t6050),
+	.dapf_sidmask = 0xcc3,
+	.coproc_control = ISP_COPROC_CONTROL_T8140,
+	.coproc_status = ISP_COPROC_STATUS_T8140,
+	.coproc_quiesce = ISP_COPROC_QUIESCE_T8140,
+	.boot_mode = 1,
+	.shared_size = 0xde000000,
+	.fw_restore = true,
+	.deferred_start = true,
+	.setfile_stride_fixup = true,
+};
+
 static const struct of_device_id apple_isp_of_match[] = {
+	{ .compatible = "apple,t6050-isp", .data = &apple_isp_hw_t6050 },
 	{ .compatible = "apple,t8103-isp", .data = &apple_isp_hw_t8103 },
 	{ .compatible = "apple,t8112-isp", .data = &apple_isp_hw_t8112 },
 	{ .compatible = "apple,t8122-isp", .data = &apple_isp_hw_t8122 },

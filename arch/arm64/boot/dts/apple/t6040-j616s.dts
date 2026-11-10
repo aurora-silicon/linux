@@ -280,3 +280,30 @@
 &usb4_2_nhi {
 	status = "okay";
 };
+
+/*
+ * The internal PCIe controller (Wi-Fi/Bluetooth, SD reader) needs APCIE_GP,
+ * APCIE_SYS_GP and APCIE_PHY_SW on top of the always-on ANS/APCIE_ST*
+ * states (ADT apcie0 clock-gates). iBoot leaves them on. The driver keeps
+ * internal links up through suspend-to-idle and cannot retrain them after
+ * a power cycle, so describe them as always-on: Linux now holds what it
+ * needs instead of relying on iBoot's state.
+ */
+&ps_apcie_gp {
+	apple,always-on;
+	status = "okay";
+};
+
+&ps_apcie_sys_gp {
+	apple,always-on;
+	status = "okay";
+};
+
+&ps_apcie_phy_sw {
+	apple,always-on;
+	status = "okay";
+};
+
+&pcie0 {
+	power-domains = <&ps_apcie_sys_gp>, <&ps_apcie_phy_sw>;
+};

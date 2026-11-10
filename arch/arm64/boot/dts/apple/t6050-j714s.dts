@@ -4,9 +4,9 @@
  *
  * target-type: J714s
  *
- * One T6050 die (t6050-max.dtsi). Nobody has booted Linux on this board
- * yet: beyond the SoC this file only adds the board's hardware inventory
- * (t6050-peripherals.dtsi), all of it disabled, from the board's ADT.
+ * One T6050 die (t6050-max.dtsi). Beyond the SoC this file adds the board's
+ * hardware inventory (t6050-peripherals.dtsi) from the board's ADT, disabled
+ * except for the PMP below.
  *
  * Copyright The Asahi Linux Contributors
  */
@@ -19,6 +19,11 @@
 	compatible = "apple,j714s", "apple,t6050", "apple,arm-platform";
 	model = "Apple MacBook Pro (14-inch, M5 Pro, 2026)";
 	chassis-type = "laptop";
+
+	aliases {
+		/* the boot loader reserves the SEP firmware and adds its manifests through this alias */
+		sep = &sep;
+	};
 
 	chosen {
 		#address-cells = <2>;
@@ -41,3 +46,59 @@
 
 #define T6050_J714S
 #include "t6050-peripherals.dtsi"
+
+/*
+ * The PMP (ADT pmp0, /chosen, /arm-io/pmgr). iBoot loads its firmware and the driver starts it
+ * with these boot arguments and the firmware properties below. Its report tells it which devices
+ * are on; it then votes DCS and the fabric for GPU load itself, and the PMC honours that next
+ * to the CLPC. The report, the PMP's vote and the GPU's request are enabled together, so the
+ * GPU never waits on a disabled report.
+ */
+&ps_pms {
+	status = "okay";
+};
+
+&ps_pmp {
+	status = "okay";
+};
+
+&ps_pms_sram {
+	status = "okay";
+};
+
+&pmp0_dart {
+	status = "okay";
+};
+
+&pmp0_mbox {
+	status = "okay";
+};
+
+&pmp0 {
+	/* ADT /chosen board-id, dram-vendor-id */
+	apple,board-id = <8>;
+	apple,dram-vendor-id = <255>;
+	/* ADT /arm-io/pmgr pmc, pmc-pmgr */
+	apple,pmc = <1>;
+	apple,pmc-pmgr = <63>;
+	status = "okay";
+};
+
+&pmp0_report {
+	status = "okay";
+};
+
+&pmc {
+	/* PMP, CLPC and AP agents, once the PMP runs */
+	apple,static-voters = <0 1 3>;
+	apple,pmp = <&pmp0>;
+};
+
+&sgx {
+	power-domains = <&pmp0_gfx>;
+};
+
+#include "t6050-j714s-pmp-tunables.dtsi"
+
+/* The same T6050 camera as J716c (J714sAP ADT); the loader sets the J714s sensor type. */
+#include "t6050-j716c-isp.dtsi"
