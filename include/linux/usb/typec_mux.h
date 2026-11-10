@@ -212,6 +212,9 @@ enum typec_thunderbolt_switch_state {
 	TYPEC_THUNDERBOLT_SWITCH_OFF,
 	TYPEC_THUNDERBOLT_SWITCH_TBT,
 	TYPEC_THUNDERBOLT_SWITCH_USB4,
+	/* Close topology admission, reject native tunnels, stop before freezer. */
+	TYPEC_THUNDERBOLT_SWITCH_SLEEP,
+	TYPEC_THUNDERBOLT_SWITCH_WAKE,
 };
 
 /**
