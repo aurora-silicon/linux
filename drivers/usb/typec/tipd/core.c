@@ -9,6 +9,7 @@
 #include <kunit/static_stub.h>
 #include <kunit/visibility.h>
 #include <linux/i2c.h>
+#include <linux/iopoll.h>
 #include <linux/acpi.h>
 #include <linux/gpio/consumer.h>
 #include <linux/of.h>
@@ -460,12 +461,21 @@ out_unlock:
 	return ret;
 }
 
+/*
+ * After a PR_Swap is accepted, the initial sink waits up to tPSSourceOff
+ * (920 ms) for the initial source's PS_RDY, and the initial source then
+ * waits up to tPSSourceOn (480 ms) for the new source's PS_RDY (USB Power
+ * Delivery, PR_Swap timers).
+ */
+#define TPS_PR_SWAP_TIMEOUT_US	(1400 * USEC_PER_MSEC)
+#define TPS_PR_SWAP_POLL_US	(10 * USEC_PER_MSEC)
+
 static int tps6598x_pr_set(struct typec_port *port, enum typec_role role)
 {
 	const char *cmd = (role == TYPEC_SINK) ? "SWSk" : "SWSr";
 	struct tps6598x *tps = typec_get_drvdata(port);
 	u32 status;
-	int ret;
+	int ret, err;
 
 	mutex_lock(&tps->lock);
 
@@ -473,11 +483,18 @@ static int tps6598x_pr_set(struct typec_port *port, enum typec_role role)
 	if (ret)
 		goto out_unlock;
 
-	ret = tps6598x_read32(tps, TPS_REG_STATUS, &status);
+	/*
+	 * The task completes once the swap has been accepted, but the port
+	 * role in STATUS changes only after the power supply transition that
+	 * follows, so wait for it before calling the swap a failure.
+	 */
+	err = read_poll_timeout(tps6598x_read32, ret,
+				ret || TPS_STATUS_TO_TYPEC_PORTROLE(status) == role,
+				TPS_PR_SWAP_POLL_US, TPS_PR_SWAP_TIMEOUT_US, false,
+				tps, TPS_REG_STATUS, &status);
 	if (ret)
 		goto out_unlock;
-
-	if (role != TPS_STATUS_TO_TYPEC_PORTROLE(status)) {
+	if (err) {
 		ret = -EPROTO;
 		goto out_unlock;
 	}
