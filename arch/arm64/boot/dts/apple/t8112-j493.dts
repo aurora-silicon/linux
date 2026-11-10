@@ -25,6 +25,8 @@
 	aliases {
 		bluetooth0 = &bluetooth0;
 		keyboard = &keyboard;
+		rtc0 = &smc_rtc;
+		rtc1 = &pmu_rtc;
 		sep = &sep;
 		touchbar0 = &touchbar0;
 		wifi0 = &wifi0;
@@ -340,3 +342,6 @@
 &pmp_report_isp_sys {
 	status = "okay";
 };
+
+
+#include "t8112-j493-peripherals.dtsi"

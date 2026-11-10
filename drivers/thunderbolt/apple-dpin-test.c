@@ -381,7 +381,7 @@ static void apple_dpin_qualification_profiles(struct kunit *test)
 
 /*
  * M4 (T8132): the M3 flow without DP IN interrupts, a lazy teardown, and
- * DP tunnels capped at HBR2.
+ * DP tunnels sharing one link rate.
  */
 static void apple_dpin_m4_policy(struct kunit *test)
 {
@@ -393,15 +393,15 @@ static void apple_dpin_m4_policy(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, p->t602x_handshake);
 	KUNIT_EXPECT_TRUE(test, p->defer_new_bringup);
 	KUNIT_EXPECT_TRUE(test, p->lazy_idle);
-	KUNIT_EXPECT_EQ(test, p->host_policy, TB_HOST_DP_NOTIFY | TB_HOST_DP_HBR2_MAX);
+	KUNIT_EXPECT_EQ(test, p->host_policy, TB_HOST_DP_NOTIFY | TB_HOST_DP_SHARED_RATE);
 	/* The hooks of the M3 flow: a queue and a display pipeline both. */
 	KUNIT_EXPECT_EQ(test, apple_dpin_hooks(p, true, true), APPLE_DPIN_CHANGED);
 	KUNIT_EXPECT_EQ(test, apple_dpin_hooks(p, true, false), APPLE_DPIN_DISABLED);
 	KUNIT_EXPECT_EQ(test, apple_dpin_hooks(p, false, true), APPLE_DPIN_DISABLED);
-	/* No other Apple host is capped. */
-	KUNIT_EXPECT_FALSE(test, apple_dpin_m3.host_policy & TB_HOST_DP_HBR2_MAX);
-	KUNIT_EXPECT_FALSE(test, apple_dpin_m2.host_policy & TB_HOST_DP_HBR2_MAX);
-	KUNIT_EXPECT_FALSE(test, apple_dpin_m1.host_policy & TB_HOST_DP_HBR2_MAX);
+	/* No other Apple host shares one rate. */
+	KUNIT_EXPECT_FALSE(test, apple_dpin_m3.host_policy & TB_HOST_DP_SHARED_RATE);
+	KUNIT_EXPECT_FALSE(test, apple_dpin_m2.host_policy & TB_HOST_DP_SHARED_RATE);
+	KUNIT_EXPECT_FALSE(test, apple_dpin_m1.host_policy & TB_HOST_DP_SHARED_RATE);
 }
 
 static void apple_dpin_all_policy_fields(struct kunit *test)

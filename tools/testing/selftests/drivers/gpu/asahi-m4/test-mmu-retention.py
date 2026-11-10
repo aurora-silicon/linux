@@ -20,7 +20,7 @@ mm=(ROOT/'drivers/gpu/drm/asahi/mmu.rs').read_text();pt=(ROOT/'drivers/gpu/drm/a
 pre=r'''
 #![allow(dead_code,unused_variables)]
 use std::{cell::RefCell,rc::Rc,mem::{ManuallyDrop,size_of},ops::{Deref,DerefMut,Range},num::NonZeroUsize,sync::{Mutex as StdMutex,atomic::{AtomicBool as StdAtomicBool,AtomicU8,AtomicU32,AtomicU64,AtomicUsize,Ordering,fence}}};
-type Result<T=()> = std::result::Result<T,i32>;const EIO:i32=5;const ETIMEDOUT:i32=110;const EOVERFLOW:i32=75;
+type Result<T=()> = std::result::Result<T,i32>;const EIO:i32=5;const ETIMEDOUT:i32=110;const EOVERFLOW:i32=75;const ENOTSUPP:i32=524;
 static TRIP_LOAD:AtomicUsize=AtomicUsize::new(0);
 struct AtomicBool(StdAtomicBool);impl AtomicBool{fn new(v:bool)->Self{Self(StdAtomicBool::new(v))}fn store(&self,v:bool,o:Ordering){self.0.store(v,o);}fn load(&self,o:Ordering)->bool{let n=TRIP_LOAD.load(Ordering::Relaxed);if n!=0&&TRIP_LOAD.fetch_sub(1,Ordering::Relaxed)==1{self.0.store(true,Ordering::Release);}self.0.load(o)}}
 const UAT_NUM_CTX:usize=64;const UAT_USER_CTX_START:usize=1;const TTBR_VALID:u64=1;const TTBR_ASID_SHIFT:usize=48;const UAT_PGSZ:usize=0x4000;
@@ -34,6 +34,8 @@ mod mem{pub fn sync(){super::BARRIERS.fetch_add(1,super::Ordering::Relaxed);}pub
 #[derive(Clone,Copy,PartialEq,Eq)]enum UatFirmware{Handoff,PublishedRoots}
 struct Handoff{lock_ap:AtomicU8,lock_fw:AtomicU8,turn:AtomicU32,cur_slot:AtomicU32}impl Handoff{fn new()->Self{Self{lock_ap:AtomicU8::new(0),lock_fw:AtomicU8::new(0),turn:AtomicU32::new(0),cur_slot:AtomicU32::new(0xffff)}}
 '''
+# Keep the production firmware predicate in the legacy-firmware harness.
+pre=pre.replace('struct Handoff{', 'impl UatFirmware{'+body(mm,'const fn is_no_peer(')+'}\nstruct Handoff{', 1)
 handoff='\n'.join(body(mm,m) for m in ['fn lock(&self) {\n        self.lock_ap', 'fn unlock(&self) {\n        self.turn', 'fn current_slot('])
 mid=r'''
 }

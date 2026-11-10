@@ -3,13 +3,13 @@
 #define _LINUX_SOC_APPLE_PMP_DISPLAY_H
 
 #include <linux/of.h>
+#include <linux/soc/apple/t8132.h>
 #include <linux/types.h>
 
-/* The retained M4 bridge and raw thermal records are qualified for J713. */
+/* The retained M4 bridge and raw thermal records: the M4 firmware path. */
 static inline bool apple_pmp_j713_board(void)
 {
-	return of_machine_is_compatible("apple,j713") &&
-	       of_machine_is_compatible("apple,t8132");
+	return apple_t8132_firmware_path() && of_machine_is_compatible("apple,t8132");
 }
 
 struct device;
@@ -31,12 +31,17 @@ void apple_pmp_display_fail(struct apple_pmp_display *display, int error);
 struct apple_pmp_display *apple_pmp_display_bound_owner(struct device *dev);
 
 /* J713 votes share the existing PMP owner's untagged request stream.
- * Prepare is probe-only; accepted DISP/AGX votes and supplier links persist
- * until reboot.
+ * Prepare is probe-only; supplier links persist until reboot, and so do
+ * accepted votes, except that the DCP releases its DISP vote while it has
+ * powered the display domains down (put) and takes it again (get). Before
+ * that it asks, changing nothing, whether the vote can be released now and
+ * taken again later (check_release).
  */
 int apple_pmp_j713_display_prepare(struct device *consumer);
 int apple_pmp_j713_display_get(struct device *consumer);
+int apple_pmp_j713_display_put(struct device *consumer);
 int apple_pmp_j713_display_check(struct device *consumer);
+int apple_pmp_j713_display_check_release(struct device *consumer);
 int apple_pmp_j713_gpu_prepare(struct device *consumer);
 int apple_pmp_j713_gpu_get(struct device *consumer);
 int apple_pmp_j713_gpu_check(struct device *consumer);

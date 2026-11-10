@@ -5,6 +5,7 @@
 #include <linux/module.h>
 
 #include "dcp_backlight.h"
+#include "dcp-edr.h"
 
 static void backlight_millinits_takeover_test(struct kunit *test)
 {
@@ -633,6 +634,132 @@ static void backlight_reports_keep_target_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, state.dirty);
 }
 
+
+/* Synthetic panel: a 1200 nit peak and a potential headroom of 8.0. */
+#define EDR_TEST_PEAK		1200U
+#define EDR_TEST_CEILING	0x80000U
+
+static void edr_ceiling_test(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, dcp_edr_ceiling(0), 0U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_ceiling(0x8000), 0U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_ceiling(0x10000), 0U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_ceiling(0x18000), 1500U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_ceiling(EDR_TEST_CEILING), 8000U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_ceiling(U32_MAX), 65535999U);
+}
+
+static void edr_target_test(struct kunit *test)
+{
+	u32 ceiling = dcp_edr_ceiling(EDR_TEST_CEILING);
+
+	/* Bright SDR white: the peak sets the headroom. */
+	KUNIT_EXPECT_EQ(test, dcp_edr_target(EDR_TEST_PEAK, 400, ceiling), 3000U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_target(EDR_TEST_PEAK, 150, ceiling), 8000U);
+	/* Dim SDR white: the ceiling does, never peak / sdr. */
+	KUNIT_EXPECT_EQ(test, dcp_edr_target(EDR_TEST_PEAK, 6, ceiling), 8000U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_target(EDR_TEST_PEAK, 1, ceiling), 8000U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_target(EDR_TEST_PEAK, 6, 0), 200000U);
+	/* No headroom above the peak, and none to give with no SDR white. */
+	KUNIT_EXPECT_EQ(test, dcp_edr_target(EDR_TEST_PEAK, 1200, ceiling), 1000U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_target(EDR_TEST_PEAK, 1500, ceiling), 1000U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_target(EDR_TEST_PEAK, 0, ceiling), 1000U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_target(10000, 1, 0), 10000000U);
+}
+
+/*
+ * Present a fade of SDR white from @from to @to in @steps swaps, as the
+ * backlight fade does, then @extra swaps at the new level, and return the
+ * number of swaps whose panel level moved against the fade.
+ */
+static unsigned int edr_fade(struct kunit *test, u32 *hm, u32 ceiling,
+			     u32 from, u32 to, unsigned int steps,
+			     unsigned int extra, u32 *last_bri)
+{
+	u32 prev = from, bri = (u64)from * *hm / DCP_EDR_UNITY;
+	unsigned int reversals = 0;
+
+	for (unsigned int i = 1; i <= steps + extra; i++) {
+		u32 sdr = i >= steps ? to :
+			(from > to ? from - (from - to) * i / steps :
+				     from + (to - from) * i / steps);
+		u32 target = dcp_edr_target(EDR_TEST_PEAK, sdr, ceiling);
+		u32 next = dcp_edr_next(*hm, target, prev, sdr);
+		u32 level = (u64)sdr * next / DCP_EDR_UNITY;
+
+		KUNIT_EXPECT_LE(test, next, max(target, *hm));
+		/* Allow the rounding of the headroom and of the level. */
+		u32 slack = max(1U, bri / 200);
+
+		if ((from > to && level > bri + slack) ||
+		    (from < to && level + slack < bri))
+			reversals++;
+		*hm = next;
+		prev = sdr;
+		bri = level;
+	}
+	*last_bri = bri;
+	return reversals;
+}
+
+static void edr_low_end_steady_test(struct kunit *test)
+{
+	u32 ceiling = dcp_edr_ceiling(EDR_TEST_CEILING);
+	u32 hm = dcp_edr_target(EDR_TEST_PEAK, 35, ceiling), bri;
+
+	/* At the ceiling below 150 nits: a fade only moves the panel level. */
+	KUNIT_EXPECT_EQ(test, edr_fade(test, &hm, ceiling, 35, 6, 15, 0, &bri), 0U);
+	KUNIT_EXPECT_EQ(test, hm, 8000U);
+	KUNIT_EXPECT_EQ(test, bri, 48U);
+	/* Swaps at the floor, e.g. for an OSD, change nothing. */
+	for (unsigned int i = 0; i < 200; i++)
+		KUNIT_EXPECT_EQ(test, dcp_edr_next(hm, dcp_edr_target(EDR_TEST_PEAK, 6, ceiling),
+						   6, 6), hm);
+}
+
+static void edr_fade_monotonic_test(struct kunit *test)
+{
+	u32 ceilings[] = { dcp_edr_ceiling(EDR_TEST_CEILING), 0 };
+
+	for (unsigned int c = 0; c < ARRAY_SIZE(ceilings); c++) {
+		u32 ceiling = ceilings[c];
+		u32 hm = dcp_edr_target(EDR_TEST_PEAK, 400, ceiling), bri;
+
+		/* Down: the panel level holds, then follows SDR white down. */
+		KUNIT_EXPECT_EQ(test, edr_fade(test, &hm, ceiling, 400, 6, 15, 300, &bri), 0U);
+		KUNIT_EXPECT_EQ(test, hm, dcp_edr_target(EDR_TEST_PEAK, 6, ceiling));
+		KUNIT_EXPECT_EQ(test, bri, (u32)((u64)6 * hm / DCP_EDR_UNITY));
+		/* Up: the headroom drops at once and the level only rises. */
+		KUNIT_EXPECT_EQ(test, edr_fade(test, &hm, ceiling, 6, 400, 15, 10, &bri), 0U);
+		KUNIT_EXPECT_EQ(test, hm, 3000U);
+		KUNIT_EXPECT_EQ(test, bri, EDR_TEST_PEAK);
+		/* One step at a time between near levels. */
+		KUNIT_EXPECT_EQ(test, edr_fade(test, &hm, ceiling, 400, 300, 15, 50, &bri), 0U);
+		KUNIT_EXPECT_EQ(test, hm, 4000U);
+	}
+}
+
+static void edr_start_ramp_test(struct kunit *test)
+{
+	u32 ceiling = dcp_edr_ceiling(EDR_TEST_CEILING);
+	u32 target = dcp_edr_target(EDR_TEST_PEAK, 6, ceiling);
+	u32 hm = DCP_EDR_UNITY;
+	unsigned int swaps = 0;
+
+	/* EDR starting at a steady level rises one step per swap. */
+	while (hm < target) {
+		u32 next = dcp_edr_next(hm, target, 6, 6);
+
+		KUNIT_ASSERT_GT(test, next, hm);
+		KUNIT_EXPECT_LE(test, next, hm * DCP_EDR_STEP_UP / DCP_EDR_UNITY + 1);
+		hm = next;
+		KUNIT_ASSERT_LT(test, ++swaps, 100U);
+	}
+	KUNIT_EXPECT_EQ(test, hm, target);
+	/* Ending EDR returns to 1.0 in one swap. */
+	KUNIT_EXPECT_EQ(test, dcp_edr_next(hm, DCP_EDR_UNITY, 6, 6), DCP_EDR_UNITY);
+}
+
 static struct kunit_case backlight_cases[] = {
 	KUNIT_CASE(backlight_reports_keep_target_test),
 	KUNIT_CASE(backlight_millinits_takeover_test),
@@ -654,6 +781,11 @@ static struct kunit_case backlight_cases[] = {
 	KUNIT_CASE(backlight_fade_test),
 	KUNIT_CASE(backlight_fade_restart_test),
 	KUNIT_CASE(backlight_fade_blank_test),
+	KUNIT_CASE(edr_ceiling_test),
+	KUNIT_CASE(edr_target_test),
+	KUNIT_CASE(edr_low_end_steady_test),
+	KUNIT_CASE(edr_fade_monotonic_test),
+	KUNIT_CASE(edr_start_ramp_test),
 	{}
 };
 

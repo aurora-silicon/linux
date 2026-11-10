@@ -43,19 +43,34 @@
 #define DCP_FORMAT_PF22		fourcc_code('2', '2', 'f', 'p') /* P230 full range 2 plane 10-bit YCbCr, 3x1 blocks */
 #define DCP_FORMAT_PF44		fourcc_code('4', '4', 'f', 'p') /* P430 full range 2 plane 10-bit YCbCr, 3x1 blocks */
 
+/*
+ * Surface colour primaries, the IOSurface primaries index the firmware takes
+ * as is. 1 is BT.709 in the IOSurface naming; the YCbCr mapping in plane.c
+ * predates that and still uses 1 for BT.601 and 2 for BT.709.
+ */
 enum dcp_colorspace {
-	DCP_COLORSPACE_BG_SRGB = 0,
+	DCP_COLORSPACE_UNSPECIFIED = 0,
 	DCP_COLORSPACE_BT601 = 1,
 	DCP_COLORSPACE_BT709 = 2,
-	DCP_COLORSPACE_BG_BT2020 = 9,
-	DCP_COLORSPACE_NATIVE = 12,
+	DCP_COLORSPACE_BT2020 = 9,
+	DCP_COLORSPACE_DCI_P3 = 11,
+	DCP_COLORSPACE_P3_D65 = 12,
 };
 
+/*
+ * Surface transfer function, the IOSurface transfer-function index the
+ * firmware takes as is: 1 is the BT.709 (and BT.601) OETF, 2 means the gamma
+ * is supplied separately, 8 is linear (extended-range FP16 EDR surfaces use
+ * it with 1.0 as SDR white), 13 is sRGB, 16 is SMPTE ST 2084 (PQ) and 18 is
+ * HLG.
+ */
 enum dcp_xfer_func {
 	DCP_XFER_FUNC_BT601 = 1,
 	DCP_XFER_FUNC_BT1886 = 2,
-	DCP_XFER_FUNC_SDR = 13,
-	DCP_XFER_FUNC_HDR = 16,
+	DCP_XFER_FUNC_LINEAR = 8,
+	DCP_XFER_FUNC_SRGB = 13,
+	DCP_XFER_FUNC_PQ = 16,
+	DCP_XFER_FUNC_HLG = 18,
 };
 
 enum dcp_addr_fmt {

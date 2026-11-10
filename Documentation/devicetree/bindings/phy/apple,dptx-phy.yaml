@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/phy/apple,dptx-phy.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple DisplayPort transmitter PHY
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  Hardware resources of the Apple Silicon DisplayPort transmitter PHY.
+  The interface is described for discovery and must remain disabled until
+  its ownership, initialization and shutdown are supported. Register windows
+  are listed in hardware resource order; firmware configuration and tuning
+  data are supplied by the boot firmware rather than this binding.
+
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6050-dptx-phy
+          - apple,t8122-dptx-phy
+  required:
+    - compatible
+
+properties:
+  compatible:
+    oneOf:
+      - items:
+          - enum:
+              - apple,t8122-dptx-phy
+          - const: apple,dptx-phy
+      - const: apple,t6050-dptx-phy
+
+  reg:
+    minItems: 2
+    maxItems: 2
+
+  reg-names:
+    items:
+      - const: core
+      - const: dptx
+
+  power-domains:
+    maxItems: 1
+
+  '#phy-cells':
+    const: 0
+
+  '#reset-cells':
+    const: 0
+
+  apple,ufp-endpoint:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      The display crossbar's upstream-facing endpoint that feeds this PHY.
+
+patternProperties:
+  '^apple,(pll-(dcocfg|dtcvreg|dtccal|dcdadj|dlfcfg)|pclkdrv-select)$':
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      PLL and pixel clock driver settings the PHY is programmed with, as the
+      ADT's lpdptx-phy node gives them.
+
+required:
+  - compatible
+  - reg
+  - power-domains
+  - '#phy-cells'
+
+additionalProperties: false

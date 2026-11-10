@@ -8,18 +8,6 @@
 	};
 };
 
-&serial0 {
-	status = "okay";
-};
-
-&ps_uart_p {
-	status = "okay";
-};
-
-&ps_uart0 {
-	status = "okay";
-};
-
 &dcuart {
 	status = "okay";
 };
@@ -36,14 +24,14 @@
 	status = "disabled";
 };
 
-&usb_drd0 {
+&dwc3_0 {
 	status = "disabled";
 };
 
-&usb_drd0_dart_0 {
+&dwc3_0_dart_0 {
 	status = "disabled";
 };
 
-&usb_drd0_dart_1 {
+&dwc3_0_dart_1 {
 	status = "disabled";
 };

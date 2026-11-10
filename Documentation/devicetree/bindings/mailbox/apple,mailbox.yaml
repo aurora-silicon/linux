@@ -23,6 +23,11 @@ properties:
   compatible:
     oneOf:
       - description:
+          T8152 SMC post-office mailbox with counted FIFOs and interrupt
+          masking provided by the interrupt controller.
+        const: apple,t8152-smc-mailbox
+
+      - description:
           ASC mailboxes are the most common variant found on the M1 used
           for example for the display controller, the system management
           controller and the NVMe coprocessor.
@@ -37,7 +42,9 @@ properties:
               - apple,t6000-asc-mailbox
               - apple,t6020-asc-mailbox
               - apple,t6030-asc-mailbox
+              - apple,t6031-asc-mailbox
               - apple,t6041-asc-mailbox
+              - apple,t6050-asc-mailbox
           - const: apple,asc-mailbox-v4
 
       - description:
@@ -61,6 +68,7 @@ properties:
           M3 GPU ASC mailboxes with no generic mailbox fallback. This keeps
           older kernels from binding before the GPU handoff is supported.
         enum:
+          - apple,t6030-agx-asc-mailbox
           - apple,t6031-agx-asc-mailbox
           - apple,t8122-agx-asc-mailbox
 
@@ -130,6 +138,21 @@ allOf:
       properties:
         compatible:
           contains:
+            const: apple,t8152-smc-mailbox
+    then:
+      properties:
+        interrupts:
+          minItems: 2
+          maxItems: 2
+        interrupt-names:
+          items:
+            - const: send-empty
+            - const: recv-not-empty
+
+  - if:
+      properties:
+        compatible:
+          contains:
             const: apple,t8140-aop-setup-mailbox
     then:
       properties:
@@ -174,6 +197,7 @@ allOf:
                 - apple,t6021-ane-mailbox
                 - apple,t8112-ane-mailbox
                 - apple,t8140-aop-setup-mailbox
+                - apple,t8152-smc-mailbox
     then:
       properties:
         interrupts:

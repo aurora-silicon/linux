@@ -9,7 +9,13 @@
 #ifndef APPLE_JPEG_HW_H
 #define APPLE_JPEG_HW_H
 
+#include <linux/align.h>
+#include <linux/bits.h>
 #include <linux/limits.h>
+#include <linux/math.h>
+#include <linux/minmax.h>
+#include <linux/mm.h>
+#include <linux/sizes.h>
 #include <linux/types.h>
 
 #define APPLE_JPEG_REG_SIZE		0x4000
@@ -46,25 +52,7 @@
 #define AJ_PX_PLANE1_TILE_H		0x080
 #define AJ_PX_PLANE1_TILE_V		0x084
 #define AJ_PX_PLANE1_STRIDE		0x088
-#define AJ_INPUT_PLANE0			0x090	/* low, high */
-#define AJ_INPUT_PLANE1			0x0a0
-#define AJ_INPUT_END			0x0b0
-#define AJ_ENCODE_PIPE_LIMIT0		0x0b8
-#define AJ_ENCODE_PIPE_LIMIT1		0x0bc
-#define AJ_OUTPUT_START0		0x0c0
-#define AJ_OUTPUT_START1		0x0d0
-#define AJ_OUTPUT_END			0x0e0
-#define AJ_ENCODE_PIXEL_FORMAT		0x13c
-#define  AJ_PIXEL_FORMAT_YUV_PLANES	4
-#define AJ_ENCODE_COMPONENT_POS(i)	(0x140 + 4 * (i))
-#define AJ_CONVERT_COLOR_SPACE		0x150
-#define AJ_AXI_READ_PREFETCH		0x154
-#define AJ_AXI_WRITE_PREFETCH		0x158
-#define AJ_TILING_ENABLE		0x19c
-#define AJ_TIMEOUT			0x1c0
-#define AJ_HWREV			0x1c4
-#define AJ_DMA_IMAGE_WIDTH		0x258
-#define AJ_DMA_IMAGE_HEIGHT		0x25c
+#define AJ_PIXEL_FORMAT_YUV_PLANES	4
 #define AJ_JPEG_IO_FLAGS		0x1000
 #define  AJ_IO_FLAGS_ORDER		(BIT(4) | BIT(5))
 #define  AJ_IO_FLAGS_422		1
@@ -85,20 +73,42 @@
 #define AJ_QTBL(t)			(0x1100 + 0x40 * (t))
 
 #define AJ_HWREV_MASK			0xffff0fff
+/* ADT hw-type 0x101008; its stepping nibble is masked off like T8140's. */
+#define AJ_HWREV_T6041			0x100008
 #define AJ_HWREV_T8140			0x110000
 
+struct apple_jpeg_write {
+	u32 offset;
+	u32 value;
+};
+
+/* Only the control/geometry and JPEG blocks are common to both layouts. */
+struct apple_jpeg_reg_layout {
+	u16 input_plane0, input_plane1, input_end;
+	u16 pipe_limit0, pipe_limit1;
+	u16 output_start0, output_start1, output_end;
+	u16 matrix_base;
+	u16 encode_format, component_pos_base, convert_cs;
+	u16 prefetch_read, prefetch_write, tiling;
+	u16 timeout, hwrev, image_width, image_height;
+	u16 decode_block_base;
+	u8 dma_addr_bits;
+	bool reset_complete;
+	const struct apple_jpeg_write *defaults;
+	u16 num_defaults;
+};
+
 struct apple_jpeg_variant {
+	const struct apple_jpeg_reg_layout *layout;
 	u32 hwrev_mask;
 	u32 hwrev;
+	u32 int_done_mask;
 };
 
-/* T6041 has the engine too, but its register layout is not qualified. */
-static const struct apple_jpeg_variant apple_jpeg_t6041 = { };
-
-static const struct apple_jpeg_variant apple_jpeg_t8140 = {
-	.hwrev_mask = AJ_HWREV_MASK,
-	.hwrev = AJ_HWREV_T8140,
-};
+extern const struct apple_jpeg_variant apple_jpeg_t6000;
+extern const struct apple_jpeg_variant apple_jpeg_t6041;
+extern const struct apple_jpeg_variant apple_jpeg_t8112;
+extern const struct apple_jpeg_variant apple_jpeg_t8140;
 
 static inline bool
 apple_jpeg_hwrev_supported(const struct apple_jpeg_variant *variant, u32 hwrev)
@@ -107,11 +117,6 @@ apple_jpeg_hwrev_supported(const struct apple_jpeg_variant *variant, u32 hwrev)
 		return false;
 	return (hwrev & variant->hwrev_mask) == variant->hwrev;
 }
-
-struct apple_jpeg_write {
-	u32 offset;
-	u32 value;
-};
 
 struct apple_jpeg_job {
 	u32 width;
@@ -128,13 +133,57 @@ struct apple_jpeg_job {
 	u32 restart_interval;
 };
 
+/*
+ * Raw input: one buffer, the luma rows, then the interleaved CbCr rows at
+ * the same stride (V4L2 NV12/NV16). The engine prefetches its input up to
+ * AJ_INPUT_END, so both planes must sit in one buffer that ends there: with
+ * separate plane buffers it read past the end of whichever plane lies lower
+ * and faulted. It also fetches whole MCU rows (16 for 4:2:0, 8 for 4:2:2);
+ * the luma overrun lands in the chroma rows, and the buffer carries the
+ * chroma rows up to the MCU boundary after the visible ones.
+ */
+struct apple_jpeg_layout {
+	u32 bytesperline;
+	u32 chroma_offset;
+	u32 sizeimage;
+};
+
+static inline void apple_jpeg_raw_layout(u32 width, u32 height, bool is422,
+					 struct apple_jpeg_layout *l)
+{
+	u32 rows = ALIGN(height, is422 ? 8 : 16);
+
+	l->bytesperline = ALIGN(width, 16);
+	l->chroma_offset = l->bytesperline * height;
+	l->sizeimage = l->chroma_offset + l->bytesperline * (is422 ? rows : rows / 2);
+}
+
+/* A kept CAPTURE size above the worst case is honoured up to this. */
+#define APPLE_JPEG_CODED_LIMIT		SZ_64M
+
+/*
+ * JPEG buffer size: the worst case at quality 100 plus headers, or @keep, a
+ * size already agreed with the client, when that is larger (bounded).
+ */
+static inline u32 apple_jpeg_coded_size(u32 width, u32 height, u32 keep)
+{
+	u64 need = PAGE_ALIGN((u64)width * height * 3 + SZ_16K);
+	u64 limit = max_t(u64, need, APPLE_JPEG_CODED_LIMIT);
+
+	if (keep > need)
+		need = min_t(u64, PAGE_ALIGN((u64)keep), limit);
+	return need;
+}
+
 /* Enough for the default image, the job and both quantisation tables. */
 #define APPLE_JPEG_MAX_WRITES		256
 
 void apple_jpeg_quant_tables(u32 quality, u8 luma[64], u8 chroma[64]);
 u32 apple_jpeg_timeout(u32 width, u32 height);
-int apple_jpeg_defaults(bool encode, struct apple_jpeg_write *w, unsigned int max);
-int apple_jpeg_build_job(const struct apple_jpeg_job *job, struct apple_jpeg_write *w,
+int apple_jpeg_defaults(const struct apple_jpeg_reg_layout *layout, bool encode,
+			struct apple_jpeg_write *w, unsigned int max);
+int apple_jpeg_build_job(const struct apple_jpeg_reg_layout *layout,
+			 const struct apple_jpeg_job *job, struct apple_jpeg_write *w,
 			 unsigned int max);
 
 #endif /* APPLE_JPEG_HW_H */

@@ -237,6 +237,29 @@ impl Accounting {
         self.complete(view, &[ticket.owner])
     }
 
+    /// Clears the scheduler and share rows of the QoS IDs in `ids`, which no context holds: a
+    /// released context's row otherwise keeps naming its scheduler page, which the pool may
+    /// already have given to another process's context. Rows of IDs with work in flight are
+    /// left alone and returned, for a later call once that work completed.
+    pub(crate) fn forget(&self, view: &View<'_>, ids: u128) -> u128 {
+        let mut left = 0;
+        for qos in 0..fw::QUEUES.min(128) {
+            if ids & (1u128 << qos) == 0 {
+                continue;
+            }
+            if self.in_flight.iter().zip(view.rows.iter())
+                .any(|(&count, row)| count != 0 && usize::from(row[0].load(Ordering::Relaxed)) == qos)
+            {
+                left |= 1u128 << qos;
+                continue;
+            }
+            view.scheduler[qos].store(0, Ordering::Relaxed);
+            view.share[qos].store(0, Ordering::Relaxed);
+        }
+        fence(Ordering::SeqCst);
+        left
+    }
+
     /// Preflights the entire set before clearing any final row. QID membership,
     /// scheduler mappings and monotonically increasing counts remain intact.
     pub(crate) fn complete(&mut self, view: &View<'_>, owners: &[Owner]) -> Result {

@@ -30,7 +30,7 @@
 #define MCC_CACHE_FLUSH		0x2844
 #define MCC_CACHE_FLUSH_BUSY	BIT(0)
 
-#define MCC_MAX_PLANES		16
+#define MCC_MAX_PLANES		32
 #define MCC_FLUSH_TIMEOUT_US	100000
 
 struct apple_mcc {

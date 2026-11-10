@@ -19,6 +19,7 @@
 #include <asm/asm-extable.h>
 #include <asm/byteorder.h>
 #include <asm/cpufeature.h>
+#include <asm/ctxr_execmem.h>
 #include <asm/debug-monitors.h>
 #include <asm/insn.h>
 #include <asm/text-patching.h>
@@ -2409,7 +2410,15 @@ void *bpf_arch_text_copy(void *dst, void *src, size_t len)
 
 u64 bpf_jit_alloc_exec_limit(void)
 {
-	return VMALLOC_END - VMALLOC_START;
+	/*
+	 * Under a CTXR window every JIT image comes from the window's pool, which
+	 * is tens of MiB, not the vmalloc space. Sizing the limit from the pool
+	 * keeps unprivileged programs (bpf_jit_limit defaults to half of this) from
+	 * using up the memory that module text and privileged BPF need.
+	 */
+	u64 pool = ctxr_exec_pool_bytes();
+
+	return pool ?: VMALLOC_END - VMALLOC_START;
 }
 
 /* Indicate the JIT backend supports mixing bpf2bpf and tailcalls. */

@@ -5,7 +5,7 @@
 use crate::debug::*;
 use crate::gem;
 use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use kernel::{new_mutex, prelude::*, sync::Mutex};
+use kernel::{new_mutex, prelude::*, str::BStr, sync::Mutex, task::Pid};
 
 const DEBUG_CLASS: DebugFlags = DebugFlags::Errors;
 
@@ -22,6 +22,11 @@ pub(crate) struct VmStatus {
     client_closed: AtomicBool,
     /// A failure of this VM has been logged as a warning.
     warned: AtomicBool,
+    /// A GPU recovery found this VM's work guilty.
+    recovery_guilty: AtomicBool,
+    /// The process that created the VM, named in the failure report.
+    tgid: Pid,
+    comm: [u8; 16],
     /// The client's mapped status word, retained with its object only while the
     /// client's VM handle exists; released by `release_mirror` at VM close.
     #[pin]
@@ -38,18 +43,44 @@ struct Mirror {
 unsafe impl Send for Mirror {}
 
 impl VmStatus {
+    /// Called from the creating client's ioctl: the VM records who it belongs to.
     pub(crate) fn new() -> impl PinInit<Self> {
+        let task = kernel::current!();
+        // SAFETY: `comm` is a fixed array inside the live current task. A concurrent rename by
+        // another thread of the process may tear the copy, as with C's unlocked `current->comm`.
+        let comm: [u8; 16] = unsafe {
+            core::ptr::read_volatile(core::ptr::addr_of!((*task.as_ptr()).comm).cast())
+        };
+        let tgid = task.tgid();
         pin_init!(Self {
             error: AtomicI32::new(0),
             reported_error: AtomicI32::new(0),
             client_closed: AtomicBool::new(false),
             warned: AtomicBool::new(false),
+            recovery_guilty: AtomicBool::new(false),
+            tgid,
+            comm,
             mirror <- new_mutex!(None, "Asahi VM status mirror"),
         })
     }
 
     pub(crate) fn get(&self) -> i32 {
         self.error.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn note_recovery_guilty(&self) {
+        self.recovery_guilty.store(true, Ordering::Release);
+    }
+
+    /// A GPU recovery found this VM guilty: it hung or faulted the GPU, unlike a VM that
+    /// failed only for its own client.
+    pub(crate) fn recovery_guilty(&self) -> bool {
+        self.recovery_guilty.load(Ordering::Acquire)
+    }
+
+    /// The client's VM handle is gone (`release_mirror`): the client submits nothing more.
+    pub(crate) fn client_closed(&self) -> bool {
+        self.client_closed.load(Ordering::Acquire)
     }
 
     /// Record permanent admission failure and report it to the client.
@@ -98,11 +129,14 @@ impl VmStatus {
                 );
             }
         } else if !self.warned.swap(true, Ordering::AcqRel) {
+            let len = self.comm.iter().position(|&b| b == 0).unwrap_or(self.comm.len());
             pr_warn!(
-                "GPU work of a client failed ({:?}, reported at {}:{}); the client sees a lost device\n",
+                "GPU work of a client failed ({:?}, reported at {}:{}, client {}[{}]); the client sees a lost device\n",
                 error,
                 file,
-                at.line()
+                at.line(),
+                BStr::from_bytes(&self.comm[..len]),
+                self.tgid
             );
         }
         let error = match first {
@@ -159,10 +193,16 @@ impl VmStatus {
         Ok(())
     }
 
+    /// The client closed its DRM file: nobody sees the teardown errors of its queued work any
+    /// more, even before its VM handle goes (the file drops its queues first).
+    pub(crate) fn mark_client_closed(&self) {
+        self.client_closed.store(true, Ordering::Release);
+    }
+
     /// The client's VM handle is gone and nobody reads the mirror any more. The
     /// mapping and object reference drop outside the mutex (GEM release may sleep).
     pub(crate) fn release_mirror(&self) {
-        self.client_closed.store(true, Ordering::Release);
+        self.mark_client_closed();
         let taken = self.mirror.lock().take();
         drop(taken);
     }
@@ -187,6 +227,20 @@ mod tests {
         assert!(!status.unobserved_teardown(ETIMEDOUT));
         assert!(!status.unobserved_teardown(EIO));
         assert!(!status.unobserved_teardown(ENODEV));
+    }
+
+    #[test]
+    fn a_closing_file_hides_teardown_errors_before_its_vm_goes() {
+        let Ok(status) = KBox::pin_init(VmStatus::new(), GFP_KERNEL) else {
+            panic!("allocation failed");
+        };
+        status.mark_client_closed();
+        assert!(status.unobserved_teardown(ENOENT));
+        assert!(status.unobserved_teardown(ECANCELED));
+        assert!(!status.unobserved_teardown(ETIMEDOUT));
+        status.report_failure(ENOENT);
+        assert!(!status.warned.load(Ordering::Acquire));
+        assert!(status.mirror.lock().is_none());
     }
 
     #[test]

@@ -381,6 +381,12 @@ static int tb_drom_parse_entry_port(struct tb_switch *sw,
 		return 0;
 
 	res = tb_port_read(port, &type, TB_CFG_PORT, 2, 1);
+	/* Listed, but not implemented by this router: skip it as well */
+	if (res == -ENODEV) {
+		tb_sw_dbg(sw, "DROM entry for unimplemented port %u ignored\n",
+			  header->index);
+		return 0;
+	}
 	if (res)
 		return res;
 	type &= 0xffffff;

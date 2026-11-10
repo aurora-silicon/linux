@@ -210,6 +210,21 @@ impl ObjectRef {
 
         vm.map_at(addr, self.gem.size(), &self.gem, prot, guard)
     }
+
+    /// Map at a specific address, reserving `guard_pages` unmapped pages
+    /// after the object in that Vm's allocator (T8152, module 1134).
+    #[cfg(CONFIG_DRM_ASAHI_G18)]
+    pub(crate) fn map_at_with_guards(
+        &mut self,
+        vm: &crate::mmu::Vm,
+        addr: u64,
+        prot: mmu::Prot,
+        guard_pages: usize,
+    ) -> Result<crate::mmu::KernelMapping> {
+        validate_vm_binding(&self.gem, vm)?;
+
+        vm.map_at_with_guards(addr, self.gem.size(), &self.gem, prot, guard_pages)
+    }
 }
 
 pub(crate) struct AsahiObjConfig {
@@ -221,7 +236,7 @@ pub(crate) struct AsahiObjConfig {
 
 /// Create a new kernel-owned GEM object.
 pub(crate) fn new_kernel_object(dev: &AsahiDrmDevice, size: usize) -> Result<ObjectRef> {
-    new_kernel_object_mapped(dev, size, false)
+    new_kernel_object_mapped(dev, size, false, true)
 }
 
 /// Create a new kernel-owned GEM object whose kernel mapping is write-combined.
@@ -229,7 +244,17 @@ pub(crate) fn new_kernel_object(dev: &AsahiDrmDevice, size: usize) -> Result<Obj
 /// Used for memory that a non-coherent agent reads as soon as the host has stored to it and
 /// issued a barrier, without cache maintenance.
 pub(crate) fn new_kernel_object_wc(dev: &AsahiDrmDevice, size: usize) -> Result<ObjectRef> {
-    new_kernel_object_mapped(dev, size, true)
+    new_kernel_object_mapped(dev, size, true, true)
+}
+
+/// Create a new kernel-owned write-combined GEM object that is not counted as kernel memory:
+/// its owner holds a user charge for it ([`memacct::Charge::user`]), and counting both would
+/// take its size twice from the device limit.
+pub(crate) fn new_kernel_object_wc_user_charged(
+    dev: &AsahiDrmDevice,
+    size: usize,
+) -> Result<ObjectRef> {
+    new_kernel_object_mapped(dev, size, true, false)
 }
 
 /// Validate before rounding: wrapping a user size can create a much smaller
@@ -244,8 +269,18 @@ pub(crate) fn checked_object_size(size: usize) -> Result<usize> {
         .ok_or(EOVERFLOW)
 }
 
-fn new_kernel_object_mapped(dev: &AsahiDrmDevice, size: usize, map_wc: bool) -> Result<ObjectRef> {
+fn new_kernel_object_mapped(
+    dev: &AsahiDrmDevice,
+    size: usize,
+    map_wc: bool,
+    kernel_charge: bool,
+) -> Result<ObjectRef> {
     let size = checked_object_size(size)?;
+    let charge = if kernel_charge {
+        memacct::Charge::kernel(&memacct::LEDGER, size as u64)
+    } else {
+        memacct::Charge::none()
+    };
     let gem = shmem::Object::<AsahiObject>::new(
         dev,
         size,
@@ -259,7 +294,7 @@ fn new_kernel_object_mapped(dev: &AsahiDrmDevice, size: usize, map_wc: bool) -> 
             flags: 0,
             exportable: false,
             kernel: true,
-            charge: memacct::Charge::kernel(&memacct::LEDGER, size as u64),
+            charge,
         },
     )?;
 
@@ -395,6 +430,12 @@ impl Drop for KernelMappingPin {
 }
 
 impl AsahiObject {
+    /// Whether this is a kernel-created object.
+    #[cfg(CONFIG_DRM_ASAHI_G18)]
+    pub(crate) fn is_kernel(&self) -> bool {
+        self.kernel
+    }
+
     /// Whether CPU mappings use the cacheable WRITEBACK policy.
     pub(crate) fn is_writeback(&self) -> bool {
         self.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_WRITEBACK != 0

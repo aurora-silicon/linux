@@ -1,0 +1,516 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * MacBook Pro (14-inch, M5 Pro, 2026)
+ *
+ * target-type: J714s
+ *
+ * One T6050 die (t6050-max.dtsi). Beyond the SoC this file adds the board's
+ * hardware inventory (t6050-peripherals.dtsi) from the board's ADT, disabled
+ * except for the PMP below.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/leds/common.h>
+#include "t6050-max.dtsi"
+
+/* The console on the USB debug link: ADT dockchannel-uart, channel 1 */
+/ {
+	aliases {
+		serial0 = &dockchannel;
+	};
+
+	chosen {
+		stdout-path = "serial0:1500000n8";
+	};
+};
+
+/*
+ * It drains only while a host reads it; the machine also boots with nothing
+ * attached there.
+ */
+&dockchannel {
+	apple,tx-never-wait;
+	status = "okay";
+};
+
+/ {
+	compatible = "apple,j714s", "apple,t6050", "apple,arm-platform";
+	model = "Apple MacBook Pro (14-inch, M5 Pro, 2026)";
+	chassis-type = "laptop";
+
+	aliases {
+		/* the boot loader reserves the SEP firmware and adds its manifests through this alias */
+		sep = &sep;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>; /* To be filled by the loader */
+			/* Format properties will be added by the loader */
+			status = "disabled";
+		};
+	};
+};
+
+/*
+ * PCIe port 0: the N1 (Wi-Fi and Bluetooth), as on J716s. ADT apcie0 gives port
+ * 0's registers and IRQ 1523, and pci-bridge0's PERST# is GPIO 80; the N1's three
+ * functions are on DART streams 1-3. The boot loader trains the link and then
+ * enables port 0 and its DART. Port 1 is the SD reader, not described yet.
+ */
+/ {
+	aliases {
+		/* The loader fills the N1's factory addresses through these */
+		wifi0 = &n1_alpha;
+		bluetooth0 = &n1_beta;
+	};
+};
+
+&pcie0 {
+	reg = <0x1c 0xb0000000 0x0 0x10000000>,
+	      <0x4 0x14000000 0x0 0x4000>,
+	      <0x4 0x10028000 0x0 0x8000>,
+	      <0x4 0x17010000 0x0 0x4000>,
+	      <0x4 0x10024000 0x0 0x4000>;
+	reg-names = "config", "rc", "port0", "phy0", "intr2axi0";
+	interrupts = <AIC_IRQ 0 1523 IRQ_TYPE_LEVEL_HIGH>;
+	interrupt-names = "port0";
+	iommu-map = <0x100 &dart_apcie0 1 3>;
+	bus-range = <0 4>;
+	status = "okay";
+
+	port00: pci@0,0 {
+		device_type = "pci";
+		reg = <0x0 0 0 0 0>;
+		bus-range = <1 1>;
+		apple,link-trained-by-bootloader;
+		/* PERST#: ADT pci-bridge0 function-perst, GPIO 80 */
+		reset-gpios = <&pinctrl_ap 80 GPIO_ACTIVE_LOW>;
+		status = "disabled";
+
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupt-map-mask = <0 0 0 7>;
+		interrupt-map = <0 0 0 1 &port00 0 0 0 0>,
+				<0 0 0 2 &port00 0 0 0 1>,
+				<0 0 0 3 &port00 0 0 0 2>,
+				<0 0 0 4 &port00 0 0 0 3>;
+
+		/* platform ID (ADT /chosen board-id 0x08 << 16) | chip 0x6050 */
+		n1_control: control@0,0 {
+			compatible = "pci106b,1900";
+			reg = <0x10000 0x0 0x0 0x0 0x0>;
+			firmware-name = "apple/centauri/j714s-ftab.bin";
+			apple,centauri-platform-id = <0x00086050>;
+			apple,centauri-protocol = <27>;
+		};
+
+		n1_alpha: wifi@0,1 {
+			compatible = "pci106b,1902";
+			reg = <0x10100 0x0 0x0 0x0 0x0>;
+			local-mac-address = [00 00 00 00 00 00];
+		};
+
+		n1_beta: bluetooth@0,2 {
+			compatible = "pci106b,1903";
+			reg = <0x10200 0x0 0x0 0x0 0x0>;
+			local-bd-address = [00 00 00 00 00 00];
+		};
+	};
+};
+
+/*
+ * Pin 112 takes an SError when read (as on J716c and J716s), so only the pin a
+ * node here names is exposed: 80, PCIe port 0's PERST#.
+ */
+&pinctrl_ap {
+	gpio-reserved-ranges = <0 80>, <81 140>;
+};
+
+/* The keyboard backlight: ADT pwm0/kbd-backlight, channel 0 at 25 kHz */
+/ {
+	aliases {
+		/* The loader fills the keyboard layout from the ADT's keyboard node */
+		keyboard = &keyboard;
+	};
+
+	led-controller {
+		compatible = "pwm-leds";
+
+		led-0 {
+			pwms = <&fpwm0 0 40000>;
+			label = "kbd_backlight";
+			function = LED_FUNCTION_KBD_BACKLIGHT;
+			color = <LED_COLOR_ID_WHITE>;
+			max-brightness = <255>;
+			default-state = "keep";
+		};
+	};
+};
+
+&fpwm0 {
+	status = "okay";
+};
+
+/*
+ * The keyboard and trackpad: the HID transport on the MTP's DockChannel FIFO
+ * (ADT dockchannel-mtp/mtp-transport: multi-touch, keyboard, stm, actuator,
+ * tp-accel), as on J716s.
+ */
+&mtp_dockchannel {
+	mtp_hid: input@8000 {
+		compatible = "apple,dockchannel-hid";
+		reg = <0x8000 0x1000>, <0xc000 0x1000>,
+		      <0x0 0x1000>, <0x4000 0x1000>;
+		reg-names = "config", "data", "rmt-config", "rmt-data";
+		iommus = <&mtp_dart 0>;
+		interrupt-parent = <&mtp_dockchannel>;
+		interrupts = <2 IRQ_TYPE_LEVEL_HIGH>,
+			     <3 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "tx", "rx";
+		apple,fifo-size = <0x800>;
+		apple,helper-cpu = <&mtp>;
+		/*
+		 * ADT mtp function-afe-reset is the SMC pcIO template (0x10000, 0x11c0000),
+		 * the same line as SMC GPIO gp1c, active low, which gpio-macsmc drives.
+		 */
+		apple,afe-reset-gpios = <&smc_gpio_low 28 GPIO_ACTIVE_LOW>;
+
+		multi-touch {
+			apple,power-method = <2>;
+			firmware-name = "apple/tpmtfw-j714s.bin";
+		};
+
+		keyboard: keyboard {
+			hid-country-code = <0>;
+			apple,keyboard-layout-id = <0>;
+		};
+
+		stm {
+		};
+
+		actuator {
+		};
+
+		tp-accel {
+		};
+	};
+};
+
+/* Nothing here drives the SMC pcIO outputs, and the AFE reset above uses gp1c */
+/delete-node/ &smc_pcio;
+
+#define T6050_J714S
+#include "t6050-peripherals.dtsi"
+
+/*
+ * Type-C, from the ADT:
+ *   ATC0 usb-drd0 left-back  hpm0 nub-spmi-a0 0x0c (the debug port, not described)
+ *   ATC1 usb-drd1 left-front hpm1 nub-spmi-a0 0x0a
+ *   ATC2 usb-drd2 right      hpm2 nub-spmi-a1 0x0c
+ *   hpm5 nub-spmi-a0 0x08 (MagSafe, not a USB-C connector)
+ * There is no usb-drd3 and no nub-spmi-a2, so ATC3's USB chain and that bus stay
+ * off. Both described ports are wired as on J716s.
+ */
+&atc3_phy_mbox {
+	status = "disabled";
+};
+
+&atc3_phy {
+	status = "disabled";
+};
+
+&usb_drd3 {
+	status = "disabled";
+};
+
+&usb_drd3_dart_0 {
+	status = "disabled";
+};
+
+&usb_drd3_dart_1 {
+	status = "disabled";
+};
+
+&nub_spmi_a2 {
+	status = "disabled";
+};
+
+/* Left-front port (ATC1): the SN201202x hpm1 and the connector graph */
+&nub_spmi_a0 {
+	hpm1: usb-pd@a {
+		compatible = "apple,sn201202x";
+		reg = <0xa SPMI_USID>;
+
+		typec1: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Left-front";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec1_hs: endpoint {
+						remote-endpoint = <&usb_drd1_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec1_ss: endpoint {
+						remote-endpoint = <&atc1_phy_typec>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&usb_drd1 {
+	port {
+		usb_drd1_hs: endpoint {
+			remote-endpoint = <&typec1_hs>;
+		};
+	};
+};
+
+&atc1_phy {
+	port {
+		atc1_phy_typec: endpoint {
+			remote-endpoint = <&typec1_ss>;
+		};
+	};
+};
+
+/*
+ * Right port (ATC2): hpm2 on nub-spmi-a1, USB only (dcpext0's DisplayPort route
+ * through ATC2 stays off). The inventory's nub-spmi-a1 has the generation 4 bus's
+ * three register windows and IRQ (ADT nub-spmi-a1); the driver polls it and
+ * refuses an interrupt, so it takes the first window only, as on J716s.
+ */
+&nub_spmi_a1 {
+	reg = <0x2 0x8a1a8000 0x0 0x4000>;
+	/delete-property/ interrupts;
+	status = "okay";
+
+	hpm2: usb-pd@c {
+		compatible = "apple,sn201202x";
+		reg = <0xc SPMI_USID>;
+
+		typec2: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Right";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec2_hs: endpoint {
+						remote-endpoint = <&usb_drd2_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec2_ss: endpoint {
+						remote-endpoint = <&atc2_phy_typec>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&ps_atc2_common {
+	status = "okay";
+};
+
+&ps_atc2_usb_aon {
+	status = "okay";
+};
+
+&ps_atc2_phymxwrap {
+	status = "okay";
+};
+
+&ps_atc2_usb {
+	status = "okay";
+};
+
+&atc2_phy_mbox {
+	status = "okay";
+};
+
+&atc2_phy {
+	status = "okay";
+
+	port {
+		atc2_phy_typec: endpoint {
+			remote-endpoint = <&typec2_ss>;
+		};
+	};
+};
+
+&usb_drd2 {
+	status = "okay";
+
+	port {
+		usb_drd2_hs: endpoint {
+			remote-endpoint = <&typec2_hs>;
+		};
+	};
+};
+
+&usb_drd2_dart_0 {
+	status = "okay";
+};
+
+&usb_drd2_dart_1 {
+	status = "okay";
+};
+
+/*
+ * The PMP (ADT pmp0, /chosen, /arm-io/pmgr). iBoot loads its firmware and the driver starts it
+ * with these boot arguments and the firmware properties below. Its report tells it which devices
+ * are on; it then votes DCS and the fabric for GPU load itself, and the PMC honours that next
+ * to the CLPC. The report, the PMP's vote and the GPU's request are enabled together, so the
+ * GPU never waits on a disabled report.
+ */
+&ps_pms {
+	status = "okay";
+};
+
+&ps_pmp {
+	status = "okay";
+};
+
+&ps_pms_sram {
+	status = "okay";
+};
+
+&pmp0_dart {
+	status = "okay";
+};
+
+&pmp0_mbox {
+	status = "okay";
+};
+
+&pmp0 {
+	/* ADT /chosen board-id, dram-vendor-id */
+	apple,board-id = <8>;
+	apple,dram-vendor-id = <255>;
+	/* ADT /arm-io/pmgr pmc, pmc-pmgr */
+	apple,pmc = <1>;
+	apple,pmc-pmgr = <63>;
+	status = "okay";
+};
+
+&pmp0_report {
+	status = "okay";
+};
+
+&pmc {
+	/* PMP, CLPC and AP agents, once the PMP runs */
+	apple,static-voters = <0 1 3>;
+	apple,pmp = <&pmp0>;
+};
+
+&sgx {
+	power-domains = <&pmp0_gfx>;
+};
+
+/*
+ * The SEP (ADT sep, dart-sep): its mailbox, and its power domain with the two
+ * fabric parents left to the firmware, which genpd votes on and never turns off.
+ * The boot loader enables the SEP itself through its alias.
+ */
+&sep_mbox {
+	status = "okay";
+};
+
+&ps_sep {
+	status = "okay";
+};
+
+&ps_fab8_soc {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_fab0_piogw {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+#include "t6050-j714s-pmp-tunables.dtsi"
+
+/*
+ * SMC sensors, as on J716s: the shared fan, power, voltage and current keys, plus
+ * every readable float T* key through apple,discover-temperatures in
+ * t6050-die0.dtsi, labelled with the key name. A key this SMC lacks only drops
+ * its channel.
+ *
+ * Discovery refuses to run once any temperature channel exists, so the shared
+ * temperature nodes go (their keys are discovered anyway), and so does
+ * apple,soc-die-keys, whose channel would also count. Only the macsmc_soc_die
+ * thermal zone is lost.
+ */
+#include "hwmon-common.dtsi"
+#include "hwmon-fan-dual.dtsi"
+#include "hwmon-laptop.dtsi"
+
+&smc_hwmon {
+	/delete-property/ apple,soc-die-keys;
+	/delete-node/ temperature-TH0x;
+	/delete-node/ temperature-TB0T;
+	/delete-node/ temperature-TCHP;
+	/delete-node/ temperature-TW0P;
+
+	/* The T6050 SMC spells the fan mode keys F0md/F1md. The SMC drives the fans. */
+	fan-F0Ac {
+		apple,fan-mode = "F0md";
+	};
+
+	fan-F1Ac {
+		apple,fan-mode = "F1md";
+	};
+};
+
+/* The same T6050 camera as J716c (J714sAP ADT); the loader sets the J714s sensor type. */
+#include "t6050-j716c-isp.dtsi"
+
+/* The GPU and the internal panel, for the boot loader's handoff */
+#include "t6050-j714s-gpu-panel.dtsi"
+
+/*
+ * Audio is not brought up: ADT i2c1 has the left sn012776 amplifiers and i2c2 the
+ * cs42l84 codec, so both buses stay off.
+ */
+&i2c1 {
+	status = "disabled";
+};
+
+&i2c2 {
+	status = "disabled";
+};

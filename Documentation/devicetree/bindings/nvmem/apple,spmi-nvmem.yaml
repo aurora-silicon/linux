@@ -20,13 +20,25 @@ properties:
       - enum:
           - apple,abbey-pmic
           - apple,baku-pmic
+          - apple,chapel-pmic
           - apple,maverick-pmic
+          - apple,mirabeau-pmic
+          - apple,monaco-pmic
           - apple,sera-pmic
+          - apple,simetra-pmic
           - apple,stowe-pmic
+          - apple,vale-pmic
       - const: apple,spmi-nvmem
 
   reg:
     maxItems: 1
+
+  interrupts:
+    maxItems: 1
+    description: Native event in the SPMI interrupt domain.
+
+  battery-monitor:
+    $ref: /schemas/power/supply/apple,battery-monitor.yaml#
 
   rtc:
     $ref: /schemas/rtc/apple,j700-pmu-rtc.yaml#

@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/misc/apple,spmi-all-ace.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple SPMI Type-C control companion
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  SPMI companion endpoint alongside the Type-C port controllers. It
+  remains firmware-owned and is distinct from the per-port HPM followers.
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t8140-spmi-all-ace
+      - const: apple,spmi-all-ace
+
+  reg:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false

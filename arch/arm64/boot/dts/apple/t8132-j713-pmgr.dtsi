@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * J713 power-domain ownership.
+ * J713 and J715 power-domain ownership, also used by the legacy-loader
+ * adapter (drivers/soc/apple/t8132-platform-data.dts).
  *
- * Only the domains whose Linux power/reset contract is qualified are enabled.
- * Retained core, GPIO and display domains are firmware-owned: neither state
- * reads nor power/reset writes are permitted. Other domains stay unavailable
- * until their consumer and power sequence are implemented. This board policy
- * is also used by the adapter for the original J713 loader tree.
+ * Only domains with a qualified Linux power/reset contract are enabled.
+ * Retained core, GPIO and display domains are firmware-owned: no state
+ * reads and no power/reset writes. The board tree enables ps_gfx and the
+ * ATC0/ATC1 PCIe and CIO domains afterwards for the GPU and USB4; the
+ * adapter enables only ps_gfx.
+ *
+ * Copyright The Asahi Linux Contributors
  */
 
 &ps_msg {
@@ -14,8 +17,8 @@
 };
 
 &ps_aic {
-	status = "okay";
 	apple,firmware-owned;
+	status = "okay";
 };
 
 &ps_dwi {
@@ -23,8 +26,8 @@
 };
 
 &ps_gpio {
-	status = "okay";
 	apple,firmware-owned;
+	status = "okay";
 };
 
 &ps_pmc {
@@ -63,6 +66,14 @@
 	status = "disabled";
 };
 
+&ps_ispsens0 {
+	status = "okay";
+};
+
+&ps_ispsens1 {
+	status = "okay";
+};
+
 &ps_pmgr_soc_ocla {
 	status = "disabled";
 };
@@ -72,18 +83,18 @@
 };
 
 &ps_dispext0_sys {
-	status = "okay";
 	apple,firmware-owned;
+	status = "okay";
 };
 
 &ps_dispext0_fe {
-	status = "okay";
 	apple,firmware-owned;
+	status = "okay";
 };
 
 &ps_dispext0_cpu {
-	status = "okay";
 	apple,firmware-owned;
+	status = "okay";
 };
 
 &ps_scodec {
@@ -94,14 +105,17 @@
 	status = "disabled";
 };
 
+/* The DCP powers these down while the display is off. */
 &ps_disp_sys {
-	status = "okay";
 	apple,firmware-owned;
+	apple,consumer-switched;
+	status = "okay";
 };
 
 &ps_disp_fe {
-	status = "okay";
 	apple,firmware-owned;
+	apple,consumer-switched;
+	status = "okay";
 };
 
 &ps_gfx {
@@ -199,7 +213,7 @@
 };
 
 &ps_spi2 {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_spi3 {
@@ -371,21 +385,21 @@
 };
 
 &ps_dispext1_sys {
-	status = "okay";
 	apple,firmware-owned;
+	status = "okay";
 };
 
 &ps_dispext1_fe {
-	status = "okay";
 	apple,firmware-owned;
+	status = "okay";
 };
 
 &ps_dispext1_cpu {
-	status = "okay";
 	apple,firmware-owned;
+	status = "okay";
 };
 
-/* No camera driver yet; genpd powers the ISP down as an unused domain. */
+/* The camera powers the ISP from its first stream until it is unbound. */
 &ps_isp_sys {
 	status = "okay";
 };
@@ -430,6 +444,58 @@
 	status = "disabled";
 };
 
+&ps_isp_cpu {
+	status = "okay";
+};
+
+&ps_isp_cpu_core0 {
+	status = "okay";
+};
+
+&ps_isp_cpu_core1 {
+	status = "okay";
+};
+
+&ps_isp_fe {
+	status = "okay";
+};
+
+&ps_isp_dprx {
+	status = "okay";
+};
+
+&ps_isp_secure {
+	status = "okay";
+};
+
+&ps_isp_sts0 {
+	status = "okay";
+};
+
+&ps_isp_sts1 {
+	status = "okay";
+};
+
+&ps_isp_pearl {
+	status = "okay";
+};
+
+&ps_isp_be {
+	status = "okay";
+};
+
+&ps_isp_clr {
+	status = "okay";
+};
+
+&ps_isp_cvd {
+	status = "okay";
+};
+
+&ps_isp_cvm {
+	status = "okay";
+};
+
 &ps_venc_dma {
 	status = "disabled";
 };
@@ -467,8 +533,11 @@
 };
 
 &ps_disp_cpu {
-	status = "okay";
 	apple,firmware-owned;
+	apple,consumer-switched;
+	/* Power-gate retention workaround, as macOS sets it while off. */
+	apple,retention-workaround = <0x2504c 0x3 0x3>, <0x25070 0x1 0x0>;
+	status = "okay";
 };
 
 &ps_debug_gated {
@@ -500,8 +569,8 @@
 };
 
 &ps_nub_gpio {
-	status = "okay";
 	apple,firmware-owned;
+	status = "okay";
 };
 
 &ps_nub_sram {
@@ -513,13 +582,13 @@
 };
 
 &ps_atc0_usb_aon {
-	status = "okay";
 	apple,inherited-on;
+	status = "okay";
 };
 
 &ps_atc1_usb_aon {
-	status = "okay";
 	apple,inherited-on;
+	status = "okay";
 };
 
 &ps_atc0_usb {

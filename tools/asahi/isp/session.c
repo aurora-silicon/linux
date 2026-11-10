@@ -170,6 +170,9 @@ static void isp_firmware_shutdown_stage2(struct apple_isp *isp)
 	++order;
 }
 
+/* This harness models command/session lifetime, not firmware memory. */
+static void isp_restore_fw_memory(struct apple_isp *isp) {}
+
 static void isp_collect_gc_surface(struct apple_isp *isp)
 {
 	++order;

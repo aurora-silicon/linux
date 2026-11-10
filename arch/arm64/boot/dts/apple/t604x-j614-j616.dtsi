@@ -109,8 +109,8 @@
 		 */
 		gpu_fw_text: gpu-fw-text {
 			reg = <0 0 0 0>;
-			status = "disabled";
 			no-map;
+			status = "disabled";
 		};
 
 		/*
@@ -119,8 +119,8 @@
 		 */
 		gpu_fw_data: gpu-fw-data {
 			reg = <0 0 0 0>;
-			status = "disabled";
 			no-map;
+			status = "disabled";
 		};
 
 		/*
@@ -130,26 +130,26 @@
 		 */
 		uat_ttbs: uat-ttbs {
 			reg = <0 0 0 0>;
-			status = "disabled";
 			no-map;
+			status = "disabled";
 		};
 
 		uat_pagetables: uat-pagetables {
 			reg = <0 0 0 0>;
-			status = "disabled";
 			no-map;
+			status = "disabled";
 		};
 
 		uat_l2_pagetables: uat-l2-pagetables {
 			reg = <0 0 0 0>;
-			status = "disabled";
 			no-map;
+			status = "disabled";
 		};
 
 		uat_handoff: uat-handoff {
 			reg = <0 0 0 0>;
-			status = "disabled";
 			no-map;
+			status = "disabled";
 		};
 	};
 
@@ -169,1460 +169,20 @@
 			max-brightness = <255>;
 		};
 	};
+};
 
+/* GPU operating points, thermal zones and the sensors they read */
+#include "t6040-gpu-thermal.dtsi"
+
+/ {
 	/*
-	 * GPU performance states, one opp-microvolt cell per cluster (ADT
-	 * /arm-io/sgx perf-states and perf-states1). The operating points are
-	 * binned per device: the loader fills these placeholders.
-	 * The driver requires a completed calibration handoff. Entries keep the
-	 * order of the GPU performance states, which is not sorted by frequency.
+	 * The boot NOR runs from a PMU rail that is on whenever the SoC is
+	 * and that no OS switches. The ADT gives the flash no supply.
 	 */
-	gpu_opp: opp-table-gpu {
-		compatible = "operating-points-v2";
-
-		opp00 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0 0>;
-		};
-		opp01 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0 0>;
-		};
-		opp02 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0 0>;
-		};
-		opp03 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0 0>;
-		};
-		opp04 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0 0>;
-		};
-		opp05 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0 0>;
-		};
-		opp06 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0 0>;
-		};
-		opp07 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0 0>;
-		};
-		opp08 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0 0>;
-		};
-		opp09 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0 0>;
-		};
-		opp10 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0 0>;
-		};
-		opp11 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0 0>;
-		};
-		opp12 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0 0>;
-		};
-		opp13 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0 0>;
-		};
-		opp14 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0 0>;
-		};
-		opp15 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0 0>;
-		};
-	};
-
-	/* The GPU's CS clock domain (ADT cs-perf-states) */
-	gpu_cs_opp: opp-table-gpucs {
-		compatible = "operating-points-v2";
-
-		opp00 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0>;
-		};
-		opp01 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0>;
-		};
-		opp02 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0>;
-		};
-		opp03 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0>;
-		};
-		opp04 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0>;
-		};
-		opp05 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0>;
-		};
-		opp06 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0>;
-		};
-		opp07 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0>;
-		};
-	};
-
-	/* The GPU's AFR clock domain (ADT afr-perf-states) */
-	gpu_afr_opp: opp-table-gpuafr {
-		compatible = "operating-points-v2";
-
-		opp00 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0>;
-		};
-		opp01 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0>;
-		};
-		opp02 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0>;
-		};
-		opp03 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0>;
-		};
-		opp04 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0>;
-		};
-		opp05 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0>;
-		};
-		opp06 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0>;
-		};
-		opp07 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <0>;
-		};
-	};
-
-	/*
-	 * CPU die temperature: SMC key TCMz (CPU die max), sensor 0 of
-	 * smc_hwmon, polled once a second as the SMC refreshes it. Per-cluster
-	 * and GPU zones follow, one per SMC die-maximum sensor (smc_hwmon
-	 * channels 1-23, in the order of the temperature nodes below): Tex0-3
-	 * throttle the E cluster, Tpx0-5 the first P cluster and Tpx8-D the
-	 * second. The die zone throttles all three. The cpufreq cooling device
-	 * sits on a cluster's policy CPU, so each map lists every CPU of its
-	 * cluster.
-	 *
-	 * The fast control is the PMP's, as on macOS: its loop holds its own
-	 * hot-spot sensors at the ADT fast-die-ctrl-loop target of 110 C and
-	 * cpufreq enforces its effort as a frequency limit within milliseconds.
-	 * Under a sustained all-core build TCMz then settles at 113 to 114 C.
-	 * The CPU zones are the slower backstop above that point: the power
-	 * allocator switches on at 75 C and controls at 115 C, so it leaves the
-	 * PMP's operating point alone and only trims what the PMP lets through.
-	 *
-	 * The PMP's sensors do not see every hot spot. Under mixed SIMD,
-	 * memory and GPU load the per-core Tpx sensors follow a core's power
-	 * within a second and jump by 9-10 C (one standard deviation) between
-	 * 1 s samples while the PMP's effort stays at zero. A controller on
-	 * these samples cannot stop single excursions, and a proportional one
-	 * swings between no limit and full cooling every second, so the zones
-	 * are integral-led: the wide 40 C switch-on window keeps the
-	 * proportional gains low and integral-time-constant-ms sets the
-	 * integral term. Each zone throttles only the cluster its sensor sits
-	 * on: the allocator divides a zone's budget by requested power, so a
-	 * zone that throttled every cluster left a hot core's own cluster
-	 * nearly at full speed.
-	 *
-	 * Critical (orderly shutdown) is at 125 C, the per-sensor maximum the
-	 * ADT temp-sensor table gives next to the 110 C target for the PMP's
-	 * sensors (the sochot level). The SMC sensors read a few degrees above
-	 * the PMP's, so Linux shuts down at or before the hardware's own limit.
-	 * A hot trip at 120 C only reports, and the critical trip acts only
-	 * after three consecutive samples at or above it (critical-samples),
-	 * so one excursion cannot shut the machine down. Under any load the
-	 * per-core excursions have peaked at 116.5-118 C, which the former
-	 * 118 C critical trip turned into a shutdown.
-	 *
-	 * The GPU has no cooling device of its own: its firmware sets the GPU
-	 * performance state and starts limiting at 101 C. So when a GPU die
-	 * sensor reaches the GPU firmware's limit, the seven
-	 * hottest ones (Tg05, Tg0S, Tg0Y, Tg0k, Tg0z, Tg1V, Tg1l) also shed
-	 * CPU power through the CPU clusters, from the same 101 C, leaving the
-	 * shared heat budget to the GPU. They shut down at 118 C. While the
-	 * GPU is powered off its sensors report placeholder values from -4 to
-	 * 4 C.
-	 *
-	 * Every zone runs the power allocator, which acts at any temperature
-	 * unless a zone has a second passive trip: the first one is then its
-	 * switch-on point, below which it resets and grants full power. So each
-	 * zone has one: 75 C under the 115 C die and CPU control trip and 90 C
-	 * under the GPU zones' 101 C one. Without them the GPU zones, whose
-	 * placeholder readings never warm up, held all 14 CPUs to about 7.5 W
-	 * (1.26/1.02/1.26 GHz) under any all-core load. The GPU zones also
-	 * carry the die's sustainable power rather than the allocator's
-	 * estimate from the lowest CPU states (about 2.6 W).
-	 *
-	 * The fans stay with the SMC, as on macOS: macOS writes no SMC key at
-	 * runtime and its fans run in the SMC's own mode, which ramps them
-	 * under sustained load. No zone has active trips; the hwmon fans stay
-	 * cooling devices for userspace and manual control.
-	 *
-	 * sustainable-power is what the CPUs dissipate with the die held at
-	 * its operating point: 720 s of all-core load (10 P, 4 E busy loops),
-	 * headless, SMC fans in their own mode. Over the last 600 s TCMz held
-	 * 112.0 to 113.8 C with the PMP limiting the P clusters to a mean of
-	 * about 3.7 GHz and the fans at 3450/3730 rpm (where macOS settles
-	 * too). The SMC core rails then read P0 25.3 W, P1 23.9 W and E 2.1 W
-	 * on average, the units of the energy model. Each zone gets the sum
-	 * over the clusters it throttles. Without it the power allocator
-	 * estimates a budget from the cooling devices' lowest states, which
-	 * throttles far below what this machine sustains.
-	 *
-	 * All of these values were measured on the J616s. The J614s inherits
-	 * them until it is measured: Apple's package power limits for it are
-	 * about 78% (CPU) and 90% (GPU) of the J616s ones, so its budgets are
-	 * generous here, and these zones are a backstop behind the PMP.
-	 */
-	thermal-zones {
-		cpu-die-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
-			integral-time-constant-ms = <20000>;
-			critical-samples = <3>;
-			sustainable-power = <51300>;
-			thermal-sensors = <&smc_hwmon 0>;	/* TCMz */
-
-			trips {
-				cpu_die_switch_on: cpu-die-switch-on {
-					temperature = <75000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				cpu_die_passive: cpu-die-passive {
-					temperature = <115000>;
-					hysteresis = <5000>;
-					type = "passive";
-				};
-
-				cpu-die-hot {
-					temperature = <120000>;
-					hysteresis = <2000>;
-					type = "hot";
-				};
-
-				cpu-die-critical {
-					temperature = <125000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
-			};
-
-			cooling-maps {
-				map-e {
-					trip = <&cpu_die_passive>;
-					cooling-device =
-						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-
-				map-p0 {
-					trip = <&cpu_die_passive>;
-					cooling-device =
-						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-
-				map-p1 {
-					trip = <&cpu_die_passive>;
-					cooling-device =
-						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
-
-		cpu-e0-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
-			integral-time-constant-ms = <20000>;
-			critical-samples = <3>;
-			sustainable-power = <2100>;
-			thermal-sensors = <&smc_hwmon 1>;	/* Tex0 */
-
-			trips {
-				cpu_e0_switch_on: trip-switch-on {
-					temperature = <75000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				cpu_e0_passive: trip-passive {
-					temperature = <115000>;
-					hysteresis = <5000>;
-					type = "passive";
-				};
-
-				trip-hot {
-					temperature = <120000>;
-					hysteresis = <2000>;
-					type = "hot";
-				};
-
-				trip-critical {
-					temperature = <125000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
-			};
-
-			cooling-maps {
-				map-e {
-					trip = <&cpu_e0_passive>;
-					cooling-device =
-						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
-
-		cpu-e1-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
-			integral-time-constant-ms = <20000>;
-			critical-samples = <3>;
-			sustainable-power = <2100>;
-			thermal-sensors = <&smc_hwmon 2>;	/* Tex1 */
-
-			trips {
-				cpu_e1_switch_on: trip-switch-on {
-					temperature = <75000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				cpu_e1_passive: trip-passive {
-					temperature = <115000>;
-					hysteresis = <5000>;
-					type = "passive";
-				};
-
-				trip-hot {
-					temperature = <120000>;
-					hysteresis = <2000>;
-					type = "hot";
-				};
-
-				trip-critical {
-					temperature = <125000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
-			};
-
-			cooling-maps {
-				map-e {
-					trip = <&cpu_e1_passive>;
-					cooling-device =
-						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
-
-		cpu-e2-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
-			integral-time-constant-ms = <20000>;
-			critical-samples = <3>;
-			sustainable-power = <2100>;
-			thermal-sensors = <&smc_hwmon 3>;	/* Tex2 */
-
-			trips {
-				cpu_e2_switch_on: trip-switch-on {
-					temperature = <75000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				cpu_e2_passive: trip-passive {
-					temperature = <115000>;
-					hysteresis = <5000>;
-					type = "passive";
-				};
-
-				trip-hot {
-					temperature = <120000>;
-					hysteresis = <2000>;
-					type = "hot";
-				};
-
-				trip-critical {
-					temperature = <125000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
-			};
-
-			cooling-maps {
-				map-e {
-					trip = <&cpu_e2_passive>;
-					cooling-device =
-						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
-
-		cpu-e3-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
-			integral-time-constant-ms = <20000>;
-			critical-samples = <3>;
-			sustainable-power = <2100>;
-			thermal-sensors = <&smc_hwmon 4>;	/* Tex3 */
-
-			trips {
-				cpu_e3_switch_on: trip-switch-on {
-					temperature = <75000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				cpu_e3_passive: trip-passive {
-					temperature = <115000>;
-					hysteresis = <5000>;
-					type = "passive";
-				};
-
-				trip-hot {
-					temperature = <120000>;
-					hysteresis = <2000>;
-					type = "hot";
-				};
-
-				trip-critical {
-					temperature = <125000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
-			};
-
-			cooling-maps {
-				map-e {
-					trip = <&cpu_e3_passive>;
-					cooling-device =
-						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
-
-		cpu-p00-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
-			integral-time-constant-ms = <20000>;
-			critical-samples = <3>;
-			sustainable-power = <25300>;
-			thermal-sensors = <&smc_hwmon 5>;	/* Tpx0 */
-
-			trips {
-				cpu_p00_switch_on: trip-switch-on {
-					temperature = <75000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				cpu_p00_passive: trip-passive {
-					temperature = <115000>;
-					hysteresis = <5000>;
-					type = "passive";
-				};
-
-				trip-hot {
-					temperature = <120000>;
-					hysteresis = <2000>;
-					type = "hot";
-				};
-
-				trip-critical {
-					temperature = <125000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
-			};
-
-			cooling-maps {
-				map-p0 {
-					trip = <&cpu_p00_passive>;
-					cooling-device =
-						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
-
-		cpu-p01-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
-			integral-time-constant-ms = <20000>;
-			critical-samples = <3>;
-			sustainable-power = <25300>;
-			thermal-sensors = <&smc_hwmon 6>;	/* Tpx1 */
-
-			trips {
-				cpu_p01_switch_on: trip-switch-on {
-					temperature = <75000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				cpu_p01_passive: trip-passive {
-					temperature = <115000>;
-					hysteresis = <5000>;
-					type = "passive";
-				};
-
-				trip-hot {
-					temperature = <120000>;
-					hysteresis = <2000>;
-					type = "hot";
-				};
-
-				trip-critical {
-					temperature = <125000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
-			};
-
-			cooling-maps {
-				map-p0 {
-					trip = <&cpu_p01_passive>;
-					cooling-device =
-						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
-
-		cpu-p02-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
-			integral-time-constant-ms = <20000>;
-			critical-samples = <3>;
-			sustainable-power = <25300>;
-			thermal-sensors = <&smc_hwmon 7>;	/* Tpx2 */
-
-			trips {
-				cpu_p02_switch_on: trip-switch-on {
-					temperature = <75000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				cpu_p02_passive: trip-passive {
-					temperature = <115000>;
-					hysteresis = <5000>;
-					type = "passive";
-				};
-
-				trip-hot {
-					temperature = <120000>;
-					hysteresis = <2000>;
-					type = "hot";
-				};
-
-				trip-critical {
-					temperature = <125000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
-			};
-
-			cooling-maps {
-				map-p0 {
-					trip = <&cpu_p02_passive>;
-					cooling-device =
-						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
-
-		cpu-p03-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
-			integral-time-constant-ms = <20000>;
-			critical-samples = <3>;
-			sustainable-power = <25300>;
-			thermal-sensors = <&smc_hwmon 8>;	/* Tpx3 */
-
-			trips {
-				cpu_p03_switch_on: trip-switch-on {
-					temperature = <75000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				cpu_p03_passive: trip-passive {
-					temperature = <115000>;
-					hysteresis = <5000>;
-					type = "passive";
-				};
-
-				trip-hot {
-					temperature = <120000>;
-					hysteresis = <2000>;
-					type = "hot";
-				};
-
-				trip-critical {
-					temperature = <125000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
-			};
-
-			cooling-maps {
-				map-p0 {
-					trip = <&cpu_p03_passive>;
-					cooling-device =
-						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
-
-		cpu-p04-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
-			integral-time-constant-ms = <20000>;
-			critical-samples = <3>;
-			sustainable-power = <25300>;
-			thermal-sensors = <&smc_hwmon 9>;	/* Tpx4 */
-
-			trips {
-				cpu_p04_switch_on: trip-switch-on {
-					temperature = <75000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				cpu_p04_passive: trip-passive {
-					temperature = <115000>;
-					hysteresis = <5000>;
-					type = "passive";
-				};
-
-				trip-hot {
-					temperature = <120000>;
-					hysteresis = <2000>;
-					type = "hot";
-				};
-
-				trip-critical {
-					temperature = <125000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
-			};
-
-			cooling-maps {
-				map-p0 {
-					trip = <&cpu_p04_passive>;
-					cooling-device =
-						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
-
-		cpu-p05-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
-			integral-time-constant-ms = <20000>;
-			critical-samples = <3>;
-			sustainable-power = <25300>;
-			thermal-sensors = <&smc_hwmon 10>;	/* Tpx5 */
-
-			trips {
-				cpu_p05_switch_on: trip-switch-on {
-					temperature = <75000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				cpu_p05_passive: trip-passive {
-					temperature = <115000>;
-					hysteresis = <5000>;
-					type = "passive";
-				};
-
-				trip-hot {
-					temperature = <120000>;
-					hysteresis = <2000>;
-					type = "hot";
-				};
-
-				trip-critical {
-					temperature = <125000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
-			};
-
-			cooling-maps {
-				map-p0 {
-					trip = <&cpu_p05_passive>;
-					cooling-device =
-						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
-
-		cpu-p10-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
-			integral-time-constant-ms = <20000>;
-			critical-samples = <3>;
-			sustainable-power = <23900>;
-			thermal-sensors = <&smc_hwmon 11>;	/* Tpx8 */
-
-			trips {
-				cpu_p10_switch_on: trip-switch-on {
-					temperature = <75000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				cpu_p10_passive: trip-passive {
-					temperature = <115000>;
-					hysteresis = <5000>;
-					type = "passive";
-				};
-
-				trip-hot {
-					temperature = <120000>;
-					hysteresis = <2000>;
-					type = "hot";
-				};
-
-				trip-critical {
-					temperature = <125000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
-			};
-
-			cooling-maps {
-				map-p1 {
-					trip = <&cpu_p10_passive>;
-					cooling-device =
-						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
-
-		cpu-p11-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
-			integral-time-constant-ms = <20000>;
-			critical-samples = <3>;
-			sustainable-power = <23900>;
-			thermal-sensors = <&smc_hwmon 12>;	/* Tpx9 */
-
-			trips {
-				cpu_p11_switch_on: trip-switch-on {
-					temperature = <75000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				cpu_p11_passive: trip-passive {
-					temperature = <115000>;
-					hysteresis = <5000>;
-					type = "passive";
-				};
-
-				trip-hot {
-					temperature = <120000>;
-					hysteresis = <2000>;
-					type = "hot";
-				};
-
-				trip-critical {
-					temperature = <125000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
-			};
-
-			cooling-maps {
-				map-p1 {
-					trip = <&cpu_p11_passive>;
-					cooling-device =
-						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
-
-		cpu-p12-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
-			integral-time-constant-ms = <20000>;
-			critical-samples = <3>;
-			sustainable-power = <23900>;
-			thermal-sensors = <&smc_hwmon 13>;	/* TpxA */
-
-			trips {
-				cpu_p12_switch_on: trip-switch-on {
-					temperature = <75000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				cpu_p12_passive: trip-passive {
-					temperature = <115000>;
-					hysteresis = <5000>;
-					type = "passive";
-				};
-
-				trip-hot {
-					temperature = <120000>;
-					hysteresis = <2000>;
-					type = "hot";
-				};
-
-				trip-critical {
-					temperature = <125000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
-			};
-
-			cooling-maps {
-				map-p1 {
-					trip = <&cpu_p12_passive>;
-					cooling-device =
-						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
-
-		cpu-p13-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
-			integral-time-constant-ms = <20000>;
-			critical-samples = <3>;
-			sustainable-power = <23900>;
-			thermal-sensors = <&smc_hwmon 14>;	/* TpxB */
-
-			trips {
-				cpu_p13_switch_on: trip-switch-on {
-					temperature = <75000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				cpu_p13_passive: trip-passive {
-					temperature = <115000>;
-					hysteresis = <5000>;
-					type = "passive";
-				};
-
-				trip-hot {
-					temperature = <120000>;
-					hysteresis = <2000>;
-					type = "hot";
-				};
-
-				trip-critical {
-					temperature = <125000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
-			};
-
-			cooling-maps {
-				map-p1 {
-					trip = <&cpu_p13_passive>;
-					cooling-device =
-						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
-
-		cpu-p14-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
-			integral-time-constant-ms = <20000>;
-			critical-samples = <3>;
-			sustainable-power = <23900>;
-			thermal-sensors = <&smc_hwmon 15>;	/* TpxC */
-
-			trips {
-				cpu_p14_switch_on: trip-switch-on {
-					temperature = <75000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				cpu_p14_passive: trip-passive {
-					temperature = <115000>;
-					hysteresis = <5000>;
-					type = "passive";
-				};
-
-				trip-hot {
-					temperature = <120000>;
-					hysteresis = <2000>;
-					type = "hot";
-				};
-
-				trip-critical {
-					temperature = <125000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
-			};
-
-			cooling-maps {
-				map-p1 {
-					trip = <&cpu_p14_passive>;
-					cooling-device =
-						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
-
-		cpu-p15-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
-			integral-time-constant-ms = <20000>;
-			critical-samples = <3>;
-			sustainable-power = <23900>;
-			thermal-sensors = <&smc_hwmon 16>;	/* TpxD */
-
-			trips {
-				cpu_p15_switch_on: trip-switch-on {
-					temperature = <75000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				cpu_p15_passive: trip-passive {
-					temperature = <115000>;
-					hysteresis = <5000>;
-					type = "passive";
-				};
-
-				trip-hot {
-					temperature = <120000>;
-					hysteresis = <2000>;
-					type = "hot";
-				};
-
-				trip-critical {
-					temperature = <125000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
-			};
-
-			cooling-maps {
-				map-p1 {
-					trip = <&cpu_p15_passive>;
-					cooling-device =
-						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
-
-		gpu0-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
-			sustainable-power = <51300>;
-			thermal-sensors = <&smc_hwmon 17>;	/* Tg05 */
-
-			trips {
-				gpu0_switch_on: trip-switch-on {
-					temperature = <90000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				gpu0_passive: trip-passive {
-					temperature = <101000>;
-					hysteresis = <5000>;
-					type = "passive";
-				};
-
-				trip-critical {
-					temperature = <118000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
-			};
-
-			cooling-maps {
-				map-e {
-					trip = <&gpu0_passive>;
-					cooling-device =
-						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-
-				map-p0 {
-					trip = <&gpu0_passive>;
-					cooling-device =
-						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-
-				map-p1 {
-					trip = <&gpu0_passive>;
-					cooling-device =
-						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
-
-		gpu1-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
-			sustainable-power = <51300>;
-			thermal-sensors = <&smc_hwmon 18>;	/* Tg0S */
-
-			trips {
-				gpu1_switch_on: trip-switch-on {
-					temperature = <90000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				gpu1_passive: trip-passive {
-					temperature = <101000>;
-					hysteresis = <5000>;
-					type = "passive";
-				};
-
-				trip-critical {
-					temperature = <118000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
-			};
-
-			cooling-maps {
-				map-e {
-					trip = <&gpu1_passive>;
-					cooling-device =
-						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-
-				map-p0 {
-					trip = <&gpu1_passive>;
-					cooling-device =
-						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-
-				map-p1 {
-					trip = <&gpu1_passive>;
-					cooling-device =
-						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
-
-		gpu2-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
-			sustainable-power = <51300>;
-			thermal-sensors = <&smc_hwmon 19>;	/* Tg0Y */
-
-			trips {
-				gpu2_switch_on: trip-switch-on {
-					temperature = <90000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				gpu2_passive: trip-passive {
-					temperature = <101000>;
-					hysteresis = <5000>;
-					type = "passive";
-				};
-
-				trip-critical {
-					temperature = <118000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
-			};
-
-			cooling-maps {
-				map-e {
-					trip = <&gpu2_passive>;
-					cooling-device =
-						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-
-				map-p0 {
-					trip = <&gpu2_passive>;
-					cooling-device =
-						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-
-				map-p1 {
-					trip = <&gpu2_passive>;
-					cooling-device =
-						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
-
-		gpu3-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
-			sustainable-power = <51300>;
-			thermal-sensors = <&smc_hwmon 20>;	/* Tg0k */
-
-			trips {
-				gpu3_switch_on: trip-switch-on {
-					temperature = <90000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				gpu3_passive: trip-passive {
-					temperature = <101000>;
-					hysteresis = <5000>;
-					type = "passive";
-				};
-
-				trip-critical {
-					temperature = <118000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
-			};
-
-			cooling-maps {
-				map-e {
-					trip = <&gpu3_passive>;
-					cooling-device =
-						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-
-				map-p0 {
-					trip = <&gpu3_passive>;
-					cooling-device =
-						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-
-				map-p1 {
-					trip = <&gpu3_passive>;
-					cooling-device =
-						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
-
-		gpu4-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
-			sustainable-power = <51300>;
-			thermal-sensors = <&smc_hwmon 21>;	/* Tg0z */
-
-			trips {
-				gpu4_switch_on: trip-switch-on {
-					temperature = <90000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				gpu4_passive: trip-passive {
-					temperature = <101000>;
-					hysteresis = <5000>;
-					type = "passive";
-				};
-
-				trip-critical {
-					temperature = <118000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
-			};
-
-			cooling-maps {
-				map-e {
-					trip = <&gpu4_passive>;
-					cooling-device =
-						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-
-				map-p0 {
-					trip = <&gpu4_passive>;
-					cooling-device =
-						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-
-				map-p1 {
-					trip = <&gpu4_passive>;
-					cooling-device =
-						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
-
-		gpu5-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
-			sustainable-power = <51300>;
-			thermal-sensors = <&smc_hwmon 22>;	/* Tg1V */
-
-			trips {
-				gpu5_switch_on: trip-switch-on {
-					temperature = <90000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				gpu5_passive: trip-passive {
-					temperature = <101000>;
-					hysteresis = <5000>;
-					type = "passive";
-				};
-
-				trip-critical {
-					temperature = <118000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
-			};
-
-			cooling-maps {
-				map-e {
-					trip = <&gpu5_passive>;
-					cooling-device =
-						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-
-				map-p0 {
-					trip = <&gpu5_passive>;
-					cooling-device =
-						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-
-				map-p1 {
-					trip = <&gpu5_passive>;
-					cooling-device =
-						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
-
-		gpu6-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
-			sustainable-power = <51300>;
-			thermal-sensors = <&smc_hwmon 23>;	/* Tg1l */
-
-			trips {
-				gpu6_switch_on: trip-switch-on {
-					temperature = <90000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				gpu6_passive: trip-passive {
-					temperature = <101000>;
-					hysteresis = <5000>;
-					type = "passive";
-				};
-
-				trip-critical {
-					temperature = <118000>;
-					hysteresis = <0>;
-					type = "critical";
-				};
-			};
-
-			cooling-maps {
-				map-e {
-					trip = <&gpu6_passive>;
-					cooling-device =
-						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-
-				map-p0 {
-					trip = <&gpu6_passive>;
-					cooling-device =
-						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-
-				map-p1 {
-					trip = <&gpu6_passive>;
-					cooling-device =
-						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
-						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
+	nor_flash_vcc: regulator-nor-flash-vcc {
+		compatible = "regulator-fixed";
+		regulator-name = "nor-flash-vcc";
+		regulator-always-on;
 	};
 
 	/*
@@ -1756,6 +316,7 @@
 		spi-max-frequency = <10000000>;
 		spi-rx-bus-width = <1>;
 		spi-tx-bus-width = <1>;
+		vcc-supply = <&nor_flash_vcc>;
 
 		partitions {
 			compatible = "fixed-partitions";
@@ -1784,12 +345,12 @@
 };
 
 &mesa {
-	status = "okay";
 	enable-gpios = <&pinctrl_nub 53 GPIO_ACTIVE_HIGH>;
 	interrupt-parent = <&pinctrl>;
 	interrupts = <116 IRQ_TYPE_EDGE_RISING>;
 	spi-cs-setup-delay-ns = <20>;
 	spi-cs-hold-delay-ns = <20>;
+	status = "okay";
 	/* The board file names the per-device factory data. */
 };
 
@@ -1841,141 +402,13 @@
 
 &smc_hwmon {
 	/*
-	 * TCMz and the 23 zone sensors after it must stay the first
-	 * temperature children: the thermal zones name a sensor by its index,
-	 * so the shared hwmon includes below only append after them.
-	 *
-	 * Every key below is in this machine's SMC key table as a readable
-	 * float and was read on the J616s (SMC firmware of macOS 26.6.2).
-	 * The J614s key table has not been read yet.
-	 * Keys that only ever read a fixed placeholder (Tz1*, Ta0*) or a
-	 * fixed limit (TVMx, TVmS, TVms, PHPB, PHPM) are left out; rails that
-	 * read 0 W while idle are kept. GPU (Tg*), P-cluster (Tp*) and
-	 * E-cluster (Te*) labels follow load tests: Tg* only read live while
-	 * the GPU is powered and rise with GPU load, Tp* and Te* rise with CPU
-	 * load. Other names follow the SMC key groups and are not otherwise
-	 * verified. SBA1-3 are the three cells of the 3S battery.
+	 * Every key here and in the zone sensors is a readable float in the
+	 * J616s SMC key table (macOS 26.6.2); the J614s table has not been
+	 * read. Keys that only read a placeholder (Tz1*, Ta0*) or a fixed
+	 * limit (TVMx, TVmS, TVms, PHPB, PHPM) are left out. Tg*, Tp* and Te*
+	 * labels follow GPU and CPU load tests; the others follow the SMC key
+	 * groups. SBA1-3 are the cells of the 3S battery.
 	 */
-	temperature-TCMz {
-		apple,key-id = "TCMz";
-		label = "CPU Die Max";
-	};
-
-	temperature-Tex0 {
-		apple,key-id = "Tex0";
-		label = "E-cluster Tex0";
-	};
-
-	temperature-Tex1 {
-		apple,key-id = "Tex1";
-		label = "E-cluster Tex1";
-	};
-
-	temperature-Tex2 {
-		apple,key-id = "Tex2";
-		label = "E-cluster Tex2";
-	};
-
-	temperature-Tex3 {
-		apple,key-id = "Tex3";
-		label = "E-cluster Tex3";
-	};
-
-	temperature-Tpx0 {
-		apple,key-id = "Tpx0";
-		label = "P-cluster Tpx0";
-	};
-
-	temperature-Tpx1 {
-		apple,key-id = "Tpx1";
-		label = "P-cluster Tpx1";
-	};
-
-	temperature-Tpx2 {
-		apple,key-id = "Tpx2";
-		label = "P-cluster Tpx2";
-	};
-
-	temperature-Tpx3 {
-		apple,key-id = "Tpx3";
-		label = "P-cluster Tpx3";
-	};
-
-	temperature-Tpx4 {
-		apple,key-id = "Tpx4";
-		label = "P-cluster Tpx4";
-	};
-
-	temperature-Tpx5 {
-		apple,key-id = "Tpx5";
-		label = "P-cluster Tpx5";
-	};
-
-	temperature-Tpx8 {
-		apple,key-id = "Tpx8";
-		label = "P-cluster Tpx8";
-	};
-
-	temperature-Tpx9 {
-		apple,key-id = "Tpx9";
-		label = "P-cluster Tpx9";
-	};
-
-	temperature-TpxA {
-		apple,key-id = "TpxA";
-		label = "P-cluster TpxA";
-	};
-
-	temperature-TpxB {
-		apple,key-id = "TpxB";
-		label = "P-cluster TpxB";
-	};
-
-	temperature-TpxC {
-		apple,key-id = "TpxC";
-		label = "P-cluster TpxC";
-	};
-
-	temperature-TpxD {
-		apple,key-id = "TpxD";
-		label = "P-cluster TpxD";
-	};
-
-	temperature-Tg05 {
-		apple,key-id = "Tg05";
-		label = "GPU Tg05";
-	};
-
-	temperature-Tg0S {
-		apple,key-id = "Tg0S";
-		label = "GPU Tg0S";
-	};
-
-	temperature-Tg0Y {
-		apple,key-id = "Tg0Y";
-		label = "GPU Tg0Y";
-	};
-
-	temperature-Tg0k {
-		apple,key-id = "Tg0k";
-		label = "GPU Tg0k";
-	};
-
-	temperature-Tg0z {
-		apple,key-id = "Tg0z";
-		label = "GPU Tg0z";
-	};
-
-	temperature-Tg1V {
-		apple,key-id = "Tg1V";
-		label = "GPU Tg1V";
-	};
-
-	temperature-Tg1l {
-		apple,key-id = "Tg1l";
-		label = "GPU Tg1l";
-	};
-
 	temperature-TAOL {
 		apple,key-id = "TAOL";
 		label = "SMC TAOL";
@@ -2589,76 +1022,91 @@
 	temperature-Tg04 {
 		apple,key-id = "Tg04";
 		label = "GPU Tg04";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg0K {
 		apple,key-id = "Tg0K";
 		label = "GPU Tg0K";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg0L {
 		apple,key-id = "Tg0L";
 		label = "GPU Tg0L";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg0R {
 		apple,key-id = "Tg0R";
 		label = "GPU Tg0R";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg0X {
 		apple,key-id = "Tg0X";
 		label = "GPU Tg0X";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg0d {
 		apple,key-id = "Tg0d";
 		label = "GPU Tg0d";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg0e {
 		apple,key-id = "Tg0e";
 		label = "GPU Tg0e";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg0j {
 		apple,key-id = "Tg0j";
 		label = "GPU Tg0j";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg0y {
 		apple,key-id = "Tg0y";
 		label = "GPU Tg0y";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg1E {
 		apple,key-id = "Tg1E";
 		label = "GPU Tg1E";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg1F {
 		apple,key-id = "Tg1F";
 		label = "GPU Tg1F";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg1U {
 		apple,key-id = "Tg1U";
 		label = "GPU Tg1U";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg1c {
 		apple,key-id = "Tg1c";
 		label = "GPU Tg1c";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg1d {
 		apple,key-id = "Tg1d";
 		label = "GPU Tg1d";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tg1k {
 		apple,key-id = "Tg1k";
 		label = "GPU Tg1k";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	temperature-Tp00 {
@@ -4239,32 +2687,36 @@
 		reg-names = "config", "rc",
 			    "port0", "port1", "port2", "port3",
 			    "phy0", "phy1", "phy2", "phy3";
-		ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0 0x20000000 0x2000000 0 0x80000000 0xb 0x80000000 0 0x40000000>;
+		ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0x0 0x20000000>,
+			 <0x02000000 0x0 0x80000000 0xb 0x80000000 0x0 0x40000000>;
 		pinctrl-names = "default";
 		pinctrl-0 = <&wifi_clkreq_pins>;
-		#size-cells = <2>;
 		#address-cells = <3>;
+		#size-cells = <2>;
 		bus-range = <0 1>;
 		iommu-map-mask = <0xffff>;
 		iommu-map = <0x100 &pcie_dart 1 2>;
 		msi-ranges = <&aic AIC_IRQ 2071 IRQ_TYPE_EDGE_RISING 32>;
 		msi-parent = <&pcie0>;
 		msi-controller;
-		interrupts = <0 0x6bb 4>;
+		interrupts = <AIC_IRQ 1723 IRQ_TYPE_LEVEL_HIGH>;
 		interrupt-parent = <&aic>;
 		device_type = "pci";
 
 		port00: pci@0,0 {
 			reg = <0 0 0 0 0>;
 			ranges;
-			interrupt-map = <0 0 0 1 &port00 0 0 0 0 0 0 0 2 &port00 0 0 0 1 0 0 0 3 &port00 0 0 0 2 0 0 0 4 &port00 0 0 0 3>;
+			interrupt-map = <0 0 0 1 &port00 0 0 0 0>,
+					<0 0 0 2 &port00 0 0 0 1>,
+					<0 0 0 3 &port00 0 0 0 2>,
+					<0 0 0 4 &port00 0 0 0 3>;
 			interrupt-map-mask = <0 0 0 7>;
 			#interrupt-cells = <1>;
 			interrupt-controller;
-			#size-cells = <2>;
 			#address-cells = <3>;
-			pwren-gpios = <&smc_gpio 0x13 0>;
-			reset-gpios = <&pinctrl 4 1>;
+			#size-cells = <2>;
+			pwren-gpios = <&smc_gpio 0x13 GPIO_ACTIVE_HIGH>;
+			reset-gpios = <&pinctrl 4 GPIO_ACTIVE_LOW>;
 			device_type = "pci";
 
 			bluetooth0: bluetooth@0,1 {
@@ -4483,12 +2935,12 @@
 			apple,output-size = <1920 1080>;
 			apple,crop = <0 0 1920 1080>;
 		};
-		/* 1280x720 */
+		/* 1280x720: the same window as 1920x1080, scaled down */
 		preset1 {
 			apple,config-index = <5>;
 			apple,input-size = <1920 2160>;
 			apple,output-size = <1280 720>;
-			apple,crop = <0 0 1280 720>;
+			apple,crop = <0 0 1920 1080>;
 		};
 	};
 };
@@ -4519,7 +2971,7 @@
 };
 
 /* The loader fills the operating points, calibration and all six memory regions. */
-&gfx_mbox {
+&agx_mbox {
 	status = "okay";
 };
 
@@ -4565,14 +3017,14 @@
 
 				port@0 {
 					reg = <0>;
-					typec0_con_hs: endpoint {
-						remote-endpoint = <&usb_drd0_hs>;
+					typec0_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_0_hs>;
 					};
 				};
 
 				port@1 {
 					reg = <1>;
-					typec0_con_ss: endpoint {
+					typec0_connector_ss: endpoint {
 						remote-endpoint = <&atcphy0_ss>;
 					};
 				};
@@ -4601,14 +3053,14 @@
 
 				port@0 {
 					reg = <0>;
-					typec1_con_hs: endpoint {
-						remote-endpoint = <&usb_drd1_hs>;
+					typec1_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_1_hs>;
 					};
 				};
 
 				port@1 {
 					reg = <1>;
-					typec1_con_ss: endpoint {
+					typec1_connector_ss: endpoint {
 						remote-endpoint = <&atcphy1_ss>;
 					};
 				};
@@ -4652,14 +3104,14 @@
 
 				port@0 {
 					reg = <0>;
-					typec2_con_hs: endpoint {
-						remote-endpoint = <&usb_drd2_hs>;
+					typec2_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_2_hs>;
 					};
 				};
 
 				port@1 {
 					reg = <1>;
-					typec2_con_ss: endpoint {
+					typec2_connector_ss: endpoint {
 						remote-endpoint = <&atcphy2_ss>;
 					};
 				};
@@ -4671,9 +3123,22 @@
 &atcphy0 {
 	status = "okay";
 
-	port {
-		atcphy0_ss: endpoint {
-			remote-endpoint = <&typec0_con_ss>;
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			atcphy0_ss: endpoint {
+				remote-endpoint = <&typec0_connector_ss>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			atcphy0_usb3: endpoint {
+				remote-endpoint = <&dwc3_0_ss>;
+			};
 		};
 	};
 };
@@ -4682,15 +3147,15 @@
 	status = "okay";
 };
 
-&usb_drd0_dart_0 {
+&dwc3_0_dart_0 {
 	status = "okay";
 };
 
-&usb_drd0_dart_1 {
+&dwc3_0_dart_1 {
 	status = "okay";
 };
 
-&usb_drd0 {
+&dwc3_0 {
 	status = "okay";
 
 	ports {
@@ -4699,8 +3164,15 @@
 
 		port@0 {
 			reg = <0>;
-			usb_drd0_hs: endpoint {
-				remote-endpoint = <&typec0_con_hs>;
+			dwc3_0_hs: endpoint {
+				remote-endpoint = <&typec0_connector_hs>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			dwc3_0_ss: endpoint {
+				remote-endpoint = <&atcphy0_usb3>;
 			};
 		};
 	};
@@ -4709,9 +3181,22 @@
 &atcphy1 {
 	status = "okay";
 
-	port {
-		atcphy1_ss: endpoint {
-			remote-endpoint = <&typec1_con_ss>;
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			atcphy1_ss: endpoint {
+				remote-endpoint = <&typec1_connector_ss>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			atcphy1_usb3: endpoint {
+				remote-endpoint = <&dwc3_1_ss>;
+			};
 		};
 	};
 };
@@ -4720,15 +3205,15 @@
 	status = "okay";
 };
 
-&usb_drd1_dart_0 {
+&dwc3_1_dart_0 {
 	status = "okay";
 };
 
-&usb_drd1_dart_1 {
+&dwc3_1_dart_1 {
 	status = "okay";
 };
 
-&usb_drd1 {
+&dwc3_1 {
 	status = "okay";
 
 	ports {
@@ -4737,8 +3222,15 @@
 
 		port@0 {
 			reg = <0>;
-			usb_drd1_hs: endpoint {
-				remote-endpoint = <&typec1_con_hs>;
+			dwc3_1_hs: endpoint {
+				remote-endpoint = <&typec1_connector_hs>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			dwc3_1_ss: endpoint {
+				remote-endpoint = <&atcphy1_usb3>;
 			};
 		};
 	};
@@ -4747,9 +3239,22 @@
 &atcphy2 {
 	status = "okay";
 
-	port {
-		atcphy2_ss: endpoint {
-			remote-endpoint = <&typec2_con_ss>;
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			atcphy2_ss: endpoint {
+				remote-endpoint = <&typec2_connector_ss>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			atcphy2_usb3: endpoint {
+				remote-endpoint = <&dwc3_2_ss>;
+			};
 		};
 	};
 };
@@ -4758,15 +3263,15 @@
 	status = "okay";
 };
 
-&usb_drd2_dart_0 {
+&dwc3_2_dart_0 {
 	status = "okay";
 };
 
-&usb_drd2_dart_1 {
+&dwc3_2_dart_1 {
 	status = "okay";
 };
 
-&usb_drd2 {
+&dwc3_2 {
 	status = "okay";
 
 	ports {
@@ -4775,8 +3280,15 @@
 
 		port@0 {
 			reg = <0>;
-			usb_drd2_hs: endpoint {
-				remote-endpoint = <&typec2_con_hs>;
+			dwc3_2_hs: endpoint {
+				remote-endpoint = <&typec2_connector_hs>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			dwc3_2_ss: endpoint {
+				remote-endpoint = <&atcphy2_usb3>;
 			};
 		};
 	};
@@ -4816,6 +3328,27 @@
 };
 
 &ave {
+	status = "okay";
+};
+
+/* Both JPEG engines; they have no board wiring. */
+&ps_jpg {
+	status = "okay";
+};
+
+&jpeg0_dart {
+	status = "okay";
+};
+
+&jpeg0 {
+	status = "okay";
+};
+
+&jpeg1_dart {
+	status = "okay";
+};
+
+&jpeg1 {
 	status = "okay";
 };
 
@@ -4937,3 +3470,5 @@
 	power-domain-names = "sys", "cpu", "mpm", "td", "base", "perf";
 	status = "okay";
 };
+
+#include "t604x-j614-j616-usb4.dtsi"

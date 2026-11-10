@@ -91,5 +91,18 @@
 			iommus = <&disp0_dart 16>;
 			phandle = <&disp0_piodma>;
 		};
+
+		/*
+		 * 13.6" 2560x1664 (1600 below the notch); 500 nits peak (ADT
+		 * backlight known-nits). Makes the connector eDP and gives the
+		 * DCP a backlight to drive.
+		 */
+		panel: panel {
+			compatible = "apple,panel-j813", "apple,panel";
+			width-mm = <290>;
+			height-mm = <188>;
+			adj-height-mm = <181>;
+			apple,max-brightness = <500>;
+		};
 	};
 };

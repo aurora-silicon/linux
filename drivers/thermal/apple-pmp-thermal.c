@@ -27,6 +27,7 @@
 #include <linux/soc/apple/pmp-telemetry.h>
 #include <linux/soc/apple/pmp-cooling.h>
 #include <linux/soc/apple/pmp-power-policy.h>
+#include <linux/soc/apple/t8132.h>
 #include <linux/thermal.h>
 #include <linux/workqueue.h>
 
@@ -739,8 +740,8 @@ static int apple_pmp_thermal_probe(struct platform_device *pdev)
 {
 	const struct apple_pmp_sensor_data *sensors = dev_get_platdata(&pdev->dev);
 
-	/* Only this board's sensor topology and operating policy are qualified. */
-	if (!of_machine_is_compatible("apple,j713"))
+	/* The M4 PMP sensor records and the Airs' fanless policy are qualified. */
+	if (!apple_t8132_firmware_path())
 		return -ENODEV;
 	if (!sensors || !sensors->read || !sensors->dev)
 		return -EINVAL;

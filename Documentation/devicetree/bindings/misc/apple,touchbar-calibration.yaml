@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/misc/apple,touchbar-calibration.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple Touch Bar calibration storage
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  I2C calibration storage associated with the Touch Bar. Contents and
+  per-unit data are not part of the static hardware description.
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t8103-touchbar-calibration
+      - const: apple,touchbar-calibration
+
+  reg:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false

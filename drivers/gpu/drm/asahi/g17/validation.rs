@@ -120,6 +120,17 @@ impl Proof {
                 .all(|&request| self.requests.covers(request))
     }
 
+    /// The requested ranges this proof does not already cover.
+    fn uncovered(&self, requests: &Requests) -> Requests {
+        let mut missing = Requests::new();
+        for &request in requests.as_slice() {
+            if !self.requests.covers(request) {
+                missing.insert(request);
+            }
+        }
+        missing
+    }
+
     fn record(&mut self, epoch: Option<u64>, requests: Requests) {
         // Alternating in-flight buffers must not evict each other's proofs.
         if epoch.is_some() && self.epoch == epoch && !requests.overflow {
@@ -153,12 +164,22 @@ impl Proof {
         let optimistic = payload.validate(window, variant, &Space::Record(&range, &requests));
         let requests = requests.into_inner();
         if optimistic.is_ok() && !requests.overflow {
-            if self.covers(vm.mapping_validation_epoch(), &requests) {
+            let epoch = vm.mapping_validation_epoch();
+            if self.covers(epoch, &requests) {
                 return optimistic;
             }
-            let (covered, epoch) = vm.covers_ranges_batch(requests.as_slice());
+            // Proofs from an unchanged epoch still hold: walk only the ranges they do not
+            // cover. A command buffer at a fresh address then no longer re-walks every
+            // render target it names.
+            let partial = self.epoch.is_some() && self.epoch == epoch;
+            let walk = if partial { self.uncovered(&requests) } else { requests };
+            let (mut covered, mut walked) = vm.covers_ranges_batch(walk.as_slice());
+            if covered && partial && walked != self.epoch {
+                // A mapping changed since the cached proofs were taken: walk everything.
+                (covered, walked) = vm.covers_ranges_batch(requests.as_slice());
+            }
             if covered {
-                self.record(epoch, requests);
+                self.record(walked, requests);
                 return optimistic;
             }
             self.epoch = None;
@@ -278,6 +299,40 @@ mod tests {
         assert!(!proof.covers(Some(7), &requests((0, 8, 1))));
         assert!(proof.covers(Some(7),
             &requests((MAX_CACHED_RANGES as u64 * 2 * PAGE, 8, 1))));
+    }
+
+    #[test]
+    fn only_uncovered_ranges_are_walked_again() {
+        let mut proof = Proof::new();
+        let mut proven = requests((PAGE, 4 * PAGE, 1));
+        proven.insert((8 * PAGE, PAGE, 3));
+        proof.record(Some(5), proven);
+
+        let mut next = requests((PAGE + 16, 8, 1));
+        next.insert((8 * PAGE, 8, 2));
+        next.insert((20 * PAGE, PAGE, 1));
+        next.insert((4 * PAGE, 2 * PAGE, 1));
+        let missing = proof.uncovered(&next);
+        assert_eq!(missing.as_slice(), &[(20 * PAGE, PAGE, 1), (4 * PAGE, 2 * PAGE, 1)]);
+
+        // Stronger access than proven is walked again.
+        assert_eq!(proof.uncovered(&requests((PAGE, 8, 2))).count, 1);
+        assert_eq!(proof.uncovered(&requests((8 * PAGE, 8, 3))).count, 0);
+    }
+
+    #[test]
+    fn a_partial_walk_extends_the_proof() {
+        let mut proof = Proof::new();
+        proof.record(Some(5), requests((PAGE, PAGE, 1)));
+        let mut next = requests((PAGE, 8, 1));
+        next.insert((10 * PAGE, 8, 1));
+        assert!(!proof.covers(Some(5), &next));
+        // validate() walks proof.uncovered(&next), then records the whole request set.
+        assert_eq!(proof.uncovered(&next).as_slice(), &[(10 * PAGE, PAGE, 1)]);
+        proof.record(Some(5), next);
+        assert!(proof.covers(Some(5), &next));
+        assert!(proof.covers(Some(5), &requests((PAGE + 8, 8, 1))));
+        assert!(!proof.covers(Some(6), &next));
     }
 
     #[test]

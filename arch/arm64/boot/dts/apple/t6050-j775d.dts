@@ -1,0 +1,698 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Mac Studio (M5 Ultra, 2026)
+ *
+ * target-type: J775D
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include "t6050-ultra.dtsi"
+
+/ {
+	compatible = "apple,j775d", "apple,t6050", "apple,arm-platform";
+	model = "Apple Mac Studio (M5 Ultra, 2026)";
+	chassis-type = "desktop";
+
+	aliases {
+		serial0 = &dockchannel;
+		/* the boot loader fills in the MAC address through this alias */
+		ethernet0 = &ethernet0;
+		/* kboot fills the N1's factory addresses from /chosen through these */
+		wifi0 = &n1_alpha;
+		bluetooth0 = &n1_beta;
+		/* Aura's kboot_setup_atc() fills this PHY's tunables from /arm-io/atc-phy2. */
+		atcphy2 = &atc2_phy;
+		/* The same fills /arm-io/atc-phy1's (rear USB-C port 2, USB data). */
+		atcphy1 = &atc1_phy;
+		/* And rear port 4's and the front ports' (die 1), while their chains wait for the PHY. */
+		atcphy3 = &atc3_phy;
+		atcphy4 = &atc4_phy;
+		atcphy5 = &atc1_phy_die1;
+		/* Aura's ACIO tunable copy fills rear port 4's router (/arm-io/acio3) through these. */
+		usb4-3-acio = &usb4_3_acio;
+		usb4-3-nhi = &usb4_3_nhi;
+		/* asahi-bless and the boot loader's dt_set_nvram find the partition by this alias */
+		nvram = &nvram;
+	};
+
+	/*
+	 * No stdout-path: the boot loader passes the console on the command
+	 * line when it wants one.
+	 */
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+	};
+
+	/*
+	 * The jack (CS42L84) and the speaker (SN012776) through the AOP's audio services. The card waits
+	 * for its CPU component, the AOP audio node, which exists only after Aura's AOP handoff.
+	 */
+	sound {
+		compatible = "apple,j775d-macaudio", "apple,macaudio";
+		model = "Mac Studio J775D";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&aop_audio 0>;
+			};
+
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+
+		dai-link@1 {
+			reg = <1>;
+			link-name = "Speaker";
+
+			cpu {
+				sound-dai = <&aop_audio 3>;
+			};
+
+			codec {
+				sound-dai = <&speaker_amp>;
+			};
+		};
+	};
+};
+
+/*
+ * PCIe ports 2 (the onboard 10 Gb Ethernet) and 3 (the rear USB-A xHCI). The boot loader
+ * powers and trains both links; it disables a port, and its DART, whose link did not come up.
+ *
+ * Port 0 carries the N1 (Wi-Fi and Bluetooth), described disabled until the boot loader trains
+ * it (pci@0,0 below).
+ */
+&pcie0 {
+	reg = <0x1c 0xb0000000 0x0 0x10000000>,
+	      <0x4 0x14000000 0x0 0x4000>,
+	      <0x4 0x12028000 0x0 0x8000>,
+	      <0x4 0x17018000 0x0 0x4000>,
+	      <0x4 0x12024000 0x0 0x4000>,
+	      <0x4 0x13028000 0x0 0x8000>,
+	      <0x4 0x1701c000 0x0 0x4000>,
+	      <0x4 0x13024000 0x0 0x4000>,
+	      <0x4 0x10028000 0x0 0x8000>,
+	      <0x4 0x17010000 0x0 0x4000>,
+	      <0x4 0x10024000 0x0 0x4000>;
+	reg-names = "config", "rc", "port2", "phy2", "intr2axi2",
+		    "port3", "phy3", "intr2axi3",
+		    "port0", "phy0", "intr2axi0";
+	interrupts = <AIC_IRQ 0 1539 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 0 1547 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 0 1523 IRQ_TYPE_LEVEL_HIGH>;
+	interrupt-names = "port2", "port3", "port0";
+
+	/*
+	 * The boot loader numbers port 2's secondary bus 1 and port 3's 2;
+	 * port 0's is 3 until a boot loader that trains it renumbers all three
+	 * in the PCI core's order. The N1's three functions are on DART
+	 * streams 1-3.
+	 */
+	iommu-map = <0x100 &dart_apcie2 1 1>,
+		    <0x200 &dart_apcie3 1 1>,
+		    <0x300 &dart_apcie0 1 3>;
+	bus-range = <0 3>;
+
+	port02: pci@2,0 {
+		device_type = "pci";
+		reg = <0x1000 0 0 0 0>;
+		bus-range = <1 1>;
+		apple,link-trained-by-bootloader;
+
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupt-map-mask = <0 0 0 7>;
+		interrupt-map = <0 0 0 1 &port02 0 0 0 0>,
+				<0 0 0 2 &port02 0 0 0 1>,
+				<0 0 0 3 &port02 0 0 0 2>,
+				<0 0 0 4 &port02 0 0 0 3>;
+
+		/* The RTL8127A keeps no MAC address of its own */
+		ethernet0: ethernet@0,0 {
+			reg = <0x10000 0x0 0x0 0x0 0x0>;
+			/* To be filled by the loader */
+			local-mac-address = [00 00 00 00 00 00];
+		};
+	};
+
+	port03: pci@3,0 {
+		device_type = "pci";
+		reg = <0x1800 0 0 0 0>;
+		bus-range = <2 2>;
+		apple,link-trained-by-bootloader;
+
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupt-map-mask = <0 0 0 7>;
+		interrupt-map = <0 0 0 1 &port03 0 0 0 0>,
+				<0 0 0 2 &port03 0 0 0 1>,
+				<0 0 0 3 &port03 0 0 0 2>,
+				<0 0 0 4 &port03 0 0 0 3>;
+	};
+
+	/*
+	 * The N1 Wi-Fi/Bluetooth (106b:1900, its ROM), trained by the bootloader after the SMC
+	 * releases its reset. Its driver boots the firmware and has this port reset after the ROM
+	 * stage; Control, Alpha (Wi-Fi) and Beta (Bluetooth) then answer at functions 0-2.
+	 * Disabled with its DART: a bootloader that trains the port enables both and renumbers the
+	 * buses here (bus-range, reg, iommu-map) to the PCI core's order, port 0 first.
+	 */
+	port00: pci@0,0 {
+		device_type = "pci";
+		reg = <0x0 0 0 0 0>;
+		bus-range = <3 3>;
+		apple,link-trained-by-bootloader;
+		/*
+		 * Its PERST# (pci-bridge0 function-perst): /arm-io/gpio0 pin 0x50, pad
+		 * register 0x140 of pinctrl_ap, which owns the pad (and exposes it: see
+		 * its gpio-reserved-ranges below). Driven only by the root-port reset after
+		 * the N1's ROM stage.
+		 */
+		reset-gpios = <&pinctrl_ap 80 GPIO_ACTIVE_LOW>;
+		status = "disabled";
+
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupt-map-mask = <0 0 0 7>;
+		interrupt-map = <0 0 0 1 &port00 0 0 0 0>,
+				<0 0 0 2 &port00 0 0 0 1>,
+				<0 0 0 3 &port00 0 0 0 2>,
+				<0 0 0 4 &port00 0 0 0 3>;
+
+		/* The firmware: the chip's image with this board's ticket; platform ID is
+		 * (board 0x12 << 16) | chip 0x6050 */
+		n1_control: control@0,0 {
+			compatible = "pci106b,1900";
+			reg = <0x30000 0x0 0x0 0x0 0x0>;
+			firmware-name = "apple/centauri/j775d-ftab.bin";
+			apple,centauri-platform-id = <0x00126050>;
+			apple,centauri-protocol = <27>;
+		};
+
+		n1_alpha: wifi@0,1 {
+			compatible = "pci106b,1902";
+			reg = <0x30100 0x0 0x0 0x0 0x0>;
+			local-mac-address = [00 00 00 00 00 00];
+		};
+
+		n1_beta: bluetooth@0,2 {
+			compatible = "pci106b,1903";
+			reg = <0x30200 0x0 0x0 0x0 0x0>;
+			local-bd-address = [00 00 00 00 00 00];
+		};
+	};
+};
+
+/* The pins this board's nodes name, and no others */
+&pinctrl_ap {
+	/*
+	 * Every pin reads cleanly, but only
+	 * the pins a node in this file names are exposed: 80 (PCIe port 0's PERST#, ADT
+	 * pci-bridge0 function-perst), 106 (amp IRQ), 107 (amp shutdown), 134 (jack IRQ)
+	 * and 139 (jack codec reset), from the ADT's audio-speaker and audio-codec-output.
+	 * A reserved line cannot be requested (gpiolib answers -EINVAL), so a node that
+	 * names a new pin of pinctrl_ap opens it here too.
+	 */
+	gpio-reserved-ranges = <0 80>, <81 25>, <108 26>, <135 4>, <140 81>;
+};
+
+&i2c1 {
+	/*
+	 * ADT speaker-config: playback slot 0, amp gain 20, V sense in slot 0 and I sense
+	 * in slot 2. The firmware's speaker frame is 250 BCLKs of 12 MHz (ADT
+	 * iop-audio-controller/audio-speaker), which the amp's ratio detection rejects.
+	 */
+	speaker_amp: codec@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		shutdown-gpios = <&pinctrl_ap 107 GPIO_ACTIVE_HIGH>;
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		#sound-dai-cells = <0>;
+		ti,imon-slot-no = <2>;
+		ti,vmon-slot-no = <0>;
+	};
+};
+
+&i2c2 {
+	jack_codec: codec@4b {
+		compatible = "cirrus,cs42l84";
+		reg = <0x4b>;
+		reset-gpios = <&pinctrl_ap 139 GPIO_ACTIVE_HIGH>;
+		interrupts-extended = <&pinctrl_ap 134 IRQ_TYPE_LEVEL_LOW>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Jack";
+	};
+};
+
+/*
+ * The console is on the USB debug link, which drains only while a host reads
+ * it; the machine also boots with nothing attached there.
+ */
+&dockchannel {
+	apple,tx-never-wait;
+	status = "okay";
+};
+
+&dart_apcie2 {
+	status = "okay";
+};
+
+&dart_apcie3 {
+	status = "okay";
+};
+
+/*
+ * The Studio's DC input. PSTR and PDTR read 0 on the Studio; PD0R is its DC input (36.5 W at an
+ * idle desktop).
+ */
+&smc_hwmon {
+	power-PD0R {
+		apple,key-id = "PD0R";
+		label = "DC Input Power";
+	};
+};
+
+#include "hwmon-fan-dual.dtsi"
+
+/*
+ * The Studio's SMC has F0Ac/F0Mn/F0Mx/F0Tg and F1*, but its mode keys are F0md/F1md (ui8, flags 0xd0:
+ * readable, writable, a function key), not the F0Md/F1Md the dtsi names; with the dtsi's names fan
+ * creation failed on the missing key. With the real keys the fans can be set by the kernel's
+ * thermal policy (the M5 GPU governor, through macsmc_hwmon_fans_request()). No
+ * apple,fan-manual-control: userspace still only reads them.
+ */
+&smc_hwmon {
+	fan-F0Ac {
+		apple,fan-mode = "F0md";
+	};
+
+	fan-F1Ac {
+		apple,fan-mode = "F1md";
+	};
+};
+
+/*
+ * The boot NOR's NVRAM: the loader fills the partition from ADT /arm-io/qspi/spinor/anvram reg
+ * (0x700000, 0xc0000 here), 12 banks of 64 KiB (/chosen nvram-bank-count, nvram-bank-size). The
+ * flash is spinor's CS0 (its reg's first cell; the second is 0x19, 25), clocked as on T8140's
+ * J700. Only this partition is exposed (no MTD_PARTITIONED_MASTER), so the rest of the boot NOR
+ * has no device node, and the controller's T8140 policy admits programs and erases only inside
+ * this partition.
+ */
+&qspi {
+	status = "okay";
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <25000000>;
+		/* Single-wire, as on T8132's J713: no quad-enable status write at probe */
+		spi-rx-bus-width = <1>;
+		spi-tx-bus-width = <1>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			nvram: partition@700000 {
+				label = "nvram";
+				/* To be filled by the loader */
+				reg = <0x0 0x0>;
+				status = "disabled";
+			};
+		};
+	};
+};
+
+/*
+ * The HDMI converter's two power outputs (ADT dp2hdmi-gpio1): line 0 hdmi_pwr_en ('pcIO',
+ * 0x800000, 0xf0000), line 1 dp2hdmi_pwr_en ('pcIO', 0x0, 0x1a0000). Nothing drives them until
+ * the HDMI output does.
+ */
+&smc_pcio {
+	apple,output-commands = /bits/ 64 <0x000f000000800000 0x001a000000000000>;
+};
+
+/*
+ * The USB-C ports: rear ports 1-4 on ATC0-3 of die 0, front ports 5 and 6 on ATC0 and ATC1 of
+ * die 1. The HPMs of the rear ports are on nub-spmi-a0, those of the front ports on nub-spmi-a2.
+ */
+&nub_spmi_a0 {
+	/*
+	 * /arm-io/nub-spmi-a0/hpm0: SN201202x (ACE3), SPMI address 0xc, port-number 1 (back-right).
+	 * Reserved: rear port 1 carries the DFU cable, the host's VDM reboot path and the
+	 * debug console (KIS) through usb-drd0; a probe wakes the controller and sets its
+	 * power state even when polled. No ATC0, usb-drd0 or dart-usb0 node either.
+	 */
+	hpm0: usb-pd@c {
+		compatible = "apple,sn201202x";
+		reg = <0xc SPMI_USID>;
+		status = "disabled";
+	};
+
+	/* /arm-io/nub-spmi-a0/hpm1: SN201202x (ACE3), SPMI address 0xa, port-number 2 */
+	hpm1: usb-pd@a {
+		compatible = "apple,sn201202x";
+		reg = <0xa SPMI_USID>;
+
+		connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Back-right-middle";
+			power-role = "dual";
+			data-role = "host";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					hpm1_hs: endpoint {
+						remote-endpoint = <&usb_drd1_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					hpm1_ss: endpoint {
+						remote-endpoint = <&atc1_phy_ep>;
+					};
+				};
+			};
+		};
+	};
+
+	/* /arm-io/nub-spmi-a0/hpm2: SN201202x (ACE3), SPMI address 8, port-number 3 */
+	hpm2: usb-pd@8 {
+		compatible = "apple,sn201202x";
+		reg = <0x8 SPMI_USID>;
+		status = "disabled";
+
+		connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Back-left-middle";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					hpm2_hs: endpoint {
+						remote-endpoint = <&usb_drd2_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					hpm2_ss: endpoint {
+						remote-endpoint = <&atc2_phy_ep>;
+					};
+				};
+
+				port@2 {
+					reg = <2>;
+					hpm2_dp: endpoint {
+						remote-endpoint = <&dcpext0_typec>;
+					};
+				};
+			};
+		};
+	};
+
+	/* /arm-io/nub-spmi-a0/hpm3: SN201202x (ACE3), SPMI address 6, port-number 4 */
+	hpm3: usb-pd@6 {
+		compatible = "apple,sn201202x";
+		reg = <0x6 SPMI_USID>;
+
+		connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Back-left";
+			power-role = "dual";
+			data-role = "host";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					hpm3_hs: endpoint {
+						remote-endpoint = <&usb_drd3_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					hpm3_ss: endpoint {
+						remote-endpoint = <&atc3_phy_ep>;
+					};
+				};
+
+				/* The USB4 router (usb4_3_acio), the PD driver's thunderbolt-switch */
+				port@2 {
+					reg = <2>;
+					hpm3_tbt: endpoint {
+						remote-endpoint = <&usb4_3_ep>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&nub_spmi_a2 {
+	/* /arm-io/nub-spmi-a2/hpm4: SN201202x (ACE3), SPMI address 0xc, port-number 5 */
+	hpm4: usb-pd@c {
+		compatible = "apple,sn201202x";
+		reg = <0xc SPMI_USID>;
+
+		connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Front-right";
+			power-role = "dual";
+			data-role = "host";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					hpm4_hs: endpoint {
+						remote-endpoint = <&usb_drd4_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					hpm4_ss: endpoint {
+						remote-endpoint = <&atc4_phy_ep>;
+					};
+				};
+			};
+		};
+	};
+
+	/* /arm-io/nub-spmi-a2/hpm5: SN201202x (ACE3), SPMI address 0xa, port-number 6 */
+	hpm5: usb-pd@a {
+		compatible = "apple,sn201202x";
+		reg = <0xa SPMI_USID>;
+
+		connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Front-left";
+			power-role = "dual";
+			data-role = "host";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					hpm5_hs: endpoint {
+						remote-endpoint = <&usb_drd5_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					hpm5_ss: endpoint {
+						remote-endpoint = <&atc5_phy_ep>;
+					};
+				};
+			};
+		};
+	};
+};
+
+/*
+ * Rear USB-C port 2 (HPM1, "back-right-middle"), USB data: ATC1's combo PHY, usb-drd1 and
+ * dart-usb1.
+ */
+&atc1_phy {
+	port {
+		atc1_phy_ep: endpoint {
+			remote-endpoint = <&hpm1_ss>;
+		};
+	};
+};
+
+&usb_drd1 {
+	port {
+		usb_drd1_hs: endpoint {
+			remote-endpoint = <&hpm1_hs>;
+		};
+	};
+};
+
+/*
+ * Rear USB-C port 3 (HPM2, "back-left-middle", the display port): DisplayPort out from dcpext0
+ * through ATC2, and USB beside it (usb-drd2, dart-usb2). The chain stays disabled: Aura's T6050
+ * display handoff enables what dcpext0 references (phys, mux-controls, the PHY's mailbox and
+ * power domains, the typec route's HPM and its SPMI bus).
+ */
+&atc2_phy {
+	port {
+		atc2_phy_ep: endpoint {
+			remote-endpoint = <&hpm2_ss>;
+		};
+	};
+};
+
+&usb_drd2 {
+	port {
+		usb_drd2_hs: endpoint {
+			remote-endpoint = <&hpm2_hs>;
+		};
+	};
+};
+
+&dcpext0 {
+	typec-routes {
+		route@0 {
+			port {
+				dcpext0_typec: endpoint {
+					remote-endpoint = <&hpm2_dp>;
+				};
+			};
+		};
+	};
+};
+
+/* Rear USB-C port 4 (HPM3, "back-left"): ATC3, and its USB4/Thunderbolt router */
+&atc3_phy {
+	port {
+		atc3_phy_ep: endpoint {
+			remote-endpoint = <&hpm3_ss>;
+		};
+	};
+};
+
+&usb_drd3 {
+	port {
+		usb_drd3_hs: endpoint {
+			remote-endpoint = <&hpm3_hs>;
+		};
+	};
+};
+
+&usb4_3_acio {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@1 {
+			reg = <1>;
+			usb4_3_ep: endpoint {
+				remote-endpoint = <&hpm3_tbt>;
+			};
+		};
+	};
+};
+
+/* Front USB-C port 5 (HPM4, "front-right"): die 1's ATC0 */
+&atc4_phy {
+	port {
+		atc4_phy_ep: endpoint {
+			remote-endpoint = <&hpm4_ss>;
+		};
+	};
+};
+
+&usb_drd4 {
+	port {
+		usb_drd4_hs: endpoint {
+			remote-endpoint = <&hpm4_hs>;
+		};
+	};
+};
+
+/* Front USB-C port 6 (HPM5, "front-left"): die 1's ATC1 */
+&atc1_phy_die1 {
+	port {
+		atc5_phy_ep: endpoint {
+			remote-endpoint = <&hpm5_ss>;
+		};
+	};
+};
+
+&usb_drd1_die1 {
+	port {
+		usb_drd5_hs: endpoint {
+			remote-endpoint = <&hpm5_hs>;
+		};
+	};
+};
+
+/*
+ * The HDMI port: dcpext4, die 1's dcpext0, through its fixed route (die 1's display crossbar,
+ * ufp endpoint 0, to lpdptx-phy1, dfp endpoint 4). Aura's T6050 handoff enables it with dcpext0
+ * when the engine passes the same checks. No output yet: the HDMI PHY, its converter's power and
+ * hotplug come with their drivers.
+ */
+&dcpext0_die1 {
+	apple,connector-type = "HDMI-A";
+	apple,dptx-die = <1>;
+	apple,dptx-phy = <4>;
+	/*
+	 * The fixed HDMI route: the PHY (its source select picks this engine: the crossbar has no
+	 * registers), the converter's hotplug output (AOP GPIO 14, active high) and its two power
+	 * enables (the SMC's pcIO pins 15 and 26).
+	 */
+	phys = <&lpdptx_phy1>;
+	phy-names = "dp-phy";
+	hdmi-hpd-gpios = <&pinctrl_aop 14 GPIO_ACTIVE_HIGH>;
+	hdmi-pwren-gpios = <&smc_pcio 0 GPIO_ACTIVE_HIGH>;
+	dp2hdmi-pwren-gpios = <&smc_pcio 1 GPIO_ACTIVE_HIGH>;
+};
+
+#define T6050_J775D
+#include "t6050-peripherals.dtsi"

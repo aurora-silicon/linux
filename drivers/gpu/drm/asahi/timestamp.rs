@@ -3,14 +3,14 @@
 //! Prepared timestamp destinations shared by native command completion paths.
 
 use crate::mmu;
-#[cfg(CONFIG_DRM_ASAHI_G16)]
+#[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
 use crate::{file, gem};
-#[cfg(CONFIG_DRM_ASAHI_G16)]
+#[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
 use core::ops::Range;
-#[cfg(CONFIG_DRM_ASAHI_G16)]
+#[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
 use core::sync::atomic::{fence as barrier, Ordering};
 use kernel::{prelude::*, sync::Arc};
-#[cfg(CONFIG_DRM_ASAHI_G16)]
+#[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
 use kernel::{uapi, xarray};
 
 /// A firmware-mapped timestamp buffer with a kernel CPU mapping of its backing, kept for the
@@ -18,6 +18,8 @@ use kernel::{uapi, xarray};
 pub(crate) struct FirmwareBuffer {
     mapping: Arc<mmu::KernelMapping>,
     cpu: mmu::TimestampVmap,
+    /// Mapped in the firmware's timestamp window: the firmware may write stamps itself.
+    window: bool,
 }
 
 /// A bound timestamp destination. Only backends which publish firmware writes need a UAT alias.
@@ -27,7 +29,7 @@ pub(crate) enum Buffer {
     /// releasing the CPU mapping takes the reservation lock: the deferral runs the release
     /// on the cleanup queue.
     Firmware(crate::cleanup::Deferred<FirmwareBuffer>),
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
     Cpu {
         // The GEM pin keeps the object's held SG table alive through CPU publication.
         gem: gem::KernelMappingPin,
@@ -37,15 +39,46 @@ pub(crate) enum Buffer {
 
 impl Buffer {
     pub(crate) fn firmware(mapping: mmu::KernelMapping) -> Result<Self> {
+        Self::new_firmware(mapping, false)
+    }
+
+    /// A buffer aliased in the firmware's timestamp window.
+    pub(crate) fn firmware_window(mapping: mmu::KernelMapping) -> Result<Self> {
+        Self::new_firmware(mapping, true)
+    }
+
+    fn new_firmware(mapping: mmu::KernelMapping, window: bool) -> Result<Self> {
         let cpu = mapping.timestamp_vmap()?;
         Ok(Self::Firmware(crate::cleanup::Deferred::new(FirmwareBuffer {
             mapping: Arc::new(mapping, GFP_KERNEL)?,
             cpu,
+            window,
         })?))
     }
 
+    /// The window address of the timestamp at `offset`, for a window buffer and an aligned
+    /// destination that lies wholly inside the mapping.
+    pub(crate) fn window_va(&self, offset: usize) -> Option<u64> {
+        match self {
+            Self::Firmware(buffer) if buffer.window && offset % size_of::<u64>() == 0 => {
+                let end = offset.checked_add(size_of::<u64>())?;
+                (end <= buffer.mapping.size()).then(|| buffer.mapping.iova() + offset as u64)
+            }
+            _ => None,
+        }
+    }
+
+    /// Reads the aligned timestamp at an object offset returned by [`Self::timestamp_offset`].
+    pub(crate) fn read_timestamp(&self, offset: usize) -> Option<u64> {
+        match self {
+            Self::Firmware(buffer) => buffer.cpu.read(offset),
+            #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
+            Self::Cpu { .. } => None,
+        }
+    }
+
     /// Retain a CPU-written byte range without publishing any firmware address.
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
     pub(crate) fn cpu(bo: gem::ObjectRef, range: Range<usize>) -> Result<Self> {
         let size = range.end.checked_sub(range.start).ok_or(EINVAL)?;
         if size == 0 || (range.start | size) & mmu::UAT_PGMSK != 0 || range.end > bo.size() {
@@ -61,16 +94,16 @@ impl Buffer {
     pub(crate) fn size(&self) -> usize {
         match self {
             Self::Firmware(buffer) => buffer.mapping.size(),
-            #[cfg(CONFIG_DRM_ASAHI_G16)]
+            #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
             Self::Cpu { range, .. } => range.end - range.start,
         }
     }
 
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
     pub(crate) fn timestamp_mapping(&self, offset: usize) -> Result<mmu::TimestampMapping> {
         match self {
             Self::Firmware(buffer) => buffer.mapping.timestamp_mapping(offset),
-            #[cfg(CONFIG_DRM_ASAHI_G16)]
+            #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
             Self::Cpu { gem, range, .. } => {
                 if offset.checked_add(size_of::<u64>()).ok_or(EOVERFLOW)? > self.size() {
                     return Err(ERANGE);
@@ -85,7 +118,7 @@ impl Buffer {
     pub(crate) fn timestamp_offset(&self, offset: usize) -> Result<usize> {
         match self {
             Self::Firmware(buffer) => buffer.mapping.timestamp_offset(offset),
-            #[cfg(CONFIG_DRM_ASAHI_G16)]
+            #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
             Self::Cpu { .. } => Err(EINVAL),
         }
     }
@@ -95,7 +128,7 @@ impl Buffer {
     pub(crate) fn write_timestamp(&self, offset: usize, value: u64) {
         match self {
             Self::Firmware(buffer) => buffer.cpu.write(offset, value),
-            #[cfg(CONFIG_DRM_ASAHI_G16)]
+            #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
             Self::Cpu { .. } => {}
         }
     }
@@ -104,13 +137,13 @@ impl Buffer {
     pub(crate) fn firmware_mapping(&self) -> Result<Arc<mmu::KernelMapping>> {
         match self {
             Self::Firmware(buffer) => Ok(buffer.mapping.clone()),
-            #[cfg(CONFIG_DRM_ASAHI_G16)]
+            #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
             Self::Cpu { .. } => Err(EINVAL),
         }
     }
 }
 
-#[cfg(CONFIG_DRM_ASAHI_G16)]
+#[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
 fn checked_offset(offset: u64, size: usize, aligned: bool) -> Result<usize> {
     let offset = usize::try_from(offset).map_err(|_| EINVAL)?;
     let end = offset.checked_add(size_of::<u64>()).ok_or(EINVAL)?;
@@ -123,14 +156,14 @@ fn checked_offset(offset: u64, size: usize, aligned: bool) -> Result<usize> {
     Ok(offset)
 }
 
-#[cfg(CONFIG_DRM_ASAHI_G16)]
+#[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
 struct Destination {
     // Retain the bound range and backing along with its prepared CPU view.
     _mapping: Arc<Buffer>,
     cpu: mmu::TimestampMapping,
 }
 
-#[cfg(CONFIG_DRM_ASAHI_G16)]
+#[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
 impl Destination {
     fn resolve(
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
@@ -165,17 +198,27 @@ impl Destination {
 }
 
 /// Timestamp mappings resolved and retained before any command is enqueued.
-#[cfg(CONFIG_DRM_ASAHI_G16)]
+#[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
 pub(crate) struct Destinations(Option<crate::cleanup::Deferred<[Option<Destination>; 4]>>);
 
-#[cfg(CONFIG_DRM_ASAHI_G16)]
+#[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
 impl Destinations {
     /// G16 retains its eight-byte destination alignment and EINVAL contract.
+    #[cfg(CONFIG_DRM_ASAHI_G16)]
     pub(crate) fn resolve_aligned(
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
         timestamps: &[uapi::drm_asahi_timestamps],
     ) -> Result<Self> {
         Self::resolve_inner(objects, timestamps, true)
+    }
+
+    /// G18 keeps module 1134's rule: any in-range offset, ERANGE beyond the buffer.
+    #[cfg(CONFIG_DRM_ASAHI_G18)]
+    pub(crate) fn resolve_unaligned(
+        objects: Pin<&xarray::XArray<KBox<file::Object>>>,
+        timestamps: &[uapi::drm_asahi_timestamps],
+    ) -> Result<Self> {
+        Self::resolve_inner(objects, timestamps, false)
     }
 
     fn resolve_inner(

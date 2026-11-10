@@ -22,6 +22,10 @@ mod gem;
 
 #[cfg(CONFIG_DRM_ASAHI_G16)]
 mod g16;
+#[cfg(CONFIG_DRM_ASAHI_G18)]
+mod g18;
+#[cfg(CONFIG_DRM_ASAHI_M5)]
+mod m5;
 mod gpu;
 mod hw;
 mod initdata;
@@ -33,9 +37,12 @@ mod mmu;
 mod object;
 mod pgtable;
 mod queue;
+mod queue_share;
 mod regs;
+mod retain;
 mod slotalloc;
 mod stats;
+mod stats_busy;
 mod stats_raw;
 mod sysfs_exports;
 mod timestamp;
@@ -78,6 +85,9 @@ struct DriverModule {
     _g15: G15Registration,
     // Field drop order unregisters/joins driver producers before queue teardown.
     _g16: Option<Pin<KBox<G16Registration>>>,
+    #[cfg(CONFIG_DRM_ASAHI_G18)]
+    #[pin]
+    _g18: kernel::driver::Registration<kernel::platform::Adapter<g18::probe::Driver>>,
     #[pin]
     _driver: kernel::driver::Registration<kernel::platform::Adapter<driver::AsahiPlatformDriver>>,
     _cleanup: cleanup::QueueOwner,
@@ -89,6 +99,8 @@ impl kernel::InPlaceModule for DriverModule {
     fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
         // SAFETY: Module init runs once, before either adapter is registered below.
         unsafe { binding::init() };
+        // SAFETY: Module init runs once, before either adapter is registered below.
+        unsafe { queue_share::init() };
         try_pin_init!(Self {
             // Initialize the queue first, before registration can invoke probe.
             _cleanup: cleanup::QueueOwner::new()?,
@@ -99,6 +111,8 @@ impl kernel::InPlaceModule for DriverModule {
                 module,
             ),
             _g16: register_g16(module)?,
+            #[cfg(CONFIG_DRM_ASAHI_G18)]
+            _g18 <- kernel::driver::Registration::new(g18::probe::DRIVER_NAME, module),
             // All fallible fields are initialized. This final unit initializer cannot fail.
             #[cfg(CONFIG_DRM_ASAHI_G15)]
             _g15_ready: g15::activate(),
@@ -113,6 +127,22 @@ module! {
     license: "Dual MIT/GPL",
     alias: ["asahi"],
     params: {
+        m5_mesh_storage_chunks: u32 {
+            default: 0x200,
+            description: "M5 mesh rendering buffer bound to API task (object-stage) render kicks only, in 64 KiB chunks; 0 disables the binding and the task feature",
+        },
+        m5_thermal_governor: u32 {
+            default: 0,
+            description: "M5 thermal flags: bit 0 enables the host GPU power budget controller, bit 2 lets the controller lower the CPU frequency ceiling while the GPU is budget-bound, bit 3 runs the fans at their maximum while it governs; default 0 preserves the existing policy",
+        },
+        m5_thermal_target_mc: u32 {
+            default: 90000,
+            description: "M5 GPU power budget governor target for the SoC hotspot temperature computed by the SMC, in milli-degrees C (70000..104000)",
+        },
+        m5_depth_msaa_compression: u32 {
+            default: 1,
+            description: "Enable single-layer D32 compressed 2x/4x ZLS admission",
+        },
         debug_flags: u64 {
             default: 0,
             // permissions: 0o644,
@@ -197,6 +227,10 @@ module! {
         oom_attribution: u8 {
             default: 1,
             description: "Count held GPU memory in its creator's RSS for the OOM killer (1 = on)",
+        },
+        m5_fw_trace: u32 {
+            default: 0,
+            description: "M5: firmware trace classes (power bit 0, submission bit 1, recovery classifier bit 9)",
         },
         g16_deadline_ms: u32 {
             default: 5000,

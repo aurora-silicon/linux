@@ -156,18 +156,110 @@ static void apr_test_desc_rejects(struct kunit *test)
 	f = apr_test_frame();
 	f.profile = APR_PROFILE_4444;		/* 4:2:2 input, 4:4:4 profile */
 	KUNIT_EXPECT_EQ(test, apr_build_desc(&f, d), -EINVAL);
+	KUNIT_EXPECT_EQ(test, apr_build_desc_v0(&f, d), -EINVAL);
 	f = apr_test_frame();
 	f.luma_stride = 600;			/* not a multiple of 64 */
 	KUNIT_EXPECT_EQ(test, apr_build_desc(&f, d), -EINVAL);
+	KUNIT_EXPECT_EQ(test, apr_build_desc_v0(&f, d), -EINVAL);
 	f = apr_test_frame();
 	f.chroma_stride = 576;			/* shorter than a row */
 	KUNIT_EXPECT_EQ(test, apr_build_desc(&f, d), -EINVAL);
+	KUNIT_EXPECT_EQ(test, apr_build_desc_v0(&f, d), -EINVAL);
 	f = apr_test_frame();
 	f.width = 321;
 	KUNIT_EXPECT_EQ(test, apr_build_desc(&f, d), -EINVAL);
+	KUNIT_EXPECT_EQ(test, apr_build_desc_v0(&f, d), -EINVAL);
 	f = apr_test_frame();
 	f.output = 0;
 	KUNIT_EXPECT_EQ(test, apr_build_desc(&f, d), -EINVAL);
+	KUNIT_EXPECT_EQ(test, apr_build_desc_v0(&f, d), -EINVAL);
+}
+
+/* Legacy words from MIT m1n1 f3ac615eb137 experiments/prores.py:607-644. */
+static void apr_test_desc_v0(struct kunit *test)
+{
+	static const u32 legacy[] = {
+		0xffffffff, 0x15100c0c, 0x80004020, 0x002c8080,
+		0x00880080, 0x004e00c5, 0x009000d0, 0x00200122,
+		0x00400200, 0x00400200, 0x00400200, 0x00400200,
+		0x00400200, 0x00400200, 0x00400200, 0x00400200,
+		0x00400200, 0x00400200, 0x00400200, 0x00400200,
+		0x00400200, 0x00400200, 0x00400200, 0x00400200, 0x23,
+	};
+	struct apr_frame f = apr_test_frame();
+	u8 *d = kunit_kmalloc(test, APR_DESC_BYTES + 1, GFP_KERNEL);
+	unsigned int i;
+	u32 budget;
+
+	KUNIT_ASSERT_NOT_NULL(test, d);
+	memset(d, 0xa5, APR_DESC_BYTES + 1);
+	KUNIT_ASSERT_EQ(test, apr_build_desc_v0(&f, d), 0);
+	KUNIT_EXPECT_EQ(test, d[APR_DESC_BYTES], 0xa5);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(d), 0x363b);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 4), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 8), f.output);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 0x10), f.output_size);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x18), 320);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x1a), 240);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x20), 10);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x22), 10);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x28), f.luma);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x38), f.chroma);
+	KUNIT_EXPECT_EQ(test, get_unaligned_be16(d + 0x58), 148);
+	KUNIT_EXPECT_EQ(test, d[0x5b], 0);
+	KUNIT_EXPECT_MEMEQ(test, d + 0x5c, "aurr", 4);
+	KUNIT_EXPECT_EQ(test, get_unaligned_be16(d + 0x60), 320);
+	KUNIT_EXPECT_EQ(test, get_unaligned_be16(d + 0x62), 240);
+	KUNIT_EXPECT_EQ(test, d[0x64], 0x80);
+	KUNIT_EXPECT_EQ(test, d[0x65], 0);
+	KUNIT_EXPECT_EQ(test, d[0x66], f.primaries);
+	KUNIT_EXPECT_EQ(test, d[0x67], f.transfer);
+	KUNIT_EXPECT_EQ(test, d[0x68], f.matrix);
+	KUNIT_EXPECT_EQ(test, d[0x69], 0);
+	KUNIT_EXPECT_EQ(test, d[0x6a], 0);
+	KUNIT_EXPECT_EQ(test, d[0x6b], 3);
+	for (i = 0x6c; i < 0xee; i++)
+		KUNIT_EXPECT_EQ_MSG(test, d[i], 0, "padding/slices %#x", i);
+	KUNIT_EXPECT_EQ(test, d[0xee], 0x30);
+	KUNIT_EXPECT_EQ(test, d[0xef], 2);
+	/* Word 0 is the rate budget, checked against v1 below. */
+	for (i = 1; i < ARRAY_SIZE(legacy); i++)
+		KUNIT_EXPECT_EQ_MSG(test, get_unaligned_le32(d + 0xf0 + 4 * i),
+				    legacy[i], "legacy word %u", i);
+	budget = get_unaligned_le32(d + 0xf0);
+	for (i = 0x154; i < APR_DESC_BYTES; i++)
+		KUNIT_EXPECT_EQ_MSG(test, d[i], 0, "v0 trailing padding %#x", i);
+
+	/* Reusing the buffer for v1 must clear the old frame header. */
+	KUNIT_ASSERT_EQ(test, apr_build_desc(&f, d), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x58), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_be16(d + 0x7c), 148);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 0x170), 0x23);
+	/* v0 carries v1's target and maximum budget words. */
+	KUNIT_EXPECT_EQ(test, budget, get_unaligned_le32(d + 0x110));
+	KUNIT_EXPECT_NE(test, budget, 0xffffffff);
+}
+
+static void apr_test_desc_v0_profiles(struct kunit *test)
+{
+	struct apr_frame f = apr_test_frame();
+	u8 *d = kunit_kmalloc(test, APR_DESC_BYTES, GFP_KERNEL);
+	unsigned int profile;
+
+	KUNIT_ASSERT_NOT_NULL(test, d);
+	for (profile = 0; profile < APR_PROFILES; profile++) {
+		bool is444 = apr_profile_is_444(profile);
+
+		f.profile = profile;
+		f.input = is444 ? APR_INPUT_444_8 : APR_INPUT_422_16;
+		KUNIT_ASSERT_EQ(test, apr_build_desc_v0(&f, d), 0);
+		KUNIT_EXPECT_EQ(test, d[0x5b], is444 ? 1 : 0);
+		KUNIT_EXPECT_EQ(test, d[0x64], is444 ? 0xc0 : 0x80);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 0x150),
+				apr_profile_qtable(profile) << 4 | 3);
+		/* The v1 extension is never written into a v0 descriptor. */
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 0x170), 0);
+	}
 }
 
 static void apr_test_budgets(struct kunit *test)
@@ -251,6 +343,8 @@ static struct kunit_case apr_test_cases[] = {
 	KUNIT_CASE(apr_test_desc_422),
 	KUNIT_CASE(apr_test_desc_444),
 	KUNIT_CASE(apr_test_desc_rejects),
+	KUNIT_CASE(apr_test_desc_v0),
+	KUNIT_CASE(apr_test_desc_v0_profiles),
 	KUNIT_CASE(apr_test_budgets),
 	KUNIT_CASE(apr_test_slices),
 	KUNIT_CASE(apr_test_output),

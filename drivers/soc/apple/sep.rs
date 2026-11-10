@@ -18,6 +18,7 @@ mod dt;
 mod fv;
 mod hwrng;
 mod image;
+mod key;
 mod keybag;
 mod keybag_identity;
 mod os_identity;
@@ -90,6 +91,12 @@ use kernel::{
 };
 
 const SETTLE_MS: time::Msecs = 200;
+/// Messages on an endpoint without a handler are logged this many times per
+/// boot; diag/unhandled_messages counts them all.
+const UNHANDLED_LOG_LIMIT: u32 = 4;
+/// Users whose last logged lock state is remembered (a Mac has the system
+/// user 501 and one or two Linux users).
+pub(crate) const LOCK_STATE_LOG_USERS: usize = 4;
 const FIRST_RESPONSE_MS: time::Msecs = 3000;
 const RNG_SURVEY_ATTEMPTS: u32 = 5;
 
@@ -354,7 +361,8 @@ enum ImageOutcome {
         complete: bool,
         has_template: bool,
     },
-    Retry,
+    // The capture did not count; the guidance says why.
+    Retry(bio::Guidance),
     NoFinger,
     Failed(u32),
 }
@@ -419,6 +427,14 @@ static_assert!(ENROL_STATUS_UNFILED != ENROL_STATUS_TIMEOUT);
 static_assert!(ENROL_STATUS_UNFILED != ENROL_STATUS_TOO_MANY);
 
 const ENROL_STATUS_RETRY: u32 = 5;
+static_assert!(bio::ENROL_POLL_RETRY == ENROL_STATUS_RETRY);
+// 7 is SEP_BIO_STATUS_REJECTED in libfprint's aurora driver.
+// The enclave stopped matching after too many failed attempts. Only a
+// password authentication, through /dev/sep-bio-rearm, makes it match again.
+const ENROL_STATUS_LOCKOUT: u32 = 8;
+static_assert!(ENROL_STATUS_LOCKOUT != ENROL_STATUS_UNFILED);
+static_assert!(ENROL_STATUS_LOCKOUT != ENROL_STATUS_RETRY);
+static_assert!(ENROL_STATUS_LOCKOUT != ENROL_STATUS_ENCLAVE);
 static_assert!(ENROL_STATUS_RETRY != ENROL_STATUS_TIMEOUT);
 static_assert!(ENROL_STATUS_RETRY != ENROL_STATUS_ENCLAVE);
 static_assert!(ENROL_STATUS_RETRY != ENROL_STATUS_SENSOR);
@@ -439,11 +455,13 @@ const ENROL_CAPTURE_TIMEOUT_MS: u32 = 60_000;
 const ENROL_POLL_ATTEMPTS: u32 = ENROL_CAPTURE_TIMEOUT_MS / ENROL_POLL_MS;
 static_assert!(ENROL_POLL_ATTEMPTS * ENROL_POLL_MS == ENROL_CAPTURE_TIMEOUT_MS);
 
-const ENROL_REPOSITION_MS: u32 = 1800;
+// How long the next capture waits for the last touch's finger to be lifted
+// before it arms anyway: as long as a capture waits for a finger.
+const LIFT_WAIT_MS: u32 = ENROL_CAPTURE_TIMEOUT_MS;
 
-const MATCH_SETTLE_MS: u32 = ENROL_REPOSITION_MS;
-
-const ENROL_IDLE_TIMEOUT_MS: u32 = 2000;
+// The backstop interval of that wait. The sensor's interrupt wakes it at the
+// lift; this bounds a missed edge (macOS arms within 2 ms of the lift).
+const LIFT_POLL_MS: u32 = 20;
 
 const PATCH_POLL_MS: u32 = 20;
 const PATCH_POLL_ATTEMPTS: u32 = 250;
@@ -664,10 +682,43 @@ struct SepData {
     #[pin]
     enrol_material: Mutex<Option<EnrolMaterial>>,
 
+    // The SCRD context whose handle every match carries, so the enclave
+    // matches in the authenticated unlock scope of the Linux user. Replaced
+    // by each successful SCRD verification of the designated bag (boot and
+    // password re-arm); `match_context_generation` numbers them for the log.
+    #[pin]
+    match_context: Mutex<Option<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>>,
+    match_context_generation: Atomic<u32>,
+
+    // Every live cold-match credential: the SCRD contexts that a flags-0
+    // verification of the designated bag satisfied (two per boot: before and
+    // after the Catacomb restore). Nothing deleted them, so a password re-arm
+    // added a new one beside the old ones while the old ones stayed live, and
+    // only a restart of the enclave dropped them. A re-arm now retires them
+    // all before it sets up the new one, as a restart does.
+    #[pin]
+    cold_match_contexts: Mutex<KVec<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>>,
+
+    // The sensor stayed powered and registered after the last verify, so the
+    // next verify captures without a new bring-up, as macOS does. Cleared by
+    // anything that powers the sensor off or resets it.
+    sensor_kept: Atomic<bool>,
+
+    // The enclave announced (SBIO tag 0x03) that a background operation
+    // result is ready; it waits for the host to collect it with 0x21.
+    bg_ops_ready: Atomic<bool>,
+
+    // A template update was announced and its user/master pair is not yet
+    // persisted; matching stays off until it is.
+    persistence_owed: Atomic<bool>,
+
     #[pin]
     enrol_identity_candidates: Mutex<KVec<[u8; bio::UUID_LEN]>>,
 
-    last_capture_end_ns: Atomic<u64>,
+    // Boot-time clock when the sensor was paused after a touch whose finger
+    // may still be down, or 0. The next capture is armed once the sensor
+    // reports the finger lifted, as macOS does, instead of after a fixed pause.
+    paused_at_ns: Atomic<u64>,
 
     // Boot-time clock at the start of the last sensor power cycle, for
     // reporting how far into a bring-up a step failed.
@@ -720,6 +771,69 @@ struct SepData {
 
     #[pin]
     bio_dev: Mutex<Option<shim::BioChardev>>,
+
+    // /dev/sep-bio-rearm: reports the Touch ID lockout and clears it after a
+    // password authentication.
+    #[pin]
+    rearm_dev: Mutex<Option<shim::BioChardev>>,
+
+    // /dev/sep-key: P-256 keys created inside the SEP (see `key`).
+    #[pin]
+    key_dev: Mutex<Option<shim::BioChardev>>,
+
+    // /dev/sep-key: the signature a touch-gated SEP_KEY_SIGN is waiting for.
+    // Set only for the length of that ioctl; while set, a verify run belongs
+    // to it and not to /dev/sep-bio's session.
+    #[pin]
+    key_touch: Mutex<Option<crate::key::KeyTouch>>,
+    key_touch_active: Atomic<bool>,
+    // The enclave status of the last /dev/sep-key signature (self-test).
+    last_key_status: Atomic<u32>,
+
+    // The enclave refused to match (MATCH_RESULT answered 0x1) after failed
+    // attempts, or the lockout survived a restart. Every verify is refused
+    // without a capture until a password authentication re-arms Touch ID.
+    bio_lockout: Atomic<bool>,
+
+    // Touch ID waits for the first password since this boot
+    // (SEP_BIO_REQUIRE_PASSWORD): every verify is refused without a capture
+    // until a password authentication re-arms it. Never recorded.
+    bio_after_boot: Atomic<bool>,
+
+    // The refusal of a verify during a lockout has been logged.
+    bio_lockout_logged: Atomic<bool>,
+
+    // Failed matches since the last match or re-arm, across prompts.
+    bio_nomatch_streak: Atomic<u32>,
+
+    // A password cleared the failed attempts while a capture held the sensor
+    // lock; the enclave's own count is cleared at the next authentication.
+    enclave_failures_owed: Atomic<bool>,
+
+    // Opens of the Touch ID device. One open is one prompt: fprintd claims
+    // the device for one PAM authentication.
+    bio_open_gen: Atomic<u64>,
+
+    // The open whose prompt holds the live match operation and the unlock
+    // evaluation in `match_context`, or 0 when none is open.
+    match_scope_gen: Atomic<u64>,
+
+    // Touches in that prompt so far.
+    match_scope_touches: Atomic<u32>,
+
+    // Failed matches in that prompt so far.
+    match_scope_misses: Atomic<u32>,
+
+    // The enclave's most recent biometric lock-state notification: the
+    // state in bits 0-15 and the user in bits 16-47, or 0 before the first.
+    // `bio_lock_state_seq` counts them, so a waiter can tell a fresh one
+    // from a stale one.
+    bio_lock_state: Atomic<u64>,
+    bio_lock_state_seq: Atomic<u32>,
+    // The last state logged for each of the most recent users, in the same
+    // layout, so a repeated notification is not logged again. Notifications
+    // are handled one at a time, on the receive path.
+    bio_lock_logged: [Atomic<u64>; LOCK_STATE_LOG_USERS],
 
     #[pin]
     store: Mutex<Option<xart_store::Store>>,
@@ -857,6 +971,18 @@ impl SepData {
         let xart_start = module_parameters::xart_start_sector.value();
         let xart_guard =
             xart_guard::level(module_parameters::xart_guard.value(), profile.xart_guard);
+        // The qualified 26.6.2 lane uses only the boot-forwarded identity.
+        // Check before opening the shared xART store writable.
+        if profile::j613_26_6_2() && xart_writes {
+            if dt::preboot_uuid().is_none()
+                || module_parameters::os_uuid_hi.value() != 0
+                || module_parameters::os_uuid_lo.value() != 0
+                || xart_guard.is_none()
+            {
+                dev_err!(dev, "J613 26.6.2 requires a DT identity and xART guard\n");
+                return Err(EINVAL);
+            }
+        }
         let store = match xart_store::Store::open_owner(xart_writes, xart_start) {
             Ok(mut store) => {
                 match xart_guard {
@@ -897,6 +1023,10 @@ impl SepData {
         let mut host_store = match store::Store::open() {
             Ok(store) => Some(store),
             Err(e) => {
+                if profile::j613_26_6_2() {
+                    dev_err!(dev, "J613 26.6.2 host-state store unavailable: {:?}\n", e);
+                    return Err(e);
+                }
                 dev_warn!(dev, "Linux host-state store unavailable: {:?}\n", e);
                 None
             }
@@ -904,6 +1034,7 @@ impl SepData {
 
         let bio_index = match host_store.as_mut().map(bio::IdentityIndex::load) {
             Some(Ok(index)) => index,
+            Some(Err(e)) if profile::j613_26_6_2() => return Err(e),
             Some(Err(_)) => bio::IdentityIndex::new(),
             None => bio::IdentityIndex::new(),
         };
@@ -941,8 +1072,14 @@ impl SepData {
                 templates_restored: Atomic::new(false),
                 cold_restore_candidate: Atomic::new(false),
                 enrol_material <- new_mutex!(None),
+                match_context <- new_mutex!(None),
+                match_context_generation: Atomic::new(0),
+                cold_match_contexts <- new_mutex!(KVec::new()),
+                sensor_kept: Atomic::new(false),
+                bg_ops_ready: Atomic::new(false),
+                persistence_owed: Atomic::new(false),
                 enrol_identity_candidates <- new_mutex!(KVec::new()),
-                last_capture_end_ns: Atomic::new(0),
+                paused_at_ns: Atomic::new(0),
                 sensor_power_ns: Atomic::new(0),
                 device_view_synced: Atomic::new(false),
                 phase: Atomic::new(PHASE_ATTACH),
@@ -963,6 +1100,23 @@ impl SepData {
                 bio_session <- new_mutex!(bio::Session::new()),
                 bio_index <- new_mutex!(bio_index),
                 bio_dev <- new_mutex!(None),
+                rearm_dev <- new_mutex!(None),
+                key_dev <- new_mutex!(None),
+                key_touch <- new_mutex!(None),
+                key_touch_active: Atomic::new(false),
+                last_key_status: Atomic::new(0),
+                bio_lockout: Atomic::new(false),
+                bio_after_boot: Atomic::new(false),
+                bio_lockout_logged: Atomic::new(false),
+                bio_nomatch_streak: Atomic::new(0),
+                enclave_failures_owed: Atomic::new(false),
+                bio_open_gen: Atomic::new(0),
+                match_scope_gen: Atomic::new(0),
+                match_scope_touches: Atomic::new(0),
+                match_scope_misses: Atomic::new(0),
+                bio_lock_state: Atomic::new(0),
+                bio_lock_state_seq: Atomic::new(0),
+                bio_lock_logged: [Atomic::new(0), Atomic::new(0), Atomic::new(0), Atomic::new(0)],
                 store <- new_mutex!(store),
                 host_store <- new_mutex!(host_store),
                 xarm <- new_mutex!(XarmState::new()),
@@ -1420,11 +1574,14 @@ impl SepData {
         };
         this.rng_survey_attempts.store(attempt, Relaxed);
         match next {
-            control::Survey::Registered => dev_info!(
-                this.dev,
-                "hwrng: registered after ready-phase survey (attempt {})\n",
-                attempt
-            ),
+            control::Survey::Registered => {
+                diag::hwrng(true);
+                dev_info!(
+                    this.dev,
+                    "hwrng: registered after ready-phase survey (attempt {})\n",
+                    attempt
+                )
+            }
             // Asleep, or holding back after a request that went unanswered:
             // this attempt did not ask the enclave anything.
             control::Survey::Held => Self::arm_settle(this),
@@ -1432,12 +1589,15 @@ impl SepData {
                 dev_warn!(this.dev, "hwrng: survey attempt {} failed ({:?}); retrying\n", attempt, e);
                 Self::arm_settle(this);
             }
-            control::Survey::GiveUp(e) => dev_err!(
-                this.dev,
-                "hwrng: survey failed after {} attempts ({:?})\n",
-                attempt,
-                e
-            ),
+            control::Survey::GiveUp(e) => {
+                diag::hwrng(false);
+                dev_err!(
+                    this.dev,
+                    "hwrng: survey failed after {} attempts ({:?})\n",
+                    attempt,
+                    e
+                )
+            }
         }
     }
 
@@ -1551,14 +1711,20 @@ impl SepData {
         match os_identity::select(hi, lo, dt::preboot_uuid) {
             os_identity::Selection::Explicit(uuid) => {
                 self.xarm.lock().os_uuid = Some(uuid);
+                diag::identity_source(diag::IdentitySource::Override);
+                diag::os_identity(diag::OsIdentity::Explicit);
                 dev_info!(self.dev, "xART: using explicit OS identity\n");
             }
             os_identity::Selection::Chosen(uuid) => {
                 self.xarm.lock().os_uuid = Some(uuid);
+                diag::identity_source(diag::IdentitySource::DeviceTree);
+                diag::os_identity(diag::OsIdentity::Chosen);
                 dev_info!(self.dev, "xART: using /chosen/apfs-preboot-uuid\n");
             }
             os_identity::Selection::Unavailable => {
                 self.xarm.lock().os_uuid = None;
+                diag::identity_source(diag::IdentitySource::Missing);
+                diag::os_identity(diag::OsIdentity::Unavailable);
                 dev_warn!(self.dev, "xART: /chosen/apfs-preboot-uuid is unavailable\n");
             }
         }
@@ -1759,6 +1925,15 @@ impl SepData {
     }
 
     fn send_xarm_reply(&self, reply: &crate::xarm::XarmReply) {
+        // Each of these used to fail the enclave's request without a trace.
+        // Count them all and log the first, so a refusal is never silent.
+        if reply.status == xarm::STATUS_FAILED && diag::xarm_failed() == 1 {
+            dev_warn!(
+                self.dev,
+                "xART: answered a request (tag {:#04x}) with the failure status; diag/xarm_failures counts them\n",
+                reply.tag
+            );
+        }
         let msg = crate::xarm::encode_xarm_reply(reply);
         let _ = self.send(msg);
     }
@@ -2026,11 +2201,165 @@ impl SepData {
             if out.reply.status != 0 {
                 return None;
             }
-            self.scrd_command(&crate::scrd::scrd_verify_touchid_enrollment(&acm_handle))?;
+            let (status, out) =
+                self.scrd_command(&crate::scrd::scrd_verify_touchid_enrollment(&acm_handle))?;
+            let satisfied = out.len() >= 4 && u32::from_le_bytes([out[0], out[1], out[2], out[3]]) != 0;
+            if status != 0 || !satisfied {
+                return None;
+            }
             Some(acm_handle)
-        })().is_some();
-        dev_info!(self.dev, "scrd: cold-match credential established {}\n", established);
-        established
+        })();
+        let ok = established.is_some();
+        let live = match established {
+            Some(handle) => {
+                let mut contexts = self.cold_match_contexts.lock();
+                if contexts.push(handle, GFP_KERNEL).is_err() {
+                    dev_warn!(self.dev, "scrd: could not track the new cold-match credential\n");
+                }
+                contexts.len()
+            }
+            None => self.cold_match_contexts.lock().len(),
+        };
+        dev_info!(self.dev, "scrd: cold-match credential established {} ({} live)\n", ok, live);
+        ok
+    }
+
+    /// Deletes every cold-match credential this boot set up. Returns how many
+    /// the enclave deleted and how many it refused. Logs counts only.
+    pub(crate) fn retire_cold_match_contexts(&self) -> (usize, usize) {
+        let old = core::mem::replace(&mut *self.cold_match_contexts.lock(), KVec::new());
+        let (mut deleted, mut refused) = (0usize, 0usize);
+        for handle in old.iter() {
+            match self.scrd_command(&crate::scrd::scrd_context_delete(handle)) {
+                Some((0, _)) => deleted += 1,
+                other => {
+                    refused += 1;
+                    dev_warn!(
+                        self.dev,
+                        "scrd: deleting a cold-match credential answered {:?}\n",
+                        other.map(|(status, _)| status)
+                    );
+                }
+            }
+        }
+        dev_info!(
+            self.dev,
+            "scrd: retired {} cold-match credential(s), {} refused\n",
+            deleted,
+            refused
+        );
+        (deleted, refused)
+    }
+
+    /// Opens the evaluation one verify matches under: a fresh tracked
+    /// context for `user`, externalised, whose unlock policy preflight leaves
+    /// exactly a biometric match outstanding. The context is not satisfied in
+    /// advance; the match satisfies it. Logs metadata only.
+    pub(crate) fn open_unlock_evaluation(
+        &self,
+        user: crate::sbio::UserId,
+    ) -> Option<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]> {
+        if !self.scrd_ready() {
+            dev_err!(self.dev, "scrd: unlock evaluation: endpoint not ready\n");
+            return None;
+        }
+        let (status, _) = self.scrd_command(&crate::scrd::scrd_initialize())?;
+        if status != 0 {
+            dev_err!(self.dev, "scrd: unlock evaluation: initialize answered {}\n", status);
+            return None;
+        }
+        let (status, out) =
+            self.scrd_command(&crate::scrd::scrd_context_create_tracked(user.value()))?;
+        let Some(handle) = crate::scrd::tracked_create_reference(&out).filter(|_| status == 0) else {
+            dev_err!(
+                self.dev,
+                "scrd: unlock evaluation: tracked create answered {} with {} reply bytes\n",
+                status,
+                out.len()
+            );
+            return None;
+        };
+        let opened = (|| -> Option<()> {
+            let (status, _) = self.scrd_command(&crate::scrd::scrd_context_externalize(&handle))?;
+            if status != 0 {
+                dev_err!(self.dev, "scrd: unlock evaluation: externalize answered {}\n", status);
+                return None;
+            }
+            let cmd = crate::scrd::scrd_verify_unlock_policy(&handle, user.value(), true);
+            let request_len = cmd.payload().len();
+            let (status, out) = self.scrd_command(&cmd)?;
+            let answer = crate::scrd::parse_policy_answer(&out);
+            let generation = self.match_context_generation.load(Relaxed).wrapping_add(1);
+            match answer {
+                Some(a) => dev_info!(
+                    self.dev,
+                    "scrd: unlock preflight: policy device-owner-biometry, user {}, request {:#x}, parameters 1, status {}, satisfied {}, requirement {:?}, generation {}\n",
+                    user.value(),
+                    request_len,
+                    status,
+                    a.satisfied,
+                    a.requirement,
+                    generation
+                ),
+                None => dev_err!(
+                    self.dev,
+                    "scrd: unlock preflight: status {}, malformed answer of {} bytes\n",
+                    status,
+                    out.len()
+                ),
+            }
+            let a = answer?;
+            // A biometric match must be outstanding. Flags bit 0 is opaque
+            // mechanism metadata the backend may set; nothing else may be.
+            let admitted = matches!(
+                a.requirement,
+                Some((ty, 1, flags)) if ty == crate::scrd::SCRD_REQUIREMENT_BIOMETRY_MATCHED && flags & !1 == 0
+            );
+            if status != 0 || a.satisfied || !admitted {
+                return None;
+            }
+            if a.requirement.is_some_and(|(_, _, flags)| flags & 1 != 0) {
+                dev_info!(self.dev, "scrd: unlock preflight: requirement carries acm-mechanism-bit0\n");
+            }
+            Some(())
+        })();
+        if opened.is_none() {
+            self.close_unlock_evaluation(&handle);
+            return None;
+        }
+        self.match_context_generation.fetch_add(1, Relaxed);
+        Some(handle)
+    }
+
+    /// The final, non-preflight unlock policy after an enrolled match. Only a
+    /// satisfied answer completes the evaluation.
+    pub(crate) fn complete_unlock_evaluation(
+        &self,
+        handle: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN],
+        user: crate::sbio::UserId,
+    ) -> bool {
+        let answer = self
+            .scrd_command(&crate::scrd::scrd_verify_unlock_policy(handle, user.value(), false))
+            .map(|(status, out)| (status, crate::scrd::parse_policy_answer(&out)));
+        let satisfied = matches!(answer, Some((0, Some(a))) if a.satisfied);
+        dev_info!(
+            self.dev,
+            "scrd: unlock policy after the match: satisfied {}, generation {}\n",
+            satisfied,
+            self.match_context_generation.load(Relaxed)
+        );
+        satisfied
+    }
+
+    pub(crate) fn close_unlock_evaluation(&self, handle: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) {
+        match self.scrd_command(&crate::scrd::scrd_context_delete(handle)) {
+            Some((0, _)) => {}
+            other => dev_warn!(
+                self.dev,
+                "scrd: deleting the unlock evaluation answered {:?}\n",
+                other.map(|(status, _)| status)
+            ),
+        }
     }
 
 
@@ -2233,6 +2562,7 @@ impl SepData {
 
         this.run_bringup();
         diag::bringup_ended();
+        diag::log_summary(&this.dev);
         this.finish_bringup();
         Self::arm_settle(this);
     }
@@ -2305,7 +2635,13 @@ impl SepData {
 
             proto::EP_BOOT => self.on_boot(msg),
 
-            ep => dev_info!(self.dev, "rx: unhandled endpoint {:#04x} (msg0 {:#018x})\n", ep, msg.msg0),
+            ep => {
+                // Counted in diag/unhandled_messages; logged the first few
+                // times only, so a chatty endpoint cannot flood the log.
+                if diag::unhandled() <= UNHANDLED_LOG_LIMIT {
+                    dev_info!(self.dev, "rx: unhandled endpoint {:#04x} (msg0 {:#018x})\n", ep, msg.msg0);
+                }
+            }
         }
     }
 
@@ -2341,7 +2677,13 @@ impl SepData {
             proto::DISCOVER_TYPE_DESCRIPTOR | proto::DISCOVER_TYPE_CONFIG => {
                 let _ = table.slot(f.param);
                 diag::endpoints(table.eps.len());
-                dev_info!(
+                if f.ty == proto::DISCOVER_TYPE_DESCRIPTOR {
+                    diag::endpoint(f.param, (msg.msg0 >> 32) as u32);
+                }
+                // One summary line follows at the end of the bring-up, and
+                // diag/endpoint_names lists them; keep the per-message trace
+                // at debug level.
+                dev_dbg!(
                     self.dev,
                     "discover: endpoint {:#04x} (type {}, msg0 {:#018x}); {} known\n",
                     f.param,
@@ -2350,7 +2692,7 @@ impl SepData {
                     table.eps.len()
                 );
             }
-            ty => dev_info!(self.dev, "discover: other type {} (msg0 {:#018x})\n", ty, msg.msg0),
+            ty => dev_dbg!(self.dev, "discover: other type {} (msg0 {:#018x})\n", ty, msg.msg0),
         }
     }
 
@@ -2376,6 +2718,10 @@ impl SepData {
         self.unregister_fv_kernel();
 
         let dev = self.bio_dev.lock().take();
+        drop(dev);
+        let dev = self.rearm_dev.lock().take();
+        drop(dev);
+        let dev = self.key_dev.lock().take();
         drop(dev);
 
         self.rng_shutdown.store(true, Relaxed);
@@ -2403,6 +2749,7 @@ impl SepData {
             );
         }
 
+        self.sensor_kept.store(false, Relaxed);
         sensor::power(false);
         sensor::unregister_driver();
         self.release_firmware_mapping();
@@ -2502,6 +2849,36 @@ unsafe extern "C" fn bio_ready_trampoline(ctx: *mut c_void) -> c_int {
     // SAFETY: per the contract above.
     let this = unsafe { &*ctx.cast::<SepData>() };
     c_int::from(this.bio_ready())
+}
+
+// /dev/sep-bio-rearm has no session: any number of root openers, no poll.
+
+/// # Safety
+unsafe extern "C" fn rearm_open_trampoline(ctx: *mut c_void) -> c_int {
+    // SAFETY: per the contract above.
+    let this = unsafe { &*ctx.cast::<SepData>() };
+    if this.shutting_down.load(Relaxed) {
+        return ENODEV.to_errno();
+    }
+    0
+}
+
+/// # Safety
+unsafe extern "C" fn rearm_release_trampoline(_ctx: *mut c_void) {}
+
+/// # Safety
+unsafe extern "C" fn rearm_ioctl_trampoline(ctx: *mut c_void, cmd: c_uint, arg: c_ulong) -> c_long {
+    // SAFETY: per the contract above.
+    let this = unsafe { &*ctx.cast::<SepData>() };
+    match this.rearm_ioctl(cmd, arg) {
+        Ok(()) => 0,
+        Err(e) => e.to_errno() as c_long,
+    }
+}
+
+/// # Safety
+unsafe extern "C" fn rearm_ready_trampoline(_ctx: *mut c_void) -> c_int {
+    0
 }
 
 /// # Safety
@@ -2660,7 +3037,16 @@ impl platform::Driver for SepDriver {
         // As soon as the fixed facts are known, so a tool can watch the attach
         // from "pending" on. Diagnostics are not worth failing the probe for.
         let guard = data.with_store(|store| store.guard_state()).flatten();
-        if let Err(e) = diag::register(dev, data.profile, data.xart_writable(), guard) {
+        let policy = diag::Policy {
+            provision_keybag: module_parameters::provision_keybag.value() != 0,
+            trusted_keys: module_parameters::trusted_keys.value() != 0,
+            filevault_api: module_parameters::filevault_api.value() != 0,
+            xarm_trace: module_parameters::xarm_trace.value() != 0,
+            refkey_v2: module_parameters::refkey_v2.value() != 0,
+            identity_override: module_parameters::os_uuid_hi.value() != 0
+                || module_parameters::os_uuid_lo.value() != 0,
+        };
+        if let Err(e) = diag::register(dev, data.profile, data.xart_writable(), guard, policy) {
             dev_warn!(dev, "diag: could not add the sysfs attributes ({:?})\n", e);
         }
 
@@ -2668,12 +3054,16 @@ impl platform::Driver for SepDriver {
 
         data.attach(&sep_node)?;
 
-        if let Err(e) = data.register_fv_kernel() {
-            dev_err!(dev, "could not register the FileVault kernel API: {:?}\n", e);
+        if module_parameters::filevault_api.value() != 0 {
+            if let Err(e) = data.register_fv_kernel() {
+                dev_err!(dev, "could not register the FileVault kernel API: {:?}\n", e);
+            }
         }
 
-        if let Err(e) = trusted::register(data.clone()) {
-            dev_warn!(data.dev, "trusted-keys: registration failed ({:?})\n", e);
+        if module_parameters::trusted_keys.value() != 0 {
+            if let Err(e) = trusted::register(data.clone()) {
+                dev_warn!(data.dev, "trusted-keys: registration failed ({:?})\n", e);
+            }
         }
 
         if let Err(e) = pm::register(data.clone()) {
@@ -2740,6 +3130,14 @@ module! {
     description: "Apple SEP coprocessor: warm attach, endpoint discovery and tag-correlated control endpoint",
     license: "Dual MIT/GPL",
     params: {
+        trusted_keys: u8 {
+            default: 1,
+            description: "Register the SEP trusted-key source; 0 leaves it disabled",
+        },
+        filevault_api: u8 {
+            default: 1,
+            description: "Register the SEP FileVault kernel API; 0 leaves it disabled",
+        },
         xart_writes: u8 {
             default: 1,
             description: "Allow shared xART writes only if APFS proves a single unsnapshotted .gl extent; set to 0 for read-only operation",
@@ -2754,7 +3152,7 @@ module! {
         },
         xart_guard: i8 {
             default: -1,
-            description: "-1: the platform's level, 1 on M1, M2 and M3 Macs and 0 on the MacBook Neo; 0: off; 1: refuse the enclave's writes and deletes of xART session records this Linux install did not create; 2: also refuse writes to the shared root records",
+            description: "-1: the platform's level, 1 on M2 and M3 Macs and 0 on M1 Macs and the MacBook Neo; 0: off; 1: refuse the enclave's writes and deletes of xART session records this Linux install did not create; 2: also refuse writes to the shared root records",
         },
         os_uuid_hi: u64 {
             default: 0,
@@ -2779,6 +3177,10 @@ module! {
         probe_owner_export: u8 {
             default: 0,
             description: "Opt-in J414s diagnostic: with zero live identities, select the system context and try saving the missing owner Catacomb",
+        },
+        key_selftest: u8 {
+            default: 0,
+            description: "Test only: let root run SEP_KEY_SELFTEST, which signs with an access-controlled /dev/sep-key key under deliberately unsuitable credential contexts to show the enclave refuses",
         },
         refkey_v2: u8 {
             default: 0,

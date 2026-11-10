@@ -1,0 +1,62 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Disabled tunnel translation and miscellaneous interfaces. */
+
+&soc {
+	pciec0_dart: iommu@721008000 {
+		compatible = "apple,t6031-dart", "apple,t8110-dart";
+		reg = <0x7 0x21008000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1348 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		power-domains = <&ps_atc0_cio_pcie>;
+		status = "disabled";
+	};
+
+	pciec1_dart: iommu@b21008000 {
+		compatible = "apple,t6031-dart", "apple,t8110-dart";
+		reg = <0xb 0x21008000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1376 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		power-domains = <&ps_atc1_cio_pcie>;
+		status = "disabled";
+	};
+
+	pciec2_dart: iommu@f21008000 {
+		compatible = "apple,t6031-dart", "apple,t8110-dart";
+		reg = <0xf 0x21008000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1404 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		power-domains = <&ps_atc2_cio_pcie>;
+		status = "disabled";
+	};
+
+	atcphy0_xbar: mux@70304c000 {
+		compatible = "apple,t6031-display-crossbar",
+			     "apple,t6020-display-crossbar";
+		reg = <0x7 0x0304c000 0 0x4000>;
+		#mux-control-cells = <1>;
+		power-domains = <&ps_atc0_usb>;
+		status = "disabled";
+	};
+
+	atcphy1_xbar: mux@b0304c000 {
+		compatible = "apple,t6031-display-crossbar",
+			     "apple,t6020-display-crossbar";
+		reg = <0xb 0x0304c000 0 0x4000>;
+		#mux-control-cells = <1>;
+		power-domains = <&ps_atc1_usb>;
+		status = "disabled";
+	};
+
+	atcphy2_xbar: mux@f0304c000 {
+		compatible = "apple,t6031-display-crossbar",
+			     "apple,t6020-display-crossbar";
+		reg = <0xf 0x0304c000 0 0x4000>;
+		#mux-control-cells = <1>;
+		power-domains = <&ps_atc2_usb>;
+		status = "disabled";
+	};
+
+};

@@ -336,6 +336,15 @@ int avd_pm_recover(struct avd_dev *avd)
 	ret = avd_pm_park(avd);
 	if (ret)
 		return ret;
+	/*
+	 * On the J616C the machine hangs right after this reset, while the
+	 * decoder's DART domain is restored. The cause is not known yet, so
+	 * stay parked: players fall back to software.
+	 */
+	if (avd->variant && avd->variant->quirks & AVD_QUIRK_NO_RECOVERY_RESET) {
+		dev_err(avd->dev, "recover: staying parked, no reset on this SoC\n");
+		return -EIO;
+	}
 	dev_warn(avd->dev, "recover: reset\n");
 	ret = reset_control_reset(avd->rstc);
 	if (ret) {

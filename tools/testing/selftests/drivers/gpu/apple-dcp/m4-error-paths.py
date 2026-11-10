@@ -59,7 +59,8 @@ static void test_log(void *dev, const char *fmt, ...) { (void)dev; (void)fmt; }
     votes += definition(pmp, 'enum pmp_power_kind {') + ';\n'
     votes += definition(pmp, 'struct pmp_power_vote {') + ';\n'
     for function in ('static void pmp_vote_fail(', 'static void pmp_vote_send_failed(',
-                     'static int pmp_vote_begin(',
+                     'static int pmp_vote_begin(', 'static int pmp_vote_begin_release(',
+                     'static int pmp_vote_check_release(', 'static int pmp_vote_finish_release(',
                      'static int pmp_vote_check(', 'static int pmp_vote_finish(',
                      'static void pmp_vote_reply('):
         votes += definition(pmp, function) + '\n'
@@ -111,6 +112,48 @@ int main(void) {
     pmp_vote_reply(&s, PMP_ENDPOINT, PMP_POWER_REPLY);
     assert(pmp_vote_check(&s, PMP_POWER_DISP) == 0);
     assert(pmp_vote_begin(&s, PMP_POWER_AGX) == -EPROTO);
+
+    /* The DCP releases DISP while its domains are down and takes it again. */
+    s = (struct pmp_power_vote){0};
+    assert(pmp_vote_check_release(&s, PMP_POWER_DISP) == -ENODEV); /* not held */
+    assert(pmp_vote_begin_release(&s, PMP_POWER_DISP) == 0); /* not held */
+    assert(pmp_vote_begin(&s, PMP_POWER_DISP) == 1);
+    assert(pmp_vote_check_release(&s, PMP_POWER_DISP) == -ENODEV); /* still pending */
+    pmp_vote_reply(&s, PMP_ENDPOINT, PMP_POWER_REPLY);
+    assert(pmp_vote_check_release(&s, PMP_POWER_DISP) == 0);
+    assert(pmp_vote_begin_release(&s, PMP_POWER_DISP) == 1);
+    pmp_vote_reply(&s, PMP_ENDPOINT, PMP_POWER_REPLY);
+    assert(pmp_vote_finish_release(&s, PMP_POWER_DISP) == 0);
+    assert(!s.held[PMP_POWER_DISP] && !s.releasing && !s.error);
+    assert(pmp_vote_check(&s, PMP_POWER_DISP) == -ENODEV);
+    assert(pmp_vote_begin(&s, PMP_POWER_DISP) == 1);
+    pmp_vote_reply(&s, PMP_ENDPOINT, PMP_POWER_REPLY);
+    assert(pmp_vote_finish(&s, PMP_POWER_DISP) == 0);
+    /* One request at a time. */
+    assert(pmp_vote_begin(&s, PMP_POWER_AGX) == 1);
+    assert(pmp_vote_check_release(&s, PMP_POWER_DISP) == -EBUSY);
+    assert(pmp_vote_begin_release(&s, PMP_POWER_DISP) == -EBUSY);
+    pmp_vote_reply(&s, PMP_ENDPOINT, PMP_POWER_REPLY);
+    assert(s.held[PMP_POWER_AGX] && s.held[PMP_POWER_DISP]);
+    /* Not transmitted: the vote is still held. */
+    assert(pmp_vote_begin_release(&s, PMP_POWER_DISP) == 1);
+    pmp_vote_send_failed(&s);
+    assert(s.held[PMP_POWER_DISP] && !s.releasing && !s.error);
+    /* No reply: neither held nor taken again; AGX stays held. */
+    assert(pmp_vote_begin_release(&s, PMP_POWER_DISP) == 1);
+    assert(pmp_vote_finish_release(&s, PMP_POWER_DISP) == -ETIMEDOUT);
+    assert(!s.held[PMP_POWER_DISP] && !s.releasing);
+    assert(pmp_vote_begin(&s, PMP_POWER_DISP) == -ETIMEDOUT);
+    assert(pmp_vote_check(&s, PMP_POWER_AGX) == 0);
+
+    /* Admission closed by another request: DISP stays held, but is not released. */
+    s = (struct pmp_power_vote){0};
+    assert(pmp_vote_begin(&s, PMP_POWER_DISP) == 1);
+    pmp_vote_reply(&s, PMP_ENDPOINT, PMP_POWER_REPLY);
+    assert(pmp_vote_begin(&s, PMP_POWER_AGX) == 1);
+    assert(pmp_vote_finish(&s, PMP_POWER_AGX) == -ETIMEDOUT);
+    assert(pmp_vote_check(&s, PMP_POWER_DISP) == 0);
+    assert(pmp_vote_check_release(&s, PMP_POWER_DISP) == -ETIMEDOUT);
     return 0;
 }
 '''

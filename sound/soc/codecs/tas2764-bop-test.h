@@ -135,7 +135,7 @@ static void tas2764_dcb_from_dt(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, tas2764->dc_blk[1], 0xa5);
 }
 
-/* No property: the registers keep their reset values */
+/* No property: explicitly program the SN012776 fallback on every amp. */
 static void tas2764_dcb_absent(struct kunit *test)
 {
 	struct tas2764_priv *tas2764;
@@ -144,7 +144,9 @@ static void tas2764_dcb_absent(struct kunit *test)
 	tas2764 = tas2764_dcb_test_parse(test, "tas2764-kunit-bop-none",
 					 DEVID_SN012776, &ret);
 	KUNIT_EXPECT_EQ(test, ret, 0);
-	KUNIT_EXPECT_FALSE(test, tas2764->have_dc_blk);
+	KUNIT_EXPECT_TRUE(test, tas2764->have_dc_blk);
+	KUNIT_EXPECT_EQ(test, tas2764->dc_blk[0], 0x01);
+	KUNIT_EXPECT_EQ(test, tas2764->dc_blk[1], 0x00);
 }
 
 /* One byte cannot hold both registers: the probe fails */
@@ -199,6 +201,52 @@ static void tas2764_tx_zd(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, tas2764->have_tx_zd);
 }
 
+/* Every register the driver or its quirk sequences write is writeable */
+static void tas2764_writeable_covers_every_write(struct kunit *test)
+{
+	unsigned int i, j, reg;
+
+	for (i = 0; i < ARRAY_SIZE(tas2764_quirk_init_sequences); i++) {
+		const struct tas2764_quirk_init_sequence *q = &tas2764_quirk_init_sequences[i];
+
+		for (j = 0; q->seq && j < q->len; j++) {
+			reg = q->seq[j].reg;
+			KUNIT_EXPECT_TRUE_MSG(test, tas2764_writeable_register(NULL, reg),
+					      "quirk %u reg 0x%x", i, reg);
+		}
+	}
+	for (i = 0; i < ARRAY_SIZE(tas2764_pre_shutdown_seq); i++) {
+		reg = tas2764_pre_shutdown_seq[i].reg;
+		KUNIT_EXPECT_TRUE(test, tas2764_writeable_register(NULL, reg));
+	}
+	for (i = 0; i < ARRAY_SIZE(tas2764_post_shutdown_seq); i++) {
+		reg = tas2764_post_shutdown_seq[i].reg;
+		KUNIT_EXPECT_TRUE(test, tas2764_writeable_register(NULL, reg));
+	}
+	for (i = 0; i < TAS2764_BOP_CFG_LEN; i++)
+		KUNIT_EXPECT_TRUE(test, tas2764_writeable_register(NULL, TAS2764_BOP_CFG0 + i));
+	KUNIT_EXPECT_TRUE(test, tas2764_writeable_register(NULL, TAS2764_PAGE));
+	KUNIT_EXPECT_TRUE(test, tas2764_writeable_register(NULL, TAS2764_PWR_CTRL));
+	KUNIT_EXPECT_TRUE(test, tas2764_writeable_register(NULL, TAS2764_DVC));
+	KUNIT_EXPECT_TRUE(test, tas2764_writeable_register(NULL, TAS2764_SDOUT_HIZ_9));
+}
+
+/*
+ * What only a debugfs dump caches is never written back: the reserved pages
+ * between the page-1 quirk registers and the page-6 ones (the 0xb3..0x313 raw
+ * block that stuck the speaker buses at resume), and the rest of pages 1 and 6.
+ */
+static void tas2764_sync_skips_read_only_cache(struct kunit *test)
+{
+	KUNIT_EXPECT_FALSE(test, tas2764_writeable_register(NULL, TAS2764_REG(0x1, 0x34)));
+	KUNIT_EXPECT_FALSE(test, tas2764_writeable_register(NULL, TAS2764_REG(0x1, 0x7f)));
+	KUNIT_EXPECT_FALSE(test, tas2764_writeable_register(NULL, TAS2764_REG(0x2, 0x00)));
+	KUNIT_EXPECT_FALSE(test, tas2764_writeable_register(NULL, TAS2764_REG(0x4, 0x40)));
+	KUNIT_EXPECT_FALSE(test, tas2764_writeable_register(NULL, TAS2764_REG(0x6, 0x13)));
+	KUNIT_EXPECT_FALSE(test, tas2764_writeable_register(NULL, TAS2764_REG(0x6, 0x20)));
+	KUNIT_EXPECT_FALSE(test, tas2764_writeable_register(NULL, TAS2764_REG(0x10, 0x00)));
+}
+
 static struct kunit_case tas2764_bop_test_cases[] = {
 	KUNIT_CASE(tas2764_bop_from_dt),
 	KUNIT_CASE(tas2764_bop_absent),
@@ -209,6 +257,8 @@ static struct kunit_case tas2764_bop_test_cases[] = {
 	KUNIT_CASE(tas2764_dcb_short),
 	KUNIT_CASE(tas2764_dcb_not_sn012776),
 	KUNIT_CASE(tas2764_tx_zd),
+	KUNIT_CASE(tas2764_writeable_covers_every_write),
+	KUNIT_CASE(tas2764_sync_skips_read_only_cache),
 	{}
 };
 

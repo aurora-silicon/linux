@@ -19,6 +19,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/clpc.h>
 #include <linux/suspend.h>
 
 #include "ane_fw_cold.h"
@@ -62,6 +63,7 @@ struct ane_fw_backend {
 	struct ane_fw_transport transport;
 	/* Programs and their ABI 3 node, after the program stage. */
 	struct ane_h16_session session;
+	struct apple_clpc_ane *clpc;
 	struct ane_fw_surface pool, ipc, heap;
 	/*
 	 * For the cold boot after system sleep: the private TEXT/DATA copies,
@@ -1519,10 +1521,18 @@ static void ane_fw_program_sync(void *ctx, const struct ane_fw_surface *s, bool 
 		dma_sync_single_for_cpu(b->memory, s->handle, s->size, DMA_BIDIRECTIONAL);
 }
 
+static void ane_fw_program_busy(void *ctx, bool busy)
+{
+	struct ane_fw_backend *b = ctx;
+
+	apple_clpc_ane_set_active(b->clpc, busy);
+}
+
 static const struct ane_h16_session_ops ane_fw_session_ops = {
 	.map = ane_fw_program_map,
 	.log = ane_fw_program_log,
 	.sync = ane_fw_program_sync,
+	.busy = ane_fw_program_busy,
 };
 
 /*
@@ -1577,6 +1587,13 @@ static void ane_fw_debugfs(struct ane_fw_backend *b)
 		dput(root);
 }
 
+/*
+ * How long dynamic power gating stays off after the last EXECUTE, as on
+ * H16: toggling it around every request costs the H17 engine about 70 us
+ * (gate open plus gate close) of each back-to-back EXECUTE.
+ */
+#define ANE_FW_GATE_HOLD_NS (2 * NSEC_PER_MSEC)
+
 static int ane_fw_program_stage(struct ane_fw_backend *b)
 {
 	int ret;
@@ -1586,9 +1603,16 @@ static int ane_fw_program_stage(struct ane_fw_backend *b)
 				   ANE_FW_TIMEOUT_NS);
 	if (ret)
 		return ret;
-	ret = ane_h16_accel_register(&b->pdev->dev, &b->session);
+	ret = apple_clpc_ane_get(&b->pdev->dev, &b->clpc);
 	if (ret)
 		return ret;
+	b->session.gate_hold_ns = ANE_FW_GATE_HOLD_NS;
+	ret = ane_h16_accel_register(&b->pdev->dev, &b->session);
+	if (ret) {
+		apple_clpc_ane_put(b->clpc);
+		b->clpc = NULL;
+		return ret;
+	}
 	ane_fw_debugfs(b);
 	dev_info(&b->pdev->dev, "ANE program: session and ABI 3 node ready\n");
 	return 0;
@@ -1767,6 +1791,7 @@ static void ane_fw_observer_free(struct ane_fw_backend *b)
 		iounmap(b->pmgr);
 	if (b->gate)
 		iounmap(b->gate);
+	apple_clpc_ane_put(b->clpc);
 	put_device(&b->pdev->dev);
 	kfree(b);
 }

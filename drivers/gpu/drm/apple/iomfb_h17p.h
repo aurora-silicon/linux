@@ -158,6 +158,9 @@ static inline struct dcp_apply_property_h17p dcp_opaque_x_property_h17p(void)
 	};
 }
 
+void iomfb_blank_h17p(struct apple_dcp *dcp);
+void iomfb_encode_backlight_swap_h17p(u8 *swap, u32 nits, u32 maximum,
+				      bool update);
 void iomfb_encode_backlight_h17p(struct dcp_present_h17p *wire, u32 nits,
 				 u32 maximum, bool update);
 

@@ -1,0 +1,566 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+/*
+ * Structural hardware resources from the board's saved Apple Device Tree.
+ * Keep unqualified blocks disabled: describing them does not transfer
+ * ownership from firmware or make their registers safe to access.
+ */
+
+&soc {
+	error-handler@220000000 {
+		compatible = "apple,t8140-error-handler", "apple,soc-error-handler";
+		/* ADT /arm-io/error-handler banks; firmware/AP access is unqualified. */
+		reg = <0x2 0x20000000 0x0 0x2f000000>,
+		      <0x2 0x80d00000 0x0 0x40000>,
+		      <0x2 0x80900000 0x0 0x8000>,
+		      <0x3 0x00000000 0x0 0x70000>,
+		      <0x3 0x00728000 0x0 0x4000>,
+		      <0x3 0x082dc000 0x0 0x18000>,
+		      <0x3 0x003d0000 0x0 0x4000>,
+		      <0x3 0x00768000 0x0 0x4000>,
+		      <0x3 0x02000000 0x0 0x1000000>,
+		      <0x2 0x4f000000 0x0 0x4000>,
+		      <0x2 0x50000000 0x0 0x4000>,
+		      <0x2 0x51000000 0x0 0x4000>,
+		      <0x2 0x52000000 0x0 0x4000>,
+		      <0x2 0x5f000000 0x0 0x4000>,
+		      <0x2 0x6f000000 0x0 0x4000>,
+		      <0x2 0x5300a000 0x0 0x9a4>,
+		      <0x2 0x54000000 0x0 0x20000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 282 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 284 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 286 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 288 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 892 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 352 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 361 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 351 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 358 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 354 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 355 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 356 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 359 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 357 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 290 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 293 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 296 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 299 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 177 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 178 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 179 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 180 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 185 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 184 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 181 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 182 IRQ_TYPE_LEVEL_HIGH>;
+	};
+	event-log-handler@300700000 {
+		compatible = "apple,t8140-event-log", "apple,soc-event-log";
+		/* ADT /arm-io/event-log-handler banks; firmware/AP access is unqualified. */
+		reg = <0x3 0x00700000 0x0 0xcc000>,
+		      <0x3 0x08280000 0x0 0x80000>,
+		      <0x3 0x00000000 0x0 0x70000>,
+		      <0x3 0x08200000 0x0 0x7c000>,
+		      <0x3 0x0028c000 0x0 0x4000>,
+		      <0x3 0x00280000 0x0 0x8000>,
+		      <0x4 0x01878000 0x0 0x4000>,
+		      <0x4 0x01868000 0x0 0x8000>,
+		      <0x3 0x02800000 0x0 0xbc000>,
+		      <0x3 0x02900000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 232 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 233 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 261 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 278 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 37 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 38 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 652 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 644 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 879 IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	/* ADT /arm-io/dwi. */
+	dwi: dwi@300200000 {
+		compatible = "apple,t8140-dwi", "apple,dwi";
+		reg = <0x3 0x00200000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 23 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dwi>;
+	};
+
+	/* ADT /arm-io/aes. */
+	aes: crypto@38500c000 {
+		compatible = "apple,t8140-aes", "apple,aes";
+		reg = <0x3 0x8500c000 0x0 0x4000>,
+		      <0x3 0x082dc000 0x0 0x8000>,
+		      <0x3 0x08078000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1107 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_aes>;
+		iommus = <&sio_dart 1>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/aon-ptd. */
+	aon_ptd: aon-ptd@30c840000 {
+		compatible = "apple,t8140-aon-ptd", "apple,aon-ptd";
+		reg = <0x3 0x0c840000 0x0 0x4000>,
+		      <0x3 0x0c850000 0x0 0x4000>,
+		      <0x3 0x0c858000 0x0 0x4000>,
+		      <0x3 0x0c860000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 586 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 587 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 588 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 589 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 590 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 591 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 592 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 593 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 594 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 595 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 596 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 597 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 598 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 599 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 600 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 601 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 602 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 603 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 604 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 605 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 606 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 607 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 608 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 609 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 610 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 611 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 612 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 613 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 614 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 615 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 616 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 617 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/scaler0. */
+	scaler0: scaler@291000000 {
+		compatible = "apple,t8140-scaler", "apple,scaler";
+		reg = <0x2 0x91000000 0x0 0x38000>,
+		      <0x2 0x91210000 0x0 0x4000>,
+		      <0x2 0x91204000 0x0 0x4000>,
+		      <0x2 0x90000000 0x0 0x8000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1086 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 1088 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_msr>,
+		                <&ps_msr_ase_core>;
+		iommus = <&scaler0_dart 0>,
+		         <&scaler0_dart 1>;
+		clocks = <&peripheral_clocks 374>;
+		resets = <&ps_msr>;
+	};
+
+	/* ADT /arm-io/aop2. */
+	aop2: coprocessor@311600000 {
+		compatible = "apple,t8140-aop2", "apple,aop2";
+		reg = <0x3 0x11600000 0x0 0x88000>,
+		      <0x3 0x11050000 0x0 0x4000>,
+		      <0x3 0x1162c000 0x0 0x3c008>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 399 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 398 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 401 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 400 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_aop2_cpu>;
+		iommus = <&aop_dart 16>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/aop2-exclave-mailbox. */
+	aop2_secure_mbox: mailbox@35167c000 {
+		compatible = "apple,t8140-secure-mailbox", "apple,secure-mailbox";
+		reg = <0x3 0x5167c000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 405 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 402 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&aop_dart 17>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/esm. */
+	esm: coprocessor@4d267c000 {
+		compatible = "apple,t8140-esm", "apple,esm";
+		reg = <0x4 0xd267c000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 350 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 347 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&sep_dart 2>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/rsm. */
+	rsm: rsm@309825000 {
+		compatible = "apple,t8140-rsm", "apple,rsm";
+		reg = <0x3 0x09825000 0x0 0x4000>,
+		      <0x3 0x098c0000 0x0 0x4>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 302 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&rsm_dart 0>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/admac-leap-s; the existing AP proxy is separate. */
+	admac_leap_secure: dma-controller@313200000 {
+		compatible = "apple,t8140-admac-secure", "apple,admac-secure";
+		reg = <0x3 0x13200000 0x0 0x34000>;
+		#dma-cells = <1>;
+		dma-channels = <18>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 451 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&aop_dart 11>;
+		power-domains = <&ps_audio_leap_s_a>;
+		status = "disabled";
+	};
+
+
+	/* ADT /arm-io/dcp-exclave-mailbox. */
+	dcp_secure_mbox: mailbox@452e7c000 {
+		compatible = "apple,t8140-secure-mailbox", "apple,secure-mailbox";
+		reg = <0x4 0x52e7c000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 686 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 683 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&dcp_dart 24>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/exdisplaypipe-s-proxy. */
+	display_secure_proxy: display-secure-proxy@450000000 {
+		compatible = "apple,t8140-display-secure-proxy", "apple,display-secure-proxy";
+		reg = <0x4 0x50000000 0x0 0xafc000>,
+		      <0x4 0x51000000 0x0 0xafc000>,
+		      <0x4 0x523b0000 0x0 0x8000>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/isp-exclave-s-proxy. */
+	isp_secure_proxy: isp-secure-proxy@361800000 {
+		compatible = "apple,t8140-isp-secure-proxy", "apple,isp-secure-proxy";
+		reg = <0x3 0x61800000 0x0 0x480000>,
+		      <0x3 0x628ac000 0x0 0x4000>,
+		      <0x3 0x62780000 0x0 0x10000>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/siri-exclave-timebase. */
+	siri_timebase: secure-timebase@3482a8000 {
+		compatible = "apple,t8140-secure-timebase", "apple,secure-timebase";
+		reg = <0x3 0x482a8000 0x0 0x4000>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/hib-exclave-watchdog. */
+	hib_watchdog: secure-watchdog@3482b0000 {
+		compatible = "apple,t8140-secure-watchdog", "apple,secure-watchdog";
+		reg = <0x3 0x482b0000 0x0 0x4000>;
+		status = "disabled";
+	};
+
+	/* Clock IDs are SoC hardware selectors, not ADT phandles. */
+	peripheral_clocks: clock-controller@300700000 {
+		compatible = "apple,t8140-pmgr-clocks", "apple,pmgr-clocks";
+		/* ADT /arm-io/pmgr register banks, in hardware-description order. */
+		reg = <0x3 0x00700000 0x0 0xcc000>,
+		      <0x3 0x08280000 0x0 0x80000>,
+		      <0x3 0x00000000 0x0 0x78000>,
+		      <0x3 0x08200000 0x0 0x7c000>,
+		      <0x3 0x08004000 0x0 0x1000>,
+		      <0x2 0x10e20000 0x0 0x2000>,
+		      <0x2 0x10050000 0x0 0xef1000>,
+		      <0x2 0x10e40000 0x0 0x9000>,
+		      <0x2 0x10e50000 0x0 0xe81000>,
+		      <0x2 0x10e70000 0x0 0x1000>,
+		      <0x2 0x10050000 0x0 0x10000>,
+		      <0x2 0x10150000 0x0 0x10000>,
+		      <0x2 0x10250000 0x0 0x10000>,
+		      <0x2 0x10350000 0x0 0x10000>,
+		      <0x2 0x11e20000 0x0 0x2000>,
+		      <0x2 0x11050000 0x0 0xef1000>,
+		      <0x2 0x11e40000 0x0 0xb000>,
+		      <0x2 0x11e50000 0x0 0xe81000>,
+		      <0x2 0x11e70000 0x0 0x1000>,
+		      <0x2 0x11050000 0x0 0x10000>,
+		      <0x2 0x11150000 0x0 0x10000>,
+		      <0x3 0x00700000 0x0 0x18000>,
+		      <0x3 0x00724000 0x0 0x4000>,
+		      <0x3 0x00728000 0x0 0x4000>,
+		      <0x3 0x00730000 0x0 0x14000>,
+		      <0x3 0x00760000 0x0 0x4000>,
+		      <0x3 0x00764000 0x0 0x4000>,
+		      <0x3 0x00768000 0x0 0x4000>,
+		      <0x3 0x00780000 0x0 0x4000>,
+		      <0x3 0x082b8000 0x0 0x10000>,
+		      <0x3 0x082c8000 0x0 0x4000>,
+		      <0x3 0x082d0000 0x0 0x8000>,
+		      <0x3 0x00208000 0x0 0x8000>,
+		      <0x3 0x00280000 0x0 0x80000>,
+		      <0x3 0x003c0000 0x0 0x30000>,
+		      <0x3 0x08100000 0x0 0xa8000>,
+		      <0x4 0x01878000 0x0 0x4000>,
+		      <0x3 0x00780000 0x0 0x4000>,
+		      <0x4 0x0195c000 0x0 0x4000>,
+		      <0x4 0x01960000 0x0 0x4000>,
+		      <0x4 0x01974000 0x0 0x4000>,
+		      <0x2 0x11000000 0x0 0xff4000>,
+		      <0x4 0x80e1c000 0x0 0x4000>,
+		      <0x3 0x02000000 0x0 0x1000000>;
+		#clock-cells = <1>;
+		apple,pmgr = <&pmgr>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/aop-gpio; coprocessor/firmware ownership unqualified. */
+	pinctrl_aop: pinctrl@310824000 {
+		compatible = "apple,t8140-pinctrl", "apple,t8103-pinctrl";
+		reg = <0x3 0x10824000 0x0 0x4000>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-ranges = <&pinctrl_aop 0 0 57>;
+		apple,npins = <57>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 380 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 381 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 382 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 383 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 384 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 385 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 386 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_aop_gpio>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/nub-gpio; coprocessor/firmware ownership unqualified. */
+	pinctrl_nub: pinctrl@3081f0000 {
+		compatible = "apple,t8140-pinctrl", "apple,t8103-pinctrl";
+		reg = <0x3 0x081f0000 0x0 0x4000>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-ranges = <&pinctrl_nub 0 0 30>;
+		apple,npins = <30>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 473 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 474 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 475 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 476 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 477 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 478 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 479 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_nub_gpio>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/smc-gpio; coprocessor/firmware ownership unqualified. */
+	pinctrl_smc: pinctrl@30c820000 {
+		compatible = "apple,t8140-pinctrl", "apple,t8103-pinctrl";
+		reg = <0x3 0x0c820000 0x0 0x4000>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-ranges = <&pinctrl_smc 0 0 6>;
+		apple,npins = <6>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 572 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 573 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 574 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 575 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 576 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 577 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 578 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/mtp-gpio; coprocessor/firmware ownership unqualified. */
+	pinctrl_mtp: pinctrl@314838000 {
+		compatible = "apple,t8140-pinctrl", "apple,t8103-pinctrl";
+		reg = <0x3 0x14838000 0x0 0x4000>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-ranges = <&pinctrl_mtp 0 0 10>;
+		apple,npins = <10>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1128 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1129 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1130 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1131 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1132 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1133 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1134 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/dart-sio. */
+	sio_dart: iommu@385060000 {
+		compatible = "apple,t8140-dart", "apple,t8110-dart";
+		reg = <0x3 0x85060000 0x0 0x20000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1120 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_sio_cpu>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/dart-scaler. */
+	scaler0_dart: iommu@291260000 {
+		compatible = "apple,t8140-dart", "apple,t8110-dart";
+		reg = <0x2 0x91260000 0x0 0x20000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1087 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_msr>;
+	};
+
+	/* ADT /arm-io/dart-rsm. */
+	rsm_dart: iommu@3099a0000 {
+		compatible = "apple,t8140-dart", "apple,t8110-dart";
+		reg = <0x3 0x099a0000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 305 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	uart0: serial@385200000 {
+		compatible = "apple,t8140-uart", "apple,s5l-uart";
+		reg = <0x3 0x85200000 0x0 0x4000>;
+		reg-io-width = <4>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1092 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&peripheral_clocks 401>, <&peripheral_clocks 4>;
+		clock-names = "uart", "clk_uart_baud0";
+		power-domains = <&ps_uart0>;
+		status = "disabled";
+	};
+
+	uart4: serial@385210000 {
+		compatible = "apple,t8140-uart", "apple,s5l-uart";
+		reg = <0x3 0x85210000 0x0 0x4000>;
+		reg-io-width = <4>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1096 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&peripheral_clocks 401>, <&peripheral_clocks 4>;
+		clock-names = "uart", "clk_uart_baud0";
+		power-domains = <&ps_uart4>;
+		status = "disabled";
+	};
+
+	uart5: serial@385214000 {
+		compatible = "apple,t8140-uart", "apple,s5l-uart";
+		reg = <0x3 0x85214000 0x0 0x4000>;
+		reg-io-width = <4>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1097 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&peripheral_clocks 401>, <&peripheral_clocks 4>;
+		clock-names = "uart", "clk_uart_baud0";
+		power-domains = <&ps_uart5>;
+		status = "disabled";
+	};
+
+	sio: dma-controller@385e00000 {
+		compatible = "apple,t8140-sio", "apple,sio";
+		/* Split the ASC bank around the separately owned mailbox window. */
+		reg = <0x3 0x85e00000 0x0 0x8000>,
+		      <0x3 0x85850000 0x0 0x4000>,
+		      <0x3 0x85e0c000 0x0 0x7c000>;
+		#dma-cells = <1>;
+		dma-channels = <128>;
+		mboxes = <&sio_mbox>;
+		iommus = <&sio_dart 0>;
+		power-domains = <&ps_sio_cpu>;
+		clocks = <&peripheral_clocks 393>, <&peripheral_clocks 391>, <&peripheral_clocks 392>;
+		status = "disabled";
+	};
+
+	sio_mbox: mailbox@385e08000 {
+		compatible = "apple,t8140-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x85e08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1124 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1125 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1126 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1127 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_sio_cpu>;
+		status = "disabled";
+	};
+
+	/* ADT /dock-connect: debug dock connection status, read only. */
+	debug_dock: debug-dock@3082d8008 {
+		compatible = "apple,t8140-debug-dock", "apple,debug-dock";
+		reg = <0x3 0x082d8008 0x0 0x4>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 303 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 304 IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	/* ADT /arm-io/eic named MMIO apertures are absolute addresses. */
+	eic: secure-controller@340700000 {
+		compatible = "apple,t8140-eic", "apple,eic";
+		reg = <0x3 0x40700000 0x0 0x18000>,
+		      <0x3 0x63b50000 0x0 0x8000>,
+		      <0x3 0x5a000000 0x0 0x4000>,
+		      <0x3 0xc5040000 0x0 0xc000>,
+		      <0x3 0x482a8000 0x0 0x4000>,
+		      <0x3 0x482b0000 0x0 0x4000>;
+		reg-names = "ps", "wd-isp", "gpio", "fpwm", "gltb", "wd-e";
+		status = "disabled";
+	};
+
+	xspmi_controller: spmi-proxy-controller@348614000 {
+		compatible = "apple,t8140-xspmi-controller", "apple,xspmi-controller";
+		reg = <0x3 0x48614000 0x0 0x4000>;
+		apple,response-vector = <256>;
+		status = "disabled";
+	};
+};
+
+&aon_ptd {
+	interrupt-controller;
+	#interrupt-cells = <2>;
+	#address-cells = <0>;
+};
+
+&{/soc/spmi@308714000/pmic@e} {
+	battery_monitor: battery-monitor {
+		compatible = "apple,t8140-battery-monitor", "apple,battery-monitor";
+		interrupt-parent = <&nub_spmi0>;
+		interrupts = <12 IRQ_TYPE_EDGE_RISING>;
+		status = "disabled";
+	};
+};
+
+&nub_spmi1 {
+	xspmi_proxy: proxy@d {
+		compatible = "apple,t8140-xspmi-proxy", "apple,xspmi-proxy";
+		reg = <0xd SPMI_USID>;
+		status = "disabled";
+	};
+};
+
+&nub_spmi_a0 {
+	spmi_all_ace: controller@e {
+		compatible = "apple,t8140-spmi-all-ace", "apple,spmi-all-ace";
+		reg = <0xe SPMI_USID>;
+		status = "disabled";
+	};
+};

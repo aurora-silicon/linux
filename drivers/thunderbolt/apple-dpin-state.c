@@ -38,14 +38,14 @@ const struct apple_dpin_policy apple_dpin_m3 = {
  * writes only DPTX_INACTIVE (+0x0c bit 0) and polls its ACK (+0x10 bit 0),
  * gated on HPD. The DP IN interrupts are not set up (nothing handles them),
  * and a tunnel that DCP never activated is torn down without touching the
- * block at all. Both DP IN streams of an ATC PHY need one link rate, so
- * every tunnel gets HBR2 at most.
+ * block at all. Both DP IN streams of an ATC PHY need one link rate: a
+ * tunnel alone gets up to HBR3, two get HBR2 (TB_HOST_DP_SHARED_RATE).
  */
 const struct apple_dpin_policy apple_dpin_m4 = {
 	.flow = APPLE_DPIN_CHANGED,
 	.capacity_retry = true,
 	.defer_new_bringup = true,
-	.host_policy = TB_HOST_DP_NOTIFY | TB_HOST_DP_HBR2_MAX,
+	.host_policy = TB_HOST_DP_NOTIFY | TB_HOST_DP_SHARED_RATE,
 	.lazy_idle = true,
 };
 

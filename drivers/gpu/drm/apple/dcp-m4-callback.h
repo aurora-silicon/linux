@@ -21,6 +21,11 @@ struct dcp_m4_callback_ops {
 	int (*memory)(void *cookie, unsigned int method, const void *input, void *output);
 	/* Idle caching: D117 state, D578/D579 fence, D580 cache-surface release. */
 	int (*idle)(void *cookie, unsigned int method, const void *input, void *output);
+	/*
+	 * D003 rt_bandwidth_setup_ap: its reply, @output zeroed (0x3c bytes).
+	 * Absent: the optional service is declined (status 1).
+	 */
+	int (*bandwidth)(void *cookie, void *output);
 };
 
 struct dcp_m4_callback_shape {
@@ -129,6 +134,8 @@ static inline int dcp_m4_callback_dispatch(const struct dcp_m4_callback_ops *ops
 		put_unaligned_le32(1, out);
 		return 0;
 	case 3:
+		if (ops->bandwidth)
+			return dcp_m4_callback_result(ops->bandwidth(cookie, out));
 		put_unaligned_le32(1, out + 56); /* Decline optional bandwidth service. */
 		return 0;
 	case 6:

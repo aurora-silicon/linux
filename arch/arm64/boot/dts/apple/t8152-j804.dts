@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/dts-v1/;
+
+#include "t8152.dtsi"
+
+/ {
+	model = "Apple MacBook Pro (J804)";
+	compatible = "apple,j804", "apple,t8152", "apple,arm-platform";
+	chassis-type = "laptop";
+};
+
+/* Unexposed chassis port instances remain described and disabled. */

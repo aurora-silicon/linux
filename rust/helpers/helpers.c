@@ -70,6 +70,7 @@
 #include "fs.c"
 #include "fwctl.c"
 #include "gpu.c"
+#include "iio.c"
 #include "interrupt.c"
 #include "io.c"
 #include "irq.c"

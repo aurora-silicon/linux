@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * Apple DCP firmware 26.6.2 (T8132/J713).
+ * Apple DCP firmware 26.6.2 (T8132/J713, J715).
  *
  * The appledrm component and KMS paths own this controller.  This backend owns
  * only its generation-specific EP37 RPC ABI and retained firmware session.
@@ -24,11 +24,13 @@
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
 #include <linux/minmax.h>
+#include <linux/unaligned.h>
 #include <linux/workqueue.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_modes.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_rect.h>
+#include <linux/iopoll.h>
 #include <linux/iosys-map.h>
 
 #include <linux/platform_device.h>
@@ -39,6 +41,8 @@
 #include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/pmp-display.h>
+#include <linux/soc/apple/pmc.h>
+#include <linux/soc/apple/pmgr-pwrstate.h>
 
 #include "afk.h"
 #include "dcp.h"
@@ -56,6 +60,16 @@
 #include "parser.h"
 #include "t8132_ext_drm.h"
 
+const struct dcp_m4_profile *dcp_m4_pf = &dcp_m4_profile_j713;
+
+static const struct dcp_m4_profile *dcp_m4_machine_profile(void)
+{
+	for (unsigned int i = 0; i < ARRAY_SIZE(dcp_m4_profiles); i++)
+		if (of_machine_is_compatible(dcp_m4_profiles[i]->machine))
+			return dcp_m4_profiles[i];
+	return NULL;
+}
+
 static unsigned int idle_cache_ms = 1000;
 
 static int idle_cache_ms_set(const char *val, const struct kernel_param *kp)
@@ -72,6 +86,32 @@ module_param_cb(idle_cache_ms, &idle_cache_ms_ops, &idle_cache_ms, 0644);
 MODULE_PARM_DESC(idle_cache_ms,
 		 "J713: cache a static frame after this many ms without a flip (0: never, at most 60000; applies from the next swap)");
 
+static unsigned int power_gate_ms;
+
+static int power_gate_ms_set(const char *val, const struct kernel_param *kp)
+{
+	return param_set_uint_minmax(val, kp, 0, 600000);
+}
+
+static const struct kernel_param_ops power_gate_ms_ops = {
+	.set = power_gate_ms_set,
+	.get = param_get_uint,
+};
+
+module_param_cb(power_gate_ms, &power_gate_ms_ops, &power_gate_ms, 0644);
+MODULE_PARM_DESC(power_gate_ms,
+		 "J713: power the display coprocessor and its domains down after this many ms blanked, and before system sleep (0: never, at most 600000)");
+
+/*
+ * DCP CPU control and status, in the coprocessor's ASC block. The idle bit
+ * is dcp.c's APPLE_DCP_COPROC_CPU_STATUS_IDLE; macOS read status 0x6e at
+ * its idle check before clearing RUN.
+ */
+#define DCP_M4_CPU_CONTROL	0x44
+#define DCP_M4_CPU_RUN		BIT(4)
+#define DCP_M4_CPU_STATUS	0x48
+#define DCP_M4_CPU_STATUS_IDLE	BIT(5)
+
 /* One timing of an external sink for its DRM connector. */
 struct iomfb_m4_ext_mode {
 	struct drm_display_mode mode;
@@ -80,7 +120,36 @@ struct iomfb_m4_ext_mode {
 	/* The timing's IsPreferred and firmware score */
 	bool fw_preferred;
 	s64 score;
+	/* Its colour element is one the timing lists as needing DSC */
+	bool dsc;
 };
+
+/* A scratch-only realtime bandwidth mailbox (D003) is this long */
+#define DCP_M4_BW_MAILBOX_SIZE	8
+
+/*
+ * How many external direct swaps may be in flight (A407 answered, the D590
+ * not yet in), 1 or 2, read at each frame. At depth 1 every flip event is
+ * sent with its swap's D590. At depth 2 a frame's flip event can be sent
+ * before the firmware confirms that the frame replaced the previous one, so a
+ * compositor may draw into a buffer that is still on screen.
+ */
+#define DCP_M4_EXT_INFLIGHT	2
+static unsigned int t8132_ext_swap_depth = DCP_M4_EXT_INFLIGHT;
+
+static int t8132_ext_swap_depth_set(const char *val, const struct kernel_param *kp)
+{
+	return param_set_uint_minmax(val, kp, 1, DCP_M4_EXT_INFLIGHT);
+}
+
+static const struct kernel_param_ops t8132_ext_swap_depth_ops = {
+	.set = t8132_ext_swap_depth_set,
+	.get = param_get_uint,
+};
+
+module_param_cb(t8132_ext_swap_depth, &t8132_ext_swap_depth_ops, &t8132_ext_swap_depth, 0644);
+MODULE_PARM_DESC(t8132_ext_swap_depth,
+		 "J713 external direct swaps in flight at most, 2 (default) or 1, from the next frame. At 2 a flip event can come before the firmware confirms the frame replaced the previous one, so a compositor may draw into a buffer still on screen; at 1 every flip event comes with its swap's completion");
 
 struct iomfb_m4 {
 	struct apple_dcp *owner;
@@ -89,6 +158,8 @@ struct iomfb_m4 {
 	struct iommu_group *scanout_group;
 	resource_size_t coproc_phys;
 	size_t coproc_size;
+	/* The realtime bandwidth mailbox from the DT (0: none), see dcp_m4_bw_mailbox() */
+	u64 bw_mailbox;
 	struct work_struct backlight_work;
 	void __iomem *coproc;
 	struct apple_rtkit *rtkit;
@@ -112,6 +183,17 @@ struct iomfb_m4 {
 	bool display_off; /* setPowerState(0) while blanked, until the next frame */
 	u64 display_off_cycles;
 	s64 display_off_us, display_off_us_max, display_on_us, display_on_us_max;
+	/*
+	 * Internal J713 DCP that can power its CPU and display domains down
+	 * while blanked (apple,pmc-interface; power_gate_ms), and whether they
+	 * are down: then no register of the DCP, its mailbox or its display
+	 * DARTs is used until iomfb_m4_power_ungate().
+	 */
+	bool gate_capable;
+	bool gated;
+	struct delayed_work gate_work;
+	u64 gate_cycles;
+	s64 gate_off_us, gate_on_us;
 	/* Exact completed successor or blank is the only framebuffer retirement. */
 	struct drm_framebuffer *active_fb;
 	struct drm_framebuffer *uncertain_fb;
@@ -173,9 +255,11 @@ struct iomfb_m4 {
 
 static void dcp_m4_runtime_wake(struct iomfb_m4 *dcp);
 struct dcp_m4_runtime;
-static void dcp_m4_ext_async_done(struct dcp_m4_runtime *r);
 static void dcp_m4_ext_async_work(struct work_struct *work);
 static int dcp_m4_set_power_state(struct iomfb_m4 *dcp, bool on);
+static int iomfb_m4_power_gate(struct iomfb_m4 *dcp);
+static int iomfb_m4_power_ungate(struct iomfb_m4 *dcp);
+static void iomfb_m4_gate_work(struct work_struct *work);
 static void dcp_m4_runtime_receive(struct iomfb_m4 *dcp, u64 word);
 
 static int dcp_m4_dart_check(struct device *dev)
@@ -712,8 +796,8 @@ out:
 /*
  * A host window of SID0 (dva, 0: not claimed) and the framebuffer it maps (key,
  * NULL: empty), with a reference held by @put's owner; whether the last
- * confirmed swap shows it; the given-up swap that may still show it; pinned:
- * its unmap failed, kept until reboot.
+ * confirmed swap shows it (given-up swaps that may still show it are in
+ * ext_lost_swap); pinned: its unmap failed, kept until reboot.
  */
 #define DCP_M4_EXT_WINDOWS	6
 struct dcp_m4_ext_window {
@@ -722,8 +806,49 @@ struct dcp_m4_ext_window {
 	void (*put)(void *key);
 	unsigned int count;
 	bool on_screen, pinned;
-	u32 lost_id;
 	unsigned long used;
+};
+
+/*
+ * A swap given up before its D590 (see dcp_m4_ext_swap_give_up()): its ID (0:
+ * a free slot), the window it may still put on screen (-1: none, or retired
+ * by a confirmed swap since), and whether a newer swap was shown before it.
+ */
+struct dcp_m4_ext_lost {
+	u32 id;
+	int win;
+	bool superseded;
+};
+
+/*
+ * A direct swap whose A407 reply came and whose D590 has not: its state, its
+ * window (-1: none), the link generation and the deadline it went out with,
+ * whether its flip waits for its completion or the older one's, whether a
+ * and whether a newer swap was shown before it completed.
+ */
+struct dcp_m4_ext_inflight {
+	struct dcp_m4_swap_state swap;
+	int win;
+	int gen;
+	unsigned long deadline;
+	bool flip_held;
+	bool superseded;
+};
+
+/* How a direct swap leaves flight, see dcp_m4_ext_async_done(). */
+enum dcp_m4_ext_end {
+	DCP_M4_EXT_END_SHOWN,	/* its own D590, displayed */
+	DCP_M4_EXT_END_KEPT,	/* named in a later swap's D590, or shown before a newer one */
+	DCP_M4_EXT_END_UNSHOWN,	/* its own D590, not displayed */
+	DCP_M4_EXT_END_TAKEN,	/* its D590 before its A407 reply, taken account of then */
+};
+
+/* What the D590 being handled says: shown, and the earlier swaps it completes. */
+struct dcp_m4_ext_done {
+	bool valid;
+	bool shown;
+	u32 count;
+	u32 hol[4];
 };
 
 struct dcp_m4_runtime {
@@ -812,19 +937,31 @@ struct dcp_m4_runtime {
 	unsigned int ext_back;
 	struct drm_rect ext_prev_damage;
 	/*
-	 * The host windows; the swap in flight without waiting for its D590
-	 * (its ID, 0: none; its window, -1: none; the link generation and the
-	 * deadline it went out with); whether the next swap_full returns after
-	 * its A407 reply; the work that gives the swap up at its deadline or
-	 * when its link goes.
+	 * The host windows; the direct swaps in flight without waiting for their
+	 * D590, oldest first, and how many; the window of the direct swap going
+	 * out (-1: none); how many the next swap_full may leave in flight,
+	 * returning after its A407 reply (0: it waits for its D590), and whether
+	 * its flip may go at once (none older in flight); what the D590 being
+	 * handled says (dcp_m4_external_callback()), and whether the swap going
+	 * out was shown, by a D590 before its A407 reply; the work that gives the
+	 * oldest up at its deadline or when its link goes.
 	 */
 	struct dcp_m4_ext_window ext_win[DCP_M4_EXT_WINDOWS];
-	u32 ext_async_id;
-	int ext_async_win;
-	int ext_async_gen;
-	unsigned long ext_async_deadline;
-	bool ext_swap_async;
+	struct dcp_m4_ext_inflight ext_q[DCP_M4_EXT_INFLIGHT];
+	unsigned int ext_qn;
+	int ext_swap_win;
+	unsigned int ext_swap_async;
+	bool ext_swap_now;
+	struct dcp_m4_ext_done ext_done;
+	bool ext_swap_shown;
 	struct delayed_work ext_async_work;
+	/*
+	 * Direct swaps completed by a later swap's D590 (named in it), whose own
+	 * D590 may still come: dropped then (0: a free slot). Never evicted: with
+	 * no slot for each swap in flight no direct swap goes out, and A406
+	 * giving one of these IDs again orphans its start, as for ext_lost_swap.
+	 */
+	u32 ext_early[16];
 	/*
 	 * The link's generation, which a released route
 	 * (iomfb_m4_external_link_gone()) and a D575(0) move on.
@@ -832,10 +969,10 @@ struct dcp_m4_runtime {
 	atomic_t ext_link_gen;
 	/*
 	 * Swaps given up before their D590 (see dcp_m4_ext_swap_give_up()),
-	 * each kept until its D590 comes (0: a free slot), so that the late
-	 * D590 is told apart and dropped.
+	 * each kept until its D590 comes (ID 0: a free slot), so that the late
+	 * D590 is told apart and dropped, with the window each may still show.
 	 */
-	u32 ext_lost_swap[16];
+	struct dcp_m4_ext_lost ext_lost_swap[16];
 	/*
 	 * The given-up swap that holds swaps (0: none), and whether a DRM
 	 * enable lets one try (a probe); surface of the swap in flight (-1:
@@ -857,6 +994,10 @@ struct dcp_m4_runtime {
 	int ext_front;
 	u32 ext_buf_lost[2];
 };
+
+static void dcp_m4_ext_async_done(struct dcp_m4_runtime *r, int i, enum dcp_m4_ext_end end);
+static void dcp_m4_ext_shown(struct dcp_m4_runtime *r, u32 id, int win, int older,
+			     enum dcp_m4_ext_end end);
 
 static void dcp_m4_runtime_wake(struct iomfb_m4 *dcp)
 {
@@ -927,6 +1068,10 @@ static int dcp_m4_runtime_health(struct dcp_m4_runtime *r)
 {
 	struct iomfb_m4 *dcp = r->dcp;
 	int ret = READ_ONCE(dcp->error);
+
+	/* Powered down by its owner: only the failure latch. */
+	if (READ_ONCE(dcp->gated))
+		return ret;
 
 	if (!ret && (!(readl(dcp->coproc + 0x44) & BIT(4)) || dcp_m4_dart_check(dcp->dev) ||
 		     (!dcp->external && dcp_m4_dart_check(&dcp->piodma->dev))))
@@ -1063,69 +1208,151 @@ static int dcp_m4_runtime_event(void *cookie, const char *name, const void *dict
 static int dcp_m4_ext_lost_slot(struct dcp_m4_runtime *r, u32 id)
 {
 	for (unsigned int i = 0; id && i < ARRAY_SIZE(r->ext_lost_swap); i++)
-		if (r->ext_lost_swap[i] == id)
+		if (r->ext_lost_swap[i].id == id)
 			return i;
 	return -1;
 }
 
+/* Whether a given-up swap may still put window @i on screen. */
+static bool dcp_m4_ext_win_lost(struct dcp_m4_runtime *r, int i)
+{
+	for (unsigned int j = 0; j < ARRAY_SIZE(r->ext_lost_swap); j++)
+		if (r->ext_lost_swap[j].id && r->ext_lost_swap[j].win == i)
+			return true;
+	return false;
+}
+
 /*
- * The late D590 of the given-up swap @id: dropped, and its
- * ID forgotten. A surface it put on screen, which no confirmed swap has
- * retired since, is the one on screen now and the other one free; the hold
- * it is responsible for, if any, ends. False if @id is no given-up swap's.
+ * The late D590 of the given-up swap @id: dropped, and its ID forgotten.
+ * Displayed (@shown): a surface it put on screen, which no confirmed swap has
+ * retired since, is the one on screen now and the other one free, or, with a
+ * newer swap shown before it, on screen with that one. Not displayed: what is
+ * on screen stays, and it no longer makes its surfaces uncertain (others
+ * given up may still). The hold it is responsible for, if any, ends. False if
+ * @id is no given-up swap's.
  */
-static bool dcp_m4_ext_late_d590(struct dcp_m4_runtime *r, u32 id)
+static bool dcp_m4_ext_late_d590(struct dcp_m4_runtime *r, u32 id, bool shown)
 {
 	int slot = dcp_m4_ext_lost_slot(r, id);
-	bool shown = false, held = r->ext_hold_id == id;
+	bool front = false, held = r->ext_hold_id == id;
+	struct dcp_m4_ext_lost lost;
 
 	if (slot < 0)
 		return false;
-	r->ext_lost_swap[slot] = 0;
+	lost = r->ext_lost_swap[slot];
+	r->ext_lost_swap[slot] = (struct dcp_m4_ext_lost){ .win = -1 };
 	for (int i = 0; i < 2; i++) {
 		if (r->ext_buf_lost[i] != id)
 			continue;
 		r->ext_buf_lost[i] = 0;
+		if (!shown)
+			continue;
 		r->ext_front = i;
 		r->ext_back = i ^ 1;
 		r->ext_buf_stale[0] = true;
 		r->ext_buf_stale[1] = true;
-		shown = true;
+		front = true;
 	}
-	/* A window it put on screen is the one shown now. */
-	for (int i = 0; i < DCP_M4_EXT_WINDOWS; i++) {
-		if (!r->ext_win[i].lost_id || r->ext_win[i].lost_id != id)
-			continue;
-		for (int j = 0; j < DCP_M4_EXT_WINDOWS; j++)
-			r->ext_win[j].on_screen = false;
-		r->ext_win[i].lost_id = 0;
-		r->ext_win[i].on_screen = true;
-		r->ext_front = -1;
-		r->ext_buf_stale[0] = true;
-		r->ext_buf_stale[1] = true;
-		shown = true;
+	/* A window it put on screen is the one shown now, or one of them. */
+	if (shown && lost.win >= 0) {
+		if (!lost.superseded) {
+			for (int j = 0; j < DCP_M4_EXT_WINDOWS; j++)
+				r->ext_win[j].on_screen = false;
+			r->ext_front = -1;
+			r->ext_buf_stale[0] = true;
+			r->ext_buf_stale[1] = true;
+		}
+		r->ext_win[lost.win].on_screen = true;
+		front = true;
 	}
 	if (held) {
 		r->ext_hold_id = 0;
 		r->ext_hold_probe = false;
 	}
 	dev_info(r->dcp->dev, "swap %u: its D590 came late: dropped%s%s\n", id,
-		 shown ? "; its surface is on screen" : "", held ? "; swaps go on" : "");
+		 !shown ? "; not displayed, the frame on screen stays" :
+		 front ? "; its surface is on screen" : "", held ? "; swaps go on" : "");
 	return true;
+}
+
+/* The slot of @id among the swaps completed early (0: a free one), or -1. */
+static int dcp_m4_ext_early_slot(struct dcp_m4_runtime *r, u32 id)
+{
+	for (unsigned int i = 0; i < ARRAY_SIZE(r->ext_early); i++)
+		if (r->ext_early[i] == id)
+			return i;
+	return -1;
+}
+
+/* The index of the direct swap @id in flight, or -1. */
+static int dcp_m4_ext_q_find(struct dcp_m4_runtime *r, u32 id)
+{
+	for (unsigned int i = 0; id && i < r->ext_qn; i++)
+		if (r->ext_q[i].swap.id == id)
+			return i;
+	return -1;
 }
 
 static int dcp_m4_runtime_swap_done(void *cookie, u32 id)
 {
 	struct dcp_m4_runtime *r = cookie;
-	int ret;
+	struct dcp_m4_ext_done done = r->ext_done;
+	int ret, i, slot;
 
+	if (!r->dcp->external)
+		return dcp_m4_swap_record_done(&r->swap, id);
+	r->ext_done.valid = false;
+	/* Its payload unread: shown, and no earlier swap named. */
+	if (!done.valid)
+		done = (struct dcp_m4_ext_done){ .shown = true };
 	/* The late D590 of a swap given up is not this swap's. */
-	if (r->dcp->external && dcp_m4_ext_late_d590(r, id))
+	if (dcp_m4_ext_late_d590(r, id, done.shown))
 		return 0;
+	/* Nor is that of a swap a later one's D590 named. */
+	slot = dcp_m4_ext_early_slot(r, id);
+	if (slot >= 0) {
+		r->ext_early[slot] = 0;
+		dev_dbg(r->dcp->dev, "swap %u: its D590 after a later one's: dropped\n", id);
+		return 0;
+	}
+	/*
+	 * The earlier direct swaps in flight it names complete first, kept on
+	 * screen with what is there (macOS completes them as displayed), each
+	 * remembered: its own D590 may still come. Unnamed ones stay in flight.
+	 */
+	for (unsigned int j = 0; j < done.count; j++) {
+		i = done.hol[j] == id ? -1 : dcp_m4_ext_q_find(r, done.hol[j]);
+		if (i < 0)
+			continue;
+		slot = dcp_m4_ext_early_slot(r, 0);
+		if (slot < 0) {
+			dev_warn_ratelimited(r->dcp->dev, "swap %u named done by swap %u, with no slot to remember it: left in flight\n",
+					     done.hol[j], id);
+			continue;
+		}
+		r->ext_early[slot] = done.hol[j];
+		dcp_m4_ext_async_done(r, i, DCP_M4_EXT_END_KEPT);
+	}
+	/* A direct swap in flight is done: its flip, or the next one's. */
+	i = dcp_m4_ext_q_find(r, id);
+	if (i >= 0) {
+		dcp_m4_ext_async_done(r, i, done.shown ? DCP_M4_EXT_END_SHOWN :
+					    DCP_M4_EXT_END_UNSHOWN);
+		return 0;
+	}
 	ret = dcp_m4_swap_record_done(&r->swap, id);
-	/* A direct swap in flight is done: its flip now. */
-	if (!ret && r->dcp->external && r->ext_async_id == id && r->swap.replied)
-		dcp_m4_ext_async_done(r);
+	/*
+	 * The swap going out, before its A407 reply: whether it was shown, and
+	 * for a direct one what that means for the screen, now, in D590 order;
+	 * only its completion and flip wait for the reply.
+	 */
+	if (!ret) {
+		r->ext_swap_shown = done.shown;
+		if (r->ext_swap_async)
+			dcp_m4_ext_shown(r, id, r->ext_swap_win, r->ext_qn,
+					 done.shown ? DCP_M4_EXT_END_SHOWN :
+					 DCP_M4_EXT_END_UNSHOWN);
+	}
 	return ret;
 }
 
@@ -1170,6 +1397,27 @@ static int dcp_m4_runtime_idle_cache(void *cookie, unsigned int method,
 	return -EOPNOTSUPP;
 }
 
+/*
+ * D003 rt_bandwidth_setup_ap, answered as macOS answers it for a T8132
+ * external pipe: the DCP's 8-byte bandwidth request slot as the mailbox,
+ * whose length (8) selects the scratch-only protocol, with no doorbell. The
+ * firmware then writes its realtime bandwidth requests there. Without a
+ * mailbox from the DT (the internal panel) the service is declined.
+ */
+static int dcp_m4_runtime_bandwidth(void *cookie, void *output)
+{
+	struct dcp_m4_runtime *r = cookie;
+	u8 *out = output;
+
+	if (!r->dcp->bw_mailbox) {
+		put_unaligned_le32(1, out + 0x38);	/* status: declined */
+		return 0;
+	}
+	put_unaligned_le64(r->dcp->bw_mailbox, out + 0x08);
+	put_unaligned_le32(DCP_M4_BW_MAILBOX_SIZE, out + 0x2c);
+	return 0;
+}
+
 static const struct dcp_m4_callback_ops dcp_m4_runtime_ops = {
 	.call = dcp_m4_runtime_call,
 	.property = dcp_m4_runtime_property,
@@ -1177,6 +1425,7 @@ static const struct dcp_m4_callback_ops dcp_m4_runtime_ops = {
 	.event = dcp_m4_runtime_event,
 	.swap_done = dcp_m4_runtime_swap_done,
 	.idle = dcp_m4_runtime_idle_cache,
+	.bandwidth = dcp_m4_runtime_bandwidth,
 };
 
 static void dcp_m4_runtime_bad_word(struct dcp_m4_runtime *r, u64 word, int error)
@@ -1332,6 +1581,9 @@ static int dcp_m4_external_shape(u32 tag, u32 input, u32 output)
 
 	if (method == 134)
 		return !input && output == 4 ? method : -EMSGSIZE;
+	/* D411 mapDeviceMemoryWithIndex, see dcp_m4_external_callback(). */
+	if (method == 411)
+		return input == 0x10 && output == 0x1c ? method : -EMSGSIZE;
 	cb = method < 0 ? NULL : dcp_m4_ext_cb(method);
 	if (!cb)
 		return -EOPNOTSUPP;
@@ -1348,6 +1600,46 @@ static int dcp_m4_external_callback(struct dcp_m4_runtime *r, u32 tag, bool remo
 	u8 one[4], out[4];
 	int ret;
 
+	/*
+	 * D590 swap_complete_ap_gated: whether the swap was displayed (+0x4),
+	 * and the earlier swaps it completes, a count at +0x19 of the IDs at
+	 * +0x5, with +0x1d set (and +0x72c, no completion data, clear). Kept for
+	 * its swap_done hook, which the shared dispatcher calls next.
+	 */
+	if (method == 590 && input_size == dcp_m4_pf->done_size) {
+		struct dcp_m4_ext_done *d = &r->ext_done;
+		u32 count = get_unaligned_le32(input + 0x19);
+
+		*d = (struct dcp_m4_ext_done){ .valid = true, .shown = input[4] != 0 };
+		if (input[0x1d] == 1 && !input[0x72c]) {
+			if (count > ARRAY_SIZE(d->hol))
+				dev_warn_ratelimited(r->dcp->dev, "D590 of swap %u names %u earlier swaps: ignored\n",
+						     get_unaligned_le32(input), count);
+			else
+				for (d->count = 0; d->count < count; d->count++)
+					d->hol[d->count] =
+						get_unaligned_le32(input + 5 + 4 * d->count);
+		}
+		return -ENOENT;
+	}
+	/*
+	 * D581 swap_complete_head_of_line: a completion too, whose 0xc bytes the
+	 * driver does not decode: logged and acknowledged, its swap left to a
+	 * D590 or to its give-up.
+	 */
+	if (method == 581 && input_size == 0xc) {
+		static DEFINE_RATELIMIT_STATE(rs, 5 * HZ, 4);
+		u32 id = get_unaligned_le32(input);
+
+		if (__ratelimit(&rs)) {
+			dev_warn(r->dcp->dev, "D581 swap_complete_head_of_line, word 0 %u (%s): left to a D590 or its give-up\n",
+				 id, dcp_m4_ext_q_find(r, id) >= 0 ? "a swap in flight" :
+				 "no swap in flight");
+			print_hex_dump_debug("D581: ", DUMP_PREFIX_OFFSET, 16, 1, input,
+					     input_size, false);
+		}
+		return -ENOENT;
+	}
 	/*
 	 * D572 powerUpDART(on): the firmware switches its display DART
 	 * on or off, which the host does nothing for but must not touch the
@@ -1443,6 +1735,43 @@ static int dcp_m4_external_callback(struct dcp_m4_runtime *r, u32 tag, bool remo
 		return 0;
 	}
 	/*
+	 * D411 mapDeviceMemoryWithIndex, which the firmware asks for its register
+	 * windows (the one holding the bandwidth mailbox among them): "VORP", the
+	 * display register index and flags in; the window's DVA, address and
+	 * length, then a u32 status out. Only a disp-N window the DT describes is
+	 * given. As on the desktop 26.x firmware, the DVA is the physical address:
+	 * the firmware reaches its register windows on its DART-bypass stream.
+	 * Any other index gets status 1.
+	 */
+	if (method == 411) {
+		struct resource *res = NULL;
+		u8 *o = output;
+		char name[16];
+		u32 index;
+
+		if (input_size != 0x10 || output_size != 0x1c)
+			return -EMSGSIZE;
+		index = get_unaligned_le32(input + 4);
+		if (!memcmp(input, "VORP", 4) && index < MAX_DISP_REGISTERS) {
+			snprintf(name, sizeof(name), "disp-%u", index);
+			res = platform_get_resource_byname(to_platform_device(r->dcp->dev),
+							   IORESOURCE_MEM, name);
+		}
+		memset(o, 0, 0x1c);
+		if (!res) {
+			put_unaligned_le32(1, o + 24);
+			dev_warn(r->dcp->dev, "D411: register index %u is not described: refused\n",
+				 index);
+			return 0;
+		}
+		put_unaligned_le64(res->start, o);
+		put_unaligned_le64(res->start, o + 8);
+		put_unaligned_le64(resource_size(res), o + 16);
+		dev_dbg(r->dcp->dev, "D411: register index %u (flags %#x) mapped: %pR\n", index,
+			get_unaligned_le32(input + 8), res);
+		return 0;
+	}
+	/*
 	 * D575, the hotplug report: the connection state and a 76-byte
 	 * tiled-display record (its null flag at 84) in, a 76-byte record out.
 	 * An external pipe with no peer answers it as the desktop 26.x external
@@ -1463,8 +1792,8 @@ static int dcp_m4_external_callback(struct dcp_m4_runtime *r, u32 tag, bool remo
 		/* A sink that went takes a new power-on and mode. */
 		if (!connected) {
 			atomic_inc(&r->ext_link_gen);
-			/* A direct swap in flight is given up now. */
-			if (r->ext_async_id)
+			/* The direct swaps in flight are given up now. */
+			if (r->ext_qn)
 				mod_delayed_work(r->wq, &r->ext_async_work, 0);
 			WRITE_ONCE(r->ext_powered, false);
 			WRITE_ONCE(r->ext_cur_timing, 0);
@@ -1696,6 +2025,14 @@ static void dcp_m4_runtime_idle(struct work_struct *work)
 	int ret;
 
 	mutex_lock(&dcp->lock);
+	/*
+	 * Powered down (iomfb_m4_power_gate()): nothing arrives then, and
+	 * nothing may reach the stopped firmware or its powered-down DARTs.
+	 */
+	if (READ_ONCE(dcp->gated)) {
+		mutex_unlock(&dcp->lock);
+		return;
+	}
 	ret = dcp_m4_runtime_drain(r, 32);
 	if (ret < 0) {
 		dcp_m4_transaction_fail(&dcp->transaction, ret);
@@ -1743,14 +2080,16 @@ static int dcp_m4_ext_swap_wait(struct dcp_m4_runtime *r, int link_gen, u64 *wor
  * After one given up on a live link, swaps are held (iomfb_m4_ext_present())
  * until its D590 or a confirmed swap after a DRM enable, so that a stuck
  * pipe does not cost every frame 5 s. With every slot taken the swap is
- * not given up. True if the swap was given up so; anything else is the
- * session's failure as before.
+ * not given up. @swap is its state: r->swap, or a direct swap's in flight,
+ * @win its window (-1: none) and @superseded whether a newer swap was shown
+ * before it. True if the swap was given up so; anything else is the session's
+ * failure as before.
  */
-static bool dcp_m4_ext_swap_give_up(struct dcp_m4_runtime *r, int error)
+static bool dcp_m4_ext_swap_give_up(struct dcp_m4_runtime *r, struct dcp_m4_swap_state *swap,
+				    int win, bool superseded, int error)
 {
 	struct iomfb_m4 *dcp = r->dcp;
 	struct dcp_m4_transaction *t = &dcp->transaction;
-	struct dcp_m4_swap_state *swap = &r->swap;
 	int slot;
 
 	if (!dcp->external || (error != -ETIMEDOUT && error != -ENOLINK) ||
@@ -1762,14 +2101,16 @@ static bool dcp_m4_ext_swap_give_up(struct dcp_m4_runtime *r, int error)
 		return false;
 	slot = -1;
 	for (unsigned int i = 0; slot < 0 && i < ARRAY_SIZE(r->ext_lost_swap); i++)
-		if (!r->ext_lost_swap[i])
+		if (!r->ext_lost_swap[i].id)
 			slot = i;
 	if (slot < 0) {
 		dev_warn(dcp->dev, "swap %u: %d given-up swaps still without their D590: not given up\n",
 			 swap->id, (int)ARRAY_SIZE(r->ext_lost_swap));
 		return false;
 	}
-	r->ext_lost_swap[slot] = swap->id;
+	r->ext_lost_swap[slot] = (struct dcp_m4_ext_lost){
+		.id = swap->id, .win = win, .superseded = superseded,
+	};
 	swap->emitted = true;
 	if (r->ext_swap_surface >= 0)
 		r->ext_buf_lost[r->ext_swap_surface] = swap->id;
@@ -1843,9 +2184,9 @@ static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
 	if (!ret)
 		ret = dcp_m4_swap_start_reply(started, sizeof(started), &id);
 	/*
-	 * An ID whose given-up swap's D590 may still come is not reused: the
-	 * two completions could not be told apart, as a D590 names the swap by
-	 * its ID alone. A407 is not sent, and the start is left orphaned: no
+	 * An ID whose given-up (or early-completed) swap's D590 may still come
+	 * is not reused: the two completions could not be told apart, as a D590
+	 * names the swap by its ID alone. A407 is not sent, and the start is left orphaned: no
 	 * host call ends or discards a started swap, and completing it (with a
 	 * surfaceless A407) would leave two completions under one ID that a
 	 * single D590 could belong to either of, while the firmware may swallow
@@ -1853,7 +2194,8 @@ static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
 	 * (dcp_m4_runtime_swap_full()) until reboot; the old swap's late D590
 	 * is still dropped, but ends no hold.
 	 */
-	if (!ret && ext && dcp_m4_ext_lost_slot(r, id) >= 0) {
+	if (!ret && ext &&
+	    (dcp_m4_ext_lost_slot(r, id) >= 0 || dcp_m4_ext_early_slot(r, id) >= 0)) {
 		dev_warn(dcp->dev, "A406 gave swap %u again, whose D590 may still come: not submitted, the start left orphaned; no swap starts until reboot\n",
 			 id);
 		r->ext_orphan_start = id;
@@ -1876,25 +2218,46 @@ static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
 	if (!ret)
 		ret = dcp_m4_swap_record_reply(&r->swap, submitted, sizeof(submitted));
 	/*
-	 * A direct swap does not wait for its D590: that completes it
-	 * (dcp_m4_runtime_swap_done()), or its work gives it up at the deadline
-	 * or when the link goes (dcp_m4_ext_async_work()). Nothing of it is
-	 * outstanding on the RPC buffer: A406 and A407 are answered.
+	 * A direct swap does not wait for its D590: it joins the swaps in flight
+	 * and is tracked there (r->swap may begin the next one) until its D590,
+	 * or a later swap's, completes it (dcp_m4_runtime_swap_done()), or its
+	 * work gives it up at the deadline or when the link goes
+	 * (dcp_m4_ext_async_work()). Nothing of it is outstanding on the RPC
+	 * buffer: A406 and A407 are answered. Its flip goes at once with none
+	 * older in flight and a depth over 1 (the previous frame's buffer may still
+	 * be on screen then), else with the completion of the older one, or its
+	 * own.
 	 */
 	if (!ret && ext && r->ext_swap_async) {
-		r->deadline = 0;
-		kfree(input);
-		r->ext_async_id = r->swap.id;
-		r->ext_async_gen = link_gen;
-		r->ext_async_deadline = jiffies + msecs_to_jiffies(5000);
-		if (r->swap.completed) {
-			dcp_m4_ext_async_done(r);
-		} else {
-			queue_delayed_work(r->wq, &r->ext_async_work, msecs_to_jiffies(5000));
-			if (!r->ext_connected || atomic_read(&r->ext_link_gen) != link_gen)
-				mod_delayed_work(r->wq, &r->ext_async_work, 0);
+		struct dcp_m4_ext_inflight *e =
+			&r->ext_q[min_t(unsigned int, r->ext_qn, DCP_M4_EXT_INFLIGHT - 1)];
+		struct dcp_m4_swap_state handed;
+
+		/* iomfb_m4_ext_present_direct() left room for it. */
+		ret = WARN_ON_ONCE(r->ext_qn >= DCP_M4_EXT_INFLIGHT) ? -EBUSY :
+		      dcp_m4_swap_hand_off(&r->swap, &handed);
+		if (!ret) {
+			r->deadline = 0;
+			kfree(input);
+			*e = (struct dcp_m4_ext_inflight){
+				.swap = handed,
+				.win = r->ext_swap_win,
+				.gen = link_gen,
+				.deadline = jiffies + msecs_to_jiffies(5000),
+				.flip_held = r->ext_qn || r->ext_swap_async < 2,
+			};
+			r->ext_swap_now = !e->flip_held;
+			r->ext_qn++;
+			if (e->swap.completed) {
+				dcp_m4_ext_async_done(r, r->ext_qn - 1, DCP_M4_EXT_END_TAKEN);
+			} else {
+				queue_delayed_work(r->wq, &r->ext_async_work,
+						   msecs_to_jiffies(5000));
+				if (!r->ext_connected || atomic_read(&r->ext_link_gen) != link_gen)
+					mod_delayed_work(r->wq, &r->ext_async_work, 0);
+			}
+			return 0;
 		}
-		return 0;
 	}
 	while (!ret && !r->swap.completed) {
 		if (ext) {
@@ -1914,7 +2277,7 @@ static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
 	/* Only the copied host input is freed; the firmware-visible RPC stays pinned. */
 	kfree(input);
 	/* Only its D590 missing: given up, the session kept. */
-	if (ret && d590_missing && dcp_m4_ext_swap_give_up(r, ret))
+	if (ret && d590_missing && dcp_m4_ext_swap_give_up(r, &r->swap, -1, false, ret))
 		return ret;
 	if (ret) {
 		dcp_m4_swap_fail(&r->swap, ret);
@@ -1963,17 +2326,16 @@ static int dcp_m4_boot_framebuffer_check(void)
 		if (!of_device_is_available(np))
 			continue;
 		found++;
-		/* The inherited console may exclude the notch (64 lines on J713). */
+		/* The inherited console may exclude the panel's notch rows. */
 		if (of_property_read_u32(np, "width", &width) ||
 		    of_property_read_u32(np, "height", &height) ||
 		    of_property_read_u32(np, "stride", &stride) ||
 		    width != dcp_m4_pf->panel_width || stride != dcp_m4_pf->boot_stride ||
 		    (height != dcp_m4_pf->panel_height &&
-		     height != dcp_m4_pf->panel_height - 64)) {
+		     height != dcp_m4_pf->panel_height - dcp_m4_pf->notch_rows)) {
 			of_node_put(np);
 			return -EINVAL;
 		}
-		/* The inherited console can exclude the 64-line notch region. */
 		ret = 0;
 	}
 	return found > 1 ? -EINVAL : ret;
@@ -2005,6 +2367,7 @@ static int dcp_m4_startup(struct iomfb_m4 *dcp)
 	}
 	/* An external firmware's D451 requests are not qualified as such. */
 	dcp->memory->relaxed = dcp->external;
+	dcp->memory->page_align = !dcp->external && dcp_m4_pf->alloc_page_align;
 	/* An external display DART counts as off until a D572(1). */
 	WRITE_ONCE(dcp->ext_dart_down, dcp->external);
 	r->properties = kzalloc(sizeof(*r->properties), GFP_KERNEL);
@@ -2016,8 +2379,8 @@ static int dcp_m4_startup(struct iomfb_m4 *dcp)
 	/* No surface on screen or in flight yet. */
 	r->ext_swap_surface = -1;
 	r->ext_front = -1;
-	/* No direct swap in flight. */
-	r->ext_async_win = -1;
+	/* No direct swap going out. */
+	r->ext_swap_win = -1;
 	INIT_DELAYED_WORK(&r->ext_async_work, dcp_m4_ext_async_work);
 	init_completion(&r->received);
 	INIT_WORK(&r->idle, dcp_m4_runtime_idle);
@@ -2187,13 +2550,51 @@ static bool iomfb_m4_firmware_property(struct device_node *np, const char *name)
 	       version[0] == 26 && version[1] == 6 && version[2] == 2;
 }
 
+/*
+ * The realtime bandwidth mailbox the DT gives @dev, or 0: apple,bw-scratch
+ * names the provider's reg range, the firmware's display register index and
+ * an offset into the range. The mailbox is DCP_M4_BW_MAILBOX_SIZE bytes, and
+ * must lie inside display register window 4, through which the firmware
+ * reaches a scratch-only mailbox.
+ */
+static u64 dcp_m4_bw_mailbox(struct device *dev)
+{
+	struct of_phandle_args args;
+	struct resource range, *win = NULL;
+	u64 slot = 0;
+	int ret;
+
+	ret = of_parse_phandle_with_args(dev->of_node, "apple,bw-scratch",
+					 "#apple,bw-scratch-cells", 0, &args);
+	if (ret == -ENOENT)
+		return 0;
+	if (ret) {
+		dev_warn(dev, "apple,bw-scratch: %d: realtime bandwidth declined\n", ret);
+		return 0;
+	}
+	if (args.args_count == 3 && args.args[1] == 4 &&
+	    !of_address_to_resource(args.np, args.args[0], &range) &&
+	    resource_size(&range) >= DCP_M4_BW_MAILBOX_SIZE &&
+	    args.args[2] <= resource_size(&range) - DCP_M4_BW_MAILBOX_SIZE) {
+		win = platform_get_resource_byname(to_platform_device(dev), IORESOURCE_MEM,
+						   "disp-4");
+		slot = range.start + args.args[2];
+	}
+	of_node_put(args.np);
+	if (!win || slot < win->start || slot + DCP_M4_BW_MAILBOX_SIZE - 1 > win->end) {
+		dev_warn(dev, "apple,bw-scratch: no mailbox inside disp-4: realtime bandwidth declined\n");
+		return 0;
+	}
+	return slot;
+}
+
 int iomfb_m4_init(struct apple_dcp *owner)
 {
 	struct platform_device *pdev = to_platform_device(owner->dev);
 	struct device *dev = owner->dev;
 	struct iomfb_m4 *dcp;
 	struct resource *res;
-	const char *uuid;
+	const struct dcp_m4_profile *pf = dcp_m4_machine_profile();
 	u32 ready = 0;
 	int ret;
 	/* An external DCP the boot loader handed over: same firmware, no panel. */
@@ -2203,13 +2604,15 @@ int iomfb_m4_init(struct apple_dcp *owner)
 	    (of_property_read_u32(dev->of_node, "apple,t8132-dcpext-firmware-ready", &ready) ||
 	     ready != 1))
 		return dev_err_probe(dev, -ENODEV, "external DCP not handed over\n");
-	if (!of_machine_is_compatible("apple,j713") ||
+	if (!pf ||
 	    (!external && !of_device_is_compatible(dev->of_node, "apple,t8132-dcp")) ||
 	    !iomfb_m4_firmware_property(dev->of_node, "apple,firmware-version") ||
-	    !iomfb_m4_firmware_property(dev->of_node, "apple,firmware-compat") ||
-	    of_property_read_string(dev->of_node, "apple,firmware-uuid", &uuid) ||
-	    strcmp(uuid, "81BAF476-679D-3CC0-8C6A-E6B6FA659D5E"))
+	    !iomfb_m4_firmware_property(dev->of_node, "apple,firmware-compat"))
 		return dev_err_probe(dev, -ENODEV, "unqualified firmware 26.6.2 handoff\n");
+	/* Refuse before any message, so the boot framebuffer stays. */
+	if (!external && !pf->timing)
+		return dev_err_probe(dev, -ENODEV, "no qualified %s panel timing\n", pf->name);
+	dcp_m4_pf = pf;
 	ret = dcp_m4_dart_check(dev);
 	if (ret)
 		return dev_err_probe(dev, ret, "inherited SID23 domain not qualified\n");
@@ -2230,6 +2633,7 @@ int iomfb_m4_init(struct apple_dcp *owner)
 		return -ENOMEM;
 	dcp->owner = owner;
 	dcp->dev = dev;
+	dcp->bw_mailbox = dcp_m4_bw_mailbox(dev);
 	mutex_init(&dcp->lock);
 	mutex_init(&dcp->ext_modes_lock);
 	spin_lock_init(&dcp->state_lock);
@@ -2240,6 +2644,7 @@ int iomfb_m4_init(struct apple_dcp *owner)
 	INIT_WORK(&dcp->ext_put_work, iomfb_m4_ext_put_work);
 	init_waitqueue_head(&dcp->ext_settle_wq);
 	INIT_DELAYED_WORK(&dcp->idle_cache, iomfb_m4_idle_cache_work);
+	INIT_DELAYED_WORK(&dcp->gate_work, iomfb_m4_gate_work);
 	if (!request_mem_region(res->start, resource_size(res), dev_name(dev))) {
 		ret = -EBUSY;
 		goto release;
@@ -2266,6 +2671,9 @@ int iomfb_m4_init(struct apple_dcp *owner)
 	if (ret)
 		return ret;
 	dcp->external = external;
+	/* The internal display's power-down: its PMC interface names the rest. */
+	dcp->gate_capable = !external && apple_pmp_j713_board() &&
+			    of_property_present(dev->of_node, "apple,pmc-interface");
 	owner->v26_6 = dcp;
 	owner->rtk = dcp->rtkit;
 	owner->coproc_reg = dcp->coproc;
@@ -2516,8 +2924,8 @@ void iomfb_m4_external_link_gone(struct apple_dcp *owner)
 	if (r && dcp->external) {
 		/* A swap waiting for its D590 stops waiting (dcp_m4_ext_swap_wait()). */
 		atomic_inc(&r->ext_link_gen);
-		/* A direct swap in flight is given up now. */
-		if (READ_ONCE(r->ext_async_id))
+		/* The direct swaps in flight are given up now. */
+		if (READ_ONCE(r->ext_qn))
 			mod_delayed_work(r->wq, &r->ext_async_work, 0);
 		/* A new link takes a new power-on and mode. */
 		WRITE_ONCE(r->ext_powered, false);
@@ -2568,6 +2976,16 @@ static u64 dcp_m4_ext_capacity(struct apple_dcp *owner)
 }
 
 /*
+ * Whether a cached mode fits the link: at 24 bpp uncompressed, at 8 bpp (the
+ * lowest DSC target) with a colour that needs DSC, whose rate the firmware
+ * picks itself.
+ */
+static bool dcp_m4_ext_fits(const struct iomfb_m4_ext_mode *e, u64 capacity)
+{
+	return !capacity || (u64)e->mode.clock * (e->dsc ? 8 : 24) <= capacity;
+}
+
+/*
  * The firmware's IDs of a mode iomfb_m4_ext_get_modes()
  * offered: -ENOENT for any other mode, -ENOSPC for one over the link.
  */
@@ -2587,23 +3005,21 @@ int iomfb_m4_ext_mode_ids(struct apple_dcp *owner, const struct drm_display_mode
 		if (!drm_mode_match(&e->mode, mode, DRM_MODE_MATCH_TIMINGS |
 				    DRM_MODE_MATCH_CLOCK | DRM_MODE_MATCH_FLAGS))
 			continue;
-		if (capacity && (u64)e->mode.clock * 24 > capacity) {
+		if (!dcp_m4_ext_fits(e, capacity)) {
 			ret = -ENOSPC;
 			continue;
 		}
 		ids->timing = e->timing;
 		ids->color = e->color;
 		ids->bootstrap = e->bootstrap;
+		dev_dbg(dcp->dev, "mode %ux%u@%d: timing %u, colour %u%s\n",
+			e->mode.hdisplay, e->mode.vdisplay, drm_mode_vrefresh(&e->mode),
+			e->timing, e->color, e->dsc ? " (DSC)" : "");
 		ret = 0;
 		break;
 	}
 	mutex_unlock(&dcp->ext_modes_lock);
 	return ret;
-}
-
-static bool dcp_m4_ext_fits(const struct drm_display_mode *m, u64 capacity)
-{
-	return !capacity || (u64)m->clock * 24 <= capacity;
 }
 
 /* A mode's refresh rate in mHz, to compare 59.94 with 60 Hz. */
@@ -2634,7 +3050,8 @@ static bool dcp_m4_ext_sink_preferred(const struct iomfb_m4 *dcp,
 
 /*
  * The cached mode to mark preferred, -1 for none (the
- * 1920x1080 fallback), with the rule that chose it in @why:
+ * 1920x1080 fallback), never one that needs DSC (the user picks those), with
+ * the rule that chose it in @why:
  * 1. the native size is the largest (pixel area) of the sink's preferred
  *    timings: its PreferredTimingElements (their own sizes too) and its
  *    IsPreferred timings;
@@ -2670,8 +3087,8 @@ static int dcp_m4_ext_pick_preferred(struct iomfb_m4 *dcp, u64 capacity, const c
 		u64 mhz = dcp_m4_ext_mhz(&e[i].mode), best_mhz;
 		bool pref, best_pref;
 
-		if (!dcp_m4_ext_same_size(&e[i].mode, width, height) ||
-		    !dcp_m4_ext_fits(&e[i].mode, capacity) || mhz < DCP_M4_EXT_MIN_MHZ)
+		if (!dcp_m4_ext_same_size(&e[i].mode, width, height) || e[i].dsc ||
+		    !dcp_m4_ext_fits(&e[i], capacity) || mhz < DCP_M4_EXT_MIN_MHZ)
 			continue;
 		if (best < 0) {
 			best = i;
@@ -2692,8 +3109,8 @@ static int dcp_m4_ext_pick_preferred(struct iomfb_m4 *dcp, u64 capacity, const c
 		u64 a = (u64)e[i].mode.hdisplay * e[i].mode.vdisplay, b;
 		u64 mhz = dcp_m4_ext_mhz(&e[i].mode);
 
-		if (!dcp_m4_ext_sink_preferred(dcp, &e[i]) ||
-		    !dcp_m4_ext_fits(&e[i].mode, capacity) || mhz < DCP_M4_EXT_MIN_MHZ)
+		if (!dcp_m4_ext_sink_preferred(dcp, &e[i]) || e[i].dsc ||
+		    !dcp_m4_ext_fits(&e[i], capacity) || mhz < DCP_M4_EXT_MIN_MHZ)
 			continue;
 		b = best < 0 ? 0 : (u64)e[best].mode.hdisplay * e[best].mode.vdisplay;
 		if (best < 0 || a > b || (a == b && mhz > dcp_m4_ext_mhz(&e[best].mode)))
@@ -2724,7 +3141,7 @@ int iomfb_m4_ext_get_modes(struct apple_dcp *owner, struct drm_connector *connec
 		const struct drm_display_mode *m = &dcp->ext_modes[i].mode;
 		struct drm_display_mode *mode;
 
-		if (capacity && (u64)m->clock * 24 > capacity) {
+		if (!dcp_m4_ext_fits(&dcp->ext_modes[i], capacity)) {
 			skipped++;
 			continue;
 		}
@@ -2736,8 +3153,10 @@ int iomfb_m4_ext_get_modes(struct apple_dcp *owner, struct drm_connector *connec
 			mode->type |= DRM_MODE_TYPE_PREFERRED;
 			preferred = mode;
 		}
-		if (!fallback || (mode->hdisplay == 1920 && mode->vdisplay == 1080 &&
-				  drm_mode_vrefresh(mode) == 60))
+		/* A DSC mode is never the fallback either: the user picks one. */
+		if (!dcp->ext_modes[i].dsc &&
+		    (!fallback || (mode->hdisplay == 1920 && mode->vdisplay == 1080 &&
+				   drm_mode_vrefresh(mode) == 60)))
 			fallback = mode;
 		drm_mode_probed_add(connector, mode);
 		added++;
@@ -2896,12 +3315,16 @@ int iomfb_m4_present(struct apple_dcp *owner, struct drm_framebuffer *fb,
 				  fb->pitches[0], fb->format->format == DRM_FORMAT_ARGB8888);
 	if (ret)
 		return ret;
+	/* A power-down not yet started is not needed; one under way finishes first. */
+	cancel_delayed_work(&dcp->gate_work);
 	mutex_lock(&dcp->lock);
 	ret = dcp_m4_runtime_live(dcp->runtime);
 	if (!ret && dcp->powered_off)
 		ret = -EAGAIN;
 	if (!ret)
 		ret = iomfb_m4_check_frame(&frame);
+	if (!ret && dcp->gated)
+		ret = iomfb_m4_power_ungate(dcp);
 	/* The first frame after a blank powers the display back up. */
 	if (!ret && dcp->display_off) {
 		ktime_t start = ktime_get();
@@ -2974,6 +3397,11 @@ int iomfb_m4_blank(struct apple_dcp *owner)
 				dcp->display_off_us = ktime_us_delta(ktime_get(), start);
 				dcp->display_off_us_max = max(dcp->display_off_us,
 							      dcp->display_off_us_max);
+				unsigned int gate_ms = READ_ONCE(power_gate_ms);
+
+				if (dcp->gate_capable && gate_ms)
+					mod_delayed_work(system_dfl_wq, &dcp->gate_work,
+							 msecs_to_jiffies(gate_ms));
 			}
 		}
 	}
@@ -3023,6 +3451,222 @@ static int dcp_m4_set_power_state(struct iomfb_m4 *dcp, bool on)
 	return ret;
 }
 
+/* Stop or start the DCP CPU; stopping waits for its idle status first. */
+static int iomfb_m4_cpu_run(struct iomfb_m4 *dcp, bool run)
+{
+	u32 control = readl(dcp->coproc + DCP_M4_CPU_CONTROL), status;
+	int ret;
+
+	if (!!(control & DCP_M4_CPU_RUN) == run)
+		return -EBUSY;
+	if (!run) {
+		ret = readl_poll_timeout(dcp->coproc + DCP_M4_CPU_STATUS, status,
+					 status & DCP_M4_CPU_STATUS_IDLE, 100, 100000);
+		if (ret)
+			return ret;
+	}
+	control = run ? control | DCP_M4_CPU_RUN : control & ~DCP_M4_CPU_RUN;
+	writel(control, dcp->coproc + DCP_M4_CPU_CONTROL);
+	return readl(dcp->coproc + DCP_M4_CPU_CONTROL) == control ? 0 : -EIO;
+}
+
+static int iomfb_m4_cpu_start(void *data)
+{
+	return iomfb_m4_cpu_run(data, true);
+}
+
+/*
+ * Whether every provider of the power-down can take part now, changing
+ * nothing: its display DARTs, the PMP vote (held, and releasable without
+ * losing it), the PMC interface enables and the PMGR states.
+ */
+static int iomfb_m4_gate_check(struct iomfb_m4 *dcp)
+{
+	return apple_dart_dcp_power_check(dcp->dev) ?:
+	       apple_dart_dcp_power_check(&dcp->piodma->dev) ?:
+	       apple_pmp_j713_display_check_release(dcp->dev) ?:
+	       apple_pmc_interface_consumer_check(dcp->dev) ?:
+	       apple_pmgr_ps_consumer_check(dcp->dev);
+}
+
+/*
+ * After the blank's setPowerState(0), power the DCP and the display domains
+ * down as macOS does for display sleep: release the AP link (A500), let RTKit
+ * idle, stop the CPU, then power down its display DARTs, release its PMP
+ * vote, clear its PMC interface enables and power its CPU, frontend and
+ * system domains off. Firmware, endpoints and shared buffers stay in place
+ * for iomfb_m4_power_ungate(). Before the first step every provider is
+ * asked whether it can take part: if one cannot, nothing changes and the
+ * display just stays logically off. A failure after that fails the session.
+ */
+static int iomfb_m4_power_gate(struct iomfb_m4 *dcp)
+{
+	struct dcp_m4_runtime *r = dcp->runtime;
+	ktime_t start = ktime_get();
+	unsigned long flags;
+	__le32 zero = 0;
+	const char *step;
+	int ret;
+
+	lockdep_assert_held(&dcp->lock);
+	if (!dcp->gate_capable || dcp->gated || !dcp->display_off || dcp->powered_off ||
+	    dcp->active_fb || dcp->active_frame.dva || dcp->transaction.calls)
+		return -EBUSY;
+	ret = dcp_m4_runtime_live(r);
+	if (ret)
+		return ret;
+	ret = iomfb_m4_gate_check(dcp);
+	if (ret) {
+		dev_dbg(dcp->dev, "display power-down not possible now (%d): stays logically off\n",
+			ret);
+		return ret;
+	}
+
+	step = "A500";
+	ret = dcp_m4_runtime_call(r, 500, false, &zero, sizeof(zero), NULL, 0);
+	if (!ret) {
+		step = "drain";
+		ret = dcp_m4_runtime_drain(r, 64);
+		if (ret > 0 || (!ret && r->count))
+			ret = -EBUSY;
+	}
+	if (!ret) {
+		step = "RTKit idle";
+		ret = apple_rtkit_idle(dcp->rtkit);
+	}
+	if (ret)
+		goto fail;
+	apple_rtkit_hold_rx(dcp->rtkit);
+	step = "CPU stop";
+	ret = iomfb_m4_cpu_run(dcp, false);
+	if (ret)
+		goto fail;
+	/*
+	 * The stopped CPU sends nothing more. A message it sent during the idle
+	 * handshake would be handled after the power-down, by firmware that is
+	 * stopped and through DARTs that are off: take everything in now, and
+	 * fail here, with nothing powered down, if anything arrived.
+	 */
+	step = "late message";
+	ret = apple_rtkit_poll(dcp->rtkit);
+	if (ret >= 0) {
+		apple_rtkit_flush_rx(dcp->rtkit);
+		spin_lock_irqsave(&dcp->state_lock, flags);
+		ret = r->count ? -EBUSY : 0;
+		spin_unlock_irqrestore(&dcp->state_lock, flags);
+	}
+	if (ret)
+		goto fail;
+
+	/* From here on nothing may use the DCP's or its DARTs' registers. */
+	WRITE_ONCE(dcp->gated, true);
+	step = "DART";
+	ret = apple_dart_dcp_power_off(dcp->dev);
+	if (!ret)
+		ret = apple_dart_dcp_power_off(&dcp->piodma->dev);
+	if (!ret) {
+		step = "PMP";
+		ret = apple_pmp_j713_display_put(dcp->dev);
+	}
+	if (!ret) {
+		step = "PMC";
+		ret = apple_pmc_interface_consumer_off(dcp->dev);
+	}
+	if (!ret) {
+		step = "PMGR";
+		ret = apple_pmgr_ps_consumer_off(dcp->dev);
+	}
+	if (ret)
+		goto fail;
+	dcp->gate_cycles++;
+	dcp->gate_off_us = ktime_us_delta(ktime_get(), start);
+	return 0;
+fail:
+	dev_err(dcp->dev, "display power-down failed at %s: %d\n", step, ret);
+	dcp_m4_failed(dcp, ret);
+	return ret;
+}
+
+/*
+ * Power the DCP back up for the first frame after a gated blank, in macOS's
+ * order: the domains, the PMP vote, the PMC interface enables, then the
+ * display DARTs, then the CPU through RTKit's retained wake, and the display
+ * preparation macOS sends before setPowerState(1). A failure fails the
+ * session.
+ */
+static int iomfb_m4_power_ungate(struct iomfb_m4 *dcp)
+{
+	struct dcp_m4_runtime *r = dcp->runtime;
+	ktime_t start = ktime_get();
+	u8 prepare[8] = {}, prepared[8] = {};
+	__le32 main_display = 0;
+	const char *step;
+	int ret;
+
+	lockdep_assert_held(&dcp->lock);
+	if (!dcp->gated)
+		return 0;
+	step = "PMGR";
+	ret = apple_pmgr_ps_consumer_on(dcp->dev);
+	if (!ret) {
+		step = "PMP";
+		ret = apple_pmp_j713_display_get(dcp->dev);
+	}
+	if (!ret) {
+		step = "PMC";
+		ret = apple_pmc_interface_consumer_on(dcp->dev);
+	}
+	if (!ret) {
+		step = "DART";
+		ret = apple_dart_dcp_power_on(dcp->dev);
+	}
+	if (!ret)
+		ret = apple_dart_dcp_power_on(&dcp->piodma->dev);
+	if (!ret) {
+		step = "RTKit wake";
+		ret = apple_rtkit_wake_retained(dcp->rtkit, iomfb_m4_cpu_start, dcp);
+	}
+	if (ret)
+		goto fail;
+	WRITE_ONCE(dcp->gated, false);
+
+	step = "A414";
+	ret = dcp_m4_runtime_call(r, 414, false, prepare, sizeof(prepare),
+				  prepared, sizeof(prepared));
+	if (!ret && get_unaligned_le32(prepared + 4))
+		ret = -EREMOTEIO;
+	if (!ret) {
+		step = "A412";
+		ret = dcp_m4_runtime_call(r, 412, false, NULL, 0, &main_display,
+					  sizeof(main_display));
+	}
+	if (!ret && le32_to_cpu(main_display) != 1)
+		ret = -EREMOTEIO;
+	if (ret)
+		goto fail;
+	dcp->gate_on_us = ktime_us_delta(ktime_get(), start);
+	return 0;
+fail:
+	dev_err(dcp->dev, "display power-up failed at %s: %d\n", step, ret);
+	dcp_m4_failed(dcp, ret);
+	return ret;
+}
+
+static void iomfb_m4_gate_work(struct work_struct *work)
+{
+	struct iomfb_m4 *dcp = container_of(to_delayed_work(work), struct iomfb_m4, gate_work);
+
+	mutex_lock(&dcp->lock);
+	/*
+	 * Still blanked and not yet down: a frame since then cancels it, and so
+	 * does turning the power-down off meanwhile (power_gate_ms = 0).
+	 */
+	if (dcp->runtime && dcp->display_off && !dcp->gated && !READ_ONCE(dcp->error) &&
+	    !READ_ONCE(dcp->owner->quiescing) && READ_ONCE(power_gate_ms))
+		iomfb_m4_power_gate(dcp);
+	mutex_unlock(&dcp->lock);
+}
+
 /* A364: the firmware's record of a timing and colour pair. */
 struct dcp_m4_mode_info_req {
 	u8 mode[0x64];
@@ -3040,9 +3684,10 @@ static_assert(sizeof(struct dcp_m4_mode_info_req) == 0x7c);
 
 /*
  * The colour element of a timing: RGB with the SDR gamma EOTF, not virtual,
- * not unsafe or needing DSC for the timing; the lowest depth offered (8 bpc
- * if there is one); then sRGB/BT.709 colorimetry and full range over
- * others, then the higher score. Never PQ or HLG.
+ * not unsafe for the timing, at 8 bpc if the timing lists it as needing DSC;
+ * the lowest depth offered (8 bpc if there is one); at that depth one that
+ * needs no DSC over one that does, then sRGB/BT.709 colorimetry and full
+ * range over others, then the higher score. Never PQ or HLG.
  */
 struct dcp_m4_ext_pick {
 	struct dcp_color_element best;
@@ -3061,16 +3706,18 @@ static void dcp_m4_ext_pick_color(void *data, const struct dcp_color_element *e)
 	struct dcp_m4_ext_pick *p = data;
 	unsigned int rank, best_rank;
 
-	if (e->is_virtual || e->restricted || e->id < 0 || e->id > U32_MAX || e->score < 0 ||
+	if (e->is_virtual || e->unsafe || e->id < 0 || e->id > U32_MAX || e->score < 0 ||
 	    e->depth <= 0 || e->encoding != DCP_COLOR_FORMAT_RGB ||
-	    e->eotf != DCP_EOTF_SDR_GAMMA)
+	    e->eotf != DCP_EOTF_SDR_GAMMA || (e->dsc_required && e->depth != 8))
 		return;
 	rank = dcp_m4_ext_color_rank(e);
 	best_rank = p->found ? dcp_m4_ext_color_rank(&p->best) : 0;
 	if (p->found && (e->depth > p->best.depth ||
 			 (e->depth == p->best.depth &&
-			  (rank < best_rank ||
-			   (rank == best_rank && e->score <= p->best.score)))))
+			  (e->dsc_required > p->best.dsc_required ||
+			   (e->dsc_required == p->best.dsc_required &&
+			    (rank < best_rank ||
+			     (rank == best_rank && e->score <= p->best.score)))))))
 		return;
 	p->best = *e;
 	p->found = true;
@@ -3094,7 +3741,8 @@ static bool dcp_m4_ext_timing_color(const void *blob, u32 size, u32 timing,
 /*
  * The timings of the sink's TimingElements @blob with an
  * 8-bpc RGB SDR colour element (see dcp_m4_ext_pick_color()), not
- * interlaced, for its DRM connector. Replaces the previous list and starts
+ * interlaced, for its DRM connector; those whose only such element needs DSC
+ * are marked so. Replaces the previous list and starts
  * the sink's catalog (no PreferredTimingElements yet); not if received in
  * sink generation @gen, before a released route (stale). True if cached.
  */
@@ -3136,6 +3784,11 @@ static bool dcp_m4_ext_cache_modes(struct iomfb_m4 *dcp, const void *blob, u32 s
 		list[kept].bootstrap = m->has_bootstrap ? m->bootstrap_color_id : 0;
 		list[kept].fw_preferred = m->firmware_preferred;
 		list[kept].score = m->score;
+		list[kept].dsc = color.dsc_required;
+		if (color.dsc_required)
+			dev_dbg(dcp->dev, "timing %u %ux%u@%d: DSC colour %u\n",
+				m->timing_mode_id, m->mode.hdisplay, m->mode.vdisplay,
+				drm_mode_vrefresh(&m->mode), (u32)color.id);
 		kept++;
 	}
 	kfree(modes);
@@ -3439,17 +4092,16 @@ static bool dcp_m4_ext_ids_current(struct iomfb_m4 *dcp, const struct iomfb_m4_e
 
 		found = e->timing == ids->timing && e->color == ids->color &&
 			e->bootstrap == ids->bootstrap && e->mode.hdisplay == width &&
-			e->mode.vdisplay == height &&
-			(!capacity || (u64)e->mode.clock * 24 <= capacity);
+			e->mode.vdisplay == height && dcp_m4_ext_fits(e, capacity);
 	}
 	mutex_unlock(&dcp->ext_modes_lock);
 	return found;
 }
 
 /*
- * DRM: before an enable or disable, which must not be refused: a direct swap
- * in flight completes (D590) or is given up (5 s, or at once when the link
- * goes). The session lock is dropped while waiting, so those can run;
+ * DRM: before an enable or disable, which must not be refused: the direct
+ * swaps in flight complete (D590) or are given up (5 s, or at once when the
+ * link goes). The session lock is dropped while waiting, so those can run;
  * nothing here holds a DRM lock they need. -EBUSY if it has not after 10 s.
  */
 static int dcp_m4_ext_settle(struct iomfb_m4 *dcp, struct dcp_m4_runtime *r, const char *what)
@@ -3457,16 +4109,17 @@ static int dcp_m4_ext_settle(struct iomfb_m4 *dcp, struct dcp_m4_runtime *r, con
 	unsigned long end = jiffies + msecs_to_jiffies(10000);
 
 	lockdep_assert_held(&dcp->lock);
-	while (r->ext_async_id) {
+	while (r->ext_qn) {
 		long left = (long)(end - jiffies);
 
 		if (left <= 0) {
-			dev_warn(dcp->dev, "%s: a direct swap still under way after 10 s\n", what);
+			dev_warn(dcp->dev, "%s: %u direct swaps still under way after 10 s\n", what,
+				 r->ext_qn);
 			return -EBUSY;
 		}
-		dev_dbg(dcp->dev, "%s waits for the direct swap in flight\n", what);
+		dev_dbg(dcp->dev, "%s waits for the %u direct swaps in flight\n", what, r->ext_qn);
 		mutex_unlock(&dcp->lock);
-		wait_event_timeout(dcp->ext_settle_wq, !READ_ONCE(r->ext_async_id), left);
+		wait_event_timeout(dcp->ext_settle_wq, !READ_ONCE(r->ext_qn), left);
 		mutex_lock(&dcp->lock);
 	}
 	return 0;
@@ -3507,7 +4160,7 @@ int iomfb_m4_ext_enable(struct apple_dcp *owner, const struct iomfb_m4_ext_ids *
 	/* The link and sink this enable is for, to tell if they changed meanwhile. */
 	link_gen = atomic_read(&r->ext_link_gen);
 	sink_gen = atomic_read(&dcp->ext_sink_gen);
-	/* Never refused: a direct swap in flight ends first. */
+	/* Never refused: the direct swaps in flight end first. */
 	ret = dcp_m4_ext_settle(dcp, r, "enable");
 	if (ret)
 		goto out;
@@ -3588,6 +4241,19 @@ out:
 }
 
 /*
+ * Whether the synchronous swap just completed was displayed, as its D590
+ * says; logged if not, for @what.
+ */
+static bool dcp_m4_ext_sync_shown(struct dcp_m4_runtime *r, const char *what)
+{
+	if (r->ext_swap_shown)
+		return true;
+	dev_dbg(r->dcp->dev, "%s: swap %u completed, not displayed: the frame on screen stays\n",
+		what, r->swap.id);
+	return false;
+}
+
+/*
  * A swap of surface @shown (-1: surfaceless) completed,
  * D590 included: that surface is the one on screen, the other one free;
  * every surface a given-up swap might have put on screen is retired by it
@@ -3607,10 +4273,10 @@ static void dcp_m4_ext_retired(struct dcp_m4_runtime *r, int shown)
 	if (shown >= 0)
 		r->ext_back = shown ^ 1;
 	/* No window is on screen, nor may a given-up swap show one. */
-	for (int i = 0; i < DCP_M4_EXT_WINDOWS; i++) {
+	for (int i = 0; i < DCP_M4_EXT_WINDOWS; i++)
 		r->ext_win[i].on_screen = false;
-		r->ext_win[i].lost_id = 0;
-	}
+	for (unsigned int i = 0; i < ARRAY_SIZE(r->ext_lost_swap); i++)
+		r->ext_lost_swap[i].win = -1;
 }
 
 /* Rows of @rect from @src (@pitch) into @dst (@stride); its pixels. */
@@ -3684,7 +4350,7 @@ int iomfb_m4_ext_present(struct apple_dcp *owner, const struct iosys_map *src, u
 		goto out;
 	ret = -EBUSY;
 	if ((r->ext_hold_id && !r->ext_hold_probe) || r->ext_orphan_start ||
-	    r->ext_async_id || r->ext_sleeping)
+	    r->ext_qn || r->ext_sleeping)
 		goto out;
 	r->ext_hold_probe = false;
 	/*
@@ -3703,6 +4369,10 @@ int iomfb_m4_ext_present(struct apple_dcp *owner, const struct iosys_map *src, u
 		dev_dbg(dcp->dev, "no free copy surface (on screen %d, uncertain swaps %u/%u): surfaceless swap first: %d\n",
 			back ^ 1, r->ext_buf_lost[0], r->ext_buf_lost[1], ret);
 		if (ret)
+			goto out;
+		/* Not displayed: no surface was freed. */
+		ret = -EBUSY;
+		if (!dcp_m4_ext_sync_shown(r, "copy"))
 			goto out;
 		dcp_m4_ext_retired(r, -1);
 		r->ext_buf_stale[0] = true;
@@ -3757,9 +4427,17 @@ int iomfb_m4_ext_present(struct apple_dcp *owner, const struct iosys_map *src, u
 		r->ext_buf_stale[back] = true;
 		goto out;
 	}
-	dcp_m4_ext_retired(r, back);
 	r->ext_buf_stale[back] = false;
 	r->ext_prev_damage = cur;
+	/*
+	 * Not displayed: what was on screen stays, this surface the back one; the
+	 * other one never got this frame's damage, so it takes a whole frame.
+	 */
+	if (!dcp_m4_ext_sync_shown(r, "copy")) {
+		r->ext_buf_stale[back ^ 1] = true;
+		goto out;
+	}
+	dcp_m4_ext_retired(r, back);
 	/* A frame shown, for the replay after a sleep. */
 	if (r->ext_restore_pending)
 		WRITE_ONCE(r->ext_restore_frame, true);
@@ -3811,14 +4489,20 @@ static void iomfb_m4_ext_put_work(struct work_struct *work)
 
 /*
  * Whether window @i may be unmapped: it maps a framebuffer that no swap shows
- * (as last confirmed), may still show (a given-up one) or has in flight, and
- * its unmap never failed.
+ * (as last confirmed), may still show (a given-up one) or has going out or in
+ * flight, and its unmap never failed.
  */
 static bool dcp_m4_ext_win_idle(struct dcp_m4_runtime *r, int i)
 {
 	const struct dcp_m4_ext_window *w = &r->ext_win[i];
 
-	return w->key && !w->on_screen && !w->lost_id && !w->pinned && r->ext_async_win != i;
+	if (!w->key || w->on_screen || w->pinned || r->ext_swap_win == i ||
+	    dcp_m4_ext_win_lost(r, i))
+		return false;
+	for (unsigned int j = 0; j < r->ext_qn; j++)
+		if (r->ext_q[j].win == i)
+			return false;
+	return true;
 }
 
 /*
@@ -3964,66 +4648,135 @@ static int dcp_m4_ext_win_get(struct dcp_m4_runtime *r, const struct iomfb_m4_ex
 	return pick;
 }
 
-/*
- * The direct swap in flight is done, A407 reply and D590 in: its window is the
- * one on screen, every other window and the copy surfaces retired (and those
- * surfaces stale), and its flip is sent. Session lock held.
- */
-static void dcp_m4_ext_async_done(struct dcp_m4_runtime *r)
+/* Take the direct swap at @i out of flight. */
+static void dcp_m4_ext_q_remove(struct dcp_m4_runtime *r, int i)
 {
-	int w = r->ext_async_win;
-
-	if (dcp_m4_swap_take_completion(&r->swap) != 1)
-		dev_warn(r->dcp->dev, "direct swap %u: completion not taken\n",
-			 r->ext_async_id);
-	cancel_delayed_work(&r->ext_async_work);
-	dcp_m4_ext_retired(r, -1);
-	if (w >= 0)
-		r->ext_win[w].on_screen = true;
-	r->ext_buf_stale[0] = true;
-	r->ext_buf_stale[1] = true;
-	r->ext_async_id = 0;
-	r->ext_async_win = -1;
+	r->ext_qn--;
+	memmove(&r->ext_q[i], &r->ext_q[i + 1], (r->ext_qn - i) * sizeof(r->ext_q[0]));
+	if (!r->ext_qn)
+		cancel_delayed_work(&r->ext_async_work);
 	wake_up_all(&r->dcp->ext_settle_wq);
-	/* A frame shown, for the replay after a sleep. */
-	if (r->ext_restore_pending)
-		WRITE_ONCE(r->ext_restore_frame, true);
-	t8132_ext_drm_flip_done(r->dcp->dev);
 }
 
 /*
- * Give the direct swap in flight up, as a waiting swap would be (its window may
- * still show), its link gone (@went) or its time out; its flip goes as lost.
- * Session lock held.
+ * The direct swap @e out of flight (completed or given up): its flip if it
+ * waited for that, and the oldest one's if that waited for an older one.
+ */
+static void dcp_m4_ext_flip_after(struct dcp_m4_runtime *r, const struct dcp_m4_ext_inflight *e)
+{
+	bool send = e->flip_held;
+
+	if (r->ext_qn && r->ext_q[0].flip_held) {
+		r->ext_q[0].flip_held = false;
+		send = true;
+	}
+	if (send)
+		t8132_ext_drm_flip_done(r->dcp->dev);
+}
+
+/*
+ * What the D590 of direct swap @id (or a later one naming it) means for the
+ * screen, taken account of as it comes: @win its window (-1: none), @older how
+ * many direct swaps in flight are older. SHOWN: its window is the one on
+ * screen, every other window and the copy surfaces retired; the older ones
+ * complete as KEPT then. KEPT: its window counts as on screen too, nothing
+ * else is retired. UNSHOWN: what was on screen stays, and its window is free.
+ * The copy surfaces go stale and a hold ends either way. Session lock held.
+ */
+static void dcp_m4_ext_shown(struct dcp_m4_runtime *r, u32 id, int win, int older,
+			     enum dcp_m4_ext_end end)
+{
+	if (end == DCP_M4_EXT_END_SHOWN) {
+		dcp_m4_ext_retired(r, -1);
+		for (int j = 0; j < older; j++)
+			r->ext_q[j].superseded = true;
+	} else {
+		if (end == DCP_M4_EXT_END_UNSHOWN)
+			dev_dbg(r->dcp->dev, "swap %u completed, not displayed: the frame on screen stays\n",
+				id);
+		if (r->ext_hold_id)
+			dev_info(r->dcp->dev, "a swap completed: the hold for swap %u ends\n",
+				 r->ext_hold_id);
+		r->ext_hold_id = 0;
+		r->ext_hold_probe = false;
+	}
+	if (end != DCP_M4_EXT_END_UNSHOWN) {
+		if (win >= 0)
+			r->ext_win[win].on_screen = true;
+		/* A frame shown, for the replay after a sleep. */
+		if (r->ext_restore_pending)
+			WRITE_ONCE(r->ext_restore_frame, true);
+	}
+	r->ext_buf_stale[0] = true;
+	r->ext_buf_stale[1] = true;
+}
+
+/*
+ * The direct swap in flight at @i is done, A407 reply and D590 in, and leaves
+ * flight; older ones not completed stay. @end as dcp_m4_ext_shown(), SHOWN
+ * as KEPT for one superseded; TAKEN: its D590 came before its A407 reply and
+ * was taken account of then. Its flip, or the next one's. Session lock held.
+ */
+static void dcp_m4_ext_async_done(struct dcp_m4_runtime *r, int i, enum dcp_m4_ext_end end)
+{
+	struct dcp_m4_ext_inflight e = r->ext_q[i];
+
+	if (end == DCP_M4_EXT_END_SHOWN && e.superseded)
+		end = DCP_M4_EXT_END_KEPT;
+	e.swap.completed = true;
+	if (dcp_m4_swap_take_completion(&e.swap) != 1)
+		dev_warn_ratelimited(r->dcp->dev, "direct swap %u: completion not taken\n",
+				     e.swap.id);
+	if (i)
+		dev_warn_ratelimited(r->dcp->dev, "swap %u completed before the older swap %u, which stays in flight\n",
+				     e.swap.id, r->ext_q[0].swap.id);
+	dcp_m4_ext_q_remove(r, i);
+	if (end != DCP_M4_EXT_END_TAKEN)
+		dcp_m4_ext_shown(r, e.swap.id, e.win, i, end);
+	dcp_m4_ext_flip_after(r, &e);
+}
+
+/* Whether the oldest direct swap in flight is due its give-up, and its link went (@went). */
+static bool dcp_m4_ext_async_due(struct dcp_m4_runtime *r, bool *went)
+{
+	const struct dcp_m4_ext_inflight *e = &r->ext_q[0];
+
+	*went = !r->ext_connected || atomic_read(&r->ext_link_gen) != e->gen;
+	return *went || !time_before(jiffies, e->deadline);
+}
+
+/*
+ * Give the oldest direct swap in flight up, as a waiting swap would be (its
+ * window may still show), its link gone (@went) or its time out; its flip goes
+ * as lost (or the next one's, dcp_m4_ext_flip_after()). Session lock held.
  */
 static void dcp_m4_ext_async_expire(struct dcp_m4_runtime *r, bool went)
 {
 	struct iomfb_m4 *dcp = r->dcp;
-	u32 id = r->ext_async_id;
-	int w = r->ext_async_win;
+	struct dcp_m4_ext_inflight e = r->ext_q[0];
 	int ret = went ? -ENOLINK : -ETIMEDOUT;
 
 	r->ext_swap_surface = -1;
-	if (!READ_ONCE(dcp->error) && dcp_m4_ext_swap_give_up(r, ret)) {
-		if (w >= 0)
-			r->ext_win[w].lost_id = id;
-	} else if (!READ_ONCE(dcp->error)) {
+	/* The copy surfaces never got this frame: whole frames, whatever its late D590 says. */
+	r->ext_buf_stale[0] = true;
+	r->ext_buf_stale[1] = true;
+	if (!READ_ONCE(dcp->error) &&
+	    !dcp_m4_ext_swap_give_up(r, &e.swap, e.win, e.superseded, ret)) {
 		dcp_m4_swap_fail(&r->swap, ret);
 		dcp_m4_transaction_fail(&dcp->transaction, ret);
 		dcp_m4_failed(dcp, ret);
 	}
-	r->ext_async_id = 0;
-	r->ext_async_win = -1;
-	wake_up_all(&dcp->ext_settle_wq);
-	t8132_ext_drm_flip_done(dcp->dev);
+	dcp_m4_ext_q_remove(r, 0);
+	dcp_m4_ext_flip_after(r, &e);
 }
 
 /*
- * The direct swap in flight at its deadline, or after its link went (D575(0),
- * a released route): words already received are taken first (its D590 among
- * them maybe); then it is given up as a waiting swap would be
- * (dcp_m4_ext_swap_give_up(): its window may still show, and is kept), and
- * its flip is sent as lost.
+ * The oldest direct swap in flight at its deadline, or after its link went
+ * (D575(0), a released route): words already received are taken first (its
+ * D590 among them maybe); then each one due is given up as a waiting swap
+ * would be (dcp_m4_ext_swap_give_up(): its window may still show, and is
+ * kept), and its flip is sent as lost. The work comes back at the next one's
+ * deadline.
  */
 static void dcp_m4_ext_async_work(struct work_struct *work)
 {
@@ -4034,21 +4787,20 @@ static void dcp_m4_ext_async_work(struct work_struct *work)
 	int ret;
 
 	mutex_lock(&dcp->lock);
-	if (!r->ext_async_id)
-		goto out;
-	went = !r->ext_connected || atomic_read(&r->ext_link_gen) != r->ext_async_gen;
-	if (!went && time_before(jiffies, r->ext_async_deadline)) {
-		queue_delayed_work(r->wq, &r->ext_async_work, r->ext_async_deadline - jiffies);
-		goto out;
+	if (r->ext_qn && dcp_m4_ext_async_due(r, &went)) {
+		ret = READ_ONCE(dcp->error) ?: dcp_m4_runtime_drain(r, 32);
+		if (ret < 0) {
+			dcp_m4_transaction_fail(&dcp->transaction, ret);
+			dcp_m4_failed(dcp, ret);
+		}
+		while (r->ext_qn && dcp_m4_ext_async_due(r, &went))
+			dcp_m4_ext_async_expire(r, went);
 	}
-	ret = READ_ONCE(dcp->error) ?: dcp_m4_runtime_drain(r, 32);
-	if (ret < 0) {
-		dcp_m4_transaction_fail(&dcp->transaction, ret);
-		dcp_m4_failed(dcp, ret);
+	if (r->ext_qn) {
+		long left = (long)(r->ext_q[0].deadline - jiffies);
+
+		queue_delayed_work(r->wq, &r->ext_async_work, max(left, 0L));
 	}
-	if (r->ext_async_id)
-		dcp_m4_ext_async_expire(r, went);
-out:
 	mutex_unlock(&dcp->lock);
 }
 
@@ -4056,10 +4808,13 @@ out:
  * One DRM frame scanned out directly
  * from its framebuffer, mapped into a SID0 host window (kept per
  * framebuffer, see dcp_m4_ext_win_get()), with a one-surface swap that
- * returns after its A407 reply; the flip is sent with its D590, or as lost
- * when it is given up. One swap in flight: -EBUSY while one is, checked
- * before any A406. -ENOSPC without a window, -EOPNOTSUPP for a framebuffer
- * that does not fit the mode or the window: the caller copies it instead.
+ * returns after its A407 reply. Up to t8132_ext_swap_depth swaps in flight:
+ * -EBUSY while that many are, checked before any A406. 1 once submitted with
+ * none older in flight and a depth over 1: its flip now; 0 once submitted
+ * otherwise: its flip is sent with the older one's completion, or its own
+ * (D590), or as lost when that is given up. -ENOSPC without a window,
+ * -EOPNOTSUPP for a framebuffer that does not fit the mode or the window: the
+ * caller copies it instead.
  */
 int iomfb_m4_ext_present_direct(struct apple_dcp *owner, const struct iomfb_m4_ext_fb *fb)
 {
@@ -4067,6 +4822,7 @@ int iomfb_m4_ext_present_direct(struct apple_dcp *owner, const struct iomfb_m4_e
 	struct dcp_m4_runtime *r;
 	struct dcp_m4_frame f;
 	int ret = -ENOLINK, w;
+	unsigned int depth, free;
 	size_t need;
 
 	if (!dcp || !dcp->external)
@@ -4082,9 +4838,23 @@ int iomfb_m4_ext_present_direct(struct apple_dcp *owner, const struct iomfb_m4_e
 	if (r->ext_mode_stale)
 		goto out;
 	ret = -EBUSY;
+	depth = clamp_val(READ_ONCE(t8132_ext_swap_depth), 1, DCP_M4_EXT_INFLIGHT);
 	if ((r->ext_hold_id && !r->ext_hold_probe) || r->ext_orphan_start ||
-	    r->ext_async_id || r->ext_sleeping)
+	    r->ext_qn >= depth || r->ext_sleeping)
 		goto out;
+	/*
+	 * A slot for each swap in flight, this one included, that a later D590
+	 * may complete (dcp_m4_runtime_swap_done()); else frames are copied.
+	 */
+	ret = -ENOSPC;
+	free = 0;
+	for (unsigned int i = 0; i < ARRAY_SIZE(r->ext_early); i++)
+		free += !r->ext_early[i];
+	if (free <= r->ext_qn) {
+		dev_warn_ratelimited(dcp->dev, "%u swaps completed by a later D590 still without their own: frames copied\n",
+				     (unsigned int)ARRAY_SIZE(r->ext_early) - free);
+		goto out;
+	}
 	ret = -EOPNOTSUPP;
 	need = PAGE_ALIGN((size_t)fb->pitch * fb->height);
 	if (fb->width != r->ext_width || fb->height != r->ext_height ||
@@ -4119,12 +4889,14 @@ int iomfb_m4_ext_present_direct(struct apple_dcp *owner, const struct iomfb_m4_e
 	};
 	r->ext_hold_probe = false;
 	r->ext_swap_surface = -1;
-	r->ext_async_win = w;
-	r->ext_swap_async = true;
+	r->ext_swap_win = w;
+	r->ext_swap_async = depth;
+	r->ext_swap_now = false;
 	ret = dcp_m4_runtime_swap_full(r, true, &f, NULL, 0, false, 0, 0, 0);
-	r->ext_swap_async = false;
-	if (ret && !r->ext_async_id)
-		r->ext_async_win = -1;
+	r->ext_swap_async = 0;
+	r->ext_swap_win = -1;
+	if (!ret && r->ext_swap_now)
+		ret = 1;
 out:
 	mutex_unlock(&dcp->lock);
 	return ret;
@@ -4150,7 +4922,7 @@ int iomfb_m4_ext_blank(struct apple_dcp *owner)
 		mutex_unlock(&dcp->lock);
 		return 0;
 	}
-	/* Never refused: a direct swap in flight ends first. */
+	/* Never refused: the direct swaps in flight end first. */
 	/* Pairs with the release store of r->done in startup. */
 	if (r && smp_load_acquire(&r->done)) {
 		int link_gen = atomic_read(&r->ext_link_gen);
@@ -4179,7 +4951,8 @@ int iomfb_m4_ext_blank(struct apple_dcp *owner)
 			dcp_m4_runtime_swap_full(r, true, NULL, NULL, 0, false, 0, 0, 0);
 		if (ret == -EBUSY)
 			dev_info(dcp->dev, "disable: swaps held or a start orphaned: the last frame stays\n");
-		if (!ret) {
+		/* Only a displayed blank takes the windows off screen. */
+		if (!ret && dcp_m4_ext_sync_shown(r, "disable")) {
 			dcp_m4_ext_retired(r, -1);
 			/* The windows are off screen: let them go. */
 			if (dcp_m4_ext_win_release_idle(r, 0))
@@ -4223,12 +4996,12 @@ bool iomfb_m4_ext_sleep_mark(struct apple_dcp *owner)
 
 /*
  * PM_SUSPEND_PREPARE, before the tasks freeze, every worker running, after
- * iomfb_m4_ext_sleep_mark(): the display down for the sleep: the swap in flight
- * settles (its D590, or its give-up); a surfaceless swap; every window let go
- * of; the display powered off (A473 0) and its firmware's D572(0) waited for
- * (1 s), so that the DCP's suspend finds the display DART off, else it refuses
- * the sleep. The DRM state replayed after the sleep powers on and sets the
- * mode from scratch.
+ * iomfb_m4_ext_sleep_mark(): the display down for the sleep: the swaps in
+ * flight settle (their D590, or their give-up); a surfaceless swap; every
+ * window let go of; the display powered off (A473 0) and its firmware's
+ * D572(0) waited for (1 s), so that the DCP's suspend finds the display DART
+ * off, else it refuses the sleep. The DRM state replayed after the sleep
+ * powers on and sets the mode from scratch.
  */
 void iomfb_m4_ext_sleep_down(struct apple_dcp *owner)
 {
@@ -4246,9 +5019,10 @@ void iomfb_m4_ext_sleep_down(struct apple_dcp *owner)
 		mutex_unlock(&dcp->lock);
 		return;
 	}
-	dev_dbg(dcp->dev, "sleep: display going down (display DART %s, swap in flight %u)\n",
-		READ_ONCE(dcp->ext_dart_down) ? "off" : "on", r->ext_async_id);
-	/* The workers run: the swap in flight completes or is given up as ever. */
+	dev_dbg(dcp->dev, "sleep: display going down (display DART %s, %u swaps in flight, oldest %u)\n",
+		READ_ONCE(dcp->ext_dart_down) ? "off" : "on", r->ext_qn,
+		r->ext_qn ? r->ext_q[0].swap.id : 0);
+	/* The workers run: the swaps in flight complete or are given up as ever. */
 	ret = dcp_m4_ext_settle(dcp, r, "sleep");
 	if (!ret && dcp_m4_ext_route_ready(dcp, r) && READ_ONCE(r->ext_cur_timing)) {
 		r->ext_swap_surface = -1;
@@ -4256,7 +5030,8 @@ void iomfb_m4_ext_sleep_down(struct apple_dcp *owner)
 			dcp_m4_runtime_swap_full(r, true, NULL, NULL, 0, false, 0, 0, 0);
 		if (ret)
 			dev_warn(dcp->dev, "sleep: surfaceless swap failed: %d\n", ret);
-		if (!ret) {
+		/* Only a displayed blank takes the windows off screen. */
+		if (!ret && dcp_m4_ext_sync_shown(r, "sleep")) {
 			dcp_m4_ext_retired(r, -1);
 			for (int i = 0; i < DCP_M4_EXT_WINDOWS; i++)
 				mapped += !!r->ext_win[i].key;
@@ -4462,7 +5237,7 @@ int iomfb_m4_suspend(struct apple_dcp *owner)
 		mutex_lock(&dcp->lock);
 		if (!READ_ONCE(dcp->ext_dart_down))
 			why = "the display DART is on (last D572 was 1)";
-		else if (dcp->runtime->ext_async_id)
+		else if (dcp->runtime->ext_qn)
 			why = "a swap is under way";
 		mutex_unlock(&dcp->lock);
 		if (why) {
@@ -4487,14 +5262,23 @@ int iomfb_m4_suspend(struct apple_dcp *owner)
 	}
 	if (!dcp || !dcp->runtime)
 		return -ENODEV;
+	cancel_delayed_work_sync(&dcp->gate_work);
 	mutex_lock(&dcp->lock);
 	/* Also the startup surface, shown before the first frame */
 	if (dcp->active_fb || dcp->active_frame.dva) {
 		dev_warn(dcp->dev, "panel still scanning out: refusing system sleep\n");
 		ret = -EBUSY;
 	} else if (dcp->display_off) {
-		/* Already powered down by the blank; the next frame powers it up. */
+		/*
+		 * Already powered down by the blank; the next frame powers it up.
+		 * Power the DCP and its domains down too, if it may. That is an
+		 * extra saving, not a condition of sleep: a power-down that cannot
+		 * start leaves the display logically off, and one that fails has
+		 * failed the session already; neither refuses the sleep.
+		 */
 		ret = 0;
+		if (dcp->gate_capable && READ_ONCE(power_gate_ms) && !dcp->gated)
+			iomfb_m4_power_gate(dcp);
 	} else {
 		ret = dcp_m4_set_power_state(dcp, false);
 		if (!ret)
@@ -4522,7 +5306,10 @@ int iomfb_m4_resume(struct apple_dcp *owner)
 	if (!dcp || !dcp->runtime)
 		return -ENODEV;
 	mutex_lock(&dcp->lock);
-	if (dcp->powered_off) {
+	if (dcp->gated) {
+		/* Stays down until the next frame. */
+		ret = 0;
+	} else if (dcp->powered_off) {
 		ret = dcp_m4_set_power_state(dcp, true);
 		if (!ret)
 			dcp->powered_off = false;
@@ -4590,6 +5377,7 @@ void iomfb_m4_quiesce(struct apple_dcp *owner)
 		flush_workqueue(dcp->runtime->wq);
 	/* After the flush, as drained callbacks can queue it. */
 	cancel_delayed_work_sync(&dcp->idle_cache);
+	cancel_delayed_work_sync(&dcp->gate_work);
 }
 
 static int iomfb_m4_status_show(struct seq_file *s, void *unused)
@@ -4608,7 +5396,11 @@ static int iomfb_m4_status_show(struct seq_file *s, void *unused)
 		dcp_m4_failed(dcp, health);
 	seq_printf(s, "firmware=26.6.2 ready=%u qualified=%u error=%d run=%u health=%d\n",
 		   dcp->ready, r && r->qualified, dcp->error,
-		   !!(readl(dcp->coproc + 0x44) & BIT(4)), health);
+		   !dcp->gated && !!(readl(dcp->coproc + DCP_M4_CPU_CONTROL) & DCP_M4_CPU_RUN),
+		   health);
+	seq_printf(s, "gate_capable=%u gated=%u gate_cycles=%llu gate_off_us=%lld gate_on_us=%lld\n",
+		   dcp->gate_capable, dcp->gated, dcp->gate_cycles, dcp->gate_off_us,
+		   dcp->gate_on_us);
 	seq_printf(s, "startup=%u background=%u power=%u scanout=%u callbacks=%u\n",
 		   r && r->done, r && r->background_done, r && r->power_done,
 		   r && r->scanout_done, r ? r->callbacks : 0);

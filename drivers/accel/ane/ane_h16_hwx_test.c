@@ -216,6 +216,126 @@ static void hwx_program_test(struct kunit *test)
 	}
 }
 
+/* Build only structural tasks: no model bytes or hardware fixtures needed. */
+static void fixture_tasks(struct hwx_fixture *f, u32 tasks, u32 records)
+{
+	u8 *text = f->bytes + SZ_16K, *program = f->bytes + f->program;
+	u8 *section = f->bytes + f->text_command + 72;
+	u64 vm = get_unaligned_le64(section + 32);
+	u32 pos = 16, task, constants;
+
+	memset(text, 0, SZ_16K);
+	put_unaligned_le32(1, text);
+	for (task = 0; task < tasks; task++) {
+		u32 count = records / tasks + (task < records % tasks);
+
+		put_unaligned_le32((9 + 2 * count) << 16, text + pos);
+		/* Coalesce writes: the hint exceeds the encoded record count. */
+		put_unaligned_le32(((2 * count - 2) << 15) | (0x4100 / 4),
+				   text + pos + 36);
+		pos += (9 + 2 * count) * 4;
+		if (task + 1 < tasks)
+			pos = ALIGN(pos, 16);
+	}
+	constants = ALIGN(pos, 64);
+	put_unaligned_le64(pos, section + 40);
+	put_unaligned_le64(vm + constants, section + 80 + 32);
+	put_unaligned_le32(SZ_16K + constants, section + 80 + 48);
+	put_unaligned_le64(vm + constants, program + 0x20);
+	put_unaligned_le32(pos / 4, program + 0x824);
+	put_unaligned_le32(tasks, program + 0x830);
+	put_unaligned_le32(records, program + 0x860);
+}
+
+static void hwx_staged_counts_test(struct kunit *test)
+{
+	static const struct {
+		u32 tasks, records, work;
+	} shapes[] = {
+		{ 7, 0x58, 1 }, /* Row softmax. */
+		{ 4, 0x2e, 0 }, /* Tiled matmul 768. */
+		{ 5, 0x3c, 0 }, /* Tiled matmul 896. */
+		{ 7, 0x58, 0 }, /* Tiled matmul 1536. */
+		{ 25, 0x154, 0 }, /* Tiled matmul 3072. */
+		{ 10, 0x75, 1 }, /* Decoded attention. */
+		{ 1, 0x10, 61 }, { 1, 0x10, 92 }, /* LUT/ALU 1024. */
+		{ 1, 0x10, 245 }, { 1, 0x10, 368 }, /* LUT/ALU 2048. */
+	};
+	struct ane_h16_hwx info;
+	unsigned int form, i;
+
+	for (form = 0; form < 2; form++) {
+		for (i = 0; i < ARRAY_SIZE(shapes); i++) {
+			struct hwx_fixture *f = fixture_create(test, form, false);
+			u32 work_offset = form ? 0x8b0 : 0x890;
+			u8 *program;
+
+			KUNIT_ASSERT_NOT_NULL(test, f);
+			fixture_tasks(f, shapes[i].tasks, shapes[i].records);
+			program = f->bytes + f->program;
+			put_unaligned_le32(shapes[i].work, program + work_offset);
+			KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+			KUNIT_EXPECT_EQ(test, info.tasks, shapes[i].tasks);
+			/* Neither count nor work may exceed its program-derived bound. */
+			put_unaligned_le32(shapes[i].records + 1, program + 0x860);
+			KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info),
+					-ENOEXEC);
+			put_unaligned_le32(0, program + 0x860);
+			KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info),
+					-ENOEXEC);
+			put_unaligned_le32(shapes[i].records, program + 0x860);
+			put_unaligned_le32(SZ_32K, program + work_offset);
+			KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+			put_unaligned_le32(SZ_32K + 1, program + work_offset);
+			KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info),
+					-ENOEXEC);
+			put_unaligned_le32(U32_MAX, program + work_offset);
+			KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info),
+					-ENOEXEC);
+			put_unaligned_le32(shapes[i].work, program + work_offset);
+			/* A plausible hint never overrides a corrupt task stream. */
+			put_unaligned_le32(0x6000 / 4, f->bytes + SZ_16K + 52);
+			KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info),
+					-ENOEXEC);
+		}
+	}
+}
+
+/*
+ * Trailing zero bytes after the last H16 task leave the engine armed, and the
+ * next EXECUTE times out. The final task must end the section exactly.
+ */
+static void hwx_final_task_end_test(struct kunit *test)
+{
+	static const u32 tails[] = { 4, 8, 12, 12 + 16 };
+	struct ane_h16_hwx info;
+	unsigned int form, i;
+
+	for (form = 0; form < 2; form++) {
+		struct hwx_fixture *f = fixture_create(test, form, false);
+		u8 *section, *program;
+		u64 end;
+
+		KUNIT_ASSERT_NOT_NULL(test, f);
+		/* One task with two records ends at 68; __const starts at 128. */
+		fixture_tasks(f, 1, 2);
+		section = f->bytes + f->text_command + 72;
+		program = f->bytes + f->program;
+		end = get_unaligned_le64(section + 40);
+		KUNIT_ASSERT_EQ(test, end, 68ULL);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+		for (i = 0; i < ARRAY_SIZE(tails); i++) {
+			put_unaligned_le64(end + tails[i], section + 40);
+			put_unaligned_le32((end + tails[i]) / 4, program + 0x824);
+			KUNIT_EXPECT_EQ_MSG(test, ane_h16_hwx_validate(f->bytes, f->size, &info),
+					    -ENOEXEC, "form %u tail %u", form, tails[i]);
+		}
+		put_unaligned_le64(end, section + 40);
+		put_unaligned_le32(end / 4, program + 0x824);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	}
+}
+
 static void hwx_geometry_test(struct kunit *test)
 {
 	struct hwx_fixture *f = fixture_create(test, false, false);
@@ -483,6 +603,8 @@ static struct kunit_case hwx_cases[] = {
 	KUNIT_CASE(hwx_tensor_test),
 	KUNIT_CASE(hwx_surface_order_test),
 	KUNIT_CASE(hwx_program_test),
+	KUNIT_CASE(hwx_staged_counts_test),
+	KUNIT_CASE(hwx_final_task_end_test),
 	KUNIT_CASE(hwx_geometry_test),
 	KUNIT_CASE(hwx_symbols_test),
 	KUNIT_CASE(hwx_relocations_test),

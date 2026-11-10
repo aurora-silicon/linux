@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Additional T8112 hardware resources. Keep unqualified blocks disabled. */
+
+&aop_spmi0 {
+	interrupt-parent = <&aic>;
+	interrupts = <AIC_IRQ 353 IRQ_TYPE_LEVEL_HIGH>;
+	#address-cells = <2>;
+	#size-cells = <0>;
+	interrupt-controller;
+	#interrupt-cells = <2>;
+	status = "disabled";
+
+	peripheral@e {
+		compatible = "apple,t8112-spmi-peripheral",
+			"apple,spmi-peripheral";
+		reg = <0xe SPMI_USID>;
+		status = "disabled";
+	};
+};
+
+&aop_spmi1 {
+	interrupt-parent = <&aic>;
+	interrupts = <AIC_IRQ 357 IRQ_TYPE_LEVEL_HIGH>;
+	#address-cells = <2>;
+	#size-cells = <0>;
+	interrupt-controller;
+	#interrupt-cells = <2>;
+	status = "disabled";
+
+	nfc@8 {
+		compatible = "apple,t8112-spmi-nfc",
+			"apple,spmi-nfc";
+		reg = <0x8 SPMI_USID>;
+		interrupt-parent = <&aop_spmi1>;
+		interrupts = <176 IRQ_TYPE_LEVEL_HIGH>,
+			<177 IRQ_TYPE_LEVEL_HIGH>,
+			<178 IRQ_TYPE_LEVEL_HIGH>,
+			<179 IRQ_TYPE_LEVEL_HIGH>,
+			<180 IRQ_TYPE_LEVEL_HIGH>,
+			<181 IRQ_TYPE_LEVEL_HIGH>,
+			<182 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+};
+
+&nub_spmi1 {
+	pmic@e {
+		compatible = "apple,vale-pmic", "apple,spmi-nvmem";
+		reg = <0xe SPMI_USID>;
+		read-only;
+		status = "disabled";
+	};
+};

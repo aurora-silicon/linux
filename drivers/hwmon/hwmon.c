@@ -171,6 +171,15 @@ static int hwmon_thermal_get_temp(struct thermal_zone_device *tz, int *temp)
 
 	ret = hwdev->chip->ops->read(tdata->dev, hwmon_temp, hwmon_temp_input,
 				     tdata->index, &t);
+	/*
+	 * -ENODATA: the sensor has no reading right now (for example it is
+	 * powered down). Let the zone skip this update and keep polling,
+	 * instead of backing off and eventually disabling it as broken.
+	 */
+	if (ret == -ENODATA) {
+		*temp = THERMAL_TEMP_INVALID;
+		return 0;
+	}
 	if (ret < 0)
 		return ret;
 

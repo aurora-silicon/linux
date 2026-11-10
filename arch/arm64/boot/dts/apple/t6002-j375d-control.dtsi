@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Populated board control clients. Transport ownership is not transferred. */
+
+&i2c4 {
+	sd_card_control: sd-card-control@20 {
+		compatible = "apple,t6000-sd-card-control", "apple,sd-card-control";
+		reg = <0x20>;
+		status = "disabled";
+	};
+};
+
+&i2c5 {
+	ethernet_sideband: ethernet-sideband@32 {
+		compatible = "apple,t6000-aqc107-i2c", "apple,aqc107-i2c";
+		reg = <0x32>;
+		status = "disabled";
+	};
+};

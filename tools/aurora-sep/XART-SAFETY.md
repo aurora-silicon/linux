@@ -26,13 +26,17 @@ The default, `xart_guard=-1`, takes the platform's level:
 
 | Platform | Default |
 | --- | --- |
-| M1 (T8103), M1 Pro/Max (T6000/T6001) | 1 |
+| M1 (T8103), M1 Pro/Max (T6000/T6001) | 0 |
 | M2 (T8112), M2 Pro/Max (T6020/T6021) | 1 |
 | M3 (T8122) | 1 |
 | MacBook Neo (T8140) | 0 |
 
-The Neo stays at 0 because it already holds Linux records from before the
-list existed, and a guarded boot would treat those as another OS's.
+M1 Macs are at 0 because they cold-boot the SEP, and creating Linux's
+identity keybag there rewrites a session record that predates Linux (see
+"Cold-boot SEP Macs rewrite a pre-Linux record"). A guard could only block
+Touch ID setup on them. The Neo stays at 0 because it already holds Linux
+records from before the list existed, and a guarded boot would treat those
+as another OS's.
 
 What the guard allows depends on what the enclave writes, and that differs
 between restoring Touch ID at boot, using it, and setting it up. The driver
@@ -76,7 +80,7 @@ another finger into an existing keybag does not create one.
 
 | Platform | Bootstrap | Keybag creation under level 1 |
 | --- | --- | --- |
-| M1 (T8103), M1 Pro/Max (T6000/T6001) | cold boot | Rewrites one pre-Linux session record (T6000). The keybag creation window lets it through if it is kind-4, which is unconfirmed there. |
+| M1 (T8103), M1 Pro/Max (T6000/T6001) | cold boot | Guard off by default. Rewrites one pre-Linux session record (T6000). |
 | M2 (T8112) | warm attach | No xART writes (J413), so the guard does not affect it. |
 | M2 Pro/Max (T6020/T6021) | warm attach | Rewrites one existing kind-4 record (J414s, 2026-11-02); the keybag creation window lets it through. |
 | M3 (T8122) | warm attach | Untested. |
@@ -263,18 +267,17 @@ it:
 - A btrfs/snapper rollback, or restoring a backup, brings back an older list.
   Records the enclave created after that snapshot are no longer listed, so
   the guard treats them as another OS's and refuses to rewrite them. Nothing
-  is overwritten, but Touch ID may fail until the newer list is put back.
-  Keep the newest copy, or leave `/var/lib/aurora-sep-xart-owned.bin` out of
-  rollback snapshots.
+  is overwritten and those records stay protected. If Touch ID fails
+  afterwards, set it up again with `aurora-xart reset-touchid` (or
+  `install-aurora-sep.sh --reset-touchid`).
 - A reinstall, or deleting the file, empties the list. Every Linux record
-  then looks like another OS's. Copy the file back from the old install if
-  you have it. Without it, those records stay protected; resetting Touch ID
-  (`install-aurora-sep.sh --reset-touchid`) creates a new keybag.
+  then looks like another OS's, and those records stay protected. Set Touch
+  ID up again with `aurora-xart reset-touchid` (or
+  `install-aurora-sep.sh --reset-touchid`), which creates a new keybag.
 - A torn last entry, from a crash while appending, is ignored at the next
   probe and overwritten by the next new record.
 
-The file holds only record kinds and session ids, no key material, and it
-can be backed up and copied like any other file.
+The file holds only record kinds and session ids, no key material.
 
 ## Cold-boot SEP Macs rewrite a pre-Linux record (2026-10-16)
 

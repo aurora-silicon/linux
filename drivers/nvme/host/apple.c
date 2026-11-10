@@ -14,6 +14,7 @@
 #include <linux/blk-crypto-profile.h>
 #include <linux/blkdev.h>
 #include <linux/blk-mq.h>
+#include <linux/crash_dump.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
@@ -45,6 +46,8 @@
 #include "nvme.h"
 
 #define APPLE_ANS_BOOT_TIMEOUT	  USEC_PER_SEC
+/* RTKit handshake timeout for the T6050 ANS, see apple_nvme_alloc() */
+#define APPLE_NVME_T6050_HANDSHAKE_TIMEOUT_MS 10000
 
 #define APPLE_ANS_COPROC_CPU_CONTROL	 0x44
 #define APPLE_ANS_COPROC_CPU_CONTROL_RUN BIT(4)
@@ -208,6 +211,8 @@ struct apple_nvme_hw {
 	bool needs_ioq_registers;
 	/* T8132 needs a PMGR reset when starting a stopped coprocessor. */
 	bool cold_reset;
+	/* The ANS is never reset through PMGR here, so no reset is named. */
+	bool reset_optional;
 	u32 max_queue_depth;
 	unsigned long quirks;
 };
@@ -223,6 +228,8 @@ struct apple_nvme {
 	bool handoff_disabled;
 	struct list_head quarantine_node;
 	resource_size_t controller_start;
+	/* The linear SQ doorbells are in the NVMMU block. */
+	bool lsq_in_nvmmu;
 	bool quarantined;
 	bool detached;
 	bool removing;
@@ -1608,6 +1615,38 @@ static void apple_nvme_wait_freeze(struct apple_nvme *anv)
 	}
 }
 
+/*
+ * Stop the pre-M4 ANS session a crashed kernel left running, so that the
+ * reset path restarts the coprocessor from scratch. Each step is best effort:
+ * if the old session does not answer, the PMGR reset still stops it.
+ */
+static void apple_nvme_stop_crashed_session(struct apple_nvme *anv)
+{
+	int ret;
+
+	anv->ctrl.cap = readq(anv->mmio_nvme + NVME_REG_CAP);
+	anv->ctrl.ctrl_config = readl(anv->mmio_nvme + NVME_REG_CC);
+	dev_info(anv->dev,
+		 "crash kernel: ANS still running (CC=%#x CSTS=%#x), restarting it\n",
+		 anv->ctrl.ctrl_config, readl(anv->mmio_nvme + NVME_REG_CSTS));
+
+	ret = apple_rtkit_adopt_running(anv->rtk);
+	if (!ret && (anv->ctrl.ctrl_config & NVME_CC_ENABLE))
+		ret = nvme_disable_ctrl(&anv->ctrl, false);
+	if (!ret)
+		ret = apple_rtkit_shutdown(anv->rtk);
+	if (ret) {
+		dev_warn(anv->dev,
+			 "crash kernel: old ANS session did not stop (%d), resetting it\n",
+			 ret);
+		/* Forget the old session; the reset below discards it. */
+		apple_rtkit_reinit(anv->rtk);
+	}
+
+	writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
+	anv->ctrl.ctrl_config = 0;
+}
+
 static void apple_nvme_reset_work(struct work_struct *work)
 {
 	unsigned int nr_io_queues = 1;
@@ -1617,6 +1656,7 @@ static void apple_nvme_reset_work(struct work_struct *work)
 	struct apple_nvme *anv =
 		container_of(work, struct apple_nvme, ctrl.reset_work);
 	enum nvme_ctrl_state state = nvme_ctrl_state(&anv->ctrl);
+	bool inherited = !anv->owns_rtkit;
 
 	if (anv->hw->needs_ioq_registers) {
 		mutex_lock(&anv->disable_lock);
@@ -1672,6 +1712,17 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		}
 		goto rtkit_ready;
 	}
+
+	/*
+	 * A crashed kernel never stops ANS, so on pre-M4 the crash kernel finds
+	 * the coprocessor still running the old kernel's RTKit session. That
+	 * session does not repeat HELLO and EPMAP, so a wake cannot work. Take
+	 * the session over, stop it and restart ANS through the cold path below.
+	 */
+	if (inherited && !anv->hw->needs_ioq_registers && is_kdump_kernel() &&
+	    (readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
+	     APPLE_ANS_COPROC_CPU_CONTROL_RUN))
+		apple_nvme_stop_crashed_session(anv);
 
 	/*
 	 * RTKit must be shut down cleanly for the (soft)-reset to work, except
@@ -1769,6 +1820,24 @@ rtkit_ready:
 	dev_dbg(anv->dev, "ANS booted successfully.");
 
 	/*
+	 * Pre-M4 ANS keeps running across a kexec, and a crashed kernel hands
+	 * it to the crash kernel with the controller still enabled on its own
+	 * queues. Woken this way, it would ignore the queue registers below,
+	 * which may only change while CC.EN is clear. Disable it first.
+	 */
+	if (inherited && !anv->hw->needs_ioq_registers) {
+		anv->ctrl.cap = readq(anv->mmio_nvme + NVME_REG_CAP);
+		anv->ctrl.ctrl_config = readl(anv->mmio_nvme + NVME_REG_CC);
+		if (anv->ctrl.ctrl_config & NVME_CC_ENABLE) {
+			dev_info(anv->dev,
+				 "controller handed over enabled, disabling it\n");
+			ret = nvme_disable_ctrl(&anv->ctrl, false);
+			if (ret)
+				goto out;
+		}
+	}
+
+	/*
 	 * Limit the max command size to prevent iod->sg allocations going
 	 * over a single page.
 	 */
@@ -1784,7 +1853,7 @@ rtkit_ready:
 		 * since T6000. Where the linear SQ registers live in the NVMMU
 		 * block, the firmware has already enabled them.
 		 */
-		if (!anv->hw->lsq_in_nvmmu) {
+		if (!anv->lsq_in_nvmmu) {
 			writel(APPLE_ANS_LINEAR_SQ_EN,
 			       anv->mmio_nvme + APPLE_ANS_LINEAR_SQ_CTRL);
 			if (anv->hw->needs_ioq_registers) {
@@ -2372,8 +2441,18 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		goto out_detach_genpd;
 	}
 
+	/*
+	 * Newer ANS firmware moves the linear submission queue registers into
+	 * the NVMMU block and ends the "nvme" block before them (T6040, and
+	 * T8142 booting the macOS 27.0 stub: 0x10000, ADT ans reg[9]). A
+	 * window that does not reach the doorbells means that layout.
+	 */
+	anv->lsq_in_nvmmu = anv->hw->lsq_in_nvmmu ||
+		(anv->hw->has_lsq_nvmmu && anv->hw->has_separate_nvmmu &&
+		 resource_size(resource) < APPLE_ANS_LINEAR_IOSQ_DB + sizeof(u32));
+
 	if (anv->hw->has_lsq_nvmmu) {
-		void __iomem *lsq = anv->hw->lsq_in_nvmmu ? anv->mmio_nvmmu : anv->mmio_nvme;
+		void __iomem *lsq = anv->lsq_in_nvmmu ? anv->mmio_nvmmu : anv->mmio_nvme;
 
 		anv->adminq.sq_db = lsq + APPLE_ANS_LINEAR_ASQ_DB;
 		anv->adminq.cq_db = anv->mmio_nvme + APPLE_ANS_ACQ_DB;
@@ -2393,7 +2472,9 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		goto out_detach_genpd;
 	}
 
-	anv->reset = devm_reset_control_array_get_exclusive(anv->dev);
+	anv->reset = anv->hw->reset_optional ?
+		devm_reset_control_array_get_optional_exclusive(anv->dev) :
+		devm_reset_control_array_get_exclusive(anv->dev);
 	if (IS_ERR(anv->reset)) {
 		ret = dev_err_probe(dev, PTR_ERR(anv->reset),
 				    "Failed to get reset control");
@@ -2469,6 +2550,14 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 				    "Failed to initialize RTKit");
 		goto out_detach_genpd;
 	}
+
+	/*
+	 * The T6050 ANS firmware handed over by iBoot can take about 3 s to
+	 * answer the power-state and endpoint-map handshake.
+	 */
+	if (of_device_is_compatible(dev->of_node, "apple,t6050-nvme-ans2"))
+		apple_rtkit_set_handshake_timeout(anv->rtk,
+						  APPLE_NVME_T6050_HANDSHAKE_TIMEOUT_MS);
 
 	ret = devm_add_action_or_reset(dev, apple_nvme_free_rtkit, anv);
 	if (ret)
@@ -2729,6 +2818,18 @@ static const struct apple_nvme_hw apple_nvme_t8140_hw = {
 };
 
 /*
+ * T8142 (M5) is laid out like T8140; the final shutdown sends SHN, as on
+ * every post-M4 controller.
+ */
+static const struct apple_nvme_hw apple_nvme_t8142_hw = {
+	.has_lsq_nvmmu = true,
+	.has_separate_nvmmu = true,
+	.needs_ioq_registers = true,
+	.max_queue_depth = 64,
+	.quirks = NVME_QUIRK_BROKEN_FUA,
+};
+
+/*
  * T6040 (M4 Pro) with the 26.x ANS firmware: the T8132 controller, but the
  * "nvme" register block ends at 0x10000 and the linear submission queue
  * doorbells are in the NVMMU block. APST has never been run on it.
@@ -2742,12 +2843,31 @@ static const struct apple_nvme_hw apple_nvme_t6040_hw = {
 	.quirks = NVME_QUIRK_NO_APST,
 };
 
+/*
+ * T6050 (M5 Ultra) ANS on bare metal: T6040's split layout (a 64 KiB "nvme"
+ * block, a separate NVMMU, linear submission queues), 64 queue entries. Like
+ * every post-M4 ANS without cold_reset it is never reset through PMGR, so no
+ * reset is named.
+ */
+static const struct apple_nvme_hw apple_nvme_t6050_hw = {
+	.has_lsq_nvmmu = true,
+	.has_separate_nvmmu = true,
+	.needs_ioq_registers = true,
+	.lsq_in_nvmmu = true,
+	.reset_optional = true,
+	.max_queue_depth = 64,
+	/* FUA is not shown durable on this ANS: flush instead. */
+	.quirks = NVME_QUIRK_NO_APST | NVME_QUIRK_BROKEN_FUA,
+};
+
 static const struct of_device_id apple_nvme_of_match[] = {
 	{ .compatible = "apple,t6041-nvme-ans2", .data = &apple_nvme_t6040_hw },
+	{ .compatible = "apple,t6050-nvme-ans2", .data = &apple_nvme_t6050_hw },
 	{ .compatible = "apple,t8015-nvme-ans2", .data = &apple_nvme_t8015_hw },
 	{ .compatible = "apple,t8103-nvme-ans2", .data = &apple_nvme_t8103_hw },
 	{ .compatible = "apple,t8132-nvme-ans2", .data = &apple_nvme_t8132_hw },
 	{ .compatible = "apple,t8140-nvme-ans2", .data = &apple_nvme_t8140_hw },
+	{ .compatible = "apple,t8142-nvme-ans2", .data = &apple_nvme_t8142_hw },
 	{ .compatible = "apple,nvme-ans2", .data = &apple_nvme_t8103_hw },
 	{},
 };

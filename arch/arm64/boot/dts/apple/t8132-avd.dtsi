@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* T8132 decoder resource windows. The driver register layout is not selected here. */
+
+&soc {
+	avd_dart: iommu@3a1020000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x3 0xa1020000 0x0 0x20000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 955 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	avd: video-decoder@3a0000000 {
+		compatible = "apple,t8132-avd", "apple,avd";
+		reg = <0x3 0xa0000000 0x0 0x1404000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 948 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 949 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&avd_dart 0>, <&avd_dart 1>, <&avd_dart 2>;
+		power-domains = <&ps_avd_sys>;
+		clocks = <&peripheral_clocks 361>;
+		status = "disabled";
+	};
+};

@@ -2090,6 +2090,7 @@ F:	drivers/soc/apple/pmp.rs
 F:	include/linux/mt7932.h
 F:	include/linux/soc/apple/pmp-report.h
 F:	Documentation/devicetree/bindings/chosen/apple,dcp-rtkit-quiesced.yaml
+F:	Documentation/devicetree/bindings/chosen/aurora,ctxr-exec-window.yaml
 F:	Documentation/devicetree/bindings/display/apple,dcp.yaml
 F:	Documentation/devicetree/bindings/display/apple,display-subsystem.yaml
 F:	Documentation/PCI/controller/apple-t8140.rst
@@ -2097,6 +2098,7 @@ F:	Documentation/devicetree/bindings/iio/imu/apple,aop-motion.yaml
 F:	Documentation/devicetree/bindings/iio/light/apple,t8140-aop-als.yaml
 F:	Documentation/devicetree/bindings/input/apple,dockchannel-hid.yaml
 F:	Documentation/devicetree/bindings/mailbox/apple,ascwrap-v6.yaml
+F:	Documentation/devicetree/bindings/media/apple,t8132-isp.yaml
 F:	Documentation/devicetree/bindings/media/apple,t8140-isp.yaml
 F:	Documentation/devicetree/bindings/mux/apple,display-crossbar.yaml
 F:	Documentation/devicetree/bindings/reserved-memory/apple,asc-mem.yaml
@@ -2732,6 +2734,7 @@ F:	Documentation/devicetree/bindings/leds/backlight/apple,dwi-bl.yaml
 F:	Documentation/devicetree/bindings/mailbox/apple,mailbox.yaml
 F:	Documentation/devicetree/bindings/mfd/apple,smc.yaml
 F:	Documentation/devicetree/bindings/net/bluetooth/brcm,bcm4377-bluetooth.yaml
+F:	Documentation/devicetree/bindings/net/nfc/apple,stockholm-nci.yaml
 F:	Documentation/devicetree/bindings/npu/apple,ane.yaml
 F:	Documentation/devicetree/bindings/nvme/apple,nvme-ans.yaml
 F:	Documentation/devicetree/bindings/nvmem/apple,efuses.yaml
@@ -2775,6 +2778,8 @@ F:	drivers/iommu/apple-dart.c
 F:	drivers/iommu/io-pgtable-dart.c
 F:	drivers/irqchip/irq-apple-aic.c
 F:	drivers/mfd/macsmc*.c
+F:	drivers/nfc/.kunitconfig
+F:	drivers/nfc/apple-stockholm*.c
 F:	drivers/nvme/host/apple.c
 F:	drivers/nvmem/apple-efuses.c
 F:	drivers/nvmem/apple-spmi-nvmem.c
@@ -2793,8 +2798,11 @@ F:	tools/asahi/isp-preview-flow-tests.py
 F:	tools/asahi/isp-preview-tests.py
 F:	tools/asahi/isp-tests.py
 F:	tools/asahi/isp/
+F:	tools/asahi/m3-uapi-*
+F:	drivers/soc/apple/clpc.kunitconfig
 F:	tools/asahi/pmp-bootargs-tests.rs
 F:	drivers/spi/spi-apple-test.c
+F:	tools/asahi/test-m3-uapi.py
 F:	drivers/spi/spi-apple.c
 F:	drivers/spmi/spmi-apple-controller.c
 F:	drivers/thermal/apple-pmp*
@@ -2841,6 +2849,14 @@ W:	https://aurora-silicon.github.io
 S:	Maintained
 F:	Documentation/devicetree/bindings/spi/apple,qspi.yaml
 F:	drivers/spi/spi-apple-qspi.c
+
+ARM/APPLE SCALER DRIVER
+M:	Ryan Murray <ryan@aurorasilicon.org>
+L:	linux-media@vger.kernel.org
+S:	Maintained
+W:	https://aurora-silicon.github.io
+F:	Documentation/devicetree/bindings/media/apple,scaler.yaml
+F:	drivers/media/platform/apple/scaler/
 
 ARM/ARTPEC MACHINE SUPPORT
 M:	Jesper Nilsson <jesper.nilsson@axis.com>
@@ -4556,34 +4572,11 @@ AURORA N1 CENTAURI TRANSPORT
 M:	Dj <hey@djdev.me>
 L:	linux-wireless@vger.kernel.org
 S:	Maintained
-F:	Documentation/arch/arm64/aurora-apif-centauri.rst
 F:	Documentation/devicetree/bindings/net/wireless/apple,centauri.yaml
 F:	Documentation/devicetree/bindings/net/bluetooth/apple,centauri.yaml
 F:	drivers/bluetooth/btcentauri.c
 F:	include/linux/apple-centauri.h
 F:	drivers/net/wireless/apple/
-
-AURORA PLATFORM MMIO INTERFACE
-M:	Dj <hey@djdev.me>
-S:	Maintained
-F:	Documentation/devicetree/bindings/firmware/aurora,apif-mmio.yaml
-F:	Documentation/devicetree/bindings/iommu/apple,dart-apif.yaml
-F:	Documentation/devicetree/bindings/soc/apple/apple,sart-apif.yaml
-F:	Documentation/driver-api/firmware/aurora-apif*.rst
-F:	Documentation/devicetree/bindings/nvme/apple,nvme-apif.yaml
-F:	Documentation/devicetree/bindings/pci/apple,apif-pcie.yaml
-F:	arch/arm64/configs/aurora-apif.config
-F:	drivers/nvme/host/apple-apif.h
-F:	drivers/pci/controller/apple-apif/
-F:	include/linux/pci-apple-apif.h
-F:	tools/aurora-apif/
-F:	drivers/firmware/aurora-apif-mmio.c
-F:	drivers/iommu/apple-dart-apif.c
-F:	drivers/soc/apple/apple-sart-apif.c
-F:	drivers/soc/apple/sart-backend.h
-F:	include/linux/apple-dart-apif.h
-F:	include/linux/soc/aurora/apif-mmio.h
-F:	tools/testing/selftests/aurora-apif/
 
 AUXILIARY DISPLAY DRIVERS
 M:	Andy Shevchenko <andy@kernel.org>
@@ -27520,6 +27513,13 @@ F:	drivers/power/supply/bq27xxx_battery.c
 F:	drivers/power/supply/bq27xxx_battery_i2c.c
 F:	include/linux/power/bq27xxx_battery.h
 
+TI CD2E22 EUSB2 REPEATER DRIVER
+M:	Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+L:	linux-phy@lists.infradead.org
+S:	Maintained
+F:	Documentation/devicetree/bindings/phy/ti,cd2e22.yaml
+F:	drivers/phy/phy-ti-cd2e22.c
+
 TI CDCE706 CLOCK DRIVER
 M:	Max Filippov <jcmvbkbc@gmail.com>
 S:	Maintained
@@ -28975,6 +28975,13 @@ T:	git https://gitlab.freedesktop.org/drm/misc/kernel.git
 F:	Documentation/gpu/vga-switcheroo.rst
 F:	drivers/gpu/vga/vga_switcheroo.c
 F:	include/linux/vga_switcheroo.h
+
+VIA LABS VL122 USB HUB SIDEBAND DRIVER
+M:	Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+L:	linux-usb@vger.kernel.org
+S:	Maintained
+F:	Documentation/devicetree/bindings/usb/via,vl122.yaml
+F:	drivers/usb/misc/vl122-hub.c
 
 VIA RHINE NETWORK DRIVER
 M:	Kevin Brace <kevinbrace@bracecomputerlab.com>

@@ -109,6 +109,14 @@
 	};
 };
 
-&isp_dart0 { status = "disabled"; };
-&isp_dart1 { status = "disabled"; };
-&isp_dart2 { status = "disabled"; };
+&isp_dart0 {
+	status = "disabled";
+};
+
+&isp_dart1 {
+	status = "disabled";
+};
+
+&isp_dart2 {
+	status = "disabled";
+};
