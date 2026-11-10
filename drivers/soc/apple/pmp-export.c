@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
+#include <linux/debugfs.h>
 #include <linux/device.h>
 #include <linux/export.h>
+#include <linux/fs.h>
+#include <linux/kstrtox.h>
+#include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/soc/apple/pmp.h>
@@ -17,6 +21,55 @@ static u8 constraint_soc[16];
 #define APPLE_PMP_CONSTRAINT_SOC 0
 #define APPLE_PMP_CONSTRAINT_DCS 2
 
+#if IS_ENABLED(CONFIG_APPLE_PMP_RAW_COMMAND_PROBE)
+static struct dentry *pmp_probe_debugfs;
+static u64 pmp_probe_request;
+static u64 pmp_probe_reply;
+static int pmp_probe_status = -ENODATA;
+
+static ssize_t pmp_probe_read(struct file *file, char __user *buf, size_t count,
+			      loff_t *ppos)
+{
+	char result[96];
+	int len;
+
+	scoped_guard(mutex, &pmp_lock)
+		len = scnprintf(result, sizeof(result),
+				"request 0x%016llx\nreply 0x%016llx\nstatus %d\n",
+				pmp_probe_request, pmp_probe_reply, pmp_probe_status);
+	return simple_read_from_buffer(buf, count, ppos, result, len);
+}
+
+static ssize_t pmp_probe_write(struct file *file, const char __user *buf,
+			       size_t count, loff_t *ppos)
+{
+	unsigned long long request;
+	u64 reply = 0;
+	int ret;
+
+	ret = kstrtoull_from_user(buf, count, 0, &request);
+	if (ret)
+		return ret;
+	guard(mutex)(&pmp_lock);
+	if (!pmp_data)
+		return -ENODEV;
+	pmp_probe_request = request;
+	pmp_probe_reply = 0;
+	pmp_probe_status = -EINPROGRESS;
+	ret = apple_pmp_send_raw_probe(pmp_data, request, &reply);
+	pmp_probe_reply = reply;
+	pmp_probe_status = ret;
+	return ret ?: count;
+}
+
+static const struct file_operations pmp_probe_fops = {
+	.owner = THIS_MODULE,
+	.read = pmp_probe_read,
+	.write = pmp_probe_write,
+	.llseek = noop_llseek,
+};
+#endif
+
 int apple_pmp_register(struct device *dev, const void *data)
 {
 	int ret = 0;
@@ -28,6 +81,11 @@ int apple_pmp_register(struct device *dev, const void *data)
 		pmp_data = data;
 		pmp_device = dev;
 		constraint_known = 0;
+#if IS_ENABLED(CONFIG_APPLE_PMP_RAW_COMMAND_PROBE)
+		pmp_probe_debugfs = debugfs_create_dir("apple_pmp", NULL);
+		debugfs_create_file("raw_command", 0600, pmp_probe_debugfs, NULL,
+				    &pmp_probe_fops);
+#endif
 	}
 	return ret;
 }
@@ -36,6 +94,10 @@ void apple_pmp_unregister(const void *data)
 {
 	guard(mutex)(&pmp_lock);
 	if (pmp_data == data) {
+#if IS_ENABLED(CONFIG_APPLE_PMP_RAW_COMMAND_PROBE)
+		debugfs_remove_recursive(pmp_probe_debugfs);
+		pmp_probe_debugfs = NULL;
+#endif
 		pmp_data = NULL;
 		pmp_device = NULL;
 		constraint_known = 0;
@@ -71,6 +133,8 @@ int apple_pmp_set_device_power(u8 command, u16 device_id, u32 enabled)
 
 	if ((command != 0x0e && command != 0x0f) || device_id > 15 || enabled > 1)
 		return -EINVAL;
+	if (IS_ENABLED(CONFIG_APPLE_PMP_RAW_COMMAND_PROBE))
+		return -EBUSY;
 	guard(mutex)(&pmp_lock);
 	if (!pmp_data)
 		return -ENODEV;
@@ -119,6 +183,8 @@ int apple_pmp_set_device_constraint(u8 device_id, u8 dcs, u8 soc)
 	     device_id != APPLE_PMP_T8112_ANE0) ||
 	    dcs > APPLE_PMP_T8112_DCS_MAX || soc > APPLE_PMP_T8112_SOC_MAX)
 		return -EINVAL;
+	if (IS_ENABLED(CONFIG_APPLE_PMP_RAW_COMMAND_PROBE))
+		return -EBUSY;
 	guard(mutex)(&pmp_lock);
 	if (!pmp_data)
 		return -ENODEV;

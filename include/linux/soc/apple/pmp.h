@@ -51,4 +51,7 @@ int apple_pmp_send_power_command(const void *data, u8 command,
 				u16 device_id, u32 enabled);
 int apple_pmp_send_constraint_command(const void *data, u8 device_id,
 				      u8 domain, u16 level);
+#if IS_ENABLED(CONFIG_APPLE_PMP_RAW_COMMAND_PROBE)
+int apple_pmp_send_raw_probe(const void *data, u64 request, u64 *reply);
+#endif
 #endif
