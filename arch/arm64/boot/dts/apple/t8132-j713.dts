@@ -233,6 +233,43 @@
 	apple,retention-workaround = <0x25b4c 0x3 0x3>, <0x25b70 0x3 0x0>;
 };
 
+/*
+ * A deep sleep with a dock attached powers these off: their hosts (the ACIO
+ * NHIs, the tunneled PCIe ports and the external DCPs) take them down and
+ * restore them, with these clock protection slices.
+ */
+&usb4_0_dart {
+	apple,clock-protection = <&ps_prot 15>;
+};
+
+&usb4_1_dart {
+	apple,clock-protection = <&ps_prot 19>;
+};
+
+&usb4_0_pcie_dart {
+	apple,clock-protection = <&ps_prot 14>;
+};
+
+&usb4_1_pcie_dart {
+	apple,clock-protection = <&ps_prot 18>;
+};
+
+&dcpext0_dart {
+	apple,clock-protection = <&ps_prot 5>;
+};
+
+&dispext0_dart {
+	apple,clock-protection = <&ps_prot 4>;
+};
+
+&dcpext1_dart {
+	apple,clock-protection = <&ps_prot 30>;
+};
+
+&dispext1_dart {
+	apple,clock-protection = <&ps_prot 29>;
+};
+
 /* Native radio recovery is required before admitting system sleep. */
 &pcie0 {
 	status = "okay";
