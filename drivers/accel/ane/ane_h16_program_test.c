@@ -1010,7 +1010,7 @@ static void program_session_test(struct kunit *test)
 	};
 	static const u32 gates[] = { 0, 0, 0, 0, 1, 0, 0, 1 };
 	struct prog_fw *f = fw_create(test);
-	struct ane_h16_program *p = NULL, *second = NULL;
+	struct ane_h16_program *p = NULL, *second = NULL, *third = NULL;
 	unsigned int i;
 
 	KUNIT_ASSERT_NOT_NULL(test, f);
@@ -1078,6 +1078,18 @@ static void program_session_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), ANE_H16_EXECUTE_FLAG_QUEUED);
 	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, second), 0);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), 0);
+	/* H16 keeps several programs resident: a LOAD while one is loaded. */
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &third), 0);
+	KUNIT_ASSERT_NOT_NULL(test, third);
+	KUNIT_EXPECT_NE(test, third->key.program, second->key.program);
+	/* Each switch between the resident programs is queued. */
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, third), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), ANE_H16_EXECUTE_FLAG_QUEUED);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, second), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), ANE_H16_EXECUTE_FLAG_QUEUED);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, second), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, third), 0);
 
 	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, second), 0);
 	/* Closing the first program's file late is harmless. */

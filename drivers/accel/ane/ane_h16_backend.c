@@ -33,8 +33,14 @@
 #include "ane_h16_preload.h"
 
 #define ANE_H16_TX_WORDS 272
-/* Private program window above the SHAREDMALLOC range; host policy. */
-#define ANE_H16_PROGRAM_WINDOW SZ_1G
+/*
+ * Private program window above the SHAREDMALLOC range; host policy. Program
+ * DVAs are never reused before a firmware reset, so the window bounds the sum
+ * of every program loaded in one boot. 16G holds a whole-model encoder (the
+ * Parakeet encoder is about 450M of constants) next to the per-layer programs
+ * a decoder pipeline keeps resident; the DART aperture is 4T.
+ */
+#define ANE_H16_PROGRAM_WINDOW SZ_16G
 
 struct ane_h16_mapping {
 	struct list_head node;
@@ -191,7 +197,7 @@ static void ane_h16_quarantine(void *ctx, int error)
 }
 
 /*
- * System sleep the macOS way (SPEC-ANE-SLEEP.md sections 4.1, 4.2 and 5.1):
+ * System sleep the macOS way:
  * suspend the firmware with SUSPEND (0x24), power gate the engine through
  * the PM domains it holds (DARTs first, then base, td, mpm, cpu, sys), and
  * after resume power it back up in order, let the DARTs restore their
@@ -571,6 +577,19 @@ static int ane_h16_sleep_prepare(struct ane_h16_device *h)
 		h->genpd[i].off_at = 0;
 		h->genpd[i].off_ns = 0;
 	}
+	/*
+	 * A quarantined engine never runs a program again in this boot, and a
+	 * resume from disk is a cold boot of the engine anyway: it must not veto
+	 * the hibernation (observed: a startup timeout at boot otherwise refused
+	 * every later attempt). Power it off so that nothing runs under the snapshot;
+	 * it stays quarantined (no replay after the resume or an abort).
+	 */
+	if (h->boot.quarantined && !h->boot.soc->sleep_warm) {
+		if (h->engine_on)
+			ane_h16_power_down(h);
+		dev_info(h->dev, "H16 ANE: quarantined engine left off for hibernation\n");
+		return 0;
+	}
 	if (!h->program_ready || h->boot.quarantined)
 		return -EBUSY;
 	ane_h16_session_sleep(&h->session, true);
@@ -649,6 +668,7 @@ static int ane_h16_pm_event(struct notifier_block *nb, unsigned long event, void
 {
 	struct ane_h16_device *h = container_of(nb, struct ane_h16_device, pm_notifier);
 	bool pinned = READ_ONCE(h->pinned);
+	bool cold = !h->boot.soc->sleep_warm;
 
 	/* Without a sleep path on this platform, every sleep is refused as before. */
 	if (!h->boot.soc->sleep_warm && !h->boot.soc->sleep_cold) {
@@ -656,17 +676,28 @@ static int ane_h16_pm_event(struct notifier_block *nb, unsigned long event, void
 			dev_warn_once(h->dev, ANE_FW_SLEEP_REFUSED);
 		return ane_fw_sleep_event(event, pinned);
 	}
-	if (event == PM_POST_SUSPEND) {
+	/*
+	 * Hibernation takes the cold cycle: the engine is powered down before
+	 * the snapshot and, after the image is restored (or the attempt is
+	 * aborted), booted again from the preload with every program replayed.
+	 * The preload stays out of the image, the verified DATA copy in it.
+	 * A restore kernel that booted the engine powers it down the same way
+	 * before it jumps into the image. The warm path keeps refusing it.
+	 */
+	if (event == PM_POST_SUSPEND ||
+	    (cold && (event == PM_POST_HIBERNATION || event == PM_POST_RESTORE))) {
 		ane_h16_sleep_resume(h);
 		return NOTIFY_DONE;
 	}
-	if (event == PM_SUSPEND_PREPARE && pinned) {
+	if (pinned && (event == PM_SUSPEND_PREPARE ||
+		       (cold && (event == PM_HIBERNATION_PREPARE ||
+				 event == PM_RESTORE_PREPARE)))) {
 		if (!ane_h16_sleep_prepare(h))
 			return NOTIFY_DONE;
 		dev_warn_once(h->dev, ANE_FW_SLEEP_REFUSED);
 		return NOTIFY_BAD;
 	}
-	/* Hibernation and restore stay refused. */
+	/* Hibernation and restore on the warm path stay refused. */
 	if (ane_fw_sleep_refused_cycle(event, pinned, true)) {
 		dev_warn_once(h->dev, ANE_FW_SLEEP_REFUSED);
 		return NOTIFY_BAD;
@@ -707,7 +738,9 @@ int ane_h16_backend_suspend(struct device *dev)
 {
 	struct ane_h16_device *h = dev_get_drvdata(dev);
 	/* Running firmware that the notifier did not suspend: refuse. */
-	bool running = h && READ_ONCE(h->pinned) && !READ_ONCE(h->slept);
+	bool running = h && READ_ONCE(h->pinned) && !READ_ONCE(h->slept) &&
+		       !(h->boot.quarantined && !h->boot.soc->sleep_warm &&
+			 pm_suspend_target_state == PM_SUSPEND_ON);
 
 	if (running)
 		dev_warn_once(dev, ANE_FW_SLEEP_REFUSED);

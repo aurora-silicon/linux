@@ -23,6 +23,13 @@
  * without it, the first job after the engine ran a different program can
  * write through that program's stale output binding. Set it on the first
  * request of each program on the engine, the first one after boot included.
+ * H16 (T6040 26.7.1 firmware): CAneProgramManagerHx refuses
+ * the direct path when this bit is set ("flags & 1"), and the direct path
+ * rebuilds the BAR table from the operation record and the request's
+ * descriptors; only the per-priority L2-spill mapping and request slot 0 are
+ * reused across programs. The queued path is the one macOS exercises on
+ * every program switch (the ISR is never idle under its load), so Linux
+ * takes it on the first request after each switch.
  */
 #define ANE_H16_EXECUTE_FLAGS 0x30
 #define ANE_H16_EXECUTE_FLAG_QUEUED BIT(0)
