@@ -3361,6 +3361,14 @@ void dcp_tb_event_work(struct work_struct *work)
 
 		dcp->tb_irq_hpd_count++;
 		dcp->tb_irq_hpd_last = now;
+		/*
+		 * The firmware may answer the request by dropping the sink, with
+		 * the tunnel and its HPD still there. Count that as a link coming
+		 * up, so that the drop gets a relink; see dcp_typec_relink().
+		 */
+		scoped_guard(spinlock_irqsave, &dcp->relink_lock)
+			dcp_relink_link_up(&dcp->relink,
+					   READ_ONCE(dcp->typec_generation), jiffies);
 		ret = dptxport_sink_irq(service);
 		dev_info(dcp->dev, "DP tunnel: sink IRQ_HPD (#%u, %lld ms after the last) passed to the firmware: %d\n",
 			 dcp->tb_irq_hpd_count, since, ret);
