@@ -4634,6 +4634,43 @@ static int apple_dart_parse_own_setup(struct apple_dart *dart, struct resource *
 	return 0;
 }
 
+struct apple_dart_available {
+	struct list_head list;
+	struct device_node *np;
+};
+
+static DEFINE_MUTEX(apple_dart_available_lock);
+static LIST_HEAD(apple_dart_available_list);
+
+void apple_dart_make_available(struct device_node *np)
+{
+	struct apple_dart_available *a;
+
+	guard(mutex)(&apple_dart_available_lock);
+	list_for_each_entry(a, &apple_dart_available_list, list)
+		if (a->np == np)
+			return;
+	a = kzalloc_obj(*a);
+	if (!a)
+		return;
+	a->np = of_node_get(np);
+	list_add(&a->list, &apple_dart_available_list);
+}
+EXPORT_SYMBOL_GPL(apple_dart_make_available);
+
+static bool apple_dart_is_available(struct device_node *np)
+{
+	struct apple_dart_available *a;
+
+	if (!of_property_read_bool(np, "apple,manual-availability"))
+		return true;
+	guard(mutex)(&apple_dart_available_lock);
+	list_for_each_entry(a, &apple_dart_available_list, list)
+		if (a->np == np)
+			return true;
+	return false;
+}
+
 static int apple_dart_probe(struct platform_device *pdev)
 {
 	int ret, sid;
@@ -4736,6 +4773,10 @@ static int apple_dart_probe(struct platform_device *pdev)
 			return -ENODEV;
 		}
 	}
+
+	/* Its registers answer only once its client is up */
+	if (!apple_dart_is_available(dev->of_node))
+		return dev_err_probe(dev, -EPROBE_DEFER, "waiting for its client\n");
 
 	dart = kzalloc(sizeof(*dart), GFP_KERNEL);
 	if (!dart)
