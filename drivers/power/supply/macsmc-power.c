@@ -1149,9 +1149,17 @@ static int macsmc_power_probe(struct platform_device *pdev)
 		props[nprops++] = POWER_SUPPLY_PROP_SCOPE;
 		props[nprops++] = POWER_SUPPLY_PROP_MODEL_NAME;
 		props[nprops++] = POWER_SUPPLY_PROP_SERIAL_NUMBER;
-		props[nprops++] = POWER_SUPPLY_PROP_MANUFACTURE_YEAR;
-		props[nprops++] = POWER_SUPPLY_PROP_MANUFACTURE_MONTH;
-		props[nprops++] = POWER_SUPPLY_PROP_MANUFACTURE_DAY;
+		/*
+		 * BMDT is the manufacture date as YYMMDD from 1992. On the
+		 * J700 it does not follow that layout (it decodes to 2082) and
+		 * macOS reports no manufacture date for the battery: leave the
+		 * date out there rather than report a wrong one.
+		 */
+		if (!of_machine_is_compatible("apple,j700")) {
+			props[nprops++] = POWER_SUPPLY_PROP_MANUFACTURE_YEAR;
+			props[nprops++] = POWER_SUPPLY_PROP_MANUFACTURE_MONTH;
+			props[nprops++] = POWER_SUPPLY_PROP_MANUFACTURE_DAY;
+		}
 
 		/* Extended properties usually present */
 		props[nprops++] = POWER_SUPPLY_PROP_TIME_TO_EMPTY_NOW;
