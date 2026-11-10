@@ -65,6 +65,9 @@ struct apple_gpio_pinctrl {
 	bool restore_all;
 	unsigned long *no_restore;
 	unsigned long *restored;
+	/* The block's word at REG_GLOBAL, which macOS keeps across a sleep too. */
+	u32 saved_global;
+	bool saved_global_valid;
 	struct apple_gpio_irq_group irqgrps[];
 };
 
@@ -91,6 +94,12 @@ struct apple_gpio_pinctrl {
 #define REG_GPIOx_LOCK       BIT(21)
 #define REG_GPIOx_DRIVE_STRENGTH1 GENMASK(23, 22)
 #define REG_IRQ(g, x)        (0x800 + 0x40 * (g) + 4 * ((x) >> 5))
+/*
+ * One word past the pins and the interrupt groups. macOS reads it when the
+ * system quiesces and writes it back on the wake, before it puts the pins back. It is 1
+ * on a running J616s; with it lost, no pin reads its input any more.
+ */
+#define REG_GLOBAL           0xc48
 
 /*
  * T6040 bring-up: put the configured pins back after a firmware-driven
@@ -709,6 +718,32 @@ static const struct of_device_id apple_gpio_pinctrl_of_match[] = {
 MODULE_DEVICE_TABLE(of, apple_gpio_pinctrl_of_match);
 
 /*
+ * A pin's whole word written the way macOS writes it: the
+ * configuration first with the input buffer as it is (off after a power loss), then the
+ * input enable in a write of its own, the lock last. A locked pin is left alone. Written
+ * in one go, with the input enable among the rest, a pin read 0 for good after the wake.
+ */
+static void apple_gpio_safe_reconfigure(struct apple_gpio_pinctrl *pctl, unsigned int pin,
+					u32 old, u32 cfg)
+{
+	u32 val = cfg & ~(REG_GPIOx_LOCK | REG_GPIOx_INPUT_ENABLE);
+
+	if (old & REG_GPIOx_LOCK)
+		return;
+	if (!(cfg & REG_GPIOx_INPUT_ENABLE)) {
+		regmap_write(pctl->map, REG_GPIO(pin),
+			     old & ~(REG_GPIOx_LOCK | REG_GPIOx_INPUT_ENABLE));
+		regmap_write(pctl->map, REG_GPIO(pin), val);
+	} else {
+		regmap_write(pctl->map, REG_GPIO(pin), (old & REG_GPIOx_INPUT_ENABLE) | val);
+		if (!(old & REG_GPIOx_INPUT_ENABLE))
+			regmap_write(pctl->map, REG_GPIO(pin), cfg & ~REG_GPIOx_LOCK);
+	}
+	if (cfg & REG_GPIOx_LOCK)
+		regmap_write(pctl->map, REG_GPIO(pin), cfg);
+}
+
+/*
  * A firmware-driven suspend powers this block off, and neither the pin core nor
  * a consumer sets a pin up again. Slots that fault aren't readable in the regmap,
  * so they stay out of this.
@@ -730,7 +765,10 @@ static int apple_gpio_pinctrl_suspend_noirq(struct device *dev)
 	 * hardware has it now, but the ones the device tree names, which may not be written
 	 * back. The pins of the panel's TCON bus, set up by the boot loader, are among them.
 	 */
+	pctl->saved_global_valid = false;
 	if (pctl->restore_all && READ_ONCE(resume_all)) {
+		pctl->saved_global = readl(pctl->base + REG_GLOBAL);
+		pctl->saved_global_valid = true;
 		if (pctl->cached)
 			regcache_cache_bypass(pctl->map, true);
 		for (i = 0; i < pctl->pinctrl_desc.npins; i++)
@@ -761,15 +799,25 @@ static int apple_gpio_pinctrl_resume_noirq(struct device *dev)
 	if (!pctl->saved || !pm_resume_via_firmware())
 		return 0;
 
+	if (pctl->saved_global_valid) {
+		val = readl(pctl->base + REG_GLOBAL);
+		writel(pctl->saved_global, pctl->base + REG_GLOBAL);
+		dev_info(dev, "resume: global word %#x, put back to %#x\n", val,
+			 pctl->saved_global);
+		pctl->saved_global_valid = false;
+	}
+
 	/* The saved words came from the cache; the hardware is what to compare. */
 	if (pctl->cached)
 		regcache_cache_bypass(pctl->map, true);
 	if (pctl->restored)
 		bitmap_zero(pctl->restored, pctl->pinctrl_desc.npins);
 	for_each_set_bit(i, pctl->saved_valid, pctl->pinctrl_desc.npins) {
-		if (!regmap_read(pctl->map, REG_GPIO(i), &val) && val == pctl->saved[i])
+		if (regmap_read(pctl->map, REG_GPIO(i), &val))
+			val = 0;
+		else if (val == pctl->saved[i])
 			continue;
-		regmap_write(pctl->map, REG_GPIO(i), pctl->saved[i]);
+		apple_gpio_safe_reconfigure(pctl, i, val, pctl->saved[i]);
 		restored++;
 		if (pctl->restored && !test_bit(i, pctl->touched))
 			set_bit(i, pctl->restored);
