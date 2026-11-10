@@ -40,6 +40,7 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/irqchip/irq-apple-aic.h>
+#include <linux/ktime.h>
 #include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -163,7 +164,9 @@ struct aura_s2r_mailbox {
 #define HPM_CMD_SSPS		0x53505353
 #define HPM_CMD_COLD_RESET	0x64696147
 #define HPM_SSPS_S3		3
-#define HPM_RESET_MS		1000
+/* The first look after the reset, and how long a contract that never seemed to go is trusted to have gone. */
+#define HPM_RESET_FIRST_MS	50
+#define HPM_RESET_FLOOR_MS	1000
 #define HPM_PAGE_POWER_STATUS	0x3f
 #define HPM_POWER_CONNECTED	BIT(0)
 #define HPM_POWER_TYPEC_MODE	GENMASK(3, 2)
@@ -1811,26 +1814,38 @@ static int sleep_hpm_sleep(struct apple_sleep *s)
  * Left to finish across the commit, that sometimes failed: neither side had a contract or
  * saw the other, and no VDM got through until a replug. Returns the ms it took.
  */
-static int sleep_hpm_wait_contract(struct apple_sleep *s)
+static int sleep_hpm_wait_contract(struct apple_sleep *s, int *gone_ms)
 {
-	bool wake = true;
+	ktime_t start = ktime_get();
+	bool wake = true, up;
 	u32 val = 0;
 	int ms, ret;
 
-	for (ms = 0; ms < HPM_CONTRACT_MS; ms += 10) {
+	/*
+	 * It reads back as before for a moment after the reset. Count it as back once it was
+	 * seen gone (no contract, or no answer while the controller restarts), or after the
+	 * floor if it never seemed to go.
+	 */
+	*gone_ms = -1;
+	mdelay(HPM_RESET_FIRST_MS);
+	for (;;) {
+		ms = ktime_ms_delta(ktime_get(), start);
+		if (ms >= HPM_CONTRACT_MS)
+			return -ETIMEDOUT;
 		ret = wake ? sleep_hpm_cmd(s, SPMI_OP_WAKEUP, 0, NULL, NULL) : 0;
 		if (!ret)
 			ret = sleep_hpm_select(s, HPM_PAGE_POWER_STATUS);
 		if (!ret)
 			ret = sleep_hpm_cmd(s, SPMI_OP_EXT_READ(4), HPM_REG_DATA, NULL, &val);
-		if (!ret && (val & HPM_POWER_CONNECTED) &&
-		    FIELD_GET(HPM_POWER_TYPEC_MODE, val) == HPM_POWER_TYPEC_PD)
+		up = !ret && (val & HPM_POWER_CONNECTED) &&
+		     FIELD_GET(HPM_POWER_TYPEC_MODE, val) == HPM_POWER_TYPEC_PD;
+		if (!up && *gone_ms < 0)
+			*gone_ms = ms;
+		if (up && (*gone_ms >= 0 || ms >= HPM_RESET_FLOOR_MS))
 			return ms;
 		wake = ret;
 		mdelay(10);
 	}
-
-	return -ETIMEDOUT;
 }
 
 /* A live debug link holds the debug switch domain on. */
@@ -1851,7 +1866,7 @@ static bool apple_sleep_usb_down(struct apple_sleep *s)
 {
 	u32 cmd = HPM_CMD_COLD_RESET;
 	u32 enable;
-	int i, ret, ms;
+	int i, ret, ms, gone;
 
 	if (s->usb_down_ran)
 		return false;
@@ -1873,11 +1888,10 @@ static bool apple_sleep_usb_down(struct apple_sleep *s)
 		if (ret)
 			break;
 		WRITE_ONCE(sleep_debug_link_cut, true);
-		mdelay(HPM_RESET_MS);
-		ms = sleep_hpm_wait_contract(s);
+		ms = sleep_hpm_wait_contract(s, &gone);
 		if (ms >= 0) {
-			dev_info(s->dev, "debug link: contract back %d ms after reset %d\n",
-				 HPM_RESET_MS + ms, i);
+			dev_info(s->dev, "debug link: contract back %d ms after reset %d (gone at %d ms)\n",
+				 ms, i, gone);
 			break;
 		}
 		dev_warn(s->dev, "debug link: no contract with the partner after reset %d\n", i);
