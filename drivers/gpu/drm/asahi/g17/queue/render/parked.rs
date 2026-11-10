@@ -253,6 +253,7 @@ impl ParkedPair {
             executed: self.executed,
             switch: None,
             published_completions: None,
+            channel_error: false,
         }))
     }
 }

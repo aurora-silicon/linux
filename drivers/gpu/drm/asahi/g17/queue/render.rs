@@ -153,6 +153,9 @@ const ABANDON_GRACE_NS: u64 = 2_000_000;
 /// Installed kick backing remains owned even when this pair has no logical
 /// owner. Commands retain their exact descriptor and allocation generations.
 pub(crate) struct Pair {
+    /// A channel error of one of this pair's queues waits for the firmware to consume its
+    /// acknowledgement: the pair keeps its owner and graph until then.
+    channel_error: bool,
     kick_aliases: Option<[Option<mmu::KernelMapping>; 2]>,
     memory: KBox<memory::Memory>,
     kicks: [kick::Queue; 2],
@@ -295,10 +298,21 @@ impl Pair {
             executed: 0,
             switch: None,
             published_completions: None,
+            channel_error: false,
         }))
     }
     pub(crate) fn qids(&self) -> [u8; 2] {
         self.kicks.each_ref().map(|kick| kick.id().qid())
+    }
+    /// The queue record the firmware runs physical queue `qid` of this pair from.
+    pub(crate) fn queue_record_va(&self, qid: u8) -> Option<u64> {
+        self.qids().contains(&qid).then(|| {
+            self.memory.graph.queues.gpu_va()
+                + u64::from(qid) * size_of::<crate::g17::fw::queue::QueueRecord>() as u64
+        })
+    }
+    pub(crate) fn set_channel_error(&mut self, pending: bool) {
+        self.channel_error = pending;
     }
     pub(crate) fn slot(&self) -> u8 {
         self.slot
@@ -2354,7 +2368,8 @@ impl Pair {
             .previous
             .as_ref()
             .is_none_or(|p| p.memory.is_none() && self.context_update && !p.ready);
-        Ok(self.owner.is_none()
+        Ok(!self.channel_error
+            && self.owner.is_none()
             && self.displaced.is_none()
             && previous_ready
             && self.idle_for_context(self.context())?)
