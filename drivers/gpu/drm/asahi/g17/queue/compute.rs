@@ -2980,6 +2980,11 @@ impl Queue {
     }
 
     fn install_m5(&mut self, packet: &Arc<Packet>, host: &mut impl Host) -> Result {
+        // Installed, configuration released and a kick published: nothing to check, and no
+        // reads of shared memory under the device mutex.
+        if self.m5_install.is_some() && self.ordinal != 0 && self.configuration.is_none() {
+            return Ok(());
+        }
         let (epoch, state) = host.epoch()?;
         if state == 0 { self.retire_configuration(epoch)?; }
         if let Some(end) = self.m5_install {
