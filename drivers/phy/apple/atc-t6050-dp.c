@@ -636,13 +636,56 @@ int apple_dp_phy_link_config(struct phy *phy, unsigned int *pclk, bool *uhbr)
 }
 EXPORT_SYMBOL_GPL(apple_dp_phy_link_config);
 
+/* Start tunnel clock @clock at link rate @rate from PMGR source @src. */
+static int atc_dp_tunnel_start(struct t6050_dp *dp, unsigned int clock, u8 rate,
+			       int src, u32 *status)
+{
+	void __iomem *cfg = dp->banks[39], *word;
+	unsigned int i = clock - 1;
+	u32 en = atc_dp_enable_bit(clock), v;
+	int ret;
+
+	if (dp->dp_gates) {
+		ret = atc_domain_set(&dp->dp_gate[i], true);
+		if (ret)
+			return ret;
+	}
+	word = dp->dp_clk_src + 4 * i;
+	writel((readl(word) & ~ATC_DP_SRC_SELECT) | FIELD_PREP(ATC_DP_SRC_SELECT, src), word);
+	ret = readl_poll_timeout(word, v, !(v & ATC_DP_SRC_BUSY), 10, 200000);
+	if (ret) {
+		dev_err(dp->dev, "DP tunnel clock %u: source %d not taken (%08x)\n",
+			clock, src, v);
+		if (dp->dp_gates)
+			atc_domain_set(&dp->dp_gate[i], false);
+		return ret;
+	}
+	writel((readl(cfg + ATC_CFG_DP_SWITCH) & ~atc_dp_switch_mask(clock)) |
+	       (clock << (3 * clock - 3)) |
+	       (rate == 0x81 || rate == 0x82 ? BIT(11 + clock) : 0),
+	       cfg + ATC_CFG_DP_SWITCH);
+	writel(readl(cfg + ATC_CFG_DP_ENABLE) | en, cfg + ATC_CFG_DP_ENABLE);
+	ret = readl_poll_timeout(cfg + ATC_CFG_DP_STATUS, v, v & en, 10, 10000);
+	if (ret) {
+		dev_err(dp->dev, "DP tunnel clock %u: switch status %08x not on\n", clock, v);
+		/* Undo the partial start before leaving the rate uncached for retry. */
+		atc_dp_tunnel_switch_off(dp, clock);
+		if (dp->dp_gates)
+			atc_domain_set(&dp->dp_gate[i], false);
+		return ret;
+	}
+	dp->tunnel_rate[i] = rate;
+	*status = v;
+	return 0;
+}
+
 int apple_t6050_dp_tunnel_clock(struct phy *phy, unsigned int clock, u8 rate)
 {
 	struct t6050_dp *dp;
-	void __iomem *cfg, *word;
 	unsigned int i = clock - 1;
 	int src = 0, ret;
-	u32 en, v;
+	bool others;
+	u32 v;
 
 	if (!phy || phy->ops != &t6050_dp_ops)
 		return -EOPNOTSUPP;
@@ -661,9 +704,8 @@ int apple_t6050_dp_tunnel_clock(struct phy *phy, unsigned int clock, u8 rate)
 		dp->tunnel_idle &= ~BIT(i);
 		return 0;
 	}
+	others = atc_dp_tunnel_others_in_use(dp, clock);
 	if (!rate) {
-		bool others = atc_dp_tunnel_others_in_use(dp, clock);
-
 		if (dp->tunnel_rate[i] && others) {
 			dp->tunnel_idle |= BIT(i);
 			dev_dbg(dp->dev, "DP tunnel clock %u left running for the others\n",
@@ -686,38 +728,23 @@ int apple_t6050_dp_tunnel_clock(struct phy *phy, unsigned int clock, u8 rate)
 		return -EIO;
 	if (dp->combo_mode != COMBO_CIO)
 		return -ENOLINK;
-	if (dp->dp_gates) {
-		ret = atc_domain_set(&dp->dp_gate[i], true);
-		if (ret)
-			return ret;
-	}
-	word = dp->dp_clk_src + 4 * i;
-	writel((readl(word) & ~ATC_DP_SRC_SELECT) | FIELD_PREP(ATC_DP_SRC_SELECT, src), word);
-	ret = readl_poll_timeout(word, v, !(v & ATC_DP_SRC_BUSY), 10, 200000);
-	if (ret) {
-		dev_err(dp->dev, "DP tunnel clock %u: source %d not taken (%08x)\n",
-			clock, src, v);
-		if (dp->dp_gates)
-			atc_domain_set(&dp->dp_gate[i], false);
+	ret = atc_dp_tunnel_start(dp, clock, rate, src, &v);
+	if (ret)
 		return ret;
+	/*
+	 * Starting a clock disturbs the running ones as stopping one does. The
+	 * port's first clock therefore starts the others with it, at its rate
+	 * and with no user: a display that comes later at that rate finds its
+	 * clock running.
+	 */
+	for (unsigned int k = 1; !others && k <= ATC_DP_TUNNELS; k++) {
+		u32 unused;
+
+		if (k == clock || dp->tunnel_rate[k - 1])
+			continue;
+		if (!atc_dp_tunnel_start(dp, k, rate, src, &unused))
+			dp->tunnel_idle |= BIT(k - 1);
 	}
-	cfg = dp->banks[39];
-	en = atc_dp_enable_bit(clock);
-	writel((readl(cfg + ATC_CFG_DP_SWITCH) & ~atc_dp_switch_mask(clock)) |
-	       (clock << (3 * clock - 3)) |
-	       (rate == 0x81 || rate == 0x82 ? BIT(11 + clock) : 0),
-	       cfg + ATC_CFG_DP_SWITCH);
-	writel(readl(cfg + ATC_CFG_DP_ENABLE) | en, cfg + ATC_CFG_DP_ENABLE);
-	ret = readl_poll_timeout(cfg + ATC_CFG_DP_STATUS, v, v & en, 10, 10000);
-	if (ret) {
-		dev_err(dp->dev, "DP tunnel clock %u: switch status %08x not on\n", clock, v);
-		/* Undo the partial start before leaving the rate uncached for retry. */
-		atc_dp_tunnel_switch_off(dp, clock);
-		if (dp->dp_gates)
-			atc_domain_set(&dp->dp_gate[i], false);
-		return ret;
-	}
-	dp->tunnel_rate[i] = rate;
 	dev_info(dp->dev, "DP tunnel clock %u: link rate 0x%02x, source %d, switch status %08x\n",
 		 clock, rate, src, v);
 	return 0;
