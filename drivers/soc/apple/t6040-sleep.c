@@ -834,9 +834,8 @@ static struct t6040_sleep_coproc {
 	bool ready;
 	bool stopped;
 	u32 status;
-	/* No ASC: its last stop takes it whole, power word @ps included, before the others. */
+	/* No ASC: its last stop takes it whole, power word included, before the others. */
 	bool first;
-	u32 ps;
 } t6040_sleep_coprocs[SLEEP_COPROCS];
 static DEFINE_MUTEX(t6040_sleep_coprocs_lock);
 
@@ -881,7 +880,6 @@ int apple_sleep_coproc_register(struct device *dev, void __iomem *asc, bool pcie
 	c->ready = false;
 	c->stopped = false;
 	c->first = false;
-	c->ps = 0;
 	c->dev = dev;
 
 	return 0;
@@ -892,27 +890,18 @@ int apple_sleep_coproc_register_first(struct device *dev, int (*last_stop)(void 
 				      void *data)
 {
 	struct t6040_sleep_coproc *c;
-	struct device_node *np;
-	u32 ps = 0;
 	int ret;
 
 	if (!last_stop)
 		return -EINVAL;
-	np = of_parse_phandle(dev->of_node, "power-domains", 0);
-	if (np) {
-		of_property_read_u32(np, "reg", &ps);
-		of_node_put(np);
-	}
 	ret = apple_sleep_coproc_register(dev, NULL, false, last_stop, data);
 	if (ret)
 		return ret;
 
 	guard(mutex)(&t6040_sleep_coprocs_lock);
 	c = t6040_sleep_coproc_find(dev);
-	if (c) {
+	if (c)
 		c->first = true;
-		c->ps = ps;
-	}
 
 	return 0;
 }
