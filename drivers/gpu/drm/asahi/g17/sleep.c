@@ -68,12 +68,29 @@ int asahi_g17_pmp_request(struct device *dev, bool enable)
 
 static int asahi_g17_ps(struct device *dev, struct regmap **regmap, u32 *offset)
 {
-	struct device_node *np;
-	int ret;
+	struct device_node *np, *next;
+	int hops, ret;
 
 	np = of_parse_phandle(dev->of_node, "power-domains", 0);
+	/*
+	 * The GPU's PMGR state word. Where a PMP report entry stands in front of it
+	 * (T6041: power-domains = pmp-gfx, whose own domain is the PMGR's gfx), follow
+	 * that entry's domain down to the word.
+	 */
+	for (hops = 0; np && hops < 2 &&
+	     !of_device_is_compatible(np, "apple,t8103-pmgr-pwrstate") &&
+	     !of_device_is_compatible(np, "apple,pmgr-pwrstate"); hops++) {
+		next = of_parse_phandle(np, "power-domains", 0);
+		of_node_put(np);
+		np = next;
+	}
 	if (!np)
 		return -EINVAL;
+	if (!of_device_is_compatible(np, "apple,t8103-pmgr-pwrstate") &&
+	    !of_device_is_compatible(np, "apple,pmgr-pwrstate")) {
+		of_node_put(np);
+		return -ENODEV;
+	}
 	ret = of_property_read_u32(np, "reg", offset);
 	if (!ret) {
 		*regmap = np->parent ? syscon_node_to_regmap(np->parent) : ERR_PTR(-EINVAL);
