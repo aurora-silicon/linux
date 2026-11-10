@@ -135,6 +135,28 @@ fn get32(bytes: &[u8], at: usize) -> u32 { u32::from_le_bytes(bytes[at..at+4].tr
     let mut s=source();s.frequency_mhz[7]=s.frequency_mhz[5];s.sram_frequency_mhz[7]=s.frequency_mhz[7];assert!(data::select(&s).is_err());
     let mut s=source();s.core_mv[14]=600;s.core_mv[15]=600;assert!(data::select(&s).is_err());
 }
+#[test] fn j604_shape_selects_its_own_layout_and_the_j713_keeps_its_own() {
+    assert_eq!(data::select_named(&source()).unwrap().1,"J713");
+    // J604 shape: five low states, equal-voltage pairs 5/6 to 13/14, a single top state 15.
+    // Rows 0-3 and 5-15 are the J604's selected values; state 4 (left out) is synthetic.
+    let mhz=[0,338,618,796,928,952,1056,1053,1170,1152,1278,1204,1338,1326,1470,1578];
+    let mv=[125,625,640,680,725,780,780,825,825,865,865,895,895,970,970,1045];
+    let mut s=source();
+    for i in 0..16 {
+        s.frequency_mhz[i]=mhz[i];s.sram_frequency_mhz[i]=mhz[i];
+        s.core_mv[i]=mv[i];s.sram_mv[i]=mv[i].max(780);
+    }
+    let (p,name)=data::select_named(&s).unwrap();
+    assert_eq!(name,"J604");
+    assert_eq!(p.frequency,[0,338,618,796,1056,1170,1278,1338,1470,1578]);
+    assert_eq!(p.auxiliary,[0,338,618,796,952,1053,1152,1204,1326,1578]);
+    assert_eq!(p.voltage,[125,625,640,680,780,825,865,895,970,1045]);
+    assert_eq!(p.sram,[780,780,780,780,780,825,865,895,970,1045]);
+    assert!(encode(p).is_ok());
+    // A J604 shape with one unequal pair matches neither layout.
+    let mut bad=s;bad.core_mv[9]+=1;bad.sram_mv[9]+=1;
+    assert_eq!(data::select(&bad),Err(perf::Error::Shape));
+}
 #[test] fn invalid_encoder_input_is_refused_without_mutating_output() {
     for variant in 0..5 {
         let mut p=tables(); match variant {0=>p.frequency[1]=0,1=>p.auxiliary[5]=p.frequency[5]+1,2=>p.voltage[9]=1101,3=>p.sram[9]=100,_=>p.frequency[0]=1};
@@ -155,7 +177,7 @@ run = subprocess.run([str(binary), '--test-threads=1'], text=True, capture_outpu
 print(run.stdout, end='')
 print(run.stderr, end='')
 run.check_returncode()
-report = {'passed': True, 'test_groups': 7, 'hardware_validated': False,
+report = {'passed': True, 'test_groups': 8, 'hardware_validated': False,
           'fixture_sha256': sha(fixture), 'original_adt_sha256': metadata['provenance']['source_sha256'],
           'production_sha256': {str(p.relative_to(root)): sha(p) for p in
               [backend / 'adt.rs', backend / 'adt/perf.rs', backend / 'board.rs', backend / 'board/data.rs', backend / 'initdata.rs', backend / 'fw/initdata.rs']}}

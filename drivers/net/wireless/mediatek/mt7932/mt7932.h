@@ -25,6 +25,7 @@
 #include "firmware.h"
 #include "calibration.h"
 #include "packet.h"
+#include "awdl.h"
 #include "scan.h"
 #include "association.h"
 #include "regulatory.h"
@@ -147,8 +148,10 @@ struct mt7932 {
 	u8 scan_seq, retired_scan_seq, scan_home_channel;
 	bool scan_finished, scan_aborted, bss_active;
 	u64 beacons;
-	unsigned long peer_alloc;
+	/* Station and security-table identities are independent host allocators. */
+	unsigned long station_alloc, wtbl_alloc, wmm_alloc;
 	struct mt7932_peer_ids peer_ids;
+	struct mt7932_awdl awdl;
 	struct cfg80211_bss *connect_bss;
 	struct work_struct connect_work, disconnect_work;
 	struct work_struct power_work;

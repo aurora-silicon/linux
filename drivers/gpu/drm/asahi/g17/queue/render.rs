@@ -526,6 +526,7 @@ impl Pair {
             fragment_status_fw_va: fragment_fw,
             aux_fb_va: auxiliary,
             timestamp_va: timestamp,
+            timestamp_window: packet.completion.window_vas(),
             ta_ids: lifecycle[0],
             fragment_ids: lifecycle[1],
             unk_2104: self.descriptor_flags[0],

@@ -1482,6 +1482,17 @@ impl TimestampVmap {
         self.0.owner().size()
     }
 
+    /// Reads the naturally aligned timestamp at byte `offset` of the GEM object.
+    pub(crate) fn read(&self, offset: usize) -> Option<u64> {
+        let end = offset.checked_add(size_of::<u64>())?;
+        if end > self.size() || offset % size_of::<u64>() != 0 {
+            return None;
+        }
+        // SAFETY: The complete aligned extent was checked above, inside this pinned vmap.
+        let source = unsafe { &*self.0.addr.cast::<u8>().add(offset).cast::<AtomicU64>() };
+        Some(u64::from_le(source.load(Ordering::Acquire)))
+    }
+
     /// Writes a timestamp at byte `offset` of the GEM object. Aligned results use a complete
     /// atomic store; byte stores support unaligned destinations without creating mutable
     /// aliases. An unaligned complete timestamp is not atomic. Out-of-range offsets are refused
@@ -3955,12 +3966,12 @@ impl Uat {
     /// and the firmware register aperture. Client mappings have their own VA.
     pub(crate) fn kernel_dynamic_range(&self) -> Range<u64> {
         let mut range = self.geometry.kernel_range();
-        range.start += if self.is_m5() {
-            0x2_0000_0000
+        if self.is_m5() {
+            range.start += 0x2_0000_0000;
+            range
         } else {
-            crate::hw::t8140::dynamic::KERNEL_OFFSET
-        };
-        range
+            crate::hw::t8140::dynamic::upper(range)
+        }
     }
 
     /// Canonical lower objects are aliased into every owning client VM.

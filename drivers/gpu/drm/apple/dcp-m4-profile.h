@@ -32,6 +32,11 @@ struct dcp_m4_profile {
 	 */
 	const u32 (*timing)[8];
 	u32 timing_elements;		/* most timing elements reported */
+	/*
+	 * D451 may also ask for an alignment that is a power of two up to a
+	 * page, besides the 4 every qualified panel firmware asks for.
+	 */
+	bool alloc_page_align;
 };
 
 static const u32 dcp_m4_timing_j713[2][8] = {
@@ -96,6 +101,7 @@ static const struct dcp_m4_profile dcp_m4_profile_j604 = {
 	.brightness_max = 1000, .brightness_default = 120,
 	.width_mm = 0, .height_mm = 0,
 	.timing = dcp_m4_timing_j604, .timing_elements = 6,
+	.alloc_page_align = true,
 };
 
 static const struct dcp_m4_profile *const dcp_m4_profiles[] = {
