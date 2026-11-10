@@ -273,6 +273,45 @@ impl Pending {
         Ok(None)
     }
 
+    /// After a cold firmware restart (hibernation resume): every closed context's release is
+    /// settled host-side, without publishing anything. The cold firmware never saw these
+    /// schedulers, so neither a published release (`Released(n)`, an index into the previous
+    /// control ring) nor a kill awaits an acknowledgement. An idle closed context is detached
+    /// now; one whose graphs are not idle yet goes back to `Draining`, so its release is
+    /// published to the new firmware once they are. Contexts that are still open (`Deferred`)
+    /// keep their entry. Returns the number of contexts detached.
+    pub(crate) fn settle_after_cold_boot(&mut self, host: &mut impl Host) -> Result<usize> {
+        let mut settled = 0;
+        let mut index = 0;
+        while index < self.entries.len() {
+            let entry = &mut self.entries[index];
+            entry.render_kill = None;
+            entry.kill_wait = None;
+            entry.announce_pending = false;
+            if entry.phase == Phase::Deferred {
+                index += 1;
+                continue;
+            }
+            let context = entry.context.clone();
+            if host.render_idle(&context)? && host.compute_idle(&context) {
+                match host.detach(&context) {
+                    Ok(()) => {
+                        self.entries.remove(index).map_err(|_| EIO)?;
+                        settled += 1;
+                        continue;
+                    }
+                    Err(EBUSY) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            let entry = &mut self.entries[index];
+            entry.phase = Phase::Draining;
+            entry.armed = super::now_ns();
+            index += 1;
+        }
+        Ok(settled)
+    }
+
     /// A render-only kill of the closed context at `index` was published.
     pub(crate) fn render_kill_published(&self, index: usize) -> bool {
         self.entries.get(index).is_some_and(|entry| entry.render_kill.is_some())

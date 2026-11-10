@@ -106,6 +106,17 @@ impl Reader {
             firmware.rings.suspend_statistics(suspended);
         }
     }
+
+    /// PM_HIBERNATION_PREPARE: drain the GPU, or refuse the hibernation.
+    pub(crate) fn freeze(&self) -> kernel::error::Result {
+        self.0.freeze_for_hibernation()
+    }
+
+    /// PM_POST_HIBERNATION: re-boot a cold firmware against the restored host session, or
+    /// resume a firmware that kept running.
+    pub(crate) fn thaw(&self) {
+        self.0.thaw_after_hibernation();
+    }
 }
 
 /// Two nominal periods is a conservative host age/window policy. The firmware

@@ -169,6 +169,33 @@ impl Host for Service<'_> {
 }
 
 impl Firmware {
+    /// Cold firmware restart: settle every closed context's scheduler release host-side
+    /// (`teardown::Pending::settle_after_cold_boot`); detached backing goes to `reclaim`.
+    pub(in crate::g17) fn settle_teardown_after_cold_boot(
+        &mut self,
+        reclaim: &mut ReclaimBatch,
+    ) -> Result<usize> {
+        let Registry {
+            admission,
+            render,
+            compute,
+            buffers,
+            teardown,
+            ..
+        } = &mut self.queues;
+        let mut service = Service {
+            render,
+            admission,
+            objects: &self.pool,
+            compute,
+            buffers,
+            init: &self.init,
+            primary: &mut self.primary,
+            reclaim,
+        };
+        teardown.settle_after_cold_boot(&mut service)
+    }
+
     /// The event worker has already reclaimed drained pairs and reannounced
     /// pending controls. Recovery blocks new releases, never an observed ack.
     pub(in crate::g17) fn service_teardown(&mut self, reclaim: &mut ReclaimBatch) -> Result {

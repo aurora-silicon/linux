@@ -169,6 +169,17 @@ impl State {
             restarts: safety::Storm::new(),
         }
     }
+    /// Returns the handshake state to [`Self::new`] for a cold-restarted firmware, whose
+    /// restart generation starts over and whose recovery words were restored to their
+    /// post-build values. A storm limit that already stopped the device is kept: `EIO`.
+    pub(super) fn reset_after_cold_boot(&mut self) -> Result {
+        self.timeouts.reset()?;
+        self.restarts.reset()?;
+        self.accepted = 0;
+        self.pending = None;
+        Ok(())
+    }
+
     pub(super) fn timeout_limit(&mut self, now: u64) -> bool {
         self.timeouts.note_unless_progress(now, safety::retired())
     }

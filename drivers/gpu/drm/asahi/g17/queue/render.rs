@@ -1928,6 +1928,126 @@ impl Pair {
         self.memory.graph.publish_recovery_targets()
     }
 
+    /// Whether a cold-restarted firmware can take this pair over as a first install
+    /// ([`Self::reset_after_cold_boot`]): idle, with nothing the previous firmware still owed
+    /// it (replay, owner-change witness, quarantine, prepared command).
+    ///
+    /// A retained binding that has retired (`ready`, waiting for `collect_retired`) or whose
+    /// replacement was never published owes nothing to the firmware: it stays for the host's
+    /// bookkeeping. `switch` is only a record (it is never cleared before a cold reset); the
+    /// owner change is in flight only while its first command is ([`Self::switch_in_flight`]).
+    pub(crate) fn cold_resettable(&self) -> bool {
+        self.cold_blockers() == 0
+    }
+
+    /// The [`Self::cold_resettable`] conditions that fail, as bits (logged by a refused
+    /// hibernation): 1 in flight or replaying, 2 prepared command, 4 quarantined, 8 terminal,
+    /// 0x10 previous binding not retired, 0x20 displaced binding not retired, 0x40 owner
+    /// change in flight.
+    pub(crate) fn cold_blockers(&self) -> u32 {
+        let mut bits = 0;
+        if self.in_flight() {
+            bits |= 1;
+        }
+        if self.prepared.is_some() {
+            bits |= 2;
+        }
+        if self.quarantined {
+            bits |= 4;
+        }
+        if self.terminal.is_some() {
+            bits |= 8;
+        }
+        if !self.previous.as_ref().is_none_or(RetiredBinding::cold_safe) {
+            bits |= 0x10;
+        }
+        if !self.displaced.as_ref().is_none_or(RetiredBinding::cold_safe) {
+            bits |= 0x20;
+        }
+        if self.switch_in_flight().is_some() {
+            bits |= 0x40;
+        }
+        bits
+    }
+
+    /// Returns an idle pair to the install state [`Self::new`] leaves, in place, for a
+    /// firmware cold-restarted against the restored graph: queue records, pointer blocks and
+    /// job list rewritten (item-ring cursors 0), the buffer manager graph rebuilt (InitBM
+    /// again), the install, registration, first-slot and context-update state of a fresh pair
+    /// and no configuration cache. The kick rings restart at [`KickTimestamp::FIRST`] with
+    /// no parent, as the cold firmware expects ([`kick::Queue::reset_render_after_cold_boot`]);
+    /// the ordinal stays monotonic (completion stamps and pass sequence numbers derive from it,
+    /// not from the kick timestamp). The caller seeds the pair's completion stamps with
+    /// [`Self::cold_stamp`], so the next command is covered and its seed names timestamp 0,
+    /// exactly as the first command of a fresh pair, and rewrites its parameter-buffer
+    /// descriptor row ([`Self::cold_descriptor`]).
+    pub(crate) fn reset_after_cold_boot(&mut self) -> Result {
+        if !self.cold_resettable() {
+            return Err(EBUSY);
+        }
+        if self.installed != [false; 2] {
+            let cursors = self.memory.graph.cursors()?;
+            for (cursor, host) in cursors.iter().zip(self.cursors) {
+                if cursor.done != cursor.read || cursor.read != cursor.write || cursor.write != host {
+                    return Err(EBUSY);
+                }
+            }
+            let qids = self.qids();
+            let context = self.memory.context.clone();
+            self.memory.graph.reset_after_cold_boot(&context, qids)?;
+            self.memory.manager.reset_after_cold_boot()?;
+        }
+        self.cursors = [0; 2];
+        self.installed = [false; 2];
+        self.registered = None;
+        self.outer_started = 0;
+        self.context_update = true;
+        self.executed = 0;
+        self.switch = None;
+        self.resync();
+        for kick in &mut self.kicks {
+            kick.reset_render_after_cold_boot()?;
+        }
+        Ok(())
+    }
+
+    /// The completion stamp both queues of this pair held after its last command: the value
+    /// the firmware writes for `ordinal`, which a restored (zero) stamp page lacks.
+    pub(crate) fn cold_stamp(&self) -> u32 {
+        crate::g17::fw::stamp_value(self.ordinal as u32)
+    }
+
+    /// Rewrites this pair's row of the parameter-buffer descriptor table (restored to its
+    /// post-build contents) for its current manager, as its installation did. No-op for a
+    /// pair whose memory was never installed.
+    pub(crate) fn cold_descriptor(&self, descriptors: &crate::g17::object::KernelObject) -> Result {
+        use core::sync::atomic::{fence, Ordering};
+        if self.memory.installed_pool.is_none() {
+            return Ok(());
+        }
+        let offset = usize::from(self.memory.manager.buffer_id()) * 16;
+        let words = [
+            descriptors.word(offset)?,
+            descriptors.word(offset + 4)?,
+            descriptors.word(offset + 8)?,
+            descriptors.word(offset + 12)?,
+        ];
+        let previous = words.map(|word| word.load(Ordering::Relaxed));
+        let pages: u32 = (self.memory.manager.blocks()
+            * crate::hw::t8140::resources::TVB_PAGES_PER_BLOCK)
+            .try_into()?;
+        let next = crate::g17::fw::buffer::reload_descriptor(
+            previous,
+            self.memory.manager.page_list_va(),
+            pages,
+        );
+        for (word, value) in words.into_iter().zip(next) {
+            word.store(value, Ordering::Relaxed);
+        }
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+
     pub(crate) fn resync(&mut self) {
         self.configs = [None; 2];
         self.published_completions = None;
@@ -2908,6 +3028,12 @@ pub(crate) struct RetiredBinding {
 impl RetiredBinding {
     pub(crate) fn wait_for_pool_release(&self) -> bool {
         self.wait_for_pool_release
+    }
+
+    /// Nothing a cold-restarted firmware could owe for it: retired and waiting for the host
+    /// to collect it, or replaced by an owner whose first command was never published.
+    pub(crate) fn cold_safe(&self) -> bool {
+        self.ready || self.publication.is_none()
     }
     pub(crate) fn context(&self) -> &Arc<Context> {
         &self.context

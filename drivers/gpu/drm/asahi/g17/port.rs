@@ -217,6 +217,35 @@ impl Port {
         Ok(())
     }
 
+    /// Whether [`Self::attach`] has run. The views name words of graph objects that are never
+    /// reallocated and the session's pinned primary mailbox, so an attached port stays valid
+    /// for a firmware re-booted against the same graph.
+    pub(super) fn attached(&self) -> bool {
+        self.views.as_ref().is_some()
+    }
+
+    /// Returns the publication state shared without the device mutex to its values at
+    /// [`Self::new`], for a firmware cold-restarted against the restored graph (whose QoS
+    /// table and work rings are back at their post-build contents). Called with the device
+    /// mutex held, preparation admission closed and drained and the GPU idle: no compute slot
+    /// reservation and no QoS charge may be outstanding (`EBUSY`).
+    pub(super) fn reset_after_cold_boot(&self) -> Result {
+        {
+            let rings = self.rings.lock();
+            if rings.iter().any(|&reserved| reserved != 0) {
+                return Err(EBUSY);
+            }
+        }
+        *self.qos.lock() = qos::Accounting::new();
+        // The receive thread's minimum utilization is applied again on the next request.
+        *self.rx_applied.lock() = None;
+        self.generation.store(0, Ordering::Release);
+        // Discard telemetry decoded from the previous firmware instance.
+        self.statistics_epoch.fetch_add(1, Ordering::Release);
+        self.set_effort_full(false);
+        Ok(())
+    }
+
     fn views(&self) -> Result<&Views> {
         self.views.as_ref().ok_or(ENODEV)
     }

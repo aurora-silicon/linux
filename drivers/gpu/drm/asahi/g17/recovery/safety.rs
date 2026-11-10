@@ -45,6 +45,14 @@ impl Storm {
     pub(super) const fn new() -> Self {
         Self { start: None, count: 0, forgiven: 0, stopped: false, progress: 0 }
     }
+    /// Starts a new window for a cold-restarted firmware. A storm that already stopped the
+    /// device stays stopped: `EIO`.
+    pub(super) fn reset(&mut self) -> kernel::error::Result {
+        if self.stopped { return Err(kernel::error::code::EIO); }
+        *self = Self::new();
+        self.progress = retired();
+        Ok(())
+    }
     /// Like [`Self::note`], but work retired since the previous event starts a new window.
     pub(super) fn note_unless_progress(&mut self, now: u64, progress: u64) -> bool {
         if !self.stopped && progress != self.progress {

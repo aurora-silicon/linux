@@ -266,6 +266,21 @@ impl QueueIds {
             .is_some_and(|entry| entry.id == id && !entry.published)
     }
 
+    /// Marks a published identity unpublished again: a cold-restarted firmware never saw it,
+    /// and the queue that holds it installs it again (or cancels it) like a fresh one.
+    pub(crate) fn unpublish(&mut self, id: Id) -> Result {
+        let entry = self
+            .entries
+            .get_mut(usize::from(id.qid))
+            .and_then(Option::as_mut)
+            .ok_or(EINVAL)?;
+        if entry.id != id {
+            return Err(EINVAL);
+        }
+        entry.published = false;
+        Ok(())
+    }
+
     pub(crate) fn cancel_unpublished(&mut self, id: Id) -> Result {
         let slot = self.entries.get_mut(usize::from(id.qid)).ok_or(EINVAL)?;
         match slot {
@@ -775,6 +790,45 @@ impl Queue {
     /// the monotonically advancing 40-bit producer.
     pub(crate) fn clear_parent_after_recovery(&mut self) {
         self.previous = None;
+    }
+
+    /// Returns a render ring to its construction state for a cold-restarted firmware,
+    /// as [`Self::reset_compute_after_cold_boot`] does for compute: zero entries, the first
+    /// timestamp and no parent. After a cold boot the firmware starts every kick queue over
+    /// at the first timestamp, as for a freshly installed queue. A queue kept at its
+    /// pre-hibernation timestamp writes a ring slot the firmware does not read next, and its
+    /// implicit parent names a completion the new firmware instance never saw (observed: the
+    /// first render after the resume timed out). The ring storage stays (its
+    /// addresses are in the restored graph and the client views).
+    pub(crate) fn reset_render_after_cold_boot(&mut self) -> Result {
+        if self.id.engine == DataMaster::Compute {
+            return Err(EINVAL);
+        }
+        let ring = self.object().pointer(0, KICK_RING_SIZE)?;
+        // SAFETY: The checked ring range stays mapped; the cold firmware has not installed
+        // this queue, so nothing reads the ring while it is cleared.
+        unsafe { ring.write_bytes(0, KICK_RING_SIZE) };
+        self.timestamp = KickTimestamp::FIRST;
+        self.previous = None;
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Returns a compute ring to its construction state for a cold-restarted firmware: zero
+    /// entries, the first timestamp and no parent, as a freshly installed queue kicks. Render
+    /// rings use [`Self::reset_render_after_cold_boot`].
+    pub(crate) fn reset_compute_after_cold_boot(&mut self) -> Result {
+        if self.id.engine != DataMaster::Compute {
+            return Err(EINVAL);
+        }
+        let ring = self.object().pointer(0, KICK_RING_SIZE)?;
+        // SAFETY: The checked ring range stays mapped; the firmware does not run kicks of
+        // this queue (it was never installed with the running firmware).
+        unsafe { ring.write_bytes(0, KICK_RING_SIZE) };
+        self.timestamp = KickTimestamp::FIRST;
+        self.previous = None;
+        fence(Ordering::SeqCst);
+        Ok(())
     }
 
     pub(crate) fn timestamp(&self) -> KickTimestamp {

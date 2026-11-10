@@ -351,6 +351,21 @@ unsafe extern "C" {
     fn asahi_clpc_gpu_get(dev: *mut core::ffi::c_void, out: *mut *mut core::ffi::c_void) -> core::ffi::c_int;
     fn asahi_clpc_gpu_set_active(gpu: *mut core::ffi::c_void, active: bool);
     fn asahi_clpc_gpu_put(gpu: *mut core::ffi::c_void);
+    fn asahi_pmp_report_wait_handed(timeout_ms: core::ffi::c_uint) -> core::ffi::c_int;
+}
+
+/// After a resume from hibernation the boot loader has cold-restarted the PMP; until it
+/// runs again and has acknowledged the power state requests the restored kernel holds for it
+/// (among them the GPU's `pmp-gfx` request), the GPU cores have no granted power state. Waits
+/// for that handover, at most `timeout_ms`; `ETIMEDOUT` if it did not happen.
+pub(super) fn wait_pmp_handover(timeout_ms: u32) -> kernel::error::Result {
+    // SAFETY: plain sleeping wait, no pointers; callable from the resume notifier.
+    let ret = unsafe { asahi_pmp_report_wait_handed(timeout_ms) };
+    if ret < 0 {
+        Err(kernel::error::Error::from_errno(ret))
+    } else {
+        Ok(())
+    }
 }
 
 /// DT-selected memory-demand provider. Its independent allocation outlives a
