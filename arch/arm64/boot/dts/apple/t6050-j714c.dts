@@ -318,6 +318,11 @@
 };
 
 &i2c3 {
+	/*
+	 * The stub's pmgr clock controller has no driver. The ADT gives i2c1, i2c2 and i2c3 the same
+	 * clock-ids (4), so i2c3 takes the reference clock as i2c1 and i2c2 do.
+	 */
+	clocks = <&clkref>;
 	status = "okay";
 
 	speaker_right_woof1: codec@3b {
