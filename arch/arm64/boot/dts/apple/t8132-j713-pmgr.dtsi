@@ -84,16 +84,22 @@
 
 &ps_dispext0_sys {
 	apple,firmware-owned;
+	/* Its coprocessor powers these three off around a deep sleep (bridge link: board DT). */
+	apple,consumer-switched;
 	status = "okay";
 };
 
 &ps_dispext0_fe {
 	apple,firmware-owned;
+	apple,consumer-switched;
 	status = "okay";
 };
 
 &ps_dispext0_cpu {
 	apple,firmware-owned;
+	apple,consumer-switched;
+	/* Power-gate retention workaround, as macOS sets it while off. */
+	apple,retention-workaround = <0x256cc 0x3 0x3>, <0x256f0 0x3 0x0>;
 	status = "okay";
 };
 
@@ -386,16 +392,22 @@
 
 &ps_dispext1_sys {
 	apple,firmware-owned;
+	/* Its coprocessor powers these three off around a deep sleep (bridge link: board DT). */
+	apple,consumer-switched;
 	status = "okay";
 };
 
 &ps_dispext1_fe {
 	apple,firmware-owned;
+	apple,consumer-switched;
 	status = "okay";
 };
 
 &ps_dispext1_cpu {
 	apple,firmware-owned;
+	apple,consumer-switched;
+	/* Power-gate retention workaround, as macOS sets it while off. */
+	apple,retention-workaround = <0x25b4c 0x3 0x3>, <0x25b70 0x3 0x0>;
 	status = "okay";
 };
 
