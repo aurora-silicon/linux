@@ -896,6 +896,14 @@ pub(crate) fn parse_lock(req: &LockRequest) -> Result<(u32, u32, u32)> {
     Ok((req.uid, req.reason, req.grace_s.min(MAX_GRACE_S)))
 }
 
+/// Whether a lock request ends the bag's grace at once. After the
+/// transition the key store keeps the bag "locking" (its class keys still
+/// usable) until the grace timer fires, so only a screen lock with a grace
+/// period may leave it there; suspend and logout lock at once.
+pub(crate) fn lock_expires_now(reason: u32, grace_s: u32) -> bool {
+    reason != LOCK_REASON_SCREEN || grace_s == 0
+}
+
 pub(crate) fn parse_change(
     req: &ChangeRequest,
 ) -> Result<(crate::sks::DesignateUser, &[u8], &[u8])> {
@@ -1326,7 +1334,7 @@ impl crate::SepData {
                 let (uid, reason, grace_s) = parse_lock(&request)?;
                 let user = crate::sks::DesignateUser::new(uid as i32).ok_or(EINVAL)?;
                 let screen = reason == LOCK_REASON_SCREEN;
-                self.userbag_lock(user, screen, screen && grace_s == 0)?;
+                self.userbag_lock(user, screen, lock_expires_now(reason, grace_s))?;
                 crate::bio::ok()
             }
             IOC_CHANGE => {
@@ -1769,6 +1777,15 @@ mod tests {
         lock.reason = LOCK_REASON_SUSPEND;
         lock.reserved = 1;
         assert!(parse_lock(&lock).is_err());
+    }
+
+    #[test]
+    fn only_a_screen_lock_with_grace_leaves_the_bag_locking() {
+        assert!(!lock_expires_now(LOCK_REASON_SCREEN, 300));
+        assert!(lock_expires_now(LOCK_REASON_SCREEN, 0));
+        assert!(lock_expires_now(LOCK_REASON_SUSPEND, 300));
+        assert!(lock_expires_now(LOCK_REASON_LOGOUT, 0));
+        assert!(lock_expires_now(LOCK_REASON_LOGOUT, 300));
     }
 
     #[test]
