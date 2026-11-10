@@ -47,6 +47,7 @@
 #include "../pci.h"
 #include "pci-host-common.h"
 #include "pcie-apple-t8140-bootstrap.h"
+#include "pcie-apple-t8122.h"
 
 static ATOMIC_NOTIFIER_HEAD(apple_pcie_tunnel_notifiers);
 
@@ -3260,17 +3261,11 @@ static int apple_msi_init(struct apple_pcie *pcie)
 				goto invalid_slice;
 			}
 		} else if (of_machine_is_compatible("apple,t8122")) {
-			aic_base = 1075;
-			switch (ecam.start) {
-			case 0x730000000ULL:
-				expected_base = 0x20;
-				break;
-			case 0xb30000000ULL:
-				expected_base = 0x40;
-				break;
-			default:
+			aic_base = APPLE_T8122_PCIEC_AIC_BASE;
+			ret = apple_t8122_msi_vector_base(ecam.start);
+			if (ret < 0)
 				goto invalid_slice;
-			}
+			expected_base = ret;
 		} else if (of_machine_is_compatible("apple,t8132")) {
 			aic_base = 1506;
 			switch (ecam.start) {
