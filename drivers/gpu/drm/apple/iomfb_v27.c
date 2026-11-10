@@ -15,18 +15,36 @@
 void iomfb_serialize_present_v27(struct dcp_swap_submit_req_v27 *wire,
 				const struct dcp_swap_submit_req_h17p *request)
 {
+	/*
+	 * The common geometry runs from swap_id through bg_color, and the tail
+	 * from surf_iova to the end of the request. Both ranges span several
+	 * fields, so copy them by offset from the start of each structure.
+	 */
+	size_t geom_dst = offsetof(struct dcp_swap_submit_req_v27, swap.swap_id);
+	size_t geom_src = offsetof(struct dcp_swap_submit_req_h17p, swap.swap_id);
+	size_t geom_size = offsetof(struct dcp_swap_v27, reserved_158) -
+			   offsetof(struct dcp_swap_v27, swap_id);
+	size_t tail_dst = offsetof(struct dcp_swap_submit_req_v27, surf_iova);
+	size_t tail_src = offsetof(struct dcp_swap_submit_req_h17p, surf_iova);
+	size_t tail_size = sizeof(*request) - tail_src;
+
+	static_assert(offsetof(struct dcp_swap_submit_req_h17p, swap.swap_id) +
+		      offsetof(struct dcp_swap_v27, reserved_158) -
+		      offsetof(struct dcp_swap_v27, swap_id) <=
+		      offsetof(struct dcp_swap_submit_req_h17p, swap) +
+		      sizeof(request->swap));
+	static_assert(sizeof(struct dcp_swap_submit_req_h17p) -
+		      offsetof(struct dcp_swap_submit_req_h17p, surf_iova) <=
+		      sizeof(struct dcp_swap_submit_req_v27) -
+		      offsetof(struct dcp_swap_submit_req_v27, surf_iova));
+
 	memset(wire, 0, sizeof(*wire));
 	memcpy(wire->swap.timestamp, request->swap.timestamp,
 	       sizeof(wire->swap.timestamp));
 	wire->swap.unk_38 = request->swap.unk_38;
-	/* The common geometry runs from swap_id through bg_color. */
-	memcpy(&wire->swap.swap_id, &request->swap.swap_id,
-	       offsetof(struct dcp_swap_v27, reserved_158) -
-	       offsetof(struct dcp_swap_v27, swap_id));
+	memcpy((u8 *)wire + geom_dst, (const u8 *)request + geom_src, geom_size);
 	memcpy(wire->surf, request->surf, sizeof(wire->surf));
-	memcpy(wire->surf_iova, request->surf_iova,
-	       sizeof(*request) -
-	       offsetof(struct dcp_swap_submit_req_h17p, surf_iova));
+	memcpy((u8 *)wire + tail_dst, (const u8 *)request + tail_src, tail_size);
 }
 
 struct dcp_h17p_hotplug_request {
