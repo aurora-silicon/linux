@@ -3313,12 +3313,11 @@ static const struct apple_nvme_hw apple_nvme_t6040_hw = {
 	 * restart, controller reset + namespace re-attach) are all generic and
 	 * already wired through this sleep_untraced state; the controller stops
 	 * ANS at the commit and raises its two ST lanes on wake
-	 * (t6040_sleep_lower/raise_apcie_st, U4). What flips a real power-loss
-	 * sleep from refused to allowed is NOT a flag here but the controller's
-	 * apple,apcie validity: with the ST-lane windows + PLL/lane tunables
-	 * absent it refuses (apple_sleep_power_loss() stays unreachable), so a dry
-	 * run is all that runs -- the flush, the quiesce and the shutdown
-	 * notification, then the controller reset as after any refusal.
+	 * (t6040_sleep_lower/raise_apcie_st). Whether a sleep cuts the power
+	 * is the controller's decision (apple_sleep_power_loss()); a dry run (2
+	 * or 3) flushes, quiesces and sends the shutdown notification at the
+	 * device suspend, as a sleep does, and resets the controller as after
+	 * any refusal.
 	 *
 	 * CC.SHN: the platform 26.7.1 on this SoC, at power state 0,
 	 * shuts NVMe down in its suspend variant:
@@ -3326,9 +3325,9 @@ static const struct apple_nvme_hw apple_nvme_t6040_hw = {
 	 * polls CSTS.SHST for complete. Flush: namespace 1 only, the OS's own; the
 	 * others belong to the firmware, as on T8140.
 	 *
-	 * TODO(HW): sleep_epmap_last_mask (the warm-restart last-epmap echo) is
-	 * unmeasured on T6040 ANS, so it is left at the rtkit default
-	 * (echo all); the first wake's warm_restart / AURA_ANS_WATCH log sets it.
+	 * sleep_epmap_last_mask stays 0, RTKit's default of echoing the whole
+	 * endpoint map on the warm restart: ANS came back with it in the J616s
+	 * S2R tests that cut the power.
 	 */
 	.sleep_untraced = true,
 	.sleep_flush_max_nsid = 1,
