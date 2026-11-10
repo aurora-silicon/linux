@@ -56,6 +56,10 @@ static void ave_6070_working_sizes_test(struct kunit *test)
 			0x30000U);
 	KUNIT_EXPECT_EQ(test, ave_6070_src_neighbor_pixel_size(1920, 1080, true),
 			0xb4000U);
+	KUNIT_EXPECT_EQ(test,
+			ave_6070_src_neighbor_data_channel_size(1920, false), 0x1a40U);
+	KUNIT_EXPECT_EQ(test,
+			ave_6070_src_neighbor_data_channel_size(1920, true), 0x100U);
 	KUNIT_EXPECT_EQ(test, ave_6070_src_neighbor_data_size(1920, false), 0x4000U);
 	KUNIT_EXPECT_EQ(test, ave_6070_src_neighbor_fw_size(1920, false), 0x4000U);
 	KUNIT_EXPECT_EQ(test, ave_6070_entropy_channel_size(1920, 1080, false),

@@ -624,6 +624,25 @@ static void ave_6070_start_process_fields(struct kunit *test)
 					sess->p.stride);
 			KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + pl->y + 12),
 					0U);
+			for (unsigned int set = 0; set < AVE_NEIGHBOUR_SETS; set++) {
+				KUNIT_EXPECT_EQ(test,
+						get_unaligned_le64(process +
+								   pl->src_neighbor_info + 8 * set),
+						sess->row_a[set].dma);
+				KUNIT_EXPECT_EQ(test,
+						get_unaligned_le64(process +
+								   pl->src_neighbor_pixel +
+								   8 * set),
+						sess->row_b[set].dma);
+				KUNIT_EXPECT_EQ(test,
+						get_unaligned_le64(process +
+								   pl->src_neighbor_data + 8 * set),
+						sess->fixed[set].dma);
+				KUNIT_EXPECT_EQ(test,
+						get_unaligned_le64(process +
+								   pl->src_neighbor_fw + 8 * set),
+						sess->neighbour_fw[set].dma);
+			}
 			KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + pl->slot), slot);
 			KUNIT_EXPECT_EQ(test, get_unaligned_le64(process + pl->coded),
 					sess->slot[slot].coded.dma);

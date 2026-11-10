@@ -231,6 +231,9 @@ struct ave_proc_layout {
 	u32 pic_size;
 	u32 first_frame;
 	u32 first_process; /* u8: first Process command since Start */
+	/* Four-entry per-picture source-neighbour address banks. */
+	u32 src_neighbor_info, src_neighbor_pixel;
+	u32 src_neighbor_data, src_neighbor_fw;
 	u32 y, uv; /* ABI-specific plane entry; 6070 is {address, stride, zero} */
 	u32 in_w, in_h;
 	u32 coded_cap;

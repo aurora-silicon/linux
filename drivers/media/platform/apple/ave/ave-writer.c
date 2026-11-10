@@ -724,6 +724,18 @@ int ave_build_process(struct ave_ctx *ctx, u8 *cmd, size_t len,
 		  fw->kind == AVE_LAYOUT_6070 ? 0 : p->stride);
 	ave_put32(cmd, l->in_w, p->width);
 	ave_put32(cmd, l->in_h, p->height);
+	if (l->src_neighbor_data) {
+		for (unsigned int set = 0; set < AVE_NEIGHBOUR_SETS; set++) {
+			ave_put64(cmd, l->src_neighbor_info + set * sizeof(u64),
+				  sess->row_a[set].dma);
+			ave_put64(cmd, l->src_neighbor_pixel + set * sizeof(u64),
+				  sess->row_b[set].dma);
+			ave_put64(cmd, l->src_neighbor_data + set * sizeof(u64),
+				  sess->fixed[set].dma);
+			ave_put64(cmd, l->src_neighbor_fw + set * sizeof(u64),
+				  sess->neighbour_fw[set].dma);
+		}
+	}
 
 	/* Session values repeated in every frame */
 	ave_put32(cmd, l->coded_cap, p->coded_cap);

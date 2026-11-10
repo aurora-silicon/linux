@@ -66,9 +66,18 @@ static inline u32 ave_6070_src_neighbor_pixel_size(u32 width, u32 height,
 	return ALIGN(max_t(u32, raw, SZ_16K), SZ_16K);
 }
 
+/* Active bytes in the transcode neighbour-data channel, before page rounding. */
+static inline u32 ave_6070_src_neighbor_data_channel_size(u32 width, bool hevc)
+{
+	if (hevc)
+		return ALIGN(ALIGN(width, 32) / 8, 128);
+
+	return ALIGN(56 * DIV_ROUND_UP(width, 16), 64);
+}
+
 static inline u32 ave_6070_src_neighbor_data_size(u32 width, bool hevc)
 {
-	u32 raw = hevc ? ALIGN(width, 32) / 8 : 56 * DIV_ROUND_UP(width, 16);
+	u32 raw = ave_6070_src_neighbor_data_channel_size(width, hevc);
 
 	return ALIGN(max_t(u32, raw, SZ_16K), SZ_16K);
 }
