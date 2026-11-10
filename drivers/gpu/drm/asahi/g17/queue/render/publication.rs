@@ -6,7 +6,7 @@
 use super::{memory, retirement::Window};
 use crate::g17::fw::{
     kick::KickTimestamp,
-    queue::{DataMaster, KickAnnounce, QueueConfig, ITEM_RING_ENTRIES},
+    queue::{DataMaster, KickAnnounce, KickPredecessor, QueueConfig, ITEM_RING_ENTRIES},
 };
 use core::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 use kernel::prelude::*;
@@ -27,16 +27,25 @@ pub(in crate::g17::queue) fn required(previous: Option<QueueConfig>, config: Que
         || previous.map(identity) != Some(identity(config))
 }
 
+const fn item_layout(present: bool, lead: bool, predecessor: bool) -> (u32, usize) {
+    let count = 2 + present as u32 + lead as u32 + predecessor as u32;
+    let prefix = count as usize - 1 - predecessor as usize;
+    (count, prefix)
+}
+
 pub(super) struct Lane<'a> {
-    items: [&'a AtomicU64; 4],
+    items: [&'a AtomicU64; 5],
     producer: &'a AtomicU32,
-    values: [u64; 4],
+    values: [u64; 5],
     config: QueueConfig,
     config_destination: *mut u64,
     config_present: bool,
     announce: KickAnnounce,
     announce_destination: *mut KickAnnounce,
+    predecessor: Option<KickPredecessor>,
+    predecessor_destination: *mut KickPredecessor,
     prefix: usize,
+    item_count: usize,
     prefix_end: u32,
     pub(super) window: Window,
 }
@@ -54,8 +63,9 @@ impl<'a> Lane<'a> {
         present: bool,
         timestamp: KickTimestamp,
         lead: bool,
+        predecessor: Option<KickPredecessor>,
     ) -> Result<Self> {
-        let count = 2 + u32::from(present) + u32::from(lead);
+        let (count, prefix) = item_layout(present, lead, predecessor.is_some());
         let window = Window::new(base, count, ITEM_RING_ENTRIES)?;
         let offset = ordinal as usize % memory::RECORDS;
         let config_offset = memory::CONFIG[stage] + offset * memory::CONFIG_STRIDE;
@@ -71,6 +81,11 @@ impl<'a> Lane<'a> {
             .queues
             .pointer(announce_offset, size_of::<KickAnnounce>())?
             .cast::<KickAnnounce>();
+        let predecessor_offset = config_offset + memory::PREDECESSOR;
+        let predecessor_destination = graph
+            .config
+            .pointer(predecessor_offset, size_of::<KickPredecessor>())?
+            .cast::<KickPredecessor>();
         let index =
             |delta: u32| memory::ITEMS[stage] + ((base + delta) % ITEM_RING_ENTRIES) as usize * 8;
         let items = [
@@ -78,11 +93,13 @@ impl<'a> Lane<'a> {
             graph.queues.dword(index(1))?,
             graph.queues.dword(index(2))?,
             graph.queues.dword(index(3))?,
+            graph.queues.dword(index(4))?,
         ];
         let announce_va = graph.queues.gpu_va() + announce_offset as u64;
         let descriptor = graph.descriptor_va(stage, ordinal);
-        // Item order: [lead command], descriptor, [configuration], announcement.
-        let mut values = [0; 4];
+        // Item order: [lead command], descriptor, [configuration], announcement,
+        // [predecessor]. The optional final record is published with the announcement.
+        let mut values = [0; 5];
         let mut n = 0;
         let mut push = |value: u64| {
             values[n] = value;
@@ -96,6 +113,9 @@ impl<'a> Lane<'a> {
             push(graph.config.gpu_va() + config_offset as u64);
         }
         push(announce_va);
+        if predecessor.is_some() {
+            push(graph.config.gpu_va() + predecessor_offset as u64);
+        }
         Ok(Self {
             items,
             producer: graph
@@ -116,8 +136,11 @@ impl<'a> Lane<'a> {
                 config.priority as u8,
             )?,
             announce_destination,
-            prefix: count as usize - 1,
-            prefix_end: (base + count - 1) % ITEM_RING_ENTRIES,
+            predecessor,
+            predecessor_destination,
+            prefix,
+            item_count: count as usize,
+            prefix_end: (base + count - 1 - u32::from(predecessor.is_some())) % ITEM_RING_ENTRIES,
             window,
         })
     }
@@ -149,6 +172,12 @@ impl<'a> Lane<'a> {
             self.announce_destination.write_unaligned(self.announce);
         }
     }
+    fn predecessor(&self) {
+        let Some(predecessor) = self.predecessor else { return };
+        // SAFETY: The record is inside the retained per-ordinal configuration
+        // slot and no firmware pointer names it before publication.
+        unsafe { self.predecessor_destination.write_unaligned(predecessor); }
+    }
     pub(super) fn publish_prefix(&self) {
         self.items(0..self.prefix);
         self.config();
@@ -157,7 +186,8 @@ impl<'a> Lane<'a> {
     }
     pub(super) fn publish_kick(&self) {
         self.announce();
-        self.items(self.prefix..self.prefix + 1);
+        self.predecessor();
+        self.items(self.prefix..self.item_count);
         fence(Ordering::SeqCst);
         self.producer.store(self.window.target(), Ordering::Relaxed);
     }
@@ -168,12 +198,41 @@ impl<'a> Lane<'a> {
         inner: &AtomicU32,
         next_inner: u32,
     ) {
-        self.items(0..self.prefix + 1);
+        self.items(0..self.item_count);
         self.config();
         self.announce();
+        self.predecessor();
         fence(Ordering::SeqCst);
         self.producer.store(self.window.target(), Ordering::Relaxed);
         event_slot.store(next_slot, Ordering::Relaxed);
         inner.store(next_inner, Ordering::Relaxed);
+    }
+}
+
+#[kernel::macros::kunit_tests(asahi_g16_per_record_render_publication)]
+mod tests {
+    use super::item_layout;
+
+    #[test]
+    fn default_layout_is_unchanged() {
+        for present in [false, true] {
+            for lead in [false, true] {
+                let old_count = 2 + present as u32 + lead as u32;
+                assert_eq!(item_layout(present, lead, false),
+                           (old_count, old_count as usize - 1));
+            }
+        }
+    }
+
+    #[test]
+    fn predecessor_extends_only_the_kick_suffix() {
+        for present in [false, true] {
+            for lead in [false, true] {
+                let plain = item_layout(present, lead, false);
+                let exact = item_layout(present, lead, true);
+                assert_eq!(exact.0, plain.0 + 1);
+                assert_eq!(exact.1, plain.1);
+            }
+        }
     }
 }

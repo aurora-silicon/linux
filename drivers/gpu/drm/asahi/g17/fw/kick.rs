@@ -37,6 +37,49 @@ pub(crate) const QID_MAX: u8 = 0x7f;
 /// Highest UAT context ID.
 pub(crate) const CONTEXT_MAX: u8 = 0x3f;
 
+const G16_EVENT_CONTEXTS: u16 = CONTEXT_MAX as u16 + 1;
+const G16_DYNAMIC_EVENTS: u16 = 192;
+const G16_EVENT_ENTRY_SIGNAL: u16 = 254;
+
+fn set_event(mask: &mut [u64; 4], event: u16) {
+    mask[usize::from(event / 64)] |= 1u64 << (event % 64);
+}
+
+/// Replaces the fixed compute event with the context/priority event selected
+/// by the 25G83 queue ABI. An explicit predecessor also selects the matching
+/// entry-signal event. Disabled calls preserve the production mask exactly.
+pub(crate) fn g16_compute_event_mask(
+    current: [u64; 4], context: u8, priority: u8, entry_signal: bool, enabled: bool,
+) -> [u64; 4] {
+    if !enabled {
+        return current;
+    }
+    let mut mask = [0; 4];
+    let event = u16::from(context).checked_add(u16::from(priority) * G16_EVENT_CONTEXTS);
+    if let Some(event) = event.filter(|event| *event < G16_DYNAMIC_EVENTS) {
+        set_event(&mut mask, event);
+    }
+    if entry_signal {
+        set_event(&mut mask, G16_EVENT_ENTRY_SIGNAL);
+    }
+    mask
+}
+
+/// Adds the entry-signal event exactly when a matching predecessor record is
+/// published. Disabled calls preserve the production render mask exactly.
+pub(crate) fn g16_render_event_mask(
+    current: [u64; 4], entry_signal: bool, enabled: bool,
+) -> [u64; 4] {
+    if !enabled {
+        return current;
+    }
+    let mut mask = [0; 4];
+    if entry_signal {
+        set_event(&mut mask, G16_EVENT_ENTRY_SIGNAL);
+    }
+    mask
+}
+
 const KICK_TIMESTAMP_BITS: u32 = 40;
 const KICK_TIMESTAMP_MASK: u64 = (1 << KICK_TIMESTAMP_BITS) - 1;
 const KICK_SLOT_MASK: u64 = KICK_SLOTS as u64 - 1;
@@ -504,6 +547,32 @@ impl KickEntry {
             unk_178: Self::UNK_178,
             pad_180: [0; KICK_ENTRY_STRIDE - 0x180],
         })
+    }
+}
+
+#[kernel::macros::kunit_tests(asahi_g16_per_record_events)]
+mod g16_per_record_event_tests {
+    use super::{g16_compute_event_mask, g16_render_event_mask};
+
+    #[test]
+    fn disabled_is_byte_identical() {
+        let current = [1, 2, 3, 4];
+        assert_eq!(g16_compute_event_mask(current, 7, 2, true, false), current);
+        assert_eq!(g16_render_event_mask(current, true, false), current);
+    }
+
+    #[test]
+    fn compute_event_tracks_context_and_priority() {
+        assert_eq!(g16_compute_event_mask([0, 0, 4, 0], 2, 2, false, true), [0, 0, 4, 0]);
+        assert_eq!(g16_compute_event_mask([0, 0, 4, 0], 7, 2, true, true),
+                   [0, 0, 1 << 7, 1 << 62]);
+        assert_eq!(g16_compute_event_mask([0; 4], 0, 3, false, true), [0; 4]);
+    }
+
+    #[test]
+    fn render_entry_signal_is_paired() {
+        assert_eq!(g16_render_event_mask([0; 4], false, true), [0; 4]);
+        assert_eq!(g16_render_event_mask([0; 4], true, true), [0, 0, 0, 1 << 62]);
     }
 }
 

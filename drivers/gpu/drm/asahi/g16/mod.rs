@@ -59,7 +59,7 @@ pub(crate) mod hw;
 mod initdata;
 mod job;
 mod object;
-mod params;
+pub(crate) mod params;
 mod poll;
 mod pools;
 mod power;

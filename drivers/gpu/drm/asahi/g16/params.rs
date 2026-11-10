@@ -48,6 +48,56 @@ pub(crate) fn stream_gate() -> bool {
     module_parameters::g16_stream_gate.value() != 0
 }
 
+/// Validated selector for the 25G83 per-record comparison. Unknown values
+/// retain the production records.
+pub(crate) const fn per_record_selector(value: u32) -> u32 {
+    match value {
+        1..=3 => value,
+        _ => 0,
+    }
+}
+
+/// Whether compute kicks use their context/priority event and matching entry
+/// signal instead of the production fixed event.
+pub(crate) fn per_record_compute() -> bool {
+    matches!(per_record_selector(module_parameters::g16_per_record_arm.value()), 1 | 3)
+}
+
+/// Whether render kicks with explicit predecessor state carry the matching
+/// entry-signal event and tag-16 record.
+pub(crate) fn per_record_render() -> bool {
+    matches!(per_record_selector(module_parameters::g16_per_record_arm.value()), 2 | 3)
+}
+
+#[kernel::macros::kunit_tests(asahi_g16_per_record_arm)]
+mod per_record_tests {
+    use super::per_record_selector;
+
+    const fn compute(value: u32) -> bool {
+        matches!(per_record_selector(value), 1 | 3)
+    }
+
+    const fn render(value: u32) -> bool {
+        matches!(per_record_selector(value), 2 | 3)
+    }
+
+    #[test]
+    fn default_and_invalid_are_production() {
+        assert_eq!(per_record_selector(0), 0);
+        assert_eq!(per_record_selector(4), 0);
+        assert_eq!(per_record_selector(u32::MAX), 0);
+        assert!(!compute(0));
+        assert!(!render(0));
+    }
+
+    #[test]
+    fn arms_are_isolated() {
+        assert!(compute(1) && !render(1));
+        assert!(!compute(2) && render(2));
+        assert!(compute(3) && render(3));
+    }
+}
+
 /// Fragment-only dependency publication has not been qualified on this backend.
 pub(crate) fn early_tiling() -> bool {
     false
