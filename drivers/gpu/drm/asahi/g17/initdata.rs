@@ -205,6 +205,9 @@ pub(super) struct InitData {
     compute_scheduler: Option<ComputeScheduler>,
     compute_active: core::cell::Cell<bool>,
     event_ring_checked: [core::cell::Cell<(u64, u64, u32)>; 2],
+    /// M5: the submission-history geometry (period, slot count) read under the firmware's
+    /// generation, with that generation.
+    history_geometry: core::cell::Cell<Option<(u32, u64, u64)>>,
     /// Completion-ring objects; a family sets only the rings it has.
     completion_rings: [Option<usize>; 4],
     stamps: [usize; 2],
@@ -308,6 +311,7 @@ impl InitData {
             compute_scheduler: None,
             compute_active: core::cell::Cell::new(false),
             event_ring_checked: [const { core::cell::Cell::new((0, 0, 0)) }; 2],
+            history_geometry: core::cell::Cell::new(None),
             completion_rings: [None; 4],
             stamps: [0; 2],
             render_pages: None,
@@ -1966,6 +1970,8 @@ impl super::recovery::Memory for InitData {
     }
 
     fn transition(&self, expected: u32, next: u32) -> Result {
+        // A restarted firmware may lay its submission history out anew.
+        self.history_geometry.set(None);
         let state = self
             .object(self.cluster)?
             .word(self.recovery_state_offset())?;

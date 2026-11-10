@@ -55,13 +55,22 @@ impl InitData {
         for _ in 0..64 {
             let generation = private.word(base + 0x74c)?.load(Ordering::Acquire);
             if generation & 1 != 0 { core::hint::spin_loop(); continue; }
-            let config = private.read_words::<4>(base + 0x73c)?;
-            fence(Ordering::Acquire);
-            if generation != private.word(base + 0x74c)?.load(Ordering::Acquire) {
-                core::hint::spin_loop(); continue;
-            }
-            let period = u64::from(config[0]) | u64::from(config[1]) << 32;
-            let count = u64::from(config[2]) | u64::from(config[3]) << 32;
+            // The firmware moves the generation around every change of the geometry: while it
+            // reads as it did, the geometry read under it stands, without four more loads.
+            let (period, count) = match self.history_geometry.get() {
+                Some((seen, period, count)) if seen == generation => (period, count),
+                _ => {
+                    let config = private.read_words::<4>(base + 0x73c)?;
+                    fence(Ordering::Acquire);
+                    if generation != private.word(base + 0x74c)?.load(Ordering::Acquire) {
+                        core::hint::spin_loop(); continue;
+                    }
+                    let period = u64::from(config[0]) | u64::from(config[1]) << 32;
+                    let count = u64::from(config[2]) | u64::from(config[3]) << 32;
+                    self.history_geometry.set(Some((generation, period, count)));
+                    (period, count)
+                }
+            };
             if period == 0 || count == 0 || count > 256 { return Err(EINVAL); }
             let (counter, frequency) = crate::g17::qos::clock();
             let ticks = crate::g17::qos::time_from_host(counter, frequency)?;
