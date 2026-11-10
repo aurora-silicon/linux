@@ -399,29 +399,40 @@ pub(crate) trait ListFile {
     fn sync_parent(&self) -> Result<()>;
 }
 
-impl ListFile for StoreFile {
+/// Linux's list at [`OWNED_PATH`], opened for each access and closed again.
+///
+/// The guard lives as long as the xART store, which the driver keeps until it
+/// is unbound, and nothing unbinds it before a reboot. Holding the list open
+/// for writing that long keeps a writer on the root file system, so the
+/// read-only remount of `/` at shutdown fails with EBUSY. Writes never create
+/// the file: only [`Guard::open`] does that.
+pub(crate) struct HostListFile;
+
+impl ListFile for HostListFile {
     fn size(&self) -> Result<u64> {
-        StoreFile::size(self)
+        StoreFile::open_readonly(OWNED_PATH)?.size()
     }
 
     fn read_exact(&self, off: u64, buf: &mut [u8]) -> Result<()> {
-        StoreFile::read_exact(self, off, buf)
+        StoreFile::open_readonly(OWNED_PATH)?.read_exact(off, buf)
     }
 
     fn write_all(&self, off: u64, buf: &[u8]) -> Result<()> {
-        StoreFile::write_all(self, off, buf)
+        StoreFile::open_writable_existing(OWNED_PATH)?.write_all(off, buf)
     }
 
+    // fsync on a new descriptor still flushes the writes made through earlier
+    // ones, and reports a writeback error that no descriptor has seen yet.
     fn sync(&self) -> Result<()> {
-        StoreFile::sync(self)
+        StoreFile::open_readonly(OWNED_PATH)?.sync()
     }
 
     fn sync_parent(&self) -> Result<()> {
-        StoreFile::sync_parent(self)
+        StoreFile::open_readonly(OWNED_PATH)?.sync_parent()
     }
 }
 
-pub(crate) struct Guard<F: ListFile = StoreFile> {
+pub(crate) struct Guard<F: ListFile = HostListFile> {
     level: u8,
     /// `None` when the list could not be opened: nothing can be adopted, so
     /// every session write that is not already listed is refused.
@@ -452,7 +463,8 @@ impl Guard {
         let mut guard = Guard::with_file(
             level,
             existing,
-            StoreFile::open_host(OWNED_PATH).map(|(file, _created)| file),
+            // Only to create the list if absent; the handle closes here.
+            StoreFile::open_host(OWNED_PATH).map(|_| HostListFile),
         );
         guard.allowance = take_allowance();
         guard
