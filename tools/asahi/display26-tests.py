@@ -130,7 +130,8 @@ int main(void) {
 #define dev_warn(...) ((void)0)
 #define dev_dbg(...) ((void)0)
 #define dev_err_probe(d, e, ...) (e)
-#define dev_info(...) ((void)0)
+/* Takes its arguments, so that a value that is only logged counts as used. */
+static inline void dev_info(const void *dev, const char *fmt, ...) {}
 #include <linux/errno.h>
 #define __iomem
 #include <string.h>
