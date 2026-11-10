@@ -44,6 +44,8 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	IOMFB_METHOD("A469", iomfbep_abort_swaps_dcp),
 	IOMFB_METHOD("A473", dcpep_set_power_state),
 	IOMFB_METHOD("A474", dcpep_pipe_query_474),
+	/* Unnamed; macOS sends it after A473(0), before the RTKit sleep. */
+	IOMFB_METHOD("A500", dcpep_unnamed_500),
 	/* A364 get_mode_info and A420/A421 gamma: see iomfb_template.c */
 };
 

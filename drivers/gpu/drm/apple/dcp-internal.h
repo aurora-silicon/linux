@@ -678,6 +678,13 @@ struct apple_dcp {
 	/* A firmware-driven suspend stops the firmware, see dcp_s2r_suspend(). */
 	bool s2r_active;
 	bool s2r_stopped;
+	/* T6040 suspend-to-RAM stopped the desktop firmware, see dcp_t6041_s2r_stop(). */
+	bool t6041_s2r_stopped;
+	/* T6040 S2R: the CPU power word's 11 children as the stop found them. */
+	u32 s2r_child_saved[11];
+	bool s2r_child_valid;
+	/* A T6040 S2R wake reuses hib_restore_work for the internal cold restart. */
+	bool s2r_cold_restart;
 	/* DPMS off stopped the firmware and lowered the domains; DPMS on brings them back. */
 	bool dpms_powered_off;
 	/* Refused its idle with the display off: the firmware still runs, the display is dark. */
@@ -965,6 +972,17 @@ struct apple_dcp {
 	struct delayed_work link_recovery_wq;
 	unsigned int link_recovery_tries;
 	unsigned int link_recovery_snap;
+	/*
+	 * Kernel retrains of an active CRTC from the hotplug worker in the
+	 * current window (dcp_hotplug_retrain_allowed()): a sink that answers
+	 * every retrain with IRQ_HPD would otherwise loop forever.
+	 */
+	unsigned long hotplug_retrain_since;
+	unsigned long hotplug_disconnect_at;
+	unsigned int hotplug_retrains;
+	bool hotplug_retrain_stopped;
+	/* One retrain at the end of a stopped window, see dcp_hotplug(). */
+	struct delayed_work hotplug_retrain_retry_wq;
 	atomic_t modesets_done;
 	unsigned long hdmi_edge_jiffies;
 	bool hdmi_edge_seen;
@@ -988,11 +1006,79 @@ struct apple_dcp {
 	unsigned int tb_hpd_count;
 	ktime_t tb_irq_hpd_last;
 
+	/*
+	 * Resume from disk (desktop 26.x panel and dcpext), see
+	 * dcp_platform_restore():
+	 * the IOMFB shared-memory iova, given again to the restarted firmware;
+	 * the restore phase; RTKit receive held since freeze; the
+	 * PM_POST_HIBERNATION notifier and the work that restarts the firmware.
+	 */
+	dma_addr_t shmem_iova;
+	int hib_phase;
+	bool hib_rx_held;
+	bool hib_poweroff_entered;
+	bool hib_nb_registered;
+	/*
+	 * External processors (dcpext): link work and the HDMI HPD interrupt
+	 * stopped, the link and DP PHYs released, from hibernation prepare
+	 * until PM_POST_HIBERNATION replays the link; this
+	 * processor still counted in the restart's firmware-start and
+	 * idle-pipe barriers (see dcp_hib_ext_restore()).
+	 */
+	bool hib_typec_disabled;
+	bool hib_irq_disabled;
+	/* The fixed (HDMI) DP PHY given back at prepare, see dcp.c. */
+	bool hib_fixed_phy_off;
+	/* Link work stopped and the link released at hibernation prepare. */
+	bool hib_link_released;
+	bool hib_ext_start_pending;
+	bool hib_ext_idle_pending;
+	struct notifier_block hib_nb;
+	struct work_struct hib_restore_work;
+
 	/* Kept last: the template instances share the layout above. */
 	struct dcp_desktop_state *desktop;
 	/* Internal panel identity; NULL without an internal panel. */
 	struct dcp_panel_identity *panel_identity;
 };
+
+/*
+ * Resume-from-disk restart of the desktop 26.x panel's firmware.
+ * QUIESCED: the old session is dropped on the host side, nothing goes to the
+ * firmware; RESTARTING: the restart work talks to the new firmware, the DRM
+ * entry points still do not; FAILED: as QUIESCED, until the reboot.
+ */
+enum dcp_hib_phase {
+	DCP_HIB_NONE = 0,
+	DCP_HIB_QUIESCED,
+	DCP_HIB_RESTARTING,
+	DCP_HIB_FAILED,
+};
+
+/* The DRM and backlight entry points leave the firmware alone. */
+static inline bool dcp_hib_gated(const struct apple_dcp *dcp)
+{
+	return IS_ENABLED(CONFIG_HIBERNATION) &&
+	       READ_ONCE(dcp->hib_phase) != DCP_HIB_NONE;
+}
+
+/* No message goes to or comes from the firmware at all. */
+static inline bool dcp_hib_tx_gated(const struct apple_dcp *dcp)
+{
+	int phase = READ_ONCE(dcp->hib_phase);
+
+	return IS_ENABLED(CONFIG_HIBERNATION) &&
+	       (phase == DCP_HIB_QUIESCED || phase == DCP_HIB_FAILED);
+}
+
+/* The restart of the last resume from disk has not finished yet. */
+static inline bool dcp_hib_busy(const struct apple_dcp *dcp)
+{
+	int phase = READ_ONCE(dcp->hib_phase);
+
+	return IS_ENABLED(CONFIG_HIBERNATION) &&
+	       (phase == DCP_HIB_QUIESCED || phase == DCP_HIB_RESTARTING);
+}
 
 /* T8132 firmware uses its own wire codec, with the common DRM/KMS owner. */
 static inline bool iomfb_is_m4(const struct apple_dcp *dcp)
@@ -1062,6 +1148,7 @@ bool dcp_external_hotplug(struct apple_dcp *dcp, bool connected);
 void dcp_announce_arm(struct apple_dcp *dcp);
 void dcp_announce_work(struct work_struct *work);
 void dcp_external_crtc_released(struct apple_dcp *dcp);
+bool dcp_external_has_sink(struct apple_dcp *dcp);
 void dcp_external_link_fault(struct apple_dcp *dcp);
 irqreturn_t dcp_desktop_dp2hdmi_hpd(struct apple_dcp *dcp);
 
