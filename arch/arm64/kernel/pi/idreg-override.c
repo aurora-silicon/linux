@@ -12,7 +12,6 @@
 
 #include <asm/cacheflush.h>
 #include <asm/cpufeature.h>
-#include <asm/cputype.h>
 #include <asm/setup.h>
 
 #include "pi.h"
@@ -457,13 +456,6 @@ void __init init_feature_override(u64 boot_status, const void *fdt,
 	__boot_status = boot_status;
 
 	parse_cmdline(fdt, chosen);
-
-	/*
-	 * Timed waits bypass the register-saving idle path on Apple M4+ cores.
-	 * Apply this after boot arguments so they cannot re-enable WFxT.
-	 */
-	if (IS_ENABLED(CONFIG_ARCH_APPLE) && midr_is_apple_m4_or_later(read_cpuid_id()))
-		__parse_cmdline("id_aa64isar2.wfxt=0", false);
 
 	for (i = 0; i < ARRAY_SIZE(regs); i++) {
 		reg = prel64_pointer(regs[i].reg);
