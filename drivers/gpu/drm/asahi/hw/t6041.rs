@@ -141,10 +141,12 @@ pub(super) const BUILD_25G83: fw::variant::Build = fw::variant::Build {
     config: None,
 };
 
-/// The 40-core M4 Max on 25G83: the 25F84 configuration with the 25G83 register map.
+/// The 40-core M4 Max on 25G83: the 25F84 configuration with the 25G83 register map and
+/// [`CHIP_25G83`].
 const CONFIG_25G83: Config = Config {
     windows: &REGISTER_WINDOWS_25G83,
     reserved_slots: &[],
+    chip: Some(&CHIP_25G83),
     firmware: fw::variant::Firmware::Identified(&[BUILD_25G83]),
     ..BASE
 };
@@ -313,6 +315,22 @@ const CHIP: v25g83::Chip = v25g83::Chip {
     power_config_words: POWER_CONFIG_WORDS,
     perf_a_replicate_lanes: true,
     cs_perf_table: false,
+};
+
+/// [`CHIP`] for 25G83: its hardware data has 0 at `+0x2610`.
+///
+/// 25F84 runs with 1 there. On 25G83 the 40-core J614C then accepts work and marks it done,
+/// but the GPU never runs it: no completion, no fault, every job times out. With 0, which is
+/// also what the J616C's 25G83 contents have, compute and render work run.
+const CHIP_25G83: v25g83::Chip = v25g83::Chip {
+    hw_data_words: HW_DATA_WORDS_25G83,
+    ..CHIP
+};
+
+/// [`HW_DATA_WORDS`] without its last word, `+0x2610 = 1`.
+const HW_DATA_WORDS_25G83: &[(usize, u32, usize)] = match HW_DATA_WORDS.split_last() {
+    Some((&(0x2610, 1, 1), rest)) => rest,
+    _ => panic!("the last T6041 hardware data word must be +0x2610"),
 };
 
 const HW_DATA_WORDS: &[(usize, u32, usize)] = &[
