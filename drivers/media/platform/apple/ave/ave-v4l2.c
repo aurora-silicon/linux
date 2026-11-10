@@ -1087,7 +1087,7 @@ static int ave_encode_one(struct ave_ctx *ctx)
 	ret = ave_sess_input(ctx, slot, src, &input);
 	if (!ret)
 		ret = ave_cmd_process(ctx, slot, src, input, READ_ONCE(ctx->bitrate),
-				      xchg(&ctx->force_key_frame, false));
+				      xchg(&ctx->force_key_frame, false), last);
 	if (ret) {
 		v4l2_m2m_buf_done(src, VB2_BUF_STATE_ERROR);
 		return ret;

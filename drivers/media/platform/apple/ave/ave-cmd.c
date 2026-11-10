@@ -175,7 +175,7 @@ int ave_cmd_start(struct ave_ctx *ctx)
 
 int ave_cmd_process(struct ave_ctx *ctx, unsigned int slot,
 		    struct vb2_v4l2_buffer *src, dma_addr_t input, u32 bitrate,
-		    bool force_key)
+		    bool force_key, bool last)
 {
 	struct ave_dev *ave = ctx->ave;
 	struct ave_session *sess = ctx->sess;
@@ -199,7 +199,8 @@ int ave_cmd_process(struct ave_ctx *ctx, unsigned int slot,
 	cmd = ave_ipc_cmd(ave, buf, len);
 	if (!cmd)
 		return -EBUSY;
-	ret = ave_build_process(ctx, cmd, len, slot, input, bitrate, force_key);
+	ret = ave_build_process(ctx, cmd, len, slot, input, bitrate, force_key,
+				last);
 	if (ret)
 		return ret;
 	if (!sess->frames)
