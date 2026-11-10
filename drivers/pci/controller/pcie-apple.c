@@ -475,11 +475,23 @@ static const struct hw_info t6050_pciec_hw = {
 
 static const struct of_device_id apple_pcie_of_match[];
 
+static bool tunnel_kernel_init = true;
+module_param(tunnel_kernel_init, bool, 0444);
+MODULE_PARM_DESC(tunnel_kernel_init,
+		 "Cold-initialize T600x/T602x PCIe-C ports that the DT does not mark (default: on)");
+
+static const char *const apple_pcie_tunnel_cold_init_machines[] = {
+	"apple,t6000", "apple,t6001", "apple,t6020", "apple,t6021", NULL
+};
+
 /**
  * apple_pcie_tunnel_needs_cold_init() - whether the kernel brings up a port
  * @np: PCIe-C host node
  *
  * DT selects kernel initialization; match data selects the hardware sequence.
+ * m1n1 hands every installed kernel the same DT and does not set
+ * apple,pciec-kernel-init on T600x/T602x, so those machines select it here;
+ * pcie_apple.tunnel_kernel_init=0 turns that off.
  * Never reset a qualified firmware handoff. Intr2AXI controllers also need
  * DART tunables before ACIO may populate their cable-powered children.
  */
@@ -491,7 +503,12 @@ bool apple_pcie_tunnel_needs_cold_init(struct device_node *np)
 	bool tunables;
 	u32 status;
 
-	if (!match || !of_property_read_bool(np, "apple,pciec-kernel-init"))
+	if (!match)
+		return false;
+	if (!of_property_read_bool(np, "apple,pciec-kernel-init") &&
+	    !(tunnel_kernel_init &&
+	      of_device_is_compatible(np, "apple,t6000-pciec") &&
+	      of_machine_compatible_match(apple_pcie_tunnel_cold_init_machines)))
 		return false;
 	hw = match->data;
 	if (!hw->tunneled)
