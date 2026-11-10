@@ -13,6 +13,7 @@
 
 /dts-v1/;
 
+#include <dt-bindings/leds/common.h>
 #include "t6050-max.dtsi"
 
 /* The console on the USB debug link: ADT dockchannel-uart, channel 1 */
@@ -137,6 +138,79 @@
 &pinctrl_ap {
 	gpio-reserved-ranges = <0 80>, <81 140>;
 };
+
+/* The keyboard backlight: ADT pwm0/kbd-backlight, channel 0 at 25 kHz */
+/ {
+	aliases {
+		/* The loader fills the keyboard layout from the ADT's keyboard node */
+		keyboard = &keyboard;
+	};
+
+	led-controller {
+		compatible = "pwm-leds";
+
+		led-0 {
+			pwms = <&fpwm0 0 40000>;
+			label = "kbd_backlight";
+			function = LED_FUNCTION_KBD_BACKLIGHT;
+			color = <LED_COLOR_ID_WHITE>;
+			max-brightness = <255>;
+			default-state = "keep";
+		};
+	};
+};
+
+&fpwm0 {
+	status = "okay";
+};
+
+/*
+ * The keyboard and trackpad: the HID transport on the MTP's DockChannel FIFO
+ * (ADT dockchannel-mtp/mtp-transport: multi-touch, keyboard, stm, actuator,
+ * tp-accel), as on J716s.
+ */
+&mtp_dockchannel {
+	mtp_hid: input@8000 {
+		compatible = "apple,dockchannel-hid";
+		reg = <0x8000 0x1000>, <0xc000 0x1000>,
+		      <0x0 0x1000>, <0x4000 0x1000>;
+		reg-names = "config", "data", "rmt-config", "rmt-data";
+		iommus = <&mtp_dart 0>;
+		interrupt-parent = <&mtp_dockchannel>;
+		interrupts = <2 IRQ_TYPE_LEVEL_HIGH>,
+			     <3 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "tx", "rx";
+		apple,fifo-size = <0x800>;
+		apple,helper-cpu = <&mtp>;
+		/*
+		 * ADT mtp function-afe-reset is the SMC pcIO template (0x10000, 0x11c0000),
+		 * the same line as SMC GPIO gp1c, active low, which gpio-macsmc drives.
+		 */
+		apple,afe-reset-gpios = <&smc_gpio_low 28 GPIO_ACTIVE_LOW>;
+
+		multi-touch {
+			apple,power-method = <2>;
+			firmware-name = "apple/tpmtfw-j714s.bin";
+		};
+
+		keyboard: keyboard {
+			hid-country-code = <0>;
+			apple,keyboard-layout-id = <0>;
+		};
+
+		stm {
+		};
+
+		actuator {
+		};
+
+		tp-accel {
+		};
+	};
+};
+
+/* Nothing here drives the SMC pcIO outputs, and the AFE reset above uses gp1c */
+/delete-node/ &smc_pcio;
 
 #define T6050_J714S
 #include "t6050-peripherals.dtsi"
