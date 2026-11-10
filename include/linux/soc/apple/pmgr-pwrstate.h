@@ -9,6 +9,7 @@ struct device_node;
 
 #if IS_ENABLED(CONFIG_APPLE_PMGR_PWRSTATE)
 int apple_pmgr_ps_cycle(struct device_node *np);
+int apple_pmgr_ps_verify_state(struct device *domain_dev, bool on);
 /*
  * Power off (child first) or on (parent first) the chain of
  * apple,consumer-switched power states that starts at @consumer's power
@@ -20,6 +21,10 @@ int apple_pmgr_ps_consumer_check(struct device *consumer);
 int apple_pmgr_ps_consumer_off(struct device *consumer);
 int apple_pmgr_ps_consumer_on(struct device *consumer);
 #else
+static inline int apple_pmgr_ps_verify_state(struct device *domain_dev, bool on)
+{
+	return -EOPNOTSUPP;
+}
 static inline int apple_pmgr_ps_cycle(struct device_node *np) { return -EOPNOTSUPP; }
 static inline int apple_pmgr_ps_consumer_check(struct device *consumer) { return -EOPNOTSUPP; }
 static inline int apple_pmgr_ps_consumer_off(struct device *consumer) { return -EOPNOTSUPP; }
