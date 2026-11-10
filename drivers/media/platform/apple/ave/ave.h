@@ -323,13 +323,35 @@ struct ave_slot {
 	bool done; /* reply in, output not delivered yet */
 };
 
+struct ave_frame_result {
+	u32 coded_bytes;
+	u32 parameter_set_bytes;
+	u32 slice_header_bytes;
+	u32 ordinal;
+	u32 frame_type;
+};
+
 #define AVE_MAX_REFS 5
 #define AVE_TILE_BUFS 8
+#define AVE_ENTROPY_SETS 4
+#define AVE_NEIGHBOUR_SETS 4
+#define AVE_6070_LOWRES_RESULTS 4
+#define AVE_6070_AVC_ENTROPY_TILES 2
+
+/* Fixed 6070 host-interface allocations, independent of picture geometry. */
+#define AVE_6070_CLIENT_MEM_BYTES SZ_1M
+#define AVE_6070_CODED_HEADER_BYTES 0x23000
+#define AVE_AVC_FLAT_SCALING_WEIGHT 16
+#define AVE_AVC_RECON_SKIP_MODE 3
+#define AVE_AVC_STATIC_AREA_MASK_ALL 0xffff
 
 struct ave_session {
 	struct ave_session *failed_next;
 	struct ave_params p;
 	struct ave_buf hdr;
+	struct ave_buf client_mem;
+	/* 6070: per-session firmware-generated VPS/SPS/PPS output. */
+	struct ave_buf param_sets;
 	struct ave_buf ref_a[AVE_MAX_REFS];
 	struct ave_buf ref_b[AVE_MAX_REFS];
 	struct ave_buf ref_c[AVE_MAX_REFS];
@@ -338,10 +360,15 @@ struct ave_session {
 	struct ave_buf ref_f[AVE_MAX_REFS];
 	struct ave_buf mb;
 	struct ave_buf mb_extra[2];
-	struct ave_buf row_a, row_b, fixed;
-	struct ave_buf tile[AVE_TILE_BUFS];
-	struct ave_buf tile_aux[AVE_TILE_BUFS];
+	struct ave_buf row_a[AVE_NEIGHBOUR_SETS];
+	struct ave_buf row_b[AVE_NEIGHBOUR_SETS];
+	struct ave_buf fixed[AVE_NEIGHBOUR_SETS];
+	struct ave_buf neighbour_fw[AVE_NEIGHBOUR_SETS];
+	struct ave_buf tile[AVE_ENTROPY_SETS][AVE_TILE_BUFS];
+	struct ave_buf tile_aux[AVE_ENTROPY_SETS][AVE_TILE_BUFS];
 	struct ave_buf hevc_extra[2];
+	u8 *codec_state;
+	size_t codec_state_bytes;
 	struct ave_slot slot[AVE_MAX_SLOTS];
 	u8 done_fifo[AVE_MAX_SLOTS];
 	unsigned int done_head;
@@ -466,6 +493,7 @@ int ave_build_start(struct ave_ctx *ctx, u8 *cmd, size_t len);
 int ave_build_process(struct ave_ctx *ctx, u8 *cmd, size_t len,
 		      unsigned int slot, dma_addr_t input, u32 bitrate,
 		      bool force_key);
+int ave_init_codec_state(struct ave_session *sess);
 
 /* ave-cmd.c */
 int ave_cmd_config(struct ave_dev *ave);
@@ -476,6 +504,7 @@ int ave_cmd_process(struct ave_ctx *ctx, unsigned int slot,
 		    struct vb2_v4l2_buffer *src, dma_addr_t input, u32 bitrate,
 		    bool force_key);
 int ave_cmd_complete(struct ave_ctx *ctx, unsigned int count);
+int ave_cmd_flush(struct ave_ctx *ctx);
 int ave_cmd_close(struct ave_ctx *ctx);
 
 /* ave-vb2.c */
@@ -485,6 +514,9 @@ void ave_vb2_put(void *buf_priv);
 
 /* ave-sess.c */
 u32 ave_cq_initial_qp(u32 quality);
+int ave_sess_decode_result(const struct ave_fw_layout *fw, enum ave_codec codec,
+			   const u8 *meta, size_t meta_bytes,
+			   struct ave_frame_result *result);
 struct ave_session *ave_sess_create(struct ave_ctx *ctx);
 void ave_sess_destroy(struct ave_ctx *ctx);
 void ave_sess_reap(struct ave_dev *ave);
