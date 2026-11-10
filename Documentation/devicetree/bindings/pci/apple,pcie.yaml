@@ -242,6 +242,13 @@ patternProperties:
         description: Optional GPIO to power on the device
         maxItems: 1
 
+      clkreq-gpios:
+        description:
+          The endpoint's CLKREQ# line. After a deep sleep has reset the pin
+          controller, the host returns the pin to an input before it trains
+          the link again.
+        maxItems: 1
+
       interrupt-controller: true
 
       apple,link-trained-by-bootloader:
