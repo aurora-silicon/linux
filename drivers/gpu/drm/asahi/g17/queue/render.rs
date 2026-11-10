@@ -170,6 +170,10 @@ struct Active {
     abandoned_since: Option<u64>,
     /// First observation of this group executed and consumed while its stamps lagged.
     stamp_wait_since: Option<u64>,
+    /// The group retired on its pass record without completion stamps and its client has its
+    /// result, but the firmware may still store the stamps through its descriptor: the
+    /// descriptor slot stays held until stamps cover the group.
+    stamps_owed: bool,
 }
 
 /// A firmware-retired, unexecuted group must hold on two observations this far
@@ -1142,6 +1146,7 @@ impl Pair {
                 drained_result: None,
                 abandoned_since: None,
                 stamp_wait_since: None,
+                stamps_owed: false,
             })
             .map_err(|_| EBUSY)?;
         self.prepared = None;
@@ -1922,6 +1927,28 @@ impl Pair {
         {
             return Err(EIO);
         }
+        if front.stamps_owed {
+            // Already reported: only the descriptor slot waits for the stamps.
+            let mut observer = Observer {
+                memory: &self.memory,
+                qids,
+                host,
+            };
+            let result = retirement::poll(&mut front.ticket, &mut observer);
+            let ordinal = front.ticket.ordinal;
+            return match result {
+                Ok(retirement::Poll::Complete(_)) => {
+                    self.memory.retire(ordinal)?;
+                    self.active.pop().ok_or(EIO)?;
+                    Ok(true)
+                }
+                Ok(_) => Ok(false),
+                Err(error) => {
+                    self.quarantine(error, defer)?;
+                    Ok(false)
+                }
+            };
+        }
         let stampless = front
             .stamp_wait_since
             .is_some_and(|since| Self::stamp_wait_expired(front, since, crate::g17::now_ns()));
@@ -1982,6 +2009,13 @@ impl Pair {
             front.packet.completion.clone(),
             front.packet.check_firmware_producers().map(|()| timestamps),
         ))?;
+        if stampless {
+            // The pass record is no witness that the firmware is done with the descriptor: it
+            // can still store the completion stamps through it, and a reused slot names no
+            // stamp target. Keep the slot until stamps cover the group.
+            front.stamps_owed = true;
+            return Ok(true);
+        }
         self.memory.retire(ordinal)?;
         self.active.pop().ok_or(EIO)?;
         self.executed_generation = Some(host.generation());
