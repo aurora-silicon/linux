@@ -2350,3 +2350,24 @@
 &ane {
 	status = "okay";
 };
+
+/* Both JPEG engines, as on the M4 Pro boards; they have no board wiring. */
+&ps_jpg {
+	status = "okay";
+};
+
+&jpeg0_dart {
+	status = "okay";
+};
+
+&jpeg0 {
+	status = "okay";
+};
+
+&jpeg1_dart {
+	status = "okay";
+};
+
+&jpeg1 {
+	status = "okay";
+};
