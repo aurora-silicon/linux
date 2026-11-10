@@ -2571,6 +2571,33 @@ bool dcp_hdr_metadata_live(struct platform_device *pdev)
 }
 
 /*
+ * Whether @pdev switches between SDR and PQ shown as EDR without a mode set:
+ * a desktop 26.x panel keeps its SDR link either way, and PQ only changes how
+ * the swaps tag their surfaces and the EDR values they carry
+ * (dcp_edr_prepare()).  macOS turns EDR on and off on a live panel too.
+ */
+bool dcp_edr_live(struct platform_device *pdev)
+{
+	return dcp_panel_edr_supported(platform_get_drvdata(pdev));
+}
+
+/* Follow a colour state change that dcp_edr_live() let through without a mode set. */
+static void dcp_edr_sync(struct apple_dcp *dcp, struct drm_crtc *crtc,
+			 struct drm_atomic_commit *commit)
+{
+	bool edr;
+
+	if (!dcp_panel_edr_supported(dcp))
+		return;
+	edr = dcp_crtc_eotf(dcp, crtc, commit) == HDMI_EOTF_SMPTE_ST2084 &&
+	      dcp_crtc_bt2020(dcp, crtc, commit);
+	if (edr == dcp->output_edr)
+		return;
+	dev_dbg(dcp->dev, "EDR %s without a mode set\n", edr ? "on" : "off");
+	dcp->output_edr = edr;
+}
+
+/*
  * Send the connector's HDR10 static metadata to the DCPAV service once the
  * link carries PQ: after the mode set that selected a PQ colour mode, and
  * whenever the metadata changes on it.  Never per frame, and never on an
@@ -3361,8 +3388,10 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
 	    READ_ONCE(dcp->mode_state.valid) && dcp->connector &&
-	    READ_ONCE(dcp->connector->connected))
+	    READ_ONCE(dcp->connector->connected)) {
+		dcp_edr_sync(dcp, crtc, commit);
 		dcp_hdr_metadata_sync(dcp, crtc, commit);
+	}
 
 	if (iomfb_uses_queue(dcp)) {
 		iomfb_queue_atomic(dcp, crtc, commit);
