@@ -868,6 +868,18 @@ pub(crate) fn is_ioctl(cmd: u32) -> bool {
     )
 }
 
+/// The requests a password unlock in the initrd needs: load the bag saved in
+/// the volume's token, unlock it with the typed password, open the sealed
+/// key-slot secret, lock the bag again, and read its state. Enrolment and
+/// password changes (create, change, export, new or re-sealed keys) wait for
+/// the real root, where the host state and Touch ID are attached.
+pub(crate) fn is_initrd_ioctl(cmd: u32) -> bool {
+    matches!(
+        cmd,
+        IOC_STATE | IOC_IMPORT | IOC_UNLOCK | IOC_LOCK | IOC_FDE_UNSEAL
+    )
+}
+
 /// Checks an unlock/create request and returns the user and the secret.
 pub(crate) fn parse_unlock(
     req: &UnlockRequest,
@@ -1385,6 +1397,17 @@ mod tests {
         let mut p = Policy::at_boot();
         p.password_unlocked(t);
         p
+    }
+
+    #[test]
+    fn initrd_allows_only_the_password_unlock() {
+        for cmd in [IOC_STATE, IOC_IMPORT, IOC_UNLOCK, IOC_LOCK, IOC_FDE_UNSEAL] {
+            assert!(is_initrd_ioctl(cmd));
+            assert!(is_ioctl(cmd));
+        }
+        for cmd in [IOC_CREATE, IOC_CHANGE, IOC_EXPORT, IOC_FDE_CREATE, IOC_FDE_SEAL] {
+            assert!(!is_initrd_ioctl(cmd));
+        }
     }
 
     const USER_HANDLE: i32 = -501;

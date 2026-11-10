@@ -40,7 +40,7 @@ if [ "${AURORA_SEP_SESSION:-0}" != 1 ]; then
 fi
 
 case "$(cat /sys/module/apple_sep/parameters/keystore_only 2>/dev/null || true)" in
-    1 | Y)
+    1 | 2 | Y)
         completed=false
         for attribute in /sys/bus/platform/devices/*.sep/complete_attach; do
             [ -e "$attribute" ] || continue

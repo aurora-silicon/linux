@@ -611,6 +611,9 @@ struct SepData {
     #[pin]
     attach_phase: Mutex<attach::Phase>,
     keystore_only: Atomic<bool>,
+    // keystore_only=2: /dev/sep-bio-rearm is published in the initrd phase
+    // for the password-unlock subset of the per-user key bag requests.
+    keystore_user_bags: bool,
     keystore_write_refusals: Atomic<u32>,
     #[pin]
     identity_keybag: Mutex<Option<keybag::StoredKeyBag>>,
@@ -969,10 +972,25 @@ impl SepData {
         let dma_ring = dma::Coherent::<u8>::zeroed_slice(dev, DMA_RING_SIZE, GFP_KERNEL)?;
 
         let keystore_only = attach::requested();
-        let xart_writes = !keystore_only && module_parameters::xart_writes.value() != 0;
+        let keystore_user_bags = keystore_only && attach::user_bags_requested();
         let xart_start = module_parameters::xart_start_sector.value();
         let xart_guard =
             xart_guard::level(module_parameters::xart_guard.value(), profile.xart_guard);
+        let xart_writes = if keystore_only {
+            attach::initrd_xart_writes(
+                module_parameters::xart_writes.value() != 0,
+                keystore_user_bags,
+                xart_guard,
+            )
+        } else {
+            module_parameters::xart_writes.value() != 0
+        };
+        if keystore_user_bags && !xart_writes {
+            dev_info!(
+                dev,
+                "initrd: per-user key bags need xart_writes=1 and no xART guard; they wait for the real root\n"
+            );
+        }
         let store = match xart_store::Store::open_owner(xart_writes, xart_start) {
             Ok(mut store) => {
                 match xart_guard {
@@ -1034,6 +1052,7 @@ impl SepData {
                 profile,
                 attach_phase <- new_mutex!(attach::Phase::new(keystore_only)),
                 keystore_only: Atomic::new(keystore_only),
+                keystore_user_bags,
                 keystore_write_refusals: Atomic::new(0),
                 identity_keybag <- new_mutex!(None),
                 fw_map <- new_mutex!(None),

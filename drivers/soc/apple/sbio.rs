@@ -2261,6 +2261,19 @@ impl SepData {
             );
             return false;
         }
+        if self.keystore_user_bags {
+            // keystore_only=2: a volume sealed to a user's password opens
+            // here, before the real root. rearm_ioctl limits the node to the
+            // unlock requests until complete_attach.
+            if let Err(e) = self.register_rearm() {
+                dev_err!(
+                    self.dev,
+                    "bringup: could not publish /dev/{} for the initrd password unlock: {:?}\n",
+                    bio::REARM_DEVICE_NAME,
+                    e
+                );
+            }
+        }
         diag::keystore_open();
         true
     }
@@ -5185,6 +5198,11 @@ impl SepData {
     pub(crate) fn rearm_ioctl(&self, cmd: u32, arg: usize) -> Result<()> {
         if self.shutting_down.load(Relaxed) {
             return Err(ENODEV);
+        }
+        // In the initrd phase the node serves only a password unlock; Touch
+        // ID and the host state are not attached yet.
+        if self.keystore_only.load(Relaxed) && !crate::userbag::is_initrd_ioctl(cmd) {
+            return Err(EAGAIN);
         }
         // The per-user key bag carries login passwords: root only, on this
         // node, never on /dev/sep-bio, which fprintd holds.

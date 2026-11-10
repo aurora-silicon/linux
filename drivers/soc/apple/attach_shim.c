@@ -10,11 +10,16 @@
 static unsigned char keystore_only;
 module_param(keystore_only, byte, 0444);
 MODULE_PARM_DESC(keystore_only,
-	"Attach for trusted keys only; defer persistent host state and Touch ID until complete_attach");
+	"Initrd attach: 1 = trusted keys only, 2 = also per-user key bags for a password unlock; defer persistent host state and Touch ID until complete_attach");
 
 bool sep_keystore_only(void)
 {
 	return keystore_only != 0;
+}
+
+bool sep_keystore_user_bags(void)
+{
+	return keystore_only == 2;
 }
 
 /* One SEP per machine. device_remove_file drains callbacks before release. */

@@ -47,6 +47,7 @@ pub(crate) fn unseal_allowed(before: u32, after: u32) -> bool {
 
 extern "C" {
     fn sep_keystore_only() -> bool;
+    fn sep_keystore_user_bags() -> bool;
     fn sep_complete_attach_register(
         dev: *mut c_void,
         ctx: *mut c_void,
@@ -58,6 +59,22 @@ extern "C" {
 pub(crate) fn requested() -> bool {
     // SAFETY: the parameter is immutable after module loading.
     unsafe { sep_keystore_only() }
+}
+
+/// `keystore_only=2`: the initrd also unlocks per-user key bags, so that a
+/// volume sealed to a user's password can open before the real root.
+pub(crate) fn user_bags_requested() -> bool {
+    // SAFETY: the parameter is immutable after module loading.
+    unsafe { sep_keystore_user_bags() }
+}
+
+/// Whether the initrd phase may let the enclave write the gigalocker. A
+/// per-user bag cannot be loaded or unlocked without those writes, but the
+/// xART guard keeps its record list in host files on the real root, which
+/// the initrd must not write. So writes are allowed only for user bags and
+/// only when no guard runs; with a guard the bags wait for complete_attach.
+pub(crate) fn initrd_xart_writes(xart_writes: bool, user_bags: bool, guard: Option<u8>) -> bool {
+    xart_writes && user_bags && guard.is_none()
 }
 
 /// Holds the callback context alive until sysfs has drained all writers.
@@ -145,6 +162,15 @@ mod tests {
         assert_eq!(phase.needs_completion(), Ok(true));
         assert_eq!(phase.complete(|| Ok(())), Ok(()));
         assert_eq!(phase.needs_completion(), Ok(false));
+    }
+
+    #[test]
+    fn initrd_writes_only_for_user_bags_without_a_guard() {
+        assert!(initrd_xart_writes(true, true, None));
+        assert!(!initrd_xart_writes(false, true, None));
+        assert!(!initrd_xart_writes(true, false, None));
+        assert!(!initrd_xart_writes(true, true, Some(1)));
+        assert!(!initrd_xart_writes(true, true, Some(2)));
     }
 
     #[test]

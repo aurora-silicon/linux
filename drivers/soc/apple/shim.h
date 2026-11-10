@@ -247,6 +247,7 @@ void sep_tk_set_blob_len(struct trusted_key_payload *p, unsigned int n);
 
 /* Initrd attach and completion; sysfs removal drains the callback. */
 bool sep_keystore_only(void);
+bool sep_keystore_user_bags(void);
 int sep_complete_attach_register(struct device *dev, void *ctx,
                                 int (*complete)(void *ctx));
 void sep_complete_attach_unregister(struct device *dev);

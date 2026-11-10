@@ -382,3 +382,13 @@ Description:
                 /var/lib paths; both are cached on first trusted-key use.
                 An unseal needing an xART write fails with EBADMSG so userspace
                 can use its passphrase fallback.
+
+                With apple_sep.keystore_only=2 the initrd phase also serves a
+                password unlock of a per-user key bag on /dev/sep-bio-rearm:
+                only the state, import, unlock, lock and FDE unseal requests;
+                every other request returns EAGAIN until complete_attach.
+                Loading and unlocking a bag needs enclave writes to xART, so
+                in this mode xART follows xart_writes, but only when the xART
+                guard is off (its record list lives in host files on the real
+                root). With a guard, xART stays read-only, the bag requests
+                fail with EROFS and the volume falls back to its passphrase.
