@@ -195,6 +195,10 @@ struct dchid_iface {
 	u32 keyboard_layout_id;
 	u32 power_method;
 	bool firmware_managed_reset;
+
+	/* Power method 2: the line that resets this interface, and its optional supply. */
+	struct gpio_desc *reset;
+	struct gpio_desc *power;
 };
 
 struct dockchannel_hid {
@@ -253,6 +257,7 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 	u32 power_method = DCHID_POWER_METHOD_1;
 	bool firmware_managed_reset = false;
 	struct device_node *of_node = NULL;
+	struct gpio_desc *reset = NULL, *power = NULL;
 	struct dchid_iface *iface;
 
 	if (READ_ONCE(dchid->stopping))
@@ -294,11 +299,34 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 				power_method, name);
 			goto err_put_node;
 		}
-		if (power_method == DCHID_POWER_METHOD_2 &&
-		    !firmware_managed_reset && !dchid->afe_reset) {
-			dev_err(dchid->dev, "Power method 2 for %s needs the AFE reset line\n",
-				name);
-			goto err_put_node;
+		if (power_method == DCHID_POWER_METHOD_2 && !firmware_managed_reset) {
+			struct fwnode_handle *fwnode = of_fwnode_handle(of_node);
+
+			/* An interface with its own reset line (kiwi) does not share the AFE one. */
+			reset = devm_fwnode_gpiod_get(dchid->dev, fwnode, "apple,reset",
+						      GPIOD_ASIS, "dchid-reset");
+			if (IS_ERR(reset)) {
+				if (PTR_ERR(reset) != -ENOENT) {
+					dev_err(dchid->dev, "Reset line of %s: %pe\n", name, reset);
+					goto err_put_node;
+				}
+				reset = dchid->afe_reset;
+			}
+			if (!reset) {
+				dev_err(dchid->dev, "Power method 2 for %s needs a reset line\n",
+					name);
+				goto err_put_node;
+			}
+
+			power = devm_fwnode_gpiod_get(dchid->dev, fwnode, "apple,power",
+						      GPIOD_OUT_HIGH, "dchid-power");
+			if (IS_ERR(power)) {
+				if (PTR_ERR(power) != -ENOENT) {
+					dev_err(dchid->dev, "Power line of %s: %pe\n", name, power);
+					goto err_put_node;
+				}
+				power = NULL;
+			}
 		}
 	}
 
@@ -314,6 +342,8 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 	iface->of_node = of_node;
 	iface->power_method = power_method;
 	iface->firmware_managed_reset = firmware_managed_reset;
+	iface->reset = reset;
+	iface->power = power;
 	iface->out_report = -1;
 	init_completion(&iface->out_complete);
 	init_completion(&iface->ready);
@@ -595,13 +625,15 @@ static int dchid_pm2_set_power(struct dchid_iface *iface, u8 state)
 	} else {
 		bool off = state == DCHID_POWER_STATE_OFF;
 
-		ret = gpiod_set_value_cansleep(dchid->afe_reset, off);
+		if (!off && iface->power)
+			gpiod_set_value_cansleep(iface->power, 1);
+		ret = gpiod_set_value_cansleep(iface->reset, off);
 		if (ret < 0) {
-			dev_err(dchid->dev, "%s: failed to %s the AFE reset: %d\n",
+			dev_err(dchid->dev, "%s: failed to %s the reset line: %d\n",
 				iface->name, off ? "assert" : "release", ret);
 			return ret;
 		}
-		dev_dbg(dchid->dev, "%s: AFE reset %s\n", iface->name,
+		dev_dbg(dchid->dev, "%s: reset %s\n", iface->name,
 			off ? "asserted" : "released");
 		/*
 		 * The sequence validated on J716s (M5 Pro, MTP firmware
