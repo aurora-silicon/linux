@@ -472,7 +472,8 @@ int sep_pm_commit_prepare(void *ptr, void *mbox, u64 msg0, u32 msg1, u64 reply, 
 	int ret;
 
 	/* Check capability before resources that legacy providers need not have. */
-	if (!READ_ONCE(sep_pm_suspending) || !IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) ||
+	if (!READ_ONCE(sep_pm_suspending) ||
+	    !(IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) || IS_ENABLED(CONFIG_APPLE_T6040_SLEEP)) ||
 	    !is_kernel_in_hyp_mode())
 		return -EOPNOTSUPP;
 	if (c->registered)
