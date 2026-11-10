@@ -7,6 +7,42 @@
 #include <linux/sizes.h>
 #include <linux/types.h>
 
+struct ave_6070_avc_recon_layout {
+	u32 luma_data;
+	u32 chroma_data;
+	u32 luma_metadata;
+	u32 chroma_metadata;
+	u32 luma_data_offset;
+	u32 chroma_data_offset;
+	u32 luma_metadata_offset;
+	u32 chroma_metadata_offset;
+	u32 bytes;
+};
+
+/* Contiguous 8-bit 4:2:0 AVC reconstruction surface. */
+static inline struct ave_6070_avc_recon_layout
+ave_6070_avc_recon_layout(u32 width, u32 height)
+{
+	struct ave_6070_avc_recon_layout l = { };
+	u32 mb_width = DIV_ROUND_UP(width, 16);
+	u32 mb_height = DIV_ROUND_UP(height, 16);
+	u32 metadata_rows = (DIV_ROUND_UP(height + 1, 8) + 7) / 8;
+
+	l.luma_data = ALIGN(256 * mb_width * mb_height, 512);
+	l.chroma_data = 128 * mb_width * mb_height;
+	l.luma_metadata = ALIGN(ALIGN(32 * mb_width, 128) * metadata_rows, 512);
+	/* This form allocates no separate chroma-metadata bytes. */
+	l.chroma_metadata = 0;
+
+	/* Header regions precede the two picture-data regions. */
+	l.luma_metadata_offset = 0;
+	l.chroma_metadata_offset = l.luma_metadata;
+	l.luma_data_offset = l.luma_metadata + l.chroma_metadata;
+	l.chroma_data_offset = l.luma_data_offset + l.luma_data;
+	l.bytes = l.chroma_data_offset + l.chroma_data;
+	return l;
+}
+
 /* Start +0x7d0 LFSRef: exact descriptor bytes, before DMA page rounding. */
 static inline u32 ave_lfs_ref_size(u32 width, u32 height, bool hevc, u32 scale)
 {

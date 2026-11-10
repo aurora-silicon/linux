@@ -712,6 +712,12 @@ static void ave_6070_start_process_fields(struct kunit *test)
 				KUNIT_EXPECT_EQ(test,
 						get_unaligned_le32(start + sl->h264_poc_type), 2U);
 				KUNIT_EXPECT_EQ(test, start[sl->ref_compression], 1U);
+				KUNIT_EXPECT_EQ(test,
+						get_unaligned_le64(start + sl->recon.address),
+						sess->ref_a[0].dma + 0x10000);
+				KUNIT_EXPECT_EQ(test,
+						get_unaligned_le64(start + sl->recon.address + 8),
+						sess->ref_a[0].dma);
 			}
 
 			slot = sess->p.slots - 1;
@@ -779,8 +785,37 @@ static void ave_6070_start_process_fields(struct kunit *test)
 						100U);
 			}
 			if (codec == AVE_CODEC_H264) {
+				struct ave_6070_avc_recon_layout recon =
+					ave_6070_avc_recon_layout(sess->p.width, sess->p.height);
+				unsigned int cur_slot = sess->frames % sess->p.refs;
+				unsigned int list0 = (sess->frames - 1) % sess->p.refs;
+
+				if (!sess->p.bframes) {
 				KUNIT_EXPECT_EQ(test,
 						get_unaligned_le64(process + pl->frame_buf),
+						sess->ref_c[cur_slot].dma);
+				KUNIT_EXPECT_EQ(test,
+						get_unaligned_le64(process +
+								   pl->current_recon.luma_data),
+						sess->ref_a[cur_slot].dma + recon.luma_data_offset);
+				KUNIT_EXPECT_EQ(test,
+						get_unaligned_le64(process +
+								   pl->current_recon.chroma_data),
+						sess->ref_a[cur_slot].dma +
+							recon.chroma_data_offset);
+				KUNIT_EXPECT_EQ(test,
+						get_unaligned_le64(process +
+								   pl->list0_recon.luma_data),
+						sess->ref_a[list0].dma + recon.luma_data_offset);
+				KUNIT_EXPECT_EQ(test,
+						get_unaligned_le64(process + pl->list0_lowres),
+						sess->ref_c[list0].dma);
+				KUNIT_EXPECT_EQ(test,
+						get_unaligned_le64(process + pl->current_colocated),
+						sess->ref_b[cur_slot].dma);
+				}
+				KUNIT_EXPECT_EQ(test,
+						get_unaligned_le64(process + pl->lrme_stats),
 						sess->slot[slot].aux.dma);
 				KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + 0x40),
 						0x984U);
@@ -819,6 +854,19 @@ static void ave_6070_start_process_fields(struct kunit *test)
 			KUNIT_EXPECT_EQ(test, process[pl->first_process], 1U);
 			KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + pl->ordinal), 0U);
 			KUNIT_EXPECT_EQ(test, get_unaligned_le64(process + pl->pts), 0ULL);
+			if (codec == AVE_CODEC_H264 && !sess->p.bframes) {
+				struct ave_6070_avc_recon_layout recon =
+					ave_6070_avc_recon_layout(sess->p.width, sess->p.height);
+
+				KUNIT_EXPECT_EQ(test,
+						get_unaligned_le64(process +
+								   pl->current_recon.luma_data),
+						sess->ref_a[0].dma + recon.luma_data_offset);
+				KUNIT_EXPECT_EQ(test,
+						get_unaligned_le64(process +
+								   pl->list0_recon.luma_data),
+						0ULL);
+			}
 		}
 }
 

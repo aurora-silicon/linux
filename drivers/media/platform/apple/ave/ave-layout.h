@@ -107,6 +107,13 @@ struct ave_retained_partition {
 	u32 command_offset, state_offset, bytes;
 };
 
+struct ave_recon_selection_layout {
+	u32 luma_data;
+	u32 luma_metadata;
+	u32 chroma_data;
+	u32 chroma_metadata;
+};
+
 #define AVE_MAX_RETAINED_PARTITIONS 3
 
 /* Zero offsets denote fields absent from a firmware's wire format. */
@@ -276,6 +283,12 @@ struct ave_proc_layout {
 	u32 crop; /* HEVC only */
 	u32 meta_size, extra, frame_size;
 	u32 low_delay; /* HEVC only: 3 with reordering off */
+	/* Per-picture reconstruction and motion-search selections. */
+	struct ave_recon_selection_layout current_recon, list0_recon;
+	u32 current_colocated;
+	u32 current_lowres, list0_lowres;
+	u32 lowres_results;
+	u32 lrme_stats;
 	struct ave_retained_partition retained[AVE_MAX_RETAINED_PARTITIONS];
 	u8 retained_count;
 };

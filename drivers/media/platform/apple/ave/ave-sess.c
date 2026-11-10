@@ -340,9 +340,13 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 		}
 	}
 
-	ref_a = ALIGN(w, 32) * ALIGN(h + 16, 32);
-	if (p->bit_depth == 10)
-		ref_a = ref_a * 5 / 4;
+	if (fw6070 && !hevc && p->bit_depth == 8) {
+		ref_a = ave_6070_avc_recon_layout(w, h).bytes;
+	} else {
+		ref_a = ALIGN(w, 32) * ALIGN(h + 16, 32);
+		if (p->bit_depth == 10)
+			ref_a = ref_a * 5 / 4;
+	}
 	ref_b = fw6070 ? ave_6070_colocated_size(w, h, hevc) :
 			   roundup_pow_of_two(w) * roundup_pow_of_two(h) / 32;
 	ref_c = ave_lfs_ref_size(w, h, hevc, ave->variant->lfs_ref_scale);
@@ -371,7 +375,9 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 		ave_req(r, &n, &sess->param_sets, AVE_PARAM_SETS_BYTES, 0, 0);
 	}
 	for (unsigned int i = 0; i < p->refs; i++) {
-		ave_req(r, &n, &sess->ref_a[i], ref_a, ref_a * 3 / 2, nomap);
+		ave_req(r, &n, &sess->ref_a[i], ref_a,
+			fw6070 && !hevc && p->bit_depth == 8 ? 0 : ref_a * 3 / 2,
+			nomap);
 		ave_req(r, &n, &sess->ref_b[i], ref_b, ref_b * 5 / 4, nomap);
 		ave_req(r, &n, &sess->ref_c[i], ref_c, 0, nomap);
 		if (!fw6070)
