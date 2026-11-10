@@ -51,13 +51,32 @@ MODULE_PARM_DESC(commit_lower_ps, "S2R commit: lower the GPU's power word in its
 
 #define ASC_CPU_STATUS		0x4
 
+/*
+ * The GPU's PMP report entry: the one apple,pmp-report-entry names, or the GPU's
+ * power domain where that is the entry itself (T6040: pmp-gfx).
+ */
+static struct device_node *asahi_g17_pmp_entry(struct device *dev)
+{
+	struct device_node *np;
+
+	np = of_parse_phandle(dev->of_node, "apple,pmp-report-entry", 0);
+	if (np)
+		return np;
+	np = of_parse_phandle(dev->of_node, "power-domains", 0);
+	if (np && of_device_is_compatible(np, "apple,t6000-pmp-v2-report-entry"))
+		return np;
+	of_node_put(np);
+
+	return NULL;
+}
+
 /* The PMP's request for the GPU, where the device tree names one. */
 int asahi_g17_pmp_request(struct device *dev, bool enable)
 {
 	struct device_node *np;
 	int ret;
 
-	np = of_parse_phandle(dev->of_node, "apple,pmp-report-entry", 0);
+	np = asahi_g17_pmp_entry(dev);
 	if (!np)
 		return 0;
 	ret = apple_pmp_report_entry_request(np, enable);
@@ -364,7 +383,7 @@ struct asahi_g17_commit *asahi_g17_commit_prepare(struct device *dev,
 	/* The word as it is before the sleep, for the raise after it if the stop leaves it. */
 	c->saved = readl(c->ps);
 
-	c->request = of_parse_phandle(dev->of_node, "apple,pmp-report-entry", 0);
+	c->request = asahi_g17_pmp_entry(dev);
 	if (c->request)
 		apple_pmp_report_entry_commit_owned(c->request, true);
 
