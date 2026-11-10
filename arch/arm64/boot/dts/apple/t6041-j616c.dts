@@ -56,4 +56,3 @@
 &mesa {
 	firmware-name = "apple/mesacal-j616c.bin", "apple/msrk-j616c.bin";
 };
-
