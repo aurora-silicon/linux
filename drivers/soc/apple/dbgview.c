@@ -6,6 +6,9 @@
  *
  *  - apple,aic-timebase: the timebase aperture of the interrupt controller
  *  - apple,debug-dock: the debug dock connection status register
+ *  - apple,t8112-dwi: the DWI serial backlight interface. The T8112 panel
+ *    backlight is driven by the display coprocessor and does not use DWI,
+ *    so these registers only hold their boot state
  *
  * The driver never writes a device register and requests no interrupt.
  * Registers are read only when a debugfs file is read.
@@ -153,6 +156,7 @@ static void dbgview_remove(struct platform_device *pdev)
 static const struct of_device_id dbgview_of_match[] = {
 	{ .compatible = "apple,aic-timebase" },
 	{ .compatible = "apple,debug-dock" },
+	{ .compatible = "apple,t8112-dwi" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, dbgview_of_match);
