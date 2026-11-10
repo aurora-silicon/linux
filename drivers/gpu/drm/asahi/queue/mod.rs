@@ -132,6 +132,10 @@ impl SubQueueJob::ver {
     fn can_submit(&self) -> Option<Fence> {
         self.job.as_ref().and_then(|job| job.can_submit())
     }
+
+    fn can_submit_inline(&self) -> bool {
+        self.job.as_ref().is_none_or(|job| job.can_submit_inline())
+    }
 }
 
 #[versions(AGX)]
@@ -218,6 +222,9 @@ pub(crate) struct QueueJob {
     fence: UserFence<JobFence::ver>,
     notifier: Arc<GpuObject<fw::event::Notifier::ver>>,
     notification_count: u32,
+    /// Zero until the ioctl tries publication, one for success, or a negative
+    /// errno for a failed attempt. The scheduler consumes the recorded result.
+    inline_result: i32,
     id: u64,
 }
 
@@ -265,6 +272,20 @@ impl QueueJob::ver {
             .map(|a| a.commit())
             .unwrap_or(Ok(()))?;
         self.sj_comp.as_mut().map(|a| a.commit()).unwrap_or(Ok(()))
+    }
+
+    fn can_submit_inline(&self) -> bool {
+        self.sj_vtx
+            .as_ref()
+            .is_none_or(|job| job.can_submit_inline())
+            && self
+                .sj_frag
+                .as_ref()
+                .is_none_or(|job| job.can_submit_inline())
+            && self
+                .sj_comp
+                .as_ref()
+                .is_none_or(|job| job.can_submit_inline())
     }
 }
 
@@ -319,6 +340,14 @@ impl sched::JobImpl for QueueJob::ver {
 
     #[allow(unused_assignments)]
     fn run(job: &mut Self) -> Result<Option<dma_fence::Fence>> {
+        if job.inline_result != 0 {
+            return if job.inline_result == 1 {
+                Ok(Some(Fence::from_fence(&job.fence)))
+            } else {
+                Err(Error::from_errno(job.inline_result))
+            };
+        }
+
         mod_dev_dbg!(job.dev, "QueueJob {}: Running Job\n", job.id);
 
         // We can only increase the notifier threshold here, now that we are
@@ -878,6 +907,8 @@ impl Queue for Queue::ver {
                 // notification count for the job.
                 notification_count: (2 * nr_render) + nr_compute,
 
+                inline_result: 0,
+
                 id,
             },
         )?;
@@ -888,8 +919,13 @@ impl Queue for Queue::ver {
             id,
             in_sync_count
         );
+        let mut dependencies_ready = true;
         for sync in syncs.drain(0..in_sync_count) {
             if let Some(fence) = sync.fence {
+                // SAFETY: `fence` owns the live dma_fence reference used for
+                // this concurrent status query.
+                dependencies_ready &=
+                    unsafe { kernel::bindings::dma_fence_get_status(fence.raw()) != 0 };
                 job.add_dependency(fence)?;
             }
         }
@@ -1048,6 +1084,16 @@ impl Queue for Queue::ver {
         let mut job = job.arm();
         let out_fence = job.fences().finished();
         self.last_out = Some(out_fence.clone());
+        if module_parameters::legacy_inline_submit.value() != 0
+            && dependencies_ready
+            && job.can_submit_inline()
+        {
+            // All fallible construction and scheduler arming has completed.
+            // Regardless of this result the scheduler takes ownership below,
+            // preserving timeout, credit, error, and teardown bookkeeping.
+            let result = <QueueJob::ver as sched::JobImpl>::run(&mut job).map(|_| ());
+            job.inline_result = result.map_or_else(|error| error.to_errno(), |()| 1);
+        }
         mod_dev_dbg!(
             self.dev,
             "Queue {}: Pushing job {}\n",
