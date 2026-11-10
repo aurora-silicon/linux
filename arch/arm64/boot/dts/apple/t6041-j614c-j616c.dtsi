@@ -76,25 +76,26 @@
 
 	thermal-zones {
 		/*
-		 * The PMP's fast die loop is off on these boards (no
-		 * apple,fast-die-effort), so these zones are the CPU's only
-		 * throttle. The ADT (temp-sensor, fast-die-ctrl-loop) gives the
-		 * J614c and J616c the M4 Pro's die limits: a 110 C target and a
-		 * 125 C maximum, the sochot level.
+		 * The PMP's fast die-temperature loop (apple,fast-die-effort)
+		 * holds its hot-spot sensors at the ADT fast-die-ctrl-loop target
+		 * of 110 C, as on macOS, and these zones are the backstop behind
+		 * it. The ADT (temp-sensor) gives the J614c and J616c the M4
+		 * Pro's die limits: 110 C target, 125 C maximum (sochot).
 		 *
-		 * - A zone per SMC core-die sensor runs the power allocator from
-		 *   75 C, controls at the 110 C target and throttles only the
-		 *   cluster its sensor sits on: Tpx0-5 follow a load on P0,
-		 *   Tpx8-D one on P1, Tex0-3 the E cluster. The die zone on TCMz,
-		 *   their maximum, controls all three clusters from 115 C as a
-		 *   backstop; controlling at 110 C itself, it divided its budget
-		 *   by requested power and held P0 at 2.4-2.9 GHz while P1 ran at
-		 *   4.1 GHz. The 1 s samples jump by about 10 C, so the zones are
-		 *   integral-led.
+		 * - The SMC sensors read a few degrees above the PMP's: with the
+		 *   PMP alone, an all-core load holds TCMz at 112 C. The zones
+		 *   switch on at 112 C and control at 116 C, so the PMP keeps the
+		 *   fast control. Switched on from 75 C, the power allocator
+		 *   trimmed far below its control point and took over: it held
+		 *   the E cluster at 1.02 GHz, which the PMP leaves at 2.59 GHz.
+		 * - A zone per SMC core-die sensor throttles only the cluster its
+		 *   sensor sits on: Tpx0-5 follow a load on P0, Tpx8-D one on P1,
+		 *   Tex0-3 the E cluster. The die zone on TCMz, their maximum,
+		 *   throttles all three. The 1 s samples jump by about 10 C, so
+		 *   the zones are integral-led.
 		 * - The SMC fans follow a power-weighted hot spot (dDT*), not
-		 *   TCMz: they only ramp once the CPU runs near 110 C at high
-		 *   power, as on macOS. A lower control point holds the power
-		 *   below where the fans engage, and the CPU then settles lower.
+		 *   TCMz, and ramp once the CPU runs near 110 C at high power, as
+		 *   on macOS.
 		 * - sustainable-power is what macOS sustained on a J614c under an
 		 *   all-core FMA load: 48-51 W, TCMz 105-110 C. The P clusters
 		 *   share one rail meter (PHPC), which reads 25 W with either
@@ -113,13 +114,13 @@
 
 			trips {
 				cpu_die_switch_on: cpu-die-switch-on {
-					temperature = <75000>;
+					temperature = <112000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				cpu_die_passive: cpu-die-passive {
-					temperature = <115000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -181,13 +182,13 @@
 
 			trips {
 				cpu_e0_switch_on: trip-switch-on {
-					temperature = <75000>;
+					temperature = <112000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				cpu_e0_passive: trip-passive {
-					temperature = <110000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -227,13 +228,13 @@
 
 			trips {
 				cpu_e1_switch_on: trip-switch-on {
-					temperature = <75000>;
+					temperature = <112000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				cpu_e1_passive: trip-passive {
-					temperature = <110000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -273,13 +274,13 @@
 
 			trips {
 				cpu_e2_switch_on: trip-switch-on {
-					temperature = <75000>;
+					temperature = <112000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				cpu_e2_passive: trip-passive {
-					temperature = <110000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -319,13 +320,13 @@
 
 			trips {
 				cpu_e3_switch_on: trip-switch-on {
-					temperature = <75000>;
+					temperature = <112000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				cpu_e3_passive: trip-passive {
-					temperature = <110000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -365,13 +366,13 @@
 
 			trips {
 				cpu_p00_switch_on: trip-switch-on {
-					temperature = <75000>;
+					temperature = <112000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				cpu_p00_passive: trip-passive {
-					temperature = <110000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -413,13 +414,13 @@
 
 			trips {
 				cpu_p01_switch_on: trip-switch-on {
-					temperature = <75000>;
+					temperature = <112000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				cpu_p01_passive: trip-passive {
-					temperature = <110000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -461,13 +462,13 @@
 
 			trips {
 				cpu_p02_switch_on: trip-switch-on {
-					temperature = <75000>;
+					temperature = <112000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				cpu_p02_passive: trip-passive {
-					temperature = <110000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -509,13 +510,13 @@
 
 			trips {
 				cpu_p03_switch_on: trip-switch-on {
-					temperature = <75000>;
+					temperature = <112000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				cpu_p03_passive: trip-passive {
-					temperature = <110000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -557,13 +558,13 @@
 
 			trips {
 				cpu_p04_switch_on: trip-switch-on {
-					temperature = <75000>;
+					temperature = <112000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				cpu_p04_passive: trip-passive {
-					temperature = <110000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -605,13 +606,13 @@
 
 			trips {
 				cpu_p05_switch_on: trip-switch-on {
-					temperature = <75000>;
+					temperature = <112000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				cpu_p05_passive: trip-passive {
-					temperature = <110000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -653,13 +654,13 @@
 
 			trips {
 				cpu_p10_switch_on: trip-switch-on {
-					temperature = <75000>;
+					temperature = <112000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				cpu_p10_passive: trip-passive {
-					temperature = <110000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -701,13 +702,13 @@
 
 			trips {
 				cpu_p11_switch_on: trip-switch-on {
-					temperature = <75000>;
+					temperature = <112000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				cpu_p11_passive: trip-passive {
-					temperature = <110000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -749,13 +750,13 @@
 
 			trips {
 				cpu_p12_switch_on: trip-switch-on {
-					temperature = <75000>;
+					temperature = <112000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				cpu_p12_passive: trip-passive {
-					temperature = <110000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -797,13 +798,13 @@
 
 			trips {
 				cpu_p13_switch_on: trip-switch-on {
-					temperature = <75000>;
+					temperature = <112000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				cpu_p13_passive: trip-passive {
-					temperature = <110000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -845,13 +846,13 @@
 
 			trips {
 				cpu_p14_switch_on: trip-switch-on {
-					temperature = <75000>;
+					temperature = <112000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				cpu_p14_passive: trip-passive {
-					temperature = <110000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -893,13 +894,13 @@
 
 			trips {
 				cpu_p15_switch_on: trip-switch-on {
-					temperature = <75000>;
+					temperature = <112000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				cpu_p15_passive: trip-passive {
-					temperature = <110000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -1182,18 +1183,6 @@
 
 &cpuidle {
 	status = "okay";
-};
-
-&cpufreq_e {
-	/delete-property/ apple,fast-die-effort;
-};
-
-&cpufreq_p0 {
-	/delete-property/ apple,fast-die-effort;
-};
-
-&cpufreq_p1 {
-	/delete-property/ apple,fast-die-effort;
 };
 
 &wdt {
@@ -2329,6 +2318,39 @@
 
 #include "t6041-j616c-hdmi.dtsi"
 #include "t6041-j616c-usbc.dtsi"
+
+/*
+ * The PMP, as the M4 Pro boards run it (t604x-j614-j616.dtsi). The pmp
+ * alias lets the loader copy this Mac's PMP values from the ADT and enable
+ * the PMP. The GPU sits on the PMP's GPU domain: a running PMP otherwise
+ * treats the GPU as off and holds it at its lowest state.
+ */
+/ {
+	aliases {
+		pmp = &pmp;
+	};
+};
+
+&pmp_dart {
+	status = "okay";
+};
+
+&pmp_report {
+	status = "okay";
+};
+
+&pmp_mbox {
+	status = "okay";
+};
+
+&pmc {
+	apple,pmp = <&pmp>;
+	status = "okay";
+};
+
+&gpu {
+	power-domains = <&pmp_gfx>;
+};
 
 / {
 	aliases {
