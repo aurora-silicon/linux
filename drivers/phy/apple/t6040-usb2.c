@@ -1845,6 +1845,18 @@ static int t6040_dp_power_off(struct phy *phy)
 		if (ret)
 			return ret;
 	}
+	/*
+	 * DP on all four lanes held the common block and the TX lanes on by
+	 * override, with no coprocessor. Release them and put the PHY to sleep,
+	 * as the CIO teardown does: the next USB3 bring-up then starts from a
+	 * sleeping PHY, as on a fresh attach. Booting the coprocessor's
+	 * firmware for the first time over the DP state crashes it.
+	 */
+	if (tphy->dp_up && !tphy->dp_mode_two_lanes && !t6040_dp_only(tphy)) {
+		t6040_phy_tx_cmn_down(tphy);
+		t6040_usb3_sleep(tphy);
+		dev_info(tphy->dev, "DP PHY down, PHY asleep\n");
+	}
 	tphy->dp_up = false;
 	if (tphy->dp_mode_two_lanes && !tphy->usb3_on)
 		t6040_usb3_down_locked(tphy);
