@@ -172,6 +172,29 @@ properties:
     $ref: "#/$defs/apple,tunable"
     description: USB2 host tunables, applied to the bank0 region.
 
+  apple,tunable-cio-lane0:
+    $ref: "#/$defs/apple,tunable"
+    description: >
+      Lane 0 receiver defaults for CIO (USB4/Thunderbolt) mode, applied to the
+      core region when the port enters USB4 or Thunderbolt. CIO mode is offered
+      only when both lane tables are present.
+
+  apple,tunable-cio-lane1:
+    $ref: "#/$defs/apple,tunable"
+    description: Lane 1 receiver defaults for CIO mode, applied to the core region.
+
+  apple,tunable-cio-uc-regs:
+    $ref: "#/$defs/apple,tunable"
+    description: Optional PHY microcontroller defaults for CIO mode, core region.
+
+  apple,tunable-cio-lane0-eq:
+    $ref: "#/$defs/apple,tunable"
+    description: Optional lane 0 receiver equalization for CIO mode, core region.
+
+  apple,tunable-cio-lane1-eq:
+    $ref: "#/$defs/apple,tunable"
+    description: Optional lane 1 receiver equalization for CIO mode, core region.
+
 required:
   - compatible
   - reg
@@ -199,6 +222,11 @@ allOf:
         mode-switch: false
         port: false
         ports: false
+        apple,tunable-cio-lane0: false
+        apple,tunable-cio-lane1: false
+        apple,tunable-cio-uc-regs: false
+        apple,tunable-cio-lane0-eq: false
+        apple,tunable-cio-lane1-eq: false
 
 additionalProperties: false
 

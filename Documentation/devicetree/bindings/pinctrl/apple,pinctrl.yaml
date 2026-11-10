@@ -69,6 +69,14 @@ properties:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: The number of pins in this GPIO controller.
 
+  apple,resume-restore-all:
+    type: boolean
+    description:
+      After a sleep that powers the block down, every pin's configuration is
+      written back, not only the pins a driver has claimed, as the vendor
+      firmware does for this block. The pins in gpio-reserved-ranges are left
+      as the wake found them.
+
   gpio-reserved-ranges: true
 
   interrupts:

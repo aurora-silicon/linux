@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/apple,t6040-sleep.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T6040 system sleep controller
+
+maintainers:
+  - František Balázsy <frantisekbalazsy@gmail.com>
+
+description:
+  The power states macOS checks before it lets the T6040 sleep engine take
+  the SoC down (the ADT's device-check-ps-b4-sleep table). Each entry names a
+  PMGR register block, the offset of a display pipe's CPU power state and the
+  offset of its last sub-block; the states in between are 8 bytes apart.
+
+  The optional register blocks are the SoC words the entry and the wake write.
+  All of them are shared with the drivers that own them, and are touched only
+  once nothing blocks the sleep any more.
+
+properties:
+  compatible:
+    const: apple,t6040-sleep
+
+  reg:
+    minItems: 2
+    items:
+      - description: CPU start/stop block (pmgr + 0x88000)
+      - description: AON watchdog
+      - description: control words of the three CPU complexes
+      - description: SoC power gate, wake and retention voters
+      - description: clock generator, the clock mux park words
+      - description: SPMI controller of the PMU (boot stage, notify, hibernate)
+      - description: second SPMI controller's notify word
+      - description: MasterMini block with the S2R timer
+      - description: SOC-East retention and power words
+      - description: PMGR power words of the west axi2af bridges
+      - description: AOP global block, S2R control and wake masks
+
+  reg-names:
+    minItems: 2
+    items:
+      - const: cpu-start
+      - const: wdt
+      - const: cluster-ctl
+      - const: soc-pwrgate
+      - const: clkgen
+      - const: spmi0
+      - const: spmi-a0
+      - const: mastermini
+      - const: soc-east
+      - const: soc-ps
+      - const: aop-global
+
+  apple,check-ps-b4-sleep:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      items:
+        - description: PMGR syscon
+        - description: offset of the pipe's CPU power state
+        - description: offset of its last sub-block's power state
+
+  apple,check-ps-b4-sleep-names:
+    description: One name per apple,check-ps-b4-sleep entry.
+
+required:
+  - compatible
+  - apple,check-ps-b4-sleep
+  - apple,check-ps-b4-sleep-names
+
+additionalProperties: false
+
+examples:
+  - |
+    sleep-controller {
+        compatible = "apple,t6040-sleep";
+        apple,check-ps-b4-sleep = <&pmgr_disp 0x0 0x58>;
+        apple,check-ps-b4-sleep-names = "disp";
+    };

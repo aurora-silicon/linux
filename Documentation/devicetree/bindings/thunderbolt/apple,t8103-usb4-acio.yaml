@@ -119,6 +119,12 @@ properties:
     description:
       GPIO on the pin that carries the router's LSTX sideband signal.
 
+  apple,atc-phy:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      Type-C PHY of this router's port. On T6040 the router starts only while
+      that PHY is in CIO mode and tells it when it stops.
+
   apple,pcie-tunnel:
     $ref: /schemas/types.yaml#/definitions/phandle
     description:
