@@ -1370,6 +1370,10 @@
 		#gpio-cells = <2>;
 		gpio-ranges = <&pinctrl 0 0 200>;
 		apple,npins = <200>;
+		/* ADT gpio0: macOS puts every pin back after a sleep, but no-restore-gpio-pins. */
+		apple,resume-restore-all;
+		/* Pins the firmware lists as no-restore */
+		gpio-reserved-ranges = <190 3>;
 
 		interrupt-controller;
 		#interrupt-cells = <2>;
