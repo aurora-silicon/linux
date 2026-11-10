@@ -1716,4 +1716,5 @@ MODULE_LICENSE("GPL v2");
 
 #if IS_ENABLED(CONFIG_SND_SOC_TAS2764_KUNIT_TEST)
 #include "tas2764-bop-test.h"
+#include "tas2764-bclk-ratio-test.h"
 #endif
