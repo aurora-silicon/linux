@@ -46,6 +46,7 @@
 #include <asm/cpu_ops.h>
 #include <asm/ctxr_execmem.h>
 #include <asm/daifflags.h>
+#include <asm/kexec.h>
 #include <asm/kvm_mmu.h>
 #include <asm/mmu_context.h>
 #include <asm/nmi.h>
