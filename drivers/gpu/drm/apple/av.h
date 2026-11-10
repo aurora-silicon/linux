@@ -16,11 +16,18 @@ void av_service_disconnect(struct apple_dcp *dcp);
 void av_audiosrv_quiesce(struct apple_dcp *dcp);
 /* Pair of av_audiosrv_quiesce after a later successful bind. */
 void av_audiosrv_reports_restart(struct apple_dcp *dcp);
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+/* Before the display's mode is set, see dcpaud_before_modeset(). */
+void av_audio_before_modeset(struct apple_dcp *dcp);
+#else
+static inline void av_audio_before_modeset(struct apple_dcp *dcp) { }
+#endif
 #else
 static inline void av_service_connect(struct apple_dcp *dcp) { }
 static inline void av_service_disconnect(struct apple_dcp *dcp) { }
 static inline void av_audiosrv_quiesce(struct apple_dcp *dcp) { }
 static inline void av_audiosrv_reports_restart(struct apple_dcp *dcp) { }
+static inline void av_audio_before_modeset(struct apple_dcp *dcp) { }
 #endif
 
 #endif /* __AV_H__ */

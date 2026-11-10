@@ -888,6 +888,28 @@ out:
 	afk_service_put(service);
 }
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+/*
+ * Before the display's mode is set: a native link's connection holds its
+ * default link through the mode set (see dcpaud_before_modeset()).
+ */
+void av_audio_before_modeset(struct apple_dcp *dcp)
+{
+	struct audiosrv_data *asrv = dcp->audiosrv;
+	struct platform_device *audio_dev = NULL;
+
+	if (!asrv || !dcp_audiosrv_native_link(dcp->dev))
+		return;
+	scoped_guard(mutex, &asrv->plug_lock) {
+		if (asrv->plugged)
+			audio_dev = asrv->audio_dev;
+	}
+	/* Outside plug_lock, which the endpoint's receive path takes. */
+	if (audio_dev)
+		dcpaud_before_modeset(audio_dev);
+}
+#endif
+
 /* @gen: only while that instance is published (NULL: whichever is) */
 static void __av_service_disconnect(struct apple_dcp *dcp, const u64 *gen)
 {
