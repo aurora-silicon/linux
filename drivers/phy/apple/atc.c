@@ -4605,6 +4605,8 @@ static int atcphy_dpphy_validate(struct phy *phy, enum phy_mode mode, int submod
 	default:
 		opts->lanes = 0;
 	}
+	/* Only the T8140 main-link PLL setup has a spread-spectrum setting per rate. */
+	opts->ssc = atcphy->hw->has_t8140_dp;
 
 	return 0;
 }
