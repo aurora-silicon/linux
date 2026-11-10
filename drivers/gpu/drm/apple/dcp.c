@@ -10206,6 +10206,7 @@ static int dcp_hib_recommit(struct apple_dcp *dcp)
 	if (!acrtc) {
 		/* No DRM pipeline: nothing to set, the firmware is up. */
 		WRITE_ONCE(dcp->hib_phase, DCP_HIB_NONE);
+		dev_info(dcp->dev, "hibernation restore: no CRTC, no mode to set\n");
 		return 0;
 	}
 	crtc = &acrtc->base;
@@ -10217,6 +10218,8 @@ static int dcp_hib_recommit(struct apple_dcp *dcp)
 		if (!dcp_uses_soft_dpms(dcp)) {
 			/* dcp_poweron() powers the pipe on the enable. */
 			WRITE_ONCE(dcp->hib_phase, DCP_HIB_NONE);
+			dev_info(dcp->dev,
+				 "hibernation restore: CRTC off, pipe and mode set on enable\n");
 			goto unlock;
 		}
 		if (!powered) {
@@ -10269,11 +10272,15 @@ static int dcp_hib_recommit(struct apple_dcp *dcp)
 
 	WRITE_ONCE(dcp->hib_phase, DCP_HIB_NONE);
 	ret = drm_atomic_commit(state);
-	if (!ret)
+	/* The commit succeeds even when the firmware refused the mode set in it. */
+	if (!ret && READ_ONCE(dcp->mode_state.valid) && !READ_ONCE(dcp->crashed))
 		dev_info(dcp->dev,
-			 "hibernation restore: mode " DRM_MODE_FMT " committed, valid %d\n",
-			 DRM_MODE_ARG(&cs->mode),
-			 READ_ONCE(dcp->mode_state.valid));
+			 "hibernation restore: mode " DRM_MODE_FMT " set\n",
+			 DRM_MODE_ARG(&cs->mode));
+	else if (!ret)
+		dev_err(dcp->dev,
+			"hibernation restore: mode " DRM_MODE_FMT " committed but not set (crashed %d)\n",
+			DRM_MODE_ARG(&cs->mode), READ_ONCE(dcp->crashed));
 	else if (ret != -EDEADLK)
 		WRITE_ONCE(dcp->hib_phase, DCP_HIB_RESTARTING);
 put:
@@ -10461,7 +10468,8 @@ static void dcp_desktop_cold_restart(struct apple_dcp *dcp)
 		dcp_hib_give_up(dcp, "modeset", ret);
 		return;
 	}
-	dev_info(dcp->dev, "display restored after cold restart\n");
+	/* What the display got is logged by dcp_hib_recommit(). */
+	dev_info(dcp->dev, "firmware back after the cold restart\n");
 }
 
 /*
@@ -10498,7 +10506,8 @@ static void dcp_t6041_s2r_warm_restart(struct apple_dcp *dcp)
 		dcp_hib_give_up(dcp, "modeset", ret);
 		return;
 	}
-	dev_info(dcp->dev, "display restored after the warm restart\n");
+	/* What the display got is logged by dcp_hib_recommit(). */
+	dev_info(dcp->dev, "firmware back after the warm restart\n");
 }
 
 static void dcp_hib_restore_work(struct work_struct *work)
