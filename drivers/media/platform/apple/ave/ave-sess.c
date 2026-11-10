@@ -281,7 +281,7 @@ struct ave_buf_req {
 };
 
 #define AVE_MAX_BUF_REQS \
-	(2 + 6 * AVE_MAX_REFS + 3 + 4 * AVE_NEIGHBOUR_SETS + \
+	(3 + 6 * AVE_MAX_REFS + 3 + 4 * AVE_NEIGHBOUR_SETS + \
 	 2 * AVE_ENTROPY_SETS * AVE_TILE_BUFS + 2 + 4 * AVE_MAX_SLOTS)
 
 static int ave_buf_req_cmp(const void *a, const void *b)
@@ -313,6 +313,8 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 	bool hevc = p->codec == AVE_CODEC_HEVC;
 	bool fw6070 = fw->kind == AVE_LAYOUT_6070;
 	unsigned int entropy_sets = fw6070 ? AVE_ENTROPY_SETS : 1;
+	unsigned int entropy_tiles = hevc ? 4 :
+		fw6070 ? AVE_6070_AVC_ENTROPY_TILES : AVE_TILE_BUFS;
 	unsigned int neighbour_sets = fw6070 ? AVE_NEIGHBOUR_SETS : 1;
 	u32 w = p->width, h = p->height;
 	u32 w16 = DIV_ROUND_UP(w, 16), w32 = DIV_ROUND_UP(w, 32);
@@ -368,18 +370,25 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 		tile *= 2;
 
 	ave_req(r, &n, &sess->hdr, fw->hdr_bytes, 0, nomap);
-	if (fw6070)
+	if (fw6070) {
+		ave_req(r, &n, &sess->client_mem, AVE_6070_CLIENT_MEM_BYTES, 0,
+			nomap);
 		ave_req(r, &n, &sess->param_sets, AVE_PARAM_SETS_BYTES, 0, 0);
+	}
 	for (unsigned int i = 0; i < p->refs; i++) {
 		ave_req(r, &n, &sess->ref_a[i], ref_a, ref_a * 3 / 2, nomap);
 		ave_req(r, &n, &sess->ref_b[i], ref_b, ref_b * 5 / 4, nomap);
 		ave_req(r, &n, &sess->ref_c[i], ref_c, 0, nomap);
-		ave_req(r, &n, &sess->ref_d[i], ref_d, 0, nomap);
+		if (!fw6070)
+			ave_req(r, &n, &sess->ref_d[i], ref_d, 0, nomap);
 		if (fw->counted) {
 			ave_req(r, &n, &sess->ref_e[i], ref_a / 2, 0, nomap);
 			ave_req(r, &n, &sess->ref_f[i], ref_b / 4, 0, nomap);
 		}
 	}
+	if (fw6070)
+		for (unsigned int i = 0; i < AVE_6070_LOWRES_RESULTS; i++)
+			ave_req(r, &n, &sess->ref_d[i], ref_d, 0, nomap);
 	if (!fw6070)
 		ave_req(r, &n, &sess->mb, ALIGN(82 * p->mbs, SZ_16K), 0,
 			nomap);
@@ -398,7 +407,7 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 				ave_6070_src_neighbor_fw_size(w, hevc), 0, nomap);
 	}
 	for (unsigned int set = 0; set < entropy_sets; set++)
-		for (unsigned int i = 0; i < (hevc ? 4 : AVE_TILE_BUFS); i++) {
+		for (unsigned int i = 0; i < entropy_tiles; i++) {
 			ave_req(r, &n, &sess->tile[set][i], tile, 0, nomap);
 			ave_req(r, &n, &sess->tile_aux[set][i],
 				fw6070 ? ave_6070_entropy_aux_size(w, h, hevc) :
@@ -449,6 +458,7 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
 {
 	ave_free(ave, &sess->hdr);
+	ave_free(ave, &sess->client_mem);
 	ave_free(ave, &sess->param_sets);
 	for (unsigned int i = 0; i < AVE_MAX_REFS; i++) {
 		ave_free(ave, &sess->ref_a[i]);
@@ -576,6 +586,7 @@ static void ave_log_buf(struct ave_dev *ave, const char *name, int i, const stru
 static void ave_sess_log_map(struct ave_dev *ave, struct ave_session *sess)
 {
 	ave_log_buf(ave, "hdr", 0, &sess->hdr);
+	ave_log_buf(ave, "client_mem", 0, &sess->client_mem);
 	ave_log_buf(ave, "param_sets", 0, &sess->param_sets);
 	ave_log_buf(ave, "mb", 0, &sess->mb);
 	for (int set = 0; set < AVE_NEIGHBOUR_SETS; set++) {
