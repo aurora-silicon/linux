@@ -182,7 +182,7 @@ static void ane_h16_quarantine(void *ctx, int error)
 {
 	struct ane_h16_device *h = ctx;
 
-	if (error == -ETIMEDOUT && h->boot.stage == ANE_H16_BOOT)
+	if ((error == -ETIMEDOUT || error == -ESHUTDOWN) && h->boot.stage == ANE_H16_BOOT)
 		ane_h16_startup_fwlog(h);
 
 	dev_err(h->dev, "H16 quarantine error %d; mappings, power and module held until reboot\n",
@@ -1145,9 +1145,10 @@ static void ane_h16_startup_fwlog(struct ane_h16_device *h)
 }
 
 /*
- * Power cycles allowed after a startup timeout at bring-up. On the J616s the
- * firmware stops part way through startup on about one boot in ten: it posts
- * no further request and never answers the pending command.
+ * Power cycles allowed after a startup timeout or stop at bring-up. On the
+ * J616s the firmware's CPU is stopped part way through startup on about one
+ * boot in six: it posts no further request and never answers the pending
+ * command.
  */
 #define ANE_H16_STARTUP_RESTARTS 2
 
@@ -1192,6 +1193,22 @@ static const struct ane_h16_boot_ops ane_h16_ops = {
 
 static void ane_h16_busy(void *ctx, bool busy);
 
+/*
+ * On the J616s the firmware's CPU is sometimes stopped part way through its
+ * startup, 8 to 12 ms after RUN: its wrapper control word reads 0 (RUN
+ * cleared) and the status 0x30006a. It then answers nothing until it is
+ * power cycled. Seen during startup only, so only watched there.
+ */
+static bool ane_h16_cpu_stopped(void *ctx)
+{
+	struct ane_h16_device *h = ctx;
+	const struct ane_h16_build *f = h->boot.build;
+
+	if (!h->boot.starting || !h->engine_on)
+		return false;
+	return !(ane_h16_mmio_read32(h, ANE_H16_ENGINE, f->cpu_control) & f->run);
+}
+
 static const struct ane_h16_session_ops ane_h16_session_ops = {
 	.map = ane_h16_program_map,
 	.log = ane_h16_log,
@@ -1212,6 +1229,7 @@ static const struct ane_fw_transport_ops ane_h16_transport_ops = {
 	.alloc = ane_h16_alloc_shared,
 	.refused = ane_h16_refused,
 	.shared_note = ane_h16_shared_note,
+	.stopped = ane_h16_cpu_stopped,
 };
 
 /* Pre-RUN rollback of everything a stage acquired. h itself stays. */

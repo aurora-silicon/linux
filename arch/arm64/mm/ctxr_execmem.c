@@ -22,6 +22,7 @@
 
 #define pr_fmt(fmt) "ctxr-execmem: " fmt
 
+#include <linux/crash_dump.h>
 #include <linux/efi.h>
 #include <linux/execmem.h>
 #include <linux/genalloc.h>
@@ -255,7 +256,15 @@ void __init ctxr_exec_reserve(void)
 	 * core. So a command-line window can only replace the device-tree one
 	 * when it is identical; a different one (a sub-window, say) is ignored.
 	 */
-	if (dt < 0) {
+	if (is_kdump_kernel() && (dt || cmd)) {
+		/*
+		 * A crash kernel runs on the boot CPU only, from ordinary memory.
+		 * The confined secondaries stay parked in the crashed kernel,
+		 * whose window holds that kernel's code, not this one's.
+		 */
+		ctxr_hold_cpus = true;
+		pr_info("crash kernel: running on the boot CPU, outside the window\n");
+	} else if (dt < 0) {
 		ctxr_hold_secondaries("malformed aurora,ctxr-exec-window");
 	} else if (dt || cmd) {
 		if (!is_kernel_in_hyp_mode()) {

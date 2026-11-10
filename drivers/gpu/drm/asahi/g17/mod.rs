@@ -1173,10 +1173,12 @@ impl Gpu {
         } else {
             None
         };
-        let (variant, build_cfg) = Self::firmware_variant(dev, &cfg.firmware)?;
+        let id = regs.get_g17_id()?;
+        let active_cores: u32 = id.core_masks.iter().map(|mask| mask.count_ones()).sum();
+        let (variant, build_cfg) =
+            Self::firmware_variant(dev, &cfg.firmware, (id.num_clusters, active_cores))?;
         // A build with its own configuration of the SoC runs with that one.
         let cfg = build_cfg.unwrap_or(cfg);
-        let id = regs.get_g17_id()?;
         if let Some(calibration) = calibration {
             calibration.check_cores(&id.core_masks)?;
             calibration.check_opps(&initdata::InitData::opps(dev, cfg.opps, id.num_clusters)?)?;
@@ -1216,7 +1218,6 @@ impl Gpu {
         let renders = availability::Availability::new()?;
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
         let feed = feed::Feed::new()?;
-        let active_cores = id.core_masks.iter().map(|mask| mask.count_ones()).sum();
         let alternate = cfg.core_layout.cores.is_some_and(|(clusters, cores)| {
             clusters == id.num_clusters
                 && cores != active_cores
@@ -1329,9 +1330,15 @@ impl Gpu {
     /// Returns the variant of the loaded firmware build and the configuration it runs with, if
     /// it has its own. An identified SoC refuses a build it does not know, before anything is
     /// written to the GPU.
+    ///
+    /// Builds can admit the same image with configurations measured on different core layouts.
+    /// The first identified build whose configuration admits `cores` (clusters and enabled
+    /// cores, as probed) is chosen, else the first identified one, whose core check then
+    /// refuses the GPU.
     fn firmware_variant(
         dev: &AsahiDrmDevice,
         firmware: &fw::variant::Firmware,
+        cores: (u32, u32),
     ) -> Result<(&'static fw::Variant, Option<&'static Config>)> {
         let builds = match firmware {
             fw::variant::Firmware::Fixed(variant) => return Ok((variant, None)),
@@ -1346,11 +1353,26 @@ impl Gpu {
         let others = builds
             .iter()
             .filter(|build| Some(build.os_version) != version);
+        let mut identified = None;
         for build in Iterator::chain(preferred, others) {
-            if Self::identify_image(dev, build).is_ok() {
-                dev_info!(dev.as_ref(), "GPU firmware: {}\n", build.name);
-                return Ok((build.variant, build.config));
+            if Self::identify_image(dev, build).is_err() {
+                continue;
             }
+            let admits = build.config.is_none_or(|config| {
+                config
+                    .core_layout
+                    .cores
+                    .is_none_or(|measured| measured == cores)
+            });
+            if admits {
+                identified = Some(build);
+                break;
+            }
+            identified.get_or_insert(build);
+        }
+        if let Some(build) = identified {
+            dev_info!(dev.as_ref(), "GPU firmware: {}\n", build.name);
+            return Ok((build.variant, build.config));
         }
         dev_err!(
             dev.as_ref(),
@@ -1823,22 +1845,41 @@ impl gpu::Gpu for Gpu {
         mut bo: gem::ObjectRef,
         range: Range<usize>,
     ) -> Result<crate::timestamp::Buffer> {
-        let mapping = {
+        let (mapping, window) = {
             let state = self.shared.state.lock();
             let firmware = (*state).as_ref().ok_or(ENODEV)?;
-            let mut addresses = firmware.uat.geometry().kernel_range();
-            addresses.start += hw::t8140::dynamic::KERNEL_OFFSET;
-            bo.map_range_into_range(
-                firmware.uat.kernel_vm(),
-                range,
-                addresses,
-                mmu::UAT_PGSZ as u64,
-                mmu::PROT_FW_SHARED_RW,
-                false,
-            )?
+            // Firmware-only, like the other alias: only the firmware writes these stamps.
+            let windowed = bo
+                .map_range_into_range(
+                    firmware.uat.kernel_vm(),
+                    range.clone(),
+                    hw::t8140::dynamic::TIMESTAMP_WINDOW,
+                    mmu::UAT_PGSZ as u64,
+                    mmu::PROT_FW_SHARED_RW,
+                    false,
+                )
+                .ok();
+            match windowed {
+                Some(mapping) => (mapping, true),
+                // A full window: this buffer's stamps are all host-written.
+                None => (
+                    bo.map_range_into_range(
+                        firmware.uat.kernel_vm(),
+                        range,
+                        hw::t8140::dynamic::upper(firmware.uat.geometry().kernel_range()),
+                        mmu::UAT_PGSZ as u64,
+                        mmu::PROT_FW_SHARED_RW,
+                        false,
+                    )?,
+                    false,
+                ),
+            }
         };
         // The buffer's CPU mapping takes the reservation lock: not under the device mutex.
-        crate::timestamp::Buffer::firmware(mapping)
+        match window {
+            true => crate::timestamp::Buffer::firmware_window(mapping),
+            false => crate::timestamp::Buffer::firmware(mapping),
+        }
     }
 }
 

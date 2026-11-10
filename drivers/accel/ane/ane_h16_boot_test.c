@@ -66,6 +66,10 @@ struct ane_h16_sim {
 	bool reset;
 	bool unpowered;
 	u32 quarantine_reads;
+	/* The stopped op, and the CPU control word the stop evidence logged. */
+	struct ane_fw_transport_ops transport;
+	u64 stop_control;
+	u32 stopped_checks;
 };
 
 static const u32 sim_power_words[] = { 0x3c0, 0xc008, 0xc000, 0xc010, 0xc018 };
@@ -410,6 +414,8 @@ static void sim_log(void *ctx, const char *item, u64 a, u64 b)
 		s->timeout_scratch++;
 	if (!strcmp(item, "quarantine scratch"))
 		s->quarantine_reads++;
+	if (!strcmp(item, "startup CPU control/status"))
+		s->stop_control = a;
 }
 
 static bool sim_powered(void *ctx)
@@ -513,6 +519,22 @@ static const struct ane_fw_transport_ops sim_transport_ops = {
 	.alloc = sim_alloc_shared,
 	.refused = sim_refused,
 };
+
+/* As the backend: only while the startup commands are out. */
+static bool sim_stopped(void *ctx)
+{
+	struct ane_h16_sim *s = ctx;
+
+	s->stopped_checks++;
+	return s->boot.starting && !(s->cpu & s->build.run);
+}
+
+static void sim_use_stopped(struct ane_h16_sim *s)
+{
+	s->transport = sim_transport_ops;
+	s->transport.stopped = sim_stopped;
+	s->boot.transport_ops = &s->transport;
+}
 
 /* A programmed bank, ends without their low two bits. */
 static void sim_program_dapf(struct ane_h16_sim *s)
@@ -854,6 +876,53 @@ static void ane_h16_startup_restart_budget_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), -EBUSY);
 }
 
+/*
+ * A CPU that loses RUN during startup can answer nothing: the wait ends at
+ * once with -ESHUTDOWN and the evidence names the control word, instead of
+ * waiting out the command deadline.
+ */
+static void ane_h16_startup_stopped_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+	u64 start;
+
+	sim_use_stopped(s);
+	s->build.command_timeout_ns = 3ULL * NSEC_PER_SEC;
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_BOOT), 0);
+	/* Running and answering: never reported stopped. */
+	KUNIT_EXPECT_FALSE(test, sim_stopped(s));
+	s->no_startup_reply = true;
+	s->cpu = 0;
+	start = s->now;
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), -ESHUTDOWN);
+	KUNIT_EXPECT_LT(test, s->now - start, 2ULL * NSEC_PER_MSEC);
+	KUNIT_EXPECT_EQ(test, s->stop_control, 0ULL);
+	KUNIT_EXPECT_EQ(test, s->timeout_scratch, 8U);
+	KUNIT_EXPECT_TRUE(test, s->boot.quarantined);
+	KUNIT_EXPECT_FALSE(test, s->boot.starting);
+}
+
+/* A stopped CPU gets the same verified restart as a timed-out one. */
+static void ane_h16_startup_stopped_restart_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+	u64 start;
+
+	sim_use_restart(s, 1, 2);
+	sim_use_stopped(s);
+	s->build.command_timeout_ns = 3ULL * NSEC_PER_SEC;
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_BOOT), 0);
+	s->cpu = 0;
+	start = s->now;
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), 0);
+	KUNIT_EXPECT_LT(test, s->now - start, 100ULL * NSEC_PER_MSEC);
+	KUNIT_EXPECT_EQ(test, s->boot.restarts, 1U);
+	KUNIT_EXPECT_EQ(test, s->power_cycles, 1U);
+	KUNIT_EXPECT_FALSE(test, s->boot.quarantined);
+	KUNIT_EXPECT_EQ(test, s->boot.stage, ANE_H16_STARTUP);
+	KUNIT_EXPECT_FALSE(test, s->boot.starting);
+}
+
 /* An unverified power cycle is not followed by another release of the CPU. */
 static void ane_h16_startup_restart_refused_test(struct kunit *test)
 {
@@ -1191,6 +1260,8 @@ static struct kunit_case ane_h16_boot_cases[] = {
 	KUNIT_CASE(ane_h16_startup_timeout_test),
 	KUNIT_CASE(ane_h16_startup_restart_test),
 	KUNIT_CASE(ane_h16_startup_restart_budget_test),
+	KUNIT_CASE(ane_h16_startup_stopped_test),
+	KUNIT_CASE(ane_h16_startup_stopped_restart_test),
 	KUNIT_CASE(ane_h16_startup_restart_refused_test),
 	KUNIT_CASE(ane_h16_startup_restart_unpowered_test),
 	KUNIT_CASE(ane_h16_startup_no_budget_test),

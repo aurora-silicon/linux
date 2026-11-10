@@ -1097,6 +1097,7 @@ impl HwData {
         self.unk_10 = 0x10_0000_0000;
         self.unk_18 = 0x10_0000_0000;
         self.unk_20 = 0x2ff_ffff_8000;
+        // hw::t8140::dynamic::TIMESTAMP_WINDOW.start; a literal so the host tests build this file alone.
         self.unk_28 = 0xffff_fc21_8140_0000;
         self.unk_e0 = Self::UNK_E0;
         self.unk_2d8 = Self::UNK_2D8;

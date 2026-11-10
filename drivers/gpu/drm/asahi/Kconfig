@@ -79,6 +79,22 @@ config DRM_ASAHI_DEBUG_ALLOCATOR
 	  Say N unless you are debugging firmware structures or porting to a
 	  new firmware version.
 
+config DRM_ASAHI_M3_T8122
+	bool "M3 MacBook Air GPU runtime (T8122, 14.8.3 firmware)"
+	depends on DRM_ASAHI
+	# The runtime adopts the firmware's UAT through the G15 backend's handoff helpers.
+	depends on DRM_ASAHI_G15
+	select CRYPTO_LIB_SHA256
+	default n
+	help
+	  Build the M3 runtime that starts the GPU of the M3 MacBook Air
+	  (J613, J615) on the 14.8.3 GPU firmware the boot loader leaves
+	  loaded. On the listed Air boards it starts after the boot loader
+	  handed the GPU over and resource/firmware identity checks pass.
+	  asahi.t8122_start=0 keeps startup disabled for recovery. Unknown
+	  boards and firmware do not gain automatic admission. Other GPUs
+	  are not affected.
+
 config DRM_ASAHI_G15
 	bool "Apple M3 Pro/Max (G15) support"
 	depends on DRM_ASAHI

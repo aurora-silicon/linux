@@ -2310,6 +2310,39 @@ static int dcp_desktop_modeset(struct apple_dcp *dcp,
 	return iomfb_modeset_v26_6_desktop(dcp, crtc_state);
 }
 
+static bool takeover_adopt = true;
+module_param(takeover_adopt, bool, 0444);
+MODULE_PARM_DESC(takeover_adopt,
+		 "Desktop 26.x panel takeover: present on the loader's live mode instead of setting it again (default: on)");
+
+/*
+ * The loader leaves the panel running, and the firmware keeps that pipe when
+ * it restarts.  Setting the same mode again blanks the panel for ~200 ms, so
+ * adopt it: record the candidate's timing and colour element as the live
+ * mode without set_digital_out_mode.  The swap watchdog follows the swaps
+ * until one completes; if none does, it sets the mode after all
+ * (dcp_swap_watchdog()).
+ */
+static int dcp_takeover_adopt(struct apple_dcp *dcp, const struct drm_display_mode *m)
+{
+	struct dcp_desktop_state *d = dcp->desktop;
+	struct dcp_display_mode sel;
+
+	if (!lookup_mode(dcp, m, &sel))
+		return -ENOENT;
+	dcp->mode = (struct dcp_set_digital_out_mode_req) {
+		.color_mode_id = sel.color_mode_id,
+		.timing_mode_id = sel.timing_mode_id,
+	};
+	dcp->use_timestamps = sel.needs_timestamps;
+	dcp->vrr_enabled = false;
+	d->mode_live = true;
+	d->takeover_adopted = true;
+	dev_info(dcp->dev, "takeover: adopting the live mode (color:%u timing:%u) " DRM_MODE_FMT "\n",
+		 sel.color_mode_id, sel.timing_mode_id, DRM_MODE_ARG(m));
+	return 0;
+}
+
 /*
  * Takeover gate of a desktop 26.x panel, called after the DCP started and
  * before the boot framebuffer is evicted.  Everything that can still be
@@ -2391,7 +2424,13 @@ int dcp_takeover_trial(struct platform_device *pdev, const char **reason)
 		goto out;
 	}
 
-	for (k = 0; k < n; k++) {
+	for (k = 0; takeover_adopt && k < n; k++) {
+		if (!dcp_takeover_adopt(dcp, &cand[k])) {
+			win = k;
+			break;
+		}
+	}
+	for (k = 0; win < 0 && k < n; k++) {
 		int r;
 
 		st->mode = cand[k];
@@ -2568,6 +2607,33 @@ bool dcp_hdr_metadata_live(struct platform_device *pdev)
 
 	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
 	       !dcp_has_panel(dcp);
+}
+
+/*
+ * Whether @pdev switches between SDR and PQ shown as EDR without a mode set:
+ * a desktop 26.x panel keeps its SDR link either way, and PQ only changes how
+ * the swaps tag their surfaces and the EDR values they carry
+ * (dcp_edr_prepare()).  macOS turns EDR on and off on a live panel too.
+ */
+bool dcp_edr_live(struct platform_device *pdev)
+{
+	return dcp_panel_edr_supported(platform_get_drvdata(pdev));
+}
+
+/* Follow a colour state change that dcp_edr_live() let through without a mode set. */
+static void dcp_edr_sync(struct apple_dcp *dcp, struct drm_crtc *crtc,
+			 struct drm_atomic_commit *commit)
+{
+	bool edr;
+
+	if (!dcp_panel_edr_supported(dcp))
+		return;
+	edr = dcp_crtc_eotf(dcp, crtc, commit) == HDMI_EOTF_SMPTE_ST2084 &&
+	      dcp_crtc_bt2020(dcp, crtc, commit);
+	if (edr == dcp->output_edr)
+		return;
+	dev_dbg(dcp->dev, "EDR %s without a mode set\n", edr ? "on" : "off");
+	dcp->output_edr = edr;
 }
 
 /*
@@ -3361,8 +3427,10 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
 	    READ_ONCE(dcp->mode_state.valid) && dcp->connector &&
-	    READ_ONCE(dcp->connector->connected))
+	    READ_ONCE(dcp->connector->connected)) {
+		dcp_edr_sync(dcp, crtc, commit);
 		dcp_hdr_metadata_sync(dcp, crtc, commit);
+	}
 
 	if (iomfb_uses_queue(dcp)) {
 		iomfb_queue_atomic(dcp, crtc, commit);

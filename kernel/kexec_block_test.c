@@ -139,12 +139,17 @@ static void kexec_block_legacy_load_test(struct kunit *test)
 {
 	/* Bad alignment also makes a missing guard fail safely in validation. */
 	struct kexec_segment segment = { .mem = 1, .memsz = PAGE_SIZE };
+	int ret;
 
 	kexec_test_acquire(test);
 	kexec_test_require_empty_images(test);
 	KUNIT_EXPECT_EQ(test, do_kexec_load(0, 1, &segment, 0), -EOPNOTSUPP);
-	KUNIT_EXPECT_EQ(test, do_kexec_load(0, 1, &segment, KEXEC_ON_CRASH),
-			-EOPNOTSUPP);
+	/* A crash kernel only passes the guard without CMA crash memory. */
+	ret = do_kexec_load(0, 1, &segment, KEXEC_ON_CRASH);
+	if (crashk_cma_cnt)
+		KUNIT_EXPECT_EQ(test, ret, -EOPNOTSUPP);
+	else
+		KUNIT_EXPECT_EQ(test, ret, -EADDRNOTAVAIL);
 	/* Unload an empty slot through the actual loader while still blocked. */
 	KUNIT_EXPECT_EQ(test, do_kexec_load(0, 0, NULL, 0), 0);
 	KUNIT_EXPECT_EQ(test, do_kexec_load(0, 0, NULL, KEXEC_ON_CRASH), 0);
@@ -166,9 +171,10 @@ static void kexec_block_file_load_test(struct kunit *test)
 	if (ret == -EPERM)
 		kunit_skip(test, "file loads disabled by permissions or attempt limit");
 	KUNIT_EXPECT_EQ(test, ret, -EOPNOTSUPP);
+	/* Past the guard, the invalid fd stops a crash load before any image. */
 	KUNIT_EXPECT_EQ(test,
 			do_kexec_file_load(-1, -1, 0, NULL, KEXEC_FILE_ON_CRASH),
-			-EOPNOTSUPP);
+			crashk_cma_cnt ? -EOPNOTSUPP : -EBADF);
 	KUNIT_EXPECT_EQ(test, do_kexec_file_load(-1, -1, 0, NULL, KEXEC_FILE_UNLOAD), 0);
 	KUNIT_EXPECT_EQ(test,
 			do_kexec_file_load(-1, -1, 0, NULL,
@@ -188,7 +194,8 @@ static void kexec_block_crash_policy_test(struct kunit *test)
 	loaded_allowed = kexec_crash_image_allowed(true);
 	kexec_unlock();
 	KUNIT_EXPECT_FALSE(test, empty_allowed);
-	KUNIT_EXPECT_FALSE(test, loaded_allowed);
+	/* Retained memory never overlaps a memblock crash reservation. */
+	KUNIT_EXPECT_EQ(test, loaded_allowed, !crashk_cma_cnt);
 	kexec_test_release(test);
 	KUNIT_ASSERT_TRUE(test, kexec_trylock());
 	/* A real guard may have appeared since this case's initial skip check. */
@@ -197,7 +204,7 @@ static void kexec_block_crash_policy_test(struct kunit *test)
 	loaded_allowed = kexec_crash_image_allowed(true);
 	kexec_unlock();
 	KUNIT_EXPECT_FALSE(test, empty_allowed);
-	KUNIT_EXPECT_EQ(test, loaded_allowed, !blocked);
+	KUNIT_EXPECT_EQ(test, loaded_allowed, !(blocked && crashk_cma_cnt));
 }
 
 static struct kunit_case kexec_block_test_cases[] = {

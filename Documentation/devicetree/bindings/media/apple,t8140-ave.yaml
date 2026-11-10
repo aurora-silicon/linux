@@ -230,7 +230,6 @@ allOf:
                       contains:
                         enum:
                           - apple,t6041-ave
-                          - apple,t8112-ave
                           - apple,t8140-ave
                 then:
                   properties:

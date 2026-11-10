@@ -102,6 +102,12 @@ struct ane_fw_transport_ops {
 	void (*refused)(void *ctx, u64 word0, u64 word1, u64 word2, int error);
 	/* Optional: a shared allocation was freed ("FREE") or served again ("reuse"). */
 	void (*shared_note)(void *ctx, const char *event, u64 dva, u64 size, u32 tag);
+	/*
+	 * Optional: true once the firmware's CPU no longer runs, so no reply can
+	 * come. A wait then ends at once with -ESHUTDOWN instead of at its
+	 * deadline.
+	 */
+	bool (*stopped)(void *ctx);
 };
 
 struct ane_fw_transaction {
@@ -914,6 +920,8 @@ static inline int ane_fw_transport_wait(struct ane_fw_transport *t, unsigned int
 		now = t->ops->now_ns(t->ctx);
 		if (now >= t->pending[ch].deadline_ns)
 			return ane_fw_transport_fail(t, -ETIMEDOUT);
+		if (t->ops->stopped && t->ops->stopped(t->ctx))
+			return ane_fw_transport_fail(t, -ESHUTDOWN);
 		t->polls++;
 		t->ops->relax(t->ctx, now - start);
 	}
