@@ -452,10 +452,12 @@ pub(crate) const T6040: PlatformProfile = PlatformProfile {
     ..T8140
 };
 
-/// MacBook Pro 16" M4 Max (J616c). Its ADT describes the SEP and the sensor as
-/// J616s's does.
+/// MacBook Pro 14" and 16" M4 Max (J614c, J616c). Their ADTs describe the SEP
+/// and the sensor as J616s's does: on the J614c (26.6.2) an `iop-sep,ascwrap-v6`
+/// SEP with `sepfw-booted`, and the Mesa sensor (`sensor-id` 0x3356) on spi2 at
+/// `0x429108000`, 8 MHz, powered by NUB GPIO 53 with data-ready on AP GPIO 116.
 pub(crate) const T6041: PlatformProfile = PlatformProfile {
-    name: "T6041/J616c",
+    name: "T6041/J614c, J616c",
     ..T6040
 };
 
@@ -677,7 +679,7 @@ fn select(
     if has(b"apple,t6040") && (has(b"apple,j616s") || has(b"apple,j614s")) {
         return Ok(&T6040);
     }
-    if has(b"apple,t6041") && has(b"apple,j616c") {
+    if has(b"apple,t6041") && (has(b"apple,j616c") || has(b"apple,j614c")) {
         return Ok(&T6041);
     }
     if has(b"apple,t6050") && has(b"apple,j714s") {
@@ -764,6 +766,8 @@ mod tests {
         assert_eq!(picked(&[b"apple,t6040"]), None);
         assert_eq!(picked(&[b"apple,j614s", b"apple,t6040"]), Some(T6040.name));
         assert_eq!(picked(&[b"apple,j616c", b"apple,t6041"]), Some(T6041.name));
+        assert_eq!(picked(&[b"apple,j614c", b"apple,t6041"]), Some(T6041.name));
+        assert_eq!(picked(&[b"apple,t6041"]), None);
         assert_eq!(picked(&[b"apple,j713", b"apple,t6041"]), None);
         assert_eq!(picked(&[b"apple,j714s", b"apple,t6050"]), Some(T6050.name));
         assert_eq!(picked(&[b"apple,t6050"]), None);
