@@ -187,6 +187,11 @@ module_param(legacy_query, bool, 0444);
 MODULE_PARM_DESC(legacy_query,
 		 "Service bounded startup allocations and CONFIG_GET; default on.");
 
+static bool forced_asc_stop = true;
+module_param(forced_asc_stop, bool, 0644);
+MODULE_PARM_DESC(forced_asc_stop,
+		 "Use the optional ANE CPU reset after an unplanned RUN-clear stop failure (default on when the reset exists).");
+
 /* 0 (default) skips RTKit in legacy mode, so the ANE mailbox never
  * starts: the 13.5 firmware sends no HELLO (-ETIME after
  * 1000 ms), and starting the mailbox enables AIC2 884, a level line
@@ -259,6 +264,11 @@ struct ane_rtclient {
 	const struct ane_t602x_soc *soc;
 	struct apple_rtkit *rtk;
 	struct reset_control *cpu_rst;
+	/* True from a successful forced stop until reset is released with all
+	 * ANE domains proven off. It survives a failed restart transaction so a
+	 * later recovery never reads the held CPU's engine registers.
+	 */
+	bool cpu_reset_asserted;
 	struct delayed_work poll_work;
 	struct ane_t6021_pm sleep_pm;
 	struct ane_rtclient_restart *sleep_restart;
@@ -3046,6 +3056,16 @@ struct ane_rtclient_cycle {
 	struct ane_rtclient_pd *pd;
 };
 
+struct ane_rtclient_restart {
+	struct ane_rtclient *ane;
+	struct ane_rtclient_cycle cycle;
+	struct ane_rtclient_retired *retired;
+	struct ane_legacy_buffer *fresh;
+	bool live;		/* POWER_DOWN never reached the firmware */
+	bool halt_attempted;	/* RUN was cleared before the forced stop */
+	bool forced_stop;	/* ASC is held in cpu_rst for this transaction */
+};
+
 static int ane_rtclient_engine_accessible(struct ane_rtclient *ane)
 {
 	if (FIELD_GET(ANE_PS_ACTUAL,
@@ -3078,11 +3098,31 @@ static bool ane_rtclient_domains_off(struct ane_rtclient_cycle *cycle)
 
 static int ane_rtclient_verify_off(void *ctx)
 {
-	struct ane_rtclient_cycle *cycle = ctx;
+	struct ane_rtclient_restart *rs = ctx;
+	struct ane_rtclient_cycle *cycle = &rs->cycle;
+	struct ane_rtclient *ane = rs->ane;
 	bool off;
+	int ret;
 
-	return read_poll_timeout(ane_rtclient_domains_off, off, off,
+	ret = read_poll_timeout(ane_rtclient_domains_off, off, off,
 				100, 100000, false, cycle);
+	if (ret || !rs->forced_stop)
+		return ret;
+
+	/* cpu_rst is a PMGR power-state reset. Releasing it here, after the
+	 * always-on PMGR and genpd state prove every partition is off, makes the
+	 * following power-on a cold start without touching engine MMIO while off.
+	 */
+	ret = reset_control_deassert(ane->cpu_rst);
+	if (ret) {
+		dev_err(ane->dev, "restart: failed to release forced ASC stop while off: %d\n",
+			ret);
+		return ret;
+	}
+	rs->forced_stop = false;
+	ane->cpu_reset_asserted = false;
+	dev_info(ane->dev, "restart: released forced ASC stop while domains were off\n");
+	return 0;
 }
 
 static void ane_rtclient_reap_retired(struct ane_rtclient *ane)
@@ -3111,14 +3151,6 @@ static void ane_rtclient_reap_retired(struct ane_rtclient *ane)
 	ane->retired_allocated = 0;
 	ane->retired_count = 0;
 }
-
-struct ane_rtclient_restart {
-	struct ane_rtclient *ane;
-	struct ane_rtclient_cycle cycle;
-	struct ane_rtclient_retired *retired;
-	struct ane_legacy_buffer *fresh;
-	bool live;		/* POWER_DOWN never reached the firmware */
-};
 
 /*
  * Post a command that never completes (POWER_DOWN). Same slot rules as
@@ -3175,6 +3207,8 @@ static int ane_rtclient_rs_power_down(void *ctx)
 	u16 mark;
 	int ret;
 
+	if (ane->cpu_reset_asserted)
+		return -EBUSY;
 	if (!ane->cmd_buf)
 		return -ENODEV;
 	memset(ane->cmd_buf->cpu, 0, SZ_16K);
@@ -3222,11 +3256,19 @@ static int ane_rtclient_rs_halt(void *ctx)
 	u32 status;
 	int ret;
 
+	/* A prior power-cycle failure may have left the CPU safely held. */
+	if (ane->cpu_reset_asserted) {
+		rs->forced_stop = true;
+		dev_info(ane->dev, "restart: ASC remains held in forced stop\n");
+		return 0;
+	}
+
 	ret = ane_rtclient_engine_accessible(ane);
 	if (ret)
 		return ret;
 	writel(readl(ctl) & ~ANE_ASC_CPU_CONTROL_RUN, ctl);
 	readl(ctl);
+	rs->halt_attempted = true;
 	ret = readl_poll_timeout(ane->engine + ANE_ASC_CPU_STATUS, status,
 				 (status & ANE_ASC_CPU_STATUS_STOPPED) &&
 				 !(status & ANE_ASC_CPU_STATUS_RUNNING),
@@ -3236,6 +3278,29 @@ static int ane_rtclient_rs_halt(void *ctx)
 	dev_info(ane->dev, "restart: ASC stop %s: CPU_STATUS %#x CPU_CONTROL %#x\n",
 		 ret ? "NOT proven" : "proven", status, readl(ctl));
 	return ret;
+}
+
+/* Used only by an unplanned restart after the ordinary RUN-clear stop could
+ * not prove STOPPED. Assert while the CPU domain is still powered. Once held,
+ * do not read CPU_STATUS or any other engine register until power returns.
+ */
+static int ane_rtclient_rs_force_halt(void *ctx)
+{
+	struct ane_rtclient_restart *rs = ctx;
+	struct ane_rtclient *ane = rs->ane;
+	int ret;
+
+	if (!rs->halt_attempted || !forced_asc_stop || !ane->cpu_rst)
+		return -EOPNOTSUPP;
+	ret = reset_control_assert(ane->cpu_rst);
+	if (ret) {
+		dev_err(ane->dev, "restart: failed to assert forced ASC stop: %d\n", ret);
+		return ret;
+	}
+	rs->forced_stop = true;
+	ane->cpu_reset_asserted = true;
+	dev_warn(ane->dev, "restart: ASC held in CPU power-state reset after RUN-clear stop failure\n");
+	return 0;
 }
 
 /* Shared post-power-transition admission, including system resume. */
@@ -3265,7 +3330,7 @@ static int ane_rtclient_rs_power_cycle(void *ctx)
 
 	/* Probe retains one consumer reference for this firmware lifetime. */
 	ret = ane_pm_cycle(ane->dev, rs->cycle.pd->pd_dev, rs->cycle.pd->count,
-			   ane_rtclient_verify_off, &rs->cycle);
+			   ane_rtclient_verify_off, rs);
 	if (ret)
 		return ret;
 	return ane_rtclient_rs_ready(ctx);
@@ -3359,6 +3424,7 @@ static const struct ane_t6021_restart_ops ane_rtclient_restart_ops = {
 	.power_down = ane_rtclient_rs_power_down,
 	.wait_idle = ane_rtclient_rs_wait_idle,
 	.halt = ane_rtclient_rs_halt,
+	.force_halt = ane_rtclient_rs_force_halt,
 	.power_cycle = ane_rtclient_rs_power_cycle,
 	.boot = ane_rtclient_rs_boot,
 };
@@ -3454,8 +3520,9 @@ failed:
  * Cold-restart the Linux-owned firmware. @planned: the instance is live and
  * idle (the caller holds the firmware lock, so no command or call is in
  * flight) and is asked to shut down first. Otherwise a command timed out
- * and only the RUN clear is tried. The ASC must be proven stopped before
- * its domains go off; if it is not, nothing changes and the device stays
+ * and only the RUN clear is tried first. If it cannot prove STOPPED, the
+ * optional CPU power-state reset may hold the ASC until the domains are off.
+ * If neither stop succeeds, nothing is powered off and the device stays
  * quarantined with every mapping, its power claim and its pin.
  */
 static int __ane_rtclient_recover(struct ane_rtclient *ane, bool planned)
