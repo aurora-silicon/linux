@@ -791,28 +791,28 @@ static void ave_6070_start_process_fields(struct kunit *test)
 				unsigned int list0 = (sess->frames - 1) % sess->p.refs;
 
 				if (!sess->p.bframes) {
-				KUNIT_EXPECT_EQ(test,
-						get_unaligned_le64(process + pl->frame_buf),
-						sess->ref_c[cur_slot].dma);
-				KUNIT_EXPECT_EQ(test,
-						get_unaligned_le64(process +
-								   pl->current_recon.luma_data),
-						sess->ref_a[cur_slot].dma + recon.luma_data_offset);
-				KUNIT_EXPECT_EQ(test,
-						get_unaligned_le64(process +
-								   pl->current_recon.chroma_data),
-						sess->ref_a[cur_slot].dma +
-							recon.chroma_data_offset);
-				KUNIT_EXPECT_EQ(test,
-						get_unaligned_le64(process +
-								   pl->list0_recon.luma_data),
-						sess->ref_a[list0].dma + recon.luma_data_offset);
-				KUNIT_EXPECT_EQ(test,
-						get_unaligned_le64(process + pl->list0_lowres),
-						sess->ref_c[list0].dma);
-				KUNIT_EXPECT_EQ(test,
-						get_unaligned_le64(process + pl->current_colocated),
-						sess->ref_b[cur_slot].dma);
+					KUNIT_EXPECT_EQ(test,
+							get_unaligned_le64(process + pl->frame_buf),
+							sess->ref_c[cur_slot].dma);
+					KUNIT_EXPECT_EQ(test,
+							get_unaligned_le64(process +
+									   pl->current_recon.luma_data),
+							sess->ref_a[cur_slot].dma + recon.luma_data_offset);
+					KUNIT_EXPECT_EQ(test,
+							get_unaligned_le64(process +
+									   pl->current_recon.chroma_data),
+							sess->ref_a[cur_slot].dma +
+								recon.chroma_data_offset);
+					KUNIT_EXPECT_EQ(test,
+							get_unaligned_le64(process +
+									   pl->list0_recon.luma_data),
+							sess->ref_a[list0].dma + recon.luma_data_offset);
+					KUNIT_EXPECT_EQ(test,
+							get_unaligned_le64(process + pl->list0_lowres),
+							sess->ref_c[list0].dma);
+					KUNIT_EXPECT_EQ(test,
+							get_unaligned_le64(process + pl->current_colocated),
+							sess->ref_b[cur_slot].dma);
 				}
 				KUNIT_EXPECT_EQ(test,
 						get_unaligned_le64(process + pl->lrme_stats),
@@ -961,11 +961,11 @@ static void ave_6070_gate(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(0x25bfd039),
 			    &ave_layout_6070_11_1);
 	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(0), NULL);
-	KUNIT_EXPECT_EQ(test, ave_build_start(ctx, cmd, sizeof(cmd)),
-			-EOPNOTSUPP);
-	KUNIT_EXPECT_EQ(
-		test, ave_build_process(ctx, cmd, sizeof(cmd), 0, 0, 0, false),
-		-EOPNOTSUPP);
+	/* H.264 low delay is qualified; a short command buffer is still refused. */
+	KUNIT_EXPECT_TRUE(test, ave_layout_6070_11_1.encode_ready);
+	KUNIT_EXPECT_LT(test, ave_build_start(ctx, cmd, sizeof(cmd)), 0);
+	KUNIT_EXPECT_LT(test,
+			ave_build_process(ctx, cmd, sizeof(cmd), 0, 0, 0, false), 0);
 	KUNIT_EXPECT_MEMEQ(test, cmd, before, sizeof(cmd));
 	KUNIT_EXPECT_EQ(test, sess->token, 0ULL);
 }

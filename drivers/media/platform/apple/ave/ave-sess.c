@@ -178,6 +178,13 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 		return -EINVAL;
 	if (ctx->ave->layout->kind == AVE_LAYOUT_6070 && p->sample_bytes != 1)
 		return -EOPNOTSUPP;
+	/*
+	 * The 6070 path is qualified for 8-bit H.264 with frame widths in whole
+	 * macroblocks; HEVC and wider-than-coded widths are not yet.
+	 */
+	if (ctx->ave->layout->kind == AVE_LAYOUT_6070 &&
+	    (p->codec != AVE_CODEC_H264 || p->width % 16))
+		return -EOPNOTSUPP;
 	p->bit_depth = 8;
 	if (p->sample_bytes == 2) {
 		/* Only the 9003 layout's Main 10 fields are mapped. */
@@ -194,6 +201,9 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	 */
 	p->intra_only = p->codec == AVE_CODEC_H264 && ctx->gop_size == 1;
 	p->bframes = !baseline && !p->intra_only && ctx->b_frames;
+	/* 6070: low-delay only for now (I and P pictures, two references). */
+	if (ctx->ave->layout->kind == AVE_LAYOUT_6070)
+		p->bframes = false;
 	p->reorder_off = !ctx->b_frames;
 	p->refs = p->intra_only ? 1 : p->bframes ? 5 : 2;
 	p->slots = p->bframes ? 5 : 3;

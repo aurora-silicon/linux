@@ -25,14 +25,15 @@ retained codec-state partitions and per-slot HEVC slice-header tables. The
 session allocator provides distinct backing for every live bank and rejects
 non-16-KiB-aligned IOVAs.
 
-Streaming still returns EOPNOTSUPP before writing or submitting either image:
-``encode_ready`` remains false for both 6070 CRCs until the lane proves hello
-and explicitly qualifies it. The implemented feature boundary is one
-quality-first NV12 constant-quality session, H.264 or HEVC Main 8-bit. Main 10,
-bit-rate modes, speed priority, standalone LRME and Reset remain unavailable.
-No Priority command is sent. Complete is the normal drain barrier; Flush is
-reserved for cancellation before Stop and Close. KUnit checks the 1080p and 4K
-fields directly from the clean ledgers and embeds no Apple command image.
+Streaming is enabled for one quality-first NV12 constant-quality session of
+8-bit H.264 (Baseline, Main or High) with low delay: I and P pictures, two
+reconstruction slots that alternate, frame widths in whole macroblocks. B
+pictures, HEVC, Main 10, bit-rate modes, speed priority, standalone LRME and
+Reset remain unavailable; a session asking for B pictures is encoded without
+them, the others are refused. No Priority command is sent. Complete is the
+normal drain barrier; Flush is reserved for cancellation before Stop and Close.
+KUnit checks the 1080p and 4K fields directly from the clean ledgers and embeds
+no Apple command image.
 
 Lifecycle-only validation
 -------------------------
