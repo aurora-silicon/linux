@@ -918,6 +918,16 @@ static int apple_connector_atomic_check(struct drm_connector *conn,
 	    to_apple_connector(conn)->dcp &&
 	    dcp_hdr_metadata_live(to_apple_connector(conn)->dcp))
 		return 0;
+	/*
+	 * A panel that shows PQ as EDR keeps its SDR link: SDR and PQ switch
+	 * with the next swap, so a compositor turning HDR on at startup does
+	 * not blank it.  Other EOTFs still go through the mode set's check.
+	 */
+	if (old->crtc == new->crtc && to_apple_connector(conn)->dcp &&
+	    dcp_edr_live(to_apple_connector(conn)->dcp) &&
+	    (apple_connector_eotf(new) == HDMI_EOTF_TRADITIONAL_GAMMA_SDR ||
+	     apple_connector_eotf(new) == HDMI_EOTF_SMPTE_ST2084))
+		return 0;
 	crtc_state->mode_changed = true;
 	return 0;
 }
