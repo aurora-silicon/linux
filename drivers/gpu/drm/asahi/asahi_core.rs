@@ -240,5 +240,9 @@ module! {
             default: 0,
             description: "G16 25G83 per-record test: compute (1), render (2), both (3)",
         },
+        legacy_wait_util_min: u32 {
+            default: 512,
+            description: "G13/G14 test: CPU capacity hint for syncobj waits after a submission (0: off)",
+        },
     },
 }
