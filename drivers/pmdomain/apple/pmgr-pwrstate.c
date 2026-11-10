@@ -1345,12 +1345,33 @@ int apple_pmgr_ps_consumer_on(struct device *consumer)
 		return n;
 	for (int i = n - 1; i >= 0; i--) {
 		ret = apple_pmgr_ps_consumer_switch(chain[i], true);
-		if (ret)
+		/* Also a rollback after a power-off that stopped partway: skip what stayed on. */
+		if (ret && ret != -EALREADY)
 			return ret;
 	}
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_pmgr_ps_consumer_on);
+
+/*
+ * Whether @consumer's own state, the first of its chain, is powered off: after
+ * a power-off that stopped partway, whether its block went through reset.
+ */
+bool apple_pmgr_ps_consumer_is_off(struct device *consumer)
+{
+	struct apple_pmgr_ps *chain[APPLE_PMGR_PS_MAX_CHAIN];
+	int n = apple_pmgr_ps_consumer_chain(consumer, chain);
+	unsigned long flags;
+	bool off;
+
+	if (n < 0)
+		return false;
+	spin_lock_irqsave(&chain[0]->genpd.slock, flags);
+	off = chain[0]->consumer_off;
+	spin_unlock_irqrestore(&chain[0]->genpd.slock, flags);
+	return off;
+}
+EXPORT_SYMBOL_GPL(apple_pmgr_ps_consumer_is_off);
 
 static const struct of_device_id apple_pmgr_ps_of_match[] = {
 	{ .compatible = "apple,t8103-pmgr-pwrstate" },
