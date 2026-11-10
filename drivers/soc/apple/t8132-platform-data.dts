@@ -34,12 +34,46 @@
 
 #include "../../../arch/arm64/boot/dts/apple/t8132-pmgr.dtsi"
 #include "../../../arch/arm64/boot/dts/apple/t8132-j713-pmgr.dtsi"
+#include "../../../arch/arm64/boot/dts/apple/t8132-j713-usb4-pmgr.dtsi"
 #include "../../../arch/arm64/boot/dts/apple/t8132-memory.dtsi"
 
 /* The J713's SEP domain, for its deep sleep: every other board keeps it off. */
 &ps_sep {
 	apple,firmware-owned;
 	status = "okay";
+	apple,policy-machine = "apple,j713";
+};
+
+/* The J713's ACIO power states: every other board keeps its own (or none). */
+&ps_atc0_pcie {
+	apple,policy-machine = "apple,j713";
+};
+
+&ps_atc1_pcie {
+	apple,policy-machine = "apple,j713";
+};
+
+&ps_atc0_cio {
+	apple,policy-machine = "apple,j713";
+};
+
+&ps_atc0_cio_pcie {
+	apple,policy-machine = "apple,j713";
+};
+
+&ps_atc0_cio_usb {
+	apple,policy-machine = "apple,j713";
+};
+
+&ps_atc1_cio {
+	apple,policy-machine = "apple,j713";
+};
+
+&ps_atc1_cio_pcie {
+	apple,policy-machine = "apple,j713";
+};
+
+&ps_atc1_cio_usb {
 	apple,policy-machine = "apple,j713";
 };
 

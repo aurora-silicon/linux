@@ -282,3 +282,14 @@
 &port00 {
 	clkreq-gpios = <&pinctrl_ap 160 GPIO_ACTIVE_LOW>;
 };
+
+/* Each ACIO host powers its Type-C PHY down and up around a deep sleep with a dock. */
+&usb4_0_acio {
+	phys = <&atcphy0 PHY_TYPE_USB3>;
+	phy-names = "cio";
+};
+
+&usb4_1_acio {
+	phys = <&atcphy1 PHY_TYPE_USB3>;
+	phy-names = "cio";
+};
