@@ -2664,6 +2664,40 @@ int DCP_FW_NAME(iomfb_s2r_500)(struct apple_dcp *dcp)
 }
 #endif
 
+#if DCP_FW_DESKTOP_26(DCP_FW_VER)
+/*
+ * The system's power state as the power management sets it on the
+ * framebuffer: A473 with the first and
+ * the last transition flag and no result, 0 for the sleep (as last_client_closed_sleep()
+ * sends it) and 1 after the wake. The display's own power (dcp_poweron(), DPMS) sets no
+ * flag and only moves the soft power state. After the sleep only this brings the
+ * firmware's hard power state back; until then it refuses every mode set.
+ */
+int DCP_FW_NAME(iomfb_system_power)(struct apple_dcp *dcp, bool on)
+{
+	struct DCP_FW_NAME(dcp_set_power_state_req) req =
+		dcp_power_state_req(on, DCP_POWER_TRANSITION_RESTARTABLE_SLEEP);
+	struct dcp_wait_cookie *cookie;
+	unsigned long left;
+
+	cookie = kzalloc_obj(*cookie);
+	if (!cookie)
+		return -ENOMEM;
+	cookie->status = ~0U;
+	init_completion(&cookie->done);
+	kref_init(&cookie->refcount);
+	/* increase refcount to ensure the receiver has a reference */
+	kref_get(&cookie->refcount);
+
+	dcp_set_power_state(dcp, DCP_POWER_OOB, &req, complete_set_powerstate, cookie);
+
+	left = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(1000));
+	kref_put(&cookie->refcount, release_wait_cookie);
+
+	return left ? 0 : -ETIMEDOUT;
+}
+#endif
+
 #if DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER < DCP_FW_VERSION(27, 0, 0)
 int DCP_FW_NAME(iomfb_s2r_power)(struct apple_dcp *dcp, bool on, bool named_calls, bool oob)
 {
