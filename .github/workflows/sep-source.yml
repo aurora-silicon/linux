@@ -12,6 +12,13 @@ on:
       - 'tools/aurora-sep/**'
       - '.github/workflows/sep-source.yml'
 
+permissions:
+  contents: read
+
+concurrency:
+  group: sep-source-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   source:
     runs-on: ubuntu-latest
