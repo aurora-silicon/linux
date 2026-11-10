@@ -23,6 +23,7 @@
 #![allow(dead_code)]
 
 use kernel::prelude::*;
+use kernel::transmute::FromBytes;
 use kernel::uaccess::{UserPtr, UserSlice};
 
 const CLIENT: u64 = crate::sks::SKS_CLIENT_ID;
@@ -1237,8 +1238,12 @@ impl crate::SepData {
                 crate::bio::ok()
             }
             IOC_FDE_CREATE => {
-                let mut key: FdeKey =
-                    UserSlice::new(user_ptr, core::mem::size_of::<FdeKey>()).reader().read()?;
+                // 2 KiB: keep the request off the kernel stack.
+                let (reader, mut writer) =
+                    UserSlice::new(user_ptr, core::mem::size_of::<FdeKey>()).reader_writer();
+                let mut buf = KVec::<u8>::with_capacity(core::mem::size_of::<FdeKey>(), GFP_KERNEL)?;
+                reader.read_all(&mut buf, GFP_KERNEL)?;
+                let key = FdeKey::from_bytes_mut(&mut buf).ok_or(EINVAL)?;
                 if key.uid < MIN_UID || key.uid > i32::MAX as u32 {
                     return Err(EINVAL);
                 }
@@ -1250,14 +1255,22 @@ impl crate::SepData {
                 key.record.fill(0);
                 key.record[..record.len()].copy_from_slice(&record);
                 key.record_len = record.len() as u32;
-                UserSlice::new(user_ptr, core::mem::size_of::<FdeKey>()).writer().write(&key)?;
+                writer.write_slice(&buf)?;
                 crate::bio::ok()
             }
             IOC_FDE_SEAL | IOC_FDE_UNSEAL => {
                 let seal = cmd == IOC_FDE_SEAL;
-                let mut req: FdeSeal =
-                    UserSlice::new(user_ptr, core::mem::size_of::<FdeSeal>()).reader().read()?;
-                let user = parse_fde(&req, seal)?;
+                // 2.4 KiB: keep the request off the kernel stack. It carries the
+                // volume secret, so the buffer is wiped when it is dropped.
+                let (reader, mut writer) =
+                    UserSlice::new(user_ptr, core::mem::size_of::<FdeSeal>()).reader_writer();
+                let mut buf = crate::Secret(KVec::<u8>::with_capacity(
+                    core::mem::size_of::<FdeSeal>(),
+                    GFP_KERNEL,
+                )?);
+                reader.read_all(&mut buf.0, GFP_KERNEL)?;
+                let req = FdeSeal::from_bytes_mut(&mut buf.0).ok_or(EINVAL)?;
+                let user = parse_fde(req, seal)?;
                 let record_len = req.record_len as usize;
                 if seal {
                     let sealed = self.fde_seal(
@@ -1286,7 +1299,7 @@ impl crate::SepData {
                     req.secret[..secret.len()].copy_from_slice(&secret);
                     req.secret_len = secret.len() as u32;
                 }
-                UserSlice::new(user_ptr, core::mem::size_of::<FdeSeal>()).writer().write(&req)?;
+                writer.write_slice(&buf)?;
                 crate::bio::ok()
             }
             IOC_CREATE | IOC_UNLOCK => {
