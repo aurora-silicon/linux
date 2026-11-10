@@ -71,8 +71,10 @@ static int apple_dart_fw_invalidate(struct apple_dart_stream_map *stream, u64 fi
 static int full(struct apple_dart_stream_map *stream) { fulls++; return 0; }
 /* No J713 sleep owns this DART, so writers are admitted; each must still leave. */
 static int writers;
-static int apple_dart_sleep_writer_get(struct apple_dart *dart) { writers++; return 0; }
-static void apple_dart_sleep_writer_put(struct apple_dart *dart) { assert(writers>0); writers--; }
+#define APPLE_DART_WRITER_COUNTED 1
+#define APPLE_DART_WRITER_CLOSED 2
+static int apple_dart_sleep_writer_get(struct apple_dart *dart) { writers++; return APPLE_DART_WRITER_COUNTED; }
+static void apple_dart_sleep_writer_put(struct apple_dart *dart, int gate) { assert(gate==APPLE_DART_WRITER_COUNTED && writers>0); writers--; }
 static void apple_dart_sleep_release_failed(void) { assert(!"sleep writer refused"); }
 '''
     source += production

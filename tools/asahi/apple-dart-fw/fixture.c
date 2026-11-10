@@ -67,6 +67,7 @@ struct apple_dart {
 	int lock, locked_retire_err[2];
 	/* A J713 sleep's, never set here. */
 	void *sleep_record;
+	bool cio_active;
 };
 struct apple_dart_stream_map {struct apple_dart*dart;unsigned long sidmap[1];};
 struct apple_dart_atomic_stream_map {struct apple_dart*dart;unsigned long sidmap[1];};
@@ -130,6 +131,24 @@ static int apple_dart_dcp_invalidate_tlb_gated(struct apple_dart_stream_map*m){a
 static void apple_dart_sleep_release_failed(void)
 {
 	abort();
+}
+
+/* Admitted and counted, as a writer of a DART a sleep owns; every one must leave. */
+#define APPLE_DART_WRITER_COUNTED 1
+#define APPLE_DART_WRITER_CLOSED 2
+static int writers;
+static int apple_dart_sleep_writer_get(struct apple_dart *dart)
+{
+	(void)dart;
+	writers++;
+	return APPLE_DART_WRITER_COUNTED;
+}
+
+static void apple_dart_sleep_writer_put(struct apple_dart *dart, int gate)
+{
+	(void)dart;
+	assert(gate == APPLE_DART_WRITER_COUNTED && writers > 0);
+	writers--;
 }
 #define dev_info(d,...) ((void)0)
 /* PRODUCTION */

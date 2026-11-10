@@ -17,15 +17,34 @@ struct apple_dart_sleep_state {
 	bool power_off;
 };
 
+/*
+ * A writer of a DART whose state a sleep owner keeps. 0: not gated, nothing to
+ * put; APPLE_DART_WRITER_COUNTED: admitted, put it afterwards;
+ * APPLE_DART_WRITER_CLOSED: a host-owned DART is closed for its power cycle,
+ * so write the page tables in memory only, never its registers (its owner
+ * flushes it when it reopens); negative: refused.
+ */
 static int apple_dart_sleep_writer_get(struct apple_dart *dart)
 {
+	struct apple_dart_cio *cio = dart->cio;
 	unsigned long flags;
-	int ret = 0;
+	int ret = APPLE_DART_WRITER_COUNTED;
 
-	if (!dart->managed_sids)
+	/* A live DART without a bound owner takes no lock; a closed one always does. */
+	if (!dart->managed_sids &&
+	    !(cio && (READ_ONCE(cio->owner) || READ_ONCE(dart->sleep_closed))))
 		return 0;
 	spin_lock_irqsave(&dart->managed_lock, flags);
-	if (dart->sleep_closed) {
+	if (dart->sleep_closed && cio) {
+		/* Counted until done: reopening waits for them before its flush. */
+		if (cio->closed_writers == UINT_MAX) {
+			ret = -EOVERFLOW;
+		} else {
+			cio->closed_writers++;
+			cio->tlb_stale = true;
+			ret = APPLE_DART_WRITER_CLOSED;
+		}
+	} else if (dart->sleep_closed) {
 		if (dart->sleep_record)
 			WRITE_ONCE(dart->sleep_record->result, -EUCLEAN);
 		ret = -EBUSY;
@@ -38,14 +57,17 @@ static int apple_dart_sleep_writer_get(struct apple_dart *dart)
 	return ret;
 }
 
-static void apple_dart_sleep_writer_put(struct apple_dart *dart)
+static void apple_dart_sleep_writer_put(struct apple_dart *dart, int gate)
 {
 	unsigned long flags;
 
-	if (!dart->managed_sids)
+	if (gate != APPLE_DART_WRITER_COUNTED && gate != APPLE_DART_WRITER_CLOSED)
 		return;
 	spin_lock_irqsave(&dart->managed_lock, flags);
-	dart->sleep_writers--;
+	if (gate == APPLE_DART_WRITER_CLOSED)
+		dart->cio->closed_writers--;
+	else
+		dart->sleep_writers--;
 	spin_unlock_irqrestore(&dart->managed_lock, flags);
 }
 
@@ -59,7 +81,7 @@ static int apple_dart_sleep_close(struct apple_dart *dart)
 	if (dart->sleep_closed || dart->sleep_writers)
 		ret = -EBUSY;
 	else
-		dart->sleep_closed = true;
+		WRITE_ONCE(dart->sleep_closed, true);
 	spin_unlock_irqrestore(&dart->managed_lock, flags);
 	return ret;
 }
@@ -67,7 +89,7 @@ static int apple_dart_sleep_close(struct apple_dart *dart)
 /* A void unmap/free caller may release backing memory when we return. */
 static void __noreturn apple_dart_sleep_release_failed(void)
 {
-	panic("J713 radio: DMA state cannot be released safely");
+	panic("Apple DART: DMA state cannot be released safely");
 }
 
 static int apple_dart_sleep_valid(struct apple_dart_sleep *sleep)
