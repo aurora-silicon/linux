@@ -66,6 +66,23 @@ struct ave_vb2_mem;
 
 #define AVE_MSG_MAX SZ_4K
 
+/*
+ * Rings the host serves. IO and IO_T2H carry commands and answers on every
+ * firmware; the 6070 firmware also borrows shared memory (SHAREDMALLOC) and
+ * logs (TERMINAL) over rings of their own.
+ */
+enum {
+	AVE_RING_IO,
+	AVE_RING_T2H,
+	AVE_RING_SMALLOC,
+	AVE_RING_LOG,
+	AVE_RINGS,
+};
+
+#define AVE_SMALLOC_GRANULE SZ_4K
+#define AVE_SMALLOC_UNITS (SZ_4M / AVE_SMALLOC_GRANULE)
+#define AVE_SMALLOC_MAX 32
+
 enum ave_codec {
 	AVE_CODEC_H264 = 1,
 	AVE_CODEC_HEVC = 2,
@@ -168,6 +185,18 @@ struct ave_variant {
 	u32 timebase_multiplier;
 	u64 vcbar_mask;
 	u64 vcbar_flags;
+	/*
+	 * TEXT offset of the 64-bit cell the loader fills with the DATA
+	 * address; it is zero in the firmware image. 0 when there is none.
+	 */
+	u32 text_link_cell;
+	/*
+	 * Mailbox offset of the SVE idle (clock gating) word that must read 0
+	 * before the firmware starts, or 0 when the variant has none.
+	 */
+	u32 mbox_idle;
+	/* Restore DATA from the boot snapshot before every start, the first included. */
+	bool restore_data_first;
 
 	size_t extra0_size;
 	/* Register sequence and boot/hello configuration have been qualified. */
@@ -216,7 +245,12 @@ struct ave_dev {
 	struct ave_reply expected[AVE_OP_COUNT];
 	u64 ipc_fw_base;
 	u32 channel_bytes;
-	struct ave_ring ring[2];
+	struct ave_ring ring[AVE_RINGS];
+	/* Shared memory lent to the firmware, in AVE_SMALLOC_GRANULE units. */
+	DECLARE_BITMAP(smalloc_map, AVE_SMALLOC_UNITS);
+	struct {
+		u32 first, units;
+	} smalloc[AVE_SMALLOC_MAX];
 	u32 next_client;
 	u32 unacked;
 	u8 want[AVE_OP_COUNT];
@@ -382,6 +416,8 @@ extern const struct ave_variant ave_t6000, ave_t8112;
 /* ave-fw.c */
 u64 ave_fw_vcbar(const struct ave_variant *variant, u64 text_iova);
 int ave_fw_probe(struct ave_dev *ave);
+int ave_fw_text_id_crc(const void *text, size_t size, u32 cell_off,
+		       u64 data_iova, u32 *crc);
 void ave_fw_remove(struct ave_dev *ave);
 int ave_fw_ensure_running(struct ave_dev *ave);
 void ave_fw_halt(struct ave_dev *ave);
@@ -402,6 +438,8 @@ void ave_free(struct ave_dev *ave, struct ave_buf *b);
 /* ave-ipc.c */
 int ave_ipc_check_hello(const struct ave_fw_transport *t, const u32 hello[4]);
 int ave_ipc_parse_channels(struct ave_dev *ave);
+int ave_ipc_serve_smalloc(struct ave_dev *ave);
+void ave_ipc_drain_log(struct ave_dev *ave);
 int ave_ipc_negotiate(struct ave_dev *ave, const u32 hello[4]);
 void *ave_ipc_cmd(struct ave_dev *ave, unsigned int buf, size_t len);
 int ave_ipc_scalar_buf(struct ave_dev *ave);
