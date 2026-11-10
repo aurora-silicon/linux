@@ -28,6 +28,7 @@
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/suspend.h>
 #include <linux/workqueue.h>
 
 #include <media/v4l2-ctrls.h>
@@ -66,7 +67,7 @@ static const struct apr_fmt apr_raw_fmts[] = {
 
 /*
  * Settings the engine and its AXI-to-fabric bridge need before the first
- * job, as read-modify-write (offset, mask, value), in order. T8140 values.
+ * job, as read-modify-write (offset, mask, value), in order.
  */
 static const struct apr_tunable apr_t8140_engine_tunables[] = {
 	{ 0x008, 0x00000008, 0x00000008 },
@@ -244,6 +245,247 @@ static const struct apr_tunable apr_t6000_engine_tunables[] = {
 	{ 0x374, 0x07ff07ff, 0x06c000a0 },
 };
 
+/*
+ * M4 Pro (T6040 in the ADT, apple,t6041 in the DT): the engine has the
+ * T8140 register layout with its own buffer and FIFO sizes. It sits in the
+ * shared codec block, so its AXI bridge is the shared codec's, and the
+ * block's system registers (the "aux" window) take their arbitration
+ * settings first.
+ * Values as macOS applies them for this engine (apr,j0).
+ */
+static const struct apr_tunable apr_t6041_engine_tunables[] = {
+	{ 0x008, 0x00000008, 0x00000008 },
+	{ 0x118, 0x0fff0fff, 0x00000600 },
+	{ 0x11c, 0x0fff0fff, 0x00000600 },
+	{ 0x148, 0x00000001, 0x00000001 },
+	{ 0x180, 0x8fff3fff, 0x800a0600 },
+	{ 0x184, 0x000000ff, 0x00000001 },
+	{ 0x188, 0x0fff0fff, 0x09b80038 },
+	{ 0x1c0, 0x8fff3fff, 0x80040600 },
+	{ 0x1c4, 0x000000ff, 0x00000003 },
+	{ 0x1c8, 0x0fff0fff, 0x080000c0 },
+	{ 0x200, 0x8fff3fff, 0x80050600 },
+	{ 0x204, 0x000000ff, 0x00000002 },
+	{ 0x208, 0x0fff0fff, 0x08c000c0 },
+	{ 0x240, 0x8fff3fff, 0x800007ff },
+	{ 0x244, 0x000000ff, 0x00000007 },
+	{ 0x248, 0x000000ff, 0x00000040 },
+	{ 0x280, 0x8fff3fff, 0x80010600 },
+	{ 0x284, 0x000000ff, 0x00000006 },
+	{ 0x288, 0x000000ff, 0x00000080 },
+	{ 0x2c0, 0x8fff3fff, 0x80020600 },
+	{ 0x2c4, 0x000000ff, 0x00000005 },
+	{ 0x2c8, 0x000000ff, 0x00000040 },
+	{ 0x300, 0x8fff3fff, 0x80030600 },
+	{ 0x304, 0x000000ff, 0x00000004 },
+	{ 0x308, 0x000000ff, 0x00000040 },
+	{ 0x340, 0xbfffff86, 0x81000006 },
+	{ 0x344, 0xffffffff, 0x0b0a0908 },
+	{ 0x348, 0x0000ffff, 0x00000720 },
+	{ 0x34c, 0x000003ff, 0x00000140 },
+	{ 0x350, 0x00ffffff, 0x00928170 },
+	{ 0x380, 0x8fff3fff, 0x800b0a00 },
+	{ 0x384, 0x000000ff, 0x0000000c },
+	{ 0x388, 0x0fff0fff, 0x09800038 },
+	{ 0x394, 0xffffffc0, 0x00200000 },
+	{ 0x3c0, 0x8fff3fff, 0x800b0a00 },
+	{ 0x3c4, 0x000000ff, 0x00000019 },
+	{ 0x3c8, 0x0fff0fff, 0x09f00010 },
+	{ 0x4c0, 0x800f3fff, 0x800b09ff },
+	{ 0x4c4, 0x000000ff, 0x0000001b },
+	{ 0x4c8, 0x0fff0fff, 0x09300010 },
+	{ 0x500, 0x800f3fff, 0x800605ff },
+	{ 0x504, 0x000000ff, 0x0000000d },
+	{ 0x508, 0x0fff0fff, 0x080000a0 },
+	{ 0x540, 0x800f3fff, 0x800005ff },
+	{ 0x544, 0x000000ff, 0x00000011 },
+	{ 0x548, 0x000000ff, 0x00000080 },
+	{ 0x580, 0x800f3fff, 0x800105ff },
+	{ 0x584, 0x000000ff, 0x00000010 },
+	{ 0x588, 0x000000ff, 0x00000080 },
+	{ 0x5c0, 0x800f3fff, 0x800205ff },
+	{ 0x5c4, 0x000000ff, 0x0000000f },
+	{ 0x5c8, 0x000000ff, 0x00000040 },
+	{ 0x600, 0x800f3fff, 0x800305ff },
+	{ 0x604, 0x000000ff, 0x0000000e },
+	{ 0x608, 0x000000ff, 0x00000040 },
+	{ 0x640, 0x802ff040, 0x80070040 },
+	{ 0x644, 0x00ffffff, 0x00071716 },
+	{ 0x648, 0xffff0003, 0x07ff0003 },
+	{ 0x650, 0x0fff0fff, 0x06000040 },
+	{ 0x680, 0x802ff040, 0x80081040 },
+	{ 0x684, 0x00ffffff, 0x00071514 },
+	{ 0x688, 0xffff0003, 0x07ff0003 },
+	{ 0x690, 0x0fff0fff, 0x06400040 },
+	{ 0x6c0, 0x802ff040, 0x80092040 },
+	{ 0x6c4, 0x00ffffff, 0x00071312 },
+	{ 0x6c8, 0xffff0003, 0x07ff0003 },
+	{ 0x6d0, 0x0fff0fff, 0x06800040 },
+	{ 0x700, 0x800f3fff, 0x800b09ff },
+	{ 0x704, 0x000000ff, 0x00000018 },
+	{ 0x708, 0x0fff0fff, 0x08a00060 },
+	{ 0x714, 0xffffffc0, 0x00200000 },
+	{ 0x740, 0x800f3fff, 0x800b09ff },
+	{ 0x744, 0x000000ff, 0x0000001a },
+	{ 0x748, 0x0fff0fff, 0x09000010 },
+	{ 0x780, 0x800f3fff, 0x800b09ff },
+	{ 0x784, 0x000000ff, 0x0000001c },
+	{ 0x788, 0x0fff0fff, 0x09100010 },
+	{ 0x7c0, 0x800f3fff, 0x800b09ff },
+	{ 0x7c4, 0x000000ff, 0x0000001d },
+	{ 0x7c8, 0x0fff0fff, 0x09200010 },
+};
+
+static const struct apr_tunable apr_t6041_wrapper_tunables[] = {
+	{ 0x0000, 0x800001ff, 0x8000001d },
+	{ 0x0004, 0x81ff01ff, 0x801d0003 },
+	{ 0x0008, 0x81ff01ff, 0x801d000c },
+	{ 0x000c, 0x81ff01ff, 0x801d0003 },
+	{ 0x0010, 0x81ff01ff, 0x80000020 },
+	{ 0x0014, 0x81ff01ff, 0x80000020 },
+	{ 0x0018, 0x81ff01ff, 0x801d0003 },
+	{ 0x001c, 0x81ff01ff, 0x801d0003 },
+	{ 0x0020, 0x800000ff, 0x80000016 },
+	{ 0x0024, 0x800000ff, 0x8000001d },
+	{ 0x0028, 0x80ff00ff, 0x801d0003 },
+	{ 0x002c, 0x80ff00ff, 0x801d0003 },
+	{ 0x0030, 0x80ff00ff, 0x80000020 },
+	{ 0x0034, 0x80ff00ff, 0x801d0003 },
+	{ 0x0038, 0x80ff00ff, 0x801d0003 },
+	{ 0x003c, 0x800000ff, 0x80000016 },
+	{ 0x0040, 0x800000ff, 0x80000016 },
+	{ 0x0044, 0x800000ff, 0x80000016 },
+	{ 0x0100, 0x000000ff, 0x000000ff },
+	{ 0x0108, 0xffff0006, 0x00100000 },
+	{ 0x0304, 0x3f3f0000, 0x02020000 },
+	{ 0x0308, 0x000fffff, 0x00001681 },
+	{ 0x030c, 0x000fffff, 0x00001680 },
+	{ 0x0310, 0x70000fff, 0x000001e0 },
+	{ 0x0314, 0xf0000fff, 0x800001e0 },
+	{ 0x0318, 0x70000fff, 0x000005a0 },
+	{ 0x031c, 0xf0000fff, 0x800005a0 },
+	{ 0x0320, 0x70000fff, 0x000005a0 },
+	{ 0x0324, 0xf0000fff, 0x800005a0 },
+	{ 0x0328, 0x70000fff, 0x0000003c },
+	{ 0x032c, 0xf0000fff, 0x8000003c },
+	{ 0x0330, 0x70000fff, 0x000005a0 },
+	{ 0x0334, 0x70000fff, 0x000005a0 },
+	{ 0x0338, 0x70000fff, 0x000005a0 },
+	{ 0x0344, 0x80000000, 0x00000000 },
+	{ 0x034c, 0xffffffff, 0x00050020 },
+	{ 0x0350, 0xffffffff, 0x000a0030 },
+	{ 0x0408, 0xffff0020, 0x00190020 },
+	{ 0x040c, 0x000fffff, 0x00001681 },
+	{ 0x0410, 0x000fffff, 0x00001680 },
+	{ 0x0414, 0x70000fff, 0x000001e0 },
+	{ 0x0418, 0x70000fff, 0x000001e0 },
+	{ 0x041c, 0x70000fff, 0x000005a0 },
+	{ 0x0420, 0x70000fff, 0x000005a0 },
+	{ 0x0424, 0x70000fff, 0x000005a0 },
+	{ 0x0428, 0x70000fff, 0x000005a0 },
+	{ 0x042c, 0x70000fff, 0x0000003c },
+	{ 0x0430, 0x70000fff, 0x0000003c },
+	{ 0x0434, 0x70000fff, 0x000005a0 },
+	{ 0x0438, 0x70000fff, 0x000005a0 },
+	{ 0x043c, 0x70000fff, 0x000005a0 },
+	{ 0x0448, 0x80000000, 0x00000000 },
+	{ 0x0748, 0x07ff07ff, 0x00200000 },
+	{ 0x0848, 0x07ff07ff, 0x00100030 },
+	{ 0x0948, 0x07ff07ff, 0x01400100 },
+	{ 0x0a50, 0x07ff07ff, 0x01000100 },
+	{ 0x0c00, 0xffffffff, 0x7fffffff },
+	{ 0x4008, 0x00000001, 0x00000000 },
+	{ 0x400c, 0x00000001, 0x00000001 },
+	{ 0x4014, 0x00000001, 0x00000000 },
+	{ 0x4018, 0x00000001, 0x00000000 },
+	{ 0x401c, 0x00000001, 0x00000001 },
+};
+
+static const struct apr_tunable apr_t6041_aux_tunables[] = {
+	{ 0x0008, 0x00000001, 0x00000001 },
+	{ 0x000c, 0x000001ff, 0x00000001 },
+	{ 0x0014, 0x01110111, 0x01100110 },
+	{ 0x0018, 0x7f7f7f7f, 0x7f007f00 },
+	{ 0x001c, 0xffff007f, 0xa000003f },
+	{ 0x0020, 0x0fff0fff, 0x001c0090 },
+	{ 0x0024, 0xffff007f, 0xa000003f },
+	{ 0x0028, 0x0fff0fff, 0x08000002 },
+	{ 0x1000, 0x00007f11, 0x00007f00 },
+	{ 0x1004, 0x03ff03ff, 0x00000000 },
+	{ 0x1008, 0x7fffff7f, 0x00000000 },
+	{ 0x100c, 0x7fffff7f, 0x00000000 },
+	{ 0x1010, 0x7fffff7f, 0x00000000 },
+	{ 0x1014, 0x7fffff7f, 0x00000000 },
+	{ 0x1018, 0x7fffff7f, 0x00000000 },
+	{ 0x101c, 0x7fffff7f, 0x00000000 },
+	{ 0x1020, 0x7fffff7f, 0x00000000 },
+	{ 0x1024, 0x01ff01ff, 0x00000000 },
+	{ 0x1028, 0x01ff01ff, 0x00000000 },
+	{ 0x102c, 0x01ff01ff, 0x00000000 },
+	{ 0x1030, 0x01ff01ff, 0x00000000 },
+	{ 0x1034, 0x01ff01ff, 0x00000000 },
+	{ 0x1038, 0x01ff01ff, 0x00000000 },
+	{ 0x103c, 0x01ff01ff, 0x00000000 },
+	{ 0x1040, 0x1ff7fdff, 0x00000000 },
+	{ 0x1044, 0x1ff7fdff, 0x00000000 },
+	{ 0x1048, 0x1ff7fdff, 0x00000000 },
+	{ 0x104c, 0x1ff7fdff, 0x00000000 },
+	{ 0x1050, 0x1ff7fdff, 0x00000000 },
+	{ 0x1054, 0x1ff7fdff, 0x00000000 },
+	{ 0x1058, 0x1ff7fdff, 0x00000000 },
+	{ 0x105c, 0x0fff0fff, 0x00000000 },
+	{ 0x1060, 0x0fff0fff, 0x00000000 },
+	{ 0x1064, 0x0fff0fff, 0x00000000 },
+	{ 0x1068, 0x0fff0fff, 0x00000000 },
+	{ 0x106c, 0x0fff0fff, 0x00000000 },
+	{ 0x1070, 0x0fff0fff, 0x00000000 },
+	{ 0x1074, 0x0fff0fff, 0x00000000 },
+	{ 0x1078, 0x00007f11, 0x00007f00 },
+	{ 0x107c, 0x03ff03ff, 0x00000000 },
+	{ 0x1080, 0x7fffff7f, 0x00000000 },
+	{ 0x1084, 0x7fffff7f, 0x00000000 },
+	{ 0x1088, 0x7fffff7f, 0x00000000 },
+	{ 0x108c, 0x7fffff7f, 0x00000000 },
+	{ 0x1090, 0x7fffff7f, 0x00000000 },
+	{ 0x1094, 0x7fffff7f, 0x00000000 },
+	{ 0x1098, 0x7fffff7f, 0x00000000 },
+	{ 0x109c, 0x01ff01ff, 0x00000000 },
+	{ 0x10a0, 0x01ff01ff, 0x00000000 },
+	{ 0x10a4, 0x01ff01ff, 0x00000000 },
+	{ 0x10a8, 0x01ff01ff, 0x00000000 },
+	{ 0x10ac, 0x01ff01ff, 0x00000000 },
+	{ 0x10b0, 0x01ff01ff, 0x00000000 },
+	{ 0x10b4, 0x01ff01ff, 0x00000000 },
+	{ 0x10b8, 0x1ff7fdff, 0x00000000 },
+	{ 0x10bc, 0x1ff7fdff, 0x00000000 },
+	{ 0x10c0, 0x1ff7fdff, 0x00000000 },
+	{ 0x10c4, 0x1ff7fdff, 0x00000000 },
+	{ 0x10c8, 0x1ff7fdff, 0x00000000 },
+	{ 0x10cc, 0x1ff7fdff, 0x00000000 },
+	{ 0x10d0, 0x1ff7fdff, 0x00000000 },
+	{ 0x10d4, 0x0fff0fff, 0x00000000 },
+	{ 0x10d8, 0x0fff0fff, 0x00000000 },
+	{ 0x10dc, 0x0fff0fff, 0x00000000 },
+	{ 0x10e0, 0x0fff0fff, 0x00000000 },
+	{ 0x10e4, 0x0fff0fff, 0x00000000 },
+	{ 0x10e8, 0x0fff0fff, 0x00000000 },
+	{ 0x10ec, 0x0fff0fff, 0x00000000 },
+	{ 0x10fc, 0x7fffff7f, 0x00000000 },
+	{ 0x1100, 0x7fffff7f, 0x00000000 },
+	{ 0x1104, 0x7fffff7f, 0x00000000 },
+	{ 0x1108, 0x7fffff7f, 0x00000000 },
+	{ 0x110c, 0x7fffff7f, 0x00000000 },
+	{ 0x1110, 0x7fffff7f, 0x00000000 },
+	{ 0x1114, 0x7fffff7f, 0x00000000 },
+	{ 0x1118, 0x7fffff7f, 0x00000000 },
+	{ 0x111c, 0x7fffff7f, 0x00000000 },
+	{ 0x1120, 0x7fffff7f, 0x00000000 },
+	{ 0x1124, 0x7fffff7f, 0x00000000 },
+	{ 0x1128, 0x7fffff7f, 0x00000000 },
+	{ 0x112c, 0x7fffff7f, 0x00000000 },
+	{ 0x1130, 0x7fffff7f, 0x00000000 },
+};
+
 struct apr_stats_regs {
 	u32 lo, hi, size;
 };
@@ -303,6 +545,12 @@ static const struct apr_variant apr_t6041 = {
 		{ APR_REG_STATS0_LO, APR_REG_STATS0_HI, APR_REG_STATS0_SIZE },
 		{ APR_REG_STATS1_LO, APR_REG_STATS1_HI, APR_REG_STATS1_SIZE },
 	},
+	.engine_tunables = apr_t6041_engine_tunables,
+	.num_engine_tunables = ARRAY_SIZE(apr_t6041_engine_tunables),
+	.wrapper_tunables = apr_t6041_wrapper_tunables,
+	.num_wrapper_tunables = ARRAY_SIZE(apr_t6041_wrapper_tunables),
+	.aux_tunables = apr_t6041_aux_tunables,
+	.num_aux_tunables = ARRAY_SIZE(apr_t6041_aux_tunables),
 	.reg_names = { "core", "wrapper", "aux" },
 	.num_regs = 3,
 	.num_irqs = 1,
@@ -312,8 +560,8 @@ static const struct apr_variant apr_t6041 = {
 };
 
 struct apr_dev {
-	const struct apr_variant *variant;
 	struct device *dev;
+	const struct apr_variant *variant;
 	void __iomem *regs;
 	void __iomem *wrapper;
 	void __iomem *aux;
@@ -1130,13 +1378,24 @@ static const struct v4l2_file_operations apr_fops = {
 
 /* ---- power management and probe ---------------------------------------- */
 
+/*
+ * Before the power domain goes off, stop the engine as macOS does when it
+ * powers a core down: interrupts off, then descriptor execution. Its
+ * registers do not survive the domain going off, so the next job programs
+ * them again from scratch (apr_hw_init()). No job is in the engine here: each
+ * holds a runtime PM reference until it finishes.
+ */
 static int apr_runtime_suspend(struct device *dev)
 {
 	struct apr_dev *apr = dev_get_drvdata(dev);
 	unsigned long flags;
 
-	/* Registers do not survive the power domain going off. */
 	spin_lock_irqsave(&apr->hw_lock, flags);
+	WARN_ON_ONCE(apr->active);
+	if (apr->ring_ready) {
+		apr_write(apr, APR_REG_IRQ_ENABLE, 0);
+		apr_write(apr, APR_REG_MODE, APR_MODE_OFF);
+	}
 	apr->ring_ready = false;
 	spin_unlock_irqrestore(&apr->hw_lock, flags);
 	return 0;
@@ -1147,19 +1406,42 @@ static int apr_runtime_resume(struct device *dev)
 	return 0;
 }
 
+/*
+ * System sleep, the hibernation snapshot and power-off: let the job in the
+ * engine finish (or the watchdog end it) and start no other, then power the
+ * engine down like an idle runtime suspend. Its DART saves and restores its
+ * own translations; this driver keeps no state in the engine across sleep.
+ */
 static int apr_suspend(struct device *dev)
-{
-	struct apr_dev *apr = dev_get_drvdata(dev);
-
-	v4l2_m2m_suspend(apr->m2m_dev);
-	return pm_runtime_force_suspend(dev);
-}
-
-static int apr_resume(struct device *dev)
 {
 	struct apr_dev *apr = dev_get_drvdata(dev);
 	int ret;
 
+	v4l2_m2m_suspend(apr->m2m_dev);
+	cancel_delayed_work_sync(&apr->watchdog);
+	ret = pm_runtime_force_suspend(dev);
+	if (ret)
+		v4l2_m2m_resume(apr->m2m_dev);
+	return ret;
+}
+
+static int apr_resume_common(struct device *dev, bool cold)
+{
+	struct apr_dev *apr = dev_get_drvdata(dev);
+	unsigned long flags;
+	int ret;
+
+	/*
+	 * After a firmware-driven suspend-to-RAM and a resume from disk the
+	 * engine starts cold: whatever an earlier hang left in it is gone with
+	 * the power, so it may take jobs again.
+	 */
+	if (cold) {
+		spin_lock_irqsave(&apr->hw_lock, flags);
+		apr->broken = false;
+		apr->ring_ready = false;
+		spin_unlock_irqrestore(&apr->hw_lock, flags);
+	}
 	ret = pm_runtime_force_resume(dev);
 	if (ret)
 		return ret;
@@ -1167,9 +1449,24 @@ static int apr_resume(struct device *dev)
 	return 0;
 }
 
+static int apr_resume(struct device *dev)
+{
+	return apr_resume_common(dev, pm_resume_via_firmware());
+}
+
+static int apr_restore(struct device *dev)
+{
+	return apr_resume_common(dev, true);
+}
+
 static const struct dev_pm_ops apr_pm_ops = {
 	RUNTIME_PM_OPS(apr_runtime_suspend, apr_runtime_resume, NULL)
-	SYSTEM_SLEEP_PM_OPS(apr_suspend, apr_resume)
+	.suspend = pm_sleep_ptr(apr_suspend),
+	.resume = pm_sleep_ptr(apr_resume),
+	.freeze = pm_sleep_ptr(apr_suspend),
+	.thaw = pm_sleep_ptr(apr_resume),
+	.poweroff = pm_sleep_ptr(apr_suspend),
+	.restore = pm_sleep_ptr(apr_restore),
 };
 
 static void apr_cleanup(void *data)
@@ -1243,6 +1540,7 @@ static int apr_probe(struct platform_device *pdev)
 	void __iomem *regs[3] = {};
 	struct apr_dev *apr;
 	unsigned int i;
+	u32 id;
 	int ret;
 
 	apr = devm_kzalloc(dev, sizeof(*apr), GFP_KERNEL);
@@ -1346,8 +1644,13 @@ static int apr_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, -EINVAL, "statistics area larger than %zu bytes\n",
 				     apr->stats_size);
 	}
-	dev_info(dev, "ProRes encoder, id %#x\n", apr_read(apr, APR_REG_ID));
+	id = apr_read(apr, APR_REG_ID);
 	pm_runtime_put_autosuspend(dev);
+	/* macOS gives the version 1 descriptor layout only to engine versions 4 and 5. */
+	if (apr->variant->build_desc == apr_build_desc && !apr_id_supported(id))
+		return dev_err_probe(dev, -ENODEV,
+				     "engine id %#x has another descriptor layout\n", id);
+	dev_info(dev, "ProRes encoder, id %#x\n", id);
 
 	vdev = &apr->vdev;
 	strscpy(vdev->name, APR_NAME, sizeof(vdev->name));

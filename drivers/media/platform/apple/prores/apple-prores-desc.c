@@ -4,6 +4,7 @@
  *
  * Nothing here touches hardware, so all of it is covered by KUnit.
  */
+#include <linux/bitfield.h>
 #include <linux/bitops.h>
 #include <linux/errno.h>
 #include <linux/export.h>
@@ -192,17 +193,21 @@ EXPORT_SYMBOL_IF_KUNIT(apr_dc_scale_reg);
 #define D_SLICES		0x078	/* big-endian */
 #define D_SLICE_LOG2		0x07a	/* high nibble */
 #define D_QUANT_INDEX		0x07b
-/* Frame header fields the engine writes into the bitstream; big-endian. */
+/*
+ * Frame header fields the engine writes into the bitstream, in SMPTE RDD 36
+ * order; big-endian.
+ */
 #define D_FH_SIZE		0x07c
 #define D_FH_VERSION		0x07f
 #define D_FH_VENDOR		0x080
 #define D_FH_WIDTH		0x084
 #define D_FH_HEIGHT		0x086
 #define D_FH_FORMAT		0x088
-#define D_FH_PRIMARIES		0x089
-#define D_FH_TRANSFER		0x08a
-#define D_FH_MATRIX		0x08b
-#define D_FH_ALPHA		0x08c
+#define D_FH_ASPECT_RATE	0x089	/* aspect ratio 7:4, frame rate 3:0 */
+#define D_FH_PRIMARIES		0x08a
+#define D_FH_TRANSFER		0x08b
+#define D_FH_MATRIX		0x08c
+#define D_FH_ALPHA		0x08d	/* source format 7:4, alpha type 3:0 */
 #define D_FH_FLAGS		0x08f
 #define D_FH_BYTES		0x94
 /* Rate control: coefficient budgets in bytes per macroblock, Q3 */
@@ -322,6 +327,19 @@ u32 apr_slice_count(u32 width, u32 height, u32 log2_slice)
 }
 EXPORT_SYMBOL_IF_KUNIT(apr_slice_count);
 
+/*
+ * The descriptors built here are layout version 1. macOS uses it for engines
+ * whose ID register reports version 4 or 5 in bits 23:16, and the older
+ * layout (frame header at 0x58) for the others.
+ */
+bool apr_id_supported(u32 id)
+{
+	u32 version = FIELD_GET(APR_ID_VERSION, id);
+
+	return version == 4 || version == 5;
+}
+EXPORT_SYMBOL_IF_KUNIT(apr_id_supported);
+
 static int apr_build_desc_common(const struct apr_frame *f, u8 *desc)
 {
 	bool is444 = apr_input_is_444(f->input);
@@ -374,6 +392,7 @@ static int apr_build_desc_common(const struct apr_frame *f, u8 *desc)
 int apr_build_desc(const struct apr_frame *f, u8 *desc)
 {
 	bool is444 = apr_input_is_444(f->input);
+	bool deep = f->input == APR_INPUT_422_16 || f->input == APR_INPUT_444_16;
 	enum apr_qtable table = apr_profile_qtable(f->profile);
 	u32 slices, mbs, target, max;
 	unsigned int i;
@@ -397,10 +416,13 @@ int apr_build_desc(const struct apr_frame *f, u8 *desc)
 	put_unaligned_be16(f->height, desc + D_FH_HEIGHT);
 	/* chroma_format in bits 7:6, progressive frame */
 	desc[D_FH_FORMAT] = (is444 ? 3 : 2) << 6;
+	/* Aspect ratio and frame rate unknown. */
+	desc[D_FH_ASPECT_RATE] = 0;
 	desc[D_FH_PRIMARIES] = f->primaries;
 	desc[D_FH_TRANSFER] = f->transfer;
 	desc[D_FH_MATRIX] = f->matrix;
-	desc[D_FH_ALPHA] = 0;
+	/* The source format nibble macOS writes; no alpha. */
+	desc[D_FH_ALPHA] = is444 ? (deep ? 0xe0 : 0xd0) : (deep ? 0x30 : 0x10);
 	/* Both quantisation matrices are carried in the frame header. */
 	desc[D_FH_FLAGS] = 0x03;
 

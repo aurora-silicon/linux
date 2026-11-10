@@ -20,6 +20,7 @@
 #include <linux/types.h>
 
 #define APR_REG_ID		0x0000
+#define APR_ID_VERSION		GENMASK(23, 16)
 #define APR_REG_MODE		0x0008
 #define APR_MODE_OFF		0x0
 #define APR_MODE_RUN		0xd
@@ -145,6 +146,7 @@ u32 apr_dc_scale_reg(unsigned int index);
 void apr_frame_budget(enum apr_profile profile, u32 width, u32 height,
 		      u32 *target, u32 *max);
 u32 apr_slice_count(u32 width, u32 height, u32 log2_slice);
+bool apr_id_supported(u32 id);
 int apr_build_desc(const struct apr_frame *f, u8 *desc);
 int apr_build_desc_v0(const struct apr_frame *f, u8 *desc);
 int apr_check_output(const u8 *out, size_t capacity, u32 *frame_bytes);

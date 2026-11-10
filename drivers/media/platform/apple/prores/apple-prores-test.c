@@ -113,8 +113,11 @@ static void apr_test_desc_422(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, get_unaligned_be16(d + 0x84), 320);
 	KUNIT_EXPECT_EQ(test, get_unaligned_be16(d + 0x86), 240);
 	KUNIT_EXPECT_EQ(test, d[0x88], 0x80);
-	KUNIT_EXPECT_EQ(test, d[0x89], 1);
+	KUNIT_EXPECT_EQ(test, d[0x89], 0);
+	KUNIT_EXPECT_EQ(test, d[0x8a], 1);
 	KUNIT_EXPECT_EQ(test, d[0x8b], 1);
+	KUNIT_EXPECT_EQ(test, d[0x8c], 1);
+	KUNIT_EXPECT_EQ(test, d[0x8d], 0x30);	/* 16-bit 4:2:2 source */
 	KUNIT_EXPECT_EQ(test, d[0x8f], 0x03);
 	/* 20 macroblocks per row: two 8-wide slices and one 4-wide. */
 	KUNIT_EXPECT_EQ(test, get_unaligned_be16(d + 0x78), 45);
@@ -144,6 +147,7 @@ static void apr_test_desc_444(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x22), 10);
 	KUNIT_EXPECT_EQ(test, d[0x7f], 1);
 	KUNIT_EXPECT_EQ(test, d[0x88], 0xc0);
+	KUNIT_EXPECT_EQ(test, d[0x8d], 0xd0);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 0x170), 0x03);
 }
 
@@ -477,6 +481,17 @@ static void apr_test_apri_row_rejects(struct kunit *test)
 	apr_test_apri_rows_reject(test, APRI_SYSTEM_BLOCK, 0, 8, 0x100);
 }
 
+/* Only engine versions 4 and 5 (ID bits 23:16) take layout 1 descriptors. */
+static void apr_test_id(struct kunit *test)
+{
+	KUNIT_EXPECT_TRUE(test, apr_id_supported(0x00040000));
+	KUNIT_EXPECT_TRUE(test, apr_id_supported(0x00050002));
+	KUNIT_EXPECT_FALSE(test, apr_id_supported(0x00030000));
+	KUNIT_EXPECT_FALSE(test, apr_id_supported(0x00060000));
+	KUNIT_EXPECT_FALSE(test, apr_id_supported(0x04000000));
+	KUNIT_EXPECT_FALSE(test, apr_id_supported(0));
+}
+
 static struct kunit_case apr_test_cases[] = {
 	KUNIT_CASE(apr_test_qmat_regs),
 	KUNIT_CASE(apr_test_dc_scale),
@@ -493,6 +508,7 @@ static struct kunit_case apr_test_cases[] = {
 	KUNIT_CASE(apr_test_apri_header_rejects),
 	KUNIT_CASE(apr_test_apri_shape_rejects),
 	KUNIT_CASE(apr_test_apri_row_rejects),
+	KUNIT_CASE(apr_test_id),
 	{}
 };
 
