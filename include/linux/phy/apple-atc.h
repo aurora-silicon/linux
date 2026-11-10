@@ -33,6 +33,12 @@ int apple_atcphy_sleep_result(struct phy *usb2_phy);
  * controller stop for later sleeps.
  */
 void apple_atcphy_sleep_finish(struct phy *usb2_phy, bool kept);
+
+/* ACIO owns this transaction; @phy is its shared USB3 lane PHY handle. */
+int apple_atcphy_cio_prepare(struct phy *phy);
+int apple_atcphy_cio_off(struct phy *phy);
+int apple_atcphy_cio_on(struct phy *phy);
+int apple_atcphy_cio_finish(struct phy *phy);
 #else
 static inline int apple_atcphy_sleep_prepare(struct phy *usb2_phy)
 {
@@ -47,6 +53,27 @@ static inline int apple_atcphy_sleep_result(struct phy *usb2_phy)
 static inline void apple_atcphy_sleep_finish(struct phy *usb2_phy, bool kept)
 {
 }
+
+static inline int apple_atcphy_cio_prepare(struct phy *phy)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int apple_atcphy_cio_off(struct phy *phy)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int apple_atcphy_cio_on(struct phy *phy)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int apple_atcphy_cio_finish(struct phy *phy)
+{
+	return -EOPNOTSUPP;
+}
+
 #endif
 
 #endif
