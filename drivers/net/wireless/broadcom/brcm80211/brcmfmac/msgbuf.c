@@ -309,6 +309,7 @@ struct brcmf_msgbuf {
 
 	struct workqueue_struct *txflow_wq;
 	struct work_struct txflow_work;
+	bool tx_suspended;
 	unsigned long *flow_map;
 	unsigned long *txstatus_done_map;
 
@@ -335,8 +336,8 @@ static void brcmf_msgbuf_rxbuf_ioctlresp_post(struct brcmf_msgbuf *msgbuf);
 
 
 /*
- * BCM4387 and BCM4388 firmware can read buffers posted for receive. Since
- * the packet-ID direction is now honored, DMA_FROM_DEVICE makes those
+ * BCM4378, BCM4387 and BCM4388 firmware can read buffers posted for receive.
+ * Since the packet-ID direction is now honored, DMA_FROM_DEVICE makes those
  * buffers write-only on permission-enforcing IOMMUs. Keep RX data, event and
  * ioctl-response buffers readable, with the same direction used for mapping
  * and unmapping.
@@ -351,7 +352,8 @@ brcmf_msgbuf_rx_dma_direction(struct device *dev)
 
 	pdev = to_pci_dev(dev);
 	if (pdev->vendor == PCI_VENDOR_ID_BROADCOM &&
-	    (pdev->device == BRCM_PCIE_4387_DEVICE_ID ||
+	    (pdev->device == BRCM_PCIE_4378_DEVICE_ID ||
+	     pdev->device == BRCM_PCIE_4387_DEVICE_ID ||
 	     pdev->device == BRCM_PCIE_4388_DEVICE_ID)) {
 		dev_info(dev, "using bidirectional receive DMA\n");
 		return DMA_BIDIRECTIONAL;
@@ -751,6 +753,10 @@ brcmf_msgbuf_flowring_create_worker(struct brcmf_msgbuf *msgbuf,
 		return BRCMF_FLOWRING_INVALID_ID;
 	}
 
+	/* A new ring has nothing in flight, whatever the previous ring on
+	 * this flowid left behind.
+	 */
+	atomic_set(&msgbuf->flowrings[flowid]->outstanding_tx, 0);
 	brcmf_commonring_config(msgbuf->flowrings[flowid],
 				BRCMF_H2D_TXFLOWRING_MAX_ITEM,
 				BRCMF_H2D_TXFLOWRING_ITEMSIZE, dma_buf);
@@ -801,6 +807,9 @@ static void brcmf_msgbuf_flowring_worker(struct work_struct *work)
 	struct brcmf_msgbuf_work_item *create;
 
 	msgbuf = container_of(work, struct brcmf_msgbuf, flowring_work);
+
+	if (READ_ONCE(msgbuf->tx_suspended))
+		return;
 
 	while ((create = brcmf_msgbuf_dequeue_work(msgbuf))) {
 		brcmf_msgbuf_flowring_create_worker(msgbuf, create);
@@ -922,6 +931,9 @@ static void brcmf_msgbuf_txflow_worker(struct work_struct *worker)
 	u32 flowid;
 
 	msgbuf = container_of(worker, struct brcmf_msgbuf, txflow_work);
+	if (READ_ONCE(msgbuf->tx_suspended))
+		return;
+
 	for_each_set_bit(flowid, msgbuf->flow_map, msgbuf->max_flowrings) {
 		clear_bit(flowid, msgbuf->flow_map);
 		brcmf_msgbuf_txflow(msgbuf, flowid);
@@ -1058,7 +1070,13 @@ brcmf_msgbuf_process_txstatus(struct brcmf_msgbuf *msgbuf, void *buf)
 
 	set_bit(flowid, msgbuf->txstatus_done_map);
 	commonring = msgbuf->flowrings[flowid];
-	atomic_dec(&commonring->outstanding_tx);
+	/* brcmf_msgbuf_delete_flowring() zeroes the count when it stops
+	 * waiting, and the firmware completes those frames later, when it
+	 * flushes the ring. Don't let them take the count below zero: a
+	 * negative count outlives the ring, and the next delete on this
+	 * flowid then waits out its full timeout.
+	 */
+	atomic_dec_if_positive(&commonring->outstanding_tx);
 
 	ifp = brcmf_get_ifp(msgbuf->drvr, tx_status->msg.ifidx);
 	/* Key on the flowring's ifidx, which the host assigned when it queued
@@ -1631,7 +1649,12 @@ void brcmf_msgbuf_delete_flowring(struct brcmf_pub *drvr, u16 flowid)
 		retry--;
 	}
 	if (!retry) {
-		brcmf_err("timed out waiting for txstatus\n");
+		/* Expected when the peer is gone (disconnect, suspend): the
+		 * firmware completes these frames only when it flushes the
+		 * ring for the delete request below.
+		 */
+		brcmf_dbg(MSGBUF, "flowring %u: %d tx outstanding, deleting it anyway\n",
+			  flowid, atomic_read(&commonring_del->outstanding_tx));
 		atomic_set(&commonring_del->outstanding_tx, 0);
 	}
 
@@ -1907,6 +1930,35 @@ fail:
 	return -ENOMEM;
 }
 
+
+/* Called after stopping and draining ndo_start_xmit, while PCIe is still up.
+ * IRQ completions may queue more work; workers leave it pending until resume.
+ */
+void brcmf_msgbuf_suspend(struct brcmf_pub *drvr)
+{
+	struct brcmf_msgbuf *msgbuf;
+
+	if (!drvr || !drvr->proto || !drvr->proto->pd)
+		return;
+	msgbuf = drvr->proto->pd;
+
+	WRITE_ONCE(msgbuf->tx_suspended, true);
+	cancel_work_sync(&msgbuf->flowring_work);
+	cancel_work_sync(&msgbuf->txflow_work);
+}
+
+void brcmf_msgbuf_resume(struct brcmf_pub *drvr)
+{
+	struct brcmf_msgbuf *msgbuf;
+
+	if (!drvr || !drvr->proto || !drvr->proto->pd)
+		return;
+	msgbuf = drvr->proto->pd;
+
+	WRITE_ONCE(msgbuf->tx_suspended, false);
+	schedule_work(&msgbuf->flowring_work);
+	queue_work(msgbuf->txflow_wq, &msgbuf->txflow_work);
+}
 
 void brcmf_proto_msgbuf_detach(struct brcmf_pub *drvr)
 {

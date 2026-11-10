@@ -104,6 +104,7 @@ Subsystem-specific APIs
    infiniband
    input
    interconnect
+   apple-pmgr-dcs
    ipmb
    ipmi
    issei/index

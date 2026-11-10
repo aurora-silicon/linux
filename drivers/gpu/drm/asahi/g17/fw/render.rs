@@ -70,6 +70,10 @@ impl Deflake {
         sub: [0xa0, 0x820],
         viewport: false,
     };
+    pub(crate) const FOUR_CLUSTERS: Deflake = Deflake {
+        sub: [0x120, 0xda0],
+        viewport: false,
+    };
 }
 
 /// The register programs of a firmware build's render descriptors.
@@ -162,8 +166,14 @@ const UTILE_CONFIG_HEIGHT_SHIFT: u32 = 14;
 const UTILE_CONFIG_SIZE_MASK: u64 = 0xf000;
 /// The partial-render phases load and store every attached depth and stencil
 /// surface.
-const ZLS_PARTIAL_DEPTH: u64 = 1 << 15 | 1 << 19;
-const ZLS_PARTIAL_STENCIL: u64 = 1 << 14 | 1 << 18;
+const ZLS_STORE_DEPTH: u64 = 1 << 19;
+const ZLS_STORE_STENCIL: u64 = 1 << 18;
+const ZLS_LOAD_DEPTH: u64 = 1 << 15;
+const ZLS_LOAD_STENCIL: u64 = 1 << 14;
+const ZLS_COMPRESS_DEPTH: u64 = 1 << 6;
+const ZLS_COMPRESS_STENCIL: u64 = 1 << 8;
+/// Bits of the main word a partial render sets for itself.
+const ZLS_PARTIAL_CLEAR: u64 = ZLS_COMPRESS_DEPTH | ZLS_COMPRESS_STENCIL | 0xf << 56;
 const STENCIL_CLEAR_BASE: u32 = 0x300;
 /// Value of the ZLS swizzle registers and descriptor field.
 const ZLS_SWIZZLE: u32 = 0x0404_0404;
@@ -366,6 +376,8 @@ pub(crate) struct RenderArgs<'a> {
     pub(crate) fragment: RenderStage,
     /// Register programs of the firmware build.
     pub(crate) programs: RegisterPrograms,
+    /// Device/build policy for registers 0x1c890 and 0x1c918 in V25G83-format arrays.
+    pub(crate) ta_mode_1: bool,
     /// Deflake-buffer layout of the GPU.
     pub(crate) deflake: Deflake,
 }
@@ -443,6 +455,7 @@ struct PassWords {
     layer_mode: u64,
     tib_blocks: u64,
     partial_zls_control: u64,
+    partial_zls_reload: u64,
     aux_fb_flags: u64,
     bg_rsrc_spec: u64,
     bg_va: u64,
@@ -478,12 +491,27 @@ impl PassWords {
             tile_config |= TILE_CONFIG_PROCESS_EMPTY_TILES;
         }
 
-        let mut partial_zls_control = pass.zls_control;
+        // The partial store keeps the main word, loads included, and stores and compresses each
+        // plane it has. The reload arrays add the loads, which a clearing pass doesn't have.
+        let mut partial_zls_control = pass.zls_control & !ZLS_PARTIAL_CLEAR;
         if pass.depth.va != 0 {
-            partial_zls_control |= ZLS_PARTIAL_DEPTH;
+            partial_zls_control |= ZLS_STORE_DEPTH;
+        }
+        if pass.depth.compression_va != 0 {
+            partial_zls_control |= ZLS_COMPRESS_DEPTH;
         }
         if pass.stencil.va != 0 {
-            partial_zls_control |= ZLS_PARTIAL_STENCIL;
+            partial_zls_control |= ZLS_STORE_STENCIL;
+        }
+        if pass.stencil.compression_va != 0 {
+            partial_zls_control |= ZLS_COMPRESS_STENCIL;
+        }
+        let mut partial_zls_reload = partial_zls_control;
+        if pass.depth.va != 0 {
+            partial_zls_reload |= ZLS_LOAD_DEPTH;
+        }
+        if pass.stencil.va != 0 {
+            partial_zls_reload |= ZLS_LOAD_STENCIL;
         }
 
         let mut aux_fb_flags = AUX_FB_FLAGS_BASE;
@@ -511,6 +539,7 @@ impl PassWords {
                 * samples)
                 .div_ceil(TIB_BLOCK_SIZE),
             partial_zls_control,
+            partial_zls_reload,
             aux_fb_flags,
             bg_rsrc_spec: rsrc_spec(pass.bg.rsrc_spec),
             bg_va: usc(pass.bg.offset)?,
@@ -636,6 +665,15 @@ fn ta_registers(
     ])
 }
 
+/// Tiler segment control of a two-cluster pass, what macOS writes.
+const VDM_SEGMENT_CONTROL: u64 = 0x20_0440;
+const VDM_SEGMENT_INDEX: u64 = 4;
+/// Tiler segment control of T6041 on 25F84, what macOS writes, with 0x1c918 = 0.
+const T6041_TA_MODE_1: u64 = 1;
+/// Pages the tiler keeps out of a partial render's segments: without them the pages a pass
+/// returns shrink to none and the tiler can't advance. Fifteen blocks, macOS's minimum heap.
+const MIN_FREE_TVB_PAGES: u64 = 0x3c;
+
 /// The 25G83 tiling array: the A18 Pro's without 0x1748 and 0x1740 (and 0x17d9 unless the stage
 /// has SCS), with the tiler parameter sub-buffer registers and 0x10131 = 0x88, in the order the
 /// M4 Pro has run with. Returns the array and its used entry count.
@@ -686,15 +724,20 @@ fn ta_registers_25g83(
     push(find(0x1c880, 0)?);
     push(RegisterWrite::new(0x1c948, gtp(4)?));
     push(RegisterWrite::new(0x1c888, gtp(5)?));
-    push(RegisterWrite::new(0x1c890, 0));
-    push(RegisterWrite::new(0x1c918, 0));
+    let (segment_control, segment_index) = if args.ta_mode_1 {
+        (T6041_TA_MODE_1, 0)
+    } else {
+        (VDM_SEGMENT_CONTROL, VDM_SEGMENT_INDEX)
+    };
+    push(RegisterWrite::new(0x1c890, segment_control));
+    push(RegisterWrite::new(0x1c918, segment_index));
     push(find(0x1c079, 0)?);
     push(find(0x1c9d8, 0)?);
     push(RegisterWrite::new(0x1c089, gtp2));
     push(RegisterWrite::new(0x1c9e0, gtp2));
     push(RegisterWrite::new(0x16c41, gtp6));
     push(RegisterWrite::new(0x1ca40, gtp6));
-    push(RegisterWrite::new(0x1c9a8, 0));
+    push(RegisterWrite::new(0x1c9a8, MIN_FREE_TVB_PAGES));
     push(RegisterWrite::new(0x1c920, gtp(7)?));
     for reg in [0x10151, 0x1c199, 0x1c1a1, 0x1c1a9, 0x1c1b1, 0x1c1b9, 0x1c8f8, 0x1c0b1, 0x1c850] {
         push(find(reg, 0)?);
@@ -930,7 +973,7 @@ fn partial_resume_registers(
         RegisterWrite::new(0x153c1, p.depth.compression_va),
         RegisterWrite::new(0x15339, p.stencil.va),
         RegisterWrite::new(0x153d1, p.stencil.compression_va),
-        RegisterWrite::new(0x15319, w.partial_zls_control),
+        RegisterWrite::new(0x15319, w.partial_zls_reload),
         RegisterWrite::new(0x15349, u64::from(ZLS_SWIZZLE)),
     ]
 }
@@ -942,13 +985,15 @@ fn partial_load_registers(
     [
         RegisterWrite::new(0x15369, w.partial_bg_rsrc_spec),
         RegisterWrite::new(0x15371, w.partial_bg_va),
-        RegisterWrite::new(0x10039, w.tile_config & !TILE_CONFIG_PROCESS_EMPTY_TILES),
+        // Only the main end-of-tile program resolves, and it has to reach tiles that only
+        // earlier segments drew to. Without this their resolve target is never written.
+        RegisterWrite::new(0x10039, w.tile_config | TILE_CONFIG_PROCESS_EMPTY_TILES),
         RegisterWrite::new(0x15309, u64::from(p.stencil_clear | STENCIL_CLEAR_BASE)),
         RegisterWrite::new(0x15329, p.depth.va),
         RegisterWrite::new(0x153c1, p.depth.compression_va),
         RegisterWrite::new(0x15339, p.stencil.va),
         RegisterWrite::new(0x153d1, p.stencil.compression_va),
-        RegisterWrite::new(0x15319, w.partial_zls_control),
+        RegisterWrite::new(0x15319, w.partial_zls_reload),
         RegisterWrite::new(0x15349, u64::from(ZLS_SWIZZLE)),
     ]
 }
@@ -1076,7 +1121,6 @@ unsafe impl Zeroable for TaDescriptor {}
 impl TaDescriptor {
     const ARRAY_OFFSET: u64 = core::mem::offset_of!(Self, registers) as u64;
     const UNK_876: u32 = u32::MAX;
-    const UNK_892: u32 = 1;
     const UNK_932: u8 = 0x44;
     const UNK_93C: u8 = 1;
     const UNK_93E_FIRST_KICK: [u8; 2] = [0xd0, 0x91];
@@ -1125,7 +1169,9 @@ impl TaDescriptor {
         self.sampler_heap_va = pass.sampler_heap_va;
         self.sampler_count = pass.sampler_count;
         self.sampler_max = sampler_max;
-        self.unk_892 = Self::UNK_892;
+        // Asks the firmware to grow the heap. macOS keeps that for memoryless passes, which can't
+        // partial-render, and Honeykrisp has none. 26A428 keeps it: untested there.
+        self.unk_892 = u32::from(args.programs != RegisterPrograms::V25G83);
         self.stamp_va = args.ta.stamp_va;
         self.aux_stamp_va = args.ta.aux_stamp_va;
         self.stamp_value_2 = stamp_value;
@@ -1561,5 +1607,179 @@ impl FragmentSlot {
             *range = McacheRange::new(attachment, McacheClass::Attachment, context)?;
         }
         Ok(Some(table))
+    }
+}
+
+#[kunit_tests(asahi_g17_ta_mode)]
+mod ta_mode_tests {
+    use super::*;
+    use crate::g17::fw::{
+        compute::{IntersectionTables, ScratchRequest},
+        render_rt::RayQueryStage,
+        variant::{Firmware, Variant, V25F84, V25G83, V26A428},
+    };
+
+    fn selected(firmware: &Firmware) -> &'static Variant {
+        match firmware {
+            Firmware::Fixed(variant) => variant,
+            Firmware::Identified(builds) => {
+                assert_eq!(builds.len(), 1);
+                builds[0].variant
+            }
+        }
+    }
+
+    /// The variants of the builds T6041 admits: 25F84, then 25G83.
+    fn t6041_variants() -> [&'static Variant; 2] {
+        let Firmware::Identified(builds) = crate::hw::t6041::CONFIG.firmware else {
+            panic!("T6041 must identify its loaded firmware");
+        };
+        assert_eq!(builds.len(), 2);
+        [builds[0].variant, builds[1].variant]
+    }
+
+    /// The TA mode of every admitted T6041 build.
+    fn t6041_ta_mode_1() -> bool {
+        let [f84, g83] = t6041_variants();
+        assert_eq!(f84.ta_mode_1, g83.ta_mode_1);
+        f84.ta_mode_1
+    }
+
+    #[test]
+    fn policy_is_local_to_the_admitted_t6041_builds() {
+        let [f84, g83] = t6041_variants();
+        let pro = selected(&crate::hw::t6040::CONFIG.firmware);
+        assert_eq!(f84.compute, crate::g17::fw::compute::ComputeProgram::V25F84);
+        assert!(f84.split_firmware_area);
+        // 25G83 keeps the M4 Pro's queue and compute rules on the M4 Max.
+        assert_eq!(g83.compute, pro.compute);
+        assert_eq!(g83.split_firmware_area, pro.split_firmware_area);
+        assert_eq!(g83.opening_record, pro.opening_record);
+        assert_eq!(g83.qid_floor, pro.qid_floor);
+        assert_eq!(g83.registration, pro.registration);
+        for max in [f84, g83] {
+            assert_eq!(max.programs, RegisterPrograms::V25G83);
+            assert!(max.ta_mode_1);
+        }
+        assert!(!pro.ta_mode_1);
+        assert!(!V25F84.ta_mode_1);
+        assert!(!V25G83.ta_mode_1);
+        assert!(!V26A428.ta_mode_1);
+    }
+
+    fn fixture() -> (RenderPass, RenderResources) {
+        // SAFETY: These two types contain only integers, bools and structs of
+        // those types, for which all-zero bytes are valid. Required render
+        // dimensions and user-window addresses are filled below.
+        let mut pass: RenderPass = unsafe { core::mem::zeroed() };
+        // SAFETY: RenderResources contains only integers and integer structs.
+        let mut resources: RenderResources = unsafe { core::mem::zeroed() };
+        pass.width = 64;
+        pass.height = 64;
+        pass.layers = 1;
+        pass.utile_width = 32;
+        pass.utile_height = 32;
+        pass.sample_size = 4;
+        pass.vdm_va = USER_BASE + 0x10000;
+        resources.tilemap_va = USER_BASE + 0x20000;
+        resources.layermeta_va = USER_BASE + 0x30000;
+        resources.heapmeta_va = USER_BASE + 0x40000;
+        resources.tpc_va = USER_BASE + 0x50000;
+        resources.deflake_va = USER_BASE + 0x60000;
+        resources.gtp_va = core::array::from_fn(|i| USER_BASE + 0x70000 + i as u64 * 0x1000);
+        (pass, resources)
+    }
+
+    fn args<'a>(pass: &'a RenderPass, resources: &'a RenderResources, scs: bool) -> RenderArgs<'a> {
+        let stage = RenderStage {
+            qid: 1,
+            descriptor_va: USER_BASE + 0x80000,
+            state_word: 1,
+            stamp_va: USER_BASE + 0x90000,
+            aux_stamp_va: USER_BASE + 0x90008,
+        };
+        // Exercise the array with and without its optional SCS entry.
+        let ray = RayQueryStage {
+            intersection: IntersectionTables::NONE,
+            scratch: ScratchRequest::new(if scs { (1 << 32) | (1 << 24) | 8 } else { 0 }).unwrap(),
+        };
+        RenderArgs {
+            pass,
+            resources,
+            ray_query: [ray; 2],
+            ordinal: 0,
+            ta: stage,
+            fragment: stage,
+            programs: RegisterPrograms::V25G83,
+            ta_mode_1: false,
+            deflake: Deflake::FOUR_CLUSTERS,
+        }
+    }
+
+    #[test]
+    fn ta_mode_changes_only_the_segment_writes_with_or_without_scs() {
+        let (mut pass, resources) = fixture();
+        for (width, height, layers) in [(64, 64, 1), (3456, 2234, 2)] {
+            pass.width = width;
+            pass.height = height;
+            pass.layers = layers;
+            let geometry = Geometry::new(&pass).unwrap();
+            let words = PassWords::new(&pass).unwrap();
+            for scs in [false, true] {
+                let mut args = args(&pass, &resources, scs);
+                let (before, count) = ta_registers_25g83(&args, &geometry, &words).unwrap();
+                args.ta_mode_1 = t6041_ta_mode_1();
+                let (after, new_count) = ta_registers_25g83(&args, &geometry, &words).unwrap();
+                assert_eq!(count, 83 + usize::from(scs));
+                assert_eq!(new_count, count);
+                let slot = after[79 + usize::from(scs)].reg;
+                assert_eq!(slot, 0x14308);
+                let mut changed = 0;
+                for (old, new) in before.iter().zip(&after).take(count) {
+                    let old = (old.reg, old.value);
+                    let new = (new.reg, new.value);
+                    if old.0 == 0x1c890 {
+                        assert_eq!(old.1, VDM_SEGMENT_CONTROL);
+                        assert_eq!(new, (0x1c890, T6041_TA_MODE_1));
+                        changed += 1;
+                    } else if old.0 == 0x1c918 {
+                        assert_eq!(old.1, VDM_SEGMENT_INDEX);
+                        assert_eq!(new, (0x1c918, 0));
+                        changed += 1;
+                    } else {
+                        // Includes every merge-buffer write and 0x1c9a8.
+                        assert_eq!(old, new);
+                    }
+                }
+                assert_eq!(changed, 2);
+            }
+        }
+    }
+
+    #[test]
+    fn mode_does_not_change_fragment_or_g17p_arrays() {
+        let (pass, resources) = fixture();
+        let geometry = Geometry::new(&pass).unwrap();
+        let words = PassWords::new(&pass).unwrap();
+        for scs in [false, true] {
+            let mut args = args(&pass, &resources, scs);
+            let (before, count) = fragment_registers_25g83(&args, &geometry, &words).unwrap();
+            args.ta_mode_1 = true;
+            let (after, new_count) = fragment_registers_25g83(&args, &geometry, &words).unwrap();
+            assert_eq!(count, 91 + usize::from(scs));
+            assert_eq!(new_count, count);
+            for (old, new) in before.iter().zip(&after).take(count) {
+                assert_eq!((old.reg, old.value), (new.reg, new.value));
+            }
+            args.programs = RegisterPrograms::G17P;
+            args.ta_mode_1 = false;
+            let before = ta_registers(&args, &geometry, &words).unwrap();
+            args.ta_mode_1 = true;
+            let after = ta_registers(&args, &geometry, &words).unwrap();
+            for (old, new) in before.iter().zip(&after) {
+                assert_eq!((old.reg, old.value), (new.reg, new.value));
+                assert_ne!({ new.reg }, 0x1c890);
+            }
+        }
     }
 }

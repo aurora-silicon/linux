@@ -23,6 +23,7 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	IOMFB_METHOD("A412", dcpep_set_digital_out_mode),
 	IOMFB_METHOD("A422", iomfbep_set_matrix),
 	IOMFB_METHOD("A426", iomfbep_get_color_remap_mode),
+	IOMFB_METHOD("A427", iomfbep_set_brightness_correction),
 	IOMFB_METHOD("A439", dcpep_set_parameter_dcp),
 	IOMFB_METHOD("A443", dcpep_create_default_fb),
 	IOMFB_METHOD("A447", dcpep_enable_disable_video_power_savings),

@@ -64,6 +64,8 @@ struct apple_mbox {
 	bool active;
 	bool ascwrap_v6_cpu_running;
 	bool removing;
+	/* apple,hold-rx-in-sleep: receive IRQ masked across system sleep */
+	bool hold_rx_in_sleep;
 
 	int irq_recv_not_empty;
 	int irq_send_empty; /* < 0: no send-empty IRQ, TX polls */
@@ -98,6 +100,7 @@ struct apple_mbox *apple_mbox_get_byname(struct device *dev, const char *name);
 
 int apple_mbox_start(struct apple_mbox *mbox);
 void apple_mbox_stop(struct apple_mbox *mbox);
+int apple_mbox_restore(struct apple_mbox *mbox);
 int apple_mbox_poll(struct apple_mbox *mbox);
 /*
  * Leave received messages in the hardware FIFO, without an interrupt, until

@@ -8,6 +8,7 @@
 
 #include <kunit/device.h>
 #include <kunit/test.h>
+#include <linux/pm_runtime.h>
 
 #define APPLE_PMC_TEST_RAILS_SIZE	0x4000
 
@@ -185,13 +186,379 @@ static void apple_pmc_test_pending_floor(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apple_pmc_floor_update(&dev, 4, 0xff, 0x35), -EINVAL);
 }
 
+static struct apple_pmc_domain *apple_pmc_test_floor(struct kunit *test,
+						     struct apple_pmc *pmc,
+						     unsigned int rail,
+						     unsigned int level)
+{
+	struct apple_pmc_domain *dom = kunit_kzalloc(test, sizeof(*dom), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, dom);
+	dom->pmc = pmc;
+	dom->floor = true;
+	dom->rail = rail;
+	dom->level = level;
+	list_add_tail(&dom->list, &pmc->domains);
+	return dom;
+}
+
+static u32 apple_pmc_test_ap_floor(struct apple_pmc *pmc)
+{
+	return readl(pmc->voters + pmc->hw->ap_agent * pmc->hw->agent_stride);
+}
+
+/*
+ * Floors on one rail combine to the highest one held, leave other rails and
+ * the AP's DCS vote alone, and are gone once the last one is released.
+ */
+static void apple_pmc_test_floor_aggregate(struct kunit *test)
+{
+	struct apple_pmc *pmc = apple_pmc_test_alloc(test);
+	struct apple_pmc_domain *mid, *max, *other;
+	u32 soc = APPLE_PMC_RAIL_MASK(1);
+
+	INIT_LIST_HEAD(&pmc->domains);
+	pmc->hw = &apple_pmc_hw_t6040;
+	apple_pmc_test_set_dcs_vote(pmc, pmc->hw->ap_agent, 3);
+	mid = apple_pmc_test_floor(test, pmc, 1, 1);
+	max = apple_pmc_test_floor(test, pmc, 1, 2);
+	other = apple_pmc_test_floor(test, pmc, 3, 1);
+
+	KUNIT_ASSERT_EQ(test, apple_pmc_floor_set(mid, true), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmc_test_ap_floor(pmc) & soc, 1U << 4);
+	KUNIT_ASSERT_EQ(test, apple_pmc_floor_set(max, true), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmc_test_ap_floor(pmc) & soc, 2U << 4);
+	KUNIT_ASSERT_EQ(test, apple_pmc_floor_set(max, false), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmc_test_ap_floor(pmc) & soc, 1U << 4);
+	KUNIT_ASSERT_EQ(test, apple_pmc_floor_set(mid, false), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmc_test_ap_floor(pmc), 3U);
+	KUNIT_EXPECT_FALSE(test, other->on);
+}
+
+/* A floor that the PMC does not take back is not left marked as held. */
+static void apple_pmc_test_floor_pending_timeout(struct kunit *test)
+{
+	struct apple_pmc *pmc = apple_pmc_test_alloc(test);
+	struct apple_pmc_domain *dom;
+	void __iomem *reg;
+
+	INIT_LIST_HEAD(&pmc->domains);
+	pmc->hw = &apple_pmc_hw_t8132;
+	reg = pmc->voters + pmc->hw->ap_agent * pmc->hw->agent_stride;
+	writel(BIT(pmc->hw->ap_agent), reg + 4);
+	dom = apple_pmc_test_floor(test, pmc, 1, 2);
+	KUNIT_EXPECT_EQ(test, apple_pmc_floor_set(dom, true), -ETIMEDOUT);
+	KUNIT_EXPECT_FALSE(test, dom->on);
+}
+
+/*
+ * A DCS floor raises the AP's DCS vote above its inherited vote while held,
+ * yields to the DCS limit, and gives the inherited vote back when released.
+ */
+static void apple_pmc_test_dcs_floor(struct kunit *test)
+{
+	struct apple_pmc *pmc = apple_pmc_test_alloc(test);
+	const struct apple_pmc_hw *hw = pmc->hw;
+	struct apple_pmc_domain *dom;
+
+	INIT_LIST_HEAD(&pmc->domains);
+	apple_pmc_test_set_dcs_vote(pmc, hw->ap_agent, 1);
+	pmc->ap_dcs_vote = apple_pmc_ap_dcs_read(pmc);
+	pmc->enable[hw->dcs_rail] = BIT(1) | BIT(hw->ap_agent);
+	dom = apple_pmc_test_floor(test, pmc, hw->dcs_rail, hw->dcs_max);
+
+	KUNIT_ASSERT_EQ(test, apple_pmc_floor_set(dom, true), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmc_ap_dcs_read(pmc), hw->dcs_max);
+	/* The limit caps the floor; the other agents ask for nothing. */
+	pmc->dcs_state = 3;
+	apple_pmc_dcs_vote(pmc);
+	KUNIT_EXPECT_EQ(test, apple_pmc_ap_dcs_read(pmc), hw->dcs_max - 3);
+	pmc->dcs_state = 0;
+	apple_pmc_dcs_vote(pmc);
+	KUNIT_EXPECT_EQ(test, apple_pmc_ap_dcs_read(pmc), hw->dcs_max);
+	KUNIT_ASSERT_EQ(test, apple_pmc_floor_set(dom, false), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmc_ap_dcs_read(pmc), 1);
+	/* Other rails of the AP's floor word are untouched. */
+	KUNIT_EXPECT_EQ(test, apple_pmc_test_ap_floor(pmc) & ~APPLE_PMC_RAIL_MASK(hw->dcs_rail), 0U);
+}
+
+/*
+ * A T8132 interface domain sets and clears its own BWR and boost enables
+ * only: the internal display's boost enable, bit 0, stays set.
+ */
+static void apple_pmc_test_interface(struct kunit *test)
+{
+	struct apple_pmc *pmc = apple_pmc_test_alloc(test);
+	struct apple_pmc_domain dom = {
+		.pmc = pmc, .interface = true, .bwr_bit = 3, .boost_bit = 1,
+	};
+	const struct apple_pmc_hw *hw = &apple_pmc_hw_t8132;
+
+	pmc->hw = hw;
+	writel(BIT(0), pmc->rails + hw->boost_enable);
+
+	KUNIT_ASSERT_EQ(test, apple_pmc_domain_power_on(&dom.genpd), 0);
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->bwr_enable), BIT(3));
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->boost_enable), BIT(0) | BIT(1));
+	KUNIT_ASSERT_EQ(test, apple_pmc_domain_power_off(&dom.genpd), 0);
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->bwr_enable), 0U);
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->boost_enable), BIT(0));
+}
+
+struct apple_pmc_test_stuck {
+	u32 offset;
+	u32 value;
+};
+
+/* The interface enable word at stuck->offset keeps stuck->value. */
+static u32 apple_pmc_test_stuck_read(struct apple_pmc *pmc, u32 offset)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct apple_pmc_test_stuck *stuck = test->priv;
+
+	if (offset == stuck->offset)
+		writel(stuck->value, pmc->rails + offset);
+	return readl(pmc->rails + offset);
+}
+
+/*
+ * If the BWR enable does not change, the boost enable goes back too, both
+ * when the domain powers on and when it powers off.
+ */
+static void apple_pmc_test_interface_stuck(struct kunit *test)
+{
+	struct apple_pmc *pmc = apple_pmc_test_alloc(test);
+	struct apple_pmc_domain dom = {
+		.pmc = pmc, .interface = true, .bwr_bit = 3, .boost_bit = 1,
+	};
+	const struct apple_pmc_hw *hw = &apple_pmc_hw_t8132;
+	struct apple_pmc_test_stuck stuck = { .offset = hw->bwr_enable };
+
+	pmc->hw = hw;
+	writel(BIT(0), pmc->rails + hw->boost_enable);
+	test->priv = &stuck;
+	kunit_activate_static_stub(test, apple_pmc_interface_read,
+				   apple_pmc_test_stuck_read);
+
+	KUNIT_EXPECT_EQ(test, apple_pmc_domain_power_on(&dom.genpd), -EIO);
+	KUNIT_EXPECT_EQ(test, apple_pmc_interface_read(pmc, hw->bwr_enable), 0U);
+	KUNIT_EXPECT_EQ(test, apple_pmc_interface_read(pmc, hw->boost_enable), BIT(0));
+
+	stuck.value = BIT(3);
+	writel(BIT(0) | BIT(1), pmc->rails + hw->boost_enable);
+	KUNIT_EXPECT_EQ(test, apple_pmc_domain_power_off(&dom.genpd), -EIO);
+	KUNIT_EXPECT_EQ(test, apple_pmc_interface_read(pmc, hw->bwr_enable), BIT(3));
+	KUNIT_EXPECT_EQ(test, apple_pmc_interface_read(pmc, hw->boost_enable),
+			BIT(0) | BIT(1));
+
+	kunit_deactivate_static_stub(test, apple_pmc_interface_read);
+	test->priv = NULL;
+}
+
+/*
+ * The internal display's consumer-switched interface (BWR and boost bit 0):
+ * off clears its bits only, on gives back the values they had, whether the
+ * boot loader left both set or only the boost enable.
+ */
+static void apple_pmc_test_interface_consumer(struct kunit *test)
+{
+	struct apple_pmc *pmc = apple_pmc_test_alloc(test);
+	struct apple_pmc_domain dom = {
+		.pmc = pmc, .interface = true, .bwr_bit = 0, .boost_bit = 0,
+		.consumer_switched = true,
+	};
+	const struct apple_pmc_hw *hw = &apple_pmc_hw_t8132;
+
+	pmc->hw = hw;
+	/* As Linux finds them: the boost enable only, next to dispext0's. */
+	writel(BIT(0) | BIT(1), pmc->rails + hw->boost_enable);
+	KUNIT_EXPECT_EQ(test, apple_pmc_interface_consumer_set(&dom, true), -EALREADY);
+	KUNIT_ASSERT_EQ(test, apple_pmc_interface_consumer_set(&dom, false), 0);
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->bwr_enable), 0U);
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->boost_enable), BIT(1));
+	KUNIT_EXPECT_EQ(test, apple_pmc_interface_consumer_set(&dom, false), -EALREADY);
+	KUNIT_ASSERT_EQ(test, apple_pmc_interface_consumer_set(&dom, true), 0);
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->bwr_enable), 0U);
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->boost_enable), BIT(0) | BIT(1));
+
+	/* As macOS keeps them while the display is on: both set. */
+	writel(BIT(0), pmc->rails + hw->bwr_enable);
+	KUNIT_ASSERT_EQ(test, apple_pmc_interface_consumer_set(&dom, false), 0);
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->bwr_enable), 0U);
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->boost_enable), BIT(1));
+	KUNIT_ASSERT_EQ(test, apple_pmc_interface_consumer_set(&dom, true), 0);
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->bwr_enable), BIT(0));
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->boost_enable), BIT(0) | BIT(1));
+}
+
+/* A BWR enable that does not clear: the boost enable goes back, still on. */
+static void apple_pmc_test_interface_consumer_stuck(struct kunit *test)
+{
+	struct apple_pmc *pmc = apple_pmc_test_alloc(test);
+	struct apple_pmc_domain dom = {
+		.pmc = pmc, .interface = true, .bwr_bit = 0, .boost_bit = 0,
+		.consumer_switched = true,
+	};
+	const struct apple_pmc_hw *hw = &apple_pmc_hw_t8132;
+	struct apple_pmc_test_stuck stuck = { .offset = hw->bwr_enable, .value = BIT(0) };
+
+	pmc->hw = hw;
+	writel(BIT(0), pmc->rails + hw->boost_enable);
+	test->priv = &stuck;
+	kunit_activate_static_stub(test, apple_pmc_interface_read, apple_pmc_test_stuck_read);
+	KUNIT_EXPECT_EQ(test, apple_pmc_interface_consumer_set(&dom, false), -EIO);
+	KUNIT_EXPECT_FALSE(test, dom.consumer_off);
+	KUNIT_EXPECT_EQ(test, apple_pmc_interface_read(pmc, hw->boost_enable), BIT(0));
+	kunit_deactivate_static_stub(test, apple_pmc_interface_read);
+	test->priv = NULL;
+}
+
+static void apple_pmc_test_genpd_remove(void *genpd)
+{
+	pm_genpd_remove(genpd);
+}
+
+static void apple_pmc_test_genpd_detach(void *dev)
+{
+	pm_runtime_disable(dev);
+	pm_genpd_remove_device(dev);
+}
+
+/* A genpd that is removed again when the test ends, children first. */
+static struct generic_pm_domain *apple_pmc_test_genpd(struct kunit *test,
+						      struct generic_pm_domain *genpd,
+						      int ret)
+{
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
+							apple_pmc_test_genpd_remove,
+							genpd), 0);
+	return genpd;
+}
+
+static struct apple_pmc_domain *apple_pmc_test_interface_dom(struct kunit *test,
+							     struct apple_pmc *pmc,
+							     const char *name)
+{
+	struct apple_pmc_domain *dom = kunit_kzalloc(test, sizeof(*dom), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, dom);
+	dom->pmc = pmc;
+	dom->interface = true;
+	dom->bwr_bit = 3;
+	dom->boost_bit = 1;
+	dom->genpd.name = name;
+	apple_pmc_test_genpd(test, &dom->genpd, apple_pmc_interface_init(pmc, dom));
+	return dom;
+}
+
+/*
+ * Link the interface domain as the PMGR driver does: under a SYS power
+ * state, with an FE power state below both, all of them IRQ safe. Powering
+ * FE through a device sets the enables after SYS is on, and powering it
+ * off clears them.
+ */
+static void apple_pmc_test_interface_genpd(struct kunit *test)
+{
+	struct apple_pmc *pmc = apple_pmc_test_alloc(test);
+	const struct apple_pmc_hw *hw = &apple_pmc_hw_t8132;
+	struct generic_pm_domain *sys, *fe;
+	struct apple_pmc_domain *dom;
+	struct device *dev;
+
+	pmc->hw = hw;
+	writel(BIT(0), pmc->rails + hw->boost_enable);
+	pmc->saved_boost = BIT(0);
+	dev = kunit_device_register(test, "apple-pmc-test-fe");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
+
+	sys = kunit_kzalloc(test, sizeof(*sys), GFP_KERNEL);
+	fe = kunit_kzalloc(test, sizeof(*fe), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, sys);
+	KUNIT_ASSERT_NOT_NULL(test, fe);
+	sys->name = "apple-pmc-test-sys";
+	sys->flags = GENPD_FLAG_IRQ_SAFE;
+	fe->name = "apple-pmc-test-fe";
+	fe->flags = GENPD_FLAG_IRQ_SAFE;
+	apple_pmc_test_genpd(test, sys, pm_genpd_init(sys, NULL, false));
+	dom = apple_pmc_test_interface_dom(test, pmc, "apple-pmc-test-interface");
+	KUNIT_EXPECT_EQ(test, dom->genpd.status, GENPD_STATE_OFF);
+	apple_pmc_test_genpd(test, fe, pm_genpd_init(fe, NULL, true));
+
+	KUNIT_ASSERT_EQ(test, pm_genpd_add_subdomain(sys, &dom->genpd), 0);
+	KUNIT_ASSERT_EQ(test, pm_genpd_add_subdomain(sys, fe), 0);
+	KUNIT_ASSERT_EQ(test, pm_genpd_add_subdomain(&dom->genpd, fe), 0);
+
+	KUNIT_ASSERT_EQ(test, pm_genpd_add_device(fe, dev), 0);
+	pm_runtime_enable(dev);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
+							apple_pmc_test_genpd_detach,
+							dev), 0);
+
+	KUNIT_ASSERT_EQ(test, pm_runtime_resume_and_get(dev), 0);
+	KUNIT_EXPECT_EQ(test, dom->genpd.status, GENPD_STATE_ON);
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->bwr_enable), BIT(3));
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->boost_enable), BIT(0) | BIT(1));
+
+	KUNIT_EXPECT_EQ(test, pm_runtime_put_sync_suspend(dev), 0);
+	KUNIT_EXPECT_EQ(test, dom->genpd.status, GENPD_STATE_OFF);
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->bwr_enable), 0U);
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->boost_enable), BIT(0));
+}
+
+/*
+ * A pipe with both enables set at boot starts on. One with only its boost
+ * enable set starts off, and a power on that fails on the BWR enable keeps
+ * that boost enable instead of clearing it.
+ */
+static void apple_pmc_test_interface_boot_state(struct kunit *test)
+{
+	struct apple_pmc *pmc = apple_pmc_test_alloc(test);
+	const struct apple_pmc_hw *hw = &apple_pmc_hw_t8132;
+	struct apple_pmc_test_stuck stuck = { .offset = hw->bwr_enable };
+	struct apple_pmc_domain *dom;
+
+	pmc->hw = hw;
+	pmc->saved_bwr = BIT(3);
+	pmc->saved_boost = BIT(0) | BIT(1);
+	dom = apple_pmc_test_interface_dom(test, pmc, "apple-pmc-test-on");
+	KUNIT_EXPECT_EQ(test, dom->genpd.status, GENPD_STATE_ON);
+
+	pmc->saved_bwr = 0;
+	writel(BIT(0) | BIT(1), pmc->rails + hw->boost_enable);
+	dom = apple_pmc_test_interface_dom(test, pmc, "apple-pmc-test-mixed");
+	KUNIT_EXPECT_EQ(test, dom->genpd.status, GENPD_STATE_OFF);
+
+	test->priv = &stuck;
+	kunit_activate_static_stub(test, apple_pmc_interface_read,
+				   apple_pmc_test_stuck_read);
+	KUNIT_EXPECT_EQ(test, apple_pmc_domain_power_on(&dom->genpd), -EIO);
+	KUNIT_EXPECT_EQ(test, apple_pmc_interface_read(pmc, hw->boost_enable),
+			BIT(0) | BIT(1));
+	kunit_deactivate_static_stub(test, apple_pmc_interface_read);
+	test->priv = NULL;
+
+	KUNIT_EXPECT_EQ(test, apple_pmc_domain_power_on(&dom->genpd), 0);
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->bwr_enable), BIT(3));
+	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->boost_enable), BIT(0) | BIT(1));
+}
+
 static struct kunit_case apple_pmc_test_cases[] = {
+	KUNIT_CASE(apple_pmc_test_dcs_floor),
 	KUNIT_CASE(apple_pmc_test_partial_enable),
 	KUNIT_CASE(apple_pmc_test_release_restores_ap_vote),
 	KUNIT_CASE(apple_pmc_test_pending_floor),
 	KUNIT_CASE(apple_pmc_test_agent_enable),
 	KUNIT_CASE(apple_pmc_test_agent_rails),
 	KUNIT_CASE(apple_pmc_test_dcs_limit_restores_ap_vote),
+	KUNIT_CASE(apple_pmc_test_floor_aggregate),
+	KUNIT_CASE(apple_pmc_test_floor_pending_timeout),
+	KUNIT_CASE(apple_pmc_test_interface),
+	KUNIT_CASE(apple_pmc_test_interface_stuck),
+	KUNIT_CASE(apple_pmc_test_interface_consumer),
+	KUNIT_CASE(apple_pmc_test_interface_consumer_stuck),
+	KUNIT_CASE(apple_pmc_test_interface_genpd),
+	KUNIT_CASE(apple_pmc_test_interface_boot_state),
 	{}
 };
 

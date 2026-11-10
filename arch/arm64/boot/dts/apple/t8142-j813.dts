@@ -14,6 +14,7 @@
 / {
 	compatible = "apple,j813", "apple,t8142", "apple,arm-platform";
 	model = "Apple MacBook Air (13-inch, M5, 2026)";
+	chassis-type = "laptop";
 
 	#address-cells = <2>;
 	#size-cells = <2>;
@@ -164,78 +165,6 @@
 		interrupt-names = "phys", "virt", "hyp-phys", "hyp-virt";
 	};
 
-	/* State 1 is 300 MHz; firmware SRAM OPP tables begin at state 2. */
-	/* Cap each cluster at its measured J813 firmware handoff state. */
-	ecluster_opp: opp-table-0 {
-		compatible = "operating-points-v2";
-		opp-shared;
-
-		opp-300000000 {
-			opp-hz = /bits/ 64 <300000000>;
-			opp-level = <1>;
-		};
-
-		opp-972000000 {
-			opp-hz = /bits/ 64 <972000000>;
-			opp-level = <2>;
-		};
-	};
-
-	pcluster_opp: opp-table-1 {
-		compatible = "operating-points-v2";
-		opp-shared;
-
-		opp-300000000 {
-			opp-hz = /bits/ 64 <300000000>;
-			opp-level = <1>;
-		};
-
-		opp-1308000000 {
-			opp-hz = /bits/ 64 <1308000000>;
-			opp-level = <2>;
-		};
-
-		opp-1608000000 {
-			opp-hz = /bits/ 64 <1608000000>;
-			opp-level = <3>;
-		};
-
-		opp-1932000000 {
-			opp-hz = /bits/ 64 <1932000000>;
-			opp-level = <4>;
-		};
-
-		opp-2220000000 {
-			opp-hz = /bits/ 64 <2220000000>;
-			opp-level = <5>;
-		};
-
-		opp-2508000000 {
-			opp-hz = /bits/ 64 <2508000000>;
-			opp-level = <6>;
-		};
-
-		opp-2820000000 {
-			opp-hz = /bits/ 64 <2820000000>;
-			opp-level = <7>;
-		};
-
-		opp-3072000000 {
-			opp-hz = /bits/ 64 <3072000000>;
-			opp-level = <8>;
-		};
-
-		opp-3300000000 {
-			opp-hz = /bits/ 64 <3300000000>;
-			opp-level = <9>;
-		};
-
-		opp-3516000000 {
-			opp-hz = /bits/ 64 <3516000000>;
-			opp-level = <10>;
-		};
-	};
-
 	clkref: clock-ref {
 		compatible = "fixed-clock";
 		#clock-cells = <0>;
@@ -248,18 +177,6 @@
 		#size-cells = <2>;
 		ranges;
 		nonposted-mmio;
-
-		cpufreq_e: performance-controller@210e20000 {
-			compatible = "apple,t8142-cluster-cpufreq";
-			reg = <0x2 0x10e20000 0 0x1000>;
-			#performance-domain-cells = <0>;
-		};
-
-		cpufreq_p: performance-controller@211e20000 {
-			compatible = "apple,t8142-cluster-cpufreq";
-			reg = <0x2 0x11e20000 0 0x1000>;
-			#performance-domain-cells = <0>;
-		};
 
 		aic: interrupt-controller@381000000 {
 			compatible = "apple,t8142-aic3", "apple,t8122-aic3";
@@ -292,5 +209,21 @@
 };
 
 #include "t8142-j813-display.dtsi"
+#include "t8142-j813-gpu.dtsi"
 #include "t8142-j813-peripherals.dtsi"
+#include "t8142-j813-j815.dtsi"
 #include "t8142-j813-usb.dtsi"
+#include "t8142-j813-avd.dtsi"
+#include "t8142-j813-isp.dtsi"
+#include "t8142-j813-n1.dtsi"
+#include "t8142-j813-audio.dtsi"
+
+#include "t8142-peripherals.dtsi"
+
+&mtp_hid {
+	multi-touch {
+		firmware-name = "apple/tpmtfw-j813.bin";
+	};
+};
+
+/* Unexposed chassis port instances remain described and disabled. */

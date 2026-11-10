@@ -637,41 +637,28 @@ static void macsmc_charge_serialized_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, t->chls, 0x013c);
 }
 
-/* Probe clears force-discharge left without a limit, and only that. */
+/* A stale force-discharge bit is cleared only by an explicit auto request. */
 static void macsmc_charge_clear_stray_discharge_test(struct kunit *test)
 {
-	static const struct {
-		u16 before, after;
-		unsigned int writes;
-	} cases[] = {
-		{ 0x0100, 0x0000, 1 },
-		{ 0x0164, 0x0064, 1 },
-		{ 0x0105, 0x0005, 1 },
-		{ 0x0150, 0x0150, 0 },	/* auto-discharge with a limit stays */
-		{ 0x0050, 0x0050, 0 },
-		{ 0x0000, 0x0000, 0 },
-	};
+	static const u16 values[] = { 0x0100, 0x0164, 0x0105, 0x0150, 0x0050, 0x0000 };
 	struct macsmc_charge_test *t = test->priv;
 	unsigned int i;
 
 	t->power.has_chls = true;
-	for (i = 0; i < ARRAY_SIZE(cases); i++) {
-		t->chls = cases[i].before;
+	for (i = 0; i < ARRAY_SIZE(values); i++) {
+		t->chls = values[i];
 		t->nops = 0;
-		KUNIT_EXPECT_EQ_MSG(test, macsmc_battery_clear_stray_discharge(&t->power), 0,
+		macsmc_battery_get_charge_behaviour(&t->power);
+		KUNIT_EXPECT_EQ_MSG(test, t->chls, values[i], "read case %u", i);
+		KUNIT_EXPECT_EQ(test, charge_test_writes(t), 0U);
+		KUNIT_EXPECT_EQ_MSG(test,
+				    charge_test_set(t, POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
+						    POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO),
+				    0, "case %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, t->chls, values[i] & ~CHLS_FORCE_DISCHARGE,
 				    "case %u", i);
-		KUNIT_EXPECT_EQ_MSG(test, t->chls, cases[i].after, "case %u", i);
-		KUNIT_EXPECT_EQ_MSG(test, charge_test_writes(t), cases[i].writes, "case %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, charge_test_writes(t), 1U, "case %u", i);
 	}
-
-	t->chls = 0x0100;
-	t->fail_key = SMC_KEY(CHLS);
-	t->fail_err = -ETIMEDOUT;
-	KUNIT_EXPECT_EQ(test, macsmc_battery_clear_stray_discharge(&t->power), -ETIMEDOUT);
-	t->fail_write = true;
-	t->fail_err = -EIO;
-	KUNIT_EXPECT_EQ(test, macsmc_battery_clear_stray_discharge(&t->power), -EIO);
-	KUNIT_EXPECT_EQ(test, t->chls, 0x0100);
 }
 
 static struct kunit_case macsmc_charge_test_cases[] = {

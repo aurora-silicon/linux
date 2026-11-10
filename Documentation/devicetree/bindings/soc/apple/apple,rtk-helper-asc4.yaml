@@ -26,6 +26,7 @@ properties:
           - apple,t6030-mtp
           - apple,t6031-mtp
           - apple,t6041-mtp
+          - apple,t6050-mtp
           - apple,t8112-mtp
           - apple,t8122-mtp
           - apple,t8132-mtp
@@ -35,6 +36,7 @@ properties:
           - apple,t6020-rtk-helper-asc4
           - apple,t6030-rtk-helper-asc4
           - apple,t6041-rtk-helper-asc4
+          - apple,t6050-rtk-helper-asc4
           - apple,t8112-rtk-helper-asc4
           - apple,t8122-rtk-helper-asc4
           - apple,t8132-rtk-helper-asc4

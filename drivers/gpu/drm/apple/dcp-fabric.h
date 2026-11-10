@@ -106,9 +106,13 @@ int dcp_tunnel_set_rate(struct apple_dcp *dcp, struct phy *phy, u32 unit,
 			u32 link_rate);
 int dcp_tunnel_dpin_activate(struct apple_dcp *dcp, u32 unit, bool active);
 
+/* An adopted T8132 dcpext. */
+bool dcp_is_t8132_ext(const struct apple_dcp *dcp);
+
 /* DCP probe, resume and endpoint teardown hooks. */
 int dcp_register_typec_routes(struct apple_dcp *dcp);
 void dcp_typec_routes_disable(struct apple_dcp *dcp);
+void dcp_typec_routes_disable_dev(struct device *dev);
 void dcp_typec_retrain_work(struct work_struct *work);
 void dcp_fabric_init(struct apple_dcp *dcp);
 void dcp_fabric_hdmi_resume(struct apple_dcp *dcp);

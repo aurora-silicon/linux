@@ -1,0 +1,396 @@
+{
+ "schema": 1,
+ "scope": "J604 (MacBook Pro 14-inch, M4) internal panel TimingElements as macOS 26B123 reports them (ioreg disp0). Types: integer, boolean, string, {\"data\": hex}, array, dictionary; key order kept.",
+ "j604": [
+  {
+   "StandardType": 0,
+   "DiscreteMediaRefreshRates": [],
+   "ElementType": 0,
+   "IsSplit": false,
+   "IsPromoted": false,
+   "IsInterlaced": false,
+   "HorizontalAttributes": {
+    "Total": 3104,
+    "Active": 3024,
+    "PixelRepetition": 0,
+    "PreciseSyncRate": 16986999,
+    "BackPorch": 40,
+    "SyncWidth": 32,
+    "FrontPorch": 8,
+    "SyncPolarity": 1,
+    "SyncRate": 16973824
+   },
+   "VerticalAttributes": {
+    "Total": 2160,
+    "Active": 1964,
+    "PixelRepetition": 0,
+    "PreciseSyncRate": 7864351,
+    "BackPorch": 86,
+    "SyncWidth": 8,
+    "FrontPorch": 102,
+    "SyncPolarity": 1,
+    "SyncRate": 7864320
+   },
+   "UnsafeColorElementIDs": [],
+   "Score": 16813,
+   "MinimumVariableRefreshRate": 0,
+   "ColorModes": [
+    {
+     "ElementData": {
+      "data": "0800000000000000000000001000000000000000000000000000000000000000"
+     },
+     "StandardType": 0,
+     "Score": 240999,
+     "IsVirtual": false,
+     "ID": 1,
+     "PixelEncoding": 0,
+     "ElementType": 1,
+     "SupportsDSC": 0,
+     "EOTF": 0,
+     "Colorimetry": 16,
+     "DynamicRange": 0,
+     "Depth": 8
+    }
+   ],
+   "IsOverscanned": false,
+   "IsVirtual": false,
+   "ElementData": {
+    "data": "00000000200c0000d00b000020000000280000000800000077330301010000000000000070080000ac0700000800000056000000660000001f0078000100000000000000809cf42f0c00000000000000"
+   },
+   "IsPreferred": true,
+   "ScanInformation": 0,
+   "TimingType": 3,
+   "DSCRequiredColorElementIDs": [],
+   "ID": 2,
+   "AspectRatio": 12,
+   "MaximumVariableRefreshRate": 0,
+   "ValidPixelEncodings": 1,
+   "PreciseAspectRatio": 100906
+  },
+  {
+   "StandardType": 0,
+   "DiscreteMediaRefreshRates": [],
+   "ElementType": 0,
+   "IsSplit": false,
+   "IsPromoted": true,
+   "IsInterlaced": false,
+   "HorizontalAttributes": {
+    "Total": 3104,
+    "Active": 3024,
+    "PixelRepetition": 0,
+    "PreciseSyncRate": 16986999,
+    "BackPorch": 40,
+    "SyncWidth": 32,
+    "FrontPorch": 8,
+    "SyncPolarity": 1,
+    "SyncRate": 16973824
+   },
+   "VerticalAttributes": {
+    "Total": 2160,
+    "Active": 1964,
+    "PixelRepetition": 0,
+    "PreciseSyncRate": 3932160,
+    "BackPorch": 86,
+    "SyncWidth": 8,
+    "FrontPorch": 102,
+    "SyncPolarity": 1,
+    "SyncRate": 3932160
+   },
+   "UnsafeColorElementIDs": [],
+   "Score": 15416,
+   "MinimumVariableRefreshRate": 0,
+   "ColorModes": [
+    {
+     "ElementData": {
+      "data": "0800000000000000000000001000000000000000000000000000000000000000"
+     },
+     "StandardType": 0,
+     "Score": 240999,
+     "IsVirtual": false,
+     "ID": 1,
+     "PixelEncoding": 0,
+     "ElementType": 1,
+     "SupportsDSC": 0,
+     "EOTF": 0,
+     "Colorimetry": 16,
+     "DynamicRange": 0,
+     "Depth": 8
+    }
+   ],
+   "IsOverscanned": false,
+   "IsVirtual": false,
+   "ElementData": {
+    "data": "00000000200c0000d00b000020000000280000000800000077330301010000000000000070080000ac07000008000000560000006600000000003c000100000000000000809cf42f0c00000000000000"
+   },
+   "IsPreferred": false,
+   "ScanInformation": 0,
+   "TimingType": 3,
+   "DSCRequiredColorElementIDs": [],
+   "ID": 3,
+   "AspectRatio": 12,
+   "MaximumVariableRefreshRate": 0,
+   "ValidPixelEncodings": 1,
+   "PreciseAspectRatio": 100906
+  },
+  {
+   "StandardType": 0,
+   "DiscreteMediaRefreshRates": [],
+   "ElementType": 0,
+   "IsSplit": false,
+   "IsPromoted": true,
+   "IsInterlaced": false,
+   "HorizontalAttributes": {
+    "Total": 3104,
+    "Active": 3024,
+    "PixelRepetition": 0,
+    "PreciseSyncRate": 16986999,
+    "BackPorch": 40,
+    "SyncWidth": 32,
+    "FrontPorch": 8,
+    "SyncPolarity": 1,
+    "SyncRate": 16973824
+   },
+   "VerticalAttributes": {
+    "Total": 2160,
+    "Active": 1964,
+    "PixelRepetition": 0,
+    "PreciseSyncRate": 3145728,
+    "BackPorch": 86,
+    "SyncWidth": 8,
+    "FrontPorch": 102,
+    "SyncPolarity": 1,
+    "SyncRate": 3145728
+   },
+   "UnsafeColorElementIDs": [],
+   "Score": 15333,
+   "MinimumVariableRefreshRate": 0,
+   "ColorModes": [
+    {
+     "ElementData": {
+      "data": "0800000000000000000000001000000000000000000000000000000000000000"
+     },
+     "StandardType": 0,
+     "Score": 240999,
+     "IsVirtual": false,
+     "ID": 1,
+     "PixelEncoding": 0,
+     "ElementType": 1,
+     "SupportsDSC": 0,
+     "EOTF": 0,
+     "Colorimetry": 16,
+     "DynamicRange": 0,
+     "Depth": 8
+    }
+   ],
+   "IsOverscanned": false,
+   "IsVirtual": false,
+   "ElementData": {
+    "data": "00000000200c0000d00b000020000000280000000800000077330301010000000000000070080000ac070000080000005600000066000000000030000100000000000000809cf42f0c00000000000000"
+   },
+   "IsPreferred": false,
+   "ScanInformation": 0,
+   "TimingType": 3,
+   "DSCRequiredColorElementIDs": [],
+   "ID": 4,
+   "AspectRatio": 12,
+   "MaximumVariableRefreshRate": 0,
+   "ValidPixelEncodings": 1,
+   "PreciseAspectRatio": 100906
+  },
+  {
+   "StandardType": 0,
+   "DiscreteMediaRefreshRates": [],
+   "ElementType": 0,
+   "IsSplit": false,
+   "IsPromoted": true,
+   "IsInterlaced": false,
+   "HorizontalAttributes": {
+    "Total": 3104,
+    "Active": 3024,
+    "PixelRepetition": 0,
+    "PreciseSyncRate": 16969960,
+    "BackPorch": 40,
+    "SyncWidth": 32,
+    "FrontPorch": 8,
+    "SyncPolarity": 1,
+    "SyncRate": 16973824
+   },
+   "VerticalAttributes": {
+    "Total": 2160,
+    "Active": 1964,
+    "PixelRepetition": 0,
+    "PreciseSyncRate": 3928232,
+    "BackPorch": 86,
+    "SyncWidth": 8,
+    "FrontPorch": 102,
+    "SyncPolarity": 1,
+    "SyncRate": 3932160
+   },
+   "UnsafeColorElementIDs": [],
+   "Score": 15416,
+   "MinimumVariableRefreshRate": 0,
+   "ColorModes": [
+    {
+     "ElementData": {
+      "data": "0800000000000000000000001000000000000000000000000000000000000000"
+     },
+     "StandardType": 0,
+     "Score": 240999,
+     "IsVirtual": false,
+     "ID": 1,
+     "PixelEncoding": 0,
+     "ElementType": 1,
+     "SupportsDSC": 0,
+     "EOTF": 0,
+     "Colorimetry": 16,
+     "DynamicRange": 0,
+     "Depth": 8
+    }
+   ],
+   "IsOverscanned": false,
+   "IsVirtual": false,
+   "ElementData": {
+    "data": "00000000200c0000d00b0000200000002800000008000000e8f00201010000000000000070080000ac070000080000005600000066000000a8f03b000100000000000000284ce82f0c00000000000000"
+   },
+   "IsPreferred": false,
+   "ScanInformation": 0,
+   "TimingType": 3,
+   "DSCRequiredColorElementIDs": [],
+   "ID": 5,
+   "AspectRatio": 12,
+   "MaximumVariableRefreshRate": 0,
+   "ValidPixelEncodings": 1,
+   "PreciseAspectRatio": 100906
+  },
+  {
+   "StandardType": 0,
+   "DiscreteMediaRefreshRates": [],
+   "ElementType": 0,
+   "IsSplit": false,
+   "IsPromoted": true,
+   "IsInterlaced": false,
+   "HorizontalAttributes": {
+    "Total": 3104,
+    "Active": 3024,
+    "PixelRepetition": 0,
+    "PreciseSyncRate": 16969960,
+    "BackPorch": 40,
+    "SyncWidth": 32,
+    "FrontPorch": 8,
+    "SyncPolarity": 1,
+    "SyncRate": 16973824
+   },
+   "VerticalAttributes": {
+    "Total": 2160,
+    "Active": 1964,
+    "PixelRepetition": 0,
+    "PreciseSyncRate": 3142585,
+    "BackPorch": 86,
+    "SyncWidth": 8,
+    "FrontPorch": 102,
+    "SyncPolarity": 1,
+    "SyncRate": 3145728
+   },
+   "UnsafeColorElementIDs": [],
+   "Score": 15333,
+   "MinimumVariableRefreshRate": 0,
+   "ColorModes": [
+    {
+     "ElementData": {
+      "data": "0800000000000000000000001000000000000000000000000000000000000000"
+     },
+     "StandardType": 0,
+     "Score": 240999,
+     "IsVirtual": false,
+     "ID": 1,
+     "PixelEncoding": 0,
+     "ElementType": 1,
+     "SupportsDSC": 0,
+     "EOTF": 0,
+     "Colorimetry": 16,
+     "DynamicRange": 0,
+     "Depth": 8
+    }
+   ],
+   "IsOverscanned": false,
+   "IsVirtual": false,
+   "ElementData": {
+    "data": "00000000200c0000d00b0000200000002800000008000000e8f00201010000000000000070080000ac070000080000005600000066000000b9f32f000100000000000000284ce82f0c00000000000000"
+   },
+   "IsPreferred": false,
+   "ScanInformation": 0,
+   "TimingType": 3,
+   "DSCRequiredColorElementIDs": [],
+   "ID": 6,
+   "AspectRatio": 12,
+   "MaximumVariableRefreshRate": 0,
+   "ValidPixelEncodings": 1,
+   "PreciseAspectRatio": 100906
+  },
+  {
+   "StandardType": 0,
+   "DiscreteMediaRefreshRates": [],
+   "ElementType": 0,
+   "IsSplit": false,
+   "IsPromoted": true,
+   "IsInterlaced": false,
+   "HorizontalAttributes": {
+    "Total": 3104,
+    "Active": 3024,
+    "PixelRepetition": 0,
+    "PreciseSyncRate": 16986931,
+    "BackPorch": 40,
+    "SyncWidth": 32,
+    "FrontPorch": 8,
+    "SyncPolarity": 1,
+    "SyncRate": 16973824
+   },
+   "VerticalAttributes": {
+    "Total": 2592,
+    "Active": 1964,
+    "PixelRepetition": 0,
+    "PreciseSyncRate": 3276800,
+    "BackPorch": 86,
+    "SyncWidth": 8,
+    "FrontPorch": 534,
+    "SyncPolarity": 1,
+    "SyncRate": 3276800
+   },
+   "UnsafeColorElementIDs": [],
+   "Score": 15347,
+   "MinimumVariableRefreshRate": 0,
+   "ColorModes": [
+    {
+     "ElementData": {
+      "data": "0800000000000000000000001000000000000000000000000000000000000000"
+     },
+     "StandardType": 0,
+     "Score": 240999,
+     "IsVirtual": false,
+     "ID": 1,
+     "PixelEncoding": 0,
+     "ElementType": 1,
+     "SupportsDSC": 0,
+     "EOTF": 0,
+     "Colorimetry": 16,
+     "DynamicRange": 0,
+     "Depth": 8
+    }
+   ],
+   "IsOverscanned": false,
+   "IsVirtual": false,
+   "ElementData": {
+    "data": "00000000200c0000d00b0000200000002800000008000000333303010100000000000000200a0000ac0700000800000056000000160200000000320001000000000000000090f42f0c00000000000000"
+   },
+   "IsPreferred": false,
+   "ScanInformation": 0,
+   "TimingType": 3,
+   "DSCRequiredColorElementIDs": [],
+   "ID": 7,
+   "AspectRatio": 12,
+   "MaximumVariableRefreshRate": 0,
+   "ValidPixelEncodings": 1,
+   "PreciseAspectRatio": 100906
+  }
+ ]
+}

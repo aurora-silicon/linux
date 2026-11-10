@@ -121,9 +121,18 @@ const EPIC_CATEGORY_NOTIFY: u8 = 0x10;
 const EPIC_CATEGORY_REPLY: u8 = 0x20;
 const EPIC_SUBTYPE_STD_SERVICE: u16 = 0xc0;
 const EPIC_SUBTYPE_FAKEHID_REPORT: u16 = 0xc4;
+/// The T8132 firmware sends its gyroscope and accelerometer samples with
+/// these report subtypes; they carry the same payload as a fake-HID report.
+const EPIC_SUBTYPE_GYRO_REPORT: u16 = 0xc1;
+const EPIC_SUBTYPE_ACCEL_REPORT: u16 = 0xc2;
 const EPIC_SUBTYPE_RETCODE: u16 = 0x84;
 const EPIC_SUBTYPE_RETCODE_PAYLOAD: u16 = 0xa0;
 const EPIC_SUBTYPE_STRING: u16 = 0x8a;
+/// Replies to the client-open (25) and client-close (26) commands. As with
+/// the other replies, the subtype is the request's with bit 7 set, and the
+/// body starts with the return code.
+const EPIC_SUBTYPE_CLIENT_OPEN_REPLY: u16 = 0x99;
+const EPIC_SUBTYPE_CLIENT_CLOSE_REPLY: u16 = 0x9a;
 const QE_MAGIC1: u32 = from_fourcc(b" POI");
 const QE_MAGIC2: u32 = from_fourcc(b" POA");
 /// Bound on the wait for the reply to an EPIC call. The firmware can stop
@@ -166,6 +175,8 @@ const SETUP_BUFFER_ENTRY_SIZE: usize = 16;
 /// them have theirs.
 const SETUP_ENDPOINTS: [u8; 5] = [0x20, 0x21, 0x23, 0x30, 0x32];
 const SETUP_BOOT_TIMEOUT_MS: u32 = 15000;
+/// How long the AP power request waits for the last endpoint map fragment.
+const SETUP_MAP_TIMEOUT_MS: u32 = 1000;
 // A request to a service endpoint: the payload goes into the endpoint's
 // message page, (3 << 60) | length announces it, the firmware answers with a
 // result word after writing a status byte at the start of the reply window,
@@ -756,7 +767,10 @@ impl AFKEndpoint {
                 let name = &name[..name.iter().position(|x| *x == 0).unwrap_or(name.len())];
                 let chan = le_u32(data, EPIC_ANNOUNCE_CHANNEL_OFFSET);
                 return Into::<Arc<_>>::into(client).register_service(self, chan, name);
-            } else if subtype == EPIC_SUBTYPE_FAKEHID_REPORT {
+            } else if subtype == EPIC_SUBTYPE_FAKEHID_REPORT
+                || subtype == EPIC_SUBTYPE_GYRO_REPORT
+                || subtype == EPIC_SUBTYPE_ACCEL_REPORT
+            {
                 return client.process_fakehid_report(self, qhdr.channel, data);
             } else if client.process_report(self, qhdr.channel, subtype, data)? {
                 return Ok(());
@@ -767,6 +781,8 @@ impl AFKEndpoint {
             if subtype == EPIC_SUBTYPE_RETCODE_PAYLOAD
                 || subtype == EPIC_SUBTYPE_RETCODE
                 || subtype == EPIC_SUBTYPE_STRING
+                || subtype == EPIC_SUBTYPE_CLIENT_OPEN_REPLY
+                || subtype == EPIC_SUBTYPE_CLIENT_CLOSE_REPLY
             {
                 if data.len() < mem::size_of::<u32>() {
                     return Err(EMSGSIZE);
@@ -1471,6 +1487,10 @@ impl AopData {
             b"aop-audio" => c_str!("audio"),
             b"las" => c_str!("las"),
             b"als" => c_str!("als"),
+            b"accel" => c_str!("accel"),
+            b"gyro" => c_str!("gyro"),
+            b"devmotion6" => c_str!("devmotion6"),
+            b"als-temp" => c_str!("als-temp"),
             _ => {
                 return Ok(());
             }
@@ -1584,17 +1604,35 @@ impl AopData {
     fn patch_bootargs(
         &self,
         aop_mmio: &Mmio<'_, Region<AOP_MMIO_SIZE>>,
-        patches: &[(u32, u64)],
+        patches: &[(u32, Option<u64>)],
+        word_access: bool,
     ) -> Result<()> {
         let offset = aop_mmio.read32(BOOTARGS_OFFSET) as usize;
         let size = aop_mmio.read32(BOOTARGS_SIZE) as usize;
         if offset > aop_mmio.size() || size > aop_mmio.size() - offset {
             return Err(EINVAL);
         }
-        let mut arg_bytes = KVec::<u8>::from_elem(0, size, GFP_KERNEL)?;
+        let start = if word_access { offset & !3 } else { offset };
+        let end = if word_access {
+            (offset + size).checked_add(3).ok_or(EINVAL)? & !3
+        } else {
+            offset + size
+        };
+        if end > aop_mmio.size() || (word_access && size == 0) {
+            return Err(EINVAL);
+        }
+        let mut bytes = KVec::<u8>::from_elem(0, end - start, GFP_KERNEL)?;
         let aop_io_array: Mmio<'_, [u8; AOP_MMIO_SIZE]> = aop_mmio.try_cast()?;
         let bootargs = io_project!(aop_io_array, [try: offset .. offset+size]);
-        bootargs.copy_to_slice(&mut arg_bytes);
+        if word_access {
+            for (i, chunk) in bytes.chunks_exact_mut(4).enumerate() {
+                chunk.copy_from_slice(&aop_mmio.try_read32(start + i * 4)?.to_le_bytes());
+            }
+        } else {
+            bootargs.copy_to_slice(&mut bytes);
+        }
+        let first = offset - start;
+        let arg_bytes = &mut bytes[first..first + size];
         let mut idx = 0;
         while idx < size {
             if size - idx < 8 {
@@ -1610,6 +1648,10 @@ impl AopData {
                 if *k != key {
                     continue;
                 }
+                // `None` keeps the value the firmware image carries.
+                let Some(v) = v else {
+                    break;
+                };
                 if len > mem::size_of::<u64>() {
                     return Err(EINVAL);
                 }
@@ -1618,7 +1660,21 @@ impl AopData {
             }
             idx += len;
         }
-        bootargs.copy_from_slice(&arg_bytes);
+        if word_access {
+            for (i, chunk) in bytes.chunks_exact(4).enumerate() {
+                let address = start + i * 4;
+                let value = u32::from_le_bytes(chunk.try_into().unwrap());
+                if aop_mmio.try_read32(address)? == value {
+                    continue;
+                }
+                aop_mmio.try_write32(value, address)?;
+                if aop_mmio.try_read32(address)? != value {
+                    return Err(EIO);
+                }
+            }
+        } else {
+            bootargs.copy_from_slice(arg_bytes);
+        }
         Ok(())
     }
 
@@ -2428,7 +2484,15 @@ impl AopData {
     /// buffers.
     fn setup_finish_boot(&self) -> Result<()> {
         let mut st = self.setup.lock();
-        if !st.map_done {
+        // The firmware sends the endpoint map right after HELLO, normally
+        // before RTKit reaches AP power on, but on some boots its last
+        // fragment arrives a few milliseconds later. Request AP power only
+        // once the map is complete, and warn only if it never completes.
+        if !st.map_done
+            && self
+                .setup_wait(&mut st, SETUP_MAP_TIMEOUT_MS, |s| s.map_done)
+                .is_err()
+        {
             dev_warn!(
                 self.dev,
                 "setup port: endpoint map incomplete before the AP power request"
@@ -2502,6 +2566,8 @@ struct AopDriver(Arc<dyn AOP>);
 
 struct AopHwConfig {
     ec0p: u64,
+    /// The `nCal` boot argument, or `None` to keep the firmware's own value.
+    ncal: Option<u64>,
     alig: u64,
     aopt: u64,
     /// Complete the firmware's boot arguments before starting it.
@@ -2519,12 +2585,14 @@ struct AopHwConfig {
     /// and lists in `memory-region`; check their IOMMU mappings before
     /// starting it (T6040).
     fw_regions: bool,
+    bootargs_word_access: bool,
     /// Halt the co-processor again when its start fails (T6040).
     halt_on_failed_start: bool,
 }
 
 const HW_CFG_T8103: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
+    ncal: Some(0),
     aopt: 1,
     alig: 128,
     patch_bootargs: true,
@@ -2533,10 +2601,14 @@ const HW_CFG_T8103: AopHwConfig = AopHwConfig {
     quiesce_on_unbind: false,
     required_endpoints: &[],
     fw_regions: false,
+    bootargs_word_access: false,
     halt_on_failed_start: false,
 };
+/// `nCal` keeps the firmware's own value, as on T6040: the J413 image carries 1,
+/// and with 0 the firmware never announces its accelerometer and gyroscope.
 const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
+    ncal: None,
     aopt: 0,
     alig: 128,
     patch_bootargs: true,
@@ -2545,10 +2617,13 @@ const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     quiesce_on_unbind: false,
     required_endpoints: &[],
     fw_regions: false,
+    bootargs_word_access: false,
     halt_on_failed_start: false,
 };
+/// `nCal` keeps the firmware's own value, as on T8112.
 const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
+    ncal: None,
     aopt: 0,
     alig: 64,
     patch_bootargs: true,
@@ -2557,10 +2632,12 @@ const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     quiesce_on_unbind: false,
     required_endpoints: &[],
     fw_regions: false,
+    bootargs_word_access: false,
     halt_on_failed_start: false,
 };
 const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     ec0p: 0x0100_00000000,
+    ncal: Some(0),
     aopt: 0,
     alig: 64,
     patch_bootargs: true,
@@ -2569,14 +2646,17 @@ const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     quiesce_on_unbind: false,
     required_endpoints: &[],
     fw_regions: false,
+    bootargs_word_access: false,
     halt_on_failed_start: false,
 };
-/// T6040 (J616s): macOS writes the same four boot arguments as for the
-/// T6020. The firmware's external code and log live in DRAM, mapped through
-/// the reserved regions the bootloader describes; the RTKit firmware is shut
-/// down on unbind.
+/// T6040 (J616s): the firmware's external code and log live in DRAM, mapped
+/// through the reserved regions the bootloader describes; the RTKit firmware
+/// is shut down on unbind. `nCal` keeps the firmware's own default of 1:
+/// with 0 the accelerometer and gyroscope services accept their calibration
+/// and report interval but never send a report.
 const HW_CFG_T6040: AopHwConfig = AopHwConfig {
     ec0p: 0x0100_00000000,
+    ncal: Some(1),
     aopt: 0,
     alig: 64,
     patch_bootargs: true,
@@ -2585,8 +2665,13 @@ const HW_CFG_T6040: AopHwConfig = AopHwConfig {
     quiesce_on_unbind: true,
     required_endpoints: &[],
     fw_regions: true,
+    bootargs_word_access: true,
     halt_on_failed_start: true,
 };
+/// T8132 (J713): as T6040. The bootloader hands the AOP over the same way, with
+/// the DART's DAPF programmed and its windows reserved alongside the firmware
+/// segments.
+const HW_CFG_T8132: AopHwConfig = HW_CFG_T6040;
 /// T8140: the firmware is started with the boot arguments the bootloader
 /// left, boots through the setup port and speaks EPIC version 4. Of the
 /// advertised AFK endpoints, the application map is 0x20 misc, 0x21
@@ -2594,6 +2679,7 @@ const HW_CFG_T6040: AopHwConfig = AopHwConfig {
 /// are started if they will.
 const HW_CFG_T8140: AopHwConfig = AopHwConfig {
     ec0p: 0,
+    ncal: Some(0),
     aopt: 0,
     alig: 0,
     patch_bootargs: false,
@@ -2602,6 +2688,7 @@ const HW_CFG_T8140: AopHwConfig = AopHwConfig {
     quiesce_on_unbind: true,
     required_endpoints: &[0x20, 0x21, 0x22, 0x23, 0x2b],
     fw_regions: false,
+    bootargs_word_access: false,
     halt_on_failed_start: false,
 };
 
@@ -2615,6 +2702,7 @@ kernel::of_device_table!(
         (of::DeviceId::new(c_str!("apple,t6020-aop")), &HW_CFG_T6020),
         (of::DeviceId::new(c_str!("apple,t8140-aop")), &HW_CFG_T8140),
         (of::DeviceId::new(c_str!("apple,t6041-aop")), &HW_CFG_T6040),
+        (of::DeviceId::new(c_str!("apple,t8132-aop")), &HW_CFG_T8132),
     ]
 );
 
@@ -2656,11 +2744,12 @@ impl platform::Driver for AopDriver {
             data.patch_bootargs(
                 &aop_mmio,
                 &[
-                    (from_fourcc(b"EC0p"), cfg.ec0p),
-                    (from_fourcc(b"nCal"), 0x0),
-                    (from_fourcc(b"alig"), cfg.alig),
-                    (from_fourcc(b"AOPt"), cfg.aopt),
+                    (from_fourcc(b"EC0p"), Some(cfg.ec0p)),
+                    (from_fourcc(b"nCal"), cfg.ncal),
+                    (from_fourcc(b"alig"), Some(cfg.alig)),
+                    (from_fourcc(b"AOPt"), Some(cfg.aopt)),
                 ],
+                cfg.bootargs_word_access,
             )?;
         }
         let rtkit = rtkit::RtKit::<AopData>::new(pdev.as_ref(), None, 0, data.clone())?;

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright 2026 Ryan Murray
 """Actual mux prepare/set and TPS removal ordering; firmware/PHY leaves are mocks."""
-from common import block, atc_function, fabric_core, fabric_rebalance
+from common import block, atc_function, atc_cio_helpers, fabric_core, fabric_rebalance
 
 def make_unit(source, parent=False, reference=None):
  reference=source if reference is None else reference
@@ -93,7 +93,9 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *r,void *x) { (
 struct tps6598x;
 struct tipd_data { REMOVE_RETURN (*remove)(struct tps6598x *); void (*unregister_port)(struct tps6598x *); int (*reset)(struct tps6598x *); };
 struct typec_port { struct typec_mux *mux; };
-struct tps6598x { bool remove_safe_prepared; struct typec_mux *mux; void *partner,*dev,*psy,*role_sw,*reset,*partner_altmode_dp; int irq,wq_poll; struct typec_port *port; struct tipd_data *data; };
+struct tps6598x;
+struct tipd_contaminant_ops { int (*update)(struct tps6598x *); void (*stop)(struct tps6598x *); };
+struct tps6598x { bool remove_safe_prepared; struct typec_mux *mux; void *partner,*dev,*psy,*role_sw,*reset,*partner_altmode_dp; int irq,wq_poll; struct typec_port *port; struct tipd_data *data; const struct tipd_contaminant_ops *contaminant_ops; };
 struct cd321x { struct tps6598x tps; struct typec_mux *mux; void *tbt_switch; };
 struct typec_thunderbolt_switch_data { int state; };
 static void cd321x_stop_work(struct cd321x *c) { (void)c;event('W'); }
@@ -128,7 +130,7 @@ static void gpiod_set_value_cansleep(void *p,int v) { (void)p;assert(v==1);gpio_
  if not parent:functions+=block(core,'static void tps6598x_drop_partner(')+'\n'+block(core,'static int tps6598x_set_data_role(')+'\n'
  # The fixed-hub SuperSpeed handover moved the locked mux body to atcphy_mux_switch();
  # atcphy_mux_set_locked() also reports whether a SuperSpeed port may come back up.
- split=[atc_function(atc,name) for name in ('atcphy_usb3_port_ready','atcphy_mux_check','atcphy_mux_park','atcphy_mux_switch')]
+ split=[atc_cio_helpers(atc)]+[atc_function(atc,name) for name in ('atcphy_usb3_port_ready','atcphy_mux_check','atcphy_mux_park','atcphy_mux_switch')]
  functions+=block(core,'static '+('void' if parent else 'int')+' tps6598x_disconnect(')+'\n'+block(core,'static '+('void' if parent else 'int')+' cd321x_remove(')+'\n'+block(core,'void tipd_remove(')+'\n'
  ordinary_phy=r'''
 /* Actual ordinary-port ATC power-off, mux recheck and USB2 init; MMIO leaves. */
@@ -147,7 +149,7 @@ struct apple_atcphy {
  void *dev; int lock;
  const struct atcphy_hw *hw;
  struct { void *usb2phy; } regs;
- bool fixed_usb2,host_active,mode_dirty,pipe_pending,usb_off_pending,ss_tunables,dp_tunables;
+ bool fixed_usb2,host_active,mode_dirty,pipe_pending,usb_off_pending,ss_tunables,dp_tunables,cio_tunables;
  bool usb3_port_off,park_owed,dp_only,pd_was_off;
  bool t8103_dummy_pending,t8103_usb3_retry,t8103_usb3_workaround;
  enum atcphy_mode mode,typec_mode;

@@ -633,6 +633,7 @@ static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 static const struct of_device_id apple_gpio_pinctrl_of_match[] = {
 	{ .compatible = "apple,t8140-pinctrl", .data = &apple_gpio_uncached_hw },
 	{ .compatible = "apple,t8132-pinctrl", .data = &apple_gpio_uncached_hw },
+	{ .compatible = "apple,t6050-pinctrl", .data = &apple_gpio_uncached_hw },
 	{ .compatible = "apple,t8103-pinctrl", },
 	{ .compatible = "apple,pinctrl", },
 	{ }

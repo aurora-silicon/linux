@@ -595,16 +595,6 @@ brcmf_cfg80211_update_proto_addr_mode(struct wireless_dev *wdev)
 						ADDR_INDIRECT);
 }
 
-/**
- * brcmf_apsta_add_vif() - create a new AP or STA virtual interface
- *
- * @wiphy: wiphy device of new interface.
- * @name: name of the new interface.
- * @params: contains mac address for AP or STA device.
- * @type: interface type.
- *
- * Return: pointer to new vif on success, ERR_PTR(-errno) if not
- */
 static void brcmf_awdl_cleanup_locked(struct brcmf_cfg80211_info *cfg)
 {
 	struct brcmf_cfg80211_vif *vif;
@@ -866,6 +856,16 @@ int brcmf_awdl_del_vif(struct wiphy *wiphy, struct wireless_dev *wdev)
 	return err;
 }
 
+/**
+ * brcmf_apsta_add_vif() - create a new AP or STA virtual interface
+ *
+ * @wiphy: wiphy device of new interface.
+ * @name: name of the new interface.
+ * @params: contains mac address for AP or STA device.
+ * @type: interface type.
+ *
+ * Return: pointer to new vif on success, ERR_PTR(-errno) if not
+ */
 static
 struct wireless_dev *brcmf_apsta_add_vif(struct wiphy *wiphy, const char *name,
 					 struct vif_params *params,
@@ -1365,7 +1365,7 @@ brcmf_run_escan(struct brcmf_cfg80211_info *cfg, struct brcmf_if *ifp,
 	void *prepped_params = NULL;
 	u32 params_size = 0;
 	struct brcmf_escan_params_le *params;
-	s32 err = 0;
+	s32 err = 0, fwerr;
 
 	brcmf_dbg(SCAN, "E-SCAN START\n");
 
@@ -1397,12 +1397,17 @@ brcmf_run_escan(struct brcmf_cfg80211_info *cfg, struct brcmf_if *ifp,
 	params->action = cpu_to_le16(WL_ESCAN_ACTION_START);
 	params->sync_id = cpu_to_le16(0x1234);
 
-	err = brcmf_fil_iovar_data_set(ifp, "escan", params, params_size);
+	err = brcmf_fil_iovar_data_set_fwerr(ifp, "escan", params,
+					     params_size, &fwerr);
+	/* Association or another firmware scan can temporarily own the radio. */
+	if (err == -EBADE && fwerr == -BRCMF_FW_BUSY)
+		err = -EBUSY;
 	if (err) {
 		if (err == -EBUSY)
 			brcmf_dbg(INFO, "system busy : escan canceled\n");
 		else
-			bphy_err(drvr, "error (%d)\n", err);
+			bphy_err(drvr, "error (%d), firmware status (%d)\n",
+				 err, fwerr);
 	}
 
 	kfree(params);
@@ -1465,8 +1470,8 @@ brcmf_cfg80211_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request)
 		return -EAGAIN;
 	}
 	if (test_bit(BRCMF_VIF_STATUS_CONNECTING, &vif->sme_state)) {
-		bphy_err(drvr, "Connecting: status (%lu)\n", vif->sme_state);
-		return -EAGAIN;
+		brcmf_dbg(SCAN, "Connecting: status (%lu)\n", vif->sme_state);
+		return -EBUSY;
 	}
 
 	brcmf_dbg(SCAN, "START ESCAN\n");
@@ -1495,6 +1500,8 @@ brcmf_cfg80211_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request)
 		  timeout, request->n_channels);
 
 	err = brcmf_do_escan(vif->ifp, request);
+	if (err == -EBUSY)
+		goto scan_cleanup;
 	if (err)
 		goto scan_out;
 
@@ -1506,6 +1513,7 @@ brcmf_cfg80211_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request)
 
 scan_out:
 	bphy_err(drvr, "scan error (%d)\n", err);
+scan_cleanup:
 	clear_bit(BRCMF_SCAN_STATUS_BUSY, &cfg->scan_status);
 	cfg->scan_request = NULL;
 	return err;
@@ -1993,6 +2001,9 @@ brcmf_set_wsec_mode(struct net_device *ndev,
 			break;
 		case WLAN_CIPHER_SUITE_CCMP:
 			pval = AES_ENABLED;
+			/* SAE offload builds its own RSNE; select CCMP explicitly. */
+			algos = KEY_ALGO_MASK(CRYPTO_ALGO_AES_CCM);
+			mask = algos | KEY_ALGO_MASK(CRYPTO_ALGO_AES_GCM256);
 			break;
 		case WLAN_CIPHER_SUITE_AES_CMAC:
 			pval = AES_ENABLED;
@@ -2429,6 +2440,22 @@ static void brcmf_set_join_pref(struct brcmf_if *ifp,
 		bphy_err(drvr, "Set join_pref error (%d)\n", err);
 }
 
+/*
+ * Until the firmware reports the BSS it joined, a failed join is reported
+ * against the BSS this join asks for, not the one the interface was last
+ * associated with: userspace puts the reported BSS on its ignore list
+ * (brcmf_bss_connect_done()). A stale BSSID there made wpa_supplicant ignore
+ * a working AP for up to two minutes while it retried the one that failed.
+ */
+static void brcmf_connect_set_target(struct brcmf_cfg80211_profile *profile,
+				     const u8 *bssid)
+{
+	if (bssid)
+		memcpy(profile->bssid, bssid, ETH_ALEN);
+	else
+		eth_zero_addr(profile->bssid);
+}
+
 static s32
 brcmf_cfg80211_connect(struct wiphy *wiphy, struct net_device *ndev,
 		       struct cfg80211_connect_params *params)
@@ -2462,6 +2489,8 @@ brcmf_cfg80211_connect(struct wiphy *wiphy, struct net_device *ndev,
 
 	if (params->bssid_hint)
 		params->bssid = params->bssid_hint;
+
+	brcmf_connect_set_target(profile, params->bssid);
 
 	if (ifp->vif == cfg->p2p.bss_idx[P2PAPI_BSSCFG_PRIMARY].vif) {
 		/* A normal (non P2P) connection request setup. */
@@ -2566,13 +2595,6 @@ brcmf_cfg80211_connect(struct wiphy *wiphy, struct net_device *ndev,
 			err = brcmf_set_pmk(ifp, params->crypto.psk,
 					    BRCMF_WSEC_MAX_PSK_LEN);
 		else if (profile->use_fwsup == BRCMF_PROFILE_FWSUP_SAE) {
-			/* clean up user-space RSNE */
-			if (brcmf_fil_iovar_data_set(ifp, "wpaie", NULL, 0)) {
-				bphy_err(
-					drvr,
-					"failed to clean up user-space RSNE\n");
-				goto done;
-			}
 			err = brcmf_fwvid_set_sae_password(ifp, &params->crypto);
 			if (!err && params->crypto.psk)
 				err = brcmf_set_pmk(ifp, params->crypto.psk,
@@ -3210,6 +3232,10 @@ static void brcmf_convert_ratespec_to_rateinfo(u32 ratespec,
 		/* Fill in nothing */
 		break;
 	}
+	if ((BRCMF_RSPEC_ISHT(ratespec) || BRCMF_RSPEC_ISVHT(ratespec)) &&
+	    BRCMF_RSPEC_ISSGI(ratespec))
+		rateinfo->flags |= RATE_INFO_FLAGS_SHORT_GI;
+
 	if (BRCMF_RSPEC_ISHT(ratespec)) {
 		rateinfo->flags |= RATE_INFO_FLAGS_MCS;
 		rateinfo->mcs = ratespec & BRCMF_RSPEC_HT_MCS_MASK;
@@ -4361,6 +4387,8 @@ static void brcmf_report_wowl_wakeind(struct wiphy *wiphy, struct brcmf_if *ifp)
 
 #endif /* CONFIG_PM */
 
+static int brcmf_cfg80211_update_country(struct brcmf_cfg80211_info *cfg);
+
 static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 {
 	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
@@ -4386,6 +4414,8 @@ static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 			cfg->wowl.nd_enabled = false;
 		}
 	}
+	cfg->suspended = false;
+	brcmf_cfg80211_update_country(cfg);
 	return 0;
 }
 
@@ -4518,6 +4548,7 @@ exit:
 	brcmf_dbg(TRACE, "Exit\n");
 	/* clear any scanning activity */
 	cfg->scan_status = 0;
+	cfg->suspended = true;
 	return 0;
 }
 
@@ -5935,6 +5966,7 @@ static int brcmf_cfg80211_get_channel(struct wiphy *wiphy,
 	struct net_device *ndev = wdev->netdev;
 	struct brcmf_pub *drvr = cfg->pub;
 	struct brcmu_chan ch;
+	struct brcmf_if *ifp;
 	enum nl80211_band band = 0;
 	enum nl80211_chan_width width = 0;
 	u32 chanspec;
@@ -5943,7 +5975,17 @@ static int brcmf_cfg80211_get_channel(struct wiphy *wiphy,
 	if (!ndev || drvr->bus_if->state != BRCMF_BUS_UP)
 		return -ENODEV;
 
-	err = brcmf_fil_iovar_int_get(netdev_priv(ndev), "chanspec", &chanspec);
+	/* AWDL has no operating channel: the firmware moves the interface
+	 * through its availability-window channel sequence, and the AWDL
+	 * bsscfg rejects the chanspec query. Report no channel, as for an
+	 * interface that is not on one, rather than logging an error each
+	 * time nl80211 describes awdl0 (its removal notification does).
+	 */
+	ifp = netdev_priv(ndev);
+	if (ifp->is_awdl)
+		return -ENODATA;
+
+	err = brcmf_fil_iovar_int_get(ifp, "chanspec", &chanspec);
 	if (err) {
 		bphy_err(drvr, "chanspec failed (%d)\n", err);
 		return err;
@@ -6800,6 +6842,21 @@ done:
 	return err;
 }
 
+/* Whether cfg80211 has a BSS entry for @bssid (the firmware's may be gone). */
+static bool brcmf_bss_known(struct brcmf_cfg80211_info *cfg, const u8 *bssid)
+{
+	struct cfg80211_bss *bss;
+
+	if (is_zero_ether_addr(bssid))
+		return false;
+	bss = cfg80211_get_bss(cfg_to_wiphy(cfg), NULL, bssid, NULL, 0,
+			       IEEE80211_BSS_TYPE_ESS, IEEE80211_PRIVACY_ANY);
+	if (!bss)
+		return false;
+	cfg80211_put_bss(cfg_to_wiphy(cfg), bss);
+	return true;
+}
+
 static s32
 brcmf_bss_connect_done(struct brcmf_cfg80211_info *cfg,
 		       struct net_device *ndev, const struct brcmf_event_msg *e,
@@ -6818,7 +6875,25 @@ brcmf_bss_connect_done(struct brcmf_cfg80211_info *cfg,
 		memset(&conn_params, 0, sizeof(conn_params));
 		if (completed) {
 			brcmf_get_assoc_ies(cfg, ifp);
-			brcmf_update_bss_info(cfg, ifp);
+			if (brcmf_update_bss_info(cfg, ifp) &&
+			    !brcmf_bss_known(cfg, profile->bssid)) {
+				/*
+				 * A link-up that raced the join's teardown (a
+				 * disconnect for system sleep, say) leaves the
+				 * firmware with no BSS to report, and cfg80211
+				 * has none either: it would reject the success
+				 * with a WARN in __cfg80211_connect_result and
+				 * another in __cfg80211_port_authorized. Report
+				 * the join as failed and drop the firmware's
+				 * half-made association instead.
+				 */
+				brcmf_dbg(CONN, "connected BSS %pM unknown, join failed\n",
+					  profile->bssid);
+				brcmf_fil_cmd_data_set(ifp, BRCMF_C_DISASSOC, NULL, 0);
+				completed = false;
+			}
+		}
+		if (completed) {
 			set_bit(BRCMF_VIF_STATUS_CONNECTED,
 				&ifp->vif->sme_state);
 			conn_params.status = WLAN_STATUS_SUCCESS;
@@ -6829,7 +6904,9 @@ brcmf_bss_connect_done(struct brcmf_cfg80211_info *cfg,
 				  &ifp->vif->sme_state);
 			conn_params.status = WLAN_STATUS_AUTH_TIMEOUT;
 		}
-		conn_params.links[0].bssid = profile->bssid;
+		/* A join without a BSSID that failed names no BSS. */
+		if (!is_zero_ether_addr(profile->bssid))
+			conn_params.links[0].bssid = profile->bssid;
 		conn_params.req_ie = conn_info->req_ie;
 		conn_params.req_ie_len = conn_info->req_ie_len;
 		conn_params.resp_ie = conn_info->resp_ie;
@@ -8824,14 +8901,56 @@ exit:
 	return err;
 }
 
-static void brcmf_cfg80211_reg_notifier(struct wiphy *wiphy,
-					struct regulatory_request *req)
+static int brcmf_cfg80211_update_country(struct brcmf_cfg80211_info *cfg)
 {
-	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
 	struct brcmf_if *ifp = brcmf_get_ifp(cfg->pub, 0);
 	struct brcmf_pub *drvr = cfg->pub;
 	struct brcmf_fil_country_le ccreq;
 	s32 err;
+
+	if (!cfg->country_pending || cfg->suspended ||
+	    drvr->bus_if->state != BRCMF_BUS_UP)
+		return 0;
+
+	err = brcmf_fil_iovar_data_get(ifp, "country", &ccreq, sizeof(ccreq));
+	if (err) {
+		bphy_err(drvr, "Country code iovar returned err = %d\n", err);
+		return err;
+	}
+
+	err = brcmf_translate_country_code(ifp->drvr, cfg->country_alpha2, &ccreq);
+	if (err) {
+		/* Because we ignore the default country code above,
+		 * we will start out in our custom reg domain, but the chip
+		 * may already be set to the right country.
+		 * As such, we force the bands to be re-set the first
+		 * time we try to set a country for real.
+		 */
+		if (err != -EAGAIN)
+			return err;
+		if (!cfg->force_band_setup) {
+			cfg->country_pending = false;
+			return 0;
+		}
+	}
+	err = brcmf_fil_iovar_data_set(ifp, "country", &ccreq, sizeof(ccreq));
+	if (err) {
+		bphy_err(drvr, "Firmware rejected country setting\n");
+		return err;
+	}
+	err = brcmf_setup_wiphybands(cfg);
+	if (err)
+		return err;
+	cfg->force_band_setup = false;
+	cfg->country_pending = false;
+	return 0;
+}
+
+static void brcmf_cfg80211_reg_notifier(struct wiphy *wiphy,
+					struct regulatory_request *req)
+{
+	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
+	struct brcmf_pub *drvr = cfg->pub;
 	int i;
 
 	/* The country code gets set to "00" by default at boot, ignore */
@@ -8849,30 +8968,12 @@ static void brcmf_cfg80211_reg_notifier(struct wiphy *wiphy,
 	brcmf_dbg(TRACE, "Enter: initiator=%d, alpha=%c%c\n", req->initiator,
 		  req->alpha2[0], req->alpha2[1]);
 
-	err = brcmf_fil_iovar_data_get(ifp, "country", &ccreq, sizeof(ccreq));
-	if (err) {
-		bphy_err(drvr, "Country code iovar returned err = %d\n", err);
-		return;
-	}
-
-	err = brcmf_translate_country_code(ifp->drvr, req->alpha2, &ccreq);
-	if (err) {
-		/* Because we ignore the default country code above,
-		 * we will start out in our custom reg domain, but the chip
-		 * may already be set to the right country.
-		 * As such, we force the bands to be re-set the first
-		 * time we try to set a country for real.
-		 */
-		if (err != -EAGAIN || !cfg->force_band_setup)
-			return;
-	}
-	cfg->force_band_setup = false;
-	err = brcmf_fil_iovar_data_set(ifp, "country", &ccreq, sizeof(ccreq));
-	if (err) {
-		bphy_err(drvr, "Firmware rejected country setting\n");
-		return;
-	}
-	brcmf_setup_wiphybands(cfg);
+	/* cfg80211 can notify after the bus has entered D3. Keep only the
+	 * latest request and replay it from wiphy resume, after bus resume.
+	 */
+	memcpy(cfg->country_alpha2, req->alpha2, sizeof(cfg->country_alpha2));
+	cfg->country_pending = true;
+	brcmf_cfg80211_update_country(cfg);
 }
 
 static void brcmf_free_wiphy(struct wiphy *wiphy)

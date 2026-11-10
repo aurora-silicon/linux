@@ -786,25 +786,6 @@ static int macsmc_battery_set_property(struct power_supply *psy,
 	return ret < 0 ? ret : 0;
 }
 
-/*
- * An earlier kernel could leave force-discharge set in CHLS without a charge limit, which this
- * driver never asks of the SMC. Clear the bit once at probe; the limit byte is kept.
- */
-static int macsmc_battery_clear_stray_discharge(struct macsmc_power *power)
-{
-	u16 chls;
-	int ret;
-
-	guard(mutex)(&power->charge_lock);
-	ret = apple_smc_read_u16(power->smc, SMC_KEY(CHLS), &chls);
-	if (ret)
-		return ret;
-	if (!(chls & CHLS_FORCE_DISCHARGE) || macsmc_chls_has_limit(chls))
-		return 0;
-	ret = apple_smc_write_u16(power->smc, SMC_KEY(CHLS), chls & ~CHLS_FORCE_DISCHARGE);
-	return ret < 0 ? ret : 0;
-}
-
 static int macsmc_battery_property_is_writeable(struct power_supply *psy,
 						enum power_supply_property psp)
 {
@@ -979,10 +960,34 @@ static int macsmc_power_event(struct notifier_block *nb, unsigned long event, vo
 	return NOTIFY_DONE;
 }
 
+static int macsmc_read_identity(struct apple_smc *smc, smc_key key,
+			       char *out, size_t capacity)
+{
+	struct apple_smc_key_info info;
+	int ret;
+
+	if (!capacity)
+		return -EINVAL;
+	out[0] = '\0';
+	ret = apple_smc_get_key_info(smc, key, &info);
+	if (ret < 0)
+		return ret;
+	if (!info.size || info.size >= capacity || !(info.flags & APPLE_SMC_READABLE))
+		return -EINVAL;
+	/* SMC read requests must describe this key, not the destination buffer. */
+	ret = apple_smc_read(smc, key, out, info.size);
+	if (ret != info.size) {
+		out[0] = '\0';
+		return ret < 0 ? ret : -EIO;
+	}
+	out[info.size] = '\0';
+	return 0;
+}
+
 static int macsmc_power_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-	struct apple_smc *smc = dev_get_drvdata(pdev->dev.parent);
+	struct apple_smc *smc;
 	struct power_supply_config psy_cfg = {};
 	struct apple_smc_key_info info;
 	struct macsmc_power *power;
@@ -995,6 +1000,9 @@ static int macsmc_power_probe(struct platform_device *pdev)
 	enum power_supply_property *props;
 	size_t nprops;
 
+	if (!dev->parent)
+		return dev_err_probe(dev, -ENODEV, "Missing SMC parent\n");
+	smc = dev_get_drvdata(dev->parent);
 	if (!smc)
 		return -ENODEV;
 
@@ -1108,26 +1116,16 @@ static int macsmc_power_probe(struct platform_device *pdev)
 				     of_machine_is_compatible("apple,j700");
 		power->status_from_current = of_machine_is_compatible("apple,j700");
 
-		/* Reset "Optimised Battery Charging" flags to default state */
-		if (power->has_chte)
-			apple_smc_write_u32(smc, SMC_KEY(CHTE), 0);
-		else if (power->has_ch0c)
-			apple_smc_write_u8(smc, SMC_KEY(CH0C), 0);
-
-		if (power->has_ch0i)
-			apple_smc_write_u8(smc, SMC_KEY(CH0I), 0);
-
-		apple_smc_write_u8(smc, SMC_KEY(CH0K), 0);
-		apple_smc_write_u8(smc, SMC_KEY(CH0B), 0);
-
+		/* Preserve firmware charge policy until userspace changes it. */
 		/* Detect charge limit method (CHWA vs CHLS) */
 		if (apple_smc_read_flag(power->smc, SMC_KEY(CHWA), &flag) == 0)
 			power->has_chwa = true;
 		else if (apple_smc_read_u16(power->smc, SMC_KEY(CHLS), &vu16) >= 0)
 			power->has_chls = true;
 
-		if (power->has_chls && macsmc_battery_clear_stray_discharge(power))
-			dev_warn(dev, "Failed to clear force-discharge without a charge limit\n");
+		if (power->has_chls && (vu16 & CHLS_FORCE_DISCHARGE) &&
+		    !macsmc_chls_has_limit(vu16))
+			dev_warn(dev, "CHLS force-discharge without a limit; select charge_behaviour=auto to clear\n");
 
 		/*
 		 * CHLS carries auto-discharge, so a CHLS-only Mac can select auto
@@ -1150,12 +1148,12 @@ static int macsmc_power_probe(struct platform_device *pdev)
 		power->batt_desc.num_properties = nprops;
 
 		/* Fetch identity strings */
-		apple_smc_read(smc, SMC_KEY(BMDN), power->model_name,
-			       sizeof(power->model_name) - 1);
-		apple_smc_read(smc, SMC_KEY(BMSN), power->serial_number,
-			       sizeof(power->serial_number) - 1);
-		apple_smc_read(smc, SMC_KEY(BMDT), power->mfg_date,
-			       sizeof(power->mfg_date) - 1);
+		macsmc_read_identity(smc, SMC_KEY(BMDN), power->model_name,
+				     sizeof(power->model_name));
+		macsmc_read_identity(smc, SMC_KEY(BMSN), power->serial_number,
+				     sizeof(power->serial_number));
+		macsmc_read_identity(smc, SMC_KEY(BMDT), power->mfg_date,
+				     sizeof(power->mfg_date));
 
 		apple_smc_read_u8(power->smc, SMC_KEY(BNCB), &power->num_cells);
 		power->nominal_voltage_mv = MACSMC_NOMINAL_CELL_VOLTAGE_MV * power->num_cells;

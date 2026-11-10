@@ -25,6 +25,8 @@
 #include <linux/dma-mapping.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
+#include <linux/ktime.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_clk.h>
@@ -125,6 +127,9 @@
 			   SNDRV_PCM_FMTBIT_S24_LE | \
 			   SNDRV_PCM_FMTBIT_S32_LE)
 
+/* Largest PCM buffer, and the playback preallocation: 3 MiB. */
+#define MCA_BUFFER_BYTES_MAX (512 * 1024 * 6)
+
 struct mca_cluster {
 	int no;
 	__iomem void *base;
@@ -151,6 +156,14 @@ struct mca_cluster {
 	int tdm_slot_width;
 	unsigned int tdm_tx_mask;
 	unsigned int tdm_rx_mask;
+
+	/*
+	 * Capture: the byte offset in the buffer up to which the CPU's view
+	 * has been synced with what the DMA wrote, and when (see
+	 * mca_capture_sync()).
+	 */
+	size_t capture_synced;
+	ktime_t capture_synced_at;
 };
 
 struct mca_data {
@@ -937,11 +950,30 @@ static int mca_set_runtime_hwparams(struct snd_soc_component *component,
 
 	hw.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
 		  SNDRV_PCM_INFO_INTERLEAVED;
+	/*
+	 * No SNDRV_PCM_INFO_EXPLICIT_SYNC for the cacheable capture buffer
+	 * (see mca_pcm_new()), though the core would set it for a managed
+	 * buffer allocated before the open. hw_ptr only ever moves through
+	 * mca_pointer(), which invalidates everything up to the position it
+	 * returns, and the whole buffer when the DMA may have lapped
+	 * (mca_capture_sync()). So a reader of the mmapped status page never
+	 * sees a frame before its lines were invalidated. The flag would add
+	 * a whole-buffer sync to every status query, which on a J316 costs
+	 * about 16% more CPU per 512-frame period of mmap capture.
+	 */
 	hw.periods_min = 2;
 	hw.periods_max = UINT_MAX;
 	hw.period_bytes_min = 256;
 	hw.period_bytes_max = dma_get_max_seg_size(dma_dev);
-	hw.buffer_bytes_max = SIZE_MAX;
+	/*
+	 * The capture buffer is not preallocated (see mca_pcm_new()), so the
+	 * core does not bound it by a preallocation: bound it here, at the size
+	 * the playback preallocation (and formerly the capture one) allows. An
+	 * unbounded maximum lets a client that sets no buffer size, such as
+	 * speakersafetyd on the speaker sense PCM, ask for gigabytes and fail
+	 * hw_params with -ENOMEM.
+	 */
+	hw.buffer_bytes_max = MCA_BUFFER_BYTES_MAX;
 	hw.fifo_size = 16;
 
 	ret = snd_dmaengine_pcm_refine_runtime_hwparams(substream, &dma_data,
@@ -1010,13 +1042,113 @@ static int mca_close(struct snd_soc_component *component,
 	return snd_dmaengine_pcm_close(substream);
 }
 
+/*
+ * The capture buffers are cacheable (SNDRV_DMA_TYPE_NONCOHERENT): reading
+ * them through an uncached mapping costs the reader several times the
+ * copy itself. The CPU's view of what the DMA wrote is made current here,
+ * before the position that covers it is returned and so before ALSA
+ * publishes it as hw_ptr: no reader can look at a frame before its cache
+ * lines were invalidated after the DMA wrote it. A line that is still being
+ * written at the reported position is invalidated again with the next
+ * range, which starts on it. The CPU never writes a capture buffer, so no
+ * dirty line can be written back over the DMA's data.
+ */
+static bool mca_capture_noncoherent(struct snd_pcm_substream *substream)
+{
+	return substream->stream == SNDRV_PCM_STREAM_CAPTURE && substream->runtime &&
+	       substream->runtime->dma_buffer_p &&
+	       substream->runtime->dma_buffer_p->dev.type == SNDRV_DMA_TYPE_NONCOHERENT;
+}
+
+/*
+ * The DMA may have gone once or more round the buffer in @elapsed_ns: the
+ * position alone cannot tell a lap from no advance, or two laps from one.
+ * It runs at the stream's rate, and its reported position lags it by less
+ * than a period, so a lap needs at least a buffer's time less a period.
+ */
+static bool mca_capture_may_lap(unsigned int rate, snd_pcm_uframes_t buffer_size,
+				snd_pcm_uframes_t period_size, s64 elapsed_ns)
+{
+	u64 lap_ns, slack_ns;
+
+	if (!rate || elapsed_ns < 0)
+		return true;
+	lap_ns = div_u64((u64)buffer_size * NSEC_PER_SEC, rate);
+	slack_ns = div_u64((u64)period_size * NSEC_PER_SEC, rate);
+	return (u64)elapsed_ns + slack_ns >= lap_ns;
+}
+
+/*
+ * The byte ranges of a @bytes buffer to sync when the DMA has moved from
+ * @from to @to: none, one, or two where it wrapped; the whole buffer when it
+ * may have lapped. Returns how many it put in @off and @len.
+ */
+static unsigned int mca_capture_ranges(size_t from, size_t to, size_t bytes, bool lap,
+				       size_t off[2], size_t len[2])
+{
+	unsigned int n = 0;
+
+	if (lap) {
+		off[0] = 0;
+		len[0] = bytes;
+		return 1;
+	}
+	if (to < from) {
+		off[n] = from;
+		len[n++] = bytes - from;
+		from = 0;
+	}
+	if (to > from) {
+		off[n] = from;
+		len[n++] = to - from;
+	}
+	return n;
+}
+
+static void mca_capture_sync(struct mca_cluster *cl, struct snd_pcm_substream *substream,
+			     size_t to)
+{
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	struct device *dev = runtime->dma_buffer_p->dev.dev;
+	size_t bytes = snd_pcm_lib_buffer_bytes(substream);
+	ktime_t now = ktime_get();
+	size_t off[2], len[2];
+	unsigned int i, n;
+	bool lap;
+
+	if (to >= bytes)
+		return;
+	lap = mca_capture_may_lap(runtime->rate, runtime->buffer_size, runtime->period_size,
+				  ktime_to_ns(ktime_sub(now, cl->capture_synced_at)));
+	n = mca_capture_ranges(cl->capture_synced, to, bytes, lap, off, len);
+	for (i = 0; i < n; i++)
+		dma_sync_single_for_cpu(dev, runtime->dma_addr + off[i], len[i],
+					DMA_FROM_DEVICE);
+	cl->capture_synced = to;
+	cl->capture_synced_at = now;
+}
+
 static int mca_trigger(struct snd_soc_component *component,
 		       struct snd_pcm_substream *substream, int cmd)
 {
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct mca_cluster *cl = mca_dai_to_cluster(snd_soc_rtd_to_cpu(rtd, 0));
 
 	if (rtd->dai_link->no_pcm)
 		return 0;
+
+	/*
+	 * The DMA starts again at the buffer's start: hand the whole buffer to
+	 * it, with no line the CPU may have cached from the previous run.
+	 */
+	if (cmd == SNDRV_PCM_TRIGGER_START && mca_capture_noncoherent(substream)) {
+		dma_sync_single_for_device(substream->runtime->dma_buffer_p->dev.dev,
+					   substream->runtime->dma_addr,
+					   snd_pcm_lib_buffer_bytes(substream),
+					   DMA_FROM_DEVICE);
+		cl->capture_synced = 0;
+		cl->capture_synced_at = ktime_get();
+	}
 
 	/*
 	 * Before we do the PCM trigger proper, insert an opportunity
@@ -1031,11 +1163,16 @@ static snd_pcm_uframes_t mca_pointer(struct snd_soc_component *component,
 				     struct snd_pcm_substream *substream)
 {
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	snd_pcm_uframes_t pos;
 
 	if (rtd->dai_link->no_pcm)
 		return -ENOTSUPP;
 
-	return snd_dmaengine_pcm_pointer(substream);
+	pos = snd_dmaengine_pcm_pointer(substream);
+	if (mca_capture_noncoherent(substream))
+		mca_capture_sync(mca_dai_to_cluster(snd_soc_rtd_to_cpu(rtd, 0)), substream,
+				 frames_to_bytes(substream->runtime, pos));
+	return pos;
 }
 
 static struct dma_chan *mca_request_dma_channel(struct mca_cluster *cl, unsigned int stream)
@@ -1109,9 +1246,18 @@ static int mca_pcm_new(struct snd_soc_component *component,
 		}
 
 		cl->dma_chans[i] = chan;
-		snd_pcm_set_managed_buffer(substream, SNDRV_DMA_TYPE_DEV_IRAM,
-					   chan->device->dev, 512 * 1024 * 6,
-					   SIZE_MAX);
+		/*
+		 * Capture is read by the CPU: cacheable, synced in mca_pointer().
+		 * Allocated at hw_params to the buffer's own size, as ALSA syncs
+		 * the whole allocation on every read.
+		 */
+		if (i == SNDRV_PCM_STREAM_CAPTURE)
+			snd_pcm_set_managed_buffer(substream, SNDRV_DMA_TYPE_NONCOHERENT,
+						   chan->device->dev, 0, SIZE_MAX);
+		else
+			snd_pcm_set_managed_buffer(substream, SNDRV_DMA_TYPE_DEV_IRAM,
+						   chan->device->dev, MCA_BUFFER_BYTES_MAX,
+						   SIZE_MAX);
 	}
 
 	return 0;
@@ -1334,3 +1480,7 @@ module_platform_driver(apple_mca_driver);
 MODULE_AUTHOR("Martin Povišer <povik+lin@cutebit.org>");
 MODULE_DESCRIPTION("ASoC Apple MCA driver");
 MODULE_LICENSE("GPL");
+
+#if IS_ENABLED(CONFIG_KUNIT) && !defined(MODULE)
+#include "mca-test.h"
+#endif

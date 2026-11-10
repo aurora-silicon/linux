@@ -1,0 +1,1388 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# board-glob ADT-path-glob | reason
+# Patterns apply to a single path component; ** is deliberately unsupported.
+# Hardware without a DT representation must remain MISSING until reviewed.
+* /arm-io | ADT SoC bus container; child hardware is inventoried separately.
+* /cpus | CPU collection container; individual CPUs are checked separately.
+* /arm-io/pmgr/power-domains | ADT power-domain collection container; individual domains require review.
+* /arm-io/pmgr/power-devices | ADT power-device collection container; individual power-state records are checked separately.
+
+# Reviewed logical records; exact board and path rules.
+t6000-j316s /arm-io/pmgr/power-devices/ANE-SYS-DART | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/ANE-SYS-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_ADMA0 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_AUDIO_ADMA0 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_AUDIO_SHIM | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_BASE | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_CPU | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_FILTER | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_FR | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_GPIO | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_I2CM0 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_I2CM1 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_LEAP | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_LEAP_CLK | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_MCA0 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_MCA1 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_PDM0_REF | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_PDM1_REF | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_PDMC_LPD | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_SCM | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_SHIM | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_SPI0 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_SPMI0 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_SPMI1 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_SRAM | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_UART0 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_UART1 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AOP_UART2 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/APCIE-ST-SYS-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/ATC0-USB-AUD-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/ATC0-USB-DART | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/ATC0-USB-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/ATC0_RESET-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/ATC1-USB-AUD-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/ATC1-USB-DART | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/ATC1-USB-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/ATC1_RESET-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/ATC2-USB-AUD-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/ATC2-USB-DART | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/ATC3-USB-AUD-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/ATC3-USB-DART | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AUDIO-LLT-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AUDIO-P-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AUSB0_AONPCIE-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AUSB0_AONUSB-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AUSB1_AONPCIE-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AUSB1_AONUSB-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AUSB2_AONPCIE-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AUSB2_AONUSB-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AUSB3_AONPCIE-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AUSB3_AONUSB-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AVD-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AVD-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AVD-SYS-DART | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AVD-SYS-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/AVEMSR-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/C0-USBCTL-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/CIO0_RECONFIG-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/CIO1_RECONFIG-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/CIO2_RECONFIG-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/CIO3_RECONFIG-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/CPU-BUSY | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/DCS-VMAX | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/DCS-VNOM | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/DISP-CARVE-OUT | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/DISP-FB-ACTIVE | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/DISP-MIE-DPB | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/DISP0_BE | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/DISP0_BLC | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/DISP0_BRC | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/DISP0_CPU0-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/DISP0_DP | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/DISP0_GP0 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/DISP0_GP1 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/DISP0_PPP | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/DISP0_SPI | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/DISP0_SPMI | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT0_BE | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT0_CPU0-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT0_DP | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT0_DSC | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT0_GP0 | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT0_GP1 | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT0_PPP | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT1_BE | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT1_CPU0-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT1_DP | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT1_DSC | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT1_GP0 | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT1_GP1 | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t6000-j316s /arm-io/pmgr/power-devices/DISPEXT1_PPP | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t6000-j316s /arm-io/pmgr/power-devices/DP0-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/DP1-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/DP2-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/DP3-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/ECPU | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/FR-SCALING-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/GFX-ASC | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/GFX-BUSY | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/GFX-SGX | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/ISP-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/ISP-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/ISP-SYS-DART | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/ISP-SYS-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/JPG-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/JPG-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/JPG0-DART | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/JPG0-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/JPG1-DART | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/JPG1-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/JPG1-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/JPG1-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/MSR0-AVMSR-VMAX | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/MSR0-AVMSR-VMD2 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/MSR0-DART | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/MSR0-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/MSR1-AVMSR-VMAX | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/MSR1-AVMSR-VMD2 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/PCPU0 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/PCPU1 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/PLACEHOLDER | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SCODEC-DART | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SCODEC-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SCODEC-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SCODEC-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SEP-PEARL-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SEP-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SEP_EISP | Power state with a register, switched by the SEP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t6000-j316s /arm-io/pmgr/power-devices/SIO-CPU-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SIO-DART | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SMC_AON | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SMC_CPU | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SMC_FABRIC | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SMC_FPWM0 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SMC_FPWM1 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SMC_FPWM2 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SMC_FPWM3 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SMC_GPIO | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SMC_I2CM0 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SMC_I2CM1 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SMC_I2CM2 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SMC_I2CM3 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SMC_I2CM4 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SMC_I2CM5 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SMC_I2CM6 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SMC_UART0 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SMC_UART1 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/SOC-VNOM | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/USB-AUDIO-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/VDD_CIO-V | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/VENC-DART | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/VENC-FAB0-VMAX | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/VENC-MEM-FAST | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/VENC-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/VENC-SOC-VMID2 | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/VENC-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/VENC-SYS-DART | Virtual PMGR vote; no independent power-state register.
+t6000-j316s /arm-io/pmgr/power-devices/VENC-SYS-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/aod2 | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t6040-j616s /arm-io/apple-processor-trace | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t6040-j616s /arm-io/dcp0-expert | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t6040-j616s /arm-io/dcp0-sac-controller | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t6040-j616s /arm-io/dcpext0-expert | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t6040-j616s /arm-io/dcpext1-expert | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t6040-j616s /arm-io/dp-audio0 | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t6040-j616s /arm-io/dp-audio3 | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t6040-j616s /arm-io/dp-audio4 | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t6040-j616s /arm-io/iop-audio-controller/audio-leap-internal-loopback | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t6040-j616s /arm-io/iop-audio-controller/audio-mca-loopback | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t6040-j616s /arm-io/iop-audio-controller/lp-mic-device | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t6040-j616s /arm-io/iop-audio-controller/lp-mic-io-buffer-device | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t6040-j616s /arm-io/iop-audio-controller/siri-listening-device | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t6040-j616s /arm-io/iop-voicetrigger-controller | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t6040-j616s /arm-io/iop-voicetrigger-controller/audio-vt-device | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t6040-j616s /arm-io/mtp-aop-mux | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t6040-j616s /arm-io/pmgr/power-devices/ANE-SYS-DART | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/ANE-SYS-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/ANE-SYS-V-PMP | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AOP_BASE | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AOP_CPU | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AOP_FILTER | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AOP_FR | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AOP_GPIO | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AOP_HE_NRCS0 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AOP_HE_NRCS1 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AOP_I2CM0 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AOP_I2CM1 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AOP_I2CM2 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AOP_PIODMA | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AOP_SCM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AOP_SHIM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AOP_SPI0 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AOP_SPI1 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AOP_SPMI0 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AOP_SPMI1 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AOP_SRAM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AOP_UART0 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AOP_UART1 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AOP_UART2 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/APCIE-SYS-GX-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/APCIE-SYS-STX-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/ATC0-USB-DART | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/ATC0-USB-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/ATC0_USB_AON_V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/ATC1-USB-DART | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/ATC1-USB-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/ATC1_USB_AON_V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/ATC2-USB-DART | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/ATC2_USB_AON_V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/ATC3-USB-DART | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/ATC3_USB_AON_V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUDIO-LLT-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUDIO-P-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUDIO_A | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUDIO_BASE_NS_A | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUDIO_BASE_S_A | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUDIO_FR | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUDIO_LEAP_A | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUDIO_LEAP_C | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUDIO_LEAP_MCA | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUDIO_LEAP_NS_A | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUDIO_LEAP_RX0 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUDIO_LEAP_RX1 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUDIO_LEAP_RX2 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUDIO_LEAP_RX3 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUDIO_LEAP_RX4 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUDIO_LEAP_S_A | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUDIO_LEAP_TX0 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUDIO_MCA0_M | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUDIO_MCA1_M | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUDIO_MCA2_M | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUDIO_MCA3_M | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUDIO_MCA4_M | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUDIO_MCA5_M | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUDIO_P | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUDIO_SENSE_PDMC | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUSB0-AONPCIE-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUSB1-AONPCIE-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUSB2-AONPCIE-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AUSB3-AONPCIE-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AVD-SOC-DART | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AVD-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AVD-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AVD-SYS-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/CIO0-RECONFIG-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/CIO1-RECONFIG-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/CIO2-RECONFIG-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/CIO3-RECONFIG-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISP-CARVE-OUT | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISP-CPU-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISP-FB-ACTIVE | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISP-MIE-DPB | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT0-CPU-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT0_DBE | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT0_DSC | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT0_GP0 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT0_GP1 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT0_GPL | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT0_PPP | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT1-CPU-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT1_DBE | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT1_DSC | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT1_GP0 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT1_GP1 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT1_GPL | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT1_PPP | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT2-CPU-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT2_DBE | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT2_DSC | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT2_GP0 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT2_GP1 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT2_GPL | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT2_PPP | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT3-CPU-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT3_DBE | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT3_DSC | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT3_GP0 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT3_GP1 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT3_GPL | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT3_PPP | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT_RAIL_V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISP_BLC | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISP_BRC | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISP_CMB | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISP_DBE | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISP_GP0 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISP_GP1 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISP_GPL | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISP_PPP | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISP_SPI | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DISP_SPMI | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DP | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DPEXT0 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DPEXT1 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DPEXT2 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DPEXT3 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DPRX | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/DPTX_PHY | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/EACC0_0_SRAM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/EACC0_1_SRAM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/EACC0_2_SRAM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/EACC0_3_SRAM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/ECPM0_SRAM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/ECPM_NRG | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/GFX-ASC | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/GFX-BUSY | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/GFX-SGX | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/ISP-CORE-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/ISP-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/ISP-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/ISP-SYS-DART | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/ISP-SYS-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/ISP_BE | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/ISP_CLR | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/ISP_SECURE | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/JPG-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/JPG-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/JPG0-DART | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/JPG0-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/JPG1-DART | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/JPG1-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/LOGICAL_CLUSTER | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/MSR0-DART | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/MSR0-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/MSR0-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/MSR0-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/MSR1-DART | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/MSR1-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/MSR1-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/MSR1-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/MTP_BASE | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/MTP_CPU | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/MTP_DMA | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/MTP_FABRIC | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/MTP_FAB_V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/MTP_GPIO | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/MTP_I2CM0 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/MTP_PERIPH | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/MTP_SCM_FABRIC | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/MTP_SHIM_PCLK | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/MTP_SPI0 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/MTP_SPI1 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/MTP_SRAM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/MTP_UART0 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/PACC0_0_SRAM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/PACC0_1_SRAM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/PACC0_2_SRAM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/PACC0_3_SRAM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/PACC0_4_SRAM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/PACC0_5_SRAM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/PACC1_0_SRAM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/PACC1_1_SRAM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/PACC1_2_SRAM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/PACC1_3_SRAM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/PACC1_4_SRAM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/PACC1_5_SRAM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/PCPM0_NRG | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/PCPM0_SRAM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/PCPM1_NRG | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/PCPM1_SRAM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/PDM0_AUDIO_REF | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/PDM1_AUDIO_REF | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/SCODEC-DART | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/SCODEC-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/SCODEC-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/SCODEC-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/SIO-CPU-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/SIO-DART-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/SMC_AON | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/SMC_CPU | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/SMC_FABRIC | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/SMC_FAB_V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/SMC_FPWM0 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/SMC_FPWM1 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/SMC_FPWM2 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/SMC_FPWM3 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/SMC_GPIO | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/SMC_I2CM0 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/SMC_I2CM1 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/SMC_I2CM2 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/SMC_I2CM3 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/SMC_I2CM4 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/SMC_I2CM5 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/SMC_I2CM6 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/SMC_PTD | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/SMC_UART0 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/SMC_UART1 | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/TRACE_FAB | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/VENC0-FAST | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/VENC0-MEM-FAST | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/VENC0-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/VENC0-SYS-DART | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/VENC0-SYS-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/VENC1-FAST | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/VENC1-MEM-FAST | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/VENC1-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/VENC1-SYS-DART | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/VENC1-SYS-V | Virtual PMGR vote; no independent power-state register.
+t6040-j616s /sacm | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8112-j413 /arm-io/pmgr/power-devices/ANE-SYS-DART | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/ANE-SYS-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_ADMA0 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_AUDIO_ADMA0 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_AUDIO_SHIM | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_BASE | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_CPU | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_FILTER | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_FR | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_GPIO | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_I2CM0 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_I2CM2 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_LEAP | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_LEAP_CLK | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_MCA0 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_MCA1 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_MCA2 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_MCA3 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_MCA4 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_MCA5 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_PDM0_REF | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_PDM1_REF | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_PDMC_LPD | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_PIODMA | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_SCM | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_SHIM | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_SPI0 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_SPI1 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_SPMI0 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_SPMI1 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_SRAM | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_UART0 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_UART1 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_UART2 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/ATC0-USB-AUD-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/ATC0-USB-DART | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/ATC0_PCIE-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/ATC1-USB-AUD-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/ATC1-USB-DART | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/ATC1_PCIE-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AUDIO-LLT-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AUDIO-P-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AUSB0_AONPCIE-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AUSB0_AONUSB-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AUSB1_AONPCIE-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AUSB1_AONUSB-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AVD-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AVD-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AVD-SYS-DART | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/AVD-SYS-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/CIO0_RECONFIG-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/CIO1_RECONFIG-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/CLPC-DCS-VMAX | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/CLPC-DCS-VNOM | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/CLPC-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/CLPC-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/CPU-BUSY | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/DCP0-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/DCPEXT0-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/DFR-CARVE-OUT | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/DFR-FB-ACTIVE | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/DFR-MIE-DPB | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/DISP-CARVE-OUT | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/DISP-FB-ACTIVE | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/DISP-MIE-DPB | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/DISP0_BE | Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISP0_BLC | Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISP0_BRC | Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISP0_GP0 | Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISP0_GP1 | Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISP0_GP2 | Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISP0_PPP | Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISP0_SPI | Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISP0_SPMI | Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISPDFR-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/DISPEXT_BE | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISPEXT_DSC | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISPEXT_GP0 | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISPEXT_GP1 | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISPEXT_GP2 | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DISPEXT_PPP | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DP | Power state with a register, switched by the DCP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DP-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/DP0_VMAX-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/DP1_VMAX-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/DPEXT | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/DPTX_PHY | Power state with a register, switched by the DCPEXT firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/ECPM_NRG | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/ECPU0_SRAM | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/ECPU1_SRAM | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/ECPU2_SRAM | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/ECPU3_SRAM | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/ECPU_SRAM | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/FR_SCALING-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/GFX-ASC | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/GFX-BUSY | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/GFX-SGX | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/ISP-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/ISP-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/ISP-SYS-DART | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/ISP-SYS-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/JPG-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/JPG-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/JPG0-DART | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/JPG0-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/JPG1-DART | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/JPG1-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/MSR-DART | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/MSR-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/MTP_BASE | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/MTP_CPU | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/MTP_DMA | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/MTP_FABRIC | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/MTP_GPIO | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/MTP_I2CM0 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/MTP_PERIPH | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/MTP_SCM_FABRIC | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/MTP_SPI0 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/MTP_SRAM | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/MTP_UART0 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/PCPM_NRG | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/PCPU0_SRAM | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/PCPU1_SRAM | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/PCPU2_SRAM | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/PCPU3_SRAM | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/PCPU_SRAM | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/PRORES_VMAX-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/PRORES_VNOM-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/SCDC_VMAX-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/SCDC_VNOM-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/SDEC-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/SDEC-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/SEP-PEARL-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/SEP_EISP | Power state with a register, switched by the SEP firmware. The ADT marks it no_ps, so the macOS PMGR driver leaves it alone too; no DT power controller.
+t8112-j413 /arm-io/pmgr/power-devices/SIO-CPU-DART | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/SIO-CPU-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/SMC_AON | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/SMC_CPU | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/SMC_FABRIC | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/SMC_FPWM0 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/SMC_FPWM1 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/SMC_FPWM2 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/SMC_FPWM3 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/SMC_GPIO | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/SMC_I2CM0 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/SMC_I2CM1 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/SMC_I2CM2 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/SMC_I2CM3 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/SMC_I2CM4 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/SMC_UART0 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/SMC_UART1 | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/USB-AUDIO-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/VDD_CIO-V | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/VENC-AVE-VMAX | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/VENC-AVE-VNOM | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/VENC-DART | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/VENC-MEM-FAST | Virtual PMGR vote; no independent power-state register.
+t8112-j413 /arm-io/pmgr/power-devices/VENC-SYS-V | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/aod2 | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /arm-io/aod3 | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /arm-io/aod4 | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /arm-io/apple-processor-trace | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /arm-io/audio-hp-mic-proxy | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /arm-io/audio-shared-dart-proxy | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /arm-io/dcp-exclave-ioreporting | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /arm-io/dcp-sac-controller | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /arm-io/dcp0-expert | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /arm-io/dcpext-expert | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /arm-io/dp-audio0 | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /arm-io/dp-audio1 | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /arm-io/exdisplaypipe | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /arm-io/iop-audio-controller/audio-leap-internal-loopback | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /arm-io/iop-audio-controller/audio-mca-loopback | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /arm-io/iop-audio-controller/audio-speaker-tap | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /arm-io/iop-audio-controller/lp-mic-device | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /arm-io/iop-audio-controller/lp-mic-injection-device | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /arm-io/iop-audio-controller/lp-mic-io-buffer-device | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /arm-io/iop-audio-controller/siri-listening-device | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /arm-io/iop-voicetrigger-controller | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /arm-io/iop-voicetrigger-controller/audio-vt-device | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /arm-io/isp-exclave-proxy | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /arm-io/mtp-aop-mux | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /arm-io/nco | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /arm-io/pmgr/power-devices/AFCMCCNI0 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/AFIAFT | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/AFIMCCNI0 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/AFINS0 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/AFISOCNI0 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/AFISOCNI1 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/AFISOCNI2 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/AMCC0_P0 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/AMCC0_P1 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/AMCC0_P2 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/AMCC0_P3 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/ANE-SYS-V | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/ANE-SYS-V-PMP | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/ANE_CPU | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/APCIE_SYS_ST-V | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/ATC0-DCS-F1 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/ATC0-DCS-F2 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/ATC0-DCS-F3 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/ATC0-DCS-F4 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/ATC0-DCS-F5 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/ATC0-USB-AUD-V | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/ATC0-USB-DART | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/AUDIO-LLT-V | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/AUDIO-P-V | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/AUSB0_AONUSB-V | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/AVD-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/AVD-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/AVD-SYS-V | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/CLPC-DCS-VMAX | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/CLPC-DCS-VNOM | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/CLPC-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/CLPC-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/CPU-BUSY | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/DCP0-V | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/DCPEXT0-V | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/DCS0 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/DCS1 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/DCS2 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/DCS3 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/DISP-CARVE-OUT | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/DISP-FB-ACTIVE | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/DISP-MIE-DPB | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/DISPEXT0_DBE | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/DISPEXT0_GPPP | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/DISP_CMB | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/DISP_DBE | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/DISP_EXT0_M3 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/DISP_GP0 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/DISP_GP1 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/DISP_HILO | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/DISP_INT_M3 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/DISP_PPP | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/DP | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/DPEXT0 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/DPTX_PHY | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/DSG | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/ECPU0_SRAM | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/ECPU1_SRAM | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/ECPU2_SRAM | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/ECPU3_SRAM | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/ECPU_NRG | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/ECPU_SRAM | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/FR_SCALING-V | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/GFX-ASC | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/GFX-ASC1 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/GFX-BUSY | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/GFX-SGX | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/HPD | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/ISP-CORE-V | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/ISP-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/ISP-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/ISP-SYS-V | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/JPG-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/JPG-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/JPG0-V | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/JPG1-V | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/MIPI_DSI | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/MSR-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/MSR-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/MSR-V | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/MTP_BASE | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/MTP_CPU | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/MTP_DMA | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/MTP_FABRIC | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/MTP_GPIO | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/MTP_I2CM0 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/MTP_PERIPH | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/MTP_SCM_FABRIC | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/MTP_SPI0 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/MTP_SRAM | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/MTP_UART0 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/NUB_AON | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/NUB_HE_NRCS0 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/NUB_HE_NRCS1 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/PCPU0_SRAM | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/PCPU1_SRAM | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/PCPU_NRG | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/PCPU_SRAM | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/PDM0_AUDIO_REF | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/PDM1_AUDIO_REF | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/PIOGW | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/PMS | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/PMS_BUSIF | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/PRORES-SOC-VMAX | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/PRORES-SOC-VNOM | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/SBR | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/SEP-PEARL-V | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/SIO | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/SIO-CPU-V | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/SMC_AON | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/SMC_CPU | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/SMC_FPWM0 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/SMC_FPWM1 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/SMC_FPWM2 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/SMC_FPWM3 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/SMC_GPIO | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/SMC_PTD | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/SMC_UART0 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/SMC_UART1 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/USB-AUDIO-V | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/USB_SLP_DDR-V | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/VENC-CLSTR-V | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/VENC0-AVE-VMAX | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/VENC0-AVE-VNOM | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/VENC0-MEM-FAST | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/VENC0-SYS-V | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/VENC1-AVE-VMAX | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/VENC1-AVE-VNOM | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/VENC1-MEM-FAST | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/VENC1-SYS-V | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/VENC1_DMA | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/VENC1_ME0 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/VENC1_ME1 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/VENC1_PIPE4 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/VENC1_PIPE5 | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/pmgr/power-devices/VENC1_SYS | Virtual PMGR vote; no independent power-state register.
+t8140-j700 /arm-io/smc/iop-smc-nub/smc-mogul | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /dock-debug-wireless | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+t8140-j700 /sacm | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
+
+# Logical relationships; their parent hardware remains independently inventoried.
+* /arm-io/dart-*/mapper-* | IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+* /arm-io/mapper-gfx-asc | GPU firmware IOMMU stream; represented by the GPU IOMMU relationship.
+* /arm-io/*/iop-*-nub | Firmware endpoint container; hosting coprocessor is inventoried separately.
+* /arm-io/*/iop-*-nub0 | Firmware endpoint container; hosting coprocessor is inventoried separately.
+* /arm-io/*/iop-*-nub/* | Firmware-discovered coprocessor service; no independent MMIO device.
+* /arm-io/*/iop-*-nub/*/* | Logical child of a firmware-discovered coprocessor service.
+* /arm-io/*/adma-tx-* | DMA channel of the parent ADMAC controller, described by dmas.
+* /arm-io/*/adma-rx-* | DMA channel of the parent ADMAC controller, described by dmas.
+* /arm-io/spi*/spinor/firmware | Firmware flash partition; parent flash hardware is inventoried separately.
+* /arm-io/spi*/spinor/anvram | Firmware NVRAM partition; parent flash hardware is inventoried separately.
+* /arm-io/spi*/spinor/syscfg | Firmware configuration partition; parent flash hardware is inventoried separately.
+* /arm-io/qspi/spinor/firmware | Firmware flash partition; parent flash hardware is inventoried separately.
+* /arm-io/qspi/spinor/anvram | Firmware NVRAM partition; parent flash hardware is inventoried separately.
+* /arm-io/qspi/spinor/syscfg | Firmware configuration partition; parent flash hardware is inventoried separately.
+* /arm-io/pmgr/clpc | Firmware performance policy; PMGR and PMP hardware are inventoried separately.
+* /arm-io/pmgr/ppm | Firmware power policy; PMGR and PMP hardware are inventoried separately.
+* /arm-io/pmgr/soc-tuner | Firmware tuning policy; not an independent hardware block.
+* /buttons | Button collection container; child devices are inventoried separately.
+
+# Runtime/policy objects explicitly distinguished by the board audit.
+t6040-j616s /arm-io/dynamic-pil | Firmware runtime policy or service metadata; not an independently addressable hardware device.
+t6040-j616s /arm-io/dynamic-pil/cil | Firmware runtime policy or service metadata; not an independently addressable hardware device.
+t6040-j616s /arm-io/pmgrtools | Firmware runtime policy or service metadata; not an independently addressable hardware device.
+t6040-j616s /arm-io/sapt | Firmware runtime policy or service metadata; not an independently addressable hardware device.
+t6040-j616s /arm-io/timesync | Firmware runtime policy or service metadata; not an independently addressable hardware device.
+t6040-j616s /arm-io/fillmore | Firmware runtime policy or service metadata; not an independently addressable hardware device.
+t8140-j700 /arm-io/sapt | Firmware runtime policy or service metadata; not an independently addressable hardware device.
+t8140-j700 /arm-io/pmgrtools | Firmware runtime policy or service metadata; not an independently addressable hardware device.
+t8140-j700 /arm-io/timesync | Firmware runtime policy or service metadata; not an independently addressable hardware device.
+t8140-j700 /arm-io/fillmore | Firmware runtime policy or service metadata; not an independently addressable hardware device.
+t8140-j700 /fillmore | Firmware runtime policy or service metadata; not an independently addressable hardware device.
+t8140-j700 /exbright | Firmware runtime policy or service metadata; not an independently addressable hardware device.
+t8140-j700 /exbright/backlight-exbright | Firmware runtime policy or service metadata; not an independently addressable hardware device.
+t8140-j700 /exclaves-test | Firmware runtime policy or service metadata; not an independently addressable hardware device.
+
+# PMGR performance-domain records do not have independent power-state registers.
+# Exact power-state label matches take precedence over this logical-domain rule.
+* /arm-io/pmgr/power-domains/* | Logical PMGR performance domain; physical power-state records are inventoried separately.
+* /arm-io/admac-*/base-*-adma-* | DMA channel of the parent ADMAC controller, described by dmas.
+* /arm-io/admac-*/leap-*-adma-* | DMA channel of the parent ADMAC controller, described by dmas.
+
+# Native OS policy and diagnostic views, not independently addressed devices.
+* /arm-io/sapt | Firmware audio performance policy, not an independent hardware block.
+* /arm-io/timesync | Firmware clock synchronization policy, not a separate timer device.
+* /arm-io/apple-processor-trace | Native diagnostic trace policy; CPU debug hardware is inventoried separately.
+* /arm-io/pmgrtools | Native PMGR diagnostic access service; PMGR hardware is inventoried separately.
+* /arm-io/dp-audio? | Logical display audio DMA endpoint; SIO and display controllers are inventoried separately.
+* /arm-io/*-expert | Coprocessor firmware policy view; hosting coprocessor is inventoried separately.
+* /arm-io/dcp-sac-controller | Logical display firmware service; hosting DCP is inventoried separately.
+* /arm-io/lcd0-sac | Display access-control policy; hosting DCP is inventoried separately.
+* /arm-io/mtp-aop-mux | Firmware transport arbitration policy; MTP and AOP hardware are inventoried separately.
+* /arm-io/ans/ans-pcie | Internal coprocessor PCI topology; represented by the ANS controller.
+* /arm-io/*/wlan-debug | Logical debug endpoint of the parent UART; UART hardware is inventoried separately.
+* /arm-io/*/bluetooth-debug | Logical debug endpoint of the parent UART; UART hardware is inventoried separately.
+* /arm-io/*/pci-bridge? | PCI root-port topology; PCIe controller hardware is inventoried separately.
+* /arm-io/*/pcic?-bridge | PCI root-port topology; PCIe controller hardware is inventoried separately.
+* /arm-io/*/stockholm-spmi/stockholm | NFC firmware service of the parent SPMI device, not another addressed bus device.
+* /sacm | Display access-control policy; display hardware is inventoried separately.
+
+# Services whose independently addressed providers are counted elsewhere.
+* /pcie-sdreader-helper | Firmware SD-card policy helper; PCIe reader hardware is inventoried separately.
+* /port-hdmi* | Logical DCP output interface; display controllers and their routes are inventoried separately.
+* /arm-io/dp2hdmi-gpio | Logical display GPIO routing helper; GPIO controller hardware is inventoried separately.
+* /arm-io/nub-swd0 | Native debug access service; debug hardware is inventoried separately.
+
+# Saved live tables: reviewed virtual votes, each without a power-state register.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC16 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_16 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC17 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_17 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC18 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_18 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC19 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_19 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC24 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_24 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC25 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_25 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC26 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_26 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC27 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/VENC1_SYS | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/VENC1_DMA | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/VENC1_PIPE4 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/VENC1_PIPE5 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/VENC1_ME0 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/VENC1_ME1 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT3_SYS | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT3_FE | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT3_CPU | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT2_SYS | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT2_FE | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DISPEXT2_CPU | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_27 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC20 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC21 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC22 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC23 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC28 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC29 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC30 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/AMCC31 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_20 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_21 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_22 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_23 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_28 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_29 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_30 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/DCS_31 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/MSR1 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/MSR1_ASE_CORE | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/ISP_CPU | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /arm-io/pmgr/power-devices/ISP_FE | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6040-j616s /port-t818-1 | Firmware accessory-port relationship of the SMC; no independently addressed bus or MMIO device.
+t6040-j616s /arm-io/spi4/dp855/lcd-pmicwp | Firmware write-protection view of the panel power-management interface mediated by DP855; not an independent host bus device.
+t6040-j616s /arm-io/spi4/dp855/lcd-pmic | Firmware panel power-management register-access view mediated by DP855; its address is internal to the TCON transport.
+t6040-j616s /arm-io/spi4/dp855/lcd-sswp | Firmware write-protection view of the panel source-driver interface mediated by DP855; not an independent host bus device.
+t6040-j616s /arm-io/spi4/dp855/lcd-ss | Firmware panel source-driver register-access view mediated by DP855; its address is internal to the TCON transport.
+t6040-j616s /arm-io/spi4/dp855/tcon-registers | Firmware register-access view of the DP855 itself; the panel timing controller represents this hardware.
+t6040-j616s /arm-io/spi4/dp855/lcd-eeprom | Firmware view of panel nonvolatile storage mediated by DP855; no independently addressed host bus endpoint.
+t6000-j316s /arm-io/pmgr/power-devices/PMS_FPWM0 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6000-j316s /arm-io/pmgr/power-devices/PMS_FPWM1 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6000-j316s /arm-io/pmgr/power-devices/PMS_FPWM2 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6000-j316s /arm-io/pmgr/power-devices/PMS_FPWM3 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6000-j316s /arm-io/pmgr/power-devices/PMS_FPWM4 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6000-j316s /arm-io/pmgr/power-devices/AFNC3_IOA | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6000-j316s /arm-io/pmgr/power-devices/AFNC3_LS | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6000-j316s /arm-io/pmgr/power-devices/AFNC3_LW0 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6000-j316s /arm-io/pmgr/power-devices/GP_USB_AON | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t6000-j316s /port-t818-1 | Firmware accessory-port relationship of the SMC; no independently addressed bus or MMIO device.
+t6000-j316s /arm-io/spi4/dp855/lcd-pmicwp | Firmware write-protection view of the panel power-management interface mediated by DP855; not an independent host bus device.
+t6000-j316s /arm-io/spi4/dp855/lcd-pmic | Firmware panel power-management register-access view mediated by DP855; its address is internal to the TCON transport.
+t6000-j316s /arm-io/spi4/dp855/lcd-sswp | Firmware write-protection view of the panel source-driver interface mediated by DP855; not an independent host bus device.
+t6000-j316s /arm-io/spi4/dp855/lcd-ss | Firmware panel source-driver register-access view mediated by DP855; its address is internal to the TCON transport.
+t6000-j316s /arm-io/spi4/dp855/tcon-registers | Firmware register-access view of the DP855 itself; the panel timing controller represents this hardware.
+t6000-j316s /arm-io/spi4/dp855/lcd-eeprom | Firmware view of panel nonvolatile storage mediated by DP855; no independently addressed host bus endpoint.
+t8112-j413 /arm-io/pmgr/power-devices/PMS_FPWM0 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t8112-j413 /arm-io/pmgr/power-devices/PMS_FPWM1 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t8112-j413 /arm-io/pmgr/power-devices/PMS_FPWM2 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t8112-j413 /arm-io/pmgr/power-devices/PMS_FPWM3 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t8112-j413 /arm-io/pmgr/power-devices/PMS_FPWM4 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t8112-j413 /arm-io/pmgr/power-devices/AOP_I2CM1 | Virtual PMGR vote marked as having no power-state register in the live table; not a separate power controller.
+t8112-j413 /port-t818-1 | Firmware accessory-port relationship of the SMC; no independently addressed bus or MMIO device.
+t8112-j413 /arm-io/spi4/dp855/lcd-pmicwp | Firmware write-protection view of the panel power-management interface mediated by DP855; not an independent host bus device.
+t8112-j413 /arm-io/spi4/dp855/lcd-pmic | Firmware panel power-management register-access view mediated by DP855; its address is internal to the TCON transport.
+t8112-j413 /arm-io/spi4/dp855/lcd-sswp | Firmware write-protection view of the panel source-driver interface mediated by DP855; not an independent host bus device.
+t8112-j413 /arm-io/spi4/dp855/lcd-ss | Firmware panel source-driver register-access view mediated by DP855; its address is internal to the TCON transport.
+t8112-j413 /arm-io/spi4/dp855/tcon-registers | Firmware register-access view of the DP855 itself; the panel timing controller represents this hardware.
+t8112-j413 /arm-io/spi4/dp855/lcd-eeprom | Firmware view of panel nonvolatile storage mediated by DP855; no independently addressed host bus endpoint.
+
+# T6050 J716s: virtual PMGR votes, each without a power-state register in the ADT's table.
+t6050-j716s /arm-io/pmgr/power-devices/TRACE_FAB | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT0_DBE | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DPEXT0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT0_GP0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT0_GP1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT0_GPL | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT0_PPP | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT2_DBE | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DPEXT2 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT2_GP0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT2_GP1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT2_GPL | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT2_PPP | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT3_DBE | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DPEXT3 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT3_GP0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT3_GP1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT3_GPL | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT3_PPP | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT1_DBE | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DPEXT1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT1_GP0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT1_GP1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT1_GPL | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT1_PPP | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT0_DSC | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT2_DSC | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT3_DSC | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT1_DSC | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISP_SPI | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISP_SPMI | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISP_SMB0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISP_SMB1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISP_DBE | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DP | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISP_GP0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISP_GP1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISP_GPL | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISP_CMB | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISP_PPP | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISP_BRC | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISP_BLC | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISP_HILO | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISP_RCA | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISP_DSC | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/FPWM1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/ISP_CPU | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/ISP_FE | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DPRX | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/ISP_SECURE | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/ISP_BE | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/ISP_CLR | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DPTX_PHY | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/NUB_OCLA | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AOP_FILTER | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AOP_GPIO | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AOP_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AOP_FR | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AOP_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUDIO_A | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AOP_I2CM0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AOP_I2CM1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AOP_I2CM2 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AOP_I2CM3 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AOP_SPI0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AOP_SPI1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AOP_SPMI0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AOP_SPMI1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AOP_HE_NRCS0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AOP_HE_NRCS1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AOP_BASE | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUDIO_FR | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AOP_SHIM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AOP_PIODMA | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AOP2_PIODMA | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AOP_SCM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AOP_CPU | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AOP2_CPU | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUDIO_P | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUDIO_LEAP_A | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUDIO_SENSE_PDMC | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AOP_UART0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AOP_UART1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AOP_UART2 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUDIO_BASE_S_A | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUDIO_BASE_NS_A | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUDIO_LEAP_MCA | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUDIO_MCA0_M | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUDIO_MCA1_M | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUDIO_MCA2_M | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUDIO_MCA3_M | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUDIO_MCA4_M | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUDIO_MCA5_M | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUDIO_LEAP_C | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUDIO_LEAP_S_A | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUDIO_LEAP_NS_A | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUDIO_LEAP_RX0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUDIO_LEAP_RX1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUDIO_LEAP_RX2 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUDIO_LEAP_RX3 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUDIO_LEAP_RX4 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUDIO_LEAP_TX0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/PDM0_AUDIO_REF | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/PDM1_AUDIO_REF | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/SMC_FABRIC | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/SMC_GPIO | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/SMC_AON | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/SMC_UART0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/SMC_UART1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/SMC_FPWM0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/SMC_FPWM1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/SMC_FPWM2 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/SMC_FPWM3 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/SMC_PTD | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/SMC_CPU | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MTP_FABRIC | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MTP_GPIO | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MTP_BASE | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MTP_PERIPH | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MTP_SCM_QSPI0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MTP_CPU | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MTP_DMA | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MTP_DMA2 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MTP_SHIM_PCLK | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MTP_SCM_FABRIC | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MTP_SPI0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MTP_I2CM0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MTP_QSPI0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MTP_SCM_QSPI0_S | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MTP_UART0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MTP_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/TRACE_FAB_GFX | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/NUB_GFX_OCLA | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MACC0_0_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MACC0_1_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MACC0_2_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MACC0_3_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MACC0_4_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MACC0_5_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MACC1_0_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MACC1_1_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MACC1_2_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MACC1_3_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MACC1_4_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MACC1_5_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/PACC_0_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/PACC_1_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/PACC_2_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/PACC_3_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/PACC_4_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/PACC_5_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MCPM0_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MCPM1_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/PCPM_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MCPM0_NRG | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MCPM1_NRG | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/PCPM_NRG | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/ATC0_USB_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/SIO_CPU_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/SIO_DART_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/ATC1_USB_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/ATC0_USB_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/ATC1_USB_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/ATC2_USB_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/ATC3_USB_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/APCIE_SYS_GX_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/APCIE_SYS_STX_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/GFX_SGX | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/GFX_ASC | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/GFX_ASC1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/GFX_BUSY | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/ANE_SYS_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/ANE_SYS_V_PMP | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/ANE_SYS_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/VENC0_SYS_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/VENC0_FAST | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/VENC0_SOC_VMAX | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AVD_SOC_VNOM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AVD_SOC_VMAX | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/JPG_SOC_VNOM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/JPG_SOC_VMAX | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MSR0_SOC_VNOM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MSR0_SOC_VMAX | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/ISP_SOC_VNOM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/ISP_SOC_VMAX | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/SCODEC_SOC_VNOM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/SCODEC_SOC_VMAX | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/VENC1_FAST | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/VENC1_SOC_VMAX | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MSR1_SOC_VNOM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MSR1_SOC_VMAX | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/PRORES_SOC_VNOM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/PRORES_SOC_VMAX | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/VENC0_MEM_FAST | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/VENC0_SYS_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AVD_SYS_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AVD_SOC_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/JPG0_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/JPG0_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/JPG1_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/JPG1_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MSR0_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MSR0_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/ISP_SYS_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/ISP_SYS_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISP_CPU_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT0_CPU_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT1_CPU_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT2_CPU_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT3_CPU_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/CIO0_RECONFIG_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/CIO1_RECONFIG_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/CIO2_RECONFIG_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/CIO3_RECONFIG_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUSB0_AONPCIE_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUSB1_AONPCIE_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUSB2_AONPCIE_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUSB3_AONPCIE_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUDIO_P_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/SCODEC_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/SCODEC_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/VENC1_SYS_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/VENC1_MEM_FAST | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/VENC1_SYS_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MSR1_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MSR1_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/PRORES_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/PRORES_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/SMC_FAB_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/MTP_FAB_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/ATC0_USB_AON_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/ATC1_USB_AON_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/ATC2_USB_AON_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/ATC3_USB_AON_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISP_MIE_DPB | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISP_FB_ACTIVE | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISP_CARVE_OUT | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/ANS_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/APCIE_GP_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/APCIE_SYS_GP_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/APCIE_ST0_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/APCIE_SYS_ST0_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/APCIE_ST1_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/APCIE_SYS_ST1_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/APCIE_PHY_SW~2 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/AUSS_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISP-M3-V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT0-M3-V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT1-M3-V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT2-M3-V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j716s /arm-io/pmgr/power-devices/DISPEXT3-M3-V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+
+# T6050 J873s: virtual PMGR votes, each without a power-state register in the ADT's table.
+t6050-j873s /arm-io/pmgr/power-devices/TRACE_FAB | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT0_DBE | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DPEXT0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT0_GP0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT0_GP1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT0_GPL | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT0_PPP | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT2_DBE | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DPEXT2 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT2_GP0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT2_GP1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT2_GPL | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT2_PPP | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT3_DBE | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DPEXT3 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT3_GP0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT3_GP1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT3_GPL | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT3_PPP | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT1_DBE | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DPEXT1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT1_GP0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT1_GP1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT1_GPL | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT1_PPP | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT0_DSC | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT2_DSC | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT3_DSC | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT1_DSC | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISP_SPI | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISP_SPMI | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISP_SMB0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISP_SMB1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISP_DBE | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DP | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISP_GP0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISP_GP1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISP_GPL | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISP_CMB | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISP_PPP | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISP_BRC | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISP_BLC | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISP_HILO | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISP_RCA | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISP_DSC | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/ISP_CPU | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/ISP_FE | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DPRX | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/ISP_SECURE | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/ISP_BE | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/ISP_CLR | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/NUB_OCLA | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AOP_FILTER | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AOP_GPIO | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AOP_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AOP_FR | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AOP_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUDIO_A | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AOP_I2CM0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AOP_I2CM1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AOP_I2CM2 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AOP_I2CM3 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AOP_SPI0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AOP_SPI1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AOP_SPMI0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AOP_SPMI1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AOP_HE_NRCS0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AOP_HE_NRCS1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AOP_BASE | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUDIO_FR | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AOP_SHIM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AOP_PIODMA | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AOP2_PIODMA | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AOP_SCM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AOP_CPU | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AOP2_CPU | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUDIO_P | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUDIO_LEAP_A | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUDIO_SENSE_PDMC | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AOP_UART0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AOP_UART1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AOP_UART2 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUDIO_BASE_S_A | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUDIO_BASE_NS_A | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUDIO_LEAP_MCA | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUDIO_MCA0_M | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUDIO_MCA1_M | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUDIO_MCA2_M | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUDIO_MCA3_M | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUDIO_MCA4_M | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUDIO_MCA5_M | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUDIO_LEAP_C | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUDIO_LEAP_S_A | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUDIO_LEAP_NS_A | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUDIO_LEAP_RX0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUDIO_LEAP_RX1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUDIO_LEAP_RX2 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUDIO_LEAP_RX3 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUDIO_LEAP_RX4 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUDIO_LEAP_TX0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/PDM0_AUDIO_REF | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/PDM1_AUDIO_REF | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/SMC_FABRIC | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/SMC_GPIO | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/SMC_AON | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/SMC_UART0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/SMC_UART1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/SMC_FPWM0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/SMC_FPWM1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/SMC_FPWM2 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/SMC_FPWM3 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/SMC_PTD | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/SMC_CPU | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MTP_FABRIC | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MTP_GPIO | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MTP_BASE | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MTP_PERIPH | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MTP_SCM_QSPI0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MTP_CPU | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MTP_DMA | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MTP_DMA2 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MTP_SHIM_PCLK | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MTP_SCM_FABRIC | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MTP_SPI0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MTP_I2CM0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MTP_QSPI0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MTP_SCM_QSPI0_S | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MTP_UART0 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MTP_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/TRACE_FAB_GFX | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/NUB_GFX_OCLA | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MACC0_0_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MACC0_1_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MACC0_2_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MACC0_3_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MACC0_4_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MACC0_5_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MACC1_0_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MACC1_1_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MACC1_2_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MACC1_3_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MACC1_4_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MACC1_5_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/PACC_0_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/PACC_1_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/PACC_2_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/PACC_3_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/PACC_4_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/PACC_5_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MCPM0_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MCPM1_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/PCPM_SRAM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MCPM0_NRG | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MCPM1_NRG | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/PCPM_NRG | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/ATC0_USB_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/SIO_CPU_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/SIO_DART_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/ATC1_USB_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/ATC0_USB_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/ATC1_USB_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/ATC2_USB_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/ATC3_USB_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/APCIE_SYS_GX_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/APCIE_SYS_STX_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/GFX_SGX | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/GFX_ASC | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/GFX_ASC1 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/GFX_BUSY | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/ANE_SYS_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/ANE_SYS_V_PMP | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/ANE_SYS_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/VENC0_SYS_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/VENC0_FAST | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/VENC0_SOC_VMAX | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AVD_SOC_VNOM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AVD_SOC_VMAX | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/JPG_SOC_VNOM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/JPG_SOC_VMAX | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MSR0_SOC_VNOM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MSR0_SOC_VMAX | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/ISP_SOC_VNOM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/ISP_SOC_VMAX | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/SCODEC_SOC_VNOM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/SCODEC_SOC_VMAX | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/VENC1_FAST | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/VENC1_SOC_VMAX | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MSR1_SOC_VNOM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MSR1_SOC_VMAX | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/PRORES_SOC_VNOM | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/PRORES_SOC_VMAX | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/VENC0_MEM_FAST | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/VENC0_SYS_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AVD_SYS_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AVD_SOC_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/JPG0_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/JPG0_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/JPG1_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/JPG1_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MSR0_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MSR0_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/ISP_SYS_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/ISP_SYS_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISP_CPU_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT0_CPU_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT1_CPU_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT2_CPU_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT3_CPU_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/CIO0_RECONFIG_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/CIO1_RECONFIG_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/CIO2_RECONFIG_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/CIO3_RECONFIG_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUSB0_AONPCIE_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUSB1_AONPCIE_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUSB2_AONPCIE_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUSB3_AONPCIE_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUDIO_P_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/SCODEC_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/SCODEC_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/VENC1_SYS_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/VENC1_MEM_FAST | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/VENC1_SYS_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MSR1_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MSR1_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/PRORES_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/PRORES_DART | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/SMC_FAB_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/MTP_FAB_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/ATC0_USB_AON_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/ATC1_USB_AON_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/ATC2_USB_AON_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/ATC3_USB_AON_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISP_MIE_DPB | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISP_FB_ACTIVE | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISP_CARVE_OUT | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/ANS_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/APCIE_GP_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/APCIE_SYS_GP_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/APCIE_ST0_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/APCIE_SYS_ST0_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/APCIE_ST1_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/APCIE_SYS_ST1_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/APCIE_PHY_SW~2 | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/AUSS_V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISP-M3-V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT0-M3-V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT1-M3-V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT2-M3-V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+t6050-j873s /arm-io/pmgr/power-devices/DISPEXT3-M3-V | Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.

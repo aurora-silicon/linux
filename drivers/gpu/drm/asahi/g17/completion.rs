@@ -13,7 +13,12 @@ use super::{
     recovery::Class,
     status::VmStatus,
 };
-use crate::{driver::AsahiDrmDevice, file, hw::t8140::{dynamic, resources as cfg}, mmu};
+use crate::{
+    driver::AsahiDrmDevice,
+    file,
+    hw::t8140::{dynamic, resources as cfg},
+    mmu,
+};
 use core::sync::atomic::{fence as barrier, AtomicBool, AtomicI32, AtomicU8, Ordering};
 use kernel::{
     dma_fence::{Fence, FenceContexts, RawDmaFence, UserFence},
@@ -86,7 +91,9 @@ impl Destinations {
         Ok(Self(destinations))
     }
 
-    pub(crate) fn has_outputs(&self) -> bool { self.0.iter().any(Option::is_some) }
+    pub(crate) fn has_outputs(&self) -> bool {
+        self.0.iter().any(Option::is_some)
+    }
 
     fn iter(&self) -> core::slice::Iter<'_, Option<Destination>> {
         self.0.iter()
@@ -175,11 +182,15 @@ pub(crate) struct ComputeTimestampCache {
 }
 
 impl ComputeTimestampCache {
-    /// Pages retained per context; deeper pipelines allocate the rest.
-    const RETAINED: usize = 8;
+    /// Pages retained per context; deeper pipelines allocate the rest. Every queued command
+    /// holds a page from submission on, and a game keeps a couple of hundred compute commands
+    /// queued, so a smaller cache refills and frees a page for nearly every command.
+    const RETAINED: usize = 256;
+    /// The cache grows to `RETAINED` only in contexts that queue that deep.
+    const INITIAL: usize = 8;
 
     pub(crate) fn new() -> Result<Arc<Self>> {
-        let pages = KVec::with_capacity(Self::RETAINED, GFP_KERNEL)?;
+        let pages = KVec::with_capacity(Self::INITIAL, GFP_KERNEL)?;
         Arc::pin_init(
             pin_init!(Self {
                 pages <- new_mutex!(pages, "G17 compute timestamp pages"),
@@ -208,7 +219,11 @@ impl ComputeTimestampCache {
     fn put(&self, page: ComputeTimestamps) {
         let rejected = {
             let mut pages = self.pages.lock();
-            pages.push_within_capacity(page).err()
+            if pages.len() < Self::RETAINED && pages.reserve(1, GFP_KERNEL).is_ok() {
+                pages.push_within_capacity(page).err().map(|rejected| rejected.0)
+            } else {
+                Some(page)
+            }
         };
         // Teardown of a page beyond the retained count runs unlocked.
         drop(rejected);
@@ -248,6 +263,7 @@ pub(crate) struct Completion {
     terminal: Option<UserFence<CompletionFence>>,
     compute: Option<PooledTimestamps>,
     feed: Option<Arc<super::feed::Feed>>,
+    usage: Arc<crate::usage::Client>,
     sources: Option<Arc<super::sync_input::Sources>>,
     #[pin]
     vm_job: Mutex<Option<mmu::VmJobGuard>>,
@@ -285,16 +301,20 @@ impl Completion {
         host_predecessors: bool,
         feed: Option<Arc<super::feed::Feed>>,
         sources: Option<Arc<super::sync_input::Sources>>,
+        usage: Arc<crate::usage::Client>,
     ) -> Result<Arc<Self>> {
         let fence = fence::independent(contexts)?;
-        let ordered = !compute
-            && (host_predecessors || destinations.iter().any(Option::is_some));
+        let ordered = !compute && (host_predecessors || destinations.iter().any(Option::is_some));
         let terminal = if host_predecessors {
             Some(fence::independent(contexts)?)
         } else {
             None
         };
-        let output = Output { fence, member, destinations };
+        let output = Output {
+            fence,
+            member,
+            destinations,
+        };
         let output = if ordered {
             HostOutput::Ordered(Publication::new(output, context.status().clone())?)
         } else {
@@ -312,6 +332,7 @@ impl Completion {
                 terminal,
                 compute,
                 feed,
+                usage,
                 sources,
                 vm_job <- new_mutex!(Some(vm_job), "G17 command VM pin"),
                 render <- new_mutex!(None, "G17 command render lease"),
@@ -334,7 +355,9 @@ impl Completion {
         Fence::from_fence(&self.output.output().fence)
     }
     pub(crate) fn scheduler_fence(&self) -> Fence {
-        self.terminal.as_ref().map_or_else(|| self.fence(), |fence| Fence::from_fence(fence))
+        self.terminal
+            .as_ref()
+            .map_or_else(|| self.fence(), |fence| Fence::from_fence(fence))
     }
     pub(crate) fn publication(&self) -> Option<Arc<Publication>> {
         match &self.output {
@@ -382,11 +405,15 @@ impl Completion {
         }
         match self.check_source_inputs() {
             Ok(()) => self.output.output().member.note_retired(),
-            Err(error) => { self.note_input_error(error); }
+            Err(error) => {
+                self.note_input_error(error);
+            }
         }
     }
     pub(super) fn check_source_inputs(&self) -> Result {
-        if let Some(sources) = &self.sources { sources.check()?; }
+        if let Some(sources) = &self.sources {
+            sources.check()?;
+        }
         Ok(())
     }
 
@@ -394,7 +421,11 @@ impl Completion {
         self.output.output().member.work_state()
     }
     pub(crate) fn has_timestamps(&self) -> bool {
-        self.output.output().destinations.iter().any(Option::is_some)
+        self.output
+            .output()
+            .destinations
+            .iter()
+            .any(Option::is_some)
     }
 
     pub(crate) fn compute_timestamp_va(&self) -> Result<u64> {
@@ -524,7 +555,7 @@ impl Completion {
     /// A firmware restart listed this command in its recovery table: it was in
     /// flight, so it may have run partly. Its stamps and completion record may
     /// still look like success. Unless a replay republishes it from the start,
-    /// it fails and the failure is always reported to the client.
+    /// it fails: its fence carries ECANCELED, and only a guilty VM is poisoned.
     pub(crate) fn note_interrupted(&self) {
         self.interrupted.store(true, Ordering::Release);
     }
@@ -533,19 +564,32 @@ impl Completion {
         self.interrupted.load(Ordering::Acquire)
     }
 
-    /// Whether this failure makes the VM unusable. Spared work, and interrupted
-    /// work no recovery found guilty, fail without poisoning it.
+    /// Whether the fence has been signalled (completed or failed).
+    pub(crate) fn signalled(&self) -> bool {
+        self.signalled.load(Ordering::Acquire)
+    }
+
+    /// Whether this failure makes the VM unusable. Spared work, interrupted
+    /// work no recovery found guilty, and work that never ran (ENODATA) fail
+    /// without poisoning it.
     pub(crate) fn poisons(&self, error: Error) -> bool {
+        // A command that never ran cannot have faulted the GPU. The queue's own failed
+        // command also comes back as ENODATA (a zero-duration record); it is classified
+        // guilty before it fails, by the firmware's fault report or by a recovery.
+        if error == ENODATA && !self.guilty() {
+            return false;
+        }
         let interrupted = self.interrupted();
         (error != ECANCELED || interrupted) && !self.spared() && !(interrupted && !self.guilty())
     }
 
-    /// ECANCELED stays silent only for work that was never interrupted (closed
-    /// or cancelled by its owner); every other failure reaches the client.
+    /// A non-poisoning ECANCELED or ENODATA (work a recovery discarded or dropped) stays out of
+    /// the VM status, as the UAPI documents for work another VM's recovery discarded:
+    /// Honeykrisp reads any status error as a lost device. Every other failure reaches the client.
     fn report(&self, error: Error) {
         if self.poisons(error) {
             self.status.record(error);
-        } else if error != ECANCELED || self.interrupted() {
+        } else if !discarded(error) {
             self.status.report_failure(error);
         }
     }
@@ -597,7 +641,9 @@ impl Completion {
     /// An exact whole-pair drain or processor stop allows rehabilitation. The
     /// VM pin goes first; the still-held lease excludes reuse until both settle.
     pub(crate) fn release_after_retirement(&self) {
-        if let Some(sources) = &self.sources { sources.release(); }
+        if let Some(sources) = &self.sources {
+            sources.release();
+        }
         drop(self.vm_job.lock().take());
         let lease = self.render.lock().take();
         if let Some(lease) = lease.as_ref() {
@@ -612,7 +658,9 @@ impl Completion {
     }
 
     fn release_healthy(&self) {
-        if let Some(sources) = &self.sources { sources.release(); }
+        if let Some(sources) = &self.sources {
+            sources.release();
+        }
         drop(self.render.lock().take());
         drop(self.vm_job.lock().take());
     }
@@ -622,13 +670,25 @@ impl Completion {
     #[track_caller]
     pub(crate) fn complete(&self, mut result: Result<[u64; 4]>) {
         if result.is_ok() {
-            if let Err(error) = self.check_source_inputs() { result = Err(error); }
+            if let Err(error) = self.check_source_inputs() {
+                result = Err(error);
+            }
         }
         if self.signalled.swap(true, Ordering::AcqRel) {
             return;
         }
         if result.is_ok() && self.interrupted() {
             result = Err(ECANCELED);
+        }
+        if let Ok(ticks) = &result {
+            use crate::usage::Engine;
+            let hz = cfg::COMMAND_TIMESTAMP_HZ as u32;
+            if self.compute.is_some() {
+                self.usage.add(Engine::Compute, ticks[0], ticks[1], hz);
+            } else {
+                self.usage.add(Engine::Vertex, ticks[0], ticks[1], hz);
+                self.usage.add(Engine::Fragment, ticks[2], ticks[3], hz);
+            }
         }
         if let (Some(feed), Ok(ticks)) = (&self.feed, &result) {
             // Compute reports its dispatch envelope in the first pair, a
@@ -655,7 +715,9 @@ impl Completion {
             return;
         }
         self.status.record_if_device_loss(error);
-        if self.accepted.load(Ordering::Acquire) {
+        // As in complete(): a cancellation is not this client's device loss. A guilty VM
+        // already carries its own sticky error.
+        if self.accepted.load(Ordering::Acquire) && error != ECANCELED {
             self.status.report_failure(error);
         }
         self.release_healthy();
@@ -674,13 +736,20 @@ impl Completion {
             guard.quarantine();
         }
         if self.spared() {
-            self.status.report_failure(error);
+            if !discarded(error) {
+                self.status.report_failure(error);
+            }
         } else {
             self.report(error);
         }
         self.signal_terminal(Err(error));
         self.output.finish(Err(error));
     }
+}
+
+/// The errors of work a recovery discarded (ECANCELED) or dropped before it ran (ENODATA).
+fn discarded(error: Error) -> bool {
+    error == ECANCELED || error == ENODATA
 }
 
 /// Collected under the device mutex and executed only after releasing it.

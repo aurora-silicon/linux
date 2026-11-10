@@ -15,7 +15,7 @@ description: |
   as HID devices over a DockChannel FIFO pair. The coprocessor announces its
   interfaces by name when it boots. Each interface that the operating system
   should use has a child node of the same name; announced interfaces without
-  a node are ignored.
+  a node are ignored, and so are interfaces whose node is disabled.
 
   The multi-touch interface may need firmware that the host sends after the
   coprocessor has booted, followed by a power cycle of the trackpad. Two
@@ -188,6 +188,23 @@ properties:
     additionalProperties: false
     description: The trackpad haptic actuator.
 
+    properties:
+      apple,click-strength:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        description:
+          Strengths at which the actuator firmware plays its own click
+          waveforms while it is device-controlled, first on press and then on
+          release. The coprocessor firmware starts with a weak placeholder
+          strength, so the host writes these over it. When absent, the
+          firmware's strength is kept.
+        items:
+          - description: Strength of the press click.
+            minimum: 1
+            maximum: 255
+          - description: Strength of the release click.
+            minimum: 1
+            maximum: 255
+
   tp_accel:
     type: object
     additionalProperties: false
@@ -199,6 +216,20 @@ properties:
     description:
       The trackpad accelerometer, under the name that the T6041 coprocessor
       firmware announces.
+
+  kiwi:
+    type: object
+    additionalProperties: false
+    description:
+      The touchscreen of the MacBook Pros with a PROLED XDR display, an
+      interface of the same coprocessor as the trackpad.
+
+    properties:
+      firmware-name:
+        maxItems: 1
+        description:
+          Name of the touchscreen firmware that the host sends to the
+          coprocessor when the interface is first opened.
 
   mtp:
     type: object
@@ -275,6 +306,7 @@ examples:
         };
 
         actuator {
+            apple,click-strength = <0xc0 0x6e>;
         };
 
         tp_accel {

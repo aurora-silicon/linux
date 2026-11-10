@@ -17,6 +17,13 @@
 			reg = <0x3 0x80700000 0 0x14000>;
 		};
 
+		/* Describes no domain; resolves the CIO PMGR the SoC tree carries. */
+		pmgr_cio: power-management@380780000 {
+			#address-cells = <1>;
+			#size-cells = <1>;
+			reg = <0x3 0x80780000 0 0x4000>;
+		};
+
 		pmgr_mini: power-management@388280000 {
 			#address-cells = <1>;
 			#size-cells = <1>;
@@ -36,6 +43,13 @@
 &pmc {
 	apple,static-voters = <3>;
 };
+
+/*
+ * The PMC interface domains' parents are PMGR states, which a copied phandle
+ * cannot reach in the loader's tree, and no loader PMGR state uses them.
+ */
+/delete-node/ &pmc_dispext0;
+/delete-node/ &pmc_dispext1;
 
 &ps_gfx {
 	status = "okay";

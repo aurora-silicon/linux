@@ -37,7 +37,7 @@ def controls(ROOT):
     actual=actual.replace('struct typec_mux_state { void *alt;', 'struct typec_altmode { unsigned svid; };\nstruct typec_mux_state { struct typec_altmode *alt;',1)
     actual=actual.replace('struct connector { bool connected; };','struct encoder { unsigned possible_crtcs; };\nstruct connector { bool connected,edid_live,edid_invalidation_pending; void *dcp; struct encoder *port_encoder; unsigned candidate_crtcs; int bl_sync_wq; };\n#define apple_connector connector\nstruct mux_control { int unused; };',1)
     actual=actual.replace('struct apple_dcp { int external_lock,external_error;', '''struct apple_dcp { int external_lock,external_error;
-     bool external_power_attempted,dptx_tunnel,tb_clock_ok,fixed_route_selected;
+     bool external_power_attempted,dptx_tunnel,tb_clock_ok,tb_clock_refused,fixed_route_selected;
      int tb_lock; unsigned typec_generation,dptx_dfp_port,dptx_phy,fixed_dptx_phy,fixed_mux_index;
      void *tb_dpin_set_active,*tb_dpin_ctx,*phy,*fixed_phy;
      struct mux_control *xbar,*fixed_xbar;
@@ -60,6 +60,10 @@ def controls(ROOT):
     extra=r'''
     /* actual DCP leaves */
     #define WRITE_ONCE(x,v) ((x)=(v))
+    /* No T8132 dcpext here: every route has DP alt mode (production: the dcpext compatible). */
+    struct apple_dcp_typec_route;
+    static bool dcp_typec_route_no_dp_alt(const struct apple_dcp_typec_route *route) { (void)route; return false; }
+    #define dev_info_once(...) ((void)0)
     #define USB_TYPEC_DP_SID 0xff01
     #define TYPEC_DP_STATE_A 10
     #define TYPEC_DP_STATE_F 15
@@ -341,7 +345,7 @@ def probe(root):
     unit = quiesce.make_unit(root)
     unit = unit.replace(block(unit, 'int main('), block(unit, 'int main(').replace('int main(', 'int __attribute__((unused)) prior_main(', 1), 1)
     unit = unit.replace('struct tipd_data {', 'struct fwnode_handle;\nstruct tipd_data { unsigned irq_mask1; int (*init)(struct tps6598x *); int (*switch_power_state)(struct tps6598x *, int); int (*register_port)(struct tps6598x *, struct fwnode_handle *); bool (*read_data_status)(struct tps6598x *); bool (*read_power_status)(struct tps6598x *); int (*connect)(struct tps6598x *,u32); void (*ready)(struct tps6598x *); void *irq_handler;')
-    unit = unit.replace('struct tps6598x {', 'struct tps6598x { bool dbma_at_probe,wakeup; u32 status;')
+    unit = unit.replace('struct tps6598x {', 'struct tps6598x { bool dbma_at_probe,wakeup; u32 status; bool (*sleep_event)(struct tps6598x *);')
     helpers = r"""
 #undef dev_err
 #define dev_err(...) ((void)0)
@@ -359,6 +363,7 @@ def probe(root):
 #define PTR_ERR(p) ((int)(intptr_t)(p))
 #define IRQF_SHARED 0
 #define IRQF_ONESHOT 0
+#define IRQF_NO_SUSPEND 0
 #define POLL_INTERVAL 1000
 #define INIT_DELAYED_WORK(...) ((void)0)
 #define tps6598x_poll_work 0
@@ -392,6 +397,7 @@ static void tipd_debugfs_register(struct tps6598x *t) { (void)t; }
 static int register_port(struct tps6598x *t,struct fwnode_handle *f) { (void)t;(void)f;return register_error; }
 static bool read_data_status(struct tps6598x *t) { (void)t;return true; }
 static int connect(struct tps6598x *t,u32 status) { (void)t;(void)status;return connect_error; }
+static int cd321x_reset_inherited_connection(struct tps6598x *t,u32 *s) { (void)t;(void)s;return 0; }
 """
     helpers += '\n#define of_machine_is_compatible(name) (!strcmp((name), \"apple,t8140\"))\n#define BIT_ULL(n) (1ULL << (n))\n#define SN201202X_INT_DP_SID_UPDATE BIT_ULL(37)\n'
     helpers += block(core, 'static bool cd321x_uses_dp_sid(') + '\n' + block(core, 'static u64 cd321x_irq_mask(') + '\n'

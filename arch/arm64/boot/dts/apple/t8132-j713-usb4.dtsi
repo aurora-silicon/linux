@@ -1,0 +1,118 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J713 USB4/Thunderbolt: ACIO0 behind the native-client port (hpm0, ATC0) and ACIO1
+ * behind the MagSafe-adjacent port (hpm1, ATC1). ACIO powers its domains only once
+ * the port controller reports a USB4 or Thunderbolt connection.
+ */
+
+/ {
+	aliases {
+		usb4-0-acio = &usb4_0_acio;
+		usb4-0-nhi = &usb4_0_nhi;
+		usb4-0-pcie-adapter = &usb4_0_acio;
+		usb4-1-acio = &usb4_1_acio;
+		usb4-1-nhi = &usb4_1_nhi;
+		usb4-1-pcie-adapter = &usb4_1_acio;
+	};
+};
+
+/* ACIO is the consumer that owns these domains while a cable is up. */
+&ps_atc0_pcie {
+	status = "okay";
+};
+
+&ps_atc1_pcie {
+	status = "okay";
+};
+
+&ps_atc0_cio {
+	status = "okay";
+};
+
+&ps_atc0_cio_pcie {
+	status = "okay";
+};
+
+&ps_atc0_cio_usb {
+	status = "okay";
+};
+
+&ps_atc1_cio {
+	status = "okay";
+};
+
+&ps_atc1_cio_pcie {
+	status = "okay";
+};
+
+&ps_atc1_cio_usb {
+	status = "okay";
+};
+
+&pmgr_cio {
+	status = "okay";
+};
+
+&usb4_0_mbox {
+	status = "okay";
+};
+
+&usb4_1_mbox {
+	status = "okay";
+};
+
+&usb4_0_acio {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* 1: USB4 port */
+		port@1 {
+			reg = <1>;
+			usb4_0_acio_tbt: endpoint {
+				remote-endpoint = <&typec0_connector_tbt>;
+			};
+		};
+	};
+};
+
+&usb4_1_acio {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* 1: USB4 port */
+		port@1 {
+			reg = <1>;
+			usb4_1_acio_tbt: endpoint {
+				remote-endpoint = <&typec1_connector_tbt>;
+			};
+		};
+	};
+};
+
+&typec0 {
+	ports {
+		port@2 {
+			reg = <2>;
+			typec0_connector_tbt: endpoint {
+				remote-endpoint = <&usb4_0_acio_tbt>;
+			};
+		};
+	};
+};
+
+&typec1 {
+	ports {
+		port@2 {
+			reg = <2>;
+			typec1_connector_tbt: endpoint {
+				remote-endpoint = <&usb4_1_acio_tbt>;
+			};
+		};
+	};
+};

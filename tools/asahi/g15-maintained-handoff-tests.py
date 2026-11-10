@@ -137,10 +137,12 @@ fn main() {
         OWNER_CALLS.set(0); let bytes = fixture(kind);
         assert!(parse(&dev, &Adt { data: &bytes }).is_err()); assert_eq!(OWNER_CALLS.get(), 0);
     }
-    assert_eq!(BUILDS.len(), 2, "maintained B0 firmware row must not require an absent profile symbol");
-    assert_eq!(BUILDS[1].machine.unwrap().to_bytes(), b"apple,j516s");
-    assert_eq!((BUILDS[1].text_size, BUILDS[1].data_size, BUILDS[1].marker), (0x5c000, 0x114000, 0x58e88));
-    assert_eq!(BUILDS[1].text_sha256, [0xda,0x26,0xec,0xca,0xb1,0xf8,0x59,0x8d,0xa8,0x0c,0x85,0x5e,0xca,0x91,0x65,0x20,0x40,0x6d,0x1d,0x06,0x70,0xf1,0xd4,0x70,0xe7,0x9b,0xb9,0xb0,0x22,0x09,0xdb,0x53]);
+    assert_eq!(BUILDS.len(), 3, "maintained B0 firmware row must not require an absent profile symbol");
+    for (row, machine) in [(1, &b"apple,j516s"[..]), (2, &b"apple,j514s"[..])] {
+        assert_eq!(BUILDS[row].machine.unwrap().to_bytes(), machine);
+        assert_eq!((BUILDS[row].text_size, BUILDS[row].data_size, BUILDS[row].marker), (0x5c000, 0x114000, 0x58e88));
+        assert_eq!(BUILDS[row].text_sha256, [0xda,0x26,0xec,0xca,0xb1,0xf8,0x59,0x8d,0xa8,0x0c,0x85,0x5e,0xca,0x91,0x65,0x20,0x40,0x6d,0x1d,0x06,0x70,0xf1,0xd4,0x70,0xe7,0x9b,0xb9,0xb0,0x22,0x09,0xdb,0x53]);
+    }
     for error in [0, -517, -12] {
         INIT_ERROR.set(error); let shared = Arc::new(Shared); let result = Rtkit::new(&dev, &shared);
         assert_eq!(result.is_ok(), error == 0);
@@ -156,13 +158,16 @@ def main():
     p = argparse.ArgumentParser(description=__doc__); p.add_argument('--output', type=Path); p.add_argument('--mutations', action='store_true'); a=p.parse_args()
     out=(a.output or Path(tempfile.mkdtemp(prefix='g15-maintained-handoff-'))).resolve(); out.mkdir(parents=True, exist_ok=True)
     adt=(G15/'adt.rs').read_text(); boot=(G15/'boot.rs').read_text(); hw=(G15/'hw.rs').read_text()
+    record=(G15/'board/record.rs').read_text()
     helpers='\n'.join(item(adt,m) for m in ["pub(crate) struct GpuAdt", "struct Adt<'a>", 'fn le32(', 'fn le64(', 'fn strncmp_eq(', "impl Adt<'_>", 'fn collect_perf(', 'fn parse(', 'fn admit_regions('])
     constants='\n'.join(re.search(r'pub\(crate\) const '+n+r':[^;]+;', hw).group(0) for n in ['PAGE','PA_MASK','TTBS_SIZE','TABLES_SIZE','HANDOFF_SIZE','SHARED_L2_SIZE','UPPER'])
+    # GpuAdt carries the T6031 sensor rows, sized by the record builder's production constant.
+    record_constants=re.search(r'pub\(crate\) const SENSOR_ROW_COUNT:[^;]+;', record).group(0)
     start=hw.index('        firmware: &['); start=hw.index('[',start); end=start+1; depth=1
     while depth: depth+=(hw[end]=='[')-(hw[end]==']'); end+=1
     firmware='static BUILDS: &[FirmwareBuild] = &'+hw[start:end]+';\n'+item(hw,'pub(crate) struct FirmwareBuild')
     constructor=item(boot,'    fn new(dev: &device::Device, shared: &Arc<Shared>)')
-    source=PREFIX+'\nmod hw {\n'+constants+'\n}\n'+helpers+'\n'+firmware+'\nimpl Rtkit {\n'+constructor+'\n}\n'+CASES
+    source=PREFIX+'\nmod hw {\n'+constants+'\n}\nmod record {\n'+record_constants+'\n}\n'+helpers+'\n'+firmware+'\nimpl Rtkit {\n'+constructor+'\n}\n'+CASES
     variants={'actual':source}
     if a.mutations:
         variants['skip-owner-check']=source.replace('if !glue::reserved_uat(i as u32, r.start, r.end - r.start) {','if false {')
@@ -170,7 +175,7 @@ def main():
         variants['drop-reserved-ram']=source.replace('Some(dram_base..dram_base + dram_size), true)?;', 'Some(dram_base..dram_base + dram_size), false)?;')
         variants['require-obsolete-b0-profile']=source.replace('          FirmwareBuild {\n            name: "J516S B0', '          #[cfg(CONFIG_SILICONFOREST_NATIVE_GPU)]\n          FirmwareBuild {\n            name: "J516S B0')
         variants['named-mailbox']=source.replace('cookie, core::ptr::null(), 0, &RTKIT_OPS', 'cookie, c"mbox".as_ptr(), 0, &RTKIT_OPS')
-    receipt={'scope':__doc__,'sources':{p:hashlib.sha256(t.encode()).hexdigest() for p,t in [('adt.rs',adt),('boot.rs',boot),('hw.rs',hw)]},'variants':{}}
+    receipt={'scope':__doc__,'sources':{p:hashlib.sha256(t.encode()).hexdigest() for p,t in [('adt.rs',adt),('boot.rs',boot),('hw.rs',hw),('board/record.rs',record)]},'variants':{}}
     for name,text in variants.items():
         if name!='actual' and text==source: raise SystemExit('NOT_APPLIED '+name)
         src=out/(name+'.rs');src.write_text(text); binary=out/name

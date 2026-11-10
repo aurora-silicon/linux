@@ -41,9 +41,7 @@ use crate::{
         AsahiDrmDevice,
         AsahiDrmDriver, //
     },
-    file,
-    memacct,
-    mmu,
+    file, memacct, mmu,
 };
 
 const DEBUG_CLASS: DebugFlags = DebugFlags::Gem;
@@ -133,9 +131,6 @@ pub(crate) fn validate_vm_binding(gem: &Object, vm: &mmu::Vm) -> Result {
     Ok(())
 }
 
-unsafe impl Send for AsahiObject {}
-unsafe impl Sync for AsahiObject {}
-
 /// A shared reference to a GEM object for this driver.
 pub(crate) struct ObjectRef {
     /// The underlying GEM object reference
@@ -214,6 +209,21 @@ impl ObjectRef {
         validate_vm_binding(&self.gem, vm)?;
 
         vm.map_at(addr, self.gem.size(), &self.gem, prot, guard)
+    }
+
+    /// Map at a specific address, reserving `guard_pages` unmapped pages
+    /// after the object in that Vm's allocator (T8152, module 1134).
+    #[cfg(CONFIG_DRM_ASAHI_G18)]
+    pub(crate) fn map_at_with_guards(
+        &mut self,
+        vm: &crate::mmu::Vm,
+        addr: u64,
+        prot: mmu::Prot,
+        guard_pages: usize,
+    ) -> Result<crate::mmu::KernelMapping> {
+        validate_vm_binding(&self.gem, vm)?;
+
+        vm.map_at_with_guards(addr, self.gem.size(), &self.gem, prot, guard_pages)
     }
 }
 
@@ -400,6 +410,12 @@ impl Drop for KernelMappingPin {
 }
 
 impl AsahiObject {
+    /// Whether this is a kernel-created object.
+    #[cfg(CONFIG_DRM_ASAHI_G18)]
+    pub(crate) fn is_kernel(&self) -> bool {
+        self.kernel
+    }
+
     /// Whether CPU mappings use the cacheable WRITEBACK policy.
     pub(crate) fn is_writeback(&self) -> bool {
         self.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_WRITEBACK != 0
@@ -503,6 +519,7 @@ pub(crate) fn prepare_new_object_g15(gem: &Object) -> Result {
     Ok(())
 }
 
-
 #[cfg(CONFIG_DRM_ASAHI_G15)]
-extern "C" { fn asahi_g15_dma_coherent(dev: *mut core::ffi::c_void) -> bool; }
+extern "C" {
+    fn asahi_g15_dma_coherent(dev: *mut core::ffi::c_void) -> bool;
+}

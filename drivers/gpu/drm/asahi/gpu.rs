@@ -35,6 +35,7 @@ use kernel::{
     },
     macros::versions,
     new_mutex,
+    new_spinlock,
     prelude::*,
     soc::apple::rtkit,
     sync::{
@@ -44,6 +45,7 @@ use kernel::{
         },
         Arc,
         Mutex,
+        SpinLock,
         UniqueArc, //
     },
     time::{
@@ -84,6 +86,7 @@ use crate::{
     queue,
     regs,
     stats,
+    stats_raw,
     workqueue, //
 };
 
@@ -258,6 +261,9 @@ pub(crate) struct GpuManager {
     pipes: PipeChannels::ver,
     event_manager: Arc<event::EventManager>,
     stats: Arc<stats::StatsSnapshot>,
+    /// Last raw firmware statistics of this device, exported read-only
+    /// through `stats_raw`.
+    raw_stats: Arc<SpinLock<stats_raw::RawStatsSnapshot>>,
     buffer_mgr: buffer::BufferManager::ver,
     ids: SequenceIDs,
     #[pin]
@@ -273,6 +279,11 @@ pub(crate) trait Gpu: Send + Sync {
 
     /// The firmware statistics snapshot of this GPU, if its firmware reports any.
     fn stats_snapshot(&self) -> Option<Arc<stats::StatsSnapshot>>;
+
+    /// The raw firmware statistics snapshot of this GPU, if its firmware reports any.
+    fn raw_stats_snapshot(&self) -> Option<Arc<SpinLock<stats_raw::RawStatsSnapshot>>> {
+        None
+    }
 
     /// Cast as an Any type.
     fn as_any(&self) -> &dyn Any;
@@ -311,7 +322,7 @@ pub(crate) trait Gpu: Send + Sync {
             flags |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES);
         }
         if self.soft_faults() && self.supports_soft_faults() {
-            flags |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
+            flags |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS);
         }
         flags
     }
@@ -350,6 +361,14 @@ pub(crate) trait Gpu: Send + Sync {
     fn base_clock_hz(&self) -> u32;
     /// Return the GPU address space geometry.
     fn uat_geometry(&self) -> mmu::UatGeometry;
+    /// Admit a client's parameter ABI before creating its VM.
+    fn admit_vm(&self, _dev: &kernel::device::Device, _params_size: u64, _flags: u32) -> Result {
+        Ok(())
+    }
+    /// GPU VA of each VM's dummy page, which must match the address the firmware was given.
+    fn unknown_page(&self) -> u64 {
+        self.uat_geometry().unk_page()
+    }
     /// Create a new `Vm` with the given range reserved for kernel-managed objects.
     fn new_vm(&self, kernel_range: Range<u64>) -> Result<mmu::Vm>;
     /// Create a VM charged to a DRM file when the backend bounds retained bindings.
@@ -367,6 +386,7 @@ pub(crate) trait Gpu: Send + Sync {
         ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
         priority: u32,
         usc_exec_base: u64,
+        usage: Arc<crate::usage::Client>,
     ) -> Result<KBox<dyn queue::Queue>>;
     /// Bind a BO range as a firmware- or CPU-written timestamp buffer.
     fn map_timestamp_buffer(
@@ -824,8 +844,24 @@ impl GpuManager::ver {
         let buffer_mgr = buffer::BufferManager::ver::new()?;
         let event_manager_clone = event_manager.clone();
         let buffer_mgr_clone = buffer_mgr.clone();
-        let stats_snap = Arc::new(stats::StatsSnapshot::default(), GFP_KERNEL)?;
+        let mut frequencies_hz = KVec::with_capacity(dyncfg.pwr.perf_states.len(), GFP_KERNEL)?;
+        for state in &dyncfg.pwr.perf_states {
+            frequencies_hz.push(u64::from(state.freq_hz), GFP_KERNEL)?;
+        }
+        let stats_snap = Arc::new(
+            stats::StatsSnapshot {
+                frequencies_hz,
+                ..Default::default()
+            },
+            GFP_KERNEL,
+        )?;
         let stats_snap_clone = stats_snap.clone();
+        // Per-device raw statistics snapshot, shared with the debugfs export.
+        let raw_stats_snap = Arc::pin_init(
+            new_spinlock!(stats_raw::RawStatsSnapshot::default(), "asahi_stats_raw"),
+            GFP_KERNEL,
+        )?;
+        let raw_stats_snap_clone = raw_stats_snap.clone();
         let alloc_ref = &mut alloc;
         let rx_channels = KBox::init(
             try_init!(RxChannels::ver {
@@ -841,6 +877,7 @@ impl GpuManager::ver {
                     dev.into(),
                     alloc_ref,
                     stats_snap_clone,
+                    raw_stats_snap_clone,
                     u64::from(cfg.base_clock_hz),
                 )?,
             }),
@@ -868,6 +905,7 @@ impl GpuManager::ver {
                 crashed: AtomicBool::new(false),
                 event_manager,
                 stats: stats_snap.clone(),
+                raw_stats: raw_stats_snap.clone(),
                 alloc <- new_mutex!(alloc, "alloc"),
                 fwctl_channel <- new_mutex!(fwctl_channel, "fwctl_channel"),
                 rx_channels <- new_mutex!(KBox::<RxChannels::ver>::into_inner(rx_channels), "rx_channels"),
@@ -1099,7 +1137,7 @@ impl GpuManager::ver {
                     virt_addr: U64(iova + off as u64),
                     total_size: (map.size * map.count * dies) as u32,
                     element_size: map.size as u32,
-                    readwrite: U64(map.writable as u64),
+                    readwrite: U64(u64::from(map.writable)),
                 };
             });
 
@@ -1149,20 +1187,14 @@ impl GpuManager::ver {
     /// Fetch the GPU MMU fault information from the hardware registers.
     fn get_fault_info(&self) -> Option<regs::FaultInfo> {
         // TODO: handle differently
-        let Some(guard) = self.dev.registration_guard() else {
-            return None;
-        };
+        let guard = self.dev.registration_guard()?;
 
         guard.registration_data_with(|reg_data| {
             let res = &reg_data.resources;
 
             let info = res.get_fault_info(self.cfg);
-            if info.is_some() {
-                dev_err!(
-                    self.dev.as_ref(),
-                    "  Fault info: {:#x?}\n",
-                    info.as_ref().unwrap()
-                );
+            if let Some(fault) = &info {
+                dev_err!(self.dev.as_ref(), "  Fault info: {:#x?}\n", fault);
             }
             info
         })
@@ -1252,6 +1284,9 @@ impl GpuManager::ver {
             .with(|raw, _inner| raw.pending_submissions.fetch_add(1, Ordering::Acquire));
 
         mod_dev_dbg!(self.dev, "OP start (pending: {})\n", val + 1);
+        // SAFETY: Takes no arguments and does nothing unless pmp_report.agx_vote is set on a T6001. The matching end call is made
+        // by OpGuard's Drop, and the guard is created right below, so every path out of here (including a failed kick) pairs it.
+        unsafe { kernel::bindings::apple_pmp_agx_activity_begin() };
         let guard = OpGuard(self.clone());
         self.kick_firmware()?;
         Ok(guard)
@@ -1327,6 +1362,10 @@ impl GpuManager::ver {
 impl Gpu for GpuManager::ver {
     fn stats_snapshot(&self) -> Option<Arc<stats::StatsSnapshot>> {
         Some(self.stats.clone())
+    }
+
+    fn raw_stats_snapshot(&self) -> Option<Arc<SpinLock<stats_raw::RawStatsSnapshot>>> {
+        Some(self.raw_stats.clone())
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -1411,6 +1450,7 @@ impl Gpu for GpuManager::ver {
         ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
         priority: u32,
         usc_exec_base: u64,
+        usage: Arc<crate::usage::Client>,
     ) -> Result<KBox<dyn queue::Queue>> {
         let mut kalloc = self.alloc();
         let id = self.ids.queue.next();
@@ -1428,6 +1468,7 @@ impl Gpu for GpuManager::ver {
                 id,
                 priority,
                 usc_exec_base,
+                usage,
             )?,
             GFP_KERNEL,
         )?)
@@ -1771,5 +1812,7 @@ impl GpuManagerPriv for GpuManager::ver {
             .with(|raw, _inner| raw.pending_submissions.fetch_sub(1, Ordering::Release));
 
         mod_dev_dbg!(self.dev, "OP end (pending: {})\n", val - 1);
+        // SAFETY: Pairs with the begin call in start_op(); callable from any context.
+        unsafe { kernel::bindings::apple_pmp_agx_activity_end() };
     }
 }

@@ -7,7 +7,7 @@
 #include <linux/unaligned.h>
 #include "dcp-m4-profile.h"
 
-/* J713 firmware 81BAF476-679D-3CC0-8C6A-E6B6FA659D5E only. */
+/* The 26.6.2 firmware's DCP protocol, the same on every M4 Mac. */
 #define DCP_M4_RPC_SIZE		0xc0000U
 #define DCP_M4_STREAM_SIZE	0x8000U
 #define DCP_M4_ALIGNMENT		64U
@@ -89,7 +89,8 @@ static inline int dcp_m4_decode_word(u64 word, struct dcp_m4_packet *packet)
 
 /*
  * External (DCPEXT) profile: incoming callbacks may use streams 0..3 and any
- * remote/bit-9 route; AP replies stay on stream 0 and carry routing only.
+ * remote/bit-9 route; AP replies come on stream 0 and carry routing only,
+ * except the reply to an out-of-band call, see dcp_m4_transaction_decode().
  */
 static inline int dcp_m4_decode_word_ext(u64 word, struct dcp_m4_packet *packet)
 {
@@ -120,15 +121,35 @@ static inline int dcp_m4_decode_word_ext(u64 word, struct dcp_m4_packet *packet)
 }
 
 /*
+ * While an AP call is outstanding on stream 1 (bit 10, the older contexts'
+ * out-of-band +4), its reply and callbacks come on stream 1 as well, besides
+ * any stream-0 traffic.
+ */
+static inline int dcp_m4_decode_word_oob(u64 word, struct dcp_m4_packet *packet)
+{
+	u8 stream = (word >> 10) & 3;
+	int ret;
+
+	if (!stream)
+		return dcp_m4_decode_word(word, packet);
+	if (stream != 1)
+		return -EPROTO;
+	ret = dcp_m4_decode_word(word & ~0x400ULL, packet);
+	if (!ret)
+		packet->stream = 1;
+	return ret;
+}
+
+/*
  * Replies require their pending request record, not a new packet location.
- * Only callbacks may name a nonzero stream (external profile); the internal
- * decoder never produces one.
+ * Callbacks may name a nonzero stream (external profile, or stream 1 during
+ * an out-of-band call); AP calls use stream 0, or stream 1 out of band.
  */
 static inline int dcp_m4_packet_offset(const struct dcp_m4_packet *packet, bool callback)
 {
 	unsigned int base;
 
-	if (packet->reply || (callback ? packet->stream >= 4 : packet->stream) ||
+	if (packet->reply || (callback ? packet->stream >= 4 : packet->stream > 1) ||
 	    (packet->callback_flag && (!callback || !packet->remote)) ||
 	    packet->offset % DCP_M4_ALIGNMENT ||
 	    packet->offset >= DCP_M4_STREAM_SIZE || packet->length < DCP_M4_PACKET_HEADER ||

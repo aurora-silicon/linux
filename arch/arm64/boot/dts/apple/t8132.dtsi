@@ -5,6 +5,7 @@
  * Copyright The Asahi Linux Contributors
  */
 
+#include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/interrupt-controller/apple-aic.h>
 #include <dt-bindings/interrupt-controller/irq.h>
 #include <dt-bindings/pinctrl/apple.h>
@@ -16,6 +17,11 @@
 
 	#address-cells = <2>;
 	#size-cells = <2>;
+
+	cpuidle: cpuidle {
+		compatible = "apple,t8132-cpuidle";
+		status = "disabled";
+	};
 
 	cpus {
 		#address-cells = <2>;
@@ -423,8 +429,6 @@
 		 * the same SoC description work across T8132 machines.
 		 */
 		ans_mbox: mbox@0 {
-			/* Enabled by the loader after all ADT resources are populated. */
-			status = "disabled";
 			compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
 			reg = <0x0 0x0 0x0 0x4000>;
 			interrupt-parent = <&aic>;
@@ -436,19 +440,19 @@
 				"recv-empty", "recv-not-empty";
 			#mbox-cells = <0>;
 			power-domains = <&ps_ans>;
+			/* Enabled by the loader after all ADT resources are populated. */
+			status = "disabled";
 		};
 
 		sart: iommu@10000 {
-			/* Enabled by the loader after all ADT resources are populated. */
-			status = "disabled";
 			compatible = "apple,t8132-sart", "apple,t6000-sart";
 			reg = <0x0 0x10000 0x0 0x10000>;
 			power-domains = <&ps_ans>;
+			/* Enabled by the loader after all ADT resources are populated. */
+			status = "disabled";
 		};
 
 		nvme: nvme@40000 {
-			/* Enabled by the loader after all ADT resources are populated. */
-			status = "disabled";
 			compatible = "apple,t8132-nvme-ans2",
 				     "apple,t8103-nvme-ans2";
 			reg = <0x0 0x40000 0x0 0x40000>,
@@ -462,14 +466,23 @@
 			power-domains = <&ps_ans>, <&ps_apcie_sys_st>;
 			power-domain-names = "ans", "apcie0";
 			resets = <&ps_ans>;
+			/* Enabled by the loader after all ADT resources are populated. */
+			status = "disabled";
 		};
 
 		pmgr: power-management@380700000 {
 			compatible = "apple,t8132-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
 			#address-cells = <1>;
 			#size-cells = <1>;
-			reg = <0x3 0x80700000 0 0x14000>;
+			/* Up to the display CPU's power-gate retention registers. */
+			reg = <0x3 0x80700000 0 0x26000>;
 			/* child nodes are added in t8132-pmgr.dtsi */
+		};
+
+		/* Clock protection slices guarding power states of DART domains. */
+		ps_prot: syscon@38079c000 {
+			compatible = "apple,t8132-ps-prot", "syscon";
+			reg = <0x3 0x8079c000 0 0x4000>;
 		};
 
 		aic: interrupt-controller@381000000 {
@@ -728,6 +741,44 @@
 			};
 		};
 
+		/*
+		 * The SEP DART's input aperture is the BIT(40) alias the DART
+		 * translates (ADT vm-base-0 0x10000004000).
+		 */
+		sep_dart: iommu@3a8c80000 {
+			compatible = "apple,t8132-dart", "apple,t8110-dart";
+			reg = <0x3 0xa8c80000 0x0 0x20000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 399 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
+			apple,dma-offset = /bits/ 64 <0x0>;
+			status = "disabled";
+		};
+
+		sep: sep@3aa600000 {
+			compatible = "apple,sep";
+			reg = <0x3 0xaa600000 0x0 0x88000>;
+			mboxes = <&sep_mbox>;
+			mbox-names = "mbox";
+			iommus = <&sep_dart 0>;
+			status = "disabled";
+		};
+
+		sep_mbox: mbox@3aa608000 {
+			compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x3 0xaa608000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 389 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 390 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 391 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 392 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+				"recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			status = "disabled";
+		};
+
 		i2c0: i2c@3ad010000 {
 			compatible = "apple,t8132-i2c", "apple,t8103-i2c";
 			reg = <0x3 0xad010000 0x0 0x4000>;
@@ -739,6 +790,7 @@
 			#address-cells = <0x1>;
 			#size-cells = <0x0>;
 			power-domains = <&ps_i2c0>;
+			resets = <&ps_i2c0>;
 
 			status = "disabled";
 		};
@@ -754,6 +806,7 @@
 			#address-cells = <0x1>;
 			#size-cells = <0x0>;
 			power-domains = <&ps_i2c1>;
+			resets = <&ps_i2c1>;
 
 			status = "disabled";
 		};
@@ -769,6 +822,7 @@
 			#address-cells = <0x1>;
 			#size-cells = <0x0>;
 			power-domains = <&ps_i2c2>;
+			resets = <&ps_i2c2>;
 
 			status = "disabled";
 		};
@@ -784,6 +838,7 @@
 			#address-cells = <0x1>;
 			#size-cells = <0x0>;
 			power-domains = <&ps_i2c3>;
+			resets = <&ps_i2c3>;
 
 			status = "disabled";
 		};
@@ -799,6 +854,7 @@
 			#address-cells = <0x1>;
 			#size-cells = <0x0>;
 			power-domains = <&ps_i2c4>;
+			resets = <&ps_i2c4>;
 
 			status = "disabled";
 		};
@@ -814,6 +870,26 @@
 		};
 
 		/* DockChannel UART: the DebugUSB console (ADT /arm-io/dockchannel-uart). */
+		spi2: spi@3ad108000 {
+			compatible = "apple,t8132-spi", "apple,t8103-spi";
+			reg = <0x3 0xad108000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1056 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>;
+			power-domains = <&ps_spi2>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+
+			mesa: fingerprint@0 {
+				compatible = "apple,mesa-fingerprint";
+				reg = <0>;
+				spi-max-frequency = <8000000>;
+				spi-cpol;
+				status = "disabled";
+			};
+		};
+
 		dockchannel_uart: serial@38812c000 {
 			compatible = "apple,dockchannel-uart";
 			reg = <0x3 0x8812c000 0x0 0x4000>,
@@ -850,11 +926,90 @@
 };
 
 #include "t8132-pmgr.dtsi"
+#include "t8132-usb4.dtsi"
+#include "t8132-pciec-tunables.dtsi"
 
 /* Shared controller resources; board files select the qualified devices. */
 &soc {
-	nub_spmi_a0: spmi@388908000 {
+	/*
+	 * AOP (always-on processor). iBoot loads its RTKit firmware and leaves
+	 * it halted; Linux starts it.
+	 */
+	aop: aop@390600000 {
+		compatible = "apple,t8132-aop";
+		reg = <0x3 0x90c00000 0x0 0x1e0000>,
+		      <0x3 0x90600000 0x0 0x88000>,
+		      <0x3 0x90050000 0x0 0x4000>,
+		      <0x3 0x882a8000 0x0 0x8>;
+		reg-names = "firmware", "asc", "asc-aux", "config";
+		mboxes = <&aop_mbox>;
+		mbox-names = "mbox";
+		iommus = <&aop_dart 0>;
 		status = "disabled";
+
+		/*
+		 * "dma" is the microphones' LEAP ADMAC channel (ADT audio-hp);
+		 * the speaker and jack channels follow the T6041 map.
+		 */
+		aop_audio: audio {
+			compatible = "apple,t8132-aop-audio", "apple,t6041-aop-audio",
+				     "apple,t6030-aop-audio";
+			dmas = <&admac0 1>;
+			dma-names = "dma";
+			#sound-dai-cells = <1>;
+		};
+	};
+
+	/* ADT lists the interrupts as 1, 0, 3, 2 of the block: send-empty is the lowest. */
+	aop_mbox: mailbox@390608000 {
+		compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x90608000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 433 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 434 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 435 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 436 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	aop_dart: iommu@390f00000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x3 0x90f00000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 457 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	/* The audio fabric's ADMACs: admac-leap-ns (DART stream 10) and admac-base-ns (stream 8) */
+	admac0: dma-controller@393300000 {
+		compatible = "apple,t8132-admac";
+		reg = <0x3 0x93300000 0x0 0x34000>;
+		#dma-cells = <1>;
+		dma-channels = <9>;
+		/* the ADT gives the first of the four outputs */
+		interrupts-extended = <&aic AIC_IRQ 478 IRQ_TYPE_LEVEL_HIGH>,
+				      <0>, <0>, <0>;
+		iommus = <&aop_dart 10>;
+		status = "disabled";
+	};
+
+	admac1: dma-controller@393800000 {
+		compatible = "apple,t8132-admac";
+		reg = <0x3 0x93800000 0x0 0x34000>;
+		#dma-cells = <1>;
+		dma-channels = <13>;
+		/* the ADT gives the first of the four outputs */
+		interrupts-extended = <&aic AIC_IRQ 475 IRQ_TYPE_LEVEL_HIGH>,
+				      <0>, <0>, <0>;
+		iommus = <&aop_dart 8>;
+		status = "disabled";
+	};
+
+	nub_spmi_a0: spmi@388908000 {
 		compatible = "apple,t8132-spmi", "apple,t8103-spmi";
 		reg = <0x3 0x88908000 0x0 0x4000>;
 		#address-cells = <2>;
@@ -863,6 +1018,7 @@
 		interrupt-controller;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 520 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
 
 
 
@@ -870,20 +1026,20 @@
 	};
 
 	pmp_dart: iommu@380300000 {
-		status = "disabled";
 		compatible = "apple,t8132-dart", "apple,t8110-dart";
 		reg = <0x3 0x80300000 0x0 0xc000>;
 		#iommu-cells = <1>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 881 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_pmp>;
+		status = "disabled";
 	};
 
 	pmp_report: pmp-report@3803c0000 {
-		status = "disabled";
 		compatible = "apple,t8132-pmp-v2-report";
 		reg = <0x3 0x803c0000 0x0 0x20000>;
 		power-domains = <&ps_pms_sram>;
+		status = "disabled";
 	};
 
 	pmp: pmp@380500000 {
@@ -900,7 +1056,6 @@
 	};
 
 	pmp_mbox: mailbox@380e08000 {
-		status = "disabled";
 		compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
 		reg = <0x3 0x80e08000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
@@ -912,10 +1067,10 @@
 				  "recv-empty", "recv-not-empty";
 		#mbox-cells = <0>;
 		power-domains = <&ps_pmp>, <&ps_pms_sram>;
+		status = "disabled";
 	};
 
 	atcphy0: phy@402a90000 {
-		status = "disabled";
 		compatible = "apple,t8132-atcphy";
 		reg = <0x4 0x02a90000 0x0 0x4000>,
 		      <0x4 0x02a84000 0x0 0x4000>;
@@ -926,32 +1081,44 @@
 		power-domains = <&ps_atc0_usb>;
 		orientation-switch;
 		mode-switch;
+		status = "disabled";
 
 
 	};
 
-	dwc3_0_dart_0: iommu@402f00000 {
+	/*
+	 * The ATC's display crossbar. Boards enable it with the external
+	 * display coprocessors whose Type-C routes use it.
+	 */
+	atc0_dpxbar: mux@40304c000 {
+		compatible = "apple,t8132-display-crossbar";
+		reg = <0x4 0x0304c000 0x0 0x4000>;
+		#mux-control-cells = <1>;
+		power-domains = <&ps_atc0_usb>;
 		status = "disabled";
+	};
+
+	dwc3_0_dart_0: iommu@402f00000 {
 		compatible = "apple,t8132-dart", "apple,t8110-dart";
 		reg = <0x4 0x02f00000 0x0 0xc000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1283 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		power-domains = <&ps_atc0_usb>;
+		status = "disabled";
 	};
 
 	dwc3_0_dart_1: iommu@402f80000 {
-		status = "disabled";
 		compatible = "apple,t8132-dart", "apple,t8110-dart";
 		reg = <0x4 0x02f80000 0x0 0xc000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1283 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		power-domains = <&ps_atc0_usb>;
+		status = "disabled";
 	};
 
 	dwc3_0: usb@402280000 {
-		status = "disabled";
 		compatible = "apple,t8132-dwc3";
 		reg = <0x4 0x02280000 0x0 0xcd00>,
 		      <0x4 0x0228cd00 0x0 0x3200>;
@@ -969,12 +1136,12 @@
 		resets = <&atcphy0>;
 		phys = <&atcphy0 PHY_TYPE_USB2>;
 		phy-names = "usb2-phy";
+		status = "disabled";
 
 
 	};
 
 	atcphy1: phy@40aa90000 {
-		status = "disabled";
 		compatible = "apple,t8132-atcphy";
 		reg = <0x4 0x0aa90000 0x0 0x4000>,
 		      <0x4 0x0aa84000 0x0 0x4000>;
@@ -985,32 +1152,44 @@
 		power-domains = <&ps_atc1_usb>;
 		orientation-switch;
 		mode-switch;
+		status = "disabled";
 
 
 	};
 
-	dwc3_1_dart_0: iommu@40af00000 {
+	/*
+	 * The ATC's display crossbar. Boards enable it with the external
+	 * display coprocessors whose Type-C routes use it.
+	 */
+	atc1_dpxbar: mux@40b04c000 {
+		compatible = "apple,t8132-display-crossbar";
+		reg = <0x4 0x0b04c000 0x0 0x4000>;
+		#mux-control-cells = <1>;
+		power-domains = <&ps_atc1_usb>;
 		status = "disabled";
+	};
+
+	dwc3_1_dart_0: iommu@40af00000 {
 		compatible = "apple,t8132-dart", "apple,t8110-dart";
 		reg = <0x4 0x0af00000 0x0 0xc000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1345 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		power-domains = <&ps_atc1_usb>;
+		status = "disabled";
 	};
 
 	dwc3_1_dart_1: iommu@40af80000 {
-		status = "disabled";
 		compatible = "apple,t8132-dart", "apple,t8110-dart";
 		reg = <0x4 0x0af80000 0x0 0xc000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1345 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		power-domains = <&ps_atc1_usb>;
+		status = "disabled";
 	};
 
 	dwc3_1: usb@40a280000 {
-		status = "disabled";
 		compatible = "apple,t8132-dwc3";
 		reg = <0x4 0x0a280000 0x0 0xcd00>,
 		      <0x4 0x0a28cd00 0x0 0x3200>;
@@ -1028,22 +1207,83 @@
 		resets = <&atcphy1>;
 		phys = <&atcphy1 PHY_TYPE_USB2>;
 		phy-names = "usb2-phy";
+		status = "disabled";
 
 
 	};
 
-	dart_apcie0: iommu@490000000 {
+	/*
+	 * ADT isp and dart-isp: three DART instances on one interrupt; streams 1,
+	 * 2, 3, 6, 7, 10 and 11 are remapped to stream 0. The first instance also
+	 * has the address filter registers.
+	 */
+	isp: isp@48c000000 {
+		compatible = "apple,t8132-isp", "apple,isp";
+		reg = <0x4 0x8c000000 0x0 0x1604000>,
+		      <0x4 0x8e924000 0x0 0x40>,
+		      <0x4 0x8e9241d0 0x0 0x20>,
+		      <0x4 0x8e924464 0x0 0x10>;
+		reg-names = "coproc", "mbox", "gpio", "mbox2";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 369 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&isp_dart0 0>, <&isp_dart1 0>, <&isp_dart2 0>;
+		power-domains = <&ps_isp_sys>, <&ps_isp_cpu>,
+				<&ps_isp_cpu_core0>, <&ps_isp_cpu_core1>,
+				<&ps_isp_fe>, <&ps_isp_dprx>, <&ps_isp_secure>,
+				<&ps_isp_sts0>, <&ps_isp_sts1>, <&ps_isp_pearl>,
+				<&ps_isp_be>, <&ps_isp_clr>, <&ps_isp_cvd>,
+				<&ps_isp_cvm>, <&ps_ispsens0>, <&ps_ispsens1>;
+		/* the DART's 0xe0000000 window above the firmware's 20 MiB */
+		apple,dart-vm-size = /bits/ 64 <0xdec00000>;
 		status = "disabled";
+	};
+
+	isp_dart0: iommu@48e8c0000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x4 0x8e8c0000 0x0 0xc000>,
+		      <0x4 0x8e8d0000 0x0 0x4000>;
+		reg-names = "dart", "dapf";
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 387 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_isp_sys>;
+		apple,remap-streams = <1 0>, <2 0>, <3 0>, <6 0>, <7 0>, <10 0>, <11 0>;
+		status = "disabled";
+	};
+
+	isp_dart1: iommu@48e8e0000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x4 0x8e8e0000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 387 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_isp_sys>;
+		apple,remap-streams = <1 0>, <2 0>, <3 0>, <6 0>, <7 0>, <10 0>, <11 0>;
+		status = "disabled";
+	};
+
+	isp_dart2: iommu@48e900000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x4 0x8e900000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 387 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_isp_sys>;
+		apple,remap-streams = <1 0>, <2 0>, <3 0>, <6 0>, <7 0>, <10 0>, <11 0>;
+		status = "disabled";
+	};
+
+	dart_apcie0: iommu@490000000 {
 		compatible = "apple,t8132-dart", "apple,t8110-dart";
 		reg = <0x4 0x90000000 0x0 0x20000>;
 		/* J713 ADT /arm-io/dart-apcie0, interrupt-parent AIC. */
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1232 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		status = "disabled";
 	};
 
 	pcie0: pcie@1cb0000000 {
-		status = "disabled";
 		compatible = "apple,t8132-pcie";
 		device_type = "pci";
 
@@ -1070,6 +1310,7 @@
 			  0xb 0xc0000000 0x0 0x20000000>,
 			 <0x02000000 0x0 0x80000000
 			  0xb 0x80000000 0x0 0x40000000>;
+		status = "disabled";
 
 		port00: pci@0,0 {
 			device_type = "pci";
@@ -1094,3 +1335,16 @@
 };
 
 #include "t8132-memory.dtsi"
+
+#include "t8132-peripherals.dtsi"
+
+#include "t8132-peripheral-buses.dtsi"
+
+#include "t8132-error-handlers.dtsi"
+
+#include "t8132-sio.dtsi"
+
+#include "t8132-avd.dtsi"
+#include "t8132-gpu.dtsi"
+#include "t8132-dcp.dtsi"
+#include "t8132-dcpext.dtsi"

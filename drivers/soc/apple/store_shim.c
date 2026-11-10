@@ -50,9 +50,7 @@ static struct file *open_as_kernel(const char *path, int flags, umode_t mode)
 /* Opens the store, creating if absent. Mode 0600: the file is the driver's own. */
 void *sep_store_open(const char *path)
 {
-	struct file *f = open_as_kernel(path, O_RDWR | O_CREAT | O_LARGEFILE, 0600);
-
-	return IS_ERR(f) ? NULL : f;
+	return open_as_kernel(path, O_RDWR | O_CREAT | O_LARGEFILE, 0600);
 }
 
 /*
@@ -78,20 +76,24 @@ void *sep_store_open_host(const char *path, bool *created)
  */
 void *sep_store_open_trunc(const char *path)
 {
-	struct file *f = open_as_kernel(path, O_RDWR | O_CREAT | O_TRUNC | O_LARGEFILE, 0600);
+	return open_as_kernel(path, O_RDWR | O_CREAT | O_TRUNC | O_LARGEFILE, 0600);
+}
+
+/* Admission check only: never create or truncate an existing record. */
+void *sep_store_open_writable_existing(const char *path)
+{
+	struct file *f = open_as_kernel(path, O_WRONLY | O_LARGEFILE, 0);
 
 	return IS_ERR(f) ? NULL : f;
 }
 
 /*
- * Opens an existing file read-only, NULL if absent. O_RDONLY and no O_CREAT so
- * the seed cannot be created, truncated or written by mistake.
+ * Opens an existing file read-only, returning an error pointer on failure.
+ * O_RDONLY and no O_CREAT: the seed cannot be created, truncated or written.
  */
 void *sep_store_open_ro(const char *path)
 {
-	struct file *f = open_as_kernel(path, O_RDONLY | O_LARGEFILE, 0);
-
-	return IS_ERR(f) ? NULL : f;
+	return open_as_kernel(path, O_RDONLY | O_LARGEFILE, 0);
 }
 
 void *sep_store_open_block(const char *path, int writable)

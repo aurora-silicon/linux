@@ -74,6 +74,7 @@
 			operating-points-v2 = <&sawtooth_opp>;
 			capacity-dmips-mhz = <804>;
 			performance-domains = <&cpufreq_e>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_e1: cpu@1 {
@@ -88,6 +89,7 @@
 			operating-points-v2 = <&sawtooth_opp>;
 			capacity-dmips-mhz = <804>;
 			performance-domains = <&cpufreq_e>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_e2: cpu@2 {
@@ -102,6 +104,7 @@
 			operating-points-v2 = <&sawtooth_opp>;
 			capacity-dmips-mhz = <804>;
 			performance-domains = <&cpufreq_e>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_e3: cpu@3 {
@@ -116,6 +119,7 @@
 			operating-points-v2 = <&sawtooth_opp>;
 			capacity-dmips-mhz = <804>;
 			performance-domains = <&cpufreq_e>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p0: cpu@10100 {
@@ -130,6 +134,7 @@
 			operating-points-v2 = <&everest_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p1: cpu@10101 {
@@ -144,6 +149,7 @@
 			operating-points-v2 = <&everest_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p2: cpu@10102 {
@@ -158,6 +164,7 @@
 			operating-points-v2 = <&everest_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p3: cpu@10103 {
@@ -172,6 +179,7 @@
 			operating-points-v2 = <&everest_opp>;
 			capacity-dmips-mhz = <1024>;
 			performance-domains = <&cpufreq_p>;
+			#cooling-cells = <2>;
 		};
 
 		l2_cache_0: l2-cache-0 {
@@ -189,6 +197,10 @@
 		};
 	};
 
+	/*
+	 * opp-microwatt: one busy CPU's power, fitted to J613 measurements.
+	 * Above 3288 MHz the hardware caps P power; those are extrapolated.
+	 */
 	sawtooth_opp: opp-table-0 {
 		compatible = "operating-points-v2";
 		opp-shared;
@@ -197,36 +209,43 @@
 			opp-hz = /bits/ 64 <744000000>;
 			opp-level = <1>;
 			clock-latency-ns = <7800>;
+			opp-microwatt = <33600>;
 		};
 		opp02 {
 			opp-hz = /bits/ 64 <1044000000>;
 			opp-level = <2>;
 			clock-latency-ns = <19400>;
+			opp-microwatt = <62800>;
 		};
 		opp03 {
 			opp-hz = /bits/ 64 <1476000000>;
 			opp-level = <3>;
 			clock-latency-ns = <24800>;
+			opp-microwatt = <118800>;
 		};
 		opp04 {
 			opp-hz = /bits/ 64 <2004000000>;
 			opp-level = <4>;
 			clock-latency-ns = <43600>;
+			opp-microwatt = <208700>;
 		};
 		opp05 {
 			opp-hz = /bits/ 64 <2268000000>;
 			opp-level = <5>;
 			clock-latency-ns = <49200>;
+			opp-microwatt = <262100>;
 		};
 		opp06 {
 			opp-hz = /bits/ 64 <2556000000>;
 			opp-level = <6>;
 			clock-latency-ns = <53400>;
+			opp-microwatt = <326700>;
 		};
 		opp07 {
 			opp-hz = /bits/ 64 <2748000000>;
 			opp-level = <7>;
 			clock-latency-ns = <56800>;
+			opp-microwatt = <373300>;
 		};
 	};
 
@@ -238,101 +257,121 @@
 			opp-hz = /bits/ 64 <696000000>;
 			opp-level = <1>;
 			clock-latency-ns = <9400>;
+			opp-microwatt = <154600>;
 		};
 		opp02 {
 			opp-hz = /bits/ 64 <1092000000>;
 			opp-level = <2>;
 			clock-latency-ns = <19800>;
+			opp-microwatt = <244800>;
 		};
 		opp03 {
 			opp-hz = /bits/ 64 <1356000000>;
 			opp-level = <3>;
 			clock-latency-ns = <23700>;
+			opp-microwatt = <329200>;
 		};
 		opp04 {
 			opp-hz = /bits/ 64 <1596000000>;
 			opp-level = <4>;
 			clock-latency-ns = <25000>;
+			opp-microwatt = <425000>;
 		};
 		opp05 {
 			opp-hz = /bits/ 64 <1884000000>;
 			opp-level = <5>;
 			clock-latency-ns = <28200>;
+			opp-microwatt = <567000>;
 		};
 		opp06 {
 			opp-hz = /bits/ 64 <2172000000>;
 			opp-level = <6>;
 			clock-latency-ns = <32300>;
+			opp-microwatt = <742700>;
 		};
 		opp07 {
 			opp-hz = /bits/ 64 <2424000000>;
 			opp-level = <7>;
 			clock-latency-ns = <35600>;
+			opp-microwatt = <928000>;
 		};
 		opp08 {
 			opp-hz = /bits/ 64 <2616000000>;
 			opp-level = <8>;
 			clock-latency-ns = <38200>;
+			opp-microwatt = <1091300>;
 		};
 		opp09 {
 			opp-hz = /bits/ 64 <2808000000>;
 			opp-level = <9>;
 			clock-latency-ns = <39700>;
+			opp-microwatt = <1275600>;
 		};
 		opp10 {
 			opp-hz = /bits/ 64 <2988000000>;
 			opp-level = <10>;
 			clock-latency-ns = <41700>;
+			opp-microwatt = <1469000>;
 		};
 		opp11 {
 			opp-hz = /bits/ 64 <3144000000>;
 			opp-level = <11>;
 			clock-latency-ns = <43700>;
+			opp-microwatt = <1654100>;
 		};
 		opp12 {
 			opp-hz = /bits/ 64 <3288000000>;
 			opp-level = <12>;
 			clock-latency-ns = <45000>;
+			opp-microwatt = <1840200>;
 		};
 		opp13 {
 			opp-hz = /bits/ 64 <3420000000>;
 			opp-level = <13>;
 			clock-latency-ns = <48700>;
+			opp-microwatt = <2024500>;
 		};
 		opp14 {
 			opp-hz = /bits/ 64 <3540000000>;
 			opp-level = <14>;
 			clock-latency-ns = <55700>;
+			opp-microwatt = <2204000>;
 		};
 		opp15 {
 			opp-hz = /bits/ 64 <3636000000>;
 			opp-level = <15>;
 			clock-latency-ns = <55900>;
+			opp-microwatt = <2356100>;
 		};
 		opp16 {
 			opp-hz = /bits/ 64 <3720000000>;
 			opp-level = <16>;
 			clock-latency-ns = <55900>;
+			opp-microwatt = <2495800>;
 		};
 		opp17 {
 			opp-hz = /bits/ 64 <3780000000>;
 			opp-level = <17>;
 			clock-latency-ns = <56000>;
+			opp-microwatt = <2599300>;
 		};
 		opp18 {
 			opp-hz = /bits/ 64 <3864000000>;
 			opp-level = <18>;
 			clock-latency-ns = <56000>;
+			opp-microwatt = <2749900>;
 		};
 		opp19 {
 			opp-hz = /bits/ 64 <3960000000>;
 			opp-level = <19>;
 			clock-latency-ns = <61800>;
+			opp-microwatt = <2930000>;
 		};
 		opp20 {
 			opp-hz = /bits/ 64 <4056000000>;
 			opp-level = <20>;
 			clock-latency-ns = <61900>;
+			opp-microwatt = <3119000>;
 		};
 	};
 
@@ -370,7 +409,7 @@
 		clock-output-names = "nco_ref";
 	};
 
-	soc {
+	soc: soc {
 		compatible = "simple-bus";
 		#address-cells = <2>;
 		#size-cells = <2>;
@@ -495,12 +534,7 @@
 			power-domains = <&ps_avd_sys>;
 		};
 
-		/*
-		 * iBoot hands over a running SEP. Keep Linux off its DART at boot;
-		 * apple_sep enables it at module initialization. The SEP only
-		 * accepts IOVAs in this window, which carries the BIT(40) alias
-		 * the DART translates (ADT vm-base 0x10000004000).
-		 */
+		/* apple_sep enables it; the SEP only takes IOVAs in this window. */
 		sep_dart: iommu@29cac0000 {
 			compatible = "apple,t8122-dart", "apple,t8110-dart";
 			reg = <0x2 0x9cac0000 0x0 0x4000>;
@@ -557,12 +591,7 @@
 			status = "disabled";
 		};
 
-		/*
-		 * Touch ID. iBoot leaves the pads muxed and the controller uses
-		 * its native chip select, so there is no pinctrl here. The
-		 * 200 MHz parent is spi1's on this SoC, and the one the J613
-		 * sensor was enrolled and matched with.
-		 */
+		/* Touch ID: pads muxed by iBoot, native chip select, 200 MHz. */
 		spi2: spi@2a1108000 {
 			compatible = "apple,t8122-spi", "apple,t8103-spi";
 			reg = <0x2 0xa1108000 0x0 0x4000>;
@@ -1085,6 +1114,46 @@
 
 			smc_hwmon: hwmon {
 				compatible = "apple,smc-hwmon";
+				#thermal-sensor-cells = <1>;
+				/*
+				 * No Tf keys on M3: the six hottest GPU keys (about 0 C
+				 * while the GPU is off), then the CPU die keys.
+				 */
+				apple,soc-die-keys = "Tg0D", "Tg0P", "Tg0X", "Tg0b",
+						     "Tg0j", "Tg0v", "Te05", "Te0P",
+						     "Tp05", "Tp0L", "Tp0b", "Tp0r";
+				apple,thermal-pressure-key = "mTPL";
+
+				/* CPU die temperatures, first: thermal zones index them. */
+				temperature-Te05 {
+					apple,key-id = "Te05";
+					label = "E-cluster Temperature 1";
+				};
+
+				temperature-Te0P {
+					apple,key-id = "Te0P";
+					label = "E-cluster Temperature 2";
+				};
+
+				temperature-Tp05 {
+					apple,key-id = "Tp05";
+					label = "P-core 0 Temperature";
+				};
+
+				temperature-Tp0L {
+					apple,key-id = "Tp0L";
+					label = "P-core 1 Temperature";
+				};
+
+				temperature-Tp0b {
+					apple,key-id = "Tp0b";
+					label = "P-core 2 Temperature";
+				};
+
+				temperature-Tp0r {
+					apple,key-id = "Tp0r";
+					label = "P-core 3 Temperature";
+				};
 			};
 
 			smc_reboot: reboot {
@@ -1786,12 +1855,7 @@
 			};
 		};
 
-		/*
-		 * The J613 ADT has atc0-dpxbar and atc1-dpxbar with compatible
-		 * "atc-dpxbar,t602x", so these use the T6020 programming
-		 * model. The display gate enables them together with the
-		 * dcpext whose Type-C routes use them.
-		 */
+		/* ADT atc-dpxbar,t602x; the gate enables them with dcpext. */
 		atcphy0_xbar: mux@70304c000 {
 			compatible = "apple,t8122-display-crossbar",
 				     "apple,t6020-display-crossbar";
@@ -1868,3 +1932,11 @@
 #include "t8122-pmgr.dtsi"
 #include "t8122-gpu.dtsi"
 #include "t8122-dcp.dtsi"
+
+#include "t8122-peripherals.dtsi"
+
+#include "t8122-peripheral-buses.dtsi"
+
+#include "t8122-coprocessors.dtsi"
+
+#include "t8122-misc-interfaces.dtsi"

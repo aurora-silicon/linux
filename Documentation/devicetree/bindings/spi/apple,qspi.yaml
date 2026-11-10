@@ -19,11 +19,24 @@ allOf:
 
 properties:
   compatible:
-    enum:
-      - apple,t8122-qspi
-      - apple,t8132-qspi
-      - apple,t6041-qspi
-      - apple,t8140-qspi
+    oneOf:
+      - enum:
+          - apple,t8122-qspi
+          - apple,t8132-qspi
+          - apple,t6041-qspi
+          - apple,t8140-qspi
+      - items:
+          - enum:
+              - apple,t6030-qspi
+              - apple,t6031-qspi
+              - apple,t8122-qspi
+          - const: apple,qspi
+      - items:
+          - enum:
+              - apple,t6050-qspi
+              - apple,t8142-qspi
+              - apple,t8152-qspi
+          - const: apple,t8140-qspi
 
   reg:
     maxItems: 1

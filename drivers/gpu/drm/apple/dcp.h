@@ -76,6 +76,7 @@ int dcp_start(struct platform_device *pdev);
 int dcp_activate(struct platform_device *pdev);
 int dcp_wait_ready(struct platform_device *pdev, u64 timeout);
 void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit);
+bool dcp_hdr_metadata_live(struct platform_device *pdev);
 void dcp_retain_framebuffer(struct platform_device *pdev,
 			    struct dcp_fb_reference *entry);
 void dcp_arm_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id);
@@ -87,6 +88,8 @@ void apple_crtc_vblank(struct apple_crtc *apple);
 void dcp_drm_crtc_vblank(struct apple_crtc *crtc);
 void dcp_drm_crtc_error(struct apple_crtc *crtc,
 			struct drm_crtc_state *state, int error);
+void dcp_drm_crtc_flip_lost(struct apple_crtc *crtc,
+			    struct completion *flip_done, int error);
 int dcp_get_modes(struct drm_connector *connector);
 enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 				    const struct drm_display_mode *mode);
