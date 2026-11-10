@@ -198,6 +198,7 @@
 #include <linux/export.h>
 #include <linux/file.h>
 #include <linux/fs.h>
+#include <linux/moduleparam.h>
 #include <linux/sched/signal.h>
 #include <linux/sync_file.h>
 #include <linux/uaccess.h>
@@ -212,6 +213,12 @@
 
 #include "drm_internal.h"
 
+static bool syncobj_timeline_direct_wait;
+module_param_named(syncobj_timeline_direct_wait,
+		   syncobj_timeline_direct_wait, bool, 0644);
+MODULE_PARM_DESC(syncobj_timeline_direct_wait,
+		 "Wait on a timeline point's contained fence when all older points are complete");
+
 struct syncobj_wait_entry {
 	struct list_head node;
 	struct task_struct *task;
@@ -222,6 +229,43 @@ struct syncobj_wait_entry {
 
 static void syncobj_wait_syncobj_func(struct drm_syncobj *syncobj,
 				      struct syncobj_wait_entry *wait);
+
+/*
+ * A chain node is the conjunction of its contained fence and its predecessor.
+ * Once the predecessor is signaled it remains so, making the contained fence
+ * an equivalent wait target. Waiting on it directly avoids the chain's
+ * irq_work propagation without changing the timeline stored in the syncobj.
+ */
+static struct dma_fence *drm_syncobj_direct_wait_fence(struct dma_fence *fence)
+{
+	struct dma_fence_chain *chain;
+	struct dma_fence *contained, *prev;
+
+	if (!syncobj_timeline_direct_wait || !fence)
+		return fence;
+
+	chain = to_dma_fence_chain(fence);
+	if (!chain)
+		return fence;
+
+	rcu_read_lock();
+	prev = dma_fence_get_rcu_safe(&chain->prev);
+	rcu_read_unlock();
+	/*
+	 * The core bit is monotonic and avoids polling another fence while the
+	 * syncobj spinlock may be held. A logically complete but not yet signaled
+	 * predecessor merely keeps the conservative chain wait.
+	 */
+	if (prev && !test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &prev->flags)) {
+		dma_fence_put(prev);
+		return fence;
+	}
+	dma_fence_put(prev);
+
+	contained = dma_fence_get(chain->fence);
+	dma_fence_put(fence);
+	return contained;
+}
 
 struct syncobj_eventfd_entry {
 	struct list_head node;
@@ -283,7 +327,7 @@ static void drm_syncobj_fence_add_wait(struct drm_syncobj *syncobj,
 	} else if (!fence) {
 		wait->fence = dma_fence_get_stub();
 	} else {
-		wait->fence = fence;
+		wait->fence = drm_syncobj_direct_wait_fence(fence);
 	}
 	spin_unlock(&syncobj->lock);
 }
@@ -471,6 +515,8 @@ int drm_syncobj_find_fence(struct drm_file *file_private,
 			 */
 			if (!*fence)
 				*fence = dma_fence_get_stub();
+			else
+				*fence = drm_syncobj_direct_wait_fence(*fence);
 
 			goto out;
 		}
@@ -1025,7 +1071,7 @@ static void syncobj_wait_syncobj_func(struct drm_syncobj *syncobj,
 	} else if (!fence) {
 		wait->fence = dma_fence_get_stub();
 	} else {
-		wait->fence = fence;
+		wait->fence = drm_syncobj_direct_wait_fence(fence);
 	}
 
 	wake_up_process(wait->task);
@@ -1131,7 +1177,7 @@ static signed long drm_syncobj_array_wait_timeout(struct drm_syncobj **syncobjs,
 		}
 
 		if (fence)
-			entries[i].fence = fence;
+			entries[i].fence = drm_syncobj_direct_wait_fence(fence);
 		else
 			entries[i].fence = dma_fence_get_stub();
 
@@ -1490,6 +1536,8 @@ syncobj_eventfd_entry_func(struct drm_syncobj *syncobj,
 		 * so that the eventfd still gets signaled below.
 		 */
 		fence = dma_fence_get_stub();
+	} else {
+		fence = drm_syncobj_direct_wait_fence(fence);
 	}
 
 	list_del_init(&entry->node);
