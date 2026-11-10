@@ -376,7 +376,12 @@ static const struct irq_chip apple_gpio_irqchip = {
 	.irq_mask		= apple_gpio_irq_mask,
 	.irq_unmask		= apple_gpio_irq_unmask,
 	.irq_set_type		= apple_gpio_irq_set_type,
-	.flags			= IRQCHIP_IMMUTABLE,
+	/*
+	 * The group interrupts are chained handlers on the AIC, which
+	 * the PM core never disables across system sleep, so a pin
+	 * interrupt only has to be marked as a wakeup source here.
+	 */
+	.flags			= IRQCHIP_IMMUTABLE | IRQCHIP_SKIP_SET_WAKE,
 	GPIOCHIP_IRQ_RESOURCE_HELPERS,
 };
 
