@@ -31,6 +31,7 @@ typedef uint64_t u64;
 #define BIT(n) (1UL << (n))
 #define BIT_ULL(n) (1ULL << (n))
 #define GENMASK_ULL(h, l) ((~0ULL >> (63 - (h))) & (~0ULL << (l)))
+#define FIELD_PREP(mask, val) (((u64)(val) << __builtin_ctzll(mask)) & (mask))
 #define GFP_KERNEL 0
 static inline unsigned int __ffs64(u64 n) { assert(n); return __builtin_ctzll(n); }
 static inline u32 get_unaligned_le32(const void *p)

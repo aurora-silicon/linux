@@ -25,6 +25,7 @@
 #include <linux/seq_file.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/pmp.h>
 #include <linux/soc/apple/pmp-report.h>
 #include <linux/soc/apple/t8132.h>
 #include <linux/string.h>
@@ -98,6 +99,13 @@ struct apple_pmp_report_offsets {
 
 struct apple_pmp_start;
 
+struct apple_pmp_t8112_constraint {
+	u8 dcs;
+	u8 soc;
+};
+
+#define PMP_T8112_CONSTRAINT_TARGET_COUNT 3
+
 struct apple_pmp_report {
 	struct device *dev;
 	struct apple_pmp_dram dram;
@@ -123,6 +131,9 @@ struct apple_pmp_report {
 	u64 dvfs_ready_achieved_word;
 	bool dvfs_ready_prime_sent;
 	bool dvfs_ready;
+	struct apple_pmp_t8112_constraint
+		t8112_constraints[PMP_T8112_CONSTRAINT_TARGET_COUNT]
+				 [APPLE_PMP_T8112_CONSTRAINT_SOURCE_COUNT];
 	/* Requests are held in memory until the PMP runs (@defer_requests). */
 	bool defer;
 	unsigned int polls;
@@ -2049,6 +2060,101 @@ static void apple_pmp_report_dvfs_write(struct apple_pmp_report *rep, u32 entry,
 	rep->dvfs_known |= BIT_ULL(index);
 	spin_unlock_irqrestore(&rep->lock, flags);
 }
+
+static int apple_pmp_t8112_constraint_target(unsigned int entry)
+{
+	switch (entry) {
+	case APPLE_PMP_T8112_DVFS_ENTRY(APPLE_PMP_T8112_EACC0):
+		return 0;
+	case APPLE_PMP_T8112_DVFS_ENTRY(APPLE_PMP_T8112_PACC0):
+		return 1;
+	case APPLE_PMP_T8112_DVFS_ENTRY(APPLE_PMP_T8112_ANE0):
+		return 2;
+	default:
+		return -EINVAL;
+	}
+}
+
+static struct apple_pmp_t8112_constraint
+apple_pmp_t8112_constraint_aggregate(const struct apple_pmp_t8112_constraint
+		votes[APPLE_PMP_T8112_CONSTRAINT_SOURCE_COUNT])
+{
+	struct apple_pmp_t8112_constraint aggregate = {};
+	unsigned int source;
+
+	for (source = 0; source < APPLE_PMP_T8112_CONSTRAINT_SOURCE_COUNT; source++) {
+		aggregate.dcs = max(aggregate.dcs, votes[source].dcs);
+		aggregate.soc = max(aggregate.soc, votes[source].soc);
+	}
+	return aggregate;
+}
+
+/**
+ * apple_pmp_t8112_set_constraint() - publish one T8112 constraint source
+ * @report_np: PMP report provider
+ * @entry: EACC0 (0xa8), PACC0 (0xa9), or ANE0 (0xab)
+ * @source: independent Linux request source
+ * @dcs: DCS state, 0 to 4
+ * @soc: SoC state, 0 to 2
+ *
+ * Source requests are max-aggregated per target. The provider then performs
+ * one whole-word store to the target's SOC-DEV-DVFS update entry. SOC domain
+ * 0 occupies the default field at bits 4:0; DCS domain 2 occupies request
+ * class 0x21 at bits 35:32. A stopped PMP or an unready DVFS range receives
+ * no target store. This function may wait for the entry-8 ready report and
+ * therefore must not be called from cpufreq fast-switch context.
+ */
+int apple_pmp_t8112_set_constraint(const struct device_node *report_np, unsigned int entry,
+				   enum apple_pmp_t8112_constraint_source source,
+				   unsigned int dcs, unsigned int soc)
+{
+	struct apple_pmp_t8112_constraint aggregate;
+	struct apple_pmp_report *rep;
+	unsigned long flags;
+	unsigned int index;
+	u64 word;
+	int target, ret = -EPROBE_DEFER;
+
+	target = apple_pmp_t8112_constraint_target(entry);
+	if (!report_np || target < 0 || source >= APPLE_PMP_T8112_CONSTRAINT_SOURCE_COUNT ||
+	    !apple_pmp_t8112_constraint_word(dcs, soc, &word))
+		return -EINVAL;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
+		if (rep->dev->of_node != report_np)
+			continue;
+		if (rep->offsets != &apple_pmp_offsets_t8112) {
+			ret = -EOPNOTSUPP;
+			break;
+		}
+		if (READ_ONCE(rep->defer) || !apple_pmp_report_running(rep)) {
+			ret = -EAGAIN;
+			break;
+		}
+		ret = apple_pmp_report_dvfs_prepare(rep);
+		if (ret)
+			break;
+
+		index = entry - rep->offsets->dvfs_first;
+		spin_lock_irqsave(&rep->lock, flags);
+		rep->t8112_constraints[target][source].dcs = dcs;
+		rep->t8112_constraints[target][source].soc = soc;
+		aggregate = apple_pmp_t8112_constraint_aggregate(rep->t8112_constraints[target]);
+		apple_pmp_t8112_constraint_word(aggregate.dcs, aggregate.soc, &word);
+		if (!(rep->dvfs_known & BIT_ULL(index)) || rep->dvfs_words[index] != word) {
+			rep->dvfs_words[index] = word;
+			writeq(word, rep->base + rep->offsets->update + 8 * entry);
+			rep->dvfs_known |= BIT_ULL(index);
+		}
+		spin_unlock_irqrestore(&rep->lock, flags);
+		ret = 0;
+		break;
+	}
+	rcu_read_unlock();
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_t8112_set_constraint);
 
 /**
  * apple_pmp_report_set_request() - set or clear one bit of the PMP power request word of a bound report

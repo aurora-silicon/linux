@@ -222,7 +222,7 @@ struct apple_soc_cpufreq_info {
 struct apple_cpu_priv {
 	struct apple_fast_die *fast_die;
 	struct device_node *pmp_report;
-	unsigned int pmp_device;
+	unsigned int pmp_entry;
 	unsigned int pmp_max_freq;
 	atomic_t pmp_vote;
 	bool pmp_stale;
@@ -401,10 +401,10 @@ static u32 apple_soc_cpufreq_timeout(const struct apple_soc_cpufreq_info *info)
 }
 
 /*
- * T8112 CLPC presents memory and fabric constraints as classed lanes in the
- * cluster's SOC-DEV-DVFS word. Linux uses the cpufreq request as its demand
- * signal: the lowest quartile releases both floors, and the upper quartiles
- * rise conservatively to the qualified DCS 4 / SoC 2 maxima.
+ * T8112 CLPC presents memory and fabric constraints in one SOC-DEV-DVFS word:
+ * SoC in the default lane and DCS in request class 0x21. Linux uses the
+ * cpufreq request as its demand signal: the lowest quartile releases both
+ * floors, and the upper quartiles rise conservatively to DCS 4 / SoC 2.
  */
 #define APPLE_PMP_VOTE_DCS	GENMASK(2, 0)
 #define APPLE_PMP_VOTE_SOC	GENMASK(9, 8)
@@ -415,9 +415,10 @@ static void apple_soc_cpufreq_pmp_work(struct work_struct *work)
 	int vote = atomic_read(&priv->pmp_vote);
 	int ret;
 
-	ret = apple_pmp_set_device_constraint(priv->pmp_device,
-					      FIELD_GET(APPLE_PMP_VOTE_DCS, vote),
-					      FIELD_GET(APPLE_PMP_VOTE_SOC, vote));
+	ret = apple_pmp_t8112_set_constraint(priv->pmp_report, priv->pmp_entry,
+					     APPLE_PMP_T8112_CONSTRAINT_CPU,
+					     FIELD_GET(APPLE_PMP_VOTE_DCS, vote),
+					     FIELD_GET(APPLE_PMP_VOTE_SOC, vote));
 	if (ret == -ENODEV || ret == -EPROBE_DEFER || ret == -EAGAIN) {
 		/* The PMP is not up yet: retry at most once a second. */
 		WRITE_ONCE(priv->pmp_retry_at, jiffies + HZ);
@@ -428,7 +429,7 @@ static void apple_soc_cpufreq_pmp_work(struct work_struct *work)
 	if (ret) {
 		/* A rejected or lost command stops the votes for this policy. */
 		WRITE_ONCE(priv->pmp_disabled, true);
-		dev_warn(priv->cpu_dev, "PMP memory/fabric command failed: %d; votes stopped\n",
+		dev_warn(priv->cpu_dev, "PMP memory/fabric publication failed: %d; votes stopped\n",
 			 ret);
 		return;
 	}
@@ -464,7 +465,7 @@ static void apple_soc_cpufreq_pmp_vote(struct apple_cpu_priv *priv,
 		(unsigned int)ARRAY_SIZE(dcs) - 1);
 	vote = FIELD_PREP(APPLE_PMP_VOTE_DCS, dcs[q]) |
 	       FIELD_PREP(APPLE_PMP_VOTE_SOC, soc[q]);
-	/* Firmware commands sleep for their reply; fast-switch only queues work. */
+	/* PTD readiness may poll; fast-switch only queues the irq_work hop. */
 	if (atomic_xchg(&priv->pmp_vote, vote) != vote ||
 	    (READ_ONCE(priv->pmp_stale) && time_after(jiffies, READ_ONCE(priv->pmp_retry_at))))
 		irq_work_queue(&priv->pmp_irq_work);
@@ -1453,8 +1454,7 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 			goto out_iounmap;
 		}
 		priv->pmp_report = pmp_args.np;
-		/* The DT names the cluster by its DVFS entry; commands use the ID. */
-		priv->pmp_device = pmp_args.args[0] - APPLE_PMP_T8112_DVFS_BASE;
+		priv->pmp_entry = pmp_args.args[0];
 	} else if (ret != -ENOENT) {
 		goto out_iounmap;
 	}
@@ -1625,7 +1625,8 @@ static void apple_soc_cpufreq_exit(struct cpufreq_policy *policy)
 		atomic_set(&priv->pmp_vote, 0);
 		irq_work_sync(&priv->pmp_irq_work);
 		cancel_work_sync(&priv->pmp_work);
-		apple_pmp_set_device_constraint(priv->pmp_device, 0, 0);
+		apple_pmp_t8112_set_constraint(priv->pmp_report, priv->pmp_entry,
+					       APPLE_PMP_T8112_CONSTRAINT_CPU, 0, 0);
 		of_node_put(priv->pmp_report);
 	}
 	iounmap(priv->reg_base);

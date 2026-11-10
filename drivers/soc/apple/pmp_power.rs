@@ -7,12 +7,6 @@ pub(crate) const SHIFT: u32 = 44;
 /// Device-power requests put the target and requested state below the opcode.
 pub(crate) const POWER_DEVICE_SHIFT: u32 = 40;
 pub(crate) const POWER_STATE_SHIFT: u32 = 32;
-/// T8112 constraint requests put the performance domain before the target.
-pub(crate) const CONSTRAINT_DOMAIN_SHIFT: u32 = 40;
-pub(crate) const CONSTRAINT_DEVICE_SHIFT: u32 = 32;
-pub(crate) const CONSTRAINT_LEVEL_SHIFT: u32 = 16;
-/// T8112 device-constraint request; its command-complete reply is opcode 0x10.
-pub(crate) const DEVICE_CONSTRAINT: u8 = 0x0f;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum Command {
@@ -57,22 +51,20 @@ mod tests {
     }
 
     #[test]
-    fn device_constraint_reply_echoes_domain_and_target() {
+    fn nonzero_reply_payload_must_match_exactly() {
         let mut state = Command::Idle;
-        // EACC0 (SOC-device 3), DCS domain (2): the reply echoes both fields.
-        let payload = (2u64 << CONSTRAINT_DOMAIN_SHIFT) | (3u64 << CONSTRAINT_DEVICE_SHIFT);
-        assert!(state.begin(DEVICE_CONSTRAINT, payload));
-        state.reply(MARKER | ((u64::from(DEVICE_CONSTRAINT) + 1) << SHIFT) | payload);
+        let payload = 1;
+        assert!(state.begin(0x0f, payload));
+        state.reply(MARKER | (0x10 << SHIFT) | payload);
         assert_eq!(state, Command::Complete);
     }
 
     #[test]
-    fn zero_target_command_complete_cannot_complete_a_constraint() {
+    fn zero_payload_completion_cannot_complete_a_tagged_request() {
         let mut state = Command::Idle;
-        let payload = (2u64 << CONSTRAINT_DOMAIN_SHIFT) | (3u64 << CONSTRAINT_DEVICE_SHIFT);
-        assert!(state.begin(DEVICE_CONSTRAINT, payload));
-        // The observed 0x0021000000000000 has the completion opcode but no echo.
-        state.reply(MARKER | ((u64::from(DEVICE_CONSTRAINT) + 1) << SHIFT));
+        let payload = 1;
+        assert!(state.begin(0x0f, payload));
+        state.reply(MARKER | (0x10 << SHIFT));
         assert_eq!(state, Command::Failed);
     }
 

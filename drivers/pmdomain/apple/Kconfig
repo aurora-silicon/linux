@@ -98,8 +98,9 @@ config APPLE_PMP_REPORT_START_KUNIT_TEST
 	  report ready or acknowledge its startup requests, consumers that
 	  time out, and the teardown of the report and its entries while a
 	  start or a consumer waits. The report region is simulated in
-	  memory. Also checks T8112 device DVFS encoding, ACK failures and
-	  idle release using emulated request and update windows.
+	  memory. Also checks T8112 device DVFS encoding, constraint-source
+	  aggregation, real update offsets, store ordering, ACK failures and idle
+	  release using emulated request and update windows.
 	  Only useful for kernel developers.
 
 endif

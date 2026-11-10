@@ -449,10 +449,27 @@ static void pmp_t8112_encoding_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rep->dvfs_known, BIT_ULL(avd) | BIT_ULL(jpg));
 }
 
+static u64 pmp_t8112_constraint_word(struct kunit *test, unsigned int dcs,
+				     unsigned int soc)
+{
+	u64 word = 0;
+
+	KUNIT_EXPECT_TRUE(test, apple_pmp_t8112_constraint_word(dcs, soc, &word));
+	return word;
+}
+
 struct pmp_dvfs_test {
 	struct apple_pmp_report rep;
 	struct apple_pmp_report_entry ent;
 };
+
+static int pmp_t8112_set_constraint(struct pmp_dvfs_test *t, unsigned int entry,
+				    enum apple_pmp_t8112_constraint_source source,
+				    unsigned int dcs, unsigned int soc)
+{
+	return apple_pmp_t8112_set_constraint(t->rep.dev->of_node, entry, source,
+					       dcs, soc);
+}
 
 static int pmp_dvfs_init(struct kunit *test)
 {
@@ -585,6 +602,86 @@ static void pmp_t8112_state_prime_timeout_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, t->rep.dvfs_ready_achieved_word, 2ULL);
 }
 
+static void pmp_t8112_constraint_aggregation_test(struct kunit *test)
+{
+	struct pmp_dvfs_test *t = test->priv;
+	const unsigned int entry = APPLE_PMP_T8112_DVFS_ENTRY(APPLE_PMP_T8112_EACC0);
+	const unsigned int offset = apple_pmp_offsets_t8112.update + 8 * entry;
+
+	writeq(PMP_REPORT_READY, t->rep.base + apple_pmp_offsets_t8112.status);
+	writeq(1, t->rep.base + apple_pmp_offsets_t8112.dvfs_ready_state);
+	KUNIT_ASSERT_EQ(test,
+			pmp_t8112_set_constraint(t, entry,
+						 APPLE_PMP_T8112_CONSTRAINT_CPU, 1, 2), 0);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + offset),
+			pmp_t8112_constraint_word(test, 1, 2));
+
+	/* A second source raises only DCS; the first source retains SOC. */
+	KUNIT_ASSERT_EQ(test,
+			pmp_t8112_set_constraint(t, entry,
+						 APPLE_PMP_T8112_CONSTRAINT_ANE, 4, 0), 0);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + offset),
+			pmp_t8112_constraint_word(test, 4, 2));
+
+	KUNIT_ASSERT_EQ(test,
+			pmp_t8112_set_constraint(t, entry,
+						 APPLE_PMP_T8112_CONSTRAINT_CPU, 0, 0), 0);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + offset),
+			pmp_t8112_constraint_word(test, 4, 0));
+	KUNIT_ASSERT_EQ(test,
+			pmp_t8112_set_constraint(t, entry,
+						 APPLE_PMP_T8112_CONSTRAINT_ANE, 0, 0), 0);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + offset),
+			pmp_t8112_constraint_word(test, 0, 0));
+}
+
+static void pmp_t8112_constraint_offsets_test(struct kunit *test)
+{
+	struct pmp_dvfs_test *t = test->priv;
+	const unsigned int pacc = APPLE_PMP_T8112_DVFS_ENTRY(APPLE_PMP_T8112_PACC0);
+	const unsigned int ane = APPLE_PMP_T8112_DVFS_ENTRY(APPLE_PMP_T8112_ANE0);
+	const unsigned int dcs = APPLE_PMP_T8112_DCS_MAX;
+	const unsigned int soc = APPLE_PMP_T8112_SOC_MAX;
+	u64 top = pmp_t8112_constraint_word(test, dcs, soc);
+
+	writeq(PMP_REPORT_READY, t->rep.base + apple_pmp_offsets_t8112.status);
+	writeq(1, t->rep.base + apple_pmp_offsets_t8112.dvfs_ready_state);
+	KUNIT_ASSERT_EQ(test,
+			pmp_t8112_set_constraint(t, pacc,
+						 APPLE_PMP_T8112_CONSTRAINT_CPU, dcs, soc), 0);
+	KUNIT_ASSERT_EQ(test,
+			pmp_t8112_set_constraint(t, ane,
+						 APPLE_PMP_T8112_CONSTRAINT_ANE, dcs, soc), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmp_offsets_t8112.update + 8 * pacc, 0x10548U);
+	KUNIT_EXPECT_EQ(test, apple_pmp_offsets_t8112.update + 8 * ane, 0x10558U);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10548), top);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10558), top);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10550), 0ULL);
+}
+
+static void pmp_t8112_constraint_store_sequence_test(struct kunit *test)
+{
+	struct pmp_dvfs_test *t = test->priv;
+	const unsigned int entry = APPLE_PMP_T8112_DVFS_ENTRY(APPLE_PMP_T8112_EACC0);
+
+	writeq(PMP_REPORT_READY, t->rep.base + apple_pmp_offsets_t8112.status);
+	KUNIT_EXPECT_EQ(test,
+			pmp_t8112_set_constraint(t, entry,
+						 APPLE_PMP_T8112_CONSTRAINT_CPU, 4, 2), -ETIMEDOUT);
+	/* Entry 8 is primed first; no target word is stored until it reports ready. */
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10040), 1ULL);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10540), 0ULL);
+	writeq(1, t->rep.base + apple_pmp_offsets_t8112.dvfs_ready_state);
+	KUNIT_ASSERT_EQ(test,
+			pmp_t8112_set_constraint(t, entry,
+						 APPLE_PMP_T8112_CONSTRAINT_CPU, 4, 2), 0);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10540),
+			pmp_t8112_constraint_word(test, 4, 2));
+	KUNIT_EXPECT_EQ(test,
+			FIELD_GET(PMP_T8112_CONSTRAINT_SOC,
+				  readq(t->rep.base + 0x10540)), 2ULL);
+}
+
 static struct kunit_case pmp_dvfs_cases[] = {
 	KUNIT_CASE(pmp_t8112_encoding_test),
 	KUNIT_CASE(pmp_t8112_stopped_test),
@@ -592,6 +689,9 @@ static struct kunit_case pmp_dvfs_cases[] = {
 	KUNIT_CASE(pmp_t8112_ack_timeout_test),
 	KUNIT_CASE(pmp_t8112_active_release_test),
 	KUNIT_CASE(pmp_t8112_state_prime_timeout_test),
+	KUNIT_CASE(pmp_t8112_constraint_aggregation_test),
+	KUNIT_CASE(pmp_t8112_constraint_offsets_test),
+	KUNIT_CASE(pmp_t8112_constraint_store_sequence_test),
 	{}
 };
 

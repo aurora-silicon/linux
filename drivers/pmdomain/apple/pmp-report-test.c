@@ -300,6 +300,20 @@ static void pmp_dvfs_words(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, apple_pmp_dvfs_word(0x21, 1, NULL));
 }
 
+static void pmp_t8112_constraint_words(struct kunit *test)
+{
+	u64 word;
+
+	KUNIT_ASSERT_TRUE(test, apple_pmp_t8112_constraint_word(4, 2, &word));
+	KUNIT_EXPECT_EQ(test, word,
+			PMP_DVFS_VALID |
+			FIELD_PREP(PMP_T8112_CONSTRAINT_DCS, 4) |
+			FIELD_PREP(PMP_T8112_CONSTRAINT_SOC, 2));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_t8112_constraint_word(5, 2, &word));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_t8112_constraint_word(4, 3, &word));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_t8112_constraint_word(4, 2, NULL));
+}
+
 static struct kunit_case apple_pmp_report_cases[] = {
 	KUNIT_CASE(pmp_ranges_t6000),
 	KUNIT_CASE(pmp_ranges_t8112),
@@ -316,6 +330,7 @@ static struct kunit_case apple_pmp_report_cases[] = {
 	KUNIT_CASE(pmp_bootargs_reject_truncation),
 	KUNIT_CASE(pmp_bootargs_reject_integer_width),
 	KUNIT_CASE(pmp_dvfs_words),
+	KUNIT_CASE(pmp_t8112_constraint_words),
 	{}
 };
 

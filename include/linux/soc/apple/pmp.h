@@ -8,7 +8,7 @@ struct device;
 
 /*
  * T8112 SOC-device IDs of the CPU-cluster and ANE constraint targets, and the
- * highest qualified DCS and SoC-fabric levels. The firmware publishes each
+ * highest qualified DCS and SoC-fabric levels. The host publishes each
  * target's SOC-DEV-DVFS entry at the SOC-device ID from a base of 0xa5.
  */
 #define APPLE_PMP_T8112_EACC0		3
@@ -22,7 +22,6 @@ struct device;
 #if IS_REACHABLE(CONFIG_APPLE_PMP)
 int apple_pmp_link_device(struct device *consumer);
 int apple_pmp_set_device_power(u8 command, u16 device_id, u32 enabled);
-int apple_pmp_set_device_constraint(u8 device_id, u8 dcs, u8 soc);
 /* After the acknowledged AGX vote and successful GPU firmware startup. */
 int apple_pmp_t6030_gpu_ready(void);
 #else
@@ -35,10 +34,6 @@ static inline int apple_pmp_set_device_power(u8 command, u16 device_id, u32 enab
 	return -ENODEV;
 }
 
-static inline int apple_pmp_set_device_constraint(u8 device_id, u8 dcs, u8 soc)
-{
-	return -ENODEV;
-}
 static inline int apple_pmp_t6030_gpu_ready(void)
 {
 	return -ENODEV;
@@ -49,6 +44,4 @@ int apple_pmp_register(struct device *dev, const void *data);
 void apple_pmp_unregister(const void *data);
 int apple_pmp_send_power_command(const void *data, u8 command,
 				u16 device_id, u32 enabled);
-int apple_pmp_send_constraint_command(const void *data, u8 device_id,
-				      u8 domain, u16 level);
 #endif

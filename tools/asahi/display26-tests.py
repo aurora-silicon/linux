@@ -127,7 +127,6 @@ static bool of_device_is_compatible(const struct device_node*n,const char*name){
 static int ready_result,send_result,calls;
 int apple_pmp_report_wait_supplier_ready(struct device*d,unsigned timeout){assert(d==pmp_device);assert(timeout==5000);return ready_result;}
 int apple_pmp_send_power_command(const void*data,u8 command,u16 id,u32 enabled){assert(data==pmp_data);calls++;return send_result;}
-int apple_pmp_send_constraint_command(const void*data,u8 id,u8 domain,u16 level){assert(data==pmp_data);calls++;return send_result;}
 int apple_pmp_report_check_t6030_gfx(struct device*d){assert(!"unexpected T6030 report on J613");return -EIO;}
 int apple_pmp_report_set_t6030_gfx(struct device*d,bool enabled){assert(!"unexpected T6030 report on J613");return -EIO;}
 int main(void){

@@ -3,11 +3,26 @@
 #define _APPLE_PMP_REPORT_VALIDATION_H
 
 #include <linux/bitops.h>
+#include <linux/bitfield.h>
 #include <linux/errno.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
 
 #define PMP_DVFS_VALID BIT_ULL(61)
+
+/* T8112 dashboard constraints: SOC uses the default lane, DCS class 0x21. */
+#define PMP_T8112_CONSTRAINT_SOC	GENMASK_ULL(4, 0)
+#define PMP_T8112_CONSTRAINT_DCS	GENMASK_ULL(35, 32)
+
+static inline bool apple_pmp_t8112_constraint_word(u32 dcs, u32 soc, u64 *word)
+{
+	if (!word || dcs > 4 || soc > 2)
+		return false;
+	*word = PMP_DVFS_VALID |
+		FIELD_PREP(PMP_T8112_CONSTRAINT_DCS, dcs) |
+		FIELD_PREP(PMP_T8112_CONSTRAINT_SOC, soc);
+	return true;
+}
 
 #define PMP_SOC_DEVICE_SIZE	0x7c
 #define PMP_SOC_DEVICE_ACK	BIT(1)
