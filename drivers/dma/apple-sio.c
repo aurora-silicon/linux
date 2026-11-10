@@ -1838,6 +1838,20 @@ static int sio_send_v9_shmem(struct sio_data *sio,
 	return 0;
 }
 
+/* Publish the shared memory to the firmware; also used after a cold restart. */
+static int sio_send_shmem_params(struct sio_data *sio)
+{
+	int err;
+
+	if (sio->protocol == 9)
+		return sio_send_v9_shmem(sio, sio_set_param);
+
+	err = sio_set_param(sio, 1, sio->shmem_iova >> 12);
+	if (err)
+		return err;
+	return sio_set_param(sio, 2, SIO_SHMEM_SIZE);
+}
+
 static int sio_alloc_shmem(struct sio_data *sio)
 {
 	const struct sio_dma_arrays *arrays = sio->hw->arrays;
@@ -1879,13 +1893,8 @@ static int sio_alloc_shmem(struct sio_data *sio)
 		err = devm_add_action_or_reset(sio->dev, sio_free_v9_shmem, sio);
 		if (err)
 			return err;
-		return sio_send_v9_shmem(sio, sio_set_param);
 	}
-
-	err = sio_set_param(sio, 1, sio->shmem_iova >> 12);
-	if (err)
-		return err;
-	return sio_set_param(sio, 2, SIO_SHMEM_SIZE);
+	return sio_send_shmem_params(sio);
 
 free_shmem:
 	/* No address has been published yet. */
@@ -2143,7 +2152,8 @@ static __maybe_unused int sio_suspend_late(struct device *dev)
 	struct sio_data *sio = dev_get_drvdata(dev);
 	int i, ret;
 
-	if (!pm_suspend_via_firmware() || sio->asleep)
+	/* A dry run keeps the power, and an idled firmware doesn't wake with it kept. */
+	if (!apple_sleep_power_loss() || sio->asleep)
 		return 0;
 
 	for (i = 0; i < sio->nchannels; i++) {
@@ -2174,6 +2184,58 @@ static __maybe_unused int sio_suspend_late(struct device *dev)
 		return ret;
 	}
 	sio->asleep = true;
+
+	return 0;
+}
+
+/*
+ * Bring a freshly loaded, halted SIO up again under the existing host state:
+ * the firmware-facing part of probe, reusing the shared memory, the DMA
+ * channels and their clients.
+ */
+static int sio_restart(struct sio_data *sio)
+{
+	u32 protocol = sio->protocol;
+	int err, i;
+
+	/* Nothing can answer the calls that were in flight. */
+	for (i = 1; i < SIO_NTAGS; i++) {
+		if (test_and_clear_bit(i, sio->tags.allocated))
+			dev_warn(sio->dev, "dropping stale call tag %d\n", i);
+		reinit_completion(&sio->tags.completions[i]);
+	}
+
+	err = apple_rtkit_reinit(sio->rtk);
+	if (err)
+		return dev_err_probe(sio->dev, err, "restart: RTKit reinit\n");
+
+	writel(CPU_CONTROL_RUN, sio->base + REG_CPU_CONTROL);
+
+	err = apple_rtkit_boot(sio->rtk);
+	if (err)
+		return dev_err_probe(sio->dev, err, "restart: SIO did not boot\n");
+
+	err = apple_rtkit_start_ep(sio->rtk, EP_SIO);
+	if (err)
+		return dev_err_probe(sio->dev, err, "restart: starting SIO endpoint\n");
+
+	err = sio_call(sio, FIELD_PREP(SIOMSG_TYPE, MSG_START));
+	if (err < 1)
+		return dev_err_probe(sio->dev, err ? err : -ENXIO,
+				     "restart: starting SIO service\n");
+	if (sio->protocol != protocol) {
+		dev_err(sio->dev, "restart: protocol changed from v%u to v%u\n",
+			protocol, sio->protocol);
+		return -EPROTO;
+	}
+
+	err = sio_send_dt_params(sio);
+	if (err < 0)
+		return dev_err_probe(sio->dev, err, "restart: boot-up parameters\n");
+
+	err = sio_send_shmem_params(sio);
+	if (err < 0)
+		return dev_err_probe(sio->dev, err, "restart: shared memory\n");
 
 	return 0;
 }
@@ -2232,8 +2294,40 @@ static __maybe_unused int sio_resume_early(struct device *dev)
 	return 0;
 }
 
+static __maybe_unused int sio_restore(struct device *dev)
+{
+	struct sio_data *sio = dev_get_drvdata(dev);
+	int err;
+
+	/*
+	 * The resume boot loaded the SIO firmware again and left the CPU
+	 * halted (this driver is not part of the resume initramfs), while the
+	 * restored session still believes the old instance runs. Start the
+	 * new instance; DMA clients set their channels up again when they
+	 * reprepare their streams.
+	 */
+	if (readl(sio->base + REG_CPU_CONTROL) & CPU_CONTROL_RUN) {
+		dev_info(dev, "resume from disk: SIO still running, session kept\n");
+	} else {
+		err = sio_restart(sio);
+		if (!err)
+			dev_info(dev, "resume from disk: SIO restarted (protocol v%u)\n",
+				 sio->protocol);
+		else
+			dev_err(dev, "resume from disk: SIO restart failed: %d\n", err);
+	}
+
+	return pm_runtime_force_resume(dev);
+}
+
+/* A firmware-driven suspend stops the firmware late; a resume from disk restarts it. */
 static const struct dev_pm_ops sio_pm_ops = {
-	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+	.suspend = pm_sleep_ptr(pm_runtime_force_suspend),
+	.resume = pm_sleep_ptr(pm_runtime_force_resume),
+	.freeze = pm_sleep_ptr(pm_runtime_force_suspend),
+	.thaw = pm_sleep_ptr(pm_runtime_force_resume),
+	.poweroff = pm_sleep_ptr(pm_runtime_force_suspend),
+	.restore = pm_sleep_ptr(sio_restore),
 	LATE_SYSTEM_SLEEP_PM_OPS(sio_suspend_late, sio_resume_early)
 	RUNTIME_PM_OPS(sio_suspend, sio_resume, NULL)
 };
