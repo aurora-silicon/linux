@@ -9,6 +9,7 @@
 #include <kunit/static_stub.h>
 #include <kunit/visibility.h>
 #include <linux/i2c.h>
+#include <linux/iopoll.h>
 #include <linux/acpi.h>
 #include <linux/gpio/consumer.h>
 #include <linux/of.h>
@@ -460,12 +461,21 @@ out_unlock:
 	return ret;
 }
 
+/*
+ * After a PR_Swap is accepted, the initial sink waits up to tPSSourceOff
+ * (920 ms) for the initial source's PS_RDY, and the initial source then
+ * waits up to tPSSourceOn (480 ms) for the new source's PS_RDY (USB Power
+ * Delivery, PR_Swap timers).
+ */
+#define TPS_PR_SWAP_TIMEOUT_US	(1400 * USEC_PER_MSEC)
+#define TPS_PR_SWAP_POLL_US	(10 * USEC_PER_MSEC)
+
 static int tps6598x_pr_set(struct typec_port *port, enum typec_role role)
 {
 	const char *cmd = (role == TYPEC_SINK) ? "SWSk" : "SWSr";
 	struct tps6598x *tps = typec_get_drvdata(port);
 	u32 status;
-	int ret;
+	int ret, err;
 
 	mutex_lock(&tps->lock);
 
@@ -473,11 +483,18 @@ static int tps6598x_pr_set(struct typec_port *port, enum typec_role role)
 	if (ret)
 		goto out_unlock;
 
-	ret = tps6598x_read32(tps, TPS_REG_STATUS, &status);
+	/*
+	 * The task completes once the swap has been accepted, but the port
+	 * role in STATUS changes only after the power supply transition that
+	 * follows, so wait for it before calling the swap a failure.
+	 */
+	err = read_poll_timeout(tps6598x_read32, ret,
+				ret || TPS_STATUS_TO_TYPEC_PORTROLE(status) == role,
+				TPS_PR_SWAP_POLL_US, TPS_PR_SWAP_TIMEOUT_US, false,
+				tps, TPS_REG_STATUS, &status);
 	if (ret)
 		goto out_unlock;
-
-	if (role != TPS_STATUS_TO_TYPEC_PORTROLE(status)) {
+	if (err) {
 		ret = -EPROTO;
 		goto out_unlock;
 	}
@@ -2017,7 +2034,14 @@ static int cd321x_switch_power_state(struct tps6598x *tps, u8 target_state)
 	if (state == target_state)
 		return 0;
 
-	ret = tps6598x_exec_cmd(tps, "SSPS", sizeof(u8), &target_state, 0, NULL);
+	/* SN201202x can still be negotiating an attached dock while waking. */
+	if (target_state == TPS_SYSTEM_POWER_STATE_S0 &&
+	    device_is_compatible(tps->dev, "apple,sn201202x"))
+		ret = tps6598x_exec_cmd_tmo(tps, "SSPS", sizeof(target_state),
+					  &target_state, 0, NULL, 5000, 0);
+	else
+		ret = tps6598x_exec_cmd(tps, "SSPS", sizeof(target_state),
+				      &target_state, 0, NULL);
 	if (ret)
 		return ret;
 
@@ -2235,26 +2259,38 @@ cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode,
 EXPORT_SYMBOL_IF_KUNIT(cd321x_tbt_switch_get);
 
 /*
- * Take a router that bound after the port gave up on it. An attached cable
- * raises no new event, so reapply it through the router as after system sleep.
+ * Take a router that bound after the port gave up on it, or that unbound and
+ * bound again. An attached cable raises no new event, so reapply it through
+ * the router as after system sleep.
  */
 static void cd321x_tbt_attach_work(struct work_struct *work)
 {
 	struct cd321x *cd321x = container_of(work, struct cd321x,
 					    tbt_attach_work);
 	struct tps6598x *tps = &cd321x->tps;
-	struct typec_thunderbolt_switch *sw;
+	struct typec_thunderbolt_switch *sw, *old;
 	int ret;
 
 	scoped_guard(mutex, &tps->lock) {
-		if (cd321x->tbt_switch || cd321x->pm.phase == CD321X_PM_REMOVED)
+		if (cd321x->pm.phase == CD321X_PM_REMOVED)
 			return;
+		/* The router this port uses is still bound. */
+		if (typec_thunderbolt_switch_is_live(cd321x->tbt_switch))
+			return;
+		old = cd321x->tbt_switch;
 	}
 
 	/* Another port's router, or this one is not usable yet: keep watching. */
 	sw = fwnode_typec_thunderbolt_switch_get(cd321x->tbt_fwnode);
 	if (IS_ERR_OR_NULL(sw))
 		return;
+
+	/* The router went away: its switch sends nothing more, stop listening. */
+	if (old && cd321x->tbt_notifier_registered) {
+		typec_thunderbolt_switch_unregister_notifier(old,
+							     &cd321x->tbt_notifier);
+		cd321x->tbt_notifier_registered = false;
+	}
 
 	ret = typec_thunderbolt_switch_register_notifier(sw,
 							 &cd321x->tbt_notifier);
@@ -2269,7 +2305,9 @@ static void cd321x_tbt_attach_work(struct work_struct *work)
 		cd321x->tbt_switch = sw;
 		cd321x->tbt_notifier_registered = true;
 	}
-	dev_info(tps->dev, "USB4/Thunderbolt router bound, reapplying the cable state\n");
+	typec_thunderbolt_switch_put(old);
+	dev_info(tps->dev, "USB4/Thunderbolt router bound%s, reapplying the cable state\n",
+		 old ? " again" : "");
 	atomic_set(&cd321x->restore_event, 1);
 	mod_delayed_work(system_freezable_wq, &cd321x->resume_work, 0);
 }
@@ -2396,8 +2434,13 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 		goto err_put_switch;
 	cd321x->tbt_notifier_registered = true;
 
-	/* Keep the port without the router rather than fail it: see above. */
-	if (tbt_late && cd321x_tbt_watch_late(cd321x, fwnode))
+	/*
+	 * Keep the port without the router rather than fail it: see above. A
+	 * router that is there can also unbind and bind again, which gives it
+	 * a new switch: watch for that as well.
+	 */
+	if ((tbt_late || cd321x->tbt_switch) &&
+	    cd321x_tbt_watch_late(cd321x, fwnode))
 		dev_warn(tps->dev, "cannot watch for the USB4/Thunderbolt router\n");
 
 	return 0;
@@ -2905,6 +2948,66 @@ static int cd321x_remove(struct tps6598x *tps)
 	return 0;
 }
 
+static int cd321x_reset_inherited_connection(struct tps6598x *tps, u32 *status)
+{
+	/* J716c's port-controller key is the reversed target identifier J716. */
+	static const u8 key[] = { '6', '1', '7', 'J' };
+	static const u8 locked[4];
+	u8 delay = 5, result;
+	unsigned long timeout;
+	int ret, lock_ret, mode;
+
+	if (!device_property_read_bool(tps->dev, "apple,reset-inherited-usb2-connection") ||
+	    !of_machine_is_compatible("apple,j716c") ||
+	    !device_is_compatible(tps->dev, "apple,sn201202x") ||
+	    tps->dbma_at_probe || !(*status & TPS_STATUS_PLUG_PRESENT) ||
+	    !TPS_STATUS_TO_TYPEC_DATAROLE(*status))
+		return 0;
+	mode = tps6598x_check_mode(tps);
+	if (mode != TPS_MODE_APP && mode != TPS_MODE_APP1)
+		return 0;
+
+	/* All suppliers are available, but no USB or router session has started. */
+	ret = tps6598x_exec_cmd(tps, "LOCK", sizeof(key), key, sizeof(result), &result);
+	if (ret)
+		return ret;
+	if (result) {
+		ret = -EIO;
+		goto relock;
+	}
+
+	/*
+	 * Nonzero DISC delay restores normal CC detection automatically. The
+	 * task can take more than a second to acknowledge at boot; wait for it
+	 * before issuing LOCK, which a still-busy controller would reject.
+	 */
+	ret = tps6598x_exec_cmd_tmo(tps, "DISC", sizeof(delay), &delay, 0, NULL,
+				  5000, 0);
+	if (!ret) {
+		msleep(5100);
+		timeout = jiffies + msecs_to_jiffies(2000);
+		do {
+			mode = tps6598x_check_mode(tps);
+			if (mode == TPS_MODE_APP || mode == TPS_MODE_APP1)
+				break;
+			msleep(20);
+		} while (time_before(jiffies, timeout));
+		if (mode != TPS_MODE_APP && mode != TPS_MODE_APP1)
+			ret = mode < 0 ? mode : -ETIMEDOUT;
+	}
+relock:
+	/* CC/PD negotiation may still be finishing when application mode returns. */
+	lock_ret = tps6598x_exec_cmd_tmo(tps, "LOCK", sizeof(locked), locked, 0, NULL,
+				       5000, 0);
+	if (ret || lock_ret)
+		return ret ?: lock_ret;
+	if (!tps6598x_read_status(tps, status))
+		return -EIO;
+	tps->status = *status;
+	dev_info(tps->dev, "reinitialized inherited USB2 connection\n");
+	return 0;
+}
+
 int tipd_init(struct tps6598x *tps)
 {
 	struct fwnode_handle *fwnode;
@@ -3011,11 +3114,16 @@ int tipd_init(struct tps6598x *tps)
 	if (tps->contaminant_ops) {
 		ret = tps->contaminant_ops->update(tps);
 		if (ret) {
-			dev_warn(tps->dev,
-				 "connector contaminant state unavailable: %d\n", ret);
+			if (ret != -EINPROGRESS)
+				dev_warn(tps->dev,
+					 "connector contaminant state unavailable: %d\n", ret);
 			ret = 0;
 		}
 	}
+
+	ret = cd321x_reset_inherited_connection(tps, &status);
+	if (ret)
+		goto err_disconnect;
 
 	if (status & TPS_STATUS_PLUG_PRESENT) {
 		ret = -EINVAL;

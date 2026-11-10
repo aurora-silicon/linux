@@ -265,6 +265,7 @@ int apple_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu **out)
 	if (!np)
 		return of_find_property(dev->of_node, "apple,clpc", NULL) ? -EINVAL : 0;
 	if (!of_device_is_compatible(np, "apple,t6041-clpc") &&
+	    !of_device_is_compatible(np, "apple,t6050-clpc") &&
 	    !of_device_is_compatible(np, "apple,t8132-clpc") &&
 	    !of_device_is_compatible(np, "apple,t8140-clpc") &&
 	    !of_device_is_compatible(np, "apple,t8142-clpc")) {
@@ -678,7 +679,8 @@ static void apple_clpc_gpu_floor_count(struct apple_clpc *clpc, bool released)
 
 /*
  * The GPU driver's input, where it drives demand instead of the GFX power
- * state: every rail at its top state while the driver reports work.
+ * state: every rail at the top of @map, or at @gpu where that is higher,
+ * while the driver reports work.
  */
 static bool apple_clpc_gpu_input_demand(const struct apple_clpc_hw *hw,
 					struct apple_clpc_gpu *gpu,
@@ -691,7 +693,8 @@ static bool apple_clpc_gpu_input_demand(const struct apple_clpc_hw *hw,
 	    !apple_clpc_gpu_active(gpu, &updated, &sequence))
 		return false;
 	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
-		demand[rail] = max(demand[rail], hw->map[rail][APPLE_CLPC_LEVELS - 1]);
+		demand[rail] = max(demand[rail],
+				   max(hw->map[rail][APPLE_CLPC_LEVELS - 1], hw->gpu[rail]));
 	return true;
 }
 
@@ -1669,7 +1672,30 @@ static const struct apple_clpc_hw apple_clpc_hw_t8152 = {
 	},
 };
 
+/*
+ * T6050 (M5 Pro/Max): DCS states 0-6 on rail 0, fabric states 0-3 on rail 1.
+ * The boot loader enables no agent on either rail, so without this floor
+ * the DRAM controller and the fabric stay at state 0: CPU memcpy caps at
+ * about 34 GB/s on the M5 Pro. A busy cluster in the upper half of its range
+ * asks for DCS 5 and fabric 2, the floor macOS's CLPC holds through an
+ * 18-thread CPU loop (J714sAP, 26A428: 0x25 on its voter 99% of the time);
+ * three busy samples in a row (12 ms) are needed, as on T6040. The GPU driver
+ * reports its work in flight and gets both top states, DCS 6 and fabric 3,
+ * while it has some: bandwidth-bound GPU work runs about 11% slower at DCS 5.
+ */
+static const struct apple_clpc_hw apple_clpc_hw_t6050 = {
+	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
+	.map = {
+		[APPLE_CLPC_DCS] = { 2, 4, 5, 5 },
+		[APPLE_CLPC_SOC] = { 1, 2, 2, 2 },
+	},
+	.gpu = { [APPLE_CLPC_DCS] = 6, [APPLE_CLPC_SOC] = 3 },
+	.sustain = 3,
+	.gpu_input = true,
+};
+
 static const struct of_device_id apple_clpc_of_match[] = {
+	{ .compatible = "apple,t6050-clpc", .data = &apple_clpc_hw_t6050 },
 	{ .compatible = "apple,t8132-clpc", .data = &apple_clpc_hw_t8132 },
 	{ .compatible = "apple,t8140-clpc", .data = &apple_clpc_hw_t8140 },
 	{ .compatible = "apple,t8142-clpc", .data = &apple_clpc_hw_t8142 },
