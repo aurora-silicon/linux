@@ -114,7 +114,7 @@ impl Accounting {
         owner: Owner,
         scheduler: u64,
         policy: Policy,
-        clock: impl FnOnce() -> (u64, u64),
+        clock: Clock,
     ) -> Result<Publication> {
         let [publication] = self.publish_owners(view, [owner], scheduler, policy, clock)?;
         Ok(publication)
@@ -131,7 +131,7 @@ impl Accounting {
         owners: [Owner; N],
         scheduler: u64,
         policy: Policy,
-        clock: impl FnOnce() -> (u64, u64),
+        clock: Clock,
     ) -> Result<[Publication; N]> {
         if scheduler == 0 {
             return Err(EINVAL);
@@ -164,12 +164,7 @@ impl Accounting {
                 return Err(EBUSY);
             }
         }
-        let time = if busy {
-            let (counter, frequency) = clock();
-            time_from_host(counter, frequency)?
-        } else {
-            0
-        };
+        let time = if busy { clock.firmware_time()? } else { 0 };
         let class = policy.qos_class();
         let mut first = false;
         for (index, owner) in owners.iter().enumerate() {
@@ -277,25 +272,79 @@ impl Accounting {
     }
 }
 
-/// Firmware accounting uses a 24 MHz domain independent of host timer speed.
-pub(crate) fn time_from_host(counter: u64, frequency: u64) -> Result<u64> {
+fn scale(counter: u64, frequency: u64, target: u64) -> Result<u64> {
     if frequency == 0 || frequency > u64::from(u32::MAX) {
         return Err(EINVAL);
     }
-    let whole = (counter / frequency)
-        .checked_mul(cfg::CLOCK_HZ)
-        .ok_or(EOVERFLOW)?;
-    let fraction = (counter % frequency) * cfg::CLOCK_HZ / frequency;
+    let whole = (counter / frequency).checked_mul(target).ok_or(EOVERFLOW)?;
+    let fraction = (counter % frequency) * target / frequency;
     whole.checked_add(fraction).ok_or(EOVERFLOW)
 }
 
-pub(crate) fn clock() -> (u64, u64) {
-    let counter: u64;
-    let frequency: u64;
-    // SAFETY: Both timer registers are readable at EL1 and have no memory effects.
-    unsafe {
-        core::arch::asm!("mrs {counter}, CNTPCT_EL0", "mrs {frequency}, CNTFRQ_EL0",
-        counter=out(reg)counter, frequency=out(reg)frequency, options(nomem,nostack,preserves_flags));
+/// One architectural-counter sample shared by every timestamp use of a submission.
+#[derive(Clone, Copy)]
+pub(crate) struct Clock {
+    counter: u64,
+    frequency: u64,
+    monotonic_ns: u64,
+}
+
+impl Clock {
+    /// Firmware accounting uses a 24 MHz domain independent of host timer speed.
+    fn firmware_time(self) -> Result<u64> {
+        scale(self.counter, self.frequency, cfg::CLOCK_HZ)
     }
-    (counter, frequency)
+
+    pub(crate) fn monotonic_ns(self) -> u64 {
+        self.monotonic_ns
+    }
+}
+
+pub(crate) fn frequency() -> u64 {
+    let frequency: u64;
+    // SAFETY: The timer frequency register is readable at EL1 and has no memory effects.
+    unsafe {
+        core::arch::asm!("mrs {frequency}, CNTFRQ_EL0",
+        frequency=out(reg)frequency, options(nomem,nostack,preserves_flags));
+    }
+    frequency
+}
+
+pub(crate) fn clock(frequency: u64, monotonic_ns: u64) -> Clock {
+    let counter: u64;
+    // SAFETY: The physical timer register is readable at EL1 and has no memory effects.
+    unsafe {
+        core::arch::asm!("mrs {counter}, CNTPCT_EL0",
+        counter=out(reg)counter, options(nomem,nostack,preserves_flags));
+    }
+    Clock {
+        counter,
+        frequency,
+        monotonic_ns,
+    }
+}
+
+#[kernel::macros::kunit_tests(asahi_g17_qos_clock)]
+mod clock_tests {
+    use super::*;
+
+    #[test]
+    fn scales_one_sample_into_both_domains() {
+        let clock = Clock {
+            counter: 25_125_000,
+            frequency: 25_000_000,
+            monotonic_ns: 1_005_000_000,
+        };
+        assert_eq!(clock.firmware_time(), Ok(24_120_000));
+        assert_eq!(clock.monotonic_ns(), 1_005_000_000);
+    }
+
+    #[test]
+    fn rejects_an_invalid_frequency() {
+        assert!(matches!(scale(1, 0, cfg::CLOCK_HZ), Err(EINVAL)));
+        assert!(matches!(
+            scale(1, u64::from(u32::MAX) + 1, cfg::CLOCK_HZ),
+            Err(EINVAL)
+        ));
+    }
 }

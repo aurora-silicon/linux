@@ -524,6 +524,7 @@ impl Registry {
 struct Host<'a> {
     firmware: &'a mut crate::g17::Firmware,
     registration_powered: bool,
+    clock: crate::g17::qos::Clock,
 }
 impl Host<'_> {
     fn release_registration(&mut self) {
@@ -563,7 +564,9 @@ impl crate::g17::queue::render::Host for Host<'_> {
         scheduler: u64,
         policy: crate::g17::fw::queue::Policy,
     ) -> Result<[crate::g17::qos::Publication; 2]> {
-        self.firmware.port.qos_publish_pair(owners, scheduler, policy)
+        self.firmware
+            .port
+            .qos_publish_pair(owners, scheduler, policy, self.clock)
     }
     fn qos_cancel(&mut self, publication: crate::g17::qos::Publication) -> Result {
         self.firmware.port.qos_cancel(publication)
@@ -651,7 +654,7 @@ impl crate::g17::queue::render::Host for Host<'_> {
         result
     }
     fn note_submission(&mut self) -> Result {
-        self.firmware.note_submission()
+        self.firmware.note_submission(self.clock)
     }
     fn complete_render(
         &mut self,
@@ -696,9 +699,11 @@ impl crate::g17::Firmware {
             .and_then(Option::as_mut)
             .and_then(|entry| entry.pair.take())
             .ok_or(EBUSY)?;
+        let clock = self.port.clock();
         let mut host = Host {
             firmware: self,
             registration_powered: false,
+            clock,
         };
         let result = operation(&mut pair, &mut host);
         host.release_registration();

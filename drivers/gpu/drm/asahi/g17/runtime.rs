@@ -1371,6 +1371,7 @@ struct ComputeHost<'a> {
     effort: &'a mut super::power::Effort,
     qids: &'a mut kick::QueueIds,
     generation: u64,
+    clock: qos::Clock,
 }
 impl compute::Host for ComputeHost<'_> {
     fn next_compute_publication(&mut self) -> Result<u64> {
@@ -1391,7 +1392,7 @@ impl compute::Host for ComputeHost<'_> {
         scheduler: u64,
         policy: super::fw::queue::Policy,
     ) -> Result<qos::Publication> {
-        self.port.qos_publish(owner, scheduler, policy)
+        self.port.qos_publish(owner, scheduler, policy, self.clock)
     }
     fn qos_cancel(&mut self, publication: qos::Publication) -> Result {
         self.port.qos_cancel(publication)
@@ -1406,6 +1407,7 @@ impl compute::Host for ComputeHost<'_> {
         self.port.notify(message)
     }
     fn note_submission(&mut self) -> Result {
+        self.port.note_gpu_activity_at(self.clock.monotonic_ns());
         self.effort.submit();
         super::Firmware::apply_shared_effort(self.init, self.effort, self.port, super::power::FULL_EFFORT)
     }
@@ -1417,6 +1419,7 @@ struct DirectHost<'a> {
     port: &'a super::port::Port,
     outer: Option<super::port::OuterClaim<'a>>,
     generation: u64,
+    clock: qos::Clock,
 }
 impl compute::Host for DirectHost<'_> {
     fn next_compute_publication(&mut self) -> Result<u64> {
@@ -1434,7 +1437,7 @@ impl compute::Host for DirectHost<'_> {
         scheduler: u64,
         policy: super::fw::queue::Policy,
     ) -> Result<qos::Publication> {
-        self.port.qos_publish(owner, scheduler, policy)
+        self.port.qos_publish(owner, scheduler, policy, self.clock)
     }
     fn qos_cancel(&mut self, publication: qos::Publication) -> Result {
         self.port.qos_cancel(publication)
@@ -1558,6 +1561,7 @@ impl super::Firmware {
             effort: &mut self.effort,
             qids: &mut queues.qids,
             generation: self.recovery.generation(),
+            clock: self.port.clock(),
         };
         if native.is_empty() {
             queue.publish(packet, dependencies, &mut host, &mut |event| deferred.push(event))
@@ -1788,9 +1792,11 @@ impl Backend {
             return None;
         }
         // Full effort is applied by the device-mutex path when it is not already.
-        if !port.note_submission() {
-            return None;
-        }
+        let clock = match port.note_submission() {
+            Ok(Some(clock)) => clock,
+            Ok(None) => return None,
+            Err(error) => return Some(Err(error)),
+        };
         match packet.completion.work_state().ok()?.acquire(crate::g17::job::Engine::Compute) {
             Ok(_) => {}
             Err(error) if error == EBUSY => return None,
@@ -1811,6 +1817,7 @@ impl Backend {
             port,
             outer: Some(outer),
             generation: port.generation(),
+            clock,
         };
         match queue.publish(packet.clone(), &[], &mut host, &mut |event| deferred.push(event)) {
             Err(error) if (error == EAGAIN || error == EBUSY) && !packet.is_published() => None,

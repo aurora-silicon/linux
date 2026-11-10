@@ -132,6 +132,10 @@ pub(crate) fn now_ns() -> u64 {
     <kernel::time::Monotonic as kernel::time::ClockSource>::ktime_get() as u64
 }
 
+pub(crate) fn coarse_now_ns() -> u64 {
+    <kernel::time::CoarseMonotonic as kernel::time::ClockSource>::ktime_get() as u64
+}
+
 pub(crate) struct Identity {
     /// GPU family field of the ID register.
     pub(crate) family: u8,
@@ -705,8 +709,8 @@ impl Firmware {
     }
 
     /// Called at actual submission publication, not while a queued job is merely being built.
-    fn note_submission(&mut self) -> Result {
-        self.port.note_gpu_activity();
+    fn note_submission(&mut self, clock: qos::Clock) -> Result {
+        self.port.note_gpu_activity_at(clock.monotonic_ns());
         self.effort.submit();
         self.apply_effort(power::FULL_EFFORT)
     }

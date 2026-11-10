@@ -41,6 +41,7 @@ struct DirectHost<'a> {
     render: &'a MutexGuard<'a, ()>,
     room: RenderRoom,
     generation: u64,
+    clock: crate::g17::qos::Clock,
     activation: Option<(u16, u64)>,
 }
 
@@ -60,7 +61,8 @@ impl crate::g17::queue::render::Host for DirectHost<'_> {
         scheduler: u64,
         policy: crate::g17::fw::queue::Policy,
     ) -> Result<[crate::g17::qos::Publication; 2]> {
-        self.port.qos_publish_pair(owners, scheduler, policy)
+        self.port
+            .qos_publish_pair(owners, scheduler, policy, self.clock)
     }
     fn qos_cancel(&mut self, publication: crate::g17::qos::Publication) -> Result {
         self.port.qos_cancel(publication)
@@ -260,6 +262,7 @@ impl Backend {
         &self,
         packet: &Arc<Packet>,
         slot: u8,
+        sleep: bool,
         deferred: &mut DeferredBatch,
     ) -> Option<Result> {
         // A compute prefix needs the compute queue's state; leave it to the
@@ -278,9 +281,11 @@ impl Backend {
             return None;
         }
         // Full effort is applied by the device-mutex path when it is not already.
-        if !port.note_submission() {
-            return None;
-        }
+        let clock = match port.note_submission() {
+            Ok(Some(clock)) => clock,
+            Ok(None) => return None,
+            Err(error) => return Some(Err(error)),
+        };
         match packet.completion.work_state().ok()?.acquire(crate::g17::job::Engine::Render) {
             Ok(_) => {}
             Err(error) if error == EBUSY => return None,
@@ -290,7 +295,16 @@ impl Backend {
         let generation = port.generation();
         let dev = self.shared.drm().ok()?;
         let mut loan = {
-            let mut state = self.shared.state.lock();
+            let mut state = if !sleep && crate::module_parameters::g17_submit_trylock.value() != 0 {
+                match self.shared.state.try_lock() {
+                    Some(state) => state,
+                    // Keep the ioctl off the mutex's optimistic spin path. No
+                    // state is owned yet, so the scheduler can publish later.
+                    None => return Some(Err(super::FALLBACK)),
+                }
+            } else {
+                self.shared.state.lock()
+            };
             let firmware = (*state).as_deref_mut()?;
             if !lease.is_current() {
                 return None;
@@ -328,6 +342,7 @@ impl Backend {
                 render: &render,
                 room,
                 generation,
+                clock,
                 activation: None,
             };
             let result = pair.publish(

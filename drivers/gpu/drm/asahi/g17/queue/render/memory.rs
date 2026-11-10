@@ -274,6 +274,11 @@ pub(super) struct Generation {
     pub(super) ordinal: Option<u64>,
 }
 impl Generation {
+    fn clear_auxiliary(&mut self) {
+        self.state.bytes_mut()[storage::AUXILIARY..storage::AUXILIARY + storage::AUXILIARY_SIZE]
+            .fill(0);
+    }
+
     fn allocate_state(alloc: &Allocator<'_>, vm: &mmu::Vm) -> Result<KernelObject> {
         KernelObject::new(
             alloc.dev,
@@ -334,8 +339,11 @@ impl Generation {
             true => Some(storage::Viewport::new(pass.width, pass.height)?),
             false => None,
         };
-        self.state.bytes_mut()[storage::AUXILIARY..storage::AUXILIARY + storage::AUXILIARY_SIZE]
-            .fill(0);
+        // The A/B arm preserves the same zero image but produces it after the
+        // preceding command has retired, outside the next SUBMIT ioctl.
+        if crate::module_parameters::g17_retire_clear.value() == 0 {
+            self.clear_auxiliary();
+        }
         if let Some(viewport) = viewport {
             let destination = self
                 .state
@@ -349,7 +357,12 @@ impl Generation {
             // and unpublished; no prior command can access it until reassigned.
             unsafe { viewport.apply(&mut *destination) };
         }
-        self.fragment.bytes_mut().fill(0);
+        // Fragment status is one GPU-produced word (the descriptor exposes
+        // only status_va/status_fw_va). It is not a command input: the tiling
+        // status word has the same interface and is likewise reused without a
+        // host clear. Clearing the rest of the page could therefore only erase
+        // bytes no command names, and clearing the output word itself is
+        // unnecessary before its producer runs.
         self.ordinal = Some(ordinal);
         Ok(())
     }
@@ -522,7 +535,11 @@ impl Memory {
         self.target.retire(ordinal)?;
         self.manager.retire_scene(ordinal)?;
         self.graph.release(ordinal)?;
-        self.generation(ordinal)?.ordinal = None;
+        let generation = self.generation(ordinal)?;
+        if crate::module_parameters::g17_retire_clear.value() != 0 {
+            generation.clear_auxiliary();
+        }
+        generation.ordinal = None;
         Ok(())
     }
 }

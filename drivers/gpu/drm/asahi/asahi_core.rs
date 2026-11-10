@@ -216,5 +216,13 @@ module! {
             default: 1,
             description: "G16: validate CDM/VDM stream records",
         },
+        g17_retire_clear: u32 {
+            default: 0,
+            description: "G17: clear render scratch at retirement (A/B)",
+        },
+        g17_submit_trylock: u32 {
+            default: 0,
+            description: "G17: defer an ioctl render on device-lock contention (A/B)",
+        },
     },
 }

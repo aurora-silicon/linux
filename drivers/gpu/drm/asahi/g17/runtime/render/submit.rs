@@ -352,7 +352,7 @@ impl Backend {
             Some(lease) if u32::from(lease.slot()) == known => {
                 let slot = lease.slot();
                 packet.completion.attach_render_lease(lease)?;
-                if let Some(result) = self.render_direct(packet, slot, deferred) {
+                if let Some(result) = self.render_direct(packet, slot, sleep, deferred) {
                     return result;
                 }
                 packet.completion.detach_render_lease()
@@ -363,7 +363,7 @@ impl Backend {
         let slot = admission.slot();
         packet.completion.attach_render_lease(admission)?;
         if ready {
-            if let Some(result) = self.render_direct(packet, slot, deferred) {
+            if let Some(result) = self.render_direct(packet, slot, sleep, deferred) {
                 return result;
             }
         }

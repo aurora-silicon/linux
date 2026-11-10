@@ -102,6 +102,32 @@ unsafe impl ClockSource for Monotonic {
     }
 }
 
+/// A coarse monotonically increasing clock.
+///
+/// This has the same suspend and adjustment semantics as [`Monotonic`], but
+/// reads the timekeeper's cached value without sampling the hardware clock.
+pub struct CoarseMonotonic;
+
+extern "C" {
+    fn ktime_get_coarse_ts64(ts: *mut bindings::timespec64);
+}
+
+// SAFETY: `ktime_get_coarse_ts64()` returns a normalized, nonnegative
+// CLOCK_MONOTONIC timestamp, which fits in `ktime_t` by the timekeeping API.
+unsafe impl ClockSource for CoarseMonotonic {
+    const ID: bindings::clockid_t = bindings::CLOCK_MONOTONIC_COARSE as bindings::clockid_t;
+
+    fn ktime_get() -> bindings::ktime_t {
+        let mut ts = bindings::timespec64 {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is writable for one complete timespec64.
+        unsafe { ktime_get_coarse_ts64(&mut ts) };
+        ts.tv_sec * bindings::NSEC_PER_SEC as i64 + ts.tv_nsec as i64
+    }
+}
+
 /// A settable system-wide clock that measures real (i.e., wall-clock) time.
 ///
 /// Setting this clock requires appropriate privileges. This clock is

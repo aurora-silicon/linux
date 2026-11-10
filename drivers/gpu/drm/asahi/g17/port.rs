@@ -116,6 +116,7 @@ pub(super) struct Port {
     /// Full firmware effort is applied; cleared before an idle clear rechecks `submissions`.
     effort_full: AtomicBool,
     demand: super::power::Demand,
+    clock_frequency: u64,
     last_submission_ns: AtomicU64,
     submissions: AtomicU64,
 }
@@ -158,6 +159,7 @@ impl Port {
         demand: super::power::Demand,
         feed: Arc<super::feed::Feed>,
     ) -> Result<Arc<Self>> {
+        let clock_frequency = qos::frequency();
         Arc::pin_init(
             pin_init!(Self {
                 views: SetOnce::new(),
@@ -172,6 +174,7 @@ impl Port {
                 publications: AtomicU64::new(0),
                 effort_full: AtomicBool::new(false),
                 demand,
+                clock_frequency,
                 last_submission_ns: AtomicU64::new(0),
                 submissions: AtomicU64::new(0),
             }),
@@ -383,10 +386,14 @@ impl Port {
         owner: qos::Owner,
         scheduler: u64,
         policy: Policy,
+        clock: qos::Clock,
     ) -> Result<qos::Publication> {
         let view = self.qos_view()?;
-        let publication = self.qos.lock().publish(&view, owner, scheduler, policy, qos::clock)?;
-        self.rx_update();
+        let publication = self
+            .qos
+            .lock()
+            .publish(&view, owner, scheduler, policy, clock)?;
+        self.rx_update(clock.monotonic_ns());
         Ok(publication)
     }
 
@@ -396,11 +403,14 @@ impl Port {
         owners: [qos::Owner; 2],
         scheduler: u64,
         policy: Policy,
+        clock: qos::Clock,
     ) -> Result<[qos::Publication; 2]> {
         let view = self.qos_view()?;
-        let publications =
-            self.qos.lock().publish_owners(&view, owners, scheduler, policy, qos::clock)?;
-        self.rx_update();
+        let publications = self
+            .qos
+            .lock()
+            .publish_owners(&view, owners, scheduler, policy, clock)?;
+        self.rx_update(clock.monotonic_ns());
         Ok(publications)
     }
 
@@ -412,7 +422,7 @@ impl Port {
     pub(super) fn qos_complete(&self, owners: &[qos::Owner]) -> Result {
         let view = self.qos_view()?;
         self.qos.lock().complete(&view, owners)?;
-        self.rx_update();
+        self.rx_update(super::now_ns());
         Ok(())
     }
 
@@ -420,11 +430,11 @@ impl Port {
     /// Called at every publication and completion: the feed's state lingers for a few
     /// milliseconds, so after a pause the publication that ends it restores the default before
     /// its completion arrives.
-    fn rx_update(&self) {
+    fn rx_update(&self, now: u64) {
         let Some(rx) = self.rx.as_ref() else {
             return;
         };
-        let want = self.feed.gpu_bound().then_some(RX_UTIL_MIN_GPU_BOUND);
+        let want = self.feed.gpu_bound_at(now).then_some(RX_UTIL_MIN_GPU_BOUND);
         let mut applied = self.rx_applied.lock();
         if *applied != Some(want) && rx.set(want).is_ok() {
             *applied = Some(want);
@@ -469,10 +479,12 @@ impl Port {
     /// A publisher without the device mutex counts itself before it checks that full effort is
     /// applied. The idle clear withdraws the flag before it rechecks the count, so either the
     /// clear sees this submission or this submission sees the flag withdrawn.
-    pub(super) fn note_submission(&self) -> bool {
+    pub(super) fn note_submission(&self) -> Result<Option<qos::Clock>> {
+        let clock = self.clock();
+        let now = clock.monotonic_ns();
         self.submissions.fetch_add(1, Ordering::SeqCst);
-        self.note_gpu_activity();
-        self.effort_full.load(Ordering::SeqCst)
+        self.note_gpu_activity_at(now);
+        Ok(self.effort_full.load(Ordering::SeqCst).then_some(clock))
     }
 
     pub(super) fn submissions(&self) -> u64 {
@@ -484,9 +496,13 @@ impl Port {
         self.demand.set_active(full);
     }
 
-    pub(super) fn note_gpu_activity(&self) {
-        self.last_submission_ns.store(super::now_ns(), Ordering::Relaxed);
+    pub(super) fn note_gpu_activity_at(&self, now: u64) {
+        self.last_submission_ns.store(now, Ordering::Relaxed);
         self.demand.set_active(true);
+    }
+
+    pub(super) fn clock(&self) -> qos::Clock {
+        qos::clock(self.clock_frequency, super::coarse_now_ns())
     }
 
     pub(super) fn write_power(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
