@@ -2310,6 +2310,39 @@ static int dcp_desktop_modeset(struct apple_dcp *dcp,
 	return iomfb_modeset_v26_6_desktop(dcp, crtc_state);
 }
 
+static bool takeover_adopt = true;
+module_param(takeover_adopt, bool, 0444);
+MODULE_PARM_DESC(takeover_adopt,
+		 "Desktop 26.x panel takeover: present on the loader's live mode instead of setting it again (default: on)");
+
+/*
+ * The loader leaves the panel running, and the firmware keeps that pipe when
+ * it restarts.  Setting the same mode again blanks the panel for ~200 ms, so
+ * adopt it: record the candidate's timing and colour element as the live
+ * mode without set_digital_out_mode.  The swap watchdog follows the swaps
+ * until one completes; if none does, it sets the mode after all
+ * (dcp_swap_watchdog()).
+ */
+static int dcp_takeover_adopt(struct apple_dcp *dcp, const struct drm_display_mode *m)
+{
+	struct dcp_desktop_state *d = dcp->desktop;
+	struct dcp_display_mode sel;
+
+	if (!lookup_mode(dcp, m, &sel))
+		return -ENOENT;
+	dcp->mode = (struct dcp_set_digital_out_mode_req) {
+		.color_mode_id = sel.color_mode_id,
+		.timing_mode_id = sel.timing_mode_id,
+	};
+	dcp->use_timestamps = sel.needs_timestamps;
+	dcp->vrr_enabled = false;
+	d->mode_live = true;
+	d->takeover_adopted = true;
+	dev_info(dcp->dev, "takeover: adopting the live mode (color:%u timing:%u) " DRM_MODE_FMT "\n",
+		 sel.color_mode_id, sel.timing_mode_id, DRM_MODE_ARG(m));
+	return 0;
+}
+
 /*
  * Takeover gate of a desktop 26.x panel, called after the DCP started and
  * before the boot framebuffer is evicted.  Everything that can still be
@@ -2391,7 +2424,13 @@ int dcp_takeover_trial(struct platform_device *pdev, const char **reason)
 		goto out;
 	}
 
-	for (k = 0; k < n; k++) {
+	for (k = 0; takeover_adopt && k < n; k++) {
+		if (!dcp_takeover_adopt(dcp, &cand[k])) {
+			win = k;
+			break;
+		}
+	}
+	for (k = 0; win < 0 && k < n; k++) {
 		int r;
 
 		st->mode = cand[k];
