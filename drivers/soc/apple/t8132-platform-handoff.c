@@ -133,6 +133,13 @@ static int __init t8132_fdt_node_offset(const void *data,
 	return fdt_subnode_offset(data, parent, kbasename(node->full_name));
 }
 
+static bool __init t8132_policy_applies(const void *data, int offset)
+{
+	const char *machine = fdt_getprop(data, offset, "apple,policy-machine", NULL);
+
+	return !machine || of_machine_is_compatible(machine);
+}
+
 /*
  * Apply only availability/ownership, never imported register values. Only the
  * original J713 loader tree (the Airs') can mark a domain okay that the policy
@@ -165,6 +172,9 @@ static int __init t8132_pmgr_policy(struct of_changeset *cs, unsigned int *chang
 				continue;
 			offset = parent < 0 ? parent :
 				fdt_subnode_offset(data, parent, kbasename(node->full_name));
+			/* An entry that names its machine is unknown to every other one. */
+			if (offset >= 0 && !t8132_policy_applies(data, offset))
+				offset = -FDT_ERR_NOTFOUND;
 			status = offset < 0 ? NULL : fdt_getprop(data, offset, "status", &len);
 			/* Unknown legacy domains stay inaccessible, rather than being probed. */
 			if (!status)
