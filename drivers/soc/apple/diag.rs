@@ -42,6 +42,8 @@ extern "C" {
     fn sep_diag_set_attach(attached: bool);
     fn sep_diag_set_endpoints(count: c_uint);
     fn sep_diag_set_keystore_open();
+    fn sep_diag_keystore_ended();
+    fn sep_diag_set_xart(writable: bool);
     fn sep_diag_set_keybag(state: c_int);
     fn sep_diag_sensor_bind() -> c_uint;
     fn sep_diag_set_sensor_result(bind: c_uint, online: bool);
@@ -174,6 +176,24 @@ pub(crate) fn register(
         )
     };
     kernel::error::to_result(ret)
+}
+
+pub(crate) fn xart_state(writable: bool, guard: Option<(u8, bool)>) {
+    XART_WRITABLE.store(writable, Relaxed);
+    let (level, loaded) = guard.unwrap_or((0, false));
+    GUARD_LEVEL.store(u32::from(level), Relaxed);
+    GUARD_LIST.store(loaded, Relaxed);
+    REFUSALS.store(0, Relaxed);
+    // SAFETY: each setter only publishes diagnostic state.
+    unsafe {
+        sep_diag_set_xart(writable);
+        sep_diag_set_xart_guard(c_uint::from(level), loaded, matching() as c_int);
+    }
+}
+
+pub(crate) fn keystore_ended() {
+    // SAFETY: no preconditions; updates one diagnostic word.
+    unsafe { sep_diag_keystore_ended() };
 }
 
 pub(crate) fn attach(attached: bool) {
