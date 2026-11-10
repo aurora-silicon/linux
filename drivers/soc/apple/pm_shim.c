@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * System sleep for the SEP driver: the notifier only forwards "about to sleep"
- * and "back from sleep" to Rust, which ends any Touch ID capture before the
- * system suspends (see pm.rs), and the enclave's power domains are kept on
- * across sleep. The device's suspend and resume callbacks are the firmware
- * suspend's: the enclave is told, and gates its own domain, whose state word is
- * read here. On T8140 at EL2 the sleep driver sends the request at the
- * irreversible commit boundary. Only errors before send may refuse.
+ * System sleep for the SEP driver: the notifier forwards the sleep events to
+ * Rust, which ends any Touch ID capture before the system suspends (see
+ * pm.rs); after a resume from disk on a cold boot it probes the device again;
+ * and the enclave's power domains are kept on across sleep. The device's
+ * suspend and resume callbacks are the firmware suspend's: the enclave is
+ * told, and gates its own domain, whose state word is read here. On T8140 at
+ * EL2 the sleep driver sends the request at the irreversible commit boundary.
+ * Only errors before send may refuse.
  */
 #include <linux/compiler.h>
 #include <linux/delay.h>
@@ -25,8 +26,11 @@
 #include <linux/regmap.h>
 #include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/mailbox.h>
+#include <linux/soc/apple/pmp.h>
 #include <linux/soc/apple/sleep.h>
+#include <linux/spinlock.h>
 #include <linux/suspend.h>
+#include <linux/workqueue.h>
 
 #include <asm/virt.h>
 
@@ -42,33 +46,174 @@ module_param(sleep_refuse_before_send, bool, 0644);
 MODULE_PARM_DESC(sleep_refuse_before_send,
 		 "Test only: refuse the next prepared deep sleep before sending SEP SLEEP");
 
-static void (*sep_pm_event)(bool entering);
+static int (*sep_pm_event)(int event);
+static struct device *sep_pm_dev;
 static int (*sep_pm_sleep)(void);
 static void (*sep_pm_wake)(void);
 static bool (*sep_pm_told)(void);
 /* In the device's .suspend, the only caller that can leave the request to the sleep. */
 static bool sep_pm_suspending;
 
+/*
+ * Whether the boot loader restarted the SoC under this hibernation. iBoot
+ * boots sepOS anew on every boot, and the SEP has no run bit the AP can read,
+ * so the PMP's restore (priority 10, ahead of this notifier) is asked: it
+ * counts the resumes from disk that found the PMP halted. The count is taken
+ * at registration and again at each hibernation's prepare and end, so a
+ * prepare this notifier missed (registered during it) still compares with
+ * the last count. Negative: no bound PMP, cold or warm cannot be told.
+ */
+static int sep_pm_cold_base = -ENODEV;
+
+/* The marker dt.rs leaves on the SEP node once the registration is sent. */
+#define SEP_REGISTERED_PROP "apple,sep-shmem-registered-iova"
+
+/*
+ * A resume from disk on a cold boot: the enclave runs a freshly booted sepOS
+ * that has never seen this kernel's registration, so the restored session is
+ * dead. The device is probed again from a work item, as at boot: probe sends
+ * a new registration (the marker is gone with the session it guarded), opens
+ * the xART store and loads the host state from disk again (the boot that
+ * resumed this image may have changed both), and recreates /dev/sep-bio.
+ */
+static struct device *sep_reprobe_dev;
+static DEFINE_SPINLOCK(sep_reprobe_lock);
+
+static void sep_reprobe_fn(struct work_struct *work)
+{
+	struct device *dev;
+	int ret;
+
+	spin_lock(&sep_reprobe_lock);
+	dev = sep_reprobe_dev;
+	sep_reprobe_dev = NULL;
+	spin_unlock(&sep_reprobe_lock);
+	if (!dev)
+		return;
+
+	dev_info(dev, "resume from disk: attaching the restarted enclave again\n");
+	ret = device_reprobe(dev);
+	/* A failed probe is not reported by device_reprobe() itself. */
+	if (ret || !READ_ONCE(dev->driver))
+		dev_err(dev, "resume from disk: probing the SEP again failed (%d); Touch ID stays down until a reboot\n",
+			ret);
+	put_device(dev);
+}
+
+static DECLARE_WORK(sep_reprobe_work, sep_reprobe_fn);
+
+static void sep_pm_schedule_reprobe(struct device *dev)
+{
+	struct device_node *np = dev->of_node;
+	struct property *prop;
+
+	/*
+	 * Only here, with the cold boot established: removing the marker on a
+	 * live enclave would let a second registration park it.
+	 */
+	prop = np ? of_find_property(np, SEP_REGISTERED_PROP, NULL) : NULL;
+	if (prop && of_remove_property(np, prop)) {
+		dev_err(dev, "resume from disk: the registration marker could not be removed; Touch ID stays down until a reboot\n");
+		return;
+	}
+
+	spin_lock(&sep_reprobe_lock);
+	if (!sep_reprobe_dev) {
+		sep_reprobe_dev = get_device(dev);
+		queue_work(system_dfl_wq, &sep_reprobe_work);
+	}
+	spin_unlock(&sep_reprobe_lock);
+}
+
+/* The module goes away: no probe may run from the work item after it. */
+void sep_pm_exit(void)
+{
+	struct device *dev;
+
+	cancel_work_sync(&sep_reprobe_work);
+	spin_lock(&sep_reprobe_lock);
+	dev = sep_reprobe_dev;
+	sep_reprobe_dev = NULL;
+	spin_unlock(&sep_reprobe_lock);
+	if (dev)
+		put_device(dev);
+}
+
 static int sep_pm_notify(struct notifier_block *nb, unsigned long action,
 			 void *data)
 {
-	void (*event)(bool entering) = READ_ONCE(sep_pm_event);
+	int (*event)(int event) = READ_ONCE(sep_pm_event);
+	struct device *dev = READ_ONCE(sep_pm_dev);
+	int base, now;
 
 	if (!event)
 		return NOTIFY_DONE;
 
 	switch (action) {
 	case PM_SUSPEND_PREPARE:
-	case PM_HIBERNATION_PREPARE:
-	case PM_RESTORE_PREPARE:
 		sep_diag_sleep(true);
-		event(true);
+		event(SEP_PM_SLEEP);
 		return NOTIFY_OK;
 	case PM_POST_SUSPEND:
-	case PM_POST_HIBERNATION:
-	case PM_POST_RESTORE:
-		event(false);
+		event(SEP_PM_WAKE);
 		sep_diag_sleep(false);
+		return NOTIFY_OK;
+	case PM_HIBERNATION_PREPARE:
+		sep_diag_sleep(true);
+		sep_pm_cold_base = apple_pmp_cold_restarts();
+		event(SEP_PM_HIBERNATE);
+		return NOTIFY_OK;
+	case PM_RESTORE_PREPARE:
+		sep_diag_sleep(true);
+		/*
+		 * This kernel is about to load an image. If it registered with the
+		 * enclave, the enclave keeps that session and may DMA into memory
+		 * the image overwrites, and the restored kernel would register a
+		 * second time: refuse the restore (this boot goes on instead).
+		 */
+		if (event(SEP_PM_RESTORE) > 0) {
+			pr_err("apple_sep: this kernel attached the SEP; refusing to restore a hibernation image over it\n");
+			return NOTIFY_BAD;
+		}
+		return NOTIFY_OK;
+	case PM_POST_RESTORE:
+		event(SEP_PM_HIBERNATE_WARM);
+		sep_diag_sleep(false);
+		return NOTIFY_OK;
+	case PM_POST_HIBERNATION:
+		sep_diag_sleep(false);
+		/*
+		 * Ends an aborted hibernation, the wake of a hybrid sleep and a
+		 * resume from the image alike. Only a resume from the image can
+		 * have gone through a boot, and only the PMP knows whether it did
+		 * (a test resume does not): a hybrid sleep's wake is never taken
+		 * for a cold boot, even when the PMP did not come back from its
+		 * suspend-to-RAM and the PMP's restore finds it halted.
+		 */
+		base = sep_pm_cold_base;
+		now = apple_pmp_cold_restarts();
+		sep_pm_cold_base = now;
+		if (!pm_hibernate_is_restored()) {
+			event(SEP_PM_HIBERNATE_WARM);
+			return NOTIFY_OK;
+		}
+		if (base < 0 || now < 0) {
+			/*
+			 * Cold or warm cannot be told. Sending to a freshly booted
+			 * enclave, or registering again with a live one, are both
+			 * worse than losing Touch ID until a reboot.
+			 */
+			if (dev)
+				dev_err(dev, "hibernation: no PMP count, cannot tell a cold boot; the SEP session is dropped until a reboot\n");
+			event(SEP_PM_HIBERNATE_COLD);
+			return NOTIFY_OK;
+		}
+		if (now != base) {
+			if (event(SEP_PM_HIBERNATE_COLD) > 0 && dev)
+				sep_pm_schedule_reprobe(dev);
+			return NOTIFY_OK;
+		}
+		event(SEP_PM_HIBERNATE_WARM);
 		return NOTIFY_OK;
 	default:
 		return NOTIFY_DONE;
@@ -77,6 +222,8 @@ static int sep_pm_notify(struct notifier_block *nb, unsigned long action,
 
 static struct notifier_block sep_pm_nb = {
 	.notifier_call = sep_pm_notify,
+	/* Below the PMP's 10, so that its restore has counted a cold boot. */
+	.priority = 0,
 };
 
 /* The enclave's own domain is the first one its node lists. */
@@ -474,21 +621,24 @@ const struct dev_pm_ops sep_pm_ops = {
 	.suspend_noirq = pm_sleep_ptr(sep_pm_suspend_noirq),
 };
 
-int sep_pm_register(void *ptr, void (*event)(bool entering), int (*sleep)(void),
+int sep_pm_register(void *ptr, int (*event)(int event), int (*sleep)(void),
 		    void (*wake)(void), bool (*told)(void))
 {
 	int ret;
 
+	WRITE_ONCE(sep_pm_dev, (struct device *)ptr);
 	WRITE_ONCE(sep_pm_event, event);
 	WRITE_ONCE(sep_pm_sleep, sleep);
 	WRITE_ONCE(sep_pm_wake, wake);
 	WRITE_ONCE(sep_pm_told, told);
+	sep_pm_cold_base = apple_pmp_cold_restarts();
 	ret = register_pm_notifier(&sep_pm_nb);
 	if (ret) {
 		WRITE_ONCE(sep_pm_event, NULL);
 		WRITE_ONCE(sep_pm_sleep, NULL);
 		WRITE_ONCE(sep_pm_wake, NULL);
 		WRITE_ONCE(sep_pm_told, NULL);
+		WRITE_ONCE(sep_pm_dev, NULL);
 		return ret;
 	}
 
@@ -503,6 +653,7 @@ void sep_pm_unregister(void)
 	WRITE_ONCE(sep_pm_sleep, NULL);
 	WRITE_ONCE(sep_pm_wake, NULL);
 	WRITE_ONCE(sep_pm_told, NULL);
+	WRITE_ONCE(sep_pm_dev, NULL);
 }
 
 static void sep_pm_release_domains(void *data)

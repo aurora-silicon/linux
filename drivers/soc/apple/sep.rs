@@ -941,6 +941,18 @@ struct SepData {
     shutting_down: Atomic<bool>,
     capture_epoch: Atomic<u64>,
 
+    // A hibernation is under way (prepare until the kernel knows how it
+    // ended): requests Linux starts get EAGAIN and the enclave's xART writes
+    // are refused, so that neither the host state nor the gigalocker changes
+    // behind the image. Separate from `sleep_gate`, which only a
+    // firmware-driven suspend moves. See pm.rs.
+    session_held: Atomic<bool>,
+    // The enclave was booted anew under a hibernation image (a resume from
+    // disk on a cold boot): nothing of this session may reach it any more.
+    // Set once; the device is then probed again.
+    session_gone: Atomic<bool>,
+    xart_held_logged: Atomic<bool>,
+
     // The system is going to sleep: no capture may start. Changed under the
     // bio session lock; `sleep_over` is signalled when it clears.
     suspending: Atomic<bool>,
@@ -1251,6 +1263,9 @@ impl SepData {
                 registered: Atomic::new(false),
                 shutting_down: Atomic::new(false),
                 capture_epoch: Atomic::new(0),
+                session_held: Atomic::new(false),
+                session_gone: Atomic::new(false),
+                xart_held_logged: Atomic::new(false),
                 suspending: Atomic::new(false),
                 sleep_over <- new_condvar!("SepData::sleep_over"),
                 captures_running: Atomic::new(0),
@@ -1452,24 +1467,29 @@ impl SepData {
         }
     }
 
+    /// Sends a request Linux starts. Refused while a hibernation holds the
+    /// session (EAGAIN) and once the enclave has been booted anew under it
+    /// (ENODEV).
     fn send(&self, msg: Message) -> Result<()> {
-        if self.shutting_down.load(Relaxed) {
+        if self.shutting_down.load(Relaxed) || self.session_gone.load(Relaxed) {
             return Err(ENODEV);
         }
         // Checked with the mailbox lock held: a sender can wait for it for longer
-        // than the system takes to tell the enclave it's going to sleep.
+        // than the system takes to tell the enclave it's going to sleep. The
+        // hibernation hold is taken under it too.
         let mbox = self.mbox.lock();
         let mbox = mbox.as_ref().ok_or(ENODEV)?;
-        if !self.sleep_gate().may_request() {
+        if !self.sleep_gate().may_request() || self.session_held.load(Relaxed) {
             return Err(EAGAIN);
         }
         Self::ring(mbox, msg)
     }
 
     /// As [`Self::send`], for an answer to something the enclave asked: it
-    /// waits for these before it can answer the sleep request.
+    /// waits for these before it can answer the sleep request. A hibernation
+    /// hold does not apply to them, but a lost session does.
     fn send_reply(&self, msg: Message) -> Result<()> {
-        if self.shutting_down.load(Relaxed) {
+        if self.shutting_down.load(Relaxed) || self.session_gone.load(Relaxed) {
             return Err(ENODEV);
         }
         let mbox = self.mbox.lock();
@@ -1478,6 +1498,45 @@ impl SepData {
             return Err(EAGAIN);
         }
         Self::ring(mbox, msg)
+    }
+
+    /// A hibernation starts (`held`) or ended without a cold boot. The hold
+    /// is taken after the capture and entropy holds and lifted before them.
+    pub(crate) fn hibernation_hold(&self, held: bool) {
+        {
+            let _mbox = self.mbox.lock();
+            self.session_held.store(held, Relaxed);
+        }
+        if held {
+            dev_info_ratelimited!(self.dev, "hibernation: holding SEP requests and xART writes\n");
+        } else {
+            self.xart_held_logged.store(false, Relaxed);
+            dev_info_ratelimited!(
+                self.dev,
+                "hibernation: ended without a cold boot, SEP session kept\n"
+            );
+        }
+    }
+
+    /// Whether this kernel registered with the enclave (a kernel about to
+    /// load a hibernation image must not have).
+    pub(crate) fn attached(&self) -> bool {
+        self.registered.load(Relaxed) && !self.session_gone.load(Relaxed)
+    }
+
+    /// The boot loader booted the enclave anew under the hibernation image.
+    /// Everything this session holds there is gone: refuse every message, so
+    /// that the fresh sepOS sees nothing before the new registration, and let
+    /// `pm_shim.c` probe the device again. Returns whether to probe again.
+    pub(crate) fn lose_session(&self) -> bool {
+        if self.session_gone.xchg(true, Relaxed) {
+            return false;
+        }
+        dev_info_ratelimited!(
+            self.dev,
+            "resume from disk on a cold boot: the boot loader restarted the enclave; dropping this session and probing again\n"
+        );
+        true
     }
 
     pub(crate) fn sleep_gate(&self) -> pm::SleepGate {
@@ -1498,6 +1557,15 @@ impl SepData {
             pm::SleepGate::Lost => return Err(EIO),
             pm::SleepGate::Open => {}
             _ => return Err(EBUSY),
+        }
+        // Booted anew under a hibernation image: nothing of the old session may
+        // reach it, the sleep request included (see `lose_session`).
+        if self.session_gone.load(Relaxed) {
+            dev_warn_ratelimited!(
+                self.dev,
+                "the enclave was restarted under a resume from disk, so it isn't told of this sleep\n"
+            );
+            return Ok(());
         }
         // Do not commit a running enclave whose sleep protocol is not ready.
         if self.phase.load(Relaxed) != PHASE_READY || !self.endpoint_present(proto::EP_CONTROL) {
@@ -1826,12 +1894,16 @@ impl SepData {
     /// way to sleep waits for it. It must not then write its request into
     /// the suspend. Lock order: mailbox, then control.
     fn send_entropy_request(&self, msg: Message) -> Result<()> {
-        if self.shutting_down.load(Relaxed) {
+        if self.shutting_down.load(Relaxed) || self.session_gone.load(Relaxed) {
             return Err(ENODEV);
         }
         let mbox = self.mbox.lock();
         let mbox = mbox.as_ref().ok_or(ENODEV)?;
-        if !self.sleep_gate().may_request() || !self.control.lock().entropy_may_send() {
+        // Under the mailbox lock, as in `send`.
+        if !self.sleep_gate().may_request()
+            || self.session_held.load(Relaxed)
+            || !self.control.lock().entropy_may_send()
+        {
             return Err(EAGAIN);
         }
         Self::ring(mbox, msg)
@@ -2083,6 +2155,21 @@ impl SepData {
     }
 
     fn service_xarm(&self, req: &crate::xarm::XarmRequest) {
+        // Behind a hibernation image nothing may change: the restored kernel
+        // would hold a stale view of the gigalocker and of the host files.
+        // Refused like a read-only gigalocker; reads are still served.
+        if xarm::is_write(req.opcode) && self.session_held.load(Relaxed) {
+            if !self.xart_held_logged.xchg(true, Relaxed) {
+                dev_warn_ratelimited!(
+                    self.dev,
+                    "xART: refused the enclave's write (op 0x{:02x}) during a hibernation\n",
+                    req.opcode
+                );
+            }
+            self.fail_xarm(req.tag);
+            return;
+        }
+
         let want = req.length as usize;
         if want > OOL_SIZE_XARM {
             self.fail_xarm(req.tag);
@@ -3535,6 +3622,15 @@ impl Drop for SepDriver {
     }
 }
 
+/// Dropped after the driver registration (fields drop in order): a probe
+/// queued after a resume from disk must not run once the module goes away.
+struct ReprobeGuard;
+
+impl Drop for ReprobeGuard {
+    fn drop(&mut self) {
+        pm::exit();
+    }
+}
 
 #[pin_data]
 struct SepModule {
@@ -3543,6 +3639,10 @@ struct SepModule {
 
     #[pin]
     _driver: driver::Registration<platform::Adapter<SepDriver>>,
+
+    // After the driver: once it is unregistered no notifier can queue a
+    // reprobe, and the one queued before is cancelled here.
+    _reprobe: ReprobeGuard,
 }
 
 impl kernel::InPlaceModule for SepModule {
@@ -3571,6 +3671,8 @@ impl kernel::InPlaceModule for SepModule {
                 <Self as kernel::ModuleMetadata>::NAME,
                 module,
             ),
+
+            _reprobe: ReprobeGuard,
         })
     }
 }
