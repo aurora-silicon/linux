@@ -15,9 +15,10 @@ obj-$(CONFIG_APPLE_CLUSTER_PWRGATE) += apple-cluster-pwrgate.o
 
 obj-$(CONFIG_APPLE_SOC_SLEEP) += apple-sleep.o
 apple-sleep-y = sleep.o
+obj-$(CONFIG_APPLE_T6040_SLEEP) += t6040-sleep.o
 
 obj-$(CONFIG_APPLE_RTKIT) += apple-rtkit.o
-apple-rtkit-y = rtkit.o rtkit-crashlog.o
+apple-rtkit-y = rtkit.o rtkit-crashlog.o rtkit-hib-handoff.o
 
 obj-$(CONFIG_APPLE_RTKIT_HELPER) += apple-rtkit-helper.o
 apple-rtkit-helper-y = rtkit-helper.o
@@ -41,6 +42,8 @@ DTC_FLAGS_t6030-gate-test := -Wno-interrupts_property -Wno-chosen_node_is_root \
 			     -Wno-avoid_unnecessary_addr_size
 DTC_FLAGS_t8122-gate-test := -Wno-interrupts_property -Wno-chosen_node_is_root
 DTC_FLAGS_t6041-gate-test := -Wno-unit_address_vs_reg -Wno-avoid_unnecessary_addr_size
+
+obj-$(CONFIG_APPLE_AURA_HIBERNATE) += aura-hibernate.o
 
 obj-$(CONFIG_APPLE_TUNABLE) += apple-tunable.o
 apple-tunable-y = tunable.o
