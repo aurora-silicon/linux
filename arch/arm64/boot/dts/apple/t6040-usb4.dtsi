@@ -36,6 +36,8 @@
 		pinctrl-names = "lstx";
 		pinctrl-0 = <&usb4_0_lstx_pins>;
 		lstx-gpios = <&pinctrl_aop 49 GPIO_ACTIVE_HIGH>;
+		/* The router starts only over its port's Type-C PHY in CIO mode. */
+		apple,atc-phy = <&atcphy0>;
 		power-domains = <&ps_atc0_cio>, <&ps_atc0_cio_pcie>,
 				<&ps_atc0_cio_usb>, <&ps_atc0_pcie>;
 		thunderbolt-switch;
@@ -133,6 +135,8 @@
 		pinctrl-names = "lstx";
 		pinctrl-0 = <&usb4_1_lstx_pins>;
 		lstx-gpios = <&pinctrl_aop 51 GPIO_ACTIVE_HIGH>;
+		/* The router starts only over its port's Type-C PHY in CIO mode. */
+		apple,atc-phy = <&atcphy1>;
 		power-domains = <&ps_atc1_cio>, <&ps_atc1_cio_pcie>,
 				<&ps_atc1_cio_usb>, <&ps_atc1_pcie>;
 		thunderbolt-switch;
@@ -230,6 +234,8 @@
 		pinctrl-names = "lstx";
 		pinctrl-0 = <&usb4_2_lstx_pins>;
 		lstx-gpios = <&pinctrl_aop 53 GPIO_ACTIVE_HIGH>;
+		/* The router starts only over its port's Type-C PHY in CIO mode. */
+		apple,atc-phy = <&atcphy2>;
 		power-domains = <&ps_atc2_cio>, <&ps_atc2_cio_pcie>,
 				<&ps_atc2_cio_usb>, <&ps_atc2_pcie>;
 		thunderbolt-switch;
