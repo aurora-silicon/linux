@@ -2114,6 +2114,15 @@ static int dcp_external_start_locked(struct apple_dcp *dcp)
 	int ret;
 
 	lockdep_assert_held(&dcp->external_lock);
+	/*
+	 * Once its DPTX link was withdrawn, the external DCP announces its AV
+	 * interfaces again under fresh interface numbers when the link comes
+	 * back, without closing the old ones. A new generation lets each
+	 * replace the one it supersedes (afk_compact_slot()) instead of piling
+	 * up until the endpoint has no slot left for the audio interface.
+	 */
+	if (!dcp->external_running)
+		WRITE_ONCE(dcp->afk_power_gen, dcp->afk_power_gen + 1);
 	ret = dcp_external_link_locked(dcp);
 	if (ret || dcp->external_running)
 		return ret;
