@@ -234,11 +234,13 @@ static int apple_pmp_commit_stop_fn(void *unused)
 /*
  * Retained J713 power votes have no teardown. On T8140 an unbind leaves the firmware running,
  * and a commit with it running reset the SoC: its sleep registration is what refuses
- * then, every sleep until reboot, since a rebind can't register again.
+ * then, every sleep until reboot, since a rebind can't register again. The T6040 sleep
+ * controller keeps the same registration, never undone.
  */
 bool apple_pmp_keep_bound(void)
 {
-	return apple_pmp_display_retained_board() || of_machine_is_compatible("apple,t8140");
+	return apple_pmp_display_retained_board() || of_machine_is_compatible("apple,t8140") ||
+	       of_machine_is_compatible("apple,t6040");
 }
 
 /* Whether the sleep's last step takes the PMP: registered with the sleep driver, once. */
