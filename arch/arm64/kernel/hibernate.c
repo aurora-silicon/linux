@@ -12,9 +12,12 @@
 #define pr_fmt(x) "hibernate: " x
 #include <linux/cpu.h>
 #include <linux/kvm_host.h>
+#include <linux/memblock.h>
+#include <linux/of.h>
 #include <linux/pm.h>
 #include <linux/sched.h>
 #include <linux/suspend.h>
+#include <linux/soc/apple/aura-hibernate.h>
 #include <linux/utsname.h>
 
 #include <asm/barrier.h>
@@ -81,6 +84,9 @@ static struct arch_hibernate_hdr {
 	phys_addr_t	__hyp_stub_vectors;
 
 	u64		sleep_cpu_mpidr;
+
+	/* What the boot loader decided for the boot that wrote the image. */
+	u64		boot_layout;
 } resume_hdr;
 
 static inline void arch_hdr_invariants(struct arch_hibernate_hdr_invariants *i)
@@ -89,13 +95,127 @@ static inline void arch_hdr_invariants(struct arch_hibernate_hdr_invariants *i)
 	memcpy(i->uts_version, init_utsname()->version, sizeof(i->uts_version));
 }
 
+static u64 hibernate_layout_mix(u64 h, const void *p, size_t len)
+{
+	const u8 *b = p;
+
+	while (len--) {
+		h ^= *b++;
+		h *= 0x100000001b3ULL;		/* FNV-1a */
+	}
+	return h;
+}
+
+/*
+ * The image restores every page to the frame it came from, so the boot that
+ * resumes it must give the kernel what the boot that wrote it did: the same
+ * RAM, and on Apple machines at EL2 the same CTXR exec window (secondaries only
+ * execute inside it) and aura's fixed hibernation layout. A boot loader decides
+ * them on every boot; the kernel build check above cannot see them.
+ *
+ * aura's own image moves with the boot object, and its CPU release addresses
+ * and S2R mailbox with it, inside the range the layout keeps from Linux. The
+ * restored kernel uses neither address of the boot that wrote the image: its
+ * CPUs come back from the boot kernel's pen, a CPU started at its reset vector
+ * again finds the release target the boot kernel wrote (both kernels run at the
+ * window's fixed address), and the T6040 sleep driver takes this boot's mailbox
+ * from aura's tree after the restore. What has to match is the spin table's
+ * shape (the same CPUs, at the same offsets from the mailbox) and that this
+ * boot keeps all of it out of the image.
+ */
+/*
+ * Mix one memory span less the parts in @ex, ranges that this boot keeps out of
+ * the image. iBoot's no-map allocations inside aura's fixed layout (the DCP
+ * oslogs, ANS firmware) move with the boot object and split memblock's regions
+ * differently on every boot; what lies there never holds an image page.
+ */
+static u64 hibernate_mix_span(u64 h, u64 b, u64 e, u32 flags, const u64 (*ex)[2], int nex)
+{
+	u64 size;
+
+	if (b >= e)
+		return h;
+	if (nex && e > ex[0][0] && b < ex[0][1]) {
+		h = hibernate_mix_span(h, b, ex[0][0], flags, ex + 1, nex - 1);
+		return hibernate_mix_span(h, ex[0][1], e, flags, ex + 1, nex - 1);
+	}
+	if (nex)
+		return hibernate_mix_span(h, b, e, flags, ex + 1, nex - 1);
+	size = e - b;
+	h = hibernate_layout_mix(h, &b, sizeof(b));
+	h = hibernate_layout_mix(h, &size, sizeof(size));
+	return hibernate_layout_mix(h, &flags, sizeof(flags));
+}
+
+static u64 hibernate_boot_layout(void)
+{
+	static const char * const chosen_props[] = {
+		"aura,hibernate-layout", "aura,hibernate-dt",
+		"aurora,ctxr-exec-window",
+	};
+	u64 h = 0xcbf29ce484222325ULL, mbox = 0, rel, hwid;
+	u64 layout[2], win[2], ex[2][2];
+	struct memblock_region *r;
+	int nex = 0;
+	struct device_node *np;
+	bool have_mbox = false;
+	const void *v;
+	u8 kept;
+	int i, len;
+
+	np = of_find_node_by_path("/chosen");
+	for (i = 0; np && i < ARRAY_SIZE(chosen_props); i++) {
+		v = of_get_property(np, chosen_props[i], &len);
+		if (!v)
+			continue;
+		h = hibernate_layout_mix(h, chosen_props[i], strlen(chosen_props[i]));
+		h = hibernate_layout_mix(h, v, len);
+	}
+	if (np && !of_property_read_u64(np, "aurora,s2r-mailbox", &mbox)) {
+		have_mbox = true;
+		kept = aura_hibernate_pfn_nosave(PHYS_PFN(mbox));
+		h = hibernate_layout_mix(h, "aurora,s2r-mailbox", strlen("aurora,s2r-mailbox"));
+		h = hibernate_layout_mix(h, &kept, sizeof(kept));
+	}
+	/* aura's layout less the OS window, only where all of it is kept out of the image */
+	if (np && !of_property_read_u64_array(np, "aura,hibernate-layout", layout, 2) &&
+	    !of_property_read_u64_array(np, "aurora,ctxr-exec-window", win, 2) &&
+	    layout[0] <= win[0] && win[0] + win[1] <= layout[1]) {
+		ex[nex][0] = layout[0];
+		ex[nex][1] = win[0];
+		if (aura_hibernate_range_nosave(ex[nex][0], ex[nex][1]))
+			nex++;
+		ex[nex][0] = win[0] + win[1];
+		ex[nex][1] = layout[1];
+		if (aura_hibernate_range_nosave(ex[nex][0], ex[nex][1]))
+			nex++;
+	}
+	of_node_put(np);
+
+	for_each_of_cpu_node(np) {
+		if (of_property_read_u64(np, "cpu-release-addr", &rel))
+			continue;
+		hwid = of_get_cpu_hwid(np, 0);
+		kept = aura_hibernate_pfn_nosave(PHYS_PFN(rel));
+		if (have_mbox)
+			rel -= mbox;
+		h = hibernate_layout_mix(h, &hwid, sizeof(hwid));
+		h = hibernate_layout_mix(h, &rel, sizeof(rel));
+		h = hibernate_layout_mix(h, &kept, sizeof(kept));
+	}
+
+	for_each_mem_region(r)
+		h = hibernate_mix_span(h, r->base, r->base + r->size, r->flags, ex, nex);
+	return h;
+}
+
 int pfn_is_nosave(unsigned long pfn)
 {
 	unsigned long nosave_begin_pfn = sym_to_pfn(&__nosave_begin);
 	unsigned long nosave_end_pfn = sym_to_pfn(&__nosave_end - 1);
 
 	return ((pfn >= nosave_begin_pfn) && (pfn <= nosave_end_pfn)) ||
-		crash_is_nosave(pfn);
+		crash_is_nosave(pfn) || aura_hibernate_pfn_nosave(pfn);
 }
 
 void notrace save_processor_state(void)
@@ -129,8 +249,9 @@ int arch_hibernation_header_save(void *addr, unsigned int max_size)
 		return -ENODEV;
 	}
 	hdr->sleep_cpu_mpidr = cpu_logical_map(sleep_cpu);
-	pr_info("Hibernating on CPU %d [mpidr:0x%llx]\n", sleep_cpu,
-		hdr->sleep_cpu_mpidr);
+	hdr->boot_layout = hibernate_boot_layout();
+	pr_info("Hibernating on CPU %d [mpidr:0x%llx], boot layout %016llx\n", sleep_cpu,
+		hdr->sleep_cpu_mpidr, hdr->boot_layout);
 
 	return 0;
 }
@@ -147,6 +268,12 @@ int arch_hibernation_header_restore(void *addr)
 		pr_crit("Hibernate image not generated by this kernel!\n");
 		return -EINVAL;
 	}
+	if (hdr->boot_layout != hibernate_boot_layout()) {
+		pr_crit("Hibernate image written under another boot layout (%016llx, this boot %016llx): not restored\n",
+			hdr->boot_layout, hibernate_boot_layout());
+		return -EINVAL;
+	}
+	pr_info("Hibernate image written under this boot layout (%016llx)\n", hdr->boot_layout);
 
 	sleep_cpu = get_logical_index(hdr->sleep_cpu_mpidr);
 	pr_info("Hibernated on CPU %d [mpidr:0x%llx]\n", sleep_cpu,
@@ -337,7 +464,7 @@ int swsusp_arch_suspend(void)
 	unsigned long flags;
 	struct sleep_stack_data state;
 
-	if (cpus_are_stuck_in_kernel() || spin_table_cpus_stuck()) {
+	if (cpus_are_stuck_in_kernel() || spin_table_hibernate_cpus_stuck()) {
 		pr_err("Can't hibernate: no mechanism to offline secondary CPUs.\n");
 		return -EBUSY;
 	}
@@ -385,6 +512,9 @@ int swsusp_arch_suspend(void)
 
 		sleep_cpu = -EINVAL;
 		__cpu_suspend_exit();
+
+		/* The boot kernel's secondaries are in its pen, not where the image parked them. */
+		spin_table_hibernate_restored();
 
 		/*
 		 * Just in case the boot kernel did turn the SSBD
@@ -489,10 +619,19 @@ int __nocfi swsusp_arch_resume(void)
 
 int hibernate_resume_nonboot_cpu_disable(void)
 {
+	int ret;
+
 	if (sleep_cpu < 0) {
 		pr_err("Failing to resume from hibernate on an unknown CPU.\n");
 		return -ENODEV;
 	}
 
-	return freeze_secondary_cpus(sleep_cpu);
+	/* Parking spin-table CPUs wait outside the image while it is restored. */
+	ret = spin_table_hibernate_pen_begin(resume_hdr.ttbr1_el1, sleep_cpu);
+	if (ret)
+		return ret;
+	ret = freeze_secondary_cpus(sleep_cpu);
+	spin_table_hibernate_pen_end(!ret);
+
+	return ret;
 }
