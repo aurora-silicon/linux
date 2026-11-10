@@ -940,6 +940,21 @@ static void tb_reclaim_usb3_bandwidth(struct tb *tb, struct tb_port *src_port,
 	tb_tunnel_reclaim_available_bandwidth(tunnel, &available_up, &available_down);
 }
 
+/* Tell the host interface when a USB3 tunnel from the host router changes. */
+static void tb_usb3_host_tunnel_changed(struct tb_tunnel *tunnel, bool on)
+{
+	const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
+	int ret;
+
+	if (!tb_tunnel_is_usb3(tunnel) || tb_route(tunnel->src_port->sw) ||
+	    !ops || !ops->usb3_tunnel_changed)
+		return;
+	ret = ops->usb3_tunnel_changed(tunnel->tb->nhi, on);
+	if (ret)
+		tb_tunnel_warn(tunnel, "host USB3 %s failed: %d\n",
+			       on ? "attach" : "detach", ret);
+}
+
 static int tb_tunnel_usb3(struct tb *tb, struct tb_switch *sw)
 {
 	struct tb_switch *parent = tb_switch_parent(sw);
@@ -1018,6 +1033,7 @@ static int tb_tunnel_usb3(struct tb *tb, struct tb_switch *sw)
 	}
 
 	list_add_tail(&tunnel->list, &tcm->tunnel_list);
+	tb_usb3_host_tunnel_changed(tunnel, true);
 	if (tb_route(parent))
 		tb_reclaim_usb3_bandwidth(tb, down, up);
 
@@ -1838,6 +1854,7 @@ static void tb_deactivate_and_free_tunnel(struct tb_tunnel *tunnel)
 		return;
 
 	tb_dp_tunnel_notify(tunnel, false);
+	tb_usb3_host_tunnel_changed(tunnel, false);
 	tb_tunnel_deactivate(tunnel);
 	list_del(&tunnel->list);
 
