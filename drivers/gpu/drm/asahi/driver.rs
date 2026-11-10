@@ -262,9 +262,10 @@ unsafe fn sleep_data<'a>(dev: *mut bindings::device) -> &'a AsahiPlatformDriverD
 }
 
 /// Runs before any device suspends, so the GPU goes first and work still in flight can finish.
+/// A dry run keeps the power, so the GPU stays up as for suspend-to-idle.
 unsafe extern "C" fn sleep_prepare(dev: *mut bindings::device) -> core::ffi::c_int {
-    // SAFETY: Reads a global flag word.
-    if !unsafe { bindings::pm_suspend_via_firmware() } {
+    // SAFETY: Reads global flag words.
+    if !unsafe { bindings::apple_sleep_power_loss() } {
         return 0;
     }
     // SAFETY: Called by the PM core.

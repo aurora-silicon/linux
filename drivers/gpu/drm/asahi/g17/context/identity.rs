@@ -250,6 +250,12 @@ impl RenderSlots {
         self.last[index] = Some((qids, ordinal));
         true
     }
+    /// Forgets every slot's pass origin, so the next command of each slot carries pass 1 and
+    /// its completion seed pass 0, exactly as the first command of a fresh pair. Used when a
+    /// cold-restarted firmware takes over idle pairs; the slot assignment is kept.
+    pub(super) fn reset_origins(&mut self) {
+        self.origins = [None; 2];
+    }
 }
 
 impl WorkStates {

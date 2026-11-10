@@ -458,6 +458,33 @@ impl Context {
         must_retain(self.work_head().ok(), self.work_head_va(), killed)
     }
 
+    /// Rewrites the firmware-written context pages to their construction contents for a
+    /// cold-restarted firmware: the scheduler page (zero, then `Scheduler::init`) and the
+    /// empty work list head. Idempotent; only while no command of the context is in flight.
+    pub(crate) fn reset_after_cold_boot(&self) -> Result {
+        let scheduler = self.scheduler.pointer(0, UAT_PGSZ)?;
+        // SAFETY: The checked page stays mapped while the Arc lives; the GPU is idle and the
+        // cold firmware has not been handed any queue naming this page yet.
+        unsafe { scheduler.write_bytes(0, UAT_PGSZ) };
+        // SAFETY: The page-aligned page holds a whole Scheduler of plain integers, now zero,
+        // and no other reference to it exists while the device mutex is held.
+        unsafe { (*scheduler.cast::<fw::Scheduler>()).init() };
+        let mut work = self.work.lock();
+        work.render.reset_origins();
+        let head = self.work_head_va();
+        work.object.write(
+            UAT_PGSZ + 0x400,
+            fw::WorkHead {
+                next: 0,
+                previous: head,
+                unk10: 0,
+                unk14: 0,
+            },
+        )?;
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+
     pub(crate) fn work_head_va(&self) -> u64 {
         self.work_base + (UAT_PGSZ + 0x400) as u64
     }

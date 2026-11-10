@@ -699,6 +699,8 @@ pub(crate) struct Manager {
     scenes: KBox<Scenes>,
     page_list_client: u64,
     scratch: u64,
+    /// `ManagerArgs::discard`, kept to rebuild the graph ([`Self::reset_after_cold_boot`]).
+    discard: u64,
     buffer_id: u8,
     generation: u64,
     shrink: Shrink,
@@ -817,11 +819,33 @@ impl Manager {
             scenes,
             page_list_client,
             scratch: args.scratch,
+            discard: args.discard,
             buffer_id: args.buffer_id,
             generation: args.generation,
             shrink: Shrink::default(),
             initialized: false,
         })
+    }
+
+    /// Rebuilds the firmware graph of this manager in place, with its current backing and
+    /// identity, as [`Self::new`] writes it, and requires an InitBM again: a cold-restarted
+    /// firmware never initialized it. Only while no pass of the manager is in flight.
+    pub(crate) fn reset_after_cold_boot(&mut self) -> Result {
+        let address = self.graph.gpu_va();
+        let args = fw::GraphArgs {
+            fw_va: address,
+            page_list_client: self.page_list_client,
+            metrics: self.metrics.addresses,
+            blocks: self.tvb.addresses(),
+            scratch: self.scratch,
+            discard: self.discard,
+            buffer_id: self.buffer_id.into(),
+            generation: self.generation,
+        };
+        self.graph.initialize::<fw::Graph>(0, |view| view.init(&args))?;
+        fence(Ordering::SeqCst);
+        self.initialized = false;
+        Ok(())
     }
 
     /// Whether a published tiling pass initialized this manager (25G83 InitBM).
