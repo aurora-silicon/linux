@@ -124,6 +124,7 @@ struct tb_tunnel {
 	bool host_relinked_up;
 	bool dprx_started;
 	bool dprx_canceled;
+	bool sleep_paused, sleep_replay, sleep_changed;
 	u64 host_dp_generation;
 	bool host_dp_notified;
 	bool host_dp_activated;
@@ -149,6 +150,10 @@ struct tb_tunnel *tb_tunnel_discover_dp(struct tb *tb, struct tb_port *in,
 					void (*callback)(struct tb_tunnel *, void *),
 					void *callback_data);
 void tb_dp_tunnel_cancel_dprx(struct tb_tunnel *tunnel);
+int tb_tunnel_sleep_prepare(struct tb_tunnel *tunnel);
+int tb_tunnel_sleep(struct tb_tunnel *tunnel);
+int tb_tunnel_wake(struct tb_tunnel *tunnel);
+void tb_tunnel_sleep_complete(struct tb_tunnel *tunnel);
 bool tb_apple_nhi_needs_bw_grant(struct tb_nhi *nhi);
 int tb_dp_cap_bandwidth(struct tb_tunnel *tunnel, int bw);
 unsigned int tb_dp_host_counted_bandwidth(u32 max_rate, u32 rate, u32 lanes);
