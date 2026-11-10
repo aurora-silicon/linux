@@ -14,6 +14,7 @@
 
 #include "t6041-j616c-ane.dtsi"
 #include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/leds/common.h>
 #include <dt-bindings/thermal/thermal.h>
 
 / {
@@ -2318,6 +2319,28 @@
 
 #include "t6041-j616c-hdmi.dtsi"
 #include "t6041-j616c-usbc.dtsi"
+
+/*
+ * Keyboard backlight, as on the M4 Pro boards: the ADT /arm-io/pwm0 has one
+ * kbd-backlight channel (reg 0) at default-hz 25000, a 40 us period.
+ */
+/ {
+	led-controller {
+		compatible = "pwm-leds";
+
+		led-0 {
+			pwms = <&fpwm0 0 40000>;
+			label = "apple::kbd_backlight";
+			function = LED_FUNCTION_KBD_BACKLIGHT;
+			color = <LED_COLOR_ID_WHITE>;
+			max-brightness = <255>;
+		};
+	};
+};
+
+&fpwm0 {
+	status = "okay";
+};
 
 /*
  * The front camera. The J614c and J616c ADTs (26.6.2) describe the same isp0:
