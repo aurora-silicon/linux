@@ -120,12 +120,13 @@ struct Queue {
     config_cache: Option<()>, source_hint: ReaderHint, source_readers: AtomicU32, claims: u32, fault_stamp: Option<u32>,
     configuration: Option<()>, retained_owner: Option<()>, timed_out_at: u64,
     m5_install: Option<()>, published_config: Option<()>, outer_started: u32, ordinal: u64,
-    channel_error: bool,
+    channel_error: bool, failed_lifecycle: bool,
 }
 impl Queue {
     fn valid_ticket(&self, _: &Active, _: &Ticket) -> Result { Ok(()) }
     fn qos_owner(&self) -> u64 { 1 }
     fn context(&self) -> Option<&Arc<Context>> { self.binding.as_ref().map(|binding| &binding.context) }
+    fn retain_failed_qid(&self) -> bool { false }
 ''' + methods + r'''
 }
 fn idle(live: &Arc<AtomicUsize>) -> Queue {
@@ -134,7 +135,7 @@ fn idle(live: &Arc<AtomicUsize>) -> Queue {
         previous: None, unpublished_binding: false, released: false,
         graph: Graph { cursors: Cursors { count: 1280, producer: 4, consumer: 4 }, stamp: 7 << 8, fail: false, resets: 0, owner: 2, m5: false },
         binding: Some(Binding { context: Context::new(2, live) }), retirement_ready: false,
-        channel_error: false, released_at: 0, growing: false, pool_phase: PoolPhase::Populated,
+        channel_error: false, failed_lifecycle: false, released_at: 0, growing: false, pool_phase: PoolPhase::Populated,
         needs_fresh_backing: false, exit: None, replays: Fifo::new(),
         awaiting_witness: false, quarantine_error: None, failure_status_pending: false,
         retired_by_teardown: false, spared_quarantine: false, spared_deferred: false,

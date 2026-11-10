@@ -35,18 +35,19 @@ struct Graph;
 impl Graph {fn set_owner(&mut self,_:&Context)->Result{Ok(())}}
 struct ReaderHint; impl ReaderHint {fn has_readers(&self,count:&AtomicU32)->bool{count.load(Ordering::Acquire)!=0}}
 struct Queue {
- owner:Option<u64>,installed:bool,growing:bool,channel_error:bool,growth:Option<ComputeCapacity>,free_list_generation:u64,configuration:Option<()>,retained_owner:Option<()>,
+ owner:Option<u64>,installed:bool,growing:bool,channel_error:bool,failed_lifecycle:bool,growth:Option<ComputeCapacity>,free_list_generation:u64,configuration:Option<()>,retained_owner:Option<()>,
  pool_phase:PoolPhase,release_sent_ns:Option<u64>,pool:Pool,binding:Option<Binding>,previous:Option<Previous>,graph:Graph,
  active:Fifo,replays:Fifo,quarantined:bool,released:bool,retirement_ready:bool,
  retired_by_teardown:bool,released_at:u64,exit:Option<()>,needs_fresh_backing:bool,
  source_hint:ReaderHint,source_readers:AtomicU32,
 }
-fn idle(live:&Arc<AtomicUsize>)->Queue{Queue{owner:Some(1),installed:true,growing:false,channel_error:false,growth:None,
+fn idle(live:&Arc<AtomicUsize>)->Queue{Queue{owner:Some(1),installed:true,growing:false,channel_error:false,failed_lifecycle:false,growth:None,
  free_list_generation:0,configuration:None,retained_owner:None,pool_phase:PoolPhase::Populated,release_sent_ns:None,pool:Pool{pages:Some(Pages(10,21)),fail:false},
  binding:Some(Binding{context:Context::new(live),pool_alias:Some(1),descriptors:Some(2)}),previous:None,graph:Graph,
  active:Fifo{len:0},replays:Fifo{len:0},quarantined:false,released:false,retirement_ready:true,
  retired_by_teardown:false,released_at:0,exit:None,needs_fresh_backing:false,source_hint:ReaderHint,source_readers:AtomicU32::new(0)}}
 impl Queue {
+fn retain_failed_qid(&self)->bool{false}
 ''' + item(source,'pub(crate) fn release_owner(') + item(source,'pub(crate) fn reusable(') + '\n}\n'
     methods = '\n'.join(item(source, sig) for sig in ['pub(crate) fn begin_growth(', 'pub(crate) fn finish_growth(', 'pub(crate) fn growth_token(', 'pub(crate) fn abort_growth(', 'pub(crate) fn observe_vacancy('])
     replace = item((ROOT / 'freelist.rs').read_text(), 'pub(crate) fn replace_pages(')
