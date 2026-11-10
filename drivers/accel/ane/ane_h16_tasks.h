@@ -8,10 +8,11 @@
 #include <linux/errno.h>
 #include <linux/overflow.h>
 #include <linux/string.h>
+#include <linux/sizes.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
 
-#define ANE_H16_TASK_MAX 0x60000
+#define ANE_H16_TASK_MAX SZ_4M
 
 /* Byte addresses in the source-backed H16 register image, exclusive ends. */
 static inline bool ane_h16_register_valid(u32 word)

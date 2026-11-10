@@ -886,14 +886,18 @@ ID, a malformed report or a timeout quarantines the session. Reports with
 an unknown UUID never complete a request. Closing the file sends TERMINATE
 then UNLOAD. Mappings stay until reboot.
 
-One program lifetime per firmware boot is mandatory. On this firmware
-family the first EXECUTE of a newly loaded program can write into the
-previous program's output buffer when the buffer counts match, and a larger
-output overruns that mapping. A second H16_LOAD therefore fails with -EBUSY
-and the log line ``H16 one program per firmware boot; reboot required``,
-also after the first program closed. The transport never publishes the
-secure-mode commands 0x27, 0x28 and 0x34 or the exclave commands 0x30 and
-0x31.
+Several programs may be loaded in one firmware boot and executed in any
+order. On this firmware family a direct (ISR) EXECUTE after a program change
+can write into the previous program's output buffer when the buffer counts
+match, and a larger output overruns that mapping. The first EXECUTE after
+every change of program or process therefore carries request flag bit 0,
+which the firmware's program manager (CAneProgramManagerHx) uses to refuse
+the direct path and queue the request on the execution loop, as macOS's
+traffic does. Program and process IDs are allocated by the firmware
+from FIFO pools of 144 and 288 entries, so an UNLOADed ID is not reissued
+until the pool wraps; the driver treats IDs as opaque. The transport never
+publishes the secure-mode commands 0x27, 0x28 and 0x34 or the exclave
+commands 0x30 and 0x31.
 
 The ``ane-h16-program`` KUnit suite covers add-128 and synthetic slot
 packing, LOAD/CREATE/TERMINATE/UNLOAD bodies and replies, the deny list,
