@@ -52,7 +52,7 @@ properties:
           PCIe adapter configuration space of the USB4 router. Present where
           the root complex exposes the adapter separately, so that the tunnel
           can be configured before a PCIe-C link is brought up.
-      - description: MxWrap co-processor control registers, on T8132 and T6050
+      - description: MxWrap co-processor control registers, on T6030, T8122, T8132 and T6050
       - description: PCIe router AP firmware registers, on T6050
 
   reg-names:
