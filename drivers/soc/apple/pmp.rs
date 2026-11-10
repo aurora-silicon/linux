@@ -74,9 +74,11 @@ const BOOTARGS_SIZE: usize = 0x230;
 const PMP_ENDPOINT: u8 = 0x20;
 const PM_COMMAND_MARKER: u64 = pmp_power::MARKER;
 const PM_COMMAND_SHIFT: u32 = pmp_power::SHIFT;
-const PM_DEVICE_SHIFT: u32 = pmp_power::DEVICE_SHIFT;
-const PM_ARGUMENT_SHIFT: u32 = pmp_power::ARGUMENT_SHIFT;
-const PM_VALUE_SHIFT: u32 = pmp_power::VALUE_SHIFT;
+const PM_POWER_DEVICE_SHIFT: u32 = pmp_power::POWER_DEVICE_SHIFT;
+const PM_POWER_STATE_SHIFT: u32 = pmp_power::POWER_STATE_SHIFT;
+const PM_CONSTRAINT_DOMAIN_SHIFT: u32 = pmp_power::CONSTRAINT_DOMAIN_SHIFT;
+const PM_CONSTRAINT_DEVICE_SHIFT: u32 = pmp_power::CONSTRAINT_DEVICE_SHIFT;
+const PM_CONSTRAINT_LEVEL_SHIFT: u32 = pmp_power::CONSTRAINT_LEVEL_SHIFT;
 const PM_DEVICE_CONSTRAINT: u8 = pmp_power::DEVICE_CONSTRAINT;
 const OPC_GET_IOVA_TABLE: u64 = 0x10;
 const OPC_MALLOC: u64 = 0x12;
@@ -445,9 +447,7 @@ impl PmpData {
     fn recv_message(&self, msg: u64) -> Result<()> {
         let pm_command = (msg >> PM_COMMAND_SHIFT) & 0xff;
         if msg & PM_COMMAND_MARKER != 0
-            && (pm_command == u64::from(PM_DEVICE_CONSTRAINT) + 1
-                || pm_command == 0x0f
-                || pm_command == 0x10)
+            && (pm_command == 0x0f || pm_command == u64::from(PM_DEVICE_CONSTRAINT) + 1)
         {
             let mut state = self.power_command.lock();
             state.reply(msg);
@@ -617,8 +617,8 @@ pub unsafe extern "C" fn apple_pmp_send_power_command(
     let data = unsafe { &*data.cast::<PmpData>() };
     let message = PM_COMMAND_MARKER
         | (u64::from(command) << PM_COMMAND_SHIFT)
-        | (u64::from(device_id) << PM_DEVICE_SHIFT)
-        | (u64::from(enabled) << PM_ARGUMENT_SHIFT);
+        | (u64::from(device_id) << PM_POWER_DEVICE_SHIFT)
+        | (u64::from(enabled) << PM_POWER_STATE_SHIFT);
     let ret = send_pm_command(data, command, message, 0, c"device-power request");
     if ret != 0 {
         return ret;
@@ -649,11 +649,11 @@ pub unsafe extern "C" fn apple_pmp_send_constraint_command(
     let command = PM_DEVICE_CONSTRAINT;
     let message = PM_COMMAND_MARKER
         | (u64::from(command) << PM_COMMAND_SHIFT)
-        | (u64::from(device_id) << PM_DEVICE_SHIFT)
-        | (u64::from(domain) << PM_ARGUMENT_SHIFT)
-        | (u64::from(level) << PM_VALUE_SHIFT);
-    let reply_payload =
-        (u64::from(device_id) << PM_DEVICE_SHIFT) | (u64::from(domain) << PM_ARGUMENT_SHIFT);
+        | (u64::from(domain) << PM_CONSTRAINT_DOMAIN_SHIFT)
+        | (u64::from(device_id) << PM_CONSTRAINT_DEVICE_SHIFT)
+        | (u64::from(level) << PM_CONSTRAINT_LEVEL_SHIFT);
+    let reply_payload = (u64::from(domain) << PM_CONSTRAINT_DOMAIN_SHIFT)
+        | (u64::from(device_id) << PM_CONSTRAINT_DEVICE_SHIFT);
     let ret = send_pm_command(
         data,
         command,
