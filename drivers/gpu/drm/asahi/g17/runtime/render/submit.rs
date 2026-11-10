@@ -749,10 +749,12 @@ impl crate::g17::Firmware {
         let port = self.port.clone();
         let _render = port.render_lock();
         // Both outer destinations must have room before pool accounting or
-        // either inner queue becomes visible.
+        // either inner queue becomes visible. On M5 both are the shared compute ring, and
+        // one check covers the pair (each reads the ring's cursors from shared memory).
         let priority = packet.context.policy().priority();
         if !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Fragment)?
-            || !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Tiling)?
+            || (!self.init.is_m5()
+                && !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Tiling)?)
         {
             return Err(EBUSY);
         }
