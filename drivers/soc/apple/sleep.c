@@ -171,7 +171,8 @@ struct aura_s2r_mailbox {
 #define HPM_POWER_CONNECTED	BIT(0)
 #define HPM_POWER_TYPEC_MODE	GENMASK(3, 2)
 #define HPM_POWER_TYPEC_PD	3
-#define HPM_CONTRACT_MS		5000
+/* A contract that comes back does by 0.7 s; one that doesn't is back after another reset. */
+#define HPM_CONTRACT_MS		1500
 #define HPM_RESET_TRIES		3
 
 /* A PMU register write on the sleep's SPMI bus */
