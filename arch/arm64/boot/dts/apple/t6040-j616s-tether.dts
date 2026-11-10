@@ -8,6 +8,10 @@
 	};
 };
 
+&dcuart {
+	status = "okay";
+};
+
 &hpm0 {
 	status = "disabled";
 };
