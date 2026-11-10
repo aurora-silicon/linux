@@ -41,7 +41,7 @@
  * number the cores 18 * d + 6 * c + n. The boot loader removes the nodes of
  * the cores it did not start.
  */
-#define T6050_CPU(label, mpidr, type, opp, cluster)		\
+#define T6050_CPU(label, mpidr, type, opp, cluster, cpu_cap)	\
 	label: cpu@mpidr {					\
 		compatible = type;				\
 		device_type = "cpu";				\
@@ -49,13 +49,20 @@
 		enable-method = "spin-table";			\
 		operating-points-v2 = <&opp>;			\
 		performance-domains = <&cluster>;		\
+		capacity-dmips-mhz = <cpu_cap>;		\
 		cpu-release-addr = <0 0>; /* to be filled by the loader */ \
 	}
 
+/*
+ * capacity-dmips-mhz from pinned single-thread throughput with every cluster at 4284 MHz (in
+ * both OPP tables), normalised by each core's measured clock (J714sAP): per MHz an M core runs
+ * zstd -3 compression at 0.736, decompression at 0.871 and a Python dict loop at 0.728 of a P
+ * core, geometric mean 0.776, so M 794 and P 1024. Small L1-resident loops run at 0.92-1.01.
+ */
 #define T6050_M_CPU(label, mpidr, cluster) \
-	T6050_CPU(label, mpidr, "apple,sawtooth", mcluster_opp, cluster)
+	T6050_CPU(label, mpidr, "apple,sawtooth", mcluster_opp, cluster, 794)
 #define T6050_P_CPU(label, mpidr, cluster) \
-	T6050_CPU(label, mpidr, "apple,everest", pcluster_opp, cluster)
+	T6050_CPU(label, mpidr, "apple,everest", pcluster_opp, cluster, 1024)
 
 / {
 	compatible = "apple,t6050", "apple,arm-platform";
