@@ -446,7 +446,7 @@ RUST_PREFIX = r'''
 #![allow(dead_code, unused_imports, unused_variables)]
 use std::cell::{Cell, RefCell, RefMut};
 use std::ffi::{c_int, c_void};
-use std::sync::atomic::{AtomicU32, Ordering, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering, Ordering::Relaxed};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)] struct Error(i32);
 impl Error { fn from_errno(n: i32) -> Self { assert!(n < 0); Self(n) } }
 type Result<T = ()> = std::result::Result<T, Error>;
@@ -529,13 +529,15 @@ const PHASE_READY: u32 = 1;
 struct SepData {
     dev: kernel::device::Device, phase: AtomicU32, control: Lock<Control>, mbox: Lock<Option<Mbox>>,
     gate: Cell<pm::SleepGate>, sleep_rx_held: Flag, endpoint: Cell<bool>, control_wq: Wq,
+    session_gone: AtomicBool,
 }
 impl SepData {
     fn new() -> Self {
         Self { dev: kernel::device::Device, phase: AtomicU32::new(PHASE_READY),
             control: Lock(RefCell::new(Control { busy: false, wake_ok: true })),
             mbox: Lock(RefCell::new(Some(Mbox))), gate: Cell::new(pm::SleepGate::Open),
-            sleep_rx_held: Flag(Cell::new(false)), endpoint: Cell::new(true), control_wq: Wq }
+            sleep_rx_held: Flag(Cell::new(false)), endpoint: Cell::new(true), control_wq: Wq,
+            session_gone: AtomicBool::new(false) }
     }
     fn endpoint_present(&self, _: u32) -> bool { self.endpoint.get() }
     fn sleep_gate(&self) -> pm::SleepGate { self.gate.get() }
