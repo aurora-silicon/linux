@@ -4558,6 +4558,16 @@ static int atcphy_usb3_power_off(struct phy *phy)
 		return ret;
 	atcphy->t8103_usb3_retry = false;
 	/*
+	 * T8132 keeps DWC3 on the dummy PIPE while USB4/Thunderbolt owns the
+	 * lanes. Stopping that USB host must not take the dock's PCIe and DP
+	 * tunnels down before their drivers suspend. The Type-C mux owns the
+	 * CIO mode and releases it when the connection ends. A CIO mode whose
+	 * last transition failed is still taken down, as before.
+	 */
+	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132 && atcphy_mode_is_cio(atcphy->mode) &&
+	    !atcphy->mode_dirty)
+		return 0;
+	/*
 	 * dwc3 can tear its host down while a DisplayPort alt mode link is up,
 	 * e.g. when a monitor's built-in hub re-enumerates after a hot-plug.
 	 * Powering the PHY off then cuts the DP lanes under DCP, which reports a
