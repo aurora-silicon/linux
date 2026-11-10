@@ -22,17 +22,20 @@ struct ave_6070_avc_recon_layout {
 
 /*
  * Contiguous 8-bit 4:2:0 AVC reconstruction surface, compressed in
- * 32-pixel luma and 16-pixel chroma tile rows: luma metadata, chroma
- * metadata, luma data, chroma data, in that order.
+ * 32-pixel luma and 16-pixel chroma tile rows over the macroblock-aligned
+ * picture: the luma and chroma data pair first, then the luma and chroma
+ * metadata pair.
  */
 static inline struct ave_6070_avc_recon_layout
 ave_6070_avc_recon_layout(u32 width, u32 height)
 {
 	struct ave_6070_avc_recon_layout l = { };
-	u32 luma_cols = DIV_ROUND_UP(width, 32);
-	u32 luma_rows = DIV_ROUND_UP(height + 4, 32);
-	u32 chroma_cols = DIV_ROUND_UP(width / 2, 16);
-	u32 chroma_rows = DIV_ROUND_UP(height / 2 + 4, 16);
+	u32 coded_w = ALIGN(width, 16), coded_h = ALIGN(height, 16);
+	u32 luma_cols = DIV_ROUND_UP(coded_w, 32);
+	u32 luma_rows = DIV_ROUND_UP(coded_h + 4, 32);
+	u32 chroma_cols = DIV_ROUND_UP(coded_w / 2, 16);
+	u32 chroma_rows = DIV_ROUND_UP(coded_h / 2 + 4, 16);
+	u32 data_span;
 
 	l.luma_data = 1024 * luma_cols * luma_rows;
 	l.chroma_data = ALIGN(512 * chroma_cols * chroma_rows, 128);
@@ -41,11 +44,12 @@ ave_6070_avc_recon_layout(u32 width, u32 height)
 	l.chroma_metadata = ALIGN(8 * roundup_pow_of_two(chroma_cols) *
 				  roundup_pow_of_two(chroma_rows), 128);
 
-	l.luma_metadata_offset = 0;
-	l.chroma_metadata_offset = l.luma_metadata;
-	l.luma_data_offset = l.chroma_metadata_offset + l.chroma_metadata;
-	l.chroma_data_offset = l.luma_data_offset + l.luma_data;
-	l.bytes = l.chroma_data_offset + l.chroma_data;
+	data_span = ALIGN(l.luma_data + l.chroma_data, 128);
+	l.luma_data_offset = 0;
+	l.chroma_data_offset = l.luma_data;
+	l.luma_metadata_offset = data_span;
+	l.chroma_metadata_offset = data_span + l.luma_metadata;
+	l.bytes = data_span + ALIGN(l.luma_metadata + l.chroma_metadata, 128);
 	return l;
 }
 
