@@ -323,6 +323,14 @@ struct ave_slot {
 	bool done; /* reply in, output not delivered yet */
 };
 
+struct ave_frame_result {
+	u32 coded_bytes;
+	u32 parameter_set_bytes;
+	u32 slice_header_bytes;
+	u32 ordinal;
+	u32 frame_type;
+};
+
 #define AVE_MAX_REFS 5
 #define AVE_TILE_BUFS 8
 #define AVE_ENTROPY_SETS 4
@@ -506,6 +514,9 @@ void ave_vb2_put(void *buf_priv);
 
 /* ave-sess.c */
 u32 ave_cq_initial_qp(u32 quality);
+int ave_sess_decode_result(const struct ave_fw_layout *fw, enum ave_codec codec,
+			   const u8 *meta, size_t meta_bytes,
+			   struct ave_frame_result *result);
 struct ave_session *ave_sess_create(struct ave_ctx *ctx);
 void ave_sess_destroy(struct ave_ctx *ctx);
 void ave_sess_reap(struct ave_dev *ave);

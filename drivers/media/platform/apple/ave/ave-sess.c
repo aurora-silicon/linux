@@ -41,11 +41,6 @@
 /* QpBdOffset: 10-bit HEVC lets the QP go 12 below the 8-bit range. */
 #define AVE_QP_BD_OFFSET_10 12
 
-#define AVE_META_BYTES 0xc000
-/* Metadata words: coded bytes (twice), HEVC slice-header bytes, parameter sets */
-#define AVE_META_PAYLOAD 0x120
-#define AVE_META_HEVC_SHDR 0x128
-#define AVE_META_PAYLOAD2 0x12c
 #define AVE_META_PARAMS 0xb2a4
 #define AVE_META_SCAN_FROM 0x200
 #define AVE_SHDR_BYTES (256 * 0x400)
@@ -701,10 +696,7 @@ void ave_sess_prepare_slot(struct ave_session *sess, unsigned int slot)
 		memset(s->aux.cpu, 0, AVE_SHDR_ENTRY_BYTES);
 }
 
-/*
- * A frame reply: +0x10 the session's client token, +0x20 the slot's
- * subtype, +0x40 status. Caller holds hw_lock.
- */
+/* Route one ABI-decoded frame reply to its session and output slot. */
 void ave_sess_reply(struct ave_dev *ave, const struct ave_reply *reply)
 {
 	u64 client = reply->client;
@@ -805,12 +797,13 @@ static void ave_scan_nals(const u8 *p, size_t len, bool hevc, bool *key, bool *p
 }
 
 /* Where in the metadata buffer do the parameter sets start, if anywhere? */
-static int ave_find_params(const u8 *meta, bool hevc)
+static int ave_find_params(const u8 *meta, size_t meta_bytes, bool hevc)
 {
-	if (ave_starts_annexb(meta + AVE_META_PARAMS, AVE_META_BYTES - AVE_META_PARAMS))
+	if (meta_bytes > AVE_META_PARAMS &&
+	    ave_starts_annexb(meta + AVE_META_PARAMS, meta_bytes - AVE_META_PARAMS))
 		return AVE_META_PARAMS;
 	/* Not at the HEVC offset: look for an SPS (H.264) or VPS (HEVC). */
-	for (int i = AVE_META_SCAN_FROM; i + 4 < AVE_META_BYTES; i++) {
+	for (int i = AVE_META_SCAN_FROM; i + 4 < meta_bytes; i++) {
 		u8 type;
 
 		if (meta[i] || meta[i + 1] || meta[i + 2] != 1)
@@ -826,6 +819,7 @@ static void ave_sess_dump(struct ave_ctx *ctx, struct ave_slot *s, const char *w
 {
 	struct ave_session *sess = ctx->sess;
 	const u8 *meta = s->meta.cpu;
+	size_t meta_bytes = s->meta.size;
 	int ps;
 
 	if (sess->warned)
@@ -837,14 +831,14 @@ static void ave_sess_dump(struct ave_ctx *ctx, struct ave_slot *s, const char *w
 	print_hex_dump_debug("ave meta: ", DUMP_PREFIX_OFFSET, 16, 4, meta, 0x200, false);
 	print_hex_dump_debug("ave meta b200: ", DUMP_PREFIX_OFFSET, 16, 1, meta + 0xb200,
 			     0x200, false);
-	ps = ave_find_params(meta, sess->p.codec == AVE_CODEC_HEVC);
+	ps = ave_find_params(meta, meta_bytes, sess->p.codec == AVE_CODEC_HEVC);
 	if (ps >= 0) {
 		dev_dbg(ctx->ave->dev, "parameter sets at metadata +%#x\n", ps);
 		print_hex_dump_debug("ave meta params: ", DUMP_PREFIX_OFFSET, 16, 1, meta + ps,
-				     min(128, AVE_META_BYTES - ps), false);
+				     min_t(size_t, 128, meta_bytes - ps), false);
 	}
 	/* Anything else the firmware wrote past the header words. */
-	for (int i = AVE_META_SCAN_FROM; i < AVE_META_BYTES; i += 16)
+	for (int i = AVE_META_SCAN_FROM; i + 16 <= meta_bytes; i += 16)
 		if (memchr_inv(meta + i, 0, 16))
 			dev_dbg(ctx->ave->dev, "metadata +%#x: %16ph\n", i, meta + i);
 }
@@ -908,27 +902,79 @@ static size_t ave_sess_cbr_fill(struct ave_ctx *ctx, u8 *out, size_t len, size_t
 	return len;
 }
 
+int ave_sess_decode_result(const struct ave_fw_layout *fw, enum ave_codec codec,
+			   const u8 *meta, size_t meta_bytes,
+			   struct ave_frame_result *result)
+{
+	const struct ave_result_layout *l;
+	u32 coded, trim = 0, parameter_bits = 0;
+
+	if (!fw || !meta || !result || codec < AVE_CODEC_H264 || codec > AVE_CODEC_HEVC)
+		return -EINVAL;
+	l = &fw->result[codec - 1];
+	if (meta_bytes < sizeof(u32) || !l->coded_bytes ||
+	    l->coded_bytes > meta_bytes - sizeof(u32))
+		return -EPROTO;
+
+	memset(result, 0, sizeof(*result));
+	coded = get_unaligned_le32(meta + l->coded_bytes);
+	if (l->coded_trim_bytes) {
+		if (l->coded_trim_bytes >= meta_bytes)
+			return -EPROTO;
+		trim = meta[l->coded_trim_bytes];
+	}
+	if (trim > coded)
+		return -EPROTO;
+	result->coded_bytes = coded - trim;
+
+	if (l->parameter_set_bits) {
+		if (l->parameter_set_bits > meta_bytes - sizeof(u32))
+			return -EPROTO;
+		parameter_bits = get_unaligned_le32(meta + l->parameter_set_bits);
+		result->parameter_set_bytes = DIV_ROUND_UP_ULL(parameter_bits, 8);
+	}
+	if (l->hevc_slice_header_bytes) {
+		if (l->hevc_slice_header_bytes > meta_bytes - sizeof(u32))
+			return -EPROTO;
+		result->slice_header_bytes =
+			get_unaligned_le32(meta + l->hevc_slice_header_bytes);
+	}
+	if (l->ordinal) {
+		if (l->ordinal > meta_bytes - sizeof(u32))
+			return -EPROTO;
+		result->ordinal = get_unaligned_le32(meta + l->ordinal);
+	}
+	if (l->frame_type) {
+		if (l->frame_type > meta_bytes - sizeof(u32))
+			return -EPROTO;
+		result->frame_type = get_unaligned_le32(meta + l->frame_type);
+	}
+	return 0;
+}
+
 /*
- * Assemble the access unit of @slot into @dst: the parameter sets the
- * firmware leaves in the metadata buffer (when it emits them), for HEVC the
- * slice header from the first slice-header entry, then the coded data.
- * Metadata +0x120 (repeated at +0x12c) holds the coded length for both
- * codecs, +0x128 the HEVC slice-header length.
+ * Assemble the access unit of @slot into @dst.  Older layouts place optional
+ * parameter sets in the result buffer.  6070 writes them into the dedicated
+ * session buffer and reports their bit count in the per-frame result.  HEVC
+ * keeps each generated slice header separate from its coded slice payload.
  */
 int ave_sess_output(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffer *dst,
 		    bool *keyframe)
 {
 	struct ave_session *sess = ctx->sess;
 	struct ave_slot *s = &sess->slot[slot];
+	const struct ave_fw_layout *fw = ctx->ave->layout;
 	bool hevc = sess->p.codec == AVE_CODEC_HEVC;
 	u8 *out = vb2_plane_vaddr(&dst->vb2_buf, 0);
 	size_t room = vb2_plane_size(&dst->vb2_buf, 0);
 	const u8 *meta = s->meta.cpu;
-	u32 data, data2, shdr = 0;
+	struct ave_frame_result result;
+	u32 data2 = 0;
 	bool params = false, filler = false;
-	ssize_t ps = 0;
+	ssize_t copied;
+	size_t ps = 0;
 	size_t len;
-	int at;
+	int at, ret;
 
 	*keyframe = false;
 	if (!out)
@@ -939,30 +985,50 @@ int ave_sess_output(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buff
 		return -EIO;
 	}
 
-	data = get_unaligned_le32(meta + AVE_META_PAYLOAD);
-	data2 = get_unaligned_le32(meta + AVE_META_PAYLOAD2);
-	if (hevc)
-		shdr = get_unaligned_le32(meta + AVE_META_HEVC_SHDR);
-	if (data != data2)
-		dev_dbg(ctx->ave->dev, "coded length words differ: %u/%u\n", data, data2);
-
-	at = ave_find_params(meta, hevc);
-	if (at >= 0) {
-		ps = ave_copy_annexb(out, room, meta + at, AVE_META_BYTES - at, 16);
-		if (ps < 0)
-			return ps;
+	ret = ave_sess_decode_result(fw, sess->p.codec, meta, s->meta.size, &result);
+	if (ret)
+		return ret;
+	if (fw->result[sess->p.codec - 1].coded_bytes_copy) {
+		data2 = get_unaligned_le32(meta +
+			fw->result[sess->p.codec - 1].coded_bytes_copy);
+		if (result.coded_bytes != data2)
+			dev_dbg(ctx->ave->dev, "coded length words differ: %u/%u\n",
+				result.coded_bytes, data2);
 	}
-	if (!data || data > sess->p.coded_cap || shdr > AVE_SHDR_ENTRY_BYTES ||
-	    ps + shdr + data > room) {
+
+	if (fw->kind == AVE_LAYOUT_6070 && result.parameter_set_bytes) {
+		if (result.parameter_set_bytes > sess->param_sets.size ||
+		    result.parameter_set_bytes > room ||
+		    !ave_starts_annexb(sess->param_sets.cpu,
+				       result.parameter_set_bytes))
+			return -EPROTO;
+		memcpy(out, sess->param_sets.cpu, result.parameter_set_bytes);
+		ps = result.parameter_set_bytes;
+	} else if (fw->kind != AVE_LAYOUT_6070) {
+		at = ave_find_params(meta, s->meta.size, hevc);
+		if (at >= 0) {
+			size_t cap = s->meta.size - at;
+
+			copied = ave_copy_annexb(out, room, meta + at, cap, 16);
+			if (copied < 0)
+				return copied;
+			ps = copied;
+		}
+	}
+	if (!result.coded_bytes || result.coded_bytes > sess->p.coded_cap ||
+	    result.slice_header_bytes > AVE_SHDR_ENTRY_BYTES ||
+	    ps + result.slice_header_bytes + result.coded_bytes > room) {
 		dev_err(ctx->ave->dev, "bad output sizes %u/%u (capacity %u, room %zu)\n",
-			shdr, data, sess->p.coded_cap, room);
+			result.slice_header_bytes, result.coded_bytes,
+			sess->p.coded_cap, room);
 		ave_sess_dump(ctx, s, "bad sizes");
 		return -EPROTO;
 	}
 	if (hevc)
-		memcpy(out + ps, s->aux.cpu, shdr);
-	memcpy(out + ps + shdr, s->coded.cpu, data);
-	len = ps + shdr + data;
+		memcpy(out + ps, s->aux.cpu, result.slice_header_bytes);
+	memcpy(out + ps + result.slice_header_bytes, s->coded.cpu,
+	       result.coded_bytes);
+	len = ps + result.slice_header_bytes + result.coded_bytes;
 
 	if (!ave_starts_annexb(out, len))
 		ave_sess_dump(ctx, s, "not Annex B");

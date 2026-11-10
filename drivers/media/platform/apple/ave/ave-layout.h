@@ -19,6 +19,7 @@ struct ave_reply {
 	enum ave_opcode op;
 	u64 client;
 	u32 subtype, status, raw_status, bytes;
+	u32 completion_index; /* Process replies only */
 };
 
 enum ave_layout_kind {
@@ -279,6 +280,17 @@ struct ave_proc_layout {
 	u8 retained_count;
 };
 
+/* Fields written into a slot's coded-header/result buffer. */
+struct ave_result_layout {
+	u32 coded_bytes;
+	u32 coded_bytes_copy;
+	u32 parameter_set_bits;
+	u32 hevc_slice_header_bytes;
+	u32 coded_trim_bytes; /* u8 */
+	u32 ordinal;
+	u32 frame_type;
+};
+
 struct ave_fw_layout {
 	const char *name;
 	const struct ave_fw_abi *abi;
@@ -287,6 +299,7 @@ struct ave_fw_layout {
 	size_t bytes[2][AVE_IMAGE_COUNT];
 	struct ave_start_layout start[2];
 	struct ave_proc_layout process[2];
+	struct ave_result_layout result[2];
 	u32 hdr_bytes, meta_bytes;
 	u32 process_timeout_us;
 	u8 process_subtype, max_slots, mcc_dsid;
