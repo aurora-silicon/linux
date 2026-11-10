@@ -453,6 +453,12 @@ bool pm_hibernation_mode_is_suspend(void);
 static inline bool pm_hibernation_mode_is_suspend(void) { return false; }
 #endif
 
+#ifdef CONFIG_HIBERNATION
+bool pm_hibernate_is_restored(void);
+#else
+static inline bool pm_hibernate_is_restored(void) { return false; }
+#endif
+
 int arch_resume_nosmt(void);
 
 #ifdef CONFIG_HIBERNATION_SNAPSHOT_DEV

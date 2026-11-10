@@ -15,6 +15,7 @@
 #include <linux/blkdev.h>
 #include <linux/export.h>
 #include <linux/suspend.h>
+#include <linux/soc/apple/aura-hibernate.h>
 #include <linux/reboot.h>
 #include <linux/string.h>
 #include <linux/device.h>
@@ -81,6 +82,25 @@ static const struct platform_hibernation_ops *hibernation_ops;
 
 static atomic_t hibernate_atomic = ATOMIC_INIT(1);
 
+/* Set when swsusp_arch_suspend() returned in a kernel restored from an image. */
+static bool hibernate_restored;
+
+/**
+ * pm_hibernate_is_restored - Whether this kernel was just restored from an image.
+ *
+ * Devices get PMSG_RESTORE both in the kernel restored from a hibernation image
+ * and in the kernel that hibernated when hibernation is aborted before the image
+ * is created (a device failed to freeze, a wakeup event).  Only in the first case
+ * did the hardware go through a boot.  True from the restore until the next
+ * hibernation starts (hibernation_snapshot()); meant for the restore callbacks
+ * and the PM_POST_HIBERNATION notifiers.
+ */
+bool pm_hibernate_is_restored(void)
+{
+	return READ_ONCE(hibernate_restored);
+}
+EXPORT_SYMBOL_GPL(pm_hibernate_is_restored);
+
 #ifdef CONFIG_SUSPEND
 /**
  * pm_hibernation_mode_is_suspend - Check if hibernation has been set to suspend
@@ -123,7 +143,13 @@ bool hibernation_in_progress(void)
  */
 static bool hibernation_platform_blocked(void)
 {
-	return of_machine_is_compatible("apple,arm-platform");
+	/*
+	 * Except where the boot object gives the OS a fixed memory layout and
+	 * the drivers rebuild their coprocessor state from the cold boot that
+	 * restores the image (aura hib=1, see aura-hibernate.c).
+	 */
+	return of_machine_is_compatible("apple,arm-platform") &&
+		!aura_hibernate_layout_fixed();
 }
 
 static bool hibernation_generic_available(void)
@@ -399,6 +425,7 @@ static int create_image(int platform_mode)
 	if (!in_suspend) {
 		events_check_enabled = false;
 		clear_or_poison_free_pages();
+		WRITE_ONCE(hibernate_restored, !error);
 	}
 
 	platform_leave(platform_mode);
@@ -438,6 +465,7 @@ int hibernation_snapshot(int platform_mode)
 	int error;
 
 	pm_suspend_clear_flags();
+	WRITE_ONCE(hibernate_restored, false);
 	error = platform_begin(platform_mode);
 	if (error)
 		goto Close;
@@ -774,6 +802,18 @@ static int load_image_and_restore(void)
 	}
 
 	error = swsusp_read(&flags);
+	if (!error) {
+		/*
+		 * The image is in memory now. Clear its on-disk signature
+		 * before the device restore, so that a restore which hangs
+		 * (for example a co-processor that does not come back after
+		 * the cold boot) cannot leave a valid image for the next boot
+		 * to resume into the same hang. swsusp_close() releases the
+		 * resume device, so do it while that is still open.
+		 */
+		if (swsusp_invalidate_sig())
+			pr_warn("could not invalidate the image signature; a failed restore may repeat\n");
+	}
 	swsusp_close();
 	if (!error)
 		error = hibernation_restore(flags & SF_PLATFORM_MODE);
