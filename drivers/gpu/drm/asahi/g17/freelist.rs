@@ -1371,6 +1371,11 @@ impl Lease {
     }
 
     /// Observes all older release records passed by one consumer snapshot.
+    /// A sent release whose consumption [`Self::observe_releases`] has yet to witness.
+    pub(crate) fn awaits_release(&self) -> bool {
+        self.previous_release.is_some() || matches!(self.phase, LeasePhase::ReleaseSent(_))
+    }
+
     pub(crate) fn observe_releases(&mut self, consumer: u32, producer: u32) -> Result {
         if let Some(cursor) = self.previous_release {
             if control_consumed(consumer, producer, cursor)? {
