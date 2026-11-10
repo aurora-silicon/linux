@@ -2329,3 +2329,36 @@
 
 #include "t6041-j616c-hdmi.dtsi"
 #include "t6041-j616c-usbc.dtsi"
+
+/*
+ * The PMP, as the M4 Pro boards run it (t604x-j614-j616.dtsi). The pmp
+ * alias lets the loader copy this Mac's PMP values from the ADT and enable
+ * the PMP. The GPU sits on the PMP's GPU domain: a running PMP otherwise
+ * treats the GPU as off and holds it at its lowest state.
+ */
+/ {
+	aliases {
+		pmp = &pmp;
+	};
+};
+
+&pmp_dart {
+	status = "okay";
+};
+
+&pmp_report {
+	status = "okay";
+};
+
+&pmp_mbox {
+	status = "okay";
+};
+
+&pmc {
+	apple,pmp = <&pmp>;
+	status = "okay";
+};
+
+&gpu {
+	power-domains = <&pmp_gfx>;
+};
