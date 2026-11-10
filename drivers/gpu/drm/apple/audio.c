@@ -1324,6 +1324,14 @@ static void dcpaud_early_link_work(struct work_struct *work)
 		dev_dbg(dcpaud->dev, "early link: service not open: %d\n", ret);
 		return;
 	}
+	/* The sink's elements, as a PCM open reads them. */
+	scoped_guard(mutex, &dcpaud->substream->pcm->open_mutex)
+		ret = dcpaud_read_remote_info(dcpaud);
+	if (ret) {
+		dcp_audiosrv_close(dcpaud->dcp_dev);
+		dev_warn(dcpaud->dev, "connection's audio link not started: elements: %d\n", ret);
+		return;
+	}
 	scoped_guard(mutex, &dcpaud->link_lock) {
 		dcpaud_drop_stale(dcpaud);
 		/* A stream got there first, or a link is held already. */
