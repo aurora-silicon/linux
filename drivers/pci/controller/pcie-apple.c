@@ -81,6 +81,14 @@ static int link_up_timeout = 500;
 module_param(link_up_timeout, int, 0644);
 MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 
+/*
+ * T6040 S2R (bring-up): a real sleep takes a conventional host's power as a
+ * resume from disk does, so its ports come back the same way.
+ */
+static bool s2r_conventional = true;
+module_param(s2r_conventional, bool, 0644);
+MODULE_PARM_DESC(s2r_conventional, "Set a conventional host's ports up again after a real S2R, as after a resume from disk");
+
 /* T8103 (original M1) and related SoCs */
 #define CORE_RC_PHYIF_CTL		0x00024
 #define   CORE_RC_PHYIF_CTL_RUN		BIT(0)
@@ -5846,6 +5854,9 @@ static void apple_pcie_stop_for_sleep(struct device *dev)
 }
 
 static void apple_pcie_neo_save_functions(struct apple_pcie *pcie);
+static bool apple_pcie_s2r_conventional(struct apple_pcie *pcie);
+static void apple_pcie_hib_save(struct apple_pcie *pcie);
+static void apple_pcie_hib_restore_noirq(struct apple_pcie *pcie, const char *what);
 
 /*
  * The J716c radio drivers save PCI state without entering D3. The PCI core
@@ -5953,6 +5964,8 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 	if (!pcie->hw->tunneled) {
 		if (pm_suspend_no_platform() && pcie->num_pds)
 			return apple_pcie_hold_domains(pcie);
+		if (apple_pcie_s2r_conventional(pcie) && pm_suspend_via_firmware())
+			apple_pcie_hib_save(pcie);
 		return 0;
 	}
 	pcie->reset_on_resume = false;
@@ -6443,8 +6456,11 @@ static int apple_pcie_resume_noirq(struct device *dev)
 		}
 		return ret;
 	}
-	if (!pcie->hw->tunneled)
+	if (!pcie->hw->tunneled) {
+		if (apple_pcie_s2r_conventional(pcie) && pm_resume_via_firmware())
+			apple_pcie_hib_restore_noirq(pcie, "S2R");
 		return 0;
+	}
 	if (pcie->resume_failed)
 		return -EIO;
 	/*
@@ -6542,6 +6558,11 @@ static bool apple_pcie_hib_conventional(struct apple_pcie *pcie)
 	       !pcie->hw->root_bus_only;
 }
 
+static bool apple_pcie_s2r_conventional(struct apple_pcie *pcie)
+{
+	return READ_ONCE(s2r_conventional) && apple_pcie_hib_conventional(pcie);
+}
+
 /* What only the port registers hold, for a restore that finds them reset. */
 static void apple_pcie_hib_save(struct apple_pcie *pcie)
 {
@@ -6606,7 +6627,7 @@ static int apple_pcie_hib_keep_fn(struct pci_dev *pdev, void *data)
  * every cold boot; nothing is written to a port in this phase. Its PWREN is an SMC GPIO, and
  * the SMC session is back only in the normal phase.
  */
-static void apple_pcie_hib_restore_noirq(struct apple_pcie *pcie)
+static void apple_pcie_hib_restore_noirq(struct apple_pcie *pcie, const char *what)
 {
 	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
 	struct apple_pcie_port *port;
@@ -6620,8 +6641,8 @@ static void apple_pcie_hib_restore_noirq(struct apple_pcie *pcie)
 			continue;
 		port->hib_cold = true;
 		cold = true;
-		dev_info(pcie->dev, "resume from disk: %pOF lost its link, setting it up again\n",
-			 port->np);
+		dev_info(pcie->dev, "%s: %pOF lost its link, setting it up again\n",
+			 what, port->np);
 	}
 	if (cold && bridge->bus)
 		pci_walk_bus(bridge->bus, apple_pcie_hib_keep_fn, pcie);
@@ -6693,16 +6714,14 @@ static int apple_pcie_hib_port_up(struct apple_pcie *pcie, struct apple_pcie_por
  * The normal phase, after the SMC's own restore (the PWREN GPIOs are its) and before the PCI
  * core's normal restore of the functions, which waits for this host as their ancestor.
  */
-static int apple_pcie_restore(struct device *dev)
+static void apple_pcie_conventional_up(struct apple_pcie *pcie, const char *what)
 {
-	struct apple_pcie *pcie = apple_pcie_lookup(dev);
+	struct device *dev = pcie->dev;
 	struct apple_pcie_port *port;
 	struct apple_pcie_hib_fn *fn;
 	unsigned int back = 0;
 	int ret;
 
-	if (!apple_pcie_hib_conventional(pcie) || !pm_hibernate_is_restored())
-		return 0;
 	list_for_each_entry(port, &pcie->ports, entry) {
 		if (!port->hib_link_up)
 			continue;
@@ -6716,13 +6735,13 @@ static int apple_pcie_restore(struct device *dev)
 		}
 		ret = apple_pcie_hib_port_up(pcie, port);
 		if (ret) {
-			dev_err(dev, "resume from disk: %pOF link not back (%d), its functions stay unreachable\n",
-				port->np, ret);
+			dev_err(dev, "%s: %pOF link not back (%d), its functions stay unreachable\n",
+				what, port->np, ret);
 			port->hib_cold = false;
 			continue;
 		}
-		dev_info(dev, "resume from disk: %pOF link back, PWREN and PERST# cycled as at probe\n",
-			 port->np);
+		dev_info(dev, "%s: %pOF link back, PWREN and PERST# cycled as at probe\n",
+			 what, port->np);
 		back++;
 	}
 	list_for_each_entry(fn, &pcie->hib_fns, entry) {
@@ -6730,13 +6749,33 @@ static int apple_pcie_restore(struct device *dev)
 		if (!port || !port->hib_cold)
 			continue;
 		if (pci_load_saved_state(fn->pdev, fn->state))
-			pci_warn(fn->pdev, "resume from disk: saved configuration not taken back\n");
+			pci_warn(fn->pdev, "%s: saved configuration not taken back\n", what);
 	}
 	apple_pcie_hib_free_fns(pcie);
 	list_for_each_entry(port, &pcie->ports, entry)
 		port->hib_cold = false;
 	if (back)
-		dev_dbg(dev, "resume from disk: %u port(s) set up again\n", back);
+		dev_dbg(dev, "%s: %u port(s) set up again\n", what, back);
+}
+
+static int apple_pcie_restore(struct device *dev)
+{
+	struct apple_pcie *pcie = apple_pcie_lookup(dev);
+
+	if (!apple_pcie_hib_conventional(pcie) || !pm_hibernate_is_restored())
+		return 0;
+	apple_pcie_conventional_up(pcie, "resume from disk");
+	return 0;
+}
+
+/* The normal phase of a real S2R's resume, ordered as the restore above. */
+static int apple_pcie_resume(struct device *dev)
+{
+	struct apple_pcie *pcie = apple_pcie_lookup(dev);
+
+	if (!apple_pcie_s2r_conventional(pcie) || !pm_resume_via_firmware())
+		return 0;
+	apple_pcie_conventional_up(pcie, "S2R");
 	return 0;
 }
 
@@ -6778,7 +6817,7 @@ static int apple_pcie_restore_noirq(struct device *dev)
 
 	if (!pcie->hw->tunnel_hibernate) {
 		if (apple_pcie_hib_conventional(pcie) && pm_hibernate_is_restored())
-			apple_pcie_hib_restore_noirq(pcie);
+			apple_pcie_hib_restore_noirq(pcie, "resume from disk");
 		return 0;
 	}
 	return apple_pcie_resume_noirq(dev);
@@ -6790,6 +6829,7 @@ static const struct dev_pm_ops apple_pcie_pm_ops = {
 	.suspend_noirq = apple_pcie_suspend_noirq,
 	.resume_noirq = apple_pcie_resume_noirq,
 	.resume_early = apple_pcie_resume_early,
+	.resume = apple_pcie_resume,
 	.freeze_noirq = apple_pcie_hibernate_noirq,
 	.thaw_noirq = apple_pcie_wake_noirq,
 	.poweroff_noirq = apple_pcie_hibernate_noirq,
