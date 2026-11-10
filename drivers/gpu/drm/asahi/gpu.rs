@@ -1489,7 +1489,7 @@ impl Gpu for GpuManager::ver {
         /// Headroom below the smallest CPU, in 64ths of its capacity.
         const SMALLEST_CPU_SHARE_64THS: u32 = 59;
         const WAIT_HINT_MS: u32 = 8;
-        if !cfg!(CONFIG_UCLAMP_TASK) {
+        if !cfg!(CONFIG_UCLAMP_TASK) || crate::module_parameters::legacy_wait_hint.value() == 0 {
             return None;
         }
         // SAFETY: The helper only reads the per-CPU capacity table.

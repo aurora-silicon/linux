@@ -170,6 +170,10 @@ module! {
             // permissions: 0o644,
             description: "Fully isolate GPU contexts (limits performance)",
         },
+        legacy_wait_hint: u32 {
+            default: 1,
+            description: "G13/G14 test: syncobj wait capacity hint (0: off)",
+        },
         legacy_inline_submit: u32 {
             default: 0,
             description: "G13/G14: publish ready in-order jobs from SUBMIT (experimental)",
