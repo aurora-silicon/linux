@@ -1,0 +1,23 @@
+What:		/sys/bus/spmi/devices/<dev>/hib_resume
+Date:		November 2026
+Contact:	František Balázsy <frantisekbalazsy@gmail.com>
+Description:
+		(RW) State a resume from hibernation left an Apple SN201202x
+		USB Type-C port controller in. Reads one of:
+
+		none
+			No resume from hibernation is pending for this port.
+		roles-pending
+			The controller was restored in place after the cold
+			boot behind the resume; the port is revalidated once
+			the USB controller that provides its role switch has
+			been bound again.
+		failed
+			The in-place restore failed; the controller has to be
+			probed again (unbind and bind the device).
+
+		Writing "roles" while the state is "roles-pending" looks the
+		USB role switch up again and revalidates the port, without
+		taking the port, or a display on it, down. Other values fail
+		with -EINVAL, a write in another state with -EALREADY, and
+		-EAGAIN means the USB role switch is not registered yet.

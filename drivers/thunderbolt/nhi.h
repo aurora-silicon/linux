@@ -110,6 +110,9 @@ struct tb_nhi_ring_layout {
  *	       connected to a lane adapter of the host router is unplugged.
  *	       Lets the NHI recover a port whose link went down while the
  *	       cable stays attached.
+ * @usb3_tunnel_changed: A USB3 tunnel from a host router USB3 adapter is
+ *			 now active (@on, after activation) or about to be
+ *			 deactivated (!@on). Called with the domain lock held.
  * @init_interrupts: NHI specific interrupt initialization hook
  * @reset_interface: Resets the host interface
  */
@@ -139,6 +142,7 @@ struct tb_nhi_ops {
 	bool (*add_links)(struct tb_nhi *nhi);
 	bool (*is_present)(struct tb_nhi *nhi);
 	void (*link_lost)(struct tb_nhi *nhi);
+	int (*usb3_tunnel_changed)(struct tb_nhi *nhi, bool on);
 	void (*dp_tunnel_changed)(struct tb_nhi *nhi, u8 in_port, u64 generation, bool active);
 	bool (*dp_tunnel_awaits_display)(struct tb_nhi *nhi, struct tb_port *in);
 	int (*init_interrupts)(struct tb_nhi *nhi);
