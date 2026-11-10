@@ -25,8 +25,9 @@ config APPLE_DBGVIEW
 	help
 	  Root-only debugfs views of Apple SoC debug register blocks: the
 	  interrupt controller timebase, the debug dock connection
-	  status and the unused T8112 DWI interface. The driver only
-	  reads registers, and only when a debugfs file is read.
+	  status and the unused DWI interface of T6000, T8112 and T8140.
+	  The driver only reads registers, and only when a debugfs file is
+	  read.
 
 	  Say m here if you debug an Apple SoC.
 
