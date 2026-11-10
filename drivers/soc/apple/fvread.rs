@@ -21,19 +21,126 @@ use kernel::{
 };
 
 const BLOCK: usize = 4096;
-const ROOT_INFO_SIZE: usize = 40;
+const UUID_SIZE: usize = 16;
 const MAX_RANGE_BLOCKS: u64 = 16;
 const MAX_RECORD: usize = 512;
 const MOD: u64 = 0xffff_ffff;
 
+// APFS object header (obj_phys_t).
+const OBJ_CKSUM_OFF: usize = 0;
+const OBJ_CKSUM_SIZE: usize = 8;
+const OBJ_OID_OFF: usize = 8;
+const OBJ_XID_OFF: usize = 16;
+const OBJ_TYPE_OFF: usize = 24;
+const OBJ_SUBTYPE_OFF: usize = 28;
+const OBJ_PHYS_SIZE: usize = 32;
+const OBJ_TYPE_MASK: u32 = 0xffff;
+const OBJECT_TYPE_NX_SUPERBLOCK: u32 = 1;
+const OBJECT_TYPE_BTREE: u32 = 2;
+const OBJECT_TYPE_BTREE_NODE: u32 = 3;
+const OBJECT_TYPE_OMAP: u32 = 11;
+const OBJECT_TYPE_CHECKPOINT_MAP: u32 = 12;
+const APFS_KEYBAG_OBJ: u32 = 0x6b65_7973;
+
+// nx_superblock_t fields used by the read-only checkpoint walker.
+const NX_MAGIC_OFF: usize = 0x20;
+const NX_BLOCK_SIZE_OFF: usize = 0x24;
+const NX_BLOCK_COUNT_OFF: usize = 0x28;
+const NX_ROCOMPAT_FEATURES_OFF: usize = 0x38;
+const NX_INCOMPAT_FEATURES_OFF: usize = 0x40;
+const NX_UUID_OFF: usize = 0x48;
+const NX_XP_DESC_BLOCKS_OFF: usize = 0x68;
+const NX_XP_DESC_BASE_OFF: usize = 0x70;
+const NX_XP_DESC_INDEX_OFF: usize = 0x88;
+const NX_XP_DESC_LEN_OFF: usize = 0x8c;
+const NX_OMAP_OID_OFF: usize = 0xa0;
+const NX_FS_OID_OFF: usize = 0xb8;
+const NX_MAX_FILE_SYSTEMS: usize = 100;
+const NX_KEYLOCKER_OFF: usize = 0x510;
+const NX_MKB_LOCKER_OFF: usize = 0x570;
+const NX_INCOMPAT_VERSION2: u64 = 2;
+
+// apfs_superblock_t fields used to identify the requested Data volume.
+const APFS_MAGIC_OFF: usize = 0x20;
+const APFS_VOL_UUID_OFF: usize = 0xf0;
+const APFS_VOL_ROLE_OFF: usize = 0x3c4;
+const APFS_VOLUME_GROUP_ID_OFF: usize = 0x3f0;
+const APFS_VOL_ROLE_SYSTEM: u16 = 0x0001;
+const APFS_VOL_ROLE_DATA: u16 = 0x0040;
+
+// omap_phys_t, btree_node_phys_t and fixed omap key/value fields.
+const OMAP_TREE_OID_OFF: usize = 0x30;
+const BTNODE_FLAGS_OFF: usize = 0x20;
+const BTNODE_LEVEL_OFF: usize = 0x22;
+const BTNODE_NKEYS_OFF: usize = 0x24;
+const BTNODE_TABLE_SPACE_OFF_OFF: usize = 0x28;
+const BTNODE_TABLE_SPACE_LEN_OFF: usize = 0x2a;
+const BTNODE_DATA_OFF: usize = 0x38;
+const BTNODE_ROOT: u16 = 0x0001;
+const BTNODE_LEAF: u16 = 0x0002;
+const BTNODE_FIXED_KV_SIZE: u16 = 0x0004;
+const BTREE_INFO_SIZE: usize = 40;
+const BTREE_INFO_FLAGS_OFF: usize = BLOCK - BTREE_INFO_SIZE;
+const BTREE_INFO_NODE_SIZE_OFF: usize = BTREE_INFO_FLAGS_OFF + 4;
+const BTREE_INFO_KEY_SIZE_OFF: usize = BTREE_INFO_FLAGS_OFF + 8;
+const BTREE_INFO_VALUE_SIZE_OFF: usize = BTREE_INFO_FLAGS_OFF + 12;
+const BTREE_PHYSICAL: u32 = 0x0000_0010;
+const OMAP_KEY_SIZE: usize = 16;
+const OMAP_VALUE_SIZE: usize = 16;
+const OMAP_INDEX_VALUE_SIZE: usize = 8;
+const OMAP_KEY_OID_OFF: usize = 0;
+const OMAP_KEY_XID_OFF: usize = 8;
+const OMAP_VALUE_FLAGS_OFF: usize = 0;
+const OMAP_VALUE_SIZE_OFF: usize = 4;
+const OMAP_VALUE_PADDR_OFF: usize = 8;
+const OMAP_INDEX_CHILD_OFF: usize = 0;
+const KVOFF_VALUE_OFF: usize = 2;
+const OMAP_VAL_DELETED: u32 = 0x0000_0001;
+const MAX_OMAP_DEPTH: u16 = 64;
+
+// checkpoint_map_phys_t and checkpoint_mapping_t fields.
+const CPM_FLAGS_OFF: usize = 0x20;
+const CPM_COUNT_OFF: usize = 0x24;
+const CPM_MAPS_OFF: usize = 0x28;
+const CPM_MAPPING_SIZE: usize = 40;
+const CPM_MAP_TYPE_OFF: usize = 0;
+const CPM_MAP_SIZE_OFF: usize = 8;
+const CPM_MAP_OID_OFF: usize = 24;
+const CPM_MAP_PADDR_OFF: usize = 32;
+const CHECKPOINT_MAP_LAST: u32 = 0x0000_0001;
+
+// prange_t.
+const PRANGE_START_OFF: usize = 0;
+const PRANGE_BLOCK_COUNT_OFF: usize = 8;
+
+// APFS keybag locker and entry fields.
 const KB_VERSION: u16 = 2;
+const KB_LOCKER_VERSION_OFF: usize = 0;
+const KB_LOCKER_NKEYS_OFF: usize = 2;
+const KB_LOCKER_NBYTES_OFF: usize = 4;
+const KB_LOCKER_HEADER_SIZE: usize = 16;
+const KB_ENTRY_UUID_OFF: usize = 0;
+const KB_ENTRY_TAG_OFF: usize = 16;
+const KB_ENTRY_KEYLEN_OFF: usize = 18;
+const KB_ENTRY_HEADER_SIZE: usize = 24;
+#[allow(dead_code)]
+const KB_TAG_UNKNOWN: u16 = 0;
+#[allow(dead_code)]
+const KB_TAG_MEDIA_KEY: u16 = 1;
 const KB_TAG_VOLUME_KEY: u16 = 2;
+#[allow(dead_code)]
 const KB_TAG_VOLUME_UNLOCK_RECORDS: u16 = 3;
+#[allow(dead_code)]
+const KB_TAG_VOLUME_PASSPHRASE_HINT: u16 = 4;
+#[allow(dead_code)]
 const KB_TAG_WRAPPING_M_KEY: u16 = 5;
+#[allow(dead_code)]
 const KB_TAG_VOLUME_M_KEY: u16 = 6;
-const WRAPPED_STATE_MAJOR: u16 = 5;
-const WRAPPED_STATE_MINOR: u16 = 0;
+const KB_TAG_VOLUME_DEVICE_KEY: u16 = 7;
+#[allow(dead_code)]
+const KB_TAG_RESERVED_F8: u16 = 0xf8;
 const WRAPPED_MEDIA_KEY_LEN: usize = 40;
+const PROTECTION_CLASS_M: u32 = 14;
 const MAX_FILE_KEY_RECORD: usize = 168;
 
 const FVREAD_IOC_MAGIC: u32 = 0xf7;
@@ -211,12 +318,12 @@ fn le64(data: &[u8], off: usize) -> Result<u64> {
 }
 
 fn checksum(data: &[u8]) -> Result<u64> {
-    if data.len() < 32 || data.len() % 4 != 0 {
+    if data.len() < OBJ_PHYS_SIZE || data.len() % 4 != 0 {
         return Err(EINVAL);
     }
     let mut s1 = 0u64;
     let mut s2 = 0u64;
-    for word in data[8..].chunks_exact(4) {
+    for word in data[OBJ_CKSUM_SIZE..].chunks_exact(4) {
         let value = u64::from(u32::from_le_bytes(word.try_into().map_err(|_| EINVAL)?));
         s1 = (s1 + value) % MOD;
         s2 = (s2 + s1) % MOD;
@@ -227,7 +334,7 @@ fn checksum(data: &[u8]) -> Result<u64> {
 }
 
 fn checked_object(data: &[u8]) -> Result<()> {
-    if le64(data, 0)? != checksum(data)? {
+    if le64(data, OBJ_CKSUM_OFF)? != checksum(data)? {
         return Err(EIO);
     }
     Ok(())
@@ -242,8 +349,8 @@ struct Range {
 impl Range {
     fn from(data: &[u8], off: usize, device_blocks: u64) -> Result<Self> {
         let range = Self {
-            start: le64(data, off)?,
-            blocks: le64(data, off + 8)?,
+            start: le64(data, off + PRANGE_START_OFF)?,
+            blocks: le64(data, off + PRANGE_BLOCK_COUNT_OFF)?,
         };
         if range.start == 0
             || range.blocks == 0
@@ -282,21 +389,21 @@ impl Nx {
     fn parse(data: &[u8], device_size: u64) -> Result<Self> {
         checked_object(data)?;
         if data.len() != BLOCK
-            || data.get(32..36) != Some(b"NXSB")
-            || le32(data, 36)? != BLOCK as u32
-            || le32(data, 24)? & 0xffff != 1
-            || le64(data, 56)? != 0
-            || le64(data, 64)? != 2
+            || data.get(NX_MAGIC_OFF..NX_MAGIC_OFF + 4) != Some(b"NXSB")
+            || le32(data, NX_BLOCK_SIZE_OFF)? != BLOCK as u32
+            || le32(data, OBJ_TYPE_OFF)? & OBJ_TYPE_MASK != OBJECT_TYPE_NX_SUPERBLOCK
+            || le64(data, NX_ROCOMPAT_FEATURES_OFF)? != 0
+            || le64(data, NX_INCOMPAT_FEATURES_OFF)? != NX_INCOMPAT_VERSION2
         {
             return Err(ENOTSUPP);
         }
         let device_blocks = device_size / BLOCK as u64;
-        let blocks = le64(data, 40)?;
+        let blocks = le64(data, NX_BLOCK_COUNT_OFF)?;
         if blocks == 0 || blocks > device_blocks {
             return Err(EINVAL);
         }
-        let desc_count = le32(data, 104)?;
-        let desc_base = le64(data, 112)?;
+        let desc_count = le32(data, NX_XP_DESC_BLOCKS_OFF)?;
+        let desc_base = le64(data, NX_XP_DESC_BASE_OFF)?;
         if desc_count == 0
             || desc_count & (1 << 31) != 0
             || desc_count > 1024
@@ -305,16 +412,19 @@ impl Nx {
             return Err(ENOTSUPP);
         }
         let mut uuid = [0; 16];
-        uuid.copy_from_slice(data.get(72..88).ok_or(EINVAL)?);
+        uuid.copy_from_slice(
+            data.get(NX_UUID_OFF..NX_UUID_OFF + UUID_SIZE)
+                .ok_or(EINVAL)?,
+        );
         Ok(Self {
-            xid: le64(data, 16)?,
+            xid: le64(data, OBJ_XID_OFF)?,
             uuid,
             blocks,
             desc_base,
             desc_count,
-            omap: le64(data, 160)?,
-            keylocker: Range::from(data, 0x510, blocks)?,
-            mkb_locker: Range::from(data, 0x570, blocks)?,
+            omap: le64(data, NX_OMAP_OID_OFF)?,
+            keylocker: Range::from(data, NX_KEYLOCKER_OFF, blocks)?,
+            mkb_locker: Range::from(data, NX_MKB_LOCKER_OFF, blocks)?,
         })
     }
 
@@ -328,21 +438,28 @@ impl Nx {
 }
 
 fn node_entry(node: &[u8], index: usize) -> Result<(&[u8], &[u8])> {
-    if node.len() != BLOCK || le16(node, 34)? != 0 || le16(node, 32)? & 4 == 0 {
+    let flags = le16(node, BTNODE_FLAGS_OFF)?;
+    let level = le16(node, BTNODE_LEVEL_OFF)?;
+    if node.len() != BLOCK || flags & BTNODE_FIXED_KV_SIZE == 0 {
         return Err(ENOTSUPP);
     }
-    let count = le32(node, 36)? as usize;
+    if (level == 0) != (flags & BTNODE_LEAF != 0) {
+        return Err(EINVAL);
+    }
+    let count = le32(node, BTNODE_NKEYS_OFF)? as usize;
     if index >= count || count > 512 {
         return Err(EINVAL);
     }
-    let toc = 56usize
-        .checked_add(le16(node, 40)? as usize)
-        .ok_or(EINVAL)?;
-    let table_len = le16(node, 42)? as usize;
+    let table_off = le16(node, BTNODE_TABLE_SPACE_OFF_OFF)? as usize;
+    if table_off != 0 {
+        return Err(ENOTSUPP);
+    }
+    let toc = BTNODE_DATA_OFF.checked_add(table_off).ok_or(EINVAL)?;
+    let table_len = le16(node, BTNODE_TABLE_SPACE_LEN_OFF)? as usize;
     let key_start = toc.checked_add(table_len).ok_or(EINVAL)?;
     let value_end = BLOCK
-        - if le16(node, 32)? & 1 != 0 {
-            ROOT_INFO_SIZE
+        - if flags & BTNODE_ROOT != 0 {
+            BTREE_INFO_SIZE
         } else {
             0
         };
@@ -351,15 +468,21 @@ fn node_entry(node: &[u8], index: usize) -> Result<(&[u8], &[u8])> {
     }
     let item = toc.checked_add(index * 4).ok_or(EINVAL)?;
     let key_offset = le16(node, item)? as usize;
-    let value_offset = le16(node, item + 2)? as usize;
+    let value_offset = le16(node, item + KVOFF_VALUE_OFF)? as usize;
     let key_start_at = key_start.checked_add(key_offset).ok_or(EINVAL)?;
     let value_start_at = value_end.checked_sub(value_offset).ok_or(EINVAL)?;
-    let key_end = key_start_at.checked_add(16).ok_or(EINVAL)?;
-    let value_end_at = value_start_at.checked_add(16).ok_or(EINVAL)?;
+    let value_size = if level == 0 {
+        OMAP_VALUE_SIZE
+    } else {
+        OMAP_INDEX_VALUE_SIZE
+    };
+    let key_end = key_start_at.checked_add(OMAP_KEY_SIZE).ok_or(EINVAL)?;
+    let value_end_at = value_start_at.checked_add(value_size).ok_or(EINVAL)?;
     if key_start_at < key_start
         || key_end > value_end
         || value_start_at < key_start
         || value_end_at > value_end
+        || key_end > value_start_at
     {
         return Err(EINVAL);
     }
@@ -367,6 +490,44 @@ fn node_entry(node: &[u8], index: usize) -> Result<(&[u8], &[u8])> {
         &node[key_start_at..key_end],
         &node[value_start_at..value_end_at],
     ))
+}
+
+fn compare_omap_key(key: &[u8], oid: u64, xid: u64) -> Result<core::cmp::Ordering> {
+    let key_oid = le64(key, OMAP_KEY_OID_OFF)?;
+    let key_xid = le64(key, OMAP_KEY_XID_OFF)?;
+    Ok(key_oid.cmp(&oid).then_with(|| key_xid.cmp(&xid)))
+}
+
+fn omap_node_entry_le(node: &[u8], oid: u64, xid: u64) -> Result<(&[u8], &[u8])> {
+    let mut selected = None;
+    let mut previous = None;
+    for index in 0..le32(node, BTNODE_NKEYS_OFF)? as usize {
+        let (key, value) = node_entry(node, index)?;
+        let current = (le64(key, OMAP_KEY_OID_OFF)?, le64(key, OMAP_KEY_XID_OFF)?);
+        if previous.is_some_and(|item| item >= current) {
+            return Err(EINVAL);
+        }
+        previous = Some(current);
+        if compare_omap_key(key, oid, xid)? != core::cmp::Ordering::Greater {
+            selected = Some((key, value));
+        }
+    }
+    selected.ok_or(ENODATA)
+}
+
+fn validate_omap_root(node: &[u8]) -> Result<u16> {
+    let flags = le16(node, BTNODE_FLAGS_OFF)?;
+    let level = le16(node, BTNODE_LEVEL_OFF)?;
+    if flags & BTNODE_ROOT == 0
+        || le32(node, BTREE_INFO_NODE_SIZE_OFF)? != BLOCK as u32
+        || le32(node, BTREE_INFO_KEY_SIZE_OFF)? != OMAP_KEY_SIZE as u32
+        || le32(node, BTREE_INFO_VALUE_SIZE_OFF)? != OMAP_VALUE_SIZE as u32
+        || le32(node, BTREE_INFO_FLAGS_OFF)? & BTREE_PHYSICAL == 0
+        || level > MAX_OMAP_DEPTH
+    {
+        return Err(ENOTSUPP);
+    }
+    Ok(level)
 }
 
 struct Entry<'a> {
@@ -381,23 +542,23 @@ struct Locker<'a> {
 
 impl<'a> Locker<'a> {
     fn parse(data: &'a [u8]) -> Result<Self> {
-        if le16(data, 0)? != KB_VERSION {
+        if le16(data, KB_LOCKER_VERSION_OFF)? != KB_VERSION {
             return Err(EPROTONOSUPPORT);
         }
-        let count = le16(data, 2)? as usize;
-        let nbytes = le32(data, 4)? as usize;
-        if count > 256 || nbytes > data.len().saturating_sub(16) {
+        let count = le16(data, KB_LOCKER_NKEYS_OFF)? as usize;
+        let nbytes = le32(data, KB_LOCKER_NBYTES_OFF)? as usize;
+        if count > 256 || nbytes > data.len().saturating_sub(KB_LOCKER_HEADER_SIZE) {
             return Err(EINVAL);
         }
-        let end = 16usize.checked_add(nbytes).ok_or(EINVAL)?;
+        let end = KB_LOCKER_HEADER_SIZE.checked_add(nbytes).ok_or(EINVAL)?;
         let mut entries = KVec::new();
-        let mut off = 16usize;
+        let mut off = KB_LOCKER_HEADER_SIZE;
         for _ in 0..count {
-            let header_end = off.checked_add(24).ok_or(EINVAL)?;
+            let header_end = off.checked_add(KB_ENTRY_HEADER_SIZE).ok_or(EINVAL)?;
             if header_end > end {
                 return Err(EINVAL);
             }
-            let keylen = le16(data, off + 18)? as usize;
+            let keylen = le16(data, off + KB_ENTRY_KEYLEN_OFF)? as usize;
             if keylen > MAX_RECORD {
                 return Err(E2BIG);
             }
@@ -406,11 +567,14 @@ impl<'a> Locker<'a> {
                 return Err(EINVAL);
             }
             let mut uuid = [0; 16];
-            uuid.copy_from_slice(&data[off..off + 16]);
+            uuid.copy_from_slice(
+                data.get(off + KB_ENTRY_UUID_OFF..off + KB_ENTRY_UUID_OFF + UUID_SIZE)
+                    .ok_or(EINVAL)?,
+            );
             entries.push(
                 Entry {
                     uuid,
-                    tag: le16(data, off + 16)?,
+                    tag: le16(data, off + KB_ENTRY_TAG_OFF)?,
                     data: &data[header_end..data_end],
                 },
                 GFP_KERNEL,
@@ -436,17 +600,6 @@ impl<'a> Locker<'a> {
     }
 }
 
-struct MediaRecord {
-    wrapped: [u8; WRAPPED_MEDIA_KEY_LEN],
-    protection_class: u32,
-}
-
-impl Drop for MediaRecord {
-    fn drop(&mut self) {
-        self.wrapped.fill(0);
-    }
-}
-
 struct SensitiveBuffer(KVec<u8>);
 
 impl SensitiveBuffer {
@@ -469,52 +622,24 @@ impl Drop for SensitiveBuffer {
     }
 }
 
-fn media_record(locker: &Locker<'_>, uuid: &[u8; 16], tag: u16) -> Result<MediaRecord> {
-    if !matches!(tag, KB_TAG_WRAPPING_M_KEY | KB_TAG_VOLUME_M_KEY) {
-        return Err(EINVAL);
-    }
-    let data = locker.one(uuid, tag)?;
-    if data.len() != 20 + WRAPPED_MEDIA_KEY_LEN
-        || le16(data, 0)? != WRAPPED_STATE_MAJOR
-        || le16(data, 2)? != WRAPPED_STATE_MINOR
-        || le16(data, 18)? as usize != WRAPPED_MEDIA_KEY_LEN
-    {
-        return Err(EPROTONOSUPPORT);
-    }
-    let protection_class = le32(data, 8)?;
-    if !matches!(protection_class, 1 | 2 | 3 | 4 | 6) {
-        return Err(EPROTONOSUPPORT);
-    }
-    let mut wrapped = [0; WRAPPED_MEDIA_KEY_LEN];
-    wrapped.copy_from_slice(&data[20..]);
-    Ok(MediaRecord {
-        wrapped,
-        protection_class,
-    })
-}
-
 struct VolumeRecords<'a> {
     wrapped_vek: &'a [u8],
-    volume_keybag: Range,
 }
 
-fn volume_records<'a>(
-    locker: &Locker<'a>,
-    volume_uuid: &[u8; 16],
-    device_blocks: u64,
-) -> Result<VolumeRecords<'a>> {
+fn device_key_record<'a>(locker: &Locker<'a>, container_uuid: &[u8; 16]) -> Result<&'a [u8]> {
+    let wrapped = locker.one(container_uuid, KB_TAG_VOLUME_DEVICE_KEY)?;
+    if wrapped.len() != WRAPPED_MEDIA_KEY_LEN {
+        return Err(EPROTONOSUPPORT);
+    }
+    Ok(wrapped)
+}
+
+fn volume_records<'a>(locker: &Locker<'a>, volume_uuid: &[u8; 16]) -> Result<VolumeRecords<'a>> {
     let wrapped_vek = locker.one(volume_uuid, KB_TAG_VOLUME_KEY)?;
     if wrapped_vek.is_empty() {
         return Err(EINVAL);
     }
-    let prange = locker.one(volume_uuid, KB_TAG_VOLUME_UNLOCK_RECORDS)?;
-    if prange.len() != 16 {
-        return Err(EPROTONOSUPPORT);
-    }
-    Ok(VolumeRecords {
-        wrapped_vek,
-        volume_keybag: Range::from(prange, 0, device_blocks)?,
-    })
+    Ok(VolumeRecords { wrapped_vek })
 }
 
 struct OpenBlock {
@@ -576,6 +701,9 @@ impl OpenBlock {
 }
 
 fn read_object(block: &OpenBlock, paddr: u64) -> Result<KVec<u8>> {
+    if paddr >= block.size / BLOCK as u64 {
+        return Err(EINVAL);
+    }
     let object = block.read_plain(paddr.checked_mul(BLOCK as u64).ok_or(EINVAL)?, BLOCK)?;
     checked_object(&object)?;
     Ok(object)
@@ -583,27 +711,55 @@ fn read_object(block: &OpenBlock, paddr: u64) -> Result<KVec<u8>> {
 
 fn omap_lookup(block: &OpenBlock, omap_paddr: u64, oid: u64, xid: u64) -> Result<u64> {
     let omap = read_object(block, omap_paddr)?;
-    if le64(&omap, 8)? != omap_paddr {
+    if le64(&omap, OBJ_OID_OFF)? != omap_paddr
+        || le32(&omap, OBJ_TYPE_OFF)? & OBJ_TYPE_MASK != OBJECT_TYPE_OMAP
+    {
         return Err(EINVAL);
     }
-    let tree_paddr = le64(&omap, 48)?;
-    let tree = read_object(block, tree_paddr)?;
-    if le64(&tree, 8)? != tree_paddr || le16(&tree, 34)? != 0 || le16(&tree, 32)? & 4 == 0 {
-        return Err(ENOTSUPP);
+    let mut node_paddr = le64(&omap, OMAP_TREE_OID_OFF)?;
+    let mut node = read_object(block, node_paddr)?;
+    if le64(&node, OBJ_OID_OFF)? != node_paddr
+        || le32(&node, OBJ_TYPE_OFF)? & OBJ_TYPE_MASK != OBJECT_TYPE_BTREE
+        || le32(&node, OBJ_SUBTYPE_OFF)? & OBJ_TYPE_MASK != OBJECT_TYPE_OMAP
+    {
+        return Err(EINVAL);
     }
-    let mut selected: Option<(u64, u32, u32, u64)> = None;
-    for index in 0..le32(&tree, 36)? as usize {
-        let (key, value) = node_entry(&tree, index)?;
-        let key_xid = le64(key, 8)?;
-        if le64(key, 0)? == oid && key_xid <= xid && selected.is_none_or(|item| key_xid > item.0) {
-            selected = Some((key_xid, le32(value, 0)?, le32(value, 4)?, le64(value, 8)?));
+    let mut expected_level = validate_omap_root(&node)?;
+
+    loop {
+        if le16(&node, BTNODE_LEVEL_OFF)? != expected_level {
+            return Err(EINVAL);
         }
+        let (key, value) = omap_node_entry_le(&node, oid, xid)?;
+        if expected_level == 0 {
+            if le64(key, OMAP_KEY_OID_OFF)? != oid {
+                return Err(ENODATA);
+            }
+            let flags = le32(value, OMAP_VALUE_FLAGS_OFF)?;
+            let object_size = le32(value, OMAP_VALUE_SIZE_OFF)?;
+            let paddr = le64(value, OMAP_VALUE_PADDR_OFF)?;
+            if flags & OMAP_VAL_DELETED != 0 || object_size != BLOCK as u32 {
+                return Err(ENOTSUPP);
+            }
+            if paddr >= block.size / BLOCK as u64 {
+                return Err(EINVAL);
+            }
+            return Ok(paddr);
+        }
+
+        node_paddr = le64(value, OMAP_INDEX_CHILD_OFF)?;
+        let child = read_object(block, node_paddr)?;
+        let child_flags = le16(&child, BTNODE_FLAGS_OFF)?;
+        if le64(&child, OBJ_OID_OFF)? != node_paddr
+            || le32(&child, OBJ_TYPE_OFF)? & OBJ_TYPE_MASK != OBJECT_TYPE_BTREE_NODE
+            || le32(&child, OBJ_SUBTYPE_OFF)? & OBJ_TYPE_MASK != OBJECT_TYPE_OMAP
+            || child_flags & BTNODE_ROOT != 0
+        {
+            return Err(EINVAL);
+        }
+        expected_level -= 1;
+        node = child;
     }
-    let (_, flags, object_size, paddr) = selected.ok_or(ENODATA)?;
-    if flags & 1 != 0 || object_size != BLOCK as u32 {
-        return Err(ENOTSUPP);
-    }
-    Ok(paddr)
 }
 
 struct VolumeIdentity {
@@ -614,28 +770,36 @@ struct VolumeIdentity {
 
 fn validate_data_volume(block: &OpenBlock, nx: &[u8], live: &Nx, wanted: &[u8; 16]) -> Result<()> {
     let mut volumes = KVec::new();
-    for index in 0..100usize {
-        let oid = le64(nx, 184 + index * 8)?;
+    for index in 0..NX_MAX_FILE_SYSTEMS {
+        let oid = le64(nx, NX_FS_OID_OFF + index * core::mem::size_of::<u64>())?;
         if oid == 0 {
             continue;
         }
         let paddr = omap_lookup(block, live.omap, oid, live.xid)?;
         let volume = read_object(block, paddr)?;
-        if volume.get(32..36) != Some(b"APSB")
-            || le64(&volume, 8)? != oid
-            || le64(&volume, 16)? > live.xid
+        if volume.get(APFS_MAGIC_OFF..APFS_MAGIC_OFF + 4) != Some(b"APSB")
+            || le64(&volume, OBJ_OID_OFF)? != oid
+            || le64(&volume, OBJ_XID_OFF)? > live.xid
         {
             return Err(EINVAL);
         }
         let mut uuid = [0; 16];
-        uuid.copy_from_slice(volume.get(0xf0..0x100).ok_or(EINVAL)?);
+        uuid.copy_from_slice(
+            volume
+                .get(APFS_VOL_UUID_OFF..APFS_VOL_UUID_OFF + UUID_SIZE)
+                .ok_or(EINVAL)?,
+        );
         let mut group = [0; 16];
-        group.copy_from_slice(volume.get(0x3f0..0x400).ok_or(EINVAL)?);
+        group.copy_from_slice(
+            volume
+                .get(APFS_VOLUME_GROUP_ID_OFF..APFS_VOLUME_GROUP_ID_OFF + UUID_SIZE)
+                .ok_or(EINVAL)?,
+        );
         volumes.push(
             VolumeIdentity {
                 uuid,
                 group,
-                role: le16(&volume, 0x3c4)?,
+                role: le16(&volume, APFS_VOL_ROLE_OFF)?,
             },
             GFP_KERNEL,
         )?;
@@ -644,7 +808,10 @@ fn validate_data_volume(block: &OpenBlock, nx: &[u8], live: &Nx, wanted: &[u8; 1
     let mut selected_group = None;
     for volume in &volumes {
         if volume.uuid == *wanted {
-            if volume.role != 0x40 || volume.group == [0; 16] || selected_group.is_some() {
+            if volume.role != APFS_VOL_ROLE_DATA
+                || volume.group == [0; 16]
+                || selected_group.is_some()
+            {
                 return Err(ENOTSUPP);
             }
             selected_group = Some(volume.group);
@@ -653,7 +820,7 @@ fn validate_data_volume(block: &OpenBlock, nx: &[u8], live: &Nx, wanted: &[u8; 1
     let selected_group = selected_group.ok_or(ENODATA)?;
     let systems = volumes
         .iter()
-        .filter(|volume| volume.role == 1 && volume.group == selected_group)
+        .filter(|volume| volume.role == APFS_VOL_ROLE_SYSTEM && volume.group == selected_group)
         .count();
     if systems != 1 {
         return Err(ENOTSUPP);
@@ -667,8 +834,8 @@ fn valid_checkpoint(
     superblock_paddr: u64,
     base: &Nx,
 ) -> Result<()> {
-    let index = u64::from(le32(superblock, 136)?);
-    let len = u64::from(le32(superblock, 140)?);
+    let index = u64::from(le32(superblock, NX_XP_DESC_INDEX_OFF)?);
+    let len = u64::from(le32(superblock, NX_XP_DESC_LEN_OFF)?);
     let count = u64::from(base.desc_count);
     if index >= count || len < 2 || len > count {
         return Err(EINVAL);
@@ -677,34 +844,36 @@ fn valid_checkpoint(
     if last != superblock_paddr {
         return Err(EINVAL);
     }
-    let xid = le64(superblock, 16)?;
+    let xid = le64(superblock, OBJ_XID_OFF)?;
     for item in 0..len - 1 {
         let paddr = base.desc_base + (index + item) % count;
         let mapping = block.read_plain(paddr.checked_mul(BLOCK as u64).ok_or(EINVAL)?, BLOCK)?;
         checked_object(&mapping)?;
-        if le32(&mapping, 24)? & 0xffff != 12 || le64(&mapping, 16)? != xid {
+        if le32(&mapping, OBJ_TYPE_OFF)? & OBJ_TYPE_MASK != OBJECT_TYPE_CHECKPOINT_MAP
+            || le64(&mapping, OBJ_XID_OFF)? != xid
+        {
             return Err(EINVAL);
         }
-        let flags = le32(&mapping, 32)?;
-        if flags & 1 != u32::from(item == len - 2) {
+        let flags = le32(&mapping, CPM_FLAGS_OFF)?;
+        if flags & CHECKPOINT_MAP_LAST != u32::from(item == len - 2) {
             return Err(EINVAL);
         }
-        let mappings = le32(&mapping, 36)? as usize;
-        if mappings > (BLOCK - 40) / 40 {
+        let mappings = le32(&mapping, CPM_COUNT_OFF)? as usize;
+        if mappings > (BLOCK - CPM_MAPS_OFF) / CPM_MAPPING_SIZE {
             return Err(EINVAL);
         }
         for map_index in 0..mappings {
-            let at = 40 + map_index * 40;
-            if le32(&mapping, at + 8)? != BLOCK as u32 {
+            let at = CPM_MAPS_OFF + map_index * CPM_MAPPING_SIZE;
+            if le32(&mapping, at + CPM_MAP_SIZE_OFF)? != BLOCK as u32 {
                 return Err(ENOTSUPP);
             }
-            let object_paddr = le64(&mapping, at + 32)?;
+            let object_paddr = le64(&mapping, at + CPM_MAP_PADDR_OFF)?;
             let object =
                 block.read_plain(object_paddr.checked_mul(BLOCK as u64).ok_or(EINVAL)?, BLOCK)?;
             checked_object(&object)?;
-            if le64(&object, 8)? != le64(&mapping, at + 24)?
-                || le64(&object, 16)? != xid
-                || le32(&object, 24)? != le32(&mapping, at)?
+            if le64(&object, OBJ_OID_OFF)? != le64(&mapping, at + CPM_MAP_OID_OFF)?
+                || le64(&object, OBJ_XID_OFF)? != xid
+                || le32(&object, OBJ_TYPE_OFF)? != le32(&mapping, at + CPM_MAP_TYPE_OFF)?
             {
                 return Err(EINVAL);
             }
@@ -789,44 +958,30 @@ impl Session {
         let mkb =
             SensitiveBuffer(block.read_plain(live.mkb_locker.offset()?, live.mkb_locker.bytes()?)?);
         checked_object(mkb.as_slice())?;
-        let mkb_locker = Locker::parse(mkb.as_slice().get(32..).ok_or(EINVAL)?)?;
-        let media = media_record(&mkb_locker, &live.uuid, KB_TAG_WRAPPING_M_KEY)?;
+        let mkb_locker = Locker::parse(mkb.as_slice().get(OBJ_PHYS_SIZE..).ok_or(EINVAL)?)?;
+        let device_key = device_key_record(&mkb_locker, &live.uuid)?;
         let mut media_key = FvKey::zeroed();
+        // Tag 7 is the class-M device wrapping key on hardware-encrypted APFS.
         // SAFETY: pointers describe fixed live buffers and media_key is exclusive output.
         to_result(unsafe {
             apple_sep_fv_unwrap_media_key(
-                media.wrapped.as_ptr(),
-                media.wrapped.len(),
-                media.protection_class,
+                device_key.as_ptr(),
+                device_key.len(),
+                PROTECTION_CLASS_M,
                 &mut media_key,
             )
         })?;
 
         let container = block.read_crypto(live.keylocker, &media_key)?;
-        if le32(container.as_slice(), 24)? != 0x6b65_7973 {
+        if le32(container.as_slice(), OBJ_TYPE_OFF)? != APFS_KEYBAG_OBJ {
             return Err(EBADMSG);
         }
         checked_object(container.as_slice())?;
-        let locker = Locker::parse(container.as_slice().get(32..).ok_or(EINVAL)?)?;
-        let records = volume_records(&locker, &request.volume_uuid, block.size / BLOCK as u64)?;
-        // The FV-off path must not inspect or select any volume unlock record.
-        let volume_media = media_record(&mkb_locker, &request.volume_uuid, KB_TAG_VOLUME_M_KEY)?;
-        let mut volume_media_key = FvKey::zeroed();
-        // SAFETY: pointers describe fixed live buffers and volume_media_key is exclusive output.
-        to_result(unsafe {
-            apple_sep_fv_unwrap_media_key(
-                volume_media.wrapped.as_ptr(),
-                volume_media.wrapped.len(),
-                volume_media.protection_class,
-                &mut volume_media_key,
-            )
-        })?;
-        let volume_bag = block.read_crypto(records.volume_keybag, &volume_media_key)?;
-        if le32(volume_bag.as_slice(), 24)? != 0x7265_6373 {
-            return Err(EBADMSG);
-        }
-        checked_object(volume_bag.as_slice())?;
-        let _volume_locker = Locker::parse(volume_bag.as_slice().get(32..).ok_or(EINVAL)?)?;
+        let locker = Locker::parse(container.as_slice().get(OBJ_PHYS_SIZE..).ok_or(EINVAL)?)?;
+        let records = volume_records(&locker, &request.volume_uuid)?;
+        // With FileVault off, the VEK is UID-only.  There is no user KEK or
+        // volume-keybag record to select: empty secret/KEK fields tell SEP to
+        // follow that hardware-bound path for the container's tag-2 VEK.
 
         let mut volume_key = FvKey::zeroed();
         // SAFETY: empty fields are represented by null/zero; all other buffers are live.
@@ -1037,81 +1192,168 @@ mod tests {
     use super::*;
 
     fn entry(buf: &mut [u8], off: usize, uuid: &[u8; 16], tag: u16, payload: &[u8]) -> usize {
-        buf[off..off + 16].copy_from_slice(uuid);
-        buf[off + 16..off + 18].copy_from_slice(&tag.to_le_bytes());
-        buf[off + 18..off + 20].copy_from_slice(&(payload.len() as u16).to_le_bytes());
-        buf[off + 24..off + 24 + payload.len()].copy_from_slice(payload);
-        (off + 24 + payload.len() + 15) & !15
+        buf[off + KB_ENTRY_UUID_OFF..off + KB_ENTRY_UUID_OFF + uuid.len()].copy_from_slice(uuid);
+        buf[off + KB_ENTRY_TAG_OFF..off + KB_ENTRY_TAG_OFF + 2].copy_from_slice(&tag.to_le_bytes());
+        buf[off + KB_ENTRY_KEYLEN_OFF..off + KB_ENTRY_KEYLEN_OFF + 2]
+            .copy_from_slice(&(payload.len() as u16).to_le_bytes());
+        let data = off + KB_ENTRY_HEADER_SIZE;
+        buf[data..data + payload.len()].copy_from_slice(payload);
+        (data + payload.len() + 15) & !15
     }
 
     fn header(buf: &mut [u8], count: u16, end: usize) {
-        buf[0..2].copy_from_slice(&KB_VERSION.to_le_bytes());
-        buf[2..4].copy_from_slice(&count.to_le_bytes());
-        buf[4..8].copy_from_slice(&((end - 16) as u32).to_le_bytes());
+        buf[KB_LOCKER_VERSION_OFF..KB_LOCKER_VERSION_OFF + 2]
+            .copy_from_slice(&KB_VERSION.to_le_bytes());
+        buf[KB_LOCKER_NKEYS_OFF..KB_LOCKER_NKEYS_OFF + 2].copy_from_slice(&count.to_le_bytes());
+        buf[KB_LOCKER_NBYTES_OFF..KB_LOCKER_NBYTES_OFF + 4]
+            .copy_from_slice(&((end - KB_LOCKER_HEADER_SIZE) as u32).to_le_bytes());
+    }
+
+    fn omap_node(entries: &[(u64, u64, u64)], level: u16, root: bool) -> [u8; BLOCK] {
+        let mut node = [0u8; BLOCK];
+        let mut flags = BTNODE_FIXED_KV_SIZE;
+        if level == 0 {
+            flags |= BTNODE_LEAF;
+        }
+        if root {
+            flags |= BTNODE_ROOT;
+        }
+        node[BTNODE_FLAGS_OFF..BTNODE_FLAGS_OFF + 2].copy_from_slice(&flags.to_le_bytes());
+        node[BTNODE_LEVEL_OFF..BTNODE_LEVEL_OFF + 2].copy_from_slice(&level.to_le_bytes());
+        node[BTNODE_NKEYS_OFF..BTNODE_NKEYS_OFF + 4]
+            .copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        let table_len = entries.len() * 4;
+        node[BTNODE_TABLE_SPACE_LEN_OFF..BTNODE_TABLE_SPACE_LEN_OFF + 2]
+            .copy_from_slice(&(table_len as u16).to_le_bytes());
+        let key_start = BTNODE_DATA_OFF + table_len;
+        let value_end = BLOCK - if root { BTREE_INFO_SIZE } else { 0 };
+        let value_size = if level == 0 {
+            OMAP_VALUE_SIZE
+        } else {
+            OMAP_INDEX_VALUE_SIZE
+        };
+        for (index, (oid, xid, payload)) in entries.iter().enumerate() {
+            let item = BTNODE_DATA_OFF + index * 4;
+            node[item..item + 2].copy_from_slice(&((index * OMAP_KEY_SIZE) as u16).to_le_bytes());
+            node[item + KVOFF_VALUE_OFF..item + KVOFF_VALUE_OFF + 2]
+                .copy_from_slice(&(((index + 1) * value_size) as u16).to_le_bytes());
+            let key = key_start + index * OMAP_KEY_SIZE;
+            node[key + OMAP_KEY_OID_OFF..key + OMAP_KEY_OID_OFF + 8]
+                .copy_from_slice(&oid.to_le_bytes());
+            node[key + OMAP_KEY_XID_OFF..key + OMAP_KEY_XID_OFF + 8]
+                .copy_from_slice(&xid.to_le_bytes());
+            let value = value_end - (index + 1) * value_size;
+            if level == 0 {
+                node[value + OMAP_VALUE_SIZE_OFF..value + OMAP_VALUE_SIZE_OFF + 4]
+                    .copy_from_slice(&(BLOCK as u32).to_le_bytes());
+                node[value + OMAP_VALUE_PADDR_OFF..value + OMAP_VALUE_PADDR_OFF + 8]
+                    .copy_from_slice(&payload.to_le_bytes());
+            } else {
+                node[value + OMAP_INDEX_CHILD_OFF..value + OMAP_INDEX_CHILD_OFF + 8]
+                    .copy_from_slice(&payload.to_le_bytes());
+            }
+        }
+        if root {
+            node[BTREE_INFO_FLAGS_OFF..BTREE_INFO_FLAGS_OFF + 4]
+                .copy_from_slice(&BTREE_PHYSICAL.to_le_bytes());
+            node[BTREE_INFO_NODE_SIZE_OFF..BTREE_INFO_NODE_SIZE_OFF + 4]
+                .copy_from_slice(&(BLOCK as u32).to_le_bytes());
+            node[BTREE_INFO_KEY_SIZE_OFF..BTREE_INFO_KEY_SIZE_OFF + 4]
+                .copy_from_slice(&(OMAP_KEY_SIZE as u32).to_le_bytes());
+            node[BTREE_INFO_VALUE_SIZE_OFF..BTREE_INFO_VALUE_SIZE_OFF + 4]
+                .copy_from_slice(&(OMAP_VALUE_SIZE as u32).to_le_bytes());
+        }
+        node
     }
 
     #[test]
-    fn parses_media_record_and_class() -> Result {
+    fn parses_class_m_device_key() -> Result {
         let uuid = [0x11; 16];
-        let mut state = [0u8; 60];
-        state[0..2].copy_from_slice(&WRAPPED_STATE_MAJOR.to_le_bytes());
-        state[2..4].copy_from_slice(&WRAPPED_STATE_MINOR.to_le_bytes());
-        state[8..12].copy_from_slice(&4u32.to_le_bytes());
-        state[18..20].copy_from_slice(&(WRAPPED_MEDIA_KEY_LEN as u16).to_le_bytes());
-        state[20..].fill(0xa5);
+        let wrapped = [0xa5; WRAPPED_MEDIA_KEY_LEN];
         let mut bag = [0u8; 128];
-        let end = entry(&mut bag, 16, &uuid, KB_TAG_WRAPPING_M_KEY, &state);
+        let end = entry(
+            &mut bag,
+            KB_LOCKER_HEADER_SIZE,
+            &uuid,
+            KB_TAG_VOLUME_DEVICE_KEY,
+            &wrapped,
+        );
         header(&mut bag, 1, end);
         let locker = Locker::parse(&bag[..end])?;
-        let record = media_record(&locker, &uuid, KB_TAG_WRAPPING_M_KEY)?;
-        assert_eq!(record.protection_class, 4);
-        assert_eq!(record.wrapped, [0xa5; WRAPPED_MEDIA_KEY_LEN]);
+        assert_eq!(device_key_record(&locker, &uuid)?, wrapped);
         Ok(())
     }
 
     #[test]
-    fn parses_volume_records() -> Result {
+    fn parses_fv_off_wrapped_vek_without_volume_keybag() -> Result {
         let uuid = [0x22; 16];
         let vek = [0x5a; 80];
-        let mut prange = [0u8; 16];
-        prange[..8].copy_from_slice(&9u64.to_le_bytes());
-        prange[8..].copy_from_slice(&2u64.to_le_bytes());
         let mut bag = [0u8; 256];
-        let off = entry(&mut bag, 16, &uuid, KB_TAG_VOLUME_KEY, &vek);
-        let end = entry(&mut bag, off, &uuid, KB_TAG_VOLUME_UNLOCK_RECORDS, &prange);
-        header(&mut bag, 2, end);
+        let end = entry(
+            &mut bag,
+            KB_LOCKER_HEADER_SIZE,
+            &uuid,
+            KB_TAG_VOLUME_KEY,
+            &vek,
+        );
+        header(&mut bag, 1, end);
         let locker = Locker::parse(&bag[..end])?;
-        let records = volume_records(&locker, &uuid, 100)?;
+        let records = volume_records(&locker, &uuid)?;
         assert_eq!(records.wrapped_vek, vek);
-        assert_eq!(records.volume_keybag.start, 9);
-        assert_eq!(records.volume_keybag.blocks, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn selects_latest_omap_leaf_version() -> Result {
+        let node = omap_node(
+            &[(9, 9, 1), (10, 2, 22), (10, 6, 66), (10, 9, 99), (11, 0, 1)],
+            0,
+            true,
+        );
+        assert_eq!(validate_omap_root(&node)?, 0);
+        let (key, value) = omap_node_entry_le(&node, 10, 7)?;
+        assert_eq!(le64(key, OMAP_KEY_XID_OFF)?, 6);
+        assert_eq!(le64(value, OMAP_VALUE_PADDR_OFF)?, 66);
+        Ok(())
+    }
+
+    #[test]
+    fn selects_multilevel_omap_child() -> Result {
+        let node = omap_node(&[(0, 0, 100), (10, 5, 200), (20, 0, 300)], 1, true);
+        assert_eq!(validate_omap_root(&node)?, 1);
+        let (_, value) = omap_node_entry_le(&node, 10, 8)?;
+        assert_eq!(le64(value, OMAP_INDEX_CHILD_OFF)?, 200);
         Ok(())
     }
 
     #[test]
     fn refuses_unknown_versions_and_truncation() -> Result {
         let mut bag = [0u8; 64];
-        bag[0..2].copy_from_slice(&3u16.to_le_bytes());
+        bag[KB_LOCKER_VERSION_OFF..KB_LOCKER_VERSION_OFF + 2].copy_from_slice(&3u16.to_le_bytes());
         assert!(Locker::parse(&bag).is_err());
-        bag[0..2].copy_from_slice(&KB_VERSION.to_le_bytes());
-        bag[2..4].copy_from_slice(&1u16.to_le_bytes());
-        bag[4..8].copy_from_slice(&8u32.to_le_bytes());
+        bag[KB_LOCKER_VERSION_OFF..KB_LOCKER_VERSION_OFF + 2]
+            .copy_from_slice(&KB_VERSION.to_le_bytes());
+        bag[KB_LOCKER_NKEYS_OFF..KB_LOCKER_NKEYS_OFF + 2].copy_from_slice(&1u16.to_le_bytes());
+        bag[KB_LOCKER_NBYTES_OFF..KB_LOCKER_NBYTES_OFF + 4].copy_from_slice(&8u32.to_le_bytes());
         assert!(Locker::parse(&bag[..24]).is_err());
         Ok(())
     }
 
     #[test]
-    fn refuses_unknown_media_state_version() -> Result {
+    fn refuses_wrong_device_key_length() -> Result {
         let uuid = [0x33; 16];
-        let mut state = [0u8; 60];
-        state[0..2].copy_from_slice(&6u16.to_le_bytes());
-        state[8..12].copy_from_slice(&4u32.to_le_bytes());
-        state[18..20].copy_from_slice(&40u16.to_le_bytes());
+        let wrapped = [0u8; WRAPPED_MEDIA_KEY_LEN - 1];
         let mut bag = [0u8; 128];
-        let end = entry(&mut bag, 16, &uuid, KB_TAG_WRAPPING_M_KEY, &state);
+        let end = entry(
+            &mut bag,
+            KB_LOCKER_HEADER_SIZE,
+            &uuid,
+            KB_TAG_VOLUME_DEVICE_KEY,
+            &wrapped,
+        );
         header(&mut bag, 1, end);
         let locker = Locker::parse(&bag[..end])?;
-        assert!(media_record(&locker, &uuid, KB_TAG_WRAPPING_M_KEY).is_err());
+        assert!(device_key_record(&locker, &uuid).is_err());
         Ok(())
     }
 
@@ -1120,7 +1362,13 @@ mod tests {
         let uuid = [0x44; 16];
         let vek = [0x11; 32];
         let mut bag = [0u8; 160];
-        let off = entry(&mut bag, 16, &uuid, KB_TAG_VOLUME_KEY, &vek);
+        let off = entry(
+            &mut bag,
+            KB_LOCKER_HEADER_SIZE,
+            &uuid,
+            KB_TAG_VOLUME_KEY,
+            &vek,
+        );
         let end = entry(&mut bag, off, &uuid, KB_TAG_VOLUME_KEY, &vek);
         header(&mut bag, 2, end);
         let locker = Locker::parse(&bag[..end])?;
