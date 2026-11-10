@@ -254,8 +254,13 @@ mod tests {
         else {
             panic!("T6041 must identify its loaded firmware");
         };
-        assert_eq!(builds.len(), 2);
-        for (i, build) in builds.iter().enumerate() {
+        assert_eq!(builds.len(), 3);
+        // The last two admit the 25G83 images, with the 40- and the 32-core configuration.
+        assert_eq!(builds[1].images.len(), builds[2].images.len());
+        for (a, b) in builds[1].images.iter().zip(builds[2].images) {
+            assert_eq!((a.entropy, a.text_sha256), (b.entropy, b.text_sha256));
+        }
+        for (i, build) in builds[..2].iter().enumerate() {
             let other = &builds[1 - i];
             for image in build.images {
                 let (entropy, digest) = (image.entropy, image.text_sha256);
@@ -277,6 +282,10 @@ mod tests {
         let cores = crate::hw::t6041::CONFIG.core_layout.cores;
         assert_eq!(g83.core_layout.cores, cores);
         assert_eq!(cores, Some((4, 40)));
+        let g83_32 = builds[2].config.unwrap();
+        assert_eq!(g83_32.core_layout.cores, Some((4, 32)));
+        assert!(g83_32.reserved_slots.is_empty());
+        assert_eq!(g83_32.windows.len(), map.len());
     }
 
     #[cfg(CONFIG_DRM_ASAHI_G16)]
