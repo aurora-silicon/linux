@@ -104,6 +104,7 @@ static int ave_reply_9003(const struct ave_fw_abi *abi, const u8 *msg, u32 len,
 	reply->raw_status = get_unaligned_le32(msg + 0x40);
 	reply->status = reply->raw_status;
 	reply->bytes = len;
+	reply->completion_index = 0;
 	return 0;
 }
 
@@ -126,6 +127,8 @@ static int ave_reply_6070(const struct ave_fw_abi *abi, const u8 *msg, u32 len,
 		reply->raw_status = get_unaligned_le32(msg + 0x38);
 		reply->status = reply->raw_status;
 		reply->bytes = len;
+		reply->completion_index = op == AVE_OP_PROCESS ?
+			get_unaligned_le32(msg + 0x40) : 0;
 		if (reply->status == 0x00ee0000)
 			reply->status = 0;
 		else if (!reply->status)

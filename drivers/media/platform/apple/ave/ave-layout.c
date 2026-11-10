@@ -265,6 +265,17 @@ const struct ave_fw_layout ave_layout_9003_78_0 = {
 			.low_delay = 0xcf8,
 		},
 	},
+	.result = {
+		[0] = {
+			.coded_bytes = 0x120,
+			.coded_bytes_copy = 0x12c,
+		},
+		[1] = {
+			.coded_bytes = 0x120,
+			.coded_bytes_copy = 0x12c,
+			.hevc_slice_header_bytes = 0x128,
+		},
+	},
 };
 
 const struct ave_fw_layout ave_layout_26a428 = {
@@ -510,6 +521,17 @@ const struct ave_fw_layout ave_layout_26a428 = {
 			.meta_size = 0x6060,
 			.extra = 0x6068,
 			.crop = 0x3190,
+		},
+	},
+	.result = {
+		[0] = {
+			.coded_bytes = 0x120,
+			.coded_bytes_copy = 0x12c,
+		},
+		[1] = {
+			.coded_bytes = 0x120,
+			.coded_bytes_copy = 0x12c,
+			.hevc_slice_header_bytes = 0x128,
 		},
 	},
 };
@@ -785,6 +807,24 @@ const struct ave_fw_layout ave_layout_6070_11_1 = {
 				  .bytes = 0x1a8 },
 			},
 			.retained_count = 3,
+		},
+	},
+	.result = {
+		[0] = {
+			/* The driver configures one slice per picture. */
+			.coded_bytes = 0x180,
+			.parameter_set_bits = 0x98,
+			.coded_trim_bytes = 0x38c,
+			.ordinal = 0x10c,
+			.frame_type = 0x110,
+		},
+		[1] = {
+			.coded_bytes = 0x180,
+			.parameter_set_bits = 0x98,
+			.hevc_slice_header_bytes = 0x398,
+			.coded_trim_bytes = 0x38c,
+			.ordinal = 0x10c,
+			.frame_type = 0x110,
 		},
 	},
 };
