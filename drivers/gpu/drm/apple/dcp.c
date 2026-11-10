@@ -59,6 +59,7 @@
 #include "dcp-fabric-effects.h"
 #include "dcp-fabric.h"
 #include "dcp-hdmi.h"
+#include "dcp-smc.h"
 #include "dcp-syslog.h"
 #include "dcpext_scanout.h"
 #include "dcp-internal.h"
@@ -3810,8 +3811,13 @@ static int dcp_start_desktop(struct apple_dcp *dcp)
 	dev_dbg(dcp->dev, "firmware endpoints 0x20+: %#010x\n", map);
 
 	ret = systemep_init(dcp);
-	if (ret)
+	if (ret) {
 		dev_warn(dcp->dev, "Failed to start system endpoint: %d\n", ret);
+	} else {
+		ret = dcp_smc_afk_publish(dcp);
+		if (ret && ret != -ENODEV)
+			dev_dbg(dcp->dev, "DCP-to-SMC route fallback: %d\n", ret);
+	}
 
 	/*
 	 * The IOMFB transport starts before the auxiliary endpoints; its
@@ -5955,6 +5961,9 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	dcp->external_native = dcp->external && dcp_t6030_ext_native(dev->of_node);
 	dcp_external_audio_init(dcp);
 	dcp->dev = dev;
+	ret = dcp_smc_afk_probe(dcp);
+	if (ret)
+		return ret;
 	/*
 	 * Type-C and Thunderbolt routes can be activated as soon as they are
 	 * registered below, before the DRM device binds.

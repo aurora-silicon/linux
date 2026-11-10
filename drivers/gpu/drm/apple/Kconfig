@@ -23,6 +23,17 @@ config DRM_APPLE
 	  Say Y if you have an Apple Silicon chipset. This includes the
 	  Type-C display fabric and Thunderbolt display routing.
 
+config DRM_APPLE_DCP_SMC
+	bool "DCP-to-SMC service route"
+	depends on DRM_APPLE && MFD_MACSMC
+	default y
+	help
+	  Publish the read-only AFK SMC service used by supported internal
+	  display firmware, and pass its native key reads to the Apple SMC
+	  core. The route is enabled at runtime only on described machines,
+	  before panel compensation starts. Unsupported machines retain the
+	  existing display startup path.
+
 config DRM_APPLE_AUDIO
 	bool "DisplayPort/HDMI Audio support"
 	default y
@@ -76,7 +87,8 @@ config DRM_APPLE_KUNIT_TEST
 	help
 	  Build tests for the Apple display driver's AFK ring parser and
 	  backlight policy (takeover, DPMS, suspend, fades and present
-	  completion).
+	  completion), and, when DRM_APPLE_DCP_SMC is enabled, native AFK SMC
+	  read messages and error replies.
 	  The tests cover the header strides used by older firmware and
 	  larger rings, as well as malformed ring size combinations.
 	  This option is intended for developer test kernels.

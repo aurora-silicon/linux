@@ -80,6 +80,8 @@ struct apple_epic_service {
 	u32 power_gen;
 	bool defer_start;
 	bool started;
+	bool local;
+	struct completion opened;
 
     struct {
         struct dentry *entry;
@@ -279,6 +281,9 @@ afk_service_reinit(struct apple_epic_service *service,
 		service->ep = ep;
 		service->channel = channel;
 		service->cookie = NULL;
+#ifdef CONFIG_DRM_APPLE_DCP_SMC
+		service->local = false;
+#endif
 		/* Keep legacy slot history; AFKV2 history belongs to the interface. */
 	}
 	spin_unlock_irqrestore(&service->lock, flags);
@@ -548,6 +553,11 @@ int afk_v2_copy_owned(struct apple_epic_service *service, u64 dva,
 		      void *buffer, size_t size, bool to_peer);
 int afk_start(struct apple_dcp_afkep *ep);
 int afk_start_service(struct apple_epic_service *service);
+struct apple_epic_service *
+afk_publish_service(struct apple_dcp_afkep *ep, const char *name,
+		    const struct apple_epic_service_ops *ops);
+int afk_wait_service_open(struct apple_epic_service *service,
+			  unsigned int timeout_ms);
 void afk_cancel_commands(struct apple_dcp_afkep *ep);
 bool afk_compact_orphans_wait(struct apple_dcp_afkep *ep, unsigned long timeout);
 unsigned int afk_compact_orphans_drop(struct apple_dcp_afkep *ep);

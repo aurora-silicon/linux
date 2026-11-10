@@ -131,8 +131,10 @@ struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 	init_completion(&afkep->started);
 	init_completion(&afkep->stopped);
 	spin_lock_init(&afkep->lock);
-	for (i = 0; i < AFK_MAX_CHANNEL; i++)
+	for (i = 0; i < AFK_MAX_CHANNEL; i++) {
 		spin_lock_init(&afkep->services[i].lock);
+		init_completion(&afkep->services[i].opened);
+	}
 	ret = devm_add_action_or_reset(dcp->dev, afk_release_context, afkep);
 	if (ret)
 		return ERR_PTR(ret);
@@ -925,6 +927,9 @@ static void afk_recv_handle_compact_init(struct apple_dcp_afkep *ep,
 	service->unit = unit;
 	service->defer_start = false;
 	service->started = false;
+#ifdef CONFIG_DRM_APPLE_DCP_SMC
+	service->local = false;
+#endif
 	service->torndown = false;
 	/* A service with an admission step is published once admitted. */
 	service->enabled = !ops->prepare;
@@ -958,6 +963,84 @@ static void afk_recv_handle_compact_init(struct apple_dcp_afkep *ep,
 				"AFK[ep:%02x]: failed to start compact service %u: %d\n",
 				ep->endpoint, channel, ret);
 	}
+}
+
+static u16 afk_compact_local_interface(struct apple_dcp_afkep *ep)
+{
+	u16 interface;
+
+	/* Firmware-published interfaces use odd IDs; the host owns the evens. */
+	for (interface = 2; interface < 2 * AFK_MAX_CHANNEL; interface += 2)
+		if (!afk_epic_find_service(ep, interface))
+			return interface;
+
+	return 0;
+}
+
+struct apple_epic_service *
+afk_publish_service(struct apple_dcp_afkep *ep, const char *name,
+		    const struct apple_epic_service_ops *ops)
+{
+	struct apple_epic_service *service;
+	unsigned long flags;
+	char announcement[32] = {};
+	u16 interface;
+	int ret;
+
+	if (!ep || !name || !name[0] ||
+	    strnlen(name, sizeof(announcement)) >= sizeof(announcement) ||
+	    !ops || !ops->name[0] || !afk_compact_capable(ep))
+		return ERR_PTR(-EINVAL);
+
+	interface = afk_compact_local_interface(ep);
+	if (!interface)
+		return ERR_PTR(-ENOSPC);
+	service = afk_compact_slot(ep, ops, name, -1);
+	if (!service)
+		return ERR_PTR(-ENOSPC);
+
+	spin_lock_irqsave(&service->lock, flags);
+	service->ops = ops;
+	service->ep = ep;
+	service->channel = interface;
+	service->cookie = NULL;
+	service->cmd_tag = 0;
+	strscpy(service->name, name, sizeof(service->name));
+	service->unit = -1;
+	service->defer_start = false;
+	service->started = false;
+	service->local = true;
+	service->torndown = false;
+	service->enabled = true;
+	reinit_completion(&service->opened);
+	spin_unlock_irqrestore(&service->lock, flags);
+	ep->num_channels = max_t(u32, ep->num_channels,
+				 service - ep->services + 1);
+
+	strscpy(announcement, name, sizeof(announcement));
+	ret = afk_send_compact(ep, interface, 0x11, 0,
+			       announcement, sizeof(announcement),
+			       sizeof(announcement));
+	if (ret) {
+		afk_service_discard(service);
+		return ERR_PTR(ret);
+	}
+
+	dev_info(ep->dcp->dev,
+		 "AFK[ep:%02x]: published host service %s on interface %u\n",
+		 ep->endpoint, name, interface);
+	return service;
+}
+
+int afk_wait_service_open(struct apple_epic_service *service,
+			  unsigned int timeout_ms)
+{
+	if (!service || !service->local)
+		return -EINVAL;
+	if (!wait_for_completion_timeout(&service->opened,
+					 msecs_to_jiffies(timeout_ms)))
+		return -ETIMEDOUT;
+	return READ_ONCE(service->started) ? 0 : -ESHUTDOWN;
 }
 
 /* IOReturn values of a refused call (IOKit's sys_iokit error space) */
@@ -1188,6 +1271,31 @@ static void afk_recv_compact_message(struct apple_dcp_afkep *ep, u16 intf_id,
 		afk_recv_handle_compact_init(ep, intf_id, payload, payload_size);
 		return;
 	}
+#ifdef CONFIG_DRM_APPLE_DCP_SMC
+	if (sub->category == 0 && sub->type == 0x12) {
+		service = afk_service_get(afk_epic_find_service(ep, intf_id));
+		if (service && service->local) {
+			WRITE_ONCE(service->started, true);
+			complete_all(&service->opened);
+			dev_info(ep->dcp->dev,
+				 "AFK[ep:%02x]: host service %s opened on interface %u\n",
+				 ep->endpoint, service->name, intf_id);
+		}
+		if (service)
+			afk_service_put(service);
+		return;
+	}
+	if (sub->category == 0 && sub->type == 0x13) {
+		service = afk_service_get(afk_epic_find_service(ep, intf_id));
+		if (service && service->local) {
+			afk_service_retire(service);
+			complete_all(&service->opened);
+		}
+		if (service)
+			afk_service_put(service);
+		return;
+	}
+#endif
 	if (sub->category == 1 && sub->type == EPIC_SUBTYPE_STD_SERVICE) {
 		afk_recv_handle_compact_call(ep, intf_id, payload, payload_size);
 		return;
