@@ -258,6 +258,13 @@ int apple_rtkit_shutdown(struct apple_rtkit *rtk);
 int apple_rtkit_poweroff(struct apple_rtkit *rtk);
 
 /*
+ * After poweroff and a power cycle: start a fresh session, let @start start the
+ * CPU, and only then start the mailbox and boot. On failure the CPU @start
+ * released may still run: the caller has to stop it.
+ */
+int apple_rtkit_cold_restart(struct apple_rtkit *rtk, int (*start)(void *), void *ctx);
+
+/*
  * Put the co-processor into idle mode
  */
 int apple_rtkit_idle(struct apple_rtkit *rtk);
