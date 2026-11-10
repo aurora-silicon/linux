@@ -68,6 +68,8 @@ struct apple_dart {
 	/* A J713 sleep's, never set here. */
 	void *sleep_record;
 	bool cio_active;
+	phys_addr_t locked_phys[2][4];
+	struct io_pgtable_cfg *locked_cfg[2];
 };
 struct apple_dart_stream_map {struct apple_dart*dart;unsigned long sidmap[1];};
 struct apple_dart_atomic_stream_map {struct apple_dart*dart;unsigned long sidmap[1];};
