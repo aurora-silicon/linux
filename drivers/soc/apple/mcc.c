@@ -14,10 +14,12 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/sizes.h>
+#include <linux/soc/apple/mcc.h>
 #include <linux/unaligned.h>
 
 #if IS_ENABLED(CONFIG_APPLE_MCC_KUNIT_TEST)
@@ -43,7 +45,6 @@
 
 #define MCC_MCACHE_STREAM_PROPERTY	"apple,tunable-mcache-stream"
 #define MCC_MCACHE_STREAM_RECORD_WORDS	12
-#define MCC_GPU_PARAMETER_BUFFER_STREAM_ID	14
 #define MCC_MCACHE_POLICY_PMP_DYNAMIC_QUOTA	2
 #define MCC_MCACHE_DEFAULT_REQUESTED_BYTES	0
 
@@ -56,6 +57,13 @@ struct apple_mcc {
 	unsigned int nr_planes;
 	bool enabled;
 	bool retained;
+	bool action_table;
+	/* Serializes all-plane actions from lifecycle consumers. */
+	struct mutex stream_lock;
+	u32 release_stream_id;
+	u32 release_dsid;
+	int release_stream_error;
+	unsigned int release_count;
 };
 
 /* Little-endian records copied verbatim from the PMP device tree node. */
@@ -102,7 +110,7 @@ static int apple_mcc_parse_stream_dsid(const u8 *records, int size, u32 *dsid)
 		u32 policy, requested;
 
 		if (MCC_STREAM_FIELD(record, stream_id) !=
-		    MCC_GPU_PARAMETER_BUFFER_STREAM_ID)
+		    APPLE_MCC_STREAM_GPU_PARAMETER_BUFFER_WRITE)
 			continue;
 		if (found)
 			return -EINVAL;
@@ -151,26 +159,61 @@ static void apple_mcc_writel(struct apple_mcc *mcc, unsigned int plane,
 	writel(value, mcc->planes[plane] + offset);
 }
 
-static int apple_mcc_release_t6041_stream(struct apple_mcc *mcc)
+static int apple_mcc_release_stream_from_provider(struct apple_mcc *mcc,
+						  u32 stream_id)
 {
 	unsigned int i;
-	u32 dsid;
-	int ret;
 
-	ret = apple_mcc_t6041_stream_dsid(mcc, &dsid);
-	if (ret)
-		return ret;
+	if (!mcc->action_table)
+		return -EOPNOTSUPP;
+	if (mcc->release_stream_error)
+		return mcc->release_stream_error;
+	if (stream_id != mcc->release_stream_id)
+		return -ENOENT;
 
+	mutex_lock(&mcc->stream_lock);
 	for (i = 0; i < mcc->nr_planes; i++)
 		apple_mcc_writel(mcc, i, MCC_DSID_DEPRIO_ACTION_DEPRIORITIZE,
 				 MCC_DSID_DEPRIO_ACTION_BASE +
-				 dsid * MCC_DSID_DEPRIO_ACTION_STRIDE);
+				 mcc->release_dsid * MCC_DSID_DEPRIO_ACTION_STRIDE);
 
 	/* The action self-clears, so a read-back cannot verify the write. */
-	dev_info(mcc->dev, "released SLC residency for stream %u DSID %u\n",
-		 MCC_GPU_PARAMETER_BUFFER_STREAM_ID, dsid);
+	if (!mcc->release_count)
+		dev_info(mcc->dev,
+			 "GPU lifecycle released SLC residency for stream %u DSID %u\n",
+			 stream_id, mcc->release_dsid);
+	mcc->release_count++;
+	mutex_unlock(&mcc->stream_lock);
 	return 0;
 }
+
+int apple_mcc_release_stream(struct device *consumer, u32 stream_id)
+{
+	struct platform_device *provider;
+	struct device_node *np;
+	struct apple_mcc *mcc;
+	int ret;
+
+	np = of_parse_phandle(consumer->of_node, "apple,memory-cache-controller", 0);
+	if (!np)
+		return of_find_property(consumer->of_node,
+					"apple,memory-cache-controller", NULL) ?
+			-EINVAL : -ENOENT;
+	provider = of_find_device_by_node(np);
+	of_node_put(np);
+	if (!provider)
+		return -EPROBE_DEFER;
+
+	/* Exclude provider removal while its mapped planes are used. */
+	device_lock(&provider->dev);
+	mcc = dev_get_drvdata(&provider->dev);
+	ret = device_is_bound(&provider->dev) && mcc ?
+		apple_mcc_release_stream_from_provider(mcc, stream_id) : -EPROBE_DEFER;
+	device_unlock(&provider->dev);
+	put_device(&provider->dev);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_mcc_release_stream);
 
 /* T8132 powers the whole cache through two multicast apertures. Unlike
  * T8140 allocation control, its dirty-data drain is not qualified yet.
@@ -312,6 +355,7 @@ static int apple_mcc_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	mcc->dev = dev;
+	mutex_init(&mcc->stream_lock);
 	t6041 = of_device_is_compatible(dev->of_node, "apple,t6041-mcc");
 	action_table = t6041;
 	mcc->retained = of_device_is_compatible(dev->of_node, "apple,t8132-mcc");
@@ -332,23 +376,26 @@ static int apple_mcc_probe(struct platform_device *pdev)
 	}
 	if (!mcc->nr_planes)
 		return dev_err_probe(dev, -EINVAL, "no planes\n");
+	mcc->action_table = action_table;
+	mcc->release_stream_error = -EOPNOTSUPP;
+	if (t6041 && action_table) {
+		mcc->release_stream_id = APPLE_MCC_STREAM_GPU_PARAMETER_BUFFER_WRITE;
+		ret = apple_mcc_t6041_stream_dsid(mcc, &mcc->release_dsid);
+		mcc->release_stream_error = ret;
+		if (mcc->release_stream_error == -ENOENT)
+			dev_dbg(dev, "no GPU parameter-buffer stream record\n");
+		else if (mcc->release_stream_error)
+			dev_warn(dev, "GPU parameter-buffer stream invalid: %pe\n",
+				 ERR_PTR(mcc->release_stream_error));
+	} else if (t6041) {
+		dev_dbg(dev, "DSID action table not mapped, stream left in place\n");
+	}
 
 	ret = apple_mcc_wait_boot_dma(dev);
 	if (ret)
 		return ret;
 
 	platform_set_drvdata(pdev, mcc);
-
-	if (t6041 && !action_table) {
-		dev_dbg(dev, "DSID action table not mapped, stream left in place\n");
-	} else if (t6041) {
-		ret = apple_mcc_release_t6041_stream(mcc);
-		if (ret == -ENOENT)
-			dev_dbg(dev, "no GPU parameter-buffer stream record\n");
-		else if (ret)
-			dev_warn(dev, "GPU parameter-buffer stream not released: %pe\n",
-				 ERR_PTR(ret));
-	}
 
 	/* Allocation is only a performance setting: leave a cache that is not ready alone. */
 	ret = mcc->retained ? apple_mcc_enable_t8132(mcc) : apple_mcc_enable(mcc);

@@ -10,6 +10,7 @@ struct apple_mcc_test {
 	unsigned long attempted;
 	unsigned long disabled;
 	unsigned long flushed;
+	unsigned long deprioritized;
 };
 
 static void apple_mcc_test_write(struct apple_mcc *mcc, unsigned int plane,
@@ -32,6 +33,12 @@ static void apple_mcc_test_write(struct apple_mcc *mcc, unsigned int plane,
 		/* Model a cache whose flush completes immediately. */
 		val = 0;
 	}
+	if (offset == MCC_DSID_DEPRIO_ACTION_BASE +
+		      mcc->release_dsid * MCC_DSID_DEPRIO_ACTION_STRIDE &&
+	    val == MCC_DSID_DEPRIO_ACTION_DEPRIORITIZE) {
+		ctx->deprioritized |= BIT(plane);
+		return;
+	}
 	writel(val, mcc->planes[plane] + offset);
 }
 
@@ -47,9 +54,12 @@ static struct apple_mcc_test *apple_mcc_test_alloc(struct kunit *test)
 	mcc->dev = kunit_device_register(test, "apple-mcc-test");
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, mcc->dev);
 	mcc->nr_planes = 3;
+	mutex_init(&mcc->stream_lock);
 	ctx->reject_plane = MCC_MAX_PLANES;
 	for (i = 0; i < mcc->nr_planes; i++) {
-		mcc->planes[i] = (__force void __iomem *)kunit_kzalloc(test, SZ_16K, GFP_KERNEL);
+		void *plane = kunit_kzalloc(test, SZ_16K, GFP_KERNEL);
+
+		mcc->planes[i] = (__force void __iomem *)plane;
 		KUNIT_ASSERT_NOT_NULL(test, mcc->planes[i]);
 		writel(1, mcc->planes[i] + MCC_ALLOC_DISABLE);
 		writel(1, mcc->planes[i] + MCC_CACHE_WAYS);
@@ -58,6 +68,28 @@ static struct apple_mcc_test *apple_mcc_test_alloc(struct kunit *test)
 	test->priv = ctx;
 	kunit_activate_static_stub(test, apple_mcc_writel, apple_mcc_test_write);
 	return ctx;
+}
+
+static void apple_mcc_test_lifecycle_release(struct kunit *test)
+{
+	struct apple_mcc_test *ctx = apple_mcc_test_alloc(test);
+	struct apple_mcc *mcc = &ctx->mcc;
+	u32 stream_id = APPLE_MCC_STREAM_GPU_PARAMETER_BUFFER_WRITE;
+	int ret;
+
+	mcc->action_table = true;
+	mcc->release_stream_id = stream_id;
+	mcc->release_dsid = 21;
+	mcc->release_stream_error = 0;
+
+	ret = apple_mcc_release_stream_from_provider(mcc, stream_id);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, ctx->deprioritized, GENMASK(mcc->nr_planes - 1, 0));
+	KUNIT_EXPECT_EQ(test, mcc->release_count, 1U);
+
+	ctx->deprioritized = 0;
+	KUNIT_EXPECT_EQ(test, apple_mcc_release_stream_from_provider(mcc, 1), -ENOENT);
+	KUNIT_EXPECT_EQ(test, ctx->deprioritized, 0UL);
 }
 
 static void apple_mcc_test_set_stream_field(u8 *record, size_t field, u32 value)
@@ -168,6 +200,7 @@ static void apple_mcc_test_not_ready(struct kunit *test)
 static struct kunit_case apple_mcc_test_cases[] = {
 	KUNIT_CASE(apple_mcc_test_stream_selection),
 	KUNIT_CASE(apple_mcc_test_stream_refusal),
+	KUNIT_CASE(apple_mcc_test_lifecycle_release),
 	KUNIT_CASE(apple_mcc_test_partial_enable),
 	KUNIT_CASE(apple_mcc_test_quiesce),
 	KUNIT_CASE(apple_mcc_test_not_ready),

@@ -714,6 +714,12 @@ impl crate::g17::queue::render::Host for Host<'_> {
         result
     }
     fn note_submission(&mut self) -> Result {
+        self.firmware
+            .primary
+            .state
+            .shared
+            .parameter_stream_dirty
+            .store(true, Ordering::Release);
         self.firmware.note_submission()
     }
     fn complete_render(

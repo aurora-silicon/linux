@@ -38,6 +38,7 @@ pub(in crate::g17::runtime) struct Loan {
 /// graph that needs no growth.
 struct DirectHost<'a> {
     port: &'a Port,
+    parameter_stream_dirty: &'a core::sync::atomic::AtomicBool,
     render: &'a MutexGuard<'a, ()>,
     room: RenderRoom,
     generation: u64,
@@ -124,6 +125,7 @@ impl crate::g17::queue::render::Host for DirectHost<'_> {
     }
     fn note_submission(&mut self) -> Result {
         // Counted, with full effort witnessed, before the pair was lent.
+        self.parameter_stream_dirty.store(true, Ordering::Release);
         Ok(())
     }
     fn complete_render(
@@ -313,7 +315,10 @@ impl Backend {
                 return None;
             }
             match firmware.lend_render(slot, self.owner, packet, priority, generation) {
-                Ok(Some(loan)) => loan,
+                Ok(Some(loan)) => {
+                    self.shared.render_loans.fetch_add(1, Ordering::AcqRel);
+                    loan
+                }
                 Ok(None) => return None,
                 Err(error) => return Some(Err(error)),
             }
@@ -343,6 +348,7 @@ impl Backend {
             }
             let mut host = DirectHost {
                 port,
+                parameter_stream_dirty: &self.shared.parameter_stream_dirty,
                 render: &render,
                 room,
                 generation,
@@ -380,6 +386,9 @@ impl Backend {
                 None => Err(ENODEV),
             }
         };
+        if self.shared.render_loans.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.shared.queue_events();
+        }
         self.shared.note_changed();
         drop(lease);
         if let Err(error) = returned {

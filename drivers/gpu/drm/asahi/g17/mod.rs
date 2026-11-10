@@ -51,6 +51,7 @@ mod ids;
 mod initdata;
 mod job;
 mod kick;
+mod mcc;
 mod object;
 mod port;
 pub(crate) mod power;
@@ -1092,6 +1093,13 @@ struct Shared {
     renders: Arc<availability::Availability>,
     /// Unbound compute publishers which can reuse a retired channel.
     compute_demand: AtomicU32,
+    /// A published render may have refilled the parameter-buffer-write stream.
+    parameter_stream_dirty: AtomicBool,
+    /// The GPU node has a usable memory-cache lifecycle provider.
+    parameter_stream_enabled: AtomicBool,
+    /// Direct render pairs lent out of the device mutex. A nonzero count is
+    /// not a safe parameter-buffer release boundary even before publication.
+    render_loans: AtomicU32,
     #[pin]
     work: Work<Shared, EVENT_WORK>,
     /// The next event pass runs every housekeeping step: set by every [`Self::queue_events`]
@@ -1597,6 +1605,9 @@ impl Gpu {
                 queues,
                 renders,
                 compute_demand: AtomicU32::new(0),
+                parameter_stream_dirty: AtomicBool::new(true),
+                parameter_stream_enabled: AtomicBool::new(false),
+                render_loans: AtomicU32::new(0),
                 work <- new_work!("g17::Shared::work"),
                 housekeeping: AtomicBool::new(true),
                 housekeeping_ns: AtomicU64::new(0),
@@ -1657,6 +1668,13 @@ impl Gpu {
             GFP_KERNEL,
         )?;
         let firmware = Self::boot(pdev, dev, cfg, regs, geometry, &gpu.id, &gpu.shared)?;
+        let parameter_stream = mcc::release_parameter_buffer(gpu.shared.dev.as_ref())?;
+        gpu.shared
+            .parameter_stream_enabled
+            .store(parameter_stream, Ordering::Release);
+        gpu.shared
+            .parameter_stream_dirty
+            .store(false, Ordering::Release);
         gpu.shared
             .port
             .store(Arc::as_ptr(&firmware.port).cast_mut(), Ordering::Release);

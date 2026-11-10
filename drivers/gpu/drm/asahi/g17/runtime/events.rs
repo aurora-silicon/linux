@@ -520,7 +520,9 @@ impl crate::g17::Shared {
             .flatten()
             .filter_map(|entry| entry.queue.as_deref())
             .any(|queue| queue.in_flight());
-        let in_flight = compute || firmware.queues.render_in_flight();
+        let render_in_flight = firmware.queues.render_in_flight()
+            || self.render_loans.load(core::sync::atomic::Ordering::Acquire) != 0;
+        let in_flight = compute || render_in_flight;
         let idle = firmware.idle_check(now, in_flight)?;
         // Expiries, drained pairs, exits, pool and heap trimming and teardown give back what
         // retirement freed; a completion needs none of them to retire or to signal. While work
@@ -564,6 +566,31 @@ impl crate::g17::Shared {
             firmware.service_teardown(&mut reclaim)?;
             if !reclaim.is_empty() {
                 self.queue_reclaims();
+            }
+        }
+        // macOS releases this stream when the parameter-buffer client's live
+        // request reaches zero, independently of other GPU streams and power.
+        // Linux retains its buffer graph, so exact render retirement is the
+        // equivalent point. The device mutex excludes normal publishers and
+        // render_loans covers the lock-light publication interval.
+        if !render_in_flight
+            && self.parameter_stream_enabled.load(core::sync::atomic::Ordering::Acquire)
+            && self.parameter_stream_dirty.swap(false, core::sync::atomic::Ordering::AcqRel)
+        {
+            match crate::g17::mcc::release_parameter_buffer(self.dev.as_ref()) {
+                Ok(true) => {}
+                Ok(false) => self
+                    .parameter_stream_enabled
+                    .store(false, core::sync::atomic::Ordering::Release),
+                Err(error) => {
+                    self.parameter_stream_enabled
+                        .store(false, core::sync::atomic::Ordering::Release);
+                    dev_warn!(
+                        self.dev.as_ref(),
+                        "Parameter-buffer SLC residency release disabled: {:?}\n",
+                        error
+                    );
+                }
             }
         }
         // The firmware may consume M5 work-ring slots without a completion interrupt: while

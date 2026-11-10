@@ -1,20 +1,23 @@
-# T6041 MCC GPU parameter-buffer residency test
+# T6041 MCC GPU parameter-buffer lifecycle test
 
 Run on J616s with the fleet46 baseline and a candidate differing only by this
 change. Use the existing dead-man procedure for both boots.
 
-1. Confirm the candidate logs `released SLC residency for stream 14 DSID D`
-   once, with `D` matching stream 14 in `apple,tunable-mcache-stream`.
-   If the existing counter tool is available, confirm that DSID's occupancy
-   reaches zero on all 16 planes, stays zero after GPU work, and that the CPU
-   group gains about 3.3 MiB.
-2. Run the same P-cluster-0 pointer chase on both boots. Compare 24, 28, and
-   32 MiB: 24 MiB must be unchanged or better; expect about 40.4 to 35.6 ns at
-   28 MiB and 51.4 to 38.0 ns at 32 MiB (P1: 54.5 to 40.6 ns).
-3. Run the complete gpubench suite, including all `rt.*` and `render.*` cases.
-   Require no fault, timeout, or performance regression.
-4. Compare five minutes of idle power and require no change. Require zero new
-   AVC messages.
+Use `kits/test/20261110-hwp6219` as the base. Arm A with the production DTB;
+arm B is a RAM-only `aura-try` boot whose only DT changes are the 256 KiB MCC
+plane windows, `apple,pmp` on MCC, and `apple,memory-cache-controller` on GPU.
+
+1. Confirm B logs `GPU lifecycle released SLC residency for stream 14 DSID D`
+   after the GPU firmware reaches its initialized state, with `D` matching the
+   unique stream-14 record in `apple,tunable-mcache-stream`.
+2. On P0 and P1, interleave 24, 28, and 32 MiB pointer chases. Both 28 and
+   32 MiB medians must improve over A on both clusters; 24 MiB must not regress.
+3. Run the complete gpubench suite, including all `rt.*` and `render.*` cases,
+   then run `rt.scene` heavy and `render.heavy` at 2160p. Repeat the same chase
+   row after the heavy pair. The 28/32 MiB gain must remain; require neutral
+   gpubench geomean and no fault, timeout, or recovery.
+4. Run s2idle three times and require 3/3 successful resumes. Compare five
+   minutes of idle power and require no change. Require zero new AVC messages.
 
 M1, M2, and M1 Pro must show no behavior change because they do not carry the
 `apple,t6041-mcc` compatible.
