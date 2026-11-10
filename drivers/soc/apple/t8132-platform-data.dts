@@ -34,7 +34,41 @@
 
 #include "../../../arch/arm64/boot/dts/apple/t8132-pmgr.dtsi"
 #include "../../../arch/arm64/boot/dts/apple/t8132-j713-pmgr.dtsi"
+#include "../../../arch/arm64/boot/dts/apple/t8132-j713-usb4-pmgr.dtsi"
 #include "../../../arch/arm64/boot/dts/apple/t8132-memory.dtsi"
+
+/* The J713's ACIO power states: every other board keeps its own (or none). */
+&ps_atc0_pcie {
+	apple,policy-machine = "apple,j713";
+};
+
+&ps_atc1_pcie {
+	apple,policy-machine = "apple,j713";
+};
+
+&ps_atc0_cio {
+	apple,policy-machine = "apple,j713";
+};
+
+&ps_atc0_cio_pcie {
+	apple,policy-machine = "apple,j713";
+};
+
+&ps_atc0_cio_usb {
+	apple,policy-machine = "apple,j713";
+};
+
+&ps_atc1_cio {
+	apple,policy-machine = "apple,j713";
+};
+
+&ps_atc1_cio_pcie {
+	apple,policy-machine = "apple,j713";
+};
+
+&ps_atc1_cio_usb {
+	apple,policy-machine = "apple,j713";
+};
 
 &mcc {
 	apple,boot-dma-devices = <&pmp>;
