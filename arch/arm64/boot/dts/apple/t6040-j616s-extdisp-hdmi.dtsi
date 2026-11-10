@@ -14,12 +14,10 @@
 
 /*
  * DISPEXT0 may only be powered once the PMP has acknowledged it in its
- * device-state table (SOC-DEV-PS-REQ/ACK, PTD entries 480/488 on T6041): the
- * soc-device record of DISPEXT0 has ID 18 (ADT iop-pmp-nub soc-device, ack
- * flag set), so its request bit is 17. Without it, enabling the DISPEXT0 PMGR
- * chain hung the machine before root.
- * Same contract as the T6030 PMP device-state provider of
- * aurora-silicon/linux#358, through the existing pmp-report entries here.
+ * device-state table (SOC-DEV-PS-REQ/ACK, PTD entries 480/488 on T6041):
+ * its ADT iop-pmp-nub soc-device ID is 18, so its request bit is 17.
+ * Without it, enabling the DISPEXT0 PMGR chain hung the machine before
+ * root. The T6030 PMP device-state provider works the same way.
  */
 &pmp_report {
 	pmp_dispext0: report@11 {
@@ -34,8 +32,9 @@
 	};
 };
 
+/* ADT DISPEXT0_SYS parents: FAB2_SOC and the DISPEXT rail (PMP request). */
 &ps_dispext0_sys {
-	power-domains = <&pmp_dispext0>;
+	power-domains = <&ps_fab2_soc>, <&pmp_dispext0>;
 };
 
 &ps_dispext0_cpu {

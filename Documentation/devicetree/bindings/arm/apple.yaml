@@ -357,21 +357,27 @@ properties:
               - apple,j604  # MacBook Pro (14-inch, M4, 2024)
               - apple,j623  # iMac (24-inch, 2x USB-C, M4, 2024)
               - apple,j624  # iMac (24-inch, 4x USB-C, M4, 2024)
-              - apple,j713  # MacBook Air (13-inch, M3, 2025)
-              - apple,j715  # MacBook Air (15-inch, M3, 2025)
+              - apple,j713  # MacBook Air (13-inch, M4, 2025)
+              - apple,j715  # MacBook Air (15-inch, M4, 2025)
               - apple,j773g # Mac mini (M4, 2024)
           - const: apple,t8132
           - const: apple,arm-platform
 
       - description: Apple M5 SoC based platforms
         items:
-          - const: apple,j813  # MacBook Air (13-inch, M5, 2026)
+          - enum:
+              - apple,j704 # MacBook Pro (14-inch, M5, 2025)
+              - apple,j813 # MacBook Air (13-inch, M5, 2026)
+              - apple,j815 # MacBook Air (15-inch, M5)
           - const: apple,t8142
           - const: apple,arm-platform
 
       - description: Apple M6 SoC based platforms
         items:
-          - const: apple,j873g # Mac mini (M6)
+          - enum:
+              - apple,j804   # MacBook Pro (J804)
+              - apple,j833ct # iMac (J833ct)
+              - apple,j873g  # Mac mini (M6)
           - const: apple,t8152
           - const: apple,arm-platform
 
@@ -470,6 +476,34 @@ properties:
               - apple,j616c # MacBook Pro (16-inch, M4 Max, 2024)
               - apple,j575c # Mac Studio (M4 Max, 2025)
           - const: apple,t6041
+          - const: apple,arm-platform
+
+      - description: Apple M5 Pro SoC based platforms
+        items:
+          - enum:
+              - apple,j714s # MacBook Pro (14-inch, M5 Pro, 2026)
+              - apple,j716s # MacBook Pro (16-inch, M5 Pro, 2026)
+              - apple,j873s # Mac mini (M5 Pro, 2026)
+              - apple,k114s # MacBook Pro (14-inch PROLED XDR, M5 Pro, 2026)
+              - apple,k116s # MacBook Pro (16-inch PROLED XDR, M5 Pro, 2026)
+          - const: apple,t6050
+          - const: apple,arm-platform
+
+      - description: Apple M5 Max SoC based platforms
+        items:
+          - enum:
+              - apple,j714c # MacBook Pro (14-inch, M5 Max, 2026)
+              - apple,j716c # MacBook Pro (16-inch, M5 Max, 2026)
+              - apple,j775c # Mac Studio (M5 Max, 2026)
+              - apple,k114c # MacBook Pro (14-inch PROLED XDR, M5 Max, 2026)
+              - apple,k116c # MacBook Pro (16-inch PROLED XDR, M5 Max, 2026)
+          - const: apple,t6050
+          - const: apple,arm-platform
+
+      - description: Apple M5 Ultra SoC based platforms
+        items:
+          - const: apple,j775d  # Mac Studio (M5 Ultra, 2026)
+          - const: apple,t6050
           - const: apple,arm-platform
 
   aurora,minimal-boot:

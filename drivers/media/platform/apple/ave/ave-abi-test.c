@@ -225,6 +225,88 @@ static void ave_9003_hevc_main10(struct kunit *test)
 	}
 }
 
+/* One 1080p HEVC Start or first Process image, with speed mode @speed. */
+static void ave_speed_image(struct kunit *test, struct ave_ctx *ctx,
+			    enum ave_image image, bool bframes, bool main10,
+			    bool speed, u8 *cmd, size_t len)
+{
+	ave_test_session(ctx->sess, AVE_CODEC_HEVC, 1920, 1080, bframes);
+	if (main10) {
+		ctx->sess->p.min_qp = -12;
+		ctx->sess->p.profile = 2;
+		ctx->sess->p.bit_depth = 10;
+	}
+	ctx->sess->p.speed = speed;
+	memset(cmd, 0, len);
+	if (image == AVE_IMAGE_START)
+		KUNIT_ASSERT_EQ(test, ave_build_start(ctx, cmd, len), 0);
+	else
+		KUNIT_ASSERT_EQ(test, ave_build_process(ctx, cmd, len, 0,
+							0x8f0000000ULL, 8000000,
+							false), 0);
+	ave_stamp_command(ctx->ave->layout->abi, cmd, 1, 2);
+}
+
+/*
+ * Speed over quality on 9003: HEVC Start changes only the throughput mode
+ * (+0x320, 3 -> 5); Process stays the same, with and without B-frames, for
+ * Main and Main 10.
+ */
+static void ave_9003_speed(struct kunit *test)
+{
+	struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
+	struct ave_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	struct ave_session *sess = kunit_kzalloc(test, sizeof(*sess), GFP_KERNEL);
+	u8 *quality = kunit_kzalloc(test, 0x14000, GFP_KERNEL);
+	u8 *speed = kunit_kzalloc(test, 0x14000, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, ave);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	KUNIT_ASSERT_NOT_NULL(test, sess);
+	KUNIT_ASSERT_NOT_NULL(test, quality);
+	KUNIT_ASSERT_NOT_NULL(test, speed);
+	ave->layout = &ave_layout_9003_78_0;
+	ctx->ave = ave;
+	ctx->sess = sess;
+
+	for (unsigned int i = 0; i < 8; i++) {
+		enum ave_image image = i & 1 ? AVE_IMAGE_PROCESS : AVE_IMAGE_START;
+		bool bframes = i & 2, main10 = i & 4;
+		size_t len = ave->layout->bytes[AVE_CODEC_HEVC - 1][image];
+		u32 changed = image == AVE_IMAGE_START ? 0x320 : 0;
+
+		ave_speed_image(test, ctx, image, bframes, main10, false, quality,
+				len);
+		ave_speed_image(test, ctx, image, bframes, main10, true, speed, len);
+		if (changed) {
+			KUNIT_EXPECT_EQ(test, get_unaligned_le32(quality + changed), 3);
+			KUNIT_EXPECT_EQ(test, get_unaligned_le32(speed + changed), 5);
+		}
+		for (size_t off = 0; off < len; off += 4) {
+			if (changed && off == changed)
+				continue;
+			KUNIT_EXPECT_EQ_MSG(test, get_unaligned_le32(quality + off),
+					    get_unaligned_le32(speed + off),
+					    "case %u word +%#zx", i, off);
+		}
+	}
+}
+
+/* Constant quality uses the measured macOS table: anchors and shape. */
+static void ave_cq_table(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, ave_cq_initial_qp(0), 48);
+	KUNIT_EXPECT_EQ(test, ave_cq_initial_qp(30), 40);
+	KUNIT_EXPECT_EQ(test, ave_cq_initial_qp(50), 33);
+	KUNIT_EXPECT_EQ(test, ave_cq_initial_qp(60), 28);
+	KUNIT_EXPECT_EQ(test, ave_cq_initial_qp(90), 10);
+	KUNIT_EXPECT_EQ(test, ave_cq_initial_qp(100), 0);
+	KUNIT_EXPECT_EQ(test, ave_cq_initial_qp(1000), 0);
+	for (unsigned int q = 1; q <= 100; q++)
+		KUNIT_EXPECT_LE(test, ave_cq_initial_qp(q),
+				ave_cq_initial_qp(q - 1));
+}
+
 static void ave_6070_images(struct kunit *test)
 {
 	const struct ave_fw_abi *abi = &ave_abi_6070;
@@ -462,6 +544,7 @@ static void ave_6070_variants(struct kunit *test)
 
 static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_9003_byte_equality), KUNIT_CASE(ave_9003_hevc_main10),
+	KUNIT_CASE(ave_9003_speed),	    KUNIT_CASE(ave_cq_table),
 	KUNIT_CASE(ave_6070_images),
 	KUNIT_CASE(ave_6070_replies),	    KUNIT_CASE(ave_6070_split_surfaces),
 	KUNIT_CASE(ave_6070_gate),	    KUNIT_CASE(ave_6070_channels),

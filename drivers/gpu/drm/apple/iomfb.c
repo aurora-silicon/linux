@@ -13,6 +13,7 @@
 #include <linux/kref.h>
 #include <linux/module.h>
 #include <linux/of_device.h>
+#include <linux/power_supply.h>
 #include <linux/ratelimit.h>
 #include <linux/slab.h>
 #include <linux/sched.h>
@@ -22,6 +23,7 @@
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_color_mgmt.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_fb_dma_helper.h>
@@ -46,6 +48,79 @@ struct dcp_identity_trace {
 	struct apple_dcp *dcp;
 	atomic_t *count;
 };
+
+/*
+ * DCP asks the AP for "PMUS"/"Temperature" once at start-up and uses it as
+ * the initial panel temperature when no 2D panel temperature has been set.
+ * macOS answers with the system battery's gas gauge temperature in units of
+ * 0.1 K (the AppleSmartBattery "Temperature" property, the SMC B0AT key);
+ * the firmware takes off 273.2 K itself. Observed on the J700 under macOS
+ * 26.6: a reply of 2997 gave an InitialPanelTemperature of 26.5 C, equal to
+ * the battery temperature at that boot.
+ *
+ * Linux power supplies report temperature in 0.1 C, so add the 273.2 K back.
+ */
+struct dcp_battery_temp {
+	u64 value;
+	bool found;
+};
+
+static int dcp_battery_temp_cb(struct power_supply *psy, void *data)
+{
+	struct dcp_battery_temp *bt = data;
+	union power_supply_propval val;
+
+	if (psy->desc->type != POWER_SUPPLY_TYPE_BATTERY)
+		return 0;
+	if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_SCOPE, &val) &&
+	    val.intval == POWER_SUPPLY_SCOPE_DEVICE)
+		return 0;
+	if (power_supply_get_property(psy, POWER_SUPPLY_PROP_TEMP, &val))
+		return 0;
+	if (val.intval <= -2732)
+		return 0;
+
+	bt->value = val.intval + 2732;
+	bt->found = true;
+	return 1;
+}
+
+u64 dcp_pmu_temperature(struct device *dev)
+{
+	struct dcp_battery_temp bt = { 0 };
+
+	if (IS_REACHABLE(CONFIG_POWER_SUPPLY))
+		power_supply_for_each_psy(&bt, dcp_battery_temp_cb);
+
+	if (bt.found) {
+		dev_dbg(dev, "PMU temperature from the battery: %llu (0.1 K)\n",
+			bt.value);
+		return bt.value;
+	}
+
+	/*
+	 * No system battery (desktops, or the battery driver is not bound):
+	 * keep the reply Linux has always sent, 302.9 K.
+	 */
+	dev_dbg(dev, "no system battery, PMU temperature fallback\n");
+	return DCP_PMU_TEMPERATURE_FALLBACK;
+}
+
+/*
+ * set_matrix coefficients for @ctm, the identity when @ctm is NULL. DRM
+ * carries S31.32 sign-magnitude; the firmware takes signed (two's
+ * complement) Q32.32, so positive values are identical and only negative
+ * coefficients need converting.
+ */
+void dcp_ctm_to_fw(u64 fw[9], const struct drm_color_ctm *ctm)
+{
+	for (unsigned int i = 0; i < 9; i++) {
+		if (ctm)
+			fw[i] = drm_color_ctm_s31_32_to_qm_n(ctm->matrix[i], 32, 32);
+		else
+			fw[i] = (i % 4 == 0) ? 1ULL << 32 : 0;
+	}
+}
 
 static void dcp_identity_key_log(void *data, const char *key, u32 key_len,
 				 u32 type, u32 size, u32 depth)
@@ -885,7 +960,35 @@ static bool dcp_crtc_lost_route(struct drm_crtc *crtc, struct apple_connector *c
 	       to_apple_crtc(crtc)->dcp != pdev;
 }
 
-static int dcp_retrain_active_crtc(struct apple_connector *connector)
+static int dcp_set_crtc_active(struct drm_crtc *crtc,
+			       struct drm_modeset_acquire_ctx *ctx, bool active)
+{
+	struct drm_crtc_state *crtc_state;
+	struct drm_atomic_commit *state;
+	int ret;
+
+	state = drm_atomic_commit_alloc(crtc->dev);
+	if (!state)
+		return -ENOMEM;
+	state->acquire_ctx = ctx;
+	crtc_state = drm_atomic_get_crtc_state(state, crtc);
+	if (IS_ERR(crtc_state)) {
+		ret = PTR_ERR(crtc_state);
+	} else {
+		crtc_state->active = active;
+		ret = drm_atomic_commit(state);
+	}
+	drm_atomic_commit_put(state);
+	return ret;
+}
+
+/*
+ * @power_cycle: the firmware powered the pipe down with the lost link, so a
+ * modeset alone cannot bring it back. Turn the CRTC off and on instead, which
+ * reconnects the DPTX and powers the pipe on before the mode is set.
+ */
+static int dcp_retrain_active_crtc(struct apple_connector *connector,
+				   struct apple_dcp *dcp, bool power_cycle)
 {
 	struct drm_device *dev = connector->base.dev;
 	struct drm_modeset_acquire_ctx ctx;
@@ -908,6 +1011,13 @@ static int dcp_retrain_active_crtc(struct apple_connector *connector)
 		struct drm_mode_set set = { .crtc = crtc };
 
 		ret = drm_atomic_helper_set_config(&set, &ctx);
+	} else if (crtc && crtc->state && crtc->state->active &&
+		   dcp_crtc_can_retrain(crtc, connector) && power_cycle) {
+		/* A commit that held the locks first may have set the mode. */
+		ret = READ_ONCE(dcp->mode_state.valid) ? 0 :
+		      dcp_set_crtc_active(crtc, &ctx, false);
+		if (!ret && !crtc->state->active)
+			ret = dcp_set_crtc_active(crtc, &ctx, true);
 	} else if (crtc && crtc->state && crtc->state->active &&
 		   dcp_crtc_can_retrain(crtc, connector)) {
 		ret = drm_atomic_helper_reset_crtc(crtc, &ctx);
@@ -1305,6 +1415,8 @@ void dcp_hotplug(struct work_struct *work)
 	dcp = platform_get_drvdata(pdev);
 	dev_info(dcp->dev, "%s() connected:%d valid_mode:%d nr_modes:%u\n", __func__,
 		 connector->connected, READ_ONCE(dcp->mode_state.valid), dcp->nr_modes);
+	if (READ_ONCE(dcp->mode_state.valid))
+		dcp->tunnel_power_cycles = 0;
 
 	scoped_guard(mutex, &connector->base.dev->mode_config.mutex) {
 		if (READ_ONCE(connector->dcp) == pdev)
@@ -1349,9 +1461,19 @@ void dcp_hotplug(struct work_struct *work)
 		    * again, and that wake does the same, forever.
 		    */
 		   !READ_ONCE(dcp->typec_crtc_off) &&
-		   !dcp_uses_t6020_tunnel_flow(dcp)) {
-		drm_connector_set_link_status_property(&connector->base,
-						       DRM_MODE_LINK_STATUS_BAD);
+		   (!dcp_uses_t6020_tunnel_flow(dcp) ||
+		    dcp->tunnel_power_cycles < DCP_TUNNEL_POWER_CYCLES)) {
+		bool power_cycle = dcp_uses_t6020_tunnel_flow(dcp);
+
+		/*
+		 * A rebuilt T6020 tunnel is power cycled here; a link reported
+		 * bad would only have userspace retry the modeset that fails.
+		 */
+		if (power_cycle)
+			dcp->tunnel_power_cycles++;
+		else
+			drm_connector_set_link_status_property(&connector->base,
+							       DRM_MODE_LINK_STATUS_BAD);
 
 		/*
 		 * A short Type-C route interruption can leave the DRM CRTC active
@@ -1360,7 +1482,7 @@ void dcp_hotplug(struct work_struct *work)
 		 * link.  Re-apply the active CRTC state once the DPTX link-config
 		 * callback has completed.
 		 */
-		ret = dcp_retrain_active_crtc(connector);
+		ret = dcp_retrain_active_crtc(connector, dcp, power_cycle);
 		if (ret) {
 			dev_warn(dcp->dev,
 				 "failed to retrain active CRTC after hotplug: %d\n",
@@ -2071,8 +2193,7 @@ int dcp_get_modes(struct drm_connector *connector)
 		}
 	} else {
 		u64 generation = 0;
-		bool panel = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
-			     dcp_has_panel(dcp);
+		bool panel = dcp->panel_identity && dcp_has_panel(dcp);
 		const struct drm_edid *derived = nr_modes ?
 			(panel ? dcp_panel_edid_snapshot(dcp, modes, nr_modes, &generation) :
 			 dcp_firmware_edid(dcp, &generation)) : ERR_PTR(-ENODATA);

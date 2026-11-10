@@ -552,6 +552,13 @@ Kernel parameters
 	apm=		[APM] Advanced Power Management
 			See header of arch/x86/kernel/apm_32.c.
 
+	apple_keep_idle_nop
+			[ARM64,EARLY] On T6050 and T8142, keep idle=nop.
+			These cores idle in WFI by default, and an idle=nop
+			that the boot loader appends is ignored, because the
+			kernel preserves the registers WFI loses there. With
+			this flag idle=nop spins the idle loop as elsewhere.
+
 	apparmor=	[APPARMOR] Disable or enable AppArmor at boot time
 			Format: { "0" | "1" }
 			See security/apparmor/Kconfig help text
@@ -1137,6 +1144,24 @@ Kernel parameters
 			the hang situation.  The default value of this
 			option depends on the CSD_LOCK_WAIT_DEBUG_DEFAULT
 			Kconfig option.
+
+	ctxr_exec_enforce=
+			[ARM64,EARLY] Whether executable code that the boot-time
+			check finds outside the CTXR executable window is
+			fatal. Applies to a window from the device tree or
+			from ctxr_exec_window=.
+			Format: <bool>
+			Default: 1
+
+	ctxr_exec_window=
+			[ARM64,EARLY] Confine kernel executable code to a
+			physical window. This is for bring-up and VMs. A value
+			that doesn't parse is ignored with a warning. The
+			kernel must be at EL2, and when the device tree carries
+			a window the given one must lie inside it; otherwise the
+			secondary CPUs are kept offline.
+			See Documentation/arch/arm64/ctxr-execmem.rst.
+			Format: <size>[KMG]@<base>[KMG]
 
 	dasd=		[HW,NET]
 			See header of drivers/s390/block/dasd_devmap.c.

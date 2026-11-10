@@ -1,0 +1,89 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The T8132 internal display coprocessor (DCP), its mailbox, firmware
+ * DART (SID23) and display DART (SID0 scanout, SID16 PIODMA), as on the
+ * J713. iBoot leaves them running. They stay disabled, and the DART driver
+ * keeps off them, until a board's panel handoff is qualified.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+	aliases {
+		dcp = &dcp;
+		disp0 = &display;
+	};
+};
+
+&soc {
+	dcp_mbox: mailbox@30ae08000 {
+		compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x0ae08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 653 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 654 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 655 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 656 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		power-domains = <&ps_disp_cpu>;
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	dcp_dart: iommu@30a340000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x3 0x0a340000 0x0 0x20000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 678 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		status = "disabled";
+	};
+
+	disp0_dart: iommu@30a300000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x3 0x0a300000 0x0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 678 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		status = "disabled";
+	};
+
+	dcp: dcp@30ae00000 {
+		compatible = "apple,t8132-dcp";
+		reg = <0x3 0x0ae00000 0x0 0x4000>,
+		      <0x3 0x08000000 0x0 0xc20000>,
+		      <0x3 0x0a240000 0x0 0x10000>,
+		      <0x3 0x0a3a8000 0x0 0x4000>,
+		      <0x3 0x0a800000 0x0 0x800000>,
+		      <0x3 0x82800000 0x0 0xbc000>,
+		      <0x3 0x0a850000 0x0 0x4000>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3",
+			    "disp-4", "iop-vbar";
+		mboxes = <&dcp_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcp_dart 23>;
+		power-domains = <&ps_disp_cpu>;
+		dma-noncoherent;
+		status = "disabled";
+
+		disp0_piodma: piodma {
+			iommus = <&disp0_dart 16>;
+			dma-noncoherent;
+			status = "disabled";
+		};
+	};
+
+	/* The scanout frontend; it has no registers of its own. */
+	display: display-subsystem {
+		compatible = "apple,t8132-display-subsystem", "apple,t8132-display-diagnostics";
+		iommus = <&disp0_dart 0>;
+		dma-noncoherent;
+		status = "disabled";
+	};
+};

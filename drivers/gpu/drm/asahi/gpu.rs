@@ -836,7 +836,17 @@ impl GpuManager::ver {
         let buffer_mgr = buffer::BufferManager::ver::new()?;
         let event_manager_clone = event_manager.clone();
         let buffer_mgr_clone = buffer_mgr.clone();
-        let stats_snap = Arc::new(stats::StatsSnapshot::default(), GFP_KERNEL)?;
+        let mut frequencies_hz = KVec::with_capacity(dyncfg.pwr.perf_states.len(), GFP_KERNEL)?;
+        for state in &dyncfg.pwr.perf_states {
+            frequencies_hz.push(u64::from(state.freq_hz), GFP_KERNEL)?;
+        }
+        let stats_snap = Arc::new(
+            stats::StatsSnapshot {
+                frequencies_hz,
+                ..Default::default()
+            },
+            GFP_KERNEL,
+        )?;
         let stats_snap_clone = stats_snap.clone();
         // Per-device raw statistics snapshot, shared with the debugfs export.
         let raw_stats_snap = Arc::pin_init(
@@ -1266,6 +1276,9 @@ impl GpuManager::ver {
             .with(|raw, _inner| raw.pending_submissions.fetch_add(1, Ordering::Acquire));
 
         mod_dev_dbg!(self.dev, "OP start (pending: {})\n", val + 1);
+        // SAFETY: Takes no arguments and does nothing unless pmp_report.agx_vote is set on a T6001. The matching end call is made
+        // by OpGuard's Drop, and the guard is created right below, so every path out of here (including a failed kick) pairs it.
+        unsafe { kernel::bindings::apple_pmp_agx_activity_begin() };
         let guard = OpGuard(self.clone());
         self.kick_firmware()?;
         Ok(guard)
@@ -1791,5 +1804,7 @@ impl GpuManagerPriv for GpuManager::ver {
             .with(|raw, _inner| raw.pending_submissions.fetch_sub(1, Ordering::Release));
 
         mod_dev_dbg!(self.dev, "OP end (pending: {})\n", val - 1);
+        // SAFETY: Pairs with the begin call in start_op(); callable from any context.
+        unsafe { kernel::bindings::apple_pmp_agx_activity_end() };
     }
 }

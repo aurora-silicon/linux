@@ -1,0 +1,88 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * T6000 rail voltages published by the SMC.
+ *
+ * The three CLVR SPMI buses (clvr-spmi0-2) connect the SMC to the cluster,
+ * GPU and SoC voltage regulators. Linux leaves those buses to the SMC and
+ * reads the SMC's VCxy keys instead (x = bus + 1, y = regulator output).
+ * With the other clusters held at their lowest step, one cluster under load
+ * moves only its own keys:
+ *   P0 cluster (cpu2-5): VC12 566-906 mV, VC13 768-1058 mV
+ *   P1 cluster (cpu6-9): VC10 571-906 mV, VC11 770-1060 mV
+ *   GPU: VC20-VC23, 0 mV while power-gated, 700-800 mV under load
+ *   SoC (clvr-spmi2): VC30/VC31 stay flat, VC32/VC33 rise with GPU load
+ * The E cluster (cpu0-1) is fed by the main PMU: VP0b 547-834 mV and
+ * VP2b 768-924 mV.
+ */
+
+&smc_hwmon {
+	voltage-VC10 {
+		apple,key-id = "VC10";
+		label = "P1-cluster VC10";
+	};
+
+	voltage-VC11 {
+		apple,key-id = "VC11";
+		label = "P1-cluster VC11";
+	};
+
+	voltage-VC12 {
+		apple,key-id = "VC12";
+		label = "P0-cluster VC12";
+	};
+
+	voltage-VC13 {
+		apple,key-id = "VC13";
+		label = "P0-cluster VC13";
+	};
+
+	voltage-VC20 {
+		apple,key-id = "VC20";
+		label = "GPU VC20";
+	};
+
+	voltage-VC21 {
+		apple,key-id = "VC21";
+		label = "GPU VC21";
+	};
+
+	voltage-VC22 {
+		apple,key-id = "VC22";
+		label = "GPU VC22";
+	};
+
+	voltage-VC23 {
+		apple,key-id = "VC23";
+		label = "GPU VC23";
+	};
+
+	voltage-VC30 {
+		apple,key-id = "VC30";
+		label = "SoC VC30";
+	};
+
+	voltage-VC31 {
+		apple,key-id = "VC31";
+		label = "SoC VC31";
+	};
+
+	voltage-VC32 {
+		apple,key-id = "VC32";
+		label = "SoC VC32";
+	};
+
+	voltage-VC33 {
+		apple,key-id = "VC33";
+		label = "SoC VC33";
+	};
+
+	voltage-VP0b {
+		apple,key-id = "VP0b";
+		label = "E-cluster VP0b";
+	};
+
+	voltage-VP2b {
+		apple,key-id = "VP2b";
+		label = "E-cluster VP2b";
+	};
+};

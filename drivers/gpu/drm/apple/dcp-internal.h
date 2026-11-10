@@ -41,6 +41,8 @@
 #include "version_utils.h"
 
 #define DCP_MAX_PLANES 4
+/* Bounds the CRTC power cycles a rebuilt T6020 tunnel may trigger. */
+#define DCP_TUNNEL_POWER_CYCLES 2
 
 struct apple_dcp;
 struct iomfb_m4;
@@ -71,6 +73,7 @@ struct apple_dcp_typec_port;
 
 void dcp_swap_watchdog_arm(struct apple_dcp *dcp);
 void dcp_swap_watchdog_complete(struct apple_dcp *dcp);
+bool dcp_swap_lost(struct apple_dcp *dcp, u32 swap_id);
 void dcp_retry_placeholder_edid(struct apple_dcp *dcp,
 				const struct drm_edid *drm_edid);
 bool dcp_typec_relink(struct apple_dcp *dcp);
@@ -177,6 +180,16 @@ struct dcp_brightness {
 	bool update;
 	/* A level was written through the backlight device (desktop 26.x). */
 	bool requested;
+	/*
+	 * Fade between levels where the firmware takes a DAC value in each
+	 * swap.  level is the one set last, in nits; crtc mutex.
+	 */
+	struct delayed_work fade_work;
+	unsigned long fade_start;
+	u32 level;
+	u32 fade_from;
+	u32 fade_to;
+	bool fading;
 };
 
 struct audiosrv_data;
@@ -191,6 +204,26 @@ struct dcp_panel {
 	bool has_mini_led;
 	/// peak panel luminance in nits, for EDR (desktop 26.x; 0 if unknown)
 	u32 peak_nits;
+	/// EDR headroom ceiling x1000 from the ADT (desktop 26.x; 0 if none)
+	u32 edr_ceiling;
+	/// calibrated colour target from the raw ADT; NULL if not given
+	const struct dcp_color_space *color_target;
+};
+
+/*
+ * Identity of a fixed internal panel, for the EDID published on its
+ * connector.  Any processor with an internal panel allocates it; the boot
+ * loader's ADT supplies the fallback, and firmware metadata or a raw panel
+ * EDID replace that when the firmware reports one.  metadata.lock.
+ */
+struct dcp_panel_identity {
+	/* Identity supplied by this fixed panel, independent of optional color data. */
+	struct dcp_display_metadata metadata;
+	struct dcp_display_metadata adt;
+	u64 generation;
+	bool metadata_valid;
+	u8 raw_edid[4096];
+	size_t raw_edid_size;
 };
 
 enum dcp_iomfb_method_profile {
@@ -255,14 +288,7 @@ struct dcp_desktop_state {
 	 * element before the real one is selected.
 	 */
 	bool mode_live;
-	/* Identity supplied by this fixed panel, independent of optional color data. */
-	struct dcp_display_metadata panel_metadata;
-	struct dcp_display_metadata panel_adt_identity;
-	u64 panel_metadata_generation;
-	bool panel_metadata_valid;
 	atomic_t identity_log_count[4];
-	u8 panel_raw_edid[4096];
-	size_t panel_raw_edid_size;
 	/* RX records an unsupported callback until the modeset RPC has drained. */
 	bool modeset_active;
 	bool modeset_callback_error;
@@ -422,6 +448,8 @@ struct apple_dcp {
 	/* Bumped by every iomfb poweron; see afk_compact_slot(). */
 	u32 afk_power_gen;
 	bool external;
+	/* A desktop 26.x external processor (apple,t6041-dcpext) */
+	bool desktop_external;
 	/*
 	 * T8122 dcpext: the panel's DRM device never waits on this processor.
 	 * A probe or bind failure leaves it in the device as an unusable pipe
@@ -548,11 +576,22 @@ struct apple_dcp {
 	u32 last_swap_id;
 	/* last_swap_id is only meaningful after the first swap completes */
 	bool have_swap_complete;
+	/* swap id of the last started swap */
+	u32 started_swap_id;
+	/*
+	 * A started swap whose flip a commit gave up on
+	 * (dcp_drm_crtc_flip_lost()); event_lock. Firmware that does not track
+	 * its presents ignores its completion, see dcp_swap_lost().
+	 */
+	u32 lost_swap_id;
+	bool swap_lost;
 	ktime_t swap_start;
 	u64 swap_submit_timestamp;
 
 	/* Current display mode */
 	struct dcp_mode_state mode_state;
+	/* hotplug worker: power cycles since the mode was last valid */
+	unsigned int tunnel_power_cycles;
 	/* One HPD pulse after a placeholder EDID, per Type-C connection. */
 	bool placeholder_retried;
 	u64 typec_generation;	/* hpd_mutex: identifies the current connection */
@@ -580,11 +619,12 @@ struct apple_dcp {
 	bool output_edr;
 	bool edr_sent;
 	/*
-	 * EDR headroom the panel was last given, x1000 (0: not in use), and
-	 * a power off since, after which the ramp starts again from 1.0 (see
-	 * dcp_edr_prepare()).
+	 * EDR headroom the panel was last given, x1000 (0: not in use), the
+	 * SDR white in nits it was given for, and a power off since, after
+	 * which the ramp starts again from 1.0 (see dcp_edr_prepare()).
 	 */
 	u32 edr_hm;
+	u32 edr_sdr;
 	bool edr_restart;
 	struct dcp_set_digital_out_mode_req mode;
 
@@ -848,6 +888,8 @@ struct apple_dcp {
 
 	/* Kept last: the template instances share the layout above. */
 	struct dcp_desktop_state *desktop;
+	/* Internal panel identity; NULL without an internal panel. */
+	struct dcp_panel_identity *panel_identity;
 };
 
 /* T8132 firmware uses its own wire codec, with the common DRM/KMS owner. */

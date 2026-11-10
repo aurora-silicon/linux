@@ -12,68 +12,211 @@ maintainers:
 description: |
   Apple Silicon JPEG engines are directly programmed memory-to-memory codecs.
   Each engine has a dedicated interrupt and DART stream. Multiple engines can
-  share a power domain. The power controller manages the gate; no separate
-  clock or firmware interface is required.
+  share a power domain. The power controller manages the gate. Earlier
+  engines also identify native input-clock selectors. The codec has no
+  firmware interface.
 
   On T6041 the DMA window reserves one 4 GiB slice of the DART high alias for
   the engine's 32-bit buffer pointer registers. T8140 engines take 64-bit
   buffer addresses and use their DART's full window.
 
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6000-jpeg
+          - apple,t6020-jpeg
+          - apple,t6021-jpeg
+          - apple,t6022-jpeg
+          - apple,t6030-jpeg
+          - apple,t6031-jpeg
+          - apple,t6032-jpeg
+          - apple,t6041-jpeg
+          - apple,t8103-jpeg
+          - apple,t8112-jpeg
+          - apple,t8122-jpeg
+          - apple,t8132-jpeg
+          - apple,t6050-jpeg
+          - apple,t8140-jpeg
+  required:
+    - compatible
+
 properties:
-  compatible:
-    enum:
-      - apple,t6041-jpeg
-      - apple,t8140-jpeg
-
-  reg:
-    maxItems: 1
-
-  interrupts:
-    maxItems: 1
-
-  iommus:
-    maxItems: 1
-
-  power-domains:
-    minItems: 1
-    items:
-      - description: The engine's power domain
-      - description: Performance request held while the engine works
-
-  power-domain-names:
-    minItems: 1
-    items:
-      - const: core
-      - const: perf
+  compatible: true
 
   apple,dma-range:
     $ref: /schemas/types.yaml#/definitions/uint64-array
-    items:
-      - const: 0x10000000000
-      - const: 0x100000000
-    description: Device-visible DMA window, as a 64-bit base and size.
-      Only for engines with 32-bit buffer pointers.
-
-required:
-  - compatible
-  - reg
-  - interrupts
-  - iommus
-  - power-domains
+    description: Shared hardware resource metadata.
 
 allOf:
   - if:
       properties:
         compatible:
-          const: apple,t6041-jpeg
-    then:
+          contains:
+            enum:
+              - apple,t8132-jpeg
+              - apple,t6050-jpeg
       required:
-        - apple,dma-range
-    else:
+        - compatible
+    then:
       properties:
-        apple,dma-range: false
+        compatible:
+          items:
+            - enum:
+                - apple,t8132-jpeg
+                - apple,t6050-jpeg
+            - const: apple,jpeg
 
-additionalProperties: false
+        reg:
+          maxItems: 1
+
+        interrupts:
+          maxItems: 1
+
+        power-domains:
+          maxItems: 1
+
+        iommus:
+          maxItems: 1
+
+        clocks:
+          minItems: 1
+          maxItems: 2
+
+      required:
+        - compatible
+        - reg
+        - interrupts
+        - power-domains
+        - iommus
+    else:
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t6032-jpeg
+            required:
+              - compatible
+          then:
+            properties:
+              compatible:
+                items:
+                  - const: apple,t6032-jpeg
+                  - const: apple,jpeg
+
+              reg:
+                maxItems: 1
+
+              interrupts:
+                maxItems: 1
+
+              power-domains:
+                maxItems: 1
+
+              iommus:
+                maxItems: 1
+
+              clocks:
+                minItems: 2
+                maxItems: 2
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - power-domains
+              - iommus
+              - clocks
+          else:
+            properties:
+              compatible:
+                oneOf:
+                  - enum:
+                      - apple,t6041-jpeg
+                      - apple,t8140-jpeg
+                  - items:
+                      - enum:
+                          - apple,t6000-jpeg
+                          - apple,t6020-jpeg
+                          - apple,t6021-jpeg
+                          - apple,t6022-jpeg
+                          - apple,t6030-jpeg
+                          - apple,t6031-jpeg
+                          - apple,t8103-jpeg
+                          - apple,t8112-jpeg
+                          - apple,t8122-jpeg
+                      - const: apple,jpeg
+
+              reg:
+                maxItems: 1
+
+              interrupts:
+                maxItems: 1
+
+              iommus:
+                maxItems: 1
+
+              clocks:
+                minItems: 1
+                maxItems: 2
+
+              power-domains:
+                minItems: 1
+                items:
+                  - description: The engine's power domain
+                  - description: Performance request held while the engine works
+
+              power-domain-names:
+                minItems: 1
+                items:
+                  - const: core
+                  - const: perf
+
+              apple,dma-range:
+                $ref: /schemas/types.yaml#/definitions/uint64-array
+                items:
+                  - const: 0x10000000000
+                  - const: 0x100000000
+                description: Device-visible DMA window, as a 64-bit base and size.
+                  Only for engines with 32-bit buffer pointers.
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - iommus
+              - power-domains
+
+            allOf:
+              - if:
+                  properties:
+                    compatible:
+                      const: apple,t6041-jpeg
+                then:
+                  required:
+                    - apple,dma-range
+                else:
+                  properties:
+                    apple,dma-range: false
+              - if:
+                  properties:
+                    compatible:
+                      contains:
+                        enum:
+                          - apple,t6030-jpeg
+                          - apple,t6031-jpeg
+                          - apple,t8122-jpeg
+                then:
+                  properties:
+                    power-domains:
+                      maxItems: 1
+
+            additionalProperties: false
+
+unevaluatedProperties: false
 
 examples:
   - |

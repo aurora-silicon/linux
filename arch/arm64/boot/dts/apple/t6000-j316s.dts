@@ -9,14 +9,23 @@
 
 /dts-v1/;
 
+/*
+ * PMP manages system power states, as on the J314s: the ANE, GPU, AVD and
+ * JPEG send it their performance requests, and the board idles lower.
+ */
+#define APPLE_USE_PMP
+
 #include "t6000.dtsi"
 #include "t600x-j314-j316.dtsi"
+#include "t6000-hwmon-rails.dtsi"
 
 / {
 	compatible = "apple,j316s", "apple,t6000", "apple,arm-platform";
 	model = "Apple MacBook Pro (16-inch, M1 Pro, 2021)";
 
 	aliases {
+		rtc0 = &smc_rtc;
+		rtc1 = &pmu_rtc;
 		sep = &sep;
 	};
 };
@@ -70,6 +79,52 @@
 &aop_audio {
 	apple,chassis-name = "J316";
 	apple,machine-kind = "MacBook Pro";
+};
+
+&aop {
+	accel {
+		compatible = "apple,t6000-aop-accel", "apple,aop-accel";
+	};
+
+	gyro {
+		compatible = "apple,t6000-aop-gyro", "apple,aop-gyro";
+	};
+};
+
+&nub_spmi1 {
+	pmic@e {
+		compatible = "apple,maverick-pmic", "apple,spmi-nvmem";
+		reg = <0xe SPMI_USID>;
+		read-only;
+		status = "disabled";
+	};
+};
+
+&clvr_spmi0 {
+	pmic@f {
+		compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
+		reg = <0xf SPMI_USID>;
+		read-only;
+		status = "disabled";
+	};
+};
+
+&clvr_spmi1 {
+	pmic@f {
+		compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
+		reg = <0xf SPMI_USID>;
+		read-only;
+		status = "disabled";
+	};
+};
+
+&clvr_spmi2 {
+	pmic@f {
+		compatible = "apple,monaco-pmic", "apple,spmi-nvmem";
+		reg = <0xf SPMI_USID>;
+		read-only;
+		status = "disabled";
+	};
 };
 
 &sound {

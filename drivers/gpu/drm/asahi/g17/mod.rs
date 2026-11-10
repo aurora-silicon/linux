@@ -736,14 +736,16 @@ impl Firmware {
         Ok(())
     }
 
-    /// Returns the delay in ns for a follow-up idle check. Queue owners report only submitted,
-    /// unretired work; quarantined work retaining mappings is excluded. Submissions published
-    /// without the device mutex count as activity, and a clear that races one is abandoned.
+    /// Observe a telemetry epoch boundary without changing GPU power policy.
     fn observe_statistics_power(&mut self) {
         if self.rings.statistics_suspended() {
             return;
         }
+        let roles = self.roles();
         self.rings.observe_statistics_power(
+            &self.primary.state.shared.dev,
+            &self.init,
+            roles,
             self.bridge.regs.g17_core_power() & 0xf != 0,
             self.port.statistics_epoch(),
         );
@@ -1171,7 +1173,9 @@ impl Gpu {
         } else {
             None
         };
-        let variant = Self::firmware_variant(dev, &cfg.firmware)?;
+        let (variant, build_cfg) = Self::firmware_variant(dev, &cfg.firmware)?;
+        // A build with its own configuration of the SoC runs with that one.
+        let cfg = build_cfg.unwrap_or(cfg);
         let id = regs.get_g17_id()?;
         if let Some(calibration) = calibration {
             calibration.check_cores(&id.core_masks)?;
@@ -1322,14 +1326,15 @@ impl Gpu {
         Ok(gpu)
     }
 
-    /// Returns the variant of the loaded firmware build. An identified SoC refuses a build it
-    /// does not know, before anything is written to the GPU.
+    /// Returns the variant of the loaded firmware build and the configuration it runs with, if
+    /// it has its own. An identified SoC refuses a build it does not know, before anything is
+    /// written to the GPU.
     fn firmware_variant(
         dev: &AsahiDrmDevice,
         firmware: &fw::variant::Firmware,
-    ) -> Result<&'static fw::Variant> {
+    ) -> Result<(&'static fw::Variant, Option<&'static Config>)> {
         let builds = match firmware {
-            fw::variant::Firmware::Fixed(variant) => return Ok(variant),
+            fw::variant::Firmware::Fixed(variant) => return Ok((variant, None)),
             fw::variant::Firmware::Identified(builds) => builds,
         };
         let version = Self::os_firmware_version(dev);
@@ -1344,7 +1349,7 @@ impl Gpu {
         for build in Iterator::chain(preferred, others) {
             if Self::identify_image(dev, build).is_ok() {
                 dev_info!(dev.as_ref(), "GPU firmware: {}\n", build.name);
-                return Ok(build.variant);
+                return Ok((build.variant, build.config));
             }
         }
         dev_err!(

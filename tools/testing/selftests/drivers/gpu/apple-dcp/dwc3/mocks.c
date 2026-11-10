@@ -36,6 +36,7 @@ struct phy_ops {
 	int (*exit)(struct phy *);
 	int (*power_on)(struct phy *);
 	int (*power_off)(struct phy *);
+	int (*reset)(struct phy *);
 };
 struct phy {
 	struct apple_atcphy *data;
@@ -191,6 +192,23 @@ static void atcphy_dp_aux_on_t8122(struct apple_atcphy *p)
 static bool of_machine_is_compatible(const char *name)
 {
 	return !strcmp(name, "apple,t8140");
+}
+/* As in <linux/soc/apple/t8132.h>. */
+static inline bool apple_t8132_air(void)
+{
+	return of_machine_is_compatible("apple,j713") ||
+	       of_machine_is_compatible("apple,j715");
+}
+static inline bool apple_t8132_pro_mini_imac(void)
+{
+	return of_machine_is_compatible("apple,j604") ||
+	       of_machine_is_compatible("apple,j623") ||
+	       of_machine_is_compatible("apple,j624") ||
+	       of_machine_is_compatible("apple,j773g");
+}
+static inline bool apple_t8132_usb_host_first(void)
+{
+	return apple_t8132_air() || apple_t8132_pro_mini_imac();
 }
 
 #define READ_ONCE(x) (x)

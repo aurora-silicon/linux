@@ -128,6 +128,11 @@ const EPIC_SUBTYPE_ACCEL_REPORT: u16 = 0xc2;
 const EPIC_SUBTYPE_RETCODE: u16 = 0x84;
 const EPIC_SUBTYPE_RETCODE_PAYLOAD: u16 = 0xa0;
 const EPIC_SUBTYPE_STRING: u16 = 0x8a;
+/// Replies to the client-open (25) and client-close (26) commands. As with
+/// the other replies, the subtype is the request's with bit 7 set, and the
+/// body starts with the return code.
+const EPIC_SUBTYPE_CLIENT_OPEN_REPLY: u16 = 0x99;
+const EPIC_SUBTYPE_CLIENT_CLOSE_REPLY: u16 = 0x9a;
 const QE_MAGIC1: u32 = from_fourcc(b" POI");
 const QE_MAGIC2: u32 = from_fourcc(b" POA");
 /// Bound on the wait for the reply to an EPIC call. The firmware can stop
@@ -170,6 +175,8 @@ const SETUP_BUFFER_ENTRY_SIZE: usize = 16;
 /// them have theirs.
 const SETUP_ENDPOINTS: [u8; 5] = [0x20, 0x21, 0x23, 0x30, 0x32];
 const SETUP_BOOT_TIMEOUT_MS: u32 = 15000;
+/// How long the AP power request waits for the last endpoint map fragment.
+const SETUP_MAP_TIMEOUT_MS: u32 = 1000;
 // A request to a service endpoint: the payload goes into the endpoint's
 // message page, (3 << 60) | length announces it, the firmware answers with a
 // result word after writing a status byte at the start of the reply window,
@@ -774,6 +781,8 @@ impl AFKEndpoint {
             if subtype == EPIC_SUBTYPE_RETCODE_PAYLOAD
                 || subtype == EPIC_SUBTYPE_RETCODE
                 || subtype == EPIC_SUBTYPE_STRING
+                || subtype == EPIC_SUBTYPE_CLIENT_OPEN_REPLY
+                || subtype == EPIC_SUBTYPE_CLIENT_CLOSE_REPLY
             {
                 if data.len() < mem::size_of::<u32>() {
                     return Err(EMSGSIZE);
@@ -1480,6 +1489,8 @@ impl AopData {
             b"als" => c_str!("als"),
             b"accel" => c_str!("accel"),
             b"gyro" => c_str!("gyro"),
+            b"devmotion6" => c_str!("devmotion6"),
+            b"als-temp" => c_str!("als-temp"),
             _ => {
                 return Ok(());
             }
@@ -1593,7 +1604,7 @@ impl AopData {
     fn patch_bootargs(
         &self,
         aop_mmio: &Mmio<'_, Region<AOP_MMIO_SIZE>>,
-        patches: &[(u32, u64)],
+        patches: &[(u32, Option<u64>)],
         word_access: bool,
     ) -> Result<()> {
         let offset = aop_mmio.read32(BOOTARGS_OFFSET) as usize;
@@ -1637,6 +1648,10 @@ impl AopData {
                 if *k != key {
                     continue;
                 }
+                // `None` keeps the value the firmware image carries.
+                let Some(v) = v else {
+                    break;
+                };
                 if len > mem::size_of::<u64>() {
                     return Err(EINVAL);
                 }
@@ -2469,7 +2484,15 @@ impl AopData {
     /// buffers.
     fn setup_finish_boot(&self) -> Result<()> {
         let mut st = self.setup.lock();
-        if !st.map_done {
+        // The firmware sends the endpoint map right after HELLO, normally
+        // before RTKit reaches AP power on, but on some boots its last
+        // fragment arrives a few milliseconds later. Request AP power only
+        // once the map is complete, and warn only if it never completes.
+        if !st.map_done
+            && self
+                .setup_wait(&mut st, SETUP_MAP_TIMEOUT_MS, |s| s.map_done)
+                .is_err()
+        {
             dev_warn!(
                 self.dev,
                 "setup port: endpoint map incomplete before the AP power request"
@@ -2543,8 +2566,8 @@ struct AopDriver(Arc<dyn AOP>);
 
 struct AopHwConfig {
     ec0p: u64,
-    /// The `nCal` boot argument.
-    ncal: u64,
+    /// The `nCal` boot argument, or `None` to keep the firmware's own value.
+    ncal: Option<u64>,
     alig: u64,
     aopt: u64,
     /// Complete the firmware's boot arguments before starting it.
@@ -2569,7 +2592,7 @@ struct AopHwConfig {
 
 const HW_CFG_T8103: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
-    ncal: 0,
+    ncal: Some(0),
     aopt: 1,
     alig: 128,
     patch_bootargs: true,
@@ -2581,9 +2604,11 @@ const HW_CFG_T8103: AopHwConfig = AopHwConfig {
     bootargs_word_access: false,
     halt_on_failed_start: false,
 };
+/// `nCal` keeps the firmware's own value, as on T6040: the J413 image carries 1,
+/// and with 0 the firmware never announces its accelerometer and gyroscope.
 const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
-    ncal: 0,
+    ncal: None,
     aopt: 0,
     alig: 128,
     patch_bootargs: true,
@@ -2595,9 +2620,10 @@ const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     bootargs_word_access: false,
     halt_on_failed_start: false,
 };
+/// `nCal` keeps the firmware's own value, as on T8112.
 const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
-    ncal: 0,
+    ncal: None,
     aopt: 0,
     alig: 64,
     patch_bootargs: true,
@@ -2611,7 +2637,7 @@ const HW_CFG_T6000: AopHwConfig = AopHwConfig {
 };
 const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     ec0p: 0x0100_00000000,
-    ncal: 0,
+    ncal: Some(0),
     aopt: 0,
     alig: 64,
     patch_bootargs: true,
@@ -2630,7 +2656,7 @@ const HW_CFG_T6020: AopHwConfig = AopHwConfig {
 /// and report interval but never send a report.
 const HW_CFG_T6040: AopHwConfig = AopHwConfig {
     ec0p: 0x0100_00000000,
-    ncal: 1,
+    ncal: Some(1),
     aopt: 0,
     alig: 64,
     patch_bootargs: true,
@@ -2653,7 +2679,7 @@ const HW_CFG_T8132: AopHwConfig = HW_CFG_T6040;
 /// are started if they will.
 const HW_CFG_T8140: AopHwConfig = AopHwConfig {
     ec0p: 0,
-    ncal: 0,
+    ncal: Some(0),
     aopt: 0,
     alig: 0,
     patch_bootargs: false,
@@ -2718,10 +2744,10 @@ impl platform::Driver for AopDriver {
             data.patch_bootargs(
                 &aop_mmio,
                 &[
-                    (from_fourcc(b"EC0p"), cfg.ec0p),
+                    (from_fourcc(b"EC0p"), Some(cfg.ec0p)),
                     (from_fourcc(b"nCal"), cfg.ncal),
-                    (from_fourcc(b"alig"), cfg.alig),
-                    (from_fourcc(b"AOPt"), cfg.aopt),
+                    (from_fourcc(b"alig"), Some(cfg.alig)),
+                    (from_fourcc(b"AOPt"), Some(cfg.aopt)),
                 ],
                 cfg.bootargs_word_access,
             )?;

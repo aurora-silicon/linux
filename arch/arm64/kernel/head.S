@@ -117,6 +117,9 @@ SYM_CODE_START(primary_entry)
 	blr	x2
 
 1:	mov	x0, x19
+#ifdef CONFIG_ARM64_CTXR_EXECMEM
+	mov	x22, xzr			// boot CPU: never read the CTXR flag
+#endif
 	bl	init_kernel_el			// w0=cpu_boot_mode
 	mov	x20, x0
 
@@ -307,6 +310,67 @@ SYM_INNER_LABEL(init_el2, SYM_L_LOCAL)
 	msr	vbar_el2, x0
 	isb
 
+#ifdef CONFIG_ARM64_CTXR_EXECMEM
+	/*
+	 * A core confined to a CTXR window can't run the window's code at EL1,
+	 * so once a window is active it switches to VHE here instead of going
+	 * through EL1 and finalise_el2. Only a secondary or a resuming CPU
+	 * reads the flag (x22 == 1): the boot CPU's first entry (x22 == 0)
+	 * runs before ctxr_stay_el2 is set and cleaned to the PoC, so it must
+	 * not read it at all.
+	 */
+	cbnz	x22, .Lctxr_read_flag
+	/*
+	 * The boot CPU of a J616s (T6040) booted from a kcbz 0 boot object
+	 * dies before earlycon on the trip through EL1, while the T8140's
+	 * boot CPU survives it. Keep Apple cores from the M4 generation on
+	 * (part numbers from 0x50) with VHE at EL2 from the boot CPU's first
+	 * entry, as 73b99c17e605 did, without reading the flag.
+	 */
+	mrs	x0, midr_el1
+	ubfx	x1, x0, #MIDR_IMPLEMENTOR_SHIFT, #8
+	cmp	x1, #ARM_CPU_IMP_APPLE
+	b.ne	.Lctxr_no_direct_vhe
+	ubfx	x0, x0, #MIDR_PARTNUM_SHIFT, #12
+	cmp	x0, #0x50
+	b.lo	.Lctxr_no_direct_vhe
+	/* A virtual EL2 without VHE, as nested KVM may give a guest. */
+	mrs	x0, id_aa64mmfr1_el1
+	ubfx	x0, x0, #ID_AA64MMFR1_EL1_VH_SHIFT, #4
+	cbz	x0, .Lctxr_no_direct_vhe
+	b	.Lctxr_direct_vhe
+.Lctxr_read_flag:
+	adr_l	x0, ctxr_stay_el2
+	ldr	w0, [x0]
+	cbz	w0, .Lctxr_no_direct_vhe
+
+.Lctxr_direct_vhe:
+	finalise_el2_state
+
+	mov_q	x0, HCR_HOST_VHE_FLAGS
+	msr_hcr_el2 x0
+	isb
+
+	mrs	x0, mdcr_el2
+	bic	x0, x0, #MDCR_EL2_E2PB_MASK
+	bic	x0, x0, #MDCR_EL2_E2TB_MASK
+	msr	mdcr_el2, x0
+
+	mov_q	x0, INIT_SCTLR_EL1_MMU_OFF
+	msr_s	SYS_SCTLR_EL12, x0
+	pre_disable_mmu_workaround
+	msr	sctlr_el1, x0
+	isb
+
+	mov	x0, #(PSR_D_BIT | PSR_A_BIT | PSR_I_BIT | PSR_F_BIT | PSR_MODE_EL2h)
+	msr	spsr_el2, x0
+
+	mov	w0, #BOOT_CPU_MODE_EL2
+	orr	x0, x0, #BOOT_CPU_FLAG_E2H
+	eret
+.Lctxr_no_direct_vhe:
+#endif
+
 	mov_q	x1, INIT_SCTLR_EL1_MMU_OFF
 
 	mrs	x0, hcr_el2
@@ -336,6 +400,9 @@ SYM_FUNC_END(init_kernel_el)
 	 */
 SYM_FUNC_START(secondary_holding_pen)
 	mov	x0, xzr
+#ifdef CONFIG_ARM64_CTXR_EXECMEM
+	mov	x22, #1				// a secondary may be confined
+#endif
 	bl	init_kernel_el			// w0=cpu_boot_mode
 	mrs	x2, mpidr_el1
 	mov_q	x1, MPIDR_HWID_BITMASK
@@ -354,6 +421,9 @@ SYM_FUNC_END(secondary_holding_pen)
 	 */
 SYM_FUNC_START(secondary_entry)
 	mov	x0, xzr
+#ifdef CONFIG_ARM64_CTXR_EXECMEM
+	mov	x22, #1				// a secondary may be confined
+#endif
 	bl	init_kernel_el			// w0=cpu_boot_mode
 	b	secondary_startup
 SYM_FUNC_END(secondary_entry)

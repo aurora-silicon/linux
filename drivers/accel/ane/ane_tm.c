@@ -5,6 +5,7 @@
 #include <linux/iopoll.h>
 #include <linux/pm_runtime.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include "ane_tm.h"
 #include "ane_pm.h"
 
@@ -224,13 +225,21 @@ static void ane_tm_push_tq(struct ane_device *ane, struct ane_request *req)
  */
 u32 ane_last_tmst;
 
+/*
+ * Every task of a request can post an event, so a program with more tasks
+ * than one poll drains leaves a backlog: a delayed poller (all CPUs busy)
+ * saw 84 events on line 1 for a 99-task MobileNet. Only a count no queue
+ * can produce means the read itself is bad.
+ */
+#define ANE_TM_EVENTS_MAX 0x1000
+
 static int ane_tm_collect_events(struct ane_device *ane,
 				 struct ane_request *req, u32 *finished)
 {
 	for (unsigned int line = 0; line < 2; line++) {
 		u32 count = tm_read32(ane, TM_IRQ_EVTC(line));
 
-		if (count > 64)
+		if (count > ANE_TM_EVENTS_MAX)
 			return -EIO;
 		for (u32 n = 0; n < count; n++) {
 			u32 info = tm_read32(ane, TM_IRQ_INFO(line));
@@ -248,14 +257,15 @@ static int ane_tm_collect_events(struct ane_device *ane,
 }
 
 /* read_poll_timeout op: consult the DART latch before any engine access.
- * Returns 1 to end the poll when a fault is latched; the caller then
- * handles the fault without ever reading the wedged engine.
+ * Returns -EIO when a fault is latched, so a fault that clears before the
+ * caller reads the latch again is still a failure. The caller handles a
+ * latched fault without ever reading the wedged engine.
  */
 static int ane_tm_poll_step(struct ane_device *ane, struct ane_request *req,
 			    u32 *finished)
 {
 	if (ane_dart_faulted(ane, NULL, NULL))
-		return 1;
+		return -EIO;
 	return ane_tm_collect_events(ane, req, finished);
 }
 
@@ -304,10 +314,13 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 			err = -ETIMEDOUT;
 		if (ane_dart_faulted(ane, &fault_iova, &fault_status)) {
 			faulted = true;
-			if (ane->scratch_pages >= ANE_DART_SCRATCH_MAX)
+			if (ane->scratch_pages >= ANE_DART_SCRATCH_MAX) {
+				err = -EIO;
 				break;
-			if (ane_dart_drain_fault(ane, fault_iova, scratch,
-						 &ane->scratch_pages))
+			}
+			err = ane_dart_drain_fault(ane, fault_iova, scratch,
+						   &ane->scratch_pages);
+			if (err)
 				break;
 			/* The retried transaction now completes; poll on. */
 			continue;
@@ -415,6 +428,32 @@ static int ane_ps_verify_on(struct ane_device *ane)
 	return err;
 }
 
+/*
+ * A power domain the ANE shares with its performance controller (the T600x
+ * PMP report SRAM, ps_pms_sram) stays on for as long as the controller is
+ * up, whatever the ANE does, so it is no part of the engine's power state.
+ */
+static bool ane_pd_is_perf_supply(struct ane_device *ane, int index)
+{
+	struct device_node *report = ane->perf.report;
+	struct of_phandle_args pd, rp;
+	bool shared = false;
+
+	if (!report || of_parse_phandle_with_args(ane->dev->of_node, "power-domains",
+						  "#power-domain-cells", index, &pd))
+		return false;
+	for (int i = 0; !shared; i++) {
+		if (of_parse_phandle_with_args(report, "power-domains",
+					       "#power-domain-cells", i, &rp))
+			break;
+		shared = rp.np == pd.np && rp.args_count == pd.args_count &&
+			 !memcmp(rp.args, pd.args, pd.args_count * sizeof(pd.args[0]));
+		of_node_put(rp.np);
+	}
+	of_node_put(pd.np);
+	return shared;
+}
+
 static bool ane_partitions_off(struct ane_device *ane)
 {
 	if (ane_ps_act(ane))
@@ -428,7 +467,8 @@ static bool ane_partitions_off(struct ane_device *ane)
 	if (ane->pd_count == 1)
 		return !dev_pm_genpd_is_on(ane->dev);
 	for (int i = 0; i < ane->pd_count; i++)
-		if (dev_pm_genpd_is_on(ane->pd_dev[i]))
+		if (dev_pm_genpd_is_on(ane->pd_dev[i]) &&
+		    !ane_pd_is_perf_supply(ane, i))
 			return false;
 	return true;
 }
@@ -476,8 +516,8 @@ static int ane_pd_cycle(struct ane_device *ane)
  * Two things must go, or the retained TM never reads idle again:
  *   - pending events on both IRQ lines. Each event pops by reading
  *     INFO/UNK1/TMST/UNK2, exactly as ane_tm_collect_events pops them;
- *     a stale backlog (or one over the 64-entry collect cap) would make
- *     the next submit's completion poll miss or fail.
+ *     a stale backlog would make the next submit's completion poll
+ *     miss its events.
  *   - the latched queue entry of the dead task. TQ_STATUS/NID1 get the
  *     same clear the normal completion path gives a finished queue.
  */
@@ -497,8 +537,8 @@ static void ane_tm_drain_retained(struct ane_device *ane)
 		u32 count = tm_read32(ane, TM_IRQ_EVTC(line));
 		u32 n;
 
-		if (count > 64)
-			count = 64;
+		if (count > ANE_TM_EVENTS_MAX)
+			count = ANE_TM_EVENTS_MAX;
 		for (n = 0; n < count; n++) {
 			tm_read32(ane, TM_IRQ_INFO(line));
 			tm_read32(ane, TM_IRQ_UNK1(line));

@@ -152,6 +152,10 @@
  * status the partner sent last (DP Status Update or Attention).
  */
 #define SN201202X_INT_DP_SID_UPDATE			BIT_ULL(37)
+/* The controller has a new liquid-detection status snapshot. */
+#define SN201202X_INT_LDCM_UPDATE			BIT_ULL(61)
+
+#define SN201202X_LDCM_STATUS_LEN	55
 
 /* TPS_REG_SYSTEM_POWER_STATE states */
 #define TPS_SYSTEM_POWER_STATE_S0	0x00
@@ -313,6 +317,21 @@ enum tipd_hw_variant {
 
 struct tps6598x;
 
+struct tipd_contaminant_ops {
+	int (*update)(struct tps6598x *tps);
+	/* update(), retried in the background on failure; tps->lock held */
+	void (*refresh)(struct tps6598x *tps);
+	void (*event)(struct tps6598x *tps);
+	void (*invalidate)(struct tps6598x *tps);
+	void (*stop)(struct tps6598x *tps);
+};
+
+struct sn201202x_ldcm_ops {
+	int (*read)(void *ctx, enum typec_contaminant *contaminant);
+	int (*set_mitigation)(void *ctx, bool enable);
+	void (*publish)(void *ctx, enum typec_contaminant contaminant);
+};
+
 struct tipd_data {
 	irq_handler_t irq_handler;
 	u64 irq_mask1;
@@ -371,6 +390,8 @@ struct tps6598x {
 	struct delayed_work	wq_poll;
 
 	const struct tipd_data *data;
+	const struct tipd_contaminant_ops *contaminant_ops;
+	enum typec_contaminant contaminant;
 
 	struct tipd_debugfs *debugfs;
 	struct typec_altmode *partner_altmode_dp;
@@ -473,6 +494,10 @@ struct sn201202x {
 	bool atomic;
 	/* Failed tries to sleep while idle since it last slept, gave up or was accessed */
 	unsigned int sleep_tries;
+	struct delayed_work ldcm_work;
+	bool ldcm_mitigated;
+	/* ldcm_mitigated matches the controller (unknown after a reset) */
+	bool ldcm_mitigation_known;
 };
 
 extern const struct tipd_data *tipd_hw_variants[];
@@ -493,6 +518,7 @@ struct cd321x_sleep_state {
 	u32 status;
 	/* A power source this port sinks from is capable of USB communication */
 	bool usb_comm;
+	bool contaminant_event;
 };
 
 int cd321x_sleep_events(struct tps6598x *tps, struct cd321x_sleep_state *st);
@@ -538,7 +564,13 @@ int sn201202x_runtime_resume(struct device *dev);
 void sn201202x_idle_sleep_start(struct tps6598x *tps);
 void sn201202x_idle_sleep_stop(struct tps6598x *tps);
 extern const struct regmap_bus regmap_sn201202x;
+extern const struct tipd_contaminant_ops sn201202x_contaminant_ops;
 u32 sn201202x_sleep_links(const struct cd321x_sleep_state *st);
+enum typec_contaminant
+sn201202x_ldcm_decode(const u8 status[SN201202X_LDCM_STATUS_LEN]);
+int sn201202x_ldcm_update_state(void *ctx,
+				const struct sn201202x_ldcm_ops *ops,
+				enum typec_contaminant last);
 #endif
 
 #endif /* __TPS6598X_H__ */

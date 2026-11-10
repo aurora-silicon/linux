@@ -3,7 +3,7 @@
 """Execute the PMU RTC callbacks against a byte-addressed W1C regmap model.
 
 C bodies and match data are extracted from the driver. The hardware model has
-independent Baku/Abbey addresses. This checks arithmetic, alarm transactions,
+independent Baku, Abbey, Stowe and Maverick addresses. This checks arithmetic, alarm transactions,
 shared control preservation, stale events and I/O failures, not physical wake.
 """
 import argparse
@@ -19,7 +19,12 @@ MUTATIONS = {
     'offset-seconds': ('sign_extend64(offset, 47) * 2', '(s64)offset'),
     'offset-sign': ('sign_extend64(offset, 47) * 2', '(s64)offset * 2'),
     'event-bit': ('.event_bit = BIT(1)', '.event_bit = BIT(0)'),
-    'wrong-base': ('.base = 0x2000', '.base = 0xf800'),
+    'wrong-control': ('.control = 0x2000', '.control = 0xf800'),
+    'maverick-event': ('.event = 0x14c0', '.event = 0x140c'),
+    'control-event-clear': ('control &= ~rtc->hw->control_event_bit;',
+                            'control |= rtc->hw->control_event_bit;'),
+    'stowe-offset': ('static const struct apple_pmu_rtc_hw apple_pmu_rtc_stowe = {',
+                     'static const struct apple_pmu_rtc_hw apple_pmu_rtc_stowe = {\n\t.offset_in_seconds = true,'),
 }
 
 PRELUDE = r'''
@@ -59,7 +64,11 @@ struct rtc_wkalrm { struct rtc_time time; bool enabled, pending; };
 struct rtc_device { int events; };
 struct device { void *data; bool wake; int wake_events; };
 struct nvmem_cell { u8 data[8]; size_t bytes; int error; };
-struct regmap { u8 bytes[65536]; unsigned base, event, bit; int ops, fail; };
+struct regmap {
+    u8 bytes[65536];
+    unsigned ctrl, counter, compare, mask, event, bit, control_event;
+    int ops, fail;
+};
 static int disabled, pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
 static inline __attribute__((unused)) s64 sign_extend64(u64 v, int bit) { return (s64)(v << (63 - bit)) >> (63 - bit); }
 static u64 get_unaligned_le64(const void *p) { u64 v; memcpy(&v, p, 8); return v; }
@@ -91,6 +100,10 @@ static int regmap_write(struct regmap *m, unsigned reg, unsigned v) {
     if (reg == m->event) {
         /* W1C event, normal R/W bits in the same byte. */
         m->bytes[reg] = (v & ~m->bit) | (m->bytes[reg] & m->bit & ~v);
+    } else if (reg == m->ctrl && m->control_event) {
+        /* Maverick's control-side event latch is cleared by writing zero. */
+        m->bytes[reg] = (v & ~m->control_event) |
+                        (m->bytes[reg] & m->control_event & v);
     } else m->bytes[reg] = v;
     return 0;
 }
@@ -106,9 +119,20 @@ static int regmap_bulk_read(struct regmap *m, unsigned reg, void *v, size_t n) {
 static int regmap_bulk_write(struct regmap *m, unsigned reg, const void *v, size_t n) {
     if (io_error(m)) return -EIO;
     /* Comparator programming must happen with the alarm masked and disarmed. */
-    assert(reg == m->base + 8 && n == 4);
-    assert(!(m->bytes[m->base] & 0x40) && (m->bytes[m->base + 14] & 1));
+    assert(reg == m->compare && n == 4);
+    assert(!(m->bytes[m->ctrl] & 0x40) && (m->bytes[m->mask] & 1));
     memcpy(m->bytes + reg, v, n); return 0;
+}
+static bool fire_alarm(struct regmap *m) {
+    assert(m->bytes[m->ctrl] & 0x40);
+    m->bytes[m->ctrl] &= ~0x40;
+    if (m->control_event) {
+        /* A stale control latch suppresses the next separate-event edge. */
+        if (m->bytes[m->ctrl] & m->control_event) return false;
+        m->bytes[m->ctrl] |= m->control_event;
+    }
+    m->bytes[m->event] |= m->bit;
+    return true;
 }
 '''
 
@@ -118,43 +142,70 @@ static struct nvmem_cell offset;
 static struct rtc_device clock_model;
 static struct apple_pmu_rtc rtc;
 static struct device dev;
-static bool abbey;
-static void set_counter(u64 ticks) { memcpy(map.bytes + map.base + 2, &ticks, 6); }
+enum { BAKU, ABBEY, STOWE, MAVERICK };
+static bool abbey; /* offset in 1/32768 s and monitor bit */
+static void set_counter(u64 ticks) { memcpy(map.bytes + map.counter, &ticks, 6); }
 static void set_offset(s64 ticks) {
     offset.bytes = abbey ? 6 : 8; memcpy(offset.data, &ticks, offset.bytes);
 }
-static void reset(bool a) {
-    abbey = a; map = (struct regmap){.base = a ? 0x2000 : 0xf800,
-        .event = a ? 0x2000 : 0xf80c, .bit = a ? 2 : 1};
+static int variant;
+static void reset(int v) {
+    static const struct regmap layout[] = {
+        [BAKU] = {.ctrl = 0xf800, .counter = 0xf802, .compare = 0xf808, .mask = 0xf80e,
+                  .event = 0xf80c, .bit = 1},
+        [ABBEY] = {.ctrl = 0x2000, .counter = 0x2002, .compare = 0x2008, .mask = 0x200e,
+                   .event = 0x2000, .bit = 2},
+        [STOWE] = {.ctrl = 0xf800, .counter = 0xf802, .compare = 0xf808, .mask = 0xf80e,
+                   .event = 0xf80c, .bit = 1},
+        [MAVERICK] = {.ctrl = 0x1401, .counter = 0x1406, .compare = 0x140c, .mask = 0x14c2,
+                      .event = 0x14c0, .bit = 1, .control_event = 2},
+    };
+    static const struct apple_pmu_rtc_hw *hw[] = {
+        [BAKU] = &apple_pmu_rtc_baku, [ABBEY] = &apple_pmu_rtc_abbey,
+        [STOWE] = &apple_pmu_rtc_stowe, [MAVERICK] = &apple_pmu_rtc_maverick,
+    };
+    bool a = v != BAKU;
+    variant = v; abbey = a; map = layout[v];
     offset = (struct nvmem_cell){0}; clock_model = (struct rtc_device){0};
-    rtc = (struct apple_pmu_rtc){.hw = a ? &apple_pmu_rtc_abbey : &apple_pmu_rtc_baku,
+    rtc = (struct apple_pmu_rtc){.hw = hw[v],
         .map = &map, .offset = &offset, .clock = &clock_model};
     dev = (struct device){.data = &rtc, .wake = true}; disabled = 0;
-    /* Keep an unrelated writable bit, and Abbey's monitor bit. */
-    map.bytes[map.base] = a ? 0x81 : 0x80;
+    /* Keep an unrelated writable bit, and each variant's monitor bit. */
+    map.bytes[map.ctrl] = a ? 0x81 : 0x80;
+    if (v == MAVERICK) map.bytes[map.ctrl] = 0x03;
     set_counter(100ULL << 16);
     set_offset(a ? 1000LL * 32768 + 16384 : 1000);
 }
-static u32 comparator(void) { u32 v; memcpy(&v, map.bytes + map.base + 8, 4); return v; }
-static void run_variant(bool a) {
+static u32 comparator(void) { u32 v; memcpy(&v, map.bytes + map.compare, 4); return v; }
+static void run_variant(int v) {
+    bool a = v != BAKU;
     struct rtc_time time;
     struct rtc_wkalrm alarm = {.time.seconds = 1130, .enabled = true}, readback;
     s64 ticks;
-    reset(a);
+    reset(v);
+    if (v == MAVERICK) {
+        /* A stale 0x03 latch suppresses a new edge until control bit 1 clears. */
+        assert(map.bytes[map.ctrl] == 0x03 && !(map.bytes[map.event] & map.bit));
+        map.bytes[map.ctrl] |= 0x40;
+        assert(!fire_alarm(&map));
+        assert(map.bytes[map.ctrl] == 0x03 && !(map.bytes[map.event] & map.bit));
+    }
     assert(!apple_pmu_rtc_read_time(&dev, &time) && time.seconds == 1100);
     set_counter((100ULL << 16) + 49152);
     assert(!apple_pmu_rtc_read_time(&dev, &time) && time.seconds == (a ? 1101 : 1100));
     assert(!apple_pmu_rtc_set_alarm(&dev, &alarm));
-    assert(comparator() == 130 && (map.bytes[map.base] & 0x40));
-    assert(map.bytes[map.base] == (a ? 0xc1 : 0xc0));
-    assert(!(map.bytes[map.base + 14] & 1));
+    assert(comparator() == 130 && (map.bytes[map.ctrl] & 0x40));
+    assert(map.bytes[map.ctrl] == (v == MAVERICK ? 0x41 : (a ? 0xc1 : 0xc0)));
+    assert(!(map.bytes[map.mask] & 1));
     assert(!apple_pmu_rtc_read_alarm(&dev, &readback));
     assert(readback.time.seconds == 1130 && readback.enabled && !readback.pending);
     /* Acknowledge without changing ARM, monitor or the unrelated bit. */
-    map.bytes[map.event] |= map.bit;
+    assert(fire_alarm(&map));
+    if (v == MAVERICK) assert(map.bytes[map.ctrl] == 0x03);
     assert(!apple_pmu_rtc_ack_alarm(&rtc));
-    assert(map.bytes[map.base] == (a ? 0xc1 : 0xc0));
+    assert(map.bytes[map.ctrl] == (a ? (v == MAVERICK ? 0x03 : 0x81) : 0x80));
     assert(!(map.bytes[map.event] & map.bit));
+    assert(!apple_pmu_rtc_arm(&rtc, true));
     /* An ordinary control write must not consume a latched event. */
     map.bytes[map.event] |= map.bit;
     assert(!apple_pmu_rtc_arm(&rtc, false));
@@ -162,12 +213,12 @@ static void run_variant(bool a) {
     assert(!apple_pmu_rtc_read_alarm(&dev, &readback) && readback.pending);
     assert(apple_pmu_rtc_interrupt(7, &dev) == IRQ_HANDLED);
     assert(clock_model.events == 1 && dev.wake_events == 1);
-    assert(map.bytes[map.base] == (a ? 0x81 : 0x80));
-    assert(!(map.bytes[map.event] & map.bit) && (map.bytes[map.base + 14] & 1));
+    assert(map.bytes[map.ctrl] == (v == MAVERICK ? 0x01 : (a ? 0x81 : 0x80)));
+    assert(!(map.bytes[map.event] & map.bit) && (map.bytes[map.mask] & 1));
     assert(apple_pmu_rtc_interrupt(7, &dev) == IRQ_NONE && clock_model.events == 1);
     /* Repeat arm/fire; no stuck status or stale IRQ after the first alarm. */
     assert(!apple_pmu_rtc_alarm_enable(&dev, 1));
-    map.bytes[map.event] |= map.bit;
+    assert(fire_alarm(&map));
     dev.wake = false;
     assert(apple_pmu_rtc_interrupt(7, &dev) == IRQ_HANDLED);
     assert(clock_model.events == 2 && dev.wake_events == 1);
@@ -185,7 +236,7 @@ static void run_variant(bool a) {
     assert(apple_pmu_rtc_offset(&rtc, &ticks) == -EINVAL);
     offset.error = -EIO;
     assert(apple_pmu_rtc_read_time(&dev, &time) == -EIO);
-    reset(a);
+    reset(v);
     set_offset(-32768);
     if (a) {
         assert(!apple_pmu_rtc_offset(&rtc, &ticks) && ticks == -65536);
@@ -194,26 +245,26 @@ static void run_variant(bool a) {
         assert(!apple_pmu_rtc_set_alarm(&dev, &alarm) && comparator() == 130);
     } else assert(apple_pmu_rtc_offset(&rtc, &ticks) == -ERANGE);
     /* Keep a valid firmware alarm and discard a stale one at probe. */
-    reset(a); alarm.time.seconds = 1130;
+    reset(v); alarm.time.seconds = 1130;
     assert(!apple_pmu_rtc_set_alarm(&dev, &alarm));
     map.ops = 0;
-    assert(!apple_pmu_rtc_init_alarm(&rtc) && (map.bytes[map.base] & 0x40));
-    set_counter(131ULL << 16); map.bytes[map.event] |= map.bit;
+    assert(!apple_pmu_rtc_init_alarm(&rtc) && (map.bytes[map.ctrl] & 0x40));
+    set_counter(131ULL << 16); assert(fire_alarm(&map));
     assert(!apple_pmu_rtc_init_alarm(&rtc));
-    assert(!(map.bytes[map.base] & 0x40) && !(map.bytes[map.event] & map.bit));
-    assert(map.bytes[map.base + 14] & 1);
+    assert(!(map.bytes[map.ctrl] & 0x40) && !(map.bytes[map.event] & map.bit));
+    assert(map.bytes[map.mask] & 1);
     /* Every failed transaction is reported; later enables fail after IRQ I/O failure. */
-    reset(a); assert(!apple_pmu_rtc_set_alarm(&dev, &alarm));
+    reset(v); assert(!apple_pmu_rtc_set_alarm(&dev, &alarm));
     int count = map.ops;
     for (int fail = 1; fail <= count; ++fail) {
-        reset(a); map.fail = fail;
+        reset(v); map.fail = fail;
         assert(apple_pmu_rtc_set_alarm(&dev, &alarm) == -EIO);
     }
-    reset(a); map.bytes[map.event] |= map.bit;
+    reset(v); map.bytes[map.event] |= map.bit;
     assert(apple_pmu_rtc_interrupt(7, &dev) == IRQ_HANDLED);
     count = map.ops;
     for (int fail = 1; fail <= count; ++fail) {
-        reset(a); map.bytes[map.event] |= map.bit; map.fail = fail;
+        reset(v); map.bytes[map.event] |= map.bit; map.fail = fail;
         assert(apple_pmu_rtc_interrupt(7, &dev) == IRQ_HANDLED);
         assert(rtc.io_failed && disabled == 1 && dev.wake_events == 1);
         assert(clock_model.events == 0);
@@ -221,14 +272,14 @@ static void run_variant(bool a) {
         assert(apple_pmu_rtc_set_alarm(&dev, &alarm) == -EIO);
         assert(apple_pmu_rtc_prepare(&dev) == -EBUSY);
     }
-    reset(a); assert(!apple_pmu_rtc_prepare(&dev));
+    reset(v); assert(!apple_pmu_rtc_prepare(&dev));
     pm_suspend_target_state = 2;
     assert(apple_pmu_rtc_prepare(&dev) == -EBUSY);
     pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
 }
 int main(void) {
-    run_variant(false); run_variant(true);
-    puts("PMU RTC: Baku and Abbey arithmetic, W1C transactions and fault injection passed");
+    run_variant(BAKU); run_variant(ABBEY); run_variant(STOWE); run_variant(MAVERICK);
+    puts("PMU RTC: Baku, Abbey, Stowe and Maverick arithmetic, W1C transactions and fault injection passed");
     return 0;
 }
 '''
@@ -240,7 +291,7 @@ def main():
     parser.add_argument('--mutation', choices=MUTATIONS)
     args = parser.parse_args()
     source = (ROOT / 'drivers/rtc/rtc-apple-pmu.c').read_text()
-    code = source[source.index('#define APPLE_PMU_RTC_CONTROL'):
+    code = source[source.index('#define APPLE_PMU_RTC_ARM'):
                   source.index('static const struct rtc_class_ops')]
     code += source[source.index('static int apple_pmu_rtc_prepare('):
                    source.index('static const struct dev_pm_ops')]

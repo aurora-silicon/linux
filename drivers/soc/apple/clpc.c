@@ -3,9 +3,9 @@
  * Apple SoC host performance controller (CLPC) floors
  *
  * On macOS the CLPC raises the floor of the memory controller (DCS) and the
- * SoC fabric while the CPU clusters or the GPU are busy, through its own
+ * SoC fabric while CPU clusters, the GPU or the ANE are busy, through its own
  * voter agent in the PMC. This driver keeps that agent's floor in step with
- * Linux CPU load:
+ * Linux demand:
  *
  *  - every sampling period, each cpufreq policy reports how busy its
  *    busiest CPU was and how fast the policy runs relative to its maximum;
@@ -38,6 +38,7 @@
 #include <linux/regmap.h>
 #include <linux/seq_file.h>
 #include <linux/soc/apple/pmc.h>
+#include <linux/uaccess.h>
 #include <linux/workqueue.h>
 
 #define APPLE_CLPC_MAX_CLUSTERS	8
@@ -78,6 +79,16 @@ enum apple_clpc_rail {
  *	@pmp_agent, limits the DCS, see apple_clpc_gpu_limited()
  * @gpu_dense: submissions per sampling period that make light GPU work
  *	dense, see apple_clpc_gpu_dense(); 0 for none
+ * @ane: state of each rail while ANE work is in flight; all zero disables input
+ * @ane_cluster: /cpus/cpu-map cluster whose CPUs' frequency the ANE engine
+ *	speed follows
+ * @ane_cluster_khz: minimum frequency of that cluster while ANE work is in
+ *	flight; 0 for none
+ * @ane_cluster_machine: the machine compatible the cluster floor was
+ *	measured on; SoCs sharing this CLPC without it get no cluster floor
+ * @gpu_input: the GPU driver reports its work in flight through
+ *	apple_clpc_gpu_get(); while there is some, both rails go to the top
+ *	of @map
  */
 struct apple_clpc_hw {
 	unsigned int rail[APPLE_CLPC_RAILS];
@@ -89,6 +100,11 @@ struct apple_clpc_hw {
 	bool pmp_backoff;
 	unsigned int pmp_agent;
 	unsigned int gpu_dense;
+	bool gpu_input;
+	u8 ane[APPLE_CLPC_RAILS];
+	unsigned int ane_cluster;
+	unsigned int ane_cluster_khz;
+	const char *ane_cluster_machine;
 };
 
 struct apple_clpc_cluster {
@@ -110,6 +126,18 @@ struct apple_clpc_gpu {
 	struct kref ref;
 	spinlock_t lock;
 	bool active;
+	u64 updated_ns;
+	u64 sequence;
+	struct delayed_work *wake;
+};
+
+/* One ANE publisher, with storage surviving provider removal. */
+struct apple_clpc_ane {
+	struct kref ref;
+	/* Protects activity, event metadata and wake across provider removal. */
+	spinlock_t lock;
+	bool active;
+	bool pending;
 	u64 updated_ns;
 	u64 sequence;
 	struct delayed_work *wake;
@@ -140,6 +168,16 @@ struct apple_clpc {
 	struct dentry *debugfs;
 	struct regmap *gpu_pmgr;
 	struct apple_clpc_gpu *gpu;
+	struct apple_clpc_ane *ane;
+	unsigned int ane_states[APPLE_CLPC_RAILS];
+	/* Minimum frequency of hw->ane_cluster while ANE work is in flight. */
+	u32 ane_cluster_khz;
+	int ane_cpu;
+	struct freq_qos_request ane_qos;
+	unsigned int ane_qos_khz;
+	unsigned long ane_until;
+	struct notifier_block policy_nb;
+	bool policy_nb_added;
 	u32 last_floor;
 	u32 last_reason;
 	u64 last_vote_ns;
@@ -227,8 +265,10 @@ int apple_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu **out)
 	if (!np)
 		return of_find_property(dev->of_node, "apple,clpc", NULL) ? -EINVAL : 0;
 	if (!of_device_is_compatible(np, "apple,t6041-clpc") &&
+	    !of_device_is_compatible(np, "apple,t6050-clpc") &&
 	    !of_device_is_compatible(np, "apple,t8132-clpc") &&
-	    !of_device_is_compatible(np, "apple,t8140-clpc")) {
+	    !of_device_is_compatible(np, "apple,t8140-clpc") &&
+	    !of_device_is_compatible(np, "apple,t8142-clpc")) {
 		of_node_put(np);
 		return -EINVAL;
 	}
@@ -276,6 +316,125 @@ static void apple_clpc_gpu_owner_put(void *data)
 	struct apple_clpc_gpu *gpu = data;
 
 	kref_put(&gpu->ref, apple_clpc_gpu_free);
+}
+
+static void apple_clpc_ane_free(struct kref *ref)
+{
+	kfree(container_of(ref, struct apple_clpc_ane, ref));
+}
+
+void apple_clpc_ane_set_active(struct apple_clpc_ane *ane, bool active)
+{
+	unsigned long flags;
+
+	if (!ane)
+		return;
+	spin_lock_irqsave(&ane->lock, flags);
+	if (active && !ane->active) {
+		/* Preserve even an EXECUTE shorter than the first queued sample. */
+		ane->pending = true;
+		if (ane->wake)
+			mod_delayed_work(system_freezable_power_efficient_wq, ane->wake, 0);
+	}
+	ane->active = active;
+	ane->updated_ns = ktime_get_mono_fast_ns();
+	ane->sequence++;
+	spin_unlock_irqrestore(&ane->lock, flags);
+}
+EXPORT_SYMBOL_GPL(apple_clpc_ane_set_active);
+
+void apple_clpc_ane_put(struct apple_clpc_ane *ane)
+{
+	if (ane) {
+		apple_clpc_ane_set_active(ane, false);
+		kref_put(&ane->ref, apple_clpc_ane_free);
+	}
+}
+EXPORT_SYMBOL_GPL(apple_clpc_ane_put);
+
+/* SoCs whose CLPC takes ANE input; each SoC has exactly one CLPC. */
+static const struct of_device_id apple_clpc_ane_providers[] = {
+	{ .compatible = "apple,t6041-clpc" },
+	{ .compatible = "apple,t8140-clpc" },
+	{}
+};
+
+int apple_clpc_ane_get(struct device *dev, struct apple_clpc_ane **out)
+{
+	struct device_node *np;
+	struct platform_device *provider;
+	struct apple_clpc *clpc;
+
+	*out = NULL;
+	if (!dev->of_node)
+		return 0;
+	np = of_parse_phandle(dev->of_node, "apple,clpc", 0);
+	if (!np && !of_find_property(dev->of_node, "apple,clpc", NULL))
+		np = of_find_matching_node(NULL, apple_clpc_ane_providers);
+	if (!np)
+		return 0;
+	if (!of_match_node(apple_clpc_ane_providers, np)) {
+		of_node_put(np);
+		return 0;
+	}
+	provider = of_find_device_by_node(np);
+	of_node_put(np);
+	if (!provider)
+		return 0;
+	/*
+	 * Optional input: never defer ANE startup for an absent CLPC driver.
+	 * No device link is needed: the independent reference protects late
+	 * publications and puts after the provider has withdrawn its work.
+	 */
+	mutex_lock(&apple_clpc_clients_lock);
+	clpc = dev_get_drvdata(&provider->dev);
+	if (device_is_bound(&provider->dev) && clpc && clpc->ane &&
+	    refcount_read(&clpc->ane->ref.refcount) == 1) {
+		kref_get(&clpc->ane->ref);
+		*out = clpc->ane;
+	}
+	mutex_unlock(&apple_clpc_clients_lock);
+	put_device(&provider->dev);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_clpc_ane_get);
+
+static void apple_clpc_ane_owner_put(void *data)
+{
+	struct apple_clpc_ane *ane = data;
+
+	kref_put(&ane->ref, apple_clpc_ane_free);
+}
+
+static void apple_clpc_ane_detach(struct apple_clpc_ane *ane)
+{
+	unsigned long flags;
+
+	if (!ane)
+		return;
+	spin_lock_irqsave(&ane->lock, flags);
+	ane->wake = NULL;
+	spin_unlock_irqrestore(&ane->lock, flags);
+}
+
+/* Called under sample_lock, like the CPU and GPU demand inputs. */
+static bool apple_clpc_ane_input_demand(struct apple_clpc *clpc, unsigned int *demand)
+{
+	struct apple_clpc_ane *ane = clpc->ane;
+	unsigned long flags;
+	unsigned int rail;
+	bool active;
+
+	if (!ane)
+		return false;
+	spin_lock_irqsave(&ane->lock, flags);
+	active = ane->active || ane->pending;
+	ane->pending = false;
+	spin_unlock_irqrestore(&ane->lock, flags);
+	if (active)
+		for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
+			demand[rail] = max(demand[rail], clpc->ane_states[rail]);
+	return active;
 }
 
 /* cpufreq policies can appear after probe; pick up new ones as they do. */
@@ -520,7 +679,8 @@ static void apple_clpc_gpu_floor_count(struct apple_clpc *clpc, bool released)
 
 /*
  * The GPU driver's input, where it drives demand instead of the GFX power
- * state: every rail at its top state while the driver reports work.
+ * state: every rail at the top of @map, or at @gpu where that is higher,
+ * while the driver reports work.
  */
 static bool apple_clpc_gpu_input_demand(const struct apple_clpc_hw *hw,
 					struct apple_clpc_gpu *gpu,
@@ -533,8 +693,43 @@ static bool apple_clpc_gpu_input_demand(const struct apple_clpc_hw *hw,
 	    !apple_clpc_gpu_active(gpu, &updated, &sequence))
 		return false;
 	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
-		demand[rail] = max(demand[rail], hw->map[rail][APPLE_CLPC_LEVELS - 1]);
+		demand[rail] = max(demand[rail],
+				   max(hw->map[rail][APPLE_CLPC_LEVELS - 1], hw->gpu[rail]));
 	return true;
+}
+
+/*
+ * Hold the ANE's cluster frequency floor from the first sample that sees ANE
+ * work until the vote hold after the last one. The request is added on first
+ * use: cpufreq may register its policies after the CLPC probes.
+ */
+static void apple_clpc_ane_cluster(struct apple_clpc *clpc, bool active,
+				   unsigned long now)
+{
+	unsigned int khz = 0;
+
+	if (active)
+		clpc->ane_until = now + msecs_to_jiffies(APPLE_CLPC_HOLD_MS);
+	if (time_before(now, clpc->ane_until))
+		khz = clpc->ane_cluster_khz;
+	else
+		clpc->ane_until = now;
+	if (khz && !freq_qos_request_active(&clpc->ane_qos) && clpc->ane_cpu >= 0) {
+		struct cpufreq_policy *policy = cpufreq_cpu_get(clpc->ane_cpu);
+
+		if (policy) {
+			if (freq_qos_add_request(&policy->constraints, &clpc->ane_qos,
+						 FREQ_QOS_MIN, FREQ_QOS_MIN_DEFAULT_VALUE) < 0)
+				clpc->update_errors++;
+			cpufreq_cpu_put(policy);
+		}
+	}
+	if (khz == clpc->ane_qos_khz || !freq_qos_request_active(&clpc->ane_qos))
+		return;
+	if (freq_qos_update_request(&clpc->ane_qos, khz ?: FREQ_QOS_MIN_DEFAULT_VALUE) < 0)
+		clpc->update_errors++;
+	else
+		clpc->ane_qos_khz = khz;
 }
 
 static void apple_clpc_sample(struct apple_clpc *clpc)
@@ -564,6 +759,9 @@ static void apple_clpc_sample(struct apple_clpc *clpc)
 			reason |= 1;
 	if (apple_clpc_gpu_input_demand(clpc->hw, clpc->gpu, demand))
 		reason |= 2;
+	if (apple_clpc_ane_input_demand(clpc, demand))
+		reason |= 32;
+	apple_clpc_ane_cluster(clpc, reason & 32, now);
 	if (clpc->gpu_pmgr) {
 		/* Both run every sample: each tracks state across samples. */
 		bool late = time_after(now, clpc->gpu_sampled +
@@ -603,7 +801,8 @@ static void apple_clpc_sample(struct apple_clpc *clpc)
 		clpc->update_errors++;
 
 	/* Sample on time while graphics is powered, to see it power off. */
-	apple_clpc_queue(clpc, !apple_clpc_floor(clpc, state) && !clpc->gpu_on);
+	apple_clpc_queue(clpc, !apple_clpc_floor(clpc, state) && !clpc->gpu_on &&
+			 !clpc->ane_qos_khz);
 }
 
 static void apple_clpc_work(struct work_struct *work)
@@ -642,7 +841,7 @@ static int apple_clpc_status_show(struct seq_file *s, void *unused)
 						   clpc->hw->rail[rail]),
 			   clpc->hw->map[rail][0], clpc->hw->map[rail][1],
 			   clpc->hw->map[rail][2], clpc->hw->map[rail][3]);
-	seq_printf(s, "last_vote: %#x reason_bits %#x sampled_ns %llu (cpu=1 host_gpu=2 streaming_gpu=4 dense_gpu=8 hold=16)\n",
+	seq_printf(s, "last_vote: %#x reason_bits %#x sampled_ns %llu (cpu=1 host_gpu=2 streaming_gpu=4 dense_gpu=8 hold=16 ane=32)\n",
 		   READ_ONCE(clpc->last_floor), READ_ONCE(clpc->last_reason),
 		   READ_ONCE(clpc->last_vote_ns));
 	if (clpc->gpu) {
@@ -650,6 +849,20 @@ static int apple_clpc_status_show(struct seq_file *s, void *unused)
 		bool active = apple_clpc_gpu_active(clpc->gpu, &updated, &sequence);
 
 		seq_printf(s, "host_gpu: active %u request_ns %llu sequence %llu\n",
+			   active, updated, sequence);
+	}
+	if (clpc->ane) {
+		struct apple_clpc_ane *ane = clpc->ane;
+		unsigned long flags;
+		u64 updated, sequence;
+		bool active;
+
+		spin_lock_irqsave(&ane->lock, flags);
+		active = ane->active;
+		updated = ane->updated_ns;
+		sequence = ane->sequence;
+		spin_unlock_irqrestore(&ane->lock, flags);
+		seq_printf(s, "ane: active %u request_ns %llu sequence %llu\n",
 			   active, updated, sequence);
 	}
 	seq_printf(s, "samples: %lu update errors: %lu\n", clpc->samples,
@@ -679,6 +892,63 @@ static int apple_clpc_status_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(apple_clpc_status);
 
+static int apple_clpc_ane_states_show(struct seq_file *s, void *unused)
+{
+	struct apple_clpc *clpc = s->private;
+
+	guard(mutex)(&clpc->sample_lock);
+	seq_printf(s, "%u %u\n", clpc->ane_states[APPLE_CLPC_DCS],
+		   clpc->ane_states[APPLE_CLPC_SOC]);
+	return 0;
+}
+
+static int apple_clpc_ane_states_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, apple_clpc_ane_states_show, inode->i_private);
+}
+
+/* The top measured CPU/GPU states bound the rail's supported range. */
+static void apple_clpc_ane_states_set(struct apple_clpc *clpc, const int *states)
+{
+	unsigned int rail, top;
+
+	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++) {
+		top = max(clpc->hw->map[rail][APPLE_CLPC_LEVELS - 1], clpc->hw->gpu[rail]);
+		clpc->ane_states[rail] = clamp(states[rail], 0, (int)top);
+	}
+}
+
+static ssize_t apple_clpc_ane_states_write(struct file *file, const char __user *buf,
+					   size_t count, loff_t *ppos)
+{
+	struct apple_clpc *clpc = ((struct seq_file *)file->private_data)->private;
+	char text[48], extra;
+	int states[APPLE_CLPC_RAILS];
+
+	if (!count || count >= sizeof(text))
+		return -EINVAL;
+	if (copy_from_user(text, buf, count))
+		return -EFAULT;
+	text[count] = '\0';
+	if (sscanf(text, "%d %d %c", &states[APPLE_CLPC_DCS],
+		   &states[APPLE_CLPC_SOC], &extra) != 2)
+		return -EINVAL;
+	guard(mutex)(&clpc->sample_lock);
+	apple_clpc_ane_states_set(clpc, states);
+	if (!READ_ONCE(clpc->stopped))
+		mod_delayed_work(system_freezable_power_efficient_wq, &clpc->work, 0);
+	return count;
+}
+
+static const struct file_operations apple_clpc_ane_states_fops = {
+	.owner = THIS_MODULE,
+	.open = apple_clpc_ane_states_open,
+	.read = seq_read,
+	.write = apple_clpc_ane_states_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 static void apple_clpc_free_clusters(struct apple_clpc *clpc)
 {
 	unsigned int i;
@@ -707,6 +977,10 @@ static void apple_clpc_halt(struct apple_clpc *clpc)
 			       clpc->saved_floor);
 	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
 		clpc->vote[rail].state = 0;
+	if (clpc->ane_qos_khz &&
+	    freq_qos_update_request(&clpc->ane_qos, FREQ_QOS_MIN_DEFAULT_VALUE) >= 0)
+		clpc->ane_qos_khz = 0;
+	clpc->ane_until = jiffies;
 }
 
 static void apple_clpc_stop(void *data)
@@ -723,9 +997,63 @@ static void apple_clpc_stop(void *data)
 		clpc->gpu->wake = NULL;
 		spin_unlock_irqrestore(&clpc->gpu->lock, flags);
 	}
-	apple_clpc_halt(clpc);
+	apple_clpc_ane_detach(clpc->ane);
 	debugfs_remove_recursive(clpc->debugfs);
+	apple_clpc_halt(clpc);
+	if (clpc->policy_nb_added)
+		cpufreq_unregister_notifier(&clpc->policy_nb, CPUFREQ_POLICY_NOTIFIER);
+	if (freq_qos_request_active(&clpc->ane_qos))
+		freq_qos_remove_request(&clpc->ane_qos);
 	apple_clpc_free_clusters(clpc);
+}
+
+/*
+ * The cluster floor is a request on a cpufreq policy, which goes away with
+ * the cpufreq driver (a module). Withdraw it then; it is added again on the
+ * next ANE work once a policy covers the CPU.
+ */
+static int apple_clpc_policy_notify(struct notifier_block *nb, unsigned long event,
+				    void *data)
+{
+	struct apple_clpc *clpc = container_of(nb, struct apple_clpc, policy_nb);
+	struct cpufreq_policy *policy = data;
+
+	if (event != CPUFREQ_REMOVE_POLICY ||
+	    !cpumask_test_cpu(clpc->ane_cpu, policy->related_cpus))
+		return NOTIFY_DONE;
+	guard(mutex)(&clpc->sample_lock);
+	if (freq_qos_request_active(&clpc->ane_qos))
+		freq_qos_remove_request(&clpc->ane_qos);
+	clpc->ane_qos_khz = 0;
+	return NOTIFY_OK;
+}
+
+/* The first CPU of /cpus/cpu-map/cluster@index, or -ENODEV. */
+static int apple_clpc_cluster_cpu(unsigned int index)
+{
+	struct device_node *map, *cluster, *core, *cpu;
+	char name[16];
+	int id = -ENODEV;
+
+	map = of_find_node_by_path("/cpus/cpu-map");
+	if (!map)
+		return id;
+	snprintf(name, sizeof(name), "cluster%u", index);
+	cluster = of_get_child_by_name(map, name);
+	of_node_put(map);
+	if (!cluster)
+		return id;
+	core = of_get_child_by_name(cluster, "core0");
+	of_node_put(cluster);
+	if (!core)
+		return id;
+	cpu = of_parse_phandle(core, "cpu", 0);
+	of_node_put(core);
+	if (cpu) {
+		id = of_cpu_node_to_id(cpu);
+		of_node_put(cpu);
+	}
+	return id;
 }
 
 static int apple_clpc_probe(struct platform_device *pdev)
@@ -744,13 +1072,11 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	clpc->pmc = dev->parent;
 	clpc->hw = of_device_get_match_data(dev);
 	/* T6040 firmware keeps GFX powered for its whole lifetime. A separate
-	 * host publication/idle input, not that supplier state, drives demand.
-	 * On T8140 the same input counts submissions for dense light work. The
-	 * T8132 GPU driver reports its work through it as well.
+	 * host publication/idle input, not that supplier state, drives demand;
+	 * the T8132 and M5 (T8142) GPU drivers report through the same input.
+	 * On T8140 the same input counts submissions for dense light work.
 	 */
-	if (of_device_is_compatible(dev->of_node, "apple,t6041-clpc") ||
-	    of_device_is_compatible(dev->of_node, "apple,t8132-clpc") ||
-	    clpc->hw->gpu_dense) {
+	if (clpc->hw->gpu_input || clpc->hw->gpu_dense) {
 		clpc->gpu = kzalloc_obj(*clpc->gpu);
 		if (!clpc->gpu)
 			return -ENOMEM;
@@ -759,6 +1085,35 @@ static int apple_clpc_probe(struct platform_device *pdev)
 		ret = devm_add_action_or_reset(dev, apple_clpc_gpu_owner_put, clpc->gpu);
 		if (ret)
 			return ret;
+	}
+	if (clpc->hw->ane[APPLE_CLPC_DCS] || clpc->hw->ane[APPLE_CLPC_SOC]) {
+		clpc->ane = kzalloc_obj(*clpc->ane);
+		if (!clpc->ane)
+			return -ENOMEM;
+		kref_init(&clpc->ane->ref);
+		spin_lock_init(&clpc->ane->lock);
+		ret = devm_add_action_or_reset(dev, apple_clpc_ane_owner_put, clpc->ane);
+		if (ret)
+			return ret;
+		for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
+			clpc->ane_states[rail] = clpc->hw->ane[rail];
+	}
+	clpc->ane_cpu = -ENODEV;
+	clpc->ane_until = jiffies;
+	if (clpc->ane && clpc->hw->ane_cluster_khz &&
+	    of_machine_is_compatible(clpc->hw->ane_cluster_machine)) {
+		clpc->ane_cpu = apple_clpc_cluster_cpu(clpc->hw->ane_cluster);
+		if (clpc->ane_cpu >= 0) {
+			clpc->policy_nb.notifier_call = apple_clpc_policy_notify;
+			if (!cpufreq_register_notifier(&clpc->policy_nb,
+						       CPUFREQ_POLICY_NOTIFIER)) {
+				clpc->policy_nb_added = true;
+				clpc->ane_cluster_khz = clpc->hw->ane_cluster_khz;
+			}
+		}
+		if (!clpc->ane_cluster_khz)
+			dev_dbg(dev, "no ANE cluster floor (cpu-map cluster%u)\n",
+				clpc->hw->ane_cluster);
 	}
 	/* The property is optional: without it, CPU demand alone sets the floors. */
 	if (clpc->hw->gpu_demand)
@@ -824,9 +1179,19 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	if (clpc->gpu && !clpc->hw->gpu_demand)
 		clpc->gpu->wake = &clpc->work;
 
+	if (clpc->ane)
+		clpc->ane->wake = &clpc->work;
+
 	clpc->debugfs = debugfs_create_dir(dev_name(dev), NULL);
 	debugfs_create_file("status", 0400, clpc->debugfs, clpc,
 			    &apple_clpc_status_fops);
+
+	if (clpc->ane)
+		debugfs_create_file("ane_states", 0600, clpc->debugfs, clpc,
+				    &apple_clpc_ane_states_fops);
+	if (clpc->ane && clpc->ane_cpu >= 0)
+		debugfs_create_u32("ane_cluster_khz", 0600, clpc->debugfs,
+				   &clpc->ane_cluster_khz);
 
 	ret = devm_add_action_or_reset(dev, apple_clpc_stop, clpc);
 	if (ret)
@@ -882,6 +1247,7 @@ static const struct apple_clpc_hw apple_clpc_hw_t8132 = {
 		[APPLE_CLPC_SOC] = { 3, 3, 3, 3 },
 	},
 	.gpu_demand = false,
+	.gpu_input = true,
 };
 
 /*
@@ -922,6 +1288,12 @@ static const struct apple_clpc_hw apple_clpc_hw_t8140 = {
 	.pmp_backoff = true,
 	.pmp_agent = 0,
 	.gpu_dense = 2,
+	/*
+	 * Measured ANE demand (Neo, MobileNetV1): DCS 4 alone takes an
+	 * EXECUTE from 2.3-2.5 to 1.8 ms, DCS 4 with fabric 3 (the GPU's
+	 * streaming floor) to 1.25-1.31 ms.
+	 */
+	.ane = { [APPLE_CLPC_DCS] = 4, [APPLE_CLPC_SOC] = 3 },
 };
 
 /*
@@ -948,6 +1320,41 @@ static const struct apple_clpc_hw apple_clpc_hw_t6040 = {
 	},
 	.sustain = 3,
 	.gpu_demand = false,
+	.gpu_input = true,
+	/*
+	 * ANE work needs two things its own floor (PMC SoC-max: fabric 2)
+	 * does not give it. ResNet-50 streams about 50 MB of weights per
+	 * inference and runs DRAM bound at DCS 0, so hold the DCS 5 / fabric
+	 * 2 a busy CPU cluster gets. And the engine runs at a speed set by
+	 * the frequency of the second P cluster (cpu-map cluster2), whatever
+	 * runs on it: MobileNetV1 takes 65-375 us of engine time (mean 165)
+	 * with that cluster at its idle frequency and 88-91 us with it at
+	 * 3.3 GHz or above (no gain above 3.756 GHz, measured at 1.8 to 4.5);
+	 * the first P cluster and the E cluster make no difference.
+	 */
+	.ane = { [APPLE_CLPC_DCS] = 5, [APPLE_CLPC_SOC] = 2 },
+	.ane_cluster = 2,
+	.ane_cluster_khz = 3756000,
+	.ane_cluster_machine = "apple,t6040",
+};
+
+/*
+ * T8142: DCS states 0-7 on rail 0, fabric states 0-4 on rail 1. The fabric
+ * state bounds CPU memory bandwidth: four P cores copy at ~40 GB/s with the
+ * fabric at 1 and at ~110 GB/s at 4 (macOS ~124).
+ *
+ * The M5 GPU driver reports its submissions in flight. Once the PMP runs, its
+ * vote (agent 0) drops from iBoot's DCS 7 / fabric 1 to 0 and nothing else
+ * raises the floor for the GPU: a 4K RGBA16F fill then takes 5.1 ms instead
+ * of 0.9 ms with both rails at the top of the map.
+ */
+static const struct apple_clpc_hw apple_clpc_hw_t8142 = {
+	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
+	.map = {
+		[APPLE_CLPC_DCS] = { 2, 4, 6, 7 },
+		[APPLE_CLPC_SOC] = { 1, 2, 3, 4 },
+	},
+	.gpu_input = true,
 };
 
 #if IS_BUILTIN(CONFIG_KUNIT) && !defined(MODULE)
@@ -1102,7 +1509,146 @@ static void apple_clpc_t8132_gpu_input_test(struct kunit *test)
 	apple_clpc_gpu_put(gpu);
 }
 
+static void apple_clpc_ane_demand_hold_test(struct kunit *test)
+{
+	struct apple_clpc_ane ane = {};
+	struct apple_clpc_vote vote = {};
+	struct apple_clpc *clpc = kunit_kzalloc(test, sizeof(*clpc), GFP_KERNEL);
+	unsigned int demand[APPLE_CLPC_RAILS] = {};
+	unsigned long now = 100, hold = msecs_to_jiffies(APPLE_CLPC_HOLD_MS);
+
+	KUNIT_ASSERT_NOT_NULL(test, clpc);
+	spin_lock_init(&ane.lock);
+	clpc->ane = &ane;
+	clpc->hw = &apple_clpc_hw_t8140;
+	clpc->ane_states[APPLE_CLPC_DCS] = clpc->hw->ane[APPLE_CLPC_DCS];
+	clpc->ane_states[APPLE_CLPC_SOC] = clpc->hw->ane[APPLE_CLPC_SOC];
+	KUNIT_EXPECT_FALSE(test, apple_clpc_ane_input_demand(clpc, demand));
+	apple_clpc_ane_set_active(&ane, true);
+	KUNIT_EXPECT_TRUE(test, apple_clpc_ane_input_demand(clpc, demand));
+	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_DCS], 4u);
+	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_SOC], 3u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_vote(&vote, demand[APPLE_CLPC_DCS], now), 4u);
+	/* Demand continues across samples, without another publication. */
+	now += hold;
+	KUNIT_EXPECT_TRUE(test, apple_clpc_ane_input_demand(clpc, demand));
+	KUNIT_EXPECT_EQ(test, apple_clpc_vote(&vote, demand[APPLE_CLPC_DCS], now), 4u);
+	apple_clpc_ane_set_active(&ane, false);
+	memset(demand, 0, sizeof(demand));
+	KUNIT_EXPECT_FALSE(test, apple_clpc_ane_input_demand(clpc, demand));
+	KUNIT_EXPECT_EQ(test, apple_clpc_vote(&vote, demand[APPLE_CLPC_DCS],
+					      now + hold - 1), 4u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_vote(&vote, demand[APPLE_CLPC_DCS],
+					      now + hold), 0u);
+	/* A request completing before the worker runs still earns the hold. */
+	apple_clpc_ane_set_active(&ane, true);
+	apple_clpc_ane_set_active(&ane, false);
+	KUNIT_EXPECT_TRUE(test, apple_clpc_ane_input_demand(clpc, demand));
+	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_DCS], 4u);
+	KUNIT_EXPECT_FALSE(test, apple_clpc_ane_input_demand(clpc, demand));
+	KUNIT_EXPECT_GT(test, ane.updated_ns, 0ull);
+	KUNIT_EXPECT_EQ(test, ane.sequence, 4ull);
+	/* T6040 holds its top qualified DCS and fabric states for the ANE. */
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t6040.ane[APPLE_CLPC_DCS], 5);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t6040.ane[APPLE_CLPC_SOC], 2);
+}
+
+static void apple_clpc_ane_cluster_test(struct kunit *test)
+{
+	struct apple_clpc *clpc = kunit_kzalloc(test, sizeof(*clpc), GFP_KERNEL);
+	unsigned long now = 1000;
+
+	KUNIT_ASSERT_NOT_NULL(test, clpc);
+	/* No CPU for the cluster: the floor is never requested. */
+	clpc->ane_cpu = -ENODEV;
+	clpc->ane_cluster_khz = apple_clpc_hw_t6040.ane_cluster_khz;
+	apple_clpc_ane_cluster(clpc, true, now);
+	KUNIT_EXPECT_FALSE(test, freq_qos_request_active(&clpc->ane_qos));
+	KUNIT_EXPECT_EQ(test, clpc->ane_qos_khz, 0u);
+	/* The hold runs from the last active sample. */
+	KUNIT_EXPECT_TRUE(test, time_before(now, clpc->ane_until));
+	KUNIT_EXPECT_FALSE(test, time_before(now + msecs_to_jiffies(APPLE_CLPC_HOLD_MS),
+					     clpc->ane_until));
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t6040.ane_cluster, 2u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8140.ane_cluster_khz, 0u);
+}
+
+static void apple_clpc_ane_states_test(struct kunit *test)
+{
+	struct apple_clpc *clpc = kunit_kzalloc(test, sizeof(*clpc), GFP_KERNEL);
+	struct apple_clpc_ane ane = {};
+	unsigned int demand[APPLE_CLPC_RAILS] = { 5, 2 };
+	int states[APPLE_CLPC_RAILS] = { 4, 3 };
+
+	KUNIT_ASSERT_NOT_NULL(test, clpc);
+	clpc->hw = &apple_clpc_hw_t8140;
+	clpc->ane = &ane;
+	spin_lock_init(&ane.lock);
+	apple_clpc_ane_states_set(clpc, states);
+	apple_clpc_ane_set_active(&ane, true);
+	KUNIT_EXPECT_TRUE(test, apple_clpc_ane_input_demand(clpc, demand));
+	/* ANE cannot lower a concurrent CPU/GPU request. */
+	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_DCS], 5u);
+	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_SOC], 3u);
+	states[APPLE_CLPC_DCS] = -1;
+	states[APPLE_CLPC_SOC] = 100;
+	apple_clpc_ane_states_set(clpc, states);
+	KUNIT_EXPECT_EQ(test, clpc->ane_states[APPLE_CLPC_DCS], 0u);
+	KUNIT_EXPECT_EQ(test, clpc->ane_states[APPLE_CLPC_SOC], 3u);
+}
+
+static void apple_clpc_ane_no_provider_test(struct kunit *test)
+{
+	struct apple_clpc *clpc = kunit_kzalloc(test, sizeof(*clpc), GFP_KERNEL);
+	struct apple_clpc_ane *ane = NULL;
+	unsigned int demand[APPLE_CLPC_RAILS] = {};
+	struct device dev = {};
+
+	KUNIT_ASSERT_NOT_NULL(test, clpc);
+	KUNIT_EXPECT_EQ(test, apple_clpc_ane_get(&dev, &ane), 0);
+	KUNIT_EXPECT_PTR_EQ(test, ane, NULL);
+	apple_clpc_ane_set_active(ane, true);
+	apple_clpc_ane_set_active(ane, false);
+	apple_clpc_ane_put(ane);
+	KUNIT_EXPECT_FALSE(test, apple_clpc_ane_input_demand(clpc, demand));
+	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_DCS], 0u);
+	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_SOC], 0u);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8132.ane[APPLE_CLPC_DCS], 0);
+	KUNIT_EXPECT_EQ(test, apple_clpc_hw_t8142.ane[APPLE_CLPC_DCS], 0);
+}
+
+static void apple_clpc_ane_wake_removal_test(struct kunit *test)
+{
+	struct apple_clpc_ane *ane = kzalloc_obj(*ane);
+	struct apple_clpc_wake_test wake;
+
+	KUNIT_ASSERT_NOT_NULL(test, ane);
+	kref_init(&ane->ref);
+	spin_lock_init(&ane->lock);
+	INIT_DELAYED_WORK(&wake.work, apple_clpc_wake_complete);
+	init_completion(&wake.done);
+	ane->wake = &wake.work;
+	kref_get(&ane->ref);
+	apple_clpc_ane_set_active(ane, true);
+	KUNIT_EXPECT_NE(test, wait_for_completion_timeout(&wake.done, HZ), 0ul);
+	/* Actual removal ordering: detach, drain, drop the provider reference. */
+	apple_clpc_ane_detach(ane);
+	cancel_delayed_work_sync(&wake.work);
+	apple_clpc_ane_owner_put(ane);
+	reinit_completion(&wake.done);
+	apple_clpc_ane_set_active(ane, false);
+	apple_clpc_ane_set_active(ane, true);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&wake.work));
+	KUNIT_EXPECT_FALSE(test, completion_done(&wake.done));
+	apple_clpc_ane_put(ane);
+}
+
 static struct kunit_case apple_clpc_cases[] = {
+	KUNIT_CASE(apple_clpc_ane_demand_hold_test),
+	KUNIT_CASE(apple_clpc_ane_states_test),
+	KUNIT_CASE(apple_clpc_ane_cluster_test),
+	KUNIT_CASE(apple_clpc_ane_no_provider_test),
+	KUNIT_CASE(apple_clpc_ane_wake_removal_test),
 	KUNIT_CASE(apple_clpc_t8132_gpu_input_test),
 	KUNIT_CASE(apple_clpc_gpu_dense_test),
 	KUNIT_CASE(apple_clpc_gpu_cold_wake_test),
@@ -1117,9 +1663,43 @@ static struct kunit_suite apple_clpc_suite = {
 kunit_test_suite(apple_clpc_suite);
 #endif
 
+/* T8152: DCS states 0-7 and fabric states 0-4. */
+static const struct apple_clpc_hw apple_clpc_hw_t8152 = {
+	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
+	.map = {
+		[APPLE_CLPC_DCS] = { 2, 4, 6, 7 },
+		[APPLE_CLPC_SOC] = { 1, 2, 3, 4 },
+	},
+};
+
+/*
+ * T6050 (M5 Pro/Max): DCS states 0-6 on rail 0, fabric states 0-3 on rail 1.
+ * The boot loader enables no agent on either rail, so without this floor
+ * the DRAM controller and the fabric stay at state 0: CPU memcpy caps at
+ * about 34 GB/s on the M5 Pro. A busy cluster in the upper half of its range
+ * asks for DCS 5 and fabric 2, the floor macOS's CLPC holds through an
+ * 18-thread CPU loop (J714sAP, 26A428: 0x25 on its voter 99% of the time);
+ * three busy samples in a row (12 ms) are needed, as on T6040. The GPU driver
+ * reports its work in flight and gets both top states, DCS 6 and fabric 3,
+ * while it has some: bandwidth-bound GPU work runs about 11% slower at DCS 5.
+ */
+static const struct apple_clpc_hw apple_clpc_hw_t6050 = {
+	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
+	.map = {
+		[APPLE_CLPC_DCS] = { 2, 4, 5, 5 },
+		[APPLE_CLPC_SOC] = { 1, 2, 2, 2 },
+	},
+	.gpu = { [APPLE_CLPC_DCS] = 6, [APPLE_CLPC_SOC] = 3 },
+	.sustain = 3,
+	.gpu_input = true,
+};
+
 static const struct of_device_id apple_clpc_of_match[] = {
+	{ .compatible = "apple,t6050-clpc", .data = &apple_clpc_hw_t6050 },
 	{ .compatible = "apple,t8132-clpc", .data = &apple_clpc_hw_t8132 },
 	{ .compatible = "apple,t8140-clpc", .data = &apple_clpc_hw_t8140 },
+	{ .compatible = "apple,t8142-clpc", .data = &apple_clpc_hw_t8142 },
+	{ .compatible = "apple,t8152-clpc", .data = &apple_clpc_hw_t8152 },
 	{ .compatible = "apple,t6041-clpc", .data = &apple_clpc_hw_t6040 },
 	{}
 };

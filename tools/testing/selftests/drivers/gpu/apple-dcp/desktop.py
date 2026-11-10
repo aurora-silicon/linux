@@ -241,7 +241,8 @@ struct backlight_device {struct backlight_properties props;void *data;bool ops_l
 struct apple_dcp {
     int fw_compat;bool quiescing;
     struct {int iomfb_method_profile;} hw;
-    struct {u32 maximum,nits,dac;bool update;struct backlight_device *bl_dev;} brightness;
+    struct {u32 maximum,nits,dac;bool update;struct backlight_device *bl_dev;
+        u32 level,fade_from,fade_to;bool fading;unsigned long fade_start;int fade_work;} brightness;
     struct {bool lock;struct dcp_backlight_state state;unsigned long fade_start;
         int fade_work;void (*kick)(struct apple_dcp *);} backlight;
     struct {bool inherited_brightness_valid;u32 inherited_brightness;} *desktop;
@@ -288,6 +289,10 @@ static u32 calculate_dac(struct apple_dcp *d,int nits) {(void)d;(void)nits;asser
 static int drm_modeset_lock_single_interruptible(int *p) {(void)p;assert(false);return 0;}
 static void drm_modeset_unlock(int *p) {(void)p;assert(false);}
 static int dcp_backlight_update(struct apple_dcp *d) {(void)d;assert(false);return 0;}
+/* The DAC fade (M1/M2 firmware) never runs on the desktop panel. */
+#define system_freezable_wq NULL
+static bool dcp_dac_fade_starts(struct apple_dcp *d,u32 nits) {(void)d;(void)nits;assert(false);return false;}
+static void mod_delayed_work(void *q,int *w,unsigned delay) {(void)q;(void)w;(void)delay;assert(false);}
 ''' + functions + r'''
 int main(void)
 {
@@ -409,10 +414,11 @@ def panel_identity(root, output=None):
 #ifndef READ_ONCE
 #define READ_ONCE(x) (x)
 #endif
+''' + block((root / 'drivers/gpu/drm/apple/dcp-internal.h').read_text(), 'struct dcp_panel_identity {') + r''';
 struct apple_dcp {
     int fw_compat;bool has_panel;struct {bool lock;} metadata;
-    struct {struct dcp_display_metadata panel_metadata, panel_adt_identity;u64 panel_metadata_generation;bool panel_metadata_valid;u8 panel_raw_edid[4096];size_t panel_raw_edid_size;} *desktop;
-    struct {u32 width_mm,height_mm,peak_nits;} panel;void *connector;
+    struct dcp_panel_identity *panel_identity;
+    struct {u32 width_mm,height_mm,peak_nits;const struct dcp_color_space *color_target;} panel;void *connector;
 };
 static unsigned notifications;
 static bool dcp_has_panel(struct apple_dcp *d) {return d->has_panel;}
@@ -428,7 +434,7 @@ int main(int argc, char **argv)
     assert(!strcmp(metadata.name,"Synthetic Int"));
     /* Optional color/date fields are absent; timings come from the catalog. */
     struct apple_dcp d={.fw_compat=5,.has_panel=true,.panel={345,223},.connector=&d};
-    __typeof__(*d.desktop) desktop={0};d.desktop=&desktop;
+    __typeof__(*d.panel_identity) desktop={0};d.panel_identity=&desktop;
     struct dcp_display_mode modes[3]={0};
     for(unsigned i=0;i<3;i++)modes[i].mode=(struct drm_display_mode){.clock=i==0?1080005:i==1?540005:432000,
         .hdisplay=3456,.hsync_start=3500,.hsync_end=3550,.htotal=4000,
@@ -436,7 +442,7 @@ int main(int argc, char **argv)
         .flags=DRM_MODE_FLAG_PHSYNC|DRM_MODE_FLAG_PVSYNC,.type=i==0?DRM_MODE_TYPE_PREFERRED:0};
     modes[0].vrr=true;modes[0].min_vrr=24U<<16;modes[0].max_vrr=120U<<16;
     u64 generation=99;
-    desktop.panel_adt_identity=(struct dcp_display_metadata){.manufacturer="APP",.product=0x616};
+    desktop.adt=(struct dcp_display_metadata){.manufacturer="APP",.product=0x616};
     /* A peak above the SDR range adds the HDR block: 1600 cd/m2 is code 160. */
     d.panel.peak_nits=1600;
     const struct drm_edid *hdr=dcp_panel_edid_snapshot(&d,modes,3,&generation);
@@ -473,9 +479,9 @@ int main(int argc, char **argv)
         assert(iomfb_check_callback_v26_6_desktop(413,sizeof(service),4));
         assert(!iomfb_check_callback_v26_6_desktop(413,sizeof(service)-1,4));
         assert(handlers[413](&d,413,&result,service) && result==1);
-        assert(desktop.panel_metadata_valid && notifications==1);
-        assert(desktop.panel_metadata.serial==(form==2?0:metadata.serial));
-        assert(!strcmp(desktop.panel_metadata.manufacturer,"TST"));
+        assert(desktop.metadata_valid && notifications==1);
+        assert(desktop.metadata.serial==(form==2?0:metadata.serial));
+        assert(!strcmp(desktop.metadata.manufacturer,"TST"));
         if(form==2) {
             const struct drm_edid *minimal_edid=dcp_panel_edid_snapshot(&d,modes,3,&generation);
             assert(!IS_ERR(minimal_edid) && drm_edid_valid(minimal_edid));
@@ -491,7 +497,7 @@ int main(int argc, char **argv)
     }
     desktop=(__typeof__(desktop)){0};notifications=0;
     dcp_panel_metadata_replace(&d,&metadata);
-    assert(notifications==1 && desktop.panel_metadata_valid);
+    assert(notifications==1 && desktop.metadata_valid);
     const struct drm_edid *edid=dcp_panel_edid_snapshot(&d,modes,3,&generation);
     assert(!IS_ERR(edid) && drm_edid_valid(edid) && dcp_panel_metadata_current(&d,generation));
     const u8 *bytes=(const void *)&edid->raw;
@@ -514,7 +520,7 @@ int main(int argc, char **argv)
     /* A real EDID replaces the fallback; invalid replacement preserves it. */
     u8 real[128];memcpy(real,bytes,128);real[12]^=1;real[127]^=1;
     dcp_panel_edid_receive(&d,real,sizeof(real));
-    assert(desktop.panel_raw_edid_size==128);
+    assert(desktop.raw_edid_size==128);
     u8 nested[148]={0};u32 word;
     word=0xd3;memcpy(nested,&word,4);word=0x01000001;memcpy(nested+4,&word,4);
     word=0x09000004;memcpy(nested+8,&word,4);memcpy(nested+12,"EDID",4);
@@ -523,7 +529,7 @@ int main(int argc, char **argv)
     assert(!parse_panel_edid_data(nested,sizeof(nested),&nested_raw,&nested_size));
     assert(nested_size==128 && !memcmp(nested_raw,real,128));
     dcp_panel_edid_receive(&d,nested,sizeof(nested));
-    generation=desktop.panel_metadata_generation;
+    generation=desktop.generation;
     const struct drm_edid *copied=dcp_panel_edid_snapshot(&d,modes,3,&generation);
     assert(!IS_ERR(copied) && !memcmp(&copied->raw,real,128));drm_edid_free(copied);
     unsigned previous=notifications;
@@ -534,7 +540,7 @@ int main(int argc, char **argv)
     for(unsigned j=0;j<127;j++)real[127]-=real[j];
     assert(!dcp_panel_edid_has_identity(real));
     dcp_panel_edid_receive(&d,real,sizeof(real));assert(notifications==previous);
-    desktop.panel_raw_edid_size=0;notifications=1;
+    desktop.raw_edid_size=0;notifications=1;
     drm_edid_free(edid);
     /* Repeated and partial dictionaries cannot trigger monitor/brightness restore loops. */
     for(unsigned repeat=0;repeat<32;repeat++) {
@@ -545,17 +551,20 @@ int main(int argc, char **argv)
     struct dcp_display_metadata partial={.manufacturer="TST",.product=42};
     dcp_panel_metadata_replace(&d,&partial);
     assert(dcp_panel_metadata_current(&d,generation) && notifications==1);
-    assert(desktop.panel_metadata.serial==metadata.serial);
+    assert(desktop.metadata.serial==metadata.serial);
     metadata.serial++;
     dcp_panel_metadata_replace(&d,&metadata);
     assert(!dcp_panel_metadata_current(&d,generation) && notifications==2);
     edid=dcp_panel_edid_snapshot(&d,modes,3,&generation);
     assert(!IS_ERR(edid) && dcp_panel_metadata_current(&d,generation));
     drm_edid_free(edid);
-    /* Another firmware/profile cannot publish a desktop panel identity. */
+    /* Any firmware's internal panel takes its identity; no identity, nothing published. */
     desktop=(__typeof__(desktop)){0};d.fw_compat=2;dcp_panel_metadata_replace(&d,&metadata);
-    assert(!desktop.panel_metadata_valid);
-    metadata.manufacturer[0]='?';assert(IS_ERR(dcp_panel_edid(&metadata,modes,3,345,223)));
+    assert(desktop.metadata_valid && !strcmp(desktop.metadata.manufacturer,"TST"));
+    desktop=(__typeof__(desktop)){0};d.panel_identity=NULL;dcp_panel_metadata_replace(&d,&metadata);
+    assert(!desktop.metadata_valid && !dcp_panel_metadata_current(&d,0));
+    assert(PTR_ERR(dcp_panel_edid_snapshot(&d,modes,3,&generation))==-ENODEV);
+    metadata.manufacturer[0]='?';assert(IS_ERR(dcp_panel_edid(&metadata,NULL,modes,3,345,223)));
     return 0;
 }
 '''
@@ -595,7 +604,9 @@ def powerlog_framing(root):
 #define __le64 u64
 #define EPIC_SUBTYPE_STD_SERVICE 0xc0
 enum epic_subtype { REPORT = 0xc0 };
-struct apple_dcp {void *dev;int fw_compat;struct {int iomfb_method_profile;} hw;struct {u32 nits;} brightness;};
+struct work_struct { unsigned scheduled; };
+static void __attribute__((unused)) schedule_work(struct work_struct *w) { w->scheduled++; }
+struct apple_dcp {void *dev;int fw_compat;struct {int iomfb_method_profile;} hw;struct {u32 nits,maximum;void *bl_dev;} brightness;struct work_struct bl_register_wq;};
 struct apple_epic_service;
 struct apple_dcp_afkep {struct apple_dcp *dcp;unsigned endpoint;struct apple_epic_service *service;};
 struct apple_epic_service_ops {int (*report)(struct apple_epic_service *,enum epic_subtype,const void *,size_t);};
@@ -765,8 +776,12 @@ def adt_identity(root):
         return bytes(out)+b''.join(children)
     panel=node({'product-id':42,'vendor-id':0x5274,'width-mm':345,'height-mm':223,
                 'serial-number':b'SYNTHETIC-PANEL','name':b'panel\0'})
+    # A synthetic potential headroom of 6.5; a nested node of that name is no
+    # panel backlight and must not override it.
+    backlight=node({'name':b'backlight\0','EDRPotentialHeadroom':0x68000},
+                   [node({'name':b'backlight\0','EDRPotentialHeadroom':0x10000})])
     data=node({'name':b'device-tree\0'},[node({'name':b'product\0'},[panel]),
-              node({'name':b'chosen\0','serial-number':b'PRIVATE-MACHINE'})])
+              node({'name':b'chosen\0','serial-number':b'PRIVATE-MACHINE'}),backlight])
     base=root/'drivers/gpu/drm/apple'
     source=(base/'dcp-panel-adt.c').read_text()
     source='\n'.join(l for l in source.splitlines() if not l.startswith('#include'))
@@ -778,8 +793,9 @@ def adt_identity(root):
 #include <stddef.h>
 #include <string.h>
 #include <errno.h>
-typedef uint8_t u8;typedef uint32_t u32;
+typedef uint8_t u8;typedef uint32_t u32;typedef int32_t s32;typedef int64_t s64;
 #define U16_MAX UINT16_MAX
+#define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
 #define SZ_16M (16U<<20)
 #define ALIGN(x,n) (((x)+(n)-1)&~((n)-1))
 #define ERR_PTR(x) ((void *)(intptr_t)(x))
@@ -787,7 +803,9 @@ typedef uint8_t u8;typedef uint32_t u32;
 #define IS_ERR(x) ((uintptr_t)(x)>(uintptr_t)-4096)
 static u32 get_unaligned_le32(const void *p) {u32 n;memcpy(&n,p,4);return n;}
 '''
-    code+=block((base/'dcp-display-metadata.h').read_text(),'struct dcp_display_metadata {')+';\n'
+    metadata=(base/'dcp-display-metadata.h').read_text()
+    code+=block(metadata,'struct dcp_display_metadata {')+';\n'
+    code+=block(metadata,'enum dcp_panel_gamut {')+';\n'
     code+=block(header,'struct dcp_panel_adt {')+';\n'+source
     code+='static const u8 fixture[]={'+','.join(map(str,data))+'};\n'
     return code+r'''
@@ -798,6 +816,7 @@ int main(void)
     assert(panel.found && panel.width_mm==345 && panel.height_mm==223);
     assert(!strcmp(panel.identity.manufacturer,"TST") && panel.identity.product==42);
     assert(panel.identity.serial && panel.identity.serial==dcp_adt_serial((const u8 *)"SYNTHETIC-PANEL",15));
+    assert(panel.edr_potential_headroom==0x68000);
     for(unsigned n=0;n<sizeof(fixture);n++) {
         struct dcp_panel_adt old=panel;
         assert(dcp_panel_adt_parse(fixture,n,&panel)<0);
@@ -835,7 +854,7 @@ struct work_struct {int unused;};
 struct backlight_device {struct {int kobj;} dev;struct {u32 brightness;} props;};
 struct apple_dcp {
     int fw_compat;bool quiescing,crashed;
-    struct {struct backlight_device *bl_dev;} brightness;
+    struct {struct backlight_device *bl_dev;int fade_work;} brightness;
     struct {bool lock;struct dcp_backlight_state state;struct work_struct notify_work;int fade_work,retry_work;} backlight;
     struct {struct dcp_backlight_swap backlight;} *desktop;
 };
@@ -871,10 +890,10 @@ int main(void)
     dcp_backlight_desktop_finish(&d,9,true,false);assert(events==1);
     d.quiescing=true;dcp_backlight_notify(&d);assert(events==1);
     d.quiescing=false;d.fw_compat=1;dcp_backlight_notify(&d);assert(events==1);
-    dcp_backlight_stop(&d);assert(!cancelled && delayed_cancelled==2);
+    dcp_backlight_stop(&d);assert(!cancelled && delayed_cancelled==3);
     d.fw_compat=5;dcp_backlight_notify_release(&d);
     assert(!d.brightness.bl_dev && cancelled==1);dcp_backlight_notify(&d);assert(events==1);
-    dcp_backlight_stop(&d);assert(cancelled==2 && delayed_cancelled==4);
+    dcp_backlight_stop(&d);assert(cancelled==2 && delayed_cancelled==6);
     return 0;
 }
 '''

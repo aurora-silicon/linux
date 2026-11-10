@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
-/* Supply missing platform descriptions for the original J713 loader ABI.
+/* Supply missing platform descriptions for the original J713 loader ABI,
+ * which the J715 shares, and the M4 PMGR ownership policy on the qualified
+ * firmware for every M4 Mac.
  * Keep the shared m1n1 payload usable by the stable kernel. Hardware control
  * remains in the ordinary MCC, PMC and CLPC drivers, with one DTS data source.
  * J713 PMGR ownership/status also comes from its board DTS, before any domain
@@ -9,6 +11,7 @@
 #include <linux/libfdt.h>
 #include <linux/of.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/t8132.h>
 #include <linux/string.h>
 
 extern const u8 __dtb_t8132_platform_data_begin[];
@@ -130,8 +133,14 @@ static int __init t8132_fdt_node_offset(const void *data,
 	return fdt_subnode_offset(data, parent, kbasename(node->full_name));
 }
 
-/* Apply only board availability/ownership, never imported register values. */
-static int __init t8132_pmgr_policy(struct of_changeset *cs, unsigned int *changed)
+/*
+ * Apply only availability/ownership, never imported register values. Only the
+ * original J713 loader tree (the Airs') can mark a domain okay that the policy
+ * refuses. Other trees state what their board wires, so keep their status,
+ * except on domains the policy gives the firmware.
+ */
+static int __init t8132_pmgr_policy(struct of_changeset *cs, unsigned int *changed,
+				    bool legacy)
 {
 	const void *data = __dtb_t8132_platform_data_begin;
 	const char * const ownership[] = { "apple,firmware-owned", "apple,inherited-on" };
@@ -150,6 +159,7 @@ static int __init t8132_pmgr_policy(struct of_changeset *cs, unsigned int *chang
 		for_each_child_of_node_scoped(pmgr, node) {
 			const char *status, *live;
 			int offset, len;
+			bool owned;
 
 			if (!of_device_is_compatible(node, "apple,t8132-pmgr-pwrstate"))
 				continue;
@@ -159,12 +169,16 @@ static int __init t8132_pmgr_policy(struct of_changeset *cs, unsigned int *chang
 			/* Unknown legacy domains stay inaccessible, rather than being probed. */
 			if (!status)
 				status = "disabled";
+			owned = offset >= 0 &&
+				(fdt_getprop(data, offset, ownership[0], NULL) ||
+				 fdt_getprop(data, offset, ownership[1], NULL));
 			if (of_property_read_string(node, "status", &live)) {
 				ret = of_changeset_add_prop_string(cs, node, "status", status);
 				if (ret)
 					goto put_pmgr;
 				(*changed)++;
-			} else if (!strcmp(status, "disabled") && strcmp(live, status)) {
+			} else if (strcmp(live, status) &&
+				   (legacy ? !strcmp(status, "disabled") : owned)) {
 				ret = of_changeset_update_prop_string(cs, node, "status", status);
 				if (ret)
 					goto put_pmgr;
@@ -184,6 +198,86 @@ static int __init t8132_pmgr_policy(struct of_changeset *cs, unsigned int *chang
 	return 0;
 put_pmgr:
 	of_node_put(pmgr);
+	return ret;
+}
+
+/*
+ * A boot framebuffer must not wait on a domain the policy keeps from Linux:
+ * that provider never registers, so the consumer only defers until the
+ * timeout. Linux never switches such a domain; it stays as the loader left it.
+ */
+static int __init t8132_framebuffer_domains(void)
+{
+	struct device_node *fb;
+	int ret = 0;
+
+	for_each_compatible_node(fb, NULL, "simple-framebuffer") {
+		struct of_phandle_args args;
+		struct property *prop;
+		__be32 *cells;
+		int count, len, kept = 0, domains = 0;
+
+		if (!of_find_property(fb, "power-domains", &len) || len <= 0)
+			continue;
+		count = of_count_phandle_with_args(fb, "power-domains", "#power-domain-cells");
+		if (count <= 0)
+			continue;
+		cells = kmalloc(len, GFP_KERNEL);
+		if (!cells) {
+			ret = -ENOMEM;
+			goto put_fb;
+		}
+		for (int i = 0; i < count; i++) {
+			bool available;
+
+			ret = of_parse_phandle_with_args(fb, "power-domains", "#power-domain-cells",
+							 i, &args);
+			if (ret)
+				break;
+			available = of_device_is_available(args.np);
+			if (available && kept + 1 + args.args_count <= len / 4) {
+				domains++;
+				cells[kept++] = cpu_to_be32(args.np->phandle);
+				for (int j = 0; j < args.args_count; j++)
+					cells[kept++] = cpu_to_be32(args.args[j]);
+			}
+			of_node_put(args.np);
+		}
+		/* Leave a list it cannot read, or one with nothing to drop, as it is. */
+		if (ret || kept * 4 == len) {
+			kfree(cells);
+			ret = 0;
+			continue;
+		}
+		prop = kzalloc_obj(*prop);
+		if (!prop) {
+			kfree(cells);
+			ret = -ENOMEM;
+			goto put_fb;
+		}
+		prop->name = kstrdup("power-domains", GFP_KERNEL);
+		prop->value = cells;
+		prop->length = kept * 4;
+		if (!prop->name) {
+			kfree(cells);
+			kfree(prop);
+			ret = -ENOMEM;
+			goto put_fb;
+		}
+		of_property_set_flag(prop, OF_DYNAMIC);
+		ret = of_update_property(fb, prop);
+		if (ret) {
+			kfree(prop->name);
+			kfree(cells);
+			kfree(prop);
+			goto put_fb;
+		}
+		pr_info("t8132-platform-handoff: %pOF keeps %d of %d power domains\n",
+			fb, domains, count);
+	}
+	return 0;
+put_fb:
+	of_node_put(fb);
 	return ret;
 }
 
@@ -215,8 +309,7 @@ static int __init t8132_platform_handoff(void)
 	unsigned int added = 0, changed = 0;
 	int root, node, ret;
 
-	if (!of_machine_is_compatible("apple,j713") ||
-	    !of_machine_is_compatible("apple,t8132"))
+	if (!apple_t8132_firmware_path() || !of_machine_is_compatible("apple,t8132"))
 		return 0;
 	if (fdt_check_header(data))
 		return -EINVAL;
@@ -229,7 +322,7 @@ static int __init t8132_platform_handoff(void)
 		goto out;
 	}
 	of_changeset_init(cs);
-	ret = t8132_pmgr_policy(cs, &changed);
+	ret = t8132_pmgr_policy(cs, &changed, apple_t8132_air());
 	if (ret)
 		goto destroy;
 
@@ -262,10 +355,12 @@ destroy:
 	if (ret) {
 		of_changeset_destroy(cs);
 		kfree(cs);
-	} else if (added || changed) {
-		/* The applied node/property storage lives until reboot. */
-		pr_info("t8132-platform-handoff: supplied %u platform nodes, %u PMGR policy properties\n",
-			added, changed);
+	} else {
+		if (added || changed)
+			/* The applied node/property storage lives until reboot. */
+			pr_info("t8132-platform-handoff: supplied %u platform nodes, %u PMGR policy properties\n",
+				added, changed);
+		ret = t8132_framebuffer_domains();
 	}
 out:
 	of_node_put(gfx);

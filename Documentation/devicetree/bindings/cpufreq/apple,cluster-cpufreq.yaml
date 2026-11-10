@@ -38,11 +38,16 @@ properties:
       - const: apple,s5l8960x-cluster-cpufreq
       - const: apple,t8140-cluster-cpufreq
       - const: apple,t8142-cluster-cpufreq
+      - const: apple,t6050-cluster-cpufreq
       - const: apple,t8152-cluster-cpufreq
       - items:
           - enum:
               - apple,t6020-cluster-cpufreq
+              - apple,t6030-cluster-cpufreq
+              - apple,t6031-cluster-cpufreq
               - apple,t6041-cluster-cpufreq
+              - apple,t6050-cluster-cpufreq
+              - apple,t8122-cluster-cpufreq
           - const: apple,t8112-cluster-cpufreq
 
   reg:
@@ -63,6 +68,14 @@ properties:
               E, 1 for P0, 2 for P1 on T6041)
             enum: [0, 1, 2]
 
+  apple,firmware-managed-thermal:
+    type: boolean
+    description:
+      The boot loader leaves the cluster's thermal limiting with the
+      firmware, which keeps the throttling, voltage and PLL control for the
+      whole time Linux runs. The T6050 driver registers DVFS only when this
+      is present.
+
   '#performance-domain-cells':
     const: 0
 
@@ -70,6 +83,16 @@ required:
   - compatible
   - reg
   - '#performance-domain-cells'
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6050-cluster-cpufreq
+    then:
+      required:
+        - apple,firmware-managed-thermal
 
 additionalProperties: false
 

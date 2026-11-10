@@ -470,6 +470,7 @@
 		};
 	};
 
+
 	soc: soc {
 		compatible = "simple-bus";
 		#address-cells = <2>;
@@ -829,7 +830,7 @@
 			reg = <0x3 0x082b0000 0x0 0x4000>;
 			clocks = <&clkref>;
 			interrupt-parent = <&aic>;
-			interrupts = <AIC_IRQ 507 IRQ_TYPE_LEVEL_HIGH>;
+			interrupts = <AIC_IRQ 481 IRQ_TYPE_LEVEL_HIGH>;
 		};
 
 		nub_spmi0: spmi@308714000 {
@@ -902,6 +903,34 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 494 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_nub_spmi_a0>;
+			status = "disabled";
+		};
+
+		/* Only a proxy for the external SPMI controller sits here. */
+		nub_spmi1: spmi@308614000 {
+			compatible = "apple,t8140-spmi", "apple,t8103-spmi";
+			reg = <0x3 0x08614000 0x0 0x100>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+			#interrupt-cells = <2>;
+			interrupt-controller;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 492 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_nub_spmi1>;
+			status = "disabled";
+		};
+
+		/* The AOP's SPMI bus (NFC controller). */
+		aop_spmi0: spmi@310914000 {
+			compatible = "apple,t8140-spmi", "apple,t8103-spmi";
+			reg = <0x3 0x10914000 0x0 0x100>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+			#interrupt-cells = <2>;
+			interrupt-controller;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 432 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_aop_spmi0>;
 			status = "disabled";
 		};
 
@@ -1177,7 +1206,7 @@
 			#size-cells = <2>;
 			ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0x0 0x20000000>,
 				 <0x02000000 0x0 0x80000000 0xb 0x80000000 0x0 0x40000000>;
-			power-domains = <&ps_apcie_gp>;
+			power-domains = <&ps_apcie_phy_sw>;
 			status = "disabled";
 
 			pcie0_port0: pci@0,0 {
@@ -1540,6 +1569,29 @@
 			status = "disabled";
 		};
 
+		/* No devices on this bus on the J700. */
+		spi3: spi@38510c000 {
+			compatible = "apple,t8140-spi", "apple,t8103-spi";
+			reg = <0x3 0x8510c000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1103 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>;
+			power-domains = <&ps_spi3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		/* Fast PWM. The J700 has no keyboard backlight or other consumer. */
+		fpwm0: pwm@385040000 {
+			compatible = "apple,t8140-fpwm", "apple,s5l-fpwm";
+			reg = <0x3 0x85040000 0x0 0x4000>;
+			power-domains = <&ps_fpwm0>;
+			clocks = <&clkref>;
+			#pwm-cells = <2>;
+			status = "disabled";
+		};
+
 		serial0: serial@30812c000 {
 			compatible = "apple,dockchannel-uart";
 			reg = <0x3 0x0812c000 0x0 0x4000>,
@@ -1716,7 +1768,8 @@
 		admac_base_ns: dma-controller@313800000 {
 			compatible = "apple,t8140-admac";
 			reg = <0x3 0x13800000 0x0 0x34000>;
-			dma-channels = <13>;
+			/* ADT has 13 slots per direction; Linux IDs alternate TX/RX. */
+			dma-channels = <26>;
 			interrupts-extended = <&aic AIC_IRQ 449 IRQ_TYPE_LEVEL_HIGH>,
 					      <0>, <0>, <0>;
 			#dma-cells = <1>;
@@ -1736,7 +1789,8 @@
 		admac_leap_ns: dma-controller@313300000 {
 			compatible = "apple,t8140-admac";
 			reg = <0x3 0x13300000 0x0 0x34000>;
-			dma-channels = <9>;
+			/* ADT has 9 slots per direction, including loopback RX4. */
+			dma-channels = <18>;
 			interrupts-extended = <&aic AIC_IRQ 452 IRQ_TYPE_LEVEL_HIGH>,
 					      <0>, <0>, <0>;
 			#dma-cells = <1>;
@@ -1950,6 +2004,7 @@
 };
 
 #include "t8140-pmgr.dtsi"
+#include "t8140-peripherals.dtsi"
 
 /*
  * DRAM interface class: width and maximum rate are inferred from topology

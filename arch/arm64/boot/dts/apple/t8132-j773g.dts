@@ -4,23 +4,289 @@
  *
  * target-type: J773g
  *
+ * Wired from the J773g ADT (macOS 26.6.2).
+ *
  * Copyright The Asahi Linux Contributors
  */
 
 /dts-v1/;
 
 #include "t8132.dtsi"
-#include "t8132-jxxx.dtsi"
+#include "t8132-desktop.dtsi"
+#include "t8132-atc23.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/spmi/spmi.h>
 
 / {
 	compatible = "apple,j773g", "apple,t8132", "apple,arm-platform";
 	model = "Apple Mac mini (M4, 2024)";
 	chassis-type = "desktop";
+
+	/*
+	 * The speaker amp's shutdown line (SDZ, AP GPIO 15, the ADT
+	 * function-reset; low = shutdown).
+	 */
+	speaker_sdz: regulator-sn012776-sdz {
+		compatible = "regulator-fixed";
+		regulator-name = "sn012776-sdz";
+		gpios = <&pinctrl_ap 15 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
 };
 
 /*
- * Keep the power-domains used for the HDMI port on.
+ * iBoot scans out through dispext0 to the HDMI port (dptx-phy and a
+ * DP-to-HDMI converter at i2c0 0x08, hot-plug on AOP GPIO 41): keep the
+ * power domains used for it on.
  */
 &framebuffer0 {
 	power-domains = <&ps_dispext0_fe>, <&ps_dptx_phy>;
+};
+
+/*
+ * Without this, the PMP firmware faults in the PMC block (0x382800000)
+ * shortly after it starts on this board. J713 keeps ps_pmc out of Linux
+ * in its PMGR policy; this board has none yet.
+ */
+&ps_pmc {
+	apple,always-on;
+};
+
+/*
+ * The AOP audio component always runs a microphone stream, and this Mac
+ * has no microphones (ADT iop-audio-controller has no audio-hp) and no
+ * speaker sense, so it has no sound card yet. The AOP registers its audio
+ * service by itself: without the node, no driver binds it.
+ */
+/delete-node/ &aop_audio;
+
+/*
+ * The SN012776 speaker amp (ADT /arm-io/i2c3/audio-speaker at 0x38, mono,
+ * speaker-protection 0): interrupt on AP GPIO 14, level low. Disabled
+ * until the speaker has a sound card and a protection profile.
+ */
+&i2c3 {
+	status = "okay";
+
+	speaker: codec@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Speaker";
+		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <0>;
+		ti,vmon-slot-no = <2>;
+		status = "disabled";
+	};
+};
+
+&typec0 {
+	label = "USB-C Back Middle";
+};
+
+&typec1 {
+	label = "USB-C Back Left";
+};
+
+/* ATC3's port controller (ADT nub-spmi-a0 hpm3). */
+&nub_spmi_a0 {
+	hpm3: usb-pd@8 {
+		compatible = "apple,t8132-sn201202x", "apple,sn201202x";
+		reg = <0x8 SPMI_USID>;
+		interrupts = <63 IRQ_TYPE_EDGE_RISING>,
+			     <69 IRQ_TYPE_EDGE_RISING>,
+			     <71 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "sleep", "wake";
+		wakeup-source;
+
+		typec3: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Back Right";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec3_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_3_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec3_connector_ss: endpoint {
+						remote-endpoint = <&atcphy3_typec_lanes>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&atcphy3 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			atcphy3_typec_lanes: endpoint {
+				remote-endpoint = <&typec3_connector_ss>;
+			};
+		};
+	};
+};
+
+&dwc3_3_dart_0 {
+	status = "okay";
+};
+
+&dwc3_3_dart_1 {
+	status = "okay";
+};
+
+&dwc3_3 {
+	dr_mode = "host";
+	maximum-speed = "super-speed";
+	phys = <&atcphy3 PHY_TYPE_USB2>, <&atcphy3 PHY_TYPE_USB3>;
+	phy-names = "usb2-phy", "usb3-phy";
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dwc3_3_hs: endpoint {
+				remote-endpoint = <&typec3_connector_hs>;
+			};
+		};
+	};
+};
+
+/*
+ * The two front USB-C ports: an on-board USB2 hub (Apple 05ac:800b, firmware
+ * on spi3) on raw USB2 root port 1 of ATC2's controller (ADT usb-drd2), with
+ * no port controller. The PHY only enters USB3 mode from a Type-C mode
+ * switch, so the hub runs at high speed. The hub child tells dwc3-apple the
+ * controller is a host from probe on; the graph link from the PHY's USB3 port
+ * to the controller's SuperSpeed port is how the PHY finds that fixed hub
+ * and keeps its USB2 path up without a cable event (no SuperSpeed data path
+ * is described). The hub's reset and SPI-flash output-enable lines (ADT
+ * usb3hub_rst, usb3hub_flash_oe) are AP GPIOs; the boot loader leaves both
+ * high, as does macOS, and the hub runs with them high.
+ */
+&atcphy2 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@1 {
+			reg = <1>;
+			atcphy2_usb: endpoint {
+				remote-endpoint = <&dwc3_2_ss>;
+			};
+		};
+	};
+};
+
+&dwc3_2_dart_0 {
+	status = "okay";
+};
+
+&dwc3_2_dart_1 {
+	status = "okay";
+};
+
+&dwc3_2 {
+	dr_mode = "host";
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	hub@1 {
+		compatible = "usb5ac,800b";
+		reg = <1>;
+	};
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* Raw xHCI port 1 is USB2; raw port 2 is SuperSpeed. */
+		port@2 {
+			reg = <2>;
+			dwc3_2_ss: endpoint {
+				remote-endpoint = <&atcphy2_usb>;
+			};
+		};
+	};
+};
+
+&pinctrl_ap {
+	usb3hub-flash-oe-hog {
+		gpio-hog;
+		gpios = <101 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "usb3hub-flash-oe";
+	};
+
+	usb3hub-reset-hog {
+		gpio-hog;
+		gpios = <198 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "usb3hub-reset";
+	};
+};
+
+&wifi0 {
+	/* ADT /arm-io/wlan module-instance */
+	brcm,board-type = "apple,sakhalin";
+};
+
+&bluetooth0 {
+	brcm,board-type = "apple,sakhalin";
+};
+
+#include "hwmon-common.dtsi"
+#include "hwmon-mini.dtsi"
+
+/*
+ * The PMGR domains of the USB-C ports this board wires beyond ATC0/ATC1, as
+ * the M4 firmware path's policy enables ATC0/ATC1's.
+ */
+&ps_atc2_common {
+	status = "okay";
+};
+
+&ps_atc2_usb_aon {
+	status = "okay";
+};
+
+&ps_atc2_usb {
+	status = "okay";
+};
+
+&ps_atc3_common {
+	status = "okay";
+};
+
+&ps_atc3_usb_aon {
+	status = "okay";
+};
+
+&ps_atc3_usb {
+	status = "okay";
 };

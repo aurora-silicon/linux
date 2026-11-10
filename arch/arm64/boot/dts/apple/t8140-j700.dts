@@ -88,16 +88,21 @@
 	 * cores do several times more work per watt, so all-core loads keep
 	 * them at full speed and trim the P cores instead.
 	 *
-	 * The SMC refreshes these readings about once a second and the die
-	 * settles within that time, so the loop carries a full sample of delay,
-	 * and the power a core draws per energy-model watt varies about 2.7x
-	 * between integer and floating-point work.  The governor derives its
-	 * gains from sustainable-power and the switch-on to control gap; 1.5 W
-	 * over 37 C gives 40/81/8 mW per C, which held the clock within one
-	 * P-state on both kinds of load (higher gains oscillate on the heavy
-	 * one).  1.5 W lies inside the sustainable range measured at ~93 C:
-	 * 1.1 W for floating-point and 2.5 W for integer loads.  The switch-on
-	 * trip sits above the idle temperature with schedutil (48-53 C), so the
+	 * The SMC refreshes these readings about once a second, far slower
+	 * than the die moves, so these zones are the slow outer loop.  The
+	 * fast loop is the PMP's: it runs a PI controller on its own die
+	 * sensors every few milliseconds and its effort caps each cluster
+	 * through cpufreq (apple,fast-die-effort), as on macOS.  Under a
+	 * sustained all-core load macOS holds the hottest SMC die reading at
+	 * 105 C with the CPUs drawing 4.1-4.3 W, so the control trip is 105 C
+	 * and sustainable-power is 4.2 W.  The governor derives its gains from
+	 * that and the switch-on to control gap (91/183/18 mW per C).  Measured
+	 * on 300 s of stress-ng on every CPU, against the earlier 95 C and
+	 * 1.5 W: 9.4% more work, P cluster 3121 instead of 2476 MHz, CPUs
+	 * 3.8 instead of 2.5 W, hottest die mean 102.8 C, p99 106.0 C, max
+	 * 106.1 C, against the 110 C critical trip.  The P clock dithers
+	 * between adjacent states (2916-3336 MHz).  The switch-on trip sits
+	 * above the idle temperature with schedutil (48-53 C), so the
 	 * controller, and with it any integral wind-up, resets whenever the
 	 * machine rests.
 	 *
@@ -117,7 +122,7 @@
 			polling-delay-passive = <500>;
 			polling-delay = <500>;
 			thermal-sensors = <&smc_hwmon 0>;	/* Te05 */
-			sustainable-power = <1500>;
+			sustainable-power = <4200>;
 
 			trips {
 				cpu_e0_alert: trip-alert {
@@ -127,7 +132,7 @@
 				};
 
 				cpu_e0_control: trip-control {
-					temperature = <95000>;
+					temperature = <105000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
@@ -164,7 +169,7 @@
 			polling-delay-passive = <500>;
 			polling-delay = <500>;
 			thermal-sensors = <&smc_hwmon 1>;	/* Te0S */
-			sustainable-power = <1500>;
+			sustainable-power = <4200>;
 
 			trips {
 				cpu_e1_alert: trip-alert {
@@ -174,7 +179,7 @@
 				};
 
 				cpu_e1_control: trip-control {
-					temperature = <95000>;
+					temperature = <105000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
@@ -211,7 +216,7 @@
 			polling-delay-passive = <500>;
 			polling-delay = <500>;
 			thermal-sensors = <&smc_hwmon 2>;	/* Tp01 */
-			sustainable-power = <1500>;
+			sustainable-power = <4200>;
 
 			trips {
 				cpu_p0_alert: trip-alert {
@@ -221,7 +226,7 @@
 				};
 
 				cpu_p0_control: trip-control {
-					temperature = <95000>;
+					temperature = <105000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
@@ -258,7 +263,7 @@
 			polling-delay-passive = <500>;
 			polling-delay = <500>;
 			thermal-sensors = <&smc_hwmon 3>;	/* Tp05 */
-			sustainable-power = <1500>;
+			sustainable-power = <4200>;
 
 			trips {
 				cpu_p1_alert: trip-alert {
@@ -268,7 +273,7 @@
 				};
 
 				cpu_p1_control: trip-control {
-					temperature = <95000>;
+					temperature = <105000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
@@ -305,7 +310,7 @@
 			polling-delay-passive = <500>;
 			polling-delay = <500>;
 			thermal-sensors = <&smc_hwmon 4>;	/* Tp09 */
-			sustainable-power = <1500>;
+			sustainable-power = <4200>;
 
 			trips {
 				cpu_p2_alert: trip-alert {
@@ -315,7 +320,7 @@
 				};
 
 				cpu_p2_control: trip-control {
-					temperature = <95000>;
+					temperature = <105000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
@@ -352,7 +357,7 @@
 			polling-delay-passive = <500>;
 			polling-delay = <500>;
 			thermal-sensors = <&smc_hwmon 5>;	/* Tp0D */
-			sustainable-power = <1500>;
+			sustainable-power = <4200>;
 
 			trips {
 				cpu_p3_alert: trip-alert {
@@ -362,7 +367,7 @@
 				};
 
 				cpu_p3_control: trip-control {
-					temperature = <95000>;
+					temperature = <105000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
@@ -471,6 +476,14 @@
 	status = "okay";
 };
 
+&jpeg1_dart {
+	status = "okay";
+};
+
+&jpeg1 {
+	status = "okay";
+};
+
 &apr_dart {
 	status = "okay";
 };
@@ -481,6 +494,32 @@
 
 &i2c2 {
 	status = "okay";
+
+	usb_repeater: phy@21 {
+		compatible = "ti,cd2e22";
+		reg = <0x21>;
+		#phy-cells = <0>;
+		ti,port = <0>;
+
+		/* apple,tunable is filled from usb-repeater-i2c by the bootloader. */
+	};
+
+	usb_hub_i2c: usb-hub@2c {
+		compatible = "via,vl122";
+		reg = <0x2c>;
+		reset-gpios = <&pinctrl_ap 142 GPIO_ACTIVE_HIGH>;
+		usb-hub = <&vl122_hub>;
+
+		/*
+		 * apple,tunable-vl, apple,tunable-vlf0 and apple,tunable-gl are
+		 * filled from usb-hub-i2c by the bootloader.
+		 */
+	};
+};
+
+&atcphy0 {
+	phys = <&usb_repeater>;
+	phy-names = "eusb2-repeater";
 };
 
 &qspi {
@@ -500,6 +539,16 @@
 			nvram: partition@24000 {
 				label = "nvram";
 				reg = <0x24000 0x1d0000>;
+			};
+
+			/*
+			 * syscfg factory data. Listed after nvram so the nvram
+			 * MTD index stays the same.
+			 */
+			partition@0 {
+				label = "syscfg";
+				reg = <0x0 0x24000>;
+				read-only;
 			};
 		};
 	};
@@ -656,8 +705,61 @@
 	};
 };
 
+/* A spare PWM channel for developers; no consumer is known. */
+&fpwm0 {
+	status = "okay";
+};
+
 &smc {
 	status = "okay";
+};
+
+/*
+ * The AOP's GPIO bank. The AOP keeps interrupt groups 0-3; the AP's are 4-6
+ * (AIC 384-386). No consumer requests a line yet. The reserved lines are the
+ * ones the firmware has already configured away from the bank's reset state
+ * by the time Linux boots; their users are not known, so they stay off limits.
+ */
+&pinctrl_aop {
+	gpio-reserved-ranges = <18 1>, <21 1>, <27 9>, <46 2>, <50 7>;
+	interrupts = <AIC_IRQ 384 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 385 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 386 IRQ_TYPE_LEVEL_HIGH>;
+	apple,irq-group-base = <4>;
+	status = "okay";
+};
+
+/*
+ * The always-on GPIO bank, as on the J616s: the AP takes none of its
+ * interrupts. Line 20 is the secure-repair enable and is never requested;
+ * the other reserved lines are configured by the firmware before Linux
+ * boots (line 27 is driven high) and have no known user.
+ */
+&pinctrl_nub {
+	gpio-reserved-ranges = <5 1>, <10 1>, <20 1>, <23 1>, <27 3>;
+	status = "okay";
+	/delete-property/ interrupt-controller;
+	/delete-property/ #interrupt-cells;
+	/delete-property/ interrupts;
+};
+
+&smc_gpio {
+	apple,pcio-templates = <10 0x800000 0xa0000>;
+};
+
+&aop_spmi0 {
+	status = "okay";
+
+	stockholm: nfc@9 {
+		compatible = "apple,stockholm-nci";
+		reg = <9 SPMI_USID>;
+		interrupt-parent = <&aop_spmi0>;
+		interrupts = <229 IRQ_TYPE_EDGE_RISING>,
+			     <230 IRQ_TYPE_EDGE_RISING>,
+			     <227 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "host-wake", "data-ready", "error";
+		enable-gpios = <&smc_gpio 10 GPIO_ACTIVE_HIGH>;
+	};
 };
 
 &smc_hwmon {
@@ -1057,6 +1159,59 @@
 	temperature-Tsx1 {
 		apple,key-id = "Tsx1";
 		label = "SMC Tsx1";
+	};
+
+	/*
+	 * GPU temperatures, last so the indexed channels above keep their
+	 * numbers. The SMC publishes them only while the GPU is powered; with
+	 * the GPU off they read -4.0 to 0.2 C placeholders, which are no data.
+	 */
+	temperature-Tg04 {
+		apple,key-id = "Tg04";
+		label = "GPU Tg04";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg05 {
+		apple,key-id = "Tg05";
+		label = "GPU Tg05";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0C {
+		apple,key-id = "Tg0C";
+		label = "GPU Tg0C";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0D {
+		apple,key-id = "Tg0D";
+		label = "GPU Tg0D";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0K {
+		apple,key-id = "Tg0K";
+		label = "GPU Tg0K";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0L {
+		apple,key-id = "Tg0L";
+		label = "GPU Tg0L";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0d {
+		apple,key-id = "Tg0d";
+		label = "GPU Tg0d";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0e {
+		apple,key-id = "Tg0e";
+		label = "GPU Tg0e";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	/*
@@ -1773,7 +1928,7 @@
 	#address-cells = <1>;
 	#size-cells = <0>;
 
-	hub@1 {
+	vl122_hub: hub@1 {
 		compatible = "usb2109,2122";
 		reg = <1>;
 
@@ -1897,6 +2052,34 @@
 	pcie0_clkreq: pcie0-clkreq-pins {
 		pinmux = <APPLE_PINMUX(101, 2)>;
 	};
+
+	uart4_rx: uart4-rx-pins {
+		pinmux = <APPLE_PINMUX(85, 2)>;
+	};
+
+	uart5_rx: uart5-rx-pins {
+		pinmux = <APPLE_PINMUX(169, 3)>;
+	};
+};
+
+/*
+ * Wi-Fi (uart4) and Bluetooth (uart5) firmware debug output. Only the
+ * receive line is routed; the ports stay closed unless a user opens them.
+ */
+&uart4 {
+	pinctrl-0 = <&uart4_rx>;
+	pinctrl-names = "default";
+	/* The PMGR clock provider is not enabled on this SoC yet. */
+	clocks = <&clkref>, <&clkref>;
+	status = "okay";
+};
+
+&uart5 {
+	pinctrl-0 = <&uart5_rx>;
+	pinctrl-names = "default";
+	/* The PMGR clock provider is not enabled on this SoC yet. */
+	clocks = <&clkref>, <&clkref>;
+	status = "okay";
 };
 
 /* SID17 bootstrap; the arena stays owned until a full reset. */
