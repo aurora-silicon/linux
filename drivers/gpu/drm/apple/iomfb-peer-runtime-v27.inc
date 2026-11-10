@@ -120,6 +120,7 @@ static bool dcp_peer_start_second(struct apple_dcp *owner,
 		return true;
 	}
 	owner->swap.h17p.swap.swap_id = resp->swap_id;
+	WRITE_ONCE(owner->started_swap_id, resp->swap_id);
 	dcp_swap_start(peer, false, &req, dcp_peer_started, owner);
 	return true;
 }
