@@ -60,6 +60,9 @@ struct apple_dcp_typec_route {
 };
 
 int dcp_typec_phy_on(struct apple_dcp *dcp);
+#ifdef CONFIG_HIBERNATION
+bool dcp_typec_phy_release(struct apple_dcp *dcp);
+#endif
 bool dcp_is_typec_output(struct apple_dcp *dcp);
 bool dcp_is_usb4_output(struct apple_dcp *dcp);
 bool dcp_uses_t6020_tunnel_flow(struct apple_dcp *dcp);
