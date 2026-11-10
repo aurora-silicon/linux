@@ -2543,3 +2543,136 @@
 &ps_qspi {
 	status = "okay";
 };
+
+/*
+ * DisplayPort/HDMI audio, as on the M4 Pro boards (t6040-j616s-dpaudio.dtsi).
+ * The J614c's ADT has the J616s's: dcpext0's audio is dp-audio1 (SIO DMA
+ * channel 0x66) and dcpext1's is dp-audio2 (0x68), and the PMGR has UART_P
+ * (0x1a0) and DPA_P (0x1a8) under SIO, and DPA1 (0x238) and DPA2 (0x240)
+ * under DPA_P. The SIO stays disabled here: the loader enables it once it has
+ * reserved the firmware iBoot loaded (it finds it by the alias).
+ */
+&pmgr {
+	ps_uart_p: power-controller@1a0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1a0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "uart_p";
+		power-domains = <&ps_sio>;
+	};
+
+	ps_dpa_p: power-controller@1a8 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1a8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dpa_p";
+		power-domains = <&ps_sio>;
+		apple,always-on;
+	};
+
+	ps_dpa1: power-controller@238 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x238 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dpa1";
+		power-domains = <&ps_dpa_p>;
+	};
+
+	ps_dpa2: power-controller@240 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x240 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dpa2";
+		power-domains = <&ps_dpa_p>;
+	};
+};
+
+/ {
+	aliases {
+		sio = &sio;
+	};
+
+	dpaudio1: audio-controller-1 {
+		compatible = "apple,t6041-dpaudio", "apple,dpaudio";
+		dmas = <&sio 0x66>;
+		dma-names = "tx";
+		power-domains = <&ps_dpa1>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dpaudio1_dcpext: endpoint {
+					remote-endpoint = <&dcpext0_audio>;
+				};
+			};
+		};
+	};
+
+	dpaudio2: audio-controller-2 {
+		compatible = "apple,t6041-dpaudio", "apple,dpaudio";
+		dmas = <&sio 0x68>;
+		dma-names = "tx";
+		power-domains = <&ps_dpa2>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dpaudio2_dcpext: endpoint {
+					remote-endpoint = <&dcpext1_audio>;
+				};
+			};
+		};
+	};
+};
+
+&dcpext0 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dcpext0_audio: endpoint {
+				remote-endpoint = <&dpaudio1_dcpext>;
+			};
+		};
+	};
+};
+
+&dcpext1 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dcpext1_audio: endpoint {
+				remote-endpoint = <&dpaudio2_dcpext>;
+			};
+		};
+	};
+};
+
+/* The SIO firmware drives the SPI, UART and DP audio shims: keep their parents on. */
+&ps_sio_cpu {
+	power-domains = <&ps_sio>, <&ps_spi_p>, <&ps_uart_p>, <&ps_dpa_p>;
+	status = "okay";
+};
+
+&sio_dart {
+	status = "okay";
+};
+
+&sio_mbox {
+	status = "okay";
+};
