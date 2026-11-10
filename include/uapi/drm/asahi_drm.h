@@ -448,11 +448,10 @@ enum drm_asahi_feature {
 	DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS = (1UL) << 30,
 
 	/*
-	 * Bit 30 above is used by the M5 runtime's userspace; the kernel does
-	 * not report it. Bits 31 and 32 belong to the G18 (M6, T8152) backend,
-	 * which alone reports them. Bit 32 is
-	 * DRM_ASAHI_FEATURE_G18_NATIVE_TILE_SAMPLES, defined after this enum so
-	 * that the enum keeps its 32-bit type. Bit 33,
+	 * Bit 30 above is reported by the M5 command set. Bits 31 and 32
+	 * belong to the G18 (M6, T8152) backend, which alone reports them.
+	 * Bit 32 is DRM_ASAHI_FEATURE_G18_NATIVE_TILE_SAMPLES, defined after
+	 * this enum so that the enum keeps its 32-bit type. Bit 33,
 	 * DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2, is defined there too.
 	 */
 

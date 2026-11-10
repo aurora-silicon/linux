@@ -1017,6 +1017,7 @@ impl power::Control for Firmware {
 /// Every feature the M5 command set reports. GET_PARAMS leaves out the MSAA compression
 /// and mesh storage bits while those paths are off.
 const M5_FEATURES: u64 = (uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE_RESOURCES
+    | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS
     | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_RESOURCES
     | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2) as u64
     | crate::file::DRM_ASAHI_FEATURE_SPARSE_TILES
