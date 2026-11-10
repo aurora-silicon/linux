@@ -617,6 +617,8 @@ pub(crate) struct Queue {
     retirement_proved: bool,
     source_readers: Arc<core::sync::atomic::AtomicU32>,
     source_hint: crate::g17::sync_input::ReaderHint,
+    /// This queue uses the identified 25G83 graph and may take the test arm.
+    per_record_25g83: bool,
 }
 
 impl Queue {
@@ -631,6 +633,7 @@ impl Queue {
         pointers: PointerLayout,
         operand_state: &'static OperandState,
         program: ComputeProgram,
+        per_record_25g83: bool,
     ) -> Result<Self> {
         let Backing { mut pool, mut kick } = backing;
         let (active, replays) = (Fifo::new()?, Fifo::new()?);
@@ -688,6 +691,7 @@ impl Queue {
             retirement_proved: false,
             source_readers: Arc::new(core::sync::atomic::AtomicU32::new(0), GFP_KERNEL)?,
             source_hint: crate::g17::sync_input::ReaderHint::new(),
+            per_record_25g83,
         })
     }
     /// The firmware failed the command whose completion stamp is `stamp`. It writes a
@@ -2372,6 +2376,10 @@ impl Queue {
         let announce =
             KickAnnounce::new(qid, DataMaster::Compute, kick_timestamp, policy.priority())?;
         let predecessor = KickPredecessor::new(qid, kick_parent)?;
+        let event_mask = crate::g17::fw::kick::g16_compute_event_mask(
+            COMPUTE_KICK_EVENT_MASK, args.context_id.try_into()?, policy.priority(), entry_signal,
+            self.per_record_25g83 && crate::g16::params::per_record_compute(),
+        );
         let kick_args = KickArgs {
             qid,
             timestamp: kick_timestamp,
@@ -2384,7 +2392,7 @@ impl Queue {
                 class: COMPUTE_QOS_CLASS,
             },
             mcache: None,
-            event_mask: COMPUTE_KICK_EVENT_MASK,
+            event_mask,
             register_arrays: ComputeDescriptor::register_bindings(descriptor_low, *scratch, self.graph.program)?,
             scs_enabled: scratch.enabled(),
             priority: policy.priority(),

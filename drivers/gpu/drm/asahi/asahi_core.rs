@@ -236,5 +236,9 @@ module! {
             default: 1,
             description: "G16: validate CDM/VDM stream records",
         },
+        g16_per_record_arm: u32 {
+            default: 0,
+            description: "G16 25G83 per-record test: compute (1), render (2), both (3)",
+        },
     },
 }
