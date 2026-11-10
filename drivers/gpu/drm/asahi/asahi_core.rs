@@ -256,5 +256,9 @@ module! {
             default: 1,
             description: "G16: validate CDM/VDM stream records",
         },
+        g17_retire_failed_compute: u32 {
+            default: 0,
+            description: "G17 25G83: retain compute QIDs that crossed a failure or recovery instead of reusing their firmware state (experimental)",
+        },
     },
 }
