@@ -10,3 +10,4 @@
 #define ENOMEM 12
 #define EOVERFLOW 75
 #define EOPNOTSUPP 95
+#define ENODATA 61

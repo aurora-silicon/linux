@@ -2313,9 +2313,19 @@ int dcp_get_modes(struct drm_connector *connector)
 			 */
 			if (PTR_ERR(edid) == -ENODEV)
 				dev_dbg(dcp->dev, "no EDID source\n");
+			/*
+			 * After resume the firmware publishes the AV service
+			 * before its link to the sink is back, and answers a
+			 * read then without data; probe again once it has read
+			 * the sink.
+			 */
+			else if (PTR_ERR(edid) == -ENODATA &&
+				 dcpavserv_edid_retry(dcp, service_epoch))
+				dev_dbg(dcp->dev, "sink EDID not read yet, probing again\n");
 			else
 				dev_warn(dcp->dev, "copy_edid failed: %pe\n", edid);
 		} else {
+			dcpavserv_edid_retry_reset(dcp);
 			drm_edid_free(apple_connector->drm_edid);
 			apple_connector->drm_edid = edid;
 			apple_connector->drm_edid_generation = edid_generation;

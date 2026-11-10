@@ -6124,6 +6124,9 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	spin_lock_init(&dcp->metadata.lock);
 	mutex_init(&dcp->dcpavserv.lock);
 	INIT_WORK(&dcp->dcpavserv.close_wq, dcpavserv_close_work);
+	ret = dcpavserv_edid_retry_init(dcp);
+	if (ret)
+		return ret;
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
 	/* The display such a processor finds at boot is its first sink. */
 	if (dcp_sink_metadata(dcp))
