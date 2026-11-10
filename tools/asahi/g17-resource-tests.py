@@ -440,10 +440,53 @@ fn main() {
     subprocess.run([os.environ.get('RUSTC','rustc'),'--edition=2021',str(fixture),'-o',str(root/'shared-alias-controls')],check=True)
     subprocess.run([str(root/'shared-alias-controls')],check=True)
 
+def segmented_free_list_tests(root, source):
+    # Free-list tables name every block by address: blocks need not be adjacent
+    # to the tables or to each other, and unrepresentable addresses are refused.
+    s=(source/'g17/fw/freelist.rs').read_text()
+    layout=s[s.index('#[derive(Copy, Clone, Debug)]\npub(crate) enum RunLayout'):s.index('#[repr(C)]\npub(crate) struct PoolTables')]
+    at=s.index('    pub(crate) fn fits(');tables=s[at:s.index('    /// Initializes a zeroed table',at)]
+    fixture=root/'segmented-free-list-controls.rs'
+    fixture.write_text('''#![allow(dead_code)]
+type Result<T=()> = std::result::Result<T,i32>;
+const EINVAL:i32=-22;const EOVERFLOW:i32=-75;
+const PAGE_LIST_SIZE:usize=0x20_0000;const RUN_LIST_SIZE:usize=0x1_0000;
+const FREE_LIST_BLOCK_PAGES:u32=0x100;const FREE_LIST_BLOCK_SIZE:usize=0x10_0000;
+const MASK:u64=0x0000_ffff_ffff_f000;
+struct FreeListRunSlot {run:u64}
+impl FreeListRunSlot {fn checked(va:u64)->Result<Self>{if va&!MASK!=0{return Err(EINVAL)}Ok(Self{run:va|(256<<52)})}}
+type FreeListRunSlotSized=[u8;0x40];
+'''+layout.replace('size_of::<FreeListRunSlot>()','std::mem::size_of::<FreeListRunSlotSized>()')+'''
+struct PoolTables;
+impl PoolTables {
+'''+tables+'''
+}
+fn words(blocks:usize,addr:impl Fn(usize)->u64)->Result<Vec<(usize,u64)>>{let mut v=Vec::new();PoolTables::for_each_word(blocks,addr,RunLayout::Render,|i,w|v.push((i,w)))?;Ok(v)}
+fn main(){
+ // Scattered, unordered blocks with gaps: each run and page entry names its own block.
+ let a=[0x70_7000_0000u64,0x70_0400_0000,0x70_5555_4000];
+ let v=words(3,|i|a[i]).unwrap();
+ for (b,addr) in a.iter().enumerate(){
+  let run=v.iter().find(|(i,_)|*i==PAGE_LIST_SIZE/8+b*8).unwrap().1; assert_eq!(run&MASK,*addr);
+  for page in [0usize,1,255]{let e=v.iter().find(|(i,_)|*i==b*256+page).unwrap().1; assert_eq!(e,addr+(page as u64)*0x1000);}
+ }
+ assert_eq!(v.len(),3*(1+256));
+ assert_eq!(words(1,|_|0x70_0400_0800).unwrap_err(),EINVAL,"an unaligned block is refused");
+ assert_eq!(words(1,|_|1u64<<48).unwrap_err(),EINVAL,"an address beyond the run field is refused");
+ assert_eq!(words(1,|_|u64::MAX-0x1000+1).unwrap_err(),EOVERFLOW,"a block may not wrap");
+ assert!(PoolTables::fits(1024,RunLayout::Render)&&!PoolTables::fits(1025,RunLayout::Render));
+ assert_eq!(words(1025,|i|0x70_0400_0000+(i as u64)*0x10_0000).unwrap_err(),EINVAL);
+ println!("segmented free lists: scattered blocks, alignment, field width, wrap and capacity controls pass");
+}
+''')
+    subprocess.run([os.environ.get('RUSTC','rustc'),'--edition=2021',str(fixture),'-o',str(root/'segmented-free-list-controls')],check=True)
+    subprocess.run([str(root/'segmented-free-list-controls')],check=True)
+
 if __name__ == '__main__':
     with tempfile.TemporaryDirectory(prefix='asahi-resource-tests-') as temporary:
         admission_tests(Path(temporary), DRIVER)
         queue_tests(Path(temporary), DRIVER)
         lower_window_gate_tests(Path(temporary), DRIVER)
+        segmented_free_list_tests(Path(temporary), DRIVER)
         watchdog_publication_guard_tests(DRIVER)
         shared_alias_tests(Path(temporary), DRIVER)
