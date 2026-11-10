@@ -31,6 +31,7 @@ pub(super) struct Grow {
     release_attempts: u16,
     /// Channel errors not yet consumed by the firmware, oldest first.
     pub(super) acks: KVec<ChannelAck>,
+    ack_attempts: u16,
 }
 impl Grow {
     pub(super) fn new() -> Result<Self> {
@@ -40,6 +41,7 @@ impl Grow {
             reply: None,
             release_attempts: 0,
             acks: KVec::new(),
+            ack_attempts: 0,
         })
     }
 }
@@ -224,6 +226,9 @@ impl crate::g17::Firmware {
                 self.mark_channel_error(qid, false);
             }
         }
+        if self.queues.render.grow.acks.is_empty() {
+            self.queues.render.grow.ack_attempts = 0;
+        }
         Ok(!full)
     }
     pub(in crate::g17) fn complete_freelist_grow(&mut self, event: FreeListCompletion) -> Result {
@@ -272,6 +277,8 @@ impl crate::g17::Firmware {
         let render = &mut self.queues.render;
         let attempts = if let Some((_, _, attempts)) = render.grow.reply.as_mut() {
             attempts
+        } else if !render.grow.acks.is_empty() {
+            &mut render.grow.ack_attempts
         } else if render.pools.pending() {
             &mut render.grow.release_attempts
         } else {
