@@ -235,6 +235,8 @@ static int ave_start_surfaces_6070(struct ave_session *sess, u8 *cmd,
 	const struct ave_start_layout *l = &fw->start[p->codec - 1];
 	bool hevc = p->codec == AVE_CODEC_HEVC;
 	unsigned int tiles = hevc ? 4 : AVE_6070_AVC_ENTROPY_TILES;
+	struct ave_6070_avc_recon_layout recon =
+		ave_6070_avc_recon_layout(p->width, p->height);
 	int ret = ave_start_validate_6070(sess);
 
 	if (ret)
@@ -247,8 +249,13 @@ static int ave_start_surfaces_6070(struct ave_session *sess, u8 *cmd,
 		    sess->param_sets.size);
 
 	for (unsigned int i = 0; i < p->refs; i++) {
-		ave_write_address_bank(cmd, &l->recon, i, sess->ref_a[i].dma,
-				       sess->ref_a[i].dma + sess->ref_a[i].size);
+		if (!hevc && p->bit_depth == 8)
+			ave_write_address_bank(cmd, &l->recon, i,
+					       sess->ref_a[i].dma + recon.luma_data_offset,
+					       sess->ref_a[i].dma + recon.luma_metadata_offset);
+		else
+			ave_write_address_bank(cmd, &l->recon, i, sess->ref_a[i].dma,
+					       sess->ref_a[i].dma + sess->ref_a[i].size);
 		ave_write_address_bank(cmd, &l->colocated, i,
 				       sess->ref_b[i].dma, 0);
 		ave_write_address_bank(cmd, &l->lfs, i, sess->ref_c[i].dma, 0);
@@ -303,6 +310,18 @@ static int ave_start_surfaces_6070(struct ave_session *sess, u8 *cmd,
 				    &sess->hevc_extra[i], sess->hevc_extra[i].size);
 		}
 	return 0;
+}
+
+static void ave_write_recon_selection(u8 *cmd,
+				      const struct ave_recon_selection_layout *wire,
+				      const struct ave_buf *buf,
+				      const struct ave_6070_avc_recon_layout *layout)
+{
+	ave_put64(cmd, wire->luma_data, buf->dma + layout->luma_data_offset);
+	ave_put64(cmd, wire->luma_metadata, buf->dma + layout->luma_metadata_offset);
+	ave_put64(cmd, wire->chroma_data, buf->dma + layout->chroma_data_offset);
+	ave_put64(cmd, wire->chroma_metadata,
+		  buf->dma + layout->chroma_metadata_offset);
 }
 
 static int ave_start_surfaces(struct ave_session *sess, u8 *cmd,
@@ -733,6 +752,8 @@ int ave_build_process(struct ave_ctx *ctx, u8 *cmd, size_t len,
 	const struct ave_fw_layout *fw = ctx->ave->layout;
 	const struct ave_proc_layout *l = &fw->process[p->codec - 1];
 	struct ave_slot *s;
+	struct ave_6070_avc_recon_layout recon;
+	unsigned int current_ref, list0_ref;
 	dma_addr_t y = input;
 	u64 pts;
 
@@ -761,6 +782,27 @@ int ave_build_process(struct ave_ctx *ctx, u8 *cmd, size_t len,
 			       sess->codec_state + part->state_offset, part->bytes);
 		}
 		ave_put32(cmd, l->pic_size, 0xf68);
+		if (p->codec == AVE_CODEC_H264 && p->bit_depth == 8 &&
+		    !p->bframes) {
+			recon = ave_6070_avc_recon_layout(p->width, p->height);
+			current_ref = sess->frames % p->refs;
+			ave_write_recon_selection(cmd, &l->current_recon,
+						  &sess->ref_a[current_ref], &recon);
+			ave_put64(cmd, l->current_colocated,
+				  sess->ref_b[current_ref].dma);
+			ave_put64(cmd, l->current_lowres,
+				  sess->ref_c[current_ref].dma);
+			for (unsigned int i = 0; i < AVE_6070_LOWRES_RESULTS; i++)
+				ave_put64(cmd, l->lowres_results + i * sizeof(u64),
+					  sess->ref_d[i].dma);
+			if (sess->frames) {
+				list0_ref = (sess->frames - 1) % p->refs;
+				ave_write_recon_selection(cmd, &l->list0_recon,
+							  &sess->ref_a[list0_ref], &recon);
+				ave_put64(cmd, l->list0_lowres,
+					  sess->ref_c[list0_ref].dma);
+			}
+		}
 	}
 	ave_write_header(ctx, cmd, AVE_OP_PROCESS, fw->process_subtype + slot,
 			 0, ave_session_arg2(ctx));
@@ -834,13 +876,15 @@ int ave_build_process(struct ave_ctx *ctx, u8 *cmd, size_t len,
 	if (l->frame_size)
 		ave_put32(cmd, l->frame_size,
 			  p->rc_mode == 3 ? 0 : s->aux.size);
-	if (l->frame_buf)
+	if (l->frame_buf && fw->kind != AVE_LAYOUT_6070)
 		ave_put64(cmd, l->frame_buf,
 			  fw->counted && p->rc_mode == 3 ? 0 : s->aux.dma);
 	if (l->shdr_table)
 		for (unsigned int i = 0; i < AVE_PROC_SHDR_ENTRIES; i++)
 			ave_put64(cmd, l->shdr_table + 8 * i,
 				  s->aux.dma + i * AVE_PROC_SHDR_STRIDE);
+	if (l->lrme_stats)
+		ave_put64(cmd, l->lrme_stats, s->aux.dma);
 	ave_put32(cmd, l->ordinal, sess->frames);
 	pts = mul_u64_u64_div_u64((u64)sess->frames * p->fps_den,
 				  AVE_PROC_TIMESCALE, p->fps_num);
