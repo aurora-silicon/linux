@@ -7,6 +7,8 @@
 #include <net/cfg80211.h>
 
 #define MT7932_AWDL_BSS_INDEX		1
+/* The managed interface owns own-MAC slot 0 for its entire lifetime. */
+#define MT7932_AWDL_OWN_MAC_INDEX		1
 #define MT7932_AWDL_NETWORK_TYPE	5
 #define MT7932_AWDL_BSS_RECORD_LEN	116
 #define MT7932_AWDL_STA_RECORD_LEN	200

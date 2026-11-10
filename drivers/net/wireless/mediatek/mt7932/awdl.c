@@ -116,7 +116,11 @@ int mt7932_awdl_build_bss_active(u8 out[12], const u8 *mac, u8 bmc_wtbl,
 	out[0] = MT7932_AWDL_BSS_INDEX;
 	out[1] = active;
 	out[2] = MT7932_AWDL_NETWORK_TYPE;
-	out[3] = 0; /* own-MAC index, deliberately not the BSS index */
+	/* Own-MAC slots are hardware resources, independent of BSS indices.
+	 * Reusing slot 0 replaces the managed interface's receive identity even
+	 * with AWDL sync disabled. Deactivation must use our own slot as well.
+	 */
+	out[3] = MT7932_AWDL_OWN_MAC_INDEX;
 	if (active)
 		ether_addr_copy(out + 4, mac);
 	out[10] = bmc_wtbl;
@@ -830,7 +834,7 @@ static netdev_tx_t mt_awdl_xmit(struct sk_buff *skb, struct net_device *netdev)
 	ret = length < 0 ? length :
 		mt7932_data_header(header, payload, length,
 				   m->data_payloads_dma + 4096 * slot, slot,
-				   wtbl, 0, 0, false);
+				   wtbl, MT7932_AWDL_OWN_MAC_INDEX, 0, false);
 	if (ret) {
 		spin_unlock_irqrestore(&m->data_lock, flags);
 		goto drop;
