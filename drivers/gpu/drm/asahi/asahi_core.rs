@@ -30,6 +30,7 @@ mod gpu;
 mod hw;
 mod initdata;
 mod m3;
+mod legacy_rx;
 mod mem;
 mod memacct;
 mod microseq;
@@ -90,6 +91,7 @@ struct DriverModule {
     _g18: kernel::driver::Registration<kernel::platform::Adapter<g18::probe::Driver>>,
     #[pin]
     _driver: kernel::driver::Registration<kernel::platform::Adapter<driver::AsahiPlatformDriver>>,
+    _legacy_rx: legacy_rx::QueueOwner,
     _cleanup: cleanup::QueueOwner,
     #[cfg(CONFIG_DRM_ASAHI_G15)]
     _g15_ready: (),
@@ -104,6 +106,7 @@ impl kernel::InPlaceModule for DriverModule {
         try_pin_init!(Self {
             // Initialize the queue first, before registration can invoke probe.
             _cleanup: cleanup::QueueOwner::new()?,
+            _legacy_rx: legacy_rx::QueueOwner::new()?,
             #[cfg(CONFIG_DRM_ASAHI_G15)]
             _g15 <- kernel::driver::Registration::new(c"aurora-g15", module),
             _driver <- kernel::driver::Registration::new(
@@ -166,6 +169,18 @@ module! {
             default: 0,
             // permissions: 0o644,
             description: "Fully isolate GPU contexts (limits performance)",
+        },
+        legacy_inline_submit: u32 {
+            default: 0,
+            description: "G13/G14: publish ready in-order jobs from SUBMIT (experimental)",
+        },
+        legacy_rx_fastpath: u32 {
+            default: 0,
+            description: "G13/G14: bypass the generic RTKit receive worker (experimental)",
+        },
+        legacy_rx_util_min: u32 {
+            default: 512,
+            description: "G13/G14: GPU event-drain utilization minimum (0..1024)",
         },
         g15_deadline_ms: u32 {
             default: 5000,
