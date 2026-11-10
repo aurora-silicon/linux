@@ -679,7 +679,8 @@ static void apple_clpc_gpu_floor_count(struct apple_clpc *clpc, bool released)
 
 /*
  * The GPU driver's input, where it drives demand instead of the GFX power
- * state: every rail at its top state while the driver reports work.
+ * state: every rail at the top of @map, or at @gpu where that is higher,
+ * while the driver reports work.
  */
 static bool apple_clpc_gpu_input_demand(const struct apple_clpc_hw *hw,
 					struct apple_clpc_gpu *gpu,
@@ -692,7 +693,8 @@ static bool apple_clpc_gpu_input_demand(const struct apple_clpc_hw *hw,
 	    !apple_clpc_gpu_active(gpu, &updated, &sequence))
 		return false;
 	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
-		demand[rail] = max(demand[rail], hw->map[rail][APPLE_CLPC_LEVELS - 1]);
+		demand[rail] = max(demand[rail],
+				   max(hw->map[rail][APPLE_CLPC_LEVELS - 1], hw->gpu[rail]));
 	return true;
 }
 
@@ -1675,16 +1677,19 @@ static const struct apple_clpc_hw apple_clpc_hw_t8152 = {
  * The boot loader enables no agent on either rail, so without this floor
  * the DRAM controller and the fabric stay at state 0: CPU memcpy caps at
  * about 34 GB/s on the M5 Pro. A busy cluster in the upper half of its range
- * asks for the top states; three busy samples in a row (12 ms) are needed,
- * as on T6040. The GPU driver reports its work in flight and gets the top
- * of the map while it has some.
+ * asks for DCS 5 and fabric 2, the floor macOS's CLPC holds through an
+ * 18-thread CPU loop (J714sAP, 26A428: 0x25 on its voter 99% of the time);
+ * three busy samples in a row (12 ms) are needed, as on T6040. The GPU driver
+ * reports its work in flight and gets both top states, DCS 6 and fabric 3,
+ * while it has some: bandwidth-bound GPU work runs about 11% slower at DCS 5.
  */
 static const struct apple_clpc_hw apple_clpc_hw_t6050 = {
 	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
 	.map = {
-		[APPLE_CLPC_DCS] = { 2, 4, 6, 6 },
-		[APPLE_CLPC_SOC] = { 1, 2, 3, 3 },
+		[APPLE_CLPC_DCS] = { 2, 4, 5, 5 },
+		[APPLE_CLPC_SOC] = { 1, 2, 2, 2 },
 	},
+	.gpu = { [APPLE_CLPC_DCS] = 6, [APPLE_CLPC_SOC] = 3 },
 	.sustain = 3,
 	.gpu_input = true,
 };
