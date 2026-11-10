@@ -666,6 +666,9 @@ pub(crate) struct Queue {
     /// The stamp of the newest command the firmware reported failed ([`Self::note_fault`]),
     /// while it is newer than the stored stamp.
     fault_stamp: Option<u32>,
+    /// A channel error of this queue waits for the firmware to consume its acknowledgement: the
+    /// queue keeps its owner and backing until then.
+    channel_error: bool,
     /// Prepared packets of the bound owner about to publish (see [`Self::claim`]).
     claims: u32,
     last_published: u64,
@@ -745,6 +748,7 @@ impl Queue {
             ordinal: 0,
             submitted: 0,
             fault_stamp: None,
+            channel_error: false,
             claims: 0,
             last_published: 0,
             last_end: 0,
@@ -818,6 +822,13 @@ impl Queue {
 
     pub(crate) fn qid(&self) -> u8 {
         self.kick.id().qid()
+    }
+    /// The queue record the firmware runs this queue from.
+    pub(crate) fn queue_record_va(&self) -> u64 {
+        self.graph.graph.gpu_va()
+    }
+    pub(crate) fn set_channel_error(&mut self, pending: bool) {
+        self.channel_error = pending;
     }
     pub(crate) fn owner(&self) -> Option<u64> {
         self.owner
@@ -1738,7 +1749,7 @@ impl Queue {
         Ok(true)
     }
     pub(crate) fn reusable(&self) -> bool {
-        if self.growing {
+        if self.growing || self.channel_error {
             return false;
         }
         self.installed
