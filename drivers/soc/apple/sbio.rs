@@ -4776,33 +4776,60 @@ impl SepData {
         }
     }
 
-    pub(crate) fn register_bio(&self) -> Result<()> {
-        let mut guard = self.bio_dev.lock();
-        if guard.is_some() {
-            return Ok(());
+    /// Publishes a chardev into `slot` (`bio_dev`, `rearm_dev`, `key_dev`).
+    ///
+    /// The slot's lock is not held across `misc_register()`. `misc_open()`
+    /// calls the shim's open under `misc_mtx`, the shim runs every callback
+    /// under its per-device lock, and the release and ioctl callbacks take the
+    /// slot lock to wake pollers. Holding the slot lock while registering
+    /// would close the cycle slot -> `misc_mtx` -> device lock -> slot.
+    ///
+    /// Only the settle work registers. A device that lost the slot, or that
+    /// came up after `remove()` emptied the slots, is dropped (unregistered)
+    /// again, outside the slot lock. Returns whether `dev` was published.
+    pub(crate) fn publish_chardev(
+        &self,
+        slot: &Mutex<Option<shim::BioChardev>>,
+        register: impl FnOnce() -> Result<shim::BioChardev>,
+    ) -> Result<bool> {
+        if slot.lock().is_some() {
+            return Ok(false);
         }
+        let dev = register()?;
+        let mut guard = slot.lock();
+        if guard.is_some() || self.shutting_down.load(Relaxed) {
+            drop(guard);
+            drop(dev);
+            return Ok(false);
+        }
+        *guard = Some(dev);
+        Ok(true)
+    }
 
+    pub(crate) fn register_bio(&self) -> Result<()> {
         let ctx = core::ptr::from_ref(self).cast_mut().cast::<c_void>();
 
-        // SAFETY: `ctx` is this `SepData`, kept alive by the `Arc` in the
-        // driver's private data. `remove()` drops the registration before that
-        // `Arc` can go, and the shim's unregister clears its stored context
-        // under the same lock every callback takes, so once it returns, no
-        // callback can observe this pointer again.
-        let dev = unsafe {
-            shim::BioChardev::register(
-                bio::DEVICE_NAME,
-                bio::DEVICE_MODE,
-                ctx,
-                bio_open_trampoline,
-                bio_release_trampoline,
-                bio_ioctl_trampoline,
-                bio_ready_trampoline,
-            )
-        }?;
-
-        *guard = Some(dev);
-        diag::bio_published();
+        let published = self.publish_chardev(&self.bio_dev, || {
+            // SAFETY: `ctx` is this `SepData`, kept alive by the `Arc` in the
+            // driver's private data. `remove()` drops the registration before that
+            // `Arc` can go, and the shim's unregister clears its stored context
+            // under the same lock every callback takes, so once it returns, no
+            // callback can observe this pointer again.
+            unsafe {
+                shim::BioChardev::register(
+                    bio::DEVICE_NAME,
+                    bio::DEVICE_MODE,
+                    ctx,
+                    bio_open_trampoline,
+                    bio_release_trampoline,
+                    bio_ioctl_trampoline,
+                    bio_ready_trampoline,
+                )
+            }
+        })?;
+        if published {
+            diag::bio_published();
+        }
         Ok(())
     }
 
@@ -5167,26 +5194,23 @@ impl SepData {
     }
 
     pub(crate) fn register_rearm(&self) -> Result<()> {
-        let mut guard = self.rearm_dev.lock();
-        if guard.is_some() {
-            return Ok(());
-        }
         let ctx = core::ptr::from_ref(self).cast_mut().cast::<c_void>();
-        // SAFETY: as in `register_bio`: `remove()` drops the registration
-        // before the `Arc` that keeps `ctx` alive, and the shim's unregister
-        // clears the stored context under the lock every callback takes.
-        let dev = unsafe {
-            shim::BioChardev::register(
-                bio::REARM_DEVICE_NAME,
-                bio::REARM_DEVICE_MODE,
-                ctx,
-                rearm_open_trampoline,
-                rearm_release_trampoline,
-                rearm_ioctl_trampoline,
-                rearm_ready_trampoline,
-            )
-        }?;
-        *guard = Some(dev);
+        self.publish_chardev(&self.rearm_dev, || {
+            // SAFETY: as in `register_bio`: `remove()` drops the registration
+            // before the `Arc` that keeps `ctx` alive, and the shim's unregister
+            // clears the stored context under the lock every callback takes.
+            unsafe {
+                shim::BioChardev::register(
+                    bio::REARM_DEVICE_NAME,
+                    bio::REARM_DEVICE_MODE,
+                    ctx,
+                    rearm_open_trampoline,
+                    rearm_release_trampoline,
+                    rearm_ioctl_trampoline,
+                    rearm_ready_trampoline,
+                )
+            }
+        })?;
         Ok(())
     }
 

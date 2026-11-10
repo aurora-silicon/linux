@@ -496,26 +496,23 @@ mod tests {
 
 impl SepData {
     pub(crate) fn register_key(&self) -> Result<()> {
-        let mut guard = self.key_dev.lock();
-        if guard.is_some() {
-            return Ok(());
-        }
         let ctx = core::ptr::from_ref(self).cast_mut().cast::<c_void>();
-        // SAFETY: as in `register_bio`: `remove()` drops the registration
-        // before the `Arc` that keeps `ctx` alive, and the shim's unregister
-        // clears the stored context under the lock every callback takes.
-        let dev = unsafe {
-            crate::shim::BioChardev::register(
-                DEVICE_NAME,
-                DEVICE_MODE,
-                ctx,
-                key_open_trampoline,
-                key_release_trampoline,
-                key_ioctl_trampoline,
-                key_ready_trampoline,
-            )
-        }?;
-        *guard = Some(dev);
+        self.publish_chardev(&self.key_dev, || {
+            // SAFETY: as in `register_bio`: `remove()` drops the registration
+            // before the `Arc` that keeps `ctx` alive, and the shim's unregister
+            // clears the stored context under the lock every callback takes.
+            unsafe {
+                crate::shim::BioChardev::register(
+                    DEVICE_NAME,
+                    DEVICE_MODE,
+                    ctx,
+                    key_open_trampoline,
+                    key_release_trampoline,
+                    key_ioctl_trampoline,
+                    key_ready_trampoline,
+                )
+            }
+        })?;
         Ok(())
     }
 
