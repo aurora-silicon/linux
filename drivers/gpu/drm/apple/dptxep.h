@@ -70,7 +70,42 @@ struct dptx_port {
 	 */
 	bool tile_hint;
 	u8 tiles_h, tiles_v, tile_x, tile_y;
+	/*
+	 * Main-link down-spread (SSC). ssc_supported is what the PHY reports;
+	 * phy_ops.dp.ssc is the setting the next rate change applies, and
+	 * ssc_applied the one the PHY runs with. in_linkcfg is set between
+	 * WillChangeLinkConfig and DidChangeLinkConfig.
+	 */
+	bool ssc_supported, ssc_applied, in_linkcfg;
 };
+
+/*
+ * Native (AFK v2) GetSupportsDownspread: 48 bytes. The request carries a
+ * capability qualifier in its first byte; the reply carries the method
+ * status and the answer in their own fields, the rest as received.
+ */
+struct dptxport_apcall_supports_downspread_v2 {
+	u8 qualifier;
+	u8 rsvd0[15];
+	__le32 status;
+	u8 rsvd1[12];
+	u8 supported;
+	u8 rsvd2[15];
+} __packed;
+static_assert(sizeof(struct dptxport_apcall_supports_downspread_v2) == 48);
+
+/*
+ * Native GetDownspread / SetDownspread: 32 bytes. SetDownspread carries the
+ * requested state in the 64-bit slot; both replies carry the status first,
+ * and the state the link runs with in the same slot.
+ */
+struct dptxport_apcall_downspread_v2 {
+	__le32 status;
+	u8 rsvd0[12];
+	__le64 enabled;
+	u8 rsvd1[8];
+} __packed;
+static_assert(sizeof(struct dptxport_apcall_downspread_v2) == 32);
 
 int dptxport_validate_connection(struct apple_epic_service *service, u8 core,
 				 u8 atc, u8 die);

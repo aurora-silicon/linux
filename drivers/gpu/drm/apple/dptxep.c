@@ -621,6 +621,8 @@ static int dptxport_call_set_link_rate(struct apple_epic_service *service,
 			ret = phy_configure(dptx->atcphy, &dptx->phy_ops);
 			if (ret)
 				return ret;
+			/* The rate change applied the requested down-spread too. */
+			dptx->ssc_applied = dptx->phy_ops.dp.ssc;
 		}
 
 		changed = dptx->link_rate != link_rate;
@@ -850,6 +852,7 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 
 	switch (idx) {
 	case DPTX_APCALL_WILL_CHANGE_LINKG_CONFIG:
+		dptx->in_linkcfg = true;
 		/* A re-link takes an established tunnel's crossbar down first. */
 		if (service->ep->dcp->dptx_tunnel && dptx->link_rate)
 			dcp_tunnel_crossbar_down(service->ep->dcp, dptx->unit);
@@ -858,6 +861,8 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 		return dptxport_call_will_change_link_config(service);
 	case DPTX_APCALL_DID_CHANGE_LINK_CONFIG: {
 		int ret = dptxport_call_did_change_link_config(service);
+
+		dptx->in_linkcfg = false;
 
 		if (!ret && service->ep->dcp->dptx_tunnel && dptx->link_rate) {
 			int xret = dcp_tunnel_crossbar_up(service->ep->dcp, dptx->unit);
@@ -1040,6 +1045,97 @@ static void dptxport_init(struct apple_epic_service *service, const char *name,
 				 &service->ep->dcp->typec_reconnect_wq, 0);
 }
 
+/*
+ * Native down-spread calls. Support is what the PHY reports for this route;
+ * a set is applied to the PHY at the current rate (or kept for the next
+ * rate change) and only a successful one is published. The firmware times
+ * the audio stream by the negotiated down-spread, so these answer with the
+ * PHY's real state, not an echo.
+ */
+static bool dptxport_ssc_route(struct apple_epic_service *service)
+{
+	struct dptx_port *dptx = service->cookie;
+	struct apple_dcp *dcp = service->ep->dcp;
+	union phy_configure_opts opts = {};
+
+	if (!dptx->atcphy || dcp->dptx_tunnel || dcp_is_usb4_output(dcp))
+		return false;
+	if (phy_validate(dptx->atcphy, PHY_MODE_DP, 0, &opts))
+		return false;
+	return opts.dp.ssc;
+}
+
+static int dptxport_v2_set_downspread(struct apple_epic_service *service, bool want)
+{
+	struct dptx_port *dptx = service->cookie;
+	struct apple_dcp *dcp = service->ep->dcp;
+	bool was = dptx->phy_ops.dp.ssc;
+	int ret = 0;
+
+	if (want && !dptx->ssc_supported)
+		return -EOPNOTSUPP;
+	dptx->phy_ops.dp.ssc = want;
+	/* Without a rate yet, the next SetLinkRate applies it. */
+	if (!dptx->link_rate || !dptx->atcphy) {
+		dptx->ssc_applied = false;
+		return 0;
+	}
+	if (want != dptx->ssc_applied) {
+		/* As for a rate change: no clocked crossbar output across it. */
+		if (!dptx->in_linkcfg)
+			dcp_direct_crossbar_link(dcp, false);
+		dptx->phy_ops.dp.set_rate = 1;
+		ret = phy_configure(dptx->atcphy, &dptx->phy_ops);
+		if (ret)
+			dptx->phy_ops.dp.ssc = was;
+		if (!dptx->in_linkcfg)
+			dcp_direct_crossbar_link(dcp, true);
+	}
+	if (!ret)
+		dptx->ssc_applied = want;
+	return ret;
+}
+
+static int dptxport_v2_downspread(struct apple_epic_service *service, u32 command,
+				  const void *data, size_t size, void *reply, size_t room)
+{
+	struct dptx_port *dptx = service->cookie;
+	struct apple_dcp *dcp = service->ep->dcp;
+	struct dptxport_apcall_downspread_v2 *r = reply;
+	const struct dptxport_apcall_downspread_v2 *q = data;
+	int ret;
+
+	if (command == DPTX_APCALL_GET_SUPPORTS_DOWN_SPREAD) {
+		struct dptxport_apcall_supports_downspread_v2 *s = reply;
+
+		if (size < sizeof(*s) || room < sizeof(*s))
+			return -EINVAL;
+		memcpy(s, data, sizeof(*s));
+		dptx->ssc_supported = dptxport_ssc_route(service);
+		s->status = cpu_to_le32(0);
+		s->supported = dptx->ssc_supported;
+		dev_dbg(dcp->dev, "DPTXPort: down-spread supported: %d\n", dptx->ssc_supported);
+		return 0;
+	}
+
+	if (size < sizeof(*q) || room < sizeof(*r))
+		return -EINVAL;
+	if (command == DPTX_APCALL_SET_DOWN_SPREAD) {
+		bool want = !!le64_to_cpu(q->enabled);
+
+		ret = dptxport_v2_set_downspread(service, want);
+		memcpy(r, data, sizeof(*r));
+		r->status = cpu_to_le32(ret ? 1 : 0);
+		dev_dbg(dcp->dev, "DPTXPort: set down-spread %d at rate 0x%x: %d\n",
+			want, dptx->link_rate, ret);
+	} else {
+		memcpy(r, data, sizeof(*r));
+		r->status = cpu_to_le32(0);
+	}
+	r->enabled = cpu_to_le64(dptx->link_rate ? dptx->ssc_applied : dptx->phy_ops.dp.ssc);
+	return 0;
+}
+
 static int dptxport_v2_group_call(struct apple_epic_service *service, u16 group, u32 command,
 			       const void *data, size_t size, void *reply, size_t room)
 {
@@ -1059,6 +1155,10 @@ static int dptxport_v2_group_call(struct apple_epic_service *service, u16 group,
 	}
 	if (command == DPTX_APCALL_GET_DRIVE_SETTINGS)
 		return dptx_j700_training(service, false, data, size, reply, room);
+	if (command == DPTX_APCALL_GET_SUPPORTS_DOWN_SPREAD ||
+	    command == DPTX_APCALL_GET_DOWN_SPREAD ||
+	    command == DPTX_APCALL_SET_DOWN_SPREAD)
+		return dptxport_v2_downspread(service, command, data, size, reply, room);
 	return dptxport_call(service, command, data, size, reply, room);
 }
 
@@ -1405,3 +1505,7 @@ int dpav_ctrl_init(struct apple_dcp *dcp)
 		dev_info(dcp->dev, "DPAV controller did not announce a service\n");
 	return 0;
 }
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
+#include "dptxep-downspread-test.c"
+#endif
