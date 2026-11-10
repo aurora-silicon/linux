@@ -716,9 +716,12 @@
 
 /*
  * The AOP's GPIO bank. The AOP keeps interrupt groups 0-3; the AP's are 4-6
- * (AIC 384-386). No consumer requests a line yet.
+ * (AIC 384-386). No consumer requests a line yet. The reserved lines are the
+ * ones the firmware has already configured away from the bank's reset state
+ * by the time Linux boots; their users are not known, so they stay off limits.
  */
 &pinctrl_aop {
+	gpio-reserved-ranges = <18 1>, <21 1>, <27 9>, <46 2>, <50 7>;
 	interrupts = <AIC_IRQ 384 IRQ_TYPE_LEVEL_HIGH>,
 		     <AIC_IRQ 385 IRQ_TYPE_LEVEL_HIGH>,
 		     <AIC_IRQ 386 IRQ_TYPE_LEVEL_HIGH>;
@@ -728,10 +731,12 @@
 
 /*
  * The always-on GPIO bank, as on the J616s: the AP takes none of its
- * interrupts. Line 20 is the secure-repair enable and is never requested.
+ * interrupts. Line 20 is the secure-repair enable and is never requested;
+ * the other reserved lines are configured by the firmware before Linux
+ * boots (line 27 is driven high) and have no known user.
  */
 &pinctrl_nub {
-	gpio-reserved-ranges = <20 1>;
+	gpio-reserved-ranges = <5 1>, <10 1>, <20 1>, <23 1>, <27 3>;
 	status = "okay";
 	/delete-property/ interrupt-controller;
 	/delete-property/ #interrupt-cells;
