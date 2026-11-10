@@ -36,8 +36,13 @@ class Tests(unittest.TestCase):
         prefix = '''#include <stdio.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <sys/types.h>
+typedef uint64_t u64;
+typedef uint32_t u32;
 typedef int atomic_t;
+typedef int64_t atomic64_t;
+#define DECLARE_BITMAP(name, bits) unsigned long name[((bits) + 63) / 64]
 struct device { int unused; };
 struct device_attribute { int unused; };
 #define atomic_read(p) (*(p))
@@ -47,6 +52,7 @@ static int sysfs_emit(char *out, const char *fmt, ...) {
  va_list args; va_start(args, fmt); int n = vsnprintf(out, 4096, fmt, args); va_end(args); return n;
 }
 '''
+        endpoint_limit = re.search(r'^#define SEP_DIAG_MAX_EP\s+\d+', text, re.M).group(0)
         main = '''int main(void) {
  char out[4096]; sep_diag.xart = true; sep_diag.xart_guard = 1;
  sep_diag_set_policy(false, false, false, true, false, false);
@@ -60,7 +66,7 @@ static int sysfs_emit(char *out, const char *fmt, ...) {
 '''
         with tempfile.TemporaryDirectory() as tmp:
             source, program = Path(tmp) / 'policy.c', Path(tmp) / 'policy'
-            source.write_text(prefix + state + body + main)
+            source.write_text(prefix + endpoint_limit + '\n' + state + body + main)
             subprocess.run([compiler, '-std=gnu11', '-Wall', '-Wextra', '-Werror',
                             '-Wno-unused-parameter', str(source), '-o', str(program)], check=True)
             lines = subprocess.check_output([str(program)], text=True).splitlines()
