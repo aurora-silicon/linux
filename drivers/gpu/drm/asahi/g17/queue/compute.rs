@@ -371,9 +371,13 @@ impl Graph {
         self.ring = Some(ring);
         Ok(())
     }
-    fn ensure_record_slot(&self, slot: usize) -> Result {
+    /// `cursors`: this publication's snapshot (M5), else a fresh read.
+    fn ensure_record_slot(&self, slot: usize, cursors: Option<Cursors>) -> Result {
         if let Some(end) = *self.record_ends.get(slot).ok_or(EINVAL)? {
-            let cursors = self.cursors()?;
+            let cursors = match cursors {
+                Some(cursors) => cursors,
+                None => self.cursors()?,
+            };
             if !cursors.consumed(end, cursors.count)? {
                 return Err(EAGAIN);
             }
@@ -2532,6 +2536,10 @@ impl Queue {
             || dependencies
                 .iter()
                 .any(|dependency| dependency.qid() != qid);
+        // On M5 one read of the item-ring cursors serves the whole publication: the producer is
+        // the host's and only this publication moves it, and the consumer only advances, so the
+        // snapshot is conservative for the room, record-slot and reclaim checks.
+        let mut snapshot = None;
         if self.graph.m5 {
             // The configuration and its notification are the only items an M5 kick appends.
             let cursors = self.graph.cursors()?;
@@ -2545,6 +2553,7 @@ impl Queue {
             if free < 2 {
                 return Err(ENOSPC);
             }
+            snapshot = Some(cursors);
         } else {
             item_capacity(self.graph.cursors()?, entry_signal)?;
         }
@@ -2557,7 +2566,7 @@ impl Queue {
         }
         let record_slot = (self.graph.m5 || !first).then_some(self.ordinal as usize % RECORD_SLOTS);
         if let Some(slot) = record_slot {
-            self.graph.ensure_record_slot(slot)?;
+            self.graph.ensure_record_slot(slot, snapshot)?;
         }
         let timestamp_va = if self.graph.m5 {
             packet.completion.bind_m5_compute_timestamps(
@@ -2730,13 +2739,13 @@ impl Queue {
                 let cursors = self.graph.cursors()?;
                 let _ = self.graph.recycle(cursors);
             }
-            if self.graph.m5 { let cursors = self.graph.cursors()?; self.graph.recycle(cursors)?; }
+            if let Some(cursors) = snapshot { self.graph.recycle(cursors)?; }
             let config_va = if send_config {
                 Some(self.graph.record(record_slot, CONFIG, 0xc0, config)?)
             } else {
                 None
             };
-            let cursors = self.graph.cursors()?;
+            let cursors = match snapshot { Some(cursors) => cursors, None => self.graph.cursors()? };
             let mut wait_vas = KVec::with_capacity(native.len(), GFP_KERNEL)?;
             for (index, wait) in native.iter().enumerate() {
                 let record = wait.bytes(
