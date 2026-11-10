@@ -291,6 +291,7 @@ allOf:
         - nhi@1f00000
         - interrupts
         - interrupt-names
+        - apple,atc-phy
     else:
       required:
         - iommu@a80000
