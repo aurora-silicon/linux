@@ -609,6 +609,10 @@ DCP_THUNK_IN(dcp_pipe_set_476, dcpep_pipe_set_476, u32);
 DCP_THUNK_IN(dcp_unnamed_500, dcpep_unnamed_500, u32);
 #endif
 #endif
+#if DCP_FW_DESKTOP_26(DCP_FW_VER)
+/* A500 on the desktop firmware too, with the same four bytes. */
+DCP_THUNK_IN(dcp_unnamed_500, dcpep_unnamed_500, u32);
+#endif
 DCP_THUNK_INOUT(dcp_set_brightness_correction, iomfbep_set_brightness_correction, u32, u32);
 
 DCP_THUNK_VOID(dcp_first_client_open, dcpep_first_client_open);
@@ -1133,6 +1137,13 @@ static bool dcpep_map_piodma(struct apple_dcp *dcp,
 		.dva = memdesc->dva,
 	};
 #elif DCP_FW_DESKTOP_26(DCP_FW_VER)
+	/*
+	 * Tracked as on H17P: a buffer released, or a session dropped after a
+	 * resume from disk, must not leave its piodma translation behind, or
+	 * the next mapping at the same address fails with -EEXIST.
+	 */
+	memdesc->piodma_mapped = true;
+
 	/* the desktop 26.x reply echoes the buffer index too */
 	*resp = (struct DCP_FW_NAME(dcp_map_buf_resp)) {
 		.buffer = req->buffer,
@@ -1185,7 +1196,7 @@ static bool dcpep_unmap_piodma(struct apple_dcp *dcp,
 	if (!test_bit(request->buffer, dcp->memdesc_map) || !memdesc->buf ||
 	    !dcp->iommu_dom)
 		goto not_mapped;
-#if DCP_FW_H17(DCP_FW_VER)
+#if DCP_FW_H17(DCP_FW_VER) || DCP_FW_DESKTOP_26(DCP_FW_VER)
 	if (!memdesc->piodma_mapped)
 		goto not_mapped;
 #endif
@@ -1310,8 +1321,9 @@ static u8 dcpep_cb_release_mem_desc(struct apple_dcp *dcp, u32 *mem_desc_id)
 	 * the allocator.  The firmware is expected to unmap piodma first, but
 	 * if it releases a descriptor without doing so we would hand the pages
 	 * back while the DART still resolves them -- the display engine would
-	 * then read whoever owns them next.  Only the H17P map_piodma handler
-	 * sets piodma_mapped, so older firmware is unaffected.
+	 * then read whoever owns them next.  The H17P and desktop 26.x
+	 * map_piodma handlers set piodma_mapped, so older firmware is
+	 * unaffected.
 	 */
 	if (memdesc->piodma_mapped) {
 		dev_warn(dcp->dev,
@@ -2616,7 +2628,10 @@ static void dcp_s2r_run(struct apple_dcp *dcp, void *out, void *cookie)
 	}
 	}
 }
+#endif
 
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER < DCP_FW_VERSION(27, 0, 0)) || \
+	DCP_FW_DESKTOP_26(DCP_FW_VER)
 static void dcp_s2r_500_done(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	struct dcp_wait_cookie *wait = cookie;
@@ -2647,7 +2662,9 @@ int DCP_FW_NAME(iomfb_s2r_500)(struct apple_dcp *dcp)
 
 	return left ? 0 : -ETIMEDOUT;
 }
+#endif
 
+#if DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER < DCP_FW_VERSION(27, 0, 0)
 int DCP_FW_NAME(iomfb_s2r_power)(struct apple_dcp *dcp, bool on, bool named_calls, bool oob)
 {
 	struct dcp_wait_cookie *cookie;

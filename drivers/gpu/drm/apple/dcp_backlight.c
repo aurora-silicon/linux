@@ -321,6 +321,9 @@ static void dcp_backlight_kick(struct apple_dcp *dcp)
 {
 	void (*kick)(struct apple_dcp *dcp) = READ_ONCE(dcp->backlight.kick);
 
+	/* Resume from disk: the level stays pending until the new session. */
+	if (dcp_hib_gated(dcp))
+		return;
 	if (kick)
 		kick(dcp);
 }
