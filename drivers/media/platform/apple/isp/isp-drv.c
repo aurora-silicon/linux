@@ -14,6 +14,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/suspend.h>
 #include <linux/workqueue.h>
 
@@ -1493,7 +1494,8 @@ static void apple_isp_stop_resident(struct apple_isp *isp, bool sleep)
 static __maybe_unused int apple_isp_suspend(struct device *dev)
 {
 	struct apple_isp *isp = dev_get_drvdata(dev);
-	bool power_lost = isp->hw->resident_fw && pm_suspend_via_firmware();
+	/* Not in a dry run, which keeps the power: see apple_sleep_power_loss(). */
+	bool power_lost = isp->hw->resident_fw && apple_sleep_power_loss();
 
 	/* A stream that couldn't restart on the other side keeps the system up. */
 	if (power_lost && !isp->hw->fw_restart &&

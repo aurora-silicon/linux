@@ -105,9 +105,9 @@ static int hwx_segment(struct hwx_parser *p, const u8 *c, u32 length)
 	}
 	if (surface || scratch) {
 		if (file || filesz || !IS_ALIGNED(vm, SZ_16K) ||
-		    !IS_ALIGNED(size, SZ_16K) || nsects != 1 || size > SZ_256M)
+		    !IS_ALIGNED(size, SZ_16K) || nsects != 1 || size > ANE_H16_SEGMENT_MAX)
 			return -ENOEXEC;
-	} else if (!filesz || filesz > size || size > SZ_256M ||
+	} else if (!filesz || filesz > size || size > ANE_H16_SEGMENT_MAX ||
 		   !IS_ALIGNED(vm, SZ_16K) || !IS_ALIGNED(file, SZ_16K) ||
 		   hwx_file_add(p, file, filesz)) {
 		return -ENOEXEC;
@@ -178,7 +178,7 @@ static int hwx_segment(struct hwx_parser *p, const u8 *c, u32 length)
 				return -ENOEXEC;
 		} else if (kernel && hwx_name(s, "__kern_0")) {
 			dest = &p->info.kernel;
-			if (!IS_ALIGNED(section.vm, 64) || section.size > SZ_256M)
+			if (!IS_ALIGNED(section.vm, 64) || section.size > ANE_H16_SEGMENT_MAX)
 				return -ENOEXEC;
 		} else if (scratch && hwx_name(s, "__bss")) {
 			dest = &p->info.scratch;

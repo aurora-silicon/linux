@@ -315,6 +315,24 @@ static const struct ane_h16_preload_rule ane_h16_preload_25g83 = {
 	},
 };
 
+/*
+ * 26.7.1 (25G241) preload: a rebuild of the 25G83 firmware (same __DATA
+ * bytes, same patchbay records and tunables range; __TEXT differs only in
+ * build strings). Its boot values are the 26A428 ones, like 25G83.
+ */
+static const struct ane_h16_preload_rule ane_h16_preload_25g241 = {
+	.cells = ane_h16_patchbay_25g83,
+	.cell_count = ARRAY_SIZE(ane_h16_patchbay_25g83),
+	.zero_start = 0x1bc00,
+	.zero_end = 0x1c2a0,
+	.digest = {
+		0x20, 0x2b, 0x95, 0xc2, 0x62, 0x21, 0x52, 0x32,
+		0xa5, 0x44, 0x88, 0x0d, 0x10, 0x7b, 0x6b, 0xc8,
+		0x3d, 0x98, 0x51, 0x09, 0xb0, 0xaf, 0xee, 0xa8,
+		0xcb, 0xe0, 0xed, 0x4b, 0xc8, 0x9e, 0xd8, 0xe2,
+	},
+};
+
 /* 26.5.2 keeps the 25G83 DATA layout around a different resident image. */
 static const struct ane_h16_preload_rule ane_h16_preload_25f84 = {
 	.cells = ane_h16_patchbay_25g83,
@@ -370,6 +388,11 @@ static const struct ane_h16_profile ane_h16_profiles[] __maybe_unused = {
 	{
 		.identity = "H16 26.6.2 25G83",
 		.preload = &ane_h16_preload_25g83,
+		.build = &ane_h16_build_26a428,
+	},
+	{
+		.identity = "H16 26.7.1 25G241",
+		.preload = &ane_h16_preload_25g241,
 		.build = &ane_h16_build_26a428,
 	},
 	{

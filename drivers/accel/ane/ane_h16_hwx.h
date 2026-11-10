@@ -9,7 +9,8 @@
 #define ANE_H16_SURFACES 4
 #define ANE_H16_SECTIONS 8
 #define ANE_H16_REGIONS 7
-#define ANE_H16_HWX_MAX (SZ_256M + SZ_1M)
+#define ANE_H16_SEGMENT_MAX SZ_1G
+#define ANE_H16_HWX_MAX (ANE_H16_SEGMENT_MAX + SZ_1M)
 /* Mach-O CPU subtypes of the two targets that share this container form. */
 #define ANE_HWX_SUBTYPE_H16 7
 #define ANE_HWX_SUBTYPE_H17 9
