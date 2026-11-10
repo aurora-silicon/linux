@@ -559,22 +559,56 @@ allOf:
                   interrupts:
                     maxItems: 3
               else:
-                properties:
-                  reg:
-                    maxItems: 10
-                  reg-names:
-                    minItems: 3
-                    items:
-                      - const: config
-                      - const: rc
-                      - const: port0
-                      - const: port1
-                      - const: port2
-                      - const: port3
-                      - const: phy0
-                      - const: phy1
-                      - const: phy2
-                      - const: phy3
+                if:
+                  properties:
+                    compatible:
+                      contains:
+                        const: apple,t8132-pcie
+                then:
+                  properties:
+                    reg:
+                      minItems: 4
+                      maxItems: 9
+                    reg-names:
+                      oneOf:
+                        - minItems: 4
+                          items:
+                            - const: config
+                            - const: rc
+                            - const: port0
+                            - const: phy0
+                            - const: axi2af
+                            - const: cio3pll
+                            - const: clkgen
+                            - const: phy-block
+                            - const: phy-ip
+                        # A board that uses the third port lists it instead.
+                        - items:
+                            - const: config
+                            - const: rc
+                            - const: port0
+                            - const: phy0
+                            - const: port2
+                            - const: phy2
+                    interrupts:
+                      maxItems: 3
+                else:
+                  properties:
+                    reg:
+                      maxItems: 10
+                    reg-names:
+                      minItems: 3
+                      items:
+                        - const: config
+                        - const: rc
+                        - const: port0
+                        - const: port1
+                        - const: port2
+                        - const: port3
+                        - const: phy0
+                        - const: phy1
+                        - const: phy2
+                        - const: phy3
       patternProperties:
         "^pci@":
           properties:
