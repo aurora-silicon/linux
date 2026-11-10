@@ -1623,5 +1623,20 @@ impl File {
 impl Drop for File {
     fn drop(&mut self) {
         mod_pr_debug!("[File {}]: Closing...\n", self.id);
+        // The queues drop before the VMs (see the field order), and destroying a queue fails
+        // its queued work with ENOENT or ECANCELED. Nobody sees those any more: the client
+        // closed its file. Say so before any queue goes, as a VM handle closed first did.
+        // SAFETY: `drop` runs on the pinned file in place, and nothing here moves it.
+        let this = unsafe { Pin::new_unchecked(&*self) };
+        let mut index = 0;
+        while let Some((idx, vm)) = this.vms().find(index, usize::MAX) {
+            if let Some(status) = vm.borrow().vm.status() {
+                status.mark_client_closed();
+            }
+            if idx == usize::MAX {
+                break;
+            }
+            index = idx + 1;
+        }
     }
 }
