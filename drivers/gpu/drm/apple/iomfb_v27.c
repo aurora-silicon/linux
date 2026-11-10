@@ -12,6 +12,19 @@
 #include "version_utils.h"
 #include "dcp-internal.h"
 
+#define V27_GEOMETRY_START offsetof(struct dcp_swap_v27, swap_id)
+#define V27_GEOMETRY_SIZE \
+	(offsetof(struct dcp_swap_v27, reserved_158) - V27_GEOMETRY_START)
+#define H17P_GEOMETRY_START offsetof(struct dcp_swap_h17p, swap_id)
+#define H17P_TAIL_START offsetof(struct dcp_swap_submit_req_h17p, surf_iova)
+#define H17P_TAIL_SIZE \
+	(sizeof(struct dcp_swap_submit_req_h17p) - H17P_TAIL_START)
+
+static_assert(H17P_GEOMETRY_START + V27_GEOMETRY_SIZE <=
+	      sizeof(struct dcp_swap_h17p));
+static_assert(offsetof(struct dcp_swap_submit_req_v27, surf_iova) +
+	      H17P_TAIL_SIZE <= sizeof(struct dcp_swap_submit_req_v27));
+
 void iomfb_serialize_present_v27(struct dcp_swap_submit_req_v27 *wire,
 				const struct dcp_swap_submit_req_h17p *request)
 {
@@ -19,14 +32,17 @@ void iomfb_serialize_present_v27(struct dcp_swap_submit_req_v27 *wire,
 	memcpy(wire->swap.timestamp, request->swap.timestamp,
 	       sizeof(wire->swap.timestamp));
 	wire->swap.unk_38 = request->swap.unk_38;
-	/* The common geometry runs from swap_id through bg_color. */
-	memcpy(&wire->swap.swap_id, &request->swap.swap_id,
-	       offsetof(struct dcp_swap_v27, reserved_158) -
-	       offsetof(struct dcp_swap_v27, swap_id));
+	/*
+	 * The common geometry runs from swap_id through bg_color, and the
+	 * request tail from surf_iova to its end; both span several fields, so
+	 * they are copied through the records that contain them.
+	 */
+	memcpy((u8 *)&wire->swap + V27_GEOMETRY_START,
+	       (const u8 *)&request->swap + H17P_GEOMETRY_START,
+	       V27_GEOMETRY_SIZE);
 	memcpy(wire->surf, request->surf, sizeof(wire->surf));
-	memcpy(wire->surf_iova, request->surf_iova,
-	       sizeof(*request) -
-	       offsetof(struct dcp_swap_submit_req_h17p, surf_iova));
+	memcpy((u8 *)wire + offsetof(struct dcp_swap_submit_req_v27, surf_iova),
+	       (const u8 *)request + H17P_TAIL_START, H17P_TAIL_SIZE);
 }
 
 struct dcp_h17p_hotplug_request {
