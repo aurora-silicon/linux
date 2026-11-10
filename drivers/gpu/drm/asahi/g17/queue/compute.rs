@@ -2625,8 +2625,15 @@ impl Queue {
         let predecessor = KickPredecessor::new(qid, kick_parent)?;
         let matrix_ops = self.graph.m5 && *requested_matrix_ops;
         let m5_board = if self.graph.m5 { Some(self.graph.board.ok_or(EINVAL)?) } else { None };
-        let m5_args = m5_board.map(|board| {
-            let tuple = crate::g17::fw::m5::compute::kick_tuple(board);
+        // Every earlier kick of this queue has retired, so the parent has completed.
+        let parent_retired = self.active.len == 0
+            && self.replays.len == 0
+            && !self.quarantined
+            && !self.awaiting_witness;
+        let parent_class = m5_board
+            .map(|board| crate::g17::fw::m5::compute::parent_dependency(board, parent_retired));
+        let m5_args = m5_board.zip(parent_class).map(|(board, parent_class)| {
+            let tuple = crate::g17::fw::m5::compute::kick_tuple(board, parent_class);
             crate::g17::fw::m5::compute::DescriptorArgs {
             registers: crate::g17::fw::m5::compute::RegisterArgs {
                 matrix_ops,
@@ -2664,8 +2671,8 @@ impl Queue {
             crate::g17::fw::m5::compute::COMPUTE_PIPELINED_DEPENDENCY,
             crate::g17::fw::m5::compute::explicit_dependency);
             crate::g17::fw::kick::QID_MAX as usize + 1];
-        if let (Some(board), Some(parent)) = (m5_board, m5_dependency_types.get_mut(dependencies.len())) {
-            *parent = crate::g17::fw::m5::compute::parent_dependency(board, false);
+        if let (Some(class), Some(parent)) = (parent_class, m5_dependency_types.get_mut(dependencies.len())) {
+            *parent = class;
         }
         let kick_args = KickArgs {
             qid,
