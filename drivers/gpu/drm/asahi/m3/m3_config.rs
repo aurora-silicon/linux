@@ -177,6 +177,16 @@ impl Config {
         Ok(())
     }
 
+    pub(crate) fn global_table_views(&mut self, vm: &mmu::Vm) -> Result<KVec<mmu::KernelMapping>> {
+        let mut mappings = KVec::new();
+        if self.profile == super::m3_profile::Profile::Extended {
+            for index in [super::m3_init_26::GLOBAL_POOL, super::m3_init_26::GLOBAL_PARAMETERS] {
+                mappings.push(self.objects[index].map_gpu_view(vm)?, GFP_KERNEL)?;
+            }
+        }
+        Ok(mappings)
+    }
+
     pub(crate) fn root(&self) -> u64 { self.objects[storage::ROOT].va() }
     pub(crate) fn log_globals_debug(&mut self,dev:&driver::AsahiDrmDevice)->Result {
         let value=self.objects[GLOBALS].read_u32(crate::m3::m3_globals_debug::OFFSET)?;
@@ -236,6 +246,18 @@ impl Config {
         self.thermal.busy(now);
         Ok(())
     }
+    pub(crate) fn render_stats(&self) -> Result<[init::Region;2]> {
+        if self.profile==super::m3_profile::Profile::Legacy {
+            let value=self.stats_region()?;return Ok([value;2]);
+        }
+        let region=|index:usize,offset:usize| {
+            let object=&self.objects[index];
+            init::Region::new(object.va().checked_add(offset as u64).ok_or(EOVERFLOW)?,
+                object.size().checked_sub(offset).ok_or(EINVAL)?).map_err(|_|EINVAL)
+        };
+        Ok([region(UNKNOWN_C0,4)?,region(UNKNOWN_C1,8)?])
+    }
+
     pub(crate) fn stats_region(&self) -> Result<init::Region> {
         let owner = &self.objects[if self.profile == super::m3_profile::Profile::Extended {
             UNKNOWN_C3

@@ -38,7 +38,7 @@ struct CompletionView(Arc<crate::m3::m3_rtkit::EventWait>);
 impl kernel::debugfs::Writer for CompletionView {
     fn write(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
         let (us, irqs, sleeps, timers, preparations) = self.0.snapshot();
-        writeln!(f, "version=1 wait_us={} notifications={} sleeps={} timer_wakes={} cpu_preparations={}",
+        writeln!(f, "version=2 policy=adaptive wait_us={} notifications={} sleeps={} timer_wakes={} cpu_preparations={}",
                  us, irqs, sleeps, timers, preparations)
     }
 }
@@ -96,6 +96,11 @@ pub(crate) struct Backend {
 }
 
 impl Backend {
+    /// HIGH promises host publication ordering, not firmware preemption.
+    pub(crate) fn supports_high_priority(&self) -> bool {
+        self.soc.chip_id == 0x8122 && self.profile == super::m3_profile::Profile::Extended
+    }
+
     /// Admits and starts the M3 runtime on `soc` (the T8122), with the DRM device `drm` that the
     /// caller registers afterwards.
     pub(crate) fn start(
@@ -113,10 +118,12 @@ impl Backend {
             crate::m3::t8122_start::not_admitted(pdev.as_ref(), soc);
         })?;
         dev_info!(pdev.as_ref(), "M3: resource admission complete\n");
-        // An armed T8122 start supplies the values its table leaves out. An unarmed T8122
-        // needs a complete table, which it does not have: it is refused here.
-        let experiment = crate::m3::t8122_start::arm(pdev.as_ref(), soc)?;
-        if experiment.is_none() {
+        // Extended T8122 uses its dedicated initialization graph. Keep the
+        // legacy guarded-start and completeness checks for older interfaces.
+        let extended=crate::m3::t8122_start::is_t8122(soc)
+            && crate::m3::t8122_admission::loaded_profile(pdev)?==super::m3_profile::Profile::Extended;
+        let experiment = if extended {None} else {crate::m3::t8122_start::arm(pdev.as_ref(), soc)?};
+        if experiment.is_none() && !extended {
             soc.require_complete(pdev.as_ref())?;
         }
         let experiment = experiment.as_ref();
