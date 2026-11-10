@@ -183,11 +183,12 @@ static int apple_drm_fbdev_probe(struct drm_fb_helper *helper,
 		if (t8132_ext_crtc(crtc))
 			continue;
 		dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
-		if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+		if (dcp->fw_compat == DCP_FIRMWARE_H17P ||
+		    dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
 			/*
-			 * H17P applies the stored fourth byte as straight alpha,
-			 * the H17G (M5) profile too: an XRGB console with X = 0
-			 * stays black. ARGB makes fbcon write it opaque.
+			 * H17P and firmware 27 apply the stored fourth byte as
+			 * straight alpha: an XRGB console with X = 0 stays black.
+			 * ARGB makes fbcon write it opaque.
 			 */
 			sizes->surface_bpp = 32;
 			sizes->surface_depth = 32;
