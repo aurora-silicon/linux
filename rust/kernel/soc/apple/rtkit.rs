@@ -367,6 +367,15 @@ impl<T: Operations> RtKit<T> {
         to_result(unsafe { bindings::apple_rtkit_wake(self.rtk) })
     }
 
+    /// Re-initialises a stopped session so a fresh HELLO/EPMAP boot can be
+    /// accepted again (hibernation restore of a coprocessor the boot loader
+    /// cold-restarted): detaches RX, frees inherited buffers, zeroes the
+    /// endpoint bitmap, reinitialises the completions and restarts the mailbox.
+    pub fn reinit(self: Pin<&mut Self>) -> Result {
+        // SAFETY: `rtk` is valid per the type invariant.
+        to_result(unsafe { bindings::apple_rtkit_reinit(self.rtk) })
+    }
+
     /// Waits for the RTKit coprocessor to finish booting.
     pub fn boot(self: Pin<&mut Self>) -> Result {
         // SAFETY: `rtk` is valid per the type invariant.
