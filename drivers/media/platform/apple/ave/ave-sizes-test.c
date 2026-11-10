@@ -58,9 +58,14 @@ static void ave_6070_working_sizes_test(struct kunit *test)
 			0xb4000U);
 	KUNIT_EXPECT_EQ(test, ave_6070_src_neighbor_data_size(1920, false), 0x4000U);
 	KUNIT_EXPECT_EQ(test, ave_6070_src_neighbor_fw_size(1920, false), 0x4000U);
-	KUNIT_EXPECT_EQ(test, ave_6070_entropy_size(1920, 1080, false), 0x1fe000U);
-	KUNIT_EXPECT_EQ(test, ave_6070_entropy_size(1920, 1080, true), 0x23dc00U);
-	KUNIT_EXPECT_EQ(test, ave_6070_entropy_aux_size(1080), 0x480U);
+	KUNIT_EXPECT_EQ(test, ave_6070_entropy_channel_size(1920, 1080, false),
+			0x1fe000U);
+	KUNIT_EXPECT_EQ(test, ave_6070_entropy_channel_size(1920, 1080, true),
+			0x23dc00U);
+	KUNIT_EXPECT_EQ(test, ave_6070_entropy_aux_size(1920, 1080, false),
+			0x1fe000U);
+	KUNIT_EXPECT_EQ(test, ave_6070_entropy_aux_size(1920, 1080, true),
+			0x23dc00U);
 	KUNIT_EXPECT_EQ(test, ave_6070_mb_input_size(1920, 1080), 0x10000U);
 
 	/* Non-aligned dimensions exercise the formula rather than a size table. */

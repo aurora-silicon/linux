@@ -352,7 +352,7 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 	ref_d = fw6070 ? ave_6070_lowres_result_size(w, h) :
 			   ALIGN(hevc ? 64 * w32 * h32 : 128 * p->mbs, SZ_16K);
 	if (fw6070) {
-		tile = ave_6070_entropy_size(w, h, hevc);
+		tile = ave_6070_entropy_channel_size(w, h, hevc);
 		row_a = ave_6070_src_neighbor_info_size(w, h, hevc);
 		row_b = ave_6070_src_neighbor_pixel_size(w, h, hevc);
 	} else {
@@ -401,7 +401,8 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 		for (unsigned int i = 0; i < (hevc ? 4 : AVE_TILE_BUFS); i++) {
 			ave_req(r, &n, &sess->tile[set][i], tile, 0, nomap);
 			ave_req(r, &n, &sess->tile_aux[set][i],
-				fw6070 ? ave_6070_entropy_aux_size(h) : ALIGN(h, 128), 0,
+				fw6070 ? ave_6070_entropy_aux_size(w, h, hevc) :
+					 ALIGN(h, 128), 0,
 				nomap);
 		}
 	if (hevc)

@@ -80,7 +80,8 @@ static inline u32 ave_6070_src_neighbor_fw_size(u32 width, bool hevc)
 	return ALIGN(max_t(u32, raw, SZ_16K), SZ_16K);
 }
 
-static inline u32 ave_6070_entropy_size(u32 width, u32 height, bool hevc)
+/* Every channel in a 6070 entropy set has the same backing capacity. */
+static inline u32 ave_6070_entropy_channel_size(u32 width, u32 height, bool hevc)
 {
 	if (hevc)
 		return 2304 * DIV_ROUND_UP(width, 32) * DIV_ROUND_UP(height, 64);
@@ -89,9 +90,9 @@ static inline u32 ave_6070_entropy_size(u32 width, u32 height, bool hevc)
 	       max_t(u32, 8, DIV_ROUND_UP(height, 64));
 }
 
-static inline u32 ave_6070_entropy_aux_size(u32 height)
+static inline u32 ave_6070_entropy_aux_size(u32 width, u32 height, bool hevc)
 {
-	return ALIGN(height, 128);
+	return ave_6070_entropy_channel_size(width, height, hevc);
 }
 
 static inline u32 ave_6070_mb_input_size(u32 width, u32 height)
