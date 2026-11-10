@@ -447,6 +447,10 @@ static void apple_pmp_report_ready_work(struct work_struct *work)
 		unsigned int ms = rep->polls++ < PMP_REPORT_FAST_POLLS ?
 				  PMP_REPORT_POLL_MS : PMP_REPORT_POLL_SLOW_MS;
 
+		if (rep->polls == PMP_REPORT_FAST_POLLS + 1)
+			dev_warn(rep->dev, "PMP still stopped, requests %#llx held\n",
+				 rep->shadow);
+
 		queue_delayed_work(system_freezable_power_efficient_wq,
 				   &rep->ready_work, msecs_to_jiffies(ms));
 		return;
@@ -558,6 +562,90 @@ void apple_pmp_report_wake(struct device *pmp, bool lost_power)
 	}
 }
 EXPORT_SYMBOL_GPL(apple_pmp_report_wake);
+
+/*
+ * Hold requests again for a PMP that stopped behind this driver's back: on
+ * a resume from hibernation the boot loader has cold-restarted the PMP
+ * (halted, its report region reset when it starts) while the restored image
+ * still has requests handed. Requests made from now on stay in @shadow and
+ * the ready work hands all of them over once the PMP runs, as at probe.
+ * Returns whether the requests are held now. Called with @rep->lock held.
+ */
+static bool apple_pmp_report_hold_locked(struct apple_pmp_report *rep)
+{
+	if (rep->defer)
+		return true;
+	if (!rep->offsets->defer_requests || apple_pmp_report_running(rep))
+		return false;
+	rep->defer = true;
+	rep->polls = 0;
+	queue_delayed_work(system_freezable_power_efficient_wq, &rep->ready_work, 0);
+	return true;
+}
+
+static bool apple_pmp_report_handed(struct apple_pmp_report *rep)
+{
+	unsigned long flags;
+	bool handed;
+	u64 want;
+
+	spin_lock_irqsave(&rep->lock, flags);
+	handed = !rep->defer;
+	want = rep->shadow;
+	spin_unlock_irqrestore(&rep->lock, flags);
+	return handed && (readq(rep->base + rep->offsets->actual) & want) == want;
+}
+
+/**
+ * apple_pmp_report_wait_handed() - wait until every held request is acknowledged
+ * @timeout_ms: upper bound of the wait
+ *
+ * For a consumer that restarts its own firmware after a resume from
+ * hibernation and must not run it before the PMP has taken the power state
+ * requests made for it (the GPU's pmp-gfx request). Sleeps.
+ *
+ * Return: 0 once every report runs with its requests acknowledged, or
+ * -ETIMEDOUT.
+ */
+int apple_pmp_report_wait_handed(unsigned int timeout_ms)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(timeout_ms);
+	struct apple_pmp_report *rep;
+	bool done;
+
+	for (;;) {
+		done = true;
+		rcu_read_lock();
+		list_for_each_entry_rcu(rep, &apple_pmp_reports, list)
+			done &= apple_pmp_report_handed(rep);
+		rcu_read_unlock();
+		if (done)
+			return 0;
+		if (time_after(jiffies, deadline))
+			return -ETIMEDOUT;
+		msleep(10);
+	}
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_wait_handed);
+
+static int apple_pmp_report_restore_noirq(struct device *dev)
+{
+	struct apple_pmp_report *rep = dev_get_drvdata(dev);
+	unsigned long flags;
+	bool held;
+	u64 want;
+
+	if (!rep)
+		return 0;
+	spin_lock_irqsave(&rep->lock, flags);
+	held = !rep->defer && apple_pmp_report_hold_locked(rep);
+	want = rep->shadow;
+	spin_unlock_irqrestore(&rep->lock, flags);
+	if (held)
+		dev_info(dev, "PMP stopped after restore: requests %#llx held until it runs\n",
+			 want);
+	return 0;
+}
 
 /* The unique, enabled and acknowledged T6030 display request (DISP, reg 7). */
 static struct device_node *apple_pmp_report_t6030_entry(struct device_node *report)
@@ -2269,8 +2357,10 @@ static int apple_pmp_report_resume(struct device *dev)
 	return 0;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(apple_pmp_report_pm_ops, apple_pmp_report_suspend,
-				apple_pmp_report_resume);
+static const struct dev_pm_ops apple_pmp_report_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(apple_pmp_report_suspend, apple_pmp_report_resume)
+	.restore_noirq = apple_pmp_report_restore_noirq,
+};
 
 static int apple_pmp_report_probe(struct platform_device *pdev)
 {
@@ -2555,7 +2645,8 @@ static int apple_pmp_report_set_state(struct apple_pmp_report *rep, u32 id,
 		rep->shadow |= bit_val;
 	else
 		rep->shadow &= ~bit_val;
-	ready = !rep->defer;
+	/* Never write a request to a stopped PMP (see the hold helper). */
+	ready = !apple_pmp_report_hold_locked(rep);
 	if (ready) {
 		val = readq(rep->base + rep->offsets->tgt_read);
 		val &= ~bit_val;

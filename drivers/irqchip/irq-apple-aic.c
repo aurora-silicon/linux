@@ -1165,7 +1165,7 @@ static int aic_syscore_suspend(void *data)
 	struct aic_irq_chip *ic = aic_irqc;
 	u32 die, i, off = 0;
 
-	if (!pm_suspend_via_firmware())
+	if (!aic_sleep.irq_cfg || !pm_suspend_via_firmware())
 		return 0;
 
 	aic_sleep.config = aic_ic_read(ic, AIC2_CONFIG);
@@ -1205,13 +1205,46 @@ static void aic_resume_boot_cpu(void)
 	}
 }
 
+/*
+ * After a resume from disk the controller holds what the boot kernel left: its
+ * init masked every IRQ and it unmasked only the ones it used itself. The IRQ
+ * core disables lazily and unmasks only an IRQ it recorded as masked, so on
+ * its own it never unmasks the restored kernel's other IRQs again. Make every
+ * hardware mask match the restored descriptor: unmasked unless the core
+ * recorded it masked (a lazily disabled IRQ was unmasked in hardware when the
+ * image was taken), and masked when this kernel has no mapping for it. On the
+ * thaw path the masks already match and this rewrites the same values.
+ */
+static void aic_resync_masks(struct aic_irq_chip *ic)
+{
+	unsigned int die, i;
+
+	for (die = 0; die < ic->nr_die; die++) {
+		for (i = 0; i < ic->nr_irq; i++) {
+			irq_hw_number_t hwirq = AIC_IRQ_HWIRQ(die, i);
+			unsigned int virq = irq_find_mapping(ic->hw_domain, hwirq);
+			struct irq_data *d = virq ? irq_get_irq_data(virq) : NULL;
+			u32 off = die * ic->info.die_stride;
+
+			if (d && !irqd_irq_masked(d))
+				aic_ic_write(ic, ic->info.mask_clr + off + MASK_REG(i), MASK_BIT(i));
+			else
+				aic_ic_write(ic, ic->info.mask_set + off + MASK_REG(i), MASK_BIT(i));
+		}
+	}
+}
+
 static void aic_syscore_resume(void *data)
 {
 	struct aic_irq_chip *ic = aic_irqc;
 	u32 die, i, off = 0;
 
-	if (!aic_sleep.saved)
+	if (!aic_sleep.saved) {
+		/* No firmware-driven suspend: the only other syscore resume that loses masks. */
+		if (IS_ENABLED(CONFIG_HIBERNATION))
+			aic_resync_masks(ic);
 		return;
+	}
 	aic_sleep.saved = false;
 
 	/* Otherwise the suspend was refused, and the controller stayed powered. */
@@ -1254,19 +1287,29 @@ static struct syscore aic_syscore = {
 	.ops = &aic_syscore_ops,
 };
 
-static void __init aic_sleep_init(struct aic_irq_chip *irqc)
+static void __init aic_sleep_init(struct aic_irq_chip *irqc, struct device_node *node)
 {
-	if (!irqc->info.fw_suspend)
+	/*
+	 * The T6040's AIC (apple,t6041-aic3, matched through aic3_info) is the
+	 * same AICv3 as the T8140's: the same CONFIG, TIMEOUT and CLUSTER_PRIO
+	 * words and IRQ_CFG array. Its suspend-to-RAM path is the separate
+	 * T6040 sleep controller, so it is admitted here only with that.
+	 */
+	if (!irqc->info.fw_suspend &&
+	    !(IS_ENABLED(CONFIG_APPLE_T6040_SLEEP) &&
+	      of_device_is_compatible(node, "apple,t6041-aic3")))
 		return;
 
 	aic_sleep.irq_cfg = kcalloc(irqc->nr_die * irqc->nr_irq, sizeof(u32), GFP_KERNEL);
 	if (WARN_ON(!aic_sleep.irq_cfg))
 		return;
 
-	register_syscore(&aic_syscore);
+	/* A resume from disk needs the mask resync on every SoC. */
+	if (aic_sleep.irq_cfg || IS_ENABLED(CONFIG_HIBERNATION))
+		register_syscore(&aic_syscore);
 }
 #else
-static void __init aic_sleep_init(struct aic_irq_chip *irqc)
+static void __init aic_sleep_init(struct aic_irq_chip *irqc, struct device_node *node)
 {
 }
 #endif
@@ -1424,7 +1467,7 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 			  "irqchip/apple-aic/ipi:starting",
 			  aic_init_cpu, NULL);
 
-	aic_sleep_init(irqc);
+	aic_sleep_init(irqc, node);
 
 	if (is_kernel_in_hyp_mode()) {
 		struct irq_fwspec mi = {

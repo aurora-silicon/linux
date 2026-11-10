@@ -10,7 +10,7 @@ struct macsmc_test_context {
 	unsigned int calls;
 	bool require_sram_lock;
 	/* What the sleep tests saw, in order: keys read, values written, notices. */
-	u32 seen[8];
+	u32 seen[12];
 	unsigned int seen_count;
 	int ap_power_result;
 	u64 record;
@@ -26,9 +26,11 @@ static int macsmc_test_command(struct apple_smc *smc, u64 cmd, u64 arg,
 
 	KUNIT_EXPECT_TRUE(kunit_get_current_test(), mutex_is_locked(&smc->mutex));
 	ctx->calls++;
+	/* A written value as wide as it was written: WKTP's is one byte. */
 	if (ctx->seen_count < ARRAY_SIZE(ctx->seen))
-		ctx->seen[ctx->seen_count++] = cmd == SMC_MSG_WRITE_KEY ?
-			get_unaligned((u32 *)ctx->shmem) : arg;
+		ctx->seen[ctx->seen_count++] = cmd != SMC_MSG_WRITE_KEY ? arg :
+			get_unaligned((u32 *)ctx->shmem) &
+			GENMASK(8 * min_t(u64, size, sizeof(u32)) - 1, 0);
 	if (ret_data && ctx->result >= 0)
 		*ret_data = ctx->data;
 	return ctx->result;
@@ -236,15 +238,16 @@ static void macsmc_sleep_order_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, ctx->smc.ap_notified);
 	KUNIT_EXPECT_FALSE(test, ctx->smc.sleep_warned);
 
-	/* As in the trace, values included. */
-	KUNIT_ASSERT_EQ(test, ctx->seen_count, 7U);
+	/* As in the trace, values included: WKTP's 2 comes before 'slpa'. */
+	KUNIT_ASSERT_EQ(test, ctx->seen_count, 8U);
 	KUNIT_EXPECT_EQ(test, ctx->seen[0], SMC_KEY(slpw));
-	KUNIT_EXPECT_EQ(test, ctx->seen[1], SMC_KEY(slpa));
-	KUNIT_EXPECT_EQ(test, ctx->seen[2], (u32)MACSMC_TEST_AP_IDLE);
-	KUNIT_EXPECT_EQ(test, ctx->seen[3], (u32)MACSMC_TEST_AP_ON);
-	KUNIT_EXPECT_EQ(test, ctx->seen[4], SMC_KEY(MBSE));
-	KUNIT_EXPECT_EQ(test, ctx->seen[5], SMC_KEY(MBSW));
-	KUNIT_EXPECT_EQ(test, ctx->seen[6], SMC_KEY(waka));
+	KUNIT_EXPECT_EQ(test, ctx->seen[1], 2U);
+	KUNIT_EXPECT_EQ(test, ctx->seen[2], SMC_KEY(slpa));
+	KUNIT_EXPECT_EQ(test, ctx->seen[3], (u32)MACSMC_TEST_AP_IDLE);
+	KUNIT_EXPECT_EQ(test, ctx->seen[4], (u32)MACSMC_TEST_AP_ON);
+	KUNIT_EXPECT_EQ(test, ctx->seen[5], SMC_KEY(MBSE));
+	KUNIT_EXPECT_EQ(test, ctx->seen[6], SMC_KEY(MBSW));
+	KUNIT_EXPECT_EQ(test, ctx->seen[7], SMC_KEY(waka));
 }
 
 static void macsmc_test_outbox_poll(struct apple_smc *smc, const char *after,
@@ -265,10 +268,11 @@ static void macsmc_sleep_warn_late_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apple_smc_sleep_enter(&ctx->smc), 0);
 	KUNIT_EXPECT_FALSE(test, ctx->smc.sleep_warn_late);
 	KUNIT_EXPECT_TRUE(test, ctx->smc.sleep_warned);
-	KUNIT_ASSERT_EQ(test, ctx->seen_count, 3U);
+	KUNIT_ASSERT_EQ(test, ctx->seen_count, 4U);
 	KUNIT_EXPECT_EQ(test, ctx->seen[0], SMC_KEY(slpw));
-	KUNIT_EXPECT_EQ(test, ctx->seen[1], SMC_KEY(slpa));
-	KUNIT_EXPECT_EQ(test, ctx->seen[2], (u32)MACSMC_TEST_AP_IDLE);
+	KUNIT_EXPECT_EQ(test, ctx->seen[1], 2U);
+	KUNIT_EXPECT_EQ(test, ctx->seen[2], SMC_KEY(slpa));
+	KUNIT_EXPECT_EQ(test, ctx->seen[3], (u32)MACSMC_TEST_AP_IDLE);
 }
 
 static void macsmc_sleep_refused_test(struct kunit *test)
@@ -282,10 +286,11 @@ static void macsmc_sleep_refused_test(struct kunit *test)
 	/* No answer: refuse, undo the notice and leave commands working. */
 	KUNIT_EXPECT_EQ(test, apple_smc_sleep_commit(&ctx->smc), -ETIME);
 	KUNIT_EXPECT_FALSE(test, ctx->smc.ap_notified);
-	KUNIT_ASSERT_EQ(test, ctx->seen_count, 3U);
-	KUNIT_EXPECT_EQ(test, ctx->seen[0], SMC_KEY(slpa));
-	KUNIT_EXPECT_EQ(test, ctx->seen[1], (u32)MACSMC_TEST_AP_IDLE);
-	KUNIT_EXPECT_EQ(test, ctx->seen[2], (u32)MACSMC_TEST_AP_ON);
+	KUNIT_ASSERT_EQ(test, ctx->seen_count, 4U);
+	KUNIT_EXPECT_EQ(test, ctx->seen[0], 2U);
+	KUNIT_EXPECT_EQ(test, ctx->seen[1], SMC_KEY(slpa));
+	KUNIT_EXPECT_EQ(test, ctx->seen[2], (u32)MACSMC_TEST_AP_IDLE);
+	KUNIT_EXPECT_EQ(test, ctx->seen[3], (u32)MACSMC_TEST_AP_ON);
 }
 
 static void macsmc_notice_test(struct kunit *test)

@@ -54,6 +54,8 @@ struct apple_gpio_pinctrl {
 	/* The pins' words across a firmware-driven suspend */
 	u32 *saved;
 	unsigned long *saved_valid;
+	/* The regmap caches the block: it holds what this driver set, not the hardware. */
+	bool cached;
 	/* Pins this driver has written. Others belong to someone else. */
 	unsigned long *touched;
 	struct apple_gpio_irq_group irqgrps[];
@@ -82,6 +84,15 @@ struct apple_gpio_pinctrl {
 #define REG_GPIOx_LOCK       BIT(21)
 #define REG_GPIOx_DRIVE_STRENGTH1 GENMASK(23, 22)
 #define REG_IRQ(g, x)        (0x800 + 0x40 * (g) + 4 * ((x) >> 5))
+
+/*
+ * T6040 bring-up: put the configured pins back after a firmware-driven
+ * suspend also on a cached block, by reading and writing the hardware past
+ * the cache. Off restores only the uncached blocks, as before.
+ */
+static bool resume_cached = true;
+module_param(resume_cached, bool, 0644);
+MODULE_PARM_DESC(resume_cached, "Put configured pins back after S2R on a cached block too (bring-up)");
 
 static const struct regmap_config regmap_config = {
 	.reg_bits = 32,
@@ -603,14 +614,19 @@ static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 		return dev_err_probe(&pdev->dev, PTR_ERR(pctl->map),
 				     "Failed to create regmap\n");
 
-	/* Only with the regmap reaching the hardware: a cache would hide the loss. */
-	if (hw && hw->no_regcache) {
-		pctl->saved = devm_kcalloc(&pdev->dev, npins, sizeof(*pctl->saved), GFP_KERNEL);
-		pctl->saved_valid = devm_bitmap_zalloc(&pdev->dev, npins, GFP_KERNEL);
-		pctl->touched = devm_bitmap_zalloc(&pdev->dev, npins, GFP_KERNEL);
-		if (!pctl->saved || !pctl->saved_valid || !pctl->touched)
-			return -ENOMEM;
-	}
+	/*
+	 * A cache would hide the loss: on a cached block the resume compares and
+	 * writes the hardware past it.
+	 */
+	pctl->cached = !(hw && hw->no_regcache);
+	pctl->saved = devm_kcalloc(&pdev->dev, npins, sizeof(*pctl->saved), GFP_KERNEL);
+	pctl->saved_valid = devm_bitmap_zalloc(&pdev->dev, npins, GFP_KERNEL);
+	if (!pctl->saved || !pctl->saved_valid)
+		return -ENOMEM;
+	/* A resume from disk also puts pins back, from the cache where there is one. */
+	pctl->touched = devm_bitmap_zalloc(&pdev->dev, npins, GFP_KERNEL);
+	if (!pctl->touched)
+		return -ENOMEM;
 
 	for (i = 0; i < npins; i++) {
 		pins[i].number = i;
@@ -676,6 +692,8 @@ static int apple_gpio_pinctrl_suspend_noirq(struct device *dev)
 	if (!pctl->saved || pm_suspend_target_state != PM_SUSPEND_MEM ||
 	    !pm_suspend_via_firmware())
 		return 0;
+	if (pctl->cached && !READ_ONCE(resume_cached))
+		return 0;
 
 	/*
 	 * Only the pins this driver configured. The others belong to the firmware or another
@@ -697,15 +715,62 @@ static int apple_gpio_pinctrl_resume_noirq(struct device *dev)
 	if (!pctl->saved || !pm_resume_via_firmware())
 		return 0;
 
+	/* The saved words came from the cache; the hardware is what to compare. */
+	if (pctl->cached)
+		regcache_cache_bypass(pctl->map, true);
 	for_each_set_bit(i, pctl->saved_valid, pctl->pinctrl_desc.npins) {
 		if (!regmap_read(pctl->map, REG_GPIO(i), &val) && val == pctl->saved[i])
 			continue;
 		regmap_write(pctl->map, REG_GPIO(i), pctl->saved[i]);
 		restored++;
 	}
-	dev_dbg(dev, "resume: %u of %u configured pins put back\n", restored,
-		bitmap_weight(pctl->saved_valid, pctl->pinctrl_desc.npins));
+	if (pctl->cached)
+		regcache_cache_bypass(pctl->map, false);
+	if (restored)
+		dev_info(dev, "resume: %u of %u configured pins put back\n", restored,
+			 bitmap_weight(pctl->saved_valid, pctl->pinctrl_desc.npins));
 	bitmap_zero(pctl->saved_valid, pctl->pinctrl_desc.npins);
+
+	return 0;
+}
+
+/*
+ * A resume from disk is a cold boot: the block holds what the boot loader and
+ * the boot kernel set up, not the restored kernel's pins, while the regmap
+ * cache still holds the restored kernel's words. An interrupt does not get
+ * its pin back by itself: the IRQ core disables lazily and unmasks only an
+ * IRQ it recorded as masked, and regmap_update_bits() skips a write the cache
+ * already has. So an edge interrupt armed before the hibernation, such as the
+ * HDMI hotplug detect, stays off for good. Write back the pins this driver set
+ * up as interrupts, from the cache; the other pins are left to their consumers.
+ *
+ * The early restore, as a PM domain does not wrap it (its restore_noirq ends
+ * in the driver's resume_noirq). An uncached block reads back only what the
+ * boot left, so this does nothing there.
+ */
+static int __maybe_unused apple_gpio_pinctrl_restore_early(struct device *dev)
+{
+	struct apple_gpio_pinctrl *pctl = dev_get_drvdata(dev);
+	unsigned int i, mode, val, armed = 0;
+
+	/* Hibernation aborted before the image: the block kept its state. */
+	if (!pm_hibernate_is_restored())
+		return 0;
+	/* Uncached: no word of the restored kernel to write back. */
+	if (!pctl->cached)
+		return 0;
+
+	for_each_set_bit(i, pctl->touched, pctl->pinctrl_desc.npins) {
+		if (regmap_read(pctl->map, REG_GPIO(i), &val))
+			continue;
+		mode = FIELD_GET(REG_GPIOx_MODE, val);
+		if (mode < REG_GPIOx_IN_IRQ_HI || mode > REG_GPIOx_IN_IRQ_ANY)
+			continue;
+		regmap_write(pctl->map, REG_GPIO(i), val);
+		armed++;
+	}
+	if (armed)
+		dev_info(dev, "resume from disk: %u interrupt pin(s) set up again\n", armed);
 
 	return 0;
 }
@@ -713,6 +778,7 @@ static int apple_gpio_pinctrl_resume_noirq(struct device *dev)
 static const struct dev_pm_ops apple_gpio_pinctrl_pm_ops = {
 	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_gpio_pinctrl_suspend_noirq,
 				  apple_gpio_pinctrl_resume_noirq)
+	.restore_early = pm_sleep_ptr(apple_gpio_pinctrl_restore_early),
 };
 
 static struct platform_driver apple_gpio_pinctrl_driver = {
