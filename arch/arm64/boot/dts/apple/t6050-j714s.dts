@@ -174,5 +174,37 @@
 
 #include "t6050-j714s-pmp-tunables.dtsi"
 
+/*
+ * SMC sensors, as on J716s: the shared fan, power, voltage and current keys, plus
+ * every readable float T* key through apple,discover-temperatures in
+ * t6050-die0.dtsi, labelled with the key name. A key this SMC lacks only drops
+ * its channel.
+ *
+ * Discovery refuses to run once any temperature channel exists, so the shared
+ * temperature nodes go (their keys are discovered anyway), and so does
+ * apple,soc-die-keys, whose channel would also count. Only the macsmc_soc_die
+ * thermal zone is lost.
+ */
+#include "hwmon-common.dtsi"
+#include "hwmon-fan-dual.dtsi"
+#include "hwmon-laptop.dtsi"
+
+&smc_hwmon {
+	/delete-property/ apple,soc-die-keys;
+	/delete-node/ temperature-TH0x;
+	/delete-node/ temperature-TB0T;
+	/delete-node/ temperature-TCHP;
+	/delete-node/ temperature-TW0P;
+
+	/* The T6050 SMC spells the fan mode keys F0md/F1md. The SMC drives the fans. */
+	fan-F0Ac {
+		apple,fan-mode = "F0md";
+	};
+
+	fan-F1Ac {
+		apple,fan-mode = "F1md";
+	};
+};
+
 /* The same T6050 camera as J716c (J714sAP ADT); the loader sets the J714s sensor type. */
 #include "t6050-j716c-isp.dtsi"
