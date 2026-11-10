@@ -2936,6 +2936,46 @@ static const __u8 *magicmouse_report_fixup(struct hid_device *hdev, __u8 *rdesc,
 		rdesc[3] = 0x02;
 	}
 
+	/* The K114c dockchannel MTP declares its input as a raw buffer pipe:
+	 * REPORT_SIZE 0x80000 bits (64 KiB), one field, no report id. macOS
+	 * reads variable-length reports against it. hid core refuses any
+	 * REPORT_SIZE above 16384 bits and aborts the whole parse, so no
+	 * report ever registers and every finger report is dropped before
+	 * hidraw. Clamp the item to the hid core maximum; real reports are
+	 * far shorter and hid core accepts reports shorter than declared. */
+	if (hdev->bus == BUS_HOST && !strncmp(hdev->name, "Apple MTP", 9)) {
+		unsigned int i = 0;
+
+		while (i < *rsize) {
+			__u8 b = rdesc[i];
+			unsigned int len;
+			static const unsigned int lens[4] = { 0, 1, 2, 4 };
+
+			if ((b >> 2 & 3) == 3) { /* long item */
+				i += 3 + rdesc[i + 1];
+				continue;
+			}
+			len = lens[b & 3];
+			if ((b >> 2 & 3) == 1 && (b >> 4) == 0x7 && len) {
+				__u32 v = 0;
+				unsigned int k;
+
+				for (k = 0; k < len; k++)
+					v |= (__u32)rdesc[i + 1 + k] << (8 * k);
+				if (v > 16384) {
+					rdesc[i + 1] = 0x00;
+					rdesc[i + 2] = 0x40;
+					rdesc[i + 3] = 0x00;
+					rdesc[i + 4] = 0x00;
+					hid_info(hdev,
+						 "clamped MTP REPORT_SIZE %u bits to 16384\n",
+						 v);
+				}
+			}
+			i += 1 + len;
+		}
+	}
+
 	return rdesc;
 }
 
