@@ -187,6 +187,7 @@ int apple_sleep_enclave_register(struct device *dev, int (*tell)(void *data), vo
 void apple_sleep_enclave_unregister(struct device *dev);
 void apple_sleep_coproc_set_ready(struct device *dev, bool ready);
 bool apple_sleep_coproc_stopped(struct device *dev);
+bool apple_sleep_commit_stops_coprocs(void);
 #else
 static inline int apple_sleep_coproc_register(struct device *dev, void __iomem *asc,
 					      bool pcie_ans, int (*last_stop)(void *data),
@@ -229,12 +230,12 @@ static inline bool apple_sleep_coproc_stopped(struct device *dev)
 {
 	return false;
 }
-#endif
 
 static inline bool apple_sleep_commit_stops_coprocs(void)
 {
 	return false;
 }
+#endif
 
 /* The T6040 controller can't send a sleep deep either: false, as with no sleep driver. */
 static inline bool apple_sleep_request_deep_once(void)
