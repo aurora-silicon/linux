@@ -693,8 +693,8 @@ static bool apple_clpc_gpu_input_demand(const struct apple_clpc_hw *hw,
 	    !apple_clpc_gpu_active(gpu, &updated, &sequence))
 		return false;
 	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
-		demand[rail] = max3(demand[rail], hw->map[rail][APPLE_CLPC_LEVELS - 1],
-				    hw->gpu[rail]);
+		demand[rail] = max(demand[rail],
+				   max(hw->map[rail][APPLE_CLPC_LEVELS - 1], hw->gpu[rail]));
 	return true;
 }
 
