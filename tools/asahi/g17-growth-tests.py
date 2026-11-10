@@ -33,13 +33,13 @@ struct Graph;
 impl Graph {fn set_owner(&mut self,_:&Context)->Result{Ok(())}}
 struct ReaderHint; impl ReaderHint {fn has_readers(&self,count:&AtomicU32)->bool{count.load(Ordering::Acquire)!=0}}
 struct Queue {
- owner:Option<u64>,installed:bool,growing:bool,growth_blocks:usize,free_list_generation:u64,
+ owner:Option<u64>,installed:bool,growing:bool,channel_error:bool,growth_blocks:usize,free_list_generation:u64,
  pool_phase:PoolPhase,release_sent_ns:Option<u64>,pool:Pool,binding:Option<Binding>,previous:Option<Previous>,graph:Graph,
  active:Fifo,replays:Fifo,quarantined:bool,released:bool,retirement_ready:bool,
  retired_by_teardown:bool,released_at:u64,exit:Option<()>,needs_fresh_backing:bool,
  source_hint:ReaderHint,source_readers:AtomicU32,
 }
-fn idle(live:&Arc<AtomicUsize>)->Queue{Queue{owner:Some(1),installed:true,growing:false,growth_blocks:0,
+fn idle(live:&Arc<AtomicUsize>)->Queue{Queue{owner:Some(1),installed:true,growing:false,channel_error:false,growth_blocks:0,
  free_list_generation:0,pool_phase:PoolPhase::Populated,release_sent_ns:None,pool:Pool{pages:Some(Pages(10)),fail:false},
  binding:Some(Binding{context:Context::new(live),pool_alias:Some(1),descriptors:Some(2)}),previous:None,graph:Graph,
  active:Fifo{len:0},replays:Fifo{len:0},quarantined:false,released:false,retirement_ready:true,
