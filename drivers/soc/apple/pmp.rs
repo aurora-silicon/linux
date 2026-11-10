@@ -610,6 +610,7 @@ impl PmpData {
         stop.sram = core::ptr::null_mut();
         stop.words = core::ptr::null_mut();
         stop.count = 0;
+        stop.offset = 0;
         if let Some(copy) = copy.as_mut() {
             stop.sram = MmioBackend::as_ptr(pmp_mmio)
                 .cast::<u8>()
@@ -617,6 +618,7 @@ impl PmpData {
                 .cast();
             stop.words = copy.words.as_mut_ptr();
             stop.count = copy.words.len();
+            stop.offset = copy.offset;
         }
         self.state.lock().sram = copy;
         Ok(())
@@ -977,11 +979,15 @@ const HW_CFG_T8140: PmpHwConfig = PmpHwConfig {
 /// T6041: the DART window starts at 1 TiB; the boot argument header is
 /// version 5. The firmware advertises endpoint 7 and does not acknowledge
 /// the IOP power state (-ETIME) until it is started and has its buffer.
+/// SRAM kept across a system sleep (bring-up): the firmware's __DATA, as the
+/// ADT's segment-ranges place it (0x500761000, 0x7d000 bytes, after __TEXT at
+/// 0x500700000, 0x61000 bytes), the segment T8140's range covers too.
+/// Without it the PMP never answered after a real S2R (endpoint discovery -62).
 const HW_CFG_T6041: PmpHwConfig = PmpHwConfig {
     dma_mask: Some(DmaMask::new::<42>()),
     check_bootargs_uuid: true,
     coreanalytics: Ep7::Always,
-    sram_backup: None,
+    sram_backup: Some((0x61000, 0x7d000)),
 };
 
 /// T8142: the DART window starts at 1 TiB as on T8140. Its registry-v2
