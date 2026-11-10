@@ -370,6 +370,8 @@ struct asahi_g17_commit *asahi_g17_commit_prepare(struct device *dev,
 					  4 * SGX_BRIDGE_WORDS);
 	if (!c->ps || !c->gating || (bridge && !c->bridge))
 		goto err;
+	/* The word as it is before the sleep, for the raise after it if the stop leaves it. */
+	c->saved = readl(c->ps);
 
 	c->request = of_parse_phandle(dev->of_node, "apple,pmp-report-entry", 0);
 	if (c->request)
