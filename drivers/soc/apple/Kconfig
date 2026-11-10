@@ -216,6 +216,22 @@ config APPLE_PMP
 
 	  Say 'y' here if you have an Apple SoC.
 
+config APPLE_PMP_RAW_COMMAND_PROBE
+	bool "TEST ONLY: raw Apple PMP PM command probe"
+	depends on APPLE_PMP && DEBUG_FS
+	default n
+	help
+	  Expose /sys/kernel/debug/apple_pmp/raw_command for a single-boot
+	  protocol experiment. A hexadecimal 64-bit PM endpoint word written to
+	  the file is sent once; reading the file reports that request, the first
+	  PM reply, and the send status. Normal device-power and constraint calls
+	  are refused while this option is built so they cannot consume the
+	  untagged reply first.
+
+	  This deliberately bypasses normal command construction and correlation.
+	  It is test-only, must never be enabled in a production configuration,
+	  and patches containing it must not be merged. If unsure, say N.
+
 config APPLE_T8132_PLATFORM_HANDOFF
 	bool "Apple T8132 legacy platform description compatibility"
 	depends on ARCH_APPLE || COMPILE_TEST

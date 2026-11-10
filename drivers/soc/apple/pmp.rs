@@ -14,6 +14,8 @@ use core::sync::atomic::{fence, AtomicI32, AtomicPtr, Ordering};
 mod pmp_bootargs;
 mod pmp_power;
 use pmp_power::Command;
+#[cfg(CONFIG_APPLE_PMP_RAW_COMMAND_PROBE)]
+use pmp_power::RawCommand;
 
 use kernel::{
     bindings,
@@ -80,6 +82,10 @@ const PM_CONSTRAINT_DOMAIN_SHIFT: u32 = pmp_power::CONSTRAINT_DOMAIN_SHIFT;
 const PM_CONSTRAINT_DEVICE_SHIFT: u32 = pmp_power::CONSTRAINT_DEVICE_SHIFT;
 const PM_CONSTRAINT_LEVEL_SHIFT: u32 = pmp_power::CONSTRAINT_LEVEL_SHIFT;
 const PM_DEVICE_CONSTRAINT: u8 = pmp_power::DEVICE_CONSTRAINT;
+#[cfg(CONFIG_APPLE_PMP_RAW_COMMAND_PROBE)]
+const PM_RAW_PAYLOAD_MASK: u64 = (1 << PM_COMMAND_SHIFT) - 1;
+#[cfg(CONFIG_APPLE_PMP_RAW_COMMAND_PROBE)]
+const PM_RAW_WORD_MASK: u64 = PM_COMMAND_MARKER | (0xff << PM_COMMAND_SHIFT) | PM_RAW_PAYLOAD_MASK;
 const OPC_GET_IOVA_TABLE: u64 = 0x10;
 const OPC_MALLOC: u64 = 0x12;
 const OPC_FREE: u64 = 0x14;
@@ -171,6 +177,9 @@ struct PmpData {
     power_command: Mutex<Command>,
     #[pin]
     power_reply: CondVar,
+    #[cfg(CONFIG_APPLE_PMP_RAW_COMMAND_PROBE)]
+    #[pin]
+    raw_command: Mutex<RawCommand>,
     /// The C power-vote bridge, published once and retained until reboot.
     display: AtomicPtr<bindings::apple_pmp_display>,
     /// The first failure seen before or after the bridge was published.
@@ -191,6 +200,8 @@ impl PmpData {
                     state <- new_mutex!(PmpState::new()?),
                     power_command <- new_mutex!(Command::Idle),
                     power_reply <- new_condvar!(),
+                    #[cfg(CONFIG_APPLE_PMP_RAW_COMMAND_PROBE)]
+                    raw_command <- new_mutex!(RawCommand::Idle),
                     pmp_mmio,
                     asc_mmio,
                     display: AtomicPtr::new(core::ptr::null_mut()),
@@ -445,6 +456,14 @@ impl PmpData {
         };
     }
     fn recv_message(&self, msg: u64) -> Result<()> {
+        #[cfg(CONFIG_APPLE_PMP_RAW_COMMAND_PROBE)]
+        {
+            let mut state = self.raw_command.lock();
+            if state.reply(msg) {
+                self.power_reply.notify_all();
+                return Ok(());
+            }
+        }
         let pm_command = (msg >> PM_COMMAND_SHIFT) & 0xff;
         if msg & PM_COMMAND_MARKER != 0
             && (pm_command == 0x0f || pm_command == u64::from(PM_DEVICE_CONSTRAINT) + 1)
@@ -672,6 +691,66 @@ pub unsafe extern "C" fn apple_pmp_send_constraint_command(
         level
     );
     0
+}
+
+/// Send one deliberately raw PM endpoint word and return the first PM reply.
+///
+/// # Safety
+/// `data` must point to the live PmpData registered by PmpDriver and `reply`
+/// must point to writable storage. The C probe bridge serializes this call
+/// against all normal PMP command producers.
+#[cfg(CONFIG_APPLE_PMP_RAW_COMMAND_PROBE)]
+#[export]
+pub unsafe extern "C" fn apple_pmp_send_raw_probe(
+    data: *const core::ffi::c_void,
+    request: u64,
+    reply: *mut u64,
+) -> i32 {
+    if reply.is_null() || request & PM_COMMAND_MARKER == 0 || request & !PM_RAW_WORD_MASK != 0 {
+        return EINVAL.to_errno();
+    }
+    let command = ((request >> PM_COMMAND_SHIFT) & 0xff) as u8;
+    if !matches!(command, 0x0c | 0x0e | 0x0f) {
+        return EINVAL.to_errno();
+    }
+
+    // SAFETY: guaranteed by the C bridge while it holds pmp_lock.
+    let data = unsafe { &*data.cast::<PmpData>() };
+    {
+        let mut state = data.raw_command.lock();
+        if !state.begin() {
+            return EBUSY.to_errno();
+        }
+    }
+    let sent = {
+        let mut guard = data.rtkit.lock();
+        match guard.as_mut().as_pin_mut() {
+            Some(rtk) => rtk.send_message(PMP_ENDPOINT, request),
+            None => Err(ENODEV),
+        }
+    };
+    let mut state = data.raw_command.lock();
+    if let Err(error) = sent {
+        *state = RawCommand::Idle;
+        return error.to_errno();
+    }
+    let mut remaining = kernel::time::msecs_to_jiffies(1000);
+    while *state == RawCommand::Pending {
+        match data.power_reply.wait_timeout(&mut state, remaining) {
+            CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
+            CondVarTimeoutResult::Timeout | CondVarTimeoutResult::Signal { .. } => break,
+        }
+    }
+    let result = match *state {
+        RawCommand::Complete(message) => {
+            // SAFETY: guaranteed by this function's caller contract.
+            unsafe { *reply = message };
+            0
+        }
+        _ => ETIMEDOUT.to_errno(),
+    };
+    *state = RawCommand::Idle;
+    result
 }
 
 struct NoBuffer;

@@ -3,6 +3,7 @@
 //! Correlation for PMP's untagged, serialized device-power replies.
 
 pub(crate) const MARKER: u64 = 1 << 53;
+const MESSAGE_TYPE_MASK: u64 = 0xf << 52;
 pub(crate) const SHIFT: u32 = 44;
 /// Device-power requests put the target and requested state below the opcode.
 pub(crate) const POWER_DEVICE_SHIFT: u32 = 40;
@@ -20,6 +21,33 @@ pub(crate) enum Command {
     Pending(u64),
     Complete,
     Failed,
+}
+
+#[cfg(CONFIG_APPLE_PMP_RAW_COMMAND_PROBE)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum RawCommand {
+    Idle,
+    Pending,
+    Complete(u64),
+}
+
+#[cfg(CONFIG_APPLE_PMP_RAW_COMMAND_PROBE)]
+impl RawCommand {
+    pub(crate) fn begin(&mut self) -> bool {
+        if *self != Self::Idle {
+            return false;
+        }
+        *self = Self::Pending;
+        true
+    }
+
+    pub(crate) fn reply(&mut self, message: u64) -> bool {
+        if *self != Self::Pending || message & MESSAGE_TYPE_MASK != MARKER {
+            return false;
+        }
+        *self = Self::Complete(message);
+        true
+    }
 }
 
 impl Command {
@@ -94,5 +122,16 @@ mod tests {
             state.reply(reply);
             assert_eq!(state, Command::Failed);
         }
+    }
+
+    #[cfg(CONFIG_APPLE_PMP_RAW_COMMAND_PROBE)]
+    #[test]
+    fn raw_probe_records_the_first_pm_reply() {
+        let mut state = RawCommand::Idle;
+
+        assert!(state.begin());
+        assert!(!state.reply(0x0030_0000_0000_0000));
+        assert!(state.reply(0x0021_0000_0000_0000));
+        assert_eq!(state, RawCommand::Complete(0x0021_0000_0000_0000));
     }
 }
