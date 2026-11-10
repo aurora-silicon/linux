@@ -3270,6 +3270,7 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 	struct brcmf_pciedev_info *devinfo;
 	struct brcmf_bus *bus;
 	struct pci_dev *pdev;
+	u32 intmask;
 	int err;
 
 	brcmf_dbg(PCIE, "Enter\n");
@@ -3292,8 +3293,19 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 		return 0;
 	}
 
+	/*
+	 * ~0 is unbacked MMIO (link still down after the Apple RC power
+	 * cycle), not a live firmware. The hot-resume path would issue more
+	 * mailbox MMIO and wedge. Fall through to remove+probe.
+	 */
+	intmask = brcmf_pcie_read_pcie32(devinfo, devinfo->reginfo->intmask);
+	if (intmask == ~0u) {
+		brcmf_err(bus, "INTMASK read ~0 on resume; reloading firmware\n");
+		goto cleanup;
+	}
+
 	/* Check if device is still up and running, if so we are ready */
-	if (brcmf_pcie_read_pcie32(devinfo, devinfo->reginfo->intmask) != 0) {
+	if (intmask != 0) {
 		brcmf_dbg(PCIE, "Try to wakeup device....\n");
 		/* Set the device up, so we can write the MB data message in ring mode */
 		devinfo->state = BRCMFMAC_PCIE_STATE_UP;

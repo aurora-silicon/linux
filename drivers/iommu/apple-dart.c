@@ -524,6 +524,14 @@ struct apple_dart {
 	 * The first error of each stream is logged.
 	 */
 	int locked_retire_err[DART_MAX_STREAMS];
+	/* Physical address of each mapped locked root, as read from its TTBR. */
+	phys_addr_t locked_phys[DART_MAX_STREAMS][DART_MAX_TTBR];
+	/*
+	 * Page-table configuration last published into each locked stream's
+	 * roots, for the re-import after a resume from disk (the boot loader
+	 * installs fresh firmware roots). Cleared when the stream's roots retire.
+	 */
+	struct io_pgtable_cfg *locked_cfg[DART_MAX_STREAMS];
 };
 
 #ifndef MODULE
@@ -1445,6 +1453,7 @@ apple_dart_hw_map_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx)
 		dart->locked_fw[sid][idx] = fw;
 		if (!idx)
 			dart->locked_fw_tree[sid] = tree;
+		dart->locked_phys[sid][idx] = phys;
 		spin_unlock_irqrestore(&dart->lock, flags);
 	}
 
@@ -1495,6 +1504,8 @@ apple_dart_hw_unmap_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx
 			tree = dart->locked_fw_tree[sid];
 			dart->locked_fw_tree[sid] = NULL;
 		}
+		dart->locked_phys[sid][idx] = 0;
+		dart->locked_cfg[sid] = NULL;
 		spin_unlock_irqrestore(&dart->lock, flags);
 		/* Once per stream: the error is never cleared. */
 		if (first)
@@ -1594,6 +1605,8 @@ apple_dart_hw_sync_locked(struct io_pgtable_cfg *cfg,
 			if (ret)
 				goto out;
 		}
+		if (dart->locked_ttbr[sid][0])
+			dart->locked_cfg[sid] = cfg;
 	}
 out:
 	spin_unlock_irqrestore(&dart->lock, flags);
@@ -5202,8 +5215,13 @@ static int apple_dart_probe(struct platform_device *pdev)
 			dart->oas = DART_PCIEC_ADDR_WIDTH;
 			dart->num_streams = DART_PCIEC_STREAMS;
 			dart->four_level = true;
-			/* T8132 PCIe-C DARTs keep per-stream exception records. */
-			if (of_device_is_compatible(dev->of_node, "apple,t8132-dart"))
+			/*
+			 * T8132 PCIe-C DARTs keep per-stream exception records.
+			 * T6040/T6041 carry the same PCIe-C block, and their DARTs
+			 * report version 0x0202 (PARAMS3) wherever they can be read.
+			 */
+			if (of_device_is_compatible(dev->of_node, "apple,t8132-dart") ||
+			    of_device_is_compatible(dev->of_node, "apple,t6041-dart"))
 				dart->version = 0x0202;
 		} else {
 			dart->pgsize = 1 << DART_PCIEC_PAGE_SHIFT;
@@ -6292,6 +6310,14 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 		return ret;
 	}
 
+	/*
+	 * A T6040/T6041 PCIe-C DART that lost its state lost its tunables with it:
+	 * apply them again before the reset, in the order of probe.
+	 */
+	if (dart->tunneled && dart->tunables &&
+	    of_device_is_compatible(dev->of_node, "apple,t6041-dart"))
+		apple_dart_apply_tunables(dart, dart->tunables);
+
 	ret = apple_dart_hw_reset(dart);
 
 	/*
@@ -6478,8 +6504,145 @@ static __maybe_unused int apple_dart_sys_resume_noirq(struct device *dev)
 	return pm_suspend_via_firmware() ? apple_dart_resume_noirq(dev) : 0;
 }
 
+#ifdef CONFIG_HIBERNATION
+/*
+ * Resume from disk is a cold boot: the boot loader locked every locked DART
+ * again with fresh firmware-owned roots, while the restored kernel still
+ * describes the roots of the image (their mapping, their firmware snapshot
+ * and the slots it had published). Every publication then fails (-EBUSY),
+ * and with it every DMA mapping through the DART (observed for the PMP and
+ * every DCP: "failed buffer request ... (-12)"). Re-import the live roots
+ * the way attach maps them, then publish the stream's page tables into them
+ * again, as attach does. Firmware-owned memory is never written: the old root's
+ * published slots are forgotten, not retired.
+ */
+static int apple_dart_reimport_locked(struct apple_dart *dart)
+{
+	DECLARE_BITMAP(redo, DART_MAX_STREAMS) = {};
+	unsigned int sid, idx;
+	int ret = 0, done = 0;
+
+	/*
+	 * Two passes, as attach does: every stream's live roots are re-read and
+	 * snapshotted before any of them is republished, so that a root shared
+	 * by several streams is snapshotted before Linux slots enter it.
+	 */
+	for (sid = 0; sid < dart->num_streams; sid++) {
+		bool any = false;
+
+		for (idx = 0; idx < dart->hw->ttbr_count; idx++) {
+			u64 *live = dart->locked_ttbr[sid][idx];
+			u64 *owned = dart->locked_owned[sid][idx];
+			struct apple_dart_fw_root *fw, *old_fw;
+			unsigned long flags;
+			phys_addr_t phys;
+			u64 *l1 = live;
+			u32 ttbr;
+
+			if (!live || !owned)
+				continue;
+			ttbr = apple_dart_readl(dart, DART_TTBR(dart, sid, idx));
+			if (!(ttbr & dart->hw->ttbr_valid)) {
+				dev_err(dart->dev, "hibernation restore: stream %u ttbr[%u] not valid\n",
+					sid, idx);
+				ret = ret ?: -EIO;
+				continue;
+			}
+			ttbr &= ~dart->hw->ttbr_valid;
+			if (dart->hw->ttbr_addr_field_shift)
+				ttbr >>= dart->hw->ttbr_addr_field_shift;
+			phys = ((phys_addr_t)ttbr) << dart->hw->ttbr_shift;
+			if (dart->fw_handoff && !apple_dart_fw_table_ram(dart, phys)) {
+				ret = ret ?: -EINVAL;
+				continue;
+			}
+			if (phys != dart->locked_phys[sid][idx]) {
+				l1 = devm_memremap(dart->dev, phys, dart->pgsize, MEMREMAP_WB);
+				if (IS_ERR(l1)) {
+					ret = ret ?: PTR_ERR(l1);
+					continue;
+				}
+			}
+			fw = apple_dart_snapshot_fw_root(dart, sid, l1);
+			if (IS_ERR(fw)) {
+				if (l1 != live)
+					devm_memunmap(dart->dev, l1);
+				ret = ret ?: PTR_ERR(fw);
+				continue;
+			}
+			spin_lock_irqsave(&dart->lock, flags);
+			old_fw = dart->locked_fw[sid][idx];
+			memset(owned, 0, dart->pgsize);
+			dart->locked_ttbr[sid][idx] = l1;
+			dart->locked_phys[sid][idx] = phys;
+			dart->locked_fw[sid][idx] = fw;
+			spin_unlock_irqrestore(&dart->lock, flags);
+			apple_dart_free_fw_root(dart, old_fw);
+			if (l1 != live)
+				devm_memunmap(dart->dev, live);
+			any = true;
+		}
+		if (any)
+			__set_bit(sid, redo);
+	}
+
+	for_each_set_bit(sid, redo, dart->num_streams) {
+		struct apple_dart_stream_map stream = { .dart = dart };
+		struct io_pgtable_cfg *cfg = READ_ONCE(dart->locked_cfg[sid]);
+		int err;
+
+		if (!cfg)
+			continue;
+		__set_bit(sid, stream.sidmap);
+		err = apple_dart_hw_sync_locked(cfg, &stream, false);
+		if (!err)
+			err = dart->hw->invalidate_tlb(&stream);
+		if (err) {
+			dev_err(dart->dev, "hibernation restore: stream %u not republished: %d\n",
+				sid, err);
+			ret = ret ?: err;
+			continue;
+		}
+		done++;
+	}
+	dev_info(dart->dev, "hibernation restore: %d locked streams re-imported from the boot loader's roots (%d)\n",
+		 done, ret);
+	return ret;
+}
+
+static int apple_dart_restore(struct device *dev)
+{
+	struct apple_dart *dart = dev_get_drvdata(dev);
+	int ret;
+
+	/* Hibernation aborted before the image (PMSG_RESTORE then too): nothing restarted. */
+	if (!pm_hibernate_is_restored())
+		return apple_dart_system_resume(dev);
+	ret = pm_runtime_force_resume(dev);
+	if (ret || !dart->locked)
+		return ret;
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret < 0)
+		return ret;
+	/* Logged per stream; a failed stream must not fail the whole restore. */
+	apple_dart_reimport_locked(dart);
+	pm_runtime_put(dev);
+	return 0;
+}
+#endif
+
+/* A resume from disk also re-imports the roots the boot loader locked again. */
 static const struct dev_pm_ops apple_dart_pm_ops = {
-	SYSTEM_SLEEP_PM_OPS(apple_dart_system_suspend, apple_dart_system_resume)
+	.suspend = pm_sleep_ptr(apple_dart_system_suspend),
+	.resume = pm_sleep_ptr(apple_dart_system_resume),
+	.freeze = pm_sleep_ptr(apple_dart_system_suspend),
+	.thaw = pm_sleep_ptr(apple_dart_system_resume),
+	.poweroff = pm_sleep_ptr(apple_dart_system_suspend),
+#ifdef CONFIG_HIBERNATION
+	.restore = apple_dart_restore,
+#else
+	.restore = pm_sleep_ptr(apple_dart_system_resume),
+#endif
 	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_dart_sys_suspend_noirq, apple_dart_sys_resume_noirq)
 	RUNTIME_PM_OPS(apple_dart_suspend, apple_dart_resume, NULL)
 };
