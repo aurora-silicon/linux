@@ -127,6 +127,7 @@ ASAHI_TESTS = {
                                    'quarantine', 'epoch', 'cutoff', 'whole-batch', 'legacy-format', 'read-drain'), out()),
     'g17-admission-deadline-tests.py': [([], PASS)],
     'g17-admission-order-tests.py': [([], PASS)],
+    'g17-capacity-backoff-tests.py': [([], PASS)],
     'g17-capacity-fault-tests.py': [([], PASS)],
     'g17-compute-constructor-tests.py': [([], PASS)],
     'g17-compute-deadline-tests.py': [([], PASS)],
