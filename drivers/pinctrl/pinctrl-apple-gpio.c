@@ -58,6 +58,13 @@ struct apple_gpio_pinctrl {
 	bool cached;
 	/* Pins this driver has written. Others belong to someone else. */
 	unsigned long *touched;
+	/*
+	 * The block whose every pin the platform puts back after a sleep that lost its power
+	 * (apple,resume-restore-all), but those in gpio-reserved-ranges.
+	 */
+	bool restore_all;
+	unsigned long *no_restore;
+	unsigned long *restored;
 	struct apple_gpio_irq_group irqgrps[];
 };
 
@@ -93,6 +100,10 @@ struct apple_gpio_pinctrl {
 static bool resume_cached = true;
 module_param(resume_cached, bool, 0644);
 MODULE_PARM_DESC(resume_cached, "Put configured pins back after S2R on a cached block too (bring-up)");
+
+static bool resume_all = true;
+module_param(resume_all, bool, 0644);
+MODULE_PARM_DESC(resume_all, "After S2R put back every pin of a block marked apple,resume-restore-all, as the platform (bring-up)");
 
 static const struct regmap_config regmap_config = {
 	.reg_bits = 32,
@@ -627,6 +638,24 @@ static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 	pctl->touched = devm_bitmap_zalloc(&pdev->dev, npins, GFP_KERNEL);
 	if (!pctl->touched)
 		return -ENOMEM;
+	pctl->restore_all = of_property_read_bool(pdev->dev.of_node, "apple,resume-restore-all");
+	if (pctl->restore_all) {
+		int n = of_property_count_u32_elems(pdev->dev.of_node, "gpio-reserved-ranges");
+		u32 start, count;
+
+		pctl->no_restore = devm_bitmap_zalloc(&pdev->dev, npins, GFP_KERNEL);
+		pctl->restored = devm_bitmap_zalloc(&pdev->dev, npins, GFP_KERNEL);
+		if (!pctl->no_restore || !pctl->restored)
+			return -ENOMEM;
+		/* The pins the firmware lists as no-restore, as (first pin, count) pairs. */
+		for (i = 0; n > 0 && i + 1 < (unsigned int)n; i += 2)
+			if (!of_property_read_u32_index(pdev->dev.of_node, "gpio-reserved-ranges",
+							i, &start) &&
+			    !of_property_read_u32_index(pdev->dev.of_node, "gpio-reserved-ranges",
+							i + 1, &count) &&
+			    start < npins && count <= npins - start)
+				bitmap_set(pctl->no_restore, start, count);
+	}
 
 	for (i = 0; i < npins; i++) {
 		pins[i].number = i;
@@ -695,11 +724,28 @@ static int apple_gpio_pinctrl_suspend_noirq(struct device *dev)
 	if (pctl->cached && !READ_ONCE(resume_cached))
 		return 0;
 
+	bitmap_zero(pctl->saved_valid, pctl->pinctrl_desc.npins);
+	/*
+	 * As the platform on the AP block at the system wake: every pin as the
+	 * hardware has it now, but the ones the device tree names, which may not be written
+	 * back. The pins of the panel's TCON bus, set up by the boot loader, are among them.
+	 */
+	if (pctl->restore_all && READ_ONCE(resume_all)) {
+		if (pctl->cached)
+			regcache_cache_bypass(pctl->map, true);
+		for (i = 0; i < pctl->pinctrl_desc.npins; i++)
+			if (!test_bit(i, pctl->no_restore) &&
+			    !regmap_read(pctl->map, REG_GPIO(i), &pctl->saved[i]))
+				set_bit(i, pctl->saved_valid);
+		if (pctl->cached)
+			regcache_cache_bypass(pctl->map, false);
+		return 0;
+	}
+
 	/*
 	 * Only the pins this driver configured. The others belong to the firmware or another
 	 * processor, and writing one back after the wake raises an SError.
 	 */
-	bitmap_zero(pctl->saved_valid, pctl->pinctrl_desc.npins);
 	for_each_set_bit(i, pctl->touched, pctl->pinctrl_desc.npins)
 		if (!regmap_read(pctl->map, REG_GPIO(i), &pctl->saved[i]))
 			set_bit(i, pctl->saved_valid);
@@ -718,17 +764,24 @@ static int apple_gpio_pinctrl_resume_noirq(struct device *dev)
 	/* The saved words came from the cache; the hardware is what to compare. */
 	if (pctl->cached)
 		regcache_cache_bypass(pctl->map, true);
+	if (pctl->restored)
+		bitmap_zero(pctl->restored, pctl->pinctrl_desc.npins);
 	for_each_set_bit(i, pctl->saved_valid, pctl->pinctrl_desc.npins) {
 		if (!regmap_read(pctl->map, REG_GPIO(i), &val) && val == pctl->saved[i])
 			continue;
 		regmap_write(pctl->map, REG_GPIO(i), pctl->saved[i]);
 		restored++;
+		if (pctl->restored && !test_bit(i, pctl->touched))
+			set_bit(i, pctl->restored);
 	}
 	if (pctl->cached)
 		regcache_cache_bypass(pctl->map, false);
 	if (restored)
 		dev_info(dev, "resume: %u of %u configured pins put back\n", restored,
 			 bitmap_weight(pctl->saved_valid, pctl->pinctrl_desc.npins));
+	if (pctl->restored && !bitmap_empty(pctl->restored, pctl->pinctrl_desc.npins))
+		dev_info(dev, "resume: pins not set up by Linux put back: %*pbl\n",
+			 pctl->pinctrl_desc.npins, pctl->restored);
 	bitmap_zero(pctl->saved_valid, pctl->pinctrl_desc.npins);
 
 	return 0;
