@@ -501,6 +501,12 @@ mod tests {
             assert_eq!((window.slot, window.va), (expected.slot, expected.va));
         }
         assert!(g83.reserved_slots.is_empty());
+        // 25G83 does not run work on 40 cores with the 25F84 word +0x2610 = 1.
+        let chip = g83.chip.unwrap();
+        assert!(chip
+            .hw_data_words
+            .iter()
+            .all(|&(offset, _, _)| offset != 0x2610));
         let cores = crate::hw::t6041::CONFIG.core_layout.cores;
         assert_eq!(g83.core_layout.cores, cores);
         assert_eq!(cores, Some((4, 40)));

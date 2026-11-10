@@ -342,6 +342,8 @@ struct dcp_desktop_state {
 	 * framebuffer was evicted; the first atomic enable reuses them.
 	 */
 	bool trial_powered, trial_modeset_ok;
+	/* The takeover kept the loader's mode without setting it. */
+	bool takeover_adopted;
 	u32 trial_timing_mode_id, trial_color_mode_id;
 	/* Result of the last power-on: 0 ok, 1 timeout, 2 failed. */
 	u8 poweron_result;
@@ -1026,6 +1028,23 @@ bool dcp_has_panel(struct apple_dcp *dcp);
  * adaptive sync minimum rate (see dcp_vrr_update()).  The external
  * processors ignore a new minimum on a live mode.
  */
+/*
+ * Desktop 26.x swaps that the watchdog follows: adaptive ones, and those on a
+ * loader mode the takeover adopted until one of them completes.
+ */
+static inline bool dcp_desktop_swap_watched(struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
+	       (READ_ONCE(dcp->vrr_enabled) ||
+		(dcp->desktop && READ_ONCE(dcp->desktop->takeover_adopted)));
+}
+
+static inline void dcp_takeover_adopt_proven(struct apple_dcp *dcp)
+{
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->desktop)
+		WRITE_ONCE(dcp->desktop->takeover_adopted, false);
+}
+
 static inline bool dcp_vrr_live(struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->main_display &&

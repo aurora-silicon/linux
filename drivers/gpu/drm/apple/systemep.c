@@ -114,7 +114,12 @@ have_mnits:
 		if (!dcp_has_panel(dcp))
 			return 0;
 		ret = dcp_backlight_takeover(dcp, mnits.millinits);
-		if (ret && ret != -EBUSY)
+		/*
+		 * With EDR the firmware reports the panel level times the
+		 * headroom, beyond the SDR range: not a loader level, and
+		 * reported with every EDR step, so not worth a message.
+		 */
+		if (ret && ret != -EBUSY && ret != -ERANGE)
 			dev_dbg(dcp->dev, "backlight takeover hint unavailable: %d\n", ret);
 		return 0;
 	}

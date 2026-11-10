@@ -663,10 +663,10 @@ static unsigned int ave_session_count(struct ave_dev *ave)
 }
 
 /*
- * Drain (with @flush), stop and close the session in the firmware. The
+ * Drain normally, or Flush an aborted 6070 stream, then Stop and Close. The
  * last session to go halts the firmware. Caller holds hw_lock.
  */
-static void ave_session_close(struct ave_ctx *ctx, bool flush)
+static void ave_session_close(struct ave_ctx *ctx, bool drain)
 {
 	struct ave_dev *ave = ctx->ave;
 	struct ave_session *sess = ctx->sess;
@@ -677,7 +677,11 @@ static void ave_session_close(struct ave_ctx *ctx, bool flush)
 		return;
 	if (sess->fw_open && ave->fw_state == AVE_FW_RUNNING) {
 		/* Complete is a barrier: answered after every frame before it. */
-		if (flush && sess->frames && !ave_cmd_complete(ctx, AVE_DRAIN_COMPLETES))
+		if (drain && sess->frames && !ave_cmd_complete(ctx, AVE_DRAIN_COMPLETES))
+			ave_ipc_settle(ave, AVE_FRAME_WAIT_MS);
+		else if (!drain && sess->handed &&
+			 !ave->layout->abi->transport->boot_config &&
+			 !ave_cmd_flush(ctx))
 			ave_ipc_settle(ave, AVE_FRAME_WAIT_MS);
 		if (ave->fw_state == AVE_FW_RUNNING)
 			ave_cmd_close(ctx);
@@ -697,14 +701,15 @@ static int ave_session_attach(struct ave_ctx *ctx)
 {
 	struct ave_dev *ave = ctx->ave;
 	struct ave_session *sess = ctx->sess;
+	unsigned int max_sessions = ave->layout->max_sessions ?: AVE_MAX_SESSIONS;
 	int idx = -1, ret;
 
 	lockdep_assert_held(&ave->hw_lock);
-	for (unsigned int i = 0; i < AVE_MAX_SESSIONS && idx < 0; i++)
+	for (unsigned int i = 0; i < max_sessions && idx < 0; i++)
 		if (!ave->sessions[i])
 			idx = i;
 	if (idx < 0) {
-		dev_err(ave->dev, "already encoding %u streams\n", AVE_MAX_SESSIONS);
+		dev_err(ave->dev, "already encoding %u streams\n", max_sessions);
 		return -EBUSY;
 	}
 	if (!ave_session_count(ave)) {
@@ -794,6 +799,8 @@ static int ave_session_begin(struct ave_ctx *ctx)
 	ret = ave_fw_check_build(ave);
 	if (ret)
 		return ret;
+	if (ave->layout->max_sessions == 1 && READ_ONCE(ave->sessions[0]))
+		return -EBUSY;
 	if (READ_ONCE(ave->sessions[0]) && READ_ONCE(ave->sessions[1]))
 		return -EBUSY;
 	/* A halted firmware restarts only from reset: let the power go first. */

@@ -1293,6 +1293,19 @@ VISIBLE_IF_KUNIT void dcp_swap_watchdog(struct work_struct *work)
 		dcp_unarm_retained_framebuffers(dcp, READ_ONCE(dcp->desktop->present_id));
 		dcp_backlight_desktop_finish(dcp, READ_ONCE(dcp->desktop->present_id),
 					     true, false);
+		/*
+		 * The firmware did not take a frame on the adopted loader mode:
+		 * set the mode after all, through the hotplug worker.
+		 */
+		if (xchg(&dcp->desktop->takeover_adopted, false)) {
+			dev_warn(dcp->dev, "no swap completed on the adopted mode, setting it\n");
+			dcp->desktop->mode_live = false;
+			dcp_mode_invalidate(&dcp->mode_state);
+			dcp_drm_crtc_vblank(dcp->crtc);
+			if (dcp->connector)
+				dcp_queue_hotplug(dcp->connector);
+			return;
+		}
 	}
 
 	if (!iomfb_retire_dropped_present_h17p(dcp))
@@ -1314,9 +1327,7 @@ VISIBLE_IF_KUNIT void dcp_swap_watchdog(struct work_struct *work)
 
 void dcp_swap_watchdog_arm(struct apple_dcp *dcp)
 {
-	if (dcp_is_typec_output(dcp) ||
-	    (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
-	     READ_ONCE(dcp->vrr_enabled))) {
+	if (dcp_is_typec_output(dcp) || dcp_desktop_swap_watched(dcp)) {
 		dcp->swap_watchdog_deadline = jiffies +
 			msecs_to_jiffies(DCP_SWAP_WATCHDOG_MS);
 		mod_delayed_work(system_dfl_wq, &dcp->swap_watchdog_wq,
@@ -1328,6 +1339,8 @@ void dcp_swap_watchdog_complete(struct apple_dcp *dcp)
 {
 	cancel_delayed_work(&dcp->swap_watchdog_wq);
 	dcp->swap_watchdog_retrains = 0;
+	/* A completed swap on the adopted mode proves it. */
+	dcp_takeover_adopt_proven(dcp);
 }
 
 /*
