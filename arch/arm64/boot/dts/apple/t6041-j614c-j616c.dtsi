@@ -127,6 +127,255 @@
 				};
 			};
 		};
+
+		/*
+		 * GPU zones, with the M4 Pro's trips: the GPU firmware limits
+		 * itself from 101 C, where these shed CPU power (allocator on at
+		 * 90 C), and they shut down at 118 C after three samples. The
+		 * CPU OPPs have no opp-microwatt yet, so until they do the
+		 * passive trips have no power actors and shed nothing. Each zone
+		 * reads one of the GPU's hotter sensors; which cluster each sits
+		 * on is not known, and under load they read within 1 C.
+		 */
+		gpu0-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			critical-samples = <3>;
+			thermal-sensors = <&smc_hwmon 23>;	/* Tg05 */
+
+			trips {
+				gpu0_switch_on: trip-switch-on {
+					temperature = <90000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				gpu0_passive: trip-passive {
+					temperature = <101000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-e {
+					trip = <&gpu0_passive>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p0 {
+					trip = <&gpu0_passive>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p05 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p1 {
+					trip = <&gpu0_passive>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p15 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		gpu1-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			critical-samples = <3>;
+			thermal-sensors = <&smc_hwmon 39>;	/* Tg1V */
+
+			trips {
+				gpu1_switch_on: trip-switch-on {
+					temperature = <90000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				gpu1_passive: trip-passive {
+					temperature = <101000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-e {
+					trip = <&gpu1_passive>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p0 {
+					trip = <&gpu1_passive>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p05 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p1 {
+					trip = <&gpu1_passive>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p15 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		gpu2-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			critical-samples = <3>;
+			thermal-sensors = <&smc_hwmon 46>;	/* Tg2Q */
+
+			trips {
+				gpu2_switch_on: trip-switch-on {
+					temperature = <90000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				gpu2_passive: trip-passive {
+					temperature = <101000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-e {
+					trip = <&gpu2_passive>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p0 {
+					trip = <&gpu2_passive>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p05 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p1 {
+					trip = <&gpu2_passive>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p15 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		gpu3-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			critical-samples = <3>;
+			thermal-sensors = <&smc_hwmon 54>;	/* Tg3q */
+
+			trips {
+				gpu3_switch_on: trip-switch-on {
+					temperature = <90000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				gpu3_passive: trip-passive {
+					temperature = <101000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-e {
+					trip = <&gpu3_passive>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p0 {
+					trip = <&gpu3_passive>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p05 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p1 {
+					trip = <&gpu3_passive>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p15 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
 	};
 };
 
@@ -277,6 +526,211 @@
 	temperature-TW0P {
 		apple,key-id = "TW0P";
 		label = "WiFi/BT Module Temp";
+	};
+
+	/*
+	 * The 33 GPU sensors of the J614c SMC key table (macOS 26.6.2). All
+	 * rose 15-17 C together under a GPU load. Sixteen read about 5.5 C
+	 * above the other seventeen, idle and loaded; the GPU zones use those.
+	 * While the GPU is powered off the SMC publishes placeholders below
+	 * 10 C, as on the M4 Pro.
+	 */
+	temperature-Tg04 {
+		apple,key-id = "Tg04";
+		label = "GPU Tg04";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg05 {
+		apple,key-id = "Tg05";
+		label = "GPU Tg05";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0K {
+		apple,key-id = "Tg0K";
+		label = "GPU Tg0K";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0L {
+		apple,key-id = "Tg0L";
+		label = "GPU Tg0L";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0R {
+		apple,key-id = "Tg0R";
+		label = "GPU Tg0R";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0S {
+		apple,key-id = "Tg0S";
+		label = "GPU Tg0S";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0X {
+		apple,key-id = "Tg0X";
+		label = "GPU Tg0X";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0Y {
+		apple,key-id = "Tg0Y";
+		label = "GPU Tg0Y";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0d {
+		apple,key-id = "Tg0d";
+		label = "GPU Tg0d";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0e {
+		apple,key-id = "Tg0e";
+		label = "GPU Tg0e";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0j {
+		apple,key-id = "Tg0j";
+		label = "GPU Tg0j";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0k {
+		apple,key-id = "Tg0k";
+		label = "GPU Tg0k";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0y {
+		apple,key-id = "Tg0y";
+		label = "GPU Tg0y";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0z {
+		apple,key-id = "Tg0z";
+		label = "GPU Tg0z";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg1E {
+		apple,key-id = "Tg1E";
+		label = "GPU Tg1E";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg1F {
+		apple,key-id = "Tg1F";
+		label = "GPU Tg1F";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg1U {
+		apple,key-id = "Tg1U";
+		label = "GPU Tg1U";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg1V {
+		apple,key-id = "Tg1V";
+		label = "GPU Tg1V";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg1c {
+		apple,key-id = "Tg1c";
+		label = "GPU Tg1c";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg1d {
+		apple,key-id = "Tg1d";
+		label = "GPU Tg1d";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg1k {
+		apple,key-id = "Tg1k";
+		label = "GPU Tg1k";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg1l {
+		apple,key-id = "Tg1l";
+		label = "GPU Tg1l";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg22 {
+		apple,key-id = "Tg22";
+		label = "GPU Tg22";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg2I {
+		apple,key-id = "Tg2I";
+		label = "GPU Tg2I";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg2Q {
+		apple,key-id = "Tg2Q";
+		label = "GPU Tg2Q";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg2Y {
+		apple,key-id = "Tg2Y";
+		label = "GPU Tg2Y";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg2g {
+		apple,key-id = "Tg2g";
+		label = "GPU Tg2g";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg2o {
+		apple,key-id = "Tg2o";
+		label = "GPU Tg2o";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg34 {
+		apple,key-id = "Tg34";
+		label = "GPU Tg34";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg3K {
+		apple,key-id = "Tg3K";
+		label = "GPU Tg3K";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg3a {
+		apple,key-id = "Tg3a";
+		label = "GPU Tg3a";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg3i {
+		apple,key-id = "Tg3i";
+		label = "GPU Tg3i";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg3q {
+		apple,key-id = "Tg3q";
+		label = "GPU Tg3q";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	power-PSTR {
