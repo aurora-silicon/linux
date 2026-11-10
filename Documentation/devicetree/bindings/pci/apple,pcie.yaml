@@ -147,6 +147,13 @@ properties:
   iommu-map: true
   iommu-map-mask: true
 
+  post-init-providers:
+    description:
+      The DART of a host whose iommu-map names a DART marked
+      apple,manual-availability, so that fw_devlink does not make the host wait
+      for a DART that probes only after the host has brought up its port.
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+
   power-domains:
     description:
       The power domains the controller needs. Internal controllers on some
