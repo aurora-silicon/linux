@@ -4,15 +4,25 @@
 //!
 //! Copyright (C) The Asahi Linux Contributors
 
+use core::{
+    ffi::{c_int, c_void},
+    ptr,
+};
+
 use kernel::{
     bindings, c_str,
-    device::Core,
+    device::{self, Core},
     firmware::Firmware,
     iio::common::aop_sensors::{AopSensorData, IIORegistration, MessageProcessor, MICRO},
     module_platform_driver, of, platform,
     prelude::*,
     soc::apple::aop::{EPICService, FakehidRegistration, AOP},
-    sync::Arc,
+    sync::{
+        aref::ARef,
+        atomic::{Atomic, Relaxed},
+        Arc,
+    },
+    types::Opaque,
 };
 
 const EPIC_SUBTYPE_GET_AOP_PROPERTY: u16 = 0xa;
@@ -146,6 +156,149 @@ fn set_als_property(aop: &dyn AOP, svc: &EPICService, tag: u32, data: &[u8]) -> 
     aop.epic_call(svc, EPIC_SUBTYPE_SET_ALS_PROPERTY, &buf)
 }
 
+/// Stops the reports around system sleep and starts them again after.
+///
+/// The AOP mailbox interrupt stays enabled in suspend-to-idle, so every
+/// report ends the CPUs' idle period: at the 200 ms interval the sensor
+/// woke the system five times a second. A zero interval stops the reports;
+/// The platform writes one to its AOP sensors when the system sleeps and the
+/// interval they had when it wakes.
+///
+/// Only suspend is handled. A hibernation powers the system off, and after
+/// a resume from disk the AOP core may have restarted the co-processor and
+/// probed this driver again, which then starts the reports itself.
+#[repr(C)]
+struct PmHook {
+    /// First, so that the callback finds the hook from it.
+    nb: Opaque<bindings::notifier_block>,
+    dev: ARef<device::Device>,
+    aop: Arc<dyn AOP>,
+    service: EPICService,
+    registered: Atomic<bool>,
+}
+
+/// The PM notifier callback.
+///
+/// # Safety
+///
+/// `nb` is the notifier block of a registered [`PmHook`].
+unsafe extern "C" fn pm_event(
+    nb: *mut bindings::notifier_block,
+    action: usize,
+    _data: *mut c_void,
+) -> c_int {
+    // SAFETY: `nb` is the first field of a registered `PmHook`.
+    let hook = unsafe { &*nb.cast::<PmHook>() };
+    let interval = match action as u32 {
+        bindings::PM_SUSPEND_PREPARE => 0,
+        bindings::PM_POST_SUSPEND => ALS_INTERVAL_US,
+        _ => return bindings::NOTIFY_DONE as c_int,
+    };
+    // As at probe, only the transport can fail; the sensor's status word is
+    // not an error (see the property comments above).
+    match set_als_property(
+        hook.aop.as_ref(),
+        &hook.service,
+        ALS_PROP_INTERVAL,
+        &interval.to_le_bytes(),
+    ) {
+        Ok(status) => dev_dbg!(
+            hook.dev,
+            "interval = {} for sleep: status {:#x}\n",
+            interval,
+            status
+        ),
+        Err(e) => dev_warn!(hook.dev, "reports not switched for sleep: {:?}\n", e),
+    }
+    bindings::NOTIFY_OK as c_int
+}
+
+/// # Safety
+///
+/// `nb` stays valid and pinned until [`pm_unregister`] is called on it.
+#[cfg(CONFIG_PM_SLEEP)]
+unsafe fn pm_register(nb: *mut bindings::notifier_block) -> c_int {
+    // SAFETY: By the caller's contract.
+    unsafe { bindings::register_pm_notifier(nb) }
+}
+
+/// # Safety
+///
+/// `nb` was registered by [`pm_register`].
+#[cfg(CONFIG_PM_SLEEP)]
+unsafe fn pm_unregister(nb: *mut bindings::notifier_block) {
+    // SAFETY: By the caller's contract.
+    unsafe { bindings::unregister_pm_notifier(nb) };
+}
+
+/// Without system sleep there is nothing to switch.
+///
+/// # Safety
+///
+/// None; the signature matches the one with system sleep.
+#[cfg(not(CONFIG_PM_SLEEP))]
+unsafe fn pm_register(_nb: *mut bindings::notifier_block) -> c_int {
+    0
+}
+
+/// # Safety
+///
+/// None; the signature matches the one with system sleep.
+#[cfg(not(CONFIG_PM_SLEEP))]
+unsafe fn pm_unregister(_nb: *mut bindings::notifier_block) {}
+
+// SAFETY: The notifier block is only touched by the PM core, which
+// serializes registration, removal and the callbacks itself.
+unsafe impl Send for PmHook {}
+// SAFETY: See above; the other fields are `Sync`.
+unsafe impl Sync for PmHook {}
+
+impl PmHook {
+    fn new(
+        dev: &device::Device,
+        aop: Arc<dyn AOP>,
+        service: EPICService,
+    ) -> Result<Pin<KBox<Self>>> {
+        let hook = KBox::pin(
+            Self {
+                nb: Opaque::new(bindings::notifier_block {
+                    notifier_call: Some(pm_event),
+                    next: ptr::null_mut(),
+                    priority: 0,
+                }),
+                dev: dev.into(),
+                aop,
+                service,
+                registered: Atomic::new(false),
+            },
+            GFP_KERNEL,
+        )?;
+        // SAFETY: The block is pinned inside the hook, which unregisters it
+        // before it goes.
+        let ret = unsafe { pm_register(hook.nb.get()) };
+        if ret < 0 {
+            return Err(Error::from_errno(ret));
+        }
+        hook.registered.store(true, Relaxed);
+        Ok(hook)
+    }
+
+    /// Returns once no callback is running any more; repeated calls do
+    /// nothing.
+    fn unregister(&self) {
+        if self.registered.xchg(false, Relaxed) {
+            // SAFETY: `nb` was registered by `new()`.
+            unsafe { pm_unregister(self.nb.get()) };
+        }
+    }
+}
+
+impl Drop for PmHook {
+    fn drop(&mut self) {
+        self.unregister();
+    }
+}
+
 /// Converts the bits of an IEEE 754 single to microlux, rounding down.
 /// Negative values clamp to zero; NaN and the infinities carry no reading.
 /// Values beyond `MAX_MICRO` saturate when they are stored.
@@ -206,7 +359,9 @@ enum AlsIio {
 }
 
 struct IIOAopAlsDriver {
-    /// Declared first: the subscription ends before the IIO device goes.
+    /// Fields are declared in teardown order: sleep handling first, then the
+    /// subscription, which ends before the IIO device goes.
+    pm: Pin<KBox<PmHook>>,
     listener: FakehidRegistration,
     _iio: AlsIio,
 }
@@ -285,13 +440,16 @@ impl platform::Driver for IIOAopAlsDriver {
                 },
             )
         };
+        let pm = PmHook::new(dev, adata, service)?;
         Ok(IIOAopAlsDriver {
+            pm,
             listener,
             _iio: iio,
         })
     }
 
     fn unbind(_dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
+        this.pm.unregister();
         this.listener.unregister();
     }
 }

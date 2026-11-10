@@ -19,6 +19,7 @@
 #include <linux/slab.h>
 #include <linux/sizes.h>
 #include <linux/soc/apple/dockchannel.h>
+#include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/rtkit-helper.h>
 #include <linux/string.h>
 #include <linux/suspend.h>
@@ -208,6 +209,11 @@ struct dockchannel_hid {
 	bool suspended;
 	/* The firmware was told of a sleep and has not been told of the wake */
 	bool host_asleep;
+	/* Boot kernel of a resume from disk: input handed to the image. */
+	bool hib_quiesced;
+	u32 hib_off_mask;
+	/* After taking the ring over: one resync to the producer allowed. */
+	bool ring_resync;
 
 	/* Held from probe on when the multi-touch interface uses power method 2 */
 	struct gpio_desc *afe_reset;
@@ -743,6 +749,50 @@ static int dchid_request_gpio(struct dchid_iface *iface)
 	return 0;
 }
 
+/* Upload the interface firmware, then reset the interface to run it. */
+static int dchid_load_firmware(struct dchid_iface *iface, void *fw, size_t size)
+{
+	int ret;
+
+	/* Send firmware to the device */
+	dev_dbg(iface->dchid->dev, "Sending firmware for %s\n", iface->name);
+	/* Retained MTP must see AFE reset throughout firmware upload. */
+	if (iface->dchid->inherited_mtp &&
+	    iface->power_method == DCHID_POWER_METHOD_2) {
+		if (iface->firmware_managed_reset)
+			return -EINVAL;
+		ret = gpiod_set_value_cansleep(iface->dchid->afe_reset, 1);
+		if (ret < 0)
+			return ret;
+		fsleep(50 * USEC_PER_MSEC);
+	}
+	ret = dchid_send_firmware(iface, fw, size);
+	if (ret < 0) {
+		dev_err(iface->dchid->dev, "Failed to send %s firmware\n", iface->name);
+		return ret;
+	}
+
+	/* After loading firmware, multi-touch needs a reset */
+	dev_dbg(iface->dchid->dev, "Resetting %s\n", iface->name);
+	if (iface->power_method == DCHID_POWER_METHOD_2) {
+		/* The retained session is already off while reset is asserted. */
+		if (!iface->dchid->inherited_mtp) {
+			ret = dchid_pm2_set_power(iface, DCHID_POWER_STATE_OFF);
+			if (ret < 0)
+				return ret;
+		}
+		ret = dchid_pm2_set_power(iface, DCHID_POWER_STATE_ON);
+		if (ret < 0)
+			return ret;
+	} else {
+		ret = dchid_reset_interface(iface, DCHID_POWER_STATE_OFF);
+		/* After a failed AFE power-off the trackpad stays off: no retry. */
+		if (ret >= 0 || !iface->dchid->afe_smc || iface->index != 1)
+			dchid_reset_interface(iface, DCHID_POWER_STATE_ON);
+	}
+	return 0;
+}
+
 static int dchid_start_interface(struct dchid_iface *iface)
 {
 	void *fw;
@@ -775,45 +825,9 @@ static int dchid_start_interface(struct dchid_iface *iface)
 
 	/* Only multi-touch has firmware */
 	if (fw && size) {
-
-		/* Send firmware to the device */
-		dev_dbg(iface->dchid->dev, "Sending firmware for %s\n", iface->name);
-		/* Retained MTP must see AFE reset throughout firmware upload. */
-		if (iface->dchid->inherited_mtp &&
-		    iface->power_method == DCHID_POWER_METHOD_2) {
-			if (iface->firmware_managed_reset) {
-				ret = -EINVAL;
-				goto err;
-			}
-			ret = gpiod_set_value_cansleep(iface->dchid->afe_reset, 1);
-			if (ret < 0)
-				goto err;
-			fsleep(50 * USEC_PER_MSEC);
-		}
-		ret = dchid_send_firmware(iface, fw, size);
-		if (ret < 0) {
-			dev_err(iface->dchid->dev, "Failed to send %s firmware\n", iface->name);
+		ret = dchid_load_firmware(iface, fw, size);
+		if (ret < 0)
 			goto err;
-		}
-
-		/* After loading firmware, multi-touch needs a reset */
-		dev_dbg(iface->dchid->dev, "Resetting %s\n", iface->name);
-		if (iface->power_method == DCHID_POWER_METHOD_2) {
-			/* The retained session is already off while reset is asserted. */
-			if (!iface->dchid->inherited_mtp) {
-				ret = dchid_pm2_set_power(iface, DCHID_POWER_STATE_OFF);
-				if (ret < 0)
-					goto err;
-			}
-			ret = dchid_pm2_set_power(iface, DCHID_POWER_STATE_ON);
-			if (ret < 0)
-				goto err;
-		} else {
-			ret = dchid_reset_interface(iface, DCHID_POWER_STATE_OFF);
-			/* After a failed AFE power-off the trackpad stays off: no retry. */
-			if (ret >= 0 || !iface->dchid->afe_smc || iface->index != 1)
-				dchid_reset_interface(iface, DCHID_POWER_STATE_ON);
-		}
 	}
 
 	return 0;
@@ -1531,11 +1545,23 @@ static int dchid_drain_ring(struct dockchannel_hid *dchid)
 		dchid_ring_copy(dchid, dchid->pkt_buf, consumer,
 				sizeof(struct dchid_hdr));
 		size = dchid_frame_size((void *)dchid->pkt_buf);
+		if (size < 0 && dchid->ring_resync)
+			goto resync;
 		if (size < 0)
 			return size;
 		if (available < size)
 			return 0;
 		dchid_ring_copy(dchid, dchid->pkt_buf, consumer, size);
+		if (dchid->ring_resync) {
+			u32 checksum;
+
+			if (!dchid_verify_checksum((void *)dchid->pkt_buf,
+						   dchid->pkt_buf + sizeof(struct dchid_hdr),
+						   &checksum))
+				goto resync;
+			/* The first good frame shows the ring is in step. */
+			dchid->ring_resync = false;
+		}
 		dchid_dispatch(dchid, (void *)dchid->pkt_buf,
 			       dchid->pkt_buf + sizeof(struct dchid_hdr), false);
 		consumer += size;
@@ -1548,6 +1574,21 @@ static int dchid_drain_ring(struct dockchannel_hid *dchid)
 		cond_resched();
 	}
 	return 0;
+
+resync:
+	/*
+	 * Only right after a resume from disk took the ring over: frames the
+	 * firmware wrote while the image was being restored are lost. Drop
+	 * what is between the consumer and the producer once.
+	 */
+	dchid->ring_resync = false;
+	dev_warn(dchid->dev, "receive ring out of step after resume from disk: skipping %#x..%#x\n",
+		 consumer, producer);
+	dchid->ring_read = producer;
+	/* As in the loop: frame reads complete before the producer may reuse them. */
+	mb();
+	WRITE_ONCE(indices[1], producer);
+	return 0;
 }
 
 static void dchid_handle_packet(void *cookie, size_t avail)
@@ -1559,9 +1600,12 @@ static void dchid_handle_packet(void *cookie, size_t avail)
 	if (READ_ONCE(dchid->stopping))
 		return;
 
+	/* Woken with less than a header in the FIFO: nothing to read yet. */
+	if (avail < sizeof(hdr))
+		goto done;
 	if (dockchannel_recv(dchid->dc, &hdr, sizeof(hdr)) != sizeof(hdr)) {
 		dev_err(dchid->dev, "Read failed (header)\n");
-		return;
+		goto done;
 	}
 	if (hdr.hdr_len != sizeof(hdr)) {
 		dev_err(dchid->dev, "Bad header length %d\n", hdr.hdr_len);
@@ -1913,8 +1957,295 @@ static int dockchannel_hid_resume(struct device *dev)
 	return ret;
 }
 
+#ifdef CONFIG_HIBERNATION
+/*
+ * Resume from disk with the MTP started by the boot kernel (for instance to
+ * type a disk passphrase in its initramfs). The boot kernel quiesces its
+ * devices before it jumps into the image; the MTP firmware is not stopped
+ * (it does not come back from RTKit QUIESCED), so the restored kernel takes
+ * over the running instance, as the RTKit helper does for the RTKit session:
+ *
+ * boot kernel (.freeze while apple_rtkit_hib_restoring()):
+ *   the input interfaces (keyboard; multi-touch once its firmware runs) are
+ *   powered off with the interface power-state commands, so that the
+ *   firmware sends (and DMAs) as little as possible while
+ *   the image is restored; then receive stops, the receive ring is drained
+ *   and its position is left for the image with the ring's IOVA.
+ *
+ * restored kernel (.restore), only if the helper took the RTKit session
+ * over and the ring sits at the same IOVA in both kernels:
+ *   the ring indices are set to the position the boot kernel stopped at
+ *   (or, if the boot kernel never registered the ring, the ring is
+ *   registered again from its start), receive restarts, and the interfaces
+ *   the boot kernel powered off are powered on again. A multi-touch
+ *   interface the image had started but the boot kernel had not gets its
+ *   firmware as on a first open.
+ *
+ * Otherwise .restore keeps the plain behaviour: a co-processor the boot
+ * loader left halted stops the transport until userspace reloads the
+ * drivers, one that runs but cannot be adopted is left as it is.
+ * Only the ring transport (T6041 / J616s) is handled.
+ */
+struct dchid_hib {
+	u32 version;
+	u32 ring_size;
+	u64 ring_dma;
+	u32 ring_pos;
+	u32 off_mask;
+	u32 started_mask;
+	u32 flags;
+};
+
+#define DCHID_HIB_VERSION 2
+/* The boot kernel gave its firmware the receive ring. */
+#define DCHID_HIB_RING_REGISTERED BIT(0)
+
+static void dchid_hib_tag(struct dockchannel_hid *dchid, char *tag, size_t len)
+{
+	snprintf(tag, len, "dchid:%s", dev_name(dchid->dev));
+}
+
+static bool dchid_hib_input(struct dchid_iface *iface)
+{
+	if (!strcmp(iface->name, "keyboard"))
+		return true;
+	/* Without its firmware the multi-touch interface was never powered. */
+	return !strcmp(iface->name, "multi-touch") && iface->starting;
+}
+
+/* The power sequences of dchid_load_firmware(), one direction at a time. */
+static int dchid_hib_set_power(struct dchid_iface *iface, u8 state)
+{
+	if (iface->power_method == DCHID_POWER_METHOD_2)
+		return dchid_pm2_set_power(iface, state);
+	return dchid_reset_interface(iface, state);
+}
+
+static void dchid_hib_quiesce(struct dockchannel_hid *dchid)
+{
+	struct dchid_hib rec = {
+		.version = DCHID_HIB_VERSION,
+		.ring_size = DCHID_RING_SIZE,
+		.ring_dma = dchid->ring_dma,
+	};
+	u32 *indices = dchid->ring;
+	char tag[32];
+	int i, ret;
+
+	for (i = 0; i < MAX_INTERFACES; i++) {
+		struct dchid_iface *iface = dchid->ifaces[i];
+
+		if (!iface || !iface->hid)
+			continue;
+		if (iface->starting)
+			rec.started_mask |= BIT(i);
+		if (!dchid_hib_input(iface))
+			continue;
+		ret = dchid_hib_set_power(iface, DCHID_POWER_STATE_OFF);
+		if (ret < 0) {
+			dev_warn(dchid->dev, "resume from disk: %s not powered off: %d\n",
+				 iface->name, ret);
+			continue;
+		}
+		rec.off_mask |= BIT(i);
+	}
+
+	if (READ_ONCE(dchid->ring_registered) && !dchid->ring_error)
+		rec.flags |= DCHID_HIB_RING_REGISTERED;
+
+	/* The power-off acknowledgments came through the ring: stop now. */
+	dockchannel_await(dchid->dc, NULL, NULL, 0);
+	ret = dchid_drain_ring(dchid);
+	if (ret < 0)
+		dev_warn(dchid->dev, "resume from disk: final ring drain failed: %d\n", ret);
+	rec.ring_pos = dchid->ring_read;
+	if (READ_ONCE(indices[0]) != rec.ring_pos)
+		dev_warn(dchid->dev, "resume from disk: ring not empty at hand-off (%#x, producer %#x)\n",
+			 rec.ring_pos, READ_ONCE(indices[0]));
+
+	dchid->hib_quiesced = true;
+	dchid->hib_off_mask = rec.off_mask;
+	dchid_hib_tag(dchid, tag, sizeof(tag));
+	ret = apple_rtkit_hib_handoff_put(tag, &rec, sizeof(rec));
+	if (ret)
+		dev_warn(dchid->dev, "resume from disk: no hand-off record for the image: %d\n",
+			 ret);
+	else
+		dev_info(dchid->dev, "resume from disk: input left for the image (interfaces off %#x, ring at %#x)\n",
+			 rec.off_mask, rec.ring_pos);
+}
+
+static int dockchannel_hid_freeze(struct device *dev)
+{
+	struct dockchannel_hid *dchid = dev_get_drvdata(dev);
+	int ret;
+
+	ret = dockchannel_hid_suspend(dev);
+	if (ret)
+		return ret;
+	if (dchid->use_ring && apple_rtkit_hib_restoring())
+		dchid_hib_quiesce(dchid);
+	return 0;
+}
+
+static void dchid_hib_power_on(struct dockchannel_hid *dchid, u32 mask)
+{
+	int i, ret;
+
+	for (i = 0; i < MAX_INTERFACES; i++) {
+		struct dchid_iface *iface = dchid->ifaces[i];
+
+		if (!(mask & BIT(i)) || !iface)
+			continue;
+		ret = dchid_hib_set_power(iface, DCHID_POWER_STATE_ON);
+		if (ret < 0)
+			dev_err(dchid->dev, "resume from disk: %s not powered on: %d\n",
+				iface->name, ret);
+	}
+}
+
+static int dockchannel_hid_thaw(struct device *dev)
+{
+	struct dockchannel_hid *dchid = dev_get_drvdata(dev);
+	char tag[32];
+
+	/* The jump into the image failed: this kernel keeps the input. */
+	if (dchid->hib_quiesced) {
+		dchid->hib_quiesced = false;
+		dchid_hib_tag(dchid, tag, sizeof(tag));
+		apple_rtkit_hib_handoff_drop(tag);
+		dockchannel_await(dchid->dc, dchid_handle_packet, dchid,
+				  sizeof(struct dchid_hdr));
+		dchid_hib_power_on(dchid, dchid->hib_off_mask);
+	}
+	return dockchannel_hid_resume(dev);
+}
+
+static void dchid_hib_take_over(struct dockchannel_hid *dchid, const struct dchid_hib *rec)
+{
+	const u32 capacity = DCHID_RING_SIZE - DCHID_RING_HEADER_SIZE;
+	u32 *indices = dchid->ring;
+	bool reregister;
+	int i, ret;
+
+	if (rec->version != DCHID_HIB_VERSION || rec->ring_size != DCHID_RING_SIZE ||
+	    rec->ring_dma != dchid->ring_dma || rec->ring_pos >= capacity ||
+	    !IS_ALIGNED(rec->ring_pos, 4)) {
+		dev_err(dchid->dev, "resume from disk: boot kernel ring %#llx+%#x@%#x does not match the image's %pad: input not taken over\n",
+			rec->ring_dma, rec->ring_size, rec->ring_pos, &dchid->ring_dma);
+		return;
+	}
+
+	/*
+	 * A boot kernel that started no interface (nothing opened the trackpad)
+	 * never gave its firmware the receive ring, which this kernel had
+	 * registered with its own: register it again, from the start, as a
+	 * first open does. Otherwise the firmware goes on at the position the
+	 * boot kernel drained to; the ring memory and indices it wrote were in
+	 * the boot kernel's RAM.
+	 */
+	reregister = !(rec->flags & DCHID_HIB_RING_REGISTERED) &&
+		     READ_ONCE(dchid->ring_registered);
+	dockchannel_await(dchid->dc, NULL, NULL, 0);
+	mutex_lock(&dchid->ring_mutex);
+	if (reregister) {
+		dchid->ring_read = 0;
+		WRITE_ONCE(indices[0], 0);
+		WRITE_ONCE(indices[1], 0);
+		dchid->ring_resync = false;
+		dchid->ring_error = 0;
+		WRITE_ONCE(dchid->ring_registered, false);
+	} else {
+		dchid->ring_read = rec->ring_pos;
+		WRITE_ONCE(indices[0], rec->ring_pos);
+		WRITE_ONCE(indices[1], rec->ring_pos);
+		dchid->ring_resync = true;
+	}
+	mutex_unlock(&dchid->ring_mutex);
+	/* Indices visible to the firmware before it is told anything. */
+	wmb();
+	dockchannel_await(dchid->dc, dchid_handle_packet, dchid,
+			  sizeof(struct dchid_hdr));
+
+	if (reregister) {
+		ret = dchid_register_ring(dchid);
+		if (ret < 0)
+			dev_err(dchid->dev, "resume from disk: receive ring not registered with the boot kernel's firmware: %d\n",
+				ret);
+		else
+			dev_info(dchid->dev, "resume from disk: receive ring registered with the boot kernel's firmware\n");
+	}
+
+	dchid_hib_power_on(dchid, rec->off_mask);
+
+	/* Started here but not in the boot kernel: firmware as on a first open. */
+	for (i = 0; i < MAX_INTERFACES; i++) {
+		struct dchid_iface *iface = dchid->ifaces[i];
+		void *fw;
+		size_t size;
+
+		if (!iface || !iface->starting || (rec->started_mask & BIT(i)))
+			continue;
+		ret = dchid_get_firmware(iface, &fw, &size);
+		if (!ret && fw && size)
+			ret = dchid_load_firmware(iface, fw, size);
+		if (ret < 0)
+			dev_err(dchid->dev, "resume from disk: %s not restarted: %d\n",
+				iface->name, ret);
+	}
+
+	dev_info(dchid->dev, "resume from disk: took over the input the boot kernel started (interfaces on %#x, ring at %#x)\n",
+		 rec->off_mask, rec->ring_pos);
+}
+
+static int dockchannel_hid_restore(struct device *dev)
+{
+	struct dockchannel_hid *dchid = dev_get_drvdata(dev);
+	struct dchid_hib rec;
+	char tag[32];
+	int ret;
+
+	dchid->hib_quiesced = false;
+	dchid_hib_tag(dchid, tag, sizeof(tag));
+	ret = apple_rtkit_hib_handoff_take(tag, &rec, sizeof(rec));
+	if (ret == sizeof(rec)) {
+		if (!dchid->use_ring)
+			dev_warn(dev, "resume from disk: hand-off without a receive ring: input not taken over\n");
+		else if (!apple_rtkit_helper_readopted(dchid->helper_link->supplier))
+			dev_warn(dev, "resume from disk: the RTKit helper did not take the session over: input not taken over\n");
+		else
+			dchid_hib_take_over(dchid, &rec);
+	} else if (ret != -ENOENT) {
+		dev_warn(dev, "resume from disk: invalid hand-off record: %d\n", ret);
+	}
+
+	/*
+	 * The boot loader halted the co-processor and the boot kernel did not
+	 * start it: the firmware this kernel talked to is gone, and the FIFO
+	 * never answers again. Stop the transport, so that receive does not
+	 * wait for frames and the HID core's requests fail at once, until the
+	 * drivers are probed again (which starts the co-processor).
+	 */
+	if (apple_rtkit_helper_halted_underneath(dchid->helper_link->supplier)) {
+		WRITE_ONCE(dchid->stopping, true);
+		dockchannel_await(dchid->dc, NULL, NULL, 0);
+		dev_info(dev, "resume from disk: co-processor halted underneath: input stopped until the drivers are reloaded\n");
+	}
+	return dockchannel_hid_resume(dev);
+}
+
+static const struct dev_pm_ops dockchannel_hid_pm_ops = {
+	.suspend = dockchannel_hid_suspend,
+	.resume = dockchannel_hid_resume,
+	.freeze = dockchannel_hid_freeze,
+	.thaw = dockchannel_hid_thaw,
+	.poweroff = dockchannel_hid_suspend,
+	.restore = dockchannel_hid_restore,
+};
+#else
 static DEFINE_SIMPLE_DEV_PM_OPS(dockchannel_hid_pm_ops, dockchannel_hid_suspend,
 				dockchannel_hid_resume);
+#endif
 
 static const struct of_device_id dockchannel_hid_of_match[] = {
 	{ .compatible = "apple,dockchannel-hid" },
