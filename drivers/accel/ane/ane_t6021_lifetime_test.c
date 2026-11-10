@@ -2,6 +2,7 @@
 #include <kunit/test.h>
 #include <linux/module.h>
 #include <linux/slab.h>
+#include <linux/unaligned.h>
 
 #include "ane_t6021_lifetime.h"
 
@@ -704,6 +705,26 @@ static void restart_stop_boundary_test(struct kunit *test)
 	}
 }
 
+static void perf_mode_cmd_test(struct kunit *test)
+{
+	u8 cmd[32];
+
+	memset(cmd, 0xa5, sizeof(cmd));
+	KUNIT_EXPECT_EQ(test, ane_t6021_perf_mode_cmd(cmd),
+			(size_t)ANE_T6021_PROP_WRITE_LEN);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(cmd + ANE_T6021_PROP_CHANNEL_OFF),
+			(u32)ANE_T6021_PROP_CHANNEL_ENGINE);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(cmd + ANE_T6021_PROP_ID_OFF),
+			(u32)ANE_T6021_PROP_PERF_MODE);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(cmd + ANE_T6021_PROP_VALUE_OFF),
+			(u32)ANE_T6021_PERF_MODE_ON);
+	/* The command header and anything past the body stay untouched. */
+	for (int i = 0; i < ANE_T6021_PROP_CHANNEL_OFF; i++)
+		KUNIT_EXPECT_EQ(test, cmd[i], 0xa5);
+	for (size_t i = ANE_T6021_PROP_WRITE_LEN; i < sizeof(cmd); i++)
+		KUNIT_EXPECT_EQ(test, cmd[i], 0xa5);
+}
+
 static void restart_state_machine_test(struct kunit *test)
 {
 	enum ane_t6021_restart_stage stage;
@@ -767,6 +788,7 @@ static struct kunit_case lifetime_cases[] = {
 	KUNIT_CASE(unload_order_test),
 	KUNIT_CASE(restart_state_machine_test),
 	KUNIT_CASE(restart_stop_boundary_test),
+	KUNIT_CASE(perf_mode_cmd_test),
 	{}
 };
 
