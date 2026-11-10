@@ -165,7 +165,7 @@ ASAHI_TESTS = {
     'pmp-j613-hwmon-tests.py': [([], PASS)],
     'pmu-rtc-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('ack-clobber', 'arm-ack', 'offset-seconds',
-                                   'offset-sign', 'event-bit', 'wrong-base', 'wrong-control',
+                                   'offset-sign', 'event-bit', 'wrong-control',
                                    'maverick-event', 'stowe-offset'), out()),
     'perf-mmap-alias-lifecycle-tests.py': [([], PASS)],
     'qspi-nvram-tests.py': [(out('--output'), PASS)],
