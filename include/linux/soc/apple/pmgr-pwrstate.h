@@ -20,6 +20,7 @@ int apple_pmgr_ps_verify_state(struct device *domain_dev, bool on);
 int apple_pmgr_ps_consumer_check(struct device *consumer);
 int apple_pmgr_ps_consumer_off(struct device *consumer);
 int apple_pmgr_ps_consumer_on(struct device *consumer);
+bool apple_pmgr_ps_consumer_is_off(struct device *consumer);
 #else
 static inline int apple_pmgr_ps_verify_state(struct device *domain_dev, bool on)
 {
@@ -29,6 +30,7 @@ static inline int apple_pmgr_ps_cycle(struct device_node *np) { return -EOPNOTSU
 static inline int apple_pmgr_ps_consumer_check(struct device *consumer) { return -EOPNOTSUPP; }
 static inline int apple_pmgr_ps_consumer_off(struct device *consumer) { return -EOPNOTSUPP; }
 static inline int apple_pmgr_ps_consumer_on(struct device *consumer) { return -EOPNOTSUPP; }
+static inline bool apple_pmgr_ps_consumer_is_off(struct device *consumer) { return false; }
 #endif
 
 #endif
