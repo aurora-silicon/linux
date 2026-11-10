@@ -24,9 +24,9 @@ config APPLE_DBGVIEW
 	depends on ARM64 && OF && DEBUG_FS
 	help
 	  Root-only debugfs views of Apple SoC debug register blocks: the
-	  interrupt controller timebase and the debug dock connection
-	  status. The driver only reads registers, and only when a debugfs
-	  file is read.
+	  interrupt controller timebase, the debug dock connection
+	  status and the unused T8112 DWI interface. The driver only
+	  reads registers, and only when a debugfs file is read.
 
 	  Say m here if you debug an Apple SoC.
 

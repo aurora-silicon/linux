@@ -96,7 +96,6 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 17 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_dwi>;
-		status = "disabled";
 	};
 
 	m2_event_log_handler: event-log@23b700000 {
