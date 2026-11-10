@@ -507,6 +507,9 @@ void dcp_backlight_desktop_power(struct apple_dcp *dcp, bool on)
 	if (!on)
 		dcp_backlight_stop(dcp);
 	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	/* The firmware's first request after a power on is never rate limited. */
+	if (on)
+		dcp->backlight.resent = false;
 	dcp->backlight.state.dpms_off = !on;
 	if (dcp->backlight.state.controlled)
 		dcp_bl_jump(&dcp->backlight.state);
