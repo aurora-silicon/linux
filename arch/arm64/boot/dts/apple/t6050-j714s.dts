@@ -15,6 +15,26 @@
 
 #include "t6050-max.dtsi"
 
+/* The console on the USB debug link: ADT dockchannel-uart, channel 1 */
+/ {
+	aliases {
+		serial0 = &dockchannel;
+	};
+
+	chosen {
+		stdout-path = "serial0:1500000n8";
+	};
+};
+
+/*
+ * It drains only while a host reads it; the machine also boots with nothing
+ * attached there.
+ */
+&dockchannel {
+	apple,tx-never-wait;
+	status = "okay";
+};
+
 / {
 	compatible = "apple,j714s", "apple,t6050", "apple,arm-platform";
 	model = "Apple MacBook Pro (14-inch, M5 Pro, 2026)";
