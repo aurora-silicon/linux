@@ -2320,6 +2320,81 @@
 #include "t6041-j616c-usbc.dtsi"
 
 /*
+ * The front camera. The J614c and J616c ADTs (26.6.2) describe the same isp0:
+ * sensor-type 5 (an IMX958), cam-connections-scheme 0x10, and a firmware of
+ * 0xca8000 bytes of TEXT and 0x1344000 of DATA, which iBoot moves each boot.
+ */
+/ {
+	/* aura opens a co-processor's DAPF only if it finds its alias. */
+	aliases {
+		isp = &isp;
+	};
+
+	reserved-memory {
+		/*
+		 * iBoot moves the ISP firmware each boot: the loader fills
+		 * these placeholders from the ADT. It runs at 0x100_0000_0000
+		 * onwards, in its 32 MiB main memory.
+		 */
+		isp_fw_text: isp-firmware-text@10000c44000 {
+			reg = <0x100 0x00c44000 0x0 0xca8000>;
+			iommu-addresses = <&isp 0x100 0x0 0x0 0xca8000>;
+			no-map;
+		};
+
+		isp_fw_data: isp-firmware-data@10001e7c000 {
+			reg = <0x100 0x01e7c000 0x0 0x1344000>;
+			iommu-addresses = <&isp 0x100 0xca8000 0x0 0x1344000>;
+			no-map;
+		};
+
+		/* the firmware's main memory, the driver allocates above it */
+		isp_heap: isp-heap {
+			iommu-addresses = <&isp 0x100 0x0 0x0 0x2000000>;
+		};
+	};
+};
+
+&isp {
+	memory-region = <&isp_fw_text>, <&isp_fw_data>, <&isp_heap>;
+	memory-region-names = "text", "data", "heap";
+	apple,platform-id = <5>;
+	/* ADT isp0 cam-connections-scheme */
+	apple,cam-connections-scheme = <0x10>;
+	status = "okay";
+
+	/* The front camera, an IMX958: firmware configuration 5. */
+	sensor-presets {
+		/* 1920x1080 */
+		preset0 {
+			apple,config-index = <5>;
+			apple,input-size = <1920 2160>;
+			apple,output-size = <1920 1080>;
+			apple,crop = <0 0 1920 1080>;
+		};
+		/* 1280x720 */
+		preset1 {
+			apple,config-index = <5>;
+			apple,input-size = <1920 2160>;
+			apple,output-size = <1280 720>;
+			apple,crop = <0 0 1920 1080>;
+		};
+	};
+};
+
+&isp_dart0 {
+	status = "okay";
+};
+
+&isp_dart1 {
+	status = "okay";
+};
+
+&isp_dart2 {
+	status = "okay";
+};
+
+/*
  * The PMP, as the M4 Pro boards run it (t604x-j614-j616.dtsi). The pmp
  * alias lets the loader copy this Mac's PMP values from the ADT and enable
  * the PMP. The GPU sits on the PMP's GPU domain: a running PMP otherwise
