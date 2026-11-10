@@ -673,6 +673,9 @@ pub(crate) struct Queue {
     /// A channel error of this queue waits for the firmware to consume its acknowledgement: the
     /// queue keeps its owner and backing until then.
     channel_error: bool,
+    /// This QID participated in an ambiguous publication/quarantine or a recovery table named
+    /// one of its commands. The qualified test arm never hands its firmware state to a new owner.
+    failed_lifecycle: bool,
     /// Prepared packets of the bound owner about to publish (see [`Self::claim`]).
     claims: u32,
     last_published: u64,
@@ -753,6 +756,7 @@ impl Queue {
             submitted: 0,
             fault_stamp: None,
             channel_error: false,
+            failed_lifecycle: false,
             claims: 0,
             last_published: 0,
             last_end: 0,
@@ -778,6 +782,7 @@ impl Queue {
     /// keep the queue's backing. Commands published after the failed one still need their own
     /// stamp or record.
     pub(crate) fn note_fault(&mut self, stamp: u32) {
+        self.failed_lifecycle = true;
         if self
             .fault_stamp
             .is_none_or(|old| retirement::stamp_newer(stamp, old))
@@ -929,7 +934,8 @@ impl Queue {
     /// A recovery record names this queue and the completion stamp of the
     /// command it interrupted, `kick << 8` like the queue's stamp. Without a
     /// stamp match the oldest published command is marked.
-    pub(crate) fn note_interrupted(&self, stamp: u32) -> recovery::Interrupted {
+    pub(crate) fn note_interrupted(&mut self, stamp: u32) -> recovery::Interrupted {
+        self.failed_lifecycle = true;
         let sequence = stamp >> 8;
         if let Some(active) = self.active.iter().find(|active| {
             active
@@ -1082,6 +1088,7 @@ impl Queue {
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result<Option<Arc<VmStatus>>> {
         if !self.quarantined {
+            self.failed_lifecycle = true;
             self.quarantined = true;
             self.quarantine_error = Some(error);
             self.failure_status_pending = true;
@@ -1786,7 +1793,7 @@ impl Queue {
         Ok(true)
     }
     pub(crate) fn reusable(&self) -> bool {
-        if self.growing || self.channel_error {
+        if self.growing || self.channel_error || self.retain_failed_qid() {
             return false;
         }
         self.installed
@@ -3082,6 +3089,9 @@ impl Queue {
         if state != 0 {
             return Err(EBUSY);
         }
+        if self.retain_failed_qid() {
+            return Err(EIO);
+        }
         let replay_front = self
             .replays
             .front()
@@ -3180,9 +3190,10 @@ impl Queue {
 
 impl Queue {
     pub(crate) fn write_capacity(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
-        write!(f, "compute_queue qid={} owned={} released={} reusable={} quarantined={} awaiting_witness={} previous={} exit={} growing={} pool={:?} active={} total={} ",
+        write!(f, "compute_queue qid={} owned={} released={} reusable={} quarantined={} failed_lifecycle={} retained_failed={} awaiting_witness={} previous={} exit={} growing={} pool={:?} active={} total={} ",
                self.qid(), u8::from(self.owner.is_some()), u8::from(self.released), u8::from(self.reusable()),
-               u8::from(self.quarantined), u8::from(self.awaiting_witness), u8::from(self.previous.is_some()),
+               u8::from(self.quarantined), u8::from(self.failed_lifecycle), u8::from(self.retain_failed_qid()),
+               u8::from(self.awaiting_witness), u8::from(self.previous.is_some()),
                u8::from(self.exit.is_some()), u8::from(self.growing), self.pool_phase, self.active.len, IN_FLIGHT)?;
         match self.graph.cursors() {
             Ok(cursors) if cursors.count != 0 => writeln!(
@@ -3279,6 +3290,16 @@ mod fault_ownership_tests {
         Previous::retire_witnessed(&mut previous);
         assert_eq!(used.load(Ordering::Relaxed), 0);
     }
+
+    #[test]
+    fn failed_qid_retirement_is_default_off_and_25g83_only() {
+        assert!(!retain_failed_qid_policy(true, false, false, true, false));
+        assert!(retain_failed_qid_policy(true, false, false, true, true));
+        assert!(!retain_failed_qid_policy(false, false, false, true, true));
+        assert!(!retain_failed_qid_policy(true, true, false, true, true));
+        assert!(!retain_failed_qid_policy(true, false, true, true, true));
+        assert!(!retain_failed_qid_policy(true, false, false, false, true));
+    }
 }
 
 impl Queue {
@@ -3320,6 +3341,7 @@ impl Queue {
     /// An open client's idle channel that [`Self::share_idle`] can hand over.
     pub(crate) fn shareable(&self) -> bool {
         self.claims == 0
+            && !self.retain_failed_qid()
             && self.installed
             && self.owner.is_some()
             && self.retirement_ready
@@ -3344,9 +3366,36 @@ impl Queue {
 impl Queue {
     pub(crate) fn can_rearm(&self) -> bool {
         self.pool_phase == PoolPhase::Vacant
+            && !self.retain_failed_qid()
             && (self.reusable() || self.recycled_pending())
             && !self.source_hint.has_readers(&self.source_readers)
     }
+}
+
+impl Queue {
+    /// 25G83 has neither a queue recovery target nor a host registration transport. After a
+    /// failed transaction may have cleared the firmware's private QID state, keep the installed
+    /// host record pinned instead of reusing it. This arm remains off until its boot matrix is
+    /// complete.
+    fn retain_failed_qid(&self) -> bool {
+        retain_failed_qid_policy(
+            self.failed_lifecycle,
+            self.graph.m5,
+            self.graph.pointers.recovery_target.is_some(),
+            self.graph.program == ComputeProgram::G17P,
+            crate::module_parameters::g17_retire_failed_compute.value() != 0,
+        )
+    }
+}
+
+fn retain_failed_qid_policy(
+    failed_lifecycle: bool,
+    m5: bool,
+    has_recovery_target: bool,
+    qualified_program: bool,
+    enabled: bool,
+) -> bool {
+    enabled && failed_lifecycle && !m5 && !has_recovery_target && qualified_program
 }
 
 impl Queue {

@@ -264,11 +264,11 @@ impl recovery::Queues for Service<'_> {
         self.firmware
             .queues
             .compute
-            .iter()
+            .iter_mut()
             .flatten()
-            .filter_map(|entry| entry.queue.as_deref())
+            .filter_map(|entry| entry.queue.as_deref_mut())
             .find(|queue| queue.qid() == qid)
-            .map_or(recovery::Interrupted::None, |queue| {
+            .map_or(recovery::Interrupted::None, |mut queue| {
                 queue.note_interrupted(stamp)
             })
     }
