@@ -104,22 +104,35 @@ const BUILD_25F84: fw::variant::Build = fw::variant::Build {
 
 /// The macOS 26.6.2 boot firmware (iBoot mBoot-18000.161.10) loads the 25G83 build the M4 Pro
 /// runs. iBoot fills part of the loaded TEXT for each Mac, so each admitted image is a
-/// measurement. The one listed is the only T6041 image measured so far, on a 32-core J616C,
-/// which runs it with [`super::t6041_25g83::CONFIG`].
+/// measurement. Two are listed: the 32-core J616C's, which runs with
+/// [`super::t6041_25g83::CONFIG`], and the 40-core J614C's, which runs with [`CONFIG_25G83`].
 pub(super) const BUILD_25G83: fw::variant::Build = fw::variant::Build {
     os_version: [26, 6, 2],
     name: "macOS 26.6.2 (25G83, iBoot mBoot-18000.161.10)",
-    images: &[crate::fwid::FirmwareBuild {
-        name: "Apple GFX 25G83 for T6041 (normalized loaded image, 32-core J616C)",
-        text_size: 0x60000,
-        data_size: 0x138000,
-        entropy: [0x59839, 0x5991c],
-        text_sha256: [
-            0xaa, 0x11, 0x3e, 0xd6, 0x20, 0x79, 0xbc, 0xfd, 0xee, 0xf0, 0xf8, 0x6c, 0x2a, 0x8d,
-            0x7e, 0xae, 0x9f, 0x90, 0x7b, 0x03, 0xbe, 0x28, 0xcc, 0xf2, 0x98, 0xc9, 0x43, 0x95,
-            0x1d, 0x0e, 0xff, 0xc5,
-        ],
-    }],
+    images: &[
+        crate::fwid::FirmwareBuild {
+            name: "Apple GFX 25G83 for T6041 (normalized loaded image, 32-core J616C)",
+            text_size: 0x60000,
+            data_size: 0x138000,
+            entropy: [0x59839, 0x5991c],
+            text_sha256: [
+                0xaa, 0x11, 0x3e, 0xd6, 0x20, 0x79, 0xbc, 0xfd, 0xee, 0xf0, 0xf8, 0x6c, 0x2a, 0x8d,
+                0x7e, 0xae, 0x9f, 0x90, 0x7b, 0x03, 0xbe, 0x28, 0xcc, 0xf2, 0x98, 0xc9, 0x43, 0x95,
+                0x1d, 0x0e, 0xff, 0xc5,
+            ],
+        },
+        crate::fwid::FirmwareBuild {
+            name: "Apple GFX 25G83 for T6041 (normalized loaded image, 40-core J614C)",
+            text_size: 0x60000,
+            data_size: 0x138000,
+            entropy: [0x59839, 0x5991c],
+            text_sha256: [
+                0x7c, 0x04, 0x36, 0x0e, 0x05, 0xa6, 0xb8, 0x62, 0x8f, 0x61, 0x26, 0x2d, 0x0a, 0x24,
+                0x41, 0x66, 0x18, 0x7a, 0xd8, 0x7a, 0x73, 0x47, 0x16, 0xd8, 0x91, 0x09, 0x08, 0xe9,
+                0x4f, 0xfe, 0xc0, 0x8a,
+            ],
+        },
+    ],
     // Four clusters: the tiler segment values of 25F84 on this machine.
     variant: &fw::variant::Variant {
         ta_mode_1: true,
@@ -128,10 +141,12 @@ pub(super) const BUILD_25G83: fw::variant::Build = fw::variant::Build {
     config: None,
 };
 
-/// The 40-core M4 Max on 25G83: the 25F84 configuration with the 25G83 register map.
+/// The 40-core M4 Max on 25G83: the 25F84 configuration with the 25G83 register map and
+/// [`CHIP_25G83`].
 const CONFIG_25G83: Config = Config {
     windows: &REGISTER_WINDOWS_25G83,
     reserved_slots: &[],
+    chip: Some(&CHIP_25G83),
     firmware: fw::variant::Firmware::Identified(&[BUILD_25G83]),
     ..BASE
 };
@@ -300,6 +315,22 @@ const CHIP: v25g83::Chip = v25g83::Chip {
     power_config_words: POWER_CONFIG_WORDS,
     perf_a_replicate_lanes: true,
     cs_perf_table: false,
+};
+
+/// [`CHIP`] for 25G83: its hardware data has 0 at `+0x2610`.
+///
+/// 25F84 runs with 1 there. On 25G83 the 40-core J614C then accepts work and marks it done,
+/// but the GPU never runs it: no completion, no fault, every job times out. With 0, which is
+/// also what the J616C's 25G83 contents have, compute and render work run.
+const CHIP_25G83: v25g83::Chip = v25g83::Chip {
+    hw_data_words: HW_DATA_WORDS_25G83,
+    ..CHIP
+};
+
+/// [`HW_DATA_WORDS`] without its last word, `+0x2610 = 1`.
+const HW_DATA_WORDS_25G83: &[(usize, u32, usize)] = match HW_DATA_WORDS.split_last() {
+    Some((&(0x2610, 1, 1), rest)) => rest,
+    _ => panic!("the last T6041 hardware data word must be +0x2610"),
 };
 
 const HW_DATA_WORDS: &[(usize, u32, usize)] = &[
