@@ -304,7 +304,7 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 
 			/* An interface with its own reset line (kiwi) does not share the AFE one. */
 			reset = devm_fwnode_gpiod_get(dchid->dev, fwnode, "apple,reset",
-						      GPIOD_ASIS, "dchid-reset");
+						      GPIOD_OUT_LOW, "dchid-reset");
 			if (IS_ERR(reset)) {
 				if (PTR_ERR(reset) != -ENOENT) {
 					dev_err(dchid->dev, "Reset line of %s: %pe\n", name, reset);
