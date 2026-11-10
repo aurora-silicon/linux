@@ -112,6 +112,22 @@ struct ane_device {
 	 */
 	bool tm_retention;
 
+	/*
+	 * Set under engine_lock when a failure is known to survive the
+	 * recovery power cycle: the engine stays wedged, recovery and the
+	 * reset attribute refuse, and only a reboot brings it back.
+	 * wedge_reason names why for the wedge_reason sysfs file.
+	 */
+	bool wedge_final;
+	const char *wedge_reason;
+
+	/*
+	 * Set by a recovery that reported the engine idle, cleared by the
+	 * next completed job. A recovery that only looks successful is
+	 * caught by the first job after it hanging the same way.
+	 */
+	bool recovery_probation;
+
 	/* Protected independently of engine_lock so idle work can release votes. */
 	struct ane_perf {
 		struct mutex lock; /* protects votes, idle work and status */
@@ -169,6 +185,25 @@ struct ane_request {
 	u32 btsp_iova;
 	u32 bar[DRM_ANE_TILE_COUNT];
 };
+
+/*
+ * Can a power cycle bring the engine back after a failed job? A job that
+ * timed out without one completion event (@finished == 0) left the task
+ * manager stopped mid-program. On SoCs that keep the tm/tq register file
+ * through the cycle (@tm_retention, T600x) that state survives every
+ * reset recovery has, so the engine never runs a task again until the
+ * next boot. Elsewhere the same failure on the first job after a
+ * recovery (@probation) shows that the recovery did not bring the
+ * engine back either. Every other failure is worth one recovery.
+ */
+static inline bool ane_tm_failure_recoverable(bool tm_retention,
+					      bool probation, int err,
+					      u32 finished)
+{
+	if (err != -ETIMEDOUT || finished)
+		return true;
+	return !tm_retention && !probation;
+}
 
 #if IS_ENABLED(CONFIG_KUNIT)
 int ane_submit_check_sizes(const struct drm_ane_submit *args, size_t cmd_size,
