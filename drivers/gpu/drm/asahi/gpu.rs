@@ -1358,19 +1358,35 @@ impl GpuManager::ver {
     }
 }
 
+extern "C" {
+    fn asahi_min_cpu_capacity() -> u32;
+}
+
 #[versions(AGX)]
 impl Gpu for GpuManager::ver {
     /// A light submission completes in tens of microseconds, so its submitter
     /// sleeps briefly between submissions and the CPU scheduler places and
     /// clocks it like idle work: on G13/G14 a single client then spends more
     /// time waking, recording and submitting than the GPU spends executing.
-    /// Give its blocking syncobj waits the same expiring capacity hint as the
-    /// G17 feed (half of the CPU capacity scale, valid for 8 ms after each
-    /// submission). The hint changes no task attribute or affinity.
+    /// Give its blocking syncobj waits an expiring capacity hint, valid for
+    /// 8 ms after each submission, like the G17 feed. The hint is half of the
+    /// capacity scale but stays below the smallest CPU's capacity, so it raises
+    /// the clock of the core the waiter wakes on instead of moving it to
+    /// another cluster (the M1 Pro's efficiency cores are below half scale).
+    /// The hint changes no task attribute or affinity.
     fn syncobj_wait_hint(&self) -> Option<(u32, u32)> {
+        /// Half of the CPU capacity scale (0..1024), as for the G17 feed.
         const WAIT_UTIL_MIN: u32 = 512;
+        /// Headroom below the smallest CPU, in 64ths of its capacity.
+        const SMALLEST_CPU_SHARE_64THS: u32 = 59;
         const WAIT_HINT_MS: u32 = 8;
-        cfg!(CONFIG_UCLAMP_TASK).then_some((WAIT_UTIL_MIN, WAIT_HINT_MS))
+        if !cfg!(CONFIG_UCLAMP_TASK) {
+            return None;
+        }
+        // SAFETY: The helper only reads the per-CPU capacity table.
+        let smallest = unsafe { asahi_min_cpu_capacity() };
+        let util_min = WAIT_UTIL_MIN.min(smallest * SMALLEST_CPU_SHARE_64THS / 64);
+        (util_min != 0).then_some((util_min, WAIT_HINT_MS))
     }
 
     fn stats_snapshot(&self) -> Option<Arc<stats::StatsSnapshot>> {
