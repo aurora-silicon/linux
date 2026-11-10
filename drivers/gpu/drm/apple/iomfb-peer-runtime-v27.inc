@@ -51,7 +51,7 @@ static void dcp_peer_submitted(struct apple_dcp *dcp, void *data, void *cookie)
 	/* Per-endpoint receive ordering handles the primary ACK before its
 	 * completion. The paired watermark still requires both completions. */
 	owner->swap_start = ktime_get();
-	owner->swap_submit_timestamp = arch_timer_read_counter();
+	owner->swap_submit_timestamp = dcp_swap_time();
 	dcp_swap_watchdog_arm(owner);
 }
 
