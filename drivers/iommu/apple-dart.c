@@ -5110,19 +5110,23 @@ params_done:
 	if (of_property_present(dev->of_node, "apple,bypass-handoff-streams")) {
 		u32 stream;
 
-		if (!of_machine_is_compatible("apple,j613") ||
-		    !of_device_is_compatible(dev->of_node, "apple,t8122-dart") ||
-		    res->start != 0x2fa808000ULL || !dart->supports_bypass ||
-		    of_property_count_u32_elems(dev->of_node,
+		/* A zero stream value advertises no live handoff (e.g. J700). */
+		if (of_property_count_u32_elems(dev->of_node,
 					    "apple,bypass-handoff-streams") != 1 ||
 		    of_property_read_u32(dev->of_node, "apple,bypass-handoff-streams",
-					 &stream) ||
-		    stream != 1 || stream >= dart->num_streams ||
-		    apple_dart_readl(dart, DART_TCR(dart, stream)) != dart->hw->tcr_bypass) {
+					 &stream)) {
 			ret = -EINVAL;
 			goto err_clk_disable;
 		}
-		dart->live_mtp = true;
+		if (stream && (!of_machine_is_compatible("apple,j613") ||
+		    !of_device_is_compatible(dev->of_node, "apple,t8122-dart") ||
+		    res->start != 0x2fa808000ULL || !dart->supports_bypass ||
+		    stream != 1 || stream >= dart->num_streams ||
+		    apple_dart_readl(dart, DART_TCR(dart, stream)) != dart->hw->tcr_bypass)) {
+			ret = -EINVAL;
+			goto err_clk_disable;
+		}
+		dart->live_mtp = stream != 0;
 	}
 
 	ret = apple_dart_read_remaps(dart);
