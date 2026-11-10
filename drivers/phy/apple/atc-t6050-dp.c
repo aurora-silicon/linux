@@ -120,6 +120,7 @@ struct t6050_dp {
 	struct atc_domain dp_gate[ATC_DP_TUNNELS];
 	bool dp_gates;
 	u8 tunnel_rate[ATC_DP_TUNNELS];
+	u8 tunnel_idle;		/* bit k - 1: clock k runs with no user, see below */
 };
 
 static int atc_domain_set(struct atc_domain *pd, bool active)
@@ -471,6 +472,7 @@ static void atc_dp_tunnel_switch_off(struct t6050_dp *dp, unsigned int k)
 	if (readl_poll_timeout(cfg + ATC_CFG_DP_STATUS, v, !(v & en), 10, 10000))
 		dev_warn(dp->dev, "DP tunnel clock %u: switch status %08x still on\n", k, v);
 	dp->tunnel_rate[k - 1] = 0;
+	dp->tunnel_idle &= ~BIT(k - 1);
 }
 
 /*
@@ -491,6 +493,28 @@ static void atc_dp_tunnels_park(struct t6050_dp *dp)
 	}
 	writel(en, cfg + ATC_CFG_DP_ENABLE);
 	writel(sw, cfg + ATC_CFG_DP_SWITCH);
+}
+
+/* Stop tunnel clock @k and gate it. */
+static int atc_dp_tunnel_stop(struct t6050_dp *dp, unsigned int k)
+{
+	if (dp->tunnel_rate[k - 1])
+		atc_dp_tunnel_switch_off(dp, k);
+	return dp->dp_gates ? atc_domain_set(&dp->dp_gate[k - 1], false) : 0;
+}
+
+/*
+ * Taking a running tunnel clock away disturbs the port's other tunnel
+ * clocks: the display on one of them loses its stream for a moment, and can
+ * lose its link. A clock whose user stopped it therefore keeps running while
+ * another clock of the port is in use, and stops with the last of them.
+ */
+static bool atc_dp_tunnel_others_in_use(struct t6050_dp *dp, unsigned int k)
+{
+	for (unsigned int i = 0; i < ATC_DP_TUNNELS; i++)
+		if (i != k - 1 && dp->tunnel_rate[i] && !(dp->tunnel_idle & BIT(i)))
+			return true;
+	return false;
 }
 
 /* Stop every tunnel clock, before the PHY leaves USB4 mode. */
@@ -633,17 +657,31 @@ int apple_t6050_dp_tunnel_clock(struct phy *phy, unsigned int clock, u8 rate)
 	guard(mutex)(&dp->lock);
 	if (!dp->combo || !dp->dp_clk_src)
 		return -EOPNOTSUPP;
-	if (rate && dp->tunnel_rate[i] == rate)
+	if (rate && dp->tunnel_rate[i] == rate) {
+		dp->tunnel_idle &= ~BIT(i);
 		return 0;
-	/* A new rate takes the clock off its old source first. */
-	if (dp->tunnel_rate[i])
-		atc_dp_tunnel_switch_off(dp, clock);
+	}
 	if (!rate) {
-		ret = dp->dp_gates ? atc_domain_set(&dp->dp_gate[i], false) : 0;
+		bool others = atc_dp_tunnel_others_in_use(dp, clock);
+
+		if (dp->tunnel_rate[i] && others) {
+			dp->tunnel_idle |= BIT(i);
+			dev_dbg(dp->dev, "DP tunnel clock %u left running for the others\n",
+				clock);
+			return 0;
+		}
+		ret = atc_dp_tunnel_stop(dp, clock);
+		/* The last user went: the clocks kept for it go as well. */
+		for (unsigned int k = 1; !others && k <= ATC_DP_TUNNELS; k++)
+			if (dp->tunnel_idle & BIT(k - 1))
+				atc_dp_tunnel_stop(dp, k);
 		if (!ret)
 			dev_info(dp->dev, "DP tunnel clock %u stopped\n", clock);
 		return ret;
 	}
+	/* A new rate takes the clock off its old source first. */
+	if (dp->tunnel_rate[i])
+		atc_dp_tunnel_switch_off(dp, clock);
 	if (dp->faulted)
 		return -EIO;
 	if (dp->combo_mode != COMBO_CIO)
