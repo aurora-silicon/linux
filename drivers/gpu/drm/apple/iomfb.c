@@ -26,6 +26,7 @@
 #include <drm/drm_color_mgmt.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_edid.h>
+#include "dcp-sdr-edid.h"
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
@@ -2380,7 +2381,31 @@ int dcp_get_modes(struct drm_connector *connector)
 		}
 	}
 	if (nr_modes && apple_connector->drm_edid) {
-		int update = drm_edid_connector_update(connector, apple_connector->drm_edid);
+		const struct drm_edid *published = apple_connector->drm_edid;
+		const struct drm_edid *sdr = NULL;
+		int update;
+
+		if (dcp_is_ext26(dcp)) {
+			const struct edid *raw = drm_edid_raw(published);
+			size_t size = (raw->extensions + 1) * EDID_LENGTH;
+			u8 *copy = kmemdup(raw, size, GFP_KERNEL);
+
+			if (!copy) {
+				drm_edid_connector_update(connector, NULL);
+				goto edid_done;
+			}
+			size = dcp_edid_sdr(copy, size);
+			if (size)
+				sdr = drm_edid_alloc(copy, size);
+			kfree(copy);
+			if (!sdr) {
+				drm_edid_connector_update(connector, NULL);
+				goto edid_done;
+			}
+			published = sdr;
+		}
+		update = drm_edid_connector_update(connector, published);
+		drm_edid_free(sdr);
 
 		if (update) {
 			dev_warn(dcp->dev, "raw EDID publication failed: %d\n", update);

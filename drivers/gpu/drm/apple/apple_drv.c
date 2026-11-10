@@ -1266,9 +1266,17 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		ret = drm_connector_attach_vrr_capable_property(&connector->base);
 		if (ret)
 			return ret;
-		ret = apple_connector_attach_hdr(&connector->base, false);
-		if (ret)
-			return ret;
+		/*
+		 * T8122's retained external scanout accepts only 8-bit RGB.
+		 * Do not advertise the BT.2020/PQ output contract until this
+		 * route has a qualified 10-bit primary-plane format. The sink
+		 * EDID remains intact; its capabilities are not the pipeline's.
+		 */
+		if (!of_machine_is_compatible("apple,t8122")) {
+			ret = apple_connector_attach_hdr(&connector->base, false);
+			if (ret)
+				return ret;
+		}
 
 		connector->base.polled = DRM_CONNECTOR_POLL_HPD;
 		connector->connected = false;

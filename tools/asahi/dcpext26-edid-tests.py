@@ -15,6 +15,7 @@ pre=r'''
 #include <string.h>
 #include <stdio.h>
 #include "epic/dpavserv-edid.h"
+#include "dcp-sdr-edid.h"
 typedef int64_t s64;
 #define DPAVSERV_ENDPOINT 0x28
 #define DPAVSERV_ENDPOINT_V2 0x2a
@@ -54,6 +55,29 @@ int main(void) {
  for(size_t n=0;n<sizeof(wire);n++)assert(dpavserv_edid_size(wire,n,&size));
  base[130]=1;assert(dpavserv_edid_size(wire,sizeof(wire),&size));base[130]=0;
  base[126]=2;checksum(base);assert(dpavserv_edid_size(wire,sizeof(wire),&size));
+ u8 sdr[384]={0}, original[384];
+ memcpy(sdr,header,8);sdr[18]=1;sdr[19]=4;sdr[20]=0xe5;sdr[126]=2;
+ memset(sdr+8,0x31,8);memset(sdr+25,0x55,10);
+ memcpy(sdr+54,"detailed timing / identity",26);
+ u8 *cta=sdr+128;cta[0]=2;cta[1]=3;cta[2]=18;cta[3]=0xf1;
+ /* Audio, colourimetry, HDR, vendor colour, video. */
+ const u8 blocks[]={0x23,1,2,3, 0xe2,5,0xff, 0xe2,6,0xff, 0x61,7, 0x41,16};
+ memcpy(cta+4,blocks,sizeof(blocks));memset(cta+18,0x77,18);
+ sdr[256]=0x70;checksum(sdr);checksum(cta);checksum(sdr+256);
+ memcpy(original,sdr,sizeof(sdr));
+ assert(dcp_edid_sdr(sdr,sizeof(sdr))==256);
+ assert(!memcmp(sdr+8,original+8,8));
+ assert(!memcmp(sdr+54,original+54,72));
+ for(unsigned i=25;i<35;i++)assert(!sdr[i]);
+ assert(sdr[126]==1 && (sdr[20]&0x70)==0x20);
+ assert(cta[2]==10 && cta[3]==0x41);
+ assert(!memcmp(cta+4,blocks,4));assert(cta[8]==0x41 && cta[9]==16);
+ assert(!memcmp(cta+10,original+128+18,18));
+ for(unsigned b=0;b<2;b++){u8 sum=0;for(unsigned j=0;j<128;j++)sum+=sdr[b*128+j];assert(!sum);}
+ memcpy(original,sdr,256);assert(dcp_edid_sdr(sdr,256)==256);assert(!memcmp(sdr,original,256));
+ for(unsigned n=0;n<128;n++)assert(!dcp_edid_sdr(sdr,n));
+ assert(!dcp_edid_sdr(sdr,128));
+ puts("PASS SDR EDID identity, audio, timing, colour removal, checksums, bounds and idempotence");
  puts("PASS native26 AV identity, stale attachment/owner, bounded EDID length, extension count and checksum failures");
 }
 '''
