@@ -438,6 +438,7 @@
 		status = "disabled";
 	};
 
+	/* The DebugUSB DockChannel serial channel; RX is drained in software. */
 	dcuart: serial@50883c000 {
 		compatible = "apple,dockchannel-uart";
 		reg = <0x5 0x0883c000 0x0 0x4000>,
@@ -448,7 +449,6 @@
 		interrupts = <AIC_IRQ 360 IRQ_TYPE_LEVEL_HIGH>;
 		apple,channel = <2>;
 		apple,sw-drain;
-		status = "disabled";
 	};
 
 	/* ACIO 0 remains disabled until its host-router handoff is supported. */
