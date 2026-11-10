@@ -40,6 +40,7 @@
 #include <linux/spinlock.h>
 #include <linux/suspend.h>
 #include <linux/soc/apple/dart.h>
+#include <linux/soc/apple/dart-cio.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/pmp-display.h>
 #include <linux/soc/apple/pmc.h>
@@ -193,6 +194,9 @@ struct iomfb_m4 {
 	 */
 	bool gate_capable;
 	bool gated;
+	/* External: its firmware (0) and display (1) DARTs, and stopped for a deep sleep. */
+	struct apple_dart_cio *ext_darts[2];
+	bool ext_stopped;
 	struct delayed_work gate_work;
 	u64 gate_cycles;
 	s64 gate_off_us, gate_on_us;
@@ -2601,6 +2605,26 @@ static u64 dcp_m4_bw_mailbox(struct device *dev)
 	return slot;
 }
 
+/* The DART behind @consumer's only "iommus" entry, owned for its power cycle. */
+static int iomfb_m4_ext_bind_dart(struct iomfb_m4 *dcp, struct device_node *consumer,
+				  struct apple_dart_cio **dart)
+{
+	struct of_phandle_args spec;
+	struct platform_device *pdev;
+	int ret;
+
+	if (!consumer ||
+	    of_parse_phandle_with_args(consumer, "iommus", "#iommu-cells", 0, &spec))
+		return -ENODEV;
+	pdev = of_find_device_by_node(spec.np);
+	of_node_put(spec.np);
+	if (!pdev)
+		return -EPROBE_DEFER;
+	ret = apple_dart_cio_bind(dcp->dev, &pdev->dev, dart);
+	put_device(&pdev->dev);
+	return ret;
+}
+
 int iomfb_m4_init(struct apple_dcp *owner)
 {
 	struct platform_device *pdev = to_platform_device(owner->dev);
@@ -2684,6 +2708,17 @@ int iomfb_m4_init(struct apple_dcp *owner)
 	if (ret)
 		return ret;
 	dcp->external = external;
+	if (external) {
+		struct device_node *piodma = of_get_child_by_name(dev->of_node, "piodma");
+
+		/* Without them a deep sleep with a session is refused, nothing else. */
+		ret = iomfb_m4_ext_bind_dart(dcp, dev->of_node, &dcp->ext_darts[0]) ?:
+		      iomfb_m4_ext_bind_dart(dcp, piodma, &dcp->ext_darts[1]);
+		of_node_put(piodma);
+		if (ret)
+			dev_info(dev, "deep sleep with an external display not supported here: %d\n",
+				 ret);
+	}
 	/* The internal display's power-down: its PMC interface names the rest. */
 	dcp->gate_capable = !external && apple_pmp_j713_board() &&
 			    of_property_present(dev->of_node, "apple,pmc-interface");
@@ -5233,6 +5268,201 @@ const char *iomfb_m4_ext_sleep_veto(struct apple_dcp *owner)
 	return why;
 }
 
+/* A map or unmap in flight closes a DART only briefly: wait for it. */
+static int iomfb_m4_ext_dart_off(struct apple_dart_cio *dart)
+{
+	int ret;
+
+	for (unsigned int i = 0; i < 20; i++) {
+		ret = apple_dart_cio_off(dart);
+		if (ret != -EBUSY)
+			break;
+		usleep_range(500, 1000);
+	}
+	return ret;
+}
+
+/*
+ * A deep sleep takes an external DCP down whole, as its display has gone
+ * already: the AP link is released, RTKit idles, the CPU stops, then its
+ * display DART and its firmware DART are powered down. Its power domains are
+ * the sleep's to lower. Firmware, endpoints and shared buffers stay for
+ * iomfb_m4_ext_start(). Before the first step its providers are asked; a
+ * refusal before RTKit idles changes nothing, and a failure after the CPU
+ * stopped is undone in reverse. Either way the sleep is refused.
+ */
+static int iomfb_m4_ext_stop(struct iomfb_m4 *dcp)
+{
+	struct dcp_m4_runtime *r = dcp->runtime;
+	bool prepared[2] = {}, rx_held = false, cpu_off = false, cpu_reset;
+	unsigned long flags;
+	__le32 zero = 0;
+	const char *step = "DART owner";
+	int ret, recover;
+
+	lockdep_assert_held(&dcp->lock);
+	if (dcp->ext_stopped || dcp->gated)
+		return -EALREADY;
+	if (!r || r->ext_qn || dcp->transaction.calls || !READ_ONCE(dcp->ext_dart_down))
+		return -EBUSY;
+	ret = dcp_m4_runtime_live(r);
+	if (ret)
+		return ret;
+	/* Bound at probe: a device link cannot be added from a PM callback. */
+	ret = dcp->ext_darts[0] && dcp->ext_darts[1] ? 0 : -ENODEV;
+	if (!ret) {
+		step = "PMGR";
+		ret = apple_pmgr_ps_consumer_check(dcp->dev);
+	}
+	for (unsigned int i = 0; !ret && i < 2; i++) {
+		step = "DART owner";
+		ret = apple_dart_cio_prepare(dcp->ext_darts[i]);
+		prepared[i] = !ret;
+	}
+	if (ret)
+		goto unprepare;
+
+	step = "A500";
+	ret = dcp_m4_runtime_call(r, 500, false, &zero, sizeof(zero), NULL, 0);
+	if (!ret) {
+		step = "drain";
+		ret = dcp_m4_runtime_drain(r, 64);
+		if (ret > 0 || (!ret && r->count))
+			ret = -EBUSY;
+	}
+	/* Nothing has changed yet: the session stays, the sleep is refused. */
+	if (ret)
+		goto unprepare;
+	step = "RTKit idle";
+	ret = apple_rtkit_idle(dcp->rtkit);
+	if (ret)
+		goto fail;
+	apple_rtkit_hold_rx(dcp->rtkit);
+	rx_held = true;
+	step = "CPU stop";
+	ret = iomfb_m4_cpu_run(dcp, false);
+	if (ret)
+		goto fail;
+	step = "late message";
+	ret = apple_rtkit_poll(dcp->rtkit);
+	if (ret >= 0) {
+		apple_rtkit_flush_rx(dcp->rtkit);
+		spin_lock_irqsave(&dcp->state_lock, flags);
+		ret = r->count ? -EBUSY : 0;
+		spin_unlock_irqrestore(&dcp->state_lock, flags);
+	}
+	if (ret)
+		goto fail;
+	/* From here on nothing may use the DCP's or its DARTs' registers. */
+	WRITE_ONCE(dcp->gated, true);
+	dcp->ext_stopped = true;
+	step = "display DART";
+	ret = iomfb_m4_ext_dart_off(dcp->ext_darts[1]);
+	if (!ret) {
+		step = "firmware DART";
+		ret = iomfb_m4_ext_dart_off(dcp->ext_darts[0]);
+	}
+	if (!ret) {
+		/* Its CPU domain off: the CPU then starts from reset, as after the sleep. */
+		step = "CPU domain";
+		cpu_off = true;
+		ret = apple_pmgr_ps_consumer_off(dcp->dev);
+	}
+	if (ret)
+		goto unwind;
+	dev_info(dcp->dev, "external DCP stopped for sleep\n");
+	return 0;
+unwind:
+	dev_err(dcp->dev, "external DCP stop failed at %s: %d; restarting it\n", step, ret);
+	/* Only a CPU whose own domain went off starts from reset. */
+	cpu_reset = cpu_off && apple_pmgr_ps_consumer_is_off(dcp->dev);
+	recover = cpu_off ? apple_pmgr_ps_consumer_on(dcp->dev) : 0;
+	recover = recover ?: apple_dart_cio_on(dcp->ext_darts[0]) ?:
+		  apple_dart_cio_on(dcp->ext_darts[1]);
+	if (!recover && cpu_reset) {
+		/* Start it as after the sleep. */
+		recover = apple_rtkit_wake_retained(dcp->rtkit, iomfb_m4_cpu_start, dcp);
+	} else if (!recover) {
+		/* A CPU only stopped resumes where it idled. */
+		recover = iomfb_m4_cpu_run(dcp, true);
+		apple_rtkit_resume_rx(dcp->rtkit);
+		recover = recover ?: apple_rtkit_wake(dcp->rtkit);
+	}
+	for (unsigned int i = 0; i < 2; i++)
+		recover = apple_dart_cio_finish(dcp->ext_darts[i]) ?: recover;
+	dcp->ext_stopped = false;
+	if (recover) {
+		dev_err(dcp->dev, "external DCP restart failed: %d\n", recover);
+		dcp_m4_failed(dcp, recover);
+		return ret;
+	}
+	WRITE_ONCE(dcp->gated, false);
+	return ret;
+fail:
+	dev_err(dcp->dev, "external DCP stop failed at %s: %d\n", step, ret);
+	dcp_m4_failed(dcp, ret);
+	/* Its CPU still runs, or was never left: the DARTs were not touched. */
+	if (rx_held)
+		apple_rtkit_resume_rx(dcp->rtkit);
+	for (unsigned int i = 0; i < 2; i++)
+		apple_dart_cio_finish(dcp->ext_darts[i]);
+	return ret;
+unprepare:
+	dev_warn(dcp->dev, "external DCP stop refused at %s: %d\n", step, ret);
+	for (unsigned int i = 0; i < 2; i++)
+		if (prepared[i])
+			apple_dart_cio_finish(dcp->ext_darts[i]);
+	return -EBUSY;
+}
+
+/*
+ * After the sleep: the firmware DART and the display DART as they were, then
+ * the CPU from its reset vector on the firmware image it kept, through
+ * RTKit's retained wake. The display comes back with its next enable. The
+ * DART transactions end whatever happens; a DART that did not come back
+ * stays closed, and the session is failed.
+ */
+static int iomfb_m4_ext_start(struct iomfb_m4 *dcp)
+{
+	const char *step = "CPU domain";
+	int ret, finish;
+
+	lockdep_assert_held(&dcp->lock);
+	if (!dcp->ext_stopped)
+		return 0;
+	ret = READ_ONCE(dcp->error);
+	if (!ret)
+		ret = apple_pmgr_ps_consumer_on(dcp->dev);
+	if (!ret) {
+		step = "firmware DART";
+		ret = apple_dart_cio_on(dcp->ext_darts[0]);
+	}
+	if (!ret) {
+		step = "display DART";
+		ret = apple_dart_cio_on(dcp->ext_darts[1]);
+	}
+	if (!ret) {
+		step = "RTKit wake";
+		ret = apple_rtkit_wake_retained(dcp->rtkit, iomfb_m4_cpu_start, dcp);
+	}
+	for (unsigned int i = 0; i < 2; i++) {
+		finish = apple_dart_cio_finish(dcp->ext_darts[1 - i]);
+		if (!ret && finish) {
+			step = "DART owner";
+			ret = finish;
+		}
+	}
+	dcp->ext_stopped = false;
+	if (ret) {
+		dev_err(dcp->dev, "external DCP restart failed at %s: %d\n", step, ret);
+		dcp_m4_failed(dcp, ret);
+		return ret;
+	}
+	WRITE_ONCE(dcp->gated, false);
+	dev_info(dcp->dev, "external DCP restarted after sleep\n");
+	return 0;
+}
+
 /* apple-drm, a consumer of this device, has blanked the panel before this. */
 int iomfb_m4_suspend(struct apple_dcp *owner)
 {
@@ -5270,8 +5500,27 @@ int iomfb_m4_suspend(struct apple_dcp *owner)
 		atomic_inc(&dcp->ext_pm_epoch);
 		WRITE_ONCE(dcp->ext_dart_down, true);
 		dcp->ext_dart_since_sleep = true;
+		ret = 0;
+		/* A deep sleep powers it off: stop it first, if it has a session. */
+		if (pm_suspend_target_state == PM_SUSPEND_MEM && dcp->runtime) {
+			/* Pairs with the release store of r->done in startup. */
+			bool session = smp_load_acquire(&dcp->runtime->done);
+
+			if (session)
+				ret = iomfb_m4_ext_stop(dcp);
+		}
 		mutex_unlock(&dcp->lock);
-		return 0;
+		/*
+		 * The PM core resumes no device whose suspend failed: end the
+		 * sleep's epoch here, as resume would, or no later powerUpDART
+		 * counts as fresh and the output stays dark.
+		 */
+		if (ret) {
+			if (dcp->rtkit)
+				apple_rtkit_flush_rx(dcp->rtkit);
+			atomic_inc(&dcp->ext_pm_epoch);
+		}
+		return ret;
 	}
 	if (!dcp || !dcp->runtime)
 		return -ENODEV;
@@ -5314,10 +5563,13 @@ int iomfb_m4_resume(struct apple_dcp *owner)
 	 * every one RTKit received before is dispatched with the old one first.
 	 */
 	if (dcp && dcp->external) {
+		mutex_lock(&dcp->lock);
+		ret = iomfb_m4_ext_start(dcp);
+		mutex_unlock(&dcp->lock);
 		if (dcp->rtkit)
 			apple_rtkit_flush_rx(dcp->rtkit);
 		atomic_inc(&dcp->ext_pm_epoch);
-		return 0;
+		return ret;
 	}
 	if (!dcp || !dcp->runtime)
 		return -ENODEV;
