@@ -90,13 +90,13 @@ int dcp_peer_hints_v27(struct apple_dcp *dcp, struct dptx_port *port,
 		return 0;
 
 	extra = dcp_peer_extra_pipes(r->hints, &port->caps);
-	memset(&r->primary_id, 0, 32);
+	memset(&r->allocation, 0, sizeof(r->allocation));
 	guard(mutex)(&dcp_peer_lock);
 	if (dcp->peer_unbinding || dcp->crashed)
 		return -ENODEV;
 	if (!extra || !(r->hints[0] & 1)) {
 		dcp_peer_release_locked(dcp);
-		memset(&r->primary_id, 0, 32);
+		memset(&r->allocation, 0, sizeof(r->allocation));
 		return 0;
 	}
 	/* This candidate implements a non-tiled, two-pipe reservation. Tiled
