@@ -683,11 +683,14 @@ MODULE_DEVICE_TABLE(of, apple_smc_of_match);
 /* The gaps macOS leaves before the AP idle notice and after it. */
 #define SMC_SLEEP_ARM_MS	6
 #define SMC_SLEEP_IDLE_MS	30
-/* The shortest gap macOS left between slpw and slpa, in two traced sleeps. */
-#define SMC_SLEEP_WARN_MS	770
+/*
+ * Between a late warning (a sleep that cut the debug link) and slpa. macOS's shortest gap
+ * was 770 ms; the warning at .prepare leaves 150-500 ms, and those sleeps run to the alarm.
+ */
+#define SMC_SLEEP_WARN_MS	200
 
-/* After the debug link's cut. Its port and charger events keep coming for over a second. */
-#define SMC_OUTBOX_QUIET_MS	500
+/* After the debug link's cut. No message came in it in any logged sleep. */
+#define SMC_OUTBOX_QUIET_MS	100
 #define SMC_OUTBOX_SETTLE_MS	5000
 
 static int apple_smc_ap_power(struct apple_smc *smc, bool on)
