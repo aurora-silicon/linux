@@ -8,8 +8,40 @@ import rate
 
 
 def panel(root, output):
+    def adt_node(props, children=()):
+        data = bytearray(struct.pack('<II', len(props), len(children)))
+        for name, value in props:
+            data += name.encode().ljust(32, b'\0') + struct.pack('<I', len(value)) + value
+            data += b'\0' * (-len(data) % 4)
+        return bytes(data) + b''.join(children)
+
+    def target_adt(name, coefficients):
+        matrix = struct.pack('<I9i', 1, *coefficients)
+        product = adt_node((('name', b'product\0'),
+                            ('artwork-display-gamut', name.encode() + b'\0'),
+                            ('primary-calibration-matrix', matrix)))
+        return adt_node((('name', b'device-tree\0'),), (product,))
+
+    q24 = 1 << 24
+    # Deliberately simple row-neutral matrices, unrelated to any panel data.
+    p3_adt = target_adt('P3', (q24 + q24 // 16, -q24 // 16, 0,
+                               0, q24, 0, 0, 0, q24))
+    srgb_adt = target_adt('sRGB', (q24, 0, 0,
+                                   -q24 // 32, q24 + q24 // 32, 0, 0, 0, q24))
     fixture = rate.parser_fixture(root)
     unit = desktop.panel_identity(root).split('int main(int argc, char **argv)')[0]
+    base = root / 'drivers/gpu/drm/apple'
+    unit += r'''
+typedef int32_t s32;
+#define ALIGN(x,n) (((x)+(n)-1)&~((n)-1))
+#define SZ_16M (16U<<20)
+static u32 get_unaligned_le32(const void *p) {u32 n;memcpy(&n,p,4);return n;}
+'''
+    unit += block((base / 'dcp-panel-adt.h').read_text(), 'struct dcp_panel_adt {') + ';\n'
+    unit += '\n'.join(line for line in (base / 'dcp-panel-adt.c').read_text().splitlines()
+                       if not line.startswith('#include'))
+    unit += 'static const u8 p3_adt[]={%s};\n' % ','.join(map(str, p3_adt))
+    unit += 'static const u8 srgb_adt[]={%s};\n' % ','.join(map(str, srgb_adt))
     # Standard colour-space coordinates, never a captured panel calibration.
     p3 = {'Chromaticity': {'Red': {'X': 44564, 'Y': 20972},
                           'Green': {'X': 17367, 'Y': 45220},
@@ -106,9 +138,14 @@ int main(int argc, char **argv)
     check(&invalid,false,NULL);
     invalid=p3;invalid.white[0]=1;invalid.white[1]=1;check(&invalid,false,NULL);
     invalid=p3;invalid.chromaticity[0][0]=65535;check(&invalid,false,NULL);
-    /* The DT colour target names the same standard coordinates as the fixtures. */
-    const struct dcp_color_space *p3_target=dcp_color_space_lookup("display-p3");
-    const struct dcp_color_space *srgb_target=dcp_color_space_lookup("srgb");
+    /* Raw ADT targets name the same standard coordinates as the fixtures. */
+    struct dcp_panel_adt p3_panel={0},srgb_panel={0};
+    assert(!dcp_panel_adt_parse(p3_adt,sizeof(p3_adt),&p3_panel));
+    assert(!dcp_panel_adt_parse(srgb_adt,sizeof(srgb_adt),&srgb_panel));
+    assert(p3_panel.gamut==DCP_PANEL_GAMUT_DISPLAY_P3);
+    assert(srgb_panel.gamut==DCP_PANEL_GAMUT_SRGB);
+    const struct dcp_color_space *p3_target=dcp_panel_gamut_color_space(p3_panel.gamut);
+    const struct dcp_color_space *srgb_target=dcp_panel_gamut_color_space(srgb_panel.gamut);
     assert(!IS_ERR(p3_target) && !IS_ERR(srgb_target));
     assert(IS_ERR(dcp_color_space_lookup("p3")) && IS_ERR(dcp_color_space_lookup("")) &&
            IS_ERR(dcp_color_space_lookup(NULL)) && IS_ERR(dcp_color_space_lookup("Display-P3")));
@@ -116,6 +153,11 @@ int main(int argc, char **argv)
     assert(!memcmp(p3_target->white,p3.white,sizeof(p3.white)) && p3_target->gamma==p3.gamma);
     assert(!memcmp(srgb_target->chromaticity,srgb.chromaticity,sizeof(srgb.chromaticity)));
     assert(!memcmp(srgb_target->white,srgb.white,sizeof(srgb.white)) && srgb_target->gamma==srgb.gamma);
+    for (unsigned n=0;n<sizeof(p3_adt);n++) {
+        struct dcp_panel_adt panel={.identity={.manufacturer="TST"}},before=panel;
+        assert(dcp_panel_adt_parse(p3_adt,n,&panel)<0);
+        assert(!memcmp(&panel,&before,sizeof(panel)));
+    }
     {
         u8 firmware[12],named[12],plain[12];
         struct dcp_display_metadata none=decode(color_2,sizeof(color_2));

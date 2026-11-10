@@ -17,6 +17,8 @@
 	model = "Apple MacBook Pro (16-inch, M1 Max, 2021)";
 
 	aliases {
+		rtc0 = &smc_rtc;
+		rtc1 = &pmu_rtc;
 		sep = &sep;
 	};
 };

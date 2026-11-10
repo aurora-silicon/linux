@@ -18,9 +18,9 @@
 		dma-coherent;
 		msi-parent = <&pcie0_msi>;
 		/* N1's three ADT mapper nodes use stream zero. */
-		iommu-map = <0x100 &dart_apcie0 0 1>,
-			    <0x101 &dart_apcie0 0 1>,
-			    <0x102 &dart_apcie0 0 1>;
+		iommu-map = <0x100 &pcie0_dart 0 1>,
+			    <0x101 &pcie0_dart 0 1>,
+			    <0x102 &pcie0_dart 0 1>;
 	};
 };
 
@@ -37,7 +37,7 @@
 		msi-ranges = <&aic AIC_IRQ 1741 IRQ_TYPE_EDGE_RISING 32>;
 	};
 
-	dart_apcie0: iommu@488000000 {
+	pcie0_dart: iommu@488000000 {
 		compatible = "apple,t8142-dart", "apple,t8110-dart";
 		reg = <4 0x88000000 0 0x20000>;
 		interrupt-parent = <&aic>;

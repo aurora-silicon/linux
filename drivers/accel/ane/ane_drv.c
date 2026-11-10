@@ -741,6 +741,20 @@ static ssize_t wedged_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(wedged);
 
+/* Why the engine is wedged until reboot; empty while recovery may help. */
+static ssize_t wedge_reason_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct ane_device *ane = dev_get_drvdata(dev);
+	ssize_t ret;
+
+	mutex_lock(&ane->engine_lock);
+	ret = sysfs_emit(buf, "%s\n", ane->wedge_final ? ane->wedge_reason : "");
+	mutex_unlock(&ane->engine_lock);
+	return ret;
+}
+static DEVICE_ATTR_RO(wedge_reason);
+
 /* Operator retry for a wedge whose automatic recovery failed: one more
  * bounded power-cycle attempt. No-op when not wedged.
  */
@@ -785,6 +799,7 @@ static DEVICE_ATTR_RO(ane_stats);
 
 static struct attribute *ane_dev_attrs[] = {
 	&dev_attr_wedged.attr,
+	&dev_attr_wedge_reason.attr,
 	&dev_attr_reset.attr,
 	&dev_attr_ane_stats.attr,
 	NULL,

@@ -267,18 +267,17 @@ it:
 - A btrfs/snapper rollback, or restoring a backup, brings back an older list.
   Records the enclave created after that snapshot are no longer listed, so
   the guard treats them as another OS's and refuses to rewrite them. Nothing
-  is overwritten, but Touch ID may fail until the newer list is put back.
-  Keep the newest copy, or leave `/var/lib/aurora-sep-xart-owned.bin` out of
-  rollback snapshots.
+  is overwritten and those records stay protected. If Touch ID fails
+  afterwards, set it up again with `aurora-xart reset-touchid` (or
+  `install-aurora-sep.sh --reset-touchid`).
 - A reinstall, or deleting the file, empties the list. Every Linux record
-  then looks like another OS's. Copy the file back from the old install if
-  you have it. Without it, those records stay protected; resetting Touch ID
-  (`install-aurora-sep.sh --reset-touchid`) creates a new keybag.
+  then looks like another OS's, and those records stay protected. Set Touch
+  ID up again with `aurora-xart reset-touchid` (or
+  `install-aurora-sep.sh --reset-touchid`), which creates a new keybag.
 - A torn last entry, from a crash while appending, is ignored at the next
   probe and overwritten by the next new record.
 
-The file holds only record kinds and session ids, no key material, and it
-can be backed up and copied like any other file.
+The file holds only record kinds and session ids, no key material.
 
 ## Cold-boot SEP Macs rewrite a pre-Linux record (2026-10-16)
 

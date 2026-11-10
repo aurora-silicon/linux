@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/spmi/apple,spmi-peripheral.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple SPMI peripheral
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  SPMI peripheral resources. The address is a unique slave identifier on
+  its parent bus. Register access and protocol support are separate from
+  describing the peripheral and its interrupt resources.
+
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6020-spmi-peripheral
+          - apple,t6021-spmi-peripheral
+          - apple,t6022-spmi-peripheral
+          - apple,t8112-spmi-peripheral
+  required:
+    - compatible
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t6020-spmi-peripheral
+          - apple,t6021-spmi-peripheral
+          - apple,t6022-spmi-peripheral
+          - apple,t8112-spmi-peripheral
+      - const: apple,spmi-peripheral
+
+  reg:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
-"""Build T6041 initialization data and compare it with captures when given."""
+"""Build T6041 initialization data and compare it with captures when given.
+
+The 32-core 25G83 configuration is also built from the operating points the loader publishes
+from the J616C's ADT, and must give the contents that unit ran with."""
 
 import argparse
 import re
@@ -102,10 +105,23 @@ SOC_ITEMS = [
 ]
 
 T6041_ITEMS = SOC_ITEMS + [
+    "pub(crate) const REGISTER_WINDOWS_25G83",
     "const RESERVED_SLOTS",
     "const MAX_POWER_MW",
     "const CHIP: ",
-    "const HW_DATA_WORDS",
+    "const CHIP_25G83: ",
+    "const HW_DATA_WORDS: ",
+    "const HW_DATA_WORDS_25G83: ",
+    "const POWER_CONFIG_WORDS",
+]
+
+J616C_ITEMS = [
+    "const REGISTER_WINDOWS: [",
+    "const PERF: PerfConfig",
+    "const MAX_POWER_MW",
+    "const REGION_C",
+    "const AON_TABLE",
+    "const CHIP: ",
     "const POWER_CONFIG_WORDS",
 ]
 
@@ -119,6 +135,19 @@ T6041_OPP_MV = [
 ]
 T6041_AUX = [(24, 585000), (338, 585000), (618, 635000), (796, 685000), (992, 720000),
              (1188, 770000), (1380, 855000), (1470, 885000)]
+
+# The 32-core J616C's ADT /arm-io/sgx: perf-states (one table per cluster) and cs-perf-states
+# (afr-perf-states is the same), as the loader publishes them in the device tree.
+J616C_OPP_HZ = [0, 338, 618, 796, 924, 952, 1056, 1062, 1182, 1182, 1312, 1242, 1380, 1326,
+                1470, 1578]
+J616C_OPP_MV = [
+    [125, 600, 650, 695, 720, 770, 770, 815, 815, 870, 870, 910, 910, 950, 950, 1030],
+    [125, 595, 645, 690, 720, 760, 760, 805, 805, 850, 850, 890, 890, 930, 930, 1025],
+    [125, 615, 660, 705, 725, 775, 775, 805, 805, 855, 855, 895, 895, 935, 935, 1030],
+    [125, 600, 660, 700, 715, 770, 770, 805, 805, 860, 860, 900, 900, 940, 940, 1020],
+]
+J616C_AUX = [(24, 585000), (338, 585000), (618, 630000), (796, 680000), (992, 720000),
+             (1188, 770000), (1380, 865000), (1470, 900000)]
 
 
 def opps(name, hz, mv):
@@ -190,9 +219,42 @@ fn main() {
         &t6041::RESERVED_SLOTS, &t6041::PERF, &T6041_OPPS, &T6041_AUX, &t6041::CHIP,
         &t6041::REGION_C, 40);
     println!("T6041 initialization objects built");
-    std::fs::write(format!("{}/t6041-hwdata.bin", out), hw).unwrap();
-    std::fs::write(format!("{}/t6041-power-config.bin", out), power).unwrap();
-    std::fs::write(format!("{}/t6041-region-c.bin", out), region).unwrap();
+    std::fs::write(format!("{}/t6041-hwdata.bin", out), &hw).unwrap();
+    std::fs::write(format!("{}/t6041-power-config.bin", out), &power).unwrap();
+    std::fs::write(format!("{}/t6041-region-c.bin", out), &region).unwrap();
+    // 25G83: the same configuration with its own register map, and 0 at +0x2610.
+    let (hw_g83, power_g83, region_g83) = build(t6041::CHIP_ID, &t6041::REGISTER_WINDOWS_25G83,
+        &[], &t6041::PERF, &T6041_OPPS, &T6041_AUX, &t6041::CHIP_25G83, &t6041::REGION_C, 40);
+    println!("T6041 25G83 initialization objects built");
+    assert_eq!(power_g83, power, "the register map changes only the hardware data");
+    assert_eq!(region_g83, region, "the register map changes only the hardware data");
+    let map = 0x640..0x640 + REGISTER_MAP_SLOTS * core::mem::size_of::<RegisterMapEntry>();
+    let outside = |a: &[u8], b: &[u8]| a.iter().zip(b).enumerate()
+        .filter(|(i, (x, y))| x != y && !map.contains(i)).map(|(i, _)| i).collect::<Vec<_>>();
+    assert_eq!(outside(&hw_g83, &hw), [0x2610],
+               "the 25G83 hardware data differs only in its register map and +0x2610");
+    assert_eq!((hw[0x2610], hw_g83[0x2610]), (1, 0), "+0x2610: 1 on 25F84, 0 on 25G83");
+    std::fs::write(format!("{}/t6041-25g83-hwdata.bin", out), &hw_g83).unwrap();
+    // The 32-core J616C on 25G83, from its operating points. What it ran with since October
+    // 2026, hashed without the runtime words (FNV-1a 64), from a dump of 25 Oct 2026.
+    let (hw32, power32, region32) = build(t6041::CHIP_ID, &t6041_25g83::REGISTER_WINDOWS, &[],
+        &t6041_25g83::PERF, &J616C_OPPS, &J616C_AUX, &t6041_25g83::CHIP,
+        &t6041_25g83::REGION_C, 32);
+    println!("T6041 25G83 32-core initialization objects built");
+    let fnv = |bytes: &[u8], skip: &[(usize, usize)]| {
+        bytes.iter().enumerate().filter(|(i, _)| !skip.iter().any(|&(at, n)| (at..at + n).contains(i)))
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, (_, &b)| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+    };
+    assert_eq!(fnv(&hw32, &[(0x2620, 0x80), (0x26b8, 8)]), 0xd781_973f_9983_1e35,
+               "the J616C hardware data");
+    assert_eq!(fnv(&power32, &[(0x3b50, 8), (0x6318, 8), (0x63d4, 4)]), 0xc36d_7dba_a597_aac4,
+               "the J616C power configuration");
+    assert_eq!(fnv(&region32, &[]), 0x91a4_c670_17e3_0a24, "the J616C region C");
+    let word = |at: usize| u32::from_le_bytes(power32[at..at + 4].try_into().unwrap());
+    assert_eq!(word(0x9ec), (-1000.0 / t6041_25g83::MAX_POWER_MW as f32).to_bits());
+    println!("T6041 25G83 32-core objects match the J616C's");
+    std::fs::write(format!("{}/t6041-25g83-32-hwdata.bin", out), &hw32).unwrap();
+    std::fs::write(format!("{}/t6041-25g83-32-power-config.bin", out), &power32).unwrap();
 }
 """
 
@@ -210,12 +272,15 @@ def program():
     common = (DRIVER / "hw/t604x.rs").read_text().replace("use crate::g17::fw::initdata::RegisterWindow;", "use super::RegisterWindow;")
     code.append("mod t604x {\n%s\n}\n" % common)
     code.append("pub mod v25g83 {\n%s\n}\n" % v25g83)
-    for name, source, items in (("t6041", t6041, T6041_ITEMS),):
+    j616c = (DRIVER / "hw/t6041_25g83.rs").read_text()
+    for name, source, items in (("t6041", t6041, T6041_ITEMS), ("t6041_25g83", j616c, J616C_ITEMS)):
         body = "\n".join(item(source, i) for i in items)
         body = re.sub(r"(?m)^const ", "pub(crate) const ", body)
         code.append("pub mod %s {\nuse super::*;\nuse super::t604x::{instances, window};\n%s\n}\n" % (name, body))
     code.append(opps("T6041_OPPS", T6041_OPP_HZ, T6041_OPP_MV))
     code.append(aux("T6041_AUX", T6041_AUX))
+    code.append(opps("J616C_OPPS", J616C_OPP_HZ, J616C_OPP_MV))
+    code.append(aux("J616C_AUX", J616C_AUX))
     code.append(MAIN)
     return "\n".join(code)
 

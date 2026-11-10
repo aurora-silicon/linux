@@ -11,6 +11,7 @@ def identity(root, output):
     unit = unit.replace('int fw_compat;bool has_panel;',
                         'int fw_compat;unsigned notch_height;bool has_panel;')
     unit += r'''
+typedef int32_t s32;
 #define ALIGN(x,n) (((x)+(n)-1)&~((n)-1))
 #define SZ_16M (16U<<20)
 static u32 get_unaligned_le32(const void *p) {u32 n;memcpy(&n,p,4);return n;}

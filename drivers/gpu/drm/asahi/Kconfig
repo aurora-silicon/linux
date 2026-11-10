@@ -29,19 +29,23 @@ config DRM_ASAHI
 	  be called aurora. It keeps "asahi" as a module alias.
 
 config DRM_ASAHI_G16
-	bool "Apple M4 (G16G) support (experimental)"
+	bool "Apple M4 (G16G) support"
 	depends on DRM_ASAHI && ARM64
+	depends on DRM_APPLE=y || (DRM_APPLE=m && DRM_ASAHI=m)
+	depends on DRM_APPLE_DCP_T8132
 	depends on APPLE_PMP=y || APPLE_PMP=DRM_ASAHI
 	depends on APPLE_CLPC=y || APPLE_CLPC=DRM_ASAHI || APPLE_CLPC=n
 	depends on THERMAL_OF
+	default y
 	help
-	  Rust backend for the qualified J713/T8132 GPU firmware.
-	  Load aurora explicitly after the native display and GFX TVM supplier
-	  are ready. Firmware-visible storage remains retained until a verified
-	  retirement or reboot. Keep the working kernel available during bring-up.
-	  A rendering VM pins about 0.7 GiB; memory-cgroup limits are advisable.
-	  An aborted receipt disables that command class until reboot.
-	  Suspend, hibernation and kexec are blocked while native graphics owns DMA.
+	  Backend for the M4 (T8132) GPU running the 25G83 firmware of
+	  macOS 26.6.2, which the boot loader leaves loaded. The driver
+	  binds when the GPU node appears and starts the firmware once the
+	  PMP supplier, and a native display the boot loader handed over,
+	  are up. The firmware session is retained until reboot and stays
+	  running across suspend-to-idle.
+	  A rendering VM pins about 0.7 GiB. An aborted receipt disables
+	  that command class until reboot.
 
 config DRM_ASAHI_G18
 	bool "Apple M6 (G18G, T8152) support (experimental)"
@@ -75,17 +79,35 @@ config DRM_ASAHI_DEBUG_ALLOCATOR
 	  Say N unless you are debugging firmware structures or porting to a
 	  new firmware version.
 
+config DRM_ASAHI_M3_T8122
+	bool "M3 MacBook Air GPU runtime (T8122, 14.8.3 firmware)"
+	depends on DRM_ASAHI
+	# The runtime adopts the firmware's UAT through the G15 backend's handoff helpers.
+	depends on DRM_ASAHI_G15
+	select CRYPTO_LIB_SHA256
+	default n
+	help
+	  Build the M3 runtime that starts the GPU of the M3 MacBook Air
+	  (J613, J615) on the 14.8.3 GPU firmware the boot loader leaves
+	  loaded. On the listed Air boards it starts after the boot loader
+	  handed the GPU over and resource/firmware identity checks pass.
+	  asahi.t8122_start=0 keeps startup disabled for recovery. Unknown
+	  boards and firmware do not gain automatic admission. Other GPUs
+	  are not affected.
+
 config DRM_ASAHI_G15
-	bool "Native G15 firmware backend (M3 Pro/Max)"
+	bool "Apple M3 Pro/Max (G15) support"
 	depends on DRM_ASAHI
 	depends on DRM_APPLE=y || (DRM_APPLE=m && DRM_ASAHI=m)
 	select APPLE_T6030_GPU_PMP_LINK
 	select CRYPTO_LIB_SHA256
-	default n
+	default y
 	help
-	  Enable the native G15 backend for explicitly admitted M3 Pro/Max
-	  firmware and boards. Other GPUs keep the maintained backend.
-	  The firmware session is retained until reboot once started.
+	  Backend for the M3 Pro (T6030) and M3 Max (T6031) GPUs on the
+	  boards and firmware it admits. The driver binds when the boot
+	  loader enables the GPU node and starts the firmware once the
+	  native display is up. The firmware session is retained until
+	  reboot. Other GPUs keep the maintained backend.
 	  The native display driver must be built in, or both drivers must
 	  be modules, so a modular display provider finishes initialization
 	  before the GPU module can probe through its direct helper import.

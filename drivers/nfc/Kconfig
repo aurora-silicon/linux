@@ -60,6 +60,30 @@ config NFC_VIRTUAL_NCI
 
 	  If unsure, say N.
 
+config NFC_APPLE_STOCKHOLM
+	tristate "Apple Stockholm NFC controller and Secure Element"
+	depends on SPMI && GPIOLIB && OF
+	depends on ARCH_APPLE || COMPILE_TEST
+	help
+	  This enables the driver for the Apple Stockholm NFC controller with
+	  embedded Secure Element found on Apple silicon Macs, connected over
+	  SPMI. The Mac parts have no NFC radio interfaces, so no NFC device
+	  is registered: the driver reads the controller identity once and
+	  keeps the controller powered off.
+
+	  Say M here to compile this driver as a module named apple-stockholm.
+
+config NFC_APPLE_STOCKHOLM_KUNIT_TEST
+	bool "KUnit tests for the Apple Stockholm driver" if !KUNIT_ALL_TESTS
+	depends on NFC_APPLE_STOCKHOLM && KUNIT
+	depends on KUNIT=y || NFC_APPLE_STOCKHOLM=m
+	default KUNIT_ALL_TESTS
+	help
+	  Tests for the parsing of the NCI identity responses, built into the
+	  apple-stockholm driver.
+
+	  If unsure, say N.
+
 source "drivers/nfc/fdp/Kconfig"
 source "drivers/nfc/pn544/Kconfig"
 source "drivers/nfc/pn533/Kconfig"

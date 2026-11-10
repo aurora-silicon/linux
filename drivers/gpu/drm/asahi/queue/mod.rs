@@ -82,6 +82,10 @@ pub(crate) trait Queue: Send + Sync {
         cmdbuf_raw: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result;
+
+    /// Waits for the work submitted so far to finish, before the mappings of a closing
+    /// client go. Queues whose VMs keep user mappings for accepted jobs need not wait.
+    fn drain(&mut self) {}
 }
 
 #[versions(AGX)]
@@ -142,6 +146,8 @@ pub(crate) struct Queue {
     fence_ctx: FenceContexts,
     inner: QueueInner::ver,
     stats: Arc<stats::StatsSnapshot>,
+    /// Finished fence of the last submitted job, waited for when the queue goes away.
+    last_out: Option<Fence>,
 }
 
 #[versions(AGX)]
@@ -551,6 +557,7 @@ impl Queue::ver {
             q_comp: None,
             fence_ctx: FenceContexts::new(1, QUEUE_NAME, QUEUE_CLASS_KEY)?,
             stats,
+            last_out: None,
             inner: QueueInner::ver {
                 dev: dev.clone(),
                 ualloc,
@@ -681,7 +688,39 @@ fn build_attachments(reader: &mut Reader<'_>, size: usize) -> Result<microseq::A
 }
 
 #[versions(AGX)]
+impl Queue::ver {
+    /// Waits, for at most [`QUEUE_CLOSE_WAIT_MS`], for the last submitted job to finish. The
+    /// jobs of one queue complete in order, so its finished fence covers all of them.
+    fn wait_submitted(&self) {
+        let Some(fence) = self.last_out.as_ref() else {
+            return;
+        };
+        // SAFETY: `fence` holds a reference for the duration of the call. No lock is held,
+        // so completion can signal it.
+        let left = unsafe {
+            kernel::bindings::dma_fence_wait_timeout(
+                fence.raw(),
+                false,
+                kernel::time::msecs_to_jiffies(QUEUE_CLOSE_WAIT_MS) as _,
+            )
+        };
+        if left == 0 {
+            dev_warn!(
+                self.dev.as_ref(),
+                "[Queue {}] Closing with work still running after {} ms\n",
+                self.inner.id,
+                QUEUE_CLOSE_WAIT_MS
+            );
+        }
+    }
+}
+
+#[versions(AGX)]
 impl Queue for Queue::ver {
+    fn drain(&mut self) {
+        self.wait_submitted();
+    }
+
     fn submit<'drm>(
         &mut self,
         reg_data: &AsahiRegData<'drm>,
@@ -1008,6 +1047,7 @@ impl Queue for Queue::ver {
         mod_dev_dbg!(self.dev, "Queue {}: Arming job {}\n", self.inner.id, job.id);
         let mut job = job.arm();
         let out_fence = job.fences().finished();
+        self.last_out = Some(out_fence.clone());
         mod_dev_dbg!(
             self.dev,
             "Queue {}: Pushing job {}\n",
@@ -1039,5 +1079,13 @@ impl Queue for Queue::ver {
 impl Drop for Queue::ver {
     fn drop(&mut self) {
         mod_dev_dbg!(self.dev, "[Queue {}] Dropping queue\n", self.inner.id);
+        // A client that exits or is killed drops its queues with jobs still queued or running
+        // on the GPU, and its VMs right after (see `file::File`). Those VMs do not track jobs:
+        // dropping one unmaps the user range at once, and the firmware then faults on the
+        // next access of the running job and times out. Let the submitted work finish first.
+        self.wait_submitted();
     }
 }
+
+/// How long a closing queue waits for its submitted work to finish.
+const QUEUE_CLOSE_WAIT_MS: u32 = 5000;

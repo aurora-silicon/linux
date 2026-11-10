@@ -16,11 +16,14 @@
 #include <asm/io.h>
 #include "linux/of.h"
 #include <dt-bindings/phy/phy.h>
+#include <linux/bits.h>
+#include <linux/delay.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/phy/phy.h>
 #include <linux/phy/phy-dp.h>
 #include <linux/platform_device.h>
+#include <linux/string.h>
 #include <linux/types.h>
 
 #define DPTX_MAX_LANES    4
@@ -31,6 +34,23 @@
 enum apple_dptx_type {
 	DPTX_PHY_T8112,
 	DPTX_PHY_T6020,
+	DPTX_PHY_T6050,
+};
+
+/* The PLL core calibration the board describes, in t6050_pll_core_cfg() order. */
+enum {
+	T6050_DCOCFG,
+	T6050_DTCVREG,
+	T6050_DTCCAL,
+	T6050_DCDADJ,
+	T6050_DLFCFG,
+	T6050_RODCOROLEAKCOMP,
+	T6050_NR_CAL,
+};
+
+static const char *const t6050_cal_props[T6050_NR_CAL] = {
+	"apple,pll-dcocfg", "apple,pll-dtcvreg", "apple,pll-dtccal",
+	"apple,pll-dcdadj", "apple,pll-dlfcfg", "apple,pll-rodcoroleakcomp",
 };
 
 struct apple_dptx_phy_hw {
@@ -48,6 +68,14 @@ struct apple_dptx_phy {
 		void __iomem *core;
 		void __iomem *dptx;
 	} regs;
+
+	/* T6050 */
+	u32 cal[T6050_NR_CAL];
+	bool cal_set[T6050_NR_CAL];
+	u32 source_select;
+	bool pclkdrv_select;
+	bool active;
+	u32 rate;		/* Mbit/s; 0: none programmed */
 
 	struct phy *phy_dp;
 	struct phy_provider *phy_provider;
@@ -523,9 +551,397 @@ static int dptx_phy_set_link_rate(struct apple_dptx_phy *phy, u32 link_rate)
 	return 0;
 }
 
+/*
+ * T6050 (M5 Ultra) lpdptx. The two banks are T602x's ("core" and "dptx", the
+ * PLL command register at dptx+0x100c), but the PLL calibration, clocking,
+ * rate programming, AUX calibration and PHY power are T8122/T8132's. Every
+ * write is a field update; nothing below replays a captured register word.
+ */
+static void t6050_rmw(void __iomem *base, u32 off, u32 shift, u32 mask, u32 val)
+{
+	mask32(base + off, mask, (val << shift) & mask);
+}
+
+#define T6050_D(phy, off, shift, mask, val) \
+	t6050_rmw((phy)->regs.dptx, off, shift, mask, val)
+#define T6050_C(phy, off, shift, mask, val) \
+	t6050_rmw((phy)->regs.core, off, shift, mask, val)
+
+/* core+0x48: PLL (bits 6:4), AUX (10:8) and PHY (2:0) power, 1 us apart. */
+static void t6050_block_power(struct apple_dptx_phy *phy, u32 lsb, bool on)
+{
+	if (on) {
+		T6050_C(phy, 0x48, lsb, BIT(lsb), 1);
+		udelay(1);
+		T6050_C(phy, 0x48, lsb + 1, BIT(lsb + 1), 1);
+		udelay(1);
+		T6050_C(phy, 0x48, lsb + 2, BIT(lsb + 2), 0);
+		udelay(1);
+	} else {
+		T6050_C(phy, 0x48, lsb + 2, BIT(lsb + 2), 1);
+		udelay(1);
+		T6050_C(phy, 0x48, lsb + 1, BIT(lsb + 1), 0);
+		udelay(1);
+		T6050_C(phy, 0x48, lsb, BIT(lsb), 0);
+		udelay(1);
+	}
+}
+
+static void t6050_device_power(struct apple_dptx_phy *phy, bool on)
+{
+	T6050_C(phy, 0x10, 0, 0x7, phy->source_select);
+	t6050_block_power(phy, 4, on);	/* PLL */
+	t6050_block_power(phy, 8, on);	/* AUX */
+	t6050_block_power(phy, 0, on);	/* PHY */
+}
+
+/* The board's PLL core calibration (an absent value leaves its field), then fixed settings. */
+static void t6050_pll_core_cfg(struct apple_dptx_phy *phy)
+{
+	const u32 *v = phy->cal;
+	const bool *set = phy->cal_set;
+
+	if (set[T6050_DCOCFG]) {
+		T6050_D(phy, 0x2240, 1, 0x6, (v[T6050_DCOCFG] >> 3) & 3);
+		T6050_D(phy, 0x2240, 4, 0x70, v[T6050_DCOCFG] & 7);
+	}
+	if (set[T6050_DTCVREG])
+		T6050_D(phy, 0x2230, 0, 0x1f, v[T6050_DTCVREG]);
+	if (set[T6050_DTCCAL])
+		T6050_D(phy, 0x22e8, 17, 0x60000, v[T6050_DTCCAL]);
+	if (set[T6050_DCDADJ])
+		T6050_D(phy, 0x2240, 22, 0x7c00000, v[T6050_DCDADJ]);
+	if (set[T6050_DLFCFG])
+		T6050_D(phy, 0x22b0, 20, 0x700000, v[T6050_DLFCFG]);
+	if (set[T6050_RODCOROLEAKCOMP])
+		T6050_D(phy, 0x2240, 19, 0x180000, v[T6050_RODCOROLEAKCOMP]);
+
+	T6050_D(phy, 0x22e8, 0, 0x1, 1);
+	T6050_D(phy, 0x2240, 3, 0x8, 1);
+	T6050_D(phy, 0x2240, 0, 0x1, 1);
+	T6050_D(phy, 0x2224, 10, 0xc00, 2);
+	T6050_D(phy, 0x22b0, 27, 0x08000000, 0);
+	T6050_D(phy, 0x2338, 23, 0x0f800000, 0xf);
+}
+
+/* The pixel clock driver: dptx+0x2200 bit 3 with pclkdrv-select, else bit 1. */
+static bool t6050_pclk(struct apple_dptx_phy *phy, bool on)
+{
+	u32 bit = phy->pclkdrv_select ? 3 : 1;
+
+	if (!on) {
+		if (!(readl(phy->regs.dptx + 0x2200) & BIT(bit)))
+			return false;
+	}
+	T6050_D(phy, 0x2200, bit, BIT(bit), on);
+	return true;
+}
+
+static void t6050_configure_pll(struct apple_dptx_phy *phy)
+{
+	T6050_D(phy, 0x2218, 0, 0x1, 1);
+	T6050_D(phy, 0x2234, 0, 0x3, 0);
+	t6050_pclk(phy, true);
+	T6050_D(phy, 0x2320, 1, 0x6, 1);	/* single-ended clock output */
+}
+
+/* AUX impedance calibration: start, sample completion once, copy the result. */
+static int t6050_impedance_calibration(struct apple_dptx_phy *phy)
+{
+	u32 done, code;
+
+	T6050_D(phy, 0x4224, 0, 0x1, 0);
+	usleep_range(1000, 1200);
+	T6050_D(phy, 0x4224, 0, 0x1, 1);
+	udelay(1);
+	T6050_D(phy, 0x4200, 4, 0x3f0, 0x3c);
+	udelay(1);
+	T6050_D(phy, 0x4200, 0, 0x1, 1);
+	udelay(125);
+	done = readl(phy->regs.dptx + 0x4204) & 1;
+	udelay(10);
+	T6050_D(phy, 0x4200, 0, 0x1, 0);
+	code = (readl(phy->regs.dptx + 0x4210) >> 18) & 0x7f;
+	if (!done) {
+		dev_err(phy->dev, "impedance calibration did not complete (0x4204 %#x)\n",
+			readl(phy->regs.dptx + 0x4204));
+		return -ETIMEDOUT;
+	}
+	T6050_D(phy, 0x4228, 16, 0x7f0000, code);
+	T6050_D(phy, 0x4228, 15, 0x8000, 1);
+	dev_dbg(phy->dev, "impedance calibration code %#x\n", code);
+	return 0;
+}
+
+static int t6050_activate(struct apple_dptx_phy *phy)
+{
+	t6050_device_power(phy, true);
+	phy->active = true;
+	t6050_pll_core_cfg(phy);	/* PLL top, PHY and AUX configuration: nothing on this board */
+	t6050_configure_pll(phy);
+	/* PLL activation */
+	T6050_D(phy, 0x1000, 1, 0x2, 0);
+	T6050_D(phy, 0x4004, 3, 0x8, 1);
+	/* PHY activation: every lane, highest first */
+	udelay(1);
+	for (int l = DPTX_MAX_LANES - 1; l >= 0; l--)
+		T6050_D(phy, DPTX_LANE0_OFFSET + DPTX_LANE_STRIDE * l, 9, 0x200, 0);
+	/* AUX power-up */
+	T6050_D(phy, 0xd000, 0, 0x1, 0);
+	return t6050_impedance_calibration(phy);
+}
+
+/* One PLL command (7 up, 0 down): request, 100 us, acknowledgment, lock state. */
+static int t6050_pll_command(struct apple_dptx_phy *phy, u32 cmd)
+{
+	bool up = cmd == 7;
+	u32 ack, sts;
+
+	T6050_D(phy, 0x100c, 0, 0x7, cmd);
+	T6050_D(phy, 0x100c, 3, 0x8, 1);
+	udelay(100);
+	ack = readl(phy->regs.dptx + 0x1014);
+	T6050_D(phy, 0x100c, 3, 0x8, 0);
+	sts = readl(phy->regs.dptx + 0x1008);
+	if (!(ack & 1)) {
+		dev_err(phy->dev, "PLL power %s: no acknowledgment (0x1014 %#x)\n",
+			up ? "up" : "down", ack);
+		return -ETIMEDOUT;
+	}
+	if (!!(sts & BIT(3)) != up) {
+		dev_err(phy->dev, "PLL power %s: lock is %s (0x1008 %#x)\n",
+			up ? "up" : "down", up ? "missing" : "still set", sts);
+		return -EIO;
+	}
+	return 0;
+}
+
+static int t6050_pll_power_down(struct apple_dptx_phy *phy)
+{
+	int ret;
+
+	if (!t6050_pclk(phy, false))
+		return 0;	/* already down */
+	ret = t6050_pll_command(phy, 0);
+	udelay(1);
+	return ret;
+}
+
+static int t6050_pll_power_up(struct apple_dptx_phy *phy)
+{
+	int ret = t6050_pll_command(phy, 7);
+
+	if (!ret)
+		t6050_pclk(phy, true);
+	return ret;
+}
+
+static void t6050_phy_power_down(struct apple_dptx_phy *phy)
+{
+	T6050_D(phy, 0x4004, 0, 0x1, 1);
+	T6050_D(phy, 0x4000, 6, 0x40, 0);
+	T6050_D(phy, 0x4004, 3, 0x8, 0);
+	T6050_D(phy, 0x4000, 25, 0x2000000, 0);
+	T6050_D(phy, 0x4000, 24, 0x1000000, 0);
+}
+
+static void t6050_phy_power_up(struct apple_dptx_phy *phy)
+{
+	T6050_D(phy, 0x4004, 3, 0x8, 1);
+	for (int l = 0; l < DPTX_MAX_LANES; l++)
+		T6050_D(phy, DPTX_LANE0_OFFSET + DPTX_LANE_STRIDE * l + 0x10,
+			27, 0x38000000, 4);
+	T6050_D(phy, 0x4030, 0, 0x1, 1);	/* TXA LDO low-power mode */
+	udelay(1);
+	T6050_D(phy, 0x4000, 24, 0x1000000, 1);
+	ndelay(250);
+	T6050_D(phy, 0x4000, 25, 0x2000000, 1);
+	udelay(1);
+	T6050_D(phy, 0x4000, 6, 0x40, 1);
+	udelay(1);
+	T6050_D(phy, 0x4004, 0, 0x1, 0);
+}
+
+static int t6050_set_lanes(struct apple_dptx_phy *phy, u32 n)
+{
+	if (n == 3 || n > DPTX_MAX_LANES)
+		return -EINVAL;
+	if (!phy->active)
+		return 0;
+	T6050_D(phy, 0x4000, 26, 0x4000000, 1);
+	udelay(1);
+	for (u32 l = 0; l < DPTX_MAX_LANES; l++)
+		T6050_D(phy, DPTX_LANE0_OFFSET + DPTX_LANE_STRIDE * l, 8, 0x100, n <= l);
+	if (n)
+		T6050_D(phy, 0x4000, 26, 0x4000000, 0);
+	phy->active_lanes = n;
+	return 0;
+}
+
+/*
+ * The PLL record of a link rate (after the T8122 adjustment of its first two
+ * words): the integer/fraction divider q08 + q0c / q10, the analog fields and
+ * whether the PLL clock output is bypassed.
+ */
+struct t6050_pll_cfg {
+	u32 rate;
+	u8 q00, q04, q14, q18, q1c;
+	u16 q08, q0c, q10, q24, q28;
+	bool bypass;
+};
+
+static const struct t6050_pll_cfg t6050_pll_cfgs[] = {
+	{ 1620, 1, 0, 1, 5, 0x13, 0x87, 0, 0, 0x80, 0x8804, true },
+	{ 2700, 1, 0, 1, 5, 0x09, 0x70, 0x1fff, 0x3ffe, 0x80, 0x8804, true },
+	{ 5400, 1, 1, 1, 5, 0x04, 0x70, 0x1fff, 0x3ffe, 0x100, 0x8984, true },
+	{ 8100, 1, 1, 1, 6, 0x04, 0xa8, 0x2ffd, 0x3ffc, 0x100, 0x8984, false },
+};
+
+static void t6050_shadow_update(struct apple_dptx_phy *phy)
+{
+	set32(phy->regs.core + 0xa0, 0x8);
+	set32(phy->regs.core + 0xa0, 0x4);
+	set32(phy->regs.core + 0xa0, 0x40000);
+	clear32(phy->regs.core + 0xa0, 0x40000);
+	set32(phy->regs.core + 0xa0, 0x80000);
+	clear32(phy->regs.core + 0xa0, 0x80000);
+	clear32(phy->regs.core + 0xa0, 0x4);
+	clear32(phy->regs.core + 0xa0, 0x8);
+}
+
+/* Program a link rate's PLL frequency and half-rate fields (the PLL and PHY stay as they are). */
+static int t6050_program_rate(struct apple_dptx_phy *phy, u32 rate)
+{
+	const struct t6050_pll_cfg *c = NULL;
+	u32 q10, f, e;
+	bool half;
+
+	for (int i = 0; i < ARRAY_SIZE(t6050_pll_cfgs); i++)
+		if (t6050_pll_cfgs[i].rate == rate)
+			c = &t6050_pll_cfgs[i];
+	if (!c)
+		return -EINVAL;
+
+	q10 = c->q10 ? c->q10 : 1;
+	f = 4 * c->q08 + (4 * c->q0c) / q10;
+	e = c->q0c > 1 ? c->q10 : 0;
+	half = rate >= 2000;
+
+	T6050_D(phy, 0x222c, 1, 0x2, c->bypass);
+	T6050_D(phy, 0x222c, 0, 0x1, !c->bypass);
+	T6050_D(phy, 0x2244, 0, 0xffff, c->q28);
+	T6050_D(phy, 0x2234, 23, 0xff800000, c->q24);
+	T6050_D(phy, 0x20b0, 0, 0x3ff, f);
+	T6050_D(phy, 0x20b0, 10, 0x400, 0);
+	T6050_D(phy, 0x20b4, 14, 0x0fffc000, c->q0c);
+	T6050_D(phy, 0x20b4, 0, 0x3fff, e);
+	T6050_D(phy, 0x20b8, 9, 0x3e00, c->q1c);
+	T6050_D(phy, 0x20b8, 14, 0xc000, c->q14);
+	T6050_D(phy, 0x20b8, 16, 0xf0000, c->q18);
+	T6050_D(phy, 0x20b8, 20, 0x300000, c->q00);
+	T6050_D(phy, 0x20b8, 22, 0x400000, c->q04);
+	t6050_shadow_update(phy);
+
+	/* half-link-rate: PHY, then PLL */
+	T6050_D(phy, 0x4004, 5, 0x20, !half);
+	T6050_D(phy, 0x4004, 6, 0x40, half);
+	T6050_D(phy, 0x2000, 29, 0x20000000, !half);
+	T6050_D(phy, 0x201c, 5, 0x20, !half);
+	phy->rate = rate;
+	return 0;
+}
+
+/*
+ * A link reconfiguration as the DCP brackets it: PHY and PLL down, the new
+ * lane count and rate, then (for a nonzero rate) PLL and PHY up.
+ */
+static int t6050_reconfigure(struct apple_dptx_phy *phy, bool set_lanes,
+			     u32 lanes, bool set_rate, u32 rate)
+{
+	int ret;
+
+	if (!phy->active)
+		return -ENODEV;
+	t6050_phy_power_down(phy);
+	ret = t6050_pll_power_down(phy);
+	if (ret)
+		return ret;
+	if (set_lanes) {
+		ret = t6050_set_lanes(phy, lanes);
+		if (ret)
+			return ret;
+	}
+	if (set_rate) {
+		if (!rate) {
+			phy->rate = 0;
+			return 0;
+		}
+		ret = t6050_program_rate(phy, rate);
+		if (ret)
+			return ret;
+	}
+	if (!phy->rate)
+		return 0;
+	ret = t6050_pll_power_up(phy);
+	if (ret)
+		return ret;
+	t6050_phy_power_up(phy);
+	return 0;
+}
+
+static int t6050_deactivate(struct apple_dptx_phy *phy)
+{
+	int ret;
+
+	if (!phy->active)
+		return 0;
+	t6050_set_lanes(phy, 0);
+	t6050_phy_power_down(phy);
+	for (int l = 0; l < DPTX_MAX_LANES; l++)
+		T6050_D(phy, DPTX_LANE0_OFFSET + DPTX_LANE_STRIDE * l, 9, 0x200, 1);
+	ret = t6050_pll_power_down(phy);
+	T6050_D(phy, 0xd000, 0, 0x1, 1);	/* AUX power-down */
+	phy->active = false;
+	phy->rate = 0;
+	t6050_device_power(phy, false);
+	return ret;
+}
+
+static int t6050_probe(struct apple_dptx_phy *phy)
+{
+	struct device_node *np = phy->dev->of_node;
+	u32 v;
+
+	for (int i = 0; i < T6050_NR_CAL; i++) {
+		if (of_property_read_u32(np, t6050_cal_props[i], &v) || v == 0xffffffff)
+			continue;
+		phy->cal[i] = v;
+		phy->cal_set[i] = true;
+	}
+	/* The crossbar's ufp endpoint u: 5 and 6 select themselves, 0xf none, any other u + 1. */
+	if (of_property_read_u32(np, "apple,ufp-endpoint", &v))
+		return dev_err_probe(phy->dev, -EINVAL, "no apple,ufp-endpoint\n");
+	phy->source_select = (v == 5 || v == 6) ? v : v == 0xf ? 0 : v + 1;
+	phy->pclkdrv_select = !of_property_read_u32(np, "apple,pclkdrv-select", &v) && v;
+
+	return 0;
+}
+
 static int dptx_phy_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 {
 	struct apple_dptx_phy *dptx_phy = phy_get_drvdata(phy);
+
+	if (dptx_phy->hw.type == DPTX_PHY_T6050) {
+		int ret = -EINVAL;
+
+		mutex_lock(&dptx_phy->lock);
+		if (mode == PHY_MODE_INVALID)
+			ret = t6050_deactivate(dptx_phy);
+		else if (mode == PHY_MODE_DP)
+			ret = dptx_phy->active ? 0 : t6050_activate(dptx_phy);
+		mutex_unlock(&dptx_phy->lock);
+		return ret;
+	}
 
 	switch (mode) {
 	case PHY_MODE_INVALID:
@@ -573,6 +989,16 @@ static int dptx_phy_configure(struct phy *phy, union phy_configure_opts *opts_)
 	struct apple_dptx_phy *dptx_phy = phy_get_drvdata(phy);
 	enum dptx_phy_link_rate link_rate;
 	int ret = 0;
+
+	if (dptx_phy->hw.type == DPTX_PHY_T6050) {
+		if (!opts->set_lanes && !opts->set_rate)
+			return 0;
+		mutex_lock(&dptx_phy->lock);
+		ret = t6050_reconfigure(dptx_phy, opts->set_lanes, opts->lanes,
+					opts->set_rate, opts->link_rate);
+		mutex_unlock(&dptx_phy->lock);
+		return ret;
+	}
 
 	if (opts->set_lanes) {
 		mutex_lock(&dptx_phy->lock);
@@ -656,6 +1082,8 @@ static int dptx_phy_probe(struct platform_device *pdev)
 	if (IS_ERR(dptx_phy->phy_provider))
 		return PTR_ERR(dptx_phy->phy_provider);
 
+	if (dptx_phy->hw.type == DPTX_PHY_T6050)
+		return t6050_probe(dptx_phy);
 	return 0;
 }
 
@@ -667,9 +1095,14 @@ static const struct apple_dptx_phy_hw apple_dptx_hw_t8112 = {
 	.type = DPTX_PHY_T8112,
 };
 
+static const struct apple_dptx_phy_hw apple_dptx_hw_t6050 = {
+	.type = DPTX_PHY_T6050,
+};
+
 static const struct of_device_id dptx_phy_match[] = {
 	{ .compatible = "apple,t6020-dptx-phy", .data = &apple_dptx_hw_t6020 },
 	{ .compatible = "apple,t8112-dptx-phy", .data = &apple_dptx_hw_t8112 },
+	{ .compatible = "apple,t6050-dptx-phy", .data = &apple_dptx_hw_t6050 },
 	{},
 };
 MODULE_DEVICE_TABLE(of, dptx_phy_match);

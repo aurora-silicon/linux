@@ -455,6 +455,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "dpa1";
+		apple,always-on;
 		power-domains = <&ps_audio_p>;
 	};
 

@@ -24,6 +24,7 @@ properties:
               - apple,t6000-dcp
               - apple,t6020-dcp
               - apple,t6041-dcp
+              - apple,t6050-dcp
               - apple,t8140-dcp
               - apple,t8142-dcp
           - const: apple,dcp
@@ -34,6 +35,7 @@ properties:
               - apple,t6000-dcpext
               - apple,t6020-dcpext
               - apple,t6041-dcpext
+              - apple,t6050-dcpext
           - const: apple,dcpext
       - items:
           - const: apple,t8140-dcpext
@@ -49,10 +51,14 @@ properties:
           reserves their firmware memory, publishes the firmware identity and
           sets apple,t8132-dcpext-firmware-ready.
         const: apple,t8132-dcpext
+      - description:
+          T6031 (M3 Max) internal display controller. The display gate enables
+          it after the boot loader has handed the running display over.
+        const: apple,t6031-dcp
 
   reg:
     minItems: 2
-    maxItems: 7
+    maxItems: 8
 
   reg-names:
     minItems: 2
@@ -63,7 +69,13 @@ properties:
       - enum: [disp-2, iop-vbar]
       - enum: [disp-3, iop-vbar]
       - enum: [disp-4, iop-vbar]
+      - enum: [disp-5, iop-vbar, coproc-aux]
       - const: iop-vbar
+
+  interrupts:
+    minItems: 7
+    maxItems: 16
+    description: Optional host display-engine interrupt sources.
 
   mboxes:
     maxItems: 1
@@ -85,13 +97,32 @@ properties:
 
   clocks:
     minItems: 1
-    maxItems: 2
+    maxItems: 64
 
   clock-names:
     minItems: 1
-    items:
-      - const: clock-154
-      - const: clock-194
+    maxItems: 64
+
+  apple,clock-ids:
+    oneOf:
+      - type: boolean
+      - $ref: /schemas/types.yaml#/definitions/uint32-array
+        minItems: 1
+        maxItems: 64
+    description: |
+      Ordered firmware provider clock identifiers. Callback clock indices
+      select the corresponding entry in clocks. An explicitly empty table
+      is allowed when the provider has no clocks.
+
+  apple,firmware-physical-regs:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    minItems: 1
+    maxItems: 10
+    description: |
+      Coprocessor physical base addresses in display register-table order,
+      including the bandwidth scratch and optional doorbell windows.
+      The number of entries must match the complete register table.
+      Omit on identity-mapped systems; reg supplies the physical view.
 
   memory-region:
     minItems: 1
@@ -262,6 +293,14 @@ properties:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Height in pixels reserved for the display notch.
 
+  apple,pmc-interface:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The PMC interface enables of this coprocessor's display pipe, an
+      apple,consumer-switched interface node. The coprocessor clears them
+      before it powers its display domains down while the display is off,
+      and restores them after it powers them up again.
+
   apple,pmp-report:
     $ref: /schemas/types.yaml#/definitions/phandle
     description:
@@ -352,19 +391,6 @@ properties:
       apple,max-brightness:
         $ref: /schemas/types.yaml#/definitions/uint32
         description: Maximum firmware backlight level.
-      apple,color-gamut:
-        $ref: /schemas/types.yaml#/definitions/string
-        enum:
-          - srgb
-          - display-p3
-        description:
-          Standard colour space the panel is calibrated to by default, as
-          named in the product's published specifications. srgb has the
-          IEC 61966-2-1 primaries, display-p3 the SMPTE EG 432-1 primaries;
-          both have a D65 white and a nominal gamma of 2.2. Factory
-          calibration of the individual unit is applied by the display
-          coprocessor and is not described here. Colour data reported by
-          the firmware takes precedence.
     required:
       - compatible
     additionalProperties: false
@@ -408,13 +434,14 @@ required:
 
 allOf:
   - if:
-      properties:
-        compatible:
-          contains:
-            enum: ['apple,t6030-dcpext', 'apple,t8132-dcpext']
-      required:
-        - compatible
-    else:
+      not:
+        properties:
+          compatible:
+            contains:
+              enum: ['apple,t6030-dcpext', 'apple,t8132-dcpext']
+        required:
+          - compatible
+    then:
       properties:
         mux-controls:
           maxItems: 8
@@ -423,20 +450,54 @@ allOf:
           items:
             pattern: '^(dp-xbar|typec[0-9]+)$'
   - if:
-      not:
-        properties:
-          compatible:
-            contains:
-              enum: ['apple,t8132-dcp', 'apple,t8132-dcpext']
+      allOf:
+        - not:
+            properties:
+              compatible:
+                contains:
+                  enum: ['apple,t6031-dcp', 'apple,t8132-dcp', 'apple,t8132-dcpext']
+        - not:
+            properties:
+              status:
+                const: disabled
+            required:
+              - status
     then:
       required:
         - apple,bw-scratch
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum: ['apple,t6050-dcp', 'apple,t6050-dcpext']
+    then:
+      required:
+        - apple,clock-ids
+        - memory-region
+        - memory-region-names
+        - apple,firmware-compat
+      properties:
+        apple,firmware-compat:
+          items:
+            - const: 27
+            - const: 0
+            - const: 0
+    else:
+      properties:
+        clocks:
+          maxItems: 2
+        clock-names:
+          items:
+            - const: clock-154
+            - const: clock-194
+        apple,clock-ids: false
+        apple,firmware-physical-regs: false
   - if:
       not:
         properties:
           compatible:
             contains:
-              enum: ['apple,t8140-dcp', 'apple,t8140-dcpext']
+              enum: ['apple,t8140-dcp', 'apple,t8140-dcpext', 'apple,t6050-dcp', 'apple,t6050-dcpext']
     then:
       properties:
         apple,power-lut-data-x: false
@@ -448,7 +509,8 @@ allOf:
       properties:
         compatible:
           contains:
-            enum: ['apple,t8140-dcp', 'apple,t8140-dcpext']
+            enum: ['apple,t8140-dcp', 'apple,t8140-dcpext',
+                   'apple,t6050-dcp', 'apple,t6050-dcpext']
     then:
       properties:
         resets: false

@@ -18,6 +18,51 @@ struct dcp_adt_cursor {
 	u32 nodes;
 };
 
+#define DCP_ADT_MATRIX_SIZE	40
+#define DCP_ADT_Q24_ONE		(1LL << 24)
+#define DCP_ADT_Q24_LIMIT	(4LL << 24)
+
+/*
+ * Validate the factory matrix only as provenance for the named target.  The
+ * DCP consumes the same raw property at matrix location 8; Linux must not
+ * retain its coefficients or submit them again through a DRM CTM.
+ */
+static bool dcp_adt_calibration_matrix(const u8 *value, u32 size)
+{
+	s64 coefficient[9], scaled[9], determinant;
+
+	if (size != DCP_ADT_MATRIX_SIZE || get_unaligned_le32(value) != 1)
+		return false;
+	for (unsigned int i = 0; i < ARRAY_SIZE(coefficient); i++) {
+		coefficient[i] = (s32)get_unaligned_le32(value + 4 + 4 * i);
+		if (coefficient[i] < -DCP_ADT_Q24_LIMIT ||
+		    coefficient[i] > DCP_ADT_Q24_LIMIT)
+			return false;
+		/* Q8.16 keeps the bounded determinant inside s64. */
+		scaled[i] = coefficient[i] >> 8;
+	}
+	for (unsigned int row = 0; row < 3; row++) {
+		s64 sum = coefficient[3 * row] + coefficient[3 * row + 1] +
+			  coefficient[3 * row + 2];
+
+		if (sum < DCP_ADT_Q24_ONE - 4 || sum > DCP_ADT_Q24_ONE + 4)
+			return false;
+	}
+	determinant = scaled[0] * (scaled[4] * scaled[8] - scaled[5] * scaled[7]) -
+		      scaled[1] * (scaled[3] * scaled[8] - scaled[5] * scaled[6]) +
+		      scaled[2] * (scaled[3] * scaled[7] - scaled[4] * scaled[6]);
+	return determinant != 0;
+}
+
+static enum dcp_panel_gamut dcp_adt_gamut(const u8 *value, u32 size)
+{
+	if (size == sizeof("P3") && !memcmp(value, "P3", sizeof("P3")))
+		return DCP_PANEL_GAMUT_DISPLAY_P3;
+	if (size == sizeof("sRGB") && !memcmp(value, "sRGB", sizeof("sRGB")))
+		return DCP_PANEL_GAMUT_SRGB;
+	return DCP_PANEL_GAMUT_UNSPECIFIED;
+}
+
 static const u8 *dcp_adt_bytes(struct dcp_adt_cursor *c, size_t size)
 {
 	const u8 *p;
@@ -76,6 +121,8 @@ static int dcp_adt_node(struct dcp_adt_cursor *c, struct dcp_panel_adt *panel,
 	size_t props_start, props_end;
 	u32 props, children;
 	char node_name[33] = {};
+	enum dcp_panel_gamut gamut = DCP_PANEL_GAMUT_UNSPECIFIED;
+	bool gamut_seen = false, matrix_seen = false, matrix_valid = false;
 	bool product, selected, backlight;
 
 	if (IS_ERR(header))
@@ -116,10 +163,23 @@ static int dcp_adt_node(struct dcp_adt_cursor *c, struct dcp_panel_adt *panel,
 
 		if (selected || (product && !strcmp(name, "raw-panel-serial-number")))
 			dcp_adt_panel_property(panel, name, prop + 36, size);
-		else if (backlight && !strcmp(name, "EDRPotentialHeadroom") && size == 4)
+		else if (product && !strcmp(name, "artwork-display-gamut")) {
+			if (gamut_seen)
+				gamut = DCP_PANEL_GAMUT_UNSPECIFIED;
+			else
+				gamut = dcp_adt_gamut(prop + 36, size);
+			gamut_seen = true;
+		} else if (product && !strcmp(name, "primary-calibration-matrix")) {
+			matrix_valid = !matrix_seen &&
+				dcp_adt_calibration_matrix(prop + 36, size);
+			matrix_seen = true;
+		} else if (backlight && !strcmp(name, "EDRPotentialHeadroom") && size == 4)
 			panel->edr_potential_headroom = get_unaligned_le32(prop + 36);
 		c->pos += 36 + ALIGN((size_t)size, 4);
 	}
+	if (product)
+		panel->gamut = gamut_seen && matrix_seen && matrix_valid ?
+			gamut : DCP_PANEL_GAMUT_UNSPECIFIED;
 	/* A valid ADT may have neither panel node; retain the OF defaults. */
 	panel->found |= selected;
 	c->pos = props_end;

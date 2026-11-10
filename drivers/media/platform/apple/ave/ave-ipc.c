@@ -8,6 +8,7 @@
  *
  * Copyright The Aurora Silicon Contributors
  */
+#include <linux/bitmap.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
@@ -66,10 +67,42 @@ static int ave_mbox_recv(struct ave_dev *ave, u32 reply[4])
 	return 0;
 }
 
+/*
+ * Channel names the firmware publishes and the direction each must have:
+ * 0 host to firmware, 1 firmware to host with every message handed back,
+ * 2 firmware to host with no hand-back message (a log).
+ */
+static const struct {
+	const char *name;
+	u32 dir;
+} ave_ring_names[AVE_RINGS] = {
+	[AVE_RING_IO] = { "IO", 0 },
+	[AVE_RING_T2H] = { "IO_T2H", 1 },
+	[AVE_RING_SMALLOC] = { "SHAREDMALLOC", 1 },
+	[AVE_RING_LOG] = { "TERMINAL", 2 },
+};
+
+static int ave_ring_id(const char *name)
+{
+	for (unsigned int id = 0; id < AVE_RINGS; id++)
+		if (!strcmp(name, ave_ring_names[id].name))
+			return id;
+	return -ENOENT;
+}
+
+static bool ave_rings_overlap(const struct ave_ring *a,
+			      const struct ave_ring *b)
+{
+	return a->slots && b->slots &&
+	       a->offset < b->offset + b->slots * AVE_RING_SLOT_BYTES &&
+	       b->offset < a->offset + a->slots * AVE_RING_SLOT_BYTES;
+}
+
 int ave_ipc_parse_channels(struct ave_dev *ave)
 {
-	bool found[2] = { false, false };
+	bool found[AVE_RINGS] = {};
 
+	memset(ave->ring, 0, sizeof(ave->ring));
 	for (unsigned int i = 0; i < ave->layout->abi->transport->descriptors;
 	     i++) {
 		u8 *desc = ave->ipc.cpu + AVE_IPC_CHANNEL_OFF +
@@ -79,7 +112,7 @@ int ave_ipc_parse_channels(struct ave_dev *ave)
 		u32 slots = get_unaligned_le32(desc + AVE_CHAN_DESC_SLOTS);
 		u64 addr = get_unaligned_le64(desc + AVE_CHAN_DESC_ADDR);
 		struct ave_ring *r;
-		unsigned int id;
+		int id;
 		u32 offset;
 
 		const struct ave_fw_transport *t = ave->layout->abi->transport;
@@ -95,17 +128,19 @@ int ave_ipc_parse_channels(struct ave_dev *ave)
 		    offset + slots * AVE_RING_SLOT_BYTES >
 			    AVE_IPC_CHANNEL_OFF + ave->channel_bytes)
 			return -EPROTO;
-		if (!strcmp(desc, "IO"))
-			id = 0;
-		else if (!strcmp(desc, "IO_T2H"))
-			id = 1;
-		else if (t->descriptors > 2)
-			continue;
-		else
+		id = ave_ring_id(desc);
+		/* Channels the host has no use for are left alone. */
+		if (id == AVE_RING_SMALLOC && !t->smalloc_bytes)
+			id = -ENOENT;
+		if (id < 0) {
+			if (t->descriptors > 2)
+				continue;
 			return -EPROTO;
-		if (found[id] || dir != id || !doorbell || doorbell >= 32 ||
-		    !slots ||
-		    (t->slots[id] &&
+		}
+		if (found[id] || dir != ave_ring_names[id].dir ||
+		    doorbell >= 32 || !slots ||
+		    (id <= AVE_RING_T2H && !doorbell) ||
+		    (id <= AVE_RING_T2H && t->slots[id] &&
 		     (slots != t->slots[id] || doorbell != t->doorbells[id] ||
 		      offset != AVE_IPC_CHANNEL_OFF + t->offsets[id] ||
 		      i != (id ? t->t2h_index : t->io_index))))
@@ -114,8 +149,12 @@ int ave_ipc_parse_channels(struct ave_dev *ave)
 		found[id] = true;
 		r = &ave->ring[id];
 		strscpy(r->name, desc, sizeof(r->name));
-		/* Host-to-firmware rings start empty, firmware-to-host rings full. */
-		r->mode = dir ^ 1;
+		/*
+		 * Host-to-firmware rings start empty, firmware-to-host rings
+		 * full. Bit 0 of a slot's first word says whose turn it is:
+		 * the host reads a firmware-to-host slot once it is clear.
+		 */
+		r->mode = dir ? 0 : 1;
 		r->doorbell = doorbell;
 		r->slots = slots;
 		r->offset = offset;
@@ -123,24 +162,38 @@ int ave_ipc_parse_channels(struct ave_dev *ave)
 		r->producer = r->mode ? 0 : -1;
 	}
 
-	if (!found[0] || !found[1])
+	if (!found[AVE_RING_IO] || !found[AVE_RING_T2H])
 		return -EPROTO;
-	if (ave->ring[0].offset <
-		    ave->ring[1].offset +
-			    ave->ring[1].slots * AVE_RING_SLOT_BYTES &&
-	    ave->ring[1].offset <
-		    ave->ring[0].offset +
-			    ave->ring[0].slots * AVE_RING_SLOT_BYTES)
-		return -EPROTO;
+	for (unsigned int a = 0; a < AVE_RINGS; a++)
+		for (unsigned int b = a + 1; b < AVE_RINGS; b++)
+			if (ave_rings_overlap(&ave->ring[a], &ave->ring[b]))
+				return -EPROTO;
 
-	/* Hand every host-to-firmware slot to the host; ownership is bit 0. */
-	for (unsigned int i = 0; i < ave->ring[0].slots; i++) {
-		__le64 *slot = ave->ipc.cpu + ave->ring[0].offset +
-			       i * AVE_RING_SLOT_BYTES;
+	/*
+	 * Hand every slot of every host-to-firmware ring to the host, the ones
+	 * the host never uses too: ownership is bit 0, and a slot left at zero
+	 * reads to the firmware as a message posted to it.
+	 */
+	for (unsigned int i = 0; i < ave->layout->abi->transport->descriptors;
+	     i++) {
+		u8 *desc = ave->ipc.cpu + AVE_IPC_CHANNEL_OFF +
+			   i * AVE_CHAN_DESC_STRIDE;
+		u32 slots = get_unaligned_le32(desc + AVE_CHAN_DESC_SLOTS);
+		u32 offset;
 
-		slot[0] = cpu_to_le64(1);
-		slot[1] = 0;
-		slot[2] = 0;
+		if (get_unaligned_le32(desc + AVE_CHAN_DESC_DIR))
+			continue;
+		/* Checked above. */
+		ave_fw_offset(ave, get_unaligned_le64(desc + AVE_CHAN_DESC_ADDR),
+			      (size_t)slots * AVE_RING_SLOT_BYTES, &offset);
+		for (unsigned int n = 0; n < slots; n++) {
+			__le64 *slot = ave->ipc.cpu + offset +
+				       n * AVE_RING_SLOT_BYTES;
+
+			slot[0] = cpu_to_le64(1);
+			slot[1] = 0;
+			slot[2] = 0;
+		}
 	}
 	dma_wmb();
 	return 0;
@@ -159,7 +212,8 @@ int ave_ipc_check_hello(const struct ave_fw_transport *t, const u32 hello[4])
 		return -EPROTO;
 	if (t->boot_config)
 		return !hello[3] || hello[3] > 4 * SZ_1M ? -EPROTO : 0;
-	return hello[1] != t->hello[1] || hello[3] != t->hello[3] ? -EPROTO : 0;
+	/* The 6070 firmware may ask for a heap too (0xc0000 on T6000). */
+	return hello[1] != t->hello[1] || hello[3] > 4 * SZ_1M ? -EPROTO : 0;
 }
 
 static int ave_iop_time_us(struct ave_dev *ave, u64 *us)
@@ -174,12 +228,14 @@ static int ave_iop_time_us(struct ave_dev *ave, u64 *us)
 	return 0;
 }
 
+static int ave_ipc_wait_ready(struct ave_dev *ave);
+
 int ave_ipc_negotiate(struct ave_dev *ave, const u32 hello[4])
 {
 	const struct ave_fw_transport *t = ave->layout->abi->transport;
 	u8 *hs = ave->ipc.cpu + AVE_IPC_HANDSHAKE_OFF;
 	u64 ticks, offset_us;
-	u32 status, reply[4], off;
+	u32 reply[4], off;
 	int ret;
 
 	ret = ave_ipc_check_hello(t, hello);
@@ -193,7 +249,7 @@ int ave_ipc_negotiate(struct ave_dev *ave, const u32 hello[4])
 			hello[1], hello[2], hello[3]);
 	ave->channel_bytes = hello[1];
 
-	if (t->boot_config) {
+	if (hello[3]) {
 		if (ave->heap.cpu && ave->heap.size != PAGE_ALIGN(hello[3]))
 			return -EPROTO;
 		if (!ave->heap.cpu) {
@@ -217,8 +273,10 @@ int ave_ipc_negotiate(struct ave_dev *ave, const u32 hello[4])
 	ave_mbox_send(ave, lower_32_bits(ave->ipc.dma),
 		      upper_32_bits(ave->ipc.dma), ave->ipc.size, 0);
 	ret = ave_mbox_recv(ave, reply);
-	if (ret)
+	if (ret) {
+		dev_err(ave->dev, "no answer to the IPC window: %d\n", ret);
 		return ret;
+	}
 	ave->ipc_fw_base = (u64)reply[1] << 32 | reply[0];
 	if (!ave->ipc_fw_base || !IS_ALIGNED(ave->ipc_fw_base, SZ_16K) ||
 	    ave->ipc_fw_base > U64_MAX - ave->ipc.size)
@@ -234,6 +292,8 @@ int ave_ipc_negotiate(struct ave_dev *ave, const u32 hello[4])
 				   hs + AVE_HS_SHARED);
 		put_unaligned_le32(AVE_IPC_SHARED_BYTES,
 				   hs + AVE_HS_SHARED_BYTES);
+	}
+	if (hello[3]) {
 		put_unaligned_le64(ave->heap.dma, hs + AVE_HS_HEAP);
 		put_unaligned_le32(hello[3], hs + AVE_HS_HEAP_BYTES);
 	}
@@ -245,8 +305,10 @@ int ave_ipc_negotiate(struct ave_dev *ave, const u32 hello[4])
 		      upper_32_bits(ave->ipc_fw_base + AVE_IPC_HANDSHAKE_OFF),
 		      0, 0);
 	ret = ave_mbox_recv(ave, reply);
-	if (ret)
+	if (ret) {
+		dev_err(ave->dev, "no answer to the handshake block: %d\n", ret);
 		return ret;
+	}
 	if (ave_fw_offset(ave, (u64)reply[1] << 32 | reply[0],
 			  ave->channel_bytes, &off) ||
 	    off != AVE_IPC_CHANNEL_OFF ||
@@ -256,10 +318,14 @@ int ave_ipc_negotiate(struct ave_dev *ave, const u32 hello[4])
 	ret = ave_ipc_parse_channels(ave);
 	if (ret)
 		return ret;
+	bitmap_zero(ave->smalloc_map, AVE_SMALLOC_UNITS);
+	memset(ave->smalloc, 0, sizeof(ave->smalloc));
 
 	writel(AVE_BOOT_MAGIC, ave->mbox + AVE_MBOX_READY);
-	return readl_poll_timeout(ave->mbox + AVE_MBOX_READY, status, !status,
-				  50, AVE_MBOX_TIMEOUT_US);
+	ret = ave_ipc_wait_ready(ave);
+	if (ret)
+		dev_err(ave->dev, "firmware did not take the channels: %d\n", ret);
+	return ret;
 }
 
 static int ave_ring_send(struct ave_dev *ave, struct ave_ring *r, u64 addr, u32 len)
@@ -307,6 +373,176 @@ static int ave_ring_recv(struct ave_dev *ave, struct ave_ring *r, u64 *addr, u32
 	next = (r->consumer + 1) % r->slots;
 	r->consumer = next == r->producer ? -1 : next;
 	return 0;
+}
+
+/*
+ * The 6070 firmware borrows shared memory from the host over its
+ * SHAREDMALLOC ring. A request with no address asks for the given number of
+ * bytes; the host answers on the same ring with the firmware address of the
+ * block and its size. A request with an address gives that block back; the
+ * host answers with the address and a size of zero. The blocks come from a
+ * part of the IPC window kept for this, so the firmware reaches them through
+ * the mapping it already has.
+ */
+static int ave_smalloc_get(struct ave_dev *ave, u32 bytes, u64 *addr)
+{
+	const struct ave_fw_transport *t = ave->layout->abi->transport;
+	u32 total = min_t(u32, t->smalloc_bytes / AVE_SMALLOC_GRANULE,
+			  AVE_SMALLOC_UNITS);
+	u32 units = DIV_ROUND_UP(bytes, AVE_SMALLOC_GRANULE);
+	unsigned long first;
+	unsigned int i;
+
+	if (!bytes || units > total)
+		return -EINVAL;
+	for (i = 0; i < AVE_SMALLOC_MAX && ave->smalloc[i].units; i++)
+		;
+	if (i == AVE_SMALLOC_MAX)
+		return -ENOSPC;
+	first = bitmap_find_next_zero_area(ave->smalloc_map, total, 0, units, 0);
+	if (first >= total)
+		return -ENOMEM;
+	bitmap_set(ave->smalloc_map, first, units);
+	ave->smalloc[i].first = first;
+	ave->smalloc[i].units = units;
+	memset(ave->ipc.cpu + t->smalloc_offset + first * AVE_SMALLOC_GRANULE, 0,
+	       units * AVE_SMALLOC_GRANULE);
+	*addr = ave->ipc_fw_base + t->smalloc_offset +
+		first * AVE_SMALLOC_GRANULE;
+	return 0;
+}
+
+static int ave_smalloc_put(struct ave_dev *ave, u64 addr)
+{
+	const struct ave_fw_transport *t = ave->layout->abi->transport;
+	u64 start = ave->ipc_fw_base + t->smalloc_offset;
+	u64 first;
+
+	if (addr < start || addr - start >= t->smalloc_bytes ||
+	    !IS_ALIGNED(addr - start, AVE_SMALLOC_GRANULE))
+		return -EINVAL;
+	first = (addr - start) / AVE_SMALLOC_GRANULE;
+	for (unsigned int i = 0; i < AVE_SMALLOC_MAX; i++) {
+		if (!ave->smalloc[i].units || ave->smalloc[i].first != first)
+			continue;
+		bitmap_clear(ave->smalloc_map, first, ave->smalloc[i].units);
+		ave->smalloc[i].units = 0;
+		return 0;
+	}
+	return -ENOENT;
+}
+
+/*
+ * Answer every pending SHAREDMALLOC request. Returns 1 when one was
+ * answered, 0 when none was pending. Caller holds hw_lock (or is the
+ * start-up path, which runs before anyone else can reach the rings).
+ */
+int ave_ipc_serve_smalloc(struct ave_dev *ave)
+{
+	struct ave_ring *r = &ave->ring[AVE_RING_SMALLOC];
+	int served = 0, ret;
+	u64 addr;
+	u32 len;
+
+	if (!r->slots)
+		return 0;
+	while (!(ret = ave_ring_recv(ave, r, &addr, &len))) {
+		u64 block = addr;
+		u32 bytes = 0;
+
+		if (addr) {
+			ret = ave_smalloc_put(ave, addr);
+			if (ret)
+				dev_warn(ave->dev,
+					 "firmware returned unknown shared block %#llx\n",
+					 addr);
+		} else {
+			ret = ave_smalloc_get(ave, len, &block);
+			if (ret) {
+				dev_err(ave->dev,
+					"no shared memory for the firmware (%u bytes): %d\n",
+					len, ret);
+				return ret;
+			}
+			bytes = len;
+		}
+		dev_dbg(ave->dev, "shared memory %s %#llx (%u bytes)\n",
+			addr ? "returned" : "lent", block, addr ? 0 : len);
+		ret = ave_ring_send(ave, r, block, bytes);
+		if (ret)
+			return ret;
+		served = 1;
+	}
+	return ret == -EAGAIN ? served : ret;
+}
+
+#define AVE_LOG_LINE_MAX 0x200
+/* What the host writes back into a log slot it has read: its type, 2, ^ 1. */
+#define AVE_LOG_SLOT_FREE 3
+
+/*
+ * Read the firmware's log lines from the TERMINAL ring. The firmware writes a
+ * line only into a slot whose bit 0 is set and clears it; the host gives the
+ * slot back by setting it again. Lines go to the debug log.
+ */
+void ave_ipc_drain_log(struct ave_dev *ave)
+{
+	struct ave_ring *r = &ave->ring[AVE_RING_LOG];
+	char line[AVE_LOG_LINE_MAX + 1];
+
+	for (unsigned int n = 0; n < r->slots; n++) {
+		__le64 *slot = ave->ipc.cpu + r->offset +
+			       r->consumer * AVE_RING_SLOT_BYTES;
+		u64 word = le64_to_cpu(READ_ONCE(slot[0]));
+		u64 addr = word & ~3ULL;
+		u32 len, off;
+
+		if (word & 1)
+			break;
+		dma_rmb();
+		len = min_t(u32, le64_to_cpu(READ_ONCE(slot[1])),
+			    AVE_LOG_LINE_MAX);
+		if (addr && len && !ave_fw_offset(ave, addr, len, &off)) {
+			memcpy(line, ave->ipc.cpu + off, len);
+			line[len] = 0;
+			len = strnlen(line, len);
+			while (len && (line[len - 1] == '\n' ||
+				       line[len - 1] == '\r'))
+				line[--len] = 0;
+			dev_dbg(ave->dev, "fw: %s\n", line);
+		} else if (addr) {
+			dev_dbg(ave->dev, "fw: line at %#llx (%u bytes) outside the IPC window\n",
+				addr, len);
+		}
+		WRITE_ONCE(slot[0], cpu_to_le64(AVE_LOG_SLOT_FREE));
+		r->consumer = (r->consumer + 1) % r->slots;
+	}
+	dma_wmb();
+}
+
+/*
+ * The firmware clears the ready word once it has taken the channels. It may
+ * borrow shared memory first, so serve that while waiting.
+ */
+static int ave_ipc_wait_ready(struct ave_dev *ave)
+{
+	ktime_t deadline = ktime_add_us(ktime_get(), AVE_MBOX_TIMEOUT_US);
+
+	for (;;) {
+		bool late = ktime_after(ktime_get(), deadline);
+		int ret;
+
+		if (!readl(ave->mbox + AVE_MBOX_READY))
+			return 0;
+		ret = ave_ipc_serve_smalloc(ave);
+		if (ret < 0)
+			return ret;
+		ave_ipc_drain_log(ave);
+		if (late)
+			return -ETIMEDOUT;
+		if (!ret)
+			usleep_range(50, 100);
+	}
 }
 
 static int ave_ipc_buf_offset(struct ave_dev *ave, unsigned int buf,
@@ -448,7 +684,8 @@ int ave_ipc_submit(struct ave_dev *ave, unsigned int buf, size_t len,
 	    (reply && op >= ARRAY_SIZE(ave->want)))
 		return -EINVAL;
 
-	if (!abi->transport->boot_config && reply && ave->want[op])
+	if (!abi->transport->boot_config && reply && ave->want[op] &&
+	    op != AVE_OP_COMPLETE)
 		return -EBUSY;
 	if (abi->transport->sync_host_clock) {
 		created = div_u64(ktime_get_ns(), NSEC_PER_USEC);
@@ -463,7 +700,8 @@ int ave_ipc_submit(struct ave_dev *ave, unsigned int buf, size_t len,
 		ave->expected[op].subtype = get_unaligned_le32(cmd + 0x1c);
 	}
 
-	ret = ave_ring_send(ave, &ave->ring[0], ave->ipc_fw_base + off, len);
+	ret = ave_ring_send(ave, &ave->ring[AVE_RING_IO], ave->ipc_fw_base + off,
+			    len);
 	if (ret) {
 		ave_fw_mark_broken(ave, ret, "command ring full");
 		return ret;
@@ -595,7 +833,7 @@ static int ave_ipc_poll_once(struct ave_dev *ave)
 	/* The status is clear: a ring event from now on raises the line again. */
 	ave_ipc_unmask(ave);
 
-	ret = ave_ring_recv(ave, &ave->ring[0], &addr, &len);
+	ret = ave_ring_recv(ave, &ave->ring[AVE_RING_IO], &addr, &len);
 	if (!ret) {
 		/* Transport acks return the command address with no payload. */
 		buf = ave_ipc_buf_of(ave, addr);
@@ -610,7 +848,12 @@ static int ave_ipc_poll_once(struct ave_dev *ave)
 	if (ret != -EAGAIN)
 		return ret;
 
-	ret = ave_ring_recv(ave, &ave->ring[1], &addr, &len);
+	ave_ipc_drain_log(ave);
+	ret = ave_ipc_serve_smalloc(ave);
+	if (ret)
+		return ret;
+
+	ret = ave_ring_recv(ave, &ave->ring[AVE_RING_T2H], &addr, &len);
 	if (ret == -EAGAIN)
 		return 0;
 	if (ret)
@@ -628,7 +871,7 @@ static int ave_ipc_poll_once(struct ave_dev *ave)
 	memcpy(ave->msg, ave->ipc.cpu + off, len);
 	ave->msg_len = len;
 	/* Return the message buffer to the firmware. */
-	ret = ave_ring_send(ave, &ave->ring[1], addr, len);
+	ret = ave_ring_send(ave, &ave->ring[AVE_RING_T2H], addr, len);
 	if (ret)
 		return ret;
 	ret = ave_ipc_dispatch(ave);

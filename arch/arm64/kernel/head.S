@@ -314,16 +314,37 @@ SYM_INNER_LABEL(init_el2, SYM_L_LOCAL)
 	/*
 	 * A core confined to a CTXR window can't run the window's code at EL1,
 	 * so once a window is active it switches to VHE here instead of going
-	 * through EL1 and finalise_el2. Only a secondary or a resuming CPU is
-	 * ever confined (x22 == 1): the boot CPU's first entry (x22 == 0) is
-	 * not, and it runs before ctxr_stay_el2 is set and cleaned to the PoC,
-	 * so it must not read the flag at all.
+	 * through EL1 and finalise_el2. Only a secondary or a resuming CPU
+	 * reads the flag (x22 == 1): the boot CPU's first entry (x22 == 0)
+	 * runs before ctxr_stay_el2 is set and cleaned to the PoC, so it must
+	 * not read it at all.
 	 */
-	cbz	x22, .Lctxr_no_direct_vhe
+	cbnz	x22, .Lctxr_read_flag
+	/*
+	 * The boot CPU of a J616s (T6040) booted from a kcbz 0 boot object
+	 * dies before earlycon on the trip through EL1, while the T8140's
+	 * boot CPU survives it. Keep Apple cores from the M4 generation on
+	 * (part numbers from 0x50) with VHE at EL2 from the boot CPU's first
+	 * entry, as 73b99c17e605 did, without reading the flag.
+	 */
+	mrs	x0, midr_el1
+	ubfx	x1, x0, #MIDR_IMPLEMENTOR_SHIFT, #8
+	cmp	x1, #ARM_CPU_IMP_APPLE
+	b.ne	.Lctxr_no_direct_vhe
+	ubfx	x0, x0, #MIDR_PARTNUM_SHIFT, #12
+	cmp	x0, #0x50
+	b.lo	.Lctxr_no_direct_vhe
+	/* A virtual EL2 without VHE, as nested KVM may give a guest. */
+	mrs	x0, id_aa64mmfr1_el1
+	ubfx	x0, x0, #ID_AA64MMFR1_EL1_VH_SHIFT, #4
+	cbz	x0, .Lctxr_no_direct_vhe
+	b	.Lctxr_direct_vhe
+.Lctxr_read_flag:
 	adr_l	x0, ctxr_stay_el2
 	ldr	w0, [x0]
 	cbz	w0, .Lctxr_no_direct_vhe
 
+.Lctxr_direct_vhe:
 	finalise_el2_state
 
 	mov_q	x0, HCR_HOST_VHE_FLAGS

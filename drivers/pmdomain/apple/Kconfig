@@ -26,6 +26,17 @@ config APPLE_PMGR_PWRSTATE_KUNIT_TEST
 	  and need no Apple hardware. Also check the T6000 GFX missing-parent
 	  wait, its timeout, and the separate actual-state acknowledgment.
 
+config APPLE_T6041_CIO_RECONFIG
+	bool "Apple T6041 CIO cluster reconfiguration"
+	depends on OF
+	select MFD_SYSCON
+	select REGMAP
+	select RESET_CONTROLLER
+	default ARCH_APPLE
+	help
+	  Provide the PMGR reconfiguration request used after the T6041 Type-C
+	  PHY is tuned and before an ACIO USB4/Thunderbolt router starts.
+
 config APPLE_PMP_REPORT
 	bool "Apple PMP report control"
 	depends on OF

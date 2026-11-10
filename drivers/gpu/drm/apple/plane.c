@@ -145,8 +145,16 @@ static int apple_get_ix_layout(u32 width, u32 height,
 	return 0;
 }
 
+static bool apple_plane_element_geometry(struct drm_crtc *crtc)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
+
+	return dcp_surface_element_geometry(dcp);
+}
+
 /* Use exactly the same geometry for admission and surface construction. */
 static int apple_plane_get_fb_layout(struct drm_framebuffer *fb,
+				     bool element_geometry,
 				     struct apple_plane_layout *planes,
 				     u32 *buf_size)
 {
@@ -195,7 +203,9 @@ static int apple_plane_get_fb_layout(struct drm_framebuffer *fb,
 				return -EINVAL;
 			p->image.tile_w = drm_format_info_block_width(fmt, i);
 			p->image.tile_h = drm_format_info_block_height(fmt, i);
-			p->tile_size = p->image.tile_w * p->image.tile_h;
+			/* tile_size is bytes per element, not pixels. */
+			p->tile_size = element_geometry ? fmt->char_per_block[i] :
+				       p->image.tile_w * p->image.tile_h;
 			p->stride = fb->pitches[i];
 			break;
 		default:
@@ -251,7 +261,9 @@ static int apple_plane_atomic_check(struct drm_plane *plane,
 	if (ret < 0)
 		return ret;
 
-	ret = apple_plane_get_fb_layout(new_plane_state->fb, layouts, &buf_size);
+	ret = apple_plane_get_fb_layout(new_plane_state->fb,
+					apple_plane_element_geometry(new_plane_state->crtc),
+					layouts, &buf_size);
 	if (ret)
 		return ret;
 
@@ -417,8 +429,9 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 
 	struct drm_framebuffer *fb = base->fb;
 	const struct drm_format_info *fmt = fb->format;
+	bool element_geometry = apple_plane_element_geometry(base->crtc);
 
-	if (WARN_ON_ONCE(apple_plane_get_fb_layout(fb, layouts, &buf_size))) {
+	if (WARN_ON_ONCE(apple_plane_get_fb_layout(fb, element_geometry, layouts, &buf_size))) {
 		memset(&new_state->surf, 0, sizeof(new_state->surf));
 		return;
 	}
@@ -450,7 +463,7 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 		.surface_id = plane->base.id,
 		.buf_size = buf_size,
 
-		/* Only used for compressed or multiplanar surfaces */
+		/* Only used for compressed or multiplanar surfaces before firmware 27 */
 		.pix_size = 1,
 		.pel_w = 1,
 		.pel_h = 1,
@@ -458,6 +471,16 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 		.has_planes = 1,
 		.has_compr_info = 1,
 	};
+
+	if (element_geometry) {
+		/* Bytes per element, and the element's width and height in pixels */
+		new_state->surf.pix_size = fmt->char_per_block[0];
+		new_state->surf.pel_w = drm_format_info_block_width(fmt, 0);
+		new_state->surf.pel_h = drm_format_info_block_height(fmt, 0);
+		/* Present only when compression_info describes a compressed plane */
+		new_state->surf.has_compr_info =
+			fb->modifier == DRM_FORMAT_MOD_APPLE_INTERCHANGE;
+	}
 
 	/* Populate plane information for planar formats */
 	struct dcp_surface *surf = &new_state->surf;

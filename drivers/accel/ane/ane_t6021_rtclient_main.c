@@ -2501,15 +2501,41 @@ static int ane_t6021_prog_load_ioctl(struct drm_device *drm, void *data,
 	return ret;
 }
 
-/* Firmware perf mode: CSNE_CMD_CH_PROPERTY_WRITE (0x1f), channel 0,
- * property 0x10aa, value 1. macOS sends it once during power-on; the
- * 13.5 firmware treats it as its engine perf-mode switch. It is a runtime
- * switch (write 1 to /sys/module/ane_t6021/parameters/fw_perf_mode) so
- * its effect on call time can be measured on one boot. Only 1 is
- * accepted: no other value is known to be safe.
+/* Firmware perf mode (ane_t6021_perf_mode_cmd()): sent at every firmware
+ * power-on on T8112, as macOS does, and again after each restart. Writing 1
+ * to /sys/module/ane_t6021/parameters/fw_perf_mode sends it at run time on
+ * a SoC that does not send it at power-on; it reads back whether it was
+ * sent. Only 1 is accepted: no other value is known to be safe.
  */
 static struct ane_rtclient *ane_t6021_perf_ane;
 static bool fw_perf_mode;
+
+static bool perf_mode_at_boot = true;
+module_param(perf_mode_at_boot, bool, 0444);
+MODULE_PARM_DESC(perf_mode_at_boot,
+		 "T8112: set the firmware perf mode at power-on, as macOS does (default 1)");
+
+/* Send the perf-mode property on the command channel and remember it, so a
+ * firmware restart sends it again. Caller holds the command buffer.
+ */
+static int ane_rtclient_send_perf_mode(struct ane_rtclient *ane,
+				       unsigned long deadline)
+{
+	struct ane_legacy_buffer *command = ane->cmd_buf;
+	size_t len;
+	int ret;
+
+	memset(command->cpu, 0, SZ_16K);
+	len = ane_t6021_perf_mode_cmd(command->cpu);
+	ret = ane_rtclient_legacy_exchange(ane, command, len,
+					   CSNE_CMD_CH_PROPERTY_WRITE, 1,
+					   deadline);
+	if (!ret) {
+		fw_perf_mode = true;
+		ane->desired_perf = true;
+	}
+	return ret;
+}
 
 /* debugfs fw_memory: what the firmware holds now. */
 static int ane_t6021_fw_memory_show(struct seq_file *m, void *v)
@@ -2564,14 +2590,13 @@ static int ane_t6021_perf_mode_set(const char *val,
 		return -ENODEV;
 	}
 	memset(command->cpu, 0, SZ_16K);
-	*(u32 *)((u8 *)command->cpu + 0x08) = cpu_to_le32(0);
-	*(u32 *)((u8 *)command->cpu + 0x0c) = cpu_to_le32(0x10aa);
-	*(u32 *)((u8 *)command->cpu + 0x10) = cpu_to_le32(1);
-	ret = ane_rtclient_command(ane, command, 0x14, 0x001f, 1, 3000);
+	ret = ane_rtclient_command(ane, command,
+				   ane_t6021_perf_mode_cmd(command->cpu),
+				   CSNE_CMD_CH_PROPERTY_WRITE, 1, 3000);
 	if (!ret) {
 		fw_perf_mode = true;
 		ane->desired_perf = true;
-		dev_info(ane->dev, "fw perf mode set (property 0x10aa = 1)\n");
+		dev_info(ane->dev, "fw perf mode set\n");
 	}
 	mutex_unlock(&ane_t6021_fw_lock);
 	return ret;
@@ -2583,7 +2608,7 @@ static const struct kernel_param_ops ane_t6021_perf_mode_ops = {
 };
 module_param_cb(fw_perf_mode, &ane_t6021_perf_mode_ops, &fw_perf_mode, 0644);
 MODULE_PARM_DESC(fw_perf_mode,
-		 "Write 1 once to send CH_PROPERTY_WRITE 0x10aa = 1 (fw perf mode); reads back whether it was sent");
+		 "Write 1 once to set the firmware perf mode; reads back whether it was sent");
 
 static int ane_t6021_proc_create_ioctl(struct drm_device *drm, void *data,
 				       struct drm_file *file)
@@ -3323,16 +3348,9 @@ static int ane_rtclient_rs_boot(void *ctx)
 	if (ret)
 		return ret;
 	if (ane->desired_perf) {
-		u8 *cmd = ane->cmd_buf->cpu;
-
-		memset(cmd, 0, SZ_16K);
-		*(u32 *)(cmd + 0x0c) = cpu_to_le32(0x10aa);
-		*(u32 *)(cmd + 0x10) = cpu_to_le32(1);
-		ret = ane_rtclient_legacy_exchange(ane, ane->cmd_buf, 0x14, 0x001f, 1,
-						   jiffies + msecs_to_jiffies(3000));
+		ret = ane_rtclient_send_perf_mode(ane, jiffies + msecs_to_jiffies(3000));
 		if (ret)
 			return ret;
-		fw_perf_mode = true;
 	}
 	return atomic_read(&ane_t6021_quarantined) ? -EIO : 0;
 }
@@ -3912,6 +3930,19 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 					dev_err(dev,
 						"LEGACY CONFIG_GET reply word +0x08 zero\n");
 					cfg_err = -EPROTO;
+				} else if (perf_mode_at_boot &&
+					   ane->soc == &ane_t8112_soc) {
+					/* As macOS at power-on; restarts send it
+					 * again (desired_perf). A refusal leaves
+					 * the ring usable and the default mode.
+					 */
+					qret = ane_rtclient_send_perf_mode(ane, query_deadline);
+					if (!qret)
+						dev_info(dev, "fw perf mode set at power-on\n");
+					else if (qret == -EREMOTEIO)
+						dev_warn(dev, "fw perf mode refused; default mode kept\n");
+					else
+						cfg_err = qret;
 				}
 			} else {
 				cfg_err = -ENOMEM;

@@ -198,6 +198,26 @@ lock screen then selects `omarchy-lock-fingerprint` automatically and accepts
 Touch ID through fprintd. Hyprlock's separate fingerprint switch is not used
 by the Quickshell lock screen.
 
+## Checking the SEP state
+
+`aurora-sep status` prints every state the driver reports, one line each
+with PASS, WARN, FAIL or INFO: the attach, the twelve endpoints by name
+(macOS lists the same twelve as `sep-endpoint,<name>` services), the
+bring-up time, the key store and identity keybag, xART, the OS identity
+(and the os_uuid pin on the MacBook Neo), the hwrng, Touch ID, the sensor,
+the fingerprint restore and matching, the xART guard, failed xART
+requests, unhandled messages, sleep, `aurora-sep-ready.service` and the
+apple_sep error and warning lines of this boot. It exits 1 if anything
+FAILed. `--summary` prints only the last line, `--quiet` hides PASS and
+INFO lines and `--json` prints the report as JSON.
+
+It only reads: it never opens `/dev/sep-bio`, since that activates Touch
+ID. Run as root and with the enclave as the current hwrng, it reads 32
+bytes from `/dev/hwrng`, which shows that the enclave still answers, also
+after a resume; `--no-live` skips that. The kernel log check needs root.
+Older kernels without some of the diag attributes are checked on what
+they have (the endpoint count instead of the names, for example).
+
 ## Packages
 
 `packaging/` builds `aurora-sep`, with the loader, its service and the fprintd

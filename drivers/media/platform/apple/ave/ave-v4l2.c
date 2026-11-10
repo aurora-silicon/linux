@@ -420,6 +420,9 @@ static int ave_s_ctrl(struct v4l2_ctrl *ctrl)
 	case V4L2_CID_MPEG_VIDEO_BITRATE_MODE:
 		ctx->bitrate_mode = ctrl->val;
 		break;
+	case V4L2_CID_MPEG_VIDEO_CONSTANT_QUALITY:
+		ctx->quality = ctrl->val;
+		break;
 	case V4L2_CID_MPEG_VIDEO_BITRATE:
 		WRITE_ONCE(ctx->bitrate, ctrl->val);
 		break;
@@ -459,6 +462,9 @@ static int ave_s_ctrl(struct v4l2_ctrl *ctrl)
 	case V4L2_CID_MPEG_VIDEO_HEVC_PROFILE:
 		ctx->hevc_profile = ctrl->val;
 		break;
+	case V4L2_CID_APPLE_AVE_PRIORITIZE_SPEED:
+		ctx->prioritize_speed = ctrl->val;
+		break;
 	case V4L2_CID_MPEG_VIDEO_HEADER_MODE:
 	case V4L2_CID_MIN_BUFFERS_FOR_OUTPUT:
 		break;
@@ -472,19 +478,28 @@ static const struct v4l2_ctrl_ops ave_ctrl_ops = {
 	.s_ctrl = ave_s_ctrl,
 };
 
+static const struct v4l2_ctrl_config ave_ctrl_prioritize_speed = {
+	.ops = &ave_ctrl_ops,
+	.id = V4L2_CID_APPLE_AVE_PRIORITIZE_SPEED,
+	.name = "Prioritize Speed Over Quality",
+	.type = V4L2_CTRL_TYPE_BOOLEAN,
+	.max = 1,
+	.step = 1,
+};
+
 static int ave_init_ctrls(struct ave_ctx *ctx)
 {
 	struct v4l2_ctrl_handler *hdl = &ctx->hdl;
 	const struct v4l2_ctrl_ops *ops = &ave_ctrl_ops;
 	struct v4l2_ctrl *c;
 
-	v4l2_ctrl_handler_init(hdl, 17);
+	v4l2_ctrl_handler_init(hdl, 19);
 
-	/* Constant quality needs a quality-to-QP mapping that is not known yet. */
 	v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
-			       V4L2_MPEG_VIDEO_BITRATE_MODE_CBR,
-			       BIT(V4L2_MPEG_VIDEO_BITRATE_MODE_CQ),
+			       V4L2_MPEG_VIDEO_BITRATE_MODE_CQ, 0,
 			       V4L2_MPEG_VIDEO_BITRATE_MODE_VBR);
+	/* Constant quality: 100 is the best; same scale as VideoToolbox's 0.0-1.0. */
+	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_CONSTANT_QUALITY, 0, 100, 1, 50);
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_BITRATE, 100000, 100000000, 1,
 			  4000000);
 	/*
@@ -530,6 +545,9 @@ static int ave_init_ctrls(struct ave_ctx *ctx)
 			       V4L2_MPEG_VIDEO_HEVC_LEVEL_1);
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_HEVC_MIN_QP, 0, 51, 1, 0);
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP, 0, 51, 1, 51);
+
+	/* Off by default: macOS also codes for quality unless asked. */
+	v4l2_ctrl_new_custom(hdl, &ave_ctrl_prioritize_speed, NULL);
 
 	/* The firmware holds up to five frames; one more keeps it fed. */
 	c = v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MIN_BUFFERS_FOR_OUTPUT, 1, 32, 1,
@@ -645,10 +663,10 @@ static unsigned int ave_session_count(struct ave_dev *ave)
 }
 
 /*
- * Drain (with @flush), stop and close the session in the firmware. The
+ * Drain normally, or Flush an aborted 6070 stream, then Stop and Close. The
  * last session to go halts the firmware. Caller holds hw_lock.
  */
-static void ave_session_close(struct ave_ctx *ctx, bool flush)
+static void ave_session_close(struct ave_ctx *ctx, bool drain)
 {
 	struct ave_dev *ave = ctx->ave;
 	struct ave_session *sess = ctx->sess;
@@ -659,7 +677,11 @@ static void ave_session_close(struct ave_ctx *ctx, bool flush)
 		return;
 	if (sess->fw_open && ave->fw_state == AVE_FW_RUNNING) {
 		/* Complete is a barrier: answered after every frame before it. */
-		if (flush && sess->frames && !ave_cmd_complete(ctx, AVE_DRAIN_COMPLETES))
+		if (drain && sess->frames && !ave_cmd_complete(ctx, AVE_DRAIN_COMPLETES))
+			ave_ipc_settle(ave, AVE_FRAME_WAIT_MS);
+		else if (!drain && sess->handed &&
+			 !ave->layout->abi->transport->boot_config &&
+			 !ave_cmd_flush(ctx))
 			ave_ipc_settle(ave, AVE_FRAME_WAIT_MS);
 		if (ave->fw_state == AVE_FW_RUNNING)
 			ave_cmd_close(ctx);
@@ -679,14 +701,15 @@ static int ave_session_attach(struct ave_ctx *ctx)
 {
 	struct ave_dev *ave = ctx->ave;
 	struct ave_session *sess = ctx->sess;
+	unsigned int max_sessions = ave->layout->max_sessions ?: AVE_MAX_SESSIONS;
 	int idx = -1, ret;
 
 	lockdep_assert_held(&ave->hw_lock);
-	for (unsigned int i = 0; i < AVE_MAX_SESSIONS && idx < 0; i++)
+	for (unsigned int i = 0; i < max_sessions && idx < 0; i++)
 		if (!ave->sessions[i])
 			idx = i;
 	if (idx < 0) {
-		dev_err(ave->dev, "already encoding %u streams\n", AVE_MAX_SESSIONS);
+		dev_err(ave->dev, "already encoding %u streams\n", max_sessions);
 		return -EBUSY;
 	}
 	if (!ave_session_count(ave)) {
@@ -776,6 +799,8 @@ static int ave_session_begin(struct ave_ctx *ctx)
 	ret = ave_fw_check_build(ave);
 	if (ret)
 		return ret;
+	if (ave->layout->max_sessions == 1 && READ_ONCE(ave->sessions[0]))
+		return -EBUSY;
 	if (READ_ONCE(ave->sessions[0]) && READ_ONCE(ave->sessions[1]))
 		return -EBUSY;
 	/* A halted firmware restarts only from reset: let the power go first. */

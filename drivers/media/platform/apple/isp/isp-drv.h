@@ -162,6 +162,7 @@ struct apple_isp_hw {
 	u64 pmu_base;
 
 	int dsid_count;
+	const u64 *dsid_clr_bases;
 	/* windows of the H17 multi broadcast-clear command, the unused all ones */
 	u8 dsid_slots;
 	u64 dsid_clr_base0;
@@ -194,6 +195,7 @@ struct apple_isp_hw {
 	u32 mbox2_offset;
 	/* further interrupt enable and routing words (ISP17a) */
 	bool mbox_irq_route;
+	bool mbox_extra_enables;
 	/* coprocessor control register, 0 for ISP_COPROC_CONTROL */
 	u32 coproc_control;
 	/* coprocessor status register, 0 for ISP_COPROC_STATUS */
@@ -216,6 +218,7 @@ struct apple_isp_hw {
 	 */
 	const struct isp_dapf_window *dapf;
 	unsigned int num_dapf;
+	u32 dapf_sidmask;
 
 	/* ISP_GPIO_6 boot mode */
 	u32 boot_mode;

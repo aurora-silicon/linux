@@ -99,4 +99,12 @@
  */
 #define USB_QUIRK_HUB_NO_SUSPENDED_PORT_WAKEUP	BIT(21)
 
+/*
+ * Device signals a remote wakeup by itself shortly after every suspend, with
+ * no input. Keep it awake in suspend-to-idle, with its interrupt transfers
+ * running, when its wakeup is enabled and the host controller keeps running,
+ * so that its own input wakes the system instead.
+ */
+#define USB_QUIRK_WAKES_ITSELF_WHEN_SUSPENDED	BIT(22)
+
 #endif /* __LINUX_USB_QUIRKS_H */

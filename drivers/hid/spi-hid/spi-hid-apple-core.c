@@ -130,9 +130,7 @@ struct spihid_apple {
 	/* devm_kzalloc leaves this SPIHID_PWR_OFF. */
 	atomic_t power;
 
-#ifdef IRQ_WAKE_SUPPORT
 	bool irq_wake_enabled;
-#endif
 };
 
 /**
@@ -1105,6 +1103,16 @@ int spihid_apple_core_probe(struct spi_device *spi, struct spihid_apple_ops *ops
 
 	spihid_set_power(spihid, SPIHID_PWR_ON);
 
+	/*
+	 * The built-in keyboard and trackpad wake the system, as they do
+	 * under macOS. User space can turn this off through power/wakeup.
+	 */
+	if (ops->enable_irq_wake && ops->disable_irq_wake) {
+		err = devm_device_init_wakeup(dev);
+		if (err)
+			dev_warn(dev, "cannot enable wakeup: %d\n", err);
+	}
+
 	/* request device information */
 	dev_dbg(dev, "request device info");
 	spihid_apple_request(spihid, 0xd0, 0x20, 0x01, 0xd0, 0, NULL, 0);
@@ -1191,9 +1199,6 @@ EXPORT_SYMBOL_GPL(spihid_apple_core_shutdown);
 static int spihid_apple_core_suspend(struct device *dev)
 {
 	int ret;
-#ifdef IRQ_WAKE_SUPPORT
-	int wake_status;
-#endif
 	struct spihid_apple *spihid = spi_get_drvdata(to_spi_device(dev));
 
 	if (spihid->tp.hid) {
@@ -1222,22 +1227,23 @@ static int spihid_apple_core_suspend(struct device *dev)
 	/* Save some power */
 	spihid->ops->disable_irq(spihid->ops);
 
-#ifdef IRQ_WAKE_SUPPORT
+	/*
+	 * A wakeup device stays powered: the controller asserts its
+	 * interrupt on a key press or a trackpad click, which wakes the
+	 * system. Its state is kept, so resume does not reboot it.
+	 */
+	spihid->irq_wake_enabled = false;
 	if (device_may_wakeup(dev)) {
-		wake_status = spihid->ops->enable_irq_wake(spihid->ops);
-		if (!wake_status)
+		ret = spihid->ops->enable_irq_wake(spihid->ops);
+		if (!ret) {
 			spihid->irq_wake_enabled = true;
-		else
-			dev_warn(dev, "Failed to enable irq wake: %d\n",
-				wake_status);
-	} else {
-		spihid_set_power(spihid, SPIHID_PWR_OFF);
-		spihid->ops->power_off(spihid->ops);
+			return 0;
+		}
+		dev_warn(dev, "Failed to enable irq wake: %d\n", ret);
 	}
-#else
+
 	spihid_set_power(spihid, SPIHID_PWR_OFF);
 	spihid->ops->power_off(spihid->ops);
-#endif
 
 	return 0;
 }
@@ -1276,23 +1282,18 @@ static int spihid_apple_core_resume(struct device *dev)
 	int ret_tp = 0, ret_kbd = 0;
 	int err = 0;
 	struct spihid_apple *spihid = spi_get_drvdata(to_spi_device(dev));
-#ifdef IRQ_WAKE_SUPPORT
-	int wake_status;
 
-	if (device_may_wakeup(dev) && spihid->irq_wake_enabled) {
-		wake_status = spihid->ops->disable_irq_wake(spihid->ops);
-		if (!wake_status)
-			spihid->irq_wake_enabled = false;
-		else
-			dev_warn(dev, "Failed to disable irq wake: %d\n",
-				wake_status);
+	if (spihid->irq_wake_enabled) {
+		err = spihid->ops->disable_irq_wake(spihid->ops);
+		if (err)
+			dev_warn(dev, "Failed to disable irq wake: %d\n", err);
+		spihid->irq_wake_enabled = false;
+		/* Still powered and booted: just take interrupts again. */
 		spihid->ops->enable_irq(spihid->ops);
+		err = 0;
 	} else {
 		err = spihid_wake_controller(spihid);
 	}
-#else
-	err = spihid_wake_controller(spihid);
-#endif
 	if (err)
 		dev_warn(dev, "SPI HID controller resume incomplete: %d\n",
 			 err);

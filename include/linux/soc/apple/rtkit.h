@@ -198,6 +198,18 @@ void apple_rtkit_free_retaining_buffers(struct apple_rtkit *rtk);
 int apple_rtkit_reinit(struct apple_rtkit *rtk);
 
 /*
+ * Set how long each handshake step (power state and endpoint map replies)
+ * waits for the co-processor, for one that is known to answer slowly. Call
+ * before apple_rtkit_boot() or apple_rtkit_wake(). Zero restores the default
+ * of 1000 ms.
+ *
+ * @rtk:        Internal RTKit state initialized by apple_rtkit_init()
+ * @timeout_ms: Timeout in milliseconds
+ */
+void apple_rtkit_set_handshake_timeout(struct apple_rtkit *rtk,
+				       unsigned int timeout_ms);
+
+/*
  * Handle RTKit's boot process. Should be called after the CPU of the
  * co-processor has been started.
  */
@@ -221,6 +233,14 @@ int apple_rtkit_wake(struct apple_rtkit *rtk);
 
 /* Wake helpers which require AP readiness before their IOP power acknowledgment. */
 int apple_rtkit_wake_early_ap(struct apple_rtkit *rtk);
+
+/*
+ * Wake a co-processor stopped after apple_rtkit_idle() with its firmware,
+ * endpoints and buffers kept: restore the mailbox, resume RX, call @start to
+ * start its CPU, then complete HELLO, the endpoint map (with the started
+ * endpoints, no INIT and no new endpoint start) and IOP/AP ON.
+ */
+int apple_rtkit_wake_retained(struct apple_rtkit *rtk, int (*start)(void *), void *ctx);
 
 /*
  * Shutdown the co-processor

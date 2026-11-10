@@ -221,6 +221,7 @@ def brightness_takeover(root):
 #define WRITE_ONCE(x,v) ((x)=(v))
 #define DCP_FIRMWARE_V_26_6_DESKTOP 5
 #define DCP_FIRMWARE_H17P 1
+#define DCP_FIRMWARE_V_27_0 6
 #define DCP_IOMFB_METHODS_H17G 7
 #define MAX_BRIGHTNESS_PART2 510U
 #define BACKLIGHT_PLATFORM 1
@@ -397,7 +398,8 @@ def panel_identity(root, output=None):
     backend = (root / 'drivers/gpu/drm/apple/iomfb_v26_6_desktop.c').read_text()
     dictionary = block((root/'drivers/gpu/drm/apple/parser.c').read_text(), 'static int parse_panel_edid_value(')
     dictionary += block((root/'drivers/gpu/drm/apple/parser.c').read_text(), 'int parse_panel_edid_data(')
-    dictionary += block(backend, 'struct dcp_dict_passthrough_req_v26_6 {')+';\n'
+    # The dictionary record is shared with firmware 27's analytics event.
+    dictionary += block((root/'drivers/gpu/drm/apple/iomfb.h').read_text(), 'struct dcp_dict_passthrough_req {')+';\n'
     dictionary += block(backend, 'static bool trampoline_panel_dictionary_v26_6(')
     dictionary += block(backend, 'static bool iomfb_check_callback_exact_v26_6_desktop(')
     dictionary += '\n#define iomfb_check_callback_v26_6_desktop iomfb_check_callback_exact_v26_6_desktop\n'
@@ -462,7 +464,7 @@ int main(int argc, char **argv)
     };
     for(unsigned form=0;form<3;form++) {
         desktop=(__typeof__(desktop)){0};notifications=0;
-        struct dcp_dict_passthrough_req_v26_6 wire={0};u32 result=0;
+        struct dcp_dict_passthrough_req wire={0};u32 result=0;
         strcpy((char *)wire.key,form?"ProductAttributes":"DisplayAttributes");
         const u8 *data=form==2?minimal:form?product:attributes;
         size_t size=form==2?sizeof(minimal):form?sizeof(product):sizeof(attributes);
@@ -595,6 +597,7 @@ def powerlog_framing(root):
     prefix += r'''
 #define DCP_FIRMWARE_H17P 1
 #define DCP_FIRMWARE_V_26_6_DESKTOP 5
+#define DCP_FIRMWARE_V_27_0 6
 #define DCP_IOMFB_METHODS_H17G 7
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
@@ -663,10 +666,18 @@ int main(void)
     d.fw_compat=DCP_FIRMWARE_H17P;
     afk_recv_compact_message(&ep,3,wire,sizeof(wire)-8);
     assert(hints==3 && !service.users);
+    d.fw_compat=DCP_FIRMWARE_V_27_0;
+    afk_recv_compact_message(&ep,3,wire,sizeof(wire)-8);
+    assert(hints==3 && !service.users);
     d.fw_compat=DCP_FIRMWARE_V_26_6_DESKTOP;
     /* The first key without its value gives no reading. */
     afk_recv_compact_message(&ep,3,wire,24+12);
     assert(hints==3 && !service.users);
+    /* Firmware 27 takes a framed report's hint as H17P does. */
+    d.fw_compat=DCP_FIRMWARE_V_27_0;hint=0;
+    memcpy(wire+16,report,sizeof(report));
+    afk_recv_compact_message(&ep,3,wire,16+sizeof(report));
+    assert(hints==4 && hint==123000 && !service.users);
     return 0;
 }
 '''
@@ -793,8 +804,9 @@ def adt_identity(root):
 #include <stddef.h>
 #include <string.h>
 #include <errno.h>
-typedef uint8_t u8;typedef uint32_t u32;
+typedef uint8_t u8;typedef uint32_t u32;typedef int32_t s32;typedef int64_t s64;
 #define U16_MAX UINT16_MAX
+#define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
 #define SZ_16M (16U<<20)
 #define ALIGN(x,n) (((x)+(n)-1)&~((n)-1))
 #define ERR_PTR(x) ((void *)(intptr_t)(x))
@@ -802,7 +814,9 @@ typedef uint8_t u8;typedef uint32_t u32;
 #define IS_ERR(x) ((uintptr_t)(x)>(uintptr_t)-4096)
 static u32 get_unaligned_le32(const void *p) {u32 n;memcpy(&n,p,4);return n;}
 '''
-    code+=block((base/'dcp-display-metadata.h').read_text(),'struct dcp_display_metadata {')+';\n'
+    metadata=(base/'dcp-display-metadata.h').read_text()
+    code+=block(metadata,'struct dcp_display_metadata {')+';\n'
+    code+=block(metadata,'enum dcp_panel_gamut {')+';\n'
     code+=block(header,'struct dcp_panel_adt {')+';\n'+source
     code+='static const u8 fixture[]={'+','.join(map(str,data))+'};\n'
     return code+r'''

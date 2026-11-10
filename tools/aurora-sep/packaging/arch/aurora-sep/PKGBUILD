@@ -44,8 +44,10 @@ source=(load-driver
         aurora-touchid-setup
         aurora-touchid-setup.service
         extract-mesa-calibration.py
-        powerdevilrc)
+        powerdevilrc
+        aurora-sep)
 sha256sums=('SKIP'
+            'SKIP'
             'SKIP'
             'SKIP'
             'SKIP'
@@ -101,6 +103,7 @@ package() {
   install -Dm644 logind-aurora-sep.conf \
     "$pkgdir/usr/lib/systemd/logind.conf.d/50-aurora-sep.conf"
   install -Dm755 sep-bio-identities "$pkgdir/usr/bin/sep-bio-identities"
+  install -Dm755 aurora-sep "$pkgdir/usr/bin/aurora-sep"
   sed -i "s|^\(Exec[A-Za-z]*=\)/usr/local/sbin/|\1/usr/lib/aurora-sep/|" \
     "$pkgdir/usr/lib/systemd/system/fprintd.service.d/aurora-sep.conf"
   install -Dm755 sensor-present "$pkgdir/usr/lib/aurora-sep/aurora-sep-sensor-present"

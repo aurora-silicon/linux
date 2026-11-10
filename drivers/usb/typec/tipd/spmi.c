@@ -25,6 +25,14 @@
 /* Failed tries to sleep before it waits for the next access */
 #define SN201202X_SLEEP_TRIES		3
 
+#define SN201202X_REG_LDCM_STATUS	0x74
+#define SN201202X_LDCM_MITIGATE		BIT(6)
+#define SN201202X_LDCM_DETECTED		BIT(2)
+#define SN201202X_LDCM_STATE		GENMASK(3, 1)
+#define SN201202X_LDCM_STATE_IDLE	0
+#define SN201202X_LDCM_RESULT		GENMASK(5, 4)
+#define SN201202X_LDCM_RETRY_MS		500
+
 static int regmap_sn201202x_select_reg(struct spmi_device *sdev, u8 reg)
 {
 	int err;
@@ -248,6 +256,230 @@ VISIBLE_IF_KUNIT const struct regmap_bus regmap_sn201202x = {
 };
 EXPORT_SYMBOL_IF_KUNIT(regmap_sn201202x);
 
+VISIBLE_IF_KUNIT enum typec_contaminant
+sn201202x_ldcm_decode(const u8 status[SN201202X_LDCM_STATUS_LEN])
+{
+	if (FIELD_GET(SN201202X_LDCM_STATE, status[1]) !=
+	    SN201202X_LDCM_STATE_IDLE)
+		return TYPEC_CONTAMINANT_UNKNOWN;
+
+	if ((status[0] & SN201202X_LDCM_DETECTED) &&
+	    (status[1] & SN201202X_LDCM_RESULT))
+		return TYPEC_CONTAMINANT_LIQUID;
+
+	return TYPEC_CONTAMINANT_NONE;
+}
+EXPORT_SYMBOL_IF_KUNIT(sn201202x_ldcm_decode);
+
+static int sn201202x_ldcm_read(void *ctx,
+			      enum typec_contaminant *contaminant)
+{
+	struct tps6598x *tps = ctx;
+	u8 status[SN201202X_LDCM_STATUS_LEN];
+	int ret;
+
+	ret = tps6598x_block_read(tps, SN201202X_REG_LDCM_STATUS, status,
+				  sizeof(status));
+	*contaminant = ret ? TYPEC_CONTAMINANT_UNKNOWN :
+			     sn201202x_ldcm_decode(status);
+	return ret;
+}
+
+static int sn201202x_ldcm_set_mitigation(void *ctx, bool enable)
+{
+	struct tps6598x *tps = ctx;
+	struct sn201202x *sn = tps_to_sn(tps);
+	u8 command = enable ? SN201202X_LDCM_MITIGATE : 0;
+	int ret;
+
+	/*
+	 * The controller keeps its mitigation until told otherwise or reset.
+	 * Repeating the current state would only disturb the port, so send a
+	 * command only for a change or after a reset or failure.
+	 */
+	if (sn->ldcm_mitigation_known && sn->ldcm_mitigated == enable)
+		return 0;
+
+	/*
+	 * Successful task completion is the controller's mitigation ACK.
+	 * Startup commands can take more than a second on SN201202x. Wait for
+	 * completion before a retry can request the opposite mitigation state.
+	 */
+	ret = tps6598x_exec_cmd_tmo(tps, "LDCM", sizeof(command), &command,
+				   0, NULL, 5000, 0);
+	sn->ldcm_mitigation_known = !ret;
+	if (!ret)
+		sn->ldcm_mitigated = enable;
+	return ret;
+}
+
+static void sn201202x_ldcm_publish(void *ctx,
+				   enum typec_contaminant contaminant)
+{
+	struct tps6598x *tps = ctx;
+
+	typec_set_contaminant(tps->port, contaminant);
+	tps->contaminant = contaminant;
+}
+
+VISIBLE_IF_KUNIT int
+sn201202x_ldcm_update_state(void *ctx, const struct sn201202x_ldcm_ops *ops,
+			    enum typec_contaminant last)
+{
+	enum typec_contaminant contaminant;
+	int read_ret, ret;
+
+	read_ret = ops->read(ctx, &contaminant);
+	/*
+	 * A measurement in progress is not a result. Keep the last result and
+	 * its mitigation; the controller reports the new one when it is done.
+	 */
+	if (!read_ret && contaminant == TYPEC_CONTAMINANT_UNKNOWN &&
+	    last != TYPEC_CONTAMINANT_UNKNOWN)
+		return -EINPROGRESS;
+	if (read_ret || contaminant != TYPEC_CONTAMINANT_NONE) {
+		ret = ops->set_mitigation(ctx, true);
+		if (ret) {
+			ops->publish(ctx, TYPEC_CONTAMINANT_UNKNOWN);
+			return ret;
+		}
+
+		ops->publish(ctx, contaminant);
+		if (read_ret)
+			return read_ret;
+		return contaminant == TYPEC_CONTAMINANT_UNKNOWN ? -EAGAIN : 0;
+	}
+
+	ret = ops->set_mitigation(ctx, false);
+	if (ret) {
+		ops->publish(ctx, TYPEC_CONTAMINANT_UNKNOWN);
+		return ret;
+	}
+
+	/* Do not report dry if liquid appeared while mitigation was removed. */
+	read_ret = ops->read(ctx, &contaminant);
+	if (!read_ret && contaminant == TYPEC_CONTAMINANT_UNKNOWN) {
+		/*
+		 * Removing mitigation can start another measurement. The dry
+		 * snapshot above is still the latest result; preserve it just
+		 * as we preserve a previously published result at entry. Forcing
+		 * mitigation back on here can prevent the measurement finishing.
+		 */
+		ops->publish(ctx, TYPEC_CONTAMINANT_NONE);
+		return -EINPROGRESS;
+	}
+	if (read_ret || contaminant != TYPEC_CONTAMINANT_NONE) {
+		ret = ops->set_mitigation(ctx, true);
+		if (ret) {
+			ops->publish(ctx, TYPEC_CONTAMINANT_UNKNOWN);
+			return ret;
+		}
+	}
+
+	ops->publish(ctx, contaminant);
+	if (read_ret)
+		return read_ret;
+	return contaminant == TYPEC_CONTAMINANT_UNKNOWN ? -EAGAIN : 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(sn201202x_ldcm_update_state);
+
+static const struct sn201202x_ldcm_ops sn201202x_ldcm_ops = {
+	.read = sn201202x_ldcm_read,
+	.set_mitigation = sn201202x_ldcm_set_mitigation,
+	.publish = sn201202x_ldcm_publish,
+};
+
+static int sn201202x_ldcm_update(struct tps6598x *tps)
+{
+	return sn201202x_ldcm_update_state(tps, &sn201202x_ldcm_ops,
+					   tps->contaminant);
+}
+
+/* Measuring, or mitigated without a result yet: wait for the controller. */
+static bool sn201202x_ldcm_pending(int ret)
+{
+	return ret == -EINPROGRESS || ret == -EAGAIN;
+}
+
+static void sn201202x_ldcm_event(struct tps6598x *tps)
+{
+	struct sn201202x *sn = tps_to_sn(tps);
+
+	mod_delayed_work(system_freezable_wq, &sn->ldcm_work, 0);
+}
+
+static void sn201202x_ldcm_retry(struct tps6598x *tps, int ret)
+{
+	struct sn201202x *sn = tps_to_sn(tps);
+
+	if (!sn201202x_ldcm_pending(ret))
+		dev_err_ratelimited(tps->dev,
+				    "liquid-detection status unavailable: %d\n", ret);
+	mod_delayed_work(system_freezable_wq, &sn->ldcm_work,
+			 msecs_to_jiffies(SN201202X_LDCM_RETRY_MS));
+}
+
+static void sn201202x_ldcm_work(struct work_struct *work)
+{
+	struct sn201202x *sn = container_of(to_delayed_work(work),
+					  struct sn201202x, ldcm_work);
+	struct tps6598x *tps = &sn->cd.tps;
+	enum typec_contaminant last;
+	int ret;
+
+	mutex_lock(&tps->lock);
+	last = tps->contaminant;
+	ret = sn201202x_ldcm_update(tps);
+	/* Apply the cable state again only if the published state changed. */
+	if (tps->contaminant != last)
+		mod_delayed_work(system_freezable_wq, &sn->cd.resume_work, 0);
+	mutex_unlock(&tps->lock);
+
+	if (ret)
+		sn201202x_ldcm_retry(tps, ret);
+}
+
+/*
+ * Refresh the snapshot in the caller's context, before it applies the cable
+ * state, so that a port is never dropped for a stale "unknown". Context:
+ * tps->lock held.
+ */
+static void sn201202x_ldcm_refresh(struct tps6598x *tps)
+{
+	int ret;
+
+	lockdep_assert_held(&tps->lock);
+	ret = sn201202x_ldcm_update(tps);
+	if (ret)
+		sn201202x_ldcm_retry(tps, ret);
+}
+
+/* The controller was reset, which also removed its mitigation. */
+static void sn201202x_ldcm_invalidate(struct tps6598x *tps)
+{
+	struct sn201202x *sn = tps_to_sn(tps);
+
+	tps->contaminant = TYPEC_CONTAMINANT_UNKNOWN;
+	sn->ldcm_mitigated = false;
+	sn->ldcm_mitigation_known = false;
+	sn201202x_ldcm_event(tps);
+}
+
+static void sn201202x_ldcm_stop(struct tps6598x *tps)
+{
+	/* Reset recovery is drained later and may still try to queue an update. */
+	disable_delayed_work_sync(&tps_to_sn(tps)->ldcm_work);
+}
+
+VISIBLE_IF_KUNIT const struct tipd_contaminant_ops sn201202x_contaminant_ops = {
+	.update = sn201202x_ldcm_update,
+	.refresh = sn201202x_ldcm_refresh,
+	.event = sn201202x_ldcm_event,
+	.invalidate = sn201202x_ldcm_invalidate,
+	.stop = sn201202x_ldcm_stop,
+};
+EXPORT_SYMBOL_IF_KUNIT(sn201202x_contaminant_ops);
+
 static struct regmap *__devm_regmap_init_sn201202x(struct spmi_device *sdev,
 						   const struct regmap_config *config,
 						   struct lock_class_key *lock_key,
@@ -441,9 +673,10 @@ EXPORT_SYMBOL_IF_KUNIT(sn201202x_sleep_links);
 static bool sn201202x_sleep_event(struct tps6598x *tps)
 {
 	struct sn201202x *sn = tps_to_sn(tps);
-	struct cd321x_sleep_state st;
+	struct cd321x_sleep_state st = {};
 	u32 links = 0;
-	bool wake;
+	bool wake, ldcm_changed = false;
+	int ldcm_ret = 0;
 	int ret;
 
 	guard(mutex)(&tps->lock);
@@ -456,7 +689,16 @@ static bool sn201202x_sleep_event(struct tps6598x *tps)
 		ret = cd321x_sleep_events(tps, &st);
 	if (!ret)
 		links = sn201202x_sleep_links(&st);
-	wake = ret || (links & ~sn->sleep_links);
+	if (!ret && st.contaminant_event) {
+		enum typec_contaminant last = tps->contaminant;
+
+		ldcm_ret = sn201202x_ldcm_update(tps);
+		/* Wake for a new result or a failure, not for a measurement. */
+		if (ldcm_ret == -EINPROGRESS)
+			ldcm_ret = 0;
+		ldcm_changed = tps->contaminant != last;
+	}
+	wake = ret || ldcm_ret || ldcm_changed || (links & ~sn->sleep_links);
 	if (!ret)
 		sn->sleep_links = links;
 	spmi_command_sleep(sn->sdev);
@@ -480,7 +722,7 @@ static int sn201202x_probe(struct spmi_device *device)
 	match = of_match_device(sn201202x_of_match, &device->dev);
 	if (!match)
 		return -EINVAL;
-	data = tipd_hw_variants[(enum tipd_hw_variant)match->data];
+	data = tipd_hw_variants[(enum tipd_hw_variant)(uintptr_t)match->data];
 
 	/*
 	 * tipd_init() defers until the connector's USB role switch (the dwc3)
@@ -507,6 +749,8 @@ static int sn201202x_probe(struct spmi_device *device)
 	mutex_init(&tps->lock);
 	tps->dev = &device->dev;
 	tps->data = data;
+	tps->contaminant_ops = &sn201202x_contaminant_ops;
+	INIT_DELAYED_WORK(&sn->ldcm_work, sn201202x_ldcm_work);
 
 	init_completion(&sn->select_completion);
 	init_completion(&sn->sleep_completion);
@@ -569,9 +813,11 @@ static int sn201202x_probe(struct spmi_device *device)
 
 	ret = tipd_init(tps);
 	if (ret) {
+		cancel_delayed_work_sync(&sn->ldcm_work);
 		spmi_command_sleep(device);
 		return ret;
 	}
+	sn201202x_ldcm_event(tps);
 
 	/* Events can latch before the IRQ is registered. Consume that state now. */
 	tps->data->irq_handler(tps->irq, tps);
@@ -690,11 +936,46 @@ out_put:
 }
 EXPORT_SYMBOL_IF_KUNIT(sn201202x_suspend);
 
+static int sn201202x_prepare(struct device *dev)
+{
+	struct tps6598x *tps = dev_get_drvdata(dev);
+	struct sn201202x *sn = tps_to_sn(tps);
+	int ret;
+
+	cancel_delayed_work_sync(&sn->ldcm_work);
+	mutex_lock(&tps->lock);
+	ret = sn201202x_ldcm_update(tps);
+	mutex_unlock(&tps->lock);
+	/* A measurement in progress keeps the last result; its event wakes us. */
+	if (ret == -EINPROGRESS)
+		ret = 0;
+	if (ret && !sn->ldcm_mitigated) {
+		/* Do not enter sleep without a dry snapshot or mitigation ACK. */
+		sn201202x_ldcm_event(tps);
+		return ret;
+	}
+	if (ret)
+		dev_warn(tps->dev,
+			 "connector state unavailable; entering sleep mitigated: %d\n",
+			 ret);
+	return tipd_prepare(dev);
+}
+
+static void sn201202x_complete(struct device *dev)
+{
+	struct tps6598x *tps = dev_get_drvdata(dev);
+
+	/* Refresh the detector snapshot before cable revalidation is thawed. */
+	scoped_guard(mutex, &tps->lock)
+		sn201202x_ldcm_refresh(tps);
+	tipd_complete(dev);
+}
+
 MODULE_DEVICE_TABLE(of, sn201202x_of_match);
 
 static const struct dev_pm_ops sn201202x_pm_ops = {
-	.prepare = pm_sleep_ptr(tipd_prepare),
-	.complete = pm_sleep_ptr(tipd_complete),
+	.prepare = pm_sleep_ptr(sn201202x_prepare),
+	.complete = pm_sleep_ptr(sn201202x_complete),
 	SET_SYSTEM_SLEEP_PM_OPS(sn201202x_suspend, sn201202x_resume)
 	SET_RUNTIME_PM_OPS(sn201202x_runtime_suspend, sn201202x_runtime_resume, NULL)
 };

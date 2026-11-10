@@ -712,7 +712,8 @@ int dpavservep_init(struct apple_dcp *dcp)
 	if (IS_ERR(ep))
 		return PTR_ERR(ep);
 	/* External H17P uses AFKV2 service calls with host-owned OOB buffers. */
-	ep->wire_v2 = dcp->hw.iomfb_method_profile ==
+	ep->wire_v2 = dcp->fw_compat == DCP_FIRMWARE_V_27_0 ||
+		dcp->hw.iomfb_method_profile ==
 		DCP_IOMFB_METHODS_H17P_EXTERNAL;
 	ep->inline_v2 = false;
 	dcp->dcpavservep = ep;

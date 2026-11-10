@@ -118,3 +118,6 @@ u8 dcp_crtc_eotf(struct apple_dcp *dcp, struct drm_crtc *crtc,
 int dcp_crtc_check_hdr(struct apple_dcp *dcp, struct drm_crtc *crtc,
 		       struct drm_atomic_commit *commit);
 void dcp_hdr_metadata_forget(struct apple_dcp *dcp);
+int dcp_push_nested(struct apple_dcp *dcp, enum dcp_context_id origin,
+		    const struct dcp_method_entry *call, u32 in_len, u32 out_len,
+		    void *data, dcp_callback_t cb, void *cookie);

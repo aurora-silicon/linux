@@ -38,5 +38,7 @@ config VIDEO_APPLE_AVE_CMD_KUNIT_TEST
 	help
 	  Compare AVC/HEVC 9003 Start and Process images byte for byte with
 	  the pre-refactor builder. Test 6070 lifecycle envelopes, replies,
-	  split surface arrays, seven-channel discovery and encoding refusal.
+	  1080p/4K Start and Process fields, fixed and split surface banks,
+	  entropy interleave, alignment refusal, seven-channel discovery and
+	  encoding refusal.
 	  These tests run without firmware or encoder hardware.

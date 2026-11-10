@@ -1,0 +1,241 @@
+# SPDX-License-Identifier: GPL-2.0-only
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/phy/apple,combo-phy.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple DisplayPort and Type-C combo PHY
+
+maintainers:
+  - Dj <hey@djdev.me>
+
+description: |
+  Fixed four-lane DisplayPort PHY for HDMI bridges, or one shared owner of
+  Type-C USB2, USB3 and DisplayPort alternate mode. DisplayPort supports RBR
+  through HBR3 without spread-spectrum clocking. The combo provider serializes
+  controller shutdown, PIPE handoff, orientation and alternate-mode changes.
+  Register resources, power domains and board tunables come from the producer.
+
+properties:
+  compatible:
+    enum:
+      - apple,t6050-dp-phy
+      - apple,t6050-combo-phy
+
+  reg:
+    minItems: 6
+    maxItems: 11
+
+  reg-names:
+    minItems: 6
+    maxItems: 11
+
+  '#phy-cells':
+    enum: [0, 1]
+
+  '#reset-cells':
+    const: 1
+
+  apple,port-index:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    enum: [1, 2, 3, 4, 5]
+    description: Type-C port; the debug port (0) is excluded
+
+  apple,guest-port-reserved:
+    type: boolean
+    description: The boot producer has excluded this port from host ownership
+
+  mode-switch: true
+  orientation-switch: true
+
+  mboxes:
+    maxItems: 1
+
+  port:
+    $ref: /schemas/graph.yaml#/properties/port
+
+  apple,tunable-aus40cmn-shm:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description: Offset, mask and value tuples for the common analog bank
+
+  apple,tunable-cio4pll:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description: Offset, mask and value tuples for the CIO PLL bank
+
+  apple,tunable-usb2-default:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description: Offset, mask and value tuples for the USB2 PHY bank
+
+  apple,tunable-usb2-host:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description: Offset, mask and value tuples for the USB2 host bank
+
+  apple,tunable-pipe-default:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description: Offset, mask and value tuples for the PIPE handler
+
+  power-domains:
+    description:
+      A combo PHY may name the USB controller's domain fourth ("usb"). Its
+      USB2 PHY and digital banks are in that domain, and the PHY then holds it
+      while it runs, also on a port with no USB controller bound.
+    minItems: 3
+    maxItems: 4
+
+  power-domain-names:
+    minItems: 3
+    items:
+      - const: usb-aon
+      - const: common
+      - const: wrapper
+      - const: usb
+
+  apple,tunable-axi2af:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description: Offset, mask and value tuples within the named bank
+
+  apple,tunable-fabric:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description: Offset, mask and value tuples within the named bank
+
+  apple,tunable-common-cfg:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description: Offset, mask and value tuples within the named bank
+
+  apple,tunable-lioa:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description: Offset, mask and value tuples within the named bank
+
+  apple,tunable-lane0-rx-clock:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description: Offset, mask and value tuples within the named bank
+
+  apple,tunable-lane1-rx-clock:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description: Offset, mask and value tuples within the named bank
+
+  apple,tunable-lane0-rx-eq:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description: Offset, mask and value tuples within the named bank
+
+  apple,tunable-lane1-rx-eq:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description: Offset, mask and value tuples within the named bank
+
+  apple,tunable-auspll:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description: Offset, mask and value tuples within the named bank
+
+  apple,tunable-uc-regs-cio:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description:
+      Offset, mask and value tuples for the PHY firmware's registers in CIO
+      (USB4/Thunderbolt) mode. Optional; an absent CIO tunable is skipped.
+
+  apple,tunable-lane0-rx-top-cio:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description: As apple,tunable-uc-regs-cio, for lane 0's receiver top bank
+
+  apple,tunable-lane1-rx-top-cio:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description: As apple,tunable-uc-regs-cio, for lane 1's receiver top bank
+
+  apple,tunable-lane0-rx-eq-cio:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description: As apple,tunable-uc-regs-cio, for lane 0's receiver equalizer
+
+  apple,tunable-lane1-rx-eq-cio:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description: As apple,tunable-uc-regs-cio, for lane 1's receiver equalizer
+
+patternProperties:
+  '^apple,dp-training-table(-rbr|-hbr|-hbr2|-hbr3)?$':
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 16
+    maxItems: 16
+    description: Drive presets indexed by voltage swing times four plus pre-emphasis
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - '#phy-cells'
+  - power-domains
+  - power-domain-names
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          const: apple,t6050-combo-phy
+    then:
+      properties:
+        '#phy-cells':
+          const: 1
+        reg:
+          minItems: 11
+          maxItems: 11
+        reg-names:
+          items:
+            - const: core
+            - const: usb2phy
+            - const: usb2-digital
+            - const: reset
+            - const: fabric
+            - const: axi2af
+            - const: lioa
+            - const: common-cfg
+            - const: usb-control
+            - const: firmware-data
+            - const: pipehandler
+      required:
+        - '#reset-cells'
+        - apple,port-index
+        - apple,guest-port-reserved
+        - mode-switch
+        - orientation-switch
+        - mboxes
+    else:
+      properties:
+        '#phy-cells':
+          const: 0
+        power-domains:
+          maxItems: 3
+        power-domain-names:
+          maxItems: 3
+      if:
+        required:
+          - mode-switch
+      then:
+        properties:
+          reg:
+            minItems: 8
+            maxItems: 8
+          reg-names:
+            items:
+              - const: core
+              - const: reset
+              - const: fabric
+              - const: axi2af
+              - const: lioa
+              - const: common-cfg
+              - const: usb-control
+              - const: firmware-data
+        required:
+          - orientation-switch
+          - mboxes
+      else:
+        properties:
+          reg:
+            minItems: 6
+            maxItems: 6
+          reg-names:
+            items:
+              - const: core
+              - const: reset
+              - const: fabric
+              - const: axi2af
+              - const: lioa
+              - const: common-cfg
+
+additionalProperties: false

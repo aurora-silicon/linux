@@ -1153,6 +1153,27 @@ impl SndSocAopDriver {
             return Err(ENODEV);
         }
         let data = SndSocAopData::new(dev, adata, svc, fwnode, info)?;
+        let listed = |name: &CStr| {
+            data.fwnode
+                .property_match_string(c_str!("dma-names"), name)
+                .is_ok()
+        };
+        let streams = listed(c_str!("spkr")) || (listed(c_str!("cout")) && listed(c_str!("cin")));
+        // A Mac without microphones (Mac mini, Mac Studio) lists no "dma"
+        // channel: its firmware has no PDM devices, so attach only the
+        // speaker and jack streams.
+        if info.t6040_flow && !listed(c_str!("dma")) {
+            if !streams {
+                return Err(ENODEV);
+            }
+            let mut this = SndSocAopDriver {
+                card: ptr::null_mut(),
+                mic: aop_lid::MicLid::new()?,
+                spkr: None,
+            };
+            this.spkr = Some(aop_spkr::SpeakerComponent::register(data)?);
+            return Ok(this);
+        }
         for dev in [AUDIO_DEV_PDM0, AUDIO_DEV_HPAI, AUDIO_DEV_LPAI] {
             data.audio_attach_device(dev)?;
         }
@@ -1175,12 +1196,7 @@ impl SndSocAopDriver {
             let mut this = Self::new(data.clone())?;
             // The speaker and jack streams, where the node has their DMA
             // channels: a machine may have the jack before its speakers.
-            let listed = |name: &CStr| {
-                data.fwnode
-                    .property_match_string(c_str!("dma-names"), name)
-                    .is_ok()
-            };
-            if listed(c_str!("spkr")) || (listed(c_str!("cout")) && listed(c_str!("cin"))) {
+            if streams {
                 this.spkr = Some(aop_spkr::SpeakerComponent::register(data)?);
             }
             return Ok(this);

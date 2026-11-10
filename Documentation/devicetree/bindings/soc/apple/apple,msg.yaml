@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,msg.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple MSG block
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  A T6050 block described from the ADT so that the device tree lists all of
+  the SoC's hardware. No driver uses it yet: the node stays disabled until
+  one does and the block is brought up on hardware.
+
+properties:
+  compatible:
+    items:
+      - const: apple,t6050-msg
+      - const: apple,msg
+
+  reg:
+    minItems: 2
+    maxItems: 2
+    description: Register windows in the ADT's order, including views shared with other blocks.
+
+  interrupts:
+    minItems: 41
+    maxItems: 41
+
+  power-domains:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - power-domains
+
+additionalProperties: false

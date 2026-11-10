@@ -17,8 +17,8 @@ description: |
 
   The co-processor exposes the Native Host Interface (NHI) and its DART IOMMU
   to the main SoC bus once it is running. They are therefore represented as
-  child nodes. All child registers are located in a single 16 MiB MMIO window
-  and use addresses relative to this window.
+  child nodes. All child registers use addresses relative to the router's MMIO
+  window. Type 7 expands that window and shifts its child offsets by 16 MiB.
 
   ACIO can only be powered on after the Type-C PHY has been switched to
   USB4/Thunderbolt mode. Before the connection to the remote device can be
@@ -30,6 +30,8 @@ properties:
     oneOf:
       - const: apple,t8103-usb4-acio
       - const: apple,t8142-usb4-acio
+      - const: apple,t6040-usb4-acio
+      - const: apple,t6050-usb4-acio
       - items:
           - enum:
               - apple,t6000-usb4-acio
@@ -50,15 +52,31 @@ properties:
           PCIe adapter configuration space of the USB4 router. Present where
           the root complex exposes the adapter separately, so that the tunnel
           can be configured before a PCIe-C link is brought up.
-      - description: MxWrap co-processor control registers, on T8132
+      - description: MxWrap co-processor control registers, on T8132 and T6050
+      - description: PCIe router AP firmware registers, on T6050
 
   reg-names:
-    minItems: 2
+    oneOf:
+      - minItems: 2
+        items:
+          - const: rc
+          - const: sram
+          - const: pcie-adapter
+          - const: cpu
+          - const: router-ap-fw
+      - description: T6050, which has no separate PCIe adapter window
+        items:
+          - const: rc
+          - const: sram
+          - const: cpu
+
+  interrupts:
+    maxItems: 1
+    description: Type 7 SRAM parity interrupt
+
+  interrupt-names:
     items:
-      - const: rc
-      - const: sram
-      - const: pcie-adapter
-      - const: cpu
+      - const: sram-parity
 
   mboxes:
     maxItems: 1
@@ -71,10 +89,11 @@ properties:
 
   power-domains:
     minItems: 3
-    maxItems: 4
+    maxItems: 5
     description: |
-      The first three domains power the ACIO co-processor complex. When
-      apple,pcie-tunnel is present, the fourth domain powers its PCIe-C
+      The first three domains (four on T6050, the fourth being the routers'
+      shared audio (AUSS) domain) power the ACIO co-processor complex. When
+      apple,pcie-tunnel is present, the domain after them powers its PCIe-C
       controller and is enabled only after the USB4 PCIe tunnel is active.
 
   thunderbolt-switch:
@@ -117,6 +136,18 @@ properties:
       As apple,tunable-rc, but applied to the PCIe adapter configuration space
       named by the pcie-adapter reg entry. Only meaningful where that entry is
       present.
+
+  apple,tunable-router-ap-fw:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: Register offset
+        - description: Mask of bits to clear
+        - description: Bits to set
+    description: |
+      As apple,tunable-rc, but applied to the PCIe router AP firmware
+      registers named by the router-ap-fw reg entry, with the other router
+      tunables once the co-processor firmware is ready.
 
   '#address-cells':
     const: 1
@@ -161,11 +192,12 @@ properties:
     required:
       - port@1
 
-  iommu@a80000:
+patternProperties:
+  "^iommu@(a80000|1a80000)$":
     $ref: /schemas/iommu/apple,dart.yaml#
     description: DART IOMMU exposed by ACIO and used for DMA from the NHI
 
-  nhi@f00000:
+  "^nhi@(f00000|1f00000)$":
     $ref: /schemas/thunderbolt/apple,t8103-usb4-nhi.yaml#
     description: Native Host Interface exposed by ACIO
 
@@ -182,8 +214,6 @@ required:
   - ranges
   - nonposted-mmio
   - ports
-  - iommu@a80000
-  - nhi@f00000
 
 allOf:
   - $ref: /schemas/usb/usb-switch.yaml#
@@ -191,19 +221,60 @@ allOf:
       properties:
         compatible:
           contains:
-            const: apple,t8132-usb4-acio
+            enum:
+              - apple,t6040-usb4-acio
+              - apple,t8132-usb4-acio
     then:
       properties:
         reg:
           minItems: 4
         reg-names:
           minItems: 4
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t6040-usb4-acio
+              - apple,t6050-usb4-acio
+              - apple,t8132-usb4-acio
+    then:
+      properties:
         pinctrl-names:
           items:
             - const: lstx
     else:
       properties:
         lstx-gpios: false
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6040-usb4-acio
+    then:
+      required:
+        - iommu@1a80000
+        - nhi@1f00000
+        - interrupts
+        - interrupt-names
+    else:
+      required:
+        - iommu@a80000
+        - nhi@f00000
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6050-usb4-acio
+    then:
+      properties:
+        power-domains:
+          minItems: 4
+    else:
+      properties:
+        power-domains:
+          maxItems: 4
+        apple,tunable-router-ap-fw: false
 
 additionalProperties: false
 

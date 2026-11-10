@@ -111,6 +111,12 @@ int ave_cmd_complete(struct ave_ctx *ctx, unsigned int count)
 	return ret;
 }
 
+/* Abort/cancel primitive: queued work may be discarded after its reply. */
+int ave_cmd_flush(struct ave_ctx *ctx)
+{
+	return ave_cmd_scalar(ctx, AVE_OP_FLUSH, 0, ave_session_arg2(ctx));
+}
+
 /* Priority and Stop go out together, Close after Stop is answered. */
 int ave_cmd_close(struct ave_ctx *ctx)
 {

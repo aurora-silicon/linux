@@ -18,7 +18,8 @@ description: |
   its serializer. The parent AOP binding describes the firmware transport.
 
   The speaker and headset jack channels are optional: a node without them has
-  no speaker or jack streams.
+  no speaker or jack streams. A Mac without microphones (Mac mini, Mac Studio)
+  lists no microphone channel, only its headset jack streams.
 
 # Only select T6041 nodes: other AOP audio nodes carry the
 # apple,t6030-aop-audio fallback too and have a different set of streams.
@@ -55,6 +56,10 @@ properties:
 
   dma-names:
     oneOf:
+      - description: The headset jack only, on a Mac without microphones
+        items:
+          - const: cout
+          - const: cin
       - description: The microphones only
         items:
           - const: dma
@@ -116,6 +121,17 @@ examples:
             dmas = <&admac0 1>, <&admac1 0>, <&admac1 1>,
                    <&admac1 4>, <&admac1 5>;
             dma-names = "dma", "spkr", "sense", "cout", "cin";
+            #sound-dai-cells = <1>;
+        };
+    };
+  - |
+    aop {
+        audio {
+            compatible = "apple,t6041-aop-audio", "apple,t6030-aop-audio";
+            apple,chassis-name = "J773";
+            apple,machine-kind = "Mac mini";
+            dmas = <&admac1 4>, <&admac1 5>;
+            dma-names = "cout", "cin";
             #sound-dai-cells = <1>;
         };
     };

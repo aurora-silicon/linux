@@ -361,6 +361,14 @@ pub(crate) trait Gpu: Send + Sync {
     fn base_clock_hz(&self) -> u32;
     /// Return the GPU address space geometry.
     fn uat_geometry(&self) -> mmu::UatGeometry;
+    /// Admit a client's parameter ABI before creating its VM.
+    fn admit_vm(&self, _dev: &kernel::device::Device, _params_size: u64, _flags: u32) -> Result {
+        Ok(())
+    }
+    /// GPU VA of each VM's dummy page, which must match the address the firmware was given.
+    fn unknown_page(&self) -> u64 {
+        self.uat_geometry().unk_page()
+    }
     /// Create a new `Vm` with the given range reserved for kernel-managed objects.
     fn new_vm(&self, kernel_range: Range<u64>) -> Result<mmu::Vm>;
     /// Create a VM charged to a DRM file when the backend bounds retained bindings.
@@ -1276,6 +1284,9 @@ impl GpuManager::ver {
             .with(|raw, _inner| raw.pending_submissions.fetch_add(1, Ordering::Acquire));
 
         mod_dev_dbg!(self.dev, "OP start (pending: {})\n", val + 1);
+        // SAFETY: Takes no arguments and does nothing unless pmp_report.agx_vote is set on a T6001. The matching end call is made
+        // by OpGuard's Drop, and the guard is created right below, so every path out of here (including a failed kick) pairs it.
+        unsafe { kernel::bindings::apple_pmp_agx_activity_begin() };
         let guard = OpGuard(self.clone());
         self.kick_firmware()?;
         Ok(guard)
@@ -1801,5 +1812,7 @@ impl GpuManagerPriv for GpuManager::ver {
             .with(|raw, _inner| raw.pending_submissions.fetch_sub(1, Ordering::Release));
 
         mod_dev_dbg!(self.dev, "OP end (pending: {})\n", val - 1);
+        // SAFETY: Pairs with the begin call in start_op(); callable from any context.
+        unsafe { kernel::bindings::apple_pmp_agx_activity_end() };
     }
 }

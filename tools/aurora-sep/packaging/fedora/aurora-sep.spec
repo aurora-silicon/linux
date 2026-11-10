@@ -39,6 +39,7 @@ Source22:       aurora-touchid-setup
 Source23:       aurora-touchid-setup.service
 Source24:       extract-mesa-calibration.py
 Source25:       powerdevilrc
+Source26:       aurora-sep
 
 BuildArch:      noarch
 BuildRequires:  systemd-rpm-macros
@@ -109,6 +110,7 @@ sed 's|@FPRINTD@|%{_libexecdir}/fprintd|' %{SOURCE7} \
 install -Dpm 0644 %{SOURCE8} \
     %{buildroot}%{_prefix}/lib/systemd/logind.conf.d/50-aurora-sep.conf
 install -Dpm 0755 %{SOURCE16} %{buildroot}%{_bindir}/sep-bio-identities
+install -Dpm 0755 %{SOURCE26} %{buildroot}%{_bindir}/aurora-sep
 sed -i "s|^\(Exec[A-Za-z]*=\)/usr/local/sbin/|\1%{_libexecdir}/|" \
     %{buildroot}%{_unitdir}/fprintd.service.d/aurora-sep.conf
 install -Dpm 0755 %{SOURCE20} %{buildroot}%{_libexecdir}/aurora-sep-sensor-present
@@ -168,6 +170,7 @@ fi
 %{_libexecdir}/aurora-sep-ready
 %{_libexecdir}/aurora-sep-greeter-fingerprint
 %{_bindir}/sep-bio-identities
+%{_bindir}/aurora-sep
 %{_sbindir}/aurora-sep-policy-change
 %{_sbindir}/aurora-touchid-setup
 %{_libexecdir}/aurora-sep-sensor-present
