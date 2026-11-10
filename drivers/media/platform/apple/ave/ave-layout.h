@@ -192,6 +192,24 @@ struct ave_start_layout {
 	u32 h264_redundant;
 	u32 h264_8x8;
 	u32 h264_pps_fw_header;
+	/* 6070 AVC first-picture setup. */
+	u32 h264_max_mvs_per_2mb;
+	u32 h264_adapt_b;
+	u32 h264_pixel_packing;
+	u32 h264_transform_mode;
+	u32 h264_skip_mode;
+	u32 h264_input_bit_depth;
+	u32 h264_parameter_set_count;
+	u32 h264_slice_map_count;
+	u32 h264_slice_map_end;
+	u32 h264_input_format;
+	u32 h264_multipass_inactive;
+	u32 h264_num_views[2];
+	u32 h264_allow_reordering;
+	u32 h264_ref_spacing[3];
+	u32 h264_scaling_4x4;
+	u32 h264_scaling_8x8;
+	u32 h264_sve_count;
 	u32 hevc_pad;
 	u32 hevc_rc_270c;
 	u32 hevc_rc_9604;
@@ -243,6 +261,9 @@ struct ave_proc_layout {
 	u32 const5;
 	u32 fps; /* f64 */
 	u32 timescale; /* u64 */
+	u32 avg_variance;
+	u32 static_area_mask;
+	u32 static_area_threshold;
 	u32 slot;
 	u32 coded, meta; /* u64 addresses */
 	u32 ordinal;

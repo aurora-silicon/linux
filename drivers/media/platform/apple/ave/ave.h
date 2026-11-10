@@ -327,11 +327,21 @@ struct ave_slot {
 #define AVE_TILE_BUFS 8
 #define AVE_ENTROPY_SETS 4
 #define AVE_NEIGHBOUR_SETS 4
+#define AVE_6070_LOWRES_RESULTS 4
+#define AVE_6070_AVC_ENTROPY_TILES 2
+
+/* Fixed 6070 host-interface allocations, independent of picture geometry. */
+#define AVE_6070_CLIENT_MEM_BYTES SZ_1M
+#define AVE_6070_CODED_HEADER_BYTES 0x23000
+#define AVE_AVC_FLAT_SCALING_WEIGHT 16
+#define AVE_AVC_RECON_SKIP_MODE 3
+#define AVE_AVC_STATIC_AREA_MASK_ALL 0xffff
 
 struct ave_session {
 	struct ave_session *failed_next;
 	struct ave_params p;
 	struct ave_buf hdr;
+	struct ave_buf client_mem;
 	/* 6070: per-session firmware-generated VPS/SPS/PPS output. */
 	struct ave_buf param_sets;
 	struct ave_buf ref_a[AVE_MAX_REFS];

@@ -58,6 +58,11 @@ static void ave_put32(u8 *cmd, u32 off, u32 val)
 	put_unaligned_le32(val, cmd + off);
 }
 
+static void ave_put16(u8 *cmd, u32 off, u16 val)
+{
+	put_unaligned_le16(val, cmd + off);
+}
+
 static void ave_put64(u8 *cmd, u32 off, u64 val)
 {
 	put_unaligned_le64(val, cmd + off);
@@ -184,17 +189,22 @@ static int ave_start_validate_6070(const struct ave_session *sess)
 {
 	const struct ave_params *p = &sess->p;
 	bool hevc = p->codec == AVE_CODEC_HEVC;
-	unsigned int tiles = hevc ? 4 : AVE_TILE_BUFS;
+	unsigned int tiles = hevc ? 4 : AVE_6070_AVC_ENTROPY_TILES;
 
 	if (ave_6070_check_buf(&sess->hdr))
+		return -EINVAL;
+	if (ave_6070_check_buf(&sess->client_mem) ||
+	    sess->client_mem.size != AVE_6070_CLIENT_MEM_BYTES)
 		return -EINVAL;
 	if (ave_6070_check_buf(&sess->param_sets) || !sess->param_sets.size)
 		return -EINVAL;
 	for (unsigned int i = 0; i < p->refs; i++)
 		if (ave_6070_check_buf(&sess->ref_a[i]) ||
 		    ave_6070_check_buf(&sess->ref_b[i]) ||
-		    ave_6070_check_buf(&sess->ref_c[i]) ||
-		    ave_6070_check_buf(&sess->ref_d[i]))
+		    ave_6070_check_buf(&sess->ref_c[i]))
+			return -EINVAL;
+	for (unsigned int i = 0; i < AVE_6070_LOWRES_RESULTS; i++)
+		if (ave_6070_check_buf(&sess->ref_d[i]))
 			return -EINVAL;
 	for (unsigned int slot = 0; slot < p->slots; slot++)
 		if (ave_6070_check_buf(&sess->slot[slot].coded) ||
@@ -224,14 +234,15 @@ static int ave_start_surfaces_6070(struct ave_session *sess, u8 *cmd,
 	const struct ave_params *p = &sess->p;
 	const struct ave_start_layout *l = &fw->start[p->codec - 1];
 	bool hevc = p->codec == AVE_CODEC_HEVC;
-	unsigned int tiles = hevc ? 4 : AVE_TILE_BUFS;
+	unsigned int tiles = hevc ? 4 : AVE_6070_AVC_ENTROPY_TILES;
 	int ret = ave_start_validate_6070(sess);
 
 	if (ret)
 		return ret;
 
 	ave_put_buf(fw, cmd, &l->header, 0, &sess->hdr, fw->hdr_bytes);
-	ave_write_surface(fw, cmd, &l->secondary, 0, 0, 0);
+	ave_put_buf(fw, cmd, &l->secondary, 0, &sess->client_mem,
+		    sess->client_mem.size);
 	ave_put_buf(fw, cmd, &l->param_sets, 0, &sess->param_sets,
 		    sess->param_sets.size);
 
@@ -241,9 +252,10 @@ static int ave_start_surfaces_6070(struct ave_session *sess, u8 *cmd,
 		ave_write_address_bank(cmd, &l->colocated, i,
 				       sess->ref_b[i].dma, 0);
 		ave_write_address_bank(cmd, &l->lfs, i, sess->ref_c[i].dma, 0);
+	}
+	for (unsigned int i = 0; i < AVE_6070_LOWRES_RESULTS; i++)
 		ave_write_address_bank(cmd, &l->lfs_result, i,
 				       sess->ref_d[i].dma, 0);
-	}
 
 	for (unsigned int slot = 0; slot < p->slots; slot++) {
 		ave_put_buf(fw, cmd, &l->coded, slot, &sess->slot[slot].coded,
@@ -457,6 +469,8 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd,
 	bool hevc = p->codec == AVE_CODEC_HEVC;
 	bool cq = p->rc_mode == 3;
 	u32 rc_mode;
+	s32 min_qp = p->min_qp;
+	u32 max_qp = p->max_qp;
 	u32 depth = p->bit_depth ?: 8;
 	u32 crop_r = (p->cw - p->width) / 2, crop_b = (p->ch - p->height) / 2;
 	bool crop = crop_r || crop_b;
@@ -490,7 +504,8 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd,
 	 */
 	rc_mode = cq && l->rc_mode_fixed_qp ? l->rc_mode_fixed_qp : p->rc_mode;
 	ave_start_put32(cmd, l->rc_mode, rc_mode);
-	ave_start_put32(cmd, l->bitrate, p->bitrate);
+	ave_start_put32(cmd, l->bitrate,
+			cq && fw->kind == AVE_LAYOUT_6070 ? 0 : p->bitrate);
 	for (unsigned int i = 0; i < (unsigned int)(l->init_qp_words ?: 3); i++)
 		ave_put32(cmd, (l->init_qp + 4 * i),
 			  cq ? p->initial_qp : AVE_START_INIT_QP_VALUE);
@@ -505,10 +520,14 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd,
 	ave_start_put64(cmd, l->f64_290, ave_f64(1, 2));
 	ave_start_put64(cmd, l->f64_2c0, AVE_F64_NEG | ave_f64(1, 1));
 	ave_start_put64(cmd, l->f64_2c8, AVE_F64_NEG | ave_f64(1, 1));
-	ave_start_put32(cmd, l->min_qp, p->min_qp);
-	ave_start_put32(cmd, l->max_qp, p->max_qp);
-	ave_start_put32(cmd, l->min_qp2, p->min_qp);
-	ave_start_put32(cmd, l->max_qp2, p->max_qp);
+	if (cq && fw->kind == AVE_LAYOUT_6070) {
+		min_qp = 0;
+		max_qp = 51;
+	}
+	ave_start_put32(cmd, l->min_qp, min_qp);
+	ave_start_put32(cmd, l->max_qp, max_qp);
+	ave_start_put32(cmd, l->min_qp2, min_qp);
+	ave_start_put32(cmd, l->max_qp2, max_qp);
 	ave_start_put32(cmd, l->rc_flags, cq ? 0 : hevc ? 0x736 : 0x8202);
 	ave_start_put32(cmd, l->rc_310, cq ? 0 : 30);
 	if (!hevc)
@@ -520,7 +539,8 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd,
 		(p->bframes ? 0x600 : 0x200) |
 			(fw->counted && cq ? 0x10000 | (hevc ? 0x100 : 0) : 0));
 	ave_start_put32(cmd, l->p_frames, p->intra_only ? 0 : 1);
-	ave_start_put32(cmd, l->max_b, p->bframes ? 3 : 0);
+	ave_start_put32(cmd, l->max_b,
+			p->bframes ? (fw->kind == AVE_LAYOUT_6070 ? 1 : 3) : 0);
 	ave_start_put32(cmd, l->ref_depth, p->bframes ? 3 : 1);
 	ave_start_put32(cmd, l->idr_interval, p->gop);
 
@@ -539,11 +559,42 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd,
 	if (!hevc) {
 		u32 profile_idc = p->high ? 100 : (p->profile == 2 ? 66 : 77);
 		u32 level_idc = h264_level_idc[p->level - 1];
+		u32 max_mvs = level_idc >= 31 ? 16 : level_idc == 30 ? 32 : 64;
 
 		ave_start_put32(cmd, l->h264_384,
 				p->width * p->height <= 320 * 240 ? 0x40 :
 								    0x10);
 		ave_start_put32(cmd, l->codec_2588, p->high ? 2 : 0);
+		ave_start_put32(cmd, l->h264_max_mvs_per_2mb, max_mvs);
+		ave_start_put8(cmd, l->h264_adapt_b, p->bframes);
+		ave_start_put8(cmd, l->h264_pixel_packing, 1);
+		ave_start_put32(cmd, l->h264_transform_mode, p->high ? 2 : 0);
+		if (l->h264_skip_mode)
+			ave_put16(cmd, l->h264_skip_mode, AVE_AVC_RECON_SKIP_MODE);
+		ave_start_put32(cmd, l->h264_input_bit_depth, depth);
+		ave_start_put32(cmd, l->h264_parameter_set_count, 1);
+		ave_start_put32(cmd, l->h264_slice_map_count, 1);
+		ave_start_put32(cmd, l->h264_slice_map_end, p->height);
+		/* The input format follows the SPS chroma and depth fields. */
+		ave_start_put32(cmd, l->h264_input_format, 16);
+		if (l->h264_multipass_inactive)
+			for (unsigned int i = 0; i < 4; i++)
+				ave_put32(cmd, l->h264_multipass_inactive + 4 * i,
+					  U32_MAX);
+		for (unsigned int i = 0; i < ARRAY_SIZE(l->h264_num_views); i++)
+			ave_start_put32(cmd, l->h264_num_views[i], 1);
+		ave_start_put8(cmd, l->h264_allow_reordering, p->bframes);
+		for (unsigned int i = 0; i < ARRAY_SIZE(l->h264_ref_spacing); i++)
+			ave_start_put32(cmd, l->h264_ref_spacing[i], p->bframes);
+		if (l->h264_scaling_4x4)
+			for (unsigned int i = 0; i < 6 * 16; i++)
+				ave_put16(cmd, l->h264_scaling_4x4 + 2 * i,
+					  AVE_AVC_FLAT_SCALING_WEIGHT);
+		if (l->h264_scaling_8x8)
+			for (unsigned int i = 0; i < 6 * 64; i++)
+				ave_put16(cmd, l->h264_scaling_8x8 + 2 * i,
+					  AVE_AVC_FLAT_SCALING_WEIGHT);
+		ave_start_put32(cmd, l->h264_sve_count, 1);
 		ave_start_put32(cmd, l->h264_profile,
 				fw->kind == AVE_LAYOUT_6070 ? profile_idc : p->profile);
 		ave_start_put32(cmd, l->h264_level,
@@ -572,9 +623,11 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd,
 		ave_start_put32(cmd, l->h264_chroma, 1);
 		ave_start_put32(cmd, l->h264_depth_luma, 0);
 		ave_start_put32(cmd, l->h264_depth_chroma, 0);
-		ave_start_put32(cmd, l->h264_frame_num_bits, 0);
+		ave_start_put32(cmd, l->h264_frame_num_bits,
+				p->bframes && fw->kind == AVE_LAYOUT_6070 ? 1 : 0);
 		ave_start_put32(cmd, l->h264_poc_type, p->bframes ? 0 : 2);
-		ave_start_put32(cmd, l->h264_poc_bits, p->bframes ? 4 : 0);
+		ave_start_put32(cmd, l->h264_poc_bits,
+				p->bframes ? (fw->kind == AVE_LAYOUT_6070 ? 2 : 4) : 0);
 		ave_start_put8(cmd, l->h264_gaps, 0);
 		ave_start_put32(cmd, l->h264_width_mbs, p->cw / 16 - 1);
 		ave_start_put32(cmd, l->h264_height_mbs, p->ch / 16 - 1);
@@ -742,7 +795,8 @@ int ave_build_process(struct ave_ctx *ctx, u8 *cmd, size_t len,
 	ave_put32(cmd, l->fps_int, p->fps_int);
 	/* The bit rate may change while streaming; it takes effect here. */
 	if (l->bitrate)
-		ave_put32(cmd, l->bitrate, bitrate);
+		ave_put32(cmd, l->bitrate,
+			  p->rc_mode == 3 && fw->kind == AVE_LAYOUT_6070 ? 0 : bitrate);
 	if (l->limits)
 		ave_put32(cmd, l->limits, p->limit_bytes ? 1 : 0);
 	if (l->limit_bytes && p->limit_bytes) {
@@ -761,6 +815,12 @@ int ave_build_process(struct ave_ctx *ctx, u8 *cmd, size_t len,
 		ave_put32(cmd, l->first_frame, sess->frames == 0);
 	if (l->first_process)
 		cmd[l->first_process] = sess->frames == 0;
+	if (l->avg_variance)
+		ave_put32(cmd, l->avg_variance, U32_MAX);
+	if (l->static_area_mask)
+		ave_put32(cmd, l->static_area_mask, AVE_AVC_STATIC_AREA_MASK_ALL);
+	if (l->static_area_threshold)
+		ave_put32(cmd, l->static_area_threshold, 100);
 	ave_put32(cmd, l->slot, slot);
 	ave_put64(cmd, l->coded, s->coded.dma);
 	ave_put64(cmd, l->meta, s->meta.dma);

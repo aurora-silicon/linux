@@ -37,7 +37,12 @@ def build(src, out, baseline):
     has_layout = (src / 'ave-layout.h').exists()
     code = (Path(__file__).parent / 'shim.h').read_text()
     for name in ('AVE_MAX_SLOTS', 'AVE_MAX_REFS', 'AVE_TILE_BUFS',
-                 'AVE_MAX_SESSIONS', 'AVE_FW_TEXT_CRC_9003_78_0'):
+                 'AVE_MAX_SESSIONS', 'AVE_FW_TEXT_CRC_9003_78_0',
+                 'AVE_6070_LOWRES_RESULTS',
+                 'AVE_6070_AVC_ENTROPY_TILES',
+                 'AVE_6070_CLIENT_MEM_BYTES', 'AVE_6070_CODED_HEADER_BYTES',
+                 'AVE_AVC_FLAT_SCALING_WEIGHT', 'AVE_AVC_RECON_SKIP_MODE',
+                 'AVE_AVC_STATIC_AREA_MASK_ALL'):
         code += re.search(r'^#define ' + name + r'\s+[^\n]+', header, re.M)[0] + '\n'
     for name in ('AVE_ENTROPY_SETS', 'AVE_NEIGHBOUR_SETS'):
         match = re.search(r'^#define ' + name + r'\s+[^\n]+', header, re.M)
