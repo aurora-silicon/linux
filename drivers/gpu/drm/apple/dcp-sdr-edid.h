@@ -52,7 +52,7 @@ static inline size_t dcp_edid_sdr(u8 *edid, size_t size)
 	     offset += DCP_EDID_BLOCK_SIZE) {
 		u8 block[DCP_EDID_BLOCK_SIZE] = { DCP_EDID_CTA, 3 };
 		const u8 *src = edid + offset;
-		unsigned int pos, end = src[2], dest = 4;
+		unsigned int pos, end = src[2] ? src[2] : 4, dest = 4;
 
 		if (src[0] != DCP_EDID_CTA || end < 4 || end > 127)
 			continue;

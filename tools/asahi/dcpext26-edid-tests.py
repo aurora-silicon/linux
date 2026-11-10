@@ -77,6 +77,11 @@ int main(void) {
  memcpy(original,sdr,256);assert(dcp_edid_sdr(sdr,256)==256);assert(!memcmp(sdr,original,256));
  for(unsigned n=0;n<128;n++)assert(!dcp_edid_sdr(sdr,n));
  assert(!dcp_edid_sdr(sdr,128));
+ /* A CTA with no data collection can still advertise basic stereo audio. */
+ memset(sdr,0,sizeof(sdr));memcpy(sdr,header,8);sdr[126]=1;
+ cta=sdr+128;cta[0]=2;cta[1]=3;cta[3]=0x40;checksum(sdr);checksum(cta);
+ assert(dcp_edid_sdr(sdr,256)==256);assert(sdr[126]==1 && cta[3]==0x40);
+
  puts("PASS SDR EDID identity, audio, timing, colour removal, checksums, bounds and idempotence");
  puts("PASS native26 AV identity, stale attachment/owner, bounded EDID length, extension count and checksum failures");
 }
