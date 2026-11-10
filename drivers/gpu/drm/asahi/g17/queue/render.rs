@@ -619,6 +619,7 @@ fn render_barriers(
     stage_prefixes: bool,
     dependencies: &RenderDependencies,
     own_tiling: KickDependency,
+    compute_class: u8,
 ) -> RenderBarriers {
     let fragment_stage = fragment_stage || stage_prefixes;
     let mut tiling_barriers = [KickDependency::ZERO; 5];
@@ -658,12 +659,12 @@ fn render_barriers(
     }
     if let Some(compute) = dependencies.compute {
         tiling_barriers[tiling_count] = compute;
-        tiling_types[tiling_count] = 2;
+        tiling_types[tiling_count] = compute_class;
         tiling_count += 1;
     }
     if let Some(compute) = dependencies.fragment_compute {
         fragment_barriers[fragment_count] = compute;
-        fragment_types[fragment_count] = 2;
+        fragment_types[fragment_count] = compute_class;
         fragment_count += 1;
     }
     if stage_prefixes {
@@ -897,7 +898,8 @@ impl Pair {
         };
         let own_tiling = KickDependency::new(qids[0], kicks[0]).ok_or(EINVAL)?;
         let barriers =
-            render_barriers(pass.fragment_barriers, pass.stage_prefixes, dependencies, own_tiling);
+            render_barriers(pass.fragment_barriers, pass.stage_prefixes, dependencies, own_tiling,
+                self.board.map_or(2, crate::g17::fw::m5::compute::explicit_dependency));
         let tiling_barriers = &barriers.tiling[..barriers.tiling_count];
         // With the G17D forms a fragment kick with history also names its parent's
         // predecessor, in class 1, after the self-parent (classes [1, 3, 1] for a lone pass).

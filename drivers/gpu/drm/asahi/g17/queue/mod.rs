@@ -528,8 +528,12 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                 }
             }
             let mut guards = guards.into_iter();
+            // Where a firmware wait reports completion before a weak stream tail's writes are
+            // visible, only a command that declares a visible completion is waited for there.
+            let visible_required = self.backend.firmware_sources_need_visible_completion();
             let firmware_source = pending.len() == 1
-                && matches!(&pending[0].0, Validated::Compute { .. })
+                && matches!(&pending[0].0, Validated::Compute { visible_completion, .. }
+                    if *visible_completion || !visible_required)
                 && !pending[0].2.has_outputs();
             let aggregate = outputs.publish(self.context.clone(), firmware_source)?;
             for (command, order, destinations) in pending {

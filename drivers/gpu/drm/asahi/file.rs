@@ -94,6 +94,14 @@ pub(crate) const DRM_ASAHI_RENDER_SHADER_WRITES: u32 =
 /// (DRM_ASAHI_RENDER_STAGE_PREFIXES), as the complete struct drm_asahi_cmd_render_m5.
 pub(crate) const DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2: u64 =
     uapi::DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2 as u64;
+/// Compute commands may declare a stream that ends with a memory-scoped flush
+/// (DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION).
+pub(crate) const DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION: u64 =
+    uapi::DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION as u64;
+/// The compute command's writes are visible when it completes, so another queue's compute
+/// command may wait for it in firmware.
+pub(crate) const DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION: u32 =
+    uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION as u32;
 /// The tiling half waits only on the render and compute prefixes of the command's stage-prefix
 /// fields, its fragment half on the whole ones.
 #[allow(dead_code)]

@@ -2637,7 +2637,10 @@ impl Queue {
                 dispatch_control: crate::g17::fw::m5::compute::dispatch_control(board, tuple.dispatch_base),
                 auxiliary_control: tuple.auxiliary_control,
             },
-            descriptor_va: descriptor_low, submit_sequence: 0, work_state_va: work_node,
+            descriptor_va: descriptor_low,
+            // M5 Pro's descriptors carry the ordinal as the submission sequence too, as macOS's do.
+            submit_sequence: if board.completion_inputs() { u64::from(self.ordinal) } else { 0 },
+            work_state_va: work_node,
             cdm_end_va: *cdm_end_va, stamp_va: [args.stamp_va, args.aux_stamp_va],
             stamp_value: crate::g17::fw::stamp_value(kick_timestamp.get() as u32), qid: u32::from(qid),
             kick_timestamp: kick_timestamp.get(),
@@ -2646,9 +2649,11 @@ impl Queue {
             shared_control_va: self.pool.control_va(), event_metadata: [0;16],
             usage_fw_va: self.graph.usage.gpu_va(), completion_identity: 1,
         }});
-        // Explicit dependencies keep the pipelined class; the implicit parent, last, takes its
-        // own ([`crate::g17::fw::m5::compute::parent_dependency`]).
-        let mut m5_dependency_types = [crate::g17::fw::m5::compute::COMPUTE_PIPELINED_DEPENDENCY;
+        // Explicit dependencies take the board's explicit class; the implicit parent, last,
+        // takes its own ([`crate::g17::fw::m5::compute::parent_dependency`]).
+        let mut m5_dependency_types = [m5_board.map_or(
+            crate::g17::fw::m5::compute::COMPUTE_PIPELINED_DEPENDENCY,
+            crate::g17::fw::m5::compute::explicit_dependency);
             crate::g17::fw::kick::QID_MAX as usize + 1];
         if let (Some(board), Some(parent)) = (m5_board, m5_dependency_types.get_mut(dependencies.len())) {
             *parent = crate::g17::fw::m5::compute::parent_dependency(board, false);

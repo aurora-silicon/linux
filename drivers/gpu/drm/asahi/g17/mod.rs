@@ -2241,6 +2241,11 @@ impl gpu::Gpu for Gpu {
             if crate::module_parameters::m5_mesh_storage_chunks.value() == 0 {
                 features &= !crate::file::DRM_ASAHI_FEATURE_TASK_MESH_STORAGE;
             }
+            // Only where firmware waits need it (runtime::backend's
+            // firmware_sources_need_visible_completion), so userspace adds the flush only there.
+            if self.shared.m5_board.is_some_and(|board| board.completion_inputs()) {
+                features |= crate::file::DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION;
+            }
             params.features |= features;
         }
         params.gpu_generation = self.cfg.gpu_generation as u32;
