@@ -102,6 +102,8 @@ struct apple_pmgr_ps {
 	struct {
 		u32 offset, mask, value, saved;
 	} retention[APPLE_PMGR_PS_MAX_RETENTION];
+	/* Two bridge link words of the block behind this state, usable while it is on. */
+	void __iomem *bridge;
 };
 
 #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
@@ -899,6 +901,21 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, -EINVAL,
 				     "retention workaround needs a consumer switch\n");
 	}
+	if (of_property_present(node, "apple,bridge-link")) {
+		struct of_phandle_args link;
+		struct resource res;
+
+		if (!ps->consumer_switched ||
+		    of_parse_phandle_with_fixed_args(node, "apple,bridge-link", 2, 0, &link))
+			return dev_err_probe(dev, -EINVAL, "bad bridge link\n");
+		ret = of_address_to_resource(link.np, link.args[0], &res);
+		of_node_put(link.np);
+		if (ret)
+			return dev_err_probe(dev, ret, "bad bridge link block\n");
+		ps->bridge = devm_ioremap(dev, res.start + link.args[1], 8);
+		if (!ps->bridge)
+			return -ENOMEM;
+	}
 	ps->sleep_retained = of_property_read_bool(node, "apple,sleep-retained");
 	ps->sleep_driver_owned = of_property_read_bool(node, "apple,sleep-driver-owned");
 	/*
@@ -1081,6 +1098,22 @@ static bool apple_pmgr_ps_consumer_ready(u32 reg)
  * automatic power management while staying on, set the retention workaround,
  * then power off (clearing the history bits) and wait for it.
  */
+/* Only with the state on: the link down before its power-off, up after its power-on. */
+static void apple_pmgr_ps_bridge(struct apple_pmgr_ps *ps, bool up)
+{
+	if (!ps->bridge)
+		return;
+	for (unsigned int i = 0; i < 2; i++) {
+		u32 value = readl(ps->bridge + 4 * i);
+
+		writel(up ? value | BIT(0) : value & ~BIT(0), ps->bridge + 4 * i);
+	}
+	/* Complete the stores before the state word changes or its block is used. */
+	mb();
+	readl(ps->bridge);
+	dev_dbg(ps->dev, "PS %s: bridge link %s\n", ps->genpd.name, up ? "up" : "down");
+}
+
 static int apple_pmgr_ps_consumer_state_off(struct apple_pmgr_ps *ps)
 {
 	u32 reg, cur;
@@ -1117,6 +1150,7 @@ static int apple_pmgr_ps_consumer_state_off(struct apple_pmgr_ps *ps)
 		if (ret)
 			goto fail;
 	}
+	apple_pmgr_ps_bridge(ps, false);
 	ps->consumer_off = true;
 	reg = (reg & ~APPLE_PMGR_PS_TARGET) | APPLE_PMGR_FLAGS |
 	      FIELD_PREP(APPLE_PMGR_PS_TARGET, APPLE_PMGR_PS_PWRGATE);
@@ -1158,6 +1192,7 @@ static int apple_pmgr_ps_consumer_state_on(struct apple_pmgr_ps *ps)
 		ret = apple_pmgr_ps_wait(ps, APPLE_PMGR_PS_LEVELS, APPLE_PMGR_PS_ALL_ON, &cur);
 	if (ret)
 		goto fail;
+	apple_pmgr_ps_bridge(ps, true);
 	for (unsigned int i = 0; i < ps->nr_retention; i++) {
 		u32 mask = ps->retention[i].mask;
 
