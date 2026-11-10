@@ -180,6 +180,10 @@ pub(crate) struct Flight {
     pub(crate) recovery_started_ns: u64,
     /// Publication time, ns.
     pub(crate) published_ns: u64,
+    /// The PB epoch this render prefix uses (its own, or a reused one with `g16_pb_reuse`).
+    pub(crate) pb: Option<Arc<super::pools::PbEpoch>>,
+    /// Its pass slot binding (`Pools::bind`).
+    pub(crate) pb_binding: u64,
 }
 
 impl Flight {
@@ -209,6 +213,8 @@ impl Flight {
             recovery_suspect: false,
             recovery_started_ns: 0,
             published_ns: 0,
+            pb: None,
+            pb_binding: 0,
         }
     }
 }
@@ -868,12 +874,30 @@ impl Firmware {
     }
 
     /// Addresses and cumulative allocator state of the selected retained render unit.
-    fn render_refs(&mut self, k: usize, job: &Job, draw: u64) -> Result<(RenderRefs, bool)> {
+    fn render_refs(
+        &mut self,
+        k: usize,
+        job: &Job,
+        draw: u64,
+    ) -> Result<(RenderRefs, bool, Arc<super::pools::PbEpoch>, u64)> {
         let generation = job.vm.generation;
         let arena = job.resources.render()?;
         let mut a = arena.pools.prepare(k, draw)?;
-        let epoch = job.resources.pb(job.progress.sent() as usize)?;
-        epoch.prepare(k, arena.pools.heap_gva(k)?)?;
+        // g16_pb_reuse: reuse this VM's retired epoch of the slot: no reseed, no InitBM.
+        let (epoch, reused) = match self.pools.reusable(params::pb_reuse(), k, &job.vm) {
+            Some(e) => {
+                self.pools.stats.reused += 1;
+                a.init_buffer = false;
+                (e, true)
+            }
+            None => {
+                let e = job.resources.pb(job.progress.sent() as usize)?.clone();
+                e.prepare(k, arena.pools.heap_gva(k)?)?;
+                self.pools.stats.fresh += 1;
+                (e, false)
+            }
+        };
+        let binding = self.pools.bind(k, reused);
         a.pb_mgr = epoch.manager.va;
         a.mgr_misc = epoch.misc.va;
         let r = &self.graph.render;
@@ -904,6 +928,8 @@ impl Firmware {
                 usc_base: job.queue.usc_base,
             },
             a.init_buffer,
+            epoch,
+            binding,
         ))
     }
 
@@ -1029,8 +1055,8 @@ impl Firmware {
             return Err(EAGAIN);
         }
         if render {
-            job.resources
-                .pb(index as usize)?
+            f.pb.as_ref()
+                .ok_or(EINVAL)?
                 .check_assignment(f.claims.pass[0] as usize)?;
         }
         // Reserve lifetime ownership before any counter or producer becomes reachable.
@@ -1043,7 +1069,7 @@ impl Firmware {
         let publication = (|| -> Result {
             if render {
                 let k = f.claims.pass[0] as usize;
-                job.resources.pb(index as usize)?.expose();
+                f.pb.as_ref().ok_or(EINVAL)?.expose();
                 job.resources.render()?.pools.publish(k, f.uma_submitted)?;
                 // Notifier service dereferences u32 counters; the host ordering ledger
                 // remains u64. Eight-byte spacing is retained allocation padding.
@@ -1259,7 +1285,9 @@ impl Firmware {
         // Claim performs only a qualified per-use scrub, never allocator/list reset.
         self.slots.claim_pass(job.resources.render()?, k)?;
         self.slots.hold_vm(&f.claims, &job.vm)?;
-        let (refs, init_buffer) = self.render_refs(k, job, draw)?;
+        let (refs, init_buffer, epoch, binding) = self.render_refs(k, job, draw)?;
+        f.pb = Some(epoch);
+        f.pb_binding = binding;
         let p = &job.resources.render()?.passes[k];
         let pass = p.refs();
         let geometry = Geometry::new(&cmd.cmd, pass.heap_gva);
@@ -1318,7 +1346,7 @@ impl Firmware {
         if init_buffer {
             pf.initbm = true;
             let bm = encode::initbm(job.vm.slot, refs.parameter_id, refs.pb_mgr, target);
-            let epoch = job.resources.pb(job.progress.sent() as usize)?;
+            let epoch = f.pb.as_ref().ok_or(EINVAL)?;
             epoch.initbm.write(0, &bm)?;
             r.ring[0].w64(8 * pf.ta_head as usize, epoch.initbm.va)?;
             pf.ta_head = (pf.ta_head + 1) % cap;

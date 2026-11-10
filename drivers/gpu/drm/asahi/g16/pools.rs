@@ -2,9 +2,12 @@
 
 //! Private render UMA/heap backing and device-wide PB-slot leases.
 //!
-//! Each VM keeps two persistent UMA/heap units. Each render command installs a fresh
-//! PB manager with full InitBM and never reinitializes exposed cursors. The previous
-//! PB-slot lease survives until the replacement's complete normal retirement.
+//! Each VM keeps two persistent UMA/heap units. With `g16_pb_reuse` (the default), a render
+//! reuses its pass slot's lease, its VM's last successfully retired epoch of the slot, while
+//! the slot is still bound to it, unchanged (the host writes nothing to it, no InitBM).
+//! Otherwise it installs a fresh PB manager with full InitBM and never reinitializes exposed
+//! cursors. The previous PB-slot lease survives until the replacement's complete normal
+//! retirement.
 
 #[path = "pools/lifetime.rs"]
 pub(crate) mod lifetime;
@@ -67,6 +70,10 @@ pub(crate) struct PbStats {
     #[allow(dead_code)]
     pub(crate) refused: u64,
     pub(crate) bad: u64,
+    /// Pass slot bindings that reused a retired epoch / started a fresh one (a deferred
+    /// render counts again when it is retried).
+    pub(crate) reused: u64,
+    pub(crate) fresh: u64,
 }
 
 pub(crate) struct PoolSet {
@@ -259,6 +266,11 @@ pub(crate) struct Pools {
     pub(crate) dev: ARef<device::Device>,
     pub(crate) stats: PbStats,
     owners: [Option<Arc<PbEpoch>>; 2],
+    /// Per pass slot, a binding count, bumped by each fresh epoch (its InitBM rebinds the
+    /// slot) and by a firmware recovery. It identifies a binding without holding the epoch.
+    binds: [u64; 2],
+    /// Per pass slot, with `g16_pb_reuse`: `owners[k]` may serve the next render of its VM.
+    keep: [bool; 2],
 }
 impl Pools {
     pub(crate) fn new(dev: &AsahiDrmDevice) -> Self {
@@ -266,6 +278,66 @@ impl Pools {
             dev: dev.as_ref().as_ref().into(),
             stats: PbStats::default(),
             owners: [None, None],
+            binds: [0, 0],
+            keep: [false, false],
+        }
+    }
+    /// With reuse `enabled` (`g16_pb_reuse`): slot `k`'s owner epoch, if its render retired
+    /// normally while the slot was still bound to it, it belongs to `vm` and was exposed (its
+    /// InitBM ran). InitBM binds the device-wide slot to one epoch and VM; a fresh epoch handed
+    /// to the slot rebinds it, so the owner is then stale and the render starts fresh. Adds no
+    /// reference beyond the owner lease itself.
+    pub(crate) fn reusable(
+        &self,
+        enabled: bool,
+        k: usize,
+        vm: &Arc<super::vm::VmState>,
+    ) -> Option<Arc<PbEpoch>> {
+        if !enabled || !*self.keep.get(k)? {
+            return None;
+        }
+        let owner = self.owners.get(k)?.as_ref()?;
+        (Arc::ptr_eq(&owner._vm, vm) && owner.exposed.load(Ordering::Acquire))
+            .then(|| owner.clone())
+    }
+    /// Slot `k` is handed to a render's epoch, `reused` or fresh (with InitBM). Returns the
+    /// binding the render retires with.
+    pub(crate) fn bind(&mut self, k: usize, reused: bool) -> u64 {
+        let (Some(binds), Some(keep)) = (self.binds.get_mut(k), self.keep.get_mut(k)) else {
+            return 0;
+        };
+        if !reused {
+            *binds = binds.wrapping_add(1);
+            *keep = false;
+        }
+        *binds
+    }
+    /// A render on slot `k` with `binding` retired, after its `retire_binding`. If no other
+    /// epoch was bound and no recovery started since, the next render of the same VM may reuse
+    /// its epoch with reuse `enabled` and a `completed` render; after a failed one it starts
+    /// fresh.
+    /// Renders are bound, published and retired one at a time (`sizes::FLIGHTS` is 1, enforced
+    /// in `Engine::new`), so `keep[k]` always refers to the epoch the slot is bound to:
+    /// `owners[k]`.
+    pub(crate) fn retire_epoch(&mut self, enabled: bool, k: usize, binding: u64, completed: bool) {
+        if self.binds.get(k) == Some(&binding) {
+            if let Some(keep) = self.keep.get_mut(k) {
+                *keep = enabled && completed;
+            }
+        }
+    }
+    /// Reuse nothing on slot `k` (its render was aborted).
+    pub(crate) fn forget(&mut self, k: usize) {
+        if let Some(keep) = self.keep.get_mut(k) {
+            *keep = false;
+        }
+    }
+    /// A firmware recovery started: no epoch bound so far is reused, also not by a render that
+    /// retires after it (its binding no longer matches); each slot's next render starts fresh.
+    pub(crate) fn invalidate(&mut self) {
+        for (binds, keep) in self.binds.iter_mut().zip(self.keep.iter_mut()) {
+            *binds = binds.wrapping_add(1);
+            *keep = false;
         }
     }
     pub(crate) fn retire_binding(&mut self, k: usize, epoch: &Arc<PbEpoch>) -> Result {
@@ -275,16 +347,19 @@ impl Pools {
     pub(crate) fn write_stats(&self, f: &mut impl fmt::Write) -> fmt::Result {
         writeln!(
             f,
-            "pb: M4 private allocators blocks {} requests {} bad {}",
+            "pb: M4 private allocators blocks {} requests {} bad {} reused {} fresh {}",
             buffer::MAX_BLOCKS,
             self.stats.requests,
-            self.stats.bad
+            self.stats.bad,
+            self.stats.reused,
+            self.stats.fresh
         )
     }
 }
 
-/// One never-reinitialized PB manager installation. Even a same-VM command gets a fresh
-/// manager and full InitBM; no host reset of exposed firmware cursors is required.
+/// One never-reinitialized PB manager installation. Unless `g16_pb_reuse` hands a same-VM
+/// command its retired epoch, every command gets a fresh manager and full InitBM; no host
+/// reset of exposed firmware cursors is required.
 pub(crate) struct PbEpoch(crate::cleanup::Deferred<PbEpochInner>);
 impl core::ops::Deref for PbEpoch {
     type Target = PbEpochInner;

@@ -43,6 +43,11 @@ pub(crate) fn recovery() -> bool {
     module_parameters::g16_recovery.value() != 0
 }
 
+/// Whether a pass slot's retired PB epoch may serve the next render of its VM.
+pub(crate) fn pb_reuse() -> bool {
+    module_parameters::g16_pb_reuse.value() != 0
+}
+
 /// Whether the CDM/VDM stream gates are on.
 pub(crate) fn stream_gate() -> bool {
     module_parameters::g16_stream_gate.value() != 0
