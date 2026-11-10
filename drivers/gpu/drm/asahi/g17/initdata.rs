@@ -691,10 +691,25 @@ impl InitData {
         Ok(next != consumer && next != consumer_b)
     }
 
+    /// M5 compute: the shared ring's cursors when it has room for one record, as
+    /// [`Self::work_ready`] judges it. The same critical section may publish against them
+    /// ([`Self::publish_work_at`]): the firmware's consumers only advance, and the producer
+    /// is the device mutex holder's.
+    pub(super) fn m5_compute_room(&self, priority: u8) -> Result<Option<[u32; 3]>> {
+        use super::fw::queue::DataMaster;
+        if !self.m5 {
+            return Err(EINVAL);
+        }
+        let cursors = self.work_cursors(priority, DataMaster::Compute)?;
+        Ok((self.outer_capacity(priority, cursors)? >= 1).then_some(cursors))
+    }
+
+    /// `cursors`: an M5 compute room check's sample ([`Self::m5_compute_room`]), else read here.
     fn work_publication<'a>(
         &'a self,
         priority: u8,
         record: &'a super::fw::channels::WorkSlot,
+        cursors: Option<[u32; 3]>,
     ) -> Result<WorkPublication<'a>> {
         use super::fw::{channels, queue::DataMaster};
         let engine = match record.data_master {
@@ -706,7 +721,11 @@ impl InitData {
             _ => return Err(EINVAL),
         };
         let channel = channels::work_ring_index(priority, engine).ok_or(EINVAL)?;
-        let [consumer, consumer_b, producer] = self.work_cursors(priority, engine)?;
+        let [consumer, consumer_b, producer] = match cursors {
+            Some(cursors) if self.m5 && engine == DataMaster::Compute => cursors,
+            Some(_) => return Err(EINVAL),
+            None => self.work_cursors(priority, engine)?,
+        };
         if self.m5 && engine == DataMaster::Compute
             && self.outer_capacity(priority, [consumer, consumer_b, producer])? < 1 {
             return Err(EBUSY);
@@ -769,7 +788,18 @@ impl InitData {
         priority: u8,
         record: &super::fw::channels::WorkSlot,
     ) -> Result<u32> {
-        Ok(self.work_publication(priority, record)?.commit())
+        self.publish_work_at(priority, record, None)
+    }
+
+    /// [`Self::publish_work`] against the cursors of a room check made earlier under the same
+    /// hold of the device mutex ([`Self::m5_compute_room`]), or a fresh read for None.
+    pub(super) fn publish_work_at(
+        &self,
+        priority: u8,
+        record: &super::fw::channels::WorkSlot,
+        cursors: Option<[u32; 3]>,
+    ) -> Result<u32> {
+        Ok(self.work_publication(priority, record, cursors)?.commit())
     }
 
     /// Reserve both common-ring slots before touching either host port. The
@@ -835,8 +865,8 @@ impl InitData {
             publish_late_tiling();
             return Ok(if deferred { pair.next() } else { pair.publish() });
         }
-        let fragment = self.work_publication(priority, fragment)?;
-        let tiling = self.work_publication(priority, tiling)?;
+        let fragment = self.work_publication(priority, fragment, None)?;
+        let tiling = self.work_publication(priority, tiling, None)?;
         fragment.copy_record();
         commit_accounting()?;
         fence(Ordering::SeqCst);
