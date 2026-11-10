@@ -1823,22 +1823,41 @@ impl gpu::Gpu for Gpu {
         mut bo: gem::ObjectRef,
         range: Range<usize>,
     ) -> Result<crate::timestamp::Buffer> {
-        let mapping = {
+        let (mapping, window) = {
             let state = self.shared.state.lock();
             let firmware = (*state).as_ref().ok_or(ENODEV)?;
-            let mut addresses = firmware.uat.geometry().kernel_range();
-            addresses.start += hw::t8140::dynamic::KERNEL_OFFSET;
-            bo.map_range_into_range(
-                firmware.uat.kernel_vm(),
-                range,
-                addresses,
-                mmu::UAT_PGSZ as u64,
-                mmu::PROT_FW_SHARED_RW,
-                false,
-            )?
+            // Firmware-only, like the other alias: only the firmware writes these stamps.
+            let windowed = bo
+                .map_range_into_range(
+                    firmware.uat.kernel_vm(),
+                    range.clone(),
+                    hw::t8140::dynamic::TIMESTAMP_WINDOW,
+                    mmu::UAT_PGSZ as u64,
+                    mmu::PROT_FW_SHARED_RW,
+                    false,
+                )
+                .ok();
+            match windowed {
+                Some(mapping) => (mapping, true),
+                // A full window: this buffer's stamps are all host-written.
+                None => (
+                    bo.map_range_into_range(
+                        firmware.uat.kernel_vm(),
+                        range,
+                        hw::t8140::dynamic::upper(firmware.uat.geometry().kernel_range()),
+                        mmu::UAT_PGSZ as u64,
+                        mmu::PROT_FW_SHARED_RW,
+                        false,
+                    )?,
+                    false,
+                ),
+            }
         };
         // The buffer's CPU mapping takes the reservation lock: not under the device mutex.
-        crate::timestamp::Buffer::firmware(mapping)
+        match window {
+            true => crate::timestamp::Buffer::firmware_window(mapping),
+            false => crate::timestamp::Buffer::firmware(mapping),
+        }
     }
 }
 

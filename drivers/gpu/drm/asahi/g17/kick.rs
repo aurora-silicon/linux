@@ -538,8 +538,7 @@ impl Queue {
             mmu::PROT_GPU_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
-        let mut range = alloc.uat.geometry().kernel_range();
-        range.start += t8140::dynamic::KERNEL_OFFSET;
+        let range = t8140::dynamic::upper(alloc.uat.geometry().kernel_range());
         let high = low.alias_in(
             alloc.uat.kernel_vm(),
             range,
