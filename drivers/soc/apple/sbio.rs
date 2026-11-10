@@ -109,12 +109,8 @@ fn prompt_step(
 }
 /// Further frames of a no-match touch relayed before the retry pass ends.
 const NOMATCH_EXTRA_FRAMES: u32 = 3;
-/// How long the no-match tail waits for each extra frame of the same touch.
+/// How long the retry pass waits for each extra frame of the same touch.
 const NOMATCH_FRAME_WAIT_MS: u64 = 500;
-/// How long the tail waits on a sensor armed for a finger: one still down is
-/// imaged within a frame period or two (~80 ms each, ~125 ms measured from a
-/// START_CAPTURE on Linux).
-const NOMATCH_ARMED_WAIT_MS: u64 = 250;
 /// Message tag of the enclave's "background operation result ready" notice.
 /// The host answers it with BG_OPS_RESULT (0x21); until it does, the result
 /// stays queued in the enclave.
@@ -723,21 +719,18 @@ impl SepData {
         self.close_unlock_evaluation(&evaluation);
     }
 
-    /// The tail macOS sends after a no-match result: further frames of the
-    /// same touch, each relayed (0x65) and followed by RETRY_CAPTURE_INFO,
-    /// then MATCH_RETRY_FINALIZE, then MATCH_POLICY. macOS relays the frames
-    /// the sensor queued while the finger stayed down (three in the captured
-    /// prompts); the whole touch is one result.
+    /// The retry pass macOS sends when a match result asks for it: further
+    /// frames of the same touch, each relayed (0x65) and followed by
+    /// RETRY_CAPTURE_INFO, then one MATCH_RETRY_FINALIZE, then MATCH_POLICY.
+    /// macOS relays only the frames the sensor queued while the finger stayed
+    /// down (three in the captured Neo prompts) and never starts a new
+    /// capture for it; the whole touch is one result.
     fn no_match_tail(&self) {
         let mut frames: u32 = 0;
-        let mut streamed: u32 = 0;
         while frames < NOMATCH_EXTRA_FRAMES {
-            let Some((advertised, from_stream)) = self.next_tail_frame() else {
+            let Some(advertised) = self.next_tail_frame() else {
                 break;
             };
-            if from_stream {
-                streamed += 1;
-            }
             let Ok(capture) = sensor::read_capture(advertised) else {
                 break;
             };
@@ -752,7 +745,7 @@ impl SepData {
                 Ok(done) => {
                     dev_warn!(
                         self.dev,
-                        "verify: no-match tail: {} answered status {} ({} bytes)\n",
+                        "verify: retry pass: {} answered status {} ({} bytes)\n",
                         op.name(),
                         done.status,
                         done.payload.len()
@@ -760,7 +753,7 @@ impl SepData {
                     break;
                 }
                 Err(e) => {
-                    dev_warn!(self.dev, "verify: no-match tail: {} failed ({:?})\n", op.name(), e);
+                    dev_warn!(self.dev, "verify: retry pass: {} failed ({:?})\n", op.name(), e);
                     break;
                 }
             }
@@ -769,41 +762,30 @@ impl SepData {
         match self.sbio_transfer(&op) {
             Ok(done) => dev_info!(
                 self.dev,
-                "verify: no-match tail: {} further frame(s) relayed ({} still streaming from the touch); {} answered status {}, {} bytes\n",
+                "verify: retry pass the result asked for: {} further frame(s) of the touch relayed; {} answered status {}, {} bytes\n",
                 frames,
-                streamed,
                 op.name(),
                 done.status,
                 done.payload.len()
             ),
-            Err(e) => dev_warn!(self.dev, "verify: no-match tail: {} failed ({:?})\n", op.name(), e),
+            Err(e) => dev_warn!(self.dev, "verify: retry pass: {} failed ({:?})\n", op.name(), e),
         }
     }
 
-    /// The next frame of the touch for the no-match tail, and whether the
-    /// sensor was still imaging it. One START_CAPTURE on macOS yields a frame
-    /// every ~80 ms while the finger stays down, and the tail relays the
-    /// frames taken while MATCH_RESULT ran; take those first. Otherwise the
-    /// capture is started again: a sensor armed for a finger finds one still
-    /// down within a frame period or two, so it waits less for a lifted one.
-    fn next_tail_frame(&self) -> Option<(u32, bool)> {
+    /// The next frame of the touch for the retry pass. One START_CAPTURE on
+    /// macOS yields a frame every ~80 ms while the finger stays down, and the
+    /// pass relays the frames taken while MATCH_RESULT ran. It never starts a
+    /// new capture: a frame of a new image is not part of this touch.
+    fn next_tail_frame(&self) -> Option<u32> {
         let st = sensor::status().ok()?;
         if let Some(n) = st.available().filter(|n| *n > 0) {
-            return Some((n, true));
+            return Some(n);
         }
-        let (wait_ms, streaming) = match st.state {
-            sensor::STATE_READING => (NOMATCH_FRAME_WAIT_MS, true),
-            sensor::STATE_ARMED => {
-                sensor::start_capture().ok()?;
-                (NOMATCH_ARMED_WAIT_MS, false)
-            }
-            _ => {
-                sensor::start_capture().ok()?;
-                (NOMATCH_FRAME_WAIT_MS, false)
-            }
-        };
-        match self.await_capture_within(wait_ms) {
-            CaptureWait::Ready(n) => Some((n, streaming)),
+        if st.state != sensor::STATE_READING {
+            return None;
+        }
+        match self.await_capture_within(NOMATCH_FRAME_WAIT_MS) {
+            CaptureWait::Ready(n) => Some(n),
             _ => None,
         }
     }
@@ -3044,9 +3026,19 @@ impl SepData {
             MatchStep::LockedOut => return self.enter_lockout(),
             MatchStep::Refused => return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE),
         };
-        // On a no-match macOS finishes the touch before MATCH_POLICY.
-        if crate::sbio::MatchResult::parse(&result).is_some_and(|p| !p.matches(user)) {
-            self.no_match_tail();
+        // macOS finishes the touch before MATCH_POLICY only when the result
+        // asks for it: the enclave sets the result's retry word when it wants
+        // the touch's further frames. Sending the pass unasked is not neutral:
+        // with it after every no-match, the M2 (T8112) enclave locked Touch ID
+        // during the third miss instead of the fifth, consistent with each
+        // unrequested MATCH_RETRY_FINALIZE counting as one more failure.
+        match crate::sbio::MatchResult::parse(&result) {
+            Some(p) if p.retry_requested() => self.no_match_tail(),
+            Some(p) if !p.matches(user) => dev_info!(
+                self.dev,
+                "verify: the no-match result asks for no retry pass; going straight to MATCH_POLICY\n"
+            ),
+            _ => {}
         }
         // macOS reads the match policy after every answered result, before
         // the image cleanup; neither a match nor a no-match counts without it.
@@ -7187,6 +7179,19 @@ mod identity_scope_tests {
         let user = UserId::new(SBIO_PROBE_USER_ID).unwrap();
         assert!(result.matches(user));
         assert!(*result.identity_uuid() == [0xa5; IDENTITY_UUID_LEN]);
+        assert!(!result.retry_requested());
+    }
+
+    #[test]
+    fn match_result_retry_pass_only_when_the_enclave_asks() {
+        let mut reply = [0u8; SBIO_MATCH_RESULT_LEN];
+        reply[MR_USER_ID..MR_USER_ID + 4].copy_from_slice(&(-1i32).to_le_bytes());
+        let plain = MatchResult::parse(&reply).unwrap();
+        assert!(!plain.retry_requested());
+        reply[MR_RETRY] = 1;
+        let asked = MatchResult::parse(&reply).unwrap();
+        assert!(asked.retry_requested());
+        assert_eq!(MR_RETRY, 0x14);
     }
 }
 
@@ -7233,9 +7238,13 @@ pub(crate) const SBIO_MATCH_RESULT_LEN: usize = 0xca2;
 
 const MR_USER_ID: usize = 0x000;
 const MR_IDENTITY: usize = 0x004;
+/// Nonzero when the enclave asks for the same-touch retry pass (further
+/// frames, RETRY_CAPTURE_INFO each, then MATCH_RETRY_FINALIZE).
+const MR_RETRY: usize = MR_IDENTITY + IDENTITY_UUID_LEN;
 static_assert!(MR_USER_ID + 4 <= SBIO_MATCH_RESULT_LEN);
 static_assert!(MR_IDENTITY + IDENTITY_UUID_LEN <= SBIO_MATCH_RESULT_LEN);
 static_assert!(MR_IDENTITY == MR_USER_ID + 4);
+static_assert!(MR_RETRY + 4 <= SBIO_MATCH_RESULT_LEN);
 static_assert!(SBIO_MATCH_RESULT_LEN != SBIO_ENROL_RESULT_LEN);
 
 pub(crate) const IDENTITY_UUID_LEN: usize = 16;
@@ -7268,6 +7277,7 @@ impl IdentityV1 {
 pub(crate) struct MatchResult {
     user_id: i32,
     identity: [u8; IDENTITY_UUID_LEN],
+    retry: u32,
 }
 
 impl MatchResult {
@@ -7285,7 +7295,19 @@ impl MatchResult {
                 bytes[MR_USER_ID + 3],
             ]),
             identity,
+            retry: u32::from_le_bytes([
+                bytes[MR_RETRY],
+                bytes[MR_RETRY + 1],
+                bytes[MR_RETRY + 2],
+                bytes[MR_RETRY + 3],
+            ]),
         })
+    }
+
+    /// Whether the enclave asks the host for the same-touch retry pass
+    /// before MATCH_POLICY.
+    pub(crate) fn retry_requested(&self) -> bool {
+        self.retry != 0
     }
 
     pub(crate) fn identity_uuid(&self) -> &[u8; IDENTITY_UUID_LEN] {
