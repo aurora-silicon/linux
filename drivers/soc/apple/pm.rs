@@ -6,6 +6,16 @@
 //! capture in flight did not wake. Before the system suspends, end any capture
 //! in progress and hold new ones until it has resumed. The hwrng fill thread
 //! is not frozen either, so entropy requests are held over the same window.
+//!
+//! A hibernation also holds every request Linux starts, and the enclave's
+//! xART writes are refused, from its prepare until the kernel knows how it
+//! ended. The image must not miss host or gigalocker state written after the
+//! snapshot, and after a resume from disk on a cold boot the enclave is a
+//! freshly booted sepOS that must not see a message of the old session before
+//! the new registration. The PM core tells a resume from the image from an
+//! aborted hibernation or the wake of a hybrid sleep, and the PMP, which the
+//! boot loader halts on a cold boot, whether that resume went through one
+//! (`pm_shim.c`); the device is then probed again.
 //! The notifier itself is in `pm_shim.c`; the capture and entropy handling is
 //! on [`SepData`].
 //!
@@ -29,7 +39,7 @@ static SEP: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 extern "C" {
     fn sep_pm_register(
         dev: *mut c_void,
-        event: unsafe extern "C" fn(bool),
+        event: unsafe extern "C" fn(c_int) -> c_int,
         sleep: unsafe extern "C" fn() -> c_int,
         wake: unsafe extern "C" fn(),
         told: unsafe extern "C" fn() -> bool,
@@ -47,7 +57,23 @@ extern "C" {
         mask: u64,
     ) -> c_int;
     fn sep_pm_commit_finish(dev: *mut c_void) -> c_int;
+    fn sep_pm_exit();
     pub(crate) static sep_pm_ops: kernel::bindings::dev_pm_ops;
+}
+
+// Sleep events from `pm_shim.c`; must match `SEP_PM_*` in `shim.h`.
+const EVENT_SLEEP: c_int = 0;
+const EVENT_WAKE: c_int = 1;
+const EVENT_HIBERNATE: c_int = 2;
+const EVENT_HIBERNATE_WARM: c_int = 3;
+const EVENT_HIBERNATE_COLD: c_int = 4;
+const EVENT_RESTORE: c_int = 5;
+
+/// Cancels a probe queued after a resume from disk. Called once the module
+/// goes away, before the driver is unregistered.
+pub(crate) fn exit() {
+    // SAFETY: no preconditions; waits for a running reprobe to finish.
+    unsafe { sep_pm_exit() };
 }
 
 /// Who may use the mailbox around a firmware-driven suspend.
@@ -164,6 +190,14 @@ trait SleepHolds {
     fn hold_captures(&self);
     fn release_captures(&self);
     fn release_entropy(&self);
+    /// Holds every request Linux starts and refuses the enclave's xART
+    /// writes, or lifts that, around a hibernation.
+    fn hold_session(&self, held: bool);
+    /// The enclave was booted anew under a hibernation image: the session
+    /// is gone. Returns whether the device should be probed again.
+    fn session_lost(&self) -> bool;
+    /// Whether this kernel registered with the enclave.
+    fn attached(&self) -> bool;
 }
 
 impl SleepHolds for SepData {
@@ -179,32 +213,70 @@ impl SleepHolds for SepData {
     fn release_entropy(&self) {
         self.rng_sleep_finished();
     }
+    fn hold_session(&self, held: bool) {
+        self.hibernation_hold(held);
+    }
+    fn session_lost(&self) -> bool {
+        self.lose_session()
+    }
+    fn attached(&self) -> bool {
+        SepData::attached(self)
+    }
 }
 
-/// `entering`: the system is about to sleep; otherwise it has resumed, or
-/// the suspend was aborted.
-fn sleep_event(sep: &impl SleepHolds, entering: bool) {
-    if entering {
-        sep.hold_entropy();
-        sep.hold_captures();
-    } else {
-        sep.release_captures();
-        sep.release_entropy();
+/// Takes or releases the holds for one sleep event. Returns 1 when the
+/// device must be probed again, or for `EVENT_RESTORE` when the restore must
+/// be refused; 0 otherwise.
+fn sleep_event(sep: &impl SleepHolds, event: c_int) -> c_int {
+    match event {
+        EVENT_SLEEP => {
+            sep.hold_entropy();
+            sep.hold_captures();
+        }
+        EVENT_HIBERNATE => {
+            sep.hold_entropy();
+            sep.hold_captures();
+            sep.hold_session(true);
+        }
+        EVENT_WAKE => {
+            sep.release_captures();
+            sep.release_entropy();
+        }
+        // This kernel is about to load a hibernation image: refused (1) if
+        // it registered with the enclave, see `pm_shim.c`.
+        EVENT_RESTORE => {
+            if sep.attached() {
+                return 1;
+            }
+            sep.hold_entropy();
+            sep.hold_captures();
+            sep.hold_session(true);
+        }
+        EVENT_HIBERNATE_WARM => {
+            sep.hold_session(false);
+            sep.release_captures();
+            sep.release_entropy();
+        }
+        // The holds stay: the removal ahead of the new probe releases them
+        // into a session that refuses everything.
+        EVENT_HIBERNATE_COLD => return sep.session_lost() as c_int,
+        _ => {}
     }
+    0
 }
 
 /// # Safety
 /// Called by `pm_shim.c` from the PM notifier chain, in process context.
-unsafe extern "C" fn pm_event(entering: bool) {
+unsafe extern "C" fn pm_event(event: c_int) -> c_int {
     let ptr = SEP.load(Ordering::Acquire);
     if ptr.is_null() {
-        return;
+        return 0;
     }
     // SAFETY: produced by `into_foreign` in `register`, and reclaimed by
     // `unregister` only after `sep_pm_unregister` has waited out any running
     // notifier call, so it is live for this borrow.
     let sep = unsafe { <Arc<SepData> as ForeignOwnable>::borrow(ptr) };
-    sleep_event(&*sep, entering);
+    sleep_event(&*sep, event)
 }
 
 /// Runs `f` on the registered instance. Only for callbacks that
@@ -270,6 +342,8 @@ pub(crate) fn register(sep: Arc<SepData>) -> Result<()> {
 
     // SAFETY: the shim stores the callback and registers a notifier block
     // that lives for the module's lifetime.
+    // `dev` is the bound SEP device: the shim drops it in `sep_pm_unregister`
+    // and takes its own reference for a reprobe.
     let rc = unsafe { sep_pm_register(dev, pm_event, pm_sleep, pm_wake, pm_told) };
     if rc != 0 {
         let raw = SEP.swap(core::ptr::null_mut(), Ordering::AcqRel);
@@ -308,10 +382,15 @@ mod tests {
     const HOLD_CAPTURES: u8 = 2;
     const RELEASE_CAPTURES: u8 = 3;
     const RELEASE_ENTROPY: u8 = 4;
+    const HOLD_SESSION: u8 = 5;
+    const RELEASE_SESSION: u8 = 6;
+    const LOSE_SESSION: u8 = 7;
 
     struct Calls {
         made: RefCell<[u8; 8]>,
         count: Cell<usize>,
+        lose: Cell<bool>,
+        attached: Cell<bool>,
     }
 
     impl Calls {
@@ -319,6 +398,8 @@ mod tests {
             Calls {
                 made: RefCell::new([0; 8]),
                 count: Cell::new(0),
+                lose: Cell::new(true),
+                attached: Cell::new(false),
             }
         }
         fn call(&self, which: u8) {
@@ -343,6 +424,16 @@ mod tests {
         }
         fn release_entropy(&self) {
             self.call(RELEASE_ENTROPY);
+        }
+        fn hold_session(&self, held: bool) {
+            self.call(if held { HOLD_SESSION } else { RELEASE_SESSION });
+        }
+        fn session_lost(&self) -> bool {
+            self.call(LOSE_SESSION);
+            self.lose.get()
+        }
+        fn attached(&self) -> bool {
+            self.attached.get()
         }
     }
 
@@ -376,7 +467,7 @@ mod tests {
     #[test]
     fn going_to_sleep_holds_entropy_then_captures() {
         let calls = Calls::new();
-        sleep_event(&calls, true);
+        assert_eq!(sleep_event(&calls, EVENT_SLEEP), 0);
         assert_eq!(
             calls.made(),
             [HOLD_ENTROPY, HOLD_CAPTURES, 0, 0, 0, 0, 0, 0]
@@ -386,9 +477,9 @@ mod tests {
     #[test]
     fn sleep_holds_stay_until_the_post_event() {
         let calls = Calls::new();
-        sleep_event(&calls, true);
+        assert_eq!(sleep_event(&calls, EVENT_SLEEP), 0);
         assert_eq!(calls.count.get(), 2);
-        sleep_event(&calls, false);
+        assert_eq!(sleep_event(&calls, EVENT_WAKE), 0);
         assert_eq!(
             calls.made(),
             [HOLD_ENTROPY, HOLD_CAPTURES, RELEASE_CAPTURES, RELEASE_ENTROPY, 0, 0, 0, 0]
@@ -398,10 +489,83 @@ mod tests {
     #[test]
     fn waking_releases_captures_then_entropy() {
         let calls = Calls::new();
-        sleep_event(&calls, false);
+        assert_eq!(sleep_event(&calls, EVENT_WAKE), 0);
         assert_eq!(
             calls.made(),
             [RELEASE_CAPTURES, RELEASE_ENTROPY, 0, 0, 0, 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn a_hibernation_holds_the_session_last() {
+        let calls = Calls::new();
+        assert_eq!(sleep_event(&calls, EVENT_HIBERNATE), 0);
+        assert_eq!(
+            calls.made(),
+            [HOLD_ENTROPY, HOLD_CAPTURES, HOLD_SESSION, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn a_warm_end_of_a_hibernation_lifts_the_session_hold_first() {
+        let calls = Calls::new();
+        assert_eq!(sleep_event(&calls, EVENT_HIBERNATE), 0);
+        assert_eq!(sleep_event(&calls, EVENT_HIBERNATE_WARM), 0);
+        assert_eq!(
+            calls.made(),
+            [
+                HOLD_ENTROPY,
+                HOLD_CAPTURES,
+                HOLD_SESSION,
+                RELEASE_SESSION,
+                RELEASE_CAPTURES,
+                RELEASE_ENTROPY,
+                0,
+                0
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cold_resume_keeps_the_holds_and_asks_for_a_probe() {
+        let calls = Calls::new();
+        assert_eq!(sleep_event(&calls, EVENT_HIBERNATE), 0);
+        assert_eq!(sleep_event(&calls, EVENT_HIBERNATE_COLD), 1);
+        assert_eq!(
+            calls.made(),
+            [HOLD_ENTROPY, HOLD_CAPTURES, HOLD_SESSION, LOSE_SESSION, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn a_second_cold_resume_asks_for_no_second_probe() {
+        let calls = Calls::new();
+        calls.lose.set(false);
+        assert_eq!(sleep_event(&calls, EVENT_HIBERNATE_COLD), 0);
+    }
+
+    #[test]
+    fn a_restore_over_an_attached_enclave_is_refused_without_holds() {
+        let calls = Calls::new();
+        calls.attached.set(true);
+        assert_eq!(sleep_event(&calls, EVENT_RESTORE), 1);
+        assert_eq!(calls.count.get(), 0);
+    }
+
+    #[test]
+    fn a_restore_without_a_session_holds_like_a_hibernation() {
+        let calls = Calls::new();
+        assert_eq!(sleep_event(&calls, EVENT_RESTORE), 0);
+        assert_eq!(
+            calls.made(),
+            [HOLD_ENTROPY, HOLD_CAPTURES, HOLD_SESSION, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn an_unknown_event_changes_nothing() {
+        let calls = Calls::new();
+        assert_eq!(sleep_event(&calls, 99), 0);
+        assert_eq!(calls.count.get(), 0);
     }
 }

@@ -21,6 +21,7 @@ int apple_pmp_report_ane_perf(const struct device_node *np,
 			      struct device *owner, unsigned int level, bool *held);
 int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int timeout_ms);
 int apple_pmp_report_wait_running(struct device_node *report_np, unsigned int timeout_ms);
+int apple_pmp_report_wait_handed(unsigned int timeout_ms);
 /* Caller holds the PMP owner's vote lock and keeps the supplier bound. */
 int apple_pmp_report_check_t6030_gfx(struct device *supplier);
 int apple_pmp_report_set_t6030_gfx(struct device *supplier, bool enable);
@@ -111,6 +112,11 @@ static inline int apple_pmp_report_wait_running(struct device_node *report_np,
 						unsigned int timeout_ms)
 {
 	return -ENODEV;
+}
+
+static inline int apple_pmp_report_wait_handed(unsigned int timeout_ms)
+{
+	return 0;
 }
 
 static inline int apple_pmp_report_check_t6030_gfx(struct device *supplier)

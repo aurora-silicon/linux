@@ -181,10 +181,14 @@ struct PmpData {
     display_error: AtomicI32,
     /// See [`PmpHwConfig::sram_backup`].
     sram_backup: Option<(usize, usize)>,
+    /// The SoC configuration, kept so the hibernation restore can re-run the
+    /// probe-time bring-up (the boot loader cold-restarts the PMP on an S4
+    /// resume and nothing else replays it).
+    cfg: &'static PmpHwConfig,
 }
 
 impl PmpData {
-    fn new(dev: &platform::Device<Core<'_>>, cfg: &PmpHwConfig) -> Result<Arc<PmpData>> {
+    fn new(dev: &platform::Device<Core<'_>>, cfg: &'static PmpHwConfig) -> Result<Arc<PmpData>> {
         let pmp_req = dev.io_request_by_name(c"pmp").ok_or(EINVAL)?;
         let pmp_mmio = pmp_req.iomap_sized::<PMP_MIN_MMIO_SIZE>()?.into_devres()?;
         let asc_req = dev.io_request_by_name(c"asc").ok_or(EINVAL)?;
@@ -202,10 +206,97 @@ impl PmpData {
                     display: AtomicPtr::new(core::ptr::null_mut()),
                     display_error: AtomicI32::new(0),
                     sram_backup: cfg.sram_backup,
+                    cfg,
                 }
             ),
             GFP_KERNEL,
         )
+    }
+
+    /// Build the SRAM boot-argument patch list from the device-tree node, as
+    /// `probe()` does. Re-derivable on a hibernation restore (the DT is static).
+    fn build_patches(&self) -> Result<KVec<(u32, u32)>> {
+        let node = self.dev.fwnode().ok_or(EIO)?;
+        let dvid = node
+            .property_read(c"apple,dram-vendor-id")
+            .required_by(&self.dev)?;
+        let bdid = node.property_read(c"apple,board-id").required_by(&self.dev)?;
+        let mut patches = KVec::with_capacity(9, GFP_KERNEL)?;
+        patches.push((from_fourcc(b"BDID"), bdid), GFP_KERNEL)?;
+        patches.push((from_fourcc(b"DVID"), dvid), GFP_KERNEL)?;
+        for (tag, prop) in OPTIONAL_BOOTARGS.iter() {
+            if let Some(v) = node.property_read::<u32>(prop).optional() {
+                patches.push((from_fourcc(tag), v), GFP_KERNEL)?;
+            }
+        }
+        if let Some(v) = node.property_read::<u32>(c"apple,pmc-pmgr").optional() {
+            patches.push((from_fourcc(b"PMCV"), v & 1), GFP_KERNEL)?;
+            patches.push((from_fourcc(b"PMCB"), (v >> 3) & 1), GFP_KERNEL)?;
+        }
+        Ok(patches)
+    }
+
+    /// Re-run the PMP bring-up after a hibernation restore. The boot loader
+    /// cold-restarts the PMP (image resident in PMS_SRAM, ASC CPU halted), and
+    /// nothing replays the probe-time sequence, so the firmware stays down:
+    /// "no PMP within 20000ms" / cpufreq "PMP not running after 30s". The
+    /// retained `PmpData` Arc, both `DevresIoMem` mappings and the C power-vote
+    /// bridge all stay; only the volatile session and firmware are rebuilt.
+    /// The decision between a halted (reinit + boot) and a live (adopt) firmware
+    /// follows the ASC CPU run bit, as the NVMe ANS restore does.
+    fn restore(&self) -> Result<()> {
+        // Reached from a PM notifier, not the bound probe context, so access the
+        // retained mappings revocably (the device is still bound during resume).
+        // try_access() holds an RCU read-side lock while its guard lives: keep each
+        // guard to the MMIO accesses, never across a mutex, an allocation or the
+        // sleeping RTKit handshake.
+        let cpu_running = {
+            let asc = self.asc_mmio.try_access().ok_or(ENODEV)?;
+            asc.as_view().relaxed().read(ASC_CPU_CONTROL).cpu_run() != 0
+        };
+        dev_info!(self.dev, "PMP restore: ASC CPU_RUN={}\n", cpu_running as u32);
+        {
+            let mut guard = self.rtkit.lock();
+            let rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
+            if rtk.is_crashed() {
+                dev_err!(self.dev, "PMP restore: session crashed, unrecoverable\n");
+                return Err(EIO);
+            }
+            if cpu_running {
+                // The firmware never stopped (an aborted hibernation, or a
+                // restore failure in the boot kernel): nothing to rebuild.
+                dev_info!(self.dev, "PMP restore: firmware still running, left as is\n");
+                return Ok(());
+            }
+            // Running before the image and halted now: the boot loader
+            // restarted the SoC under it, a cold boot, which co-processors
+            // without a run bit the AP can read (the SEP) have to know.
+            // SAFETY: no arguments; the bridge only counts.
+            unsafe { bindings::apple_pmp_note_cold_restart() };
+            // Halted firmware: detach the stale session so a fresh HELLO/EPMAP
+            // boot is accepted, as the NVMe ANS restore reinits its session.
+            rtk.reinit()?;
+        }
+        // The runtime handshake on the PMP endpoint fails against the state
+        // left from before the hibernation, so clear it first.
+        *self.state.lock() = PmpState::new()?;
+        *self.power_command.lock() = Command::Idle;
+        // Re-patch the SRAM boot args (the cold-restarted firmware re-reads them).
+        let patches = self.build_patches()?;
+        {
+            let pmp = self.pmp_mmio.try_access().ok_or(ENODEV)?;
+            self.patch_bootargs(&pmp.as_view(), &patches, self.cfg.check_bootargs_uuid)?;
+        }
+        // Release the ASC CPU and drive the wake/boot handshake, as probe does.
+        {
+            let asc = self.asc_mmio.try_access().ok_or(ENODEV)?;
+            asc.as_view()
+                .relaxed()
+                .update(ASC_CPU_CONTROL, |r| r.with_const_cpu_run::<1>());
+        }
+        self.start()?;
+        dev_info!(self.dev, "PMP restore: firmware and endpoint back\n");
+        Ok(())
     }
     fn start(&self) -> Result<()> {
         let mut guard = self.rtkit.lock();
@@ -778,6 +869,28 @@ pub unsafe extern "C" fn apple_pmp_wake(data: *const core::ffi::c_void) -> i32 {
         Err(error) => {
             data.fail_display(error);
             error.to_errno()
+        }
+    }
+}
+
+/// Rebuild the PMP firmware session after a resume from disk (PM_POST_HIBERNATION).
+/// The C power-vote bridge calls this with the retained `PmpData` pointer; the
+/// bridge, the Arc and the MMIO mappings all stay — only the firmware session is
+/// rebuilt. Returns 0 on success or a negative errno. A failure is logged and the
+/// PMP stays down (cpufreq keeps its fallback clamp) rather than aborting resume.
+///
+/// # Safety
+/// `data` must be the live `PmpData` pointer the bridge was registered with, and
+/// the caller must serialize against unregister in `Drop`.
+#[export]
+pub unsafe extern "C" fn apple_pmp_restore(data: *const core::ffi::c_void) -> i32 {
+    // SAFETY: the C bridge holds the retained foreign reference until reboot.
+    let data = unsafe { &*data.cast::<PmpData>() };
+    match data.restore() {
+        Ok(()) => 0,
+        Err(e) => {
+            dev_err!(data.dev, "PMP restore failed: {:?}\n", e);
+            e.to_errno()
         }
     }
 }

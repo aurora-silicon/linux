@@ -11,6 +11,13 @@ int apple_pmp_link_device(struct device *consumer);
 int apple_pmp_set_device_power(u8 command, u16 device_id, u32 enabled);
 /* After the acknowledged AGX vote and successful GPU firmware startup. */
 int apple_pmp_t6030_gpu_ready(void);
+/*
+ * How many resumes from disk the PMP found halted by the boot loader, i.e.
+ * cold boots of the SoC under a hibernation image, or -ENODEV without a
+ * bound PMP. Counted in the PMP's own PM_POST_HIBERNATION notifier
+ * (priority 10), so a lower-priority notifier sees this resume counted.
+ */
+int apple_pmp_cold_restarts(void);
 #else
 static inline int apple_pmp_link_device(struct device *consumer)
 {
@@ -21,6 +28,10 @@ static inline int apple_pmp_set_device_power(u8 command, u16 device_id, u32 enab
 	return -ENODEV;
 }
 static inline int apple_pmp_t6030_gpu_ready(void)
+{
+	return -ENODEV;
+}
+static inline int apple_pmp_cold_restarts(void)
 {
 	return -ENODEV;
 }
@@ -49,4 +60,8 @@ struct apple_pmp_commit_stop {
 };
 
 int apple_pmp_sleep_prepare(const void *data, struct apple_pmp_commit_stop *stop);
+/* Rebuild the firmware session after a resume from disk (PM_POST_HIBERNATION). */
+int apple_pmp_restore(const void *data);
+/* Called by the restore when it finds the PMP halted (a cold boot). */
+void apple_pmp_note_cold_restart(void);
 #endif

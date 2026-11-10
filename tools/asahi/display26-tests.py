@@ -87,7 +87,7 @@ int main(void) {
             '-I'+str(tmp), '-I'+str(ROOT), str(tmp/'profile.c'), '-o', str(tmp/'profile'))
         run(str(tmp/'profile'))
         # Platform functions are mocked; the bridge's actual decisions and cleanup execute.
-        for name in ('device', 'export', 'mutex', 'of'):
+        for name in ('atomic', 'device', 'export', 'limits', 'mutex', 'notifier', 'of'):
             write(tmp, 'linux/'+name+'.h', '#include "mock.h"\n')
         write(tmp, 'linux/errno.h', '#define EPROBE_DEFER 517\n#define ENODEV 19\n#define EINVAL 22\n#define EBUSY 16\n#define EIO 5\n#define ETIMEDOUT 110\n#define EAGAIN 11\n')
         write(tmp, 'linux/kconfig.h', '#define IS_REACHABLE(x) 1\n#define IS_ENABLED(x) 1\n')
@@ -95,9 +95,12 @@ int main(void) {
         write(tmp, 'linux/pm.h', '#include "mock.h"\n'
               'struct dev_pm_ops { int (*suspend_late)(struct device *); int (*resume_early)(struct device *); };\n'
               '#define LATE_SYSTEM_SLEEP_PM_OPS(s, r) .suspend_late = (s), .resume_early = (r),\n')
-        write(tmp, 'linux/suspend.h', '#include <stdbool.h>\n'
+        write(tmp, 'linux/suspend.h', '#include "mock.h"\n'
               'static inline bool pm_suspend_via_firmware(void) { return false; }\n'
-              'static inline bool pm_resume_via_firmware(void) { return false; }\n')
+              'static inline bool pm_resume_via_firmware(void) { return false; }\n'
+              '#define PM_POST_HIBERNATION 0x0002\n#define PM_POST_RESTORE 0x0006\n'
+              'int register_pm_notifier(struct notifier_block *nb);\n'
+              'int unregister_pm_notifier(struct notifier_block *nb);\n')
         # The bridge's sleep-commit stop: MMIO, RTKit and the sleep driver, reached only in a suspend.
         write(tmp, 'linux/io.h', '#include "mock.h"\n'
               'static inline u32 readl_relaxed(const volatile void __iomem *a) { assert(!"no system sleep here"); return 0; }\n'
@@ -114,12 +117,14 @@ int main(void) {
               '\t\t\t\t\t      int (*f)(void *), void *x) { assert(!"no system sleep here"); return -EIO; }\n'
               'static inline void apple_sleep_coproc_set_ready(struct device *d, bool r) { assert(!"no system sleep here"); }\n'
               'static inline bool apple_sleep_coproc_stopped(struct device *d) { assert(!"no system sleep here"); return false; }\n'
-              'static inline bool apple_sleep_commit_stops_coprocs(void) { assert(!"no system sleep here"); return false; }\n')
+              'static inline bool apple_sleep_commit_stops_coprocs(void) { assert(!"no system sleep here"); return false; }\n'
+              'static inline bool apple_sleep_power_loss(void) { assert(!"no system sleep here"); return false; }\n')
         write(tmp, 'linux/soc/apple/pmp-display.h', '#include <stdbool.h>\nbool apple_pmp_display_retained_board(void);\n')
         write(tmp, 'mock.h', '''#pragma once
 #include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <limits.h>
 #include <pthread.h>
 #define dev_err(...) ((void)0)
 #define dev_warn(...) ((void)0)
@@ -142,6 +147,14 @@ static void leave(struct mutex_guard *g){pthread_mutex_unlock(&g->m->lock);}
 #define guard(x) struct mutex_guard JOIN(g,__LINE__) __attribute__((cleanup(leave))) = enter
 #define scoped_guard(x,m) for(bool once=true;once;) for(struct mutex_guard g __attribute__((cleanup(leave)))=enter(m);once;once=false)
 #define EXPORT_SYMBOL_GPL(x)
+typedef struct { int counter; } atomic_t;
+#define ATOMIC_INIT(i) { (i) }
+static inline void atomic_inc(atomic_t *v){v->counter++;}
+static inline int atomic_read(const atomic_t *v){return v->counter;}
+#define READ_ONCE(x) (x)
+#define WRITE_ONCE(x,v) ((x)=(v))
+struct notifier_block { int (*notifier_call)(struct notifier_block*,unsigned long,void*); int priority; };
+#define NOTIFY_DONE 0
 #define DL_FLAG_AUTOREMOVE_CONSUMER 1
 static struct device_node *phandle; static bool link_fail;
 static struct device_node *of_parse_phandle(struct device_node*n,const char*k,int index){return phandle;}
@@ -168,6 +181,11 @@ void apple_pmp_report_wake(struct device*d,bool real){assert(!"no system sleep h
 int apple_pmp_sleep(const void*data){assert(!"no system sleep here");return -EIO;}
 int apple_pmp_sleep_prepare(const void*data,struct apple_pmp_commit_stop*stop){assert(!"no system sleep here");return -EIO;}
 int apple_pmp_wake(const void*data){assert(!"no system sleep here");return -EIO;}
+int apple_pmp_restore(const void*data){assert(!"no hibernation here");return -EIO;}
+/* The PM notifier chain: one block, registered while the PMP is. */
+static struct notifier_block *pm_notifier;
+int register_pm_notifier(struct notifier_block*nb){assert(!pm_notifier);pm_notifier=nb;return 0;}
+int unregister_pm_notifier(struct notifier_block*nb){assert(pm_notifier==nb);pm_notifier=NULL;return 0;}
 int main(void){
  struct device_node n={1},wrong={2}; struct device supplier={&n,true,0},consumer={NULL,false,0}; int data;
  assert(apple_pmp_set_device_power(0xf,8,1)==-ENODEV);
@@ -190,7 +208,7 @@ int main(void){
  assert(apple_pmp_set_device_power(0xf,5,1)==0);assert(calls==3);
  assert(apple_pmp_set_device_power(0xe,5,0)==0);assert(calls==4);
  apple_pmp_unregister(&wrong);assert(pmp_data==&data);
- apple_pmp_unregister(&data);assert(!pmp_data && !pmp_device);
+ apple_pmp_unregister(&data);assert(!pmp_data && !pmp_device);assert(!pm_notifier);
  assert(apple_pmp_set_device_power(0xf,8,1)==-ENODEV);
  puts("production PMP bridge supplier/ready/ack controls: PASS");
 }
