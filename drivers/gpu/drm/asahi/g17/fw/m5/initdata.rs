@@ -1796,6 +1796,9 @@ pub(crate) struct Board {
     /// Whether the host encodings are the G17D ones measured on the M5 Ultra
     /// ([`Board::g17d_forms`]).
     g17d_forms: bool,
+    /// Whether explicit waits on other kicks take the completion class
+    /// ([`Board::completion_inputs`]).
+    completion_inputs: bool,
 }
 
 /// M5 Pro: two clusters of ten cores.
@@ -1818,6 +1821,7 @@ pub(crate) const J714: Board = Board {
     topology_words: None,
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
+    completion_inputs: true,
 };
 
 /// M5 Max: four clusters of ten cores.
@@ -1842,6 +1846,7 @@ pub(crate) const J716C: Board = Board {
     topology_words: Some((16, 40)),
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
+    completion_inputs: false,
 };
 
 /// J775D's performance controllers run from P3.
@@ -1876,6 +1881,7 @@ pub(crate) const J775D: Board = Board {
     // above the SMC's own start rather than below it.
     fan_curve_start_mc: 97_000,
     g17d_forms: true,
+    completion_inputs: false,
 };
 
 const _: () = {
@@ -2160,6 +2166,14 @@ impl Board {
     /// differ from J714's, as `super::compute` and the render registers read them.
     pub(crate) const fn g17d_forms(&self) -> bool {
         self.g17d_forms
+    }
+
+    /// Whether a kick's explicit waits on other kicks (inputs from other queues, other-engine
+    /// producers) take the completion class, which holds them in firmware until those kicks
+    /// complete. A wait on another queue's compute stays in firmware only for work that declares
+    /// a visible completion (DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION); others wait on the host.
+    pub(crate) const fn completion_inputs(&self) -> bool {
+        self.completion_inputs
     }
 
     /// The board's `index`th register window.

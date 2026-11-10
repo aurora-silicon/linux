@@ -29,21 +29,37 @@ pub(crate) const fn topology_dispatch_control(base: u64, clusters: u32) -> u64 {
 /// for compute work (tiling's is also 2, fragment's 3).
 pub(crate) const COMPUTE_PIPELINED_DEPENDENCY: u8 = 2;
 
-/// Dependency class of a compute kick's implicit parent (the previous kick of its queue) on
-/// `board`. With the G17D forms it is derived as the kick-queue encoder derives it: the compute
-/// class only for a command whose pipeline dependency type is 1, which only a late-evaluated wait
-/// sets, and class 1 otherwise, which holds the kick until its parent has completed. No DRM
-/// compute kick is a late-evaluated wait. Otherwise it is the pipelined class, with which a kick
-/// may start while its parent still runs.
-pub(crate) fn parent_dependency(board: &Board, pipelined: bool) -> u8 {
-    if pipelined || !board.g17d_forms() { COMPUTE_PIPELINED_DEPENDENCY } else { 1 }
+/// The completion class, which holds a kick until the kick it names has completed.
+pub(crate) const COMPLETION_DEPENDENCY: u8 = 1;
+
+/// Dependency class of an explicit dependency of a compute kick on `board`.
+pub(crate) fn explicit_dependency(board: &Board) -> u8 {
+    if board.completion_inputs() { COMPLETION_DEPENDENCY } else { COMPUTE_PIPELINED_DEPENDENCY }
 }
 
-/// The completion ordinal of a compute command on `board`. With the G17D forms it is the count of
-/// compute commands its hardware queue published before it (zero for a new queue), wrapping as a
-/// u32; render commands count separately. Otherwise it is 0 on every kick.
+/// Dependency class of a compute kick's implicit parent (the previous kick of its queue) on
+/// `board`. With the counted forms ([`counted_forms`]) it is derived as the kick-queue encoder
+/// derives it: the compute class only for a command whose pipeline dependency type is 1, which
+/// only a late-evaluated wait sets, and class 1 otherwise, which holds the kick until its parent
+/// has completed. No DRM compute kick is a late-evaluated wait. Otherwise it is the pipelined
+/// class, with which a kick may start while its parent still runs.
+pub(crate) fn parent_dependency(board: &Board, pipelined: bool) -> u8 {
+    if pipelined || !counted_forms(board) { COMPUTE_PIPELINED_DEPENDENCY } else { 1 }
+}
+
+/// Whether compute kicks on `board` count their completion ordinal and hold for their parent:
+/// with the G17D forms, and on boards whose explicit waits take the completion class
+/// ([`Board::completion_inputs`]), as macOS encodes M5 Pro compute.
+pub(crate) fn counted_forms(board: &Board) -> bool {
+    board.g17d_forms() || board.completion_inputs()
+}
+
+/// The completion ordinal of a compute command on `board`. With the counted forms
+/// ([`counted_forms`]) it is the count of compute commands its hardware queue published before it
+/// (zero for a new queue), wrapping as a u32; render commands count separately. Otherwise it is 0
+/// on every kick.
 pub(crate) fn completion_ordinal(board: &Board, published_before: u32) -> u32 {
-    if board.g17d_forms() { published_before } else { 0 }
+    if counted_forms(board) { published_before } else { 0 }
 }
 
 /// Contexts per engine in the event space: a pool's event is 64 x its engine + its context.
@@ -58,17 +74,20 @@ const ENTRY_GATE_EVENT: u32 = 254;
 /// The event mask of a compute kick of context `context_id` on `board`, published with its
 /// current-kick notification. With the G17D forms ([`Board::g17d_forms`]) the kick waits on its
 /// own context's pool event (64 x 2 + the context), which the firmware holds while it processes
-/// that pool's dependencies, and on the entry-signal gate; a context of 64 or more is EINVAL.
-/// Otherwise it is the fixed `[0, 0, 8, 0]` (event 131, context 3's pool event, without the gate).
+/// that pool's dependencies, and on the entry-signal gate; a context of 64 or more is EINVAL. With
+/// the other counted forms ([`counted_forms`]) it is the pool event alone. Otherwise it is the
+/// fixed `[0, 0, 8, 0]` (event 131, context 3's pool event, without the gate).
 pub(crate) fn kick_event_mask(board: &Board, context_id: u32) -> Result<[u64; 4]> {
-    if !board.g17d_forms() {
+    if !counted_forms(board) {
         return Ok([0, 0, 8, 0]);
     }
     if context_id >= POOL_EVENT_CONTEXTS {
         return Err(EINVAL);
     }
     let mut mask = [0u64; 4];
-    for event in [POOL_EVENT_ENGINE * POOL_EVENT_CONTEXTS + context_id, ENTRY_GATE_EVENT] {
+    let pool = POOL_EVENT_ENGINE * POOL_EVENT_CONTEXTS + context_id;
+    let events = [Some(pool), board.g17d_forms().then_some(ENTRY_GATE_EVENT)];
+    for event in events.into_iter().flatten() {
         mask[(event / 64) as usize] |= 1 << (event % 64);
     }
     Ok(mask)
@@ -92,9 +111,22 @@ pub(crate) const NORMAL_TUPLE: KickTuple =
 pub(crate) const QUALIFIED_TUPLE: KickTuple =
     KickTuple { preempt_state_offset: 0x1480, dispatch_base: 0x10c0_8860, auxiliary_control: 0 };
 
-/// The DRM compute tuple of `board` ([`Board::g17d_forms`]).
+/// The DRM compute tuple of `board` ([`Board::g17d_forms`]). Where explicit waits take the
+/// completion class ([`Board::completion_inputs`]) it is macOS's M5 Pro form: the J714
+/// preemption offset with the qualified dispatch base, and the auxiliary control set only when
+/// the kick's parent is pipelined.
 pub(crate) fn kick_tuple(board: &Board) -> KickTuple {
-    if board.g17d_forms() { QUALIFIED_TUPLE } else { NORMAL_TUPLE }
+    if board.g17d_forms() {
+        QUALIFIED_TUPLE
+    } else if board.completion_inputs() {
+        KickTuple {
+            preempt_state_offset: NORMAL_TUPLE.preempt_state_offset,
+            dispatch_base: QUALIFIED_TUPLE.dispatch_base,
+            auxiliary_control: u64::from(parent_dependency(board, false) == COMPUTE_PIPELINED_DEPENDENCY),
+        }
+    } else {
+        NORMAL_TUPLE
+    }
 }
 
 const _: () = {

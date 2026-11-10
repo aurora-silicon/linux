@@ -483,6 +483,13 @@ enum drm_asahi_feature {
  */
 #define DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2 ((1ULL) << 33)
 
+/*
+ * DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION: M5: compute commands accept
+ * DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION. A feature bit like those of enum
+ * drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION ((1ULL) << 34)
+
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
 #define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2
 
@@ -2023,6 +2030,15 @@ enum drm_asahi_compute_flags {
 	 * Any bytes after it are zero.
 	 */
 	DRM_ASAHI_COMPUTE_G18_RESOURCES = (1L << 19),
+
+	/**
+	 * @DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION: M5: the command's control
+	 * stream ends with a strong, memory-scoped cache flush, so its writes
+	 * are visible once it completes. A compute command of another queue may
+	 * then wait for it in firmware rather than on the host. Requires
+	 * DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION.
+	 */
+	DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION = (1L << 20),
 };
 
 /**

@@ -319,6 +319,9 @@ pub(crate) trait Backend: Send + Sync {
     /// prefix producers: without the G17D forms an M5 kick may start while its ring
     /// predecessor still runs.
     fn host_producer_waits(&self) -> bool { false }
+    /// Whether a compute command may be waited for in firmware only when it declares that its
+    /// writes are visible at completion (DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION).
+    fn firmware_sources_need_visible_completion(&self) -> bool { false }
     /// The reclaim-safe queue for the scheduler's timeout work, whose handler signals the
     /// fences of timed-out jobs.
     fn fence_queue(&self) -> Arc<workqueue::OwnedQueue>;
