@@ -57,6 +57,8 @@ typedef uint64_t __le64;
 #define kfree free
 #define guard(x) (void)
 #define dev_err(...) ((void)0)
+#define dev_warn(...) ((void)0)
+#define PM_SUSPEND_ON 0
 #define PM_SUSPEND_TO_IDLE 1
 #define RTC_IRQF 0x80
 #define RTC_AF 0x20
@@ -333,6 +335,14 @@ static void run_variant(int v) {
     firmware_suspend = true;
     assert(!apple_pmu_rtc_prepare(&dev));
     firmware_suspend = false;
+    /* Hibernation is accepted: its power-off stops the alarm, and goes on if that fails. */
+    pm_suspend_target_state = PM_SUSPEND_ON;
+    assert(!apple_pmu_rtc_prepare(&dev));
+    assert(!apple_pmu_rtc_set_alarm(&dev, &alarm) && (map.bytes[map.ctrl] & 0x40));
+    assert(!apple_pmu_rtc_poweroff(&dev));
+    assert(!(map.bytes[map.ctrl] & 0x40) && (map.bytes[map.mask] & 1));
+    map.ops = 0; map.fail = 1;
+    assert(!apple_pmu_rtc_poweroff(&dev));
     pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
 }
 int main(void) {

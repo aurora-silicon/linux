@@ -432,17 +432,39 @@ static int apple_pmu_rtc_prepare(struct device *dev)
 	if (rtc->io_failed)
 		return -EBUSY;
 	/*
+	 * Suspend to idle keeps the PMU powered and the alarm wakes the system.
 	 * A firmware-driven suspend programs the wake sources itself, and the
-	 * alarm stays armed in the PMU, which stays powered. Only a sleep state
-	 * without either has no way to bring the alarm back.
+	 * alarm stays armed in the PMU, which stays powered. Hibernation (the
+	 * target state stays PM_SUSPEND_ON) is accepted as well: the alarm is
+	 * stopped before the power-off below. Only a sleep state without any of
+	 * these has no way to bring the alarm back.
 	 */
-	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE && !pm_suspend_via_firmware())
+	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE &&
+	    pm_suspend_target_state != PM_SUSPEND_ON && !pm_suspend_via_firmware())
 		return -EBUSY;
+	return 0;
+}
+
+/*
+ * Whether an armed PMU alarm powers the machine on again after the
+ * hibernation power-off is not established, so do not leave one armed.
+ */
+static int apple_pmu_rtc_poweroff(struct device *dev)
+{
+	struct apple_pmu_rtc *rtc = dev_get_drvdata(dev);
+	int error;
+
+	mutex_lock(&rtc->transaction);
+	error = apple_pmu_rtc_stop_alarm(rtc);
+	mutex_unlock(&rtc->transaction);
+	if (error)
+		dev_warn(dev, "could not stop the alarm before power-off: %d\n", error);
 	return 0;
 }
 
 static const struct dev_pm_ops apple_pmu_rtc_pm = {
 	.prepare = apple_pmu_rtc_prepare,
+	.poweroff = apple_pmu_rtc_poweroff,
 };
 
 static void apple_pmu_rtc_release(void *context)

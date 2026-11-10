@@ -117,6 +117,8 @@ struct apple_spmi {
 	bool notify_irq;
 	bool notify_parked;
 	bool prev_fail;
+	/* The noirq restore rewrote the masks after a resume from disk. */
+	bool hib_resynced;
 };
 
 static void apple_spmi_irq_ack_raw(struct apple_spmi *spmi, u32 irq)
@@ -630,9 +632,6 @@ static int apple_spmi_resume_noirq(struct device *dev)
 	return 0;
 }
 
-static DEFINE_NOIRQ_DEV_PM_OPS(apple_spmi_pm_ops, apple_spmi_suspend_noirq,
-			       apple_spmi_resume_noirq);
-
 static int apple_spmi_probe(struct platform_device *pdev)
 {
 	struct apple_spmi *spmi;
@@ -687,6 +686,108 @@ static int apple_spmi_probe(struct platform_device *pdev)
 
 	return 0;
 }
+
+#ifdef CONFIG_HIBERNATION
+/*
+ * After a resume from disk the controller holds the boot kernel's masks and
+ * pending interrupts, not this kernel's: drop the pending ones and rewrite
+ * the masks from the cache the mask/unmask paths keep, notification IRQ
+ * included.
+ */
+static void apple_spmi_hib_resync_irqs(struct apple_spmi *spmi)
+{
+	u32 nirq = spmi->hw->num_irqs;
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&spmi->irq_mask_lock, flags);
+	/*
+	 * As at probe, drop what is latched: interrupts the boot kernel left
+	 * pending complete a register selection of a device restored now
+	 * before its own answer arrives. The devices read their state afresh.
+	 */
+	for (size_t offset = 0; offset < (nirq + 32) / 8; offset += 4) {
+		writel(0, spmi->regs + SPMI_IRQ_MASK_BASE + offset);
+		writel(U32_MAX, spmi->regs + SPMI_IRQ_ACK_BASE + offset);
+	}
+	for (size_t offset = 0; offset < (nirq + 32) / 8; offset += 4) {
+		u32 val = 0;
+
+		if (offset < nirq / 8)
+			val = bitmap_read(spmi->irq_mask_cache, offset * 8, 32);
+		else if (spmi->notify_irq && offset == (nirq / 32) * 4)
+			val = BIT(nirq % 32);
+		writel(val, spmi->regs + SPMI_IRQ_MASK_BASE + offset);
+	}
+	raw_spin_unlock_irqrestore(&spmi->irq_mask_lock, flags);
+}
+
+static int apple_spmi_restore_noirq(struct device *dev)
+{
+	struct apple_spmi *spmi = dev_get_drvdata(dev);
+
+	/* Hibernation aborted before the image (PMSG_RESTORE then too): nothing restarted. */
+	if (!pm_hibernate_is_restored())
+		return apple_spmi_resume_noirq(dev);
+	if (spmi->irq < 0)
+		return 0;
+
+	apple_spmi_hib_resync_irqs(spmi);
+	spmi->hib_resynced = true;
+
+	return 0;
+}
+
+/*
+ * A controller in a PM domain does not get the callback above: genpd's
+ * restore_noirq ends in the driver's resume_noirq, whatever callback
+ * genpd_finish_resume() was given (outside a wakeup path), and that has
+ * nothing to do after a resume from disk. The masks then stay as the boot
+ * kernel left them: its probe masked everything, and only its own drivers
+ * unmasked theirs before it loaded the image (on T6040 not the Type-C port
+ * controllers, whose driver is a module). The IRQ core disables lazily and
+ * unmasks only an IRQ it recorded as masked, so it does not write them again
+ * either, and the port controllers on nub_spmi_a0/a1 raise no event after the
+ * restore. genpd does not wrap the early restore: catch up there, before the
+ * devices on the bus are restored.
+ */
+static int apple_spmi_restore_early(struct device *dev)
+{
+	struct apple_spmi *spmi = dev_get_drvdata(dev);
+
+	if (spmi->hib_resynced) {
+		spmi->hib_resynced = false;
+		return 0;
+	}
+	if (!pm_hibernate_is_restored() || spmi->irq < 0)
+		return 0;
+
+	/* Commands can run by now: none may have its reply acknowledged away. */
+	scoped_guard(mutex, &spmi->fifo_lock)
+		apple_spmi_hib_resync_irqs(spmi);
+	dev_info(dev, "resume from disk: interrupt masks rewritten in the early restore\n");
+
+	return 0;
+}
+
+#endif
+
+/*
+ * Suspend-to-RAM parks the notification queue; a resume from disk rewrites the
+ * masks, in the early restore where a PM domain kept the noirq one from running.
+ */
+static const struct dev_pm_ops apple_spmi_pm_ops = {
+	.suspend_noirq = pm_sleep_ptr(apple_spmi_suspend_noirq),
+	.resume_noirq = pm_sleep_ptr(apple_spmi_resume_noirq),
+	.freeze_noirq = pm_sleep_ptr(apple_spmi_suspend_noirq),
+	.thaw_noirq = pm_sleep_ptr(apple_spmi_resume_noirq),
+	.poweroff_noirq = pm_sleep_ptr(apple_spmi_suspend_noirq),
+#ifdef CONFIG_HIBERNATION
+	.restore_noirq = apple_spmi_restore_noirq,
+	.restore_early = apple_spmi_restore_early,
+#else
+	.restore_noirq = pm_sleep_ptr(apple_spmi_resume_noirq),
+#endif
+};
 
 static const struct of_device_id apple_spmi_match_table[] = {
 	{ .compatible = "apple,t8142-spmi", .data = &apple_spmi_gen4 },
