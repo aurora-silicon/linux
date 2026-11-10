@@ -102,3 +102,15 @@
 
 /* The same T6050 camera as J716c (J714sAP ADT); the loader sets the J714s sensor type. */
 #include "t6050-j716c-isp.dtsi"
+
+/*
+ * Audio is not brought up: ADT i2c1 has the left sn012776 amplifiers and i2c2 the
+ * cs42l84 codec, so both buses stay off.
+ */
+&i2c1 {
+	status = "disabled";
+};
+
+&i2c2 {
+	status = "disabled";
+};
