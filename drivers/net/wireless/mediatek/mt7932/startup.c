@@ -804,6 +804,11 @@ static const struct cfg80211_ops mt_cfg_ops = {
 	.dump_station = mt_dump_station,
 	.set_power_mgmt = mt_set_power_mgmt,
 	.set_cqm_rssi_config = mt_set_cqm_rssi_config,
+#if IS_ENABLED(CONFIG_MT7932_AWDL)
+	.add_station = mt_awdl_add_station,
+	.del_station = mt_awdl_del_station,
+	.change_station = mt_awdl_change_station,
+#endif
 };
 
 int mt_register_regulatory_gate(struct mt7932 *m)
@@ -829,6 +834,7 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 	set_wiphy_dev(m->wiphy, &m->pdev->dev);
 	ether_addr_copy(m->wiphy->perm_addr, m->mac);
 	m->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
+	mt_awdl_wiphy_setup(m);
 	m->wiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
 	m->wiphy->cipher_suites = ciphers;
 	m->wiphy->n_cipher_suites = ARRAY_SIZE(ciphers);
@@ -943,6 +949,9 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 	m->wiphy_registered = true;
 	mt_policy_debugfs_init(m);
 	ret = mt_register_interface(m);
+	if (ret)
+		return ret;
+	ret = mt_awdl_register(m);
 	if (ret)
 		return ret;
 	WRITE_ONCE(m->interface_registered, true);

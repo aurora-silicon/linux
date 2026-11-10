@@ -165,6 +165,10 @@ static void mt_receive(struct mt7932 *m, const u8 *packet, size_t length)
 		mt_bss_presence(m, &event);
 		goto unlock;
 	}
+	if (IS_ENABLED(CONFIG_MT7932_AWDL) && event.eid == 0xf7) {
+		mt_awdl_event(m, &event);
+		goto unlock;
+	}
 	if (event.eid == 0xd6) {
 		ret = mt7932_cal_null(&m->cal_state, packet + 36,
 				     event.length >= 36 ? event.length - 36 : 0,
@@ -1142,6 +1146,7 @@ static void mt_remove(struct pci_dev *pdev)
 		free_netdev(m->netdev);
 		m->netdev = NULL;
 	}
+	mt_awdl_unregister(m);
 	if (m->wiphy_registered)
 		wiphy_unregister(m->wiphy);
 	if (m->wiphy)

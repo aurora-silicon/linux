@@ -33,6 +33,12 @@ void mt_stop_host(struct mt7932 *m)
 		netif_carrier_off(m->netdev);
 		netif_tx_disable(m->netdev);
 	}
+#if IS_ENABLED(CONFIG_MT7932_AWDL)
+	if (m->awdl.netdev) {
+		netif_carrier_off(m->awdl.netdev);
+		netif_tx_disable(m->awdl.netdev);
+	}
+#endif
 	WRITE_ONCE(m->running, false);
 	mt_write(m, W + 0x204, 0);
 	if (m->irq_requested) {
