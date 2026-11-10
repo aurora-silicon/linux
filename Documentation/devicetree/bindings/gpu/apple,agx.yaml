@@ -111,6 +111,12 @@ properties:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: PMP firmware provider owning the GPU power vote and telemetry
 
+  apple,memory-cache-controller:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      Memory-cache controller accepting GPU stream lifetime releases after
+      parameter-buffer work has retired.
+
   operating-points-v2: true
 
   apple,firmware-version:
@@ -450,6 +456,7 @@ allOf:
         - operating-points-v2
         - apple,cs-opp
         - apple,afr-opp
+        - apple,memory-cache-controller
   - if:
       not:
         properties:

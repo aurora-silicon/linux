@@ -220,6 +220,7 @@
 		mboxes = <&agx_mbox>;
 		power-domains = <&pmp_gfx>;
 		apple,clpc = <&clpc>;
+		apple,memory-cache-controller = <&mcc>;
 		status = "disabled";
 	};
 

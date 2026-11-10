@@ -352,6 +352,7 @@
 		reg-names = "asc", "sgx";
 		mboxes = <&agx_mbox>;
 		power-domains = <&ps_gfx>;
+		apple,memory-cache-controller = <&mcc>;
 	};
 
 	agx_mbox: mailbox@28a600000 {
