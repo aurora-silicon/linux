@@ -66,31 +66,45 @@ int asahi_g17_pmp_request(struct device *dev, bool enable)
 	return ret;
 }
 
-static int asahi_g17_ps(struct device *dev, struct regmap **regmap, u32 *offset)
+static bool asahi_g17_is_pwrstate(struct device_node *np)
+{
+	return of_device_is_compatible(np, "apple,t8103-pmgr-pwrstate") ||
+	       of_device_is_compatible(np, "apple,pmgr-pwrstate");
+}
+
+/*
+ * The GPU's PMGR state word. Where a PMP report entry stands in front of it (T6040:
+ * power-domains = pmp-gfx, whose own domain is the PMGR's gfx), follow that entry's
+ * domain down to the word.
+ */
+static struct device_node *asahi_g17_ps_node(struct device *dev)
 {
 	struct device_node *np, *next;
-	int hops, ret;
+	int hops;
 
 	np = of_parse_phandle(dev->of_node, "power-domains", 0);
-	/*
-	 * The GPU's PMGR state word. Where a PMP report entry stands in front of it
-	 * (T6041: power-domains = pmp-gfx, whose own domain is the PMGR's gfx), follow
-	 * that entry's domain down to the word.
-	 */
-	for (hops = 0; np && hops < 2 &&
-	     !of_device_is_compatible(np, "apple,t8103-pmgr-pwrstate") &&
-	     !of_device_is_compatible(np, "apple,pmgr-pwrstate"); hops++) {
+	for (hops = 0; np && hops < 2 && !asahi_g17_is_pwrstate(np); hops++) {
 		next = of_parse_phandle(np, "power-domains", 0);
 		of_node_put(np);
 		np = next;
 	}
 	if (!np)
-		return -EINVAL;
-	if (!of_device_is_compatible(np, "apple,t8103-pmgr-pwrstate") &&
-	    !of_device_is_compatible(np, "apple,pmgr-pwrstate")) {
+		return ERR_PTR(-EINVAL);
+	if (!asahi_g17_is_pwrstate(np)) {
 		of_node_put(np);
-		return -ENODEV;
+		return ERR_PTR(-ENODEV);
 	}
+
+	return np;
+}
+
+static int asahi_g17_ps(struct device *dev, struct regmap **regmap, u32 *offset)
+{
+	struct device_node *np = asahi_g17_ps_node(dev);
+	int ret;
+
+	if (IS_ERR(np))
+		return PTR_ERR(np);
 	ret = of_property_read_u32(np, "reg", offset);
 	if (!ret) {
 		*regmap = np->parent ? syscon_node_to_regmap(np->parent) : ERR_PTR(-EINVAL);
@@ -332,10 +346,12 @@ struct asahi_g17_commit *asahi_g17_commit_prepare(struct device *dev,
 			goto err;
 	}
 
-	ret = -ENODEV;
-	np = of_parse_phandle(dev->of_node, "power-domains", 0);
-	if (!np)
+	np = asahi_g17_ps_node(dev);
+	if (IS_ERR(np)) {
+		ret = PTR_ERR(np);
 		goto err;
+	}
+	ret = -ENODEV;
 	if (!of_property_read_u32(np, "reg", &offset) && np->parent)
 		c->ps = asahi_g17_map(np->parent, NULL, 0, offset, 4);
 	of_node_put(np);
