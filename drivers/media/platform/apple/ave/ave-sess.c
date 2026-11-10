@@ -25,10 +25,6 @@
 #include "ave.h"
 #include "ave-regs.h"
 
-#define AVE_RC_VBR 4
-#define AVE_RC_CBR 2
-#define AVE_RC_CQ 3
-
 /* Filler-data NAL unit types */
 #define AVE_H264_NAL_FILLER 12
 #define AVE_HEVC_NAL_FILLER 38
@@ -179,8 +175,9 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	if (ctx->ave->layout->kind == AVE_LAYOUT_6070 && p->sample_bytes != 1)
 		return -EOPNOTSUPP;
 	/*
-	 * The 6070 path is qualified for 8-bit H.264 with frame widths in whole
-	 * macroblocks; HEVC and wider-than-coded widths are not yet.
+	 * The 6070 path is qualified for 8-bit H.264 (low delay and one B per
+	 * P) with frame widths in whole macroblocks; HEVC and wider-than-coded
+	 * widths are not yet.
 	 */
 	if (ctx->ave->layout->kind == AVE_LAYOUT_6070 &&
 	    (p->codec != AVE_CODEC_H264 || p->width % 16))
@@ -201,9 +198,6 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	 */
 	p->intra_only = p->codec == AVE_CODEC_H264 && ctx->gop_size == 1;
 	p->bframes = !baseline && !p->intra_only && ctx->b_frames;
-	/* 6070: low-delay only for now (I and P pictures, two references). */
-	if (ctx->ave->layout->kind == AVE_LAYOUT_6070)
-		p->bframes = false;
 	p->reorder_off = !ctx->b_frames;
 	p->refs = p->intra_only ? 1 : p->bframes ? 5 : 2;
 	p->slots = p->bframes ? 5 : 3;
@@ -288,7 +282,7 @@ struct ave_buf_req {
 
 #define AVE_MAX_BUF_REQS \
 	(3 + 6 * AVE_MAX_REFS + 3 + 4 * AVE_NEIGHBOUR_SETS + \
-	 2 * AVE_ENTROPY_SETS * AVE_TILE_BUFS + 2 + 4 * AVE_MAX_SLOTS)
+	 2 * AVE_ENTROPY_SETS * AVE_TILE_BUFS + 4 + 4 * AVE_MAX_SLOTS)
 
 static int ave_buf_req_cmp(const void *a, const void *b)
 {
@@ -351,8 +345,8 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 		}
 	}
 
-	if (fw6070 && !hevc && p->bit_depth == 8) {
-		ref_a = ave_6070_avc_recon_layout(w, h).bytes;
+	if (fw6070) {
+		ref_a = ave_6070_recon_layout(w, h, p->bit_depth).bytes;
 	} else {
 		ref_a = ALIGN(w, 32) * ALIGN(h + 16, 32);
 		if (p->bit_depth == 10)
@@ -387,7 +381,7 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 	}
 	for (unsigned int i = 0; i < p->refs; i++) {
 		ave_req(r, &n, &sess->ref_a[i], ref_a,
-			fw6070 && !hevc && p->bit_depth == 8 ? 0 : ref_a * 3 / 2,
+			fw6070 ? 0 : ref_a * 3 / 2,
 			nomap);
 		ave_req(r, &n, &sess->ref_b[i], ref_b, ref_b * 5 / 4, nomap);
 		ave_req(r, &n, &sess->ref_c[i], ref_c, 0, nomap);
@@ -432,6 +426,10 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 				fw6070 ? ave_6070_mb_input_size(w, h) :
 					 ALIGN(w * h32, SZ_16K),
 				0, nomap);
+	if (fw6070 && hevc)
+		for (unsigned int i = 0; i < 2; i++)
+			ave_req(r, &n, &sess->hevc_transcoded[i],
+				ave_6070_transcoded_size(p->coded_cap), 0, nomap);
 	for (unsigned int s = 0; s < p->slots; s++) {
 		ave_req(r, &n, &sess->slot[s].coded, p->coded_cap, 0, 0);
 		ave_req(r, &n, &sess->slot[s].meta, fw->meta_bytes, 0, 0);
@@ -496,6 +494,8 @@ static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
 		}
 	for (unsigned int i = 0; i < 2; i++)
 		ave_free(ave, &sess->hevc_extra[i]);
+	for (unsigned int i = 0; i < 2; i++)
+		ave_free(ave, &sess->hevc_transcoded[i]);
 	for (unsigned int s = 0; s < AVE_MAX_SLOTS; s++) {
 		ave_free(ave, &sess->slot[s].coded);
 		ave_free(ave, &sess->slot[s].meta);

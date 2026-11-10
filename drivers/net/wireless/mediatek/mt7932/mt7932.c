@@ -9,6 +9,8 @@
 #include "mt7932.h"
 #include "wow.h"
 
+#include <kunit/static_stub.h>
+
 #include <linux/pm_wakeup.h>
 #include <linux/suspend.h>
 
@@ -467,6 +469,8 @@ int mt_request_ext(struct mt7932 *m, u8 cid, u8 ext, bool runtime, bool set, boo
 int mt_request(struct mt7932 *m, u8 cid, bool runtime, bool set, bool wait,
 		      const void *payload, size_t length)
 {
+	KUNIT_STATIC_STUB_REDIRECT(mt_request, m, cid, runtime, set, wait,
+				   payload, length);
 	return mt_request_ext(m, cid, 0, runtime, set, wait, payload, length);
 }
 

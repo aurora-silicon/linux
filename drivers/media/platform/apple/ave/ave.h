@@ -33,6 +33,11 @@ struct iommu_domain;
 struct ave_vb2_mem;
 
 /* Frames the firmware can hold at once per session (Process "slots"). */
+/* Firmware rate-control modes in struct ave_params.rc_mode */
+#define AVE_RC_CBR 2
+#define AVE_RC_CQ 3
+#define AVE_RC_VBR 4
+
 #define AVE_MAX_SLOTS 7
 /* Sessions one firmware boot serves at once (macOS was seen running two). */
 #define AVE_MAX_SESSIONS 2
@@ -296,7 +301,7 @@ struct ave_params {
 	bool intra_only;
 	bool reorder_off; /* the client asked for no B-frames */
 	u32 gop;
-	u32 rc_mode;
+	u32 rc_mode; /* AVE_RC_* */
 	u32 bitrate;
 	u32 limit_bytes; /* 0: no data-rate limit */
 	s32 min_qp;
@@ -367,6 +372,7 @@ struct ave_session {
 	struct ave_buf tile[AVE_ENTROPY_SETS][AVE_TILE_BUFS];
 	struct ave_buf tile_aux[AVE_ENTROPY_SETS][AVE_TILE_BUFS];
 	struct ave_buf hevc_extra[2];
+	struct ave_buf hevc_transcoded[2];
 	u8 *codec_state;
 	size_t codec_state_bytes;
 	struct ave_slot slot[AVE_MAX_SLOTS];
@@ -492,7 +498,7 @@ void ave_write_surface(const struct ave_fw_layout *fw, u8 *cmd,
 int ave_build_start(struct ave_ctx *ctx, u8 *cmd, size_t len);
 int ave_build_process(struct ave_ctx *ctx, u8 *cmd, size_t len,
 		      unsigned int slot, dma_addr_t input, u32 bitrate,
-		      bool force_key);
+		      bool force_key, bool last);
 int ave_init_codec_state(struct ave_session *sess);
 
 /* ave-cmd.c */
@@ -502,7 +508,7 @@ int ave_cmd_open(struct ave_ctx *ctx);
 int ave_cmd_start(struct ave_ctx *ctx);
 int ave_cmd_process(struct ave_ctx *ctx, unsigned int slot,
 		    struct vb2_v4l2_buffer *src, dma_addr_t input, u32 bitrate,
-		    bool force_key);
+		    bool force_key, bool last);
 int ave_cmd_complete(struct ave_ctx *ctx, unsigned int count);
 int ave_cmd_flush(struct ave_ctx *ctx);
 int ave_cmd_close(struct ave_ctx *ctx);

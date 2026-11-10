@@ -8,6 +8,17 @@
 #include <linux/unaligned.h>
 
 #define PMP_DVFS_VALID BIT_ULL(61)
+/* Main (default) request level: bits 4:0. */
+#define PMP_DVFS_MAIN_LEVEL_MAX		0x1f
+/* Request classes 0x21..0x25: four-bit lanes from bit 32 upwards. */
+#define PMP_DVFS_CLASS_FIRST		0x21
+#define PMP_DVFS_CLASS_LAST		0x25
+#define PMP_DVFS_CLASS_COUNT		(PMP_DVFS_CLASS_LAST - PMP_DVFS_CLASS_FIRST + 1)
+#define PMP_DVFS_CLASS_LEVEL_MAX	0xf
+#define PMP_DVFS_CLASS_SHIFT		32
+#define PMP_DVFS_CLASS_BITS		4
+/* <class level> pairs, each class at most once */
+#define PMP_DVFS_CLASS_CELLS_MAX	(2 * PMP_DVFS_CLASS_COUNT)
 
 #define PMP_SOC_DEVICE_SIZE	0x7c
 #define PMP_SOC_DEVICE_ACK	BIT(1)
@@ -25,26 +36,38 @@ static inline u64 apple_pmp_request_word(u64 found, u64 known, u64 shadow)
 }
 
 /*
- * A SOC-DEV-DVFS request word: the valid bit, and the level either in the
- * default five-bit lane at bits 4:0 or, for request classes 0x21 through
- * 0x25, in the four-bit lane at bits 35:32 through 51:48.
+ * A complete SOC-DEV-DVFS request word: the valid bit, an optional main level
+ * in bits 4:0, and zero or more <request-class level> pairs. Classes 0x21
+ * through 0x25 occupy the four-bit lanes at bits 35:32 through 51:48.
  */
-static inline bool apple_pmp_dvfs_word(u32 request_class, u32 level, u64 *word)
+static inline bool apple_pmp_dvfs_word(u32 main_level, const u32 *class_levels,
+				       size_t cells, u64 *word)
 {
-	u32 shift;
+	u32 classes = 0;
+	u64 value;
+	size_t i;
 
-	if (!word)
+	if (!word || main_level > PMP_DVFS_MAIN_LEVEL_MAX || cells % 2 ||
+	    (cells && !class_levels) || cells > PMP_DVFS_CLASS_CELLS_MAX)
 		return false;
-	if (!request_class) {
-		if (level > 0x1f)
+	value = PMP_DVFS_VALID | main_level;
+	for (i = 0; i < cells; i += 2) {
+		u32 request_class = class_levels[i];
+		u32 level = class_levels[i + 1];
+		u32 index, shift;
+
+		if (request_class < PMP_DVFS_CLASS_FIRST ||
+		    request_class > PMP_DVFS_CLASS_LAST ||
+		    level > PMP_DVFS_CLASS_LEVEL_MAX)
 			return false;
-		*word = PMP_DVFS_VALID | level;
-		return true;
+		index = request_class - PMP_DVFS_CLASS_FIRST;
+		if (classes & BIT(index))
+			return false;
+		classes |= BIT(index);
+		shift = PMP_DVFS_CLASS_SHIFT + PMP_DVFS_CLASS_BITS * index;
+		value |= (u64)level << shift;
 	}
-	if (request_class < 0x21 || request_class > 0x25 || level > 0xf)
-		return false;
-	shift = 32 + 4 * (request_class - 0x21);
-	*word = PMP_DVFS_VALID | (u64)level << shift;
+	*word = value;
 	return true;
 }
 

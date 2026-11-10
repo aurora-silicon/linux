@@ -2363,23 +2363,55 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	}
 	ent->sleep_release = of_property_read_bool(node, "apple,release-for-sleep");
 	if (of_property_present(node, "apple,dvfs")) {
-		u32 request_class = 0;
+		u32 class_levels[PMP_DVFS_CLASS_CELLS_MAX];
+		u32 off_levels[PMP_DVFS_CLASS_CELLS_MAX];
+		u32 request_class;
 		u32 dvfs[2];
+		int cells = 0, i;
 
-		if (of_property_read_u32(node, "apple,dvfs-request-class",
-					 &request_class) &&
-		    of_property_present(node, "apple,dvfs-request-class")) {
-			ret = dev_err_probe(dev, -EINVAL,
-					    "invalid apple,dvfs-request-class\n");
+		ret = of_property_read_u32_array(node, "apple,dvfs", dvfs, 2);
+		if (ret || of_property_count_u32_elems(node, "apple,dvfs") != 2) {
+			ret = dev_err_probe(dev, -EINVAL, "invalid apple,dvfs\n");
 			goto err_free;
 		}
-		ret = of_property_read_u32_array(node, "apple,dvfs", dvfs, 2);
-		if (ret || of_property_count_u32_elems(node, "apple,dvfs") != 2 ||
-		    !rep || !rep->offsets->update ||
+		if (of_property_present(node, "apple,dvfs-request-levels")) {
+			if (of_property_present(node, "apple,dvfs-request-class")) {
+				ret = dev_err_probe(dev, -EINVAL,
+						    "both DVFS request-class properties present\n");
+				goto err_free;
+			}
+			cells = of_property_count_u32_elems(node,
+						     "apple,dvfs-request-levels");
+			if (cells <= 0 || cells > (int)ARRAY_SIZE(class_levels) ||
+			    of_property_read_u32_array(node, "apple,dvfs-request-levels",
+						       class_levels, cells)) {
+				ret = dev_err_probe(dev, -EINVAL,
+						    "invalid apple,dvfs-request-levels\n");
+				goto err_free;
+			}
+		} else if (of_property_present(node, "apple,dvfs-request-class")) {
+			if (of_property_read_u32(node, "apple,dvfs-request-class",
+						 &request_class)) {
+				ret = dev_err_probe(dev, -EINVAL,
+						    "invalid apple,dvfs-request-class\n");
+				goto err_free;
+			}
+			/* Legacy DTs put their only class level in apple,dvfs[1]. */
+			class_levels[0] = request_class;
+			class_levels[1] = dvfs[1];
+			cells = 2;
+			dvfs[1] = 0;
+		}
+		/* Releasing the request writes the same classes at level 0. */
+		for (i = 0; i < cells; i += 2) {
+			off_levels[i] = class_levels[i];
+			off_levels[i + 1] = 0;
+		}
+		if (!rep || !rep->offsets->update ||
 		    dvfs[0] < rep->offsets->dvfs_first ||
 		    dvfs[0] >= rep->offsets->dvfs_first + rep->offsets->dvfs_count ||
-		    !apple_pmp_dvfs_word(request_class, 0, &ent->dvfs_off) ||
-		    !apple_pmp_dvfs_word(request_class, dvfs[1], &ent->dvfs_on)) {
+		    !apple_pmp_dvfs_word(0, off_levels, cells, &ent->dvfs_off) ||
+		    !apple_pmp_dvfs_word(dvfs[1], class_levels, cells, &ent->dvfs_on)) {
 			ret = dev_err_probe(dev, -EINVAL, "invalid apple,dvfs\n");
 			goto err_free;
 		}
