@@ -41,6 +41,7 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
+#include <linux/phy/apple-t6040-cio.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
@@ -48,11 +49,12 @@
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/tunable.h>
+#include <linux/suspend.h>
+#include <linux/usb/pd.h>
 #include <linux/usb/typec_mux.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_tbt.h>
-#include <linux/usb/pd_vdo.h>
 
 #define T6040_USB2_USBCTL		0x00
 #define T6040_USB2_USBCTL_MODE		GENMASK(2, 0)
@@ -124,10 +126,8 @@
 #define T6040_CORE_CMN_OVRD_SLEEP_B_BIG	BIT(0)
 #define T6040_CORE_CMN_OVRD_SLEEP_B_SML	BIT(2)
 #define T6040_CORE_CMN_OVRD_CLAMP	BIT(4)
-#define T6040_CORE_LANE_RX		0x10	/* CFG1_TOP */
+#define T6040_CORE_CFG1_TOP		0x10	/* ACIOPHY_TOP_BLK_CFG1_TOP: per-lane RX power */
 #define T6040_CORE_SLP_CTRL		0x120	/* CFG_SLP_CTRL */
-#define T6040_CORE_LN0_RX_TOP_CIO	0x935c
-#define T6040_CORE_LN1_RX_TOP_CIO	0x1935c
 #define T6040_CORE_CMN_BIAS		0xa00	/* AUS40CMN_SHM CMN_BIAS_REG */
 #define T6040_CORE_CMN_BIAS_BGBIAS_EN_OV	BIT(1)
 #define T6040_CORE_UC_CTRL		0x260	/* ACIOPHY_TOP_BLK_UC_CTRL_REG */
@@ -292,7 +292,6 @@ struct t6040_usb2_phy {
 	bool usb3_pipe;		/* dwc3 asked for the PIPE switch this power cycle */
 	bool usb3_lent;		/* DP mode took the lanes of this Type-C port */
 	bool pipe_switched;	/* the controller's PIPE runs on this PHY */
-	bool cio_up;		/* the lanes run USB4/Thunderbolt */
 
 	/* DisplayPort; dp_ok is false when the DT lacks a DP route */
 	struct phy *dp;
@@ -305,6 +304,17 @@ struct t6040_usb2_phy {
 	bool dp_mode_flip;
 	bool dp_flip;		/* plug orientation reversed for the DP lanes */
 	int dp_rate;		/* link rate index of the running link sequence, -1 = off */
+
+	/* CIO (USB4/Thunderbolt); cio_ok is false unless the DT has the CIO tables */
+	struct apple_tunable *cio_tunables[5];
+	bool cio_ok;
+	bool cio_up;		/* PHY in mode 2, holds a runtime PM reference */
+	bool pipe_tunneled;	/* the controller's PIPE runs on the USB4 router */
+	u8 tun_rate[2];		/* DP tunnel link rate per DP IN adapter, 0 = off */
+	bool tun_pll;		/* AUSPLL programmed for DP tunnels */
+	bool router_running;	/* the USB4 router runs on this port's CIO link */
+	bool usb3_tunnel_req;	/* the router carries USB3 for the controller */
+	bool cio_flip;
 };
 
 static inline void t6040_usb2_mask32(void __iomem *reg, u32 mask, u32 set)
@@ -677,19 +687,16 @@ static int t6040_usb3_cpu_start(struct t6040_usb2_phy *tphy)
 }
 
 /*
- * C: runFirmware. macOS starts the coprocessor on every attach and stops it on
- * every detach; each start makes the firmware tune the PHY. Then release the
- * PHY reset (D).
+ * Part C of the PHY init from the delay after the lane swap on, for the modes
+ * that run the PHY firmware (USB3 and CIO): the firmware start, the tune-done
+ * poll and the reset release (D). @what and @lane only label the log.
  */
-static int t6040_usb3_run_firmware(struct t6040_usb2_phy *tphy, bool usb, bool swap)
+static int t6040_phy_run_firmware(struct t6040_usb2_phy *tphy, const char *what, int lane)
 {
 	void __iomem *cpu = t6040_cpu(tphy);
 	u32 uc_before;
 	int ret;
 
-	if (usb)
-		t6040_usb2_mask32(t6040_cfg(tphy) + T6040_CFG_SPARE0, T6040_CFG_SPARE0_USB_LN_SWAP,
-				  swap ? T6040_CFG_SPARE0_USB_LN_SWAP : 0);
 	fsleep(20);
 	t6040_usb2_set32(cpu + T6040_CPU_IDLE_CTRL, T6040_CPU_IDLE_CTRL_EN);
 	fsleep(10);
@@ -698,25 +705,37 @@ static int t6040_usb3_run_firmware(struct t6040_usb2_phy *tphy, bool usb, bool s
 	if (!tphy->rtk || !apple_rtkit_is_running(tphy->rtk)) {
 		ret = t6040_usb3_cpu_start(tphy);
 		if (ret) {
-			dev_err(tphy->dev, "USB3: the PHY coprocessor was not started: %d (run %#x, idle %#x, status %#x)\n",
-				ret, readl(cpu + T6040_CPU_RUN),
+			dev_err(tphy->dev, "%s: the PHY coprocessor was not started: %d (run %#x, idle %#x, status %#x)\n",
+				what, ret, readl(cpu + T6040_CPU_RUN),
 				readl(cpu + T6040_CPU_IDLE_CTRL), readl(cpu + T6040_CPU_STATUS));
 			return ret;
 		}
 	}
 	ret = t6040_usb3_wait_tuned(tphy);
 	if (ret) {
-		dev_err(tphy->dev, "USB3: the PHY coprocessor did not tune the PHY (uc %#x -> %#x, idle %#x, status %#x)\n",
-			uc_before, readl(t6040_core(tphy) + T6040_CORE_UC_CTRL),
+		dev_err(tphy->dev, "%s: the PHY coprocessor did not tune the PHY (uc %#x -> %#x, idle %#x, status %#x)\n",
+			what, uc_before, readl(t6040_core(tphy) + T6040_CORE_UC_CTRL),
 			readl(cpu + T6040_CPU_IDLE_CTRL), readl(cpu + T6040_CPU_STATUS));
 		return ret;
 	}
 
-	dev_info(tphy->dev, "USB3 PHY tuned: lane %d, coprocessor started, uc %#x -> %#x\n", swap,
-		 uc_before, readl(t6040_core(tphy) + T6040_CORE_UC_CTRL));
+	dev_info(tphy->dev, "%s PHY tuned: lane %d, coprocessor started, uc %#x -> %#x\n", what,
+		 lane, uc_before, readl(t6040_core(tphy) + T6040_CORE_UC_CTRL));
 	t6040_usb2_set32(t6040_cfg(tphy) + T6040_CFG_CTRL, T6040_CFG_CTRL_PHY_RESET_N);
 	fsleep(100);
 	return 0;
+}
+
+/*
+ * C: the firmware start. The coprocessor is started on every attach and stopped on
+ * every detach; each start makes the firmware tune the PHY. Then release the
+ * PHY reset (D).
+ */
+static int t6040_usb3_run_firmware(struct t6040_usb2_phy *tphy, bool swap)
+{
+	t6040_usb2_mask32(t6040_cfg(tphy) + T6040_CFG_SPARE0, T6040_CFG_SPARE0_USB_LN_SWAP,
+			  swap ? T6040_CFG_SPARE0_USB_LN_SWAP : 0);
+	return t6040_phy_run_firmware(tphy, "USB3", swap);
 }
 
 /*
@@ -915,15 +934,15 @@ static void t6040_usb3_bist_off(struct t6040_usb2_phy *tphy)
 }
 
 /*
- * aciophy_phy_shutdown_partA: the PHY's USB link side down (the same BIST
- * handshake as the PIPE switch), both TX lanes, then the common block.
+ * Part A of the PHY shutdown for every firmware mode: both TX lanes
+ * powered down, then the common block shut down.
  */
-/* aciophy_tx_powerdown(0), (1), then aciophy_cmn_shutdown: USB and CIO alike. */
-static void t6040_phy_tx_cmn_down(struct t6040_usb2_phy *tphy)
+static void t6040_phy_tx_cmn_shutdown(struct t6040_usb2_phy *tphy)
 {
 	void __iomem *core = t6040_core(tphy);
 	unsigned int lane;
 
+	/* The TX power-down of lane 0, then of lane 1 */
 	for (lane = 0; lane < 2; lane++) {
 		t6040_usb2_set32(core + T6040_CORE_SLP_CTRL, 0x100 << lane);
 		udelay(1);
@@ -944,6 +963,10 @@ static void t6040_phy_tx_cmn_down(struct t6040_usb2_phy *tphy)
 	udelay(1);
 }
 
+/*
+ * Part A of the PHY shutdown: the PHY's USB link side down (the same BIST
+ * handshake as the PIPE switch), both TX lanes, then the common block.
+ */
 static void t6040_usb3_shutdown_lanes(struct t6040_usb2_phy *tphy)
 {
 	void __iomem *bist = t6040_bist(tphy);
@@ -959,8 +982,8 @@ static void t6040_usb3_shutdown_lanes(struct t6040_usb2_phy *tphy)
 	t6040_usb3_bist_wait(tphy, T6040_BIST_STATUS_PHY_2, true, 1000);
 	t6040_usb2_clear32(bist + T6040_BIST_CFG0, BIT(0));
 
-	t6040_phy_tx_cmn_down(tphy);
-	fsleep(200);
+	t6040_phy_tx_cmn_shutdown(tphy);
+	fsleep(200);	/* the PHY shutdown waits 200 us after part A */
 }
 
 static int t6040_usb3_pipe_lock(struct t6040_usb2_phy *tphy, unsigned int ms)
@@ -1071,9 +1094,15 @@ static void t6040_usb3_up_locked(struct t6040_usb2_phy *tphy)
 	lockdep_assert_held(&tphy->lock);
 	if (!tphy->usb3_ok || tphy->usb3_up)
 		return;
-	/* DP and CIO own all four lanes; USB3 comes back in t6040_usb3_reclaim_locked(). */
-	if (tphy->dp_up || tphy->cio_up) {
+	/* DP mode owns all four lanes; USB3 comes back in t6040_usb3_reclaim_locked(). */
+	if (tphy->dp_up) {
 		dev_dbg(tphy->dev, "USB3: lanes held by DP, USB2 only for now\n");
+		return;
+	}
+	/* CIO owns both lanes; USB3 comes back in t6040_usb3_reclaim_locked() after it. */
+	if (tphy->cio_up) {
+		dev_dbg(tphy->dev, "USB3: lanes held by CIO, USB2 only for now\n");
+		tphy->usb3_lent = true;
 		return;
 	}
 
@@ -1105,7 +1134,7 @@ retry:
 		goto sleep;	/* the coprocessor block may be unclocked: never touch it */
 	t6040_usb3_tunables(tphy);
 	t6040_usb3_lanes(tphy, swap);
-	ret = t6040_usb3_run_firmware(tphy, true, swap);
+	ret = t6040_usb3_run_firmware(tphy, swap);
 	if (ret)
 		goto retry_or_fail;
 
@@ -1131,6 +1160,8 @@ failed:
 	dev_warn(tphy->dev, "USB3 PHY bring-up failed (%d), USB2 only\n", ret);
 }
 
+static void t6040_cio_pipe_update_locked(struct t6040_usb2_phy *tphy);
+
 static int t6040_usb3_power_on(struct phy *phy)
 {
 	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
@@ -1147,6 +1178,11 @@ static void t6040_usb3_down_locked(struct t6040_usb2_phy *tphy)
 	if (tphy->pipe_switched) {
 		t6040_usb3_pipe_park(tphy);
 		tphy->pipe_switched = false;
+	}
+	/* The USB3 mode 0 from 3: the park from the USB4 router uses the same writes. */
+	if (tphy->pipe_tunneled) {
+		t6040_usb3_pipe_park(tphy);
+		tphy->pipe_tunneled = false;
 	}
 	/* DWC3 can drop its role before the DP fabric has released pin D. */
 	if (tphy->dp_up && tphy->dp_mode_two_lanes)
@@ -1190,6 +1226,10 @@ static int t6040_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 
 	guard(mutex)(&tphy->lock);
 	tphy->usb3_pipe = true;
+	if (tphy->cio_up) {
+		t6040_cio_pipe_update_locked(tphy);
+		return 0;
+	}
 	if (!tphy->usb3_up || tphy->pipe_switched)
 		return 0;
 	t6040_usb3_pipe_switch(tphy);
@@ -1615,176 +1655,6 @@ static void t6040_usb3_reclaim_locked(struct t6040_usb2_phy *tphy)
 	dev_info(tphy->dev, "USB3 %s after DP\n", tphy->usb3_up ? "back" : "not restored");
 }
 
-/* ---- CIO: USB4 and Thunderbolt on both lanes ---- */
-
-/* The ADT tables of the common set, then the CIO ones; no DPTX writes. */
-static void t6040_cio_tunables(struct t6040_usb2_phy *tphy)
-{
-	void __iomem *core = t6040_core(tphy);
-	size_t i;
-
-	for (i = 0; i < T6040_USB3_NR_TUNABLES; i++)
-		apple_tunable_apply(tphy->regs[t6040_usb3_tunable_list[i].region],
-				    tphy->tunables[i]);
-	/* tunable_LN0/1_RX_TOP_CIO_DFLT; UC_REGS_CIO and RX_EQ_CIO are empty. */
-	t6040_usb2_clear32(core + T6040_CORE_LN0_RX_TOP_CIO, 0xe00);
-	t6040_usb2_clear32(core + T6040_CORE_LN1_RX_TOP_CIO, 0xe00);
-}
-
-/* aciophy_xbar_config, mode 2: orientation is one crossbar bit. */
-static void t6040_cio_xbar(struct t6040_usb2_phy *tphy, bool flip)
-{
-	void __iomem *core = t6040_core(tphy);
-
-	t6040_usb2_clear32(core + T6040_CORE_XBAR, 0xfc);
-	t6040_usb2_mask32(core + T6040_CORE_XBAR_LANES, 0x1f, flip ? 1 : 0);
-	t6040_usb2_mask32(core + T6040_CORE_XBAR, 0x3, 0x2);
-}
-
-/* aciophy_slpctrl_init, mode 2: both lanes, whatever the orientation. */
-static void t6040_cio_lanes_on(struct t6040_usb2_phy *tphy)
-{
-	static const struct { u32 off, bit; bool set; } steps[] = {
-		{ T6040_CORE_LANE_RX, 0x10, true }, { T6040_CORE_LANE_RX, 0x40, true },
-		{ T6040_CORE_LANE_RX, 0x1, true }, { T6040_CORE_LANE_RX, 0x4, true },
-		{ T6040_CORE_CMN_OVRD, 0x400, true }, { T6040_CORE_CMN_OVRD, 0x1000, true },
-		{ T6040_CORE_CMN_OVRD, 0x40, true }, { T6040_CORE_CMN_OVRD, 0x100, true },
-		{ T6040_CORE_CMN_OVRD, 0x4000, false }, { T6040_CORE_CMN_OVRD, 0x10000, true },
-		{ T6040_CORE_SLP_CTRL, 0x40, false }, { T6040_CORE_SLP_CTRL, 0x4, false },
-		{ T6040_CORE_SLP_CTRL, 0x400, false },
-	};
-	void __iomem *core = t6040_core(tphy);
-	unsigned int lane;
-	size_t i;
-
-	t6040_usb2_clear32(core + T6040_CORE_CMN_OVRD, 0x2a);
-	udelay(1);
-	for (lane = 0; lane < 2; lane++) {
-		for (i = 0; i < ARRAY_SIZE(steps); i++) {
-			if (steps[i].set)
-				t6040_usb2_set32(core + steps[i].off, steps[i].bit << lane);
-			else
-				t6040_usb2_clear32(core + steps[i].off, steps[i].bit << lane);
-			udelay(1);
-		}
-	}
-}
-
-/* aciophy_rx_powerdown(0), (1): CIO powers the receivers down, USB does not. */
-static void t6040_cio_rx_down(struct t6040_usb2_phy *tphy)
-{
-	void __iomem *core = t6040_core(tphy);
-	unsigned int lane;
-
-	for (lane = 0; lane < 2; lane++) {
-		t6040_usb2_set32(core + T6040_CORE_CMN_OVRD, 0x4000 << lane);
-		udelay(1);
-		t6040_usb2_clear32(core + T6040_CORE_CMN_OVRD, 0x40 << lane);
-		udelay(1);
-		t6040_usb2_clear32(core + T6040_CORE_CMN_OVRD, 0x400 << lane);
-		udelay(1);
-		t6040_usb2_clear32(core + T6040_CORE_LANE_RX, 0x1 << lane);
-		udelay(1);
-		t6040_usb2_clear32(core + T6040_CORE_LANE_RX, 0x10 << lane);
-		udelay(1);
-	}
-}
-
-/* The Type-C state that needs CIO: USB4 entered, or the Thunderbolt alt mode. */
-static bool t6040_cio_state(const struct typec_mux_state *state)
-{
-	if (state->alt)
-		return state->alt->svid == USB_TYPEC_TBT_SID;
-	if (state->mode != TYPEC_MODE_USB4 || !state->data)
-		return false;
-	return FIELD_GET(EUDO_USB_MODE_MASK,
-			 ((const struct enter_usb_data *)state->data)->eudo) == EUDO_USB_MODE_USB4;
-}
-
-static int t6040_cio_up_locked(struct t6040_usb2_phy *tphy)
-{
-	bool cycle;
-	bool flip;
-	int ret;
-
-	lockdep_assert_held(&tphy->lock);
-	if (!tphy->usb3_ok || tphy->dp_up)
-		return -EBUSY;
-	switch (tphy->orientation) {
-	case TYPEC_ORIENTATION_NORMAL:
-		flip = false;
-		break;
-	case TYPEC_ORIENTATION_REVERSE:
-		flip = true;
-		break;
-	default:
-		dev_warn(tphy->dev, "CIO: no plug orientation\n");
-		return -EINVAL;
-	}
-	if (tphy->usb3_up || tphy->pipe_switched)
-		t6040_usb3_down_locked(tphy);
-	tphy->usb3_lent = tphy->usb3_on;
-
-	ret = pm_runtime_resume_and_get(tphy->dev);
-	if (ret)
-		return ret;
-
-	cycle = t6040_recovery_start(&tphy->recovery);
-retry:
-	if (cycle) {
-		ret = t6040_usb3_hard_recover(tphy);
-		if (ret)
-			goto put;
-	}
-
-	ret = t6040_usb3_wake(tphy);
-	if (ret)
-		goto sleep;	/* the coprocessor block may be unclocked: never touch it */
-	t6040_cio_tunables(tphy);
-	t6040_cio_xbar(tphy, flip);
-	t6040_cio_lanes_on(tphy);
-	ret = t6040_usb3_run_firmware(tphy, false, flip);
-	if (ret) {
-		t6040_phy_tx_cmn_down(tphy);
-		t6040_cio_rx_down(tphy);
-		fsleep(200);
-		t6040_usb3_firmware_power_down(tphy);
-		t6040_usb3_sleep(tphy);
-		if (t6040_recovery_retry(&tphy->recovery)) {
-			cycle = true;
-			goto retry;
-		}
-		goto put;
-	}
-	t6040_recovery_complete(&tphy->recovery);
-	tphy->cio_up = true;
-	dev_info(tphy->dev, "CIO PHY up, %s orientation\n", flip ? "reverse" : "normal");
-	return 0;
-
-sleep:
-	t6040_usb3_sleep(tphy);
-put:
-	pm_runtime_put(tphy->dev);
-	dev_warn(tphy->dev, "CIO PHY bring-up failed: %d\n", ret);
-	return ret;
-}
-
-static void t6040_cio_down_locked(struct t6040_usb2_phy *tphy)
-{
-	lockdep_assert_held(&tphy->lock);
-	if (!tphy->cio_up)
-		return;
-	t6040_phy_tx_cmn_down(tphy);
-	t6040_cio_rx_down(tphy);
-	fsleep(200);
-	t6040_usb3_firmware_power_down(tphy);
-	t6040_usb3_sleep(tphy);
-	tphy->cio_up = false;
-	pm_runtime_put(tphy->dev);
-	dev_info(tphy->dev, "CIO PHY asleep\n");
-	t6040_usb3_reclaim_locked(tphy);
-}
-
 /* ---- DP phy_ops ---- */
 
 static int t6040_dp_power_on(struct phy *phy)
@@ -1795,6 +1665,7 @@ static int t6040_dp_power_on(struct phy *phy)
 	guard(mutex)(&tphy->lock);
 	if (!tphy->dp_ok || tphy->dp_up)
 		return 0;
+	/* The port carries USB4/Thunderbolt: DP reaches it only as a tunnel. */
 	if (tphy->cio_up)
 		return -EBUSY;
 	/* Pin D shares the running PHY with USB3. Keep its PIPE and firmware. */
@@ -1853,7 +1724,7 @@ static int t6040_dp_power_off(struct phy *phy)
 	 * firmware for the first time over the DP state crashes it.
 	 */
 	if (tphy->dp_up && !tphy->dp_mode_two_lanes && !t6040_dp_only(tphy)) {
-		t6040_phy_tx_cmn_down(tphy);
+		t6040_phy_tx_cmn_shutdown(tphy);
 		t6040_usb3_sleep(tphy);
 		dev_info(tphy->dev, "DP PHY down, PHY asleep\n");
 	}
@@ -1949,6 +1820,649 @@ static const struct phy_ops t6040_dp_phy_ops = {
 	.set_mode = t6040_dp_set_mode,
 };
 
+/* ---- DP tunnels: the pixel clocks of the router's DP IN adapters (PHY in CIO) ----
+ *
+ * The DP 1.4 tunnel's init, update and shutdown and the DP clock
+ * configuration, as the platform sequences them: one fixed
+ * AUSPLL frequency feeds the DPTX pixel clocks, whose select field divides it
+ * per link rate. DP IN adapter 0 is taken to use PCLK1 and clock switch 1,
+ * adapter 1 PCLK2 and switch 2 (the PHY does not choose; the platform gets the index
+ * from the display controller). Driven only by appledrm through
+ * apple_atc_dp_tunnel_rate(), and only while the PHY is in CIO.
+ */
+#define T6040_CORE_RCAL1		0x804	/* AUS40CMN_DIG RCAL1 */
+#define T6040_CORE_RCAL1_DONE		BIT(0)
+#define T6040_CORE_AUSPLL_CMD		0x3000	/* AUSPLL_TOP_APB_CMD_CMDOVERRIDE */
+#define T6040_CORE_AUSPLL_CMD_REQ	BIT(0)
+#define T6040_CORE_AUSPLL_CMD_ACK	BIT(1)
+#define T6040_CORE_AUSPLL_FREQDESC_A	0x3080
+#define T6040_CORE_AUSPLL_FREQDESC_B	0x3084
+#define T6040_CORE_AUSPLL_FREQDESC_C	0x3088
+#define T6040_CORE_AUSPLL_CLKOUT_MASTER	0x3200
+#define T6040_CORE_AUSPLL_CLKOUT_DIV	0x3208
+#define T6040_CORE_AUSPLL_BGR		0x3218
+#define T6040_CORE_AUSPLL_FREQINIT_1	0x3234
+#define T6040_CORE_TX_DP_CTRL0		0x7000
+#define T6040_CORE_TX_DP_CTRL0_ENABLES	GENMASK(18, 16)
+#define T6040_CORE_DP_PCLK_STATUS	0x7034
+#define T6040_CORE_DP_PCLK_STATUS_LOCK	BIT(3)	/* AUSPLL_LOCK */
+
+static const struct t6040_tun_pclk {
+	u8 sel_shift;		/* TX_DP_CTRL0 select field */
+	u32 en;			/* TX_DP_CTRL0 enable */
+	u32 sw_mask, sw_gate, sw_on;	/* clock switch: cleared, set, status when on */
+	u32 req[2], req_stat[2], sw_off;	/* PMGR requests, their status, cleared at off */
+} t6040_tun_pclk[2] = {
+	{ 4, BIT(16), 0x473, 0x10, BIT(0), { 0x20, 0x40 }, { BIT(1), BIT(2) }, 0x403 },
+	{ 8, BIT(17), 0xb8c, 0x80, BIT(3), { 0x100, 0x200 }, { BIT(4), BIT(5) }, 0x80c },
+};
+
+/* The pixel clock select: RBR, HBR, HBR2, HBR3; UHBR is not tunnelled on this path. */
+static int t6040_tun_select(u8 rate)
+{
+	switch (rate) {
+	case 0x06:
+		return 4;
+	case 0x0a:
+		return 3;
+	case 0x14:
+		return 1;
+	case 0x1e:
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static u32 t6040_tun_enables(struct t6040_usb2_phy *tphy)
+{
+	return (tphy->tun_rate[0] ? t6040_tun_pclk[0].en : 0) |
+	       (tphy->tun_rate[1] ? t6040_tun_pclk[1].en : 0);
+}
+
+/* AUSPLL_TOP command override: request @req with the toggle protocol, then wait for @ack. */
+static int t6040_tun_pll_cmd(struct t6040_usb2_phy *tphy, u32 val, bool ack_set)
+{
+	void __iomem *cmd = t6040_core(tphy) + T6040_CORE_AUSPLL_CMD;
+	u32 v;
+
+	writel((readl(cmd) & 0xe0000006) | val, cmd);
+	return readl_poll_timeout(cmd, v, !!(v & T6040_CORE_AUSPLL_CMD_ACK) == ack_set,
+				  10, 500 * USEC_PER_MSEC);
+}
+
+/* The DP 1.4 tunnel shutdown: pixel clocks off, AUSPLL released. */
+static void t6040_tun_pll_stop(struct t6040_usb2_phy *tphy)
+{
+	void __iomem *core = t6040_core(tphy);
+	bool ack = readl(core + T6040_CORE_AUSPLL_CMD) & T6040_CORE_AUSPLL_CMD_ACK;
+	u32 v;
+
+	t6040_usb2_clear32(core + T6040_CORE_TX_DP_CTRL0, T6040_CORE_TX_DP_CTRL0_ENABLES);
+	t6040_usb2_clear32(core + T6040_CORE_TX_DP_CTRL0, 0xc);
+	if (t6040_tun_pll_cmd(tphy, (ack ? 0 : T6040_CORE_AUSPLL_CMD_REQ) | 0x10000000, !ack) ||
+	    t6040_tun_pll_cmd(tphy, (ack ? T6040_CORE_AUSPLL_CMD_REQ : 0) | 0x10000018, ack) ||
+	    readl_poll_timeout(core + T6040_CORE_DP_PCLK_STATUS, v,
+			       !(v & T6040_CORE_DP_PCLK_STATUS_LOCK), 10, 500 * USEC_PER_MSEC))
+		dev_warn(tphy->dev, "DP tunnel: AUSPLL release timed out (cmd %#x, pclk status %#x)\n",
+			 readl(core + T6040_CORE_AUSPLL_CMD),
+			 readl(core + T6040_CORE_DP_PCLK_STATUS));
+	t6040_usb2_clear32(core + T6040_CORE_AUSPLL_CLKOUT_MASTER, 0x8);
+	tphy->tun_pll = false;
+}
+
+/* The common block's init, then the fixed AUSPLL program of the DP 1.4 tunnel init. */
+static int t6040_tun_pll_start(struct t6040_usb2_phy *tphy)
+{
+	void __iomem *core = t6040_core(tphy);
+	bool ack;
+	u32 v;
+
+	if ((readl(core + T6040_CORE_AUSPLL_CLKOUT_MASTER) & 0x808) ||
+	    (readl(core + T6040_CORE_AUSPLL_CMD) & T6040_CORE_AUSPLL_CMD_REQ)) {
+		dev_warn(tphy->dev, "DP tunnel: AUSPLL already in use (master %#x, cmd %#x)\n",
+			 readl(core + T6040_CORE_AUSPLL_CLKOUT_MASTER),
+			 readl(core + T6040_CORE_AUSPLL_CMD));
+		return -EBUSY;
+	}
+	t6040_usb2_clear32(core + T6040_CORE_TX_DP_CTRL0, T6040_CORE_TX_DP_CTRL0_ENABLES);
+
+	t6040_usb2_set32(core + T6040_CORE_CMN_OVRD, 0x4);
+	t6040_usb2_set32(core + T6040_CORE_CMN_OVRD, 0x8);
+	udelay(1);
+	t6040_usb2_set32(core + T6040_CORE_CMN_OVRD, 0x1);
+	t6040_usb2_set32(core + T6040_CORE_CMN_OVRD, 0x2);
+	udelay(1);
+	t6040_usb2_clear32(core + T6040_CORE_CMN_OVRD, T6040_CORE_CMN_OVRD_CLAMP);
+	t6040_usb2_set32(core + T6040_CORE_CMN_OVRD, 0x20);
+	udelay(1);
+	t6040_usb2_set32(core + T6040_CORE_CMN_BIAS, T6040_CORE_CMN_BIAS_BGBIAS_EN_OV);
+	udelay(15);
+	if (readl_poll_timeout(core + T6040_CORE_RCAL1, v, v & T6040_CORE_RCAL1_DONE, 1, 100))
+		dev_dbg(tphy->dev, "DP tunnel: RCAL not done (%#x)\n", v);
+
+	t6040_usb2_clear32(core + T6040_CORE_AUSPLL_FREQINIT_1, 0x3);
+	writel(0x1e0e021c, core + T6040_CORE_AUSPLL_FREQDESC_A);
+	t6040_usb2_mask32(core + T6040_CORE_AUSPLL_FREQDESC_B, 0x0fffffff, 0);
+	t6040_usb2_mask32(core + T6040_CORE_AUSPLL_FREQDESC_C, 0x007fffff, 0x644a00);
+	t6040_usb2_mask32(core + T6040_CORE_AUSPLL_CLKOUT_DIV, 0x001f0000, 0x10000);
+	t6040_usb2_set32(core + T6040_CORE_AUSPLL_BGR, 0x1);
+	t6040_usb2_set32(core + T6040_CORE_AUSPLL_CLKOUT_MASTER, 0x808);
+	tphy->tun_pll = true;
+
+	ack = readl(core + T6040_CORE_AUSPLL_CMD) & T6040_CORE_AUSPLL_CMD_ACK;
+	if (t6040_tun_pll_cmd(tphy, (ack ? 0 : T6040_CORE_AUSPLL_CMD_REQ) | 0x10000000, true) ||
+	    readl_poll_timeout(core + T6040_CORE_DP_PCLK_STATUS, v,
+			       !!(v & T6040_CORE_DP_PCLK_STATUS_LOCK) == !ack,
+			       10, 500 * USEC_PER_MSEC) ||
+	    t6040_tun_pll_cmd(tphy, (ack ? T6040_CORE_AUSPLL_CMD_REQ : 0) | 0x10010000, ack)) {
+		dev_err(tphy->dev, "DP tunnel: AUSPLL did not lock (cmd %#x, pclk status %#x)\n",
+			readl(core + T6040_CORE_AUSPLL_CMD),
+			readl(core + T6040_CORE_DP_PCLK_STATUS));
+		t6040_tun_pll_stop(tphy);
+		return -ETIMEDOUT;
+	}
+	t6040_usb2_set32(core + T6040_CORE_TX_DP_CTRL0, 0xc);
+	return 0;
+}
+
+/* The DP 1.4 tunnel update for one pclk: select with its enable off, then the enables. */
+static void t6040_tun_select_write(struct t6040_usb2_phy *tphy, unsigned int dpin, int sel)
+{
+	const struct t6040_tun_pclk *p = &t6040_tun_pclk[dpin];
+	void __iomem *ctrl0 = t6040_core(tphy) + T6040_CORE_TX_DP_CTRL0;
+	u32 v = readl(ctrl0);
+
+	if (!!(v & p->en) != !!tphy->tun_rate[dpin] ||
+	    ((v >> p->sel_shift) & 0xf) != sel) {
+		v = (v & ~(p->en | (0xf << p->sel_shift))) | (sel << p->sel_shift);
+		writel(v, ctrl0);
+	}
+	writel((v & ~T6040_CORE_TX_DP_CTRL0_ENABLES) | t6040_tun_enables(tphy), ctrl0);
+}
+
+/* The DP clock configuration for one DP 1.x switch: pixel-clock gate on, or off. */
+static int t6040_tun_switch(struct t6040_usb2_phy *tphy, unsigned int dpin, bool on)
+{
+	const struct t6040_tun_pclk *p = &t6040_tun_pclk[dpin];
+	void __iomem *cfg = t6040_cfg(tphy);
+	unsigned int i;
+	u32 s;
+
+	if (on) {
+		t6040_usb2_mask32(cfg + T6040_CFG_DP_CLKSWITCH_CTRL, p->sw_mask, p->sw_gate);
+		return readl_poll_timeout(cfg + T6040_CFG_DP_CLKSWITCH_STAT, s, s & p->sw_on,
+					  10, 5 * USEC_PER_MSEC);
+	}
+	t6040_usb2_set32(cfg + T6040_CFG_DP_CLKSWITCH_CTRL, p->sw_gate);
+	for (i = 0; i < 2; i++) {
+		if (!(readl(cfg + T6040_CFG_DP_CLKSWITCH_CTRL) & p->req[i]))
+			continue;
+		t6040_usb2_clear32(cfg + T6040_CFG_DP_CLKSWITCH_CTRL, p->req[i]);
+		if (readl_poll_timeout(cfg + T6040_CFG_DP_CLKSWITCH_STAT, s, !(s & p->req_stat[i]),
+				       10, 5 * USEC_PER_MSEC))
+			dev_dbg(tphy->dev, "DP tunnel %u: request %#x not released (%#x)\n",
+				dpin, p->req[i], s);
+	}
+	t6040_usb2_clear32(cfg + T6040_CFG_DP_CLKSWITCH_CTRL, p->sw_off);
+	return 0;
+}
+
+/* All tunnel clocks down, as the lane configuration does before the ACIO shutdown. */
+static void t6040_tun_stop_all_locked(struct t6040_usb2_phy *tphy)
+{
+	unsigned int dpin;
+
+	lockdep_assert_held(&tphy->lock);
+	if (!tphy->tun_pll)
+		return;
+	for (dpin = 0; dpin < 2; dpin++) {
+		if (!tphy->tun_rate[dpin])
+			continue;
+		tphy->tun_rate[dpin] = 0;
+		t6040_tun_switch(tphy, dpin, false);
+	}
+	t6040_tun_pll_stop(tphy);
+	dev_info(tphy->dev, "DP tunnel clocks off\n");
+}
+
+static int t6040_tun_rate_locked(struct t6040_usb2_phy *tphy, unsigned int dpin, u8 rate)
+{
+	int sel, ret;
+	u8 old = tphy->tun_rate[dpin];
+
+	lockdep_assert_held(&tphy->lock);
+	if (!rate) {
+		if (!old)
+			return 0;
+		tphy->tun_rate[dpin] = 0;
+		t6040_tun_switch(tphy, dpin, false);
+		t6040_usb2_clear32(t6040_core(tphy) + T6040_CORE_TX_DP_CTRL0,
+				   t6040_tun_pclk[dpin].en);
+		if (!tphy->tun_rate[!dpin])
+			t6040_tun_pll_stop(tphy);
+		dev_dbg(tphy->dev, "DP tunnel %u off\n", dpin);
+		return 0;
+	}
+	sel = t6040_tun_select(rate);
+	if (sel < 0)
+		return sel;
+	if (!tphy->cio_up)
+		return -EBUSY;
+	if (old == rate)
+		return 0;
+	if (!tphy->tun_pll) {
+		ret = t6040_tun_pll_start(tphy);
+		if (ret)
+			return ret;
+	}
+	tphy->tun_rate[dpin] = rate;
+	t6040_tun_select_write(tphy, dpin, sel);
+	ret = t6040_tun_switch(tphy, dpin, true);
+	if (ret) {
+		dev_err(tphy->dev, "DP tunnel %u: clock switch timed out (ctrl %#x status %#x)\n",
+			dpin, readl(t6040_cfg(tphy) + T6040_CFG_DP_CLKSWITCH_CTRL),
+			readl(t6040_cfg(tphy) + T6040_CFG_DP_CLKSWITCH_STAT));
+		t6040_tun_rate_locked(tphy, dpin, 0);
+		return ret;
+	}
+	dev_info(tphy->dev, "DP tunnel %u: rate %#x, select %d (ctrl0 %#x, pclk status %#x)\n",
+		 dpin, rate, sel, readl(t6040_core(tphy) + T6040_CORE_TX_DP_CTRL0),
+		 readl(t6040_core(tphy) + T6040_CORE_DP_PCLK_STATUS));
+	return 0;
+}
+
+/*
+ * The dp-tunnel.h provider for appledrm, which looks it up with symbol_get().
+ * phy-apple-atc exports the same names for the older SoCs; a kernel that
+ * builds both gets them from there (and T6040 tunnels then need appledrm to
+ * pick a T6040 provider instead).
+ */
+#if !IS_ENABLED(CONFIG_PHY_APPLE_ATC)
+int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
+{
+	struct t6040_usb2_phy *tphy;
+
+	if (!phy || phy->ops != &t6040_dp_phy_ops || dpin > 1)
+		return -EINVAL;
+	tphy = phy_get_drvdata(phy);
+	guard(mutex)(&tphy->lock);
+	return t6040_tun_rate_locked(tphy, dpin, rate);
+}
+EXPORT_SYMBOL_GPL(apple_atc_dp_tunnel_rate);
+
+/* The rate call does all of it, as on every SoC but t600x. */
+int apple_atc_dp_tunnel_open(struct phy *phy)
+{
+	if (!phy || phy->ops != &t6040_dp_phy_ops)
+		return -EINVAL;
+	return -EOPNOTSUPP;
+}
+EXPORT_SYMBOL_GPL(apple_atc_dp_tunnel_open);
+#endif
+
+/* ---- CIO: USB4/Thunderbolt (PHY mode 2) ----
+ *
+ * The PHY init for mode 2 with the orientation: the power-up reset (shared
+ * with USB3), the generic ADT tables, the CIO core tunables (the same
+ * three core tables as USB3) and the CIO-only tunables (the CIO lane
+ * tables, applied in every CIO session: nothing on the PHY side picks 40G or
+ * 80G), the mode-2 crossbar, the mode-2 sleep-control init (common and both
+ * lanes, receivers powered by override), then part C: the PHY coprocessor
+ * firmware tunes the PHY as for USB3, without the USB lane-swap bit. The
+ * firmware's only message, Power Down, is sent at exit as for
+ * USB3. The Type-C controller sets the mux to USB4/TBT after the orientation
+ * and before it hands the cable to the host router (drivers/thunderbolt/apple.c),
+ * and back to SAFE after the router has stopped; the PHY holds a runtime PM
+ * reference in between. CIO is offered only with the CIO tables in the DT;
+ * without them every mux state takes the path it took before.
+ *
+ * USB3 runs tunnelled through the router: the controller's PIPE goes to the
+ * USB4 backend (the USB3 mode 3, see t6040_cio_pipe_tunnel)
+ * while the PHY is in CIO, only with the cio_usb3_tunnel parameter set.
+ */
+
+static bool cio_usb3_tunnel;
+module_param(cio_usb3_tunnel, bool, 0644);
+MODULE_PARM_DESC(cio_usb3_tunnel,
+		 "Route the USB3 PIPE to a running USB4 router without its request (testing)");
+
+/* The ADT tables of the CIO-only tunables, in order; lane0/1 are required. */
+static const char * const t6040_cio_tunable_props[] = {
+	"apple,tunable-cio-uc-regs",	/* tunable_UC_REGS_CIO_DFLT, core + 0x400 */
+	"apple,tunable-cio-lane0",	/* tunable_LN0_RX_TOP_CIO_DFLT, core + 0x9000 */
+	"apple,tunable-cio-lane1",	/* tunable_LN1_RX_TOP_CIO_DFLT, core + 0x19000 */
+	"apple,tunable-cio-lane0-eq",	/* tunable_LN0_RX_EQ_CIO_DFLT, core + 0xb000 */
+	"apple,tunable-cio-lane1-eq",	/* tunable_LN1_RX_EQ_CIO_DFLT, core + 0x1b000 */
+};
+
+static_assert(ARRAY_SIZE(t6040_cio_tunable_props) ==
+	      ARRAY_SIZE(((struct t6040_usb2_phy *)NULL)->cio_tunables));
+
+/* The PIPE backend of USB3 tunnelled through the USB4 router */
+#define T6040_PIPEHANDLER_MUX_CLK_USB4		2
+#define T6040_PIPEHANDLER_MUX_DATA_USB4		1
+
+/* The tunables of mode 2: generic tables, the CIO core tunables, the CIO-only tunables. */
+static void t6040_cio_tunables(struct t6040_usb2_phy *tphy)
+{
+	size_t i;
+
+	for (i = 0; i < T6040_USB3_NR_TUNABLES; i++)
+		apple_tunable_apply(tphy->regs[t6040_usb3_tunable_list[i].region],
+				    tphy->tunables[i]);
+	for (i = 0; i < ARRAY_SIZE(tphy->cio_tunables); i++)
+		apple_tunable_apply(t6040_core(tphy), tphy->cio_tunables[i]);
+}
+
+/* The mode-2 crossbar: lane fields of core+0x6c cleared, core+0x78[4:0] = flip, then [1:0] = 2. */
+static void t6040_cio_xbar_config(struct t6040_usb2_phy *tphy, bool flip)
+{
+	void __iomem *core = t6040_core(tphy);
+
+	t6040_usb2_mask32(core + T6040_CORE_XBAR, ~0xffffff03u, 0);
+	t6040_usb2_mask32(core + T6040_CORE_XBAR_LANES, 0x1f, flip ? 1 : 0);
+	t6040_usb2_mask32(core + T6040_CORE_XBAR, 0x3, 0x2);
+}
+
+struct t6040_cio_step {
+	u16 off;
+	u32 bit;	/* lane 0; lane 1 is the next bit up */
+	bool set;
+};
+
+static void t6040_cio_steps(struct t6040_usb2_phy *tphy, const struct t6040_cio_step *step,
+			    size_t n, unsigned int lane)
+{
+	size_t i;
+
+	for (i = 0; i < n; i++) {
+		t6040_usb2_mask32(t6040_core(tphy) + step[i].off, step[i].bit << lane,
+				  step[i].set ? step[i].bit << lane : 0);
+		udelay(1);
+	}
+}
+
+/* RX power-up, per lane: the lane's receiver powered by override (CFG1_TOP, CFG0_TOP). */
+static const struct t6040_cio_step t6040_cio_pwr_up_rxa[] = {
+	{ T6040_CORE_CFG1_TOP, 0x10, true }, { T6040_CORE_CFG1_TOP, 0x40, true },
+	{ T6040_CORE_CFG1_TOP, 0x1, true }, { T6040_CORE_CFG1_TOP, 0x4, true },
+	{ T6040_CORE_CMN_OVRD, 0x400, true }, { T6040_CORE_CMN_OVRD, 0x1000, true },
+	{ T6040_CORE_CMN_OVRD, 0x40, true }, { T6040_CORE_CMN_OVRD, 0x100, true },
+	{ T6040_CORE_CMN_OVRD, 0x4000, false }, { T6040_CORE_CMN_OVRD, 0x10000, true },
+};
+
+/* TX override removal, per lane: the transmitter's overrides released (CFG_SLP_CTRL). */
+static const struct t6040_cio_step t6040_cio_tx_rm_ovrd[] = {
+	{ T6040_CORE_SLP_CTRL, 0x40, false }, { T6040_CORE_SLP_CTRL, 0x4, false },
+	{ T6040_CORE_SLP_CTRL, 0x400, false },
+};
+
+/* RX power-down, per lane */
+static const struct t6040_cio_step t6040_cio_rx_powerdown[] = {
+	{ T6040_CORE_CMN_OVRD, 0x4000, true }, { T6040_CORE_CMN_OVRD, 0x40, false },
+	{ T6040_CORE_CMN_OVRD, 0x400, false }, { T6040_CORE_CFG1_TOP, 0x1, false },
+	{ T6040_CORE_CFG1_TOP, 0x10, false },
+};
+
+/*
+ * The mode-2 sleep-control init: the common block's overrides removed, then
+ * the RX power-up and the TX override removal per lane.
+ */
+static void t6040_cio_slpctrl(struct t6040_usb2_phy *tphy)
+{
+	unsigned int lane;
+
+	t6040_usb2_clear32(t6040_core(tphy) + T6040_CORE_CMN_OVRD, 0x2a);
+	udelay(1);
+	for (lane = 0; lane < 2; lane++) {
+		t6040_cio_steps(tphy, t6040_cio_pwr_up_rxa, ARRAY_SIZE(t6040_cio_pwr_up_rxa), lane);
+		t6040_cio_steps(tphy, t6040_cio_tx_rm_ovrd, ARRAY_SIZE(t6040_cio_tx_rm_ovrd), lane);
+	}
+}
+
+/*
+ * The USB3 mode 3 from 0: the PIPE from the dummy backend to the USB4
+ * router, with the lock handshake only while the controller is out of reset.
+ * No non-selected override and no BIST bracket, unlike the PHY's own USB3.
+ */
+static void t6040_cio_pipe_tunnel(struct t6040_usb2_phy *tphy)
+{
+	void __iomem *ph = tphy->pipehandler;
+	bool running = readl(ph + T6040_PIPEHANDLER_AON_GEN) &
+		       T6040_PIPEHANDLER_AON_GEN_DWC3_RESET_N;
+
+	if (readl(ph + T6040_PIPEHANDLER_LOCK_ACK) & T6040_PIPEHANDLER_LOCK_EN)
+		dev_dbg(tphy->dev, "CIO: PIPE lock already acknowledged\n");
+	t6040_usb2_clear32(ph + T6040_PIPEHANDLER_OVERRIDE_VALUES, 0xe);
+	t6040_usb2_set32(ph + T6040_PIPEHANDLER_OVERRIDE, T6040_PIPEHANDLER_OVERRIDE_EN);
+	if (running && t6040_usb3_pipe_lock(tphy, 6))
+		dev_dbg(tphy->dev, "CIO: PIPE lock not acknowledged, switching anyway\n");
+	t6040_usb3_pipe_mux(tphy, T6040_PIPEHANDLER_MUX_CLK_USB4,
+			    T6040_PIPEHANDLER_MUX_DATA_USB4);
+	t6040_usb2_clear32(ph + T6040_PIPEHANDLER_OVERRIDE, T6040_PIPEHANDLER_OVERRIDE_EN);
+	t6040_usb2_clear32(ph + T6040_PIPEHANDLER_OVERRIDE, T6040_PIPEHANDLER_OVERRIDE_EN2);
+	if (running)
+		t6040_usb3_pipe_unlock(tphy);
+	tphy->pipe_tunneled = true;
+	dev_info(tphy->dev, "USB3 PIPE on the USB4 router\n");
+}
+
+/*
+ * The PIPE is on the router while the router runs and carries USB3 for the
+ * controller (the platform asks for USB3 mode 3 only for a tunnelled USB3
+ * transport, once it uses the tunnel), dwc3 holds the USB3 phy with its PIPE
+ * and the controller is out of reset. Otherwise it goes back to the dummy.
+ */
+static void t6040_cio_pipe_update_locked(struct t6040_usb2_phy *tphy)
+{
+	bool want;
+
+	lockdep_assert_held(&tphy->lock);
+	want = tphy->cio_up && tphy->router_running &&
+	       (tphy->usb3_tunnel_req || cio_usb3_tunnel) &&
+	       tphy->usb3_on && tphy->usb3_pipe && tphy->dwc3_running && !tphy->pipe_switched;
+	if (want && !tphy->pipe_tunneled) {
+		t6040_cio_pipe_tunnel(tphy);
+	} else if (!want && tphy->pipe_tunneled) {
+		t6040_usb3_pipe_park(tphy);
+		tphy->pipe_tunneled = false;
+		dev_info(tphy->dev, "USB3 PIPE back on the dummy PHY\n");
+	}
+}
+
+/* The PHY shutdown of mode 2: part A, the coprocessor down, part B. */
+static void t6040_cio_down_locked(struct t6040_usb2_phy *tphy)
+{
+	u32 uc;
+	unsigned int lane;
+
+	lockdep_assert_held(&tphy->lock);
+	if (!tphy->cio_up)
+		return;
+	t6040_tun_stop_all_locked(tphy);
+	/* The USB3 mode 0 from 3: the same writes as the park from 2 */
+	if (tphy->pipe_tunneled) {
+		t6040_usb3_pipe_park(tphy);
+		tphy->pipe_tunneled = false;
+	}
+	uc = readl(t6040_core(tphy) + T6040_CORE_UC_CTRL);
+	t6040_phy_tx_cmn_shutdown(tphy);
+	for (lane = 0; lane < 2; lane++)
+		t6040_cio_steps(tphy, t6040_cio_rx_powerdown, ARRAY_SIZE(t6040_cio_rx_powerdown),
+				lane);
+	fsleep(200);
+	t6040_usb3_firmware_power_down(tphy);
+	t6040_usb3_sleep(tphy);
+	dev_info(tphy->dev, "CIO PHY asleep: uc %#x -> %#x, cfg %#x/%#x\n", uc,
+		 readl(t6040_core(tphy) + T6040_CORE_UC_CTRL),
+		 readl(t6040_cfg(tphy) + T6040_CFG_CTRL),
+		 readl(t6040_cfg(tphy) + T6040_CFG_STATUS));
+	tphy->cio_up = false;
+	pm_runtime_put(tphy->dev);
+}
+
+/*
+ * Bring the PHY into CIO for the plug orientation. A failure is returned to
+ * the Type-C controller, which then does not hand the cable to the router.
+ */
+static int t6040_cio_up_locked(struct t6040_usb2_phy *tphy)
+{
+	void __iomem *core = t6040_core(tphy);
+	bool flip;
+	int ret;
+
+	lockdep_assert_held(&tphy->lock);
+	if (tphy->cio_up)
+		return 0;
+
+	switch (tphy->orientation) {
+	case TYPEC_ORIENTATION_NORMAL:
+		flip = false;
+		break;
+	case TYPEC_ORIENTATION_REVERSE:
+		flip = true;
+		break;
+	default:
+		dev_warn(tphy->dev, "CIO: no plug orientation\n");
+		return -ENODEV;
+	}
+	if (tphy->dp_up) {
+		dev_warn(tphy->dev, "CIO: lanes held by DP\n");
+		return -EBUSY;
+	}
+	/* USB3 hands its lanes over and comes back once the port leaves CIO. */
+	if (tphy->usb3_up || tphy->pipe_switched) {
+		t6040_usb3_down_locked(tphy);
+		tphy->usb3_lent = true;
+	}
+
+	ret = pm_runtime_resume_and_get(tphy->dev);
+	if (ret) {
+		t6040_usb3_reclaim_locked(tphy);
+		return ret;
+	}
+	ret = t6040_usb3_wake(tphy);
+	if (ret)
+		goto sleep;	/* the coprocessor block may be unclocked: never touch it */
+	t6040_cio_tunables(tphy);
+	t6040_cio_xbar_config(tphy, flip);
+	t6040_cio_slpctrl(tphy);
+	ret = t6040_phy_run_firmware(tphy, "CIO", flip);
+	if (ret)
+		goto firmware;
+
+	tphy->cio_up = true;
+	tphy->cio_flip = flip;
+	dev_info(tphy->dev, "CIO PHY up (mode 2), %s orientation: xbar %#x/%#x cfg %#x/%#x\n",
+		 flip ? "reverse" : "normal", readl(core + T6040_CORE_XBAR),
+		 readl(core + T6040_CORE_XBAR_LANES), readl(t6040_cfg(tphy) + T6040_CFG_CTRL),
+		 readl(t6040_cfg(tphy) + T6040_CFG_STATUS));
+	t6040_cio_pipe_update_locked(tphy);
+	return 0;
+
+firmware:
+	t6040_usb3_firmware_power_down(tphy);
+sleep:
+	t6040_usb3_sleep(tphy);
+	pm_runtime_put(tphy->dev);
+	dev_warn(tphy->dev, "CIO PHY bring-up failed: %d\n", ret);
+	/* The port stays out of CIO: give the lanes back to USB3. */
+	t6040_usb3_reclaim_locked(tphy);
+	return ret;
+}
+
+/* USB4 entered with Enter_USB in USB4 mode, or Thunderbolt alt mode. */
+static bool cio_without_router;
+module_param(cio_without_router, bool, 0644);
+MODULE_PARM_DESC(cio_without_router,
+		 "bring-up test: enter CIO on a USB4/Thunderbolt mux event even while no USB4 router node for this port is enabled (default N)");
+
+/*
+ * A USB4/Thunderbolt mux event only takes the port into CIO while the router
+ * that runs over this PHY (a node whose apple,atc-phy points here) is enabled
+ * in the live device tree. The default device trees keep the routers
+ * disabled, so the port stays on its USB2/USB3/DP paths until a router is
+ * enabled (the USB4 bring-up tree, or at runtime).
+ */
+static bool t6040_cio_router_enabled(struct t6040_usb2_phy *tphy)
+{
+	struct device_node *np;
+
+	if (READ_ONCE(cio_without_router))
+		return true;
+	for_each_compatible_node(np, NULL, "apple,t6040-usb4-acio") {
+		struct device_node *phy = of_parse_phandle(np, "apple,atc-phy", 0);
+		bool match = phy == tphy->dev->of_node && of_device_is_available(np);
+
+		of_node_put(phy);
+		if (match) {
+			of_node_put(np);
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool t6040_cio_requested(const struct typec_mux_state *state)
+{
+	const struct enter_usb_data *data = state->data;
+
+	if (state->alt)
+		return state->alt->svid == USB_TYPEC_TBT_SID;
+	return state->mode == TYPEC_MODE_USB4 && data &&
+	       FIELD_GET(EUDO_USB_MODE_MASK, data->eudo) == EUDO_USB_MODE_USB4;
+}
+
+static void t6040_cio_remove(void *data)
+{
+	struct t6040_usb2_phy *tphy = data;
+
+	guard(mutex)(&tphy->lock);
+	if (tphy->router_running)
+		dev_warn(tphy->dev, "CIO: unbound under a running USB4 router\n");
+	tphy->router_running = false;
+	t6040_cio_down_locked(tphy);
+}
+
+/* CIO needs the USB3 pieces and the CIO lane tables; anything less leaves it off. */
+static int t6040_cio_probe(struct t6040_usb2_phy *tphy)
+{
+	struct device *dev = tphy->dev;
+	size_t i;
+
+	if (!tphy->usb3_ok ||
+	    (!of_property_present(dev->of_node, t6040_cio_tunable_props[1]) &&
+	     !of_property_present(dev->of_node, t6040_cio_tunable_props[2])))
+		return 0;
+
+	for (i = 0; i < ARRAY_SIZE(t6040_cio_tunable_props); i++) {
+		const char *prop = t6040_cio_tunable_props[i];
+		struct apple_tunable *t;
+
+		if (!of_property_present(dev->of_node, prop)) {
+			if (i == 1 || i == 2) {
+				dev_warn(dev, "CIO: no %s, no USB4/Thunderbolt\n", prop);
+				return 0;
+			}
+			continue;
+		}
+		t = devm_apple_tunable_parse(dev, dev->of_node, prop, tphy->res[T6040_USB3_CORE]);
+		if (IS_ERR(t)) {
+			dev_warn(dev, "CIO: %s: %pe, no USB4/Thunderbolt\n", prop, t);
+			return 0;
+		}
+		tphy->cio_tunables[i] = t;
+	}
+
+	/* Registered before the mode switch, so it runs after the switch is gone. */
+	if (devm_add_action_or_reset(dev, t6040_cio_remove, tphy))
+		return -ENOMEM;
+	tphy->cio_ok = true;
+	dev_dbg(dev, "CIO (USB4/Thunderbolt) mode available\n");
+	return 0;
+}
+
 /* ---- Type-C mode switch: the Type-C controller asks for DP on a USB-C port ---- */
 
 static int t6040_dp_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *state)
@@ -1958,12 +2472,26 @@ static int t6040_dp_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *s
 	bool alt = false;
 
 	guard(mutex)(&tphy->lock);
-	if (t6040_cio_state(state)) {
-		if (tphy->cio_up)
-			return 0;
-		return t6040_cio_up_locked(tphy);
+	/* USB4/TBT, only with the CIO tables; leaving it first takes the PHY out of CIO. */
+	if (tphy->cio_ok && (tphy->cio_up || t6040_cio_router_enabled(tphy))) {
+		bool cio = t6040_cio_requested(state);
+
+		if (tphy->cio_up && !cio) {
+			/* The router stops before the mux leaves USB4/TBT (apple.c). */
+			if (tphy->router_running) {
+				dev_err(tphy->dev, "CIO: the USB4 router still runs, not leaving CIO\n");
+				return -EBUSY;
+			}
+			t6040_cio_down_locked(tphy);
+		}
+		if (cio) {
+			tphy->dp_alt = false;
+			tphy->dp_two_lanes = false;
+			dev_dbg(tphy->dev, "Type-C mux: %s -> CIO\n",
+				state->alt ? "Thunderbolt" : "USB4");
+			return t6040_cio_up_locked(tphy);
+		}
 	}
-	t6040_cio_down_locked(tphy);
 	tphy->dp_flip = (tphy->orientation == TYPEC_ORIENTATION_REVERSE);
 	/*
 	 * Latch the DP alt mode state for the DCP's Type-C route. Pin
@@ -2486,6 +3014,10 @@ static int t6040_usb2_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	ret = t6040_cio_probe(tphy);
+	if (ret)
+		return ret;
+
 	ret = t6040_dp_probe(tphy);
 	if (ret)
 		return ret;
@@ -2493,6 +3025,159 @@ static int t6040_usb2_probe(struct platform_device *pdev)
 	provider = devm_of_phy_provider_register(dev, t6040_usb2_xlate);
 	return PTR_ERR_OR_ZERO(provider);
 }
+
+#ifdef CONFIG_HIBERNATION
+static int t6040_phy_count(struct phy *phy)
+{
+	return IS_ERR_OR_NULL(phy) ? 0 : phy->power_count;
+}
+
+/*
+ * Resume from disk is a cold boot: the PHY, its coprocessor and the
+ * pipehandler come back reset, while this driver's state comes from the
+ * image.  Before the image its consumers gave it back: the sleep hook
+ * unbinds dwc3 (USB2/USB3 phys powered off, controller reset asserted),
+ * the DCP powers the DP phy off at hibernation prepare.  What is left set
+ * here describes hardware that no longer is: clear it to the state after
+ * probe, so that the next power-on programs the PHY afresh (with pin D,
+ * t6040_dp_power_on() otherwise takes the USB3 PHY for running).  What
+ * consumers hold (powered, usb3_on, usb3_pipe, dwc3_running and the PHY
+ * core counts, with their runtime PM reference) is theirs to release and
+ * is kept, so that every count stays balanced; a phy still held is only
+ * reported.  The port's Type-C state (orientation, DP alt mode, pin
+ * assignment) describes the partner, not the PHY, and stays for the next
+ * power-on.  Early, before any .restore: the Type-C controller's may set
+ * the mux again.  Nothing touches the hardware here.  CIO is torn down
+ * before the image (.freeze), so the image never holds a CIO session.
+ */
+static int t6040_usb2_restore_early(struct device *dev)
+{
+	struct t6040_usb2_phy *tphy = dev_get_drvdata(dev);
+
+	if (!tphy)
+		return 0;
+	/* Hibernation aborted before the image (PMSG_RESTORE then too): nothing restarted. */
+	if (!pm_hibernate_is_restored())
+		return 0;
+	guard(mutex)(&tphy->lock);
+	if (tphy->powered || tphy->usb3_on || tphy->dwc3_running ||
+	    t6040_phy_count(tphy->dp))
+		dev_warn(dev,
+			 "restore: still held across the image (usb2 %d, usb3 %d, dwc3 %d, dp %d/%d): its next power-on finds the PHY cold\n",
+			 tphy->powered, tphy->usb3_on, tphy->dwc3_running,
+			 t6040_phy_count(tphy->dp), tphy->dp_up);
+	/* .freeze refuses an image with CIO up; never trust one that has it. */
+	if (tphy->cio_up) {
+		dev_warn(dev, "restore: CIO was up in the image, dropped\n");
+		tphy->cio_up = false;
+		tphy->router_running = false;
+		tphy->usb3_tunnel_req = false;
+		tphy->pipe_tunneled = false;
+		tphy->tun_pll = false;
+		tphy->tun_rate[0] = tphy->tun_rate[1] = 0;
+		pm_runtime_put_noidle(dev);
+	}
+	dev_info(dev, "restore: PHY state reset (usb3 up %d, pipe %d, lent %d, dp up %d, 2-lane %d)\n",
+		 tphy->usb3_up, tphy->pipe_switched, tphy->usb3_lent, tphy->dp_up,
+		 tphy->dp_mode_two_lanes);
+	tphy->usb3_up = false;
+	tphy->pipe_switched = false;
+	tphy->usb3_lent = false;
+	tphy->dp_up = false;
+	tphy->dp_mode_two_lanes = false;
+	tphy->dp_mode_flip = false;
+	tphy->dp_rate = -1;
+	tphy->shutdown_failed = false;
+	return 0;
+}
+
+/*
+ * The coprocessor's RTKit session is reset with it.  Its host side is
+ * reset at power-down already (t6040_usb3_firmware_power_down()); one
+ * still running here (USB3 held across the image) is reset now, in the
+ * normal phase, after the DARTs its buffers live behind are restored.
+ */
+static int t6040_usb2_restore(struct device *dev)
+{
+	struct t6040_usb2_phy *tphy = dev_get_drvdata(dev);
+	int ret;
+
+	if (!tphy || IS_ERR_OR_NULL(tphy->rtk))
+		return 0;
+	if (!pm_hibernate_is_restored())
+		return 0;
+	guard(mutex)(&tphy->lock);
+	if (!apple_rtkit_is_running(tphy->rtk))
+		return 0;
+	ret = apple_rtkit_reinit(tphy->rtk);
+	dev_info(dev, "restore: USB3 coprocessor RTKit reset: %d\n", ret);
+	return 0;
+}
+
+#endif
+
+#ifdef CONFIG_PM_SLEEP
+/*
+ * System sleep with the port in USB4/Thunderbolt: s2idle, a firmware-driven
+ * suspend (pm_suspend_via_firmware(), which brings the PHY back like a cold
+ * start) and the three phases of hibernation that leave the running system
+ * (freeze before the image, poweroff after it). CIO is not kept across a
+ * sleep: the ACIO sleep is a full PHY shutdown, and
+ * the ACIO wake a full PHY init for mode 2; the firmware-assisted S2R state
+ * save is for the USB modes only. Here CIO is torn down the same way in each
+ * of them, after the router has stopped (apple_t6040_cio_router_stopped(),
+ * from its sleep notifier before any device callback); its DP tunnels and the
+ * tunnelled PIPE go with it. Nothing is kept for resume: the Type-C
+ * controller reads the port afresh after every sleep and sets the mux again,
+ * which brings CIO back before it starts the router. A router still marked
+ * running breaks that contract and fails the transition. Without a CIO
+ * session none of this touches the hardware.
+ */
+static int t6040_usb2_sleep(struct device *dev, const char *what)
+{
+	struct t6040_usb2_phy *tphy = dev_get_drvdata(dev);
+
+	if (!tphy)
+		return 0;
+	guard(mutex)(&tphy->lock);
+	if (!tphy->cio_up)
+		return 0;
+	if (tphy->router_running) {
+		dev_err(dev, "%s: the USB4 router still runs on this port; it must stop before the PHY\n",
+			what);
+		return -EBUSY;
+	}
+	t6040_cio_down_locked(tphy);
+	dev_info(dev, "%s: CIO down for system sleep; the Type-C controller brings it back\n",
+		 what);
+	return 0;
+}
+
+static int t6040_usb2_suspend(struct device *dev)
+{
+	return t6040_usb2_sleep(dev, "suspend");
+}
+
+static int t6040_usb2_freeze(struct device *dev)
+{
+	return t6040_usb2_sleep(dev, "freeze");
+}
+
+static int t6040_usb2_poweroff(struct device *dev)
+{
+	return t6040_usb2_sleep(dev, "poweroff");
+}
+
+static const struct dev_pm_ops t6040_usb2_pm_ops = {
+	.suspend = t6040_usb2_suspend,
+	.freeze = t6040_usb2_freeze,
+	.poweroff = t6040_usb2_poweroff,
+#ifdef CONFIG_HIBERNATION
+	.restore_early = t6040_usb2_restore_early,
+	.restore = t6040_usb2_restore,
+#endif
+};
+#endif
 
 static const struct of_device_id t6040_usb2_of_match[] = {
 	{ .compatible = "apple,t6040-atcphy" },
@@ -2505,8 +3190,101 @@ static struct platform_driver t6040_usb2_driver = {
 	.driver = {
 		.name = "phy-apple-t6040-usb2",
 		.of_match_table = t6040_usb2_of_match,
+#ifdef CONFIG_PM_SLEEP
+		.pm = &t6040_usb2_pm_ops,
+#endif
 	},
 };
+
+/* ---- the USB4 router's view of the PHY (linux/phy/apple-t6040-cio.h) ---- */
+
+/*
+ * Run @fn on the bound PHY of @phy_np with its lock held. The device lock
+ * keeps the driver bound for the call.
+ */
+static int t6040_cio_call(struct device_node *phy_np,
+			  int (*fn)(struct t6040_usb2_phy *tphy, unsigned long arg),
+			  unsigned long arg)
+{
+	struct platform_device *pdev;
+	struct t6040_usb2_phy *tphy;
+	int ret;
+
+	if (!phy_np || !of_device_is_compatible(phy_np, "apple,t6040-atcphy"))
+		return -ENODEV;
+	pdev = of_find_device_by_node(phy_np);
+	if (!pdev)
+		return -EPROBE_DEFER;
+	device_lock(&pdev->dev);
+	tphy = platform_get_drvdata(pdev);
+	if (pdev->dev.driver != &t6040_usb2_driver.driver || !tphy) {
+		ret = -EPROBE_DEFER;
+	} else {
+		guard(mutex)(&tphy->lock);
+		ret = fn(tphy, arg);
+	}
+	device_unlock(&pdev->dev);
+	put_device(&pdev->dev);
+	return ret;
+}
+
+static int t6040_cio_state_fn(struct t6040_usb2_phy *tphy, unsigned long arg)
+{
+	return tphy->cio_up ? 1 : 0;
+}
+
+static int t6040_cio_router_fn(struct t6040_usb2_phy *tphy, unsigned long running)
+{
+	if (running) {
+		if (!tphy->cio_up)
+			return -EAGAIN;
+		tphy->router_running = true;
+		dev_dbg(tphy->dev, "CIO: router started\n");
+		t6040_cio_pipe_update_locked(tphy);
+		return 0;
+	}
+	if (!tphy->router_running)
+		return 0;
+	tphy->router_running = false;
+	tphy->usb3_tunnel_req = false;
+	t6040_cio_pipe_update_locked(tphy);
+	dev_dbg(tphy->dev, "CIO: router stopped\n");
+	return 0;
+}
+
+static int t6040_cio_usb3_fn(struct t6040_usb2_phy *tphy, unsigned long on)
+{
+	if (on && !tphy->router_running)
+		return -EAGAIN;
+	tphy->usb3_tunnel_req = on;
+	t6040_cio_pipe_update_locked(tphy);
+	return 0;
+}
+
+int apple_t6040_cio_state(struct device_node *phy_np)
+{
+	return t6040_cio_call(phy_np, t6040_cio_state_fn, 0);
+}
+EXPORT_SYMBOL_GPL(apple_t6040_cio_state);
+
+int apple_t6040_cio_router_started(struct device_node *phy_np)
+{
+	return t6040_cio_call(phy_np, t6040_cio_router_fn, 1);
+}
+EXPORT_SYMBOL_GPL(apple_t6040_cio_router_started);
+
+void apple_t6040_cio_router_stopped(struct device_node *phy_np)
+{
+	t6040_cio_call(phy_np, t6040_cio_router_fn, 0);
+}
+EXPORT_SYMBOL_GPL(apple_t6040_cio_router_stopped);
+
+int apple_t6040_cio_usb3_tunnel(struct device_node *phy_np, bool on)
+{
+	return t6040_cio_call(phy_np, t6040_cio_usb3_fn, on);
+}
+EXPORT_SYMBOL_GPL(apple_t6040_cio_usb3_tunnel);
+
 module_platform_driver(t6040_usb2_driver);
 
 MODULE_AUTHOR("The Asahi Linux Contributors");

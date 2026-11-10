@@ -91,6 +91,8 @@ static void list_del(struct list_head*l){current=NULL;}
 static void list_del_init(struct list_head*l){}
 static bool tb_port_is_dpin(struct tb_port*p){return p->is_dpin;}
 static void tb_dp_tunnel_notify(struct tb_tunnel*t,bool active){}
+/* Only a USB3 tunnel from the host router is reported; these cases retire DP tunnels. */
+static void tb_usb3_host_tunnel_changed(struct tb_tunnel*t,bool on){CHECK(t->type==TB_TUNNEL_DP && !on);}
 static void tb_tunnel_deactivate(struct tb_tunnel*t){}
 static void tb_detach_bandwidth_group(struct tb_port*p){}
 static void tb_switch_dealloc_dp_resource(struct tb_switch*s,struct tb_port*p){}
