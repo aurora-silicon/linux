@@ -197,6 +197,42 @@
 	apple,pmc-interface = <&pmc_disp0>;
 };
 
+/*
+ * Each external DCP powers its CPU, front-end and system domains off around
+ * a deep sleep. The system domains have a bus bridge in front of their
+ * block: its link words are 0x800104 past the start of the block's disp-3
+ * registers (reg 4 of the external DCP).
+ */
+&ps_dispext0_sys {
+	apple,consumer-switched;
+	apple,bridge-link = <&dcpext0 4 0x800104>;
+};
+
+&ps_dispext0_fe {
+	apple,consumer-switched;
+};
+
+&ps_dispext0_cpu {
+	apple,consumer-switched;
+	/* Power-gate retention workaround, as macOS sets it while off. */
+	apple,retention-workaround = <0x256cc 0x3 0x3>, <0x256f0 0x3 0x0>;
+};
+
+&ps_dispext1_sys {
+	apple,consumer-switched;
+	apple,bridge-link = <&dcpext1 4 0x800104>;
+};
+
+&ps_dispext1_fe {
+	apple,consumer-switched;
+};
+
+&ps_dispext1_cpu {
+	apple,consumer-switched;
+	/* Power-gate retention workaround, as macOS sets it while off. */
+	apple,retention-workaround = <0x25b4c 0x3 0x3>, <0x25b70 0x3 0x0>;
+};
+
 /* Native radio recovery is required before admitting system sleep. */
 &pcie0 {
 	status = "okay";
