@@ -854,8 +854,7 @@ static const struct net_device_ops mt_awdl_net_ops = {
 void mt_awdl_wiphy_setup(struct mt7932 *m)
 {
 	static const struct ieee80211_iface_limit limits[] = {
-		{ .max = 1, .types = BIT(NL80211_IFTYPE_STATION) },
-		{ .max = 1, .types = BIT(NL80211_IFTYPE_NAN) },
+		{ .max = 2, .types = BIT(NL80211_IFTYPE_STATION) },
 	};
 	static const struct ieee80211_iface_combination combinations[] = {
 		{
@@ -866,7 +865,6 @@ void mt_awdl_wiphy_setup(struct mt7932 *m)
 		},
 	};
 
-	m->wiphy->interface_modes |= BIT(NL80211_IFTYPE_NAN);
 	m->wiphy->iface_combinations = combinations;
 	m->wiphy->n_iface_combinations = ARRAY_SIZE(combinations);
 }
@@ -884,7 +882,12 @@ int mt_awdl_register(struct mt7932 *m)
 		return -ENOMEM;
 	*(struct mt7932 **)netdev_priv(netdev) = m;
 	m->awdl.wdev.wiphy = m->wiphy;
-	m->awdl.wdev.iftype = NL80211_IFTYPE_NAN;
+	/*
+	 * cfg80211 has no AWDL type and rejects a wiphy that advertises NAN
+	 * without the NAN operations, so awdl0 is a station-typed wdev, as in
+	 * brcmfmac; the firmware BSS 1 records define its behaviour.
+	 */
+	m->awdl.wdev.iftype = NL80211_IFTYPE_STATION;
 	m->awdl.wdev.netdev = netdev;
 	netdev->ieee80211_ptr = &m->awdl.wdev;
 	netdev->netdev_ops = &mt_awdl_net_ops;

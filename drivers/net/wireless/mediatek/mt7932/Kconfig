@@ -35,7 +35,7 @@ config MT7932_AWDL
 	default n
 	help
 	  Build the experimental second-BSS Apple Wireless Direct Link path.
-	  It exposes an awdl0 NAN-style Ethernet interface, programs the native
+	  It exposes an awdl0 station-typed Ethernet interface, programs the native
 	  firmware AWDL command records and routes BSS-1 RX records.  The option
 	  is deliberately off by default while firmware policy values and target
 	  validation remain incomplete.
