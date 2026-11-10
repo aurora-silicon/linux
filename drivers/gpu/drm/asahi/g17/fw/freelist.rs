@@ -40,32 +40,37 @@ static_assert!(size_of::<PoolTables>() == TABLE_SIZE);
 static_assert!(core::mem::offset_of!(PoolTables, runs) == PAGE_LIST_SIZE);
 
 impl PoolTables {
+    /// Whether both tables have room for `blocks` blocks.
+    pub(crate) fn fits(blocks: usize, layout: RunLayout) -> bool {
+        blocks <= RUN_LIST_SIZE / (layout.words() * 8)
+            && blocks <= PAGE_LIST_SIZE / (FREE_LIST_BLOCK_PAGES as usize * 8)
+    }
+
     /// Enumerates only the initialized run words and page addresses, in their
     /// publication order. Reserved run words and unused table space stay zero.
+    /// Each table entry names its block on its own: `block(n)` is the address of
+    /// block `n`, and blocks need not be adjacent to each other or to the tables.
     pub(crate) fn for_each_word(
-        base: u64,
         blocks: usize,
+        block: impl Fn(usize) -> u64,
         layout: RunLayout,
         mut put: impl FnMut(usize, u64),
     ) -> Result {
-        if blocks > RUN_LIST_SIZE / (layout.words() * 8)
-            || blocks > PAGE_LIST_SIZE / (FREE_LIST_BLOCK_PAGES as usize * 8)
-        {
+        if !Self::fits(blocks, layout) {
             return Err(EINVAL);
         }
-        let buffers = base.checked_add(TABLE_SIZE as u64).ok_or(EOVERFLOW)?;
-        buffers
-            .checked_add((blocks * FREE_LIST_BLOCK_SIZE) as u64)
-            .ok_or(EOVERFLOW)?;
-        for block in 0..blocks {
-            let address = buffers + (block * FREE_LIST_BLOCK_SIZE) as u64;
+        for index in 0..blocks {
+            let address = block(index);
+            address
+                .checked_add(FREE_LIST_BLOCK_SIZE as u64)
+                .ok_or(EOVERFLOW)?;
             put(
-                PAGE_LIST_SIZE / 8 + block * layout.words(),
-                FreeListRunSlot::new(address).run,
+                PAGE_LIST_SIZE / 8 + index * layout.words(),
+                FreeListRunSlot::checked(address)?.run,
             );
             for page in 0..FREE_LIST_BLOCK_PAGES as usize {
                 put(
-                    block * FREE_LIST_BLOCK_PAGES as usize + page,
+                    index * FREE_LIST_BLOCK_PAGES as usize + page,
                     address
                         + (page * (FREE_LIST_BLOCK_SIZE / FREE_LIST_BLOCK_PAGES as usize)) as u64,
                 );
@@ -75,8 +80,13 @@ impl PoolTables {
     }
 
     /// Initializes a zeroed table before its first publication.
-    pub(crate) fn init(&mut self, base: u64, blocks: usize, layout: RunLayout) -> Result {
-        Self::for_each_word(base, blocks, layout, |index, value| {
+    pub(crate) fn init(
+        &mut self,
+        blocks: usize,
+        block: impl Fn(usize) -> u64,
+        layout: RunLayout,
+    ) -> Result {
+        Self::for_each_word(blocks, block, layout, |index, value| {
             if index < self.pages.len() {
                 self.pages[index] = value;
             } else {

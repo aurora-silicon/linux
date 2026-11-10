@@ -73,7 +73,7 @@ static_assert!(core::mem::offset_of!(GraphLayout, items) == ITEMS);
 /// Backing of a vacated pool and descriptor ring, freed outside the device
 /// mutex. Field order drops each client alias before the storage it names.
 pub(crate) struct Vacated {
-    _alias: Option<mmu::KernelMapping>,
+    _alias: Option<crate::g17::freelist::PoolAliases>,
     _pages: Option<crate::g17::freelist::Pages>,
     _descriptors: Option<mmu::KernelMapping>,
     _ring: Option<DescriptorRing>,
@@ -83,7 +83,7 @@ pub(crate) struct Binding {
     _kick_alias: mmu::KernelMapping,
     /// Client alias of the USC pool pages; dropped when the pool is vacated and
     /// recreated when an owner binds a re-armed pool (it pins the backing).
-    pool_alias: Option<mmu::KernelMapping>,
+    pool_alias: Option<crate::g17::freelist::PoolAliases>,
     /// Client alias of the descriptor ring; dropped with the ring when the queue
     /// is vacated and recreated when an owner binds a re-armed queue.
     descriptors: Option<mmu::KernelMapping>,
@@ -234,7 +234,7 @@ impl Graph {
         &mut self,
         context: Arc<Context>,
         kick_alias: mmu::KernelMapping,
-        pool_alias: mmu::KernelMapping,
+        pool_alias: crate::g17::freelist::PoolAliases,
     ) -> Result<Binding> {
         if !context.is_current() {
             return Err(EFAULT);
@@ -1957,7 +1957,7 @@ impl Queue {
         &mut self,
         init: &crate::g17::initdata::InitData,
         pages: &mut Option<crate::g17::freelist::Pages>,
-        alias: &mut Option<mmu::KernelMapping>,
+        alias: &mut Option<crate::g17::freelist::PoolAliases>,
         blocks: usize,
     ) -> Result<Vacated> {
         if !self.growing || blocks < self.growth_blocks {

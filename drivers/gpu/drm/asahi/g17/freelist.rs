@@ -123,8 +123,15 @@ fn place_lower<T>(size: usize, place: impl FnOnce() -> Result<T>) -> Result<T> {
     }
 }
 
+/// One free list's backing. The tables and every fixed-size data block are
+/// separate lower-window extents: the tables name each block by address, so a
+/// large free list never needs one contiguous hole the size of the whole pool
+/// in the shared lower window.
 pub(crate) struct Pages {
-    backing: KernelObject,
+    /// Page list followed by run list.
+    tables: KernelObject,
+    /// Data blocks, in run-list order.
+    data: KVec<KernelObject>,
     blocks: usize,
     layout: RunLayout,
 }
@@ -133,27 +140,47 @@ impl Drop for Pages {
         LOWER_FREED.fetch_add(1, Ordering::AcqRel);
     }
 }
+/// The client aliases of one free list: its tables and every data block, each
+/// at its canonical lower address. Owners drop it before the `Pages` it names.
+pub(crate) struct PoolAliases {
+    _mappings: KVec<mmu::KernelMapping>,
+}
+
+/// One canonical lower extent of a free list.
+fn lower_extent(alloc: &Allocator<'_>, size: usize) -> Result<KernelObject> {
+    place_lower(size, || {
+        alloc.lower(size, mmu::UAT_PGSZ as u64, mmu::PROT_GPU_SHARED_RW, CpuMap::WriteCombined)
+    })
+}
+
 impl Pages {
+    /// Builds all extents before any of them is published; a failure drops the
+    /// extents built so far.
     fn new(alloc: &Allocator<'_>, blocks: usize, layout: RunLayout) -> Result<Self> {
-        let size = TABLE_SIZE + blocks * FREE_LIST_BLOCK_SIZE;
-        let backing = place_lower(size, || {
-            alloc.lower(
-                size,
-                mmu::UAT_PGSZ as u64,
-                mmu::PROT_GPU_SHARED_RW,
-                CpuMap::WriteCombined,
-            )
-        })?;
-        Self::from_backing(backing, blocks, layout)
+        if !PoolTables::fits(blocks, layout) {
+            return Err(EINVAL);
+        }
+        let mut tables = lower_extent(alloc, TABLE_SIZE)?;
+        let mut data = KVec::with_capacity(blocks, GFP_KERNEL)?;
+        for _ in 0..blocks {
+            data.push(lower_extent(alloc, FREE_LIST_BLOCK_SIZE)?, GFP_KERNEL)?;
+        }
+        Self::init_tables(&mut tables, &data, layout)?;
+        Ok(Self::from_extents(tables, data, layout))
     }
-    fn from_backing(mut backing: KernelObject, blocks: usize, layout: RunLayout) -> Result<Self> {
-        let base = backing.gpu_va();
-        backing.initialize::<PoolTables>(0, |tables| tables.init(base, blocks, layout))?;
-        Ok(Self {
-            backing,
-            blocks,
-            layout,
+    /// Writes the zeroed tables for `data` before their first publication.
+    fn init_tables(tables: &mut KernelObject, data: &[KernelObject], layout: RunLayout) -> Result {
+        tables.initialize::<PoolTables>(0, |view| {
+            view.init(data.len(), |index| data[index].gpu_va(), layout)
         })
+    }
+    fn from_extents(tables: KernelObject, data: KVec<KernelObject>, layout: RunLayout) -> Self {
+        Self {
+            tables,
+            blocks: data.len(),
+            data,
+            layout,
+        }
     }
     /// Fresh compute backing at the admitted capacity, built off-lock.
     pub(crate) fn compute_sized(alloc: &Allocator<'_>, blocks: usize) -> Result<Self> {
@@ -162,20 +189,28 @@ impl Pages {
         }
         Self::new(alloc, blocks, RunLayout::Compute)
     }
-    pub(crate) fn map_client(&self, vm: &mmu::Vm) -> Result<mmu::KernelMapping> {
-        self.backing.map_alias(vm, self.page_list_va(), mmu::PROT_GPU_SHARED_RW)
+    /// Aliases the tables and every block into `vm` at their canonical addresses.
+    pub(crate) fn map_client(&self, vm: &mmu::Vm) -> Result<PoolAliases> {
+        let mut mappings = KVec::with_capacity(self.data.len() + 1, GFP_KERNEL)?;
+        for extent in Iterator::chain(core::iter::once(&self.tables), self.data.iter()) {
+            mappings.push(
+                extent.map_alias(vm, extent.gpu_va(), mmu::PROT_GPU_SHARED_RW)?,
+                GFP_KERNEL,
+            )?;
+        }
+        Ok(PoolAliases { _mappings: mappings })
     }
     pub(crate) fn page_list_va(&self) -> u64 {
-        self.backing.gpu_va()
+        self.tables.gpu_va()
     }
     fn run_list_va(&self) -> u64 {
         self.page_list_va() + PAGE_LIST_SIZE as u64
     }
     fn repopulate(&self) -> Result {
-        let table = self.backing.pointer(0, TABLE_SIZE)?.cast::<u64>();
+        let table = self.tables.pointer(0, TABLE_SIZE)?.cast::<u64>();
         PoolTables::for_each_word(
-            self.page_list_va(),
             self.blocks,
+            |index| self.data[index].gpu_va(),
             self.layout,
             |index, value| {
                 // SAFETY: The page-aligned backing was validated for the complete
@@ -190,11 +225,11 @@ impl Pages {
 /// Pool-object identities are independent of recycled firmware IDs and VAs.
 static RENDER_POOL_SERIAL: AtomicU64 = AtomicU64::new(0);
 
-/// The USC backing of a render pool and its two aliases. Field order drops
-/// both aliases before the backing.
+/// The USC backing of a render pool and its aliases in the client and the
+/// render-global VM. Field order drops every alias before the backing.
 pub(crate) struct RenderBacking {
-    _client: mmu::KernelMapping,
-    _global: mmu::KernelMapping,
+    _client: KVec<mmu::KernelMapping>,
+    _global: KVec<mmu::KernelMapping>,
     pages: Pages,
 }
 
@@ -209,20 +244,37 @@ impl RenderBacking {
         if blocks < RENDER_BLOCKS || blocks > PAGE_LIST_SIZE / (FREE_LIST_BLOCK_PAGES as usize * 8) {
             return Err(EINVAL);
         }
-        let size = TABLE_SIZE + blocks * FREE_LIST_BLOCK_SIZE;
-        let (backing, [global, client]) = place_lower(size, || {
-            alloc.lower_with_aliases(
-                size,
-                mmu::UAT_PGSZ as u64,
-                mmu::PROT_GPU_SHARED_RW,
-                CpuMap::WriteCombined,
-                [render_global, client],
-            )
-        })?;
-        let pages = Pages::from_backing(backing, blocks, RunLayout::Render)?;
+        // Every extent is placed at one address shared by the canonical lower,
+        // render-global and client VMs. The extents are declared before their
+        // aliases, so a failure drops every alias before the extent it names.
+        let mut data = KVec::with_capacity(blocks, GFP_KERNEL)?;
+        let mut tables = None;
+        let mut global_aliases = KVec::with_capacity(blocks + 1, GFP_KERNEL)?;
+        let mut client_aliases = KVec::with_capacity(blocks + 1, GFP_KERNEL)?;
+        for index in 0..=blocks {
+            let size = if index == 0 { TABLE_SIZE } else { FREE_LIST_BLOCK_SIZE };
+            let (extent, [global, client]) = place_lower(size, || {
+                alloc.lower_with_aliases(
+                    size,
+                    mmu::UAT_PGSZ as u64,
+                    mmu::PROT_GPU_SHARED_RW,
+                    CpuMap::WriteCombined,
+                    [render_global, client],
+                )
+            })?;
+            global_aliases.push(global, GFP_KERNEL)?;
+            client_aliases.push(client, GFP_KERNEL)?;
+            if index == 0 {
+                tables = Some(extent);
+            } else {
+                data.push(extent, GFP_KERNEL)?;
+            }
+        }
+        Pages::init_tables(tables.as_mut().ok_or(EINVAL)?, &data, RunLayout::Render)?;
+        let pages = Pages::from_extents(tables.take().ok_or(EINVAL)?, data, RunLayout::Render);
         Ok(Self {
-            _client: client,
-            _global: global,
+            _client: client_aliases,
+            _global: global_aliases,
             pages,
         })
     }
@@ -623,12 +675,8 @@ impl ComputePool {
         Ok(())
     }
 
-    pub(crate) fn map_client(&mut self, vm: &mmu::Vm) -> Result<mmu::KernelMapping> {
-        let pages = self.pages.as_mut().ok_or(EAGAIN)?;
-        let address = pages.page_list_va();
-        pages
-            .backing
-            .map_alias(vm, address, mmu::PROT_GPU_SHARED_RW)
+    pub(crate) fn map_client(&mut self, vm: &mmu::Vm) -> Result<PoolAliases> {
+        self.pages.as_ref().ok_or(EAGAIN)?.map_client(vm)
     }
     pub(crate) fn reserve_submission(&self) -> Result<u64> {
         let counter = self.state.dword(0)?;

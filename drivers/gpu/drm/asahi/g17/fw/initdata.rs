@@ -2200,6 +2200,15 @@ unsafe impl Zeroable for FreeListRunSlot {}
 static_assert!(size_of::<FreeListRunSlot>() == RUN_SLOT_QWORDS as usize * size_of::<u64>());
 
 impl FreeListRunSlot {
+    /// As `new`, refusing a block address the run descriptor cannot carry
+    /// (unaligned, or with bits outside the address field).
+    pub(crate) fn checked(block_va: u64) -> Result<Self> {
+        if block_va & !RUN_ADDRESS_MASK != 0 {
+            return Err(EINVAL);
+        }
+        Ok(Self::new(block_va))
+    }
+
     /// Returns the slot describing the block at `block_va`.
     pub(crate) const fn new(block_va: u64) -> Self {
         Self {

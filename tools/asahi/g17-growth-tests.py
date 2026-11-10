@@ -59,7 +59,7 @@ mod mmu {pub type KernelMapping=u64;}
 mod g17 {
  pub fn now_ns()->u64{crate::now_ns()}
  pub mod channel {pub fn observe_control(_:u32,_:u32){}}
- pub mod freelist {pub(crate) use crate::Pages; pub fn control_consumed(c:u32,_:u32,t:u32)->crate::Result<bool>{Ok(c==t)}}
+ pub mod freelist {pub(crate) use crate::Pages; pub type PoolAliases=u64; pub fn control_consumed(c:u32,_:u32,t:u32)->crate::Result<bool>{Ok(c==t)}}
  pub mod initdata {
   pub struct InitData {pub fail:bool}
   impl InitData {
