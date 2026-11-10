@@ -121,23 +121,34 @@ void mt_rf_fail_locked(struct mt7932 *m, int error)
 	}
 }
 
-/* One owned station and firmware handshake; no host key fabrication. */
+/*
+ * One owned station and firmware handshake; no host key fabrication.
+ *
+ * The infrastructure connection takes its station and WTBL indices from one
+ * index space, as it did before AWDL, so none of its WTBL entries reuses one
+ * of its station indices; the firmware refuses such a connect with -EINVAL.
+ * Each index is still recorded in its own allocator, so AWDL peers keep
+ * their per-table release.
+ */
 static int mt_peer_reserve(struct mt7932 *m)
 {
 	unsigned long station = m->station_alloc, wtbl = m->wtbl_alloc;
+	unsigned long used = station | wtbl;
 	unsigned int i, id;
 
 	for (i = 0; i < ARRAY_SIZE(m->peer_ids.station); i++) {
-		id = find_first_zero_bit(&station, 15);
+		id = find_first_zero_bit(&used, 15);
 		if (id >= 15)
 			return -ENOSPC;
+		__set_bit(id, &used);
 		__set_bit(id, &station);
 		m->peer_ids.station[i] = id;
 	}
 	for (i = 0; i < ARRAY_SIZE(m->peer_ids.wtbl); i++) {
-		id = find_first_zero_bit(&wtbl, 14);
+		id = find_first_zero_bit(&used, 14);
 		if (id >= 14)
 			return -ENOSPC;
+		__set_bit(id, &used);
 		__set_bit(id, &wtbl);
 		m->peer_ids.wtbl[i] = id;
 	}
