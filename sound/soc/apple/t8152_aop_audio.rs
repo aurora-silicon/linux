@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Apple T8152 (J873, Mac mini M6) and T8142 (J813, MacBook Air M5) AOP audio
+//! Apple T8152 (J873, Mac mini M6), T8142 (J813, MacBook Air M5) and T6050
+//! (J714c, MacBook Pro 14-inch M5 Max) AOP audio
 //!
 //! The AOP firmware owns the audio fabric, as on T8140. The ADT
 //! (/arm-io/iop-audio-controller) names its services; all of them run on the
@@ -578,6 +579,17 @@ static HW_CFG_T8152: HwConfig = HwConfig {
 static HW_CFG_T8142: HwConfig = HwConfig {
     spkr_channels: 4,
     sense_channels: 8,
+    sense_formats: FMTBIT_S16_LE,
+    realign_sense: true,
+};
+
+/// J714c: six amplifiers (left and right woofer 1, woofer 2 and tweeter) in
+/// 32-bit slots 0-5, their voltage and current sense back as twelve 16-bit
+/// slots (V, I per amplifier) on the stream's RX, as on J813. The ADT
+/// audio-speaker stream header gives 6 amplifier slots and 12 sense words.
+static HW_CFG_T6050: HwConfig = HwConfig {
+    spkr_channels: 6,
+    sense_channels: 12,
     sense_formats: FMTBIT_S16_LE,
     realign_sense: true,
 };
@@ -1389,6 +1401,7 @@ kernel::of_device_table!(
     [
         (of::DeviceId::new(c_str!("apple,t8142-aop-audio")), &HW_CFG_T8142),
         (of::DeviceId::new(c_str!("apple,t8152-aop-audio")), &HW_CFG_T8152),
+        (of::DeviceId::new(c_str!("apple,t6050-aop-audio")), &HW_CFG_T6050),
     ]
 );
 
