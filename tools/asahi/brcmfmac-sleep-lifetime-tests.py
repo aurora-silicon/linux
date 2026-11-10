@@ -5,9 +5,12 @@
 from pathlib import Path
 import resource
 import subprocess
+import sys
 import tempfile
 
-from sleep_test_utils import function
+# python3 -I, as run-host-tests.py runs it, leaves this directory off sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sleep_test_utils import function  # noqa: E402
 
 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 root = Path(__file__).resolve().parents[2]

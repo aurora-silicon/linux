@@ -2,28 +2,71 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """Check that the compiled legacy policy preserves USB4's PMGR providers.
 
-Usage: t8132-usb4-policy-tests.py POLICY.dtb BOARD.dtb [BOARD.dtb ...]
-Requires the Python libfdt module. No hardware access.
+Usage: t8132-usb4-policy-tests.py --dtc DTC --output DIR
+Builds the T8132 platform data and the J713 and J715 trees from this checkout
+with the given dtc, as the kernel build does. No hardware access.
 """
 
+import argparse
 from pathlib import Path
 import struct
-import sys
+import subprocess
 
-import libfdt
+ROOT = Path(__file__).resolve().parents[2]
+BOARDS = ('t8132-j713', 't8132-j715')
+
+
+class Tree:
+    """A flattened tree's nodes in depth-first order, with their paths and properties."""
+
+    def __init__(self, blob):
+        magic, _, off_struct, off_strings = struct.unpack_from('>4I', blob)
+        assert magic == 0xd00dfeed, 'Not a flattened device tree'
+        self.paths, self.props, self.children = [], [], []
+        stack, pos = [], off_struct
+        while True:
+            token, = struct.unpack_from('>I', blob, pos)
+            pos += 4
+            if token == 1:  # FDT_BEGIN_NODE
+                end = blob.index(b'\0', pos)
+                name = blob[pos:end].decode()
+                pos = (end + 4) & ~3
+                node = len(self.paths)
+                if stack:
+                    self.children[stack[-1]].append(node)
+                    self.paths.append(self.paths[stack[-1]].rstrip('/') + '/' + name)
+                else:
+                    self.paths.append('/')
+                self.props.append({})
+                self.children.append([])
+                stack.append(node)
+            elif token == 2:  # FDT_END_NODE
+                stack.pop()
+            elif token == 3:  # FDT_PROP
+                length, nameoff = struct.unpack_from('>II', blob, pos)
+                pos += 8
+                start = off_strings + nameoff
+                name = blob[start:blob.index(b'\0', start)].decode()
+                self.props[stack[-1]][name] = blob[pos:pos + length]
+                pos = (pos + length + 3) & ~3
+            elif token == 9:  # FDT_END
+                assert not stack, 'Unterminated node'
+                return
+            else:
+                assert token == 4, f'Bad structure token {token:#x}'  # FDT_NOP
+
+    def get_path(self, node):
+        return self.paths[node]
 
 
 def nodes(tree, parent=0):
     yield parent
-    child = tree.first_subnode(parent, quiet=(libfdt.NOTFOUND,))
-    while child >= 0:
+    for child in tree.children[parent]:
         yield from nodes(tree, child)
-        child = tree.next_subnode(child, quiet=(libfdt.NOTFOUND,))
 
 
 def prop(tree, node, name):
-    value = tree.getprop(node, name, quiet=(libfdt.NOTFOUND,))
-    return b'' if isinstance(value, int) else bytes(value)
+    return tree.props[node].get(name, b'')
 
 
 def words(value):
@@ -88,13 +131,29 @@ def check(policy, board):
     return len(checked)
 
 
+def build(dtc, source, dtb):
+    """Preprocess and compile one tree, as scripts/Makefile.dtbs does."""
+    text = subprocess.check_output([
+        'cpp', '-nostdinc', '-undef', '-D__DTS__',
+        '-I', str(ROOT / 'scripts/dtc/include-prefixes'),
+        '-x', 'assembler-with-cpp', str(source),
+    ])
+    subprocess.run([dtc, '-q', '-I', 'dts', '-O', 'dtb', '-o', str(dtb)], input=text, check=True)
+    return Tree(dtb.read_bytes())
+
+
 def main():
-    if len(sys.argv) < 3:
-        raise SystemExit(__doc__)
-    policy = libfdt.Fdt(Path(sys.argv[1]).read_bytes())
-    for name in sys.argv[2:]:
-        count = check(policy, libfdt.Fdt(Path(name).read_bytes()))
-        print(f'{Path(name).name}: {count} USB4 PMGR providers available')
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument('--dtc', required=True, help="this kernel's built scripts/dtc/dtc")
+    parser.add_argument('--output', type=Path, required=True)
+    args = parser.parse_args()
+    args.output.mkdir(parents=True, exist_ok=True)
+    policy = build(args.dtc, ROOT / 'drivers/soc/apple/t8132-platform-data.dts',
+                   args.output / 't8132-platform-data.dtb')
+    for board in BOARDS:
+        tree = build(args.dtc, ROOT / f'arch/arm64/boot/dts/apple/{board}.dts',
+                     args.output / f'{board}.dtb')
+        print(f'{board}.dtb: {check(policy, tree)} USB4 PMGR providers available')
 
 
 if __name__ == '__main__':

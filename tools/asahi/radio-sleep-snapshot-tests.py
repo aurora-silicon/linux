@@ -3,11 +3,15 @@
 """Exercise the production retained-link snapshot, including an operating link with BUSY set."""
 
 from pathlib import Path
-import sleep_test_utils as x
 import re
 import resource
 import subprocess
+import sys
 import tempfile
+
+# python3 -I, as run-host-tests.py runs it, leaves this directory off sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sleep_test_utils as x  # noqa: E402
 
 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 root = Path(__file__).resolve().parents[2]
