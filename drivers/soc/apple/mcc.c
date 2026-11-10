@@ -304,7 +304,7 @@ static int apple_mcc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct apple_mcc *mcc;
-	bool t6041;
+	bool t6041, action_table;
 	int ret;
 
 	mcc = devm_kzalloc(dev, sizeof(*mcc), GFP_KERNEL);
@@ -313,15 +313,18 @@ static int apple_mcc_probe(struct platform_device *pdev)
 
 	mcc->dev = dev;
 	t6041 = of_device_is_compatible(dev->of_node, "apple,t6041-mcc");
+	action_table = t6041;
 	mcc->retained = of_device_is_compatible(dev->of_node, "apple,t8132-mcc");
 	while (platform_get_resource(pdev, IORESOURCE_MEM, mcc->nr_planes)) {
 		struct resource *res = platform_get_resource(pdev, IORESOURCE_MEM, mcc->nr_planes);
 
 		if (mcc->nr_planes == MCC_MAX_PLANES)
 			return dev_err_probe(dev, -EINVAL, "too many planes\n");
-		if (resource_size(res) < (mcc->retained ? 0x1c1c04 :
-					  t6041 ? MCC_T6041_PLANE_SIZE : 0x4000))
+		if (resource_size(res) < (mcc->retained ? 0x1c1c04 : 0x4000))
 			return dev_err_probe(dev, -EINVAL, "cache register aperture too small\n");
+		/* A device tree that predates the wider T6041 window still gets allocation. */
+		if (resource_size(res) < MCC_T6041_PLANE_SIZE)
+			action_table = false;
 		mcc->planes[mcc->nr_planes] = devm_platform_ioremap_resource(pdev, mcc->nr_planes);
 		if (IS_ERR(mcc->planes[mcc->nr_planes]))
 			return PTR_ERR(mcc->planes[mcc->nr_planes]);
@@ -336,9 +339,13 @@ static int apple_mcc_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, mcc);
 
-	if (t6041) {
+	if (t6041 && !action_table) {
+		dev_dbg(dev, "DSID action table not mapped, stream left in place\n");
+	} else if (t6041) {
 		ret = apple_mcc_release_t6041_stream(mcc);
-		if (ret)
+		if (ret == -ENOENT)
+			dev_dbg(dev, "no GPU parameter-buffer stream record\n");
+		else if (ret)
 			dev_warn(dev, "GPU parameter-buffer stream not released: %pe\n",
 				 ERR_PTR(ret));
 	}
