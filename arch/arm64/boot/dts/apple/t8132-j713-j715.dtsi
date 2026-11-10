@@ -357,27 +357,27 @@
 };
 
 /*
- * t8132-j713-pmgr.dtsi disables VENC, SCODEC and SIO_CPU, and their engines
+ * t8132-j713-pmgr.dtsi disables SCODEC and SIO_CPU, and their engines
  * with them. Their DARTs, which name those states in t8132-peripherals.dtsi,
  * would wait for them forever if anything enabled them, so drop the reference
  * here.
  */
-&dart_ave0 {
-	/delete-property/ power-domains;
-};
-
-&dart_ave1 {
-	/delete-property/ power-domains;
-};
-
-&dart_ave2 {
-	/delete-property/ power-domains;
-};
-
 &dart_apr0 {
 	/delete-property/ power-domains;
 };
 
 &dart_sio0 {
 	/delete-property/ power-domains;
+};
+
+&dart_ave0 {
+	status = "okay";
+};
+
+&dart_ave1 {
+	status = "okay";
+};
+
+&ave {
+	status = "okay";
 };
