@@ -131,6 +131,7 @@ struct apple_dcp {
  struct delayed_work typec_reconnect_wq, placeholder_edid_wq;
  struct work_struct external_stop_work;
  bool external_running, external_stopped, external_power_attempted;
+ unsigned int afk_power_gen;
  bool external_stop_deferred; unsigned int external_stop_retries;
  struct delayed_work external_stop_retry_wq;
  bool external_cable, typec_cable_connected, typec_crtc_off, pipe_enabled_h17p;
