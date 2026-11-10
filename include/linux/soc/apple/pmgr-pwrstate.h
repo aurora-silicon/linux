@@ -8,6 +8,7 @@ struct device;
 struct device_node;
 
 #if IS_ENABLED(CONFIG_APPLE_PMGR_PWRSTATE)
+int apple_pmgr_ps_verify_off(struct device *consumer);
 int apple_pmgr_ps_cycle(struct device_node *np);
 int apple_pmgr_ps_verify_state(struct device *domain_dev, bool on);
 /*
@@ -22,6 +23,7 @@ int apple_pmgr_ps_consumer_off(struct device *consumer);
 int apple_pmgr_ps_consumer_on(struct device *consumer);
 bool apple_pmgr_ps_consumer_is_off(struct device *consumer);
 #else
+static inline int apple_pmgr_ps_verify_off(struct device *consumer) { return -EOPNOTSUPP; }
 static inline int apple_pmgr_ps_verify_state(struct device *domain_dev, bool on)
 {
 	return -EOPNOTSUPP;
