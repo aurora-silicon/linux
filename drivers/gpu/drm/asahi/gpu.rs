@@ -1360,6 +1360,19 @@ impl GpuManager::ver {
 
 #[versions(AGX)]
 impl Gpu for GpuManager::ver {
+    /// A light submission completes in tens of microseconds, so its submitter
+    /// sleeps briefly between submissions and the CPU scheduler places and
+    /// clocks it like idle work: on G13/G14 a single client then spends more
+    /// time waking, recording and submitting than the GPU spends executing.
+    /// Give its blocking syncobj waits the same expiring capacity hint as the
+    /// G17 feed (half of the CPU capacity scale, valid for 8 ms after each
+    /// submission). The hint changes no task attribute or affinity.
+    fn syncobj_wait_hint(&self) -> Option<(u32, u32)> {
+        const WAIT_UTIL_MIN: u32 = 512;
+        const WAIT_HINT_MS: u32 = 8;
+        cfg!(CONFIG_UCLAMP_TASK).then_some((WAIT_UTIL_MIN, WAIT_HINT_MS))
+    }
+
     fn stats_snapshot(&self) -> Option<Arc<stats::StatsSnapshot>> {
         Some(self.stats.clone())
     }
