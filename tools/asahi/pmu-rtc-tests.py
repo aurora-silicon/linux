@@ -21,6 +21,8 @@ MUTATIONS = {
     'event-bit': ('.event_bit = BIT(1)', '.event_bit = BIT(0)'),
     'wrong-control': ('.control = 0x2000', '.control = 0xf800'),
     'maverick-event': ('.event = 0x14c0', '.event = 0x140c'),
+    'control-event-clear': ('control &= ~rtc->hw->control_event_bit;',
+                            'control |= rtc->hw->control_event_bit;'),
     'stowe-offset': ('static const struct apple_pmu_rtc_hw apple_pmu_rtc_stowe = {',
                      'static const struct apple_pmu_rtc_hw apple_pmu_rtc_stowe = {\n\t.offset_in_seconds = true,'),
 }
@@ -62,7 +64,11 @@ struct rtc_wkalrm { struct rtc_time time; bool enabled, pending; };
 struct rtc_device { int events; };
 struct device { void *data; bool wake; int wake_events; };
 struct nvmem_cell { u8 data[8]; size_t bytes; int error; };
-struct regmap { u8 bytes[65536]; unsigned ctrl, counter, compare, mask, event, bit; int ops, fail; };
+struct regmap {
+    u8 bytes[65536];
+    unsigned ctrl, counter, compare, mask, event, bit, control_event;
+    int ops, fail;
+};
 static int disabled, pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
 static inline __attribute__((unused)) s64 sign_extend64(u64 v, int bit) { return (s64)(v << (63 - bit)) >> (63 - bit); }
 static u64 get_unaligned_le64(const void *p) { u64 v; memcpy(&v, p, 8); return v; }
@@ -94,6 +100,10 @@ static int regmap_write(struct regmap *m, unsigned reg, unsigned v) {
     if (reg == m->event) {
         /* W1C event, normal R/W bits in the same byte. */
         m->bytes[reg] = (v & ~m->bit) | (m->bytes[reg] & m->bit & ~v);
+    } else if (reg == m->ctrl && m->control_event) {
+        /* Maverick's control-side event latch is cleared by writing zero. */
+        m->bytes[reg] = (v & ~m->control_event) |
+                        (m->bytes[reg] & m->control_event & v);
     } else m->bytes[reg] = v;
     return 0;
 }
@@ -112,6 +122,17 @@ static int regmap_bulk_write(struct regmap *m, unsigned reg, const void *v, size
     assert(reg == m->compare && n == 4);
     assert(!(m->bytes[m->ctrl] & 0x40) && (m->bytes[m->mask] & 1));
     memcpy(m->bytes + reg, v, n); return 0;
+}
+static bool fire_alarm(struct regmap *m) {
+    assert(m->bytes[m->ctrl] & 0x40);
+    m->bytes[m->ctrl] &= ~0x40;
+    if (m->control_event) {
+        /* A stale control latch suppresses the next separate-event edge. */
+        if (m->bytes[m->ctrl] & m->control_event) return false;
+        m->bytes[m->ctrl] |= m->control_event;
+    }
+    m->bytes[m->event] |= m->bit;
+    return true;
 }
 '''
 
@@ -137,7 +158,7 @@ static void reset(int v) {
         [STOWE] = {.ctrl = 0xf800, .counter = 0xf802, .compare = 0xf808, .mask = 0xf80e,
                    .event = 0xf80c, .bit = 1},
         [MAVERICK] = {.ctrl = 0x1401, .counter = 0x1406, .compare = 0x140c, .mask = 0x14c2,
-                      .event = 0x14c0, .bit = 1},
+                      .event = 0x14c0, .bit = 1, .control_event = 2},
     };
     static const struct apple_pmu_rtc_hw *hw[] = {
         [BAKU] = &apple_pmu_rtc_baku, [ABBEY] = &apple_pmu_rtc_abbey,
@@ -149,8 +170,9 @@ static void reset(int v) {
     rtc = (struct apple_pmu_rtc){.hw = hw[v],
         .map = &map, .offset = &offset, .clock = &clock_model};
     dev = (struct device){.data = &rtc, .wake = true}; disabled = 0;
-    /* Keep an unrelated writable bit, and Abbey's monitor bit. */
+    /* Keep an unrelated writable bit, and each variant's monitor bit. */
     map.bytes[map.ctrl] = a ? 0x81 : 0x80;
+    if (v == MAVERICK) map.bytes[map.ctrl] = 0x03;
     set_counter(100ULL << 16);
     set_offset(a ? 1000LL * 32768 + 16384 : 1000);
 }
@@ -161,20 +183,29 @@ static void run_variant(int v) {
     struct rtc_wkalrm alarm = {.time.seconds = 1130, .enabled = true}, readback;
     s64 ticks;
     reset(v);
+    if (v == MAVERICK) {
+        /* A stale 0x03 latch suppresses a new edge until control bit 1 clears. */
+        assert(map.bytes[map.ctrl] == 0x03 && !(map.bytes[map.event] & map.bit));
+        map.bytes[map.ctrl] |= 0x40;
+        assert(!fire_alarm(&map));
+        assert(map.bytes[map.ctrl] == 0x03 && !(map.bytes[map.event] & map.bit));
+    }
     assert(!apple_pmu_rtc_read_time(&dev, &time) && time.seconds == 1100);
     set_counter((100ULL << 16) + 49152);
     assert(!apple_pmu_rtc_read_time(&dev, &time) && time.seconds == (a ? 1101 : 1100));
     assert(!apple_pmu_rtc_set_alarm(&dev, &alarm));
     assert(comparator() == 130 && (map.bytes[map.ctrl] & 0x40));
-    assert(map.bytes[map.ctrl] == (a ? 0xc1 : 0xc0));
+    assert(map.bytes[map.ctrl] == (v == MAVERICK ? 0x41 : (a ? 0xc1 : 0xc0)));
     assert(!(map.bytes[map.mask] & 1));
     assert(!apple_pmu_rtc_read_alarm(&dev, &readback));
     assert(readback.time.seconds == 1130 && readback.enabled && !readback.pending);
     /* Acknowledge without changing ARM, monitor or the unrelated bit. */
-    map.bytes[map.event] |= map.bit;
+    assert(fire_alarm(&map));
+    if (v == MAVERICK) assert(map.bytes[map.ctrl] == 0x03);
     assert(!apple_pmu_rtc_ack_alarm(&rtc));
-    assert(map.bytes[map.ctrl] == (a ? 0xc1 : 0xc0));
+    assert(map.bytes[map.ctrl] == (a ? (v == MAVERICK ? 0x03 : 0x81) : 0x80));
     assert(!(map.bytes[map.event] & map.bit));
+    assert(!apple_pmu_rtc_arm(&rtc, true));
     /* An ordinary control write must not consume a latched event. */
     map.bytes[map.event] |= map.bit;
     assert(!apple_pmu_rtc_arm(&rtc, false));
@@ -182,12 +213,12 @@ static void run_variant(int v) {
     assert(!apple_pmu_rtc_read_alarm(&dev, &readback) && readback.pending);
     assert(apple_pmu_rtc_interrupt(7, &dev) == IRQ_HANDLED);
     assert(clock_model.events == 1 && dev.wake_events == 1);
-    assert(map.bytes[map.ctrl] == (a ? 0x81 : 0x80));
+    assert(map.bytes[map.ctrl] == (v == MAVERICK ? 0x01 : (a ? 0x81 : 0x80)));
     assert(!(map.bytes[map.event] & map.bit) && (map.bytes[map.mask] & 1));
     assert(apple_pmu_rtc_interrupt(7, &dev) == IRQ_NONE && clock_model.events == 1);
     /* Repeat arm/fire; no stuck status or stale IRQ after the first alarm. */
     assert(!apple_pmu_rtc_alarm_enable(&dev, 1));
-    map.bytes[map.event] |= map.bit;
+    assert(fire_alarm(&map));
     dev.wake = false;
     assert(apple_pmu_rtc_interrupt(7, &dev) == IRQ_HANDLED);
     assert(clock_model.events == 2 && dev.wake_events == 1);
@@ -218,7 +249,7 @@ static void run_variant(int v) {
     assert(!apple_pmu_rtc_set_alarm(&dev, &alarm));
     map.ops = 0;
     assert(!apple_pmu_rtc_init_alarm(&rtc) && (map.bytes[map.ctrl] & 0x40));
-    set_counter(131ULL << 16); map.bytes[map.event] |= map.bit;
+    set_counter(131ULL << 16); assert(fire_alarm(&map));
     assert(!apple_pmu_rtc_init_alarm(&rtc));
     assert(!(map.bytes[map.ctrl] & 0x40) && !(map.bytes[map.event] & map.bit));
     assert(map.bytes[map.mask] & 1);

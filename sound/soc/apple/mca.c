@@ -127,6 +127,9 @@
 			   SNDRV_PCM_FMTBIT_S24_LE | \
 			   SNDRV_PCM_FMTBIT_S32_LE)
 
+/* Largest PCM buffer, and the playback preallocation: 3 MiB. */
+#define MCA_BUFFER_BYTES_MAX (512 * 1024 * 6)
+
 struct mca_cluster {
 	int no;
 	__iomem void *base;
@@ -962,7 +965,15 @@ static int mca_set_runtime_hwparams(struct snd_soc_component *component,
 	hw.periods_max = UINT_MAX;
 	hw.period_bytes_min = 256;
 	hw.period_bytes_max = dma_get_max_seg_size(dma_dev);
-	hw.buffer_bytes_max = SIZE_MAX;
+	/*
+	 * The capture buffer is not preallocated (see mca_pcm_new()), so the
+	 * core does not bound it by a preallocation: bound it here, at the size
+	 * the playback preallocation (and formerly the capture one) allows. An
+	 * unbounded maximum lets a client that sets no buffer size, such as
+	 * speakersafetyd on the speaker sense PCM, ask for gigabytes and fail
+	 * hw_params with -ENOMEM.
+	 */
+	hw.buffer_bytes_max = MCA_BUFFER_BYTES_MAX;
 	hw.fifo_size = 16;
 
 	ret = snd_dmaengine_pcm_refine_runtime_hwparams(substream, &dma_data,
@@ -1245,7 +1256,7 @@ static int mca_pcm_new(struct snd_soc_component *component,
 						   chan->device->dev, 0, SIZE_MAX);
 		else
 			snd_pcm_set_managed_buffer(substream, SNDRV_DMA_TYPE_DEV_IRAM,
-						   chan->device->dev, 512 * 1024 * 6,
+						   chan->device->dev, MCA_BUFFER_BYTES_MAX,
 						   SIZE_MAX);
 	}
 

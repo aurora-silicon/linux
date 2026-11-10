@@ -662,6 +662,12 @@ static void dcp_report_swap_complete(struct apple_dcp *dcp, u32 id, ktime_t now)
 	if (!dcp_desktop_present_complete(dcp, id))
 		return;
 	dcp_backlight_desktop_finish(dcp, id, false, true);
+#else
+	/* Nor can a lost flip's on firmware that does not track its presents. */
+	if ((!DCP_FW_H17(DCP_FW_VER) ||
+	     dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G) &&
+	    dcp_swap_lost(dcp, id))
+		return;
 #endif
 	dcp->last_swap_id = id;
 	dcp->have_swap_complete = true;
@@ -966,11 +972,7 @@ dcpep_cb_get_uint_prop(struct apple_dcp *dcp, struct dcp_get_uint_prop_req *req)
 	if (dcp->panel.has_mini_led &&
 	    memcmp(req->obj, "SUMP", sizeof(req->obj)) == 0) { /* "PMUS */
 	    if (strncmp(req->key, "Temperature", sizeof(req->key)) == 0) {
-		/*
-		 * TODO: value from j314c, find out if it is temperature in
-		 *       centigrade C and which temperature sensor reports it
-		 */
-		resp.value = 3029;
+		resp.value = dcp_pmu_temperature(dcp->dev);
 		resp.ret = true;
 	    }
 	}
@@ -2252,6 +2254,7 @@ static void dcp_swap_clear_started(struct apple_dcp *dcp, void *data,
 		dcp_prepare_clear_swap(dcp, &DCP_FW_SWAP(dcp));
 #endif
 	DCP_FW_SWAP(dcp).swap.swap_id = resp->swap_id;
+	WRITE_ONCE(dcp->started_swap_id, resp->swap_id);
 	if (dcp_present_retires(dcp))
 		dcp_arm_retained_framebuffers(dcp, resp->swap_id);
 
@@ -3147,6 +3150,7 @@ static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 		return;
 #endif
 	DCP_FW_SWAP(dcp).swap.swap_id = resp->swap_id;
+	WRITE_ONCE(dcp->started_swap_id, resp->swap_id);
 	if (dcp_present_retires(dcp))
 		dcp_arm_retained_framebuffers(dcp, resp->swap_id);
 
@@ -3814,7 +3818,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	dcp->output_pq = dcp->pq_requested && mode->pq.score >= 0;
 
 	/* Built-in ProMotion panels require timestamps even in fixed-120 mode. */
-	dcp->use_timestamps = mode->vrr && dcp->main_display;
+	dcp->use_timestamps = mode->needs_timestamps && dcp->main_display;
 
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie) {

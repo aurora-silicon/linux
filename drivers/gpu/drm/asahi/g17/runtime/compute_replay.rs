@@ -146,6 +146,11 @@ impl Firmware {
                     }
                     queue.fail_replays(error);
                     if !queue.owns_packet(&packet) {
+                        // Replays are spared work a recovery dropped before it ran: it fails
+                        // without poisoning its VM, as a dropped render group does.
+                        if !packet.completion.guilty() {
+                            packet.completion.classify(recovery::Class::Spared);
+                        }
                         deferred
                             .push(Deferred::Retired(packet.completion.clone(), Err(ENODATA)))?;
                     }

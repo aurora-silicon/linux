@@ -44,6 +44,13 @@ properties:
   connector:
     $ref: /schemas/connector/usb-connector.yaml#
 
+  apple,reset-inherited-usb2-connection:
+    type: boolean
+    description:
+      The boot USB port retains a USB2 repeater connection that cannot be
+      recovered by resetting the host PHY. Renegotiate a normal application
+      connection before starting the host controllers. Debug routes are preserved.
+
 required:
   - compatible
   - reg

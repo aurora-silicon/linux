@@ -1251,7 +1251,7 @@ impl SepData {
                 dev_err!(self.dev, "enrol: opt-in fresh-context owner export failed\n");
                 return false;
             }
-            if crate::catacomb::read(PRIVATE_TYPE_CATACOMB_OWNER).is_none() {
+            if !crate::catacomb::is_saved(PRIVATE_TYPE_CATACOMB_OWNER) {
                 dev_err!(self.dev, "enrol: opt-in fresh context has no owner file\n");
                 return false;
             }
@@ -1390,9 +1390,9 @@ impl SepData {
             return;
         }
         if self.templates_restored.load(Relaxed)
-            || crate::catacomb::read(PRIVATE_TYPE_CATACOMB_OWNER).is_some()
-            || crate::catacomb::read(PRIVATE_TYPE_CATACOMB_MASTER).is_none()
-            || crate::catacomb::read(PRIVATE_TYPE_CATACOMB_USER).is_none()
+            || !crate::catacomb::is_absent(PRIVATE_TYPE_CATACOMB_OWNER)
+            || !crate::catacomb::is_saved(PRIVATE_TYPE_CATACOMB_MASTER)
+            || !crate::catacomb::is_saved(PRIVATE_TYPE_CATACOMB_USER)
         {
             dev_warn!(self.dev, "owner-probe: preconditions not met; no context selected\n");
             return;
@@ -1528,8 +1528,10 @@ impl SepData {
             crate::sbio::ComponentAction::AlreadyActive => RestoreOutcome::AlreadyActive,
             crate::sbio::ComponentAction::Unsupported => RestoreOutcome::Failed,
             crate::sbio::ComponentAction::Load => {
-                let Some(blob) = self.read_stored(kind, what) else {
-                    return RestoreOutcome::NoStoredFile;
+                let blob = match self.read_stored(kind, what) {
+                    Ok(Some(blob)) => blob,
+                    Ok(None) => return RestoreOutcome::NoStoredFile,
+                    Err(_) => return RestoreOutcome::Failed,
                 };
 
                 let at = crate::sbio::SBIO_SAVED_USER_ID_AT;
@@ -1646,8 +1648,10 @@ impl SepData {
     }
 
     fn restore_lockout(&self) -> RestoreOutcome {
-        let Some(blob) = self.read_stored(PRIVATE_TYPE_LOCKOUT, c"bio lockout record") else {
-            return RestoreOutcome::NoStoredFile;
+        let blob = match self.read_stored(PRIVATE_TYPE_LOCKOUT, c"bio lockout record") {
+            Ok(Some(blob)) => blob,
+            Ok(None) => return RestoreOutcome::NoStoredFile,
+            Err(_) => return RestoreOutcome::Failed,
         };
         let Some(request) = crate::sbio::SbioLoadLockout::new(&blob) else {
             return RestoreOutcome::Failed;
@@ -1673,17 +1677,26 @@ impl SepData {
         }
     }
 
-    fn read_stored(&self, kind: u8, _what: &CStr) -> Option<KVec<u8>> {
+    /// `Ok(None)` means provably not stored; any read failure is an error so
+    /// it cannot be mistaken for a missing file.
+    fn read_stored(&self, kind: u8, what: &CStr) -> Result<Option<KVec<u8>>> {
         if crate::catacomb::is_kind(kind) {
-            if let Some(blob) = crate::catacomb::read(kind) {
-                return Some(blob);
+            match crate::catacomb::read(kind) {
+                Ok(Some(blob)) => return Ok(Some(blob)),
+                Ok(None) => {}
+                Err(e) => {
+                    dev_err!(self.dev, "restore: cannot read {}: {:?}\n", what, e);
+                    return Err(e);
+                }
             }
         }
         match self.with_host_store(|store| store.read(&store::Key::root(kind))) {
-            Some(Ok(Some(blob))) => Some(blob),
-            Some(Ok(None)) => None,
-            Some(Err(_)) => None,
-            None => None,
+            Some(Ok(found)) => Ok(found),
+            Some(Err(e)) => {
+                dev_err!(self.dev, "restore: cannot read {}: {:?}\n", what, e);
+                Err(e)
+            }
+            None => Ok(None),
         }
     }
 
@@ -1737,7 +1750,7 @@ impl SepData {
             }
             if (who.value() == user.value()
                 || who.value() == crate::sbio::CatacombUser::MASTER.value())
-                && crate::catacomb::read(kind).is_none()
+                && !crate::catacomb::is_saved(kind)
             {
                 dev_err!(self.dev, "enrol: {} has no durable host file\n", what);
                 return false;
@@ -1751,7 +1764,7 @@ impl SepData {
     }
 
     fn save_all_components_user_first(&self, user: crate::sbio::UserId) -> bool {
-        if crate::catacomb::read(PRIVATE_TYPE_CATACOMB_OWNER).is_none() {
+        if !crate::catacomb::is_saved(PRIVATE_TYPE_CATACOMB_OWNER) {
             dev_err!(self.dev, "enrol: opt-in completion has no owner Catacomb file\n");
             return false;
         }
@@ -1790,7 +1803,7 @@ impl SepData {
             if !self.save_catacomb(who, kind, what) {
                 return false;
             }
-            if crate::catacomb::read(kind).is_none() {
+            if !crate::catacomb::is_saved(kind) {
                 dev_err!(self.dev, "enrol: opt-in {} has no durable host file\n", what);
                 return false;
             }
@@ -1846,7 +1859,7 @@ impl SepData {
                 dev_err!(self.dev, "verify: {} persistence failed\n", what);
                 return false;
             }
-            if crate::catacomb::read(kind).is_none() {
+            if !crate::catacomb::is_saved(kind) {
                 dev_err!(self.dev, "verify: {} has no durable host file\n", what);
                 return false;
             }
@@ -2913,7 +2926,7 @@ impl SepData {
         let advertised = match self.await_capture() {
             CaptureWait::Ready(n) => n,
             CaptureWait::Timeout => {
-                dev_warn!(self.dev, "verify: the capture ended without a frame\n");
+                dev_info!(self.dev, "verify: the capture ended without a frame\n");
                 // No finger came: nothing was compared, so ask again rather
                 // than report an error. PLACE names the cause.
                 self.retry_cause(bio::Guidance::Place);
@@ -4024,7 +4037,7 @@ impl SepData {
         let available = match self.await_capture() {
             CaptureWait::Ready(n) => n,
             CaptureWait::Timeout => {
-                dev_warn!(self.dev, "enrol: capture {} ended without a frame\n", counter);
+                dev_info!(self.dev, "enrol: capture {} ended without a frame\n", counter);
                 return ImageOutcome::NoFinger;
             }
             CaptureWait::Fault(state) => {
@@ -4359,26 +4372,62 @@ impl SepData {
     fn on_lock_state_notification(&self, word: u64) {
         let state = (word >> proto::MSG_TYPE_SHIFT) as u16;
         let user = (word >> proto::MSG_DATA_SHIFT) as u32;
-        self.bio_lock_state
-            .store(u64::from(state) | (u64::from(user) << 16), Relaxed);
+        let word = u64::from(state) | (u64::from(user) << 16);
+        self.bio_lock_state.store(word, Relaxed);
         self.bio_lock_state_seq.fetch_add(1, Relaxed);
         let lockout = if state & LOCK_STATE_NEEDS_PASSWORD != 0 { "set" } else { "clear" };
         let n = lock_state_names(state);
-        dev_info!(
-            self.dev,
-            "sbio: lock state of user {} is {:#06x} (lockout {}:{}{}{}{}{}{}{})\n",
-            user,
-            state,
-            lockout,
-            n[0],
-            n[1],
-            n[2],
-            n[3],
-            n[4],
-            n[5],
-            n[6]
-        );
+        // The enclave repeats a user's state after each query; log each
+        // user's state when it changes, and a repeat only at debug level.
+        if self.lock_state_changed(word) {
+            dev_info!(
+                self.dev,
+                "sbio: lock state of user {} is {:#06x} (lockout {}:{}{}{}{}{}{}{})\n",
+                user,
+                state,
+                lockout,
+                n[0],
+                n[1],
+                n[2],
+                n[3],
+                n[4],
+                n[5],
+                n[6]
+            );
+        } else {
+            dev_dbg!(
+                self.dev,
+                "sbio: lock state of user {} is still {:#06x}\n",
+                user,
+                state
+            );
+        }
         self.sbio_wq.notify_all();
+    }
+
+    /// Records `word` (state and user, as in `bio_lock_state`) as the last
+    /// lock state logged for its user. Returns false if it is that user's
+    /// last logged state already. A user not in the table takes the slot of
+    /// one that is, in turn, so a new user is always logged.
+    fn lock_state_changed(&self, word: u64) -> bool {
+        let user = word >> 16;
+        let slots = &self.bio_lock_logged;
+        let mut free = None;
+        for (i, slot) in slots.iter().enumerate() {
+            let seen = slot.load(Relaxed);
+            if seen == 0 {
+                free.get_or_insert(i);
+            } else if seen >> 16 == user {
+                if seen == word {
+                    return false;
+                }
+                slot.store(word, Relaxed);
+                return true;
+            }
+        }
+        let i = free.unwrap_or_else(|| (self.bio_lock_state_seq.load(Relaxed) as usize) % slots.len());
+        slots[i].store(word, Relaxed);
+        true
     }
 
     /// Waits up to `timeout_ms` for a lock-state notification for `user`
@@ -5515,7 +5564,7 @@ impl SepData {
         let kinds = [PRIVATE_TYPE_CATACOMB_OWNER, PRIVATE_TYPE_CATACOMB_USER,
                      PRIVATE_TYPE_CATACOMB_MASTER];
         let readable = kinds.map(|kind| !catacomb_needed_for_enrol(kind, live_count)
-            || crate::catacomb::read(kind).is_some());
+            || crate::catacomb::is_saved(kind));
         let writable = kinds.map(|kind| !catacomb_needed_for_enrol(kind, live_count)
             || crate::catacomb::writable(kind));
         let index = self.bio_index.lock();
@@ -5578,12 +5627,16 @@ impl SepData {
         if !ids.is_empty() {
             // An existing identity must already have a durable owner file;
             // selecting SYSTEM here could disturb its live context.
-            return if crate::catacomb::read(PRIVATE_TYPE_CATACOMB_OWNER).is_some() {
+            return if crate::catacomb::is_saved(PRIVATE_TYPE_CATACOMB_OWNER) {
                 bio::ok()
             } else { Err(ENODATA) };
         }
-        if crate::catacomb::read(PRIVATE_TYPE_CATACOMB_OWNER).is_some() {
+        if crate::catacomb::is_saved(PRIVATE_TYPE_CATACOMB_OWNER) {
             return bio::ok();
+        }
+        // An unreadable owner record is not permission to select a new context.
+        if !crate::catacomb::is_absent(PRIVATE_TYPE_CATACOMB_OWNER) {
+            return Err(EIO);
         }
         if !self.keybag_designated.load(Relaxed)
             || !self.enrol_material.lock().as_ref()
@@ -5611,7 +5664,7 @@ impl SepData {
             if !prepared { return Err(EIO); }
             break;
         }
-        if crate::catacomb::read(PRIVATE_TYPE_CATACOMB_OWNER).is_none()
+        if !crate::catacomb::is_saved(PRIVATE_TYPE_CATACOMB_OWNER)
             || !crate::catacomb::writable(PRIVATE_TYPE_CATACOMB_OWNER) {
             return Err(EROFS);
         }
@@ -6025,7 +6078,7 @@ impl SepData {
         // owner Catacomb provides the recovery path even when the bag snapshot
         // has no binding; export that owner first if this install lacks a file.
         for kind in [PRIVATE_TYPE_CATACOMB_USER, PRIVATE_TYPE_CATACOMB_MASTER] {
-            if crate::catacomb::read(kind).is_none() || !crate::catacomb::writable(kind) {
+            if !crate::catacomb::is_saved(kind) || !crate::catacomb::writable(kind) {
                 dev_err!(
                     self.dev,
                     "bio: not deleting: user/master Catacomb is unavailable or unwritable\n"
@@ -6033,7 +6086,7 @@ impl SepData {
                 return Err(EIO);
             }
         }
-        if orphan && crate::catacomb::read(PRIVATE_TYPE_CATACOMB_OWNER).is_none() {
+        if orphan && crate::catacomb::is_absent(PRIVATE_TYPE_CATACOMB_OWNER) {
             let Some(reply) = self.read_component_states() else { return Err(EIO); };
             let state = crate::sbio::ComponentStates::new(&reply)
                 .state_for(crate::sbio::CatacombUser::OWNER.value());
@@ -6045,7 +6098,7 @@ impl SepData {
                 return Err(EIO);
             }
         }
-        if crate::catacomb::read(PRIVATE_TYPE_CATACOMB_OWNER).is_none()
+        if !crate::catacomb::is_saved(PRIVATE_TYPE_CATACOMB_OWNER)
             || !crate::catacomb::writable(PRIVATE_TYPE_CATACOMB_OWNER)
         {
             return Err(EIO);
@@ -6132,7 +6185,7 @@ impl SepData {
                 );
                 return Err(EIO);
             }
-            if crate::catacomb::read(kind).is_none() {
+            if !crate::catacomb::is_saved(kind) {
                 dev_err!(self.dev, "bio: the {} has no durable host file\n", what);
                 return Err(EIO);
             }

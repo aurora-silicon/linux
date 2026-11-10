@@ -3161,11 +3161,21 @@ static int tb_approve_xdomain_paths(struct tb *tb, struct tb_xdomain *xd,
 	struct tb_switch *sw;
 	int ret;
 
+	mutex_lock(&tb->lock);
+
+	/*
+	 * A service driver can still ask for paths after the XDomain was
+	 * unplugged or while the domain is being stopped, when the router
+	 * may already be gone and tb->root_switch is NULL.
+	 */
+	if (xd->is_unplugged || !tb->root_switch) {
+		mutex_unlock(&tb->lock);
+		return -ENODEV;
+	}
+
 	sw = tb_to_switch(xd->dev.parent);
 	dst_port = tb_port_at(xd->route, sw);
 	nhi_port = tb_switch_find_port(tb->root_switch, TB_TYPE_NHI);
-
-	mutex_lock(&tb->lock);
 
 	/*
 	 * When tunneling DMA paths the link should not enter CL states
@@ -3248,6 +3258,15 @@ static int tb_disconnect_xdomain_paths(struct tb *tb, struct tb_xdomain *xd,
 
 /* hotplug handling */
 
+/* The partner on a host router lane adapter went away */
+static void tb_host_link_lost(struct tb *tb, struct tb_port *port)
+{
+	if (tb_route(port->sw) || !tb_port_is_null(port))
+		return;
+	if (tb->nhi->ops && tb->nhi->ops->link_lost)
+		tb->nhi->ops->link_lost(tb->nhi);
+}
+
 /*
  * tb_handle_hotplug() - handle hotplug event
  *
@@ -3312,6 +3331,7 @@ static void tb_handle_hotplug(struct work_struct *work)
 			tb_recalc_estimated_bandwidth(tb);
 			tb_tunnel_dp(tb);
 			tb_dp_host_tunnel_gone(tb, dp_up);
+			tb_host_link_lost(tb, port);
 		} else if (port->xdomain) {
 			struct tb_xdomain *xd = tb_xdomain_get(port->xdomain);
 
@@ -3329,6 +3349,7 @@ static void tb_handle_hotplug(struct work_struct *work)
 			__tb_disconnect_xdomain_paths(tb, xd, -1, -1, -1, -1);
 			tb_xdomain_put(xd);
 			tb_port_unconfigure_xdomain(port);
+			tb_host_link_lost(tb, port);
 		} else if (tb_port_is_dpout(port) || tb_port_is_dpin(port)) {
 			tb_dp_resource_unavailable(tb, port, "adapter unplug");
 			/* A display went: the DP tunnel left may take a higher rate. */
@@ -4388,6 +4409,12 @@ static bool tb_apple_add_links(struct tb_nhi *nhi)
 	return ret;
 }
 
+/* Hosts without ACPI tables may order their tunneled native ports themselves. */
+static bool tb_nhi_add_links(struct tb_nhi *nhi)
+{
+	return nhi->ops && nhi->ops->add_links && nhi->ops->add_links(nhi);
+}
+
 static void tb_cm_init(struct tb_cm *tcm)
 {
 	INIT_LIST_HEAD(&tcm->tunnel_list);
@@ -4425,7 +4452,8 @@ struct tb *tb_probe(struct tb_nhi *nhi)
 	 * before the PCIe/USB stack is resumed so complain here if we
 	 * found them missing.
 	 */
-	if (!tb_apple_add_links(nhi) && !tb_acpi_add_links(nhi))
+	if (!tb_nhi_add_links(nhi) && !tb_apple_add_links(nhi) &&
+	    !tb_acpi_add_links(nhi))
 		tb_warn(tb, "device links to tunneled native ports are missing!\n");
 
 	return tb;
