@@ -44,6 +44,8 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 967 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x00004000 0x0 0xffffc000>;
+		power-domains = <&ps_venc_sys>;
 		status = "disabled";
 	};
 
@@ -53,6 +55,8 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 967 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x00004000 0x0 0xffffc000>;
+		power-domains = <&ps_venc_sys>;
 		status = "disabled";
 	};
 
@@ -346,20 +350,22 @@
 		status = "okay";
 	};
 
+	/* The encoder runs firmware that the bootloader preloads and hands off. */
 	ave: video-encoder@421100000 {
-		compatible = "apple,t8132-ave", "apple,ave";
+		compatible = "apple,t8132-ave";
 		reg = <0x4 0x21100000 0x0 0x45c000>,
-		      <0x4 0x21800000 0x0 0x800000>,
 		      <0x4 0x21050000 0x0 0x4000>,
-		      <0x3 0x80708000 0x0 0x4000>,
-		      <0x4 0x20000000 0x0 0x1000000>;
+		      <0x4 0x21800000 0x0 0x800000>;
+		reg-names = "codec", "mailbox", "coproc";
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 970 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 964 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 963 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 966 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 965 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_venc_sys>, <&ps_venc_pipe4>, <&ps_venc_pipe5>, <&ps_venc_me0>, <&ps_venc_me1>, <&ps_venc_dma>;
+		power-domains = <&ps_venc_dma>, <&ps_venc_pipe4>, <&ps_venc_pipe5>,
+				<&ps_venc_me0>, <&ps_venc_me1>;
+		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
 		iommus = <&dart_ave0 0>, <&dart_ave1 0>;
 		clocks = <&peripheral_clocks 430>;
 		status = "disabled";
