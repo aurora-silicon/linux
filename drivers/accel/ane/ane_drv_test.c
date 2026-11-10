@@ -98,7 +98,51 @@ static struct kunit_suite ane_submit_test_suite = {
 	.test_cases = ane_submit_test_cases,
 };
 
-kunit_test_suite(ane_submit_test_suite);
+struct ane_recoverable_case {
+	const char *desc;
+	bool tm_retention;
+	bool probation;
+	int err;
+	u32 finished;
+	bool recoverable;
+};
+
+static const struct ane_recoverable_case ane_recoverable_cases[] = {
+	{ "T8103 timeout without events", false, false, -ETIMEDOUT, 0, true },
+	{ "T8103 timeout without events after a recovery", false, true,
+	  -ETIMEDOUT, 0, false },
+	{ "T600x timeout without events", true, false, -ETIMEDOUT, 0, false },
+	{ "T600x timeout after a recovery", true, true, -ETIMEDOUT, 0, false },
+	{ "T600x timeout with one finish line", true, false, -ETIMEDOUT, 1,
+	  true },
+	{ "T600x task error with one finish line", true, false, -EIO, 1, true },
+	{ "T600x bad event count", true, false, -EIO, 0, true },
+	{ "T600x task error after a recovery", true, true, -EIO, 2, true },
+};
+
+KUNIT_ARRAY_PARAM_DESC(ane_recoverable, ane_recoverable_cases, desc);
+
+static void ane_recoverable_test(struct kunit *test)
+{
+	const struct ane_recoverable_case *c = test->param_value;
+
+	KUNIT_EXPECT_EQ(test, ane_tm_failure_recoverable(c->tm_retention,
+							 c->probation, c->err,
+							 c->finished),
+			c->recoverable);
+}
+
+static struct kunit_case ane_recovery_test_cases[] = {
+	KUNIT_CASE_PARAM(ane_recoverable_test, ane_recoverable_gen_params),
+	{}
+};
+
+static struct kunit_suite ane_recovery_test_suite = {
+	.name = "ane-tm-recovery",
+	.test_cases = ane_recovery_test_cases,
+};
+
+kunit_test_suites(&ane_submit_test_suite, &ane_recovery_test_suite);
 
 MODULE_DESCRIPTION("KUnit tests for the Apple Neural Engine SUBMIT checks");
 MODULE_LICENSE("Dual MIT/GPL");
