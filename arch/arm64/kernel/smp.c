@@ -1354,14 +1354,29 @@ bool smp_crash_stop_failed(void)
 }
 #endif
 
+/*
+ * The CPUs that have to leave the kernel are the others. A boot CPU whose node
+ * carries no enable-method (Apple boot objects describe only the secondaries'
+ * spin table) has no operations of its own: then every other possible CPU must
+ * have a way out.
+ */
 static bool have_cpu_die(void)
 {
 #ifdef CONFIG_HOTPLUG_CPU
-	int any_cpu = raw_smp_processor_id();
-	const struct cpu_operations *ops = get_cpu_ops(any_cpu);
+	int this_cpu = raw_smp_processor_id(), cpu;
+	const struct cpu_operations *ops = get_cpu_ops(this_cpu);
 
-	if (ops && ops->cpu_die)
-		return true;
+	if (ops)
+		return ops->cpu_die != NULL;
+
+	for_each_possible_cpu(cpu) {
+		if (cpu == this_cpu)
+			continue;
+		ops = get_cpu_ops(cpu);
+		if (!ops || !ops->cpu_die)
+			return false;
+	}
+	return num_possible_cpus() > 1;
 #endif
 	return false;
 }
