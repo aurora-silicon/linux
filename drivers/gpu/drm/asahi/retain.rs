@@ -2,14 +2,22 @@
 
 //! The once-per-boot module pin taken before the firmware is first touched.
 //!
-//! A started G15 firmware session cannot be stopped, so this module must stay loaded until
-//! reboot from the first firmware-visible write on. `__module_get` alone does not ensure that:
-//! a deferred or asynchronous probe can run while an ordinary rmmod is already past its
-//! reference check, and the module is then unloaded under a running firmware.
-//! `try_module_get` fails once removal has begun, so the pin is taken with it, before the
-//! session is marked retained and before anything firmware-visible happens.
+//! A started firmware session that is never freed (every backend's: G15, G16, G18, the M5
+//! RAM-boot path, and G17 on M5) keeps RTKit and mailbox callbacks into this module, so the
+//! module must stay loaded until reboot from the first firmware-visible write on.
+//! `__module_get` alone does not ensure that: a deferred or asynchronous probe can run while
+//! an ordinary rmmod is already past its reference check, and the module is then unloaded
+//! under a running firmware. `try_module_get` fails once removal has begun, so the pin is
+//! taken with it, before the session is marked retained and before anything
+//! firmware-visible happens.
 
 use core::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(not(test))]
+extern "C" {
+    fn asahi_module_try_get() -> bool;
+    fn asahi_module_put();
+}
 
 /// The module is being removed: nothing was pinned or marked, and nothing may be started.
 #[derive(Debug, PartialEq, Eq)]
@@ -36,6 +44,21 @@ pub(crate) fn retain(
         put();
     }
     Ok(())
+}
+
+/// Pins this module until reboot, once for the session `retained` tracks
+/// (`try_module_get(THIS_MODULE)`, see [`retain`]). ENODEV, with nothing pinned or marked, once
+/// the module's removal has begun.
+#[cfg(not(test))]
+pub(crate) fn retain_module(retained: &AtomicBool) -> kernel::error::Result {
+    retain(
+        retained,
+        // SAFETY: Takes a reference to this module unless its removal has begun.
+        || unsafe { asahi_module_try_get() },
+        // SAFETY: Drops only the reference this call took; the winner's is never put.
+        || unsafe { asahi_module_put() },
+    )
+    .map_err(|_| kernel::error::code::ENODEV)
 }
 
 #[cfg(test)]

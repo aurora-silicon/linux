@@ -11,7 +11,7 @@
 use crate::g17::{
     fw::kick::KickDependency,
     hazard::{self, Footprint, Plan},
-    job::Packet,
+    job::{Order, Packet},
 };
 use crate::{hw::t8140::queues as cfg, mmu::MAX_EXECUTION_CONTEXTS};
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -107,12 +107,25 @@ impl State {
     fn exhausted(&self) -> bool {
         self.quarantined & Self::MASK == Self::MASK
     }
+    /// The owner's quarantined pairs, if any: `Some(true)` when every one of
+    /// them is spared (quarantined behind another VM's recovery). One
+    /// quarantined pair stops the owner on all of its pairs, so a healthy
+    /// sibling never bypasses it.
+    fn owner_quarantine(&self, owner: u64) -> Option<bool> {
+        let owned = (0..cfg::RENDER_SLOTS)
+            .filter(|slot| self.owners[*slot] == owner)
+            .fold(0u64, |mask, slot| mask | 1u64 << slot);
+        let quarantined = self.quarantined & owned;
+        (quarantined != 0).then_some(quarantined & !self.spared == 0)
+    }
     fn refusal(&self, owner: u64) -> Result {
         if self.exhausted() {
             return Err(EIO);
         }
+        if self.owner_quarantine(owner).is_some() {
+            return Err(EIO);
+        }
         match self.owners.iter().position(|id| *id == owner) {
-            Some(slot) if self.quarantined & (1u64 << slot) != 0 => Err(EIO),
             None if !self.owners[1..].contains(&0)
                 && self.released
                     & !self.active
@@ -147,9 +160,27 @@ impl State {
         self.advance(slot);
         slot as u8
     }
-    fn acquire(&mut self, owner: u64) -> Option<u8> {
+    fn acquire(&mut self, owner: u64, pairs: usize) -> Option<u8> {
         if owner == 0 {
             return None;
+        }
+        // A shallow queue stays on its busy pair: a second pair pays off only
+        // once the first has a backlog (at depth 2 a switch on every render
+        // cost a 1080p fill about 45 us a submit on M5 Ultra).
+        if pairs > 1 {
+            let busy = (0..cfg::RENDER_SLOTS)
+                .filter(|slot| {
+                    self.owners[*slot] == owner
+                        && self.refs[*slot] != 0
+                        && self.active & (1u64 << slot) != 0
+                        && self.usable(owner, *slot)
+                })
+                .min_by_key(|slot| (self.refs[*slot], u64::MAX - self.epochs[*slot]));
+            if let Some(slot) = busy.filter(|slot| self.refs[*slot] <= crate::g17::pairs::sibling_backlog()) {
+                self.refs[slot] += 1;
+                self.advance(slot);
+                return Some(slot as u8);
+            }
         }
         // Prefer the owner's idle pair. A missing sibling can be claimed
         // only while this owner has no live kick, before constructing it.
@@ -164,7 +195,7 @@ impl State {
             if !(0..cfg::RENDER_SLOTS)
                 .any(|other| self.owners[other] == owner && self.refs[other] != 0)
             {
-                self.claim_sibling(owner);
+                self.claim_sibling(owner, pairs);
             }
             return Some(self.take_idle(slot, owner));
         }
@@ -203,11 +234,12 @@ impl State {
             })
             .or_else(unowned)?;
         let first = self.take_idle(slot, owner);
-        self.claim_sibling(owner);
+        self.claim_sibling(owner, pairs);
         Some(first)
     }
-    fn claim_sibling(&mut self, owner: u64) {
-        if self.owners.iter().filter(|id| **id == owner).count() >= cfg::RENDER_PAIRS_PER_OWNER {
+    /// Claims another pair for an owner that may hold `pairs`.
+    fn claim_sibling(&mut self, owner: u64, pairs: usize) {
+        if self.owners.iter().filter(|id| **id == owner).count() >= pairs {
             return;
         }
         // A speculative sibling never takes a killed context's pair.
@@ -238,6 +270,8 @@ impl State {
     /// The device lock separately proves the physical graph was never published.
     /// An open owner keeps another usable pair. Exclude every live borrower,
     /// including off-lock sibling construction; a closed owner needs no spare.
+    /// A spare goes only to an owner without a pair: a second pair comes only
+    /// from surplus, through claim_sibling.
     fn reassign_unused_spare(
         &mut self,
         slot: u8,
@@ -249,8 +283,7 @@ impl State {
             || slot >= cfg::RENDER_SLOTS
             || owner.is_some_and(|owner| {
                 owner == 0
-                    || self.owners.iter().filter(|value| **value == owner).count()
-                        >= cfg::RENDER_PAIRS_PER_OWNER
+                    || self.owners.contains(&owner)
             })
         {
             return false;
@@ -336,14 +369,11 @@ impl State {
 
     /// Whether `pick` would return a slot, without taking it.
     fn can_pick(&self, owner: u64, plan: Plan) -> bool {
-        let usable = |slot: usize| {
-            self.owners[slot] == owner
-                && (self.quarantined | self.kill_hold) & (1u64 << slot) == 0
-                && self.refs[slot] < cfg::RENDER_DEPTH
-        };
+        let usable = |slot: usize| self.usable(owner, slot);
         match plan {
             Plan::Wait => false,
-            Plan::Pair(slot) => usize::from(slot) < cfg::RENDER_SLOTS && usable(usize::from(slot)),
+            Plan::Pair(slot) => usable(usize::from(slot)),
+            Plan::Join(_) => (0..cfg::RENDER_SLOTS).any(usable),
             Plan::Any if owner == 0 => false,
             Plan::Any if self.owners.contains(&owner) => (0..cfg::RENDER_SLOTS).any(usable),
             Plan::Any => {
@@ -356,26 +386,36 @@ impl State {
         }
     }
 
-    fn pick(&mut self, owner: u64, plan: Plan) -> Option<u8> {
+    fn pick(&mut self, owner: u64, pairs: usize, plan: Plan) -> Option<u8> {
         match plan {
-            Plan::Any => self.acquire(owner),
+            Plan::Any => self.acquire(owner, pairs),
             Plan::Wait => None,
-            Plan::Pair(slot) => {
-                let index = usize::from(slot);
-                if self.owners.get(index) != Some(&owner)
-                    || (self.quarantined | self.kill_hold) & (1u64 << slot) != 0
-                    || self.refs[index] >= cfg::RENDER_DEPTH
-                {
-                    return None;
-                }
-                if self.refs[index] == 0 {
-                    Some(self.take_idle(index, owner))
-                } else {
-                    self.refs[index] += 1;
-                    self.advance(index);
-                    Some(slot)
-                }
-            }
+            Plan::Pair(slot) => self.join(owner, usize::from(slot)),
+            // The preferred pair, else the owner's least-loaded other pair:
+            // the publication barrier orders the overlap from there.
+            Plan::Join(slot) => self.join(owner, usize::from(slot)).or_else(|| {
+                let other = (0..cfg::RENDER_SLOTS)
+                    .filter(|other| *other != usize::from(slot) && self.usable(owner, *other))
+                    .min_by_key(|other| (self.refs[*other], u64::MAX - self.epochs[*other]))?;
+                self.join(owner, other)
+            }),
+        }
+    }
+    fn usable(&self, owner: u64, slot: usize) -> bool {
+        self.owners.get(slot) == Some(&owner)
+            && (self.quarantined | self.kill_hold) & (1u64 << slot) == 0
+            && self.refs[slot] < cfg::RENDER_DEPTH
+    }
+    fn join(&mut self, owner: u64, index: usize) -> Option<u8> {
+        if !self.usable(owner, index) {
+            return None;
+        }
+        if self.refs[index] == 0 {
+            Some(self.take_idle(index, owner))
+        } else {
+            self.refs[index] += 1;
+            self.advance(index);
+            Some(index as u8)
         }
     }
 
@@ -501,17 +541,14 @@ impl Pool {
     }
     /// The owner's pair is quarantined behind another VM's recovery (spared) and drains.
     pub(crate) fn spared_quarantined(&self, owner: u64) -> bool {
-        let state = self.state.lock();
-        state
-            .owners
-            .iter()
-            .position(|id| *id == owner)
-            .is_some_and(|slot| state.quarantined & state.spared & (1u64 << slot) != 0)
+        self.state.lock().owner_quarantine(owner) == Some(true)
     }
 
+    /// For an owner that may hold `pairs` render pairs.
     pub(crate) fn acquire_render(
         self: &Arc<Self>,
         owner: u64,
+        pairs: usize,
         request: Option<Request<'_>>,
         deadline_ns: u64,
         check: impl Fn() -> Result,
@@ -532,22 +569,12 @@ impl Pool {
             if state.exhausted() {
                 return Err(EIO);
             }
-            // The first retained pair's quarantine is not bypassed through its
+            // A retained pair's quarantine is not bypassed through its
             // healthy sibling. Reclamation wakes this bounded admission wait.
-            if state
-                .owners
-                .iter()
-                .position(|id| *id == owner)
-                .is_some_and(|slot| state.quarantined & (1u64 << slot) != 0)
-            {
+            if let Some(spared) = state.owner_quarantine(owner) {
                 // Behind an innocent pair's quarantine (another VM wedged the GPU) wait for the
                 // pair to drain until the caller's deadline, which the caller extends while it
                 // drains (RECOVERY_WAIT_MS); a guilty pair's publication fails after a second.
-                let spared = state
-                    .owners
-                    .iter()
-                    .position(|id| *id == owner)
-                    .is_some_and(|slot| state.spared & (1u64 << slot) != 0);
                 if now >= quarantine_deadline && !spared {
                     return Err(EIO);
                 }
@@ -570,7 +597,7 @@ impl Pool {
             } else {
                 state.plan(owner, request, ticket)
             };
-            if let Some(slot) = state.pick(owner, plan) {
+            if let Some(slot) = state.pick(owner, pairs, plan) {
                 state.forget_waiter(ticket.take());
                 let record =
                     request.and_then(|request| state.record(owner, Some(slot), 0, request));
@@ -613,6 +640,7 @@ impl Pool {
     pub(crate) fn try_acquire_render(
         self: &Arc<Self>,
         owner: u64,
+        pairs: usize,
         request: Option<Request<'_>>,
     ) -> Result<Option<RenderLease>> {
         if owner == 0 {
@@ -623,7 +651,7 @@ impl Pool {
             return Ok(None);
         }
         let plan = state.plan(owner, request, None);
-        let Some(slot) = state.pick(owner, plan) else {
+        let Some(slot) = state.pick(owner, pairs, plan) else {
             return Ok(None);
         };
         let record = request.and_then(|request| state.record(owner, Some(slot), 0, request));
@@ -640,12 +668,7 @@ impl Pool {
         if owner == 0 || state.refusal(owner).is_err() {
             return false;
         }
-        if state
-            .owners
-            .iter()
-            .position(|id| *id == owner)
-            .is_some_and(|slot| state.quarantined & (1u64 << slot) != 0)
-        {
+        if state.owner_quarantine(owner).is_some() {
             return false;
         }
         let plan = state.plan(owner, request, None);
@@ -735,7 +758,7 @@ mod accounting_tests {
     fn every_logical_owner_fits_without_speculative_spares() {
         let mut state = State::new();
         for owner in 1..=u64::from(MAX_EXECUTION_CONTEXTS) {
-            let slot = state.acquire(owner).unwrap();
+            let slot = state.acquire(owner, 1).unwrap();
             assert_eq!(state.owners.iter().filter(|id| **id == owner).count(), 1);
             state.release(slot);
         }
@@ -746,7 +769,7 @@ mod accounting_tests {
     #[test]
     fn close_does_not_reuse_an_active_lease() {
         let mut state = State::new();
-        let slot = state.acquire(1).unwrap();
+        let slot = state.acquire(1, 1).unwrap();
         state.released |= 1u64 << slot;
         assert!(!state.reassign_unused_spare(slot, Some(1), None));
         state.release(slot);
@@ -759,7 +782,7 @@ mod accounting_tests {
     #[test]
     fn warming_quarantine_and_exit_hold_exclude_reassignment() {
         let mut state = State::new();
-        let primary = state.acquire(1).unwrap();
+        let primary = state.acquire(1, 1).unwrap();
         // A retained legacy sibling still obeys all quarantine/kill guards.
         state.owners[2] = 1;
         let spare = state.borrow_warm_sibling(1, primary).unwrap();
@@ -804,6 +827,19 @@ impl QueueSlot {
     /// The device's admission pool, which lives as long as the firmware session.
     pub(crate) fn pool(&self) -> &Arc<Pool> {
         &self.pool
+    }
+    /// Gives back a slot no queue was published in, for a creator that sampled the waiters'
+    /// domain as `observed` before claiming it. Returns the sample that creator waits on next
+    /// ([`Availability::notify_own`]): its own return still wakes the other waiters, but not
+    /// itself.
+    ///
+    /// [`Availability::notify_own`]: crate::g17::availability::Availability::notify_own
+    pub(crate) fn cancel(self, observed: u64) -> u64 {
+        let this = core::mem::ManuallyDrop::new(self);
+        // SAFETY: `this` is never used or dropped again, so the pool reference moves out once.
+        let pool = unsafe { core::ptr::read(&this.pool) };
+        pool.queues.fetch_sub(1, Ordering::AcqRel);
+        pool.waiters.as_ref().map_or(observed, |waiters| waiters.notify_own(observed))
     }
 }
 impl Drop for QueueSlot {
@@ -879,11 +915,20 @@ impl Pool {
     /// Under the device mutex, which orders every publication: the newest
     /// published fragment kick of each other pair whose live same-VM render
     /// overlaps `footprint`. Quarantined pairs are skipped as in admission.
+    ///
+    /// That includes the owner's own other pair, for its renders that `prefix`
+    /// (the render's queue prefix) does not already order: an owner's renders
+    /// on its two pairs run on different queues (see [`hazard::plan`]). An
+    /// owner publishes in submission order (the backlog keeps inline
+    /// publication behind queued commands, and the ordered run_job worker
+    /// publishes one command at a time), so its earlier renders already carry
+    /// their fragment kick here.
     pub(crate) fn publication_barriers(
         &self,
         owner: u64,
         slot: u8,
         footprint: &Footprint,
+        prefix: Option<u64>,
         barriers: &mut [KickDependency; hazard::PUBLICATION_BARRIERS],
     ) -> Result<usize> {
         let state = self.state.lock();
@@ -894,7 +939,7 @@ impl Pool {
                 continue;
             };
             if other == slot
-                || entry.owner == owner
+                || (entry.owner == owner && Order::contains(prefix, entry.sequence))
                 || state.quarantined & (1u64 << other) != 0
                 || !footprint.same_vm(&entry.footprint)
                 || !footprint.overlaps(&entry.footprint)
@@ -1011,6 +1056,35 @@ impl Pool {
     }
 }
 
+#[kunit_tests(asahi_g17_queue_slot_cancel)]
+mod queue_slot_cancel_tests {
+    use super::*;
+    use crate::g17::availability::Availability;
+
+    #[test]
+    fn a_creator_does_not_wake_itself_by_giving_back_its_slot() -> Result {
+        let waiters = Availability::new()?;
+        let pool = Pool::with_waiters(MAX_EXECUTION_CONTEXTS, Some(waiters.clone()), None)?;
+        let observed = waiters.observe();
+        let slot = pool.reserve_queue()?;
+        let next = slot.cancel(observed);
+        assert_eq!(pool.queues(), 0);
+        // The return advanced the domain, so other waiters wake, but the creator's next
+        // sample is current: its wait registers instead of returning at once.
+        assert_eq!(next, waiters.observe());
+        assert_ne!(next, observed);
+        assert!(waiters.wait(next)?.is_some());
+        // A return by anyone else after the sample still ends the creator's wait.
+        let observed = waiters.observe();
+        let slot = pool.reserve_queue()?;
+        drop(pool.reserve_queue()?);
+        assert_eq!(slot.cancel(observed), observed);
+        assert!(waiters.wait(observed)?.is_none());
+        waiters.notify();
+        Ok(())
+    }
+}
+
 #[kunit_tests(asahi_g17_fault_admission)]
 mod fault_capacity_tests {
     use super::*;
@@ -1019,7 +1093,7 @@ mod fault_capacity_tests {
     fn a_guilty_failure_makes_a_spared_quarantine_guilty() {
         let pool = Pool::new(MAX_EXECUTION_CONTEXTS).unwrap();
         let queue = pool.reserve_queue().unwrap();
-        let lease = pool.acquire_render(1, None, u64::MAX, || Ok(())).unwrap();
+        let lease = pool.acquire_render(1, 1, None, u64::MAX, || Ok(())).unwrap();
         let bit = 1u64 << lease.slot();
         assert!(!pool.spared_quarantined(1));
         lease.quarantine(true);
@@ -1045,7 +1119,7 @@ mod fault_capacity_tests {
         let pool = Pool::new(MAX_EXECUTION_CONTEXTS).unwrap();
         for owner in 1..=512 {
             let queue = pool.reserve_queue().unwrap();
-            let lease = pool.acquire_render(owner, None, u64::MAX, || Ok(())).unwrap();
+            let lease = pool.acquire_render(owner, 1, None, u64::MAX, || Ok(())).unwrap();
             lease.quarantine(false);
             pool.release_owner(owner);
             let bit = 1u64 << lease.slot();
@@ -1066,7 +1140,7 @@ mod fault_capacity_tests {
     #[test]
     fn published_exit_kill_holds_survive_close_and_drain() {
         let pool = Pool::new(MAX_EXECUTION_CONTEXTS).unwrap();
-        let lease = pool.acquire_render(1, None, u64::MAX, || Ok(())).unwrap();
+        let lease = pool.acquire_render(1, 1, None, u64::MAX, || Ok(())).unwrap();
         let bit = 1u64 << lease.slot();
         pool.release_owner(1);
         drop(lease);
@@ -1081,7 +1155,7 @@ mod fault_capacity_tests {
     #[test]
     fn consumed_scheduler_release_ends_the_kill_hold() {
         let pool = Pool::new(MAX_EXECUTION_CONTEXTS).unwrap();
-        let lease = pool.acquire_render(1, None, u64::MAX, || Ok(())).unwrap();
+        let lease = pool.acquire_render(1, 1, None, u64::MAX, || Ok(())).unwrap();
         let slot = lease.slot();
         let bit = 1u64 << slot;
         pool.release_owner(1);
@@ -1095,7 +1169,7 @@ mod fault_capacity_tests {
         // The killed context's pair is never reassigned as a spare, and a new owner takes
         // a new graph before it.
         assert!(!pool.reassign_unused_spare(slot, Some(1), Some(2)));
-        let next = pool.acquire_render(2, None, u64::MAX, || Ok(())).unwrap();
+        let next = pool.acquire_render(2, 1, None, u64::MAX, || Ok(())).unwrap();
         assert_ne!(next.slot(), slot);
         drop(next);
         pool.release_retained_owners_after_processor_stop();
@@ -1116,9 +1190,9 @@ mod fault_capacity_tests {
             // One pair released without a kill.
             state.killed &= !(1u64 << 7);
         }
-        let first = pool.acquire_render(1, None, u64::MAX, || Ok(())).unwrap();
+        let first = pool.acquire_render(1, 1, None, u64::MAX, || Ok(())).unwrap();
         assert_eq!(first.slot(), 7);
-        let second = pool.acquire_render(2, None, u64::MAX, || Ok(())).unwrap();
+        let second = pool.acquire_render(2, 1, None, u64::MAX, || Ok(())).unwrap();
         assert_eq!(usize::from(second.slot()), cfg::RENDER_SLOTS - 1);
         assert_eq!(pool.state.lock().killed & (1u64 << second.slot()), 0);
     }
@@ -1136,11 +1210,11 @@ mod fault_capacity_tests {
             }
         }
         // With room in the queue table a new owner builds a pair in an unowned slot.
-        let built = pool.acquire_render(1, None, u64::MAX, || Ok(())).unwrap();
+        let built = pool.acquire_render(1, 1, None, u64::MAX, || Ok(())).unwrap();
         assert!(usize::from(built.slot()) >= 8);
         // Without room it takes the killed pair released longest ago.
         pool.note_build_room(false);
-        let reused = pool.acquire_render(2, None, u64::MAX, || Ok(())).unwrap();
+        let reused = pool.acquire_render(2, 1, None, u64::MAX, || Ok(())).unwrap();
         assert_eq!(reused.slot(), 7);
         assert_eq!(pool.state.lock().killed & (1u64 << 7), 0);
         // It claims no sibling: neither another killed pair nor an unowned slot.
@@ -1165,12 +1239,164 @@ mod shared_depth_tests {
     #[test]
     fn a_full_pair_waits_for_retirement_instead_of_allocating_a_spare() {
         let mut state = State::new();
-        let first = state.acquire(1).unwrap();
-        for _ in 1..cfg::RENDER_DEPTH { assert_eq!(state.acquire(1), Some(first)); }
-        assert_eq!(state.acquire(1), None);
+        let first = state.acquire(1, 1).unwrap();
+        for _ in 1..cfg::RENDER_DEPTH { assert_eq!(state.acquire(1, 1), Some(first)); }
+        assert_eq!(state.acquire(1, 1), None);
         assert_eq!(state.owners.iter().filter(|id| **id == 1).count(), 1);
         state.release(first);
-        assert_eq!(state.acquire(1), Some(first));
+        assert_eq!(state.acquire(1, 1), Some(first));
+    }
+}
+
+#[kunit_tests(asahi_g17_owner_pairs)]
+mod owner_pair_tests {
+    use super::*;
+    use crate::g17::fw::kick::KickTimestamp;
+
+    fn kick(qid: u8, timestamp: u64) -> KickDependency {
+        KickDependency::new(qid, KickTimestamp::new(timestamp).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_full_preferred_pair_moves_to_the_owners_other_pair() {
+        let mut state = State::new();
+        state.owners[1] = 1;
+        state.owners[2] = 1;
+        for _ in 0..cfg::RENDER_DEPTH {
+            assert_eq!(state.pick(1, 1, Plan::Pair(1)), Some(1));
+        }
+        assert!(!state.can_pick(1, Plan::Pair(1)));
+        assert_eq!(state.pick(1, 1, Plan::Pair(1)), None);
+        assert!(state.can_pick(1, Plan::Join(1)));
+        assert_eq!(state.pick(1, 1, Plan::Join(1)), Some(2));
+        // With one pair a preference is the pair.
+        state.owners[2] = 0;
+        assert!(!state.can_pick(1, Plan::Join(1)));
+        assert_eq!(state.pick(1, 1, Plan::Join(1)), None);
+    }
+
+    #[test]
+    fn any_quarantined_pair_stops_its_owner() {
+        let mut state = State::new();
+        state.owners[1] = 1;
+        state.owners[2] = 1;
+        assert!(state.owner_quarantine(1).is_none());
+        state.quarantined |= 1u64 << 2;
+        assert_eq!(state.owner_quarantine(1), Some(false));
+        assert!(state.refusal(1).is_err());
+        state.spared |= 1u64 << 2;
+        assert_eq!(state.owner_quarantine(1), Some(true));
+        state.quarantined |= 1u64 << 1;
+        assert_eq!(state.owner_quarantine(1), Some(false));
+    }
+
+    #[test]
+    fn an_uncovered_own_render_on_the_other_pair_is_a_barrier() {
+        let pool = Pool::new(MAX_EXECUTION_CONTEXTS).unwrap();
+        let mut footprint = Footprint::new(1, false);
+        footprint.push_vm(0, 0x1000);
+        let footprint = Arc::new(footprint, GFP_KERNEL).unwrap();
+        {
+            let mut state = pool.state.lock();
+            for (slot, sequence, timestamp) in [(1u8, 4u64, 7u64), (1, 5, 9), (2, 6, 3)] {
+                state
+                    .footprints
+                    .push(
+                        InFlight {
+                            owner: 1,
+                            sequence,
+                            slot: Some(slot),
+                            ticket: 0,
+                            footprint: footprint.clone(),
+                            fragment: Some(kick(10 + slot, timestamp)),
+                        },
+                        GFP_KERNEL,
+                    )
+                    .unwrap();
+            }
+        }
+        let mut barriers = [KickDependency::ZERO; hazard::PUBLICATION_BARRIERS];
+        // On pair 2: pair 1's newest overlapping fragment kick, never its own.
+        assert_eq!(pool.publication_barriers(1, 2, &footprint, None, &mut barriers).unwrap(), 1);
+        assert!(barriers[0] == kick(11, 9));
+        assert_eq!(pool.publication_barriers(1, 2, &footprint, Some(4), &mut barriers).unwrap(), 1);
+        assert!(barriers[0] == kick(11, 9));
+        // The queue prefix already orders them.
+        assert_eq!(pool.publication_barriers(1, 2, &footprint, Some(5), &mut barriers).unwrap(), 0);
+        // Another owner's render is a barrier whatever the prefix.
+        assert_eq!(pool.publication_barriers(3, 2, &footprint, Some(9), &mut barriers).unwrap(), 1);
+        assert_eq!(pool.publication_barriers(3, 3, &footprint, Some(9), &mut barriers).unwrap(), 2);
+    }
+}
+
+#[kunit_tests(asahi_g17_two_pairs)]
+mod two_pair_tests {
+    use super::*;
+
+    #[test]
+    fn a_two_pair_owner_spreads_its_depth_over_a_surplus_sibling() {
+        crate::g17::pairs::set_sibling_backlog(0);
+        let mut state = State::new();
+        let first = state.acquire(1, 2).unwrap();
+        // The sibling is claimed with the first pair, from surplus.
+        let sibling = (0..cfg::RENDER_SLOTS)
+            .find(|slot| *slot != usize::from(first) && state.owners[*slot] == 1)
+            .unwrap();
+        // With the first pair busy, the next render takes the idle sibling, then
+        // the least-loaded of the two.
+        assert_eq!(usize::from(state.acquire(1, 2).unwrap()), sibling);
+        let third = state.acquire(1, 2).unwrap();
+        assert!(third == first || usize::from(third) == sibling);
+        for _ in 3..2 * usize::from(cfg::RENDER_DEPTH) {
+            assert!(state.acquire(1, 2).is_some());
+        }
+        assert_eq!(state.refs[usize::from(first)], cfg::RENDER_DEPTH);
+        assert_eq!(state.refs[sibling], cfg::RENDER_DEPTH);
+        assert_eq!(state.acquire(1, 2), None);
+        assert_eq!(state.owners.iter().filter(|id| **id == 1).count(), 2);
+        crate::g17::pairs::set_sibling_backlog(1);
+    }
+
+    #[test]
+    fn a_shallow_two_pair_queue_stays_on_its_busy_pair() {
+        crate::g17::pairs::set_sibling_backlog(1);
+        let mut state = State::new();
+        let first = state.acquire(1, 2).unwrap();
+        // At depth 2 the second render stacks on the busy pair.
+        assert_eq!(state.acquire(1, 2), Some(first));
+        // With a backlog there, the third takes the idle sibling.
+        let third = state.acquire(1, 2).unwrap();
+        assert_ne!(third, first);
+        assert_eq!(state.owners[usize::from(third)], 1);
+        // Retired back to one render, the pair keeps the next one.
+        state.release(first);
+        state.release(third);
+        assert_eq!(state.acquire(1, 2), Some(first));
+    }
+
+    #[test]
+    fn a_sibling_needs_room_to_build_and_never_takes_a_spare() {
+        let mut state = State::new();
+        state.build_room = false;
+        // A released pair of a closed owner is reused for the first pair; no
+        // other free slot is claimed without room to build.
+        state.owners[5] = 9;
+        state.released |= 1u64 << 5;
+        assert_eq!(state.acquire(1, 2), Some(5));
+        assert_eq!(state.owners.iter().filter(|id| **id == 1).count(), 1);
+        // An unused spare goes only to an owner without a pair.
+        state.owners[6] = 3;
+        state.released |= 1u64 << 6;
+        assert!(!state.reassign_unused_spare(6, Some(3), Some(1)));
+        assert!(state.reassign_unused_spare(6, Some(3), Some(2)));
+    }
+
+    #[test]
+    fn a_one_pair_owner_claims_no_sibling() {
+        let mut state = State::new();
+        let first = state.acquire(1, 1).unwrap();
+        assert_eq!(state.owners.iter().filter(|id| **id == 1).count(), 1);
+        assert_eq!(state.acquire(1, 1), Some(first));
     }
 }
 
@@ -1191,7 +1417,7 @@ mod deadline_tests {
             state.active = State::MASK;
         }
         let start = crate::g17::now_ns();
-        let result = pool.acquire_render(1, None, start + 20_000_000, || Ok(()));
+        let result = pool.acquire_render(1, 1, None, start + 20_000_000, || Ok(()));
         assert!(matches!(result, Err(error) if error == EBUSY));
         assert!(crate::g17::now_ns() - start < 500_000_000);
         assert!(pool.state.lock().footprints.is_empty());
@@ -1209,7 +1435,7 @@ mod deadline_tests {
             state.active = State::MASK;
         }
         let start = crate::g17::now_ns();
-        let result = pool.acquire_render(1, None, start + 2_000_000_000, || {
+        let result = pool.acquire_render(1, 1, None, start + 2_000_000_000, || {
             if crate::g17::now_ns() - start >= 10_000_000 { Err(ECANCELED) } else { Ok(()) }
         });
         assert!(matches!(result, Err(error) if error == ECANCELED));
@@ -1220,7 +1446,7 @@ mod deadline_tests {
     #[test]
     fn cancellation_precedes_available_capacity() {
         let pool = Pool::new(MAX_EXECUTION_CONTEXTS).unwrap();
-        assert!(matches!(pool.acquire_render(1, None, u64::MAX, || Err(ECANCELED)),
+        assert!(matches!(pool.acquire_render(1, 1, None, u64::MAX, || Err(ECANCELED)),
                          Err(error) if error == ECANCELED));
         assert_eq!(pool.state.lock().active, 0);
     }

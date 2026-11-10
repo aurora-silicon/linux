@@ -183,11 +183,12 @@ static int apple_drm_fbdev_probe(struct drm_fb_helper *helper,
 		if (t8132_ext_crtc(crtc))
 			continue;
 		dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
-		if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+		if (dcp->fw_compat == DCP_FIRMWARE_H17P ||
+		    dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
 			/*
-			 * H17P applies the stored fourth byte as straight alpha,
-			 * the H17G (M5) profile too: an XRGB console with X = 0
-			 * stays black. ARGB makes fbcon write it opaque.
+			 * H17P and firmware 27 apply the stored fourth byte as
+			 * straight alpha: an XRGB console with X = 0 stays black.
+			 * ARGB makes fbcon write it opaque.
 			 */
 			sizes->surface_bpp = 32;
 			sizes->surface_depth = 32;
@@ -1684,8 +1685,13 @@ static int apple_drm_init(struct device *dev)
 	 * the boot framebuffer owns the screen; past the eviction there is no
 	 * way back.  On refusal leave the DCP running (its shutdown sequence
 	 * can crash it and blank the panel), pin the module and keep the boot
-	 * framebuffer.
+	 * framebuffer. The pin is taken before the trials, while a refusal can
+	 * still unwind; it is given back if every trial passes.
 	 */
+	if (!try_module_get(THIS_MODULE)) {
+		ret = -ENODEV;
+		goto err_unbind;
+	}
 	drm_for_each_crtc(crtc, &apple->drm) {
 		const char *reason = "none";
 
@@ -1699,9 +1705,9 @@ static int apple_drm_init(struct device *dev)
 		/*
 		 * The DCPs keep running and keep their pipelines: pin the
 		 * module and the DRM device their CRTCs and connectors live
-		 * in, and keep them out of shutdown and sleep.
+		 * in, and keep them out of shutdown and sleep. The module
+		 * reference taken before the trials is kept.
 		 */
-		__module_get(THIS_MODULE);
 		drm_dev_get(&apple->drm);
 		drm_for_each_crtc(crtc, &apple->drm)
 			if (!t8132_ext_crtc(crtc))
@@ -1711,6 +1717,7 @@ static int apple_drm_init(struct device *dev)
 		t8132_ext_drm_fini(&apple->drm);
 		return 0;
 	}
+	module_put(THIS_MODULE);
 
 	if (retained_modeset)
 		drm_modeset_lock_all(&apple->drm);

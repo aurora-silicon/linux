@@ -90,6 +90,8 @@ struct macsmc_hwmon_fan {
 	bool manual;
 	/* The device tree allows a manual speed from userspace. */
 	bool manual_control;
+	/* Manual for a kernel thermal policy (macsmc_hwmon_fans_request()). */
+	bool kernel;
 };
 
 struct macsmc_hwmon_sensors {
@@ -457,6 +459,7 @@ static int macsmc_hwmon_fan_auto(struct macsmc_hwmon *hwmon,
 
 	ret = macsmc_hwmon_write_key(hwmon->smc, &fan->mode, MACSMC_FAN_MODE_AUTO);
 	fan->manual = false;
+	fan->kernel = false;
 	hwmon->fan.manual--;
 
 	if (hwmon->fan.unlocked && !hwmon->fan.manual) {
@@ -578,6 +581,8 @@ static int macsmc_hwmon_set_fan(struct macsmc_hwmon *hwmon, int channel, long va
 	if (!ret)
 		ret = macsmc_hwmon_fan_manual(hwmon, fan);
 	if (!ret) {
+		/* Userspace takes the fan over from a kernel policy. */
+		fan->kernel = false;
 		ret = macsmc_hwmon_write_key(hwmon->smc, &fan->set, clamp(val, min, max));
 		if (ret >= 0)
 			return 0;
@@ -586,6 +591,102 @@ static int macsmc_hwmon_set_fan(struct macsmc_hwmon *hwmon, int channel, long va
 
 	return ret;
 }
+
+/**
+ * macsmc_hwmon_fans_request() - set the fans for a kernel thermal policy
+ * @dev: the bound macsmc-hwmon device; the caller holds its device lock
+ * @permille: each fan's target as a share of its minimum-to-maximum range;
+ *	0 hands the fans this interface set back to the SMC
+ * @min_step_rpm: a fan already set by this interface whose target is closer
+ *	than this to the new one keeps its target
+ *
+ * The fans go through the same manual mode as a userspace request, so the
+ * mode key has one owner: fans userspace holds are left alone, and every fan
+ * returns to the SMC at suspend, shutdown and unbind. Only fans whose device
+ * tree node names their mode, target, minimum and maximum keys take part.
+ *
+ * Return: the first such fan's target in rpm (0 once handed back), -ENODEV
+ * without such a fan, -EBUSY while stopped, or the first error.
+ */
+int macsmc_hwmon_fans_request(struct device *dev, unsigned int permille,
+			      unsigned int min_step_rpm)
+{
+	struct macsmc_hwmon *hwmon = dev_get_drvdata(dev);
+	long first = -ENODEV;
+	int ret = 0;
+	u32 i;
+
+	if (!hwmon)
+		return -ENODEV;
+	permille = min(permille, 1000U);
+
+	guard(mutex)(&hwmon->fan.lock);
+
+	if (permille && hwmon->fan.stopped)
+		return -EBUSY;
+
+	for (i = 0; i < hwmon->fan.count; i++) {
+		struct macsmc_hwmon_fan *fan = &hwmon->fan.fans[i];
+		long min, max, now, target;
+		int err;
+
+		if (!fan->mode.macsmc_key ||
+		    (fan->attrs & (HWMON_F_TARGET | HWMON_F_MIN | HWMON_F_MAX)) !=
+		    (HWMON_F_TARGET | HWMON_F_MIN | HWMON_F_MAX))
+			continue;
+		if (fan->manual && !fan->kernel)
+			continue;
+
+		if (!permille) {
+			if (first < 0)
+				first = 0;
+			err = macsmc_hwmon_fan_auto(hwmon, fan);
+			if (err && !ret)
+				ret = err;
+			continue;
+		}
+
+		err = macsmc_hwmon_read_key(hwmon->smc, &fan->min, 1, &min);
+		if (!err)
+			err = macsmc_hwmon_read_key(hwmon->smc, &fan->max, 1, &max);
+		if (!err && (min <= 0 || max < min))
+			err = -EIO;
+		if (err) {
+			dev_warn_ratelimited(hwmon->dev, "%s: no fan range for a kernel request (%d)\n",
+					     fan->label, err);
+			if (!ret)
+				ret = err;
+			continue;
+		}
+		target = min + (max - min) * permille / 1000;
+		if (first < 0)
+			first = target;
+
+		if (fan->kernel &&
+		    !macsmc_hwmon_read_key(hwmon->smc, &fan->set, 1, &now) &&
+		    abs(now - target) < (long)min_step_rpm)
+			continue;
+
+		err = macsmc_hwmon_fan_manual(hwmon, fan);
+		if (!err) {
+			fan->kernel = true;
+			err = macsmc_hwmon_write_key(hwmon->smc, &fan->set, target);
+			if (err > 0)
+				err = 0;
+		}
+		if (err) {
+			/* -EOPNOTSUPP: the fan is in system mode and this SMC has no unlock key. */
+			dev_warn_ratelimited(hwmon->dev, "%s: kernel fan request refused (%d)\n",
+					     fan->label, err);
+			macsmc_hwmon_fan_auto(hwmon, fan);
+			if (!ret)
+				ret = err;
+		}
+	}
+
+	return ret ? ret : first;
+}
+EXPORT_SYMBOL_GPL(macsmc_hwmon_fans_request);
 
 static int macsmc_hwmon_write_fan(struct device *dev, u32 attr, int channel,
 				  long val)

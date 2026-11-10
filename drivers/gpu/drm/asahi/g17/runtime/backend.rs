@@ -8,7 +8,7 @@ use crate::g17::{
     job::{self, Engine, Packet},
 };
 use core::sync::atomic::Ordering;
-use kernel::{dma_fence::Fence, drm::sched, prelude::*, sync::Arc};
+use kernel::{dma_fence::{Fence, RawDmaFence}, drm::sched, prelude::*, sync::Arc};
 
 impl Backend {
     pub(super) fn release_backlog(&self, packet: &Packet) {
@@ -94,6 +94,8 @@ impl Backend {
         // Record intent before scanning queues; every later install/rearm checks it.
         self.closed.store(true, Ordering::Release);
         self.hold_claim(None);
+        self.release_outer(Engine::Compute);
+        self.release_outer(Engine::Render);
         let mut state = self.shared.state.lock();
         let Some(firmware) = (*state).as_deref_mut() else {
             return Ok(());
@@ -116,6 +118,21 @@ impl Backend {
 }
 
 impl job::Backend for Backend {
+    fn creator_cluster_scheduling(&self) -> bool {
+        self.shared.follows_submitter()
+    }
+    fn host_producer_waits(&self) -> bool {
+        self.shared.m5_board.is_some_and(|board| !board.g17d_forms() && !board.completion_inputs())
+    }
+    fn firmware_sources_need_visible_completion(&self) -> bool {
+        self.shared.m5_board.is_some_and(|board| board.completion_inputs())
+    }
+    fn fence_queue(&self) -> Arc<kernel::workqueue::OwnedQueue> {
+        self.shared.fence_queue()
+    }
+    fn render_pairs(&self) -> u32 {
+        u32::from(self.pairs)
+    }
     fn input_sources(&self, inputs: &[crate::file::SyncItem])
         -> Option<Arc<crate::g17::sync_input::Sources>>
     {
@@ -169,16 +186,49 @@ impl job::Backend for Backend {
         Some(self.shared.feed.clone())
     }
 
-    fn render_scs_blocks(&self, pages: [u16; 2]) -> Result<usize> {
-        crate::g17::fw::render_rt::required_blocks(self.shared.active_cores, pages)
+    fn supports_submission(&self) -> bool {
+        self.shared.submission_enabled
     }
 
-    fn ensure_compute(&self, scs_pages: u16) -> Result {
+    fn supports_engine(&self, engine: crate::g17::job::Engine) -> bool {
+        !self.shared.firmware_test || engine == crate::g17::job::Engine::Compute
+    }
+
+    fn prepare_command(&self, command: &mut crate::g17::command::Validated) -> Result {
+        use crate::g17::command::Validated;
+        let Some(policy) = self.shared.render_policy else { return Ok(()) };
+        let priority = self.context.policy().priority();
+        match command {
+            Validated::Render { resources, plan, .. } => {
+                let programs = resources.as_deref().ok_or(EINVAL)?;
+                *plan = Some(policy.plan(programs, priority)?);
+                // The M5 target layout refuses the passes the M5 path cannot run. Derive it
+                // here, so that SUBMIT returns the refusal before anything is queued.
+                crate::g17::queue::render::m5_render_submission::layout(
+                    command, self.shared.clusters, self.shared.variant.programs)?;
+            }
+            Validated::Compute { resources, plan, m5_scratch, cdm_auxiliary_allocation, .. } => {
+                if let Some(programs) = resources {
+                    *plan = Some(policy.plan_compute_scs(programs, priority, m5_scratch.layout(),
+                        *cdm_auxiliary_allocation)?);
+                } else if m5_scratch.enabled() {
+                    // SCS needs the dispatch storage declarations to size its pool.
+                    return Err(EINVAL);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn render_scs_blocks(&self, pages: [u16; 2]) -> Result<usize> {
+        crate::g17::fw::render_rt::required_blocks(self.shared.active_cores, pages, self.pairs)
+    }
+
+    fn ensure_compute(&self, command: &crate::g17::command::Validated) -> Result {
         // A reverse timeline chain must be submitted before the host signal.
         // Validate here, but do not consume physical capacity behind unsignalled
         // DRM dependencies. compute_packet admits it when the job can run.
-        crate::g17::fw::compute_pool::required_blocks(self.shared.compute_blocks, self.shared.active_cores, scs_pages)
-            .map(|_| ())
+        self.compute_capacity(command).map(|_| ())
     }
 
     fn fail_vm(&self, error: Error) {
@@ -253,6 +303,7 @@ impl job::Backend for Backend {
         if packet.engine() == Engine::Compute {
             self.hold_claim(None);
         }
+        self.release_outer(packet.engine());
         self.release_backlog(&packet);
         self.finish_publication(&packet, result, &mut deferred)
     }
@@ -284,6 +335,7 @@ impl job::Backend for Backend {
         if packet.engine() == Engine::Compute {
             self.hold_claim(None);
         }
+        self.release_outer(packet.engine());
         if packet.request_cancel() {
             Deferred::Unpublished(packet.completion.clone(), ECANCELED).finish();
             return;
@@ -295,6 +347,33 @@ impl job::Backend for Backend {
         if result.is_err() {
             self.stop_after_error();
         }
+        // drm_sched frees the job as soon as this returns while the job's
+        // completion callback is still on its scheduler fence, so the fence
+        // must be signalled by now even when the queue could not settle the
+        // packet (a busy or failed runtime, a settle racing another queue's
+        // timeout). A completion its physical queue still owns keeps the VM
+        // pinned until the queue retires it; that later completion is a no-op.
+        if !packet.completion.signalled() {
+            packet.completion.fail_while_owned(ECANCELED);
+        }
+        // Another thread may have claimed the completion and not yet signalled.
+        let fence = packet.completion.scheduler_fence();
+        // SAFETY: the retained fence stays alive across this bounded wait,
+        // which holds no device lock.
+        unsafe {
+            kernel::bindings::dma_fence_wait_timeout(
+                fence.raw(),
+                false,
+                kernel::time::msecs_to_jiffies(1000) as _,
+            )
+        };
+    }
+
+    /// Not on M5: a job that does not finish within its watchdog interval fails then, however
+    /// recently other work retired. Its compute kill then follows the first expiry.
+    fn renews_shared(&self) -> bool {
+        let state = self.shared.state.lock();
+        (*state).as_deref().is_none_or(|firmware| !firmware.init.is_m5())
     }
 
     fn long_job_beside(&self, _packet: &Arc<Packet>) -> bool {
@@ -323,6 +402,14 @@ impl job::Backend for Backend {
             };
             if let Some(deferred) = deferred.as_mut() {
                 firmware.scan_renders(deferred)?;
+            }
+            if let Some((older, own)) = self.behind_own_head(packet, &firmware.init, renewals) {
+                if renewals == 0 {
+                    dev_info!(self.shared.dev.as_ref(),
+                        "Render watchdog owner={} behind its context's older node {:#x} (own {:#x}); the firmware progresses: renewed\n",
+                        self.owner, older, own);
+                }
+                return Ok(true);
             }
             // Borrowed-graph and queued-retirement deferrals share the renewal bound.
             if timeout::transaction_grace(renewals)

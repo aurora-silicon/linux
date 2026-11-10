@@ -656,6 +656,7 @@ static u64 mul_u32_u32(u32 x,u32 y) { return (u64)x*y; }
 #define DRM_FORMAT_XRGB8888 0x34325258U
 #define DRM_FORMAT_ARGB8888 0x34325241U
 #define DCP_FIRMWARE_H17P 1
+#define DCP_FIRMWARE_V_27_0 3
 #define DCP_IOMFB_METHODS_H17G 2
 #define READ_ONCE(x) (x)
 #define spin_lock_irqsave(p,f) do { (void)(p); (f)=0; } while(0)

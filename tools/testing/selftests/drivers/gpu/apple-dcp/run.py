@@ -155,7 +155,9 @@ def main():
                           '#define iomfb_m4_get_mode(...) (-95)\n'
                           '#define iomfb_m4_blank(...) (-95)\n')
                 if 'dcp_fail_stop(' in unit:
+                    # Firmware 27 fail-stops like H17P; no fixture here runs firmware 27.
                     prefix += ('struct apple_dcp;\n'
+                               '#define DCP_FIRMWARE_V_27_0 0x2700\n'
                                'static inline bool dcp_fail_stop(const struct apple_dcp *dcp);\n')
                     unit += '\n' + block((apple / 'dcp-internal.h').read_text(),
                                           'static inline bool dcp_fail_stop(')

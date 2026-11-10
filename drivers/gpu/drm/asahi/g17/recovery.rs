@@ -11,7 +11,7 @@ mod attribution;
 mod slot;
 mod safety;
 pub(crate) use safety::{note_retired, since_retired};
-pub(crate) use attribution::Sources;
+pub(crate) use attribution::{Sources, PAGE_FAULT};
 use attribution::Attribution;
 
 pub(super) fn slot_key(slot: usize, slot_keys: Option<u64>) -> Option<u64> {
@@ -50,8 +50,8 @@ pub(super) struct Entries {
 }
 
 impl Entries {
-    /// Returns false at the first invalid record: the table is a packed list and
-    /// records after it are left over from an earlier restart.
+    /// Counts a valid record. Returns false for an invalid one, which ends the walk on G17P
+    /// and is skipped on M5 (see `read_entries`).
     pub(super) fn include(&mut self, flags: u32) -> bool {
         if flags & 1 == 0 {
             return false;
@@ -134,6 +134,8 @@ pub(super) trait Memory {
     fn entry(&self, index: usize) -> Result<(u32, u32)>;
     /// One millisecond wait; this is polled because the firmware sends no state-3 notification.
     fn wait_tick(&self);
+    /// The M5 firmware's recovery table, whose stamp form is not the G17P one.
+    fn is_m5(&self) -> bool;
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -170,7 +172,11 @@ impl State {
     pub(super) fn timeout_limit(&mut self, now: u64) -> bool {
         self.timeouts.note_unless_progress(now, safety::retired())
     }
-    pub(super) fn restart_limit(&mut self, now: u64) -> bool { self.restarts.note(now) }
+    /// Like timeouts, restarts with work retired between them start a new window: each one
+    /// still costs the guilty client its device, but only restarts without progress stop the GPU.
+    pub(super) fn restart_limit(&mut self, now: u64) -> bool {
+        self.restarts.note_unless_progress(now, safety::retired())
+    }
     /// A restart that only dropped leftover work of failed VMs (`ServiceResult::leftover`)
     /// does not count toward the storm limit. Returns whether it was forgiven.
     pub(super) fn forgive_restart(&mut self) -> bool { self.restarts.forgive() }
@@ -304,7 +310,14 @@ pub(super) fn service<H: Host>(
 
     let (listed, exact, fallback) = (entries.listed, entries.exact, entries.fallback);
     let (cancelled, blame, leftover) = classify(host, entries, request.blamed, attribution);
-    if listed != 0 {
+    if listed != 0 && host.is_m5() {
+        // The M5 table only classifies (read_entries): each command is retired from its own
+        // queue's records, replayed when it never ran.
+        pr_warn!(
+            "G17: GPU recovery: {} commands were in flight; each is retired from its own queue's records\n",
+            listed
+        );
+    } else if listed != 0 {
         pr_warn!(
             "G17: GPU recovery: {} commands were in flight ({} matched by stamp, {} by queue); they fail instead of completing\n",
             listed,
@@ -331,16 +344,25 @@ pub(super) fn service<H: Host>(
     Ok(ServiceResult { scan_error, target_error, leftover })
 }
 
-/// Walks the packed recovery table up to its first invalid record and marks
-/// every listed command interrupted. A failed read keeps what was read so far.
+/// Walks the recovery table. G17P's is a packed list: records after its first invalid one are
+/// left over from an earlier restart, so the walk ends there. M5's need not be packed, so all
+/// of its records are walked and invalid ones skipped; they only classify the recovery, while
+/// on G17P every listed command is marked interrupted. A failed read keeps what was read so far.
 fn read_entries<H: Host>(host: &mut H) -> Entries {
     let mut entries = Entries::default();
+    let m5 = host.is_m5();
     for index in 0..RECOVERY_RECORDS {
         let Ok((flags, stamp)) = host.entry(index) else {
             break;
         };
         if !entries.include(flags) {
+            if m5 {
+                continue;
+            }
             break;
+        }
+        if m5 {
+            continue;
         }
         let qid = ((flags >> 4) & 0x7f) as u8;
         match host.note_interrupted(qid, stamp) {
@@ -459,6 +481,7 @@ mod tests {
     }
 
     impl Memory for Halted {
+        fn is_m5(&self) -> bool { false }
         fn recovery_state(&self) -> Result<u32> { Ok(self.state.get()) }
         fn host_recovery(&self) -> Result<u32> { Ok(0) }
         fn fault_sources(&self) -> Result<Sources> {
@@ -511,6 +534,96 @@ mod tests {
     impl Host for Halted {
         fn recovery(&self) -> &State { &self.recovery }
         fn recovery_mut(&mut self) -> &mut State { &mut self.recovery }
+    }
+
+    /// A halted recovery table holding `records` (index, flags); every other record is invalid.
+    /// Records the QIDs whose commands the walk marks interrupted.
+    struct Table {
+        recovery: State,
+        m5: bool,
+        records: [(usize, u32); 5],
+        marked: u128,
+    }
+
+    impl Table {
+        fn new(m5: bool) -> Self {
+            const VALID: u32 = 1;
+            Self {
+                recovery: State::new(),
+                m5,
+                records: [
+                    (0, VALID | (12 << 4)),
+                    (1, VALID | u32::from(GUILTY) | (17 << 4)),
+                    // Index 2 is invalid: G17P's list ends here, and what follows is left over.
+                    (3, VALID | u32::from(GUILTY | CANCELLED) | (40 << 4)),
+                    (RECOVERY_RECORDS - 1, VALID | u32::from(GUILTY) | (41 << 4)),
+                    (RECOVERY_RECORDS, VALID | u32::from(GUILTY) | (42 << 4)),
+                ],
+                marked: 0,
+            }
+        }
+    }
+
+    impl Memory for Table {
+        fn is_m5(&self) -> bool { self.m5 }
+        fn recovery_state(&self) -> Result<u32> { Ok(3) }
+        fn host_recovery(&self) -> Result<u32> { Ok(0) }
+        fn fault_sources(&self) -> Result<Sources> { Err(EIO) }
+        fn transition(&self, _expected: u32, _next: u32) -> Result { Err(EIO) }
+        fn clear_timestamps(&self) -> Result { Err(EIO) }
+        fn entry(&self, index: usize) -> Result<(u32, u32)> {
+            assert!(index < RECOVERY_RECORDS);
+            let flags = self.records.iter().find(|(at, _)| *at == index).map_or(0, |(_, flags)| *flags);
+            Ok((flags, index as u32))
+        }
+        fn wait_tick(&self) {}
+    }
+
+    impl Queues for Table {
+        fn render_scheduler_active(&self) -> bool { true }
+        fn render_pass_started(&self, _qid: u8, _stamp: u64) -> Option<bool> { None }
+        fn publish_recovery_targets(&self) -> Option<Error> { None }
+        fn oldest_spared(&self, _qid: u8) -> Option<bool> { None }
+        fn visit_owners(&self, _qid: u8, _visit: &mut dyn FnMut(&Arc<VmStatus>)) {}
+        fn classify_work(&mut self, _class: &dyn Fn(&Arc<VmStatus>) -> Class) -> u128 { 0 }
+        fn note_interrupted(&mut self, qid: u8, _stamp: u32) -> Interrupted {
+            self.marked |= 1u128 << qid;
+            Interrupted::Exact
+        }
+        fn settle_blamed_render(&mut self, _qid: u8, _error: Error) {}
+        fn settle_cancelled_renders(&mut self, _qids: u128) {}
+        fn rescan_compute(&mut self) -> Result { Ok(()) }
+        fn release_retired_compute(&mut self) {}
+    }
+
+    impl Host for Table {
+        fn recovery(&self) -> &State { &self.recovery }
+        fn recovery_mut(&mut self) -> &mut State { &mut self.recovery }
+    }
+
+    #[test]
+    fn recovery_table_ends_at_its_first_invalid_record() {
+        let mut host = Table::new(false);
+        let entries = read_entries(&mut host);
+        assert_eq!(entries.listed, 2);
+        assert_eq!(entries.guilty, 1u128 << 17);
+        assert_eq!(entries.cancelled, 0);
+        assert_eq!(entries.exact, 2);
+        assert_eq!(entries.exact_qids, (1u128 << 12) | (1u128 << 17));
+        // Leftover records blame and cancel nothing and mark no bystander's command.
+        assert_eq!(host.marked, (1u128 << 12) | (1u128 << 17));
+    }
+
+    #[test]
+    fn m5_recovery_table_is_walked_past_invalid_records() {
+        let mut host = Table::new(true);
+        let entries = read_entries(&mut host);
+        assert_eq!(entries.listed, 4);
+        assert_eq!(entries.guilty, (1u128 << 17) | (1u128 << 40) | (1u128 << 41));
+        assert_eq!(entries.cancelled, 1u128 << 40);
+        // The M5 table only classifies.
+        assert_eq!((entries.exact, entries.fallback, entries.exact_qids), (0, 0, 0));
+        assert_eq!(host.marked, 0);
     }
 
     #[test]

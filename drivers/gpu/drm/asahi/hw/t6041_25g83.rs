@@ -44,8 +44,8 @@ use crate::g17::{Config, CoreLayout};
 pub(super) const CONFIG: Config = Config {
     windows: &REGISTER_WINDOWS,
     reserved_slots: &[],
-    perf: &PERF,
-    region_c: &REGION_C,
+    perf: Some(&PERF),
+    region_c: Some(&REGION_C),
     chip: Some(&CHIP),
     firmware: fw::variant::Firmware::Identified(&[t6041::BUILD_25G83]),
     core_layout: CoreLayout {
