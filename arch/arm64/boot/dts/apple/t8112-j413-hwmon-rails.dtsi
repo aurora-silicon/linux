@@ -1,0 +1,282 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * T8112 J413 PMU rail channels published by the SMC.
+ *
+ * The SMC samples the main PMU outputs (VPxy voltage, IPxy current, PPxy
+ * power) and a second regulator family (VRxy, IRxy, PRxy). With the other
+ * cluster held at its lowest step, one cluster under load moves only its
+ * own output:
+ *   P cluster (cpu4-7): VP0b 555-775 mV, IP0b up to 7.8 A, PP0b up to 6.1 W
+ *   E cluster (cpu0-3): VPbb 537-905 mV, IPbb up to 2.2 A, PPbb up to 2.0 W
+ *   GPU: VP1b 0 mV while power-gated, 900-930 mV under load, PP1b ~1.1 W
+ * The consumers of the other outputs are not mapped; they are labelled
+ * "PMU <key>" and "Rail <key>". Outputs whose current and power read 0 in
+ * every state are left out. Linux only reads the SMC keys.
+ */
+
+&smc_hwmon {
+	voltage-VP0b {
+		apple,key-id = "VP0b";
+		label = "P-cluster VP0b";
+	};
+
+	voltage-VPbb {
+		apple,key-id = "VPbb";
+		label = "E-cluster VPbb";
+	};
+
+	voltage-VP1b {
+		apple,key-id = "VP1b";
+		label = "GPU VP1b";
+	};
+
+	voltage-VP0R {
+		apple,key-id = "VP0R";
+		label = "PMU VP0R";
+	};
+
+	voltage-VP2b {
+		apple,key-id = "VP2b";
+		label = "PMU VP2b";
+	};
+
+	voltage-VP2l {
+		apple,key-id = "VP2l";
+		label = "PMU VP2l";
+	};
+
+	voltage-VP3b {
+		apple,key-id = "VP3b";
+		label = "PMU VP3b";
+	};
+
+	voltage-VP4b {
+		apple,key-id = "VP4b";
+		label = "PMU VP4b";
+	};
+
+	voltage-VP7b {
+		apple,key-id = "VP7b";
+		label = "PMU VP7b";
+	};
+
+	voltage-VP7l {
+		apple,key-id = "VP7l";
+		label = "PMU VP7l";
+	};
+
+	voltage-VP8l {
+		apple,key-id = "VP8l";
+		label = "PMU VP8l";
+	};
+
+	voltage-VP9b {
+		apple,key-id = "VP9b";
+		label = "PMU VP9b";
+	};
+
+	voltage-VP9l {
+		apple,key-id = "VP9l";
+		label = "PMU VP9l";
+	};
+
+	voltage-VPdb {
+		apple,key-id = "VPdb";
+		label = "PMU VPdb";
+	};
+
+	voltage-VPkl {
+		apple,key-id = "VPkl";
+		label = "PMU VPkl";
+	};
+
+	voltage-VR4l {
+		apple,key-id = "VR4l";
+		label = "Rail VR4l";
+	};
+
+	voltage-VR5b {
+		apple,key-id = "VR5b";
+		label = "Rail VR5b";
+	};
+
+	voltage-VR6b {
+		apple,key-id = "VR6b";
+		label = "Rail VR6b";
+	};
+
+	voltage-VR8b {
+		apple,key-id = "VR8b";
+		label = "Rail VR8b";
+	};
+
+	voltage-VRab {
+		apple,key-id = "VRab";
+		label = "Rail VRab";
+	};
+
+	voltage-VRcb {
+		apple,key-id = "VRcb";
+		label = "Rail VRcb";
+	};
+
+	voltage-VRcl {
+		apple,key-id = "VRcl";
+		label = "Rail VRcl";
+	};
+
+	voltage-VReb {
+		apple,key-id = "VReb";
+		label = "Rail VReb";
+	};
+
+	current-IP0b {
+		apple,key-id = "IP0b";
+		label = "P-cluster IP0b";
+	};
+
+	current-IPbb {
+		apple,key-id = "IPbb";
+		label = "E-cluster IPbb";
+	};
+
+	current-IP1b {
+		apple,key-id = "IP1b";
+		label = "GPU IP1b";
+	};
+
+	current-IP2b {
+		apple,key-id = "IP2b";
+		label = "PMU IP2b";
+	};
+
+	current-IP4b {
+		apple,key-id = "IP4b";
+		label = "PMU IP4b";
+	};
+
+	current-IP7b {
+		apple,key-id = "IP7b";
+		label = "PMU IP7b";
+	};
+
+	current-IP7l {
+		apple,key-id = "IP7l";
+		label = "PMU IP7l";
+	};
+
+	current-IP8l {
+		apple,key-id = "IP8l";
+		label = "PMU IP8l";
+	};
+
+	current-IP9b {
+		apple,key-id = "IP9b";
+		label = "PMU IP9b";
+	};
+
+	current-IPBR {
+		apple,key-id = "IPBR";
+		label = "PMU IPBR";
+	};
+
+	current-IPkl {
+		apple,key-id = "IPkl";
+		label = "PMU IPkl";
+	};
+
+	current-IR4l {
+		apple,key-id = "IR4l";
+		label = "Rail IR4l";
+	};
+
+	current-IR5b {
+		apple,key-id = "IR5b";
+		label = "Rail IR5b";
+	};
+
+	current-IR8b {
+		apple,key-id = "IR8b";
+		label = "Rail IR8b";
+	};
+
+	current-IRcl {
+		apple,key-id = "IRcl";
+		label = "Rail IRcl";
+	};
+
+	power-PP0b {
+		apple,key-id = "PP0b";
+		label = "P-cluster PP0b";
+	};
+
+	power-PPbb {
+		apple,key-id = "PPbb";
+		label = "E-cluster PPbb";
+	};
+
+	power-PP1b {
+		apple,key-id = "PP1b";
+		label = "GPU PP1b";
+	};
+
+	power-PP2b {
+		apple,key-id = "PP2b";
+		label = "PMU PP2b";
+	};
+
+	power-PP4b {
+		apple,key-id = "PP4b";
+		label = "PMU PP4b";
+	};
+
+	power-PP7b {
+		apple,key-id = "PP7b";
+		label = "PMU PP7b";
+	};
+
+	power-PP7l {
+		apple,key-id = "PP7l";
+		label = "PMU PP7l";
+	};
+
+	power-PP8l {
+		apple,key-id = "PP8l";
+		label = "PMU PP8l";
+	};
+
+	power-PP9b {
+		apple,key-id = "PP9b";
+		label = "PMU PP9b";
+	};
+
+	power-PPBR {
+		apple,key-id = "PPBR";
+		label = "PMU PPBR";
+	};
+
+	power-PPkl {
+		apple,key-id = "PPkl";
+		label = "PMU PPkl";
+	};
+
+	power-PR4l {
+		apple,key-id = "PR4l";
+		label = "Rail PR4l";
+	};
+
+	power-PR5b {
+		apple,key-id = "PR5b";
+		label = "Rail PR5b";
+	};
+
+	power-PR8b {
+		apple,key-id = "PR8b";
+		label = "Rail PR8b";
+	};
+
+	power-PRcl {
+		apple,key-id = "PRcl";
+		label = "Rail PRcl";
+	};
+};
