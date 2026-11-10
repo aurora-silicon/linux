@@ -320,6 +320,9 @@ impl Firmware {
         }
         self.recovery.running = true;
         self.engine.frozen = true;
+        // A recovery may reset what the firmware keeps for a bound PB epoch, also one whose
+        // render was not affected: start the next render on each pass slot fresh.
+        self.pools.invalidate();
         self.events.grow.clear();
         // These frontiers must be captured before the host answers 2: the
         // firmware can force the stage target while aborting a work item.
