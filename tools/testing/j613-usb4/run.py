@@ -62,3 +62,28 @@ with tempfile.TemporaryDirectory(prefix='j613-usb4-') as tmp:
                     str(t / 'test.c'), '-o', str(t / 'test')], check=True)
     subprocess.run([str(t / 'test')], check=True)
 print('PASS: production PMGR witness rejects missing/foreign domains, read faults, all live state bits')
+
+# Use the same aperture selector and constants as PCIe-C admission.
+msi = r'''
+#include <assert.h>
+#include "pcie-apple-t8122.h"
+int main(void)
+{
+    assert(apple_t8122_msi_vector_base(APPLE_T8122_PCIEC0_ECAM) == 32);
+    assert(apple_t8122_msi_vector_base(APPLE_T8122_PCIEC1_ECAM) == 64);
+    assert(APPLE_T8122_PCIEC_AIC_BASE + APPLE_T8122_PCIEC0_MSI_BASE == 1107);
+    assert(APPLE_T8122_PCIEC_AIC_BASE + APPLE_T8122_PCIEC1_MSI_BASE == 1139);
+    assert(apple_t8122_msi_vector_base(0) < 0);
+    assert(apple_t8122_msi_vector_base(APPLE_T8122_PCIEC0_ECAM + 1) < 0);
+    assert(apple_t8122_msi_vector_base(APPLE_T8122_PCIEC1_ECAM - 1) < 0);
+    return 0;
+}
+'''
+with tempfile.TemporaryDirectory(prefix='j613-msi-') as tmp:
+    t = Path(tmp)
+    (t / 'test.c').write_text(msi)
+    subprocess.run([os.environ.get('CC', 'cc'), '-Wall', '-Werror',
+                    '-I', str(root / 'drivers/pci/controller'),
+                    str(t / 'test.c'), '-o', str(t / 'test')], check=True)
+    subprocess.run([str(t / 'test')], check=True)
+print('PASS: shared T8122 PCIe-C aperture/MSI selector and unknown apertures')
