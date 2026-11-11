@@ -4355,6 +4355,8 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j700-macaudio", .data = &macaudio_j700_cfg },
 	/* j714    -       sn012776    15      2x 2W+1T (AOP-fed, V/I sense) */
 	{ .compatible = "apple,j714-macaudio", .data = &macaudio_j714_cfg },
+	/* k116    -       sn012776    15      2x 2W+1T (AOP-fed, V/I sense; the 16" PROLED chassis, J714's amps and frame) */
+	{ .compatible = "apple,k116-macaudio", .data = &macaudio_j714_cfg },
 	/* j713    -       sn012776    15      2x 1W+1T (AOP-fed, one serializer) */
 	{ .compatible = "apple,j713-macaudio", .data = &macaudio_j713_cfg },
 	/* The J713 jack runs on the AOP like the J616s one. */
