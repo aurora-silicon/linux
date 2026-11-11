@@ -29,6 +29,9 @@
 
 #define COMMAND_TIMEOUT_MS 1000
 #define START_TIMEOUT_MS 2000
+/* The MTP bootloader writes the 1.3 MB kiwi image over the touch IC SPI: seconds, not 1 s. */
+#define KIWI_CMD_TIMEOUT_MS 10000
+#define KIWI_START_TIMEOUT_MS 10000
 
 #define MAX_INTERFACES 16
 
@@ -180,8 +183,15 @@ struct dchid_iface {
 	size_t hid_desc_len;
 
 	struct gpio_desc *gpio;
-	char gpio_name[MAX_GPIO_NAME];
-	int gpio_id;
+	/* The k114c MTP announces several GPIOs per interface (kiwi:
+	 * clock_24MHz_enable, display_sync, power, reset). Track them all;
+	 * gpio keeps the legacy single-GPIO semantics for existing paths. */
+#define MAX_IFACE_GPIOS 4
+	struct gpio_desc *gpios[MAX_IFACE_GPIOS];
+	char gpio_names[MAX_IFACE_GPIOS][MAX_GPIO_NAME];
+	int gpio_ids[MAX_IFACE_GPIOS];
+	int gpio_count;
+	bool gpios_requested;
 	bool gpio_announced;
 
 	struct mutex out_mutex;
@@ -195,6 +205,11 @@ struct dchid_iface {
 	u32 keyboard_layout_id;
 	u32 power_method;
 	bool firmware_managed_reset;
+
+	/* Power method 2: the line that resets this interface, and its optional supply. */
+	struct gpio_desc *reset;
+	struct gpio_desc *power;
+	struct gpio_desc *clock;
 };
 
 struct dockchannel_hid {
@@ -203,6 +218,8 @@ struct dockchannel_hid {
 	struct device_link *helper_link;
 	struct apple_smc *afe_smc;
 	bool stopping;
+	/* The kiwi firmware load is running: comm commands get the long timeout */
+	bool kiwi_loading;
 	bool inherited_mtp;
 	/* Between the system sleep suspend and resume callbacks */
 	bool suspended;
@@ -253,6 +270,7 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 	u32 power_method = DCHID_POWER_METHOD_1;
 	bool firmware_managed_reset = false;
 	struct device_node *of_node = NULL;
+	struct gpio_desc *reset = NULL, *power = NULL, *clock = NULL;
 	struct dchid_iface *iface;
 
 	if (READ_ONCE(dchid->stopping))
@@ -294,11 +312,44 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 				power_method, name);
 			goto err_put_node;
 		}
-		if (power_method == DCHID_POWER_METHOD_2 &&
-		    !firmware_managed_reset && !dchid->afe_reset) {
-			dev_err(dchid->dev, "Power method 2 for %s needs the AFE reset line\n",
-				name);
-			goto err_put_node;
+		if (power_method == DCHID_POWER_METHOD_2 && !firmware_managed_reset) {
+			struct fwnode_handle *fwnode = of_fwnode_handle(of_node);
+
+			/* An interface with its own reset line (kiwi) does not share the AFE one. */
+			reset = devm_fwnode_gpiod_get(dchid->dev, fwnode, "apple,reset",
+						      GPIOD_OUT_LOW, "dchid-reset");
+			if (IS_ERR(reset)) {
+				if (PTR_ERR(reset) != -ENOENT) {
+					dev_err(dchid->dev, "Reset line of %s: %pe\n", name, reset);
+					goto err_put_node;
+				}
+				reset = dchid->afe_reset;
+			}
+			if (!reset) {
+				dev_err(dchid->dev, "Power method 2 for %s needs a reset line\n",
+					name);
+				goto err_put_node;
+			}
+
+			power = devm_fwnode_gpiod_get(dchid->dev, fwnode, "apple,power",
+						      GPIOD_OUT_HIGH, "dchid-power");
+			if (IS_ERR(power)) {
+				if (PTR_ERR(power) != -ENOENT) {
+					dev_err(dchid->dev, "Power line of %s: %pe\n", name, power);
+					goto err_put_node;
+				}
+				power = NULL;
+			}
+
+			clock = devm_fwnode_gpiod_get(dchid->dev, fwnode, "apple,clock",
+						      GPIOD_OUT_HIGH, "dchid-clock");
+			if (IS_ERR(clock)) {
+				if (PTR_ERR(clock) != -ENOENT) {
+					dev_err(dchid->dev, "Clock line of %s: %pe\n", name, clock);
+					goto err_put_node;
+				}
+				clock = NULL;
+			}
 		}
 	}
 
@@ -314,6 +365,9 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 	iface->of_node = of_node;
 	iface->power_method = power_method;
 	iface->firmware_managed_reset = firmware_managed_reset;
+	iface->reset = reset;
+	iface->power = power;
+	iface->clock = clock;
 	iface->out_report = -1;
 	init_completion(&iface->out_complete);
 	init_completion(&iface->ready);
@@ -443,7 +497,10 @@ static int dchid_cmd(struct dchid_iface *iface, u32 type, u32 req,
 	if (ret < 0)
 		goto done;
 
-	if (!wait_for_completion_timeout(&iface->out_complete, msecs_to_jiffies(COMMAND_TIMEOUT_MS))) {
+	if (!wait_for_completion_timeout(&iface->out_complete,
+			msecs_to_jiffies(READ_ONCE(iface->dchid->kiwi_loading) ?
+					     KIWI_CMD_TIMEOUT_MS :
+					     COMMAND_TIMEOUT_MS))) {
 		dev_err(iface->dchid->dev, "output report 0x%x to iface  %d (%s) timed out\n",
 			report_id, iface->index, iface->name);
 		ret = -ETIMEDOUT;
@@ -571,11 +628,23 @@ static int dchid_register_ring(struct dockchannel_hid *dchid)
 	return ret;
 }
 
+/* Drive an interface's own power, clock and reset lines to the OFF or ON state. */
+static int dchid_set_own_lines(struct dchid_iface *iface, u8 state)
+{
+	bool on = state == DCHID_POWER_STATE_ON;
+
+	if (on && iface->power)
+		gpiod_set_value_cansleep(iface->power, on);
+	if (iface->clock)
+		gpiod_set_value_cansleep(iface->clock, on);
+	return gpiod_set_value_cansleep(iface->reset, !on);
+}
+
 /*
- * Power method 2: announce the transition, drive the AFE reset line to the
- * new state and confirm the transition. The reset is asserted for a power-off
- * and held for 50 ms, and released for a power-on and given 50 ms to settle
- * before the transition is confirmed.
+ * Power method 2: announce the transition, drive the interface's reset line
+ * to the new state and confirm the transition. The reset is asserted for a
+ * power-off and held for 50 ms, and released for a power-on before the
+ * transition is confirmed.
  */
 static int dchid_pm2_set_power(struct dchid_iface *iface, u8 state)
 {
@@ -595,21 +664,19 @@ static int dchid_pm2_set_power(struct dchid_iface *iface, u8 state)
 	} else {
 		bool off = state == DCHID_POWER_STATE_OFF;
 
-		ret = gpiod_set_value_cansleep(dchid->afe_reset, off);
+		ret = dchid_set_own_lines(iface, state);
 		if (ret < 0) {
-			dev_err(dchid->dev, "%s: failed to %s the AFE reset: %d\n",
+			dev_err(dchid->dev, "%s: failed to %s the reset line: %d\n",
 				iface->name, off ? "assert" : "release", ret);
 			return ret;
 		}
-		dev_dbg(dchid->dev, "%s: AFE reset %s\n", iface->name,
-			off ? "asserted" : "released");
 		/*
-		 * The sequence validated on J716s (M5 Pro, MTP firmware
-		 * 6320.86.1, "Touch MT ready" on 3 of 3 boots) also waits
-		 * 50 ms after the release before HasChanged, as the
-		 * firmware-managed path above does.
+		 * The kiwi sequence was verified with a settle after power-off
+		 * only; the shared AFE reset (multi-touch, sequence validated
+		 * on J716s) settles after every transition.
 		 */
-		fsleep(50 * USEC_PER_MSEC);
+		if (off || iface->reset == dchid->afe_reset)
+			fsleep(50 * USEC_PER_MSEC);
 	}
 
 	dchid_pm2_command(iface->index, state, true, msg);
@@ -705,7 +772,7 @@ done:
 static int dchid_request_gpio(struct dchid_iface *iface)
 {
 	char prop_name[MAX_GPIO_NAME + 16];
-	int ret;
+	int ret, g;
 
 	if (iface->firmware_managed_reset)
 		return -EINVAL;
@@ -715,30 +782,42 @@ static int dchid_request_gpio(struct dchid_iface *iface)
 		return -EOPNOTSUPP;
 	}
 
-	if (iface->gpio)
+	if (iface->gpio_count && iface->gpios_requested)
+		return 0;
+	if (!iface->gpio_count && iface->gpio)
 		return 0;
 
-	dev_dbg(iface->dchid->dev, "Requesting GPIO %s#%d: %s\n",
-		iface->name, iface->gpio_id, iface->gpio_name);
+	for (g = 0; g < iface->gpio_count; g++) {
+		const char *name = iface->gpio_names[g];
 
-	/* A power method 2 interface holds its reset line from probe on. */
-	if (iface->power_method == DCHID_POWER_METHOD_2 &&
-	    !strcmp(iface->gpio_name, "afe-reset")) {
-		iface->gpio = iface->dchid->afe_reset;
-		return 0;
+		dev_dbg(iface->dchid->dev, "Requesting GPIO %s#%d: %s\n",
+			iface->name, iface->gpio_ids[g], name);
+
+		/* A power method 2 multi-touch holds its AFE reset line from
+		 * probe on; the pm2 transitions drive it, not this path. */
+		if (iface->power_method == DCHID_POWER_METHOD_2 &&
+		    !strcmp(name, "afe-reset")) {
+			iface->gpios[g] = iface->dchid->afe_reset;
+			if (g == 0)
+				iface->gpio = iface->dchid->afe_reset;
+			continue;
+		}
+
+		snprintf(prop_name, sizeof(prop_name), "apple,%s", name);
+		iface->gpios[g] = devm_gpiod_get_index(iface->dchid->dev, prop_name,
+						       0, GPIOD_OUT_LOW);
+		if (IS_ERR(iface->gpios[g])) {
+			ret = PTR_ERR(iface->gpios[g]);
+			iface->gpios[g] = NULL;
+			dev_err(iface->dchid->dev,
+				"Failed to request GPIO %s-gpios: %d\n",
+				prop_name, ret);
+			return ret;
+		}
+		if (g == 0)
+			iface->gpio = iface->gpios[g];
 	}
-
-	snprintf(prop_name, sizeof(prop_name), "apple,%s", iface->gpio_name);
-
-	iface->gpio = devm_gpiod_get_index(iface->dchid->dev, prop_name, 0, GPIOD_OUT_LOW);
-
-	if (IS_ERR(iface->gpio)) {
-		ret = PTR_ERR(iface->gpio);
-		iface->gpio = NULL;
-		dev_err(iface->dchid->dev, "Failed to request GPIO %s-gpios: %d\n",
-			prop_name, ret);
-		return ret;
-	}
+	iface->gpios_requested = true;
 
 	return 0;
 }
@@ -773,13 +852,29 @@ static int dchid_start_interface(struct dchid_iface *iface)
 			goto err;
 	}
 
-	/* Only multi-touch has firmware */
+	/* Only multi-touch and kiwi have firmware */
 	if (fw && size) {
+		bool kiwi_own = !strcmp(iface->name, "kiwi") &&
+				iface->power_method == DCHID_POWER_METHOD_2 &&
+				!iface->firmware_managed_reset;
+
+		WRITE_ONCE(iface->dchid->kiwi_loading, kiwi_own);
+
+		/* The kiwi chip needs a full power cycle with a reset pulse
+		 * before its firmware goes out (its reset line is active low
+		 * in the device tree); the sequence is verified on hardware. */
+		if (kiwi_own) {
+			dchid_set_own_lines(iface, DCHID_POWER_STATE_OFF);
+			fsleep(50 * USEC_PER_MSEC);
+			dchid_set_own_lines(iface, DCHID_POWER_STATE_ON);
+			fsleep(50 * USEC_PER_MSEC);
+		}
 
 		/* Send firmware to the device */
 		dev_dbg(iface->dchid->dev, "Sending firmware for %s\n", iface->name);
 		/* Retained MTP must see AFE reset throughout firmware upload. */
 		if (iface->dchid->inherited_mtp &&
+		    !kiwi_own &&
 		    iface->power_method == DCHID_POWER_METHOD_2) {
 			if (iface->firmware_managed_reset) {
 				ret = -EINVAL;
@@ -799,8 +894,9 @@ static int dchid_start_interface(struct dchid_iface *iface)
 		/* After loading firmware, multi-touch needs a reset */
 		dev_dbg(iface->dchid->dev, "Resetting %s\n", iface->name);
 		if (iface->power_method == DCHID_POWER_METHOD_2) {
-			/* The retained session is already off while reset is asserted. */
-			if (!iface->dchid->inherited_mtp) {
+			/* The retained session is already off while reset is asserted;
+			 * kiwi always power-cycles its own lines. */
+			if (!iface->dchid->inherited_mtp || kiwi_own) {
 				ret = dchid_pm2_set_power(iface, DCHID_POWER_STATE_OFF);
 				if (ret < 0)
 					goto err;
@@ -816,9 +912,11 @@ static int dchid_start_interface(struct dchid_iface *iface)
 		}
 	}
 
+	WRITE_ONCE(iface->dchid->kiwi_loading, false);
 	return 0;
 
 err:
+	WRITE_ONCE(iface->dchid->kiwi_loading, false);
 	iface->starting = false;
 	return ret;
 }
@@ -859,7 +957,10 @@ static int dchid_open(struct hid_device *hdev)
 		if (ret < 0)
 			return ret;
 
-		if (!wait_for_completion_timeout(&iface->ready, msecs_to_jiffies(START_TIMEOUT_MS))) {
+		if (!wait_for_completion_timeout(&iface->ready,
+				msecs_to_jiffies(!strcmp(iface->name, "kiwi") ?
+						 KIWI_START_TIMEOUT_MS :
+						 START_TIMEOUT_MS))) {
 			dev_err(iface->dchid->dev, "iface %s start timed out\n", iface->name);
 			return -ETIMEDOUT;
 		}
@@ -1206,14 +1307,16 @@ static void dchid_handle_init(struct dockchannel_hid *dchid, void *data, size_t 
 				break;
 			}
 
-			if (iface->gpio_announced) {
+			if (iface->gpio_count >= MAX_IFACE_GPIOS) {
 				dev_err(dchid->dev,
-					"Cannot request more than one GPIO per interface!\n");
+					"Too many GPIO requests for %s\n", iface->name);
 				break;
 			}
 
-			strscpy(iface->gpio_name, req->name, MAX_GPIO_NAME);
-			iface->gpio_id = req->id;
+			strscpy(iface->gpio_names[iface->gpio_count], req->name,
+				MAX_GPIO_NAME);
+			iface->gpio_ids[iface->gpio_count] = req->id;
+			iface->gpio_count++;
 			iface->gpio_announced = true;
 			break;
 		}
@@ -1260,6 +1363,9 @@ static void dchid_handle_init(struct dockchannel_hid *dchid, void *data, size_t 
 
 static void dchid_handle_gpio(struct dockchannel_hid *dchid, void *data, size_t length)
 {
+	struct gpio_desc *cmd_gpio = NULL;
+	bool found = false;
+	unsigned int g;
 	struct dchid_gpio_cmd *cmd = data;
 	struct dchid_iface *iface;
 	u32 retcode = 0xe000f00d; /* Give it a random Apple-style error code */
@@ -1282,7 +1388,14 @@ static void dchid_handle_gpio(struct dockchannel_hid *dchid, void *data, size_t 
 	if (dchid_request_gpio(iface) < 0)
 		goto err;
 
-	if (!iface->gpio || cmd->gpio != iface->gpio_id) {
+	for (g = 0; g < iface->gpio_count; g++) {
+		if (iface->gpio_ids[g] == cmd->gpio) {
+			cmd_gpio = iface->gpios[g];
+			found = true;
+			break;
+		}
+	}
+	if (!found) {
 		dev_err(dchid->dev, "Got GPIO command for bad GPIO %s#%d\n",
 			iface->name, cmd->gpio);
 		goto err;
@@ -1293,13 +1406,13 @@ static void dchid_handle_gpio(struct dockchannel_hid *dchid, void *data, size_t 
 	switch (cmd->cmd) {
 	case 3:
 		/* Pulse.  */
-		gpiod_set_value_cansleep(iface->gpio, 1);
+		gpiod_set_value_cansleep(cmd_gpio, 1);
 		msleep(10); /* Random guess... */
-		gpiod_set_value_cansleep(iface->gpio, 0);
+		gpiod_set_value_cansleep(cmd_gpio, 0);
 		retcode = 0;
 		break;
 	default:
-		dev_err(dchid->dev, "Unknown GPIO command %d\n", cmd->cmd	);
+		dev_err(dchid->dev, "Unknown GPIO command %d\n", cmd->cmd);
 		break;
 	}
 
