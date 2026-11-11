@@ -6887,6 +6887,82 @@ EXPORT_SYMBOL_GPL(apple_dart_gapf_ready);
  * Stopping again after a sleep that never reached the commit does nothing: the
  * domains may be off by then.
  */
+/*
+ * T6041 sleep bring-up (test): a display DART is locked, so the driver neither saves nor restores
+ * its TCR / TTBR, and after a real sleep the panel stayed black with everything else up. Keep
+ * the words of @streams before the sleep (save), and after it log what the wake left and write
+ * back what differs (!save). Returns how many words were written back.
+ */
+int apple_dart_display_keep(struct device *dev, u32 streams, bool save)
+{
+	static struct { struct apple_dart *dart; u32 tcr[32]; u32 ttbr[32][4]; u32 raw[0x4100 / 4]; } keep[2];
+	unsigned int off, shown = 0, total = 0;
+	struct apple_dart *dart = dev_get_drvdata(dev);
+	unsigned long bits = streams;
+	unsigned int sid, idx, k, n = 0;
+
+	if (!dart)
+		return -ENODEV;
+	for (k = 0; k < 2 && keep[k].dart && keep[k].dart != dart; k++)
+		;
+	if (k == 2)
+		return -ENOSPC;
+	if (!save && keep[k].dart != dart)
+		return -ENOENT;
+	keep[k].dart = dart;
+	/*
+	 * The whole register block too: after a real sleep the panel shows black with every
+	 * display step succeeding, and TCR / TTBR alone come back unchanged. Only reported.
+	 */
+	for (off = 0; off < 0x4100; off += 4) {
+		u32 v = readl(dart->regs + off);
+
+		if (save) {
+			keep[k].raw[off / 4] = v;
+		} else if (v != keep[k].raw[off / 4]) {
+			total++;
+			if (shown++ < 80)
+				dev_warn(dev, "S2RDART reg %#x: %#x -> %#x\n", off, keep[k].raw[off / 4], v);
+		}
+	}
+	if (!save)
+		dev_warn(dev, "S2RDART %u register words differ from before the stop\n", total);
+	for_each_set_bit(sid, &bits, 32) {
+		u32 tcr = readl(dart->regs + DART_TCR(dart, sid));
+
+		if (sid >= dart->num_streams)
+			break;
+		if (save) {
+			keep[k].tcr[sid] = tcr;
+		} else {
+			dev_warn(dev, "S2RDART sid %u tcr %#x (was %#x)\n", sid, tcr, keep[k].tcr[sid]);
+		}
+		for (idx = 0; idx < dart->hw->ttbr_count && idx < 4; idx++) {
+			u32 ttbr = readl(dart->regs + DART_TTBR(dart, sid, idx));
+
+			if (save) {
+				keep[k].ttbr[sid][idx] = ttbr;
+				continue;
+			}
+			if (ttbr != keep[k].ttbr[sid][idx]) {
+				dev_warn(dev, "S2RDART sid %u ttbr%u %#x (was %#x)\n", sid, idx, ttbr,
+					 keep[k].ttbr[sid][idx]);
+				writel(keep[k].ttbr[sid][idx], dart->regs + DART_TTBR(dart, sid, idx));
+				n++;
+			}
+		}
+		if (!save && tcr != keep[k].tcr[sid]) {
+			writel(keep[k].tcr[sid], dart->regs + DART_TCR(dart, sid));
+			n++;
+		}
+	}
+	if (!save)
+		dev_warn(dev, "S2RDART locked %d, %u words written back, sid %lu tcr now %#x\n",
+			 dart->locked, n, __ffs(bits), readl(dart->regs + DART_TCR(dart, __ffs(bits))));
+	return n;
+}
+EXPORT_SYMBOL_GPL(apple_dart_display_keep);
+
 int apple_dart_display_streams(struct device *dev, u32 streams, bool on, bool flush)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
