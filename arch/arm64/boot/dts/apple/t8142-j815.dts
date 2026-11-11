@@ -209,6 +209,55 @@
 };
 
 /*
+ * SMC sensors beyond the discovered temperatures. Only non-temperature nodes
+ * may be added here: a temperature-* node would stop
+ * apple,discover-temperatures. Keys the SMC lacks are skipped at probe. The
+ * die key list is J704's (same T8142): the listed keys form the SoC die
+ * thermal zone.
+ */
+&smc {
+	hwmon {
+		apple,soc-die-keys = "Te04", "Te08", "Te0C", "Te0R",
+				     "Tp00", "Tp04", "Tp0C", "Tp0G", "Tp0O",
+				     "Tp0R", "Tp0X", "Tp0a", "Tp0p", "Tp0u",
+				     "Tp0y", "Tp12", "Tp16", "Tp1E",
+				     "Tg0U", "Tg0X", "Tg0d", "Tg0g", "Tg0j",
+				     "Tg1Y", "Tg1c", "Tg1g";
+		apple,thermal-pressure-key = "mTPL";
+
+		power-PSTR {
+			apple,key-id = "PSTR";
+			label = "Total System Power";
+		};
+
+		power-PDTR {
+			apple,key-id = "PDTR";
+			label = "AC Input Power";
+		};
+
+		power-PMVR {
+			apple,key-id = "PMVR";
+			label = "3.8 V Rail Power";
+		};
+
+		voltage-VD0R {
+			apple,key-id = "VD0R";
+			label = "AC Input Voltage";
+		};
+
+		voltage-SBAV {
+			apple,key-id = "SBAV";
+			label = "Battery Voltage";
+		};
+
+		current-ID0R {
+			apple,key-id = "ID0R";
+			label = "AC Input Current";
+		};
+	};
+};
+
+/*
  * J815 has six speaker amplifiers, not J813's four. Keep J813's sound card
  * and the AOP audio service off until the J815 speaker layout is described.
  */
