@@ -43,7 +43,12 @@ impl<T> DerefMut for KVec<T> {fn deref_mut(&mut self)->&mut Vec<T>{&mut self.0}}
 struct Secret(KVec<u8>);
 impl Deref for Secret {type Target=[u8];fn deref(&self)->&[u8]{&self.0.0}}
 macro_rules! dev_err {($($x:tt)*)=>{()};}
+macro_rules! dev_info_refusal {($($x:tt)*)=>{()};}
+macro_rules! dev_err_ratelimited {($($x:tt)*)=>{()};}
+macro_rules! dev_info_ratelimited {($($x:tt)*)=>{()};}
+macro_rules! dev_dbg {($($x:tt)*)=>{()};}
 macro_rules! dev_warn {($($x:tt)*)=>{()};}
+macro_rules! dev_warn_ratelimited {($($x:tt)*)=>{()};}
 '''
 
 REFKEY = r'''

@@ -66,7 +66,6 @@
 		interrupts = <AIC_IRQ 0 1117 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_aes>;
 		iommus = <&sio_dart_0 1>, <&sio_dart_1 1>;
-		status = "disabled";
 	};
 
 	jpeg0: jpeg@409000000 {

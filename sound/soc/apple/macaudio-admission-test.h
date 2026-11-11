@@ -11,6 +11,9 @@ static void macaudio_admission_needs_a_safe_level(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&macaudio_j45x_cfg));
 	KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j413_cfg));
 	KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j700_cfg));
+	/* The AOP-fed machines: J813 with its safe level, J873 without one */
+	KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j813_cfg));
+	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&macaudio_j873_cfg));
 	cfg = macaudio_j413_cfg;
 	cfg.safe_vol = 0;
 	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&cfg));
