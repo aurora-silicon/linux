@@ -28,76 +28,65 @@
 	};
 };
 
-&{/soc} {
-	pmgr: power-management@380700000 {
-		compatible = "apple,t8142-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
-		/* As on T8140: up to the ISP17a slots at +0x4000..+0x4060. */
-		reg = <3 0x80700000 0 0x14000>;
-		#address-cells = <1>;
-		#size-cells = <1>;
+&pmgr {
+	/* As on T8140: up to the ISP17a slots at +0x4000..+0x4060. */
+	reg = <3 0x80700000 0 0x14000>;
+	status = "okay";
 
-		ps_fpwm0: power-controller@330 {
-			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-			reg = <0x330 4>;
-			#power-domain-cells = <0>;
-			#reset-cells = <0>;
-			label = "fpwm0";
-		};
-
-		/* ADT pmgr devices: SPI_P id 94 (+0x390), QSPI id 120 (+0x460). */
-		ps_spi_p: power-controller@390 {
-			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-			reg = <0x390 4>;
-			#power-domain-cells = <0>;
-			#reset-cells = <0>;
-			label = "spi_p";
-		};
-
-		/* ADT pmgr devices: PMP id 159 (+0x598), PMS_SRAM id 160 (+0x5a0). */
-		ps_pmp: power-controller@598 {
-			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-			reg = <0x598 4>;
-			#power-domain-cells = <0>;
-			#reset-cells = <0>;
-			label = "pmp";
-			/* The PMP's SRAM, which the driver reads first. */
-			power-domains = <&ps_pms_sram>;
-		};
-
-		ps_pms_sram: power-controller@5a0 {
-			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-			reg = <0x5a0 4>;
-			#power-domain-cells = <0>;
-			#reset-cells = <0>;
-			label = "pms_sram";
-			/* T8140 holds it through its always-on PMP report node. */
-			apple,always-on;
-		};
-
-		ps_qspi: power-controller@460 {
-			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-			reg = <0x460 4>;
-			#power-domain-cells = <0>;
-			#reset-cells = <0>;
-			label = "qspi";
-			power-domains = <&ps_spi_p>;
-		};
+	ps_fpwm0: power-controller@330 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x330 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "fpwm0";
 	};
 
+	/* ADT pmgr devices: SPI_P id 94 (+0x390), QSPI id 120 (+0x460). */
+	ps_spi_p: power-controller@390 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x390 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "spi_p";
+	};
+
+	/* ADT pmgr devices: PMP id 159 (+0x598), PMS_SRAM id 160 (+0x5a0). */
+	ps_pmp: power-controller@598 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x598 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pmp";
+		/* The PMP's SRAM, which the driver reads first. */
+		power-domains = <&ps_pms_sram>;
+	};
+
+	ps_pms_sram: power-controller@5a0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x5a0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pms_sram";
+		/* T8140 holds it through its always-on PMP report node. */
+		apple,always-on;
+	};
+
+	ps_qspi: power-controller@460 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x460 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "qspi";
+		power-domains = <&ps_spi_p>;
+	};
+};
+
+&{/soc} {
 	/*
 	 * PMP, laid out as on T8140 (ADT /arm-io/pmp, dart-pmp): it runs the
 	 * DRAM controller (DCS) and fabric DVFS. Without it the memory stays at
 	 * the bootloader's state (memcpy ~20 GB/s against ~120 GB/s on macOS).
 	 */
-	pmp_dart: iommu@380300000 {
-		compatible = "apple,t8142-dart", "apple,t8110-dart";
-		reg = <0x3 0x80300000 0x0 0xc000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1004 IRQ_TYPE_LEVEL_HIGH>;
-		#iommu-cells = <1>;
-		apple,dma-range = /bits/ 64 <0x10000000000 0xbff00000>;
-		power-domains = <&ps_pmp>;
-	};
 
 	pmp: pmp@380500000 {
 		compatible = "apple,t8142-pmp-v2", "apple,t8140-pmp-v2";
@@ -168,14 +157,19 @@
 		clocks = <&clkref>;
 		#pwm-cells = <2>;
 	};
-
-	mtp_dart: iommu@394800000 {
-		compatible = "apple,t8142-dart", "apple,t8110-dart";
-		reg = <3 0x94800000 0 0xc000>;
-		interrupts = <AIC_IRQ 1275 IRQ_TYPE_LEVEL_HIGH>;
-		#iommu-cells = <1>;
-		/* Keep host allocations clear of firmware's low IOVA mappings. */
-		apple,dma-range = <0 0x02000000 0 0x10000000>;
-	};
 };
 #include "t8142-j813-pmp-tunables.dtsi"
+
+&pmp_dart {
+	apple,dma-range = /bits/ 64 <0x10000000000 0xbff00000>;
+	power-domains = <&ps_pmp>;
+	status = "okay";
+};
+
+&mtp_dart {
+	reg = <3 0x94800000 0 0xc000>;
+	/delete-property/ reg-names;
+	/* Keep host allocations clear of firmware's low IOVA mappings. */
+	apple,dma-range = <0 0x02000000 0 0x10000000>;
+	status = "okay";
+};

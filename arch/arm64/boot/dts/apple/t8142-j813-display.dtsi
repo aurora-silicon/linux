@@ -44,23 +44,6 @@
 		#mbox-cells = <0>;
 	};
 
-	disp0_dart: iommu@286300000 {
-		compatible = "apple,t8142-dart", "apple,t8110-dart";
-		reg = <2 0x86300000 0 0xc000>;
-		interrupts = <AIC_IRQ 800 IRQ_TYPE_LEVEL_HIGH>;
-		#iommu-cells = <1>;
-		apple,dma-range = <0x100 0x0 0x10 0x0>;
-		status = "disabled";
-	};
-
-	dcp_dart: iommu@286340000 {
-		compatible = "apple,t8142-dart", "apple,t8110-dart";
-		reg = <2 0x86340000 0 0x20000>;
-		interrupts = <AIC_IRQ 800 IRQ_TYPE_LEVEL_HIGH>;
-		#iommu-cells = <1>;
-		apple,dma-range = <0x100 0x0 0x10 0x0>;
-	};
-
 	dcp: dcp@286e00000 {
 		compatible = "apple,t8142-dcp", "apple,dcp";
 		mboxes = <&dcp_mbox>;
@@ -105,4 +88,14 @@
 			apple,max-brightness = <500>;
 		};
 	};
+};
+
+&disp0_dart {
+	reg = <2 0x86300000 0 0xc000>;
+	apple,dma-range = <0x100 0x0 0x10 0x0>;
+};
+
+&dcp_dart {
+	apple,dma-range = <0x100 0x0 0x10 0x0>;
+	status = "okay";
 };
