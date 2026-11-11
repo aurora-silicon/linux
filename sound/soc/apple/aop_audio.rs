@@ -33,6 +33,7 @@ use kernel::{
     device,
     device::property::FwNode,
     device::Core,
+    dma::{Device as DmaDevice, DmaMask},
     error::from_err_ptr,
     module_platform_driver,
     of,
@@ -1209,7 +1210,26 @@ impl SndSocAopDriver {
             if data.set_decimator_config_hf().is_err() {
                 dev_warn!(data.dev, "decimator config refused, continuing\n");
             }
-            let mut this = Self::new(data.clone(), None)?;
+            // The low-power microphone's ring goes through the audio node's
+            // own DART stream; a node without one has the array only.
+            let lpai = if data.fwnode.property_present(c_str!("iommus")) {
+                // SAFETY: no DMA is in flight on this device yet.
+                unsafe { pdev.dma_set_mask_and_coherent(DmaMask::new::<42>())? };
+                aop_lpai::LpaiCapture::new_ring(
+                    pdev.as_ref(),
+                    &data.dev,
+                    &data.adata,
+                    data.service,
+                    true,
+                )
+                .unwrap_or_else(|e| {
+                    dev_warn!(data.dev, "no low-power microphone PCM: {:?}\n", e);
+                    None
+                })
+            } else {
+                None
+            };
+            let mut this = Self::new(data.clone(), lpai)?;
             // The speaker and jack streams, where the node has their DMA
             // channels: a machine may have the jack before its speakers.
             if streams {

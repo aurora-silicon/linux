@@ -38,6 +38,7 @@ mod sks;
 mod store;
 mod transfer;
 mod trusted;
+mod userbag;
 mod xarm;
 mod xart_apfs;
 mod xart_guard;

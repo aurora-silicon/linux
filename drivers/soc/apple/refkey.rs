@@ -89,8 +89,6 @@ impl SepData {
         secret: &[u8],
         acl: Option<&[u8]>,
     ) -> Option<KVec<u8>> {
-        use crate::der::RefKeyValue as RV;
-
         let (protection_class, key_type) = match self.profile.key_store {
             // J313 accepted this non-class-F class and 13.5 EC key type for
             // creation, same-boot unseal, and post-reboot unseal. The exact
@@ -115,6 +113,21 @@ impl SepData {
             return None;
         }
 
+        self.sks_create_refkey_at(handle.value(), protection_class, key_type, acl)
+    }
+
+    /// The ref-key create itself, with `handle` as the outer key-bag handle:
+    /// a loaded bag, or a designated user's special handle `-uid` (the bag a
+    /// macOS Secure Enclave key lives under). The bag must already be
+    /// unlocked.
+    fn sks_create_refkey_at(
+        &self,
+        handle: i32,
+        protection_class: u32,
+        key_type: u32,
+        acl: Option<&[u8]>,
+    ) -> Option<KVec<u8>> {
+        use crate::der::RefKeyValue as RV;
         let create_der = {
             let mut items: KVec<(&[u8], RV<'_>)> = KVec::new();
             if items.push((b"o", RV::Utf8(b"oc")), GFP_KERNEL).is_err()
@@ -134,7 +147,7 @@ impl SepData {
             }
             crate::der::encode_refkey_set(&items).ok()?
         };
-        let cout = match self.sks_send(self.sks_req_refkey(handle.value(), &create_der)) {
+        let cout = match self.sks_send(self.sks_req_refkey(handle, &create_der)) {
             Some(out) => out,
             None => {
                 dev_warn!(self.dev, "sks: ref-key create got no usable reply\n");
@@ -459,6 +472,33 @@ impl SepData {
         let mut point = [0u8; refkey_seal::POINT_LEN];
         point.copy_from_slice(Self::refkey_pub(&blob).ok_or(EIO)?);
         Ok((blob, point))
+    }
+
+    /// Test only (`key_selftest`): a ref-key under the designated user bag
+    /// `user` (outer handle `-uid`), which the caller has unlocked. Variant-5
+    /// key store only.
+    pub(crate) fn user_key_create_in_bag(
+        &self,
+        user: crate::sks::DesignateUser,
+        acl: Option<&[u8]>,
+    ) -> Result<KVec<u8>> {
+        if self.profile.key_store != profile::KeyStore::Variant5 {
+            return Err(EOPNOTSUPP);
+        }
+        crate::xart_guard::close_policy_window();
+        self.sks_create_refkey_at(user.special_handle().value(), 9, 5, acl).ok_or(EIO)
+    }
+
+    /// Test only: sign with a ref-key under the designated user bag `user`.
+    pub(crate) fn user_key_sign_in_bag(
+        &self,
+        user: crate::sks::DesignateUser,
+        blob: &[u8],
+        digest: &[u8; 32],
+        acm: Option<&[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>,
+    ) -> Result<KVec<u8>> {
+        let handle = crate::sks::KeyBagHandle::from_load_reply(user.special_handle().value());
+        self.sks_refkey_sign(handle, blob, digest, acm)
     }
 
     /// The public point recorded in a ref-key record; no enclave round trip.
