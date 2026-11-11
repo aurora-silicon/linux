@@ -3429,7 +3429,8 @@ static int ane_rtclient_rs_prepare(struct ane_rtclient_restart *rs)
 	struct ane_rtclient *ane = rs->ane;
 	struct ane_t6021 *a = ane->fw;
 	struct ane_rtclient_pd *pd;
-	unsigned int domains = ane->soc->soc == 0x8112 ? 7 : 8;
+	/* T8112 has seven ANE domains, plus its PMP report entry when linked. */
+	unsigned int domains = ane->soc->soc != 0x8112 ? 8 : ane->pmp_report ? 8 : 7;
 
 	lockdep_assert_held(&ane_t6021_fw_lock);
 	if (!ane->registered)
