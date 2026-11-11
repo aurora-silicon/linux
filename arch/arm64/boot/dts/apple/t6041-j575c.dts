@@ -889,7 +889,7 @@
 };
 
 / {
-	/* guess: the SDZ line of the J616c and J773s, AP pin 54 */
+	/* ADT audio-speaker function-reset: AP pin 54 (0x36) */
 	speaker_sdz: regulator-sn012776-sdz {
 		compatible = "regulator-fixed";
 		regulator-name = "sn012776-sdz";
@@ -898,16 +898,15 @@
 	};
 
 	/*
-	 * The speaker stays off: it has no bring-up and no protection
-	 * profile. The card, the amp and the AOP speaker stream are all left
-	 * out or disabled.
+	 * The speaker: the AOP audio component's speaker back-end (DAI 3) to
+	 * the SN012776. The card holds the amp at its lowest volume step until
+	 * a protection daemon takes the volume lock.
 	 */
 	sound: sound {
 		compatible = "apple,j575c-macaudio", "apple,macaudio";
 		model = "Mac Studio J575";
 		#address-cells = <1>;
 		#size-cells = <0>;
-		status = "disabled";
 
 		dai-link@0 {
 			reg = <0>;
@@ -964,26 +963,30 @@
 	status = "okay";
 };
 
-/* No microphones: only the jack's streams, as on the J773s. */
+/*
+ * No microphones. ADT iop-audio-controller: the speaker stream on base-ns
+ * ADMAC channel 0 (TX0), the jack's on channels 4 and 5. The firmware runs
+ * the speaker serializer in the J616s frame, sense included, on RX0.
+ */
 &aop_audio {
-	dmas = <&admac1 4>, <&admac1 5>;
-	dma-names = "cout", "cin";
+	dmas = <&admac1 0>, <&admac1 1>, <&admac1 4>, <&admac1 5>;
+	dma-names = "spkr", "sense", "cout", "cin";
 	apple,chassis-name = "J575";
 	apple,machine-kind = "Mac Studio";
 };
 
-/* guess: one SN012776 at 0x38 as on the J773s and J575d, interrupt AP 55 */
+/* ADT /arm-io/i2c1/audio-speaker: one SN012776 at 0x38, interrupt AP 55 */
 &i2c1 {
+	status = "okay";
+
 	speaker: codec@38 {
 		compatible = "ti,sn012776", "ti,tas2764";
 		reg = <0x38>;
 		SDZ-supply = <&speaker_sdz>;
 		#sound-dai-cells = <0>;
-		sound-name-prefix = "Speaker";
 		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
 		ti,imon-slot-no = <0>;
 		ti,vmon-slot-no = <2>;
-		status = "disabled";
 	};
 };
 
