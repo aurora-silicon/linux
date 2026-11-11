@@ -8,6 +8,8 @@
 #include <linux/ieee80211.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
+#include <linux/of.h>
+#include <linux/of_net.h>
 #include <linux/seq_file.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
@@ -1438,6 +1440,26 @@ static int wifi_get_channel(struct wiphy *wiphy, struct wireless_dev *wdev,
 	return ret;
 }
 
+/*
+ * The factory address, which the loader copies from ADT /chosen
+ * mac-address-wifi0 into the wifi0 alias target's local-mac-address (as on
+ * T6050). A board without that node, or a loader that left the placeholder,
+ * keeps the old per-boot random address.
+ */
+static void centauri_wifi_set_address(struct net_device *netdev)
+{
+	struct device_node *np = of_find_node_by_path("wifi0");
+	u8 addr[ETH_ALEN];
+	int ret = np ? of_get_mac_address(np, addr) : -ENODEV;
+
+	of_node_put(np);
+	if (!ret && is_valid_ether_addr(addr)) {
+		eth_hw_addr_set(netdev, addr);
+		return;
+	}
+	eth_hw_addr_random(netdev);
+}
+
 static const struct cfg80211_ops wifi_ops = {
 	.scan = wifi_scan,
 	.connect = wifi_connect,
@@ -2462,7 +2484,7 @@ int centauri_wifi_register(struct centauri *c)
 	SET_NETDEV_DEV(wifi->netdev, &c->pdev->dev);
 	strscpy(wifi->netdev->name, "wlan%d", IFNAMSIZ);
 	wifi->netdev->max_mtu = ETH_DATA_LEN;
-	eth_hw_addr_random(wifi->netdev);
+	centauri_wifi_set_address(wifi->netdev);
 	ret = register_netdev(wifi->netdev);
 	if (ret)
 		goto failed;
