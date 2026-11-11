@@ -293,6 +293,13 @@
 
 			/* Layout is filled by the loader using this machine's own data. */
 			keyboard: keyboard { };
+
+			/*
+			 * The trackpad's haptic engine. The MTP firmware offers it
+			 * as interface 4 "actuator"; without this node the click
+			 * stays firmware-driven and there is no Force Touch stage.
+			 */
+			actuator { };
 		};
 	};
 };
