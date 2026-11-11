@@ -2553,10 +2553,15 @@ static int t6040_pmu_cmd(struct t6040_sleep *s, u32 cmd, const u32 *tx, u32 *rx,
  * Bring-up progress through a reset (#1314's way on T8132): the PMU keeps its RTC comparator
  * across one, and userspace reads it back on any kernel (spmi_nvmem0 offset 0x2008). A value
  * 0x5334xxxx is the last step reached; the saved alarm + 1 s means the commit itself ran.
+ *
+ * Off by default. The comparator is the wake alarm's: a mark left in it at the commit takes
+ * the alarm's place, and that sleep ends only on a key. And the marks go to the SPMI
+ * controller raw, beside the SPMI driver's own transfers: during a resume one of the PMU
+ * RTC's interrupt thread then got no reply, and that driver gives its alarm up for good.
  */
-static bool marks = true;
+static bool marks;
 module_param(marks, bool, 0644);
-MODULE_PARM_DESC(marks, "Write S2R progress marks into the PMU RTC comparator (bring-up)");
+MODULE_PARM_DESC(marks, "Bring-up: write S2R progress marks into the PMU RTC comparator (takes the wake alarm's place: no RTC wake)");
 
 static void t6040_mark_raw(struct t6040_sleep *s, u32 v);
 
@@ -2653,7 +2658,8 @@ static void t6040_susf_begin(struct t6040_sleep *s)
 {
 	u32 w[2] = { T6040_SUSF_MAGIC, 0 };
 
-	if (!READ_ONCE(susp_rec) || !s->spmi0)
+	/* The record holds device marks: nothing to keep, and no raw SPMI, without them. */
+	if (!READ_ONCE(marks) || !READ_ONCE(susp_rec) || !s->spmi0)
 		return;
 	t6040_pmu_cmd(s, SPMI_CMD_PMU(T6040_SUSF_PMU, SPMI_OP_WRITE4), &w[0], NULL, 0);
 	t6040_pmu_cmd(s, SPMI_CMD_PMU(T6040_SUSF_PMU + 4, SPMI_OP_WRITE4), &w[1], NULL, 0);
