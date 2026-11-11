@@ -102,6 +102,10 @@ pub(crate) const DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION: u64 =
 /// command may wait for it in firmware.
 pub(crate) const DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION: u32 =
     uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION as u32;
+/// Queues take a watchdog allowance for their compute commands
+/// (`drm_asahi_queue_create::compute_timeout_ms`).
+pub(crate) const DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT: u64 =
+    uapi::DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT as u64;
 /// The tiling half waits only on the render and compute prefixes of the command's stage-prefix
 /// fields, its fragment half on the whole ones.
 #[allow(dead_code)]
@@ -1584,6 +1588,10 @@ impl File {
             data.flags,
         );
 
+        if data.pad != 0 {
+            cls_pr_debug!(Errors, "queue_create: Invalid arguments\n");
+            return Err(EINVAL);
+        }
         if data.flags != 0 || data.priority > uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_REALTIME {
             cls_pr_debug!(Errors, "queue_create: Invalid arguments\n");
             return Err(EINVAL);
@@ -1655,6 +1663,9 @@ impl File {
         )?;
 
         queue.reserve_render_scs(data.render_scs_layout)?;
+        if data.compute_timeout_ms != 0 {
+            data.compute_timeout_ms = queue.set_compute_timeout(data.compute_timeout_ms)?;
+        }
 
         data.queue_id = resv.index().try_into()?;
         resv.fill(Arc::pin_init(

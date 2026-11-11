@@ -52,6 +52,59 @@ pub(crate) fn as_build(flags: u32) -> Option<bool> {
     if flags & !AS_BUILD != 0 { None } else { Some(flags & AS_BUILD != 0) }
 }
 
+/// The watchdog allowance of a compute command unless its queue asked for
+/// another (`drm_asahi_queue_create::compute_timeout_ms`): one watchdog poll.
+pub(crate) const DEFAULT_ALLOWANCE_MS: u32 = POLL_MS;
+
+/// The allowance a queue gets for its compute commands when it asks for
+/// `requested_ms`, given the longest the system allows (`maximum_ms`, the
+/// `compute_timeout_max_ms` module parameter): never below the default.
+pub(crate) fn allowance_ms(requested_ms: u32, maximum_ms: u32) -> u32 {
+    requested_ms.min(maximum_ms).max(DEFAULT_ALLOWANCE_MS)
+}
+
+/// A job's watchdog allowance: how long the watchdog renews it for the asking,
+/// counted from about when it reached the head of its queue.
+///
+/// It is not a deadline. The watchdog only sees a job at its expiries, and
+/// does not know when the job started: the scheduler arms a queue's watchdog
+/// when a job reaches the head (the job ahead of it completed) and again
+/// whenever a later job of the queue is pushed, and the watchdog expires one
+/// [`POLL_MS`] later. So a job's first expiry comes at least one poll after it
+/// reached the head, later if pushes postponed it, and the time is counted
+/// from one poll before that expiry. A job still in publication at an expiry
+/// (waiting for capacity) has not started: its time counts from the first
+/// expiry that finds it published. Either way a job never loses time to the
+/// jobs ahead of it, and it may get up to one poll more than its allowance.
+/// Under the default allowance it is never renewed. A job past its allowance
+/// is not failed for that alone: the caller's other renewals and deferrals
+/// are tried next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Allowance {
+    ms: u32,
+    /// When the job reached the head, once an expiry placed it.
+    head_since: Option<u64>,
+    /// An expiry found the job still in publication.
+    waited: bool,
+}
+
+impl Allowance {
+    pub(crate) const fn new(ms: u32) -> Self {
+        Self { ms, head_since: None, waited: false }
+    }
+
+    /// Whether the job is within its allowance at the expiry at `now` (host ns).
+    pub(crate) fn renew(&mut self, published: bool, now: u64) -> bool {
+        if !published {
+            self.waited = true;
+            return false;
+        }
+        let poll = if self.waited { 0 } else { u64::from(POLL_MS) * 1_000_000 };
+        let since = *self.head_since.get_or_insert(now.saturating_sub(poll));
+        now.saturating_sub(since) < u64::from(self.ms) * 1_000_000
+    }
+}
+
 pub(crate) fn renew_execution(published: bool, enabled: bool, renewals: &mut u8) -> bool {
     if !published || !enabled || *renewals >= EXECUTION_RENEWALS {
         return false;
@@ -201,6 +254,54 @@ pub(crate) fn behind_own_head(published: bool, older: Option<u32>, progressing: 
 #[cfg_attr(not(test), kernel::macros::kunit_tests(asahi_g17_execution_allowance))]
 mod tests {
     use super::*;
+    const MS: u64 = 1_000_000;
+    #[test]
+    fn a_queue_gets_the_allowance_it_asks_for_within_bounds() {
+        assert_eq!(allowance_ms(0, 30_000), DEFAULT_ALLOWANCE_MS);
+        assert_eq!(allowance_ms(500, 30_000), DEFAULT_ALLOWANCE_MS);
+        assert_eq!(allowance_ms(20_000, 30_000), 20_000);
+        assert_eq!(allowance_ms(u32::MAX, 30_000), 30_000);
+        // A maximum below the default still leaves the default.
+        assert_eq!(allowance_ms(20_000, 0), DEFAULT_ALLOWANCE_MS);
+    }
+    #[test]
+    fn the_default_allowance_renews_nothing() {
+        let mut allowance = Allowance::new(DEFAULT_ALLOWANCE_MS);
+        assert!(!allowance.renew(true, 100_000 * MS));
+        // Not after a wait in publication either.
+        let mut allowance = Allowance::new(DEFAULT_ALLOWANCE_MS);
+        assert!(!allowance.renew(false, 100_000 * MS));
+        assert!(allowance.renew(true, 102_000 * MS));
+        assert!(!allowance.renew(true, 104_000 * MS));
+    }
+    #[test]
+    fn a_long_allowance_runs_from_the_head_of_the_queue() {
+        // Reached the head at 10 s (the job ahead completed): first expiry at 12 s.
+        let start = 10_000 * MS;
+        let poll = u64::from(POLL_MS) * MS;
+        let mut allowance = Allowance::new(30_000);
+        let mut expiry = start + poll;
+        while allowance.renew(true, expiry) {
+            expiry += poll;
+        }
+        assert_eq!(allowance.head_since, Some(start));
+        // Killed at the first poll at or past 30 s after it reached the head.
+        assert_eq!(expiry - start, 30_000 * MS);
+        // A first expiry delayed by later pushes only moves the count later.
+        let mut allowance = Allowance::new(30_000);
+        assert!(allowance.renew(true, start + poll + 500 * MS));
+        assert_eq!(allowance.head_since, Some(start + 500 * MS));
+    }
+    #[test]
+    fn a_job_waiting_in_publication_starts_at_its_first_published_expiry() {
+        let mut allowance = Allowance::new(30_000);
+        assert!(!allowance.renew(false, 10_000 * MS));
+        assert_eq!(allowance.head_since, None);
+        assert!(allowance.renew(true, 12_000 * MS));
+        assert_eq!(allowance.head_since, Some(12_000 * MS));
+        assert!(allowance.renew(true, 41_999 * MS));
+        assert!(!allowance.renew(true, 42_000 * MS));
+    }
     #[test]
     fn selects_compute_both_render_halves_and_builds() {
         assert!(!select(false, [false; 2], false));
