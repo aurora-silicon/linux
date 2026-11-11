@@ -213,7 +213,7 @@
 
 #include "drm_internal.h"
 
-static bool syncobj_timeline_direct_wait;
+static bool syncobj_timeline_direct_wait = true;
 module_param_named(syncobj_timeline_direct_wait,
 		   syncobj_timeline_direct_wait, bool, 0644);
 MODULE_PARM_DESC(syncobj_timeline_direct_wait,

@@ -171,12 +171,12 @@ module! {
             description: "Fully isolate GPU contexts (limits performance)",
         },
         legacy_inline_submit: u32 {
-            default: 0,
-            description: "G13/G14: publish ready in-order jobs from SUBMIT (experimental)",
+            default: 1,
+            description: "G13/G14: publish ready in-order jobs from SUBMIT (0: off)",
         },
         legacy_rx_fastpath: u32 {
-            default: 0,
-            description: "G13/G14: bypass the generic RTKit receive worker (experimental)",
+            default: 1,
+            description: "G13/G14: drain GPU events on a dedicated receive worker (0: off)",
         },
         legacy_rx_util_min: u32 {
             default: 512,
