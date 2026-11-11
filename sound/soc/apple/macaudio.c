@@ -2770,6 +2770,17 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 			card->dai_link[i].num_platforms = 0;
 		else
 			card->dai_link[i].platforms->of_node = platform;
+
+		/*
+		 * A stream with more slots than amps: the front-end carries
+		 * every slot, while a back-end with a single amp would cap it
+		 * at that codec's own channel count (ASoC merges a lone
+		 * codec's channels, not several codecs'). The amp takes its
+		 * slots from its TDM mask.
+		 */
+		if (ma->cfg->speaker_fe_channels &&
+		    !strcmp(card->dai_link[i].name, "Secondary"))
+			card->dai_link[i].dpcm_merged_chan = 0;
 	}
 
 	/* Skip the speaker sense PCM link if this amp has no sense (or no speakers) */
