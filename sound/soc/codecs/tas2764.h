@@ -129,9 +129,9 @@
 
 /* Clock/IRQ Settings */
 #define TAS2764_INT_CLK_CFG             TAS2764_REG(0x0, 0x5c)
+#define TAS2764_INT_CLK_CFG_IRQZ_CLR    BIT(2)
 /* BCLK/FS ratio code, written by macOS for the J873 speaker frame */
 #define TAS2764_CLK_CFG                 TAS2764_REG(0x0, 0x60)
-#define TAS2764_INT_CLK_CFG_IRQZ_CLR    BIT(2)
 
 #define TAS2764_BOP_CFG0                TAS2764_REG(0X0, 0x1d)
 /* BOP_CFG0 to BOP_CFG24, page 0 0x1d to 0x34 */
