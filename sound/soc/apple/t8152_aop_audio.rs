@@ -566,6 +566,10 @@ struct HwConfig {
     realign_sense: bool,
     /// The AP powers the serializer (MCA) leaves.
     ap_mca: bool,
+    /// The AP powers the microphone array's LEAP leaves. Without it the
+    /// firmware raises them with the service's `pw0 `, and the DT's "hpai"
+    /// DMA channel alone says whether there is a microphone array.
+    ap_leap: bool,
 }
 
 /// J873: one amplifier in one 32-bit slot, nothing sent back.
@@ -575,6 +579,7 @@ static HW_CFG_T8152: HwConfig = HwConfig {
     sense_formats: FORMATS,
     realign_sense: false,
     ap_mca: true,
+    ap_leap: true,
 };
 
 /// J813: four amplifiers (left woofer, left tweeter, right woofer, right
@@ -586,17 +591,19 @@ static HW_CFG_T8142: HwConfig = HwConfig {
     sense_formats: FMTBIT_S16_LE,
     realign_sense: true,
     ap_mca: true,
+    ap_leap: true,
 };
 
 /// J714s: six amplifiers in 32-bit slots 0-5, their voltage and current
 /// sense back as twelve 16-bit slots on the stream's RX, as on J813. The
-/// MCA leaves have no AP power state: the firmware powers them.
+/// MCA and LEAP leaves have no AP power state: the firmware powers them.
 static HW_CFG_T6050: HwConfig = HwConfig {
     spkr_channels: 6,
     sense_channels: 12,
     sense_formats: FMTBIT_S16_LE,
     realign_sense: true,
     ap_mca: false,
+    ap_leap: false,
 };
 
 /// # Safety
@@ -1471,10 +1478,11 @@ impl platform::Driver for T8152AopAudioDriver {
             }
         }
 
-        // The microphone array, where the DT describes it: all of its leaves
-        // or none.
+        // The microphone array, where the DT describes it: where the AP powers
+        // its leaves, all of them or none; elsewhere its DMA channel.
+        let leap_names: &[&CStr] = if cfg.ap_leap { &LEAP_NAMES } else { &[] };
         let mut leap = KVec::new();
-        for name in LEAP_NAMES {
+        for &name in leap_names {
             match PowerDomain::attach(&dev, name) {
                 Ok(Some(pd)) => leap.push(pd, GFP_KERNEL)?,
                 Ok(None) => {}
@@ -1485,6 +1493,12 @@ impl platform::Driver for T8152AopAudioDriver {
             dev_err!(dev, "incomplete microphone power domains\n");
             return Err(ENODEV);
         }
+        let has_mic = if cfg.ap_leap {
+            !leap.is_empty()
+        } else {
+            dev.fwnode()
+                .is_some_and(|node| node.property_match_string(c"dma-names", c"hpai").is_ok())
+        };
 
         let data_dev = dev.clone();
         let data = Arc::pin_init(
@@ -1511,7 +1525,7 @@ impl platform::Driver for T8152AopAudioDriver {
 
         // The microphones are optional: the speakers and the jack stay
         // usable without them.
-        let mic = if data.leap.is_empty() {
+        let mic = if !has_mic {
             None
         } else {
             match MicCard::new(&data) {
