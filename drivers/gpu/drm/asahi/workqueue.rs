@@ -473,6 +473,18 @@ impl Job::ver {
         }
     }
 
+    /// Whether this committed job is the next unpublished prefix and fits in
+    /// the firmware queue. Holding the same queue lock as `submit()` makes the
+    /// sequence observation authoritative; a preceding scheduler publisher can
+    /// only advance it after this check.
+    pub(crate) fn can_submit_inline(&self) -> bool {
+        let inner = self.wq.inner.lock();
+
+        inner.submit_seq == self.event_info.cmd_seq
+            && inner.free_slots() > self.event_count
+            && inner.free_space() > self.pending.len()
+    }
+
     pub(crate) fn submit(&mut self) -> Result<JobSubmission::ver<'_>> {
         if !self.committed {
             pr_err!("WorkQueue: Tried to submit uncommitted Job\n");
@@ -948,6 +960,7 @@ impl WorkQueue for WorkQueue::ver {
     ///
     /// This will check the event stamp value to find out exactly how many commands were processed.
     fn signal(&self) -> bool {
+        let signalling = dma_fence::SignallingGuard::new();
         let mut inner = self.inner.lock();
         let event = inner.event.as_ref();
         let value = match event {
@@ -1014,6 +1027,7 @@ impl WorkQueue for WorkQueue::ver {
             cmd.as_mut().inner_mut().complete();
             workqueue::system_dfl().enqueue(cmd);
         }
+        drop(signalling);
 
         mod_pr_debug!(
             "WorkQueue({:?}): Completed {} commands, left pending {}, ls {:#x?}, lc {:#x?}\n",
