@@ -282,7 +282,7 @@ int main(void) {
             ('omit-host-demand', code.replace('if (apple_clpc_gpu_input_demand(clpc->hw, clpc->gpu, demand))',
                                               'if (false && apple_clpc_gpu_input_demand(clpc->hw, clpc->gpu, demand))')),            ('omit-ane-demand', code.replace('if (apple_clpc_ane_input_demand(clpc, demand))',
                                              'if (false && apple_clpc_ane_input_demand(clpc, demand))')),
-            ('omit-ane-cluster', code.replace('apple_clpc_ane_cluster(clpc, reason & 32, now);',
+            ('omit-ane-cluster', code.replace('apple_clpc_ane_cluster(clpc, reason & APPLE_CLPC_REASON_ANE, now);',
                                               '(void)apple_clpc_ane_cluster;')),
             ('ane-cluster-no-hold', code.replace('if (time_before(now, clpc->ane_until))',
                                                  'if (active)')),
