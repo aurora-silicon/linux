@@ -5526,9 +5526,12 @@ params_done:
 	if (ret)
 		goto err_sysfs_remove;
 
-	/* Retain supplier references; generic suspend/resume is not applicable. */
-	if (!dart->retained_mtp && !dart->managed_sids && !dart->cold_ane &&
-	    !apple_dart_has_borrowed(dart))
+	/*
+	 * Retain supplier references; generic suspend/resume is not applicable.
+	 * Not for a cold ANE DART: ANE_SYS goes off while the ANE has no client,
+	 * as on macOS, instead of staying on until the next system sleep.
+	 */
+	if (!dart->retained_mtp && !dart->managed_sids && !apple_dart_has_borrowed(dart))
 		pm_runtime_put(dev);
 
 	dev_dbg(
@@ -6033,9 +6036,9 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 	if (READ_ONCE(dart->commands_gated))
 		return 0;
 	/*
-	 * The cold ANE DARTs belong to the ANE backend, which refuses system
-	 * sleep up front while it runs the firmware. Otherwise they hold
-	 * nothing to keep: neither save nor reset them.
+	 * The cold ANE DARTs belong to the ANE backend: it deactivates them
+	 * before ANE_SYS goes off and attaches SID0 again once it is back on.
+	 * Neither save nor reset them.
 	 */
 	if (dart->cold_ane)
 		return 0;

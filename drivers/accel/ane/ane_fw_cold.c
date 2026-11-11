@@ -580,10 +580,10 @@ static int ane_fw_power_down(struct ane_fw_backend *b)
 	b->powered = false;
 	b->power_ref = false;
 	/*
-	 * This only drops our reference. The ANE DARTs share the domain and stay
-	 * active, so genpd turns it off in the noirq phase of the system suspend.
-	 * ane_fw_genpd_event() records that, and the resume reports a domain that
-	 * stayed on.
+	 * Our reference was the last one on ANE_SYS: genpd turns it off once the
+	 * ANE DARTs are idle, or at the latest in the noirq phase of the system
+	 * suspend. ane_fw_genpd_event() records that, and the resume reports a
+	 * domain that stayed on.
 	 */
 	pm_runtime_put_sync(b->power);
 	dev_info(&b->pdev->dev, "H17 ANE: powered down for system sleep\n");
@@ -1073,9 +1073,11 @@ MODULE_PARM_DESC(dart_off, "Deactivate the H17 ANE DARTs before ANE_SYS powers o
  *
  * macOS deactivates the three ANE DARTs before every ANE_SYS power-off, with
  * or without firmware: it also powers ANE_SYS up for DART work alone and down
- * again this way (recorded, 25G83). Here ANE_SYS goes off in genpd, held on
- * by the DARTs until then, with their streams still enabled; on most sleeps
- * it then reaches off with BUSY latched. Do macOS's step right before the off.
+ * again this way (recorded, 25G83). Here ANE_SYS goes off in genpd, at
+ * runtime once the ANE and its DARTs are idle or in the noirq phase of a
+ * system suspend, with the DARTs' streams still enabled; without this step
+ * it reached off with BUSY latched on most sleeps. Do macOS's step right
+ * before the off.
  */
 static int ane_fw_genpd_event(struct notifier_block *nb, unsigned long action, void *data)
 {
@@ -2144,7 +2146,7 @@ static void ane_fw_start_work(struct work_struct *work)
 		mutex_unlock(&b->lock);
 	}
 	unlock_system_sleep(flags);
-	/* Nothing holds ANE_SYS now: with no firmware, genpd keeps it as macOS does. */
+	/* Nothing holds ANE_SYS now: with no firmware, genpd turns it off, as macOS keeps it. */
 	ane_fw_bind_release(b);
 	if (ret < 0)
 		dev_err(&b->pdev->dev, "H17 ANE: node registration stopped: %zd\n", ret);
