@@ -1498,6 +1498,6 @@ impl platform::Driver for T8152AopAudioDriver {
 module_platform_driver! {
     type: T8152AopAudioDriver,
     name: "snd_soc_t8152_aop_audio",
-    description: "Apple T8152 AOP audio: headphone jack and speaker",
+    description: "Apple T8152 AOP audio: headphone jack, speakers and microphones",
     license: "Dual MIT/GPL",
 }

@@ -22,8 +22,9 @@ config SND_SOC_APPLE_T8152_AOP_AUDIO
 	select SND_DMAENGINE_PCM
 	help
 	  This option enables a driver for the audio paths owned by the AOP
-	  co-processor on Apple T8152 SoCs (Mac mini M6): the headphone jack
-	  and the internal speaker.
+	  co-processor on Apple T8152 (Mac mini M6) and T8142 (MacBook Air M5)
+	  SoCs: the headphone jack, the internal speakers and, where present,
+	  the microphone array.
 
 config SND_SOC_APPLE_MCA
 	tristate "Apple Silicon MCA driver"
