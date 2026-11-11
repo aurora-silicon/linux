@@ -124,6 +124,7 @@
 #include "t8142-j813-j815.dtsi"
 #include "t8142-j813-usb.dtsi"
 #include "t8142-j813-avd.dtsi"
+#include "t8142-j813-isp.dtsi"
 
 &mtp_hid {
 	multi-touch {
@@ -142,4 +143,9 @@
 	width-mm = <326>;
 	height-mm = <211>;
 	adj-height-mm = <204>;
+};
+
+&isp {
+	/* J815 ADT /arm-io/isp sensor-type */
+	apple,platform-id = <0x72>;
 };
