@@ -2534,6 +2534,21 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	struct dcp_wait_cookie *poff_cookie;
 	typeof(DCP_FW_SWAP(dcp)) *swap = &DCP_FW_SWAP(dcp);
 
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+	/*
+	 * Firmware 27 has its own paired stop sequence. Its hardware profile
+	 * does not use H17G's single-pipe methods, so stop an active pair
+	 * before applying the guard for the single-pipe path below.
+	 */
+	ret = dcp_peer_stop_v27(dcp);
+	if (ret < 0) {
+		dev_err(dcp->dev, "paired power-off failed: %d\n", ret);
+		return;
+	}
+	if (ret > 0)
+		goto close_client;
+#endif
+
 #if DCP_FW_H17(DCP_FW_VER)
 	/* H17P has no known safe pipe-off or surface-free transition. */
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
@@ -2548,17 +2563,6 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	if (ret > 0)
 		goto peer_stopped;
 #endif
-
-#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
-	ret = dcp_peer_stop_v27(dcp);
-	if (ret < 0) {
-		dev_err(dcp->dev, "paired power-off failed: %d\n", ret);
-		return;
-	}
-	if (ret > 0)
-		goto close_client;
-#endif
-
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie)
 		return;

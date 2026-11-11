@@ -327,6 +327,16 @@
 				label = "nvram";
 				reg = <0x700000 0x100000>;
 			};
+
+			/*
+			 * iBoot firmware and the syscfg factory data. Listed
+			 * after nvram so the nvram MTD index stays the same.
+			 */
+			partition@0 {
+				label = "firmware";
+				reg = <0x0 0x700000>;
+				read-only;
+			};
 		};
 	};
 };

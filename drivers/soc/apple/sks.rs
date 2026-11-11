@@ -129,8 +129,10 @@ impl SepData {
     }
 
     pub(crate) fn sks_next_seq(&self) -> crate::sks::Sequence {
-        let n = self.sks_seq.load(Relaxed);
-        self.sks_seq.store(n.wrapping_add(1), Relaxed);
+        // One atomic step: concurrent callers build requests outside the
+        // exchange lock, and two requests with the same sequence would defeat
+        // the late-reply bookkeeping of an abandoned one.
+        let n = self.sks_seq.fetch_add(1, Relaxed);
         crate::sks::Sequence::from_counter(n as u8)
     }
 
@@ -548,13 +550,31 @@ impl SepData {
     }
 
     /// `0x02` copy the designated biometric identity bag.
-    fn sks_req_copy_keybag_special(&self, handle: crate::sks::SpecialHandle) -> Result<SksRequest> {
+    pub(crate) fn sks_req_copy_keybag_special(&self, handle: crate::sks::SpecialHandle) -> Result<SksRequest> {
         let op = crate::sks::sks_copy_keybag();
         let mut body = image::Body::new();
         body.put_u32(0)?;
         body.put_u64(crate::sks::SKS_CLIENT_ID)?;
         body.put_i32(handle.value())?;
         self.sks_seal(&op, &body)
+    }
+
+    /// Loads a wrapped bag (`0x03`) and returns its temporary handle. Used for
+    /// per-user bags, whose wrapped container userspace keeps.
+    pub(crate) fn sks_load_wrapped(&self, wrapped: &[u8]) -> Option<crate::sks::KeyBagHandle> {
+        let out = self.sks_send(self.sks_req_load_keybag(wrapped))?;
+        let body = self.sks_report_response(crate::sks::SKS_LOAD_NAME, &out)?;
+        if out.reply.status != 0 || body.len() != SKS_LOAD_REPLY_LEN {
+            dev_info!(self.dev, "sks: LOAD_KEYBAG (user bag): status {}, {} bytes\n", out.reply.status, body.len());
+            return None;
+        }
+        let status = i32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+        let handle = i32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+        if status != 0 || handle < 0 {
+            dev_info!(self.dev, "sks: LOAD_KEYBAG (user bag): operation status {}, handle {}\n", status, handle);
+            return None;
+        }
+        Some(crate::sks::KeyBagHandle::from_load_reply(handle))
     }
 
     /// `0x03` load key bag.
@@ -1218,12 +1238,15 @@ impl SepData {
                 || guard.captured.len() >= until || remaining == 0 {
                 return;
             }
+            // A reply wait sleeps uninterruptibly: with a signal pending an
+            // interruptible wait returns at once with the time left unchanged,
+            // so this loop would spin until the reply came, or forever.
             match self
                 .sks_wq
-                .wait_interruptible_timeout(&mut guard, remaining)
+                .wait_timeout(&mut guard, remaining)
             {
                 CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
-                CondVarTimeoutResult::Signal { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Signal { .. } => remaining = 0,
                 CondVarTimeoutResult::Timeout => remaining = 0,
             }
         }
@@ -1354,6 +1377,13 @@ const OP_SKS_LOAD_KEYBAG: u8 = 0x03;
 
 pub(crate) const SKS_LOAD_NAME: &CStr = c"LOAD_KEYBAG";
 
+const OP_SKS_CHANGE_SECRET: u8 = 0x07;
+pub(crate) const SKS_CHANGE_SECRET_NAME: &CStr = c"CHANGE_SECRET";
+
+pub(crate) fn encode_sks_change_secret(seq: Sequence, len: ImageLen) -> Message {
+    encode_sks_raw(OP_SKS_CHANGE_SECRET, seq.value(), len.value())
+}
+
 const OP_SKS_CHANGE_LOCK_STATE: u8 = 0x04;
 
 pub(crate) const SKS_LOCK_STATE_NAME: &CStr = c"CHANGE_LOCK_STATE";
@@ -1363,6 +1393,27 @@ pub(crate) const SKS_DEVICE_STATE_NAME: &CStr = c"DEVICE_STATE_TRANSITION";
 
 pub(crate) fn encode_sks_device_state_transition(seq: Sequence, len: ImageLen) -> Message {
     encode_sks_raw(OP_SKS_DEVICE_STATE_TRANSITION, seq.value(), len.value())
+}
+
+const OP_SKS_GET_DEVICE_STATE: u8 = 0x19;
+pub(crate) const SKS_GET_DEVICE_STATE_NAME: &CStr = c"GET_DEVICE_STATE";
+
+pub(crate) fn encode_sks_get_device_state(seq: Sequence, len: ImageLen) -> Message {
+    encode_sks_raw(OP_SKS_GET_DEVICE_STATE, seq.value(), len.value())
+}
+
+const OP_SKS_GET_CONFIGURATION: u8 = 0x23;
+pub(crate) const SKS_GET_CONFIGURATION_NAME: &CStr = c"GET_CONFIGURATION";
+
+pub(crate) fn encode_sks_get_configuration(seq: Sequence, len: ImageLen) -> Message {
+    encode_sks_raw(OP_SKS_GET_CONFIGURATION, seq.value(), len.value())
+}
+
+const OP_SKS_HANDLE_TIMER_FIRE: u8 = 0x2f;
+pub(crate) const SKS_HANDLE_TIMER_FIRE_NAME: &CStr = c"HANDLE_TIMER_FIRE";
+
+pub(crate) fn encode_sks_handle_timer_fire(seq: Sequence, len: ImageLen) -> Message {
+    encode_sks_raw(OP_SKS_HANDLE_TIMER_FIRE, seq.value(), len.value())
 }
 
 const OP_SKS_VERIFY_SECRET: u8 = 0x21;

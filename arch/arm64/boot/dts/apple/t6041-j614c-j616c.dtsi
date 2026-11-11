@@ -1767,6 +1767,51 @@
 &nub_spmi_a0 {
 	status = "okay";
 
+	/*
+	 * The left-back port and the MagSafe controller, as on the M4 Pro boards.
+	 * The J614c's ADT has nub-spmi-a0 hpm0 (left-back, port 1, 0xc) and hpm5
+	 * (0x8) with the J614s's event, sleep and wake interrupts.
+	 */
+	hpm0: usb-pd@c {
+		compatible = "apple,sn201202x";
+		reg = <0xc SPMI_USID>;
+		interrupts = <11 IRQ_TYPE_EDGE_RISING>,
+			     <13 IRQ_TYPE_EDGE_RISING>,
+			     <17 IRQ_TYPE_EDGE_RISING>,
+			     <19 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+
+		typec0: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Left Back";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec0_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_0_hs>;
+					};
+				};
+			};
+		};
+	};
+
+	/* MagSafe port */
+	hpm5: usb-pd@8 {
+		compatible = "apple,sn201202x";
+		reg = <0x8 SPMI_USID>;
+		interrupts = <63 IRQ_TYPE_EDGE_RISING>,
+			     <65 IRQ_TYPE_EDGE_RISING>,
+			     <69 IRQ_TYPE_EDGE_RISING>,
+			     <71 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+	};
+
 	hpm1: usb-pd@a {
 		compatible = "apple,sn201202x";
 		reg = <0xa SPMI_USID>;
@@ -1825,6 +1870,45 @@
 						remote-endpoint = <&dwc3_2_hs>;
 					};
 				};
+			};
+		};
+	};
+};
+
+/* The left-back port, USB 2 as the other two. */
+&atcphy0 {
+	apple,tunable-usb2-host = <0x8 0x7003 0x3>;
+	status = "okay";
+};
+
+&dwc3_0_dart_0 {
+	status = "okay";
+};
+
+&dwc3_0_dart_1 {
+	status = "okay";
+};
+
+&dwc3_0 {
+	maximum-speed = "high-speed";
+	phys = <&atcphy0 PHY_TYPE_USB2>;
+	phy-names = "usb2-phy";
+	apple,tunable-gbl-host = <0x4 0x0001ef00 0x00002f00>, <0x1c 0x00000100 0x0>,
+		<0x2c 0x000a07ff 0x000800c8>, <0x100 0x02000100 0x02000100>,
+		<0x504 0x00001000 0x0>, <0x528 0xff0000ff 0x06000006>,
+		<0x52c 0xff0000ff 0x08000008>, <0x538 0x00000800 0x00000800>,
+		<0x580 0xffffffff 0x6f000006>;
+	apple,tunable-cfg-host = <0x20 0xff 0x1b>;
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dwc3_0_hs: endpoint {
+				remote-endpoint = <&typec0_connector_hs>;
 			};
 		};
 	};

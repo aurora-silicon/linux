@@ -1505,6 +1505,8 @@ struct ComputeHost<'a> {
     regs: &'a crate::regs::G17Resources,
     port: &'a super::port::Port,
     outer: Option<super::port::OuterClaim<'a>>,
+    /// M5: the shared compute ring's room check of this publication, by priority.
+    outer_cursors: Option<(u8, [u32; 3])>,
     effort: &'a mut super::power::Effort,
     qids: &'a mut kick::QueueIds,
     generation: u64,
@@ -1545,7 +1547,11 @@ impl compute::Host for ComputeHost<'_> {
     }
     fn publish_outer(&mut self, priority: u8, slot: &super::fw::channels::WorkSlot) -> Result {
         if self.init.is_m5() {
-            return self.init.publish_work(priority, slot).map(|_| ());
+            // The room check's sample serves the first record only: it moves the producer.
+            let cursors = self.outer_cursors.take()
+                .filter(|&(checked, _)| checked == priority)
+                .map(|(_, cursors)| cursors);
+            return self.init.publish_work_at(priority, slot, cursors).map(|_| ());
         }
         self.port.publish_compute(self.outer.take().ok_or(EIO)?, slot).map(|_| ())
     }
@@ -1553,7 +1559,7 @@ impl compute::Host for ComputeHost<'_> {
         // Every M5 pipe-2 doorbell (0x83) is noted in the firmware's submission history first,
         // as the render doorbell notes its pair.
         if self.init.is_m5() && message >> super::MSG_TYPE_SHIFT == 0x83 && message & 3 == 2 {
-            if let Err(error) = self.init.note_m5_submission_history() {
+            if let Err(error) = self.init.note_m5_submission_history(1) {
                 pr_warn!("asahi: M5 submission history skipped: {:?}\n", error);
             }
         }
@@ -1712,12 +1718,13 @@ impl super::Firmware {
         // reservation; dropping it unused returns the work-ring slot. M5 compute takes its
         // slot on the work ring M5 render shares, under this mutex (InitData::publish_work):
         // a full ring is refused here, before a queue install or kick changes any state.
+        let mut outer_cursors = None;
         let outer = if self.init.is_m5() {
-            if !self.init.work_ready(packet.context.policy().priority(),
-                super::fw::queue::DataMaster::Compute)?
-            {
+            let priority = packet.context.policy().priority();
+            let Some(cursors) = self.init.m5_compute_room(priority)? else {
                 return Err(EAGAIN);
-            }
+            };
+            outer_cursors = Some((priority, cursors));
             None
         } else {
             Some(self.port.reserve_compute(packet.context.policy().priority())?)
@@ -1745,6 +1752,7 @@ impl super::Firmware {
             regs: &self.bridge.regs,
             port: &self.port,
             outer,
+            outer_cursors,
             effort: &mut self.effort,
             qids: &mut queues.qids,
             generation: self.recovery.generation(),
