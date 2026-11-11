@@ -551,6 +551,8 @@ struct t6040_sleep {
 	bool disp_down;			/* t6040_disp_off() lowered the internal display */
 	void __iomem *pmc_dcp;		/* PMS pmc-dcp voter pair 0x5048a9c14/c18 */
 	u32 pmc_dcp_saved[2];
+	u32 pmc_if_saved[2];		/* BWR and boost interface enables at the commit */
+	bool pmc_if_valid;
 	/* The GP PCIe host's two ports (Wi-Fi/BT, SD) for the commit's port stop (T8140's). */
 	void __iomem *gp_port[2];
 	void __iomem *gp_phy[2];
@@ -5261,6 +5263,10 @@ static bool gated_cpu_target_only = true;
 module_param(gated_cpu_target_only, bool, 0644);
 MODULE_PARM_DESC(gated_cpu_target_only, "A DISP_CPU already gated (ACTUAL 0) only gets TARGET 0, keeping AUTO_ENABLE, and dart-dcp is left unread");
 
+static bool pmc_if_restore = true;
+module_param(pmc_if_restore, bool, 0644);
+MODULE_PARM_DESC(pmc_if_restore, "After a real sleep set the display pipes' PMC BWR and boost interface enables again");
+
 static bool pmc_dcp_off = true;
 module_param(pmc_dcp_off, bool, 0644);
 MODULE_PARM_DESC(pmc_dcp_off, "Drop the PMS DCP voters to 0 before the internal display goes down");
@@ -5514,7 +5520,19 @@ static int t6040_disp_off(struct t6040_sleep *s, const struct t6040_sleep_group 
 	if (!s->soc_east)
 		return -ENODEV;
 	s->disp_down = true;
-	/* The PMS DCP voters to 0 first, as the the platform entry trace and T8140's driver end. */
+	/*
+	 * The PMC's bandwidth-request and boost interface enables of the display pipes
+	 * (0x5048ac020 / 0x5048ac028, one bit per pipe; the PMGR sets them when it powers
+	 * a pipe's SYS domain). The power loss clears them and nothing sets them
+	 * again: without its boost bit a pipe's backlight data stream never runs.
+	 */
+	s->pmc_if_valid = false;
+	if (s->pmc_bwr) {
+		s->pmc_if_saved[0] = readl(s->pmc_bwr);
+		s->pmc_if_saved[1] = readl(s->pmc_bwr + PMC_BOOST);
+		s->pmc_if_valid = true;
+	}
+	/* The PMS DCP voters to 0 first, as the entry and T8140's driver end. */
 	if (s->pmc_dcp && READ_ONCE(pmc_dcp_off)) {
 		s->pmc_dcp_saved[0] = readl(s->pmc_dcp);
 		s->pmc_dcp_saved[1] = readl(s->pmc_dcp + 4);
@@ -5638,6 +5656,18 @@ static void t6040_disp_back(struct t6040_sleep *s)
 	if (s->pmc_dcp && READ_ONCE(pmc_dcp_off)) {
 		writel(s->pmc_dcp_saved[1], s->pmc_dcp + 4);
 		writel(s->pmc_dcp_saved[0], s->pmc_dcp);
+	}
+	if (s->pmc_if_valid && READ_ONCE(pmc_if_restore)) {
+		u32 bwr = readl(s->pmc_bwr), boost = readl(s->pmc_bwr + PMC_BOOST);
+
+		s->pmc_if_valid = false;
+		if (bwr != s->pmc_if_saved[0])
+			writel(bwr | s->pmc_if_saved[0], s->pmc_bwr);
+		if (boost != s->pmc_if_saved[1])
+			writel(boost | s->pmc_if_saved[1], s->pmc_bwr + PMC_BOOST);
+		if (bwr != s->pmc_if_saved[0] || boost != s->pmc_if_saved[1])
+			pr_info("t6040-sleep: wake: PMC display interfaces BWR %#x boost %#x, put back to %#x %#x\n",
+				bwr, boost, readl(s->pmc_bwr), readl(s->pmc_bwr + PMC_BOOST));
 	}
 }
 
