@@ -171,3 +171,49 @@
 	/delete-property/ memory-region;
 	/delete-property/ memory-region-names;
 };
+
+/*
+ * HDMI audio: dcpext2's audio is ADT dp-audio3 (DPA3: SIO DMA channel 0x6a,
+ * power state DPA3 at 0x502280248 under DPA_P), as dcpext0's is DPA1 (0x66)
+ * and dcpext1's DPA2 (0x68) in t6040-j616s-dpaudio.dtsi. DPA1 stays wired to
+ * the absent dcpext0 and reports no audio support.
+ */
+/ {
+	dpaudio3: audio-controller-3 {
+		compatible = "apple,t6041-dpaudio", "apple,dpaudio";
+		dmas = <&sio 0x6a>;
+		dma-names = "tx";
+		power-domains = <&ps_dpa3>;
+		status = "okay";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dpaudio3_dcpext: endpoint {
+					remote-endpoint = <&dcpext2_audio>;
+				};
+			};
+		};
+	};
+};
+
+&dcpext2 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dcpext2_audio: endpoint {
+				remote-endpoint = <&dpaudio3_dcpext>;
+			};
+		};
+	};
+};
+
+&ps_dpa3 {
+	status = "okay";
+};
