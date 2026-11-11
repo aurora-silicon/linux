@@ -8950,6 +8950,19 @@ static int dcp_t6041_stop_one(struct device *dev, void *data)
 			return 0;
 		}
 		seen[idx & 3] = true;
+		/*
+		 * This pipe's display DART too goes dark for good, now, while its block is still on:
+		 * step 2 forces the external display domains off and nothing raises them, but the
+		 * framebuffers are mapped through all three display DARTs, so every later unmap went
+		 * to flush a DART behind a dead block and the CPU doing it never came back (login or
+		 * sddm restart after a wake, last line DRM_IOCTL_MODE_CLOSEFB; 11 Nov). Marked dark,
+		 * the flush only publishes to memory.
+		 */
+		dcp_s2r_find_darts(dcp);
+		if (dcp->s2r_disp_dart)
+			dev_warn(dev, "S2RSTOP: display DART dark for good: %d\n",
+				 apple_dart_display_streams(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS,
+							    false, true));
 	}
 	dcp_stop_mark(idx, 1);
 	r[0] = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS);
@@ -9075,6 +9088,8 @@ static int dcp_t6041_stop_one(struct device *dev, void *data)
 static u32 dcp_t6041_child_saved[11];
 static bool dcp_t6041_child_valid;
 
+static u32 dcp_t6041_gapf_boot;
+
 static void dcp_t6041_word_try(const char *name, int idx, u32 slice, unsigned long cpu,
 			       unsigned long fe, unsigned long sys, unsigned long pg_a,
 			       unsigned long pg_b)
@@ -9089,6 +9104,9 @@ static void dcp_t6041_word_try(const char *name, int idx, u32 slice, unsigned lo
 		return;
 	val = readl(gapf);
 	pr_warn("S2RSTOP %s slice %#x\n", name, val);
+	/* The internal pipe's word as boot left it (0x12), to put back after the restart. */
+	if (cpu < 0x502800000UL && (val & BIT(4)) && !dcp_t6041_gapf_boot)
+		dcp_t6041_gapf_boot = val;
 	dcp_stop_mark(idx, 20);
 	writel(val & ~BIT(4), gapf);
 	dcp_stop_mark(idx, 21);
@@ -9344,6 +9362,10 @@ unlock:
 static struct apple_dcp *dcp_t6041_main;
 static int dcp_t6041_bl_text(char *buf, size_t len);
 void dcp_backlight_s2r_restore(struct apple_dcp *dcp);
+static bool s2r_bridge_arm;
+module_param(s2r_bridge_arm, bool, 0644);
+static bool s2r_gapf_restore;	/* writing 0x12 back after a wake froze the Max (11 Nov 22:0x) */
+module_param(s2r_gapf_restore, bool, 0644);
 static bool s2r_bl_restore = true;
 module_param(s2r_bl_restore, bool, 0644);
 
@@ -9379,8 +9401,18 @@ static int dcp_t6041_start_one(struct device *dev, void *data)
 		to |= BIT(0);
 	writel(0, pg + 0x1c);
 	writel(1, pg + 0x60);
-	writel(readl(br + 0x4) | 1, br + 0x4);
-	writel(readl(br + 0x8) | 1, br + 0x8);
+	/*
+	 * Bit 0 of bridge 4's two words: macOS's wake sets it and so did this restart, but boot has
+	 * it clear (0x10000 / 0x101330) with the display working, and with it set the driver's own
+	 * display power-off after a wake froze the whole machine right after "dcp_poweroff() done"
+	 * (login after a wake, sddm restart; 11 Nov 21:37 with a live log). Left as boot has it.
+	 */
+	if (READ_ONCE(s2r_bridge_arm)) {
+		writel(readl(br + 0x4) | 1, br + 0x4);
+		writel(readl(br + 0x8) | 1, br + 0x8);
+	}
+	pr_warn("S2RSTART bridge4 %#x %#x (arm %d)\n", readl(br + 0x4), readl(br + 0x8),
+		READ_ONCE(s2r_bridge_arm));
 	v = readl(ps + 0x368) & ~(GENMASK(9, 8) | GENMASK(3, 0) | BIT(28));
 	writel((v & ~0x30fU) | 0xf, ps + 0x368);
 	if (readl_poll_timeout(ps + 0x368, cur, (cur & 0xf0) == 0xf0, 50, 10000))
@@ -9449,6 +9481,24 @@ static int dcp_t6041_start_one(struct device *dev, void *data)
 	dev_warn(dev, "S2RSTART mode set %d crashed %d\n", ret, READ_ONCE(dcp->crashed));
 	if (!READ_ONCE(dcp->crashed))
 		iomfb_pause_presentation(dcp, false);
+	/*
+	 * The stop clears bit 4 of the internal pipe's GAPF word (0x500578540) and nothing set it
+	 * again: boot has 0x12, after a restart it read 0x2 or 0. With it clear, the first display
+	 * power-off by the driver after a wake left one CPU dead (CPU 8 both times, no NMI answer)
+	 * right after "dcp_poweroff() done". Put the boot value back once the display runs.
+	 */
+	if (READ_ONCE(s2r_gapf_restore) && dcp_t6041_gapf_boot) {
+		void __iomem *g = ioremap(0x500578540UL, 4);
+
+		if (g) {
+			u32 was = readl(g);
+
+			writel(dcp_t6041_gapf_boot, g);
+			dev_warn(dev, "S2RSTART gapf %#x -> %#x (boot %#x)\n", was, readl(g),
+				 dcp_t6041_gapf_boot);
+			iounmap(g);
+		}
+	}
 	if (READ_ONCE(s2r_bl_restore))
 		dcp_backlight_s2r_restore(dcp);
 	else if (dcp->brightness.bl_dev)
