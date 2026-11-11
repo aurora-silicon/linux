@@ -56,6 +56,7 @@
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_tbt.h>
+#include <linux/wait.h>
 
 #define T6040_USB2_USBCTL		0x00
 #define T6040_USB2_USBCTL_MODE		GENMASK(2, 0)
@@ -176,6 +177,8 @@
 #define T6040_CPU_MSG_POWER_DOWN	0x0100000000000000ULL
 
 #define T6040_RECOVERY_RETRIES		1
+/* DP's power-on waits this long for the wake of a host kept through a sleep */
+#define T6040_SLEEP_DP_WAIT_MS		2000
 
 static unsigned int recovery_dwell_ms = 50;
 module_param(recovery_dwell_ms, uint, 0644);
@@ -323,6 +326,8 @@ struct t6040_usb2_phy {
 	bool sleep_reset;	/* the controller held in reset for it, behind its consumer */
 	bool sleep_usb3;	/* USB3 ran when it went down, and comes back with USB2 */
 	bool sleep_waking;	/* in that wake: no power cycle of the PHY's domains */
+	bool sleep_back;	/* the system resumes and that wake is still to run */
+	wait_queue_head_t sleep_wq;	/* DP's power-on waits here for sleep_back to end */
 	bool sleep_no_keep;	/* a wake of its own failed: the host stops for later sleeps */
 	int sleep_ret;		/* what the wake has come to, for the controller's glue */
 };
@@ -542,6 +547,16 @@ static int t6040_usb2_off_locked(struct t6040_usb2_phy *tphy)
 	return 0;
 }
 
+/* The wake of a sleep with the host kept has run, or won't: DP stops waiting for it. */
+static void t6040_sleep_back_done(struct t6040_usb2_phy *tphy)
+{
+	lockdep_assert_held(&tphy->lock);
+	if (!tphy->sleep_back)
+		return;
+	WRITE_ONCE(tphy->sleep_back, false);
+	wake_up_all(&tphy->sleep_wq);
+}
+
 static int t6040_usb2_power_off(struct phy *phy)
 {
 	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
@@ -559,6 +574,7 @@ static int t6040_usb2_power_off(struct phy *phy)
 		return ret;
 	tphy->powered = false;
 	tphy->sleep_down = false;
+	t6040_sleep_back_done(tphy);
 	return 0;
 }
 
@@ -1734,11 +1750,31 @@ static void t6040_usb3_reclaim_locked(struct t6040_usb2_phy *tphy)
 
 /* ---- DP phy_ops ---- */
 
+/*
+ * A port that is down for a sleep with its host kept, while the system
+ * resumes: the Type-C controller can report a display before the host's
+ * resume has brought the PHY back, one that came to a dock during the sleep
+ * or an adapter in the place of the USB device. DP waits for that wake, and
+ * then finds the port as on any running host: USB3 up for pin assignment D
+ * to share, or to lend its lanes. If the wake fails or doesn't come, DP goes
+ * on and gets what it gets on a port without a host.
+ */
+static void t6040_dp_wait_host(struct t6040_usb2_phy *tphy)
+{
+	if (!READ_ONCE(tphy->sleep_back))
+		return;
+	if (!wait_event_timeout(tphy->sleep_wq, !READ_ONCE(tphy->sleep_back),
+				msecs_to_jiffies(T6040_SLEEP_DP_WAIT_MS)))
+		dev_warn(tphy->dev, "DP: the host's wake from the sleep did not come in %u ms\n",
+			 T6040_SLEEP_DP_WAIT_MS);
+}
+
 static int t6040_dp_power_on(struct phy *phy)
 {
 	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
 	int ret;
 
+	t6040_dp_wait_host(tphy);
 	guard(mutex)(&tphy->lock);
 	if (!tphy->dp_ok || tphy->dp_up)
 		return 0;
@@ -1751,8 +1787,12 @@ static int t6040_dp_power_on(struct phy *phy)
 			return -ENOLINK;
 		if (!tphy->usb3_up)
 			t6040_usb3_up_locked(tphy);
-		if (!tphy->usb3_up)
+		if (!tphy->usb3_up) {
+			if (tphy->sleep_down)
+				dev_info(tphy->dev,
+					 "DP PHY pin D: the port is down for a sleep, no link\n");
 			return -ENOLINK;
+		}
 		/* USB3 startup already applied these DPTX tunables before firmware. */
 		t6040_dp_aux_init(tphy);
 		tphy->dp_rate = -1;
@@ -3076,6 +3116,7 @@ static int t6040_usb2_probe(struct platform_device *pdev)
 	 */
 	tphy->mode = PHY_MODE_USB_HOST;
 	mutex_init(&tphy->lock);
+	init_waitqueue_head(&tphy->sleep_wq);
 	atomic_set(&tphy->drop_next_power_down_ack, 0);
 	platform_set_drvdata(pdev, tphy);
 
@@ -3187,9 +3228,16 @@ static struct t6040_usb2_phy *t6040_from_usb2_phy(struct phy *phy)
 
 /*
  * A USB2 host that runs, alone or with USB3 on this PHY and the PIPE on it.
- * DisplayPort on the lanes, with any pin assignment, and USB4/Thunderbolt have
- * clients of their own, which come back in their own order: such a port's
- * host stops for the sleep.
+ * DisplayPort on the lanes and USB4/Thunderbolt have clients of their own,
+ * which come back in their own order: such a port's host stops for the
+ * sleep. So does one whose four lanes are DisplayPort's by its pin assignment
+ * (C, E), link or not.
+ *
+ * Pin assignment D without a DisplayPort link is a USB port to the PHY: a
+ * dock with no display on it. USB3 runs on its pair as on any other port,
+ * nothing is programmed for the other pair before the DCP powers the DP phy
+ * on, and the mode is only latched here for that. With a link up the port
+ * stops its host like the others.
  */
 static bool t6040_can_sleep_in_place(const struct t6040_usb2_phy *tphy)
 {
@@ -3197,8 +3245,8 @@ static bool t6040_can_sleep_in_place(const struct t6040_usb2_phy *tphy)
 	       tphy->mode == PHY_MODE_USB_HOST && !tphy->shutdown_failed &&
 	       !tphy->sleep_no_keep && !tphy->sleep_down && !tphy->sleep_reset &&
 	       !tphy->cio_up && !tphy->pipe_tunneled && !tphy->router_running &&
-	       !tphy->dp_up && !tphy->dp_alt && !tphy->usb3_lent &&
-	       tphy->usb3_up == tphy->pipe_switched;
+	       !tphy->dp_up && (!tphy->dp_alt || tphy->dp_two_lanes) &&
+	       !tphy->usb3_lent && tphy->usb3_up == tphy->pipe_switched;
 }
 
 int apple_t6040_atcphy_sleep_prepare(struct phy *usb2_phy)
@@ -3260,6 +3308,7 @@ int apple_t6040_atcphy_sleep_enter(struct phy *usb2_phy)
 	t6040_dwc3_reset_hold_locked(tphy);
 	tphy->sleep_down = true;
 	tphy->sleep_reset = true;
+	WRITE_ONCE(tphy->sleep_back, false);
 	dev_info(tphy->dev, "PHY down for the sleep with the host kept, USB3 %s\n",
 		 tphy->sleep_usb3 ? "was up" : "was off");
 	return 0;
@@ -3321,6 +3370,8 @@ int apple_t6040_atcphy_sleep_power_up(struct phy *usb2_phy)
 	/* Only for a controller this sleep's result has taken out of reset. */
 	if (!tphy->sleep_armed || tphy->sleep_reset)
 		return -EINVAL;
+	/* Whatever this comes to, DP has nothing more to wait for. */
+	t6040_sleep_back_done(tphy);
 	if (!tphy->sleep_down)
 		return tphy->sleep_ret < 0 ? tphy->sleep_ret : 0;
 
@@ -3380,6 +3431,7 @@ void apple_t6040_atcphy_sleep_finish(struct phy *usb2_phy, bool kept)
 		return;
 
 	guard(mutex)(&tphy->lock);
+	t6040_sleep_back_done(tphy);
 	if (!tphy->sleep_armed)
 		return;
 	/* A sleep refused for a USB change doesn't count, nor a restart for another reason. */
@@ -3536,8 +3588,26 @@ static int t6040_usb2_poweroff(struct device *dev)
 	return t6040_usb2_sleep(dev, "poweroff");
 }
 
+/*
+ * A port that went down for the sleep with its host kept comes back in the
+ * host's resume. From here until then DP waits for it in its power-on, see
+ * t6040_dp_wait_host(). Early, before any .resume: the Type-C controller
+ * reports a display from its own.
+ */
+static int t6040_usb2_resume_early(struct device *dev)
+{
+	struct t6040_usb2_phy *tphy = dev_get_drvdata(dev);
+
+	if (!tphy)
+		return 0;
+	guard(mutex)(&tphy->lock);
+	WRITE_ONCE(tphy->sleep_back, tphy->sleep_down);
+	return 0;
+}
+
 static const struct dev_pm_ops t6040_usb2_pm_ops = {
 	.suspend = t6040_usb2_suspend,
+	.resume_early = t6040_usb2_resume_early,
 	.freeze = t6040_usb2_freeze,
 	.poweroff = t6040_usb2_poweroff,
 #ifdef CONFIG_HIBERNATION
