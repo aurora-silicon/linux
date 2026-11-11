@@ -4070,6 +4070,29 @@ struct macaudio_platform_cfg macaudio_j813_cfg = {
 };
 
 /*
+ * J714s (T6050, MacBook Pro 14" M5 Pro): as on J813, the AOP firmware owns
+ * the audio fabric and the CPU component is the T8152-style AOP audio
+ * driver. The jack is a CS42L84 on "cout"; the speakers are six SN012776
+ * (two woofers and a tweeter per side) on "spkr", in the J616s frame: six
+ * 32-bit playback slots and twelve 16-bit sense slots in 250 BCLKs of
+ * 12 MHz. Each amp's level is its apple,speaker-config from the boot loader.
+ */
+struct macaudio_platform_cfg macaudio_j714_cfg = {
+	.enable_speakers = true,
+	.amp = AMP_SN012776,
+	.speakers = SPKR_2W1T,
+	.stereo = true,
+	.safe_vol = -20,
+	.fe_dai_names = { "j873-pcm-0", "j873-pcm-1", "j873-pcm-2" },
+	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_IB_NF,
+	.spk_dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
+		       SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
+	.spk_secondary_only = true,
+	/* Granted, the tweeters restore their DT corner, as on the J616s */
+	.tweeter_hpf_granted = true,
+};
+
+/*
  * J815 (T8142, MacBook Air M5 15"): J813's AOP-fed card with six SN012776,
  * two woofers and a tweeter per side, in ADT speaker-config order (left
  * woofer 1, right woofer 1, left tweeter, right tweeter, left woofer 2,
@@ -4330,6 +4353,8 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j624-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* j700    AID44   max98360a   -       2x 1W    (AOP-fed, software gain) */
 	{ .compatible = "apple,j700-macaudio", .data = &macaudio_j700_cfg },
+	/* j714    -       sn012776    15      2x 2W+1T (AOP-fed, V/I sense) */
+	{ .compatible = "apple,j714-macaudio", .data = &macaudio_j714_cfg },
 	/* j713    -       sn012776    15      2x 1W+1T (AOP-fed, one serializer) */
 	{ .compatible = "apple,j713-macaudio", .data = &macaudio_j713_cfg },
 	/* The J713 jack runs on the AOP like the J616s one. */
