@@ -24,7 +24,6 @@ properties:
               - apple,t6000-dcp
               - apple,t6020-dcp
               - apple,t6041-dcp
-              - apple,t8122-dcp
               - apple,t6050-dcp
               - apple,t8140-dcp
               - apple,t8142-dcp
@@ -57,6 +56,9 @@ properties:
           T6031 (M3 Max) internal display controller. The display gate enables
           it after the boot loader has handed the running display over.
         const: apple,t6031-dcp
+      - description:
+          T8122 internal display controller using its native firmware handoff.
+        const: apple,t8122-dcp
 
   reg:
     minItems: 2
