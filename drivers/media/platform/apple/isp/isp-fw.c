@@ -1337,11 +1337,13 @@ void apple_isp_firmware_shutdown(struct apple_isp *isp)
 	isp_free_released_surfaces(isp);
 
 	/*
-	 * Firmware that starts again goes down with the stream, as macOS's camera close
-	 * takes it, and boots again for the next one. A system sleep then finds it off:
-	 * stopped on the way into a sleep that keeps DRAM up, the SoC doesn't wake.
+	 * Firmware that starts again goes down after the stream, at once or, with
+	 * hw->fw_idle_ms, once it has idled that long, as macOS's camera service
+	 * powers it off. A system sleep finds it off either way: idle firmware is
+	 * stopped before the sleep begins (apple_isp_pm_notify()). The DRAM-kept
+	 * wake runs the ISP itself and needs it left that way.
 	 */
-	if (isp->hw->fw_restart)
+	if (isp->hw->fw_restart && !isp->hw->fw_idle_ms)
 		apple_isp_firmware_halt(isp);
 
 	/* Not on isp->wq: the stop flushes that. */

@@ -133,7 +133,7 @@ static void isp_test_firmware_lifetime(struct kunit *test)
 					      match->compatible);
 		/* Only firmware that starts again idles before it stops. */
 		if (hw->fw_idle_ms)
-			KUNIT_EXPECT_TRUE_MSG(test, hw->fw_restore, "%s",
+			KUNIT_EXPECT_TRUE_MSG(test, hw->fw_restore || hw->fw_restart, "%s",
 					      match->compatible);
 		/* The fallback keeps restartable firmware resident. */
 		if (hw->resident_fallback)

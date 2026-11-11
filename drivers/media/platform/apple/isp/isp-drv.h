@@ -8,6 +8,7 @@
 #include <linux/list.h>
 #include <linux/maple_tree.h>
 #include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/types.h>
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
@@ -425,6 +426,9 @@ struct apple_isp {
 	bool camera_detected;
 	/* configurations the firmware has, once a deferred start detected them */
 	u32 num_fw_presets;
+
+	/* stops idle resident firmware before a system sleep */
+	struct notifier_block pm_nb;
 
 	/* stopped for system sleep, to start again on resume */
 	bool fw_sleep_stopped;

@@ -635,6 +635,21 @@ static void apple_isp_resume_work(struct work_struct *work)
 	apple_isp_video_resume(isp);
 }
 
+/*
+ * Idle firmware that starts again from its own memory is stopped before a
+ * system sleep begins, as macOS's camera service powers an idle ISP off
+ * before the kernel sleeps: the sleep then finds it off, as after a stream.
+ */
+static int apple_isp_pm_notify(struct notifier_block *nb, unsigned long event,
+			       void *unused)
+{
+	struct apple_isp *isp = container_of(nb, struct apple_isp, pm_nb);
+
+	if (event == PM_SUSPEND_PREPARE || event == PM_HIBERNATION_PREPARE)
+		apple_isp_firmware_flush(isp);
+	return NOTIFY_DONE;
+}
+
 static int apple_isp_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -813,6 +828,11 @@ static int apple_isp_probe(struct platform_device *pdev)
 		goto halt_firmware;
 	}
 
+	if (isp->hw->fw_idle_ms && isp->hw->resident_fw) {
+		isp->pm_nb.notifier_call = apple_isp_pm_notify;
+		register_pm_notifier(&isp->pm_nb);
+	}
+
 	return 0;
 
 halt_firmware:
@@ -837,6 +857,8 @@ static void apple_isp_remove(struct platform_device *pdev)
 {
 	struct apple_isp *isp = platform_get_drvdata(pdev);
 
+	if (isp->pm_nb.notifier_call)
+		unregister_pm_notifier(&isp->pm_nb);
 	cancel_work_sync(&isp->resume_work);
 	apple_isp_remove_video(isp);
 	/* Stop resident firmware before freeing what it may still use. */
@@ -1080,6 +1102,8 @@ static const struct apple_isp_hw apple_isp_hw_t8140 = {
 	.fw_restart = true,
 	/* As on macOS, the firmware first starts when a client opens the camera. */
 	.deferred_start = true,
+	/* macOS powers it off 5 s after the last frame (twice in its recording). */
+	.fw_idle_ms = 5000,
 	.meta_exposure = true,
 };
 
