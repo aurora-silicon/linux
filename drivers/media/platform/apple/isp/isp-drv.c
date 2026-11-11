@@ -1160,7 +1160,11 @@ static const struct isp_mmio_window apple_isp_fw_mmio_t6040[] = {
  * as macOS boots it on the J616s (macOS 26.6.2 camera log, kext register
  * map) and as aurora's m1n1 proxy captures with it: no coprocessor reset,
  * four broadcast-clear windows in eight slots, the scaler 1 output path and
- * no capture metadata pool or watchdog.
+ * no capture metadata pool or watchdog. Like T8132's, its firmware starts
+ * again from its data segment as loaded once the coprocessor was quiesced
+ * before the power-down: the ISP is powered only while the camera is in
+ * use, and the camera works again after a system sleep. The camera is
+ * detected at probe, which the P010 config discovery needs.
  */
 static const struct apple_isp_hw apple_isp_hw_t6040 = {
 	.gen = ISP_GEN_T6040,
@@ -1193,9 +1197,11 @@ static const struct apple_isp_hw apple_isp_hw_t6040 = {
 	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t6040),
 
 	.coproc_control = ISP_COPROC_CONTROL_T8140,
+	.coproc_status = ISP_COPROC_STATUS_T8140,
+	.coproc_quiesce = ISP_COPROC_QUIESCE_T8140,
 	.boot_mode = 1,
 	.shared_size = 0xde600000,
-	.resident_fw = true,
+	.fw_restore = true,
 	.meta_exposure = true,
 };
 
