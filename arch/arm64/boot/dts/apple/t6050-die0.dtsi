@@ -814,6 +814,14 @@
 			dma-names = "cout", "cin", "spkr", "sense";
 			#sound-dai-cells = <1>;
 		};
+
+		/*
+		 * The firmware's "als" service, a VD6286. It reports once it has the machine's
+		 * calibration, which the driver loads as apple/aop-als-cal.bin.
+		 */
+		aop_als: als {
+			compatible = "apple,t6050-aop-als", "apple,aop-als";
+		};
 	};
 };
 
