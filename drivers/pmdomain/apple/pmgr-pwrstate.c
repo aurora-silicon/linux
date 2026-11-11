@@ -43,6 +43,8 @@
 #define APPLE_PMGR_PS_PWRGATE   0x0
 
 #define APPLE_PMGR_PS_SET_TIMEOUT 100
+/* How long a lowered domain may report BUSY while its switch finishes */
+#define APPLE_PMGR_BUSY_SETTLE_US 1000
 #define APPLE_PMGR_PS_CONSUMER_TIMEOUT 1000
 #define APPLE_PMGR_PS_MAX_RETENTION 4
 #define APPLE_PMGR_PS_MAX_CHAIN 4
@@ -308,6 +310,16 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 	 * reset clears it, and the domain is off, so pulse one as on the power-on
 	 * path (not in a system sleep transition, see apple_pmgr_ps_clear_latch()).
 	 */
+	/*
+	 * Off only once BUSY clears too: macOS waits for (word & 0x8ff) == 0. The
+	 * actual state reads 0 a moment before the switch is done. BUSY still set
+	 * after this is a latch.
+	 */
+	if (!ret && ps->macos_lower && pstate != APPLE_PMGR_PS_ACTIVE && (cur & APPLE_PMGR_BUSY))
+		regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, cur,
+						!(cur & APPLE_PMGR_BUSY), 1,
+						APPLE_PMGR_BUSY_SETTLE_US);
+
 	if (!ret && pstate != APPLE_PMGR_PS_ACTIVE && (cur & APPLE_PMGR_BUSY) &&
 	    !FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) && (!ps->system_sleep || ps->macos_lower) &&
 	    !ps->wait_parent && !ps->strict_state && !ps->externally_clocked) {

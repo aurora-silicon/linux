@@ -80,6 +80,7 @@ struct aura_s2r_mailbox {
 /* PS word */
 #define PS_AUTO_ENABLE		BIT(28)
 #define PS_UNLATCH		BIT(12)
+#define PS_BUSY_SETTLE_US	1000
 #define PS_DEV_DISABLE		BIT(10)
 #define PS_FLAGS		GENMASK(9, 8)
 #define PS_ACTUAL		GENMASK(7, 4)
@@ -2466,6 +2467,9 @@ static bool apple_sleep_ps_unlatch(struct apple_sleep *s)
 		u32 val = readl(reg), off;
 
 		if (!(val & PS_BUSY) || (val & (PS_ACTUAL | PS_TARGET)))
+			continue;
+		/* A switch still finishing reads BUSY for a moment: only one that stays is a latch. */
+		if (!readl_poll_timeout_atomic(reg, val, !(val & PS_BUSY), 1, PS_BUSY_SETTLE_US))
 			continue;
 		s->ps_unlatched[s->ps_unlatched_count].offset = words->offset[i];
 		s->ps_unlatched[s->ps_unlatched_count++].val = val;
