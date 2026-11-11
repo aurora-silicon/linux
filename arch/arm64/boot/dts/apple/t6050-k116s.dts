@@ -33,14 +33,13 @@
 	};
 };
 
-/* Only PCIe port 0's PERST#, pin 80, is exposed */
 &pinctrl_ap {
 	/*
 	 * Pin 112 takes an SError when read, so only the pins a node names are
-	 * exposed: 80 (PCIe PERST#), 106/107 (amp fault, amp shutdown), 134/139
-	 * (jack codec interrupt, reset) and 136/137 (speaker ID).
+	 * exposed: 80/81 (PCIe ports 0 and 1's PERST#), 106/107 (amp fault, amp
+	 * shutdown), 134/139 (jack codec interrupt, reset) and 136/137 (speaker ID).
 	 */
-	gpio-reserved-ranges = <0 80>, <81 25>, <108 26>, <135 1>, <138 1>, <140 81>;
+	gpio-reserved-ranges = <0 80>, <82 24>, <108 26>, <135 1>, <138 1>, <140 81>;
 };
 
 /*
@@ -48,18 +47,47 @@
  * gives port 0's registers and IRQ 1523, pci-bridge0's PERST# is GPIO 80, and
  * the N1's three functions are on DART streams 1-3. The platform ID is this
  * board's ADT /chosen board-id (0x16) << 16 | chip 0x6050.
+ *
+ * PCIe port 1: the SD card reader (ADT apcie0/pci-bridge1/pcie-sdreader, a
+ * GL9755), as on J714s. The boot loader leaves the port down, so the kernel
+ * trains it. From this board's ADT:
+ *   port1, phy1, intr2axi1: apcie0 reg[22], reg[24], reg[25] (port 0's are
+ *     reg[16], reg[18], reg[19]), behind /arm-io's ranges (+0x200000000)
+ *   phy-shared: apcie0 reg[3], the shared PHY's state, which the train reads;
+ *     the boot loader leaves the PHY up with port 0
+ *   IRQ 1531: apcie0 interrupts[1]
+ *   PERST#: pci-bridge1 function-perst, gpio0 pin 0x51 (81)
+ *   power: pcie-sdreader function-sd_pwr_en, SMC pcIO (0x0, 0x190000), output
+ *     0 of smc_pcio below
+ *   link tunables: pci-bridge1's apcie-config-tunables, pcie-rc-tunables and
+ *     pcie-rc-gen{3,4,5}-shadow-tunables, as (offset, size, mask, value)
+ * The reader is behind dart-apcie1 (0x211000000, IRQ 1532; manual-availability:
+ * it answers only once the root complex is up). The ADT's mapper-apcie1 names
+ * no stream (the bridge requests one at run time), so stream 1 is this tree's
+ * choice, below the DART's first bypass stream (16), as on J714s.
+ * pci-bridge1's function-clkreq (gpio0 pin 0x4d) is not described: the
+ * driver does not take CLKREQ# lines.
  */
 &pcie0 {
 	reg = <0x1c 0xb0000000 0x0 0x10000000>,
 	      <0x4 0x14000000 0x0 0x4000>,
 	      <0x4 0x10028000 0x0 0x8000>,
 	      <0x4 0x17010000 0x0 0x4000>,
-	      <0x4 0x10024000 0x0 0x4000>;
-	reg-names = "config", "rc", "port0", "phy0", "intr2axi0";
-	interrupts = <AIC_IRQ 0 1523 IRQ_TYPE_LEVEL_HIGH>;
-	interrupt-names = "port0";
-	iommu-map = <0x100 &dart_apcie0 1 3>;
+	      <0x4 0x10024000 0x0 0x4000>,
+	      <0x4 0x11028000 0x0 0x8000>,
+	      <0x4 0x17014000 0x0 0x4000>,
+	      <0x4 0x11024000 0x0 0x4000>,
+	      <0x4 0x17020000 0x0 0x4000>;
+	reg-names = "config", "rc", "port0", "phy0", "intr2axi0", "port1", "phy1", "intr2axi1",
+		    "phy-shared";
+	interrupts = <AIC_IRQ 0 1523 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 0 1531 IRQ_TYPE_LEVEL_HIGH>;
+	interrupt-names = "port0", "port1";
+	iommu-map = <0x100 &dart_apcie0 1 3>,
+		    <0x200 &apcie1_dart 1 1>;
 	bus-range = <0 4>;
+	/* apcie1_dart probes only once port 1 is up: the host must not wait for it */
+	post-init-providers = <&apcie1_dart>;
 	status = "okay";
 
 	port00: pci@0,0 {
@@ -103,6 +131,65 @@
 			local-bd-address = [00 00 00 00 00 00];
 		};
 	};
+
+	port01: pci@1,0 {
+		device_type = "pci";
+		reg = <0x800 0 0 0 0>;
+		bus-range = <2 2>;
+		/* Down at boot: the kernel trains it, powering the reader first */
+		apple,link-trained-by-bootloader;
+		/* ADT pcie-sdreader function-sd_pwr_en: SMC pcIO output 0 below */
+		pwren-gpios = <&smc_pcio 0 GPIO_ACTIVE_HIGH>;
+		/* PERST#: ADT pci-bridge1 function-perst, GPIO 81 */
+		reset-gpios = <&pinctrl_ap 81 GPIO_ACTIVE_LOW>;
+		/* ADT pci-bridge1 */
+		apple,apcie-config-tunables = <0x140 4 0x1 0x1>,
+			<0x144 4 0xffffff 0x253770>,
+			<0x8a8 4 0x1 0x1>,
+			<0x8ac 4 0x1 0x1>;
+		apple,pcie-rc-tunables = <0x78 4 0x7000 0x0>,
+			<0x194 4 0x2 0x2>,
+			<0xb80 4 0x7f3f3f 0x7f1e1e>,
+			<0xb88 4 0x7f3f3f 0x7f1e1e>;
+		apple,pcie-rc-gen3-shadow-tunables = <0x154 4 0xf0f0f0f 0x5050505>,
+			<0x890 4 0x3000000 0x0>,
+			<0x8a8 4 0xffff0f 0x1>;
+		apple,pcie-rc-gen4-shadow-tunables = <0x178 4 0xffff 0x5555>,
+			<0x890 4 0x3000000 0x1000000>,
+			<0x8a8 4 0xffff0f 0x1>;
+		apple,pcie-rc-gen5-shadow-tunables = <0x1ac 4 0xffff 0x5555>,
+			<0x890 4 0x3000000 0x2000000>,
+			<0x8a8 4 0xffff0f 0x1>;
+
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupt-map-mask = <0 0 0 7>;
+		interrupt-map = <0 0 0 1 &port01 0 0 0 0>,
+				<0 0 0 2 &port01 0 0 0 1>,
+				<0 0 0 3 &port01 0 0 0 2>,
+				<0 0 0 4 &port01 0 0 0 3>;
+
+		/*
+		 * The GL9755. Card detect and write protect are active high: ADT
+		 * pcie-sdreader card-detect-polarity and write-protect-polarity = 1.
+		 */
+		sdhci0: mmc@0,0 {
+			compatible = "pci17a0,9755";
+			reg = <0x20000 0x0 0x0 0x0 0x0>;
+			cd-inverted;
+			wp-inverted;
+		};
+	};
+};
+
+/* ADT dart-apcie1 manual-availability: pcie-apple enables it once port 1 is up */
+&apcie1_dart {
+	apple,manual-availability;
+	status = "okay";
 };
 
 /*
@@ -407,10 +494,18 @@
  * The trackpad's AFE reset. The ADT names the SMC pcIO template (0x10000,
  * 0x11c0000), the same line as SMC GPIO gp1c, active low, which gpio-macsmc
  * drives; through the pcIO outputs the multi-touch interface never comes up.
- * As on J714s: gp1c, and the pcIO outputs go. The keyboard alias lets the
- * loader fill the layout from the ADT.
+ * As on J714s: gp1c. The keyboard alias lets the loader fill the layout from
+ * the ADT.
+ *
+ * The one SMC pcIO output this board drives, as a pKW8('pcIO', lo, hi) template
+ * written (hi << 32) | lo with the level in the low bits; this replaces the
+ * three of t6050-k114-k116.dtsi:
+ *   0 sd_pwr_en (0x0, 0x190000): ADT pcie-sdreader function-sd_pwr_en (and
+ *     /pcie-sdreader-helper), the SD reader's power on PCIe port 1
  */
-/delete-node/ &smc_pcio;
+&smc_pcio {
+	apple,output-commands = /bits/ 64 <0x0019000000000000>;
+};
 
 &mtp_hid {
 	apple,afe-reset-gpios = <&smc_gpio_low 28 GPIO_ACTIVE_LOW>;
