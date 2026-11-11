@@ -525,11 +525,6 @@ static int apple_pmgr_ps_resume_early(struct device *dev)
 	return 0;
 }
 
-/*
- * By the noirq phase genpd has powered off what it is going to. A domain it has off
- * whose target is still on was raised by a coprocessor's firmware: on T8140 the AOP
- * raises audio domains of its own in the always-on PMGR, and the sleep keeps them.
- */
 /* T8140's always-on PMGR, the block the AOP shares */
 #define APPLE_PMGR_T8140_AON_BASE 0x308280000ULL
 
@@ -541,6 +536,11 @@ static bool apple_pmgr_ps_in_aon(struct device_node *node)
 	       res.start == APPLE_PMGR_T8140_AON_BASE;
 }
 
+/*
+ * By the noirq phase genpd has powered off what it is going to. A domain it has off
+ * whose target is still on was raised by a coprocessor's firmware: on T8140 the AOP
+ * raises audio domains of its own in the always-on PMGR, and the sleep keeps them.
+ */
 static int apple_pmgr_ps_suspend_noirq(struct device *dev)
 {
 	struct apple_pmgr_ps *ps = dev_get_drvdata(dev);
