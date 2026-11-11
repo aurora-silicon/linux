@@ -300,3 +300,45 @@
 #include "t8142-j813-psci-idle.dtsi"
 #include "t8142-j813-nvme.dtsi"
 #include "t8142-j813-power.dtsi"
+
+/*
+ * CPU topology: DT cpu0-5 are the E cores (cluster 0), cpu6-9 (MPIDR
+ * 0x10100-0x10103) the P cores (cluster 1). The scheduler then knows the
+ * two clusters are asymmetric (SD_ASYM_CPUCAPACITY) and places heavy tasks
+ * on the P cores. Linux boots on a P core, so logical cpu0 and 7-9 are P.
+ * capacity-dmips-mhz (per MHz, scaled by each cluster's top OPP): E 671 /
+ * P 1024, measured on J815 (boot 0f4c4bbd, pinned integer loop at the top
+ * OPP of each cluster, best of 3: E 0.1045 / P 0.1597 per MHz). The T8132
+ * (M4) ratio this replaces, 754, overstated the E cores by 12%; E capacity
+ * at 2964 MHz is now ~445 of 1024 (4464 MHz P).
+ */
+&{/cpus} {
+	cpu-map {
+		cluster0 {
+			core0 { cpu = <&cpu0>; };
+			core1 { cpu = <&cpu1>; };
+			core2 { cpu = <&cpu2>; };
+			core3 { cpu = <&cpu3>; };
+			core4 { cpu = <&cpu4>; };
+			core5 { cpu = <&cpu5>; };
+		};
+
+		cluster1 {
+			core0 { cpu = <&cpu6>; };
+			core1 { cpu = <&cpu7>; };
+			core2 { cpu = <&cpu8>; };
+			core3 { cpu = <&cpu9>; };
+		};
+	};
+};
+
+&cpu0 { capacity-dmips-mhz = <671>; };
+&cpu1 { capacity-dmips-mhz = <671>; };
+&cpu2 { capacity-dmips-mhz = <671>; };
+&cpu3 { capacity-dmips-mhz = <671>; };
+&cpu4 { capacity-dmips-mhz = <671>; };
+&cpu5 { capacity-dmips-mhz = <671>; };
+&cpu6 { capacity-dmips-mhz = <1024>; };
+&cpu7 { capacity-dmips-mhz = <1024>; };
+&cpu8 { capacity-dmips-mhz = <1024>; };
+&cpu9 { capacity-dmips-mhz = <1024>; };
