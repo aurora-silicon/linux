@@ -30,7 +30,6 @@ const CLIENT: u64 = crate::sks::SKS_CLIENT_ID;
 const CREATE_VARIANT: u32 = 4;
 const CREATE_BAG_TYPE: u32 = 0;
 const CREATE_ARG: i32 = -1;
-const DESIGNATE_VARIANT: u32 = 1;
 const CHANGE_VARIANT: u32 = 3;
 const LOCK_STATE_VARIANT: u32 = 1;
 const DEVICE_STATE_VARIANT: u32 = 0;
@@ -200,28 +199,32 @@ fn decode_create_reply(body: &[u8]) -> Option<crate::sks::KeyBagHandle> {
     Some(crate::sks::KeyBagHandle::from_create_reply(handle))
 }
 
-fn encode_designate(source_handle: i32, user_handle: i32) -> Result<crate::image::Body> {
+fn encode_designate(key_store: crate::profile::KeyStore, source_handle: i32, user_handle: i32) -> Result<crate::image::Body> {
     if source_handle < 0 || user_handle >= 0 {
         return Err(EINVAL);
     }
     let mut body = crate::image::Body::new();
-    body.put_u32(DESIGNATE_VARIANT)?;
+    body.put_u32(crate::sks::designate_variant(key_store))?;
     body.put_u64(CLIENT)?;
     body.put_i32(source_handle)?;
     body.put_i32(user_handle)?;
     body.put_blob(&[])?;
-    body.put_u64(0)?;
+    // The 13.5 structure ends after the empty blob, as in sks_req_designate.
+    if key_store == crate::profile::KeyStore::Variant5 {
+        body.put_u64(0)?;
+    }
     Ok(body)
 }
 
-fn decode_designate(body: &[u8]) -> Option<Designate> {
+fn decode_designate(key_store: crate::profile::KeyStore, body: &[u8]) -> Option<Designate> {
     let mut c = Cursor::new(body);
-    if c.u32()? != DESIGNATE_VARIANT || c.u64()? != CLIENT {
+    if c.u32()? != crate::sks::designate_variant(key_store) || c.u64()? != CLIENT {
         return None;
     }
     let source_handle = c.i32()?;
     let user_handle = c.i32()?;
-    if source_handle < 0 || user_handle >= 0 || !c.blob()?.is_empty() || c.u64()? != 0 || !c.done()
+    if source_handle < 0 || user_handle >= 0 || !c.blob()?.is_empty()
+        || (key_store == crate::profile::KeyStore::Variant5 && c.u64()? != 0) || !c.done()
     {
         return None;
     }
@@ -231,8 +234,8 @@ fn decode_designate(body: &[u8]) -> Option<Designate> {
     })
 }
 
-fn decode_designate_reply(body: &[u8]) -> bool {
-    body == DESIGNATE_VARIANT.to_le_bytes()
+fn decode_designate_reply(key_store: crate::profile::KeyStore, body: &[u8]) -> bool {
+    body == crate::sks::designate_variant(key_store).to_le_bytes()
 }
 
 fn encode_transition(
@@ -1168,13 +1171,13 @@ impl crate::SepData {
         let designated = self.sks_step(crate::sks::SKS_DESIGNATE_NAME, |_healthy| {
             self.userbag_request(
                 crate::sks::SKS_DESIGNATE_NAME,
-                encode_designate(handle.value(), user.special_handle().value())?,
+                encode_designate(self.profile.key_store, handle.value(), user.special_handle().value())?,
                 |seq, len| crate::sks::encode_sks_designate(seq, len).ok_or(EINVAL),
             )
         });
         let valid = designated.as_ref().is_some_and(|out| {
             self.sks_report_response(crate::sks::SKS_DESIGNATE_NAME, out)
-                .is_some_and(decode_designate_reply)
+                .is_some_and(|body| decode_designate_reply(self.profile.key_store, body))
         });
         let _ = self.sks_send(self.sks_req_unload_keybag(handle));
         if !valid {
@@ -1208,13 +1211,13 @@ impl crate::SepData {
         let designated = self.sks_step(crate::sks::SKS_DESIGNATE_NAME, |_healthy| {
             self.userbag_request(
                 crate::sks::SKS_DESIGNATE_NAME,
-                encode_designate(handle.value(), user.special_handle().value())?,
+                encode_designate(self.profile.key_store, handle.value(), user.special_handle().value())?,
                 |seq, len| crate::sks::encode_sks_designate(seq, len).ok_or(EINVAL),
             )
         });
         let valid = designated.as_ref().is_some_and(|out| {
             self.sks_report_response(crate::sks::SKS_DESIGNATE_NAME, out)
-                .is_some_and(decode_designate_reply)
+                .is_some_and(|body| decode_designate_reply(self.profile.key_store, body))
         });
         if !valid {
             let _ = self.sks_send(self.sks_req_unload_keybag(handle));
@@ -1544,7 +1547,8 @@ mod tests {
 
     #[test]
     fn designate_layout_golden_and_round_trip() {
-        let body = encode_designate(1, USER_HANDLE).expect("designate");
+        let key_store = crate::profile::KeyStore::Variant5;
+        let body = encode_designate(key_store, 1, USER_HANDLE).expect("designate");
         let mut golden = [0u8; 32];
         golden[0..4].copy_from_slice(&1u32.to_le_bytes());
         golden[4..12].copy_from_slice(&CLIENT_LE);
@@ -1552,13 +1556,32 @@ mod tests {
         golden[16..20].copy_from_slice(&USER_HANDLE.to_le_bytes());
         assert_eq!(body.as_slice(), &golden);
         assert_eq!(
-            decode_designate(body.as_slice()),
+            decode_designate(key_store, body.as_slice()),
             Some(Designate {
                 source_handle: 1,
                 user_handle: USER_HANDLE
             })
         );
-        assert!(decode_designate_reply(&1u32.to_le_bytes()));
+        assert!(decode_designate_reply(key_store, &1u32.to_le_bytes()));
+    }
+
+    #[test]
+    fn sepos13_designation_has_no_flags_trailer() {
+        let key_store = crate::profile::KeyStore::Sepos13 { cpx_encryption_mode: 0 };
+        let body = encode_designate(key_store, 1, USER_HANDLE).expect("designate");
+        let mut golden = [0u8; 24];
+        golden[4..12].copy_from_slice(&CLIENT_LE);
+        golden[12..16].copy_from_slice(&1i32.to_le_bytes());
+        golden[16..20].copy_from_slice(&USER_HANDLE.to_le_bytes());
+        assert_eq!(body.as_slice(), &golden);
+        assert_eq!(decode_designate(key_store, body.as_slice()),
+            Some(Designate { source_handle: 1, user_handle: USER_HANDLE }));
+        assert!(decode_designate_reply(key_store, &0u32.to_le_bytes()));
+        assert!(!decode_designate_reply(key_store, &1u32.to_le_bytes()));
+        assert!(decode_designate(crate::profile::KeyStore::Variant5, body.as_slice()).is_none());
+        let mut extra = [0u8; 32];
+        extra[..24].copy_from_slice(body.as_slice());
+        assert!(decode_designate(key_store, &extra).is_none());
     }
 
     #[test]
