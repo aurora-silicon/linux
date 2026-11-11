@@ -581,3 +581,23 @@
 			<&ps_atc2_cio_usb>, <&ps_atc2_cio_auss>, <&ps_atc2_pcie>;
 	apple,pcie-tunnel = <&acio2_pcie_tunnel>;
 };
+/* The touchscreen (kiwi). Its reset and supply are NUB GPIO pins 25 and 26 (ADT
+ * function-reset and function-power), not the shared multi-touch AFE reset.
+ * The NUB GPIO block powers the touch controller; upstream wires its interrupts.
+ * the reset, as for the AFE one [INFERENCE].
+ */
+&ps_nub_gpio {
+	status = "okay";
+};
+
+&nub_gpio0 {
+	status = "okay";
+};
+
+&kiwi {
+	firmware-name = "apple/tpkiwifw-k114c.bin";
+	apple,power-method = <2>;
+	apple,reset-gpios = <&nub_gpio0 25 GPIO_ACTIVE_HIGH>;
+	apple,power-gpios = <&nub_gpio0 26 GPIO_ACTIVE_HIGH>;
+	status = "okay";
+};
