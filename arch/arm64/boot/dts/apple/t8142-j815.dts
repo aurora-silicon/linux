@@ -125,6 +125,7 @@
 #include "t8142-j813-usb.dtsi"
 #include "t8142-j813-avd.dtsi"
 #include "t8142-j813-isp.dtsi"
+#include "t8142-j813-n1.dtsi"
 
 &mtp_hid {
 	multi-touch {
@@ -148,4 +149,47 @@
 &isp {
 	/* J815 ADT /arm-io/isp sensor-type */
 	apple,platform-id = <0x72>;
+};
+
+/*
+ * N1 functions behind apcie port 0 (0000:00:00.0 -> 01:00.{0,1,2}), so the
+ * loader has somewhere to put the factory addresses: it copies ADT /chosen
+ * mac-address-wifi0 and mac-address-bluetooth0 into the wifi0/bluetooth0
+ * alias targets, as on T6050 (t6050-j716s.dts).
+ */
+/ {
+	aliases {
+		wifi0 = &n1_alpha;
+		bluetooth0 = &n1_beta;
+	};
+};
+
+&pcie0 {
+	n1_port: pci@0,0 {
+		device_type = "pci";
+		reg = <0x0 0x0 0x0 0x0 0x0>;
+		bus-range = <1 1>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		n1_control: control@0,0 {
+			compatible = "pci106b,1900";
+			reg = <0x10000 0x0 0x0 0x0 0x0>;
+		};
+
+		n1_alpha: wifi@0,1 {
+			compatible = "pci106b,1902";
+			reg = <0x10100 0x0 0x0 0x0 0x0>;
+			/* Filled by the loader */
+			local-mac-address = [00 00 00 00 00 00];
+		};
+
+		n1_beta: bluetooth@0,2 {
+			compatible = "pci106b,1903";
+			reg = <0x10200 0x0 0x0 0x0 0x0>;
+			/* Filled by the loader */
+			local-bd-address = [00 00 00 00 00 00];
+		};
+	};
 };
