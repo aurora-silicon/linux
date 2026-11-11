@@ -50,22 +50,36 @@ static struct iomfb_scanout_h17p *admission(struct apple_dcp *dcp,struct iomfb_s
 ''' + admit + '\nreturn scanout;}\n' + r'''
 int main(void){
  struct apple_dcp d={0};init(&d.iomfb.dropped);init(&d.ext26_retained);
- struct obj o={32ULL<<20};struct fb f={{&o}};struct iomfb_scanout_h17p frames[16]={0};
- for(unsigned i=0;i<12;i++){
+ struct obj o={32ULL<<20};struct fb f={{&o}};struct iomfb_scanout_h17p frames[32]={0};
+ for(unsigned i=0;i<30;i++){
    frames[i].fb[0]=&f;init(&frames[i].link);
    assert(admission(&d,&frames[i]));d.iomfb.scanout=&frames[i];
    assert(!iomfb_ext26_retain_epoch(&d));assert(!d.iomfb.scanout);
  }
- assert(d.ext26_epochs==12&&d.ext26_retained_bytes==(384ULL<<20));
- frames[12].fb[0]=&f;init(&frames[12].link);
- d.ext26_retained_bytes=960ULL<<20;
- assert(!admission(&d,&frames[12])&&released==1); /* unexposed: safe put */
- d.iomfb.scanout=&frames[12]; /* simulate previously exposed backing at limit */
+ assert(d.ext26_epochs==30&&d.ext26_retained_bytes==(960ULL<<20));
+ frames[30].fb[0]=&f;init(&frames[30].link);
+ assert(d.ext26_retained_bytes==960ULL<<20);
+ assert(!admission(&d,&frames[30])&&released==1); /* unexposed: safe put */
+ d.iomfb.scanout=&frames[30]; /* simulate previously exposed backing at limit */
  assert(!iomfb_ext26_retain_epoch(&d)); /* stop never strands route on quota */
  assert(d.ext26_retained_bytes==(992ULL<<20));
  assert(!dcpext26_backing_fits(~0ULL,1));
  assert(dcpext26_backing_fits((960ULL<<20)-1,1));
  assert(!dcpext26_backing_fits(960ULL<<20,1));
+ /* Overflow in actual surface accumulation must fail closed. */
+ o.size=(1ULL<<63);frames[31].fb[0]=&f;frames[31].fb[1]=&f;
+ assert(ext26_scanout_bytes(&frames[31])==~0ULL);
+ d.ext26_retained_bytes=0;
+ assert(!admission(&d,&frames[31]));
+ /* Overflow across current plus dropped must not wrap back under budget. */
+ frames[30].fb[0]=&f;d.iomfb.scanout=&frames[30];
+ assert(!admission(&d,&frames[30]));
+ d.iomfb.scanout=0;
+ struct iomfb_scanout_h17p dropped={.fb={&f}};init(&dropped.link);
+ list_add_tail(&dropped.link,&d.iomfb.dropped);
+ assert(!admission(&d,&frames[31]));
+ d.ext26_retained_bytes=~0ULL-1;
+ assert(!iomfb_ext26_retain_epoch(&d)&&d.ext26_retained_bytes==~0ULL);
  idle=false;assert(iomfb_ext26_retain_epoch(&d)==-EBUSY);
  idle=true;d.ext26_control_pending=true;assert(iomfb_ext26_retain_epoch(&d)==-EBUSY);
 }
@@ -76,4 +90,4 @@ with tempfile.TemporaryDirectory() as t:
     subprocess.run(['clang','-std=gnu11','-Wall','-Werror','-Wno-unused-function',
                     '-fsanitize=address,undefined',str(p),'-o',str(p.with_suffix(''))],check=True)
     subprocess.run([str(p.with_suffix(''))],check=True)
-print('PASS production budget admission and retention: 12 epochs, byte limit, overflow, busy fences')
+print('PASS production budget admission and retention: 30 epochs to 960 MiB, refusal past limit, production surface/current/dropped/retained accumulation overflow, busy fences')

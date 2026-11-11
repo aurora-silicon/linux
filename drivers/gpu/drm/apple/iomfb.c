@@ -3333,9 +3333,10 @@ iomfb_scanout_prepare_h17p(struct apple_dcp *dcp, struct drm_crtc *crtc,
 
 		/* Reserve every exposed object, including an unsuccessful present. */
 		if (dcp->iomfb.scanout)
-			bytes += ext26_scanout_bytes(dcp->iomfb.scanout);
+			bytes = dcpext26_backing_add(bytes,
+						   ext26_scanout_bytes(dcp->iomfb.scanout));
 		list_for_each_entry(dropped, &dcp->iomfb.dropped, link)
-			bytes += ext26_scanout_bytes(dropped);
+			bytes = dcpext26_backing_add(bytes, ext26_scanout_bytes(dropped));
 		if (!dcpext26_backing_fits(dcp->ext26_retained_bytes, bytes)) {
 			dev_warn_ratelimited(dcp->dev,
 				"native26 backing budget exhausted; new present refused\n");
@@ -3537,7 +3538,8 @@ VISIBLE_IF_KUNIT void iomfb_scanout_put_h17p(struct apple_dcp *dcp,
 	if (dcp_is_ext26(dcp)) {
 		/* An unsuccessful present can still have exposed its IOVAs. */
 		list_add_tail(&scanout->link, &dcp->ext26_retained);
-		dcp->ext26_retained_bytes += ext26_scanout_bytes(scanout);
+		dcp->ext26_retained_bytes = dcpext26_backing_add(
+			dcp->ext26_retained_bytes, ext26_scanout_bytes(scanout));
 		return;
 	}
 	iomfb_scanout_release_h17p(scanout);
@@ -3615,7 +3617,9 @@ static void iomfb_atomic_start(struct apple_dcp *dcp,
 	}
 	atomic->scanout = iomfb_scanout_prepare_h17p(dcp, atomic->crtc, atomic->state);
 	if (!atomic->scanout) {
-		/* Allocation/admission failure exposed no new backing. */
+		/* Only native26 admission refuses unexposed backing nonfatally. */
+		if (!dcp_is_ext26(dcp))
+			WRITE_ONCE(dcp->crashed, true);
 		schedule_work(&dcp->vblank_wq);
 		return;
 	}
@@ -3969,7 +3973,7 @@ static u64 ext26_scanout_bytes(struct iomfb_scanout_h17p *scanout)
 
 	for (i = 0; i < SWAP_SURFACES; i++)
 		if (scanout->fb[i] && scanout->fb[i]->obj[0])
-			bytes += scanout->fb[i]->obj[0]->size;
+			bytes = dcpext26_backing_add(bytes, scanout->fb[i]->obj[0]->size);
 	return bytes;
 }
 
@@ -3985,9 +3989,9 @@ int iomfb_ext26_retain_epoch(struct apple_dcp *dcp)
 	    dcp->ext26_control_pending)
 		return -EBUSY;
 	if (dcp->iomfb.scanout)
-		bytes += ext26_scanout_bytes(dcp->iomfb.scanout);
+		bytes = dcpext26_backing_add(bytes, ext26_scanout_bytes(dcp->iomfb.scanout));
 	list_for_each_entry(scanout, &dcp->iomfb.dropped, link)
-		bytes += ext26_scanout_bytes(scanout);
+		bytes = dcpext26_backing_add(bytes, ext26_scanout_bytes(scanout));
 	/*
 	 * Admission reserved this backing before exposure. Retaining it here
 	 * allocates nothing: a quota refusal after power/link withdrawal would
@@ -3998,7 +4002,7 @@ int iomfb_ext26_retain_epoch(struct apple_dcp *dcp)
 		dcp->iomfb.scanout = NULL;
 	}
 	list_splice_tail_init(&dcp->iomfb.dropped, &dcp->ext26_retained);
-	dcp->ext26_retained_bytes += bytes;
+	dcp->ext26_retained_bytes = dcpext26_backing_add(dcp->ext26_retained_bytes, bytes);
 	if (bytes)
 		dcp->ext26_epochs++;
 	dcp->ext26_blanked = false;

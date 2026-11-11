@@ -32,6 +32,12 @@ static inline bool dcpext26_exchange_finished(const struct dcpext26_exchange *x)
 {
 	return x->failed || (x->id && x->replied && x->completed);
 }
+/* Saturate accounting so a wrapped sum can never reopen admission. */
+static inline u64 dcpext26_backing_add(u64 total, u64 incoming)
+{
+	return incoming > ~0ULL - total ? ~0ULL : total + incoming;
+}
+
 /* Admission only: already exposed backing must always survive teardown. */
 static inline bool dcpext26_backing_fits(u64 retained, u64 incoming)
 {

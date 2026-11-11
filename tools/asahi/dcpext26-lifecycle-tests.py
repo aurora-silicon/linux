@@ -106,6 +106,8 @@ static struct apple_dcp fresh(struct apple_dcp_afkep *ep) {
 static void native_pm_complete(struct apple_dcp *dcp);
 static int native_pm_resume(struct apple_dcp *dcp);
 int main(void) {
+ assert(dcpext26_backing_add(1,2)==3);
+ assert(dcpext26_backing_add(~0ULL,1)==~0ULL);
  struct ext26_control c={0}; struct apple_dcp d={0};d.ext26_control=&c;d.ext26_control_pending=true;
  assert(!dcpext26_exchange_begin(&c.exchange,0));
  assert(dcpext26_exchange_begin(&c.exchange,42));assert(!dcpext26_exchange_begin(&c.exchange,43));
