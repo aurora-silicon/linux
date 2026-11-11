@@ -2488,7 +2488,7 @@ impl SepData {
     /// not ended by a suspend and not closed.
     fn verify_wanted(&self) -> bool {
         !self.shutting_down.load(Relaxed)
-            && (self.key_touch_active.load(Relaxed)
+            && ((self.key_touch_active.load(Relaxed) && !self.key_touch_cancel.load(Relaxed))
                 || bio::verify_is_live(&self.bio_session.lock(), self.capture_epoch.load(Relaxed)))
     }
 

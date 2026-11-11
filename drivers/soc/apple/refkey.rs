@@ -483,6 +483,66 @@ impl SepData {
         self.with_identity_bag(|handle, _secret| self.sks_refkey_sign(handle, blob, digest, acm))
     }
 
+    /// `/dev/sep-key` unseal: the enclave's ECIES decrypt (op `oecd`) of
+    /// `sealed` (from `refkey_seal::ecies_seal` to this key's public point)
+    /// with the key in `blob`, checked against the credential context `acm`
+    /// when one is given, as `user_key_sign` is. `EKEYREJECTED` when the
+    /// enclave refuses (a record from elsewhere, an access-control list the
+    /// context does not satisfy, or a blob sealed to another key).
+    pub(crate) fn user_key_unseal(
+        &self,
+        blob: &[u8],
+        sealed: &[u8],
+        acm: Option<&[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>,
+    ) -> Result<KVec<u8>> {
+        Self::refkey_pub(blob).ok_or(EINVAL)?;
+        self.with_identity_bag(|handle, _secret| self.sks_refkey_decrypt(handle, blob, sealed, acm))
+    }
+
+    /// Op `oecd` with an optional credential context (`acmh`); the enclave's
+    /// status is kept in `last_key_status` like a signature's.
+    fn sks_refkey_decrypt(
+        &self,
+        handle: crate::sks::KeyBagHandle,
+        refkey_blob: &[u8],
+        sealed: &[u8],
+        acm: Option<&[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>,
+    ) -> Result<KVec<u8>> {
+        use crate::der::RefKeyValue as RV;
+        let mut items: KVec<(&[u8], RV<'_>)> = KVec::new();
+        items.push((b"o", RV::Utf8(b"oecd")), GFP_KERNEL)?;
+        items.push((b"d", RV::Octets(sealed)), GFP_KERNEL)?;
+        items.push((b"rk", RV::Der(refkey_blob)), GFP_KERNEL)?;
+        if let Some(acm) = acm {
+            items.push((b"acmh", RV::Octets(acm)), GFP_KERNEL)?;
+        }
+        let der = crate::der::encode_refkey_set(&items)?;
+        let Some(out) = self.sks_send(self.sks_req_refkey(handle.value(), &der)) else {
+            self.last_key_status.store(i32::MIN as u32, Relaxed);
+            return Err(EIO);
+        };
+        self.last_key_status.store(i32::from(out.reply.status) as u32, Relaxed);
+        if out.reply.status != 0 {
+            dev_warn!(
+                self.dev,
+                "sks: ref-key unseal refused by the enclave (status {}{})\n",
+                out.reply.status,
+                (if acm.is_some() { ", with a credential context" } else { "" })
+            );
+            return Err(EKEYREJECTED);
+        }
+        let body = self
+            .sks_report_response(crate::sks::SKS_PERFORM_OP_NAME, &out)
+            .ok_or(EIO)?;
+        let mut f = proto::FieldCursor::new(body);
+        let (Some(0), Some(rec)) = (f.i32(), f.blob()) else {
+            return Err(EIO);
+        };
+        let mut owned: KVec<u8> = KVec::new();
+        owned.extend_from_slice(rec, GFP_KERNEL)?;
+        Ok(owned)
+    }
+
     /// Enclave ECIES-decrypt (o = "oecd"); takes the ephemeral from the front of `d`.
     fn sks_refkey_unseal(
         &self,

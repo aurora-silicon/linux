@@ -787,6 +787,8 @@ struct SepData {
     #[pin]
     key_touch: Mutex<Option<crate::key::KeyTouch>>,
     key_touch_active: Atomic<bool>,
+    /// `SEP_KEY_CANCEL`: ends the touch-gated operation that is waiting.
+    key_touch_cancel: Atomic<bool>,
     // The enclave status of the last /dev/sep-key signature (self-test).
     last_key_status: Atomic<u32>,
 
@@ -1104,6 +1106,7 @@ impl SepData {
                 key_dev <- new_mutex!(None),
                 key_touch <- new_mutex!(None),
                 key_touch_active: Atomic::new(false),
+                key_touch_cancel: Atomic::new(false),
                 last_key_status: Atomic::new(0),
                 bio_lockout: Atomic::new(false),
                 bio_after_boot: Atomic::new(false),

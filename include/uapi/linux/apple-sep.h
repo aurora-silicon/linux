@@ -258,6 +258,15 @@ struct sep_bio_rearm {
  * only passcode is a key bag secret root holds, so CREATE refuses them with
  * EOPNOTSUPP rather than check a password in software.
  *
+ * Version 3 adds SEP_KEY_CANCEL, SEP_KEY_SEAL and SEP_KEY_UNSEAL (INFO
+ * 'features'). CANCEL ends a touch-gated SIGN or UNSEAL that is waiting for
+ * a finger; that call fails with ECANCELED. SEAL encrypts up to
+ * SEP_KEY_SECRET_MAX bytes to a biometric key's public point (ECIES, in the
+ * kernel, no touch). UNSEAL has the enclave decrypt such a blob with the key
+ * under the same touch-satisfied credential context as a SIGN, so a sealed
+ * secret is released only after a Touch ID match the enclave saw. SEAL and
+ * UNSEAL refuse keys made without a biometric policy (EINVAL).
+ *
  * Keep a second key (a backup) wherever a biometric key is trusted, as with
  * hardware security keys: no key can be exported or recovered.
  *
@@ -269,9 +278,14 @@ struct sep_bio_rearm {
  * install, or an access-control list not satisfied), EACCES when the touch
  * did not match (or Touch ID is locked out), ETIMEDOUT when no finger came,
  * ENODEV while the key store or Touch ID is not up, EOPNOTSUPP for a
- * reserved policy, EIO for any other enclave failure.
+ * reserved policy, ECANCELED after SEP_KEY_CANCEL, EIO for any other
+ * enclave failure.
  */
-#define SEP_KEY_IFACE_VERSION 2
+#define SEP_KEY_IFACE_VERSION 3
+#define SEP_KEY_FEATURE_CANCEL 0x1
+#define SEP_KEY_FEATURE_SEAL   0x2
+#define SEP_KEY_SECRET_MAX 64
+#define SEP_KEY_SEALED_MAX 256
 #define SEP_KEY_CREATE_BIOMETRY_CURRENT_SET 0x1
 #define SEP_KEY_CREATE_BIOMETRY_ANY         0x2
 #define SEP_KEY_CREATE_USER_PRESENCE        0x4  /* reserved: EOPNOTSUPP */
@@ -285,7 +299,7 @@ struct sep_key_info {
 	__u32 version;          /* SEP_KEY_IFACE_VERSION */
 	__u32 flags_supported;  /* SEP_KEY_CREATE_* bits this kernel accepts */
 	__u32 handle_max;       /* SEP_KEY_HANDLE_MAX */
-	__u32 reserved;
+	__u32 features;         /* SEP_KEY_FEATURE_* (version 3; zero before) */
 };
 
 struct sep_key_create {
@@ -318,6 +332,21 @@ struct sep_key_public {
 #define SEP_KEY_SIGN     _IOWR(SEP_BIO_IOC_MAGIC, 0x22, struct sep_key_sign)
 #define SEP_KEY_PUBLIC   _IOWR(SEP_BIO_IOC_MAGIC, 0x23, struct sep_key_public)
 
+/* SEAL: secret in, sealed out. UNSEAL: sealed in, secret out (waits for a touch). */
+struct sep_key_seal {
+	__u32 flags;                            /* in: 0 */
+	__u32 handle_len;                       /* in */
+	__u32 secret_len;                       /* SEAL in, UNSEAL out */
+	__u32 sealed_len;                       /* SEAL out, UNSEAL in */
+	__u8  secret[SEP_KEY_SECRET_MAX];
+	__u8  sealed[SEP_KEY_SEALED_MAX];
+	__u8  handle[SEP_KEY_HANDLE_MAX];       /* in */
+};
+
+#define SEP_KEY_CANCEL   _IO(SEP_BIO_IOC_MAGIC, 0x25)
+#define SEP_KEY_SEAL     _IOWR(SEP_BIO_IOC_MAGIC, 0x26, struct sep_key_seal)
+#define SEP_KEY_UNSEAL   _IOWR(SEP_BIO_IOC_MAGIC, 0x27, struct sep_key_seal)
+
 /*
  * Test only, refused unless apple_sep.key_selftest=1, root: sign with a
  * biometric key under a deliberately unsuitable credential context, to show
@@ -327,6 +356,10 @@ struct sep_key_public {
  * 6 (handle ignored): make a throwaway key with the .userPresence list and
  * sign with a key-bag-secret context ('result') and with a context with no
  * match ('result2').
+ * 20 one touch: sign, then sign again in the same open context ('result2').
+ * 21 one touch: sign, then unseal a secret sealed to the key in the same
+ * context ('result2' 0 when it came back unchanged). 22 (no finger): unseal
+ * with no context ('result') and with an unsatisfied one ('result2').
  * 'result' is 0 when the enclave signed, else a negative errno.
  */
 struct sep_key_selftest {
