@@ -370,19 +370,12 @@ static u32 t6040_usb2_sig_want(struct t6040_usb2_phy *tphy)
 	return want & T6040_USB2_SIG_INIT;
 }
 
-static int t6040_usb2_power_on(struct phy *phy)
+/* The USB2 host sequence itself. A field that did not take leaves the PHY failed. */
+static int t6040_usb2_on_locked(struct t6040_usb2_phy *tphy)
 {
-	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
 	u32 status, ctl, sig, tune, mode, sig_want;
 
-	guard(mutex)(&tphy->lock);
-	if (tphy->shutdown_failed)
-		return -EIO;
-
-	if (tphy->mode != PHY_MODE_USB_HOST)
-		return -EINVAL;
-	if (tphy->powered)
-		return 0;
+	lockdep_assert_held(&tphy->lock);
 
 	/*
 	 * eUSB2 PHY init, in this exact order.
@@ -459,7 +452,6 @@ static int t6040_usb2_power_on(struct phy *phy)
 	    !(status & T6040_USB2_EVT_CTL_EN))
 		goto failed;
 
-	tphy->powered = true;
 	dev_info(tphy->dev, "USB2 host sequence complete\n");
 	return 0;
 failed:
@@ -467,21 +459,37 @@ failed:
 	return -EIO;
 }
 
+static int t6040_usb2_power_on(struct phy *phy)
+{
+	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
+	int ret;
+
+	guard(mutex)(&tphy->lock);
+	if (tphy->shutdown_failed)
+		return -EIO;
+
+	if (tphy->mode != PHY_MODE_USB_HOST)
+		return -EINVAL;
+	if (tphy->powered)
+		return 0;
+
+	ret = t6040_usb2_on_locked(tphy);
+	if (ret)
+		return ret;
+	tphy->powered = true;
+	return 0;
+}
+
 /*
  * Power the PHY down: port reset (held 5 ms), USBCTL mode 4, SIDDQ, PHY
  * reset, then gate the APB and reference clocks. The host controller must be
  * halted first; this is not a substitute for an xHCI halt.
  */
-static int t6040_usb2_power_off(struct phy *phy)
+static int t6040_usb2_off_locked(struct t6040_usb2_phy *tphy)
 {
-	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
 	u32 ctl, mode, tune;
 
-	guard(mutex)(&tphy->lock);
-	if (tphy->shutdown_failed)
-		return -EIO;
-	if (!tphy->powered)
-		return 0;
+	lockdep_assert_held(&tphy->lock);
 	tphy->shutdown_failed = true;
 
 	if (!(readl(tphy->usb2 + T6040_USB2_CTL) & T6040_USB2_CTL_PORT_RESET)) {
@@ -521,6 +529,23 @@ static int t6040_usb2_power_off(struct phy *phy)
 		     T6040_USB2_MISCTUNE_REFCLK_GATE_OFF))
 		return -EIO;
 	tphy->shutdown_failed = false;
+	return 0;
+}
+
+static int t6040_usb2_power_off(struct phy *phy)
+{
+	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
+	int ret;
+
+	guard(mutex)(&tphy->lock);
+	if (tphy->shutdown_failed)
+		return -EIO;
+	if (!tphy->powered)
+		return 0;
+
+	ret = t6040_usb2_off_locked(tphy);
+	if (ret)
+		return ret;
 	tphy->powered = false;
 	return 0;
 }
@@ -2888,6 +2913,36 @@ static int t6040_usb3_probe(struct t6040_usb2_phy *tphy, struct platform_device 
 	return 0;
 }
 
+/* The controller's reset, see t6040_usb2_reset_assert(). */
+static void t6040_dwc3_reset_hold_locked(struct t6040_usb2_phy *tphy)
+{
+	lockdep_assert_held(&tphy->lock);
+	t6040_usb2_clear32(tphy->pipehandler + T6040_PIPEHANDLER_AON_GEN,
+			   T6040_PIPEHANDLER_AON_GEN_DWC3_RESET_N);
+	t6040_usb2_set32(tphy->pipehandler + T6040_PIPEHANDLER_AON_GEN,
+			 T6040_PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
+}
+
+/* -EIO if the register does not read back released: the controller may not be there. */
+static int t6040_dwc3_reset_release_locked(struct t6040_usb2_phy *tphy)
+{
+	u32 value;
+
+	lockdep_assert_held(&tphy->lock);
+	t6040_usb2_clear32(tphy->pipehandler + T6040_PIPEHANDLER_AON_GEN,
+			   T6040_PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
+	t6040_usb2_set32(tphy->pipehandler + T6040_PIPEHANDLER_AON_GEN,
+			 T6040_PIPEHANDLER_AON_GEN_DWC3_RESET_N);
+
+	value = readl(tphy->pipehandler + T6040_PIPEHANDLER_AON_GEN);
+	if (value == U32_MAX ||
+	    (value & (T6040_PIPEHANDLER_AON_GEN_DWC3_RESET_N |
+		      T6040_PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN)) !=
+		    T6040_PIPEHANDLER_AON_GEN_DWC3_RESET_N)
+		return -EIO;
+	return 0;
+}
+
 /*
  * dwc3-apple asserts this at probe, deasserts it before dwc3_core_init()
  * (which then powers this PHY on), and asserts it again on stop. As in
@@ -2907,10 +2962,7 @@ static int t6040_usb2_reset_assert(struct reset_controller_dev *rcdev,
 		return ret;
 
 	guard(mutex)(&tphy->lock);
-	t6040_usb2_clear32(tphy->pipehandler + T6040_PIPEHANDLER_AON_GEN,
-			   T6040_PIPEHANDLER_AON_GEN_DWC3_RESET_N);
-	t6040_usb2_set32(tphy->pipehandler + T6040_PIPEHANDLER_AON_GEN,
-			 T6040_PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
+	t6040_dwc3_reset_hold_locked(tphy);
 	if (tphy->dwc3_running) {
 		tphy->dwc3_running = false;
 		pm_runtime_put(tphy->dev);
@@ -2923,7 +2975,6 @@ static int t6040_usb2_reset_deassert(struct reset_controller_dev *rcdev,
 {
 	struct t6040_usb2_phy *tphy =
 		container_of(rcdev, struct t6040_usb2_phy, rcdev);
-	u32 value;
 	int ret;
 
 	PM_RUNTIME_ACQUIRE(tphy->dev, pm);
@@ -2934,17 +2985,9 @@ static int t6040_usb2_reset_deassert(struct reset_controller_dev *rcdev,
 	guard(mutex)(&tphy->lock);
 	if (tphy->shutdown_failed)
 		return -EIO;
-	t6040_usb2_clear32(tphy->pipehandler + T6040_PIPEHANDLER_AON_GEN,
-			   T6040_PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
-	t6040_usb2_set32(tphy->pipehandler + T6040_PIPEHANDLER_AON_GEN,
-			 T6040_PIPEHANDLER_AON_GEN_DWC3_RESET_N);
-
-	value = readl(tphy->pipehandler + T6040_PIPEHANDLER_AON_GEN);
-	if (value == U32_MAX ||
-	    (value & (T6040_PIPEHANDLER_AON_GEN_DWC3_RESET_N |
-		      T6040_PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN)) !=
-		    T6040_PIPEHANDLER_AON_GEN_DWC3_RESET_N)
-		return -EIO;
+	ret = t6040_dwc3_reset_release_locked(tphy);
+	if (ret)
+		return ret;
 	if (!tphy->dwc3_running) {
 		pm_runtime_get_noresume(tphy->dev);
 		tphy->dwc3_running = true;
