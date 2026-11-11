@@ -220,6 +220,29 @@ config APPLE_SEP_KUNIT_TEST
 
 	  If unsure, say N.
 
+config APPLE_FVREAD
+	tristate "Read-only Apple-silicon APFS FileVault consumer"
+	default n
+	depends on APPLE_SEP
+	depends on BLK_INLINE_ENCRYPTION
+	depends on RUST
+	help
+	  Expose the narrow, read-only control path needed by an APFS reader to
+	  release an Apple-silicon container media key and a FileVault-off volume
+	  key through the SEP.  All storage is opened read-only and the interface
+	  has no write operation.  Unknown keybag layouts and FileVault-on volumes
+	  without an explicit credential are refused.
+
+	  This is an experimental consumer and is disabled by default.
+
+config APPLE_FVREAD_KUNIT_TEST
+	bool "KUnit tests for the Apple FVREAD keybag parser" if !KUNIT_ALL_TESTS
+	depends on APPLE_FVREAD && KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Test strict parsing of synthetic APFS media and container keybags.  The
+	  tests perform no storage I/O and do not contact the Secure Enclave.
+
 config APPLE_PMP
 	tristate "Apple Power Management Processor"
 	depends on ARCH_APPLE || COMPILE_TEST
