@@ -606,6 +606,20 @@ static HW_CFG_T6050: HwConfig = HwConfig {
     ap_leap: false,
 };
 
+/// J815 (MacBook Air 15-inch, M5): the same T8142 speaker stream with six
+/// amplifiers (ADT audio-speaker reg: 6 slots, mask 0x3f; 12 sense words,
+/// mask 0xfff), in ADT speaker-config order: left woofer 1, right woofer 1,
+/// left tweeter, right tweeter, left woofer 2, right woofer 2. Selected by
+/// `apple,speaker-amps = <6>` on the audio node.
+static HW_CFG_T8142_6AMP: HwConfig = HwConfig {
+    spkr_channels: 6,
+    sense_channels: 12,
+    sense_formats: FMTBIT_S16_LE,
+    realign_sense: true,
+    ap_mca: true,
+    ap_leap: true,
+};
+
 /// # Safety
 ///
 /// `substream` must be live and belong to one of this component's links.
@@ -1446,7 +1460,23 @@ impl platform::Driver for T8152AopAudioDriver {
         info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let dev = ARef::<device::Device>::from(pdev.as_ref());
-        let cfg: &'static HwConfig = info.copied().unwrap_or(&HW_CFG_T8152);
+        let mut cfg: &'static HwConfig = info.copied().unwrap_or(&HW_CFG_T8152);
+        // A machine whose speaker stream has more amplifiers than its SoC's
+        // default says so in its DT. Only shapes this driver knows are
+        // accepted: the firmware's stream must match the PCM exactly.
+        if let Some(amps) = dev
+            .fwnode()
+            .and_then(|n| n.property_read::<u32>(c_str!("apple,speaker-amps")).optional())
+        {
+            cfg = match (amps, ptr::eq(cfg, &HW_CFG_T8142)) {
+                (4, true) => &HW_CFG_T8142,
+                (6, true) => &HW_CFG_T8142_6AMP,
+                _ => {
+                    dev_err!(dev, "unsupported apple,speaker-amps {}\n", amps);
+                    return Err(EINVAL);
+                }
+            };
+        }
         // SAFETY: this is a service device the AOP core registered.
         let adata = unsafe { <dyn AOP>::from_child(pdev.as_ref()) }?;
         // SAFETY: the AOP core sets the child's platform data to its EPIC service.
@@ -1528,7 +1558,12 @@ impl platform::Driver for T8152AopAudioDriver {
         let mic = if !has_mic {
             None
         } else {
-            match MicCard::new(&data) {
+            // Initialize the shared output service before exposing HPAI.
+            // This is standby only: no DMA, running state or codec unmute.
+            // No userspace stream can race this before card registration.
+            match data.set_power(&data.cout, POWER_STATE_PW0)
+                .and_then(|_| MicCard::new(&data))
+            {
                 Ok(card) => Some(card),
                 Err(e) => {
                     dev_err!(dev, "microphone card: {:?}\n", e);
