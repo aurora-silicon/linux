@@ -53,6 +53,7 @@ def mutations(flag, names, base, expect=KILL):
 
 # test file -> [(arguments, expectation)]. '{out}' is a fresh directory.
 ASAHI_TESTS = {
+    'j613-mtp-s2idle-tests.py': [([], PASS)],
     # 11eccbedc3ed writes frames without a transport-wide lock.
     'mtp-tx-frame-tests.py': [(out(), PASS),
                               (out() + ['--old-transport', '11eccbedc3ed'], PASS)],
