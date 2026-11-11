@@ -87,9 +87,10 @@
 
 #ifdef APPLE_USE_PMP
 /*
- * The video encoder, AVD and the JPEG codecs also send the PMP a performance
- * request while they are powered. The bootloader fills each entry's
- * SOC-DEV-DVFS slot and levels from this machine's ADT (apple,adt-dvfs).
+ * The video encoder, AVD, the JPEG codecs, the scaler and the ProRes codec
+ * also send the PMP a performance request while they are powered. The
+ * bootloader fills each entry's SOC-DEV-DVFS slot and levels from this
+ * machine's ADT (apple,adt-dvfs).
  */
 &pmp_report_venc_sys {
 	apple,adt-dvfs;
@@ -102,6 +103,16 @@
 
 &pmp_report_jpg {
 	apple,adt-dvfs;
+};
+
+&pmp_report_msr0 {
+	apple,adt-dvfs;
+	status = "okay";
+};
+
+&pmp_report_scodec {
+	apple,adt-dvfs;
+	status = "okay";
 };
 
 &ave {
@@ -162,6 +173,17 @@
 &apr0 {
 	status = "okay";
 };
+
+#ifdef APPLE_USE_PMP
+/* The scaler and the ProRes codec request their PMP performance level. */
+&scaler0 {
+	power-domains = <&pmp_report_msr0>, <&ps_msr0_ase_core>;
+};
+
+&apr0 {
+	power-domains = <&pmp_report_scodec>;
+};
+#endif
 
 /* Both JPEG encoders are SoC blocks with no board wiring. */
 &jpeg0_dart {
