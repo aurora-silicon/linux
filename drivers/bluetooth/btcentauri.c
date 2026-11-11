@@ -10,11 +10,13 @@
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
+#include <linux/etherdevice.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/pci.h>
+#include <linux/property.h>
 #include <linux/random.h>
 #include <linux/seq_file.h>
 #include <linux/sizes.h>
@@ -54,6 +56,22 @@ MODULE_PARM_DESC(arm_auxiliary_rings, "Diagnostic: arm remaining native Beta res
 static bool native_startup;
 module_param(native_startup, bool, 0444);
 MODULE_PARM_DESC(native_startup, "Diagnostic: program a temporary address, InitDone and random seed before the first HCI reset");
+
+static bool factory_address = true;
+module_param(factory_address, bool, 0444);
+MODULE_PARM_DESC(factory_address, "Program the loader-provided local-bd-address before the first HCI reset");
+
+static bool fixup_adv_phy = true;
+module_param(fixup_adv_phy, bool, 0444);
+MODULE_PARM_DESC(fixup_adv_phy, "Mask the firmware's extra bits in LE extended advertising report PHYs");
+
+static bool scan_dup_filter;
+module_param(scan_dup_filter, bool, 0444);
+MODULE_PARM_DESC(scan_dup_filter, "Let the controller drop duplicate LE advertising reports (off: every report reaches the host)");
+
+static bool accept_list;
+module_param(accept_list, bool, 0444);
+MODULE_PARM_DESC(accept_list, "Let the controller filter LE scans by its accept list (off: report its size as 0, the host filters)");
 
 static bool enable_acl;
 module_param(enable_acl, bool, 0444);
@@ -118,6 +136,7 @@ struct cen_bt {
 	u32 proprietary_features, hrb_commands, hrb_status_events;
 	u32 hrb_connection_events;
 	u8 hrb_last_link_type;
+	u32 scan_dup_rewritten, accept_list_hidden;
 };
 
 static u16 cen_tail(struct cen_bt *bt, u16 ring)
@@ -489,6 +508,26 @@ static void cen_normalize_ext_adv(struct sk_buff *skb)
 	}
 }
 
+/*
+ * When a paired LE device is put on the accept list and hci_sync scans
+ * passively with filter policy 1, the N1 sends no advertising report and no
+ * other event at all, so the connection is never made. Unless accept_list is
+ * set, report an accept list of size 0: hci_update_accept_list_sync() then
+ * finds no room and scans with filter policy 0, and the host matches
+ * pend_le_conns itself, as for a controller whose list is full.
+ */
+static void cen_fixup_event(struct cen_bt *bt, struct sk_buff *skb)
+{
+	if (skb->len >= 7 && skb->data[0] == HCI_EV_CMD_COMPLETE &&
+	    get_unaligned_le16(skb->data + 3) == HCI_OP_LE_READ_ACCEPT_LIST_SIZE &&
+	    !skb->data[5] && !accept_list) {
+		bt_dev_info(bt->hdev, "LE accept list (%u entries) not used; the host filters scans",
+			    skb->data[6]);
+		skb->data[6] = 0;
+		bt->accept_list_hidden++;
+	}
+}
+
 static void cen_poll(struct work_struct *work)
 {
 	struct cen_bt *bt = container_of(to_delayed_work(work), struct cen_bt, poll);
@@ -573,6 +612,7 @@ static void cen_poll(struct work_struct *work)
 				bt->hrb_connection_events++;
 			}
 			cen_normalize_ext_adv(skb);
+			cen_fixup_event(bt, skb);
 			hci_skb_pkt_type(skb) = HCI_EVENT_PKT;
 			hdev->stat.byte_rx += length;
 			hci_recv_frame(hdev, skb);
@@ -673,24 +713,57 @@ static int cen_hci_post_init(struct hci_dev *hdev)
 	return 0;
 }
 
+/*
+ * The factory address in network byte order, for WriteBdAddr, from the
+ * standard local-bd-address (least significant byte first; the loader fills
+ * it from the ADT for the bluetooth0 alias). As in btcentauri_t6050.c.
+ */
+static int cen_bt_address(struct device *dev, u8 address[6])
+{
+	u8 bd[6];
+	int i, ret;
+
+	if (device_property_count_u8(dev, "local-bd-address") != 6)
+		return -ENOENT;
+	ret = device_property_read_u8_array(dev, "local-bd-address", bd, sizeof(bd));
+	if (ret)
+		return ret;
+	for (i = 0; i < 6; i++)
+		address[i] = bd[5 - i];
+	if (is_zero_ether_addr(address) || is_broadcast_ether_addr(address))
+		return -EINVAL;
+	return 0;
+}
+
 static int cen_hci_setup(struct hci_dev *hdev)
 {
 	struct cen_bt *bt = hci_get_drvdata(hdev);
 	u8 address[6], init_done[16], seed[24];
+	bool factory;
 	int ret;
 
-	if (!native_startup)
+	/*
+	 * Without WriteBdAddr the controller reports BD_ADDR 00:00:00:00:00:00
+	 * and bluetoothd ignores it ("No Bluetooth address for index 0").
+	 */
+	factory = factory_address && !cen_bt_address(&bt->pdev->dev, address);
+	if (factory_address && !factory)
+		bt_dev_info(hdev, "No factory local-bd-address from the loader");
+	if (!factory && !native_startup)
 		return 0;
 
 	/* Native PROXIMA initialization starts with these three commands, then
 	 * HCI Reset. The core calls setup before its ordinary reset/init sequence.
-	 * Address provisioning is still diagnostic: use a temporary locally
-	 * administered address, in native WriteBdAddr display/network byte order.
+	 * The address is the factory one when the loader provided it, else
+	 * (diagnostic) a temporary locally administered address, in native
+	 * WriteBdAddr display/network byte order.
 	 */
-	ret = get_random_bytes_wait(address, sizeof(address));
-	if (ret)
-		return ret;
-	address[0] = (address[0] & 0xfc) | 0x02;
+	if (!factory) {
+		ret = get_random_bytes_wait(address, sizeof(address));
+		if (ret)
+			return ret;
+		address[0] = (address[0] & 0xfc) | 0x02;
+	}
 	get_random_bytes(seed, sizeof(seed));
 	memset(init_done, 0xff, sizeof(init_done));
 	ret = cen_vendor_command(hdev, 0xfc06, address, sizeof(address));
@@ -710,7 +783,8 @@ out:
 		bt_dev_err(hdev, "Native startup stopped after %u commands: %d",
 			   bt->native_startup_steps, ret);
 	else
-		bt_dev_info(hdev, "Native startup accepted; temporary diagnostic address in use");
+		bt_dev_info(hdev, "Native startup accepted; %s address in use",
+			    factory ? "factory" : "temporary diagnostic");
 	return ret;
 }
 
@@ -780,6 +854,22 @@ static int cen_hci_send(struct hci_dev *hdev, struct sk_buff *skb)
 		}
 	}
 	mutex_lock(&bt->lock);
+	/*
+	 * The N1 does not reset its duplicate filter when scanning is enabled
+	 * again. A discovery shortly after another one reports only addresses
+	 * not seen before, and so does the passive scan hci_sync starts for a
+	 * pending LE connection: a device found in discovery never matches
+	 * pend_le_conns and no LE Create Connection is sent. Unless
+	 * scan_dup_filter is set, enable scans with Filter_Duplicates = 0; the
+	 * host copes with repeated reports.
+	 */
+	if (hci_skb_pkt_type(skb) == HCI_COMMAND_PKT && skb->len >= 5 && !scan_dup_filter &&
+	    (get_unaligned_le16(skb->data) == HCI_OP_LE_SET_EXT_SCAN_ENABLE ||
+	     get_unaligned_le16(skb->data) == HCI_OP_LE_SET_SCAN_ENABLE) &&
+	    skb->data[3] && skb->data[4] && !skb_ensure_writable(skb, 5)) {
+		skb->data[4] = 0;
+		bt->scan_dup_rewritten++;
+	}
 	if (!bt->running)
 		ret = -ENETDOWN;
 	else if (skb_queue_len(queue) >= 64)
@@ -836,6 +926,10 @@ static int cen_status_show(struct seq_file *s, void *unused)
 		   bt->hrb_status_events, bt->hrb_status_pending);
 	seq_printf(s, "hrb_connection_events=%u hrb_last_link_type=0x%02x\n",
 		   bt->hrb_connection_events, bt->hrb_last_link_type);
+	seq_printf(s, "accept_list=%u accept_list_hidden=%u\n", accept_list,
+		   bt->accept_list_hidden);
+	seq_printf(s, "scan_dup_filter=%u scan_dup_rewritten=%u\n", scan_dup_filter,
+		   bt->scan_dup_rewritten);
 	seq_printf(s, "acl_enabled=%u acl_tx=%u acl_rx=%u acl_queued=%u le_queued=%u\n",
 		   enable_acl, bt->hdev->stat.acl_tx, bt->hdev->stat.acl_rx,
 		   skb_queue_len(&bt->acl_txq), skb_queue_len(&bt->le_txq));
@@ -901,7 +995,8 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	struct hci_dev *hdev;
 	int ret;
 
-	if (!(of_machine_is_compatible("apple,j813") || of_machine_is_compatible("apple,j873g")) ||
+	if (!(of_machine_is_compatible("apple,j813") || of_machine_is_compatible("apple,j815") ||
+	      of_machine_is_compatible("apple,j873g")) ||
 	    PCI_FUNC(pdev->devfn) != 2)
 		return -ENODEV;
 	bt = devm_kzalloc(&pdev->dev, sizeof(*bt), GFP_KERNEL);
@@ -962,6 +1057,14 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	hdev->send = cen_hci_send;
 	hdev->setup = cen_hci_setup;
 	hdev->post_init = cen_hci_post_init;
+	/*
+	 * The N1 sets bits above the PHY value in LE Extended Advertising
+	 * Reports, as on T6050 (btcentauri_t6050.c). Unmasked, no PHY matches in
+	 * hci_le_ext_create_conn_sync(): LE Extended Create Connection goes out
+	 * with no initiating PHY and LE devices never connect.
+	 */
+	if (fixup_adv_phy)
+		hci_set_quirk(hdev, HCI_QUIRK_FIXUP_LE_EXT_ADV_REPORT_PHY);
 	SET_HCIDEV_DEV(hdev, &pdev->dev);
 	hci_set_drvdata(hdev, bt);
 	pci_set_drvdata(pdev, bt);
