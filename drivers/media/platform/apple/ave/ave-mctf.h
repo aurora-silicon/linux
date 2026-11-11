@@ -22,16 +22,15 @@
 
 /*
  * Per-frame filter level, written raw to Process +0xad68. -1 (0xffffffff)
- * means "use the session strength"; the camera daemon on macOS overrides it
- * with 16 for the first frames, then 12 in room light and 9 in the dark.
+ * means "use the session strength", as the VideoToolbox filter sends it.
  */
 #define V4L2_CID_APPLE_AVE_MCTF_LEVEL	(V4L2_CID_USER_BASE + 0x1240)
 #define AVE_MCTF_LEVEL_MIN	-1
 #define AVE_MCTF_LEVEL_MAX	31
 #define AVE_MCTF_LEVEL_DEFAULT	-1
 /*
- * Session strength, Start +0x26f8: round(24 x strength) for strength 0..1.
- * The camera daemon uses 16. Takes effect at the next STREAMON.
+ * Session strength, Start +0x26f8: round(24 x strength) for the
+ * VideoToolbox filter strength 0..1. Takes effect at the next STREAMON.
  */
 #define V4L2_CID_APPLE_AVE_MCTF_STRENGTH	(V4L2_CID_USER_BASE + 0x1241)
 #define AVE_MCTF_STRENGTH_MAX	24

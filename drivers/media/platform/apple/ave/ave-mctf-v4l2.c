@@ -3,8 +3,9 @@
  * Apple AVE MCTF: V4L2 memory-to-memory temporal noise filter
  *
  * One NV12 1920x1080 picture in on OUTPUT, the filtered picture out on
- * CAPTURE, with the OUTPUT timestamp. The firmware keeps the temporal
- * history itself; a session runs from STREAMON to STREAMOFF, so the next
+ * CAPTURE, with the OUTPUT timestamp; ave-mctf.c has the command order.
+ * The firmware keeps the temporal history itself; a session runs from
+ * STREAMON to STREAMOFF, so the next
  * STREAMON starts again with no history. The strength control applies at
  * STREAMON; the per-frame level control (-1: the strength) is
  * written into every frame.
@@ -318,6 +319,17 @@ static void ave_mctf_deliver(struct ave_ctx *ctx)
 		struct ave_slot *s = &sess->slot[slot];
 		enum vb2_buffer_state state = VB2_BUF_STATE_DONE;
 
+		if (!s->dst) {	/* the companion command: nothing to deliver */
+			if (s->status)
+				dev_warn_ratelimited(ctx->ave->dev,
+						     "MCTF slot %u: firmware status %#x\n",
+						     slot, s->status);
+			sess->done_head = (sess->done_head + 1) % AVE_MAX_SLOTS;
+			sess->done_count--;
+			atomic_dec(&ctx->ready);
+			s->done = false;
+			continue;
+		}
 		if (s->status) {
 			dev_warn_ratelimited(ctx->ave->dev,
 					     "MCTF frame %u: firmware status %#x\n",
@@ -347,27 +359,43 @@ static void ave_mctf_deliver(struct ave_ctx *ctx)
 	}
 }
 
-/* Send OUTPUT frames while slots and CAPTURE buffers allow. Caller holds hw_lock. */
+static bool ave_mctf_slot_free(const struct ave_session *sess, unsigned int slot)
+{
+	return !sess->slot[slot].busy && !sess->slot[slot].done;
+}
+
+/*
+ * Send the next OUTPUT frame once both slots are free: frame 0 to slot 0,
+ * every later frame as the previous picture again to slot 0 and the new one
+ * to slot 1 (delivered), then a Complete. Caller holds hw_lock.
+ */
 static int ave_mctf_submit(struct ave_ctx *ctx)
 {
 	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
 	struct ave_session *sess = ctx->sess;
-	int slot, ret = 0;
+	struct vb2_v4l2_buffer *src, *dst;
+	bool first;
+	int ret;
 
-	while (!ret && v4l2_m2m_num_src_bufs_ready(m2m) &&
-	       v4l2_m2m_num_dst_bufs_ready(m2m) &&
-	       (slot = ave_sess_free_slot(sess)) >= 0) {
-		struct vb2_v4l2_buffer *src = v4l2_m2m_src_buf_remove(m2m);
-		struct vb2_v4l2_buffer *dst = v4l2_m2m_dst_buf_remove(m2m);
-
-		src->sequence = ctx->src_sequence++;
-		ret = ave_mctf_cmd_process(ctx, slot, src, dst);
-		if (ret) {
+	if (!v4l2_m2m_num_src_bufs_ready(m2m) || !v4l2_m2m_num_dst_bufs_ready(m2m) ||
+	    !ave_mctf_slot_free(sess, 0) || !ave_mctf_slot_free(sess, 1))
+		return 0;
+	src = v4l2_m2m_src_buf_remove(m2m);
+	dst = v4l2_m2m_dst_buf_remove(m2m);
+	src->sequence = ctx->src_sequence++;
+	first = !sess->frames;
+	ret = ave_mctf_cmd_process(ctx, 0, src, first ? dst : NULL, !first);
+	if (!ret && !first)
+		ret = ave_mctf_cmd_process(ctx, 1, src, dst, false);
+	if (ret) {
+		/* Nothing of this frame is pinned unless its delivering command went out. */
+		if (!(first ? sess->slot[0].dst == dst : sess->slot[1].dst == dst)) {
 			v4l2_m2m_buf_done(src, VB2_BUF_STATE_ERROR);
 			v4l2_m2m_buf_done(dst, VB2_BUF_STATE_ERROR);
 		}
+		return ret;
 	}
-	return ret;
+	return ave_cmd_complete(ctx, 1);
 }
 
 static void ave_mctf_run_work(struct work_struct *work)

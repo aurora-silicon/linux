@@ -4,20 +4,18 @@
  *
  * The Start and Process images are data: the constant words macOS sets in
  * every MCTF session of the MacBook Neo (firmware TEXT CRC 69c54454, macOS
- * 26.6.2, Photo Booth at 1920x1080 in six sessions from dark to room light),
- * the surfaces the firmware owns, and the few words that change per frame.
- * Nothing in Start depends on the scene; Process changes only in its
- * header, the input and output pictures, the slot and its two surfaces,
- * the first-frame word, the frame index and the filter level.
+ * 26.6.2), the surfaces the firmware owns, and the few words that change
+ * per frame. The session is the one the public VideoToolbox temporal noise
+ * filter opens at 1920x1080 (one past and two next frames): the camera
+ * daemon's session differs in four Start words and the Process header
+ * argument, and with it the engine returns every picture unfiltered.
  *
- * The client filters compressed surfaces: four planes per picture (Y data,
- * Y header, CbCr data, CbCr header). The camera hands macOS such surfaces;
- * here the input and output surfaces are driver-owned, five inputs used in
- * turn and one output per slot, as macOS does. The Neo answers every
- * Process in this form (the earlier linear descriptors made it hang, then
- * fault on header planes at address 0). The slot's Start surfaces at
- * +0xac88/+0xac90 are firmware-owned; a user picture copied to +0xac88
- * came back untouched, so it is not the picture path.
+ * The filter looks ahead, so each picture is sent twice: frame 0 goes to
+ * slot 0 alone; for every later frame, slot 0 gets the previous picture
+ * again and slot 1 the new one, then a Complete makes the firmware answer
+ * both. Slot 1's output is the filtered new picture, slot 0's writes the
+ * firmware's own copy and is not delivered. Input surfaces are
+ * driver-owned, five used in turn; each slot has one output surface.
  *
  * The surfaces are Apple's lossless compressed 4:2:0 form (ave-cmp420.c).
  * The driver writes each NV12 input picture as raw tiles and reads the
@@ -41,10 +39,9 @@
 /* Start words other than the header and the surface addresses */
 static const struct ave_mctf_word ave_mctf_start_25g83[] = {
 	/* Session configuration */
-	{ 0x50, 0x12c000 }, { 0x78, 0x200 }, { 0x7c, 0x1 },
-	{ 0x80, 0x50 }, { 0x94, 0x3c0 }, { 0x220, 0x1e },
-	{ 0x338, 0x1 }, { 0x33c, 0xffffffff }, { 0x368, 0x780 },
-	{ 0x36c, 0x438 }, { 0x370, 0x2000002 },
+	{ 0x50, 0x12c000 }, { 0x78, 0x200 }, { 0x94, 0x3c0 },
+	{ 0x220, 0x1e }, { 0x338, 0x1 }, { 0x33c, 0xffffffff },
+	{ 0x368, 0x780 }, { 0x36c, 0x438 }, { 0x370, 0x2 },
 	/* Sizes and strides of the internal surfaces */
 	{ 0x398, 0x1fe000 }, { 0x3a8, 0x20000 }, { 0x3b8, 0x1fe000 },
 	{ 0x3c8, 0x20000 }, { 0x3d8, 0x1fe000 }, { 0x3e8, 0x20000 },
@@ -52,7 +49,11 @@ static const struct ave_mctf_word ave_mctf_start_25g83[] = {
 	{ 0x838, 0x3fc00 }, { 0x858, 0x3fc00 }, { 0xc18, 0xa4000 },
 	{ 0xc28, 0xa4000 }, { 0xc38, 0xa4000 }, { 0xcb8, 0x4c000 },
 	{ 0xcc8, 0x4c000 }, { 0xcd8, 0x4c000 }, { 0xd58, 0x2f8000 },
-	{ 0xd68, 0x2f8000 }, { 0xf58, 0xc000 }, { 0xf68, 0xc000 },
+	{ 0xd68, 0x2f8000 }, { 0xd78, 0x2f8000 }, { 0xd88, 0x2f8000 },
+	{ 0xd98, 0x2f8000 }, { 0xda8, 0x2f8000 }, { 0xdb8, 0x2f8000 },
+	{ 0xdc8, 0x2f8000 }, { 0xf58, 0xc000 }, { 0xf68, 0xc000 },
+	{ 0xf78, 0xc000 }, { 0xf88, 0xc000 }, { 0xf98, 0xc000 },
+	{ 0xfa8, 0xc000 }, { 0xfb8, 0xc000 }, { 0xfc8, 0xc000 },
 	{ 0x1138, 0x20000 }, { 0x1148, 0x20000 }, { 0x1158, 0x20000 },
 	{ 0x1358, 0x78000 }, { 0x1398, 0xc000 }, { 0x13d8, 0x4000 },
 	{ 0x1418, 0x23dc00 }, { 0x1428, 0x480 }, { 0x1438, 0x23dc00 },
@@ -70,7 +71,7 @@ static const struct ave_mctf_word ave_mctf_start_25g83[] = {
 	{ 0x2580, 0x1000000 }, { 0x2584, 0x101 }, { 0x2594, 0x1 },
 	{ 0x2598, 0x8 }, { 0x259c, 0x2 }, { 0x25a4, 0x101 },
 	{ 0x25d4, 0x1 }, { 0x26e8, 0x3000000 }, { 0x26f8, 0x10 },
-	{ 0x26fc, 0xffffffff }, { 0x2700, 0x1 }, { 0x2704, 0x1 },
+	{ 0x26fc, 0xffffffff }, { 0x2700, 0x2 }, { 0x2704, 0x1 },
 	{ 0x2738, 0x10 }, { 0x5aac, 0x1 }, { 0x7558, 0x100 },
 	{ 0xb774, 0x1 },
 	/* Reference structure: delta POCs -1 .. -4 */
@@ -109,7 +110,11 @@ static const struct ave_mctf_surface ave_mctf_surfaces_25g83[] = {
 	S(0x850, 0x44000), ALIAS(0x860, 0x850), S(0xc10, 0xa8000),
 	S(0xc20, 0xa8000), S(0xc30, 0xa8000), S(0xcb0, 0x50000),
 	S(0xcc0, 0x50000), S(0xcd0, 0x50000), S(0xd50, 0x2fc000),
-	S(0xd60, 0x2fc000), S(0xf50, 0x10000), S(0xf60, 0x10000),
+	S(0xd60, 0x2fc000), S(0xd70, 0x2fc000), S(0xd80, 0x2fc000),
+	S(0xd90, 0x2fc000), S(0xda0, 0x2fc000), S(0xdb0, 0x2fc000),
+	S(0xdc0, 0x2fc000), S(0xf50, 0x10000), S(0xf60, 0x10000),
+	S(0xf70, 0x10000), S(0xf80, 0x10000), S(0xf90, 0x10000),
+	S(0xfa0, 0x10000), S(0xfb0, 0x10000), S(0xfc0, 0x10000),
 	S(0x1130, 0x24000), S(0x1140, 0x24000), S(0x1150, 0x24000),
 	S(0x1350, 0x7c000), S(0x1390, 0x10000), S(0x13d0, 0x8000),
 	S(0x1410, 0x23dc00), S(0x1420, 0x8000), S(0x1430, 0x23dc00),
@@ -150,7 +155,7 @@ static const struct ave_mctf_word ave_mctf_process_25g83[] = {
 		.text_crc = (crc),					\
 		.start_bytes = 0x13f28, .process_bytes = 0xb1c0,	\
 		.unit = AVE_MCTF_WORK_TYPE, .arg1 = 0x3c0,		\
-		.frame_arg0 = 0x50,					\
+		.frame_arg0 = 0,					\
 		.subtype = 0x15, .slots = AVE_MCTF_SLOTS,		\
 		.start_words = ave_mctf_start_25g83,			\
 		.n_start_words = ARRAY_SIZE(ave_mctf_start_25g83),	\
@@ -385,10 +390,14 @@ static int ave_mctf_put_picture(struct ave_ctx *ctx, struct vb2_v4l2_buffer *src
 	return 0;
 }
 
-/* Filter @src into @dst in @slot. Caller holds hw_lock. */
+/*
+ * Filter @src into @dst in @slot. With @same_input, the picture of the last
+ * command goes again (its surface still holds it). A NULL @dst sends the
+ * companion command whose output is not delivered. Caller holds hw_lock.
+ */
 int ave_mctf_cmd_process(struct ave_ctx *ctx, unsigned int slot,
 			 struct vb2_v4l2_buffer *src,
-			 struct vb2_v4l2_buffer *dst)
+			 struct vb2_v4l2_buffer *dst, bool same_input)
 {
 	struct ave_dev *ave = ctx->ave;
 	struct ave_session *sess = ctx->sess;
@@ -408,10 +417,15 @@ int ave_mctf_cmd_process(struct ave_ctx *ctx, unsigned int slot,
 
 	if (!l || slot >= sess->p.slots)
 		return -EINVAL;
-	ret = ave_mctf_put_picture(ctx, src, sess->frames % AVE_MCTF_INPUTS);
-	if (ret)
-		return ret;
-	s->mctf_input = sess->frames % AVE_MCTF_INPUTS;
+	if (same_input) {
+		s->mctf_input = sess->mctf_last_input;
+	} else {
+		ret = ave_mctf_put_picture(ctx, src, sess->frames % AVE_MCTF_INPUTS);
+		if (ret)
+			return ret;
+		s->mctf_input = sess->frames % AVE_MCTF_INPUTS;
+		sess->mctf_last_input = s->mctf_input;
+	}
 	f.in = sess->mctf_in[s->mctf_input].dma;
 	f.out = sess->mctf_out[slot].dma;
 	ret = ave_ipc_wait_ack(ave, buf);
@@ -431,8 +445,8 @@ int ave_mctf_cmd_process(struct ave_ctx *ctx, unsigned int slot,
 				      l->process_bytes);
 
 	/* Pin both pictures before publishing the command. */
-	s->input_mem = ave_vb2_get(&src->vb2_buf);
-	s->output_mem = ave_vb2_get(&dst->vb2_buf);
+	s->input_mem = dst ? ave_vb2_get(&src->vb2_buf) : NULL;
+	s->output_mem = dst ? ave_vb2_get(&dst->vb2_buf) : NULL;
 	ret = ave_ipc_submit(ave, buf, l->process_bytes,
 			     ave->layout->process_timeout_us, false);
 	dev_dbg(ave->dev,
@@ -440,7 +454,7 @@ int ave_mctf_cmd_process(struct ave_ctx *ctx, unsigned int slot,
 		f.frame, slot, sess->token, f.level, &f.in, &f.out, ret);
 	if (ret)
 		return ret;
-	s->src = src;
+	s->src = dst ? src : NULL;
 	s->dst = dst;
 	s->busy = true;
 	s->status = 0;

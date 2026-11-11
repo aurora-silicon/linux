@@ -212,7 +212,7 @@ struct ave_variant {
 };
 
 /* Start surfaces of an MCTF session, aliases included */
-#define AVE_MCTF_BUFS 72
+#define AVE_MCTF_BUFS 96
 /* MCTF picture surfaces: inputs used in turn, one output per slot */
 #define AVE_MCTF_IN_BUFS 5
 #define AVE_MCTF_OUT_BUFS 2
@@ -438,6 +438,7 @@ struct ave_session {
 	struct ave_cmp420_geom mctf_geom;
 	u8 *mctf_surf, *mctf_lin;
 	bool mctf_borrowed; /* mctf_buf/in/out are the device pool's */
+	unsigned int mctf_last_input; /* input surface of the last new picture */
 	/* Header words; zero means the encoder's values */
 	u32 unit, arg1, frame_arg0;
 	u8 done_fifo[AVE_MAX_SLOTS];
@@ -638,7 +639,7 @@ int ave_mctf_check_build(struct ave_dev *ave);
 int ave_mctf_cmd_start(struct ave_ctx *ctx);
 int ave_mctf_cmd_process(struct ave_ctx *ctx, unsigned int slot,
 			 struct vb2_v4l2_buffer *src,
-			 struct vb2_v4l2_buffer *dst);
+			 struct vb2_v4l2_buffer *dst, bool same_input);
 int ave_mctf_register(struct ave_dev *ave);
 void ave_mctf_unregister(struct ave_dev *ave);
 
