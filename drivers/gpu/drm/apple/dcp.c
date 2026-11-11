@@ -1931,7 +1931,13 @@ static bool dcp_rtk_syslog_mode_set(void *cookie, const char *context, const cha
 	return false;
 }
 
+static bool dcp_rtk_syslog_is_debug(void *cookie, const char *context, const char *message)
+{
+	return dcp_h17p_syslog_is_debug(context, message);
+}
+
 static struct apple_rtkit_ops rtkit_ops = {
+	.syslog_is_debug = dcp_rtk_syslog_is_debug,
 	.crashed = dcp_rtk_crashed,
 	.recv_message = dcp_recv_msg,
 	.recv_message_timed = dcp_recv_msg_timed,
@@ -1947,11 +1953,6 @@ static const struct apple_rtkit_ops link_report_rtkit_ops = {
 	.shmem_setup = dcp_rtk_shmem_setup,
 	.shmem_destroy = dcp_rtk_shmem_destroy,
 };
-
-static bool dcp_rtk_syslog_is_debug(void *cookie, const char *context, const char *message)
-{
-	return dcp_h17p_syslog_is_debug(context, message);
-}
 
 static const struct apple_rtkit_ops external_h17p_rtkit_ops = {
 	.flags = APPLE_RTKIT_COPROC_PLACES_BUFFERS,
