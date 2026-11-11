@@ -17,6 +17,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/soc/apple/clpc.h>
 #include <linux/soc/apple/pmgr-pwrstate.h>
+#include <linux/soc/apple/pmp-report.h>
 #include <linux/scatterlist.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
@@ -1661,10 +1662,41 @@ refuse:
  * path. A failure before RUN leaves the device refused; after RUN it is held
  * until reboot, as for a stage written to debugfs.
  */
+/* How long bring-up waits for the PMP before it starts the firmware anyway. */
+#define ANE_H16_PMP_WAIT_MS 10000
+
+/*
+ * On the J616s, Linux starts the PMP itself, about a second before the ANE
+ * probes, and its firmware takes about another second to come up. A H16 CPU
+ * released while it does is stopped part way through its startup on about
+ * one boot in six (the wrapper control word reads 0, RUN cleared): 0 of 22
+ * when the release waited until the PMP ran. Wait for it, outside every lock.
+ * The stop detection and restart stay as the fallback.
+ */
+static void ane_h16_wait_pmp(struct ane_h16_device *h)
+{
+	const char *compatible = h->boot.soc->pmp_report;
+	struct device_node *np;
+	int ret;
+
+	if (!compatible)
+		return;
+	np = of_find_compatible_node(NULL, NULL, compatible);
+	if (!np)
+		return;
+	ret = apple_pmp_report_wait_running(np, ANE_H16_PMP_WAIT_MS);
+	of_node_put(np);
+	if (ret && ret != -ENODEV)
+		dev_warn(h->dev, "H16 ANE: PMP not running (%d); starting the firmware anyway\n",
+			 ret);
+}
+
 static void ane_h16_start_work(struct work_struct *work)
 {
 	struct ane_h16_device *h = container_of(work, struct ane_h16_device, start);
 	unsigned int flags;
+
+	ane_h16_wait_pmp(h);
 
 	/* Never start the firmware in the middle of a system sleep transition. */
 	flags = lock_system_sleep();
