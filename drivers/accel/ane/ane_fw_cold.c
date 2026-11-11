@@ -870,9 +870,10 @@ static int ane_fw_firmware_stop(struct ane_fw_backend *b)
 	ret = ane_fw_transport_settle(t, 2 * NSEC_PER_MSEC, 20 * NSEC_PER_MSEC);
 	if (ret < 0)
 		return ret;
-	ret = ane_fw_exclave_mode_stop(b);
-	if (ret)
-		return ret;
+	/*
+	 * No EXCLAVE_MODE_STOP here: macOS's AP never rings that channel around its sleep
+	 * (recorded), and after it this firmware doesn't answer the stop.
+	 */
 	/* The host flags as macOS sets them before its stop: SCRATCH14 = 0, SCRATCH16 = 1. */
 	ane_wr32(b, 0, b->engine + b->soc->scratch + 0x38);
 	ane_rd32(b, b->engine + b->soc->scratch + 0x3c);
