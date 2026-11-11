@@ -7,6 +7,7 @@ on:
       - 'rust/**'
       - 'tools/aurora-bindgen/**'
       - 'drivers/soc/apple/**'
+      - 'drivers/pmdomain/apple/pmp-report.c'
       - 'include/uapi/linux/apple-sep.h'
       - 'tools/aurora-sep/**'
       - '.github/workflows/sep-source.yml'
