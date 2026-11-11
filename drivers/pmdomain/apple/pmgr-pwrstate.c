@@ -529,6 +529,17 @@ static int apple_pmgr_ps_resume_early(struct device *dev)
  * whose target is still on was raised by a coprocessor's firmware: on T8140 the AOP
  * raises audio domains of its own in the always-on PMGR, and the sleep keeps them.
  */
+/* T8140's always-on PMGR, the block the AOP shares */
+#define APPLE_PMGR_T8140_AON_BASE 0x308280000ULL
+
+static bool apple_pmgr_ps_in_aon(struct device_node *node)
+{
+	struct resource res;
+
+	return node->parent && !of_address_to_resource(node->parent, 0, &res) &&
+	       res.start == APPLE_PMGR_T8140_AON_BASE;
+}
+
 static int apple_pmgr_ps_suspend_noirq(struct device *dev)
 {
 	struct apple_pmgr_ps *ps = dev_get_drvdata(dev);
@@ -541,6 +552,20 @@ static int apple_pmgr_ps_suspend_noirq(struct device *dev)
 
 	spin_lock_irqsave(&ps->genpd.slock, flags);
 	if (!regmap_read(ps->regmap, ps->offset, &reg)) {
+		/*
+		 * Off for genpd but still powered, as the loader left it (T8140
+		 * isp_dprx): finish the power-off now. Otherwise the sleep lowers it
+		 * at the commit, raises it again at the wake, and the resync lowers
+		 * it a second time with BUSY left. macOS has it off at the commit and
+		 * doesn't touch it after the wake. Not in the always-on PMGR, whose
+		 * words the AOP raises for itself.
+		 */
+		if (ps->macos_lower && ps->genpd.status == GENPD_STATE_OFF &&
+		    FIELD_GET(APPLE_PMGR_PS_TARGET, reg) && FIELD_GET(APPLE_PMGR_PS_ACTUAL, reg) &&
+		    !apple_pmgr_ps_in_aon(dev->of_node)) {
+			apple_pmgr_ps_set(&ps->genpd, APPLE_PMGR_PS_PWRGATE, false);
+			regmap_read(ps->regmap, ps->offset, &reg);
+		}
 		ps->sleep_target = FIELD_GET(APPLE_PMGR_PS_TARGET, reg);
 		ps->sleep_raised_by_other = ps->genpd.status == GENPD_STATE_OFF &&
 					    ps->sleep_target != APPLE_PMGR_PS_PWRGATE;
