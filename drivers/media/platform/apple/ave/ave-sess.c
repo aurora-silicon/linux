@@ -263,6 +263,12 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	    (p->fps_num != 30ULL * p->fps_den ||
 	     (!p->bframes && (p->codec == AVE_CODEC_HEVC || (!baseline && !p->intra_only)))))
 		return -EOPNOTSUPP;
+	/*
+	 * Where the 26A428 firmware leaves an HEVC slice header is not known: its
+	 * slots have no slice-header buffer, so refuse HEVC there.
+	 */
+	if (ctx->ave->layout->counted && p->codec == AVE_CODEC_HEVC)
+		return -EOPNOTSUPP;
 	return 0;
 }
 
