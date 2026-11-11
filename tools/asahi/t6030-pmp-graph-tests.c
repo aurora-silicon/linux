@@ -755,6 +755,13 @@ static int apple_pmp_native_records(struct apple_pmp_report *rep)
  * never matches, and the call does nothing. */
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t600x;
 static void apple_pmp_agx_activity_resume(void) {}
+/* Floor admission is covered independently by the J613 fixture. */
+static int j613_floor_probe(struct apple_pmp_report *rep)
+{
+	(void)rep;
+	return 0;
+}
+
 #include "production.h"
 #if HOST_HAS_DRAM
 static int devm_device_add_group(struct device *dev, const struct attribute_group *group)
