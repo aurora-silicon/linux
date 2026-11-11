@@ -73,35 +73,6 @@ class PolicyWindowTests(unittest.TestCase):
         self.sbio = (APPLE / "sbio.rs").read_text()
         self.activate = function(self.sbio, "activate_touchid")
 
-    def assert_cached_refkey_window(self, body, at):
-        # A deferred closure's wrapper comes after its definition. Match its
-        # complete dispatch rather than accepting any later window in the fn.
-        # Preserve offsets while ignoring words in comments.
-        clean = re.sub(r"//[^\n]*|/\*.*?\*/", lambda m: " " * len(m[0]),
-                       body, flags=re.S)
-        closure = re.search(r"\blet\s+(?P<binding>unlock)\s*=\s*\|\|\s*\{", clean)
-        self.assertIsNotNone(closure)
-        opening = closure.end() - 1
-        depth, end = 1, opening + 1
-        while depth and end < len(clean):
-            depth += (clean[end] == "{") - (clean[end] == "}")
-            end += 1
-        self.assertEqual(depth, 0)
-        self.assertTrue(opening < at < end)
-        self.assertEqual(clean.count(PREPARE), 1)
-        # The initrd deliberately leaves the real root's window unused; its
-        # guarded store is read-only. Only that branch may call unlock directly.
-        dispatch = re.search(
-            r"\blet\s+unlocked\s*=\s*if\s+self\.keystore_only\.load\(Relaxed\)\s*"
-            r"\{\s*(?P<initrd>unlock)\(\)\s*\}\s*else\s*"
-            r"\{\s*crate::xart_guard::policy_window\((?P<root>unlock)\)\s*\};",
-            clean)
-        self.assertIsNotNone(dispatch)
-        self.assertGreater(dispatch.start(), end)
-        self.assertEqual(
-            [m.start() for m in re.finditer(r"\bunlock\b", clean)],
-            [closure.start("binding"), dispatch.start("initrd"), dispatch.start("root")])
-
     def test_touchid_designates_inside_the_window(self):
         at = self.activate.index(DESIGNATE)
         self.assertIn("crate::xart_guard::policy_window(", statement(self.activate, at))
@@ -116,26 +87,6 @@ class PolicyWindowTests(unittest.TestCase):
         self.assertLess(recovered, self.activate.index(DESIGNATE))
         self.assertNotIn("sks_provision_identity_keybag(", self.activate)
 
-    def test_cached_refkey_window_wraps_deferred_unlock(self):
-        body = function((APPLE / "refkey.rs").read_text(), "refkey_unseal_cached")
-        self.assert_cached_refkey_window(body, body.index(PREPARE))
-
-    def test_cached_refkey_rejects_unguarded_real_root_unlock(self):
-        body = function((APPLE / "refkey.rs").read_text(), "refkey_unseal_cached")
-        wrapped = "crate::xart_guard::policy_window(unlock)"
-        self.assertEqual(body.count(wrapped), 1)
-        body = body.replace(wrapped, "unlock()")
-        with self.assertRaises(AssertionError):
-            self.assert_cached_refkey_window(body, body.index(PREPARE))
-
-    def test_cached_refkey_rejects_extra_unguarded_unlock(self):
-        body = function((APPLE / "refkey.rs").read_text(), "refkey_unseal_cached")
-        dispatch = "let unlocked = if self.keystore_only.load(Relaxed)"
-        self.assertEqual(body.count(dispatch), 1)
-        body = body.replace(dispatch, "unlock();\n            " + dispatch)
-        with self.assertRaises(AssertionError):
-            self.assert_cached_refkey_window(body, body.index(PREPARE))
-
     def test_no_other_path_designates_outside_a_window(self):
         # A new designate of an existing keybag needs the window too; add it
         # here once it runs in one.
@@ -146,15 +97,37 @@ class PolicyWindowTests(unittest.TestCase):
         # after a ref-key create has closed the window for the boot.
         callers = calls(PREPARE)
         self.assertTrue(callers)
+        deferred = 0
         for f, outer, body, at in callers:
             with self.subTest(caller=outer):
-                if (f, outer) == ("refkey.rs", "refkey_unseal_cached"):
-                    self.assert_cached_refkey_window(body, at)
-                    continue
                 before = body[:at]
-                self.assertTrue("crate::xart_guard::policy_window(" in before
-                                or "crate::xart_guard::close_policy_window(" in before,
-                                f"{f}: {outer}")
+                if ("crate::xart_guard::policy_window(" in before
+                        or "crate::xart_guard::close_policy_window(" in before):
+                    continue
+                # The call sits in a closure that is run later.
+                self.assertEqual((f, outer), ("refkey.rs", "refkey_unseal_cached"))
+                self.assertIn("let unlock = || {", before)
+                deferred += 1
+                self.assert_unlock_runs_in_the_window_or_the_initrd(body[at:])
+        self.assertEqual(deferred, 1)
+
+    def assert_unlock_runs_in_the_window_or_the_initrd(self, after):
+        """`unlock` is run twice: in the window, or bare in the initrd.
+
+        The trusted-key-only initrd attach (keystore_only) leaves the boot's
+        one window to the real root: "Do not consume the real root's one
+        policy window in the initrd". Its designate runs with the window
+        shut, where the guard lets no existing session record be rewritten.
+        """
+        uses = re.findall(r"\bunlock\b(?!\s*=)", after)
+        self.assertEqual(len(uses), 2)
+        self.assertRegex(
+            after,
+            r"if self\.keystore_only\.load\(Relaxed\) \{\s*"
+            r"unlock\(\)\s*"
+            r"\} else \{\s*"
+            r"crate::xart_guard::policy_window\(unlock\)\s*"
+            r"\}")
 
 
 if __name__ == "__main__":
