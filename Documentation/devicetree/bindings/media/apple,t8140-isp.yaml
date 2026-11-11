@@ -57,21 +57,8 @@ properties:
       - description: Third ISP DART stream
 
   power-domains:
-    items:
-      - description: ISP system domain
-      - description: ISP CPU domain
-      - description: ISP CPU core 0 domain
-      - description: ISP CPU core 1 domain
-      - description: ISP FE domain
-      - description: ISP DPRX domain
-      - description: ISP secure domain
-      - description: ISP STS0 domain
-      - description: ISP STS1 domain
-      - description: ISP Pearl domain
-      - description: ISP BE domain
-      - description: ISP CLR domain
-      - description: ISP CVD domain
-      - description: ISP CVM domain
+    minItems: 8
+    maxItems: 14
 
   memory-region:
     maxItems: 1
@@ -134,6 +121,43 @@ properties:
           - apple,crop
         additionalProperties: false
     additionalProperties: false
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8142-isp
+    then:
+      properties:
+        power-domains:
+          items:
+            - description: ISP system domain
+            - description: ISP CPU domain
+            - description: ISP CPU core 0 domain
+            - description: ISP FE domain
+            - description: ISP DPRX domain
+            - description: ISP STS0 domain
+            - description: ISP BE domain
+            - description: ISP CLR domain
+    else:
+      properties:
+        power-domains:
+          items:
+            - description: ISP system domain
+            - description: ISP CPU domain
+            - description: ISP CPU core 0 domain
+            - description: ISP CPU core 1 domain
+            - description: ISP FE domain
+            - description: ISP DPRX domain
+            - description: ISP secure domain
+            - description: ISP STS0 domain
+            - description: ISP STS1 domain
+            - description: ISP Pearl domain
+            - description: ISP BE domain
+            - description: ISP CLR domain
+            - description: ISP CVD domain
+            - description: ISP CVM domain
 
 required:
   - compatible

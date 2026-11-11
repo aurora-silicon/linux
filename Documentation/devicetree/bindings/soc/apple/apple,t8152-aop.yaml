@@ -59,9 +59,31 @@ properties:
       Host DMA allocation window as a base and nonzero size, inside the root
       slots of this AOP DART stream that are free for the host.
 
+  als:
+    type: object
+    $ref: /schemas/iio/light/apple,aop-als.yaml#
+
   audio:
     type: object
     $ref: /schemas/sound/apple,t8152-aop-audio.yaml#
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8142-aop
+    then:
+      properties:
+        als:
+          properties:
+            compatible:
+              items:
+                - const: apple,t8142-aop-als
+                - const: apple,aop-als
+    else:
+      properties:
+        als: false
 
 required:
   - compatible

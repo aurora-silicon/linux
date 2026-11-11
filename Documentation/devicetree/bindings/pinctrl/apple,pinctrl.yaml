@@ -30,6 +30,10 @@ properties:
               - apple,t8152-pinctrl
           - const: apple,t8103-pinctrl
       - items:
+          - const: apple,t8142-pinctrl
+          - const: apple,t8140-pinctrl
+          - const: apple,t8103-pinctrl
+      - items:
           - const: apple,t6050-pinctrl
           - const: apple,t8132-pinctrl
       - items:
