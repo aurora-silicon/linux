@@ -67,6 +67,8 @@
 			compatible = "apple,t6050-usb4-nhi";
 			reg = <0xf00000 0x100000>;
 			reg-names = "nhi";
+			/* Replaced by the boot loader with this host's DROM. */
+			apple,thunderbolt-drom = [00];
 			interrupts = <AIC_IRQ 0 1579 IRQ_TYPE_LEVEL_HIGH>,
 						     <AIC_IRQ 0 1580 IRQ_TYPE_LEVEL_HIGH>,
 						     <AIC_IRQ 0 1581 IRQ_TYPE_LEVEL_HIGH>,
@@ -175,6 +177,8 @@
 			compatible = "apple,t6050-usb4-nhi";
 			reg = <0xf00000 0x100000>;
 			reg-names = "nhi";
+			/* Replaced by the boot loader with this host's DROM. */
+			apple,thunderbolt-drom = [00];
 			interrupts = <AIC_IRQ 0 1611 IRQ_TYPE_LEVEL_HIGH>,
 						     <AIC_IRQ 0 1612 IRQ_TYPE_LEVEL_HIGH>,
 						     <AIC_IRQ 0 1613 IRQ_TYPE_LEVEL_HIGH>,
@@ -283,6 +287,8 @@
 			compatible = "apple,t6050-usb4-nhi";
 			reg = <0xf00000 0x100000>;
 			reg-names = "nhi";
+			/* Replaced by the boot loader with this host's DROM. */
+			apple,thunderbolt-drom = [00];
 			interrupts = <AIC_IRQ 0 1675 IRQ_TYPE_LEVEL_HIGH>,
 						     <AIC_IRQ 0 1676 IRQ_TYPE_LEVEL_HIGH>,
 						     <AIC_IRQ 0 1677 IRQ_TYPE_LEVEL_HIGH>,
