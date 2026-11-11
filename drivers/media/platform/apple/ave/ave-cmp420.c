@@ -31,6 +31,7 @@
 #include <linux/kernel.h>
 #include <linux/minmax.h>
 #include <linux/string.h>
+#include <linux/unaligned.h>
 
 #include "ave-cmp420.h"
 
@@ -184,20 +185,30 @@ void ave_cmp420_pack(const struct ave_cmp420_geom *g, u8 *surf,
 	ave_cmp420_pack_c(g, surf, cbcr, stride);
 }
 
-/* LSB-first bit reader over one block payload */
+/* LSB-first bit reader over one block payload, zero padded */
 struct ave_cmp420_bits {
-	const u8 *p;
-	u32 len, pos;
+	u8 buf[64 + 8];
+	u32 pos;
 };
+
+static void ave_cmp420_bits_init(struct ave_cmp420_bits *b, const u8 *p, u32 len)
+{
+	len = min_t(u32, len, 64);
+	memcpy(b->buf, p, len);
+	memset(b->buf + len, 0, sizeof(b->buf) - len);
+	b->pos = 0;
+}
 
 static u32 ave_cmp420_get(struct ave_cmp420_bits *b, u32 n)
 {
-	u32 v = 0;
+	u64 w;
 
-	for (u32 i = 0; i < n; i++, b->pos++)
-		if (b->pos / 8 < b->len && (b->p[b->pos / 8] >> (b->pos % 8)) & 1)
-			v |= BIT(i);
-	return v;
+	if (!n)
+		return 0;
+	w = get_unaligned_le64(b->buf + min_t(u32, b->pos / 8, 64));
+	w >>= b->pos % 8;
+	b->pos += n;
+	return w & (BIT_ULL(n) - 1);
 }
 
 static s32 ave_cmp420_sget(struct ave_cmp420_bits *b, u32 n)
@@ -241,7 +252,7 @@ static const u8 ave_cmp420_nb_order[AVE_CMP420_BLOCK - 1] = {
  */
 static bool ave_cmp420_y_coded(const u8 *p, u32 len, u8 mode, u8 *o)
 {
-	struct ave_cmp420_bits b = { .p = p, .len = len };
+	struct ave_cmp420_bits b;
 	u32 w, red[4] = { 0 };
 	s32 bias = 0, eff[AVE_CMP420_BLOCK] = { 0 };
 	bool has_bias;
@@ -249,6 +260,7 @@ static bool ave_cmp420_y_coded(const u8 *p, u32 len, u8 mode, u8 *o)
 
 	if (mode != 0 && mode != 1 && mode != 4 && mode != 5)
 		return false;
+	ave_cmp420_bits_init(&b, p, len);
 	has_bias = ave_cmp420_get(&b, 1);
 	w = ave_cmp420_get(&b, 3) + 1;
 	base = ave_cmp420_get(&b, 8);
@@ -353,21 +365,22 @@ static unsigned int ave_cmp420_c_ctile(const u8 *body, const u8 *meta, u8 *out,
 		}
 		{
 			u32 n = (m & 0x3f) + 1;
-			struct ave_cmp420_bits b = { .p = body + off,
-						     .len = off + n <= size ? n : 0 };
+			bool fits = off + n <= size;
+			struct ave_cmp420_bits b;
 			u8 cb, cr;
 
 			/* Coded RG8 block: only its two bases are known (bits 14, 22). */
+			ave_cmp420_bits_init(&b, body + off, fits ? n : 0);
 			b.pos = 14;
 			cb = ave_cmp420_get(&b, 8);
 			cr = ave_cmp420_get(&b, 8);
 			for (u32 j = 0; j < AVE_CMP420_BLOCK; j++) {
-				o[2 * j] = sync && b.len ? cb : AVE_CMP420_CB_MARK;
-				o[2 * j + 1] = sync && b.len ? cr : AVE_CMP420_CR_MARK;
+				o[2 * j] = sync && fits ? cb : AVE_CMP420_CB_MARK;
+				o[2 * j + 1] = sync && fits ? cr : AVE_CMP420_CR_MARK;
 			}
 			st->other++;
 			seen |= SEEN_OTHER;
-			if (b.len)
+			if (fits)
 				off += n;
 			else
 				sync = false;
