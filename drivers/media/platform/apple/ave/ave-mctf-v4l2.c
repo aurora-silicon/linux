@@ -35,14 +35,38 @@
 #define AVE_MCTF_SIZEIMAGE	(AVE_MCTF_STRIDE * ALIGN(AVE_MCTF_HEIGHT, 16) * 3 / 2)
 #define AVE_MCTF_POLL_MS	2
 
+/*
+ * NV12 is converted on the CPU; V4L2_PIX_FMT_APPLE_L8V0 is the engine's own
+ * lossless form (the platform scaler reads and writes it), copied as is.
+ */
+static const u32 ave_mctf_formats[] = { V4L2_PIX_FMT_NV12, V4L2_PIX_FMT_APPLE_L8V0 };
+
+static bool ave_mctf_format_ok(u32 fourcc)
+{
+	for (unsigned int i = 0; i < ARRAY_SIZE(ave_mctf_formats); i++)
+		if (ave_mctf_formats[i] == fourcc)
+			return true;
+	return false;
+}
+
 static void ave_mctf_fill(struct v4l2_pix_format_mplane *f)
 {
-	f->pixelformat = V4L2_PIX_FMT_NV12;
+	struct ave_cmp420_geom g;
+
+	if (!ave_mctf_format_ok(f->pixelformat))
+		f->pixelformat = V4L2_PIX_FMT_NV12;
 	f->width = AVE_MCTF_WIDTH;
 	f->height = AVE_MCTF_HEIGHT;
 	f->num_planes = 1;
-	f->plane_fmt[0].bytesperline = AVE_MCTF_STRIDE;
-	f->plane_fmt[0].sizeimage = AVE_MCTF_SIZEIMAGE;
+	if (f->pixelformat == V4L2_PIX_FMT_APPLE_L8V0 &&
+	    !ave_cmp420_geom(&g, AVE_MCTF_WIDTH, AVE_MCTF_HEIGHT)) {
+		f->plane_fmt[0].bytesperline = g.y_pitch;
+		f->plane_fmt[0].sizeimage = g.bytes;
+	} else {
+		f->pixelformat = V4L2_PIX_FMT_NV12;
+		f->plane_fmt[0].bytesperline = AVE_MCTF_STRIDE;
+		f->plane_fmt[0].sizeimage = AVE_MCTF_SIZEIMAGE;
+	}
 	f->field = V4L2_FIELD_NONE;
 	if (f->colorspace == V4L2_COLORSPACE_DEFAULT) {
 		f->colorspace = V4L2_COLORSPACE_REC709;
@@ -65,16 +89,16 @@ static int ave_mctf_querycap(struct file *file, void *priv,
 static int ave_mctf_enum_fmt(struct file *file, void *priv,
 			     struct v4l2_fmtdesc *f)
 {
-	if (f->index)
+	if (f->index >= ARRAY_SIZE(ave_mctf_formats))
 		return -EINVAL;
-	f->pixelformat = V4L2_PIX_FMT_NV12;
+	f->pixelformat = ave_mctf_formats[f->index];
 	return 0;
 }
 
 static int ave_mctf_enum_framesizes(struct file *file, void *priv,
 				    struct v4l2_frmsizeenum *fs)
 {
-	if (fs->index || fs->pixel_format != V4L2_PIX_FMT_NV12)
+	if (fs->index || !ave_mctf_format_ok(fs->pixel_format))
 		return -EINVAL;
 	fs->type = V4L2_FRMSIZE_TYPE_DISCRETE;
 	fs->discrete.width = AVE_MCTF_WIDTH;
@@ -101,7 +125,7 @@ static int ave_mctf_try_fmt(struct file *file, void *priv,
 	return 0;
 }
 
-/* Only NV12 at 1920x1080 is filtered; anything else is refused. */
+/* Only 1920x1080 is filtered, NV12 or lossless; anything else is refused. */
 static int ave_mctf_s_fmt(struct file *file, void *priv, struct v4l2_format *f)
 {
 	struct ave_ctx *ctx = ave_file_to_ctx(file);
@@ -110,7 +134,7 @@ static int ave_mctf_s_fmt(struct file *file, void *priv, struct v4l2_format *f)
 
 	if (vb2_is_busy(vq))
 		return -EBUSY;
-	if (pix->pixelformat != V4L2_PIX_FMT_NV12 ||
+	if (!ave_mctf_format_ok(pix->pixelformat) ||
 	    pix->width != AVE_MCTF_WIDTH || pix->height != AVE_MCTF_HEIGHT)
 		return -EINVAL;
 	ave_mctf_fill(pix);
@@ -284,6 +308,12 @@ static int ave_mctf_get_picture(struct ave_ctx *ctx, unsigned int slot,
 
 	if (!from || !to || !sess->mctf_surf || !sess->mctf_lin)
 		return -EFAULT;
+	if (ctx->dst_fmt.pixelformat == V4L2_PIX_FMT_APPLE_L8V0) {
+		if (vb2_plane_size(&dst->vb2_buf, 0) < g->bytes)
+			return -EINVAL;
+		memcpy(to, from, g->bytes);
+		return 0;
+	}
 	if (vb2_plane_size(&dst->vb2_buf, 0) < luma * 3 / 2)
 		return -EINVAL;
 	memcpy(sess->mctf_surf, from, g->bytes);

@@ -364,7 +364,8 @@ int ave_mctf_cmd_start(struct ave_ctx *ctx)
 }
 
 /*
- * Fill input surface @n from the NV12 picture in @src, every tile raw. The
+ * Fill input surface @n from @src: a lossless picture as it is, an NV12
+ * picture written with every tile raw. The
  * conversion runs in cached memory; the DMA surfaces see only bulk copies.
  */
 static int ave_mctf_put_picture(struct ave_ctx *ctx, struct vb2_v4l2_buffer *src,
@@ -379,6 +380,13 @@ static int ave_mctf_put_picture(struct ave_ctx *ctx, struct vb2_v4l2_buffer *src
 
 	if (!to || !from || !sess->mctf_surf || !sess->mctf_lin)
 		return -EFAULT;
+	if (ctx->src_fmt.pixelformat == V4L2_PIX_FMT_APPLE_L8V0) {
+		if (src->vb2_buf.planes[0].data_offset + g->bytes >
+		    vb2_plane_size(&src->vb2_buf, 0))
+			return -EINVAL;
+		memcpy(to, from + src->vb2_buf.planes[0].data_offset, g->bytes);
+		return 0;
+	}
 	if (src->vb2_buf.planes[0].data_offset + luma * 3 / 2 >
 	    vb2_plane_size(&src->vb2_buf, 0))
 		return -EINVAL;
