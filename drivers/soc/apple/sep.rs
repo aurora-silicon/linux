@@ -752,6 +752,13 @@ struct SepData {
 
     #[pin]
     sks_exchange_lock: Mutex<()>,
+    // One SCRD request in flight at a time: the endpoint has one pair of
+    // shared buffers and replies are told apart by request type only, so
+    // two callers (a touch-gated /dev/sep-key call, the re-arm, a self-test)
+    // would overwrite each other's payload or take each other's reply,
+    // including a new credential context's handle.
+    #[pin]
+    scrd_exchange_lock: Mutex<()>,
     #[pin]
     sks_probe: Mutex<SksProbe>,
     #[pin]
@@ -1097,6 +1104,7 @@ impl SepData {
                 ool_sbio <- new_mutex!(Some(ool_sbio)),
                 ool_sks <- new_mutex!(Some(ool_sks)),
                 sks_exchange_lock <- new_mutex!(()),
+                scrd_exchange_lock <- new_mutex!(()),
                 sks_probe <- new_mutex!(SksProbe::new()),
                 sks_wq <- new_condvar!("SepData::sks_wq"),
                 ool_scrd <- new_mutex!(Some(ool_scrd)),
@@ -2037,6 +2045,7 @@ impl SepData {
         payload: &[u8],
         timeout_ms: time::Msecs,
     ) -> Option<(crate::scrd::ScrdReply, KVec<u8>)> {
+        let _exchange = self.scrd_exchange_lock.lock();
         if !self.ool_registered(&self.ool_scrd) {
             return None;
         }

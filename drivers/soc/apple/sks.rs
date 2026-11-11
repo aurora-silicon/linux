@@ -129,8 +129,10 @@ impl SepData {
     }
 
     pub(crate) fn sks_next_seq(&self) -> crate::sks::Sequence {
-        let n = self.sks_seq.load(Relaxed);
-        self.sks_seq.store(n.wrapping_add(1), Relaxed);
+        // One atomic step: concurrent callers build requests outside the
+        // exchange lock, and two requests with the same sequence would defeat
+        // the late-reply bookkeeping of an abandoned one.
+        let n = self.sks_seq.fetch_add(1, Relaxed);
         crate::sks::Sequence::from_counter(n as u8)
     }
 
