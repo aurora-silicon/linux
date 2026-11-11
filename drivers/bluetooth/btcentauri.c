@@ -69,6 +69,10 @@ static bool scan_dup_filter;
 module_param(scan_dup_filter, bool, 0444);
 MODULE_PARM_DESC(scan_dup_filter, "Let the controller drop duplicate LE advertising reports (off: every report reaches the host)");
 
+static bool accept_list;
+module_param(accept_list, bool, 0444);
+MODULE_PARM_DESC(accept_list, "Let the controller filter LE scans by its accept list (off: report its size as 0, the host filters)");
+
 static bool enable_acl;
 module_param(enable_acl, bool, 0444);
 MODULE_PARM_DESC(enable_acl, "Experimental ACL data delivery; requires LE and auxiliary rings");
@@ -132,7 +136,7 @@ struct cen_bt {
 	u32 proprietary_features, hrb_commands, hrb_status_events;
 	u32 hrb_connection_events;
 	u8 hrb_last_link_type;
-	u32 scan_dup_rewritten;
+	u32 scan_dup_rewritten, accept_list_hidden;
 };
 
 static u16 cen_tail(struct cen_bt *bt, u16 ring)
@@ -504,6 +508,26 @@ static void cen_normalize_ext_adv(struct sk_buff *skb)
 	}
 }
 
+/*
+ * When a paired LE device is put on the accept list and hci_sync scans
+ * passively with filter policy 1, the N1 sends no advertising report and no
+ * other event at all, so the connection is never made. Unless accept_list is
+ * set, report an accept list of size 0: hci_update_accept_list_sync() then
+ * finds no room and scans with filter policy 0, and the host matches
+ * pend_le_conns itself, as for a controller whose list is full.
+ */
+static void cen_fixup_event(struct cen_bt *bt, struct sk_buff *skb)
+{
+	if (skb->len >= 7 && skb->data[0] == HCI_EV_CMD_COMPLETE &&
+	    get_unaligned_le16(skb->data + 3) == HCI_OP_LE_READ_ACCEPT_LIST_SIZE &&
+	    !skb->data[5] && !accept_list) {
+		bt_dev_info(bt->hdev, "LE accept list (%u entries) not used; the host filters scans",
+			    skb->data[6]);
+		skb->data[6] = 0;
+		bt->accept_list_hidden++;
+	}
+}
+
 static void cen_poll(struct work_struct *work)
 {
 	struct cen_bt *bt = container_of(to_delayed_work(work), struct cen_bt, poll);
@@ -588,6 +612,7 @@ static void cen_poll(struct work_struct *work)
 				bt->hrb_connection_events++;
 			}
 			cen_normalize_ext_adv(skb);
+			cen_fixup_event(bt, skb);
 			hci_skb_pkt_type(skb) = HCI_EVENT_PKT;
 			hdev->stat.byte_rx += length;
 			hci_recv_frame(hdev, skb);
@@ -901,6 +926,8 @@ static int cen_status_show(struct seq_file *s, void *unused)
 		   bt->hrb_status_events, bt->hrb_status_pending);
 	seq_printf(s, "hrb_connection_events=%u hrb_last_link_type=0x%02x\n",
 		   bt->hrb_connection_events, bt->hrb_last_link_type);
+	seq_printf(s, "accept_list=%u accept_list_hidden=%u\n", accept_list,
+		   bt->accept_list_hidden);
 	seq_printf(s, "scan_dup_filter=%u scan_dup_rewritten=%u\n", scan_dup_filter,
 		   bt->scan_dup_rewritten);
 	seq_printf(s, "acl_enabled=%u acl_tx=%u acl_rx=%u acl_queued=%u le_queued=%u\n",
