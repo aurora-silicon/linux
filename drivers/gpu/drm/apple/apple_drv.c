@@ -392,7 +392,8 @@ static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 		apple_crtc->fabric_held = true;
 	}
 	if (crtc_state->active &&
-	    (crtc_state->active_changed || dcp_crtc_needs_route_start(dcp))) {
+	    (crtc_state->active_changed || dcp_crtc_needs_route_start(dcp) ||
+	     dcp_external_pipe_off(apple_crtc->dcp))) {
 		dcp_poweron(apple_crtc->dcp);
 		crtc_state->color_mgmt_changed = true;
 	} else if (crtc_state->active && drm_atomic_crtc_needs_modeset(crtc_state)) {

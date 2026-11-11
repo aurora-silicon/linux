@@ -66,6 +66,7 @@ void dcp_poweroff(struct platform_device *pdev);
 int dcp_typec_prepare_route(struct apple_dcp *dcp);
 void dcp_poweron(struct platform_device *pdev);
 void dcp_external_recover(struct platform_device *pdev);
+bool dcp_external_pipe_off(struct platform_device *pdev);
 int dcp_peer_hints_v27(struct apple_dcp *dcp, struct dptx_port *port,
 		      const void *data, size_t size, void *reply, size_t reply_size);
 bool dcp_peer_tiling_state_v27(struct apple_dcp *dcp, bool write,
