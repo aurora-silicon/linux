@@ -79,6 +79,7 @@ struct aura_s2r_mailbox {
 
 /* PS word */
 #define PS_AUTO_ENABLE		BIT(28)
+#define PS_UNLATCH		BIT(12)
 #define PS_DEV_DISABLE		BIT(10)
 #define PS_FLAGS		GENMASK(9, 8)
 #define PS_ACTUAL		GENMASK(7, 4)
@@ -418,6 +419,8 @@ struct apple_sleep_soc {
 	struct apple_sleep_words ps_aon_wake_order;
 	/* Polled off just before the complex words */
 	struct apple_sleep_words ps_still_on;
+	/* The wake's timed power-gate polls: off with BUSY clear at the commit, on macOS */
+	struct apple_sleep_words ps_engine_polled;
 	/* Lowered at the last step if still on, with no user left */
 	const struct apple_sleep_word *stray;
 	unsigned int nstray;
@@ -568,6 +571,14 @@ struct apple_sleep {
 	bool deep_ran;
 	/* This sleep's wake came from the SMC's sources alone. */
 	bool smc_woke_alone;
+	/* A power word the DRAM-kept wake polls stayed latched: this sleep went deep. */
+	bool deep_once;
+	/* Each latched word the commit cleared, as it found it */
+	struct {
+		u32 offset;
+		u32 val;
+	} ps_unlatched[48];
+	unsigned int ps_unlatched_count;
 };
 
 static struct apple_sleep *apple_sleep;
@@ -629,6 +640,9 @@ static void __iomem *sleep_slp_ddr_word;
  */
 static bool sleep_slp_ddr_crashed;
 
+/* This sleep only: the DRAM-kept wake would stall on something this commit leaves wrong. */
+static bool sleep_slp_ddr_deep_once;
+
 static void sleep_slp_ddr_write(void)
 {
 	u32 val;
@@ -637,9 +651,16 @@ static void sleep_slp_ddr_write(void)
 	if (!sleep_slp_ddr_word)
 		return;
 	val = readl(sleep_slp_ddr_word) & ~WAKE_SLP_DDR_USB;
-	if (sleep_slp_ddr_usb && !sleep_slp_ddr_crashed)
+	if (sleep_slp_ddr_usb && !sleep_slp_ddr_crashed && !sleep_slp_ddr_deep_once)
 		val |= WAKE_SLP_DDR_USB;
 	writel(val, sleep_slp_ddr_word);
+}
+
+static void sleep_slp_ddr_set_deep_once(bool deep)
+{
+	guard(spinlock_irqsave)(&sleep_slp_ddr_lock);
+	sleep_slp_ddr_deep_once = deep;
+	sleep_slp_ddr_write();
 }
 
 void apple_sleep_usb_slp_ddr(bool up)
@@ -2414,6 +2435,38 @@ static void sleep_pmu_write(struct apple_sleep *s, u16 reg, u8 val)
 	writel(enable, s->spmi + SPMI_NOTIFY_ENABLE);
 }
 
+/*
+ * The DRAM-kept wake writes each of these words and gives its switch 171 us to report closed.
+ * A domain that went off with BUSY latched holds that poll until WD2 resets the SoC. The PMGR
+ * driver doesn't clear the latch in a system sleep, so do it here. Returns whether one stayed
+ * latched; the deep path then cuts their power instead.
+ */
+static bool apple_sleep_ps_unlatch(struct apple_sleep *s)
+{
+	const struct apple_sleep_words *words = &s->soc->ps_engine_polled;
+	bool stuck = false;
+	unsigned int i;
+
+	s->ps_unlatched_count = 0;
+	for (i = 0; i < words->count && i < ARRAY_SIZE(s->ps_unlatched); i++) {
+		void __iomem *reg = s->ps + words->offset[i];
+		u32 val = readl(reg), off;
+
+		if (!(val & PS_BUSY) || (val & (PS_ACTUAL | PS_TARGET)))
+			continue;
+		s->ps_unlatched[s->ps_unlatched_count].offset = words->offset[i];
+		s->ps_unlatched[s->ps_unlatched_count++].val = val;
+		off = val & ~(PS_AUTO_ENABLE | PS_FLAGS | PS_BUSY | PS_UNLATCH | PS_DEV_DISABLE);
+		writel(off | PS_UNLATCH, reg);
+		readl_poll_timeout_atomic(reg, val, !(val & PS_BUSY), 1, PS_OFF_TIMEOUT_US);
+		writel(off, reg);
+		if (readl(reg) & PS_BUSY)
+			stuck = true;
+	}
+
+	return stuck;
+}
+
 static void apple_sleep_match(struct apple_sleep *s)
 {
 	const struct apple_sleep_soc *soc = s->soc;
@@ -2650,6 +2703,12 @@ static int apple_sleep_commit(unsigned long unused)
 	apple_sleep_arm_wd2(s);
 	apple_sleep_wait_still_on(s);
 
+	/* Everything the wake polls is down by now, the words just lowered included. */
+	if (apple_sleep_ps_unlatch(s)) {
+		s->deep_once = true;
+		sleep_slp_ddr_set_deep_once(true);
+	}
+
 	/* The SoC comes down before memory does, as on macOS. */
 	if (sleep_perf_wait(s->clk_perf + CLK_PERF_SOC, SOC_SLEEP_STATE)) {
 		writel(SOC_SLEEP_STATE, s->clk_perf + CLK_PERF_SOC);
@@ -2827,6 +2886,7 @@ static int apple_sleep_enter(suspend_state_t state)
 	apple_sleep_coprocs_stop(s, false);
 	/* Done by now unless no SMC driver is bound. */
 	apple_sleep_usb_down(s);
+	s->deep_once = false;
 
 	s->cntkctl = read_sysreg(cntkctl_el1);
 	pm_set_resume_via_firmware();
@@ -2834,6 +2894,8 @@ static int apple_sleep_enter(suspend_state_t state)
 	if (ret)
 		panic("Apple committed sleep returned without physical wake: %d", ret);
 	apple_sleep_return(s);
+	if (s->deep_once)
+		sleep_slp_ddr_set_deep_once(false);
 
 	apple_sleep_match_undo(s);
 	apple_sleep_stray_restore(s);
@@ -2950,6 +3012,11 @@ static void apple_sleep_report(void)
 
 	dev_info(s->dev, "back from sleep, boot object resumes %llu -> %llu\n",
 		 s->resumes_before, s->resumes_after);
+	for (i = 0; i < s->ps_unlatched_count; i++)
+		dev_warn(s->dev, "power word %#x was off with BUSY latched at the commit: %#x\n",
+			 s->ps_unlatched[i].offset, s->ps_unlatched[i].val);
+	if (s->deep_once)
+		dev_info(s->dev, "took the deep path: a power word stayed latched\n");
 	if (s->deep_ran)
 		dev_info(s->dev, "the deep path ran\n");
 	for (i = 0; i < s->soc->nwake_names; i++) {
@@ -3476,6 +3543,14 @@ static const u32 t8140_ps_aon_macos_no_auto[] = {
 	0x4078, 0x4080,
 };
 
+/* M2A_1B's power-gate polls, less the SEP, PMP and SIO switch, which macOS doesn't have off. */
+static const u32 t8140_ps_engine_polled[] = {
+	0xc008, 0xc010, 0xc000, 0x290, 0x270, 0x8038, 0x8030, 0x8048, 0x8040, 0x8028, 0x248,
+	0x8010, 0x8008, 0x8020, 0x8018, 0x8000, 0x240, 0x4038, 0x4030, 0x4028, 0x4040, 0x4060,
+	0x4058, 0x4050, 0x4048, 0x4018, 0x4010, 0x4008, 0x4000, 0x268, 0x1f0, 0x298, 0x238,
+	0x3b8, 0x3b0, 0x328, 0x288, 0x308, 0x3a0, 0x2a0, 0x278,
+};
+
 static const u32 t8140_ps_still_on[] = {
 	T8140_PS_ATC0_COMMON, T8140_PS_DISP_SYS, T8140_PS_DISPEXT0_SYS, T8140_PS_ANS,
 	0x270 /* AVD_SYS */, 0x240 /* VENC0_SYS */, 0x248 /* VENC1_SYS */, 0x1f0 /* GFX */,
@@ -3555,6 +3630,7 @@ static const struct apple_sleep_soc t8140_sleep_soc = {
 	.ps_wake_order = SLEEP_WORDS(t8140_ps_wake_order),
 	.ps_aon_wake_order = SLEEP_WORDS(t8140_ps_aon_wake_order),
 	.ps_still_on = SLEEP_WORDS(t8140_ps_still_on),
+	.ps_engine_polled = SLEEP_WORDS(t8140_ps_engine_polled),
 	.stray = t8140_stray_words,
 	.nstray = ARRAY_SIZE(t8140_stray_words),
 	.gate_off = t8140_gate_off,
