@@ -3542,6 +3542,38 @@ out_wifi:
 	return ret;
 }
 
+/*
+ * Adopted T6050 links have no kernel CLKREQ# pad or reference-clock gating
+ * setup. Disabling L0s/L1 capabilities alone does not disable Clock PM.
+ * Keep Clock PM off before enabling endpoints and after host enumeration;
+ * the policy mask also prevents a later ASPM policy change re-enabling it.
+ */
+static void apple_pcie_adopted_no_clkpm(struct pci_dev *pdev, bool locked)
+{
+	u32 lnkcap;
+	int ret;
+
+	if (pci_is_root_bus(pdev->bus) || !pci_is_pcie(pdev))
+		return;
+	if (pcie_capability_read_dword(pdev, PCI_EXP_LNKCAP, &lnkcap) ||
+	    !(lnkcap & PCI_EXP_LNKCAP_CLKPM))
+		return;
+	ret = locked ? pci_disable_link_state_locked(pdev, PCIE_LINK_STATE_CLKPM) :
+		       pci_disable_link_state(pdev, PCIE_LINK_STATE_CLKPM);
+	if (ret == -EINVAL)	/* no ASPM link state: nothing turns Clock PM on */
+		return;
+	if (ret)
+		pci_warn(pdev, "cannot turn Clock PM off: %d\n", ret);
+	else if (locked)
+		pci_info(pdev, "Clock PM off: the host does not handle CLKREQ#\n");
+}
+
+static int apple_pcie_adopted_no_clkpm_walk(struct pci_dev *pdev, void *data)
+{
+	apple_pcie_adopted_no_clkpm(pdev, true);
+	return 0;
+}
+
 static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_dev *pdev)
 {
 	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
@@ -3592,6 +3624,7 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 	if (pcie->hw->adopt_link) {
 		if (READ_ONCE(port->link_failed))
 			return -ENODEV;
+		apple_pcie_adopted_no_clkpm(pdev, false);
 		mutex_lock(&pcie->lock);
 		err = apple_pcie_adopted_route(port, rid);
 		mutex_unlock(&pcie->lock);
@@ -4784,6 +4817,16 @@ absent:
 	dev_warn(dev, "no deep sleep: the loader didn't publish what this host needs\n");
 }
 
+static int apple_pcie_host_init(struct platform_device *pdev, struct pci_host_bridge *bridge)
+{
+	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
+	int ret = pci_host_common_init(pdev, bridge, &apple_pcie_cfg_ecam_ops);
+
+	if (!ret && pcie->hw->adopt_link)
+		pci_walk_bus(bridge->bus, apple_pcie_adopted_no_clkpm_walk, NULL);
+	return ret;
+}
+
 static int apple_pcie_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -4951,7 +4994,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 
 	if (hw->adopt_link)
 		bridge->reset_root_port = apple_pcie_t6050_reset_root_port;
-	ret = pci_host_common_init(pdev, bridge, &apple_pcie_cfg_ecam_ops);
+	ret = apple_pcie_host_init(pdev, bridge);
 	if (ret) {
 		apple_pcie_cleanup(pcie);
 		if (pcie->piodma_supplier) {
