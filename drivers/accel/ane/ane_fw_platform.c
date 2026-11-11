@@ -31,6 +31,24 @@ static const u32 ane_h16_power_words[] = {
 static const char * const ane_h17_reg_names[] = { "engine", "pmgr", "pwgate" };
 static const u32 ane_h17_reg_sizes[] = { 0x2000000, 0x18000, 0x34 };
 
+/*
+ * The measured TEXT of each staged firmware. A different build is refused
+ * before anything is powered or written.
+ */
+static const u8 ane_h17_text_pin_26_6_2[] = {
+	0xcd, 0xa0, 0x9e, 0xc1, 0xae, 0xe6, 0x8b, 0x88,
+	0xb4, 0x7e, 0xdc, 0x0e, 0xeb, 0xc8, 0x10, 0x45,
+	0x25, 0x32, 0xa8, 0x55, 0x56, 0x3f, 0xbd, 0x65,
+	0x0b, 0x95, 0xe2, 0x84, 0x6c, 0x34, 0x53, 0x10,
+};
+
+static const u8 ane_t6050_text_pin_27_0[] = {
+	0x93, 0xae, 0x3a, 0x37, 0x1c, 0xaa, 0x93, 0xf2,
+	0xa9, 0x26, 0x8c, 0x5b, 0xfd, 0x94, 0xba, 0xa9,
+	0x9d, 0x8d, 0xd5, 0x9c, 0xbe, 0xc9, 0x99, 0xe2,
+	0xd1, 0xa2, 0x20, 0xd0, 0xee, 0x43, 0x8b, 0x8f,
+};
+
 const struct ane_fw_platform ane_h16_platform = {
 	.h16_profiles = ane_h16_profiles,
 	.h16_profile_count = ARRAY_SIZE(ane_h16_profiles),
@@ -108,6 +126,54 @@ const struct ane_fw_platform ane_h17_platform = {
 	/* Cold AP-direct acquisition is staged before any power or DMA write.
 	 * The observer uses the measured H17 26.6.2 register layout.
 	 */
+	.pmgr_sys = 0x290,
+	.pmgr_cpu = 0xc000,
+	.pmgr_subblock = 0xc008,
+	.dart_compatible = "apple,t8140-ane-dart",
+	.dart_revision = 0x203,
+	.dapf_count = 4,
+	.text_pin = ane_h17_text_pin_26_6_2,
+};
+
+/*
+ * The M5 Pro (J714s) ANE: the H17 engine and firmware protocol (ADT
+ * "ane,t8132exclave", ane-type 0x220), exclave-assigned and preloaded by
+ * iBoot. From the ADT and macOS's own bring-up on this machine: ANE_SYS at
+ * PMGR +0x3a8, then ANE_CPU (+0x3c8) and ANE_TDBASE (+0x3d0) behind it; the
+ * scratch cells start at +0x1880028; the DARTs are revision 0x204; five DAPF
+ * records. System sleep cycles the engine cold, as on T8140.
+ */
+const struct ane_fw_platform ane_t6050_platform = {
+	.soc = 0x6050,
+	.chip_family = 17,
+	.ane_type = 0x220,
+	.hwx_subtype = 9,
+	.task_generation = 19,
+	.interrupt_count = 2,
+	.owner = ANE_FW_OWNER_EXCLAVE,
+	.reg_names = ane_h17_reg_names,
+	.reg_sizes = ane_h17_reg_sizes,
+	.reg_count = ARRAY_SIZE(ane_h17_reg_names),
+	.wrapper = 0x1600000,
+	.mailbox = 0x1608000,
+	.scratch = 0x1880028,
+	.doorbell = 0x1884000,
+	.irq_status = 0x188c000,
+	.irq_ack = 0x1890000,
+	.preload_dva = { 0x10000000000, 0x100000c0000 },
+	.preload_size = { 0xc0000, 0x2ac000 },
+	.stream_mask = BIT(0),
+	.firmware_preloaded = true,
+	.safe_reset = false,
+	.sleep_warm = false,
+	.pmgr_sys = 0x3a8,
+	.pmgr_cpu = 0x3c8,
+	.pmgr_subblock = 0x3d0,
+	/* Normal T6050 DARTs, as on T6041; SID0 is the host's. */
+	.dart_compatible = "apple,t6050-dart",
+	.dart_revision = 0x204,
+	.dapf_count = 5,
+	.text_pin = ane_t6050_text_pin_27_0,
 };
 
 /*
