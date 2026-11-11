@@ -9364,6 +9364,23 @@ static int dcp_t6041_s2r_stop(struct apple_dcp *dcp)
 	int ret;
 
 	apple_sleep_bringup_mark(DCP_S2R_MARK(id, 1));
+	/*
+	 * An external firmware that did not come back from an earlier sleep has nothing left
+	 * to quiesce, and must not refuse every later sleep: its CPU off again, nothing else.
+	 */
+	if (dcp_desktop_external(dcp) && READ_ONCE(dcp->ext_dead) && !IS_ERR_OR_NULL(dcp->rtk)) {
+		apple_rtkit_mailbox_off(dcp->rtk);
+		if (!READ_ONCE(s2r_keep_run)) {
+			writel(readl(control) & ~APPLE_DCP_COPROC_CPU_CONTROL_RUN, control);
+			writel(readl(control) & ~(APPLE_DCP_COPROC_CPU_CONTROL_RUN | BIT(5)),
+			       control);
+			if (READ_ONCE(s2r_cpu_off))
+				dcp_t6041_s2r_cpu_off(dcp, id);
+		}
+		dcp->t6041_s2r_stopped = true;
+		dev_info(dcp->dev, "dead external firmware: CPU off for the sleep\n");
+		return 0;
+	}
 	if (READ_ONCE(dcp->crashed) || IS_ERR_OR_NULL(dcp->rtk))
 		return -EBUSY;
 	/* macOS's DP port lets its display go first; that teardown isn't built here. */
@@ -9512,6 +9529,15 @@ static void dcp_t6041_s2r_resume(struct apple_dcp *dcp)
 				apple_dart_display_streams(dcp->s2r_dcp_dart,
 							   DCP_S2R_DCP_STREAMS, true, false);
 			apple_sleep_bringup_mark(DCP_S2R_MARK(0, 0xc));
+		} else if (READ_ONCE(s2r_dcp_dart_on)) {
+			/*
+			 * An external DCP's stop turned its own DART's streams off as well:
+			 * its firmware answers no endpoint start without them (-110).
+			 */
+			dcp_s2r_find_darts(dcp);
+			if (dcp->s2r_dcp_dart)
+				apple_dart_display_streams(dcp->s2r_dcp_dart,
+							   DCP_S2R_DCP_STREAMS, true, false);
 		}
 		dcp->s2r_cold_restart = true;
 		queue_work(system_long_wq, &dcp->hib_restore_work);
@@ -10553,6 +10579,43 @@ static void dcp_t6041_s2r_warm_restart(struct apple_dcp *dcp)
 	dev_info(dcp->dev, "firmware back after the warm restart\n");
 }
 
+/*
+ * An external DCP after a real sleep: the same warm return as the internal one. Its
+ * firmware was idle with no display when it stopped, so there is no mode to set: the
+ * rest is what any system sleep ends with, and a display plugged in later goes the
+ * usual hotplug way.
+ */
+static void dcp_t6041_s2r_warm_restart_ext(struct apple_dcp *dcp)
+{
+	int ret;
+
+	WRITE_ONCE(dcp->crashed, false);
+	ret = apple_rtkit_power_cycled_return(dcp->rtk,
+					      dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	if (dcp->hib_rx_held) {
+		dcp->hib_rx_held = false;
+		apple_rtkit_resume_rx(dcp->rtk);
+	}
+	dev_info(dcp->dev, "S2R resume: warm restart of the idled firmware: %d (CPU_CONTROL %#x STATUS %#x)\n",
+		 ret, readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL),
+		 readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS));
+	if (ret) {
+		dcp_hib_give_up(dcp, "warm-restart", ret);
+		return;
+	}
+	dcp_t6041_s2r_afk(dcp, true);
+	ret = iomfb_system_power_v26_6_desktop(dcp, true);
+	dev_info(dcp->dev, "S2R resume: system power state 1: %d\n", ret);
+
+	dcp->link_recovery_tries = 0;
+	dcp_release_after_sleep(dcp);
+	dcp_enable_typec_work(dcp);
+	/* The HDMI output's PHY and crossbar lost their setup with the power. */
+	if (dcp->external_native)
+		dcp_fabric_hdmi_reinit(dcp, "after system sleep");
+	dev_info(dcp->dev, "external firmware back after the warm restart\n");
+}
+
 static void dcp_hib_restore_work(struct work_struct *work)
 {
 	struct apple_dcp *dcp = container_of(work, struct apple_dcp,
@@ -10566,7 +10629,9 @@ static void dcp_hib_restore_work(struct work_struct *work)
 	if (dcp->s2r_cold_restart) {
 		dcp->s2r_cold_restart = false;
 		if (dcp_desktop_external(dcp)) {
-			if (!dcp_cold_session_start(dcp))
+			if (READ_ONCE(s2r_warm))
+				dcp_t6041_s2r_warm_restart_ext(dcp);
+			else if (!dcp_cold_session_start(dcp))
 				dcp_hib_ext_restore(dcp);
 		} else if (READ_ONCE(s2r_warm)) {
 			dcp_t6041_s2r_warm_restart(dcp);
