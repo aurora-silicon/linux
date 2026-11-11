@@ -579,9 +579,18 @@
 	status = "okay";
 };
 
+&admac_ec_proxy {
+	status = "okay";
+};
+
 &aop_audio {
 	apple,chassis-name = "J714";
 	apple,machine-kind = "MacBook Pro";
+	/* hpai: the microphone array, ADT audio-hp-mic on leap-s RX0 (Linux channel 1). */
+	dmas = <&admac_base_ns 4>, <&admac_base_ns 5>,
+	       <&admac_base_ns 0>, <&admac_base_ns 1>,
+	       <&admac_ec_proxy 1>;
+	dma-names = "cout", "cin", "spkr", "sense", "hpai";
 };
 
 / {
