@@ -156,6 +156,17 @@ config HID_APPLE_MTP_HAPTIC
 	  This driver can also be built as a module. If so, it will be called
 	  hid-apple-mtp-haptic.
 
+config HID_APPLE_MTP_KIWI
+	tristate "Apple MTP touch screen (kiwi) support"
+	depends on HID
+	help
+	  Support for the touch screen of Apple Silicon laptops that have one,
+	  such as the MacBook Pro with a touch display. The driver turns the raw
+	  capacitance image of the touch interface into multi-touch contacts.
+
+	  This driver can also be built as a module. If so, it will be called
+	  hid-apple-mtp-kiwi.
+
 config HID_APPLEIR
 	tristate "Apple infrared receiver"
 	depends on (USB_HID)
