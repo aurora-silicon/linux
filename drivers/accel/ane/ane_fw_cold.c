@@ -824,6 +824,38 @@ static int ane_fw_dart_idle(struct ane_fw_backend *b)
 	return 0;
 }
 
+/*
+ * Each DART as macOS leaves it before the power words (recorded, 25G83): its counters
+ * cleared, error status acknowledged, every enabled stream disabled one at a time, then
+ * the TLB flushed.
+ */
+static void ane_fw_dart_deactivate(struct ane_fw_backend *b)
+{
+	for (unsigned int i = 0; i < ANE_FW_DARTS; i++) {
+		void __iomem *dart = b->dart[i];
+		u32 enabled;
+
+		ane_wr32(b, U32_MAX, dart + 0x4060);
+		ane_rd32(b, dart + 0x4060);
+		ane_rd32(b, dart + 0x4000);
+		ane_wr32(b, 0, dart + 0x4000);
+		ane_wr32(b, U32_MAX, dart + 0x704);
+		ane_rd32(b, dart + 0x704);
+		enabled = ane_rd32(b, dart + 0xc00);
+		for (unsigned int bit = 0; bit < 16; bit++) {
+			if (!(enabled & BIT(bit)) && bit != 11 && bit != 15)
+				continue;
+			ane_wr32(b, BIT(bit), dart + 0xc20);
+			ane_rd32(b, dart + 0xc20);
+		}
+		/* Flush all: V2 | STT, as macOS writes it. */
+		for (unsigned int j = 0; j < ANE_FW_DARTS; j++)
+			ane_wr32(b, 0xa000, b->dart[j] + 0x80);
+		for (unsigned int j = 0; j < ANE_FW_DARTS; j++)
+			ane_rd32(b, b->dart[j] + 0x80);
+	}
+}
+
 static int ane_fw_firmware_stop(struct ane_fw_backend *b)
 {
 	struct ane_fw_transport *t = &b->transport;
@@ -841,6 +873,11 @@ static int ane_fw_firmware_stop(struct ane_fw_backend *b)
 	ret = ane_fw_exclave_mode_stop(b);
 	if (ret)
 		return ret;
+	/* The host flags as macOS sets them before its stop: SCRATCH14 = 0, SCRATCH16 = 1. */
+	ane_wr32(b, 0, b->engine + b->soc->scratch + 0x38);
+	ane_rd32(b, b->engine + b->soc->scratch + 0x3c);
+	ane_wr32(b, 1, b->engine + b->soc->scratch + 0x40);
+	ane_rd32(b, b->engine + b->soc->scratch + 0x44);
 	put_unaligned_le16(ANE_FW_CMD_STOP, stop + 4);
 	ret = ane_fw_command(b, ANE_FW_IO, stop, sizeof(stop), ktime_get_ns() + ANE_FW_TIMEOUT_NS);
 	if (ret) {
@@ -864,7 +901,11 @@ static int ane_fw_firmware_stop(struct ane_fw_backend *b)
 	if (readl_poll_timeout(status, val, val & 3, 10000, 200000))
 		dev_warn(dev, "H17 ANE: no WFI after POWER_DOWN, status %#x\n", ane_rd32(b, status));
 	dev_info(dev, "H17 ANE: firmware stopped, status %#x\n", ane_rd32(b, status));
-	return ane_fw_dart_idle(b);
+	ane_wr32(b, 0xfeedbabe, b->engine + b->soc->scratch + 4);
+	ret = ane_fw_dart_idle(b);
+	if (!ret)
+		ane_fw_dart_deactivate(b);
+	return ret;
 }
 
 /* The cold way down: nothing in flight, stop the firmware, then power off. */
@@ -1633,6 +1674,9 @@ static int ane_fw_startup(struct ane_fw_backend *b)
 				return ret;
 		}
 	}
+	/* The host flags macOS sets once the firmware is up (recorded, 25G83). */
+	ane_wr32(b, 1, b->engine + b->soc->scratch + 0x38);
+	ane_wr32(b, 0, b->engine + b->soc->scratch + 0x40);
 	return 0;
 }
 
