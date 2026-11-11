@@ -519,6 +519,8 @@ static int ane_fw_suspend_firmware(struct ane_fw_backend *b)
 static const u8 ane_fw_text_pin[SHA256_DIGEST_SIZE];
 static int ane_fw_boot(struct ane_fw_backend *b);
 static int ane_fw_startup(struct ane_fw_backend *b);
+static int ane_fw_first_bringup(struct ane_fw_backend *b);
+static ssize_t ane_fw_stage_action(struct device *dev, const char *buf, size_t count);
 static int ane_fw_rvbar_ready(struct ane_fw_backend *b);
 
 /* A power word goes off whole, and off means target, actual and BUSY clear. */
@@ -969,35 +971,14 @@ static int ane_fw_cold_cycle_down(struct ane_fw_backend *b)
 	return ane_fw_power_down(b);
 }
 
-/*
- * Off with no firmware until a request needs it, as macOS keeps the ANE
- * without a client. Called with b->lock held, the engine up at the program
- * stage. Its session stays closed: ane_h16_session_enter() wakes it.
- */
-static int ane_fw_park(struct ane_fw_backend *b)
-{
-	int ret;
-
-	ane_h16_session_sleep(&b->session, true);
-	b->down_for_sleep = false;
-	ret = ane_fw_cold_cycle_down(b);
-	if (ret) {
-		ane_fw_quarantine(b, ret);
-		b->session.quarantined = true;
-		ane_h16_session_sleep(&b->session, false);
-		return ret;
-	}
-	WRITE_ONCE(b->parked, true);
-	WRITE_ONCE(b->session.parked, true);
-	return 0;
-}
-
 /* A request for a parked engine: boot it from the preload, as after a sleep. */
 static int ane_fw_session_wake(void *ctx)
 {
 	struct ane_fw_backend *b = ctx;
 	int ret;
 
+	if (READ_ONCE(b->stage) == ANE_STAGE_PROBED)
+		return READ_ONCE(b->in_sleep) ? -EAGAIN : ane_fw_first_bringup(b);
 	guard(mutex)(&b->lock);
 	if (!b->parked)
 		return 0;
@@ -1192,6 +1173,9 @@ static int ane_fw_pm_event(struct notifier_block *nb, unsigned long event, void 
 static int ane_fw_retain(struct ane_fw_backend *b)
 {
 	int ret;
+
+	if (b->retained)
+		return 0;
 
 	/*
 	 * The kexec blocker takes built-in users only. A module, like the H16
@@ -1923,6 +1907,68 @@ static int ane_fw_program_stage(struct ane_fw_backend *b)
 	return 0;
 }
 
+/*
+ * The node without the firmware: macOS has no ANE running until its first
+ * client, so the domains stay off and a sleep has nothing to stop. The first
+ * request maps, boots and starts the engine (ane_fw_first_bringup()).
+ */
+static int ane_fw_register_parked(struct ane_fw_backend *b)
+{
+	int ret;
+
+	ret = ane_fw_retain(b);
+	if (ret)
+		return ret;
+	b->transport.soc = b->soc;
+	ret = ane_h16_session_init_parked(&b->session, &b->transport, &ane_fw_session_ops, b,
+					  ANE_FW_TIMEOUT_NS);
+	if (ret)
+		return ret;
+	ret = apple_clpc_ane_get(&b->pdev->dev, &b->clpc);
+	if (ret)
+		return ret;
+	b->session.gate_hold_ns = ANE_FW_GATE_HOLD_NS;
+	ret = ane_h16_accel_register(&b->pdev->dev, &b->session);
+	if (ret) {
+		apple_clpc_ane_put(b->clpc);
+		b->clpc = NULL;
+		return ret;
+	}
+	ane_fw_debugfs(b);
+	WRITE_ONCE(b->parked, true);
+	return 0;
+}
+
+/* The first request: what the boot used to do, map, boot and start-up, then admit it. */
+static int ane_fw_first_bringup(struct ane_fw_backend *b)
+{
+	static const char *const steps[] = { "map", "boot", "startup" };
+	unsigned int flags, i;
+	ssize_t ret = 0;
+
+	flags = lock_system_sleep();
+	if (READ_ONCE(b->stage) != ANE_STAGE_PROBED)
+		goto out;
+	for (i = 0; ret >= 0 && i < ARRAY_SIZE(steps); i++)
+		ret = ane_fw_stage_action(&b->pdev->dev, steps[i], strlen(steps[i]));
+	mutex_lock(&b->lock);
+	if (ret >= 0) {
+		b->transport.allow_free = true;
+		b->stage = ANE_STAGE_PROGRAM;
+		ret = 0;
+	} else {
+		b->session.quarantined = true;
+	}
+	WRITE_ONCE(b->parked, false);
+	WRITE_ONCE(b->session.parked, false);
+	ane_h16_session_sleep(&b->session, false);
+	mutex_unlock(&b->lock);
+	dev_info(&b->pdev->dev, "H17 ANE: first bring-up for a request: %zd\n", ret);
+out:
+	unlock_system_sleep(flags);
+	return ret;
+}
+
 static ssize_t firmware_stage_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	static const char * const names[] = {
@@ -2064,30 +2110,24 @@ static bool ane_fw_handoff_present(struct platform_device *pdev,
  */
 static void ane_fw_start_work(struct work_struct *work)
 {
-	static const char *const steps[] = { "probe", "map", "boot", "startup", "program" };
 	struct ane_fw_backend *b = container_of(work, struct ane_fw_backend, start);
-	unsigned int i, flags;
+	unsigned int flags;
 	ssize_t ret;
 
-	for (i = 0; i < ARRAY_SIZE(steps); i++) {
-		flags = lock_system_sleep();
-		ret = ane_fw_stage_action(&b->pdev->dev, steps[i], strlen(steps[i]));
-		unlock_system_sleep(flags);
-		if (ret < 0) {
-			dev_err(&b->pdev->dev, "H17 ANE: boot bring-up stopped at %s, error %zd\n",
-				steps[i], ret);
-			ane_fw_bind_release(b);
-			return;
-		}
-	}
-	dev_info(&b->pdev->dev, "H17 ANE: up at boot, accel node ready\n");
-	/* Then off until a client's request, as macOS keeps it. */
 	flags = lock_system_sleep();
-	mutex_lock(&b->lock);
-	ret = ane_fw_park(b);
-	mutex_unlock(&b->lock);
+	ret = ane_fw_stage_action(&b->pdev->dev, "probe", strlen("probe"));
+	if (ret >= 0) {
+		mutex_lock(&b->lock);
+		ret = ane_fw_register_parked(b);
+		mutex_unlock(&b->lock);
+	}
 	unlock_system_sleep(flags);
-	dev_info(&b->pdev->dev, "H17 ANE: parked until the first request%s\n", ret ? " FAILED" : "");
+	/* Nothing holds ANE_SYS now: with no firmware, genpd keeps it as macOS does. */
+	ane_fw_bind_release(b);
+	if (ret < 0)
+		dev_err(&b->pdev->dev, "H17 ANE: node registration stopped: %zd\n", ret);
+	else
+		dev_info(&b->pdev->dev, "H17 ANE: accel node ready; firmware starts on the first request\n");
 }
 
 static void ane_fw_observer_free(struct ane_fw_backend *b)

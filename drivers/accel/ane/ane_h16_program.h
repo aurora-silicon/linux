@@ -340,6 +340,10 @@ struct ane_h16_session {
 int ane_h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *transport,
 			 const struct ane_h16_session_ops *ops, void *ctx,
 			 u64 timeout_ns);
+int ane_h16_session_init_parked(struct ane_h16_session *s,
+				struct ane_fw_transport *transport,
+				const struct ane_h16_session_ops *ops, void *ctx,
+				u64 timeout_ns);
 int ane_h16_session_load(struct ane_h16_session *s,
 			 struct ane_h16_hwx_snapshot *snapshot,
 			 const void *const aux[ANE_H16_AUX_COUNT],

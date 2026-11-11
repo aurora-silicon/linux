@@ -511,12 +511,12 @@ static void h16_drain(struct ane_h16_session *s)
 	wake_up_all(&s->wake);
 }
 
-int ane_h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *transport,
-			 const struct ane_h16_session_ops *ops, void *ctx,
-			 u64 timeout_ns)
+static int h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *transport,
+			    const struct ane_h16_session_ops *ops, void *ctx,
+			    u64 timeout_ns, bool parked)
 {
-	if (!s || !transport || !transport->armed || !ops || !ops->map || !ops->log ||
-	    !timeout_ns)
+	if (!s || !transport || !transport->soc || (!parked && !transport->armed) || !ops ||
+	    !ops->map || !ops->log || !timeout_ns || (parked && !ops->wake))
 		return -EINVAL;
 	memset(s, 0, sizeof(*s));
 	s->transport = transport;
@@ -531,9 +531,27 @@ int ane_h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *tra
 	INIT_LIST_HEAD(&s->programs);
 	spin_lock_init(&s->stats_lock);
 	INIT_DELAYED_WORK(&s->gate_work, h16_gate_work);
+	s->asleep = parked;
+	s->parked = parked;
 	return 0;
 }
+
+int ane_h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *transport,
+			 const struct ane_h16_session_ops *ops, void *ctx,
+			 u64 timeout_ns)
+{
+	return h16_session_init(s, transport, ops, ctx, timeout_ns, false);
+}
 EXPORT_SYMBOL_GPL(ane_h16_session_init);
+
+/* Closed and parked, its transport armed only by ops->wake on the first request. */
+int ane_h16_session_init_parked(struct ane_h16_session *s, struct ane_fw_transport *transport,
+				const struct ane_h16_session_ops *ops, void *ctx,
+				u64 timeout_ns)
+{
+	return h16_session_init(s, transport, ops, ctx, timeout_ns, true);
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_init_parked);
 
 static int h16_fail(struct ane_h16_session *s, int error)
 {
