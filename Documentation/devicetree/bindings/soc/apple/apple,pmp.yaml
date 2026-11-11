@@ -14,6 +14,9 @@ description: |
   RTKit and supplies calibration copied from the Apple device tree. The
   bootloader must initialize the PMP DART address protection filter before
   Linux starts the firmware. Firmware-owned PMC power state must be retained.
+  On T6000 and T8112 the board and DRAM vendor identifiers are required at
+  runtime, together with the firmware-requested calibration. They are supplied
+  from the current boot's Apple device tree, not from static board DTS values.
 
 properties:
   compatible:
@@ -26,6 +29,7 @@ properties:
           - enum:
               - apple,t6030-pmp-v2
               - apple,t6031-pmp-v2
+              - apple,t8112-pmp-v2
               - apple,t6041-pmp-v2
               - apple,t6050-pmp-v2
               - apple,t8122-pmp-v2
@@ -75,11 +79,11 @@ properties:
 
   apple,board-id:
     $ref: /schemas/types.yaml#/definitions/uint32
-    description: Board identifier copied by the bootloader.
+    description: Required runtime board identifier copied from ADT /chosen/board-id.
 
   apple,dram-vendor-id:
     $ref: /schemas/types.yaml#/definitions/uint32
-    description: DRAM vendor identifier copied by the bootloader.
+    description: Required runtime DRAM vendor identifier copied from ADT /chosen/dram-vendor-id.
 
   apple,dram-capacity:
     $ref: /schemas/types.yaml#/definitions/uint32
@@ -112,7 +116,10 @@ properties:
   apple,pio-ranges:
     $ref: /schemas/types.yaml#/definitions/uint64-array
     minItems: 2
-    description: Host physical address and size pairs mapped into firmware PIO space.
+    maxItems: 36
+    description: |
+      Host physical address and size pairs mapped into firmware PIO space.
+      T6000 supplies its SoC-specific mapper ranges; T8112 has no PIO table.
 
   apple,tunable-segment-names:
     $ref: /schemas/types.yaml#/definitions/string
