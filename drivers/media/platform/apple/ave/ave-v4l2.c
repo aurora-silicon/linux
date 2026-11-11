@@ -495,9 +495,20 @@ static int ave_init_ctrls(struct ave_ctx *ctx)
 
 	v4l2_ctrl_handler_init(hdl, 19);
 
-	v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
-			       V4L2_MPEG_VIDEO_BITRATE_MODE_CQ, 0,
-			       V4L2_MPEG_VIDEO_BITRATE_MODE_VBR);
+	/*
+	 * The 6070 firmware path (M1 Pro/Max, M2) is qualified for constant
+	 * quality only: offer just that mode, so a client that keeps the
+	 * defaults (GStreamer, FFmpeg) gets a session instead of a refusal.
+	 */
+	if (ctx->ave->layout && ctx->ave->layout->kind == AVE_LAYOUT_6070)
+		v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
+				       V4L2_MPEG_VIDEO_BITRATE_MODE_CQ,
+				       ~BIT(V4L2_MPEG_VIDEO_BITRATE_MODE_CQ),
+				       V4L2_MPEG_VIDEO_BITRATE_MODE_CQ);
+	else
+		v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
+				       V4L2_MPEG_VIDEO_BITRATE_MODE_CQ, 0,
+				       V4L2_MPEG_VIDEO_BITRATE_MODE_VBR);
 	/* Constant quality: 100 is the best; same scale as VideoToolbox's 0.0-1.0. */
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_CONSTANT_QUALITY, 0, 100, 1, 50);
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_BITRATE, 100000, 100000000, 1,
