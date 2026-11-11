@@ -89,6 +89,8 @@ enum apple_clpc_rail {
  * @gpu_input: the GPU driver reports its work in flight through
  *	apple_clpc_gpu_get(); while there is some, both rails go to the top
  *	of @map
+ * @idle_on_time: sample every period even with no vote held, instead of
+ *	from a deferrable timer
  */
 struct apple_clpc_hw {
 	unsigned int rail[APPLE_CLPC_RAILS];
@@ -105,6 +107,7 @@ struct apple_clpc_hw {
 	unsigned int ane_cluster;
 	unsigned int ane_cluster_khz;
 	const char *ane_cluster_machine;
+	bool idle_on_time;
 };
 
 struct apple_clpc_cluster {
@@ -554,8 +557,10 @@ static void apple_clpc_queue(struct apple_clpc *clpc, bool idle)
 	/*
 	 * A held vote has to be sampled on time so that it drops once demand
 	 * stops; with no vote held, sampling can wait for a CPU that wakes up
-	 * anyway rather than waking an idle one every period.
+	 * anyway rather than waking an idle one every period, unless the SoC
+	 * samples on time (@idle_on_time).
 	 */
+	idle = idle && !clpc->hw->idle_on_time;
 	/* A demand edge can queue work while the deferrable pass is pending.
 	 * Keep one sampling cadence once the serialized pass settles.
 	 */
@@ -1677,11 +1682,18 @@ static const struct apple_clpc_hw apple_clpc_hw_t8152 = {
  * The boot loader enables no agent on either rail, so without this floor
  * the DRAM controller and the fabric stay at state 0: CPU memcpy caps at
  * about 34 GB/s on the M5 Pro. A busy cluster in the upper half of its range
- * asks for DCS 5 and fabric 2, the floor macOS's CLPC holds through an
- * 18-thread CPU loop (J714sAP, 26A428: 0x25 on its voter 99% of the time);
- * three busy samples in a row (12 ms) are needed, as on T6040. The GPU driver
- * reports its work in flight and gets both top states, DCS 6 and fabric 3,
- * while it has some: bandwidth-bound GPU work runs about 11% slower at DCS 5.
+ * asks for DCS 5 and fabric 2; three busy samples in a row (12 ms) are
+ * needed, as on T6040. macOS's CLPC votes from memory stalls instead, which
+ * this driver doesn't see (J714sAP, 26A428: no vote for one CPU-bound thread,
+ * DCS 6 and fabric 2 for memcpy); DCS 5 and fabric 2 keep pointer chasing at
+ * 110 ns against 300 ns at state 0. The GPU driver reports its work in
+ * flight and gets both top states, DCS 6 and fabric 3, while it has some:
+ * bandwidth-bound GPU work runs about 11% slower at DCS 5.
+ *
+ * Sampling stays on time with no vote held. From a deferrable timer, a CPU
+ * that went busy after an idle spell waited for the timer's own CPU to wake,
+ * and pointer chasing ran at 300 ns for 60 ms and more; on time the floor is
+ * in place within 24-32 ms, for no measurable idle power (6.44 against 6.40 W).
  */
 static const struct apple_clpc_hw apple_clpc_hw_t6050 = {
 	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
@@ -1692,6 +1704,7 @@ static const struct apple_clpc_hw apple_clpc_hw_t6050 = {
 	.gpu = { [APPLE_CLPC_DCS] = 6, [APPLE_CLPC_SOC] = 3 },
 	.sustain = 3,
 	.gpu_input = true,
+	.idle_on_time = true,
 };
 
 static const struct of_device_id apple_clpc_of_match[] = {
