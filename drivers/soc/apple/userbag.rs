@@ -1675,7 +1675,8 @@ mod tests {
             secret: [0x61; SECRET_MAX],
         };
         let (user, secret) = parse_unlock(&req, false).expect("valid request");
-        assert_eq!(user.special_handle().value(), -1000);
+        // uid 1000's bag is not the identity bag's designation (1000).
+        assert_eq!(user.special_handle().value(), -((USER_BAG_BASE + 1000) as i32));
         assert_eq!(secret.len(), 4);
         req.secret_len = 0;
         assert!(parse_unlock(&req, false).is_err());
