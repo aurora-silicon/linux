@@ -101,6 +101,7 @@ struct centauri_wifi {
 	struct work_struct connect_work;
 	struct delayed_work link_work;
 	struct cfg80211_scan_request *scan_request;
+	bool scan_abort;
 	struct mutex lock;
 	/* The logger has its own coherent allocation. Reads/acknowledgements
 	 * must remain possible while scan/connect hold the command mutex.
@@ -885,6 +886,12 @@ static void scan_worker(struct work_struct *work)
 				ret = -EIO;
 				break;
 			}
+			if (READ_ONCE(wifi->scan_abort)) {
+				if (!stopped)
+					command(wifi, 65537, NULL, 0);
+				ret = -ECANCELED;
+				break;
+			}
 			if (!stopped && wifi->channels_seen - channels >= 8) {
 				stopped = true;
 				ret = command(wifi, 65537, NULL, 0);
@@ -1398,6 +1405,14 @@ static int net_stop(struct net_device *netdev)
 
 	netif_stop_queue(netdev);
 	skb_queue_purge(&wifi->data_tx_queue);
+	/*
+	 * Finish a running scan before cfg80211's NETDEV_DOWN. Otherwise
+	 * cfg80211 completes it as driver-owned and stale, keeps its scan
+	 * message, and refuses every later scan with -EBUSY.
+	 */
+	WRITE_ONCE(wifi->scan_abort, true);
+	flush_work(&wifi->scan_work);
+	WRITE_ONCE(wifi->scan_abort, false);
 	return 0;
 }
 
