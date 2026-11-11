@@ -16,6 +16,16 @@
 //! the ALSA buffer.  `runn` and `idle` power requests (property 202) start and
 //! stop the producer, and property 200 reads the state back.
 //!
+//! T6041 firmware produces into a host ring instead.  The AP allocates it on
+//! the audio node's own DART stream (the I/O buffer device's stream) and
+//! hands its address and size to the firmware's I/O buffer device `adpx`
+//! (property 300), once per AOP lifetime.  `lpai` property 301 is the stream
+//! format and 302 the ring geometry (ring frames, frames per report); the
+//! firmware's property-change reports (EPIC subtype 0x20, property 305) carry
+//! the producer position in the same fields as the T8140 ring's.  The first
+//! report after a start only sets the position, so audio from before the start
+//! is never copied.
+//!
 //! Copyright (C) 2026 The Aurora Silicon Contributors
 
 use core::{mem, ptr, slice};
@@ -26,7 +36,7 @@ use kernel::{
     new_mutex,
     new_spinlock,
     prelude::*,
-    soc::apple::aop::{from_fourcc, EPICService, ReportListener, AOP},
+    soc::apple::aop::{from_fourcc, EPICService, ReportListener, SourceRing, AOP},
     sync::{
         aref::ARef,
         atomic::{Acquire, Atomic, AtomicFlag, Relaxed, Release},
@@ -41,9 +51,16 @@ use kernel::{
 const EPIC_SUBTYPE_WRAPPED_CALL: u16 = 0x20;
 /// The audio service's report that carries low-power microphone samples.
 pub(crate) const EPIC_SUBTYPE_LPAI_SAMPLES: u16 = 0xee;
+/// The T6041 firmware's property-change reports, which carry the ring producer position.
+const EPIC_SUBTYPE_PROPERTY_CHANGE: u16 = 0x20;
+const CALLTYPE_AUDIO_ATTACH_DEVICE: u32 = 0xc3000002;
 const CALLTYPE_AUDIO_GET_PROP: u32 = 0xc3000004;
 const CALLTYPE_AUDIO_SET_PROP: u32 = 0xc3000005;
 const AUDIO_DEV_LPAI: u32 = from_fourcc(b"lpai");
+/// The T6041 I/O buffer device: takes the host ring the low-power microphone produces into.
+const AUDIO_DEV_IO_BUFFER: u32 = from_fourcc(b"adpx");
+/// kIOReturnBusy from the firmware: the device is already attached.
+const AUDIO_RET_BUSY: u32 = 0xe00002d5;
 
 /// Property 200: the device's current power state (a FourCC).
 const PROP_POWER_STATE: u32 = 200;
@@ -51,6 +68,17 @@ const PROP_POWER_STATE: u32 = 200;
 const PROP_POWER_REQUEST: u32 = 202;
 /// Property 302: the stream format of the inline samples ([`StreamFormat`]).
 const PROP_STREAM_FORMAT: u32 = 302;
+/// T6041: `adpx` property 300, the host ring ([`IoBufferBinding`]).
+const PROP_IO_BUFFER: u32 = 300;
+/// T6041: `lpai` property 301, the stream format (as the inline firmware's 302).
+const PROP_RING_FORMAT: u32 = 301;
+/// T6041: `lpai` property 302, the ring geometry: clock domain, a reserved
+/// word, the ring's frames and the frames per producer report.
+const PROP_RING_GEOMETRY: u32 = 302;
+const GEOMETRY_RING_FRAMES: usize = 0x08;
+const GEOMETRY_REPORT_FRAMES: usize = 0x10;
+/// T6041: the stream status property whose changes report the producer.
+const PROP_STREAM_STATUS: u32 = 305;
 const POWER_STATE_RUN: u32 = from_fourcc(b"runn");
 const POWER_STATE_IDLE: u32 = from_fourcc(b"idle");
 /// The power request's parameter for an input device.
@@ -68,6 +96,18 @@ const INNER_HEADER_BYTES: usize = 0x24;
 /// stream events, hardware errors and history records).
 const INNER_KIND_SAMPLES: u32 = 1;
 
+/// T6041 property-change report: an envelope magic, the property and the
+/// length of its status, then the status words, among them the index of the
+/// last completed frame and the ring's write cursor in bytes.
+const CHANGE_MAGIC: usize = 0x24;
+const CHANGE_PROPERTY: usize = 0x30;
+const CHANGE_STATUS_BYTES: usize = 0x34;
+const STATUS_LAST_FRAME: usize = 0x40;
+const STATUS_RING_CURSOR: usize = 0x60;
+const CHANGE_REPORT_MIN: usize = 0x68;
+const PROPERTY_CHANGE_MAGIC: u32 = from_fourcc(b"pchg");
+const STREAM_STATUS_BYTES: u32 = 48;
+
 /// Firmware power requests carry a timestamp in the 24 MHz always-on
 /// timebase; the architected counter may run at a different rate.
 const AOP_TIMEBASE_HZ: u64 = 24_000_000;
@@ -84,7 +124,8 @@ const WARN_MALFORMED: usize = 0;
 const WARN_GAP: usize = 1;
 const WARN_BACKWARDS: usize = 2;
 const WARN_OVERRUN: usize = 3;
-const WARN_COUNT: usize = 4;
+const WARN_CURSOR: usize = 4;
+const WARN_COUNT: usize = 5;
 
 fn le_u32(buf: &[u8], off: usize) -> Option<u32> {
     let b = buf.get(off..off.checked_add(4)?)?;
@@ -114,6 +155,39 @@ fn aop_timestamp() -> Result<u64> {
     // SAFETY: both helpers read the architected timer and take no arguments.
     let (counter, rate) = unsafe { (bindings::arch_timer_counter(), bindings::arch_timer_rate()) };
     aop_counter_ticks(counter, u64::from(rate))
+}
+
+#[repr(C, packed(4))]
+#[derive(Clone, Copy, Default)]
+struct AudioAttachDevice {
+    _zero0: u32,
+    unk0: u32,
+    calltype: u32,
+    _zero1: [u8; 16],
+    _cookie: u32,
+    len: u64,
+    dev_id: u32,
+    _zero2: u32,
+}
+
+impl AudioAttachDevice {
+    fn new(dev_id: u32) -> Self {
+        Self {
+            unk0: 0xffffffff,
+            calltype: CALLTYPE_AUDIO_ATTACH_DEVICE,
+            len: 0x2c,
+            dev_id,
+            ..Self::default()
+        }
+    }
+}
+
+/// T6041 `adpx` property 300: the ring's first IOVA and its length.
+#[repr(C, packed(4))]
+#[derive(Clone, Copy, Default)]
+struct IoBufferBinding {
+    iova: u64,
+    bytes: u64,
 }
 
 #[repr(C, packed(4))]
@@ -192,26 +266,56 @@ struct PowerRequest {
 
 static_assert!(mem::size_of::<PowerRequest>() == 48);
 
-/// Property 302 of the inline-sample firmware: a non-zero sample-format
-/// selector, the rate, the channels per frame and the bytes per channel.
+/// The stream format property (302 of the inline-sample firmware, 301 of the
+/// T6041 one): a non-zero sample-format selector, the rate, the channels per
+/// frame and the bytes per channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StreamFormat {
     pub(crate) rate: u32,
     pub(crate) channels: u32,
+    /// The bytes each sample takes in a frame.
     pub(crate) bytes_per_channel: u32,
+    /// The significant bits of a sample, most-significant aligned.
+    pub(crate) valid_bits: u32,
 }
 
+/// The T6041 stream format (`lpai` property 301) gives the sample's valid
+/// bytes; the ring holds every sample in a 4-byte container, most-significant
+/// aligned (24 valid bits over a zero low byte), so a frame is four bytes per
+/// channel.  The ring geometry and the producer cursor are checked against
+/// that frame size.
+const RING_CONTAINER_BYTES: u32 = 4;
+
 impl StreamFormat {
-    /// Decodes the 16-byte property; `None` for a format this driver cannot
-    /// present as an ALSA PCM.
+    /// Decodes the inline firmware's 16-byte property, whose last word is the
+    /// sample size; `None` for a format this driver cannot present.
     pub(crate) fn parse(prop: &[u8]) -> Option<Self> {
+        let bytes = le_u32(prop, 0xc)?;
+        Self::new(prop, bytes, bytes)
+    }
+
+    /// Decodes the T6041 property, whose last word is the valid bytes of a
+    /// sample in its 4-byte container.
+    pub(crate) fn parse_ring(prop: &[u8]) -> Option<Self> {
+        let valid = le_u32(prop, 0xc)?;
+        Self::new(prop, RING_CONTAINER_BYTES, valid)
+    }
+
+    fn new(prop: &[u8], bytes: u32, valid: u32) -> Option<Self> {
         let selector = le_u32(prop, 0x0)?;
         let fmt = Self {
             rate: le_u32(prop, 0x4)?,
             channels: le_u32(prop, 0x8)?,
-            bytes_per_channel: le_u32(prop, 0xc)?,
+            bytes_per_channel: bytes,
+            valid_bits: valid.checked_mul(8)?,
         };
-        if selector == 0 || fmt.rate == 0 || fmt.channels == 0 || fmt.channels > 8 {
+        if selector == 0
+            || fmt.rate == 0
+            || fmt.channels == 0
+            || fmt.channels > 8
+            || valid == 0
+            || valid > bytes
+        {
             return None;
         }
         fmt.alsa_format()?;
@@ -222,7 +326,7 @@ impl StreamFormat {
         (self.channels * self.bytes_per_channel) as usize
     }
 
-    /// Signed little-endian PCM of the channel width.
+    /// Signed little-endian PCM of the container width.
     fn alsa_format(&self) -> Option<u64> {
         match self.bytes_per_channel {
             2 => Some(bindings::BINDINGS_SNDRV_PCM_FMTBIT_S16_LE),
@@ -276,6 +380,39 @@ pub(crate) fn parse_sample_report(
         offset: REPORT_INNER + INNER_HEADER_BYTES,
         len,
     })
+}
+
+/// A T6041 producer report: the absolute producer byte count and the ring's
+/// write cursor, `None` unless it is a well-formed stream-status change.
+pub(crate) fn parse_ring_report(report: &[u8], frame_bytes: usize) -> Option<(u64, u64)> {
+    if report.len() < CHANGE_REPORT_MIN
+        || le_u32(report, CHANGE_MAGIC)? != PROPERTY_CHANGE_MAGIC
+        || le_u32(report, CHANGE_PROPERTY)? != PROP_STREAM_STATUS
+        || le_u32(report, CHANGE_STATUS_BYTES)? != STREAM_STATUS_BYTES
+    {
+        return None;
+    }
+    let absolute = le_u64(report, STATUS_LAST_FRAME)?
+        .checked_add(1)?
+        .checked_mul(frame_bytes as u64)?;
+    Some((absolute, le_u64(report, STATUS_RING_CURSOR)?))
+}
+
+/// What the consumer at `copied` does with a ring producer position.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RingStep {
+    /// Take the position without copying (first report, backwards, overrun).
+    Rebase,
+    Copy(usize),
+}
+
+pub(crate) fn ring_step(copied: Option<u64>, absolute: u64, ring_bytes: usize) -> RingStep {
+    match copied {
+        Some(c) if absolute >= c && ((absolute - c) as usize) < ring_bytes => {
+            RingStep::Copy((absolute - c) as usize)
+        }
+        _ => RingStep::Rebase,
+    }
 }
 
 /// What a sample span means for a consumer at `copied`: the bytes of the
@@ -341,6 +478,14 @@ struct StreamState {
 // close clears it under the same lock.
 unsafe impl Send for StreamState {}
 
+/// Where the samples come from.
+enum Source {
+    /// In the sample reports themselves.
+    Inline,
+    /// In a host ring of `ring_bytes` the firmware produces into.
+    Ring { ring: Arc<SourceRing>, ring_bytes: usize },
+}
+
 /// The low-power microphone capture of one AOP audio device.
 #[pin_data]
 pub(crate) struct LpaiCapture {
@@ -348,6 +493,11 @@ pub(crate) struct LpaiCapture {
     adata: Arc<dyn AOP>,
     service: EPICService,
     format: StreamFormat,
+    source: Source,
+    /// The report subtype the listener takes.
+    subtype: u16,
+    /// The power request's device field: `lpai` on the inline firmware, 0 on T6041.
+    power_dev_id: u32,
     sequence: Atomic<u32>,
     /// The PCM holds `runn`.
     powered: AtomicFlag,
@@ -427,12 +577,117 @@ impl LpaiCapture {
             format.channels,
             format.bytes_per_channel
         );
+        Self::register(dev, adata, service, format, Source::Inline, EPIC_SUBTYPE_LPAI_SAMPLES, AUDIO_DEV_LPAI)
+            .map(Some)
+    }
+
+    /// T6041: binds the host ring and registers the producer listener.  `lpai`
+    /// is already attached with its channel masks set.  The ring is allocated
+    /// on `bus`, the audio node, whose DART stream is the I/O buffer device's;
+    /// a node without one yields `Ok(None)`.
+    ///
+    /// The geometry is read before the binding so the ring has exactly the
+    /// size the firmware describes (frames times frame bytes).
+    pub(crate) fn new_ring(
+        bus: &device::Device<device::Bound>,
+        dev: &ARef<device::Device>,
+        adata: &Arc<dyn AOP>,
+        service: EPICService,
+        has_iommu: bool,
+    ) -> Result<Option<Arc<Self>>> {
+        if !has_iommu {
+            return Ok(None);
+        }
+        let attach = AudioAttachDevice::new(AUDIO_DEV_IO_BUFFER);
+        // SAFETY: the request is a plain packed firmware record.
+        let bytes = unsafe {
+            slice::from_raw_parts(ptr::from_ref(&attach).cast::<u8>(), mem::size_of_val(&attach))
+        };
+        match adata.epic_call(&service, EPIC_SUBTYPE_WRAPPED_CALL, bytes)? {
+            0 | AUDIO_RET_BUSY => {}
+            ret => {
+                dev_err!(dev, "unable to attach the lpai I/O buffer: {:#x}\n", ret);
+                return Err(EIO);
+            }
+        }
+        let geo = Self::get_prop(adata, &service, dev, PROP_RING_GEOMETRY, 24)?;
+        let prop = Self::get_prop(adata, &service, dev, PROP_RING_FORMAT, 16)?;
+        let Some(format) = StreamFormat::parse_ring(&prop) else {
+            dev_warn!(
+                dev,
+                "lpai: unsupported stream format ({} Hz, {} channels, {} bytes), no low-power PCM\n",
+                le_u32(&prop, 0x4).unwrap_or(0),
+                le_u32(&prop, 0x8).unwrap_or(0),
+                le_u32(&prop, 0xc).unwrap_or(0)
+            );
+            return Ok(None);
+        };
+        let frames = le_u64(&geo, GEOMETRY_RING_FRAMES).ok_or(EIO)?;
+        let quantum = le_u64(&geo, GEOMETRY_REPORT_FRAMES).ok_or(EIO)?;
+        let ring_bytes = frames
+            .checked_mul(format.frame_bytes() as u64)
+            .filter(|b| *b > 0 && *b <= u64::from(u32::MAX))
+            .ok_or(EIO)? as usize;
+        if quantum == 0 || quantum > frames / 2 {
+            dev_err!(dev, "invalid lpai ring geometry: {} frames, {} per report\n", frames, quantum);
+            return Err(EIO);
+        }
+        let ring = adata.bound_ring(bus, ring_bytes, &mut |iova, len| {
+            let req = AudioSetDeviceProp::new(
+                AUDIO_DEV_IO_BUFFER,
+                PROP_IO_BUFFER,
+                IoBufferBinding { iova, bytes: len },
+            );
+            // SAFETY: the request is a plain packed firmware record.
+            let bytes = unsafe {
+                slice::from_raw_parts(ptr::from_ref(&req).cast::<u8>(), mem::size_of_val(&req))
+            };
+            match adata.epic_call(&service, EPIC_SUBTYPE_WRAPPED_CALL, bytes)? {
+                0 => Ok(()),
+                ret => {
+                    dev_err!(dev, "lpai ring binding refused: {:#x}\n", ret);
+                    Err(EIO)
+                }
+            }
+        })?;
+        dev_dbg!(
+            dev,
+            "lpai: {} Hz, {} channels, ring {} frames, {} per report\n",
+            format.rate,
+            format.channels,
+            frames,
+            quantum
+        );
+        Self::register(
+            dev,
+            adata,
+            service,
+            format,
+            Source::Ring { ring, ring_bytes },
+            EPIC_SUBTYPE_PROPERTY_CHANGE,
+            0,
+        )
+        .map(Some)
+    }
+
+    fn register(
+        dev: &ARef<device::Device>,
+        adata: &Arc<dyn AOP>,
+        service: EPICService,
+        format: StreamFormat,
+        source: Source,
+        subtype: u16,
+        power_dev_id: u32,
+    ) -> Result<Arc<Self>> {
         let this = Arc::pin_init(
             try_pin_init!(Self {
                 dev: dev.clone(),
                 adata: adata.clone(),
                 service,
                 format,
+                source,
+                subtype,
+                power_dev_id,
                 sequence: Atomic::new(0),
                 powered: AtomicFlag::new(false),
                 running: AtomicFlag::new(false),
@@ -451,22 +706,21 @@ impl LpaiCapture {
             GFP_KERNEL,
         )?;
         let listener: Arc<dyn ReportListener> = this.clone();
-        adata.add_report_listener(service, EPIC_SUBTYPE_LPAI_SAMPLES, listener)?;
-        Ok(Some(this))
+        adata.add_report_listener(service, subtype, listener)?;
+        Ok(this)
     }
 
     /// Stops report delivery; returns once no report callback runs.
     pub(crate) fn detach(&self) {
         self.running.store(false, Relaxed);
-        self.adata
-            .remove_report_listener(&self.service, EPIC_SUBTYPE_LPAI_SAMPLES);
+        self.adata.remove_report_listener(&self.service, self.subtype);
     }
 
     fn set_power(&self, state: u32) -> Result<()> {
         let _guard = self.power.lock();
         let sequence = self.sequence.fetch_add(1, Relaxed).wrapping_add(1);
         let req = PowerRequest {
-            dev_id: AUDIO_DEV_LPAI,
+            dev_id: self.power_dev_id,
             sequence,
             timestamp: aop_timestamp()?,
             state,
@@ -555,8 +809,77 @@ impl LpaiCapture {
     }
 }
 
+impl LpaiCapture {
+    /// Copies what a ring producer report announces.
+    fn process_ring_report(&self, ring: &SourceRing, ring_bytes: usize, report: &[u8]) -> Result<()> {
+        let frame = self.format.frame_bytes();
+        let Some((absolute, cursor)) = parse_ring_report(report, frame) else {
+            // Other property changes share the subtype.
+            return Ok(());
+        };
+        if cursor != absolute % ring_bytes as u64 {
+            if self.warn_once(WARN_CURSOR) {
+                dev_warn!(self.dev, "inconsistent lpai report: {} bytes, cursor {:#x}\n", absolute, cursor);
+            }
+            return Ok(());
+        }
+        let mut st = self.stream.lock();
+        if !self.running.load(Relaxed) || st.substream.is_null() || st.buffer_bytes == 0 {
+            return Ok(());
+        }
+        let len = match ring_step(st.copied, absolute, ring_bytes) {
+            RingStep::Rebase => {
+                if let Some(c) = st.copied {
+                    let class = if absolute < c { WARN_BACKWARDS } else { WARN_OVERRUN };
+                    if self.warn_once(class) {
+                        dev_warn!(self.dev, "lpai ring position lost, continuing at the producer\n");
+                    }
+                }
+                st.copied = Some(absolute);
+                return Ok(());
+            }
+            RingStep::Copy(0) => return Ok(()),
+            RingStep::Copy(len) => len,
+        };
+        let from = st.copied.unwrap_or(absolute);
+        // SAFETY: as for the inline reports below.
+        let dma_area = unsafe { (*(*st.substream).runtime).dma_area };
+        let mut src = (from % ring_bytes as u64) as usize;
+        let mut dst = st.hw_ptr_bytes;
+        let mut left = len;
+        while left > 0 {
+            let n = left.min(ring_bytes - src).min(st.buffer_bytes - dst);
+            // SAFETY: dst + n <= buffer_bytes, and the buffer stays mapped
+            // while the substream is set in the stream state.
+            let span = unsafe { slice::from_raw_parts_mut(dma_area.add(dst), n) };
+            ring.read(src, span)?;
+            src = (src + n) % ring_bytes;
+            dst = (dst + n) % st.buffer_bytes;
+            left -= n;
+        }
+        self.advance(&mut st, absolute, dst, len);
+        Ok(())
+    }
+
+    fn advance(&self, st: &mut StreamState, absolute: u64, new_ptr: usize, len: usize) {
+        st.hw_ptr_bytes = new_ptr;
+        st.copied = Some(absolute);
+        st.period_acc += len;
+        self.hw_ptr_frames
+            .store((new_ptr / self.format.frame_bytes()) as u32, Release);
+        if st.period_bytes != 0 && st.period_acc >= st.period_bytes {
+            st.period_acc %= st.period_bytes;
+            // SAFETY: the substream is valid while registered in the state.
+            unsafe { bindings::snd_pcm_period_elapsed(st.substream) };
+        }
+    }
+}
+
 impl ReportListener for LpaiCapture {
     fn process_report(&self, _subtype: u16, report: &[u8]) -> Result<()> {
+        if let Source::Ring { ring, ring_bytes } = &self.source {
+            return self.process_ring_report(ring, *ring_bytes, report);
+        }
         let frame = self.format.frame_bytes();
         let span = match parse_sample_report(report, frame) {
             Ok(s) => s,
@@ -601,15 +924,7 @@ impl ReportListener for LpaiCapture {
         let dma_area = unsafe { (*(*st.substream).runtime).dma_area };
         // SAFETY: as above; `hw_ptr_bytes` stays below `buffer_bytes`.
         let new_ptr = unsafe { copy_into(dma_area, st.buffer_bytes, st.hw_ptr_bytes, samples) };
-        st.hw_ptr_bytes = new_ptr;
-        st.copied = Some(span.end);
-        st.period_acc += samples.len();
-        self.hw_ptr_frames.store((new_ptr / frame) as u32, Release);
-        if st.period_bytes != 0 && st.period_acc >= st.period_bytes {
-            st.period_acc %= st.period_bytes;
-            // SAFETY: the substream is valid while registered in the state.
-            unsafe { bindings::snd_pcm_period_elapsed(st.substream) };
-        }
+        self.advance(&mut st, span.end, new_ptr, samples.len());
         Ok(())
     }
 }
@@ -628,6 +943,21 @@ unsafe extern "C" fn pcm_open(substream: *mut bindings::snd_pcm_substream) -> i3
     let data = unsafe { pcm_data(substream) };
     // SAFETY: the runtime exists for the op's duration.
     unsafe { (*(*substream).runtime).hw = data.hw() };
+    let width = data.format.bytes_per_channel * 8;
+    if data.format.valid_bits < width {
+        // SAFETY: as above; the constraint only describes the samples.
+        let ret = unsafe {
+            bindings::snd_pcm_hw_constraint_msbits(
+                (*substream).runtime,
+                0,
+                width,
+                data.format.valid_bits,
+            )
+        };
+        if ret < 0 {
+            return ret;
+        }
+    }
     data.running.store(false, Relaxed);
     let mut st = data.stream.lock();
     st.substream = substream;
@@ -804,12 +1134,48 @@ mod tests {
         p[8..12].copy_from_slice(&3u32.to_le_bytes());
         p[12..16].copy_from_slice(&2u32.to_le_bytes());
         let f = StreamFormat::parse(&p).unwrap();
-        assert_eq!(f.frame_bytes(), 6);
+        assert_eq!((f.frame_bytes(), f.valid_bits), (6, 16));
+        assert_eq!(f.alsa_format(), Some(bindings::BINDINGS_SNDRV_PCM_FMTBIT_S16_LE));
+        // T6041: three valid bytes in each 4-byte container.
+        p[12..16].copy_from_slice(&3u32.to_le_bytes());
+        let r = StreamFormat::parse_ring(&p).unwrap();
+        assert_eq!((r.frame_bytes(), r.valid_bits), (12, 24));
+        assert_eq!(r.alsa_format(), Some(bindings::BINDINGS_SNDRV_PCM_FMTBIT_S32_LE));
+        assert!(StreamFormat::parse(&p).is_none());
+        p[12..16].copy_from_slice(&5u32.to_le_bytes());
+        assert!(StreamFormat::parse_ring(&p).is_none());
+        p[12..16].copy_from_slice(&2u32.to_le_bytes());
         p[0..4].copy_from_slice(&0u32.to_le_bytes());
         assert!(StreamFormat::parse(&p).is_none());
-        p[0..4].copy_from_slice(&1u32.to_le_bytes());
-        p[12..16].copy_from_slice(&3u32.to_le_bytes());
-        assert!(StreamFormat::parse(&p).is_none());
+    }
+
+    fn change(last_frame: u64, cursor: u64, property: u32) -> [u8; CHANGE_REPORT_MIN] {
+        let mut r = [0u8; CHANGE_REPORT_MIN];
+        r[CHANGE_MAGIC..CHANGE_MAGIC + 4].copy_from_slice(&PROPERTY_CHANGE_MAGIC.to_le_bytes());
+        r[CHANGE_PROPERTY..CHANGE_PROPERTY + 4].copy_from_slice(&property.to_le_bytes());
+        r[CHANGE_STATUS_BYTES..CHANGE_STATUS_BYTES + 4]
+            .copy_from_slice(&STREAM_STATUS_BYTES.to_le_bytes());
+        r[STATUS_LAST_FRAME..STATUS_LAST_FRAME + 8].copy_from_slice(&last_frame.to_le_bytes());
+        r[STATUS_RING_CURSOR..STATUS_RING_CURSOR + 8].copy_from_slice(&cursor.to_le_bytes());
+        r
+    }
+
+    #[test]
+    fn a_ring_report_gives_the_producer_after_the_last_completed_frame() {
+        let r = change(3199, 38400, PROP_STREAM_STATUS);
+        assert_eq!(parse_ring_report(&r, 12), Some((38400, 38400)));
+        assert_eq!(parse_ring_report(&change(3199, 38400, 304), 12), None);
+        assert_eq!(parse_ring_report(&r[..CHANGE_REPORT_MIN - 1], 12), None);
+        assert_eq!(parse_ring_report(&change(u64::MAX, 0, PROP_STREAM_STATUS), 12), None);
+    }
+
+    #[test]
+    fn the_ring_consumer_starts_at_the_producer_and_rebases_on_loss() {
+        assert_eq!(ring_step(None, 38400, 768000), RingStep::Rebase);
+        assert_eq!(ring_step(Some(38400), 76800, 768000), RingStep::Copy(38400));
+        assert_eq!(ring_step(Some(76800), 38400, 768000), RingStep::Rebase);
+        assert_eq!(ring_step(Some(0), 768000, 768000), RingStep::Rebase);
+        assert_eq!(ring_step(Some(0), 767988, 768000), RingStep::Copy(767988));
     }
 
     #[test]
