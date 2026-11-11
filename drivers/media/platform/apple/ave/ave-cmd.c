@@ -107,7 +107,8 @@ int ave_cmd_complete(struct ave_ctx *ctx, unsigned int count)
 	int ret = 0;
 
 	for (unsigned int i = 0; i < count && !ret; i++)
-		ret = ave_cmd_scalar(ctx, AVE_OP_COMPLETE, 0, ave_session_arg2(ctx));
+		ret = ave_cmd_scalar(ctx, AVE_OP_COMPLETE, ctx->sess->frame_arg0,
+				     ave_session_arg2(ctx));
 	return ret;
 }
 
@@ -139,7 +140,8 @@ int ave_cmd_close(struct ave_ctx *ctx)
 	err = ave_cmd_scalar(ctx, AVE_OP_CLOSE, AVE_SESSION_ARG0, arg2);
 	if (!err)
 		err = ave_ipc_settle(ctx->ave, AVE_CMD_WAIT_MS);
-	if (legacy || !err)
+	/* Only a fully answered Stop and Close end the session in the firmware. */
+	if (!ret && !err)
 		ctx->sess->fw_open = false;
 	return ret ?: err;
 }
@@ -175,7 +177,7 @@ int ave_cmd_start(struct ave_ctx *ctx)
 
 int ave_cmd_process(struct ave_ctx *ctx, unsigned int slot,
 		    struct vb2_v4l2_buffer *src, dma_addr_t input, u32 bitrate,
-		    bool force_key)
+		    bool force_key, bool last)
 {
 	struct ave_dev *ave = ctx->ave;
 	struct ave_session *sess = ctx->sess;
@@ -199,7 +201,8 @@ int ave_cmd_process(struct ave_ctx *ctx, unsigned int slot,
 	cmd = ave_ipc_cmd(ave, buf, len);
 	if (!cmd)
 		return -EBUSY;
-	ret = ave_build_process(ctx, cmd, len, slot, input, bitrate, force_key);
+	ret = ave_build_process(ctx, cmd, len, slot, input, bitrate, force_key,
+				last);
 	if (ret)
 		return ret;
 	if (!sess->frames)

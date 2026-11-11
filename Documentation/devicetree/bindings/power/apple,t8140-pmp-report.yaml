@@ -137,21 +137,44 @@ patternProperties:
         $ref: /schemas/types.yaml#/definitions/uint32-array
         items:
           - description: SOC-DEV-DVFS entry holding the device's request.
-          - description: Performance level requested while powered (0-31).
+          - description:
+              Main-field performance level requested while powered (0-31).
+              Legacy trees with apple,dvfs-request-class instead use this as
+              that single request class's level.
             maximum: 31
         description:
           The device also has a performance request. While the domain is
           powered, after the PMP acknowledges the device, the host writes the
-          level (with the valid bit) to the entry once; before clearing the
-          device request it writes level 0.
+          complete request word (with the valid bit) to the entry once; before
+          clearing the device request it writes every level as 0.
+
+      apple,dvfs-request-levels:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        minItems: 2
+        maxItems: 10
+        description:
+          Request-class and level pairs. Classes 0x21 through 0x25 occupy the
+          four-bit fields at bits 35:32 through 51:48; levels are 0 through
+          15. Each class may occur once. These fields are combined with the
+          main level in apple,dvfs into one 64-bit request word.
+
+      apple,adt-dvfs:
+        type: boolean
+        description:
+          The bootloader fills apple,dvfs and apple,dvfs-request-levels from
+          this machine's ADT (the soc-device's SOC-DEV-DVFS slot and its named
+          PMGR performance sources). Without this property the bootloader
+          leaves the entry as it is. If the bootloader does not fill it, the
+          entry sends no performance request.
 
       apple,dvfs-request-class:
         $ref: /schemas/types.yaml#/definitions/uint32
         enum: [0x21, 0x22, 0x23, 0x24, 0x25]
+        deprecated: true
         description:
-          Request class holding the level. Classes 0x21 through
-          0x25 occupy the four-bit fields at bits 35:32 through 51:48. If
-          absent, apple,dvfs uses the default five-bit field at bits 4:0.
+          Legacy single request class holding apple,dvfs's second cell. New
+          trees use apple,dvfs-request-levels so a main level and multiple
+          class levels can be requested together.
 
       apple,always-on:
         type: boolean
@@ -183,6 +206,18 @@ patternProperties:
       - reg
       - label
       - '#power-domain-cells'
+
+    allOf:
+      - not:
+          required:
+            - apple,dvfs-request-levels
+            - apple,dvfs-request-class
+
+    dependentRequired:
+      apple,dvfs-request-levels:
+        - apple,dvfs
+      apple,dvfs-request-class:
+        - apple,dvfs
 
 required:
   - compatible

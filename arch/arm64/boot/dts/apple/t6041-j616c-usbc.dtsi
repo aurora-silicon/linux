@@ -15,6 +15,17 @@
 	};
 
 	reserved-memory {
+		/*
+		 * The loader replaces this placeholder with the internal DCP's
+		 * TEXT, which the external processors share, as on the M4 Pro.
+		 */
+		dcpext1_text: dcpext1-text {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
 		dcpext1_data: dcpext1-data {
 			compatible = "apple,asc-mem";
 			reg = <0x0 0x0 0x0 0x4000>;
@@ -41,8 +52,8 @@
 	/* indexed by route */
 	apple,typec-dptx-phys = <0 1 2>;
 	apple,typec-mux-indices = <2 2 2>;
-	memory-region = <&dcpext1_data>, <&dcpext1_heap>;
-	memory-region-names = "data", "heap";
+	memory-region = <&dcpext1_text>, <&dcpext1_data>, <&dcpext1_heap>;
+	memory-region-names = "text", "data", "heap";
 
 	typec-routes {
 		#address-cells = <1>;

@@ -155,6 +155,10 @@ mod cleanup {
     pub struct QueueOwner;
     impl QueueOwner { pub fn new() -> crate::Result<Self> { Ok(Self) } }
 }
+mod legacy_rx {
+    pub struct QueueOwner;
+    impl QueueOwner { pub fn new() -> crate::Result<Self> { Ok(Self) } }
+}
 mod driver {
     use super::*;
     #[pin_data]

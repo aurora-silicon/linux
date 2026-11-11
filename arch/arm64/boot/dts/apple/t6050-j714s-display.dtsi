@@ -1,0 +1,264 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J714s external displays: DisplayPort alt mode on the left-front and right ports and USB4
+ * DisplayPort tunnels on the right port. dcpext0 and dcpext2 drive the routes; dcpext1 and
+ * dcpext3 are their pairs for modes that need two pipelines. The left-back port (ATC0) is the
+ * debug port and is not described. Addresses and interrupts are from the J714sAP ADT. The boot
+ * loader hands each engine over: it enables the engine, its mailbox and DARTs, publishes its
+ * bandwidth scratch and adds its display DART to the display subsystem.
+ */
+
+&dcpext1 {
+	apple,dcp-index = <2>;
+	apple,connector-type = "USB-C";
+	apple,dptx-die = <0>;
+};
+
+&dcpext2 {
+	apple,dcp-index = <3>;
+	apple,connector-type = "USB-C";
+	apple,dptx-die = <0>;
+	apple,typec-dptx-phys = <2 1>;
+	apple,typec-mux-indices = <4 4>;
+	phys = <&atc2_phy 6>, <&atc1_phy 6>;
+	phy-names = "typec0", "typec1";
+	mux-controls = <&atc2_xbar 0>, <&atc2_xbar 1>, <&atc2_xbar 2>, <&atc2_xbar 3>,
+		       <&atc2_xbar 4>, <&atc1_dpxbar 0>, <&atc1_dpxbar 1>, <&atc1_dpxbar 2>,
+		       <&atc1_dpxbar 3>, <&atc1_dpxbar 4>;
+	mux-control-names = "typec0", "typec0-dpin0", "typec0-dpin1", "typec0-dpin2",
+			    "typec0-dpin3", "typec1", "typec1-dpin0", "typec1-dpin1",
+			    "typec1-dpin2", "typec1-dpin3";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+
+			port {
+				dcpext2_right: endpoint {
+					remote-endpoint = <&hpm2_dp1>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+
+			port {
+				dcpext2_left: endpoint {
+					remote-endpoint = <&typec1_dp1>;
+				};
+			};
+		};
+	};
+};
+
+&dcpext3 {
+	apple,dcp-index = <4>;
+	apple,connector-type = "USB-C";
+	apple,dptx-die = <0>;
+};
+
+&dcpext0 {
+	apple,typec-dptx-phys = <2 1>;
+	apple,typec-mux-indices = <0 0>;
+	phys = <&atc2_phy 6>, <&atc1_phy 6>;
+	phy-names = "typec0", "typec1";
+	mux-controls = <&atc2_xbar 0>, <&atc2_xbar 1>, <&atc2_xbar 2>, <&atc2_xbar 3>,
+		       <&atc2_xbar 4>, <&atc1_dpxbar 0>, <&atc1_dpxbar 1>, <&atc1_dpxbar 2>,
+		       <&atc1_dpxbar 3>, <&atc1_dpxbar 4>;
+	mux-control-names = "typec0", "typec0-dpin0", "typec0-dpin1", "typec0-dpin2",
+			    "typec0-dpin3", "typec1", "typec1-dpin0", "typec1-dpin1",
+			    "typec1-dpin2", "typec1-dpin3";
+
+	typec-routes {
+		route@0 {
+			status = "okay";
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+
+			port {
+				dcpext0_left: endpoint {
+					remote-endpoint = <&typec1_dp0>;
+				};
+			};
+		};
+	};
+};
+
+&hpm2 {
+	connector {
+		ports {
+			port@2 {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				/delete-node/ endpoint;
+
+				hpm2_dp: endpoint@0 {
+					reg = <0>;
+					remote-endpoint = <&dcpext0_typec>;
+				};
+
+				hpm2_dp1: endpoint@1 {
+					reg = <1>;
+					remote-endpoint = <&dcpext2_right>;
+				};
+			};
+		};
+	};
+};
+
+&typec1 {
+	ports {
+		port@2 {
+			reg = <2>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			typec1_dp0: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&dcpext0_left>;
+			};
+
+			typec1_dp1: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext2_left>;
+			};
+		};
+	};
+};
+
+/* Scanout and PIODMA share the first register window, as on dispext0 */
+&dispext1_dart {
+	reg = <0x3 0x92300000 0x0 0xc000>;
+};
+
+&dispext2_dart {
+	reg = <0x3 0x02300000 0x0 0xc000>;
+};
+
+&dispext3_dart {
+	reg = <0x3 0x06300000 0x0 0xc000>;
+};
+
+&atc2_xbar {
+	status = "okay";
+};
+
+&atc1_dpxbar {
+	power-domains = <&ps_atc1_usb_aon>, <&ps_atc1_common>;
+	power-domain-names = "usb-aon", "common";
+	status = "okay";
+};
+
+&ps_atc2_common_dp_0 {
+	status = "okay";
+};
+
+&ps_atc2_common_dp_1 {
+	status = "okay";
+};
+
+&ps_atc2_common_dp_2 {
+	status = "okay";
+};
+
+&ps_atc2_common_dp_3 {
+	status = "okay";
+};
+
+&ps_atc1_common_dp_0 {
+	status = "okay";
+};
+
+&ps_atc1_common_dp_1 {
+	status = "okay";
+};
+
+&ps_atc1_common_dp_2 {
+	status = "okay";
+};
+
+&ps_atc1_common_dp_3 {
+	status = "okay";
+};
+
+&atc2_phy {
+	reg = <0x3 0x83000000 0x0 0x2c000>,
+	      <0x3 0x82a90000 0x0 0x4000>,
+	      <0x3 0x82800000 0x0 0x4000>,
+	      <0x3 0x83200000 0x0 0x4000>,
+	      <0x3 0x83244000 0x0 0x4000>,
+	      <0x3 0x80000000 0x0 0x8000>,
+	      <0x3 0x80020000 0x0 0x4000>,
+	      <0x3 0x83250000 0x0 0x4000>,
+	      <0x3 0x83140000 0x0 0x4000>,
+	      <0x3 0x830c0000 0x0 0x10000>,
+	      <0x3 0x82a84000 0x0 0x4000>,
+	      <0x2 0x80000068 0x0 0x10>;
+	reg-names = "core", "usb2phy", "usb2-digital", "reset", "fabric", "axi2af", "lioa",
+		    "common-cfg", "usb-control", "firmware-data", "pipehandler",
+		    "dp-clock-source";
+	power-domains = <&ps_atc2_usb_aon>, <&ps_atc2_common>, <&ps_atc2_phymxwrap>,
+			<&ps_atc2_usb>, <&ps_atc2_common_dp_0>, <&ps_atc2_common_dp_1>,
+			<&ps_atc2_common_dp_2>, <&ps_atc2_common_dp_3>;
+	power-domain-names = "usb-aon", "common", "wrapper", "usb", "dp0", "dp1", "dp2", "dp3";
+};
+
+&atc1_phy {
+	reg = <0x2 0xab000000 0x0 0x2c000>,
+	      <0x2 0xaaa90000 0x0 0x4000>,
+	      <0x2 0xaa800000 0x0 0x4000>,
+	      <0x2 0xab200000 0x0 0x4000>,
+	      <0x2 0xab244000 0x0 0x4000>,
+	      <0x2 0xa8000000 0x0 0x8000>,
+	      <0x2 0xa8020000 0x0 0x4000>,
+	      <0x2 0xab250000 0x0 0x4000>,
+	      <0x2 0xab140000 0x0 0x4000>,
+	      <0x2 0xab0c0000 0x0 0x10000>,
+	      <0x2 0xaaa84000 0x0 0x4000>,
+	      <0x2 0x80000058 0x0 0x10>;
+	reg-names = "core", "usb2phy", "usb2-digital", "reset", "fabric", "axi2af", "lioa",
+		    "common-cfg", "usb-control", "firmware-data", "pipehandler",
+		    "dp-clock-source";
+	power-domains = <&ps_atc1_usb_aon>, <&ps_atc1_common>, <&ps_atc1_phymxwrap>,
+			<&ps_atc1_usb>, <&ps_atc1_common_dp_0>, <&ps_atc1_common_dp_1>,
+			<&ps_atc1_common_dp_2>, <&ps_atc1_common_dp_3>;
+	power-domain-names = "usb-aon", "common", "wrapper", "usb", "dp0", "dp1", "dp2", "dp3";
+};
+
+/* The right router's DP IN interrupts (ADT atc2-dpin0..3) */
+&acio2 {
+	interrupts = <AIC_IRQ 0 1667 IRQ_TYPE_LEVEL_HIGH>, <AIC_IRQ 0 1668 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 0 1673 IRQ_TYPE_LEVEL_HIGH>, <AIC_IRQ 0 1674 IRQ_TYPE_LEVEL_HIGH>;
+	interrupt-names = "dpin0", "dpin1", "dpin2", "dpin3";
+};
+
+/* The right router's suppliers, disabled in the inventory */
+&ps_atc2_cio {
+	status = "okay";
+};
+
+&ps_atc2_cio_pcie {
+	status = "okay";
+};
+
+&ps_atc2_cio_usb {
+	status = "okay";
+};
+
+&ps_atc2_cio_auss {
+	status = "okay";
+};
+
+&ps_atc2_pcie {
+	status = "okay";
+};

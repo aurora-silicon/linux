@@ -76,6 +76,9 @@ static void ave_test_session(struct ave_session *sess, enum ave_codec codec,
 		}
 	for (unsigned int i = 0; i < 2; i++)
 		ave_test_buf(&sess->hevc_extra[i], &index);
+	for (unsigned int i = 0; i < 2; i++)
+		ave_test_buf(&sess->hevc_transcoded[i], &index);
+	sess->hevc_transcoded[1].size = sess->hevc_transcoded[0].size;
 	for (unsigned int i = 0; i < p->slots; i++) {
 		ave_test_buf(&sess->slot[i].coded, &index);
 		ave_test_buf(&sess->slot[i].meta, &index);
@@ -180,7 +183,8 @@ static void ave_9003_byte_equality(struct kunit *test)
 					test,
 					ave_build_process(ctx, actual, len,
 							  slot, 0x8f0000000ULL,
-							  9000000, !!frame),
+							  9000000, !!frame,
+							  false),
 					0);
 				sess->token = 500;
 				ave_reference_process(ctx, expected, len, slot,
@@ -283,7 +287,7 @@ static void ave_speed_image(struct kunit *test, struct ave_ctx *ctx,
 	else
 		KUNIT_ASSERT_EQ(test, ave_build_process(ctx, cmd, len, 0,
 							0x8f0000000ULL, 8000000,
-							false), 0);
+							false, false), 0);
 	ave_stamp_command(ctx->ave->layout->abi, cmd, 1, 2);
 }
 
@@ -639,16 +643,16 @@ static void ave_6070_start_process_fields(struct kunit *test)
 						get_unaligned_le32(start + sl->h264_level), 41U);
 				KUNIT_EXPECT_EQ(test,
 						get_unaligned_le32(start + sl->h264_max_refs),
-						sess->p.refs - 1);
+						2U);
 				KUNIT_EXPECT_EQ(test,
 						get_unaligned_le32(start + sl->h264_chroma), 1U);
 				KUNIT_EXPECT_EQ(test,
 						get_unaligned_le32(start +
-								     sl->h264_frame_num_bits), 1U);
+								     sl->h264_frame_num_bits), 0U);
 				KUNIT_EXPECT_EQ(test,
 						get_unaligned_le32(start + sl->h264_poc_type), 0U);
 				KUNIT_EXPECT_EQ(test,
-						get_unaligned_le32(start + sl->h264_poc_bits), 2U);
+						get_unaligned_le32(start + sl->h264_poc_bits), 4U);
 				KUNIT_EXPECT_EQ(test,
 						get_unaligned_le32(start + sl->h264_width_mbs),
 						sess->p.cw / 16 - 1);
@@ -725,7 +729,8 @@ static void ave_6070_start_process_fields(struct kunit *test)
 			memset(process, 0, 0x6838);
 			KUNIT_ASSERT_EQ(test,
 					ave_build_process(ctx, process, process_len, slot,
-							  0x8f0000000ULL, 4000000, true),
+							  0x8f0000000ULL, 4000000, true,
+							  false),
 					0);
 			KUNIT_EXPECT_EQ(test, get_unaligned_le16(process),
 					codec == AVE_CODEC_H264 ? 7 : 8);
@@ -788,7 +793,6 @@ static void ave_6070_start_process_fields(struct kunit *test)
 				struct ave_6070_avc_recon_layout recon =
 					ave_6070_avc_recon_layout(sess->p.width, sess->p.height);
 				unsigned int cur_slot = sess->frames % sess->p.refs;
-				unsigned int list0 = (sess->frames - 1) % sess->p.refs;
 
 				if (!sess->p.bframes) {
 					KUNIT_EXPECT_EQ(test,
@@ -806,10 +810,10 @@ static void ave_6070_start_process_fields(struct kunit *test)
 					KUNIT_EXPECT_EQ(test,
 							get_unaligned_le64(process +
 									   pl->list0_recon.luma_data),
-							sess->ref_a[list0].dma + recon.luma_data_offset);
+							0ULL);
 					KUNIT_EXPECT_EQ(test,
 							get_unaligned_le64(process + pl->list0_lowres),
-							sess->ref_c[list0].dma);
+							0ULL);
 					KUNIT_EXPECT_EQ(test,
 							get_unaligned_le64(process + pl->current_colocated),
 							sess->ref_b[cur_slot].dma);
@@ -849,7 +853,8 @@ static void ave_6070_start_process_fields(struct kunit *test)
 			memset(process, 0, 0x6838);
 			KUNIT_ASSERT_EQ(test,
 					ave_build_process(ctx, process, process_len, 0,
-							  0x8f0000000ULL, 4000000, false),
+							  0x8f0000000ULL, 4000000, false,
+							  false),
 					0);
 			KUNIT_EXPECT_EQ(test, process[pl->first_process], 1U);
 			KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + pl->ordinal), 0U);
@@ -903,6 +908,138 @@ static void ave_6070_entropy_interleave(struct kunit *test)
 			0ULL);
 }
 
+static void ave_6070_reordered_pictures(struct kunit *test)
+{
+	struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
+	struct ave_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	struct ave_session *sess = kunit_kzalloc(test, sizeof(*sess), GFP_KERNEL);
+	u8 *cmd = kunit_kzalloc(test, 0x1940, GFP_KERNEL);
+	const struct ave_proc_layout *pl;
+	struct ave_6070_avc_recon_layout recon;
+
+	KUNIT_ASSERT_TRUE(test, ave && ctx && sess && cmd);
+	ave_test_6070_session(test, ave, ctx, sess, AVE_CODEC_H264, 1920, 1080);
+	pl = &ave->layout->process[AVE_CODEC_H264 - 1];
+	recon = ave_6070_avc_recon_layout(1920, 1080);
+
+	for (u32 frame = 0; frame < 5; frame++) {
+		memset(cmd, 0, 0x1940);
+		sess->frames = frame;
+		KUNIT_ASSERT_EQ(test,
+				ave_build_process(ctx, cmd, 0x1940, frame,
+						  0x8f0000000ULL, 4000000, false,
+						  false),
+				0);
+		KUNIT_EXPECT_EQ(test,
+				get_unaligned_le64(cmd + pl->current_recon.luma_data),
+				sess->ref_a[frame].dma + recon.luma_data_offset);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(cmd + pl->frame_type),
+				frame ? frame & 1 ? 2U : 1U : 3U);
+	}
+
+	/* B1 writes slot 1 and reads the past/future anchors in slots 0/2. */
+	sess->frames = 1;
+	memset(cmd, 0, 0x1940);
+	KUNIT_ASSERT_EQ(test,
+			ave_build_process(ctx, cmd, 0x1940, 1, 0x8f0000000ULL,
+					  4000000, false, false),
+			0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(cmd + 0x44), 0U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(cmd + 0x48), 1U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(cmd + 0x5c), 2U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(cmd + 0x68), 1U);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le64(cmd + pl->list0_recon.luma_data),
+			sess->ref_a[0].dma);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le64(cmd + pl->list1_recon.luma_data),
+			sess->ref_a[2].dma);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(cmd + pl->list1_colocated),
+			sess->ref_b[2].dma);
+
+	/* P4 has two ordered past anchors: P2 then IDR0. */
+	sess->frames = 4;
+	memset(cmd, 0, 0x1940);
+	KUNIT_ASSERT_EQ(test,
+			ave_build_process(ctx, cmd, 0x1940, 4, 0x8f0000000ULL,
+					  4000000, false, false),
+			0);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le64(cmd + pl->list0_recon.luma_data),
+			sess->ref_a[2].dma);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le64(cmd + pl->list0_recon_second.luma_data),
+			sess->ref_a[0].dma);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(cmd + 0x84), 1U);
+
+	/* A final unpaired display picture is promoted from B to P. */
+	sess->frames = 1;
+	memset(cmd, 0, 0x1940);
+	KUNIT_ASSERT_EQ(test,
+			ave_build_process(ctx, cmd, 0x1940, 1, 0x8f0000000ULL,
+					  4000000, false, true),
+			0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(cmd + pl->frame_type), 1U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(cmd + 0x50), 0U);
+}
+
+static void ave_6070_hevc_contract(struct kunit *test)
+{
+	struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
+	struct ave_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	struct ave_session *sess = kunit_kzalloc(test, sizeof(*sess), GFP_KERNEL);
+	u8 *start = kunit_kzalloc(test, 0x32dc8, GFP_KERNEL);
+	u8 *process = kunit_kzalloc(test, 0x6838, GFP_KERNEL);
+	const struct ave_start_layout *sl;
+	const struct ave_proc_layout *pl;
+	struct ave_6070_avc_recon_layout recon;
+
+	KUNIT_ASSERT_TRUE(test, ave && ctx && sess && start && process);
+	ave_test_6070_session(test, ave, ctx, sess, AVE_CODEC_HEVC, 1920, 1080);
+	sl = &ave->layout->start[AVE_CODEC_HEVC - 1];
+	pl = &ave->layout->process[AVE_CODEC_HEVC - 1];
+	recon = ave_6070_recon_layout(1920, 1080, 8);
+	KUNIT_ASSERT_EQ(test, ave_build_start(ctx, start, 0x32dc8), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_input_format),
+			16U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_num_views[0]),
+			1U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_sve_count), 1U);
+	KUNIT_EXPECT_EQ(test, start[sl->hevc_vps_temporal_nesting], 1U);
+	KUNIT_EXPECT_EQ(test, start[sl->hevc_sps_temporal_nesting], 1U);
+	KUNIT_EXPECT_EQ(test, start[sl->hevc_sps_fw_header], 1U);
+	KUNIT_EXPECT_EQ(test, start[sl->hevc_pps_fw_header], 1U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_rps), 8U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_rps + 4 + 0xbc),
+			0U);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le32(start + sl->hevc_rps + 4 + 0x164 + 0xbc),
+			1U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(start + sl->recon.address + 8),
+			sess->ref_a[0].dma + recon.luma_metadata_offset);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le64(start + sl->hevc_transcoded.address),
+			sess->hevc_transcoded[0].dma);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le32(start + sl->hevc_transcoded.size),
+			sess->hevc_transcoded[0].size);
+
+	sess->frames = 1;
+	KUNIT_ASSERT_EQ(test,
+			ave_build_process(ctx, process, 0x6838, 1,
+					  0x8f0000000ULL, 4000000, false,
+					  false),
+			0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + pl->frame_type), 2U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + 0x68), 1U);
+	KUNIT_EXPECT_EQ(test, process[0x15d], 1U);
+	KUNIT_EXPECT_EQ(test, process[0x15e], 1U);
+	KUNIT_EXPECT_EQ(test, process[0x6524], 1U);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le64(process + pl->list1_recon.luma_data),
+			sess->ref_a[2].dma);
+}
+
 static void ave_6070_alignment_refusal(struct kunit *test)
 {
 	struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
@@ -934,7 +1071,7 @@ static void ave_6070_alignment_refusal(struct kunit *test)
 	memset(cmd, 0xa5, 0x1940);
 	KUNIT_EXPECT_EQ(test,
 			ave_build_process(ctx, cmd, 0x1940, 0, 0x8f0000004ULL,
-					  4000000, false),
+					  4000000, false, false),
 			-EINVAL);
 	KUNIT_EXPECT_EQ(test, cmd[0], 0xa5);
 }
@@ -965,7 +1102,8 @@ static void ave_6070_gate(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, ave_layout_6070_11_1.encode_ready);
 	KUNIT_EXPECT_LT(test, ave_build_start(ctx, cmd, sizeof(cmd)), 0);
 	KUNIT_EXPECT_LT(test,
-			ave_build_process(ctx, cmd, sizeof(cmd), 0, 0, 0, false), 0);
+			ave_build_process(ctx, cmd, sizeof(cmd), 0, 0, 0, false, false),
+			0);
 	KUNIT_EXPECT_MEMEQ(test, cmd, before, sizeof(cmd));
 	KUNIT_EXPECT_EQ(test, sess->token, 0ULL);
 }
@@ -1244,6 +1382,8 @@ static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_6070_replies),	    KUNIT_CASE(ave_6070_frame_result),
 	KUNIT_CASE(ave_6070_split_surfaces),
 	KUNIT_CASE(ave_6070_start_process_fields),
+	KUNIT_CASE(ave_6070_reordered_pictures),
+	KUNIT_CASE(ave_6070_hevc_contract),
 	KUNIT_CASE(ave_6070_entropy_interleave),
 	KUNIT_CASE(ave_6070_alignment_refusal),
 	KUNIT_CASE(ave_6070_gate),	    KUNIT_CASE(ave_6070_channels),
