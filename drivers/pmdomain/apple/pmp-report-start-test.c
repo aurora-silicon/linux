@@ -431,6 +431,11 @@ static u64 pdt_constraint_word(u32 dcs, u32 soc)
 	return pdt_class_word(PMP_T8112_CONSTRAINT_DCS_CLASS, dcs) | soc;
 }
 
+static u64 pdt_state_word(u32 level)
+{
+	return PMP_DVFS_VALID | level;
+}
+
 static void __iomem *pdt_update(const struct apple_pmp_report *rep, unsigned int entry)
 {
 	return rep->base + rep->offsets->update + 8 * entry;
@@ -456,7 +461,10 @@ static void pmp_t8112_layout_test(struct kunit *test)
 	KUNIT_EXPECT_GT(test, o->dvfs_first + o->dvfs_count, (u32)PDT_ENTRY);
 	KUNIT_EXPECT_LT(test, o->dvfs_ready_entry, o->dvfs_first);
 	KUNIT_EXPECT_EQ(test, o->dvfs_ready_state, 16 * o->dvfs_ready_entry);
-	KUNIT_EXPECT_EQ(test, o->soc_dvfs_state, 16 * (o->dvfs_ready_entry + 1));
+	KUNIT_EXPECT_EQ(test, o->dvfs_state_first, (u32)APPLE_PMP_T8112_DVFS_STATE_DCS);
+	KUNIT_EXPECT_EQ(test, o->dvfs_state_count, 2U);
+	KUNIT_EXPECT_EQ(test, 16 * o->dvfs_state_first, 0x90U);
+	KUNIT_EXPECT_EQ(test, 16 * (o->dvfs_state_first + 1), 0xa0U);
 	KUNIT_EXPECT_NE(test, o->dvfs_ready_prime, 0ULL);
 }
 
@@ -603,7 +611,7 @@ static void pmp_t8112_unready_range_test(struct kunit *test)
 
 	pdt_run(&t->rep);
 	/* A nonzero SOC state is not the separate range ready report. */
-	writeq(2, t->rep.base + o->soc_dvfs_state);
+	writeq(2, t->rep.base + 16 * APPLE_PMP_T8112_DVFS_STATE_SOC);
 	writeq(BIT_ULL(PDT_ID), t->rep.base + o->actual);
 	KUNIT_ASSERT_EQ(test, apple_pmp_report_entry_power_on(&t->ent.genpd), 0);
 	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, o->dvfs_ready_entry)),
@@ -634,11 +642,17 @@ static void pmp_t8112_constraint_aggregation_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, pmp_t8112_set_constraint(t, entry,
 						       APPLE_PMP_T8112_CONSTRAINT_CPU, 1, 2), 0);
 	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, entry)), pdt_constraint_word(1, 2));
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, APPLE_PMP_T8112_DVFS_STATE_DCS)),
+			pdt_state_word(1));
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, APPLE_PMP_T8112_DVFS_STATE_SOC)),
+			pdt_state_word(2));
 
 	/* A second source raises only DCS; the first source retains SoC. */
 	KUNIT_ASSERT_EQ(test, pmp_t8112_set_constraint(t, entry,
 						       APPLE_PMP_T8112_CONSTRAINT_ANE, 4, 0), 0);
 	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, entry)), pdt_constraint_word(4, 2));
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, APPLE_PMP_T8112_DVFS_STATE_DCS)),
+			pdt_state_word(4));
 
 	KUNIT_ASSERT_EQ(test, pmp_t8112_set_constraint(t, entry,
 						       APPLE_PMP_T8112_CONSTRAINT_CPU, 0, 0), 0);
@@ -647,6 +661,10 @@ static void pmp_t8112_constraint_aggregation_test(struct kunit *test)
 						       APPLE_PMP_T8112_CONSTRAINT_ANE, 0, 0), 0);
 	/* Release leaves the valid bit with every level at zero. */
 	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, entry)), PMP_DVFS_VALID);
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, APPLE_PMP_T8112_DVFS_STATE_DCS)),
+			PMP_DVFS_VALID);
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, APPLE_PMP_T8112_DVFS_STATE_SOC)),
+			PMP_DVFS_VALID);
 }
 
 static void pmp_t8112_constraint_targets_test(struct kunit *test)
@@ -667,6 +685,10 @@ static void pmp_t8112_constraint_targets_test(struct kunit *test)
 						       APPLE_PMP_T8112_CONSTRAINT_ANE, dcs, soc), 0);
 	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, pacc)), top);
 	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, ane)), top);
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, APPLE_PMP_T8112_DVFS_STATE_DCS)),
+			pdt_state_word(dcs));
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, APPLE_PMP_T8112_DVFS_STATE_SOC)),
+			pdt_state_word(soc));
 	/* Neighbouring entries are untouched. */
 	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, eacc)), 0ULL);
 	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, ane - 1)), 0ULL);
