@@ -580,14 +580,15 @@ static int ane_h16_sleep_prepare(struct ane_h16_device *h)
 	/*
 	 * A quarantined engine never runs a program again in this boot, and a
 	 * resume from disk is a cold boot of the engine anyway: it must not veto
-	 * the hibernation (observed: a startup timeout at boot otherwise refused
-	 * every later attempt). Power it off so that nothing runs under the snapshot;
-	 * it stays quarantined (no replay after the resume or an abort).
+	 * the sleep (observed: a startup timeout at boot otherwise refused every
+	 * later hibernation and suspend of that boot). Power it off so that nothing
+	 * runs under the snapshot or into the sleep; it stays quarantined (no replay
+	 * after the resume or an abort).
 	 */
 	if (h->boot.quarantined && !h->boot.soc->sleep_warm) {
 		if (h->engine_on)
 			ane_h16_power_down(h);
-		dev_info(h->dev, "H16 ANE: quarantined engine left off for hibernation\n");
+		dev_info(h->dev, "H16 ANE: quarantined engine left off for the sleep\n");
 		return 0;
 	}
 	if (!h->program_ready || h->boot.quarantined)
@@ -737,10 +738,13 @@ static int ane_h16_pin(void *ctx)
 int ane_h16_backend_suspend(struct device *dev)
 {
 	struct ane_h16_device *h = dev_get_drvdata(dev);
-	/* Running firmware that the notifier did not suspend: refuse. */
+	/*
+	 * Running firmware that the notifier did not suspend: refuse. Not a
+	 * quarantined engine of the cold cycle: the notifier powered it off, for a
+	 * suspend as for a hibernation, and there is nothing of it to bring back.
+	 */
 	bool running = h && READ_ONCE(h->pinned) && !READ_ONCE(h->slept) &&
-		       !(h->boot.quarantined && !h->boot.soc->sleep_warm &&
-			 pm_suspend_target_state == PM_SUSPEND_ON);
+		       !(h->boot.quarantined && !h->boot.soc->sleep_warm);
 
 	if (running)
 		dev_warn_once(dev, ANE_FW_SLEEP_REFUSED);
