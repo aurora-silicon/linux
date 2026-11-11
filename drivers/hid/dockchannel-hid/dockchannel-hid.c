@@ -809,6 +809,9 @@ static int dchid_request_gpio(struct dchid_iface *iface)
 		if (IS_ERR(iface->gpios[g])) {
 			ret = PTR_ERR(iface->gpios[g]);
 			iface->gpios[g] = NULL;
+			/* An announced line the DT does not wire (a pad function): its commands are refused. */
+			if (ret == -ENOENT)
+				continue;
 			dev_err(iface->dchid->dev,
 				"Failed to request GPIO %s-gpios: %d\n",
 				prop_name, ret);
@@ -827,6 +830,12 @@ static int dchid_start_interface(struct dchid_iface *iface)
 	void *fw;
 	size_t size;
 	int ret;
+	/* Only a kiwi with its own reset line takes the long firmware timeout and the power
+	 * cycle: without one it would pulse the AFE reset that the trackpad shares. */
+	bool kiwi_own = !strcmp(iface->name, "kiwi") &&
+			iface->power_method == DCHID_POWER_METHOD_2 &&
+			!iface->firmware_managed_reset &&
+			iface->reset != iface->dchid->afe_reset;
 
 	if (iface->starting) {
 		dev_warn(iface->dchid->dev, "Interface %s is already starting\n", iface->name);
@@ -854,11 +863,8 @@ static int dchid_start_interface(struct dchid_iface *iface)
 
 	/* Only multi-touch and kiwi have firmware */
 	if (fw && size) {
-		bool kiwi_own = !strcmp(iface->name, "kiwi") &&
-				iface->power_method == DCHID_POWER_METHOD_2 &&
-				!iface->firmware_managed_reset;
-
-		WRITE_ONCE(iface->dchid->kiwi_loading, kiwi_own);
+		if (kiwi_own)
+			WRITE_ONCE(iface->dchid->kiwi_loading, true);
 
 		/* The kiwi chip needs a full power cycle with a reset pulse
 		 * before its firmware goes out (its reset line is active low
@@ -912,11 +918,13 @@ static int dchid_start_interface(struct dchid_iface *iface)
 		}
 	}
 
-	WRITE_ONCE(iface->dchid->kiwi_loading, false);
+	if (kiwi_own)
+		WRITE_ONCE(iface->dchid->kiwi_loading, false);
 	return 0;
 
 err:
-	WRITE_ONCE(iface->dchid->kiwi_loading, false);
+	if (kiwi_own)
+		WRITE_ONCE(iface->dchid->kiwi_loading, false);
 	iface->starting = false;
 	return ret;
 }
@@ -1397,6 +1405,11 @@ static void dchid_handle_gpio(struct dockchannel_hid *dchid, void *data, size_t 
 	}
 	if (!found) {
 		dev_err(dchid->dev, "Got GPIO command for bad GPIO %s#%d\n",
+			iface->name, cmd->gpio);
+		goto err;
+	}
+	if (!cmd_gpio) {
+		dev_dbg(dchid->dev, "GPIO %s#%d is not wired in the DT: refused\n",
 			iface->name, cmd->gpio);
 		goto err;
 	}
