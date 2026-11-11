@@ -3,19 +3,15 @@
  * Apple lossless compressed 8-bit 4:2:0 surfaces (see ave-cmp420.h).
  *
  * A surface is four regions: Y bodies, Y metadata, CbCr bodies, CbCr
- * metadata. Storage tiles are row-major: 32x32 luma samples in a 1024-byte
- * body with 32 metadata bytes, 16x16 CbCr pairs in a 512-byte body with 8
- * metadata bytes. Metadata rows and columns are padded to 64 tiles. Inside a
- * tile, samples (CbCr: Cb,Cr pairs) are in Y-first Morton order: y bits at
- * index bits 0, 2, 4..., x bits at 1, 3, 5...
- *
- * Compression works on 16x16 tiles: a luma storage tile is four of them,
- * top-left, bottom-left, top-right, bottom-right (Morton order again), each
- * in its own 256-byte quarter of the body with its own eight metadata bytes;
- * a CbCr storage tile is one. Each metadata byte describes 32 consecutive
- * Morton-order samples; a block's payload starts where the previous one
- * ends. Raw blocks (Y 0x1f, CbCr 0x3f) carry the samples as they are,
- * solid blocks (Y 0x60, CbCr 0x01) one sample (pair) for all 32.
+ * metadata. Bodies are row-major storage tiles: 32x32 luma samples in 1024
+ * bytes with 32 metadata bytes, 16x16 CbCr pairs in 512 bytes with 8
+ * metadata bytes. The metadata of tile (tx, ty) sits at a Morton slot of a
+ * square grid of at least 64x64 slots. A tile is a raster of 8x4-sample
+ * blocks (CbCr: pairs), one metadata byte each; inside a block the samples
+ * interleave x0 y0 x1 y1 x2. A block's payload starts where the previous
+ * one of the tile ends. Raw blocks (Y 0x1f, CbCr 0x3f) carry the samples
+ * as they are, solid blocks (Y 0x60, CbCr 0x01) one sample (pair) for all
+ * 32.
  *
  * The writer marks every block raw, so its output is a lossless surface
  * with no compression. The reader decodes raw and solid blocks and the
@@ -63,6 +59,27 @@ static inline u32 ave_cmp420_meta_slot(u32 tx, u32 ty)
 	return ave_cmp420_spread(tx) | ave_cmp420_spread(ty) << 1;
 }
 
+/*
+ * Sample index inside a storage tile, split into its x and y parts. A tile
+ * is a raster of 8x4 blocks (four across in luma, two in CbCr); inside a
+ * block, the index bits are x0 y0 x1 y1 x2. Luma index bits: x0 y0 x1 y1
+ * x2 x3 x4 y2 y3 y4; CbCr: x0 y0 x1 y1 x2 x3 y2 y3.
+ */
+static inline u32 ave_cmp420_xbits(u32 x)
+{
+	return (x & 1) | (x & 2) << 1 | (x & ~3u) << 2;
+}
+
+static inline u32 ave_cmp420_y_ybits(u32 y)
+{
+	return (y & 1) << 1 | (y & 2) << 2 | (y & ~3u) << 5;
+}
+
+static inline u32 ave_cmp420_c_ybits(u32 y)
+{
+	return (y & 1) << 1 | (y & 2) << 2 | (y & ~3u) << 4;
+}
+
 int ave_cmp420_geom(struct ave_cmp420_geom *g, u32 width, u32 height)
 {
 	u32 cols, rows;
@@ -98,7 +115,7 @@ static void ave_cmp420_pack_y(const struct ave_cmp420_geom *g, u8 *surf,
 	u8 row[AVE_CMP420_Y_TILE];
 
 	for (u32 x = 0; x < AVE_CMP420_Y_TILE; x++)
-		sx[x] = ave_cmp420_spread(x) << 1;
+		sx[x] = ave_cmp420_xbits(x);
 	/* Every slot raw, the padding tiles' included: the reader visits them. */
 	memset(surf + g->y_meta, AVE_CMP420_Y_RAW, g->c - g->y_meta);
 
@@ -110,7 +127,7 @@ static void ave_cmp420_pack_y(const struct ave_cmp420_geom *g, u8 *surf,
 
 			for (u32 yy = 0; yy < AVE_CMP420_Y_TILE; yy++) {
 				u32 y = ty * AVE_CMP420_Y_TILE + yy;
-				u32 sy = ave_cmp420_spread(yy);
+				u32 sy = ave_cmp420_y_ybits(yy);
 				const u8 *s = row;
 
 				if (y < g->height && n == AVE_CMP420_Y_TILE) {
@@ -135,7 +152,7 @@ static void ave_cmp420_pack_c(const struct ave_cmp420_geom *g, u8 *surf,
 	u8 row[2 * AVE_CMP420_C_TILE];
 
 	for (u32 x = 0; x < AVE_CMP420_C_TILE; x++)
-		sx[x] = ave_cmp420_spread(x) << 1;
+		sx[x] = ave_cmp420_xbits(x);
 	memset(surf + g->c_meta, AVE_CMP420_C_RAW, g->bytes - g->c_meta);
 
 	for (u32 ty = 0; ty < g->tiles_y; ty++) {
@@ -146,7 +163,7 @@ static void ave_cmp420_pack_c(const struct ave_cmp420_geom *g, u8 *surf,
 
 			for (u32 yy = 0; yy < AVE_CMP420_C_TILE; yy++) {
 				u32 y = ty * AVE_CMP420_C_TILE + yy;
-				u32 sy = ave_cmp420_spread(yy);
+				u32 sy = ave_cmp420_c_ybits(yy);
 				const u8 *s = row;
 
 				if (y < ch && n == AVE_CMP420_C_TILE) {
@@ -246,7 +263,7 @@ static const u8 ave_cmp420_nb_order[AVE_CMP420_BLOCK - 1] = {
 
 /*
  * Residuals to 32 samples of one component, written every @step bytes in
- * Morton order. Direct prediction: sample 0 is the base, sample k is base +
+ * block order. Direct prediction: sample 0 is the base, sample k is base +
  * residual k. Neighbour prediction (@tree): the tree above, with the origin
  * (the base) at sample 7 and sample 0 in slot 7. Samples wrap modulo 256.
  */
@@ -281,7 +298,7 @@ static s32 ave_cmp420_residual(struct ave_cmp420_bits *b, u32 w,
 }
 
 /*
- * Decode one coded luma block (modes 0, 1, 4, 5) into 32 samples in Morton
+ * Decode one coded luma block (modes 0, 1, 4, 5) into 32 samples in block
  * order. Payload: has_bias:1, width-1:3, base:8, [four 2-bit width
  * reductions, modes 4/5], [signed bias:width], then 31 signed residuals,
  * slot k at width - reduction[k / 8]; the bias applies to full-width
@@ -372,7 +389,7 @@ static bool ave_cmp420_c_coded(const u8 *p, u32 len, u8 meta, u8 *o)
 
 /*
  * Decode the four luma compression tiles of one storage tile into @out
- * (1024 samples, Morton order). The 32 block payloads are packed from the
+ * (1024 samples, tile order). The 32 block payloads are packed from the
  * start of the body in metadata order.
  */
 static unsigned int ave_cmp420_y_stile(const u8 *body, const u8 *meta, u8 *out,
@@ -485,7 +502,7 @@ static void ave_cmp420_unpack_y(const struct ave_cmp420_geom *g, const u8 *surf,
 	u8 tmp[AVE_CMP420_Y_TILE * AVE_CMP420_Y_TILE];
 
 	for (u32 x = 0; x < AVE_CMP420_Y_TILE; x++)
-		sx[x] = ave_cmp420_spread(x) << 1;
+		sx[x] = ave_cmp420_xbits(x);
 
 	for (u32 ty = 0; ty < g->tiles_y; ty++) {
 		for (u32 tx = 0; tx < g->tiles_x; tx++) {
@@ -498,7 +515,7 @@ static void ave_cmp420_unpack_y(const struct ave_cmp420_geom *g, const u8 *surf,
 			ave_cmp420_count_tile(st, ave_cmp420_y_stile(body, meta, tmp, st));
 			for (u32 yy = 0; yy < AVE_CMP420_Y_TILE && y0 + yy < g->height; yy++) {
 				u8 *d = dst + (size_t)(y0 + yy) * stride + x0;
-				u32 sy = ave_cmp420_spread(yy);
+				u32 sy = ave_cmp420_y_ybits(yy);
 
 				for (u32 x = 0; x < n; x++)
 					d[x] = tmp[sy | sx[x]];
@@ -515,7 +532,7 @@ static void ave_cmp420_unpack_c(const struct ave_cmp420_geom *g, const u8 *surf,
 	u8 tmp[AVE_CMP420_C_BODY];
 
 	for (u32 x = 0; x < AVE_CMP420_C_TILE; x++)
-		sx[x] = ave_cmp420_spread(x) << 1;
+		sx[x] = ave_cmp420_xbits(x);
 
 	for (u32 ty = 0; ty < g->tiles_y; ty++) {
 		for (u32 tx = 0; tx < g->tiles_x; tx++) {
@@ -529,7 +546,7 @@ static void ave_cmp420_unpack_c(const struct ave_cmp420_geom *g, const u8 *surf,
 			ave_cmp420_count_tile(st, ave_cmp420_c_ctile(body, meta, tmp, st));
 			for (u32 yy = 0; yy < AVE_CMP420_C_TILE && y0 + yy < ch; yy++) {
 				u8 *d = dst + (size_t)(y0 + yy) * stride + 2 * x0;
-				u32 sy = ave_cmp420_spread(yy);
+				u32 sy = ave_cmp420_c_ybits(yy);
 
 				for (u32 x = 0; x < n; x++) {
 					u32 m = 2 * (sy | sx[x]);

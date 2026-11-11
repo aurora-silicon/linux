@@ -57,15 +57,21 @@ static void t_fill(struct t_pic *t)
 	}
 }
 
-/* Y-first Morton index, bit by bit */
-static u32 t_morton(u32 x, u32 y)
+/*
+ * Index of sample (x, y) in a tile: 8x4 blocks in raster order (@cols
+ * across), x0 y0 x1 y1 x2 inside a block. Written out bit by bit, apart
+ * from the driver's helpers.
+ */
+static u32 t_idx(u32 x, u32 y, u32 cols)
 {
-	u32 m = 0;
+	u32 in = (x & 1) | (y & 1) << 1 | ((x >> 1) & 1) << 2 |
+		 ((y >> 1) & 1) << 3 | ((x >> 2) & 1) << 4;
 
-	for (u32 b = 0; b < 8; b++)
-		m |= ((y >> b) & 1) << (2 * b) | ((x >> b) & 1) << (2 * b + 1);
-	return m;
+	return 32 * ((y / 4) * cols + x / 8) + in;
 }
+
+#define t_yidx(x, y)	t_idx(x, y, 4)
+#define t_cidx(x, y)	t_idx(x, y, 2)
 
 static u8 *t_ybody(struct t_pic *t, u32 tx, u32 ty)
 {
@@ -108,34 +114,36 @@ static void ave_cmp420_pack_layout(struct kunit *test)
 	t_fill(&t);
 	ave_cmp420_pack(&t.g, t.surf, t.in, t.in + t.luma, t.stride);
 
-	/* Luma: Morton inside the tile, quadrants TL, BL, TR, BR */
+	/* Luma: 8x4 blocks in raster order, x0 y0 x1 y1 x2 inside a block */
 	KUNIT_EXPECT_EQ(test, t_ybody(&t, 0, 0)[0], t.in[0]);
-	KUNIT_EXPECT_EQ(test, t_ybody(&t, 0, 0)[1], t.in[1920]);
-	KUNIT_EXPECT_EQ(test, t_ybody(&t, 0, 0)[2], t.in[1]);
-	KUNIT_EXPECT_EQ(test, t_ybody(&t, 0, 0)[3], t.in[1920 + 1]);
-	KUNIT_EXPECT_EQ(test, t_ybody(&t, 0, 0)[256], t.in[16 * 1920]);
-	KUNIT_EXPECT_EQ(test, t_ybody(&t, 0, 0)[512], t.in[16]);
-	KUNIT_EXPECT_EQ(test, t_ybody(&t, 0, 0)[768], t.in[16 * 1920 + 16]);
+	KUNIT_EXPECT_EQ(test, t_ybody(&t, 0, 0)[1], t.in[1]);
+	KUNIT_EXPECT_EQ(test, t_ybody(&t, 0, 0)[2], t.in[1920]);
+	KUNIT_EXPECT_EQ(test, t_ybody(&t, 0, 0)[4], t.in[2]);
+	KUNIT_EXPECT_EQ(test, t_ybody(&t, 0, 0)[16], t.in[4]);
+	KUNIT_EXPECT_EQ(test, t_ybody(&t, 0, 0)[31], t.in[3 * 1920 + 7]);
+	KUNIT_EXPECT_EQ(test, t_ybody(&t, 0, 0)[32], t.in[8]);
+	KUNIT_EXPECT_EQ(test, t_ybody(&t, 0, 0)[128], t.in[4 * 1920]);
 	KUNIT_EXPECT_EQ(test, t_ybody(&t, 0, 0)[1023], t.in[31 * 1920 + 31]);
 	KUNIT_EXPECT_EQ(test, t_ybody(&t, 1, 0)[0], t.in[32]);
 	KUNIT_EXPECT_EQ(test, t_ybody(&t, 0, 1)[0], t.in[32 * 1920]);
-	KUNIT_EXPECT_EQ(test, t_ybody(&t, 59, 33)[t_morton(5, 7)],
+	KUNIT_EXPECT_EQ(test, t_ybody(&t, 59, 33)[t_yidx(5, 7)],
 			t.in[(33 * 32 + 7) * 1920 + 59 * 32 + 5]);
 	/* Lines 1080..1087 are video black */
-	KUNIT_EXPECT_EQ(test, t_ybody(&t, 7, 33)[t_morton(3, 24)], 0x10);
-	KUNIT_EXPECT_EQ(test, t_ybody(&t, 7, 33)[t_morton(31, 31)], 0x10);
+	KUNIT_EXPECT_EQ(test, t_ybody(&t, 7, 33)[t_yidx(3, 24)], 0x10);
+	KUNIT_EXPECT_EQ(test, t_ybody(&t, 7, 33)[t_yidx(31, 31)], 0x10);
 
-	/* CbCr pairs, same order, 16x16 tiles */
+	/* CbCr pairs, 8x4 blocks two across, 16x16 tiles */
 	KUNIT_EXPECT_EQ(test, t_cbody(&t, 0, 0)[0], t.in[t.luma]);
 	KUNIT_EXPECT_EQ(test, t_cbody(&t, 0, 0)[1], t.in[t.luma + 1]);
-	KUNIT_EXPECT_EQ(test, t_cbody(&t, 0, 0)[2], t.in[t.luma + 1920]);
-	KUNIT_EXPECT_EQ(test, t_cbody(&t, 0, 0)[4], t.in[t.luma + 2]);
-	KUNIT_EXPECT_EQ(test, t_cbody(&t, 0, 0)[5], t.in[t.luma + 3]);
-	KUNIT_EXPECT_EQ(test, t_cbody(&t, 2, 3)[2 * t_morton(9, 4) + 1],
+	KUNIT_EXPECT_EQ(test, t_cbody(&t, 0, 0)[2], t.in[t.luma + 2]);
+	KUNIT_EXPECT_EQ(test, t_cbody(&t, 0, 0)[4], t.in[t.luma + 1920]);
+	KUNIT_EXPECT_EQ(test, t_cbody(&t, 0, 0)[5], t.in[t.luma + 1920 + 1]);
+	KUNIT_EXPECT_EQ(test, t_cbody(&t, 0, 0)[64], t.in[t.luma + 2 * 8]);
+	KUNIT_EXPECT_EQ(test, t_cbody(&t, 2, 3)[2 * t_cidx(9, 4) + 1],
 			t.in[t.luma + (3 * 16 + 4) * 1920 + 2 * (2 * 16 + 9) + 1]);
 	/* Chroma lines 540..543 are video black */
-	KUNIT_EXPECT_EQ(test, t_cbody(&t, 4, 33)[2 * t_morton(0, 12)], 0x80);
-	KUNIT_EXPECT_EQ(test, t_cbody(&t, 4, 33)[2 * t_morton(15, 15) + 1], 0x80);
+	KUNIT_EXPECT_EQ(test, t_cbody(&t, 4, 33)[2 * t_cidx(0, 12)], 0x80);
+	KUNIT_EXPECT_EQ(test, t_cbody(&t, 4, 33)[2 * t_cidx(15, 15) + 1], 0x80);
 
 	/* Every metadata slot raw, the padding tiles' too: the reader visits them */
 	for (u32 i = t.g.y_meta; i < t.g.c; i++) {
@@ -208,7 +216,7 @@ static u32 t_slot(u32 tx, u32 ty)
 /*
  * Blocks the encoder's MCTF wrote on hardware for a static test card at
  * strength 0 (output equals input there), with the input samples of each
- * block in Morton order: neighbour mode 0xa4, delta mode 0x84 and solids,
+ * block in block order: neighbour mode 0xa4, delta mode 0x84 and solids,
  * packed from the start of the storage tile body.
  */
 static const u8 t_hw_body[] = {
@@ -260,7 +268,7 @@ static void ave_cmp420_hw_blocks(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ys.other, 1U);
 	KUNIT_EXPECT_EQ(test, cs.solid, t.g.tiles_x * t.g.tiles_y * 8);
 
-	/* Read back through the raw writer: tile bodies hold Morton samples */
+	/* Read back through the raw writer: tile bodies hold samples in tile order */
 	ave_cmp420_pack(&t.g, again, t.out, t.out + t.luma, t.stride);
 	for (u32 j = 0; j < 32; j++) {
 		const u8 *y = again + 5 * t.g.y_pitch + 3 * 1024;
@@ -282,7 +290,7 @@ static void ave_cmp420_hw_blocks(struct kunit *test)
 
 /*
  * CbCr blocks the encoder's MCTF wrote on hardware at strength 0, with the
- * input pairs of each block in Morton order: direct and neighbour
+ * input pairs of each block in block order: direct and neighbour
  * prediction for both components, region reductions and biases, and a
  * constant component on either side.
  */
