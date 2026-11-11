@@ -259,13 +259,17 @@ struct apr_variant {
 	/* SCODEC-system rows, applied to the "aux" window before the engine. */
 	const struct apr_tunable *aux_tunables;
 	size_t num_aux_tunables;
-	const char *reg_names[3];
+	/* SCODEC control rows (T6050), applied to "ctrl" after the system rows. */
+	const struct apr_tunable *ctrl_tunables;
+	size_t num_ctrl_tunables;
+	const char *reg_names[4];
 	unsigned int num_regs;
 	unsigned int num_irqs;
 	u32 ring_bytes;
 	u32 desc_bytes;
 	/* Optional per-machine APRI file that replaces the built-in rows. */
 	const char *firmware_name;
+	const struct apri_layout *apri;
 };
 
 static const struct apr_variant apr_t8140 = {
@@ -309,6 +313,23 @@ static const struct apr_variant apr_t6041 = {
 	.ring_bytes = APR_RING_BYTES,
 	.desc_bytes = APR_DESC_BYTES,
 	.firmware_name = APRI_T6041_FIRMWARE_NAME,
+	.apri = &apri_t6041,
+};
+
+/* T6041's engine plus the SCODEC control window; no built-in rows. */
+static const struct apr_variant apr_t6050 = {
+	.build_desc = apr_build_desc,
+	.stats = {
+		{ APR_REG_STATS0_LO, APR_REG_STATS0_HI, APR_REG_STATS0_SIZE },
+		{ APR_REG_STATS1_LO, APR_REG_STATS1_HI, APR_REG_STATS1_SIZE },
+	},
+	.reg_names = { "core", "wrapper", "aux", "ctrl" },
+	.num_regs = 4,
+	.num_irqs = 1,
+	.ring_bytes = APR_RING_BYTES,
+	.desc_bytes = APR_DESC_BYTES,
+	.firmware_name = APRI_T6050_FIRMWARE_NAME,
+	.apri = &apri_t6050,
 };
 
 struct apr_dev {
@@ -317,10 +338,11 @@ struct apr_dev {
 	void __iomem *regs;
 	void __iomem *wrapper;
 	void __iomem *aux;
+	void __iomem *ctrl;
 	struct apr_init_data init;
 	/* Rows applied at power-up, per APRI block: built-in or the file's. */
-	const struct apr_tunable *tunables[APRI_BLOCK_COUNT];
-	size_t num_tunables[APRI_BLOCK_COUNT];
+	const struct apr_tunable *tunables[APRI_MAX_BLOCKS];
+	size_t num_tunables[APRI_MAX_BLOCKS];
 	struct reset_control *reset;
 	struct dev_pm_domain_list *pd_list;
 	int irq[2];
@@ -399,6 +421,9 @@ static void apr_hw_init(struct apr_dev *apr)
 	if (apr->aux)
 		apr_apply(apr->aux, apr->tunables[APRI_SYSTEM_BLOCK],
 			  apr->num_tunables[APRI_SYSTEM_BLOCK]);
+	if (apr->ctrl)
+		apr_apply(apr->ctrl, apr->tunables[APRI_CONTROL_BLOCK],
+			  apr->num_tunables[APRI_CONTROL_BLOCK]);
 	apr_apply(apr->regs, apr->tunables[APRI_CORE_BLOCK],
 		  apr->num_tunables[APRI_CORE_BLOCK]);
 	if (apr->wrapper)
@@ -1202,16 +1227,18 @@ static int apr_select_tunables(struct apr_dev *apr)
 	apr->num_tunables[APRI_CORE_BLOCK] = v->num_engine_tunables;
 	apr->tunables[APRI_WRAPPER_BLOCK] = v->wrapper_tunables;
 	apr->num_tunables[APRI_WRAPPER_BLOCK] = v->num_wrapper_tunables;
+	apr->tunables[APRI_CONTROL_BLOCK] = v->ctrl_tunables;
+	apr->num_tunables[APRI_CONTROL_BLOCK] = v->num_ctrl_tunables;
 
 	if (v->firmware_name &&
 	    !firmware_request_nowarn(&firmware, v->firmware_name, dev)) {
-		ret = apr_parse_t6041_init(firmware->data, firmware->size,
-					   &apr->init);
+		ret = apr_parse_init(v->apri, firmware->data, firmware->size,
+				     &apr->init);
 		release_firmware(firmware);
 		if (ret)
 			return dev_err_probe(dev, ret, "invalid %s\n",
 					     v->firmware_name);
-		for (i = 0; i < APRI_BLOCK_COUNT; i++) {
+		for (i = 0; i < v->apri->blocks; i++) {
 			apr->tunables[i] = apr->init.blocks[i].entries;
 			apr->num_tunables[i] = apr->init.blocks[i].count;
 		}
@@ -1240,7 +1267,7 @@ static int apr_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct video_device *vdev;
-	void __iomem *regs[3] = {};
+	void __iomem *regs[4] = {};
 	struct apr_dev *apr;
 	unsigned int i;
 	int ret;
@@ -1269,6 +1296,7 @@ static int apr_probe(struct platform_device *pdev)
 	apr->regs = regs[0];
 	apr->wrapper = regs[1];
 	apr->aux = regs[2];
+	apr->ctrl = regs[3];
 	/*
 	 * A second power domain, "perf", is the SoC performance request the
 	 * engine needs for full speed. With more than one domain the core
@@ -1372,6 +1400,7 @@ static void apr_remove(struct platform_device *pdev)
 static const struct of_device_id apr_of_match[] = {
 	{ .compatible = "apple,t6000-prores", .data = &apr_t6000 },
 	{ .compatible = "apple,t6041-prores", .data = &apr_t6041 },
+	{ .compatible = "apple,t6050-prores", .data = &apr_t6050 },
 	{ .compatible = "apple,t8140-prores", .data = &apr_t8140 },
 	{ }
 };
@@ -1391,3 +1420,4 @@ module_platform_driver(apr_driver);
 MODULE_DESCRIPTION("Apple ProRes encoder");
 MODULE_LICENSE("GPL");
 MODULE_FIRMWARE(APRI_T6041_FIRMWARE_NAME);
+MODULE_FIRMWARE(APRI_T6050_FIRMWARE_NAME);
