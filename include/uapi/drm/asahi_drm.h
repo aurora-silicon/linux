@@ -496,6 +496,13 @@ enum drm_asahi_feature {
 #define DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION ((1ULL) << 34)
 
 /*
+ * DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT: drm_asahi_queue_create::compute_timeout_ms
+ * sets the watchdog allowance of the queue's compute commands. A feature bit
+ * like those of enum drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT ((1ULL) << 36)
+
+/*
  * DRM_ASAHI_FEATURE_USERPTR: DRM_IOCTL_ASAHI_GEM_USERPTR is available. A
  * feature bit like those of enum drm_asahi_feature, defined here like bit 32.
  */
@@ -1112,6 +1119,49 @@ struct drm_asahi_queue_create {
 	 * Requires DRM_ASAHI_FEATURE_RENDER_RAY_QUERY; zero otherwise.
 	 */
 	__u64 render_scs_layout[2];
+
+	/**
+	 * @compute_timeout_ms: Watchdog allowance of each compute command of
+	 * this queue, in milliseconds. Zero keeps the driver's default.
+	 * Requires DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT; zero otherwise.
+	 *
+	 * The driver's watchdog polls a queue every two seconds. By default it
+	 * takes a compute command that a poll finds still running at the head
+	 * of the queue (every earlier compute command of the queue has
+	 * completed) to have hung, and fails it, and the queue's VM with it.
+	 * With an allowance, the watchdog lets the command run on at each poll
+	 * until the allowance has passed. The driver raises a shorter
+	 * allowance to its default of one poll, lowers a longer one to the
+	 * maximum the system allows, and returns the allowance in effect here.
+	 *
+	 * This is an allowance, not a deadline:
+	 *
+	 * - The watchdog acts at its polls only, so a command may run up to
+	 *   one poll longer than its allowance.
+	 * - The start of a command is known only approximately. The time is
+	 *   counted from one poll before the first poll that finds the command
+	 *   at the head of the queue. That is no earlier than the command got
+	 *   there and may be later: commands submitted to the queue in the
+	 *   meantime postpone that poll.
+	 * - Once the allowance has passed, the deferrals the watchdog grants
+	 *   any command still apply, as they do by default: a command it takes
+	 *   to be waiting behind other clients' work, or one of a kind it
+	 *   gives extra polls, runs on until those are used up as well.
+	 *
+	 * The allowance is per command, and nothing bounds the sum: a queue
+	 * that is kept full of long commands occupies the GPU for as long as
+	 * it is fed. The driver does not shield the other clients from such a
+	 * queue: they share the GPU with it as the firmware schedules them,
+	 * and a command of another client may have to wait until a long
+	 * command ends, which can be longer than that client's own allowance
+	 * and the deferrals it gets. Userspace should ask for an allowance
+	 * only for queues whose commands need one, and keep those commands as
+	 * short as it can.
+	 */
+	__u32 compute_timeout_ms;
+
+	/** @pad: MBZ */
+	__u32 pad;
 };
 
 /**

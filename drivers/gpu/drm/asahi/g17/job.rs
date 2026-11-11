@@ -365,6 +365,8 @@ pub(crate) trait Backend: Send + Sync {
 struct Job<B: Backend> {
     backend: Arc<B>,
     packet: Arc<Packet>,
+    /// The watchdog allowance of the job ([`super::timeout::Allowance`]), in ms.
+    allowance_ms: u32,
 }
 
 struct Timeout<B: Backend> {
@@ -372,6 +374,7 @@ struct Timeout<B: Backend> {
     victim_renewals: u8,
     execution_renewals: u8,
     shared_renewals: u8,
+    allowance: super::timeout::Allowance,
     packet: Arc<Packet>,
 }
 
@@ -397,12 +400,17 @@ impl<B: Backend> sched::JobImpl for Job<B> {
             victim_renewals: 0,
             execution_renewals: 0,
             shared_renewals: 0,
+            allowance: super::timeout::Allowance::new(self.allowance_ms),
             packet: self.packet.clone(),
         }
     }
 
     fn false_timeout(job: &mut Timeout<B>, finished: bool) -> bool {
         if finished || job.packet.completion.take_replay_timeout() {
+            return true;
+        }
+        // Within the allowance its queue asked for. Past it, the deferrals below still apply.
+        if job.allowance.renew(job.packet.is_published(), super::now_ns()) {
             return true;
         }
         if super::timeout::renew_execution(
@@ -457,6 +465,7 @@ pub(crate) struct Scheduler<B: Backend> {
     entity: sched::Entity<Job<B>>,
     _scheduler: sched::Scheduler<Job<B>>,
     backend: Arc<B>,
+    allowance_ms: u32,
 }
 
 #[derive(Clone)]
@@ -486,7 +495,11 @@ impl Fences {
 }
 
 impl<B: Backend> Scheduler<B> {
-    pub(crate) fn new(dev: &AsahiDrmDevice, backend: Arc<B>, engine: Engine) -> Result<Self> {
+    /// `allowance_ms`: the watchdog allowance of each job ([`super::timeout::allowance_ms`]);
+    /// the watchdog still polls every [`TIMEOUT_MS`].
+    pub(crate) fn new(dev: &AsahiDrmDevice, backend: Arc<B>, engine: Engine, allowance_ms: u32)
+        -> Result<Self>
+    {
         let (credits, name) = match engine {
             Engine::Render => (
                 RENDER_CREDITS.checked_mul(backend.render_pairs()).ok_or(EOVERFLOW)?,
@@ -513,6 +526,7 @@ impl<B: Backend> Scheduler<B> {
             entity,
             _scheduler: scheduler,
             backend,
+            allowance_ms,
         })
     }
 
@@ -540,6 +554,7 @@ impl<B: Backend> Scheduler<B> {
             Job {
                 backend: self.backend.clone(),
                 packet: packet.clone(),
+                allowance_ms: self.allowance_ms,
             },
         )?;
         if dependencies.len() > MERGED_DEPENDENCIES {
