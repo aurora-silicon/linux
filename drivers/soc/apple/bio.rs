@@ -1253,7 +1253,7 @@ fn delete(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
         .read()?;
 
     if !ctx.index.contains(&request.uuid) {
-        pr_info!(
+        pr_info_ratelimited!(
             "sep_bio: DELETE of an identity not held; reporting success (nothing to delete)\n"
         );
         return ok();
@@ -1261,7 +1261,7 @@ fn delete(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
 
     // `0x57` takes one `identity_v1_t` (signed user id + 16-byte UUID).
     let Some(identity) = ctx.index.identity_v1_for(&request.uuid, ENROL_USER_ID) else {
-        pr_warn!("sep_bio: DELETE of a held identity could not be expressed as an identity_v1_t\n");
+        pr_warn_ratelimited!("sep_bio: DELETE of a held identity could not be expressed as an identity_v1_t\n");
         return Err(ENOENT);
     };
 
@@ -1282,14 +1282,14 @@ fn delete_all(ctx: &mut Context<'_>) -> Result<Handled> {
     }
 
     if ctx.index.total() == 0 {
-        pr_info!("sep_bio: DELETE_ALL on empty index; reporting success (nothing to delete)\n");
+        pr_info_ratelimited!("sep_bio: DELETE_ALL on empty index; reporting success (nothing to delete)\n");
         return ok();
     }
 
     let mut ids = KVec::new();
     for entry in ctx.index.entries.iter() {
         let Some(identity) = ctx.index.identity_v1_for(&entry.uuid, ENROL_USER_ID) else {
-            pr_warn!(
+            pr_warn_ratelimited!(
                 "sep_bio: DELETE_ALL of a held identity could not be expressed as an identity_v1_t\n"
             );
             return Err(ENOENT);

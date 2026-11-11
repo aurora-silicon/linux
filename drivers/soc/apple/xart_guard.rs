@@ -369,7 +369,7 @@ fn take_allowance() -> Option<Allowance> {
     };
     drop(file);
     if let Err(e) = StoreFile::open_trunc(ALLOW_PATH).and_then(|file| file.sync()) {
-        pr_warn!(
+        pr_warn_ratelimited!(
             "xART guard: could not empty the one-time allowance ({:?}); not using it\n",
             e
         );
@@ -377,16 +377,16 @@ fn take_allowance() -> Option<Allowance> {
     }
     let allowance = if read { Allowance::decode(&entry) } else { None };
     match allowance {
-        Some(Allowance::Record(key)) => pr_info!(
+        Some(Allowance::Record(key)) => pr_info_ratelimited!(
             "xART guard: this boot may rewrite kind-{} record {} once, for a boot policy change\n",
             key.kind,
             Id(&key.uuid)
         ),
-        Some(Allowance::FirstOfKind(kind)) => pr_info!(
+        Some(Allowance::FirstOfKind(kind)) => pr_info_ratelimited!(
             "xART guard: this boot may rewrite the first existing kind-{} record the enclave asks for, once, for a boot policy change\n",
             kind
         ),
-        None => pr_warn!("xART guard: ignored a damaged one-time allowance\n"),
+        None => pr_warn_ratelimited!("xART guard: ignored a damaged one-time allowance\n"),
     }
     allowance
 }
@@ -497,7 +497,7 @@ impl<F: ListFile> Guard<F> {
         match file {
             Ok(file) => {
                 if let Err(e) = guard.load(&file) {
-                    pr_warn!(
+                    pr_warn_ratelimited!(
                         "xART guard: the list of Linux's records is unreadable ({:?}); every existing session record is protected and none can be adopted\n",
                         e
                     );
@@ -505,7 +505,7 @@ impl<F: ListFile> Guard<F> {
                     guard.file = Some(file);
                 }
             }
-            Err(e) => pr_warn!(
+            Err(e) => pr_warn_ratelimited!(
                 "xART guard: the list of Linux's records could not be opened ({:?}); every existing session record is protected and none can be adopted\n",
                 e
             ),
@@ -521,7 +521,7 @@ impl<F: ListFile> Guard<F> {
         } else {
             ""
         };
-        pr_info!(
+        pr_info_ratelimited!(
             "xART guard level {}: {} session records exist, {} created by Linux; the other {} are protected{}\n",
             level,
             sessions,
@@ -549,7 +549,7 @@ impl<F: ListFile> Guard<F> {
             }
         }
         if torn != 0 {
-            pr_warn!("xART guard: ignored {} unreadable list entries\n", torn);
+            pr_warn_ratelimited!("xART guard: ignored {} unreadable list entries\n", torn);
         }
         // A torn tail entry is overwritten by the next adoption.
         self.end = (whole * ENTRY_SIZE) as u64;
@@ -609,7 +609,7 @@ impl<F: ListFile> Guard<F> {
             Verdict::Adopt if !write => Ok(()),
             Verdict::Adopt => self.adopt(key).inspect_err(|e| {
                 crate::diag::xart_guard_refused();
-                pr_warn!(
+                pr_warn_ratelimited!(
                     "xART guard: could not list a new kind-{} record as Linux's ({:?}); refusing to write it\n",
                     key.kind,
                     e
@@ -631,7 +631,7 @@ impl<F: ListFile> Guard<F> {
         self.refused += 1;
         if self.refused <= LOGGED_REFUSALS {
             let action = if write { "rewrite" } else { "delete" };
-            pr_warn!(
+            pr_warn_ratelimited!(
                 "xART guard: refused to {} kind-{} record {}, which this Linux install did not create\n",
                 action,
                 key.kind,
@@ -666,7 +666,7 @@ impl<F: ListFile> Guard<F> {
     pub(crate) fn refuse_unsaved(&mut self, key: &Key, why: Rewrite, e: Error) {
         crate::diag::xart_guard_refused();
         self.refused += 1;
-        pr_warn!(
+        pr_warn_ratelimited!(
             "xART guard: could not save kind-{} record {} before rewriting it {} ({:?}); refusing it\n",
             key.kind,
             Id(&key.uuid),

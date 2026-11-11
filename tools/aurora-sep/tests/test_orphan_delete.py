@@ -37,6 +37,10 @@ const GFP_KERNEL: u32 = 0;
 const EIO: Error = -5;
 
 macro_rules! dev_err { ($($arg:tt)*) => {}; }
+macro_rules! dev_info_refusal { ($($arg:tt)*) => {}; }
+macro_rules! dev_err_ratelimited { ($($arg:tt)*) => {}; }
+macro_rules! dev_info_ratelimited { ($($arg:tt)*) => {}; }
+macro_rules! dev_dbg { ($($arg:tt)*) => {}; }
 
 struct Mutex<T>(StdMutex<T>);
 impl<T> Mutex<T> {
