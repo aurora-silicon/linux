@@ -9,7 +9,8 @@ config APPLE_SIO_AES
 	depends on OF && HAS_IOMEM && PM && IOMMU_API
 	help
 	  Capture the S8000-family AES readiness and hardware-key disable
-	  state once at probe on T6000, T8112, T6041 and T8140. The snapshot
+	  state once at probe on T6041 and T8140. T6000 and T8112 are served
+	  by the CRYPTO_DEV_APPLE_SIO_AES skcipher driver instead. The snapshot
 	  is logged and available in a root-readable debugfs state file.
 	  Revision is reported from the SoC compatible; register words are
 	  raw diagnostics, not a claim that a hardware key is usable.
