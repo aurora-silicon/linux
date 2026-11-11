@@ -66,6 +66,8 @@ struct apple_pmgr_ps {
 	bool force_reset;
 	bool externally_clocked;
 	bool system_sleep;
+	/* Lowered as macOS lowers it, and unlatched even in a system sleep. */
+	bool macos_lower;
 	bool firmware_owned;
 	/* apple,sleep-retained: kept on while the system sleeps */
 	bool sleep_retained;
@@ -220,11 +222,27 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 					    genpd->name, cur);
 	}
 
+	/*
+	 * As macOS lowers a domain: automatic power management off first, back at full
+	 * power, and only then the target. Taking both at once from an auto-gated state
+	 * can leave BUSY latched, and a latch stalls the sleep engine's wake.
+	 */
+	if (ps->macos_lower && pstate != APPLE_PMGR_PS_ACTIVE && (reg & APPLE_PMGR_AUTO_ENABLE)) {
+		regmap_write(ps->regmap, ps->offset,
+			     reg & ~(APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS | APPLE_PMGR_BUSY));
+		regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, cur,
+						FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) ==
+						APPLE_PMGR_PS_ACTIVE, 1, timeout);
+	}
+
 	/* Do not replay the hardware-owned BUSY bit in this whole-word write. */
 	reg &= ~(APPLE_PMGR_DEV_DISABLE | APPLE_PMGR_PS_RESET |
 		 APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS | APPLE_PMGR_BUSY |
 		 APPLE_PMGR_PS_TARGET);
 	reg |= FIELD_PREP(APPLE_PMGR_PS_TARGET, pstate);
+	/* Writing the history bits clears them. */
+	if (ps->macos_lower && pstate != APPLE_PMGR_PS_ACTIVE)
+		reg |= APPLE_PMGR_FLAGS;
 
 	dev_dbg(ps->dev, "PS %s: pwrstate = 0x%x: 0x%x\n", genpd->name, pstate, reg);
 
@@ -291,9 +309,16 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 	 * path (not in a system sleep transition, see apple_pmgr_ps_clear_latch()).
 	 */
 	if (!ret && pstate != APPLE_PMGR_PS_ACTIVE && (cur & APPLE_PMGR_BUSY) &&
-	    !FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) && !ps->system_sleep &&
-	    !ps->wait_parent && !ps->strict_state && !ps->externally_clocked)
+	    !FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) && (!ps->system_sleep || ps->macos_lower) &&
+	    !ps->wait_parent && !ps->strict_state && !ps->externally_clocked) {
+		/* macOS never needs this: say so when it does. */
+		if (ps->macos_lower)
+			dev_info_ratelimited(ps->dev,
+					     "PS %s: off with BUSY%s: %#x; cleared by a PS reset\n",
+					     genpd->name, ps->system_sleep ? " in a system sleep" : "",
+					     cur);
 		apple_pmgr_ps_unlatch_off(ps, &cur);
+	}
 
 report:
 	if (ret < 0)
@@ -765,6 +790,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, ps);
 	ps->reset_time_us = t8132 ? APPLE_PMGR_T8132_RESET_TIME : APPLE_PMGR_RESET_TIME;
 	ps->needs_reset_idle_wait = t8132;
+	ps->macos_lower = of_device_is_compatible(node, "apple,t8140-pmgr-pwrstate");
 	ps->no_auto_enable = t8132 && !strict_state;
 	ps->strict_state = strict_state;
 
