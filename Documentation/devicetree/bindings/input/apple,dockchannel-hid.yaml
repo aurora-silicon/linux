@@ -231,6 +231,31 @@ properties:
           Name of the touchscreen firmware that the host sends to the
           coprocessor when the interface is first opened.
 
+      apple,power-method:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        enum: [1, 2]
+        default: 1
+        description:
+          The power sequencing protocol of the coprocessor firmware, as
+          described above. With power method 2 the touchscreen owns its
+          lines, so apple,reset-gpios is required.
+
+      apple,reset-gpios:
+        maxItems: 1
+        description:
+          Reset line of the touchscreen, described with the level that
+          asserts the reset as its active level. Unlike the multi-touch
+          analog front end reset the touchscreen owns the line, and with
+          power method 2 the host drives it itself during the start
+          sequence instead of using the shared reset of the parent.
+
+      apple,power-gpios:
+        maxItems: 1
+        description:
+          Optional supply enable line of the touchscreen, raised to power
+          the interface on and lowered to power it off during power
+          method 2 transitions.
+
   mtp:
     type: object
     additionalProperties: false
