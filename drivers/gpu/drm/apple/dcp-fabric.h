@@ -30,10 +30,12 @@ struct apple_dcp_typec_route {
 	struct dcp_fabric_route core;
 	struct apple_dcp *dcp;
 	struct apple_dcp_typec_port *port;
+	/* T6050: this port/pipeline pair has a connector with a fixed CRTC. */
+	struct apple_connector *connector;
 	struct list_head port_link;
 	struct phy *phy;
 	struct mux_control *xbar;
-	struct mux_control *dpin[2];
+	struct mux_control *dpin[DCP_FABRIC_DPIN_MAX];
 	bool dual_stream;
 	struct typec_mux_dev *typec_mux;
 	u32 dptx_phy;
@@ -43,6 +45,8 @@ struct apple_dcp_typec_route {
 	bool phy_powered;
 	/* crossbar output actually selected: xbar (dpphy) or a Thunderbolt dpin */
 	unsigned int tunnel_dpin;
+	/* T6050: DP link rate code the tunnel's pixel clock runs at, 0 if stopped */
+	u8 tunnel_rate;
 	u64 tunnel_generation;
 	struct mux_control *active_xbar;
 	bool tunnel;
@@ -74,7 +78,9 @@ struct device_node *dcp_typec_port_of_node(unsigned int idx);
 bool dcp_typec_port_has_candidate(unsigned int idx, struct platform_device *pdev);
 bool dcp_typec_port_unusable(unsigned int idx);
 void dcp_typec_port_set_connector(unsigned int idx, bool secondary,
-				  struct apple_connector *connector);
+				  struct apple_connector *connector,
+				  struct platform_device *pipeline);
+bool dcp_typec_fixed_crtcs(void);
 bool dcp_typec_dual_stream(void);
 bool dcp_typec_ordered_dual_stream(void);
 void dcp_typec_reorder(void);

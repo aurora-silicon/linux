@@ -54,7 +54,7 @@ obj-$(CONFIG_APPLE_SEP_FV_INTERFACE) += fv_shim.o
 obj-$(CONFIG_APPLE_SEP) += apple-sep.o
 apple-sep-y := sep.o hwrng_shim.o store_shim.o bio_shim.o sha_shim.o \
 		crypto_shim.o sensor_shim.o p256_shim.o trusted_shim.o work_shim.o \
-		pm_shim.o diag_shim.o
+		pm_shim.o diag_shim.o attach_shim.o
 
 obj-$(CONFIG_APPLE_PMP) += apple-pmp.o
 apple-pmp-y := pmp.o pmp-export.o pmp-display.o pmp-telemetry.o
@@ -68,3 +68,5 @@ obj-$(CONFIG_APPLE_CLPC) += clpc.o
 
 obj-$(CONFIG_APPLE_REGVIEW) += apple-regview.o
 apple-regview-y := regview.o
+
+obj-$(CONFIG_APPLE_AURORA_BOOT_SECURITY) += aurora-boot-security.o

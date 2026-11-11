@@ -89,7 +89,8 @@ static void isp_meta_read_exposure(struct apple_isp *isp,
 	u32 offset, time;
 	u16 gain;
 
-	if (!isp->hw->meta_exposure || !virt)
+	if (!isp->hw->meta_exposure || !virt ||
+	    meta->size < ISP_META_SECTIONS + 4 * (ISP_META_SECTION_EXPOSURE + 1))
 		return;
 
 	offset = get_unaligned_le32(virt + ISP_META_SECTIONS +
@@ -1154,6 +1155,9 @@ static const struct v4l2_ctrl_ops isp_exposure_ctrl_ops = {
  */
 static void isp_init_exposure_ctrls(struct apple_isp *isp)
 {
+	if (!isp->hw->meta_exposure)
+		return;
+
 	isp->frame_gain = 256;
 	isp->gain = v4l2_ctrl_new_std(&isp->ctrl_handler,
 				      &isp_exposure_ctrl_ops, V4L2_CID_GAIN,

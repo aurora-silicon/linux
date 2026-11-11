@@ -2,6 +2,7 @@
 #ifndef __ANE_H16_PROGRAM_H__
 #define __ANE_H16_PROGRAM_H__
 
+#include <linux/refcount.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/spinlock.h>
@@ -174,6 +175,22 @@ struct ane_h16_session_ops {
 	int (*wake)(void *ctx);
 };
 
+/*
+ * A program surface mapped into a process (ane_h16_session_export()). The
+ * pages stay with the mapping: when the program is torn down, the surface
+ * goes back to the session's spares only after the last mapping is gone,
+ * so a later program, maybe of another process, never shares them.
+ */
+struct ane_h16_export {
+	refcount_t ref;
+	struct ane_h16_session *session;
+	struct ane_fw_surface surface;
+	bool write;
+	/* The program gave the surface back; the last put returns it to the spares. */
+	bool released;
+	struct list_head node;
+};
+
 struct ane_h16_program {
 	struct ane_h16_hwx_snapshot snapshot;
 	/* Parsed again from the authenticated bytes, never the cached info. */
@@ -184,6 +201,8 @@ struct ane_h16_program {
 	struct ane_h16_load_slot slots[ANE_H16_LOAD_SLOTS];
 	struct ane_h16_resource resources[ANE_H16_SURFACES];
 	struct ane_fw_surface *surfaces[ANE_H16_SURFACES];
+	/* Mapped surfaces, by region; the program holds one reference each. */
+	struct ane_h16_export *exports[ANE_H16_REGIONS];
 	struct ane_h16_custom_bar bars[ANE_H16_MAX_CUSTOM_BARS];
 	unsigned int bar_count;
 	unsigned int resource_count;
@@ -335,6 +354,10 @@ struct ane_h16_session {
 	/* Accounted EXECUTEs; the lock lets a reader snapshot them. */
 	spinlock_t stats_lock;
 	struct ane_h16_exec_stats stats;
+	/* Exports whose last mapping is gone, returned by export_work. */
+	spinlock_t export_lock;
+	struct list_head exports_done;
+	struct work_struct export_work;
 };
 
 int ane_h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *transport,
@@ -356,6 +379,11 @@ int ane_h16_session_run(struct ane_h16_session *s, struct ane_h16_program *p);
 int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p);
 int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p);
 void ane_h16_session_put(struct ane_h16_session *s, struct ane_h16_program *p);
+int ane_h16_session_export(struct ane_h16_session *s, struct ane_h16_program *p,
+			   unsigned int index, struct ane_h16_export **out);
+void ane_h16_export_get(struct ane_h16_export *e);
+void ane_h16_export_put(struct ane_h16_export *e);
+void ane_h16_session_flush_exports(struct ane_h16_session *s);
 int ane_h16_session_enter(struct ane_h16_session *s, bool nonblock);
 unsigned int ane_h16_session_dump_fwlog(struct ane_h16_session *s);
 void ane_h16_session_sleep(struct ane_h16_session *s, bool asleep);

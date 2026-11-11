@@ -1549,6 +1549,13 @@ static struct pci_driver mt_driver = {
 	.remove = mt_remove,
 	.shutdown = mt_shutdown,
 	.driver.suppress_bind_attrs = true,
+	/*
+	 * Probing boots the firmware, which takes over a second. The Wi-Fi
+	 * function is added from the PCIe host bridge's probe, often from the
+	 * deferred-probe worker: probed synchronously it holds that worker, and
+	 * every deferred device waits behind it.
+	 */
+	.driver.probe_type = PROBE_PREFER_ASYNCHRONOUS,
 	.driver.pm = pm_sleep_ptr(&mt_pm_ops),
 };
 

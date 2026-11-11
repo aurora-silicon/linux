@@ -231,9 +231,15 @@ void *sep_bio_register(const char *name, unsigned short mode, void *ctx,
 			  void (*f_release)(void *),
 			  long (*f_ioctl)(void *, unsigned int, unsigned long),
 			  int (*f_ready)(void *));
+void *sep_bio_register_concurrent(const char *name, unsigned short mode,
+				  void *ctx, int (*f_open)(void *),
+				  void (*f_release)(void *),
+				  long (*f_ioctl)(void *, unsigned int, unsigned long),
+				  int (*f_ready)(void *));
 void sep_bio_unregister(void *dev);
 void sep_bio_wake(void *dev);
 int sep_bio_capable_admin(void);
+__u32 sep_bio_current_euid(void);
 __u64 sep_bio_monotonic_ns(void);
 __u64 sep_bio_boottime_ns(void);
 
@@ -272,5 +278,15 @@ void sep_tk_set_key_len(struct trusted_key_payload *p, unsigned int n);
 unsigned char *sep_tk_blob_ptr(struct trusted_key_payload *p);
 unsigned int sep_tk_blob_len(const struct trusted_key_payload *p);
 void sep_tk_set_blob_len(struct trusted_key_payload *p, unsigned int n);
+
+
+/* Initrd attach and completion; sysfs removal drains the callback. */
+bool sep_keystore_only(void);
+bool sep_keystore_user_bags(void);
+int sep_complete_attach_register(struct device *dev, void *ctx,
+                                int (*complete)(void *ctx));
+void sep_complete_attach_unregister(struct device *dev);
+void sep_diag_keystore_ended(void);
+void sep_diag_set_xart(bool writable);
 
 #endif /* SEP_SHIM_H */

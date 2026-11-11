@@ -1875,8 +1875,11 @@ void ane_h16_backend_remove(struct platform_device *pdev)
 		return;
 	/* Waits for the boot bring-up and any stage write in progress. */
 	cancel_work_sync(&h->start);
-	if (h->program_ready)
+	if (h->program_ready) {
 		cancel_delayed_work_sync(&h->session.gate_work);
+		/* Return released exports; mapped ones stay with their mappings. */
+		flush_work(&h->session.export_work);
+	}
 	debugfs_remove_recursive(h->debugfs);
 	mutex_lock(&ane_h16_lock);
 	if (!--ane_h16_debugfs_users) {

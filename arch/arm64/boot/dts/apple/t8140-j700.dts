@@ -2178,6 +2178,7 @@
 
 /* The loader publishes external resources after validating their firmware. */
 #include "t8140-j700-dcpext.dtsi"
+#include "t8140-j700-dpaudio.dtsi"
 
 &sleep {
 	apple,display-coprocessors = <&dcp>, <&dcpext>;

@@ -166,6 +166,24 @@
 	status = "okay";
 };
 
+/*
+ * The video encoder runs the firmware iBoot preloads. The bootloader hands
+ * it over at the start of the encoder's DART window and admits the
+ * preloaded code in the CPU DART's address filter; without that handoff
+ * the driver refuses the reservation and the encoder stays off.
+ */
+&ave_dart0 {
+	status = "okay";
+};
+
+&ave_dart1 {
+	status = "okay";
+};
+
+&ave {
+	status = "okay";
+};
+
 &apr0_dart {
 	status = "okay";
 };

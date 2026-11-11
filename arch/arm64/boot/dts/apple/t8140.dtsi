@@ -1287,7 +1287,12 @@
 				       <&pmp_report_ave0>;
 			power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1",
 					     "perf";
-			iommus = <&ave_dart0 0>, <&ave_dart1 0>;
+			/*
+			 * Stream 12 carries the temporal filter engines; it must
+			 * translate through the encoder's domain, not bypass.
+			 */
+			iommus = <&ave_dart0 0>, <&ave_dart0 12>,
+				 <&ave_dart1 0>, <&ave_dart1 12>;
 			status = "disabled";
 		};
 

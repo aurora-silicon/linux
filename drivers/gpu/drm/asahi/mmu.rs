@@ -3104,7 +3104,9 @@ impl Vm {
             return Err(EINVAL);
         }
 
-        dev_info!(dev, "MMU: IO map: {:#x}:{:#x} -> {:#x}\n", phys, size, iova);
+        crate::debug! {
+            dev_info!(dev, "MMU: IO map: {:#x}:{:#x} -> {:#x}\n", phys, size, iova);
+        }
 
         let inner = vm_exec.unique_gpuvm.data();
         let uat_inner = inner.uat_inner.clone();
