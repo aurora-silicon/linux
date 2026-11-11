@@ -1965,12 +1965,20 @@
 		status = "disabled";
 	};
 
-	aop_exclave_mailbox: mailbox@4d067c000 {
-		compatible = "apple,t6050-secure-mailbox", "apple,secure-mailbox";
-		reg = <0x4 0xd067c000 0x0 0x4000>;
-		interrupts = <AIC_IRQ 0 585 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 0 582 IRQ_TYPE_LEVEL_HIGH>;
+	/*
+	 * The AOP setup port, ADT aop-exclave-mailbox. Its ADT reg is not behind the arm-io
+	 * translation: AOP ASC + 0x4007c000, as on T8140 and T8142. ADT interrupts [585, 582].
+	 * dart-aop stream 1: ADT vm-base-1 0x20000000000, vm-size-1 0x2000000000.
+	 */
+	aop_setup_mbox: mailbox@2d067c000 {
+		compatible = "apple,t6050-aop-setup-mailbox", "apple,t8140-aop-setup-mailbox";
+		reg = <0x2 0xd067c000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 582 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 585 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "recv-not-empty";
 		iommus = <&aop_dart 1>;
+		apple,dma-range = <0x200 0x0 0x20 0x0>;
+		#mbox-cells = <0>;
 		status = "disabled";
 	};
 
