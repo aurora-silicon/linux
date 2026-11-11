@@ -63,6 +63,12 @@ properties:
     type: object
     $ref: /schemas/sound/apple,t8152-aop-audio.yaml#
 
+  als:
+    type: object
+    $ref: /schemas/iio/light/apple,aop-als.yaml#
+    description: The ambient light sensor service.
+    unevaluatedProperties: false
+
 required:
   - compatible
   - reg
