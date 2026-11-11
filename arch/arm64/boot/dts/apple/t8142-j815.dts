@@ -194,7 +194,7 @@
 		ranges;
 
 		n1_control: control@0,0 {
-			compatible = "pci106b,1900";
+			compatible = "apple,t8142-centauri-control", "pci106b,1900";
 			reg = <0x10000 0x0 0x0 0x0 0x0>;
 		};
 
