@@ -23,6 +23,7 @@ properties:
           - apple,agx-t6050
           - apple,agx-t8132
           - apple,agx-t8140
+          - apple,agx-t8142
       - items:
           - const: apple,agx-t8103
           - const: apple,agx-g13g
@@ -83,13 +84,7 @@ properties:
 
   memory-region-names:
     minItems: 3
-    items:
-      - const: ttbs
-      - const: pagetables
-      - const: handoff
-      - enum: [hw-cal-a, shared-l2, fw-data]
-      - enum: [hw-cal-b, fw-text, l2-pagetables]
-      - enum: [globals, fw-data, fw-text]
+    maxItems: 6
 
   apple,clpc:
     $ref: /schemas/types.yaml#/definitions/phandle
@@ -460,6 +455,7 @@ allOf:
                 - apple,agx-t6041
                 - apple,agx-t8132
                 - apple,agx-t8140
+                - apple,agx-t8142
                 - apple,agx-g17s
     then:
       properties:
@@ -485,6 +481,60 @@ allOf:
             - const: globals
       required:
         - apple,firmware-abi
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,agx-t8142
+    then:
+      properties:
+        reg:
+          items:
+            - description: GFX coprocessor control registers
+            - description: GPU block MMIO registers
+        reg-names:
+          items:
+            - const: asc
+            - const: sgx
+        mboxes:
+          items:
+            - description: GFX coprocessor mailbox
+            - description: GFX1 coprocessor mailbox
+        memory-region:
+          items:
+            - description: GPU MMU TTBs
+            - description: GPU MMU page tables
+            - description: Shared GPU MMU handoff structure
+            - description: Shared L2 page tables
+            - description: GFX firmware data
+            - description: GFX1 firmware data
+        memory-region-names:
+          items:
+            - const: ttbs
+            - const: pagetables
+            - const: handoff
+            - const: shared-l2
+            - const: gfx-data
+            - const: gfx1-data
+      required:
+        - reg-names
+        - mboxes
+        - memory-region
+        - memory-region-names
+        - power-domains
+        - operating-points-v2
+    else:
+      properties:
+        memory-region-names:
+          minItems: 3
+          items:
+            - const: ttbs
+            - const: pagetables
+            - const: handoff
+            - enum: [hw-cal-a, shared-l2, fw-data]
+            - enum: [hw-cal-b, fw-text, l2-pagetables]
+            - enum: [globals, fw-data, fw-text]
 
 additionalProperties: false
 

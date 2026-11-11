@@ -35,6 +35,36 @@ static bool avd_image_fmt_changed(struct avd_ctx *ctx,
 	return ctx->image_fmt != image_fmt;
 }
 
+/*
+ * Whether the allocated CAPTURE buffers already suit @image_fmt: the
+ * negotiated pixel format is the one for it and the compressed reference
+ * area after the picture is laid out the same. A request applied when its
+ * job starts always finds CAPTURE buffers allocated; its picture format is
+ * no change then. (ctx->image_fmt can still say ANY there: a client that
+ * set the format control only to its default value never reached s_ctrl,
+ * as the control framework skips values that equal the current one.)
+ */
+static bool avd_image_fmt_fits_capture(struct avd_ctx *ctx,
+				       enum avd_image_fmt image_fmt)
+{
+	const struct avd_coded_fmt_desc *desc = ctx->coded_fmt_desc;
+	const struct v4l2_pix_format_mplane *pix = &ctx->decoded_fmt.fmt.pix_mp;
+	struct avd_comp comp = {};
+	bool fourcc_ok = false;
+	unsigned int i;
+
+	for (i = 0; i < desc->num_decoded_fmts; i++)
+		if (desc->decoded_fmts[i].image_fmt == image_fmt &&
+		    desc->decoded_fmts[i].fourcc == pix->pixelformat)
+			fourcc_ok = true;
+	if (!fourcc_ok)
+		return false;
+
+	fill_comp(&comp, image_fmt, pix->width, pix->height);
+	return comp.size == ctx->comp.size &&
+	       !memcmp(comp.offsets, ctx->comp.offsets, sizeof(comp.offsets));
+}
+
 static u32 avd_enum_decoded_fmt(struct avd_ctx *ctx, int index,
 				enum avd_image_fmt image_fmt)
 {
@@ -139,8 +169,12 @@ static int avd_s_ctrl(struct v4l2_ctrl *ctrl)
 	if (avd_image_fmt_changed(ctx, image_fmt)) {
 		vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx,
 				     V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
-		if (vb2_is_busy(vq))
-			return -EBUSY;
+		if (vb2_is_busy(vq)) {
+			if (!avd_image_fmt_fits_capture(ctx, image_fmt))
+				return -EBUSY;
+			ctx->image_fmt = image_fmt;
+			return 0;
+		}
 
 		ctx->image_fmt = image_fmt;
 		avd_reset_decoded_fmt(ctx);
@@ -1017,7 +1051,11 @@ void avd_run_preamble(struct avd_ctx *ctx, struct avd_run *run)
 	/* Apply request(s) controls if needed. */
 	src_req = run->bufs.src->vb2_buf.req_obj.req;
 	if (src_req)
-		v4l2_ctrl_request_setup(src_req, &ctx->ctrl_hdl);
+		run->setup_err = v4l2_ctrl_request_setup(src_req, &ctx->ctrl_hdl);
+	if (run->setup_err)
+		dev_err_ratelimited(ctx->dev->dev,
+				    "request controls not applied (%d), failing the frame\n",
+				    run->setup_err);
 
 	v4l2_m2m_buf_copy_metadata(run->bufs.src, run->bufs.dst);
 }

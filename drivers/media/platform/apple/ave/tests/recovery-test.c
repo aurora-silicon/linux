@@ -396,8 +396,150 @@ static void mapping_lifetimes(void)
 	assert(dbuf.refs == 1 && !dev.dma_refs);
 }
 
+/*
+ * Lifetime rules: a session the firmware saw is never freed at teardown,
+ * Close answered or not; only a reap after proven power loss frees it, and
+ * MCTF memory (the device pool) is only handed back, with a CRC kept. A
+ * session the firmware never saw is freed at once.
+ */
+static void session_lifetime(void)
+{
+	static char pool_mem[64];
+	struct ave_session *sess;
+
+	init();
+	ave.mctf_pool_flags = 1UL << AVE_MCTF_POOL_READY | 1UL << AVE_MCTF_POOL_LENT;
+	ave.mctf_pool[0].cpu = pool_mem;
+	ave.mctf_pool[0].alloc = sizeof(pool_mem);
+
+	/* Encoder session, Close answered, firmware running: quarantined. */
+	sess = calloc(1, sizeof(*sess));
+	assert(sess);
+	sess->handed = true;
+	sess->hdr.cpu = (void *)1;
+	ctx[0].sess = sess;
+	ave.fw_state = AVE_FW_RUNNING;
+	ave_sess_destroy(&ctx[0]);
+	assert(!freed && !ctx[0].sess && ave.failed_sessions == sess);
+
+	/* MCTF session: quarantined holding the pool. */
+	sess = calloc(1, sizeof(*sess));
+	assert(sess);
+	sess->handed = true;
+	sess->mctf_borrowed = true;
+	sess->mctf_buf[0] = ave.mctf_pool[0];
+	ctx[1].sess = sess;
+	ave_sess_destroy(&ctx[1]);
+	assert(!freed && ave.failed_sessions == sess);
+	assert(ave.mctf_pool_flags & 1UL << AVE_MCTF_POOL_LENT);
+	/* The canary is taken when the session stops. */
+	assert(ave.mctf_pool_crc_valid &&
+	       ave.mctf_pool_crc == crc32_le(~0U, pool_mem, sizeof(pool_mem)));
+
+	/* Halted, power not yet lost (CTRL or BOOT_ARG still set): nothing goes. */
+	ave.fw_state = AVE_FW_HALTED;
+	*(u32 *)((char *)coproc + regs.ctrl) = 1;
+	*(u32 *)((char *)coproc + regs.boot_arg) = 0x10000;
+	mutex_lock(&ave.hw_lock);
+	assert(ave_fw_prepare_restart(&ave) == -EAGAIN);
+	*(u32 *)((char *)coproc + regs.ctrl) = 0;
+	assert(ave_fw_prepare_restart(&ave) == -EAGAIN);	/* CTRL alone is no proof */
+	mutex_unlock(&ave.hw_lock);
+	assert(!freed && ave.failed_sessions);
+
+	/* Power lost: the encoder buffers are freed, the pool only handed back. */
+	*(u32 *)((char *)coproc + regs.boot_arg) = 0;
+	stop_seen = power_seen = true;
+	pool_mem[0] = 0x5a;
+	mutex_lock(&ave.hw_lock);
+	assert(!ave_fw_prepare_restart(&ave));
+	mutex_unlock(&ave.hw_lock);
+	assert(!ave.failed_sessions && freed == 1);
+	assert(ave.mctf_pool_changed == 1);	/* written after it stopped: seen at reap */
+	assert(ave.mctf_pool_flags == 1UL << AVE_MCTF_POOL_READY);
+	assert(ave.mctf_pool_crc_valid &&
+	       ave.mctf_pool_crc == crc32_le(~0U, pool_mem, sizeof(pool_mem)));
+	assert(ave.mctf_pool[0].cpu == pool_mem);
+
+	/* A session the firmware never saw is freed at once. */
+	sess = calloc(1, sizeof(*sess));
+	assert(sess);
+	sess->hdr.cpu = (void *)1;
+	ctx[0].sess = sess;
+	ave_sess_destroy(&ctx[0]);
+	assert(freed == 2 && !ave.failed_sessions);
+}
+
+/* A BOOT_ARG that did not hold its boot value proves nothing: never reap. */
+static void unusable_witness(void)
+{
+	struct ave_session *sess;
+
+	init();
+	sess = calloc(1, sizeof(*sess));
+	assert(sess);
+	sess->handed = true;
+	sess->hdr.cpu = (void *)1;
+	ctx[0].sess = sess;
+	ave.fw_state = AVE_FW_RUNNING;
+	ave_sess_destroy(&ctx[0]);
+	ave.witness_unusable = true;
+	ave.fw_state = AVE_FW_HALTED;
+	stop_seen = power_seen = true;
+	mutex_lock(&ave.hw_lock);
+	assert(!ave_fw_prepare_restart(&ave));	/* restart still allowed on CTRL */
+	mutex_unlock(&ave.hw_lock);
+	assert(!freed && ave.failed_sessions == sess);
+	free(sess);
+}
+
+/* An unanswered Close, or frames still out, fail the firmware; fw_open stays. */
+static void unconfirmed_close(void)
+{
+	init();
+	owners();
+	ave.fw_state = AVE_FW_RUNNING;
+	close_result = -ETIMEDOUT;
+	ctx[0].mctf = true;
+	mutex_lock(&ave.hw_lock);
+	ave_session_close(&ctx[0], false);
+	mutex_unlock(&ave.hw_lock);
+	assert(ave.fw_state == AVE_FW_BROKEN && ctx[0].sess->fw_open);
+	assert(!ave.sessions[0]);
+	free(ctx[0].sess);
+	free(ctx[1].sess);
+
+	init();
+	owners();
+	ave.fw_state = AVE_FW_RUNNING;
+	ctx[1].sess->busy = 1;
+	ctx[1].mctf = true;
+	mutex_lock(&ave.hw_lock);
+	ave_session_close(&ctx[1], false);
+	mutex_unlock(&ave.hw_lock);
+	assert(ave.fw_state == AVE_FW_BROKEN && !ctx[1].sess->fw_open);
+	free(ctx[0].sess);
+	free(ctx[1].sess);
+
+	/* An encoder session keeps the firmware running after a refused Close. */
+	init();
+	owners();
+	ave.fw_state = AVE_FW_RUNNING;
+	close_result = -ETIMEDOUT;
+	ctx[0].mctf = false;
+	mutex_lock(&ave.hw_lock);
+	ave_session_close(&ctx[0], false);
+	mutex_unlock(&ave.hw_lock);
+	assert(ave.fw_state == AVE_FW_RUNNING);
+	free(ctx[0].sess);
+	free(ctx[1].sess);
+}
+
 int main(void)
 {
+	session_lifetime();
+	unconfirmed_close();
+	unusable_witness();
 	mapping_lifetimes();
 	failed_submission();
 	failed_start();
@@ -409,6 +551,7 @@ int main(void)
 	quiet_ring_deadline();
 	restore_data();
 	puts("ok: recovery ownership, queues, quarantine, reset proof, rate limit, "
-	     "PM rollback, DATA, IPC deadline and interrupt wait, MMAP/dma-buf release ordering");
+	     "PM rollback, DATA, IPC deadline and interrupt wait, MMAP/dma-buf release ordering, "
+	     "session and MCTF pool lifetime, canary, unconfirmed Close, unusable witness");
 	return 0;
 }

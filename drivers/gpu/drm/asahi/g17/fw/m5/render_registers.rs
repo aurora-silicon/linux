@@ -331,16 +331,20 @@ pub(crate) struct TaExtra {
     pub(crate) min_free_tvb_pages: u64,
     pub(crate) scs_bracket: u8,
     pub(crate) matrix_bracket: u8,
+    /// The J813's form, as macOS 27.0 writes it there: the program keeps its own 0x1748/0x1740
+    /// bracket (every TA program opens with 0x1748 = 1 and closes with 0x1740 = 1) and carries
+    /// the common registers unchanged, without the tiler parameter sub-buffer writes.
+    pub(crate) j813: bool,
 }
 
 pub(crate) struct TaProgram {
-    registers: [RegisterWrite; 97],
+    registers: [RegisterWrite; 99],
     length: usize,
 }
 
 impl TaProgram {
     pub(crate) const fn empty() -> Self {
-        Self { registers: [RegisterWrite {reg: 0, value: 0}; 97], length: 0 }
+        Self { registers: [RegisterWrite {reg: 0, value: 0}; 99], length: 0 }
     }
     pub(crate) fn registers(&self) -> &[RegisterWrite] { &self.registers[..self.length] }
     pub(crate) fn set_lifecycle(&mut self, value: u64) {
@@ -365,10 +369,19 @@ pub(crate) fn tiling_with_scratch_into(common: &[RegisterWrite], e: TaExtra,
     if e.matrix_bracket & 1 != 0 { out.push(0x17f1, 1)?; }
     let mut deflake = false;
     for r in common.iter().copied() {
-        if r.reg == 0x1748 { continue; }
+        if r.reg == 0x1748 {
+            if e.j813 { out.push(0x1748, 1)?; }
+            continue;
+        }
         if r.reg == 0x1740 {
             if e.scs_bracket & 1 != 0 { out.push(0x17d9, 1)?; }
             if e.matrix_bracket & 1 != 0 { out.push(0x17e9, 1)?; }
+            if e.j813 { out.push(0x1740, 1)?; }
+            continue;
+        }
+        if e.j813 {
+            // 0x10141 (copied to 0x1ca60) keeps the one-layer 0x200, as macOS writes it.
+            out.push(r.reg, r.value)?;
             continue;
         }
         out.push(r.reg, r.value)?;
@@ -391,8 +404,8 @@ pub(crate) fn tiling_with_scratch_into(common: &[RegisterWrite], e: TaExtra,
             _ => {}
         }
     }
-    if out.length != 92 + usize::from(e.scs_bracket & 1) * 2 + usize::from(e.matrix_bracket & 1) * 2
-        + usize::from(mesh_storage != 0) {
+    if !e.j813 && out.length != 92 + usize::from(e.scs_bracket & 1) * 2
+        + usize::from(e.matrix_bracket & 1) * 2 + usize::from(mesh_storage != 0) {
         return Err(EINVAL);
     }
     Ok(())
@@ -400,6 +413,14 @@ pub(crate) fn tiling_with_scratch_into(common: &[RegisterWrite], e: TaExtra,
 
 pub(crate) fn fragment_main_with_scratch_into(p: &RenderPass, common: &[RegisterWrite],
     dispatch: FragmentDispatch, descriptor_flag: u8, scs: bool, out: &mut [RegisterWrite]) -> Result {
+    fragment_main_forms_into(p, common, dispatch, descriptor_flag, scs, false, out)
+}
+
+/// As [`fragment_main_with_scratch_into`]; with `j813`, the J813's macOS 27.0 form, which writes no
+/// 0x160a8 before either tile write.
+pub(crate) fn fragment_main_forms_into(p: &RenderPass, common: &[RegisterWrite],
+    dispatch: FragmentDispatch, descriptor_flag: u8, scs: bool, j813: bool,
+    out: &mut [RegisterWrite]) -> Result {
 
     let mut n = 0;
     let mut tile = 0;
@@ -410,9 +431,11 @@ pub(crate) fn fragment_main_with_scratch_into(p: &RenderPass, common: &[Register
         }
         if r.reg == 0x16068 {
             if tile == 2 { return Err(EINVAL); }
-            out[n] = RegisterWrite { reg: 0x160a8,
-                value: if tile == 0 { dispatch.initial(descriptor_flag) } else { 0x20 } };
-            n += 1;
+            if !j813 {
+                out[n] = RegisterWrite { reg: 0x160a8,
+                    value: if tile == 0 { dispatch.initial(descriptor_flag) } else { 0x20 } };
+                n += 1;
+            }
             tile += 1;
         }
         let slot = out.get_mut(n).ok_or(EINVAL)?;
@@ -526,14 +549,20 @@ impl Workspace {
         build_ta_registers_into(p, &c, r.free_list_slot, ta, &self.common.ta)?;
         let mut extra = extra;
         extra.scs_bracket |= u8::from(c.ta.scs.scratch.enabled());
+        extra.j813 = c.board.j813_forms();
         tiling_with_scratch_into(ta, extra, r.mesh_storage, &mut self.ta)?;
         self.ta.set_lifecycle((u64::from(inputs.ta.predecessor_id) << 32) | u64::from(inputs.ta.completion.key as u32));
         c.fragment_tile_flags = (c.fragment_tile_flags & !0x7ffff) | 0x36011
             | (u64::from(inputs.fragment.empty_tile_flags[3] & 1) << 18);
+        let j813 = c.board.j813_forms();
+        if j813 {
+            // macOS 27.0's J813 fragment program writes 0xa741 = 0 at entry.
+            c.fragment_event_control = 0;
+        }
         build_fragment_registers_into(p, &c, r.free_list_slot, &mut self.base, &self.common.fragment)?;
-        self.fragment_count = 92 + usize::from(c.fragment.scs.scratch.enabled()) * 2;
-        fragment_main_with_scratch_into(p, &self.base, dispatch, inputs.fragment.empty_tile_flags[3],
-            c.fragment.scs.scratch.enabled(), &mut self.fragment[..self.fragment_count])?;
+        self.fragment_count = if j813 { 90 } else { 92 } + usize::from(c.fragment.scs.scratch.enabled()) * 2;
+        fragment_main_forms_into(p, &self.base, dispatch, inputs.fragment.empty_tile_flags[3],
+            c.fragment.scs.scratch.enabled(), j813, &mut self.fragment[..self.fragment_count])?;
         for reg in &mut self.fragment {
             if matches!(reg.reg, 0x160e0 | 0x1499 | 0xa341) {
                 reg.value = (u64::from(inputs.fragment.predecessor_id) << 32) | u64::from(inputs.fragment.completion.key as u32);

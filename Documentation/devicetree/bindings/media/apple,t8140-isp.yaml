@@ -57,29 +57,22 @@ properties:
       - description: Third ISP DART stream
 
   power-domains:
-    items:
-      - description: ISP system domain
-      - description: ISP CPU domain
-      - description: ISP CPU core 0 domain
-      - description: ISP CPU core 1 domain
-      - description: ISP FE domain
-      - description: ISP DPRX domain
-      - description: ISP secure domain
-      - description: ISP STS0 domain
-      - description: ISP STS1 domain
-      - description: ISP Pearl domain
-      - description: ISP BE domain
-      - description: ISP CLR domain
-      - description: ISP CVD domain
-      - description: ISP CVM domain
+    minItems: 8
+    maxItems: 16
 
   memory-region:
-    maxItems: 1
-    description: Firmware heap region provided by the bootloader
+    minItems: 1
+    maxItems: 3
+    description:
+      Firmware heap region provided by the bootloader, then the firmware text
+      and data segments it loaded
 
   memory-region-names:
+    minItems: 1
     items:
       - const: heap
+      - const: text
+      - const: data
 
   apple,dart-vm-size:
     $ref: /schemas/types.yaml#/definitions/uint64
@@ -135,6 +128,46 @@ properties:
         additionalProperties: false
     additionalProperties: false
 
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8142-isp
+    then:
+      properties:
+        power-domains:
+          items:
+            - description: ISP system domain
+            - description: ISP CPU domain
+            - description: ISP CPU core 0 domain
+            - description: ISP FE domain
+            - description: ISP DPRX domain
+            - description: ISP STS0 domain
+            - description: ISP BE domain
+            - description: ISP CLR domain
+    else:
+      properties:
+        power-domains:
+          items:
+            - description: ISP system domain
+            - description: ISP CPU domain
+            - description: ISP CPU core 0 domain
+            - description: ISP CPU core 1 domain
+            - description: ISP FE domain
+            - description: ISP DPRX domain
+            - description: ISP secure domain
+            - description: ISP STS0 domain
+            - description: ISP STS1 domain
+            - description: ISP Pearl domain
+            - description: ISP BE domain
+            - description: ISP CLR domain
+            - description: ISP CVD domain
+            - description: ISP CVM domain
+            - description: Camera sensor 0 domain
+            - description: Camera sensor 1 domain
+          minItems: 14
+
 required:
   - compatible
   - reg
@@ -174,7 +207,7 @@ examples:
                             <&ps_isp_fe>, <&ps_isp_dprx>, <&ps_isp_secure>,
                             <&ps_isp_sts0>, <&ps_isp_sts1>, <&ps_isp_pearl>,
                             <&ps_isp_be>, <&ps_isp_clr>, <&ps_isp_cvd>,
-                            <&ps_isp_cvm>;
+                            <&ps_isp_cvm>, <&ps_ispsens0>, <&ps_ispsens1>;
             memory-region = <&isp_heap>;
             memory-region-names = "heap";
             apple,dart-vm-size = <0x0 0xa0000000>;

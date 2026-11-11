@@ -26,6 +26,9 @@
 		keyboard = &keyboard;
 		sep = &sep;
 		serial0 = &serial0;
+		serial1 = &uart4;
+		serial2 = &uart5;
+		serial3 = &uart0;
 		pmp = &pmp;
 		rtc0 = &smc_rtc;
 		rtc1 = &pmu_rtc;
@@ -428,6 +431,12 @@
 };
 
 &serial0 {
+	status = "okay";
+};
+
+&uart0 {
+	/* The PMGR clock provider is not enabled on this SoC yet. */
+	clocks = <&clkref>, <&clkref>;
 	status = "okay";
 };
 
@@ -2116,6 +2125,7 @@
 
 /* The loader publishes external resources after validating their firmware. */
 #include "t8140-j700-dcpext.dtsi"
+#include "t8140-j700-dpaudio.dtsi"
 
 &display {
 	iommus = <&disp0_dart 0>, <&dispext0_dart 0>;

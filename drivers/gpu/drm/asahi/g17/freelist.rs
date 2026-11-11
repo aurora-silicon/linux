@@ -839,7 +839,8 @@ impl RenderPool {
                 let mut bytes = [0; super::fw::m5::pool::STATE_BYTES];
                 super::fw::m5::pool::encode_g17s_render_state(pages.m5_layout(self.id())?,
                     self.state.gpu_va(), &mut bytes).map_err(|_| EINVAL)?;
-                bytes[super::fw::m5::pool::COMPLETED..super::fw::m5::pool::COMPLETED + 8]
+                let completed_at = super::fw::m5::pool::completed_offset();
+                bytes[completed_at..completed_at + 8]
                     .copy_from_slice(&submitted.to_le_bytes());
                 let raw = self.control.pointer(0, bytes.len())?;
                 for (index, byte) in bytes.into_iter().enumerate() {
@@ -891,7 +892,7 @@ impl RenderPool {
     /// counter, so retain the byte accesses required by that interface.
     pub(crate) fn counters(&self) -> Result<[u64; 2]> {
         let submitted = self.state.dword(0)?.load(Ordering::Relaxed);
-        let offset = if self.is_m5() { super::fw::m5::pool::COMPLETED }
+        let offset = if self.is_m5() { super::fw::m5::pool::completed_offset() }
             else { FreeListControl::COMPLETED };
         let completed = self.control.pointer(offset, 8)?;
         let mut bytes = [0; 8];
@@ -1073,7 +1074,8 @@ impl ComputePool {
                 use super::fw::m5::pool;
                 pool::encode_g17s_compute_state(pages.m5_layout(id)?, submitted,
                     &mut control.bytes_mut()[..pool::STATE_BYTES]).map_err(|_| EINVAL)?;
-                control.bytes_mut()[pool::COMPLETED..pool::COMPLETED + 8].copy_from_slice(&completed);
+                let completed_at = pool::completed_offset();
+                control.bytes_mut()[completed_at..completed_at + 8].copy_from_slice(&completed);
                 Ok(())
             }
             PageLayout::Neo { blocks, .. } => {
@@ -1094,7 +1096,7 @@ impl ComputePool {
         Ok(u64::from_le_bytes(self.completed_bytes()?))
     }
     fn completed_bytes(&self) -> Result<[u8; 8]> {
-        let offset = if self.m5 { super::fw::m5::pool::COMPLETED } else { FreeListControl::COMPLETED };
+        let offset = if self.m5 { super::fw::m5::pool::completed_offset() } else { FreeListControl::COMPLETED };
         let pointer = self.control.pointer(offset, 8)?;
         let mut bytes = [0; 8];
         for (index, byte) in bytes.iter_mut().enumerate() {

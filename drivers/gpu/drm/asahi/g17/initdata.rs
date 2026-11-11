@@ -172,12 +172,16 @@ impl WorkPublication<'_> {
 /// Session-long storage and mappings. Aliases are released before their backing objects.
 pub(super) struct InitData {
     m5: bool,
+    /// The M5 firmware build's layout, where [`Self::m5`].
+    graph: &'static super::fw::m5::initdata::Graph,
     outer_credits: Option<Arc<outer_credit::Credits>>,
     // Live publication uses interior writes under the device mutex. This owner is Send but not
     // Sync, so safe host code cannot issue those writes concurrently through shared references.
     _single_publisher: core::marker::PhantomData<core::cell::Cell<()>>,
     aliases: KVec<mmu::KernelMapping>,
     objects: KVec<KernelObject>,
+    /// The log buffers published to each [`Role`], for reading back what the firmware wrote.
+    fw_log_objects: [Option<usize>; 2],
     roots: usize,
     cluster: usize,
     bundle: usize,
@@ -287,10 +291,12 @@ impl InitData {
     pub(super) fn new() -> Self {
         Self {
             m5: false,
+            graph: &super::fw::m5::initdata::M5_GRAPH,
             outer_credits: None,
             _single_publisher: core::marker::PhantomData,
             aliases: KVec::new(),
             objects: KVec::new(),
+            fw_log_objects: [None; 2],
             roots: 0,
             cluster: 0,
             bundle: 0,
@@ -340,6 +346,20 @@ impl InitData {
             mmu::UAT_PGSZ as u64, mmu::PROT_FW_SHARED_RW)?;
         self.metrics_fw_va = alias.iova();
         self.aliases.push(alias, GFP_KERNEL)?;
+        if super::J813_FORMS.load(Ordering::Relaxed) {
+            // The J813's firmware touches a render's metrics in context 0 (the kernel lower VM)
+            // at the client's compact-window address. Every client VM maps its metrics entry at
+            // the window's start plus the entry's offset (MetricsLease::map_client), so map the
+            // whole backing at the window's start here.
+            let start = super::buffer::BlockGeometry::M5_COMPACT.start;
+            let alias = metrics.alias_in(uat.kernel_lower_vm(),
+                start..start + metrics.size() as u64, mmu::UAT_PGSZ as u64,
+                mmu::PROT_GPU_SHARED_RW)?;
+            if alias.iova() != start {
+                return Err(EINVAL);
+            }
+            self.aliases.push(alias, GFP_KERNEL)?;
+        }
         Ok(())
     }
 
@@ -418,6 +438,17 @@ impl InitData {
     /// One M5 page-pool row: the pool's eight descriptor words at its 64-byte slot.
     fn set_m5_uma(&self, slot: u16, words: [u64; 8]) -> Result {
         let object = self.object(self.page_pool)?;
+        if super::fw::m5::pool::j813_pools() {
+            // The J813's rows are the descriptor's first four words, 0x20 apart.
+            const ROW: usize = super::fw::m5::pool::J813_ROW_WORDS * 8;
+            let offset = usize::from(slot) * ROW;
+            object.pointer(offset, ROW)?;
+            for (index, word) in words.into_iter().take(ROW / 8).enumerate() {
+                object.dword(offset + index * 8)?.store(word, Ordering::Relaxed);
+            }
+            fence(Ordering::SeqCst);
+            return Ok(());
+        }
         let offset = usize::from(slot) * core::mem::size_of::<[u64; 8]>();
         // Check the full row before the first store.
         object.pointer(offset, core::mem::size_of::<[u64; 8]>())?;
@@ -1724,17 +1755,17 @@ impl InitData {
     }
 
     fn main_config_offset(&self, role: Role) -> usize {
-        if self.m5 { super::fw::m5::initdata::M5_MAIN_BUNDLE_OFFSETS[role as usize] }
+        if self.m5 { self.graph.shared.main_config[role as usize] }
         else { abi::bundle::MAIN_CONFIG[role as usize] }
     }
 
     fn work_ring_offset(&self, channel: usize) -> usize {
-        if self.m5 { super::fw::m5::initdata::M5_WORK_RING_BUNDLE_OFFSETS[channel] }
+        if self.m5 { self.graph.work_ring_offsets[channel] }
         else { abi::work_ring_offset(channel) }
     }
 
     fn state_offset(&self, role: Role) -> usize {
-        if self.m5 { return super::fw::m5::initdata::M5_PRIVATE_STATE_GRIDS[role as usize]; }
+        if self.m5 { return self.graph.state_grids[role as usize]; }
         match role {
             Role::Primary => abi::private::PRIMARY_STATE,
             Role::Secondary => abi::private::SECONDARY_STATE,
@@ -1742,7 +1773,7 @@ impl InitData {
     }
 
     fn status_offset(&self, role: Role) -> usize {
-        if self.m5 { return super::fw::m5::initdata::M5_PRIVATE_STATUS_A[role as usize]; }
+        if self.m5 { return self.graph.private.roles[role as usize].status_a; }
         match role {
             Role::Primary => self.status_a,
             Role::Secondary => abi::private::SECONDARY_STATUS_A,
@@ -1839,13 +1870,13 @@ impl InitData {
         next: u32,
     ) -> Result {
         let ring_base = if self.m5 {
-            super::fw::m5::initdata::M5_CONTROL_RING_BUNDLE_OFFSETS[0]
+            self.graph.shared.control_ring[0]
         } else { self.main_config_offset(Role::Primary) + abi::MainConfig::CONTROL_RING };
         let offset = ring_base + (slot as usize).checked_mul(record.len()).ok_or(EINVAL)?;
         let ring = self.object(self.bundle)?.pointer(offset, record.len())?;
         let power = self
             .object(self.region_c)?
-            .pointer(if self.m5 { super::fw::m5::power::POWER_ASSERT_TALLY }
+            .pointer(if self.m5 { self.graph.power_assert_tally }
                 else { abi::RegionC::POWER_ASSERT_TALLY }, 4)?;
         let producer = self.control_producer()?;
         // SAFETY: The checked pointers remain valid for the lifetime of this non-Sync owner.
@@ -1896,13 +1927,13 @@ impl InitData {
         fence(Ordering::Acquire);
         Ok(self
             .object(self.cluster)?
-            .word(m::M5_PRIVATE_LAYOUT.status_b + m::M5_PROGRESS)?
+            .word(self.graph.private.status_b + m::M5_PROGRESS)?
             .load(Ordering::Relaxed))
     }
 
     fn recovery_state_offset(&self) -> usize {
         if self.m5 {
-            super::fw::m5::initdata::M5_PRIVATE_LAYOUT.status_b
+            self.graph.private.status_b
                 + super::fw::m5::initdata::M5_RECOVERY_STATE
         } else { self.status_b + abi::PrimaryStatusB::RECOVERY_STATE }
     }
@@ -1911,7 +1942,7 @@ impl InitData {
     fn recovery_view_words<const N: usize>(&self, view: usize, offset: usize) -> Result<[u32; N]> {
         let bundle = self.object(self.bundle)?;
         let extent = if self.m5 {
-            *super::fw::m5::initdata::M5_BUNDLE_VIEW_EXTENTS.get(view).ok_or(EINVAL)?
+            *self.graph.bundle_view_extents.get(view).ok_or(EINVAL)?
         } else {
             *abi::recovery::VIEW_EXTENTS.get(view).ok_or(EINVAL)?
         };
@@ -1920,7 +1951,7 @@ impl InitData {
             Some(views) => (self.object(*views.get(view).ok_or(EINVAL)?)?, 0),
             None if self.m5 => (
                 bundle,
-                *super::fw::m5::initdata::M5_BUNDLE_VIEW_OFFSETS.get(view).ok_or(EINVAL)?,
+                *self.graph.bundle_view_offsets.get(view).ok_or(EINVAL)?,
             ),
             None => (bundle, *abi::bundle::VIEWS.get(view).ok_or(EINVAL)?),
         };
@@ -1948,7 +1979,7 @@ impl super::recovery::Memory for InitData {
     }
     fn fault_sources(&self) -> Result<super::recovery::Sources> {
         let mask_offset = if self.m5 {
-            super::fw::m5::initdata::M5_PRIVATE_LAYOUT.status_b
+            self.graph.private.status_b
                 + super::fw::m5::initdata::M5_RECOVERY_SLOT_MASK
         } else {
             self.status_b + abi::PrimaryStatusB::RECOVERY_SLOT_MASK
@@ -1996,7 +2027,7 @@ impl super::recovery::Memory for InitData {
         Ok(self
             .object(self.cluster)?
             .word(if self.m5 {
-                super::fw::m5::initdata::M5_PRIVATE_LAYOUT.status_b
+                self.graph.private.status_b
                     + super::fw::m5::initdata::M5_HOST_RECOVERY
             } else {
                 self.status_b + abi::PrimaryStatusB::HOST_RECOVERY
@@ -2027,7 +2058,7 @@ impl super::recovery::Memory for InitData {
             Some(views) => (self.object(*views.get(4).ok_or(EINVAL)?)?, 0),
             None if self.m5 => (
                 self.object(self.bundle)?,
-                super::fw::m5::initdata::M5_BUNDLE_VIEW_OFFSETS[4],
+                self.graph.bundle_view_offsets[4],
             ),
             None => (self.object(self.bundle)?, abi::bundle::VIEWS[4]),
         };
@@ -2053,7 +2084,7 @@ impl super::recovery::Memory for InitData {
         }
         let cluster = self.object(self.cluster)?;
         let base = if self.m5 {
-            super::fw::m5::initdata::M5_PRIVATE_LAYOUT.status_b
+            self.graph.private.status_b
                 + super::fw::m5::initdata::M5_RECOVERY_INFO
         } else {
             self.status_b + abi::PrimaryStatusB::RECOVERY_INFO
@@ -2085,9 +2116,10 @@ impl InitData {
     /// M5 only: the GPU's current power draw in mW, as the firmware's power controller reports it
     /// (integer word of the shared power-policy block).
     pub(super) fn m5_gpu_power_mw(&self) -> Result<u32> {
-        if !self.m5 { return Err(EINVAL); }
+        // The power word's place is the M5 Pro build's.
+        if !self.m5 || self.graph.is_common26() { return Err(EINVAL); }
         Ok(self.object(self.bundle)?
-            .word(super::fw::m5::initdata::M5_SHARED_LAYOUT.policy + super::thermal::POLICY_GPU_POWER)?
+            .word(self.graph.shared.policy + super::thermal::POLICY_GPU_POWER)?
             .load(Ordering::Relaxed))
     }
 
@@ -2096,7 +2128,7 @@ impl InitData {
     pub(super) fn m5_firmware_clamped(&self) -> Result<bool> {
         if !self.m5 { return Err(EINVAL); }
         let block = self.object(self.bundle)?;
-        let base = super::fw::m5::initdata::M5_SHARED_LAYOUT.policy;
+        let base = self.graph.shared.policy;
         let mask = block.word(base + super::thermal::POLICY_LIMITER_MASK)?.load(Ordering::Relaxed);
         let limit = block.word(base + super::thermal::POLICY_LIMITER_LIMIT)?.load(Ordering::Relaxed);
         Ok(super::thermal::is_emergency_clamp(mask, limit))

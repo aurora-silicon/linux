@@ -62,7 +62,14 @@
 		apple,bw-doorbell = <&pmgr_dcp 1 6>;
 		/* Scan out the primary plane on IOMFB surface 2. */
 		apple,iomfb-surfaces = <0 0 1 0>;
-		clocks = <&clkref>;
+		/*
+		 * clkref is the clock the 26.x firmware paths use. Firmware 27
+		 * (DCP_FIRMWARE_V_27_0) asks for its provider clocks by index into
+		 * /arm-io/disp0 clock-ids, in this order: firmware-0 and firmware-1.
+		 */
+		apple,clock-ids = <585 431>;
+		clocks = <&clkref>, <&dcp_fw_clk585>, <&dcp_fw_clk431>;
+		clock-names = "clock-154", "firmware-0", "firmware-1";
 		/* generate phandle explicitly for use in loader */
 		phandle = <&dcp>;
 		status = "disabled";
@@ -98,4 +105,29 @@
 &dcp_dart {
 	apple,dma-range = <0x100 0x0 0x10 0x0>;
 	status = "okay";
+};
+
+/ {
+	/*
+	 * The DCP firmware's clocks 585 and 431 (/arm-io/disp0 clock-ids). The
+	 * J813 ADT's clock-frequencies (ids 0x100..0x1ad) has no entry for
+	 * either. Firmware 27 reads only 585, as its minimum pixel clock
+	 * (getClockFrequency(0)); below its 138.521 MHz video clock it gives up
+	 * on frequencies. 712 MHz is clock-frequencies entry 0x49, the one 585's
+	 * low byte names; with it macOS 27.0's DCP firmware offered a display
+	 * under aura. The firmware never asks for 431, which has no rate here.
+	 */
+	dcp_fw_clk585: clock-dcp-firmware-585 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <712000000>;
+		clock-output-names = "dcp_firmware_585";
+	};
+
+	dcp_fw_clk431: clock-dcp-firmware-431 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <0>;
+		clock-output-names = "dcp_firmware_431";
+	};
 };

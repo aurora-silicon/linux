@@ -50,6 +50,7 @@
 #define APPLE_PMGR_PS_ALL_ON	(FIELD_PREP(APPLE_PMGR_PS_TARGET, APPLE_PMGR_PS_ACTIVE) | \
 				 FIELD_PREP(APPLE_PMGR_PS_ACTUAL, APPLE_PMGR_PS_ACTIVE))
 #define APPLE_PMGR_PS_PARENT_TIMEOUT 10000
+#define APPLE_PMGR_T8122_PMS_C1PPT 0x160
 #define APPLE_PMGR_RESET_TIME 1
 #define APPLE_PMGR_T8132_RESET_TIME 10
 
@@ -746,8 +747,12 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 			return dev_err_probe(dev, ret, "cannot read power state\n");
 		active = ret;
 	}
+	/* Legacy handoff DTs must also keep the throttle controller powered. */
 	if (!ps->firmware_owned && !ps->inherited_on &&
-	    of_property_read_bool(node, "apple,always-on")) {
+	    (of_property_read_bool(node, "apple,always-on") ||
+	     (of_device_is_compatible(node, "apple,t8122-pmgr-pwrstate") &&
+	      ps->offset == APPLE_PMGR_T8122_PMS_C1PPT &&
+	      !strcmp(name, "pms_c1ppt")))) {
 		ps->genpd.flags |= GENPD_FLAG_ALWAYS_ON;
 		if (!active) {
 			/*
