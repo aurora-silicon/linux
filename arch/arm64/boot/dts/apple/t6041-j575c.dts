@@ -283,6 +283,27 @@
 	xhci_clkreq_pins: xhci-clkreq-pins {
 		pinmux = <APPLE_PINMUX(3, 1)>;
 	};
+
+	/*
+	 * The GL3590 hub behind the ASM3142 (back USB-A, front USB-C) loads its
+	 * firmware from its own SPI flash. ADT /arm-io/spi3/usb3hub-flash/usb3hub-fw:
+	 * usb3hub_rst is AP pin 127 and usb3hub_flash_oe AP pin 130. The boot
+	 * loader leaves both low, which holds the hub in reset; with both high the
+	 * hub enumerates (05ac:8009 USB2, 05ac:800a USB3 Gen2).
+	 */
+	usb3hub-flash-oe-hog {
+		gpio-hog;
+		gpios = <130 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "usb3hub-flash-oe";
+	};
+
+	usb3hub-reset-hog {
+		gpio-hog;
+		gpios = <127 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "usb3hub-reset";
+	};
 };
 
 &pinctrl_nub {
