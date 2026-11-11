@@ -67,7 +67,6 @@
 		interrupts = <AIC_IRQ 759 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&sio_dart 1>;
 		power-domains = <&ps_aes>;
-		status = "disabled";
 	};
 
 	/*

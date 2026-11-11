@@ -202,6 +202,15 @@
 		status = "disabled";
 	};
 
+	/* /arm-io/dart-apcie1: PCIe port 1's DART (the SD reader on the MacBook Pros) */
+	dart_apcie1: iommu@411000000 {
+		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		reg = <0x4 0x11000000 0x0 0x20000>;
+		interrupts = <AIC_IRQ 0 1532 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
 	dart_apcie3: iommu@413000000 {
 		compatible = "apple,t6050-dart", "apple,t8110-dart";
 		reg = <0x4 0x13000000 0x0 0x20000>;
@@ -650,9 +659,9 @@
 	/*
 	 * The AOP's audio path: the AP GPIO block, the I2C1/I2C2 buses and their power states (in
 	 * pmgr1, below), and the AOP with its mailbox, dart-aop and the ADMAC its audio streams use.
-	 * From the ADT (arm-io ranges +0x200000000). The AOP, its mailbox, dart-aop and the ADMAC are disabled:
-	 * iBoot leaves the AOP halted on locked dart-aop tables, and Aura enables them only when its
-	 * checks of that state pass (chosen.aurora,t6050-aop=1).
+	 * From the ADT (arm-io ranges +0x200000000). The AOP, its mailboxes, dart-aop and the ADMAC are
+	 * disabled here: iBoot leaves the AOP halted on locked dart-aop tables, and the boards that
+	 * boot it enable them.
 	 */
 	pinctrl_ap: pinctrl@29c000000 {
 		compatible = "apple,t6050-pinctrl", "apple,t8103-pinctrl";
@@ -790,17 +799,15 @@
 
 	/*
 	 * The AOP: its SRAM window (ADT reg[2]) and its ASC (reg[0]). Its firmware is loaded and
-	 * left halted by iBoot. Booted as on T8152, over the RTKit mailbox alone: the ADT's
-	 * aop-exclave-mailbox (the setup port T8140 and T8142 boot through) is exclave-assigned
-	 * here and takes an SError from the AP.
+	 * left halted by iBoot. Booted as on T8142, over the RTKit mailbox and the setup port.
 	 */
 	aop: aop@290c00000 {
 		compatible = "apple,t6050-aop", "apple,t8152-aop";
 		reg = <0x2 0x90c00000 0x0 0x1e0000>,
 		      <0x2 0x90600000 0x0 0x4000>;
 		reg-names = "mmio", "asc";
-		mboxes = <&aop_mbox>;
-		mbox-names = "mbox";
+		mboxes = <&aop_mbox>, <&aop_setup_mbox>;
+		mbox-names = "mbox", "setup";
 		iommus = <&aop_dart 0>;
 		apple,dma-range = <0x110 0x0 0x10 0x0>;
 		status = "disabled";
@@ -815,6 +822,19 @@
 			       <&admac_base_ns 0>, <&admac_base_ns 1>;
 			dma-names = "cout", "cin", "spkr", "sense";
 			#sound-dai-cells = <1>;
+		};
+
+		/*
+		 * The firmware's "als" service, a VD6286. It reports once it has the machine's
+		 * calibration, which the driver loads as apple/aop-als-cal.bin.
+		 */
+		aop_als: als {
+			compatible = "apple,t6050-aop-als", "apple,aop-als";
+		};
+
+		/* The firmware's "las" service: the lid angle, as on T6020 and T8112. */
+		aop_las: las {
+			compatible = "apple,t6050-aop-las", "apple,aop-las";
 		};
 	};
 };

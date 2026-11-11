@@ -126,7 +126,7 @@ static int sep_smc_set_power(int on)
 				for (; i >= 0; i--) {
 					rc = sep_smc_write_rail(sep_smc_rails[i], 0);
 					if (rc)
-						pr_err("apple_sep: sensor: SMC rail rollback failed (%d)\n", rc);
+						pr_err_ratelimited("apple_sep: sensor: SMC rail rollback failed (%d)\n", rc);
 				}
 				break;
 			}
@@ -140,7 +140,7 @@ static int sep_smc_set_power(int on)
 		}
 	}
 	if (first_error)
-		pr_err("apple_sep: sensor: SMC rail write failed (%d)\n", first_error);
+		pr_err_ratelimited("apple_sep: sensor: SMC rail write failed (%d)\n", first_error);
 	return first_error;
 }
 

@@ -799,3 +799,20 @@
 		};
 	};
 };
+
+/* Read-only fault counter views (apple-regview); nothing writes these windows. */
+&m2_nub_spmi0_sideband {
+	status = "okay";
+};
+
+&m2_nub_spmi1_sideband {
+	status = "okay";
+};
+
+&m2_aop_spmi0_sideband {
+	status = "okay";
+};
+
+&m2_aop_spmi1_sideband {
+	status = "okay";
+};

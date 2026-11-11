@@ -142,6 +142,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "i2c0";
+		power-domains = <&ps_sio>;
 	};
 
 	ps_spi_p: power-controller@2f0 {
@@ -150,6 +151,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "spi_p";
+		power-domains = <&ps_sio>;
 		status = "okay";
 	};
 
@@ -859,12 +861,35 @@
 		status = "okay";
 	};
 
+	/*
+	 * The SIO block itself: the parent of its CPU, DPA_P and the SIO
+	 * peripheral states. The ADT marks this state no_ps (on at boot, no
+	 * AP-controlled state word), and the PMGR access lockdown latches an
+	 * event-log error when the AP reads or writes the word at 0x260. Keep
+	 * the dependency links but never touch the register.
+	 */
+	ps_sio: power-controller@260 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x260 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "sio";
+		apple,firmware-owned;
+		status = "okay";
+	};
+
 	ps_sio_cpu: power-controller@2a8 {
 		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x2a8 4>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "sio_cpu";
+		/*
+		 * The SIO firmware brings up its native SPI and UART DMA shims,
+		 * which sit in those blocks, when it takes its shim table: their
+		 * parent states must be on while it runs.
+		 */
+		power-domains = <&ps_sio>, <&ps_spi_p>, <&ps_uart_p>;
 		status = "okay";
 	};
 
@@ -874,6 +899,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "fpwm0";
+		power-domains = <&ps_sio>;
 		status = "okay";
 	};
 
@@ -883,6 +909,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "fpwm1";
+		power-domains = <&ps_sio>;
 		status = "okay";
 	};
 
@@ -892,6 +919,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "fpwm2";
+		power-domains = <&ps_sio>;
 		status = "okay";
 	};
 
@@ -901,6 +929,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "i2c1";
+		power-domains = <&ps_sio>;
 		status = "okay";
 	};
 
@@ -910,6 +939,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "i2c2";
+		power-domains = <&ps_sio>;
 		status = "okay";
 	};
 
@@ -919,6 +949,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "i2c3";
+		power-domains = <&ps_sio>;
 		status = "okay";
 	};
 
@@ -928,6 +959,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "i2c4";
+		power-domains = <&ps_sio>;
 		status = "okay";
 	};
 
@@ -937,6 +969,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "uart_p";
+		power-domains = <&ps_sio>;
 		status = "okay";
 	};
 
@@ -946,6 +979,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "dpa_p";
+		power-domains = <&ps_sio>;
 		apple,always-on;
 		status = "okay";
 	};
@@ -956,6 +990,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "aes";
+		power-domains = <&ps_sio>;
 		status = "okay";
 	};
 

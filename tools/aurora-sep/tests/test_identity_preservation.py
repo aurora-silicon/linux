@@ -43,10 +43,16 @@ impl<T> DerefMut for KVec<T> {fn deref_mut(&mut self)->&mut Vec<T>{&mut self.0}}
 struct Secret(KVec<u8>);
 impl Deref for Secret {type Target=[u8];fn deref(&self)->&[u8]{&self.0.0}}
 macro_rules! dev_err {($($x:tt)*)=>{()};}
+macro_rules! dev_info_refusal {($($x:tt)*)=>{()};}
+macro_rules! dev_err_ratelimited {($($x:tt)*)=>{()};}
+macro_rules! dev_info_ratelimited {($($x:tt)*)=>{()};}
+macro_rules! dev_dbg {($($x:tt)*)=>{()};}
 macro_rules! dev_warn {($($x:tt)*)=>{()};}
+macro_rules! dev_warn_ratelimited {($($x:tt)*)=>{()};}
 '''
 
 REFKEY = r'''
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 thread_local! {static OPEN_ERROR:Cell<i32>=const{Cell::new(0)};}
 mod sks {pub type KeyBagHandle=u32;}
 mod module_parameters {
@@ -67,7 +73,7 @@ mod shim {
 }
 struct Cache;
 impl Cache {fn lock(&self)->Option<()>{None}}
-struct SepData {machine_refkey:Cache,creates:Cell<usize>}
+struct SepData {machine_refkey:Cache,creates:Cell<usize>,keystore_only:AtomicBool}
 impl SepData {
  fn sks_create_refkey(&self,_:u32,_:&[u8],_:Option<&[u8]>)->Option<KVec<u8>>{self.creates.set(self.creates.get()+1);None}
  fn cache_machine_refkey(&self,_:KVec<u8>)->bool{true}
@@ -76,9 +82,12 @@ impl SepData {
 fn main(){
  for error in [0,ENOENT,EIO,13,12,30,40] {
   OPEN_ERROR.with(|e|e.set(error));
-  let s=SepData{machine_refkey:Cache,creates:Cell::new(0)};
+  let s=SepData{machine_refkey:Cache,creates:Cell::new(0),keystore_only:AtomicBool::new(false)};
   s.sks_machine_refkey(0,&[]);
   assert_eq!(s.creates.get(),usize::from(error==ENOENT),"only absence permits ref-key creation");
+  let s=SepData{machine_refkey:Cache,creates:Cell::new(0),keystore_only:AtomicBool::new(true)};
+  s.sks_machine_refkey(0,&[]);
+  assert_eq!(s.creates.get(),0,"the key-store-only initrd never creates a ref-key");
  }
  println!("refkey cases passed");
 }

@@ -2661,10 +2661,14 @@ impl Queue {
                 // The board's core layout sizes the operand state, as on G17P.
                 operand_region_bytes: self.graph.operand_state.bank_bytes(),
                 operand_aux_offset: self.graph.operand_state.tail_offset(),
-                operand_bytes: self.graph.operand_state.size, resource_control: plan.map_or(0x54b, |p| p.resource_flags),
+                operand_bytes: self.graph.operand_state.size, resource_control: plan.map_or(
+                    // macOS 27.0 on the J813 runs every compute program with one secondary and
+                    // one imageblock unit beside the primary one (0x0104054b).
+                    if board.j813_forms() { 0x0104_054b } else { 0x54b }, |p| p.resource_flags),
                 dispatch_control: crate::g17::fw::m5::compute::dispatch_control(board, tuple.dispatch_base),
                 auxiliary_control: tuple.auxiliary_control,
             },
+            common26_tail: board.graph.is_common26(),
             descriptor_va: descriptor_low,
             // M5 Pro's descriptors carry the ordinal as the submission sequence too, as macOS's do.
             submit_sequence: if board.completion_inputs() { u64::from(self.ordinal) } else { 0 },
@@ -2674,10 +2678,13 @@ impl Queue {
             kick_timestamp: kick_timestamp.get(),
             completion_ordinal: crate::g17::fw::m5::compute::completion_ordinal(board, self.ordinal),
             status_va: args.status_va, timestamp_va: [timestamp_va, timestamp_va + 8],
-            shared_control_va: self.pool.control_va(), event_metadata: [0;16],
-            usage_fw_va: self.graph.usage.gpu_va(), completion_identity: 1,
+            shared_control_va: self.pool.control_va(),
+            event_metadata: crate::g17::fw::m5::compute::completion_forms(board).1,
+            usage_fw_va: self.graph.usage.gpu_va(),
+            completion_identity: crate::g17::fw::m5::compute::completion_forms(board).0,
         }});
-        // Explicit dependencies take the board's explicit class; the implicit parent, last,
+        // Explicit dependencies take the board's class
+        // ([`crate::g17::fw::m5::compute::explicit_dependency`]); the implicit parent, last,
         // takes its own ([`crate::g17::fw::m5::compute::parent_dependency`]).
         let mut m5_dependency_types = [m5_board.map_or(
             crate::g17::fw::m5::compute::COMPUTE_PIPELINED_DEPENDENCY,
@@ -2800,6 +2807,11 @@ impl Queue {
                     })?;
                 visible = true;
                 self.unpublished_binding = false;
+                // The J813 (common 26A428) reads the descriptor from the item ring, after
+                // the configuration, as macOS 27.0's compute ring has it.
+                if crate::g17::J813_FORMS.load(Ordering::Relaxed) {
+                    producer = self.graph.append(producer, descriptor_high, || {})?;
+                }
                 // This Active and its Packet pins now own all visible records.
                 if let Some(configuration) = self.configuration.take() { configuration.release(); }
             } else if first {
@@ -2887,7 +2899,7 @@ impl Queue {
             }
             prepared_kick.commit();
             self.submitted = self.submitted.checked_add(1).ok_or(EOVERFLOW)?;
-            let announce_va = if self.graph.m5 {
+            let announce_va = if self.graph.m5 && !crate::g17::J813_FORMS.load(Ordering::Relaxed) {
                 self.graph.record(record_slot, ANNOUNCE, 0x40,
                     crate::g17::fw::m5::queue::notification(qid, kick_timestamp)?)?
             } else { self.graph.record(record_slot, ANNOUNCE, 0x40, announce)? };

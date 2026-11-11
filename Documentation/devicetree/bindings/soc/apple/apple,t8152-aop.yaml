@@ -59,13 +59,21 @@ properties:
       Host DMA allocation window as a base and nonzero size, inside the root
       slots of this AOP DART stream that are free for the host.
 
-  als:
-    type: object
-    $ref: /schemas/iio/light/apple,aop-als.yaml#
-
   audio:
     type: object
     $ref: /schemas/sound/apple,t8152-aop-audio.yaml#
+
+  als:
+    type: object
+    $ref: /schemas/iio/light/apple,aop-als.yaml#
+    description: The ambient light sensor service.
+    unevaluatedProperties: false
+
+  las:
+    type: object
+    $ref: /schemas/iio/position/apple,aop-las.yaml#
+    description: The lid angle sensor service.
+    unevaluatedProperties: false
 
 allOf:
   - if:
@@ -83,7 +91,12 @@ allOf:
                 - const: apple,aop-als
     else:
       properties:
-        als: false
+        als:
+          properties:
+            compatible:
+              not:
+                contains:
+                  const: apple,t8142-aop-als
 
 required:
   - compatible

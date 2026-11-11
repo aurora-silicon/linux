@@ -77,9 +77,11 @@ properties:
         const: apple,t8140-aop-setup-mailbox
 
       - description:
-          T8142 AOP setup port, compatible with the T8140 setup layout.
+          Later AOP setup-port mailboxes with the T8140 register layout.
         items:
-          - const: apple,t8142-aop-setup-mailbox
+          - enum:
+              - apple,t6050-aop-setup-mailbox
+              - apple,t8142-aop-setup-mailbox
           - const: apple,t8140-aop-setup-mailbox
 
       - description:

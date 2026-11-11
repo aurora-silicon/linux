@@ -809,6 +809,23 @@ source "drivers/crypto/hisilicon/Kconfig"
 
 source "drivers/crypto/amlogic/Kconfig"
 
+config CRYPTO_DEV_APPLE_SIO_AES
+	tristate "Apple SIO AES engine"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on OF && HAS_DMA && PM && IOMMU_API
+	select CRYPTO_SKCIPHER
+	select CRYPTO_ENGINE
+	select CRYPTO_LIB_AES
+	help
+	  ECB, CBC and CTR AES on the SIO AES engine of Apple T6000 (M1
+	  Pro/Max/Ultra) and T8112 (M2) SoCs, with software keys only.
+	  The engine is slower than the ARMv8 Crypto Extensions, so it is
+	  registered at a lower priority and is only used when asked for
+	  by driver name.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called apple-aes.
+
 config CRYPTO_DEV_SA2UL
 	tristate "Support for TI security accelerator"
 	depends on ARCH_K3 || COMPILE_TEST
