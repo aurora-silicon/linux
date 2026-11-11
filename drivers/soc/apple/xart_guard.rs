@@ -17,9 +17,10 @@
 //! then be unavailable, but no other OS's record changes.
 //!
 //! The parameter's default, -1, takes the platform profile's level: 1 on the
-//! M1, M2 and M3 Macs, whose enclave Linux shares with a macOS install, and
-//! 0 on the MacBook Neo, which already holds Linux records from before the
-//! list existed and would otherwise lose write access to them.
+//! M2 and M3 Macs, whose enclave Linux shares with a macOS install, and 0 on
+//! the M1 Macs, where setting up Touch ID has to rewrite a record from before
+//! Linux, and on the MacBook Neo, which already holds Linux records from
+//! before the list existed and would otherwise lose write access to them.
 //!
 //! The effective level, whether the list could be loaded and every refused
 //! write are reported in the driver's `diag` attributes, with what they make
@@ -398,29 +399,40 @@ pub(crate) trait ListFile {
     fn sync_parent(&self) -> Result<()>;
 }
 
-impl ListFile for StoreFile {
+/// Linux's list at [`OWNED_PATH`], opened for each access and closed again.
+///
+/// The guard lives as long as the xART store, which the driver keeps until it
+/// is unbound, and nothing unbinds it before a reboot. Holding the list open
+/// for writing that long keeps a writer on the root file system, so the
+/// read-only remount of `/` at shutdown fails with EBUSY. Writes never create
+/// the file: only [`Guard::open`] does that.
+pub(crate) struct HostListFile;
+
+impl ListFile for HostListFile {
     fn size(&self) -> Result<u64> {
-        StoreFile::size(self)
+        StoreFile::open_readonly(OWNED_PATH)?.size()
     }
 
     fn read_exact(&self, off: u64, buf: &mut [u8]) -> Result<()> {
-        StoreFile::read_exact(self, off, buf)
+        StoreFile::open_readonly(OWNED_PATH)?.read_exact(off, buf)
     }
 
     fn write_all(&self, off: u64, buf: &[u8]) -> Result<()> {
-        StoreFile::write_all(self, off, buf)
+        StoreFile::open_writable_existing(OWNED_PATH)?.write_all(off, buf)
     }
 
+    // fsync on a new descriptor still flushes the writes made through earlier
+    // ones, and reports a writeback error that no descriptor has seen yet.
     fn sync(&self) -> Result<()> {
-        StoreFile::sync(self)
+        StoreFile::open_readonly(OWNED_PATH)?.sync()
     }
 
     fn sync_parent(&self) -> Result<()> {
-        StoreFile::sync_parent(self)
+        StoreFile::open_readonly(OWNED_PATH)?.sync_parent()
     }
 }
 
-pub(crate) struct Guard<F: ListFile = StoreFile> {
+pub(crate) struct Guard<F: ListFile = HostListFile> {
     level: u8,
     /// `None` when the list could not be opened: nothing can be adopted, so
     /// every session write that is not already listed is refused.
@@ -451,7 +463,8 @@ impl Guard {
         let mut guard = Guard::with_file(
             level,
             existing,
-            StoreFile::open_host(OWNED_PATH).map(|(file, _created)| file),
+            // Only to create the list if absent; the handle closes here.
+            StoreFile::open_host(OWNED_PATH).map(|_| HostListFile),
         );
         guard.allowance = take_allowance();
         guard
@@ -1060,9 +1073,10 @@ mod tests {
     fn the_default_follows_the_platform() {
         use crate::profile;
 
+        // Off on M1, whose Touch ID setup rewrites a pre-Linux record.
+        assert_eq!(level(-1, profile::T8103.xart_guard), None);
+        assert_eq!(level(-1, profile::T6000.xart_guard), None);
         // On where Linux shares the enclave with macOS.
-        assert_eq!(level(-1, profile::T8103.xart_guard), Some(1));
-        assert_eq!(level(-1, profile::T6000.xart_guard), Some(1));
         assert_eq!(level(-1, profile::T6020.xart_guard), Some(1));
         assert_eq!(level(-1, profile::T6020_SEPOS13.xart_guard), Some(1));
         assert_eq!(level(-1, profile::T8112.xart_guard), Some(1));

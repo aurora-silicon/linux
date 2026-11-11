@@ -428,17 +428,19 @@ int ane_h16_operation_validate(const struct ane_h16_hwx_snapshot *snapshot,
 EXPORT_SYMBOL_GPL(ane_h16_operation_validate);
 
 /*
- * The mcache custom-BAR record comes from the program descriptor relocation
- * tuple (BAR ID, field, bit offset, width at +0x868, +0x870, +0x878, +0x87c of
- * the linear 0x8a0 form). The validator pins those words. The scratch form's
- * tuple layout is not established, so it sends no record, which is legal.
+ * The mcache custom-BAR records come from the program descriptor relocation
+ * tuples pinned by the HWX validator.  The linear 0x8a0 form has one prefetch
+ * tuple (BAR ID, field, bit offset, width at +0x868, +0x870, +0x878, +0x87c).
+ * The scratch-backed 0x8c0 form has that tuple plus one intermediate-spill
+ * tuple in the kind-3 payload at +0x890.  The two records use independent
+ * mcache value types even though both name BAR 4 and their bit ranges overlap.
  */
 int ane_h16_custom_bars(const struct ane_h16_hwx_snapshot *snapshot,
 			const struct ane_h16_hwx *hwx, u32 dsid,
 			struct ane_h16_custom_bar *bars, unsigned int *count)
 {
 	const u8 *c;
-	u32 bar, offset, width;
+	u32 bar, offset, width, length;
 	int ret;
 
 	if (!hwx || !bars || !count)
@@ -451,8 +453,7 @@ int ane_h16_custom_bars(const struct ane_h16_hwx_snapshot *snapshot,
 		return -ENOEXEC;
 	c = (const u8 *)snapshot->bytes + hwx->program_offset;
 	*count = 0;
-	if (get_unaligned_le32(c + 4) != 0x8a0)
-		return 0;
+	length = get_unaligned_le32(c + 4);
 	bar = get_unaligned_le32(c + 0x868);
 	offset = get_unaligned_le32(c + 0x878);
 	width = get_unaligned_le32(c + 0x87c);
@@ -467,11 +468,49 @@ int ane_h16_custom_bars(const struct ane_h16_hwx_snapshot *snapshot,
 		.value = dsid,
 	};
 	*count = 1;
+	if (length == 0x8a0)
+		return 0;
+	if (length != 0x8c0 || snapshot->size < 0x8c0 ||
+	    hwx->program_offset > snapshot->size - 0x8c0)
+		return -ENOEXEC;
+	bar = get_unaligned_le16(c + 0x890);
+	offset = c[0x893];
+	width = c[0x894];
+	if (!width || width > 16 || offset > 64 - width || dsid >= BIT(width))
+		return -ENOEXEC;
+	bars[1] = (struct ane_h16_custom_bar) {
+		.configuration = 1,
+		.value_type = 1,
+		.bar = bar,
+		.bit_offset = offset,
+		.bit_width = width,
+		.value = dsid,
+	};
+	*count = 2;
 	return 0;
 }
 EXPORT_SYMBOL_GPL(ane_h16_custom_bars);
 
+/* Read-only after module load: use depth 1 for the throughput A/B baseline. */
+static unsigned int execute_depth = 2;
+module_param(execute_depth, uint, 0444);
+MODULE_PARM_DESC(execute_depth, "Maximum concurrent EXECUTEs (1-4, default 2)");
+
 static void h16_gate_work(struct work_struct *work);
+static void h16_export_work(struct work_struct *work);
+
+/* Lifecycle traffic must not interleave with a batch's command arena. */
+static void h16_drain(struct ane_h16_session *s)
+{
+	if (!s->active)
+		return;
+	s->draining++;
+	mutex_unlock(s->lock);
+	wait_event(s->wake, !READ_ONCE(s->active));
+	mutex_lock(s->lock);
+	s->draining--;
+	wake_up_all(&s->wake);
+}
 
 int ane_h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *transport,
 			 const struct ane_h16_session_ops *ops, void *ctx,
@@ -487,11 +526,15 @@ int ane_h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *tra
 	s->timeout_ns = timeout_ns;
 	s->dsid = ANE_H16_MCACHE_DSID;
 	s->settle_ns = ANE_H16_SETTLE_QUIET_NS;
+	s->depth = clamp(execute_depth, 1U, 4U);
 	init_waitqueue_head(&s->wake);
 	INIT_LIST_HEAD(&s->deferred);
 	INIT_LIST_HEAD(&s->programs);
 	spin_lock_init(&s->stats_lock);
 	INIT_DELAYED_WORK(&s->gate_work, h16_gate_work);
+	spin_lock_init(&s->export_lock);
+	INIT_LIST_HEAD(&s->exports_done);
+	INIT_WORK(&s->export_work, h16_export_work);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_init);
@@ -502,7 +545,8 @@ static int h16_fail(struct ane_h16_session *s, int error)
 		s->error = error;
 	if (!s->quarantined) {
 		s->quarantined = true;
-		s->pending.quarantined = true;
+		ane_h16_pending_fail_all(&s->pending, s->error);
+		wake_up_all(&s->wake);
 		s->ops->log(s->ctx, "program quarantine", (u64)-s->error, 0);
 	}
 	return s->error;
@@ -604,12 +648,108 @@ static void h16_give_spare(struct ane_h16_session *s, struct ane_fw_surface *sur
 	memset(surface, 0, sizeof(*surface));
 }
 
+static void h16_export_work(struct work_struct *work)
+{
+	struct ane_h16_session *s = container_of(work, struct ane_h16_session, export_work);
+	struct ane_h16_export *e, *next;
+	LIST_HEAD(done);
+
+	spin_lock(&s->export_lock);
+	list_splice_init(&s->exports_done, &done);
+	spin_unlock(&s->export_lock);
+	mutex_lock(s->lock);
+	list_for_each_entry_safe(e, next, &done, node) {
+		list_del(&e->node);
+		h16_give_spare(s, &e->surface, e->write);
+		kfree(e);
+	}
+	mutex_unlock(s->lock);
+}
+
+/* Return released exports now. Caller does not hold the node lock. */
+void ane_h16_session_flush_exports(struct ane_h16_session *s)
+{
+	flush_work(&s->export_work);
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_flush_exports);
+
+/*
+ * A process maps surface @index of @p. The first mapping of a surface
+ * creates its export, held by the program; each call returns one more
+ * reference for the caller's mapping. Caller holds the node lock.
+ */
+int ane_h16_session_export(struct ane_h16_session *s, struct ane_h16_program *p,
+			   unsigned int index, struct ane_h16_export **out)
+{
+	struct ane_h16_export *e;
+	unsigned int j;
+
+	if (!s || !p || p->session != s || p->closed || p->released ||
+	    index >= p->resource_count || !p->surfaces[index])
+		return -EINVAL;
+	j = p->surfaces[index] - p->regions;
+	if (j >= p->plan.count)
+		return -EINVAL;
+	e = p->exports[j];
+	if (!e) {
+		e = kzalloc_obj(*e);
+		if (!e)
+			return -ENOMEM;
+		refcount_set(&e->ref, 1);
+		e->session = s;
+		e->surface = p->regions[j];
+		e->write = p->plan.regions[j].permissions & 2;
+		INIT_LIST_HEAD(&e->node);
+		p->exports[j] = e;
+	}
+	refcount_inc(&e->ref);
+	*out = e;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_export);
+
+void ane_h16_export_get(struct ane_h16_export *e)
+{
+	refcount_inc(&e->ref);
+}
+EXPORT_SYMBOL_GPL(ane_h16_export_get);
+
+/*
+ * Drop a reference. The last one returns a released surface to the spares
+ * from a work item: a mapping's last put runs under the process mmap lock,
+ * which an EXECUTE may wait for while holding the node lock.
+ */
+void ane_h16_export_put(struct ane_h16_export *e)
+{
+	struct ane_h16_session *s;
+
+	if (!e || !refcount_dec_and_test(&e->ref))
+		return;
+	s = e->session;
+	spin_lock(&s->export_lock);
+	list_add_tail(&e->node, &s->exports_done);
+	spin_unlock(&s->export_lock);
+	schedule_work(&s->export_work);
+}
+EXPORT_SYMBOL_GPL(ane_h16_export_put);
+
 static void h16_give_back(struct ane_h16_session *s, struct ane_h16_program *p)
 {
 	unsigned int i;
 
-	for (i = 0; i < p->plan.count; i++)
+	for (i = 0; i < p->plan.count; i++) {
+		struct ane_h16_export *e = p->exports[i];
+
+		if (e) {
+			/* Mapped by a process: the export returns it after the last unmap. */
+			e->released = true;
+			p->exports[i] = NULL;
+			memset(&p->regions[i], 0, sizeof(p->regions[i]));
+			ane_h16_export_put(e);
+			continue;
+		}
 		h16_give_spare(s, &p->regions[i], p->plan.regions[i].permissions & 2);
+	}
 	for (i = 0; i < ANE_H16_AUX_COUNT; i++)
 		h16_give_spare(s, &p->aux[i], false);
 	memset(p->surfaces, 0, sizeof(p->surfaces));
@@ -628,25 +768,42 @@ static int h16_map(struct ane_h16_session *s, size_t size, bool write,
 	return 0;
 }
 
+struct h16_program_binds {
+	struct ane_h16_process_binding bindings[ANE_H16_SURFACES];
+	struct ane_h16_process_binding scratch;
+	unsigned int count;
+};
+
+/* Pure checks of the program and its process descriptors; nothing is mapped. */
+static int h16_program_bind(const struct ane_h16_program *p,
+			    const void *const aux[ANE_H16_AUX_COUNT],
+			    const size_t aux_size[ANE_H16_AUX_COUNT],
+			    struct h16_program_binds *b)
+{
+	int ret;
+
+	ret = ane_h16_process_bindings(&p->hwx, aux[ANE_H16_AUX_GENERIC],
+				       aux_size[ANE_H16_AUX_GENERIC], b->bindings,
+				       &b->count, &b->scratch);
+	if (!ret)
+		ret = ane_h16_operation_validate(&p->snapshot, &p->hwx,
+						 aux[ANE_H16_AUX_OPERATION],
+						 aux_size[ANE_H16_AUX_OPERATION],
+						 b->bindings, b->count, &b->scratch);
+	return ret;
+}
+
 static int h16_program_map(struct ane_h16_session *s, struct ane_h16_program *p,
 			   const void *const aux[ANE_H16_AUX_COUNT],
 			   const size_t aux_size[ANE_H16_AUX_COUNT],
+			   struct h16_program_binds *b,
 			   struct ane_h16_load_layout *layout)
 {
-	struct ane_h16_process_binding bindings[ANE_H16_SURFACES], scratch = {};
+	struct ane_h16_process_binding *bindings = b->bindings, scratch = b->scratch;
 	const struct ane_h16_hwx *hwx = &p->hwx;
-	unsigned int i, j, count;
+	unsigned int i, j, count = b->count;
 	int ret;
 
-	ret = ane_h16_process_bindings(hwx, aux[ANE_H16_AUX_GENERIC],
-				       aux_size[ANE_H16_AUX_GENERIC], bindings, &count,
-				       &scratch);
-	if (!ret)
-		ret = ane_h16_operation_validate(&p->snapshot, hwx, aux[ANE_H16_AUX_OPERATION],
-						 aux_size[ANE_H16_AUX_OPERATION], bindings,
-						 count, &scratch);
-	if (ret)
-		return ret;
 	for (i = 0; i < p->plan.count; i++) {
 		const struct ane_h16_hwx_region *r = &p->plan.regions[i];
 
@@ -736,9 +893,8 @@ static const size_t h16_load_sequence[] = {
  * the previous program's output buffer unless it is queued. The session
  * queues the first EXECUTE whenever the engine last ran another program, the
  * first one after boot included (see ane_h16_session_execute()). A LOAD is
- * refused while the previous program is still loaded and accepted once it
- * closed; a switch-safe transport (H17) also requeues on every program or
- * process change, so its session may hold several programs at once. Every
+ * serialized with in-flight EXECUTEs. The transport also requeues on every
+ * program or process change, so a session may hold several programs. Every
  * program's firmware-visible memory stays mapped until reset.
  */
 int ane_h16_session_load(struct ane_h16_session *s,
@@ -748,6 +904,7 @@ int ane_h16_session_load(struct ane_h16_session *s,
 			 struct ane_h16_program **program)
 {
 	struct ane_h16_load_layout layout = {};
+	struct h16_program_binds binds = {};
 	struct ane_h16_program *p;
 	u8 *command;
 	const u8 *reply;
@@ -756,11 +913,11 @@ int ane_h16_session_load(struct ane_h16_session *s,
 
 	if (!s || !snapshot || !aux || !aux_size || !program)
 		return -EINVAL;
+	h16_drain(s);
+	if (s->asleep)
+		return -EAGAIN;
 	if (s->quarantined)
 		return -EIO;
-	if (s->program && !s->program->closed &&
-	    !ane_fw_transport_switch_safe(s->transport))
-		return -EBUSY;
 	for (i = 0; i < ANE_H16_AUX_COUNT; i++)
 		if (!aux[i] || aux_size[i] < ANE_H16_AUX_MIN ||
 		    aux_size[i] > ANE_H16_AUX_MAX || !IS_ALIGNED(aux_size[i], 4))
@@ -787,6 +944,14 @@ int ane_h16_session_load(struct ane_h16_session *s,
 		goto free;
 	p->snapshot = *snapshot;
 	/*
+	 * Refuse a program whose process descriptors do not validate before the
+	 * session owns it: nothing is mapped yet, so it can still be freed and
+	 * the next LOAD is not blocked by it.
+	 */
+	ret = h16_program_bind(p, aux, aux_size, &binds);
+	if (ret)
+		goto free;
+	/*
 	 * From the first mapping on, firmware-visible memory exists that is never
 	 * released before reset, so the program becomes the session's here and
 	 * is never freed.
@@ -798,11 +963,17 @@ int ane_h16_session_load(struct ane_h16_session *s,
 	memset(snapshot, 0, sizeof(*snapshot));
 	p->session = s;
 	s->program = p;
-	ret = h16_program_map(s, p, aux, aux_size, &layout);
+	ret = h16_program_map(s, p, aux, aux_size, &binds, &layout);
 	if (!ret)
 		ret = ane_h16_load_encode(command, ANE_H16_LOAD_SIZE, p->slots);
-	if (ret)
+	if (ret) {
+		/*
+		 * Firmware never saw this program. It keeps its mappings until
+		 * reset, but it must not hold the session against the next LOAD.
+		 */
+		p->closed = true;
 		goto out;
+	}
 	ret = h16_send(s, ANE_FW_IO, command, ANE_H16_LOAD_SIZE, &reply);
 	if (!ret)
 		ret = ane_h16_load_reply(reply, ANE_H16_LOAD_SIZE, command, &p->key.program);
@@ -876,7 +1047,7 @@ int ane_h16_session_gate_expire(struct ane_h16_session *s)
 {
 	if (!s->gate_held)
 		return 0;
-	if (h16_now(s) - s->gate_last_ns < s->gate_hold_ns)
+	if (s->running || h16_now(s) - s->gate_last_ns < s->gate_hold_ns)
 		return -EAGAIN;
 	return h16_gate_release(s);
 }
@@ -972,6 +1143,11 @@ struct h16_execute_trace {
 	u64 done_ns;
 };
 
+struct h16_request {
+	struct ane_h16_pending pending;
+	struct h16_execute_trace trace;
+};
+
 enum {
 	H16_STEP_GATE_OPEN = 1,
 	H16_STEP_SEND,
@@ -994,7 +1170,32 @@ static void h16_trace_report(struct h16_execute_trace *trace, const u8 *report,
 	}
 }
 
-/* Wait for the terminal report of one pending UUID, servicing allocations. */
+/* Dispatch by key, including timing, even when another caller polls the ring. */
+static int h16_report(struct ane_h16_session *s, const u8 *report, size_t size)
+{
+	struct ane_h16_event event;
+	unsigned int i;
+	u64 now = h16_now(s);
+
+	if (!ane_h16_event_decode(report, size, ANE_FW_IO_T2H, &event)) {
+		for (i = 0; i < ANE_H16_PENDING_MAX; i++) {
+			struct ane_h16_pending *p = s->pending.slots[i];
+			struct h16_request *r;
+
+			if (!p || p->key.uuid != event.key.uuid)
+				continue;
+			r = container_of(p, struct h16_request, pending);
+			h16_trace_report(&r->trace, report, size, p, now);
+			if (event.state == 1)
+				r->trace.done_ns = now;
+			break;
+		}
+	}
+	return ane_h16_pending_dispatch(&s->pending, report, size, ANE_FW_IO_T2H,
+					(unsigned long)div_u64(now, NSEC_PER_USEC));
+}
+
+/* Wait for this request, serving all keys under the session mutex. */
 static int h16_wait_report(struct ane_h16_session *s, struct ane_h16_pending *request,
 			   u64 deadline, struct h16_execute_trace *trace)
 {
@@ -1010,33 +1211,28 @@ static int h16_wait_report(struct ane_h16_session *s, struct ane_h16_pending *re
 		size_t size;
 		u32 pending;
 
+		/* A request that already ended keeps its own result. */
+		if (!request->active) {
+			ret = request->status;
+			break;
+		}
+		if (s->quarantined || s->pending.quarantined) {
+			ret = s->error ?: s->pending.error ?: -EIO;
+			break;
+		}
+		/* Other keys' reports must not postpone this request's deadline. */
+		if (h16_now(s) >= deadline) {
+			ret = -ETIMEDOUT;
+			break;
+		}
 		ret = ane_fw_transport_consume(t, report, ANE_H16_REPORT_MAX, &size);
 		if (!ret) {
-			ret = ane_h16_pending_dispatch(&s->pending, report, size,
-						       ANE_FW_IO_T2H,
-						       (unsigned long)div_u64(h16_now(s),
-									      NSEC_PER_USEC));
-			if (ret == ANE_H16_EVENT_COMPLETE) {
-				trace->done_ns = h16_now(s);
-				if (!trace->reports)
-					trace->first_ns = trace->done_ns;
-				ret = 0;
-				break;
-			}
-			if (ret == ANE_H16_EVENT_FAILED) {
-				ret = -EIO;
-				break;
-			}
-			/* Foreign or late UUIDs and ISP-routed reports never retire this call. */
-			if (ret == ANE_H16_EVENT_PROGRESS) {
-				h16_trace_report(trace, report, size, request, h16_now(s));
-				continue;
-			}
-			if (ret == -ENOENT || ret == -ENOMSG) {
+			ret = h16_report(s, report, size);
+			if (ret == -ENOENT || ret == -ENOMSG)
 				trace->other++;
-				continue;
-			}
-			break;
+			else if (ret < 0)
+				break;
+			continue;
 		}
 		if (ret != -EAGAIN)
 			break;
@@ -1056,10 +1252,41 @@ static int h16_wait_report(struct ane_h16_session *s, struct ane_h16_pending *re
 			break;
 		}
 		t->polls++;
-		t->ops->relax(t->ctx, now - start);
+		/*
+		 * Publish/ack and dispatch stay serialized; engine time can
+		 * overlap. Only the pause runs unlocked: servicing the mailbox
+		 * and fault state touches shared transport state.
+		 */
+		if (s->lock && t->ops->service) {
+			t->ops->service(t->ctx);
+			mutex_unlock(s->lock);
+			if (t->ops->pause)
+				t->ops->pause(t->ctx, now - start);
+			else
+				ane_fw_poll_pause(now - start);
+			mutex_lock(s->lock);
+		} else if (s->lock) {
+			mutex_unlock(s->lock);
+			t->ops->relax(t->ctx, now - start);
+			mutex_lock(s->lock);
+		} else {
+			t->ops->relax(t->ctx, now - start);
+		}
 	}
 	kfree(report);
 	return ret;
+}
+
+/* Include the final gate and teardown pair before admitting another command. */
+static int h16_execute_room(struct ane_h16_session *s, struct ane_h16_program *p)
+{
+	const size_t sequence[] = {
+		ANE_H16_GATE_SIZE,
+		ANE_H16_EXECUTE_BASE_SIZE + p->bar_count * ANE_H16_CUSTOM_BAR_STRIDE,
+		ANE_H16_GATE_SIZE, ANE_H16_TERMINATE_SIZE, ANE_H16_UNLOAD_SIZE,
+	};
+
+	return h16_pool_room(s, sequence, ARRAY_SIZE(sequence));
 }
 
 /*
@@ -1071,11 +1298,12 @@ static int h16_wait_report(struct ane_h16_session *s, struct ane_h16_pending *re
 static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 {
 	struct ane_h16_execute_buffer buffers[ANE_H16_SURFACES + 1];
-	struct ane_h16_pending request = {};
-	struct h16_execute_trace trace = { .last_state = U32_MAX };
+	struct h16_request r = { .trace.last_state = U32_MAX };
+	struct ane_h16_pending *request = &r.pending;
+	struct h16_execute_trace *trace = &r.trace;
 	struct ane_h16_execute call = {};
 	struct ane_h16_exec_sample *x = &s->timing;
-	size_t length, sequence[5], mark;
+	size_t length;
 	u8 *command;
 	const u8 *reply = NULL;
 	unsigned int i;
@@ -1115,51 +1343,43 @@ static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 	if (p->has_scratch)
 		buffers[i++] = p->scratch;
 	length = ANE_H16_EXECUTE_BASE_SIZE + p->bar_count * ANE_H16_CUSTOM_BAR_STRIDE;
-	/* Keep room for the teardown pair after this request. */
-	sequence[0] = ANE_H16_GATE_SIZE;
-	sequence[1] = length;
-	sequence[2] = ANE_H16_GATE_SIZE;
-	sequence[3] = ANE_H16_TERMINATE_SIZE;
-	sequence[4] = ANE_H16_UNLOAD_SIZE;
-	ret = h16_pool_room(s, sequence, ARRAY_SIZE(sequence));
+	ret = h16_execute_room(s, p);
 	if (ret)
 		return ret;
 	command = kzalloc(length, GFP_KERNEL);
 	if (!command)
 		return -ENOMEM;
-	mark = ane_fw_transport_mark(s->transport);
 	/* Inputs and poisoned outputs must reach memory before any doorbell. */
 	s->transport->ops->write_barrier(s->transport->ctx);
 	polls = s->transport->polls;
-	trace.step = H16_STEP_GATE_OPEN;
+	trace->step = H16_STEP_GATE_OPEN;
 	t0 = h16_now(s);
 	if (!s->gate_held) {
 		ret = h16_gate(s, 0);
 		if (ret)
 			goto fail;
-		s->gate_held = s->gate_hold_ns != 0;
+		s->gate_held = true;
 	}
 	gate_open = h16_now(s) - t0;
 	deadline = t0 + gate_open + s->timeout_ns;
-	request.key = p->key;
-	request.deadline = (unsigned long)div_u64(deadline, NSEC_PER_USEC);
-	ret = ane_h16_pending_insert(&s->pending, &request,
+	request->key = p->key;
+	request->deadline = (unsigned long)div_u64(deadline, NSEC_PER_USEC);
+	ret = ane_h16_pending_insert(&s->pending, request,
 				     (unsigned long)div_u64(h16_now(s), NSEC_PER_USEC));
 	if (ret)
 		goto fail;
-	call.key = request.key;
+	call.key = request->key;
 	call.buffers = buffers;
 	call.buffer_count = p->resource_count + (p->has_scratch ? 1 : 0);
 	/*
 	 * The first request of a program on the engine, the first one after boot
 	 * included, takes the queued path once: only EXELOOP sets up the BAR
-	 * context and the L2-spill mapping that later direct requests reuse.
+	 * context and the L2-spill mapping that later direct requests reuse.  The
+	 * request carries every descriptor-declared custom BAR, including both
+	 * mixed-descriptor mcache streams, on the queued and direct paths.
 	 */
-	if (s->executed != p->generation) {
+	if (s->running > 1 || s->executed != p->generation)
 		call.flags = ANE_H16_EXECUTE_FLAG_QUEUED;
-		s->ops->log(s->ctx, "EXECUTE first of this program, queued", p->key.program,
-			    request.key.uuid);
-	}
 	s->executed = p->generation;
 	call.bars = p->bars;
 	call.bar_count = p->bar_count;
@@ -1168,30 +1388,30 @@ static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 		ret = ane_h16_command_prepare(command, length, ANE_H16_EXECUTE,
 					      ANE_FW_DATA_CHAIN);
 	if (!ret) {
-		trace.step = H16_STEP_SEND;
+		trace->step = H16_STEP_SEND;
 		t1 = h16_now(s);
 		ret = h16_send(s, ANE_FW_DATA_CHAIN, command, length, &reply);
 	}
 	/* The channel-7 reply acknowledges transport only, never completion. */
 	if (!ret) {
-		trace.step = H16_STEP_REPORT;
+		trace->step = H16_STEP_REPORT;
 		t2 = h16_now(s);
-		ret = h16_wait_report(s, &request, deadline, &trace);
+		ret = h16_wait_report(s, request, deadline, trace);
 	}
 	if (ret) {
-		if (request.active)
-			ane_h16_pending_abort(&s->pending, &request, ret);
+		if (request->active)
+			ane_h16_pending_abort(&s->pending, request, ret);
 		goto fail;
 	}
-	trace.step = H16_STEP_GATE_CLOSE;
+	trace->step = H16_STEP_GATE_CLOSE;
 	t3 = h16_now(s);
-	if (!s->gate_held) {
-		ret = h16_gate(s, 1);
+	if (s->running == 1 && !s->gate_hold_ns) {
+		ret = h16_gate_release(s);
 		if (ret)
 			goto fail;
 	}
 	end = h16_now(s);
-	if (s->gate_held) {
+	if (s->gate_held && s->running == 1) {
 		/* Back-to-back requests find gating off; it goes on when idle. */
 		s->gate_last_ns = end;
 		if (s->lock)
@@ -1203,30 +1423,25 @@ static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 	x->ns[ANE_H16_T_PREPARE] = t0 - entry;
 	x->ns[ANE_H16_T_GATE_OPEN] = gate_open;
 	x->ns[ANE_H16_T_SUBMIT_ACK] = t2 - t1;
-	x->ns[ANE_H16_T_ACK_REPORT] = trace.first_ns - t2;
-	x->ns[ANE_H16_T_REPORT_DONE] = trace.done_ns - trace.first_ns;
+	x->ns[ANE_H16_T_ACK_REPORT] = trace->first_ns - t2;
+	x->ns[ANE_H16_T_REPORT_DONE] = trace->done_ns - trace->first_ns;
 	x->ns[ANE_H16_T_GATE_CLOSE] = end - t3;
 	x->ns[ANE_H16_T_FIRMWARE] = end - t0;
 	x->polls = s->transport->polls - polls;
 	kfree(command);
-	/*
-	 * The completion report and the closing gate reply both arrived, so the
-	 * firmware no longer reads this sequence's commands: reuse their space.
-	 */
-	ret = ane_fw_transport_release(s->transport, mark);
 	x->ns[ANE_H16_T_FINISH] = h16_now(s) - end;
-	return ret;
+	return 0;
 fail:
-	s->ops->log(s->ctx, "EXECUTE failed", (u64)-ret, request.key.uuid);
+	s->ops->log(s->ctx, "EXECUTE failed", (u64)-ret, request->key.uuid);
 	/*
 	 * Step 1 opening gate, 2 channel-7 ack, 3 report wait, 4 closing gate.
 	 * Reports for this UUID and the last state (0 start, 3 engine start,
 	 * ffffffff none), then the count of other reports seen while waiting.
 	 */
-	s->ops->log(s->ctx, "EXECUTE step/flags", trace.step, call.flags);
-	s->ops->log(s->ctx, "EXECUTE reports/last state", trace.reports, trace.last_state);
-	s->ops->log(s->ctx, "EXECUTE other reports", trace.other, 0);
-	if (trace.step >= H16_STEP_SEND) {
+	s->ops->log(s->ctx, "EXECUTE step/flags", trace->step, call.flags);
+	s->ops->log(s->ctx, "EXECUTE reports/last state", trace->reports, trace->last_state);
+	s->ops->log(s->ctx, "EXECUTE other reports", trace->other, 0);
+	if (trace->step >= H16_STEP_SEND) {
 		h16_dump_rows("EXECUTE sent", command, length);
 		if (reply)
 			h16_dump_rows("EXECUTE ack", reply, 0x40);
@@ -1243,20 +1458,109 @@ bool ane_h16_program_lost(const struct ane_h16_session *s, const struct ane_h16_
 }
 EXPORT_SYMBOL_GPL(ane_h16_program_lost);
 
-int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p)
+/* Read without the mutex in wait_event(), then rechecked under it. */
+static bool h16_available(struct ane_h16_session *s, struct ane_h16_program *p)
+{
+	return !READ_ONCE(s->asleep) && !READ_ONCE(s->draining) &&
+	       !READ_ONCE(p->executing) && READ_ONCE(s->active) < s->depth;
+}
+
+/* Own one program's surfaces, and one bounded session slot, through copy-out. */
+int ane_h16_session_acquire(struct ane_h16_session *s, struct ane_h16_program *p)
 {
 	int ret;
 
 	if (!s || !p || p->session != s)
 		return -EINVAL;
-	/* The firmware that knew it is gone: no firmware traffic, reload. */
+	while (!s->quarantined && !h16_available(s, p)) {
+		mutex_unlock(s->lock);
+		ret = wait_event_freezable(s->wake,
+					   READ_ONCE(s->quarantined) || h16_available(s, p));
+		mutex_lock(s->lock);
+		if (ret)
+			return ret;
+	}
+	if (s->quarantined)
+		return -EIO;
 	if (ane_h16_program_lost(s, p))
 		return -ENODEV;
-	if (s->ops->busy)
-		s->ops->busy(s->ctx, true);
+	if (!p->created || p->closed)
+		return -EINVAL;
+	p->executing = true;
+	s->active++;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_acquire);
+
+void ane_h16_session_release(struct ane_h16_session *s, struct ane_h16_program *p)
+{
+	p->executing = false;
+	s->active--;
+	wake_up_all(&s->wake);
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_release);
+
+/* Surface ownership was acquired before copy-in. Called with s->lock held. */
+int ane_h16_session_run(struct ane_h16_session *s, struct ane_h16_program *p)
+{
+	int ret;
+
+	if (!s || !p || p->session != s || !p->executing)
+		return -EINVAL;
+	/*
+	 * A continuous pipeline can fill the monotonic command arena. Stop
+	 * admission and let the current batch drain and reclaim it, without
+	 * counting this not-yet-published request among the running commands.
+	 */
+	if (s->running && h16_execute_room(s, p)) {
+		s->draining++;
+		do {
+			mutex_unlock(s->lock);
+			wait_event(s->wake, !READ_ONCE(s->running));
+			mutex_lock(s->lock);
+		} while (s->running);
+		s->draining--;
+		wake_up_all(&s->wake);
+		if (s->quarantined)
+			return s->error;
+	}
+	if (s->running)
+		s->pipelined = true;
+	if (!s->running++) {
+		s->execute_mark = ane_fw_transport_mark(s->transport);
+		if (s->ops->busy)
+			s->ops->busy(s->ctx, true);
+	}
 	ret = h16_execute(s, p);
-	if (s->ops->busy)
-		s->ops->busy(s->ctx, false);
+	if (!--s->running) {
+		/* Completion order need not match submission order. */
+		if (s->pipelined) {
+			s->executed = 0;
+			s->transport->bar_known = false;
+			s->pipelined = false;
+		}
+		/* An uncertain outcome pins the entire batch, including its commands. */
+		if (!s->quarantined) {
+			int err = ane_fw_transport_release(s->transport, s->execute_mark);
+
+			if (err)
+				ret = h16_fail(s, err);
+		}
+		if (s->ops->busy)
+			s->ops->busy(s->ctx, false);
+	}
+	return ret;
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_run);
+
+int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p)
+{
+	int ret = ane_h16_session_acquire(s, p);
+
+	if (ret)
+		return ret;
+	ret = ane_h16_session_run(s, p);
+	ane_h16_session_release(s, p);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_execute);
@@ -1382,6 +1686,7 @@ int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p)
 
 	if (!s || !p || p->session != s)
 		return -EINVAL;
+	h16_drain(s);
 	if (p->closed || !p->created)
 		return 0;
 	/*
@@ -1466,7 +1771,7 @@ int ane_h16_session_enter(struct ane_h16_session *s, bool nonblock)
 EXPORT_SYMBOL_GPL(ane_h16_session_enter);
 
 /*
- * Close the session to new requests and wait for the one in flight
+ * Close the session to new requests and wait for every surface owner
  * (asleep), or reopen it. The caller cycles the firmware in between.
  */
 void ane_h16_session_sleep(struct ane_h16_session *s, bool asleep)
@@ -1474,6 +1779,10 @@ void ane_h16_session_sleep(struct ane_h16_session *s, bool asleep)
 	struct ane_h16_program *p, *n;
 
 	mutex_lock(s->lock);
+	/* Close admission before dropping the lock to drain every owner. */
+	WRITE_ONCE(s->asleep, asleep);
+	if (asleep)
+		h16_drain(s);
 	/* The firmware is suspended or powered off with gating on. */
 	if (asleep && s->gate_held && h16_gate_release(s))
 		s->ops->log(s->ctx, "gate release before sleep failed", (u64)-s->error, 0);

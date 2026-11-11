@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Run production MTP PM and magicmouse resume callbacks without a device.
+"""Run production MTP PM and magicmouse suspend/resume callbacks without a device.
 
-Checks notification order, suspend rollback, resume-error handling and the
-actuator mode cache. The old transport must compile and fail at runtime.
+Checks notification order, suspend rollback, resume-error handling, the
+actuator mode cache and the multitouch enable work held across sleep. The old transport must compile and fail at runtime.
 """
 import argparse
 import os
@@ -37,7 +37,13 @@ PREFIX = r'''
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x) = (v))
 struct haptics { int mode; };
-struct magicmouse_sc { struct haptics *haptics; bool haptic_button_down, haptic_deep_down; };
+struct delayed_work { bool pending; unsigned queued; };
+struct magicmouse_sc { struct haptics *haptics; bool haptic_button_down, haptic_deep_down;
+    struct delayed_work work; bool work_held; };
+typedef int pm_message_t;
+static unsigned long msecs_to_jiffies(unsigned m) { return m; }
+static bool cancel_delayed_work_sync(struct delayed_work *w) { bool p = w->pending; w->pending = false; return p; }
+static bool schedule_delayed_work(struct delayed_work *w, unsigned long d) { w->queued++; w->pending = true; return true; }
 struct hid_device { struct magicmouse_sc *data; int id; };
 struct dchid_iface { struct hid_device *hid; };
 struct dockchannel_hid { struct dchid_iface *ifaces[MAX_INTERFACES]; bool suspended; };
@@ -53,6 +59,8 @@ static void magicmouse_force_key(struct magicmouse_sc *m, bool down) {
 static int hid_driver_suspend(struct hid_device *h, int state) {
     assert(state == PMSG_SUSPEND && !transport->suspended);
     suspends[h->id]++;
+    if (h->id != suspend_error_at)
+        magicmouse_suspend(h, state);
     return h->id == suspend_error_at ? -EBUSY : 0;
 }
 '''
@@ -97,7 +105,14 @@ int main(void) {
         assert(!dockchannel_hid_resume(&d));
         assert(hap.mode == HID_HAPTIC_MODE_DEVICE);
     }
-    puts("MTP PM: HID notifications, rollback, all-interface resume and haptic cache passed");
+    /* Pending multitouch enable work is held across sleep and re-queued once. */
+    m.work.pending = true; m.work.queued = 0;
+    assert(!dockchannel_hid_suspend(&d) && !m.work.pending && m.work_held);
+    assert(!dockchannel_hid_resume(&d) && m.work.pending && !m.work_held && m.work.queued == 1);
+    m.work.pending = false;
+    assert(!dockchannel_hid_suspend(&d) && !m.work_held);
+    assert(!dockchannel_hid_resume(&d) && !m.work.pending && m.work.queued == 1);
+    puts("MTP PM: HID notifications, rollback, all-interface resume, haptic cache and held enable work passed");
 }
 '''
 
@@ -115,7 +130,8 @@ def main():
         out = Path(args.out or tmp)
         out.mkdir(parents=True, exist_ok=True)
         c, exe = out/'mtp-pm.c', out/'mtp-pm'
-        c.write_text(PREFIX + function(mouse, 'magicmouse_haptic_forget_mode') + '\n' +
+        c.write_text(PREFIX.replace('static int hid_driver_suspend', function(mouse, 'magicmouse_suspend') + '\nstatic int hid_driver_suspend', 1) +
+                     function(mouse, 'magicmouse_haptic_forget_mode') + '\n' +
                      function(mouse, 'magicmouse_resume') + MIDDLE +
                      function(source, 'dockchannel_hid_suspend') + '\n' +
                      function(source, 'dockchannel_hid_resume') + CASES)

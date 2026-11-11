@@ -168,7 +168,7 @@ class SepReadyTest(unittest.TestCase):
         self.assert_blocked(log, "no fingerprint is enrolled")
 
     def test_cold_boot_without_a_guard_is_ready(self):
-        # An M1 Pro pinned to xart_guard=0.
+        # An M1 Pro, where the guard is off by default.
         self.attached(matching="usable", xart="enabled", xart_guard="0",
                       xart_guard_list="none", xart_guard_refusals="0", boot="cold")
         rc, log = self.run_ready()

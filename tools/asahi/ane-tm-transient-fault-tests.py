@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
-"""Run the production ANE task-manager completion poll against a simulated DART fault latch."""
+"""Run the production ANE task-manager completion poll against a simulated DART fault latch and hangs."""
 import argparse
 import subprocess
 import tempfile
@@ -8,6 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = 'drivers/accel/ane/ane_tm.c'
+HEADER = 'drivers/accel/ane/ane.h'
 
 HARNESS = r'''
 #include <errno.h>
@@ -30,16 +31,21 @@ typedef int64_t ktime_t;
 #define atomic_xchg(ptr, value) (*(ptr) = (value), 0)
 #define read_poll_timeout(op, status, cond, delay, timeout, sleep, ...) \
 	((status) = op(__VA_ARGS__), 0)
+#define KOBJ_CHANGE 0
+#define sysfs_notify(kobj, dir, attr) ((void)0)
+#define kobject_uevent_env(kobj, action, env) ((void)(env), uevents++)
 
 struct ane_dart_scratch { int unused; };
 struct ane_device {
 	int engine_lock, wedged, dev;
 	struct ane_dart_scratch scratch[ANE_DART_SCRATCH_MAX];
 	int scratch_pages;
+	bool tm_retention, wedge_final, recovery_probation;
+	const char *wedge_reason;
 };
 struct ane_request { int qid, nid; };
 
-static int latch_reads, scenario, recoveries, drains, released_pages;
+static int latch_reads, scenario, recoveries, drains, released_pages, uevents;
 
 static ktime_t ktime_get(void) { return 0; }
 static ktime_t ktime_add_ms(ktime_t t, int ms) { return t + ms; }
@@ -56,13 +62,14 @@ static bool ane_dart_faulted(struct ane_device *ane, u64 *iova, u32 *status)
 	case 2: return n < 3;
 	case 3: return n < 2;
 	case 6: return (n % 2 == 1) && n <= 9;
+	case 7: return false;
 	default: return n < 100;
 	}
 }
 static int ane_tm_collect_events(struct ane_device *ane, struct ane_request *req, u32 *finished)
 {
 	(void)ane;
-	if (!req)
+	if (!req || scenario == 7)	/* 7: the job never posts an event */
 		return 0;
 	*finished = 3;
 	return 1;
@@ -90,14 +97,21 @@ static void tq_write32(struct ane_device *ane, int reg, u32 value) { (void)ane; 
 '''
 
 MAIN = r'''
-static int run(int which, struct ane_device *dev)
+static int run_on(int which, struct ane_device *dev, bool retention, bool probation)
 {
 	struct ane_request req = {.qid = 4, .nid = 4};
 
 	*dev = (struct ane_device){0};
+	dev->tm_retention = retention;
+	dev->recovery_probation = probation;
 	scenario = which;
-	latch_reads = recoveries = drains = released_pages = 0;
+	latch_reads = recoveries = drains = released_pages = uevents = 0;
 	return ane_tm_execute(dev, &req);
+}
+
+static int run(int which, struct ane_device *dev)
+{
+	return run_on(which, dev, false, false);
 }
 
 #define CHECK(cond, ...) do { if (!(cond)) { fprintf(stderr, __VA_ARGS__); failures++; } } while (0)
@@ -141,6 +155,27 @@ int main(void)
 	      "scratch cap: rc=%d drains=%d recoveries=%d released=%d pages=%d\n",
 	      result, drains, recoveries, released_pages, dev.scratch_pages);
 
+	result = run_on(0, &dev, true, true);
+	CHECK(result == 0 && !dev.recovery_probation && !dev.wedge_final,
+	      "completion ends probation: rc=%d probation=%d final=%d\n",
+	      result, dev.recovery_probation, dev.wedge_final);
+
+	result = run_on(7, &dev, false, false);
+	CHECK(result == -ETIMEDOUT && recoveries == 1 && !dev.wedge_final && !uevents,
+	      "hang without retention: rc=%d recoveries=%d final=%d uevents=%d\n",
+	      result, recoveries, dev.wedge_final, uevents);
+
+	result = run_on(7, &dev, true, false);
+	CHECK(result == -ETIMEDOUT && !recoveries && dev.wedge_final && dev.wedged &&
+	      dev.wedge_reason && uevents == 1,
+	      "hang with a retained task manager: rc=%d recoveries=%d final=%d wedged=%d uevents=%d\n",
+	      result, recoveries, dev.wedge_final, dev.wedged, uevents);
+
+	result = run_on(7, &dev, false, true);
+	CHECK(result == -ETIMEDOUT && !recoveries && dev.wedge_final && uevents == 1,
+	      "hang on the first job after a recovery: rc=%d recoveries=%d final=%d uevents=%d\n",
+	      result, recoveries, dev.wedge_final, uevents);
+
 	if (failures)
 		return 1;
 	puts("ane tm completion: PASS");
@@ -149,16 +184,27 @@ int main(void)
 '''
 
 
-def production(ref):
+def production(ref, source=SOURCE):
     if ref:
-        return subprocess.check_output(['git', 'show', f'{ref}:{SOURCE}'], cwd=ROOT, text=True)
-    return (ROOT / SOURCE).read_text()
+        return subprocess.check_output(['git', 'show', f'{ref}:{source}'], cwd=ROOT, text=True)
+    return (ROOT / source).read_text()
 
 
-def build(text, work):
-    start = text.index('static int ane_tm_poll_step(')
+def helper(header):
+    start = header.find('static inline bool ane_tm_failure_recoverable(')
+    if start < 0:
+        return ''
+    return header[start:header.index('\n}\n', start) + 3]
+
+
+def build(text, header, work):
+    start = text.find('static void ane_tm_wedge_final(')
+    if start < 0:
+        start = text.index('static int ane_tm_poll_step(')
+    else:
+        start = min(start, text.index('static int ane_tm_poll_step('))
     end = text.index('\n/*\n * Recovery runs', start)
-    (work / 'tm.c').write_text(HARNESS + text[start:end] + MAIN)
+    (work / 'tm.c').write_text(HARNESS + helper(header) + text[start:end] + MAIN)
     subprocess.run(['cc', '-std=gnu11', '-Wall', '-Werror', str(work / 'tm.c'), '-o', str(work / 'tm')], check=True)
     return subprocess.run([str(work / 'tm')], capture_output=True, text=True)
 
@@ -168,7 +214,7 @@ def main():
     ap.add_argument('--old-ref', help='Require this older revision to fail the same checks')
     args = ap.parse_args()
     with tempfile.TemporaryDirectory() as tmp:
-        result = build(production(args.old_ref), Path(tmp))
+        result = build(production(args.old_ref), production(args.old_ref, HEADER), Path(tmp))
     if args.old_ref:
         if result.returncode == 0:
             raise SystemExit(f'{args.old_ref} passed; the test does not catch the original code')

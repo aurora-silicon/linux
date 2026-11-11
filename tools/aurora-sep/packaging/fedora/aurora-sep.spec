@@ -8,7 +8,7 @@
 
 Name:           aurora-sep
 Version:        1
-Release:        11%{?dist}
+Release:        12%{?dist}
 Summary:        Loader and desktop integration for the Apple SEP fingerprint driver
 
 License:        GPL-2.0-only
@@ -30,6 +30,16 @@ Source11:       aurora_sep.te
 Source12:       aurora_sep.fc
 Source13:       OS-IDENTITY.md
 Source16:       sep-bio-identities
+Source17:       aurora-sep.timer
+Source18:       aurora-sep-load.conf
+Source19:       90-aurora-sep.conf
+Source20:       sensor-present
+Source21:       touchid-setup-needed
+Source22:       aurora-touchid-setup
+Source23:       aurora-touchid-setup.service
+Source24:       extract-mesa-calibration.py
+Source25:       powerdevilrc
+Source26:       aurora-sep
 
 BuildArch:      noarch
 BuildRequires:  systemd-rpm-macros
@@ -39,6 +49,7 @@ Requires:       coreutils
 Requires:       fprintd
 Requires:       keyutils
 Requires:       kmod
+Requires:       python3
 Requires:       (%{name}-selinux = %{version}-%{release} if selinux-policy-%{selinuxtype})
 # Only for aurora-sep-greeter-fingerprint.service, which is off by default.
 Suggests:       /usr/bin/gresource
@@ -81,7 +92,7 @@ bzip2 -9 %{modulename}.pp
 unit() {
     install -Dpm 0755 "$1" %{buildroot}%{_libexecdir}/"$3"
     install -Dpm 0644 "$2" %{buildroot}%{_unitdir}/"${2##*/}"
-    sed -i "s|^\(Exec[A-Za-z]*=\)/usr/local/sbin/$3|\1%{_libexecdir}/$3|" \
+    sed -i "s|^\(Exec[A-Za-z]*=\)/usr/local/sbin/|\1%{_libexecdir}/|" \
         %{buildroot}%{_unitdir}/"${2##*/}"
     if grep -q /usr/local %{buildroot}%{_unitdir}/"${2##*/}"; then exit 1; fi
 }
@@ -99,21 +110,40 @@ sed 's|@FPRINTD@|%{_libexecdir}/fprintd|' %{SOURCE7} \
 install -Dpm 0644 %{SOURCE8} \
     %{buildroot}%{_prefix}/lib/systemd/logind.conf.d/50-aurora-sep.conf
 install -Dpm 0755 %{SOURCE16} %{buildroot}%{_bindir}/sep-bio-identities
+install -Dpm 0755 %{SOURCE26} %{buildroot}%{_bindir}/aurora-sep
+sed -i "s|^\(Exec[A-Za-z]*=\)/usr/local/sbin/|\1%{_libexecdir}/|" \
+    %{buildroot}%{_unitdir}/fprintd.service.d/aurora-sep.conf
+install -Dpm 0755 %{SOURCE20} %{buildroot}%{_libexecdir}/aurora-sep-sensor-present
+# The Touch ID calibration setup, run when a file is missing or refused.
+install -Dpm 0755 %{SOURCE21} %{buildroot}%{_libexecdir}/aurora-touchid-setup-needed
+install -Dpm 0755 %{SOURCE22} %{buildroot}%{_sbindir}/aurora-touchid-setup
+install -Dpm 0755 %{SOURCE24} %{buildroot}%{_libexecdir}/aurora/extract-mesa-calibration
+install -Dpm 0644 %{SOURCE23} %{buildroot}%{_unitdir}/aurora-touchid-setup.service
+sed -i -e "s|^\(Exec[A-Za-z]*=\)/usr/local/sbin/aurora-touchid-setup |\1%{_sbindir}/aurora-touchid-setup |" \
+    -e "s|^\(Exec[A-Za-z]*=\)/usr/local/sbin/|\1%{_libexecdir}/|" \
+    %{buildroot}%{_unitdir}/aurora-touchid-setup.service
+# Load the driver from aurora-sep.service, once /var/lib is there, and keep
+# it out of the initramfs.
+install -Dpm 0644 %{SOURCE18} %{buildroot}%{_prefix}/lib/modprobe.d/aurora-sep-load.conf
+install -Dpm 0644 %{SOURCE19} %{buildroot}%{_prefix}/lib/dracut/dracut.conf.d/90-aurora-sep.conf
+install -Dpm 0644 %{SOURCE17} %{buildroot}%{_unitdir}/aurora-sep.timer
+install -Dpm 0644 %{SOURCE25} %{buildroot}%{_sysconfdir}/xdg/powerdevilrc
+if grep -rq /usr/local %{buildroot}%{_unitdir}; then exit 1; fi
 # Load the driver at boot, so the enclave is up before the login screen asks.
 install -d %{buildroot}%{_presetdir}
-echo 'enable aurora-sep.service' >%{buildroot}%{_presetdir}/80-aurora-sep.preset
+printf 'enable aurora-sep.service\nenable aurora-sep.timer\n' >%{buildroot}%{_presetdir}/80-aurora-sep.preset
 install -Dpm 0644 %{modulename}.pp.bz2 \
     %{buildroot}%{_datadir}/selinux/packages/%{selinuxtype}/%{modulename}.pp.bz2
 
 %post
-%systemd_post aurora-sep.service aurora-sep-ready.service aurora-sep-greeter-fingerprint.service aurora-sep-greeter-refresh.service
+%systemd_post aurora-sep.timer aurora-sep.service aurora-sep-ready.service aurora-touchid-setup.service aurora-sep-greeter-fingerprint.service aurora-sep-greeter-refresh.service
 
 %preun
-%systemd_preun aurora-sep.service aurora-sep-ready.service aurora-sep-greeter-fingerprint.service aurora-sep-greeter-refresh.service
+%systemd_preun aurora-sep.timer aurora-sep.service aurora-sep-ready.service aurora-touchid-setup.service aurora-sep-greeter-fingerprint.service aurora-sep-greeter-refresh.service
 
 %postun
 # Never restart them: the driver attaches to the enclave once per boot.
-%systemd_postun aurora-sep.service aurora-sep-ready.service aurora-sep-greeter-fingerprint.service aurora-sep-greeter-refresh.service
+%systemd_postun aurora-sep.timer aurora-sep.service aurora-sep-ready.service aurora-touchid-setup.service aurora-sep-greeter-fingerprint.service aurora-sep-greeter-refresh.service
 
 %pre selinux
 %selinux_relabel_pre -s %{selinuxtype}
@@ -140,7 +170,18 @@ fi
 %{_libexecdir}/aurora-sep-ready
 %{_libexecdir}/aurora-sep-greeter-fingerprint
 %{_bindir}/sep-bio-identities
+%{_bindir}/aurora-sep
 %{_sbindir}/aurora-sep-policy-change
+%{_sbindir}/aurora-touchid-setup
+%{_libexecdir}/aurora-sep-sensor-present
+%{_libexecdir}/aurora-touchid-setup-needed
+%dir %{_libexecdir}/aurora
+%{_libexecdir}/aurora/extract-mesa-calibration
+%{_prefix}/lib/modprobe.d/aurora-sep-load.conf
+%{_prefix}/lib/dracut/dracut.conf.d/90-aurora-sep.conf
+%config(noreplace) %{_sysconfdir}/xdg/powerdevilrc
+%{_unitdir}/aurora-sep.timer
+%{_unitdir}/aurora-touchid-setup.service
 %{_unitdir}/aurora-sep.service
 %{_unitdir}/aurora-sep-ready.service
 %{_unitdir}/aurora-sep-greeter-fingerprint.service
@@ -156,6 +197,16 @@ fi
 %ghost %verify(not md5 size mode mtime) %{_sharedstatedir}/selinux/%{selinuxtype}/active/modules/200/%{modulename}
 
 %changelog
+* Sat Nov 07 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-12
+- Take the distribution packages' changes: wait on the driver's key-store
+  attribute before the trusted-key probe, leave /dev/sep-bio to
+  aurora-sep-ready (a Mac without a reader still gets SEP trusted keys),
+  run the readiness unit and fprintd only with a reader present, load the
+  driver from the service after /var/lib (modprobe blacklist, timer, not in
+  the initramfs), and set up a missing or refused Touch ID calibration with
+  aurora-touchid-setup
+- The SELinux module gives the driver's state files their own type
+
 * Sun Nov 01 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-11
 - aurora-sep-selinux: name the device type aurora_sep_device_t, as the
   distribution packages do, let fprintd read input devices for the lid

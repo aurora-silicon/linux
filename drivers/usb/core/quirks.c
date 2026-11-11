@@ -476,6 +476,10 @@ static const struct usb_device_id usb_quirk_list[] = {
 	/* Sony Xperia XZ1 Compact (lilac) smartphone in fastboot mode */
 	{ USB_DEVICE(0x0fce, 0x0dde), .driver_info = USB_QUIRK_NO_LPM },
 
+	/* SteelSeries Apex Pro: wakes itself about 0.5 s after every suspend */
+	{ USB_DEVICE(0x1038, 0x1610), .driver_info =
+			USB_QUIRK_WAKES_ITSELF_WHEN_SUSPENDED },
+
 	/* Action Semiconductor flash disk */
 	{ USB_DEVICE(0x10d6, 0x2200), .driver_info =
 			USB_QUIRK_STRING_FETCH_255 },

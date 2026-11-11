@@ -13,7 +13,7 @@ struct mt7932_rx_frame {
 	size_t length;
 	u32 timestamp, rcpi, rxv;
 	u16 frame_control, sequence_control, qos_control, wtbl;
-	u8 channel, amsdu, sec_mode;
+	u8 channel, amsdu, sec_mode, bss;
 	enum nl80211_band band;
 	bool translated, group4, signal_valid, rate_valid, unicast;
 	bool cipher_mismatch;
@@ -64,6 +64,7 @@ static inline int mt7932_rx_frame(const u8 *packet, size_t size, struct mt7932_r
 		return -EPROTO;
 	memset(out, 0, sizeof(*out));
 	out->translated = !!(w2 & (1U << 13));
+	out->bss = w2 & 0x3f;
 	out->channel = (w3 >> 8) & 255;
 	out->wtbl = w1 & 0x3ff;
 	out->unicast = ((w3 >> 16) & 3) == 1;

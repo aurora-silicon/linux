@@ -77,5 +77,8 @@ config TYPEC_SN201202X_KUNIT_TEST
 	  sleeps, that a system suspend that fails leaves the controller awake,
 	  and that an idle controller sleeps and wakes for register access and
 	  for system suspend. Also test which data status and status count as
-	  a link that wakes the system from suspend-to-idle. These tests run on
-	  a simulated SPMI bus, without accessing a physical Type-C controller.
+	  a link that wakes the system from suspend-to-idle. Liquid-detection
+	  coverage includes status decode and the ordering of controller
+	  mitigation, dry revalidation and connector-state reporting. These tests
+	  run on a simulated SPMI bus, without accessing a physical Type-C
+	  controller.

@@ -42,8 +42,8 @@ pub(crate) mod glue {
 
     extern "C" {
         fn asahi_g16_board() -> bool;
+        fn asahi_g16_display_prepare(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
         fn asahi_g16_hold_power(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
-        fn asahi_g16_module_get();
         fn asahi_g16_ram_disjoint(start: u64, size: u64) -> bool;
         fn asahi_g16_ioremap_wc(start: u64, size: usize) -> *mut core::ffi::c_void;
         fn asahi_g16_dma_unsupported(dev: *mut core::ffi::c_void) -> bool;
@@ -66,6 +66,12 @@ pub(crate) mod glue {
         unsafe { asahi_g16_board() }
     }
 
+    /// Links the GPU to the published native display, or defers until it is.
+    pub(crate) fn display_prepare(dev: &device::Device) -> Result {
+        // SAFETY: `dev` is the bound GPU device; the helper only adds a device link.
+        kernel::error::to_result(unsafe { asahi_g16_display_prepare(dev.as_raw().cast()) })
+    }
+
     /// Holds the GFX power domain for the retained session.
     pub(crate) fn hold_power(dev: &device::Device) -> Result {
         // SAFETY: `dev` is a valid device; runtime-PM accounting on it has no other requirement.
@@ -79,12 +85,10 @@ pub(crate) mod glue {
         RETAINED.load(Ordering::Acquire)
     }
 
-    /// Pins this module until reboot, once (`__module_get(THIS_MODULE)`).
-    pub(crate) fn retain_module() {
-        if !RETAINED.swap(true, Ordering::AcqRel) {
-            // SAFETY: The module is live while its code runs; the reference is never put.
-            unsafe { asahi_g16_module_get() };
-        }
+    /// Pins this module until reboot, once (`try_module_get(THIS_MODULE)`, see `retain.rs`).
+    /// ENODEV, with nothing pinned or marked, once the module's removal has begun.
+    pub(crate) fn retain_module() -> Result {
+        crate::retain::retain_module(&RETAINED)
     }
 
     /// The physical range is disjoint from System RAM.
@@ -455,6 +459,11 @@ pub(crate) fn admit(
         }
         return Err(err);
     }
+    glue::display_prepare(dev).inspect_err(|e| {
+        if *e != EPROBE_DEFER {
+            dev_err!(dev, "native display not admitted: {:?}\n", e);
+        }
+    })?;
     let adt =
         adt::read(dev).inspect_err(|e| dev_err!(dev, "ADT GPU regions not admitted: {:?}\n", e))?;
     crate::fwid::identify(
@@ -473,8 +482,9 @@ pub(crate) fn admit(
     }
     let regs = regs::Regs::new(pdev, res)?;
     // Once power admission starts, even a rejected cold check must not detach the GFX
-    // domain under an inherited firmware owner. Keep the module and platform binding.
-    glue::retain_module();
+    // domain under an inherited firmware owner. Keep the module and platform binding; once
+    // the module's removal has begun nothing is held.
+    glue::retain_module()?;
     glue::hold_power(dev)?;
     let (power_offset, power_state) = glue::power_domain_state(dev)?;
     if power_offset != 0x250 || (power_state >> 4) & 0xf != 0xf {
@@ -719,8 +729,12 @@ pub(crate) fn start(
         return Err(e);
     }
 
-    // From here on the firmware is touched: nothing it can reach is freed.
-    glue::retain_module();
+    // From here on the firmware is touched: nothing it can reach is freed. Admission pinned
+    // the module, so this only confirms it.
+    if let Err(e) = glue::retain_module() {
+        core::mem::forget(objects);
+        return Err(e);
+    }
     let rtkit = match Rtkit::new(&d, shared) {
         Ok(rtkit) => rtkit,
         Err(e) => {

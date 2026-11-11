@@ -64,3 +64,5 @@
 	spi-cs-setup-delay-ns = <20>;
 	spi-cs-hold-delay-ns = <20>;
 };
+
+#include "t6021-peripherals.dtsi"

@@ -267,6 +267,23 @@ APPLE_SMC_TYPE_OPS(s32)
 APPLE_SMC_TYPE_OPS(s16)
 APPLE_SMC_TYPE_OPS(s8)
 
+struct device;
+
+/*
+ * The SMC hwmon cell's fan control for a kernel thermal policy (a GPU
+ * governor): see drivers/hwmon/macsmc-hwmon.c.
+ */
+#if IS_REACHABLE(CONFIG_SENSORS_MACSMC_HWMON)
+int macsmc_hwmon_fans_request(struct device *dev, unsigned int permille,
+			      unsigned int min_step_rpm);
+#else
+static inline int macsmc_hwmon_fans_request(struct device *dev, unsigned int permille,
+					    unsigned int min_step_rpm)
+{
+	return -ENODEV;
+}
+#endif
+
 static inline int apple_smc_read_flag(struct apple_smc *smc, smc_key key, bool *flag)
 {
 	u8 val;

@@ -14,9 +14,12 @@ properties:
     oneOf:
       - const: apple,t8015-nvme-ans2
       - const: apple,t6041-nvme-ans2
+      - const: apple,t6050-nvme-ans2
       - items:
           - enum:
               - apple,t6020-nvme-ans2
+              - apple,t6030-nvme-ans2
+              - apple,t6031-nvme-ans2
               - apple,t8122-nvme-ans2
           - const: apple,t8103-nvme-ans2
       - const: apple,t8132-nvme-ans2
@@ -26,6 +29,9 @@ properties:
       - items:
           - const: apple,t8140-nvme-ans2
           - const: apple,t8132-nvme-ans2
+      - items:
+          - const: apple,t8142-nvme-ans2
+          - const: apple,t8140-nvme-ans2
       - items:
           - enum:
               # Do not add additional SoC to this list.
@@ -111,6 +117,7 @@ allOf:
           not:
             contains:
               enum:
+                - apple,t6050-nvme-ans2
                 - apple,t8132-nvme-ans2
                 - apple,t8140-nvme-ans2
     then:
@@ -124,6 +131,7 @@ allOf:
             enum:
               - apple,t6000-nvme-ans2
               - apple,t6020-nvme-ans2
+              - apple,t6031-nvme-ans2
               - apple,t6041-nvme-ans2
               - apple,t8140-nvme-ans2
     then:
@@ -145,7 +153,9 @@ allOf:
           contains:
             enum:
               - apple,t6041-nvme-ans2
+              - apple,t6050-nvme-ans2
               - apple,t8132-nvme-ans2
+              - apple,t8140-nvme-ans2
     then:
       properties:
         reg:
@@ -159,13 +169,30 @@ allOf:
         reg-names:
           maxItems: 2
 
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6050-nvme-ans2
+    then:
+      description:
+        On T6050 the boot loader leaves ANS running with the controller shut
+        down. Its power stays with the firmware and it is never reset through
+        PMGR, so the node names no power domain and no reset.
+      properties:
+        resets: false
+        power-domains: false
+        power-domain-names: false
+    else:
+      required:
+        - resets
+        - power-domains
+        - power-domain-names
+
 required:
   - compatible
   - reg
   - reg-names
-  - resets
-  - power-domains
-  - power-domain-names
   - mboxes
   - interrupts
   - apple,sart

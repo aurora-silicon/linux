@@ -210,6 +210,21 @@ impl ObjectRef {
 
         vm.map_at(addr, self.gem.size(), &self.gem, prot, guard)
     }
+
+    /// Map at a specific address, reserving `guard_pages` unmapped pages
+    /// after the object in that Vm's allocator (T8152, module 1134).
+    #[cfg(CONFIG_DRM_ASAHI_G18)]
+    pub(crate) fn map_at_with_guards(
+        &mut self,
+        vm: &crate::mmu::Vm,
+        addr: u64,
+        prot: mmu::Prot,
+        guard_pages: usize,
+    ) -> Result<crate::mmu::KernelMapping> {
+        validate_vm_binding(&self.gem, vm)?;
+
+        vm.map_at_with_guards(addr, self.gem.size(), &self.gem, prot, guard_pages)
+    }
 }
 
 pub(crate) struct AsahiObjConfig {
@@ -221,7 +236,7 @@ pub(crate) struct AsahiObjConfig {
 
 /// Create a new kernel-owned GEM object.
 pub(crate) fn new_kernel_object(dev: &AsahiDrmDevice, size: usize) -> Result<ObjectRef> {
-    new_kernel_object_mapped(dev, size, false)
+    new_kernel_object_mapped(dev, size, false, true)
 }
 
 /// Create a new kernel-owned GEM object whose kernel mapping is write-combined.
@@ -229,7 +244,17 @@ pub(crate) fn new_kernel_object(dev: &AsahiDrmDevice, size: usize) -> Result<Obj
 /// Used for memory that a non-coherent agent reads as soon as the host has stored to it and
 /// issued a barrier, without cache maintenance.
 pub(crate) fn new_kernel_object_wc(dev: &AsahiDrmDevice, size: usize) -> Result<ObjectRef> {
-    new_kernel_object_mapped(dev, size, true)
+    new_kernel_object_mapped(dev, size, true, true)
+}
+
+/// Create a new kernel-owned write-combined GEM object that is not counted as kernel memory:
+/// its owner holds a user charge for it ([`memacct::Charge::user`]), and counting both would
+/// take its size twice from the device limit.
+pub(crate) fn new_kernel_object_wc_user_charged(
+    dev: &AsahiDrmDevice,
+    size: usize,
+) -> Result<ObjectRef> {
+    new_kernel_object_mapped(dev, size, true, false)
 }
 
 /// Validate before rounding: wrapping a user size can create a much smaller
@@ -244,14 +269,24 @@ pub(crate) fn checked_object_size(size: usize) -> Result<usize> {
         .ok_or(EOVERFLOW)
 }
 
-fn new_kernel_object_mapped(dev: &AsahiDrmDevice, size: usize, map_wc: bool) -> Result<ObjectRef> {
+fn new_kernel_object_mapped(
+    dev: &AsahiDrmDevice,
+    size: usize,
+    map_wc: bool,
+    kernel_charge: bool,
+) -> Result<ObjectRef> {
     let size = checked_object_size(size)?;
+    let charge = if kernel_charge {
+        memacct::Charge::kernel(&memacct::LEDGER, size as u64)
+    } else {
+        memacct::Charge::none()
+    };
     let gem = shmem::Object::<AsahiObject>::new(
         dev,
         size,
         shmem::ObjectConfig::<AsahiObject> {
             reclaimable_cpu_mappings: false,
-            pages_no_reclaim: false,
+            pages_bounded_reclaim: false,
             map_wc,
             parent_resv_obj: None,
         },
@@ -259,7 +294,7 @@ fn new_kernel_object_mapped(dev: &AsahiDrmDevice, size: usize, map_wc: bool) -> 
             flags: 0,
             exportable: false,
             kernel: true,
-            charge: memacct::Charge::kernel(&memacct::LEDGER, size as u64),
+            charge,
         },
     )?;
 
@@ -278,7 +313,7 @@ pub(crate) fn new_object(
     flags: u32,
     parent_object: Option<&shmem::Object<AsahiObject>>,
     reclaim_cpu: bool,
-    pages_no_reclaim: bool,
+    pages_bounded_reclaim: bool,
     commit: memacct::Commit,
 ) -> Result<ARef<Object>> {
     if (flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0) != parent_object.is_some()
@@ -291,7 +326,7 @@ pub(crate) fn new_object(
         checked_object_size(size)?,
         shmem::ObjectConfig::<AsahiObject> {
             reclaimable_cpu_mappings: parent_object.is_some() && reclaim_cpu,
-            pages_no_reclaim,
+            pages_bounded_reclaim,
             map_wc: flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_WRITEBACK == 0,
             parent_resv_obj: parent_object,
         },
@@ -395,6 +430,12 @@ impl Drop for KernelMappingPin {
 }
 
 impl AsahiObject {
+    /// Whether this is a kernel-created object.
+    #[cfg(CONFIG_DRM_ASAHI_G18)]
+    pub(crate) fn is_kernel(&self) -> bool {
+        self.kernel
+    }
+
     /// Whether CPU mappings use the cacheable WRITEBACK policy.
     pub(crate) fn is_writeback(&self) -> bool {
         self.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_WRITEBACK != 0
@@ -431,10 +472,11 @@ pub(crate) fn madvise(gem: &Object, dontneed: bool) -> Result<u32> {
     Ok(u32::from(gem.madvise(i32::from(dontneed))))
 }
 
-/// Large user BOs have a cheap ENOMEM fallback instead of per-folio reclaim.
-/// Keep ordinary resource allocations and kernel-owned backing on their existing
-/// policy. 256 MiB also matches Mesa's maximum reusable BO-cache footprint.
-pub(crate) fn user_pages_no_reclaim(size: usize, g17: bool) -> bool {
+/// Large user BOs may release clean page cache but never swap out the rest of the
+/// system per folio; they get a quick ENOMEM when they cannot fit. Keep ordinary
+/// resource allocations and kernel-owned backing on their existing policy. 256 MiB
+/// also matches Mesa's maximum reusable BO-cache footprint.
+pub(crate) fn user_pages_bounded_reclaim(size: usize, g17: bool) -> bool {
     g17 && size >= 256 * 1024 * 1024
 }
 
@@ -444,10 +486,10 @@ mod allocation_policy_tests {
 
     #[test]
     fn large_user_backing() {
-        assert!(!user_pages_no_reclaim(256 * 1024 * 1024 - 1, true));
-        assert!(user_pages_no_reclaim(256 * 1024 * 1024, true));
-        assert!(user_pages_no_reclaim(3_257_113_344, true));
-        assert!(!user_pages_no_reclaim(3_257_113_344, false));
+        assert!(!user_pages_bounded_reclaim(256 * 1024 * 1024 - 1, true));
+        assert!(user_pages_bounded_reclaim(256 * 1024 * 1024, true));
+        assert!(user_pages_bounded_reclaim(3_257_113_344, true));
+        assert!(!user_pages_bounded_reclaim(3_257_113_344, false));
     }
 }
 

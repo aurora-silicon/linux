@@ -92,6 +92,8 @@ struct audiosrv_data {
 	struct mutex open_lock;
 	struct apple_epic_service *open_srv;
 	u64 open_gen;
+	/* Woken when gen changes: an Open waits there for a replacement. */
+	wait_queue_head_t gen_wq;
 	/* The instance the link was last prepared on (open_lock) */
 	u64 link_gen;
 #endif
@@ -109,6 +111,10 @@ struct audiosrv_data {
 	bool work_disabled;
 	/* afk_init/afk_start failed. Rebind must not enable these works. */
 	bool restart_blocked;
+	/* The element capacity a compact endpoint's last catalog fitted */
+	size_t elements_cap;
+	/* The published instance answered the whole capacity with an empty catalog */
+	bool elements_empty;
 };
 
 static void av_interface_init(struct apple_epic_service *service, const char *name,
@@ -155,10 +161,15 @@ static void av_audiosrv_init(struct apple_epic_service *service, const char *nam
 #endif
 	queue_start = !asrv->reports_stopped;
 	up_write(&asrv->srv_rwsem);
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	wake_up_all(&asrv->gen_wq);
+#endif
 	if (old)
 		afk_service_put(old);
 
 	asrv->plugged = true;
+	/* A new instance, maybe a new sink: its catalog is asked for afresh. */
+	WRITE_ONCE(asrv->elements_empty, false);
 	mutex_unlock(&asrv->plug_lock);
 	if (queue_start)
 		schedule_work(&asrv->start_av_service_wq);
@@ -260,7 +271,7 @@ bool dcp_audiosrv_native_link(struct device *dev)
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
 	return dcp_is_v14_7_external(dcp) ||
-	       (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->external);
+	       (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->desktop_external);
 }
 
 /* The 14.7 external role's audio service calls; KUnit stubs them. */
@@ -280,6 +291,9 @@ static int av_audiosrv_call(struct apple_epic_service *srv, u32 command, const v
 	return afk_service_call(srv, 0, command, body, body_len, body_pad, reply, reply_len, 0);
 }
 
+/* How long an Open refused by an instance being replaced waits for the next one */
+#define AV_AUDIOSRV_REPLACE_MS	1000
+
 /*
  * The 14.7 external role: the service is open while a PCM is (see
  * av_service_connect()). The instance the PCM opened is kept under open_lock,
@@ -295,7 +309,8 @@ int dcp_audiosrv_open(struct device *dev)
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	struct audiosrv_data *asrv = dcp->audiosrv;
 	struct apple_epic_service *srv;
-	u8 reply[32] = {};
+	u8 reply[32];
+	bool replaced;
 	u64 gen;
 	int ret;
 
@@ -303,32 +318,59 @@ int dcp_audiosrv_open(struct device *dev)
 		return -ENODEV;
 
 	guard(mutex)(&asrv->open_lock);
-	scoped_guard(rwsem_read, &asrv->srv_rwsem) {
-		srv = afk_service_get(asrv->srv);
-		gen = asrv->gen;
-	}
-	if (!srv)
-		return -ENODEV;
-	if (asrv->open_srv) {
-		if (asrv->open_gen == gen) {
-			afk_service_put(srv);
-			return 0;
+	/*
+	 * A display that wakes up (DPMS on) reports its sink on the audio
+	 * interface it had, and the firmware replaces that instance a few
+	 * hundred milliseconds later: an Open sent in between is refused
+	 * (kIOReturnOffline). The Open that follows the replacement is
+	 * answered, so wait for that instance and try it once more.
+	 * Userspace drops an output whose first open fails, so this is the
+	 * difference between a display with and without audio after it
+	 * wakes up.
+	 */
+	for (int attempt = 0; ; attempt++) {
+		scoped_guard(rwsem_read, &asrv->srv_rwsem) {
+			srv = afk_service_get(asrv->srv);
+			gen = asrv->gen;
 		}
-		/* An earlier instance's open went with that instance. */
-		afk_service_put(asrv->open_srv);
-		asrv->open_srv = NULL;
-	}
+		if (!srv)
+			return -ENODEV;
+		if (asrv->open_srv) {
+			if (asrv->open_gen == gen) {
+				afk_service_put(srv);
+				return 0;
+			}
+			/* An earlier instance's open went with that instance. */
+			afk_service_put(asrv->open_srv);
+			asrv->open_srv = NULL;
+		}
 
-	/* Open: a zero body; status at +0, the opened Boolean at +16. */
-	ret = av_audiosrv_call(srv, asrv->cmds.open, NULL, 0, 32, reply, sizeof(reply));
-	if (!ret && (get_unaligned_le32(reply) || !get_unaligned_le64(reply + 16))) {
-		dev_err(dev, "audiosrv: open answered %#x, opened %llu\n",
-			get_unaligned_le32(reply), get_unaligned_le64(reply + 16));
-		ret = -EIO;
-	}
-	if (ret) {
+		/* Open: a zero body; status at +0, the opened Boolean at +16. */
+		memset(reply, 0, sizeof(reply));
+		ret = av_audiosrv_call(srv, asrv->cmds.open, NULL, 0, 32, reply, sizeof(reply));
+		if (!ret && (get_unaligned_le32(reply) || !get_unaligned_le64(reply + 16))) {
+			dev_err(dev, "audiosrv: open answered %#x, opened %llu\n",
+				get_unaligned_le32(reply), get_unaligned_le64(reply + 16));
+			ret = -EIO;
+		}
+		if (!ret)
+			break;
 		afk_service_put(srv);
-		return ret;
+		if (attempt)
+			return ret;
+		/*
+		 * The instance refused it as offline: its successor is on the
+		 * way (published within some 200 ms on the J616s), wait for it.
+		 */
+		if (ret == -ENODEV)
+			wait_event_timeout(asrv->gen_wq,
+					   READ_ONCE(asrv->srv) && READ_ONCE(asrv->gen) != gen,
+					   msecs_to_jiffies(AV_AUDIOSRV_REPLACE_MS));
+		scoped_guard(rwsem_read, &asrv->srv_rwsem)
+			replaced = asrv->srv && asrv->gen != gen;
+		if (!replaced)
+			return ret;
+		dev_dbg(dev, "audiosrv: open on a replaced instance failed (%d), retrying\n", ret);
 	}
 	asrv->open_srv = srv;
 	asrv->open_gen = gen;
@@ -500,6 +542,8 @@ dcp_audiosrv_osobject_call(struct apple_epic_service *service, u16 group,
 	void *bfr __free(kfree) = NULL;
 	int ret;
 
+	KUNIT_STATIC_STUB_REDIRECT(dcp_audiosrv_osobject_call, service, group, command, output,
+				   output_maxsize, output_size);
 	bfr = kzalloc(bfr_len, GFP_KERNEL);
 	if (!bfr)
 		return -ENOMEM;
@@ -534,12 +578,41 @@ dcp_audiosrv_osobject_call(struct apple_epic_service *service, u16 group,
 	return 0;
 }
 
+/*
+ * A compact EPIC endpoint (desktop 26.x) carries a call's whole reply
+ * capacity in band, through the endpoint's rings, where the transports
+ * before it passed a buffer: a 256 KiB element capacity is some 255
+ * fragments, which the firmware queues for the audio interface's thread.
+ * While that thread is busy, as when a display that is plugged in has its
+ * modes read, that queue overflows and the processor stops ("MBI queue
+ * overflow:dcpav-interface-ep"). So a compact endpoint is asked with a
+ * capacity a display's catalog fits in (7784 bytes for a 2560x1440
+ * monitor), and the capacity grows only for a catalog that does not fit.
+ * The firmware answers a capacity too small for the catalog with an empty
+ * one (no error, nothing used), so an empty answer grows it too, as do one
+ * that fills it and one reported larger than it; nothing else does (a
+ * timeout leaves the endpoint unusable, other errors are not about size).
+ * The capacity that fitted is kept for the next query. An instance that
+ * answers even the whole capacity with an empty catalog has none: it is
+ * asked once more only with the smallest capacity, until it is replaced.
+ */
+#define AV_COMPACT_ELEMENTS_MIN		SZ_16K
+#define AV_COMPACT_ELEMENTS_GROWTH	4
+
+static bool av_elements_need_more(int ret, size_t size, size_t cap, bool empty)
+{
+	if (!ret)
+		return (!size && !empty) || size >= cap;
+	return ret == -EMSGSIZE;
+}
+
 int dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	struct audiosrv_data *asrv = dcp->audiosrv;
 	struct apple_epic_service *srv;
-	size_t size;
+	size_t size = 0, cap;
+	bool compact, empty;
 	int ret;
 
 	if (!asrv)
@@ -548,8 +621,33 @@ int dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize
 		srv = afk_service_get(asrv->srv);
 	if (!srv)
 		return -ENODEV;
-	ret = dcp_audiosrv_osobject_call(srv, 1, asrv->cmds.get_elements,
-					 elements, maxsize, &size);
+
+	compact = READ_ONCE(srv->ep->compact);
+	empty = READ_ONCE(asrv->elements_empty);
+	cap = maxsize;
+	if (compact)
+		cap = clamp(READ_ONCE(asrv->elements_cap) ?: AV_COMPACT_ELEMENTS_MIN,
+			    min_t(size_t, AV_COMPACT_ELEMENTS_MIN, maxsize), maxsize);
+	for (;;) {
+		ret = dcp_audiosrv_osobject_call(srv, 1, asrv->cmds.get_elements,
+						 elements, cap, &size);
+		if (cap >= maxsize || !av_elements_need_more(ret, size, cap, empty))
+			break;
+		dev_dbg(dev, "audiosrv: elements do not fit %zu bytes (%d, %zu used), asking for more\n",
+			cap, ret, size);
+		cap = min(cap * AV_COMPACT_ELEMENTS_GROWTH, maxsize);
+	}
+	if (compact && !ret) {
+		/* The call cleared the capacity it asked with; the rest goes too. */
+		memset(elements + cap, 0, maxsize - cap);
+		/* A smaller display's catalog goes back to a smaller capacity. */
+		if (!size && cap >= maxsize)
+			WRITE_ONCE(asrv->elements_empty, true);
+		while (cap > AV_COMPACT_ELEMENTS_MIN &&
+		       size < cap / AV_COMPACT_ELEMENTS_GROWTH)
+			cap /= AV_COMPACT_ELEMENTS_GROWTH;
+		WRITE_ONCE(asrv->elements_cap, max_t(size_t, cap, AV_COMPACT_ELEMENTS_MIN));
+	}
 	afk_service_put(srv);
 
 	if (ret && !asrv->warned_get_elements) {
@@ -589,6 +687,30 @@ int dcp_audiosrv_get_product_attrs(struct device *dev, void *attrs, size_t maxsi
 	}
 
 	return ret;
+}
+
+/*
+ * The ELD of the display this processor drives, as drm builds it from the
+ * connector's EDID: monitor name, vendor and product codes, connection type
+ * and the audio descriptors of a CTA-861 audio block, if there is one.
+ * Zeroes without a connector or EDID.
+ */
+int dcp_audio_sink_eld(struct device *dev, u8 *eld, size_t size)
+{
+	struct apple_dcp *dcp;
+	struct apple_connector *connector;
+
+	KUNIT_STATIC_STUB_REDIRECT(dcp_audio_sink_eld, dev, eld, size);
+	memset(eld, 0, size);
+	dcp = dev_get_drvdata(dev);
+	if (!dcp)
+		return -ENODEV;
+	connector = READ_ONCE(dcp->connector);
+	if (!connector)
+		return -ENODEV;
+	guard(mutex)(&connector->base.eld_mutex);
+	memcpy(eld, connector->base.eld, min(size, sizeof(connector->base.eld)));
+	return 0;
 }
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
@@ -664,26 +786,62 @@ static void av_cec_teardown(struct apple_epic_service *service)
 #endif
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+static const struct apple_epic_service_ops av_desktop_ops[];
+
+/*
+ * The desktop 26.x external processors (T6041 DCPEXT) publish their audio
+ * interface on endpoint 0x2b as dcpav-audio-interface-epic, unit 0. With
+ * the role in front ("dispext0:") the announcement is longer than its
+ * field, so it arrives cut, without the unit: admit the cut too, as unit 0.
+ */
 static int av_desktop_audio_prepare(struct apple_epic_service *service, const char *name,
 				    const char *class, s64 unit)
 {
 	struct apple_dcp *dcp = service->ep->dcp;
 
-	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP || !dcp->external ||
-	    service->ep->endpoint != AV_AUDIO_ENDPOINT_DESKTOP ||
-	    !name || strcmp(name, "dcpav-audio-epic") || unit != 0)
+	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP || !dcp->desktop_external ||
+	    service->ep->endpoint != AV_AUDIO_ENDPOINT_DESKTOP || !name)
 		return -EINVAL;
-	return 0;
+	if (!strcmp(name, av_desktop_ops[0].name) && unit == 0)
+		return 0;
+	if (unit == -1 && afk_compact_cut_of(&av_desktop_ops[0], name))
+		return 0;
+	return -EINVAL;
 }
 
 static const struct apple_epic_service_ops av_desktop_ops[] = {
 	{
-		.name = "dcpav-audio-epic",
+		.name = "dcpav-audio-interface-epic",
+		.compact_full = "dcpav-audio-interface-epic:0",
 		.reusable = true,
 		.prepare = av_desktop_audio_prepare,
 		.init = av_audiosrv_init,
 		.report = av_audiosrv_report,
 		.teardown = av_audiosrv_teardown,
+	},
+	{
+		/*
+		 * The same endpoint also publishes the processor's CEC
+		 * interface, cut to "dcpav-cec-interface-ep" as above. The
+		 * host makes no use of CEC: take it and drop its reports.
+		 */
+		.name = "dcpav-cec-interface-epic",
+		.compact_full = "dcpav-cec-interface-epic:0",
+		.init = av_cec_init,
+		.report = av_cec_report,
+		.teardown = av_cec_teardown,
+	},
+	{
+		/*
+		 * And its video interface, cut to "dcpav-video-interface-" on
+		 * every display power-on. The video side runs through the
+		 * IOMFB endpoint; take it like the CEC interface.
+		 */
+		.name = "dcpav-video-interface-epic",
+		.compact_full = "dcpav-video-interface-epic:0",
+		.init = av_cec_init,
+		.report = av_cec_report,
+		.teardown = av_cec_teardown,
 	},
 	{}
 };
@@ -1032,7 +1190,7 @@ int avep_init(struct apple_dcp *dcp)
 
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
-		if (!dcp->external)
+		if (!dcp->desktop_external)
 			return -EOPNOTSUPP;
 		ops = av_desktop_ops;
 		av_endpoint = AV_AUDIO_ENDPOINT_DESKTOP;
@@ -1045,7 +1203,7 @@ int avep_init(struct apple_dcp *dcp)
 	 * Only a processor whose port@0 links an audio device has DP/HDMI
 	 * audio to start. Look before the firmware: a processor without one
 	 * (an internal panel's, or one whose firmware has no audio service
-	 * here, such as H17P) stays as it is without hdmi_audio, quietly.
+	 * here, such as H17P) stays as it is, quietly.
 	 */
 	endpoint = of_graph_get_endpoint_by_regs(dev->of_node, 0, 0);
 	if (endpoint) {
@@ -1096,6 +1254,7 @@ int avep_init(struct apple_dcp *dcp)
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
 	INIT_WORK(&audiosrv_data->terminate_wq, av_work_service_terminate);
 	mutex_init(&audiosrv_data->open_lock);
+	init_waitqueue_head(&audiosrv_data->gen_wq);
 #endif
 	audiosrv_data->works_live = true;
 	dcp->audiosrv = audiosrv_data;

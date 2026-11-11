@@ -209,6 +209,23 @@ static int isp_check_presets(struct apple_isp *isp, u32 num_fw_presets)
 	if (!num_fw_presets)
 		return 0;
 
+	/*
+	 * A deferred start detects the camera after the presets were
+	 * advertised: keep them, and refuse a stream on one the firmware
+	 * lacks instead.
+	 */
+	if (isp->hw->deferred_start) {
+		isp->num_fw_presets = num_fw_presets;
+		for (int i = 0; i < isp->num_presets; i++)
+			if (isp->presets[i].index >= num_fw_presets)
+				dev_warn(isp->dev,
+					 "%ux%u preset: config %u, firmware has %u\n",
+					 isp->presets[i].output_dim.x,
+					 isp->presets[i].output_dim.y,
+					 isp->presets[i].index, num_fw_presets);
+		return 0;
+	}
+
 	for (int i = 0; i < isp->num_presets; i++) {
 		struct isp_preset *preset = &isp->presets[i];
 
@@ -262,7 +279,7 @@ static int isp_ch_cache_sensor_configs(struct apple_isp *isp, u32 ch, u32 count)
 	if (!count || count > ISP_MAX_SENSOR_CONFIGS)
 		return -EINVAL;
 
-	presets = devm_kcalloc(isp->dev, num + count, sizeof(*presets), GFP_KERNEL);
+	presets = devm_kcalloc(isp->dev, num, sizeof(*presets), GFP_KERNEL);
 	if (!presets)
 		return -ENOMEM;
 	memcpy(presets, isp->presets, num * sizeof(*presets));
@@ -273,7 +290,6 @@ static int isp_ch_cache_sensor_configs(struct apple_isp *isp, u32 ch, u32 count)
 	for (u32 i = 0; i < count; i++) {
 		struct cmd_ch_camera_config *config = &args.config;
 		struct isp_sensor_config *cached = &configs[i];
-		bool duplicate = false;
 
 		err = isp_cmd_ch_camera_config_get(isp, ch, i, &args);
 		if (err)
@@ -312,31 +328,12 @@ static int isp_ch_cache_sensor_configs(struct apple_isp *isp, u32 ch, u32 count)
 			    preset->input_dim.x == config->in_width &&
 			    preset->input_dim.y == config->in_height &&
 			    !preset->crop_offset.x && !preset->crop_offset.y &&
-			    preset->crop_size.x == preset->output_dim.x &&
-			    preset->crop_size.y == preset->output_dim.y)
+			    /* Same aspect ratio, never enlarged: the scaler may shrink it. */
+			    preset->crop_size.x >= preset->output_dim.x &&
+			    preset->crop_size.x * preset->output_dim.y ==
+			    preset->crop_size.y * preset->output_dim.x)
 				preset->p010 = preview || reported;
 		}
-		if (!cached->usable)
-			continue;
-
-		/* Keep the board's config-5 presets, including the default, first. */
-		for (unsigned int j = 0; j < num; j++) {
-			if (presets[j].output_dim.x == config->out_width &&
-			    presets[j].output_dim.y == config->out_height) {
-				duplicate = true;
-				break;
-			}
-		}
-		if (duplicate)
-			continue;
-
-		presets[num++] = (struct isp_preset){
-			.index = i,
-			.input_dim = cached->input_dim,
-			.output_dim = cached->output_dim,
-			.crop_size = cached->output_dim,
-			.p010 = true,
-		};
 	}
 	isp->sensor_configs = configs;
 	isp->num_sensor_configs = count;
@@ -558,8 +555,12 @@ int apple_isp_detect_camera(struct apple_isp *isp)
 		dev_err(isp->dev,
 			"failed to boot firmware for initial sensor detection: %d\n",
 			err);
-		/* Resident firmware would fail a deferred retry the same way. */
-		return isp->hw->resident_fw ? err : -EPROBE_DEFER;
+		/*
+		 * Resident firmware would fail a deferred retry the same way,
+		 * and a deferred start is not a probe to defer.
+		 */
+		return isp->hw->resident_fw || isp->hw->deferred_start ?
+		       err : -EPROBE_DEFER;
 	}
 
 	err = isp_detect_camera(isp);
@@ -568,6 +569,8 @@ int apple_isp_detect_camera(struct apple_isp *isp)
 	if (isp->hw->resident_fw) {
 		if (err)
 			apple_isp_firmware_halt(isp);
+		else
+			isp->camera_detected = true;
 		return err;
 	}
 
@@ -578,6 +581,8 @@ int apple_isp_detect_camera(struct apple_isp *isp)
 
 	apple_isp_firmware_shutdown(isp);
 
+	if (!err)
+		isp->camera_detected = true;
 	return err;
 }
 
@@ -669,7 +674,7 @@ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 	memset(isp->data_surf->virt + len, 0, setfile->size - len);
 	release_firmware(fw);
 	/* Seen on T6040 only; T8140 runs its setfiles as they are. */
-	if (isp->hw->gen == ISP_GEN_T6040)
+	if (isp->hw->gen == ISP_GEN_T6040 || isp->hw->setfile_stride_fixup)
 		isp_setfile_fixup_h17(isp->data_surf->virt, len);
 
 	err = isp_cmd_ch_set_file_load(isp, ch, isp->data_surf->iova,
@@ -955,12 +960,32 @@ static int isp_configure_capture(struct apple_isp *isp)
 
 int apple_isp_start_camera(struct apple_isp *isp)
 {
+	struct isp_format *fmt = isp_get_current_format(isp);
 	int err;
 
+	/*
+	 * A deferred start detects the camera now. Resident firmware is then
+	 * left running; firmware that starts again is stopped after the
+	 * detection like at probe, and booted again here.
+	 */
+	if (isp->hw->deferred_start && !isp->camera_detected) {
+		err = apple_isp_detect_camera(isp);
+		if (err < 0) {
+			dev_err(isp->dev, "failed to detect the camera: %d\n", err);
+			return err;
+		}
+	}
 	err = apple_isp_firmware_boot(isp);
 	if (err < 0) {
 		dev_err(isp->dev, "failed to boot firmware: %d\n", err);
 		return err;
+	}
+
+	if (isp->num_fw_presets && fmt->preset->index >= isp->num_fw_presets) {
+		dev_err(isp->dev, "preset config %u: firmware has %u\n",
+			fmt->preset->index, isp->num_fw_presets);
+		apple_isp_firmware_shutdown(isp);
+		return -EINVAL;
 	}
 
 	err = isp_configure_capture(isp);

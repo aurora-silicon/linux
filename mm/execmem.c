@@ -36,6 +36,16 @@ static void *execmem_vmalloc(struct execmem_range *range, size_t size,
 	unsigned long end = range->end;
 	void *p;
 
+#ifdef CONFIG_EXECMEM_CONFINE
+	/*
+	 * Confined ranges draw their physical backing from a fixed window
+	 * rather than from arbitrary buddy pages, so that every executable
+	 * physical page stays inside a CTXR-enrolled region.
+	 */
+	if (range->flags & EXECMEM_CONFINE)
+		return execmem_confine_alloc(range, size, pgprot, vm_flags);
+#endif
+
 	if (kasan)
 		vm_flags |= VM_DEFER_KMEMLEAK;
 
@@ -502,6 +512,11 @@ void execmem_free(void *ptr)
 	 * supported by vmalloc.
 	 */
 	WARN_ON(in_interrupt());
+
+#ifdef CONFIG_EXECMEM_CONFINE
+	if (execmem_confine_free(ptr))
+		return;
+#endif
 
 	if (!execmem_cache_free(ptr))
 		vfree(ptr);

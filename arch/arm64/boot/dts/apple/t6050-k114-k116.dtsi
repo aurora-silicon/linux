@@ -1,0 +1,238 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * MacBook Pro (14-inch and 16-inch PROLED XDR, M5 Pro and M5 Max, 2026)
+ *
+ * Shared by K114c, K114s, K116c and K116s. These are the J714/J716 MacBook Pros
+ * with a tandem OLED panel that takes touch input, and a rear Apple logo that is
+ * lit by its own light. Everything here comes from the boards' Apple device tree
+ * (ADT) as shipped with macOS 27.2. None of it has been tested on the hardware yet.
+ *
+ * Against J716c the ADT differs in:
+ *  - the panel: no I2C backlight driver (i2c7 disp-bklt) and no dp855 TCON; an
+ *    "ixora" TCON and a display NAND on spi4 instead. The OLED needs no separate
+ *    backlight controller, so the panel only ever runs through the display
+ *    coprocessor here, as the boot framebuffer for now.
+ *  - the MTP transport: a "kiwi" interface (the touchscreen) next to the trackpad.
+ *  - the FPWM channels: pwm1 (fpwm,s5l8920x at 0x305044000) drives the rear logo
+ *    ("bklb-backlight", 25 kHz), and pwm2 (0x305048000, "mesa-backlight", 100 Hz)
+ *    exists only on these boards.
+ *
+ * The M5 Pro boards (K114s, K116s) use the same die and, in the static ADT, the
+ * same CPU list as the M5 Max ones; the boot loader drops the cores a part does
+ * not have from this tree using the ADT the Mac boots with.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/leds/common.h>
+
+#include "t6050-max.dtsi"
+
+/ {
+	chassis-type = "laptop";
+
+	aliases {
+		serial0 = &dockchannel;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>; /* To be filled by the loader */
+			/* Format properties will be added by the loader */
+			status = "disabled";
+		};
+	};
+
+	led-controller {
+		compatible = "pwm-leds";
+
+		/* ADT /arm-io/pwm0/kbd-backlight: default-hz 25000 */
+		led-0 {
+			pwms = <&fpwm0 0 40000>;
+			label = "apple::kbd_backlight";
+			function = LED_FUNCTION_KBD_BACKLIGHT;
+			color = <LED_COLOR_ID_WHITE>;
+			max-brightness = <255>;
+		};
+
+		/*
+		 * The rear Apple logo, ADT /arm-io/pwm1/bklb-backlight: default-hz 25000.
+		 * Keep whatever state the boot loader left it in. The ADT's brightness
+		 * mapping (nits-to-pwm-percentage, calibrated per device through syscfg
+		 * CGBl) is policy for user space, and its use-enable-pulse is not
+		 * handled yet.
+		 */
+		led-1 {
+			pwms = <&fpwm1 0 40000>;
+			label = "apple::logo";
+			max-brightness = <255>;
+			default-state = "keep";
+		};
+	};
+};
+
+/* ATC1, ATC3 and the PD controller buses nub-spmi-a0 and -a2: not yet described for these boards */
+&nub_spmi_a0 {
+	status = "disabled";
+};
+
+&nub_spmi_a2 {
+	status = "disabled";
+};
+
+&atc1_phy_mbox {
+	status = "disabled";
+};
+
+&atc1_phy {
+	status = "disabled";
+};
+
+&usb_drd1 {
+	status = "disabled";
+};
+
+&usb_drd1_dart_0 {
+	status = "disabled";
+};
+
+&usb_drd1_dart_1 {
+	status = "disabled";
+};
+
+&atc3_phy_mbox {
+	status = "disabled";
+};
+
+&atc3_phy {
+	status = "disabled";
+};
+
+&usb_drd3 {
+	status = "disabled";
+};
+
+&usb_drd3_dart_0 {
+	status = "disabled";
+};
+
+&usb_drd3_dart_1 {
+	status = "disabled";
+};
+
+&i2c1 {
+	status = "disabled";
+};
+
+&i2c2 {
+	status = "disabled";
+};
+
+/*
+ * As on J716c, where reading pin 112 takes an SError, only the pins a node
+ * here names are exposed, and none is yet. The N1 on PCIe port 0 needs its
+ * board's platform ID, which the static ADT does not carry, so the port and
+ * its PERST# pin stay unused for now.
+ */
+&pinctrl_ap {
+	gpio-reserved-ranges = <0 221>;
+};
+
+&pcie0 {
+	status = "disabled";
+};
+
+/* These boards' SMC fan and power keys are not yet checked */
+&smc_hwmon {
+	status = "disabled";
+};
+
+/*
+ * The console is on the USB debug link, which drains only while a host reads
+ * it; the machine also boots with nothing attached there.
+ */
+&dockchannel {
+	apple,tx-never-wait;
+	status = "okay";
+};
+
+&fpwm0 {
+	status = "okay";
+};
+
+&ps_fpwm1 {
+	status = "okay";
+};
+
+&fpwm1 {
+	status = "okay";
+};
+
+/*
+ * ADT /arm-io/pwm2/mesa-backlight (default-hz 100), next to the Touch ID sensor
+ * (spi2/mesa). What it lights and how macOS drives it is not known yet.
+ */
+&fpwm2 {
+	status = "disabled";
+};
+
+/*
+ * The keyboard, trackpad and touchscreen: the HID transport on the MTP's
+ * DockChannel FIFO, laid out as on J716c (ADT dockchannel-mtp/mtp-transport).
+ */
+&mtp_dockchannel {
+	mtp_hid: input@8000 {
+		compatible = "apple,dockchannel-hid";
+		reg = <0x8000 0x1000>, <0xc000 0x1000>,
+		      <0x0 0x1000>, <0x4000 0x1000>;
+		reg-names = "config", "data", "rmt-config", "rmt-data";
+		iommus = <&mtp_dart 0>;
+		interrupt-parent = <&mtp_dockchannel>;
+		interrupts = <2 IRQ_TYPE_LEVEL_HIGH>,
+			     <3 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "tx", "rx";
+		apple,fifo-size = <0x800>;
+		apple,helper-cpu = <&mtp>;
+		/* ADT multi-touch function-afe-reset: pKW8('pcIO', 0x10000, 0x11c0000) */
+		apple,afe-reset-gpios = <&smc_pcio 2 GPIO_ACTIVE_HIGH>;
+
+		mtp_multitouch: multi-touch {
+			apple,power-method = <2>;
+		};
+
+		keyboard {
+		};
+
+		stm {
+		};
+
+		/*
+		 * The touchscreen (ADT mtp-transport/kiwi, image-tag "fsat"). macOS
+		 * sends it firmware through the same CBOR bootloader as the trackpad.
+		 * Its power, reset, 24 MHz clock and display-sync lines are SoC GPIOs
+		 * (nub-gpio0 0x1a, 0x19, 0x16; gpio0 0xb), with an SMC power reference
+		 * (pKW4('rCIO', 0x20000)) and the TSRC clock source. How that load and
+		 * the report format map onto this transport is still being worked
+		 * out, so the interface stays off until it has been tested.
+		 */
+		kiwi: kiwi {
+			status = "disabled";
+		};
+	};
+};
+
+/*
+ * The board's pcIO outputs, from the ADT: dp2hdmi_pwr_en pKW8('pcIO', 0, 0x1a0000),
+ * hdmi_pwr_en pKW8('pcIO', 0x800000, 0xf0000), and the trackpad AFE reset (2),
+ * pKW8('pcIO', 0x10000, 0x11c0000); the same as on J716c.
+ */
+&smc_pcio {
+	apple,output-commands = /bits/ 64 <0x001a000000000000 0x000f000000800000 0x011c000000010000>;
+};

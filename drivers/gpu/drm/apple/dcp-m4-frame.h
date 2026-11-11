@@ -404,4 +404,21 @@ static inline int dcp_m4_swap_take_completion(struct dcp_m4_swap_state *swap)
 	return 1;
 }
 
+/*
+ * Hand a replied swap over to @to, which tracks it from then on (its D590 may
+ * be in already): @swap counts as taken, so that the next swap may begin.
+ */
+static inline int dcp_m4_swap_hand_off(struct dcp_m4_swap_state *swap,
+				       struct dcp_m4_swap_state *to)
+{
+	if (swap->error)
+		return swap->error;
+	if (!swap->id || !swap->replied || swap->emitted)
+		return dcp_m4_swap_fail(swap, -EPROTO);
+	*to = *swap;
+	swap->completed = true;
+	swap->emitted = true;
+	return 0;
+}
+
 #endif

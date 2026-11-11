@@ -16,11 +16,11 @@ static int afk_parser_test_init(struct kunit *test)
 	if (IS_ERR(dcp->dev))
 		return PTR_ERR(dcp->dev);
 	dcp->fw_compat = DCP_FIRMWARE_H17P;
+	afk_ep_init_state(ep);
 	ep->dcp = dcp;
 	ep->num_channels = 1;
 	ep->services[0].channel = 1;
 	ep->services[0].enabled = true;
-	spin_lock_init(&ep->services[0].lock);
 	test->priv = ep;
 	return 0;
 }

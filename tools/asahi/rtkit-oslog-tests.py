@@ -41,6 +41,7 @@ typedef uint8_t u8; typedef uint64_t u64; typedef uint32_t u32;
 #define spin_unlock_irqrestore(l,f) ((void)(l), (void)(f))
 struct apple_rtkit_shmem { size_t size; };
 struct mailbox { int rx_lock; void (*rx)(void); };
+struct delayed_work { int pending; };
 struct apple_rtkit {
  void *dev, *wq;
  struct mailbox *mbox;
@@ -49,10 +50,11 @@ struct apple_rtkit {
  int sync_ack_fifo;
  bool sync_syslog_ack, oslog_inherited, syslog_inherited, crashlog_inherited, crashed, shutting_down;
  unsigned iop_power_state, ap_power_state;
- unsigned long endpoints[4];
+ unsigned long endpoints[4], started[4];
  char *syslog_msg_buffer;
  size_t syslog_n_entries, syslog_msg_size;
  int epmap_completion, iop_pwr_ack_completion, ap_pwr_ack_completion, coreanalytics_completion;
+ struct delayed_work crashlog_late_work;
 };
 static unsigned sent, warnings, errors, requests, detachments, flushes, freed, checks;
 static int send_error, setup_error, start_error;
@@ -70,6 +72,7 @@ static void reinit_completion(int *c) { *c=0; }
 static void apple_rtkit_rx(void) {}
 static void apple_rtkit_detach_rx(struct apple_rtkit *r) { ++detachments; r->shutting_down=true; }
 static void flush_workqueue(void *w) { (void)w; ++flushes; }
+#define cancel_delayed_work_sync(w) ((void)(w), false)
 static void apple_rtkit_free_buffer(struct apple_rtkit *r, struct apple_rtkit_shmem *b)
 { (void)r; ++freed; b->size=0; }
 #define kfree(p) ((void)(p))

@@ -44,14 +44,25 @@ config PHY_APPLE_T6040_USB2
 	  USB3 host attach decoded from the paired AppleT6040TypeCPhy driver,
 	  including the start of the PHY coprocessor, and the DisplayPort mode
 	  (all four lanes, RBR to HBR3) a Type-C controller selects through the
-	  PHY's mode switch or that an HDMI converter's PHY runs permanently.
-	  It provides no device mode, DisplayPort pin assignment D, USB4,
-	  Thunderbolt or retimer support.
+	  PHY's mode switch or that an HDMI converter's PHY runs permanently. The
+	  same mode switch configures both lanes for USB4 or Thunderbolt. It
+	  provides no device mode or retimer support.
 
 	  This driver performs no ATC-register writes at probe time. Enabling a
 	  matching device-tree node causes MMIO writes when a USB2, USB3 or
 	  DisplayPort consumer powers on the PHY and therefore requires
 	  platform-specific safety review.
+
+config PHY_APPLE_T6040_KUNIT_TEST
+	bool "KUnit tests for Apple T6040 PHY recovery" if !KUNIT_ALL_TESTS
+	depends on PHY_APPLE_T6040_USB2 && KUNIT
+	depends on PHY_APPLE_T6040_USB2=m || KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Test the bounded hard-recovery state machine for a missed Power Down
+	  acknowledgment, a failed firmware tune and retry exhaustion. The tests
+	  access no hardware and run when the PHY driver is loaded. They are only
+	  useful for kernel developers.
 
 config PHY_APPLE_DPTX
 	tristate "Apple DPTX PHY"
@@ -62,3 +73,16 @@ config PHY_APPLE_DPTX
 	  such as the M2.
 	  This driver provides support for DisplayPort and is used on the
 	  Mac mini (M2 and M2 Pro, 2023).
+
+config PHY_APPLE_T6050_DP
+	tristate "Apple T6050 DisplayPort and Type-C combo PHY"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on OF && PM && TYPEC
+	select GENERIC_PHY
+	select APPLE_TUNABLE
+	select APPLE_RTKIT
+	select RESET_CONTROLLER
+	help
+	  Fixed HDMI bridges and Type-C USB host/DisplayPort alternate mode.
+	  One owner coordinates the shared PHY, firmware, PIPE and USB2 state.
+	  Requires named register banks, power domains and firmware tunables.

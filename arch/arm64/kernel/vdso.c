@@ -12,6 +12,7 @@
 #include <linux/elf.h>
 #include <linux/err.h>
 #include <linux/errno.h>
+#include <linux/execmem.h>
 #include <linux/gfp.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
@@ -65,6 +66,24 @@ static int vdso_mremap(const struct vm_special_mapping *sm,
 	return 0;
 }
 
+/*
+ * The kernel image sits in the CTXR window, where EL0 can't execute on a core
+ * the window is enforced on, so EL0 gets a copy in ordinary memory.
+ */
+static struct page * __init vdso_code_page(unsigned long pfn)
+{
+	struct page *page;
+
+	if (!execmem_confine_active())
+		return pfn_to_page(pfn);
+
+	page = alloc_page(GFP_KERNEL);
+	if (page)
+		copy_page(page_address(page), pfn_to_kaddr(pfn));
+
+	return page;
+}
+
 static int __init __vdso_init(enum vdso_abi abi)
 {
 	int i;
@@ -88,12 +107,23 @@ static int __init __vdso_init(enum vdso_abi abi)
 	/* Grab the vDSO code pages. */
 	pfn = sym_to_pfn(vdso_info[abi].vdso_code_start);
 
-	for (i = 0; i < vdso_info[abi].vdso_pages; i++)
-		vdso_pagelist[i] = pfn_to_page(pfn + i);
+	for (i = 0; i < vdso_info[abi].vdso_pages; i++) {
+		vdso_pagelist[i] = vdso_code_page(pfn + i);
+		if (!vdso_pagelist[i])
+			goto err_free;
+	}
 
 	vdso_info[abi].cm->pages = vdso_pagelist;
 
 	return 0;
+
+err_free:
+	/* Only the confined copies were allocated; image pages must not go. */
+	if (execmem_confine_active())
+		while (i--)
+			__free_page(vdso_pagelist[i]);
+	kfree(vdso_pagelist);
+	return -ENOMEM;
 }
 
 static int __setup_additional_pages(enum vdso_abi abi,

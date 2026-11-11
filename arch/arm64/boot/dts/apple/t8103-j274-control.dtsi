@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Populated board control clients. Transport ownership is not transferred. */
+
+&i2c3 {
+	ethernet_sideband: ethernet-sideband@32 {
+		compatible = "apple,t8103-aqc107-i2c", "apple,aqc107-i2c";
+		reg = <0x32>;
+		status = "disabled";
+	};
+};

@@ -18,7 +18,7 @@ import tempfile
 
 
 def function(source, name):
-    match = re.search(r"^(?:static (?:inline )?)?(?:int|bool) " + name +
+    match = re.search(r"^(?:static (?:inline )?)?(?:(?:int|bool|void) |const char \*)" + name +
                       r"\(.*?^\}", source, re.M | re.S)
     if not match:
         raise ValueError("missing source function: " + name)
@@ -51,20 +51,45 @@ struct snd_ctl_elem_info {
  union { struct { unsigned int items, item; char name[64]; } enumerated; } value;
 };
 struct snd_kcontrol_volatile { unsigned int access; struct snd_ctl_file *owner; };
-struct snd_soc_component { unsigned int reg, writes; };
+struct snd_soc_card;
+struct snd_soc_dapm_context { struct snd_soc_card *card; };
+struct snd_soc_component { unsigned int reg, writes; struct snd_soc_dapm_context dapm; };
 struct soc_enum { unsigned int items, shift_l, shift_r, mask, reg; };
 struct snd_kcontrol {
  struct snd_ctl_elem_id id; struct snd_kcontrol_volatile vd[2]; unsigned int count;
  int (*put)(struct snd_kcontrol *, struct snd_ctl_elem_value *);
  int (*info)(struct snd_kcontrol *, struct snd_ctl_elem_info *);
+ int (*get)(struct snd_kcontrol *, struct snd_ctl_elem_value *);
+ int (*write_check)(struct snd_kcontrol *, struct snd_ctl_file *);
  unsigned long private_value; struct snd_soc_component *component;
  struct snd_kcontrol *next; const char * const *texts;
 };
 struct snd_card { int controls_rwsem; struct snd_kcontrol *controls; };
 enum { AMP_NONE, AMP_TAS5770, AMP_SN012776, AMP_SSM3515, AMP_MAX98360A };
-struct macaudio_platform_cfg { int amp, amp_gain; bool stereo; };
-struct macaudio_snd_data { bool has_speakers; struct macaudio_platform_cfg *cfg; };
-struct snd_soc_card { struct snd_card *snd_card; struct macaudio_snd_data *data; };
+struct macaudio_platform_cfg { int amp, amp_gain; bool stereo; bool tweeter_hpf_granted; };
+struct macaudio_snd_data;
+struct snd_soc_card { struct snd_card *snd_card; struct macaudio_snd_data *data; struct device *dev; };
+struct macaudio_snd_data {
+ bool has_speakers; struct macaudio_platform_cfg *cfg;
+ struct snd_ctl_file *spk_owner; struct snd_soc_card card;
+ struct snd_kcontrol **spk_hpfs; unsigned int *spk_hpf_granted;
+ unsigned int spk_nr_hpfs, spk_hpf_safe; struct snd_ctl_elem_value *spk_uval;
+ bool spk_granted; int spk_iface;
+};
+/* MACAUDIO_SPK_IFACE_LEASE: the sense switches are the lease owner's */
+static bool macaudio_spk_leased(const struct macaudio_snd_data *ma) { return ma->spk_iface == 1; }
+#define GFP_KERNEL 0
+#define devm_kcalloc(d, n, s, g) calloc(n, s)
+#define kzalloc_obj(o) calloc(1, sizeof(o))
+#define kfree free
+#define lockdep_assert_held(p) ((void)0)
+#define smp_load_acquire(p) __atomic_load_n(p, __ATOMIC_ACQUIRE)
+static void snd_ctl_notify(struct snd_card *c, int e, struct snd_ctl_elem_id *i) {}
+static struct snd_soc_dapm_context *snd_soc_dapm_kcontrol_to_dapm(struct snd_kcontrol *k) { return &k->component->dapm; }
+static struct snd_soc_card *snd_soc_dapm_to_card(struct snd_soc_dapm_context *d) { return d->card; }
+static int enum_get(struct snd_kcontrol *k, struct snd_ctl_elem_value *v)
+{ v->value.enumerated.item[0] = k->component->reg; return 0; }
+
 static int please_blow_up_my_speakers;
 #define snd_soc_card_get_drvdata(card) ((card)->data)
 #define down_write(x) ((void)0)
@@ -89,7 +114,7 @@ static struct snd_soc_component *snd_kcontrol_chip(struct snd_kcontrol *k) { ret
 static unsigned int snd_soc_enum_item_to_val(struct soc_enum *e, unsigned int item) { return item; }
 static int snd_soc_component_update_bits(struct snd_soc_component *c, unsigned int r, unsigned int m, unsigned int v)
 { unsigned int old = c->reg; c->writes++; c->reg = (old & ~m) | (v & m); return old != c->reg; }
-/* Amp gain is volume-limited separately, not a fixed enum. */
+/* Amp gain is volume-limited (KUnit apple-speaker-protection), not a fixed enum. */
 static int snd_soc_limit_volume(struct snd_soc_card *c, const char *n, int v) { return 1; }
 static int enum_info(struct snd_kcontrol *k, struct snd_ctl_elem_info *i)
 {
@@ -162,9 +187,112 @@ static void scenario(int amp, const char *prefix, bool tweeter, bool stereo)
   }
  }
 }
+static void sense_scenario(void)
+{
+ const char *names[] = { "ISENSE Switch", "VSENSE Switch",
+  "Left Woofer ISENSE Switch", "Left Woofer VSENSE Switch",
+  "Right Tweeter ISENSE Switch", "Right Tweeter VSENSE Switch", "Jack Switch" };
+ struct snd_kcontrol controls[7] = {0};
+ struct snd_soc_component regs[7] = {0};
+ struct soc_enum e = { .items = 2, .mask = 1 };
+ struct snd_card card = { .controls = controls };
+ struct macaudio_snd_data ma = {0};
+ struct snd_soc_card soc = { .snd_card = &card, .data = &ma };
+ struct snd_ctl_file owner = {0}, other = {0};
+ unsigned int i, j;
+ for (i = 0; i < 7; i++) {
+  snprintf(controls[i].id.name, sizeof(controls[i].id.name), "%s", names[i]);
+  controls[i].count = 2; controls[i].vd[0].access = controls[i].vd[1].access = 3;
+  controls[i].component = &regs[i]; regs[i].dapm.card = &soc;
+  controls[i].put = snd_soc_put_enum_double; controls[i].private_value = (unsigned long)&e;
+  controls[i].next = i < 6 ? &controls[i + 1] : NULL;
+ }
+ macaudio_protect_sense(&soc);
+ for (i = 0; i < 7; i++) for (j = 0; j < 2; j++) {
+  struct snd_ctl_elem_value v = { .id = controls[i].id };
+  v.id.index = j;
+  ma.spk_owner = NULL;
+  check(snd_ctl_elem_write(&card, &other, &v) == 0, "unowned writable", names[i]);
+  /* Under the volume lock a lease owner owns nothing */
+  ma.spk_owner = &owner; ma.spk_iface = 0;
+  check(snd_ctl_elem_write(&card, &other, &v) == 0, "lease owner without the lease", names[i]);
+  ma.spk_iface = 1;
+  unsigned int before = regs[i].writes;
+  int rc = snd_ctl_elem_write(&card, &other, &v);
+  check(rc == (i < 6 ? -EPERM : 0), "other file during ownership", names[i]);
+  if (i < 6) check(before == regs[i].writes, "denied before DAPM callback", names[i]);
+  check(snd_ctl_elem_write(&card, &owner, &v) == 0, "owner writable", names[i]);
+  /* An independent lock on the sense control cannot bypass protection. */
+  controls[i].vd[j].owner = &other;
+  check(snd_ctl_elem_write(&card, &other, &v) == (i < 6 ? -EPERM : 0), "sense lock is not protection ownership", names[i]);
+  controls[i].vd[j].owner = NULL;
+  ma.spk_owner = NULL;
+  check(snd_ctl_elem_write(&card, &other, &v) == 0, "after owner close", names[i]);
+  attempts += 6;
+ }
+}
+/* The speaker route is fixed while protection is granted, for every file. */
+static void route_scenario(void)
+{
+ struct snd_kcontrol control = {0};
+ struct snd_soc_component reg = {0};
+ struct soc_enum e = { .items = 2, .mask = 1 };
+ struct snd_card card = { .controls = &control };
+ struct macaudio_snd_data ma = {0};
+ struct snd_soc_card soc = { .snd_card = &card, .data = &ma };
+ struct snd_ctl_file owner = {0}, other = {0};
+ struct snd_ctl_elem_value v = {0};
+ snprintf(control.id.name, sizeof(control.id.name), "%s", "Speaker Playback Mux");
+ control.count = 1; control.vd[0].access = 3; control.component = &reg; reg.dapm.card = &soc;
+ control.put = snd_soc_put_enum_double; control.private_value = (unsigned long)&e;
+ macaudio_protect_sense(&soc);
+ v.id = control.id; v.value.enumerated.item[0] = 1;
+ check(snd_ctl_elem_write(&card, &other, &v) == 0, "route writable while withdrawn", control.id.name);
+ ma.spk_owner = &owner; ma.spk_granted = true;
+ unsigned int before = reg.writes;
+ v.value.enumerated.item[0] = 0;
+ check(snd_ctl_elem_write(&card, &other, &v) == -EBUSY, "route fixed while granted (other file)", control.id.name);
+ check(snd_ctl_elem_write(&card, &owner, &v) == -EBUSY, "route fixed while granted (owner)", control.id.name);
+ check(before == reg.writes, "route denied before DAPM callback", control.id.name);
+ ma.spk_granted = false;
+ check(snd_ctl_elem_write(&card, &owner, &v) == 0, "route writable after withdrawal", control.id.name);
+ attempts += 4;
+}
+static void hpf_scenario(void)
+{
+ const char * const texts[] = { "Disabled", "2 Hz", "50 Hz", "100 Hz", "200 Hz", "400 Hz", "800 Hz" };
+ struct soc_enum e = { .items = 7, .mask = 7 };
+ struct snd_kcontrol controls[2] = {0};
+ struct snd_soc_component regs[2] = {0};
+ struct macaudio_platform_cfg cfg = { .tweeter_hpf_granted = true };
+ struct snd_card card = { .controls = controls };
+ struct snd_ctl_elem_value value = {0};
+ struct macaudio_snd_data ma = { .cfg = &cfg, .spk_uval = &value, .card.snd_card = &card };
+ unsigned int initial, i;
+ /* Every legal DT playback corner, including Disabled, must round trip. */
+ for (initial = 0; initial < 7; initial++) {
+  ma.spk_nr_hpfs = 0;
+  for (i = 0; i < 2; i++) {
+   snprintf(controls[i].id.name, sizeof(controls[i].id.name), "%s Tweeter HPF Corner Frequency", i ? "Right" : "Left");
+   controls[i].count = 1; controls[i].vd[0].access = 3;
+   controls[i].info = enum_info; controls[i].get = enum_get; controls[i].put = snd_soc_put_enum_double;
+   controls[i].private_value = (unsigned long)&e; controls[i].component = &regs[i]; controls[i].texts = texts;
+   controls[i].next = i ? NULL : &controls[1]; regs[i].reg = (initial + i) % 7;
+  }
+  check(macaudio_spk_take_hpfs(&ma) == 0, "capture DT corner", "HPF");
+  check(macaudio_spk_set_hpf(&ma, false) == 0, "floor", "HPF");
+  check(regs[0].reg == 6 && regs[1].reg == 6, "safe 800 Hz", "HPF");
+  check(macaudio_spk_set_hpf(&ma, true) == 0, "grant", "HPF");
+  for (i = 0; i < 2; i++) check(regs[i].reg == (initial + i) % 7, "restore each amp DT corner", "HPF");
+  free(ma.spk_hpfs); free(ma.spk_hpf_granted);
+ }
+}
 int main(void)
 {
  int values[] = {0, 1, 2, 3, -1}; unsigned int p;
+ sense_scenario();
+ route_scenario();
+ hpf_scenario();
  for (p = 0; p < sizeof(values) / sizeof(values[0]); p++) {
   please_blow_up_my_speakers = values[p];
   scenario(AMP_SN012776, "* Tweeter ", true, true);
@@ -196,8 +324,22 @@ def main():
              function(core, "snd_ctl_elem_write"),
              function(ops, "snd_soc_deactivate_kctl"),
              function(ops, "soc_set_enum_kctl"), function(ops, "snd_soc_set_enum_kctl")]
+    if "static void macaudio_deny_write(" in ma:
+        parts.append(function(ma, "macaudio_deny_write"))
     if "static int macaudio_set_fixed_enum(" in ma:
         parts.append(function(ma, "macaudio_set_fixed_enum"))
+    if "static const char *macaudio_speaker_hpf(" in ma:
+        parts += re.findall(r"^#define MACAUDIO_\w*HPF\w*\s.*$", ma, re.M)
+        parts.append(function(ma, "macaudio_speaker_hpf"))
+    parts += re.findall(r"^#define MACAUDIO_\w*HPF\w*\s.*$", ma, re.M)
+    parts += [function(ma, "macaudio_sense_owner_check"),
+              function(ma, "macaudio_sense_write_check"),
+              *([function(ma, "macaudio_route_check"), function(ma, "macaudio_route_write_check")]
+                if "static int macaudio_route_write_check(" in ma else []),
+              function(ma, "macaudio_protect_sense"),
+              function(ma, "macaudio_enum_item"),
+              function(ma, "macaudio_spk_take_hpfs"),
+              function(ma, "macaudio_spk_set_hpf")]
     parts += [ma[ma.index("#define CHECK(call,"):ma.index("static int macaudio_set_speaker(")],
               function(ma, "macaudio_set_speaker"), MAIN]
     with tempfile.TemporaryDirectory(prefix="macaudio-fixed-") as temp:

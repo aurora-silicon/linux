@@ -18,6 +18,8 @@
 	aliases {
 		atcphy4 = &atcphy0_die1;
 		atcphy5 = &atcphy1_die1;
+		rtc0 = &smc_rtc;
+		rtc1 = &pmu_rtc;
 		usb4-4-acio = &usb4_0_acio_die1;
 		usb4-4-nhi = &usb4_0_nhi_die1;
 		usb4-5-acio = &usb4_1_acio_die1;
@@ -300,3 +302,5 @@
 };
 
 #include "hwmon-fan-dual.dtsi"
+
+#include "t6002-j375d-control.dtsi"

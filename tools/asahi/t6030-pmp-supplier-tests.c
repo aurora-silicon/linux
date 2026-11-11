@@ -159,6 +159,17 @@ static bool of_machine_is_compatible(const char *name)
 {
 	return !strcmp(machine, name);
 }
+/* As in <linux/soc/apple/t8132.h>. */
+static inline bool apple_t8132_air(void)
+{
+	return of_machine_is_compatible("apple,j713") ||
+	       of_machine_is_compatible("apple,j715");
+}
+/* The qualified-firmware term: these harnesses model no /chosen. */
+static inline bool apple_t8132_firmware_path(void)
+{
+	return apple_t8132_air();
+}
 static struct device_node *of_find_compatible_node(struct device_node *from,
 						   const char *type,
 						   const char *compat)

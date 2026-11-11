@@ -2474,6 +2474,8 @@ next:
 		if (ret)
 			break;
 	}
+	if (snd_soc_link_trigger_refused(fe->dai_link, ret))
+		return ret;
 	return soc_pcm_ret(fe, ret);
 }
 EXPORT_SYMBOL_GPL(dpcm_be_dai_trigger);
@@ -2507,6 +2509,8 @@ static int dpcm_dai_trigger_fe_be(struct snd_pcm_substream *substream,
 		ret = soc_pcm_trigger(substream, cmd);
 	}
 end:
+	if (snd_soc_link_trigger_refused(fe->dai_link, ret))
+		return ret;
 	return snd_soc_ret(fe->dev, ret, "trigger FE cmd: %d failed\n", cmd);
 }
 

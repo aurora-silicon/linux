@@ -117,6 +117,7 @@ void apr_frame_budget(enum apr_profile profile, u32 width, u32 height,
 		      u32 *target, u32 *max);
 u32 apr_slice_count(u32 width, u32 height, u32 log2_slice);
 int apr_build_desc(const struct apr_frame *f, u8 *desc);
+int apr_build_desc_v0(const struct apr_frame *f, u8 *desc);
 int apr_check_output(const u8 *out, size_t capacity, u32 *frame_bytes);
 
 #endif

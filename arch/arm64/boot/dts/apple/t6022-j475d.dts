@@ -110,3 +110,7 @@
 	compatible = "apple,j475-macaudio", "apple,j375-macaudio", "apple,macaudio";
 	model = "Mac Studio J475";
 };
+
+#include "t6022-peripherals.dtsi"
+
+#include "t6022-j475d-peripherals.dtsi"

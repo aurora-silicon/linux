@@ -14,9 +14,9 @@
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 #include <linux/pm_wakeup.h>
-#include <linux/suspend.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/rtkit-helper.h>
+#include <linux/soc/apple/t8132.h>
 #include <linux/string.h>
 #include <linux/suspend.h>
 
@@ -277,15 +277,15 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 		count = apple_rtkit_helper_inherit_buffers(helper, buffers);
 		if (count < 0)
 			return dev_err_probe(dev, count, "Invalid inherited RTKit buffers\n");
-		if ((of_machine_is_compatible("apple,j713") &&
+		if ((apple_t8132_live_mtp() &&
 		     of_device_is_compatible(dev->of_node, "apple,t8132-mtp")) ||
 		    (of_machine_is_compatible("apple,j614s") &&
-		     of_device_is_compatible(dev->of_node, "apple,t6041-mtp")))
+		     of_device_is_compatible(dev->of_node, "apple,t6041-mtp")) ||
+		    of_device_is_compatible(dev->of_node, "apple,t8142-mtp"))
 			helper->preserved = true;
 	}
 
-	if (!live && of_machine_is_compatible("apple,j713") &&
-	    of_machine_is_compatible("apple,t8132")) {
+	if (!live && apple_t8132_live_mtp() && of_machine_is_compatible("apple,t8132")) {
 		struct property *prop;
 		u32 inherited;
 		int len;
@@ -415,6 +415,7 @@ static int __maybe_unused apple_rtkit_helper_freeze(struct device *dev)
 {
 	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
 
+	/* A hibernation image cannot recreate the firmware's live DMA ownership. */
 	return helper->adopted ? -EBUSY : 0;
 }
 
@@ -436,7 +437,6 @@ MODULE_DEVICE_TABLE(of, apple_rtkit_helper_of_match);
 static struct platform_driver apple_rtkit_helper_driver = {
 	.driver = {
 		.name = "rtkit-helper",
-		.pm = pm_sleep_ptr(&apple_rtkit_helper_pm_ops),
 		.of_match_table = apple_rtkit_helper_of_match,
 		/* The live MTP input session is announced only once per boot. */
 		.suppress_bind_attrs = true,

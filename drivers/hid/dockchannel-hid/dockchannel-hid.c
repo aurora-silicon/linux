@@ -224,6 +224,9 @@ struct dockchannel_hid {
 
 	/* Workqueue to asynchronously create HID devices */
 	struct workqueue_struct *new_iface_wq;
+
+	/* Held while one frame is written to the shared TX FIFO */
+	struct mutex tx_mutex;
 };
 
 static ssize_t apple_layout_id_show(struct device *dev,
@@ -262,6 +265,11 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 		of_node = of_get_child_by_name(dchid->dev->of_node, name);
 		if (!of_node) {
 			dev_dbg(dchid->dev, "No OF node for subdevice %s, ignoring\n", name);
+			return NULL;
+		}
+		if (!of_device_is_available(of_node)) {
+			dev_dbg(dchid->dev, "Subdevice %s is disabled, ignoring\n", name);
+			of_node_put(of_node);
 			return NULL;
 		}
 
@@ -342,7 +350,7 @@ static bool dchid_verify_checksum(struct dchid_hdr *hdr, void *data, u32 *checks
 	return *checksum == U32_MAX;
 }
 
-static int dchid_send(struct dchid_iface *iface, u32 flags, void *msg, size_t size)
+static int dchid_send_frame(struct dchid_iface *iface, u32 flags, void *msg, size_t size)
 {
 	u32 checksum = 0xffffffff;
 	size_t wsize = round_down(size, 4);
@@ -391,6 +399,23 @@ static int dchid_send(struct dchid_iface *iface, u32 flags, void *msg, size_t si
 		return ret;
 
 	return 0;
+}
+
+/*
+ * A frame goes out as several FIFO writes, and each interface has its own
+ * output lock, so frames for two interfaces could interleave in the shared
+ * FIFO. The MTP firmware then fails the frame checksum and crashes
+ * ("[dock ch tl]: xsum err"). Write whole frames only.
+ */
+static int dchid_send(struct dchid_iface *iface, u32 flags, void *msg, size_t size)
+{
+	struct dockchannel_hid *dchid = iface->dchid;
+	int ret;
+
+	mutex_lock(&dchid->tx_mutex);
+	ret = dchid_send_frame(iface, flags, msg, size);
+	mutex_unlock(&dchid->tx_mutex);
+	return ret;
 }
 
 static int dchid_cmd(struct dchid_iface *iface, u32 type, u32 req,
@@ -535,7 +560,8 @@ static int dchid_register_ring(struct dockchannel_hid *dchid)
 /*
  * Power method 2: announce the transition, drive the AFE reset line to the
  * new state and confirm the transition. The reset is asserted for a power-off
- * and held for 50 ms, and released for a power-on.
+ * and held for 50 ms, and released for a power-on and given 50 ms to settle
+ * before the transition is confirmed.
  */
 static int dchid_pm2_set_power(struct dchid_iface *iface, u8 state)
 {
@@ -553,12 +579,23 @@ static int dchid_pm2_set_power(struct dchid_iface *iface, u8 state)
 		if (state == DCHID_POWER_STATE_ON)
 			fsleep(50 * USEC_PER_MSEC);
 	} else {
-		ret = gpiod_set_value_cansleep(dchid->afe_reset,
-					       state == DCHID_POWER_STATE_OFF);
-		if (ret < 0)
+		bool off = state == DCHID_POWER_STATE_OFF;
+
+		ret = gpiod_set_value_cansleep(dchid->afe_reset, off);
+		if (ret < 0) {
+			dev_err(dchid->dev, "%s: failed to %s the AFE reset: %d\n",
+				iface->name, off ? "assert" : "release", ret);
 			return ret;
-		if (state == DCHID_POWER_STATE_OFF)
-			fsleep(50 * USEC_PER_MSEC);
+		}
+		dev_dbg(dchid->dev, "%s: AFE reset %s\n", iface->name,
+			off ? "asserted" : "released");
+		/*
+		 * The sequence validated on J716s (M5 Pro, MTP firmware
+		 * 6320.86.1, "Touch MT ready" on 3 of 3 boots) also waits
+		 * 50 ms after the release before HasChanged, as the
+		 * firmware-managed path above does.
+		 */
+		fsleep(50 * USEC_PER_MSEC);
 	}
 
 	dchid_pm2_command(iface->index, state, true, msg);
@@ -1566,6 +1603,7 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	}
 
 	dchid->dev = dev;
+	mutex_init(&dchid->tx_mutex);
 	stm = device_get_named_child_node(dev, "stm");
 	dchid->id_ready = !stm || !fwnode_device_is_available(stm);
 	fwnode_handle_put(stm);

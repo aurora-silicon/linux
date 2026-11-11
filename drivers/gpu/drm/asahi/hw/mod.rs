@@ -15,10 +15,14 @@ pub(crate) mod t600x;
 pub(crate) mod t602x;
 pub(crate) mod t6040;
 pub(crate) mod t6041;
+mod t6041_25g83;
 mod t604x;
 pub(crate) mod t8103;
 pub(crate) mod t8112;
 pub(crate) mod t8140;
+pub(crate) mod t6050;
+#[cfg(CONFIG_DRM_ASAHI_G18)]
+pub(crate) mod t8152;
 
 /// GPU generation enumeration. Note: Part of the UABI.
 #[derive(Debug, PartialEq, Copy, Clone)]

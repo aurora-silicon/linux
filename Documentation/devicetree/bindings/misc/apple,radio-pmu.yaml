@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/misc/apple,radio-pmu.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple radio power management follower
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  SPMI radio power-management follower. The firmware controls its power
+  policy; this node only describes its address on the SPMI bus.
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t6041-radio-pmu
+          - apple,t6000-wifibt-pmu
+          - apple,t6000-uwb-pmu
+          - apple,t8112-wifibt-pmu
+      - const: apple,radio-pmu
+
+  reg:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false

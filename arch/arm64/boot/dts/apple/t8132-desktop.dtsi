@@ -1,0 +1,28 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple M4 Mac mini and iMac 24" (2024)
+ *
+ * This file contains parts common to the T8132 desktops.
+ *
+ * target-type: J623, J624, J773g
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+#include "t8132-jxxx.dtsi"
+#include "t8132-apcie-port2.dtsi"
+
+/ {
+	aliases {
+		ethernet0 = &ethernet0;
+	};
+};
+
+/* The Gigabit Ethernet controller (ADT pci-bridge2/lan-1gb). */
+&port02 {
+	ethernet0: ethernet@0,0 {
+		reg = <0x20000 0x0 0x0 0x0 0x0>;
+		/* To be filled by the loader */
+		local-mac-address = [00 10 18 00 00 00];
+	};
+};

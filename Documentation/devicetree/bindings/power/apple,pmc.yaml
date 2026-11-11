@@ -26,8 +26,11 @@ properties:
   compatible:
     enum:
       - apple,t6041-pmc
+      - apple,t6050-pmc
       - apple,t8132-pmc
       - apple,t8140-pmc
+      - apple,t8142-pmc
+      - apple,t8152-pmc
 
   reg:
     minItems: 2
@@ -35,8 +38,10 @@ properties:
     description: |
       The perf-state floor words of the voter agents ("voters"), and the
       per-agent words holding the floor the PMC honours for each agent with
-      the per-rail interface enable words ("rails"). Optionally, the cluster
-      enable control word followed by its status word ("clusters").
+      the per-rail interface enable words ("rails"); on T8132 the rails
+      block also holds the bandwidth request and boost interface enable
+      words. Optionally, the cluster enable control word followed by its
+      status word ("clusters").
 
   reg-names:
     description: |
@@ -178,6 +183,59 @@ patternProperties:
       - '#power-domain-cells'
       - apple,cluster-bit
 
+  '^interface-[a-z0-9-]+$':
+    type: object
+    description: |
+      A display pipe's interface enables, provided as a power domain. The
+      bandwidth request (BWR) and boost interfaces each have an enable word
+      with one bit per agent, and the PMC ignores the pipe's bandwidth and
+      boost votes while its bits are clear. Both bits are set after the
+      parent domain powers on, and cleared before it powers off.
+    additionalProperties: false
+
+    properties:
+      label:
+        description: Name of the power domain.
+
+      '#power-domain-cells':
+        const: 0
+
+      power-domains:
+        maxItems: 1
+        description: Domain that must be powered while the enables are set.
+
+      apple,bwr-bit:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        maximum: 31
+        description: Bit of the pipe in the BWR interface enable word.
+
+      apple,boost-bit:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        maximum: 31
+        description: Bit of the pipe in the boost interface enable word.
+
+      apple,consumer-switched:
+        type: boolean
+        description: |
+          Not a power domain. The pipe's power is firmware-owned, and the
+          display coprocessor that refers to this node (apple,pmc-interface)
+          clears the bits before it powers the pipe down and gives them back
+          the values they had after it powers the pipe up again.
+
+    required:
+      - apple,bwr-bit
+      - apple,boost-bit
+
+    oneOf:
+      - required:
+          - '#power-domain-cells'
+          - power-domains
+      - required:
+          - apple,consumer-switched
+        properties:
+          '#power-domain-cells': false
+          power-domains: false
+
   '^performance-controller@[0-9a-f]+$':
     type: object
     description: The host performance controller's voter agent.
@@ -185,10 +243,16 @@ patternProperties:
 
     properties:
       compatible:
-        enum:
-          - apple,t6041-clpc
-          - apple,t8132-clpc
-          - apple,t8140-clpc
+        oneOf:
+          - items:
+              - const: apple,t6050-clpc
+              - const: apple,t6041-clpc
+          - enum:
+              - apple,t6041-clpc
+              - apple,t8132-clpc
+              - apple,t8140-clpc
+              - apple,t8142-clpc
+              - apple,t8152-clpc
 
       reg:
         maxItems: 1
@@ -206,6 +270,17 @@ required:
   - compatible
   - reg
   - reg-names
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              const: apple,t8132-pmc
+    then:
+      patternProperties:
+        '^interface-[a-z0-9-]+$': false
 
 additionalProperties: false
 
@@ -242,6 +317,30 @@ examples:
                 #power-domain-cells = <0>;
                 apple,rail = <1>;
                 apple,level = <2>;
+            };
+        };
+    };
+
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        power-management@382800000 {
+            compatible = "apple,t8132-pmc";
+            reg = <0x3 0x82800000 0x0 0x10000>,
+                  <0x3 0x828aa000 0x0 0x3000>;
+            reg-names = "voters", "rails";
+            #address-cells = <1>;
+            #size-cells = <0>;
+            apple,static-voters = <3>;
+
+            interface-dispext0 {
+                label = "dispext0-interface";
+                #power-domain-cells = <0>;
+                power-domains = <&ps_dispext0_sys>;
+                apple,bwr-bit = <3>;
+                apple,boost-bit = <1>;
             };
         };
     };

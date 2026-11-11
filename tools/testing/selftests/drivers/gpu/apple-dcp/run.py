@@ -83,7 +83,9 @@ def main():
         ('m4', 'm4-common-plane', m4.plane, ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
         ('m4', 'm4-producer-retirement', m4.prepare, ((),), ('-Wno-unused-function',)),
         ('m4', 'm4-dpms-retirement', m4.blank, ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
+        ('m4', 'm4-power-gate', m4.gate, ((),), ('-Wno-unused-function',)),
         ('m4', 'm4-dart-consumer', m4.dart, ((),), ('-Wno-unused-function',)),
+        ('m4', 'm4-panel-timing', m4.timing, ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
         ('boot', 'oslog-events', boot.oslog, ((),), ()),
         ('boot', 'syslog-policy', boot.syslog, ((),), ()),
         ('edid', 'dpavserv-start', edid.startup, ((),), ()),
@@ -153,7 +155,9 @@ def main():
                           '#define iomfb_m4_get_mode(...) (-95)\n'
                           '#define iomfb_m4_blank(...) (-95)\n')
                 if 'dcp_fail_stop(' in unit:
+                    # Firmware 27 fail-stops like H17P; no fixture here runs firmware 27.
                     prefix += ('struct apple_dcp;\n'
+                               '#define DCP_FIRMWARE_V_27_0 0x2700\n'
                                'static inline bool dcp_fail_stop(const struct apple_dcp *dcp);\n')
                     unit += '\n' + block((apple / 'dcp-internal.h').read_text(),
                                           'static inline bool dcp_fail_stop(')
