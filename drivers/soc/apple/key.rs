@@ -766,9 +766,9 @@ mod tests {
     }
 
     #[test]
-    fn version_three_lists_cancel_and_seal() {
+    fn version_four_lists_cancel_seal_and_password() {
         let i = info();
-        assert_eq!(i.version, 3);
+        assert_eq!(i.version, 4);
         assert_eq!(i.features, FEATURE_CANCEL | FEATURE_SEAL);
         assert_eq!(info_for(true).features, FEATURE_CANCEL | FEATURE_SEAL | FEATURE_PASSWORD);
         assert_eq!(info_for(true).features & FEATURE_PERSISTENT_ATTEMPTS, 0);
