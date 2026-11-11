@@ -237,8 +237,8 @@ static void macsmc_sleep_order_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, ctx->smc.ap_notified);
 	KUNIT_EXPECT_FALSE(test, ctx->smc.sleep_warned);
 
-	/* As in the trace, values included: WKTP's 2 comes before 'slpa'. */
-	KUNIT_ASSERT_EQ(test, ctx->seen_count, 8U);
+	/* As on macOS, values included: WKTP's 2 comes before 'slpa', its 0 ends the wake. */
+	KUNIT_ASSERT_EQ(test, ctx->seen_count, 9U);
 	KUNIT_EXPECT_EQ(test, ctx->seen[0], SMC_KEY(slpw));
 	KUNIT_EXPECT_EQ(test, ctx->seen[1], 2U);
 	KUNIT_EXPECT_EQ(test, ctx->seen[2], SMC_KEY(slpa));
@@ -247,6 +247,8 @@ static void macsmc_sleep_order_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ctx->seen[5], SMC_KEY(MBSE));
 	KUNIT_EXPECT_EQ(test, ctx->seen[6], SMC_KEY(MBSW));
 	KUNIT_EXPECT_EQ(test, ctx->seen[7], SMC_KEY(waka));
+	KUNIT_EXPECT_EQ(test, ctx->seen[8], 0U);
+	KUNIT_EXPECT_FALSE(test, ctx->smc.wake_silent);
 }
 
 static void macsmc_test_outbox_poll(struct apple_smc *smc, const char *after,
@@ -290,6 +292,13 @@ static void macsmc_sleep_refused_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ctx->seen[1], SMC_KEY(slpa));
 	KUNIT_EXPECT_EQ(test, ctx->seen[2], (u32)MACSMC_TEST_AP_IDLE);
 	KUNIT_EXPECT_EQ(test, ctx->seen[3], (u32)MACSMC_TEST_AP_ON);
+
+	/* The key the commit wrote is taken back when the sleep ends, once. */
+	KUNIT_EXPECT_TRUE(test, ctx->smc.wake_silent);
+	apple_smc_wake_full(&ctx->smc);
+	apple_smc_wake_full(&ctx->smc);
+	KUNIT_ASSERT_EQ(test, ctx->seen_count, 5U);
+	KUNIT_EXPECT_EQ(test, ctx->seen[4], 0U);
 }
 
 static void macsmc_notice_test(struct kunit *test)
