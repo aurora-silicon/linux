@@ -48,7 +48,8 @@ impl InitData {
         Ok(self.object(self.bundle)?.word(at)?.load(Ordering::Relaxed))
     }
 
-    pub(crate) fn note_m5_submission_history(&self) -> Result {
+    /// Counts `submissions` in the firmware's submission history, in the slot of this moment.
+    pub(crate) fn note_m5_submission_history(&self, submissions: u8) -> Result {
         if !self.m5 { return Err(EINVAL); }
         let private = self.object(self.cluster)?;
         let base = m::M5_PRIVATE_LAYOUT.status_config;
@@ -81,7 +82,7 @@ impl InitData {
             // SAFETY: retained, bounds-checked WC byte, written as a single byte
             // after reading the even, stable generation, as the firmware expects.
             unsafe {
-                let value = core::ptr::read_volatile(byte).wrapping_add(1);
+                let value = core::ptr::read_volatile(byte).wrapping_add(submissions);
                 core::ptr::write_volatile(byte, value);
             };
             fence(Ordering::SeqCst);

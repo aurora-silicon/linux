@@ -1559,7 +1559,7 @@ impl compute::Host for ComputeHost<'_> {
         // Every M5 pipe-2 doorbell (0x83) is noted in the firmware's submission history first,
         // as the render doorbell notes its pair.
         if self.init.is_m5() && message >> super::MSG_TYPE_SHIFT == 0x83 && message & 3 == 2 {
-            if let Err(error) = self.init.note_m5_submission_history() {
+            if let Err(error) = self.init.note_m5_submission_history(1) {
                 pr_warn!("asahi: M5 submission history skipped: {:?}\n", error);
             }
         }

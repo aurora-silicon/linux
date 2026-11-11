@@ -724,11 +724,10 @@ impl crate::g17::queue::render::Host for Host<'_> {
         self.release_registration();
         let m5 = self.firmware.init.is_m5();
         if m5 {
-            // A paired publication is one tiling and one fragment submission.
-            for _ in 0..2 {
-                if let Err(error) = self.firmware.init.note_m5_submission_history() {
-                    pr_warn!("asahi: M5 submission history skipped: {:?}\n", error);
-                }
+            // A paired publication is one tiling and one fragment submission, counted in
+            // one slot.
+            if let Err(error) = self.firmware.init.note_m5_submission_history(2) {
+                pr_warn!("asahi: M5 submission history skipped: {:?}\n", error);
             }
         } else {
             crate::g17::trace::doorbell(crate::g17::trace::RENDER, || {
