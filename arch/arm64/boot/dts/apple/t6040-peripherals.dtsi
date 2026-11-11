@@ -126,7 +126,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1725 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&pcie_dart 17>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	/* ADT /arm-io/apcie1-piodma. */
@@ -138,7 +138,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1734 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&apcie1_dart 17>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	/* ADT /arm-io/apciec0-piodma. */
