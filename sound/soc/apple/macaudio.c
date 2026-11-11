@@ -4069,6 +4069,28 @@ struct macaudio_platform_cfg macaudio_j813_cfg = {
 	.spk_secondary_only = true,
 };
 
+/*
+ * J815 (T8142, MacBook Air M5 15"): J813's AOP-fed card with six SN012776,
+ * two woofers and a tweeter per side, in ADT speaker-config order (left
+ * woofer 1, right woofer 1, left tweeter, right tweeter, left woofer 2,
+ * right woofer 2: left in even slots, right in odd), and twelve V/I sense
+ * words on the same stream. Locked to the safe level until speakersafetyd
+ * holds the volume, as on J813. Each amp's level is its apple,speaker-config
+ * from the boot loader (15 on all six in the J815 ADT).
+ */
+struct macaudio_platform_cfg macaudio_j815_cfg = {
+	.enable_speakers = true,
+	.amp = AMP_SN012776,
+	.speakers = SPKR_2W1T,
+	.stereo = true,
+	.safe_vol = -20,
+	.fe_dai_names = { "j873-pcm-0", "j873-pcm-1", "j873-pcm-2" },
+	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_IB_NF,
+	.spk_dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
+		       SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
+	.spk_secondary_only = true,
+};
+
 struct macaudio_platform_cfg macaudio_j314_cfg = {
 	true,	AMP_SN012776,	SPKR_2W1T,	true,	0,	-20,
 };
@@ -4323,6 +4345,8 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j873-macaudio", .data = &macaudio_j873_cfg },
 	/* j813    AID?    sn012776    15      2x 1W+1T (AOP-fed, V/I sense) */
 	{ .compatible = "apple,j813-macaudio", .data = &macaudio_j813_cfg },
+	/* j815    AID43   sn012776    15      2x 2W+1T (AOP-fed, V/I sense) */
+	{ .compatible = "apple,j815-macaudio", .data = &macaudio_j815_cfg },
 	/* Fallback, jack only */
 	{ .compatible = "apple,macaudio"},
 	{ }
