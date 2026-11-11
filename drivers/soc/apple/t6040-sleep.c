@@ -3423,10 +3423,17 @@ static void t6040_atc_commons_on(struct t6040_sleep *s, u32 *timeouts)
  * 28/2c of the 4 ports now; atc_s2r (port mask) does the three writes + the ack poll right
  * before the timer, after the commons are up (fab_on bit 2). The 'ATCF' record at PMU 0xa240
  * (instead of 'FABS') keeps, per port, +0x04 and a word of +0x08/+0x24/+0x28/+0x2c low bytes.
+ *
+ * Port 3 carries the HDMI output's DisplayPort lanes and is always in that state. Any other
+ * port is too once a display runs on it in DP alternate mode: the engine then stalls on that
+ * port in the entry itself (seq 25, the same +0x2c write and +0x04 poll; port 0 with a
+ * display on it). A parked port and one the PHY driver put to sleep (USB3) already have
+ * +0x28 bit 0 set. So every port in the mask whose +0x28 bit 0 is still clear gets the three
+ * writes; the default mask is all four.
  */
-static unsigned int atc_s2r = 8;
+static unsigned int atc_s2r = 0xf;
 module_param(atc_s2r, uint, 0644);
-MODULE_PARM_DESC(atc_s2r, "Bring-up: port mask; the platform aciophy_s2r_entry's CFG writes (+0x2c, +0x08, +0x28 |= 1, poll +0x04 bit 8) right before the S2R timer");
+MODULE_PARM_DESC(atc_s2r, "Port mask: the CFG writes of the PHY S2R entry (+0x2c, +0x08, +0x28 |= 1, poll +0x04 bit 8) right before the S2R timer on each port that has not asked for its clock gate yet");
 static bool atc_rec = true;
 module_param(atc_rec, bool, 0644);
 MODULE_PARM_DESC(atc_rec, "Bring-up: record the 4 ATCPHY_CFG blocks at PMU 0xa240 right before the S2R timer (replaces 'FABS')");
@@ -3441,7 +3448,7 @@ static u32 t6040_atc_s2r_entry(struct t6040_sleep *s, unsigned int mask)
 	for (n = 0; n < 4; n++) {
 		void __iomem *c = s->atc_cfg[n];
 
-		if (!(mask & BIT(n)) || !c)
+		if (!(mask & BIT(n)) || !c || (readl(c + 0x28) & BIT(0)))
 			continue;
 		writel(readl(c + 0x2c) | BIT(0), c + 0x2c);
 		udelay(1);
