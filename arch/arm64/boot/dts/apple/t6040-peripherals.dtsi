@@ -23,7 +23,6 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 273 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_dwi>;
-		status = "disabled";
 	};
 
 	/* ADT /arm-io/aes. */

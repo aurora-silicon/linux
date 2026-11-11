@@ -832,11 +832,13 @@ impl Firmware {
         commit_accounting: impl FnOnce() -> Result,
         publish_inner: impl FnOnce(),
         deferred: bool,
+        cursors: Option<[u32; 3]>,
     ) -> Result<[u32; 2]> {
         let mut commit_accounting = Some(commit_accounting);
         let mut publish_inner = Some(publish_inner);
+        let mut cursors = cursors;
         for attempt in 0..2 {
-            let pair = self.init.m5_work_pair(priority, &records[0], &records[1])?;
+            let pair = self.init.m5_work_pair(priority, &records[0], &records[1], cursors.take())?;
             pair.prepare();
             if let Some(commit) = commit_accounting.take() { commit()?; }
             match self.bridge.regs.submit_m5_work(submission) {
@@ -919,8 +921,16 @@ impl Firmware {
         // given, and the state records, the M5 value (InitData::submission_effort).
         let published = init.submission_effort(effort, state.waited());
         port.set_effort_full(effort == power::FULL_EFFORT);
-        if state.applied() == published && init.effort()? == published {
-            return Ok(());
+        if state.applied() == published {
+            // M5 maps region C read-only to the firmware: once confirmed, the word holds
+            // `applied` without reading it back.
+            if init.is_m5() && state.confirmed() {
+                return Ok(());
+            }
+            if init.effort()? == published {
+                state.confirm();
+                return Ok(());
+            }
         }
         init.publish_effort(published)?;
         trace::message(trace::EFFORT, u64::from(published));

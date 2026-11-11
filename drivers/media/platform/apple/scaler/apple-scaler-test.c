@@ -439,6 +439,183 @@ static void asc_test_job(struct kunit *test)
 	}
 }
 
+/* Final register values of one macOS job on the MacBook Neo (addresses and tag left out) */
+static const struct asc_reg t_l8v0_from_nv12[] = {
+	{ 0x00080, 0x00000001 }, { 0x0008c, 0x0000ffff }, { 0x00098, 0xfffffffe },
+	{ 0x000e4, 0x00000000 }, { 0x000e8, 0x00000038 }, { 0x00124, 0x00000000 },
+	{ 0x00180, 0x0000000c }, { 0x00184, 0x00000001 }, { 0x00188, 0x00000006 },
+	{ 0x0018c, 0x00000000 }, { 0x00190, 0x00000000 }, { 0x001d8, 0x00000780 },
+	{ 0x001dc, 0x00000780 }, { 0x001e8, 0x00000000 }, { 0x001ec, 0x00000000 },
+	{ 0x001f0, 0x00000000 }, { 0x001f8, 0x03000102 }, { 0x001fc, 0x00000780 },
+	{ 0x00200, 0x00000438 }, { 0x00234, 0x00000780 }, { 0x00238, 0x000003c0 },
+	{ 0x0023c, 0x00000780 }, { 0x00244, 0x00000438 }, { 0x00248, 0x0000021c },
+	{ 0x0024c, 0x00000438 }, { 0x00280, 0x0000000c }, { 0x00284, 0x00008078 },
+	{ 0x00288, 0x00008046 }, { 0x0028c, 0x00008040 }, { 0x002c0, 0x0000f000 },
+	{ 0x002c4, 0x00007800 }, { 0x002cc, 0x00000000 }, { 0x002d0, 0x00000000 },
+	{ 0x002d4, 0x00000000 }, { 0x002d8, 0x03000102 }, { 0x002dc, 0x00000780 },
+	{ 0x002e0, 0x00000438 }, { 0x00308, 0x00000780 }, { 0x0030c, 0x000003c0 },
+	{ 0x00310, 0x00000780 }, { 0x00314, 0x00000438 }, { 0x00318, 0x0000021c },
+	{ 0x0031c, 0x00000438 }, { 0x00380, 0x00000000 }, { 0x00480, 0x00000000 },
+	{ 0x00800, 0x0000000c }, { 0x00804, 0x00000000 }, { 0x00808, 0x00000800 },
+	{ 0x0080c, 0x00000800 }, { 0x00810, 0x00000000 }, { 0x00814, 0x00000000 },
+	{ 0x00818, 0x00000800 }, { 0x0081c, 0x00000800 }, { 0x00820, 0x00000000 },
+	{ 0x00824, 0x0000000c }, { 0x00900, 0x00000000 }, { 0x00a00, 0x00000000 },
+	{ 0x01000, 0x00000002 }, { 0x01004, 0x00000000 }, { 0x01008, 0x00000000 },
+	{ 0x0100c, 0x00400000 }, { 0x01010, 0x00400000 }, { 0x01014, 0x00400000 },
+	{ 0x01018, 0x00400000 }, { 0x0101c, 0x00000000 }, { 0x01020, 0x00400000 },
+	{ 0x01024, 0x00400000 }, { 0x02000, 0x00000002 }, { 0x02004, 0x00000000 },
+	{ 0x02008, 0x00000000 }, { 0x0200c, 0x00400000 }, { 0x02010, 0x00400000 },
+	{ 0x02014, 0x00400000 }, { 0x02018, 0x00400000 }, { 0x0201c, 0x00000000 },
+	{ 0x02020, 0x00400000 }, { 0x02024, 0x00400000 }, { 0x03000, 0x00000000 },
+	{ 0x03800, 0x000e0000 }, { 0x07418, 0xffffffff }, { 0x13800, 0x00000000 },
+	{ 0x13804, 0x00000000 }, { 0x13808, 0x00000000 }, { 0x1380c, 0x00000000 },
+	{ 0x13810, 0x00000008 }, { 0x13814, 0x00000028 }, { 0x13818, 0x00000028 },
+	{ 0x1381c, 0x00000020 }, { 0x13c00, 0x00000001 }, { 0x13c04, 0x00000000 },
+	{ 0x13c10, 0x00000008 }, { 0x13c14, 0x00000028 }, { 0x13c18, 0x00000028 },
+	{ 0x13c1c, 0x00000020 }, { 0x16000, 0x00000000 }, { 0x16080, 0x00000000 },
+	{ 0x16084, 0x0b710367 }, { 0x16088, 0x00000128 }, { 0x16504, 0x02000500 },
+	{ 0x16508, 0x00003200 }, { 0x1651c, 0x00851400 }, { 0x16534, 0x00000008 },
+	{ 0x16568, 0x00250500 }, { 0x16588, 0x00496513 }, { 0x16600, 0x00000015 },
+	{ 0x16800, 0x00000000 }, { 0x25080, 0x00000000 }, { 0x2e300, 0x03804038 },
+	{ 0x2e304, 0xa0a0a0a0 }, { 0x2e308, 0x02550000 }, { 0x2e30c, 0x02550255 },
+	{ 0x2e310, 0x00000000 }, { 0x2e314, 0x00100008 }, { 0x2e318, 0x02550000 },
+};
+
+/* Final register values of one macOS job on the MacBook Neo (addresses and tag left out) */
+static const struct asc_reg t_l8v0_to_nv12[] = {
+	{ 0x00080, 0x00000001 }, { 0x0008c, 0x0000ffff }, { 0x00098, 0xfffffffe },
+	{ 0x000e4, 0x00000000 }, { 0x000e8, 0x00000038 }, { 0x00124, 0x00000000 },
+	{ 0x00180, 0x0000000c }, { 0x00184, 0x00000078 }, { 0x00188, 0x00000046 },
+	{ 0x0018c, 0x00000040 }, { 0x00190, 0x00000040 }, { 0x001d8, 0x0000f000 },
+	{ 0x001dc, 0x00007800 }, { 0x001e8, 0x00000000 }, { 0x001ec, 0x00000000 },
+	{ 0x001f0, 0x00000000 }, { 0x001f8, 0x03000102 }, { 0x001fc, 0x00000780 },
+	{ 0x00200, 0x00000438 }, { 0x00234, 0x00000780 }, { 0x00238, 0x000003c0 },
+	{ 0x0023c, 0x00000780 }, { 0x00244, 0x00000438 }, { 0x00248, 0x0000021c },
+	{ 0x0024c, 0x00000438 }, { 0x00280, 0x0000000c }, { 0x00284, 0x00008001 },
+	{ 0x00288, 0x00008006 }, { 0x0028c, 0x00008000 }, { 0x002c0, 0x00000780 },
+	{ 0x002c4, 0x00000780 }, { 0x002cc, 0x00000000 }, { 0x002d0, 0x00000000 },
+	{ 0x002d4, 0x00000000 }, { 0x002d8, 0x03000102 }, { 0x002dc, 0x00000780 },
+	{ 0x002e0, 0x00000438 }, { 0x00308, 0x00000780 }, { 0x0030c, 0x000003c0 },
+	{ 0x00310, 0x00000780 }, { 0x00314, 0x00000438 }, { 0x00318, 0x0000021c },
+	{ 0x0031c, 0x00000438 }, { 0x00380, 0x00000000 }, { 0x00480, 0x00000000 },
+	{ 0x00800, 0x0000000c }, { 0x00804, 0x00000000 }, { 0x00808, 0x00000800 },
+	{ 0x0080c, 0x00000800 }, { 0x00810, 0x00000000 }, { 0x00814, 0x00000000 },
+	{ 0x00818, 0x00000800 }, { 0x0081c, 0x00000800 }, { 0x00820, 0x00000000 },
+	{ 0x00824, 0x0000000c }, { 0x00900, 0x00000000 }, { 0x00a00, 0x00000000 },
+	{ 0x01000, 0x00000002 }, { 0x01004, 0x00000000 }, { 0x01008, 0x00000000 },
+	{ 0x0100c, 0x00400000 }, { 0x01010, 0x00400000 }, { 0x01014, 0x00400000 },
+	{ 0x01018, 0x00400000 }, { 0x0101c, 0x00000000 }, { 0x01020, 0x00400000 },
+	{ 0x01024, 0x00400000 }, { 0x02000, 0x00000002 }, { 0x02004, 0x00000000 },
+	{ 0x02008, 0x00000000 }, { 0x0200c, 0x00400000 }, { 0x02010, 0x00400000 },
+	{ 0x02014, 0x00400000 }, { 0x02018, 0x00400000 }, { 0x0201c, 0x00000000 },
+	{ 0x02020, 0x00400000 }, { 0x02024, 0x00400000 }, { 0x03000, 0x00000000 },
+	{ 0x03800, 0x000e0000 }, { 0x07418, 0xffffffff }, { 0x13800, 0x00000000 },
+	{ 0x13804, 0x00000000 }, { 0x13808, 0x00000000 }, { 0x1380c, 0x00000000 },
+	{ 0x13810, 0x00000008 }, { 0x13814, 0x00000028 }, { 0x13818, 0x00000028 },
+	{ 0x1381c, 0x00000020 }, { 0x13c00, 0x00000001 }, { 0x13c04, 0x00000000 },
+	{ 0x13c10, 0x00000008 }, { 0x13c14, 0x00000028 }, { 0x13c18, 0x00000028 },
+	{ 0x13c1c, 0x00000020 }, { 0x16000, 0x00000000 }, { 0x16080, 0x00000000 },
+	{ 0x16084, 0x0b710367 }, { 0x16088, 0x00000128 }, { 0x16504, 0x02000500 },
+	{ 0x16508, 0x00003200 }, { 0x1651c, 0x00851400 }, { 0x16534, 0x00000008 },
+	{ 0x16568, 0x00250500 }, { 0x16588, 0x00496513 }, { 0x16600, 0x00000015 },
+	{ 0x16800, 0x00000000 }, { 0x25080, 0x00000000 }, { 0x2e300, 0x03804038 },
+	{ 0x2e304, 0xa0a0a0a0 }, { 0x2e308, 0x02550000 }, { 0x2e30c, 0x02550255 },
+	{ 0x2e310, 0x00000000 }, { 0x2e314, 0x00100008 }, { 0x2e318, 0x02550000 },
+};
+
+/* Layout of a 1080p lossless picture: the AVE temporal filter's surface. */
+static void asc_test_lossless_geom(struct kunit *test)
+{
+	struct asc_lossless_geom g;
+
+	asc_lossless_geom(1920, 1080, &g);
+	KUNIT_EXPECT_EQ(test, g.tiles_x, 60);
+	KUNIT_EXPECT_EQ(test, g.y_pitch, 0xf000);
+	KUNIT_EXPECT_EQ(test, g.y_meta, 0x1fe000);
+	KUNIT_EXPECT_EQ(test, g.c, 0x21e000);
+	KUNIT_EXPECT_EQ(test, g.c_pitch, 0x7800);
+	KUNIT_EXPECT_EQ(test, g.c_meta, 0x31d000);
+	KUNIT_EXPECT_EQ(test, g.bytes, 0x325000);
+}
+
+static u32 t_final(const struct asc_reg *w, int n, u32 off, bool *found)
+{
+	u32 val = 0;
+
+	*found = false;
+	for (int j = 0; j < n; j++)
+		if (w[j].off == off) {
+			val = w[j].val;
+			*found = true;
+		}
+	return val;
+}
+
+/*
+ * NV12 <-> lossless at 1080p on the MacBook Neo (MSR22): every register macOS
+ * set ends with the same value, and the four planes of the lossless side
+ * sit at the picture's region offsets.
+ */
+static void asc_test_job_lossless(struct kunit *test)
+{
+	const struct {
+		const struct asc_reg *expect;
+		unsigned int n;
+		bool to_lossless;
+	} cases[] = {
+		{ t_l8v0_from_nv12, ARRAY_SIZE(t_l8v0_from_nv12), true },
+		{ t_l8v0_to_nv12, ARRAY_SIZE(t_l8v0_to_nv12), false },
+	};
+	const u64 lin = 0x10000000000ULL, cmp = 0x10001000000ULL;
+	struct asc_lossless_geom g;
+	struct asc_reg *w;
+
+	w = kunit_kcalloc(test, ASC_JOB_MAX_WRITES, sizeof(*w), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, w);
+	asc_lossless_geom(1920, 1080, &g);
+
+	for (unsigned int c = 0; c < ARRAY_SIZE(cases); c++) {
+		struct asc_image nv12 = {
+			.fmt = asc_find_format(V4L2_PIX_FMT_NV12),
+			.width = 1920, .height = 1080,
+			.dva = { lin, lin + 1920 * 1080 }, .stride = { 1920, 1920 },
+		};
+		struct asc_image l8 = {
+			.fmt = asc_find_format(V4L2_PIX_FMT_APPLE_L8V0),
+			.width = 1920, .height = 1080,
+			.dva = { cmp, cmp + g.c }, .meta = { cmp + g.y_meta, cmp + g.c_meta },
+			.stride = { g.y_pitch, g.c_pitch },
+		};
+		struct asc_job job = {
+			.src = cases[c].to_lossless ? nv12 : l8,
+			.dst = cases[c].to_lossless ? l8 : nv12,
+			.msr20 = true,
+		};
+		u32 m = cases[c].to_lossless ? 0x2a8 : 0x1b8;
+		u32 p = cases[c].to_lossless ? 0x290 : 0x198;
+		bool found;
+		int n;
+
+		KUNIT_ASSERT_NOT_NULL(test, l8.fmt);
+		n = asc_job_build(&job, w, ASC_JOB_MAX_WRITES);
+		KUNIT_ASSERT_GT(test, n, 0);
+		for (unsigned int i = 0; i < cases[c].n; i++) {
+			u32 val = t_final(w, n, cases[c].expect[i].off, &found);
+
+			KUNIT_EXPECT_TRUE_MSG(test, found, "case %u: %#x not written",
+					      c, cases[c].expect[i].off);
+			KUNIT_EXPECT_EQ_MSG(test, val, cases[c].expect[i].val,
+					    "case %u: register %#x", c,
+					    cases[c].expect[i].off);
+		}
+		KUNIT_EXPECT_EQ(test, t_final(w, n, p, &found), lower_32_bits(cmp));
+		KUNIT_EXPECT_EQ(test, t_final(w, n, p + 8, &found), lower_32_bits(cmp + g.c));
+		KUNIT_EXPECT_EQ(test, t_final(w, n, m, &found), lower_32_bits(cmp + g.y_meta));
+		KUNIT_EXPECT_EQ(test, t_final(w, n, m + 8, &found), lower_32_bits(cmp + g.c_meta));
+		KUNIT_EXPECT_EQ(test, t_final(w, n, m + 4, &found), upper_32_bits(cmp));
+	}
+}
+
 static void asc_test_job_rejects(struct kunit *test)
 {
 	struct asc_reg *w = kunit_kcalloc(test, ASC_JOB_MAX_WRITES, sizeof(*w), GFP_KERNEL);
@@ -469,6 +646,8 @@ static struct kunit_case asc_test_cases[] = {
 	KUNIT_CASE(asc_test_formats),
 	KUNIT_CASE_PARAM(asc_test_job, asc_job_gen_params),
 	KUNIT_CASE(asc_test_job_rejects),
+	KUNIT_CASE(asc_test_lossless_geom),
+	KUNIT_CASE(asc_test_job_lossless),
 	{}
 };
 

@@ -277,6 +277,7 @@
 };
 
 #include "hwmon-laptop.dtsi"
+#include "t8112-j413-hwmon-rails.dtsi"
 
 /*
  * GPU temperatures, after the channels the thermal zones index. The SMC

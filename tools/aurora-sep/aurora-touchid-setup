@@ -1,0 +1,1142 @@
+#!/usr/bin/python3
+"""Set up this Mac's Touch ID calibration.
+
+    aurora-touchid-setup                  set up what is missing
+    aurora-touchid-setup --check          report only, write nothing
+    aurora-touchid-setup --force-rebuild  rebuild and replace what differs
+    add --json for a machine-readable result
+
+The fingerprint sensor's driver loads per-device factory data that no
+package can ship. The sensor node's firmware-name list in the device tree
+names it, and the driver reads it as follows:
+  - the first entry is the calibration (apple/mesa_calibration.bin when the
+    node names none);
+  - the second entry is the sensor's signed root key, which sensors with a
+    nonce session load (MacBook Neo, M4 Pro). The driver's default is
+    apple/msrk-j700.bin when the node names only the calibration.
+
+Where the bytes come from, read-only:
+  - Macs whose factory cache holds an FSC2 calibration (J700, J713, J616s).
+    Each file is rebuilt from the factory records on the Hardware volume of
+    the iBoot System Container, in the layout the enclave loads:
+      comb { fdrd: IMG4 { IM4P, [0] seal-<CHIP>-<ECID> }, secb: trust bundle }
+    The seal must name this Mac's CHIP, ECID and serial number and cover the
+    record. The root key is rebuilt the same way from the MSRk record.
+  - Other Macs (M1, M2) keep a comb record in the container, which is
+    installed as carved.
+The enclave alone verifies the signatures; these are provenance and
+structure checks.
+
+When it runs. It is never routine boot work:
+  1. A file is missing. aurora-touchid-setup.service runs once at boot,
+     before Touch ID starts. A boot where every file is in place skips it,
+     on a condition that only checks that the files exist.
+  2. The enclave refused the installed file. aurora-sep-ready finds the
+     refusal in this boot's kernel log and starts the service once. The
+     file is replaced, with a rollback copy kept. There is at most one
+     automatic rebuild per boot.
+  3. The owner runs it, with --check for a report or --force-rebuild to
+     rebuild anyway.
+
+A file this tool did not install is never replaced, unless the enclave
+refused it this boot or --force-rebuild asks for it. Every replacement
+keeps the old bytes in /var/lib/aurora-sep/rollback. The new file is
+written atomically with mode 0600 and read back. The last result is in
+/var/lib/aurora-sep/touchid-setup.json, with one JSON line per run in
+touchid-setup.log.
+"""
+# The factory-record reader and the sealed-record rebuild below (the files,
+# DER, APFS and admission sections) are Erik Bourget's work, first proposed
+# in aurora-silicon/alarm-aurora#26, fedora-aurora#28 and nixos-aurora#27.
+# This tool runs them on demand, adds the root key and keeps his checks.
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+
+DEVICE = Path('/dev/disk/by-partlabel/iBootSystemContainer')
+STATE = Path('/var/lib/aurora-sep')
+RUN = Path('/run/aurora-sep')
+EXTRACTOR = Path('/usr/libexec/aurora/extract-mesa-calibration')
+DT = Path('/sys/firmware/devicetree/base')
+SOURCE_LIMIT = 4 * 1024 * 1024
+RECORD_LIMIT = 16 * 1024 * 1024
+DER_MAX_DEPTH = 32
+DER_MAX_NODES = 16384
+KEEP_EVIDENCE = 4
+
+
+class Refused(ValueError):
+    """The calibration cannot be admitted; Touch ID stays unready."""
+
+
+# ---------------------------------------------------------------- files
+
+def private_directory(path):
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    mode = path.lstat()
+    if not stat.S_ISDIR(mode.st_mode) or mode.st_uid != os.geteuid():
+        raise ValueError(f'unsafe state directory: {path}')
+    path.chmod(0o700)
+
+
+def regular(path):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return (stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid()
+            and info.st_nlink == 1 and not info.st_mode & 0o077)
+
+
+def atomic_write(path, data, mode=0o600):
+    fd, temporary = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as out:
+            os.fchmod(out.fileno(), mode)
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, path)
+        sync_directory(path.parent)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def sync_directory(path):
+    directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def read_installed(path):
+    """(bytes, mode) of the record at `path`, read once without following a
+    link; None when there is none. Anything but a private regular file of
+    ours, at most RECORD_LIMIT bytes, is (None, why)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        return None, f'cannot be opened ({error.strerror})'
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+            return None, 'not a private regular file'
+        if info.st_size > RECORD_LIMIT:
+            return None, 'oversized'
+        with os.fdopen(os.dup(fd), 'rb') as f:
+            data = f.read(RECORD_LIMIT + 1)
+        if len(data) > RECORD_LIMIT:
+            return None, 'oversized'
+        return data, stat.S_IMODE(info.st_mode)
+    finally:
+        os.close(fd)
+
+
+def keep_evidence(directory, name, data):
+    """Keep `data` as private evidence in `directory`, with the newest few."""
+    private_directory(directory)
+    stamp = time.strftime('%Y%m%dT%H%M%S', time.gmtime())
+    path = directory / f'{stamp}-{hashlib.sha256(data).hexdigest()[:16]}-{name}'
+    atomic_write(path, data)
+    for old in sorted(directory.iterdir())[:-KEEP_EVIDENCE]:
+        old.unlink()
+    return path
+
+
+def quarantine(target, state, why):
+    """Move whatever is at `target` out of the firmware path, keeping its bytes
+    privately when they can be read."""
+    found = read_installed(target)
+    if isinstance(found, tuple) and found[0] is not None:
+        keep_evidence(state / 'quarantine', target.name, found[0])
+    target.unlink(missing_ok=True)
+    sync_directory(target.parent)
+    print(f'aurora-touchid-setup: moved {target} aside to private quarantine: {why}', file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------- DER
+
+class DER:
+    """Strict DER over one record: definite minimal lengths and identifiers,
+    no trailing data, bounded depth and element count."""
+
+    def __init__(self, data):
+        self.data = data
+        self.nodes = 0
+
+    def element(self, at, end):
+        """(identifier, tag number, content start, content end) at `at`."""
+        data = self.data
+        self.nodes += 1
+        if self.nodes > DER_MAX_NODES:
+            raise Refused('too many DER elements')
+        if at + 2 > end:
+            raise Refused('truncated DER header')
+        identifier = data[at]
+        number, i = identifier & 0x1f, at + 1
+        if number == 0x1f:
+            number = 0
+            for width in range(5):
+                if i >= end:
+                    raise Refused('truncated DER identifier')
+                part = data[i]
+                i += 1
+                if width == 0 and part == 0x80:
+                    raise Refused('non-minimal DER identifier')
+                number = number << 7 | part & 0x7f
+                if not part & 0x80:
+                    break
+            else:
+                raise Refused('oversized DER identifier')
+            if number < 0x1f:
+                raise Refused('non-minimal DER identifier')
+        if i >= end:
+            raise Refused('truncated DER header')
+        first = data[i]
+        i += 1
+        if first & 0x80:
+            count = first & 0x7f
+            if not 1 <= count <= 4 or i + count > end or data[i] == 0:
+                raise Refused('malformed DER length')
+            length = int.from_bytes(data[i:i + count], 'big')
+            i += count
+            if length < 0x80:
+                raise Refused('non-minimal DER length')
+        else:
+            length = first
+        if i + length > end:
+            raise Refused('truncated DER element')
+        return identifier, number, i, i + length
+
+    def whole(self):
+        identifier, number, start, end = self.element(0, len(self.data))
+        if end != len(self.data):
+            raise Refused('trailing data after the DER record')
+        return identifier, number, start, end
+
+    def children(self, start, end, depth):
+        if depth > DER_MAX_DEPTH:
+            raise Refused('DER nested too deeply')
+        out, at = [], start
+        while at < end:
+            element = self.element(at, end)
+            out.append((at,) + element)
+            at = element[3]
+        return out
+
+    def text(self, child):
+        return self.data[child[3]:child[4]] if child[1] == 0x16 else None
+
+
+def fourcc(number):
+    return number.to_bytes(4, 'big') if number < 1 << 32 else None
+
+
+def manifest(data, at=0, end=None):
+    """{object: {property: (identifier, value)}} of the IM4M in [at, end):
+    the manifest body's objects (MANP and one per sealed record) and their
+    properties, walked as DER private-class elements. A duplicate object or
+    property within one scope, or any other shape, is refused."""
+    der = DER(data)
+    end = len(data) if end is None else end
+    identifier, _, start, stop = der.element(at, end)
+    if identifier != 0x30 or stop != end:
+        raise Refused('not one IM4M')
+    top = der.children(start, stop, 1)
+    if len(top) != 5 or der.text(top[0]) != b'IM4M' or top[1][1] != 0x02 or \
+            top[2][1] != 0x31 or top[3][1] != 0x04 or top[4][1] != 0x30:
+        raise Refused('not an IM4M with a body, signature and certificates')
+    body = der.children(top[2][3], top[2][4], 2)
+    if len(body) != 1 or body[0][1] != 0xff or fourcc(body[0][2]) != b'MANB':
+        raise Refused('IM4M without one MANB')
+    _, objects_set = named(der, body[0], 3)
+    if objects_set[1] != 0x31:
+        raise Refused('malformed MANB')
+    objects = {}
+    for child in der.children(objects_set[3], objects_set[4], 5):
+        object_name, properties_set = named(der, child, 6)
+        if object_name in objects or properties_set[1] != 0x31:
+            raise Refused('duplicate or malformed manifest object')
+        properties = objects[object_name] = {}
+        for item in der.children(properties_set[3], properties_set[4], 8):
+            prop, value = named(der, item, 9)
+            if prop in properties:
+                raise Refused('duplicate manifest property')
+            properties[prop] = value[1], data[value[3]:value[4]]
+    return objects
+
+
+def named(der, element, depth):
+    """(NAME, value element) of a private-class [NAME] SEQUENCE
+    { IA5String NAME, value }; the tag number must spell the name."""
+    name = fourcc(element[2])
+    if element[1] != 0xff or name is None:
+        raise Refused('unnamed manifest element')
+    inner = der.children(element[3], element[4], depth)
+    if len(inner) != 1 or inner[0][1] != 0x30:
+        raise Refused('malformed manifest element')
+    pair = der.children(inner[0][3], inner[0][4], depth + 1)
+    if len(pair) != 2 or der.text(pair[0]) != name:
+        raise Refused('manifest element name mismatch')
+    return name, pair[1]
+
+
+def image(data, kind):
+    """(IM4P element bytes, manifest bytes) of an IMG4 whose IM4P type is
+    `kind`, exactly: IMG4 { IM4P { type, version, payload }, [0] IM4M }."""
+    der = DER(data)
+    identifier, _, start, end = der.whole()
+    parts = der.children(start, end, 1)
+    if identifier != 0x30 or len(parts) != 3 or der.text(parts[0]) != b'IMG4' or \
+            parts[1][1] != 0x30 or parts[2][1] != 0xa0:
+        raise Refused('not an IMG4 with a payload and a manifest')
+    payload = der.children(parts[1][3], parts[1][4], 2)
+    if len(payload) != 4 or der.text(payload[0]) != b'IM4P' or der.text(payload[1]) != kind or \
+            payload[2][1] != 0x16 or payload[3][1] != 0x04:
+        raise Refused(f'not an {kind.decode()} calibration')
+    wrapper = der.children(parts[2][3], parts[2][4], 2)
+    if len(wrapper) != 1 or wrapper[0][1] != 0x30 or wrapper[0][4] != parts[2][4]:
+        raise Refused('malformed manifest wrapper')
+    seal = data[wrapper[0][0]:wrapper[0][4]]
+    manifest(seal)
+    return data[parts[1][0]:parts[1][4]], seal
+
+
+def combined(data):
+    """(fdrd image bytes, secb bytes) of a comb record, exactly."""
+    der = DER(data)
+    identifier, _, start, end = der.whole()
+    fields = der.children(start, end, 1)
+    if identifier != 0x30 or len(fields) != 3 or der.text(fields[0]) != b'comb' or \
+            fields[1][1] != 0x30 or fields[2][1] != 0x30:
+        raise Refused('not a combined record')
+    record = der.children(fields[1][3], fields[1][4], 2)
+    security = der.children(fields[2][3], fields[2][4], 2)
+    if len(record) != 2 or der.text(record[0]) != b'fdrd' or record[1][1] != 0x04:
+        raise Refused('combined record without an fdrd image')
+    if len(security) != 2 or der.text(security[0]) != b'secb' or security[1][1] != 0x04 or \
+            security[1][3] == security[1][4]:
+        raise Refused('combined record without a trust bundle')
+    return data[record[1][3]:record[1][4]], data[security[1][3]:security[1][4]]
+
+
+def encode(tag, value):
+    if len(value) < 0x80:
+        return bytes([tag, len(value)]) + value
+    count = (len(value).bit_length() + 7) // 8
+    return bytes([tag, 0x80 | count]) + len(value).to_bytes(count, 'big') + value
+
+
+def reseal(payload, seal, trust):
+    fdrd = encode(0x30, encode(0x16, b'IMG4') + payload + encode(0xa0, seal))
+    return encode(0x30, encode(0x16, b'comb')
+                  + encode(0x30, encode(0x16, b'fdrd') + encode(0x04, fdrd))
+                  + encode(0x30, encode(0x16, b'secb') + encode(0x04, trust)))
+
+
+# ---------------------------------------------------------------- APFS
+
+APFS_ROLE_HARDWARE = 5 << 6
+APFS_FACTORY = ('FactoryData', 'System', 'Library', 'Caches', 'com.apple.factorydata')
+APFS_MAX_BLOCK = 65536
+APFS_MAX_NODES = 16384
+APFS_MAX_DEPTH = 8
+APFS_MAX_FILES = 4096
+
+
+class Container:
+    """Read-only APFS, just enough for one directory of the Hardware volume:
+    the newest valid checkpoint, the container and volume object maps, the
+    file-system tree and uncompressed, unencrypted regular files. Every object
+    read is checksummed; any other layout is refused."""
+
+    def __init__(self, read):
+        self._read = read
+        head = read(0, 4096)
+        if len(head) < 4096 or head[32:36] != b'NXSB':
+            raise Refused('the boot container is not APFS')
+        self.block_size, self.blocks = struct.unpack_from('<IQ', head, 36)
+        if not 4096 <= self.block_size <= APFS_MAX_BLOCK or self.block_size & (self.block_size - 1):
+            raise Refused('unsupported APFS block size')
+        self.nodes = 0
+        first = self.block(0, 0x1)
+        base, count = struct.unpack_from('<Q', first, 112)[0], struct.unpack_from('<I', first, 104)[0]
+        if count & 0x80000000 or not 0 < count <= 65536:
+            raise Refused('unsupported APFS checkpoint area')
+        self.superblock = first
+        for number in range(base, base + count):
+            try:
+                candidate = self.block(number, 0x1)
+            except Refused:
+                continue
+            if candidate[32:36] == b'NXSB' and xid(candidate) > xid(self.superblock):
+                self.superblock = candidate
+        omap = self.block(struct.unpack_from('<Q', self.superblock, 160)[0], 0xb)
+        self.omap_root = struct.unpack_from('<Q', omap, 48)[0]
+
+    def block(self, number, kind=None):
+        if not (0 < number < self.blocks or number == 0 and kind == 0x1):
+            raise Refused('APFS block out of range')
+        data = self._read(number * self.block_size, self.block_size)
+        if len(data) != self.block_size or struct.unpack_from('<Q', data)[0] != fletcher64(data):
+            raise Refused('APFS checksum mismatch')
+        if kind is not None and struct.unpack_from('<I', data, 24)[0] & 0xffff != kind:
+            raise Refused('unexpected APFS object')
+        return data
+
+    def entries(self, number, resolve=None, depth=0):
+        """Each (key, value) of the B-tree at block `number`, in order; a
+        virtual tree's children go through `resolve`."""
+        self.nodes += 1
+        if self.nodes > APFS_MAX_NODES or depth > APFS_MAX_DEPTH:
+            raise Refused('APFS tree too large')
+        node = self.block(number)
+        if struct.unpack_from('<I', node, 24)[0] & 0xffff not in (0x2, 0x3):
+            raise Refused('unexpected APFS object')
+        flags, level, count = struct.unpack_from('<HHI', node, 32)
+        toc, toc_length = struct.unpack_from('<HH', node, 40)
+        if (level == 0) != bool(flags & 2) or bool(flags & 1) != (depth == 0):
+            raise Refused('inconsistent APFS tree node')
+        keys = 56 + toc + toc_length
+        values = self.block_size - (40 if flags & 1 else 0)
+        width = 4 if flags & 4 else 8
+        if 56 + toc + count * width > keys or keys > values:
+            raise Refused('malformed APFS tree node')
+        for index in range(count):
+            at = 56 + toc + index * width
+            if flags & 4:
+                key_at, value_at = struct.unpack_from('<HH', node, at)
+                key_length, value_length = 16, 16 if level == 0 else 8
+            else:
+                key_at, key_length, value_at, value_length = struct.unpack_from('<HHHH', node, at)
+            key_at, value_at = keys + key_at, values - value_at
+            if not keys <= key_at <= key_at + key_length <= values or \
+                    not keys <= value_at <= value_at + value_length <= values:
+                raise Refused('APFS record outside its node')
+            key, value = node[key_at:key_at + key_length], node[value_at:value_at + value_length]
+            if level == 0:
+                yield key, value
+            else:
+                child = struct.unpack_from('<Q', value)[0]
+                yield from self.entries(resolve(child) if resolve else child, resolve, depth + 1)
+
+    def lookup(self, root, oid, as_of):
+        found = None
+        for key, value in self.entries(root):
+            key_oid, key_xid = struct.unpack_from('<QQ', key)
+            if key_oid == oid and key_xid <= as_of and (found is None or key_xid > found[0]):
+                found = key_xid, value
+        if found is None:
+            raise Refused('APFS object missing from its map')
+        flags, _, address = struct.unpack_from('<IIQ', found[1])
+        if flags & 0x5:
+            raise Refused('APFS object deleted or encrypted')
+        return address
+
+    def hardware(self):
+        """{name: bytes} of the regular files in the Hardware volume's
+        factory cache."""
+        volumes = []
+        count = min(struct.unpack_from('<I', self.superblock, 180)[0], 100)
+        for index in range(count):
+            oid = struct.unpack_from('<Q', self.superblock, 184 + 8 * index)[0]
+            if oid:
+                volume = self.block(self.lookup(self.omap_root, oid, xid(self.superblock)), 0xd)
+                if volume[32:36] == b'APSB' and \
+                        struct.unpack_from('<H', volume, 964)[0] == APFS_ROLE_HARDWARE:
+                    volumes.append(volume)
+        if len(volumes) != 1:
+            raise Refused('the boot container has no single Hardware volume')
+        return self.files(volumes[0], APFS_FACTORY)
+
+    def files(self, volume, path):
+        if not struct.unpack_from('<Q', volume, 264)[0] & 1:
+            raise Refused('encrypted Hardware volume')
+        omap = self.block(struct.unpack_from('<Q', volume, 128)[0], 0xb)
+        omap_root, as_of = struct.unpack_from('<Q', omap, 48)[0], xid(volume)
+        physical = struct.unpack_from('<I', volume, 116)[0] & 0x40000000
+
+        def resolve(oid):
+            return oid if physical else self.lookup(omap_root, oid, as_of)
+
+        hashed = struct.unpack_from('<Q', volume, 56)[0] & 0x9
+        directories, inodes, extents = {}, {}, {}
+        for key, value in self.entries(resolve(struct.unpack_from('<Q', volume, 136)[0]), resolve):
+            header = struct.unpack_from('<Q', key)[0]
+            oid, kind = header & (1 << 60) - 1, header >> 60
+            if kind == 9:
+                if hashed:
+                    length, name_at = struct.unpack_from('<I', key, 8)[0] & 0x3ff, 12
+                else:
+                    length, name_at = struct.unpack_from('<H', key, 8)[0], 10
+                name = key[name_at:name_at + length].rstrip(b'\0')
+                entries = directories.setdefault(oid, {})
+                if name in entries:
+                    raise Refused('duplicate APFS directory entry')
+                file_id, _, flags = struct.unpack_from('<QQH', value)
+                entries[name] = file_id, flags & 0xf
+            elif kind == 3:
+                inodes[oid] = value
+            elif kind == 8:
+                logical = struct.unpack_from('<Q', key, 8)[0]
+                length, physical_block = struct.unpack_from('<QQ', value)
+                extents.setdefault(oid, []).append((logical, length & (1 << 56) - 1, physical_block))
+        directory = 2
+        for part in path:
+            entry = directories.get(directory, {}).get(part.encode())
+            if entry is None or entry[1] != 4:
+                raise Refused('no factory cache on the Hardware volume')
+            directory = entry[0]
+        found = {}
+        for name, (file_id, kind) in sorted(directories.get(directory, {}).items()):
+            if kind == 8:
+                if len(found) == APFS_MAX_FILES:
+                    raise Refused('too many factory records')
+                found[name.decode('utf-8', 'replace')] = self.contents(inodes.get(file_id), extents)
+        return found
+
+    def contents(self, inode, extents):
+        if inode is None or len(inode) < 96:
+            raise Refused('missing APFS inode')
+        if struct.unpack_from('<I', inode, 68)[0] & 0x20:
+            raise Refused('compressed factory record')
+        private_id = struct.unpack_from('<Q', inode, 8)[0]
+        count = struct.unpack_from('<H', inode, 92)[0]
+        types, at, size = 96, 96 + 4 * count, 0
+        for index in range(count):
+            field, _, length = struct.unpack_from('<BBH', inode, types + 4 * index)
+            if at + length > len(inode):
+                raise Refused('malformed APFS inode')
+            if field == 8:
+                size = struct.unpack_from('<Q', inode, at)[0]
+            at += length + 7 & ~7
+        if size > RECORD_LIMIT:
+            raise Refused('oversized factory record')
+        data, covered = bytearray(), 0
+        for logical, length, block in sorted(extents.get(private_id, [])):
+            if covered >= size:
+                break
+            if logical != covered or not length or length % self.block_size or \
+                    not 0 < block <= self.blocks - length // self.block_size:
+                raise Refused('sparse or malformed APFS extent')
+            data += self._read(block * self.block_size, length)
+            covered += length
+        if covered < size or len(data) < size:
+            raise Refused('factory record shorter than its size')
+        return bytes(data[:size])
+
+
+def xid(obj):
+    return struct.unpack_from('<Q', obj, 16)[0]
+
+
+def fletcher64(block):
+    low = high = 0
+    for (word,) in struct.iter_unpack('<I', block[8:]):
+        low = (low + word) % 0xffffffff
+        high = (high + low) % 0xffffffff
+    check_low = 0xffffffff - (low + high) % 0xffffffff
+    return check_low | (0xffffffff - (low + check_low) % 0xffffffff) << 32
+
+
+# ---------------------------------------------------------------- admission
+
+def live_identity(tree):
+    """(CHIP, ECID, serial number) of the running Mac: the first two from the
+    boot's local policy manifest, the serial number from the device tree. A
+    value that is absent is None, which admits nothing."""
+    found = set()
+    for item in tree.rglob('compatible'):
+        policy = item.with_name('local-policy-manifest')
+        if b'apple,sep' not in item.read_bytes().split(b'\0') or not policy.exists():
+            continue
+        try:
+            properties = manifest(policy.read_bytes()).get(b'MANP', {})
+        except Refused:
+            continue
+        values = [properties.get(name) for name in (b'CHIP', b'ECID')]
+        if all(value is not None and value[0] == 0x02 and value[1] for value in values):
+            found.add(tuple(int.from_bytes(value[1], 'big') for value in values))
+    chip, ecid = found.pop() if len(found) == 1 else (None, None)
+    try:
+        serial = (tree / 'serial-number').read_bytes().rstrip(b'\0') or None
+    except FileNotFoundError:
+        serial = None
+    return chip, ecid, serial
+
+
+def admit(records, identity, kind=b'FSC2'):
+    """The record this Mac's enclave loads, rebuilt from its factory records,
+    and the digests that identify what it was built from. `kind` is FSC2 for
+    the calibration and MSRk for the sensor's signed root key."""
+    chip, ecid, serial = identity
+    if None in identity:
+        raise Refused('the running Mac does not identify itself (CHIP, ECID and serial number)')
+    seals = [name for name in records if name.lower().startswith('seal-')]
+    if len(seals) != 1:
+        raise Refused(f'expected exactly one seal, found {len(seals)}')
+    match = re.fullmatch(r'seal-([0-9A-Fa-f]{8})-([0-9A-Fa-f]{16})', seals[0])
+    if not match or (int(match[1], 16), int(match[2], 16)) != (chip, ecid):
+        raise Refused('the seal is for another Mac')
+    seal = records[seals[0]]
+    if len(seal) > SOURCE_LIMIT:
+        raise Refused('oversized seal')
+    objects = manifest(seal)
+    if objects.get(b'MANP', {}).get(b'SrNm') != (0x04, serial):
+        raise Refused("the seal does not carry this Mac's serial number")
+    calibrations = [name for name in records if name.startswith(kind.decode() + '-')]
+    if len(calibrations) != 1:
+        raise Refused(f'expected exactly one {kind.decode()} record, found {len(calibrations)}')
+    source = records[calibrations[0]]
+    if len(source) > SOURCE_LIMIT:
+        raise Refused('oversized calibration')
+    payload, _ = image(source, kind)
+    if objects.get(kind, {}).get(b'DGST') != (0x04, hashlib.sha384(payload).digest()):
+        raise Refused(f'the seal does not cover this {kind.decode()} record')
+    trust = trust_bundle(records)
+    return reseal(payload, seal, trust), {
+        'source': calibrations[0],
+        'source_sha384': hashlib.sha384(source).hexdigest(),
+        'payload_sha384': hashlib.sha384(payload).hexdigest(),
+        'seal_sha256': hashlib.sha256(seal).hexdigest(),
+        'trust_sha256': hashlib.sha256(trust).hexdigest(),
+    }
+
+
+def trust_bundle(records):
+    """The trust bundle in use: the named trustobject-<sha256> whose digest
+    and bytes match trustobject-current, or without that, the only named one,
+    whose bytes match its name."""
+    named = {name[12:].lower(): name for name in records
+             if re.fullmatch(r'trustobject-[0-9A-Fa-f]{64}', name)}
+    current = records.get('trustobject-current')
+    if current is not None:
+        digest = hashlib.sha256(current).hexdigest()
+        if digest not in named or records[named[digest]] != current:
+            raise Refused('trustobject-current matches no named trust bundle')
+        return current
+    if len(named) != 1:
+        raise Refused('no trustobject-current and not exactly one named trust bundle')
+    digest, name = next(iter(named.items()))
+    if hashlib.sha256(records[name]).hexdigest() != digest:
+        raise Refused('the trust bundle does not match its name')
+    return records[name]
+
+
+def installed_problem(data, serial):
+    """Why an installed record must leave the firmware path, or None when it
+    may be this Mac's but cannot be confirmed now."""
+    try:
+        fscl_record(data)
+        return None
+    except Refused:
+        pass
+    try:
+        fdrd, _ = combined(data)
+    except Refused as error:
+        try:
+            image(data, b'FSC2')
+        except Refused:
+            return f'malformed ({error})'
+        return 'a standalone image, which the enclave refuses'
+    try:
+        _, seal = image(fdrd, b'FSC2')
+    except Refused as error:
+        return f'malformed ({error})'
+    sealed_serial = manifest(seal).get(b'MANP', {}).get(b'SrNm')
+    if serial is not None and sealed_serial is not None and sealed_serial != (0x04, serial):
+        return 'its seal is for another Mac'
+    return None
+
+
+def fscl_record(data):
+    """`data` when it is a comb record wrapping an FSCl image, which is
+    installed as carved. Its layout is checked as far as the extractor checks
+    it: comb, fdrd and secb, then IMG4 and the IM4P's FSCl type, version and
+    payload, read in order. The rest is the enclave's to verify."""
+    der = DER(data)
+    identifier, _, start, end = der.whole()
+    fields = der.children(start, end, 1)
+    if identifier != 0x30 or len(fields) != 3 or der.text(fields[0]) != b'comb' or \
+            fields[1][1] != 0x30 or fields[2][1] != 0x30:
+        raise Refused('not a combined record')
+    record = der.children(fields[1][3], fields[1][4], 2)
+    if len(record) != 2 or der.text(record[0]) != b'fdrd' or record[1][1] != 0x04 or \
+            in_order(der, fields[2][3], fields[2][4], 1) != [(0x16, b'secb')]:
+        raise Refused('not an fdrd record with a secb')
+    inner = DER(data[record[1][3]:record[1][4]])
+    identifier, _, start, end = inner.whole()
+    first, im4p = in_order(inner, start, end, 2, values=False)
+    if identifier != 0x30 or first != (0x16, b'IMG4') or im4p[0] != 0x30:
+        raise Refused('fdrd is not one IMG4')
+    kinds = in_order(inner, im4p[1], im4p[2], 4)
+    if kinds[:2] != [(0x16, b'IM4P'), (0x16, b'FSCl')] or kinds[2][0] != 0x16 or kinds[3][0] != 0x04:
+        raise Refused('not an FSCl calibration')
+    return data
+
+
+def in_order(der, start, end, count, values=True):
+    """The first `count` elements in [start, end) as (identifier, content),
+    or with `values` False, an IA5String's (identifier, text) and any other
+    element's (identifier, content start, content end)."""
+    out, at = [], start
+    for _ in range(count):
+        identifier, _, content, after = der.element(at, end)
+        if values or identifier == 0x16:
+            out.append((identifier, der.data[content:after]))
+        else:
+            out.append((identifier, content, after))
+        at = after
+    return out
+
+
+# ---------------------------------------------------------------- setup
+
+DEFAULT_CALIBRATION = 'apple/mesa_calibration.bin'
+# The driver's root-key name when the board names only the calibration.
+DEFAULT_ROOT_KEY = 'apple/msrk-j700.bin'
+FIRMWARE_PATH = Path('/sys/module/firmware_class/parameters/path')
+DEFAULT_FIRMWARE = '/usr/lib/firmware'
+DIAG = Path('/sys/bus/platform/devices')
+BOOT_ID = Path('/proc/sys/kernel/random/boot_id')
+REFUSED = 'calibration-refused'    # in RUN: aurora-sep-ready saw a refusal
+AUTO_DONE = 'touchid-auto-rebuild'  # in RUN: this boot's automatic rebuild ran
+RESULT = 'touchid-setup.json'       # in STATE: the last result
+FILES = 'touchid-files'             # in STATE: the files the boot condition checks
+HISTORY = 'touchid-setup.log'       # in STATE: one JSON line per run
+KEEP_HISTORY = 100
+FIRMWARE_NAME = re.compile(r'apple/[A-Za-z0-9_.-]+\.bin')
+KINDS = {'calibration': b'FSC2', 'root key': b'MSRk'}
+
+
+def log(message):
+    print(f'aurora-touchid-setup: {message}', file=sys.stderr, flush=True)
+
+
+def enabled(node, tree):
+    """Whether `node` and every node above it are enabled, as the kernel
+    decides before it probes a device. The SoC device trees carry a disabled
+    fingerprint node on Macs without a built-in reader (Mac mini, Mac Studio),
+    and the boot loader disables the controller on a J700 sold without one."""
+    while True:
+        status = node / 'status'
+        if status.exists() and status.read_bytes().rstrip(b'\0') not in (b'okay', b'ok'):
+            return False
+        if node == tree or node == node.parent:
+            return True
+        node = node.parent
+
+
+def sensor_names(tree):
+    """[calibration, root key] as the sensor's driver names them, from the
+    fingerprint node's firmware-name list; None without an enabled
+    fingerprint node."""
+    found = set()
+    for item in tree.rglob('compatible'):
+        if b'apple,mesa-fingerprint' not in item.read_bytes().split(b'\0'):
+            continue
+        if not enabled(item.parent, tree):
+            continue
+        path = item.with_name('firmware-name')
+        value = path.read_bytes() if path.exists() else b''
+        entries = tuple(entry.decode('ascii', 'replace') for entry in value.split(b'\0') if entry)
+        if not all(FIRMWARE_NAME.fullmatch(entry) for entry in entries):
+            raise ValueError('unsafe fingerprint firmware name')
+        found.add(entries)
+    if not found:
+        return None
+    if len(found) > 1:
+        raise ValueError('conflicting fingerprint firmware names')
+    entries = found.pop()
+    return [entries[0] if entries else DEFAULT_CALIBRATION,
+            entries[1] if len(entries) > 1 else DEFAULT_ROOT_KEY]
+
+
+class Wanted:
+    """One file the driver loads, and the bytes it should hold."""
+
+    def __init__(self, role, name):
+        self.role, self.name = role, name
+        self.data = self.source = self.error = None
+        self.evidence = {}
+
+
+def factory(read):
+    try:
+        return Container(read).hardware(), None
+    except Refused as error:
+        return {}, str(error)
+
+
+def carve(device, extractor, work=None):
+    """The calibration record the extractor carves from the container."""
+    with tempfile.TemporaryDirectory(prefix='.extract-', dir=work) as tmp:
+        output = Path(tmp) / 'calibration.bin'
+        done = subprocess.run([str(extractor), str(device), '--output', str(output)],
+                              capture_output=True, text=True)
+        if done.returncode:
+            reason = (done.stderr.strip().splitlines() or ['no output'])[-1]
+            raise Refused(f'the extractor found no calibration ({reason})')
+        if not regular(output) or not 0 < output.stat().st_size <= SOURCE_LIMIT:
+            raise Refused('unsafe or oversized calibration output')
+        return output.read_bytes()
+
+
+def build(read, device, extractor, identity, names, work=None):
+    """The files this Mac's sensor loads, built from its own factory data."""
+    calibration = Wanted('calibration', names[0])
+    wanted = [calibration]
+    records, unreadable = factory(read)
+    try:
+        if any(name.startswith('FSC2-') for name in records):
+            calibration.data, calibration.evidence = admit(records, identity, b'FSC2')
+            calibration.source = 'resealed from the factory records'
+        else:
+            source = carve(device, extractor, work)
+            try:
+                calibration.data = fscl_record(source)
+            except Refused:
+                raise Refused('the factory cache does not hold this calibration ('
+                              + (unreadable or 'no FSC2 record')
+                              + ') and the container holds no FSCl comb record') from None
+            calibration.source = 'carved from the iBoot System Container'
+            calibration.evidence = {'source_sha384': hashlib.sha384(source).hexdigest()}
+    except Refused as error:
+        calibration.error = str(error)
+    if any(name.startswith('MSRk-') for name in records):
+        root_key = Wanted('root key', names[1])
+        try:
+            root_key.data, root_key.evidence = admit(records, identity, b'MSRk')
+            root_key.source = 'resealed from the factory records'
+        except Refused as error:
+            root_key.error = str(error)
+        wanted.append(root_key)
+    for item in wanted:
+        if item.data is not None:
+            try:
+                self_check(item)
+            except Refused as error:
+                item.data, item.error = None, f'the built record does not read back: {error}'
+    return wanted
+
+
+def self_check(item):
+    """Read a built record back the way the checks above read a source."""
+    if len(item.data) > RECORD_LIMIT:
+        raise Refused('oversized record')
+    if item.source.startswith('carved'):
+        fscl_record(item.data)
+    else:
+        fdrd, _ = combined(item.data)
+        image(fdrd, KINDS[item.role])
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def installed_by_us(state):
+    """Digests of the files earlier runs installed, including the record and
+    cache that prepare-sep-calibration kept."""
+    ours = set()
+    found = read_installed(state / RESULT)
+    if isinstance(found, tuple) and found[0]:
+        try:
+            for item in json.loads(found[0]).get('files', []):
+                for key in ('sha256', 'installed_sha256'):
+                    if item.get('action') in ('install', 'replace', 'keep') and \
+                            re.fullmatch(r'[0-9a-f]{64}', str(item.get(key))):
+                        ours.add(item[key])
+        except (ValueError, AttributeError):
+            pass
+    for name in ('installed.sha256', 'mesa-calibration.bin'):
+        found = read_installed(state / name)
+        if not isinstance(found, tuple) or not found[0]:
+            continue
+        if name.endswith('.sha256'):
+            text = found[0].decode('ascii', 'replace').strip()
+            if re.fullmatch(r'[0-9a-f]{64}', text):
+                ours.add(text)
+        else:
+            ours.add(digest(found[0]))
+    return ours
+
+
+def decide(item, installed, ours, trigger):
+    """(action, reason) for one file: keep, install, replace, leave or fail."""
+    if item.data is None:
+        return 'fail', item.error
+    if installed is None:
+        return 'install', 'missing'
+    data, why = installed
+    if data == item.data:
+        if trigger == 'refused':
+            return 'keep', ('identical to the rebuild, so a rebuild cannot fix the refusal; '
+                            'see the kernel log for the enclave\'s status')
+        return 'keep', 'identical to the rebuild'
+    if trigger == 'force':
+        return 'replace', 'replacing on --force-rebuild'
+    if trigger == 'refused':
+        return 'replace', 'the enclave refused the installed file this boot'
+    if data is not None and digest(data) in ours:
+        return 'replace', 'this tool installed it, and the factory data now builds a different file'
+    return 'leave', ((f'it is {why}' if data is None else 'it differs from the rebuild')
+                     + ', and this tool did not install it; '
+                     'run aurora-touchid-setup --force-rebuild to replace it (a rollback copy is kept)')
+
+
+def apply(item, target, state):
+    """Make `target` exactly the built record; returns the rollback copy."""
+    parent = target.parent
+    parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    if not stat.S_ISDIR(parent.lstat().st_mode):
+        raise ValueError(f'unsafe firmware directory: {parent}')
+    rollback = None
+    old = read_installed(target)
+    if old is not None and old[0] is not None:
+        rollback = keep_evidence(state / 'rollback', target.name, old[0])
+    elif old is not None:
+        quarantine(target, state, old[1])
+    atomic_write(target, item.data)
+    if read_installed(target) != (item.data, 0o600):
+        raise ValueError(f'{target} did not read back')
+    return rollback
+
+
+def publish(target, name, search):
+    """Link `target` into the kernel's firmware search path when the files
+    live elsewhere (NixOS keeps that path on /run)."""
+    if search is None or search == target.parent.parent:
+        return None
+    link = search / name
+    link.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    if link.is_symlink() and os.readlink(link) == str(target):
+        return link
+    if link.exists() and not link.is_symlink():
+        log(f'{link} is a file this tool did not place; leaving it')
+        return None
+    temporary = link.with_name(f'.{link.name}.link')
+    temporary.unlink(missing_ok=True)
+    temporary.symlink_to(target)
+    os.replace(temporary, link)
+    return link
+
+
+def driver_state(devices=DIAG):
+    """The SEP driver's view of the sensor, from its diag attributes."""
+    for diag in sorted(devices.glob('*.sep/diag')):
+        state = {}
+        for name in ('touchid', 'sensor_attach', 'restore'):
+            try:
+                state[name] = (diag / name).read_text().strip()
+            except OSError:
+                pass
+        return state
+    return {}
+
+
+def next_steps(result, sep_bio, devices):
+    changed = any(item['action'] in ('install', 'replace') for item in result['files'])
+    steps = []
+    if result['status'] == 'failed':
+        steps.append('Touch ID cannot be set up from this Mac\'s factory data; see the reasons above. '
+                     'Password login is unaffected.')
+        return steps
+    if changed:
+        attach = driver_state(devices).get('sensor_attach')
+        if not sep_bio.exists():
+            steps.append('Touch ID starts with these files at the next boot (or when aurora-sep.service starts).')
+        elif attach == 'attached':
+            steps.append('The sensor attached this boot with the earlier file; the driver uses the new '
+                         'one from its next sensor bring-up. Reboot for a clean start.')
+        else:
+            steps.append('The driver loads the new file at its next sensor bring-up: its own retry '
+                         'about 10 s after Touch ID starts, or the next enrolment or verify. If '
+                         'aurora-sep-ready still reports the sensor not attached, reboot.')
+    if not changed and driver_state(devices).get('restore') == 'restored':
+        steps.append('Nothing to do: the files are in place and the enrolled fingerprints are restored.')
+        return steps
+    user = os.environ.get('SUDO_USER') or 'USER'
+    steps.append(f'Enrol a finger with: fprintd-enroll -f right-index-finger {user} '
+                 '(the last word is the user name), or use the desktop\'s fingerprint settings.')
+    return steps
+
+
+def boot_id():
+    try:
+        return BOOT_ID.read_text().strip()
+    except OSError:
+        return None
+
+
+def setup(read, device, extractor, tree, firmware, state, run, *, check=False, trigger='user',
+          search=None, sep_bio=Path('/dev/sep-bio'), devices=DIAG):
+    """Set up (or, with `check`, only report) this Mac's Touch ID files."""
+    result = {'tool': 'aurora-touchid-setup', 'version': 1,
+              'time': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+              'boot_id': boot_id(), 'mode': 'check' if check else 'apply',
+              'trigger': trigger, 'firmware_dir': str(firmware), 'files': []}
+    names = sensor_names(tree)
+    result['sensor'] = names is not None
+    if names is None:
+        result['status'] = 'no-sensor'
+        log('this Mac has no Touch ID sensor in its device tree; nothing to do')
+        if not check:
+            private_directory(state)
+            record(state, result, [])
+        return result
+    identity = live_identity(tree)
+    result['identity_known'] = None not in identity
+    lock = None
+    if not check:
+        private_directory(state)
+        lock = os.open(state / '.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        ours = installed_by_us(state) if state.is_dir() else set()
+        wanted = build(read, device, extractor, identity, names, None if check else state)
+        for item in wanted:
+            target = firmware / item.name
+            installed = read_installed(target)
+            action, reason = decide(item, installed, ours, trigger)
+            entry = {'role': item.role, 'name': item.name, 'path': str(target),
+                     'source': item.source, 'action': action, 'reason': reason,
+                     'sha256': digest(item.data) if item.data is not None else None,
+                     'installed_sha256': digest(installed[0])
+                     if installed is not None and installed[0] is not None else None}
+            if not check and action in ('install', 'replace'):
+                rollback = apply(item, target, state)
+                entry['rollback'] = str(rollback) if rollback else None
+                entry['installed_sha256'] = entry['sha256']
+            if not check and action != 'fail':
+                linked = publish(target, item.name, search)
+                if linked:
+                    entry['published'] = str(linked)
+            result['files'].append(entry)
+            verb = {'keep': 'in place', 'install': 'would install' if check else 'installed',
+                    'replace': 'would replace' if check else 'replaced',
+                    'leave': 'left as it is', 'fail': 'CANNOT BUILD'}[action]
+            log(f'{item.role} {target}: {verb} ({reason})')
+        actions = {item['action'] for item in result['files']}
+        if 'fail' in actions:
+            result['status'] = 'failed'
+        elif actions & {'install', 'replace'}:
+            result['status'] = 'would-change' if check else 'changed'
+        elif 'leave' in actions:
+            result['status'] = 'left'
+        else:
+            result['status'] = 'ok'
+        result['next_steps'] = next_steps(result, sep_bio, devices)
+        if not check:
+            record(state, result, [item['path'] for item in result['files']])
+        return result
+    finally:
+        if lock is not None:
+            os.close(lock)
+
+
+def record(state, result, paths):
+    """Keep the result, the files the boot condition checks and the history."""
+    line = json.dumps(result, sort_keys=True)
+    atomic_write(state / RESULT, (json.dumps(result, indent=2, sort_keys=True) + '\n').encode())
+    atomic_write(state / FILES, ''.join(f'{path}\n' for path in paths).encode())
+    found = read_installed(state / HISTORY)
+    lines = found[0].decode('utf-8', 'replace').splitlines() \
+        if isinstance(found, tuple) and found[0] else []
+    atomic_write(state / HISTORY, ('\n'.join(lines[-(KEEP_HISTORY - 1):] + [line]) + '\n').encode())
+
+
+def automatic(run, state):
+    """The service's trigger: 'refused' once per boot when aurora-sep-ready saw
+    the enclave refuse a file, else 'missing'; None when this boot's
+    automatic rebuild already ran."""
+    if not (run / REFUSED).exists():
+        return 'missing'
+    if (run / AUTO_DONE).exists():
+        return None
+    private_directory(run)
+    atomic_write(run / AUTO_DONE, f'{boot_id()}\n'.encode())
+    return 'refused'
+
+
+def firmware_dirs():
+    """(where the files are kept, the kernel's search path when that differs).
+
+    The files are kept on persistent storage: /usr/lib/firmware, or
+    AURORA_TOUCHID_FIRMWARE_DIR. The kernel's custom search path is where the
+    boot puts this Mac's vendor firmware package (Arch, NixOS) and is
+    rebuilt on every boot, so it only gets links."""
+    try:
+        search = FIRMWARE_PATH.read_text().strip()
+    except OSError:
+        search = ''
+    kept = Path(os.environ.get('AURORA_TOUCHID_FIRMWARE_DIR') or DEFAULT_FIRMWARE)
+    return kept, Path(search) if search and Path(search) != kept else None
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog='aurora-touchid-setup',
+        description="Set up this Mac's Touch ID calibration from its own factory data.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--check', action='store_true', help='report what would be done; write nothing')
+    mode.add_argument('--force-rebuild', action='store_true',
+                      help='rebuild and replace files that differ, even ones this tool did not install')
+    mode.add_argument('--auto', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--json', action='store_true', help='print the result as JSON')
+    args = parser.parse_args(argv)
+    if os.geteuid() != 0:
+        log('this reads the boot container and writes firmware files; run it as root (sudo)')
+        return 2
+    trigger = 'force' if args.force_rebuild else 'user'
+    if args.auto:
+        trigger = automatic(RUN, STATE)
+        if trigger is None:
+            log('the automatic rebuild already ran this boot; not running it again '
+                '(run aurora-touchid-setup by hand to retry)')
+            return 0
+        if trigger == 'refused':
+            log('the enclave refused the installed Touch ID file this boot; rebuilding it once')
+    firmware, search = firmware_dirs()
+    try:
+        if not stat.S_ISBLK(DEVICE.stat().st_mode):
+            raise ValueError(f'{DEVICE} is not a block device')
+        fd = os.open(DEVICE, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            result = setup(lambda offset, length: os.pread(fd, length, offset), DEVICE, EXTRACTOR,
+                           DT, firmware, STATE, RUN, check=args.check, trigger=trigger, search=search)
+        finally:
+            os.close(fd)
+    except (OSError, ValueError) as error:
+        result = {'tool': 'aurora-touchid-setup', 'version': 1, 'status': 'failed',
+                  'trigger': trigger, 'mode': 'check' if args.check else 'apply',
+                  'error': str(error), 'files': []}
+        log(f'cannot set up Touch ID: {error}')
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        for step in result.get('next_steps', []):
+            log(f'next: {step}')
+    if result['status'] == 'failed':
+        return 2
+    if args.check and result['status'] in ('would-change', 'left'):
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

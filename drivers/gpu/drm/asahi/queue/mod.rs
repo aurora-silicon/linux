@@ -64,6 +64,10 @@ mod common;
 mod compute;
 mod render;
 
+fn can_submit_inline(dependencies_ready: bool, previous_status: Option<i32>) -> bool {
+    dependencies_ready && previous_status.is_none_or(|status| status != 0)
+}
+
 /// Trait implemented by all versioned queues.
 pub(crate) trait Queue: Send + Sync {
     fn reserve_render_scs(&mut self, layouts: [u64; 2]) -> Result {
@@ -131,6 +135,10 @@ impl SubQueueJob::ver {
 
     fn can_submit(&self) -> Option<Fence> {
         self.job.as_ref().and_then(|job| job.can_submit())
+    }
+
+    fn can_submit_inline(&self) -> bool {
+        self.job.as_ref().is_none_or(|job| job.can_submit_inline())
     }
 }
 
@@ -218,6 +226,9 @@ pub(crate) struct QueueJob {
     fence: UserFence<JobFence::ver>,
     notifier: Arc<GpuObject<fw::event::Notifier::ver>>,
     notification_count: u32,
+    /// Zero until the ioctl tries publication, one for success, or a negative
+    /// errno for a failed attempt. The scheduler consumes the recorded result.
+    inline_result: i32,
     id: u64,
 }
 
@@ -265,6 +276,20 @@ impl QueueJob::ver {
             .map(|a| a.commit())
             .unwrap_or(Ok(()))?;
         self.sj_comp.as_mut().map(|a| a.commit()).unwrap_or(Ok(()))
+    }
+
+    fn can_submit_inline(&self) -> bool {
+        self.sj_vtx
+            .as_ref()
+            .is_none_or(|job| job.can_submit_inline())
+            && self
+                .sj_frag
+                .as_ref()
+                .is_none_or(|job| job.can_submit_inline())
+            && self
+                .sj_comp
+                .as_ref()
+                .is_none_or(|job| job.can_submit_inline())
     }
 }
 
@@ -319,6 +344,14 @@ impl sched::JobImpl for QueueJob::ver {
 
     #[allow(unused_assignments)]
     fn run(job: &mut Self) -> Result<Option<dma_fence::Fence>> {
+        if job.inline_result != 0 {
+            return if job.inline_result == 1 {
+                Ok(Some(Fence::from_fence(&job.fence)))
+            } else {
+                Err(Error::from_errno(job.inline_result))
+            };
+        }
+
         mod_dev_dbg!(job.dev, "QueueJob {}: Running Job\n", job.id);
 
         // We can only increase the notifier threshold here, now that we are
@@ -878,6 +911,8 @@ impl Queue for Queue::ver {
                 // notification count for the job.
                 notification_count: (2 * nr_render) + nr_compute,
 
+                inline_result: 0,
+
                 id,
             },
         )?;
@@ -888,8 +923,13 @@ impl Queue for Queue::ver {
             id,
             in_sync_count
         );
+        let mut dependencies_ready = true;
         for sync in syncs.drain(0..in_sync_count) {
             if let Some(fence) = sync.fence {
+                // SAFETY: `fence` owns the live dma_fence reference used for
+                // this concurrent status query.
+                dependencies_ready &=
+                    unsafe { kernel::bindings::dma_fence_get_status(fence.raw()) != 0 };
                 job.add_dependency(fence)?;
             }
         }
@@ -1047,6 +1087,21 @@ impl Queue for Queue::ver {
         mod_dev_dbg!(self.dev, "Queue {}: Arming job {}\n", self.inner.id, job.id);
         let mut job = job.arm();
         let out_fence = job.fences().finished();
+        let previous_status = self.last_out.as_ref().map(|fence| {
+            // SAFETY: `last_out` owns the live dma_fence reference used for
+            // this concurrent status query.
+            unsafe { kernel::bindings::dma_fence_get_status(fence.raw()) }
+        });
+        if module_parameters::legacy_inline_submit.value() != 0
+            && can_submit_inline(dependencies_ready, previous_status)
+            && job.can_submit_inline()
+        {
+            // All fallible construction and scheduler arming has completed.
+            // Regardless of this result the scheduler takes ownership below,
+            // preserving timeout, credit, error, and teardown bookkeeping.
+            let result = <QueueJob::ver as sched::JobImpl>::run(&mut job).map(|_| ());
+            job.inline_result = result.map_or_else(|error| error.to_errno(), |()| 1);
+        }
         self.last_out = Some(out_fence.clone());
         mod_dev_dbg!(
             self.dev,
@@ -1072,6 +1127,46 @@ impl Queue for Queue::ver {
         }
 
         Ok(())
+    }
+}
+
+#[kunit_tests(asahi_legacy_inline_queue)]
+mod tests {
+    use super::can_submit_inline;
+
+    #[test]
+    fn depth_192_only_publishes_the_idle_head_inline() {
+        const DEPTH: usize = 192;
+        let mut previous_status = None;
+        let mut inline = 0;
+
+        for _ in 0..DEPTH {
+            if can_submit_inline(true, previous_status) {
+                inline += 1;
+            }
+            // Every later ioctl sees the preceding logical queue fence. A
+            // burst cannot publish around that unsignalled scheduler owner.
+            previous_status = Some(0);
+        }
+
+        assert_eq!(inline, 1);
+    }
+
+    #[test]
+    fn serial_round_trips_stay_eligible() {
+        const SUBMITS: usize = 192;
+
+        for index in 0..SUBMITS {
+            let previous_status = (index != 0).then_some(1);
+            assert!(can_submit_inline(true, previous_status));
+        }
+    }
+
+    #[test]
+    fn unsignalled_dependency_or_predecessor_falls_back() {
+        assert!(!can_submit_inline(false, None));
+        assert!(!can_submit_inline(true, Some(0)));
+        assert!(can_submit_inline(true, Some(-5)));
     }
 }
 

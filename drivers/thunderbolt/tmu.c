@@ -19,7 +19,7 @@ static const unsigned int tmu_rates[] = {
 	[TB_SWITCH_TMU_MODE_MEDRES_ENHANCED_UNI] = 16,
 };
 
-static const struct {
+static const struct tmu_mode_params {
 	unsigned int freq_meas_window;
 	unsigned int avg_const;
 	unsigned int delta_avg_const;
@@ -36,6 +36,36 @@ static const struct {
 		800, 4, 0, 3125, 25, 128, 255,
 	},
 };
+
+/*
+ * Enhanced uni-directional mode as Apple silicon hosts run it: averaging
+ * and delta averaging constants 8, and replenish timeout 1875, threshold 0
+ * and count 222, written to the parent side of the link only.
+ */
+static const struct tmu_mode_params tmu_params_host_enhanced = {
+	800, 8, 8, 1875, 0, 222, 255,
+};
+
+/**
+ * tb_switch_tmu_host_managed() - Is the TMU set up the host's way
+ * @sw: Any router of the domain
+ *
+ * Return: %true if the host router's TMU is left to its firmware and
+ * enhanced uni-directional mode uses the host's constants.
+ */
+bool tb_switch_tmu_host_managed(const struct tb_switch *sw)
+{
+	return sw->tb->nhi->quirks & QUIRK_HOST_TMU;
+}
+
+static const struct tmu_mode_params *
+tb_tmu_params(const struct tb_switch *sw, enum tb_switch_tmu_mode mode)
+{
+	if (mode == TB_SWITCH_TMU_MODE_MEDRES_ENHANCED_UNI &&
+	    tb_switch_tmu_host_managed(sw))
+		return &tmu_params_host_enhanced;
+	return &tmu_params[mode];
+}
 
 static const char *tmu_mode_name(enum tb_switch_tmu_mode mode)
 {
@@ -66,8 +96,8 @@ static int tb_switch_set_tmu_mode_params(struct tb_switch *sw,
 	u32 freq, avg, val;
 	int ret;
 
-	freq = tmu_params[mode].freq_meas_window;
-	avg = tmu_params[mode].avg_const;
+	freq = tb_tmu_params(sw, mode)->freq_meas_window;
+	avg = tb_tmu_params(sw, mode)->avg_const;
 
 	ret = tb_sw_read(sw, &val, TB_CFG_SWITCH,
 			 sw->tmu.cap + TMU_RTR_CS_0, 1);
@@ -102,7 +132,7 @@ static int tb_switch_set_tmu_mode_params(struct tb_switch *sw,
 		return ret;
 
 	if (tb_switch_tmu_enhanced_is_supported(sw)) {
-		u32 delta_avg = tmu_params[mode].delta_avg_const;
+		u32 delta_avg = tb_tmu_params(sw, mode)->delta_avg_const;
 
 		ret = tb_sw_read(sw, &val, TB_CFG_SWITCH,
 				 sw->tmu.cap + TMU_RTR_CS_18, 1);
@@ -257,10 +287,10 @@ static int tb_port_set_tmu_mode_params(struct tb_port *port,
 	u32 repl_timeout, repl_threshold, repl_n, dirswitch_n, val;
 	int ret;
 
-	repl_timeout = tmu_params[mode].repl_timeout;
-	repl_threshold = tmu_params[mode].repl_threshold;
-	repl_n = tmu_params[mode].repl_n;
-	dirswitch_n = tmu_params[mode].dirswitch_n;
+	repl_timeout = tb_tmu_params(port->sw, mode)->repl_timeout;
+	repl_threshold = tb_tmu_params(port->sw, mode)->repl_threshold;
+	repl_n = tb_tmu_params(port->sw, mode)->repl_n;
+	dirswitch_n = tb_tmu_params(port->sw, mode)->dirswitch_n;
 
 	ret = tb_port_read(port, &val, TB_CFG_PORT,
 			   port->cap_tmu + TMU_ADP_CS_8, 1);
@@ -285,6 +315,23 @@ static int tb_port_set_tmu_mode_params(struct tb_port *port,
 	val &= ~TMU_ADP_CS_9_REPL_N_MASK;
 	val &= ~TMU_ADP_CS_9_DIRSWITCH_N_MASK;
 	val |= FIELD_PREP(TMU_ADP_CS_9_REPL_N_MASK, repl_n);
+	val |= FIELD_PREP(TMU_ADP_CS_9_DIRSWITCH_N_MASK, dirswitch_n);
+
+	return tb_port_write(port, &val, TB_CFG_PORT,
+			     port->cap_tmu + TMU_ADP_CS_9, 1);
+}
+
+static int tb_port_tmu_dirswitch_write(struct tb_port *port, u32 dirswitch_n)
+{
+	int ret;
+	u32 val;
+
+	ret = tb_port_read(port, &val, TB_CFG_PORT,
+			   port->cap_tmu + TMU_ADP_CS_9, 1);
+	if (ret)
+		return ret;
+
+	val &= ~TMU_ADP_CS_9_DIRSWITCH_N_MASK;
 	val |= FIELD_PREP(TMU_ADP_CS_9_DIRSWITCH_N_MASK, dirswitch_n);
 
 	return tb_port_write(port, &val, TB_CFG_PORT,
@@ -786,7 +833,29 @@ static int tb_switch_tmu_enable_enhanced(struct tb_switch *sw)
 	up = tb_upstream_port(sw);
 	down = tb_switch_downstream_port(sw);
 
-	ret = tb_port_set_tmu_mode_params(up, sw->tmu.mode_request);
+	/*
+	 * The host's way: time sync off on both lane adapters first, then
+	 * on again once the mode is programmed (below). The host router
+	 * applies its TMU configuration only when its lane adapter's time
+	 * sync goes from off to on, and it comes out of reset on.
+	 */
+	if (tb_switch_tmu_host_managed(sw)) {
+		ret = tb_port_tmu_time_sync_disable(up);
+		if (!ret)
+			ret = tb_port_tmu_time_sync_disable(down);
+		if (ret)
+			goto out;
+	}
+
+	/*
+	 * The host's way: replenish parameters on the parent side only,
+	 * but the direction switch count on both.
+	 */
+	if (tb_switch_tmu_host_managed(sw))
+		ret = tb_port_tmu_dirswitch_write(up,
+			tb_tmu_params(sw, sw->tmu.mode_request)->dirswitch_n);
+	else
+		ret = tb_port_set_tmu_mode_params(up, sw->tmu.mode_request);
 	if (ret)
 		goto out;
 
@@ -809,6 +878,16 @@ static int tb_switch_tmu_enable_enhanced(struct tb_switch *sw)
 	ret = tb_port_tmu_enhanced_enable(down, true);
 	if (ret)
 		goto out;
+
+	/* Time sync on again: device side first, then the host router's. */
+	if (tb_switch_tmu_host_managed(sw)) {
+		ret = tb_port_tmu_time_sync_enable(up);
+		if (ret)
+			goto out;
+		ret = tb_port_tmu_time_sync_enable(down);
+		if (ret)
+			goto out;
+	}
 
 	return 0;
 
@@ -962,9 +1041,12 @@ int tb_switch_tmu_enable(struct tb_switch *sw)
 			return ret;
 	}
 
-	ret = tb_switch_tmu_set_time_disruption(sw, true);
-	if (ret)
-		return ret;
+	/* The host's way leaves the router's time disruption bit alone. */
+	if (!tb_switch_tmu_host_managed(sw)) {
+		ret = tb_switch_tmu_set_time_disruption(sw, true);
+		if (ret)
+			return ret;
+	}
 
 	if (tb_route(sw)) {
 		/*
@@ -1014,6 +1096,8 @@ int tb_switch_tmu_enable(struct tb_switch *sw)
 		tb_sw_dbg(sw, "TMU: mode set to: %s\n", tmu_mode_name(sw->tmu.mode));
 	}
 
+	if (tb_switch_tmu_host_managed(sw))
+		return ret;
 	return tb_switch_tmu_set_time_disruption(sw, false);
 }
 

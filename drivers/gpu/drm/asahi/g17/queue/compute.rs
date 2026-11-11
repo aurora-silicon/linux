@@ -1912,8 +1912,10 @@ impl Queue {
         }
         let binding = self.binding.take()?;
         self.retained_owner = Some(binding.context.retain_firmware_pages());
-        // The backing served the exited VM only: give it back for fresh backing.
-        self.needs_fresh_backing = true;
+        // The backing stays tied to the exited VM (`pool_serves` refuses every other VM). It
+        // is given back only when another VM needs this queue (`require_fresh_backing` under
+        // QID pressure), not at every owner exit: releasing and re-arming the pool of each
+        // exited owner's idle queue left a later command retired without a completion stamp.
         Some(binding)
     }
     /// An idle retained queue whose USC backing may be given back.
@@ -2408,7 +2410,17 @@ impl Graph {
         Ok(object.gpu_va() + start as u64)
     }
     fn append(&self, expected: u32, address: u64, before_publish: impl FnOnce()) -> Result<u32> {
-        let cursors = self.cursors()?;
+        self.append_to(self.cursors()?, expected, address, before_publish)
+    }
+    /// Appends against `cursors`: a fresh read, or an M5 publication's snapshot whose
+    /// producer the publication advanced itself (see `publish_with_native_waits`).
+    fn append_to(
+        &self,
+        cursors: Cursors,
+        expected: u32,
+        address: u64,
+        before_publish: impl FnOnce(),
+    ) -> Result<u32> {
         if cursors.producer != expected
             || cursors.count != ITEM_RING_ENTRIES
             || expected >= ITEM_RING_ENTRIES
@@ -2784,7 +2796,8 @@ impl Queue {
                         self.pool.cancel_unpublished(target)?; Err(error)
                     })?;
                 self.active.back_mut().ok_or(EIO)?.qos_pending = true;
-                producer = self.graph.append(cursors.producer, config_va.ok_or(EINVAL)?,
+                // `cursors` is this publication's snapshot: no second read of the ring.
+                producer = self.graph.append_to(cursors, cursors.producer, config_va.ok_or(EINVAL)?,
                     || packet.mark_published())
                     .or_else(|error| {
                         self.pool.cancel_unpublished(target)?;
@@ -2890,7 +2903,13 @@ impl Queue {
                 self.graph.record(record_slot, ANNOUNCE, 0x40,
                     crate::g17::fw::m5::queue::notification(qid, kick_timestamp)?)?
             } else { self.graph.record(record_slot, ANNOUNCE, 0x40, announce)? };
-            producer = self.graph.append(producer, announce_va, || {})?;
+            producer = match snapshot {
+                // The snapshot's consumer only lags the firmware's, and the free-room check
+                // above covered both M5 items; the producer is the one this publication set.
+                Some(snapshot) => self.graph.append_to(Cursors { producer, ..snapshot }, producer,
+                    announce_va, || {})?,
+                None => self.graph.append(producer, announce_va, || {})?,
+            };
             fence(Ordering::SeqCst);
             if entry_signal && !self.graph.m5 {
                 let predecessor_va =
@@ -2992,6 +3011,11 @@ impl Queue {
     }
 
     fn install_m5(&mut self, packet: &Arc<Packet>, host: &mut impl Host) -> Result {
+        // Installed, configuration released and a kick published: nothing to check, and no
+        // reads of shared memory under the device mutex.
+        if self.m5_install.is_some() && self.ordinal != 0 && self.configuration.is_none() {
+            return Ok(());
+        }
         let (epoch, state) = host.epoch()?;
         if state == 0 { self.retire_configuration(epoch)?; }
         if let Some(end) = self.m5_install {

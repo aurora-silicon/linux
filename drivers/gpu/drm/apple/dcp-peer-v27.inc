@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: GPL-2.0-only OR MIT */
 
-/* Bring-up gate until the framebuffer merge lifecycle is implemented. This
- * only reserves an otherwise unrouted DCP; it never replaces a physical route.
+/* Logical peer allocation for a merged mode. This only reserves an otherwise
+ * unrouted DCP; it never replaces a physical route.
  */
-static bool peer_allocation_probe;
+static bool peer_allocation_probe = true;
 module_param(peer_allocation_probe, bool, 0444);
-MODULE_PARM_DESC(peer_allocation_probe, "Test firmware27 logical peer allocation (merge bring-up)");
+MODULE_PARM_DESC(peer_allocation_probe, "Firmware27 logical peer allocation for merged modes (default: on)");
 
 bool dcp_peer_tiling_state_v27(struct apple_dcp *dcp, bool write,
 			      u32 event, u32 param, u32 *value)
@@ -90,13 +90,13 @@ int dcp_peer_hints_v27(struct apple_dcp *dcp, struct dptx_port *port,
 		return 0;
 
 	extra = dcp_peer_extra_pipes(r->hints, &port->caps);
-	memset(&r->primary_id, 0, 32);
+	memset(&r->allocation, 0, sizeof(r->allocation));
 	guard(mutex)(&dcp_peer_lock);
 	if (dcp->peer_unbinding || dcp->crashed)
 		return -ENODEV;
 	if (!extra || !(r->hints[0] & 1)) {
 		dcp_peer_release_locked(dcp);
-		memset(&r->primary_id, 0, 32);
+		memset(&r->allocation, 0, sizeof(r->allocation));
 		return 0;
 	}
 	/* This candidate implements a non-tiled, two-pipe reservation. Tiled

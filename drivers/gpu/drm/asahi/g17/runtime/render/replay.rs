@@ -33,6 +33,15 @@ impl super::RenderState {
             .any(|pair| pair.owner() == Some(owner) && pair.replay_through(through))
     }
 
+    /// Whether any pair holds a group parked for replay.
+    pub(in crate::g17) fn replay_parked(&self) -> bool {
+        self.entries
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.pair.as_ref())
+            .any(|pair| pair.replay_front().is_some())
+    }
+
     pub(in crate::g17) fn replay_polling(&self) -> bool {
         self.entries
             .iter()
@@ -44,9 +53,12 @@ impl super::RenderState {
 
 impl Firmware {
     pub(in crate::g17) fn replay_render(&mut self, deferred: &mut DeferredBatch) -> Result {
-        if self.recovery.pending()
-            || crate::g17::recovery::Memory::recovery_state(&self.init)? != 0
-        {
+        // Runs on every event pass: with no group parked for replay, return before reading the
+        // recovery state from shared memory.
+        if self.recovery.pending() || !self.queues.render.replay_parked() {
+            return Ok(());
+        }
+        if crate::g17::recovery::Memory::recovery_state(&self.init)? != 0 {
             return Ok(());
         }
         for slot in 0..self.queues.render.entries.len() {

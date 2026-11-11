@@ -899,8 +899,17 @@ impl Pair {
             // run under another client's (or no) context under parallel load.
             j813 || publication::required(cache[stage], config)
         });
-        let cursors = self.memory.graph.cursors()?;
-        if cursors[0].write != self.cursors[0] || cursors[1].write != self.cursors[1] {
+        // An idle pair's next command starts from the rings' cursors; behind a command in
+        // flight it starts from that command's windows, and only the producers are checked.
+        let cursors = match self.active.front() {
+            Some(_) => None,
+            None => Some(self.memory.graph.cursors()?),
+        };
+        let producers = match cursors {
+            Some(cursors) => cursors.map(|cursors| cursors.write),
+            None => self.memory.graph.write_cursors()?,
+        };
+        if producers != self.cursors {
             return Err(EBUSY);
         }
         let queues = qids.map(|qid| self.memory.graph.queue_va(qid));
@@ -1056,16 +1065,18 @@ impl Pair {
             )?,
         ];
         let windows = [lanes[0].window, lanes[1].window];
-        let previous = self.active.front().map_or(cursors, |active| {
-            active.ticket.windows.map(|window| {
+        let previous = match (self.active.front(), cursors) {
+            (Some(active), _) => active.ticket.windows.map(|window| {
                 let target = window.target();
                 retirement::Cursors {
                     done: target,
                     read: target,
                     write: target,
                 }
-            })
-        });
+            }),
+            (None, Some(cursors)) => cursors,
+            (None, None) => return Err(EIO),
+        };
         let fragment_slot = WorkSlot::new(
             DataMaster::Fragment,
             queues[1],
