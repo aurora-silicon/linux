@@ -35,6 +35,10 @@ class SensorWakeTest(unittest.TestCase):
 #![allow(dead_code, unused_variables)]
 use std::cell::RefCell;
 macro_rules! dev_warn { ($($args:tt)*) => {} }
+macro_rules! dev_info_refusal { ($($args:tt)*) => {} }
+macro_rules! dev_warn_ratelimited { ($($args:tt)*) => {} }
+macro_rules! dev_info_ratelimited { ($($args:tt)*) => {} }
+macro_rules! dev_dbg { ($($args:tt)*) => {} }
 macro_rules! dev_info { ($($args:tt)*) => {} }
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 mod shim { pub fn boottime_ns()->u64 {0} }
@@ -48,6 +52,7 @@ mod registration {
 ''' + patch_loaded + r'''
 }
 macro_rules! dev_err { ($($args:tt)*) => {} }
+macro_rules! dev_err_ratelimited { ($($args:tt)*) => {} }
 mod kernel { pub mod time {
  pub struct Delta;
  impl Delta { pub fn from_millis(_:i64)->Self {Self} }

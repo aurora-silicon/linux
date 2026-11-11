@@ -567,7 +567,7 @@ impl SepData {
             .ok_or(EIO)?;
         if out.reply.status != 0 {
             let status: i32 = out.reply.status.into();
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "fv: GET_BLOB_STATE failed with status {}\n",
                 status
@@ -580,7 +580,7 @@ impl SepData {
         let mut fields = proto::FieldCursor::new(body);
         let version = fields.i32();
         if version != Some(0) {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "fv: GET_BLOB_STATE response has version {:?}, {} body bytes\n",
                 version,
@@ -591,7 +591,7 @@ impl SepData {
         let state = match fields.blob() {
             Some(state) => state,
             None => {
-                dev_err!(
+                dev_err_ratelimited!(
                     self.dev,
                     "fv: GET_BLOB_STATE has no complete state blob in {} body bytes\n",
                     body.len()
@@ -612,7 +612,7 @@ impl SepData {
                     .and_then(|bytes| bytes.try_into().ok())
                     .map(u64::from_be_bytes)
                     .unwrap_or(0);
-                dev_err!(
+                dev_err_ratelimited!(
                     self.dev,
                     "fv: GET_BLOB_STATE returned {} state bytes without a UUID (head {:016x}{:016x})\n",
                     state.len(),
@@ -624,7 +624,7 @@ impl SepData {
         };
         let raw_uuid = crate::der::octet_string_body(uuid_tlv).ok_or(EMSGSIZE)?;
         if raw_uuid.len() != 16 {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "fv: GET_BLOB_STATE returned a {}-byte UUID\n",
                 raw_uuid.len()
@@ -675,7 +675,7 @@ impl SepData {
     fn decode_media_key(&self, out: crate::SksOutcome) -> Result<MediaKey> {
         if out.reply.status != 0 {
             let status: i32 = out.reply.status.into();
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "fv: UNWRAP_MEDIA_KEY failed with status {}\n",
                 status
@@ -738,7 +738,7 @@ impl SepData {
             .ok_or(EIO)?;
         if out.reply.status != 0 {
             let status: i32 = out.reply.status.into();
-            dev_err!(self.dev, "fv: UNWRAP_VEK failed with status {}\n", status);
+            dev_err_ratelimited!(self.dev, "fv: UNWRAP_VEK failed with status {}\n", status);
             return Err(EACCES);
         }
         let body = self
@@ -788,7 +788,7 @@ impl SepData {
     ) -> Result<KVec<u8>> {
         if out.reply.status != 0 {
             let status: i32 = out.reply.status.into();
-            dev_err!(self.dev, "fv: {} failed with status {}\n", name, status);
+            dev_err_ratelimited!(self.dev, "fv: {} failed with status {}\n", name, status);
             return Err(EACCES);
         }
         let body = self.sks_report_response(name, &out).unwrap_or(&[]);
@@ -796,7 +796,7 @@ impl SepData {
         let version = fields.i32();
         let record = fields.blob().filter(|_| version == Some(FV_UNWRAP_VERSION as i32));
         let Some(record) = record.filter(|r| !r.is_empty() && r.len() <= RECORD_MAX_LEN) else {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "fv: {} answered status 0 with an unusable reply: image {} bytes, body {} bytes, version {:?}\n",
                 name,
@@ -815,10 +815,10 @@ impl SepData {
     /// itself is silent when the key store was already given up on.
     fn rearm_exchange(&self, name: &'static CStr, req: Result<SksRequest>) -> Result<crate::SksOutcome> {
         let req = req.inspect_err(|e| {
-            dev_err!(self.dev, "Touch ID: re-arm: could not build {}: {:?}\n", name, e);
+            dev_err_ratelimited!(self.dev, "Touch ID: re-arm: could not build {}: {:?}\n", name, e);
         })?;
         self.sks_send(Ok(req)).ok_or_else(|| {
-            dev_err!(self.dev, "Touch ID: re-arm: {} got no reply\n", name);
+            dev_err_ratelimited!(self.dev, "Touch ID: re-arm: {} got no reply\n", name);
             EIO
         })
     }
@@ -850,7 +850,7 @@ impl SepData {
         )?;
         let status: i32 = out.reply.status.into();
         if status != 0 {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "Touch ID: re-arm FV unwrap (0x41, option 2) failed with SKS status {}\n",
                 status
@@ -858,7 +858,7 @@ impl SepData {
             return Err(EACCES);
         }
         let Some(body) = self.sks_report_response(crate::sks::SKS_UNWRAP_VEK_NAME, &out) else {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "Touch ID: re-arm FV unwrap answered SKS status 0 with a malformed {}-byte reply image\n",
                 out.response.len()
@@ -867,7 +867,7 @@ impl SepData {
         };
         let shape = UnwrapReplyShape::of(body);
         if !shape.usable() {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "Touch ID: re-arm FV unwrap answered SKS status 0 with an unusable reply: body {} bytes, version {:?}, key {:?} bytes, flags {:?}, {} trailing bytes\n",
                 shape.body_len,
@@ -878,7 +878,7 @@ impl SepData {
             );
             return Err(EMSGSIZE);
         }
-        dev_info!(
+        dev_info_ratelimited!(
             self.dev,
             "Touch ID: re-arm FV unwrap succeeded: SKS status 0, {}-byte key discarded, flags {:#x}\n",
             shape.key_len.unwrap_or(0),
@@ -895,7 +895,7 @@ impl SepData {
             .with_host_store(|store| store.can_write(&FV_REARM_STORE_KEY, maximum))
             .unwrap_or(false)
         {
-            dev_err!(self.dev, "Touch ID: re-arm: the host-state store has no room for the FV record pair\n");
+            dev_err_ratelimited!(self.dev, "Touch ID: re-arm: the host-state store has no room for the FV record pair\n");
             return Err(ENOSPC);
         }
 
@@ -906,9 +906,9 @@ impl SepData {
         self.with_host_store(|store| store.write(&FV_REARM_STORE_KEY, &raw))
             .ok_or(ENODEV)?
             .inspect_err(|e| {
-                dev_err!(self.dev, "Touch ID: re-arm: could not save the FV record pair: {:?}\n", e);
+                dev_err_ratelimited!(self.dev, "Touch ID: re-arm: could not save the FV record pair: {:?}\n", e);
             })?;
-        dev_info!(
+        dev_info_ratelimited!(
             self.dev,
             "Touch ID: provisioned the Linux FV re-arm record pair ({} + {} bytes)\n",
             kek.len(),
@@ -935,13 +935,13 @@ impl SepData {
             match decode_rearm_records(&raw) {
                 Ok(records) => match self.unwrap_rearm_vek(secret, records.kek, records.vek) {
                     Ok(()) => return Ok(()),
-                    Err(e) if e == EACCES => dev_warn!(
+                    Err(e) if e == EACCES => dev_warn_ratelimited!(
                         self.dev,
                         "Touch ID: re-arm: the enclave refused the stored FV record pair; provisioning a new one\n"
                     ),
                     Err(e) => return Err(e),
                 },
-                Err(_) => dev_warn!(
+                Err(_) => dev_warn_ratelimited!(
                     self.dev,
                     "Touch ID: re-arm: the stored FV record pair does not decode; provisioning a new one\n"
                 ),
@@ -999,7 +999,7 @@ impl SepData {
             .ok_or(EIO)?;
         if out.reply.status != 0 {
             let status: i32 = out.reply.status.into();
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "fv: UNWRAP_PFK v2 class {} ekwk {} ek {} failed with status {}\n",
                 protection_class,
@@ -1067,7 +1067,7 @@ impl SepData {
             .ok_or(EIO)?;
         if out.reply.status != 0 {
             let status: i32 = out.reply.status.into();
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "fv: NEW_PFK class {} failed with status {}\n",
                 protection_class,
@@ -1100,7 +1100,7 @@ impl SepData {
             || key_flags & PFK_NEW_KEY_FLAG == 0
             || wrapped_class != class as i32
         {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "fv: NEW_PFK malformed response: key {} iv {} eph {} ek {} ekwk {} flags {:#x} class {} expected {}\n",
                 opaque.len(),
@@ -1184,7 +1184,7 @@ impl SepData {
         };
         if out.reply.status != 0 {
             let status: i32 = out.reply.status.into();
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "fv: LOAD_CLASS_KEYS failed with status {}\n",
                 status
@@ -1210,7 +1210,7 @@ impl SepData {
         let apfs_lo = u64::from_be_bytes(volume_uuid[8..].try_into().unwrap());
         let bag_hi = u64::from_be_bytes(bag_uuid[..8].try_into().unwrap());
         let bag_lo = u64::from_be_bytes(bag_uuid[8..].try_into().unwrap());
-        dev_info!(
+        dev_info_ratelimited!(
             self.dev,
             "fv: mapped APFS UUID {:016x}-{:016x} to keybag UUID {:016x}-{:016x}\n",
             apfs_hi,

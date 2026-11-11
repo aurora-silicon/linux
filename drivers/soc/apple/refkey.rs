@@ -74,7 +74,7 @@ impl SepData {
             self.sks_designate_user_keybag(handle, secret);
         }
         if !self.keybag_designated.load(Relaxed) {
-            dev_warn!(self.dev, "sks: ref-key identity designation failed\n");
+            dev_warn_ratelimited!(self.dev, "sks: ref-key identity designation failed\n");
             return false;
         }
         let Some(user) = crate::sks::DesignateUser::new(crate::SBIO_PROBE_USER_ID) else {
@@ -88,15 +88,20 @@ impl SepData {
             secret,
             healthy,
         )) else {
-            dev_warn!(self.dev, "sks: ref-key identity unlock got no reply\n");
+            dev_warn_ratelimited!(self.dev, "sks: ref-key identity unlock got no reply\n");
             return false;
         };
-        dev_info!(
+        dev_dbg!(
             self.dev,
             "sks: ref-key identity unlock mailbox status {}\n",
             out.reply.status
         );
         if out.reply.status != 0 {
+            dev_warn_ratelimited!(
+                self.dev,
+                "sks: ref-key identity unlock refused (status {})\n",
+                out.reply.status
+            );
             return false;
         }
         let Some(body) = self.sks_report_response(c"DEVICE_STATE_TRANSITION", &out) else {
@@ -172,11 +177,11 @@ impl SepData {
         let cout = match self.sks_send(self.sks_req_refkey(handle, &create_der)) {
             Some(out) => out,
             None => {
-                dev_warn!(self.dev, "sks: ref-key create got no usable reply\n");
+                dev_warn_ratelimited!(self.dev, "sks: ref-key create got no usable reply\n");
                 return None;
             }
         };
-        dev_info!(
+        dev_dbg!(
             self.dev,
             "sks: ref-key create mailbox status {}, response {} bytes\n",
             cout.reply.status,
@@ -188,11 +193,11 @@ impl SepData {
         let cbody = self.sks_report_response(crate::sks::SKS_PERFORM_OP_NAME, &cout)?;
         let mut cf = proto::FieldCursor::new(cbody);
         let (Some(version), Some(cblob)) = (cf.i32(), cf.blob()) else {
-            dev_warn!(self.dev, "sks: ref-key create reply was malformed\n");
+            dev_warn_ratelimited!(self.dev, "sks: ref-key create reply was malformed\n");
             return None;
         };
         if version != 0 {
-            dev_warn!(self.dev, "sks: ref-key create reply version {}\n", version);
+            dev_warn_ratelimited!(self.dev, "sks: ref-key create reply version {}\n", version);
             return None;
         }
         let mut refkey_blob: KVec<u8> = KVec::new();
@@ -224,7 +229,7 @@ impl SepData {
             Ok(file) => Some(file),
             Err(ENOENT) => None,
             Err(error) => {
-                dev_err!(
+                dev_err_ratelimited!(
                     self.dev,
                     "sks: cannot read existing machine ref-key: {:?}; refusing replacement\n",
                     error
@@ -243,7 +248,7 @@ impl SepData {
                     return;
                 }
             }
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "sks: existing machine ref-key is unreadable or invalid; refusing replacement\n"
             );
@@ -255,18 +260,18 @@ impl SepData {
             return;
         }
         let Some(blob) = self.sks_create_refkey(handle, secret, None) else {
-            dev_warn!(
+            dev_warn_ratelimited!(
                 self.dev,
                 "sks: could not create the machine ref-key; trusted-key sealing is unavailable this boot.\n"
             );
             return;
         };
         let Ok(f) = shim::StoreFile::open(path) else {
-            dev_err!(self.dev, "sks: could not persist machine ref-key\n");
+            dev_err_ratelimited!(self.dev, "sks: could not persist machine ref-key\n");
             return;
         };
         if f.write_all(0, &blob).is_err() || f.sync().is_err() {
-            dev_err!(self.dev, "sks: machine ref-key persistence failed\n");
+            dev_err_ratelimited!(self.dev, "sks: machine ref-key persistence failed\n");
             return;
         }
         let _ = self.cache_machine_refkey(blob);
@@ -324,7 +329,7 @@ impl SepData {
         // unsealing, which acquires that lock again.
         let recovered = crate::Secret(self.refkey_unseal_trusted(&sealed)?);
         if &*recovered != key {
-            dev_err!(self.dev, "trusted-keys: refusing a new blob whose private-key round trip failed\n");
+            dev_err_ratelimited!(self.dev, "trusted-keys: refusing a new blob whose private-key round trip failed\n");
             return Err(EIO);
         }
         Ok(sealed)
@@ -416,7 +421,7 @@ impl SepData {
         };
         self.last_key_status.store(i32::from(out.reply.status) as u32, Relaxed);
         if out.reply.status != 0 {
-            dev_warn!(
+            dev_info_refusal!(
                 self.dev,
                 "sks: ref-key sign refused by the enclave (status {}{})\n",
                 out.reply.status,
@@ -629,7 +634,7 @@ impl SepData {
         let sealed = refkey_seal::ecies_seal(Self::refkey_pub(record).ok_or(EINVAL)?, &framed)?;
         let recovered = crate::Secret(self.fde_unseal(user, record, &sealed)?);
         if &*recovered != secret {
-            dev_err!(self.dev, "fde: refusing a sealed volume secret whose round trip failed\n");
+            dev_err_ratelimited!(self.dev, "fde: refusing a sealed volume secret whose round trip failed\n");
             return Err(EIO);
         }
         Ok(sealed)
@@ -744,7 +749,7 @@ impl SepData {
         };
         self.last_key_status.store(i32::from(out.reply.status) as u32, Relaxed);
         if out.reply.status != 0 {
-            dev_warn!(
+            dev_info_refusal!(
                 self.dev,
                 "sks: ref-key key exchange refused by the enclave (status {}{})\n",
                 out.reply.status,
@@ -781,7 +786,7 @@ impl SepData {
         let der = crate::der::encode_refkey_set(&items).ok()?;
         let out = self.sks_send(self.sks_req_refkey(handle.value(), &der))?;
         if out.reply.status != 0 {
-            dev_warn!(
+            dev_info_refusal!(
                 self.dev,
                 "trusted-keys: ref-key unseal failed (status {})\n",
                 out.reply.status
