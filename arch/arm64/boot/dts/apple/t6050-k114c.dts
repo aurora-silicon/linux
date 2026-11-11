@@ -597,7 +597,7 @@
 &kiwi {
 	firmware-name = "apple/tpkiwifw-k114c.bin";
 	apple,power-method = <2>;
-	apple,reset-gpios = <&nub_gpio0 25 GPIO_ACTIVE_HIGH>;
+	apple,reset-gpios = <&nub_gpio0 25 GPIO_ACTIVE_LOW>;
 	apple,power-gpios = <&nub_gpio0 26 GPIO_ACTIVE_HIGH>;
 	status = "okay";
 };
