@@ -375,6 +375,7 @@ struct ave_slot {
 	struct ave_vb2_mem *input_mem; /* independent firmware mapping reference */
 	struct ave_vb2_mem *output_mem; /* the same, for an MCTF CAPTURE buffer */
 	u8 mctf_input; /* MCTF: the input surface this frame used */
+	bool mctf_direct; /* MCTF: the engine wrote the CAPTURE buffer itself */
 	u32 status;
 	bool busy; /* Process sent, reply pending */
 	bool done; /* reply in, output not delivered yet */

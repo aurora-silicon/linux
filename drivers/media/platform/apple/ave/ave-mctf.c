@@ -435,7 +435,15 @@ int ave_mctf_cmd_process(struct ave_ctx *ctx, unsigned int slot,
 		sess->mctf_last_input = s->mctf_input;
 	}
 	f.in = sess->mctf_in[s->mctf_input].dma;
-	f.out = sess->mctf_out[slot].dma;
+	/*
+	 * A lossless CAPTURE buffer takes slot 1's output directly: the engine
+	 * keeps no reference to it (slot 0's surface is the firmware's own).
+	 */
+	s->mctf_direct = dst && slot == 1 &&
+			  ctx->dst_fmt.pixelformat == V4L2_PIX_FMT_APPLE_L8V0 &&
+			  vb2_plane_size(&dst->vb2_buf, 0) >= sess->mctf_geom.bytes;
+	f.out = s->mctf_direct ? vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 0) :
+				 sess->mctf_out[slot].dma;
 	ret = ave_ipc_wait_ack(ave, buf);
 	if (ret)
 		return ret;
