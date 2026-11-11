@@ -83,8 +83,6 @@ struct ane_fw_backend {
 	bool parked;
 	/* Between PM_SUSPEND_PREPARE and PM_POST_SUSPEND. */
 	bool in_sleep;
-	/* This power-down is for a system sleep: a stuck one may send it deep. */
-	bool down_for_sleep;
 	/* The last cold boot after sleep: firmware ready, first replay, count. */
 	u64 resume_ready_ns, resume_first_ns;
 	unsigned int resume_replayed;
@@ -547,10 +545,6 @@ static int ane_fw_ps_off(struct ane_fw_backend *b, u32 offset)
 		if (!ane_poll32(b, reg, ANE_FW_PS_OFF_MASK, 0, 1, 1000))
 			return 0;
 	}
-	if (!b->down_for_sleep) {
-		dev_warn(&b->pdev->dev, "H17 ANE: power word %#x still stuck while parking\n", offset);
-		return 0;
-	}
 	if (!apple_sleep_request_deep_once())
 		return ret;
 	dev_warn(&b->pdev->dev, "H17 ANE: power word %#x still stuck, taking the deep path\n", offset);
@@ -959,11 +953,8 @@ static int ane_fw_cold_cycle_down(struct ane_fw_backend *b)
 			return -EBUSY;
 	if (ane_fw_clean_stop(b)) {
 		ret = ane_fw_firmware_stop(b);
-		/* Parking at runtime: the PMGR clears a latch outside a system sleep. */
-		if (ret && !b->down_for_sleep)
-			dev_warn(&b->pdev->dev, "H17 ANE: no clean stop (%d) while parking\n", ret);
 		/* A refused sleep is a failed suspend: the deep path cuts its power cleanly. */
-		else if (ret && apple_sleep_request_deep_once())
+		if (ret && apple_sleep_request_deep_once())
 			dev_warn(&b->pdev->dev, "H17 ANE: no clean stop (%d), taking the deep path\n", ret);
 		else if (ret)
 			return ret == -EBUSY ? -EIO : ret;
@@ -1005,7 +996,6 @@ static int ane_fw_sleep_prepare(struct ane_fw_backend *b)
 	/* Parked: already off, with nothing to stop. */
 	if (b->parked)
 		return 0;
-	b->down_for_sleep = true;
 	/*
 	 * A quarantined engine that never came up has nothing to lose; give
 	 * back an ANE_SYS reference a failed power-up kept.
