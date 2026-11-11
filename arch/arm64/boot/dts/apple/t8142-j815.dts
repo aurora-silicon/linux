@@ -126,6 +126,7 @@
 #include "t8142-j813-avd.dtsi"
 #include "t8142-j813-isp.dtsi"
 #include "t8142-j813-n1.dtsi"
+#include "t8142-j813-audio.dtsi"
 
 &mtp_hid {
 	multi-touch {
@@ -191,5 +192,19 @@
 			/* Filled by the loader */
 			local-bd-address = [00 00 00 00 00 00];
 		};
+	};
+};
+
+/*
+ * J815 has six speaker amplifiers, not J813's four. Keep J813's sound card
+ * and the AOP audio service off until the J815 speaker layout is described.
+ */
+&aop_audio {
+	status = "disabled";
+};
+
+/ {
+	sound {
+		status = "disabled";
 	};
 };
