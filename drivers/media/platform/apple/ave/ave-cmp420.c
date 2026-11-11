@@ -18,15 +18,16 @@
  * solid blocks (Y 0x60, CbCr 0x01) one sample (pair) for all 32.
  *
  * The writer marks every block raw, so its output is a lossless surface
- * with no compression. The reader decodes raw and solid blocks exactly. Any
- * other block is counted and filled with a marker. In luma the ordinary
- * lossless modes (all but mode 7, upper three bits) carry their size in the
- * low five bits, so the reader keeps its place after them; after any other
- * unknown block, and after any unknown CbCr block, the rest of that
- * compression tile is unknown too.
+ * with no compression. The reader decodes raw and solid blocks and the
+ * coded forms the MCTF writes: luma modes 0, 1, 4 and 5 and CbCr blocks
+ * with direct, neighbour or constant prediction per component. Any other
+ * block is counted and filled with a marker. Luma blocks other than mode 7
+ * and every CbCr block carry their size in the metadata byte, so the reader
+ * keeps its place after an unknown block of those kinds.
  *
  * Copyright The Aurora Silicon Contributors
  */
+#include <linux/bitfield.h>
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/minmax.h>
@@ -244,11 +245,48 @@ static const u8 ave_cmp420_nb_order[AVE_CMP420_BLOCK - 1] = {
 };
 
 /*
+ * Residuals to 32 samples of one component, written every @step bytes in
+ * Morton order. Direct prediction: sample 0 is the base, sample k is base +
+ * residual k. Neighbour prediction (@tree): the tree above, with the origin
+ * (the base) at sample 7 and sample 0 in slot 7. Samples wrap modulo 256.
+ */
+static void ave_cmp420_recon(u8 base, const s32 *eff, bool tree, u8 *o,
+			     u32 step)
+{
+	u8 v[AVE_CMP420_BLOCK];
+
+	if (!tree) {
+		o[0] = base;
+		for (u32 k = 1; k < AVE_CMP420_BLOCK; k++)
+			o[k * step] = base + eff[k];
+		return;
+	}
+	v[0] = base;
+	for (u32 i = 0; i < ARRAY_SIZE(ave_cmp420_nb_order); i++) {
+		u8 k = ave_cmp420_nb_order[i], from = ave_cmp420_nb_pred[k];
+
+		v[k] = (from == AVE_CMP420_FROM_BASE ? base : v[from]) + eff[k];
+	}
+	for (u32 k = 0; k < AVE_CMP420_BLOCK; k++)
+		o[(k == 0 ? 7 : k == 7 ? 0 : k) * step] = v[k];
+}
+
+/* Residual k of a component: width - reduction of its region, bias only at full width */
+static s32 ave_cmp420_residual(struct ave_cmp420_bits *b, u32 w,
+			       const u32 *red, s32 bias, u32 k)
+{
+	u32 g = k / 8, n = w > red[g] ? w - red[g] : 0;
+
+	return ave_cmp420_sget(b, n) - (red[g] ? 0 : bias);
+}
+
+/*
  * Decode one coded luma block (modes 0, 1, 4, 5) into 32 samples in Morton
  * order. Payload: has_bias:1, width-1:3, base:8, [four 2-bit width
  * reductions, modes 4/5], [signed bias:width], then 31 signed residuals,
  * slot k at width - reduction[k / 8]; the bias applies to full-width
- * regions only. Returns false for a mode this reader does not know.
+ * regions only. Odd modes use neighbour prediction. Returns false for a
+ * mode this reader does not know.
  */
 static bool ave_cmp420_y_coded(const u8 *p, u32 len, u8 mode, u8 *o)
 {
@@ -256,7 +294,7 @@ static bool ave_cmp420_y_coded(const u8 *p, u32 len, u8 mode, u8 *o)
 	u32 w, red[4] = { 0 };
 	s32 bias = 0, eff[AVE_CMP420_BLOCK] = { 0 };
 	bool has_bias;
-	u8 base, v[AVE_CMP420_BLOCK];
+	u8 base;
 
 	if (mode != 0 && mode != 1 && mode != 4 && mode != 5)
 		return false;
@@ -269,25 +307,66 @@ static bool ave_cmp420_y_coded(const u8 *p, u32 len, u8 mode, u8 *o)
 			red[r] = ave_cmp420_get(&b, 2);
 	if (has_bias)
 		bias = ave_cmp420_sget(&b, w);
-	for (u32 k = 1; k < AVE_CMP420_BLOCK; k++) {
-		u32 g = k / 8, n = w > red[g] ? w - red[g] : 0;
+	for (u32 k = 1; k < AVE_CMP420_BLOCK; k++)
+		eff[k] = ave_cmp420_residual(&b, w, red, bias, k);
+	ave_cmp420_recon(base, eff, mode & 1, o, 1);
+	return true;
+}
 
-		eff[k] = ave_cmp420_sget(&b, n) - (red[g] ? 0 : bias);
-	}
-	if (mode == 0 || mode == 4) {
-		o[0] = base;
-		for (u32 k = 1; k < AVE_CMP420_BLOCK; k++)
-			o[k] = base + eff[k];
-		return true;
-	}
-	v[0] = base;
-	for (u32 i = 0; i < ARRAY_SIZE(ave_cmp420_nb_order); i++) {
-		u8 k = ave_cmp420_nb_order[i], from = ave_cmp420_nb_pred[k];
+/* CbCr header flags */
+#define AVE_CMP420_C_CB_RED	BIT(0)	/* Cb region reductions follow */
+#define AVE_CMP420_C_CB_BIAS	BIT(1)	/* signed Cb bias follows */
+#define AVE_CMP420_C_CR_KIND	GENMASK(4, 3)	/* Cr prediction */
+#define AVE_CMP420_C_CR_RED	BIT(5)
+#define AVE_CMP420_C_CR_BIAS	BIT(6)
+#define AVE_CMP420_C_UNKNOWN	(BIT(2) | BIT(7))
+/* Prediction kinds: direct, neighbour tree, constant (no residuals) */
+#define AVE_CMP420_KIND_DIRECT	0
+#define AVE_CMP420_KIND_TREE	1
+#define AVE_CMP420_KIND_CONST	3
 
-		v[k] = (from == AVE_CMP420_FROM_BASE ? base : v[from]) + eff[k];
-	}
-	for (u32 k = 0; k < AVE_CMP420_BLOCK; k++)
-		o[k == 0 ? 7 : k == 7 ? 0 : k] = v[k];
+/*
+ * Decode one coded CbCr block into 32 interleaved pairs. Payload: flags:8,
+ * Cb width-1:3, Cr width-1:3, Cb base:8, Cr base:8, [Cb reductions],
+ * [Cr reductions], [Cb bias], [Cr bias], then for slots 1..31 the Cb and
+ * the Cr residual. Cb's prediction is the metadata's upper two bits, Cr's
+ * is in the flags. Returns false for a form this reader does not know.
+ */
+static bool ave_cmp420_c_coded(const u8 *p, u32 len, u8 meta, u8 *o)
+{
+	struct ave_cmp420_bits b;
+	u32 flags, kind[2], w[2], red[2][4] = { { 0 } };
+	s32 bias[2] = { 0 }, eff[2][AVE_CMP420_BLOCK] = { { 0 } };
+	u8 base[2];
+
+	ave_cmp420_bits_init(&b, p, len);
+	flags = ave_cmp420_get(&b, 8);
+	kind[0] = meta >> 6;
+	kind[1] = FIELD_GET(AVE_CMP420_C_CR_KIND, flags);
+	if ((flags & AVE_CMP420_C_UNKNOWN) || kind[0] == 2 || kind[1] == 2)
+		return false;
+	w[0] = ave_cmp420_get(&b, 3) + 1;
+	w[1] = ave_cmp420_get(&b, 3) + 1;
+	base[0] = ave_cmp420_get(&b, 8);
+	base[1] = ave_cmp420_get(&b, 8);
+	if (flags & AVE_CMP420_C_CB_RED)
+		for (u32 r = 0; r < 4; r++)
+			red[0][r] = ave_cmp420_get(&b, 2);
+	if (flags & AVE_CMP420_C_CR_RED)
+		for (u32 r = 0; r < 4; r++)
+			red[1][r] = ave_cmp420_get(&b, 2);
+	if (flags & AVE_CMP420_C_CB_BIAS)
+		bias[0] = ave_cmp420_sget(&b, w[0]);
+	if (flags & AVE_CMP420_C_CR_BIAS)
+		bias[1] = ave_cmp420_sget(&b, w[1]);
+	for (u32 k = 1; k < AVE_CMP420_BLOCK; k++)
+		for (u32 c = 0; c < 2; c++)
+			if (kind[c] != AVE_CMP420_KIND_CONST)
+				eff[c][k] = ave_cmp420_residual(&b, w[c], red[c],
+								bias[c], k);
+	for (u32 c = 0; c < 2; c++)
+		ave_cmp420_recon(base[c], eff[c], kind[c] == AVE_CMP420_KIND_TREE,
+				 o + c, 2);
 	return true;
 }
 
@@ -365,25 +444,23 @@ static unsigned int ave_cmp420_c_ctile(const u8 *body, const u8 *meta, u8 *out,
 		}
 		{
 			u32 n = (m & 0x3f) + 1;
-			bool fits = off + n <= size;
-			struct ave_cmp420_bits b;
-			u8 cb, cr;
 
-			/* Coded RG8 block: only its two bases are known (bits 14, 22). */
-			ave_cmp420_bits_init(&b, body + off, fits ? n : 0);
-			b.pos = 14;
-			cb = ave_cmp420_get(&b, 8);
-			cr = ave_cmp420_get(&b, 8);
+			if (off + n > size) {
+				sync = false;
+			} else if (sync && ave_cmp420_c_coded(body + off, n, m, o)) {
+				off += n;
+				st->coded++;
+				seen |= SEEN_RAW;
+				continue;
+			} else {
+				off += n;
+			}
 			for (u32 j = 0; j < AVE_CMP420_BLOCK; j++) {
-				o[2 * j] = sync && fits ? cb : AVE_CMP420_CB_MARK;
-				o[2 * j + 1] = sync && fits ? cr : AVE_CMP420_CR_MARK;
+				o[2 * j] = AVE_CMP420_CB_MARK;
+				o[2 * j + 1] = AVE_CMP420_CR_MARK;
 			}
 			st->other++;
 			seen |= SEEN_OTHER;
-			if (fits)
-				off += n;
-			else
-				sync = false;
 		}
 	}
 	return seen;

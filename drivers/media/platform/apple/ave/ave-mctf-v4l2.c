@@ -267,8 +267,8 @@ static void ave_mctf_log_meta(struct ave_ctx *ctx, const char *plane, bool chrom
 }
 
 /*
- * Read the output surface of @slot into @dst as NV12. Raw and solid tiles
- * are exact; other tile modes are not decoded and show the marker colour.
+ * Read the output surface of @slot into @dst as NV12. Block forms the
+ * reader does not know show the marker colour.
  * The debug log counts the tile kinds of every frame.
  */
 static int ave_mctf_get_picture(struct ave_ctx *ctx, unsigned int slot,
@@ -298,11 +298,11 @@ static int ave_mctf_get_picture(struct ave_ctx *ctx, unsigned int slot,
 			  sess->mctf_lin + luma, sess->p.stride, &ys, &cs);
 	memcpy(to, sess->mctf_lin, luma * 3 / 2);
 	dev_dbg(ctx->ave->dev,
-		"MCTF frame %u slot %u tiles raw/solid/mixed/other: Y %u/%u/%u/%u CbCr %u/%u/%u/%u; blocks raw/solid/other: Y %u/%u/%u CbCr %u/%u/%u\n",
+		"MCTF frame %u slot %u tiles raw/solid/mixed/other: Y %u/%u/%u/%u CbCr %u/%u/%u/%u; blocks raw/solid/coded/other: Y %u/%u/%u/%u CbCr %u/%u/%u/%u\n",
 		ctx->dst_sequence, slot,
 		ys.tiles_raw, ys.tiles_solid, ys.tiles_mixed, ys.tiles_other,
 		cs.tiles_raw, cs.tiles_solid, cs.tiles_mixed, cs.tiles_other,
-		ys.raw, ys.solid, ys.other, cs.raw, cs.solid, cs.other);
+		ys.raw, ys.solid, ys.coded, ys.other, cs.raw, cs.solid, cs.coded, cs.other);
 	ave_mctf_log_meta(ctx, "Y", false);
 	ave_mctf_log_meta(ctx, "CbCr", true);
 	return 0;

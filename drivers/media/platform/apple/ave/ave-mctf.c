@@ -21,8 +21,8 @@
  *
  * The surfaces are Apple's lossless compressed 4:2:0 form (ave-cmp420.c).
  * The driver writes each NV12 input picture as raw tiles and reads the
- * output's raw and solid tiles back to NV12 on the CPU; any other tile mode
- * is counted and shown as a marker (ave-mctf-v4l2.c).
+ * output back to NV12 on the CPU; a block form the reader does not know is
+ * counted and shown as a marker (ave-mctf-v4l2.c).
  *
  * Copyright The Aurora Silicon Contributors
  */

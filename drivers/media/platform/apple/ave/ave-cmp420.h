@@ -2,8 +2,8 @@
 /*
  * Apple lossless compressed 8-bit 4:2:0 surfaces ("&8v0"), the picture form
  * the AVE MCTF client reads and writes. CPU helpers only: a raw-tile writer
- * and a raw/solid reader. Everything else a surface can hold is counted and
- * shown as a marker; it is not decoded.
+ * and a reader for the lossless block forms the MCTF writes. A block form
+ * the reader does not know is counted and shown as a marker.
  *
  * Copyright The Aurora Silicon Contributors
  */
