@@ -112,6 +112,9 @@
 &mesa {
 	status = "okay";
 	enable-gpios = <&pinctrl_ap 108 GPIO_ACTIVE_HIGH>;
+	/* ADT spi2/mesa: data ready on AP GPIO 104 */
+	interrupt-parent = <&pinctrl_ap>;
+	interrupts = <104 IRQ_TYPE_EDGE_RISING>;
 	spi-cs-setup-delay-ns = <20>;
 	spi-cs-hold-delay-ns = <20>;
 	/*
