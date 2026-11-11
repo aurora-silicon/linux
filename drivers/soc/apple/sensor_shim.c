@@ -625,7 +625,7 @@ static irqreturn_t sep_drdy_isr(int irq, void *dev_id)
  * configured and enabled for the driver's lifetime -- never toggled per capture
  * -- because reconfiguring this line mid-capture is what drops the sensor's
  * firmware patch. Returns 0 when an interrupt is available, -errno otherwise
- * (the caller then falls back to polling).
+ * (the sensor then cannot capture).
  */
 static int sep_sensor_irq_setup_locked(void)
 {
@@ -727,8 +727,8 @@ static void sep_sensor_irq_arm_locked(void)
 
 /*
  * Wait for the data-ready line to assert, up to timeout_ms. 0 = fired,
- * -ETIMEDOUT = no signal (the caller re-polls status over SPI regardless, so a
- * missed interrupt only costs one poll interval), -ENODEV = no interrupt.
+ * -ETIMEDOUT = no signal (the caller reads status over SPI regardless, so a
+ * missed interrupt only costs one wait), -ENODEV = no interrupt.
  */
 static int sep_sensor_irq_wait_locked(unsigned int timeout_ms)
 {
