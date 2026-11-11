@@ -219,6 +219,20 @@ bool hdmi_audio = true;
 module_param(hdmi_audio, bool, 0644);
 MODULE_PARM_DESC(hdmi_audio, "DP/HDMI audio of external displays (default: on)");
 
+/*
+ * Firmware 27 (H17G) internal panel: how the first mode set reaches the panel
+ * iBoot already lit.  On J815 the firmware advertises a single fixed timing and
+ * rejects set_digital_out_mode for it (0x8000000b, "create_default_fb_surface
+ * failed"); the pipe then never scans out and the panel stays black.
+ *   -1 auto: keep the boot mode when the panel advertises one timing (default)
+ *    0 always send set_digital_out_mode (the previous behaviour)
+ *    1 always keep the boot mode on the internal panel
+ */
+int fw27_panel_boot_mode = -1;
+module_param(fw27_panel_boot_mode, int, 0644);
+MODULE_PARM_DESC(fw27_panel_boot_mode,
+		 "FW27 internal panel: -1 keep the boot mode for a single fixed timing (default), 0 always mode-set, 1 always keep the boot mode");
+
 static bool unstable_edid = true;
 module_param(unstable_edid, bool, 0644);
 MODULE_PARM_DESC(unstable_edid, "Enable unstable EDID retrival support");
