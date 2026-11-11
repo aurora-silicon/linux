@@ -694,11 +694,12 @@ static int dcpaud_pin_rate_format(struct dcp_audio *dcpaud,
 				  struct snd_pcm_runtime *runtime)
 {
 	static const unsigned int rates[] = { 48000, 44100, 32000 };
+	/* The 24-bit element only: a 16-bit one would need a widening path (see open). */
 	static const snd_pcm_format_t formats[] = {
-		SNDRV_PCM_FORMAT_S24_LE, SNDRV_PCM_FORMAT_S16_LE,
+		SNDRV_PCM_FORMAT_S24_LE,
 	};
 	struct dcp_sound_format_mask sieve = {
-		.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE,
+		.formats = SNDRV_PCM_FMTBIT_S24_LE,
 		.rates = GENMASK(snd_pcm_known_rates.count - 1, 0),
 		.nchans = BIT(2),
 	};
@@ -865,6 +866,20 @@ static int dcp_pcm_native_open(struct snd_pcm_substream *substream)
 	}
 
 	ret = dcp_pcm_open(substream);
+	/*
+	 * The DPA takes one 32-bit entry per channel sample whatever the
+	 * link's sample size: packed S16_LE (one word per stereo frame) plays
+	 * as silence, so native links take 32-bit containers only.
+	 */
+	if (!ret) {
+		ret = snd_pcm_hw_constraint_mask64(substream->runtime, SNDRV_PCM_HW_PARAM_FORMAT,
+						   SNDRV_PCM_FMTBIT_S20_LE | SNDRV_PCM_FMTBIT_S24_LE |
+						   SNDRV_PCM_FMTBIT_S32_LE);
+		if (ret > 0)
+			ret = 0;
+		if (ret)
+			dcp_pcm_close(substream);
+	}
 	if (!ret && live && !dcpaud->open_unplugged) {
 		ret = dcpaud_pin_rate_format(dcpaud, substream->runtime);
 		if (!ret)
@@ -926,6 +941,11 @@ static void dcpaud_link_teardown(struct dcp_audio *dcpaud)
 	live = (dcpaud->link_prepared || dcpaud->link_started) &&
 	       dcp_audiosrv_link_live(dcpaud->dcp_dev);
 	if (dcpaud->link_started && live) {
+		/* As macOS: the stopping notification, then STOP, same link data. */
+		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_WILL_STOP,
+					&dcpaud->link_cookie);
+		if (ret && ret != -ENODEV)
+			dev_err(dcpaud->dev, "audio link will-stop failed: %d\n", ret);
 		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_STOP,
 					&dcpaud->link_cookie);
 		if (ret && ret != -ENODEV)
@@ -1077,8 +1097,18 @@ static int dcp_pcm_native_start(struct snd_pcm_substream *substream, int cmd)
 		return 0;
 	ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_START,
 				&dcpaud->link_cookie);
-	dcpaud->link_started = !ret;
-	return ret;
+	if (ret)
+		return ret;
+	/* As macOS: START, then the started notification with the same link data. */
+	ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_DID_START,
+				&dcpaud->link_cookie);
+	if (ret) {
+		dev_err(dcpaud->dev, "audio link did-start failed: %d\n", ret);
+		dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_STOP, &dcpaud->link_cookie);
+		return ret;
+	}
+	dcpaud->link_started = true;
+	return 0;
 }
 
 static int dcp_pcm_native_trigger(struct snd_pcm_substream *substream, int cmd)
@@ -1157,6 +1187,169 @@ static int dcp_pcm_native_sync_stop(struct snd_pcm_substream *substream)
 	dcpaud_link_teardown(dcpaud);
 
 	return ret;
+}
+
+/*
+ * The default element of a held link: stereo at the rate and sample size
+ * dcpaud_pin_rate_format() gives a stream, so that the first stream follows
+ * the link instead of replacing it. 0 if the sink has none.
+ */
+static int dcpaud_select_default_cookie(struct dcp_audio *dcpaud)
+{
+	static const unsigned int rates[] = { 48000, 44100, 32000 };
+	struct dcp_sound_format_mask sieve = {
+		.formats = SNDRV_PCM_FMTBIT_S24_LE,
+		.rates = GENMASK(snd_pcm_known_rates.count - 1, 0),
+		.nchans = BIT(2),
+	};
+	struct dcp_sound_format_mask hits = { 0, 0, 0 };
+	struct dcp_parse_ctx elements = {
+		.dcp = dev_get_drvdata(dcpaud->dcp_dev),
+		.blob = dcpaud->elements + 4,
+		.len = dcpaud_elements_size(dcpaud) - 4,
+		.pos = 0,
+		.v14_7_audio = dcpaud->native_link,
+	};
+	unsigned int i, j;
+
+	parse_sound_constraints(&elements, &sieve, &hits);
+	for (i = 0; i < ARRAY_SIZE(rates); i++)
+		for (j = 0; j < snd_pcm_known_rates.count; j++)
+			if (snd_pcm_known_rates.list[j] == rates[i] && (hits.rates & BIT(j))) {
+				sieve.rates = BIT(j);
+				elements.pos = 0;
+				return parse_sound_mode(&elements, &sieve, &dcpaud->selected_chmap,
+							&dcpaud->selected_cookie);
+			}
+	return 0;
+}
+
+/*
+ * Holds a link of the selected element with silence, as one a stream left:
+ * PREPARE, the silence as the channel's idle transfer, START and the
+ * started notification. The link then carries the PM reference.
+ */
+static int dcpaud_hold_link_locked(struct dcp_audio *dcpaud)
+{
+	struct dma_slave_config slave_config = {
+		.direction = DMA_MEM_TO_DEV,
+		.dst_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES,
+	};
+	int ret;
+
+	lockdep_assert_held(&dcpaud->link_lock);
+	if (!dcpaud->chan || !dcpaud->silence)
+		return -ENODEV;
+	if (pm_runtime_get_sync(dcpaud->dev) < 0 && pm_runtime_enabled(dcpaud->dev)) {
+		pm_runtime_put_noidle(dcpaud->dev);
+		return -EIO;
+	}
+	ret = dmaengine_slave_config(dcpaud->chan, &slave_config);
+	if (!ret)
+		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_PREPARE,
+					&dcpaud->selected_cookie);
+	if (ret)
+		goto put;
+	dcpaud->link_prepared = true;
+	dcpaud->link_cookie = dcpaud->selected_cookie;
+	/* The silence first, as a stream's first period: the link must not start dry. */
+	ret = dcpaud_silence_start(dcpaud);
+	if (ret) {
+		dcpaud_link_teardown(dcpaud);
+		goto put;
+	}
+	ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_START, &dcpaud->link_cookie);
+	if (!ret) {
+		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_DID_START,
+					&dcpaud->link_cookie);
+		if (ret)
+			dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_STOP,
+					  &dcpaud->link_cookie);
+	}
+	if (ret) {
+		/* The silence carries the PM reference: teardown drops it. */
+		dcpaud_link_teardown(dcpaud);
+		return ret;
+	}
+	dcpaud->link_started = true;
+	return 0;
+put:
+	pm_runtime_mark_last_busy(dcpaud->dev);
+	pm_runtime_put_autosuspend(dcpaud->dev);
+	return ret;
+}
+
+/* A link is held, or a stream runs or is about to start its own. */
+static bool dcpaud_link_busy_locked(struct dcp_audio *dcpaud)
+{
+	lockdep_assert_held(&dcpaud->link_lock);
+	return dcpaud->link_prepared || dcpaud->link_started || dcpaud->silence_running ||
+	       READ_ONCE(dcpaud->stream_dma);
+}
+
+/*
+ * As macOS: the connection gets its default link before the display's mode
+ * is set, held with silence until a stream takes it over, so the link runs
+ * through the mode set. A link first started after the mode set left a
+ * monitor recovering a clock ~1500 ppm fast (one repeated sample every ~680
+ * frames); one running through it did not. Called by the display just
+ * before it sets the mode, once the sink's elements are known; a link
+ * already held or a running stream stay as they are.
+ */
+void dcpaud_before_modeset(struct platform_device *pdev)
+{
+	struct dcp_audio *dcpaud = platform_get_drvdata(pdev);
+	unsigned int cookie;
+	bool held;
+	int ret;
+
+	if (!dcpaud || !dcpaud->native_link || !dcpaud->card)
+		return;
+	scoped_guard(mutex, &dcpaud->data_lock) {
+		if (!dcpaud->connected)
+			return;
+		cookie = dcpaud->connection_cookie;
+	}
+	scoped_guard(mutex, &dcpaud->link_lock) {
+		dcpaud_drop_stale(dcpaud);
+		if (dcpaud_link_busy_locked(dcpaud))
+			return;
+	}
+
+	scoped_guard(mutex, &dcpaud->substream->pcm->open_mutex)
+		ret = dcpaud_init_dma(dcpaud);
+	if (ret)
+		goto out;
+	ret = dcp_audiosrv_open(dcpaud->dcp_dev);
+	if (ret)
+		goto out;
+	/* The sink's elements, as a PCM open reads them. */
+	scoped_guard(mutex, &dcpaud->substream->pcm->open_mutex)
+		ret = dcpaud_read_remote_info(dcpaud);
+	held = false;
+	if (!ret) {
+		guard(mutex)(&dcpaud->link_lock);
+		if (dcpaud_link_busy_locked(dcpaud)) {
+			ret = -EBUSY;
+		} else {
+			scoped_guard(mutex, &dcpaud->data_lock)
+				ret = dcpaud->connected && dcpaud->connection_cookie == cookie ?
+					dcpaud_select_default_cookie(dcpaud) : -ENODEV;
+			if (ret > 0)
+				ret = dcpaud_hold_link_locked(dcpaud);
+			else if (!ret)
+				ret = -ENOENT;
+			held = !ret;
+		}
+	}
+	/* A held link keeps its service open, as one a stream left. */
+	if (!held)
+		dcp_audiosrv_close(dcpaud->dcp_dev);
+out:
+	if (ret && ret != -EBUSY)
+		dev_dbg(dcpaud->dev, "no link held before the mode set: %d\n", ret);
+	else if (!ret)
+		dev_dbg(dcpaud->dev, "link held before the mode set\n");
 }
 
 /*
