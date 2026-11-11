@@ -798,11 +798,13 @@ impl Firmware {
         commit_accounting: impl FnOnce() -> Result,
         publish_inner: impl FnOnce(),
         deferred: bool,
+        cursors: Option<[u32; 3]>,
     ) -> Result<[u32; 2]> {
         let mut commit_accounting = Some(commit_accounting);
         let mut publish_inner = Some(publish_inner);
+        let mut cursors = cursors;
         for attempt in 0..2 {
-            let pair = self.init.m5_work_pair(priority, &records[0], &records[1])?;
+            let pair = self.init.m5_work_pair(priority, &records[0], &records[1], cursors.take())?;
             pair.prepare();
             if let Some(commit) = commit_accounting.take() { commit()?; }
             match self.bridge.regs.submit_m5_work(submission) {

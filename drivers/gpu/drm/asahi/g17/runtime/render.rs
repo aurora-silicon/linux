@@ -526,8 +526,19 @@ struct Host<'a> {
     registration_powered: bool,
     /// An M5 pair's installation, submitted with its first outer publication.
     m5_registration: Option<crate::g17::fw::m5::queue::HardwareSubmission>,
+    /// M5: the shared ring's room check of this publication, by priority. It serves the
+    /// first pair written to the ring only.
+    outer_cursors: Option<(u8, [u32; 3])>,
 }
 impl Host<'_> {
+    /// The room check's cursors for the first pair this publication writes to the ring.
+    fn room_cursors(&mut self, priority: u8) -> Option<[u32; 3]> {
+        self.outer_cursors
+            .take()
+            .filter(|&(checked, _)| checked == priority)
+            .map(|(_, cursors)| cursors)
+    }
+
     fn release_registration(&mut self) {
         if !self.registration_powered && !self.firmware.registration_power_release_pending {
             return;
@@ -634,6 +645,7 @@ impl crate::g17::queue::render::Host for Host<'_> {
                     tiling.qid,
                 )?,
             };
+            let cursors = self.room_cursors(priority);
             return self.firmware.submit_m5_render_pair(
                 priority,
                 &[copy_slot(fragment), copy_slot(tiling)],
@@ -641,6 +653,7 @@ impl crate::g17::queue::render::Host for Host<'_> {
                 commit,
                 late_tiling,
                 true,
+                cursors,
             );
         }
         self.firmware
@@ -654,7 +667,8 @@ impl crate::g17::queue::render::Host for Host<'_> {
         tiling: &crate::g17::fw::channels::WorkSlot,
         prepare: impl FnOnce(),
     ) -> Result {
-        let pair = self.firmware.init.m5_work_pair(priority, fragment, tiling)?;
+        let cursors = self.room_cursors(priority);
+        let pair = self.firmware.init.m5_work_pair(priority, fragment, tiling, cursors)?;
         pair.prepare();
         prepare();
         pair.publish();
@@ -677,6 +691,8 @@ impl crate::g17::queue::render::Host for Host<'_> {
         tiling: &crate::g17::fw::channels::WorkSlot,
         next: [u32; 2],
     ) -> Result {
+        // This pair moves the producer: a room check's sample no longer holds.
+        self.outer_cursors = None;
         let result = self
             .firmware
             .init
@@ -763,6 +779,17 @@ impl crate::g17::Firmware {
         slot: usize,
         operation: impl FnOnce(&mut Pair, &mut Host<'_>) -> Result<R>,
     ) -> Result<R> {
+        self.with_render_at(slot, None, operation)
+    }
+
+    /// [`Self::with_render`] for a publication whose shared-ring room check, made in this
+    /// hold, sampled `outer_cursors`.
+    fn with_render_at<R>(
+        &mut self,
+        slot: usize,
+        outer_cursors: Option<(u8, [u32; 3])>,
+        operation: impl FnOnce(&mut Pair, &mut Host<'_>) -> Result<R>,
+    ) -> Result<R> {
         let mut pair = self
             .queues
             .render
@@ -775,6 +802,7 @@ impl crate::g17::Firmware {
             firmware: self,
             registration_powered: false,
             m5_registration: None,
+            outer_cursors,
         };
         let result = operation(&mut pair, &mut host);
         host.release_registration();

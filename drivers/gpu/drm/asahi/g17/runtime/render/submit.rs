@@ -749,15 +749,23 @@ impl crate::g17::Firmware {
         let port = self.port.clone();
         let _render = port.render_lock();
         // Both outer destinations must have room before pool accounting or
-        // either inner queue becomes visible. On M5 both are the shared compute ring, and
-        // one check covers the pair (each reads the ring's cursors from shared memory).
+        // either inner queue becomes visible. On M5 both are the shared compute ring: one
+        // check covers the pair, and the pair is written against its cursors (this hold
+        // is the ring's only producer; the firmware's consumers only advance).
         let priority = packet.context.policy().priority();
-        if !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Fragment)?
-            || (!self.init.is_m5()
-                && !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Tiling)?)
-        {
-            return Err(EBUSY);
-        }
+        let outer_cursors = if self.init.is_m5() {
+            let Some(cursors) = self.init.m5_render_room(priority)? else {
+                return Err(EBUSY);
+            };
+            Some((priority, cursors))
+        } else {
+            if !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Fragment)?
+                || !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Tiling)?
+            {
+                return Err(EBUSY);
+            }
+            None
+        };
         if let Some(footprint) = packet.footprint.as_ref() {
             dependencies.hazard_count = self.queues.admission.publication_barriers(
                 owner,
@@ -798,7 +806,7 @@ impl crate::g17::Firmware {
             buffer_token,
             buffer_context: buffer_context.map(|(context, _)| context),
         };
-        let result = self.with_render(usize::from(slot), |pair, host| {
+        let result = self.with_render_at(usize::from(slot), outer_cursors, |pair, host| {
             pair.publish(
                 packet.clone(),
                 &dependencies,

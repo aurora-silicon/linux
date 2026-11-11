@@ -708,6 +708,18 @@ impl InitData {
         Ok((self.outer_capacity(priority, cursors)? >= 1).then_some(cursors))
     }
 
+    /// M5 render: the shared ring's cursors when it has room for a pair, as
+    /// [`Self::work_ready`] judges it, for the pair's publication in the same hold
+    /// ([`Self::m5_work_pair`]).
+    pub(super) fn m5_render_room(&self, priority: u8) -> Result<Option<[u32; 3]>> {
+        use super::fw::queue::DataMaster;
+        if !self.m5 {
+            return Err(EINVAL);
+        }
+        let cursors = self.work_cursors(priority, DataMaster::Compute)?;
+        Ok((self.outer_capacity(priority, cursors)? >= 2).then_some(cursors))
+    }
+
     /// `cursors`: an M5 compute room check's sample ([`Self::m5_compute_room`]), else read here.
     fn work_publication<'a>(
         &'a self,
@@ -808,11 +820,14 @@ impl InitData {
 
     /// Reserve both common-ring slots before touching either host port. The
     /// returned views retain the graph borrow until the pair is published.
+    /// `cursors`: a room check's sample from the same hold ([`Self::m5_render_room`]),
+    /// else read here.
     pub(super) fn m5_work_pair(
         &self,
         priority: u8,
         fragment: &super::fw::channels::WorkSlot,
         tiling: &super::fw::channels::WorkSlot,
+        cursors: Option<[u32; 3]>,
     ) -> Result<work_pair::Publication<'_>> {
         use super::fw::{channels, queue::DataMaster};
         if !self.m5
@@ -821,7 +836,10 @@ impl InitData {
         {
             return Err(EINVAL);
         }
-        let cursors = self.work_cursors(priority, DataMaster::Compute)?;
+        let cursors = match cursors {
+            Some(cursors) => cursors,
+            None => self.work_cursors(priority, DataMaster::Compute)?,
+        };
         if self.outer_capacity(priority, cursors)? < 2 { return Err(EBUSY); }
         let window = work_pair::Window::new(cursors)?;
         let channel = channels::work_ring_index(priority, DataMaster::Compute).ok_or(EINVAL)?;
@@ -863,7 +881,7 @@ impl InitData {
             return Err(EINVAL);
         }
         if self.m5 {
-            let pair = self.m5_work_pair(priority, fragment, tiling)?;
+            let pair = self.m5_work_pair(priority, fragment, tiling, None)?;
             pair.prepare();
             commit_accounting()?;
             publish_late_tiling();
@@ -934,7 +952,7 @@ impl InitData {
     ) -> Result {
         use super::fw::queue::DataMaster;
         if self.m5 {
-            let pair = self.m5_work_pair(priority, fragment, tiling)?;
+            let pair = self.m5_work_pair(priority, fragment, tiling, None)?;
             if pair.next() != next { return Err(EBUSY); }
             pair.publish();
             return Ok(());
