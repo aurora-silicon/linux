@@ -1064,13 +1064,35 @@ static int ane_fw_sleep_prepare(struct ane_fw_backend *b)
 	return 0;
 }
 
-/* Called by genpd under its lock, in the noirq phase too: record only. */
+static bool dart_off = true;
+module_param(dart_off, bool, 0644);
+MODULE_PARM_DESC(dart_off, "Deactivate the H17 ANE DARTs before ANE_SYS powers off, as macOS does");
+
+/*
+ * Called by genpd under its lock, in the noirq phase too: nothing that sleeps.
+ *
+ * macOS deactivates the three ANE DARTs before every ANE_SYS power-off, with
+ * or without firmware: it also powers ANE_SYS up for DART work alone and down
+ * again this way (recorded, 25G83). Here ANE_SYS goes off in genpd, held on
+ * by the DARTs until then, with their streams still enabled; on most sleeps
+ * it then reaches off with BUSY latched. Do macOS's step right before the off.
+ */
 static int ane_fw_genpd_event(struct notifier_block *nb, unsigned long action, void *data)
 {
 	struct ane_fw_backend *b = container_of(nb, struct ane_fw_backend, genpd_nb);
 	u64 now = ktime_get_boottime_ns();
 
-	if (action == GENPD_NOTIFY_OFF) {
+	if (action == GENPD_NOTIFY_PRE_OFF && dart_off && b->soc->exclave_mode_stop &&
+	    b->dart[0] && b->dart[1] && b->dart[2]) {
+		u32 streams[ANE_FW_DARTS];
+
+		for (unsigned int i = 0; i < ANE_FW_DARTS; i++)
+			streams[i] = ane_rd32(b, b->dart[i] + 0xc00);
+		ane_fw_dart_deactivate(b);
+		dev_info(&b->pdev->dev,
+			 "H17 ANE: DARTs off before ANE_SYS: streams were %#x %#x %#x, PMGR %#x\n",
+			 streams[0], streams[1], streams[2], ane_rd32(b, b->pmgr + 0x290));
+	} else if (action == GENPD_NOTIFY_OFF) {
 		b->sys_offs++;
 		b->sys_off_pmgr = ane_rd32(b, b->pmgr + 0x290);
 		b->sys_off_at = now;
