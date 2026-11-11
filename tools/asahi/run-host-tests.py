@@ -63,6 +63,7 @@ ASAHI_TESTS = {
     'dcpext26-admission-tests.py': [([], PASS)],
 
     'dcpext26-startup-tests.py': [([], PASS)],
+    'iomfb-startup-tests.py': [([], PASS)],
     'dcpext26-wire-tests.py': [([], PASS)],
     'pmp-native26-tests.py': [([], PASS)],
 
