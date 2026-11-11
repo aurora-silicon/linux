@@ -1082,8 +1082,8 @@ void apple_isp_stop_capture(struct apple_isp *isp)
 {
 	if (isp->ipc_failed || isp->fw_state == ISP_FW_DEAD)
 		return;
-	isp_cmd_ch_stop(isp, 0); // TODO channel mask
-	isp_cmd_ch_buffer_return(isp, isp->current_ch);
+	if (!isp_cmd_ch_stop(isp, 0)) /* TODO channel mask */
+		isp_cmd_ch_buffer_return(isp, isp->current_ch);
 
 	/* ... until its buffers are back. */
 	apple_isp_wdt_stop(isp);

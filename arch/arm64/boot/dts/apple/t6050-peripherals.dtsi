@@ -720,12 +720,27 @@
 		power-domains = <&ps_fab9_soc>;
 		status = "disabled";
 	};
+	/*
+	 * ADT ANE_SYS. The ANE driver switches its children ANE_CPU and
+	 * ANE_TDBASE (+0x3c8, +0x3d0) itself, as on T8140, so ps_ane_cpu stays
+	 * disabled.
+	 */
+	ps_ane_sys: power-controller@3a8 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3a8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ane-sys";
+		power-domains = <&ps_fab8_soc>, <&ps_fab9_soc>;
+		status = "disabled";
+	};
 	ps_ane_cpu: power-controller@3c8 {
 		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x3c8 4>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "ane-cpu";
+		power-domains = <&ps_ane_sys>;
 		status = "disabled";
 	};
 #if defined(T6050_J775C) || defined(T6050_J775D) || defined(T6050_J873S)
@@ -3171,32 +3186,48 @@
 		status = "disabled";
 	};
 
+	/*
+	 * ADT ane0 ("ane,t8132exclave", ane-type 0x220): the T8140 (H17) model.
+	 * The engine, the ANE PMGR window and the power gate at ADT reg[2]
+	 * +0x1590; the other ADT windows, a CPU cluster's included, are not the
+	 * ANE's. Inclusive DAPF bounds from dart-ane0 dapf-instance-0, in record
+	 * order. A board adds the preload reservations its boot loader fills.
+	 */
 	ane0: neural-processor@508000000 {
 		compatible = "apple,t6050-ane";
 		reg = <0x5 0x8000000 0x0 0x2000000>,
 		      <0x2 0x80900000 0x0 0x18000>,
-		      <0x2 0x80920000 0x0 0x4000>,
-		      <0x2 0x84240000 0x0 0x40000>,
-		      <0x2 0x12000000 0x0 0xff4000>,
-		      <0x5 0x84000000 0x0 0x2000000>,
-		      <0x2 0x88374000 0x0 0x4000>;
-		reg-names = "engine", "pmgr", "aux-0", "aux-1", "aux-2",
-			    "aux-3", "aux-4";
+		      <0x2 0x80921590 0x0 0x34>;
+		reg-names = "engine", "pmgr", "pwgate";
 		interrupts = <AIC_IRQ 0 954 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 967 IRQ_TYPE_LEVEL_HIGH>;
-		/* Stream 0 of each DART, as on T6041: the MPM stream 11 is not the host's. */
 		iommus = <&ane0_dart 0>, <&ane0_dart1 0>, <&ane0_dart2 0>;
-		power-domains = <&ps_ane_cpu>;
+		power-domains = <&ps_ane_sys>;
 		clocks = <&peripheral_clocks 335>, <&peripheral_clocks 334>, <&peripheral_clocks 381>;
+		apple,firmware-preloaded;
+		apple,firmware-iovas = /bits/ 64 <0x10000000000 0x100000c0000>;
+		apple,dapf-ranges = /bits/ 64 <0x2809003a8 0x2809003ab>,
+				    /bits/ 64 <0x2809003c0 0x2809003d3>,
+				    /bits/ 64 <0x581668000 0x581668003>,
+				    /bits/ 64 <0x2302668000 0x2302668003>,
+				    /bits/ 64 <0x6302668000 0x6302668003>;
 		status = "disabled";
 	};
 
+	/*
+	 * The ANE DARTs, in ANE_SYS. SID0 is the host's; the ADT's static bypass
+	 * streams (dart-ane0 bypass-10, bypass-13) stay in bypass.
+	 */
 	ane0_dart: iommu@509800000 {
 		compatible = "apple,t6050-dart", "apple,t8110-dart";
 		reg = <0x5 0x9800000 0x0 0xc000>,
 		      <0x5 0x9810000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 955 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_ane_sys>;
+		/* ADT vm-base 0x100_0000_0000, vm-size 0x300_0000_0000 */
+		apple,dma-range = <0x0 0x0 0x400 0x0>;
+		apple,bypass-sids = <10 13>;
 		status = "disabled";
 	};
 
@@ -3205,6 +3236,9 @@
 		reg = <0x5 0x9820000 0x0 0xc000>;
 		interrupts = <AIC_IRQ 0 955 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_ane_sys>;
+		apple,dma-range = <0x0 0x0 0x400 0x0>;
+		apple,bypass-sids = <10 13>;
 		status = "disabled";
 	};
 
@@ -3213,6 +3247,9 @@
 		reg = <0x5 0x9840000 0x0 0xc000>;
 		interrupts = <AIC_IRQ 0 955 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_ane_sys>;
+		apple,dma-range = <0x0 0x0 0x400 0x0>;
+		apple,bypass-sids = <10 13>;
 		status = "disabled";
 	};
 
