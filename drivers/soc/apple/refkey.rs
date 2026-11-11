@@ -539,7 +539,23 @@ impl SepData {
         self.sks_create_refkey_at(user.special_handle().value(), 9, 5, acl).ok_or(EIO)
     }
 
-    /// Test only: sign with a ref-key under the designated user bag `user`.
+    /// Unseal (enclave `ock` + kernel decrypt, as `user_key_unseal`) with a
+    /// ref-key under the designated user bag `user`.
+    pub(crate) fn user_key_unseal_in_bag(
+        &self,
+        user: crate::sks::DesignateUser,
+        blob: &[u8],
+        sealed: &[u8],
+        acm: Option<&[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>,
+    ) -> Result<KVec<u8>> {
+        Self::refkey_pub(blob).ok_or(EINVAL)?;
+        let eph = refkey_seal::sealed_ephemeral(sealed)?;
+        let handle = crate::sks::KeyBagHandle::from_load_reply(user.special_handle().value());
+        let shared = crate::Secret(self.sks_refkey_key_exchange(handle, blob, eph, acm)?);
+        refkey_seal::ecies_open_with_shared(&shared, sealed)
+    }
+
+    /// Sign with a ref-key under the designated user bag `user`.
     pub(crate) fn user_key_sign_in_bag(
         &self,
         user: crate::sks::DesignateUser,
