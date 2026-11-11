@@ -4769,6 +4769,9 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	struct device *piodma_supplier = NULL;
 	int ret;
 
+	/* Setting the ports up again after a real sleep takes ~0.75 s: resume in parallel. */
+	device_enable_async_suspend(&pdev->dev);
+
 	hw = of_device_get_match_data(dev);
 	if (!hw)
 		return -ENODEV;

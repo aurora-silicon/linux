@@ -2454,6 +2454,8 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		return ERR_PTR(ret);
 	anv->adminq.is_adminq = true;
 	platform_set_drvdata(pdev, anv);
+	/* Its resume waits on the coprocessor (0.2 to 0.9 s after a real sleep): not in the others' way. */
+	device_enable_async_suspend(&pdev->dev);
 
 	anv->hw = of_device_get_match_data(&pdev->dev);
 	if (!anv->hw) {
