@@ -20,6 +20,7 @@
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/clpc.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/suspend.h>
 
 #include "ane_fw_cold.h"
@@ -514,17 +515,31 @@ static int ane_fw_rvbar_ready(struct ane_fw_backend *b);
 /* A power word goes off whole, and off means target, actual and BUSY clear. */
 #define ANE_FW_PS_OFF 0x300
 #define ANE_FW_PS_OFF_MASK 0x8ff
+#define ANE_FW_PS_BUSY BIT(11)
+#define ANE_FW_PS_UNLATCH BIT(12)
 
+/* A word left BUSY stalls a wake that keeps DRAM up: clear it, or send this sleep deep. */
 static int ane_fw_ps_off(struct ane_fw_backend *b, u32 offset)
 {
+	void __iomem *reg = b->pmgr + offset;
 	int ret;
 
-	ane_wr32(b, ANE_FW_PS_OFF, b->pmgr + offset);
-	ret = ane_poll32(b, b->pmgr + offset, ANE_FW_PS_OFF_MASK, 0, 1, 100000);
-	if (ret)
-		dev_err(&b->pdev->dev, "H17 ANE: power word %#x stuck at %#x\n", offset,
-			ane_rd32(b, b->pmgr + offset));
-	return ret;
+	ane_wr32(b, ANE_FW_PS_OFF, reg);
+	ret = ane_poll32(b, reg, ANE_FW_PS_OFF_MASK, 0, 1, 100000);
+	if (!ret)
+		return 0;
+	dev_warn(&b->pdev->dev, "H17 ANE: power word %#x stuck at %#x\n", offset, ane_rd32(b, reg));
+	if (!(ane_rd32(b, reg) & 0xff)) {
+		ane_wr32(b, ANE_FW_PS_OFF | ANE_FW_PS_UNLATCH, reg);
+		ane_poll32(b, reg, ANE_FW_PS_BUSY, 0, 1, 1000);
+		ane_wr32(b, ANE_FW_PS_OFF, reg);
+		if (!ane_poll32(b, reg, ANE_FW_PS_OFF_MASK, 0, 1, 1000))
+			return 0;
+	}
+	if (!apple_sleep_request_deep_once())
+		return ret;
+	dev_warn(&b->pdev->dev, "H17 ANE: power word %#x still stuck, taking the deep path\n", offset);
+	return 0;
 }
 
 /* The order macOS uses for this engine: sub-block, PWGATE, its ack, CPU, then ANE_SYS. */
@@ -862,8 +877,10 @@ static int ane_fw_cold_cycle_down(struct ane_fw_backend *b)
 			return -EBUSY;
 	if (ane_fw_clean_stop(b)) {
 		ret = ane_fw_firmware_stop(b);
-		/* Past this point the firmware may be stopped: never a clean refusal. */
-		if (ret)
+		/* A refused sleep is a failed suspend: the deep path cuts its power cleanly. */
+		if (ret && apple_sleep_request_deep_once())
+			dev_warn(&b->pdev->dev, "H17 ANE: no clean stop (%d), taking the deep path\n", ret);
+		else if (ret)
 			return ret == -EBUSY ? -EIO : ret;
 	}
 	return ane_fw_power_down(b);

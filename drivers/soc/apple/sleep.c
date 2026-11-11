@@ -656,6 +656,19 @@ static void sleep_slp_ddr_write(void)
 	writel(val, sleep_slp_ddr_word);
 }
 
+/* A driver found something the DRAM-kept wake would stall on: this sleep goes deep. */
+static bool sleep_deep_requested;
+
+bool apple_sleep_request_deep_once(void)
+{
+	if (!READ_ONCE(apple_sleep))
+		return false;
+	WRITE_ONCE(sleep_deep_requested, true);
+
+	return true;
+}
+EXPORT_SYMBOL_GPL(apple_sleep_request_deep_once);
+
 static void sleep_slp_ddr_set_deep_once(bool deep)
 {
 	guard(spinlock_irqsave)(&sleep_slp_ddr_lock);
@@ -2886,7 +2899,9 @@ static int apple_sleep_enter(suspend_state_t state)
 	apple_sleep_coprocs_stop(s, false);
 	/* Done by now unless no SMC driver is bound. */
 	apple_sleep_usb_down(s);
-	s->deep_once = false;
+	s->deep_once = READ_ONCE(sleep_deep_requested);
+	if (s->deep_once)
+		sleep_slp_ddr_set_deep_once(true);
 
 	s->cntkctl = read_sysreg(cntkctl_el1);
 	pm_set_resume_via_firmware();
@@ -2927,6 +2942,7 @@ static int apple_sleep_begin(suspend_state_t state)
 
 static void apple_sleep_end(void)
 {
+	WRITE_ONCE(sleep_deep_requested, false);
 	if (pm_suspend_via_firmware())
 		writel(0, apple_sleep->wdt + WDT_WD2_CTL);
 }
@@ -3016,7 +3032,7 @@ static void apple_sleep_report(void)
 		dev_warn(s->dev, "power word %#x was off with BUSY latched at the commit: %#x\n",
 			 s->ps_unlatched[i].offset, s->ps_unlatched[i].val);
 	if (s->deep_once)
-		dev_info(s->dev, "took the deep path: a power word stayed latched\n");
+		dev_info(s->dev, "took the deep path: a power word stayed latched or stuck\n");
 	if (s->deep_ran)
 		dev_info(s->dev, "the deep path ran\n");
 	for (i = 0; i < s->soc->nwake_names; i++) {
