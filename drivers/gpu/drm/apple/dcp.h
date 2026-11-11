@@ -132,6 +132,7 @@ void dcp_external_retry(struct apple_dcp *dcp, const char *why, int error,
 			unsigned int base_ms);
 void dcp_external_retry_work(struct work_struct *work);
 void dcp_external_sink_irq(struct apple_dcp *dcp);
+void dcp_tb_event_work(struct work_struct *work);
 void dcp_queue_typec_reconnect(struct apple_dcp *dcp, unsigned long delay);
 int dcp_dptx_recover_irq(struct apple_dcp *dcp);
 int dcp_dptx_park(struct apple_dcp *dcp);

@@ -48,20 +48,30 @@ impl InitData {
         Ok(self.object(self.bundle)?.word(at)?.load(Ordering::Relaxed))
     }
 
-    pub(crate) fn note_m5_submission_history(&self) -> Result {
+    /// Counts `submissions` in the firmware's submission history, in the slot of this moment.
+    pub(crate) fn note_m5_submission_history(&self, submissions: u8) -> Result {
         if !self.m5 { return Err(EINVAL); }
         let private = self.object(self.cluster)?;
         let base = m::M5_PRIVATE_LAYOUT.status_config;
         for _ in 0..64 {
             let generation = private.word(base + 0x74c)?.load(Ordering::Acquire);
             if generation & 1 != 0 { core::hint::spin_loop(); continue; }
-            let config = private.read_words::<4>(base + 0x73c)?;
-            fence(Ordering::Acquire);
-            if generation != private.word(base + 0x74c)?.load(Ordering::Acquire) {
-                core::hint::spin_loop(); continue;
-            }
-            let period = u64::from(config[0]) | u64::from(config[1]) << 32;
-            let count = u64::from(config[2]) | u64::from(config[3]) << 32;
+            // The firmware moves the generation around every change of the geometry: while it
+            // reads as it did, the geometry read under it stands, without four more loads.
+            let (period, count) = match self.history_geometry.get() {
+                Some((seen, period, count)) if seen == generation => (period, count),
+                _ => {
+                    let config = private.read_words::<4>(base + 0x73c)?;
+                    fence(Ordering::Acquire);
+                    if generation != private.word(base + 0x74c)?.load(Ordering::Acquire) {
+                        core::hint::spin_loop(); continue;
+                    }
+                    let period = u64::from(config[0]) | u64::from(config[1]) << 32;
+                    let count = u64::from(config[2]) | u64::from(config[3]) << 32;
+                    self.history_geometry.set(Some((generation, period, count)));
+                    (period, count)
+                }
+            };
             if period == 0 || count == 0 || count > 256 { return Err(EINVAL); }
             let (counter, frequency) = crate::g17::qos::clock();
             let ticks = crate::g17::qos::time_from_host(counter, frequency)?;
@@ -72,7 +82,7 @@ impl InitData {
             // SAFETY: retained, bounds-checked WC byte, written as a single byte
             // after reading the even, stable generation, as the firmware expects.
             unsafe {
-                let value = core::ptr::read_volatile(byte).wrapping_add(1);
+                let value = core::ptr::read_volatile(byte).wrapping_add(submissions);
                 core::ptr::write_volatile(byte, value);
             };
             fence(Ordering::SeqCst);

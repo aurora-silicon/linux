@@ -545,6 +545,50 @@ int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int t
 }
 EXPORT_SYMBOL_GPL(apple_pmp_report_wait_supplier_ready);
 
+/**
+ * apple_pmp_report_wait_running() - wait until the PMP behind a report runs
+ * @report_np: report region node
+ * @timeout_ms: how long to wait
+ *
+ * While its firmware starts, the PMP takes over the power management of the
+ * SoC's coprocessors, and a coprocessor CPU released before then can be
+ * stopped by it. A driver that releases such a CPU at boot waits here first.
+ *
+ * Context: process context; sleeps.
+ * Return: 0 once the PMP runs, -ENODEV for a report that is not available,
+ * -EPROBE_DEFER while the report is not bound, -ETIMEDOUT otherwise.
+ */
+int apple_pmp_report_wait_running(struct device_node *report_np, unsigned int timeout_ms)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(timeout_ms);
+	struct platform_device *pdev;
+	int ret;
+
+	if (!report_np || !of_device_is_available(report_np))
+		return -ENODEV;
+	pdev = of_find_device_by_node(report_np);
+	if (!pdev)
+		return -EPROBE_DEFER;
+	for (;;) {
+		struct apple_pmp_report *rep;
+
+		ret = -EPROBE_DEFER;
+		/* Never wait behind the report's removal. */
+		if (device_trylock(&pdev->dev)) {
+			rep = device_is_bound(&pdev->dev) ? platform_get_drvdata(pdev) : NULL;
+			if (rep)
+				ret = apple_pmp_report_running(rep) ? 0 : -ETIMEDOUT;
+			device_unlock(&pdev->dev);
+		}
+		if (!ret || time_after(jiffies, deadline))
+			break;
+		usleep_range(10000, 20000);
+	}
+	put_device(&pdev->dev);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_wait_running);
+
 /*
  * Starting a halted PMP (T8122, T6031, opted-in T6030)
  *
@@ -2243,23 +2287,55 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	}
 	ent->sleep_release = of_property_read_bool(node, "apple,release-for-sleep");
 	if (of_property_present(node, "apple,dvfs")) {
-		u32 request_class = 0;
+		u32 class_levels[PMP_DVFS_CLASS_CELLS_MAX];
+		u32 off_levels[PMP_DVFS_CLASS_CELLS_MAX];
+		u32 request_class;
 		u32 dvfs[2];
+		int cells = 0, i;
 
-		if (of_property_read_u32(node, "apple,dvfs-request-class",
-					 &request_class) &&
-		    of_property_present(node, "apple,dvfs-request-class")) {
-			ret = dev_err_probe(dev, -EINVAL,
-					    "invalid apple,dvfs-request-class\n");
+		ret = of_property_read_u32_array(node, "apple,dvfs", dvfs, 2);
+		if (ret || of_property_count_u32_elems(node, "apple,dvfs") != 2) {
+			ret = dev_err_probe(dev, -EINVAL, "invalid apple,dvfs\n");
 			goto err_free;
 		}
-		ret = of_property_read_u32_array(node, "apple,dvfs", dvfs, 2);
-		if (ret || of_property_count_u32_elems(node, "apple,dvfs") != 2 ||
-		    !rep || !rep->offsets->update ||
+		if (of_property_present(node, "apple,dvfs-request-levels")) {
+			if (of_property_present(node, "apple,dvfs-request-class")) {
+				ret = dev_err_probe(dev, -EINVAL,
+						    "both DVFS request-class properties present\n");
+				goto err_free;
+			}
+			cells = of_property_count_u32_elems(node,
+						     "apple,dvfs-request-levels");
+			if (cells <= 0 || cells > (int)ARRAY_SIZE(class_levels) ||
+			    of_property_read_u32_array(node, "apple,dvfs-request-levels",
+						       class_levels, cells)) {
+				ret = dev_err_probe(dev, -EINVAL,
+						    "invalid apple,dvfs-request-levels\n");
+				goto err_free;
+			}
+		} else if (of_property_present(node, "apple,dvfs-request-class")) {
+			if (of_property_read_u32(node, "apple,dvfs-request-class",
+						 &request_class)) {
+				ret = dev_err_probe(dev, -EINVAL,
+						    "invalid apple,dvfs-request-class\n");
+				goto err_free;
+			}
+			/* Legacy DTs put their only class level in apple,dvfs[1]. */
+			class_levels[0] = request_class;
+			class_levels[1] = dvfs[1];
+			cells = 2;
+			dvfs[1] = 0;
+		}
+		/* Releasing the request writes the same classes at level 0. */
+		for (i = 0; i < cells; i += 2) {
+			off_levels[i] = class_levels[i];
+			off_levels[i + 1] = 0;
+		}
+		if (!rep || !rep->offsets->update ||
 		    dvfs[0] < rep->offsets->dvfs_first ||
 		    dvfs[0] >= rep->offsets->dvfs_first + rep->offsets->dvfs_count ||
-		    !apple_pmp_dvfs_word(request_class, 0, &ent->dvfs_off) ||
-		    !apple_pmp_dvfs_word(request_class, dvfs[1], &ent->dvfs_on)) {
+		    !apple_pmp_dvfs_word(0, off_levels, cells, &ent->dvfs_off) ||
+		    !apple_pmp_dvfs_word(dvfs[1], class_levels, cells, &ent->dvfs_on)) {
 			ret = dev_err_probe(dev, -EINVAL, "invalid apple,dvfs\n");
 			goto err_free;
 		}

@@ -3142,13 +3142,25 @@ static int dcp_dptx_connect_attached(struct apple_dcp *dcp, u32 port)
  * does not reset them, dcp_poweron() does. dcp-relink.h holds the
  * decisions; relink_lock protects their state.
  */
+/*
+ * A T6050 tunnel keeps its Thunderbolt binding and its HPD when the firmware
+ * drops the sink after servicing its IRQ_HPD (see dcp_tb_event_work()):
+ * nothing else connects it again. Other tunnels are left to their owners.
+ */
+static bool dcp_tunnel_relinks(struct apple_dcp *dcp)
+{
+	return of_device_is_compatible(dcp->dev->of_node, "apple,t6050-dcpext") &&
+	       READ_ONCE(dcp->tb_event_hpd);
+}
+
 static bool dcp_typec_relink_eligible(struct apple_dcp *dcp)
 {
 	struct apple_connector *connector = READ_ONCE(dcp->connector);
 
 	/* H17P and native external pipes recover through their own lifecycle */
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P || dcp->external_native ||
-	    !dcp_is_typec_output(dcp) || dcp_is_usb4_output(dcp) ||
+	    !dcp_is_typec_output(dcp) ||
+	    (dcp_is_usb4_output(dcp) && !dcp_tunnel_relinks(dcp)) ||
 	    dcp_is_retained_external(dcp) || !dcp->typec_connector)
 		return false;
 	/*
@@ -3156,7 +3168,7 @@ static bool dcp_typec_relink_eligible(struct apple_dcp *dcp)
 	 * not one the driver itself let go, holds HPD low for (see
 	 * dcp_placeholder_edid_work()) or moves to another pipeline.
 	 */
-	/* Tunnels are excluded above; direct follows use the carried gate. */
+	/* Most tunnels are excluded above; direct follows use the carried gate. */
 	return READ_ONCE(dcp->typec_work_enabled) &&
 	       READ_ONCE(dcp->typec_cable_connected) &&
 	       !READ_ONCE(dcp->typec_crtc_off) &&
@@ -5413,6 +5425,12 @@ VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release
 	disable_delayed_work_sync(&dcp->hdmi_settle_wq);
 	disable_delayed_work_sync(&dcp->hdmi_recheck_wq);
 	disable_delayed_work_sync(&dcp->link_recovery_wq);
+	disable_work_sync(&dcp->tb_event_work);
+	scoped_guard(mutex, &dcp->tb_event_lock) {
+		dcp->tb_events = 0;
+		dcp->tb_event_route = NULL;
+		dcp->tb_event_generation = 0;
+	}
 	disable_delayed_work_sync(&dcp->hybrid_wq);
 	dcp_hdmi_disable(dcp);
 }
@@ -5428,6 +5446,7 @@ VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
 	enable_delayed_work(&dcp->hdmi_settle_wq);
 	enable_delayed_work(&dcp->hdmi_recheck_wq);
 	enable_delayed_work(&dcp->link_recovery_wq);
+	enable_work(&dcp->tb_event_work);
 	enable_delayed_work(&dcp->hybrid_wq);
 	dcp_hdmi_enable(dcp);
 	scoped_guard(mutex, &dcp->hpd_mutex)
@@ -6462,6 +6481,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&dcp->typec_reconnect_wq,
 			  dcp_typec_reconnect_work);
 	INIT_DELAYED_WORK(&dcp->link_recovery_wq, dcp_link_recovery_work);
+	mutex_init(&dcp->tb_event_lock);
+	INIT_WORK(&dcp->tb_event_work, dcp_tb_event_work);
 	INIT_DELAYED_WORK(&dcp->placeholder_edid_wq,
 			  dcp_placeholder_edid_work);
 	INIT_DELAYED_WORK(&dcp->typec_relink_wq, dcp_typec_relink_work);
@@ -6480,6 +6501,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	disable_delayed_work(&dcp->typec_relink_wq);
 	disable_delayed_work(&dcp->announce_wq);
 	disable_delayed_work(&dcp->link_recovery_wq);
+	disable_work(&dcp->tb_event_work);
 	dcp->announce.stopped = true;
 	/*
 	 * A native external pipe's bind enables these; firmware callbacks may

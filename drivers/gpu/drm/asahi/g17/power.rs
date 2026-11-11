@@ -39,6 +39,8 @@ pub(super) struct Effort {
     streaming: bool,
     idle_since: Option<u64>,
     applied: u32,
+    /// The firmware's effort word is known to hold `applied`: the host wrote it, or read it.
+    confirmed: bool,
     submissions: u64,
     /// A host thread waits, or waited within [`IDLE_HOLD_NS`], for submitted work
     /// ([`Self::note_waiters`]).
@@ -55,6 +57,7 @@ impl Effort {
             streaming: false,
             idle_since: None,
             applied: 0,
+            confirmed: false,
             submissions: 0,
             waited: false,
             seen_waits: 0,
@@ -102,6 +105,13 @@ impl Effort {
     }
     pub(super) fn did_apply(&mut self, value: u32) {
         self.applied = value;
+        self.confirmed = true;
+    }
+    pub(super) fn confirmed(&self) -> bool {
+        self.confirmed
+    }
+    pub(super) fn confirm(&mut self) {
+        self.confirmed = true;
     }
 
     /// Quarantined jobs do not count as work in flight; they retain mappings but cannot justify

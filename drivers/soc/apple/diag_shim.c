@@ -150,7 +150,7 @@ static DEVICE_ATTR_RO(protocol);
 static ssize_t xart_show(struct device *dev, struct device_attribute *attr,
 			 char *buf)
 {
-	return sysfs_emit(buf, "%s\n", sep_diag.xart ? "enabled" : "disabled");
+	return sysfs_emit(buf, "%s\n", READ_ONCE(sep_diag.xart) ? "enabled" : "disabled");
 }
 static DEVICE_ATTR_RO(xart);
 
@@ -371,7 +371,7 @@ static DEVICE_ATTR_RO(restore);
 static ssize_t xart_guard_show(struct device *dev,
 			       struct device_attribute *attr, char *buf)
 {
-	return sysfs_emit(buf, "%u\n", sep_diag.xart_guard);
+	return sysfs_emit(buf, "%u\n", READ_ONCE(sep_diag.xart_guard));
 }
 static DEVICE_ATTR_RO(xart_guard);
 
@@ -380,9 +380,9 @@ static ssize_t xart_guard_list_show(struct device *dev,
 {
 	const char *state;
 
-	if (!sep_diag.xart_guard)
+	if (!READ_ONCE(sep_diag.xart_guard))
 		state = "none";
-	else if (sep_diag.xart_guard_list)
+	else if (READ_ONCE(sep_diag.xart_guard_list))
 		state = "loaded";
 	else
 		state = "unavailable";
@@ -784,8 +784,8 @@ void sep_diag_set_restore(int state)
 void sep_diag_set_xart_guard(unsigned int level, bool list_loaded,
 			     int matching)
 {
-	sep_diag.xart_guard = level;
-	sep_diag.xart_guard_list = list_loaded;
+	WRITE_ONCE(sep_diag.xart_guard, level);
+	WRITE_ONCE(sep_diag.xart_guard_list, list_loaded);
 	atomic_set(&sep_diag.xart_refusals, 0);
 	atomic_set(&sep_diag.matching, matching);
 }
@@ -802,11 +802,21 @@ void sep_diag_xart_guard_refused(int matching)
  * and it is not repeated. Whatever it left undecided is final for this boot:
  * the key store stays closed and Touch ID cannot start.
  */
-void sep_diag_bringup_ended(void)
+void sep_diag_set_xart(bool writable)
+{
+	WRITE_ONCE(sep_diag.xart, writable);
+}
+
+void sep_diag_keystore_ended(void)
 {
 	atomic64_cmpxchg(&sep_diag.ready_ns, 0, ktime_get_boottime_ns());
 	atomic_cmpxchg(&sep_diag.keystore, SEP_DIAG_KEYSTORE_UNKNOWN,
 		       SEP_DIAG_KEYSTORE_CLOSED);
+}
+
+void sep_diag_bringup_ended(void)
+{
+	sep_diag_keystore_ended();
 	atomic_cmpxchg(&sep_diag.touchid, SEP_DIAG_TOUCHID_PENDING,
 		       SEP_DIAG_TOUCHID_UNAVAILABLE);
 }

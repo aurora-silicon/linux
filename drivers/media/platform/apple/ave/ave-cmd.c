@@ -107,7 +107,8 @@ int ave_cmd_complete(struct ave_ctx *ctx, unsigned int count)
 	int ret = 0;
 
 	for (unsigned int i = 0; i < count && !ret; i++)
-		ret = ave_cmd_scalar(ctx, AVE_OP_COMPLETE, 0, ave_session_arg2(ctx));
+		ret = ave_cmd_scalar(ctx, AVE_OP_COMPLETE, ctx->sess->frame_arg0,
+				     ave_session_arg2(ctx));
 	return ret;
 }
 
@@ -139,7 +140,8 @@ int ave_cmd_close(struct ave_ctx *ctx)
 	err = ave_cmd_scalar(ctx, AVE_OP_CLOSE, AVE_SESSION_ARG0, arg2);
 	if (!err)
 		err = ave_ipc_settle(ctx->ave, AVE_CMD_WAIT_MS);
-	if (legacy || !err)
+	/* Only a fully answered Stop and Close end the session in the firmware. */
+	if (!ret && !err)
 		ctx->sess->fw_open = false;
 	return ret ?: err;
 }

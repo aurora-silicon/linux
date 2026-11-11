@@ -1210,6 +1210,8 @@ u32 lane_count, link_rate;''')
 #define LINK_RATE_RBR 0x06
 #define LINK_RATE_HBR 0x0a
 #define LINK_RATE_HBR2 0x14
+#define LINK_RATE_UHBR10 0x81
+#define LINK_RATE_UHBR20 0x82
 #define PHY_MODE_DP 1
 #define trace_dptxport_call_set_link_rate(...) ((void)0)
 /* Not a T8132 dcpext: its DRM outputs never follow this link. */
@@ -1239,6 +1241,8 @@ static int dcp_tunnel_set_rate(struct apple_dcp *d,void *phy,...) {
 /* The T6030 14.7 backend never matches this H17P display. */
 #define DCP_FIRMWARE_V_14_7 (DCP_FIRMWARE_H17P + 1)
 #define DCP_FIRMWARE_V_14_7_TEMPLATE (DCP_FIRMWARE_H17P + 2)
+/* Firmware 27's tunnel clock refusal and resume readiness; this H17P display never runs it. */
+#define DCP_FIRMWARE_V_27_0 (DCP_FIRMWARE_H17P + 5)
 '''
     real_handlers += block(training, 'static int dptx_j700_validate_lanes(') + '\n'
     real_handlers += block(dptx, 'static int dptxport_call_set_active_lane_count(') + '\n'
@@ -1258,8 +1262,6 @@ static int dcp_tunnel_set_rate(struct apple_dcp *d,void *phy,...) {
     unsigned swap_watchdog_retrains;int typec_iomfb_hpd_ready,typec_display_ready;''')
     stubs = r'''
 #define DCP_HOTPLUG_NOTIFY 1
-/* Firmware 27's resume readiness; this H17P display never runs it. */
-#define DCP_FIRMWARE_V_27_0 (DCP_FIRMWARE_H17P + 5)
 static bool dcp_is_typec_output(struct apple_dcp *d) { (void)d;return true; }
 static void complete_all(int *p) { (*p)++; }
 #define dcp_mode_invalidate(s) ((s)->valid=false)

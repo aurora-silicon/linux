@@ -71,6 +71,22 @@ struct atc_domain {
 	bool active;
 };
 enum combo_mode { COMBO_SAFE, COMBO_USB, COMBO_DP4, COMBO_DP2, COMBO_CIO };
+
+/*
+ * USB4 DisplayPort tunnel pixel clocks, k = 1..4. Each has a clock gate, a
+ * source select word in the power manager's clock block (the DP link rate's
+ * source, then a busy bit to wait out), and a switch in the PHY's CFG block
+ * (bank 39): +0x14 holds a 3-bit field per clock (k = on, 7 = parked) and a
+ * UHBR bit 11 + k, +0x18 an enable bit per clock, +0x1c its status. Switch k
+ * feeds the display crossbar's pixel clock k.
+ */
+#define ATC_DP_TUNNELS		4
+#define ATC_CFG_DP_SWITCH	0x14
+#define ATC_CFG_DP_ENABLE	0x18
+#define ATC_CFG_DP_STATUS	0x1c
+#define ATC_DP_SWITCH_PARKED	7
+#define ATC_DP_SRC_SELECT	GENMASK(27, 24)
+#define ATC_DP_SRC_BUSY		BIT(30)
 struct t6050_dp {
 	bool combo, usb_prepared, usb2_active, pipe_active, controller_active, cio_prepared;
 	bool pipe_tunnel;	/* the active PIPE is a USB4 router's USB3 tunnel */
@@ -99,6 +115,12 @@ struct t6050_dp {
 	void __iomem *fw_data;
 	bool fw_running;
 	void *fw_data_saved;	/* the firmware data SRAM as the first start found it */
+	/* USB4 DP tunnel pixel clocks: source words, gates, running link rates */
+	void __iomem *dp_clk_src;
+	struct atc_domain dp_gate[ATC_DP_TUNNELS];
+	bool dp_gates;
+	u8 tunnel_rate[ATC_DP_TUNNELS];
+	u8 tunnel_idle;		/* bit k - 1: clock k runs with no user, see below */
 };
 
 static int atc_domain_set(struct atc_domain *pd, bool active)
@@ -413,6 +435,100 @@ static void atc_drive(struct t6050_dp *dp, unsigned int lane, u32 preset)
 	atc_mask(base + (tx ? 0x100 : 0xa8), 0x7ffff, eq);
 }
 
+static u32 atc_dp_switch_mask(unsigned int k)
+{
+	return GENMASK(3 * k - 1, 3 * k - 3) | BIT(11 + k);
+}
+
+/* Enable (and status) bits 1, 8, 15 and 22 */
+static u32 atc_dp_enable_bit(unsigned int k)
+{
+	return BIT(7 * k - 6);
+}
+
+/* The power manager's source code for a DP link rate */
+static int atc_dp_source(u8 rate)
+{
+	switch (rate) {
+	case 0x06: return 10;	/* RBR */
+	case 0x0a: return 9;	/* HBR */
+	case 0x14: return 8;	/* HBR2 */
+	case 0x1e: return 7;	/* HBR3 */
+	case 0x81: return 6;	/* UHBR10 */
+	case 0x82: return 5;	/* UHBR20 */
+	default: return -EINVAL;
+	}
+}
+
+/* Switch tunnel clock @k off and park it; its gate stays as it is. */
+static void atc_dp_tunnel_switch_off(struct t6050_dp *dp, unsigned int k)
+{
+	void __iomem *cfg = dp->banks[39];
+	u32 en = atc_dp_enable_bit(k), v;
+
+	writel(readl(cfg + ATC_CFG_DP_ENABLE) & ~en, cfg + ATC_CFG_DP_ENABLE);
+	writel((readl(cfg + ATC_CFG_DP_SWITCH) & ~atc_dp_switch_mask(k)) |
+	       (ATC_DP_SWITCH_PARKED << (3 * k - 3)), cfg + ATC_CFG_DP_SWITCH);
+	if (readl_poll_timeout(cfg + ATC_CFG_DP_STATUS, v, !(v & en), 10, 10000))
+		dev_warn(dp->dev, "DP tunnel clock %u: switch status %08x still on\n", k, v);
+	dp->tunnel_rate[k - 1] = 0;
+	dp->tunnel_idle &= ~BIT(k - 1);
+}
+
+/*
+ * Park every tunnel clock switch that runs no clock (field 7, enable off),
+ * once the PHY is in USB4 mode: an unparked switch selects the native DP
+ * clock for its crossbar pixel clock.
+ */
+static void atc_dp_tunnels_park(struct t6050_dp *dp)
+{
+	void __iomem *cfg = dp->banks[39];
+	u32 sw = readl(cfg + ATC_CFG_DP_SWITCH), en = readl(cfg + ATC_CFG_DP_ENABLE);
+
+	for (unsigned int k = 1; k <= ATC_DP_TUNNELS; k++) {
+		if (dp->tunnel_rate[k - 1])
+			continue;
+		sw = (sw & ~atc_dp_switch_mask(k)) | (ATC_DP_SWITCH_PARKED << (3 * k - 3));
+		en &= ~atc_dp_enable_bit(k);
+	}
+	writel(en, cfg + ATC_CFG_DP_ENABLE);
+	writel(sw, cfg + ATC_CFG_DP_SWITCH);
+}
+
+/* Stop tunnel clock @k and gate it. */
+static int atc_dp_tunnel_stop(struct t6050_dp *dp, unsigned int k)
+{
+	if (dp->tunnel_rate[k - 1])
+		atc_dp_tunnel_switch_off(dp, k);
+	return dp->dp_gates ? atc_domain_set(&dp->dp_gate[k - 1], false) : 0;
+}
+
+/*
+ * Taking a running tunnel clock away disturbs the port's other tunnel
+ * clocks: the display on one of them loses its stream for a moment, and can
+ * lose its link. A clock whose user stopped it therefore keeps running while
+ * another clock of the port is in use, and stops with the last of them.
+ */
+static bool atc_dp_tunnel_others_in_use(struct t6050_dp *dp, unsigned int k)
+{
+	for (unsigned int i = 0; i < ATC_DP_TUNNELS; i++)
+		if (i != k - 1 && dp->tunnel_rate[i] && !(dp->tunnel_idle & BIT(i)))
+			return true;
+	return false;
+}
+
+/* Stop every tunnel clock, before the PHY leaves USB4 mode. */
+static void atc_dp_tunnels_stop(struct t6050_dp *dp)
+{
+	for (unsigned int k = 1; k <= ATC_DP_TUNNELS; k++) {
+		if (dp->tunnel_rate[k - 1])
+			atc_dp_tunnel_switch_off(dp, k);
+		/* A failed start or gate suspend can leave a held domain at rate zero. */
+		if (dp->dp_gates)
+			atc_domain_set(&dp->dp_gate[k - 1], false);
+	}
+}
+
 #include "atc-t6050-combo.h"
 
 static int t6050_dp_set_mode(struct phy *phy, enum phy_mode mode, int submode)
@@ -519,6 +635,121 @@ int apple_dp_phy_link_config(struct phy *phy, unsigned int *pclk, bool *uhbr)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_dp_phy_link_config);
+
+/* Start tunnel clock @clock at link rate @rate from PMGR source @src. */
+static int atc_dp_tunnel_start(struct t6050_dp *dp, unsigned int clock, u8 rate,
+			       int src, u32 *status)
+{
+	void __iomem *cfg = dp->banks[39], *word;
+	unsigned int i = clock - 1;
+	u32 en = atc_dp_enable_bit(clock), v;
+	int ret;
+
+	if (dp->dp_gates) {
+		ret = atc_domain_set(&dp->dp_gate[i], true);
+		if (ret)
+			return ret;
+	}
+	word = dp->dp_clk_src + 4 * i;
+	writel((readl(word) & ~ATC_DP_SRC_SELECT) | FIELD_PREP(ATC_DP_SRC_SELECT, src), word);
+	ret = readl_poll_timeout(word, v, !(v & ATC_DP_SRC_BUSY), 10, 200000);
+	if (ret) {
+		dev_err(dp->dev, "DP tunnel clock %u: source %d not taken (%08x)\n",
+			clock, src, v);
+		if (dp->dp_gates)
+			atc_domain_set(&dp->dp_gate[i], false);
+		return ret;
+	}
+	writel((readl(cfg + ATC_CFG_DP_SWITCH) & ~atc_dp_switch_mask(clock)) |
+	       (clock << (3 * clock - 3)) |
+	       (rate == 0x81 || rate == 0x82 ? BIT(11 + clock) : 0),
+	       cfg + ATC_CFG_DP_SWITCH);
+	writel(readl(cfg + ATC_CFG_DP_ENABLE) | en, cfg + ATC_CFG_DP_ENABLE);
+	ret = readl_poll_timeout(cfg + ATC_CFG_DP_STATUS, v, v & en, 10, 10000);
+	if (ret) {
+		dev_err(dp->dev, "DP tunnel clock %u: switch status %08x not on\n", clock, v);
+		/* Undo the partial start before leaving the rate uncached for retry. */
+		atc_dp_tunnel_switch_off(dp, clock);
+		if (dp->dp_gates)
+			atc_domain_set(&dp->dp_gate[i], false);
+		return ret;
+	}
+	dp->tunnel_rate[i] = rate;
+	*status = v;
+	return 0;
+}
+
+int apple_t6050_dp_tunnel_clock(struct phy *phy, unsigned int clock, u8 rate)
+{
+	struct t6050_dp *dp;
+	unsigned int i = clock - 1;
+	int src = 0, ret;
+	bool others;
+	u32 v;
+
+	if (!phy || phy->ops != &t6050_dp_ops)
+		return -EOPNOTSUPP;
+	if (clock < 1 || clock > ATC_DP_TUNNELS)
+		return -EINVAL;
+	if (rate) {
+		src = atc_dp_source(rate);
+		if (src < 0)
+			return src;
+	}
+	dp = phy_get_drvdata(phy);
+	guard(mutex)(&dp->lock);
+	if (!dp->combo || !dp->dp_clk_src)
+		return -EOPNOTSUPP;
+	if (rate && dp->tunnel_rate[i] == rate) {
+		dp->tunnel_idle &= ~BIT(i);
+		return 0;
+	}
+	others = atc_dp_tunnel_others_in_use(dp, clock);
+	if (!rate) {
+		if (dp->tunnel_rate[i] && others) {
+			dp->tunnel_idle |= BIT(i);
+			dev_dbg(dp->dev, "DP tunnel clock %u left running for the others\n",
+				clock);
+			return 0;
+		}
+		ret = atc_dp_tunnel_stop(dp, clock);
+		/* The last user went: the clocks kept for it go as well. */
+		for (unsigned int k = 1; !others && k <= ATC_DP_TUNNELS; k++)
+			if (dp->tunnel_idle & BIT(k - 1))
+				atc_dp_tunnel_stop(dp, k);
+		if (!ret)
+			dev_info(dp->dev, "DP tunnel clock %u stopped\n", clock);
+		return ret;
+	}
+	/* A new rate takes the clock off its old source first. */
+	if (dp->tunnel_rate[i])
+		atc_dp_tunnel_switch_off(dp, clock);
+	if (dp->faulted)
+		return -EIO;
+	if (dp->combo_mode != COMBO_CIO)
+		return -ENOLINK;
+	ret = atc_dp_tunnel_start(dp, clock, rate, src, &v);
+	if (ret)
+		return ret;
+	/*
+	 * Starting a clock disturbs the running ones as stopping one does. The
+	 * port's first clock therefore starts the others with it, at its rate
+	 * and with no user: a display that comes later at that rate finds its
+	 * clock running.
+	 */
+	for (unsigned int k = 1; !others && k <= ATC_DP_TUNNELS; k++) {
+		u32 unused;
+
+		if (k == clock || dp->tunnel_rate[k - 1])
+			continue;
+		if (!atc_dp_tunnel_start(dp, k, rate, src, &unused))
+			dp->tunnel_idle |= BIT(k - 1);
+	}
+	dev_info(dp->dev, "DP tunnel clock %u: link rate 0x%02x, source %d, switch status %08x\n",
+		 clock, rate, src, v);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_t6050_dp_tunnel_clock);
 
 /* The connector sets orientation before changing the alternate-mode mux. */
 static int t6050_set_orientation(struct t6050_dp *dp,
@@ -633,7 +864,7 @@ static int t6050_dp_probe(struct platform_device *pdev)
 	struct phy *phy;
 	struct resource *core;
 	void __iomem *base;
-	int ndomains, ret;
+	int ndomains, gates, ret;
 
 	dp = devm_kzalloc(dev, sizeof(*dp), GFP_KERNEL);
 	if (!dp)
@@ -642,9 +873,9 @@ static int t6050_dp_probe(struct platform_device *pdev)
 	dp->combo = of_device_is_compatible(dev->of_node, "apple,t6050-combo-phy");
 	if (dp->combo) {
 		u32 port;
-		/* Every Type-C port but 0, the debug port that carries the boot link. */
+		/* Only ports explicitly handed over by the boot producer. */
 		if (of_property_read_u32(dev->of_node, "apple,port-index", &port) ||
-		    port < 1 || port > 5 ||
+		    port > 5 ||
 		    !of_property_present(dev->of_node, "apple,guest-port-reserved") ||
 		    !of_property_present(dev->of_node, "mode-switch"))
 			return -EINVAL;
@@ -769,6 +1000,14 @@ static int t6050_dp_probe(struct platform_device *pdev)
 	 * are in (combo_start()).
 	 */
 	ndomains = of_count_phandle_with_args(dev->of_node, "power-domains", "#power-domain-cells");
+	/* A combo's tunnel clock gates, "dp0".."dp3", follow its own domains. */
+	gates = dp->combo ?
+		of_property_match_string(dev->of_node, "power-domain-names", "dp0") : -EINVAL;
+	if (gates > 0) {
+		if (ndomains != gates + ATC_DP_TUNNELS)
+			return -EINVAL;
+		ndomains = gates;
+	}
 	if (ndomains != 3 && !(dp->combo && ndomains == 4))
 		return -EINVAL;
 	dp->ndomains = ndomains;
@@ -780,6 +1019,32 @@ static int t6050_dp_probe(struct platform_device *pdev)
 		ret = devm_add_action_or_reset(dev, atc_domain_release, &dp->domain[i]);
 		if (ret)
 			return ret;
+	}
+	for (unsigned int i = 0; gates > 0 && i < ATC_DP_TUNNELS; i++) {
+		char name[4];
+
+		snprintf(name, sizeof(name), "dp%u", i);
+		dp->dp_gate[i].dev = dev_pm_domain_attach_by_name(dev, name);
+		if (IS_ERR_OR_NULL(dp->dp_gate[i].dev)) {
+			ret = dp->dp_gate[i].dev ? PTR_ERR(dp->dp_gate[i].dev) : -ENODEV;
+			return dev_err_probe(dev, ret, "cannot attach %s domain\n", name);
+		}
+		ret = devm_add_action_or_reset(dev, atc_domain_release, &dp->dp_gate[i]);
+		if (ret)
+			return ret;
+		dp->dp_gates = true;
+	}
+	if (dp->combo) {
+		struct resource *res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+								   "dp-clock-source");
+
+		if (res) {
+			if (resource_size(res) < 4 * ATC_DP_TUNNELS)
+				return -EINVAL;
+			dp->dp_clk_src = devm_ioremap_resource(dev, res);
+			if (IS_ERR(dp->dp_clk_src))
+				return PTR_ERR(dp->dp_clk_src);
+		}
 	}
 	if (dp->typec) {
 		dp->fw_data = devm_platform_ioremap_resource_byname(pdev, "firmware-data");
