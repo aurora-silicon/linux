@@ -814,6 +814,35 @@ static int radio_start(struct centauri_wifi *wifi)
 	return 0;
 }
 
+/* The station's RSN element (body) with PSK as its only AKM, written to selected; returns its size. */
+static int select_rsn(const u8 *body, size_t size, u8 *selected)
+{
+	size_t offset, tail;
+	u16 count;
+	unsigned int i;
+
+	if (size < 8 || get_unaligned_le16(body) != 1)
+		return -EINVAL;
+	count = get_unaligned_le16(body + 6);
+	offset = 8 + 4 * count;
+	if (!count || offset + 2 > size)
+		return -EINVAL;
+	count = get_unaligned_le16(body + offset);
+	tail = offset + 2 + 4 * count;
+	if (!count || tail > size)
+		return -EINVAL;
+	for (i = 0; i < count; i++)
+		if (get_unaligned_be32(body + offset + 2 + 4 * i) == WLAN_AKM_SUITE_PSK)
+			break;
+	if (i == count)
+		return -EOPNOTSUPP;
+	memcpy(selected, body, offset);
+	put_unaligned_le16(1, selected + offset);
+	put_unaligned_be32(WLAN_AKM_SUITE_PSK, selected + offset + 2);
+	memcpy(selected + offset + 6, body + tail, size - tail);
+	return offset + 6 + size - tail;
+}
+
 static void append_tlv(u8 *payload, size_t *size, u16 tag, const void *data, u16 length);
 
 /* Dwell times in ms for the scan request. The macOS 27 scan adapter copies
@@ -987,16 +1016,44 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	u8 *payload = wifi->connect_payload;
 	size_t size = 130, rsn_size;
 	u16 caps = 0;
-	int ret = 0, offset;
+	int ret = 0, offset, i;
 
+	/*
+	 * wpa_supplicant without SME lists every AKM the network allows
+	 * (NetworkManager's "WPA-PSK WPA-PSK-SHA256" gives PSK and PSK-SHA256).
+	 * Accept any list that offers PSK and send the firmware PSK alone, as
+	 * the T6050 driver does (select_rsn).
+	 */
+	for (i = 0; i < params->crypto.n_akm_suites; i++)
+		if (params->crypto.akm_suites[i] == WLAN_AKM_SUITE_PSK)
+			break;
 	if (!params->ssid_len || params->ssid_len > 32 || !params->crypto.psk ||
-	    params->crypto.n_akm_suites != 1 || params->crypto.akm_suites[0] != WLAN_AKM_SUITE_PSK ||
+	    i == params->crypto.n_akm_suites ||
 	    params->crypto.n_ciphers_pairwise != 1 || params->crypto.ciphers_pairwise[0] != WLAN_CIPHER_SUITE_CCMP ||
-	    params->crypto.cipher_group != WLAN_CIPHER_SUITE_CCMP || params->ie_len > sizeof(wifi->request_ie))
+	    params->crypto.cipher_group != WLAN_CIPHER_SUITE_CCMP || params->ie_len > sizeof(wifi->request_ie)) {
+		dev_info(&wifi->control->pdev->dev,
+			 "connect refused: ssid_len=%zu psk=%d akms=%d [%08x %08x] pairwise=%d [%08x] group=%08x ie_len=%zu\n",
+			 params->ssid_len, !!params->crypto.psk, params->crypto.n_akm_suites,
+			 params->crypto.n_akm_suites > 0 ? params->crypto.akm_suites[0] : 0,
+			 params->crypto.n_akm_suites > 1 ? params->crypto.akm_suites[1] : 0,
+			 params->crypto.n_ciphers_pairwise,
+			 params->crypto.n_ciphers_pairwise ? params->crypto.ciphers_pairwise[0] : 0,
+			 params->crypto.cipher_group, params->ie_len);
 		return -EOPNOTSUPP;
+	}
 	rsn = cfg80211_find_ie(WLAN_EID_RSN, params->ie, params->ie_len);
-	if (!rsn || rsn_caps_offset(rsn + 2, rsn[1]) < 0)
+	if (!rsn) {
+		dev_info(&wifi->control->pdev->dev, "connect refused: no RSN element in the request\n");
 		return -EINVAL;
+	}
+	ret = select_rsn(rsn + 2, rsn[1], rsn_body);
+	if (ret < 0 || rsn_caps_offset(rsn_body, ret) < 0) {
+		dev_info(&wifi->control->pdev->dev, "connect refused: RSN element %*ph not usable (%d)\n",
+			 rsn[1] + 2, rsn, ret);
+		return ret < 0 ? ret : -EINVAL;
+	}
+	rsn_size = ret;
+	ret = 0;
 	mutex_lock(&wifi->lock);
 	if (!wifi->configured || wifi->connecting || wifi->connected || wifi->scan_request) {
 		ret = -EBUSY;
@@ -1020,8 +1077,6 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 			caps = get_unaligned_le16(ap_rsn + 2 + offset);
 	}
 	rcu_read_unlock();
-	rsn_size = rsn[1];
-	memcpy(rsn_body, rsn + 2, rsn_size);
 	offset = rsn_caps_offset(rsn_body, rsn_size);
 	put_unaligned_le16(caps, rsn_body + offset);
 	pmf = !!(caps & BIT(7));
