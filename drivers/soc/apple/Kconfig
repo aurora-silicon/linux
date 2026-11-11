@@ -340,6 +340,21 @@ config APPLE_AURORA_BOOT_SECURITY
 	  The record is the firmware's account, not a proof: it is only
 	  called verified when an enforcing Stage 1 verified Stage 2.
 
+config APPLE_AURORA_BOOT_SECURITY_LOCKDOWN
+	bool "Lock the kernel down (integrity) on a verified boot"
+	depends on APPLE_AURORA_BOOT_SECURITY=y && SECURITY_LOCKDOWN_LSM && EFI
+	default y
+	help
+	  Raise lockdown to integrity when the firmware says this boot is
+	  on the secure path: UEFI Secure Boot is enforcing (the SecureBoot
+	  variable, or U-Boot's entry in the boot record), or the record's
+	  chain is verified from an enforcing Stage 1 on. This is the
+	  equivalent of locking down under UEFI Secure Boot on other
+	  platforms. Unsigned modules, unsigned kexec, /dev/mem and similar
+	  interfaces are then refused. A boot in audit or off mode is not
+	  locked down by this option; lockdown= on the command line still
+	  applies.
+
 endmenu
 
 endif
