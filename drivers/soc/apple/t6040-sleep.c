@@ -630,6 +630,7 @@ struct t6040_sleep {
 	/* ANS's storage ST lanes: windows + whether a commit stopped ANS. */
 	struct t6040_apcie_st apcie_st;
 	bool pcie_ans_stopped;
+	bool ans_bridge_quiesced;	/* the commit found ANS's fabric bridge armed */
 	int ans_off_ret;
 	int pcie_ans_on_ret;
 	u32 apcie_wake_step;
@@ -3917,6 +3918,37 @@ static void t6040_apcie_diag_store(struct t6040_sleep *s)
 			      &s->apcie_diag[i], NULL, 0);
 }
 
+/*
+ * ANS's own fabric bridge (0x4_0b00_0000 +0x104/+0x108 bit 0). macOS clears the bit before a
+ * retained domain goes off and sets it again once it is back up; here the wake sets it
+ * (t6040_sleep_raise_apcie_st()) and the A2D engine, not this driver, takes ANS down. iBoot
+ * leaves the bit clear, so a boot's first sleep goes down with it clear; without this the
+ * next one meets the bridge as the first wake armed it. Only while ANS is on: the bridge sits
+ * in it. Returns whether the bit was set.
+ */
+static bool ans_bridge_quiesce = true;
+module_param(ans_bridge_quiesce, bool, 0644);
+MODULE_PARM_DESC(ans_bridge_quiesce,
+		 "Clear ANS's fabric-bridge bit 0 in the commit, once ANS is stopped, as macOS before the domain goes off");
+
+static bool t6040_ans_bridge_quiesce(struct t6040_sleep *s)
+{
+	void __iomem *bridge = s->axi2af_bridge[AXI2AF_ANS];
+	u32 a, b;
+
+	if (!READ_ONCE(ans_bridge_quiesce) || !bridge || !s->soc_east ||
+	    FIELD_GET(PS_ACTUAL, readl(s->soc_east + PS_ANS)) != 0xf)
+		return false;
+	a = readl(bridge + AXI2AF_BRIDGE_104);
+	b = readl(bridge + AXI2AF_BRIDGE_108);
+	if (!((a | b) & BIT(0)))
+		return false;
+	writel(a & ~BIT(0), bridge + AXI2AF_BRIDGE_104);
+	writel(b & ~BIT(0), bridge + AXI2AF_BRIDGE_108);
+
+	return true;
+}
+
 static void t6040_sleep_lower_apcie_st(struct t6040_sleep *s)
 {
 	struct t6040_apcie_st *a = &s->apcie_st;
@@ -3955,6 +3987,7 @@ static void t6040_sleep_lower_apcie_st(struct t6040_sleep *s)
 		writel(readl(a->axi + APCIE_AXI_EN0) & ~BIT(0), a->axi + APCIE_AXI_EN0);
 		writel(readl(a->axi + APCIE_AXI_EN1) & ~BIT(0), a->axi + APCIE_AXI_EN1);
 	}
+	s->ans_bridge_quiesced = t6040_ans_bridge_quiesce(s);
 	if (READ_ONCE(apcie_st_ps))
 		t6040_ps_lower(ps, PS_ANS);
 	/* The caller polls PS_ANS off, as #1208 does. */
@@ -5917,6 +5950,7 @@ static int t6040_sleep_enter(suspend_state_t state)
 	t6040_mark(s, 0x12);
 	t6040_pmc_cp(s, 2);
 	s->pcie_ans_stopped = false;
+	s->ans_bridge_quiesced = false;
 	t6040_sleep_coprocs_stop(true);
 	t6040_sleep_coprocs_stop(false);
 	t6040_mark(s, 0x13);
@@ -5935,6 +5969,8 @@ static int t6040_sleep_enter(suspend_state_t state)
 	if (s->alarm_ok)
 		pr_info("t6040-sleep: marks: PMU comparator was %#x (reply %#x), cpu_suspend %d\n",
 			s->alarm_saved, s->alarm_hdr, ret);
+	if (s->ans_bridge_quiesced)
+		pr_info("t6040-sleep: ANS's fabric bridge was armed at the commit: quiesced\n");
 
 	if (s->returned)
 		t6040_ret_mark(s, 0x41);
