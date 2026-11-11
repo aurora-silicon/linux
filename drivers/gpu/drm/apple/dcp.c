@@ -7283,6 +7283,9 @@ static bool dcp_hibernating(void)
 }
 
 static int dcp_hib_prepare(struct apple_dcp *dcp);
+static void dcp_hib_stop_ext_link_work(struct apple_dcp *dcp);
+static void dcp_hib_ext_get(struct apple_dcp *dcp);
+static void dcp_hib_ext_put(struct apple_dcp *dcp, bool start, bool idle);
 #else
 static bool dcp_hibernating(void)
 {
@@ -7516,7 +7519,11 @@ static int dcp_platform_prepare(struct device *dev)
 		return 0;
 	}
 #ifdef CONFIG_HIBERNATION
-	if (dcp_hibernating()) {
+	/*
+	 * A T6040 S2R takes the power from the DP PHYs as the cold boot of a resume from
+	 * disk does: an external processor gives its link back the same way.
+	 */
+	if (dcp_hibernating() || (dcp_desktop_external(dcp) && apple_sleep_power_loss())) {
 		int ret = dcp_hib_prepare(dcp);
 
 		if (ret)
@@ -9428,6 +9435,23 @@ static void dcp_t6041_s2r_afk(struct apple_dcp *dcp, bool resume)
 		 resume ? "resumed" : "paused");
 }
 
+/*
+ * No link work may reach a firmware that is about to idle. An external processor's was
+ * stopped at prepare, when its link went (dcp_hib_prepare()), and stays stopped until the
+ * wake replays the link.
+ */
+static void dcp_t6041_s2r_stop_link_work(struct apple_dcp *dcp)
+{
+#ifdef CONFIG_HIBERNATION
+	if (dcp_desktop_external(dcp)) {
+		dcp_hib_stop_ext_link_work(dcp);
+		return;
+	}
+#endif
+	dcp_disable_typec_work(dcp, false);
+	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
+}
+
 static int dcp_t6041_s2r_stop(struct apple_dcp *dcp)
 {
 	void __iomem *control = dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL;
@@ -9469,8 +9493,7 @@ static int dcp_t6041_s2r_stop(struct apple_dcp *dcp)
 		iomfb_v14_7_backlight_suspend(dcp);
 	apple_sleep_bringup_mark(DCP_S2R_MARK(id, 3));
 	dcp_drain_for_sleep(dcp);
-	dcp_disable_typec_work(dcp, false);
-	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
+	dcp_t6041_s2r_stop_link_work(dcp);
 
 	/*
 	 * The internal panel's DPMS is soft (backlight only), so its pipe is still lit here.
@@ -9613,12 +9636,25 @@ static void dcp_t6041_s2r_resume(struct apple_dcp *dcp)
 				apple_dart_display_streams(dcp->s2r_dcp_dart,
 							   DCP_S2R_DCP_STREAMS, true, false);
 		}
+		/*
+		 * apple-drm resumes after this device and restores its CRTCs at once: its
+		 * entry points leave the firmware alone until the restart is through, as
+		 * after a resume from disk. A call of theirs into the returning firmware
+		 * timed out, and one sent while another was unanswered crashed it.
+		 */
+		WRITE_ONCE(dcp->hib_phase, DCP_HIB_RESTARTING);
+		if (dcp_desktop_external(dcp))
+			dcp_hib_ext_get(dcp);
 		dcp->s2r_cold_restart = true;
 		queue_work(system_long_wq, &dcp->hib_restore_work);
 		return;
 #endif
 	}
 
+#ifdef CONFIG_HIBERNATION
+	/* Not coming back: the other external processors do not wait for this one's link. */
+	dcp_hib_ext_put(dcp, true, true);
+#endif
 	WRITE_ONCE(dcp->crashed, true);
 	dev_crit(dcp->dev,
 		 "the firmware stopped for the sleep could not restart (%s): the display stays off until reboot\n",
@@ -9904,6 +9940,14 @@ static bool dcp_hib_can_restart(struct apple_dcp *dcp)
 static atomic_t dcp_hib_ext_starting = ATOMIC_INIT(0);
 static atomic_t dcp_hib_ext_idle = ATOMIC_INIT(0);
 static DECLARE_WAIT_QUEUE_HEAD(dcp_hib_ext_wq);
+
+static void dcp_hib_ext_get(struct apple_dcp *dcp)
+{
+	if (dcp->hib_ext_start_pending)
+		return;
+	dcp->hib_ext_start_pending = true;
+	atomic_inc(&dcp_hib_ext_starting);
+}
 
 static void dcp_hib_ext_put(struct apple_dcp *dcp, bool start, bool idle)
 {
@@ -10504,14 +10548,14 @@ static void dcp_hib_ext_link_up(struct apple_dcp *dcp, const char *when)
 	    !wait_event_timeout(dcp_hib_ext_wq, dcp_hib_ext_settled(),
 				DCP_HIB_READY_TIMEOUT))
 		dev_warn(dcp->dev,
-			 "hibernation %s: other display processors not up after 10 s (%d starting, %d idle), connecting anyway\n",
+			 "%s: other display processors not up after 10 s (%d starting, %d idle), connecting anyway\n",
 			 when, atomic_read(&dcp_hib_ext_starting),
 			 atomic_read(&dcp_hib_ext_idle));
 
 	dcp_hib_ext_relink(dcp);
 	dcp_hib_ext_put(dcp, false, true);
 	dev_info(dcp->dev,
-		 "hibernation %s: external link replayed: display %d, route %s, cable %d, DPTX port 0 connected %d\n",
+		 "%s: external link replayed: display %d, route %s, cable %d, DPTX port 0 connected %d\n",
 		 when, display,
 		 READ_ONCE(dcp->active_typec_route) ? "Type-C" :
 		 dcp->fixed_phy ? "fixed" : "none",
@@ -10539,7 +10583,7 @@ static void dcp_hib_ext_restore(struct apple_dcp *dcp)
 		 dptx_service_available(&dcp->dptxport[1]));
 
 	WRITE_ONCE(dcp->hib_phase, DCP_HIB_NONE);
-	dcp_hib_ext_link_up(dcp, "restore");
+	dcp_hib_ext_link_up(dcp, "hibernation restore");
 }
 
 /*
@@ -10656,10 +10700,11 @@ static void dcp_t6041_s2r_warm_restart(struct apple_dcp *dcp)
 
 /*
  * An external DCP after a real sleep: the same warm return as the internal one. Its
- * firmware was idle with no display when it stopped, so there is no mode to set: the
- * rest is what any system sleep ends with, and a display plugged in later goes the
- * usual hotplug way. One that had crashed before the sleep is tried once more, without
- * its old calls.
+ * link went at prepare (dcp_hib_prepare()) and its firmware stopped idle with no display,
+ * so there is no mode to set: with the firmware back the DRM entry points open and the
+ * link is replayed as after a resume from disk, the DP PHY set up again and a display
+ * reported by the firmware's hotplug. One that had crashed before the sleep is tried once
+ * more, without its old calls.
  */
 static void dcp_t6041_s2r_warm_restart_ext(struct apple_dcp *dcp)
 {
@@ -10686,10 +10731,8 @@ static void dcp_t6041_s2r_warm_restart_ext(struct apple_dcp *dcp)
 
 	dcp->link_recovery_tries = 0;
 	dcp_release_after_sleep(dcp);
-	dcp_enable_typec_work(dcp);
-	/* The HDMI output's PHY and crossbar lost their setup with the power. */
-	if (dcp->external_native)
-		dcp_fabric_hdmi_reinit(dcp, "after system sleep");
+	WRITE_ONCE(dcp->hib_phase, DCP_HIB_NONE);
+	dcp_hib_ext_link_up(dcp, "S2R wake");
 	dev_info(dcp->dev, "external firmware back after the warm restart\n");
 }
 
@@ -10721,7 +10764,7 @@ static void dcp_hib_restore_work(struct work_struct *work)
 	/* The kernel that hibernated: the hibernation failed, or disk=suspend woke. */
 	if (READ_ONCE(dcp->hib_phase) == DCP_HIB_NONE && dcp->hib_link_released &&
 	    !READ_ONCE(dcp->ext_dead)) {
-		dcp_hib_ext_link_up(dcp, "aborted");
+		dcp_hib_ext_link_up(dcp, "sleep aborted");
 		return;
 	}
 	if (READ_ONCE(dcp->hib_phase) != DCP_HIB_QUIESCED) {
@@ -10745,6 +10788,8 @@ static void dcp_hib_restore_work(struct work_struct *work)
  * PM_POST_RESTORE: a restore through the snapshot device.  In the kernel
  * that hibernated, PM_POST_HIBERNATION comes only after a failure or a
  * disk=suspend wake: the link given back at prepare is replayed then.
+ * PM_POST_SUSPEND: a T6040 S2R gives the link back at prepare as well, and
+ * one that failed before the firmware stopped has no wake to replay it.
  * Before the next system sleep the restart work has finished.
  */
 static int dcp_hib_pm_notify(struct notifier_block *nb, unsigned long action,
@@ -10759,6 +10804,7 @@ static int dcp_hib_pm_notify(struct notifier_block *nb, unsigned long action,
 		break;
 	case PM_POST_HIBERNATION:
 	case PM_POST_RESTORE:
+	case PM_POST_SUSPEND:
 		if (READ_ONCE(dcp->hib_phase) == DCP_HIB_QUIESCED ||
 		    (READ_ONCE(dcp->hib_phase) == DCP_HIB_NONE &&
 		     dcp->hib_link_released))
@@ -10774,6 +10820,8 @@ static int dcp_hib_pm_notify(struct notifier_block *nb, unsigned long action,
  * processor stops its link work and gives back its link and DP PHYs.  The
  * PM_HIBERNATION_PREPARE notifier set dcp_hib_in_progress; s2idle never
  * gets here.  The second prepare, for the power-off, finds it done.
+ * A T6040 S2R does the same at its prepare (dcp_platform_prepare()): its
+ * wake replays the link (dcp_t6041_s2r_warm_restart_ext()).
  */
 static int dcp_hib_prepare(struct apple_dcp *dcp)
 {
@@ -10925,8 +10973,7 @@ static int dcp_platform_restore_early(struct device *dev)
 	/* Host side only: the DMA of the old session goes in .restore. */
 	dcp_hib_quiesce(dcp);
 	dcp_hib_quiesce_ext(dcp);
-	dcp->hib_ext_start_pending = true;
-	atomic_inc(&dcp_hib_ext_starting);
+	dcp_hib_ext_get(dcp);
 	/* Counted at prepare, in the image, unless prepare did not run. */
 	if (!dcp->hib_ext_idle_pending) {
 		dcp->hib_ext_idle_pending = true;
