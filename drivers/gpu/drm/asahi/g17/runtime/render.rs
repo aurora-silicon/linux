@@ -526,17 +526,34 @@ struct Host<'a> {
     registration_powered: bool,
     /// An M5 pair's installation, submitted with its first outer publication.
     m5_registration: Option<crate::g17::fw::m5::queue::HardwareSubmission>,
-    /// M5: the shared ring's room check of this publication, by priority. It serves the
-    /// first pair written to the ring only.
+    /// M5: the shared ring's room check of this publication, by priority. Its consumers stay
+    /// conservative for the whole hold (the firmware only advances them); its producer
+    /// serves the first pair written to the ring only.
     outer_cursors: Option<(u8, [u32; 3])>,
+    outer_producer_used: bool,
 }
 impl Host<'_> {
     /// The room check's cursors for the first pair this publication writes to the ring.
     fn room_cursors(&mut self, priority: u8) -> Option<[u32; 3]> {
+        if core::mem::replace(&mut self.outer_producer_used, true) {
+            return None;
+        }
         self.outer_cursors
-            .take()
             .filter(|&(checked, _)| checked == priority)
             .map(|(_, cursors)| cursors)
+    }
+
+    /// The room check's consumers with the producer read now: a retained pair revalidates the
+    /// producer it was prepared against.
+    fn retained_cursors(&mut self, priority: u8) -> Result<Option<[u32; 3]>> {
+        self.outer_producer_used = true;
+        let Some((checked, [consumer, consumer_b, _])) = self.outer_cursors else {
+            return Ok(None);
+        };
+        if checked != priority {
+            return Ok(None);
+        }
+        Ok(Some([consumer, consumer_b, self.firmware.init.work_producer(priority)?]))
     }
 
     fn release_registration(&mut self) {
@@ -691,12 +708,11 @@ impl crate::g17::queue::render::Host for Host<'_> {
         tiling: &crate::g17::fw::channels::WorkSlot,
         next: [u32; 2],
     ) -> Result {
-        // This pair moves the producer: a room check's sample no longer holds.
-        self.outer_cursors = None;
-        let result = self
-            .firmware
-            .init
-            .publish_retained_work_pair(priority, fragment, tiling, next);
+        let result = self.retained_cursors(priority).and_then(|cursors| {
+            self.firmware
+                .init
+                .publish_retained_work_pair(priority, fragment, tiling, next, cursors)
+        });
         if result.is_err() {
             self.firmware.primary.state.shared.lose_device_quietly();
         }
@@ -803,6 +819,7 @@ impl crate::g17::Firmware {
             registration_powered: false,
             m5_registration: None,
             outer_cursors,
+            outer_producer_used: false,
         };
         let result = operation(&mut pair, &mut host);
         host.release_registration();

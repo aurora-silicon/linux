@@ -771,6 +771,21 @@ impl InitData {
         })
     }
 
+    /// The host producer of the shared M5 ring alone (the last of [`Self::work_cursors`]).
+    pub(super) fn work_producer(&self, priority: u8) -> Result<u32> {
+        use super::fw::{channels, queue::DataMaster};
+        let channel = channels::work_ring_index(priority, DataMaster::Compute).ok_or(EINVAL)?;
+        let producer = self
+            .object(self.cluster)?
+            .word(self.state_offset(Role::Primary) + abi::work_state_offset(channel)
+                + abi::ChannelState::PRODUCER)?
+            .load(Ordering::Relaxed);
+        if producer >= channels::WORK_RING_SLOTS {
+            return Err(EINVAL);
+        }
+        Ok(producer)
+    }
+
     /// Two firmware consumers and the host producer, sampled in that order.
     pub(super) fn work_cursors(
         &self,
@@ -943,16 +958,18 @@ impl InitData {
 
     /// Release a retained pair after its control transaction. Revalidate the original producer
     /// witnesses before either copy; both bodies precede the fragment and tiling publications.
+    /// `cursors`: M5, as for [`Self::m5_work_pair`].
     pub(super) fn publish_retained_work_pair(
         &self,
         priority: u8,
         fragment: &super::fw::channels::WorkSlot,
         tiling: &super::fw::channels::WorkSlot,
         next: [u32; 2],
+        cursors: Option<[u32; 3]>,
     ) -> Result {
         use super::fw::queue::DataMaster;
         if self.m5 {
-            let pair = self.m5_work_pair(priority, fragment, tiling, None)?;
+            let pair = self.m5_work_pair(priority, fragment, tiling, cursors)?;
             if pair.next() != next { return Err(EBUSY); }
             pair.publish();
             return Ok(());
