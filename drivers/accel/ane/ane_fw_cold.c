@@ -511,21 +511,39 @@ static int ane_fw_boot(struct ane_fw_backend *b);
 static int ane_fw_startup(struct ane_fw_backend *b);
 static int ane_fw_rvbar_ready(struct ane_fw_backend *b);
 
-/* Reverse of the proven power-up: sub-block, PWGATE, CPU, then ANE_SYS. */
+/* A power word goes off whole, and off means target, actual and BUSY clear. */
+#define ANE_FW_PS_OFF 0x300
+#define ANE_FW_PS_OFF_MASK 0x8ff
+
+static int ane_fw_ps_off(struct ane_fw_backend *b, u32 offset)
+{
+	int ret;
+
+	ane_wr32(b, ANE_FW_PS_OFF, b->pmgr + offset);
+	ret = ane_poll32(b, b->pmgr + offset, ANE_FW_PS_OFF_MASK, 0, 1, 100000);
+	if (ret)
+		dev_err(&b->pdev->dev, "H17 ANE: power word %#x stuck at %#x\n", offset,
+			ane_rd32(b, b->pmgr + offset));
+	return ret;
+}
+
+/* The order macOS uses for this engine: sub-block, PWGATE, its ack, CPU, then ANE_SYS. */
 static int ane_fw_power_down(struct ane_fw_backend *b)
 {
 	int ret;
 
-	ane_wr32(b, ane_rd32(b, b->pmgr + 0xc008) & ~0xf, b->pmgr + 0xc008);
-	ret = ane_poll32(b, b->pmgr + 0xc008, 0xf0, 0, 1, 100000);
+	ret = ane_fw_ps_off(b, 0xc008);
 	if (ret)
 		return ret;
 	ane_wr32(b, 3, b->gate + 0xc);
 	ret = ane_poll32(b, b->gate + 0xc, 3, 3, 1, 100000);
 	if (ret)
 		return ret;
-	ane_wr32(b, ane_rd32(b, b->pmgr + 0xc000) & ~0xf, b->pmgr + 0xc000);
-	ret = ane_poll32(b, b->pmgr + 0xc000, 0xf0, 0, 1, 100000);
+	ane_wr32(b, 0, b->gate + 0x30);
+	ret = ane_poll32(b, b->gate + 0x30, 1, 0, 1, 100000);
+	if (ret)
+		return ret;
+	ret = ane_fw_ps_off(b, 0xc000);
 	if (ret)
 		return ret;
 	/* No engine or DART access from here until ANE_SYS is back on. */
