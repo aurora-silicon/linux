@@ -61,6 +61,10 @@ static bool factory_address = true;
 module_param(factory_address, bool, 0444);
 MODULE_PARM_DESC(factory_address, "Program the loader-provided local-bd-address before the first HCI reset");
 
+static bool fixup_adv_phy = true;
+module_param(fixup_adv_phy, bool, 0444);
+MODULE_PARM_DESC(fixup_adv_phy, "Mask the firmware's extra bits in LE extended advertising report PHYs");
+
 static bool enable_acl;
 module_param(enable_acl, bool, 0444);
 MODULE_PARM_DESC(enable_acl, "Experimental ACL data delivery; requires LE and auxiliary rings");
@@ -1002,6 +1006,14 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	hdev->send = cen_hci_send;
 	hdev->setup = cen_hci_setup;
 	hdev->post_init = cen_hci_post_init;
+	/*
+	 * The N1 sets bits above the PHY value in LE Extended Advertising
+	 * Reports, as on T6050 (btcentauri_t6050.c). Unmasked, no PHY matches in
+	 * hci_le_ext_create_conn_sync(): LE Extended Create Connection goes out
+	 * with no initiating PHY and LE devices never connect.
+	 */
+	if (fixup_adv_phy)
+		hci_set_quirk(hdev, HCI_QUIRK_FIXUP_LE_EXT_ADV_REPORT_PHY);
 	SET_HCIDEV_DEV(hdev, &pdev->dev);
 	hci_set_drvdata(hdev, bt);
 	pci_set_drvdata(pdev, bt);
