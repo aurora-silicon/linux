@@ -114,7 +114,7 @@ kunit_test_suite(isp_dapf_test_suite);
 /*
  * A deferred start detects the camera once: its firmware must keep running
  * or start again. Firmware that starts again is not resident, and only it
- * is quiesced before the power-down.
+ * is quiesced before the power-down or idles after a stream.
  */
 static void isp_test_firmware_lifetime(struct kunit *test)
 {
@@ -131,6 +131,14 @@ static void isp_test_firmware_lifetime(struct kunit *test)
 		if (hw->coproc_quiesce)
 			KUNIT_EXPECT_TRUE_MSG(test, hw->fw_restore, "%s",
 					      match->compatible);
+		/* Only firmware that starts again idles before it stops. */
+		if (hw->fw_idle_ms)
+			KUNIT_EXPECT_TRUE_MSG(test, hw->fw_restore, "%s",
+					      match->compatible);
+		/* The fallback keeps restartable firmware resident. */
+		if (hw->resident_fallback)
+			KUNIT_EXPECT_TRUE_MSG(test, hw->fw_restore && hw->num_dapf,
+					      "%s", match->compatible);
 	}
 }
 
