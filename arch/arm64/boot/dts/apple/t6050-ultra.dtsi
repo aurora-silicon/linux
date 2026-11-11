@@ -57,6 +57,168 @@
 		T6050_P_CPU(cpu32, 11202, cpufreq_pc_die1);
 		T6050_P_CPU(cpu33, 11203, cpufreq_pc_die1);
 		T6050_P_CPU(cpu34, 11204, cpufreq_pc_die1);
+
+		/*
+		 * The clusters are MPIDR Aff1 (die 0's M0, M1 and P, then die 1's), each with its
+		 * own L2. They are listed flat, as on the other two-die parts. The boot loader
+		 * prunes the entries of cores it did not start.
+		 */
+		cpu-map {
+			cluster0 {
+				core0 {
+					cpu = <&cpu0>;
+				};
+				core1 {
+					cpu = <&cpu1>;
+				};
+				core2 {
+					cpu = <&cpu2>;
+				};
+				core3 {
+					cpu = <&cpu3>;
+				};
+				core4 {
+					cpu = <&cpu4>;
+				};
+			};
+
+			cluster1 {
+				core0 {
+					cpu = <&cpu6>;
+				};
+				core1 {
+					cpu = <&cpu7>;
+				};
+				core2 {
+					cpu = <&cpu8>;
+				};
+				core3 {
+					cpu = <&cpu9>;
+				};
+				core4 {
+					cpu = <&cpu10>;
+				};
+			};
+
+			cluster2 {
+				core0 {
+					cpu = <&cpu12>;
+				};
+				core1 {
+					cpu = <&cpu13>;
+				};
+				core2 {
+					cpu = <&cpu14>;
+				};
+				core3 {
+					cpu = <&cpu15>;
+				};
+				core4 {
+					cpu = <&cpu16>;
+				};
+			};
+
+			cluster3 {
+				core0 {
+					cpu = <&cpu18>;
+				};
+				core1 {
+					cpu = <&cpu19>;
+				};
+				core2 {
+					cpu = <&cpu20>;
+				};
+				core3 {
+					cpu = <&cpu21>;
+				};
+				core4 {
+					cpu = <&cpu22>;
+				};
+			};
+
+			cluster4 {
+				core0 {
+					cpu = <&cpu24>;
+				};
+				core1 {
+					cpu = <&cpu25>;
+				};
+				core2 {
+					cpu = <&cpu26>;
+				};
+				core3 {
+					cpu = <&cpu27>;
+				};
+				core4 {
+					cpu = <&cpu28>;
+				};
+			};
+
+			cluster5 {
+				core0 {
+					cpu = <&cpu30>;
+				};
+				core1 {
+					cpu = <&cpu31>;
+				};
+				core2 {
+					cpu = <&cpu32>;
+				};
+				core3 {
+					cpu = <&cpu33>;
+				};
+				core4 {
+					cpu = <&cpu34>;
+				};
+			};
+		};
+
+		/*
+		 * One L2 per cluster: the ADT gives each CPU an l2-cache-size of 8 MiB in the M
+		 * clusters and 16 MiB in the P clusters. It gives no L1 sizes and no L2 geometry,
+		 * so the nodes carry the level and the size only.
+		 */
+		l2_cache_0: l2-cache-0 {
+			compatible = "cache";
+			cache-level = <2>;
+			cache-unified;
+			cache-size = <0x800000>;
+		};
+
+		l2_cache_1: l2-cache-1 {
+			compatible = "cache";
+			cache-level = <2>;
+			cache-unified;
+			cache-size = <0x800000>;
+		};
+
+		l2_cache_2: l2-cache-2 {
+			compatible = "cache";
+			cache-level = <2>;
+			cache-unified;
+			cache-size = <0x1000000>;
+		};
+
+		l2_cache_3: l2-cache-3 {
+			compatible = "cache";
+			cache-level = <2>;
+			cache-unified;
+			cache-size = <0x800000>;
+		};
+
+		l2_cache_4: l2-cache-4 {
+			compatible = "cache";
+			cache-level = <2>;
+			cache-unified;
+			cache-size = <0x800000>;
+		};
+
+		l2_cache_5: l2-cache-5 {
+			compatible = "cache";
+			cache-level = <2>;
+			cache-unified;
+			cache-size = <0x1000000>;
+		};
 	};
 
 	/* Die 1 MMIO. The boot loader needs each die's bus. */
@@ -67,6 +229,127 @@
 		ranges = <0x42 0x0 0x42 0x0 0x3 0xc0000000>;
 		nonposted-mmio;
 	};
+};
+
+/* Each CPU's next-level cache is its cluster's L2 (cluster N, l2_cache_N). */
+&cpu0 {
+	next-level-cache = <&l2_cache_0>;
+};
+
+&cpu1 {
+	next-level-cache = <&l2_cache_0>;
+};
+
+&cpu2 {
+	next-level-cache = <&l2_cache_0>;
+};
+
+&cpu3 {
+	next-level-cache = <&l2_cache_0>;
+};
+
+&cpu4 {
+	next-level-cache = <&l2_cache_0>;
+};
+
+&cpu6 {
+	next-level-cache = <&l2_cache_1>;
+};
+
+&cpu7 {
+	next-level-cache = <&l2_cache_1>;
+};
+
+&cpu8 {
+	next-level-cache = <&l2_cache_1>;
+};
+
+&cpu9 {
+	next-level-cache = <&l2_cache_1>;
+};
+
+&cpu10 {
+	next-level-cache = <&l2_cache_1>;
+};
+
+&cpu12 {
+	next-level-cache = <&l2_cache_2>;
+};
+
+&cpu13 {
+	next-level-cache = <&l2_cache_2>;
+};
+
+&cpu14 {
+	next-level-cache = <&l2_cache_2>;
+};
+
+&cpu15 {
+	next-level-cache = <&l2_cache_2>;
+};
+
+&cpu16 {
+	next-level-cache = <&l2_cache_2>;
+};
+
+&cpu18 {
+	next-level-cache = <&l2_cache_3>;
+};
+
+&cpu19 {
+	next-level-cache = <&l2_cache_3>;
+};
+
+&cpu20 {
+	next-level-cache = <&l2_cache_3>;
+};
+
+&cpu21 {
+	next-level-cache = <&l2_cache_3>;
+};
+
+&cpu22 {
+	next-level-cache = <&l2_cache_3>;
+};
+
+&cpu24 {
+	next-level-cache = <&l2_cache_4>;
+};
+
+&cpu25 {
+	next-level-cache = <&l2_cache_4>;
+};
+
+&cpu26 {
+	next-level-cache = <&l2_cache_4>;
+};
+
+&cpu27 {
+	next-level-cache = <&l2_cache_4>;
+};
+
+&cpu28 {
+	next-level-cache = <&l2_cache_4>;
+};
+
+&cpu30 {
+	next-level-cache = <&l2_cache_5>;
+};
+
+&cpu31 {
+	next-level-cache = <&l2_cache_5>;
+};
+
+&cpu32 {
+	next-level-cache = <&l2_cache_5>;
+};
+
+&cpu33 {
+	next-level-cache = <&l2_cache_5>;
+};
+
+&cpu34 {
+	next-level-cache = <&l2_cache_5>;
 };
 
 #define DIE
