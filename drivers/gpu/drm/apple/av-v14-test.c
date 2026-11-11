@@ -517,6 +517,107 @@ static void av_desktop_service_admission(struct kunit *test)
 
 static const bool av_native_desktop[] = { false, true };
 
+/*
+ * A firmware whose element catalog is av_elements_catalog bytes: a capacity
+ * too small for it is answered with an empty catalog, as the T6041 DCPEXT
+ * does (av_elements_refuse: refused as too large instead).
+ */
+static size_t av_elements_catalog;
+static size_t av_elements_caps[8];
+static unsigned int av_elements_ncalls;
+static bool av_elements_refuse;
+
+static int av_elements_call(struct apple_epic_service *service, u16 group, u32 command,
+			    void *output, size_t output_maxsize, size_t *output_size)
+{
+	if (av_elements_ncalls < ARRAY_SIZE(av_elements_caps))
+		av_elements_caps[av_elements_ncalls] = output_maxsize;
+	av_elements_ncalls++;
+	memset(output, 0, output_maxsize);
+	if (av_elements_catalog > output_maxsize) {
+		if (av_elements_refuse)
+			return -EMSGSIZE;
+		*output_size = 0;
+		return 0;
+	}
+	*output_size = av_elements_catalog;
+	memset(output, 0xa5, av_elements_catalog);
+	return 0;
+}
+
+/*
+ * A compact endpoint carries the capacity in band: the catalog is asked for
+ * with a small capacity that grows only when it does not fit, and the
+ * capacity that fitted is kept (and shrinks for a smaller catalog). The
+ * buffer transport asks with the whole capacity once.
+ */
+static void av_elements_capacity(struct kunit *test)
+{
+	struct av_v14_test *t = av_v14_setup(test);
+	bool desktop = *(const bool *)test->param_value;
+	u8 *elements = kunit_kzalloc(test, SZ_256K, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, elements);
+	kunit_activate_static_stub(test, dcp_audiosrv_osobject_call, av_elements_call);
+	memset(elements, 0x5a, SZ_256K);
+	av_elements_refuse = false;
+
+	av_elements_catalog = 7784;
+	av_elements_ncalls = 0;
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_get_elements(t->dcp->dev, elements, SZ_256K), 0);
+	KUNIT_ASSERT_EQ(test, av_elements_ncalls, 1U);
+	KUNIT_EXPECT_EQ(test, av_elements_caps[0], desktop ? (size_t)SZ_16K : (size_t)SZ_256K);
+	/* Nothing of an earlier catalog is left beyond this one */
+	KUNIT_EXPECT_EQ(test, elements[7783], 0xa5);
+	KUNIT_EXPECT_EQ(test, elements[7784], 0);
+	KUNIT_EXPECT_EQ(test, elements[SZ_256K - 1], 0);
+
+	/* A television's catalog: grown until it fits, then kept */
+	av_elements_catalog = 100000;
+	av_elements_ncalls = 0;
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_get_elements(t->dcp->dev, elements, SZ_256K), 0);
+	if (desktop) {
+		KUNIT_ASSERT_EQ(test, av_elements_ncalls, 3U);
+		KUNIT_EXPECT_EQ(test, av_elements_caps[0], (size_t)SZ_16K);
+		KUNIT_EXPECT_EQ(test, av_elements_caps[1], (size_t)SZ_64K);
+		KUNIT_EXPECT_EQ(test, av_elements_caps[2], (size_t)SZ_256K);
+	} else {
+		KUNIT_EXPECT_EQ(test, av_elements_ncalls, 1U);
+	}
+	av_elements_ncalls = 0;
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_get_elements(t->dcp->dev, elements, SZ_256K), 0);
+	KUNIT_ASSERT_EQ(test, av_elements_ncalls, 1U);
+	KUNIT_EXPECT_EQ(test, av_elements_caps[0], (size_t)SZ_256K);
+
+	/* Back to the monitor: asked with the kept capacity, then a small one again */
+	av_elements_catalog = 7784;
+	av_elements_ncalls = 0;
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_get_elements(t->dcp->dev, elements, SZ_256K), 0);
+	av_elements_ncalls = 0;
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_get_elements(t->dcp->dev, elements, SZ_256K), 0);
+	KUNIT_ASSERT_EQ(test, av_elements_ncalls, 1U);
+	KUNIT_EXPECT_EQ(test, av_elements_caps[0], desktop ? (size_t)SZ_16K : (size_t)SZ_256K);
+
+	/* A firmware that refuses a small capacity instead: grown the same way */
+	av_elements_refuse = true;
+	av_elements_catalog = 30000;
+	av_elements_ncalls = 0;
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_get_elements(t->dcp->dev, elements, SZ_256K), 0);
+	KUNIT_EXPECT_EQ(test, av_elements_ncalls, desktop ? 2U : 1U);
+	KUNIT_EXPECT_EQ(test, elements[29999], 0xa5);
+
+	/* A catalog larger than the whole capacity: asked once at it, last */
+	av_elements_catalog = SZ_256K + 1;
+	av_elements_ncalls = 0;
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_get_elements(t->dcp->dev, elements, SZ_256K), -EMSGSIZE);
+	KUNIT_EXPECT_EQ(test, av_elements_caps[av_elements_ncalls - 1], (size_t)SZ_256K);
+	av_elements_refuse = false;
+	av_elements_ncalls = 0;
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_get_elements(t->dcp->dev, elements, SZ_256K), 0);
+	KUNIT_EXPECT_EQ(test, av_elements_caps[av_elements_ncalls - 1], (size_t)SZ_256K);
+	KUNIT_EXPECT_EQ(test, elements[0], 0);
+}
+
 static void av_native_desc(const bool *desktop, char *desc)
 {
 	scnprintf(desc, KUNIT_PARAM_DESC_SIZE, "%s", *desktop ? "desktop-26" : "external-14.7");
@@ -542,6 +643,7 @@ static struct kunit_case av_v14_cases[] = {
 	KUNIT_CASE_PARAM(av_v14_terminate_unpublished, av_native_gen_params),
 	KUNIT_CASE_PARAM(av_native_link_payload_status, av_native_gen_params),
 	KUNIT_CASE_PARAM(av_desktop_service_admission, av_native_gen_params),
+	KUNIT_CASE_PARAM(av_elements_capacity, av_native_gen_params),
 	{}
 };
 
