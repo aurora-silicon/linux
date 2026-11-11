@@ -437,7 +437,7 @@
 };
 
 &ps_avd_sys {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_sep {
