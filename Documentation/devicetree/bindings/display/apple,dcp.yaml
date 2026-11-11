@@ -275,10 +275,6 @@ properties:
     const: 1
     description: All external firmware reservations were committed by the loader.
 
-  apple,firmware-uuid:
-    $ref: /schemas/types.yaml#/definitions/string
-    description: UUID of the actual loaded display image, read from its iop nub.
-
   apple,pmp:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: Native PMP supplier, independent of the report request entry.
