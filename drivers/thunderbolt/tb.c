@@ -10,6 +10,7 @@
 #include <linux/slab.h>
 #include <linux/errno.h>
 #include <linux/delay.h>
+#include <linux/export.h>
 #include <linux/of.h>
 #include <linux/pm_runtime.h>
 #include <linux/platform_data/x86/apple.h>
@@ -3824,6 +3825,7 @@ int tb_apple_sleep_quiesce(struct tb *tb)
 	flush_workqueue(tb->wq);
 	return 0;
 }
+EXPORT_SYMBOL_GPL(tb_apple_sleep_quiesce);
 
 static void tb_stop(struct tb *tb)
 {
