@@ -887,8 +887,16 @@ impl Firmware {
         // given, and the state records, the M5 value (InitData::submission_effort).
         let published = init.submission_effort(effort, state.waited());
         port.set_effort_full(effort == power::FULL_EFFORT);
-        if state.applied() == published && init.effort()? == published {
-            return Ok(());
+        if state.applied() == published {
+            // M5 maps region C read-only to the firmware: once confirmed, the word holds
+            // `applied` without reading it back.
+            if init.is_m5() && state.confirmed() {
+                return Ok(());
+            }
+            if init.effort()? == published {
+                state.confirm();
+                return Ok(());
+            }
         }
         init.publish_effort(published)?;
         trace::message(trace::EFFORT, u64::from(published));
