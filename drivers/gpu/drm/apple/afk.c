@@ -2,6 +2,8 @@
 /* Copyright 2022 Sven Peter <sven@svenpeter.dev> */
 
 #include <linux/bitfield.h>
+#include <linux/io.h>
+#include <linux/iommu.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
@@ -15,6 +17,8 @@
 #include <linux/sizes.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
+#include <linux/ioport.h>
+#include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/rtkit.h>
 
 #include <kunit/visibility.h>
@@ -106,6 +110,7 @@ struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 
 	afkep->ops = ops;
 	afkep->dcp = dcp;
+	afkep->wire_v2 = dcp->fw_compat == DCP_FIRMWARE_V_27_0;
 	afkep->endpoint = endpoint;
 	afkep->wq = alloc_ordered_workqueue("apple-dcp-afkep%02x",
 					    WQ_MEM_RECLAIM, endpoint);
@@ -1552,7 +1557,8 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 			return;
 		}
 		ret = parse_epic_service_init(&ctx, &epic_name, &epic_class, &epic_unit,
-					      ep->dcp->fw_compat == DCP_FIRMWARE_H17P);
+					      (ep->dcp->fw_compat == DCP_FIRMWARE_H17P || ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0),
+					      ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0);
 		if (ret == -ENOENT &&
 		    ep->dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G) {
 			/*
@@ -1655,6 +1661,8 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 	}
 	if (ops->prepare)
 		afk_service_publish(service);
+	if (ops->init_props)
+		ops->init_props(service, epic_unit, props, props_size);
 	if (ops->init)
 		ops->init(service, epic_name, epic_class, epic_unit);
 	dev_info(ep->dcp->dev, "AFK[ep:%02x]: new service %s on channel %d\n",
@@ -1940,6 +1948,61 @@ static void afk_v2_status(struct apple_dcp_afkep *ep,
 		dev_warn(ep->dcp->dev, "AFKV2 error reply failed: %d\n", ret);
 }
 
+/*
+ * A buffer the DCP firmware names that is none of the host's pending command
+ * buffers. Only the firmware's own retained mappings are followed, with the
+ * permission they grant: a reply is written only where the firmware's leaf
+ * allows writes, and a DVA that Linux mapped itself, or that names Linux's RAM,
+ * a claimed resource or anything below DRAM (a device's registers, claimed or
+ * not), is refused. The copy goes through a write-combined mapping, as the
+ * RTKit buffers in the same firmware segments are mapped (dcp_rtk_shmem_setup()):
+ * the DCP is not described as DMA-coherent, so a cacheable alias could see
+ * stale data.
+ */
+static int afk_v27_access_remote(struct apple_dcp_afkep *ep, u64 dva, void *buffer,
+			   size_t size, bool to_remote, bool copy)
+{
+	size_t off = 0;
+
+	if (!dva || size > SZ_1M || size > U64_MAX - dva)
+		return -EINVAL;
+	while (off < size) {
+		phys_addr_t pa = 0;
+		size_t chunk = min_t(size_t, size - off,
+				    PAGE_SIZE - ((dva + off) & ~PAGE_MASK));
+		int ret = apple_dart_fw_remote(ep->dcp->dev, dva + off, to_remote, &pa);
+		void *cpu;
+
+		if (!ret && (!dcp_fw_phys_in_dram(pa) ||
+			     region_intersects(pa, chunk, IORESOURCE_MEM,
+					       IORES_DESC_NONE) != REGION_DISJOINT))
+			ret = -EACCES;
+		if (ret) {
+			dev_err_ratelimited(ep->dcp->dev,
+				"AFK[ep:%02x]: refused remote buffer %#llx + %#zx (%s): %d\n",
+				ep->endpoint, dva, off, to_remote ? "reply" : "request", ret);
+			return ret;
+		}
+		if (!copy) {
+			off += chunk;
+			continue;
+		}
+		cpu = memremap(pa, chunk, MEMREMAP_WC);
+		if (!cpu)
+			return -ENOMEM;
+		if (to_remote) {
+			memcpy(cpu, buffer + off, chunk);
+			dma_wmb();
+		} else {
+			dma_rmb();
+			memcpy(buffer + off, cpu, chunk);
+		}
+		memunmap(cpu);
+		off += chunk;
+	}
+	return 0;
+}
+
 static int afk_v2_access_owned(struct apple_epic_service *service, u64 dva,
 			       void *buffer, size_t size, bool to_peer, bool copy)
 {
@@ -1983,6 +2046,9 @@ static int afk_v2_access_owned(struct apple_epic_service *service, u64 dva,
 		break;
 	}
 	spin_unlock_irqrestore(&service->lock, flags);
+	/* T6050 callbacks may refer to firmware-owned buffers in the retained DART. */
+	if (ret && service->ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+		ret = afk_v27_access_remote(service->ep, dva, buffer, size, to_peer, copy);
 	if (ret)
 		dev_warn_ratelimited(service->ep->dcp->dev,
 				     "AFKV2 unowned buffer: ep=%u interface=%u size=%zu write=%u\n",
@@ -2201,7 +2267,8 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 		hdr_len = sizeof(*ehdr) + sizeof(*c);
 		if (data_size < hdr_len)
 			goto too_small;
-		if (ep->dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+		if (ep->dcp->fw_compat == DCP_FIRMWARE_H17P &&
+		    ep->dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 		    !afk_validate_h17p_header(data, data_size)) {
 			dev_err(ep->dcp->dev,
 				"AFK[ep:%02x]: invalid compact message length\n",
@@ -2219,7 +2286,7 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 		 * queue channel at face value binds "system" to 0 and makes
 		 * every later announce and report look like a duplicate.
 		 */
-		channel = le16_to_cpup((__le16 *)(data + 2));
+		channel = get_unaligned_le16(data + 2);
 
 		/*
 		 * Normalise into the wide sub-header the rest of this file
@@ -2240,6 +2307,7 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 	subtype = le16_to_cpu(eshdr->type);
 	payload = data + hdr_len;
 	payload_size = data_size - hdr_len;
+
 
 	trace_afk_recv_handle(ep, channel, type, data_size, ehdr, eshdr);
 
@@ -2585,7 +2653,7 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	}
 
 	spin_lock_irqsave(&ep->lock, flags);
-	if (ep->stopping) {
+	if (ep->stopping || !ep->txbfr.ready) {
 		ret = -ESHUTDOWN;
 		goto out;
 	}
@@ -2599,6 +2667,12 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	dma_rmb();
 	rptr = le32_to_cpu(*ep->txbfr.rptr);
 	wptr = le32_to_cpu(*ep->txbfr.wptr);
+	if (rptr >= ep->txbfr.bufsz || wptr >= ep->txbfr.bufsz ||
+	    !IS_ALIGNED(rptr, ep->txbfr.stride) ||
+	    !IS_ALIGNED(wptr, ep->txbfr.stride)) {
+		ret = -EPROTO;
+		goto out;
+	}
 	trace_afk_send_rwptr_pre(ep, rptr, wptr);
 	total_epic_size = sizeof(*ehdr) +
 		(ep->wire_v2 ? sizeof(struct epic_sub_hdr_h17p) : sizeof(*eshdr)) +

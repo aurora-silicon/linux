@@ -7,7 +7,8 @@ import tempfile
 root = Path(__file__).resolve().parents[2]
 s = (root / 'drivers/gpu/drm/asahi/file.rs').read_text()
 a = s.index('        if data.flags != 0', s.index('pub(crate) fn queue_create('))
-b = s.index('        let queues_xa', a)
+# Keep this credential/priority fixture scoped before queue-quota accounting.
+b = s.index('        let share =', a)
 gate = s[a:b]
 predicate = (root / 'drivers/gpu/drm/asahi/m3/m3_drm.rs').read_text().split('pub(crate) fn supports_high_priority(&self) -> bool {', 1)[1].split('\n    }', 1)[0]
 submit = (root / 'drivers/gpu/drm/asahi/m3/m3_submit.rs').read_text()

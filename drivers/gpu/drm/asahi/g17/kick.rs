@@ -20,7 +20,7 @@ use super::{
     fw::{kick::*, queue::DataMaster},
     object::{Allocator, CpuMap, KernelObject},
 };
-use crate::{hw::t8140, mem, mmu};
+use crate::{mem, mmu};
 
 pub(super) const QID_COUNT: usize = QID_MAX as usize + 1;
 
@@ -56,7 +56,9 @@ const _: () = {
     assert!(queue_limit(0) == crate::mmu::MAX_EXECUTION_CONTEXTS);
     // Compute keeps this many channels even with every execution context open.
     assert!(QID_COUNT - FULL_RENDER_RESERVE >= 4);
-    assert!(crate::hw::t8140::queues::RENDER_PAIRS_PER_OWNER == 1);
+    // The reserve counts one pair per owner. A second pair of an owner comes
+    // only from surplus (g17::pairs), never from this reserve.
+    assert!(FULL_RENDER_RESERVE == 2 * crate::mmu::MAX_EXECUTION_CONTEXTS as usize + 2);
 };
 
 /// Stable physical-channel identity. The owner must not be reused within a
@@ -398,11 +400,27 @@ enum Backing {
     Render(RenderRing),
 }
 
+/// A client VM's view of a kick ring. The host writes the entries through the kernel's mapping
+/// and the firmware reads them through its own; a client's GPU work only reads them, so its
+/// view is read-only: a client cannot rewrite an entry after the kernel built and checked it.
+const CLIENT_KICK_PROT: mmu::Prot = mmu::PROT_GPU_SHARED_RO;
+
 /// A render ring's pages and the shared lower reservation clients alias.
 struct RenderStorage {
     // The lower alias drops before its backing.
     low: mmu::KernelMapping,
     high: KernelObject,
+    /// The client VM the storage was created for, whose alias of it lasts as long as that VM.
+    vm: u64,
+    /// That VM's status, which tells when its client closed it.
+    status: Option<Arc<super::status::VmStatus>>,
+}
+
+impl RenderStorage {
+    /// The client closed the VM this storage was created for.
+    fn closed(&self) -> bool {
+        self.status.as_ref().is_some_and(|status| status.client_closed())
+    }
 }
 
 /// Render ring storage outlives its rings for the life of the device.
@@ -442,12 +460,27 @@ impl RenderRings {
         )
     }
 
-    fn take(&self) -> Option<RenderStorage> {
+    /// Reusable storage created for `client`, else storage whose VM its client has closed,
+    /// which then belongs to `client`. Storage of another open VM is never handed out: that VM
+    /// keeps its read-write alias of the pages, so it could read and write the new ring.
+    fn take(&self, client: &mmu::Vm) -> Option<RenderStorage> {
+        let vm = client.id();
         let mut stock = self.stock.lock();
-        let index = stock.retired.iter().rposition(|(reusable, _)| *reusable)?;
+        let reusable = |own: bool| {
+            stock.retired.iter().rposition(|(reusable, storage)| {
+                *reusable && if own { storage.vm == vm } else { storage.closed() }
+            })
+        };
+        let index = reusable(true).or_else(|| reusable(false))?;
         let last = stock.retired.len() - 1;
         stock.retired.swap(index, last);
-        stock.retired.pop().map(|(_, storage)| storage)
+        let (_, mut storage) = stock.retired.pop()?;
+        drop(stock);
+        if storage.vm != vm {
+            storage.vm = vm;
+            storage.status = client.status().cloned();
+        }
+        Some(storage)
     }
 
     /// Reserves the return of one more, just created storage.
@@ -538,10 +571,10 @@ impl Queue {
             mmu::PROT_GPU_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
-        let range = t8140::dynamic::upper(alloc.uat.geometry().kernel_range());
+// The UAT reserves the boot graph and firmware register aperture.
         let high = low.alias_in(
             alloc.uat.kernel_vm(),
-            range,
+            alloc.uat.kernel_dynamic_range(),
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_SHARED_RW,
         )?;
@@ -566,7 +599,7 @@ impl Queue {
         if id.engine == DataMaster::Compute {
             return Err(EINVAL);
         }
-        if let Some(storage) = rings.take() {
+        if let Some(storage) = rings.take(client) {
             let mut ring = RenderRing {
                 storage: ManuallyDrop::new(storage),
                 rings: rings.clone(),
@@ -579,7 +612,7 @@ impl Queue {
             let alias =
                 ring.storage
                     .high
-                    .prepare_alias(client, address, mmu::PROT_GPU_SHARED_RW, true);
+                    .prepare_alias(client, address, CLIENT_KICK_PROT, false);
             // On failure the storage returns to the stock and a fresh ring is built.
             if let Ok(alias) = alias {
                 return Ok((
@@ -593,13 +626,22 @@ impl Queue {
                 ));
             }
         }
+        let (vm, status) = (client.id(), client.status().cloned());
+        // The firmware's mapping sits in the upper half, which every execution context includes.
+        // On M5 it is firmware-only, as a compute ring's is; the GPU reads the ring at its lower
+        // address.
+        let firmware_prot = if alloc.uat.is_m5() {
+            mmu::PROT_FW_SHARED_RW
+        } else {
+            mmu::PROT_GPU_FW_SHARED_RW
+        };
         let high = alloc.kernel(
             KICK_RING_SIZE,
             mmu::UAT_PGSZ as u64,
-            mmu::PROT_GPU_FW_SHARED_RW,
+            firmware_prot,
             CpuMap::WriteCombined,
         )?;
-        let mut range = t8140::dynamic::LOWER;
+        let mut range = alloc.uat.kernel_lower_dynamic_range();
         let (low, client) = loop {
             let low = high.alias_in(
                 alloc.uat.kernel_lower_vm(),
@@ -611,7 +653,7 @@ impl Queue {
                 .iova()
                 .checked_add(KICK_RING_SIZE as u64)
                 .ok_or(EOVERFLOW)?;
-            match high.map_alias(client, low.iova(), mmu::PROT_GPU_SHARED_RW) {
+            match high.map_alias(client, low.iova(), CLIENT_KICK_PROT) {
                 Ok(client) => break (low, client),
                 Err(error) if error == ENOSPC && end < range.end => {
                     drop(low);
@@ -620,7 +662,7 @@ impl Queue {
                 Err(error) => return Err(error),
             }
         };
-        let storage = RenderStorage { low, high };
+        let storage = RenderStorage { low, high, vm, status };
         // Count the storage only once it exists. Without room to return it,
         // nothing has aliased it but `client`, which drops first.
         if let Err(error) = rings.admit() {
@@ -667,7 +709,31 @@ impl Queue {
     pub(crate) fn map_client(&mut self, vm: &mmu::Vm) -> Result<mmu::KernelMapping> {
         let address = self.low_va();
         self.object()
-            .map_alias(vm, address, mmu::PROT_GPU_SHARED_RW)
+            .map_alias(vm, address, CLIENT_KICK_PROT)
+    }
+
+    /// Clears an idle compute ring before another VM is given a view of it, so the new owner
+    /// cannot read the entries the previous owner's commands left. The firmware has consumed
+    /// every entry; the host's position in the ring is kept.
+    pub(crate) fn clear_ring(&mut self) -> Result {
+        let Backing::Compute { low, .. } = &mut self.backing else {
+            return Err(EINVAL);
+        };
+        low.bytes_mut().fill(0);
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Clears an idle render ring before a context of another VM is given a view of it, so the
+    /// new owner cannot read the entries earlier owners' commands left. The firmware has
+    /// consumed every entry; the host's position in the ring is kept.
+    pub(crate) fn clear_render_ring(&mut self) -> Result {
+        let Backing::Render(ring) = &mut self.backing else {
+            return Err(EINVAL);
+        };
+        ring.storage.high.bytes_mut().fill(0);
+        fence(Ordering::SeqCst);
+        Ok(())
     }
 
     /// Reuse a permanent client view only when every page names this ring.
@@ -676,14 +742,25 @@ impl Queue {
             Backing::Compute { low, .. } => low,
             Backing::Render(ring) => &ring.storage.high,
         };
-        object.prepare_alias(vm, self.low_va(), mmu::PROT_GPU_SHARED_RW, true)
+        object.prepare_alias(vm, self.low_va(), CLIENT_KICK_PROT, false)
     }
 
     /// Both aliases are owned mappings of the same full ring. Publish their
     /// page-table updates to each live translation regime before installation.
+    ///
+    /// With published roots each alias reaches every context whose lower or
+    /// upper half names its VM's root: the low alias lives in the kernel lower
+    /// VM, the firmware alias in the kernel upper VM, whose root sits in the
+    /// upper half of every execution context. Under the handoff the first four
+    /// contexts are invalidated.
     pub(crate) fn prepare_compute_install(&self) -> Result {
-        if self.id.engine != DataMaster::Compute {
+        let Backing::Compute { high, low } = &self.backing else {
             return Err(EINVAL);
+        };
+        if high.tracks_contexts() {
+            low.publish_to_contexts()?;
+            high.publish_to_contexts();
+            return Ok(());
         }
         mem::sync();
         for asid in 0..4 {
@@ -709,10 +786,17 @@ impl Queue {
             _ => self.timestamp.prev(),
         })
     }
+    /// The parent's predecessor, while this queue remembers a previous kick: a G17D fragment
+    /// kick names it after its pipelined self-parent. Never on the first kick's synthetic
+    /// parent; recovery clears the history, and with it this.
+    pub(crate) fn ancestor(&self) -> Option<KickTimestamp> {
+        self.previous.map(KickTimestamp::prev)
+    }
     pub(crate) fn prepare_entry(&mut self, args: &KickArgs<'_>) -> Result<PreparedKick<'_>> {
         if args.qid != self.id.qid
             || args.timestamp != self.timestamp
             || args.parent != self.parent()
+            || args.ancestor.is_some_and(|ancestor| Some(ancestor) != self.ancestor())
         {
             return Err(EINVAL);
         }

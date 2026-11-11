@@ -17,6 +17,7 @@ typedef void (*dcp_identity_key_fn)(void *data, const char *key, u32 key_len,
 int parse_identity_keys(const void *blob, size_t len, dcp_identity_key_fn emit, void *data);
 struct apple_connector;
 struct apple_dcp_typec_route;
+struct dcp_dptx_caps;
 
 struct dcp_parse_ctx {
 	struct apple_dcp *dcp;
@@ -224,7 +225,9 @@ int parse_panel_product_metadata(struct dcp_parse_ctx *handle,
 int parse_display_attributes(struct dcp_parse_ctx *handle, int *width_mm,
 			     int *height_mm, bool *backlight_control);
 int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
-			    const char **class, s64 *unit, bool h17p_keys);
+			    const char **class, s64 *unit, bool h17p_keys,
+			    bool epic_unit_first);
+int parse_dptx_caps(struct dcp_parse_ctx *handle, struct dcp_dptx_caps *caps);
 
 struct dcp_sound_format_mask {
 	u64 formats;			/* SNDRV_PCM_FMTBIT_* */

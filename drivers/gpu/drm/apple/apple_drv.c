@@ -183,11 +183,12 @@ static int apple_drm_fbdev_probe(struct drm_fb_helper *helper,
 		if (t8132_ext_crtc(crtc))
 			continue;
 		dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
-		if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+		if (dcp->fw_compat == DCP_FIRMWARE_H17P ||
+		    dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
 			/*
-			 * H17P applies the stored fourth byte as straight alpha,
-			 * the H17G (M5) profile too: an XRGB console with X = 0
-			 * stays black. ARGB makes fbcon write it opaque.
+			 * H17P and firmware 27 apply the stored fourth byte as
+			 * straight alpha: an XRGB console with X = 0 stays black.
+			 * ARGB makes fbcon write it opaque.
 			 */
 			sizes->surface_bpp = 32;
 			sizes->surface_depth = 32;
@@ -1211,23 +1212,27 @@ static int apple_probe_per_dcp(struct device *dev,
  * Create a connector per physical Type-C port and attach it to every
  * pipeline that can drive it. The M2 Pro/Max laptops append a second
  * connector per port for a dock's second DP tunnel, preserving primary
- * connector names.
+ * connector names. T6050 instead exposes one connector per port/pipeline
+ * pair: tunnel allocation chooses which connector is connected, without
+ * changing any encoder's advertised CRTC mask after registration.
  */
 static int apple_probe_typec_ports(struct drm_device *drm,
 				   struct platform_device **dcp,
 				   u32 *crtc_mask, int num_dcp)
 {
 	unsigned int idx, nr_ports = dcp_typec_nr_ports();
+	bool fixed = dcp_typec_fixed_crtcs();
+	unsigned int slots = fixed ? num_dcp : (dcp_typec_dual_stream() ? 2 : 1);
 	int i, ret;
 
 	/* Keep the existing physical-port connector numbers stable. On the
 	 * M2 Pro/Max laptops, append one more connector per port for a second
 	 * USB4 DP tunnel.
 	 */
-	for (idx = 0; idx < nr_ports * (dcp_typec_dual_stream() ? 2 : 1);
-	     idx++) {
+	for (idx = 0; idx < nr_ports * slots; idx++) {
 		struct apple_connector *connector;
 		struct apple_encoder *enc;
+		struct platform_device *pipeline = fixed ? dcp[idx / nr_ports] : NULL;
 		unsigned int port_idx = idx % nr_ports;
 		bool secondary = idx >= nr_ports;
 		u32 mask = 0;
@@ -1237,6 +1242,29 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 			drm_warn(drm, "Type-C port %u: its display pipeline is unusable\n",
 				 port_idx);
 			continue;
+		}
+
+		if (fixed) {
+			if (!dcp_typec_port_has_candidate(port_idx, pipeline))
+				continue;
+			mask = crtc_mask[idx / nr_ports];
+			if (!mask)
+				continue;
+		} else {
+			for (i = 0; i < num_dcp; i++) {
+				if (!dcp_typec_port_has_candidate(port_idx, dcp[i]))
+					continue;
+				/* Ordered dual-stream docks reserve the Type-C-only pipe. */
+				mask = dcp_fabric_port_crtc_mask(secondary,
+								 dcp_typec_ordered_dual_stream(),
+							       dcp_is_typec_only(dcp[i]),
+							       mask, crtc_mask[i]);
+			}
+			if (!mask) {
+				drm_warn(drm, "Type-C port %u has no display pipeline\n",
+					 port_idx);
+				return -ENODEV;
+			}
 		}
 
 		connector = kzalloc_obj(*connector);
@@ -1270,32 +1298,10 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		connector->connected = false;
 		connector->dcp = NULL;
 
-		for (i = 0; i < num_dcp; i++) {
-			if (!dcp_typec_port_has_candidate(port_idx, dcp[i]))
-				continue;
-			/*
-			 * A dock's second stream (DPIN1) always runs on the
-			 * lowest-indexed Type-C-only pipeline (dcpext1). Fix the
-			 * connector to it: compositors read possible_crtcs once
-			 * and would otherwise pair it with a pipeline the stream
-			 * can never be routed to. T6030 instead narrows both
-			 * connectors to the native processor holding their route.
-			 */
-			mask = dcp_fabric_port_crtc_mask(secondary,
-						       dcp_typec_ordered_dual_stream(),
-						       dcp_is_typec_only(dcp[i]),
-						       mask, crtc_mask[i]);
-		}
-
-		if (!mask) {
-			drm_warn(drm, "Type-C port %u has no display pipeline\n",
-					 port_idx);
-			return -ENODEV;
-		}
-
 		/*
-		 * One encoder for the port, spanning every pipeline that can
-		 * drive it.  Attaching one encoder per pipeline would describe
+		 * One encoder per connector, covering its allowed pipelines.
+		 * T6050 connectors each cover exactly one. Attaching several
+		 * encoders to the same connector would describe
 		 * the same hardware, but userspace takes the CRTCs a connector
 		 * can use to be what all of its encoders have in common, and
 		 * single-pipeline encoders have nothing in common -- the port
@@ -1313,7 +1319,7 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		connector->port_encoder = &enc->base;
 		connector->candidate_crtcs = mask;
 
-		dcp_typec_port_set_connector(port_idx, secondary, connector);
+		dcp_typec_port_set_connector(port_idx, secondary, connector, pipeline);
 	}
 
 	return 0;
@@ -1684,8 +1690,13 @@ static int apple_drm_init(struct device *dev)
 	 * the boot framebuffer owns the screen; past the eviction there is no
 	 * way back.  On refusal leave the DCP running (its shutdown sequence
 	 * can crash it and blank the panel), pin the module and keep the boot
-	 * framebuffer.
+	 * framebuffer. The pin is taken before the trials, while a refusal can
+	 * still unwind; it is given back if every trial passes.
 	 */
+	if (!try_module_get(THIS_MODULE)) {
+		ret = -ENODEV;
+		goto err_unbind;
+	}
 	drm_for_each_crtc(crtc, &apple->drm) {
 		const char *reason = "none";
 
@@ -1699,9 +1710,9 @@ static int apple_drm_init(struct device *dev)
 		/*
 		 * The DCPs keep running and keep their pipelines: pin the
 		 * module and the DRM device their CRTCs and connectors live
-		 * in, and keep them out of shutdown and sleep.
+		 * in, and keep them out of shutdown and sleep. The module
+		 * reference taken before the trials is kept.
 		 */
-		__module_get(THIS_MODULE);
 		drm_dev_get(&apple->drm);
 		drm_for_each_crtc(crtc, &apple->drm)
 			if (!t8132_ext_crtc(crtc))
@@ -1711,6 +1722,7 @@ static int apple_drm_init(struct device *dev)
 		t8132_ext_drm_fini(&apple->drm);
 		return 0;
 	}
+	module_put(THIS_MODULE);
 
 	if (retained_modeset)
 		drm_modeset_lock_all(&apple->drm);

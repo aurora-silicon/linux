@@ -36,6 +36,13 @@ The driver leaves fan policy to the SMC until userspace writes a nonzero
 shutdown and removal release only fans taken over by such a request; resume
 does not reapply it. A new target write is required after resume.
 
+A kernel thermal policy (the M5 GPU governor) sets the fans through
+macsmc_hwmon_fans_request(), as a share of each fan's range, on every fan
+whose node names its mode, target, minimum and maximum keys, with or without
+apple,fan-manual-control. It uses the same manual mode, leaves fans userspace
+holds alone, and its fans return to the SMC at suspend, shutdown and removal
+like userspace's.
+
 SoC die temperatures are described by the ``apple,soc-die-keys`` string list
 on the hwmon device node. The driver appends these temperature channels after
 the ``temperature-*`` children, in list order, with labels ``SoC die <key>``.

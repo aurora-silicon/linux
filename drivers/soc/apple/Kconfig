@@ -24,9 +24,10 @@ config APPLE_DBGVIEW
 	depends on ARM64 && OF && DEBUG_FS
 	help
 	  Root-only debugfs views of Apple SoC debug register blocks: the
-	  interrupt controller timebase and the debug dock connection
-	  status. The driver only reads registers, and only when a debugfs
-	  file is read.
+	  interrupt controller timebase, the debug dock connection
+	  status and the unused DWI interface of T6000, T8112 and T8140.
+	  The driver only reads registers, and only when a debugfs file is
+	  read.
 
 	  Say m here if you debug an Apple SoC.
 
@@ -219,6 +220,19 @@ config APPLE_SEP_KUNIT_TEST
 
 	  If unsure, say N.
 
+config APPLE_SEP_KEY_RESEARCH
+	bool "Apple SEP: /dev/sep-key context-reuse measurements (research only)"
+	depends on APPLE_SEP
+	help
+	  Build the SEP_KEY_SELFTEST modes that run a second key operation in
+	  a credential context a Touch ID match has satisfied (modes 20 and
+	  21). They measure what the enclave allows; a production kernel never
+	  issues more than one operation per match, and without this option
+	  the code that could do so is not built at all. The modes still need
+	  root and the key_selftest module parameter.
+
+	  Say N unless you are measuring the enclave on a lab machine.
+
 config APPLE_PMP
 	tristate "Apple Power Management Processor"
 	depends on ARCH_APPLE || COMPILE_TEST
@@ -353,6 +367,35 @@ config APPLE_DISPLAY_GATE_KUNIT_TEST
 	  J616c: each external display chain is enabled without a PMP once
 	  its processor has firmware memory, and the display subsystem's
 	  status is never written.
+
+config APPLE_AURORA_BOOT_SECURITY
+	tristate "Report how the boot chain verified this boot"
+	depends on OF
+	default y if ARCH_APPLE
+	help
+	  aura (Stage 1 and Stage 2) and U-Boot leave a record of what
+	  each stage measured and verified in /chosen/aurora,boot-security,
+	  together with what iBoot reports about the LocalPolicy that
+	  admitted Stage 1. This driver logs the chain state at boot and
+	  exposes it in /sys/firmware/aurora/boot_security/.
+
+	  The record is the firmware's account, not a proof: it is only
+	  called verified when an enforcing Stage 1 verified Stage 2.
+
+config APPLE_AURORA_BOOT_SECURITY_LOCKDOWN
+	bool "Lock the kernel down (integrity) on a verified boot"
+	depends on APPLE_AURORA_BOOT_SECURITY=y && SECURITY_LOCKDOWN_LSM && EFI
+	default y
+	help
+	  Raise lockdown to integrity when the firmware says this boot is
+	  on the secure path: UEFI Secure Boot is enforcing (the SecureBoot
+	  variable, or U-Boot's entry in the boot record), or the record's
+	  chain is verified from an enforcing Stage 1 on. This is the
+	  equivalent of locking down under UEFI Secure Boot on other
+	  platforms. Unsigned modules, unsigned kexec, /dev/mem and similar
+	  interfaces are then refused. A boot in audit or off mode is not
+	  locked down by this option; lockdown= on the command line still
+	  applies.
 
 endmenu
 

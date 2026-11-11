@@ -78,6 +78,11 @@ impl VmStatus {
         self.recovery_guilty.load(Ordering::Acquire)
     }
 
+    /// The client's VM handle is gone (`release_mirror`): the client submits nothing more.
+    pub(crate) fn client_closed(&self) -> bool {
+        self.client_closed.load(Ordering::Acquire)
+    }
+
     /// Record permanent admission failure and report it to the client.
     #[track_caller]
     pub(crate) fn record(&self, error: Error) {

@@ -87,7 +87,7 @@ impl Backend {
                 if !sleep {
                     return Err(FALLBACK);
                 }
-                match pool.acquire_render(self.owner, Request::of(packet), deadline_ns, || {
+                match pool.acquire_render(self.owner, self.pairs.into(), Request::of(packet), deadline_ns, || {
                     // Atomics only: the callback runs under the pool mutex.
                     if packet.cancel_requested() || self.closed.load(Ordering::Acquire) {
                         return Err(ECANCELED);
@@ -263,10 +263,22 @@ impl Backend {
         sleep: bool,
         packet: &Packet,
     ) -> Result {
+        self.wait_render_retirement(clock, observed, sleep, packet, super::super::WORK_RING_WAIT_NS)
+    }
+
+    /// [`Self::wait_render_busy`] bounded at `bound_ns`.
+    fn wait_render_retirement(
+        &self,
+        clock: &mut WaitClock,
+        observed: &mut Option<u64>,
+        sleep: bool,
+        packet: &Packet,
+        bound_ns: u64,
+    ) -> Result {
         if !sleep {
             return Err(FALLBACK);
         }
-        let deadline = self.wait_deadline(clock, super::super::WORK_RING_WAIT_NS)?;
+        let deadline = self.wait_deadline(clock, bound_ns)?;
         // Sample, then retry once: only a refusal after the sample waits.
         let Some(sample) = observed.take() else {
             *observed = Some(self.shared.renders.observe());
@@ -392,7 +404,7 @@ impl Backend {
             Some(lease) => Some(lease),
             None if known != 0 => self
                 .admission
-                .try_acquire_render(self.owner, Request::of(packet))
+                .try_acquire_render(self.owner, self.pairs.into(), Request::of(packet))
                 .ok()
                 .flatten(),
             None => None,
@@ -422,6 +434,8 @@ impl Backend {
         let mut recovery_since = None;
         let mut seen = None;
         let mut states = None;
+        let mut outer_wait = None;
+        let mut channel = WaitClock::default();
         loop {
             if packet.cancel_requested() {
                 return Err(ECANCELED);
@@ -489,7 +503,16 @@ impl Backend {
                 }
                 result => result?,
             }
-            match self.prepare_render(slot, packet, deferred, sleep) {
+            match self.prepare_render(slot, packet, deferred, sleep, &mut outer_wait) {
+                Err(error)
+                    if !packet.is_published() && error == crate::g17::context::RENDER_CHANNEL_PENDING =>
+                {
+                    // Both of the context's render channels serve other pairs: one moves here
+                    // once its publications retire. Like a compute queue, it frees only as this
+                    // context's earlier work retires, so wait as long.
+                    self.wait_render_retirement(&mut channel, &mut seen, sleep, packet,
+                        crate::g17::preparation::QUEUE_WAIT_NS)?;
+                }
                 Err(error) if !packet.is_published() && error == ENOSPC => {
                     self.wait_render_capacity(&mut seen, &mut capacity, sleep)?;
                     continue;
@@ -516,6 +539,15 @@ impl Backend {
                         self.shared
                             .preparations
                             .wait_closure(gate, since.saturating_add(recovery_wait_ns()))?;
+                    } else if let Some((domain, observed)) = outer_wait.take() {
+                        // No unclaimed room on the shared work ring: consumption or a
+                        // returned claim frees it.
+                        if !sleep {
+                            return Err(FALLBACK);
+                        }
+                        let deadline = self.wait_deadline(&mut busy, super::super::WORK_RING_WAIT_NS)?;
+                        self.shared.queue_events();
+                        self.wait_domain(&domain, observed, deadline, packet)?;
                     } else if error == EBUSY {
                         self.wait_render_busy(&mut busy, &mut seen, sleep, packet)?;
                     } else if !sleep {
@@ -531,7 +563,7 @@ impl Backend {
         if self.backlog.load(Ordering::Acquire) != 0 || packet.has_dependencies() {
             return false;
         }
-        let admission = match self.admission.try_acquire_render(self.owner, Request::of(packet)) {
+        let admission = match self.admission.try_acquire_render(self.owner, self.pairs.into(), Request::of(packet)) {
             Ok(Some(lease)) => lease,
             _ => return false,
         };
@@ -562,6 +594,7 @@ impl Backend {
             packet.abandon_publication();
             return false;
         }
+        self.release_outer(crate::g17::job::Engine::Render);
         let result = self
             .finish_publication(packet, result, &mut deferred)
             .map(|_| ());
@@ -586,9 +619,22 @@ impl Registry {
                 .ok_or(EOVERFLOW)? = *dependency;
             dependencies.render_count += 1;
         }
-        if dependencies.render_count != 0
-            && matches!(&packet.command, crate::g17::command::Validated::Render { pass, .. }
-                if pass.fragment_barriers)
+        let staged = matches!(&packet.command, crate::g17::command::Validated::Render { pass, .. }
+            if pass.stage_prefixes);
+        if staged {
+            let tiling = self.render_prefix_at(owner, packet, packet.order.tiling_wait_through[0])?;
+            for dependency in tiling.as_slice() {
+                *dependencies
+                    .render_tiling
+                    .get_mut(dependencies.render_tiling_count)
+                    .ok_or(EOVERFLOW)? = *dependency;
+                dependencies.render_tiling_count += 1;
+            }
+        }
+        if staged
+            || (dependencies.render_count != 0
+                && matches!(&packet.command, crate::g17::command::Validated::Render { pass, .. }
+                    if pass.fragment_barriers))
         {
             let tiling = self.tiling_prefix(owner, packet)?;
             for dependency in tiling.as_slice() {
@@ -603,9 +649,20 @@ impl Registry {
             dependencies.compute = queue.dependency(
                 owner,
                 packet.completion.status(),
-                packet.order.wait_through[1],
+                packet.order.tiling_wait_through[1],
                 state,
             )?;
+            if packet.order.tiling_wait_through[1] != packet.order.wait_through[1] {
+                let whole = queue.dependency(
+                    owner,
+                    packet.completion.status(),
+                    packet.order.wait_through[1],
+                    state,
+                )?;
+                if whole != dependencies.compute {
+                    dependencies.fragment_compute = whole;
+                }
+            }
         }
         Ok(dependencies)
     }
@@ -692,18 +749,29 @@ impl crate::g17::Firmware {
         let port = self.port.clone();
         let _render = port.render_lock();
         // Both outer destinations must have room before pool accounting or
-        // either inner queue becomes visible.
+        // either inner queue becomes visible. On M5 both are the shared compute ring: one
+        // check covers the pair, and the pair is written against its cursors (this hold
+        // is the ring's only producer; the firmware's consumers only advance).
         let priority = packet.context.policy().priority();
-        if !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Fragment)?
-            || !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Tiling)?
-        {
-            return Err(EBUSY);
-        }
+        let outer_cursors = if self.init.is_m5() {
+            let Some(cursors) = self.init.m5_render_room(priority)? else {
+                return Err(EBUSY);
+            };
+            Some((priority, cursors))
+        } else {
+            if !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Fragment)?
+                || !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Tiling)?
+            {
+                return Err(EBUSY);
+            }
+            None
+        };
         if let Some(footprint) = packet.footprint.as_ref() {
             dependencies.hazard_count = self.queues.admission.publication_barriers(
                 owner,
                 slot,
                 footprint,
+                packet.order.wait_through[0],
                 &mut dependencies.hazards,
             )?;
         }
@@ -718,7 +786,14 @@ impl crate::g17::Firmware {
         }
         let pool = pair.pool().clone();
         let buffer_id = pair.buffer_id();
-        let (buffer_id, buffer_token) = self.queues.buffers.acquire_owner(buffer_id)?;
+        // An M5 PB token is bound to the hardware context and PB state it names.
+        let buffer_context = pair.m5_pb_state_va().map(|pb_va| (packet.context.id(), pb_va));
+        let (buffer_id, buffer_token) = match buffer_context {
+            Some((context, pb_va)) => {
+                self.queues.buffers.acquire_owner_bound(buffer_id, context, pb_va)?
+            }
+            None => self.queues.buffers.acquire_owner(buffer_id)?,
+        };
         let preparation = match self.queues.render.pools.prepare(&self.init, &pool) {
             Ok(preparation) => preparation,
             Err(error) => {
@@ -729,8 +804,9 @@ impl crate::g17::Firmware {
         let lease = PublicationLease {
             free_list_generation: preparation.generation,
             buffer_token,
+            buffer_context: buffer_context.map(|(context, _)| context),
         };
-        let result = self.with_render(usize::from(slot), |pair, host| {
+        let result = self.with_render_at(usize::from(slot), outer_cursors, |pair, host| {
             pair.publish(
                 packet.clone(),
                 &dependencies,

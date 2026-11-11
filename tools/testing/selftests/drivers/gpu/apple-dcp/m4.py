@@ -259,7 +259,24 @@ static void surfaces(void)
     puts("PASS prepublication rejection, DMA aperture/extent bounds and cursor constraints");
 }
 
-int main(void) { completion(); routes(); surfaces(); return 0; }
+static void deadline(void)
+{
+    struct dcp_m4_frame frame = {.dva=DCP_M4_SCANOUT_BASE, .backing_size=0x4000000,
+        .width=2560, .height=1664, .stride=10240, .format=DCP_M4_XRGB8888};
+    u8 bytes[DCP_M4_SWAP_SIZE], plain[DCP_M4_SWAP_SIZE];
+    assert(!dcp_m4_swap_encode(plain, sizeof(plain), 7, &frame, false, 0));
+    memcpy(bytes, plain, sizeof(bytes));
+    dcp_m4_swap_set_deadline(bytes, 120);
+    for (size_t i = 0; i < sizeof(bytes); i++) {
+        bool field = i < 0x10 || (i >= 0x30 && i < 0x38);
+        assert(bytes[i] == (field && (i % 8) == 0 ? 120 : plain[i]));
+    }
+    dcp_m4_swap_set_deadline(bytes, 0);
+    assert(!memcmp(bytes, plain, sizeof(bytes)));
+    puts("PASS swap deadline: timestamp types 1, 2 and 7 only");
+}
+
+int main(void) { completion(); routes(); surfaces(); deadline(); return 0; }
 '''
 
 
@@ -656,6 +673,7 @@ static u64 mul_u32_u32(u32 x,u32 y) { return (u64)x*y; }
 #define DRM_FORMAT_XRGB8888 0x34325258U
 #define DRM_FORMAT_ARGB8888 0x34325241U
 #define DCP_FIRMWARE_H17P 1
+#define DCP_FIRMWARE_V_27_0 3
 #define DCP_IOMFB_METHODS_H17G 2
 #define READ_ONCE(x) (x)
 #define spin_lock_irqsave(p,f) do { (void)(p); (f)=0; } while(0)

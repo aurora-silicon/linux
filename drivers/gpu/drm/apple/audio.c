@@ -9,8 +9,6 @@
  *    there's many DCP instances)
  */
 
-#define DEBUG
-
 #include <kunit/static_stub.h>
 #include <linux/component.h>
 #include <linux/debugfs.h>

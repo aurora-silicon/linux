@@ -22,7 +22,6 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 22 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_dwi>;
-		status = "disabled";
 	};
 
 	/* The DebugUSB DockChannel serial channel; RX is drained in software. */

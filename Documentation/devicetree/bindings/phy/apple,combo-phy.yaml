@@ -24,11 +24,11 @@ properties:
 
   reg:
     minItems: 6
-    maxItems: 11
+    maxItems: 12
 
   reg-names:
     minItems: 6
-    maxItems: 11
+    maxItems: 12
 
   '#phy-cells':
     enum: [0, 1]
@@ -38,8 +38,8 @@ properties:
 
   apple,port-index:
     $ref: /schemas/types.yaml#/definitions/uint32
-    enum: [1, 2, 3, 4, 5]
-    description: Type-C port; the debug port (0) is excluded
+    enum: [0, 1, 2, 3, 4, 5]
+    description: Type-C port, including port zero when handed over to the host
 
   apple,guest-port-reserved:
     type: boolean
@@ -78,9 +78,11 @@ properties:
     description:
       A combo PHY may name the USB controller's domain fourth ("usb"). Its
       USB2 PHY and digital banks are in that domain, and the PHY then holds it
-      while it runs, also on a port with no USB controller bound.
+      while it runs, also on a port with no USB controller bound. USB4
+      DisplayPort tunnel pixel clocks add four clock gates ("dp0" to "dp3"),
+      held while the corresponding clock runs.
     minItems: 3
-    maxItems: 4
+    maxItems: 8
 
   power-domain-names:
     minItems: 3
@@ -89,6 +91,10 @@ properties:
       - const: common
       - const: wrapper
       - const: usb
+      - const: dp0
+      - const: dp1
+      - const: dp2
+      - const: dp3
 
   apple,tunable-axi2af:
     $ref: /schemas/types.yaml#/definitions/uint32-matrix
@@ -174,8 +180,9 @@ allOf:
           const: 1
         reg:
           minItems: 11
-          maxItems: 11
+          maxItems: 12
         reg-names:
+          minItems: 11
           items:
             - const: core
             - const: usb2phy
@@ -188,6 +195,8 @@ allOf:
             - const: usb-control
             - const: firmware-data
             - const: pipehandler
+            - description: Source select words for the four USB4 DP pixel clocks
+              const: dp-clock-source
       required:
         - '#reset-cells'
         - apple,port-index

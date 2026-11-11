@@ -26,13 +26,14 @@ pub(super) const BASE: Config = Config {
     secondary_root_offset: None,
     crash_buffers: CrashBuffers::FirmwareData,
     // Unverified placement; use the M4 Pro layout.
-    pm_metrics: FixedBuffer {
+    profile: crate::g17::FirmwareProfile::PublishedRoots,
+    pm_metrics: Some(FixedBuffer {
         va: 0x10_0008_0000,
         size: 0x8000,
-    },
+    }),
     windows: &REGISTER_WINDOWS,
     reserved_slots: &RESERVED_SLOTS,
-    perf: &PERF,
+    perf: Some(&PERF),
     opps: OPPS,
     uat_quirks: UatQuirks {
         reserved_tables: true,
@@ -40,10 +41,12 @@ pub(super) const BASE: Config = Config {
         page_tlbi: true,
         handoff_lock: false,
         handoff_slot: 0xffff_ffff,
+        handoff_unk2: 0,
         native_gpu_permissions: true,
     },
-    region_c: &REGION_C,
+    region_c: Some(&REGION_C),
     chip: Some(&CHIP),
+    m5: None,
     adopt_root_entries: false,
     fabric_bridge: false,
     recovery_slot_keys: None,
@@ -87,7 +90,8 @@ const BUILD_25F84: fw::variant::Build = fw::variant::Build {
         name: "Apple GFX 25F84 for T6041 (normalized loaded image)",
         text_size: 0x60000,
         data_size: 0x138000,
-        entropy: [0x5983a, 0x5991d],
+        entropy: &[[0x5983a, 0x5991d]],
+        boot_filled: &[],
         text_sha256: [
             0x6d, 0xa4, 0xd4, 0x42, 0x35, 0x35, 0x14, 0x44, 0xf6, 0xec, 0x00, 0x33, 0xf1, 0x9c,
             0xbf, 0x98, 0xd3, 0x43, 0x91, 0x28, 0x83, 0xe4, 0xe2, 0x94, 0xc1, 0x8b, 0xb8, 0xb8,
@@ -114,7 +118,8 @@ pub(super) const BUILD_25G83: fw::variant::Build = fw::variant::Build {
             name: "Apple GFX 25G83 for T6041 (normalized loaded image, 32-core J616C)",
             text_size: 0x60000,
             data_size: 0x138000,
-            entropy: [0x59839, 0x5991c],
+            entropy: &[[0x59839, 0x5991c]],
+            boot_filled: &[],
             text_sha256: [
                 0xaa, 0x11, 0x3e, 0xd6, 0x20, 0x79, 0xbc, 0xfd, 0xee, 0xf0, 0xf8, 0x6c, 0x2a, 0x8d,
                 0x7e, 0xae, 0x9f, 0x90, 0x7b, 0x03, 0xbe, 0x28, 0xcc, 0xf2, 0x98, 0xc9, 0x43, 0x95,
@@ -125,7 +130,8 @@ pub(super) const BUILD_25G83: fw::variant::Build = fw::variant::Build {
             name: "Apple GFX 25G83 for T6041 (normalized loaded image, 40-core J614C)",
             text_size: 0x60000,
             data_size: 0x138000,
-            entropy: [0x59839, 0x5991c],
+            entropy: &[[0x59839, 0x5991c]],
+            boot_filled: &[],
             text_sha256: [
                 0x7c, 0x04, 0x36, 0x0e, 0x05, 0xa6, 0xb8, 0x62, 0x8f, 0x61, 0x26, 0x2d, 0x0a, 0x24,
                 0x41, 0x66, 0x18, 0x7a, 0xd8, 0x7a, 0x73, 0x47, 0x16, 0xd8, 0x91, 0x09, 0x08, 0xe9,

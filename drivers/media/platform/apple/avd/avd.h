@@ -79,6 +79,8 @@ struct avd_run {
 	dma_addr_t y_out;
 	dma_addr_t uv_out;
 	dma_addr_t comp_out;
+	/* v4l2_ctrl_request_setup() result: nonzero, the controls are stale */
+	int setup_err;
 };
 
 struct avd_ctrl_desc {

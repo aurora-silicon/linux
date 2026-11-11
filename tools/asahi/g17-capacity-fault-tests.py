@@ -33,9 +33,14 @@ def fixture():
         'pub(crate) fn recycle_quarantined_idle(', 'pub(crate) fn recycle_killed(',
         'fn recycle_settled(', 'fn release_witnessed_inner(', 'pub(crate) fn share_idle(', 'pub(crate) fn shareable(', 'pub(crate) fn can_rearm(', 'pub(crate) fn recycled_pending('])
     exit_source = (ROOT / 'queue/compute/exit.rs').read_text()
-    methods += '\n' + item(exit_source, 'pub(crate) fn settle_exit(').replace('super::Previous', 'Previous').replace('crate::g17::qos::Owner', 'qos::Owner')
+    methods += '\n' + (item(exit_source, 'pub(crate) fn settle_exit(').replace('super::Previous', 'Previous')
+                        .replace('crate::g17::qos::Owner', 'qos::Owner').replace('super::retirement::', 'retirement::'))
     drain = item((ROOT / 'mod.rs').read_text(), 'fn drain_reclaims(')
     proof = item(retirement, 'pub(crate) const fn stamp_newer(') + '\n' + item(retirement, 'pub(crate) const fn stamp_covers(') + '\n' + item(retirement, 'pub(crate) fn quarantined_retired(')
+    # M5 judges retained commands by their completion records.
+    proof += '\n' + '#[derive(Clone, Copy, Debug, PartialEq, Eq)]\n' + item(retirement, 'pub(crate) struct Observation')
+    proof += '\n' + next(line for line in retirement.splitlines() if 'const CANCELLED_TICKS:' in line)
+    proof += '\n' + item(retirement, 'pub(crate) fn unexecuted(')
     return r'''
 #![allow(dead_code)]
 use std::sync::{Arc, atomic::{AtomicUsize, AtomicU32, Ordering}};
@@ -50,6 +55,7 @@ fn now_ns() -> u64 { 123 }
 struct Context { id: u64, live: Arc<AtomicUsize>, killed: AtomicU32 }
 impl Context {
     fn note_compute_binding(&self, _: bool) {}
+    fn retain_firmware_pages(&self) {}
     fn new(id: u64, live: &Arc<AtomicUsize>) -> Arc<Self> {
         live.fetch_add(1, Ordering::SeqCst);
         Arc::new(Self { id, live: live.clone(), killed: AtomicU32::new(1) })
@@ -64,8 +70,9 @@ struct Binding { context: Arc<Context> }
 }
 #[derive(Clone, Copy)] struct Cursors { count: u32, producer: u32, consumer: u32 }
 ''' + proof + r'''
-mod retirement { pub(crate) use super::{quarantined_retired, stamp_newer}; }
-struct Graph { cursors: Cursors, stamp: u32, fail: bool, resets: usize, owner: u64 }
+mod retirement { pub(crate) use super::{quarantined_retired, stamp_newer, unexecuted}; }
+// These queues are G17P's (m5 false); the M5 branches compile but do not run.
+struct Graph { cursors: Cursors, stamp: u32, fail: bool, resets: usize, owner: u64, m5: bool }
 impl Graph {
     fn set_owner(&mut self, context: &Context) -> Result { if self.fail { Err(EIO) } else { self.owner = context.id; Ok(()) } }
     fn reset_items(&mut self) -> Result { if self.fail { Err(EIO) } else { self.resets += 1; Ok(()) } }
@@ -75,7 +82,7 @@ impl Graph {
 struct Kick;
 impl Kick { fn clear_parent_after_recovery(&mut self) {} }
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Phase { Published, Acknowledged, Unproven, Released }
+enum Phase { Published, Acknowledged, Unproven, Witnessed, Released }
 struct Exit { phase: Phase }
 impl Exit { fn released(&self) -> bool { self.phase == Phase::Released } }
 struct State { killed: u32 }
@@ -85,9 +92,10 @@ impl Completion {
     fn has_firmware_consumer(&self) -> bool { false }
     fn compute_words(&self) -> Result<[u32; 2]> { Ok([0, 0]) }
     fn replay_witness_words(&self) -> Option<[u32; 2]> { Some([0, 0]) }
+    fn signalled(&self) -> bool { false }
 }
 struct Packet { completion: Arc<Completion> }
-struct Active { packet: Arc<Packet>, ticket: Option<Ticket>, qos_pending: bool }
+struct Active { packet: Arc<Packet>, ticket: Option<Ticket>, observed: Option<Observation>, qos_pending: bool }
 struct Fifo<T> { entries: Vec<T>, len: usize }
 impl<T> Fifo<T> {
     fn new() -> Self { Self { entries: vec![], len: 0 } }
@@ -110,6 +118,8 @@ struct Queue {
     retire_pending: bool, retirement_proved: bool, replay_retirement: bool,
     replay_error: Option<Error>, replay_prepared: bool, submitted: u32, kick: Kick,
     config_cache: Option<()>, source_hint: ReaderHint, source_readers: AtomicU32, claims: u32, fault_stamp: Option<u32>,
+    configuration: Option<()>, retained_owner: Option<()>, timed_out_at: u64,
+    m5_install: Option<()>, published_config: Option<()>, outer_started: u32, ordinal: u64,
 }
 impl Queue {
     fn valid_ticket(&self, _: &Active, _: &Ticket) -> Result { Ok(()) }
@@ -121,7 +131,7 @@ fn idle(live: &Arc<AtomicUsize>) -> Queue {
     Queue {
         owner: Some(2), installed: true, active: Fifo::new(), quarantined: false,
         previous: None, unpublished_binding: false, released: false,
-        graph: Graph { cursors: Cursors { count: 1280, producer: 4, consumer: 4 }, stamp: 7 << 8, fail: false, resets: 0, owner: 2 },
+        graph: Graph { cursors: Cursors { count: 1280, producer: 4, consumer: 4 }, stamp: 7 << 8, fail: false, resets: 0, owner: 2, m5: false },
         binding: Some(Binding { context: Context::new(2, live) }), retirement_ready: false,
         released_at: 0, growing: false, pool_phase: PoolPhase::Populated,
         needs_fresh_backing: false, exit: None, replays: Fifo::new(),
@@ -130,14 +140,16 @@ fn idle(live: &Arc<AtomicUsize>) -> Queue {
         retire_pending: false, retirement_proved: false, replay_retirement: false,
         replay_error: None, replay_prepared: false, submitted: 0, kick: Kick,
         fault_stamp: None, config_cache: None, source_hint: ReaderHint { possible: false }, source_readers: AtomicU32::new(0), claims: 0,
+        configuration: None, retained_owner: None, timed_out_at: 0,
+        m5_install: None, published_config: None, outer_started: 0, ordinal: 0,
     }
 }
 fn fault(live: &Arc<AtomicUsize>) -> Queue {
     let mut queue = idle(live);
     let old = Context::new(1, live);
-    queue.previous = Some(Previous { binding: Some(Binding { context: old.clone() }), context: old, publication: Some((11, 3)) });
+    queue.previous = Some(Previous { binding: Some(Binding { context: old.clone() }), context: old, publication: Some((11, 3)), moved: false });
     queue.active.push(Active { packet: Arc::new(Packet { completion: Arc::new(Completion) }),
-        ticket: Some(Ticket { owner: 2, item_count: 1280, descriptor: 0x1000, item_producer: 4, kick: 7 }), qos_pending: true }).unwrap();
+        ticket: Some(Ticket { owner: 2, item_count: 1280, descriptor: 0x1000, item_producer: 4, kick: 7 }), observed: None, qos_pending: true }).unwrap();
     queue.quarantined = true;
     queue.awaiting_witness = true;
     queue.submitted = 1;
@@ -259,7 +271,7 @@ fn main() {
     }
     let mut queue = idle(&live);
     let old = Context::new(1, &live);
-    queue.previous = Some(Previous { binding: Some(Binding { context: old.clone() }), context: old, publication: None });
+    queue.previous = Some(Previous { binding: Some(Binding { context: old.clone() }), context: old, publication: None, moved: false });
     queue.release_owner().unwrap();
     assert_eq!(queue.graph.owner, 1);
     assert!(queue.previous.is_none());

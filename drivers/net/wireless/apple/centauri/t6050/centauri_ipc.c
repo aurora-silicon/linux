@@ -323,32 +323,49 @@ static int enumerate_functions(struct centauri_t6050 *c)
 		    !(pci_resource_flags(ipc->function[i], 0) & IORESOURCE_MEM) ||
 		    pci_resource_len(ipc->function[i], 0) < (i ? 0x2000 : 0x9080))
 			return -ENODEV;
-		if (i && ipc->function[i]->dev.driver)
-			return -EBUSY;
+		if (i) {
+			/*
+			 * The driver core sets dev.driver before calling probe.
+			 * Beta can be probing only to defer until c->ready.
+			 * Wait for that probe before deciding it is owned.
+			 */
+			device_lock(&ipc->function[i]->dev);
+			if (ipc->function[i]->dev.driver) {
+				ret = -EBUSY;
+				goto unlock;
+			}
+		}
 		ipc->owned[i] = true;
 		ipc->bar[i] = pci_iomap(ipc->function[i], 0, 0);
-		if (!ipc->bar[i])
-			return -ENOMEM;
+		if (!ipc->bar[i]) {
+			ret = -ENOMEM;
+			goto unlock;
+		}
 		if (i) {
 			ret = pci_enable_device_mem(ipc->function[i]);
 			if (ret)
-				return ret;
+				goto unlock;
 			ipc->enabled[i] = true;
 		}
-		if (i == 1 && !ipc->function[i]->dev.driver) {
+		if (i == 1) {
 			dev_pm_domain_set(&ipc->function[i]->dev, &centauri_t6050_alpha_pm_domain);
 			ipc->alpha_pm_domain = true;
 		}
 		ret = dma_set_mask_and_coherent(&ipc->function[i]->dev, DMA_BIT_MASK(40));
 		if (ret)
-			return ret;
+			goto unlock;
 		if (i == 1) {
 			ret = centauri_t6050_request_irqs(&c->alpha_irqs, ipc->function[i],
 						    16, centauri_t6050_alpha_irq, c);
 			if (ret)
-				return ret;
+				goto unlock;
 		}
 		pci_set_master(ipc->function[i]);
+unlock:
+		if (i)
+			device_unlock(&ipc->function[i]->dev);
+		if (ret)
+			return ret;
 	}
 	return 0;
 }

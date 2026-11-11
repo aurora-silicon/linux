@@ -233,6 +233,19 @@ static void asc_image(struct asc_image *img, const struct v4l2_pix_format_mplane
 	img->fmt = asc_find_format(pix->pixelformat);
 	img->width = pix->width;
 	img->height = pix->height;
+	if (img->fmt->lossless) {
+		struct asc_lossless_geom g;
+		u64 base = vb2_dma_contig_plane_dma_addr(vb, 0);
+
+		asc_lossless_geom(pix->width, pix->height, &g);
+		img->dva[0] = base;
+		img->dva[1] = base + g.c;
+		img->meta[0] = base + g.y_meta;
+		img->meta[1] = base + g.c_meta;
+		img->stride[0] = g.y_pitch;
+		img->stride[1] = g.c_pitch;
+		return;
+	}
 	for (i = 0; i < img->fmt->planes; i++) {
 		if (pix->num_planes > 1) {
 			img->dva[i] = vb2_dma_contig_plane_dma_addr(vb, i);
@@ -348,7 +361,19 @@ static void asc_fill(struct v4l2_pix_format_mplane *pix, const struct v4l2_pix_f
 	h = clamp_t(u32, ALIGN(h, f->vsub), ASC_MIN_SIZE, ASC_MAX_SIZE);
 
 	memset(pix, 0, sizeof(*pix));
-	v4l2_fill_pixfmt_mp_aligned(pix, f->fourcc, w, h, ASC_STRIDE_ALIGN);
+	if (f->lossless) {
+		struct asc_lossless_geom g;
+
+		asc_lossless_geom(w, h, &g);
+		pix->pixelformat = f->fourcc;
+		pix->width = w;
+		pix->height = h;
+		pix->num_planes = 1;
+		pix->plane_fmt[0].bytesperline = g.y_pitch;
+		pix->plane_fmt[0].sizeimage = g.bytes;
+	} else {
+		v4l2_fill_pixfmt_mp_aligned(pix, f->fourcc, w, h, ASC_STRIDE_ALIGN);
+	}
 	pix->field = V4L2_FIELD_NONE;
 
 	if (ref && ref->colorspace != V4L2_COLORSPACE_DEFAULT) {

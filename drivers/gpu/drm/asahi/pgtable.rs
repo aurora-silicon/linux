@@ -289,7 +289,7 @@ const HIGH_BITS_PXN: u16 = 1 << 1;
 const HIGH_BITS_UXN: u16 = 1 << 2;
 const HIGH_BITS_GPU_ACCESS: u16 = 1 << 3;
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct Prot {
     memattr: u8,
     ap: u8,
@@ -416,6 +416,10 @@ impl Prot {
 
     pub(crate) const fn as_uncached(&self) -> Self {
         self.memattr(MEMATTR_UNCACHED)
+    }
+
+    pub(crate) const fn as_cached(&self) -> Self {
+        self.memattr(MEMATTR_CACHED)
     }
 }
 
@@ -669,6 +673,7 @@ impl UatPageTable {
                     mod_pr_debug!("UATPageTable::with_pages: borrowed phys {:#x}\n", phys);
                     let driver_tables = &mut self.driver_tables;
                     let oas_mask = self.oas_mask;
+                    let firmware_tree = reserved.as_deref();
                     let entry = |p: *mut u8| -> Result<Option<PhysicalAddr>> {
                         let uptep = p.cast_const().cast::<Pte>();
                         // SAFETY: with_table() ensures the pointer is valid, and our index is
@@ -706,7 +711,21 @@ impl UatPageTable {
                             }
                         }
                         if upte_val & PTE_TYPE_BITS == PTE_TYPE_LEAF_TABLE {
-                            Ok(Some(upte_val & oas_mask & (!UAT_PGMSK as u64)))
+                            let child = upte_val & oas_mask & (!UAT_PGMSK as u64);
+                            // Below a root the driver did not allocate, the descriptors were
+                            // written by the firmware or the bootloader. Follow one only into a
+                            // reserved table page or a table this driver allocated, never into
+                            // other RAM, whose PTEs this walk would then write.
+                            if let (Some(firmware_tree), Some(tables)) =
+                                (firmware_tree, driver_tables.as_ref())
+                            {
+                                if !firmware_tree.contains(child) && !tables.contains(&child) {
+                                    pr_err!("UATPageTable::with_pages: table PTE {:#x} at iova {:#x} level {} names a page outside the reserved and driver tables\n",
+                                            upte_val, iova, level + 1);
+                                    return Err(EIO);
+                                }
+                            }
+                            Ok(Some(child))
                         } else if upte_val == 0 || (!alloc && !free) {
                             mod_pr_debug!("UATPageTable::with_pages: no level {}\n", level);
                             Ok(None)
@@ -986,11 +1005,15 @@ impl UatPageTable {
             for (idx, pte) in ptes.iter().enumerate() {
                 let ptev = pte.load(Ordering::Relaxed);
                 if ptev != 0 {
+                    // Never replace a live leaf: it belongs to another mapping. The callers
+                    // check their whole range first (`ensure_unmapped`), so this is reached
+                    // only by a collision they missed.
                     pr_err!(
                         "UATPageTable::map_pages: Page at IOVA {:#x} is mapped (PTE: {:#x})\n",
                         iova + (idx * UAT_PGSZ) as u64,
                         ptev
                     );
+                    return Err(EBUSY);
                 }
                 pte.store(phys | prot.as_pte() | pte_bits, Ordering::Relaxed);
                 if !one_page {
@@ -998,6 +1021,28 @@ impl UatPageTable {
                 }
             }
             Ok(())
+        })
+    }
+
+    /// Refuses with `EBUSY`, writing nothing, when any leaf of `iova_range` is live.
+    ///
+    /// Every PTE store writes either zero or a complete entry, so a nonzero leaf belongs to
+    /// another mapping. A map operation checks its whole range with this before its first
+    /// store: its failure path clears the whole range it asked for, which would otherwise
+    /// also clear the other mapping's leaves.
+    pub(crate) fn ensure_unmapped(&mut self, iova_range: Range<u64>) -> Result {
+        self.walk(iova_range, false, false, false, |iova, ptes| {
+            match ptes.iter().position(|pte| pte.load(Ordering::Relaxed) != 0) {
+                Some(idx) => {
+                    pr_err!(
+                        "UATPageTable::ensure_unmapped: Page at IOVA {:#x} is mapped (PTE: {:#x})\n",
+                        iova + (idx * UAT_PGSZ) as u64,
+                        ptes[idx].load(Ordering::Relaxed)
+                    );
+                    Err(EBUSY)
+                }
+                None => Ok(()),
+            }
         })
     }
 
