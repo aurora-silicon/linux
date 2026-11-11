@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Apple T8152 (J873, Mac mini M6) and T8142 (J813, MacBook Air M5) AOP audio
+//! Apple T8152 (J873, Mac mini M6), T8142 (J813, MacBook Air M5) and T6050
+//! (J714s, MacBook Pro M5 Pro) AOP audio
 //!
 //! The AOP firmware owns the audio fabric, as on T8140. The ADT
 //! (/arm-io/iop-audio-controller) names its services; all of them run on the
@@ -17,7 +18,8 @@
 //! Each service is an ASoC back-end DAI: startup attaches it and requests
 //! `pw0 ` (which also brings up the audio fabric), prepare requests `pwrd`
 //! (the firmware then runs the serializer and its clocks) and shutdown goes
-//! back to `pw0 `. The serializer (MCA) leaves are the AP's to power. The
+//! back to `pw0 `. On T8152 and T8142 the serializer (MCA) leaves are the
+//! AP's to power; on T6050 the firmware powers them itself. The
 //! front-end PCMs are plain dmaengine PCMs on the base-ns channels; macaudio
 //! links them to the codecs.
 //!
@@ -558,6 +560,8 @@ struct HwConfig {
     /// The sense capture is the speaker stream's RX: restart it at a frame
     /// boundary whenever the speaker starts (see `realign_sense`).
     realign_sense: bool,
+    /// The AP powers the serializer (MCA) leaves.
+    ap_mca: bool,
 }
 
 /// J873: one amplifier in one 32-bit slot, nothing sent back.
@@ -566,6 +570,7 @@ static HW_CFG_T8152: HwConfig = HwConfig {
     sense_channels: 2,
     sense_formats: FORMATS,
     realign_sense: false,
+    ap_mca: true,
 };
 
 /// J813: four amplifiers (left woofer, left tweeter, right woofer, right
@@ -576,6 +581,18 @@ static HW_CFG_T8142: HwConfig = HwConfig {
     sense_channels: 8,
     sense_formats: FMTBIT_S16_LE,
     realign_sense: true,
+    ap_mca: true,
+};
+
+/// J714s: six amplifiers in 32-bit slots 0-5, their voltage and current
+/// sense back as twelve 16-bit slots on the stream's RX, as on J813. The
+/// MCA leaves have no AP power state: the firmware powers them.
+static HW_CFG_T6050: HwConfig = HwConfig {
+    spkr_channels: 6,
+    sense_channels: 12,
+    sense_formats: FMTBIT_S16_LE,
+    realign_sense: true,
+    ap_mca: false,
 };
 
 /// # Safety
@@ -1368,6 +1385,7 @@ kernel::of_device_table!(
     OF_TABLE,
     <T8152AopAudioDriver as platform::Driver>::IdInfo,
     [
+        (of::DeviceId::new(c_str!("apple,t6050-aop-audio")), &HW_CFG_T6050),
         (of::DeviceId::new(c_str!("apple,t8142-aop-audio")), &HW_CFG_T8142),
         (of::DeviceId::new(c_str!("apple,t8152-aop-audio")), &HW_CFG_T8152),
     ]
@@ -1395,11 +1413,12 @@ impl platform::Driver for T8152AopAudioDriver {
         // SAFETY: checked above; it lives as long as the child.
         let service = unsafe { *service };
 
-        // Every serializer leaf is required: the firmware's streams run on
-        // them, so the driver must not bind without one (or before its
-        // provider has probed).
+        // Where the AP powers them, every serializer leaf is required: the
+        // firmware's streams run on them, so the driver must not bind
+        // without one (or before its provider has probed).
+        let mca_names: &[&CStr] = if cfg.ap_mca { &MCA_NAMES } else { &[] };
         let mut mca = KVec::new();
-        for name in MCA_NAMES {
+        for &name in mca_names {
             match PowerDomain::attach(&dev, name) {
                 Ok(Some(pd)) => mca.push(pd, GFP_KERNEL)?,
                 Ok(None) => {
