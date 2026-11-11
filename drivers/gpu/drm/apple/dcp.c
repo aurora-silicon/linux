@@ -6263,27 +6263,23 @@ static const struct component_ops dcp_comp_ops = {
 static bool dcp_hdmi_power_checked;
 
 /*
- * Power the DP-to-HDMI converter at probe. Its rails are SMC GPIOs, and the
- * SMC keeps running across a reboot: a converter the kernel before left on is
- * still on here, and requesting its GPIOs high changes nothing. Its HDMI link
- * and the display's input then start in whatever state they were left in.
- * Switch it off first in that case, as an unplug does, so that the link comes
- * up from a power-up. An unreadable rail counts as on. Only the first probe
- * looks: one deferred after this point finds the converter powered by the
- * attempt before. The rails must be stable before DCP requests the link.
+ * The converter's rails up for a link that starts from nothing. They are SMC
+ * GPIOs, and the SMC keeps running across a reboot and a system sleep: a
+ * converter left on is still on here, and requesting its GPIOs high changes
+ * nothing. Its HDMI link and the display's input then start in whatever state
+ * they were left in. Switch it off first in that case, as an unplug does, so
+ * that the link comes up from a power-up. An unreadable rail counts as on. The
+ * rails must be stable before DCP requests the link.
  */
-static int dcp_hdmi_power_up(struct apple_dcp *dcp)
+static int dcp_hdmi_rails_up(struct apple_dcp *dcp, const char *when)
 {
 	struct gpio_desc *rail[] = { dcp->hdmi_pwren, dcp->dp2hdmi_pwren };
 	bool on = false;
 	int i, ret;
 
-	if (!dcp_hdmi_power_checked) {
-		dcp_hdmi_power_checked = true;
-		for (i = 0; i < ARRAY_SIZE(rail); i++)
-			if (rail[i] && gpiod_get_value_cansleep(rail[i]) != 0)
-				on = true;
-	}
+	for (i = 0; i < ARRAY_SIZE(rail); i++)
+		if (when && rail[i] && gpiod_get_value_cansleep(rail[i]) != 0)
+			on = true;
 	if (on) {
 		for (i = 0; i < ARRAY_SIZE(rail); i++) {
 			if (!rail[i])
@@ -6293,7 +6289,7 @@ static int dcp_hdmi_power_up(struct apple_dcp *dcp)
 				return ret;
 		}
 		msleep(DCP_HDMI_POWER_OFF_MS);
-		dev_info(dcp->dev, "HDMI: converter was powered at probe, power-cycled\n");
+		dev_info(dcp->dev, "HDMI: converter was powered %s, power-cycled\n", when);
 	}
 	for (i = 0; i < ARRAY_SIZE(rail); i++) {
 		if (!rail[i])
@@ -6304,6 +6300,18 @@ static int dcp_hdmi_power_up(struct apple_dcp *dcp)
 	}
 	msleep(100);
 	return 0;
+}
+
+/*
+ * At probe. Only the first one looks: one deferred after this point finds the
+ * converter powered by the attempt before.
+ */
+static int dcp_hdmi_power_up(struct apple_dcp *dcp)
+{
+	bool look = !dcp_hdmi_power_checked;
+
+	dcp_hdmi_power_checked = true;
+	return dcp_hdmi_rails_up(dcp, look ? "at probe" : NULL);
 }
 
 /*
@@ -10436,15 +10444,18 @@ static void dcp_hib_ext_relink(struct apple_dcp *dcp)
 	 * of a resume from disk turned off behind the restored kernel's back:
 	 * without them its HPD stays low and no plug is ever seen. Power it as
 	 * probe did, and let the rails settle before the link (as the T6030
-	 * output set-up does).
+	 * output set-up does). A T6040 S2R leaves the rails on and takes the DP
+	 * lanes away under the converter: left as it was, it locked to no link
+	 * rate after the wake (clock recovery failed at every rate, five rounds),
+	 * so it is switched off first, as probe does with one found powered.
 	 */
 	if (dcp->hdmi_pwren || dcp->dp2hdmi_pwren) {
-		if (dcp->hdmi_pwren)
-			gpiod_set_value_cansleep(dcp->hdmi_pwren, 1);
-		if (dcp->dp2hdmi_pwren)
-			gpiod_set_value_cansleep(dcp->dp2hdmi_pwren, 1);
-		msleep(100);
-		dev_info(dcp->dev, "hibernation: HDMI converter powered again\n");
+		int ret = dcp_hdmi_rails_up(dcp, "through the sleep");
+
+		if (ret)
+			dev_warn(dcp->dev, "HDMI converter not powered again: %d\n", ret);
+		else
+			dev_info(dcp->dev, "HDMI converter powered again\n");
 	}
 	dcp_hib_fixed_phy_on(dcp);
 	if (dcp->hib_typec_disabled) {
