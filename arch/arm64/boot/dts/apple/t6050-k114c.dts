@@ -601,3 +601,24 @@
 	apple,power-gpios = <&nub_gpio0 26 GPIO_ACTIVE_HIGH>;
 	status = "okay";
 };
+
+/*
+ * The kiwi 24 MHz clock pad (NUB pin 22) and display_sync pad (AP pin 11) are pad
+ * functions, not host GPIOs: function 1 on each.
+ */
+&pinctrl_ap {
+	kiwi_dsync_pins: kiwi-dsync-pins {
+		pinmux = <0x1000b>;	/* APPLE_PINMUX(11, 1) */
+	};
+};
+
+&nub_gpio0 {
+	kiwi_clk24_pins: kiwi-clk24-pins {
+		pinmux = <0x10016>;	/* APPLE_PINMUX(22, 1) */
+	};
+};
+
+&mtp_hid {
+	pinctrl-0 = <&kiwi_clk24_pins>, <&kiwi_dsync_pins>;
+	pinctrl-names = "default";
+};
