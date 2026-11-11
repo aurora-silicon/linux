@@ -1038,6 +1038,8 @@ struct SetupState {
     expected: [u8; SETUP_MAX_ENDPOINTS],
     expected_count: usize,
     epmap_endpoints: bool,
+    /// Boot also waits for the system endpoints (below 0x20) it maps.
+    wait_system: bool,
     map_done: bool,
     ap_ready: bool,
     power_sent: bool,
@@ -1046,7 +1048,7 @@ struct SetupState {
 }
 
 impl SetupState {
-    fn new(epmap_endpoints: bool) -> SetupState {
+    fn new(epmap_endpoints: bool, wait_system: bool) -> SetupState {
         let mut expected = [0; SETUP_MAX_ENDPOINTS];
         let mut expected_count = 0;
         if !epmap_endpoints {
@@ -1061,6 +1063,7 @@ impl SetupState {
             expected,
             expected_count,
             epmap_endpoints,
+            wait_system,
             map_done: false,
             ap_ready: false,
             power_sent: false,
@@ -1100,10 +1103,17 @@ impl SetupState {
     }
 
     /// Boot is complete once the AP power state is on and every service
-    /// endpoint has its buffers.
+    /// endpoint has its buffers. A system endpoint that never asks for one
+    /// is not waited for unless `wait_system` is set.
     fn ready(&self) -> bool {
-        self.ap_ready && self.expected_count != 0
-            && self.endpoint_count() == self.expected_count
+        self.ap_ready
+            && self.expected_count != 0
+            && self.expected[..self.expected_count]
+                .iter()
+                .zip(self.endpoints.iter())
+                .all(|(ep, slot)| {
+                    slot.is_some() || (!self.wait_system && *ep < AFK_ENDPOINT_START)
+                })
     }
 
     /// Sends one word to a setup-port endpoint. Callers run in process
@@ -1401,7 +1411,10 @@ impl AopData {
                     required_endpoints: cfg.required_endpoints,
                     setup_queue,
                     setup_lost: Atomic::new(false),
-                    setup <- new_mutex!(SetupState::new(cfg.setup_epmap_endpoints)),
+                    setup <- new_mutex!(SetupState::new(
+                        cfg.setup_epmap_endpoints,
+                        cfg.setup_wait_system_endpoints
+                    )),
                     setup_cv <- new_condvar!(),
                     rtkit <- new_mutex!(None),
                     endpoints <- pin_init::pin_init_array_from_fn(|i| {
@@ -2624,6 +2637,8 @@ struct AopHwConfig {
     setup_port: bool,
     /// Its service endpoints are the ones its EPMAP announces, not T8140's.
     setup_epmap_endpoints: bool,
+    /// Its boot waits for the system endpoints the EPMAP names as well.
+    setup_wait_system_endpoints: bool,
     /// Shut the co-processor down on unbind and retain its buffers if the
     /// shutdown cannot be confirmed.
     quiesce_on_unbind: bool,
@@ -2647,6 +2662,7 @@ const HW_CFG_T8103: AopHwConfig = AopHwConfig {
     epic_v4: false,
     setup_port: false,
     setup_epmap_endpoints: false,
+    setup_wait_system_endpoints: true,
     quiesce_on_unbind: false,
     required_endpoints: &[],
     fw_regions: false,
@@ -2664,6 +2680,7 @@ const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     epic_v4: false,
     setup_port: false,
     setup_epmap_endpoints: false,
+    setup_wait_system_endpoints: true,
     quiesce_on_unbind: false,
     required_endpoints: &[],
     fw_regions: false,
@@ -2680,6 +2697,7 @@ const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     epic_v4: false,
     setup_port: false,
     setup_epmap_endpoints: false,
+    setup_wait_system_endpoints: true,
     quiesce_on_unbind: false,
     required_endpoints: &[],
     fw_regions: false,
@@ -2695,6 +2713,7 @@ const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     epic_v4: false,
     setup_port: false,
     setup_epmap_endpoints: false,
+    setup_wait_system_endpoints: true,
     quiesce_on_unbind: false,
     required_endpoints: &[],
     fw_regions: false,
@@ -2715,6 +2734,7 @@ const HW_CFG_T6040: AopHwConfig = AopHwConfig {
     epic_v4: false,
     setup_port: false,
     setup_epmap_endpoints: false,
+    setup_wait_system_endpoints: true,
     quiesce_on_unbind: true,
     required_endpoints: &[],
     fw_regions: true,
@@ -2739,6 +2759,7 @@ const HW_CFG_T8140: AopHwConfig = AopHwConfig {
     epic_v4: true,
     setup_port: true,
     setup_epmap_endpoints: false,
+    setup_wait_system_endpoints: true,
     quiesce_on_unbind: true,
     required_endpoints: &[0x20, 0x21, 0x22, 0x23, 0x2b],
     fw_regions: false,
@@ -2756,6 +2777,7 @@ const HW_CFG_T8152: AopHwConfig = AopHwConfig {
     epic_v4: true,
     setup_port: false,
     setup_epmap_endpoints: false,
+    setup_wait_system_endpoints: true,
     quiesce_on_unbind: true,
     required_endpoints: &[],
     fw_regions: false,
@@ -2777,11 +2799,19 @@ const HW_CFG_T8142: AopHwConfig = AopHwConfig {
     epic_v4: true,
     setup_port: true,
     setup_epmap_endpoints: true,
+    setup_wait_system_endpoints: true,
     quiesce_on_unbind: true,
     required_endpoints: &[],
     fw_regions: false,
     bootargs_word_access: false,
     halt_on_failed_start: false,
+};
+/// T6050 (M5 Pro and Max): booted as T8142, through the setup port at
+/// AOP ASC + 0x4007c000. Its EPMAP also names system endpoint 4, which never
+/// asks for a buffer, so boot doesn't wait for it.
+const HW_CFG_T6050: AopHwConfig = AopHwConfig {
+    setup_wait_system_endpoints: false,
+    ..HW_CFG_T8142
 };
 
 kernel::of_device_table!(
@@ -2795,6 +2825,7 @@ kernel::of_device_table!(
         (of::DeviceId::new(c_str!("apple,t8140-aop")), &HW_CFG_T8140),
         (of::DeviceId::new(c_str!("apple,t6041-aop")), &HW_CFG_T6040),
         (of::DeviceId::new(c_str!("apple,t8132-aop")), &HW_CFG_T8132),
+        (of::DeviceId::new(c_str!("apple,t6050-aop")), &HW_CFG_T6050),
         (of::DeviceId::new(c_str!("apple,t8142-aop")), &HW_CFG_T8142),
         (of::DeviceId::new(c_str!("apple,t8152-aop")), &HW_CFG_T8152),
     ]
