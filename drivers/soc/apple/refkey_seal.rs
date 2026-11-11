@@ -69,57 +69,89 @@ fn p256_sender(peer_pub64: &[u8]) -> Result<([u8; COORDS_LEN], [u8; 32])> {
         )
     };
     if rc != 0 {
+        wipe(&mut shared);
         return Err(Error::from_errno(rc));
     }
     Ok((eph, shared))
 }
 
+/// The KDF output is key material: it is wiped on every error path, and
+/// the caller wipes what it returns.
 fn kdf_sha256_mode(z: &[u8], shared_info: &[u8], out_len: usize, mode: u8) -> Result<KVec<u8>> {
-    let mut out = KVec::new();
-    let mut counter: u32 = 1;
-    while out.len() < out_len {
-        let ctr = counter.to_be_bytes();
-        let mut buf = KVec::new();
-        match mode {
-            0 => {
-                buf.extend_from_slice(z, GFP_KERNEL)?;
-                buf.extend_from_slice(&ctr, GFP_KERNEL)?;
-                buf.extend_from_slice(shared_info, GFP_KERNEL)?;
-            }
-            1 => {
-                buf.extend_from_slice(&ctr, GFP_KERNEL)?;
-                buf.extend_from_slice(z, GFP_KERNEL)?;
-                buf.extend_from_slice(shared_info, GFP_KERNEL)?;
-            }
-            2 => {
-                buf.extend_from_slice(z, GFP_KERNEL)?;
-                buf.extend_from_slice(shared_info, GFP_KERNEL)?;
-                buf.extend_from_slice(&ctr, GFP_KERNEL)?;
-            }
-            3 => {
-                buf.extend_from_slice(shared_info, GFP_KERNEL)?;
-                buf.extend_from_slice(z, GFP_KERNEL)?;
-                buf.extend_from_slice(&ctr, GFP_KERNEL)?;
-            }
-            _ => {
-                buf.extend_from_slice(z, GFP_KERNEL)?;
-                buf.extend_from_slice(shared_info, GFP_KERNEL)?;
-            }
-        }
-        let digest = crate::image::sha256(&buf)?;
-        wipe(&mut buf);
-        let take = core::cmp::min(digest.len(), out_len - out.len());
-        out.extend_from_slice(&digest[..take], GFP_KERNEL)?;
-        counter = counter.checked_add(1).ok_or(EINVAL)?;
+    let mut out = KVec::with_capacity(out_len, GFP_KERNEL)?;
+    let r = kdf_sha256_into(&mut out, z, shared_info, out_len, mode);
+    if let Err(e) = r {
+        wipe(&mut out);
+        return Err(e);
     }
     Ok(out)
 }
 
+fn kdf_sha256_into(out: &mut KVec<u8>, z: &[u8], shared_info: &[u8], out_len: usize, mode: u8) -> Result {
+    let mut counter: u32 = 1;
+    while out.len() < out_len {
+        let ctr = counter.to_be_bytes();
+        // Sized up front so no reallocation leaves a copy of the shared
+        // secret behind. `buf` is wiped below on success, and here if
+        // building it fails part way.
+        let mut buf = KVec::with_capacity(z.len() + ctr.len() + shared_info.len(), GFP_KERNEL)?;
+        let built = (|| -> Result {
+            match mode {
+                0 => {
+                    buf.extend_from_slice(z, GFP_KERNEL)?;
+                    buf.extend_from_slice(&ctr, GFP_KERNEL)?;
+                    buf.extend_from_slice(shared_info, GFP_KERNEL)?;
+                }
+                1 => {
+                    buf.extend_from_slice(&ctr, GFP_KERNEL)?;
+                    buf.extend_from_slice(z, GFP_KERNEL)?;
+                    buf.extend_from_slice(shared_info, GFP_KERNEL)?;
+                }
+                2 => {
+                    buf.extend_from_slice(z, GFP_KERNEL)?;
+                    buf.extend_from_slice(shared_info, GFP_KERNEL)?;
+                    buf.extend_from_slice(&ctr, GFP_KERNEL)?;
+                }
+                3 => {
+                    buf.extend_from_slice(shared_info, GFP_KERNEL)?;
+                    buf.extend_from_slice(z, GFP_KERNEL)?;
+                    buf.extend_from_slice(&ctr, GFP_KERNEL)?;
+                }
+                _ => {
+                    buf.extend_from_slice(z, GFP_KERNEL)?;
+                    buf.extend_from_slice(shared_info, GFP_KERNEL)?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = built {
+            wipe(&mut buf);
+            return Err(e);
+        }
+        let digest = crate::image::sha256(&buf);
+        wipe(&mut buf);
+        let mut digest = digest?;
+        let take = core::cmp::min(digest.len(), out_len - out.len());
+        let pushed = out.extend_from_slice(&digest[..take], GFP_KERNEL);
+        wipe(&mut digest);
+        pushed?;
+        counter = counter.checked_add(1).ok_or(EINVAL)?;
+    }
+    Ok(())
+}
+
 fn gcm_encrypt(key: &[u8], iv: &[u8], aad: &[u8], plaintext: &[u8]) -> Result<KVec<u8>> {
-    let mut buf = KVec::new();
-    buf.extend_from_slice(aad, GFP_KERNEL)?;
-    buf.extend_from_slice(plaintext, GFP_KERNEL)?;
-    buf.resize(aad.len() + plaintext.len() + TAG_LEN, 0u8, GFP_KERNEL)?;
+    let mut buf = KVec::with_capacity(aad.len() + plaintext.len() + TAG_LEN, GFP_KERNEL)?;
+    let built = (|| -> Result {
+        buf.extend_from_slice(aad, GFP_KERNEL)?;
+        buf.extend_from_slice(plaintext, GFP_KERNEL)?;
+        buf.resize(aad.len() + plaintext.len() + TAG_LEN, 0u8, GFP_KERNEL)?;
+        Ok(())
+    })();
+    if let Err(e) = built {
+        wipe(&mut buf);
+        return Err(e);
+    }
     // SAFETY: `key`/`iv` are live; `buf` holds aad‖plaintext‖tag-space and its
     // length is passed as both the buffer size and the extent to authenticate.
     let rc = unsafe {
@@ -136,10 +168,14 @@ fn gcm_encrypt(key: &[u8], iv: &[u8], aad: &[u8], plaintext: &[u8]) -> Result<KV
         )
     };
     if rc != 0 {
+        // The plaintext is still in `buf`.
+        wipe(&mut buf);
         return Err(Error::from_errno(rc));
     }
     let mut out = KVec::new();
-    out.extend_from_slice(&buf[aad.len()..], GFP_KERNEL)?;
+    let copied = out.extend_from_slice(&buf[aad.len()..], GFP_KERNEL);
+    wipe(&mut buf);
+    copied?;
     Ok(out)
 }
 
@@ -194,13 +230,18 @@ pub(crate) fn ecies_encrypt_parts(
     } else {
         key_len
     };
-    let mut km = kdf_sha256_mode(&shared, &si, kdf_len, kdf_mode)?;
+    let km = kdf_sha256_mode(&shared, &si, kdf_len, kdf_mode);
     wipe(&mut shared);
+    let mut km = km?;
     let mut iv = KVec::new();
-    if variable_iv {
-        iv.extend_from_slice(&km[key_len..key_len + iv_len], GFP_KERNEL)?;
+    let made = if variable_iv {
+        iv.extend_from_slice(&km[key_len..key_len + iv_len], GFP_KERNEL)
     } else {
-        iv.resize(iv_len, 0u8, GFP_KERNEL)?;
+        iv.resize(iv_len, 0u8, GFP_KERNEL)
+    };
+    if let Err(e) = made {
+        wipe(&mut km);
+        return Err(e.into());
     }
     let aad: &[u8] = if aad_eph { &eph_point } else { &[] };
     let ct_tag = gcm_encrypt(&km[..key_len], &iv, aad, plaintext);

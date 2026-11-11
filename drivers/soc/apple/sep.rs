@@ -752,6 +752,13 @@ struct SepData {
 
     #[pin]
     sks_exchange_lock: Mutex<()>,
+    // One SCRD request in flight at a time: the endpoint has one pair of
+    // shared buffers and replies are told apart by request type only, so
+    // two callers (a touch-gated /dev/sep-key call, the re-arm, a self-test)
+    // would overwrite each other's payload or take each other's reply,
+    // including a new credential context's handle.
+    #[pin]
+    scrd_exchange_lock: Mutex<()>,
     #[pin]
     sks_probe: Mutex<SksProbe>,
     #[pin]
@@ -1097,6 +1104,7 @@ impl SepData {
                 ool_sbio <- new_mutex!(Some(ool_sbio)),
                 ool_sks <- new_mutex!(Some(ool_sks)),
                 sks_exchange_lock <- new_mutex!(()),
+                scrd_exchange_lock <- new_mutex!(()),
                 sks_probe <- new_mutex!(SksProbe::new()),
                 sks_wq <- new_condvar!("SepData::sks_wq"),
                 ool_scrd <- new_mutex!(Some(ool_scrd)),
@@ -1409,12 +1417,15 @@ impl SepData {
                 return Ok(None);
             }
 
+            // A reply wait sleeps uninterruptibly: with a signal pending an
+            // interruptible wait returns at once with the time left unchanged,
+            // so this loop would spin until the reply came, or forever.
             match self
                 .control_wq
-                .wait_interruptible_timeout(&mut guard, remaining)
+                .wait_timeout(&mut guard, remaining)
             {
                 CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
-                CondVarTimeoutResult::Signal { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Signal { .. } => remaining = 0,
                 CondVarTimeoutResult::Timeout => remaining = 0,
             }
         }
@@ -1448,12 +1459,15 @@ impl SepData {
             if remaining == 0 {
                 break (Err(ETIMEDOUT), control::EntropyEnd::TimedOut);
             }
+            // A reply wait sleeps uninterruptibly: with a signal pending an
+            // interruptible wait returns at once with the time left unchanged,
+            // so this loop would spin until the reply came, or forever.
             match self
                 .control_wq
-                .wait_interruptible_timeout(&mut guard, remaining)
+                .wait_timeout(&mut guard, remaining)
             {
                 CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
-                CondVarTimeoutResult::Signal { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Signal { .. } => remaining = 0,
                 CondVarTimeoutResult::Timeout => remaining = 0,
             }
         };
@@ -1996,12 +2010,15 @@ impl SepData {
                 || guard.captured.len() >= until || remaining == 0 {
                 return;
             }
+            // A reply wait sleeps uninterruptibly: with a signal pending an
+            // interruptible wait returns at once with the time left unchanged,
+            // so this loop would spin until the reply came, or forever.
             match self
                 .scrd_wq
-                .wait_interruptible_timeout(&mut guard, remaining)
+                .wait_timeout(&mut guard, remaining)
             {
                 CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
-                CondVarTimeoutResult::Signal { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Signal { .. } => remaining = 0,
                 CondVarTimeoutResult::Timeout => remaining = 0,
             }
         }
@@ -2028,6 +2045,7 @@ impl SepData {
         payload: &[u8],
         timeout_ms: time::Msecs,
     ) -> Option<(crate::scrd::ScrdReply, KVec<u8>)> {
+        let _exchange = self.scrd_exchange_lock.lock();
         if !self.ool_registered(&self.ool_scrd) {
             return None;
         }
