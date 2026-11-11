@@ -3282,10 +3282,19 @@
 #endif
 
 #if defined(T6050_J714C) || defined(T6050_J714S) || defined(T6050_J716C) || defined(T6050_J716S) || defined(T6050_K114C) || defined(T6050_K114S) || defined(T6050_K116C) || defined(T6050_K116S)
-	admac_ec_proxy: dma-controller@4d3200000 {
-		compatible = "apple,t6050-admac-secure", "apple,admac-secure";
-		reg = <0x4 0xd3200000 0x0 0x34000>;
+	/*
+	 * admac-leap-s through its proxy aperture (ADT admac-hp-mic-ec-proxy), for the microphone
+	 * array, as on T8140 and T8142. Its ADT reg is not behind the arm-io translation.
+	 * dart-aop stream 11 with the ADT's vm-base-11/vm-size-11.
+	 */
+	admac_ec_proxy: dma-controller@2d3200000 {
+		compatible = "apple,t6050-admac", "apple,t8140-admac";
+		reg = <0x2 0xd3200000 0x0 0x34000>;
+		dma-channels = <9>;
+		interrupts-extended = <&aic AIC_IRQ 0 638 IRQ_TYPE_LEVEL_HIGH>, <0>, <0>, <0>;
 		#dma-cells = <1>;
+		iommus = <&aop_dart 11>;
+		apple,dma-range = <0x100 0x40000000 0x0 0xffff0000>;
 		status = "disabled";
 	};
 #endif

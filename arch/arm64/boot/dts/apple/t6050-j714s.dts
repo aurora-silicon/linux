@@ -440,8 +440,9 @@
 #include "t6050-j714s-display.dtsi"
 
 /*
- * Audio is not brought up: ADT i2c1 has the left sn012776 amplifiers and i2c2 the
- * cs42l84 codec, so both buses stay off.
+ * The speakers and the headphone jack are not brought up: ADT i2c1 has the left
+ * sn012776 amplifiers and i2c2 the cs42l84 codec, so both buses stay off. The
+ * microphone array, below, needs neither.
  */
 &i2c1 {
 	status = "disabled";
@@ -466,4 +467,25 @@
 
 &aop {
 	status = "okay";
+};
+
+/*
+ * The microphone array: ADT audio-hp-mic, three microphones on leap-s RX0 through the
+ * proxy ADMAC (Linux channel 1, as on J813), captured by the AOP audio service's own card.
+ */
+&admac_base_ns {
+	status = "okay";
+};
+
+&admac_ec_proxy {
+	status = "okay";
+};
+
+&aop_audio {
+	apple,chassis-name = "J714";
+	apple,machine-kind = "MacBook Pro";
+	dmas = <&admac_base_ns 4>, <&admac_base_ns 5>,
+	       <&admac_base_ns 0>, <&admac_base_ns 1>,
+	       <&admac_ec_proxy 1>;
+	dma-names = "cout", "cin", "spkr", "sense", "hpai";
 };
