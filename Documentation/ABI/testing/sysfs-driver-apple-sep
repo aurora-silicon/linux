@@ -441,7 +441,7 @@ Description:
 		(RO) Where the OS identity that the driver gives the
 		enclave's xART exchange came from. Decided at the attach.
 
-		===========	=========================================
+		===========	==================================
 		unknown		Not decided yet.
 		explicit	The os_uuid_hi and os_uuid_lo parameters.
 		chosen		/chosen/apfs-preboot-uuid, as the boot
@@ -498,3 +498,36 @@ Description:
 		power domains stay on across sleep, so every other attribute
 		keeps its value over a suspend; a reader checking that the
 		enclave still answers after a resume reads the hwrng.
+=======
+What:           /sys/bus/platform/devices/.../complete_attach
+Date:           November 2026
+Contact:        Aurora Silicon maintainers
+Description:
+                Write-only, root-only (0200). Writing 1 completes an attach
+                started with apple_sep.keystore_only=1: opens host state and
+                the identity index on the real root, reopens xART with the
+                configured write and guard policy, and publishes the biometric
+                devices. Sensor activation still occurs on first device open,
+                just as with a normal attach. No SEP registration is repeated.
+                Successful completion is idempotent. Failed store opens may
+                be retried. Returns EINVAL for other values, or if the driver
+                was loaded without keystore_only. The read-only module
+                parameter retains its load-time value after completion.
+
+                In keystore-only mode, xART is read-only regardless of
+                xart_writes, provisioning is disabled, and no host-state or
+                guard files are opened for writing. The initrd must carry the
+                existing identity keybag and machine ref-key at their usual
+                /var/lib paths; both are cached on first trusted-key use.
+                An unseal needing an xART write fails with EBADMSG so userspace
+                can use its passphrase fallback.
+
+                With apple_sep.keystore_only=2 the initrd phase also serves a
+                password unlock of a per-user key bag on /dev/sep-bio-rearm:
+                only the state, import, unlock, lock and FDE unseal requests;
+                every other request returns EAGAIN until complete_attach.
+                Loading and unlocking a bag needs enclave writes to xART, so
+                in this mode xART follows xart_writes, but only when the xART
+                guard is off (its record list lives in host files on the real
+                root). With a guard, xART stays read-only, the bag requests
+                fail with EROFS and the volume falls back to its passphrase.

@@ -2256,18 +2256,42 @@ impl SepData {
         if self.bringup_started.xchg(true, Relaxed) {
             return;
         }
+        if !self.run_keystore_bringup() {
+            return;
+        }
+        self.finish_keystore_bringup();
+    }
+
+    pub(crate) fn run_keystore_bringup(&self) -> bool {
         if let Err(e) = self.enable_sks() {
             dev_warn!(self.dev, "bringup: could not enable the key store ({:?}); keybag and ref-key operations are unavailable\n", e);
-            return;
+            return false;
         }
         if !self.sks_init_endpoint() {
             dev_err!(
                 self.dev,
                 "bringup: key-store endpoint init failed; the key store stays closed\n"
             );
-            return;
+            return false;
+        }
+        if self.keystore_user_bags {
+            // keystore_only=2: a volume sealed to a user's password opens
+            // here, before the real root. rearm_ioctl limits the node to the
+            // unlock requests until complete_attach.
+            if let Err(e) = self.register_rearm() {
+                dev_err!(
+                    self.dev,
+                    "bringup: could not publish /dev/{} for the initrd password unlock: {:?}\n",
+                    bio::REARM_DEVICE_NAME,
+                    e
+                );
+            }
         }
         diag::keystore_open();
+        true
+    }
+
+    pub(crate) fn finish_keystore_bringup(&self) {
         if module_parameters::provision_keybag.value() != 0 {
             if module_parameters::xart_writes.value() == 0 {
                 dev_err!(
@@ -5247,6 +5271,16 @@ impl SepData {
     pub(crate) fn rearm_ioctl(&self, cmd: u32, arg: usize) -> Result<()> {
         if self.shutting_down.load(Relaxed) {
             return Err(ENODEV);
+        }
+        // In the initrd phase the node serves only a password unlock; Touch
+        // ID and the host state are not attached yet.
+        if self.keystore_only.load(Relaxed) && !crate::userbag::is_initrd_ioctl(cmd) {
+            return Err(EAGAIN);
+        }
+        // The per-user key bag carries login passwords: root only, on this
+        // node, never on /dev/sep-bio, which fprintd holds.
+        if crate::userbag::is_ioctl(cmd) {
+            return self.userbag_ioctl(cmd, arg).map(|_| ());
         }
         match cmd {
             bio::IOC_LOCKOUT_STATE => self.write_lockout_state(arg),
