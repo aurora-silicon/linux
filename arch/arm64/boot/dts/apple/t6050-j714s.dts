@@ -450,3 +450,20 @@
 &i2c2 {
 	status = "disabled";
 };
+
+/* The AOP, booted through its setup port, with its sensor and audio services. */
+&aop_mbox {
+	status = "okay";
+};
+
+&aop_setup_mbox {
+	status = "okay";
+};
+
+&aop_dart {
+	status = "okay";
+};
+
+&aop {
+	status = "okay";
+};
