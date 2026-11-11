@@ -2806,6 +2806,8 @@ static int t6040_debugfs_init(struct t6040_usb2_phy *tphy)
 	}
 	debugfs_create_atomic_t("drop_next_power_down_ack", 0600, tphy->debugfs,
 				&tphy->drop_next_power_down_ack);
+	/* Set by a wake that failed with the host kept; clear it to let the port try again. */
+	debugfs_create_bool("sleep_no_keep", 0600, tphy->debugfs, &tphy->sleep_no_keep);
 	ret = devm_add_action_or_reset(tphy->dev, t6040_debugfs_remove, tphy->debugfs);
 	if (ret)
 		tphy->debugfs = NULL;
@@ -3384,7 +3386,7 @@ void apple_t6040_atcphy_sleep_finish(struct phy *usb2_phy, bool kept)
 	if (!kept && tphy->sleep_ret < 0 && tphy->sleep_ret != -EBUSY) {
 		tphy->sleep_no_keep = true;
 		dev_warn(tphy->dev,
-			 "PHY did not come back from a sleep with the host kept (%d): the host stops for sleeps from now on\n",
+			 "PHY did not come back from a sleep with the host kept (%d): the host stops for sleeps from now on (debugfs sleep_no_keep)\n",
 			 tphy->sleep_ret);
 	}
 	tphy->sleep_armed = false;
