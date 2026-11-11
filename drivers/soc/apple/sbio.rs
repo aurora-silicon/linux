@@ -5248,6 +5248,11 @@ impl SepData {
         if self.shutting_down.load(Relaxed) {
             return Err(ENODEV);
         }
+        // The per-user key bag carries login passwords: root only, on this
+        // node, never on /dev/sep-bio, which fprintd holds.
+        if crate::userbag::is_ioctl(cmd) {
+            return self.userbag_ioctl(cmd, arg).map(|_| ());
+        }
         match cmd {
             bio::IOC_LOCKOUT_STATE => self.write_lockout_state(arg),
             bio::IOC_REARM => {

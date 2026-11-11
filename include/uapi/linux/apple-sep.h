@@ -327,6 +327,21 @@ struct sep_key_public {
  * 6 (handle ignored): make a throwaway key with the .userPresence list and
  * sign with a key-bag-secret context ('result') and with a context with no
  * match ('result2').
+ * 7 (research): the same throwaway key signed with a context whose passcode
+ * credential comes from another user's key bag. In: 'enclave_status' = that
+ * uid, 'handle'/'handle_len' = that bag's password. Out: 'result2' = the
+ * verify-secret status, 'result'/'enclave_status' = the signature.
+ * 8 (research): a throwaway .userPresence key under the unlocked bag of the
+ * uid in 'enclave_status'; 'result' = signed with that bag's password
+ * credential (password in 'handle'), 'result2' = with no credential.
+ * 9 (research): as 8, 'result' = with the identity bag's secret as the
+ * credential, 'result2' = with the password given in 'handle'.
+ * 10 (research): as 8, but the kernel also locks the bag for good and signs
+ * with a stale, an empty and a fresh credential, then unlocks and signs
+ * again; the results come back in 'digest' (see key.rs).
+ * 11 (research): make such a key under that uid's unlocked bag and return its
+ * record in 'handle'. 12: sign that record with a password credential from
+ * the bag; the password is the NUL-padded 'digest'.
  * 'result' is 0 when the enclave signed, else a negative errno.
  */
 struct sep_key_selftest {
@@ -341,5 +356,85 @@ struct sep_key_selftest {
 };
 
 #define SEP_KEY_SELFTEST _IOWR(SEP_BIO_IOC_MAGIC, 0x24, struct sep_key_selftest)
+
+/*
+ * DESIGN DRAFT, not a stable ABI: the per-user key bag whose secret is the
+ * login password. Root only, on the re-arm node, never on /dev/sep-bio. The
+ * password passes through once per call and the kernel keeps no copy.
+ * 0x0e/0x0f are the lockout re-arm and 0x10 SEP_BIO_REQUIRE_PASSWORD; these
+ * use 0x30-0x36.
+ */
+#define SEP_KEYBAG_SECRET_MAX 256
+
+struct sep_keybag_unlock {      /* UNLOCK and CREATE */
+	__u32 uid;
+	__u32 secret_len;          /* UNLOCK permits zero to cancel pending lock */
+	__u8  secret[SEP_KEYBAG_SECRET_MAX];
+};
+
+#define SEP_KEYBAG_LOCK_SCREEN  1   /* after grace_s */
+#define SEP_KEYBAG_LOCK_SUSPEND 2   /* at once */
+#define SEP_KEYBAG_LOCK_LOGOUT  3   /* at once; the password is needed again */
+
+struct sep_keybag_lock {
+	__u32 uid;
+	__u32 reason;
+	__u32 grace_s;
+	__u32 reserved;
+};
+
+#define SEP_KEYBAG_STATE_LOCKED_SINCE_BOOT 0
+#define SEP_KEYBAG_STATE_UNLOCKED          1
+#define SEP_KEYBAG_STATE_LOCKING           2
+#define SEP_KEYBAG_STATE_LOCKED            3
+
+#define SEP_KEYBAG_BIO_ALLOWED             0
+#define SEP_KEYBAG_BIO_PASSWORD_SINCE_BOOT 1
+#define SEP_KEYBAG_BIO_NO_UNLOCK_48H       2
+#define SEP_KEYBAG_BIO_NO_PASSWORD_156H    3
+#define SEP_KEYBAG_BIO_FAILED_MATCHES      4
+
+struct sep_keybag_state {
+	__u32 uid;                /* in */
+	__u32 bag_state;          /* SEP_KEYBAG_STATE_* */
+	__u32 biometry;           /* SEP_KEYBAG_BIO_* */
+	__u32 failed_matches;
+	__u64 since_password_s;   /* ~0 when none since boot */
+	__u64 since_unlock_s;
+	__u32 enclave_lock_state; /* raw enclave state word */
+	__u32 lock_phase;         /* enclave lock phase */
+};
+
+struct sep_keybag_change {
+	__u32 uid;
+	__u32 old_len;
+	__u32 new_len;
+	__u32 reserved;
+	__u8  old_secret[SEP_KEYBAG_SECRET_MAX];
+	__u8  new_secret[SEP_KEYBAG_SECRET_MAX];
+};
+
+#define SEP_BIO_KEYBAG_STATE  _IOWR(SEP_BIO_IOC_MAGIC, 0x30, struct sep_keybag_state)
+#define SEP_BIO_KEYBAG_UNLOCK _IOW(SEP_BIO_IOC_MAGIC, 0x31, struct sep_keybag_unlock)
+#define SEP_BIO_KEYBAG_LOCK   _IOW(SEP_BIO_IOC_MAGIC, 0x32, struct sep_keybag_lock)
+#define SEP_BIO_KEYBAG_CHANGE _IOW(SEP_BIO_IOC_MAGIC, 0x33, struct sep_keybag_change)
+#define SEP_BIO_KEYBAG_CREATE _IOW(SEP_BIO_IOC_MAGIC, 0x34, struct sep_keybag_unlock)
+
+/*
+ * A user's wrapped bag, for userspace to keep across reboots (as macOS
+ * saves it). It holds no secret: it opens only with the user's password,
+ * on this Mac. EXPORT copies the designated bag; IMPORT loads a saved one
+ * and designates it again, locked until SEP_BIO_KEYBAG_UNLOCK.
+ */
+#define SEP_KEYBAG_BLOB_MAX 4096
+
+struct sep_keybag_blob {
+	__u32 uid;
+	__u32 len;
+	__u8  data[SEP_KEYBAG_BLOB_MAX];
+};
+
+#define SEP_BIO_KEYBAG_EXPORT _IOWR(SEP_BIO_IOC_MAGIC, 0x35, struct sep_keybag_blob)
+#define SEP_BIO_KEYBAG_IMPORT _IOW(SEP_BIO_IOC_MAGIC, 0x36, struct sep_keybag_blob)
 
 #endif /* _UAPI_LINUX_APPLE_SEP_H */
