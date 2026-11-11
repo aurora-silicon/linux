@@ -65,7 +65,14 @@
  * PCIe port 0: the N1 (Wi-Fi and Bluetooth), as on J716s. ADT apcie0 gives port
  * 0's registers and IRQ 1523, and pci-bridge0's PERST# is GPIO 80; the N1's three
  * functions are on DART streams 1-3. The boot loader trains the link and then
- * enables port 0 and its DART. Port 1 is the SD reader, not described yet.
+ * enables port 0 and its DART.
+ *
+ * PCIe port 1: the SD card reader (ADT pci-bridge1/pcie-sdreader, a GL9755). The
+ * boot loader leaves it down, so the kernel trains it: its power is the SMC pcIO
+ * output of the ADT's function-sd_pwr_en, its PERST# GPIO 81, its IRQ 1531, and
+ * the link tunables below are pci-bridge1's. It is on stream 1 of dart-apcie1,
+ * which answers only once the root complex is up. The kernel's train reads the
+ * shared PHY's state (ADT reg[3]); the boot loader leaves it up with port 0.
  */
 / {
 	aliases {
@@ -80,12 +87,21 @@
 	      <0x4 0x14000000 0x0 0x4000>,
 	      <0x4 0x10028000 0x0 0x8000>,
 	      <0x4 0x17010000 0x0 0x4000>,
-	      <0x4 0x10024000 0x0 0x4000>;
-	reg-names = "config", "rc", "port0", "phy0", "intr2axi0";
-	interrupts = <AIC_IRQ 0 1523 IRQ_TYPE_LEVEL_HIGH>;
-	interrupt-names = "port0";
-	iommu-map = <0x100 &dart_apcie0 1 3>;
+	      <0x4 0x10024000 0x0 0x4000>,
+	      <0x4 0x11028000 0x0 0x8000>,
+	      <0x4 0x17014000 0x0 0x4000>,
+	      <0x4 0x11024000 0x0 0x4000>,
+	      <0x4 0x17020000 0x0 0x4000>;
+	reg-names = "config", "rc", "port0", "phy0", "intr2axi0", "port1", "phy1", "intr2axi1",
+		    "phy-shared";
+	interrupts = <AIC_IRQ 0 1523 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 0 1531 IRQ_TYPE_LEVEL_HIGH>;
+	interrupt-names = "port0", "port1";
+	iommu-map = <0x100 &dart_apcie0 1 3>,
+		    <0x200 &dart_apcie1 1 1>;
 	bus-range = <0 4>;
+	/* dart_apcie1 probes only once port 1 is up: the host must not wait for it */
+	post-init-providers = <&dart_apcie1>;
 	status = "okay";
 
 	port00: pci@0,0 {
@@ -130,14 +146,68 @@
 			local-bd-address = [00 00 00 00 00 00];
 		};
 	};
+
+	port01: pci@1,0 {
+		device_type = "pci";
+		reg = <0x800 0 0 0 0>;
+		bus-range = <2 2>;
+		/* Down at boot: the kernel trains it, powering the reader first */
+		apple,link-trained-by-bootloader;
+		pwren-gpios = <&smc_pcio 0 GPIO_ACTIVE_HIGH>;
+		/* PERST#: ADT pci-bridge1 function-perst, GPIO 81 */
+		reset-gpios = <&pinctrl_ap 81 GPIO_ACTIVE_LOW>;
+		apple,apcie-config-tunables = <0x140 4 0x1 0x1>,
+			<0x144 4 0xffffff 0x253770>,
+			<0x8a8 4 0x1 0x1>,
+			<0x8ac 4 0x1 0x1>;
+		apple,pcie-rc-tunables = <0x78 4 0x7000 0x0>,
+			<0x194 4 0x2 0x2>,
+			<0xb80 4 0x7f3f3f 0x7f1e1e>,
+			<0xb88 4 0x7f3f3f 0x7f1e1e>;
+		apple,pcie-rc-gen3-shadow-tunables = <0x154 4 0xf0f0f0f 0x5050505>,
+			<0x890 4 0x3000000 0x0>,
+			<0x8a8 4 0xffff0f 0x1>;
+		apple,pcie-rc-gen4-shadow-tunables = <0x178 4 0xffff 0x5555>,
+			<0x890 4 0x3000000 0x1000000>,
+			<0x8a8 4 0xffff0f 0x1>;
+		apple,pcie-rc-gen5-shadow-tunables = <0x1ac 4 0xffff 0x5555>,
+			<0x890 4 0x3000000 0x2000000>,
+			<0x8a8 4 0xffff0f 0x1>;
+
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupt-map-mask = <0 0 0 7>;
+		interrupt-map = <0 0 0 1 &port01 0 0 0 0>,
+				<0 0 0 2 &port01 0 0 0 1>,
+				<0 0 0 3 &port01 0 0 0 2>,
+				<0 0 0 4 &port01 0 0 0 3>;
+
+		/* The GL9755; card detect and write protect active high (ADT *-polarity = 1) */
+		sdhci0: mmc@0,0 {
+			compatible = "pci17a0,9755";
+			reg = <0x20000 0x0 0x0 0x0 0x0>;
+			cd-inverted;
+			wp-inverted;
+		};
+	};
 };
 
 /*
- * Pin 112 takes an SError when read (as on J716c and J716s), so only the pin a
- * node here names is exposed: 80, PCIe port 0's PERST#.
+ * Pin 112 takes an SError when read (as on J716c and J716s), so only the pins
+ * nodes here name are exposed: 80 and 81, PCIe ports 0 and 1's PERST#.
  */
 &pinctrl_ap {
-	gpio-reserved-ranges = <0 80>, <81 140>;
+	gpio-reserved-ranges = <0 80>, <82 139>;
+};
+
+/* It answers only once port 1's root complex is up: pcie-apple then enables it */
+&dart_apcie1 {
+	apple,manual-availability;
+	status = "okay";
 };
 
 /* The keyboard backlight: ADT pwm0/kbd-backlight, channel 0 at 25 kHz */
@@ -210,8 +280,14 @@
 	};
 };
 
-/* Nothing here drives the SMC pcIO outputs, and the AFE reset above uses gp1c */
-/delete-node/ &smc_pcio;
+/*
+ * The SMC pcIO outputs this board drives, as pKW8('pcIO', lo, hi) templates written
+ * (hi << 32) | lo with the level in the low bits. The AFE reset above uses gp1c.
+ *   0 sd_pwr_en (0x0, 0x190000): ADT pcie-sdreader function-sd_pwr_en
+ */
+&smc_pcio {
+	apple,output-commands = /bits/ 64 <0x0019000000000000>;
+};
 
 #include "t6050-peripherals.dtsi"
 
