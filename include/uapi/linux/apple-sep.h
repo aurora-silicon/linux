@@ -360,6 +360,10 @@ struct sep_key_seal {
  * 21 one touch: sign, then unseal a secret sealed to the key in the same
  * context ('result2' 0 when it came back unchanged). 22 (no finger): unseal
  * with no context ('result') and with an unsatisfied one ('result2').
+ * 23 (no finger, handle ignored): for each of the list operations "oecd",
+ * "od", "ock", "oe", a throwaway key with only that one (and sign, attest,
+ * delete) free, unsealed with no context; 'result' has bit i set when key i
+ * gave the secret back, 'result2' is 0 when a key with none of them free did.
  * 'result' is 0 when the enclave signed, else a negative errno.
  */
 struct sep_key_selftest {

@@ -781,6 +781,13 @@ struct SepData {
     #[pin]
     key_dev: Mutex<Option<shim::BioChardev>>,
 
+    // /dev/sep-key: one identity-bag load, operation and unload at a time.
+    // The device's ioctls run concurrently (a touch wait must not block
+    // SEP_KEY_CANCEL), so this, not the chardev lock, keeps one caller from
+    // unloading the bag under another's operation.
+    #[pin]
+    key_bag_lock: Mutex<()>,
+
     // /dev/sep-key: the signature a touch-gated SEP_KEY_SIGN is waiting for.
     // Set only for the length of that ioctl; while set, a verify run belongs
     // to it and not to /dev/sep-bio's session.
@@ -1104,6 +1111,7 @@ impl SepData {
                 bio_dev <- new_mutex!(None),
                 rearm_dev <- new_mutex!(None),
                 key_dev <- new_mutex!(None),
+                key_bag_lock <- new_mutex!(()),
                 key_touch <- new_mutex!(None),
                 key_touch_active: Atomic::new(false),
                 key_touch_cancel: Atomic::new(false),

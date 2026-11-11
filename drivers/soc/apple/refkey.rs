@@ -416,6 +416,7 @@ impl SepData {
         op: impl FnOnce(crate::sks::KeyBagHandle, &[u8]) -> Result<T>,
     ) -> Result<T> {
         self.wait_for_trusted_ready()?;
+        let _bag = self.key_bag_lock.lock();
         let keybag::State::Present(stored) = keybag::read(keybag::Slot::Identity)? else {
             return Err(ENODEV);
         };

@@ -217,6 +217,13 @@ pub(crate) const SELFTEST_TOUCH_SIGN_THEN_UNSEAL: u32 = 21;
 /// No finger: unseal a secret sealed to the key with no context (`result`)
 /// and with an unsatisfied one (`result2`). Both must be refused.
 pub(crate) const SELFTEST_UNSEAL_UNSATISFIED: u32 = 22;
+/// Research probe, no finger, ignores the handle: for each operation in
+/// `UNSEAL_ACL_PROBE_OPS`, a throwaway key whose list leaves only that
+/// operation (besides sign, attest and delete) free, then an unseal with no
+/// context. `result` has bit i set when the unseal with operation i free
+/// returned the secret; `result2` is 0 when a key whose list names none of
+/// them still unseals (then the list does not govern the decrypt at all).
+pub(crate) const SELFTEST_UNSEAL_ACL_PROBE: u32 = 23;
 
 static_assert!(core::mem::size_of::<Info>() == 16);
 static_assert!(core::mem::size_of::<Create>() == 2124);
@@ -366,12 +373,23 @@ pub(crate) fn presence_acl() -> Result<KVec<u8>> {
 /// As macOS writes it for `.privateKeyUsage | .biometryCurrentSet`: sign,
 /// key agreement (`ock`) and derivation (`okd`) need a biometric credential
 /// (`cbio`) for this catacomb (`pbioc`) and enrolled set (`pbioh`); delete
-/// (`odel`) and attest (`oa`) are free. With no `enrolled_hash` it is the
+/// (`odel`) and attest (`oa`) are free. The ECIES decrypt SEP_KEY_UNSEAL
+/// uses (`UNSEAL_ACL_OP`) needs the same credential, so a secret sealed to the
+/// key comes back only after a match. With no `enrolled_hash` it is the
 /// `.biometryAny` list: `cbio` names the catacomb only.
 pub(crate) struct BioAcl {
     pub(crate) ed: KVec<u8>,
     pub(crate) constraint: KVec<u8>,
 }
+
+/// The access-control-list operation that governs the enclave's ECIES
+/// decrypt (request op `oecd`), which SEP_KEY_UNSEAL uses. A biometric key
+/// constrains it like its signature; `SELFTEST_UNSEAL_ACL_PROBE` shows which
+/// list entry the enclave consults for it.
+pub(crate) const UNSEAL_ACL_OP: &[u8] = b"oecd";
+
+/// The operations SELFTEST_UNSEAL_ACL_PROBE tries, one throwaway key each.
+pub(crate) const UNSEAL_ACL_PROBE_OPS: [&[u8]; 4] = [b"oecd", b"od", b"ock", b"oe"];
 
 pub(crate) fn bio_acl(catacomb: &[u8; 16], enrolled_hash: Option<&[u8; 32]>) -> Result<BioAcl> {
     let cbio = match enrolled_hash {
@@ -388,6 +406,7 @@ pub(crate) fn bio_acl(catacomb: &[u8; 16], enrolled_hash: Option<&[u8; 32]>) -> 
         (b"odel".as_slice(), RV::Bool(true)),
         (b"okd".as_slice(), RV::Der(&constraint)),
         (b"osgn".as_slice(), RV::Der(&constraint)),
+        (UNSEAL_ACL_OP, RV::Der(&constraint)),
     ])?;
     let ed = crate::der::encode_refkey_set(&[(b"acl".as_slice(), RV::Der(&acl))])?;
     Ok(BioAcl { ed, constraint })
@@ -596,8 +615,8 @@ mod tests {
         assert_eq!(&acl.constraint[4..10], b"\x0c\x04cbio");
         let ed = &acl.ed;
         assert_eq!(ed[0], 0x31);
-        // The list names all five operations; delete and attest are free.
-        for op in [b"oa".as_slice(), b"ock", b"odel", b"okd", b"osgn"] {
+        // The list names all six operations; delete and attest are free.
+        for op in [b"oa".as_slice(), b"ock", b"odel", b"okd", b"osgn", UNSEAL_ACL_OP] {
             assert!(ed.windows(op.len() + 2).any(|w| w[0] == 0x0c && w[1] as usize == op.len() && &w[2..] == op));
         }
         assert!(ed.windows(3).any(|w| w == [0x01u8, 0x01, 0x01].as_slice()));
@@ -620,9 +639,12 @@ impl SepData {
         self.publish_chardev(&self.key_dev, || {
             // SAFETY: as in `register_bio`: `remove()` drops the registration
             // before the `Arc` that keeps `ctx` alive, and the shim's unregister
-            // clears the stored context under the lock every callback takes.
+            // waits for running ioctls and clears the stored context before
+            // any later callback. Ioctls run concurrently: a touch-gated SIGN or
+            // UNSEAL sleeps up to a minute, and CANCEL must reach it meanwhile.
+            // They serialise on `catacomb_writer`; CANCEL only sets a flag.
             unsafe {
-                crate::shim::BioChardev::register(
+                crate::shim::BioChardev::register_concurrent(
                     DEVICE_NAME,
                     DEVICE_MODE,
                     ctx,
@@ -656,7 +678,7 @@ impl SepData {
     /// Evaluates the signing constraint on the fresh context before the
     /// match, as LocalAuthentication does. Best effort: logged only.
     pub(crate) fn key_touch_preflight(&self, evaluation: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) {
-        let constraint = {
+        let (constraint, op) = {
             let guard = self.key_touch.lock();
             let Some(job) = guard.as_ref() else {
                 return;
@@ -665,9 +687,13 @@ impl SepData {
             if c.extend_from_slice(&job.constraint, GFP_KERNEL).is_err() {
                 return;
             }
-            c
+            let op: &[u8] = match job.op {
+                TouchOp::Sign => b"osgn",
+                TouchOp::Unseal => UNSEAL_ACL_OP,
+            };
+            (c, op)
         };
-        let Ok(payload) = crate::scrd::scrd_verify_acl_constraint(evaluation, &constraint, b"osgn") else {
+        let Ok(payload) = crate::scrd::scrd_verify_acl_constraint(evaluation, &constraint, op) else {
             return;
         };
         match self.scrd_transact(
@@ -946,6 +972,67 @@ impl SepData {
         Ok(())
     }
 
+    /// One throwaway key with `free` (if any) set free next to sign, attest
+    /// and delete; unseal with no context. 0 when the secret came back.
+    fn key_unseal_probe_one(&self, free: Option<&[u8]>, secret: &[u8]) -> (i32, i32) {
+        use crate::der::RefKeyValue as RV;
+        let run = || -> Result<KVec<u8>> {
+            let mut items: KVec<(&[u8], RV<'_>)> = KVec::new();
+            for op in [b"oa".as_slice(), b"odel", b"osgn"] {
+                items.push((op, RV::Bool(true)), GFP_KERNEL)?;
+            }
+            if let Some(op) = free {
+                items.push((op, RV::Bool(true)), GFP_KERNEL)?;
+            }
+            let acl = crate::der::encode_refkey_set(&items)?;
+            let ed = crate::der::encode_refkey_set(&[(b"acl".as_slice(), RV::Der(&acl))])?;
+            let (blob, _) = self.user_key_create(Some(&ed))?;
+            let sealed = seal_to(&blob, secret)?;
+            self.user_key_unseal(&blob, &sealed, None)
+        };
+        self.last_key_status.store(0, Relaxed);
+        let r = match run() {
+            Ok(got) if got[..] == secret[..] => 0,
+            Ok(_) => EIO.to_errno(),
+            Err(e) => e.to_errno(),
+        };
+        (r, self.last_key_status.load(Relaxed) as i32)
+    }
+
+    fn key_unseal_acl_probe(&self, req: &mut Selftest) -> Result<()> {
+        let secret = req.digest;
+        let mut mask = 0i32;
+        for (i, op) in UNSEAL_ACL_PROBE_OPS.iter().enumerate() {
+            let (r, st) = self.key_unseal_probe_one(Some(op), &secret);
+            if r == 0 {
+                mask |= 1 << i;
+            }
+            dev_info!(
+                self.dev,
+                "sep-key: self-test unseal ACL probe: {} free: {} ({}, enclave status {})
+",
+                core::str::from_utf8(op).unwrap_or("?"),
+                (if r == 0 { "UNSEALED" } else { "refused" }),
+                r,
+                st
+            );
+        }
+        let (r2, st2) = self.key_unseal_probe_one(None, &secret);
+        dev_info!(
+            self.dev,
+            "sep-key: self-test unseal ACL probe: none of them free: {} ({}, enclave status {})
+",
+            (if r2 == 0 { "UNSEALED" } else { "refused" }),
+            r2,
+            st2
+        );
+        req.result = mask;
+        req.enclave_status = 0;
+        req.result2 = r2;
+        req.enclave_status2 = st2;
+        Ok(())
+    }
+
     fn key_selftest(&self, req: &mut Selftest) -> Result<()> {
         if crate::module_parameters::key_selftest.value() == 0 {
             return Err(EPERM);
@@ -953,6 +1040,9 @@ impl SepData {
         crate::bio::require_admin()?;
         if req.mode == SELFTEST_PRESENCE_PROBE {
             return self.key_presence_probe(req);
+        }
+        if req.mode == SELFTEST_UNSEAL_ACL_PROBE {
+            return self.key_unseal_acl_probe(req);
         }
         let (blob, flags) = decode_handle(&req.handle, req.handle_len)?;
         if flags & HANDLE_BIOMETRY == 0 {
