@@ -97,12 +97,37 @@ class PolicyWindowTests(unittest.TestCase):
         # after a ref-key create has closed the window for the boot.
         callers = calls(PREPARE)
         self.assertTrue(callers)
+        deferred = 0
         for f, outer, body, at in callers:
             with self.subTest(caller=outer):
                 before = body[:at]
-                self.assertTrue("crate::xart_guard::policy_window(" in before
-                                or "crate::xart_guard::close_policy_window(" in before,
-                                f"{f}: {outer}")
+                if ("crate::xart_guard::policy_window(" in before
+                        or "crate::xart_guard::close_policy_window(" in before):
+                    continue
+                # The call sits in a closure that is run later.
+                self.assertEqual((f, outer), ("refkey.rs", "refkey_unseal_cached"))
+                self.assertIn("let unlock = || {", before)
+                deferred += 1
+                self.assert_unlock_runs_in_the_window_or_the_initrd(body[at:])
+        self.assertEqual(deferred, 1)
+
+    def assert_unlock_runs_in_the_window_or_the_initrd(self, after):
+        """`unlock` is run twice: in the window, or bare in the initrd.
+
+        The trusted-key-only initrd attach (keystore_only) leaves the boot's
+        one window to the real root: "Do not consume the real root's one
+        policy window in the initrd". Its designate runs with the window
+        shut, where the guard lets no existing session record be rewritten.
+        """
+        uses = re.findall(r"\bunlock\b(?!\s*=)", after)
+        self.assertEqual(len(uses), 2)
+        self.assertRegex(
+            after,
+            r"if self\.keystore_only\.load\(Relaxed\) \{\s*"
+            r"unlock\(\)\s*"
+            r"\} else \{\s*"
+            r"crate::xart_guard::policy_window\(unlock\)\s*"
+            r"\}")
 
 
 if __name__ == "__main__":
