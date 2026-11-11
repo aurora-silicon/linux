@@ -113,6 +113,8 @@ struct audiosrv_data {
 	bool restart_blocked;
 	/* The element capacity a compact endpoint's last catalog fitted */
 	size_t elements_cap;
+	/* The published instance answered the whole capacity with an empty catalog */
+	bool elements_empty;
 };
 
 static void av_interface_init(struct apple_epic_service *service, const char *name,
@@ -166,6 +168,8 @@ static void av_audiosrv_init(struct apple_epic_service *service, const char *nam
 		afk_service_put(old);
 
 	asrv->plugged = true;
+	/* A new instance, maybe a new sink: its catalog is asked for afresh. */
+	WRITE_ONCE(asrv->elements_empty, false);
 	mutex_unlock(&asrv->plug_lock);
 	if (queue_start)
 		schedule_work(&asrv->start_av_service_wq);
@@ -585,18 +589,21 @@ dcp_audiosrv_osobject_call(struct apple_epic_service *service, u16 group,
  * capacity a display's catalog fits in (7784 bytes for a 2560x1440
  * monitor), and the capacity grows only for a catalog that does not fit.
  * The firmware answers a capacity too small for the catalog with an empty
- * one (no error, nothing used), so an empty answer grows it too, as do
- * one that fills it, one reported larger than it and a refusal. The
- * capacity that fitted is kept for the next query.
+ * one (no error, nothing used), so an empty answer grows it too, as do one
+ * that fills it and one reported larger than it; nothing else does (a
+ * timeout leaves the endpoint unusable, other errors are not about size).
+ * The capacity that fitted is kept for the next query. An instance that
+ * answers even the whole capacity with an empty catalog has none: it is
+ * asked once more only with the smallest capacity, until it is replaced.
  */
 #define AV_COMPACT_ELEMENTS_MIN		SZ_16K
 #define AV_COMPACT_ELEMENTS_GROWTH	4
 
-static bool av_elements_need_more(int ret, size_t size, size_t cap)
+static bool av_elements_need_more(int ret, size_t size, size_t cap, bool empty)
 {
 	if (!ret)
-		return !size || size >= cap;
-	return ret == -EMSGSIZE || ret == -EINVAL || ret == -EREMOTEIO;
+		return (!size && !empty) || size >= cap;
+	return ret == -EMSGSIZE;
 }
 
 int dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize)
@@ -605,7 +612,7 @@ int dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize
 	struct audiosrv_data *asrv = dcp->audiosrv;
 	struct apple_epic_service *srv;
 	size_t size = 0, cap;
-	bool compact;
+	bool compact, empty;
 	int ret;
 
 	if (!asrv)
@@ -616,6 +623,7 @@ int dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize
 		return -ENODEV;
 
 	compact = READ_ONCE(srv->ep->compact);
+	empty = READ_ONCE(asrv->elements_empty);
 	cap = maxsize;
 	if (compact)
 		cap = clamp(READ_ONCE(asrv->elements_cap) ?: AV_COMPACT_ELEMENTS_MIN,
@@ -623,7 +631,7 @@ int dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize
 	for (;;) {
 		ret = dcp_audiosrv_osobject_call(srv, 1, asrv->cmds.get_elements,
 						 elements, cap, &size);
-		if (cap >= maxsize || !av_elements_need_more(ret, size, cap))
+		if (cap >= maxsize || !av_elements_need_more(ret, size, cap, empty))
 			break;
 		dev_dbg(dev, "audiosrv: elements do not fit %zu bytes (%d, %zu used), asking for more\n",
 			cap, ret, size);
@@ -633,10 +641,12 @@ int dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize
 		/* The call cleared the capacity it asked with; the rest goes too. */
 		memset(elements + cap, 0, maxsize - cap);
 		/* A smaller display's catalog goes back to a smaller capacity. */
+		if (!size && cap >= maxsize)
+			WRITE_ONCE(asrv->elements_empty, true);
 		while (cap > AV_COMPACT_ELEMENTS_MIN &&
 		       size < cap / AV_COMPACT_ELEMENTS_GROWTH)
 			cap /= AV_COMPACT_ELEMENTS_GROWTH;
-		WRITE_ONCE(asrv->elements_cap, cap);
+		WRITE_ONCE(asrv->elements_cap, max_t(size_t, cap, AV_COMPACT_ELEMENTS_MIN));
 	}
 	afk_service_put(srv);
 

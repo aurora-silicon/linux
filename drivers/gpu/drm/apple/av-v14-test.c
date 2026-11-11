@@ -526,6 +526,7 @@ static size_t av_elements_catalog;
 static size_t av_elements_caps[8];
 static unsigned int av_elements_ncalls;
 static bool av_elements_refuse;
+static int av_elements_error;
 
 static int av_elements_call(struct apple_epic_service *service, u16 group, u32 command,
 			    void *output, size_t output_maxsize, size_t *output_size)
@@ -533,6 +534,8 @@ static int av_elements_call(struct apple_epic_service *service, u16 group, u32 c
 	if (av_elements_ncalls < ARRAY_SIZE(av_elements_caps))
 		av_elements_caps[av_elements_ncalls] = output_maxsize;
 	av_elements_ncalls++;
+	if (av_elements_error)
+		return av_elements_error;
 	memset(output, 0, output_maxsize);
 	if (av_elements_catalog > output_maxsize) {
 		if (av_elements_refuse)
@@ -561,6 +564,7 @@ static void av_elements_capacity(struct kunit *test)
 	kunit_activate_static_stub(test, dcp_audiosrv_osobject_call, av_elements_call);
 	memset(elements, 0x5a, SZ_256K);
 	av_elements_refuse = false;
+	av_elements_error = 0;
 
 	av_elements_catalog = 7784;
 	av_elements_ncalls = 0;
@@ -593,6 +597,8 @@ static void av_elements_capacity(struct kunit *test)
 	av_elements_catalog = 7784;
 	av_elements_ncalls = 0;
 	KUNIT_EXPECT_EQ(test, dcp_audiosrv_get_elements(t->dcp->dev, elements, SZ_256K), 0);
+	KUNIT_ASSERT_EQ(test, av_elements_ncalls, 1U);
+	KUNIT_EXPECT_EQ(test, av_elements_caps[0], (size_t)SZ_256K);
 	av_elements_ncalls = 0;
 	KUNIT_EXPECT_EQ(test, dcp_audiosrv_get_elements(t->dcp->dev, elements, SZ_256K), 0);
 	KUNIT_ASSERT_EQ(test, av_elements_ncalls, 1U);
@@ -611,11 +617,39 @@ static void av_elements_capacity(struct kunit *test)
 	av_elements_ncalls = 0;
 	KUNIT_EXPECT_EQ(test, dcp_audiosrv_get_elements(t->dcp->dev, elements, SZ_256K), -EMSGSIZE);
 	KUNIT_EXPECT_EQ(test, av_elements_caps[av_elements_ncalls - 1], (size_t)SZ_256K);
+	/* An instance without a catalog: the whole capacity once, then only the smallest */
 	av_elements_refuse = false;
 	av_elements_ncalls = 0;
 	KUNIT_EXPECT_EQ(test, dcp_audiosrv_get_elements(t->dcp->dev, elements, SZ_256K), 0);
 	KUNIT_EXPECT_EQ(test, av_elements_caps[av_elements_ncalls - 1], (size_t)SZ_256K);
 	KUNIT_EXPECT_EQ(test, elements[0], 0);
+	av_elements_ncalls = 0;
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_get_elements(t->dcp->dev, elements, SZ_256K), 0);
+	KUNIT_ASSERT_EQ(test, av_elements_ncalls, 1U);
+	KUNIT_EXPECT_EQ(test, av_elements_caps[0], desktop ? (size_t)SZ_16K : (size_t)SZ_256K);
+	/* Its replacement is asked afresh */
+	av_v14_replace(t);
+	av_elements_catalog = 7784;
+	av_elements_ncalls = 0;
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_get_elements(t->dcp->dev, elements, SZ_256K), 0);
+	KUNIT_EXPECT_EQ(test, elements[7783], 0xa5);
+
+	/* Errors that are not about size are not retried with more */
+	av_elements_error = -EREMOTEIO;
+	av_elements_ncalls = 0;
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_get_elements(t->dcp->dev, elements, SZ_256K), -EREMOTEIO);
+	KUNIT_EXPECT_EQ(test, av_elements_ncalls, 1U);
+	av_elements_error = -ETIMEDOUT;
+	av_elements_ncalls = 0;
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_get_elements(t->dcp->dev, elements, SZ_256K), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, av_elements_ncalls, 1U);
+	av_elements_error = 0;
+
+	/* A capacity under the smallest step is asked once, whole */
+	av_elements_ncalls = 0;
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_get_elements(t->dcp->dev, elements, SZ_8K), 0);
+	KUNIT_ASSERT_EQ(test, av_elements_ncalls, 1U);
+	KUNIT_EXPECT_EQ(test, av_elements_caps[0], (size_t)SZ_8K);
 }
 
 static void av_native_desc(const bool *desktop, char *desc)
