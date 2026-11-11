@@ -109,11 +109,37 @@ ring on powered cores becomes stale rather than fabricating a zero-utilisation
 sample; only gated cores read as zero. Readers
 must not convert these percentages into engine nanoseconds or cycles.
 
+M5 performance state and busy time
+----------------------------------
+
+The M5 firmware runs on the same backend and decoder, and its statistics ring
+carries more. ``agx_stats`` reports there:
+
+* ``pstate``: the performance state in effect, from the firmware's state
+  reports (tag ``0x1b``, words 1 and 3, which must agree). It is an index into
+  the board's performance state table, 1 to 13. The interval record before a
+  report (tag ``0x19``) gives its firmware timestamp. A report that names state
+  0 or a state beyond the table is not used, and ``pstate_status`` reads
+  ``stale`` while the cores are gated.
+* ``achieved_frequency_hz``: the frequency of that state in the board's table,
+  while ``pstate_status`` is ``valid``.
+* ``busy_ns``: the M5 utilisation records carry their own timestamps (words 1
+  and 2, 24 MHz ticks), so each record closes a window of known length, which
+  is credited at the record's device utilisation. A record that follows the
+  previous one by more than two 8 ms periods, or whose timestamp went back,
+  only starts a new window: time the GPU spent gated is never credited. The
+  total keeps counting across power epochs.
+
+``requested_frequency_hz``, ``power_mw`` and ``temperature_raw`` stay
+unsupported. ``busy_ns`` is device-wide, as on G13 and G14; it does not change
+fdinfo's per-client ``drm-engine-*`` counters.
+
 Deferred shared power telemetry
 ------------------------------
 
 Current pstate and requested/achieved frequency remain unsupported for these
-firmware graphs. The shared-power snapshot ABI is not sufficiently specified
+firmware graphs (the M5 firmware reports its state in the statistics ring, see
+above). The shared-power snapshot ABI is not sufficiently specified
 to implement a read-only reader. For **each** of G16S and G17P, it still needs:
 
 * The firmware-version-to-layout mapping, containing allocation and bounds,
