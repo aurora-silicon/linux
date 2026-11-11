@@ -120,3 +120,5 @@
 &isp_dart2 {
 	status = "disabled";
 };
+
+#include "t6040-j614s-extdisp-hdmi.dtsi"
