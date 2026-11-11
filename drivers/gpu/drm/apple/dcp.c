@@ -2614,6 +2614,8 @@ static int dcp_dptx_connect_tile(struct apple_dcp *dcp)
  * The DPTX link is set up on HPD (HDMI) or when the Type-C display fabric
  * routes a port's DP alt mode to the processor (USB-C).
  */
+static void dcp_hdmi_converter_power(struct apple_dcp *dcp, bool on);
+
 static int dcp_desktop_dptx_connect(struct apple_dcp *dcp, u32 port)
 {
 	struct dptx_port *dptx = &dcp->dptxport[port];
@@ -2639,7 +2641,21 @@ static int dcp_desktop_dptx_connect(struct apple_dcp *dcp, u32 port)
 	if (dptx->connected)
 		goto out_unlock;
 
+	/*
+	 * The DP-to-HDMI converter is powered for its link and each link starts
+	 * from its power-up, as macOS's port controller has it (it powers the
+	 * converter when the port is connected to a pipe, before the port is
+	 * activated). Not while the other port's link runs through it, and not
+	 * again for a link dcp_hib_ext_relink() has just powered it up for.
+	 */
+	if (dcp->dp2hdmi_pwren && !dcp->dptxport[!port].connected) {
+		if (!dcp->hdmi_converter_fresh)
+			dcp_hdmi_converter_power(dcp, true);
+		dcp->hdmi_converter_fresh = false;
+	}
+
 	reinit_completion(&dptx->linkcfg_completion);
+	WRITE_ONCE(dptx->link_configured, false);
 	dptx->atcphy = dcp->phy;
 	ret = dptxport_connect(dptx->service, 0, dcp->dptx_phy, dcp->dptx_die, true);
 	if (ret) {
@@ -2665,6 +2681,9 @@ static int dcp_desktop_dptx_connect(struct apple_dcp *dcp, u32 port)
 			dev_warn(dcp->dev, "DPTX port %u: set_hpd(1): %d\n", port, ret);
 		ret = 0;
 	}
+	/* Connected without its display: the link starts over when HPD comes. */
+	WRITE_ONCE(dcp->hdmi_resync,
+		   dcp->hdmi_hpd && gpiod_get_value_cansleep(dcp->hdmi_hpd) <= 0);
 	mutex_unlock(&dcp->hpd_mutex);
 
 	/* Without a sink the link is configured once one arrives. */
@@ -2702,11 +2721,22 @@ static int dcp_desktop_dptx_disconnect_oob(struct apple_dcp *dcp, u32 port)
 }
 
 /*
- * HDMI HPD of a desktop 26.x external processor.  A cold plug after boot
- * finds the port connected without a sink: the firmware never saw this HPD,
- * so pulse the AP-asserted HPD to make it export the modes now.  An unplug
- * is reported by nothing else: the DP-to-HDMI converter keeps its DP link
- * up without a sink and the firmware sees no change.
+ * HDMI HPD of a desktop 26.x external processor.  The firmware takes HPD
+ * from the host only, with the connection: a display that arrives is
+ * connected, one that leaves is released (nothing else reports an unplug:
+ * the DP-to-HDMI converter keeps its DP link up without a sink).  Each plug
+ * is one link start from the converter's power-up, as on macOS, where the
+ * port is connected at HPD and the converter is powered with the connection.
+ *
+ * The firmware must not be given HPD off and on again under a link it is
+ * bringing up.  Once the link has trained and the firmware has set up the
+ * converter's HDMI side, it takes a new HPD as the same link: it trains the
+ * DP side again, skips the HDMI side and shows the display with a mode set,
+ * and the display stays black until its link is released.  On the J616s a
+ * 100 ms HPD pulse sent 0.6 s or later after the first training, and before
+ * the display was shown, ended black every time; a release and a new
+ * connection at the same moment did not.  So an HPD change under a connected
+ * port starts the link over through a release, see dcp_desktop_hdmi_restart().
  */
 /* The HDMI display gives its pipeline up: report it gone, release its link. */
 void dcp_hdmi_yield_link(struct apple_dcp *dcp)
@@ -2721,16 +2751,68 @@ void dcp_hdmi_yield_link(struct apple_dcp *dcp)
 		dev_warn(dcp->dev, "HDMI link not released: %d\n", ret);
 }
 
+#define DCP_HDMI_START_TRIES	3
+
+/*
+ * The fixed output is connected and its display asserts HPD, but the firmware
+ * found no active sink behind the converter (seen when the port is connected
+ * within about 2 s of the +5 V: the converter has not found the display
+ * yet). It then waits for another HPD event, which only the host can give.
+ * macOS releases a display whose sink is inactive and requests it again while
+ * HPD stays; do the same and start the link again, a few times.
+ */
+static void dcp_desktop_hdmi_unpark(struct apple_dcp *dcp)
+{
+	struct dptx_port *dptx = &dcp->dptxport[0];
+	int tries, ret;
+
+	for (tries = 1; tries <= DCP_HDMI_START_TRIES; tries++) {
+		if (!READ_ONCE(dptx->connected) || READ_ONCE(dptx->link_configured) ||
+		    READ_ONCE(dcp->active_typec_route) || READ_ONCE(dcp->hdmi_yielded) ||
+		    gpiod_get_value_cansleep(dcp->hdmi_hpd) <= 0)
+			return;
+		dev_info(dcp->dev, "HDMI: no sink behind the converter yet, link started again (%d/%d)\n",
+			 tries, DCP_HDMI_START_TRIES);
+		ret = dcp_desktop_dptx_disconnect_oob(dcp, 0);
+		if (ret)
+			dev_warn(dcp->dev, "HDMI link not released: %d\n", ret);
+		dcp_dptx_connect(dcp, 0);
+	}
+}
+
+/*
+ * The display behind a connected port changed, or came after the port was
+ * connected: release the link and connect again, converter power-up included.
+ */
+static void dcp_desktop_hdmi_restart(struct apple_dcp *dcp)
+{
+	int ret;
+
+	dev_info(dcp->dev, "HDMI: HPD changed under the connected port, link started again\n");
+	ret = dcp_desktop_dptx_disconnect_oob(dcp, 0);
+	if (ret)
+		dev_warn(dcp->dev, "HDMI link not released: %d\n", ret);
+	dcp_dptx_connect(dcp, 0);
+	dcp_desktop_hdmi_unpark(dcp);
+}
+
 irqreturn_t dcp_desktop_dp2hdmi_hpd(struct apple_dcp *dcp)
 {
 	struct dptx_port *dptx = &dcp->dptxport[0];
 	bool connected;
-	int ret;
 
+	/*
+	 * A level that is low now, or after the settle time, is a real change.
+	 * An edge latched before the interrupt was enabled finds the level the
+	 * port was connected at.
+	 */
+	if (gpiod_get_value_cansleep(dcp->hdmi_hpd) <= 0)
+		WRITE_ONCE(dcp->hdmi_resync, true);
 	msleep(500);
 	connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
 	dev_dbg(dcp->dev, "DP2HDMI HPD irq, connected:%d after 500 ms\n", connected);
 	if (!connected) {
+		WRITE_ONCE(dcp->hdmi_resync, true);
 		/*
 		 * A yield outlasts HDMI blinks (a monitor reconfiguring its
 		 * inputs drops HPD on all of them): it ends with the Type-C
@@ -2741,6 +2823,7 @@ irqreturn_t dcp_desktop_dp2hdmi_hpd(struct apple_dcp *dcp)
 			dev_info(dcp->dev, "HDMI display unplugged\n");
 			disconnected_hpd_event(dcp->connector);
 			dcp_dptx_disconnect(dcp, 0);
+			dcp_hdmi_converter_power(dcp, false);
 			dcp_fabric_hdmi_unplugged(dcp);
 		}
 		return IRQ_HANDLED;
@@ -2758,17 +2841,21 @@ irqreturn_t dcp_desktop_dp2hdmi_hpd(struct apple_dcp *dcp)
 	mutex_lock(&dcp->hpd_mutex);
 	if (dptx_service_available(dptx) && dptx->connected &&
 	    READ_ONCE(dptx->service->ep->compact)) {
-		ret = dptxport_set_hpd(dptx->service, false);
-		msleep(100);
-		ret = dptxport_set_hpd(dptx->service, true) ?: ret;
 		mutex_unlock(&dcp->hpd_mutex);
-		dev_dbg(dcp->dev, "HDMI cold plug: HPD pulse on the connected port: %d\n",
-			ret);
+		/*
+		 * An edge from before the connection changes nothing, unless
+		 * the firmware still waits for the display's sink.
+		 */
+		if (READ_ONCE(dcp->hdmi_resync))
+			dcp_desktop_hdmi_restart(dcp);
+		else
+			dcp_desktop_hdmi_unpark(dcp);
 		return IRQ_HANDLED;
 	}
 	mutex_unlock(&dcp->hpd_mutex);
 
 	dcp_dptx_connect(dcp, 0);
+	dcp_desktop_hdmi_unpark(dcp);
 	return IRQ_HANDLED;
 }
 
@@ -3977,7 +4064,8 @@ static int dcp_desktop_start_ext_ep(struct apple_dcp *dcp, u32 map, u32 endpoint
 /*
  * The link step of an external processor's start: a Type-C route powers the
  * PHY and selects the crossbar when it is claimed; until then there is no
- * link to bring up.  The fixed HDMI output connects without a sink.
+ * link to bring up.  The fixed HDMI output is connected when its display is
+ * there; one that comes later is connected at its HPD.
  */
 static void dcp_start_desktop_ext_link(struct apple_dcp *dcp)
 {
@@ -3985,6 +4073,9 @@ static void dcp_start_desktop_ext_link(struct apple_dcp *dcp)
 
 	if (!dptx_service_available(&dcp->dptxport[0]) ||
 	    !(dcp->fixed_phy || dcp->active_typec_route))
+		return;
+	if (dcp->hdmi_hpd && !READ_ONCE(dcp->active_typec_route) &&
+	    gpiod_get_value_cansleep(dcp->hdmi_hpd) <= 0)
 		return;
 	ret = dcp_dptx_connect(dcp, 0);
 	if (ret)
@@ -4382,7 +4473,14 @@ static const struct dcp_fabric_resume_ops dcp_resume_ops = {
 	.sample = dcp_resume_sample,
 };
 
-static int dcp_enable_dp2hdmi_hpd(struct apple_dcp *dcp)
+/*
+ * @replay: the link is set up again after a sleep. A display that is not
+ * back yet (one in standby raises HPD only once it has woken up) is connected
+ * by the HPD interrupt, and the pipe is left to the DRM resume's commit,
+ * which runs at the same time: a power-off from here collides with its mode
+ * set and leaves the firmware's calls unanswered.
+ */
+static int __dcp_enable_dp2hdmi_hpd(struct apple_dcp *dcp, bool replay)
 {
 	if (dcp_is_typec_output(dcp)) {
 		if (READ_ONCE(dcp->typec_cable_connected))
@@ -4392,16 +4490,24 @@ static int dcp_enable_dp2hdmi_hpd(struct apple_dcp *dcp)
 		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
 		dev_info(dcp->dev, "%s: DP2HDMI HPD connected:%d\n", __func__, connected);
 
-		if (connected && !READ_ONCE(dcp->hdmi_yielded))
+		if (connected && !READ_ONCE(dcp->hdmi_yielded)) {
 			dcp_dptx_connect(dcp, 0);
-		else if (!connected)
+			if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+				dcp_desktop_hdmi_unpark(dcp);
+		} else if (!connected && !replay) {
 			_dcp_poweroff(dcp);
+		}
 	}
 
 	if (dcp->hdmi_hpd_irq)
 		dcp_fabric_run_resume(&dcp_resume_ops, dcp);
 
 	return 0;
+}
+
+static int dcp_enable_dp2hdmi_hpd(struct apple_dcp *dcp)
+{
+	return __dcp_enable_dp2hdmi_hpd(dcp, false);
 }
 
 int dcp_wait_ready(struct platform_device *pdev, u64 timeout)
@@ -6294,7 +6400,7 @@ static int dcp_hdmi_power_up(struct apple_dcp *dcp)
  * under it, locked to no link rate after the wake. One still on when a link
  * starts is switched off first, as probe does.
  */
-static void __maybe_unused dcp_hdmi_converter_power(struct apple_dcp *dcp, bool on)
+static void dcp_hdmi_converter_power(struct apple_dcp *dcp, bool on)
 {
 	if (!dcp->dp2hdmi_pwren)
 		return;
@@ -6305,6 +6411,7 @@ static void __maybe_unused dcp_hdmi_converter_power(struct apple_dcp *dcp, bool 
 	gpiod_set_value_cansleep(dcp->dp2hdmi_pwren, on);
 	if (on)
 		msleep(100);
+	dcp->hdmi_converter_fresh = on;
 }
 
 /*
@@ -10439,7 +10546,7 @@ static void dcp_hib_ext_relink(struct apple_dcp *dcp)
 	if (dcp->hdmi_hpd_irq && !dcp->hib_irq_disabled)
 		disable_irq(dcp->hdmi_hpd_irq);
 	dcp->hib_irq_disabled = false;
-	dcp_enable_dp2hdmi_hpd(dcp);
+	__dcp_enable_dp2hdmi_hpd(dcp, true);
 }
 
 /*

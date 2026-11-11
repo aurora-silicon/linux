@@ -898,6 +898,10 @@ struct apple_dcp {
 	struct gpio_desc *hdmi_hpd;
 	struct gpio_desc *hdmi_pwren;
 	struct gpio_desc *dp2hdmi_pwren;
+	/* The converter was just powered up for a link: the next link start takes it as it is. */
+	bool hdmi_converter_fresh;
+	/* HPD changed since the firmware was told of this port's sink: its link starts over. */
+	bool hdmi_resync;
 
 	struct mutex hpd_mutex;
 
