@@ -14,6 +14,7 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/jiffies.h>
+#include <linux/kernel_stat.h>
 #include <linux/kstrtox.h>
 #include <linux/ktime.h>
 #include <linux/math64.h>
@@ -1701,7 +1702,10 @@ static void j613_floor_sample_cpus(struct j613_floor *f, u64 period,
 		if (!cpu_online(cpu))
 			f->cpu_wall[cpu] = 0;
 	for_each_online_cpu(cpu) {
-		u64 wall, idle = get_cpu_idle_time(cpu, &wall, 0);
+		u64 wall, idle = get_cpu_idle_time_us(cpu, NULL);
+
+		/* Match CPUFreq io_busy=0 accounting without requiring CPU_FREQ. */
+		idle += get_cpu_iowait_time_us(cpu, &wall);
 
 		/* A CPU unseen for many periods (hotplug, long delay) is skipped once. */
 		if (f->primed && f->cpu_wall[cpu] && wall > f->cpu_wall[cpu] &&
