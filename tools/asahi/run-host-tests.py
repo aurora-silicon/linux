@@ -57,6 +57,7 @@ ASAHI_TESTS = {
     # 11eccbedc3ed writes frames without a transport-wide lock.
     'mtp-tx-frame-tests.py': [(out(), PASS),
                               (out() + ['--old-transport', '11eccbedc3ed'], PASS)],
+    'pmgr-ppt-tests.py': [([], PASS)],
     'queue-priority-tests.py': [([], PASS)],
     # The old revision reports a DART fault that clears before the second latch read as success.
     'ane-tm-transient-fault-tests.py': [([], PASS),
