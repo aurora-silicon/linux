@@ -5658,8 +5658,13 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
 
+	/*
+	 * The adopted MTP keeps issuing DMA through its firmware bypass.
+	 * Like its RTKit helper, admit only suspend-to-idle: leave the DART
+	 * untouched while that live session and its power domain stay on.
+	 */
 	if (dart->live_mtp)
-		return -EBUSY;
+		return pm_suspend_target_state == PM_SUSPEND_TO_IDLE ? 0 : -EBUSY;
 
 	dart->tunnel_state_restored = false;
 	if (READ_ONCE(dart->commands_gated))
@@ -5797,7 +5802,7 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	int ret;
 
 	/* No reset or restore: see apple_dart_suspend(). */
-	if (dart->cold_ane)
+	if (dart->cold_ane || dart->live_mtp)
 		return 0;
 	/* Powered down by its DCP, which restores it at power-up. */
 	if (READ_ONCE(dart->host_off))
