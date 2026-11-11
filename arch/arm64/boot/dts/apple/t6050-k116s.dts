@@ -845,29 +845,28 @@
 	status = "okay";
 };
 
-#if 0
 /*
- * OPTIONAL, second step: the microphone array, from branch m5-parity/t6050-mic-on-speakers
- * (commit 1026d291ef84, on top of PR #1554; not yet in the PR). ADT audio-hp-mic: three
- * microphones ("Digital Mic", input-data-selectors imi1/imi2/imi3) on leap-s ADMAC RX0,
- * reached through the proxy aperture ADT admac-hp-mic-ec-proxy at 0x2d3200000 (reg not
- * behind the arm-io translation; dart-aop stream 11, vm-base-11 0x10040000000,
- * vm-size-11 0xffff0000; admac-leap-s IRQ 638). That branch re-describes admac_ec_proxy in
- * t6050-peripherals.dtsi as a plain apple,t8140-admac at 0x2d3200000 on <&aop_dart 11>;
- * without that peripherals change this block must stay off.
+ * The microphone array: ADT audio-hp-mic ("Digital Mic", three microphones imi1/imi2/imi3,
+ * 48 kHz float32) on leap-s ADMAC RX0, which the AP reaches through the proxy aperture ADT
+ * admac-hp-mic-ec-proxy: reg 0x2d3200000 size 0x34000 (not behind the arm-io translation,
+ * like the AOP setup port), dma-channel 0, admac-leap-s interrupt 638, dart-aop
+ * mapper-admac-leap-s stream 11 (vm-base-11 0x10040000000, vm-size-11 0xffff0000). The K116s
+ * ADT has the J714s values in each of these. The AOP audio service captures the array on a
+ * card of its own (AppleK116HPAI). The LEAP leaves have no AP power state: the firmware
+ * raises them with the hpai service's "pw0 " when the capture opens, and the ADMAC's
+ * registers are first touched after that, when the capture requests its channel.
  */
 &admac_ec_proxy {
 	status = "okay";
 };
 
 &aop_audio {
-	/* hpai: leap-s RX0 = Linux channel 1 of the proxy ADMAC (odd = DEV_TO_MEM) */
+	/* hpai: leap-s RX0 is Linux channel 1 of the proxy ADMAC (2N for TX N, 2N+1 for RX N) */
 	dmas = <&admac_base_ns 4>, <&admac_base_ns 5>,
 	       <&admac_base_ns 0>, <&admac_base_ns 1>,
 	       <&admac_ec_proxy 1>;
 	dma-names = "cout", "cin", "spkr", "sense", "hpai";
 };
-#endif
 
 #if 1
 /*
