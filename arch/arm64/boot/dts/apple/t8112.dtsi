@@ -520,7 +520,7 @@
 			interrupts = <AIC_IRQ 689 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_venc_sys>;
 			#iommu-cells = <1>;
-			status = "disabled";
+			status = "okay";
 		};
 
 		ave_dart1: iommu@267040000 {
@@ -530,7 +530,7 @@
 			interrupts = <AIC_IRQ 689 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_venc_sys>;
 			#iommu-cells = <1>;
-			status = "disabled";
+			status = "okay";
 		};
 
 		ave: video-codec@267100000 {
@@ -551,7 +551,7 @@
 					<&ps_venc_pipe5>, <&ps_venc_me0>, <&ps_venc_me1>;
 			power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
 			iommus = <&ave_dart0 0>, <&ave_dart1 0>;
-			status = "disabled";
+			status = "okay";
 		};
 
 		gpu: gpu@206400000 {

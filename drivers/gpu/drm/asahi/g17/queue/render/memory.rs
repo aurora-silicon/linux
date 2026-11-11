@@ -283,6 +283,17 @@ impl Graph {
         }
         Ok(values)
     }
+    /// The two rings' producers alone: the `write` of [`Self::cursors`].
+    pub(super) fn write_cursors(&self) -> Result<[u32; 2]> {
+        let mut values = [0; 2];
+        for (stage, value) in values.iter_mut().enumerate() {
+            *value = self
+                .queues
+                .word(POINTERS[stage] + self.pointers.producer)?
+                .load(Ordering::Relaxed);
+        }
+        Ok(values)
+    }
     pub(super) fn claim(&mut self, ordinal: u64) -> Result {
         let owner = &mut self.owners[ordinal as usize % RECORDS];
         if owner.is_some_and(|old| old != ordinal) {

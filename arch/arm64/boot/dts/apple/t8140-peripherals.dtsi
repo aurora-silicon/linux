@@ -414,7 +414,7 @@
 		#iommu-cells = <1>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1120 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_sio_cpu>;
+		power-domains = <&ps_sio>;
 		status = "disabled";
 	};
 

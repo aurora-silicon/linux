@@ -13,6 +13,7 @@
 
 /dts-v1/;
 
+#define T6050_J714S
 #include <dt-bindings/leds/common.h>
 #include "t6050-max.dtsi"
 
@@ -212,7 +213,6 @@
 /* Nothing here drives the SMC pcIO outputs, and the AFE reset above uses gp1c */
 /delete-node/ &smc_pcio;
 
-#define T6050_J714S
 #include "t6050-peripherals.dtsi"
 
 /*
@@ -299,94 +299,27 @@
 };
 
 /*
- * Right port (ATC2): hpm2 on nub-spmi-a1, USB only (dcpext0's DisplayPort route
- * through ATC2 stays off). The inventory's nub-spmi-a1 has the generation 4 bus's
- * three register windows and IRQ (ADT nub-spmi-a1); the driver polls it and
- * refuses an interrupt, so it takes the first window only, as on J716s.
+ * Right port (ATC2): hpm2 on nub-spmi-a1, with USB and the USB4/Thunderbolt router. The
+ * inventory's nub-spmi-a1 has the generation 4 bus's three register windows and IRQ (ADT
+ * nub-spmi-a1); the driver polls it and refuses an interrupt, so it takes the first window only.
  */
 &nub_spmi_a1 {
 	reg = <0x2 0x8a1a8000 0x0 0x4000>;
 	/delete-property/ interrupts;
 	status = "okay";
-
-	hpm2: usb-pd@c {
-		compatible = "apple,sn201202x";
-		reg = <0xc SPMI_USID>;
-
-		typec2: connector {
-			compatible = "usb-c-connector";
-			label = "USB-C Right";
-			power-role = "dual";
-			data-role = "dual";
-
-			ports {
-				#address-cells = <1>;
-				#size-cells = <0>;
-
-				port@0 {
-					reg = <0>;
-					typec2_hs: endpoint {
-						remote-endpoint = <&usb_drd2_hs>;
-					};
-				};
-
-				port@1 {
-					reg = <1>;
-					typec2_ss: endpoint {
-						remote-endpoint = <&atc2_phy_typec>;
-					};
-				};
-			};
-		};
-	};
 };
 
-&ps_atc2_common {
-	status = "okay";
-};
+#include "t6050-max-atc2.dtsi"
 
-&ps_atc2_usb_aon {
-	status = "okay";
-};
-
-&ps_atc2_phymxwrap {
-	status = "okay";
-};
-
-&ps_atc2_usb {
-	status = "okay";
-};
-
-&atc2_phy_mbox {
-	status = "okay";
-};
-
-&atc2_phy {
-	status = "okay";
-
-	port {
-		atc2_phy_typec: endpoint {
-			remote-endpoint = <&typec2_ss>;
-		};
-	};
-};
-
-&usb_drd2 {
-	status = "okay";
-
-	port {
-		usb_drd2_hs: endpoint {
-			remote-endpoint = <&typec2_hs>;
-		};
-	};
-};
-
-&usb_drd2_dart_0 {
-	status = "okay";
-};
-
-&usb_drd2_dart_1 {
-	status = "okay";
+/* The host DROM from the J714sAP ADT (/arm-io/acio2 thunderbolt-drom); the boot loader replaces it */
+&acio2_nhi {
+	apple,thunderbolt-drom = [fd 02 00 00 00 00 00 00 00 90 19 c3 8c 00 5c 00
+			00 00 00 00 00 00 08 81 82 02 82 00 00 00 08 82
+			92 01 82 00 00 00 03 83 20 08 84 00 00 00 00 00
+			00 08 85 00 00 00 00 00 00 05 86 09 01 00 08 87
+			00 00 00 00 00 00 05 88 09 01 00 05 89 09 01 00
+			05 8a 09 01 00 0e 01 41 70 70 6c 65 2c 20 49 6e
+			63 2e 00 06 02 69 4f 53 00 00 00 00];
 };
 
 /*
@@ -503,9 +436,13 @@
 /* The GPU and the internal panel, for the boot loader's handoff */
 #include "t6050-j714s-gpu-panel.dtsi"
 
+/* External displays, on the left-front and right ports */
+#include "t6050-j714s-display.dtsi"
+
 /*
- * Audio is not brought up: ADT i2c1 has the left sn012776 amplifiers and i2c2 the
- * cs42l84 codec, so both buses stay off.
+ * The speakers and the headphone jack are not brought up: ADT i2c1 has the left
+ * sn012776 amplifiers and i2c2 the cs42l84 codec, so both buses stay off. The
+ * microphone array, below, needs neither.
  */
 &i2c1 {
 	status = "disabled";
@@ -513,4 +450,42 @@
 
 &i2c2 {
 	status = "disabled";
+};
+
+/* The AOP, booted through its setup port, with its sensor and audio services. */
+&aop_mbox {
+	status = "okay";
+};
+
+&aop_setup_mbox {
+	status = "okay";
+};
+
+&aop_dart {
+	status = "okay";
+};
+
+&aop {
+	status = "okay";
+};
+
+/*
+ * The microphone array: ADT audio-hp-mic, three microphones on leap-s RX0 through the
+ * proxy ADMAC (Linux channel 1, as on J813), captured by the AOP audio service's own card.
+ */
+&admac_base_ns {
+	status = "okay";
+};
+
+&admac_ec_proxy {
+	status = "okay";
+};
+
+&aop_audio {
+	apple,chassis-name = "J714";
+	apple,machine-kind = "MacBook Pro";
+	dmas = <&admac_base_ns 4>, <&admac_base_ns 5>,
+	       <&admac_base_ns 0>, <&admac_base_ns 1>,
+	       <&admac_ec_proxy 1>;
+	dma-names = "cout", "cin", "spkr", "sense", "hpai";
 };

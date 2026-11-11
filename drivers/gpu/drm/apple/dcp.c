@@ -219,6 +219,20 @@ bool hdmi_audio = true;
 module_param(hdmi_audio, bool, 0644);
 MODULE_PARM_DESC(hdmi_audio, "DP/HDMI audio of external displays (default: on)");
 
+/*
+ * Firmware 27 (H17G) internal panel: how the first mode set reaches the panel
+ * iBoot already lit.  On J815 the firmware advertises a single fixed timing and
+ * rejects set_digital_out_mode for it (0x8000000b, "create_default_fb_surface
+ * failed"); the pipe then never scans out and the panel stays black.
+ *   -1 auto: keep the boot mode when the panel advertises one timing (default)
+ *    0 always send set_digital_out_mode (the previous behaviour)
+ *    1 always keep the boot mode on the internal panel
+ */
+int fw27_panel_boot_mode = -1;
+module_param(fw27_panel_boot_mode, int, 0644);
+MODULE_PARM_DESC(fw27_panel_boot_mode,
+		 "FW27 internal panel: -1 keep the boot mode for a single fixed timing (default), 0 always mode-set, 1 always keep the boot mode");
+
 static bool unstable_edid = true;
 module_param(unstable_edid, bool, 0644);
 MODULE_PARM_DESC(unstable_edid, "Enable unstable EDID retrival support");
@@ -1241,6 +1255,9 @@ static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 		if (ep)
 			return ep;
 	}
+	/* The J700 DCPEXT's audio service sits on endpoint 0x2b, not AV 0x29. */
+	if (!IS_ERR_OR_NULL(dcp->avep) && endpoint == dcp->avep->endpoint)
+		return dcp->avep;
 	/* DPAV 0x2a on H17P overlaps the legacy DPTX endpoint number. */
 	if (dcp->dcpavservep && endpoint == dcp->dcpavservep->endpoint)
 		return dcp->dcpavservep;
@@ -2128,6 +2145,15 @@ static int dcp_external_start_locked(struct apple_dcp *dcp)
 	int ret;
 
 	lockdep_assert_held(&dcp->external_lock);
+	/*
+	 * Once its DPTX link was withdrawn, the external DCP announces its AV
+	 * interfaces again under fresh interface numbers when the link comes
+	 * back, without closing the old ones. A new generation lets each
+	 * replace the one it supersedes (afk_compact_slot()) instead of piling
+	 * up until the endpoint has no slot left for the audio interface.
+	 */
+	if (!dcp->external_running)
+		WRITE_ONCE(dcp->afk_power_gen, dcp->afk_power_gen + 1);
 	ret = dcp_external_link_locked(dcp);
 	if (ret || dcp->external_running)
 		return ret;
@@ -2600,6 +2626,15 @@ static int dcp_external_stop_locked(struct apple_dcp *dcp, u64 generation)
 		return dcp->external_error;
 	if (dcp->external_stopped && !READ_ONCE(dcp->dptxport[0].connected))
 		return 0;
+	/*
+	 * The sink's audio first, as around a 14.7 external mode set: a link
+	 * the audio client still holds when the pipe powers off and the DPTX
+	 * link is withdrawn left the next activation timing out (-ETIMEDOUT)
+	 * and the display dark. It comes back with the link
+	 * (dcp_dptx_connect_raw()), before the pipe is powered on again.
+	 */
+	if (dcp->avep)
+		av_service_disconnect(dcp);
 	iomfb_pause_presentation(dcp, true);
 	dcp->external_running = false;
 	/* Route setup can call this before IOMFB or its shared memory exists. */
@@ -2652,8 +2687,6 @@ release_link:
 	}
 	dcp->external_stopped = true;
 	WRITE_ONCE(dcp->typec_crtc_off, true);
-	if (dcp->avep)
-		av_service_disconnect(dcp);
 	return 0;
 failed:
 	/* A retry could race a late reply. Keep this session blocked and owned. */
@@ -3009,13 +3042,25 @@ static int dcp_dptx_connect_attached(struct apple_dcp *dcp, u32 port)
  * does not reset them, dcp_poweron() does. dcp-relink.h holds the
  * decisions; relink_lock protects their state.
  */
+/*
+ * A T6050 tunnel keeps its Thunderbolt binding and its HPD when the firmware
+ * drops the sink after servicing its IRQ_HPD (see dcp_tb_event_work()):
+ * nothing else connects it again. Other tunnels are left to their owners.
+ */
+static bool dcp_tunnel_relinks(struct apple_dcp *dcp)
+{
+	return of_device_is_compatible(dcp->dev->of_node, "apple,t6050-dcpext") &&
+	       READ_ONCE(dcp->tb_event_hpd);
+}
+
 static bool dcp_typec_relink_eligible(struct apple_dcp *dcp)
 {
 	struct apple_connector *connector = READ_ONCE(dcp->connector);
 
 	/* H17P and native external pipes recover through their own lifecycle */
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P || dcp->external_native ||
-	    !dcp_is_typec_output(dcp) || dcp_is_usb4_output(dcp) ||
+	    !dcp_is_typec_output(dcp) ||
+	    (dcp_is_usb4_output(dcp) && !dcp_tunnel_relinks(dcp)) ||
 	    dcp_is_external_h17p(dcp) || !dcp->typec_connector)
 		return false;
 	/*
@@ -3023,7 +3068,7 @@ static bool dcp_typec_relink_eligible(struct apple_dcp *dcp)
 	 * not one the driver itself let go, holds HPD low for (see
 	 * dcp_placeholder_edid_work()) or moves to another pipeline.
 	 */
-	/* Tunnels are excluded above; direct follows use the carried gate. */
+	/* Most tunnels are excluded above; direct follows use the carried gate. */
 	return READ_ONCE(dcp->typec_work_enabled) &&
 	       READ_ONCE(dcp->typec_cable_connected) &&
 	       !READ_ONCE(dcp->typec_crtc_off) &&
@@ -5001,6 +5046,18 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	char fw_str[DCP_FW_VERSION_STR_LEN];
 	int ret;
 
+	/*
+	 * T8142 (J813) on macOS 27.0: the H17P interface written for its 26.x
+	 * firmware makes the 27.0 DCP firmware panic right after the first
+	 * hotplug ("ap_link: callback failed with: 0x5"). It runs the T6050's
+	 * firmware-27 generation.
+	 */
+	if (of_device_is_compatible(dev->of_node, "apple,t8142-dcp")) {
+		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
+		if (ret >= 0 && !strcmp(compat_str, "27.0.0"))
+			return DCP_FIRMWARE_V_27_0;
+	}
+
 	if (hw->firmware_compat == DCP_FIRMWARE_V_27_0) {
 		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
 		if (ret < 0 || strcmp(compat_str, "27.0.0"))
@@ -5174,6 +5231,12 @@ VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release
 	disable_delayed_work_sync(&dcp->hdmi_settle_wq);
 	disable_delayed_work_sync(&dcp->hdmi_recheck_wq);
 	disable_delayed_work_sync(&dcp->link_recovery_wq);
+	disable_work_sync(&dcp->tb_event_work);
+	scoped_guard(mutex, &dcp->tb_event_lock) {
+		dcp->tb_events = 0;
+		dcp->tb_event_route = NULL;
+		dcp->tb_event_generation = 0;
+	}
 	disable_delayed_work_sync(&dcp->hybrid_wq);
 	dcp_hdmi_disable(dcp);
 }
@@ -5189,6 +5252,7 @@ VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
 	enable_delayed_work(&dcp->hdmi_settle_wq);
 	enable_delayed_work(&dcp->hdmi_recheck_wq);
 	enable_delayed_work(&dcp->link_recovery_wq);
+	enable_work(&dcp->tb_event_work);
 	enable_delayed_work(&dcp->hybrid_wq);
 	dcp_hdmi_enable(dcp);
 	scoped_guard(mutex, &dcp->hpd_mutex)
@@ -5251,6 +5315,30 @@ clocks:
 		clocks = 0;
 	if (clocks < 0 || clocks > 64)
 		return -EINVAL;
+	/*
+	 * A DCP that also boots earlier firmware (T8142) lists the clock those
+	 * use first and names the provider clocks "firmware-<index>". Take only
+	 * the named ones here.
+	 */
+	if (clocks &&
+	    of_property_match_string(dev->of_node, "clock-names", "firmware-0") >= 0) {
+		dcp->firmware_clocks = devm_kcalloc(dev, clocks,
+						    sizeof(*dcp->firmware_clocks),
+						    GFP_KERNEL);
+		if (!dcp->firmware_clocks)
+			return -ENOMEM;
+		for (index = 0; index < clocks; index++) {
+			dcp->firmware_clocks[index].id =
+				devm_kasprintf(dev, GFP_KERNEL, "firmware-%d", index);
+			if (!dcp->firmware_clocks[index].id)
+				return -ENOMEM;
+		}
+		ret = devm_clk_bulk_get(dev, clocks, dcp->firmware_clocks);
+		if (ret)
+			return ret;
+		dcp->num_firmware_clocks = clocks;
+		return 0;
+	}
 	ret = devm_clk_bulk_get_all(dev, &dcp->firmware_clocks);
 	if (ret < 0)
 		return ret;
@@ -6124,7 +6212,17 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	spin_lock_init(&dcp->metadata.lock);
 	mutex_init(&dcp->dcpavserv.lock);
 	INIT_WORK(&dcp->dcpavserv.close_wq, dcpavserv_close_work);
+	ret = dcpavserv_edid_retry_init(dcp);
+	if (ret)
+		return ret;
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
+	/*
+	 * T8142 on firmware 27 runs as the T6050's firmware-27 instance, with
+	 * the default method profile: with H17G every swap fails with status 4.
+	 */
+	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    of_device_is_compatible(dev->of_node, "apple,t8142-dcp"))
+		dcp->hw.iomfb_method_profile = DCP_IOMFB_METHODS_DEFAULT;
 	/* The display such a processor finds at boot is its first sink. */
 	if (dcp_sink_metadata(dcp))
 		dcp_desktop_metadata_new_sink(dcp);
@@ -6159,6 +6257,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&dcp->typec_reconnect_wq,
 			  dcp_typec_reconnect_work);
 	INIT_DELAYED_WORK(&dcp->link_recovery_wq, dcp_link_recovery_work);
+	mutex_init(&dcp->tb_event_lock);
+	INIT_WORK(&dcp->tb_event_work, dcp_tb_event_work);
 	INIT_DELAYED_WORK(&dcp->placeholder_edid_wq,
 			  dcp_placeholder_edid_work);
 	INIT_DELAYED_WORK(&dcp->typec_relink_wq, dcp_typec_relink_work);
@@ -6177,6 +6277,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	disable_delayed_work(&dcp->typec_relink_wq);
 	disable_delayed_work(&dcp->announce_wq);
 	disable_delayed_work(&dcp->link_recovery_wq);
+	disable_work(&dcp->tb_event_work);
 	dcp->announce.stopped = true;
 	/*
 	 * A native external pipe's bind enables these; firmware callbacks may

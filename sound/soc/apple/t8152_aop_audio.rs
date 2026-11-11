@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Apple T8152 (J873, Mac mini M6) and T8142 (J813, MacBook Air M5) AOP audio
+//! Apple T8152 (J873, Mac mini M6), T8142 (J813, MacBook Air M5) and T6050
+//! (J714s, MacBook Pro M5 Pro) AOP audio
 //!
 //! The AOP firmware owns the audio fabric, as on T8140. The ADT
 //! (/arm-io/iop-audio-controller) names its services; all of them run on the
@@ -17,7 +18,8 @@
 //! Each service is an ASoC back-end DAI: startup attaches it and requests
 //! `pw0 ` (which also brings up the audio fabric), prepare requests `pwrd`
 //! (the firmware then runs the serializer and its clocks) and shutdown goes
-//! back to `pw0 `. The serializer (MCA) leaves are the AP's to power. The
+//! back to `pw0 `. On T8152 and T8142 the serializer (MCA) leaves are the
+//! AP's to power; on T6050 the firmware powers them itself. The
 //! front-end PCMs are plain dmaengine PCMs on the base-ns channels; macaudio
 //! links them to the codecs.
 //!
@@ -562,6 +564,12 @@ struct HwConfig {
     /// The sense capture is the speaker stream's RX: restart it at a frame
     /// boundary whenever the speaker starts (see `realign_sense`).
     realign_sense: bool,
+    /// The AP powers the serializer (MCA) leaves.
+    ap_mca: bool,
+    /// The AP powers the microphone array's LEAP leaves. Without it the
+    /// firmware raises them with the service's `pw0 `, and the DT's "hpai"
+    /// DMA channel alone says whether there is a microphone array.
+    ap_leap: bool,
 }
 
 /// J873: one amplifier in one 32-bit slot, nothing sent back.
@@ -570,6 +578,8 @@ static HW_CFG_T8152: HwConfig = HwConfig {
     sense_channels: 2,
     sense_formats: FORMATS,
     realign_sense: false,
+    ap_mca: true,
+    ap_leap: true,
 };
 
 /// J813: four amplifiers (left woofer, left tweeter, right woofer, right
@@ -580,6 +590,20 @@ static HW_CFG_T8142: HwConfig = HwConfig {
     sense_channels: 8,
     sense_formats: FMTBIT_S16_LE,
     realign_sense: true,
+    ap_mca: true,
+    ap_leap: true,
+};
+
+/// J714s: six amplifiers in 32-bit slots 0-5, their voltage and current
+/// sense back as twelve 16-bit slots on the stream's RX, as on J813. The
+/// MCA and LEAP leaves have no AP power state: the firmware powers them.
+static HW_CFG_T6050: HwConfig = HwConfig {
+    spkr_channels: 6,
+    sense_channels: 12,
+    sense_formats: FMTBIT_S16_LE,
+    realign_sense: true,
+    ap_mca: false,
+    ap_leap: false,
 };
 
 /// J815 (MacBook Air 15-inch, M5): the same T8142 speaker stream with six
@@ -592,6 +616,8 @@ static HW_CFG_T8142_6AMP: HwConfig = HwConfig {
     sense_channels: 12,
     sense_formats: FMTBIT_S16_LE,
     realign_sense: true,
+    ap_mca: true,
+    ap_leap: true,
 };
 
 /// # Safety
@@ -857,6 +883,23 @@ unsafe extern "C" fn asoc_pcm_trigger(
     unsafe { bindings::snd_dmaengine_pcm_trigger(substream, cmd) }
 }
 
+/// Wait for asynchronous DMA termination before ALSA reuses a front-end's buffer.
+///
+/// # Safety
+///
+/// Called by ASoC on this driver's component with a live substream.
+unsafe extern "C" fn asoc_pcm_sync_stop(
+    _component: *mut bindings::snd_soc_component,
+    substream: *mut bindings::snd_pcm_substream,
+) -> i32 {
+    // SAFETY: by the caller's contract.
+    if unsafe { rtd_is_be(substream_rtd(substream)) } {
+        return 0;
+    }
+    // SAFETY: the dmaengine runtime was set up in `asoc_pcm_open`.
+    unsafe { bindings::snd_dmaengine_pcm_sync_stop(substream) }
+}
+
 /// # Safety
 ///
 /// Called by ASoC on this driver's component with live arguments.
@@ -1094,6 +1137,7 @@ impl AsocContext {
             close: Some(asoc_pcm_close),
             hw_params: Some(asoc_pcm_hw_params),
             trigger: Some(asoc_pcm_trigger),
+            sync_stop: Some(asoc_pcm_sync_stop),
             pointer: Some(asoc_pcm_pointer),
             ..Default::default()
         };
@@ -1399,6 +1443,7 @@ kernel::of_device_table!(
     OF_TABLE,
     <T8152AopAudioDriver as platform::Driver>::IdInfo,
     [
+        (of::DeviceId::new(c_str!("apple,t6050-aop-audio")), &HW_CFG_T6050),
         (of::DeviceId::new(c_str!("apple,t8142-aop-audio")), &HW_CFG_T8142),
         (of::DeviceId::new(c_str!("apple,t8152-aop-audio")), &HW_CFG_T8152),
     ]
@@ -1442,11 +1487,12 @@ impl platform::Driver for T8152AopAudioDriver {
         // SAFETY: checked above; it lives as long as the child.
         let service = unsafe { *service };
 
-        // Every serializer leaf is required: the firmware's streams run on
-        // them, so the driver must not bind without one (or before its
-        // provider has probed).
+        // Where the AP powers them, every serializer leaf is required: the
+        // firmware's streams run on them, so the driver must not bind
+        // without one (or before its provider has probed).
+        let mca_names: &[&CStr] = if cfg.ap_mca { &MCA_NAMES } else { &[] };
         let mut mca = KVec::new();
-        for name in MCA_NAMES {
+        for &name in mca_names {
             match PowerDomain::attach(&dev, name) {
                 Ok(Some(pd)) => mca.push(pd, GFP_KERNEL)?,
                 Ok(None) => {
@@ -1462,10 +1508,11 @@ impl platform::Driver for T8152AopAudioDriver {
             }
         }
 
-        // The microphone array, where the DT describes it: all of its leaves
-        // or none.
+        // The microphone array, where the DT describes it: where the AP powers
+        // its leaves, all of them or none; elsewhere its DMA channel.
+        let leap_names: &[&CStr] = if cfg.ap_leap { &LEAP_NAMES } else { &[] };
         let mut leap = KVec::new();
-        for name in LEAP_NAMES {
+        for &name in leap_names {
             match PowerDomain::attach(&dev, name) {
                 Ok(Some(pd)) => leap.push(pd, GFP_KERNEL)?,
                 Ok(None) => {}
@@ -1476,6 +1523,12 @@ impl platform::Driver for T8152AopAudioDriver {
             dev_err!(dev, "incomplete microphone power domains\n");
             return Err(ENODEV);
         }
+        let has_mic = if cfg.ap_leap {
+            !leap.is_empty()
+        } else {
+            dev.fwnode()
+                .is_some_and(|node| node.property_match_string(c"dma-names", c"hpai").is_ok())
+        };
 
         let data_dev = dev.clone();
         let data = Arc::pin_init(
@@ -1502,7 +1555,7 @@ impl platform::Driver for T8152AopAudioDriver {
 
         // The microphones are optional: the speakers and the jack stay
         // usable without them.
-        let mic = if data.leap.is_empty() {
+        let mic = if !has_mic {
             None
         } else {
             // Initialize the shared output service before exposing HPAI.
@@ -1550,6 +1603,6 @@ impl platform::Driver for T8152AopAudioDriver {
 module_platform_driver! {
     type: T8152AopAudioDriver,
     name: "snd_soc_t8152_aop_audio",
-    description: "Apple T8152 AOP audio: headphone jack and speaker",
+    description: "Apple T8152 AOP audio: headphone jack, speakers and microphones",
     license: "Dual MIT/GPL",
 }

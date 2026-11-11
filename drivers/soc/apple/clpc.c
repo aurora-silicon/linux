@@ -64,6 +64,14 @@ enum apple_clpc_rail {
  */
 #define APPLE_CLPC_GPU_BACKOFF_MS	100
 
+/* Why the last vote was cast, for debugfs */
+#define APPLE_CLPC_REASON_CPU		BIT(0)
+#define APPLE_CLPC_REASON_HOST_GPU	BIT(1)
+#define APPLE_CLPC_REASON_STREAMING_GPU	BIT(2)
+#define APPLE_CLPC_REASON_DENSE_GPU	BIT(3)
+#define APPLE_CLPC_REASON_HOLD		BIT(4)
+#define APPLE_CLPC_REASON_ANE		BIT(5)
+
 /**
  * struct apple_clpc_hw - per-SoC CLPC parameters
  * @rail: PMC rail of the DCS and of the fabric
@@ -89,6 +97,8 @@ enum apple_clpc_rail {
  * @gpu_input: the GPU driver reports its work in flight through
  *	apple_clpc_gpu_get(); while there is some, both rails go to the top
  *	of @map
+ * @idle_on_time: sample every period even with no vote held, instead of
+ *	from a deferrable timer
  */
 struct apple_clpc_hw {
 	unsigned int rail[APPLE_CLPC_RAILS];
@@ -105,6 +115,7 @@ struct apple_clpc_hw {
 	unsigned int ane_cluster;
 	unsigned int ane_cluster_khz;
 	const char *ane_cluster_machine;
+	bool idle_on_time;
 };
 
 struct apple_clpc_cluster {
@@ -554,8 +565,10 @@ static void apple_clpc_queue(struct apple_clpc *clpc, bool idle)
 	/*
 	 * A held vote has to be sampled on time so that it drops once demand
 	 * stops; with no vote held, sampling can wait for a CPU that wakes up
-	 * anyway rather than waking an idle one every period.
+	 * anyway rather than waking an idle one every period, unless the SoC
+	 * samples on time (@idle_on_time).
 	 */
+	idle = idle && !clpc->hw->idle_on_time;
 	/* A demand edge can queue work while the deferrable pass is pending.
 	 * Keep one sampling cadence once the serialized pass settles.
 	 */
@@ -756,12 +769,12 @@ static void apple_clpc_sample(struct apple_clpc *clpc)
 	}
 	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
 		if (demand[rail])
-			reason |= 1;
+			reason |= APPLE_CLPC_REASON_CPU;
 	if (apple_clpc_gpu_input_demand(clpc->hw, clpc->gpu, demand))
-		reason |= 2;
+		reason |= APPLE_CLPC_REASON_HOST_GPU;
 	if (apple_clpc_ane_input_demand(clpc, demand))
-		reason |= 32;
-	apple_clpc_ane_cluster(clpc, reason & 32, now);
+		reason |= APPLE_CLPC_REASON_ANE;
+	apple_clpc_ane_cluster(clpc, reason & APPLE_CLPC_REASON_ANE, now);
 	if (clpc->gpu_pmgr) {
 		/* Both run every sample: each tracks state across samples. */
 		bool late = time_after(now, clpc->gpu_sampled +
@@ -774,7 +787,8 @@ static void apple_clpc_sample(struct apple_clpc *clpc)
 
 			apple_clpc_gpu_floor_count(clpc, released);
 			if (!released) {
-				reason |= streaming ? 4 : 8;
+				reason |= streaming ? APPLE_CLPC_REASON_STREAMING_GPU :
+						      APPLE_CLPC_REASON_DENSE_GPU;
 				if (streaming)
 					clpc->gpu_streaming_samples++;
 				else
@@ -793,7 +807,7 @@ static void apple_clpc_sample(struct apple_clpc *clpc)
 	floor = apple_clpc_floor(clpc, state);
 	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
 		if (state[rail] > demand[rail])
-			reason |= 16;
+			reason |= APPLE_CLPC_REASON_HOLD;
 	clpc->last_floor = floor;
 	clpc->last_reason = reason;
 	clpc->last_vote_ns = ktime_get_mono_fast_ns();
@@ -805,24 +819,22 @@ static void apple_clpc_sample(struct apple_clpc *clpc)
 			 !clpc->ane_qos_khz);
 }
 
-static void apple_clpc_work(struct work_struct *work)
+static void apple_clpc_run(struct apple_clpc *clpc)
 {
-	struct apple_clpc *clpc = container_of(to_delayed_work(work), struct apple_clpc, work);
-
 	mutex_lock(&clpc->sample_lock);
 	if (!READ_ONCE(clpc->stopped))
 		apple_clpc_sample(clpc);
 	mutex_unlock(&clpc->sample_lock);
 }
 
+static void apple_clpc_work(struct work_struct *work)
+{
+	apple_clpc_run(container_of(to_delayed_work(work), struct apple_clpc, work));
+}
+
 static void apple_clpc_idle_work(struct work_struct *work)
 {
-	struct apple_clpc *clpc = container_of(to_delayed_work(work), struct apple_clpc, idle_work);
-
-	mutex_lock(&clpc->sample_lock);
-	if (!READ_ONCE(clpc->stopped))
-		apple_clpc_sample(clpc);
-	mutex_unlock(&clpc->sample_lock);
+	apple_clpc_run(container_of(to_delayed_work(work), struct apple_clpc, idle_work));
 }
 
 static int apple_clpc_status_show(struct seq_file *s, void *unused)
@@ -1677,11 +1689,18 @@ static const struct apple_clpc_hw apple_clpc_hw_t8152 = {
  * The boot loader enables no agent on either rail, so without this floor
  * the DRAM controller and the fabric stay at state 0: CPU memcpy caps at
  * about 34 GB/s on the M5 Pro. A busy cluster in the upper half of its range
- * asks for DCS 5 and fabric 2, the floor macOS's CLPC holds through an
- * 18-thread CPU loop (J714sAP, 26A428: 0x25 on its voter 99% of the time);
- * three busy samples in a row (12 ms) are needed, as on T6040. The GPU driver
- * reports its work in flight and gets both top states, DCS 6 and fabric 3,
- * while it has some: bandwidth-bound GPU work runs about 11% slower at DCS 5.
+ * asks for DCS 5 and fabric 2; three busy samples in a row (12 ms) are
+ * needed, as on T6040. macOS's CLPC votes from memory stalls instead, which
+ * this driver doesn't see (J714sAP, 26A428: no vote for one CPU-bound thread,
+ * DCS 6 and fabric 2 for memcpy); DCS 5 and fabric 2 keep pointer chasing at
+ * 110 ns against 300 ns at state 0. The GPU driver reports its work in
+ * flight and gets both top states, DCS 6 and fabric 3, while it has some:
+ * bandwidth-bound GPU work runs about 11% slower at DCS 5.
+ *
+ * Sampling stays on time with no vote held. From a deferrable timer, a CPU
+ * that went busy after an idle spell waited for the timer's own CPU to wake,
+ * and pointer chasing ran at 300 ns for 60 ms and more; on time the floor is
+ * in place within 24-32 ms, for no measurable idle power (6.44 against 6.40 W).
  */
 static const struct apple_clpc_hw apple_clpc_hw_t6050 = {
 	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
@@ -1692,6 +1711,7 @@ static const struct apple_clpc_hw apple_clpc_hw_t6050 = {
 	.gpu = { [APPLE_CLPC_DCS] = 6, [APPLE_CLPC_SOC] = 3 },
 	.sustain = 3,
 	.gpu_input = true,
+	.idle_on_time = true,
 };
 
 static const struct of_device_id apple_clpc_of_match[] = {

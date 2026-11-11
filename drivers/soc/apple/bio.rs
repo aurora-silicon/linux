@@ -259,6 +259,26 @@ pub(crate) struct Rearm {
     pub(crate) secret: [u8; REARM_SECRET_MAX],
 }
 
+impl Drop for Rearm {
+    fn drop(&mut self) {
+        crate::image::wipe(&mut self.secret);
+    }
+}
+
+/// Copies in and checks a `REARM` request: the password it carries, in a
+/// buffer that wipes itself, and nothing left behind on the stack or in the
+/// request, whatever is refused.
+pub(crate) fn read_rearm(arg: usize) -> Result<crate::Secret> {
+    let request = crate::key::read_user_boxed::<Rearm>(UserPtr::from_addr(arg))?;
+    let len = request.secret_len as usize;
+    if request.reserved != 0 || len == 0 || len > request.secret.len() {
+        return Err(EINVAL);
+    }
+    let mut bytes = KVec::with_capacity(len, GFP_KERNEL)?;
+    bytes.extend_from_slice(&request.secret[..len], GFP_KERNEL)?;
+    Ok(crate::Secret(bytes))
+}
+
 // Sizes are baked into the ioctl numbers.
 static_assert!(core::mem::size_of::<Identity>() == 144);
 static_assert!(core::mem::size_of::<Info>() == 32);
@@ -1233,7 +1253,7 @@ fn delete(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
         .read()?;
 
     if !ctx.index.contains(&request.uuid) {
-        pr_info!(
+        pr_info_ratelimited!(
             "sep_bio: DELETE of an identity not held; reporting success (nothing to delete)\n"
         );
         return ok();
@@ -1241,7 +1261,7 @@ fn delete(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
 
     // `0x57` takes one `identity_v1_t` (signed user id + 16-byte UUID).
     let Some(identity) = ctx.index.identity_v1_for(&request.uuid, ENROL_USER_ID) else {
-        pr_warn!("sep_bio: DELETE of a held identity could not be expressed as an identity_v1_t\n");
+        pr_warn_ratelimited!("sep_bio: DELETE of a held identity could not be expressed as an identity_v1_t\n");
         return Err(ENOENT);
     };
 
@@ -1262,14 +1282,14 @@ fn delete_all(ctx: &mut Context<'_>) -> Result<Handled> {
     }
 
     if ctx.index.total() == 0 {
-        pr_info!("sep_bio: DELETE_ALL on empty index; reporting success (nothing to delete)\n");
+        pr_info_ratelimited!("sep_bio: DELETE_ALL on empty index; reporting success (nothing to delete)\n");
         return ok();
     }
 
     let mut ids = KVec::new();
     for entry in ctx.index.entries.iter() {
         let Some(identity) = ctx.index.identity_v1_for(&entry.uuid, ENROL_USER_ID) else {
-            pr_warn!(
+            pr_warn_ratelimited!(
                 "sep_bio: DELETE_ALL of a held identity could not be expressed as an identity_v1_t\n"
             );
             return Err(ENOENT);
@@ -1298,4 +1318,74 @@ pub(crate) fn open(session: &mut Session) -> Result<()> {
 
 pub(crate) fn release(session: &mut Session) {
     session.reset();
+}
+
+/// KUnit hooks for `sep_ioctl_test.c`: a `/dev/sep-bio` session driven
+/// through [`ioctl`] from real user memory, with no sensor or enclave.
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+pub(crate) struct KunitBio {
+    session: Session,
+    index: IdentityIndex,
+}
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[no_mangle]
+pub extern "C" fn sep_kunit_bio_new() -> *mut c_void {
+    match KBox::new(KunitBio { session: Session::new(), index: IdentityIndex::new() }, GFP_KERNEL) {
+        Ok(b) => KBox::into_raw(b).cast(),
+        Err(_) => core::ptr::null_mut(),
+    }
+}
+
+/// # Safety
+/// `bio` comes from [`sep_kunit_bio_new`] and is not yet freed.
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[no_mangle]
+pub unsafe extern "C" fn sep_kunit_bio_ioctl(bio: *mut c_void, cmd: c_uint, arg: c_ulong) -> c_long {
+    // SAFETY: per the contract above.
+    let bio = unsafe { &mut *bio.cast::<KunitBio>() };
+    let mut ctx = Context {
+        session: &mut bio.session,
+        index: &bio.index,
+        sensor_present: true,
+        live_identity_count: Some(0),
+    };
+    match ioctl(&mut ctx, cmd, arg as usize) {
+        Ok(h) => h.ret as c_long,
+        Err(e) => e.to_errno() as c_long,
+    }
+}
+
+/// The capture worker a started enrolment or verify would run has stopped.
+///
+/// # Safety
+/// As for [`sep_kunit_bio_ioctl`].
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[no_mangle]
+pub unsafe extern "C" fn sep_kunit_bio_worker_stopped(bio: *mut c_void) {
+    // SAFETY: per the contract above.
+    let bio = unsafe { &mut *bio.cast::<KunitBio>() };
+    if let Some(epoch) = bio.session.worker_epoch {
+        worker_stopped(&mut bio.session, epoch);
+    }
+}
+
+/// # Safety
+/// As for [`sep_kunit_bio_ioctl`]; `bio` is not used again.
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[no_mangle]
+pub unsafe extern "C" fn sep_kunit_bio_free(bio: *mut c_void) {
+    if !bio.is_null() {
+        // SAFETY: per the contract above, `bio` came from `KBox::into_raw`.
+        drop(unsafe { KBox::from_raw(bio.cast::<KunitBio>()) });
+    }
+}
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[no_mangle]
+pub extern "C" fn sep_kunit_rearm_read(arg: c_ulong) -> c_int {
+    match read_rearm(arg as usize) {
+        Ok(_) => 0,
+        Err(e) => e.to_errno(),
+    }
 }

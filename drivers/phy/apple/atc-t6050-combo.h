@@ -122,6 +122,8 @@ static int combo_stop(struct t6050_dp *dp)
 	lockdep_assert_held(&dp->lock);
 	if (dp->faulted)
 		return -EIO;
+	/* No tunnel clock outlives USB4 mode. */
+	atc_dp_tunnels_stop(dp);
 	if (dp->controller_active || dp->pipe_active)
 		return -EBUSY;
 	ret = combo_quiesce(dp);
@@ -180,8 +182,10 @@ static int combo_start(struct t6050_dp *dp, enum combo_mode mode)
 		ret = dp->reverse ?
 			APPLE_T6050_USB_RUN(&dp->usb_platform, apple_t6050_cio_init_reverse) :
 			APPLE_T6050_USB_RUN(&dp->usb_platform, apple_t6050_cio_init_normal);
-		if (!ret)
+		if (!ret) {
 			dp->cio_prepared = true;
+			atc_dp_tunnels_park(dp);
+		}
 		dev_info(dp->dev, "CIO mode %s (%d), %s orientation, %lld ms\n",
 			 ret ? "failed" : "up: UC_TNBL_DONE", ret,
 			 dp->reverse ? "reverse" : "normal",

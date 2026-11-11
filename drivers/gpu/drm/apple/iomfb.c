@@ -999,6 +999,34 @@ void dcp_push(struct apple_dcp *dcp, bool oob,
 			 in_len, out_len, data, cb, cookie);
 }
 
+/*
+ * Push one command on the independent OOB command stream while a transaction
+ * on the command stream is still pending (dcp_push() would queue it behind
+ * that transaction). For queries the firmware serves concurrently, such as a
+ * paired modeset's DSC handoff while the primary's A413 waits for its peer.
+ */
+int dcp_push_oob_concurrent(struct apple_dcp *dcp, const struct dcp_method_entry *call,
+			    u32 in_len, u32 out_len, void *data, dcp_callback_t cb,
+			    void *cookie)
+{
+	int ret = 0;
+
+	mutex_lock(&dcp->iomfb.lock);
+	if (READ_ONCE(dcp->crashed) || dcp->iomfb.stopped) {
+		ret = -ESHUTDOWN;
+	} else if (dcp->ch_oobcmd.depth || dcp->ch_oobcb.depth || dcp->ch_oobasync.depth ||
+		   READ_ONCE(dcp->iomfb.owner)) {
+		ret = -EBUSY;
+	} else {
+		WRITE_ONCE(dcp->iomfb.owner, current);
+		dcp_push_context(dcp, dcp_call_context(dcp, true), call,
+				 in_len, out_len, data, cb, cookie);
+		WRITE_ONCE(dcp->iomfb.owner, NULL);
+	}
+	mutex_unlock(&dcp->iomfb.lock);
+	return ret;
+}
+
 /* A nested query must return on the firmware-initiated stream it answers. */
 int dcp_push_nested(struct apple_dcp *dcp, enum dcp_context_id origin,
 		    const struct dcp_method_entry *call, u32 in_len, u32 out_len,
@@ -2313,9 +2341,19 @@ int dcp_get_modes(struct drm_connector *connector)
 			 */
 			if (PTR_ERR(edid) == -ENODEV)
 				dev_dbg(dcp->dev, "no EDID source\n");
+			/*
+			 * After resume the firmware publishes the AV service
+			 * before its link to the sink is back, and answers a
+			 * read then without data; probe again once it has read
+			 * the sink.
+			 */
+			else if (PTR_ERR(edid) == -ENODATA &&
+				 dcpavserv_edid_retry(dcp, service_epoch))
+				dev_dbg(dcp->dev, "sink EDID not read yet, probing again\n");
 			else
 				dev_warn(dcp->dev, "copy_edid failed: %pe\n", edid);
 		} else {
+			dcpavserv_edid_retry_reset(dcp);
 			drm_edid_free(apple_connector->drm_edid);
 			apple_connector->drm_edid = edid;
 			apple_connector->drm_edid_generation = edid_generation;
@@ -3283,13 +3321,21 @@ bool iomfb_apply_backlight_h17p(struct apple_dcp *dcp,
 					    dcp->brightness.maximum, false);
 		return true;
 	}
-	if (!transaction || !dcp->brightness.maximum)
+	if (!transaction || !dcp->brightness.maximum) {
+		/* The caller drops this present ("swap failed"): say why. */
+		dev_warn_ratelimited(dcp->dev,
+				     "present dropped: transaction %d brightness maximum %u\n",
+				     !!transaction, dcp->brightness.maximum);
 		return false;
+	}
 	for (i = 0; i < SWAP_SURFACES; i++)
 		have_surface |= !request->surf_null[i];
 	ret = dcp_backlight_prepare(dcp, have_surface, &present);
-	if (ret && ret != -EALREADY)
+	if (ret && ret != -EALREADY) {
+		dev_warn_ratelimited(dcp->dev,
+				     "present dropped: backlight prepare %d\n", ret);
 		return false;
+	}
 	if (!ret) {
 		transaction->backlight = present;
 		transaction->backlight_reserved = true;

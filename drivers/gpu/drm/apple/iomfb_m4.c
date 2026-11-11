@@ -57,6 +57,7 @@
 #include "dcp-m4-callback.h"
 #include "dcp-m4-property.h"
 #include "dcp-m4-frame.h"
+#include "dcp-refresh.h"
 #include "parser.h"
 #include "t8132_ext_drm.h"
 
@@ -2212,6 +2213,17 @@ static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
 					    keep, brightness_change, nits, check, width, height);
 	if (!ret && intent)
 		dcp_m4_swap_set_intent(input, intent, surface_id);
+	/*
+	 * A present on a 120 Hz panel carries the deadline, or the DCP completes
+	 * it only at the second vblank. Not on a retargeted (registering) swap.
+	 */
+	if (!ret && !ext && !intent) {
+		bool promo = dcp_refresh_is_promotion(r->timing.refresh_16_16);
+		bool shown = (primary && frame) || upper;
+		u64 deadline = dcp_desktop_present_deadline(shown, promo);
+
+		dcp_m4_swap_set_deadline(input, deadline);
+	}
 	if (!ret)
 		ret = dcp_m4_runtime_call(r, 407, false, input, DCP_M4_SWAP_SIZE,
 					 submitted, sizeof(submitted));

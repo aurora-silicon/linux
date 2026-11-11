@@ -1431,6 +1431,8 @@ static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 	int dst_len, ret, tlb_len;
 
 	avd_run_preamble(ctx, &run->base);
+	if (run->base.setup_err)
+		return run->base.setup_err;
 
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_AV1_SEQUENCE);
 	if (WARN_ON(!ctrl))
