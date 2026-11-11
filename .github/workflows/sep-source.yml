@@ -66,7 +66,13 @@ jobs:
           fetch-depth: 1
       - name: Install kernel build dependencies
         run: |
-          sudo apt-get update
+          # Avoid the hosted runner's Azure mirror after repeated DNS failures.
+          # Keep signed Ubuntu archive/security suites and fail on update errors.
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' 'https://security.ubuntu.com/ubuntu/' | \
+              sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          fi
+          sudo apt-get update -o APT::Update::Error-Mode=any
           sudo apt-get install -y clang lld llvm libclang-dev libelf-dev libssl-dev \
             flex bison bc pkg-config make perl
           rustup component add rust-src
@@ -97,7 +103,13 @@ jobs:
           fetch-depth: 1
       - name: Install kernel build and QEMU dependencies
         run: |
-          sudo apt-get update
+          # Avoid the hosted runner's Azure mirror after repeated DNS failures.
+          # Keep signed Ubuntu archive/security suites and fail on update errors.
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' 'https://security.ubuntu.com/ubuntu/' | \
+              sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          fi
+          sudo apt-get update -o APT::Update::Error-Mode=any
           sudo apt-get install -y clang lld llvm libclang-dev libelf-dev libssl-dev \
             flex bison bc pkg-config make perl qemu-system-arm
           rustup component add rust-src
