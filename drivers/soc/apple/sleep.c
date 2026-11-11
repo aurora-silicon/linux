@@ -80,12 +80,12 @@ struct aura_s2r_mailbox {
 /* PS word */
 #define PS_AUTO_ENABLE		BIT(28)
 #define PS_UNLATCH		BIT(12)
-#define PS_BUSY_SETTLE_US	1000
 #define PS_DEV_DISABLE		BIT(10)
 #define PS_FLAGS		GENMASK(9, 8)
 #define PS_ACTUAL		GENMASK(7, 4)
 #define PS_TARGET		GENMASK(3, 0)
 #define PS_OFF_TIMEOUT_US	5000
+#define PS_BUSY_SETTLE_US	1000
 
 /* CPU start block, as aura's smp_start_cpu() uses it */
 #define CPU_START_STOP		0x0

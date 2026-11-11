@@ -34,6 +34,11 @@ int apple_sleep_coproc_register(struct device *dev, void __iomem *asc, bool pcie
 int apple_sleep_coproc_register_first(struct device *dev, int (*last_stop)(void *data),
 				      void *data);
 void apple_sleep_coproc_unregister(struct device *dev);
+
+/*
+ * During a suspend: a driver left something the DRAM-kept wake would stall on, so this
+ * sleep takes the deep path. False if no sleep driver can do that.
+ */
 bool apple_sleep_request_deep_once(void);
 
 /*
