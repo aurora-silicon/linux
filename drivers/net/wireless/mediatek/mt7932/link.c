@@ -86,6 +86,12 @@ void mt_rf_fail_locked(struct mt7932 *m, int error)
 		spin_lock(&m->data_lock);
 	netif_carrier_off(m->netdev);
 	netif_stop_queue(m->netdev);
+#if IS_ENABLED(CONFIG_MT7932_AWDL)
+	if (m->awdl.netdev) {
+		netif_carrier_off(m->awdl.netdev);
+		netif_stop_queue(m->awdl.netdev);
+	}
+#endif
 	if (data_ready)
 		spin_unlock(&m->data_lock);
 	if (m->connecting) {
@@ -115,21 +121,39 @@ void mt_rf_fail_locked(struct mt7932 *m, int error)
 	}
 }
 
-/* One owned station and firmware handshake; no host key fabrication. */
+/*
+ * One owned station and firmware handshake; no host key fabrication.
+ *
+ * The infrastructure connection takes its station and WTBL indices from one
+ * index space, as it did before AWDL, so none of its WTBL entries reuses one
+ * of its station indices; the firmware refuses such a connect with -EINVAL.
+ * Each index is still recorded in its own allocator, so AWDL peers keep
+ * their per-table release.
+ */
 static int mt_peer_reserve(struct mt7932 *m)
 {
-	u8 *ids = (u8 *)&m->peer_ids;
-	unsigned long allocation = m->peer_alloc;
+	unsigned long station = m->station_alloc, wtbl = m->wtbl_alloc;
+	unsigned long used = station | wtbl;
 	unsigned int i, id;
 
-	for (i = 0; i < 6; i++) {
-		id = find_first_zero_bit(&allocation, i < 2 ? 15 : 14);
-		if (id >= (i < 2 ? 15 : 14))
+	for (i = 0; i < ARRAY_SIZE(m->peer_ids.station); i++) {
+		id = find_first_zero_bit(&used, 15);
+		if (id >= 15)
 			return -ENOSPC;
-		__set_bit(id, &allocation);
-		ids[i] = id;
+		__set_bit(id, &used);
+		__set_bit(id, &station);
+		m->peer_ids.station[i] = id;
 	}
-	m->peer_alloc = allocation;
+	for (i = 0; i < ARRAY_SIZE(m->peer_ids.wtbl); i++) {
+		id = find_first_zero_bit(&used, 14);
+		if (id >= 14)
+			return -ENOSPC;
+		__set_bit(id, &used);
+		__set_bit(id, &wtbl);
+		m->peer_ids.wtbl[i] = id;
+	}
+	m->station_alloc = station;
+	m->wtbl_alloc = wtbl;
 	return 0;
 }
 
@@ -305,11 +329,12 @@ static int mt_association_calibration(struct mt7932 *m)
 /* command_mutex and response_lock held; all old DMA/readers already retired. */
 static void mt_peer_release(struct mt7932 *m)
 {
-	const u8 *ids = (const u8 *)&m->peer_ids;
 	unsigned int i;
 
-	for (i = 0; i < sizeof(m->peer_ids); i++)
-		__clear_bit(ids[i], &m->peer_alloc);
+	for (i = 0; i < ARRAY_SIZE(m->peer_ids.station); i++)
+		__clear_bit(m->peer_ids.station[i], &m->station_alloc);
+	for (i = 0; i < ARRAY_SIZE(m->peer_ids.wtbl); i++)
+		__clear_bit(m->peer_ids.wtbl[i], &m->wtbl_alloc);
 	memset(&m->peer_ids, 0, sizeof(m->peer_ids));
 	memset(m->duplicates, 0, sizeof(m->duplicates));
 	memzero_explicit(m->connect_pmk, sizeof(m->connect_pmk));

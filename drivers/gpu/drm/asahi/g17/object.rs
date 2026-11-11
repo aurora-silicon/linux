@@ -75,9 +75,13 @@ impl KernelObject {
         prot: mmu::Prot,
         cpu: CpuMap,
     ) -> Result<Self> {
-        let mut this = Self::backing(dev, size, cpu)?;
+        Self::backing(dev, size, cpu)?.placed(vm, placement, prot)
+    }
+
+    /// Maps fresh backing into `vm`.
+    fn placed(mut self, vm: &mmu::Vm, placement: Placement, prot: mmu::Prot) -> Result<Self> {
         let mapping = match placement {
-            Placement::At(addr) => this.obj.map_at(vm, addr, prot, false)?,
+            Placement::At(addr) => self.obj.map_at(vm, addr, prot, false)?,
             Placement::In(range, align) => {
                 let site = if range.start >= crate::hw::t8140::dynamic::LOWER.start
                     && range.end <= crate::hw::t8140::dynamic::LOWER.end {
@@ -85,21 +89,24 @@ impl KernelObject {
                 } else {
                     super::capacity::Site::UpperVa
                 };
-                this.obj.map_into_range(vm, range, align, prot, true).map_err(|error| {
+                self.obj.map_into_range(vm, range, align, prot, true).map_err(|error| {
                     if error == ENOSPC { super::capacity::refused(site) } else { error }
                 })?
             }
         };
-        this.mapping = Some(mapping);
-        Ok(this)
+        self.mapping = Some(mapping);
+        Ok(self)
     }
 
     /// Allocates CPU-accessible backing whose GPU mappings will be installed later.
     pub(crate) fn backing(dev: &AsahiDrmDevice, size: usize, cpu: CpuMap) -> Result<Self> {
-        let mut obj = match cpu {
+        Self::with_object(match cpu {
             CpuMap::WriteBack => gem::new_kernel_object(dev, size)?,
             CpuMap::WriteCombined => gem::new_kernel_object_wc(dev, size)?,
-        };
+        }, size)
+    }
+
+    fn with_object(mut obj: gem::ObjectRef, size: usize) -> Result<Self> {
         let vmap = obj.vmap()?;
         let ptr = NonNull::new(vmap.addr.cast::<u8>()).ok_or(ENOMEM)?;
         // SAFETY: The mapping covers the whole object.
@@ -229,6 +236,13 @@ impl KernelObject {
         self.mapping.take().ok_or(EINVAL)
     }
 
+    /// Publishes the page-table updates of the object's own mapping to every context naming its
+    /// VM's root (see [`mmu::KernelMapping::publish_to_contexts`]).
+    pub(crate) fn publish_to_contexts(&self) -> Result {
+        self.mapping.as_ref().ok_or(EINVAL)?.publish_to_contexts();
+        Ok(())
+    }
+
     /// Returns the GPU address of the object.
     pub(crate) fn gpu_va(&self) -> u64 {
         self.mapping.as_ref().map_or(0, |mapping| mapping.iova())
@@ -314,6 +328,17 @@ impl KernelObject {
     pub(crate) fn read_words<const N: usize>(&self, offset: usize) -> Result<[u32; N]> {
         let base = self.aligned::<[u32; N]>(offset)?.cast::<u32>();
         let mut words = [0u32; N];
+        // Most views are uncached: where the copy is 8-byte aligned, load two words at a time.
+        if N % 2 == 0 && base as usize % 8 == 0 {
+            let pairs = base.cast::<u64>();
+            for (i, pair) in words.chunks_exact_mut(2).enumerate() {
+                // SAFETY: As below; the 8-byte loads cover the same aligned `N` words.
+                let bytes = unsafe { pairs.add(i).read_volatile() }.to_ne_bytes();
+                pair[0] = u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                pair[1] = u32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            }
+            return Ok(words);
+        }
         for (i, word) in words.iter_mut().enumerate() {
             // SAFETY: `aligned()` checked that all `N` words are within the object and aligned.
             *word = unsafe { base.add(i).read_volatile() };
@@ -338,8 +363,7 @@ impl Allocator<'_> {
         prot: mmu::Prot,
         cpu: CpuMap,
     ) -> Result<KernelObject> {
-        let mut range = self.uat.geometry().kernel_range();
-        range.start += crate::hw::t8140::dynamic::KERNEL_OFFSET;
+        let range = self.uat.kernel_dynamic_range();
         KernelObject::new(
             self.dev,
             self.uat.kernel_vm(),
@@ -362,11 +386,27 @@ impl Allocator<'_> {
         KernelObject::new(
             self.dev,
             self.uat.kernel_lower_vm(),
-            Placement::In(crate::hw::t8140::dynamic::LOWER, align),
+            Placement::In(self.uat.kernel_lower_dynamic_range(), align),
             size,
             prot,
             cpu,
         )
+    }
+
+    /// [`Self::lower`] write-combined backing that is not counted as kernel memory: the
+    /// caller charges it to a client ([`crate::memacct::Charge::user`]).
+    pub(crate) fn lower_user_charged(
+        &self,
+        size: usize,
+        align: u64,
+        prot: mmu::Prot,
+    ) -> Result<KernelObject> {
+        KernelObject::with_object(gem::new_kernel_object_wc_user_charged(self.dev, size)?, size)?
+            .placed(
+                self.uat.kernel_lower_vm(),
+                Placement::In(self.uat.kernel_lower_dynamic_range(), align),
+                prot,
+            )
     }
 
     /// Place fresh backing at one address in the canonical and both alias VMs.
@@ -448,9 +488,11 @@ pub(crate) enum Family {
     WorkState = 1,
     QueueState = 2,
     QueueConfig = 3,
+    /// An M5 context's scheduler page, whose mapping the M5 firmware caches.
+    Scheduler = 4,
 }
 
-const POOL_FAMILIES: usize = 4;
+const POOL_FAMILIES: usize = 5;
 const POOL_SLOTS: usize = 64;
 const POOL_BYTES: usize = 128 * 1024 * 1024;
 

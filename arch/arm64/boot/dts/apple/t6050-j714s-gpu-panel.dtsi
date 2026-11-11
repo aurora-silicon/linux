@@ -1,0 +1,196 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J714s internal panel, external display engines and GPU (G17S), for the boot
+ * loader's display and GPU handoff. Everything here stays disabled: the loader
+ * checks the ADT and the live DCP, DART and GPU firmware state, publishes the
+ * DCP's firmware properties and fills the GPU reservations, and only then
+ * enables the nodes, the GPU last. A loader without the handoff, or one whose
+ * checks fail, leaves the boot framebuffer to simpledrm and the GPU off.
+ *
+ * Values are from the J714sAP 27.0 ADT (dcp, dart-dcp, dart-disp0, dcpext*,
+ * dart-dcpext*, dart-dispext*, sgx, gfx-asc, gfx1-asc, pmgr) and the GPU
+ * firmware's own boot arguments (dArW, the two ASC wrappers).
+ */
+
+/ {
+	aliases {
+		/* The loader writes apple,notch-height into the "dcp" alias */
+		dcp = &dcp;
+		disp0 = &display;
+		/* The loader finds the GPU through this alias */
+		gpu = &sgx;
+	};
+
+	/* As on t6050-ultra.dtsi, with the internal display's DART (disp0, SID 0) */
+	display: display-subsystem {
+		compatible = "apple,display-subsystem";
+		iommus = <&disp0_dart 0>;
+		status = "disabled";
+	};
+
+	reserved-memory {
+		/* Filled and enabled by the loader from the ADT */
+		gpu_fw_text: gpu-fw-text {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		gpu_fw_data: gpu-fw-data {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		uat_ttbs: uat-ttbs {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		uat_pagetables: uat-pagetables {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		uat_l2_pagetables: uat-l2-pagetables {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		uat_handoff: uat-handoff {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+	};
+};
+
+/* ADT dart-dcp and dart-disp0: vm-base 1 TiB, vm-size 3 TiB */
+&dcp_dart {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+&disp0_dart {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+&dcp {
+	/*
+	 * The 14.2-inch 3024x1964 mini-LED panel of J314/J414/J514. The OS takes
+	 * the dimensions from the ADT when it has them; this J714s ADT does not.
+	 */
+	panel {
+		compatible = "apple,panel-j714", "apple,panel-mini-led", "apple,panel";
+		width-mm = <302>;
+		height-mm = <196>;
+		adj-height-mm = <189>;
+	};
+};
+
+/*
+ * The four external display engines (dcpext0..3): the loader hands each over
+ * when its checks pass, else leaves it disabled. t6050-j714s-display.dtsi
+ * describes their routes.
+ */
+
+/* The ADT lists no clocks for the external engines (clock-ids = []) */
+&dcpext1 {
+	apple,clock-ids;
+};
+
+&dcpext2 {
+	apple,clock-ids;
+};
+
+&dcpext3 {
+	apple,clock-ids;
+};
+
+/* ADT dart-dcpextN and dart-dispextN: vm-base 1 TiB, vm-size 3 TiB, as dcpext0's */
+&dcpext1_dart {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+&dispext1_dart {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+&dcpext2_dart {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+&dispext2_dart {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+&dcpext3_dart {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+&dispext3_dart {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+/* The inventory ASC nodes; the mailboxes below describe the same windows. */
+/delete-node/ &gfx_asc;
+/delete-node/ &gfx1_asc;
+
+&{/soc} {
+	/*
+	 * ADT gfx-asc and gfx1-asc at their physical windows: the wrapper, the
+	 * 8-byte iop-vbar, and their second and third interrupts (send-empty,
+	 * recv-not-empty), as T8140/T8142.
+	 */
+	gfx_mbox: mailbox@2302600000 {
+		compatible = "apple,t6050-j775d-ascwrap-v6";
+		reg = <0x23 0x2600000 0x0 0x88000>,
+		      <0x23 0x2050000 0x0 0x8>;
+		reg-names = "wrapper", "iop-vbar";
+		interrupts = <AIC_IRQ 0 2797 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 2800 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "recv-not-empty";
+		apple,firmware-role = "GFX";
+		power-domains = <&ps_gfx>;
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	gfx1_mbox: mailbox@2302e00000 {
+		compatible = "apple,t6050-j775d-ascwrap-v6";
+		reg = <0x23 0x2e00000 0x0 0x88000>,
+		      <0x23 0x2850000 0x0 0x8>;
+		reg-names = "wrapper", "iop-vbar";
+		interrupts = <AIC_IRQ 0 2801 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 2804 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "recv-not-empty";
+		apple,firmware-role = "GFX1";
+		power-domains = <&ps_gfx>;
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+};
+
+/* The ADT marks GPX and AFR, GFX's parents, critical. */
+&ps_gpx {
+	apple,always-on;
+};
+
+&ps_afr {
+	apple,always-on;
+};
+
+&sgx {
+	compatible = "apple,agx-g17s";
+	/* ADT sgx reg[0]; the driver maps the first 16 MiB as "sgx" */
+	reg = <0x23 0x0 0x0 0x3fdc000>;
+	reg-names = "sgx";
+	/delete-property/ interrupts;
+	mboxes = <&gfx_mbox>, <&gfx1_mbox>;
+	memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>,
+			<&gpu_fw_data>, <&uat_l2_pagetables>, <&gpu_fw_text>;
+	memory-region-names = "ttbs", "pagetables", "handoff", "fw-data",
+			      "l2-pagetables", "fw-text";
+};

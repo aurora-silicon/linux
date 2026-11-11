@@ -30,6 +30,15 @@ extern "C" {
         sepos13: bool,
         xart: bool,
     ) -> c_int;
+    fn sep_diag_set_policy(
+        provision_keybag: bool,
+        trusted_keys: bool,
+        filevault_api: bool,
+        xarm_trace: bool,
+        refkey_v2: bool,
+        identity_override: bool,
+    );
+    fn sep_diag_set_identity_source(source: c_uint);
     fn sep_diag_set_attach(attached: bool);
     fn sep_diag_set_endpoints(count: c_uint);
     fn sep_diag_set_keystore_open();
@@ -45,6 +54,12 @@ extern "C" {
     fn sep_diag_set_xart_guard(level: c_uint, list_loaded: bool, matching: c_int);
     fn sep_diag_xart_guard_refused(matching: c_int);
     fn sep_diag_bringup_ended();
+    fn sep_diag_set_endpoint(id: u8, name: u32);
+    fn sep_diag_set_os_identity(source: c_int);
+    fn sep_diag_set_hwrng(registered: bool);
+    fn sep_diag_xarm_failed() -> c_uint;
+    fn sep_diag_unhandled() -> c_uint;
+    fn sep_diag_log_summary(dev: *mut c_void);
 }
 
 /// The identity keybag, as `SEP_DIAG_KEYBAG_*` in `shim.h` spells it.
@@ -53,6 +68,18 @@ pub(crate) enum Keybag {
     Present = 1,
     Missing = 2,
     Failed = 3,
+}
+
+/// Where the OS identity the driver answers xART's GET_OS_UUID with came from,
+/// as `SEP_DIAG_OS_IDENTITY_*` in `shim.h` spells it.
+#[derive(Clone, Copy)]
+pub(crate) enum OsIdentity {
+    /// The `os_uuid_hi`/`os_uuid_lo` parameters.
+    Explicit = 1,
+    /// `/chosen/apfs-preboot-uuid`.
+    Chosen = 2,
+    /// Neither: GET_OS_UUID is answered "unavailable".
+    Unavailable = 3,
 }
 
 /// The enrolled fingerprints at attach, as `SEP_DIAG_RESTORE_*` in `shim.h`
@@ -68,6 +95,28 @@ pub(crate) enum Restore {
     Unproven = 3,
 }
 
+/// Boot-time policy, without identity values or key material.
+pub(crate) struct Policy {
+    pub provision_keybag: bool,
+    pub trusted_keys: bool,
+    pub filevault_api: bool,
+    pub xarm_trace: bool,
+    pub refkey_v2: bool,
+    pub identity_override: bool,
+}
+
+/// The source selected by prepare_os_uuid, not the UUID itself.
+pub(crate) enum IdentitySource {
+    DeviceTree = 1,
+    Override = 2,
+    Missing = 3,
+}
+
+pub(crate) fn identity_source(source: IdentitySource) {
+    // SAFETY: this only stores the source enum in the passive cache.
+    unsafe { sep_diag_set_identity_source(source as c_uint) };
+}
+
 /// Adds the `diag` group to the SEP device, with the facts fixed at probe. The
 /// group goes away when the driver unbinds.
 ///
@@ -78,6 +127,7 @@ pub(crate) fn register(
     profile: &profile::PlatformProfile,
     xart_writable: bool,
     guard: Option<(u8, bool)>,
+    policy: Policy,
 ) -> Result {
     // Exhaustive, so a new bootstrap or key store fails to build here until
     // the ABI has a value for it.
@@ -98,6 +148,18 @@ pub(crate) fn register(
     REFUSALS.store(0, Relaxed);
     // SAFETY: no preconditions; stores three words.
     unsafe { sep_diag_set_xart_guard(c_uint::from(level), list_loaded, matching() as c_int) };
+
+    // SAFETY: the facts are fixed before the attribute group is published.
+    unsafe {
+        sep_diag_set_policy(
+            policy.provision_keybag,
+            policy.trusted_keys,
+            policy.filevault_api,
+            policy.xarm_trace,
+            policy.refkey_v2,
+            policy.identity_override,
+        )
+    };
 
     // SAFETY: `dev` is bound for the duration of the call, which is what devres
     // needs. `profile.name` is a `str`, valid for reads of `profile.name.len()`
@@ -228,4 +290,44 @@ pub(crate) fn xart_guard_refused() {
 pub(crate) fn bringup_ended() {
     // SAFETY: no preconditions; updates two words.
     unsafe { sep_diag_bringup_ended() };
+}
+
+/// An endpoint the SEP advertised, with the four-character name its
+/// descriptor carries in the upper half of `msg0`.
+pub(crate) fn endpoint(id: u8, name: u32) {
+    // SAFETY: no preconditions; stores one word and sets one bit.
+    unsafe { sep_diag_set_endpoint(id, name) };
+}
+
+pub(crate) fn os_identity(source: OsIdentity) {
+    // SAFETY: no preconditions; stores one word.
+    unsafe { sep_diag_set_os_identity(source as c_int) };
+}
+
+/// The hwrng survey registered the enclave's entropy source, or gave up.
+pub(crate) fn hwrng(registered: bool) {
+    // SAFETY: no preconditions; stores one word.
+    unsafe { sep_diag_set_hwrng(registered) };
+}
+
+/// The driver answered an xART request with the failure status. Returns how
+/// many it has answered so since probe, this one included.
+pub(crate) fn xarm_failed() -> u32 {
+    // SAFETY: no preconditions; updates one word.
+    unsafe { sep_diag_xarm_failed() }
+}
+
+/// A message arrived on an endpoint the driver has no handler for. Returns
+/// how many have, this one included.
+pub(crate) fn unhandled() -> u32 {
+    // SAFETY: no preconditions; updates one word.
+    unsafe { sep_diag_unhandled() }
+}
+
+/// Logs the one-line summary of the boot-time bring-up. Call it after
+/// [`bringup_ended`].
+pub(crate) fn log_summary(dev: &device::Device) {
+    // SAFETY: `dev` is the bound SEP device for the duration of the call; the
+    // shim only passes it to `dev_info()` and keeps no reference.
+    unsafe { sep_diag_log_summary(dev.as_raw().cast()) };
 }

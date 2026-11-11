@@ -22,8 +22,10 @@
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/seq_file.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/unaligned.h>
 #include <linux/vmalloc.h>
 
 #include "ave.h"
@@ -121,6 +123,52 @@ static int ave_fw_crc(const struct ave_fw_segment *seg, u32 *crc, void *copy)
 }
 
 /*
+ * The firmware build is identified by its image CRC. The loader links TEXT
+ * to DATA by writing the DATA address into one cell that is zero in the
+ * image, so hash TEXT with that cell as the image has it. Any other value
+ * in the cell means TEXT is not the build this variant expects.
+ */
+int ave_fw_text_id_crc(const void *text, size_t size, u32 cell_off,
+		       u64 data_iova, u32 *crc)
+{
+	static const u8 zero[sizeof(u64)];
+	u64 cell;
+
+	if (cell_off > size || size - cell_off < sizeof(zero))
+		return -EINVAL;
+	/*
+	 * The cell holds the firmware's own alias of DATA, which has the low
+	 * 32 bits of DATA's DART address.
+	 */
+	cell = get_unaligned_le64(text + cell_off);
+	if (cell && lower_32_bits(cell) != lower_32_bits(data_iova))
+		return -ENODEV;
+	*crc = crc32_le(~0U, text, cell_off);
+	*crc = crc32_le(*crc, zero, sizeof(zero));
+	*crc = crc32_le(*crc, text + cell_off + sizeof(zero),
+			size - cell_off - sizeof(zero));
+	*crc ^= ~0U;
+	return 0;
+}
+
+static int ave_fw_text_id(struct ave_dev *ave, u32 *crc)
+{
+	void *va;
+	int ret;
+
+	if (!ave->variant->text_link_cell)
+		return 0;
+	va = memremap(ave->text.phys, ave->text.size, MEMREMAP_WB);
+	if (!va)
+		return -ENOMEM;
+	ret = ave_fw_text_id_crc(va, ave->text.size,
+				 ave->variant->text_link_cell, ave->data.iova,
+				 crc);
+	memunmap(va);
+	return ret;
+}
+
+/*
  * Find the firmware, check that it is a build we speak to and that DATA is
  * still as the bootloader left it, and keep a copy of DATA for restarts.
  */
@@ -158,6 +206,18 @@ int ave_fw_probe(struct ave_dev *ave)
 			dev, -EIO,
 			"firmware is not mapped where it was loaded\n");
 
+	/*
+	 * TEXT starts the DART window: at address 0 on T6000, at the DART's
+	 * vm-base (0x800000000) on T8112, where iBoot points the code base.
+	 * DATA follows TEXT.
+	 */
+	if (ave->variant->text_link_cell &&
+	    (lower_32_bits(ave->text.iova) ||
+	     ave->data.iova != ave->text.iova + ave->text.size))
+		return dev_err_probe(dev, -EINVAL,
+				     "firmware must start its DART window (TEXT %#llx, DATA %#llx)\n",
+				     (u64)ave->text.iova, (u64)ave->data.iova);
+
 	ret = ave_fw_crc(&ave->text, &text_crc, NULL);
 	if (ret)
 		return ret;
@@ -165,6 +225,10 @@ int ave_fw_probe(struct ave_dev *ave)
 	if (ret || text_crc != want)
 		return dev_err_probe(dev, -ENODEV,
 				     "firmware text differs from loader CRC\n");
+	ret = ave_fw_text_id(ave, &text_crc);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "firmware text link cell is not the DATA address\n");
 	for (unsigned int i = 0; i < ARRAY_SIZE(ave_known_text_crc); i++)
 		known |= text_crc == ave_known_text_crc[i];
 	if (!known ||
@@ -217,7 +281,7 @@ static int ave_fw_restore_data(struct ave_dev *ave)
 {
 	void *va;
 
-	if (!ave->data_dirty)
+	if (!ave->data_dirty && !ave->variant->restore_data_first)
 		return 0;
 	va = memremap(ave->data.phys, ave->data.size, MEMREMAP_WC);
 	if (!va)
@@ -416,11 +480,23 @@ static int ave_fw_prepare_restart(struct ave_dev *ave)
 	if (ave->fw_state != AVE_FW_HALTED)
 		return 0;
 
-	if (readl(ave->coproc + ave->variant->regs->ctrl)) {
+	/*
+	 * Boot left CTRL running and BOOT_ARG set; only a power loss clears
+	 * both. Until then stopped sessions' memory stays, and so does the
+	 * coprocessor: retry once it suspends.
+	 */
+	dev_dbg(ave->dev, "restart: CTRL %#x BOOT_ARG %#x\n",
+		readl(ave->coproc + ave->variant->regs->ctrl),
+		readl(ave->coproc + ave->variant->regs->boot_arg));
+	if (readl(ave->coproc + ave->variant->regs->ctrl) ||
+	    (!ave->witness_unusable &&
+	     readl(ave->coproc + ave->variant->regs->boot_arg))) {
 		dev_dbg(ave->dev,
 			"coprocessor kept power after its halt; retry once it suspends\n");
 		return -EAGAIN;
 	}
+	/* The coprocessor and its engines were reset: stopped sessions' memory can go. */
+	ave_sess_reap(ave);
 	status = readl(ave->mbox + AVE_MBOX_STATUS);
 	if (status)
 		writel(status, ave->mbox + AVE_MBOX_STATUS);
@@ -429,10 +505,124 @@ static int ave_fw_prepare_restart(struct ave_dev *ave)
 	return 0;
 }
 
+/*
+ * Read-only audit of every stream of the encoder's DARTs (T8110 layout).
+ * The AVE DMA window (0x100_0000_4000..0x100_ffff_ffff) is numerically the
+ * first 4 GiB of DRAM, so a stream that bypasses the DART, or translates
+ * through tables that are not Linux's, turns our IOVAs into physical writes
+ * to memory Linux owns. Refuse to start the firmware if any stream does.
+ */
+#define AVE_DART_PARAMS4	0x0c
+#define AVE_DART_PROTECT	0x200
+#define AVE_DART_TCR(sid)	(0x1000 + 4 * (sid))
+#define AVE_DART_TTBR(sid)	(0x1400 + 4 * (sid))
+
+int ave_dart_audit(struct ave_dev *ave, const char *when)
+{
+	int ret = 0;
+
+	for (unsigned int d = 0; d < ave->n_darts; d++) {
+		void __iomem *r = ave->dart_regs[d];
+		u32 own = ave->dart_sid[d];
+		u32 own_ttbr = readl(r + AVE_DART_TTBR(own));
+		u32 sids = min_t(u32, readl(r + AVE_DART_PARAMS4) & 0x1ff, 256);
+		unsigned int live = 0, bad = 0, len = 0;
+		char line[160];
+
+		line[0] = 0;
+		for (u32 sid = 0; sid < sids; sid++) {
+			u32 tcr = readl(r + AVE_DART_TCR(sid));
+			u32 ttbr = readl(r + AVE_DART_TTBR(sid));
+			enum ave_dart_stream k = ave_dart_classify(tcr, ttbr, sid == own,
+								   own, own_ttbr);
+
+			if (k == AVE_DART_STREAM_OFF) {
+				if (sid < 32 && (ave->dart_sid_mask[d] & BIT(sid)))
+					dev_warn(ave->dev, "DART%u %s: attached stream %u is off\n",
+						 d, when, sid);
+				continue;
+			}
+			live++;
+			if (k == AVE_DART_STREAM_UNSAFE)
+				bad++;
+			if (len < sizeof(line) - 32)
+				len += scnprintf(line + len, sizeof(line) - len,
+						 " %u:%x/%x%s", sid, tcr, ttbr,
+						 k == AVE_DART_STREAM_UNSAFE ? "!" : "");
+		}
+		dev_info(ave->dev,
+			 "DART%u %s: lock %#x, %u streams, %u live, %u unsafe:%s\n",
+			 d, when, readl(r + AVE_DART_PROTECT), sids, live, bad, line);
+		if (bad) {
+			dev_err(ave->dev,
+				"DART%u has %u streams outside the encoder's domain; refusing to run the firmware\n",
+				d, bad);
+			ret = -EPERM;
+		}
+	}
+	return ret;
+}
+
+#define AVE_DART_PARAMS1	0x00
+#define AVE_DART_PARAMS2	0x04
+#define AVE_DART_PARAMS3	0x08
+#define AVE_DART_ERROR		0x100
+#define AVE_DART_ERROR_ADDR_LO	0x170
+#define AVE_DART_ERROR_ADDR_HI	0x174
+#define AVE_DART_PROTECT_LOCK	0x208
+#define AVE_DART_ENABLE		0xc00
+
+/*
+ * Raw, read-only register dump of the encoder's DARTs for debugfs: base,
+ * PARAMS1-4 (PARAMS2 bit 0 is bypass support), PROTECT and its lock, the
+ * error state, the stream-enable words, and TCR/TTBR of every stream that
+ * is not off, with the audit's verdict. Caller holds hw_lock and keeps the
+ * DARTs powered.
+ */
+void ave_dart_dump(struct ave_dev *ave, struct seq_file *m)
+{
+	seq_printf(m, "coprocessor ctrl %#x boot_arg %#x fw_state %d\n",
+		   readl(ave->coproc + ave->variant->regs->ctrl),
+		   readl(ave->coproc + ave->variant->regs->boot_arg), ave->fw_state);
+	for (unsigned int d = 0; d < ave->n_darts; d++) {
+		void __iomem *r = ave->dart_regs[d];
+		u32 own = ave->dart_sid[d];
+		u32 own_ttbr = readl(r + AVE_DART_TTBR(own));
+		u32 sids = min_t(u32, readl(r + AVE_DART_PARAMS4) & 0x1ff, 256);
+
+		seq_printf(m, "DART%u base %pa attached sid %u\n", d, &ave->dart_phys[d], own);
+		seq_printf(m, "  params %08x %08x %08x %08x (bypass support %u, %u sids)\n",
+			   readl(r + AVE_DART_PARAMS1), readl(r + AVE_DART_PARAMS2),
+			   readl(r + AVE_DART_PARAMS3), readl(r + AVE_DART_PARAMS4),
+			   readl(r + AVE_DART_PARAMS2) & 1, sids);
+		seq_printf(m, "  protect %08x lock %08x error %08x addr %08x%08x\n",
+			   readl(r + AVE_DART_PROTECT), readl(r + AVE_DART_PROTECT_LOCK),
+			   readl(r + AVE_DART_ERROR), readl(r + AVE_DART_ERROR_ADDR_HI),
+			   readl(r + AVE_DART_ERROR_ADDR_LO));
+		seq_puts(m, "  enable");
+		for (u32 w = 0; w < DIV_ROUND_UP(sids, 32); w++)
+			seq_printf(m, " %08x", readl(r + AVE_DART_ENABLE + 4 * w));
+		seq_puts(m, "\n");
+		for (u32 sid = 0; sid < sids; sid++) {
+			u32 tcr = readl(r + AVE_DART_TCR(sid));
+			u32 ttbr = readl(r + AVE_DART_TTBR(sid));
+			enum ave_dart_stream k = ave_dart_classify(tcr, ttbr, sid == own,
+								   own, own_ttbr);
+
+			if (k == AVE_DART_STREAM_OFF && !ttbr)
+				continue;
+			seq_printf(m, "  sid %3u tcr %08x ttbr %08x %s\n", sid, tcr, ttbr,
+				   k == AVE_DART_STREAM_OURS ? "ours" :
+				   k == AVE_DART_STREAM_UNSAFE ? "UNSAFE" : "off (ttbr set)");
+		}
+	}
+}
+
 /* Boot the coprocessor and bring up its command rings. Caller holds hw_lock. */
 static int ave_fw_boot(struct ave_dev *ave)
 {
 	const struct ave_fw_transport *t = ave->layout->abi->transport;
+	struct iommu_domain *domain;
 	__le32 *cfg, *log;
 	u32 status, hello[4];
 	int ret;
@@ -469,6 +659,16 @@ static int ave_fw_boot(struct ave_dev *ave)
 		return -EIO;
 	}
 
+	/* Clear the SVE idle word first: the codec clocks stay gated otherwise. */
+	if (ave->variant->mbox_idle) {
+		writel(0, ave->mbox + ave->variant->mbox_idle);
+		if (readl(ave->mbox + ave->variant->mbox_idle)) {
+			dev_err(ave->dev, "SVE idle word did not clear\n");
+			return -EIO;
+		}
+		wmb();
+	}
+
 	memset(ave->ring, 0, sizeof(ave->ring));
 	ave->unacked = 0;
 	memset(ave->want, 0, sizeof(ave->want));
@@ -478,6 +678,10 @@ static int ave_fw_boot(struct ave_dev *ave)
 	ret = ave_fw_restore_data(ave);
 	if (ret)
 		return ret;
+	/* Nothing from an earlier firmware lifetime may be read as ring state. */
+	memset(ave->ipc.cpu, 0, ave->ipc.alloc);
+	if (ave->heap.cpu)
+		memset(ave->heap.cpu, 0, ave->heap.alloc);
 
 	if (t->boot_config) {
 		cfg = ave->boot_cfg.cpu;
@@ -514,13 +718,15 @@ static int ave_fw_boot(struct ave_dev *ave)
 		       ave->mbox + AVE_MBOX_SCRATCH(2));
 	}
 	if (!t->boot_config) {
-		writeq(ave_fw_vcbar(ave->variant, ave->text.iova),
-		       ave->coproc + ave->variant->regs->vcbar);
-		if (readq(ave->coproc + ave->variant->regs->vcbar) !=
-		    ave_fw_vcbar(ave->variant, ave->text.iova))
-			return -EIO;
-		dev_dbg(ave->dev, "VCBAR %#llx boot argument %#x\n",
-			ave_fw_vcbar(ave->variant, ave->text.iova),
+		/*
+		 * The bootloader preloads the 6070 firmware and sets its code
+		 * base. Leave that register alone: any write to it, even of
+		 * the value it already holds, lets the core build its boot
+		 * page tables and then stop before the first device access,
+		 * so it never answers.
+		 */
+		dev_dbg(ave->dev, "code base %#llx (bootloader) boot argument %#x\n",
+			readq(ave->coproc + ave->variant->regs->vcbar),
 			ave->variant->boot_arg_value);
 	}
 
@@ -529,7 +735,16 @@ static int ave_fw_boot(struct ave_dev *ave)
 			return -ENODEV;
 		ave->module_pinned = true;
 	}
+	/* No AVE DART stream may bypass or translate outside our domain. */
+	ret = ave_dart_audit(ave, "before start");
+	if (ret)
+		return ret;
+	/* The coprocessor is in reset: drop every cached translation before it runs. */
+	domain = iommu_get_domain_for_dev(ave->dev);
+	if (domain)
+		iommu_flush_iotlb_all(domain);
 	ave->data_dirty = true;
+	ave->fw_ever_ran = true;
 	writel(1, ave->coproc + ave->variant->regs->keep_mappings);
 	writel(0, ave->coproc + ave->variant->regs->ctrl);
 	writel(ave->variant->boot_arg_value,
@@ -547,6 +762,28 @@ static int ave_fw_boot(struct ave_dev *ave)
 	for (unsigned int i = 0; i < 4; i++)
 		hello[i] = readl(ave->mbox + AVE_MBOX_SCRATCH(i));
 	dma_rmb();
+
+	/*
+	 * The reset witness: BOOT_ARG is nonzero while the coprocessor has
+	 * power (the firmware adds bit 10 to what boot wrote: 0x10000 reads
+	 * 0x10400) and zero after a power loss. A zero here proves nothing.
+	 */
+	status = readl(ave->coproc + ave->variant->regs->boot_arg);
+	dev_dbg(ave->dev, "BOOT_ARG after start %#x (wrote %#x)\n", status,
+		ave->variant->boot_arg_value);
+	if (t->boot_config && !ave_witness_armed(status) && !ave->witness_unusable) {
+		ave->witness_unusable = true;
+		dev_warn(ave->dev,
+			 "BOOT_ARG reads %#x after start: no reset proof, stopped sessions keep their memory\n",
+			 status);
+	}
+
+	/* The firmware may program its own DART streams: check again now. */
+	ret = ave_dart_audit(ave, "after start");
+	if (ret) {
+		ave_fw_mark_broken(ave, ret, "DART stream outside the domain");
+		return ret;
+	}
 
 	ret = ave_ipc_negotiate(ave, hello);
 	if (ret) {

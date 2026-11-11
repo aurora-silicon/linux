@@ -93,6 +93,12 @@ use kernel::{
 };
 
 const SETTLE_MS: time::Msecs = 200;
+/// Messages on an endpoint without a handler are logged this many times per
+/// boot; diag/unhandled_messages counts them all.
+const UNHANDLED_LOG_LIMIT: u32 = 4;
+/// Users whose last logged lock state is remembered (a Mac has the system
+/// user 501 and one or two Linux users).
+pub(crate) const LOCK_STATE_LOG_USERS: usize = 4;
 const FIRST_RESPONSE_MS: time::Msecs = 3000;
 const RNG_SURVEY_ATTEMPTS: u32 = 5;
 
@@ -789,12 +795,21 @@ struct SepData {
     #[pin]
     key_dev: Mutex<Option<shim::BioChardev>>,
 
+    // /dev/sep-key: one identity-bag load, operation and unload at a time.
+    // The device's ioctls run concurrently (a touch wait must not block
+    // SEP_KEY_CANCEL), so this, not the chardev lock, keeps one caller from
+    // unloading the bag under another's operation.
+    #[pin]
+    key_bag_lock: Mutex<()>,
+
     // /dev/sep-key: the signature a touch-gated SEP_KEY_SIGN is waiting for.
     // Set only for the length of that ioctl; while set, a verify run belongs
     // to it and not to /dev/sep-bio's session.
     #[pin]
     key_touch: Mutex<Option<crate::key::KeyTouch>>,
     key_touch_active: Atomic<bool>,
+    /// `SEP_KEY_CANCEL`: ends the touch-gated operation that is waiting.
+    key_touch_cancel: Atomic<bool>,
     // The enclave status of the last /dev/sep-key signature (self-test).
     last_key_status: Atomic<u32>,
 
@@ -838,6 +853,10 @@ struct SepData {
     // from a stale one.
     bio_lock_state: Atomic<u64>,
     bio_lock_state_seq: Atomic<u32>,
+    // The last state logged for each of the most recent users, in the same
+    // layout, so a repeated notification is not logged again. Notifications
+    // are handled one at a time, on the receive path.
+    bio_lock_logged: [Atomic<u64>; LOCK_STATE_LOG_USERS],
 
     #[pin]
     store: Mutex<Option<xart_store::Store>>,
@@ -991,6 +1010,18 @@ impl SepData {
                 "initrd: per-user key bags need xart_writes=1 and no xART guard; they wait for the real root\n"
             );
         }
+        // The qualified 26.6.2 lane uses only the boot-forwarded identity.
+        // Check before opening the shared xART store writable.
+        if profile::j613_26_6_2() && xart_writes {
+            if dt::preboot_uuid().is_none()
+                || module_parameters::os_uuid_hi.value() != 0
+                || module_parameters::os_uuid_lo.value() != 0
+                || xart_guard.is_none()
+            {
+                dev_err!(dev, "J613 26.6.2 requires a DT identity and xART guard\n");
+                return Err(EINVAL);
+            }
+        }
         let store = match xart_store::Store::open_owner(xart_writes, xart_start) {
             Ok(mut store) => {
                 match xart_guard {
@@ -1034,6 +1065,10 @@ impl SepData {
             match store::Store::open() {
                 Ok(store) => Some(store),
                 Err(e) => {
+                    if profile::j613_26_6_2() {
+                        dev_err!(dev, "J613 26.6.2 host-state store unavailable: {:?}\n", e);
+                        return Err(e);
+                    }
                     dev_warn!(dev, "Linux host-state store unavailable: {:?}\n", e);
                     None
                 }
@@ -1042,6 +1077,7 @@ impl SepData {
 
         let bio_index = match host_store.as_mut().map(bio::IdentityIndex::load) {
             Some(Ok(index)) => index,
+            Some(Err(e)) if profile::j613_26_6_2() => return Err(e),
             Some(Err(_)) => bio::IdentityIndex::new(),
             None => bio::IdentityIndex::new(),
         };
@@ -1114,8 +1150,10 @@ impl SepData {
                 bio_dev <- new_mutex!(None),
                 rearm_dev <- new_mutex!(None),
                 key_dev <- new_mutex!(None),
+                key_bag_lock <- new_mutex!(()),
                 key_touch <- new_mutex!(None),
                 key_touch_active: Atomic::new(false),
+                key_touch_cancel: Atomic::new(false),
                 last_key_status: Atomic::new(0),
                 bio_lockout: Atomic::new(false),
                 bio_after_boot: Atomic::new(false),
@@ -1128,6 +1166,7 @@ impl SepData {
                 match_scope_misses: Atomic::new(0),
                 bio_lock_state: Atomic::new(0),
                 bio_lock_state_seq: Atomic::new(0),
+                bio_lock_logged: [Atomic::new(0), Atomic::new(0), Atomic::new(0), Atomic::new(0)],
                 store <- new_mutex!(store),
                 host_store <- new_mutex!(host_store),
                 xarm <- new_mutex!(XarmState::new()),
@@ -1585,11 +1624,14 @@ impl SepData {
         };
         this.rng_survey_attempts.store(attempt, Relaxed);
         match next {
-            control::Survey::Registered => dev_info!(
-                this.dev,
-                "hwrng: registered after ready-phase survey (attempt {})\n",
-                attempt
-            ),
+            control::Survey::Registered => {
+                diag::hwrng(true);
+                dev_info!(
+                    this.dev,
+                    "hwrng: registered after ready-phase survey (attempt {})\n",
+                    attempt
+                )
+            }
             // Asleep, or holding back after a request that went unanswered:
             // this attempt did not ask the enclave anything.
             control::Survey::Held => Self::arm_settle(this),
@@ -1597,12 +1639,15 @@ impl SepData {
                 dev_warn!(this.dev, "hwrng: survey attempt {} failed ({:?}); retrying\n", attempt, e);
                 Self::arm_settle(this);
             }
-            control::Survey::GiveUp(e) => dev_err!(
-                this.dev,
-                "hwrng: survey failed after {} attempts ({:?})\n",
-                attempt,
-                e
-            ),
+            control::Survey::GiveUp(e) => {
+                diag::hwrng(false);
+                dev_err!(
+                    this.dev,
+                    "hwrng: survey failed after {} attempts ({:?})\n",
+                    attempt,
+                    e
+                )
+            }
         }
     }
 
@@ -1716,14 +1761,20 @@ impl SepData {
         match os_identity::select(hi, lo, dt::preboot_uuid) {
             os_identity::Selection::Explicit(uuid) => {
                 self.xarm.lock().os_uuid = Some(uuid);
+                diag::identity_source(diag::IdentitySource::Override);
+                diag::os_identity(diag::OsIdentity::Explicit);
                 dev_info!(self.dev, "xART: using explicit OS identity\n");
             }
             os_identity::Selection::Chosen(uuid) => {
                 self.xarm.lock().os_uuid = Some(uuid);
+                diag::identity_source(diag::IdentitySource::DeviceTree);
+                diag::os_identity(diag::OsIdentity::Chosen);
                 dev_info!(self.dev, "xART: using /chosen/apfs-preboot-uuid\n");
             }
             os_identity::Selection::Unavailable => {
                 self.xarm.lock().os_uuid = None;
+                diag::identity_source(diag::IdentitySource::Missing);
+                diag::os_identity(diag::OsIdentity::Unavailable);
                 dev_warn!(self.dev, "xART: /chosen/apfs-preboot-uuid is unavailable\n");
             }
         }
@@ -1934,6 +1985,15 @@ impl SepData {
     }
 
     fn send_xarm_reply(&self, reply: &crate::xarm::XarmReply) {
+        // Each of these used to fail the enclave's request without a trace.
+        // Count them all and log the first, so a refusal is never silent.
+        if reply.status == xarm::STATUS_FAILED && diag::xarm_failed() == 1 {
+            dev_warn!(
+                self.dev,
+                "xART: answered a request (tag {:#04x}) with the failure status; diag/xarm_failures counts them\n",
+                reply.tag
+            );
+        }
         let msg = crate::xarm::encode_xarm_reply(reply);
         let _ = self.send(msg);
     }
@@ -2567,6 +2627,7 @@ impl SepData {
             this.run_bringup();
             diag::bringup_ended();
         }
+        diag::log_summary(&this.dev);
         this.finish_bringup();
         Self::arm_settle(this);
     }
@@ -2705,7 +2766,13 @@ impl SepData {
 
             proto::EP_BOOT => self.on_boot(msg),
 
-            ep => dev_info!(self.dev, "rx: unhandled endpoint {:#04x} (msg0 {:#018x})\n", ep, msg.msg0),
+            ep => {
+                // Counted in diag/unhandled_messages; logged the first few
+                // times only, so a chatty endpoint cannot flood the log.
+                if diag::unhandled() <= UNHANDLED_LOG_LIMIT {
+                    dev_info!(self.dev, "rx: unhandled endpoint {:#04x} (msg0 {:#018x})\n", ep, msg.msg0);
+                }
+            }
         }
     }
 
@@ -2741,7 +2808,13 @@ impl SepData {
             proto::DISCOVER_TYPE_DESCRIPTOR | proto::DISCOVER_TYPE_CONFIG => {
                 let _ = table.slot(f.param);
                 diag::endpoints(table.eps.len());
-                dev_info!(
+                if f.ty == proto::DISCOVER_TYPE_DESCRIPTOR {
+                    diag::endpoint(f.param, (msg.msg0 >> 32) as u32);
+                }
+                // One summary line follows at the end of the bring-up, and
+                // diag/endpoint_names lists them; keep the per-message trace
+                // at debug level.
+                dev_dbg!(
                     self.dev,
                     "discover: endpoint {:#04x} (type {}, msg0 {:#018x}); {} known\n",
                     f.param,
@@ -2750,7 +2823,7 @@ impl SepData {
                     table.eps.len()
                 );
             }
-            ty => dev_info!(self.dev, "discover: other type {} (msg0 {:#018x})\n", ty, msg.msg0),
+            ty => dev_dbg!(self.dev, "discover: other type {} (msg0 {:#018x})\n", ty, msg.msg0),
         }
     }
 
@@ -3096,7 +3169,16 @@ impl platform::Driver for SepDriver {
         // As soon as the fixed facts are known, so a tool can watch the attach
         // from "pending" on. Diagnostics are not worth failing the probe for.
         let guard = data.with_store(|store| store.guard_state()).flatten();
-        if let Err(e) = diag::register(dev, data.profile, data.xart_writable(), guard) {
+        let policy = diag::Policy {
+            provision_keybag: module_parameters::provision_keybag.value() != 0,
+            trusted_keys: module_parameters::trusted_keys.value() != 0,
+            filevault_api: module_parameters::filevault_api.value() != 0,
+            xarm_trace: module_parameters::xarm_trace.value() != 0,
+            refkey_v2: module_parameters::refkey_v2.value() != 0,
+            identity_override: module_parameters::os_uuid_hi.value() != 0
+                || module_parameters::os_uuid_lo.value() != 0,
+        };
+        if let Err(e) = diag::register(dev, data.profile, data.xart_writable(), guard, policy) {
             dev_warn!(dev, "diag: could not add the sysfs attributes ({:?})\n", e);
         }
 
@@ -3104,16 +3186,16 @@ impl platform::Driver for SepDriver {
 
         data.attach(&sep_node)?;
 
-        if let Err(e) = data.register_fv_kernel() {
-            dev_err!(
-                dev,
-                "could not register the FileVault kernel API: {:?}\n",
-                e
-            );
+        if module_parameters::filevault_api.value() != 0 {
+            if let Err(e) = data.register_fv_kernel() {
+                dev_err!(dev, "could not register the FileVault kernel API: {:?}\n", e);
+            }
         }
 
-        if let Err(e) = trusted::register(data.clone()) {
-            dev_warn!(data.dev, "trusted-keys: registration failed ({:?})\n", e);
+        if module_parameters::trusted_keys.value() != 0 {
+            if let Err(e) = trusted::register(data.clone()) {
+                dev_warn!(data.dev, "trusted-keys: registration failed ({:?})\n", e);
+            }
         }
 
         if let Err(e) = pm::register(data.clone()) {
@@ -3192,6 +3274,14 @@ module! {
     description: "Apple SEP coprocessor: warm attach, endpoint discovery and tag-correlated control endpoint",
     license: "Dual MIT/GPL",
     params: {
+        trusted_keys: u8 {
+            default: 1,
+            description: "Register the SEP trusted-key source; 0 leaves it disabled",
+        },
+        filevault_api: u8 {
+            default: 1,
+            description: "Register the SEP FileVault kernel API; 0 leaves it disabled",
+        },
         xart_writes: u8 {
             default: 1,
             description: "Allow shared xART writes only if APFS proves a single unsnapshotted .gl extent; set to 0 for read-only operation",

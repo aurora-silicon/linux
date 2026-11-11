@@ -85,6 +85,34 @@ static const struct apple_soc_edac_range t6041_error_ranges[] = {
 	{ 68, 2, "ni6" },
 };
 
+/*
+ * T6000 follows the T6041 policy: the AMCC, DCS, NSC and NSI lines stay
+ * unclaimed. PMGR has no interrupt line on this SoC.
+ */
+static const struct apple_soc_edac_range t6000_error_ranges[] = {
+	{ 0, 8, "sep" },
+	{ 12, 4, "ioa" },
+	{ 32, 4, "ni0" },
+	{ 36, 3, "ni1" },
+	{ 39, 3, "ni2" },
+	{ 42, 2, "ni3" },
+	{ 44, 2, "ni4" },
+	{ 46, 4, "ni5" },
+	{ 50, 4, "ni6" },
+	{ 54, 4, "ni7" },
+	{ 58, 4, "ni8" },
+	{ 72, 4, "nsr" },
+};
+
+/*
+ * T8112: one AMCC aggregate line (0), two SEP lines (1-2) and sixteen DCS
+ * lines (3-18, eight channels plus their calibration partners). AMCC and
+ * DCS stay unclaimed, as on T6000 and T6041.
+ */
+static const struct apple_soc_edac_range t8112_error_ranges[] = {
+	{ 1, 2, "sep" },
+};
+
 static const struct apple_soc_edac_range t8140_error_ranges[] = {
 	{ 4, 1, "pmgr" },
 	{ 5, 9, "sep" },
@@ -98,6 +126,12 @@ static const struct apple_soc_edac_range t8140_error_ranges[] = {
 	{ 25, 1, "pio" },
 };
 
+static const struct apple_soc_edac_hw t6000_error_hw = {
+	.ranges = t6000_error_ranges,
+	.nranges = ARRAY_SIZE(t6000_error_ranges),
+	.num_irqs = 76,
+};
+
 static const struct apple_soc_edac_hw t6041_error_hw = {
 	.ranges = t6041_error_ranges,
 	.nranges = ARRAY_SIZE(t6041_error_ranges),
@@ -105,10 +139,26 @@ static const struct apple_soc_edac_hw t6041_error_hw = {
 	.num_status_regs = T6041_NI_REGS,
 };
 
+static const struct apple_soc_edac_hw t8112_error_hw = {
+	.ranges = t8112_error_ranges,
+	.nranges = ARRAY_SIZE(t8112_error_ranges),
+	.num_irqs = 19,
+};
+
 static const struct apple_soc_edac_hw t8140_error_hw = {
 	.ranges = t8140_error_ranges,
 	.nranges = ARRAY_SIZE(t8140_error_ranges),
 	.num_irqs = 26,
+};
+
+static const struct apple_soc_edac_hw t6000_event_hw = {
+	.num_irqs = 28,
+	.event_log = true,
+};
+
+static const struct apple_soc_edac_hw t8112_event_hw = {
+	.num_irqs = 16,
+	.event_log = true,
 };
 
 static const struct apple_soc_edac_hw t6041_event_hw = {
@@ -353,9 +403,13 @@ static void apple_soc_edac_remove(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_soc_edac_of_match[] = {
+	{ .compatible = "apple,t6000-error-handler", .data = &t6000_error_hw },
 	{ .compatible = "apple,t6041-error-handler", .data = &t6041_error_hw },
+	{ .compatible = "apple,t8112-error-handler", .data = &t8112_error_hw },
 	{ .compatible = "apple,t8140-error-handler", .data = &t8140_error_hw },
+	{ .compatible = "apple,t6000-event-log", .data = &t6000_event_hw },
 	{ .compatible = "apple,t6041-event-log", .data = &t6041_event_hw },
+	{ .compatible = "apple,t8112-event-log", .data = &t8112_event_hw },
 	{ .compatible = "apple,t8140-event-log", .data = &t8140_event_hw },
 	{ }
 };

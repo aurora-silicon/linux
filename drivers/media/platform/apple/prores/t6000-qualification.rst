@@ -16,9 +16,12 @@ Standard, HQ and 4444 at 3840x2160. ffmpeg decoded every frame at the
 expected size and chroma format. There were no DART faults, and the
 engine runtime-suspended with its power domain off afterwards.
 
+Rate control matches macOS: with the per-profile budgets, frame sizes
+equal VideoToolbox's on the same input (measured against macOS on the
+T8140 engine), on easy, detailed and noisy clips at 1080p and 2160p.
+
 Not yet covered: cancellation, failed-reset retention (#925), system
-suspend, rate-control parity with macOS, and the SCODEC performance
-request below.
+suspend and the SCODEC performance request below.
 
 Implementation sources
 ----------------------
@@ -30,10 +33,10 @@ f3ac615eb1376d3bbba24cd84c414b9e41892adb:
 * ``proxyclient/experiments/prores.py:42-89``: all 48 core RMWs, in order.
 * ``proxyclient/m1n1/hw/prores.py:7-111``: the v0 descriptor layout.
 * ``proxyclient/experiments/prores.py:592-644``: legacy header, slice and
-  rate-control words. The v0 builder retains the two public 0xffff limits;
-  it does not assign them v1 coefficient-budget semantics. Profile matrices
-  and initial quantisers follow the existing driver's policy, but profile
-  bitrate/quality equivalence remains to be measured on v0.
+  rate-control words. The v0 rate-control block is the v1 one, 0x20 bytes
+  earlier; the builder writes the per-profile target and maximum budgets
+  at 0xf0/0xf2 instead of the experiment's unbudgeted 0xffff. Profile
+  matrices and initial quantisers follow the existing driver's policy.
 
 The MIT notice for the adapted constants is retained in ``m1n1-LICENSE``.
 T6000 selects neither wrapper nor SCODEC-system writes. It has no BWR entry;

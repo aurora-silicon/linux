@@ -184,7 +184,7 @@ static const struct apple_jpeg_write aj_wide64_defaults[] = {
 	{ 0x020, 0xff },
 };
 
-/* Known legacy defaults; sparse scratch entries still need specification. */
+/* Complete legacy32 reset image; the layout helper appends tiling. */
 static const struct apple_jpeg_write aj_legacy32_defaults[] = {
 	{ 0x000, 0x0 },
 	{ 0x004, 0x0 },
@@ -263,6 +263,39 @@ static const struct apple_jpeg_write aj_legacy32_defaults[] = {
 	{ 0x0a8, 0xffffffff },
 	{ 0x094, 0x1 },
 	{ 0x098, 0x1 },
+	{ 0x1fc, 0x0 },
+	{ 0x200, 0x0 },
+	{ 0x204, 0x0 },
+	{ 0x208, 0x0 },
+	{ 0x214, 0x0 },
+	{ 0x218, 0x0 },
+	{ 0x21c, 0x0 },
+	{ 0x220, 0x0 },
+	{ 0x224, 0x0 },
+	{ 0x228, 0x0 },
+	{ 0x22c, 0x0 },
+	{ 0x230, 0x0 },
+	{ 0x234, 0x1f40 },
+	{ 0x244, 0x0 },
+	{ 0x248, 0x0 },
+	{ 0x258, 0x0 },
+	{ 0x25c, 0x0 },
+	{ 0x23c, 0x0 },
+	{ 0x240, 0x0 },
+	{ 0x250, 0x0 },
+	{ 0x254, 0x0 },
+	{ 0x1a0, 0x0 },
+	{ 0x1a8, 0x0 },
+	{ 0x1ac, 0x0 },
+	{ 0x1b0, 0x0 },
+	{ 0x1b4, 0x0 },
+	{ 0x1bc, 0x0 },
+	{ 0x1c0, 0x0 },
+	{ 0x1c4, 0x0 },
+	{ 0x1c8, 0x0 },
+	{ 0x1cc, 0x0 },
+	{ 0x1d0, 0x0 },
+	{ 0x1d4, 0x0 },
 	{ 0x020, 0xff },
 };
 
@@ -315,7 +348,7 @@ static const struct apple_jpeg_reg_layout aj_legacy32 = {
 	.image_height = 0x210,
 	.decode_block_base = 0x130,
 	.dma_addr_bits = 32,
-	.reset_complete = false,
+	.reset_complete = true,
 	.defaults = aj_legacy32_defaults,
 	.num_defaults = ARRAY_SIZE(aj_legacy32_defaults),
 };
@@ -324,7 +357,7 @@ const struct apple_jpeg_variant apple_jpeg_t6000 = {
 	.layout = &aj_legacy32,
 	.hwrev_mask = AJ_HWREV_MASK,
 	.hwrev = 0x0d0013,
-	.int_done_mask = BIT(31) | BIT(30),
+	.int_done_mask = BIT(31),
 };
 EXPORT_SYMBOL_IF_KUNIT(apple_jpeg_t6000);
 

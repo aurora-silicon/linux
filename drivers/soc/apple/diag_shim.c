@@ -15,7 +15,11 @@
  * the state before the driver has decided anything.
  */
 #include <linux/atomic.h>
+#include <linux/bitmap.h>
+#include <linux/bitops.h>
+#include <linux/ctype.h>
 #include <linux/device.h>
+#include <linux/ktime.h>
 #include <linux/minmax.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
@@ -23,7 +27,7 @@
 #include "shim.h"
 
 /* The contract version; see Documentation/ABI/testing/sysfs-driver-apple-sep. */
-#define SEP_DIAG_ABI			2
+#define SEP_DIAG_ABI			3
 
 #define SEP_DIAG_ATTACH_PENDING		0
 #define SEP_DIAG_ATTACH_ATTACHED	1
@@ -58,12 +62,22 @@
 #define SEP_DIAG_TOUCHID_STARTED	3
 #define SEP_DIAG_TOUCHID_FAILED		4
 
+/* The SEP's endpoint numbers are one byte. */
+#define SEP_DIAG_MAX_EP			256
+
 static struct {
 	/* Set at probe, before the group is added. */
 	char profile[32];
 	bool cold;
 	bool sepos13;
 	bool xart;
+	bool provision_keybag;
+	bool trusted_keys;
+	bool filevault_api;
+	bool xarm_trace;
+	bool refkey_v2;
+	bool identity_override;
+	atomic_t identity_source;
 	/* The xART guard's effective level (0: none runs), and its list. */
 	unsigned int xart_guard;
 	bool xart_guard_list;
@@ -78,6 +92,26 @@ static struct {
 	atomic_t restore;
 	atomic_t xart_refusals;
 	atomic_t matching;
+
+	/* Boot-time clock at probe, and at the attach and bring-up decisions. */
+	u64 probe_ns;
+	atomic64_t attach_ns;
+	atomic64_t ready_ns;
+
+	/*
+	 * The four-character name each endpoint advertised, by endpoint number.
+	 * A name is stored before its bit is set, so a reader that sees the bit
+	 * sees the name.
+	 */
+	u32 ep_name[SEP_DIAG_MAX_EP];
+	DECLARE_BITMAP(ep_seen, SEP_DIAG_MAX_EP);
+
+	atomic_t os_identity;
+	atomic_t hwrng;
+	atomic_t xarm_failures;
+	atomic_t unhandled;
+	atomic_t sleeps;
+	atomic_t sleeping;
 } sep_diag;
 
 static unsigned int sep_diag_sensor(void)
@@ -119,6 +153,54 @@ static ssize_t xart_show(struct device *dev, struct device_attribute *attr,
 	return sysfs_emit(buf, "%s\n", READ_ONCE(sep_diag.xart) ? "enabled" : "disabled");
 }
 static DEVICE_ATTR_RO(xart);
+
+/* Parameter policy is captured at probe; the identity choice is cached later. */
+static ssize_t policy_show(struct device *dev, struct device_attribute *attr,
+			   char *buf)
+{
+	const char *identity;
+
+	switch (atomic_read(&sep_diag.identity_source)) {
+	case 1:
+		identity = "dt";
+		break;
+	case 2:
+		identity = "override";
+		break;
+	case 3:
+		identity = "missing";
+		break;
+	default:
+		identity = "pending";
+		break;
+	}
+	return sysfs_emit(buf,
+		"xart_writes=%u provision_keybag=%u xart_guard=%u "
+		"trusted_keys=%u filevault_api=%u xarm_trace=%u "
+		"refkey_v2=%u identity_override=%u identity_source=%s\n",
+		sep_diag.xart, sep_diag.provision_keybag, sep_diag.xart_guard,
+		sep_diag.trusted_keys, sep_diag.filevault_api, sep_diag.xarm_trace,
+		sep_diag.refkey_v2, sep_diag.identity_override, identity);
+}
+static DEVICE_ATTR_RO(policy);
+
+void sep_diag_set_policy(bool provision_keybag, bool trusted_keys,
+			 bool filevault_api, bool xarm_trace, bool refkey_v2,
+			 bool identity_override)
+{
+	sep_diag.provision_keybag = provision_keybag;
+	sep_diag.trusted_keys = trusted_keys;
+	sep_diag.filevault_api = filevault_api;
+	sep_diag.xarm_trace = xarm_trace;
+	sep_diag.refkey_v2 = refkey_v2;
+	sep_diag.identity_override = identity_override;
+	atomic_set(&sep_diag.identity_source, 0);
+}
+
+void sep_diag_set_identity_source(unsigned int source)
+{
+	atomic_set(&sep_diag.identity_source, source);
+}
 
 static ssize_t attach_show(struct device *dev, struct device_attribute *attr,
 			   char *buf)
@@ -340,12 +422,156 @@ static ssize_t matching_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(matching);
 
+/* Milliseconds from probe to a decision, or 0 while it is still pending. */
+static unsigned int sep_diag_ms_since_probe(atomic64_t *at)
+{
+	u64 t = atomic64_read(at);
+
+	if (!t || t < sep_diag.probe_ns)
+		return 0;
+	return (unsigned int)min_t(u64, div_u64(t - sep_diag.probe_ns,
+						NSEC_PER_MSEC), UINT_MAX);
+}
+
+static ssize_t attach_ms_show(struct device *dev, struct device_attribute *attr,
+			      char *buf)
+{
+	return sysfs_emit(buf, "%u\n", sep_diag_ms_since_probe(&sep_diag.attach_ns));
+}
+static DEVICE_ATTR_RO(attach_ms);
+
+static ssize_t ready_ms_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	return sysfs_emit(buf, "%u\n", sep_diag_ms_since_probe(&sep_diag.ready_ns));
+}
+static DEVICE_ATTR_RO(ready_ms);
+
+/*
+ * An endpoint's name as the SEP spells it, trailing spaces dropped ("sks ").
+ * A name with a byte that is not a lower-case letter or digit is shown as its
+ * number, so the list stays one line of space-separated tokens.
+ */
+static int sep_diag_ep_name(unsigned int id, char out[5])
+{
+	u32 name = READ_ONCE(sep_diag.ep_name[id]);
+	int len = 0, i;
+
+	for (i = 0; i < 4; i++) {
+		char c = (char)(name >> (24 - 8 * i));
+
+		if (c == ' ' && len == i)
+			break;
+		if (!(islower(c) || isdigit(c)) || len != i)
+			return scnprintf(out, 5, "%02x", id);
+		out[len++] = c;
+	}
+	if (!len)
+		return scnprintf(out, 5, "%02x", id);
+	out[len] = '\0';
+	return len;
+}
+
+static ssize_t endpoint_names_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	unsigned int id;
+	ssize_t n = 0;
+
+	for_each_set_bit(id, sep_diag.ep_seen, SEP_DIAG_MAX_EP) {
+		char name[5];
+
+		/* Pairs with the barrier in sep_diag_set_endpoint(). */
+		smp_rmb();
+		sep_diag_ep_name(id, name);
+		n += sysfs_emit_at(buf, n, "%s%s", n ? " " : "", name);
+	}
+	n += sysfs_emit_at(buf, n, "\n");
+	return n;
+}
+static DEVICE_ATTR_RO(endpoint_names);
+
+static ssize_t os_identity_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	const char *state;
+
+	switch (atomic_read(&sep_diag.os_identity)) {
+	case SEP_DIAG_OS_IDENTITY_EXPLICIT:
+		state = "explicit";
+		break;
+	case SEP_DIAG_OS_IDENTITY_CHOSEN:
+		state = "chosen";
+		break;
+	case SEP_DIAG_OS_IDENTITY_UNAVAILABLE:
+		state = "unavailable";
+		break;
+	default:
+		state = "unknown";
+		break;
+	}
+	return sysfs_emit(buf, "%s\n", state);
+}
+static DEVICE_ATTR_RO(os_identity);
+
+static ssize_t hwrng_show(struct device *dev, struct device_attribute *attr,
+			  char *buf)
+{
+	const char *state;
+
+	switch (atomic_read(&sep_diag.hwrng)) {
+	case SEP_DIAG_HWRNG_REGISTERED:
+		state = "registered";
+		break;
+	case SEP_DIAG_HWRNG_FAILED:
+		state = "failed";
+		break;
+	default:
+		state = "pending";
+		break;
+	}
+	return sysfs_emit(buf, "%s\n", state);
+}
+static DEVICE_ATTR_RO(hwrng);
+
+static ssize_t xarm_failures_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n",
+			  (unsigned int)atomic_read(&sep_diag.xarm_failures));
+}
+static DEVICE_ATTR_RO(xarm_failures);
+
+static ssize_t unhandled_messages_show(struct device *dev,
+				       struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n",
+			  (unsigned int)atomic_read(&sep_diag.unhandled));
+}
+static DEVICE_ATTR_RO(unhandled_messages);
+
+static ssize_t sleeps_show(struct device *dev, struct device_attribute *attr,
+			   char *buf)
+{
+	return sysfs_emit(buf, "%u\n", (unsigned int)atomic_read(&sep_diag.sleeps));
+}
+static DEVICE_ATTR_RO(sleeps);
+
+static ssize_t sleep_show(struct device *dev, struct device_attribute *attr,
+			  char *buf)
+{
+	return sysfs_emit(buf, "%s\n",
+			  atomic_read(&sep_diag.sleeping) ? "held" : "awake");
+}
+static DEVICE_ATTR_RO(sleep);
+
 static struct attribute *sep_diag_attrs[] = {
 	&dev_attr_abi.attr,
 	&dev_attr_profile.attr,
 	&dev_attr_boot.attr,
 	&dev_attr_protocol.attr,
 	&dev_attr_xart.attr,
+	&dev_attr_policy.attr,
 	&dev_attr_attach.attr,
 	&dev_attr_endpoints.attr,
 	&dev_attr_keystore.attr,
@@ -358,6 +584,15 @@ static struct attribute *sep_diag_attrs[] = {
 	&dev_attr_xart_guard_list.attr,
 	&dev_attr_xart_guard_refusals.attr,
 	&dev_attr_matching.attr,
+	&dev_attr_attach_ms.attr,
+	&dev_attr_ready_ms.attr,
+	&dev_attr_endpoint_names.attr,
+	&dev_attr_os_identity.attr,
+	&dev_attr_hwrng.attr,
+	&dev_attr_xarm_failures.attr,
+	&dev_attr_unhandled_messages.attr,
+	&dev_attr_sleeps.attr,
+	&dev_attr_sleep.attr,
 	NULL
 };
 
@@ -379,12 +614,14 @@ int sep_diag_register(struct device *dev, const char *profile,
 	sep_diag.cold = cold;
 	sep_diag.sepos13 = sepos13;
 	sep_diag.xart = xart;
+	sep_diag.probe_ns = ktime_get_boottime_ns();
 
 	return devm_device_add_group(dev, &sep_diag_group);
 }
 
 void sep_diag_set_attach(bool attached)
 {
+	atomic64_cmpxchg(&sep_diag.attach_ns, 0, ktime_get_boottime_ns());
 	atomic_set(&sep_diag.attach,
 		   attached ? SEP_DIAG_ATTACH_ATTACHED : SEP_DIAG_ATTACH_FAILED);
 }
@@ -392,6 +629,72 @@ void sep_diag_set_attach(bool attached)
 void sep_diag_set_endpoints(unsigned int count)
 {
 	atomic_set(&sep_diag.endpoints, count);
+}
+
+void sep_diag_set_endpoint(u8 id, u32 name)
+{
+	WRITE_ONCE(sep_diag.ep_name[id], name);
+	/* The name is visible before the bit; see endpoint_names_show(). */
+	smp_wmb();
+	set_bit(id, sep_diag.ep_seen);
+}
+
+void sep_diag_set_os_identity(int source)
+{
+	atomic_set(&sep_diag.os_identity, source);
+}
+
+void sep_diag_set_hwrng(bool registered)
+{
+	atomic_set(&sep_diag.hwrng, registered ? SEP_DIAG_HWRNG_REGISTERED :
+						 SEP_DIAG_HWRNG_FAILED);
+}
+
+unsigned int sep_diag_xarm_failed(void)
+{
+	return (unsigned int)atomic_inc_return(&sep_diag.xarm_failures);
+}
+
+unsigned int sep_diag_unhandled(void)
+{
+	return (unsigned int)atomic_inc_return(&sep_diag.unhandled);
+}
+
+/* From the PM notifier (pm_shim.c), which runs its calls one at a time. */
+void sep_diag_sleep(bool entering)
+{
+	if (entering) {
+		atomic_set(&sep_diag.sleeping, 1);
+	} else if (atomic_xchg(&sep_diag.sleeping, 0)) {
+		atomic_inc(&sep_diag.sleeps);
+	}
+}
+
+/*
+ * One line for the kernel log when the boot-time bring-up has ended: what the
+ * per-endpoint discovery lines (now debug level) used to show, and the states
+ * a reader would otherwise collect from several attributes.
+ */
+void sep_diag_log_summary(struct device *dev)
+{
+	char names[192];
+	unsigned int id;
+	size_t n = 0;
+
+	names[0] = '\0';
+	for_each_set_bit(id, sep_diag.ep_seen, SEP_DIAG_MAX_EP) {
+		char name[5];
+
+		smp_rmb();
+		sep_diag_ep_name(id, name);
+		n += scnprintf(names + n, sizeof(names) - n, "%s%s",
+			       n ? " " : "", name);
+	}
+	dev_info(dev, "ready in %u ms: %u endpoints (%s), key store %s\n",
+		 sep_diag_ms_since_probe(&sep_diag.ready_ns),
+		 (unsigned int)atomic_read(&sep_diag.endpoints), names,
+		 atomic_read(&sep_diag.keystore) == SEP_DIAG_KEYSTORE_OPEN ?
+		 "open" : "closed");
 }
 
 void sep_diag_set_keystore_open(void)
@@ -506,6 +809,7 @@ void sep_diag_set_xart(bool writable)
 
 void sep_diag_keystore_ended(void)
 {
+	atomic64_cmpxchg(&sep_diag.ready_ns, 0, ktime_get_boottime_ns());
 	atomic_cmpxchg(&sep_diag.keystore, SEP_DIAG_KEYSTORE_UNKNOWN,
 		       SEP_DIAG_KEYSTORE_CLOSED);
 }

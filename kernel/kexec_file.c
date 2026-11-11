@@ -382,7 +382,8 @@ int do_kexec_file_load(int kernel_fd, int initrd_fd, unsigned long cmdline_len,
 
 	if (!kexec_trylock())
 		return -EBUSY;
-	if (!(flags & KEXEC_FILE_UNLOAD) && kexec_blocked()) {
+	if (!(flags & KEXEC_FILE_UNLOAD) &&
+	    ((flags & KEXEC_FILE_ON_CRASH) ? kexec_crash_blocked() : kexec_blocked())) {
 		pr_warn_ratelimited("kexec file load refused by active interlock; first reason: %s\n",
 				    kexec_block_reason());
 		kexec_unlock();

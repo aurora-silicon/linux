@@ -13,8 +13,8 @@ description: |
   PCI function zero owns the shared N1 firmware bootstrap. The boot producer
   supplies the personalized FTAB filename and packed firmware platform ID.
   The endpoint must be left in its stopped ROM personality with DMA and MSI
-  quiesced. A supported APIF PCI host performs the isolated port reset after
-  ROM bootstrap. This binding does not authorize adopting an existing live
+  quiesced. The host's root-port reset retrains the link after the ROM
+  bootstrap. This binding does not authorize adopting an existing live
   firmware session or releasing another owner's retained DART streams.
 
 properties:

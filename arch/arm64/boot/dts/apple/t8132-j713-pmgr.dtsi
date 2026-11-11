@@ -105,13 +105,16 @@
 	status = "disabled";
 };
 
+/* The DCP powers these down while the display is off. */
 &ps_disp_sys {
 	apple,firmware-owned;
+	apple,consumer-switched;
 	status = "okay";
 };
 
 &ps_disp_fe {
 	apple,firmware-owned;
+	apple,consumer-switched;
 	status = "okay";
 };
 
@@ -531,6 +534,9 @@
 
 &ps_disp_cpu {
 	apple,firmware-owned;
+	apple,consumer-switched;
+	/* Power-gate retention workaround, as macOS sets it while off. */
+	apple,retention-workaround = <0x2504c 0x3 0x3>, <0x25070 0x1 0x0>;
 	status = "okay";
 };
 

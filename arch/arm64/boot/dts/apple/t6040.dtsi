@@ -313,6 +313,14 @@
 	aop_gyro: gyro {
 		compatible = "apple,t6041-aop-gyro", "apple,aop-gyro";
 	};
+
+	aop_devmotion: devmotion6 {
+		compatible = "apple,t6041-aop-devmotion6", "apple,aop-devmotion6";
+	};
+
+	aop_temp: als-temp {
+		compatible = "apple,t6041-aop-als-temp", "apple,aop-als-temp";
+	};
 };
 
 / {
@@ -430,6 +438,11 @@
 		status = "disabled";
 	};
 
+	/*
+	 * The DebugUSB DockChannel serial channel. Binding it disturbs the
+	 * speaker amplifiers (I2C timeouts, TDM clock faults), so it stays
+	 * disabled outside the tether variant.
+	 */
 	dcuart: serial@50883c000 {
 		compatible = "apple,dockchannel-uart";
 		reg = <0x5 0x0883c000 0x0 0x4000>,

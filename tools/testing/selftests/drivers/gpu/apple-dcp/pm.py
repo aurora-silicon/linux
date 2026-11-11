@@ -747,8 +747,14 @@ int main(void) {
  assert(cd321x_register_port(&c.tps,&connector)==0&&c.state_valid&&!c.tbt_switch);
  assert(!watches&&!c.tbt_watch_registered&&!c.tbt_fwnode);
  cd321x_unregister_port(&c.tps);balanced();
- /* A router present at probe needs no watch. */
- reset(&c);assert(cd321x_register_port(&c.tps,&connector)==0&&c.tbt_switch&&!watches);
+ /* A router present at probe is watched too: it can unbind and bind again with a new switch. */
+ reset(&c);assert(cd321x_register_port(&c.tps,&connector)==0&&c.tbt_switch);
+ assert(watches==1&&c.tbt_watch_registered&&c.tbt_fwnode==&connector);
+ cd321x_unregister_port(&c.tps);balanced();
+ /* Without that watch the port still probes with the router it has. */
+ reset(&c);watch_error=-ENOMEM;
+ assert(cd321x_register_port(&c.tps,&connector)==0&&c.tbt_switch);
+ assert(!watches&&!c.tbt_watch_registered&&!c.tbt_fwnode);
  cd321x_unregister_port(&c.tps);balanced();
 ''', 1)
 

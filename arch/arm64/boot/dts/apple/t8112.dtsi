@@ -75,6 +75,7 @@
 			next-level-cache = <&l2_cache_0>;
 			i-cache-size = <0x20000>;
 			d-cache-size = <0x10000>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_e1: cpu@1 {
@@ -89,6 +90,7 @@
 			next-level-cache = <&l2_cache_0>;
 			i-cache-size = <0x20000>;
 			d-cache-size = <0x10000>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_e2: cpu@2 {
@@ -103,6 +105,7 @@
 			next-level-cache = <&l2_cache_0>;
 			i-cache-size = <0x20000>;
 			d-cache-size = <0x10000>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_e3: cpu@3 {
@@ -117,6 +120,7 @@
 			next-level-cache = <&l2_cache_0>;
 			i-cache-size = <0x20000>;
 			d-cache-size = <0x10000>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p0: cpu@10100 {
@@ -131,6 +135,7 @@
 			next-level-cache = <&l2_cache_1>;
 			i-cache-size = <0x30000>;
 			d-cache-size = <0x20000>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p1: cpu@10101 {
@@ -145,6 +150,7 @@
 			next-level-cache = <&l2_cache_1>;
 			i-cache-size = <0x30000>;
 			d-cache-size = <0x20000>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p2: cpu@10102 {
@@ -159,6 +165,7 @@
 			next-level-cache = <&l2_cache_1>;
 			i-cache-size = <0x30000>;
 			d-cache-size = <0x20000>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p3: cpu@10103 {
@@ -173,6 +180,7 @@
 			next-level-cache = <&l2_cache_1>;
 			i-cache-size = <0x30000>;
 			d-cache-size = <0x20000>;
+			#cooling-cells = <2>;
 		};
 
 		l2_cache_0: l2-cache-0 {
@@ -529,8 +537,10 @@
 			compatible = "apple,t8112-ave";
 			reg = <0x2 0x67100000 0 0x45c000>,
 			      <0x2 0x67050000 0 0x8000>,
-			      <0x2 0x67800000 0 0x800000>;
-			reg-names = "codec", "mailbox", "coproc";
+			      <0x2 0x67800000 0 0x800000>,
+			      <0x2 0x3b708000 0 0x4000>,
+			      <0x2 0x66000000 0 0x1000000>;
+			reg-names = "codec", "mailbox", "coproc", "pmgr", "pio";
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 692 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 686 IRQ_TYPE_LEVEL_HIGH>,
@@ -731,7 +741,9 @@
 				<&ps_isp_set4>, <&ps_isp_set5>, <&ps_isp_set6>,
 				<&ps_isp_set7>, <&ps_isp_set8>, <&ps_isp_set9>,
 				<&ps_isp_set10>, <&ps_isp_set11>,
-				<&ps_isp_set12>;
+				<&ps_isp_set12>, <&ps_ispsens0>,
+				<&ps_ispsens1>, <&ps_ispsens2>,
+				<&ps_ispsens3>;
 
 			apple,dart-vm-size = <0x0 0xa0000000>;
 			status = "disabled";
@@ -1538,6 +1550,44 @@
 
 			smc_hwmon: hwmon {
 				compatible = "apple,smc-hwmon";
+				#thermal-sensor-cells = <1>;
+				/*
+				 * The GPU keys read a fixed low value while the GPU
+				 * is idle, then the CPU die keys.
+				 */
+				apple,soc-die-keys = "Tg0f", "Tg0n", "Tg0r", "Te05",
+						     "Tp01", "Tp05", "Tp09", "Tp0D";
+
+				/* SoC die temperatures, first: thermal zones index them. */
+				temperature-TCMz {
+					apple,key-id = "TCMz";
+					label = "SoC Die Temperature";
+				};
+
+				temperature-Te05 {
+					apple,key-id = "Te05";
+					label = "E-cluster Temperature";
+				};
+
+				temperature-Tp01 {
+					apple,key-id = "Tp01";
+					label = "P-core 0 Temperature";
+				};
+
+				temperature-Tp05 {
+					apple,key-id = "Tp05";
+					label = "P-core 1 Temperature";
+				};
+
+				temperature-Tp09 {
+					apple,key-id = "Tp09";
+					label = "P-core 2 Temperature";
+				};
+
+				temperature-Tp0D {
+					apple,key-id = "Tp0D";
+					label = "P-core 3 Temperature";
+				};
 			};
 
 			smc_rtc: rtc {
@@ -2512,7 +2562,7 @@
 			ranges = <0x43000000 0x6 0xa0000000 0x6 0xa0000000 0x0 0x20000000>,
 				 <0x02000000 0x0 0xc0000000 0x6 0xc0000000 0x0 0x40000000>;
 
-			power-domains = <&ps_apcie_gp>;
+			power-domains = <&ps_apcie_gp>, <&ps_apcie_st>;
 			pinctrl-0 = <&pcie_pins>;
 			pinctrl-names = "default";
 
@@ -2651,6 +2701,11 @@
 };
 
 #include "t8112-peripherals.dtsi"
+
+/* Event-log interrupt group (apple_soc_edac). */
+&m2_event_log_handler {
+	status = "okay";
+};
 
 /* Both JPEG encoders are SoC blocks with no board wiring. */
 &m2_dart_jpeg0 {

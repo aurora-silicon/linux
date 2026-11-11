@@ -85,19 +85,119 @@
 	reg-names = "report", "ane-dvfs";
 };
 
+#ifdef APPLE_USE_PMP
+/*
+ * The video encoder, AVD, the JPEG codecs, the scaler and the ProRes codec
+ * also send the PMP a performance request while they are powered. The
+ * bootloader fills each entry's SOC-DEV-DVFS slot and levels from this
+ * machine's ADT (apple,adt-dvfs).
+ */
+&pmp_report_venc_sys {
+	apple,adt-dvfs;
+	status = "okay";
+};
+
+&pmp_report_avd_sys {
+	apple,adt-dvfs;
+};
+
+&pmp_report_jpg {
+	apple,adt-dvfs;
+};
+
+&pmp_report_msr0 {
+	apple,adt-dvfs;
+	status = "okay";
+};
+
+&pmp_report_scodec {
+	apple,adt-dvfs;
+	status = "okay";
+};
+
+&ave {
+	power-domains = <&ps_venc_dma>, <&ps_venc_pipe4>,
+			<&ps_venc_pipe5>, <&ps_venc_me0>, <&ps_venc_me1>,
+			<&pmp_report_venc_sys>;
+	power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1", "perf";
+};
+#endif
+
 &ane {
 	apple,performance-controller = <&pmp_report>;
 	power-domains = <&ps_ane_sys_cpu>, <&ps_ane_set1>,
 		<&ps_ane_set2>, <&ps_ane_set3>, <&ps_ane_set4>, <&ps_pms_sram>;
 };
 
+/*
+ * T6000 has no power state registers for the AFNC3 fabric controllers or
+ * the USB-A AON domain: they are always on without a PMGR switch.
+ */
+&ps_afnc3_ioa {
+	status = "disabled";
+};
+
+&ps_afnc3_ls {
+	status = "disabled";
+};
+
+&ps_afnc3_lw0 {
+	status = "disabled";
+};
+
+&ps_gp_usb_aon {
+	status = "disabled";
+};
+
+/* The video decoder is IO-coherent in both directions. */
+&avd {
+	dma-coherent;
+};
+
 #include "t6000-peripherals.dtsi"
 #include "t6000-aux-spmi.dtsi"
+
+/* Platform error and event-log interrupt groups (apple_soc_edac). */
+&soc_errors {
+	status = "okay";
+};
+
+&soc_events {
+	status = "okay";
+};
 
 &apr0_dart {
 	status = "okay";
 };
 
 &apr0 {
+	status = "okay";
+};
+
+#ifdef APPLE_USE_PMP
+/* The scaler and the ProRes codec request their PMP performance level. */
+&scaler0 {
+	power-domains = <&pmp_report_msr0>, <&ps_msr0_ase_core>;
+};
+
+&apr0 {
+	power-domains = <&pmp_report_scodec>;
+};
+#endif
+
+/* Both JPEG encoders are SoC blocks with no board wiring. */
+&jpeg0_dart {
+	status = "okay";
+};
+
+&jpeg0 {
+	status = "okay";
+};
+
+&jpeg1_dart {
+	status = "okay";
+};
+
+&jpeg1 {
 	status = "okay";
 };

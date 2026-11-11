@@ -27,8 +27,10 @@
 //!
 //! The speaker front-end is copy-only: the LEAP consumes float32 and the
 //! driver converts each S32 sample through the amplifier's full scale and
-//! the "Speaker Playback Volume" control, which macaudio holds at full scale
-//! while a protection engine owns the speakers and 20 dB down otherwise.
+//! the "Speaker Playback Volume" control, below one of two ceilings that
+//! macaudio selects with the protection interface: half the amplifier's full
+//! scale under the volume lock of a protection daemon, the full scale under
+//! the lease of a protection engine in the signal path.
 //!
 //! Closing the lid disconnects both internal microphones in hardware.  The
 //! array then reads back as digital silence, but the low-power microphone's
@@ -492,6 +494,9 @@ struct SndSocT8140AopData {
     hpai_want_run: AtomicFlag,
     /// "Speaker Playback Volume" (REG_SPKR_VOLUME), 0..=SPKR_VOLUME_MAX.
     spkr_volume: Atomic<u32>,
+    /// REG_SPKR_FULL_SCALE: the volume is below SPKR_CEILING_Q31, not the
+    /// legacy ceiling.
+    spkr_full_scale: AtomicFlag,
     /// The sleeping firmware starts queued from the atomic triggers.
     #[pin]
     spkr_start_work: Work<Self, SPKR_START_WORK>,
@@ -1614,9 +1619,10 @@ const FE_DMA_NAMES: [[Option<&core::ffi::CStr>; 2]; FE_COUNT] = [
 /// "Secondary" PCM): its data goes through `spkr_copy` below.
 const FE_SPKR: usize = 1;
 
-/// Digital ceiling of the speaker path, as a Q31 gain applied to every
-/// sample userspace writes: unity, so a full-scale S32 sample is a float of
-/// 1.0, the amplifier's full scale.
+/// Digital ceiling of the speaker path under the lease of a protection engine
+/// ("Speaker Protection"), as a Q31 gain applied to every sample userspace
+/// writes: unity, so a full-scale S32 sample is a float of 1.0, the
+/// amplifier's full scale.
 ///
 /// The LEAP consumes float32 with 1.0 as the I2S full scale.  Measured
 /// from outside the machine, the same program through the same speaker
@@ -1635,6 +1641,13 @@ const FE_SPKR: usize = 1;
 /// "Speaker Playback Volume" at this full scale, and without an owner 20 dB
 /// down with speaker playback refused.
 const SPKR_CEILING_Q31: i64 = 1 << 31;
+
+/// Digital ceiling under the volume lock of a protection daemon ("Speaker
+/// Volume Unlock", speakerguardd 0.1): 0.5, the scale that daemon was
+/// calibrated against, unchanged from the kernels that had only that
+/// interface.  It is the default: macaudio selects the full scale only
+/// while the lease is the interface (REG_SPKR_FULL_SCALE).
+const SPKR_LEGACY_CEILING_Q31: i64 = 1 << 30;
 
 /// "Speaker Playback Volume": the software gain below the ceiling that
 /// macaudio sets (full scale or its safe level), 0.5 dB per
@@ -1659,8 +1672,33 @@ const SPKR_VOLUME_Q31: [u32; 128] = [
     1140065663, 1207618800, 1279174713, 1354970580, 1435257634, 1520301996, 1610385552, 1705806895,
     1806882308, 1913946816, 2027355295, 2147483648,
 ];
-/// The component's only "register": the speaker volume.
+/// The volume table under the volume lock: entry i =
+/// round(SPKR_LEGACY_CEILING_Q31 * 10^(-(127 - i) / 40)).
+const _: () = assert!(
+    SPKR_LEGACY_VOLUME_Q31[SPKR_VOLUME_MAX as usize] as i64 == SPKR_LEGACY_CEILING_Q31
+);
+const SPKR_LEGACY_VOLUME_Q31: [u32; 128] = [
+    0, 760151, 805193, 852903, 903441, 956973, 1013678, 1073742, 1137365, 1204758, 1276145,
+    1351761, 1431858, 1516701, 1606571, 1701766, 1802602, 1909413, 2022553, 2142397, 2269342,
+    2403809, 2546243, 2697118, 2856932, 3026216, 3205530, 3395470, 3596664, 3809780, 4035523,
+    4274643, 4527932, 4796229, 5080423, 5381457, 5700328, 6038094, 6395874, 6774853, 7176288,
+    7601510, 8051928, 8529034, 9034412, 9569734, 10136776, 10737418, 11373650, 12047581, 12761445,
+    13517609, 14318577, 15167006, 16065708, 17017661, 18026021, 19094130, 20225528, 21423966,
+    22693416, 24038085, 25462431, 26971175, 28569318, 30262156, 32055302, 33954698, 35966640,
+    38097798, 40355234, 42746432, 45279317, 47962285, 50804230, 53814569, 57003283, 60380940,
+    63958736, 67748529, 71762882, 76015100, 80519278, 85290345, 90344115, 95697341, 101367765,
+    107374182, 113736503, 120475814, 127614455, 135176087, 143185773, 151670064, 160657080,
+    170176611, 180260209, 190941298, 202255281, 214239660, 226934158, 240380852, 254624313,
+    269711752, 285693178, 302621563, 320553018, 339546978, 359666402, 380977976, 403552340,
+    427464319, 452793173, 479622855, 508042296, 538145694, 570032831, 603809400, 639587356,
+    677485290, 717628817, 760150998, 805192776, 852903448, 903441154, 956973408, 1013677647,
+    1073741824,
+];
+/// The component's "registers": the speaker volume, and which ceiling it
+/// is below (0: SPKR_LEGACY_CEILING_Q31, 1: SPKR_CEILING_Q31), which
+/// macaudio writes (MACAUDIO_SW_GAIN_REG_FULL_SCALE) and no control exposes.
 const REG_SPKR_VOLUME: u32 = 0;
+const REG_SPKR_FULL_SCALE: u32 = 1;
 /// DECLARE_TLV_DB_SCALE(-6350, 50, 1): a dB scale from -63.50 dB in 0.50 dB
 /// steps whose lowest value mutes.
 static SPKR_VOLUME_TLV: [u32; 4] = [
@@ -1972,6 +2010,15 @@ fn f32_bits_of_q31(v: i32) -> u32 {
 
 /// One S32 sample -> the float32 word the LEAP consumes, through the volume
 /// table (whose top entry is the ceiling).
+/// The Q31 gain of @volume below the selected ceiling.
+fn spkr_gain_q31(full_scale: bool, volume: usize) -> u32 {
+    if full_scale {
+        SPKR_VOLUME_Q31[volume]
+    } else {
+        SPKR_LEGACY_VOLUME_Q31[volume]
+    }
+}
+
 fn spkr_f32_bits(sample: i32, gain_q31: u32) -> u32 {
     let scaled = (i64::from(sample) * i64::from(gain_q31)) >> 31; // |scaled| <= SPKR_CEILING_Q31
     f32_bits_of_q31(scaled as i32)
@@ -2038,7 +2085,7 @@ unsafe extern "C" fn asoc_pcm_copy(
     // throughout registration, use and unregister.
     let data = unsafe { component_data(component) };
     let volume = core::cmp::min(data.spkr_volume.load(Relaxed), SPKR_VOLUME_MAX) as usize;
-    let gain = SPKR_VOLUME_Q31[volume];
+    let gain = spkr_gain_q31(data.spkr_full_scale.load(Relaxed), volume);
     let mut chunk = [0u8; 512];
     let mut off = 0;
     while off < bytes {
@@ -2135,6 +2182,7 @@ unsafe extern "C" fn asoc_component_read(
     let data = unsafe { component_data(component) };
     match reg {
         REG_SPKR_VOLUME => data.spkr_volume.load(Relaxed),
+        REG_SPKR_FULL_SCALE => u32::from(data.spkr_full_scale.load(Relaxed)),
         _ => 0,
     }
 }
@@ -2155,6 +2203,10 @@ unsafe extern "C" fn asoc_component_write(
         REG_SPKR_VOLUME => {
             data.spkr_volume
                 .store(core::cmp::min(val, SPKR_VOLUME_MAX), Relaxed);
+            0
+        }
+        REG_SPKR_FULL_SCALE => {
+            data.spkr_full_scale.store(val != 0, Relaxed);
             0
         }
         _ => EINVAL.to_errno(),
@@ -2889,6 +2941,7 @@ impl SndSocT8140AopDriver {
                 spkr_want_run: AtomicFlag::new(false),
                 hpai_want_run: AtomicFlag::new(false),
                 spkr_volume: Atomic::new(SPKR_VOLUME_MAX),
+                spkr_full_scale: AtomicFlag::new(false),
                 spkr_start_work <- new_work!("SndSocT8140AopData::spkr_start_work"),
                 hpai_start_work <- new_work!("SndSocT8140AopData::hpai_start_work"),
                 mic,
@@ -2928,6 +2981,30 @@ mod tests {
     const HALF_DB_PPB: u128 = 1_059_253_725;
     /// 1.0 as a float32: the amplifier's full scale on the wire.
     const F32_ONE: u32 = 0x3f80_0000;
+
+    /// Under the volume lock the table is the one the lock-only kernels had:
+    /// half the full scale at the top, every entry within one LSB of half
+    /// the lease's, and 20 dB below it at the locked level.
+    #[test]
+    fn the_volume_lock_keeps_the_legacy_ceiling() {
+        assert_eq!(SPKR_LEGACY_CEILING_Q31, 1 << 30);
+        assert_eq!(
+            spkr_gain_q31(false, SPKR_VOLUME_MAX as usize) as i64,
+            SPKR_LEGACY_CEILING_Q31
+        );
+        assert_eq!(
+            spkr_gain_q31(true, SPKR_VOLUME_MAX as usize) as i64,
+            SPKR_CEILING_Q31
+        );
+        assert_eq!(f32_bits_of_q31(SPKR_LEGACY_CEILING_Q31 as i32), 0x3f00_0000);
+        for i in 0..=SPKR_VOLUME_MAX as usize {
+            let half = i64::from(SPKR_VOLUME_Q31[i]) / 2;
+            assert!((i64::from(SPKR_LEGACY_VOLUME_Q31[i]) - half).abs() <= 1);
+        }
+        // 0.05 as a float32 is 0x3d4c_cccd; the conversion truncates
+        let locked = spkr_f32_bits(i32::MIN, spkr_gain_q31(false, LOCKED_VOLUME));
+        assert!(locked & 0x7fff_ffff <= 0x3d4c_cccd && locked & 0x7fff_ffff > 0x3d4c_cccd - 64);
+    }
 
     #[test]
     fn the_top_of_the_volume_range_is_the_amplifier_full_scale() {

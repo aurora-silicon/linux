@@ -12,8 +12,6 @@ config VIDEO_APPLE_JPEG
 	  in T6000, T6041, T8112 and T8140 SoCs. It takes full-range NV12
 	  (4:2:0) or NV16 (4:2:2) frames. The device compatible selects the
 	  register layout and address width; unrecognized revisions are refused.
-	  T6000 has a layout description but remains refused until its complete
-	  reset image is specified.
 
 	  To compile this driver as a module, choose M here: the module
 	  will be called apple-jpeg.

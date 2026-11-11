@@ -3,6 +3,7 @@
 
 #include <linux/phy/phy.h>
 #include <linux/mux/consumer.h>
+#include "dcp-peer-v27.h"
 
 enum dptx_apcall {
 	DPTX_APCALL_ACTIVATE = 0,
@@ -30,6 +31,7 @@ enum dptx_apcall {
 	DPTX_APCALL_DEVICE_NOT_RESPONDING = 22,
 	DPTX_APCALL_DEVICE_BUSY_TIMEOUT = 23,
 	DPTX_APCALL_DEVICE_NOT_STARTED = 24,
+	DPTX_APCALL_SET_RESOURCE_AVAILABLE = 25,
 	DPTX_APCALL_GET_VIRTUAL_DEVICE_MODE = 26,
 };
 
@@ -44,11 +46,15 @@ enum dptx_link_rate {
 	LINK_RATE_HBR = 0x0a,
 	LINK_RATE_HBR2 = 0x14,
 	LINK_RATE_HBR3 = 0x1e,
+	/* 128b/132b: 0x80 | the rate's DPCD 0x2215 bit */
+	LINK_RATE_UHBR10 = 0x81,
+	LINK_RATE_UHBR20 = 0x82,
 };
 
 struct apple_epic_service;
 
 struct dptx_port {
+	struct dcp_dptx_caps caps;
 	bool enabled, connected;
 	/* A published session closed; unlike initial discovery, this is terminal. */
 	bool closed;
@@ -63,6 +69,14 @@ struct dptx_port {
 	u32 link_rate, pending_link_rate;
 	u32 drive_settings[2];
 	u32 trained_voltage[4], trained_pre[4];
+	u32 drive_voltage[4], drive_pre[4];
+	/*
+	 * Firmware 27 on a Thunderbolt DP tunnel: the drive settings DCP last
+	 * set, {mode, voltage swing, pre-emphasis} per lane, as it sent them.
+	 * Nothing applies them; GetDriveSettings returns them.
+	 */
+	u32 tunnel_drive[4][3];
+	u32 tunnel_drive_count;
 	/*
 	 * The sink's tile topology as DCP reports it in SetTiledDisplayHints:
 	 * tiles across and down, and this stream's tile. Valid once

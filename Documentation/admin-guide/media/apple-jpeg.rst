@@ -29,16 +29,17 @@ uses compact 32-bit DMA addresses and a separate reset image. DMA addresses
 and inclusive boundaries must fit the selected address width. They are never
 truncated to fit a register.
 
-The T6000 reset image is incomplete: its sparse scratch-register defaults
-still need a complete clean specification. Its layout and job programming are
-testable without hardware, but probe refuses runtime use until that reset
-image is complete. Do not enable T6000 engine nodes for streaming yet.
+The legacy32 reset image is complete: 111 static defaults, including the
+sparse scratch block, plus the tiling write the helper appends. Unlisted
+registers in that block are left unwritten. T6000 completes jobs with
+interrupt status bit 31.
 
 Each engine has a 16 KiB MMIO resource and a separate adjacent DART at SID 0.
 The engine's resource must not include the DART window. Both T8112 engines
-and their DARTs are enabled in ``t8112.dtsi`` (qualified on the J413). The
-T6000 pairs stay disabled until the reset image is complete. Enabling nodes on
-another SoC requires qualifying both of its instances.
+and their DARTs are enabled in ``t8112.dtsi`` (qualified on the J413), and
+both T6000 engines in ``t6000.dtsi`` (qualified on the J316s). T6001 and T6002
+stay disabled. Enabling nodes on another SoC requires qualifying both of its
+instances.
 
 KUnit
 -----
@@ -58,8 +59,8 @@ Qualification
 Before enabling a new board, qualify both instances: record raw HWREV,
 terminal interrupt status (bit 30 or bit 31 for initial older-family
 qualification), reset/idle handshakes, runtime PM, geometry, output-capacity
-checks and error recovery. T8140 retains its qualified bit-31 completion
-mask. The other variants initially accept bits 30 and 31; status/error and
+checks and error recovery. T8140 and T6000 use their qualified bit-31
+completion mask. The other variants accept bits 30 and 31; status/error and
 output-capacity checks still apply.
 
 Check each encoder's advertised formats and use its actual video node. For

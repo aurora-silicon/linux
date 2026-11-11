@@ -122,6 +122,8 @@ static void netif_stop_queue(void*n){}
 static void schedule_work(void*w){scheduled++;}
 static void mt_scan_event(struct mt7932*m,const struct mt7932_event*e){}
 static void mt_bss_presence(struct mt7932*m,const struct mt7932_event*e){}
+#define IS_ENABLED(option) 0
+static void mt_awdl_event(struct mt7932*m,const struct mt7932_event*e){}
 static void mt_data_complete(struct mt7932*m,const u8*p,size_t n){}
 static void mt_packet_receive(struct mt7932*m,const u8*p,size_t n){}
 static void mt_rf_fail_locked(struct mt7932*m,int e){m->rf_ready=false;m->link_failed=true;m->cal_state.error=e;m->cal_state.active=false;m->connect_error=e;complete_all(&m->assoc_done);complete_all(&m->cal_response);}

@@ -189,6 +189,7 @@ static void apr_test_desc_v0(struct kunit *test)
 	struct apr_frame f = apr_test_frame();
 	u8 *d = kunit_kmalloc(test, APR_DESC_BYTES + 1, GFP_KERNEL);
 	unsigned int i;
+	u32 budget;
 
 	KUNIT_ASSERT_NOT_NULL(test, d);
 	memset(d, 0xa5, APR_DESC_BYTES + 1);
@@ -221,9 +222,11 @@ static void apr_test_desc_v0(struct kunit *test)
 		KUNIT_EXPECT_EQ_MSG(test, d[i], 0, "padding/slices %#x", i);
 	KUNIT_EXPECT_EQ(test, d[0xee], 0x30);
 	KUNIT_EXPECT_EQ(test, d[0xef], 2);
-	for (i = 0; i < ARRAY_SIZE(legacy); i++)
+	/* Word 0 is the rate budget, checked against v1 below. */
+	for (i = 1; i < ARRAY_SIZE(legacy); i++)
 		KUNIT_EXPECT_EQ_MSG(test, get_unaligned_le32(d + 0xf0 + 4 * i),
 				    legacy[i], "legacy word %u", i);
+	budget = get_unaligned_le32(d + 0xf0);
 	for (i = 0x154; i < APR_DESC_BYTES; i++)
 		KUNIT_EXPECT_EQ_MSG(test, d[i], 0, "v0 trailing padding %#x", i);
 
@@ -232,6 +235,9 @@ static void apr_test_desc_v0(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x58), 0);
 	KUNIT_EXPECT_EQ(test, get_unaligned_be16(d + 0x7c), 148);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 0x170), 0x23);
+	/* v0 carries v1's target and maximum budget words. */
+	KUNIT_EXPECT_EQ(test, budget, get_unaligned_le32(d + 0x110));
+	KUNIT_EXPECT_NE(test, budget, 0xffffffff);
 }
 
 static void apr_test_desc_v0_profiles(struct kunit *test)

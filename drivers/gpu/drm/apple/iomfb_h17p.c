@@ -516,7 +516,7 @@ static bool trampoline_get_uint_prop_h17p(struct apple_dcp *dcp, int tag,
 		return trampoline_get_uint_prop(dcp, tag, out, in);
 
 	trace_iomfb_callback(dcp, tag, __func__);
-	/* The observed startup query uses Asahi's existing Temperature reply. */
+	/* The observed startup query: the battery temperature in 0.1 K. */
 	if (memcmp(request->obj, "SUMP", sizeof(request->obj)) ||
 	    strnlen(request->key, sizeof(request->key)) == sizeof(request->key) ||
 	    strcmp(request->key, "Temperature") || request->value_null ||
@@ -526,7 +526,7 @@ static bool trampoline_get_uint_prop_h17p(struct apple_dcp *dcp, int tag,
 		return false;
 	}
 
-	put_unaligned_le64(3029, out);
+	put_unaligned_le64(dcp_pmu_temperature(dcp->dev), out);
 	*((u8 *)out + offsetof(struct dcp_get_uint_prop_resp, ret)) = true;
 	return true;
 }

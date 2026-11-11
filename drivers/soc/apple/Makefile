@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
+obj-$(CONFIG_APPLE_SIO_AES) += apple-sio-aes.o
+
+obj-$(CONFIG_APPLE_DBGVIEW) += apple-dbgview.o
+apple-dbgview-y = dbgview.o
+
 obj-$(CONFIG_APPLE_DOCKCHANNEL) += apple-dockchannel.o
 apple-dockchannel-y = dockchannel.o
 
@@ -56,4 +61,5 @@ apple-mcc-y := mcc.o
 
 obj-$(CONFIG_APPLE_CLPC) += clpc.o
 
-obj-$(CONFIG_APPLE_SART_APIF) += apple-sart-apif.o
+obj-$(CONFIG_APPLE_REGVIEW) += apple-regview.o
+apple-regview-y := regview.o

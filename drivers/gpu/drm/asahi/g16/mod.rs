@@ -173,7 +173,8 @@ impl platform::Driver for Driver {
     fn unbind<'bound>(_pdev: &'bound platform::Device<Core<'_>>, this: Pin<&Self::Data<'bound>>) {
         if let Some(driver) = this.get_ref() {
             if let Some(gpu) = &driver.g16 {
-                gpu.retain();
+                // Admission pinned the module; this only confirms the pin.
+                let _ = gpu.retain();
             }
             driver.close_binding();
         }
@@ -415,18 +416,17 @@ impl Gpu {
             },
             GFP_KERNEL,
         )?;
-        gpu.retain();
+        gpu.retain()?;
         Ok(gpu)
     }
 
     /// Keeps the firmware session and this module alive until reboot.
     ///
-    /// Takes the module reference once. Nothing firmware-reachable is freed on any path: the
-    /// RTKit callbacks hold [`Shared`], which holds the [`Firmware`] (or the [`boot::Orphan`] of a
-    /// failed start) until reboot.
-    pub(crate) fn retain(&self) {
-        // Admission already pinned the module, so this cannot fail.
-        let _ = boot::glue::retain_module();
+    /// Takes the module reference once; admission already took it, so this only confirms it.
+    /// Nothing firmware-reachable is freed on any path: the RTKit callbacks hold [`Shared`],
+    /// which holds the [`Firmware`] (or the [`boot::Orphan`] of a failed start) until reboot.
+    pub(crate) fn retain(&self) -> Result {
+        boot::glue::retain_module()
     }
 }
 
