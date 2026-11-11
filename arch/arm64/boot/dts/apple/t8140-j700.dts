@@ -2116,6 +2116,7 @@
 
 /* The loader publishes external resources after validating their firmware. */
 #include "t8140-j700-dcpext.dtsi"
+#include "t8140-j700-dpaudio.dtsi"
 
 &display {
 	iommus = <&disp0_dart 0>, <&dispext0_dart 0>;

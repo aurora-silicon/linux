@@ -58,6 +58,17 @@ expiry boundaries, with staggered attempts and across jiffies wrap. Run with
 ../.kunitconfig using tools/testing/kunit/kunit.py. The existing
 tools/asahi/ave-pm-tests.py also checks the #651 sleep rollback contract.
 
+MCTF streaming tool
+-------------------
+
+On a machine with the MCTF video device, python3 mctf-stream.py streams
+NV12 1920x1080 frames through it (synthetic noise with a moving square, or
+-i a raw NV12 file), and prints per-frame latency, the standard deviation of
+the frame-to-frame luma difference in a static region for input and output,
+and whether the OUTPUT timestamps came back on CAPTURE. -l sets the MCTF
+Level, -o keeps the filtered frames. It needs only the Python 3 standard
+library. The apple-ave-mctf KUnit suite covers the command images.
+
 Hardware procedure (requires a qualified firmware/SoC and an approved lane)
 -------------------------------------------------------------------------
 

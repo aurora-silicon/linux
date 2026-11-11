@@ -355,6 +355,10 @@ static int tb_enable_tmu(struct tb_switch *sw)
 {
 	int ret;
 
+	/* The host router's firmware runs its TMU on these hosts. */
+	if (!tb_route(sw) && tb_switch_tmu_host_managed(sw))
+		return 0;
+
 	/*
 	 * If both routers at the end of the link are v2 we simply
 	 * enable the enhanced uni-directional mode. That covers all
@@ -746,9 +750,10 @@ static int tb_maximum_bandwidth(struct tb *tb, struct tb_port *src_port,
 
 	/*
 	 * Can include asymmetric, only if it is actually supported by
-	 * the lane adapter.
+	 * the lane adapter and allowed on the host.
 	 */
-	if (!tb_asym_supported(src_port, dst_port, port))
+	if (!tb_asym_supported(src_port, dst_port, port) ||
+	    (tb->nhi->quirks & QUIRK_NO_ASYM))
 		include_asym = false;
 
 	if (tb_is_upstream_port(port)) {
@@ -1078,7 +1083,7 @@ static int tb_configure_asym(struct tb *tb, struct tb_port *src_port,
 	struct tb_port *up;
 	int ret = 0;
 
-	if (!asym_threshold)
+	if (!asym_threshold || (tb->nhi->quirks & QUIRK_NO_ASYM))
 		return 0;
 
 	downstream = tb_port_path_direction_downstream(src_port, dst_port);
@@ -3964,9 +3969,11 @@ static int tb_start(struct tb *tb, bool reset)
 	 * To support highest CLx state, we set host router's TMU to
 	 * Normal mode.
 	 */
-	tb_switch_tmu_configure(tb->root_switch, TB_SWITCH_TMU_MODE_LOWRES);
-	/* Enable TMU if it is off */
-	tb_switch_tmu_enable(tb->root_switch);
+	if (!tb_switch_tmu_host_managed(tb->root_switch)) {
+		tb_switch_tmu_configure(tb->root_switch, TB_SWITCH_TMU_MODE_LOWRES);
+		/* Enable TMU if it is off */
+		tb_switch_tmu_enable(tb->root_switch);
+	}
 
 	/*
 	 * Boot firmware might have created tunnels of its own. Since we

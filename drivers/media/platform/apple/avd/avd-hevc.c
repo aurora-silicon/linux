@@ -1405,6 +1405,8 @@ static int avd_hevc_run_preamble(struct avd_ctx *ctx, struct avd_hevc_run *run)
 	 * larger array can move their storage.
 	 */
 	avd_run_preamble(ctx, &run->base);
+	if (run->base.setup_err)
+		return run->base.setup_err;
 
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
 			      V4L2_CID_STATELESS_HEVC_DECODE_PARAMS);

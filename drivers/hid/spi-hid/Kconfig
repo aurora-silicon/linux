@@ -22,3 +22,15 @@ config SPI_HID_APPLE_CORE
 	tristate
 	select HID
 	select CRC16
+
+config SPI_HID_APPLE_KUNIT_TEST
+	bool "KUnit tests for the Apple SPI HID transport" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && SPI && INPUT
+	select SPI_HID_APPLE_CORE
+	default KUNIT_ALL_TESTS
+	help
+	  Test get-report recovery with a fake SPI controller, including bad
+	  status, dropped and stale replies, and bounded reply copies.
+	  The tests use synthetic reports and do not access any hardware.
+	  Run them with tools/testing/kunit/kunit.py and the .kunitconfig
+	  in drivers/hid/spi-hid.

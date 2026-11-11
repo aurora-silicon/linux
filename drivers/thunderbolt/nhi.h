@@ -227,6 +227,15 @@ struct tb_nhi_ops {
 #define QUIRK_KEEP_TUNNELS				BIT(7)
 /* The links of the host router must not enter CL states. */
 #define QUIRK_NO_HOST_CLX				BIT(8)
+/* The links of the domain must stay symmetric. */
+#define QUIRK_NO_ASYM					BIT(9)
+/* Gen4 links of the domain run with link recovery enabled on both ends. */
+#define QUIRK_GEN4_LINK_RECOVERY			BIT(10)
+/*
+ * The host router's firmware runs its TMU, and enhanced uni-directional
+ * mode takes the host's own constants, see tmu.c.
+ */
+#define QUIRK_HOST_TMU					BIT(11)
 
 /* Host display policies are independent of which optional hooks are installed. */
 #define TB_HOST_DP_NOTIFY		BIT(0)

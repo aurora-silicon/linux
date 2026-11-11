@@ -1241,6 +1241,9 @@ static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 		if (ep)
 			return ep;
 	}
+	/* The J700 DCPEXT's audio service sits on endpoint 0x2b, not AV 0x29. */
+	if (!IS_ERR_OR_NULL(dcp->avep) && endpoint == dcp->avep->endpoint)
+		return dcp->avep;
 	/* DPAV 0x2a on H17P overlaps the legacy DPTX endpoint number. */
 	if (dcp->dcpavservep && endpoint == dcp->dcpavservep->endpoint)
 		return dcp->dcpavservep;
@@ -2128,6 +2131,15 @@ static int dcp_external_start_locked(struct apple_dcp *dcp)
 	int ret;
 
 	lockdep_assert_held(&dcp->external_lock);
+	/*
+	 * Once its DPTX link was withdrawn, the external DCP announces its AV
+	 * interfaces again under fresh interface numbers when the link comes
+	 * back, without closing the old ones. A new generation lets each
+	 * replace the one it supersedes (afk_compact_slot()) instead of piling
+	 * up until the endpoint has no slot left for the audio interface.
+	 */
+	if (!dcp->external_running)
+		WRITE_ONCE(dcp->afk_power_gen, dcp->afk_power_gen + 1);
 	ret = dcp_external_link_locked(dcp);
 	if (ret || dcp->external_running)
 		return ret;
@@ -2600,6 +2612,15 @@ static int dcp_external_stop_locked(struct apple_dcp *dcp, u64 generation)
 		return dcp->external_error;
 	if (dcp->external_stopped && !READ_ONCE(dcp->dptxport[0].connected))
 		return 0;
+	/*
+	 * The sink's audio first, as around a 14.7 external mode set: a link
+	 * the audio client still holds when the pipe powers off and the DPTX
+	 * link is withdrawn left the next activation timing out (-ETIMEDOUT)
+	 * and the display dark. It comes back with the link
+	 * (dcp_dptx_connect_raw()), before the pipe is powered on again.
+	 */
+	if (dcp->avep)
+		av_service_disconnect(dcp);
 	iomfb_pause_presentation(dcp, true);
 	dcp->external_running = false;
 	/* Route setup can call this before IOMFB or its shared memory exists. */
@@ -2652,8 +2673,6 @@ release_link:
 	}
 	dcp->external_stopped = true;
 	WRITE_ONCE(dcp->typec_crtc_off, true);
-	if (dcp->avep)
-		av_service_disconnect(dcp);
 	return 0;
 failed:
 	/* A retry could race a late reply. Keep this session blocked and owned. */
@@ -3009,13 +3028,25 @@ static int dcp_dptx_connect_attached(struct apple_dcp *dcp, u32 port)
  * does not reset them, dcp_poweron() does. dcp-relink.h holds the
  * decisions; relink_lock protects their state.
  */
+/*
+ * A T6050 tunnel keeps its Thunderbolt binding and its HPD when the firmware
+ * drops the sink after servicing its IRQ_HPD (see dcp_tb_event_work()):
+ * nothing else connects it again. Other tunnels are left to their owners.
+ */
+static bool dcp_tunnel_relinks(struct apple_dcp *dcp)
+{
+	return of_device_is_compatible(dcp->dev->of_node, "apple,t6050-dcpext") &&
+	       READ_ONCE(dcp->tb_event_hpd);
+}
+
 static bool dcp_typec_relink_eligible(struct apple_dcp *dcp)
 {
 	struct apple_connector *connector = READ_ONCE(dcp->connector);
 
 	/* H17P and native external pipes recover through their own lifecycle */
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P || dcp->external_native ||
-	    !dcp_is_typec_output(dcp) || dcp_is_usb4_output(dcp) ||
+	    !dcp_is_typec_output(dcp) ||
+	    (dcp_is_usb4_output(dcp) && !dcp_tunnel_relinks(dcp)) ||
 	    dcp_is_external_h17p(dcp) || !dcp->typec_connector)
 		return false;
 	/*
@@ -3023,7 +3054,7 @@ static bool dcp_typec_relink_eligible(struct apple_dcp *dcp)
 	 * not one the driver itself let go, holds HPD low for (see
 	 * dcp_placeholder_edid_work()) or moves to another pipeline.
 	 */
-	/* Tunnels are excluded above; direct follows use the carried gate. */
+	/* Most tunnels are excluded above; direct follows use the carried gate. */
 	return READ_ONCE(dcp->typec_work_enabled) &&
 	       READ_ONCE(dcp->typec_cable_connected) &&
 	       !READ_ONCE(dcp->typec_crtc_off) &&
@@ -5174,6 +5205,12 @@ VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release
 	disable_delayed_work_sync(&dcp->hdmi_settle_wq);
 	disable_delayed_work_sync(&dcp->hdmi_recheck_wq);
 	disable_delayed_work_sync(&dcp->link_recovery_wq);
+	disable_work_sync(&dcp->tb_event_work);
+	scoped_guard(mutex, &dcp->tb_event_lock) {
+		dcp->tb_events = 0;
+		dcp->tb_event_route = NULL;
+		dcp->tb_event_generation = 0;
+	}
 	disable_delayed_work_sync(&dcp->hybrid_wq);
 	dcp_hdmi_disable(dcp);
 }
@@ -5189,6 +5226,7 @@ VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
 	enable_delayed_work(&dcp->hdmi_settle_wq);
 	enable_delayed_work(&dcp->hdmi_recheck_wq);
 	enable_delayed_work(&dcp->link_recovery_wq);
+	enable_work(&dcp->tb_event_work);
 	enable_delayed_work(&dcp->hybrid_wq);
 	dcp_hdmi_enable(dcp);
 	scoped_guard(mutex, &dcp->hpd_mutex)
@@ -6124,6 +6162,9 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	spin_lock_init(&dcp->metadata.lock);
 	mutex_init(&dcp->dcpavserv.lock);
 	INIT_WORK(&dcp->dcpavserv.close_wq, dcpavserv_close_work);
+	ret = dcpavserv_edid_retry_init(dcp);
+	if (ret)
+		return ret;
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
 	/* The display such a processor finds at boot is its first sink. */
 	if (dcp_sink_metadata(dcp))
@@ -6159,6 +6200,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&dcp->typec_reconnect_wq,
 			  dcp_typec_reconnect_work);
 	INIT_DELAYED_WORK(&dcp->link_recovery_wq, dcp_link_recovery_work);
+	mutex_init(&dcp->tb_event_lock);
+	INIT_WORK(&dcp->tb_event_work, dcp_tb_event_work);
 	INIT_DELAYED_WORK(&dcp->placeholder_edid_wq,
 			  dcp_placeholder_edid_work);
 	INIT_DELAYED_WORK(&dcp->typec_relink_wq, dcp_typec_relink_work);
@@ -6177,6 +6220,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	disable_delayed_work(&dcp->typec_relink_wq);
 	disable_delayed_work(&dcp->announce_wq);
 	disable_delayed_work(&dcp->link_recovery_wq);
+	disable_work(&dcp->tb_event_work);
 	dcp->announce.stopped = true;
 	/*
 	 * A native external pipe's bind enables these; firmware callbacks may

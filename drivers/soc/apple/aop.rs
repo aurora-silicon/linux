@@ -2032,7 +2032,18 @@ impl AOP for AopData {
         false
     }
     fn source_ring(&self, dev: &device::Device<Bound>, size: usize) -> Result<Arc<SourceRing>> {
-        if self.setup_queue.is_none() || self.transport_closing.load(Acquire) {
+        if self.setup_queue.is_none() {
+            return Err(ENODEV);
+        }
+        self.bound_ring(dev, size, &mut |iova, size| self.setup_bind_source(iova, size))
+    }
+    fn bound_ring(
+        &self,
+        dev: &device::Device<Bound>,
+        size: usize,
+        bind: &mut dyn FnMut(u64, u64) -> Result<()>,
+    ) -> Result<Arc<SourceRing>> {
+        if self.transport_closing.load(Acquire) {
             return Err(ENODEV);
         }
         let mut guard = self.source_ring.lock();
@@ -2055,7 +2066,7 @@ impl AOP for AopData {
             ring: ring.clone(),
             confirmed: false,
         });
-        self.setup_bind_source(iova, size as u64)?;
+        bind(iova, size as u64)?;
         if let Some(binding) = &mut *guard {
             binding.confirmed = true;
         }

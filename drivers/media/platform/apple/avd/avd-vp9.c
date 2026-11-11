@@ -776,6 +776,8 @@ static int avd_vp9_run_preamble(struct avd_ctx *ctx, struct avd_vp9_run *run)
 	int ret;
 
 	avd_run_preamble(ctx, &run->base);
+	if (run->base.setup_err)
+		return run->base.setup_err;
 
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
 			      V4L2_CID_STATELESS_VP9_COMPRESSED_HDR);
