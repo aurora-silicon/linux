@@ -14,5 +14,5 @@ static inline bool apple_pcie_mirror_pref_window(bool kernel_init,
 						 bool tunnel_cold_init,
 						 bool tunnel_intr2axi)
 {
-	return kernel_init || tunnel_cold_init;
+	return kernel_init || tunnel_cold_init || tunnel_intr2axi;
 }
