@@ -1409,12 +1409,15 @@ impl SepData {
                 return Ok(None);
             }
 
+            // A reply wait sleeps uninterruptibly: with a signal pending an
+            // interruptible wait returns at once with the time left unchanged,
+            // so this loop would spin until the reply came, or forever.
             match self
                 .control_wq
-                .wait_interruptible_timeout(&mut guard, remaining)
+                .wait_timeout(&mut guard, remaining)
             {
                 CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
-                CondVarTimeoutResult::Signal { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Signal { .. } => remaining = 0,
                 CondVarTimeoutResult::Timeout => remaining = 0,
             }
         }
@@ -1448,12 +1451,15 @@ impl SepData {
             if remaining == 0 {
                 break (Err(ETIMEDOUT), control::EntropyEnd::TimedOut);
             }
+            // A reply wait sleeps uninterruptibly: with a signal pending an
+            // interruptible wait returns at once with the time left unchanged,
+            // so this loop would spin until the reply came, or forever.
             match self
                 .control_wq
-                .wait_interruptible_timeout(&mut guard, remaining)
+                .wait_timeout(&mut guard, remaining)
             {
                 CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
-                CondVarTimeoutResult::Signal { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Signal { .. } => remaining = 0,
                 CondVarTimeoutResult::Timeout => remaining = 0,
             }
         };
@@ -1996,12 +2002,15 @@ impl SepData {
                 || guard.captured.len() >= until || remaining == 0 {
                 return;
             }
+            // A reply wait sleeps uninterruptibly: with a signal pending an
+            // interruptible wait returns at once with the time left unchanged,
+            // so this loop would spin until the reply came, or forever.
             match self
                 .scrd_wq
-                .wait_interruptible_timeout(&mut guard, remaining)
+                .wait_timeout(&mut guard, remaining)
             {
                 CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
-                CondVarTimeoutResult::Signal { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Signal { .. } => remaining = 0,
                 CondVarTimeoutResult::Timeout => remaining = 0,
             }
         }

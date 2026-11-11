@@ -1236,12 +1236,15 @@ impl SepData {
                 || guard.captured.len() >= until || remaining == 0 {
                 return;
             }
+            // A reply wait sleeps uninterruptibly: with a signal pending an
+            // interruptible wait returns at once with the time left unchanged,
+            // so this loop would spin until the reply came, or forever.
             match self
                 .sks_wq
-                .wait_interruptible_timeout(&mut guard, remaining)
+                .wait_timeout(&mut guard, remaining)
             {
                 CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
-                CondVarTimeoutResult::Signal { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Signal { .. } => remaining = 0,
                 CondVarTimeoutResult::Timeout => remaining = 0,
             }
         }
