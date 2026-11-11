@@ -1736,6 +1736,32 @@ static int t6040_dp_power_on(struct phy *phy)
 	return 0;
 }
 
+/*
+ * The PHY's close for DP on all four lanes, as macOS has it (with a DP client: the DP
+ * transmitter's shutdown, the AUX shutdown, the PHY shutdown of mode 3): a link still up goes
+ * down, then both TX lanes and the common block (part A), and after its 200 us the CFG
+ * block returns to its boot state (part B; no coprocessor to stop in this mode). The AUX
+ * block has no step of its own here: it goes into reset and behind the clamp with the PHY.
+ *
+ * Without this the fixed DP PHY of the HDMI converter stays as it ran once it is powered
+ * off; a Type-C port's was put to sleep, with no step for a link still up. The sleep engine
+ * of an S2R stalled on a port left as it ran, and the next power-on programmed a PHY that
+ * had not been through its reset.
+ */
+static void t6040_dp_shutdown(struct t6040_usb2_phy *tphy)
+{
+	int ret = t6040_dp_set_rate(tphy, -1);
+
+	if (ret)
+		dev_warn(tphy->dev, "DP link not taken down before the PHY shutdown: %d\n", ret);
+	tphy->dp_rate = -1;
+	t6040_phy_tx_cmn_shutdown(tphy);
+	fsleep(200);
+	t6040_usb3_sleep(tphy);
+	dev_dbg(tphy->dev, "DP PHY shut down: cfg %#x/%#x\n",
+		readl(t6040_cfg(tphy) + T6040_CFG_CTRL), readl(t6040_cfg(tphy) + T6040_CFG_STATUS));
+}
+
 static int t6040_dp_power_off(struct phy *phy)
 {
 	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
@@ -1754,9 +1780,8 @@ static int t6040_dp_power_off(struct phy *phy)
 	 * sleeping PHY, as on a fresh attach. Booting the coprocessor's
 	 * firmware for the first time over the DP state crashes it.
 	 */
-	if (tphy->dp_up && !tphy->dp_mode_two_lanes && !t6040_dp_only(tphy)) {
-		t6040_phy_tx_cmn_shutdown(tphy);
-		t6040_usb3_sleep(tphy);
+	if (tphy->dp_up && !tphy->dp_mode_two_lanes) {
+		t6040_dp_shutdown(tphy);
 		dev_info(tphy->dev, "DP PHY down, PHY asleep\n");
 	}
 	tphy->dp_up = false;
