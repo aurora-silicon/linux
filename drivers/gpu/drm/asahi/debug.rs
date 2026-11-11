@@ -54,6 +54,13 @@ pub(crate) enum DebugFlags {
     DeviceControlCh = 21,
     FwCtlCh = 22,
 
+    // Host submission/completion timestamps without verbose firmware tracing.
+    SubmitTiming = 23,
+    // Low-volume M3 command/geometry totals without per-IRQ printk.
+    M3SubmitSummary = 24,
+    // Per-slot retired timestamps, without enabling firmware ktrace.
+    M3PassTiming = 25,
+
     // 32-35: Allocator debugging
     FillAllocations = 32,
     DebugAllocations = 33,

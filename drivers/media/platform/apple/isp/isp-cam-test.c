@@ -438,14 +438,11 @@ static void isp_test_sensor_config_list(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, isp->sensor_configs[5].reply[ISP_SENSOR_CONFIG_SIZE - 1], 0x5a);
 	KUNIT_EXPECT_EQ(test, count, 6);
 	KUNIT_EXPECT_EQ(test, isp->num_sensor_configs, 6);
-	KUNIT_EXPECT_EQ(test, isp->num_presets, 3);
+	/* Firmware configs only qualify P010: the uncropped 4096x3072 one is not offered. */
+	KUNIT_ASSERT_EQ(test, isp->num_presets, 2);
 	KUNIT_EXPECT_EQ(test, isp->presets[0].index, 5);
 	KUNIT_EXPECT_EQ(test, isp->presets[0].output_dim.y, 1080);
 	KUNIT_EXPECT_TRUE(test, isp->presets[1].p010);
-	KUNIT_EXPECT_TRUE(test, isp->presets[2].p010);
-	KUNIT_EXPECT_EQ(test, isp->presets[2].index, 1);
-	KUNIT_EXPECT_EQ(test, isp->presets[2].output_dim.x, 4096);
-	KUNIT_EXPECT_EQ(test, isp->presets[2].crop_size.y, 3072);
 	KUNIT_EXPECT_FALSE(test, isp->sensor_configs[2].usable);
 	KUNIT_EXPECT_EQ(test, isp_ch_cache_sensor_configs(isp, 0, 0), -EINVAL);
 	KUNIT_EXPECT_EQ(test, isp_ch_cache_sensor_configs(isp, 0, 65), -EINVAL);

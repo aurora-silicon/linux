@@ -571,8 +571,7 @@ impl Queue {
             mmu::PROT_GPU_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
-        // The UAT's dynamic range: on M5 it lies past the boot graph, its unmapped sentinel and the
-        // firmware register aperture.
+// The UAT reserves the boot graph and firmware register aperture.
         let high = low.alias_in(
             alloc.uat.kernel_vm(),
             alloc.uat.kernel_dynamic_range(),

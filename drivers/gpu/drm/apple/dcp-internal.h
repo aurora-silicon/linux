@@ -76,6 +76,7 @@ struct apple_dcp_typec_port;
 
 void dcp_swap_watchdog_arm(struct apple_dcp *dcp);
 void dcp_swap_watchdog_complete(struct apple_dcp *dcp);
+bool dcp_swap_lost(struct apple_dcp *dcp, u32 swap_id);
 void dcp_retry_placeholder_edid(struct apple_dcp *dcp,
 				const struct drm_edid *drm_edid);
 bool dcp_typec_relink(struct apple_dcp *dcp);
@@ -341,6 +342,8 @@ struct dcp_desktop_state {
 	 * framebuffer was evicted; the first atomic enable reuses them.
 	 */
 	bool trial_powered, trial_modeset_ok;
+	/* The takeover kept the loader's mode without setting it. */
+	bool takeover_adopted;
 	u32 trial_timing_mode_id, trial_color_mode_id;
 	/* Result of the last power-on: 0 ok, 1 timeout, 2 failed. */
 	u8 poweron_result;
@@ -455,6 +458,8 @@ struct apple_dcp {
 	/* Bumped by every iomfb poweron; see afk_compact_slot(). */
 	u32 afk_power_gen;
 	bool external;
+	/* A desktop 26.x external processor (apple,t6041-dcpext) */
+	bool desktop_external;
 	/*
 	 * A failsafe dcpext (dcp_ext_is_failsafe(): T8122's, T6041's, T6050's):
 	 * the DRM device of the other displays never waits on this processor.
@@ -596,6 +601,15 @@ struct apple_dcp {
 	u32 last_swap_id;
 	/* last_swap_id is only meaningful after the first swap completes */
 	bool have_swap_complete;
+	/* swap id of the last started swap */
+	u32 started_swap_id;
+	/*
+	 * A started swap whose flip a commit gave up on
+	 * (dcp_drm_crtc_flip_lost()); event_lock. Firmware that does not track
+	 * its presents ignores its completion, see dcp_swap_lost().
+	 */
+	u32 lost_swap_id;
+	bool swap_lost;
 	ktime_t swap_start;
 	u64 swap_submit_timestamp;
 
@@ -903,6 +917,21 @@ struct apple_dcp {
 	/* T6030 HDMI converter service requests, see dcp-hdmi.c */
 	struct dcp_hdmi *hdmi;
 
+	/*
+	 * Interrupts of a Thunderbolt DP tunnel's DP IN adapter, to pass to
+	 * the DPTX port; see apple_dcp_tb_dp_event().
+	 */
+	struct work_struct tb_event_work;
+	/* Serializes event delivery against attachment retirement. */
+	struct mutex tb_event_lock;
+	struct apple_dcp_typec_route *tb_event_route;
+	u64 tb_event_generation;
+	unsigned long tb_events;
+	bool tb_event_hpd;
+	unsigned int tb_irq_hpd_count;
+	unsigned int tb_hpd_count;
+	ktime_t tb_irq_hpd_last;
+
 	/* Kept last: the template instances share the layout above. */
 	struct dcp_desktop_state *desktop;
 	/* Internal panel identity; NULL without an internal panel. */
@@ -1014,6 +1043,23 @@ bool dcp_has_panel(struct apple_dcp *dcp);
  * adaptive sync minimum rate (see dcp_vrr_update()).  The external
  * processors ignore a new minimum on a live mode.
  */
+/*
+ * Desktop 26.x swaps that the watchdog follows: adaptive ones, and those on a
+ * loader mode the takeover adopted until one of them completes.
+ */
+static inline bool dcp_desktop_swap_watched(struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
+	       (READ_ONCE(dcp->vrr_enabled) ||
+		(dcp->desktop && READ_ONCE(dcp->desktop->takeover_adopted)));
+}
+
+static inline void dcp_takeover_adopt_proven(struct apple_dcp *dcp)
+{
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->desktop)
+		WRITE_ONCE(dcp->desktop->takeover_adopted, false);
+}
+
 static inline bool dcp_vrr_live(struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->main_display &&

@@ -37,14 +37,15 @@
 //!
 //! A boot policy change (a new Stage 1, a different boot object) makes the
 //! enclave rewrite one existing session record the first time Linux's
-//! identity keybag is unlocked under the new policy. Linux did not create
-//! that record. On a boot under an unchanged policy that unlock rewrites no
-//! session record at all, so a rewrite inside it is the sign of a policy
+//! identity keybag is used under the new policy: its first unlock, or
+//! Touch ID's `DESIGNATE_KEYBAG` when that comes first. Linux did not create
+//! that record. On a boot under an unchanged policy neither rewrites an
+//! existing session record, so a rewrite inside them is the sign of a policy
 //! change. The guard lets exactly one kind-4 rewrite through in that window
-//! ([`policy_window`]): the first unlock of an identity keybag that already
-//! existed, at most once per boot, never a delete, and only once the
-//! record's previous value is saved in a host file ([`PREVIOUS_PATH`]).
-//! The record is not added to Linux's list.
+//! ([`policy_window`]): the first unlock or designate of an identity keybag
+//! that already existed, at most once per boot, never a delete, and only
+//! once the record's previous value is saved in a host file
+//! ([`PREVIOUS_PATH`]). The record is not added to Linux's list.
 //!
 //! For a policy change the window did not cover, `aurora-sep-policy-change`
 //! backs up the gigalocker and leaves a one-time allowance in a host file
@@ -122,9 +123,9 @@ fn with_window<T>(why: Rewrite, f: impl FnOnce() -> T) -> T {
     result
 }
 
-/// Runs `unlock`, the unlock of an identity keybag that already existed,
-/// with the boot policy window open if it is this boot's first. Later
-/// unlocks run with it closed.
+/// Runs `unlock`, the unlock or Touch ID designate of an identity keybag
+/// that already existed, with the boot policy window open if it is this
+/// boot's first. Later ones run with it closed.
 pub(crate) fn policy_window<T>(unlock: impl FnOnce() -> T) -> T {
     with_window(Rewrite::PolicyChange, unlock)
 }
@@ -326,8 +327,9 @@ pub(crate) enum Allowance {
     Record(Key),
     /// The first existing record of this kind the enclave asks to rewrite.
     /// An installer that changes the boot policy cannot know the record's
-    /// session id beforehand; the first identity unlock under the new policy
-    /// comes before anything else can rewrite a session record.
+    /// session id beforehand; the keybag's first use under the new policy
+    /// (an unlock or Touch ID's designate) comes before anything else can
+    /// rewrite a session record.
     FirstOfKind(u8),
 }
 
@@ -399,29 +401,40 @@ pub(crate) trait ListFile {
     fn sync_parent(&self) -> Result<()>;
 }
 
-impl ListFile for StoreFile {
+/// Linux's list at [`OWNED_PATH`], opened for each access and closed again.
+///
+/// The guard lives as long as the xART store, which the driver keeps until it
+/// is unbound, and nothing unbinds it before a reboot. Holding the list open
+/// for writing that long keeps a writer on the root file system, so the
+/// read-only remount of `/` at shutdown fails with EBUSY. Writes never create
+/// the file: only [`Guard::open`] does that.
+pub(crate) struct HostListFile;
+
+impl ListFile for HostListFile {
     fn size(&self) -> Result<u64> {
-        StoreFile::size(self)
+        StoreFile::open_readonly(OWNED_PATH)?.size()
     }
 
     fn read_exact(&self, off: u64, buf: &mut [u8]) -> Result<()> {
-        StoreFile::read_exact(self, off, buf)
+        StoreFile::open_readonly(OWNED_PATH)?.read_exact(off, buf)
     }
 
     fn write_all(&self, off: u64, buf: &[u8]) -> Result<()> {
-        StoreFile::write_all(self, off, buf)
+        StoreFile::open_writable_existing(OWNED_PATH)?.write_all(off, buf)
     }
 
+    // fsync on a new descriptor still flushes the writes made through earlier
+    // ones, and reports a writeback error that no descriptor has seen yet.
     fn sync(&self) -> Result<()> {
-        StoreFile::sync(self)
+        StoreFile::open_readonly(OWNED_PATH)?.sync()
     }
 
     fn sync_parent(&self) -> Result<()> {
-        StoreFile::sync_parent(self)
+        StoreFile::open_readonly(OWNED_PATH)?.sync_parent()
     }
 }
 
-pub(crate) struct Guard<F: ListFile = StoreFile> {
+pub(crate) struct Guard<F: ListFile = HostListFile> {
     level: u8,
     /// `None` when the list could not be opened: nothing can be adopted, so
     /// every session write that is not already listed is refused.
@@ -452,7 +465,8 @@ impl Guard {
         let mut guard = Guard::with_file(
             level,
             existing,
-            StoreFile::open_host(OWNED_PATH).map(|(file, _created)| file),
+            // Only to create the list if absent; the handle closes here.
+            StoreFile::open_host(OWNED_PATH).map(|_| HostListFile),
         );
         guard.allowance = take_allowance();
         guard

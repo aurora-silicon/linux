@@ -33,6 +33,15 @@ impl super::RenderState {
             .any(|pair| pair.owner() == Some(owner) && pair.replay_through(through))
     }
 
+    /// Whether any pair holds a group parked for replay.
+    pub(in crate::g17) fn replay_parked(&self) -> bool {
+        self.entries
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.pair.as_ref())
+            .any(|pair| pair.replay_front().is_some())
+    }
+
     pub(in crate::g17) fn replay_polling(&self) -> bool {
         self.entries
             .iter()
@@ -44,9 +53,12 @@ impl super::RenderState {
 
 impl Firmware {
     pub(in crate::g17) fn replay_render(&mut self, deferred: &mut DeferredBatch) -> Result {
-        if self.recovery.pending()
-            || crate::g17::recovery::Memory::recovery_state(&self.init)? != 0
-        {
+        // Runs on every event pass: with no group parked for replay, return before reading the
+        // recovery state from shared memory.
+        if self.recovery.pending() || !self.queues.render.replay_parked() {
+            return Ok(());
+        }
+        if crate::g17::recovery::Memory::recovery_state(&self.init)? != 0 {
             return Ok(());
         }
         for slot in 0..self.queues.render.entries.len() {
@@ -78,7 +90,12 @@ impl Firmware {
             return Ok(false);
         };
         if stalled {
-            return Err(ETIMEDOUT);
+            // The parked groups' fences must signal; a stalled replay is no reason to lose
+            // every client's device.
+            self.with_render(slot, |pair, _| {
+                pair.fail_stalled_replay(&mut |event| deferred.push(event))
+            })?;
+            return Ok(false);
         }
         if busy {
             return Ok(false);
@@ -128,9 +145,16 @@ impl Firmware {
                 self.with_render(slot, |pair, _| pair.finish_replay(&packet))?;
                 Ok(true)
             }
-            Err(error) if error == EBUSY || error == EAGAIN => Ok(false),
             Err(error) => {
                 self.with_render(slot, |pair, _| {
+                    // A refusal before publication leaves the descriptor prepared; the next
+                    // pass prepares the group again, which it cannot while that one is held.
+                    if !packet.is_published() {
+                        pair.discard_prepared(&packet)?;
+                    }
+                    if error == EBUSY || error == EAGAIN {
+                        return Ok(());
+                    }
                     pair.fail_replay(error, &mut |event| deferred.push(event))
                 })?;
                 Ok(false)

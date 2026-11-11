@@ -9,14 +9,23 @@
 
 /dts-v1/;
 
+/*
+ * PMP manages system power states, as on the J314s: the ANE, GPU, AVD and
+ * JPEG send it their performance requests, and the board idles lower.
+ */
+#define APPLE_USE_PMP
+
 #include "t6000.dtsi"
 #include "t600x-j314-j316.dtsi"
+#include "t6000-hwmon-rails.dtsi"
 
 / {
 	compatible = "apple,j316s", "apple,t6000", "apple,arm-platform";
 	model = "Apple MacBook Pro (16-inch, M1 Pro, 2021)";
 
 	aliases {
+		rtc0 = &smc_rtc;
+		rtc1 = &pmu_rtc;
 		sep = &sep;
 	};
 };
@@ -75,12 +84,10 @@
 &aop {
 	accel {
 		compatible = "apple,t6000-aop-accel", "apple,aop-accel";
-		status = "disabled";
 	};
 
 	gyro {
 		compatible = "apple,t6000-aop-gyro", "apple,aop-gyro";
-		status = "disabled";
 	};
 };
 

@@ -23,6 +23,7 @@ properties:
       - const: apple,dockchannel-uart
       - items:
           - enum:
+              - apple,t6000-dockchannel-uart
               - apple,t8112-dockchannel-uart
               - apple,t6020-dockchannel-uart
               - apple,t6021-dockchannel-uart

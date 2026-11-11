@@ -118,6 +118,8 @@ mod lifetime;
 #[cfg(CONFIG_DRM_ASAHI_M5)]
 mod m5_context;
 mod ppl;
+#[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+mod m3;
 mod residency;
 mod shared;
 mod sparse_tile;
@@ -1379,8 +1381,7 @@ impl VmBind {
         self.1
     }
 
-    /// Stable wire incarnation for this active root lease. M4 reserves zero as unbound.
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    /// Stable firmware wire incarnation for this active root lease; zero is unbound.
     pub(crate) fn generation(&self) -> u8 {
         self.0.binding.lock().generation
     }
@@ -1479,6 +1480,17 @@ impl TimestampVmap {
     fn size(&self) -> usize {
         use kernel::drm::gem::BaseObject;
         self.0.owner().size()
+    }
+
+    /// Reads the naturally aligned timestamp at byte `offset` of the GEM object.
+    pub(crate) fn read(&self, offset: usize) -> Option<u64> {
+        let end = offset.checked_add(size_of::<u64>())?;
+        if end > self.size() || offset % size_of::<u64>() != 0 {
+            return None;
+        }
+        // SAFETY: The complete aligned extent was checked above, inside this pinned vmap.
+        let source = unsafe { &*self.0.addr.cast::<u8>().add(offset).cast::<AtomicU64>() };
+        Some(u64::from_le(source.load(Ordering::Acquire)))
     }
 
     /// Writes a timestamp at byte `offset` of the GEM object. Aligned results use a complete
@@ -3054,7 +3066,6 @@ impl Vm {
     }
 
     /// Spend the binding generation only for an incarnation exposed to firmware.
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
     pub(crate) fn mark_binding_published(&self) -> Result {
         let uat = self.gpuvm.lock_inner().uat_inner.clone();
         let binding = self.binding.lock();
@@ -3093,7 +3104,9 @@ impl Vm {
             return Err(EINVAL);
         }
 
-        dev_info!(dev, "MMU: IO map: {:#x}:{:#x} -> {:#x}\n", phys, size, iova);
+        crate::debug! {
+            dev_info!(dev, "MMU: IO map: {:#x}:{:#x} -> {:#x}\n", phys, size, iova);
+        }
 
         let inner = vm_exec.unique_gpuvm.data();
         let uat_inner = inner.uat_inner.clone();
@@ -3498,7 +3511,7 @@ impl Uat {
     /// Creates the same owned-RAM adopted UAT, choosing whether application contexts also
     /// name the firmware upper root. M4 qualifies only context 0 for firmware-upper access;
     /// its application TTBAT upper words stay zero. G15 preserves its existing shared upper.
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_M3_T8122))]
     pub(crate) fn new_adopted_with_user_upper(
         dev: &driver::AsahiDrmDevice,
         geometry: UatGeometry,
@@ -3955,12 +3968,12 @@ impl Uat {
     /// and the firmware register aperture. Client mappings have their own VA.
     pub(crate) fn kernel_dynamic_range(&self) -> Range<u64> {
         let mut range = self.geometry.kernel_range();
-        range.start += if self.is_m5() {
-            0x2_0000_0000
+        if self.is_m5() {
+            range.start += 0x2_0000_0000;
+            range
         } else {
-            crate::hw::t8140::dynamic::KERNEL_OFFSET
-        };
-        range
+            crate::hw::t8140::dynamic::upper(range)
+        }
     }
 
     /// Canonical lower objects are aliased into every owning client VM.

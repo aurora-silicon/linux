@@ -209,9 +209,15 @@ static bool show_notch;
 module_param(show_notch, bool, 0644);
 MODULE_PARM_DESC(show_notch, "Use the full display height and show the notch (also when /chosen/asahi,show-notch is \"1\")");
 
-bool hdmi_audio;
+/*
+ * DP/HDMI audio of external displays, on by default as on macOS: a display
+ * that takes audio, over HDMI or DisplayPort (USB-C alt mode included),
+ * is an audio output while it is connected. hdmi_audio=0 leaves the audio
+ * endpoints stopped and registers no sound cards.
+ */
+bool hdmi_audio = true;
 module_param(hdmi_audio, bool, 0644);
-MODULE_PARM_DESC(hdmi_audio, "Enable unstable HDMI audio support");
+MODULE_PARM_DESC(hdmi_audio, "DP/HDMI audio of external displays (default: on)");
 
 static bool unstable_edid = true;
 module_param(unstable_edid, bool, 0644);
@@ -537,6 +543,63 @@ void dcp_drm_crtc_error(struct apple_crtc *crtc,
 	if (state_event != pending)
 		dcp_failed_page_flip(crtc, state_event, error);
 	spin_unlock_irqrestore(&drm->event_lock, flags);
+}
+
+/*
+ * The flip of the commit whose flip_done is @flip_done never completed: send
+ * its still pending event as failed. Only that commit's event is sent; a newer
+ * commit's stays for its own swap.
+ *
+ * The swap started last is that flip's. Its displaced framebuffers are
+ * unarmed, as the swap watchdog does, so that the next swap arms them and its
+ * completion releases them. Its completion may still come, after the next
+ * commit installed its event: firmware that does not track its presents
+ * ignores it (dcp_swap_lost()), so that it does not retire the newer flip.
+ */
+void dcp_drm_crtc_flip_lost(struct apple_crtc *crtc,
+			    struct completion *flip_done, int error)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(crtc->dcp);
+	unsigned long flags;
+	bool lost = false;
+	u32 swap_id = 0;
+
+	spin_lock_irqsave(&crtc->base.dev->event_lock, flags);
+	if (crtc->event && crtc->event->base.completion == flip_done) {
+		dcp_failed_page_flip(crtc, crtc->event, error);
+		crtc->event = NULL;
+		swap_id = READ_ONCE(dcp->started_swap_id);
+		dcp->lost_swap_id = swap_id;
+		dcp->swap_lost = true;
+		lost = true;
+	}
+	spin_unlock_irqrestore(&crtc->base.dev->event_lock, flags);
+
+	if (lost)
+		dcp_unarm_retained_framebuffers(dcp, swap_id);
+}
+
+/*
+ * Is @swap_id the swap whose flip dcp_drm_crtc_flip_lost() gave up on? On
+ * firmware that does not track its presents, its completion would retire
+ * whichever flip is pending; it is ignored instead. Swaps complete in order,
+ * so once another swap completed, the lost one will not.
+ */
+bool dcp_swap_lost(struct apple_dcp *dcp, u32 swap_id)
+{
+	unsigned long flags;
+	bool lost;
+
+	spin_lock_irqsave(&dcp->crtc->base.dev->event_lock, flags);
+	lost = dcp->swap_lost && dcp->lost_swap_id == swap_id;
+	dcp->swap_lost = false;
+	spin_unlock_irqrestore(&dcp->crtc->base.dev->event_lock, flags);
+
+	if (lost)
+		dev_warn_ratelimited(dcp->dev,
+				     "completion for lost present %u ignored\n",
+				     swap_id);
+	return lost;
 }
 
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now)
@@ -1230,6 +1293,19 @@ VISIBLE_IF_KUNIT void dcp_swap_watchdog(struct work_struct *work)
 		dcp_unarm_retained_framebuffers(dcp, READ_ONCE(dcp->desktop->present_id));
 		dcp_backlight_desktop_finish(dcp, READ_ONCE(dcp->desktop->present_id),
 					     true, false);
+		/*
+		 * The firmware did not take a frame on the adopted loader mode:
+		 * set the mode after all, through the hotplug worker.
+		 */
+		if (xchg(&dcp->desktop->takeover_adopted, false)) {
+			dev_warn(dcp->dev, "no swap completed on the adopted mode, setting it\n");
+			dcp->desktop->mode_live = false;
+			dcp_mode_invalidate(&dcp->mode_state);
+			dcp_drm_crtc_vblank(dcp->crtc);
+			if (dcp->connector)
+				dcp_queue_hotplug(dcp->connector);
+			return;
+		}
 	}
 
 	if (!iomfb_retire_dropped_present_h17p(dcp))
@@ -1251,9 +1327,7 @@ VISIBLE_IF_KUNIT void dcp_swap_watchdog(struct work_struct *work)
 
 void dcp_swap_watchdog_arm(struct apple_dcp *dcp)
 {
-	if (dcp_is_typec_output(dcp) ||
-	    (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
-	     READ_ONCE(dcp->vrr_enabled))) {
+	if (dcp_is_typec_output(dcp) || dcp_desktop_swap_watched(dcp)) {
 		dcp->swap_watchdog_deadline = jiffies +
 			msecs_to_jiffies(DCP_SWAP_WATCHDOG_MS);
 		mod_delayed_work(system_dfl_wq, &dcp->swap_watchdog_wq,
@@ -1265,6 +1339,8 @@ void dcp_swap_watchdog_complete(struct apple_dcp *dcp)
 {
 	cancel_delayed_work(&dcp->swap_watchdog_wq);
 	dcp->swap_watchdog_retrains = 0;
+	/* A completed swap on the adopted mode proves it. */
+	dcp_takeover_adopt_proven(dcp);
 }
 
 /*
@@ -2933,13 +3009,25 @@ static int dcp_dptx_connect_attached(struct apple_dcp *dcp, u32 port)
  * does not reset them, dcp_poweron() does. dcp-relink.h holds the
  * decisions; relink_lock protects their state.
  */
+/*
+ * A T6050 tunnel keeps its Thunderbolt binding and its HPD when the firmware
+ * drops the sink after servicing its IRQ_HPD (see dcp_tb_event_work()):
+ * nothing else connects it again. Other tunnels are left to their owners.
+ */
+static bool dcp_tunnel_relinks(struct apple_dcp *dcp)
+{
+	return of_device_is_compatible(dcp->dev->of_node, "apple,t6050-dcpext") &&
+	       READ_ONCE(dcp->tb_event_hpd);
+}
+
 static bool dcp_typec_relink_eligible(struct apple_dcp *dcp)
 {
 	struct apple_connector *connector = READ_ONCE(dcp->connector);
 
 	/* H17P and native external pipes recover through their own lifecycle */
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P || dcp->external_native ||
-	    !dcp_is_typec_output(dcp) || dcp_is_usb4_output(dcp) ||
+	    !dcp_is_typec_output(dcp) ||
+	    (dcp_is_usb4_output(dcp) && !dcp_tunnel_relinks(dcp)) ||
 	    dcp_is_external_h17p(dcp) || !dcp->typec_connector)
 		return false;
 	/*
@@ -2947,7 +3035,7 @@ static bool dcp_typec_relink_eligible(struct apple_dcp *dcp)
 	 * not one the driver itself let go, holds HPD low for (see
 	 * dcp_placeholder_edid_work()) or moves to another pipeline.
 	 */
-	/* Tunnels are excluded above; direct follows use the carried gate. */
+	/* Most tunnels are excluded above; direct follows use the carried gate. */
 	return READ_ONCE(dcp->typec_work_enabled) &&
 	       READ_ONCE(dcp->typec_cable_connected) &&
 	       !READ_ONCE(dcp->typec_crtc_off) &&
@@ -3939,7 +4027,7 @@ int dcp_start(struct platform_device *pdev)
 
 /*
  * A native T6030 external processor: its DP/HDMI audio endpoint (EP 0x29)
- * on the driver's opt-in (hdmi_audio), as the other DCPs start it, for a
+ * unless hdmi_audio is off, as the other DCPs start it, for a
  * processor whose port@0 links an audio device; once per session, and after
  * the first display's EDID was read: with the endpoint's interfaces
  * published, an EDID copy (dcpavserv_copy_edid()) has the firmware rebuild
@@ -5098,6 +5186,12 @@ VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release
 	disable_delayed_work_sync(&dcp->hdmi_settle_wq);
 	disable_delayed_work_sync(&dcp->hdmi_recheck_wq);
 	disable_delayed_work_sync(&dcp->link_recovery_wq);
+	disable_work_sync(&dcp->tb_event_work);
+	scoped_guard(mutex, &dcp->tb_event_lock) {
+		dcp->tb_events = 0;
+		dcp->tb_event_route = NULL;
+		dcp->tb_event_generation = 0;
+	}
 	disable_delayed_work_sync(&dcp->hybrid_wq);
 	dcp_hdmi_disable(dcp);
 }
@@ -5113,6 +5207,7 @@ VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
 	enable_delayed_work(&dcp->hdmi_settle_wq);
 	enable_delayed_work(&dcp->hdmi_recheck_wq);
 	enable_delayed_work(&dcp->link_recovery_wq);
+	enable_work(&dcp->tb_event_work);
 	enable_delayed_work(&dcp->hybrid_wq);
 	dcp_hdmi_enable(dcp);
 	scoped_guard(mutex, &dcp->hpd_mutex)
@@ -6025,6 +6120,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	}
 	dcp->ext_failsafe = dcp_ext_is_failsafe(dev->of_node);
 	dcp->external = of_device_is_compatible(dev->of_node, "apple,t6030-dcpext");
+	dcp->desktop_external = of_device_is_compatible(dev->of_node, "apple,t6041-dcpext");
 	dcp->external_native = dcp->external && dcp_t6030_ext_native(dev->of_node);
 	dcp_external_audio_init(dcp);
 	dcp->dev = dev;
@@ -6047,6 +6143,9 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	spin_lock_init(&dcp->metadata.lock);
 	mutex_init(&dcp->dcpavserv.lock);
 	INIT_WORK(&dcp->dcpavserv.close_wq, dcpavserv_close_work);
+	ret = dcpavserv_edid_retry_init(dcp);
+	if (ret)
+		return ret;
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
 	/* The display such a processor finds at boot is its first sink. */
 	if (dcp_sink_metadata(dcp))
@@ -6082,6 +6181,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&dcp->typec_reconnect_wq,
 			  dcp_typec_reconnect_work);
 	INIT_DELAYED_WORK(&dcp->link_recovery_wq, dcp_link_recovery_work);
+	mutex_init(&dcp->tb_event_lock);
+	INIT_WORK(&dcp->tb_event_work, dcp_tb_event_work);
 	INIT_DELAYED_WORK(&dcp->placeholder_edid_wq,
 			  dcp_placeholder_edid_work);
 	INIT_DELAYED_WORK(&dcp->typec_relink_wq, dcp_typec_relink_work);
@@ -6100,6 +6201,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	disable_delayed_work(&dcp->typec_relink_wq);
 	disable_delayed_work(&dcp->announce_wq);
 	disable_delayed_work(&dcp->link_recovery_wq);
+	disable_work(&dcp->tb_event_work);
 	dcp->announce.stopped = true;
 	/*
 	 * A native external pipe's bind enables these; firmware callbacks may
@@ -6855,7 +6957,9 @@ static int dcp_platform_suspend(struct device *dev)
 
 	/*
 	 * T8132: setPowerState powers the display down; the coprocessor keeps
-	 * running and its power domains stay on, as below.
+	 * running and its power domains stay on, as below, unless the internal
+	 * display is blanked with appledrm.power_gate_ms set: then the
+	 * coprocessor and its domains are powered down too (iomfb_m4_suspend()).
 	 */
 	if (iomfb_is_m4(dcp)) {
 		int ret = iomfb_m4_suspend(dcp);

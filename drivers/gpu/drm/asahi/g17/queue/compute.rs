@@ -371,9 +371,13 @@ impl Graph {
         self.ring = Some(ring);
         Ok(())
     }
-    fn ensure_record_slot(&self, slot: usize) -> Result {
+    /// `cursors`: this publication's snapshot (M5), else a fresh read.
+    fn ensure_record_slot(&self, slot: usize, cursors: Option<Cursors>) -> Result {
         if let Some(end) = *self.record_ends.get(slot).ok_or(EINVAL)? {
-            let cursors = self.cursors()?;
+            let cursors = match cursors {
+                Some(cursors) => cursors,
+                None => self.cursors()?,
+            };
             if !cursors.consumed(end, cursors.count)? {
                 return Err(EAGAIN);
             }
@@ -516,6 +520,10 @@ struct Active {
     observed_at: Option<u64>,
     failure_deferred: bool,
     qos_pending: bool,
+    /// Spared because it came back unexecuted after a recovery ([`Queue::classify_unexecuted`]),
+    /// not by the recovery's own attribution, or a replay of spared work, which runs again from
+    /// the start. A later fault report on the queue makes it guilty.
+    spared_as_dropped: bool,
 }
 struct Previous<B = Binding, C = Arc<Context>> {
     binding: Option<B>,
@@ -768,6 +776,24 @@ impl Queue {
         {
             self.fault_stamp = Some(stamp);
         }
+        // The report can arrive after the queue's unexecuted commands were spared as dropped by
+        // a recovery, or while replays of spared work run: the failed command is among them.
+        // They are guilty, as without the recovery: the VM fails, and the queue is neither
+        // replayed nor returned to service.
+        let mut guilty = None;
+        for active in self.active.iter_mut().filter(|active| active.spared_as_dropped) {
+            active.spared_as_dropped = false;
+            if !active.packet.completion.signalled() {
+                active.packet.completion.classify(recovery::Class::Guilty);
+                guilty.get_or_insert_with(|| active.packet.completion.status().clone());
+            }
+        }
+        if let Some(status) = guilty {
+            self.spared_quarantine = false;
+            if self.terminal.is_none() {
+                self.terminal = Some((status, ENODATA));
+            }
+        }
     }
 
     /// The firmware failed a command of this quarantined queue, and the queue still waits for
@@ -847,9 +873,13 @@ impl Queue {
                     && active.packet.command.long_job()
             })
     }
-    /// Quarantines without a pending witness no longer describe live pipe order.
+    /// Quarantines without a pending witness no longer describe live pipe order. Spared work
+    /// whose fences still wait (`spared_deferred`) does, whether or not every entry holds a
+    /// ticket: it holds the GPU until the firmware drains it or this queue's watchdog settles it
+    /// ([`Self::timeout`]), so other VMs' watchdogs see it as a failed blocker and defer to it
+    /// within their bounded renewals instead of failing their own work at once.
     pub(crate) fn timeout_head(&self) -> Option<crate::g17::timeout::Head> {
-        if self.quarantined && !self.awaiting_witness {
+        if self.quarantined && !self.awaiting_witness && !self.spared_deferred {
             return None;
         }
         self.active.front().map(|active| crate::g17::timeout::Head {
@@ -1067,6 +1097,19 @@ impl Queue {
         self.failure_status_pending = false;
         self.awaiting_witness =
             self.active.len != 0 && self.active.iter().all(|a| a.ticket.is_some());
+        // Spared work waits for its retirement witness to replay or fail. An entry without a
+        // ticket never gives one (release_witnessed() validates every ticket), and an
+        // unpublished entry's own watchdog does nothing, so nothing would bound that wait. Fail
+        // it now instead: ENODATA, which stays out of the VM status.
+        if self.spared_deferred && !self.awaiting_witness {
+            for active in self.active.iter_mut() {
+                if !active.failure_deferred {
+                    defer(Deferred::FailedOwned(active.packet.completion.clone(), ENODATA))?;
+                    active.failure_deferred = true;
+                }
+            }
+            self.spared_deferred = false;
+        }
         Ok(terminal)
     }
 
@@ -1089,6 +1132,7 @@ impl Queue {
         let mut oldest = true;
         while let Some(front) = self.active.front() {
             let mut restart = None;
+            let mut crossed = false;
             let result = (|| {
                 let ticket = front.ticket.ok_or(EIO)?;
                 self.valid_ticket(front, &ticket)?;
@@ -1096,6 +1140,7 @@ impl Queue {
                     return Err(EAGAIN);
                 }
                 let recordless = if epoch != ticket.epoch {
+                    crossed = true;
                     Recordless::CrossedRecovery
                 } else if masks.is_none() || (finished_before && oldest) {
                     Recordless::Allowed
@@ -1194,12 +1239,39 @@ impl Queue {
                     break;
                 }
                 Err(error) => {
+                    if error == ENODATA {
+                        self.classify_unexecuted(crossed);
+                    }
                     self.terminal = self.quarantine(error, defer)?.map(|status| (status, error));
                     return Ok(());
                 }
             }
         }
         Ok(())
+    }
+
+    /// The front command came back unexecuted (ENODATA from [`retirement::poll`]), and every
+    /// later command of the queue is ordered behind it, so none of them ran either. After a
+    /// recovery (`crossed`) the recovery dropped them: they cannot have faulted the GPU and are
+    /// spared, as the render groups a restart drops are, so they fail or replay without
+    /// poisoning their VM. Without a recovery in between, or once the firmware reported a fault
+    /// on this queue ([`Self::note_fault`]), the zero-duration record is the firmware's report
+    /// of the queue's own failed command: the work is guilty and fails its VM as before. Work a
+    /// recovery already classified keeps its class.
+    fn classify_unexecuted(&mut self, crossed: bool) {
+        let dropped = crossed && self.fault_stamp.is_none();
+        for active in self.active.iter_mut() {
+            let completion = &active.packet.completion;
+            if completion.spared() || completion.guilty() {
+                continue;
+            }
+            if dropped {
+                completion.classify(recovery::Class::Spared);
+                active.spared_as_dropped = true;
+            } else {
+                completion.classify(recovery::Class::Guilty);
+            }
+        }
     }
 
     /// Exact terminal witness releases command pins, not installed graph ownership. Spared
@@ -1840,8 +1912,10 @@ impl Queue {
         }
         let binding = self.binding.take()?;
         self.retained_owner = Some(binding.context.retain_firmware_pages());
-        // The backing served the exited VM only: give it back for fresh backing.
-        self.needs_fresh_backing = true;
+        // The backing stays tied to the exited VM (`pool_serves` refuses every other VM). It
+        // is given back only when another VM needs this queue (`require_fresh_backing` under
+        // QID pressure), not at every owner exit: releasing and re-arming the pool of each
+        // exited owner's idle queue left a later command retired without a completion stamp.
         Some(binding)
     }
     /// An idle retained queue whose USC backing may be given back.
@@ -2157,6 +2231,11 @@ impl Queue {
 
     /// A watchdog settles spared, deferred waiters without changing their VM status.
     /// Fully ticketed spared work can still return this queue after its drain witness.
+    ///
+    /// Spared, deferred work is work a recovery dropped before it ran (the quarantine's
+    /// ENODATA) whose witness did not come before this queue's job watchdog expired: it fails
+    /// with ENODATA too. ETIMEDOUT would reach the client as a lost device (`fail_while_owned`
+    /// reports every error but ENODATA and ECANCELED), for work it never got to run.
     pub(crate) fn timeout(
         &mut self,
         defer: &mut impl FnMut(Deferred) -> Result,
@@ -2172,7 +2251,7 @@ impl Queue {
                 if !active.failure_deferred {
                     defer(Deferred::FailedOwned(
                         active.packet.completion.clone(),
-                        ETIMEDOUT,
+                        ENODATA,
                     ))?;
                     active.failure_deferred = true;
                 }
@@ -2331,7 +2410,17 @@ impl Graph {
         Ok(object.gpu_va() + start as u64)
     }
     fn append(&self, expected: u32, address: u64, before_publish: impl FnOnce()) -> Result<u32> {
-        let cursors = self.cursors()?;
+        self.append_to(self.cursors()?, expected, address, before_publish)
+    }
+    /// Appends against `cursors`: a fresh read, or an M5 publication's snapshot whose
+    /// producer the publication advanced itself (see `publish_with_native_waits`).
+    fn append_to(
+        &self,
+        cursors: Cursors,
+        expected: u32,
+        address: u64,
+        before_publish: impl FnOnce(),
+    ) -> Result<u32> {
         if cursors.producer != expected
             || cursors.count != ITEM_RING_ENTRIES
             || expected >= ITEM_RING_ENTRIES
@@ -2459,6 +2548,10 @@ impl Queue {
             || dependencies
                 .iter()
                 .any(|dependency| dependency.qid() != qid);
+        // On M5 one read of the item-ring cursors serves the whole publication: the producer is
+        // the host's and only this publication moves it, and the consumer only advances, so the
+        // snapshot is conservative for the room, record-slot and reclaim checks.
+        let mut snapshot = None;
         if self.graph.m5 {
             // The configuration and its notification are the only items an M5 kick appends.
             let cursors = self.graph.cursors()?;
@@ -2472,6 +2565,7 @@ impl Queue {
             if free < 2 {
                 return Err(ENOSPC);
             }
+            snapshot = Some(cursors);
         } else {
             item_capacity(self.graph.cursors()?, entry_signal)?;
         }
@@ -2484,7 +2578,7 @@ impl Queue {
         }
         let record_slot = (self.graph.m5 || !first).then_some(self.ordinal as usize % RECORD_SLOTS);
         if let Some(slot) = record_slot {
-            self.graph.ensure_record_slot(slot)?;
+            self.graph.ensure_record_slot(slot, snapshot)?;
         }
         let timestamp_va = if self.graph.m5 {
             packet.completion.bind_m5_compute_timestamps(
@@ -2543,8 +2637,15 @@ impl Queue {
         let predecessor = KickPredecessor::new(qid, kick_parent)?;
         let matrix_ops = self.graph.m5 && *requested_matrix_ops;
         let m5_board = if self.graph.m5 { Some(self.graph.board.ok_or(EINVAL)?) } else { None };
-        let m5_args = m5_board.map(|board| {
-            let tuple = crate::g17::fw::m5::compute::kick_tuple(board);
+        // Every earlier kick of this queue has retired, so the parent has completed.
+        let parent_retired = self.active.len == 0
+            && self.replays.len == 0
+            && !self.quarantined
+            && !self.awaiting_witness;
+        let parent_class = m5_board
+            .map(|board| crate::g17::fw::m5::compute::parent_dependency(board, parent_retired));
+        let m5_args = m5_board.zip(parent_class).map(|(board, parent_class)| {
+            let tuple = crate::g17::fw::m5::compute::kick_tuple(board, parent_class);
             crate::g17::fw::m5::compute::DescriptorArgs {
             registers: crate::g17::fw::m5::compute::RegisterArgs {
                 matrix_ops,
@@ -2564,7 +2665,10 @@ impl Queue {
                 dispatch_control: crate::g17::fw::m5::compute::dispatch_control(board, tuple.dispatch_base),
                 auxiliary_control: tuple.auxiliary_control,
             },
-            descriptor_va: descriptor_low, submit_sequence: 0, work_state_va: work_node,
+            descriptor_va: descriptor_low,
+            // M5 Pro's descriptors carry the ordinal as the submission sequence too, as macOS's do.
+            submit_sequence: if board.completion_inputs() { u64::from(self.ordinal) } else { 0 },
+            work_state_va: work_node,
             cdm_end_va: *cdm_end_va, stamp_va: [args.stamp_va, args.aux_stamp_va],
             stamp_value: crate::g17::fw::stamp_value(kick_timestamp.get() as u32), qid: u32::from(qid),
             kick_timestamp: kick_timestamp.get(),
@@ -2573,12 +2677,14 @@ impl Queue {
             shared_control_va: self.pool.control_va(), event_metadata: [0;16],
             usage_fw_va: self.graph.usage.gpu_va(), completion_identity: 1,
         }});
-        // Explicit dependencies keep the pipelined class; the implicit parent, last, takes its
-        // own ([`crate::g17::fw::m5::compute::parent_dependency`]).
-        let mut m5_dependency_types = [crate::g17::fw::m5::compute::COMPUTE_PIPELINED_DEPENDENCY;
+        // Explicit dependencies take the board's explicit class; the implicit parent, last,
+        // takes its own ([`crate::g17::fw::m5::compute::parent_dependency`]).
+        let mut m5_dependency_types = [m5_board.map_or(
+            crate::g17::fw::m5::compute::COMPUTE_PIPELINED_DEPENDENCY,
+            crate::g17::fw::m5::compute::explicit_dependency);
             crate::g17::fw::kick::QID_MAX as usize + 1];
-        if let (Some(board), Some(parent)) = (m5_board, m5_dependency_types.get_mut(dependencies.len())) {
-            *parent = crate::g17::fw::m5::compute::parent_dependency(board, false);
+        if let (Some(class), Some(parent)) = (parent_class, m5_dependency_types.get_mut(dependencies.len())) {
+            *parent = class;
         }
         let kick_args = KickArgs {
             qid,
@@ -2619,6 +2725,8 @@ impl Queue {
                 observed_at: None,
                 failure_deferred: false,
                 qos_pending: false,
+                // A replay keeps its spared class: its own fault must still make it guilty.
+                spared_as_dropped: packet.completion.spared(),
             })
             .map_err(|_| EBUSY)?;
         self.retirement_ready = false;
@@ -2650,13 +2758,13 @@ impl Queue {
                 let cursors = self.graph.cursors()?;
                 let _ = self.graph.recycle(cursors);
             }
-            if self.graph.m5 { let cursors = self.graph.cursors()?; self.graph.recycle(cursors)?; }
+            if let Some(cursors) = snapshot { self.graph.recycle(cursors)?; }
             let config_va = if send_config {
                 Some(self.graph.record(record_slot, CONFIG, 0xc0, config)?)
             } else {
                 None
             };
-            let cursors = self.graph.cursors()?;
+            let cursors = match snapshot { Some(cursors) => cursors, None => self.graph.cursors()? };
             let mut wait_vas = KVec::with_capacity(native.len(), GFP_KERNEL)?;
             for (index, wait) in native.iter().enumerate() {
                 let record = wait.bytes(
@@ -2681,7 +2789,8 @@ impl Queue {
                         self.pool.cancel_unpublished(target)?; Err(error)
                     })?;
                 self.active.back_mut().ok_or(EIO)?.qos_pending = true;
-                producer = self.graph.append(cursors.producer, config_va.ok_or(EINVAL)?,
+                // `cursors` is this publication's snapshot: no second read of the ring.
+                producer = self.graph.append_to(cursors, cursors.producer, config_va.ok_or(EINVAL)?,
                     || packet.mark_published())
                     .or_else(|error| {
                         self.pool.cancel_unpublished(target)?;
@@ -2782,7 +2891,13 @@ impl Queue {
                 self.graph.record(record_slot, ANNOUNCE, 0x40,
                     crate::g17::fw::m5::queue::notification(qid, kick_timestamp)?)?
             } else { self.graph.record(record_slot, ANNOUNCE, 0x40, announce)? };
-            producer = self.graph.append(producer, announce_va, || {})?;
+            producer = match snapshot {
+                // The snapshot's consumer only lags the firmware's, and the free-room check
+                // above covered both M5 items; the producer is the one this publication set.
+                Some(snapshot) => self.graph.append_to(Cursors { producer, ..snapshot }, producer,
+                    announce_va, || {})?,
+                None => self.graph.append(producer, announce_va, || {})?,
+            };
             fence(Ordering::SeqCst);
             if entry_signal && !self.graph.m5 {
                 let predecessor_va =
@@ -2884,6 +2999,11 @@ impl Queue {
     }
 
     fn install_m5(&mut self, packet: &Arc<Packet>, host: &mut impl Host) -> Result {
+        // Installed, configuration released and a kick published: nothing to check, and no
+        // reads of shared memory under the device mutex.
+        if self.m5_install.is_some() && self.ordinal != 0 && self.configuration.is_none() {
+            return Ok(());
+        }
         let (epoch, state) = host.epoch()?;
         if state == 0 { self.retire_configuration(epoch)?; }
         if let Some(end) = self.m5_install {

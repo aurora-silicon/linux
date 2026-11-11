@@ -4,19 +4,23 @@
 $id: http://devicetree.org/schemas/media/apple,t6050-isp.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple T6050 image signal processor
+title: Apple T6050 Image Signal Processor
 
 maintainers:
   - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+  - Erik Bourget <erik@ebourget.net>
 
 description:
-  The camera image signal processor of the T6050 MacBook Pros (ADT isp0).
-  Unlike earlier generations its ADT node lists the coprocessor window and
-  two PMGR windows rather than mailbox and handshake windows inside the ISP
-  block. Its buffers go through the three instances of the ISP DART. It is
-  described from the ADT so the device tree lists all of the SoC's
-  hardware; no driver supports this generation yet and the node stays
-  disabled.
+  The T6050 ISP controls the attached camera sensor and processes its frames
+  through firmware the bootloader loads. The firmware segments are described
+  as reserved memory mapped at the addresses the firmware runs them at. The
+  host exchanges commands and image buffers through streams 0 and 12 of three
+  DART instances. A capture watchdog must be serviced while streaming.
+
+  Disabled hardware inventory nodes use three register windows, five interrupts,
+  three stream references and two power domains. Driver-ready nodes name their
+  five register windows and describe the host streams and individual power gates.
+  The bootloader supplies the reserved memory and platform ID before enabling them.
 
 select:
   properties:
@@ -33,31 +37,124 @@ properties:
       - const: apple,isp
 
   reg:
+    minItems: 3
+    maxItems: 5
+    description:
+      Inventory nodes list the coprocessor and two PMGR windows. Named driver
+      resources list the coprocessor, mailbox, handshake, doorbell and watchdog.
+
+  reg-names:
     items:
-      - description: Coprocessor registers
-      - description: The ISP's PMGR control window
-      - description: The ISP's PMGR power-state window
+      - const: coproc
+      - const: mbox
+      - const: gpio
+      - const: mbox2
+      - const: wdt
 
   interrupts:
-    minItems: 5
+    minItems: 1
     maxItems: 5
 
   iommus:
-    items:
-      - description: Stream 0 of the first ISP DART
-      - description: Stream 0 of the second ISP DART
-      - description: Stream 0 of the third ISP DART
+    minItems: 3
+    maxItems: 6
+    description:
+      Inventory nodes list stream 0 of each DART. Driver-ready nodes list
+      streams 0 and 12 of each of the three DARTs, in controller order.
 
   power-domains:
-    items:
-      - description: ISP system domain
-      - description: Camera sensor domain
+    minItems: 2
+    maxItems: 8
+    description:
+      Inventory nodes list system and sensor domains. Driver-ready nodes list
+      system, CPU, FE, sensor, DPRX, secure, BE and CLR domains, in that order.
 
   clocks:
     maxItems: 2
 
-  status:
-    const: disabled
+  memory-region:
+    items:
+      - description: Firmware text loaded by the bootloader
+      - description: Firmware data loaded by the bootloader
+      - description: Firmware main memory window; host allocations follow it
+
+  memory-region-names:
+    items:
+      - const: text
+      - const: data
+      - const: heap
+
+  apple,dart-vm-size:
+    $ref: /schemas/types.yaml#/definitions/uint64
+    description:
+      Size in bytes of the host allocation aperture used by the ISP driver.
+
+  apple,platform-id:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Platform identifier passed in the firmware boot descriptor.
+
+  apple,cam-connections-scheme:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Camera connection layout of the board passed in the firmware boot
+      descriptor.
+
+  apple,firmware-version:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 3
+    maxItems: 5
+    description: Version of the firmware loaded by the bootloader.
+
+  apple,firmware-compat:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 3
+    maxItems: 5
+    description: Compatibility version supplied by the bootloader.
+
+  apple,temporal-filter:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Firmware temporal-filter strength selected for the attached sensor.
+
+  sensor-presets:
+    type: object
+    description:
+      Sensor firmware presets and the host output geometry associated with them.
+    patternProperties:
+      "^preset[0-9]+$":
+        type: object
+        properties:
+          apple,config-index:
+            $ref: /schemas/types.yaml#/definitions/uint32
+            description: Sensor configuration index understood by the firmware
+          apple,input-size:
+            $ref: /schemas/types.yaml#/definitions/uint32-array
+            items:
+              - description: Input width in pixels
+              - description: Input height in pixels
+            description: Sensor input dimensions
+          apple,output-size:
+            $ref: /schemas/types.yaml#/definitions/uint32-array
+            items:
+              - description: Output width in pixels
+              - description: Output height in pixels
+            description: Delivered frame dimensions
+          apple,crop:
+            $ref: /schemas/types.yaml#/definitions/uint32-array
+            items:
+              - description: Horizontal crop origin in pixels
+              - description: Vertical crop origin in pixels
+              - description: Crop width in pixels
+              - description: Crop height in pixels
+            description: Cropped sensor rectangle
+        required:
+          - apple,config-index
+          - apple,input-size
+          - apple,output-size
+          - apple,crop
+        additionalProperties: false
+    additionalProperties: false
 
 required:
   - compatible
@@ -65,6 +162,93 @@ required:
   - interrupts
   - iommus
   - power-domains
-  - status
+
+allOf:
+  - if:
+      required:
+        - reg-names
+    then:
+      properties:
+        reg:
+          minItems: 5
+        interrupts:
+          maxItems: 1
+        iommus:
+          minItems: 6
+        power-domains:
+          minItems: 8
+        clocks: false
+      required:
+        - apple,dart-vm-size
+        - sensor-presets
+      allOf:
+        - if:
+            properties:
+              status:
+                const: disabled
+            required:
+              - status
+          then: {}
+          else:
+            required:
+              - memory-region
+              - memory-region-names
+              - apple,platform-id
+    else:
+      properties:
+        reg:
+          maxItems: 3
+        interrupts:
+          minItems: 5
+        iommus:
+          maxItems: 3
+        power-domains:
+          maxItems: 2
+        status:
+          const: disabled
+      required:
+        - status
 
 additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        isp@580000000 {
+            compatible = "apple,t6050-isp", "apple,isp";
+            reg = <0x5 0x80000000 0x0 0x1604000>,
+                  <0x5 0x82924000 0x0 0x40>,
+                  <0x5 0x829241d0 0x0 0x20>,
+                  <0x5 0x82924464 0x0 0x10>,
+                  <0x5 0xc3b50000 0x0 0x8000>;
+            reg-names = "coproc", "mbox", "gpio", "mbox2", "wdt";
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 0 513 IRQ_TYPE_LEVEL_HIGH>;
+            iommus = <&isp_dart0 0>, <&isp_dart0 12>,
+                     <&isp_dart1 0>, <&isp_dart1 12>,
+                     <&isp_dart2 0>, <&isp_dart2 12>;
+            power-domains = <&ps_isp_sys>, <&ps_isp_cpu>, <&ps_isp_fe>,
+                            <&ps_ispsens0>, <&ps_isp_dprx>, <&ps_isp_secure>,
+                            <&ps_isp_be>, <&ps_isp_clr>;
+            memory-region = <&isp_fw_text>, <&isp_fw_data>, <&isp_heap>;
+            memory-region-names = "text", "data", "heap";
+            apple,dart-vm-size = /bits/ 64 <0xde000000>;
+            apple,platform-id = <0x75>;
+            apple,cam-connections-scheme = <0x10>;
+
+            sensor-presets {
+                preset0 {
+                    apple,config-index = <5>;
+                    apple,input-size = <1920 2160>;
+                    apple,output-size = <1920 1080>;
+                    apple,crop = <0 0 1920 1080>;
+                };
+            };
+        };
+    };

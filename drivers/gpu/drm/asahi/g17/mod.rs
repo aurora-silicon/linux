@@ -168,8 +168,6 @@ pub(crate) enum FirmwareProfile {
     /// The firmware publishes its kernel roots and the driver owns the page tables (A18 Pro,
     /// M4 Pro).
     PublishedRoots,
-    /// An M5 board without bare-metal GPU tables yet: probe refuses it.
-    M5NoBareMetalTables,
     /// The M5 firmware on bare metal: both roles publish their kernel roots
     /// ([`mmu::UatFirmware::PublishedRoots`]) and the driver owns the page tables.
     M5PublishedRoots,
@@ -195,7 +193,7 @@ impl Config {
 impl FirmwareProfile {
     /// The M5 firmware's protocol (26A428 InitData graph, queues and submission).
     pub(crate) const fn is_m5(self) -> bool {
-        matches!(self, Self::M5NoBareMetalTables | Self::M5PublishedRoots)
+        matches!(self, Self::M5PublishedRoots)
     }
 }
 
@@ -800,11 +798,13 @@ impl Firmware {
         commit_accounting: impl FnOnce() -> Result,
         publish_inner: impl FnOnce(),
         deferred: bool,
+        cursors: Option<[u32; 3]>,
     ) -> Result<[u32; 2]> {
         let mut commit_accounting = Some(commit_accounting);
         let mut publish_inner = Some(publish_inner);
+        let mut cursors = cursors;
         for attempt in 0..2 {
-            let pair = self.init.m5_work_pair(priority, &records[0], &records[1])?;
+            let pair = self.init.m5_work_pair(priority, &records[0], &records[1], cursors.take())?;
             pair.prepare();
             if let Some(commit) = commit_accounting.take() { commit()?; }
             match self.bridge.regs.submit_m5_work(submission) {
@@ -887,8 +887,16 @@ impl Firmware {
         // given, and the state records, the M5 value (InitData::submission_effort).
         let published = init.submission_effort(effort, state.waited());
         port.set_effort_full(effort == power::FULL_EFFORT);
-        if state.applied() == published && init.effort()? == published {
-            return Ok(());
+        if state.applied() == published {
+            // M5 maps region C read-only to the firmware: once confirmed, the word holds
+            // `applied` without reading it back.
+            if init.is_m5() && state.confirmed() {
+                return Ok(());
+            }
+            if init.effort()? == published {
+                state.confirm();
+                return Ok(());
+            }
         }
         init.publish_effort(published)?;
         trace::message(trace::EFFORT, u64::from(published));
@@ -1019,6 +1027,7 @@ impl power::Control for Firmware {
 /// Every feature the M5 command set reports. GET_PARAMS leaves out the MSAA compression
 /// and mesh storage bits while those paths are off.
 const M5_FEATURES: u64 = (uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE_RESOURCES
+    | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS
     | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_RESOURCES
     | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2) as u64
     | crate::file::DRM_ASAHI_FEATURE_SPARSE_TILES
@@ -1464,8 +1473,12 @@ impl Gpu {
         } else {
             None
         };
-        let variant = Self::firmware_variant(dev, &cfg.firmware)?;
         let id = regs.get_g17_id()?;
+        let active_cores: u32 = id.core_masks.iter().map(|mask| mask.count_ones()).sum();
+        let (variant, build_cfg) =
+            Self::firmware_variant(dev, &cfg.firmware, (id.num_clusters, active_cores))?;
+        // A build with its own configuration of the SoC runs with that one.
+        let cfg = build_cfg.unwrap_or(cfg);
         if let Some(calibration) = calibration {
             calibration.check_cores(&id.core_masks)?;
             calibration.check_opps(&initdata::InitData::opps(dev, cfg.opps, id.num_clusters)?)?;
@@ -1530,7 +1543,6 @@ impl Gpu {
         let renders = availability::Availability::new()?;
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
         let feed = feed::Feed::new(m5)?;
-        let active_cores = id.core_masks.iter().map(|mask| mask.count_ones()).sum();
         let alternate = cfg.core_layout.cores.is_some_and(|(clusters, cores)| {
             clusters == id.num_clusters
                 && cores != active_cores
@@ -1663,14 +1675,21 @@ impl Gpu {
         Ok(gpu)
     }
 
-    /// Returns the variant of the loaded firmware build. An identified SoC refuses a build it
-    /// does not know, before anything is written to the GPU.
+    /// Returns the variant of the loaded firmware build and the configuration it runs with, if
+    /// it has its own. An identified SoC refuses a build it does not know, before anything is
+    /// written to the GPU.
+    ///
+    /// Builds can admit the same image with configurations measured on different core layouts.
+    /// The first identified build whose configuration admits `cores` (clusters and enabled
+    /// cores, as probed) is chosen, else the first identified one, whose core check then
+    /// refuses the GPU.
     fn firmware_variant(
         dev: &AsahiDrmDevice,
         firmware: &fw::variant::Firmware,
-    ) -> Result<&'static fw::Variant> {
+        cores: (u32, u32),
+    ) -> Result<(&'static fw::Variant, Option<&'static Config>)> {
         let builds = match firmware {
-            fw::variant::Firmware::Fixed(variant) => return Ok(variant),
+            fw::variant::Firmware::Fixed(variant) => return Ok((variant, None)),
             fw::variant::Firmware::Identified(builds) => builds,
         };
         let version = Self::os_firmware_version(dev);
@@ -1682,11 +1701,26 @@ impl Gpu {
         let others = builds
             .iter()
             .filter(|build| Some(build.os_version) != version);
+        let mut identified = None;
         for build in Iterator::chain(preferred, others) {
-            if Self::identify_image(dev, build).is_ok() {
-                dev_info!(dev.as_ref(), "GPU firmware: {}\n", build.name);
-                return Ok(build.variant);
+            if Self::identify_image(dev, build).is_err() {
+                continue;
             }
+            let admits = build.config.is_none_or(|config| {
+                config
+                    .core_layout
+                    .cores
+                    .is_none_or(|measured| measured == cores)
+            });
+            if admits {
+                identified = Some(build);
+                break;
+            }
+            identified.get_or_insert(build);
+        }
+        if let Some(build) = identified {
+            dev_info!(dev.as_ref(), "GPU firmware: {}\n", build.name);
+            return Ok((build.variant, build.config));
         }
         dev_err!(
             dev.as_ref(),
@@ -2216,6 +2250,11 @@ impl gpu::Gpu for Gpu {
             if crate::module_parameters::m5_mesh_storage_chunks.value() == 0 {
                 features &= !crate::file::DRM_ASAHI_FEATURE_TASK_MESH_STORAGE;
             }
+            // Only where firmware waits need it (runtime::backend's
+            // firmware_sources_need_visible_completion), so userspace adds the flush only there.
+            if self.shared.m5_board.is_some_and(|board| board.completion_inputs()) {
+                features |= crate::file::DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION;
+            }
             params.features |= features;
         }
         params.gpu_generation = self.cfg.gpu_generation as u32;
@@ -2368,21 +2407,44 @@ impl gpu::Gpu for Gpu {
         mut bo: gem::ObjectRef,
         range: Range<usize>,
     ) -> Result<crate::timestamp::Buffer> {
-        let mapping = {
+        let (mapping, window) = {
             let state = self.shared.state.lock();
             let firmware = (*state).as_ref().ok_or(ENODEV)?;
-            let addresses = firmware.uat.kernel_dynamic_range();
-            bo.map_range_into_range(
-                firmware.uat.kernel_vm(),
-                range,
-                addresses,
-                mmu::UAT_PGSZ as u64,
-                mmu::PROT_FW_SHARED_RW,
-                false,
-            )?
+            // The timestamp window is part of the older firmware graph, not M5's graph.
+            let windowed = if firmware.uat.is_m5() {
+                None
+            } else {
+                bo.map_range_into_range(
+                    firmware.uat.kernel_vm(),
+                    range.clone(),
+                    hw::t8140::dynamic::TIMESTAMP_WINDOW,
+                    mmu::UAT_PGSZ as u64,
+                    mmu::PROT_FW_SHARED_RW,
+                    false,
+                )
+                .ok()
+            };
+            match windowed {
+                Some(mapping) => (mapping, true),
+                // A full window: this buffer's stamps are all host-written.
+                None => (
+                    bo.map_range_into_range(
+                        firmware.uat.kernel_vm(),
+                        range,
+                        firmware.uat.kernel_dynamic_range(),
+                        mmu::UAT_PGSZ as u64,
+                        mmu::PROT_FW_SHARED_RW,
+                        false,
+                    )?,
+                    false,
+                ),
+            }
         };
         // The buffer's CPU mapping takes the reservation lock: not under the device mutex.
-        crate::timestamp::Buffer::firmware(mapping)
+        match window {
+            true => crate::timestamp::Buffer::firmware_window(mapping),
+            false => crate::timestamp::Buffer::firmware(mapping),
+        }
     }
 }
 

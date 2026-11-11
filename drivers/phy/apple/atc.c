@@ -925,6 +925,19 @@ static bool atcphy_usb2_only(const struct apple_atcphy *atcphy)
 	return atcphy->hw->usb2_only && !atcphy->t8132_ss;
 }
 
+/*
+ * The USB2 PHY's host-mode field. T8132's ordinary Type-C ports use bits 6:4,
+ * while its fixed-hub path uses bits 14:12 (plus the VBUSDET force bits 1:0
+ * that this driver programs separately).
+ */
+static u32 atcphy_usb2_sig_host(const struct apple_atcphy *atcphy)
+{
+	if (atcphy->hw->usb2phy_sig_host &&
+	    !atcphy->fixed_usb2)
+		return atcphy->hw->usb2phy_sig_host;
+	return USB2PHY_SIG_HOST;
+}
+
 static const struct {
 	const struct atcphy_mode_configuration normal;
 	const struct atcphy_mode_configuration swapped;
@@ -1960,6 +1973,15 @@ static void atcphy_setup_pipehandler(struct apple_atcphy *atcphy)
 		      PIPEHANDLER_T8132_USB2_CONFIG_EN);
 		atcphy_pipehandler_set_mux(atcphy, PIPEHANDLER_MUX_CTRL_DATA_DUMMY,
 					   PIPEHANDLER_MUX_CTRL_CLK_DUMMY);
+		/*
+		 * As on T8122, the PIPE lock that starts the routing to USB3
+		 * is only acknowledged with the dummy PHY enabled. The boot
+		 * firmware leaves it set on the ports it brought up, but not
+		 * on every SuperSpeed port: on the J604, ATC3 comes up with it
+		 * clear and its first USB3 start times out.
+		 */
+		if (atcphy->t8132_ss)
+			atcphy_enable_dummy_phy(atcphy);
 		atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
 		atcphy->pipe_pending = false;
 		return;
@@ -4261,12 +4283,10 @@ static int atcphy_usb2_set_mode(struct phy *phy, enum phy_mode mode, int submode
 
 	switch (mode) {
 	case PHY_MODE_USB_HOST:
-		set32(atcphy->regs.usb2phy + USB2PHY_SIG,
-		      atcphy->hw->usb2phy_sig_host ?: USB2PHY_SIG_HOST);
+		set32(atcphy->regs.usb2phy + USB2PHY_SIG, atcphy_usb2_sig_host(atcphy));
 		break;
 	case PHY_MODE_USB_DEVICE:
-		clear32(atcphy->regs.usb2phy + USB2PHY_SIG,
-			atcphy->hw->usb2phy_sig_host ?: USB2PHY_SIG_HOST);
+		clear32(atcphy->regs.usb2phy + USB2PHY_SIG, atcphy_usb2_sig_host(atcphy));
 		break;
 	default:
 		return -EINVAL;
@@ -4310,8 +4330,7 @@ static int atcphy_usb2_init(struct phy *phy)
 	 * powered off as well the whole block is off; bring it back in the mode
 	 * the Type-C mux last asked for, USB2 until a cable event says otherwise.
 	 */
-	set32(atcphy->regs.usb2phy + USB2PHY_SIG,
-	      atcphy->hw->usb2phy_sig_host ?: USB2PHY_SIG_HOST);
+	set32(atcphy->regs.usb2phy + USB2PHY_SIG, atcphy_usb2_sig_host(atcphy));
 	if (atcphy->mode == APPLE_ATCPHY_MODE_OFF || atcphy->mode_dirty)
 		return atcphy_configure(atcphy, atcphy->typec_mode);
 
@@ -6246,8 +6265,7 @@ static int atcphy_probe_finalize(struct apple_atcphy *atcphy)
 	 * in reset.
 	 */
 	if (atcphy->fixed_usb2) {
-		set32(atcphy->regs.usb2phy + USB2PHY_SIG,
-		      atcphy->hw->usb2phy_sig_host ?: USB2PHY_SIG_HOST);
+		set32(atcphy->regs.usb2phy + USB2PHY_SIG, atcphy_usb2_sig_host(atcphy));
 		ret = atcphy_configure(atcphy, APPLE_ATCPHY_MODE_USB2);
 		if (ret)
 			return dev_err_probe(atcphy->dev, ret, "Failed to bring up USB2\n");

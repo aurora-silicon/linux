@@ -328,6 +328,17 @@ impl KernelObject {
     pub(crate) fn read_words<const N: usize>(&self, offset: usize) -> Result<[u32; N]> {
         let base = self.aligned::<[u32; N]>(offset)?.cast::<u32>();
         let mut words = [0u32; N];
+        // Most views are uncached: where the copy is 8-byte aligned, load two words at a time.
+        if N % 2 == 0 && base as usize % 8 == 0 {
+            let pairs = base.cast::<u64>();
+            for (i, pair) in words.chunks_exact_mut(2).enumerate() {
+                // SAFETY: As below; the 8-byte loads cover the same aligned `N` words.
+                let bytes = unsafe { pairs.add(i).read_volatile() }.to_ne_bytes();
+                pair[0] = u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                pair[1] = u32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            }
+            return Ok(words);
+        }
         for (i, word) in words.iter_mut().enumerate() {
             // SAFETY: `aligned()` checked that all `N` words are within the object and aligned.
             *word = unsafe { base.add(i).read_volatile() };

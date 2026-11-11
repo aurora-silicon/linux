@@ -100,6 +100,9 @@ typedef void (*dcp_callback_t)(struct apple_dcp *, void *, void *);
 	}
 
 /* Call a DCP function given by a tag */
+int dcp_push_oob_concurrent(struct apple_dcp *dcp, const struct dcp_method_entry *call,
+			    u32 in_len, u32 out_len, void *data, dcp_callback_t cb,
+			    void *cookie);
 void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *call,
 		     u32 in_len, u32 out_len, void *data, dcp_callback_t cb,
 		     void *cookie);

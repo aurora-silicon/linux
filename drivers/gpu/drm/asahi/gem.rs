@@ -286,7 +286,7 @@ fn new_kernel_object_mapped(
         size,
         shmem::ObjectConfig::<AsahiObject> {
             reclaimable_cpu_mappings: false,
-            pages_no_reclaim: false,
+            pages_bounded_reclaim: false,
             map_wc,
             parent_resv_obj: None,
         },
@@ -313,7 +313,7 @@ pub(crate) fn new_object(
     flags: u32,
     parent_object: Option<&shmem::Object<AsahiObject>>,
     reclaim_cpu: bool,
-    pages_no_reclaim: bool,
+    pages_bounded_reclaim: bool,
     commit: memacct::Commit,
 ) -> Result<ARef<Object>> {
     if (flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0) != parent_object.is_some()
@@ -326,7 +326,7 @@ pub(crate) fn new_object(
         checked_object_size(size)?,
         shmem::ObjectConfig::<AsahiObject> {
             reclaimable_cpu_mappings: parent_object.is_some() && reclaim_cpu,
-            pages_no_reclaim,
+            pages_bounded_reclaim,
             map_wc: flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_WRITEBACK == 0,
             parent_resv_obj: parent_object,
         },
@@ -472,10 +472,11 @@ pub(crate) fn madvise(gem: &Object, dontneed: bool) -> Result<u32> {
     Ok(u32::from(gem.madvise(i32::from(dontneed))))
 }
 
-/// Large user BOs have a cheap ENOMEM fallback instead of per-folio reclaim.
-/// Keep ordinary resource allocations and kernel-owned backing on their existing
-/// policy. 256 MiB also matches Mesa's maximum reusable BO-cache footprint.
-pub(crate) fn user_pages_no_reclaim(size: usize, g17: bool) -> bool {
+/// Large user BOs may release clean page cache but never swap out the rest of the
+/// system per folio; they get a quick ENOMEM when they cannot fit. Keep ordinary
+/// resource allocations and kernel-owned backing on their existing policy. 256 MiB
+/// also matches Mesa's maximum reusable BO-cache footprint.
+pub(crate) fn user_pages_bounded_reclaim(size: usize, g17: bool) -> bool {
     g17 && size >= 256 * 1024 * 1024
 }
 
@@ -485,10 +486,10 @@ mod allocation_policy_tests {
 
     #[test]
     fn large_user_backing() {
-        assert!(!user_pages_no_reclaim(256 * 1024 * 1024 - 1, true));
-        assert!(user_pages_no_reclaim(256 * 1024 * 1024, true));
-        assert!(user_pages_no_reclaim(3_257_113_344, true));
-        assert!(!user_pages_no_reclaim(3_257_113_344, false));
+        assert!(!user_pages_bounded_reclaim(256 * 1024 * 1024 - 1, true));
+        assert!(user_pages_bounded_reclaim(256 * 1024 * 1024, true));
+        assert!(user_pages_bounded_reclaim(3_257_113_344, true));
+        assert!(!user_pages_bounded_reclaim(3_257_113_344, false));
     }
 }
 

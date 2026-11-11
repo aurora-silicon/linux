@@ -225,7 +225,11 @@ impl<B: Backend> Queue<B> {
         if engine == Engine::Compute {
             super::trace::inputs(self.context.id(), order.sequence, 0, inputs.len(), None);
         }
-        let sources = if engine == Engine::Compute
+        // Ring order completes a converted input only if a kick waits for its
+        // ring predecessor; without that, keep the input's completion wait.
+        let host_waits = self.backend.host_producer_waits();
+        let sources = if !host_waits
+            && engine == Engine::Compute
             && !inputs.is_empty()
             && !destinations.has_outputs()
             && self.frontiers[0].iter().all(|(sequence, fences)| {
@@ -325,9 +329,17 @@ impl<B: Backend> Queue<B> {
             inputs.len() + count + timestamp_count + failure_count,
             GFP_KERNEL,
         )?;
-        let mut checked_inputs =
-            KVec::with_capacity(inputs.len() + timestamp_count + failure_count, GFP_KERNEL)?;
-        let mut firmware = KVec::with_capacity(count, GFP_KERNEL)?;
+        // Host-waited producers are checked on the host instead of in firmware.
+        let (host_count, firmware_count) = if host_waits {
+            (count, 0)
+        } else {
+            (0, count)
+        };
+        let mut checked_inputs = KVec::with_capacity(
+            inputs.len() + host_count + timestamp_count + failure_count,
+            GFP_KERNEL,
+        )?;
+        let mut firmware = KVec::with_capacity(firmware_count, GFP_KERNEL)?;
         for fence in failures.into_iter().flatten() {
             checked_inputs.push(fence.clone(), GFP_KERNEL)?;
             dependencies.push(fence.clone(), GFP_KERNEL)?;
@@ -348,8 +360,15 @@ impl<B: Backend> Queue<B> {
             if fences.status() > 0 {
                 continue;
             }
-            dependencies.push(fences.ready.clone(), GFP_KERNEL)?;
-            firmware.push(fences.completed.clone(), GFP_KERNEL)?;
+            if host_waits {
+                // Keep other-engine producers on the host until completion, and
+                // propagate their errors before publishing the consumer.
+                dependencies.push(fences.completed.clone(), GFP_KERNEL)?;
+                checked_inputs.push(fences.completed.clone(), GFP_KERNEL)?;
+            } else {
+                dependencies.push(fences.ready.clone(), GFP_KERNEL)?;
+                firmware.push(fences.completed.clone(), GFP_KERNEL)?;
+            }
         }
         // Each command owns every input fence; independent engines may publish in
         // either order and must each consume an input's error status before running.
@@ -509,8 +528,12 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                 }
             }
             let mut guards = guards.into_iter();
+            // Where a firmware wait reports completion before a weak stream tail's writes are
+            // visible, only a command that declares a visible completion is waited for there.
+            let visible_required = self.backend.firmware_sources_need_visible_completion();
             let firmware_source = pending.len() == 1
-                && matches!(&pending[0].0, Validated::Compute { .. })
+                && matches!(&pending[0].0, Validated::Compute { visible_completion, .. }
+                    if *visible_completion || !visible_required)
                 && !pending[0].2.has_outputs();
             let aggregate = outputs.publish(self.context.clone(), firmware_source)?;
             for (command, order, destinations) in pending {

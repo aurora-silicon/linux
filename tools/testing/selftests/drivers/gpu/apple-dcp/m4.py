@@ -493,6 +493,148 @@ int main(void)
 '''
 
 
+def gate(root):
+    """The physical power-down and power-up of the internal DCP: their order,
+    the providers asked before the first step, and a late firmware message."""
+    backend = (root / APPLE / 'iomfb_m4.c').read_text()
+    return PREFIX + r'''
+#define READ_ONCE(x) (x)
+#define WRITE_ONCE(x,v) ((x)=(v))
+#define container_of(p,t,m) ((t *)((char *)(p) - __builtin_offsetof(t,m)))
+#define le32_to_cpu(x) (x)
+#define dev_dbg(...) ((void)0)
+#define dev_err(d,...) ((void)(d),(void)fprintf(stderr,__VA_ARGS__))
+#define spin_lock_irqsave(p,f) do { (void)(p); (f)=0; } while(0)
+#define spin_unlock_irqrestore(p,f) do { (void)(p); (void)(f); } while(0)
+typedef u32 __le32;
+typedef int64_t s64;
+typedef s64 ktime_t;
+static ktime_t clock_ns;
+static ktime_t ktime_get(void) { return clock_ns += 1000; }
+static s64 ktime_us_delta(ktime_t later,ktime_t earlier) { return (later-earlier)/1000; }
+struct device { int unused; };
+struct platform_device { struct device dev; };
+struct apple_rtkit { int unused; };
+struct work_struct { int unused; };
+struct delayed_work { struct work_struct work; };
+#define to_delayed_work(w) container_of(w,struct delayed_work,work)
+struct apple_dcp { bool quiescing; };
+struct dcp_m4_frame { u64 dva; };
+struct dcp_m4_transaction { unsigned calls; };
+struct iomfb_m4;
+struct dcp_m4_runtime { struct iomfb_m4 *dcp; unsigned count; };
+struct iomfb_m4 {
+    struct apple_dcp *owner;
+    struct device *dev;
+    struct platform_device *piodma;
+    struct apple_rtkit *rtkit;
+    struct dcp_m4_runtime *runtime;
+    int lock,state_lock,error;
+    struct dcp_m4_transaction transaction;
+    struct dcp_m4_frame active_frame;
+    void *active_fb;
+    bool gate_capable,gated,display_off,powered_off;
+    struct delayed_work gate_work;
+    u64 gate_cycles;
+    s64 gate_off_us,gate_on_us;
+};
+static unsigned power_gate_ms;
+static struct iomfb_m4 *the_dcp;
+/* Every step taken, in order. */
+static char steps[512];
+static void trace(const char *s) { strcat(steps,s); strcat(steps," "); }
+static int refuse;		/* the provider check that refuses (1..5), or 0 */
+static bool late_word;		/* a DCP message arrives during the idle handshake */
+static void mutex_lock(int *l) { assert(!*l); *l=1; }
+static void mutex_unlock(int *l) { assert(*l==1); *l=0; }
+static void lockdep_assert_held(int *l) { assert(*l==1); }
+static void dcp_m4_failed(struct iomfb_m4 *dcp,int error) { if(!dcp->error) dcp->error=error; }
+static int dcp_m4_runtime_live(struct dcp_m4_runtime *r) { return r->dcp->error; }
+static int dcp_m4_runtime_call(void *cookie,unsigned int method,bool remote,
+    const void *input,u32 input_size,void *output,u32 output_size)
+{
+    char name[16];
+    (void)cookie; (void)remote; (void)input; (void)input_size;
+    snprintf(name,sizeof(name),"A%u",method); trace(name);
+    if(output) memset(output,0,output_size);
+    if(method==412) { assert(output_size==4); put_unaligned_le32(1,output); }
+    return 0;
+}
+static int dcp_m4_runtime_drain(struct dcp_m4_runtime *r,unsigned budget)
+{ (void)r; (void)budget; trace("drain"); return 0; }
+static int apple_rtkit_idle(struct apple_rtkit *rtk) { (void)rtk; trace("idle"); return 0; }
+static void apple_rtkit_hold_rx(struct apple_rtkit *rtk) { (void)rtk; trace("hold"); }
+static int apple_rtkit_poll(struct apple_rtkit *rtk) { (void)rtk; trace("poll"); return 0; }
+static void apple_rtkit_flush_rx(struct apple_rtkit *rtk)
+{ (void)rtk; trace("flush"); if(late_word) the_dcp->runtime->count++; }
+static int iomfb_m4_cpu_run(struct iomfb_m4 *dcp,bool run) { (void)dcp; trace(run?"run":"stop"); return 0; }
+static int iomfb_m4_cpu_start(void *data) { return iomfb_m4_cpu_run(data,true); }
+static int apple_rtkit_wake_retained(struct apple_rtkit *rtk,int (*start)(void *),void *ctx)
+{ (void)rtk; trace("wake"); return start(ctx); }
+static bool dcp_dev(struct device *dev) { return dev==the_dcp->dev; }
+static int apple_dart_dcp_power_check(struct device *dev) { return refuse==(dcp_dev(dev)?1:2)?-EAGAIN:0; }
+static int apple_pmp_j713_display_check_release(struct device *dev) { (void)dev; return refuse==3?-ETIMEDOUT:0; }
+static int apple_pmc_interface_consumer_check(struct device *dev) { (void)dev; return refuse==4?-ENODEV:0; }
+static int apple_pmgr_ps_consumer_check(struct device *dev) { (void)dev; return refuse==5?-EBUSY:0; }
+static int apple_dart_dcp_power_off(struct device *dev) { trace(dcp_dev(dev)?"dart-off":"piodma-off"); return 0; }
+static int apple_dart_dcp_power_on(struct device *dev) { trace(dcp_dev(dev)?"dart-on":"piodma-on"); return 0; }
+static int apple_pmp_j713_display_put(struct device *dev) { (void)dev; trace("pmp-put"); return 0; }
+static int apple_pmp_j713_display_get(struct device *dev) { (void)dev; trace("pmp-get"); return 0; }
+static int apple_pmc_interface_consumer_off(struct device *dev) { (void)dev; trace("pmc-off"); return 0; }
+static int apple_pmc_interface_consumer_on(struct device *dev) { (void)dev; trace("pmc-on"); return 0; }
+static int apple_pmgr_ps_consumer_off(struct device *dev) { (void)dev; trace("pmgr-off"); return 0; }
+static int apple_pmgr_ps_consumer_on(struct device *dev) { (void)dev; trace("pmgr-on"); return 0; }
+''' + '\n'.join(block(backend, name) for name in (
+        'static int iomfb_m4_gate_check(', 'static int iomfb_m4_power_gate(',
+        'static int iomfb_m4_power_ungate(', 'static void iomfb_m4_gate_work(')) + r'''
+int main(void)
+{
+    struct apple_dcp owner={0};
+    struct device dev={0};
+    struct platform_device piodma={{0}};
+    struct apple_rtkit rtk={0};
+    struct iomfb_m4 dcp={.owner=&owner,.dev=&dev,.piodma=&piodma,.rtkit=&rtk,
+                         .gate_capable=true,.display_off=true};
+    struct dcp_m4_runtime r={.dcp=&dcp};
+
+    dcp.runtime=&r; the_dcp=&dcp;
+    /* Turned off after the blank: the queued power-down does nothing. */
+    iomfb_m4_gate_work(&dcp.gate_work.work);
+    assert(!steps[0] && !dcp.gated);
+    /* Wanted: the whole power-down, in its order. */
+    power_gate_ms=1000;
+    iomfb_m4_gate_work(&dcp.gate_work.work);
+    assert(!strcmp(steps,"A500 drain idle hold stop poll flush dart-off piodma-off "
+                         "pmp-put pmc-off pmgr-off "));
+    assert(dcp.gated && !dcp.error && dcp.gate_cycles==1 && !dcp.lock);
+
+    /* The power-up, in macOS's order: domains, PMP vote, PMC enables, DARTs, CPU. */
+    steps[0]=0; dcp.lock=1;
+    assert(!iomfb_m4_power_ungate(&dcp));
+    assert(!strcmp(steps,"pmgr-on pmp-get pmc-on dart-on piodma-on wake run A414 A412 "));
+    assert(!dcp.gated && !dcp.error);
+
+    /* A provider that cannot take part now: no step at all, and no failure. */
+    for(refuse=1;refuse<=5;refuse++) {
+        steps[0]=0;
+        assert(iomfb_m4_power_gate(&dcp)<0);
+        assert(!steps[0] && !dcp.gated && !dcp.error);
+    }
+    refuse=0;
+
+    /* A message from the idle handshake: failed with nothing powered down. */
+    steps[0]=0; late_word=true;
+    assert(iomfb_m4_power_gate(&dcp)==-EBUSY);
+    assert(!strcmp(steps,"A500 drain idle hold stop poll flush "));
+    assert(!dcp.gated && dcp.error==-EBUSY);
+    dcp.lock=0;
+    puts("PASS the power-down and power-up keep their order, a refusing provider changes nothing, "
+         "and a late message fails before anything is powered down");
+    return 0;
+}
+'''
+
+
 def blank(root):
     backend = (root / APPLE / 'iomfb_m4.c').read_text()
     backlight = (root / APPLE / 'dcp_backlight.c').read_text()
@@ -552,7 +694,16 @@ struct iomfb_m4 {
     bool display_off;
     u64 display_off_cycles;
     s64 display_off_us,display_off_us_max,display_on_us,display_on_us_max;
+    bool gate_capable,gated;
+    int gate_work;
 };
+/* The power-down after a blank: its scheduling and the power-up before ON. */
+static unsigned power_gate_ms,scheduled,cancelled,ungates,ungate_error,ons_at_ungate;
+#define system_dfl_wq NULL
+static unsigned long msecs_to_jiffies(unsigned ms) { return ms; }
+static bool mod_delayed_work(void *wq,int *work,unsigned long delay)
+{ (void)wq; (void)work; assert(delay==power_gate_ms); scheduled++; return true; }
+static bool cancel_delayed_work(int *work) { (void)work; cancelled++; return false; }
 static void mutex_lock(int *lock) { assert(!*lock); *lock=1; }
 static void mutex_unlock(int *lock) { assert(*lock==1); *lock=0; }
 static void lockdep_assert_held(int *lock) { assert(*lock==1); }
@@ -569,6 +720,13 @@ static unsigned power_offs,power_ons;
 static int dcp_m4_set_power_state(struct iomfb_m4 *dcp,bool on)
 { assert(dcp->lock==1); if(on) power_ons++; else power_offs++; return 0; }
 static int dcp_m4_runtime_live(struct dcp_m4_runtime *r) { return r->dcp->error; }
+static int iomfb_m4_power_ungate(struct iomfb_m4 *dcp)
+{
+    assert(dcp->lock==1 && dcp->gated && dcp->display_off);
+    ons_at_ungate=power_ons; ungates++;
+    if(ungate_error) { dcp_m4_failed(dcp,ungate_error); return ungate_error; }
+    dcp->gated=false; return 0;
+}
 static int iomfb_m4_check_frame(const struct dcp_m4_frame *f)
 { return dcp_m4_frame_check(f); }
 static unsigned order,failure,publications;
@@ -640,6 +798,42 @@ int main(void)
         assert(iomfb_m4_blank(&owner)==-ETIMEDOUT);
         assert(fb.refs==2 && next.refs==2 && dcp.active_fb==&fb && dcp.uncertain_fb==&next);
         failure=0;
+    }
+    /* Not opted in: a blank schedules no power-down; a frame still cancels one. */
+    {
+        struct drm_format_info fmt={.format=DRM_FORMAT_XRGB8888,.num_planes=1};
+        struct drm_framebuffer fb={.format=&fmt,.width=2560,.height=1664,.pitches={10240},.refs=1};
+        struct apple_dcp owner={0};
+        struct iomfb_m4 dcp={.owner=&owner};
+        struct dcp_m4_runtime runtime={.dcp=&dcp};
+        unsigned c;
+        owner.v26_6=&dcp; dcp.runtime=&runtime;
+        assert(!dcp_bl_init(&owner.backlight.state,500,true,120,false,0));
+        c=cancelled;
+        assert(!iomfb_m4_present(&owner,&fb,0x10000100000ULL,0x2000000));
+        assert(cancelled==c+1);
+        assert(!iomfb_m4_blank(&owner) && scheduled==0);
+        dcp.gate_capable=true;
+        assert(!iomfb_m4_present(&owner,&fb,0x10000100000ULL,0x2000000));
+        assert(!iomfb_m4_blank(&owner) && scheduled==0); /* power_gate_ms is 0 */
+
+        /* Opted in: one power-down after the blank, after power_gate_ms. */
+        power_gate_ms=1000;
+        assert(!iomfb_m4_present(&owner,&fb,0x10000100000ULL,0x2000000));
+        assert(!iomfb_m4_blank(&owner) && scheduled==1);
+        /* Powered down: the next frame powers it up first, then setPowerState(1). */
+        dcp.gated=true;
+        unsigned ons=power_ons;
+        assert(!iomfb_m4_present(&owner,&fb,0x10000100000ULL,0x2000000));
+        assert(ungates==1 && ons_at_ungate==ons && power_ons==ons+1);
+        assert(!dcp.gated && !dcp.display_off && dcp.active_fb==&fb);
+        /* A failed power-up refuses the frame; the session is failed by it. */
+        assert(!iomfb_m4_blank(&owner) && scheduled==2);
+        dcp.gated=true; ungate_error=-EIO; ons=power_ons;
+        assert(iomfb_m4_present(&owner,&fb,0x10000100000ULL,0x2000000)==-EIO);
+        assert(ungates==2 && power_ons==ons && dcp.error==-EIO && dcp.display_off);
+        assert(fb.refs==1 && !dcp.active_fb);
+        ungate_error=0; power_gate_ms=0;
     }
     puts("PASS DPMS-off blank carries zero before delayed work and completes only after both exact receipts");
     puts("PASS actual present/blank retain active+uncertain DMA framebuffer references across a missing receipt");

@@ -13,6 +13,7 @@
 #include <linux/kref.h>
 #include <linux/module.h>
 #include <linux/of_device.h>
+#include <linux/power_supply.h>
 #include <linux/ratelimit.h>
 #include <linux/slab.h>
 #include <linux/sched.h>
@@ -47,6 +48,63 @@ struct dcp_identity_trace {
 	struct apple_dcp *dcp;
 	atomic_t *count;
 };
+
+/*
+ * DCP asks the AP for "PMUS"/"Temperature" once at start-up and uses it as
+ * the initial panel temperature when no 2D panel temperature has been set.
+ * macOS answers with the system battery's gas gauge temperature in units of
+ * 0.1 K (the AppleSmartBattery "Temperature" property, the SMC B0AT key);
+ * the firmware takes off 273.2 K itself. Observed on the J700 under macOS
+ * 26.6: a reply of 2997 gave an InitialPanelTemperature of 26.5 C, equal to
+ * the battery temperature at that boot.
+ *
+ * Linux power supplies report temperature in 0.1 C, so add the 273.2 K back.
+ */
+struct dcp_battery_temp {
+	u64 value;
+	bool found;
+};
+
+static int dcp_battery_temp_cb(struct power_supply *psy, void *data)
+{
+	struct dcp_battery_temp *bt = data;
+	union power_supply_propval val;
+
+	if (psy->desc->type != POWER_SUPPLY_TYPE_BATTERY)
+		return 0;
+	if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_SCOPE, &val) &&
+	    val.intval == POWER_SUPPLY_SCOPE_DEVICE)
+		return 0;
+	if (power_supply_get_property(psy, POWER_SUPPLY_PROP_TEMP, &val))
+		return 0;
+	if (val.intval <= -2732)
+		return 0;
+
+	bt->value = val.intval + 2732;
+	bt->found = true;
+	return 1;
+}
+
+u64 dcp_pmu_temperature(struct device *dev)
+{
+	struct dcp_battery_temp bt = { 0 };
+
+	if (IS_REACHABLE(CONFIG_POWER_SUPPLY))
+		power_supply_for_each_psy(&bt, dcp_battery_temp_cb);
+
+	if (bt.found) {
+		dev_dbg(dev, "PMU temperature from the battery: %llu (0.1 K)\n",
+			bt.value);
+		return bt.value;
+	}
+
+	/*
+	 * No system battery (desktops, or the battery driver is not bound):
+	 * keep the reply Linux has always sent, 302.9 K.
+	 */
+	dev_dbg(dev, "no system battery, PMU temperature fallback\n");
+	return DCP_PMU_TEMPERATURE_FALLBACK;
+}
 
 /*
  * set_matrix coefficients for @ctm, the identity when @ctm is NULL. DRM
@@ -939,6 +997,34 @@ void dcp_push(struct apple_dcp *dcp, bool oob,
 
 	dcp_push_context(dcp, dcp_call_context(dcp, oob), call,
 			 in_len, out_len, data, cb, cookie);
+}
+
+/*
+ * Push one command on the independent OOB command stream while a transaction
+ * on the command stream is still pending (dcp_push() would queue it behind
+ * that transaction). For queries the firmware serves concurrently, such as a
+ * paired modeset's DSC handoff while the primary's A413 waits for its peer.
+ */
+int dcp_push_oob_concurrent(struct apple_dcp *dcp, const struct dcp_method_entry *call,
+			    u32 in_len, u32 out_len, void *data, dcp_callback_t cb,
+			    void *cookie)
+{
+	int ret = 0;
+
+	mutex_lock(&dcp->iomfb.lock);
+	if (READ_ONCE(dcp->crashed) || dcp->iomfb.stopped) {
+		ret = -ESHUTDOWN;
+	} else if (dcp->ch_oobcmd.depth || dcp->ch_oobcb.depth || dcp->ch_oobasync.depth ||
+		   READ_ONCE(dcp->iomfb.owner)) {
+		ret = -EBUSY;
+	} else {
+		WRITE_ONCE(dcp->iomfb.owner, current);
+		dcp_push_context(dcp, dcp_call_context(dcp, true), call,
+				 in_len, out_len, data, cb, cookie);
+		WRITE_ONCE(dcp->iomfb.owner, NULL);
+	}
+	mutex_unlock(&dcp->iomfb.lock);
+	return ret;
 }
 
 /* A nested query must return on the firmware-initiated stream it answers. */
@@ -2255,9 +2341,19 @@ int dcp_get_modes(struct drm_connector *connector)
 			 */
 			if (PTR_ERR(edid) == -ENODEV)
 				dev_dbg(dcp->dev, "no EDID source\n");
+			/*
+			 * After resume the firmware publishes the AV service
+			 * before its link to the sink is back, and answers a
+			 * read then without data; probe again once it has read
+			 * the sink.
+			 */
+			else if (PTR_ERR(edid) == -ENODATA &&
+				 dcpavserv_edid_retry(dcp, service_epoch))
+				dev_dbg(dcp->dev, "sink EDID not read yet, probing again\n");
 			else
 				dev_warn(dcp->dev, "copy_edid failed: %pe\n", edid);
 		} else {
+			dcpavserv_edid_retry_reset(dcp);
 			drm_edid_free(apple_connector->drm_edid);
 			apple_connector->drm_edid = edid;
 			apple_connector->drm_edid_generation = edid_generation;
@@ -2394,6 +2490,39 @@ static int dcp_desktop_modeset(struct apple_dcp *dcp,
 	return iomfb_modeset_v26_6_desktop(dcp, crtc_state);
 }
 
+static bool takeover_adopt = true;
+module_param(takeover_adopt, bool, 0444);
+MODULE_PARM_DESC(takeover_adopt,
+		 "Desktop 26.x panel takeover: present on the loader's live mode instead of setting it again (default: on)");
+
+/*
+ * The loader leaves the panel running, and the firmware keeps that pipe when
+ * it restarts.  Setting the same mode again blanks the panel for ~200 ms, so
+ * adopt it: record the candidate's timing and colour element as the live
+ * mode without set_digital_out_mode.  The swap watchdog follows the swaps
+ * until one completes; if none does, it sets the mode after all
+ * (dcp_swap_watchdog()).
+ */
+static int dcp_takeover_adopt(struct apple_dcp *dcp, const struct drm_display_mode *m)
+{
+	struct dcp_desktop_state *d = dcp->desktop;
+	struct dcp_display_mode sel;
+
+	if (!lookup_mode(dcp, m, &sel))
+		return -ENOENT;
+	dcp->mode = (struct dcp_set_digital_out_mode_req) {
+		.color_mode_id = sel.color_mode_id,
+		.timing_mode_id = sel.timing_mode_id,
+	};
+	dcp->use_timestamps = sel.needs_timestamps;
+	dcp->vrr_enabled = false;
+	d->mode_live = true;
+	d->takeover_adopted = true;
+	dev_info(dcp->dev, "takeover: adopting the live mode (color:%u timing:%u) " DRM_MODE_FMT "\n",
+		 sel.color_mode_id, sel.timing_mode_id, DRM_MODE_ARG(m));
+	return 0;
+}
+
 /*
  * Takeover gate of a desktop 26.x panel, called after the DCP started and
  * before the boot framebuffer is evicted.  Everything that can still be
@@ -2475,7 +2604,13 @@ int dcp_takeover_trial(struct platform_device *pdev, const char **reason)
 		goto out;
 	}
 
-	for (k = 0; k < n; k++) {
+	for (k = 0; takeover_adopt && k < n; k++) {
+		if (!dcp_takeover_adopt(dcp, &cand[k])) {
+			win = k;
+			break;
+		}
+	}
+	for (k = 0; win < 0 && k < n; k++) {
 		int r;
 
 		st->mode = cand[k];
@@ -2652,6 +2787,33 @@ bool dcp_hdr_metadata_live(struct platform_device *pdev)
 
 	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
 	       !dcp_has_panel(dcp);
+}
+
+/*
+ * Whether @pdev switches between SDR and PQ shown as EDR without a mode set:
+ * a desktop 26.x panel keeps its SDR link either way, and PQ only changes how
+ * the swaps tag their surfaces and the EDR values they carry
+ * (dcp_edr_prepare()).  macOS turns EDR on and off on a live panel too.
+ */
+bool dcp_edr_live(struct platform_device *pdev)
+{
+	return dcp_panel_edr_supported(platform_get_drvdata(pdev));
+}
+
+/* Follow a colour state change that dcp_edr_live() let through without a mode set. */
+static void dcp_edr_sync(struct apple_dcp *dcp, struct drm_crtc *crtc,
+			 struct drm_atomic_commit *commit)
+{
+	bool edr;
+
+	if (!dcp_panel_edr_supported(dcp))
+		return;
+	edr = dcp_crtc_eotf(dcp, crtc, commit) == HDMI_EOTF_SMPTE_ST2084 &&
+	      dcp_crtc_bt2020(dcp, crtc, commit);
+	if (edr == dcp->output_edr)
+		return;
+	dev_dbg(dcp->dev, "EDR %s without a mode set\n", edr ? "on" : "off");
+	dcp->output_edr = edr;
 }
 
 /*
@@ -3455,8 +3617,10 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
 	    READ_ONCE(dcp->mode_state.valid) && dcp->connector &&
-	    READ_ONCE(dcp->connector->connected))
+	    READ_ONCE(dcp->connector->connected)) {
+		dcp_edr_sync(dcp, crtc, commit);
 		dcp_hdr_metadata_sync(dcp, crtc, commit);
+	}
 
 	if (iomfb_uses_queue(dcp)) {
 		iomfb_queue_atomic(dcp, crtc, commit);

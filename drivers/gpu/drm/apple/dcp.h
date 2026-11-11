@@ -90,6 +90,7 @@ int dcp_activate(struct platform_device *pdev);
 int dcp_wait_ready(struct platform_device *pdev, u64 timeout);
 void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit);
 bool dcp_hdr_metadata_live(struct platform_device *pdev);
+bool dcp_edr_live(struct platform_device *pdev);
 void dcp_retain_framebuffer(struct platform_device *pdev,
 			    struct dcp_fb_reference *entry);
 void dcp_arm_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id);
@@ -101,6 +102,8 @@ void apple_crtc_vblank(struct apple_crtc *apple);
 void dcp_drm_crtc_vblank(struct apple_crtc *crtc);
 void dcp_drm_crtc_error(struct apple_crtc *crtc,
 			struct drm_crtc_state *state, int error);
+void dcp_drm_crtc_flip_lost(struct apple_crtc *crtc,
+			    struct completion *flip_done, int error);
 int dcp_get_modes(struct drm_connector *connector);
 enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 				    const struct drm_display_mode *mode);
@@ -127,6 +130,7 @@ void dcp_external_retry(struct apple_dcp *dcp, const char *why, int error,
 			unsigned int base_ms);
 void dcp_external_retry_work(struct work_struct *work);
 void dcp_external_sink_irq(struct apple_dcp *dcp);
+void dcp_tb_event_work(struct work_struct *work);
 void dcp_queue_typec_reconnect(struct apple_dcp *dcp, unsigned long delay);
 int dcp_dptx_recover_irq(struct apple_dcp *dcp);
 int dcp_dptx_park(struct apple_dcp *dcp);

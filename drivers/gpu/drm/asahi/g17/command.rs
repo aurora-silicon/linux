@@ -441,6 +441,8 @@ pub(crate) enum Validated {
         /// The command may copy or reset queries, so it must follow the host's
         /// timestamp publication for earlier commands.
         query_access: bool,
+        /// The command's writes are visible when it completes (M5).
+        visible_completion: bool,
         resources: Option<Arc<ComputePrograms>>,
         plan: Option<super::render_resources::Plan>,
         scratch: ScratchRequest,
@@ -651,7 +653,8 @@ impl Payload {
                 if (m5
                     && (cmd.flags
                         & !(crate::file::DRM_ASAHI_COMPUTE_USES_MATRIX
-                            | crate::file::DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS)
+                            | crate::file::DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS
+                            | crate::file::DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION)
                         != 0
                         || cmd.reserved != 0))
                     || (!m5 && resources.is_some())
@@ -710,6 +713,8 @@ impl Payload {
                     intersection: *intersection,
                     matrix_ops: cmd.flags & crate::file::DRM_ASAHI_COMPUTE_USES_MATRIX != 0,
                     query_access: cmd.flags & crate::file::DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS == 0,
+                    visible_completion: m5
+                        && cmd.flags & crate::file::DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION != 0,
                     resources: resources.clone(), plan: None,
                     scratch,
                     m5_scratch,

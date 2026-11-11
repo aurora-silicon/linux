@@ -548,6 +548,7 @@
 		power-domains = <&ps_fab8_soc>;
 		status = "disabled";
 	};
+	/* The enclave runs from iBoot and gates its own domain: never Linux's to change. */
 	ps_sep: power-controller@298 {
 		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x298 4>;
@@ -555,6 +556,7 @@
 		#reset-cells = <0>;
 		label = "sep";
 		power-domains = <&ps_fab8_soc>;
+		apple,firmware-owned;
 		status = "disabled";
 	};
 	ps_sio_cpu: power-controller@2a0 {
@@ -1334,7 +1336,7 @@
 	};
 #endif
 
-#if defined(T6050_J714C) || defined(T6050_J714S) || defined(T6050_J716C) || defined(T6050_K114C) || defined(T6050_K114S) || defined(T6050_K116C) || defined(T6050_K116S)
+#if defined(T6050_J714S) || defined(T6050_K114C) || defined(T6050_K114S) || defined(T6050_K116C) || defined(T6050_K116S)
 #ifndef T6050_J716C
 	nub_spmi_a1: spmi@28a1a8000 {
 		compatible = "apple,t6050-spmi", "apple,t8142-spmi";
@@ -1486,6 +1488,7 @@
 		status = "disabled";
 	};
 
+#if !defined(T6050_J714C) && !defined(T6050_J714S) && !defined(T6050_J716C)
 	apciec2_dart: iommu@384000000 {
 		compatible = "apple,t6050-dart", "apple,t8110-dart";
 		reg = <0x3 0x84000000 0x0 0x20000>;
@@ -1493,6 +1496,7 @@
 		#iommu-cells = <1>;
 		status = "disabled";
 	};
+#endif
 
 	apciec2_piodma: dma-controller@384068000 {
 		compatible = "apple,t6050-pciec-piodma", "apple,pciec-piodma";
@@ -2193,49 +2197,121 @@
 		status = "disabled";
 	};
 
+	/* ADT pmp0 reg[2] (firmware SRAM) and reg[0] (ASC); iBoot loads the firmware, the OS starts it */
 	pmp0: pmp@284e00000 {
 		compatible = "apple,t6050-pmp-v2", "apple,t6000-pmp-v2";
-		reg = <0x2 0x84e00000 0x0 0x88000>,
-		      <0x2 0x84850000 0x0 0x4000>,
-		      <0x2 0x84500000 0x0 0x100000>,
-		      <0x2 0x84250000 0x0 0x4000>;
-		interrupts = <AIC_IRQ 0 397 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 0 396 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 0 399 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 0 398 IRQ_TYPE_LEVEL_HIGH>;
+		reg = <0x2 0x84500000 0x0 0x100000>,
+		      <0x2 0x84e00000 0x0 0x4000>;
+		reg-names = "pmp", "asc";
+		mboxes = <&pmp0_mbox>;
+		mbox-names = "mbox";
 		iommus = <&pmp0_dart 0>;
 		power-domains = <&ps_pmp>, <&ps_pms_sram>;
 		status = "disabled";
 	};
 
+	pmp0_mbox: mailbox@284e08000 {
+		compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x2 0x84e08000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 396 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 397 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 398 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 399 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_pmp>;
+		status = "disabled";
+	};
+
+	/*
+	 * PMP report (PTD): reads 16 bytes per entry from the base, writes 8 bytes per entry from
+	 * base + 0x10000, which is pmp0's ptd-update register (ADT pmp0 reg[3]); together they are
+	 * /arm-io/pmgr reg[7]. Entries are PMP soc-devices; an entry's reg is its soc-device ID - 1
+	 * (ADT iop-pmp0-nub soc-device). Without requests the running PMP keeps the vote iBoot left.
+	 */
+	pmp0_report: pmp-report@284240000 {
+		compatible = "apple,t6050-pmp-v2-report";
+		reg = <0x2 0x84240000 0x0 0x20000>;
+		power-domains = <&ps_pms_sram>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+
+		/* The CPU clusters: MACC0, MACC1, PACC */
+		report@c {
+			compatible = "apple,t6050-pmp-v2-report-entry",
+				     "apple,t6000-pmp-v2-report-entry";
+			reg = <0xc>;
+			label = "pmp-macc0";
+			#power-domain-cells = <0>;
+			apple,always-on;
+		};
+
+		report@d {
+			compatible = "apple,t6050-pmp-v2-report-entry",
+				     "apple,t6000-pmp-v2-report-entry";
+			reg = <0xd>;
+			label = "pmp-macc1";
+			#power-domain-cells = <0>;
+			apple,always-on;
+		};
+
+		report@e {
+			compatible = "apple,t6050-pmp-v2-report-entry",
+				     "apple,t6000-pmp-v2-report-entry";
+			reg = <0xe>;
+			label = "pmp-pacc";
+			#power-domain-cells = <0>;
+			apple,always-on;
+		};
+
+		/*
+		 * The GPU (AGX), on the GPU's own power state, so the PMP is told the GPU is on only
+		 * while it is powered (a request with the GPU off crashes the T6041 PMP). The GPU takes
+		 * this domain on a board that enables the report.
+		 */
+		pmp0_gfx: report@f {
+			compatible = "apple,t6050-pmp-v2-report-entry",
+				     "apple,t6000-pmp-v2-report-entry";
+			reg = <0xf>;
+			label = "pmp-gfx";
+			#power-domain-cells = <0>;
+			power-domains = <&ps_gfx>;
+		};
+
+		/* The internal display (DISPINT) */
+		report@12 {
+			compatible = "apple,t6050-pmp-v2-report-entry",
+				     "apple,t6000-pmp-v2-report-entry";
+			reg = <0x12>;
+			label = "pmp-dispint";
+			#power-domain-cells = <0>;
+			apple,always-on;
+		};
+
+		/* Storage (ANS) */
+		report@24 {
+			compatible = "apple,t6050-pmp-v2-report-entry",
+				     "apple,t6000-pmp-v2-report-entry";
+			reg = <0x24>;
+			label = "pmp-ans";
+			#power-domain-cells = <0>;
+			apple,always-on;
+		};
+	};
+
 	pmp0_dart: iommu@2841a0000 {
 		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		/* ADT dart-pmp0 instance: DART, then DAPF */
 		reg = <0x2 0x841a0000 0x0 0xc000>,
 		      <0x2 0x841b0000 0x0 0x4000>;
+		reg-names = "dart", "dapf";
 		interrupts = <AIC_IRQ 0 371 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
-		status = "disabled";
-	};
-
-	sep: sep@502600000 {
-		compatible = "apple,t6050-sep", "apple,sep";
-		reg = <0x5 0x2600000 0x0 0x88000>,
-		      <0x5 0x2050000 0x0 0x4000>;
-		interrupts = <AIC_IRQ 0 534 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 0 533 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 0 536 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 0 535 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&sep_dart 0>;
-		power-domains = <&ps_sep>;
-		clocks = <&peripheral_clocks 447>;
-		status = "disabled";
-	};
-
-	sep_dart: iommu@500b80000 {
-		compatible = "apple,t6050-dart", "apple,t8110-dart";
-		reg = <0x5 0xb80000 0x0 0x20000>;
-		interrupts = <AIC_IRQ 0 543 IRQ_TYPE_LEVEL_HIGH>;
-		#iommu-cells = <1>;
+		/* ADT dart-pmp0 vm-base, vm-size */
+		apple,dma-range = /bits/ 64 <0x10000000000 0x1000000000>;
+		power-domains = <&ps_pmp>;
 		status = "disabled";
 	};
 
@@ -3156,6 +3232,8 @@
 		             <AIC_IRQ 0 2463 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 2465 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_gfx>;
+		/* Raises the DRAM and fabric floors while GPU work is in flight */
+		apple,clpc = <&clpc>;
 		status = "disabled";
 	};
 
@@ -3413,4 +3491,51 @@
 
 
 
+};
+
+/*
+ * The SEP sits in die 0's soc node, not in the unit-less soc above: the boot loader
+ * resolves the sep alias by path, and "/soc" names soc@200000000 first.
+ */
+&die0 {
+	/* iBoot hands over a running SEP; apple_sep enables it and its DART when it loads. */
+	sep: sep@502600000 {
+		compatible = "apple,t6050-sep", "apple,sep";
+		reg = <0x5 0x2600000 0x0 0x88000>,
+		      <0x5 0x2050000 0x0 0x4000>;
+		mboxes = <&sep_mbox>;
+		mbox-names = "mbox";
+		iommus = <&sep_dart 0>;
+		power-domains = <&ps_sep>;
+		clocks = <&peripheral_clocks 447>;
+		status = "disabled";
+	};
+
+	/* The ASC v4 mailbox at sep + 0x8000; the first four ADT interrupts in mailbox order */
+	sep_mbox: mailbox@502608000 {
+		compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x5 0x2608000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 533 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 534 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 535 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 536 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	sep_dart: iommu@500b80000 {
+		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		reg = <0x5 0xb80000 0x0 0x20000>;
+		interrupts = <AIC_IRQ 0 543 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		/*
+		 * The window iBoot programmed (ADT dart-sep vm-base-0, vm-size-0), which
+		 * already carries the BIT(40) alias the DART translates.
+		 */
+		apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
+		apple,dma-offset = /bits/ 64 <0x0>;
+		status = "disabled";
+	};
 };

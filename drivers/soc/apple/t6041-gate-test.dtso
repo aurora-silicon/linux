@@ -7,8 +7,9 @@
  * heap regions of both processors are the boot loader's disabled
  * placeholders, the text region the one it adds.
  *
- * The display subsystem is the only node that is enabled. It sits at the
- * root, as on the J616c, so a tree that has one does not get this applied.
+ * The display subsystem is the only node that is enabled, as the internal
+ * display handoff leaves it. It sits at the root, as on the J616c, so a tree
+ * that has one does not get this applied.
  */
 
 /dts-v1/;

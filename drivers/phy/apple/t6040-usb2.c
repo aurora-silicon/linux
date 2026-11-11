@@ -34,11 +34,13 @@
 #include <linux/cleanup.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
+#include <linux/debugfs.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/of_platform.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
@@ -172,6 +174,46 @@
 #define T6040_CPU_EP_APP		32
 #define T6040_CPU_MSG_POWER_DOWN	0x0100000000000000ULL
 
+#define T6040_RECOVERY_RETRIES		1
+
+static unsigned int recovery_dwell_ms = 50;
+module_param(recovery_dwell_ms, uint, 0644);
+MODULE_PARM_DESC(recovery_dwell_ms,
+		 "PHY coprocessor hard-recovery off dwell in milliseconds (minimum 1, default 50)");
+
+struct t6040_recovery_state {
+	bool cycle_pending;
+	u8 retries;
+};
+
+static void t6040_recovery_power_down(struct t6040_recovery_state *state,
+				      bool acknowledged, bool clean_stop)
+{
+	if (!acknowledged || !clean_stop)
+		state->cycle_pending = true;
+}
+
+static bool t6040_recovery_start(struct t6040_recovery_state *state)
+{
+	state->retries = 0;
+	return state->cycle_pending;
+}
+
+static bool t6040_recovery_retry(struct t6040_recovery_state *state)
+{
+	state->cycle_pending = true;
+	if (state->retries >= T6040_RECOVERY_RETRIES)
+		return false;
+	state->retries++;
+	return true;
+}
+
+static void t6040_recovery_complete(struct t6040_recovery_state *state)
+{
+	state->cycle_pending = false;
+	state->retries = 0;
+}
+
 enum t6040_usb3_region {
 	T6040_USB3_AXI2AF,
 	T6040_USB3_AXI2AF_LIOA,
@@ -239,7 +281,11 @@ struct t6040_usb2_phy {
 	/* ADT tunable_USB2PHY_HOST, applied after the signal setup. */
 	struct apple_tunable *tunable_usb2_host;
 	struct apple_rtkit *rtk;
+	struct device *mbox_dev;
 	struct completion app_reply;
+	struct t6040_recovery_state recovery;
+	atomic_t drop_next_power_down_ack;
+	struct dentry *debugfs;
 	enum typec_orientation orientation;
 	bool usb3_up;		/* tuned by the coprocessor this power cycle */
 	bool usb3_on;		/* dwc3 holds the USB3 phy powered on */
@@ -577,7 +623,33 @@ static int t6040_usb3_wait_tuned(struct t6040_usb2_phy *tphy)
 	u32 uc;
 
 	return readl_poll_timeout(t6040_core(tphy) + T6040_CORE_UC_CTRL, uc,
-				  uc & T6040_CORE_UC_CTRL_TNBL_DONE, 1000, USEC_PER_SEC);
+				  uc & T6040_CORE_UC_CTRL_TNBL_DONE, 1, USEC_PER_SEC);
+}
+
+static const struct apple_rtkit_ops t6040_cpu_rtkit_ops;
+
+static int t6040_rtkit_start_transport(struct t6040_usb2_phy *tphy)
+{
+	if (tphy->rtk)
+		return 0;
+
+	tphy->rtk = apple_rtkit_init(tphy->dev, tphy, "phy-cpu", 0,
+				     &t6040_cpu_rtkit_ops);
+	if (IS_ERR(tphy->rtk)) {
+		int ret = PTR_ERR(tphy->rtk);
+
+		tphy->rtk = NULL;
+		return ret;
+	}
+	return 0;
+}
+
+static void t6040_rtkit_stop_transport(struct t6040_usb2_phy *tphy)
+{
+	if (!tphy->rtk)
+		return;
+	apple_rtkit_free(tphy->rtk);
+	tphy->rtk = NULL;
 }
 
 /*
@@ -589,6 +661,11 @@ static int t6040_usb3_wait_tuned(struct t6040_usb2_phy *tphy)
 static int t6040_usb3_cpu_start(struct t6040_usb2_phy *tphy)
 {
 	void __iomem *cpu = t6040_cpu(tphy);
+	int ret;
+
+	ret = t6040_rtkit_start_transport(tphy);
+	if (ret)
+		return ret;
 
 	if (readl(cpu + T6040_CPU_RUN) & T6040_CPU_RUN_START) {
 		dev_err(tphy->dev, "USB3: the PHY coprocessor runs without an RTKit session\n");
@@ -618,7 +695,7 @@ static int t6040_usb3_run_firmware(struct t6040_usb2_phy *tphy, bool usb, bool s
 	fsleep(10);
 
 	uc_before = readl(t6040_core(tphy) + T6040_CORE_UC_CTRL);
-	if (!apple_rtkit_is_running(tphy->rtk)) {
+	if (!tphy->rtk || !apple_rtkit_is_running(tphy->rtk)) {
 		ret = t6040_usb3_cpu_start(tphy);
 		if (ret) {
 			dev_err(tphy->dev, "USB3: the PHY coprocessor was not started: %d (run %#x, idle %#x, status %#x)\n",
@@ -644,43 +721,57 @@ static int t6040_usb3_run_firmware(struct t6040_usb2_phy *tphy, bool usb, bool s
 
 /*
  * Detach, RTBuddy::setPowerState(0): Power Down, RTKit AP then IOP to idle,
- * wait up to 10 ms for the CPU to idle, STOP. The RTKit state is reset so the
- * next attach boots the firmware as the first one did. The mailbox outbox
- * enable that macOS clears here is left as iBoot set it: Linux never clears it.
+ * wait up to 10 ms for the CPU to idle, STOP. The RTKit transport stays stopped
+ * so the next attach can either restart it normally or first power-cycle the
+ * domains. The mailbox outbox enable that macOS clears here is left as iBoot
+ * set it: Linux never clears it.
  */
 static void t6040_usb3_firmware_power_down(struct t6040_usb2_phy *tphy)
 {
 	void __iomem *cpu = t6040_cpu(tphy);
+	bool acknowledged = false;
+	bool clean_stop = true;
 	u32 status;
 	int ret;
 
-	if (apple_rtkit_is_running(tphy->rtk)) {
-		reinit_completion(&tphy->app_reply);
+	reinit_completion(&tphy->app_reply);
+	if (tphy->rtk && apple_rtkit_is_running(tphy->rtk)) {
 		ret = apple_rtkit_start_ep(tphy->rtk, T6040_CPU_EP_APP);
 		if (!ret)
 			ret = apple_rtkit_send_message(tphy->rtk, T6040_CPU_EP_APP,
 						       T6040_CPU_MSG_POWER_DOWN, NULL, false);
-		if (!ret && !wait_for_completion_timeout(&tphy->app_reply, msecs_to_jiffies(500)))
-			ret = -ETIMEDOUT;
 		if (ret)
-			dev_warn(tphy->dev, "USB3: no Power Down acknowledge: %d\n", ret);
+			dev_warn(tphy->dev, "USB3: Power Down submission failed: %d\n", ret);
 
 		ret = apple_rtkit_idle(tphy->rtk);
-		if (ret)
+		if (ret) {
 			dev_warn(tphy->dev, "USB3: PHY coprocessor idle failed: %d\n", ret);
+			clean_stop = false;
+		}
 	}
 
-	if (!(readl(cpu + T6040_CPU_RUN) & T6040_CPU_RUN_START))
-		return;
-	if (readl_poll_timeout(cpu + T6040_CPU_STATUS, status, status & T6040_CPU_STATUS_IDLE,
-			       1000, 10000))
-		dev_warn(tphy->dev, "USB3: the PHY coprocessor did not idle (status %#x)\n",
-			 status);
-	writel(~T6040_CPU_RUN_START, cpu + T6040_CPU_RUN);
+	if (readl(cpu + T6040_CPU_RUN) & T6040_CPU_RUN_START) {
+		if (readl_poll_timeout(cpu + T6040_CPU_STATUS, status,
+				       status & T6040_CPU_STATUS_IDLE, 1000, 10000)) {
+			dev_warn(tphy->dev,
+				 "USB3: the PHY coprocessor did not idle (status %#x)\n",
+				 status);
+			clean_stop = false;
+		}
+		writel(~T6040_CPU_RUN_START, cpu + T6040_CPU_RUN);
+		if (readl(cpu + T6040_CPU_RUN) & T6040_CPU_RUN_START) {
+			dev_warn(tphy->dev, "USB3: the PHY coprocessor STOP did not latch\n");
+			clean_stop = false;
+		}
+	}
 
-	ret = apple_rtkit_reinit(tphy->rtk);
-	if (ret)
-		dev_warn(tphy->dev, "USB3: RTKit reset failed: %d\n", ret);
+	/* Leave the transport stopped until the next firmware start. Free drains RX. */
+	t6040_rtkit_stop_transport(tphy);
+	/* Power Down is asynchronous; never wait solely for its application reply. */
+	acknowledged = completion_done(&tphy->app_reply);
+	if (!acknowledged)
+		dev_warn(tphy->dev, "USB3: no asynchronous Power Down acknowledge\n");
+	t6040_recovery_power_down(&tphy->recovery, acknowledged, clean_stop);
 }
 
 /*
@@ -709,6 +800,76 @@ static void t6040_usb3_sleep(struct t6040_usb2_phy *tphy)
 	t6040_usb3_cfg_ack(tphy, "SLEEP_B_SML release", T6040_CFG_STATUS_SLEEP_B_SML, false);
 	t6040_usb2_clear32(cfg + T6040_CFG_SPARE0, T6040_CFG_SPARE0_S2R_FSM_EN);
 	udelay(1);
+}
+
+static int t6040_common_dp_force_resume(struct t6040_usb2_phy *tphy)
+{
+	int ret;
+
+	ret = pm_runtime_force_resume(tphy->dev);
+	if (ret)
+		return ret;
+	/* force_resume may preserve an idle device in suspend; this caller needs MMIO now. */
+	ret = pm_runtime_resume_and_get(tphy->dev);
+	if (ret < 0)
+		return ret;
+	pm_runtime_put_noidle(tphy->dev);
+	return 0;
+}
+
+/*
+ * Drop both domains with RTKit fully detached. phymxwrap is the mailbox
+ * provider's runtime domain; common_dp is this device's runtime domain. Force
+ * common_dp through a balanced suspend/resume because the USB2 PHY and DWC3
+ * reset can hold independent runtime references while the SuperSpeed lanes are
+ * quiesced.
+ */
+static int t6040_usb3_hard_recover(struct t6040_usb2_phy *tphy)
+{
+	unsigned int dwell = max(recovery_dwell_ms, 1U);
+	int ret, resume_ret;
+
+	if (WARN_ON(tphy->rtk))
+		t6040_rtkit_stop_transport(tphy);
+
+	ret = pm_runtime_force_suspend(tphy->dev);
+	if (ret < 0)
+		return ret;
+
+	pm_runtime_barrier(tphy->mbox_dev);
+	ret = pm_runtime_suspend(tphy->mbox_dev);
+	if (ret < 0 && ret != -EACCES) {
+		dev_err(tphy->dev, "USB3: phymxwrap suspend failed: %d\n", ret);
+		goto resume_phy;
+	}
+	if (!pm_runtime_status_suspended(tphy->mbox_dev)) {
+		ret = -EBUSY;
+		dev_err(tphy->dev, "USB3: phymxwrap did not power off\n");
+		goto resume_phy;
+	}
+
+	msleep(dwell);
+	ret = t6040_rtkit_start_transport(tphy);
+	if (ret) {
+		dev_err(tphy->dev, "USB3: RTKit transport restart failed: %d\n", ret);
+		goto resume_phy;
+	}
+
+	resume_ret = t6040_common_dp_force_resume(tphy);
+	if (resume_ret < 0) {
+		dev_err(tphy->dev, "USB3: common_dp resume failed: %d\n", resume_ret);
+		t6040_rtkit_stop_transport(tphy);
+		return resume_ret;
+	}
+
+	dev_warn(tphy->dev, "USB3: completed hard recovery with %u ms off dwell\n", dwell);
+	return 0;
+
+resume_phy:
+	resume_ret = t6040_common_dp_force_resume(tphy);
+	if (resume_ret < 0)
+		return resume_ret;
+	return ret;
 }
 
 /* Sets PHY_STATUS(_2) handshake bits in the BIST block and waits as macOS does, without failing. */
@@ -782,7 +943,6 @@ static void t6040_phy_tx_cmn_down(struct t6040_usb2_phy *tphy)
 	t6040_usb2_clear32(core + T6040_CORE_CMN_OVRD, T6040_CORE_CMN_OVRD_SLEEP_B_SML);
 	udelay(1);
 }
-
 
 static void t6040_usb3_shutdown_lanes(struct t6040_usb2_phy *tphy)
 {
@@ -904,6 +1064,7 @@ static void t6040_usb3_pipe_park(struct t6040_usb2_phy *tphy)
  */
 static void t6040_usb3_up_locked(struct t6040_usb2_phy *tphy)
 {
+	bool cycle;
 	bool swap;
 	int ret;
 
@@ -931,6 +1092,14 @@ static void t6040_usb3_up_locked(struct t6040_usb2_phy *tphy)
 	/* PIPE_HANDLER_DEFAULT: the dummy PIPE clock the controller keeps using at USB2 */
 	apple_tunable_apply(tphy->pipehandler, tphy->tunable_pipehandler);
 
+	cycle = t6040_recovery_start(&tphy->recovery);
+retry:
+	if (cycle) {
+		ret = t6040_usb3_hard_recover(tphy);
+		if (ret)
+			goto failed;
+	}
+
 	ret = t6040_usb3_wake(tphy);
 	if (ret)
 		goto sleep;	/* the coprocessor block may be unclocked: never touch it */
@@ -938,17 +1107,27 @@ static void t6040_usb3_up_locked(struct t6040_usb2_phy *tphy)
 	t6040_usb3_lanes(tphy, swap);
 	ret = t6040_usb3_run_firmware(tphy, true, swap);
 	if (ret)
-		goto usb2_only;
+		goto retry_or_fail;
 
+	t6040_recovery_complete(&tphy->recovery);
 	tphy->usb3_up = true;
 	dev_dbg(tphy->dev, "USB3 PHY up, lane %d\n", swap);
 	return;
-
-usb2_only:
-	/* power_off skips a PHY that never came up: undo here, so the next attach starts clean */
+retry_or_fail:
+	/* A retune is a full detach sequence followed by one complete fresh start. */
+	t6040_usb3_shutdown_lanes(tphy);
 	t6040_usb3_firmware_power_down(tphy);
+	t6040_usb3_sleep(tphy);
+	if (t6040_recovery_retry(&tphy->recovery)) {
+		cycle = true;
+		goto retry;
+	}
+	goto failed;
+
 sleep:
 	t6040_usb3_sleep(tphy);
+
+failed:
 	dev_warn(tphy->dev, "USB3 PHY bring-up failed (%d), USB2 only\n", ret);
 }
 
@@ -1524,6 +1703,7 @@ static bool t6040_cio_state(const struct typec_mux_state *state)
 
 static int t6040_cio_up_locked(struct t6040_usb2_phy *tphy)
 {
+	bool cycle;
 	bool flip;
 	int ret;
 
@@ -1548,6 +1728,15 @@ static int t6040_cio_up_locked(struct t6040_usb2_phy *tphy)
 	ret = pm_runtime_resume_and_get(tphy->dev);
 	if (ret)
 		return ret;
+
+	cycle = t6040_recovery_start(&tphy->recovery);
+retry:
+	if (cycle) {
+		ret = t6040_usb3_hard_recover(tphy);
+		if (ret)
+			goto put;
+	}
+
 	ret = t6040_usb3_wake(tphy);
 	if (ret)
 		goto sleep;	/* the coprocessor block may be unclocked: never touch it */
@@ -1556,15 +1745,25 @@ static int t6040_cio_up_locked(struct t6040_usb2_phy *tphy)
 	t6040_cio_lanes_on(tphy);
 	ret = t6040_usb3_run_firmware(tphy, false, flip);
 	if (ret) {
+		t6040_phy_tx_cmn_down(tphy);
+		t6040_cio_rx_down(tphy);
+		fsleep(200);
 		t6040_usb3_firmware_power_down(tphy);
-		goto sleep;
+		t6040_usb3_sleep(tphy);
+		if (t6040_recovery_retry(&tphy->recovery)) {
+			cycle = true;
+			goto retry;
+		}
+		goto put;
 	}
+	t6040_recovery_complete(&tphy->recovery);
 	tphy->cio_up = true;
 	dev_info(tphy->dev, "CIO PHY up, %s orientation\n", flip ? "reverse" : "normal");
 	return 0;
 
 sleep:
 	t6040_usb3_sleep(tphy);
+put:
 	pm_runtime_put(tphy->dev);
 	dev_warn(tphy->dev, "CIO PHY bring-up failed: %d\n", ret);
 	return ret;
@@ -1645,6 +1844,18 @@ static int t6040_dp_power_off(struct phy *phy)
 		ret = t6040_dp_set_rate(tphy, -1);
 		if (ret)
 			return ret;
+	}
+	/*
+	 * DP on all four lanes held the common block and the TX lanes on by
+	 * override, with no coprocessor. Release them and put the PHY to sleep,
+	 * as the CIO teardown does: the next USB3 bring-up then starts from a
+	 * sleeping PHY, as on a fresh attach. Booting the coprocessor's
+	 * firmware for the first time over the DP state crashes it.
+	 */
+	if (tphy->dp_up && !tphy->dp_mode_two_lanes && !t6040_dp_only(tphy)) {
+		t6040_phy_tx_cmn_down(tphy);
+		t6040_usb3_sleep(tphy);
+		dev_info(tphy->dev, "DP PHY down, PHY asleep\n");
 	}
 	tphy->dp_up = false;
 	if (tphy->dp_mode_two_lanes && !tphy->usb3_on)
@@ -1892,10 +2103,16 @@ static void t6040_cpu_recv_message(void *cookie, u8 ep, u64 msg)
 {
 	struct t6040_usb2_phy *tphy = cookie;
 
-	if (ep == T6040_CPU_EP_APP)
+	if (ep == T6040_CPU_EP_APP) {
+		if (atomic_xchg(&tphy->drop_next_power_down_ack, 0)) {
+			dev_warn(tphy->dev, "USB3: dropped Power Down acknowledge (fault injection)\n");
+			return;
+		}
+		dev_dbg(tphy->dev, "USB3: Power Down acknowledge %#llx\n", msg);
 		complete(&tphy->app_reply);
-	else
+	} else {
 		dev_dbg(tphy->dev, "USB3: coprocessor message on endpoint %u: %#llx\n", ep, msg);
+	}
 }
 
 static const struct apple_rtkit_ops t6040_cpu_rtkit_ops = {
@@ -1905,6 +2122,65 @@ static const struct apple_rtkit_ops t6040_cpu_rtkit_ops = {
 	.shmem_setup = t6040_cpu_shmem_setup,
 	.shmem_destroy = t6040_cpu_shmem_destroy,
 };
+
+static void t6040_rtkit_cleanup(void *data)
+{
+	t6040_rtkit_stop_transport(data);
+}
+
+static void t6040_mbox_dev_put(void *data)
+{
+	put_device(data);
+}
+
+static int t6040_get_mbox_dev(struct t6040_usb2_phy *tphy)
+{
+	struct of_phandle_args args;
+	struct platform_device *pdev;
+	int ret;
+
+	ret = of_parse_phandle_with_args(tphy->dev->of_node, "mboxes", "#mbox-cells", 0,
+					 &args);
+	if (ret)
+		return ret;
+	pdev = of_find_device_by_node(args.np);
+	of_node_put(args.np);
+	if (!pdev)
+		return -EPROBE_DEFER;
+
+	tphy->mbox_dev = &pdev->dev;
+	return devm_add_action_or_reset(tphy->dev, t6040_mbox_dev_put, tphy->mbox_dev);
+}
+
+static void t6040_debugfs_remove(void *data)
+{
+	debugfs_remove_recursive(data);
+}
+
+static int t6040_debugfs_init(struct t6040_usb2_phy *tphy)
+{
+	const char *name;
+	int ret;
+
+	name = devm_kasprintf(tphy->dev, GFP_KERNEL, "t6040-atcphy-%s",
+			      dev_name(tphy->dev));
+	if (!name)
+		return -ENOMEM;
+	tphy->debugfs = debugfs_create_dir(name, NULL);
+	if (IS_ERR(tphy->debugfs)) {
+		if (PTR_ERR(tphy->debugfs) == -ENODEV) {
+			tphy->debugfs = NULL;
+			return 0;
+		}
+		return PTR_ERR(tphy->debugfs);
+	}
+	debugfs_create_atomic_t("drop_next_power_down_ack", 0600, tphy->debugfs,
+				&tphy->drop_next_power_down_ack);
+	ret = devm_add_action_or_reset(tphy->dev, t6040_debugfs_remove, tphy->debugfs);
+	if (ret)
+		tphy->debugfs = NULL;
+	return ret;
+}
 
 /*
  * Map the PHY register windows shared by the USB3 and DisplayPort paths. Each
@@ -2003,14 +2279,26 @@ static int t6040_usb3_probe(struct t6040_usb2_phy *tphy, struct platform_device 
 		return 0;
 	}
 
-	tphy->rtk = devm_apple_rtkit_init(dev, tphy, "phy-cpu", 0, &t6040_cpu_rtkit_ops);
+	ret = t6040_get_mbox_dev(tphy);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to find PHY coprocessor mailbox\n");
+
+	tphy->rtk = apple_rtkit_init(dev, tphy, "phy-cpu", 0, &t6040_cpu_rtkit_ops);
 	if (IS_ERR(tphy->rtk)) {
 		ret = PTR_ERR(tphy->rtk);
+		tphy->rtk = NULL;
 		if (ret == -EPROBE_DEFER)
 			return ret;
 		dev_warn(dev, "USB3: no PHY coprocessor mailbox (%d), USB2 only\n", ret);
 		return 0;
 	}
+	ret = devm_add_action_or_reset(dev, t6040_rtkit_cleanup, tphy);
+	if (ret)
+		return ret;
+
+	ret = t6040_debugfs_init(tphy);
+	if (ret)
+		return ret;
 
 	tphy->usb3_ok = true;
 	return 0;
@@ -2135,6 +2423,7 @@ static int t6040_usb2_probe(struct platform_device *pdev)
 	 */
 	tphy->mode = PHY_MODE_USB_HOST;
 	mutex_init(&tphy->lock);
+	atomic_set(&tphy->drop_next_power_down_ack, 0);
 	platform_set_drvdata(pdev, tphy);
 
 	tphy->usb2 = devm_platform_ioremap_resource_byname(pdev, "bank0");
@@ -2223,3 +2512,7 @@ module_platform_driver(t6040_usb2_driver);
 MODULE_AUTHOR("The Asahi Linux Contributors");
 MODULE_DESCRIPTION("Apple T6040 Type-C PHY, USB2/USB3 host and DisplayPort");
 MODULE_LICENSE("Dual BSD/GPL");
+
+#if IS_ENABLED(CONFIG_PHY_APPLE_T6040_KUNIT_TEST)
+#include "t6040-recovery-test.c"
+#endif

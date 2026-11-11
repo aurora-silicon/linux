@@ -163,3 +163,51 @@ fn experimental_air_is_active_while_pro_retains_serial_default() {
     assert!(default_depth(true)<=SLOTS);
     assert_eq!(MAX_PACKETS,8);
 }
+
+#[test]
+fn firmware_starts_once_per_boot() {
+    let latch=StartLatch::new();
+    assert!(latch.claim());
+    // Unbind and rebind, a reload or a retry: every later start is refused.
+    for _ in 0..3 {assert!(!latch.claim());}
+    // Concurrent probes: exactly one claims it.
+    let latch=std::sync::Arc::new(StartLatch::new());
+    let claims:usize=(0..8).map(|_|{let l=latch.clone();std::thread::spawn(move||l.claim())})
+        .collect::<Vec<_>>().into_iter().map(|t|usize::from(t.join().unwrap())).sum();
+    assert_eq!(claims,1);
+}
+
+#[test]
+fn failed_pending_packets_quarantine_only_what_the_firmware_may_have_seen() {
+    // (in a batch fail_active drained, partly published and still pending, never in a batch)
+    struct Packet {published:bool,guard:bool}
+    let mut active=vec![Packet{published:true,guard:true}];
+    let mut pending=vec![Packet{published:true,guard:true},Packet{published:false,guard:true}];
+    // fail_active drains active before fail_pending: a check against active can't see these.
+    let drained:Vec<_>=active.drain(..).collect();
+    for p in pending.iter_mut() {if release_unpublished(p.published) {p.guard=false;}}
+    assert!(drained[0].guard);
+    assert!(pending[0].guard,"a partly published packet keeps its guard");
+    assert!(!pending[1].guard,"a never-published packet releases its guard");
+}
+
+#[test]
+fn the_start_pins_the_module_before_claiming_and_fails_closed() {
+    use std::cell::Cell;
+    let latch=StartLatch::new();
+    let refs=Cell::new(1i32); // the module's base reference
+    let pin_ok=||{refs.set(refs.get()+1);true};
+    let unpin=||refs.set(refs.get()-1);
+    // rmmod has begun: no pin, no claim, no start, and the reference count is untouched.
+    assert_eq!(claim_start(&latch,||false,unpin),Err(StartRefusal::Removing));
+    assert_eq!(refs.get(),1);
+    // The first live start wins and keeps its pin.
+    assert_eq!(claim_start(&latch,pin_ok,unpin),Ok(()));
+    assert_eq!(refs.get(),2);
+    // A later start (rebind, retry) loses the claim and drops only its own pin.
+    assert_eq!(claim_start(&latch,pin_ok,unpin),Err(StartRefusal::AlreadyStarted));
+    assert_eq!(refs.get(),2);
+    // A later start racing rmmod still claims nothing.
+    assert_eq!(claim_start(&latch,||false,||panic!("nothing to unpin")),Err(StartRefusal::Removing));
+    assert_eq!(refs.get(),2);
+}

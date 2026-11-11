@@ -205,6 +205,9 @@ pub(super) struct InitData {
     compute_scheduler: Option<ComputeScheduler>,
     compute_active: core::cell::Cell<bool>,
     event_ring_checked: [core::cell::Cell<(u64, u64, u32)>; 2],
+    /// M5: the submission-history geometry (period, slot count) read under the firmware's
+    /// generation, with that generation.
+    history_geometry: core::cell::Cell<Option<(u32, u64, u64)>>,
     /// Completion-ring objects; a family sets only the rings it has.
     completion_rings: [Option<usize>; 4],
     stamps: [usize; 2],
@@ -308,6 +311,7 @@ impl InitData {
             compute_scheduler: None,
             compute_active: core::cell::Cell::new(false),
             event_ring_checked: [const { core::cell::Cell::new((0, 0, 0)) }; 2],
+            history_geometry: core::cell::Cell::new(None),
             completion_rings: [None; 4],
             stamps: [0; 2],
             render_pages: None,
@@ -691,10 +695,37 @@ impl InitData {
         Ok(next != consumer && next != consumer_b)
     }
 
+    /// M5 compute: the shared ring's cursors when it has room for one record, as
+    /// [`Self::work_ready`] judges it. The same critical section may publish against them
+    /// ([`Self::publish_work_at`]): the firmware's consumers only advance, and the producer
+    /// is the device mutex holder's.
+    pub(super) fn m5_compute_room(&self, priority: u8) -> Result<Option<[u32; 3]>> {
+        use super::fw::queue::DataMaster;
+        if !self.m5 {
+            return Err(EINVAL);
+        }
+        let cursors = self.work_cursors(priority, DataMaster::Compute)?;
+        Ok((self.outer_capacity(priority, cursors)? >= 1).then_some(cursors))
+    }
+
+    /// M5 render: the shared ring's cursors when it has room for a pair, as
+    /// [`Self::work_ready`] judges it, for the pair's publication in the same hold
+    /// ([`Self::m5_work_pair`]).
+    pub(super) fn m5_render_room(&self, priority: u8) -> Result<Option<[u32; 3]>> {
+        use super::fw::queue::DataMaster;
+        if !self.m5 {
+            return Err(EINVAL);
+        }
+        let cursors = self.work_cursors(priority, DataMaster::Compute)?;
+        Ok((self.outer_capacity(priority, cursors)? >= 2).then_some(cursors))
+    }
+
+    /// `cursors`: an M5 compute room check's sample ([`Self::m5_compute_room`]), else read here.
     fn work_publication<'a>(
         &'a self,
         priority: u8,
         record: &'a super::fw::channels::WorkSlot,
+        cursors: Option<[u32; 3]>,
     ) -> Result<WorkPublication<'a>> {
         use super::fw::{channels, queue::DataMaster};
         let engine = match record.data_master {
@@ -706,7 +737,11 @@ impl InitData {
             _ => return Err(EINVAL),
         };
         let channel = channels::work_ring_index(priority, engine).ok_or(EINVAL)?;
-        let [consumer, consumer_b, producer] = self.work_cursors(priority, engine)?;
+        let [consumer, consumer_b, producer] = match cursors {
+            Some(cursors) if self.m5 && engine == DataMaster::Compute => cursors,
+            Some(_) => return Err(EINVAL),
+            None => self.work_cursors(priority, engine)?,
+        };
         if self.m5 && engine == DataMaster::Compute
             && self.outer_capacity(priority, [consumer, consumer_b, producer])? < 1 {
             return Err(EBUSY);
@@ -734,6 +769,21 @@ impl InitData {
             producer,
             next,
         })
+    }
+
+    /// The host producer of the shared M5 ring alone (the last of [`Self::work_cursors`]).
+    pub(super) fn work_producer(&self, priority: u8) -> Result<u32> {
+        use super::fw::{channels, queue::DataMaster};
+        let channel = channels::work_ring_index(priority, DataMaster::Compute).ok_or(EINVAL)?;
+        let producer = self
+            .object(self.cluster)?
+            .word(self.state_offset(Role::Primary) + abi::work_state_offset(channel)
+                + abi::ChannelState::PRODUCER)?
+            .load(Ordering::Relaxed);
+        if producer >= channels::WORK_RING_SLOTS {
+            return Err(EINVAL);
+        }
+        Ok(producer)
     }
 
     /// Two firmware consumers and the host producer, sampled in that order.
@@ -769,16 +819,30 @@ impl InitData {
         priority: u8,
         record: &super::fw::channels::WorkSlot,
     ) -> Result<u32> {
-        Ok(self.work_publication(priority, record)?.commit())
+        self.publish_work_at(priority, record, None)
+    }
+
+    /// [`Self::publish_work`] against the cursors of a room check made earlier under the same
+    /// hold of the device mutex ([`Self::m5_compute_room`]), or a fresh read for None.
+    pub(super) fn publish_work_at(
+        &self,
+        priority: u8,
+        record: &super::fw::channels::WorkSlot,
+        cursors: Option<[u32; 3]>,
+    ) -> Result<u32> {
+        Ok(self.work_publication(priority, record, cursors)?.commit())
     }
 
     /// Reserve both common-ring slots before touching either host port. The
     /// returned views retain the graph borrow until the pair is published.
+    /// `cursors`: a room check's sample from the same hold ([`Self::m5_render_room`]),
+    /// else read here.
     pub(super) fn m5_work_pair(
         &self,
         priority: u8,
         fragment: &super::fw::channels::WorkSlot,
         tiling: &super::fw::channels::WorkSlot,
+        cursors: Option<[u32; 3]>,
     ) -> Result<work_pair::Publication<'_>> {
         use super::fw::{channels, queue::DataMaster};
         if !self.m5
@@ -787,7 +851,10 @@ impl InitData {
         {
             return Err(EINVAL);
         }
-        let cursors = self.work_cursors(priority, DataMaster::Compute)?;
+        let cursors = match cursors {
+            Some(cursors) => cursors,
+            None => self.work_cursors(priority, DataMaster::Compute)?,
+        };
         if self.outer_capacity(priority, cursors)? < 2 { return Err(EBUSY); }
         let window = work_pair::Window::new(cursors)?;
         let channel = channels::work_ring_index(priority, DataMaster::Compute).ok_or(EINVAL)?;
@@ -829,14 +896,14 @@ impl InitData {
             return Err(EINVAL);
         }
         if self.m5 {
-            let pair = self.m5_work_pair(priority, fragment, tiling)?;
+            let pair = self.m5_work_pair(priority, fragment, tiling, None)?;
             pair.prepare();
             commit_accounting()?;
             publish_late_tiling();
             return Ok(if deferred { pair.next() } else { pair.publish() });
         }
-        let fragment = self.work_publication(priority, fragment)?;
-        let tiling = self.work_publication(priority, tiling)?;
+        let fragment = self.work_publication(priority, fragment, None)?;
+        let tiling = self.work_publication(priority, tiling, None)?;
         fragment.copy_record();
         commit_accounting()?;
         fence(Ordering::SeqCst);
@@ -891,16 +958,18 @@ impl InitData {
 
     /// Release a retained pair after its control transaction. Revalidate the original producer
     /// witnesses before either copy; both bodies precede the fragment and tiling publications.
+    /// `cursors`: M5, as for [`Self::m5_work_pair`].
     pub(super) fn publish_retained_work_pair(
         &self,
         priority: u8,
         fragment: &super::fw::channels::WorkSlot,
         tiling: &super::fw::channels::WorkSlot,
         next: [u32; 2],
+        cursors: Option<[u32; 3]>,
     ) -> Result {
         use super::fw::queue::DataMaster;
         if self.m5 {
-            let pair = self.m5_work_pair(priority, fragment, tiling)?;
+            let pair = self.m5_work_pair(priority, fragment, tiling, cursors)?;
             if pair.next() != next { return Err(EBUSY); }
             pair.publish();
             return Ok(());
@@ -1079,7 +1148,7 @@ impl InitData {
             lower: uat.kernel_lower_vm(),
             render,
             base: range.start,
-            dynamic: range.start + t8140::dynamic::KERNEL_OFFSET..range.end,
+            dynamic: t8140::dynamic::upper(range.clone()),
             clusters,
         };
         if variant.graph == super::fw::variant::InitGraph::V25G83 {
@@ -1936,6 +2005,8 @@ impl super::recovery::Memory for InitData {
     }
 
     fn transition(&self, expected: u32, next: u32) -> Result {
+        // A restarted firmware may lay its submission history out anew.
+        self.history_geometry.set(None);
         let state = self
             .object(self.cluster)?
             .word(self.recovery_state_offset())?;

@@ -526,6 +526,7 @@ impl Pair {
             fragment_status_fw_va: fragment_fw,
             aux_fb_va: auxiliary,
             timestamp_va: timestamp,
+            timestamp_window: packet.completion.window_vas(),
             ta_ids: lifecycle[0],
             fragment_ids: lifecycle[1],
             unk_2104: self.descriptor_flags[0],
@@ -618,6 +619,7 @@ fn render_barriers(
     stage_prefixes: bool,
     dependencies: &RenderDependencies,
     own_tiling: KickDependency,
+    compute_class: u8,
 ) -> RenderBarriers {
     let fragment_stage = fragment_stage || stage_prefixes;
     let mut tiling_barriers = [KickDependency::ZERO; 5];
@@ -657,12 +659,12 @@ fn render_barriers(
     }
     if let Some(compute) = dependencies.compute {
         tiling_barriers[tiling_count] = compute;
-        tiling_types[tiling_count] = 2;
+        tiling_types[tiling_count] = compute_class;
         tiling_count += 1;
     }
     if let Some(compute) = dependencies.fragment_compute {
         fragment_barriers[fragment_count] = compute;
-        fragment_types[fragment_count] = 2;
+        fragment_types[fragment_count] = compute_class;
         fragment_count += 1;
     }
     if stage_prefixes {
@@ -883,8 +885,17 @@ impl Pair {
             }
             publication::required(cache[stage], config)
         });
-        let cursors = self.memory.graph.cursors()?;
-        if cursors[0].write != self.cursors[0] || cursors[1].write != self.cursors[1] {
+        // An idle pair's next command starts from the rings' cursors; behind a command in
+        // flight it starts from that command's windows, and only the producers are checked.
+        let cursors = match self.active.front() {
+            Some(_) => None,
+            None => Some(self.memory.graph.cursors()?),
+        };
+        let producers = match cursors {
+            Some(cursors) => cursors.map(|cursors| cursors.write),
+            None => self.memory.graph.write_cursors()?,
+        };
+        if producers != self.cursors {
             return Err(EBUSY);
         }
         let queues = qids.map(|qid| self.memory.graph.queue_va(qid));
@@ -896,7 +907,8 @@ impl Pair {
         };
         let own_tiling = KickDependency::new(qids[0], kicks[0]).ok_or(EINVAL)?;
         let barriers =
-            render_barriers(pass.fragment_barriers, pass.stage_prefixes, dependencies, own_tiling);
+            render_barriers(pass.fragment_barriers, pass.stage_prefixes, dependencies, own_tiling,
+                self.board.map_or(2, crate::g17::fw::m5::compute::explicit_dependency));
         let tiling_barriers = &barriers.tiling[..barriers.tiling_count];
         // With the G17D forms a fragment kick with history also names its parent's
         // predecessor, in class 1, after the self-parent (classes [1, 3, 1] for a lone pass).
@@ -1019,16 +1031,18 @@ impl Pair {
             )?,
         ];
         let windows = [lanes[0].window, lanes[1].window];
-        let previous = self.active.front().map_or(cursors, |active| {
-            active.ticket.windows.map(|window| {
+        let previous = match (self.active.front(), cursors) {
+            (Some(active), _) => active.ticket.windows.map(|window| {
                 let target = window.target();
                 retirement::Cursors {
                     done: target,
                     read: target,
                     write: target,
                 }
-            })
-        });
+            }),
+            (None, Some(cursors)) => cursors,
+            (None, None) => return Err(EIO),
+        };
         let fragment_slot = WorkSlot::new(
             DataMaster::Fragment,
             queues[1],
@@ -2189,10 +2203,43 @@ impl Pair {
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result {
         self.replay_since = None;
+        // A descriptor prepared for the front and never published goes with it, or the pair
+        // would take no work again.
+        if let Some(front) = self.replay.front().cloned() {
+            if self
+                .prepared
+                .as_ref()
+                .is_some_and(|prepared| Arc::ptr_eq(&prepared.packet, &front))
+            {
+                self.discard_prepared(&front)?;
+            }
+        }
         while let Some(packet) = self.replay.pop() {
             defer(Deferred::Retired(packet.completion.clone(), Err(error)))?;
         }
         Ok(())
+    }
+
+    /// The parked groups did not publish within the replay bound
+    /// ([`crate::g17::timeout::background_stalled`], 10 s after they were parked). They are
+    /// groups a restart dropped before they ran, which `replay::decide` parks only for innocent
+    /// VMs: like `fail_dropped`'s, they fail with ENODATA without poisoning their VM, instead of
+    /// the replay pass failing the whole device.
+    pub(crate) fn fail_stalled_replay(
+        &mut self,
+        defer: &mut impl FnMut(Deferred) -> Result,
+    ) -> Result {
+        pr_warn!(
+            "G17: render slot {}: replay of {} parked groups stalled; failing them\n",
+            self.slot,
+            self.replay.len()
+        );
+        for packet in self.replay.iter() {
+            if !packet.completion.guilty() {
+                packet.completion.classify(recovery::Class::Spared);
+            }
+        }
+        self.fail_replay(ENODATA, defer)
     }
 
     /// A closed preparation epoch invalidates only this unpublished descriptor.

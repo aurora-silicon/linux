@@ -9,6 +9,7 @@
 #[cfg(not(CONFIG_OF_DYNAMIC))]
 compile_error!("apple_sep requires CONFIG_OF_DYNAMIC: the SEP and DART nodes ship disabled and are enabled with a device-tree changeset");
 
+mod attach;
 mod bio;
 mod catacomb;
 mod control;
@@ -38,6 +39,7 @@ mod sks;
 mod store;
 mod transfer;
 mod trusted;
+mod userbag;
 mod xarm;
 mod xart_apfs;
 mod xart_guard;
@@ -91,6 +93,12 @@ use kernel::{
 };
 
 const SETTLE_MS: time::Msecs = 200;
+/// Messages on an endpoint without a handler are logged this many times per
+/// boot; diag/unhandled_messages counts them all.
+const UNHANDLED_LOG_LIMIT: u32 = 4;
+/// Users whose last logged lock state is remembered (a Mac has the system
+/// user 501 and one or two Linux users).
+pub(crate) const LOCK_STATE_LOG_USERS: usize = 4;
 const FIRST_RESPONSE_MS: time::Msecs = 3000;
 const RNG_SURVEY_ATTEMPTS: u32 = 5;
 
@@ -605,6 +613,18 @@ struct SepData {
 
     profile: &'static profile::PlatformProfile,
 
+    // Serialises completion, including concurrent sysfs writers and retries.
+    #[pin]
+    attach_phase: Mutex<attach::Phase>,
+    keystore_only: Atomic<bool>,
+    // keystore_only=2: /dev/sep-bio-rearm is published in the initrd phase
+    // for the password-unlock subset of the per-user key bag requests.
+    keystore_user_bags: bool,
+    keystore_write_refusals: Atomic<u32>,
+    #[pin]
+    identity_keybag: Mutex<Option<keybag::StoredKeyBag>>,
+
+
     #[pin]
     fw_map: Mutex<Option<FirmwareMap>>,
 
@@ -745,6 +765,13 @@ struct SepData {
 
     #[pin]
     sks_exchange_lock: Mutex<()>,
+    // One SCRD request in flight at a time: the endpoint has one pair of
+    // shared buffers and replies are told apart by request type only, so
+    // two callers (a touch-gated /dev/sep-key call, the re-arm, a self-test)
+    // would overwrite each other's payload or take each other's reply,
+    // including a new credential context's handle.
+    #[pin]
+    scrd_exchange_lock: Mutex<()>,
     #[pin]
     sks_probe: Mutex<SksProbe>,
     #[pin]
@@ -775,12 +802,21 @@ struct SepData {
     #[pin]
     key_dev: Mutex<Option<shim::BioChardev>>,
 
+    // /dev/sep-key: one identity-bag load, operation and unload at a time.
+    // The device's ioctls run concurrently (a touch wait must not block
+    // SEP_KEY_CANCEL), so this, not the chardev lock, keeps one caller from
+    // unloading the bag under another's operation.
+    #[pin]
+    key_bag_lock: Mutex<()>,
+
     // /dev/sep-key: the signature a touch-gated SEP_KEY_SIGN is waiting for.
     // Set only for the length of that ioctl; while set, a verify run belongs
     // to it and not to /dev/sep-bio's session.
     #[pin]
     key_touch: Mutex<Option<crate::key::KeyTouch>>,
     key_touch_active: Atomic<bool>,
+    /// `SEP_KEY_CANCEL`: ends the touch-gated operation that is waiting.
+    key_touch_cancel: Atomic<bool>,
     // The enclave status of the last /dev/sep-key signature (self-test).
     last_key_status: Atomic<u32>,
 
@@ -804,6 +840,12 @@ struct SepData {
     // lock; the enclave's own count is cleared at the next authentication.
     enclave_failures_owed: Atomic<bool>,
 
+    // A saved enclave lockout record waits to be handed back (LOAD_LOCKOUT).
+    // macOS loads it only after the user's first unlock, the sensor's
+    // registration and the full Catacomb restore; sent earlier, the enclave
+    // refuses it (0x8002). The first password authentication sends it.
+    lockout_import_pending: Atomic<bool>,
+
     // Opens of the Touch ID device. One open is one prompt: fprintd claims
     // the device for one PAM authentication.
     bio_open_gen: Atomic<u64>,
@@ -824,6 +866,10 @@ struct SepData {
     // from a stale one.
     bio_lock_state: Atomic<u64>,
     bio_lock_state_seq: Atomic<u32>,
+    // The last state logged for each of the most recent users, in the same
+    // layout, so a repeated notification is not logged again. Notifications
+    // are handled one at a time, on the receive path.
+    bio_lock_logged: [Atomic<u64>; LOCK_STATE_LOG_USERS],
 
     #[pin]
     store: Mutex<Option<xart_store::Store>>,
@@ -957,10 +1003,38 @@ impl SepData {
         )?;
         let dma_ring = dma::Coherent::<u8>::zeroed_slice(dev, DMA_RING_SIZE, GFP_KERNEL)?;
 
-        let xart_writes = module_parameters::xart_writes.value() != 0;
+        let keystore_only = attach::requested();
+        let keystore_user_bags = keystore_only && attach::user_bags_requested();
         let xart_start = module_parameters::xart_start_sector.value();
         let xart_guard =
             xart_guard::level(module_parameters::xart_guard.value(), profile.xart_guard);
+        let xart_writes = if keystore_only {
+            attach::initrd_xart_writes(
+                module_parameters::xart_writes.value() != 0,
+                keystore_user_bags,
+                xart_guard,
+            )
+        } else {
+            module_parameters::xart_writes.value() != 0
+        };
+        if keystore_user_bags && !xart_writes {
+            dev_info!(
+                dev,
+                "initrd: per-user key bags need xart_writes=1 and no xART guard; they wait for the real root\n"
+            );
+        }
+        // The qualified 26.6.2 lane uses only the boot-forwarded identity.
+        // Check before opening the shared xART store writable.
+        if profile::j613_26_6_2() && xart_writes {
+            if dt::preboot_uuid().is_none()
+                || module_parameters::os_uuid_hi.value() != 0
+                || module_parameters::os_uuid_lo.value() != 0
+                || xart_guard.is_none()
+            {
+                dev_err!(dev, "J613 26.6.2 requires a DT identity and xART guard\n");
+                return Err(EINVAL);
+            }
+        }
         let store = match xart_store::Store::open_owner(xart_writes, xart_start) {
             Ok(mut store) => {
                 match xart_guard {
@@ -998,16 +1072,25 @@ impl SepData {
             }
         };
 
-        let mut host_store = match store::Store::open() {
-            Ok(store) => Some(store),
-            Err(e) => {
-                dev_warn!(dev, "Linux host-state store unavailable: {:?}\n", e);
-                None
+        let mut host_store = if keystore_only {
+            None
+        } else {
+            match store::Store::open() {
+                Ok(store) => Some(store),
+                Err(e) => {
+                    if profile::j613_26_6_2() {
+                        dev_err!(dev, "J613 26.6.2 host-state store unavailable: {:?}\n", e);
+                        return Err(e);
+                    }
+                    dev_warn!(dev, "Linux host-state store unavailable: {:?}\n", e);
+                    None
+                }
             }
         };
 
         let bio_index = match host_store.as_mut().map(bio::IdentityIndex::load) {
             Some(Ok(index)) => index,
+            Some(Err(e)) if profile::j613_26_6_2() => return Err(e),
             Some(Err(_)) => bio::IdentityIndex::new(),
             None => bio::IdentityIndex::new(),
         };
@@ -1016,6 +1099,11 @@ impl SepData {
             try_pin_init!(SepData {
                 dev: ARef::<device::Device>::from(dev),
                 profile,
+                attach_phase <- new_mutex!(attach::Phase::new(keystore_only)),
+                keystore_only: Atomic::new(keystore_only),
+                keystore_user_bags,
+                keystore_write_refusals: Atomic::new(0),
+                identity_keybag <- new_mutex!(None),
                 fw_map <- new_mutex!(None),
                 mbox <- new_mutex!(None),
                 shmem <- new_mutex!(Some(buf)),
@@ -1060,6 +1148,7 @@ impl SepData {
                 ool_sbio <- new_mutex!(Some(ool_sbio)),
                 ool_sks <- new_mutex!(Some(ool_sks)),
                 sks_exchange_lock <- new_mutex!(()),
+                scrd_exchange_lock <- new_mutex!(()),
                 sks_probe <- new_mutex!(SksProbe::new()),
                 sks_wq <- new_condvar!("SepData::sks_wq"),
                 ool_scrd <- new_mutex!(Some(ool_scrd)),
@@ -1075,20 +1164,24 @@ impl SepData {
                 bio_dev <- new_mutex!(None),
                 rearm_dev <- new_mutex!(None),
                 key_dev <- new_mutex!(None),
+                key_bag_lock <- new_mutex!(()),
                 key_touch <- new_mutex!(None),
                 key_touch_active: Atomic::new(false),
+                key_touch_cancel: Atomic::new(false),
                 last_key_status: Atomic::new(0),
                 bio_lockout: Atomic::new(false),
                 bio_after_boot: Atomic::new(false),
                 bio_lockout_logged: Atomic::new(false),
                 bio_nomatch_streak: Atomic::new(0),
                 enclave_failures_owed: Atomic::new(false),
+                lockout_import_pending: Atomic::new(false),
                 bio_open_gen: Atomic::new(0),
                 match_scope_gen: Atomic::new(0),
                 match_scope_touches: Atomic::new(0),
                 match_scope_misses: Atomic::new(0),
                 bio_lock_state: Atomic::new(0),
                 bio_lock_state_seq: Atomic::new(0),
+                bio_lock_logged: [Atomic::new(0), Atomic::new(0), Atomic::new(0), Atomic::new(0)],
                 store <- new_mutex!(store),
                 host_store <- new_mutex!(host_store),
                 xarm <- new_mutex!(XarmState::new()),
@@ -1369,12 +1462,15 @@ impl SepData {
                 return Ok(None);
             }
 
+            // A reply wait sleeps uninterruptibly: with a signal pending an
+            // interruptible wait returns at once with the time left unchanged,
+            // so this loop would spin until the reply came, or forever.
             match self
                 .control_wq
-                .wait_interruptible_timeout(&mut guard, remaining)
+                .wait_timeout(&mut guard, remaining)
             {
                 CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
-                CondVarTimeoutResult::Signal { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Signal { .. } => remaining = 0,
                 CondVarTimeoutResult::Timeout => remaining = 0,
             }
         }
@@ -1408,12 +1504,15 @@ impl SepData {
             if remaining == 0 {
                 break (Err(ETIMEDOUT), control::EntropyEnd::TimedOut);
             }
+            // A reply wait sleeps uninterruptibly: with a signal pending an
+            // interruptible wait returns at once with the time left unchanged,
+            // so this loop would spin until the reply came, or forever.
             match self
                 .control_wq
-                .wait_interruptible_timeout(&mut guard, remaining)
+                .wait_timeout(&mut guard, remaining)
             {
                 CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
-                CondVarTimeoutResult::Signal { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Signal { .. } => remaining = 0,
                 CondVarTimeoutResult::Timeout => remaining = 0,
             }
         };
@@ -1546,11 +1645,14 @@ impl SepData {
         };
         this.rng_survey_attempts.store(attempt, Relaxed);
         match next {
-            control::Survey::Registered => dev_info!(
-                this.dev,
-                "hwrng: registered after ready-phase survey (attempt {})\n",
-                attempt
-            ),
+            control::Survey::Registered => {
+                diag::hwrng(true);
+                dev_info!(
+                    this.dev,
+                    "hwrng: registered after ready-phase survey (attempt {})\n",
+                    attempt
+                )
+            }
             // Asleep, or holding back after a request that went unanswered:
             // this attempt did not ask the enclave anything.
             control::Survey::Held => Self::arm_settle(this),
@@ -1558,12 +1660,15 @@ impl SepData {
                 dev_warn!(this.dev, "hwrng: survey attempt {} failed ({:?}); retrying\n", attempt, e);
                 Self::arm_settle(this);
             }
-            control::Survey::GiveUp(e) => dev_err!(
-                this.dev,
-                "hwrng: survey failed after {} attempts ({:?})\n",
-                attempt,
-                e
-            ),
+            control::Survey::GiveUp(e) => {
+                diag::hwrng(false);
+                dev_err!(
+                    this.dev,
+                    "hwrng: survey failed after {} attempts ({:?})\n",
+                    attempt,
+                    e
+                )
+            }
         }
     }
 
@@ -1677,14 +1782,20 @@ impl SepData {
         match os_identity::select(hi, lo, dt::preboot_uuid) {
             os_identity::Selection::Explicit(uuid) => {
                 self.xarm.lock().os_uuid = Some(uuid);
+                diag::identity_source(diag::IdentitySource::Override);
+                diag::os_identity(diag::OsIdentity::Explicit);
                 dev_info!(self.dev, "xART: using explicit OS identity\n");
             }
             os_identity::Selection::Chosen(uuid) => {
                 self.xarm.lock().os_uuid = Some(uuid);
+                diag::identity_source(diag::IdentitySource::DeviceTree);
+                diag::os_identity(diag::OsIdentity::Chosen);
                 dev_info!(self.dev, "xART: using /chosen/apfs-preboot-uuid\n");
             }
             os_identity::Selection::Unavailable => {
                 self.xarm.lock().os_uuid = None;
+                diag::identity_source(diag::IdentitySource::Missing);
+                diag::os_identity(diag::OsIdentity::Unavailable);
                 dev_warn!(self.dev, "xART: /chosen/apfs-preboot-uuid is unavailable\n");
             }
         }
@@ -1757,6 +1868,13 @@ impl SepData {
         if !writable
             && xarm::is_write(req.opcode)
             && done.reply.status != xarm::STATUS_OK
+            && self.keystore_only.load(Relaxed)
+        {
+            self.keystore_write_refusals.fetch_add(1, Relaxed);
+        }
+        if !writable
+            && xarm::is_write(req.opcode)
+            && done.reply.status != xarm::STATUS_OK
             && !self.xart_refusal_logged.xchg(true, Relaxed)
         {
             dev_warn!(
@@ -1778,7 +1896,10 @@ impl SepData {
         }
 
         if done.reply_bytes > 0 {
-            if self.ool_write(&self.ool_xarm, 0, &staging[..done.reply_bytes]).is_err() {
+            if self
+                .ool_write(&self.ool_xarm, 0, &staging[..done.reply_bytes])
+                .is_err()
+            {
                 self.fail_xarm(req.tag);
                 return;
             }
@@ -1885,6 +2006,15 @@ impl SepData {
     }
 
     fn send_xarm_reply(&self, reply: &crate::xarm::XarmReply) {
+        // Each of these used to fail the enclave's request without a trace.
+        // Count them all and log the first, so a refusal is never silent.
+        if reply.status == xarm::STATUS_FAILED && diag::xarm_failed() == 1 {
+            dev_warn!(
+                self.dev,
+                "xART: answered a request (tag {:#04x}) with the failure status; diag/xarm_failures counts them\n",
+                reply.tag
+            );
+        }
         let msg = crate::xarm::encode_xarm_reply(reply);
         let _ = self.send(msg);
     }
@@ -1935,12 +2065,15 @@ impl SepData {
                 || guard.captured.len() >= until || remaining == 0 {
                 return;
             }
+            // A reply wait sleeps uninterruptibly: with a signal pending an
+            // interruptible wait returns at once with the time left unchanged,
+            // so this loop would spin until the reply came, or forever.
             match self
                 .scrd_wq
-                .wait_interruptible_timeout(&mut guard, remaining)
+                .wait_timeout(&mut guard, remaining)
             {
                 CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
-                CondVarTimeoutResult::Signal { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Signal { .. } => remaining = 0,
                 CondVarTimeoutResult::Timeout => remaining = 0,
             }
         }
@@ -1967,6 +2100,7 @@ impl SepData {
         payload: &[u8],
         timeout_ms: time::Msecs,
     ) -> Option<(crate::scrd::ScrdReply, KVec<u8>)> {
+        let _exchange = self.scrd_exchange_lock.lock();
         if !self.ool_registered(&self.ool_scrd) {
             return None;
         }
@@ -2511,8 +2645,14 @@ impl SepData {
             }
         }
 
-        this.run_bringup();
-        diag::bringup_ended();
+        if this.keystore_only.load(Relaxed) {
+            this.run_keystore_bringup();
+            diag::keystore_ended();
+        } else {
+            this.run_bringup();
+            diag::bringup_ended();
+        }
+        diag::log_summary(&this.dev);
         this.finish_bringup();
         Self::arm_settle(this);
     }
@@ -2523,6 +2663,72 @@ impl SepData {
         let _guard = self.endpoints.lock();
         self.phase.store(PHASE_READY, Relaxed);
         self.trusted_ready.notify_all();
+    }
+
+    /// Completes the original attach without sending a second registration.
+    fn complete_attach(&self) -> Result<()> {
+        self.attach_phase.lock().complete(|| self.finish_attach())
+    }
+
+    fn finish_attach(&self) -> Result<()> {
+        self.wait_for_trusted_ready()?;
+        if module_parameters::provision_keybag.value() != 0
+            && module_parameters::xart_writes.value() == 0
+        {
+            return Err(EINVAL);
+        }
+
+        // Wait out a cached-keybag consumer before enabling persistent writes.
+        // All opens below resolve against PID 1's current (real) root.
+        let mut cached = self.identity_keybag.lock();
+        let mut host = store::Store::open()?;
+        let index = bio::IdentityIndex::load(&mut host)?;
+        let mut store = self.store.lock();
+        // Drop the read-only block handle before reopening the owner writable.
+        // Failure leaves a usable read-only store when it can be reopened.
+        *store = None;
+        let reopened = (|| {
+            let mut new = xart_store::Store::open_owner(
+                module_parameters::xart_writes.value() != 0,
+                module_parameters::xart_start_sector.value(),
+            )?;
+            if new.writes_enabled() {
+                if let Some(level) = xart_guard::level(
+                    module_parameters::xart_guard.value(),
+                    self.profile.xart_guard,
+                ) {
+                    new.set_guard(level)?;
+                }
+            }
+            Ok(new)
+        })();
+        let new = match reopened {
+            Ok(new) => new,
+            Err(e) => {
+                *store = xart_store::Store::open_owner(
+                    false,
+                    module_parameters::xart_start_sector.value(),
+                )
+                .ok();
+                return Err(e);
+            }
+        };
+        let writable = new.writes_enabled();
+        let guard = new.guard_state();
+        *store = Some(new);
+        drop(store);
+        *self.host_store.lock() = Some(host);
+        *self.bio_index.lock() = index;
+        diag::xart_state(writable, guard);
+        self.keystore_only.store(false, Relaxed);
+        *cached = None;
+        drop(cached);
+
+        // The default path's ordering stays in run_bringup. SKS has already
+        // been initialised, so completion resumes immediately after that step.
+        self.finish_keystore_bringup();
+        diag::bringup_ended();
+        Ok(())
     }
 
     /// Trusted-key callbacks can run as soon as probe publishes the source,
@@ -2585,7 +2791,13 @@ impl SepData {
 
             proto::EP_BOOT => self.on_boot(msg),
 
-            ep => dev_info!(self.dev, "rx: unhandled endpoint {:#04x} (msg0 {:#018x})\n", ep, msg.msg0),
+            ep => {
+                // Counted in diag/unhandled_messages; logged the first few
+                // times only, so a chatty endpoint cannot flood the log.
+                if diag::unhandled() <= UNHANDLED_LOG_LIMIT {
+                    dev_info!(self.dev, "rx: unhandled endpoint {:#04x} (msg0 {:#018x})\n", ep, msg.msg0);
+                }
+            }
         }
     }
 
@@ -2621,7 +2833,13 @@ impl SepData {
             proto::DISCOVER_TYPE_DESCRIPTOR | proto::DISCOVER_TYPE_CONFIG => {
                 let _ = table.slot(f.param);
                 diag::endpoints(table.eps.len());
-                dev_info!(
+                if f.ty == proto::DISCOVER_TYPE_DESCRIPTOR {
+                    diag::endpoint(f.param, (msg.msg0 >> 32) as u32);
+                }
+                // One summary line follows at the end of the bring-up, and
+                // diag/endpoint_names lists them; keep the per-message trace
+                // at debug level.
+                dev_dbg!(
                     self.dev,
                     "discover: endpoint {:#04x} (type {}, msg0 {:#018x}); {} known\n",
                     f.param,
@@ -2630,7 +2848,7 @@ impl SepData {
                     table.eps.len()
                 );
             }
-            ty => dev_info!(self.dev, "discover: other type {} (msg0 {:#018x})\n", ty, msg.msg0),
+            ty => dev_dbg!(self.dev, "discover: other type {} (msg0 {:#018x})\n", ty, msg.msg0),
         }
     }
 
@@ -2922,7 +3140,7 @@ impl WorkItem<VERIFY_WORK_ID> for SepData {
 }
 
 
-struct SepDriver(Arc<SepData>);
+struct SepDriver(Arc<SepData>, attach::Attribute);
 
 // Deliberately not exported as a module alias: udev must not load the driver
 // on its own. The loader service loads it once the iBoot system container's
@@ -2942,7 +3160,8 @@ impl platform::Driver for SepDriver {
         _info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let dev: &device::Device<device::Core<'_>> = pdev.as_ref();
-        if module_parameters::provision_keybag.value() != 0
+        if !attach::requested()
+            && module_parameters::provision_keybag.value() != 0
             && module_parameters::xart_writes.value() == 0
         {
             dev_err!(dev, "provision_keybag=1 requires xart_writes=1\n");
@@ -2975,7 +3194,16 @@ impl platform::Driver for SepDriver {
         // As soon as the fixed facts are known, so a tool can watch the attach
         // from "pending" on. Diagnostics are not worth failing the probe for.
         let guard = data.with_store(|store| store.guard_state()).flatten();
-        if let Err(e) = diag::register(dev, data.profile, data.xart_writable(), guard) {
+        let policy = diag::Policy {
+            provision_keybag: module_parameters::provision_keybag.value() != 0,
+            trusted_keys: module_parameters::trusted_keys.value() != 0,
+            filevault_api: module_parameters::filevault_api.value() != 0,
+            xarm_trace: module_parameters::xarm_trace.value() != 0,
+            refkey_v2: module_parameters::refkey_v2.value() != 0,
+            identity_override: module_parameters::os_uuid_hi.value() != 0
+                || module_parameters::os_uuid_lo.value() != 0,
+        };
+        if let Err(e) = diag::register(dev, data.profile, data.xart_writable(), guard, policy) {
             dev_warn!(dev, "diag: could not add the sysfs attributes ({:?})\n", e);
         }
 
@@ -2983,28 +3211,44 @@ impl platform::Driver for SepDriver {
 
         data.attach(&sep_node)?;
 
-        if let Err(e) = data.register_fv_kernel() {
-            dev_err!(dev, "could not register the FileVault kernel API: {:?}\n", e);
+        if module_parameters::filevault_api.value() != 0 {
+            if let Err(e) = data.register_fv_kernel() {
+                dev_err!(dev, "could not register the FileVault kernel API: {:?}\n", e);
+            }
         }
 
-        if let Err(e) = trusted::register(data.clone()) {
-            dev_warn!(data.dev, "trusted-keys: registration failed ({:?})\n", e);
+        if module_parameters::trusted_keys.value() != 0 {
+            if let Err(e) = trusted::register(data.clone()) {
+                dev_warn!(data.dev, "trusted-keys: registration failed ({:?})\n", e);
+            }
         }
 
         if let Err(e) = pm::register(data.clone()) {
-            dev_warn!(data.dev, "sleep notifier registration failed ({:?}); a capture may run into a suspend\n", e);
+            dev_warn!(
+                data.dev,
+                "sleep notifier registration failed ({:?}); a capture may run into a suspend\n",
+                e
+            );
         }
 
         if data.registered.load(Relaxed) {
             SepData::arm_settle(&data);
         }
 
-        Ok(SepDriver(data))
+        let attribute = match attach::Attribute::register(data.clone()) {
+            Ok(attribute) => attribute,
+            Err(e) => {
+                data.remove();
+                return Err(e);
+            }
+        };
+        Ok(SepDriver(data, attribute))
     }
 }
 
 impl Drop for SepDriver {
     fn drop(&mut self) {
+        self.1.unregister();
         self.0.remove();
     }
 }
@@ -3055,6 +3299,14 @@ module! {
     description: "Apple SEP coprocessor: warm attach, endpoint discovery and tag-correlated control endpoint",
     license: "Dual MIT/GPL",
     params: {
+        trusted_keys: u8 {
+            default: 1,
+            description: "Register the SEP trusted-key source; 0 leaves it disabled",
+        },
+        filevault_api: u8 {
+            default: 1,
+            description: "Register the SEP FileVault kernel API; 0 leaves it disabled",
+        },
         xart_writes: u8 {
             default: 1,
             description: "Allow shared xART writes only if APFS proves a single unsnapshotted .gl extent; set to 0 for read-only operation",

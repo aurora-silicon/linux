@@ -14,6 +14,28 @@ use kernel::sync::atomic::Relaxed;
 pub(crate) const REFKEY_ENVELOPE_VERSION: u32 = 2;
 
 impl SepData {
+    /// Keep only decoded bytes across switch-root, never an open initrd file.
+    fn with_identity_keybag<T>(
+        &self,
+        f: impl FnOnce(&keybag::StoredKeyBag) -> Result<T>,
+    ) -> Result<T> {
+        let mut cache = self.identity_keybag.lock();
+        if self.keystore_only.load(Relaxed) {
+            if cache.is_none() {
+                let keybag::State::Present(stored) = keybag::read(keybag::Slot::Identity)? else {
+                    return Err(ENODEV);
+                };
+                *cache = Some(stored);
+            }
+            return f(cache.as_ref().ok_or(ENODEV)?);
+        }
+        drop(cache);
+        let keybag::State::Present(stored) = keybag::read(keybag::Slot::Identity)? else {
+            return Err(ENODEV);
+        };
+        f(&stored)
+    }
+
     fn sks_req_refkey(&self, keybag: i32, der_set: &[u8]) -> Result<SksRequest> {
         let (keybag, envelope) = match self.profile.key_store {
             // The 13.5 operation envelope is 3. Use the designated identity
@@ -89,8 +111,6 @@ impl SepData {
         secret: &[u8],
         acl: Option<&[u8]>,
     ) -> Option<KVec<u8>> {
-        use crate::der::RefKeyValue as RV;
-
         let (protection_class, key_type) = match self.profile.key_store {
             // J313 accepted this non-class-F class and 13.5 EC key type for
             // creation, same-boot unseal, and post-reboot unseal. The exact
@@ -115,6 +135,21 @@ impl SepData {
             return None;
         }
 
+        self.sks_create_refkey_at(handle.value(), protection_class, key_type, acl)
+    }
+
+    /// The ref-key create itself, with `handle` as the outer key-bag handle:
+    /// a loaded bag, or a designated user's special handle `-uid` (the bag a
+    /// macOS Secure Enclave key lives under). The bag must already be
+    /// unlocked.
+    fn sks_create_refkey_at(
+        &self,
+        handle: i32,
+        protection_class: u32,
+        key_type: u32,
+        acl: Option<&[u8]>,
+    ) -> Option<KVec<u8>> {
+        use crate::der::RefKeyValue as RV;
         let create_der = {
             let mut items: KVec<(&[u8], RV<'_>)> = KVec::new();
             if items.push((b"o", RV::Utf8(b"oc")), GFP_KERNEL).is_err()
@@ -134,7 +169,7 @@ impl SepData {
             }
             crate::der::encode_refkey_set(&items).ok()?
         };
-        let cout = match self.sks_send(self.sks_req_refkey(handle.value(), &create_der)) {
+        let cout = match self.sks_send(self.sks_req_refkey(handle, &create_der)) {
             Some(out) => out,
             None => {
                 dev_warn!(self.dev, "sks: ref-key create got no usable reply\n");
@@ -185,7 +220,19 @@ impl SepData {
             return;
         }
 
-        if let Ok(f) = shim::StoreFile::open_readonly(path) {
+        let existing = match shim::StoreFile::open_readonly(path) {
+            Ok(file) => Some(file),
+            Err(ENOENT) => None,
+            Err(error) => {
+                dev_err!(
+                    self.dev,
+                    "sks: cannot read existing machine ref-key: {:?}; refusing replacement\n",
+                    error
+                );
+                return;
+            }
+        };
+        if let Some(f) = existing {
             let sz = f.size().unwrap_or(0);
             if (1..=8192).contains(&sz) {
                 let mut blob: KVec<u8> = KVec::new();
@@ -203,6 +250,10 @@ impl SepData {
             return;
         }
 
+        if self.keystore_only.load(Relaxed) {
+            // A missing initrd copy is never permission to replace an identity.
+            return;
+        }
         let Some(blob) = self.sks_create_refkey(handle, secret, None) else {
             dev_warn!(
                 self.dev,
@@ -240,12 +291,17 @@ impl SepData {
         if !self.sks_ready() {
             return Err(ENODEV);
         }
-        let keybag::State::Present(stored) = keybag::read(keybag::Slot::Identity)? else {
-            return Err(ENODEV);
-        };
-        let (handle, _uuid) = self.sks_recover(&stored).ok_or(EIO)?;
-        self.sks_machine_refkey(handle, stored.secret());
-        let _ = self.sks_send(self.sks_req_unload_keybag(handle));
+        // The identity bag is loaded, used and unloaded under
+        // `key_bag_lock`, as `with_identity_bag` does: /dev/sep-key calls run
+        // concurrently, and an unload here must not end the handle one of
+        // them is using.
+        let _bag = self.key_bag_lock.lock();
+        self.with_identity_keybag(|stored| {
+            let (handle, _uuid) = self.sks_recover(stored).ok_or(EIO)?;
+            self.sks_machine_refkey(handle, stored.secret());
+            let _ = self.sks_send(self.sks_req_unload_keybag(handle));
+            Ok(())
+        })?;
         if self.machine_refkey.lock().is_some() {
             Ok(())
         } else {
@@ -275,6 +331,16 @@ impl SepData {
     }
 
     pub(crate) fn refkey_unseal_trusted(&self, sealed: &[u8]) -> Result<KVec<u8>> {
+        let refusals = self.keystore_write_refusals.load(Relaxed);
+        let recovered = self.refkey_unseal_cached(sealed)?;
+        if !crate::attach::unseal_allowed(refusals, self.keystore_write_refusals.load(Relaxed)) {
+            drop(crate::Secret(recovered));
+            return Err(EIO); // trusted.rs maps every unseal rejection to EBADMSG.
+        }
+        Ok(recovered)
+    }
+
+    fn refkey_unseal_cached(&self, sealed: &[u8]) -> Result<KVec<u8>> {
         self.wait_for_trusted_ready()?;
         self.ensure_machine_refkey()?;
         let blob = {
@@ -284,34 +350,41 @@ impl SepData {
             b.extend_from_slice(&mk.blob, GFP_KERNEL)?;
             b
         };
-        let keybag::State::Present(stored) = keybag::read(keybag::Slot::Identity)? else {
-            return Err(ENODEV);
-        };
-        let (handle, _uuid) = self.sks_recover(&stored).ok_or(EIO)?;
-        // The first unlock under a changed boot policy rewrites one session
-        // record; see crate::xart_guard.
-        let unlocked = crate::xart_guard::policy_window(|| {
-            if self.profile.key_store == profile::KeyStore::Variant5 {
-                if let Some(healthy) = self.sks_health_check(c"trusted-key unseal") {
-                    let _ = self.sks_send(self.sks_req_change_lock_state(
-                        handle,
-                        LockState::Unlocked,
-                        stored.secret(),
-                        healthy,
-                    ));
+        // See `ensure_machine_refkey`.
+        let _bag = self.key_bag_lock.lock();
+        self.with_identity_keybag(|stored| {
+            let (handle, _uuid) = self.sks_recover(stored).ok_or(EIO)?;
+            // The first unlock under a changed boot policy rewrites one session
+            // record; see crate::xart_guard.
+            let unlock = || {
+                if self.profile.key_store == profile::KeyStore::Variant5 {
+                    if let Some(healthy) = self.sks_health_check(c"trusted-key unseal") {
+                        let _ = self.sks_send(self.sks_req_change_lock_state(
+                            handle,
+                            LockState::Unlocked,
+                            stored.secret(),
+                            healthy,
+                        ));
+                    }
+                    true
+                } else {
+                    self.sks_prepare_identity_refkey(handle, stored.secret())
                 }
-                true
+            };
+            // Do not consume the real root's one policy window in the initrd.
+            let unlocked = if self.keystore_only.load(Relaxed) {
+                unlock()
             } else {
-                self.sks_prepare_identity_refkey(handle, stored.secret())
+                crate::xart_guard::policy_window(unlock)
+            };
+            if !unlocked {
+                let _ = self.sks_send(self.sks_req_unload_keybag(handle));
+                return Err(EIO);
             }
-        });
-        if !unlocked {
+            let recovered = self.sks_refkey_unseal(handle, &blob, sealed);
             let _ = self.sks_send(self.sks_req_unload_keybag(handle));
-            return Err(EIO);
-        }
-        let recovered = self.sks_refkey_unseal(handle, &blob, sealed);
-        let _ = self.sks_send(self.sks_req_unload_keybag(handle));
-        recovered.ok_or(EIO)
+            recovered.ok_or(EIO)
+        })
     }
 
     /// Op `osgn`: ECDSA-P256 over `challenge` as the pre-computed digest.
@@ -378,6 +451,8 @@ impl SepData {
             p.extend_from_slice(&mk.pub_raw, GFP_KERNEL)?;
             (b, p)
         };
+        // See `ensure_machine_refkey`.
+        let _bag = self.key_bag_lock.lock();
         let keybag::State::Present(stored) = keybag::read(keybag::Slot::Identity)? else {
             return Err(ENODEV);
         };
@@ -404,6 +479,7 @@ impl SepData {
         op: impl FnOnce(crate::sks::KeyBagHandle, &[u8]) -> Result<T>,
     ) -> Result<T> {
         self.wait_for_trusted_ready()?;
+        let _bag = self.key_bag_lock.lock();
         let keybag::State::Present(stored) = keybag::read(keybag::Slot::Identity)? else {
             return Err(ENODEV);
         };
@@ -448,6 +524,49 @@ impl SepData {
         Ok((blob, point))
     }
 
+    /// Test only (`key_selftest`): a ref-key under the designated user bag
+    /// `user` (outer handle `-uid`), which the caller has unlocked. Variant-5
+    /// key store only.
+    pub(crate) fn user_key_create_in_bag(
+        &self,
+        user: crate::sks::DesignateUser,
+        acl: Option<&[u8]>,
+    ) -> Result<KVec<u8>> {
+        if self.profile.key_store != profile::KeyStore::Variant5 {
+            return Err(EOPNOTSUPP);
+        }
+        crate::xart_guard::close_policy_window();
+        self.sks_create_refkey_at(user.special_handle().value(), 9, 5, acl).ok_or(EIO)
+    }
+
+    /// Unseal (enclave `ock` + kernel decrypt, as `user_key_unseal`) with a
+    /// ref-key under the designated user bag `user`.
+    pub(crate) fn user_key_unseal_in_bag(
+        &self,
+        user: crate::sks::DesignateUser,
+        blob: &[u8],
+        sealed: &[u8],
+        acm: Option<&[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>,
+    ) -> Result<KVec<u8>> {
+        Self::refkey_pub(blob).ok_or(EINVAL)?;
+        let eph = refkey_seal::sealed_ephemeral(sealed)?;
+        let handle = crate::sks::KeyBagHandle::from_load_reply(user.special_handle().value());
+        let shared = crate::Secret(self.sks_refkey_key_exchange(handle, blob, eph, acm)?);
+        refkey_seal::ecies_open_with_shared(&shared, sealed)
+    }
+
+    /// Sign with a ref-key under the designated user bag `user`.
+    pub(crate) fn user_key_sign_in_bag(
+        &self,
+        user: crate::sks::DesignateUser,
+        blob: &[u8],
+        digest: &[u8; 32],
+        acm: Option<&[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>,
+    ) -> Result<KVec<u8>> {
+        let handle = crate::sks::KeyBagHandle::from_load_reply(user.special_handle().value());
+        self.sks_refkey_sign(handle, blob, digest, acm)
+    }
+
     /// The public point recorded in a ref-key record; no enclave round trip.
     pub(crate) fn user_key_public(blob: &[u8]) -> Result<[u8; refkey_seal::POINT_LEN]> {
         let mut point = [0u8; refkey_seal::POINT_LEN];
@@ -469,6 +588,182 @@ impl SepData {
         // A record without a public point is not a ref-key record at all.
         Self::refkey_pub(blob).ok_or(EINVAL)?;
         self.with_identity_bag(|handle, _secret| self.sks_refkey_sign(handle, blob, digest, acm))
+    }
+
+    /// Volume-key sealing: a ref-key without an access-control list under
+    /// the designated user bag `user` (outer handle `-uid`), protection
+    /// class 9, so the enclave uses it only while that bag is unlocked. The
+    /// caller has unlocked the bag with the user's password. Variant-5 key
+    /// store only.
+    pub(crate) fn fde_key_create(&self, user: crate::sks::DesignateUser) -> Result<KVec<u8>> {
+        if self.profile.key_store != profile::KeyStore::Variant5 {
+            return Err(EOPNOTSUPP);
+        }
+        crate::xart_guard::close_policy_window();
+        let blob = self
+            .sks_create_refkey_at(user.special_handle().value(), 9, 5, None)
+            .ok_or(EACCES)?;
+        Self::refkey_pub(&blob).ok_or(EIO)?;
+        Ok(blob)
+    }
+
+    /// The OS install this kernel runs as (the explicit `os_uuid_hi/lo`
+    /// identity, else `/chosen/apfs-preboot-uuid`), which FDE secrets are
+    /// bound to, as FileVault binds a volume key to its volume.
+    fn fde_os_identity(&self) -> Result<[u8; 16]> {
+        self.xarm.lock().os_uuid.ok_or(ENOKEY)
+    }
+
+    /// ECIES-encrypts `secret`, framed with this OS install's identity, to the
+    /// sealing key in `record` and has the enclave open the result once before
+    /// returning it, so a sealed blob this bag cannot open is never handed
+    /// out. `ENOKEY` when this kernel has no OS identity.
+    pub(crate) fn fde_seal(
+        &self,
+        user: crate::sks::DesignateUser,
+        record: &[u8],
+        secret: &[u8],
+    ) -> Result<KVec<u8>> {
+        let os = self.fde_os_identity()?;
+        let framed = crate::Secret(crate::userbag::fde_bind(&os, secret)?);
+        let sealed = refkey_seal::ecies_seal(Self::refkey_pub(record).ok_or(EINVAL)?, &framed)?;
+        let recovered = crate::Secret(self.fde_unseal(user, record, &sealed)?);
+        if &*recovered != secret {
+            dev_err!(self.dev, "fde: refusing a sealed volume secret whose round trip failed\n");
+            return Err(EIO);
+        }
+        Ok(sealed)
+    }
+
+    /// Has the enclave open `sealed` with the sealing key in `record`. It
+    /// does so only on the Mac whose enclave made the key and only while
+    /// `user`'s bag is unlocked; any refusal is `EKEYREJECTED`. The secret is
+    /// returned only to the OS install it was sealed under: `EXDEV` for
+    /// another install, `ENOKEY` when this kernel has no OS identity.
+    pub(crate) fn fde_unseal(
+        &self,
+        user: crate::sks::DesignateUser,
+        record: &[u8],
+        sealed: &[u8],
+    ) -> Result<KVec<u8>> {
+        if self.profile.key_store != profile::KeyStore::Variant5 {
+            return Err(EOPNOTSUPP);
+        }
+        Self::refkey_pub(record).ok_or(EINVAL)?;
+        let os = self.fde_os_identity()?;
+        let handle = crate::sks::KeyBagHandle::from_load_reply(user.special_handle().value());
+        let framed =
+            crate::Secret(self.sks_refkey_unseal(handle, record, sealed).ok_or(EKEYREJECTED)?);
+        let secret = crate::userbag::fde_unbind(&os, &framed)?;
+        let mut out = KVec::with_capacity(secret.len(), GFP_KERNEL)?;
+        out.extend_from_slice(secret, GFP_KERNEL)?;
+        Ok(out)
+    }
+
+    /// `/dev/sep-key` unseal of `sealed` (from `refkey_seal::ecies_seal` to
+    /// this key's public point), checked against the credential context `acm`
+    /// when one is given, as `user_key_sign` is. The enclave refuses its own
+    /// decrypt (`oecd`) for every key with an access-control list, so, as on
+    /// macOS, it does only the key exchange (`ock`, which a biometric list
+    /// constrains like the signature) and the AES-GCM decrypt runs here.
+    /// `EKEYREJECTED` when the enclave refuses (a record from elsewhere, or a
+    /// list `acm` does not satisfy), `EBADMSG` for a blob sealed to another
+    /// key or modified.
+    pub(crate) fn user_key_unseal(
+        &self,
+        blob: &[u8],
+        sealed: &[u8],
+        acm: Option<&[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>,
+    ) -> Result<KVec<u8>> {
+        Self::refkey_pub(blob).ok_or(EINVAL)?;
+        let eph = refkey_seal::sealed_ephemeral(sealed)?;
+        let shared = crate::Secret(self.with_identity_bag(|handle, _secret| self.sks_refkey_key_exchange(handle, blob, eph, acm))?);
+        refkey_seal::ecies_open_with_shared(&shared, sealed)
+    }
+
+    /// Self-test only: one ref-key operation `op` with data `d` (under the
+    /// key `field`) on the key in `blob`, with an optional credential
+    /// context. Returns the enclave's status and, when it is 0, the record the
+    /// reply carries.
+    pub(crate) fn user_key_raw_op(
+        &self,
+        blob: &[u8],
+        op: &[u8],
+        field: &[u8],
+        d: &[u8],
+        acm: Option<&[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>,
+    ) -> Result<(i32, KVec<u8>)> {
+        use crate::der::RefKeyValue as RV;
+        Self::refkey_pub(blob).ok_or(EINVAL)?;
+        self.with_identity_bag(|handle, _secret| {
+            let mut items: KVec<(&[u8], RV<'_>)> = KVec::new();
+            if let Some(acm) = acm {
+                items.push((b"acmh", RV::Octets(acm)), GFP_KERNEL)?;
+            }
+            items.push((field, RV::Octets(d)), GFP_KERNEL)?;
+            items.push((b"o", RV::Utf8(op)), GFP_KERNEL)?;
+            items.push((b"rk", RV::Der(blob)), GFP_KERNEL)?;
+            let der = crate::der::encode_refkey_set(&items)?;
+            let out = self.sks_send(self.sks_req_refkey(handle.value(), &der)).ok_or(EIO)?;
+            let status = i32::from(out.reply.status);
+            let mut owned: KVec<u8> = KVec::new();
+            if status == 0 {
+                if let Some(body) = self.sks_report_response(crate::sks::SKS_PERFORM_OP_NAME, &out) {
+                    let mut f = proto::FieldCursor::new(body);
+                    if let (Some(0), Some(rec)) = (f.i32(), f.blob()) {
+                        owned.extend_from_slice(rec, GFP_KERNEL)?;
+                    }
+                }
+            }
+            Ok((status, owned))
+        })
+    }
+
+    /// Op `ock` (`pub` = the peer point) with an optional credential context
+    /// (`acmh`): the ECDH shared X of the peer and the key. The enclave's
+    /// status is kept in `last_key_status` like a signature's.
+    fn sks_refkey_key_exchange(
+        &self,
+        handle: crate::sks::KeyBagHandle,
+        refkey_blob: &[u8],
+        peer: &[u8],
+        acm: Option<&[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>,
+    ) -> Result<KVec<u8>> {
+        use crate::der::RefKeyValue as RV;
+        let mut items: KVec<(&[u8], RV<'_>)> = KVec::new();
+        items.push((b"o", RV::Utf8(b"ock")), GFP_KERNEL)?;
+        items.push((b"pub", RV::Octets(peer)), GFP_KERNEL)?;
+        items.push((b"rk", RV::Der(refkey_blob)), GFP_KERNEL)?;
+        if let Some(acm) = acm {
+            items.push((b"acmh", RV::Octets(acm)), GFP_KERNEL)?;
+        }
+        let der = crate::der::encode_refkey_set(&items)?;
+        let Some(out) = self.sks_send(self.sks_req_refkey(handle.value(), &der)) else {
+            self.last_key_status.store(i32::MIN as u32, Relaxed);
+            return Err(EIO);
+        };
+        self.last_key_status.store(i32::from(out.reply.status) as u32, Relaxed);
+        if out.reply.status != 0 {
+            dev_warn!(
+                self.dev,
+                "sks: ref-key key exchange refused by the enclave (status {}{})\n",
+                out.reply.status,
+                (if acm.is_some() { ", with a credential context" } else { "" })
+            );
+            return Err(EKEYREJECTED);
+        }
+        let body = self
+            .sks_report_response(crate::sks::SKS_PERFORM_OP_NAME, &out)
+            .ok_or(EIO)?;
+        let mut f = proto::FieldCursor::new(body);
+        let (Some(0), Some(rec)) = (f.i32(), f.blob()) else {
+            return Err(EIO);
+        };
+        // The record is the shared X as a DER OCTET STRING.
+        let x = crate::der::octet_string_body(rec).filter(|x| x.len() == 32).ok_or(EIO)?;
+        let mut owned: KVec<u8> = KVec::new();
+        owned.extend_from_slice(x, GFP_KERNEL)?;
+        Ok(owned)
     }
 
     /// Enclave ECIES-decrypt (o = "oecd"); takes the ephemeral from the front of `d`.

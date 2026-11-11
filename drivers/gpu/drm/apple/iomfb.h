@@ -397,6 +397,11 @@ struct iomfb_set_matrix_req {
 	u8 padding[3];
 } __packed;
 
+/* "PMUS"/"Temperature" reply in 0.1 K: the battery temperature, as macOS. */
+#define DCP_PMU_TEMPERATURE_FALLBACK 3029
+struct device;
+u64 dcp_pmu_temperature(struct device *dev);
+
 struct drm_color_ctm;
 void dcp_ctm_to_fw(u64 fw[9], const struct drm_color_ctm *ctm);
 

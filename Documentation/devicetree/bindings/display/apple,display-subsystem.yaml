@@ -23,7 +23,9 @@ properties:
       - const: apple,t8132-display-diagnostics
         deprecated: true
       - items:
-          - const: apple,t8140-display-subsystem
+          - enum:
+              - apple,t8140-display-subsystem
+              - apple,t8142-display-subsystem
           - const: apple,display-subsystem
       - items:
           - const: apple,t8132-display-subsystem

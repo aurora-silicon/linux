@@ -17,11 +17,8 @@ impl Firmware {
         if self.recovery.pending() {
             return Ok(());
         }
-        let state = recovery::Memory::recovery_state(&self.init)?;
-        if state != 0 {
-            return Ok(());
-        }
-        self.queues.replay_consumer_wait = None;
+        // Runs on every event pass and inline publication: with nothing retained for replay,
+        // return before reading the recovery state from shared memory.
         let commands = self
             .queues
             .compute
@@ -31,9 +28,15 @@ impl Firmware {
             .map(|queue| queue.replay_commands())
             .sum::<usize>();
         if commands == 0 {
+            self.queues.replay_consumer_wait = None;
             self.queues.replay_outer_wait = None;
             return Ok(());
         }
+        let state = recovery::Memory::recovery_state(&self.init)?;
+        if state != 0 {
+            return Ok(());
+        }
+        self.queues.replay_consumer_wait = None;
         deferred.reserve_replays(commands)?;
         let port = &self.port;
         for entry in self.queues.compute.iter_mut().flatten() {
@@ -146,6 +149,11 @@ impl Firmware {
                     }
                     queue.fail_replays(error);
                     if !queue.owns_packet(&packet) {
+                        // Replays are spared work a recovery dropped before it ran: it fails
+                        // without poisoning its VM, as a dropped render group does.
+                        if !packet.completion.guilty() {
+                            packet.completion.classify(recovery::Class::Spared);
+                        }
                         deferred
                             .push(Deferred::Retired(packet.completion.clone(), Err(ENODATA)))?;
                     }

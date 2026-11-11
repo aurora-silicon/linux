@@ -106,6 +106,7 @@ pub(crate) const CONFIG: Config = Config {
             },
         ],
         variant: &fw::variant::V25G83,
+        config: None,
     }]),
     // Measured on the 20-core M4 Pro; the alternative below remains experimental.
     core_layout: CoreLayout {

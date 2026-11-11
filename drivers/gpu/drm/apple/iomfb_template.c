@@ -13,6 +13,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/iommu.h>
 #include <linux/kref.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/of_device.h>
 #include <linux/overflow.h>
@@ -662,6 +663,12 @@ static void dcp_report_swap_complete(struct apple_dcp *dcp, u32 id, ktime_t now)
 	if (!dcp_desktop_present_complete(dcp, id))
 		return;
 	dcp_backlight_desktop_finish(dcp, id, false, true);
+#else
+	/* Nor can a lost flip's on firmware that does not track its presents. */
+	if ((!DCP_FW_H17(DCP_FW_VER) ||
+	     dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G) &&
+	    dcp_swap_lost(dcp, id))
+		return;
 #endif
 	dcp->last_swap_id = id;
 	dcp->have_swap_complete = true;
@@ -966,11 +973,7 @@ dcpep_cb_get_uint_prop(struct apple_dcp *dcp, struct dcp_get_uint_prop_req *req)
 	if (dcp->panel.has_mini_led &&
 	    memcmp(req->obj, "SUMP", sizeof(req->obj)) == 0) { /* "PMUS */
 	    if (strncmp(req->key, "Temperature", sizeof(req->key)) == 0) {
-		/*
-		 * TODO: value from j314c, find out if it is temperature in
-		 *       centigrade C and which temperature sensor reports it
-		 */
-		resp.value = 3029;
+		resp.value = dcp_pmu_temperature(dcp->dev);
 		resp.ret = true;
 	    }
 	}
@@ -2252,6 +2255,7 @@ static void dcp_swap_clear_started(struct apple_dcp *dcp, void *data,
 		dcp_prepare_clear_swap(dcp, &DCP_FW_SWAP(dcp));
 #endif
 	DCP_FW_SWAP(dcp).swap.swap_id = resp->swap_id;
+	WRITE_ONCE(dcp->started_swap_id, resp->swap_id);
 	if (dcp_present_retires(dcp))
 		dcp_arm_retained_framebuffers(dcp, resp->swap_id);
 
@@ -2530,6 +2534,21 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	struct dcp_wait_cookie *poff_cookie;
 	typeof(DCP_FW_SWAP(dcp)) *swap = &DCP_FW_SWAP(dcp);
 
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+	/*
+	 * Firmware 27 has its own paired stop sequence. Its hardware profile
+	 * does not use H17G's single-pipe methods, so stop an active pair
+	 * before applying the guard for the single-pipe path below.
+	 */
+	ret = dcp_peer_stop_v27(dcp);
+	if (ret < 0) {
+		dev_err(dcp->dev, "paired power-off failed: %d\n", ret);
+		return;
+	}
+	if (ret > 0)
+		goto close_client;
+#endif
+
 #if DCP_FW_H17(DCP_FW_VER)
 	/* H17P has no known safe pipe-off or surface-free transition. */
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
@@ -2544,17 +2563,6 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	if (ret > 0)
 		goto peer_stopped;
 #endif
-
-#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
-	ret = dcp_peer_stop_v27(dcp);
-	if (ret < 0) {
-		dev_err(dcp->dev, "paired power-off failed: %d\n", ret);
-		return;
-	}
-	if (ret > 0)
-		goto close_client;
-#endif
-
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie)
 		return;
@@ -3086,6 +3094,43 @@ TRAMPOLINE_INOUT(trampoline_set_tiling_state_v26_6, dcpep_cb_set_tiling_state_v2
 TRAMPOLINE_OUT(trampoline_create_backlight_service, dcpep_cb_create_backlight_service, u8);
 
 /*
+ * Swap timestamps are in the firmware's continuous time. Firmware 27 counts
+ * it at 24 MHz, while the ARM counter Linux reads may run faster (1 GHz on
+ * T6050). A raw counter value then names a moment far in the future and the
+ * firmware holds the swap for it, so scale the counter to the firmware's
+ * timebase.
+ */
+#define DCP_V27_TIMEBASE_HZ 24000000U
+
+static u64 __maybe_unused dcp_swap_time(void)
+{
+	u64 now = arch_timer_read_counter();
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+	u32 rate = arch_timer_get_cntfrq();
+
+	if (rate && rate != DCP_V27_TIMEBASE_HZ)
+		return mul_u64_u32_div(now, DCP_V27_TIMEBASE_HZ, rate);
+#endif
+	return now;
+}
+
+/*
+ * The previous accepted swap's time, or now without one. On firmware 27 also
+ * now when it is from the future or more than a second old, as after an idle
+ * period: the firmware paces the swap from it.
+ */
+static u64 __maybe_unused dcp_swap_prev_time(u64 now, u64 prev)
+{
+	if (!prev)
+		return now;
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+	if (prev > now || now - prev > DCP_V27_TIMEBASE_HZ)
+		return now;
+#endif
+	return prev;
+}
+
+/*
  * Callback for swap requests. If a swap failed, we'll never get a swap
  * complete event so we need to fake a vblank event early to avoid a hang.
  */
@@ -3119,7 +3164,7 @@ static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 		return;
 	}
 	dcp->swap_start = ktime_get();
-	dcp->swap_submit_timestamp = arch_timer_read_counter();
+	dcp->swap_submit_timestamp = dcp_swap_time();
 	dcp_swap_watchdog_arm(dcp);
 }
 
@@ -3147,6 +3192,7 @@ static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 		return;
 #endif
 	DCP_FW_SWAP(dcp).swap.swap_id = resp->swap_id;
+	WRITE_ONCE(dcp->started_swap_id, resp->swap_id);
 	if (dcp_present_retires(dcp))
 		dcp_arm_retained_framebuffers(dcp, resp->swap_id);
 
@@ -3814,7 +3860,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	dcp->output_pq = dcp->pq_requested && mode->pq.score >= 0;
 
 	/* Built-in ProMotion panels require timestamps even in fixed-120 mode. */
-	dcp->use_timestamps = mode->vrr && dcp->main_display;
+	dcp->use_timestamps = mode->needs_timestamps && dcp->main_display;
 
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie) {
@@ -4078,18 +4124,16 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	}
 #else
 	if (has_surface && (dcp->use_timestamps || dcp->vrr_enabled)) {
-		u64 submit_timestamp = dcp->swap_submit_timestamp;
-		u64 timestamp = arch_timer_read_counter();
+		u64 timestamp = dcp_swap_time();
+		u64 submit_timestamp =
+			dcp_swap_prev_time(timestamp, dcp->swap_submit_timestamp);
 
 		/*
-		 * IOMobileFramebuffer uses Mach continuous-time values here. On
-		 * Apple Silicon that is the ARM architectural counter. Empirical
+		 * The firmware takes continuous-time values here, in its own
+		 * timebase (see dcp_swap_time()). Empirical
 		 * testing shows that using the current submission time together
 		 * with the previous accepted swap makes DCP follow swap pacing.
 		 */
-		if (!submit_timestamp)
-			submit_timestamp = timestamp;
-
 		/* Firmware 12.x/13.x requires timestamp types 1, 2, and 7. */
 		req->swap.timestamp[0] = timestamp;
 		req->swap.timestamp[1] = submit_timestamp;

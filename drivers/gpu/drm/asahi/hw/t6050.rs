@@ -3,18 +3,11 @@
 //!
 //! The M5 firmware builds its HW data, performance tables and region C in its own graph
 //! ([`crate::g17::fw::m5::initdata`]), so the 26A428/25G83 graph tables of [`Config`] are empty.
-use crate::g17::{Config, CoreLayout, CrashBuffers, FirmwareProfile, FixedBuffer, Identity};
+use crate::g17::{Config, CoreLayout, CrashBuffers, FirmwareProfile, Identity};
 use crate::hw::{GpuGen, GpuVariant};
 use crate::regs::G17Id;
 
-// The coprocessors request a crash log buffer at these addresses (primary first) when they start and hand
-// its contents back when they crash; outside the canonical range of dynamic objects. They are the
-// ADT sgx gfx-data-shared-ro-base and gfx1-data-shared-ro-base (each 0x8000), so they differ per board.
-const J714_CRASH_BUFFERS: [FixedBuffer; 2] = [
-    FixedBuffer { va: 0x100_025b_4000, size: 0x8000 },
-    FixedBuffer { va: 0x100_0267_0000, size: 0x8000 },
-];
-
+/// M5 Pro (J714s): ID variant 3, GPU variant S, on bare metal like the M5 Max.
 pub(crate) const CONFIG: Config = Config {
     chip_id: 0x6050,
     identity: Identity {
@@ -27,16 +20,21 @@ pub(crate) const CONFIG: Config = Config {
     },
     uat_ias: 42,
     uat_oas: 42,
-    // Unknown until the board has bare-metal page tables.
-    secondary_root_offset: None,
-    crash_buffers: CrashBuffers::Fixed(J714_CRASH_BUFFERS),
-    profile: FirmwareProfile::M5NoBareMetalTables,
+    // Both roles publish their kernel roots. The boot arguments iBoot writes into each role's
+    // TEXT give the primary's tables at `pagetables` (BPTP, the ADT gfx-shared-region) and the
+    // secondary's 0x40000 above it, 0x40000 each (SPTP).
+    secondary_root_offset: Some(0x40000),
+    // Each role places its own buffers. Its crash log goes in its __DATA_SHARED_RO, inside
+    // `fw-data`, as on the M5 Max, whose data segments have the same layout.
+    crash_buffers: CrashBuffers::FirmwareData,
+    profile: FirmwareProfile::M5PublishedRoots,
     pm_metrics: None,
     windows: &[],
     reserved_slots: &[],
     perf: None,
     opps: 0,
-    uat_quirks: crate::mmu::UatQuirks::DEFAULT,
+    // The M5 Max and Ultra's UAT policy, for the same firmware family.
+    uat_quirks: CONFIG_ULTRA.uat_quirks,
     region_c: None,
     chip: None,
     m5: Some(&crate::g17::fw::m5::initdata::J714),
@@ -44,8 +42,33 @@ pub(crate) const CONFIG: Config = Config {
     fabric_bridge: false,
     recovery_slot_keys: None,
     gpu_generation: GpuGen::G17,
-    // No loaded image is admitted: the board has no bare-metal page tables yet.
-    firmware: crate::g17::fw::variant::Firmware::Identified(&[]),
+    // The firmware in `fw-text` must be this build. iBoot loads the G17S build of both roles
+    // back to back: the primary's TEXT 0x50000, then the secondary's 0x54000, with the same
+    // entropy records and boot-filled ranges as the M5 Max. The digest is that of the
+    // firmware's TEXT with those ranges zeroed, measured on two J714s boots.
+    firmware: crate::g17::fw::variant::Firmware::Identified(&[crate::g17::fw::variant::Build {
+        os_version: [27, 0, 0],
+        name: "27.0 (26A428), G17S",
+        images: &[
+            crate::fwid::FirmwareBuild {
+                name: "26A428 for T6050 G17S, primary then secondary",
+                text_size: 0xa4000,
+                data_size: 0x184000,
+                entropy: &[[0x49e60, 0x49f43], [0x9d918, 0x9d9fb]],
+                boot_filled: &[
+                    (0x224, 4), (0x23c, 8), (0x49720, 0x740), (0x49e60, 0x231),
+                    (0x50224, 4), (0x5023c, 8), (0x9d1d8, 0x740), (0x9d918, 0x231),
+                ],
+                text_sha256: [
+                    0x85, 0xd0, 0xfd, 0x82, 0x80, 0xf7, 0x24, 0x65, 0x5c, 0xa9, 0xa9, 0x71, 0x7b,
+                    0xc9, 0x1a, 0x8a, 0x5e, 0xf6, 0x09, 0x28, 0xd7, 0x72, 0x00, 0xf6, 0xd5, 0x3b,
+                    0xd0, 0x99, 0xb9, 0x47, 0x39, 0xc6,
+                ],
+            },
+        ],
+        variant: &crate::g17::fw::variant::V26A428_M5,
+        config: None,
+    }]),
     // Two clusters of ten cores. The buffers are sized for every core slot of the board, so the
     // board's cluster and slot counts admit the GPU, whichever cores are fused off.
     core_layout: CoreLayout {
@@ -114,6 +137,7 @@ pub(crate) const CONFIG_MAX: Config = Config {
             },
         ],
         variant: &crate::g17::fw::variant::V26A428_M5,
+        config: None,
     }]),
     // Four clusters of ten cores. The buffers are sized for every core slot of the board, so the
     // board's cluster and slot counts admit the GPU, whichever cores are fused off.
@@ -196,6 +220,7 @@ pub(crate) const CONFIG_ULTRA: Config = Config {
             ],
         }],
         variant: &crate::g17::fw::variant::V26A428_M5,
+        config: None,
     }]),
     // Eight clusters of ten cores. M5 renders lay out their tiler context store themselves
     // (`fw::m5::render_registers`), so the deflake layout is the M5 Pro's. As on the M5 Pro, the

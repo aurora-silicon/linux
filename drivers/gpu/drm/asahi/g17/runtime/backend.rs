@@ -121,6 +121,12 @@ impl job::Backend for Backend {
     fn creator_cluster_scheduling(&self) -> bool {
         self.shared.follows_submitter()
     }
+    fn host_producer_waits(&self) -> bool {
+        self.shared.m5_board.is_some_and(|board| !board.g17d_forms() && !board.completion_inputs())
+    }
+    fn firmware_sources_need_visible_completion(&self) -> bool {
+        self.shared.m5_board.is_some_and(|board| board.completion_inputs())
+    }
     fn fence_queue(&self) -> Arc<kernel::workqueue::OwnedQueue> {
         self.shared.fence_queue()
     }

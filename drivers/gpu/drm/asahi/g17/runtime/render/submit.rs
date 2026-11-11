@@ -8,7 +8,11 @@ use crate::g17::{
     queue::admission::{RenderLease, Request},
 };
 use core::sync::atomic::Ordering;
-use kernel::{prelude::*, sync::Arc};
+use kernel::{
+    prelude::*,
+    sync::Arc,
+    time::{delay::fsleep, Delta},
+};
 
 /// Internal result of a publication attempted from the submitting ioctl that
 /// met contention before anything became visible: the scheduler publishes the
@@ -287,6 +291,13 @@ impl Backend {
     /// Render capacity is short: return what idle owners hold, then block until
     /// a pair, lease or owner returns. No packet is firmware-visible here, and
     /// neither the device mutex nor a preparation lease is held while waiting.
+    ///
+    /// A reclaim that returned something retries at once, but only once per
+    /// pause: reclaim can keep reporting returns (vacated pools the firmware has
+    /// not released yet, or backing another refused publisher takes first)
+    /// while the refusal persists. Every later refusal sleeps for at least the
+    /// clock's backoff pause, even when a notification (often another refused
+    /// publisher's own reclaim) ends the domain wait sooner.
     fn wait_render_capacity(
         &self,
         observed: &mut Option<u64>,
@@ -296,7 +307,7 @@ impl Backend {
         if !sleep {
             return Err(FALLBACK);
         }
-        if self.reclaim_render_capacity()? {
+        if self.reclaim_render_capacity()? && clock.fast_retry() {
             *observed = None;
             return Ok(());
         }
@@ -306,15 +317,22 @@ impl Backend {
         };
         self.shared.queue_events();
         self.admission_open()?;
+        let started = super::super::now_ns();
         let remaining = self
             .wait_deadline(clock, super::super::WORK_RING_WAIT_NS)?
-            .saturating_sub(super::super::now_ns());
+            .saturating_sub(started);
         if remaining == 0 {
             return Err(EBUSY);
         }
+        let pause = clock.pause_ns(remaining);
         self.shared
             .renders
-            .block(sample, remaining.div_ceil(1_000_000).min(10) as u32, false)
+            .block(sample, remaining.div_ceil(1_000_000).min(10) as u32, false)?;
+        let left = pause.saturating_sub(super::super::now_ns().saturating_sub(started));
+        if left != 0 {
+            fsleep(Delta::from_nanos(left as i64));
+        }
+        Ok(())
     }
 
     /// Gives idle render backing back under capacity pressure. Returns whether
@@ -731,13 +749,23 @@ impl crate::g17::Firmware {
         let port = self.port.clone();
         let _render = port.render_lock();
         // Both outer destinations must have room before pool accounting or
-        // either inner queue becomes visible.
+        // either inner queue becomes visible. On M5 both are the shared compute ring: one
+        // check covers the pair, and the pair is written against its cursors (this hold
+        // is the ring's only producer; the firmware's consumers only advance).
         let priority = packet.context.policy().priority();
-        if !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Fragment)?
-            || !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Tiling)?
-        {
-            return Err(EBUSY);
-        }
+        let outer_cursors = if self.init.is_m5() {
+            let Some(cursors) = self.init.m5_render_room(priority)? else {
+                return Err(EBUSY);
+            };
+            Some((priority, cursors))
+        } else {
+            if !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Fragment)?
+                || !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Tiling)?
+            {
+                return Err(EBUSY);
+            }
+            None
+        };
         if let Some(footprint) = packet.footprint.as_ref() {
             dependencies.hazard_count = self.queues.admission.publication_barriers(
                 owner,
@@ -778,7 +806,7 @@ impl crate::g17::Firmware {
             buffer_token,
             buffer_context: buffer_context.map(|(context, _)| context),
         };
-        let result = self.with_render(usize::from(slot), |pair, host| {
+        let result = self.with_render_at(usize::from(slot), outer_cursors, |pair, host| {
             pair.publish(
                 packet.clone(),
                 &dependencies,
@@ -808,11 +836,21 @@ fn recovery_wait_ns() -> u64 {
     u64::from(crate::g17::timeout::RECOVERY_WAIT_MS) * 1_000_000
 }
 
+/// First pause of a render capacity wait (WaitClock::pause_ns).
+const CAPACITY_PAUSE_MIN_NS: u64 = 50_000;
+/// Longest pause of a render capacity wait: a 2 s wait makes at most about
+/// a thousand attempts.
+const CAPACITY_PAUSE_MAX_NS: u64 = 2_000_000;
+
 /// One bounded wait (Backend::wait_deadline).
 #[derive(Default)]
 struct WaitClock {
     first: Option<u64>,
     calm: u64,
+    /// Pauses this wait has slept (pause_ns).
+    pauses: u32,
+    /// The immediate retry after a reclaim is used up until the next pause.
+    retried: bool,
 }
 
 impl WaitClock {
@@ -825,6 +863,24 @@ impl WaitClock {
         first
             .saturating_add(recovery_wait_ns())
             .min(self.calm.saturating_add(bound_ns))
+    }
+
+    /// Whether a refusal after a reclaim that returned something retries at
+    /// once: the first time, and again only after a pause.
+    fn fast_retry(&mut self) -> bool {
+        !core::mem::replace(&mut self.retried, true)
+    }
+
+    /// The least time the next refused attempt sleeps: CAPACITY_PAUSE_MIN_NS,
+    /// doubling per pause up to CAPACITY_PAUSE_MAX_NS, never past `remaining`.
+    fn pause_ns(&mut self, remaining: u64) -> u64 {
+        let pause = CAPACITY_PAUSE_MIN_NS
+            .checked_shl(self.pauses)
+            .filter(|pause| *pause <= CAPACITY_PAUSE_MAX_NS)
+            .unwrap_or(CAPACITY_PAUSE_MAX_NS);
+        self.pauses = self.pauses.saturating_add(1);
+        self.retried = false;
+        pause.min(remaining)
     }
 }
 
@@ -855,5 +911,40 @@ mod tests {
         clock.deadline(100, true, BOUND);
         let limit = 100 + recovery_wait_ns();
         assert_eq!(clock.deadline(limit - 1, true, BOUND), limit);
+    }
+
+    #[test]
+    fn a_reclaim_retries_at_once_only_once_per_pause() {
+        let mut clock = WaitClock::default();
+        assert!(clock.fast_retry());
+        assert!(!clock.fast_retry());
+        clock.pause_ns(BOUND);
+        assert!(clock.fast_retry());
+        assert!(!clock.fast_retry());
+    }
+
+    #[test]
+    fn pauses_double_up_to_the_cap_and_stop_at_the_deadline() {
+        let mut clock = WaitClock::default();
+        assert_eq!(clock.pause_ns(BOUND), CAPACITY_PAUSE_MIN_NS);
+        assert_eq!(clock.pause_ns(BOUND), 2 * CAPACITY_PAUSE_MIN_NS);
+        for _ in 0..80 {
+            assert!(clock.pause_ns(BOUND) <= CAPACITY_PAUSE_MAX_NS);
+        }
+        assert_eq!(clock.pause_ns(BOUND), CAPACITY_PAUSE_MAX_NS);
+        assert_eq!(clock.pause_ns(1_000), 1_000);
+    }
+
+    #[test]
+    fn a_wait_that_always_wakes_makes_bounded_attempts() {
+        let mut clock = WaitClock::default();
+        let (mut now, mut attempts) = (0, 0);
+        while now < BOUND {
+            attempts += 1;
+            if !clock.fast_retry() {
+                now += clock.pause_ns(BOUND - now);
+            }
+        }
+        assert!(attempts <= 2 * (BOUND / CAPACITY_PAUSE_MAX_NS + 16));
     }
 }

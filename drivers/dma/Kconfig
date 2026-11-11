@@ -125,6 +125,16 @@ config APPLE_SIO_T6030_KUNIT_TEST
 	  against tables a T6030-aware boot loader builds, an earlier
 	  loader's tables, and malformed, truncated and out-of-window ones.
 
+config APPLE_SIO_T6041_KUNIT_TEST
+	bool "KUnit tests for the T6041 SIO boot contract" if !KUNIT_ALL_TESTS
+	depends on APPLE_SIO=y && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Check the T6041 (M4 Pro/Max) SIO boot: which boot-loader tables
+	  are admitted and at which sizes, the order the firmware takes them
+	  in with the power-gating scalar, the DMA array counts, and the
+	  six-word channel configuration.
+
 config ARM_DMA350
 	tristate "Arm DMA-350 support"
 	depends on ARM || ARM64 || COMPILE_TEST

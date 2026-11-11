@@ -127,6 +127,9 @@ properties:
   memory-region:
     minItems: 1
     maxItems: 64
+    description:
+      Boot framebuffer and reserved mappings. A T6050 external processor
+      without a boot framebuffer may omit these regions and their names.
 
   memory-region-names:
     minItems: 1
@@ -293,6 +296,14 @@ properties:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Height in pixels reserved for the display notch.
 
+  apple,pmc-interface:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The PMC interface enables of this coprocessor's display pipe, an
+      apple,consumer-switched interface node. The coprocessor clears them
+      before it powers its display domains down while the display is off,
+      and restores them after it powers them up again.
+
   apple,pmp-report:
     $ref: /schemas/types.yaml#/definitions/phandle
     description:
@@ -314,17 +325,18 @@ properties:
   mux-controls:
     $ref: /schemas/types.yaml#/definitions/phandle-array
     minItems: 1
-    maxItems: 10
+    maxItems: 21
     description: |
       T6030 and T8132 external DCPs may also name the two DP IN tunnel states
       of each Type-C crossbar, in addition to the fixed output and Type-C
-      routes.
+      routes. T6050 has four DP IN states per crossbar and up to four
+      Type-C routes, plus a fixed output.
 
   mux-control-names:
     minItems: 1
-    maxItems: 10
+    maxItems: 21
     items:
-      pattern: '^(dp-xbar|typec[0-9]+(-dpin[01])?)$'
+      pattern: '^(dp-xbar|typec[0-9]+(-dpin[0-3])?)$'
 
   mux-index:
     $ref: /schemas/types.yaml#/definitions/uint32
@@ -432,7 +444,24 @@ allOf:
         properties:
           compatible:
             contains:
-              enum: ['apple,t6030-dcpext', 'apple,t8132-dcpext']
+              enum: ['apple,t6050-dcp', 'apple,t6050-dcpext']
+        required:
+          - compatible
+    then:
+      properties:
+        mux-controls:
+          maxItems: 10
+        mux-control-names:
+          maxItems: 10
+          items:
+            pattern: '^(dp-xbar|typec[0-9]+(-dpin[01])?)$'
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              enum: ['apple,t6030-dcpext', 'apple,t8132-dcpext',
+                     'apple,t6050-dcp', 'apple,t6050-dcpext']
         required:
           - compatible
     then:
@@ -467,9 +496,20 @@ allOf:
     then:
       required:
         - apple,clock-ids
-        - memory-region
-        - memory-region-names
         - apple,firmware-compat
+      dependencies:
+        memory-region: [memory-region-names]
+        memory-region-names: [memory-region]
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6050-dcp
+          then:
+            required:
+              - memory-region
+              - memory-region-names
       properties:
         apple,firmware-compat:
           items:

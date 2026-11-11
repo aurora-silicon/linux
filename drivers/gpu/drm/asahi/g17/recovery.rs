@@ -172,7 +172,11 @@ impl State {
     pub(super) fn timeout_limit(&mut self, now: u64) -> bool {
         self.timeouts.note_unless_progress(now, safety::retired())
     }
-    pub(super) fn restart_limit(&mut self, now: u64) -> bool { self.restarts.note(now) }
+    /// Like timeouts, restarts with work retired between them start a new window: each one
+    /// still costs the guilty client its device, but only restarts without progress stop the GPU.
+    pub(super) fn restart_limit(&mut self, now: u64) -> bool {
+        self.restarts.note_unless_progress(now, safety::retired())
+    }
     /// A restart that only dropped leftover work of failed VMs (`ServiceResult::leftover`)
     /// does not count toward the storm limit. Returns whether it was forgiven.
     pub(super) fn forgive_restart(&mut self) -> bool { self.restarts.forgive() }

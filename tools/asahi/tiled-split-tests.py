@@ -17,6 +17,7 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
 FUNCTIONS = {
+    'drivers/gpu/drm/apple/dcp-fabric-core.h': ['dcp_fabric_dpin_slot'],
     'drivers/gpu/drm/apple/dcp-fabric-session.h': ['dcp_fabric_binding_request'],
     'drivers/gpu/drm/apple/dcp-fabric-core.c': ['dcp_fabric_tunnel_slot'],
     'drivers/gpu/drm/apple/dcp-fabric.c': [
@@ -26,6 +27,8 @@ FUNCTIONS = {
 CASES = ['t6030-dpin1-alone', 't6030-dpin1-alone-before-services',
          't6030-dpin1-with-external-owner', 't6030-dpin1-then-dpin0',
          't6030-dpin0-then-dpin1', 't6030-split-off', 't6030-inactive-dpin1',
+         't6050-dpin1-alone', 't6050-dpin1-with-tile-hint', 't6050-dpin3-alone',
+         't6050-dpin3-shares-slot',
          'internal-dpin1-alone-waits', 'internal-not-ready-waits',
          'mixed-routes-wait', 'no-routes-wait', 'internal-tile-hint-pending',
          'internal-tiled-join', 'internal-owner-without-port1',
@@ -41,15 +44,21 @@ MUTATIONS = [
      'lockdep_assert_held(&dcp_typec_fabric_lock);\n\tif (dcp_typec_port_untileable(port))\n'
      '\t\treturn -EOPNOTSUPP;\n\t/* A retired provider'),
     ('readiness-judged',
-     'if (!route->dcp->external && !dcp_typec_route_no_dp_alt(route))\n\t\t\treturn false;',
-     'if (!route->dcp->external && !dcp_typec_route_no_dp_alt(route) &&\n'
+     'route->dcp->fw_compat != DCP_FIRMWARE_V_27_0)\n\t\t\treturn false;',
+     'route->dcp->fw_compat != DCP_FIRMWARE_V_27_0 &&\n'
      '\t\t    route->dcp->dptxport[1].enabled)\n\t\t\treturn false;'),
     ('empty-untileable', 'return !list_empty(&port->routes);', 'return true;'),
     ('any-external-untileable',
-     'if (!route->dcp->external && !dcp_typec_route_no_dp_alt(route))\n\t\t\treturn false;',
-     'if (route->dcp->external || dcp_typec_route_no_dp_alt(route))\n\t\t\treturn true;'),
-    ('dcpext-tileable', 'if (!route->dcp->external && !dcp_typec_route_no_dp_alt(route))',
-     'if (!route->dcp->external)'),
+     'if (!route->dcp->external &&\n\t\t    !dcp_typec_route_no_dp_alt(route) &&\n'
+     '\t\t    route->dcp->fw_compat != DCP_FIRMWARE_V_27_0)\n\t\t\treturn false;',
+     'if (route->dcp->external || dcp_typec_route_no_dp_alt(route) ||\n'
+     '\t\t    route->dcp->fw_compat == DCP_FIRMWARE_V_27_0)\n\t\t\treturn true;'),
+    ('dcpext-tileable', '!dcp_typec_route_no_dp_alt(route) &&\n', ''),
+    # Firmware 27 pipelines drive one DP IN each: never a tile.
+    ('fw27-tileable', ' &&\n\t\t    route->dcp->fw_compat != DCP_FIRMWARE_V_27_0)', ')'),
+    # DP IN 3 is a second stream, in DP IN 1's slot.
+    ('dpin3-primary-slot', 'slot = dcp_fabric_dpin_slot(dpin) ? &port->secondary_owner : &port->owner;',
+     'slot = dpin == 1 ? &port->secondary_owner : &port->owner;'),
     ('gate-always', 'if (dcp_typec_port_untileable(port))',
      'if (true || dcp_typec_port_untileable(port))'),
 ]
@@ -71,7 +80,12 @@ def function(source, name):
 
 def build(out, bodies, tag):
     fixture = (ROOT / 'tools/asahi/tiled-split/fixture.c').read_text()
-    code = fixture.replace('/* PRODUCTION_FUNCTIONS */', '\n'.join(bodies.values()))
+    core = (ROOT / 'drivers/gpu/drm/apple/dcp-fabric-core.h').read_text()
+    versions = re.search(r'enum dcp_firmware_version \{.*?\n\};',
+                         (ROOT / 'drivers/gpu/drm/apple/version_utils.h').read_text(), re.S).group()
+    code = fixture.replace('/* FABRIC_DEFINES */', re.search(
+        r'^#define DCP_FABRIC_DPIN_MAX\b.*$', core, re.M).group() + '\n' + versions).replace(
+        '/* PRODUCTION_FUNCTIONS */', '\n'.join(bodies.values()))
     source, binary = out / f'{tag}.c', out / tag
     source.write_text(code)
     subprocess.run(['cc', '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
