@@ -10,11 +10,13 @@
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
+#include <linux/etherdevice.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/pci.h>
+#include <linux/property.h>
 #include <linux/random.h>
 #include <linux/seq_file.h>
 #include <linux/sizes.h>
@@ -54,6 +56,10 @@ MODULE_PARM_DESC(arm_auxiliary_rings, "Diagnostic: arm remaining native Beta res
 static bool native_startup;
 module_param(native_startup, bool, 0444);
 MODULE_PARM_DESC(native_startup, "Diagnostic: program a temporary address, InitDone and random seed before the first HCI reset");
+
+static bool factory_address = true;
+module_param(factory_address, bool, 0444);
+MODULE_PARM_DESC(factory_address, "Program the loader-provided local-bd-address before the first HCI reset");
 
 static bool enable_acl;
 module_param(enable_acl, bool, 0444);
@@ -673,24 +679,57 @@ static int cen_hci_post_init(struct hci_dev *hdev)
 	return 0;
 }
 
+/*
+ * The factory address in network byte order, for WriteBdAddr, from the
+ * standard local-bd-address (least significant byte first; the loader fills
+ * it from the ADT for the bluetooth0 alias). As in btcentauri_t6050.c.
+ */
+static int cen_bt_address(struct device *dev, u8 address[6])
+{
+	u8 bd[6];
+	int i, ret;
+
+	if (device_property_count_u8(dev, "local-bd-address") != 6)
+		return -ENOENT;
+	ret = device_property_read_u8_array(dev, "local-bd-address", bd, sizeof(bd));
+	if (ret)
+		return ret;
+	for (i = 0; i < 6; i++)
+		address[i] = bd[5 - i];
+	if (is_zero_ether_addr(address) || is_broadcast_ether_addr(address))
+		return -EINVAL;
+	return 0;
+}
+
 static int cen_hci_setup(struct hci_dev *hdev)
 {
 	struct cen_bt *bt = hci_get_drvdata(hdev);
 	u8 address[6], init_done[16], seed[24];
+	bool factory;
 	int ret;
 
-	if (!native_startup)
+	/*
+	 * Without WriteBdAddr the controller reports BD_ADDR 00:00:00:00:00:00
+	 * and bluetoothd ignores it ("No Bluetooth address for index 0").
+	 */
+	factory = factory_address && !cen_bt_address(&bt->pdev->dev, address);
+	if (factory_address && !factory)
+		bt_dev_info(hdev, "No factory local-bd-address from the loader");
+	if (!factory && !native_startup)
 		return 0;
 
 	/* Native PROXIMA initialization starts with these three commands, then
 	 * HCI Reset. The core calls setup before its ordinary reset/init sequence.
-	 * Address provisioning is still diagnostic: use a temporary locally
-	 * administered address, in native WriteBdAddr display/network byte order.
+	 * The address is the factory one when the loader provided it, else
+	 * (diagnostic) a temporary locally administered address, in native
+	 * WriteBdAddr display/network byte order.
 	 */
-	ret = get_random_bytes_wait(address, sizeof(address));
-	if (ret)
-		return ret;
-	address[0] = (address[0] & 0xfc) | 0x02;
+	if (!factory) {
+		ret = get_random_bytes_wait(address, sizeof(address));
+		if (ret)
+			return ret;
+		address[0] = (address[0] & 0xfc) | 0x02;
+	}
 	get_random_bytes(seed, sizeof(seed));
 	memset(init_done, 0xff, sizeof(init_done));
 	ret = cen_vendor_command(hdev, 0xfc06, address, sizeof(address));
@@ -710,7 +749,8 @@ out:
 		bt_dev_err(hdev, "Native startup stopped after %u commands: %d",
 			   bt->native_startup_steps, ret);
 	else
-		bt_dev_info(hdev, "Native startup accepted; temporary diagnostic address in use");
+		bt_dev_info(hdev, "Native startup accepted; %s address in use",
+			    factory ? "factory" : "temporary diagnostic");
 	return ret;
 }
 
