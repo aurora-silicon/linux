@@ -2658,6 +2658,23 @@ impl SepData {
             return;
         };
 
+        // Reuse the kept sensor only for the next touch of the authentication
+        // that is still open. A new authentication brings it up afresh: on
+        // J815 a sensor kept idle for 57 s between two sudo prompts had reset
+        // itself and lost its patch (state 9 in the next capture, boot
+        // 0f4c4bbd), while a fresh bring-up takes about 40 ms.
+        if self.sensor_kept.load(Relaxed)
+            && (self.key_touch_active.load(Relaxed)
+                || self.match_scope_gen.load(Relaxed) != self.bio_open_gen.load(Relaxed)
+                || self.match_context.lock().is_none())
+        {
+            dev_info!(self.dev, "verify: a new authentication; bringing the sensor up afresh instead of reusing it\n");
+            let _ = sensor::idle();
+            self.sensor_kept.store(false, Relaxed);
+            self.forget_finger_lift();
+            sensor::power(false);
+        }
+
         // Arm the capture once the last touch's finger is off the sensor, as
         // macOS does; a sensor brought up afresh has no touch to wait out.
         if !self.sensor_kept.load(Relaxed) {
@@ -2765,12 +2782,17 @@ impl SepData {
         // A retry straight from the capture (no finger in time, partial
         // contact, a damaged frame) compared nothing and needs no new
         // bring-up; the touch is simply taken again in the same prompt.
-        let capture_retry = matches!(outcome, bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY));
+        // A sensor that reset under the capture is a retry for the user but
+        // not a capture retry here: the prompt's match operation ends and the
+        // sensor is dropped (below), so the next try starts from a bring-up.
+        let sensor_reset = self.sensor_reset_in_capture.xchg(false, Relaxed);
+        let capture_retry =
+            matches!(outcome, bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY)) && !sensor_reset;
         let touched_at = shim::boottime_ns();
         // The touch's frames are taken: stop imaging but keep watching the
         // finger, as macOS does right after the image cleanup. The next
         // capture is armed when it is lifted.
-        if matches!(outcome, bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR)) {
+        if matches!(outcome, bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR)) || sensor_reset {
             self.forget_finger_lift();
             let _ = sensor::idle();
         } else {
@@ -3019,6 +3041,15 @@ impl SepData {
                     "verify: the sensor fell to state {} during the capture\n",
                     state
                 );
+                if state == sensor::STATE_NEEDS_PATCH {
+                    // The sensor reset itself: nothing was compared, and a
+                    // fresh bring-up recovers it. Ask for another touch rather
+                    // than fail the authentication.
+                    dev_info!(self.dev, "verify: the sensor reset under the capture; asking for another touch after a fresh bring-up\n");
+                    self.sensor_reset_in_capture.store(true, Relaxed);
+                    self.retry_cause(bio::Guidance::Place);
+                    return bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY);
+                }
                 return bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR);
             }
             CaptureWait::Abandon => {
