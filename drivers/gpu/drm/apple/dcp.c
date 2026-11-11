@@ -4699,6 +4699,22 @@ void dcp_poweron(struct platform_device *pdev)
 		av_service_connect(dcp);
 }
 
+/*
+ * A desktop 26.x external pipe that the firmware powered off with its display: an unplug, or
+ * the link released for a sleep. A mode set alone leaves it off ("Modeset done, but pipe not
+ * enabled") and the firmware swallows every swap after it. The mode is valid from then on,
+ * so the flush that would power the pipe on for the first swap (dcp_flush()) leaves it too.
+ * A mode set on a CRTC that stayed active, as the hotplug worker's when the display is back
+ * before the compositor has flipped once, powers such a pipe on first.
+ */
+bool dcp_external_pipe_off(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && !dcp->main_display &&
+	       dcp->desktop->ext_pipe_off;
+}
+
 /* Same-CRTC helper dependencies order this token refresh before later disables. */
 void dcp_external_recover(struct platform_device *pdev)
 {
