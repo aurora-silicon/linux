@@ -41,6 +41,10 @@ struct centauri {
  * (board-id << 16) | chip-id from the machine's ADT /chosen, and the physical addresses and
  * the one differing register value of the port cycle (centauri_port.c).
  * J813: board 0x24, chip 0x8142 (measured); port, PHY lane and PERST pad from the live ADT.
+ * J815 (MacBook Air 15" M5): board 0x26, chip 0x8142 from its ADT /chosen; same T8142 port 0
+ * config/lane and PERST# (pci-bridge0 function-perst = gpio0 pin 0xc0 -> 0x39a000300) as J813,
+ * and the same N1 image (t2026macG1 ftab in the J813 and J815 restore identities). Its stub is
+ * macOS 27.0, so it takes the 27.0 adapter's link TLV 386 and scan TLVs.
  * J873 (Mac mini M6): board 0x24, chip 0x8152 from its ADT, the composition taken from the J813
  * word; port 0 config 0x388028000, lane 0x38f010000 and PERST# gpio0 pin 3 (0x31a000000 + 4 * 3)
  * from its ADT; config +0x130 is 0x208 as in the m1n1 T8152 bring-up that links the port.
@@ -73,6 +77,9 @@ static inline const struct centauri_board *centauri_board(void)
 		{ "apple,j813", "apple/centauri/j813-ftab.bin", 0x00248142,
 		  0x488028000ULL, 0x48f010000ULL, 0x39a000300ULL, 0x03020000, 0x100c, false,
 		  385, false },
+		{ "apple,j815", "apple/centauri/j815-ftab.bin", 0x00268142,
+		  0x488028000ULL, 0x48f010000ULL, 0x39a000300ULL, 0x03020000, 0x100c, false,
+		  386, true },
 		{ "apple,j873g", "apple/centauri/j873-ftab.bin", 0x00248152,
 		  0x388028000ULL, 0x38f010000ULL, 0x31a00000cULL, 0x208, 0, true,
 		  386, true },
