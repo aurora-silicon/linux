@@ -97,3 +97,335 @@
 		};
 	};
 };
+
+/*
+ * Type-C, from the ADT (as on J714s):
+ *   ATC0 usb-drd0 left-back  hpm0 nub-spmi-a0 0x0c (the debug port, not described)
+ *   ATC1 usb-drd1 left-front hpm1 nub-spmi-a0 0x0a
+ *   ATC2 usb-drd2 right      hpm2 nub-spmi-a1 0x0c
+ *   hpm5 nub-spmi-a0 0x08 (MagSafe, not a USB-C connector)
+ */
+
+/* Left-front port (ATC1): the SN201202x hpm1 and the connector graph */
+&nub_spmi_a0 {
+	status = "okay";
+
+	hpm1: usb-pd@a {
+		compatible = "apple,sn201202x";
+		reg = <0xa SPMI_USID>;
+
+		typec1: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Left-front";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec1_hs: endpoint {
+						remote-endpoint = <&usb_drd1_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec1_ss: endpoint {
+						remote-endpoint = <&atc1_phy_typec>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&atc1_phy_mbox {
+	status = "okay";
+};
+
+&atc1_phy {
+	status = "okay";
+
+	port {
+		atc1_phy_typec: endpoint {
+			remote-endpoint = <&typec1_ss>;
+		};
+	};
+};
+
+&usb_drd1 {
+	status = "okay";
+
+	port {
+		usb_drd1_hs: endpoint {
+			remote-endpoint = <&typec1_hs>;
+		};
+	};
+};
+
+&usb_drd1_dart_0 {
+	status = "okay";
+};
+
+&usb_drd1_dart_1 {
+	status = "okay";
+};
+
+/*
+ * Right port (ATC2): hpm2 on nub-spmi-a1, USB only (dcpext0's DisplayPort route
+ * through ATC2 stays off). The driver polls the generation 4 bus and refuses an
+ * interrupt, so it takes the first register window only, as on J714s.
+ */
+&nub_spmi_a1 {
+	reg = <0x2 0x8a1a8000 0x0 0x4000>;
+	/delete-property/ interrupts;
+	status = "okay";
+
+	hpm2: usb-pd@c {
+		compatible = "apple,sn201202x";
+		reg = <0xc SPMI_USID>;
+
+		typec2: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Right";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec2_hs: endpoint {
+						remote-endpoint = <&usb_drd2_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec2_ss: endpoint {
+						remote-endpoint = <&atc2_phy_typec>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&ps_atc2_common {
+	status = "okay";
+};
+
+&ps_atc2_usb_aon {
+	status = "okay";
+};
+
+&ps_atc2_phymxwrap {
+	status = "okay";
+};
+
+&ps_atc2_usb {
+	status = "okay";
+};
+
+&atc2_phy_mbox {
+	status = "okay";
+};
+
+&atc2_phy {
+	status = "okay";
+
+	port {
+		atc2_phy_typec: endpoint {
+			remote-endpoint = <&typec2_ss>;
+		};
+	};
+};
+
+&usb_drd2 {
+	status = "okay";
+
+	port {
+		usb_drd2_hs: endpoint {
+			remote-endpoint = <&typec2_hs>;
+		};
+	};
+};
+
+&usb_drd2_dart_0 {
+	status = "okay";
+};
+
+&usb_drd2_dart_1 {
+	status = "okay";
+};
+
+/*
+ * SMC sensors, as on J714s: every readable float T* key is discovered through
+ * apple,discover-temperatures in t6050-die0.dtsi, so the shared temperature
+ * nodes and apple,soc-die-keys go. The T6050 SMC spells the fan mode keys
+ * F0md/F1md and drives the fans itself.
+ */
+#include "hwmon-common.dtsi"
+#include "hwmon-fan-dual.dtsi"
+#include "hwmon-laptop.dtsi"
+
+&smc_hwmon {
+	status = "okay";
+	/delete-property/ apple,soc-die-keys;
+	/delete-node/ temperature-TH0x;
+	/delete-node/ temperature-TB0T;
+	/delete-node/ temperature-TCHP;
+	/delete-node/ temperature-TW0P;
+	fan-F0Ac {
+		apple,fan-mode = "F0md";
+	};
+	fan-F1Ac {
+		apple,fan-mode = "F1md";
+	};
+};
+
+/*
+ * The internal panel and the display coprocessor, for the boot loader's display
+ * hand-off (aura, chosen.aurora,t6050-display=1). Everything stays disabled: the
+ * loader checks the ADT and the live DCP and DART state, publishes the DCP's
+ * firmware properties, reserves the ADT /vram as the framebuffer and only then
+ * enables dcp, its DARTs and mailbox and the display subsystem. A loader without
+ * the hand-off leaves the boot framebuffer to simpledrm.
+ */
+/ {
+	aliases {
+		/* The loader writes apple,notch-height into the "dcp" alias */
+		dcp = &dcp;
+		disp0 = &display;
+	};
+
+	/* As on J714s, with the internal display's DART (disp0, SID 0) */
+	display: display-subsystem {
+		compatible = "apple,display-subsystem";
+		iommus = <&disp0_dart 0>;
+		status = "disabled";
+	};
+};
+
+/* ADT dart-dcp and dart-disp0: vm-base 1 TiB, vm-size 3 TiB */
+&dcp_dart {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+&disp0_dart {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+/* The DCP firmware's clocks: ADT disp0 clock-ids; the loader fills the rates */
+/ {
+	dcp_clk_361: clock-dcp-firmware-361 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <0>;
+	};
+
+	dcp_clk_458: clock-dcp-firmware-458 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <0>;
+	};
+};
+
+&dcp {
+	/*
+	 * The bandwidth request scratch: the PMC metadata (disp-4, register window
+	 * 5) at the slot of PMGR bandwidth agent DISP_INT (ADT bwr-agent index 0,
+	 * BIRQ 0x96 = disp0 function-bw_req_interrupt0): 0x20000 + 0 * 0x4000.
+	 */
+	apple,bw-scratch = <&dcpext0_pmc 0 5 0x20000>;
+	/* ADT disp0 clock-ids */
+	apple,clock-ids = <361 458>;
+	clocks = <&dcp_clk_361>, <&dcp_clk_458>;
+
+	/*
+	 * The 16.2-inch 3456x2234 tandem OLED panel. The ADT carries no dimensions;
+	 * these are the panel's active area, for the DPI only.
+	 */
+	panel {
+		compatible = "apple,panel-k116", "apple,panel";
+		width-mm = <345>;
+		height-mm = <223>;
+	};
+};
+
+/* The ADT lists no clocks for the external engines (clock-ids = []) */
+&dcpext1 {
+	apple,clock-ids;
+};
+
+&dcpext2 {
+	apple,clock-ids;
+};
+
+&dcpext3 {
+	apple,clock-ids;
+};
+
+/* ADT dart-dcpextN and dart-dispextN: vm-base 1 TiB, vm-size 3 TiB */
+&dcpext1_dart {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+&dispext1_dart {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+&dcpext2_dart {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+&dispext2_dart {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+&dcpext3_dart {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+&dispext3_dart {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+/*
+ * The trackpad's AFE reset. The ADT names the SMC pcIO template (0x10000,
+ * 0x11c0000), the same line as SMC GPIO gp1c, active low, which gpio-macsmc
+ * drives; through the pcIO outputs the multi-touch interface never comes up.
+ * As on J714s: gp1c, and the pcIO outputs go. The keyboard alias lets the
+ * loader fill the layout from the ADT.
+ */
+/delete-node/ &smc_pcio;
+
+&mtp_hid {
+	apple,afe-reset-gpios = <&smc_gpio_low 28 GPIO_ACTIVE_LOW>;
+
+	keyboard: keyboard {
+	};
+
+	/*
+	 * The touchscreen's MTP interface. Its GPIO functions (reset, power, clock,
+	 * display sync) are not described yet, so the interface stays off until
+	 * they are, as a pending GPIO request from the firmware stalls the others.
+	 */
+	kiwi {
+		status = "disabled";
+	};
+};
+
+/ {
+	aliases {
+		keyboard = &keyboard;
+		/* The loader fills the PHYs' tunables from the ADT through these */
+		atcphy1 = &atc1_phy;
+		atcphy2 = &atc2_phy;
+	};
+};
