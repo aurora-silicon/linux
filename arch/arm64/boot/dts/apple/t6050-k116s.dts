@@ -790,3 +790,6 @@
 &speaker_left_tweet  { apple,speaker-config = /bits/ 8 <0x04 0x0f 0x10 0x12>; };
 &speaker_right_tweet { apple,speaker-config = /bits/ 8 <0x05 0x0f 0x14 0x16>; };
 #endif
+
+/* The GPU, handed over by the boot loader */
+#include "t6050-k116s-gpu.dtsi"
