@@ -250,8 +250,10 @@ struct ave_start_layout {
 	u32 hevc_conf_right;
 	u32 hevc_conf_top;
 	u32 hevc_conf_bottom;
+	u32 hevc_chroma_format;
 	u32 hevc_depth_luma;
 	u32 hevc_depth_chroma;
+	u32 hevc_log2_max_poc_lsb_minus4;
 	u32 hevc_refs;
 	u32 hevc_reorder_copy;
 	u32 hevc_dpb_minus1;
@@ -289,6 +291,8 @@ struct ave_start_layout {
 	u32 hevc_sps_fw_header;
 	u32 hevc_sps_header_len;
 	u32 hevc_pps_extra_slice_bits;
+	u32 hevc_pps_l0_default_active_minus1;
+	u32 hevc_pps_l1_default_active_minus1;
 	u32 hevc_pps_init_qp;
 	u32 hevc_pps_cu_qp_delta;
 	u32 hevc_pps_cu_qp_depth;
