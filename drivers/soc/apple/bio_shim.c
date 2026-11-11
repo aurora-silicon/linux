@@ -253,4 +253,5 @@ __u64 sep_bio_boottime_ns(void)
 
 #ifdef CONFIG_APPLE_SEP_KUNIT_TEST
 #include "bio_shim_test.c"
+#include "sep_ioctl_test.c"
 #endif
