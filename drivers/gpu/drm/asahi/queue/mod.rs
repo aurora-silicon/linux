@@ -64,6 +64,10 @@ mod common;
 mod compute;
 mod render;
 
+fn can_submit_inline(dependencies_ready: bool, previous_status: Option<i32>) -> bool {
+    dependencies_ready && previous_status.is_none_or(|status| status != 0)
+}
+
 /// Trait implemented by all versioned queues.
 pub(crate) trait Queue: Send + Sync {
     fn reserve_render_scs(&mut self, layouts: [u64; 2]) -> Result {
@@ -1083,9 +1087,13 @@ impl Queue for Queue::ver {
         mod_dev_dbg!(self.dev, "Queue {}: Arming job {}\n", self.inner.id, job.id);
         let mut job = job.arm();
         let out_fence = job.fences().finished();
-        self.last_out = Some(out_fence.clone());
+        let previous_status = self.last_out.as_ref().map(|fence| {
+            // SAFETY: `last_out` owns the live dma_fence reference used for
+            // this concurrent status query.
+            unsafe { kernel::bindings::dma_fence_get_status(fence.raw()) }
+        });
         if module_parameters::legacy_inline_submit.value() != 0
-            && dependencies_ready
+            && can_submit_inline(dependencies_ready, previous_status)
             && job.can_submit_inline()
         {
             // All fallible construction and scheduler arming has completed.
@@ -1094,6 +1102,7 @@ impl Queue for Queue::ver {
             let result = <QueueJob::ver as sched::JobImpl>::run(&mut job).map(|_| ());
             job.inline_result = result.map_or_else(|error| error.to_errno(), |()| 1);
         }
+        self.last_out = Some(out_fence.clone());
         mod_dev_dbg!(
             self.dev,
             "Queue {}: Pushing job {}\n",
@@ -1118,6 +1127,46 @@ impl Queue for Queue::ver {
         }
 
         Ok(())
+    }
+}
+
+#[kunit_tests(asahi_legacy_inline_queue)]
+mod tests {
+    use super::can_submit_inline;
+
+    #[test]
+    fn depth_192_only_publishes_the_idle_head_inline() {
+        const DEPTH: usize = 192;
+        let mut previous_status = None;
+        let mut inline = 0;
+
+        for _ in 0..DEPTH {
+            if can_submit_inline(true, previous_status) {
+                inline += 1;
+            }
+            // Every later ioctl sees the preceding logical queue fence. A
+            // burst cannot publish around that unsignalled scheduler owner.
+            previous_status = Some(0);
+        }
+
+        assert_eq!(inline, 1);
+    }
+
+    #[test]
+    fn serial_round_trips_stay_eligible() {
+        const SUBMITS: usize = 192;
+
+        for index in 0..SUBMITS {
+            let previous_status = (index != 0).then_some(1);
+            assert!(can_submit_inline(true, previous_status));
+        }
+    }
+
+    #[test]
+    fn unsignalled_dependency_or_predecessor_falls_back() {
+        assert!(!can_submit_inline(false, None));
+        assert!(!can_submit_inline(true, Some(0)));
+        assert!(can_submit_inline(true, Some(-5)));
     }
 }
 
