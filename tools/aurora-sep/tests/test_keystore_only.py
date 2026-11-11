@@ -153,7 +153,12 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 type Result<T> = std::result::Result<T, u8>;
 const GFP_KERNEL: u8 = 0;
 macro_rules! dev_err { ($($arg:tt)*) => {}; }
+macro_rules! dev_info_refusal { ($($arg:tt)*) => {}; }
+macro_rules! dev_err_ratelimited { ($($arg:tt)*) => {}; }
+macro_rules! dev_info_ratelimited { ($($arg:tt)*) => {}; }
+macro_rules! dev_dbg { ($($arg:tt)*) => {}; }
 macro_rules! dev_warn { ($($arg:tt)*) => {}; }
+macro_rules! dev_warn_ratelimited { ($($arg:tt)*) => {}; }
 thread_local! {
     static READABLE: Cell<bool> = const { Cell::new(true) };
     static VALID: Cell<bool> = const { Cell::new(true) };

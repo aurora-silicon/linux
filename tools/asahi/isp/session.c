@@ -55,12 +55,17 @@ struct isp_channel {
 
 struct hardware {
 	bool resident_fw;
+	unsigned int fw_idle_ms;
 };
 
+struct delayed_work { unsigned int scheduled; };
+
 struct apple_isp {
-	int ipc_error, wait, fw_state, irq, vbq, buf_lock;
+	int ipc_error, wait, fw_state, irq, vbq, buf_lock, video_lock;
 	unsigned long state;
 	bool ipc_quiescing;
+	bool fw_idle;
+	struct delayed_work fw_idle_work;
 	struct isp_channel *chan_io, *chan_sm, *chan_tm, *chan_bt;
 	struct isp_channel *ipc_stale;
 	bool ipc_failed;
@@ -88,6 +93,7 @@ static unsigned int stop_order, free_order, order, halts, freed_released;
 static int stage_error, fail_stage, stop_error;
 static bool ack;
 static int entry_error, stage3_error;
+static bool entry_quiescing, stage3_quiescing;
 static void chan_write_msg(struct apple_isp *isp, struct isp_channel *ch,
 			   struct isp_message *msg)
 {
@@ -178,10 +184,14 @@ static void isp_collect_gc_surface(struct apple_isp *isp)
 
 static int stage(struct apple_isp *isp, int n)
 {
-	if (n == 1)
+	if (n == 1) {
 		entry_error = isp->ipc_error;
-	if (n == 3)
+		entry_quiescing = isp->ipc_quiescing;
+	}
+	if (n == 3) {
 		stage3_error = isp->ipc_error;
+		stage3_quiescing = isp->ipc_quiescing;
+	}
 	return fail_stage == n ? stage_error : 0;
 }
 
@@ -287,6 +297,25 @@ static void isp_free_released_surfaces(struct apple_isp *isp)
 	freed_released++;
 }
 
+static void *system_unbound_wq;
+static unsigned int idle_schedules;
+static unsigned int msecs_to_jiffies(unsigned int ms) { return ms; }
+static bool mod_delayed_work(void *wq, struct delayed_work *work, unsigned int delay)
+{
+	CHECK(wq == system_unbound_wq && delay == 1000);
+	CHECK(!irq_disabled && !synchronizing->ipc_quiescing);
+	work->scheduled++;
+	idle_schedules++;
+	return false;
+}
+
+static bool cancel_delayed_work_sync(struct delayed_work *work)
+{
+	bool pending = work->scheduled;
+	work->scheduled = 0;
+	return pending;
+}
+
 static u64 get_unaligned_le64(const void *p) { u64 v; memcpy(&v, p, sizeof(v)); return v; }
 #define IS_ENABLED(x) 0
 #define jiffies 0
@@ -385,6 +414,45 @@ int main(void)
 	flood = true;
 	isp_firmware_shutdown(&isp);
 	CHECK(isp.ipc_error == -ESHUTDOWN);
+	/* Main's idle lease must retain containment and IRQ lifetime rules. */
+	flood = false;
+	const struct hardware idle = { .fw_idle_ms = 1000 };
+	isp.hw = &idle;
+	isp.fw_state = ISP_FW_RUNNING;
+	isp.ipc_error = 0;
+	isp.fw_idle = false;
+	sync_error = 0;
+	irq_disabled = false;
+	unsigned int before_halts = halts, before_freed = freed_released;
+	apple_isp_firmware_shutdown(&isp);
+	CHECK(isp.fw_state == ISP_FW_RUNNING && isp.fw_idle);
+	CHECK(halts == before_halts && freed_released == before_freed + 1);
+	CHECK(!irq_disabled && !isp.ipc_quiescing && idle_schedules == 1);
+	CHECK(!apple_isp_firmware_boot(&isp) && !isp.fw_idle);
+	isp.fw_idle = true;
+	isp.ipc_error = -ETIME;
+	CHECK(apple_isp_firmware_boot(&isp) == -ETIME && isp.fw_idle);
+	apple_isp_firmware_flush(&isp);
+	CHECK(!isp.fw_idle_work.scheduled);
+	CHECK(isp.fw_state == ISP_FW_OFF && !isp.fw_idle);
+	CHECK(halts == before_halts + 1 && idle_schedules == 1);
+	isp.fw_state = ISP_FW_RUNNING;
+	isp.ipc_error = 0;
+	isp.fw_idle = true;
+	sync_error = -EIO;
+	apple_isp_firmware_shutdown(&isp);
+	CHECK(isp.fw_state == ISP_FW_OFF && !isp.fw_idle);
+	CHECK(halts == before_halts + 2 && idle_schedules == 1);
+	/* Restart only after fresh channels, with full receive turns restored. */
+	CHECK(isp.ipc_quiescing && isp.ipc_error == -EIO);
+	CHECK(!apple_isp_firmware_boot(&isp));
+	CHECK(entry_quiescing && stage3_quiescing);
+	CHECK(!isp.ipc_quiescing && !isp.ipc_error && isp.fw_state == ISP_FW_RUNNING);
+	incoming.remaining = 9;
+	refill = false;
+	receive_rounds = 0;
+	CHECK(apple_isp_isr_thread(isp.irq, &isp) == IRQ_HANDLED);
+	CHECK(!incoming.remaining && receive_rounds > 1);
 	puts("PASS: timeout, late ACK, shared writes, stop, boot and resident lifetime");
 	return 0;
 }

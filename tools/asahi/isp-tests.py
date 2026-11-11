@@ -53,6 +53,8 @@ def main():
     if args.suite == 'session':
         groups['isp-ipc.c'] += ['chan_rx_done', 'ipc_chan_handle']
         groups['isp-fw.c'] += ['apple_isp_isr_thread']
+        if 'void apple_isp_firmware_flush(' in inputs['isp-fw.c']:
+            groups['isp-fw.c'] += ['apple_isp_firmware_flush']
     bodies = {n: function(inputs[f], n) for f, names in groups.items() for n in names}
     if args.suite == 'session' and 'apple_isp_video_error(isp);' in bodies['apple_isp_isr_thread']:
         bodies = {'apple_isp_video_error': function(

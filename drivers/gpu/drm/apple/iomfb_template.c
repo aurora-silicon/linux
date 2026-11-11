@@ -430,6 +430,25 @@ DCP_THUNK_INOUT(dcp_set_power_state, dcpep_set_power_state,
 #endif
 
 /*
+ * Firmware 27 changes a fixed internal panel's picture through the swap
+ * geometry; the panel iBoot lit keeps its timing.  J815 rejects
+ * set_digital_out_mode for its single timing (0x8000000b) and never scans out
+ * afterwards, so keep the boot mode there (appledrm.fw27_panel_boot_mode).
+ */
+static bool __maybe_unused DCP_FW_NAME(dcp_fw27_keep_panel_mode)(struct apple_dcp *dcp)
+{
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+	int policy = READ_ONCE(fw27_panel_boot_mode);
+
+	if (policy == 0 || !dcp->main_display || !dcp_has_panel(dcp))
+		return false;
+	return policy > 0 || READ_ONCE(dcp->nr_modes) == 1;
+#else
+	return false;
+#endif
+}
+
+/*
  * abort_swaps_dcp and last_client_close have no verified H17P method numbers,
  * and the H17P table leaves them out.  Rather than send the firmware a record
  * it would decode as some other call, power-off and sleep skip both and go
@@ -3879,10 +3898,11 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 
 	dcp->swap_submit_timestamp = 0;
 
-	if (DCP_INHERIT_BOOT_MODE &&
+	if ((DCP_INHERIT_BOOT_MODE || DCP_FW_NAME(dcp_fw27_keep_panel_mode)(dcp)) &&
 	    dcp->hw.iomfb_method_profile !=
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
-		dev_dbg(dcp->dev, "inheriting the bootloader's display mode\n");
+		dev_info(dcp->dev, "inheriting the bootloader's display mode (%u fixed timing(s))\n",
+			 READ_ONCE(dcp->nr_modes));
 		complete_set_digital_out_mode(dcp, NULL, cookie);
 	} else
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
