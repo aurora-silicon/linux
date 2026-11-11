@@ -7,6 +7,7 @@
 #include <linux/ktime.h>
 #include <linux/miscdevice.h>
 #include <linux/poll.h>
+#include <linux/rwsem.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/types.h>
@@ -25,6 +26,15 @@ struct sep_bio_chardev {
 	int (*f_ready)(void *ctx);
 	bool registered;
 	int open_count;
+	/*
+	 * Concurrent devices run ioctls without @lock, so an ioctl that sleeps
+	 * (a touch-gated signature waits up to a minute for a finger) does not
+	 * hold up open() or another caller's ioctl, such as the cancel that
+	 * ends it. @life keeps @ctx valid across such an ioctl: they hold it for
+	 * reading, unregister for writing.
+	 */
+	bool concurrent;
+	struct rw_semaphore life;
 };
 
 static struct sep_bio_chardev *from_file(struct file *file)
@@ -75,7 +85,16 @@ static long sep_bio_fop_ioctl(struct file *file, unsigned int cmd,
 				 unsigned long arg)
 {
 	struct sep_bio_chardev *d = from_file(file);
+	void *ctx;
 	long ret;
+
+	if (d->concurrent) {
+		down_read(&d->life);
+		ctx = READ_ONCE(d->ctx);
+		ret = ctx ? d->f_ioctl(ctx, cmd, arg) : -ENODEV;
+		up_read(&d->life);
+		return ret;
+	}
 
 	mutex_lock(&d->lock);
 	ret = d->ctx ? d->f_ioctl(d->ctx, cmd, arg) : -ENODEV;
@@ -116,12 +135,11 @@ static const struct file_operations sep_bio_fops = {
 	.poll = sep_bio_fop_poll,
 };
 
-/* @name must outlive the registration; the Rust side passes a &'static CStr. */
-void *sep_bio_register(const char *name, unsigned short mode, void *ctx,
-			  int (*f_open)(void *),
-			  void (*f_release)(void *),
-			  long (*f_ioctl)(void *, unsigned int, unsigned long),
-			  int (*f_ready)(void *))
+static void *__sep_bio_register(const char *name, unsigned short mode, void *ctx,
+				int (*f_open)(void *),
+				void (*f_release)(void *),
+				long (*f_ioctl)(void *, unsigned int, unsigned long),
+				int (*f_ready)(void *), bool concurrent)
 {
 	struct sep_bio_chardev *d;
 	int ret;
@@ -132,6 +150,8 @@ void *sep_bio_register(const char *name, unsigned short mode, void *ctx,
 
 	init_waitqueue_head(&d->wq);
 	mutex_init(&d->lock);
+	init_rwsem(&d->life);
+	d->concurrent = concurrent;
 	d->ctx = ctx;
 	d->f_open = f_open;
 	d->f_release = f_release;
@@ -154,6 +174,32 @@ void *sep_bio_register(const char *name, unsigned short mode, void *ctx,
 	return d;
 }
 
+/* @name must outlive the registration; the Rust side passes a &'static CStr. */
+void *sep_bio_register(const char *name, unsigned short mode, void *ctx,
+			  int (*f_open)(void *),
+			  void (*f_release)(void *),
+			  long (*f_ioctl)(void *, unsigned int, unsigned long),
+			  int (*f_ready)(void *))
+{
+	return __sep_bio_register(name, mode, ctx, f_open, f_release, f_ioctl,
+				  f_ready, false);
+}
+
+/*
+ * As sep_bio_register(), but ioctls run concurrently, without the device
+ * lock: f_ioctl does its own locking. Unregistering waits for the ioctls
+ * that are running.
+ */
+void *sep_bio_register_concurrent(const char *name, unsigned short mode,
+				  void *ctx, int (*f_open)(void *),
+				  void (*f_release)(void *),
+				  long (*f_ioctl)(void *, unsigned int, unsigned long),
+				  int (*f_ready)(void *))
+{
+	return __sep_bio_register(name, mode, ctx, f_open, f_release, f_ioctl,
+				  f_ready, true);
+}
+
 void sep_bio_unregister(void *dev)
 {
 	struct sep_bio_chardev *d = dev;
@@ -165,11 +211,14 @@ void sep_bio_unregister(void *dev)
 	if (d->registered)
 		misc_deregister(&d->misc);
 
+	/* Waits for running concurrent ioctls; none starts with ctx cleared. */
+	down_write(&d->life);
 	mutex_lock(&d->lock);
-	d->ctx = NULL;
+	WRITE_ONCE(d->ctx, NULL);
 	free_now = (d->open_count == 0);
-	/* The last close may free d as soon as the lifetime lock is dropped. */
 	wake_up_interruptible(&d->wq);
+	/* Before the mutex: the last close may free d once it is dropped. */
+	up_write(&d->life);
 	mutex_unlock(&d->lock);
 
 	if (free_now) {
@@ -201,3 +250,7 @@ __u64 sep_bio_boottime_ns(void)
 {
 	return ktime_get_boottime_ns();
 }
+
+#ifdef CONFIG_APPLE_SEP_KUNIT_TEST
+#include "bio_shim_test.c"
+#endif

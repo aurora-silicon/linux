@@ -223,6 +223,11 @@ void *sep_bio_register(const char *name, unsigned short mode, void *ctx,
 			  void (*f_release)(void *),
 			  long (*f_ioctl)(void *, unsigned int, unsigned long),
 			  int (*f_ready)(void *));
+void *sep_bio_register_concurrent(const char *name, unsigned short mode,
+				  void *ctx, int (*f_open)(void *),
+				  void (*f_release)(void *),
+				  long (*f_ioctl)(void *, unsigned int, unsigned long),
+				  int (*f_ready)(void *));
 void sep_bio_unregister(void *dev);
 void sep_bio_wake(void *dev);
 int sep_bio_capable_admin(void);

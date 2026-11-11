@@ -216,6 +216,15 @@ extern "C" {
         f_ioctl: Option<unsafe extern "C" fn(*mut c_void, c_uint, c_ulong) -> c_long>,
         f_ready: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
     ) -> *mut c_void;
+    fn sep_bio_register_concurrent(
+        name: *const c_char,
+        mode: u16,
+        ctx: *mut c_void,
+        f_open: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+        f_release: Option<unsafe extern "C" fn(*mut c_void)>,
+        f_ioctl: Option<unsafe extern "C" fn(*mut c_void, c_uint, c_ulong) -> c_long>,
+        f_ready: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+    ) -> *mut c_void;
     fn sep_bio_unregister(dev: *mut c_void);
     fn sep_bio_wake(dev: *mut c_void);
     fn sep_bio_capable_admin() -> c_int;
@@ -271,6 +280,40 @@ impl BioChardev {
         // registration, and the caller guarantees the same of `ctx`.
         let dev = unsafe {
             sep_bio_register(
+                name.as_char_ptr(),
+                mode,
+                ctx,
+                Some(f_open),
+                Some(f_release),
+                Some(f_ioctl),
+                Some(f_ready),
+            )
+        };
+        if dev.is_null() {
+            return Err(ENODEV);
+        }
+        Ok(BioChardev { dev })
+    }
+
+    /// As [`BioChardev::register`], but ioctls run concurrently, without the
+    /// shim's device lock, so one that sleeps does not hold up `open()` or
+    /// another caller's ioctl. `f_ioctl` must do its own locking. Dropping
+    /// the registration waits for the ioctls that are running.
+    ///
+    /// # Safety
+    /// As for [`BioChardev::register`].
+    pub(crate) unsafe fn register_concurrent(
+        name: &'static CStr,
+        mode: u16,
+        ctx: *mut c_void,
+        f_open: unsafe extern "C" fn(*mut c_void) -> c_int,
+        f_release: unsafe extern "C" fn(*mut c_void),
+        f_ioctl: unsafe extern "C" fn(*mut c_void, c_uint, c_ulong) -> c_long,
+        f_ready: unsafe extern "C" fn(*mut c_void) -> c_int,
+    ) -> Result<BioChardev> {
+        // SAFETY: as in `register`.
+        let dev = unsafe {
+            sep_bio_register_concurrent(
                 name.as_char_ptr(),
                 mode,
                 ctx,
