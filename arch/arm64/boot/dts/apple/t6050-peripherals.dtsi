@@ -43,6 +43,26 @@
 			};
 		};
 
+		/*
+		 * The video decoder (avd0): the M5's (T8142) Hibiscus layout. ADT reg[0]
+		 * 0x2108000000 + 0x1404000 at the arm-io offset; CM3 code and SRAM 0x14000
+		 * each, mailbox at +0x10a8000, ctrl at +0x1100000; IRQs 2417/2418.
+		 */
+		avd: avd@2309080000 {
+			compatible = "apple,t6050-avd", "apple,t8142-avd";
+			interrupts = <AIC_IRQ 0 2417 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 2418 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_avd_sys>;
+			resets = <&ps_avd_sys>;
+			reg = <0x23 0x09080000 0x0 0x14000>,
+			      <0x23 0x09094000 0x0 0x14000>,
+			      <0x23 0x090a8000 0x0 0x4000>,
+			      <0x23 0x09100000 0x0 0x10000>;
+			reg-names = "code", "sram", "mbox", "ctrl";
+			iommus = <&avd_dart 0>, <&avd_dart 1>, <&avd_dart 2>;
+			status = "disabled";
+		};
+
 		avd_dart: iommu@2309020000 {
 			compatible = "apple,t6050-dart", "apple,t8110-dart";
 			reg = <0x23 0x09020000 0x0 0x20000>;
@@ -3233,20 +3253,6 @@
 		status = "disabled";
 	};
 
-#if defined(T6050_J714C) || defined(T6050_J714S) || defined(T6050_J716C) || defined(T6050_J716S) || defined(T6050_J775C) || defined(T6050_J775D) || defined(T6050_K114C) || defined(T6050_K114S) || defined(T6050_K116C) || defined(T6050_K116S)
-	avd0: video-decoder@2308000000 {
-		compatible = "apple,t6050-avd", "apple,avd";
-		reg = <0x23 0x8000000 0x0 0x1404000>,
-		      <0x23 0x88090000 0x0 0x4000>;
-		interrupts = <AIC_IRQ 0 2417 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 0 2418 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&avd_dart 0>, <&avd_dart 1>, <&avd_dart 2>;
-		power-domains = <&ps_avd_sys>;
-		clocks = <&peripheral_clocks 488>;
-		status = "disabled";
-	};
-#endif
-
 	sgx: gpu@2300000000 {
 		compatible = "apple,agx-t6050";
 		reg = <0x23 0x0 0x0 0x3fdc000>,
@@ -3508,19 +3514,6 @@
 		             <AIC_IRQ 0 1762 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&apr1_dart 0>;
 		power-domains = <&ps_prores>;
-		status = "disabled";
-	};
-#endif
-
-#if defined(T6050_J873S)
-	avd0: video-decoder@2308000000 {
-		compatible = "apple,t6050-avd", "apple,avd";
-		reg = <0x23 0x8000000 0x0 0x1404000>,
-		      <0x23 0x88090000 0x0 0x4000>;
-		interrupts = <AIC_IRQ 0 2417 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 0 2418 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_avd_sys>;
-		clocks = <&peripheral_clocks 488>;
 		status = "disabled";
 	};
 #endif
