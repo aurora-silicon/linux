@@ -230,6 +230,9 @@ struct dockchannel_hid {
 
 	/* Workqueue to asynchronously create HID devices */
 	struct workqueue_struct *new_iface_wq;
+
+	/* Held while one frame is written to the shared TX FIFO */
+	struct mutex tx_mutex;
 };
 
 static ssize_t apple_layout_id_show(struct device *dev,
@@ -353,7 +356,7 @@ static bool dchid_verify_checksum(struct dchid_hdr *hdr, void *data, u32 *checks
 	return *checksum == U32_MAX;
 }
 
-static int dchid_send(struct dchid_iface *iface, u32 flags, void *msg, size_t size)
+static int dchid_send_frame(struct dchid_iface *iface, u32 flags, void *msg, size_t size)
 {
 	u32 checksum = 0xffffffff;
 	size_t wsize = round_down(size, 4);
@@ -402,6 +405,23 @@ static int dchid_send(struct dchid_iface *iface, u32 flags, void *msg, size_t si
 		return ret;
 
 	return 0;
+}
+
+/*
+ * A frame goes out as several FIFO writes, and each interface has its own
+ * output lock, so frames for two interfaces could interleave in the shared
+ * FIFO. The MTP firmware then fails the frame checksum and crashes
+ * ("[dock ch tl]: xsum err"). Write whole frames only.
+ */
+static int dchid_send(struct dchid_iface *iface, u32 flags, void *msg, size_t size)
+{
+	struct dockchannel_hid *dchid = iface->dchid;
+	int ret;
+
+	mutex_lock(&dchid->tx_mutex);
+	ret = dchid_send_frame(iface, flags, msg, size);
+	mutex_unlock(&dchid->tx_mutex);
+	return ret;
 }
 
 static int dchid_cmd(struct dchid_iface *iface, u32 type, u32 req,
@@ -1597,6 +1617,7 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	}
 
 	dchid->dev = dev;
+	mutex_init(&dchid->tx_mutex);
 	stm = device_get_named_child_node(dev, "stm");
 	dchid->id_ready = !stm || !fwnode_device_is_available(stm);
 	fwnode_handle_put(stm);

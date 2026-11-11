@@ -1080,6 +1080,7 @@ int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
 s32 dcp_ext_backlight_value(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
+extern int fw27_panel_boot_mode;
 
 /*
  * The desktop 26.6 panel takes VRR_ENABLED on its live mode, through the

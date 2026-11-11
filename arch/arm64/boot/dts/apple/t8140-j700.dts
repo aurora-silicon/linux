@@ -26,6 +26,9 @@
 		keyboard = &keyboard;
 		sep = &sep;
 		serial0 = &serial0;
+		serial1 = &uart4;
+		serial2 = &uart5;
+		serial3 = &uart0;
 		pmp = &pmp;
 		/* First the RTC that can wake the system */
 		rtc0 = &pmu_rtc;
@@ -464,6 +467,12 @@
 };
 
 &serial0 {
+	status = "okay";
+};
+
+&uart0 {
+	/* The PMGR clock provider is not enabled on this SoC yet. */
+	clocks = <&clkref>, <&clkref>;
 	status = "okay";
 };
 

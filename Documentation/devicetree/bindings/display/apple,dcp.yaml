@@ -524,7 +524,13 @@ allOf:
             - const: 27
             - const: 0
             - const: 0
-    else:
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              enum: ['apple,t6050-dcp', 'apple,t6050-dcpext', 'apple,t8142-dcp']
+    then:
       properties:
         clocks:
           maxItems: 2
@@ -533,6 +539,26 @@ allOf:
             - const: clock-154
             - const: clock-194
         apple,clock-ids: false
+        apple,firmware-physical-regs: false
+  # T8142 runs both 26.x and 27.0 DCP firmware. The 26.x paths use the first
+  # clock; firmware 27 asks for the provider clocks of apple,clock-ids by
+  # index, as firmware-0 and firmware-1.
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8142-dcp
+    then:
+      properties:
+        clocks:
+          minItems: 1
+          maxItems: 3
+        clock-names:
+          minItems: 1
+          items:
+            - const: clock-154
+            - const: firmware-0
+            - const: firmware-1
         apple,firmware-physical-regs: false
   - if:
       not:

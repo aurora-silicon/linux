@@ -737,7 +737,7 @@ impl crate::g17::queue::render::Host for Host<'_> {
         let result = self.firmware.primary.notify(
             (0x83 << crate::g17::MSG_TYPE_SHIFT)
                 | u64::from(priority) << 2
-                | if m5 { 2 } else { 0 },
+                | if m5 && !crate::g17::J813_FORMS.load(core::sync::atomic::Ordering::Relaxed) { 2 } else { 0 },
         );
         if result.is_err() {
             self.firmware.primary.state.shared.lose_device_quietly();

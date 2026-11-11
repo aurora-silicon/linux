@@ -62,12 +62,18 @@ properties:
     maxItems: 16
 
   memory-region:
-    maxItems: 1
-    description: Firmware heap region provided by the bootloader
+    minItems: 1
+    maxItems: 3
+    description:
+      Firmware heap region provided by the bootloader, then the firmware text
+      and data segments it loaded
 
   memory-region-names:
+    minItems: 1
     items:
       - const: heap
+      - const: text
+      - const: data
 
   apple,dart-vm-size:
     $ref: /schemas/types.yaml#/definitions/uint64

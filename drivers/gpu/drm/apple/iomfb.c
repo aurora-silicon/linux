@@ -3357,13 +3357,21 @@ bool iomfb_apply_backlight_h17p(struct apple_dcp *dcp,
 					    dcp->brightness.maximum, false);
 		return true;
 	}
-	if (!transaction || !dcp->brightness.maximum)
+	if (!transaction || !dcp->brightness.maximum) {
+		/* The caller drops this present ("swap failed"): say why. */
+		dev_warn_ratelimited(dcp->dev,
+				     "present dropped: transaction %d brightness maximum %u\n",
+				     !!transaction, dcp->brightness.maximum);
 		return false;
+	}
 	for (i = 0; i < SWAP_SURFACES; i++)
 		have_surface |= !request->surf_null[i];
 	ret = dcp_backlight_prepare(dcp, have_surface, &present);
-	if (ret && ret != -EALREADY)
+	if (ret && ret != -EALREADY) {
+		dev_warn_ratelimited(dcp->dev,
+				     "present dropped: backlight prepare %d\n", ret);
 		return false;
+	}
 	if (!ret) {
 		transaction->backlight = present;
 		transaction->backlight_reserved = true;

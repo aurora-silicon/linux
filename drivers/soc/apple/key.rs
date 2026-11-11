@@ -1408,7 +1408,7 @@ impl SepData {
                     out.get(at..at + 4)
                         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                 };
-                dev_info!(
+                dev_dbg!(
                     self.dev,
                     "sep-key: signing constraint on the new context: status {}, {} reply bytes, satisfied {:?}, first requirement {:?}\n",
                     reply.status,
@@ -1417,7 +1417,7 @@ impl SepData {
                     word(4)
                 );
             }
-            None => dev_info!(self.dev, "sep-key: signing constraint check got no answer\n"),
+            None => dev_dbg!(self.dev, "sep-key: signing constraint check got no answer\n"),
         }
     }
 
@@ -1470,7 +1470,7 @@ impl SepData {
         let end = grant.run(|op, blob, digest, sealed| self.key_op_in(bag, op, blob, digest, sealed, Some(evaluation)));
         let status = self.last_key_status.load(Relaxed) as i32;
         let ok = matches!(end, GrantEnd::Done(Ok(_)));
-        dev_info!(
+        dev_dbg!(
             self.dev,
             "sep-key: touch-gated {:?} {}: {} (enclave status {})\n",
             op,
@@ -1509,7 +1509,7 @@ impl SepData {
         };
         let r2 = self.key_touch_op(second, &blob, &digest, &sealed, evaluation).map(crate::Secret);
         let status2 = self.last_key_status.load(Relaxed) as i32;
-        dev_info!(
+        dev_info_ratelimited!(
             self.dev,
             "sep-key: self-test: second operation ({:?}) in the same matched context: {} (enclave status {})\n",
             second,
@@ -1546,7 +1546,7 @@ impl SepData {
         };
         let r = self.user_key_sign(&blob, &digest, Some(evaluation)).map(crate::Secret);
         let status = self.last_key_status.load(Relaxed) as i32;
-        dev_info!(
+        dev_info_ratelimited!(
             self.dev,
             "sep-key: self-test: signature with the deleted matched context: {} (enclave status {})\n",
             (if r.is_ok() { "SIGNED" } else { "refused" }),
@@ -1592,7 +1592,7 @@ impl SepData {
         *self.key_touch.lock() = Some(job);
         self.key_touch_cancel.store(false, Relaxed);
         self.key_touch_active.store(true, Relaxed);
-        dev_info!(self.dev, "sep-key: waiting for a Touch ID match ({:?})\n", op);
+        dev_dbg!(self.dev, "sep-key: waiting for a Touch ID match ({:?})\n", op);
         let deadline = crate::shim::boottime_ns().saturating_add(TOUCH_WAIT_MS * 1_000_000);
         let ended = loop {
             if self.shutting_down.load(Relaxed) {
@@ -1637,7 +1637,7 @@ impl SepData {
         self.key_touch_cancel.store(false, Relaxed);
         // Whatever is left of the grant goes with the job.
         let job = self.key_touch.lock().take().ok_or(EIO)?;
-        dev_info!(
+        dev_dbg!(
             self.dev,
             "sep-key: touch-gated {:?} ended: {:?}, result {}\n",
             op,
@@ -1671,7 +1671,7 @@ impl SepData {
                 return None;
             }
             let out = self.sks_send(self.sks_req_verify_secret(du.special_handle(), stored.secret(), &handle))?;
-            dev_info!(self.dev, "sep-key: self-test: passcode credential added, status {}\n", out.reply.status);
+            dev_info_ratelimited!(self.dev, "sep-key: self-test: passcode credential added, status {}\n", out.reply.status);
             (out.reply.status == 0).then_some(())
         })();
         if ok.is_none() {
@@ -1726,7 +1726,7 @@ impl SepData {
             req.handle[..blob.len()].copy_from_slice(&blob);
             req.handle_len = blob.len() as u32;
             req.result = 0;
-            dev_info!(self.dev, "sep-key: self-test 11: key under uid {}'s bag, record {} bytes\n", uid, blob.len());
+            dev_info_ratelimited!(self.dev, "sep-key: self-test 11: key under uid {}'s bag, record {} bytes\n", uid, blob.len());
             return Ok(());
         }
         let len = req.handle_len as usize;
@@ -1750,7 +1750,7 @@ impl SepData {
         self.close_unlock_evaluation(&ctx);
         req.result = r.err().map(|e| e.to_errno()).unwrap_or(0);
         req.enclave_status = self.last_key_status.load(Relaxed) as i32;
-        dev_info!(
+        dev_info_ratelimited!(
             self.dev,
             "sep-key: self-test 12: saved key under uid {}'s bag: verify {} -> {} ({})\n",
             uid,
@@ -1806,12 +1806,12 @@ impl SepData {
                     }
                     Ok(false) => {}
                     Err(e) => {
-                        dev_info!(self.dev, "sep-key: self-test 10: timer fire returned {:?}\n", e);
+                        dev_info_ratelimited!(self.dev, "sep-key: self-test 10: timer fire returned {:?}\n", e);
                         break;
                     }
                 }
             }
-            dev_info!(
+            dev_info_ratelimited!(
                 self.dev,
                 "sep-key: self-test 10: bag locked by the store: {} after {} s\n",
                 locked,
@@ -1837,7 +1837,7 @@ impl SepData {
             req.digest[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
         }
         req.result = 0;
-        dev_info!(
+        dev_info_ratelimited!(
             self.dev,
             "sep-key: self-test 10, uid {}'s bag: phase {} -> sign {}; locked (phase {}): stale credential {}, none {}, fresh password credential {}; unlocked (phase {}): {}\n",
             uid, r[5], r[0], r[6], r[1], r[2], r[3], r[7], r[4]
@@ -1861,7 +1861,7 @@ impl SepData {
             Ok(b) => b,
             Err(e) => {
                 pw.fill(0);
-                dev_info!(self.dev, "sep-key: self-test: key under uid {}'s bag not created ({:?})\n", uid, e);
+                dev_info_ratelimited!(self.dev, "sep-key: self-test: key under uid {}'s bag not created ({:?})\n", uid, e);
                 return Err(e);
             }
         };
@@ -1900,7 +1900,7 @@ impl SepData {
         let (ctx2, v2) = second?;
         (req.result2, req.enclave_status2) = sign(&ctx2);
         self.close_unlock_evaluation(&ctx2);
-        dev_info!(
+        dev_info_ratelimited!(
             self.dev,
             "sep-key: self-test {}: key under uid {}'s bag: first ({}) verify {} -> {} ({}); second ({}) verify {} -> {} ({})\n",
             req.mode,
@@ -1948,7 +1948,7 @@ impl SepData {
         req.result = r.err().map(|e| e.to_errno()).unwrap_or(0);
         req.enclave_status = self.last_key_status.load(Relaxed) as i32;
         self.close_unlock_evaluation(&ctx);
-        dev_info!(
+        dev_info_ratelimited!(
             self.dev,
             "sep-key: self-test presence key with a credential from uid {}'s bag: verify status {}, signature {} (enclave status {})\n",
             uid,
@@ -1975,7 +1975,7 @@ impl SepData {
         let ctx = self.open_unlock_evaluation(user).ok_or(EIO)?;
         (req.result2, req.enclave_status2) = record(self.user_key_sign(&blob, &digest, Some(&ctx)), self);
         self.close_unlock_evaluation(&ctx);
-        dev_info!(
+        dev_info_ratelimited!(
             self.dev,
             "sep-key: self-test presence probe: bag-secret context {} (enclave status {}), unsatisfied context {} (enclave status {})\n",
             (if req.result == 0 { "SIGNED" } else { "refused" }),
@@ -2032,7 +2032,7 @@ impl SepData {
                     b"ock" => out.windows(32).any(|w| w == z),
                     _ => !out.is_empty(),
                 };
-            dev_info!(
+            dev_info_ratelimited!(
                 self.dev,
                 "sep-key: self-test decrypt probe: {}: {}: {} (enclave status {}, {} reply bytes)\n",
                 name,
@@ -2066,7 +2066,7 @@ impl SepData {
             let bits = match self.key_unseal_context_probe_key(name, *free, &secret) {
                 Ok(b) => b,
                 Err(e) => {
-                    dev_info!(self.dev, "sep-key: self-test decrypt probe: {}: key failed ({:?})\n", name, e);
+                    dev_info_ratelimited!(self.dev, "sep-key: self-test decrypt probe: {}: key failed ({:?})\n", name, e);
                     0
                 }
             };
@@ -2104,13 +2104,13 @@ impl SepData {
         let (handle, verify) = self.key_context_for(designated_id(bag), Some((bag.special_handle(), pw)))?;
         let ctx = OwnedContext::new(self, handle);
         let r = if verify != 0 {
-            dev_info!(self.dev, "sep-key: uid {}'s password refused by the enclave (status {})\n", uid, verify);
+            dev_info_refusal!(self.dev, "sep-key: uid {}'s password refused by the enclave (status {})\n", uid, verify);
             Err(EACCES)
         } else {
             self.key_op_in(Some(uid), op, blob, digest, sealed, Some(ctx.handle()))
         };
         drop(ctx);
-        dev_info!(
+        dev_dbg!(
             self.dev,
             "sep-key: password-gated {:?} under uid {}'s bag: {}\n",
             op,
@@ -2231,7 +2231,7 @@ impl SepData {
         };
         req.result = result;
         req.enclave_status = status;
-        dev_info!(
+        dev_info_ratelimited!(
             self.dev,
             "sep-key: self-test mode {}: {} (enclave status {})\n",
             req.mode,
@@ -2288,7 +2288,7 @@ impl SepData {
                 // like pulling a security key, it can only make a request fail.
                 if self.key_touch_active.load(Relaxed) {
                     self.key_touch_cancel.store(true, Relaxed);
-                    dev_info!(self.dev, "sep-key: waiting operation cancelled\n");
+                    dev_dbg!(self.dev, "sep-key: waiting operation cancelled\n");
                 }
                 Ok(())
             }
@@ -2333,7 +2333,7 @@ impl SepData {
                 let blob = self.user_key_create_in_bag(bag, ed.as_deref())?;
                 req.public_key = SepData::user_key_public(&blob)?;
                 req.handle_len = encode_user_handle(&blob, req.uid, plain, &mut req.handle)? as u32;
-                dev_info!(
+                dev_info_ratelimited!(
                     self.dev,
                     "sep-key: {} key under uid {}'s bag\n",
                     (if plain { "bag-unlocked-only" } else { "user-presence" }),

@@ -288,12 +288,24 @@ pub(super) enum Role {
     Secondary = 1,
 }
 
+/// RTKit's crash log endpoint, over which the host also publishes a log buffer of its own.
+const EP_CRASHLOG: u8 = 0x01;
 /// RTKit endpoint of firmware messages: initialization, its acknowledgement and event
 /// notifications.
 const EP_FIRMWARE: u8 = 0x20;
 /// RTKit endpoint of host notifications to the firmware.
 const EP_DOORBELL: u8 = 0x21;
 
+/// Host message on the crashlog endpoint that hands a coprocessor a log buffer of the host's
+/// own, which it reaches through its kernel window: the size in 4 KiB pages and the buffer's
+/// address, in the fields of a buffer request but under a type of its own. macOS 27.0 sends it
+/// to both coprocessors once they run, after RTKit has echoed each one's request for the buffer
+/// in its own data segment; without it the firmware asks for that buffer a second time.
+const MSG_LOG_BUFFER: u64 = 0x9 << 52;
+/// Bit position of [`MSG_LOG_BUFFER`]'s size, in 4 KiB pages.
+const MSG_LOG_BUFFER_PAGES_SHIFT: u32 = 44;
+/// Address bits of a buffer that [`MSG_LOG_BUFFER`] carries.
+const MSG_LOG_BUFFER_ADDR_MASK: u64 = (1 << 44) - 1;
 /// Bit position of the type field of firmware messages.
 const MSG_TYPE_SHIFT: u32 = 48;
 /// Host message handing a coprocessor the address of its initialization root.
@@ -302,10 +314,23 @@ const MSG_INITDATA: u64 = 0x81 << MSG_TYPE_SHIFT;
 const MSG_INITDATA_ADDR_MASK: u64 = (1 << 44) - 1;
 /// Firmware message acknowledging [`MSG_INITDATA`].
 const MSG_INITDATA_ACK: u64 = 0x09;
+/// Host message on the doorbell endpoint that answers [`MSG_INITDATA_ACK`]: the acknowledgement
+/// type with the host bit. macOS 27.0 on the J813 sends it to both roles a few milliseconds after
+/// it hands them their initialization root (aura's trace: 0x89000000000000 on endpoint 0x21).
+const MSG_INITDATA_DONE: u64 = 0x89 << MSG_TYPE_SHIFT;
 /// Firmware message announcing new records in the event and trace rings.
 const MSG_EVENTS: u64 = 0x42 << MSG_TYPE_SHIFT;
 /// Primary processor notification for newly published device-control records.
 const MSG_CONTROL_NOTIFY: u64 = (0x84 << MSG_TYPE_SHIFT) | 0x11;
+
+/// The board is the J813 ([`fw::m5::initdata::Board::j813_forms`]), whose firmware (common
+/// 26A428) takes work in the G17P forms. macOS 27.0 there submits through the doorbell alone: it
+/// never writes the M5 Pro's host port (sgx+0x4090/0x4098) or the KSM queue registers
+/// (sgx+0x21068..0x21080), and rings render doorbells as 0x83 | priority << 2 (0 and 8 in its
+/// trace; compute is | 2).
+pub(crate) static J813_FORMS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Host message, sent to both coprocessors once both are initialized, ending the power-on
 /// transition. The firmware then retires the opening device-control records.
 const MSG_POWER_ON_DONE: u64 = 0x89 << MSG_TYPE_SHIFT;
@@ -634,6 +659,15 @@ impl Coprocessor {
         self.cpu.start()?;
         self.running = true;
         self.rtkit.with(|rtkit| rtkit.boot())
+    }
+
+    /// Hands the firmware the host's log buffer ([`MSG_LOG_BUFFER`]).
+    fn publish_log_buffer(&self, va: u64, size: usize) -> Result {
+        let msg = MSG_LOG_BUFFER
+            | (((size >> 12) as u64) << MSG_LOG_BUFFER_PAGES_SHIFT)
+            | (va & MSG_LOG_BUFFER_ADDR_MASK);
+        trace::message(trace::MAILBOX, msg);
+        self.rtkit.send(EP_CRASHLOG, msg)
     }
 
     /// Stops the CPU. The firmware keeps its state, but no longer runs.
@@ -1533,6 +1567,8 @@ pub(crate) struct Gpu {
     _capacity: Pin<KBox<kernel::debugfs::File<capacity::View>>>,
     _reports: Pin<KBox<kernel::debugfs::File<reports::View>>>,
     _power: Pin<KBox<kernel::debugfs::File<reports::PowerView>>>,
+    _firmware_log: Pin<KBox<kernel::debugfs::File<reports::FirmwareLogView>>>,
+    _hardware_data: Pin<KBox<kernel::debugfs::File<reports::HardwareDataView>>>,
 }
 
 impl Gpu {
@@ -1579,6 +1615,27 @@ impl Gpu {
         let m5 = cfg.profile.is_m5();
         if m5 {
             let board = cfg.m5.ok_or(EINVAL)?;
+            J813_FORMS.store(board.j813_forms(), core::sync::atomic::Ordering::Relaxed);
+            // Hold the J813's GFX power domain for the session, as the G15 and G16 paths do
+            // for theirs. Without a hold genpd gates it once it finds no active consumer, and
+            // the GPU's cores can never come up: ps_gfx reads target 0xf with actual 0 while
+            // the coprocessors run out of their own always-on island and report the GPU busy.
+            if cfg.chip_id == 0x8142 {
+                extern "C" {
+                    fn asahi_j813_hold_power(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+                    fn asahi_j813_power_on_gfx() -> core::ffi::c_int;
+                }
+                // SAFETY: `dev` is this probe's device; runtime-PM accounting has no other
+                // requirement.
+                kernel::error::to_result(unsafe {
+                    asahi_j813_hold_power(pdev.as_ref().as_raw().cast())
+                })
+                .inspect_err(|e| dev_err!(dev.as_ref(), "M5: no GFX power hold: {:?}\n", e))?;
+                // SAFETY: the helper only ioremaps and pokes the T8142 PMGR GPU power-state
+                // register.
+                kernel::error::to_result(unsafe { asahi_j813_power_on_gfx() })
+                    .inspect_err(|e| dev_err!(dev.as_ref(), "M5: GFX domain not powered: {:?}\n", e))?;
+            }
             // The M5 layouts are sized for every core slot of the board, fused-off cores
             // included, so the GPU is matched on clusters and slots, not on enabled cores.
             if id.num_clusters != board.clusters || id.num_clusters * id.num_cores != board.gpu_cores
@@ -1728,6 +1785,14 @@ impl Gpu {
             directory.read_only_file(c"power", reports::PowerView(shared.clone())),
             GFP_KERNEL,
         )?;
+        let firmware_log = KBox::pin_init(
+            directory.read_only_file(c"firmware_log", reports::FirmwareLogView(shared.clone())),
+            GFP_KERNEL,
+        )?;
+        let hardware_data = KBox::pin_init(
+            directory.read_only_file(c"hardware_data", reports::HardwareDataView(shared.clone())),
+            GFP_KERNEL,
+        )?;
         let stats = Arc::new(
             crate::stats::StatsSnapshot {
                 g17_reader: Some(stats::Reader(shared.clone())),
@@ -1747,6 +1812,8 @@ impl Gpu {
                 _capacity: capacity,
                 _reports: reports,
                 _power: power,
+                _firmware_log: firmware_log,
+                _hardware_data: hardware_data,
             },
             GFP_KERNEL,
         )?;
@@ -1894,8 +1961,24 @@ impl Gpu {
         // link the tables of every lower range the M5 graph and its queues use first.
         uat.prepare_lower_tables(&initdata::InitData::m5_lower_links(
             uat.kernel_lower_dynamic_range(),
+            board.graph,
         ))
         .inspect_err(at("lower links"))?;
+        // The J813's firmware runs part of a render in context 0, whose user root is the kernel
+        // lower VM, and touches the render's metrics through their compact-window address
+        // there (InitData::bind_m5_metrics): link that window's table too.
+        if J813_FORMS.load(core::sync::atomic::Ordering::Relaxed) {
+            let compact = buffer::BlockGeometry::M5_COMPACT.start;
+            uat.prepare_lower_tables(&[compact..compact + mmu::UAT_PGSZ as u64])
+                .inspect_err(at("lower links"))?;
+        }
+        // The J813 in native order, from aura's trace of macOS 27.0 on that machine: the start
+        // control is written first (macOS does it at platform init), the coprocessors are started
+        // next, and the Fender gating is cleared only once both of them run -- not before them.
+        // The other boards prepare both after the coprocessor boot (prepare_m5_firmware).
+        if cfg.chip_id == 0x8142 {
+            regs.set_m5_start_control().inspect_err(at("M5 start control"))?;
+        }
         let primary = Coprocessor::new(pdev, dev, cfg, &uat, shared, Role::Primary)
             .inspect_err(|e| dev_err!(dev.as_ref(), "Primary coprocessor setup failed: {:?}\n", e))?;
         let secondary = Coprocessor::new(pdev, dev, cfg, &uat, shared, Role::Secondary)
@@ -1965,9 +2048,24 @@ impl Gpu {
         let session = &mut **retained;
         // M5 renders take 64-byte metrics records.
         session.queues.metrics = metrics_ids;
-        session.primary.boot().inspect_err(at("primary boot"))?;
-        let secondary = session.secondary.as_mut().ok_or(EINVAL)?;
-        secondary.boot().inspect_err(at("secondary boot"))?;
+        // The J813's macOS 27.0 starts GFX1's coprocessor first and GFX's 330 ms later (aura's
+        // trace), the same way round as the InitData it publishes below.
+        if cfg.chip_id == 0x8142 {
+            session.secondary.as_mut().ok_or(EINVAL)?.boot().inspect_err(at("secondary boot"))?;
+            session.primary.boot().inspect_err(at("primary boot"))?;
+        } else {
+            session.primary.boot().inspect_err(at("primary boot"))?;
+            session.secondary.as_mut().ok_or(EINVAL)?.boot().inspect_err(at("secondary boot"))?;
+        }
+        // Both coprocessors run: clear the J813's Fender gating here, where macOS 27.0 clears it
+        // (it reads 0x6 and writes 0 after both ASCs are running and the first mailbox exchange).
+        if cfg.chip_id == 0x8142 {
+            session
+                .bridge
+                .regs
+                .enable_g17_gating()
+                .inspect_err(at("G17 gating after the coprocessor boot"))?;
+        }
         // The firmware built its root and kernel-window tables while booting.
         session.uat.invalidate_reserved_tables();
         let root_entries = session
@@ -1999,21 +2097,45 @@ impl Gpu {
             .confirm_firmware_root_entries(root_entries)
             .inspect_err(at("root confirmation"))?;
         session.uat.mirror_secondary_root().inspect_err(at("secondary root"))?;
-        session
-            .bridge
-            .regs
-            .prepare_m5_firmware()
-            .inspect_err(at("M5 preparation"))?;
+        if cfg.chip_id == 0x8142 {
+            // The J813's log buffers, GFX1's first and then GFX's, in macOS 27.0's order and
+            // before any endpoint of theirs is started.
+            for role in [Role::Secondary, Role::Primary] {
+                let (va, size) = initdata::InitData::fw_log(role);
+                let coprocessor = match role {
+                    Role::Primary => &session.primary,
+                    Role::Secondary => session.secondary.as_ref().ok_or(EINVAL)?,
+                };
+                coprocessor.publish_log_buffer(va, size).inspect_err(at("log buffer"))?;
+            }
+        } else {
+            session
+                .bridge
+                .regs
+                .prepare_m5_firmware()
+                .inspect_err(at("M5 preparation"))?;
+        }
         let ack = shared.variant.init_ack;
-        session
-            .primary
-            .init(session.init.root_va(Role::Primary)?, ack)
-            .inspect_err(at("primary InitData"))?;
-        dev_info!(dev.as_ref(), "M5 primary initdata acknowledged\n");
-        let root_va = session.init.root_va(Role::Secondary)?;
+        let primary_root = session.init.root_va(Role::Primary)?;
+        let secondary_root = session.init.root_va(Role::Secondary)?;
+        // The J813's macOS publishes and acknowledges GFX1's InitData first, then GFX's (its
+        // 25G76 trace); the M5 Pro's graph starts with the primary.
+        if cfg.chip_id == 0x8142 {
+            let secondary = session.secondary.as_mut().ok_or(EINVAL)?;
+            secondary.init(secondary_root, ack).inspect_err(at("secondary InitData"))?;
+            secondary.notify(MSG_INITDATA_DONE)?;
+            dev_info!(dev.as_ref(), "M5 secondary initdata acknowledged\n");
+            session.primary.init(primary_root, ack).inspect_err(at("primary InitData"))?;
+            session.primary.notify(MSG_INITDATA_DONE)?;
+            dev_info!(dev.as_ref(), "M5 primary initdata acknowledged\n");
+        } else {
+            session.primary.init(primary_root, ack).inspect_err(at("primary InitData"))?;
+            dev_info!(dev.as_ref(), "M5 primary initdata acknowledged\n");
+            let secondary = session.secondary.as_mut().ok_or(EINVAL)?;
+            secondary.init(secondary_root, ack).inspect_err(at("secondary InitData"))?;
+            dev_info!(dev.as_ref(), "M5 secondary initdata acknowledged\n");
+        }
         let secondary = session.secondary.as_mut().ok_or(EINVAL)?;
-        secondary.init(root_va, ack).inspect_err(at("secondary InitData"))?;
-        dev_info!(dev.as_ref(), "M5 secondary initdata acknowledged\n");
         session.primary.notify(MSG_POWER_ON_DONE)?;
         secondary.notify(MSG_POWER_ON_DONE)?;
         Self::wait_for_opening(dev, &session.init, &session.primary, session.secondary.as_ref())

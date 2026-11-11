@@ -261,6 +261,20 @@ struct apple_isp_hw {
 
 	/* The xx24 setfiles' lens shading strides need zeroing (T8142). */
 	bool setfile_stride_fixup;
+
+	/*
+	 * Firmware that starts again (fw_restore) only with what the device
+	 * tree may lack: the DART address filter registers and the location
+	 * of the data segment. Without them it is kept resident instead.
+	 */
+	bool resident_fallback;
+
+	/*
+	 * Firmware that starts again stays up this long after a stream, so
+	 * that a stream started again soon, as applications do when they
+	 * reopen the camera, does not wait for another firmware start.
+	 */
+	unsigned int fw_idle_ms;
 };
 
 enum isp_sensor_id {
@@ -404,6 +418,9 @@ struct apple_isp {
 	} fw;
 	/* changes under video_lock once the video device is registered */
 	enum isp_fw_state fw_state;
+	/* firmware that starts again, idling until fw_idle_work stops it */
+	bool fw_idle;
+	struct delayed_work fw_idle_work;
 	/* the camera was detected; until then a deferred start is pending */
 	bool camera_detected;
 	/* configurations the firmware has, once a deferred start detected them */
@@ -422,6 +439,12 @@ struct apple_isp {
 	void *fw_data;
 	void *fw_data_copy;
 	size_t fw_data_size;
+	/* and the boot loader's heap memory, where it provides it */
+	void *fw_heap;
+	void *fw_heap_copy;
+	size_t fw_heap_size;
+	/* hw, as this device runs it (see apple_isp_select_hw()) */
+	struct apple_isp_hw hw_local;
 	struct isp_surf *log_surf;
 	struct isp_surf *bt_surf;
 	struct isp_surf *meta_surfs[ISP_MAX_BUFFERS];

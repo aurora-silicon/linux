@@ -663,6 +663,9 @@ impl G17Resources {
         &self,
         submission: &crate::g17::fw::m5::queue::HardwareSubmission,
     ) -> Result {
+        if crate::g17::J813_FORMS.load(core::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         let sgx = (&*sgx).as_view();
         for &(offset, value) in submission.writes() {
@@ -900,21 +903,21 @@ impl G17Resources {
         Ok(())
     }
 
-    /// Enable dynamic power gating of idle G17 GPU cores. The firmware expects this before it is
-    /// initialized.
-    /// Prepares the GPU for the M5 firmware before its initialization: sets bit 0 of the
-    /// firmware start control, which reads 0x30000 or 0x30001 until then, and enables dynamic
-    /// core power gating.
-    pub(crate) fn prepare_m5_firmware(&self) -> Result {
-        {
-            let sgx = self.sgx.try_access().ok_or(ENODEV)?;
-            let sgx = (&*sgx).as_view();
-            let value = sgx.try_read32(0xe90000)?;
-            if value != 0x30000 && value != 0x30001 {
-                return Err(EIO);
-            }
-            sgx.try_write32(value | 1, 0xe90000)?;
+    /// Sets bit 0 of the firmware start control, which reads 0x30000 or 0x30001 until then.
+    /// macOS writes it at platform init, long before the GPU's power-on and its coprocessors.
+    pub(crate) fn set_m5_start_control(&self) -> Result {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let sgx = (&*sgx).as_view();
+        let value = sgx.try_read32(0xe90000)?;
+        if value != 0x30000 && value != 0x30001 {
+            return Err(EIO);
         }
+        sgx.try_write32(value | 1, 0xe90000)
+    }
+
+    /// Prepares the GPU for the M5 firmware: the start control, then dynamic core power gating.
+    pub(crate) fn prepare_m5_firmware(&self) -> Result {
+        self.set_m5_start_control()?;
         self.enable_g17_gating()
     }
 
