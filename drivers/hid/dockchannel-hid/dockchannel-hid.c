@@ -877,48 +877,10 @@ static void dchid_close(struct hid_device *hdev)
 	WRITE_ONCE(iface->open, false);
 }
 
-/*
- * The K116s MTP firmware (AppleMTPFirmwareMac-6310.85.7) describes the
- * multi-touch interface's one input report with a 4-byte Report Size of
- * 0x80000 bits (64 KiB), which the HID core refuses (16384 bits at most), so
- * no driver can bind and the firmware upload a bind triggers never happens.
- * The report's size is not used by the transport: the MTP's reports arrive
- * through raw_event with their own framing. Clamp any such item to the
- * maximum the core accepts, in place, so the item layout stays the same.
- */
-static void dchid_clamp_report_size(struct hid_device *hdev, u8 *desc, size_t len)
-{
-	size_t i = 0;
-
-	while (i < len) {
-		u8 hdr = desc[i], size = hdr & 3, type = (hdr >> 2) & 3, tag = hdr >> 4;
-
-		if (hdr == 0xfe) { /* long item */
-			if (i + 2 >= len)
-				return;
-			i += 3 + desc[i + 1];
-			continue;
-		}
-		if (size == 3)
-			size = 4;
-		/* Global item, Report Size, 4-byte value */
-		if (type == 1 && tag == 7 && size == 4 && i + 4 < len) {
-			u32 val = get_unaligned_le32(&desc[i + 1]);
-
-			if (val > 16384) {
-				hid_info(hdev, "clamping report size %u to 16384 bits\n", val);
-				put_unaligned_le32(16384, &desc[i + 1]);
-			}
-		}
-		i += 1 + size;
-	}
-}
-
 static int dchid_parse(struct hid_device *hdev)
 {
 	struct dchid_iface *iface = hdev->driver_data;
 
-	dchid_clamp_report_size(hdev, iface->hid_desc, iface->hid_desc_len);
 	return hid_parse_report(hdev, iface->hid_desc, iface->hid_desc_len);
 }
 
@@ -1049,6 +1011,51 @@ static int dchid_create_interface(struct dchid_iface *iface)
 	return queue_work(iface->dchid->new_iface_wq, &iface->create_work);
 }
 
+/* hid-core rejects any Report Size above this (see hid_parser_global()). */
+#define DCHID_MAX_REPORT_SIZE	16384
+
+/*
+ * The T6050 multi-touch firmware declares its raw touch report as one item of
+ * 0x80000 bits. The magicmouse driver reads those reports in raw_event() and
+ * never looks at the field layout, so clamp every Report Size item to what
+ * hid-core accepts instead of failing the whole interface.
+ */
+static void dchid_clamp_report_sizes(struct dchid_iface *iface, u8 *desc, size_t len)
+{
+	size_t i = 0;
+
+	while (i < len) {
+		u8 prefix = desc[i];
+		size_t n = prefix & 3;
+		u32 val = 0;
+		size_t j;
+
+		if (prefix == 0xfe) {
+			if (i + 1 >= len)
+				return;
+			i += 3 + desc[i + 1];
+			continue;
+		}
+		if (n == 3)
+			n = 4;
+		if (i + 1 + n > len)
+			return;
+
+		if ((prefix & 0xfc) == 0x74 && n >= 2) {
+			for (j = 0; j < n; j++)
+				val |= (u32)desc[i + 1 + j] << (8 * j);
+			if (val > DCHID_MAX_REPORT_SIZE) {
+				dev_info(iface->dchid->dev,
+					 "%s: clamping Report Size %u to %u\n",
+					 iface->name, val, DCHID_MAX_REPORT_SIZE);
+				for (j = 0; j < n; j++)
+					desc[i + 1 + j] = (DCHID_MAX_REPORT_SIZE >> (8 * j)) & 0xff;
+			}
+		}
+		i += 1 + n;
+	}
+}
+
 static void dchid_handle_descriptor(struct dchid_iface *iface, void *hid_desc, size_t desc_len)
 {
 	if (iface->hid) {
@@ -1062,6 +1069,7 @@ static void dchid_handle_descriptor(struct dchid_iface *iface, void *hid_desc, s
 		return;
 
 	iface->hid_desc_len = desc_len;
+	dchid_clamp_report_sizes(iface, iface->hid_desc, desc_len);
 }
 
 static void dchid_handle_ready(struct dockchannel_hid *dchid, void *data, size_t length)
