@@ -1797,6 +1797,13 @@
 						remote-endpoint = <&dwc3_0_hs>;
 					};
 				};
+
+				port@1 {
+					reg = <1>;
+					typec0_connector_ss: endpoint {
+						remote-endpoint = <&atcphy0_ss>;
+					};
+				};
 			};
 		};
 	};
@@ -1837,6 +1844,13 @@
 						remote-endpoint = <&dwc3_1_hs>;
 					};
 				};
+
+				port@1 {
+					reg = <1>;
+					typec1_connector_ss: endpoint {
+						remote-endpoint = <&atcphy1_ss>;
+					};
+				};
 			};
 		};
 	};
@@ -1870,14 +1884,46 @@
 						remote-endpoint = <&dwc3_2_hs>;
 					};
 				};
+
+				port@1 {
+					reg = <1>;
+					typec2_connector_ss: endpoint {
+						remote-endpoint = <&atcphy2_ss>;
+					};
+				};
 			};
 		};
 	};
 };
 
-/* The left-back port, USB 2 as the other two. */
+/*
+ * USB 3 on the three USB-C ports. The loader appends the PHY and controller
+ * tunables from the ADT, as on the M4 Pro, and disables a port it can't tune.
+ */
 &atcphy0 {
-	apple,tunable-usb2-host = <0x8 0x7003 0x3>;
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			atcphy0_ss: endpoint {
+				remote-endpoint = <&typec0_connector_ss>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			atcphy0_usb3: endpoint {
+				remote-endpoint = <&dwc3_0_ss>;
+			};
+		};
+	};
+};
+
+&atcphy0_mbox {
 	status = "okay";
 };
 
@@ -1890,15 +1936,6 @@
 };
 
 &dwc3_0 {
-	maximum-speed = "high-speed";
-	phys = <&atcphy0 PHY_TYPE_USB2>;
-	phy-names = "usb2-phy";
-	apple,tunable-gbl-host = <0x4 0x0001ef00 0x00002f00>, <0x1c 0x00000100 0x0>,
-		<0x2c 0x000a07ff 0x000800c8>, <0x100 0x02000100 0x02000100>,
-		<0x504 0x00001000 0x0>, <0x528 0xff0000ff 0x06000006>,
-		<0x52c 0xff0000ff 0x08000008>, <0x538 0x00000800 0x00000800>,
-		<0x580 0xffffffff 0x6f000006>;
-	apple,tunable-cfg-host = <0x20 0xff 0x1b>;
 	status = "okay";
 
 	ports {
@@ -1911,11 +1948,40 @@
 				remote-endpoint = <&typec0_connector_hs>;
 			};
 		};
+
+		port@1 {
+			reg = <1>;
+			dwc3_0_ss: endpoint {
+				remote-endpoint = <&atcphy0_usb3>;
+			};
+		};
 	};
 };
 
 &atcphy1 {
-	apple,tunable-usb2-host = <0x8 0x7003 0x3>;
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			atcphy1_ss: endpoint {
+				remote-endpoint = <&typec1_connector_ss>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			atcphy1_usb3: endpoint {
+				remote-endpoint = <&dwc3_1_ss>;
+			};
+		};
+	};
+};
+
+&atcphy1_mbox {
 	status = "okay";
 };
 
@@ -1928,15 +1994,6 @@
 };
 
 &dwc3_1 {
-	maximum-speed = "high-speed";
-	phys = <&atcphy1 PHY_TYPE_USB2>;
-	phy-names = "usb2-phy";
-	apple,tunable-gbl-host = <0x4 0x0001ef00 0x00002f00>, <0x1c 0x00000100 0x0>,
-		<0x2c 0x000a07ff 0x000800c8>, <0x100 0x02000100 0x02000100>,
-		<0x504 0x00001000 0x0>, <0x528 0xff0000ff 0x06000006>,
-		<0x52c 0xff0000ff 0x08000008>, <0x538 0x00000800 0x00000800>,
-		<0x580 0xffffffff 0x6f000006>;
-	apple,tunable-cfg-host = <0x20 0xff 0x1b>;
 	status = "okay";
 
 	ports {
@@ -1949,11 +2006,40 @@
 				remote-endpoint = <&typec1_connector_hs>;
 			};
 		};
+
+		port@1 {
+			reg = <1>;
+			dwc3_1_ss: endpoint {
+				remote-endpoint = <&atcphy1_usb3>;
+			};
+		};
 	};
 };
 
 &atcphy2 {
-	apple,tunable-usb2-host = <0x8 0x7003 0x3>;
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			atcphy2_ss: endpoint {
+				remote-endpoint = <&typec2_connector_ss>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			atcphy2_usb3: endpoint {
+				remote-endpoint = <&dwc3_2_ss>;
+			};
+		};
+	};
+};
+
+&atcphy2_mbox {
 	status = "okay";
 };
 
@@ -1966,15 +2052,6 @@
 };
 
 &dwc3_2 {
-	maximum-speed = "high-speed";
-	phys = <&atcphy2 PHY_TYPE_USB2>;
-	phy-names = "usb2-phy";
-	apple,tunable-gbl-host = <0x4 0x0001ef00 0x00002f00>, <0x1c 0x00000100 0x0>,
-		<0x2c 0x000a07ff 0x000800c8>, <0x100 0x02000100 0x02000100>,
-		<0x504 0x00001000 0x0>, <0x528 0xff0000ff 0x06000006>,
-		<0x52c 0xff0000ff 0x08000008>, <0x538 0x00000800 0x00000800>,
-		<0x580 0xffffffff 0x6f000006>;
-	apple,tunable-cfg-host = <0x20 0xff 0x1b>;
 	status = "okay";
 
 	ports {
@@ -1985,6 +2062,13 @@
 			reg = <0>;
 			dwc3_2_hs: endpoint {
 				remote-endpoint = <&typec2_connector_hs>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			dwc3_2_ss: endpoint {
+				remote-endpoint = <&atcphy2_usb3>;
 			};
 		};
 	};
@@ -2625,5 +2709,138 @@
 
 /* The QSPI controller cannot probe while its power state is disabled. */
 &ps_qspi {
+	status = "okay";
+};
+
+/*
+ * DisplayPort/HDMI audio, as on the M4 Pro boards (t6040-j616s-dpaudio.dtsi).
+ * The J614c's ADT has the J616s's: dcpext0's audio is dp-audio1 (SIO DMA
+ * channel 0x66) and dcpext1's is dp-audio2 (0x68), and the PMGR has UART_P
+ * (0x1a0) and DPA_P (0x1a8) under SIO, and DPA1 (0x238) and DPA2 (0x240)
+ * under DPA_P. The SIO stays disabled here: the loader enables it once it has
+ * reserved the firmware iBoot loaded (it finds it by the alias).
+ */
+&pmgr {
+	ps_uart_p: power-controller@1a0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1a0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "uart_p";
+		power-domains = <&ps_sio>;
+	};
+
+	ps_dpa_p: power-controller@1a8 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1a8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dpa_p";
+		power-domains = <&ps_sio>;
+		apple,always-on;
+	};
+
+	ps_dpa1: power-controller@238 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x238 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dpa1";
+		power-domains = <&ps_dpa_p>;
+	};
+
+	ps_dpa2: power-controller@240 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x240 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dpa2";
+		power-domains = <&ps_dpa_p>;
+	};
+};
+
+/ {
+	aliases {
+		sio = &sio;
+	};
+
+	dpaudio1: audio-controller-1 {
+		compatible = "apple,t6041-dpaudio", "apple,dpaudio";
+		dmas = <&sio 0x66>;
+		dma-names = "tx";
+		power-domains = <&ps_dpa1>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dpaudio1_dcpext: endpoint {
+					remote-endpoint = <&dcpext0_audio>;
+				};
+			};
+		};
+	};
+
+	dpaudio2: audio-controller-2 {
+		compatible = "apple,t6041-dpaudio", "apple,dpaudio";
+		dmas = <&sio 0x68>;
+		dma-names = "tx";
+		power-domains = <&ps_dpa2>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dpaudio2_dcpext: endpoint {
+					remote-endpoint = <&dcpext1_audio>;
+				};
+			};
+		};
+	};
+};
+
+&dcpext0 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dcpext0_audio: endpoint {
+				remote-endpoint = <&dpaudio1_dcpext>;
+			};
+		};
+	};
+};
+
+&dcpext1 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dcpext1_audio: endpoint {
+				remote-endpoint = <&dpaudio2_dcpext>;
+			};
+		};
+	};
+};
+
+/* The SIO firmware drives the SPI, UART and DP audio shims: keep their parents on. */
+&ps_sio_cpu {
+	power-domains = <&ps_sio>, <&ps_spi_p>, <&ps_uart_p>, <&ps_dpa_p>;
+	status = "okay";
+};
+
+&sio_dart {
+	status = "okay";
+};
+
+&sio_mbox {
 	status = "okay";
 };

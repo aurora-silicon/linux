@@ -17,6 +17,19 @@
 
 	/* State 1 is 300 MHz; firmware SRAM OPP tables begin at state 2. */
 	/* Cap each cluster at its measured J813 firmware handoff state. */
+	/*
+	 * opp-microwatt (per core, for the energy model) was measured on J815
+	 * with the main-PMU rail meters through the SMC: each cluster pinned to
+	 * each OPP with all its cores busy, the cluster rail (P: PP0b at VP0b,
+	 * E: PPbb at VPbb) read at the end of the load and split per core. The
+	 * readings follow C * V^2 * f closely (P: C 950-1150, E: 226-263 mW per
+	 * V^2 GHz, 900 MHz up to the highest unthrottled OPP), so the table is
+	 * that fit (P 1061, E 237) at each OPP's measured rail voltage. Above
+	 * 4020 MHz the P cluster sat at its power limit (die ~102 C), so those
+	 * rows rely on the fit, not on a direct reading. The values carry the
+	 * cluster's shared leakage, like the T8132 table; P at 4464 MHz (5.07 W)
+	 * matches T8132's 5.01 W.
+	 */
 	ecluster_opp: opp-table-0 {
 		compatible = "operating-points-v2";
 		opp-shared;
@@ -24,41 +37,49 @@
 		opp-300000000 {
 			opp-hz = /bits/ 64 <300000000>;
 			opp-level = <1>;
+			opp-microwatt = <31000>;
 		};
 
 		opp-972000000 {
 			opp-hz = /bits/ 64 <972000000>;
 			opp-level = <2>;
+			opp-microwatt = <88000>;
 		};
 
 		opp-1152000000 {
 			opp-hz = /bits/ 64 <1152000000>;
 			opp-level = <3>;
+			opp-microwatt = <109000>;
 		};
 
 		opp-1584000000 {
 			opp-hz = /bits/ 64 <1584000000>;
 			opp-level = <4>;
+			opp-microwatt = <178000>;
 		};
 
 		opp-1992000000 {
 			opp-hz = /bits/ 64 <1992000000>;
 			opp-level = <5>;
+			opp-microwatt = <252000>;
 		};
 
 		opp-2352000000 {
 			opp-hz = /bits/ 64 <2352000000>;
 			opp-level = <6>;
+			opp-microwatt = <330000>;
 		};
 
 		opp-2700000000 {
 			opp-hz = /bits/ 64 <2700000000>;
 			opp-level = <7>;
+			opp-microwatt = <463000>;
 		};
 
 		opp-2964000000 {
 			opp-hz = /bits/ 64 <2964000000>;
 			opp-level = <8>;
+			opp-microwatt = <630000>;
 		};
 	};
 
@@ -69,51 +90,61 @@
 		opp-300000000 {
 			opp-hz = /bits/ 64 <300000000>;
 			opp-level = <1>;
+			opp-microwatt = <109000>;
 		};
 
 		opp-1308000000 {
 			opp-hz = /bits/ 64 <1308000000>;
 			opp-level = <2>;
+			opp-microwatt = <467000>;
 		};
 
 		opp-1608000000 {
 			opp-hz = /bits/ 64 <1608000000>;
 			opp-level = <3>;
+			opp-microwatt = <643000>;
 		};
 
 		opp-1932000000 {
 			opp-hz = /bits/ 64 <1932000000>;
 			opp-level = <4>;
+			opp-microwatt = <869000>;
 		};
 
 		opp-2220000000 {
 			opp-hz = /bits/ 64 <2220000000>;
 			opp-level = <5>;
+			opp-microwatt = <1076000>;
 		};
 
 		opp-2508000000 {
 			opp-hz = /bits/ 64 <2508000000>;
 			opp-level = <6>;
+			opp-microwatt = <1293000>;
 		};
 
 		opp-2820000000 {
 			opp-hz = /bits/ 64 <2820000000>;
 			opp-level = <7>;
+			opp-microwatt = <1577000>;
 		};
 
 		opp-3072000000 {
 			opp-hz = /bits/ 64 <3072000000>;
 			opp-level = <8>;
+			opp-microwatt = <1927000>;
 		};
 
 		opp-3300000000 {
 			opp-hz = /bits/ 64 <3300000000>;
 			opp-level = <9>;
+			opp-microwatt = <2180000>;
 		};
 
 		opp-3516000000 {
 			opp-hz = /bits/ 64 <3516000000>;
 			opp-level = <10>;
+			opp-microwatt = <2651000>;
 		};
 
 		/* ADT levels 11-20, measured on J813 (level 19, 4416 MHz, is below
@@ -121,46 +152,55 @@
 		opp-3720000000 {
 			opp-hz = /bits/ 64 <3720000000>;
 			opp-level = <11>;
+			opp-microwatt = <3001000>;
 		};
 
 		opp-3876000000 {
 			opp-hz = /bits/ 64 <3876000000>;
 			opp-level = <12>;
+			opp-microwatt = <3451000>;
 		};
 
 		opp-4020000000 {
 			opp-hz = /bits/ 64 <4020000000>;
 			opp-level = <13>;
+			opp-microwatt = <3841000>;
 		};
 
 		opp-4176000000 {
 			opp-hz = /bits/ 64 <4176000000>;
 			opp-level = <14>;
+			opp-microwatt = <4520000>;
 		};
 
 		opp-4248000000 {
 			opp-hz = /bits/ 64 <4248000000>;
 			opp-level = <15>;
+			opp-microwatt = <4828000>;
 		};
 
 		opp-4272000000 {
 			opp-hz = /bits/ 64 <4272000000>;
 			opp-level = <16>;
+			opp-microwatt = <4855000>;
 		};
 
 		opp-4332000000 {
 			opp-hz = /bits/ 64 <4332000000>;
 			opp-level = <17>;
+			opp-microwatt = <4924000>;
 		};
 
 		opp-4428000000 {
 			opp-hz = /bits/ 64 <4428000000>;
 			opp-level = <18>;
+			opp-microwatt = <5033000>;
 		};
 
 		opp-4464000000 {
 			opp-hz = /bits/ 64 <4464000000>;
 			opp-level = <20>;
+			opp-microwatt = <5074000>;
 		};
 	};
 };
@@ -293,6 +333,13 @@
 
 			/* Layout is filled by the loader using this machine's own data. */
 			keyboard: keyboard { };
+
+			/*
+			 * The trackpad's haptic engine. The MTP firmware offers it
+			 * as interface 4 "actuator"; without this node the click
+			 * stays firmware-driven and there is no Force Touch stage.
+			 */
+			actuator { };
 		};
 	};
 };
@@ -300,3 +347,45 @@
 #include "t8142-j813-psci-idle.dtsi"
 #include "t8142-j813-nvme.dtsi"
 #include "t8142-j813-power.dtsi"
+
+/*
+ * CPU topology: DT cpu0-5 are the E cores (cluster 0), cpu6-9 (MPIDR
+ * 0x10100-0x10103) the P cores (cluster 1). The scheduler then knows the
+ * two clusters are asymmetric (SD_ASYM_CPUCAPACITY) and places heavy tasks
+ * on the P cores. Linux boots on a P core, so logical cpu0 and 7-9 are P.
+ * capacity-dmips-mhz (per MHz, scaled by each cluster's top OPP): E 671 /
+ * P 1024, measured on J815 (boot 0f4c4bbd, pinned integer loop at the top
+ * OPP of each cluster, best of 3: E 0.1045 / P 0.1597 per MHz). The T8132
+ * (M4) ratio this replaces, 754, overstated the E cores by 12%; E capacity
+ * at 2964 MHz is now ~445 of 1024 (4464 MHz P).
+ */
+&{/cpus} {
+	cpu-map {
+		cluster0 {
+			core0 { cpu = <&cpu0>; };
+			core1 { cpu = <&cpu1>; };
+			core2 { cpu = <&cpu2>; };
+			core3 { cpu = <&cpu3>; };
+			core4 { cpu = <&cpu4>; };
+			core5 { cpu = <&cpu5>; };
+		};
+
+		cluster1 {
+			core0 { cpu = <&cpu6>; };
+			core1 { cpu = <&cpu7>; };
+			core2 { cpu = <&cpu8>; };
+			core3 { cpu = <&cpu9>; };
+		};
+	};
+};
+
+&cpu0 { capacity-dmips-mhz = <671>; };
+&cpu1 { capacity-dmips-mhz = <671>; };
+&cpu2 { capacity-dmips-mhz = <671>; };
+&cpu3 { capacity-dmips-mhz = <671>; };
+&cpu4 { capacity-dmips-mhz = <671>; };
+&cpu5 { capacity-dmips-mhz = <671>; };
+&cpu6 { capacity-dmips-mhz = <1024>; };
+&cpu7 { capacity-dmips-mhz = <1024>; };
+&cpu8 { capacity-dmips-mhz = <1024>; };
+&cpu9 { capacity-dmips-mhz = <1024>; };

@@ -253,6 +253,13 @@ impl KernelObject {
         self.size
     }
 
+    /// Reads the contents of the object. The firmware may be writing them, so a reader sees a
+    /// torn snapshot: for diagnostics, never for anything the host acts on.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        // SAFETY: Per the type invariant `ptr` is valid for `size` bytes.
+        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.size) }
+    }
+
     /// Returns the contents of the object.
     ///
     /// Only for building an object the firmware does not access concurrently, before its address
