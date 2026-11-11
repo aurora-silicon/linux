@@ -1478,7 +1478,9 @@ impl SepData {
             user_outcome,
             RestoreOutcome::Restored | RestoreOutcome::AlreadyActive
         );
-        let lockout_outcome = self.restore_lockout();
+        // The enclave's lockout record goes back after the first password
+        // (see `lockout_import_pending`); here only whether one is stored.
+        let lockout_outcome = self.defer_lockout_import();
         dev_info!(self.dev, "sbio: restore lockout outcome {:?}\n", lockout_outcome);
         let lockout = match lockout_outcome {
             RestoreOutcome::Restored | RestoreOutcome::AlreadyActive => true,
@@ -1647,6 +1649,47 @@ impl SepData {
         }
     }
 
+    /// Notes whether a lockout record is stored, for `import_lockout_after_password`.
+    /// A stored record counts as present for match readiness: until it is
+    /// loaded the host record carries the failed-attempt count, and Touch ID
+    /// waits for the first password anyway.
+    fn defer_lockout_import(&self) -> RestoreOutcome {
+        match self.read_stored(PRIVATE_TYPE_LOCKOUT, c"bio lockout record") {
+            Ok(Some(_)) => {
+                self.lockout_import_pending.store(true, Relaxed);
+                RestoreOutcome::EmptyTolerated
+            }
+            Ok(None) => RestoreOutcome::NoStoredFile,
+            Err(_) => RestoreOutcome::Failed,
+        }
+    }
+
+    /// Hands the saved lockout record back to the enclave once, after the
+    /// first password authentication of the boot, as macOS does after the
+    /// first unlock. Before anything else the re-arm does, so the enclave's
+    /// own count is in place before a password clears it.
+    fn import_lockout_after_password(&self) {
+        if !self.touchid_started.load(Relaxed) || !self.lockout_import_pending.xchg(false, Relaxed) {
+            return;
+        }
+        let Some(_writer) = self.catacomb_writer.try_lock() else {
+            // A capture holds the sensor lock; try again at the next password.
+            self.lockout_import_pending.store(true, Relaxed);
+            return;
+        };
+        if !self.capture_begin() {
+            self.lockout_import_pending.store(true, Relaxed);
+            return;
+        }
+        let outcome = self.restore_lockout();
+        self.capture_end();
+        dev_info!(
+            self.dev,
+            "sbio: lockout record loaded after the first password: {:?}\n",
+            outcome
+        );
+    }
+
     fn restore_lockout(&self) -> RestoreOutcome {
         let blob = match self.read_stored(PRIVATE_TYPE_LOCKOUT, c"bio lockout record") {
             Ok(Some(blob)) => blob,
@@ -1665,12 +1708,13 @@ impl SepData {
                 ) =>
             {
                 // Not a restore: the enclave did not take the record (macOS
-                // discards such a record). The host record keeps the count.
+                // discards such a record). The host record keeps the count,
+                // and the next SAVE_LOCKOUT replaces the stored one.
                 dev_info!(
                     self.dev,
-                    "sbio: LOAD_LOCKOUT refused the saved lockout record (0x8002, it does not match the restored catacombs); the failed-attempt count comes from the host record\n"
+                    "sbio: LOAD_LOCKOUT refused the saved lockout record (0x8002); the failed-attempt count comes from the host record\n"
                 );
-                RestoreOutcome::EmptyTolerated
+                RestoreOutcome::Failed
             }
             Ok(_) => RestoreOutcome::Failed,
             Err(_) => RestoreOutcome::Failed,
@@ -5303,6 +5347,7 @@ impl SepData {
                 "Touch ID: armed by the first password since this boot\n"
             );
         }
+        self.import_lockout_after_password();
         if !self.touchid_started.load(Relaxed) {
             // Activation sets up a fresh match credential; only the record of
             // a lockout from before the restart is left to clear.
