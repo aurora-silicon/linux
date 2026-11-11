@@ -95,6 +95,12 @@ pub(crate) struct Accounting {
     in_flight: [u32; fw::QUEUES],
     dm_in_flight: [u64; fw::DATA_MASTERS],
     dm_by_qid: [u8; fw::QUEUES],
+    /// The table's counts as last stored, indexed as in [`View`]. Only the host writes
+    /// them, so a publication counts on from these instead of reading them back.
+    queue_submitted: [u32; fw::QUEUES],
+    owner_submitted: [u32; fw::QUEUES],
+    intervals: u64,
+    times_and_counts: [u64; 7],
 }
 impl Accounting {
     pub(crate) const fn new() -> Self {
@@ -102,6 +108,10 @@ impl Accounting {
             in_flight: [0; fw::QUEUES],
             dm_in_flight: [0; fw::DATA_MASTERS],
             dm_by_qid: [0; fw::QUEUES],
+            queue_submitted: [0; fw::QUEUES],
+            owner_submitted: [0; fw::QUEUES],
+            intervals: 0,
+            times_and_counts: [0; 7],
         }
     }
 
@@ -124,7 +134,8 @@ impl Accounting {
     /// firmware-visible values as one `publish` per owner. The owners use
     /// distinct queues and data masters. Every check precedes the first store,
     /// so a refusal changes nothing; every table word is read before the first
-    /// store, so no uncached read waits for an earlier store to drain.
+    /// store, so no uncached read waits for an earlier store to drain. The counts come from
+    /// the host's copy; only the rows are read.
     pub(crate) fn publish_owners<const N: usize>(
         &mut self,
         view: &View<'_>,
@@ -150,12 +161,12 @@ impl Accounting {
             self.dm_in_flight[dm].checked_add(1).ok_or(EOVERFLOW)?;
         }
         let rows = indices.map(|(qid, _, _)| view.row_word(qid));
-        let queue_submitted = indices.map(|(qid, _, _)| view.queue_submitted[qid].load(Ordering::Relaxed));
-        let owner_submitted = indices.map(|(_, qos, _)| view.owner_submitted[qos].load(Ordering::Relaxed));
-        let dm_submitted = indices.map(|(_, _, dm)| view.times_and_counts[3 + dm].load(Ordering::Relaxed));
+        let queue_submitted = indices.map(|(qid, _, _)| self.queue_submitted[qid]);
+        let owner_submitted = indices.map(|(_, qos, _)| self.owner_submitted[qos]);
+        let dm_submitted = indices.map(|(_, _, dm)| self.times_and_counts[3 + dm]);
         let starts_busy = indices.map(|(_, _, dm)| self.dm_in_flight[dm] == 0);
         let busy = starts_busy.iter().any(|&starts| starts);
-        let intervals = if busy { view.intervals.load(Ordering::Relaxed) } else { 0 };
+        let intervals = if busy { self.intervals } else { 0 };
         for (index, owner) in owners.iter().enumerate() {
             let (qid, _, _) = indices[index];
             if self.in_flight[qid] != 0
@@ -191,21 +202,25 @@ impl Accounting {
         let mut intervals = intervals;
         for (index, owner) in owners.iter().enumerate() {
             let (qid, qos, dm) = indices[index];
-            view.queue_submitted[qid].store(queue_submitted[index].wrapping_add(1), Ordering::Relaxed);
+            let queued = queue_submitted[index].wrapping_add(1);
+            view.queue_submitted[qid].store(queued, Ordering::Relaxed);
+            self.queue_submitted[qid] = queued;
             // Owners of one logical queue share their submission count.
             let earlier = indices[..index].iter().filter(|&&(_, other, _)| other == qos).count();
-            view.owner_submitted[qos].store(
-                owner_submitted[index].wrapping_add(earlier as u32 + 1),
-                Ordering::Relaxed,
-            );
+            let owned = owner_submitted[index].wrapping_add(earlier as u32 + 1);
+            view.owner_submitted[qos].store(owned, Ordering::Relaxed);
+            self.owner_submitted[qos] = owned;
             if starts_busy[index] {
                 view.times_and_counts[dm].store(time, Ordering::Relaxed);
+                self.times_and_counts[dm] = time;
             }
             let submitted = dm_submitted[index].wrapping_add(1);
             view.times_and_counts[3 + dm].store(submitted, Ordering::Relaxed);
+            self.times_and_counts[3 + dm] = submitted;
             if starts_busy[index] {
                 intervals = intervals.wrapping_add(1);
                 view.intervals.store(intervals, Ordering::Relaxed);
+                self.intervals = intervals;
             }
             let mut record = rows[index];
             record[0] = owner.qos;
