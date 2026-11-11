@@ -23,6 +23,14 @@
 #define T6050_K114C
 #include "t6050-peripherals.dtsi"
 
+/ {
+	aliases {
+		/* kboot fills the N1's factory addresses from /chosen through these */
+		wifi0 = &n1_alpha;
+		bluetooth0 = &n1_beta;
+	};
+};
+
 /*
  * PCIe port 0: the N1 (Wi-Fi and Bluetooth), laid out as on J716c: the boot
  * loader trains the link and keeps power, clocks, the PHY and PERST; Linux owns
