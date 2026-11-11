@@ -24,6 +24,9 @@
 
 #include "t6050-peripherals.dtsi"
 
+/* The Neural Engine, started only after the boot loader's preload hand-off */
+#include "t6050-j714s-ane.dtsi"
+
 / {
 	aliases {
 		/* kboot fills the N1's factory addresses from /chosen through these */
