@@ -10,6 +10,9 @@
  *  - memory cache controller (T8112, T6000): the carveout bounds and enables
  *    of plane 0 and the cache status of every plane. The boot loader reads
  *    exactly these registers on every boot of these SoCs.
+ *  - SPMI sideband (T8112): the bus and queue fault counters. These are
+ *    plain 32-bit counters; the interrupt status and acknowledge words of
+ *    the window are left out, since clearing them takes a write.
  *
  * Copyright The Asahi Linux Contributors
  */
@@ -93,6 +96,28 @@ static const struct apple_regview_hw apple_regview_t6000_mcc_hw = {
 	.ranges = apple_regview_t6000_mcc,
 	.nr_ranges = ARRAY_SIZE(apple_regview_t6000_mcc),
 	.nr_regs = 4,
+};
+
+/*
+ * SPMI sideband window (reg[0]): ten bus fault counters (unmapped writes,
+ * unsupported reads, missing responses, NACKs, parity and command errors,
+ * collisions) followed by seven queue and filter fault counters. Only the
+ * counters are listed; how they wrap is not part of the interface.
+ */
+#define SPMI_SB_BUS_FAULTS	0x200
+#define SPMI_SB_NR_BUS_FAULTS	10
+#define SPMI_SB_QUEUE_FAULTS	0x25c
+#define SPMI_SB_NR_QUEUE_FAULTS	7
+
+static const struct apple_regview_range apple_regview_t8112_spmi_sb[] = {
+	{ 0, SPMI_SB_BUS_FAULTS, SPMI_SB_NR_BUS_FAULTS, 0, "bus-fault-count" },
+	{ 0, SPMI_SB_QUEUE_FAULTS, SPMI_SB_NR_QUEUE_FAULTS, 0, "queue-fault-count" },
+};
+
+static const struct apple_regview_hw apple_regview_t8112_spmi_sb_hw = {
+	.ranges = apple_regview_t8112_spmi_sb,
+	.nr_ranges = ARRAY_SIZE(apple_regview_t8112_spmi_sb),
+	.nr_regs = 1,
 };
 
 static u32 apple_regview_stride(const struct apple_regview_range *r)
@@ -202,6 +227,8 @@ static int apple_regview_probe(struct platform_device *pdev)
 static const struct of_device_id apple_regview_of_match[] = {
 	{ .compatible = "apple,t8112-mcc", .data = &apple_regview_t8112_mcc_hw },
 	{ .compatible = "apple,t6000-mcc", .data = &apple_regview_t6000_mcc_hw },
+	{ .compatible = "apple,t8112-spmi-sideband",
+	  .data = &apple_regview_t8112_spmi_sb_hw },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_regview_of_match);

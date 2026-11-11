@@ -9,10 +9,12 @@
 #include <linux/sizes.h>
 #include <linux/types.h>
 
-#define PIODMA_PACKET_MASK	GENMASK_ULL(35, 0)
-#define PIODMA_POINTER_MASK	GENMASK_ULL(41, 0)
-#define PIODMA_POINTER_PREFIX	BIT_ULL(40)
-#define PIODMA_IRQ_COMPLETE	(BIT(0) | BIT(6))
+#include "pcie-apple-t8140-bootstrap.h"
+
+#define PIODMA_PACKET_MASK	APPLE_PIODMA_PACKET_MASK
+#define PIODMA_POINTER_MASK	APPLE_PIODMA_POINTER_MASK
+#define PIODMA_POINTER_PREFIX	APPLE_PIODMA_POINTER_PREFIX
+#define PIODMA_IRQ_COMPLETE	APPLE_PIODMA_IRQ_COMPLETION
 #define PIODMA_IRQ_LIMIT		16
 
 /* Only RELEASE before publication can end guard ownership. No reset event. */

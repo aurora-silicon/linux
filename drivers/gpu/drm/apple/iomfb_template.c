@@ -35,6 +35,7 @@
 #include "iomfb_internal.h"
 #include "iomfb-dfb.h"
 #include "parser.h"
+#include "av.h"
 #include "dcp-refresh.h"
 #include "dcp-property.h"
 #include "trace.h"
@@ -3831,6 +3832,9 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	/* An HDR commit scans out through the timing's PQ element. */
 	if (dcp->pq_requested && mode->pq.score >= 0)
 		mode->color_mode_id = mode->pq.id;
+
+	/* The connection's audio link runs through the mode set. */
+	av_audio_before_modeset(dcp);
 
 	dev_info(dcp->dev,
 		 "set_digital_out_mode(color:%d timing:%d) " DRM_MODE_FMT "\n",
