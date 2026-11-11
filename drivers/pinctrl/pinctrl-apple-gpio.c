@@ -54,7 +54,7 @@ struct apple_gpio_pinctrl {
 
 #define REG_GPIO(x)          (4 * (x))
 #define REG_GPIOx_DATA       BIT(0)
-#define REG_GPIOx_MODE       GENMASK(3, 1)
+#define REG_GPIOx_MODE       GENMASK(4, 1)
 #define REG_GPIOx_OUT        1
 #define REG_GPIOx_IN_IRQ_HI  2
 #define REG_GPIOx_IN_IRQ_LO  3
