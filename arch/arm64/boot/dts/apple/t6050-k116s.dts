@@ -887,3 +887,22 @@
 
 /* The GPU, handed over by the boot loader */
 #include "t6050-k116s-gpu.dtsi"
+
+/*
+ * The camera: the T6050 ISP as J716c and J714s describe it. From the K116sAP ADT (27.2):
+ *  - isp0 reg[0] 0x380000000 (+ the arm-io range, 0x580000000) + 0x3ff0000 holds the windows
+ *    the include names; reg[1] 0x280900000 + 0x3f4 ends at the last ISP power state (0x3f0);
+ *    interrupts 513..516, 526; EIC mmio-wd-isp 0x5c3b50000 + 0x8000.
+ *  - dart-isp0: three instances at 0x5828c0000, 0x5828e0000 and 0x582900000 (0xc000 each),
+ *    the address filter at 0x5828d0000, interrupt 531, host streams 0 and 12 (sid), exclave
+ *    streams 4/5 and 8/9, remap 1, 6, 7, 10, 11, DAPF stream mask 0xcc3.
+ *  - pmgr: FAB9_SOC 0x398, ISP_SYS 0x3a0 and ISPSENS0 0x100 in the second register block
+ *    (0x280900000); ISP_CPU, ISP_FE, DPRX, ISP_SECURE, ISP_BE and ISP_CLR are devices 0xdc,
+ *    0xdd and 0xe1..0xe4 with no register of their own in the table, eight bytes per device
+ *    from ISP_SYS (0xda): 0x3b0, 0x3b8 and 0x3d8..0x3f0, the range the DAPF opens.
+ *  - two firmware segments, 0xc1c000 and 0x13d0000 bytes at DART address 0x10000000000.
+ * The firmware (uuid 980F533B-34EA-3FBA-878C-809F6AF57345) runs one "FrontRGB" IMX958 here,
+ * J714s's sensor. The sensor type is 0xbc and the connection scheme 0x10; the loader passes
+ * both. Everything stays disabled until the loader has reserved the firmware.
+ */
+#include "t6050-j716c-isp.dtsi"
