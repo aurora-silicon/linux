@@ -11,6 +11,7 @@ ARM64 Architecture
     amu
     apple-j813
     apple-m6-cpu
+    apple-pmp
     arm-acpi
     arm-cca
     asymmetric-32bit
