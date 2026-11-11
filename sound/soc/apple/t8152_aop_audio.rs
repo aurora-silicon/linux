@@ -845,6 +845,23 @@ unsafe extern "C" fn asoc_pcm_trigger(
     unsafe { bindings::snd_dmaengine_pcm_trigger(substream, cmd) }
 }
 
+/// Wait for asynchronous DMA termination before ALSA reuses a front-end's buffer.
+///
+/// # Safety
+///
+/// Called by ASoC on this driver's component with a live substream.
+unsafe extern "C" fn asoc_pcm_sync_stop(
+    _component: *mut bindings::snd_soc_component,
+    substream: *mut bindings::snd_pcm_substream,
+) -> i32 {
+    // SAFETY: by the caller's contract.
+    if unsafe { rtd_is_be(substream_rtd(substream)) } {
+        return 0;
+    }
+    // SAFETY: the dmaengine runtime was set up in `asoc_pcm_open`.
+    unsafe { bindings::snd_dmaengine_pcm_sync_stop(substream) }
+}
+
 /// # Safety
 ///
 /// Called by ASoC on this driver's component with live arguments.
@@ -1082,6 +1099,7 @@ impl AsocContext {
             close: Some(asoc_pcm_close),
             hw_params: Some(asoc_pcm_hw_params),
             trigger: Some(asoc_pcm_trigger),
+            sync_stop: Some(asoc_pcm_sync_stop),
             pointer: Some(asoc_pcm_pointer),
             ..Default::default()
         };
