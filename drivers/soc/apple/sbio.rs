@@ -2469,7 +2469,13 @@ impl SepData {
             EIO
         })?;
         diag::keybag(diag::Keybag::Present);
-        self.sks_designate_user_keybag(handle, stored.secret());
+        // When Touch ID comes up before a trusted key is unsealed, this is
+        // the keybag's first use this boot, and after a boot policy change
+        // the enclave rewrites one session record here; see
+        // crate::xart_guard.
+        crate::xart_guard::policy_window(|| {
+            self.sks_designate_user_keybag(handle, stored.secret())
+        });
         self.sks_machine_refkey(handle, stored.secret());
         let prepared = self.cold_match_continue(handle, uuid, stored.uuid_provenance());
         self.ensure_restored_after(prepared);
