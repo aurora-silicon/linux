@@ -3178,6 +3178,8 @@ static const struct dev_pm_ops brcmf_pciedrvr_pm = {
 	.suspend = brcmf_pcie_pm_enter_D3,
 	.resume = brcmf_pcie_pm_leave_D3,
 	.freeze = brcmf_pcie_pm_enter_D3,
+	/* The chip kept its power and its firmware: the resume of a sleep that kept them. */
+	.thaw = brcmf_pcie_pm_leave_D3,
 	.restore = brcmf_pcie_pm_leave_D3,
 };
 
