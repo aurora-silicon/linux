@@ -1155,6 +1155,12 @@ static bool sleep_ps_on(struct apple_sleep *s, u32 offset)
 	return FIELD_GET(PS_ACTUAL, readl(s->ps + offset));
 }
 
+/* Below full power the hardware has idled it, and its registers may not answer. */
+static bool sleep_ps_full(struct apple_sleep *s, u32 offset)
+{
+	return FIELD_GET(PS_ACTUAL, readl(s->ps + offset)) == FIELD_MAX(PS_ACTUAL);
+}
+
 /* @pd's word in "ps": a power controller node, child of the PMGR that "ps" maps. */
 static int sleep_ps_offset(struct apple_sleep *s, struct device_node *pd)
 {
@@ -1511,6 +1517,14 @@ static bool apple_sleep_gate_failed(struct apple_sleep *s)
 		if (!g->bound) {
 			dev_err(s->dev, "%s isn't bound\n", g->name);
 			bad++;
+			/* Nothing will stop it, and a commit over a running CPU resets the SoC. */
+			if (g->must_stop && g->asc && g->ps && sleep_ps_full(s, g->ps) &&
+			    (readl(g->asc + ASC_CPU_CONTROL) & ASC_CPU_CONTROL_RUN)) {
+				dev_err(s->dev, "%s runs unbound: control %#x status %#x\n", g->name,
+					readl(g->asc + ASC_CPU_CONTROL),
+					readl(g->asc + ASC_CPU_STATUS));
+				running++;
+			}
 			continue;
 		}
 		/* A CPU whose domain is off isn't running, and its registers aren't there. */
@@ -3484,7 +3498,7 @@ static const struct apple_sleep_word t8140_stray_words[] = {
 static const struct apple_sleep_gate_coproc t8140_gate_coprocs[] = {
 	{ "/soc/dcp@412e00000", true, T8140_PS_DISP_CPU },
 	{ "/soc/dcp@416e00000", true, T8140_PS_DISPEXT0_CPU },
-	{ "/soc/pmp@300500000", true },	{ "/soc/dma-controller@385e00000", true },
+	{ "/soc/pmp@300500000", true },	{ "/soc/dma-controller@385e00000", true, T8140_PS_SIO_CPU },
 	{ "/soc/nvme@3cdcc0000" },	{ "/soc/mtp@314600000" },
 	{ "/soc/aop@310c00000" },	{ "/soc/smc@30c600000" },
 	{ "/soc/sep@282600000" },	{ "/soc/gpu@482600000" },
