@@ -41,7 +41,7 @@ def check_guards():
     prepare = (ROOT / 'runtime/render/prepare.rs').read_text()
     build = item(prepare, 'fn build_render_pair(')
     # The in-place rebind is refused while the pair's scheduler release is pending.
-    ordered(build, 'if !pair.reusable()?', 'firmware.queues.teardown.releasing(pair.context())',
+    ordered(build, 'if !pair.bindable(self.owner, &self.context)?', 'firmware.queues.teardown.releasing(pair.context())',
             'return Err(EBUSY);', 'Build::Rebind {')
     rebind = item(prepare, 'fn rebind_pair(')
     # A live donor that closed while the binding was prepared is caught at commit.
@@ -73,8 +73,8 @@ def check_guards():
             'return Err(EAGAIN);', 'queue.publish(')
     # A busy pair (for example one whose scheduler release is still being consumed)
     # kicks the event worker, which observes the release and parks the pair.
-    ordered(item(submit, 'fn wait_render_busy('), 'WORK_RING_WAIT_NS',
-            'self.shared.queue_events();', 'self.wait_domain(')
+    ordered(item(submit, 'fn wait_render_busy('), 'self.wait_render_retirement(', 'WORK_RING_WAIT_NS')
+    ordered(item(submit, 'fn wait_render_retirement('), 'self.shared.queue_events();', 'self.wait_domain(')
     ordered(item(submit, 'fn wait_domain('), 'if remaining == 0', 'return Err(ETIMEDOUT);', 'domain.block(')
     borrowed = item((ROOT / 'runtime/render.rs').read_text(), 'fn take_pair(')
     ordered(borrowed, 'entry.borrowed_switch = pair.switch_in_flight();',
@@ -102,8 +102,10 @@ def fixture():
         'pub(crate) fn owner_switch_from(', 'pub(crate) fn switch_in_flight(']).replace('pub(crate) ', '')
     record = render[render.index('        let scheduler = packet.context.scheduler_va();'):
                     render.index('        self.executed = scheduler;') + len('        self.executed = scheduler;')]
-    idle = item((ROOT / 'runtime/render/teardown.rs').read_text(),
-                'pub(in crate::g17::runtime) fn teardown_idle(').replace('pub(in crate::g17::runtime) ', '')
+    render_teardown = (ROOT / 'runtime/render/teardown.rs').read_text()
+    # teardown_idle() is idle_for() without the release-time kill exception.
+    idle = '\n'.join(item(render_teardown, name) for name in [
+        'pub(in crate::g17::runtime) fn teardown_idle(', 'fn idle_for(']).replace('pub(in crate::g17::runtime) ', '')
     compute_switch = item((ROOT / 'queue/compute.rs').read_text(),
                           'pub(crate) fn switching_from(').replace('pub(crate) ', '')
     compute_idle = item((ROOT / 'runtime/teardown.rs').read_text(), 'fn compute_idle(')
@@ -116,6 +118,8 @@ struct Context { scheduler: u64, published: bool }
 impl Context {
     fn scheduler_va(&self) -> u64 { self.scheduler }
     fn is_published(&self) -> bool { self.published }
+    // Reached only for a release-time check, which this fixture does not make.
+    fn kill_published(&self) -> bool { unreachable!() }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase { Deferred, Draining, Released(u32) }

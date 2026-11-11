@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
-/* Disabled resource descriptions for T6000. */
+/* Additional T6000 hardware resources. Keep unqualified blocks disabled. */
 
 &{/soc} {
 	ane0_dma: dma-controller@285804000 {
@@ -14,7 +14,6 @@
 	aic_timebase: timer@28e148000 {
 		compatible = "apple,t6000-aic-timebase", "apple,aic-timebase";
 		reg = <0x2 0x8e148000 0x0 0x1000>;
-		status = "disabled";
 	};
 
 	dwi: bus-controller@28e208000 {
@@ -23,21 +22,18 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 22 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_dwi>;
-		status = "disabled";
 	};
 
-	dockchannel_uart: fifo@29250c000 {
-		compatible = "apple,t6000-dockchannel", "apple,dockchannel";
-		reg = <0x2 0x9250c000 0x0 0x18>;
+	/* The DebugUSB DockChannel serial channel; RX is drained in software. */
+	dockchannel_uart: serial@29252c000 {
+		compatible = "apple,t6000-dockchannel-uart", "apple,dockchannel-uart";
+		reg = <0x2 0x9252c000 0x0 0x4000>,
+		      <0x2 0x92528000 0x0 0x4000>,
+		      <0x2 0x9250c000 0x0 0x18>;
+		reg-names = "data", "config", "irq";
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 620 IRQ_TYPE_LEVEL_HIGH>;
-		reg-names = "irq";
-		ranges = <0 0x2 0x92528000 0x10004>;
-		#address-cells = <1>;
-		#size-cells = <1>;
-		interrupt-controller;
-		#interrupt-cells = <2>;
-		status = "disabled";
+		apple,sw-drain;
 	};
 
 	apr0: video-codec@311000000 {
@@ -249,7 +245,6 @@
 		      <0x2 0x01000000 0x0 0x1000000>,
 		      <0x2 0x02000000 0x0 0x1000000>,
 		      <0x2 0x03000000 0x0 0x1000000>;
-		status = "disabled";
 	};
 
 	soc_events: event-log@28e080000 {

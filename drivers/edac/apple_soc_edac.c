@@ -104,6 +104,15 @@ static const struct apple_soc_edac_range t6000_error_ranges[] = {
 	{ 72, 4, "nsr" },
 };
 
+/*
+ * T8112: one AMCC aggregate line (0), two SEP lines (1-2) and sixteen DCS
+ * lines (3-18, eight channels plus their calibration partners). AMCC and
+ * DCS stay unclaimed, as on T6000 and T6041.
+ */
+static const struct apple_soc_edac_range t8112_error_ranges[] = {
+	{ 1, 2, "sep" },
+};
+
 static const struct apple_soc_edac_range t8140_error_ranges[] = {
 	{ 4, 1, "pmgr" },
 	{ 5, 9, "sep" },
@@ -128,6 +137,12 @@ static const struct apple_soc_edac_hw t6041_error_hw = {
 	.nranges = ARRAY_SIZE(t6041_error_ranges),
 	.num_irqs = 89,
 	.num_status_regs = T6041_NI_REGS,
+};
+
+static const struct apple_soc_edac_hw t8112_error_hw = {
+	.ranges = t8112_error_ranges,
+	.nranges = ARRAY_SIZE(t8112_error_ranges),
+	.num_irqs = 19,
 };
 
 static const struct apple_soc_edac_hw t8140_error_hw = {
@@ -390,6 +405,7 @@ static void apple_soc_edac_remove(struct platform_device *pdev)
 static const struct of_device_id apple_soc_edac_of_match[] = {
 	{ .compatible = "apple,t6000-error-handler", .data = &t6000_error_hw },
 	{ .compatible = "apple,t6041-error-handler", .data = &t6041_error_hw },
+	{ .compatible = "apple,t8112-error-handler", .data = &t8112_error_hw },
 	{ .compatible = "apple,t8140-error-handler", .data = &t8140_error_hw },
 	{ .compatible = "apple,t6000-event-log", .data = &t6000_event_hw },
 	{ .compatible = "apple,t6041-event-log", .data = &t6041_event_hw },

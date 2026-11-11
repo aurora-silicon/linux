@@ -249,6 +249,10 @@ def watchdog(root):
         'VISIBLE_IF_KUNIT void dcp_swap_watchdog(',
         'void dcp_swap_watchdog_arm(',
         'void dcp_swap_watchdog_complete('))
+    internal=(root/'drivers/gpu/drm/apple/dcp-internal.h').read_text()
+    helpers='\n'.join(block(internal, marker) for marker in (
+        'static inline bool dcp_desktop_swap_watched(',
+        'static inline void dcp_takeover_adopt_proven('))
     definitions='\n'.join(line for line in source.splitlines()
                           if line.startswith('#define DCP_SWAP_WATCHDOG_'))
     return r'''
@@ -273,7 +277,7 @@ struct work_struct {unsigned unused;};
 struct delayed_work {struct work_struct work;};
 struct apple_dcp {
     int fw_compat;bool vrr_enabled,typec;
-    struct {u32 present_id;bool present_pending,vrr_failed;} *desktop;
+    struct {u32 present_id;bool present_pending,vrr_failed,takeover_adopted,mode_live;} *desktop;
     struct {bool valid;} mode_state;
     struct delayed_work swap_watchdog_wq;
     unsigned long swap_watchdog_deadline;
@@ -294,7 +298,7 @@ static bool dcp_is_typec_output(struct apple_dcp *d) {return d->typec;}
 static void mod_delayed_work(void *q,struct delayed_work *w,unsigned long delay)
 {assert(delay==1000);scheduled++;}
 static void cancel_delayed_work(struct delayed_work *w) {cancelled++;}
-''' + definitions + '\n' + production + r'''
+''' + definitions + '\n' + helpers + '\n' + production + r'''
 int main(void) {
     struct apple_dcp d={.fw_compat=5,.vrr_enabled=true,.mode_state={true},.connector=(void *)1};
     __typeof__(*d.desktop) state={.present_id=42,.present_pending=true};d.desktop=&state;
@@ -321,6 +325,17 @@ int main(void) {
     d.fw_compat=1;d.typec=true;dcp_swap_watchdog_arm(&d);assert(scheduled==before+1);
     allow_retire=false;d.mode_state.valid=true;
     dcp_swap_watchdog(&d.swap_watchdog_wq.work);assert(d.mode_state.valid && hotplugs==1);
+    /* A takeover that adopted the loader's mode is watched until a swap
+     * completes; with none, the mode is set through the hotplug worker. */
+    allow_retire=true;d.fw_compat=5;d.typec=false;d.vrr_enabled=false;
+    state.takeover_adopted=true;state.mode_live=true;
+    before=scheduled;dcp_swap_watchdog_arm(&d);assert(scheduled==before+1);
+    dcp_swap_watchdog_complete(&d);assert(!state.takeover_adopted);
+    before=scheduled;dcp_swap_watchdog_arm(&d);assert(scheduled==before);
+    state.takeover_adopted=true;state.present_id=45;state.present_pending=true;
+    jiffies=d.swap_watchdog_deadline;unsigned hp=hotplugs;
+    dcp_swap_watchdog(&d.swap_watchdog_wq.work);
+    assert(!state.takeover_adopted && !state.mode_live && !d.mode_state.valid && hotplugs==hp+1);
     return 0;
 }
 '''

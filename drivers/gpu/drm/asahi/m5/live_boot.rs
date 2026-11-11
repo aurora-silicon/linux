@@ -279,6 +279,9 @@ fn new_uat(dev: &AsahiDrmDevice) -> Result<(Arc<mmu::Uat>, [mmu::KernelMapping; 
     Ok((uat, views))
 }
 
+/// Set once the module is pinned for an M5 session, which is retained until reboot.
+static M5_MODULE_RETAINED: AtomicBool = AtomicBool::new(false);
+
 pub(crate) struct M5Runtime {
     session: Option<KBox<M5Session>>,
     application: bool,
@@ -321,8 +324,10 @@ impl M5Runtime {
         // even when firmware rejects the graph. Failed probe unwinding must
         // never release UAT or transports beneath a running firmware CPU.
         // Keep callback code resident even if a failed stop retains owners.
-        // This explicit RAM-boot experiment is released by reboot only.
-        unsafe { kernel::bindings::__module_get((*kernel::module::this_module::<crate::LocalModule>()).as_ptr()); }
+        // This explicit RAM-boot experiment is released by reboot only. No
+        // CPU has started yet: once module removal has begun, refuse with
+        // nothing started and the session freed.
+        crate::retain::retain_module(&M5_MODULE_RETAINED)?;
         Ok(Self { session: Some(session), application: false, faulted: false,
             application_generation: 0, application_compute_generation: 0 })
     }

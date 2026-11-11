@@ -564,6 +564,7 @@ int sn201202x_runtime_resume(struct device *dev);
 void sn201202x_idle_sleep_start(struct tps6598x *tps);
 void sn201202x_idle_sleep_stop(struct tps6598x *tps);
 extern const struct regmap_bus regmap_sn201202x;
+extern const struct tipd_contaminant_ops sn201202x_contaminant_ops;
 u32 sn201202x_sleep_links(const struct cd321x_sleep_state *st);
 enum typec_contaminant
 sn201202x_ldcm_decode(const u8 status[SN201202X_LDCM_STATUS_LEN]);

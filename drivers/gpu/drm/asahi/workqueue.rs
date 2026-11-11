@@ -64,6 +64,21 @@ const DEBUG_CLASS: DebugFlags = DebugFlags::WorkQueue;
 
 const MAX_JOB_SLOTS: u32 = 127;
 
+fn can_submit_inline(
+    submit_seq: u64,
+    job_seq: u64,
+    pending_commands: usize,
+    free_slots: usize,
+    event_count: usize,
+    free_space: usize,
+    command_count: usize,
+) -> bool {
+    submit_seq == job_seq
+        && pending_commands == 0
+        && free_slots > event_count
+        && free_space > command_count
+}
+
 /// An enum of possible errors that might cause a piece of work to fail execution.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum WorkError {
@@ -471,6 +486,23 @@ impl Job::ver {
             );
             None
         }
+    }
+
+    /// Whether this committed job is the next unpublished prefix, the firmware
+    /// queue has no backlog, and the job fits. Holding the same queue lock as
+    /// `submit()` makes the sequence and backlog observations authoritative.
+    pub(crate) fn can_submit_inline(&self) -> bool {
+        let inner = self.wq.inner.lock();
+
+        can_submit_inline(
+            inner.submit_seq,
+            self.event_info.cmd_seq,
+            inner.pending.len(),
+            inner.free_slots(),
+            self.event_count,
+            inner.free_space(),
+            self.pending.len(),
+        )
     }
 
     pub(crate) fn submit(&mut self) -> Result<JobSubmission::ver<'_>> {
@@ -948,6 +980,7 @@ impl WorkQueue for WorkQueue::ver {
     ///
     /// This will check the event stamp value to find out exactly how many commands were processed.
     fn signal(&self) -> bool {
+        let signalling = dma_fence::SignallingGuard::new();
         let mut inner = self.inner.lock();
         let event = inner.event.as_ref();
         let value = match event {
@@ -1014,6 +1047,7 @@ impl WorkQueue for WorkQueue::ver {
             cmd.as_mut().inner_mut().complete();
             workqueue::system_dfl().enqueue(cmd);
         }
+        drop(signalling);
 
         mod_pr_debug!(
             "WorkQueue({:?}): Completed {} commands, left pending {}, ls {:#x?}, lc {:#x?}\n",
@@ -1109,5 +1143,35 @@ impl WorkQueue for WorkQueue::ver {
             cmd.as_mut().inner_mut().mark_error(error);
             cmd.as_mut().inner_mut().complete();
         }
+    }
+}
+
+#[kunit_tests(asahi_legacy_inline_workqueue)]
+mod tests {
+    use super::can_submit_inline;
+
+    #[test]
+    fn depth_192_stops_at_the_first_inflight_command() {
+        const DEPTH: usize = 192;
+        let mut submit_seq = 0;
+        let mut pending = 0;
+        let mut inline = 0;
+
+        for job_seq in 0..DEPTH as u64 {
+            if can_submit_inline(submit_seq, job_seq, pending, 127, 1, 0x4ff, 1) {
+                inline += 1;
+                submit_seq += 1;
+                pending += 1;
+            }
+        }
+
+        assert_eq!(inline, 1);
+    }
+
+    #[test]
+    fn capacity_keeps_one_firmware_slot_and_ring_entry_free() {
+        assert!(!can_submit_inline(4, 4, 0, 1, 1, 2, 1));
+        assert!(!can_submit_inline(4, 4, 0, 2, 1, 1, 1));
+        assert!(can_submit_inline(4, 4, 0, 2, 1, 2, 1));
     }
 }

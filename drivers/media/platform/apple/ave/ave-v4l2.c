@@ -645,7 +645,7 @@ static void ave_return_bufs(struct ave_ctx *ctx, struct vb2_queue *q,
 
 /* Sessions */
 
-static int ave_session_index(struct ave_dev *ave, struct ave_ctx *ctx)
+int ave_session_index(struct ave_dev *ave, struct ave_ctx *ctx)
 {
 	for (unsigned int i = 0; i < AVE_MAX_SESSIONS; i++)
 		if (ave->sessions[i] == ctx)
@@ -663,10 +663,10 @@ static unsigned int ave_session_count(struct ave_dev *ave)
 }
 
 /*
- * Drain (with @flush), stop and close the session in the firmware. The
+ * Drain normally, or Flush an aborted 6070 stream, then Stop and Close. The
  * last session to go halts the firmware. Caller holds hw_lock.
  */
-static void ave_session_close(struct ave_ctx *ctx, bool flush)
+static void ave_session_close(struct ave_ctx *ctx, bool drain)
 {
 	struct ave_dev *ave = ctx->ave;
 	struct ave_session *sess = ctx->sess;
@@ -676,13 +676,35 @@ static void ave_session_close(struct ave_ctx *ctx, bool flush)
 	if (!sess || idx < 0)
 		return;
 	if (sess->fw_open && ave->fw_state == AVE_FW_RUNNING) {
+		int err = 0;
+
 		/* Complete is a barrier: answered after every frame before it. */
-		if (flush && sess->frames && !ave_cmd_complete(ctx, AVE_DRAIN_COMPLETES))
+		if (drain && sess->frames) {
+			err = ave_cmd_complete(ctx, AVE_DRAIN_COMPLETES);
+			if (!err)
+				err = ave_ipc_settle(ave, AVE_FRAME_WAIT_MS);
+		} else if (!drain && sess->handed &&
+			   !ave->layout->abi->transport->boot_config &&
+			   !ave_cmd_flush(ctx)) {
 			ave_ipc_settle(ave, AVE_FRAME_WAIT_MS);
-		if (ave->fw_state == AVE_FW_RUNNING)
-			ave_cmd_close(ctx);
+		}
+		if (ave->fw_state == AVE_FW_RUNNING) {
+			int cerr = ave_cmd_close(ctx);
+
+			err = err ?: cerr;
+		}
+		/*
+		 * An MCTF session whose Complete or Close went unanswered, or
+		 * with frames still out, stays live in the firmware: fail the
+		 * firmware so only a proven power cycle ends it.
+		 */
+		if (ctx->mctf && (err || sess->busy) &&
+		    ave->fw_state == AVE_FW_RUNNING) {
+			dev_err(ave->dev, "MCTF session close not confirmed (%d, %u frames out)\n",
+				err, sess->busy);
+			ave_fw_mark_broken(ave, err ?: -EBUSY, "Close");
+		}
 	}
-	sess->fw_open = false;
 	ave->sessions[idx] = NULL;
 	if (!ave_session_count(ave))
 		ave_fw_halt(ave);
@@ -697,14 +719,15 @@ static int ave_session_attach(struct ave_ctx *ctx)
 {
 	struct ave_dev *ave = ctx->ave;
 	struct ave_session *sess = ctx->sess;
+	unsigned int max_sessions = ave->layout->max_sessions ?: AVE_MAX_SESSIONS;
 	int idx = -1, ret;
 
 	lockdep_assert_held(&ave->hw_lock);
-	for (unsigned int i = 0; i < AVE_MAX_SESSIONS && idx < 0; i++)
+	for (unsigned int i = 0; i < max_sessions && idx < 0; i++)
 		if (!ave->sessions[i])
 			idx = i;
 	if (idx < 0) {
-		dev_err(ave->dev, "already encoding %u streams\n", AVE_MAX_SESSIONS);
+		dev_err(ave->dev, "already encoding %u streams\n", max_sessions);
 		return -EBUSY;
 	}
 	if (!ave_session_count(ave)) {
@@ -720,9 +743,11 @@ static int ave_session_attach(struct ave_ctx *ctx)
 	sess->frames = 0;
 	sess->nudged = false;
 	ave->sessions[idx] = ctx;
-	ret = ave_cmd_open(ctx);
+	ret = ctx->mctf ? ave_sess_mctf_borrow(ctx) : 0;
 	if (!ret)
-		ret = ave_cmd_start(ctx);
+		ret = ave_cmd_open(ctx);
+	if (!ret)
+		ret = ctx->mctf ? ave_mctf_cmd_start(ctx) : ave_cmd_start(ctx);
 	if (ret)
 		ave_session_close(ctx, false);
 	return ret;
@@ -774,6 +799,9 @@ static void ave_session_free(struct ave_ctx *ctx)
 		if (s->src)
 			v4l2_m2m_buf_done(s->src, VB2_BUF_STATE_ERROR);
 		s->src = NULL;
+		if (s->dst)
+			v4l2_m2m_buf_done(s->dst, VB2_BUF_STATE_ERROR);
+		s->dst = NULL;
 	}
 	atomic_set(&ctx->ready, 0);
 	ave_sess_destroy(ctx);
@@ -785,15 +813,26 @@ static void ave_session_free(struct ave_ctx *ctx)
 static int ave_session_begin(struct ave_ctx *ctx)
 {
 	struct ave_dev *ave = ctx->ave;
+	struct iommu_domain *domain;
 	struct ave_session *sess;
 	bool pm_lost;
 	int ret;
 
 	if (ctx->sess)
 		return 0;
-	ret = ave_fw_check_build(ave);
+	/* The domain type can still change (DMA to DMA-FQ) while bound. */
+	domain = iommu_get_domain_for_dev(ave->dev);
+	if (!domain || !ave_domain_type_safe(domain->type)) {
+		dev_err(ave->dev,
+			"encoder DMA domain is not strict (type %#x); refusing to start\n",
+			domain ? domain->type : 0);
+		return -EPERM;
+	}
+	ret = ctx->mctf ? ave_mctf_check_build(ave) : ave_fw_check_build(ave);
 	if (ret)
 		return ret;
+	if (ave->layout->max_sessions == 1 && READ_ONCE(ave->sessions[0]))
+		return -EBUSY;
 	if (READ_ONCE(ave->sessions[0]) && READ_ONCE(ave->sessions[1]))
 		return -EBUSY;
 	/* A halted firmware restarts only from reset: let the power go first. */
@@ -829,7 +868,7 @@ static int ave_session_begin(struct ave_ctx *ctx)
  * Open and Start it again with the same parameters; its next frame is an
  * IDR with fresh parameter sets, so the stream stays decodable.
  */
-static int ave_session_reopen(struct ave_ctx *ctx)
+int ave_session_reopen(struct ave_ctx *ctx)
 {
 	bool pm_lost;
 	int ret;
@@ -922,7 +961,7 @@ static void ave_stop_streaming(struct vb2_queue *q)
 		WRITE_ONCE(ctx->failed, false);
 }
 
-static const struct vb2_ops ave_qops = {
+const struct vb2_ops ave_qops = {
 	.queue_setup = ave_queue_setup,
 	.buf_prepare = ave_buf_prepare,
 	.buf_queue = ave_buf_queue,
@@ -1080,7 +1119,7 @@ static int ave_encode_one(struct ave_ctx *ctx)
 	ret = ave_sess_input(ctx, slot, src, &input);
 	if (!ret)
 		ret = ave_cmd_process(ctx, slot, src, input, READ_ONCE(ctx->bitrate),
-				      xchg(&ctx->force_key_frame, false));
+				      xchg(&ctx->force_key_frame, false), last);
 	if (ret) {
 		v4l2_m2m_buf_done(src, VB2_BUF_STATE_ERROR);
 		return ret;
@@ -1141,7 +1180,7 @@ static bool ave_finish_drain(struct ave_ctx *ctx)
 }
 
 /* The firmware or the session failed: return everything, fail the queues. */
-static void ave_job_fail(struct ave_ctx *ctx, int err)
+void ave_job_fail(struct ave_ctx *ctx, int err)
 {
 	struct ave_dev *ave = ctx->ave;
 	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
@@ -1417,8 +1456,13 @@ int ave_v4l2_register(struct ave_dev *ave)
 	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
 	if (ret)
 		goto err_m2m;
+	ret = ave_mctf_register(ave);
+	if (ret)
+		goto err_vdev;
 	return 0;
 
+err_vdev:
+	video_unregister_device(vdev);
 err_m2m:
 	v4l2_m2m_release(ave->m2m_dev);
 err_v4l2:
@@ -1433,6 +1477,7 @@ err_wq:
 
 void ave_v4l2_unregister(struct ave_dev *ave)
 {
+	ave_mctf_unregister(ave);
 	video_unregister_device(&ave->vdev);
 	v4l2_m2m_release(ave->m2m_dev);
 	v4l2_device_unregister(&ave->v4l2_dev);

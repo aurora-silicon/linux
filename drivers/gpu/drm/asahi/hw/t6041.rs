@@ -9,7 +9,9 @@ use crate::hw::{GpuGen, GpuVariant};
 use super::t604x::{instances, window};
 use crate::mmu::UatQuirks;
 
-pub(crate) const CONFIG: Config = Config {
+/// What the configurations of the firmware builds share: the 40-core M4 Max measured with
+/// 25F84. The 40-core 25G83 configuration only has its own register map.
+pub(super) const BASE: Config = Config {
     chip_id: CHIP_ID,
     identity: Identity {
         family: 0xa,
@@ -24,13 +26,14 @@ pub(crate) const CONFIG: Config = Config {
     secondary_root_offset: None,
     crash_buffers: CrashBuffers::FirmwareData,
     // Unverified placement; use the M4 Pro layout.
-    pm_metrics: FixedBuffer {
+    profile: crate::g17::FirmwareProfile::PublishedRoots,
+    pm_metrics: Some(FixedBuffer {
         va: 0x10_0008_0000,
         size: 0x8000,
-    },
+    }),
     windows: &REGISTER_WINDOWS,
     reserved_slots: &RESERVED_SLOTS,
-    perf: &PERF,
+    perf: Some(&PERF),
     opps: OPPS,
     uat_quirks: UatQuirks {
         reserved_tables: true,
@@ -38,34 +41,17 @@ pub(crate) const CONFIG: Config = Config {
         page_tlbi: true,
         handoff_lock: false,
         handoff_slot: 0xffff_ffff,
+        handoff_unk2: 0,
         native_gpu_permissions: true,
     },
-    region_c: &REGION_C,
+    region_c: Some(&REGION_C),
     chip: Some(&CHIP),
+    m5: None,
     adopt_root_entries: false,
     fabric_bridge: false,
     recovery_slot_keys: None,
     gpu_generation: GpuGen::G16,
-    firmware: fw::variant::Firmware::Identified(&[fw::variant::Build {
-        os_version: [26, 5, 2],
-        name: "macOS 26.5.2 (25F84, iBoot mBoot-18000.121.3)",
-        images: &[crate::fwid::FirmwareBuild {
-            name: "Apple GFX 25F84 for T6041 (normalized loaded image)",
-            text_size: 0x60000,
-            data_size: 0x138000,
-            entropy: [0x5983a, 0x5991d],
-            text_sha256: [
-                0x6d, 0xa4, 0xd4, 0x42, 0x35, 0x35, 0x14, 0x44, 0xf6, 0xec, 0x00, 0x33, 0xf1, 0x9c,
-                0xbf, 0x98, 0xd3, 0x43, 0x91, 0x28, 0x83, 0xe4, 0xe2, 0x94, 0xc1, 0x8b, 0xb8, 0xb8,
-                0xa3, 0xc1, 0x83, 0xe8,
-            ],
-        }],
-        // macOS writes these tiler segment values on this machine, not the two-cluster ones.
-        variant: &fw::variant::Variant {
-            ta_mode_1: true,
-            ..fw::variant::V25F84
-        },
-    }]),
+    firmware: fw::variant::Firmware::Identified(&[]),
     core_layout: CoreLayout {
         cores: Some((4, 40)),
         alternate_core_masks: None,
@@ -73,6 +59,102 @@ pub(crate) const CONFIG: Config = Config {
         deflake: fw::render::Deflake::FOUR_CLUSTERS,
         compute_blocks: 160,
     },
+};
+
+/// The 40-core M4 Max. 25F84 runs this configuration; 25G83 runs [`CONFIG_25G83`], or
+/// [`super::t6041_25g83::CONFIG`] on a 32-core part.
+pub(crate) const CONFIG: Config = Config {
+    firmware: fw::variant::Firmware::Identified(&BUILDS),
+    ..BASE
+};
+
+/// The 25G83 image is admitted twice, with the configuration of each measured core layout;
+/// the one that matches the probed cores is used.
+const BUILDS: [fw::variant::Build; 3] = [
+    BUILD_25F84,
+    fw::variant::Build {
+        config: Some(&CONFIG_25G83),
+        ..BUILD_25G83
+    },
+    fw::variant::Build {
+        name: "macOS 26.6.2 (25G83, iBoot mBoot-18000.161.10), 32 cores",
+        config: Some(&super::t6041_25g83::CONFIG),
+        ..BUILD_25G83
+    },
+];
+
+const BUILD_25F84: fw::variant::Build = fw::variant::Build {
+    os_version: [26, 5, 2],
+    name: "macOS 26.5.2 (25F84, iBoot mBoot-18000.121.3)",
+    images: &[crate::fwid::FirmwareBuild {
+        name: "Apple GFX 25F84 for T6041 (normalized loaded image)",
+        text_size: 0x60000,
+        data_size: 0x138000,
+        entropy: &[[0x5983a, 0x5991d]],
+        boot_filled: &[],
+        text_sha256: [
+            0x6d, 0xa4, 0xd4, 0x42, 0x35, 0x35, 0x14, 0x44, 0xf6, 0xec, 0x00, 0x33, 0xf1, 0x9c,
+            0xbf, 0x98, 0xd3, 0x43, 0x91, 0x28, 0x83, 0xe4, 0xe2, 0x94, 0xc1, 0x8b, 0xb8, 0xb8,
+            0xa3, 0xc1, 0x83, 0xe8,
+        ],
+    }],
+    // macOS writes these tiler segment values on this machine, not the two-cluster ones.
+    variant: &fw::variant::Variant {
+        ta_mode_1: true,
+        ..fw::variant::V25F84
+    },
+    config: None,
+};
+
+/// The macOS 26.6.2 boot firmware (iBoot mBoot-18000.161.10) loads the 25G83 build the M4 Pro
+/// runs. iBoot fills part of the loaded TEXT for each Mac, so each admitted image is a
+/// measurement. Two are listed: the 32-core J616C's, which runs with
+/// [`super::t6041_25g83::CONFIG`], and the 40-core J614C's, which runs with [`CONFIG_25G83`].
+pub(super) const BUILD_25G83: fw::variant::Build = fw::variant::Build {
+    os_version: [26, 6, 2],
+    name: "macOS 26.6.2 (25G83, iBoot mBoot-18000.161.10)",
+    images: &[
+        crate::fwid::FirmwareBuild {
+            name: "Apple GFX 25G83 for T6041 (normalized loaded image, 32-core J616C)",
+            text_size: 0x60000,
+            data_size: 0x138000,
+            entropy: &[[0x59839, 0x5991c]],
+            boot_filled: &[],
+            text_sha256: [
+                0xaa, 0x11, 0x3e, 0xd6, 0x20, 0x79, 0xbc, 0xfd, 0xee, 0xf0, 0xf8, 0x6c, 0x2a, 0x8d,
+                0x7e, 0xae, 0x9f, 0x90, 0x7b, 0x03, 0xbe, 0x28, 0xcc, 0xf2, 0x98, 0xc9, 0x43, 0x95,
+                0x1d, 0x0e, 0xff, 0xc5,
+            ],
+        },
+        crate::fwid::FirmwareBuild {
+            name: "Apple GFX 25G83 for T6041 (normalized loaded image, 40-core J614C)",
+            text_size: 0x60000,
+            data_size: 0x138000,
+            entropy: &[[0x59839, 0x5991c]],
+            boot_filled: &[],
+            text_sha256: [
+                0x7c, 0x04, 0x36, 0x0e, 0x05, 0xa6, 0xb8, 0x62, 0x8f, 0x61, 0x26, 0x2d, 0x0a, 0x24,
+                0x41, 0x66, 0x18, 0x7a, 0xd8, 0x7a, 0x73, 0x47, 0x16, 0xd8, 0x91, 0x09, 0x08, 0xe9,
+                0x4f, 0xfe, 0xc0, 0x8a,
+            ],
+        },
+    ],
+    // Four clusters: the tiler segment values of 25F84 on this machine.
+    variant: &fw::variant::Variant {
+        ta_mode_1: true,
+        ..fw::variant::V25G83
+    },
+    config: None,
+};
+
+/// The 40-core M4 Max on 25G83: the 25F84 configuration with the 25G83 register map and
+/// [`CHIP_25G83`].
+const CONFIG_25G83: Config = Config {
+    windows: &REGISTER_WINDOWS_25G83,
+    reserved_slots: &[],
+    chip: Some(&CHIP_25G83),
+    firmware: fw::variant::Firmware::Identified(&[BUILD_25G83]),
+    ..BASE
 };
 
 pub(crate) const CHIP_ID: u32 = 0x6041;
@@ -113,6 +195,69 @@ pub(crate) const REGISTER_WINDOWS: [RegisterWindow; 25] = [
     window(43, 0x2_88e6_0000, 0x2f_8000, 0x58, 0xe6_0000, 2),
 ];
 
+/// The register map of the 25G83 build: the windows of [`REGISTER_WINDOWS`] (slot 3 holds the
+/// eight memory controllers) laid out as 25G83 lays them out on the M4 Pro
+/// ([`super::t6040::REGISTER_WINDOWS`]), from `+0x20_0000`, each window followed by a 16K
+/// guard page, with no reserved slots. The windows after slot 3 lie 0x60000 further than the M4
+/// Pro's, for its four more controllers.
+pub(crate) const REGISTER_WINDOWS_25G83: [RegisterWindow; 25] = [
+    window(0, 0x5_0241_4000, 0x20_0000, 0x4000, 0, 2),
+    instances(
+        window(3, 0x2_201c_4000, 0x20_8000, 0x1_8000, 0, 2),
+        8,
+        0x200_0000,
+    ),
+    window(4, 0x5_0244_c000, 0x2c_c000, 0x4000, 0, 0),
+    window(9, 0x5_003d_0000, 0x2d_4000, 0x4000, 0, 2),
+    window(10, 0x5_003c_0000, 0x2d_c000, 0x4000, 0, 0),
+    window(11, 0x5_003d_8000, 0x2e_4000, 0x4000, 0, 2),
+    window(12, 0x4_8565_c000, 0x2e_c000, 0x4000, 0, 2),
+    window(14, 0x5_0040_0000, 0x2f_4000, 0x1_0000, 0, 0),
+    window(15, 0x5_0cdc_0000, 0x30_8000, 0x4000, 0, 0),
+    window(17, 0x2_8800_0000, 0x31_0000, 0x2_1400, 0, 2),
+    instances(
+        window(20, 0x2_8b00_0000, 0x33_8000, 0x4_0000, 0, 2),
+        4,
+        0x20_0000,
+    ),
+    window(22, 0x2_8900_0000, 0x43_c000, 0x8000, 0, 2),
+    window(26, 0x2_88d0_4000, 0x44_8000, 0x8000, 0xd0_4000, 2),
+    window(28, 0x2_88d5_8000, 0x45_4000, 0x8000, 0xd5_8000, 2),
+    window(29, 0x2_88d1_0000, 0x46_0000, 0x4000, 0xd1_0000, 2),
+    window(31, 0x2_88d4_0000, 0x46_8000, 0x4000, 0xd4_0000, 2),
+    window(32, 0x2_88d6_0000, 0x47_0000, 0x2_0000, 0xd6_0000, 2),
+    window(33, 0x2_88d4_4000, 0x49_4000, 0x4000, 0xd4_4000, 2),
+    window(34, 0x2_88d4_c000, 0x49_c000, 0x200, 0xd4_c000, 2),
+    window(35, 0x2_88e0_0000, 0x4a_4000, 0x4000, 0xe0_0000, 2),
+    window(37, 0x2_88e4_0000, 0x4a_c000, 0x4000, 0xe4_0000, 2),
+    window(39, 0x2_88e0_8000, 0x4b_4000, 0x8000, 0, 2),
+    window(40, 0x2_88e1_c000, 0x4c_0000, 0x4000, 0xe1_c000, 2),
+    window(41, 0x2_88e1_f800, 0x4c_b800, 0x4000, 0, 2),
+    window(43, 0x2_88e6_0000, 0x4d_4000, 0x58, 0xe6_0000, 2),
+];
+
+// The 25G83 map holds the 25F84 windows, laid out as 25G83 lays out the M4 Pro's.
+const _: () = {
+    assert!(super::t604x::laid_out_25g83(
+        &super::t6040::REGISTER_WINDOWS
+    ));
+    assert!(super::t604x::laid_out_25g83(&REGISTER_WINDOWS_25G83));
+    let mut index = 0;
+    while index < REGISTER_WINDOWS.len() {
+        let (f84, g83) = (&REGISTER_WINDOWS[index], &REGISTER_WINDOWS_25G83[index]);
+        assert!(
+            f84.slot == g83.slot
+                && f84.phys == g83.phys
+                && f84.size == g83.size
+                && f84.unk_18 == g83.unk_18
+                && f84.unk_20 == g83.unk_20
+                && f84.instances == g83.instances
+                && f84.phys_stride == g83.phys_stride
+        );
+        index += 1;
+    }
+};
+
 const RESERVED_SLOTS: [usize; 14] = [2, 5, 6, 7, 8, 27, 30, 38, 42, 46, 47, 48, 49, 52];
 
 pub(crate) const PERF: PerfConfig = PerfConfig {
@@ -136,7 +281,7 @@ const _: () = {
 
 const MAX_POWER_MW: u32 = 129_702;
 
-const REGION_C: RegionCConfig = RegionCConfig {
+pub(super) const REGION_C: RegionCConfig = RegionCConfig {
     unk_54: 0x0fa0,
     unk_78: [1, 0, 0],
     max_power_mw: MAX_POWER_MW,
@@ -176,6 +321,22 @@ const CHIP: v25g83::Chip = v25g83::Chip {
     power_config_words: POWER_CONFIG_WORDS,
     perf_a_replicate_lanes: true,
     cs_perf_table: false,
+};
+
+/// [`CHIP`] for 25G83: its hardware data has 0 at `+0x2610`.
+///
+/// 25F84 runs with 1 there. On 25G83 the 40-core J614C then accepts work and marks it done,
+/// but the GPU never runs it: no completion, no fault, every job times out. With 0, which is
+/// also what the J616C's 25G83 contents have, compute and render work run.
+const CHIP_25G83: v25g83::Chip = v25g83::Chip {
+    hw_data_words: HW_DATA_WORDS_25G83,
+    ..CHIP
+};
+
+/// [`HW_DATA_WORDS`] without its last word, `+0x2610 = 1`.
+const HW_DATA_WORDS_25G83: &[(usize, u32, usize)] = match HW_DATA_WORDS.split_last() {
+    Some((&(0x2610, 1, 1), rest)) => rest,
+    _ => panic!("the last T6041 hardware data word must be +0x2610"),
 };
 
 const HW_DATA_WORDS: &[(usize, u32, usize)] = &[

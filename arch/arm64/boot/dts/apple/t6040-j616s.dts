@@ -305,5 +305,14 @@
 };
 
 &pcie0 {
-	power-domains = <&ps_apcie_sys_gp>;
+	power-domains = <&ps_apcie_sys_gp>, <&ps_apcie_phy_sw>;
+};
+
+/* The debug UART on the DebugUSB port; it is not the console. */
+&serial0 {
+	status = "okay";
+};
+
+&ps_uart0 {
+	status = "okay";
 };

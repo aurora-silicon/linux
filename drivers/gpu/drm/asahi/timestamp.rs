@@ -18,6 +18,8 @@ use kernel::{uapi, xarray};
 pub(crate) struct FirmwareBuffer {
     mapping: Arc<mmu::KernelMapping>,
     cpu: mmu::TimestampVmap,
+    /// Mapped in the firmware's timestamp window: the firmware may write stamps itself.
+    window: bool,
 }
 
 /// A bound timestamp destination. Only backends which publish firmware writes need a UAT alias.
@@ -37,11 +39,42 @@ pub(crate) enum Buffer {
 
 impl Buffer {
     pub(crate) fn firmware(mapping: mmu::KernelMapping) -> Result<Self> {
+        Self::new_firmware(mapping, false)
+    }
+
+    /// A buffer aliased in the firmware's timestamp window.
+    pub(crate) fn firmware_window(mapping: mmu::KernelMapping) -> Result<Self> {
+        Self::new_firmware(mapping, true)
+    }
+
+    fn new_firmware(mapping: mmu::KernelMapping, window: bool) -> Result<Self> {
         let cpu = mapping.timestamp_vmap()?;
         Ok(Self::Firmware(crate::cleanup::Deferred::new(FirmwareBuffer {
             mapping: Arc::new(mapping, GFP_KERNEL)?,
             cpu,
+            window,
         })?))
+    }
+
+    /// The window address of the timestamp at `offset`, for a window buffer and an aligned
+    /// destination that lies wholly inside the mapping.
+    pub(crate) fn window_va(&self, offset: usize) -> Option<u64> {
+        match self {
+            Self::Firmware(buffer) if buffer.window && offset % size_of::<u64>() == 0 => {
+                let end = offset.checked_add(size_of::<u64>())?;
+                (end <= buffer.mapping.size()).then(|| buffer.mapping.iova() + offset as u64)
+            }
+            _ => None,
+        }
+    }
+
+    /// Reads the aligned timestamp at an object offset returned by [`Self::timestamp_offset`].
+    pub(crate) fn read_timestamp(&self, offset: usize) -> Option<u64> {
+        match self {
+            Self::Firmware(buffer) => buffer.cpu.read(offset),
+            #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
+            Self::Cpu { .. } => None,
+        }
     }
 
     /// Retain a CPU-written byte range without publishing any firmware address.

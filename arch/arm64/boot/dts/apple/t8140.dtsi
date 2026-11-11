@@ -1176,7 +1176,12 @@
 				       <&pmp_report_ave0>;
 			power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1",
 					     "perf";
-			iommus = <&ave_dart0 0>, <&ave_dart1 0>;
+			/*
+			 * Stream 12 carries the temporal filter engines; it must
+			 * translate through the encoder's domain, not bypass.
+			 */
+			iommus = <&ave_dart0 0>, <&ave_dart0 12>,
+				 <&ave_dart1 0>, <&ave_dart1 12>;
 			status = "disabled";
 		};
 
@@ -1206,7 +1211,7 @@
 			#size-cells = <2>;
 			ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0x0 0x20000000>,
 				 <0x02000000 0x0 0x80000000 0xb 0x80000000 0x0 0x40000000>;
-			power-domains = <&ps_apcie_gp>;
+			power-domains = <&ps_apcie_phy_sw>;
 			status = "disabled";
 
 			pcie0_port0: pci@0,0 {

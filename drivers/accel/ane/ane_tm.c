@@ -2,6 +2,8 @@
 /* Copyright 2022 Eileen Yoon <eyn@gmx.com> */
 
 #include <linux/device.h>
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
 #include <linux/iopoll.h>
 #include <linux/pm_runtime.h>
 #include <linux/module.h>
@@ -269,6 +271,27 @@ static int ane_tm_poll_step(struct ane_device *ane, struct ane_request *req,
 	return ane_tm_collect_events(ane, req, finished);
 }
 
+/*
+ * Keep the engine wedged until reboot and tell userspace: the wedged
+ * attribute stays 1 (pollable), wedge_reason says why, and a change uevent
+ * carries ANE_WEDGED=1. Resources stay preserved, as for a failed reset.
+ */
+static void ane_tm_wedge_final(struct ane_device *ane, const char *reason)
+{
+	static char *env[] = { "ANE_WEDGED=1", NULL };
+
+	lockdep_assert_held(&ane->engine_lock);
+	if (ane->wedge_final)
+		return;
+	ane->wedge_final = true;
+	ane->wedge_reason = reason;
+	dev_err(ane->dev,
+		"engine wedged until reboot: %s; submissions refused, resources retained\n",
+		reason);
+	sysfs_notify(&ane->dev->kobj, NULL, "wedged");
+	kobject_uevent_env(&ane->dev->kobj, KOBJ_CHANGE, env);
+}
+
 int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 {
 	u32 finished = 0;
@@ -373,6 +396,7 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 	rmb();
 	tq_write32(ane, TQ_STATUS(req->qid), 0x0);
 	ane_dart_unmask(ane);
+	ane->recovery_probation = false;
 	return 0;
 
 wedge:
@@ -382,6 +406,15 @@ wedge:
 		dev_err(ane->dev,
 			"tm completion failed: %d, finish lines=%x (q%d nid=%#x)\n",
 			err, finished, req->qid, req->nid);
+	}
+
+	if (!ane_tm_failure_recoverable(ane->tm_retention,
+					ane->recovery_probation, err,
+					finished)) {
+		ane_tm_wedge_final(ane, ane->recovery_probation ?
+				   "the first job after a recovery hung without an event" :
+				   "a job hung without a completion event and the task manager keeps it through a power cycle");
+		return err;
 	}
 
 	/* One bounded recovery attempt: stop the tm, power-cycle the engine
@@ -605,6 +638,11 @@ int ane_tm_recover(struct ane_device *ane)
 	lockdep_assert_held(&ane->engine_lock);
 	if (!atomic_read(&ane->wedged))
 		return 0;
+	if (ane->wedge_final) {
+		dev_err(ane->dev, "no recovery: %s; reboot required\n",
+			ane->wedge_reason);
+		return -EIO;
+	}
 
 	dev_err(ane->dev, "recovering: power-cycling engine partitions\n");
 
@@ -659,6 +697,8 @@ int ane_tm_recover(struct ane_device *ane)
 		 * module lifetime.
 		 */
 		ane_reclaim_preserved(ane);
+		/* Idle is all a reset can show; the next job proves it. */
+		ane->recovery_probation = true;
 		dev_info(ane->dev, "tm recovered: idle, accepting work again\n");
 	}
 	return 0;

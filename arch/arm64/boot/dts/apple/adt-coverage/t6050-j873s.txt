@@ -1192,14 +1192,14 @@
 /arm-io/dart-pmp1 - -> MISSING
 /arm-io/dart-pmp1/mapper-pmp1 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
 /arm-io/dart-pmp1/mapper-pmp1-ptd-fwd - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
-/arm-io/sep 0x502600000 -> /soc/sep@502600000
-/arm-io/sep/iop-sep-nub - -> /soc/sep@502600000
-/arm-io/sep/iop-sep-nub/Sandcat - -> /soc/sep@502600000
-/arm-io/sep/iop-sep-nub/xART - -> /soc/sep@502600000
-/arm-io/sep/iop-sep-nub/InvalidateHmac - -> /soc/sep@502600000
-/arm-io/dart-sep 0x500b80000 -> /soc/iommu@500b80000
-/arm-io/dart-sep/mapper-sep - -> /soc/iommu@500b80000
-/arm-io/dart-sep/mapper-sep-exclave - -> /soc/iommu@500b80000
+/arm-io/sep 0x502600000 -> /soc@200000000/sep@502600000
+/arm-io/sep/iop-sep-nub - -> /soc@200000000/sep@502600000
+/arm-io/sep/iop-sep-nub/Sandcat - -> /soc@200000000/sep@502600000
+/arm-io/sep/iop-sep-nub/xART - -> /soc@200000000/sep@502600000
+/arm-io/sep/iop-sep-nub/InvalidateHmac - -> /soc@200000000/sep@502600000
+/arm-io/dart-sep 0x500b80000 -> /soc@200000000/iommu@500b80000
+/arm-io/dart-sep/mapper-sep - -> /soc@200000000/iommu@500b80000
+/arm-io/dart-sep/mapper-sep-exclave - -> /soc@200000000/iommu@500b80000
 /arm-io/esm 0x54267c000 -> MISSING
 /arm-io/ans 0x419600000 -> /soc@200000000/nvme@45dcc0000
 /arm-io/ans/iop-ans-nub - -> /soc@200000000/nvme@45dcc0000

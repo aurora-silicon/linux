@@ -62,7 +62,9 @@ properties:
       follow the temperature-* children in the listed order and are labelled
       "SoC die <key>". Keys absent from the running firmware or with an
       unsupported format are skipped. These channels do not change the indices
-      used by thermal-sensors references to temperature-* children.
+      used by thermal-sensors references to temperature-* children. With
+      apple,discover-temperatures, a listed key adds no channel; its
+      discovered channel (labelled with the key) supplies the zone.
 
   apple,thermal-pressure-key:
     $ref: /schemas/types.yaml#/definitions/string

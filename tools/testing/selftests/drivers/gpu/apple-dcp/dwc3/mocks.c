@@ -36,6 +36,7 @@ struct phy_ops {
 	int (*exit)(struct phy *);
 	int (*power_on)(struct phy *);
 	int (*power_off)(struct phy *);
+	int (*reset)(struct phy *);
 };
 struct phy {
 	struct apple_atcphy *data;

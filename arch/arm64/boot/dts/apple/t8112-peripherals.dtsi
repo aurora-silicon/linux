@@ -42,7 +42,6 @@
 			<AIC_IRQ 242 IRQ_TYPE_LEVEL_HIGH>,
 			<AIC_IRQ 246 IRQ_TYPE_LEVEL_HIGH>,
 			<AIC_IRQ 250 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 	};
 
 	m2_mcc: memory-controller@200100000 {
@@ -52,7 +51,6 @@
 			<0x2 0x1000000 0x0 0x2000000>,
 			<0x2 0xf00000 0x0 0x100000>,
 			<0x2 0x3b3c0000 0x0 0x20000>;
-		status = "disabled";
 	};
 
 	m2_aft: fabric-tracker@200110000 {
@@ -72,19 +70,24 @@
 		status = "disabled";
 	};
 
-	m2_pwm: pwm@235040000 {
-		compatible = "apple,t8112-pwm", "apple,pwm";
+	/*
+	 * The FPWM0 instance, next to the keyboard backlight's FPWM1. No board
+	 * wires it to anything known: a spare PWM channel with no consumer.
+	 */
+	fpwm0: pwm@235040000 {
+		compatible = "apple,t8112-fpwm", "apple,s5l-fpwm";
 		reg = <0x2 0x35040000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 766 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_fpwm0>;
+		clocks = <&clkref>;
+		#pwm-cells = <2>;
 		status = "disabled";
 	};
 
 	m2_aic_timebase: timer@23b0dc000 {
 		compatible = "apple,t8112-aic-timebase", "apple,aic-timebase";
 		reg = <0x2 0x3b0dc000 0x0 0x1000>;
-		status = "disabled";
 	};
 
 	m2_dwi: dwi@23b200000 {
@@ -93,7 +96,6 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 17 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_dwi>;
-		status = "disabled";
 	};
 
 	m2_event_log_handler: event-log@23b700000 {
@@ -142,7 +144,6 @@
 			<0x2 0x3d10c000 0x0 0x1000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 368 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 		apple,sw-drain;
 	};
 

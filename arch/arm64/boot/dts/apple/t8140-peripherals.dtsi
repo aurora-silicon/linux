@@ -86,7 +86,6 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 23 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_dwi>;
-		status = "disabled";
 	};
 
 	/* ADT /arm-io/aes. */
@@ -505,14 +504,13 @@
 		status = "disabled";
 	};
 
-	/* ADT /dock-connect; no qualified host transport/ownership contract. */
+	/* ADT /dock-connect: debug dock connection status, read only. */
 	debug_dock: debug-dock@3082d8008 {
 		compatible = "apple,t8140-debug-dock", "apple,debug-dock";
 		reg = <0x3 0x082d8008 0x0 0x4>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 303 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 304 IRQ_TYPE_LEVEL_HIGH>;
-		status = "disabled";
 	};
 
 	/* ADT /arm-io/eic named MMIO apertures are absolute addresses. */

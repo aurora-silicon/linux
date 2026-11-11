@@ -10,6 +10,7 @@
  */
 
 #include <dt-bindings/leds/common.h>
+#include <dt-bindings/thermal/thermal.h>
 
 / {
 	chassis-type = "laptop";
@@ -997,6 +998,628 @@
 #include "spi1-nvram.dtsi"
 #include "hwmon-laptop.dtsi"
 #include "hwmon-fan-dual.dtsi"
+
+/*
+ * GPU temperatures. The SMC publishes them only while the GPU is powered:
+ * with the GPU off, Tg04/Tg0C read 0 C and Tg05/Tg0D read 9.2 C (they
+ * track Tg04/Tg0C plus a fixed 9.2 C). Those placeholders are no data.
+ */
+&smc_hwmon {
+	temperature-Tg04 {
+		apple,key-id = "Tg04";
+		label = "GPU Tg04";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg05 {
+		apple,key-id = "Tg05";
+		label = "GPU Tg05";
+		apple,no-data-below-millicelsius = <15000>;
+	};
+
+	temperature-Tg0C {
+		apple,key-id = "Tg0C";
+		label = "GPU Tg0C";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0D {
+		apple,key-id = "Tg0D";
+		label = "GPU Tg0D";
+		apple,no-data-below-millicelsius = <15000>;
+	};
+};
+
+/*
+ * CPU temperatures, after the channels above so their numbers do not
+ * change. Each sensor site has three keys: the reading (TpX0), the same
+ * plus a fixed offset (TpX1: 9 C, Te01: 13.4 C), and a hotspot estimate
+ * (TpX2) above both. TCMz is the hottest of the hotspot keys. Under
+ * load on one cluster at a time, Tp00-Tp0I follow the first P cluster,
+ * Tp0K-Tp0c the second, and Te00-Te02 the E cluster.
+ */
+&smc_hwmon {
+	#thermal-sensor-cells = <1>;
+
+	temperature-TCMz {
+		apple,key-id = "TCMz";
+		label = "SoC Die Temperature";
+	};
+
+	temperature-Te00 {
+		apple,key-id = "Te00";
+		label = "E-cluster Te00";
+	};
+
+	temperature-Te01 {
+		apple,key-id = "Te01";
+		label = "E-cluster Te01";
+	};
+
+	temperature-Te02 {
+		apple,key-id = "Te02";
+		label = "E-cluster Te02";
+	};
+
+	temperature-Tp00 {
+		apple,key-id = "Tp00";
+		label = "P0-cluster Tp00";
+	};
+
+	temperature-Tp01 {
+		apple,key-id = "Tp01";
+		label = "P0-cluster Tp01";
+	};
+
+	temperature-Tp02 {
+		apple,key-id = "Tp02";
+		label = "P0-cluster Tp02";
+	};
+
+	temperature-Tp04 {
+		apple,key-id = "Tp04";
+		label = "P0-cluster Tp04";
+	};
+
+	temperature-Tp05 {
+		apple,key-id = "Tp05";
+		label = "P0-cluster Tp05";
+	};
+
+	temperature-Tp06 {
+		apple,key-id = "Tp06";
+		label = "P0-cluster Tp06";
+	};
+
+	temperature-Tp08 {
+		apple,key-id = "Tp08";
+		label = "P0-cluster Tp08";
+	};
+
+	temperature-Tp09 {
+		apple,key-id = "Tp09";
+		label = "P0-cluster Tp09";
+	};
+
+	temperature-Tp0A {
+		apple,key-id = "Tp0A";
+		label = "P0-cluster Tp0A";
+	};
+
+	temperature-Tp0C {
+		apple,key-id = "Tp0C";
+		label = "P0-cluster Tp0C";
+	};
+
+	temperature-Tp0D {
+		apple,key-id = "Tp0D";
+		label = "P0-cluster Tp0D";
+	};
+
+	temperature-Tp0E {
+		apple,key-id = "Tp0E";
+		label = "P0-cluster Tp0E";
+	};
+
+	temperature-Tp0G {
+		apple,key-id = "Tp0G";
+		label = "P0-cluster Tp0G";
+	};
+
+	temperature-Tp0H {
+		apple,key-id = "Tp0H";
+		label = "P0-cluster Tp0H";
+	};
+
+	temperature-Tp0I {
+		apple,key-id = "Tp0I";
+		label = "P0-cluster Tp0I";
+	};
+
+	temperature-Tp0K {
+		apple,key-id = "Tp0K";
+		label = "P1-cluster Tp0K";
+	};
+
+	temperature-Tp0L {
+		apple,key-id = "Tp0L";
+		label = "P1-cluster Tp0L";
+	};
+
+	temperature-Tp0M {
+		apple,key-id = "Tp0M";
+		label = "P1-cluster Tp0M";
+	};
+
+	temperature-Tp0O {
+		apple,key-id = "Tp0O";
+		label = "P1-cluster Tp0O";
+	};
+
+	temperature-Tp0P {
+		apple,key-id = "Tp0P";
+		label = "P1-cluster Tp0P";
+	};
+
+	temperature-Tp0Q {
+		apple,key-id = "Tp0Q";
+		label = "P1-cluster Tp0Q";
+	};
+
+	temperature-Tp0S {
+		apple,key-id = "Tp0S";
+		label = "P1-cluster Tp0S";
+	};
+
+	temperature-Tp0T {
+		apple,key-id = "Tp0T";
+		label = "P1-cluster Tp0T";
+	};
+
+	temperature-Tp0U {
+		apple,key-id = "Tp0U";
+		label = "P1-cluster Tp0U";
+	};
+
+	temperature-Tp0W {
+		apple,key-id = "Tp0W";
+		label = "P1-cluster Tp0W";
+	};
+
+	temperature-Tp0X {
+		apple,key-id = "Tp0X";
+		label = "P1-cluster Tp0X";
+	};
+
+	temperature-Tp0Y {
+		apple,key-id = "Tp0Y";
+		label = "P1-cluster Tp0Y";
+	};
+
+	temperature-Tp0a {
+		apple,key-id = "Tp0a";
+		label = "P1-cluster Tp0a";
+	};
+
+	temperature-Tp0b {
+		apple,key-id = "Tp0b";
+		label = "P1-cluster Tp0b";
+	};
+
+	temperature-Tp0c {
+		apple,key-id = "Tp0c";
+		label = "P1-cluster Tp0c";
+	};
+};
+
+/* The zones below throttle the clusters through cpufreq. */
+&cpu_e00 {
+	#cooling-cells = <2>;
+};
+
+&cpu_e01 {
+	#cooling-cells = <2>;
+};
+
+&cpu_p00 {
+	#cooling-cells = <2>;
+};
+
+&cpu_p01 {
+	#cooling-cells = <2>;
+};
+
+&cpu_p02 {
+	#cooling-cells = <2>;
+};
+
+&cpu_p03 {
+	#cooling-cells = <2>;
+};
+
+&cpu_p10 {
+	#cooling-cells = <2>;
+};
+
+&cpu_p11 {
+	#cooling-cells = <2>;
+};
+
+&cpu_p12 {
+	#cooling-cells = <2>;
+};
+
+&cpu_p13 {
+	#cooling-cells = <2>;
+};
+
+/ {
+	/*
+	 * One zone per sensor site on its hotspot key, throttling only the
+	 * cluster the site sits on. The power allocator starts at 75 C, above
+	 * the 46-66 C idle readings, and controls at 105 C. The E site also
+	 * warms with the P clusters, so its zone starts at 85 C: the governor
+	 * grants no power to an idle cluster and would park E at its lowest
+	 * speed. A 180 s load on every CPU, with the fans under SMC control,
+	 * peaks at 95 C on the hottest site and 87 C on the E site without
+	 * any throttling, so these zones are a backstop. There is no hot or
+	 * critical trip: the SMC drives the fans and keeps its own
+	 * protection. sustainable-power is the energy model's four cores at
+	 * 2448 MHz per P cluster and both cores at full speed for E.
+	 */
+	thermal-zones {
+		cpu-e0-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <800>;
+			thermal-sensors = <&smc_hwmon 11>;	/* Te02 */
+
+			trips {
+				cpu_e0_switch_on: trip-switch-on {
+					temperature = <85000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_e0_control: trip-control {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_e0_control>;
+					cooling-device =
+						<&cpu_e00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p00-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <11600>;
+			thermal-sensors = <&smc_hwmon 14>;	/* Tp02 */
+
+			trips {
+				cpu_p00_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p00_control: trip-control {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p00_control>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p01-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <11600>;
+			thermal-sensors = <&smc_hwmon 17>;	/* Tp06 */
+
+			trips {
+				cpu_p01_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p01_control: trip-control {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p01_control>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p02-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <11600>;
+			thermal-sensors = <&smc_hwmon 20>;	/* Tp0A */
+
+			trips {
+				cpu_p02_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p02_control: trip-control {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p02_control>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p03-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <11600>;
+			thermal-sensors = <&smc_hwmon 23>;	/* Tp0E */
+
+			trips {
+				cpu_p03_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p03_control: trip-control {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p03_control>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p04-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <11600>;
+			thermal-sensors = <&smc_hwmon 26>;	/* Tp0I */
+
+			trips {
+				cpu_p04_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p04_control: trip-control {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p04_control>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p10-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <11600>;
+			thermal-sensors = <&smc_hwmon 29>;	/* Tp0M */
+
+			trips {
+				cpu_p10_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p10_control: trip-control {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p10_control>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p11-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <11600>;
+			thermal-sensors = <&smc_hwmon 32>;	/* Tp0Q */
+
+			trips {
+				cpu_p11_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p11_control: trip-control {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p11_control>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p12-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <11600>;
+			thermal-sensors = <&smc_hwmon 35>;	/* Tp0U */
+
+			trips {
+				cpu_p12_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p12_control: trip-control {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p12_control>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p13-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <11600>;
+			thermal-sensors = <&smc_hwmon 38>;	/* Tp0Y */
+
+			trips {
+				cpu_p13_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p13_control: trip-control {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p13_control>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p14-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <11600>;
+			thermal-sensors = <&smc_hwmon 41>;	/* Tp0c */
+
+			trips {
+				cpu_p14_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p14_control: trip-control {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p14_control>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+	};
+};
+
 #include "isp-imx558.dtsi"
 
 &isp {
