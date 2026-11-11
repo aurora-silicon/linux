@@ -456,9 +456,9 @@
 };
 
 /*
- * guess: three of the four back Thunderbolt ports, with the J773s's PD
- * controllers (nub-spmi-a0 0xc, 0xa and 0x8 for ATC0-2), at USB2 high speed
- * as on the J616c. The fourth port (ATC3) is not described.
+ * Three of the four back Thunderbolt ports, with the J773s's PD controllers
+ * (nub-spmi-a0 0xc, 0xa and 0x8 for ATC0-2), at USB2 high speed as on the
+ * J616c. t6041-j575c-atc3.dtsi adds the fourth (hpm3 at 0x6, ATC3).
  */
 &nub_spmi_a0 {
 	status = "okay";
@@ -1049,7 +1049,10 @@
 	memory-region = <&aop_mmio_pmgr>;
 };
 
+
+#include "t6041-j575c-atc3.dtsi"
+
 /*
  * Not described: HDMI and the external display chains (unknown PHY routing
- * on this board), the fourth back port and the SEP (no Touch ID sensor).
+ * on this board) and the SEP (no Touch ID sensor).
  */
