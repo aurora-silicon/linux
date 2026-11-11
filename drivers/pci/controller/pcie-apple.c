@@ -5711,6 +5711,22 @@ static void apple_pcie_stop_for_sleep(struct device *dev)
 
 static void apple_pcie_neo_save_functions(struct apple_pcie *pcie);
 
+/* Whether Linux trained the port above pdev itself (cold train), rather than adopting it */
+static bool apple_pcie_below_kernel_trained_port(struct pci_dev *pdev)
+{
+	struct pci_config_window *cfg = pdev->sysdata;
+	struct apple_pcie *pcie = apple_pcie_lookup(cfg->parent);
+	struct pci_dev *rp = pcie_find_root_port(pdev);
+	struct apple_pcie_port *port;
+
+	if (!rp)
+		return false;
+	list_for_each_entry(port, &pcie->ports, entry)
+		if (port->idx == PCI_SLOT(rp->devfn))
+			return !!port->pwren;
+	return false;
+}
+
 /*
  * The J716c radio drivers save PCI state without entering D3. The PCI core
  * keeps the root port in D0 as well. Its host and DART have no switchable
@@ -5724,6 +5740,16 @@ static int apple_pcie_check_d0(struct pci_dev *pdev, void *data)
 {
 	int *error = data;
 	u16 value;
+
+	/*
+	 * Below a port the boot loader trained (the N1's), every device stays
+	 * in D0. Below a port Linux trained itself (the K116s SD reader's), the
+	 * PCI core restores what it suspends to D3hot, so only the devices that
+	 * asked to stay awake need to remain in D0.
+	 */
+	if (!device_awake_path(&pdev->dev) &&
+	    apple_pcie_below_kernel_trained_port(pdev))
+		return 0;
 
 	if (pci_read_config_word(pdev, PCI_VENDOR_ID, &value) ||
 	    value != pdev->vendor) {
