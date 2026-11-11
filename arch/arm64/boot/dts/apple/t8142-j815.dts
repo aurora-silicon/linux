@@ -2,12 +2,20 @@
 /*
  * Apple MacBook Air (15-inch, M5), J815.
  *
- * Boots on the T8142 inventory with the resources its ADT (25G83) shares
- * with J813: CPUs, timer, AIC, DockChannel UART, PMGR, CPU performance
- * states, PMC, SMC, the MTP keyboard and trackpad, ANS NVMe, watchdog and
- * PMU. The loader supplies usable memory, CPU release addresses and
- * framebuffer geometry. Audio, display, USB, camera, GPU and radios are not
- * described yet: their J815 wiring has not been checked.
+ * J815 is the 15-inch sibling of J813 on the same T8142 die. It uses the
+ * J813 board fragments and overrides what the J815 ADT shows to be
+ * different:
+ *
+ *  - /chosen board-id 0x26 (J813: 0x24)
+ *  - 15.3" 2880x1864 panel (2880x1800 below the notch), 326 x 211 mm
+ *  - six SN012776 speaker amplifiers on i2c3 (0x38-0x3d: two tweeters and
+ *    four force-cancelling woofers); J813 has four
+ *  - ISP sensor-type 0x72 (J813: 0x71)
+ *  - MTP hid-merge-personality C1FD3,3 (J813: C1FD1,4)
+ *
+ * The rest of the J813/J815 ADT difference is firmware selection (AOP
+ * j815aop, acoustic-id 0x2b), ADMAC speaker channel counts and higher
+ * CLPC package power limits.
  */
 /dts-v1/;
 
@@ -110,16 +118,7 @@
 	status = "okay";
 };
 
-&pmgr {
-	status = "okay";
-};
-
-&mtp_dart {
-	/* Keep host allocations clear of firmware's low IOVA mappings. */
-	apple,dma-range = <0 0x02000000 0 0x10000000>;
-	status = "okay";
-};
-
+#include "t8142-j813-peripherals.dtsi"
 #include "t8142-j813-j815.dtsi"
 
 &mtp_hid {
@@ -129,4 +128,7 @@
 	};
 };
 
-/* Unexposed chassis port instances remain described and disabled. */
+&pmp {
+	/* ADT /chosen board-id (J815) */
+	apple,board-id = <38>;
+};
