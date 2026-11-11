@@ -448,6 +448,14 @@ static int ave_fw_prepare_restart(struct ave_dev *ave)
 			return -EAGAIN; /* A runtime PM suspend/resume must intervene. */
 		if (readl(ave->coproc + ave->variant->regs->ctrl))
 			return -EBUSY;
+		/*
+		 * The firmware confirmed its Halt through scratch0, the core
+		 * read back stopped, and runtime PM cycled the VENC power
+		 * before the state left HALTED: the sessions it saw can give
+		 * their memory back now. Without this every 6070 session's
+		 * buffers stayed quarantined until the module was removed.
+		 */
+		ave_sess_reap(ave);
 		status = readl(ave->mbox + AVE_MBOX_STATUS);
 		if (status)
 			writel(status, ave->mbox + AVE_MBOX_STATUS);
@@ -627,6 +635,7 @@ static int ave_fw_boot(struct ave_dev *ave)
 	u32 status, hello[4];
 	int ret;
 
+	ave->boot_unanswered = false;
 	ret = ave_alloc(ave, &ave->ipc, t->ipc_bytes, 0);
 	if (!ret && t->boot_config)
 		ret = ave_alloc(ave, &ave->boot_cfg, SZ_16K, 0);
@@ -757,6 +766,7 @@ static int ave_fw_boot(struct ave_dev *ave)
 	if (ret) {
 		dev_err(ave->dev, "firmware did not answer (status %#x)\n",
 			readl(ave->coproc + ave->variant->regs->status));
+		ave->boot_unanswered = true;
 		return ret;
 	}
 	for (unsigned int i = 0; i < 4; i++)
@@ -801,6 +811,31 @@ static int ave_fw_boot(struct ave_dev *ave)
 	return 0;
 }
 
+/*
+ * A 6070 restart that reached RUN without the firmware posting its hello has
+ * no rings, no session and no command in flight: the core never got as far
+ * as the IPC set-up. Stop the core and, once CTRL reads back zero, treat it
+ * like a confirmed Halt, so the next attempt starts again from a VENC power
+ * cycle instead of leaving the encoder broken until reboot. Seen on the
+ * M1 Pro and M2 roughly once in a few dozen restarts. Caller holds hw_lock.
+ */
+static int ave_fw_stop_unanswered(struct ave_dev *ave)
+{
+	u32 ctrl;
+	int ret;
+
+	writel(0, ave->coproc + ave->variant->regs->ctrl);
+	ret = readl_poll_timeout(ave->coproc + ave->variant->regs->ctrl, ctrl,
+				 !ctrl, 100, AVE_MBOX_TIMEOUT_US);
+	if (ret)
+		return ret;
+	ave->fw_state = AVE_FW_HALTED;
+	memset(ave->ring, 0, sizeof(ave->ring));
+	ave->ipc_fw_base = 0;
+	dev_warn(ave->dev, "stopped the unanswered firmware; restarting it from a power cycle\n");
+	return 0;
+}
+
 /* Caller holds hw_lock. */
 int ave_fw_ensure_running(struct ave_dev *ave)
 {
@@ -826,6 +861,10 @@ int ave_fw_ensure_running(struct ave_dev *ave)
 	/* A boot that reached RUN must use the same recovery as a session fault. */
 	prev = ave->fw_state;
 	ret = ave_fw_boot(ave);
+	if (ret == -ETIMEDOUT && ave->boot_unanswered &&
+	    ave->layout->abi->transport->scratch_halt &&
+	    !ave_fw_stop_unanswered(ave))
+		return -EAGAIN;
 	if (ret && ret != -EAGAIN) {
 		if (ave->layout->abi->transport->scratch_halt &&
 		    (ave->module_pinned ||

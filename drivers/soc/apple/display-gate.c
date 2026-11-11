@@ -2993,8 +2993,10 @@ static const char *const t6041_max_hdmi_nodes[] = {
 };
 
 static const char *const t6041_max_usbc_nodes[] = {
-	/* ATC1 mailbox and crossbar, DARTs, mailbox, route, dcpext1 */
-	"/mailbox@38b148000",
+	/*
+	 * ATC1 crossbar, DARTs, mailbox, route, dcpext1. The ATC1 mailbox is
+	 * the PHY's, on for USB3 whatever the display does, as on the M4 Pro.
+	 */
 	"/mux@38b24c000",
 	"/iommu@602340000",
 	"/iommu@602300000",
@@ -3014,7 +3016,7 @@ static const struct gate_staged t6041_max_stages[] = {
  * mailbox is not part of the chain here, and the rest is the J616c's.
  */
 static const struct gate_staged t6041_j575c_usbc = {
-	"/iommu@602300000", t6041_max_usbc_nodes + 1, ARRAY_SIZE(t6041_max_usbc_nodes) - 1,
+	"/iommu@602300000", t6041_max_usbc_nodes, ARRAY_SIZE(t6041_max_usbc_nodes),
 };
 
 static const struct gate_staged *t6041_max_stage(unsigned int i)

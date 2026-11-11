@@ -236,6 +236,8 @@ struct ave_dev {
 	u32 data_crc;
 	void *data_pristine;
 	bool data_dirty;
+	/* The last boot reached RUN but the firmware never posted its hello. */
+	bool boot_unanswered;
 
 	/* hw_lock protects recovery history and quarantined DMA allocations. */
 	struct ave_recovery_history recovery;

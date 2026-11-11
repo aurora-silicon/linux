@@ -37,7 +37,22 @@ if [ "${AURORA_SEP_SESSION:-0}" != 1 ]; then
     exec keyctl session aurora-sep-load env AURORA_SEP_SESSION=1 "$0" "$@"
 fi
 
-modprobe apple_sep xart_writes=1 provision_keybag=1
+case "$(cat /sys/module/apple_sep/parameters/keystore_only 2>/dev/null || true)" in
+    1 | 2 | Y)
+        completed=false
+        for attribute in /sys/bus/platform/devices/*.sep/complete_attach; do
+            [ -e "$attribute" ] || continue
+            printf '1\n' >"$attribute"
+            completed=true
+            break
+        done
+        if [ "$completed" != true ]; then
+            log "keystore-only driver has no complete_attach attribute"
+            exit 1
+        fi
+        ;;
+    *) modprobe apple_sep xart_writes=1 provision_keybag=1 ;;
+esac
 
 work=$(mktemp -d /run/aurora-sep-load.XXXXXX)
 cleanup() {

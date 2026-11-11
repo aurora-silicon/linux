@@ -1478,7 +1478,9 @@ impl SepData {
             user_outcome,
             RestoreOutcome::Restored | RestoreOutcome::AlreadyActive
         );
-        let lockout_outcome = self.restore_lockout();
+        // The enclave's lockout record goes back after the first password
+        // (see `lockout_import_pending`); here only whether one is stored.
+        let lockout_outcome = self.defer_lockout_import();
         dev_info!(self.dev, "sbio: restore lockout outcome {:?}\n", lockout_outcome);
         let lockout = match lockout_outcome {
             RestoreOutcome::Restored | RestoreOutcome::AlreadyActive => true,
@@ -1647,6 +1649,47 @@ impl SepData {
         }
     }
 
+    /// Notes whether a lockout record is stored, for `import_lockout_after_password`.
+    /// A stored record counts as present for match readiness: until it is
+    /// loaded the host record carries the failed-attempt count, and Touch ID
+    /// waits for the first password anyway.
+    fn defer_lockout_import(&self) -> RestoreOutcome {
+        match self.read_stored(PRIVATE_TYPE_LOCKOUT, c"bio lockout record") {
+            Ok(Some(_)) => {
+                self.lockout_import_pending.store(true, Relaxed);
+                RestoreOutcome::EmptyTolerated
+            }
+            Ok(None) => RestoreOutcome::NoStoredFile,
+            Err(_) => RestoreOutcome::Failed,
+        }
+    }
+
+    /// Hands the saved lockout record back to the enclave once, after the
+    /// first password authentication of the boot, as macOS does after the
+    /// first unlock. Before anything else the re-arm does, so the enclave's
+    /// own count is in place before a password clears it.
+    fn import_lockout_after_password(&self) {
+        if !self.touchid_started.load(Relaxed) || !self.lockout_import_pending.xchg(false, Relaxed) {
+            return;
+        }
+        let Some(_writer) = self.catacomb_writer.try_lock() else {
+            // A capture holds the sensor lock; try again at the next password.
+            self.lockout_import_pending.store(true, Relaxed);
+            return;
+        };
+        if !self.capture_begin() {
+            self.lockout_import_pending.store(true, Relaxed);
+            return;
+        }
+        let outcome = self.restore_lockout();
+        self.capture_end();
+        dev_info!(
+            self.dev,
+            "sbio: lockout record loaded after the first password: {:?}\n",
+            outcome
+        );
+    }
+
     fn restore_lockout(&self) -> RestoreOutcome {
         let blob = match self.read_stored(PRIVATE_TYPE_LOCKOUT, c"bio lockout record") {
             Ok(Some(blob)) => blob,
@@ -1665,12 +1708,13 @@ impl SepData {
                 ) =>
             {
                 // Not a restore: the enclave did not take the record (macOS
-                // discards such a record). The host record keeps the count.
+                // discards such a record). The host record keeps the count,
+                // and the next SAVE_LOCKOUT replaces the stored one.
                 dev_info!(
                     self.dev,
-                    "sbio: LOAD_LOCKOUT refused the saved lockout record (0x8002, it does not match the restored catacombs); the failed-attempt count comes from the host record\n"
+                    "sbio: LOAD_LOCKOUT refused the saved lockout record (0x8002); the failed-attempt count comes from the host record\n"
                 );
-                RestoreOutcome::EmptyTolerated
+                RestoreOutcome::Failed
             }
             Ok(_) => RestoreOutcome::Failed,
             Err(_) => RestoreOutcome::Failed,
@@ -2256,18 +2300,42 @@ impl SepData {
         if self.bringup_started.xchg(true, Relaxed) {
             return;
         }
+        if !self.run_keystore_bringup() {
+            return;
+        }
+        self.finish_keystore_bringup();
+    }
+
+    pub(crate) fn run_keystore_bringup(&self) -> bool {
         if let Err(e) = self.enable_sks() {
             dev_warn!(self.dev, "bringup: could not enable the key store ({:?}); keybag and ref-key operations are unavailable\n", e);
-            return;
+            return false;
         }
         if !self.sks_init_endpoint() {
             dev_err!(
                 self.dev,
                 "bringup: key-store endpoint init failed; the key store stays closed\n"
             );
-            return;
+            return false;
+        }
+        if self.keystore_user_bags {
+            // keystore_only=2: a volume sealed to a user's password opens
+            // here, before the real root. rearm_ioctl limits the node to the
+            // unlock requests until complete_attach.
+            if let Err(e) = self.register_rearm() {
+                dev_err!(
+                    self.dev,
+                    "bringup: could not publish /dev/{} for the initrd password unlock: {:?}\n",
+                    bio::REARM_DEVICE_NAME,
+                    e
+                );
+            }
         }
         diag::keystore_open();
+        true
+    }
+
+    pub(crate) fn finish_keystore_bringup(&self) {
         if module_parameters::provision_keybag.value() != 0 {
             if module_parameters::xart_writes.value() == 0 {
                 dev_err!(
@@ -2401,7 +2469,13 @@ impl SepData {
             EIO
         })?;
         diag::keybag(diag::Keybag::Present);
-        self.sks_designate_user_keybag(handle, stored.secret());
+        // When Touch ID comes up before a trusted key is unsealed, this is
+        // the keybag's first use this boot, and after a boot policy change
+        // the enclave rewrites one session record here; see
+        // crate::xart_guard.
+        crate::xart_guard::policy_window(|| {
+            self.sks_designate_user_keybag(handle, stored.secret())
+        });
         self.sks_machine_refkey(handle, stored.secret());
         let prepared = self.cold_match_continue(handle, uuid, stored.uuid_provenance());
         self.ensure_restored_after(prepared);
@@ -5261,6 +5335,11 @@ impl SepData {
         if self.shutting_down.load(Relaxed) {
             return Err(ENODEV);
         }
+        // In the initrd phase the node serves only a password unlock; Touch
+        // ID and the host state are not attached yet.
+        if self.keystore_only.load(Relaxed) && !crate::userbag::is_initrd_ioctl(cmd) {
+            return Err(EAGAIN);
+        }
         // The per-user key bag carries login passwords: root only, on this
         // node, never on /dev/sep-bio, which fprintd holds.
         if crate::userbag::is_ioctl(cmd) {
@@ -5303,6 +5382,7 @@ impl SepData {
                 "Touch ID: armed by the first password since this boot\n"
             );
         }
+        self.import_lockout_after_password();
         if !self.touchid_started.load(Relaxed) {
             // Activation sets up a fresh match credential; only the record of
             // a lockout from before the restart is left to clear.
