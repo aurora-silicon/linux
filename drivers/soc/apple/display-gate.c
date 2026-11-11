@@ -3154,8 +3154,29 @@ static const struct gate_staged t6041_j575c_usbc = {
 	"/iommu@602300000", t6041_j575c_usbc_nodes, ARRAY_SIZE(t6041_j575c_usbc_nodes),
 };
 
+/*
+ * The J575c's HDMI chain. Its ATC3 is a USB-C port, and its HDMI port runs
+ * through the LPDPTX PHY instead (t6041-j575c-hdmi.dtsi): that PHY's power,
+ * the AOP pins (the converter's hotplug), the PHY, then dcpext0's chain.
+ */
+static const char *const t6041_j575c_hdmi_nodes[] = {
+	"/power-management@502280000/power-controller@360",
+	"/pinctrl@510824000",
+	"/phy@51c200000",
+	"/iommu@3a2340000",
+	"/iommu@3a2300000",
+	"/mailbox@3a2e08000",
+	"/dcp@3a2e00000",
+};
+
+static const struct gate_staged t6041_j575c_hdmi = {
+	"/iommu@3a2300000", t6041_j575c_hdmi_nodes, ARRAY_SIZE(t6041_j575c_hdmi_nodes),
+};
+
 static const struct gate_staged *t6041_max_stage(unsigned int i)
 {
+	if (i == 0 && of_machine_is_compatible("apple,j575c"))
+		return &t6041_j575c_hdmi;
 	if (i == 1 && of_machine_is_compatible("apple,j575c"))
 		return &t6041_j575c_usbc;
 	return &t6041_max_stages[i];
