@@ -64,6 +64,14 @@ enum apple_clpc_rail {
  */
 #define APPLE_CLPC_GPU_BACKOFF_MS	100
 
+/* Why the last vote was cast, for debugfs */
+#define APPLE_CLPC_REASON_CPU		BIT(0)
+#define APPLE_CLPC_REASON_HOST_GPU	BIT(1)
+#define APPLE_CLPC_REASON_STREAMING_GPU	BIT(2)
+#define APPLE_CLPC_REASON_DENSE_GPU	BIT(3)
+#define APPLE_CLPC_REASON_HOLD		BIT(4)
+#define APPLE_CLPC_REASON_ANE		BIT(5)
+
 /**
  * struct apple_clpc_hw - per-SoC CLPC parameters
  * @rail: PMC rail of the DCS and of the fabric
@@ -756,12 +764,12 @@ static void apple_clpc_sample(struct apple_clpc *clpc)
 	}
 	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
 		if (demand[rail])
-			reason |= 1;
+			reason |= APPLE_CLPC_REASON_CPU;
 	if (apple_clpc_gpu_input_demand(clpc->hw, clpc->gpu, demand))
-		reason |= 2;
+		reason |= APPLE_CLPC_REASON_HOST_GPU;
 	if (apple_clpc_ane_input_demand(clpc, demand))
-		reason |= 32;
-	apple_clpc_ane_cluster(clpc, reason & 32, now);
+		reason |= APPLE_CLPC_REASON_ANE;
+	apple_clpc_ane_cluster(clpc, reason & APPLE_CLPC_REASON_ANE, now);
 	if (clpc->gpu_pmgr) {
 		/* Both run every sample: each tracks state across samples. */
 		bool late = time_after(now, clpc->gpu_sampled +
@@ -774,7 +782,8 @@ static void apple_clpc_sample(struct apple_clpc *clpc)
 
 			apple_clpc_gpu_floor_count(clpc, released);
 			if (!released) {
-				reason |= streaming ? 4 : 8;
+				reason |= streaming ? APPLE_CLPC_REASON_STREAMING_GPU :
+						      APPLE_CLPC_REASON_DENSE_GPU;
 				if (streaming)
 					clpc->gpu_streaming_samples++;
 				else
@@ -793,7 +802,7 @@ static void apple_clpc_sample(struct apple_clpc *clpc)
 	floor = apple_clpc_floor(clpc, state);
 	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
 		if (state[rail] > demand[rail])
-			reason |= 16;
+			reason |= APPLE_CLPC_REASON_HOLD;
 	clpc->last_floor = floor;
 	clpc->last_reason = reason;
 	clpc->last_vote_ns = ktime_get_mono_fast_ns();
@@ -805,24 +814,22 @@ static void apple_clpc_sample(struct apple_clpc *clpc)
 			 !clpc->ane_qos_khz);
 }
 
-static void apple_clpc_work(struct work_struct *work)
+static void apple_clpc_run(struct apple_clpc *clpc)
 {
-	struct apple_clpc *clpc = container_of(to_delayed_work(work), struct apple_clpc, work);
-
 	mutex_lock(&clpc->sample_lock);
 	if (!READ_ONCE(clpc->stopped))
 		apple_clpc_sample(clpc);
 	mutex_unlock(&clpc->sample_lock);
 }
 
+static void apple_clpc_work(struct work_struct *work)
+{
+	apple_clpc_run(container_of(to_delayed_work(work), struct apple_clpc, work));
+}
+
 static void apple_clpc_idle_work(struct work_struct *work)
 {
-	struct apple_clpc *clpc = container_of(to_delayed_work(work), struct apple_clpc, idle_work);
-
-	mutex_lock(&clpc->sample_lock);
-	if (!READ_ONCE(clpc->stopped))
-		apple_clpc_sample(clpc);
-	mutex_unlock(&clpc->sample_lock);
+	apple_clpc_run(container_of(to_delayed_work(work), struct apple_clpc, idle_work));
 }
 
 static int apple_clpc_status_show(struct seq_file *s, void *unused)
