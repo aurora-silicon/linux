@@ -118,6 +118,7 @@
 	status = "okay";
 };
 
+#include "t8142-j813-display.dtsi"
 #include "t8142-j813-peripherals.dtsi"
 #include "t8142-j813-j815.dtsi"
 #include "t8142-j813-usb.dtsi"
@@ -132,4 +133,11 @@
 &pmp {
 	/* ADT /chosen board-id (J815) */
 	apple,board-id = <38>;
+};
+
+&panel {
+	compatible = "apple,panel-j815", "apple,panel";
+	width-mm = <326>;
+	height-mm = <211>;
+	adj-height-mm = <204>;
 };
