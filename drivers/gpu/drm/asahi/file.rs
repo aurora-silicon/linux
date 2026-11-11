@@ -565,6 +565,9 @@ impl File {
         gpu.get_params(&mut params)?;
 
         params.features |= gpu.feature_flags();
+        if Self::supports_user_memory(reg_data) {
+            params.features |= uapi::DRM_ASAHI_FEATURE_USERPTR as u64;
+        }
 
         let size = core::mem::size_of::<uapi::drm_asahi_params_global>().min(data.size.try_into()?);
 
@@ -897,6 +900,103 @@ impl File {
         Ok(0)
     }
 
+    /// Whether this GPU takes objects over user memory (DRM_IOCTL_ASAHI_GEM_USERPTR).
+    ///
+    /// The bindings of G17 user VMs are the only ones that admit such an object's pages. They
+    /// are GPU-only page-table entries, and the GPU's accesses through those are taken to be
+    /// coherent with the CPU caches, as they are for the cacheable CPU mappings of ordinary
+    /// objects (DRM_ASAHI_GEM_WRITEBACK): see `gem::new_user_memory_object()`.
+    fn supports_user_memory(reg_data: &driver::AsahiDrmRegistrationData<'_>) -> bool {
+        reg_data.gpu.as_any().is::<crate::g17::Gpu>()
+    }
+
+    /// IOCTL: gem_userptr: Create a GEM object over the caller's own memory.
+    pub(crate) fn gem_userptr(
+        device: &AsahiDrmDevice,
+        reg_data: &driver::AsahiDrmRegistrationData<'_>,
+        data: &mut uapi::drm_asahi_gem_userptr,
+        file: &DrmFile,
+    ) -> Result<u32> {
+        mod_dev_dbg!(
+            device,
+            "[File {}]: IOCTL: gem_userptr addr={:#x} size={:#x}\n",
+            file.inner().id,
+            data.userptr,
+            data.size
+        );
+
+        if !Self::supports_user_memory(reg_data) {
+            return Err(EOPNOTSUPP);
+        }
+        let private = data.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0;
+        if data.flags
+            & !(uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE
+                | uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_USERPTR_READ_ONLY)
+            != 0
+            || (!private && data.vm_id != 0)
+            || data.pad != 0
+            || data.size == 0
+            || (data.userptr | data.size) & (mmu::UAT_PGMSK | (kernel::page::PAGE_SIZE - 1)) as u64
+                != 0
+        {
+            cls_pr_debug!(Errors, "gem_userptr: Invalid arguments\n");
+            return Err(EINVAL);
+        }
+        let addr = usize::try_from(data.userptr)?;
+        let size = gem::checked_object_size(data.size.try_into()?)?;
+        let writable = data.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_USERPTR_READ_ONLY == 0;
+
+        let resv_gem;
+        let resv_obj = if private {
+            let vms = file.inner().vms();
+            let vms = vms.lock();
+            resv_gem = vms
+                .get(data.vm_id.try_into()?)
+                .ok_or(ENOENT)?
+                .vm
+                .get_resv_obj();
+            Some(resv_gem.deref())
+        } else {
+            None
+        };
+
+        let commit = memacct::LEDGER
+            .admit(&file.inner().mem, size as u64)
+            .inspect_err(|_| {
+                cls_pr_debug!(
+                    Errors,
+                    "gem_userptr: {:#x} bytes refused by the GPU memory limits\n",
+                    size
+                );
+            })?;
+        let pages = gem::UserPages::pin(addr, size, writable).inspect_err(|e| {
+            cls_pr_debug!(Errors, "gem_userptr: pinning failed: {:?}\n", e);
+        })?;
+        let registered = device.registration_guard().ok_or(ENODEV)?;
+        let parent: &kernel::platform::Device<kernel::device::Bound> = registered.as_ref();
+        let gem = gem::new_user_memory_object(
+            device,
+            parent.as_ref(),
+            pages,
+            data.flags,
+            resv_obj,
+            commit,
+        )?;
+        drop(registered);
+
+        data.handle = gem.create_handle(file)?;
+
+        mod_dev_dbg!(
+            device,
+            "[File {}]: IOCTL: gem_userptr size={:#x} handle={:#x?}\n",
+            file.inner().id,
+            size,
+            data.handle
+        );
+
+        Ok(0)
+    }
+
     /// IOCTL: gem_mmap_offset: Assign an mmap offset to a GEM object.
     pub(crate) fn gem_mmap_offset(
         device: &AsahiDrmDevice,
@@ -917,6 +1017,10 @@ impl File {
         }
 
         let gem = gem::Object::lookup_handle(file, data.handle)?;
+        // The caller maps a user-memory object's memory itself.
+        if gem.is_user_memory() {
+            return Err(EINVAL);
+        }
         data.offset = gem.create_mmap_offset()?;
         Ok(0)
     }
