@@ -741,6 +741,18 @@ fn designated_id(user: crate::sks::DesignateUser) -> i32 {
     -user.special_handle().value()
 }
 
+/// Whether a caller may make a key under the Linux identity (machine) bag.
+/// As on macOS, where only the system makes machine-identity keys, that is
+/// root (CAP_SYS_ADMIN or uid 0); users make keys under their own bag
+/// (`CREATE_USER`).
+pub(crate) fn may_create_machine_key(admin: bool, euid: u32) -> Result<()> {
+    if admin || euid == 0 {
+        Ok(())
+    } else {
+        Err(EPERM)
+    }
+}
+
 /// A user-bag call may come from root or from the bag's own user.
 pub(crate) fn require_admin_or(uid: u32) -> Result<()> {
     if crate::shim::capable_admin() || crate::shim::current_euid() == uid {
@@ -1267,6 +1279,14 @@ mod tests {
         let n1 = encode_handle(&b, HANDLE_BIOMETRY, &mut v1).unwrap();
         let d1 = decode_any_handle(&v1, n1 as u32).unwrap();
         assert_eq!((d1.flags, d1.uid), (HANDLE_BIOMETRY, None));
+    }
+
+    #[test]
+    fn only_root_makes_machine_keys() {
+        assert_eq!(may_create_machine_key(true, 1000), Ok(()));
+        assert_eq!(may_create_machine_key(false, 0), Ok(()));
+        assert_eq!(may_create_machine_key(false, 1000), Err(EPERM));
+        assert_eq!(may_create_machine_key(false, 60127), Err(EPERM));
     }
 
     #[test]
@@ -2229,6 +2249,7 @@ impl SepData {
         match read_request(cmd, arg)? {
             KeyRequest::Info => write_user(user, &info_for(self.profile.key_store == crate::profile::KeyStore::Variant5)),
             KeyRequest::Create(mut req, policy) => {
+                may_create_machine_key(crate::shim::capable_admin(), crate::shim::current_euid())?;
                 let (acl, flags) = match policy {
                     Policy::None => (None, 0),
                     Policy::BiometryCurrentSet => (Some(self.key_bio_acl(false)?), HANDLE_BIOMETRY),

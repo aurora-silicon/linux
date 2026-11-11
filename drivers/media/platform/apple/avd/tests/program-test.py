@@ -115,7 +115,7 @@ struct avd_ctx { struct avd_dev *dev; void *priv; struct avd_job job; unsigned i
  dma_addr_t job_fifo; struct avd_buf inst;
 };
 struct avd_run { struct { struct vb2_v4l2_buffer *dst; } bufs;
- dma_addr_t comp_out, y_out, uv_out; };
+ dma_addr_t comp_out, y_out, uv_out; int setup_err; };
 struct dma_site { unsigned int segment,word,shift,width; dma_addr_t addr; };
 static struct dma_site dma_sites[256];static unsigned int dma_count;
 static void record_dma(struct avd_ctx *ctx,dma_addr_t addr,unsigned int shift,unsigned int width) {

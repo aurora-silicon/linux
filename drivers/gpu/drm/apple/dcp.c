@@ -1293,6 +1293,9 @@ static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 		if (endpoint == 0x2c)
 			return dcp->ext26_aux[2];
 	}
+	/* The J700 DCPEXT's audio service sits on endpoint 0x2b, not AV 0x29. */
+	if (!IS_ERR_OR_NULL(dcp->avep) && endpoint == dcp->avep->endpoint)
+		return dcp->avep;
 	/* DPAV 0x2a on H17P overlaps the legacy DPTX endpoint number. */
 	if (dcp->dcpavservep && endpoint == dcp->dcpavservep->endpoint)
 		return dcp->dcpavservep;
@@ -2203,6 +2206,15 @@ static int dcp_external_start_locked(struct apple_dcp *dcp)
 	int ret;
 
 	lockdep_assert_held(&dcp->external_lock);
+	/*
+	 * Once its DPTX link was withdrawn, the external DCP announces its AV
+	 * interfaces again under fresh interface numbers when the link comes
+	 * back, without closing the old ones. A new generation lets each
+	 * replace the one it supersedes (afk_compact_slot()) instead of piling
+	 * up until the endpoint has no slot left for the audio interface.
+	 */
+	if (!dcp->external_running)
+		WRITE_ONCE(dcp->afk_power_gen, dcp->afk_power_gen + 1);
 	ret = dcp_external_link_locked(dcp);
 	if (ret)
 		return ret;
@@ -2685,6 +2697,15 @@ static int dcp_external_stop_locked(struct apple_dcp *dcp, u64 generation)
 		return dcp->external_error;
 	if (dcp->external_stopped && !READ_ONCE(dcp->dptxport[0].connected))
 		return 0;
+	/*
+	 * The sink's audio first, as around a 14.7 external mode set: a link
+	 * the audio client still holds when the pipe powers off and the DPTX
+	 * link is withdrawn left the next activation timing out (-ETIMEDOUT)
+	 * and the display dark. It comes back with the link
+	 * (dcp_dptx_connect_raw()), before the pipe is powered on again.
+	 */
+	if (dcp->avep)
+		av_service_disconnect(dcp);
 	iomfb_pause_presentation(dcp, true);
 	if (dcp_is_ext26(dcp)) {
 		WRITE_ONCE(dcp->ext26_stopping, true);
@@ -2767,8 +2788,6 @@ release_link:
 	if (dcp_is_ext26(dcp))
 		WRITE_ONCE(dcp->ext26_stopping, false);
 	WRITE_ONCE(dcp->typec_crtc_off, true);
-	if (dcp->avep)
-		av_service_disconnect(dcp);
 	return 0;
 failed:
 	/* A retry could race a late reply. Keep this session blocked and owned. */

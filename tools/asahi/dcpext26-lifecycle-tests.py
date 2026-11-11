@@ -59,7 +59,7 @@ struct iomfb_scanout_h17p { struct drm_framebuffer *fb[4]; struct { struct iomfb
 struct apple_dcp {
  struct { int lock; } iomfb; struct { struct iomfb_scanout_h17p *first; } ext26_retained;
  bool external_suspended,ext26_pm_preparing,ext26_pm_work_off;u8 *coproc_reg;
- u64 external_generation; int dev,external_error; bool external_stopped,external_power_attempted,external_running;
+ u64 external_generation; u32 afk_power_gen; int dev,external_error; bool external_stopped,external_power_attempted,external_running;
  bool external_stop_deferred,pipe_enabled_h17p,typec_crtc_off,ext26_normal,ext26_stopping;
  unsigned external_stop_retries; int external_lock,hpd_mutex,external_stop_retry_wq,rtk,avep;
  struct port dptxport[1];
@@ -136,8 +136,8 @@ int main(void) {
  assert(!strchr(trace,'K'));ep.services[0].cmd_map[0]=0;
  d=fresh(&ep);d.external_power_attempted=false;assert(!dcp_external_stop_locked(&d,7));
  assert(!strchr(trace,'P')&&strchr(trace,'K')); /* no-sink / pre-picture stop */
- d=fresh(&ep);assert(d.external_running);assert(!dcp_external_start_locked(&d));assert(!strcmp(trace,"LU"));
- d=fresh(&ep);d.external_running=false;assert(!dcp_external_start_locked(&d));assert(d.external_running&&!strcmp(trace,"LU"));
+ d=fresh(&ep);assert(d.external_running);assert(!dcp_external_start_locked(&d));assert(!strcmp(trace,"LU")&&!d.afk_power_gen);
+ d=fresh(&ep);d.external_running=false;assert(!dcp_external_start_locked(&d));assert(d.external_running&&!strcmp(trace,"LU")&&d.afk_power_gen==1);
  struct drm_gem_object oldobj={1},newobj={2};
  struct drm_framebuffer oldfb={{&oldobj}},aliasfb={{&oldobj}},newfb={{&newobj}};
  struct iomfb_scanout_h17p retained={.fb={&oldfb}};d.ext26_retained.first=&retained;

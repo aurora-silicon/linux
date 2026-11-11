@@ -288,6 +288,11 @@ struct sep_bio_rearm {
  * Keep a second key (a backup) wherever a biometric key is trusted, as with
  * hardware security keys: no key can be exported or recovered.
  *
+ * SEP_KEY_CREATE (a key under the Linux identity bag) is root only
+ * (CAP_SYS_ADMIN or uid 0; EPERM otherwise), as on macOS where only the
+ * system makes machine-identity keys; users make keys under their own bag
+ * with SEP_KEY_CREATE_USER.
+ *
  * The node is created 0600; distributions may grant a group. Unknown 'flags'
  * bits and 'reserved' fields must be zero.
  *
