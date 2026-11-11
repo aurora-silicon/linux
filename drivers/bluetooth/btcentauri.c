@@ -65,6 +65,10 @@ static bool fixup_adv_phy = true;
 module_param(fixup_adv_phy, bool, 0444);
 MODULE_PARM_DESC(fixup_adv_phy, "Mask the firmware's extra bits in LE extended advertising report PHYs");
 
+static bool scan_dup_filter;
+module_param(scan_dup_filter, bool, 0444);
+MODULE_PARM_DESC(scan_dup_filter, "Let the controller drop duplicate LE advertising reports (off: every report reaches the host)");
+
 static bool enable_acl;
 module_param(enable_acl, bool, 0444);
 MODULE_PARM_DESC(enable_acl, "Experimental ACL data delivery; requires LE and auxiliary rings");
@@ -128,6 +132,7 @@ struct cen_bt {
 	u32 proprietary_features, hrb_commands, hrb_status_events;
 	u32 hrb_connection_events;
 	u8 hrb_last_link_type;
+	u32 scan_dup_rewritten;
 };
 
 static u16 cen_tail(struct cen_bt *bt, u16 ring)
@@ -824,6 +829,22 @@ static int cen_hci_send(struct hci_dev *hdev, struct sk_buff *skb)
 		}
 	}
 	mutex_lock(&bt->lock);
+	/*
+	 * The N1 does not reset its duplicate filter when scanning is enabled
+	 * again. A discovery shortly after another one reports only addresses
+	 * not seen before, and so does the passive scan hci_sync starts for a
+	 * pending LE connection: a device found in discovery never matches
+	 * pend_le_conns and no LE Create Connection is sent. Unless
+	 * scan_dup_filter is set, enable scans with Filter_Duplicates = 0; the
+	 * host copes with repeated reports.
+	 */
+	if (hci_skb_pkt_type(skb) == HCI_COMMAND_PKT && skb->len >= 5 && !scan_dup_filter &&
+	    (get_unaligned_le16(skb->data) == HCI_OP_LE_SET_EXT_SCAN_ENABLE ||
+	     get_unaligned_le16(skb->data) == HCI_OP_LE_SET_SCAN_ENABLE) &&
+	    skb->data[3] && skb->data[4] && !skb_ensure_writable(skb, 5)) {
+		skb->data[4] = 0;
+		bt->scan_dup_rewritten++;
+	}
 	if (!bt->running)
 		ret = -ENETDOWN;
 	else if (skb_queue_len(queue) >= 64)
@@ -880,6 +901,8 @@ static int cen_status_show(struct seq_file *s, void *unused)
 		   bt->hrb_status_events, bt->hrb_status_pending);
 	seq_printf(s, "hrb_connection_events=%u hrb_last_link_type=0x%02x\n",
 		   bt->hrb_connection_events, bt->hrb_last_link_type);
+	seq_printf(s, "scan_dup_filter=%u scan_dup_rewritten=%u\n", scan_dup_filter,
+		   bt->scan_dup_rewritten);
 	seq_printf(s, "acl_enabled=%u acl_tx=%u acl_rx=%u acl_queued=%u le_queued=%u\n",
 		   enable_acl, bt->hdev->stat.acl_tx, bt->hdev->stat.acl_rx,
 		   skb_queue_len(&bt->acl_txq), skb_queue_len(&bt->le_txq));
