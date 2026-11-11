@@ -117,6 +117,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "pms_c1ppt";
+		apple,always-on; /* Gating asserts the per-core throttle. */
 	};
 
 	ps_soc_rc: power-controller@168 {
