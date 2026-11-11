@@ -93,6 +93,8 @@ struct dwc3_apple {
 	/* Stopped for a deep sleep, and the state to bring back. */
 	bool sleep_stopped;
 	enum dwc3_apple_state sleep_state;
+	/* Kept in place through a deep sleep, or lost in one; the fixtures do neither. */
+	bool sleep_in_place, sleep_dead;
 	/* Votes sleep DDR while the host is up; the fixtures leave it off. */
 	bool sleep_ddr;
 	bool rpm_held, host_only;
