@@ -729,6 +729,15 @@
 		label = "debug-gated";
 		status = "disabled";
 	};
+	ps_nub_gpio: power-controller@88 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x88 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "nub-gpio";
+		apple,always-on;
+		status = "disabled";
+	};
 	ps_atc0_common_dp_0: power-controller@98 {
 		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x98 4>;
@@ -1952,9 +1961,18 @@
 		status = "disabled";
 	};
 
+	/* The always-on GPIO bank (61 pins); its power state is in the always-on PMGR. */
 	nub_gpio0: pinctrl@2881e4000 {
 		compatible = "apple,t6050-pinctrl", "apple,t8103-pinctrl";
 		reg = <0x2 0x881e4000 0x0 0x4000>;
+		power-domains = <&ps_nub_gpio>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-ranges = <&nub_gpio0 0 0 61>;
+		apple,npins = <61>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 706 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 708 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 710 IRQ_TYPE_LEVEL_HIGH>,
