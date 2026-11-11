@@ -311,7 +311,8 @@ static int ave_mctf_get_picture(struct ave_ctx *ctx, unsigned int slot,
 	if (ctx->dst_fmt.pixelformat == V4L2_PIX_FMT_APPLE_L8V0) {
 		if (vb2_plane_size(&dst->vb2_buf, 0) < g->bytes)
 			return -EINVAL;
-		memcpy(to, from, g->bytes);
+		if (!sess->slot[slot].mctf_direct)
+			memcpy(to, from, g->bytes);
 		return 0;
 	}
 	if (vb2_plane_size(&dst->vb2_buf, 0) < luma * 3 / 2)
