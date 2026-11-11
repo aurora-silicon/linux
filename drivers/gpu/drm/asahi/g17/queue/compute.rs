@@ -1912,8 +1912,10 @@ impl Queue {
         }
         let binding = self.binding.take()?;
         self.retained_owner = Some(binding.context.retain_firmware_pages());
-        // The backing served the exited VM only: give it back for fresh backing.
-        self.needs_fresh_backing = true;
+        // The backing stays tied to the exited VM (`pool_serves` refuses every other VM). It
+        // is given back only when another VM needs this queue (`require_fresh_backing` under
+        // QID pressure), not at every owner exit: releasing and re-arming the pool of each
+        // exited owner's idle queue left a later command retired without a completion stamp.
         Some(binding)
     }
     /// An idle retained queue whose USC backing may be given back.
