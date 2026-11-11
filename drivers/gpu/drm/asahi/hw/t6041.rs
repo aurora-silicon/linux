@@ -108,8 +108,9 @@ const BUILD_25F84: fw::variant::Build = fw::variant::Build {
 
 /// The macOS 26.6.2 boot firmware (iBoot mBoot-18000.161.10) loads the 25G83 build the M4 Pro
 /// runs. iBoot fills part of the loaded TEXT for each Mac, so each admitted image is a
-/// measurement. Two are listed: the 32-core J616C's, which runs with
-/// [`super::t6041_25g83::CONFIG`], and the 40-core J614C's, which runs with [`CONFIG_25G83`].
+/// measurement. Three are listed: the 32-core J616C's, which runs with
+/// [`super::t6041_25g83::CONFIG`], and the 40-core J614C's and J575C's, which run with
+/// [`CONFIG_25G83`]. The J575C's is measured with its boot-filled ranges zeroed.
 pub(super) const BUILD_25G83: fw::variant::Build = fw::variant::Build {
     os_version: [26, 6, 2],
     name: "macOS 26.6.2 (25G83, iBoot mBoot-18000.161.10)",
@@ -136,6 +137,21 @@ pub(super) const BUILD_25G83: fw::variant::Build = fw::variant::Build {
                 0x7c, 0x04, 0x36, 0x0e, 0x05, 0xa6, 0xb8, 0x62, 0x8f, 0x61, 0x26, 0x2d, 0x0a, 0x24,
                 0x41, 0x66, 0x18, 0x7a, 0xd8, 0x7a, 0x73, 0x47, 0x16, 0xd8, 0x91, 0x09, 0x08, 0xe9,
                 0x4f, 0xfe, 0xc0, 0x8a,
+            ],
+        },
+        crate::fwid::FirmwareBuild {
+            name: "Apple GFX 25G83 for T6041 (normalized loaded image, 40-core J575C)",
+            text_size: 0x60000,
+            data_size: 0x138000,
+            entropy: &[[0x59839, 0x5991c]],
+            // On this Mac iBoot also changes the header's load field and the SLID record from
+            // boot to boot, so the header field and the whole record block are zeroed, as the
+            // M5 builds do.
+            boot_filled: &[(0x224, 4), (0x59839, 0x231)],
+            text_sha256: [
+                0x9f, 0x23, 0xd1, 0x88, 0x92, 0xd4, 0x82, 0x81, 0x78, 0xa4, 0x98, 0xb6, 0x7a, 0x14,
+                0xe3, 0xe6, 0xa8, 0x36, 0x7c, 0xc4, 0x6a, 0x6b, 0x13, 0xae, 0x91, 0x02, 0xa4, 0x72,
+                0x74, 0x0a, 0x3c, 0xcd,
             ],
         },
     ],
