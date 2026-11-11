@@ -869,6 +869,32 @@ static void ane_fw_dart_deactivate(struct ane_fw_backend *b)
 	}
 }
 
+/* h17 push telemetry control; macOS sets bit 0 at start-up. */
+#define ANE_FW_TELEMETRY 0x196c000
+
+/*
+ * macOS's step right before the stop on this chip (ANE_deInit, its h17 case):
+ * push telemetry off once bit 4 reads clear, then SCRATCH14 = 0 and wait for
+ * SCRATCH15 bit 0, then SCRATCH16 = 1 and wait for SCRATCH17 bit 0. Each wait
+ * is 50 ms and macOS goes on after a miss.
+ */
+static void ane_fw_stop_handshake(struct ane_fw_backend *b)
+{
+	void __iomem *scratch = b->engine + b->soc->scratch;
+	void __iomem *telemetry = b->engine + ANE_FW_TELEMETRY;
+	struct device *dev = &b->pdev->dev;
+
+	if (ane_poll32(b, telemetry, BIT(4), 0, 10, 50000))
+		dev_warn(dev, "H17 ANE: telemetry busy before the stop: %#x\n", ane_rd32(b, telemetry));
+	ane_wr32(b, ane_rd32(b, telemetry) & ~BIT(0), telemetry);
+	ane_wr32(b, 0, scratch + 0x38);
+	if (ane_poll32(b, scratch + 0x3c, 1, 1, 10, 50000))
+		dev_warn(dev, "H17 ANE: SCRATCH15 not set: %#x\n", ane_rd32(b, scratch + 0x3c));
+	ane_wr32(b, 1, scratch + 0x40);
+	if (ane_poll32(b, scratch + 0x44, 1, 1, 10, 50000))
+		dev_warn(dev, "H17 ANE: SCRATCH17 not set: %#x\n", ane_rd32(b, scratch + 0x44));
+}
+
 static int ane_fw_firmware_stop(struct ane_fw_backend *b)
 {
 	struct ane_fw_transport *t = &b->transport;
@@ -887,11 +913,10 @@ static int ane_fw_firmware_stop(struct ane_fw_backend *b)
 	 * No EXCLAVE_MODE_STOP here: macOS's AP never rings that channel around its sleep
 	 * (recorded), and after it this firmware doesn't answer the stop.
 	 */
-	/* The host flags as macOS sets them before its stop: SCRATCH14 = 0, SCRATCH16 = 1. */
-	ane_wr32(b, 0, b->engine + b->soc->scratch + 0x38);
-	ane_rd32(b, b->engine + b->soc->scratch + 0x3c);
-	ane_wr32(b, 1, b->engine + b->soc->scratch + 0x40);
-	ane_rd32(b, b->engine + b->soc->scratch + 0x44);
+	/* Without the PMU base the stop can't finish: its DM-bus idle query needs it. */
+	if (!b->pmu_base_set)
+		return -ENODEV;
+	ane_fw_stop_handshake(b);
 	put_unaligned_le16(ANE_FW_CMD_STOP, stop + 4);
 	ret = ane_fw_command(b, ANE_FW_IO, stop, sizeof(stop), ktime_get_ns() + ANE_FW_TIMEOUT_NS);
 	if (ret) {
@@ -1703,22 +1728,24 @@ static int ane_fw_command(struct ane_fw_backend *b, unsigned int channel,
 }
 
 /*
- * SET_SNE_PMU_BASE2 (0x29) on the control ring with the DT "pmgr" range
- * base, once per cold firmware boot. Without it the 0x24 handler's DM-bus
- * idle query never completes (C2-C7; SPEC-ANE-SLEEP-H17-r2.md).
+ * SET_SNE_PMU_BASE2 (0x29) with the DT "pmgr" range base, once per firmware
+ * boot, right after START, on the IO ring. macOS's command helper takes a
+ * queue, not a table position: 0 is IO, 1 DEBUG, 2 DATA_CHAIN_H2T
+ * (aneFirmwareCommandSend, 25G83), and 0x29 goes on queue 0, never DEBUG.
  */
 static int ane_fw_pmu_base(struct ane_fw_backend *b)
 {
-	struct ane_fw_transport *t = &b->transport;
+	u8 command[ANE_FW_PMU_BASE_SIZE] = {};
 	u64 base = b->window[1].pa;
 	int ret;
 
 	b->pmu_base_set = false;
-	ret = ane_fw_transport_publish_pmu_base(t, base, ktime_get_ns() + ANE_FW_TIMEOUT_NS);
-	if (!ret)
-		ret = ane_fw_transport_wait(t, t->control_ch);
-	dev_info(&b->pdev->dev, "H17 ANE: SET_SNE_PMU_BASE2 (0x29) %#llx on ring %s: %d\n",
-		 base, ane_fw_channel_name(t->control_ch), ret);
+	put_unaligned_le16(ANE_FW_CMD_SET_PMU_BASE, command + 4);
+	put_unaligned_le64(base, command + 8);
+	ret = ane_fw_command(b, ANE_FW_IO, command, sizeof(command),
+			     ktime_get_ns() + ANE_FW_TIMEOUT_NS);
+	dev_info(&b->pdev->dev, "H17 ANE: SET_SNE_PMU_BASE2 (0x29) %#llx on ring IO: %d\n",
+		 base, ret);
 	if (!ret)
 		b->pmu_base_set = true;
 	return ret;
