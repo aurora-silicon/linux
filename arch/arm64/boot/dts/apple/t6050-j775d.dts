@@ -696,3 +696,5 @@
 
 #define T6050_J775D
 #include "t6050-peripherals.dtsi"
+
+#include "t6050-j775d-gpu.dtsi"
