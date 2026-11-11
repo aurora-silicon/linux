@@ -3008,13 +3008,29 @@ static const struct gate_staged t6041_max_stages[] = {
 	{ "/iommu@602300000", t6041_max_usbc_nodes, ARRAY_SIZE(t6041_max_usbc_nodes) },
 };
 
+/*
+ * The J575c's typec1 chain. That port is also a USB3 port, so its device tree
+ * enables the ATC1 PHY's coprocessor mailbox, as the M4 Pro boards do: the
+ * mailbox is not part of the chain here, and the rest is the J616c's.
+ */
+static const struct gate_staged t6041_j575c_usbc = {
+	"/iommu@602300000", t6041_max_usbc_nodes + 1, ARRAY_SIZE(t6041_max_usbc_nodes) - 1,
+};
+
+static const struct gate_staged *t6041_max_stage(unsigned int i)
+{
+	if (i == 1 && of_machine_is_compatible("apple,j575c"))
+		return &t6041_j575c_usbc;
+	return &t6041_max_stages[i];
+}
+
 /* Applied, they stay: the live tree refers to them. Only the KUnit test reverts them. */
 static struct of_changeset t6041_max_cs[ARRAY_SIZE(t6041_max_stages)];
 
 /* Enable every node of stage @i and put its display DART into the display subsystem's iommus. */
 static int __init t6041_max_apply(unsigned int i, struct device_node *display)
 {
-	const struct gate_staged *st = &t6041_max_stages[i];
+	const struct gate_staged *st = t6041_max_stage(i);
 	struct of_changeset *cs = &t6041_max_cs[i];
 	struct device_node *np;
 	unsigned int n;
@@ -3067,7 +3083,7 @@ static void __init gate_t6041_max_run(void)
 		return;
 	}
 	for (i = 0; i < ARRAY_SIZE(t6041_max_stages); i++) {
-		const struct gate_staged *st = &t6041_max_stages[i];
+		const struct gate_staged *st = t6041_max_stage(i);
 		const char *dcp = st->nodes[st->nr - 1];
 
 		if (!staged_ready(st))
