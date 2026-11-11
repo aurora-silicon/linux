@@ -2601,8 +2601,14 @@ mod fuzz_tests {
 
     /// Whatever a check accepts must be a well-formed record and handle.
     fn accepted_handle_is_sound(blob: &[u8], flags: u8, len: u32) -> bool {
-        handle_flags_valid(flags)
-            && blob.len() + HANDLE_HEADER == len as usize
+        // A version-2 (user-bag) handle carries the uid in a longer header.
+        let (valid, header) = if flags & HANDLE_USER_BAG != 0 {
+            (flags == HANDLE_USER_BAG || flags == HANDLE_USER_BAG | HANDLE_USER_PLAIN, HANDLE_HEADER_USER)
+        } else {
+            (handle_flags_valid(flags), HANDLE_HEADER)
+        };
+        valid
+            && blob.len() + header == len as usize
             && !blob.is_empty()
             && blob.len() <= BLOB_MAX
             && SepData::user_key_public(blob).is_ok()
@@ -2725,9 +2731,9 @@ mod fuzz_tests {
                 Ok(n) => s.handle_len = n as u32,
                 Err(_) => continue,
             }
-            if let Ok((b, f)) = check_sign(&s) {
+            if let Ok(h) = check_sign(&s) {
                 accepted += 1;
-                assert!(accepted_handle_is_sound(b, f, s.handle_len));
+                assert!(accepted_handle_is_sound(h.blob, h.flags, s.handle_len));
             }
             let _ = crate::refkey_seal::sealed_ephemeral(&blob[..len]);
         }
@@ -2749,8 +2755,8 @@ mod fuzz_tests {
             if rng.below(2) == 0 {
                 s.handle_len = rng.below(HANDLE_MAX as u64 + 64) as u32;
             }
-            if let Ok((b, f)) = check_sign(&s) {
-                assert!(accepted_handle_is_sound(b, f, s.handle_len));
+            if let Ok(h) = check_sign(&s) {
+                assert!(accepted_handle_is_sound(h.blob, h.flags, s.handle_len));
             }
             let mut p = zeroed::<Public>();
             rng.fill((*p).as_bytes_mut());
@@ -2766,7 +2772,7 @@ mod fuzz_tests {
             if let Ok((_, _, secret)) = check_seal(&q) {
                 assert!((1..=SECRET_MAX).contains(&secret.len()));
             }
-            if let Ok((_, _, sealed)) = check_unseal(&q) {
+            if let Ok((_, sealed)) = check_unseal(&q) {
                 assert!(sealed.len() > crate::refkey_seal::POINT_LEN + 16 && sealed[0] == 0x04);
             }
         }
