@@ -743,12 +743,129 @@ static int ane_fw_cold_cycle_boot(struct ane_fw_backend *b)
 	return ret;
 }
 
-/* The cold way down: nothing in flight, then power off under the firmware. */
+/*
+ * macOS stops this firmware before its power goes (ANE_deInit, 25G83): command
+ * 1, then SCRATCH0 armed and POWER_DOWN, which is answered in SCRATCH0 and not
+ * on the ring. SUSPEND (0x24) is for chips with a warm sleep, not this one.
+ */
+#define ANE_FW_CMD_STOP 0x1
+#define ANE_FW_STOP_SIZE 12
+#define ANE_FW_CMD_POWER_DOWN 0xb
+#define ANE_FW_POWER_DOWN_SIZE 8
+#define ANE_FW_STOP_ARM 0xf7fbdff9
+#define ANE_FW_STOP_DONE 0x08042006
+
+static bool clean_stop = true;
+module_param(clean_stop, bool, 0644);
+MODULE_PARM_DESC(clean_stop, "Stop the H17 firmware before powering it off for system sleep");
+
+#define ane_fw_clean_stop(b) (clean_stop && (b)->soc->exclave_mode_stop)
+
+/* Until SCRATCH0 answers, keep serving what the firmware posts on its way down. */
+static int ane_fw_stop_wait(struct ane_fw_backend *b)
+{
+	struct ane_fw_transport *t = &b->transport;
+	void __iomem *scratch0 = b->engine + b->soc->scratch;
+	u64 deadline = ktime_get_ns() + NSEC_PER_SEC;
+	u8 report[ANE_FW_SUSPEND_REPORT_MAX];
+	u32 pending;
+	size_t size;
+	int ret;
+
+	while (ane_rd32(b, scratch0) != ANE_FW_STOP_DONE) {
+		if (ktime_get_ns() >= deadline)
+			return -ETIMEDOUT;
+		ret = ane_fw_transport_consume(t, report, sizeof(report), &size);
+		if (ret && ret != -EAGAIN)
+			return ret;
+		ret = ane_fw_transport_irq(t, &pending);
+		if (ret)
+			return ret;
+		ret = ane_fw_transport_shared(t);
+		if (ret && ret != -EAGAIN)
+			return ret;
+		usleep_range(100, 200);
+	}
+	return 0;
+}
+
+/* Every port of every ANE DART idle: what macOS checks before it powers one down. */
+static int ane_fw_dart_idle(struct ane_fw_backend *b)
+{
+	for (unsigned int i = 0; i < ANE_FW_DARTS; i++) {
+		u32 params = ane_rd32(b, b->dart[i] + 4);
+		unsigned int ports = max((params >> 16) & 7, (params >> 20) & 7);
+
+		for (unsigned int p = 0; p < min(ports, 4U); p++) {
+			int ret = ane_poll32(b, b->dart[i] + 0x230 + 4 * p, U32_MAX, 0, 1, 10000);
+
+			if (ret) {
+				dev_err(&b->pdev->dev, "H17 ANE: DART %u port %u not idle: %#x\n",
+					i, p, ane_rd32(b, b->dart[i] + 0x230 + 4 * p));
+				return ret;
+			}
+		}
+	}
+	return 0;
+}
+
+static int ane_fw_firmware_stop(struct ane_fw_backend *b)
+{
+	struct ane_fw_transport *t = &b->transport;
+	struct device *dev = &b->pdev->dev;
+	void __iomem *status = b->engine + b->soc->wrapper + 0x48;
+	u8 stop[ANE_FW_STOP_SIZE] = {};
+	u8 down[ANE_FW_POWER_DOWN_SIZE] = {};
+	u32 val;
+	int ret;
+
+	/* A core in WFI can't finish an allocation request, so answer those first. */
+	ret = ane_fw_transport_settle(t, 2 * NSEC_PER_MSEC, 20 * NSEC_PER_MSEC);
+	if (ret < 0)
+		return ret;
+	ret = ane_fw_exclave_mode_stop(b);
+	if (ret)
+		return ret;
+	put_unaligned_le16(ANE_FW_CMD_STOP, stop + 4);
+	ret = ane_fw_command(b, ANE_FW_IO, stop, sizeof(stop), ktime_get_ns() + ANE_FW_TIMEOUT_NS);
+	if (ret) {
+		dev_err(dev, "H17 ANE: STOP failed: %d\n", ret);
+		return ret;
+	}
+	put_unaligned_le16(ANE_FW_CMD_POWER_DOWN, down + 4);
+	ane_wr32(b, ANE_FW_STOP_ARM, b->engine + b->soc->scratch);
+	ret = ane_fw_transport_publish(t, ANE_FW_IO, down, sizeof(down),
+				       ktime_get_ns() + ANE_FW_TIMEOUT_NS);
+	if (!ret)
+		ret = ane_fw_stop_wait(b);
+	if (ret) {
+		ane_fw_sleep_trace(b, "POWER_DOWN failed", ane_fw_transport_slot(t, ANE_FW_IO));
+		ane_h16_session_dump_fwlog(&b->session);
+		return ret;
+	}
+	/* It never completes on the ring; the boot after the wake starts a new one. */
+	t->pending[ANE_FW_IO].active = false;
+	/* macOS waits up to 200 ms for WFI and goes on without it. */
+	if (readl_poll_timeout(status, val, val & 3, 10000, 200000))
+		dev_warn(dev, "H17 ANE: no WFI after POWER_DOWN, status %#x\n", ane_rd32(b, status));
+	dev_info(dev, "H17 ANE: firmware stopped, status %#x\n", ane_rd32(b, status));
+	return ane_fw_dart_idle(b);
+}
+
+/* The cold way down: nothing in flight, stop the firmware, then power off. */
 static int ane_fw_cold_cycle_down(struct ane_fw_backend *b)
 {
+	int ret;
+
 	for (unsigned int ch = 0; ch < ANE_FW_CHANNELS; ch++)
 		if (b->transport.pending[ch].active)
 			return -EBUSY;
+	if (ane_fw_clean_stop(b)) {
+		ret = ane_fw_firmware_stop(b);
+		/* Past this point the firmware may be stopped: never a clean refusal. */
+		if (ret)
+			return ret == -EBUSY ? -EIO : ret;
+	}
 	return ane_fw_power_down(b);
 }
 
@@ -1493,7 +1610,7 @@ static int ane_fw_startup(struct ane_fw_backend *b)
 		if (commands[i].id == 0x22)
 			dev_dbg(&b->pdev->dev, "ANE RESOURCE_INFO: %*ph\n", 100, command);
 		/* macOS order: START, then SET_SNE_PMU_BASE2, then CONFIG_GET. */
-		if (commands[i].id == 0 && b->soc->sleep_warm) {
+		if (commands[i].id == 0 && (b->soc->sleep_warm || ane_fw_clean_stop(b))) {
 			ret = ane_fw_pmu_base(b);
 			if (ret)
 				return ret;
