@@ -171,6 +171,7 @@ static const struct ave_mctf_word ave_mctf_process_25g83[] = {
 		.next_value = 4,					\
 		.slot = 0xac84, .frame = 0xacf8, .level = 0xad68,	\
 		.strength = 0x26f8,					\
+		.stream = 12,						\
 		.qualified = (ok),					\
 	}
 
@@ -295,14 +296,32 @@ int ave_mctf_build_process(const struct ave_mctf_layout *l, u8 *cmd,
 	return 0;
 }
 
-/* MCTF needs a qualified boot and a qualified MCTF layout for this build. */
+/*
+ * MCTF needs a qualified boot, a qualified MCTF layout for this build and
+ * the layout's DART stream attached on every encoder DART.
+ */
 int ave_mctf_check_build(struct ave_dev *ave)
 {
+	const struct ave_mctf_layout *l;
 	int ret = ave_fw_check_boot(ave);
 
 	if (ret)
 		return ret;
-	return ave_mctf_qualified(ave->text_crc) ? 0 : -EOPNOTSUPP;
+	l = ave_mctf_qualified(ave->text_crc);
+	if (!l)
+		return -EOPNOTSUPP;
+	if (!ave->n_darts)
+		goto no_stream;
+	for (unsigned int d = 0; d < ave->n_darts; d++)
+		if (l->stream >= 32 || !(ave->dart_sid_mask[d] & BIT(l->stream)))
+			goto no_stream;
+	return 0;
+
+no_stream:
+	dev_warn_once(ave->dev,
+		      "MCTF disabled: DART stream %u is not attached on every encoder DART\n",
+		      l->stream);
+	return -EOPNOTSUPP;
 }
 
 int ave_mctf_cmd_start(struct ave_ctx *ctx)

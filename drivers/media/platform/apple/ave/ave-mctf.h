@@ -90,6 +90,12 @@ struct ave_mctf_layout {
 	u32 first_frame, first_value, next_value;
 	u32 slot, frame, level;
 	u32 strength;	/* Start offset */
+	/*
+	 * DART stream the MCTF engines use on both encoder DARTs. Unless it
+	 * is attached to the encoder's domain it is left in bypass, and the
+	 * engines then write our IOVAs to physical memory.
+	 */
+	u32 stream;
 	/* Start and Process images match captures of this build at 1080p. */
 	bool qualified;
 };
