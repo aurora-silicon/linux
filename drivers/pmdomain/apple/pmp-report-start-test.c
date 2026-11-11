@@ -408,3 +408,322 @@ static struct kunit_suite pmp_start_suite = {
 };
 
 kunit_test_suite(pmp_start_suite);
+
+/* Device DVFS: emulated report/update windows, no hardware. */
+
+/* An emulated media entry and its request class, inside the T8112 range. */
+#define PDT_ENTRY	0xb0
+#define PDT_CLASS	0x25
+#define PDT_LEVEL	2
+#define PDT_ID		10
+
+/* Expected words, built from the named fields rather than copied. */
+static u64 pdt_class_word(u32 request_class, u32 level)
+{
+	u32 lane = request_class - PMP_DVFS_CLASS_FIRST;
+
+	return PMP_DVFS_VALID |
+	       (u64)level << (PMP_DVFS_CLASS_SHIFT + PMP_DVFS_CLASS_BITS * lane);
+}
+
+static u64 pdt_constraint_word(u32 dcs, u32 soc)
+{
+	return pdt_class_word(PMP_T8112_CONSTRAINT_DCS_CLASS, dcs) | soc;
+}
+
+static void __iomem *pdt_update(const struct apple_pmp_report *rep, unsigned int entry)
+{
+	return rep->base + rep->offsets->update + 8 * entry;
+}
+
+static void pdt_run(const struct apple_pmp_report *rep)
+{
+	writeq(PMP_REPORT_READY, rep->base + rep->offsets->status);
+}
+
+static void pdt_range_ready(const struct apple_pmp_report *rep, u64 state)
+{
+	writeq(state, rep->base + rep->offsets->dvfs_ready_state);
+}
+
+static void pmp_t8112_layout_test(struct kunit *test)
+{
+	const struct apple_pmp_report_offsets *o = &apple_pmp_offsets_t8112;
+
+	/* The update aperture covers every entry, eight bytes each. */
+	KUNIT_EXPECT_EQ(test, o->update, 0x10000U);
+	KUNIT_EXPECT_EQ(test, o->dvfs_first, APPLE_PMP_T8112_DVFS_ENTRY(APPLE_PMP_T8112_EACC0));
+	KUNIT_EXPECT_GT(test, o->dvfs_first + o->dvfs_count, (u32)PDT_ENTRY);
+	KUNIT_EXPECT_LT(test, o->dvfs_ready_entry, o->dvfs_first);
+	KUNIT_EXPECT_EQ(test, o->dvfs_ready_state, 16 * o->dvfs_ready_entry);
+	KUNIT_EXPECT_EQ(test, o->soc_dvfs_state, 16 * (o->dvfs_ready_entry + 1));
+	KUNIT_EXPECT_NE(test, o->dvfs_ready_prime, 0ULL);
+}
+
+struct pmp_dvfs_test {
+	struct apple_pmp_report rep;
+	struct apple_pmp_report_entry ent;
+};
+
+static int pmp_t8112_set_constraint(struct pmp_dvfs_test *t, unsigned int entry,
+				    enum apple_pmp_t8112_constraint_source source,
+				    unsigned int dcs, unsigned int soc)
+{
+	return apple_pmp_t8112_set_constraint(t->rep.dev->of_node, entry, source,
+					       dcs, soc);
+}
+
+static int pmp_dvfs_init(struct kunit *test)
+{
+	struct pmp_dvfs_test *t = kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
+	void *mem = kunit_kzalloc(test, 0x20000, GFP_KERNEL);
+	const u32 on[] = { PDT_CLASS, PDT_LEVEL }, off[] = { PDT_CLASS, 0 };
+
+	if (!t || !mem)
+		return -ENOMEM;
+	test->priv = t;
+	t->rep.base = (void __iomem *)mem;
+	t->rep.offsets = &apple_pmp_offsets_t8112;
+	/* Identity only: neither callback dereferences this emulated node. */
+	t->ent.report_node = (struct device_node *)t;
+	t->rep.dev = kunit_kzalloc(test, sizeof(*t->rep.dev), GFP_KERNEL);
+	if (!t->rep.dev)
+		return -ENOMEM;
+	t->rep.dev->of_node = t->ent.report_node;
+	t->ent.id = PDT_ID;
+	t->ent.dvfs = true;
+	t->ent.dvfs_entry = PDT_ENTRY;
+	if (!apple_pmp_dvfs_word(0, off, ARRAY_SIZE(off), &t->ent.dvfs_off) ||
+	    !apple_pmp_dvfs_word(0, on, ARRAY_SIZE(on), &t->ent.dvfs_on))
+		return -EINVAL;
+	spin_lock_init(&t->rep.lock);
+	mutex_lock(&apple_pmp_reports_lock);
+	list_add_tail_rcu(&t->rep.list, &apple_pmp_reports);
+	mutex_unlock(&apple_pmp_reports_lock);
+	return 0;
+}
+
+static void pmp_dvfs_exit(struct kunit *test)
+{
+	struct pmp_dvfs_test *t = test->priv;
+
+	mutex_lock(&apple_pmp_reports_lock);
+	list_del_rcu(&t->rep.list);
+	mutex_unlock(&apple_pmp_reports_lock);
+	synchronize_rcu();
+}
+
+static void pmp_t8112_entry_words_test(struct kunit *test)
+{
+	struct pmp_dvfs_test *t = test->priv;
+
+	KUNIT_EXPECT_EQ(test, t->ent.dvfs_on, pdt_class_word(PDT_CLASS, PDT_LEVEL));
+	KUNIT_EXPECT_EQ(test, t->ent.dvfs_off, PMP_DVFS_VALID);
+}
+
+/* A floor asked for before the PMP runs is held, then published once ready. */
+static void pmp_t8112_stopped_test(struct kunit *test)
+{
+	struct pmp_dvfs_test *t = test->priv;
+	unsigned int index = PDT_ENTRY - t->rep.offsets->dvfs_first;
+
+	KUNIT_EXPECT_EQ(test, apple_pmp_report_entry_power_on(&t->ent.genpd), 0);
+	KUNIT_EXPECT_EQ(test, t->rep.shadow, BIT_ULL(PDT_ID));
+	KUNIT_EXPECT_EQ(test, t->rep.dvfs_known, 0ULL);
+	KUNIT_EXPECT_EQ(test, t->rep.dvfs_pending, BIT_ULL(index));
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, PDT_ENTRY)), 0ULL);
+	KUNIT_EXPECT_FALSE(test, t->rep.dvfs_ready_prime_sent);
+
+	pdt_run(&t->rep);
+	pdt_range_ready(&t->rep, 2);
+	KUNIT_ASSERT_EQ(test, apple_pmp_report_dvfs_prime(&t->rep), 0);
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, PDT_ENTRY)),
+			pdt_class_word(PDT_CLASS, PDT_LEVEL));
+	KUNIT_EXPECT_EQ(test, t->rep.dvfs_known, BIT_ULL(index));
+	KUNIT_EXPECT_EQ(test, t->rep.dvfs_pending, 0ULL);
+}
+
+static void pmp_t8112_supplier_ready_test(struct kunit *test)
+{
+	struct pmp_dvfs_test *t = test->priv;
+
+	/* A ready range alone is insufficient: the PMP report must also run. */
+	pdt_range_ready(&t->rep, 2);
+	KUNIT_EXPECT_EQ(test, apple_pmp_report_wait_t8112_ready(&t->rep, 1), -ETIMEDOUT);
+	KUNIT_EXPECT_FALSE(test, t->rep.dvfs_ready);
+
+	pdt_run(&t->rep);
+	KUNIT_ASSERT_EQ(test, apple_pmp_report_wait_t8112_ready(&t->rep, 1), 0);
+	KUNIT_EXPECT_TRUE(test, t->rep.dvfs_ready);
+	KUNIT_EXPECT_EQ(test, t->rep.dvfs_ready_achieved_word, 2ULL);
+	KUNIT_EXPECT_FALSE(test, t->rep.dvfs_ready_prime_sent);
+}
+
+static void pmp_t8112_ack_timeout_test(struct kunit *test)
+{
+	struct pmp_dvfs_test *t = test->priv;
+
+	pdt_run(&t->rep);
+	pdt_range_ready(&t->rep, 2);
+	KUNIT_EXPECT_EQ(test, apple_pmp_report_entry_power_on(&t->ent.genpd), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + t->rep.offsets->tgt_write), BIT_ULL(PDT_ID));
+	KUNIT_EXPECT_EQ(test, t->rep.dvfs_known, 0ULL);
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, PDT_ENTRY)), 0ULL);
+}
+
+static void pmp_t8112_active_release_test(struct kunit *test)
+{
+	struct pmp_dvfs_test *t = test->priv;
+	void __iomem *actual = t->rep.base + t->rep.offsets->actual;
+
+	pdt_run(&t->rep);
+	pdt_range_ready(&t->rep, 3);
+	writeq(BIT_ULL(PDT_ID), actual);
+	KUNIT_ASSERT_EQ(test, apple_pmp_report_entry_power_on(&t->ent.genpd), 0);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + t->rep.offsets->tgt_write), BIT_ULL(PDT_ID));
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, PDT_ENTRY)),
+			pdt_class_word(PDT_CLASS, PDT_LEVEL));
+	KUNIT_EXPECT_FALSE(test, t->rep.dvfs_ready_prime_sent);
+	KUNIT_EXPECT_TRUE(test, t->rep.dvfs_ready);
+	KUNIT_EXPECT_EQ(test, t->rep.dvfs_ready_achieved_word, 3ULL);
+	/* ACK deliberately stays asserted: release is stored before ACK clear. */
+	KUNIT_EXPECT_EQ(test, apple_pmp_report_entry_power_off(&t->ent.genpd), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, PDT_ENTRY)), PMP_DVFS_VALID);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + t->rep.offsets->tgt_write), 0ULL);
+	writeq(0, actual);
+	KUNIT_EXPECT_EQ(test, apple_pmp_report_entry_power_off(&t->ent.genpd), 0);
+	KUNIT_EXPECT_EQ(test, t->rep.shadow, 0ULL);
+}
+
+/* An unready range never blocks admission; the floor follows readiness. */
+static void pmp_t8112_unready_range_test(struct kunit *test)
+{
+	struct pmp_dvfs_test *t = test->priv;
+	const struct apple_pmp_report_offsets *o = t->rep.offsets;
+
+	pdt_run(&t->rep);
+	/* A nonzero SOC state is not the separate range ready report. */
+	writeq(2, t->rep.base + o->soc_dvfs_state);
+	writeq(BIT_ULL(PDT_ID), t->rep.base + o->actual);
+	KUNIT_ASSERT_EQ(test, apple_pmp_report_entry_power_on(&t->ent.genpd), 0);
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, o->dvfs_ready_entry)),
+			o->dvfs_ready_prime);
+	KUNIT_EXPECT_TRUE(test, t->rep.dvfs_ready_prime_sent);
+	KUNIT_EXPECT_FALSE(test, t->rep.dvfs_ready);
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, PDT_ENTRY)), 0ULL);
+	KUNIT_EXPECT_EQ(test, t->rep.shadow, BIT_ULL(PDT_ID));
+
+	/* The prime is sent once; a later published state releases the floor. */
+	writeq(0, pdt_update(&t->rep, o->dvfs_ready_entry));
+	KUNIT_EXPECT_EQ(test, apple_pmp_report_dvfs_prime(&t->rep), -EAGAIN);
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, o->dvfs_ready_entry)), 0ULL);
+	pdt_range_ready(&t->rep, 2);
+	KUNIT_ASSERT_EQ(test, apple_pmp_report_dvfs_prime(&t->rep), 0);
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, PDT_ENTRY)),
+			pdt_class_word(PDT_CLASS, PDT_LEVEL));
+	KUNIT_EXPECT_EQ(test, t->rep.dvfs_ready_achieved_word, 2ULL);
+}
+
+static void pmp_t8112_constraint_aggregation_test(struct kunit *test)
+{
+	struct pmp_dvfs_test *t = test->priv;
+	const unsigned int entry = APPLE_PMP_T8112_DVFS_ENTRY(APPLE_PMP_T8112_EACC0);
+
+	pdt_run(&t->rep);
+	pdt_range_ready(&t->rep, 1);
+	KUNIT_ASSERT_EQ(test, pmp_t8112_set_constraint(t, entry,
+						       APPLE_PMP_T8112_CONSTRAINT_CPU, 1, 2), 0);
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, entry)), pdt_constraint_word(1, 2));
+
+	/* A second source raises only DCS; the first source retains SoC. */
+	KUNIT_ASSERT_EQ(test, pmp_t8112_set_constraint(t, entry,
+						       APPLE_PMP_T8112_CONSTRAINT_ANE, 4, 0), 0);
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, entry)), pdt_constraint_word(4, 2));
+
+	KUNIT_ASSERT_EQ(test, pmp_t8112_set_constraint(t, entry,
+						       APPLE_PMP_T8112_CONSTRAINT_CPU, 0, 0), 0);
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, entry)), pdt_constraint_word(4, 0));
+	KUNIT_ASSERT_EQ(test, pmp_t8112_set_constraint(t, entry,
+						       APPLE_PMP_T8112_CONSTRAINT_ANE, 0, 0), 0);
+	/* Release leaves the valid bit with every level at zero. */
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, entry)), PMP_DVFS_VALID);
+}
+
+static void pmp_t8112_constraint_targets_test(struct kunit *test)
+{
+	struct pmp_dvfs_test *t = test->priv;
+	const unsigned int eacc = APPLE_PMP_T8112_DVFS_ENTRY(APPLE_PMP_T8112_EACC0);
+	const unsigned int pacc = APPLE_PMP_T8112_DVFS_ENTRY(APPLE_PMP_T8112_PACC0);
+	const unsigned int ane = APPLE_PMP_T8112_DVFS_ENTRY(APPLE_PMP_T8112_ANE0);
+	const unsigned int dcs = APPLE_PMP_T8112_DCS_MAX;
+	const unsigned int soc = APPLE_PMP_T8112_SOC_MAX;
+	u64 top = pdt_constraint_word(dcs, soc);
+
+	pdt_run(&t->rep);
+	pdt_range_ready(&t->rep, 1);
+	KUNIT_ASSERT_EQ(test, pmp_t8112_set_constraint(t, pacc,
+						       APPLE_PMP_T8112_CONSTRAINT_CPU, dcs, soc), 0);
+	KUNIT_ASSERT_EQ(test, pmp_t8112_set_constraint(t, ane,
+						       APPLE_PMP_T8112_CONSTRAINT_ANE, dcs, soc), 0);
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, pacc)), top);
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, ane)), top);
+	/* Neighbouring entries are untouched. */
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, eacc)), 0ULL);
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, ane - 1)), 0ULL);
+	/* Targets other than the CPU clusters and the ANE are refused. */
+	KUNIT_EXPECT_EQ(test, pmp_t8112_set_constraint(t, PDT_ENTRY,
+						       APPLE_PMP_T8112_CONSTRAINT_CPU, dcs, soc),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, pmp_t8112_set_constraint(t, pacc,
+						       APPLE_PMP_T8112_CONSTRAINT_CPU, dcs + 1, soc),
+			-EINVAL);
+}
+
+/* Not ready is transient: the caller retries and the vote then lands. */
+static void pmp_t8112_constraint_retry_test(struct kunit *test)
+{
+	struct pmp_dvfs_test *t = test->priv;
+	const struct apple_pmp_report_offsets *o = t->rep.offsets;
+	const unsigned int entry = APPLE_PMP_T8112_DVFS_ENTRY(APPLE_PMP_T8112_EACC0);
+
+	/* Stopped PMP: nothing is stored, not even the prime. */
+	KUNIT_EXPECT_EQ(test, pmp_t8112_set_constraint(t, entry,
+						       APPLE_PMP_T8112_CONSTRAINT_CPU, 4, 2), -EAGAIN);
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, o->dvfs_ready_entry)), 0ULL);
+
+	/* Running, range not ready: the range is primed and no target is stored. */
+	pdt_run(&t->rep);
+	KUNIT_EXPECT_EQ(test, pmp_t8112_set_constraint(t, entry,
+						       APPLE_PMP_T8112_CONSTRAINT_CPU, 4, 2), -EAGAIN);
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, o->dvfs_ready_entry)),
+			o->dvfs_ready_prime);
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, entry)), 0ULL);
+
+	pdt_range_ready(&t->rep, 1);
+	KUNIT_ASSERT_EQ(test, pmp_t8112_set_constraint(t, entry,
+						       APPLE_PMP_T8112_CONSTRAINT_CPU, 4, 2), 0);
+	KUNIT_EXPECT_EQ(test, readq(pdt_update(&t->rep, entry)), pdt_constraint_word(4, 2));
+}
+
+static struct kunit_case pmp_dvfs_cases[] = {
+	KUNIT_CASE(pmp_t8112_layout_test),
+	KUNIT_CASE(pmp_t8112_entry_words_test),
+	KUNIT_CASE(pmp_t8112_stopped_test),
+	KUNIT_CASE(pmp_t8112_supplier_ready_test),
+	KUNIT_CASE(pmp_t8112_ack_timeout_test),
+	KUNIT_CASE(pmp_t8112_active_release_test),
+	KUNIT_CASE(pmp_t8112_unready_range_test),
+	KUNIT_CASE(pmp_t8112_constraint_aggregation_test),
+	KUNIT_CASE(pmp_t8112_constraint_targets_test),
+	KUNIT_CASE(pmp_t8112_constraint_retry_test),
+	{}
+};
+
+static struct kunit_suite pmp_dvfs_suite = {
+	.name = "apple-pmp-dvfs",
+	.init = pmp_dvfs_init,
+	.exit = pmp_dvfs_exit,
+	.test_cases = pmp_dvfs_cases,
+};
+
+kunit_test_suite(pmp_dvfs_suite);

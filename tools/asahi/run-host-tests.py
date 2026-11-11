@@ -168,6 +168,7 @@ ASAHI_TESTS = {
                                    'offset-sign', 'event-bit', 'wrong-control',
                                    'maverick-event', 'stowe-offset'), out()),
     'perf-mmap-alias-lifecycle-tests.py': [([], PASS)],
+    'pmp-validation-tests.py': [(out(), PASS)],
     'qspi-nvram-tests.py': [(out('--output'), PASS)],
     'rtkit-crashlog-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('buffer-header', 'section-header', 'section-size', 'footer-room',
