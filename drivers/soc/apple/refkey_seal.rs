@@ -5,6 +5,11 @@
 //! The SEP has no scalar×G, so it cannot make the sender ephemeral (in-SEP `ow`
 //! returns -10); `od` imports the one this module produces, ECDHs it against the
 //! in-SEP private key and AES-GCM-decrypts. The encrypt runs here by construction.
+//!
+//! For keys with an access-control list the enclave does not decrypt at all
+//! (`oecd` is refused even when the list leaves it free); as on macOS, the
+//! enclave only does the key exchange (`ock`, which the list constrains) and
+//! [`ecies_open_with_shared`] finishes the decrypt here.
 
 use kernel::prelude::*;
 
@@ -217,6 +222,59 @@ pub(crate) fn ecies_encrypt_parts(
     })
 }
 
+fn gcm_decrypt(key: &[u8], iv: &[u8], ct_tag: &[u8]) -> Result<KVec<u8>> {
+    if ct_tag.len() <= TAG_LEN {
+        return Err(EINVAL);
+    }
+    let datalen = ct_tag.len() - TAG_LEN;
+    let mut buf = KVec::new();
+    buf.extend_from_slice(ct_tag, GFP_KERNEL)?;
+    // SAFETY: `key`/`iv` are live; `buf` holds ciphertext‖tag (no AAD) and its
+    // length is passed as the buffer size; the plaintext is left in place.
+    let rc = unsafe {
+        sep_gcm(
+            0,
+            key.as_ptr().cast(),
+            key.len(),
+            iv.as_ptr().cast(),
+            iv.len(),
+            0,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            datalen,
+        )
+    };
+    if rc != 0 {
+        wipe(&mut buf);
+        return Err(Error::from_errno(rc));
+    }
+    buf.truncate(datalen);
+    Ok(buf)
+}
+
+/// The ephemeral point at the front of a blob from [`ecies_seal`].
+pub(crate) fn sealed_ephemeral(sealed: &[u8]) -> Result<&[u8]> {
+    if sealed.len() <= POINT_LEN + TAG_LEN || sealed[0] != 0x04 {
+        return Err(EINVAL);
+    }
+    Ok(&sealed[..POINT_LEN])
+}
+
+/// Opens a blob from [`ecies_seal`] given the ECDH shared X of its ephemeral
+/// point and the recipient key (what the enclave's `ock` returns): the same
+/// X9.63-SHA256 KDF and AES-256-GCM with the KDF-derived 16-byte IV.
+/// `EBADMSG` when the tag does not match (wrong key or a modified blob).
+pub(crate) fn ecies_open_with_shared(shared: &[u8], sealed: &[u8]) -> Result<KVec<u8>> {
+    let eph = sealed_ephemeral(sealed)?;
+    if shared.len() != 32 {
+        return Err(EINVAL);
+    }
+    let mut km = kdf_sha256_mode(shared, eph, AES256_KEY_LEN + IV_LEN, 0)?;
+    let r = gcm_decrypt(&km[..AES256_KEY_LEN], &km[AES256_KEY_LEN..], &sealed[POINT_LEN..]);
+    wipe(&mut km);
+    r
+}
+
 /// A fresh sender ephemeral for `recipient_pub` (uncompressed point) and the
 /// ECDH shared X it makes with that key: what an enclave key exchange
 /// (`ock`) with the returned point must give back. Self-test only.
@@ -248,4 +306,51 @@ pub(crate) fn ecies_seal(recipient_pub: &[u8], secret: &[u8]) -> Result<KVec<u8>
     blob.extend_from_slice(&parts.ciphertext, GFP_KERNEL)?;
     blob.extend_from_slice(&parts.tag, GFP_KERNEL)?;
     Ok(blob)
+}
+
+#[::kernel::macros::kunit_tests(apple_sep_ecies_open)]
+mod tests {
+    use super::*;
+
+    /// The P-256 generator as a recipient point: the ECDH shared X of an
+    /// ephemeral `e·G` with `G` is that ephemeral's own X, so a test can open
+    /// what it sealed without an enclave.
+    fn generator() -> [u8; POINT_LEN] {
+        let mut p = [0u8; POINT_LEN];
+        p[0] = 0x04;
+        p[1..33].copy_from_slice(&[
+            0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5, 0x63, 0xa4, 0x40, 0xf2,
+            0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0, 0xf4, 0xa1, 0x39, 0x45, 0xd8, 0x98, 0xc2, 0x96,
+        ]);
+        p[33..].copy_from_slice(&[
+            0x4f, 0xe3, 0x42, 0xe2, 0xfe, 0x1a, 0x7f, 0x9b, 0x8e, 0xe7, 0xeb, 0x4a, 0x7c, 0x0f, 0x9e, 0x16,
+            0x2b, 0xce, 0x33, 0x57, 0x6b, 0x31, 0x5e, 0xce, 0xcb, 0xb6, 0x40, 0x68, 0x37, 0xbf, 0x51, 0xf5,
+        ]);
+        p
+    }
+
+    #[test]
+    fn opens_what_it_sealed_with_the_shared_x() {
+        let secret = [0x42u8; 32];
+        let sealed = ecies_seal(&generator(), &secret).unwrap();
+        let shared = &sealed[1..33];
+        let got = ecies_open_with_shared(shared, &sealed).unwrap();
+        assert_eq!(&got[..], &secret[..]);
+    }
+
+    #[test]
+    fn refuses_a_wrong_shared_x_or_a_modified_blob() {
+        let secret = [0x24u8; 20];
+        let mut sealed = ecies_seal(&generator(), &secret).unwrap();
+        let mut wrong = [0u8; 32];
+        wrong.copy_from_slice(&sealed[1..33]);
+        wrong[0] ^= 1;
+        assert!(ecies_open_with_shared(&wrong, &sealed).is_err());
+        let mut shared = [0u8; 32];
+        shared.copy_from_slice(&sealed[1..33]);
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0x80;
+        assert!(ecies_open_with_shared(&shared, &sealed).is_err());
+        assert!(ecies_open_with_shared(&shared, &sealed[..POINT_LEN]).is_err());
+    }
 }

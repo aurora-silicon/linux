@@ -375,15 +375,11 @@ struct sep_key_seal {
  * 21 one touch: sign, then unseal a secret sealed to the key in the same
  * context ('result2' 0 when it came back unchanged). 22 (no finger): unseal
  * with no context ('result') and with an unsatisfied one ('result2').
- * 23 (no finger, handle ignored): for each of the list operations "oecd",
- * "od", "ock", "oe", a throwaway key with only that one (and sign, attest,
- * delete) free, unsealed with no context; 'result' has bit i set when key i
- * gave the secret back, 'result2' is 0 when a key with none of them free did.
  * 24 (no finger, handle ignored): five throwaway keys (no list, "oecd" free,
  * no decrypt entry, "ock" free, the plain ock/odel/osgn/oa/okd list), each
- * signed, decrypted and key-exchanged with no, an unsatisfied and a
- * key-bag-secret context; bit 8*key+row of 'result' (keys 0-3) or bit row of
- * 'result2' (key 4) is set when that row worked (rows in key.rs).
+ * signed, decrypted, key-exchanged and unsealed with no, an unsatisfied and
+ * a key-bag-secret context; bit 8*key+row of 'result' (keys 0-3) or bit row
+ * of 'result2' (key 4) is set when that row worked (rows in key.rs).
  * 'result' is 0 when the enclave signed, else a negative errno.
  */
 struct sep_key_selftest {

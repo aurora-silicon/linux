@@ -524,12 +524,15 @@ impl SepData {
         self.with_identity_bag(|handle, _secret| self.sks_refkey_sign(handle, blob, digest, acm))
     }
 
-    /// `/dev/sep-key` unseal: the enclave's ECIES decrypt (op `oecd`) of
-    /// `sealed` (from `refkey_seal::ecies_seal` to this key's public point)
-    /// with the key in `blob`, checked against the credential context `acm`
-    /// when one is given, as `user_key_sign` is. `EKEYREJECTED` when the
-    /// enclave refuses (a record from elsewhere, an access-control list the
-    /// context does not satisfy, or a blob sealed to another key).
+    /// `/dev/sep-key` unseal of `sealed` (from `refkey_seal::ecies_seal` to
+    /// this key's public point), checked against the credential context `acm`
+    /// when one is given, as `user_key_sign` is. The enclave refuses its own
+    /// decrypt (`oecd`) for every key with an access-control list, so, as on
+    /// macOS, it does only the key exchange (`ock`, which a biometric list
+    /// constrains like the signature) and the AES-GCM decrypt runs here.
+    /// `EKEYREJECTED` when the enclave refuses (a record from elsewhere, or a
+    /// list `acm` does not satisfy), `EBADMSG` for a blob sealed to another
+    /// key or modified.
     pub(crate) fn user_key_unseal(
         &self,
         blob: &[u8],
@@ -537,16 +540,20 @@ impl SepData {
         acm: Option<&[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>,
     ) -> Result<KVec<u8>> {
         Self::refkey_pub(blob).ok_or(EINVAL)?;
-        self.with_identity_bag(|handle, _secret| self.sks_refkey_decrypt(handle, blob, sealed, acm))
+        let eph = refkey_seal::sealed_ephemeral(sealed)?;
+        let shared = crate::Secret(self.with_identity_bag(|handle, _secret| self.sks_refkey_key_exchange(handle, blob, eph, acm))?);
+        refkey_seal::ecies_open_with_shared(&shared, sealed)
     }
 
-    /// Self-test only: one ref-key operation `op` with data `d` on the key in
-    /// `blob`, with an optional credential context. Returns the enclave's
-    /// status and, when it is 0, the record the reply carries.
+    /// Self-test only: one ref-key operation `op` with data `d` (under the
+    /// key `field`) on the key in `blob`, with an optional credential
+    /// context. Returns the enclave's status and, when it is 0, the record the
+    /// reply carries.
     pub(crate) fn user_key_raw_op(
         &self,
         blob: &[u8],
         op: &[u8],
+        field: &[u8],
         d: &[u8],
         acm: Option<&[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>,
     ) -> Result<(i32, KVec<u8>)> {
@@ -557,7 +564,7 @@ impl SepData {
             if let Some(acm) = acm {
                 items.push((b"acmh", RV::Octets(acm)), GFP_KERNEL)?;
             }
-            items.push((b"d", RV::Octets(d)), GFP_KERNEL)?;
+            items.push((field, RV::Octets(d)), GFP_KERNEL)?;
             items.push((b"o", RV::Utf8(op)), GFP_KERNEL)?;
             items.push((b"rk", RV::Der(blob)), GFP_KERNEL)?;
             let der = crate::der::encode_refkey_set(&items)?;
@@ -576,19 +583,20 @@ impl SepData {
         })
     }
 
-    /// Op `oecd` with an optional credential context (`acmh`); the enclave's
+    /// Op `ock` (`pub` = the peer point) with an optional credential context
+    /// (`acmh`): the ECDH shared X of the peer and the key. The enclave's
     /// status is kept in `last_key_status` like a signature's.
-    fn sks_refkey_decrypt(
+    fn sks_refkey_key_exchange(
         &self,
         handle: crate::sks::KeyBagHandle,
         refkey_blob: &[u8],
-        sealed: &[u8],
+        peer: &[u8],
         acm: Option<&[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>,
     ) -> Result<KVec<u8>> {
         use crate::der::RefKeyValue as RV;
         let mut items: KVec<(&[u8], RV<'_>)> = KVec::new();
-        items.push((b"o", RV::Utf8(b"oecd")), GFP_KERNEL)?;
-        items.push((b"d", RV::Octets(sealed)), GFP_KERNEL)?;
+        items.push((b"o", RV::Utf8(b"ock")), GFP_KERNEL)?;
+        items.push((b"pub", RV::Octets(peer)), GFP_KERNEL)?;
         items.push((b"rk", RV::Der(refkey_blob)), GFP_KERNEL)?;
         if let Some(acm) = acm {
             items.push((b"acmh", RV::Octets(acm)), GFP_KERNEL)?;
@@ -602,7 +610,7 @@ impl SepData {
         if out.reply.status != 0 {
             dev_warn!(
                 self.dev,
-                "sks: ref-key unseal refused by the enclave (status {}{})\n",
+                "sks: ref-key key exchange refused by the enclave (status {}{})\n",
                 out.reply.status,
                 (if acm.is_some() { ", with a credential context" } else { "" })
             );
@@ -615,8 +623,10 @@ impl SepData {
         let (Some(0), Some(rec)) = (f.i32(), f.blob()) else {
             return Err(EIO);
         };
+        // The record is the shared X as a DER OCTET STRING.
+        let x = crate::der::octet_string_body(rec).filter(|x| x.len() == 32).ok_or(EIO)?;
         let mut owned: KVec<u8> = KVec::new();
-        owned.extend_from_slice(rec, GFP_KERNEL)?;
+        owned.extend_from_slice(x, GFP_KERNEL)?;
         Ok(owned)
     }
 
