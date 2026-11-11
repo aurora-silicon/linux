@@ -7,6 +7,7 @@
 
 #include <linux/bitfield.h>
 #include <linux/completion.h>
+#include <linux/cpu.h>
 #include <linux/cpufreq.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
@@ -1641,35 +1642,55 @@ static void j613_floor_prime(struct j613_floor *f)
 	f->gov.streak = 0;
 }
 
-static void j613_floor_sample(struct j613_floor *f)
+static void j613_floor_sample_cpus(struct j613_floor *f, u64 period,
+				   unsigned int *cpct, unsigned int *csum)
 {
-	u64 now = ktime_get_ns(), gpu, period = (u64)f->sample_ms * NSEC_PER_MSEC;
-	unsigned int cpu, cpct = 0, csum = 0;
-	enum pmp_floor_action act;
+	unsigned int cpu;
 
-	f->samples++;
 	memset(f->cluster_sum, 0, nr_cpu_ids * sizeof(*f->cluster_sum));
+	/* Sleepable worker only; exclude hotplug while reading idle counters.
+	 * A policy reference keeps related_cpus alive even if it is unpublished
+	 * during this sample. No policy pointer escapes the mask lookup.
+	 */
+	cpus_read_lock();
+	for_each_possible_cpu(cpu)
+		if (!cpu_online(cpu))
+			f->cpu_wall[cpu] = 0;
 	for_each_online_cpu(cpu) {
 		u64 wall, idle = get_cpu_idle_time(cpu, &wall, 0);
 
 		/* A CPU unseen for many periods (hotplug, long delay) is skipped once. */
-		if (f->primed && wall > f->cpu_wall[cpu] &&
+		if (f->primed && f->cpu_wall[cpu] && wall > f->cpu_wall[cpu] &&
 		    (wall - f->cpu_wall[cpu]) * NSEC_PER_USEC <= 10 * period) {
 			unsigned int pct = pmp_floor_cpu_pct(f->cpu_idle[cpu], f->cpu_wall[cpu],
 							     idle, wall);
-			struct cpufreq_policy *pol = cpufreq_cpu_get_raw(cpu);
+			struct cpufreq_policy *pol = cpufreq_cpu_get(cpu);
 			/* A cluster is a cpufreq policy; without one, all CPUs are one. */
 			unsigned int key = pol ? cpumask_first(pol->related_cpus) : 0;
 
-			cpct = max(cpct, pct);
+			if (pol)
+				cpufreq_cpu_put(pol);
+
+			*cpct = max(*cpct, pct);
 			if (key < nr_cpu_ids) {
 				f->cluster_sum[key] += pct;
-				csum = max(csum, f->cluster_sum[key]);
+				*csum = max(*csum, f->cluster_sum[key]);
 			}
 		}
 		f->cpu_idle[cpu] = idle;
 		f->cpu_wall[cpu] = wall;
 	}
+	cpus_read_unlock();
+}
+
+static void j613_floor_sample(struct j613_floor *f)
+{
+	u64 now = ktime_get_ns(), gpu, period = (u64)f->sample_ms * NSEC_PER_MSEC;
+	unsigned int cpct = 0, csum = 0;
+	enum pmp_floor_action act;
+
+	f->samples++;
+	j613_floor_sample_cpus(f, period, &cpct, &csum);
 	gpu = j613_floor_gpu_busy_ns(now, NULL);
 	f->cpu_pct = cpct;
 	f->cpu_sum = csum;

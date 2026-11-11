@@ -380,6 +380,79 @@ def static_checks():
     print('pmp-j613-floor: static source checks passed')
 
 
+
+def sampling_checks():
+    # Failure modes: absent/removed policy, leaked reference, mask use after
+    # put, hotplug during iteration, stale utilization after CPU re-online.
+    src = block(SRC.read_text(), 'static void j613_floor_sample_cpus(')
+    harness = r"""
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+#define BIT_ULL(x) (1ULL << (x))
+#define u64 uint64_t
+#define NSEC_PER_USEC 1000
+#define nr_cpu_ids 2
+#define max(a,b) ((a) > (b) ? (a) : (b))
+#define for_each_possible_cpu(cpu) for ((cpu)=0; (cpu)<2; (cpu)++)
+#define for_each_online_cpu(cpu) for_each_possible_cpu(cpu) if (cpu_online(cpu))
+static bool online[2] = {true, true}, locked, present = true, remove_on_get;
+static int refs, gets, puts;
+static unsigned int mask = 0;
+struct cpufreq_policy { unsigned int *related_cpus; } policy = { &mask };
+struct j613_floor { bool primed; u64 cpu_idle[2], cpu_wall[2]; unsigned int cluster_sum[2]; };
+static void cpus_read_lock(void) { assert(!locked); locked = true; }
+static void cpus_read_unlock(void) { assert(locked && !refs); locked = false; }
+static bool cpu_online(unsigned int cpu) { assert(locked); return online[cpu]; }
+static struct cpufreq_policy *cpufreq_cpu_get(unsigned int cpu)
+{
+    (void)cpu; assert(locked); gets++;
+    if (!present) return 0;
+    refs++;
+    if (remove_on_get) present = false; /* Unpublish after referenced lookup. */
+    return &policy;
+}
+static unsigned int cpumask_first(unsigned int *m)
+{ assert(locked && refs == 1 && m == &mask); return *m; }
+static void cpufreq_cpu_put(struct cpufreq_policy *p)
+{ assert(p == &policy && refs == 1); refs--; puts++; }
+static u64 get_cpu_idle_time(unsigned int cpu, u64 *wall, int io)
+{ (void)cpu; (void)io; assert(locked); *wall = 1030; return 100; }
+#include "gov.h"
+""" + src + r"""
+int main(void)
+{
+    struct j613_floor f = { .primed = true, .cpu_idle = {100,100}, .cpu_wall = {1000,1000} };
+    unsigned int pct = 0, sum = 0;
+    j613_floor_sample_cpus(&f, 30000000, &pct, &sum);
+    assert(pct == 100 && sum == 200 && gets == 2 && puts == 2 && !refs);
+    present = false; pct = sum = 0; f.cpu_wall[0] = f.cpu_wall[1] = 1000;
+    j613_floor_sample_cpus(&f, 30000000, &pct, &sum);
+    assert(pct == 100 && sum == 200 && puts == 2 && !refs);
+    present = remove_on_get = true; pct = sum = 0; f.cpu_wall[0] = f.cpu_wall[1] = 1000;
+    j613_floor_sample_cpus(&f, 30000000, &pct, &sum);
+    assert(pct == 100 && sum == 200 && puts == 3 && !refs);
+    online[1] = false; f.cpu_wall[1] = 1000;
+    j613_floor_sample_cpus(&f, 30000000, &pct, &sum);
+    assert(f.cpu_wall[1] == 0);
+    online[1] = true; pct = sum = 0;
+    j613_floor_sample_cpus(&f, 30000000, &pct, &sum);
+    assert(pct == 0 && sum == 0 && f.cpu_wall[1] == 1030 && !locked && !refs);
+    return 0;
+}
+"""
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        (d / 'gov.h').write_text(HDR.read_text())
+        (d / 'sample.c').write_text(harness)
+        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
+                        '-Werror', '-fsanitize=undefined', '-fno-sanitize-recover=all',
+                        str(d / 'sample.c'), '-o', str(d / 'sample')], check=True)
+        subprocess.run([str(d / 'sample')], check=True)
+    print('pmp-j613-floor: referenced sampling, removal and hotplug passed')
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--mutant', choices=sorted(MUTANTS))
@@ -392,6 +465,7 @@ def main():
         hdr = hdr.replace(old, new)
     else:
         static_checks()
+        sampling_checks()
     with tempfile.TemporaryDirectory(dir=a.out) as d:
         d = Path(d)
         (d / 'gov.h').write_text(hdr)
