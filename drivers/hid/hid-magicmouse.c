@@ -1495,6 +1495,17 @@ static int magicmouse_input_mapping(struct hid_device *hdev,
 	if (!msc->input)
 		msc->input = hi->input;
 
+	/*
+	 * The dockchannel MTP descriptors (K114c and later) open with a GD
+	 * Mouse collection. raw_event() drives the pad, and libinput refuses
+	 * a mouse and multi-touch hybrid, so drop the Mouse usages. The
+	 * keyboard interface is a GD Keyboard, and kiwi never gets here
+	 * (type guard in magicmouse_probe()).
+	 */
+	if (hdev->bus == BUS_HOST && !strncmp(hdev->name, "Apple MTP", 9) &&
+	    field->application == HID_GD_MOUSE)
+		return -1;
+
 	/* Magic Trackpad does not give relative data after switching to MT */
 	if ((hi->input->id.product == USB_DEVICE_ID_APPLE_MAGICTRACKPAD ||
 	     hi->input->id.product == USB_DEVICE_ID_APPLE_MAGICTRACKPAD2 ||
