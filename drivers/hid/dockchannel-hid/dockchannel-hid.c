@@ -977,6 +977,51 @@ static int dchid_create_interface(struct dchid_iface *iface)
 	return queue_work(iface->dchid->new_iface_wq, &iface->create_work);
 }
 
+/* hid-core rejects any Report Size above this (see hid_parser_global()). */
+#define DCHID_MAX_REPORT_SIZE	16384
+
+/*
+ * The T6050 multi-touch firmware declares its raw touch report as one item of
+ * 0x80000 bits. The magicmouse driver reads those reports in raw_event() and
+ * never looks at the field layout, so clamp every Report Size item to what
+ * hid-core accepts instead of failing the whole interface.
+ */
+static void dchid_clamp_report_sizes(struct dchid_iface *iface, u8 *desc, size_t len)
+{
+	size_t i = 0;
+
+	while (i < len) {
+		u8 prefix = desc[i];
+		size_t n = prefix & 3;
+		u32 val = 0;
+		size_t j;
+
+		if (prefix == 0xfe) {
+			if (i + 1 >= len)
+				return;
+			i += 3 + desc[i + 1];
+			continue;
+		}
+		if (n == 3)
+			n = 4;
+		if (i + 1 + n > len)
+			return;
+
+		if ((prefix & 0xfc) == 0x74 && n >= 2) {
+			for (j = 0; j < n; j++)
+				val |= (u32)desc[i + 1 + j] << (8 * j);
+			if (val > DCHID_MAX_REPORT_SIZE) {
+				dev_info(iface->dchid->dev,
+					 "%s: clamping Report Size %u to %u\n",
+					 iface->name, val, DCHID_MAX_REPORT_SIZE);
+				for (j = 0; j < n; j++)
+					desc[i + 1 + j] = (DCHID_MAX_REPORT_SIZE >> (8 * j)) & 0xff;
+			}
+		}
+		i += 1 + n;
+	}
+}
+
 static void dchid_handle_descriptor(struct dchid_iface *iface, void *hid_desc, size_t desc_len)
 {
 	if (iface->hid) {
@@ -990,6 +1035,7 @@ static void dchid_handle_descriptor(struct dchid_iface *iface, void *hid_desc, s
 		return;
 
 	iface->hid_desc_len = desc_len;
+	dchid_clamp_report_sizes(iface, iface->hid_desc, desc_len);
 }
 
 static void dchid_handle_ready(struct dockchannel_hid *dchid, void *data, size_t length)

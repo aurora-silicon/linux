@@ -170,6 +170,33 @@ static void dchid_init_descriptor_test(struct kunit *test)
 	KUNIT_EXPECT_MEMEQ(test, iface->hid_desc, msg.descriptor, sizeof(msg.descriptor));
 }
 
+/* Only real Report Size items above the hid-core limit change. */
+static void dchid_report_size_clamp_test(struct kunit *test)
+{
+	struct dchid_iface *iface = test->priv;
+	static const u8 want[] = {
+		0xfe, 0x02, 0x00, 0x77, 0x00,	/* long item, data looks like Report Size */
+		0x75, 0x08,			/* Report Size (8) */
+		0x77, 0x00, 0x40, 0x00, 0x00,	/* Report Size (0x80000), now 16384 */
+		0x95, 0x01,			/* Report Count (1) */
+	};
+	struct {
+		struct dchid_init_hdr hdr;
+		struct dchid_init_block_hdr block;
+		u8 descriptor[sizeof(want)];
+	} __packed msg = {
+		.hdr = { .iface = 1, .more_packets = 1 },
+		.block = { .type = INIT_HID_DESCRIPTOR, .length = sizeof(want) },
+		.descriptor = { 0xfe, 0x02, 0x00, 0x77, 0x00, 0x75, 0x08,
+				0x77, 0x00, 0x00, 0x08, 0x00, 0x95, 0x01 },
+	};
+
+	dchid_handle_init(iface->dchid, &msg, sizeof(msg));
+	KUNIT_ASSERT_NOT_NULL(test, iface->hid_desc);
+	KUNIT_EXPECT_EQ(test, iface->hid_desc_len, sizeof(want));
+	KUNIT_EXPECT_MEMEQ(test, iface->hid_desc, want, sizeof(want));
+}
+
 static void dchid_packet_checksum_test(struct kunit *test)
 {
 	struct dchid_hdr hdr = { .hdr_len = sizeof(hdr), .length = 8 };
@@ -265,6 +292,7 @@ static struct kunit_case dchid_parser_cases[] = {
 	KUNIT_CASE(dchid_init_bounds_test),
 	KUNIT_CASE(dchid_short_input_test),
 	KUNIT_CASE(dchid_init_descriptor_test),
+	KUNIT_CASE(dchid_report_size_clamp_test),
 	KUNIT_CASE(dchid_packet_checksum_test),
 	KUNIT_CASE(dchid_ring_wrap_test),
 	KUNIT_CASE(dchid_ring_bad_header_test),
