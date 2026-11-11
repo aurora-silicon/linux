@@ -2871,7 +2871,7 @@ impl SepData {
                 Some(context) => drop(context),
                 None => self.close_unlock_evaluation(&evaluation),
             }
-            if key_mode && matched {
+            if key_mode && matched && !self.key_context_failed.load(Relaxed) {
                 self.key_touch_after_close(&evaluation);
             }
         }
