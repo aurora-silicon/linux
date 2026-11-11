@@ -6,10 +6,10 @@
  *
  *  - apple,aic-timebase: the timebase aperture of the interrupt controller
  *  - apple,debug-dock: the debug dock connection status register
- *  - apple,t6000-dwi, apple,t8112-dwi, apple,t8140-dwi: the DWI serial
- *    backlight interface. The panel backlight of these machines is driven by
- *    the display coprocessor and does not use DWI, so these registers only
- *    hold their boot state
+ *  - apple,t6000-dwi, apple,t6041-dwi, apple,t8112-dwi, apple,t8140-dwi:
+ *    the DWI serial backlight interface. The panel backlight of these
+ *    machines is driven by the display coprocessor and does not use DWI, so
+ *    these registers only hold their boot state
  *
  * The driver never writes a device register and requests no interrupt.
  * Registers are read only when a debugfs file is read. A block in a power
@@ -183,6 +183,7 @@ static const struct of_device_id dbgview_of_match[] = {
 	{ .compatible = "apple,aic-timebase" },
 	{ .compatible = "apple,debug-dock" },
 	{ .compatible = "apple,t6000-dwi" },
+	{ .compatible = "apple,t6041-dwi" },
 	{ .compatible = "apple,t8112-dwi" },
 	{ .compatible = "apple,t8140-dwi" },
 	{ }

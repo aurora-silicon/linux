@@ -497,6 +497,7 @@ module_param(execute_depth, uint, 0444);
 MODULE_PARM_DESC(execute_depth, "Maximum concurrent EXECUTEs (1-4, default 2)");
 
 static void h16_gate_work(struct work_struct *work);
+static void h16_export_work(struct work_struct *work);
 
 /* Lifecycle traffic must not interleave with a batch's command arena. */
 static void h16_drain(struct ane_h16_session *s)
@@ -531,6 +532,9 @@ int ane_h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *tra
 	INIT_LIST_HEAD(&s->programs);
 	spin_lock_init(&s->stats_lock);
 	INIT_DELAYED_WORK(&s->gate_work, h16_gate_work);
+	spin_lock_init(&s->export_lock);
+	INIT_LIST_HEAD(&s->exports_done);
+	INIT_WORK(&s->export_work, h16_export_work);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_init);
@@ -644,12 +648,108 @@ static void h16_give_spare(struct ane_h16_session *s, struct ane_fw_surface *sur
 	memset(surface, 0, sizeof(*surface));
 }
 
+static void h16_export_work(struct work_struct *work)
+{
+	struct ane_h16_session *s = container_of(work, struct ane_h16_session, export_work);
+	struct ane_h16_export *e, *next;
+	LIST_HEAD(done);
+
+	spin_lock(&s->export_lock);
+	list_splice_init(&s->exports_done, &done);
+	spin_unlock(&s->export_lock);
+	mutex_lock(s->lock);
+	list_for_each_entry_safe(e, next, &done, node) {
+		list_del(&e->node);
+		h16_give_spare(s, &e->surface, e->write);
+		kfree(e);
+	}
+	mutex_unlock(s->lock);
+}
+
+/* Return released exports now. Caller does not hold the node lock. */
+void ane_h16_session_flush_exports(struct ane_h16_session *s)
+{
+	flush_work(&s->export_work);
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_flush_exports);
+
+/*
+ * A process maps surface @index of @p. The first mapping of a surface
+ * creates its export, held by the program; each call returns one more
+ * reference for the caller's mapping. Caller holds the node lock.
+ */
+int ane_h16_session_export(struct ane_h16_session *s, struct ane_h16_program *p,
+			   unsigned int index, struct ane_h16_export **out)
+{
+	struct ane_h16_export *e;
+	unsigned int j;
+
+	if (!s || !p || p->session != s || p->closed || p->released ||
+	    index >= p->resource_count || !p->surfaces[index])
+		return -EINVAL;
+	j = p->surfaces[index] - p->regions;
+	if (j >= p->plan.count)
+		return -EINVAL;
+	e = p->exports[j];
+	if (!e) {
+		e = kzalloc_obj(*e);
+		if (!e)
+			return -ENOMEM;
+		refcount_set(&e->ref, 1);
+		e->session = s;
+		e->surface = p->regions[j];
+		e->write = p->plan.regions[j].permissions & 2;
+		INIT_LIST_HEAD(&e->node);
+		p->exports[j] = e;
+	}
+	refcount_inc(&e->ref);
+	*out = e;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_export);
+
+void ane_h16_export_get(struct ane_h16_export *e)
+{
+	refcount_inc(&e->ref);
+}
+EXPORT_SYMBOL_GPL(ane_h16_export_get);
+
+/*
+ * Drop a reference. The last one returns a released surface to the spares
+ * from a work item: a mapping's last put runs under the process mmap lock,
+ * which an EXECUTE may wait for while holding the node lock.
+ */
+void ane_h16_export_put(struct ane_h16_export *e)
+{
+	struct ane_h16_session *s;
+
+	if (!e || !refcount_dec_and_test(&e->ref))
+		return;
+	s = e->session;
+	spin_lock(&s->export_lock);
+	list_add_tail(&e->node, &s->exports_done);
+	spin_unlock(&s->export_lock);
+	schedule_work(&s->export_work);
+}
+EXPORT_SYMBOL_GPL(ane_h16_export_put);
+
 static void h16_give_back(struct ane_h16_session *s, struct ane_h16_program *p)
 {
 	unsigned int i;
 
-	for (i = 0; i < p->plan.count; i++)
+	for (i = 0; i < p->plan.count; i++) {
+		struct ane_h16_export *e = p->exports[i];
+
+		if (e) {
+			/* Mapped by a process: the export returns it after the last unmap. */
+			e->released = true;
+			p->exports[i] = NULL;
+			memset(&p->regions[i], 0, sizeof(p->regions[i]));
+			ane_h16_export_put(e);
+			continue;
+		}
 		h16_give_spare(s, &p->regions[i], p->plan.regions[i].permissions & 2);
+	}
 	for (i = 0; i < ANE_H16_AUX_COUNT; i++)
 		h16_give_spare(s, &p->aux[i], false);
 	memset(p->surfaces, 0, sizeof(p->surfaces));
