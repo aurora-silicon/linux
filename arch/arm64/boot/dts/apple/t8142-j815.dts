@@ -120,6 +120,7 @@
 
 #include "t8142-j813-peripherals.dtsi"
 #include "t8142-j813-j815.dtsi"
+#include "t8142-j813-usb.dtsi"
 
 &mtp_hid {
 	multi-touch {
