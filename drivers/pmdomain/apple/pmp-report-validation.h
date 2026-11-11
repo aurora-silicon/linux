@@ -81,6 +81,14 @@ static inline bool apple_pmp_t8112_constraint_word(u32 dcs, u32 soc, u64 *word)
 	return apple_pmp_dvfs_word(soc, class_levels, ARRAY_SIZE(class_levels), word);
 }
 
+/* T8112's direct DCS and SoC domain floors use the main request level. */
+static inline bool apple_pmp_t8112_state_word(u32 level, u32 max, u64 *word)
+{
+	if (level > max)
+		return false;
+	return apple_pmp_dvfs_word(level, NULL, 0, word);
+}
+
 /* The PTD request read, request update and acknowledgment apertures. */
 static inline bool apple_pmp_ranges_valid(const u8 *table, size_t len,
 					  u32 request_read, u32 request_write,

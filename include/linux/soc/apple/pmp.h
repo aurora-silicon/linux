@@ -9,13 +9,17 @@ struct device;
 /*
  * T8112 SOC-device IDs of the CPU-cluster and ANE constraint targets, and the
  * highest qualified DCS and SoC-fabric levels. The host publishes each
- * target's SOC-DEV-DVFS entry at the SOC-device ID from a base of 0xa5.
+ * target's SOC-DEV-DVFS entry at the SOC-device ID from a base of 0xa5, plus
+ * the direct DCS and SoC floors in DVFS-state entries 9 and 10.
  */
 #define APPLE_PMP_T8112_EACC0		3
 #define APPLE_PMP_T8112_PACC0		4
 #define APPLE_PMP_T8112_ANE0		6
 #define APPLE_PMP_T8112_DCS_MAX		4
 #define APPLE_PMP_T8112_SOC_MAX		2
+#define APPLE_PMP_T8112_DVFS_STATE_READY	0x8
+#define APPLE_PMP_T8112_DVFS_STATE_DCS		0x9
+#define APPLE_PMP_T8112_DVFS_STATE_SOC		0xa
 #define APPLE_PMP_T8112_DVFS_BASE	0xa5
 #define APPLE_PMP_T8112_DVFS_ENTRY(id)	(APPLE_PMP_T8112_DVFS_BASE + (id))
 

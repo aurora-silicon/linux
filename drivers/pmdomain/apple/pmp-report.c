@@ -56,7 +56,8 @@
  * @dvfs_ready_state: achieved-state report used by the DVFS ready gate
  * @dvfs_ready_entry: PTD entry primed by the ready gate
  * @dvfs_ready_prime: word written to @dvfs_ready_entry to request a report
- * @soc_dvfs_state: SOC achieved-state report offset; 0 if not reported
+ * @dvfs_state_first: first direct DVFS-state request/report entry
+ * @dvfs_state_count: number of direct DVFS-state entries exposed for debug
  * @actual: power state acknowledgment
  * @status: PMP status; bit 0 is set while the PMP is running
  * @fast_die: 32-bit word holding the fast die-temperature effort of each
@@ -86,7 +87,7 @@ struct apple_pmp_report_offsets {
 	u32 dvfs_first, dvfs_count;
 	u32 dvfs_ready_state, dvfs_ready_entry;
 	u64 dvfs_ready_prime;
-	u32 soc_dvfs_state;
+	u32 dvfs_state_first, dvfs_state_count;
 	bool running_any;
 	bool defer_requests;
 	bool starts_pmp;
@@ -104,6 +105,7 @@ struct apple_pmp_t8112_constraint {
 };
 
 #define PMP_T8112_CONSTRAINT_TARGET_COUNT 3
+#define PMP_T8112_STATE_COUNT 2
 
 struct apple_pmp_report {
 	struct device *dev;
@@ -130,6 +132,8 @@ struct apple_pmp_report {
 	u64 dvfs_pending;
 	u64 dvfs_ready_prime_word;
 	u64 dvfs_ready_achieved_word;
+	u64 t8112_state_words[PMP_T8112_STATE_COUNT];
+	u8 t8112_state_known;
 	bool dvfs_ready_prime_sent;
 	bool dvfs_ready;
 	struct apple_pmp_t8112_constraint
@@ -410,6 +414,8 @@ static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 	unsigned long flags;
 	u64 known, shadow, request_word, dvfs_known, words[64];
 	u64 dvfs_ready_prime_word, dvfs_ready_achieved_word;
+	u64 state_words[PMP_T8112_STATE_COUNT];
+	u8 state_known;
 	bool request_word_known, dvfs_ready_prime_sent, dvfs_ready;
 	u32 effort;
 
@@ -421,6 +427,8 @@ static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 	dvfs_known = rep->dvfs_known;
 	dvfs_ready_prime_word = rep->dvfs_ready_prime_word;
 	dvfs_ready_achieved_word = rep->dvfs_ready_achieved_word;
+	state_known = rep->t8112_state_known;
+	memcpy(state_words, rep->t8112_state_words, sizeof(state_words));
 	dvfs_ready_prime_sent = rep->dvfs_ready_prime_sent;
 	dvfs_ready = rep->dvfs_ready;
 	memcpy(words, rep->dvfs_words, sizeof(words));
@@ -445,11 +453,21 @@ static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 		seq_printf(s, "dvfs_ready_achieved@%x: offset: %#x word: %#llx ready: %u\n",
 			   offs->dvfs_ready_entry, offs->dvfs_ready_state,
 			   dvfs_ready_achieved_word, dvfs_ready);
-		if (running && offs->soc_dvfs_state)
-			seq_printf(s, "soc_dvfs_state: offset: %#x word: %#llx metadata: %#llx\n",
-				   offs->soc_dvfs_state,
-				   readq(rep->base + offs->soc_dvfs_state),
-				   readq(rep->base + offs->soc_dvfs_state + 8));
+		for (lane = 0; lane < offs->dvfs_state_count; lane++) {
+			u32 entry = offs->dvfs_state_first + lane;
+			u32 state = 16 * entry;
+
+			if (state_known & BIT(lane))
+				seq_printf(s,
+					   "dvfs_state_request@%x: offset: %#x word: %#llx (host)\n",
+					   entry, offs->update + 8 * entry,
+					   state_words[lane]);
+			if (running)
+				seq_printf(s,
+					   "dvfs_state_achieved@%x: offset: %#x word: %#llx metadata: %#llx\n",
+					   entry, state, readq(rep->base + state),
+					   readq(rep->base + state + 8));
+		}
 	}
 	if (rep->start)
 		apple_pmp_start_show(s, rep->start);
@@ -1641,11 +1659,12 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8112 = {
 	.tgt_read = 0xa00,
 	.tgt_write = 0x10500,
 	.update = 0x10000,
-	/* DVFS readiness belongs to range base entry 8, not SOC state entry 9. */
+	/* Entry 8 is readiness; domain IDs then map DCS to 9 and SoC to 10. */
 	.dvfs_ready_state = 0x80,
 	.dvfs_ready_entry = 0x8,
 	.dvfs_ready_prime = 1,
-	.soc_dvfs_state = 0x90,
+	.dvfs_state_first = APPLE_PMP_T8112_DVFS_STATE_DCS,
+	.dvfs_state_count = 2,
 	/* EACC0 through JPEG; individual consumers are still allow-listed. */
 	.dvfs_first = 0xa8,
 	.dvfs_count = 0xb3 - 0xa8,
@@ -2118,6 +2137,8 @@ static void apple_pmp_report_dvfs_write(struct apple_pmp_report *rep, u32 entry,
 
 static_assert(PMP_T8112_CONSTRAINT_DCS_MAX == APPLE_PMP_T8112_DCS_MAX);
 static_assert(PMP_T8112_CONSTRAINT_SOC_MAX == APPLE_PMP_T8112_SOC_MAX);
+static_assert(PMP_T8112_STATE_COUNT ==
+	      APPLE_PMP_T8112_DVFS_STATE_SOC - APPLE_PMP_T8112_DVFS_STATE_DCS + 1);
 
 static int apple_pmp_t8112_constraint_target(unsigned int entry)
 {
@@ -2147,6 +2168,38 @@ apple_pmp_t8112_constraint_aggregate(const struct apple_pmp_t8112_constraint
 	return aggregate;
 }
 
+static struct apple_pmp_t8112_constraint
+apple_pmp_t8112_system_aggregate(const struct apple_pmp_report *rep)
+{
+	struct apple_pmp_t8112_constraint aggregate = {};
+	unsigned int source, target;
+
+	for (target = 0; target < PMP_T8112_CONSTRAINT_TARGET_COUNT; target++)
+		for (source = 0; source < APPLE_PMP_T8112_CONSTRAINT_SOURCE_COUNT; source++) {
+			aggregate.dcs = max(aggregate.dcs,
+					    rep->t8112_constraints[target][source].dcs);
+			aggregate.soc = max(aggregate.soc,
+					    rep->t8112_constraints[target][source].soc);
+		}
+	return aggregate;
+}
+
+/* The caller holds @rep->lock and has already qualified the levels. */
+static void apple_pmp_t8112_write_state(struct apple_pmp_report *rep,
+					unsigned int entry, unsigned int level,
+					unsigned int max, unsigned int index)
+{
+	u64 word;
+
+	apple_pmp_t8112_state_word(level, max, &word);
+	if (!(rep->t8112_state_known & BIT(index)) ||
+	    rep->t8112_state_words[index] != word) {
+		rep->t8112_state_words[index] = word;
+		writeq(word, rep->base + rep->offsets->update + 8 * entry);
+		rep->t8112_state_known |= BIT(index);
+	}
+}
+
 /**
  * apple_pmp_t8112_set_constraint() - publish one T8112 constraint source
  * @report_np: PMP report provider
@@ -2158,8 +2211,9 @@ apple_pmp_t8112_constraint_aggregate(const struct apple_pmp_t8112_constraint
  * Source requests are max-aggregated per target. The provider then performs
  * one whole-word store to the target's SOC-DEV-DVFS update entry: the SoC
  * fabric level is the main level (bits 4:0) and the DCS level is request
- * class 0x21 (bits 35:32). A stopped PMP or an unready DVFS range receives no
- * target store.
+ * class 0x21 (bits 35:32). It also max-aggregates every Linux target into the
+ * direct DCS and SoC domain-floor entries. A stopped PMP or an unready DVFS
+ * range receives no target or floor store.
  *
  * Context: any context that may take a spinlock; this function never waits.
  * Return: 0 when published; -EAGAIN while the PMP is stopped or the DVFS range
@@ -2172,6 +2226,7 @@ int apple_pmp_t8112_set_constraint(const struct device_node *report_np, unsigned
 				   unsigned int dcs, unsigned int soc)
 {
 	struct apple_pmp_t8112_constraint aggregate;
+	struct apple_pmp_t8112_constraint system;
 	struct apple_pmp_report *rep;
 	unsigned long flags;
 	unsigned int index;
@@ -2201,12 +2256,22 @@ int apple_pmp_t8112_set_constraint(const struct device_node *report_np, unsigned
 		rep->t8112_constraints[target][source].dcs = dcs;
 		rep->t8112_constraints[target][source].soc = soc;
 		aggregate = apple_pmp_t8112_constraint_aggregate(rep->t8112_constraints[target]);
+		system = apple_pmp_t8112_system_aggregate(rep);
 		apple_pmp_t8112_constraint_word(aggregate.dcs, aggregate.soc, &word);
 		if (!(rep->dvfs_known & BIT_ULL(index)) || rep->dvfs_words[index] != word) {
 			rep->dvfs_words[index] = word;
 			writeq(word, rep->base + rep->offsets->update + 8 * entry);
 			rep->dvfs_known |= BIT_ULL(index);
 		}
+		/*
+		 * Device constraints qualify a transition but do not request the
+		 * system domains themselves. Publish the direct DCS and SoC floors
+		 * from the same max-aggregated Linux demand.
+		 */
+		apple_pmp_t8112_write_state(rep, APPLE_PMP_T8112_DVFS_STATE_DCS,
+					    system.dcs, APPLE_PMP_T8112_DCS_MAX, 0);
+		apple_pmp_t8112_write_state(rep, APPLE_PMP_T8112_DVFS_STATE_SOC,
+					    system.soc, APPLE_PMP_T8112_SOC_MAX, 1);
 		spin_unlock_irqrestore(&rep->lock, flags);
 		ret = 0;
 		break;
