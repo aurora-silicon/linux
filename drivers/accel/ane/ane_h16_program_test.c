@@ -1477,6 +1477,65 @@ static void program_pool_recycle_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_fw_transport_release(&f->t, f->t.pool_used + 1), -EINVAL);
 }
 
+/*
+ * A surface mapped into a process outlives its program's teardown: it goes
+ * back to the spares only after the last mapping reference is dropped, so a
+ * later program never gets pages a process still maps.
+ */
+static void program_export_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct mutex *lock = kunit_kzalloc(test, sizeof(*lock), GFP_KERNEL);
+	struct ane_h16_program *p = NULL, *second = NULL;
+	struct ane_h16_export *e = NULL, *again = NULL;
+	struct ane_fw_surface exported;
+	unsigned int spares, i;
+	bool reused = false;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, lock);
+	mutex_init(lock);
+	f->s.lock = lock;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	/* Bad indices refuse; two mappings of one surface share its export. */
+	KUNIT_EXPECT_EQ(test, ane_h16_session_export(&f->s, p, p->resource_count, &e), -EINVAL);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_export(&f->s, p, 1, &e), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_export(&f->s, p, 1, &again), 0);
+	KUNIT_EXPECT_PTR_EQ(test, e, again);
+	KUNIT_EXPECT_EQ(test, refcount_read(&e->ref), 3);
+	KUNIT_EXPECT_TRUE(test, e->write);
+	exported = e->surface;
+	KUNIT_EXPECT_EQ(test, exported.dva, p->surfaces[1]->dva);
+	ane_h16_export_put(again);
+
+	spares = f->s.spare_count;
+	KUNIT_ASSERT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+	/* Every region and section went back except the mapped surface. */
+	KUNIT_EXPECT_EQ(test, f->s.spare_count, spares + p->plan.count + ANE_H16_AUX_COUNT - 1);
+	KUNIT_EXPECT_TRUE(test, e->released);
+	for (i = 0; i < f->s.spare_count; i++)
+		KUNIT_EXPECT_NE(test, f->s.spares[i].surface.dva, exported.dva);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_export(&f->s, p, 1, &again), -EINVAL);
+	ane_h16_session_put(&f->s, p);
+
+	/* A second program cannot get the mapped pages. */
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &second), 0);
+	for (i = 0; i < second->plan.count; i++)
+		KUNIT_EXPECT_NE(test, second->regions[i].dva, exported.dva);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_close(&f->s, second), 0);
+	ane_h16_session_put(&f->s, second);
+
+	/* The last unmap returns it. */
+	spares = f->s.spare_count;
+	ane_h16_export_put(e);
+	ane_h16_session_flush_exports(&f->s);
+	KUNIT_EXPECT_EQ(test, f->s.spare_count, spares + 1);
+	for (i = 0; i < f->s.spare_count; i++)
+		reused |= f->s.spares[i].surface.dva == exported.dva;
+	KUNIT_EXPECT_TRUE(test, reused);
+	f->s.lock = NULL;
+}
+
 /* Running out of arena refuses cleanly, before any traffic. */
 static void program_pool_test(struct kunit *test)
 {
@@ -2708,6 +2767,7 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_shared_tag_test),
 	KUNIT_CASE(program_pool_test),
 	KUNIT_CASE(program_pool_recycle_test),
+	KUNIT_CASE(program_export_test),
 	KUNIT_CASE(program_h17_hwx_test),
 	KUNIT_CASE(program_h17_sections_test),
 	KUNIT_CASE(program_h17_mobilenet_test),
