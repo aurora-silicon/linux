@@ -323,6 +323,8 @@
 			compatible = "apple,t6050-usb4-nhi";
 			reg = <0xf00000 0x100000>;
 			reg-names = "nhi";
+			/* The board or boot loader supplies the host DROM. */
+			apple,thunderbolt-drom = [00];
 			interrupts = <AIC_IRQ 0 1643 IRQ_TYPE_LEVEL_HIGH>,
 					     <AIC_IRQ 0 1644 IRQ_TYPE_LEVEL_HIGH>,
 					     <AIC_IRQ 0 1645 IRQ_TYPE_LEVEL_HIGH>,
