@@ -131,6 +131,17 @@ pub trait AOP: Send + Sync {
     /// port, with `EBUSY` when the bound ring is smaller than `size`, and with `EIO` after a
     /// binding whose outcome is unknown.
     fn source_ring(&self, dev: &Device<Bound>, size: usize) -> Result<Arc<SourceRing>>;
+    /// A host ring of `size` bytes allocated on and mapped through `dev`, the audio child, and
+    /// handed to the firmware by `bind(iova, size)` on first use; then shared for the rest of
+    /// the AOP's lifetime, like [`AOP::source_ring`], whose binding goes over the setup port.
+    /// `bind` runs with the ring binding held, so it must not ask for a ring itself. Fails as
+    /// [`AOP::source_ring`] does, without its setup-port requirement.
+    fn bound_ring(
+        &self,
+        dev: &Device<Bound>,
+        size: usize,
+        bind: &mut dyn FnMut(u64, u64) -> Result<()>,
+    ) -> Result<Arc<SourceRing>>;
     /// Internal method to detach the device.
     fn remove(&self);
 }

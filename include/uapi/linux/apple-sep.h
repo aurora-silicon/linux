@@ -258,6 +258,33 @@ struct sep_bio_rearm {
  * only passcode is a key bag secret root holds, so CREATE refuses them with
  * EOPNOTSUPP rather than check a password in software.
  *
+ * Version 3 adds SEP_KEY_CANCEL, SEP_KEY_SEAL and SEP_KEY_UNSEAL (INFO
+ * 'features'). CANCEL ends a touch-gated SIGN or UNSEAL that is waiting for
+ * a finger; that call fails with ECANCELED. SEAL encrypts up to
+ * SEP_KEY_SECRET_MAX bytes to a biometric key's public point (ECIES, in the
+ * kernel, no touch). UNSEAL has the enclave decrypt such a blob with the key
+ * under the same touch-satisfied credential context as a SIGN, so a sealed
+ * secret is released only after a Touch ID match the enclave saw. SEAL and
+ * UNSEAL refuse keys made without a biometric policy (EINVAL).
+ *
+ * Version 4 (INFO 'features' SEP_KEY_FEATURE_PASSWORD, variant-5 key store
+ * only) adds keys under a user's own key bag (the bag whose secret is that
+ * user's login password, SEP_BIO_KEYBAG_*). Root or the bag's own user may
+ * make these calls. SEP_KEY_CREATE_USER with SEP_KEY_CREATE_USER_PRESENCE
+ * makes a .userPresence key under 'uid''s bag; with flags 0 it makes a key
+ * with no list that works, with no touch and no password, only while the
+ * bag is unlocked. The enclave refuses either while the bag is locked or
+ * absent. Its handle is version 2 and names the uid. SIGN, UNSEAL and
+ * PUBLIC take it; SIGN and UNSEAL wait for a Touch ID match.
+ * SEP_KEY_SIGN_PASSWORD and SEP_KEY_UNSEAL_PASSWORD hand the bag's password
+ * to the enclave instead: it checks the password (counting a wrong one),
+ * puts the credential into a fresh context, does the operation and the
+ * context is deleted. The kernel keeps no copy. EACCES when the enclave
+ * refuses the password. SEP_KEY_FEATURE_PERSISTENT_ATTEMPTS means the
+ * enclave's count of wrong passwords survives a restart; until a kernel sets
+ * it, the count restarts with the bag after a reboot, and a PIN retry limit
+ * built on it is not root-proof.
+ *
  * Keep a second key (a backup) wherever a biometric key is trusted, as with
  * hardware security keys: no key can be exported or recovered.
  *
@@ -269,12 +296,20 @@ struct sep_bio_rearm {
  * install, or an access-control list not satisfied), EACCES when the touch
  * did not match (or Touch ID is locked out), ETIMEDOUT when no finger came,
  * ENODEV while the key store or Touch ID is not up, EOPNOTSUPP for a
- * reserved policy, EIO for any other enclave failure.
+ * reserved policy, ECANCELED after SEP_KEY_CANCEL, EIO for any other
+ * enclave failure.
  */
-#define SEP_KEY_IFACE_VERSION 2
+#define SEP_KEY_IFACE_VERSION 4
+#define SEP_KEY_FEATURE_CANCEL 0x1
+#define SEP_KEY_FEATURE_SEAL   0x2
+#define SEP_KEY_FEATURE_PASSWORD 0x4
+#define SEP_KEY_FEATURE_PERSISTENT_ATTEMPTS 0x8
+#define SEP_KEY_PASSWORD_MAX 256
+#define SEP_KEY_SECRET_MAX 64
+#define SEP_KEY_SEALED_MAX 256
 #define SEP_KEY_CREATE_BIOMETRY_CURRENT_SET 0x1
 #define SEP_KEY_CREATE_BIOMETRY_ANY         0x2
-#define SEP_KEY_CREATE_USER_PRESENCE        0x4  /* reserved: EOPNOTSUPP */
+#define SEP_KEY_CREATE_USER_PRESENCE        0x4  /* CREATE_USER only; CREATE: EOPNOTSUPP */
 #define SEP_KEY_CREATE_DEVICE_PASSCODE      0x8  /* reserved: EOPNOTSUPP */
 #define SEP_KEY_HANDLE_MAX 2048
 #define SEP_KEY_PUB_LEN    65  /* uncompressed point, 04 || X || Y */
@@ -285,7 +320,7 @@ struct sep_key_info {
 	__u32 version;          /* SEP_KEY_IFACE_VERSION */
 	__u32 flags_supported;  /* SEP_KEY_CREATE_* bits this kernel accepts */
 	__u32 handle_max;       /* SEP_KEY_HANDLE_MAX */
-	__u32 reserved;
+	__u32 features;         /* SEP_KEY_FEATURE_* (version 3; zero before) */
 };
 
 struct sep_key_create {
@@ -318,6 +353,51 @@ struct sep_key_public {
 #define SEP_KEY_SIGN     _IOWR(SEP_BIO_IOC_MAGIC, 0x22, struct sep_key_sign)
 #define SEP_KEY_PUBLIC   _IOWR(SEP_BIO_IOC_MAGIC, 0x23, struct sep_key_public)
 
+/* SEAL: secret in, sealed out. UNSEAL: sealed in, secret out (waits for a touch). */
+struct sep_key_seal {
+	__u32 flags;                            /* in: 0 */
+	__u32 handle_len;                       /* in */
+	__u32 secret_len;                       /* SEAL in, UNSEAL out */
+	__u32 sealed_len;                       /* SEAL out, UNSEAL in */
+	__u8  secret[SEP_KEY_SECRET_MAX];
+	__u8  sealed[SEP_KEY_SEALED_MAX];
+	__u8  handle[SEP_KEY_HANDLE_MAX];       /* in */
+};
+
+#define SEP_KEY_CANCEL   _IO(SEP_BIO_IOC_MAGIC, 0x25)
+#define SEP_KEY_SEAL     _IOWR(SEP_BIO_IOC_MAGIC, 0x26, struct sep_key_seal)
+#define SEP_KEY_UNSEAL   _IOWR(SEP_BIO_IOC_MAGIC, 0x27, struct sep_key_seal)
+
+/* Version 4: .userPresence keys under a user's key bag (root only). */
+struct sep_key_create_user {
+	__u32 flags;                            /* in: SEP_KEY_CREATE_USER_PRESENCE */
+	__u32 uid;                              /* in: the bag's uid */
+	__u32 handle_len;                       /* out */
+	__u8  public_key[SEP_KEY_PUB_LEN];      /* out */
+	__u8  reserved[3];
+	__u8  handle[SEP_KEY_HANDLE_MAX];       /* out */
+};
+
+struct sep_key_password {
+	__u32 len;                              /* 1..SEP_KEY_PASSWORD_MAX */
+	__u32 reserved;
+	__u8  bytes[SEP_KEY_PASSWORD_MAX];      /* wiped by the kernel */
+};
+
+struct sep_key_sign_password {
+	struct sep_key_sign sign;
+	struct sep_key_password password;
+};
+
+struct sep_key_unseal_password {
+	struct sep_key_seal seal;
+	struct sep_key_password password;
+};
+
+#define SEP_KEY_CREATE_USER     _IOWR(SEP_BIO_IOC_MAGIC, 0x28, struct sep_key_create_user)
+#define SEP_KEY_SIGN_PASSWORD   _IOWR(SEP_BIO_IOC_MAGIC, 0x29, struct sep_key_sign_password)
+#define SEP_KEY_UNSEAL_PASSWORD _IOWR(SEP_BIO_IOC_MAGIC, 0x2a, struct sep_key_unseal_password)
+
 /*
  * Test only, refused unless apple_sep.key_selftest=1, root: sign with a
  * biometric key under a deliberately unsuitable credential context, to show
@@ -327,6 +407,30 @@ struct sep_key_public {
  * 6 (handle ignored): make a throwaway key with the .userPresence list and
  * sign with a key-bag-secret context ('result') and with a context with no
  * match ('result2').
+ * 7 (research): the same throwaway key signed with a context whose passcode
+ * credential comes from another user's key bag. In: 'enclave_status' = that
+ * uid, 'handle'/'handle_len' = that bag's password. Out: 'result2' = the
+ * verify-secret status, 'result'/'enclave_status' = the signature.
+ * 8 (research): a throwaway .userPresence key under the unlocked bag of the
+ * uid in 'enclave_status'; 'result' = signed with that bag's password
+ * credential (password in 'handle'), 'result2' = with no credential.
+ * 9 (research): as 8, 'result' = with the identity bag's secret as the
+ * credential, 'result2' = with the password given in 'handle'.
+ * 10 (research): as 8, but the kernel also locks the bag for good and signs
+ * with a stale, an empty and a fresh credential, then unlocks and signs
+ * again; the results come back in 'digest' (see key.rs).
+ * 11 (research): make such a key under that uid's unlocked bag and return its
+ * record in 'handle'. 12: sign that record with a password credential from
+ * the bag; the password is the NUL-padded 'digest'.
+ * 20 one touch: sign, then sign again in the same open context ('result2').
+ * 21 one touch: sign, then unseal a secret sealed to the key in the same
+ * context ('result2' 0 when it came back unchanged). 22 (no finger): unseal
+ * with no context ('result') and with an unsatisfied one ('result2').
+ * 24 (no finger, handle ignored): five throwaway keys (no list, "oecd" free,
+ * no decrypt entry, "ock" free, the plain ock/odel/osgn/oa/okd list), each
+ * signed, decrypted, key-exchanged and unsealed with no, an unsatisfied and
+ * a key-bag-secret context; bit 8*key+row of 'result' (keys 0-3) or bit row
+ * of 'result2' (key 4) is set when that row worked (rows in key.rs).
  * 'result' is 0 when the enclave signed, else a negative errno.
  */
 struct sep_key_selftest {
@@ -341,5 +445,133 @@ struct sep_key_selftest {
 };
 
 #define SEP_KEY_SELFTEST _IOWR(SEP_BIO_IOC_MAGIC, 0x24, struct sep_key_selftest)
+
+/*
+ * DESIGN DRAFT, not a stable ABI: the per-user key bag whose secret is the
+ * login password. Root only, on the re-arm node, never on /dev/sep-bio. The
+ * password passes through once per call and the kernel keeps no copy.
+ * 0x0e/0x0f are the lockout re-arm and 0x10 SEP_BIO_REQUIRE_PASSWORD; these
+ * use 0x30-0x36.
+ */
+#define SEP_KEYBAG_SECRET_MAX 256
+
+struct sep_keybag_unlock {      /* UNLOCK and CREATE */
+	__u32 uid;
+	__u32 secret_len;          /* UNLOCK permits zero to cancel pending lock */
+	__u8  secret[SEP_KEYBAG_SECRET_MAX];
+};
+
+#define SEP_KEYBAG_LOCK_SCREEN  1   /* after grace_s */
+#define SEP_KEYBAG_LOCK_SUSPEND 2   /* at once */
+#define SEP_KEYBAG_LOCK_LOGOUT  3   /* at once; the password is needed again */
+
+struct sep_keybag_lock {
+	__u32 uid;
+	__u32 reason;
+	__u32 grace_s;
+	__u32 reserved;
+};
+
+#define SEP_KEYBAG_STATE_LOCKED_SINCE_BOOT 0
+#define SEP_KEYBAG_STATE_UNLOCKED          1
+#define SEP_KEYBAG_STATE_LOCKING           2
+#define SEP_KEYBAG_STATE_LOCKED            3
+
+#define SEP_KEYBAG_BIO_ALLOWED             0
+#define SEP_KEYBAG_BIO_PASSWORD_SINCE_BOOT 1
+#define SEP_KEYBAG_BIO_NO_UNLOCK_48H       2
+#define SEP_KEYBAG_BIO_NO_PASSWORD_156H    3
+#define SEP_KEYBAG_BIO_FAILED_MATCHES      4
+
+struct sep_keybag_state {
+	__u32 uid;                /* in */
+	__u32 bag_state;          /* SEP_KEYBAG_STATE_* */
+	__u32 biometry;           /* SEP_KEYBAG_BIO_* */
+	__u32 failed_matches;
+	__u64 since_password_s;   /* ~0 when none since boot */
+	__u64 since_unlock_s;
+	__u32 enclave_lock_state; /* raw enclave state word */
+	__u32 lock_phase;         /* enclave lock phase */
+};
+
+struct sep_keybag_change {
+	__u32 uid;
+	__u32 old_len;
+	__u32 new_len;
+	__u32 reserved;
+	__u8  old_secret[SEP_KEYBAG_SECRET_MAX];
+	__u8  new_secret[SEP_KEYBAG_SECRET_MAX];
+};
+
+#define SEP_BIO_KEYBAG_STATE  _IOWR(SEP_BIO_IOC_MAGIC, 0x30, struct sep_keybag_state)
+#define SEP_BIO_KEYBAG_UNLOCK _IOW(SEP_BIO_IOC_MAGIC, 0x31, struct sep_keybag_unlock)
+#define SEP_BIO_KEYBAG_LOCK   _IOW(SEP_BIO_IOC_MAGIC, 0x32, struct sep_keybag_lock)
+#define SEP_BIO_KEYBAG_CHANGE _IOW(SEP_BIO_IOC_MAGIC, 0x33, struct sep_keybag_change)
+#define SEP_BIO_KEYBAG_CREATE _IOW(SEP_BIO_IOC_MAGIC, 0x34, struct sep_keybag_unlock)
+
+/*
+ * A user's wrapped bag, for userspace to keep across reboots (as macOS
+ * saves it). It holds no secret: it opens only with the user's password,
+ * on this Mac. EXPORT copies the designated bag; IMPORT loads a saved one
+ * and designates it again, locked until SEP_BIO_KEYBAG_UNLOCK.
+ */
+#define SEP_KEYBAG_BLOB_MAX 4096
+
+struct sep_keybag_blob {
+	__u32 uid;
+	__u32 len;
+	__u8  data[SEP_KEYBAG_BLOB_MAX];
+};
+
+#define SEP_BIO_KEYBAG_EXPORT _IOWR(SEP_BIO_IOC_MAGIC, 0x35, struct sep_keybag_blob)
+#define SEP_BIO_KEYBAG_IMPORT _IOW(SEP_BIO_IOC_MAGIC, 0x36, struct sep_keybag_blob)
+
+/*
+ * DESIGN DRAFT, not a stable ABI: sealing a disk-encryption secret (a LUKS2
+ * key-slot secret) to a user's key bag, as FileVault ties the volume key to
+ * the user's password. Root only, on the re-arm node.
+ *
+ * FDE_CREATE makes a P-256 sealing key inside the enclave under the
+ * designated, unlocked bag of 'uid' and returns its record. The record holds
+ * no secret and works only with this Mac's enclave. FDE_SEAL encrypts
+ * 'secret' to that key and has the enclave open the result once before
+ * returning 'sealed'. FDE_UNSEAL returns the secret; the enclave opens it
+ * only while the bag of 'uid' is unlocked (SEP_BIO_KEYBAG_UNLOCK with the
+ * user's password, which the enclave checks and counts).
+ *
+ * The secret is bound to the OS install that sealed it (the apple_sep
+ * os_uuid_hi/lo identity, else /chosen/apfs-preboot-uuid): the identity is
+ * sealed with the secret and FDE_UNSEAL returns the secret only under the
+ * same identity, as FileVault binds a volume key to its volume.
+ *
+ * Errors: EINVAL for a malformed request, EKEYREJECTED when the enclave
+ * refuses (bag locked, a record or blob from another Mac or another bag),
+ * EXDEV on FDE_UNSEAL of a secret sealed under another OS install, ENOKEY
+ * when the kernel has no OS identity (FDE_SEAL and FDE_UNSEAL),
+ * EOPNOTSUPP on a key store without user bags.
+ */
+#define SEP_FDE_RECORD_MAX 2048
+#define SEP_FDE_SECRET_MAX 64
+#define SEP_FDE_SEALED_MAX 256
+
+struct sep_fde_key {
+	__u32 uid;                         /* in */
+	__u32 record_len;                  /* out */
+	__u8  record[SEP_FDE_RECORD_MAX];  /* out */
+};
+
+struct sep_fde_seal {
+	__u32 uid;                         /* in */
+	__u32 record_len;                  /* in */
+	__u32 secret_len;                  /* SEAL: in; UNSEAL: out (in 0) */
+	__u32 sealed_len;                  /* SEAL: out (in 0); UNSEAL: in */
+	__u8  secret[SEP_FDE_SECRET_MAX];
+	__u8  sealed[SEP_FDE_SEALED_MAX];
+	__u8  record[SEP_FDE_RECORD_MAX];  /* in */
+};
+
+#define SEP_BIO_FDE_CREATE _IOWR(SEP_BIO_IOC_MAGIC, 0x37, struct sep_fde_key)
+#define SEP_BIO_FDE_SEAL   _IOWR(SEP_BIO_IOC_MAGIC, 0x38, struct sep_fde_seal)
+#define SEP_BIO_FDE_UNSEAL _IOWR(SEP_BIO_IOC_MAGIC, 0x39, struct sep_fde_seal)
 
 #endif /* _UAPI_LINUX_APPLE_SEP_H */

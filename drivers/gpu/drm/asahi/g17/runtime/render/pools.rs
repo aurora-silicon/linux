@@ -219,6 +219,11 @@ impl Pools {
     }
 
     pub(super) fn observe(&mut self, init: &InitData) -> Result {
+        // Every render publication observes: with no release in flight there is nothing to
+        // witness, and no reason to read the control ring's cursors from shared memory.
+        if !self.leases[FIRST_RENDER_POOL..].iter().flatten().any(|lease| lease.awaits_release()) {
+            return Ok(());
+        }
         fence(Ordering::Acquire);
         let consumer = init.control_consumer()?.load(Ordering::Relaxed);
         let producer = init.control_producer()?.load(Ordering::Relaxed);

@@ -16,6 +16,7 @@ use core::ops::Range;
 use core::slice;
 use core::sync::atomic::{
     AtomicBool,
+    AtomicU32,
     AtomicU64,
     Ordering, //
 };
@@ -36,6 +37,7 @@ use kernel::{
     macros::versions,
     new_mutex,
     new_spinlock,
+    new_work,
     prelude::*,
     soc::apple::rtkit,
     sync::{
@@ -55,6 +57,7 @@ use kernel::{
     },
     types::ForeignOwnable,
     uapi, //
+    workqueue::{HasWork, Work, WorkItem},
 };
 
 use crate::alloc::Allocator;
@@ -81,6 +84,7 @@ use crate::{
     gem,
     hw,
     initdata,
+    legacy_rx,
     mem,
     mmu,
     queue,
@@ -101,6 +105,9 @@ const EP_DOORBELL: u8 = 0x21;
 /// Initialize the GPU firmware.
 const MSG_INIT: u64 = 0x81 << 48;
 const INIT_DATA_MASK: u64 = (1 << 44) - 1;
+
+const RX_WORK_PENDING: u32 = 1 << 0;
+const RX_WORK_RUNNING: u32 = 1 << 1;
 
 /// TX channel doorbell.
 const MSG_TX_DOORBELL: u64 = 0x83 << 48;
@@ -254,6 +261,9 @@ pub(crate) struct GpuManager {
     rtkit: Mutex<Option<rtkit::RtKit<GpuManager::ver>>>,
     #[pin]
     rx_channels: Mutex<RxChannels::ver>,
+    rx_work_state: AtomicU32,
+    #[pin]
+    rx_work: Work<GpuManager::ver>,
     #[pin]
     tx_channels: Mutex<TxChannels::ver>,
     #[pin]
@@ -268,6 +278,46 @@ pub(crate) struct GpuManager {
     ids: SequenceIDs,
     #[pin]
     garbage_contexts: Mutex<KVec<workqueue::RetiredContext>>,
+}
+
+#[versions(AGX)]
+unsafe impl HasWork<GpuManager::ver> for GpuManager::ver {
+    unsafe fn raw_get_work(ptr: *mut Self) -> *mut Work<GpuManager::ver> {
+        // SAFETY: The caller supplies a live GpuManager allocation.
+        unsafe { core::ptr::addr_of_mut!((*ptr).rx_work) }
+    }
+
+    unsafe fn work_container_of(ptr: *mut Work<GpuManager::ver>) -> *mut Self {
+        // SAFETY: `ptr` came from `raw_get_work` above.
+        unsafe { kernel::container_of!(ptr, Self, rx_work) }
+    }
+}
+
+#[versions(AGX)]
+impl WorkItem for GpuManager::ver {
+    type Pointer = Arc<Self>;
+
+    fn run(this: Arc<Self>) {
+        let _util_min =
+            legacy_rx::UtilMinGuard::new(crate::module_parameters::legacy_rx_util_min.value());
+
+        loop {
+            this.rx_work_state
+                .fetch_and(!RX_WORK_PENDING, Ordering::AcqRel);
+            this.poll_rx_channels();
+
+            if this.rx_work_state.load(Ordering::Acquire) & RX_WORK_PENDING != 0 {
+                continue;
+            }
+            if this
+                .rx_work_state
+                .compare_exchange(RX_WORK_RUNNING, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
 }
 
 /// Operations the DRM driver performs on a GPU, independent of its firmware interface.
@@ -474,12 +524,24 @@ impl rtkit::Operations for GpuManager::ver {
             return;
         }
 
-        let mut ch = data.rx_channels.lock();
+        data.poll_rx_channels();
+    }
 
-        ch.fw_log.poll();
-        ch.ktrace.poll();
-        ch.stats.poll();
-        ch.event.poll();
+    fn recv_message_early(
+        data: <Self::Data as ForeignOwnable>::Borrowed<'_>,
+        ep: u8,
+        msg: u64,
+    ) -> bool {
+        if crate::module_parameters::legacy_rx_fastpath.value() == 0
+            || ep != EP_FIRMWARE
+            || msg != MSG_RX_DOORBELL
+            || legacy_rx::get().is_none()
+        {
+            return false;
+        }
+
+        let manager = Arc::from(data);
+        manager.queue_rx_work()
     }
 
     fn crashed(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _crashlog: Option<&[u8]>) {
@@ -518,6 +580,51 @@ impl rtkit::Operations for GpuManager::ver {
 
 #[versions(AGX)]
 impl GpuManager::ver {
+    fn poll_rx_channels(&self) {
+        let mut ch = self.rx_channels.lock();
+
+        ch.fw_log.poll();
+        ch.ktrace.poll();
+        ch.stats.poll();
+        ch.event.poll();
+    }
+
+    /// Coalesce doorbells without losing the one arriving as work returns.
+    fn queue_rx_work(self: Arc<Self>) -> bool {
+        loop {
+            let state = self
+                .rx_work_state
+                .fetch_or(RX_WORK_PENDING, Ordering::AcqRel);
+            if state & RX_WORK_RUNNING != 0 {
+                return true;
+            }
+            if self
+                .rx_work_state
+                .compare_exchange(
+                    state | RX_WORK_PENDING,
+                    state | RX_WORK_PENDING | RX_WORK_RUNNING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                continue;
+            }
+
+            let Some(queue) = legacy_rx::get() else {
+                self.rx_work_state.store(0, Ordering::Release);
+                return false;
+            };
+            return match queue.enqueue(self) {
+                Ok(()) => true,
+                Err(manager) => {
+                    manager.rx_work_state.store(0, Ordering::Release);
+                    false
+                }
+            };
+        }
+    }
+
     /// Create a new GpuManager of this version/GPU combination.
     #[inline(never)]
     pub(crate) fn new(
@@ -909,6 +1016,8 @@ impl GpuManager::ver {
                 alloc <- new_mutex!(alloc, "alloc"),
                 fwctl_channel <- new_mutex!(fwctl_channel, "fwctl_channel"),
                 rx_channels <- new_mutex!(KBox::<RxChannels::ver>::into_inner(rx_channels), "rx_channels"),
+                rx_work_state: AtomicU32::new(0),
+                rx_work <- new_work!("GpuManager::rx_work"),
                 tx_channels <- new_mutex!(KBox::<TxChannels::ver>::into_inner(tx_channels), "tx_channels"),
                 pipes,
                 buffer_mgr,

@@ -70,17 +70,29 @@ properties:
           - const: sram
           - const: cpu
 
-  interrupts:
-    maxItems: 1
-    description: Type 7 SRAM parity interrupt
-
-  interrupt-names:
-    items:
-      - const: sram-parity
-
   mboxes:
     maxItems: 1
     description: Mailbox used for RTKit communication with the co-processor
+
+  interrupts:
+    minItems: 1
+    maxItems: 4
+    description: |
+      Type 7 SRAM parity interrupt, or interrupts of the router's DP IN
+      adapter blocks, one per DP IN adapter:
+      a change of the HPD level the adapter receives over the tunnel, and
+      IRQ_HPD from the sink.
+
+  interrupt-names:
+    oneOf:
+      - items:
+          - const: sram-parity
+      - minItems: 1
+        items:
+          - const: dpin0
+          - const: dpin1
+          - const: dpin2
+          - const: dpin3
 
   resets:
     maxItems: 1
@@ -252,6 +264,12 @@ allOf:
           contains:
             const: apple,t6040-usb4-acio
     then:
+      properties:
+        interrupts:
+          maxItems: 1
+        interrupt-names:
+          items:
+            - const: sram-parity
       required:
         - iommu@1a80000
         - nhi@1f00000
