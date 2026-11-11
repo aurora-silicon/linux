@@ -63,6 +63,27 @@ impl TransitionState {
     }
 }
 
+/// State passed to the key store's explicit change-lock-state operation.
+///
+/// Device-state transitions model screen/sleep transitions and may enter the
+/// bag's configured grace period.  This operation is the direct key-bag lock
+/// used when the caller asked for no grace (logout, suspend, or a zero-grace
+/// screen lock).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LockStateChange {
+    Query,
+    Locked,
+}
+
+impl LockStateChange {
+    const fn wire(self) -> i32 {
+        match self {
+            LockStateChange::Query => -1,
+            LockStateChange::Locked => 1,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct Transition<'a> {
     user_handle: i32,
@@ -336,7 +357,10 @@ fn decode_change_secret_reply(body: &[u8]) -> bool {
     body == [3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 }
 
-fn encode_lock_query(user_handle: i32) -> Result<crate::image::Body> {
+fn encode_lock_state_change(
+    user_handle: i32,
+    state: LockStateChange,
+) -> Result<crate::image::Body> {
     if user_handle >= 0 {
         return Err(EINVAL);
     }
@@ -344,10 +368,18 @@ fn encode_lock_query(user_handle: i32) -> Result<crate::image::Body> {
     body.put_u32(LOCK_STATE_VARIANT)?;
     body.put_u64(CLIENT)?;
     body.put_i32(user_handle)?;
-    body.put_i32(-1)?;
+    body.put_i32(state.wire())?;
     body.put_blob(&[])?;
     body.put_u64(0)?;
     Ok(body)
+}
+
+fn encode_lock_query(user_handle: i32) -> Result<crate::image::Body> {
+    encode_lock_state_change(user_handle, LockStateChange::Query)
+}
+
+fn encode_explicit_lock(user_handle: i32) -> Result<crate::image::Body> {
+    encode_lock_state_change(user_handle, LockStateChange::Locked)
 }
 
 fn decode_lock_query(body: &[u8]) -> Option<i32> {
@@ -791,6 +823,40 @@ pub(crate) const FDE_SECRET_MAX: usize = 64;
 /// `ephemeral point (65) || ciphertext || tag (16)` for the largest secret.
 pub(crate) const FDE_SEALED_MAX: usize = 256;
 
+/// Magic and version at the front of every sealed FDE plaintext.
+const FDE_BINDING_MAGIC: [u8; 8] = *b"AURFDEO1";
+/// Magic followed by the 16-byte OS install identity, then the secret.
+const FDE_BINDING_LEN: usize = FDE_BINDING_MAGIC.len() + 16;
+
+/// Frames a volume secret with the OS install identity it is sealed under.
+/// The frame sits inside the ECIES envelope, so the enclave's AEAD covers it.
+pub(crate) fn fde_bind(os: &[u8; 16], secret: &[u8]) -> Result<KVec<u8>> {
+    if secret.is_empty() || secret.len() > FDE_SECRET_MAX {
+        return Err(EINVAL);
+    }
+    let mut v = KVec::with_capacity(FDE_BINDING_LEN + secret.len(), GFP_KERNEL)?;
+    v.extend_from_slice(&FDE_BINDING_MAGIC, GFP_KERNEL)?;
+    v.extend_from_slice(os, GFP_KERNEL)?;
+    v.extend_from_slice(secret, GFP_KERNEL)?;
+    Ok(v)
+}
+
+/// The secret inside a frame made by [`fde_bind`], if it was bound to `os`:
+/// `EXDEV` for a secret sealed under another OS install, `EKEYREJECTED` for a
+/// plaintext without the frame (not sealed by this driver).
+pub(crate) fn fde_unbind<'a>(os: &[u8; 16], framed: &'a [u8]) -> Result<&'a [u8]> {
+    if framed.len() <= FDE_BINDING_LEN
+        || framed.len() > FDE_BINDING_LEN + FDE_SECRET_MAX
+        || framed[..FDE_BINDING_MAGIC.len()] != FDE_BINDING_MAGIC
+    {
+        return Err(EKEYREJECTED);
+    }
+    if framed[FDE_BINDING_MAGIC.len()..FDE_BINDING_LEN] != os[..] {
+        return Err(EXDEV);
+    }
+    Ok(&framed[FDE_BINDING_LEN..])
+}
+
 /// The UAPI `struct sep_fde_key`: a sealing key made under `uid`'s bag.
 #[repr(C)]
 pub(crate) struct FdeKey {
@@ -908,6 +974,15 @@ pub(crate) fn parse_lock(req: &LockRequest) -> Result<(u32, u32, u32)> {
     Ok((req.uid, req.reason, req.grace_s.min(MAX_GRACE_S)))
 }
 
+/// Whether this UAPI request is an explicit, no-grace key-bag lock.
+///
+/// Only a screen lock may retain keys for a requested grace period.  Apple
+/// documents sleep and logout as immediate/password-required boundaries, and
+/// the UAPI promises the same for suspend and logout.
+pub(crate) fn lock_is_immediate(reason: u32, grace_s: u32) -> bool {
+    reason != LOCK_REASON_SCREEN || grace_s == 0
+}
+
 pub(crate) fn parse_change(
     req: &ChangeRequest,
 ) -> Result<(crate::sks::DesignateUser, &[u8], &[u8])> {
@@ -1011,14 +1086,25 @@ impl crate::SepData {
         &self,
         user: crate::sks::DesignateUser,
         screen_lock: bool,
-        expire_now: bool,
+        immediate: bool,
     ) -> Result<()> {
-        self.userbag_transition(user, TransitionState::Locked, u64::from(screen_lock), &[])?;
-        if expire_now {
-            if !self.userbag_timer_fire(user)? {
-                return Err(EAGAIN);
-            }
+        if immediate {
+            let handle = user.special_handle().value();
+            return self
+                .sks_step(crate::sks::SKS_LOCK_STATE_NAME, |_healthy| {
+                    self.userbag_request(
+                        crate::sks::SKS_LOCK_STATE_NAME,
+                        encode_explicit_lock(handle)?,
+                        |seq, len| {
+                            crate::sks::encode_sks_change_lock_state(seq, len).ok_or(EINVAL)
+                        },
+                    )
+                })
+                .map(|_| ())
+                .ok_or(EACCES);
         }
+
+        self.userbag_transition(user, TransitionState::Locked, u64::from(screen_lock), &[])?;
         Ok(())
     }
 
@@ -1338,7 +1424,7 @@ impl crate::SepData {
                 let (uid, reason, grace_s) = parse_lock(&request)?;
                 let user = crate::sks::DesignateUser::new(uid as i32).ok_or(EINVAL)?;
                 let screen = reason == LOCK_REASON_SCREEN;
-                self.userbag_lock(user, screen, screen && grace_s == 0)?;
+                self.userbag_lock(user, screen, lock_is_immediate(reason, grace_s))?;
                 crate::bio::ok()
             }
             IOC_CHANGE => {
@@ -1553,6 +1639,14 @@ mod tests {
             decode_lock_query_reply(&[1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
             Some(1)
         );
+
+        let lock = encode_explicit_lock(USER_HANDLE).expect("explicit lock");
+        let mut golden = [0u8; 32];
+        golden[0..4].copy_from_slice(&LOCK_STATE_VARIANT.to_le_bytes());
+        golden[4..12].copy_from_slice(&CLIENT_LE);
+        golden[12..16].copy_from_slice(&USER_HANDLE.to_le_bytes());
+        golden[16..20].copy_from_slice(&LockStateChange::Locked.wire().to_le_bytes());
+        assert_eq!(lock.as_slice(), &golden);
     }
 
     #[test]
@@ -1795,6 +1889,15 @@ mod tests {
     }
 
     #[test]
+    fn only_a_screen_lock_with_grace_uses_the_grace_transition() {
+        assert!(!lock_is_immediate(LOCK_REASON_SCREEN, 300));
+        assert!(lock_is_immediate(LOCK_REASON_SCREEN, 0));
+        assert!(lock_is_immediate(LOCK_REASON_SUSPEND, 300));
+        assert!(lock_is_immediate(LOCK_REASON_LOGOUT, 0));
+        assert!(lock_is_immediate(LOCK_REASON_LOGOUT, 300));
+    }
+
+    #[test]
     fn the_user_bag_handle_is_minus_the_uid() {
         let user = crate::sks::DesignateUser::new(501).expect("user");
         assert_eq!(user.special_handle().value(), -501);
@@ -1825,6 +1928,27 @@ mod tests {
             sealed: [0; FDE_SEALED_MAX],
             record: [0; FDE_RECORD_MAX],
         }
+    }
+
+    #[test]
+    fn fde_secret_is_bound_to_its_os_install() {
+        let a = [0x11u8; 16];
+        let b = [0x22u8; 16];
+        let secret = [0x5au8; 32];
+        let framed = fde_bind(&a, &secret).expect("bind");
+        assert_eq!(framed.len(), FDE_BINDING_LEN + secret.len());
+        assert_eq!(fde_unbind(&a, &framed).expect("same install"), &secret[..]);
+        assert_eq!(fde_unbind(&b, &framed), Err(EXDEV));
+        // A plaintext without the frame (an older draft's blob) is refused.
+        assert_eq!(fde_unbind(&a, &secret), Err(EKEYREJECTED));
+        let mut bad = [0u8; FDE_BINDING_LEN + 32];
+        bad.copy_from_slice(&framed);
+        bad[0] ^= 1;
+        assert_eq!(fde_unbind(&a, &bad), Err(EKEYREJECTED));
+        assert_eq!(fde_unbind(&a, &framed[..FDE_BINDING_LEN]), Err(EKEYREJECTED));
+        assert!(fde_bind(&a, &[]).is_err());
+        assert!(fde_bind(&a, &[0u8; FDE_SECRET_MAX + 1]).is_err());
+        assert!(fde_bind(&a, &[0u8; FDE_SECRET_MAX]).is_ok());
     }
 
     #[test]
