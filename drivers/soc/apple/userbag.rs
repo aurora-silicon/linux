@@ -823,6 +823,40 @@ pub(crate) const FDE_SECRET_MAX: usize = 64;
 /// `ephemeral point (65) || ciphertext || tag (16)` for the largest secret.
 pub(crate) const FDE_SEALED_MAX: usize = 256;
 
+/// Magic and version at the front of every sealed FDE plaintext.
+const FDE_BINDING_MAGIC: [u8; 8] = *b"AURFDEO1";
+/// Magic followed by the 16-byte OS install identity, then the secret.
+const FDE_BINDING_LEN: usize = FDE_BINDING_MAGIC.len() + 16;
+
+/// Frames a volume secret with the OS install identity it is sealed under.
+/// The frame sits inside the ECIES envelope, so the enclave's AEAD covers it.
+pub(crate) fn fde_bind(os: &[u8; 16], secret: &[u8]) -> Result<KVec<u8>> {
+    if secret.is_empty() || secret.len() > FDE_SECRET_MAX {
+        return Err(EINVAL);
+    }
+    let mut v = KVec::with_capacity(FDE_BINDING_LEN + secret.len(), GFP_KERNEL)?;
+    v.extend_from_slice(&FDE_BINDING_MAGIC, GFP_KERNEL)?;
+    v.extend_from_slice(os, GFP_KERNEL)?;
+    v.extend_from_slice(secret, GFP_KERNEL)?;
+    Ok(v)
+}
+
+/// The secret inside a frame made by [`fde_bind`], if it was bound to `os`:
+/// `EXDEV` for a secret sealed under another OS install, `EKEYREJECTED` for a
+/// plaintext without the frame (not sealed by this driver).
+pub(crate) fn fde_unbind<'a>(os: &[u8; 16], framed: &'a [u8]) -> Result<&'a [u8]> {
+    if framed.len() <= FDE_BINDING_LEN
+        || framed.len() > FDE_BINDING_LEN + FDE_SECRET_MAX
+        || framed[..FDE_BINDING_MAGIC.len()] != FDE_BINDING_MAGIC
+    {
+        return Err(EKEYREJECTED);
+    }
+    if framed[FDE_BINDING_MAGIC.len()..FDE_BINDING_LEN] != os[..] {
+        return Err(EXDEV);
+    }
+    Ok(&framed[FDE_BINDING_LEN..])
+}
+
 /// The UAPI `struct sep_fde_key`: a sealing key made under `uid`'s bag.
 #[repr(C)]
 pub(crate) struct FdeKey {
@@ -1871,6 +1905,27 @@ mod tests {
             sealed: [0; FDE_SEALED_MAX],
             record: [0; FDE_RECORD_MAX],
         }
+    }
+
+    #[test]
+    fn fde_secret_is_bound_to_its_os_install() {
+        let a = [0x11u8; 16];
+        let b = [0x22u8; 16];
+        let secret = [0x5au8; 32];
+        let framed = fde_bind(&a, &secret).expect("bind");
+        assert_eq!(framed.len(), FDE_BINDING_LEN + secret.len());
+        assert_eq!(fde_unbind(&a, &framed).expect("same install"), &secret[..]);
+        assert_eq!(fde_unbind(&b, &framed), Err(EXDEV));
+        // A plaintext without the frame (an older draft's blob) is refused.
+        assert_eq!(fde_unbind(&a, &secret), Err(EKEYREJECTED));
+        let mut bad = [0u8; FDE_BINDING_LEN + 32];
+        bad.copy_from_slice(&framed);
+        bad[0] ^= 1;
+        assert_eq!(fde_unbind(&a, &bad), Err(EKEYREJECTED));
+        assert_eq!(fde_unbind(&a, &framed[..FDE_BINDING_LEN]), Err(EKEYREJECTED));
+        assert!(fde_bind(&a, &[]).is_err());
+        assert!(fde_bind(&a, &[0u8; FDE_SECRET_MAX + 1]).is_err());
+        assert!(fde_bind(&a, &[0u8; FDE_SECRET_MAX]).is_ok());
     }
 
     #[test]

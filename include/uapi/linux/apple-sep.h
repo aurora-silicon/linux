@@ -450,8 +450,15 @@ struct sep_keybag_blob {
  * only while the bag of 'uid' is unlocked (SEP_BIO_KEYBAG_UNLOCK with the
  * user's password, which the enclave checks and counts).
  *
+ * The secret is bound to the OS install that sealed it (the apple_sep
+ * os_uuid_hi/lo identity, else /chosen/apfs-preboot-uuid): the identity is
+ * sealed with the secret and FDE_UNSEAL returns the secret only under the
+ * same identity, as FileVault binds a volume key to its volume.
+ *
  * Errors: EINVAL for a malformed request, EKEYREJECTED when the enclave
  * refuses (bag locked, a record or blob from another Mac or another bag),
+ * EXDEV on FDE_UNSEAL of a secret sealed under another OS install, ENOKEY
+ * when the kernel has no OS identity (FDE_SEAL and FDE_UNSEAL),
  * EOPNOTSUPP on a key store without user bags.
  */
 #define SEP_FDE_RECORD_MAX 2048

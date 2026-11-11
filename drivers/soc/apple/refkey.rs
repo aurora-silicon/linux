@@ -528,16 +528,26 @@ impl SepData {
         Ok(blob)
     }
 
-    /// ECIES-encrypts `secret` to the sealing key in `record` and has the
-    /// enclave open the result once before returning it, so a sealed blob
-    /// this bag cannot open is never handed out.
+    /// The OS install this kernel runs as (the explicit `os_uuid_hi/lo`
+    /// identity, else `/chosen/apfs-preboot-uuid`), which FDE secrets are
+    /// bound to, as FileVault binds a volume key to its volume.
+    fn fde_os_identity(&self) -> Result<[u8; 16]> {
+        self.xarm.lock().os_uuid.ok_or(ENOKEY)
+    }
+
+    /// ECIES-encrypts `secret`, framed with this OS install's identity, to the
+    /// sealing key in `record` and has the enclave open the result once before
+    /// returning it, so a sealed blob this bag cannot open is never handed
+    /// out. `ENOKEY` when this kernel has no OS identity.
     pub(crate) fn fde_seal(
         &self,
         user: crate::sks::DesignateUser,
         record: &[u8],
         secret: &[u8],
     ) -> Result<KVec<u8>> {
-        let sealed = refkey_seal::ecies_seal(Self::refkey_pub(record).ok_or(EINVAL)?, secret)?;
+        let os = self.fde_os_identity()?;
+        let framed = crate::Secret(crate::userbag::fde_bind(&os, secret)?);
+        let sealed = refkey_seal::ecies_seal(Self::refkey_pub(record).ok_or(EINVAL)?, &framed)?;
         let recovered = crate::Secret(self.fde_unseal(user, record, &sealed)?);
         if &*recovered != secret {
             dev_err!(self.dev, "fde: refusing a sealed volume secret whose round trip failed\n");
@@ -548,7 +558,9 @@ impl SepData {
 
     /// Has the enclave open `sealed` with the sealing key in `record`. It
     /// does so only on the Mac whose enclave made the key and only while
-    /// `user`'s bag is unlocked; any refusal is `EKEYREJECTED`.
+    /// `user`'s bag is unlocked; any refusal is `EKEYREJECTED`. The secret is
+    /// returned only to the OS install it was sealed under: `EXDEV` for
+    /// another install, `ENOKEY` when this kernel has no OS identity.
     pub(crate) fn fde_unseal(
         &self,
         user: crate::sks::DesignateUser,
@@ -559,8 +571,14 @@ impl SepData {
             return Err(EOPNOTSUPP);
         }
         Self::refkey_pub(record).ok_or(EINVAL)?;
+        let os = self.fde_os_identity()?;
         let handle = crate::sks::KeyBagHandle::from_load_reply(user.special_handle().value());
-        self.sks_refkey_unseal(handle, record, sealed).ok_or(EKEYREJECTED)
+        let framed =
+            crate::Secret(self.sks_refkey_unseal(handle, record, sealed).ok_or(EKEYREJECTED)?);
+        let secret = crate::userbag::fde_unbind(&os, &framed)?;
+        let mut out = KVec::with_capacity(secret.len(), GFP_KERNEL)?;
+        out.extend_from_slice(secret, GFP_KERNEL)?;
+        Ok(out)
     }
 
     /// Enclave ECIES-decrypt (o = "oecd"); takes the ephemeral from the front of `d`.
