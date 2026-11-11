@@ -765,3 +765,54 @@
 &avd {
 	status = "okay";
 };
+
+/*
+ * The video encoder (J714sAP ADT ave0), its DARTs and the VENC0 power states. Like
+ * FAB1_SOC, macOS sets FAB0_SOC active once at boot and never gates it; the PIO
+ * gateway above it is left to the firmware.
+ */
+&ps_fab1_piogw {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_fab0_soc {
+	apple,always-on;
+	status = "okay";
+};
+
+&ps_venc0_sys {
+	status = "okay";
+};
+
+&ps_venc0_dma {
+	status = "okay";
+};
+
+&ps_venc0_pipe4 {
+	status = "okay";
+};
+
+&ps_venc0_pipe5 {
+	status = "okay";
+};
+
+&ps_venc0_me0 {
+	status = "okay";
+};
+
+&ps_venc0_me1 {
+	status = "okay";
+};
+
+&ave0_dart {
+	status = "okay";
+};
+
+&ave0_dart1 {
+	status = "okay";
+};
+
+&ave0 {
+	status = "okay";
+};

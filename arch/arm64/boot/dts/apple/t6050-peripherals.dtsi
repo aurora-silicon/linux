@@ -3047,20 +3047,26 @@
 		status = "disabled";
 	};
 
+	/*
+	 * The video encoder (ADT ave0): firmware that iBoot preloads, handed over by the boot
+	 * loader. dart-ave0 serves streams 0 and 12 (the temporal filter) on both instances.
+	 */
 	ave0: video-encoder@2283100000 {
-		compatible = "apple,t6050-ave", "apple,ave";
+		compatible = "apple,t6050-ave";
 		reg = <0x22 0x83100000 0x0 0x45c000>,
-		      <0x22 0x83800000 0x0 0x800000>,
 		      <0x22 0x83050000 0x0 0x4000>,
-		      <0x23 0x806001c0 0x0 0x7e64>,
-		      <0x22 0x82000000 0x0 0x8000>;
+		      <0x22 0x83800000 0x0 0x800000>;
+		reg-names = "codec", "mailbox", "coproc";
 		interrupts = <AIC_IRQ 0 2435 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 2790 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 2789 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 2792 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 2791 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&ave0_dart 0>, <&ave0_dart1 0>;
-		power-domains = <&ps_venc0_sys>, <&ps_venc0_pipe4>, <&ps_venc0_pipe5>, <&ps_venc0_me0>, <&ps_venc0_me1>, <&ps_venc0_dma>;
+		iommus = <&ave0_dart 0>, <&ave0_dart 12>,
+			 <&ave0_dart1 0>, <&ave0_dart1 12>;
+		power-domains = <&ps_venc0_dma>, <&ps_venc0_pipe4>, <&ps_venc0_pipe5>,
+				<&ps_venc0_me0>, <&ps_venc0_me1>;
+		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
 		clocks = <&peripheral_clocks 503>;
 		status = "disabled";
 	};
@@ -3072,6 +3078,7 @@
 		interrupts = <AIC_IRQ 0 2432 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc0_sys>;
 		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x00004000 0x0 0xffffc000>;
 		status = "disabled";
 	};
 
@@ -3082,23 +3089,25 @@
 		interrupts = <AIC_IRQ 0 2432 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc0_sys>;
 		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x00004000 0x0 0xffffc000>;
 		status = "disabled";
 	};
 
 	ave1: video-encoder@23a3100000 {
-		compatible = "apple,t6050-ave", "apple,ave";
+		compatible = "apple,t6050-ave";
 		reg = <0x23 0xa3100000 0x0 0x45c000>,
-		      <0x23 0xa3800000 0x0 0x800000>,
 		      <0x23 0xa3050000 0x0 0x4000>,
-		      <0x23 0x806001f0 0x0 0x7e5c>,
-		      <0x23 0xa2000000 0x0 0x8000>;
+		      <0x23 0xa3800000 0x0 0x800000>;
+		reg-names = "codec", "mailbox", "coproc";
 		interrupts = <AIC_IRQ 0 2443 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 2794 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 2793 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 2796 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 2795 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&ave1_dart 0>, <&ave1_dart1 0>;
-		power-domains = <&ps_venc1_sys>, <&ps_venc1_pipe4>, <&ps_venc1_pipe5>, <&ps_venc1_me0>, <&ps_venc1_me1>, <&ps_venc1_dma>;
+		power-domains = <&ps_venc1_dma>, <&ps_venc1_pipe4>, <&ps_venc1_pipe5>,
+				<&ps_venc1_me0>, <&ps_venc1_me1>;
+		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
 		clocks = <&peripheral_clocks 504>;
 		status = "disabled";
 	};
@@ -3110,6 +3119,7 @@
 		interrupts = <AIC_IRQ 0 2440 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc1_sys>;
 		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x00004000 0x0 0xffffc000>;
 		status = "disabled";
 	};
 
@@ -3120,6 +3130,7 @@
 		interrupts = <AIC_IRQ 0 2440 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc1_sys>;
 		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x00004000 0x0 0xffffc000>;
 		status = "disabled";
 	};
 
