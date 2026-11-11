@@ -116,8 +116,8 @@ int main(void) {
  assert(dcpext26_exchange_begin(&c.exchange,51));c.exchange.replied=true;
  ext26_control_signal(&d,&c);assert(!c.done.signaled);
  assert(iomfb_ext26_control_complete(&d,51,true));assert(c.exchange.failed&&c.done.signaled);
- assert(!dcpext26_epoch_fits(8,1,1)); assert(dcpext26_epoch_fits(7,0,(960ULL<<20)));
- assert(!dcpext26_epoch_fits(7,(960ULL<<20),1));assert(!dcpext26_epoch_fits(0,~0ULL,1));
+ assert(dcpext26_backing_fits(1,1)); assert(dcpext26_backing_fits(0,(960ULL<<20)));
+ assert(!dcpext26_backing_fits((960ULL<<20),1));assert(!dcpext26_backing_fits(~0ULL,1));
  struct apple_dcp_afkep ep={0};u32 read=0,write=0;
  ep.rxbfr=(struct ring){true,&read,&write};assert(afk_host_idle(&ep));
  write=64;assert(!afk_host_idle(&ep));read=64;assert(afk_host_idle(&ep));

@@ -32,11 +32,11 @@ static inline bool dcpext26_exchange_finished(const struct dcpext26_exchange *x)
 {
 	return x->failed || (x->id && x->replied && x->completed);
 }
-/* Reserve headroom for an in-flight full-frame primary before readmission. */
-static inline bool dcpext26_epoch_fits(unsigned int epochs, u64 retained, u64 incoming)
+/* Admission only: already exposed backing must always survive teardown. */
+static inline bool dcpext26_backing_fits(u64 retained, u64 incoming)
 {
 	const u64 limit = (1ULL << 30) - (64ULL << 20);
 
-	return !incoming || (epochs < 8 && retained <= limit && incoming <= limit - retained);
+	return retained <= limit && incoming <= limit - retained;
 }
 #endif

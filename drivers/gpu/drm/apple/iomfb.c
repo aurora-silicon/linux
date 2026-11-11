@@ -3327,6 +3327,23 @@ iomfb_scanout_prepare_h17p(struct apple_dcp *dcp, struct drm_crtc *crtc,
 			drm_framebuffer_get(new_state->fb);
 		}
 	}
+	if (dcp_is_ext26(dcp)) {
+		struct iomfb_scanout_h17p *dropped;
+		u64 bytes = ext26_scanout_bytes(scanout);
+
+		/* Reserve every exposed object, including an unsuccessful present. */
+		if (dcp->iomfb.scanout)
+			bytes += ext26_scanout_bytes(dcp->iomfb.scanout);
+		list_for_each_entry(dropped, &dcp->iomfb.dropped, link)
+			bytes += ext26_scanout_bytes(dropped);
+		if (!dcpext26_backing_fits(dcp->ext26_retained_bytes, bytes)) {
+			dev_warn_ratelimited(dcp->dev,
+				"native26 backing budget exhausted; new present refused\n");
+			/* This scanout has not been exposed to firmware. */
+			iomfb_scanout_release_h17p(scanout);
+			return NULL;
+		}
+	}
 	return scanout;
 }
 
@@ -3598,7 +3615,7 @@ static void iomfb_atomic_start(struct apple_dcp *dcp,
 	}
 	atomic->scanout = iomfb_scanout_prepare_h17p(dcp, atomic->crtc, atomic->state);
 	if (!atomic->scanout) {
-		WRITE_ONCE(dcp->crashed, true);
+		/* Allocation/admission failure exposed no new backing. */
 		schedule_work(&dcp->vblank_wq);
 		return;
 	}
@@ -3971,8 +3988,11 @@ int iomfb_ext26_retain_epoch(struct apple_dcp *dcp)
 		bytes += ext26_scanout_bytes(dcp->iomfb.scanout);
 	list_for_each_entry(scanout, &dcp->iomfb.dropped, link)
 		bytes += ext26_scanout_bytes(scanout);
-	if (!dcpext26_epoch_fits(dcp->ext26_epochs, dcp->ext26_retained_bytes, bytes))
-		return -ENOSPC;
+	/*
+	 * Admission reserved this backing before exposure. Retaining it here
+	 * allocates nothing: a quota refusal after power/link withdrawal would
+	 * incorrectly latch external_error and strand the shared Type-C route.
+	 */
 	if (dcp->iomfb.scanout) {
 		list_add_tail(&dcp->iomfb.scanout->link, &dcp->ext26_retained);
 		dcp->iomfb.scanout = NULL;
