@@ -518,7 +518,9 @@ static void ave_start_put8(u8 *cmd, u32 off, u8 val)
 #define AVE_6070_HEVC_RPS_SETS_REORDER	8
 
 /* HEVC Start constants (H.265 A.3 and 7.4.3.2). */
-#define AVE_6070_HEVC_INPUT_420_8BIT	16	/* firmware input-format code: 4:2:0 Main */
+#define AVE_6070_HEVC_INPUT_CHROMA_FROM_SPS 16 /* bits [4:2] = 4: use SPS format */
+#define AVE_6070_HEVC_CHROMA_420		1  /* H.265 chroma_format_idc */
+#define AVE_6070_HEVC_LOG2_MAX_POC_LSB_MINUS4 4 /* eight-bit POC lsb */
 #define AVE_6070_HEVC_SAO_ALL		GENMASK(15, 0)	/* SAO on for every CTB class */
 
 enum ave_6070_picture_type {
@@ -989,8 +991,11 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd,
 	ave_start_put32(cmd, l->hevc_conf_right, crop_r);
 	ave_start_put32(cmd, l->hevc_conf_top, 0);
 	ave_start_put32(cmd, l->hevc_conf_bottom, crop_b);
+	ave_start_put32(cmd, l->hevc_chroma_format, AVE_6070_HEVC_CHROMA_420);
 	ave_start_put32(cmd, l->hevc_depth_luma, depth - 8);
 	ave_start_put32(cmd, l->hevc_depth_chroma, depth - 8);
+	ave_start_put32(cmd, l->hevc_log2_max_poc_lsb_minus4,
+			AVE_6070_HEVC_LOG2_MAX_POC_LSB_MINUS4);
 	/* Reference structure: B-frame pyramid or low-delay P (ave-image.c) */
 	ave_start_put32(cmd, l->hevc_refs,
 			fw->kind == AVE_LAYOUT_6070 ? p->refs - 1 :
@@ -1002,7 +1007,8 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd,
 	ave_start_put32(cmd, l->hevc_reorder_copy,
 			p->bframes ? fw->kind == AVE_LAYOUT_6070 ? 1 : 2 : 0);
 	ave_start_put32(cmd, l->hevc_reorder_on, p->bframes);
-	ave_start_put32(cmd, l->hevc_input_format, AVE_6070_HEVC_INPUT_420_8BIT);
+	ave_start_put32(cmd, l->hevc_input_format,
+			AVE_6070_HEVC_INPUT_CHROMA_FROM_SPS);
 	ave_start_put32(cmd, l->hevc_pps_count, 1);
 	ave_start_put32(cmd, l->hevc_slice_map_count, 1);
 	ave_start_put32(cmd, l->hevc_slice_map_end, p->ch);
@@ -1035,6 +1041,9 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd,
 	ave_start_put8(cmd, l->hevc_sps_fw_header, 1);
 	ave_start_put32(cmd, l->hevc_sps_header_len, 0);
 	ave_start_put32(cmd, l->hevc_pps_extra_slice_bits, 0);
+	/* Process publishes one L0 and one L1 entry; never advertise a zero tail. */
+	ave_start_put32(cmd, l->hevc_pps_l0_default_active_minus1, 0);
+	ave_start_put32(cmd, l->hevc_pps_l1_default_active_minus1, 0);
 	ave_start_put32(cmd, l->hevc_pps_init_qp, 0);
 	ave_start_put8(cmd, l->hevc_pps_cu_qp_delta, 0);
 	ave_start_put32(cmd, l->hevc_pps_cu_qp_depth, 0);

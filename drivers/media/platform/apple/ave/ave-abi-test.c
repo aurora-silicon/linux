@@ -1002,6 +1002,12 @@ static void ave_6070_hevc_contract(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, ave_build_start(ctx, start, 0x32dc8), 0);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_input_format),
 			16U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_chroma_format),
+			1U);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le32(start +
+					   sl->hevc_log2_max_poc_lsb_minus4),
+			4U);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_num_views[0]),
 			1U);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_sve_count), 1U);
@@ -1009,6 +1015,14 @@ static void ave_6070_hevc_contract(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, start[sl->hevc_sps_temporal_nesting], 1U);
 	KUNIT_EXPECT_EQ(test, start[sl->hevc_sps_fw_header], 1U);
 	KUNIT_EXPECT_EQ(test, start[sl->hevc_pps_fw_header], 1U);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le32(start +
+					   sl->hevc_pps_l0_default_active_minus1),
+			0U);
+	KUNIT_EXPECT_EQ(test,
+			get_unaligned_le32(start +
+					   sl->hevc_pps_l1_default_active_minus1),
+			0U);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_rps), 8U);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_rps + 4 + 0xbc),
 			0U);
