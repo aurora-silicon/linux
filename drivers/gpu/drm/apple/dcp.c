@@ -5046,6 +5046,18 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	char fw_str[DCP_FW_VERSION_STR_LEN];
 	int ret;
 
+	/*
+	 * T8142 (J813) on macOS 27.0: the H17P interface written for its 26.x
+	 * firmware makes the 27.0 DCP firmware panic right after the first
+	 * hotplug ("ap_link: callback failed with: 0x5"). It runs the T6050's
+	 * firmware-27 generation.
+	 */
+	if (of_device_is_compatible(dev->of_node, "apple,t8142-dcp")) {
+		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
+		if (ret >= 0 && !strcmp(compat_str, "27.0.0"))
+			return DCP_FIRMWARE_V_27_0;
+	}
+
 	if (hw->firmware_compat == DCP_FIRMWARE_V_27_0) {
 		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
 		if (ret < 0 || strcmp(compat_str, "27.0.0"))
@@ -5303,6 +5315,30 @@ clocks:
 		clocks = 0;
 	if (clocks < 0 || clocks > 64)
 		return -EINVAL;
+	/*
+	 * A DCP that also boots earlier firmware (T8142) lists the clock those
+	 * use first and names the provider clocks "firmware-<index>". Take only
+	 * the named ones here.
+	 */
+	if (clocks &&
+	    of_property_match_string(dev->of_node, "clock-names", "firmware-0") >= 0) {
+		dcp->firmware_clocks = devm_kcalloc(dev, clocks,
+						    sizeof(*dcp->firmware_clocks),
+						    GFP_KERNEL);
+		if (!dcp->firmware_clocks)
+			return -ENOMEM;
+		for (index = 0; index < clocks; index++) {
+			dcp->firmware_clocks[index].id =
+				devm_kasprintf(dev, GFP_KERNEL, "firmware-%d", index);
+			if (!dcp->firmware_clocks[index].id)
+				return -ENOMEM;
+		}
+		ret = devm_clk_bulk_get(dev, clocks, dcp->firmware_clocks);
+		if (ret)
+			return ret;
+		dcp->num_firmware_clocks = clocks;
+		return 0;
+	}
 	ret = devm_clk_bulk_get_all(dev, &dcp->firmware_clocks);
 	if (ret < 0)
 		return ret;
@@ -6180,6 +6216,13 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
+	/*
+	 * T8142 on firmware 27 runs as the T6050's firmware-27 instance, with
+	 * the default method profile: with H17G every swap fails with status 4.
+	 */
+	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    of_device_is_compatible(dev->of_node, "apple,t8142-dcp"))
+		dcp->hw.iomfb_method_profile = DCP_IOMFB_METHODS_DEFAULT;
 	/* The display such a processor finds at boot is its first sink. */
 	if (dcp_sink_metadata(dcp))
 		dcp_desktop_metadata_new_sink(dcp);
