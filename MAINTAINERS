@@ -2064,6 +2064,11 @@ F:	drivers/gpu/drm/apple/dcp-fabric*
 F:	tools/testing/selftests/drivers/gpu/apple-afkv2/
 F:	tools/testing/selftests/drivers/gpu/apple-dcp/
 
+APPLE MTP TOUCH SCREEN (KIWI) DRIVER
+M:	Joshua Warren <816217+joshuaswarren@users.noreply.github.com>
+S:	Maintained
+F:	drivers/hid/hid-apple-mtp-kiwi.c
+
 APPLE PCIE CONTROLLER DRIVER
 M:	Marc Zyngier <maz@kernel.org>
 L:	linux-pci@vger.kernel.org
