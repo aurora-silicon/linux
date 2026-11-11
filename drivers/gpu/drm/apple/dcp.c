@@ -9320,10 +9320,12 @@ static int dcp_t6041_s2r_stop(struct apple_dcp *dcp)
 
 	apple_sleep_bringup_mark(DCP_S2R_MARK(id, 1));
 	/*
-	 * An external firmware that did not come back from an earlier sleep has nothing left
-	 * to quiesce, and must not refuse every later sleep: its CPU off again, nothing else.
+	 * An external firmware that did not come back from an earlier sleep, or that crashed,
+	 * has nothing left to quiesce, and must not refuse every later sleep: its CPU off
+	 * again, nothing else. The wake tries to start it once more.
 	 */
-	if (dcp_desktop_external(dcp) && READ_ONCE(dcp->ext_dead) && !IS_ERR_OR_NULL(dcp->rtk)) {
+	if (dcp_desktop_external(dcp) && !IS_ERR_OR_NULL(dcp->rtk) &&
+	    (READ_ONCE(dcp->ext_dead) || READ_ONCE(dcp->crashed))) {
 		apple_rtkit_mailbox_off(dcp->rtk);
 		if (!READ_ONCE(s2r_keep_run)) {
 			writel(readl(control) & ~APPLE_DCP_COPROC_CPU_CONTROL_RUN, control);
@@ -10526,12 +10528,14 @@ static void dcp_t6041_s2r_warm_restart(struct apple_dcp *dcp)
  * An external DCP after a real sleep: the same warm return as the internal one. Its
  * firmware was idle with no display when it stopped, so there is no mode to set: the
  * rest is what any system sleep ends with, and a display plugged in later goes the
- * usual hotplug way.
+ * usual hotplug way. One that had crashed before the sleep is tried once more, without
+ * its old calls.
  */
 static void dcp_t6041_s2r_warm_restart_ext(struct apple_dcp *dcp)
 {
 	int ret;
 
+	dcp_s2r_forget_crash(dcp);
 	WRITE_ONCE(dcp->crashed, false);
 	ret = apple_rtkit_power_cycled_return(dcp->rtk,
 					      dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
