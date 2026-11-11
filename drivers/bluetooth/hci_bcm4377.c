@@ -5,6 +5,7 @@
  * Copyright (C) The Asahi Linux Contributors
  */
 
+#include <linux/suspend.h>
 #include <linux/async.h>
 #include <linux/atomic.h>
 #include <linux/bitfield.h>
@@ -3166,6 +3167,19 @@ static int bcm4377_resume(struct device *dev)
 	if (bcm4377->wake_armed) {
 		disable_irq_wake(pdev->irq);
 		bcm4377->wake_armed = false;
+	}
+
+	/*
+	 * A real sleep took the function's power: the firmware is gone, and every resume command
+	 * would only time out (two times 2 s inside the system resume, then the rebind anyway).
+	 * Skip them and rebind from the work queue; probe boots the firmware from scratch.
+	 */
+	if (pm_resume_via_firmware() && !bcm4377->dma_window_base) {
+		bcm4377->quiesced = false;
+		bcm4377->resume_powered = false;
+		WRITE_ONCE(bcm4377->setup_retry_blocked, false);
+		bcm4377_queue_rebind(bcm4377, "power lost in the sleep");
+		return 0;
 	}
 
 	if (bcm4377->quiesced) {
