@@ -58,6 +58,7 @@ use kernel::{
 use pin_init::Zeroable;
 
 mod aop_lid;
+mod aop_lpai;
 mod aop_spkr;
 mod aop_t8140;
 
@@ -766,6 +767,8 @@ struct SndSocAopDriver {
     mic: Arc<aop_lid::MicLid>,
     /// The J616s speaker and jack ASoC components (T6040, where the node has a "spkr" DMA channel)
     spkr: Option<aop_spkr::SpeakerComponent>,
+    /// The low-power microphone, PCM 1 of the card, where the firmware streams it inline.
+    lpai: Option<Arc<aop_lpai::LpaiCapture>>,
 }
 
 fn copy_str(target: &mut [u8], source: &[u8]) {
@@ -936,11 +939,13 @@ impl SndSocAopDriver {
         mmap: None,
         ack: None,
     };
-    fn new(data: Arc<SndSocAopData>) -> Result<Self> {
+    fn new(data: Arc<SndSocAopData>, lpai: Option<Arc<aop_lpai::LpaiCapture>>) -> Result<Self> {
+        // Set first, so that a failure below detaches its listener in Drop.
         let mut this = SndSocAopDriver {
             card: ptr::null_mut(),
             mic: aop_lid::MicLid::new()?,
             spkr: None,
+            lpai,
         };
         let ret = unsafe {
             bindings::snd_card_new(
@@ -1012,6 +1017,12 @@ impl SndSocAopDriver {
             );
         }
 
+        // The low-power microphone is PCM 1: UCM and the microphone rules
+        // keep using PCM 0, the array.
+        if let Some(lpai) = &this.lpai {
+            lpai.new_pcm(this.card, 1)?;
+        }
+
         // The array's jack: unplugged while a lid is closed.
         this.mic.attach(&data.dev, this.card)?;
 
@@ -1028,6 +1039,10 @@ impl Drop for SndSocAopDriver {
     fn drop(&mut self) {
         // The speaker component (and any card bound to its DAIs) goes before the microphone card.
         self.spkr.take();
+        // No sample report reaches the low-power PCM once the card goes.
+        if let Some(lpai) = &self.lpai {
+            lpai.detach();
+        }
         // The last jack report finishes before the card, and the jack with it, goes away.
         self.mic.detach();
         if self.card != ptr::null_mut() {
@@ -1170,6 +1185,7 @@ impl SndSocAopDriver {
                 card: ptr::null_mut(),
                 mic: aop_lid::MicLid::new()?,
                 spkr: None,
+                lpai: None,
             };
             this.spkr = Some(aop_spkr::SpeakerComponent::register(data)?);
             return Ok(this);
@@ -1193,7 +1209,7 @@ impl SndSocAopDriver {
             if data.set_decimator_config_hf().is_err() {
                 dev_warn!(data.dev, "decimator config refused, continuing\n");
             }
-            let mut this = Self::new(data.clone())?;
+            let mut this = Self::new(data.clone(), None)?;
             // The speaker and jack streams, where the node has their DMA
             // channels: a machine may have the jack before its speakers.
             if streams {
@@ -1208,7 +1224,13 @@ impl SndSocAopDriver {
         } else {
             data.set_decimator_config()?;
         }
-        Ok(Self::new(data)?)
+        // The low-power microphone is optional: without it the card keeps the array alone.
+        let lpai = aop_lpai::LpaiCapture::new_inline(&data.dev, &data.adata, data.service)
+            .unwrap_or_else(|e| {
+                dev_warn!(data.dev, "no low-power microphone PCM: {:?}\n", e);
+                None
+            });
+        Ok(Self::new(data, lpai)?)
     }
 }
 
