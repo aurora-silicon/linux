@@ -231,6 +231,7 @@ void *sep_bio_register_concurrent(const char *name, unsigned short mode,
 void sep_bio_unregister(void *dev);
 void sep_bio_wake(void *dev);
 int sep_bio_capable_admin(void);
+__u32 sep_bio_current_euid(void);
 __u64 sep_bio_monotonic_ns(void);
 __u64 sep_bio_boottime_ns(void);
 

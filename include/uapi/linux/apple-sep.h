@@ -268,11 +268,13 @@ struct sep_bio_rearm {
  * UNSEAL refuse keys made without a biometric policy (EINVAL).
  *
  * Version 4 (INFO 'features' SEP_KEY_FEATURE_PASSWORD, variant-5 key store
- * only) adds .userPresence keys under a user's own key bag (the bag whose
- * secret is that user's login password, SEP_BIO_KEYBAG_*). Root only.
- * SEP_KEY_CREATE_USER makes one under 'uid''s bag (refused while the bag is
- * locked or absent; uid 1000 is the Linux identity bag's designation and is
- * refused). Its handle is version 2 and names the uid. SIGN, UNSEAL and
+ * only) adds keys under a user's own key bag (the bag whose secret is that
+ * user's login password, SEP_BIO_KEYBAG_*). Root or the bag's own user may
+ * make these calls. SEP_KEY_CREATE_USER with SEP_KEY_CREATE_USER_PRESENCE
+ * makes a .userPresence key under 'uid''s bag; with flags 0 it makes a key
+ * with no list that works, with no touch and no password, only while the
+ * bag is unlocked. The enclave refuses either while the bag is locked or
+ * absent. Its handle is version 2 and names the uid. SIGN, UNSEAL and
  * PUBLIC take it; SIGN and UNSEAL wait for a Touch ID match.
  * SEP_KEY_SIGN_PASSWORD and SEP_KEY_UNSEAL_PASSWORD hand the bag's password
  * to the enclave instead: it checks the password (counting a wrong one),

@@ -109,6 +109,9 @@ pub(crate) const CREATE_DEVICE_PASSCODE: u32 = 8;
 const CREATE_FLAGS: u32 = CREATE_BIOMETRY_CURRENT_SET | CREATE_BIOMETRY_ANY;
 /// `CREATE_USER` flags (version 4): `.userPresence` under the user's bag.
 const CREATE_USER_FLAGS: u32 = CREATE_USER_PRESENCE;
+/// `CREATE_USER` with flags 0: a key with no list under the user's bag,
+/// usable exactly while that bag is unlocked.
+const CREATE_USER_PLAIN: u32 = 0;
 const CREATE_RESERVED: u32 = CREATE_USER_PRESENCE | CREATE_DEVICE_PASSCODE;
 
 /// The access policy a `CREATE` request asks for: at most one policy bit.
@@ -148,6 +151,10 @@ pub(crate) const HANDLE_BIOMETRY_ANY: u8 = 0x02;
 /// Handle flag (handle version 2): the record lives under a user's key bag
 /// with macOS's `.userPresence` list; the uid follows the length.
 pub(crate) const HANDLE_USER_BAG: u8 = 0x04;
+/// Handle flag, with `HANDLE_USER_BAG` only: the record has no list. It
+/// works with no touch and no password, but only while the bag is unlocked
+/// (protection class 9: the enclave refuses while it is locked).
+pub(crate) const HANDLE_USER_PLAIN: u8 = 0x08;
 const HANDLE_VERSION_USER: u8 = 2;
 pub(crate) const HANDLE_HEADER: usize = 12;
 const HANDLE_HEADER_USER: usize = 16;
@@ -438,7 +445,7 @@ pub(crate) fn encode_handle(blob: &[u8], flags: u8, out: &mut [u8; HANDLE_MAX]) 
 }
 
 /// Writes a version-2 handle for a record under `uid`'s bag.
-pub(crate) fn encode_user_handle(blob: &[u8], uid: u32, out: &mut [u8; HANDLE_MAX]) -> Result<usize> {
+pub(crate) fn encode_user_handle(blob: &[u8], uid: u32, plain: bool, out: &mut [u8; HANDLE_MAX]) -> Result<usize> {
     if blob.is_empty() || blob.len() > HANDLE_MAX - HANDLE_HEADER_USER {
         return Err(EINVAL);
     }
@@ -446,7 +453,7 @@ pub(crate) fn encode_user_handle(blob: &[u8], uid: u32, out: &mut [u8; HANDLE_MA
     out.fill(0);
     out[..4].copy_from_slice(HANDLE_MAGIC);
     out[4] = HANDLE_VERSION_USER;
-    out[5] = HANDLE_USER_BAG;
+    out[5] = HANDLE_USER_BAG | (if plain { HANDLE_USER_PLAIN } else { 0 });
     out[8..12].copy_from_slice(&len.to_le_bytes());
     out[12..16].copy_from_slice(&uid.to_le_bytes());
     out[HANDLE_HEADER_USER..HANDLE_HEADER_USER + blob.len()].copy_from_slice(blob);
@@ -470,7 +477,7 @@ pub(crate) fn decode_any_handle(handle: &[u8; HANDLE_MAX], len: u32) -> Result<H
     let len = len as usize;
     if !(HANDLE_HEADER_USER + 1..=HANDLE_MAX).contains(&len)
         || &handle[..4] != HANDLE_MAGIC
-        || handle[5] != HANDLE_USER_BAG
+        || (handle[5] != HANDLE_USER_BAG && handle[5] != HANDLE_USER_BAG | HANDLE_USER_PLAIN)
         || handle[6] != 0
         || handle[7] != 0
     {
@@ -481,17 +488,30 @@ pub(crate) fn decode_any_handle(handle: &[u8; HANDLE_MAX], len: u32) -> Result<H
         return Err(EINVAL);
     }
     let uid = u32::from_le_bytes([handle[12], handle[13], handle[14], handle[15]]);
-    Ok(Handle { blob: &handle[HANDLE_HEADER_USER..len], flags: HANDLE_USER_BAG, uid: Some(uid) })
+    Ok(Handle { blob: &handle[HANDLE_HEADER_USER..len], flags: handle[5], uid: Some(uid) })
 }
 
-/// The `DesignateUser` for a user-bag uid; refuses uids the key store does
-/// not designate and the uid the Linux identity bag is designated as.
+/// The key store's designated user for `uid`'s bag (see
+/// `userbag::USER_BAG_BASE`: never the identity bag's designation).
 pub(crate) fn bag_user(uid: u32) -> Result<crate::sks::DesignateUser> {
-    let uid = i32::try_from(uid).map_err(|_| EINVAL)?;
-    if uid < crate::sks::SKS_DESIGNATE_USER_MIN || uid == crate::SBIO_PROBE_USER_ID {
+    if uid < crate::userbag::MIN_UID {
         return Err(EINVAL);
     }
-    crate::sks::DesignateUser::new(uid).ok_or(EINVAL)
+    crate::userbag::bag_designation(uid)
+}
+
+/// The tracked-context user id for a designated user.
+fn designated_id(user: crate::sks::DesignateUser) -> i32 {
+    -user.special_handle().value()
+}
+
+/// A user-bag call may come from root or from the bag's own user.
+pub(crate) fn require_admin_or(uid: u32) -> Result<()> {
+    if crate::shim::capable_admin() || crate::shim::current_euid() == uid {
+        Ok(())
+    } else {
+        Err(EPERM)
+    }
 }
 
 /// Copies the password out of `pw` and wipes `pw`.
@@ -846,7 +866,7 @@ mod tests {
     fn user_handle_round_trips_and_keeps_the_uid() {
         let b = blob();
         let mut h = [0u8; HANDLE_MAX];
-        let n = encode_user_handle(&b, 60124, &mut h).unwrap();
+        let n = encode_user_handle(&b, 60124, false, &mut h).unwrap();
         assert_eq!(n, HANDLE_HEADER_USER + b.len());
         let d = decode_any_handle(&h, n as u32).unwrap();
         assert_eq!(d.blob, &b[..]);
@@ -858,6 +878,9 @@ mod tests {
         bad[5] = HANDLE_BIOMETRY;
         assert!(decode_any_handle(&bad, n as u32).is_err());
         assert!(decode_any_handle(&h, n as u32 - 1).is_err());
+        let mut p = [0u8; HANDLE_MAX];
+        let np = encode_user_handle(&b, 60124, true, &mut p).unwrap();
+        assert_eq!(decode_any_handle(&p, np as u32).unwrap().flags, HANDLE_USER_BAG | HANDLE_USER_PLAIN);
         let mut v1 = [0u8; HANDLE_MAX];
         let n1 = encode_handle(&b, HANDLE_BIOMETRY, &mut v1).unwrap();
         let d1 = decode_any_handle(&v1, n1 as u32).unwrap();
@@ -865,8 +888,11 @@ mod tests {
     }
 
     #[test]
-    fn bag_users_exclude_the_identity_designation() {
-        assert!(bag_user(crate::SBIO_PROBE_USER_ID as u32).is_err());
+    fn user_bags_never_share_the_identity_designation() {
+        // uid 1000 gets a bag of its own, apart from the identity bag's designation.
+        let ryan = bag_user(1000).unwrap();
+        assert_ne!(designated_id(ryan), crate::SBIO_PROBE_USER_ID);
+        assert_eq!(designated_id(ryan), (crate::userbag::USER_BAG_BASE + 1000) as i32);
         assert!(bag_user(5).is_err());
         assert!(bag_user(u32::MAX).is_err());
         assert!(bag_user(60124).is_ok());
@@ -1270,10 +1296,10 @@ impl SepData {
 
     fn key_userbag_record(&self, req: &mut Selftest) -> Result<()> {
         let uid = req.enclave_status;
-        if uid < crate::sks::SKS_DESIGNATE_USER_MIN || uid == crate::SBIO_PROBE_USER_ID {
+        if uid < crate::sks::SKS_DESIGNATE_USER_MIN {
             return Err(EINVAL);
         }
-        let user = crate::sks::DesignateUser::new(uid).ok_or(EINVAL)?;
+        let user = bag_user(u32::try_from(uid).map_err(|_| EINVAL)?)?;
         if req.mode == SELFTEST_USERBAG_KEY_MAKE {
             let ed = presence_acl()?;
             let blob = self.user_key_create_in_bag(user, Some(&ed))?;
@@ -1299,7 +1325,7 @@ impl SepData {
         }
         let mut record = KVec::new();
         record.extend_from_slice(&req.handle[..len], GFP_KERNEL)?;
-        let made = self.key_context_for(uid, Some((user.special_handle(), &pw[..plen])));
+        let made = self.key_context_for(designated_id(user), Some((user.special_handle(), &pw[..plen])));
         pw.fill(0);
         let (ctx, v) = made?;
         req.result2 = v;
@@ -1322,13 +1348,13 @@ impl SepData {
     fn key_userbag_locked(&self, req: &mut Selftest) -> Result<()> {
         let uid = req.enclave_status;
         let len = req.handle_len as usize;
-        if len == 0 || len > 256 || uid < crate::sks::SKS_DESIGNATE_USER_MIN || uid == crate::SBIO_PROBE_USER_ID {
+        if len == 0 || len > 256 || uid < crate::sks::SKS_DESIGNATE_USER_MIN {
             return Err(EINVAL);
         }
         let mut pw = [0u8; 256];
         pw[..len].copy_from_slice(&req.handle[..len]);
         req.handle.fill(0);
-        let user = crate::sks::DesignateUser::new(uid).ok_or(EINVAL)?;
+        let user = bag_user(u32::try_from(uid).map_err(|_| EINVAL)?)?;
         let out = (|| -> Result<[i32; 8]> {
             let ed = presence_acl()?;
             let blob = self.user_key_create_in_bag(user, Some(&ed))?;
@@ -1345,7 +1371,7 @@ impl SepData {
             };
             let mut r = [0i32; 8];
             r[5] = self.userbag_lock_phase(user).map(|p| p as i32).unwrap_or(-1);
-            let (stale, _) = self.key_context_for(uid, Some((user.special_handle(), &pw[..len])))?;
+            let (stale, _) = self.key_context_for(designated_id(user), Some((user.special_handle(), &pw[..len])))?;
             r[0] = sign(Some(&stale));
             // Lock for good: the screen lock, then grace-timer fires (as the
             // Mac's kernel sends them) until the store locks the bag, for at
@@ -1378,12 +1404,12 @@ impl SepData {
             r[1] = sign(Some(&stale));
             self.close_unlock_evaluation(&stale);
             r[2] = sign(None);
-            let (fresh, v) = self.key_context_for(uid, Some((user.special_handle(), &pw[..len])))?;
+            let (fresh, v) = self.key_context_for(designated_id(user), Some((user.special_handle(), &pw[..len])))?;
             r[3] = if v == 0 { sign(Some(&fresh)) } else { v };
             self.close_unlock_evaluation(&fresh);
             self.userbag_unlock(user, &pw[..len])?;
             r[7] = self.userbag_lock_phase(user).map(|p| p as i32).unwrap_or(-1);
-            let (fresh2, v2) = self.key_context_for(uid, Some((user.special_handle(), &pw[..len])))?;
+            let (fresh2, v2) = self.key_context_for(designated_id(user), Some((user.special_handle(), &pw[..len])))?;
             r[4] = if v2 == 0 { sign(Some(&fresh2)) } else { v2 };
             self.close_unlock_evaluation(&fresh2);
             Ok(r)
@@ -1405,13 +1431,13 @@ impl SepData {
     fn key_userbag_probe(&self, req: &mut Selftest) -> Result<()> {
         let uid = req.enclave_status;
         let len = req.handle_len as usize;
-        if len == 0 || len > 256 || uid < crate::sks::SKS_DESIGNATE_USER_MIN || uid == crate::SBIO_PROBE_USER_ID {
+        if len == 0 || len > 256 || uid < crate::sks::SKS_DESIGNATE_USER_MIN {
             return Err(EINVAL);
         }
         let mut pw = [0u8; 256];
         pw[..len].copy_from_slice(&req.handle[..len]);
         req.handle.fill(0);
-        let user = crate::sks::DesignateUser::new(uid).ok_or(EINVAL)?;
+        let user = bag_user(u32::try_from(uid).map_err(|_| EINVAL)?)?;
         let ed = presence_acl()?;
         let made = self.user_key_create_in_bag(user, Some(&ed));
         let blob = match made {
@@ -1429,7 +1455,7 @@ impl SepData {
             (r.err().map(|e| e.to_errno()).unwrap_or(0), self.last_key_status.load(Relaxed) as i32)
         };
         let first = if req.mode == SELFTEST_USERBAG_KEY_SAME_BAG {
-            self.key_context_for(uid, Some((user.special_handle(), &pw[..len])))
+            self.key_context_for(designated_id(user), Some((user.special_handle(), &pw[..len])))
         } else {
             let du = crate::sks::DesignateUser::new(crate::SBIO_PROBE_USER_ID).ok_or(EINVAL)?;
             match crate::keybag::read(crate::keybag::Slot::Identity) {
@@ -1449,9 +1475,9 @@ impl SepData {
         (req.result, req.enclave_status) = sign(&ctx);
         self.close_unlock_evaluation(&ctx);
         let second = if req.mode == SELFTEST_USERBAG_KEY_SAME_BAG {
-            self.key_context_for(uid, None)
+            self.key_context_for(designated_id(user), None)
         } else {
-            self.key_context_for(uid, Some((user.special_handle(), &pw[..len])))
+            self.key_context_for(designated_id(user), Some((user.special_handle(), &pw[..len])))
         };
         pw.fill(0);
         let (ctx2, v2) = second?;
@@ -1477,10 +1503,10 @@ impl SepData {
     fn key_presence_other_bag(&self, req: &mut Selftest) -> Result<()> {
         let uid = req.enclave_status;
         let len = req.handle_len as usize;
-        if len == 0 || len > 256 || uid < crate::sks::SKS_DESIGNATE_USER_MIN || uid == crate::SBIO_PROBE_USER_ID {
+        if len == 0 || len > 256 || uid < crate::sks::SKS_DESIGNATE_USER_MIN {
             return Err(EINVAL);
         }
-        let du = crate::sks::DesignateUser::new(uid).ok_or(EINVAL)?;
+        let du = bag_user(u32::try_from(uid).map_err(|_| EINVAL)?)?;
         let ed = presence_acl()?;
         let (blob, _) = self.user_key_create(Some(&ed))?;
         let digest = req.digest;
@@ -1659,7 +1685,7 @@ impl SepData {
         let bag = bag_user(uid)?;
         // Not under `catacomb_writer`: a touch wait holds it for up to a
         // minute, and this path needs no capture.
-        let (ctx, verify) = self.key_context_for(uid as i32, Some((bag.special_handle(), &pw[..])))?;
+        let (ctx, verify) = self.key_context_for(designated_id(bag), Some((bag.special_handle(), &pw[..])))?;
         let r = if verify != 0 {
             dev_info!(self.dev, "sep-key: uid {}'s password refused by the enclave (status {})\n", uid, verify);
             Err(EACCES)
@@ -1790,24 +1816,29 @@ impl SepData {
                 .writer()
                 .write(&info_for(self.profile.key_store == crate::profile::KeyStore::Variant5)),
             IOC_CREATE_USER => {
-                crate::bio::require_admin()?;
                 let slice = UserSlice::new(user, core::mem::size_of::<CreateUser>());
                 let (mut reader, mut writer) = slice.reader_writer();
                 let mut req: CreateUser = reader.read()?;
-                if req.reserved != [0; 3] || req.flags & !CREATE_USER_FLAGS != 0 || req.flags != CREATE_USER_PRESENCE {
+                require_admin_or(req.uid)?;
+                if req.reserved != [0; 3] || req.flags & !CREATE_USER_FLAGS != 0 {
                     return Err(EINVAL);
                 }
+                let plain = req.flags == CREATE_USER_PLAIN;
                 let bag = bag_user(req.uid)?;
-                let ed = presence_acl()?;
+                let ed = if plain { None } else { Some(presence_acl()?) };
                 // The enclave refuses while the bag is locked or absent.
-                let blob = self.user_key_create_in_bag(bag, Some(&ed))?;
+                let blob = self.user_key_create_in_bag(bag, ed.as_deref())?;
                 req.public_key = SepData::user_key_public(&blob)?;
-                req.handle_len = encode_user_handle(&blob, req.uid, &mut req.handle)? as u32;
-                dev_info!(self.dev, "sep-key: user-presence key under uid {}'s bag\n", req.uid);
+                req.handle_len = encode_user_handle(&blob, req.uid, plain, &mut req.handle)? as u32;
+                dev_info!(
+                    self.dev,
+                    "sep-key: {} key under uid {}'s bag\n",
+                    (if plain { "bag-unlocked-only" } else { "user-presence" }),
+                    req.uid
+                );
                 writer.write(&req)
             }
             IOC_SIGN_PASSWORD => {
-                crate::bio::require_admin()?;
                 let slice = UserSlice::new(user, core::mem::size_of::<SignPassword>());
                 let (mut reader, mut writer) = slice.reader_writer();
                 let mut req: SignPassword = reader.read()?;
@@ -1817,13 +1848,16 @@ impl SepData {
                 }
                 let h = decode_any_handle(&req.sign.handle, req.sign.handle_len)?;
                 let uid = h.uid.ok_or(EINVAL)?;
+                require_admin_or(uid)?;
+                if h.flags & HANDLE_USER_PLAIN != 0 {
+                    return Err(EINVAL);
+                }
                 let digest = req.sign.digest;
                 let sig = self.key_op_with_password(uid, h.blob, TouchOp::Sign, &digest, &[], &pw)?;
                 put_signature(&sig, &mut req.sign)?;
                 writer.write(&req)
             }
             IOC_UNSEAL_PASSWORD => {
-                crate::bio::require_admin()?;
                 let slice = UserSlice::new(user, core::mem::size_of::<UnsealPassword>());
                 let (mut reader, mut writer) = slice.reader_writer();
                 let mut req: UnsealPassword = reader.read()?;
@@ -1837,6 +1871,10 @@ impl SepData {
                 }
                 let h = decode_any_handle(&req.seal.handle, req.seal.handle_len)?;
                 let uid = h.uid.ok_or(EINVAL)?;
+                require_admin_or(uid)?;
+                if h.flags & HANDLE_USER_PLAIN != 0 {
+                    return Err(EINVAL);
+                }
                 let mut sealed = KVec::new();
                 sealed.extend_from_slice(&req.seal.sealed[..n], GFP_KERNEL)?;
                 let mut secret =
@@ -1875,7 +1913,12 @@ impl SepData {
                 let sig = {
                     let h = decode_any_handle(&req.handle, req.handle_len)?;
                     let digest = req.digest;
-                    if h.flags & (HANDLE_BIOMETRY | HANDLE_USER_BAG) != 0 {
+                    if let Some(uid) = h.uid {
+                        require_admin_or(uid)?;
+                    }
+                    if h.flags & HANDLE_USER_PLAIN != 0 {
+                        self.key_op_in(h.uid, TouchOp::Sign, h.blob, &digest, &[], None)?
+                    } else if h.flags & (HANDLE_BIOMETRY | HANDLE_USER_BAG) != 0 {
                         let job = self.key_touch_run(h.blob, h.flags, TouchOp::Sign, &digest, &[], false, None, h.uid)?;
                         job.sig.ok_or(EIO)??
                     } else {
@@ -1913,6 +1956,9 @@ impl SepData {
                     return Err(EINVAL);
                 }
                 let h = decode_any_handle(&req.handle, req.handle_len)?;
+                if let Some(uid) = h.uid {
+                    require_admin_or(uid)?;
+                }
                 let (blob, flags) = (h.blob, h.flags);
                 // Only for keys whose use the enclave gates on a touch or the password.
                 if flags & (HANDLE_BIOMETRY | HANDLE_USER_BAG) == 0 {
@@ -1932,9 +1978,13 @@ impl SepData {
                     if n == 0 || n > SEALED_MAX {
                         return Err(EINVAL);
                     }
-                    let job = self.key_touch_run(blob, flags, TouchOp::Unseal, &[0; DIGEST_LEN],
-                                                 &req.sealed[..n], false, None, h.uid)?;
-                    let secret = job.sig.ok_or(EIO)??;
+                    let secret = if flags & HANDLE_USER_PLAIN != 0 {
+                        self.key_op_in(h.uid, TouchOp::Unseal, blob, &[0; DIGEST_LEN], &req.sealed[..n], None)?
+                    } else {
+                        let job = self.key_touch_run(blob, flags, TouchOp::Unseal, &[0; DIGEST_LEN],
+                                                     &req.sealed[..n], false, None, h.uid)?;
+                        job.sig.ok_or(EIO)??
+                    };
                     let r = put_secret(&secret, &mut req);
                     let mut secret = secret;
                     secret.fill(0);
