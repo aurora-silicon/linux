@@ -1656,10 +1656,18 @@ int ane_h16_session_enter(struct ane_h16_session *s, bool nonblock)
 	int ret;
 
 	for (;;) {
+		/* A parked engine comes up for its first request. */
+		if (READ_ONCE(s->parked) && s->ops->wake) {
+			ret = s->ops->wake(s->ctx);
+			if (ret && ret != -EAGAIN)
+				return ret;
+		}
 		/* O_NONBLOCK: a clean -EAGAIN while the engine is cycled. */
 		if (nonblock && READ_ONCE(s->asleep))
 			return -EAGAIN;
-		ret = wait_event_freezable(s->wake, !READ_ONCE(s->asleep));
+		ret = wait_event_freezable(s->wake, !READ_ONCE(s->asleep) ||
+					   (READ_ONCE(s->parked) && s->ops->wake &&
+					    !READ_ONCE(s->wake_blocked)));
 		if (ret)
 			return ret;
 		mutex_lock(s->lock);
