@@ -373,6 +373,14 @@ static void isp_test_meta_exposure(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, isp->frame_exposure_us, 32475);
 	KUNIT_EXPECT_EQ(test, isp->frame_gain, 3253);
 
+	/* A short header cannot supply the section-table entry. */
+	put_unaligned_le16(700, virt + 0x1876);
+	meta.size = 0x1f;
+	isp_meta_read_exposure(isp, &meta);
+	KUNIT_EXPECT_EQ(test, isp->frame_gain, 3253);
+	meta.size = 0x2000;
+	put_unaligned_le16(3253, virt + 0x1876);
+
 	/* a section that would end past the buffer is ignored */
 	put_unaligned_le32(meta.size - 4, virt + 0x1c);
 	put_unaligned_le32(1000, virt + meta.size - 4);
@@ -483,8 +491,32 @@ static void isp_test_error_wakeup(struct kunit *test)
 	KUNIT_EXPECT_GT(test, w.remaining, 0L);
 }
 
+static void isp_test_exposure_control_gate(struct kunit *test)
+{
+	static const struct apple_isp_hw hw_none = { };
+	static const struct apple_isp_hw hw = { .meta_exposure = true };
+	struct apple_isp *isp = isp_test_alloc(test);
+
+	v4l2_ctrl_handler_init(&isp->ctrl_handler, 3);
+	isp->hw = &hw_none;
+	isp_init_exposure_ctrls(isp);
+	KUNIT_EXPECT_PTR_EQ(test, isp->gain, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, isp->exposure, NULL);
+	isp->hw = &hw;
+	isp_init_exposure_ctrls(isp);
+	KUNIT_EXPECT_EQ(test, isp->ctrl_handler.error, 0);
+	KUNIT_EXPECT_NOT_ERR_OR_NULL(test, isp->gain);
+	KUNIT_EXPECT_NOT_ERR_OR_NULL(test, isp->exposure);
+	if (isp->gain)
+		KUNIT_EXPECT_EQ(test, isp->gain->flags &
+			(V4L2_CTRL_FLAG_READ_ONLY | V4L2_CTRL_FLAG_VOLATILE),
+			(u32)(V4L2_CTRL_FLAG_READ_ONLY | V4L2_CTRL_FLAG_VOLATILE));
+	v4l2_ctrl_handler_free(&isp->ctrl_handler);
+}
+
 static struct kunit_case isp_v4l2_test_cases[] = {
 	KUNIT_CASE(isp_test_meta_exposure),
+	KUNIT_CASE(isp_test_exposure_control_gate),
 	KUNIT_CASE(isp_test_imx958_last_lease_requeue),
 	KUNIT_CASE(isp_test_p010_report_defers_completion),
 	KUNIT_CASE(isp_test_p010_mode_selection),

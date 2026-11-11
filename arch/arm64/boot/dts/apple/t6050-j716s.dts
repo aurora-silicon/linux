@@ -83,30 +83,52 @@
 /*
  * PCIe port 0: the N1 (Wi-Fi and Bluetooth). Port 1 is the SD reader, not yet
  * described. The registers, interrupt, DART streams and PERST# pin are the
- * J716c's: the J716s ADT has the same port. Disabled with its DART until the
- * boot loader trains it.
+ * J716c's: the J716s ADT has the same port. Port 0 and its DART stay disabled
+ * until the boot loader enables them: once it trained the port, or with the
+ * port down because the kernel can train it (port00 names the N1's power
+ * line, the DART waits for its root complex). The kernel's train uses the
+ * shared PHY (ADT reg[3]), its common block (reg[2] + 0x4000) and the windows
+ * of the host tunable lists the boot loader copies from the ADT: axi2af
+ * (reg[5]), pcieclkgen (reg[6]), phy-window (reg[2]) and phy-ip (reg[4]),
+ * the same as the J714c's; the PHY and axi2af windows are cut to what their
+ * lists reach.
  */
 &pcie0 {
 	reg = <0x1c 0xb0000000 0x0 0x10000000>,
 	      <0x4 0x14000000 0x0 0x4000>,
 	      <0x4 0x10028000 0x0 0x8000>,
 	      <0x4 0x17010000 0x0 0x4000>,
-	      <0x4 0x10024000 0x0 0x4000>;
-	reg-names = "config", "rc", "port0", "phy0", "intr2axi0";
+	      <0x4 0x10024000 0x0 0x4000>,
+	      <0x4 0x17020000 0x0 0x4000>,
+	      <0x4 0x17004000 0x0 0x4000>,
+	      <0x4 0x16000000 0x0 0x24000>,
+	      <0x4 0x15044000 0x0 0x4000>,
+	      <0x4 0x17000000 0x0 0x24000>,
+	      <0x4 0x17800000 0x0 0x1b4000>;
+	reg-names = "config", "rc", "port0", "phy0", "intr2axi0",
+		    "phy-shared", "phy-common", "axi2af", "pcieclkgen",
+		    "phy-window", "phy-ip";
 	interrupts = <AIC_IRQ 0 1523 IRQ_TYPE_LEVEL_HIGH>;
 	interrupt-names = "port0";
 
 	/* The N1's three functions are on DART streams 1-3 */
 	iommu-map = <0x100 &dart_apcie0 1 3>;
 	bus-range = <0 4>;
+	/*
+	 * dart_apcie0 probes only once this host has the port up: fw_devlink
+	 * must not make the host wait for it (strict mode enforces iommu-map)
+	 */
+	post-init-providers = <&dart_apcie0>;
 
 	port00: pci@0,0 {
 		device_type = "pci";
 		reg = <0x0 0 0 0 0>;
 		bus-range = <1 1>;
-		apple,link-trained-by-bootloader;
+		/* The N1's power: ADT pci-bridge0 function-reset, gP13 */
+		pwren-gpios = <&smc_gpio 0x13 GPIO_ACTIVE_HIGH>;
 		/* PERST#: ADT pci-bridge0 function-perst, GPIO 80 */
 		reset-gpios = <&pinctrl_ap 80 GPIO_ACTIVE_LOW>;
+		apple,link-trained-by-bootloader;
 		status = "disabled";
 
 		#address-cells = <3>;
@@ -141,6 +163,108 @@
 			reg = <0x10200 0x0 0x0 0x0 0x0>;
 			local-bd-address = [00 00 00 00 00 00];
 		};
+	};
+};
+
+/* It answers only once port 0's root complex is up: pcie-apple then enables it */
+&dart_apcie0 {
+	apple,manual-availability;
+};
+
+/*
+ * Nothing here drives the SMC pcIO outputs (apple,smc-pcio-gpio), and the AFE
+ * reset above uses gp1c, so the node goes. This board's templates,
+ * pKW8('pcIO', lo, hi) as (hi << 32) | lo, are the J716c's:
+ *   0 dp2hdmi_pwr_en (0x0, 0x1a0000)
+ *   1 hdmi_pwr_en    (0x800000, 0xf0000)
+ *   2 afe-reset      (0x10000, 0x11c0000)
+ */
+/delete-node/ &smc_pcio;
+
+/*
+ * The SMC's first GPIO bank, the gP keys: the N1's power line is gP13.
+ * gpio-macsmc drives it with the line's ADT template, pKW4("gP13",
+ * 0x00800000): 0x00800000 | level, as m1n1 does.
+ */
+&smc {
+	smc_gpio: gpio {
+		compatible = "apple,smc-gpio";
+		#gpio-cells = <2>;
+		gpio-controller;
+	};
+};
+
+/*
+ * The power of the N1's port. iBoot leaves APCIE_SYS_GP, APCIE_PHY_SW and
+ * APHY_GP_AUS5 in automatic power management with the block gated (boot
+ * state 0x1000030f, 0x1400024f, 0x1000030f); the train needs them on and
+ * staying on, as m1n1 raises them (target active, auto-PM off). Always on:
+ * the port's link is kept through suspend-to-idle, and the host has no
+ * power domain of its own. Parents as the ADT names them, the
+ * register-less APCIE_SYS_GE left out. ADT pmgr devices APCIE_GP +0x118,
+ * FAB6_SOC +0x138, APCIE_SYS_GP +0x148, APCIE_PHY_SW +0x1b0,
+ * APHY_GP_AUS5_A +0x258, APHY_GP_AUS5 +0x280 (group 1).
+ */
+&pmgr1 {
+	ps_apcie_gp: power-controller@118 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x118 4>;
+		label = "apcie_gp";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		apple,always-on;
+	};
+
+	ps_fab6_soc: power-controller@138 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x138 4>;
+		label = "fab6_soc";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		apple,always-on;
+	};
+
+	ps_apcie_sys_gp: power-controller@148 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x148 4>;
+		label = "apcie_sys_gp";
+		power-domains = <&ps_apcie_gp>, <&ps_fab6_soc>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		apple,always-on;
+		apple,no-auto-pm;
+	};
+
+	ps_apcie_phy_sw: power-controller@1b0 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1b0 4>;
+		label = "apcie_phy_sw";
+		power-domains = <&ps_apcie_sys_gp>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		apple,always-on;
+		apple,no-auto-pm;
+	};
+
+	ps_aphy_gp_aus5_a: power-controller@258 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x258 4>;
+		label = "aphy_gp_aus5_a";
+		power-domains = <&ps_apcie_phy_sw>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		apple,always-on;
+	};
+
+	power-controller@280 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x280 4>;
+		label = "aphy_gp_aus5";
+		power-domains = <&ps_aphy_gp_aus5_a>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		apple,always-on;
+		apple,no-auto-pm;
 	};
 };
 
@@ -443,16 +567,6 @@
 		};
 	};
 };
-
-/*
- * Nothing here drives the SMC pcIO outputs (apple,smc-pcio-gpio), and the AFE
- * reset above uses gp1c, so the node goes. This board's templates,
- * pKW8('pcIO', lo, hi) as (hi << 32) | lo, are the J716c's:
- *   0 dp2hdmi_pwr_en (0x0, 0x1a0000)
- *   1 hdmi_pwr_en    (0x800000, 0xf0000)
- *   2 afe-reset      (0x10000, 0x11c0000)
- */
-/delete-node/ &smc_pcio;
 
 #define T6050_J716S
 #include "t6050-peripherals.dtsi"

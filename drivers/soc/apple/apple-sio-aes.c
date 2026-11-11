@@ -152,11 +152,6 @@ static int apple_sio_aes_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static const struct apple_sio_aes_data apple_sio_aes_v3 = {
-	.revision = 3,
-	.shared_disable = true,
-};
-
 static const struct apple_sio_aes_data apple_sio_aes_t6041 = {
 	.revision = 5,
 	.uid_offset = 0x04,
@@ -172,8 +167,6 @@ static const struct apple_sio_aes_data apple_sio_aes_t8140 = {
 };
 
 static const struct of_device_id apple_sio_aes_of_match[] = {
-	{ .compatible = "apple,t6000-aes", .data = &apple_sio_aes_v3 },
-	{ .compatible = "apple,t8112-aes", .data = &apple_sio_aes_v3 },
 	{ .compatible = "apple,t6041-aes", .data = &apple_sio_aes_t6041 },
 	{ .compatible = "apple,t8140-aes", .data = &apple_sio_aes_t8140 },
 	{ }

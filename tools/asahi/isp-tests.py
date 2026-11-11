@@ -53,6 +53,8 @@ def main():
     if args.suite == 'session':
         groups['isp-ipc.c'] += ['chan_rx_done', 'ipc_chan_handle']
         groups['isp-fw.c'] += ['apple_isp_isr_thread']
+        if 'void apple_isp_firmware_flush(' in inputs['isp-fw.c']:
+            groups['isp-fw.c'] += ['apple_isp_firmware_flush']
     bodies = {n: function(inputs[f], n) for f, names in groups.items() for n in names}
     if args.suite == 'session' and 'apple_isp_video_error(isp);' in bodies['apple_isp_isr_thread']:
         bodies = {'apple_isp_video_error': function(
@@ -82,7 +84,7 @@ def main():
             (DRIVER / 'isp-cam.c').read_text(), 'apple_isp_stop_capture')
         if args.control == 'rollback':
             old = args.base_source.read_text() if args.base_source else subprocess.check_output(
-                ['git', 'show', '7876c8e8349c4f3d0a2f4ce982e3e13ce5bb5d70:'
+                ['git', 'show', '7cb581e81d0d6b6368af6d2bfb48ba115ab106aa:'
                  'drivers/media/platform/apple/isp/isp-v4l2.c'], cwd=ROOT, text=True)
             bodies['isp_submit_buffers'] = function(old, 'isp_submit_buffers')
     if args.suite == 'returns':

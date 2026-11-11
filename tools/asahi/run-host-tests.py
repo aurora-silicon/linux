@@ -53,13 +53,15 @@ def mutations(flag, names, base, expect=KILL):
 
 # test file -> [(arguments, expectation)]. '{out}' is a fresh directory.
 ASAHI_TESTS = {
+    'j613-mtp-s2idle-tests.py': [([], PASS)],
+    # 11eccbedc3ed writes frames without a transport-wide lock.
+    'mtp-tx-frame-tests.py': [(out(), PASS),
+                              (out() + ['--old-transport', '11eccbedc3ed'], PASS)],
+    'pmgr-ppt-tests.py': [([], PASS)],
     'queue-priority-tests.py': [([], PASS)],
     # The old revision reports a DART fault that clears before the second latch read as success.
     'ane-tm-transient-fault-tests.py': [([], PASS),
                                         (['--old-ref', 'b50066848322c6799c1433ee3a358aab2e9faabb'], PASS)],
-    'isp-preview-tests.py': [([], PASS)],
-    'isp-preview-flow-tests.py': [([], PASS)],
-    'isp-tests.py': [(['--suite', suite] + out(), PASS) for suite in ['session', 'buffers', 'receive', 'returns', 'queue']] + [(['--suite', suite, '--control', control] + out(), KILL) for suite, controls in [('session', ['send', 'overwrite', 'stop', 'reset']), ('buffers', ['rollback']), ('receive', ['drain']), ('returns', ['address', 'pool', 'duplicate', 'snapshot']), ('queue', ['queue-error'])] for control in controls],
     'test-m3-power.py': [([], PASS)],
     'test-m3-uapi.py': [([], PASS)],
     'test-m3-mailbox.py': [([], PASS)],
@@ -150,6 +152,9 @@ ASAHI_TESTS = {
     'g17-t6041-initdata-tests.py': [([], PASS)],
     'g17-uninstalled-cleanup-tests.py': [([], PASS)],
     'g17-unpublished-tests.py': [([], PASS)],
+    'isp-preview-flow-tests.py': [([], PASS)],
+    'isp-preview-tests.py': [([], PASS)],
+    'isp-tests.py': [(['--suite', suite] + out(), PASS) for suite in ['session', 'buffers', 'receive', 'returns', 'queue']] + [(['--suite', suite, '--control', control] + out(), KILL) for suite, controls in [('session', ['send', 'overwrite', 'stop', 'reset']), ('buffers', ['rollback']), ('receive', ['drain']), ('returns', ['address', 'pool', 'duplicate', 'snapshot']), ('queue', ['queue-error'])] for control in controls],
     'mt7932-association-events-tests.py': [(out(), PASS)],
     'mt7932-connect-result-tests.py': [(out('--output'), PASS)],
     'mt7932-owe-retry-tests.py': [(out(), PASS)],
@@ -165,6 +170,7 @@ ASAHI_TESTS = {
     'pciec-policy-tests.py': [(out(), PASS)],
     'pmgr-bus-tests.py': [([], PASS)],
     'pmp-agx-vote-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
+    'pmp-j613-floor-tests.py': [([], PASS)] + mutations('--mutant', ['no-hold', 'no-rate', 'no-streak', 'bad-word', 'foreign-ok', 'no-names', 'no-sum', 'no-board', 'no-default', 'no-disable'], []),
     'pmp-j613-hwmon-tests.py': [([], PASS)],
     'pmu-rtc-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('ack-clobber', 'arm-ack', 'offset-seconds',

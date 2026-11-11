@@ -27,36 +27,6 @@ static void apple_isp_kvfree(void *data)
 	kvfree(data);
 }
 
-/*
- * Keep a copy of the firmware data segment as the boot loader loaded it
- * (hw->fw_restore). This must run before the firmware first starts.
- */
-static int apple_isp_copy_fw_data(struct apple_isp *isp)
-{
-	struct device *dev = isp->dev;
-	struct resource res;
-	int err;
-
-	err = of_reserved_mem_region_to_resource_byname(dev->of_node, "data", &res);
-	if (err)
-		return err;
-
-	isp->fw_data_size = resource_size(&res);
-	isp->fw_data = devm_memremap(dev, res.start, isp->fw_data_size, MEMREMAP_WB);
-	if (IS_ERR(isp->fw_data))
-		return PTR_ERR(isp->fw_data);
-
-	isp->fw_data_copy = kvmalloc(isp->fw_data_size, GFP_KERNEL);
-	if (!isp->fw_data_copy)
-		return -ENOMEM;
-	err = devm_add_action_or_reset(dev, apple_isp_kvfree, isp->fw_data_copy);
-	if (err)
-		return err;
-
-	memcpy(isp->fw_data_copy, isp->fw_data, isp->fw_data_size);
-	return 0;
-}
-
 static void apple_isp_detach_genpd(struct apple_isp *isp)
 {
 	if (isp->pd_count <= 1)
@@ -181,17 +151,12 @@ static int apple_isp_map_fw_mmio(struct apple_isp *isp)
 	return 0;
 }
 
-/* The IOVA range of a memory-region, from its last iommu-addresses entry. */
-static int isp_of_region_iova(struct device *dev, const char *name,
-			      phys_addr_t *base, size_t *size)
+/* The IOVA range of memory-region @idx, from its last iommu-addresses entry. */
+static int isp_of_region_iova_idx(struct device *dev, int idx,
+				  phys_addr_t *base, size_t *size)
 {
 	const __be32 *maps, *end;
-	int idx, len;
-
-	idx = of_property_match_string(dev->of_node, "memory-region-names",
-				       name);
-	if (idx < 0)
-		return -ENOENT;
+	int len;
 
 	struct device_node *np __free(device_node) =
 		of_parse_phandle(dev->of_node, "memory-region", idx);
@@ -210,6 +175,139 @@ static int isp_of_region_iova(struct device *dev, const char *name,
 	}
 
 	return 0;
+}
+
+/* The IOVA range of a named memory-region. */
+static int isp_of_region_iova(struct device *dev, const char *name,
+			      phys_addr_t *base, size_t *size)
+{
+	int idx;
+
+	idx = of_property_match_string(dev->of_node, "memory-region-names",
+				       name);
+	if (idx < 0)
+		return -ENOENT;
+
+	return isp_of_region_iova_idx(dev, idx, base, size);
+}
+
+/*
+ * The memory-region of the firmware data segment: the one named "data", or,
+ * where the boot loader lists the firmware segments without names (T8140),
+ * the one that ends where the heap starts. The loader places the text and
+ * data segments and the heap back to back in the firmware's address space.
+ */
+static int isp_of_fw_data_region(struct device *dev)
+{
+	phys_addr_t heap_base, base;
+	size_t heap_size, size;
+	int idx, count;
+
+	idx = of_property_match_string(dev->of_node, "memory-region-names",
+				       "data");
+	if (idx >= 0)
+		return idx;
+
+	if (isp_of_region_iova(dev, "heap", &heap_base, &heap_size))
+		return -ENOENT;
+
+	count = of_count_phandle_with_args(dev->of_node, "memory-region", NULL);
+	for (idx = 0; idx < count; idx++) {
+		if (isp_of_region_iova_idx(dev, idx, &base, &size))
+			continue;
+		if (size && base + size == heap_base)
+			return idx;
+	}
+
+	return -ENOENT;
+}
+
+static void *apple_isp_copy_region(struct device *dev, struct resource *res,
+				   void **copy)
+{
+	void *mem;
+
+	mem = devm_memremap(dev, res->start, resource_size(res), MEMREMAP_WB);
+	if (IS_ERR(mem))
+		return mem;
+
+	*copy = kvmalloc(resource_size(res), GFP_KERNEL);
+	if (!*copy)
+		return ERR_PTR(-ENOMEM);
+	if (devm_add_action_or_reset(dev, apple_isp_kvfree, *copy))
+		return ERR_PTR(-ENOMEM);
+
+	memcpy(*copy, mem, resource_size(res));
+	return mem;
+}
+
+/*
+ * Keep a copy of the firmware data segment as the boot loader loaded it
+ * (hw->fw_restore), and of the heap where the boot loader provides its
+ * memory instead of the host. This must run before the firmware first
+ * starts.
+ */
+static int apple_isp_copy_fw_data(struct apple_isp *isp)
+{
+	struct device *dev = isp->dev;
+	struct resource res;
+	int idx, err;
+
+	idx = isp_of_fw_data_region(dev);
+	if (idx < 0)
+		return idx;
+
+	err = of_reserved_mem_region_to_resource(dev->of_node, idx, &res);
+	if (err)
+		return err;
+
+	isp->fw_data_size = resource_size(&res);
+	isp->fw_data = apple_isp_copy_region(dev, &res, &isp->fw_data_copy);
+	if (IS_ERR(isp->fw_data))
+		return PTR_ERR(isp->fw_data);
+
+	/* A host-backed main memory tail is cleared instead. */
+	if (isp->fw.data_top ||
+	    of_reserved_mem_region_to_resource_byname(dev->of_node, "heap", &res))
+		return 0;
+
+	isp->fw_heap_size = resource_size(&res);
+	isp->fw_heap = apple_isp_copy_region(dev, &res, &isp->fw_heap_copy);
+	return PTR_ERR_OR_ZERO(isp->fw_heap);
+}
+
+/*
+ * Firmware that starts again needs the DART address filter registers, to
+ * program the filter after each power-up, and its data segment. Device
+ * trees from before those were described run it resident instead
+ * (hw->resident_fallback), as it ran before.
+ */
+static void apple_isp_select_hw(struct apple_isp *isp)
+{
+	struct device *dev = isp->dev;
+	struct apple_isp_hw *hw = &isp->hw_local;
+
+	*hw = *isp->hw;
+	isp->hw = hw;
+
+	if (!hw->resident_fallback)
+		return;
+
+	struct device_node *dart __free(device_node) =
+		of_parse_phandle(dev->of_node, "iommus", 0);
+
+	if (dart && of_property_match_string(dart, "reg-names", "dapf") >= 0 &&
+	    isp_of_fw_data_region(dev) >= 0)
+		return;
+
+	dev_info(dev, "no address filter or firmware data in the device tree, keeping the firmware resident\n");
+	hw->fw_restore = false;
+	hw->deferred_start = false;
+	hw->resident_fw = true;
+	hw->coproc_quiesce = 0;
+	hw->dapf = NULL;
+	hw->num_dapf = 0;
+	hw->fw_idle_ms = 0;
 }
 
 /*
@@ -609,6 +707,8 @@ static int apple_isp_probe(struct platform_device *pdev)
 		goto free_isp;
 	}
 
+	apple_isp_select_hw(isp);
+
 	err = apple_isp_attach_genpd(isp);
 	if (err) {
 		dev_err(dev, "failed to attatch power domains\n");
@@ -679,6 +779,7 @@ static int apple_isp_probe(struct platform_device *pdev)
 	}
 
 	mutex_init(&isp->video_lock);
+	apple_isp_firmware_init(isp);
 	spin_lock_init(&isp->buf_lock);
 	init_waitqueue_head(&isp->wait);
 	INIT_LIST_HEAD(&isp->gc);
@@ -757,6 +858,7 @@ static void apple_isp_remove(struct platform_device *pdev)
 
 	apple_isp_remove_video(isp);
 	/* Stop resident firmware before freeing what it may still use. */
+	apple_isp_firmware_flush(isp);
 	apple_isp_firmware_halt(isp);
 	apple_isp_free_video(isp);
 	pm_runtime_disable(isp->dev);
@@ -954,6 +1056,31 @@ static const struct isp_mmio_window apple_isp_fw_mmio_t8140[] = {
 	{ 0x401660000, 0x4000 },
 };
 
+/*
+ * The windows the boot loader programs into the first ISP DART's address
+ * filter, in its order, as they read back on the J700. The DART is in the
+ * ISP system domain, so they are programmed again after each power-up.
+ */
+static const struct isp_dapf_window apple_isp_dapf_t8140[] = {
+	{ 0x300704000, 0x300704063 },	/* PMGR, ISP power states */
+	{ 0x300730000, 0x300733fff },
+	{ 0x300e3c000, 0x300e3c003 },
+	{ 0x31062c000, 0x310648003 },
+	{ 0x401660000, 0x401660003 },
+	{ 0x220004000, 0x2200162ff },	/* DSID broadcast-clear windows */
+	{ 0x220044000, 0x2200562ff },
+	{ 0x220084000, 0x2200962ff },
+	{ 0x2200c4000, 0x2200d62ff },
+	{ 0x220104000, 0x2201162ff },
+	{ 0x302824000, 0x302824007 },	/* PMP bandwidth scratch */
+	{ 0x3003c0000, 0x3003e4003 },	/* PMGR, with the PMP clock scratch */
+};
+
+/*
+ * The firmware starts again from its data segment as loaded once the
+ * coprocessor was quiesced before the power-down, as T8132's does, so the
+ * ISP is powered only while the camera is in use.
+ */
 static const struct apple_isp_hw apple_isp_hw_t8140 = {
 	.gen = ISP_GEN_T8140,
 	.fw_abi = ISP_FW_ABI_H17,
@@ -981,11 +1108,18 @@ static const struct apple_isp_hw apple_isp_hw_t8140 = {
 	.mbox2_offset = 0x410,
 	.mbox_irq_route = true,
 	.coproc_control = ISP_COPROC_CONTROL_T8140,
+	.coproc_status = ISP_COPROC_STATUS_T8140,
+	.coproc_quiesce = ISP_COPROC_QUIESCE_T8140,
 	.fw_mmio = apple_isp_fw_mmio_t8140,
 	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t8140),
+	.dapf = apple_isp_dapf_t8140,
+	.num_dapf = ARRAY_SIZE(apple_isp_dapf_t8140),
 	.boot_mode = 1,
 	.capture_meta_size = ISP_CAPTURE_META_SIZE_T8140,
-	.resident_fw = true,
+	.fw_restore = true,
+	.deferred_start = true,
+	.resident_fallback = true,
+	.fw_idle_ms = 2000,
 	.meta_exposure = true,
 };
 
@@ -1288,7 +1422,9 @@ static __maybe_unused int apple_isp_suspend(struct device *dev)
 	/*
 	 * Resident firmware stays up, idle, across suspend-to-idle and
 	 * suspend-to-RAM: its domains stay on, see apple_isp_attach_genpd().
+	 * Firmware that starts again and still idles after a stream stops.
 	 */
+	apple_isp_firmware_flush(isp);
 	return 0;
 }
 
@@ -1297,6 +1433,7 @@ static __maybe_unused int apple_isp_freeze(struct device *dev)
 	struct apple_isp *isp = dev_get_drvdata(dev);
 
 	apple_isp_video_suspend(isp);
+	apple_isp_firmware_flush(isp);
 
 	/*
 	 * Hibernation hands the system from one kernel to another, and
@@ -1346,6 +1483,7 @@ static void apple_isp_shutdown(struct platform_device *pdev)
 		return;
 	/* A stream that still runs is stopped cleanly first, as for hibernation */
 	apple_isp_video_suspend(isp);
+	apple_isp_firmware_flush(isp);
 	mutex_lock(&isp->video_lock);
 	apple_isp_firmware_halt(isp);
 	mutex_unlock(&isp->video_lock);

@@ -408,7 +408,8 @@ static int isp_reset_coproc(struct apple_isp *isp)
 
 /*
  * With hw->fw_restore, put the firmware memory back as the boot loader left
- * it: the data segment from its copy, and the main memory above it cleared.
+ * it: the data segment, and a heap the boot loader provides, from their
+ * copies, and the host-backed main memory above the data cleared.
  */
 static void isp_restore_fw_memory(struct apple_isp *isp)
 {
@@ -418,6 +419,8 @@ static void isp_restore_fw_memory(struct apple_isp *isp)
 		return;
 
 	memcpy(isp->fw_data, isp->fw_data_copy, isp->fw_data_size);
+	if (isp->fw_heap)
+		memcpy(isp->fw_heap, isp->fw_heap_copy, isp->fw_heap_size);
 	if (tail)
 		for (u32 i = 0; i < tail->num_pages; i++)
 			clear_highpage(tail->pages[i]);
@@ -1070,6 +1073,7 @@ static int isp_firmware_boot(struct apple_isp *isp)
 
 	/* The old coprocessor stopped and all channel slots were initialized. */
 	WRITE_ONCE(isp->ipc_error, 0);
+	WRITE_ONCE(isp->ipc_quiescing, false);
 
 	err = isp_enable_irq(isp);
 	if (err < 0) {
@@ -1130,8 +1134,12 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
 	case ISP_FW_OFF:
 		break;
 	case ISP_FW_RUNNING:
-		/* Resident firmware keeps running between streams. */
-		return READ_ONCE(isp->ipc_error);
+		/* Resident or idling firmware keeps running between streams. */
+		err = READ_ONCE(isp->ipc_error);
+		if (err)
+			return err;
+		isp->fw_idle = false;
+		return 0;
 	case ISP_FW_DEAD:
 		dev_err_ratelimited(isp->dev,
 				    "firmware was stopped and cannot be restarted before the next boot\n");
@@ -1166,16 +1174,18 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
 /* The end of a stream or of the camera detection */
 void apple_isp_firmware_shutdown(struct apple_isp *isp)
 {
-	if (!isp->hw->resident_fw || READ_ONCE(isp->ipc_error)) {
+	if ((!isp->hw->resident_fw && !isp->hw->fw_idle_ms) ||
+	    READ_ONCE(isp->ipc_error)) {
 		apple_isp_firmware_halt(isp);
 		return;
 	}
 
 	/*
-	 * Resident firmware keeps running, so the surfaces it allocated for
-	 * the stream and freed again are not collected by a firmware stop.
-	 * The stream has stopped, so free them now: wait for the interrupt
-	 * thread to finish the free requests the firmware has already sent.
+	 * Resident or idling firmware keeps running, so the surfaces it
+	 * allocated for the stream and freed again are not collected by a
+	 * firmware stop. The stream has stopped, so free them now: wait for
+	 * the interrupt thread to finish the free requests the firmware has
+	 * already sent.
 	 */
 	if (isp->fw_state != ISP_FW_RUNNING)
 		return;
@@ -1191,6 +1201,42 @@ void apple_isp_firmware_shutdown(struct apple_isp *isp)
 	isp_free_released_surfaces(isp);
 	WRITE_ONCE(isp->ipc_quiescing, false);
 	enable_irq(isp->irq);
+
+	/* Not on isp->wq: the stop flushes that. */
+	if (isp->hw->fw_idle_ms && isp->fw_state == ISP_FW_RUNNING) {
+		isp->fw_idle = true;
+		mod_delayed_work(system_unbound_wq, &isp->fw_idle_work,
+				 msecs_to_jiffies(isp->hw->fw_idle_ms));
+	}
+}
+
+static void apple_isp_fw_idle_work(struct work_struct *work)
+{
+	struct apple_isp *isp = container_of(to_delayed_work(work),
+					     struct apple_isp, fw_idle_work);
+
+	mutex_lock(&isp->video_lock);
+	if (isp->fw_idle)
+		apple_isp_firmware_halt(isp);
+	mutex_unlock(&isp->video_lock);
+}
+
+void apple_isp_firmware_init(struct apple_isp *isp)
+{
+	INIT_DELAYED_WORK(&isp->fw_idle_work, apple_isp_fw_idle_work);
+}
+
+/* Stop idling firmware now, and wait for a stop that was due. */
+void apple_isp_firmware_flush(struct apple_isp *isp)
+{
+	if (!isp->hw->fw_idle_ms)
+		return;
+
+	cancel_delayed_work_sync(&isp->fw_idle_work);
+	mutex_lock(&isp->video_lock);
+	if (isp->fw_idle)
+		apple_isp_firmware_halt(isp);
+	mutex_unlock(&isp->video_lock);
 }
 
 /* Stop the firmware; resident firmware cannot be started again. */
@@ -1205,5 +1251,6 @@ void apple_isp_firmware_halt(struct apple_isp *isp)
 	isp_firmware_shutdown(isp);
 	pm_runtime_put_sync(isp->dev);
 	isp->ipc_stale = NULL;
+	isp->fw_idle = false;
 	isp->fw_state = isp->hw->resident_fw ? ISP_FW_DEAD : ISP_FW_OFF;
 }

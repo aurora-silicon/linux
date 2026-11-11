@@ -1973,6 +1973,15 @@ static void atcphy_setup_pipehandler(struct apple_atcphy *atcphy)
 		      PIPEHANDLER_T8132_USB2_CONFIG_EN);
 		atcphy_pipehandler_set_mux(atcphy, PIPEHANDLER_MUX_CTRL_DATA_DUMMY,
 					   PIPEHANDLER_MUX_CTRL_CLK_DUMMY);
+		/*
+		 * As on T8122, the PIPE lock that starts the routing to USB3
+		 * is only acknowledged with the dummy PHY enabled. The boot
+		 * firmware leaves it set on the ports it brought up, but not
+		 * on every SuperSpeed port: on the J604, ATC3 comes up with it
+		 * clear and its first USB3 start times out.
+		 */
+		if (atcphy->t8132_ss)
+			atcphy_enable_dummy_phy(atcphy);
 		atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
 		atcphy->pipe_pending = false;
 		return;

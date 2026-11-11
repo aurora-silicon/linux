@@ -478,7 +478,8 @@ static void fabric_scenario_test(struct kunit *test)
 		KUNIT_EXPECT_PTR_EQ(test, found, NULL);
 		KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_request(f.port, 3, 0, &found), -ENODEV);
 		KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_request(f.port, 0, 0, &found), -EINVAL);
-		KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_request(f.port, 1, 2, &found), -EINVAL);
+		KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_request(f.port, 1, DCP_FABRIC_DPIN_MAX,
+								&found), -EINVAL);
 		break;
 	}
 }

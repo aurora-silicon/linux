@@ -104,7 +104,7 @@ struct ane_fw_backend {
 	u32 sys_off_pmgr, sys_on_pmgr;
 	u64 sys_off_at, sys_off_ns;
 	struct ane_fw_cold_state cold;
-	u64 ranges[ANE_FW_DAPF_RANGES * 2];
+	u64 ranges[ANE_FW_DAPF_MAX * 2];
 	u64 next_dva;
 	enum ane_fw_stage stage;
 	bool retained;
@@ -215,9 +215,9 @@ static void ane_fw_snapshot_pmgr(struct ane_fw_backend *b)
 {
 	struct ane_fw_cold_state *s = &b->cold;
 
-	s->sys = ane_rd32(b, b->pmgr + 0x290);
-	s->cpu = ane_rd32(b, b->pmgr + 0xc000);
-	s->subblock = ane_rd32(b, b->pmgr + 0xc008);
+	s->sys = ane_rd32(b, b->pmgr + b->soc->pmgr_sys);
+	s->cpu = ane_rd32(b, b->pmgr + b->soc->pmgr_cpu);
+	s->subblock = ane_rd32(b, b->pmgr + b->soc->pmgr_subblock);
 	dev_info(&b->pdev->dev, "U2 ANE_SYS=%#x CPU_PS=%#x subblock=%#x\n",
 		 s->sys, s->cpu, s->subblock);
 }
@@ -265,7 +265,7 @@ static void ane_fw_snapshot_engine(struct ane_fw_backend *b)
 				dev_info(dev, "U2 DART%u stream enable word %u=%#x\n", i, j,
 					 s->dart[i].enabled[j]);
 	}
-	for (i = 0; i < ANE_FW_DAPF_RANGES; i++) {
+	for (i = 0; i < b->soc->dapf_count; i++) {
 		void __iomem *r = b->engine + 0x1810000 + i * 0x40;
 
 		dev_info(dev, "U2 DAPF%u flags=%#x start=%#llx end=%#llx enable=%#x\n",
@@ -506,7 +506,6 @@ static int ane_fw_suspend_firmware(struct ane_fw_backend *b)
 	return ret;
 }
 
-static const u8 ane_fw_text_pin[SHA256_DIGEST_SIZE];
 static int ane_fw_boot(struct ane_fw_backend *b);
 static int ane_fw_startup(struct ane_fw_backend *b);
 static int ane_fw_rvbar_ready(struct ane_fw_backend *b);
@@ -514,19 +513,20 @@ static int ane_fw_rvbar_ready(struct ane_fw_backend *b);
 /* Reverse of the proven power-up: sub-block, PWGATE, CPU, then ANE_SYS. */
 static int ane_fw_power_down(struct ane_fw_backend *b)
 {
+	void __iomem *cpu = b->pmgr + b->soc->pmgr_cpu, *sub = b->pmgr + b->soc->pmgr_subblock;
 	u32 sys;
 	int ret;
 
-	ane_wr32(b, ane_rd32(b, b->pmgr + 0xc008) & ~0xf, b->pmgr + 0xc008);
-	ret = ane_poll32(b, b->pmgr + 0xc008, 0xf0, 0, 1, 100000);
+	ane_wr32(b, ane_rd32(b, sub) & ~0xf, sub);
+	ret = ane_poll32(b, sub, 0xf0, 0, 1, 100000);
 	if (ret)
 		return ret;
 	ane_wr32(b, 3, b->gate + 0xc);
 	ret = ane_poll32(b, b->gate + 0xc, 3, 3, 1, 100000);
 	if (ret)
 		return ret;
-	ane_wr32(b, ane_rd32(b, b->pmgr + 0xc000) & ~0xf, b->pmgr + 0xc000);
-	ret = ane_poll32(b, b->pmgr + 0xc000, 0xf0, 0, 1, 100000);
+	ane_wr32(b, ane_rd32(b, cpu) & ~0xf, cpu);
+	ret = ane_poll32(b, cpu, 0xf0, 0, 1, 100000);
 	if (ret)
 		return ret;
 	/* No engine or DART access from here until ANE_SYS is back on. */
@@ -537,7 +537,7 @@ static int ane_fw_power_down(struct ane_fw_backend *b)
 	 * PMGR reads are safe in any power state. ANE_SYS's actual state
 	 * (bits 7:4) reads 0 once genpd has really turned the domain off.
 	 */
-	sys = ane_rd32(b, b->pmgr + 0x290);
+	sys = ane_rd32(b, b->pmgr + b->soc->pmgr_sys);
 	/*
 	 * Here only requested: while other devices of the domain (the ANE
 	 * DARTs) are active, genpd turns it off in the noirq phase of the
@@ -644,7 +644,7 @@ static int ane_fw_reload_segment(struct ane_fw_backend *b, unsigned int i)
 	memunmap(source);
 	dma_wmb();
 	sha256(s->cpu, s->size, digest);
-	return memcmp(digest, i ? b->data_digest : ane_fw_text_pin, sizeof(digest)) ?
+	return memcmp(digest, i ? b->data_digest : b->soc->text_pin, sizeof(digest)) ?
 	       -EKEYREJECTED : 0;
 }
 
@@ -680,10 +680,10 @@ static int ane_fw_cold_cycle_boot(struct ane_fw_backend *b)
 	 * an always-on block.
 	 */
 	dev_info(dev, "H17 ANE: cold cycle finds the engine %s after ANE_SYS %s (status %#x, DAPF0 %#x)\n",
-		 ane_fw_cold_engine_valid(&b->cold) ? "at its reset values" :
+		 ane_fw_cold_engine_valid(&b->cold, b->soc) ? "at its reset values" :
 		 "with registers kept", b->sys_offs ? "really went off" : "stayed on",
 		 b->cold.status, ane_rd32(b, b->engine + 0x1810000));
-	if (!ane_fw_cold_engine_restartable(&b->cold))
+	if (!ane_fw_cold_engine_restartable(&b->cold, b->soc))
 		return -EPERM;
 	ret = ane_fw_rvbar_ready(b);
 	if (ret)
@@ -812,11 +812,11 @@ static int ane_fw_genpd_event(struct notifier_block *nb, unsigned long action, v
 
 	if (action == GENPD_NOTIFY_OFF) {
 		b->sys_offs++;
-		b->sys_off_pmgr = ane_rd32(b, b->pmgr + 0x290);
+		b->sys_off_pmgr = ane_rd32(b, b->pmgr + b->soc->pmgr_sys);
 		b->sys_off_at = now;
 	} else if (action == GENPD_NOTIFY_ON) {
 		b->sys_ons++;
-		b->sys_on_pmgr = ane_rd32(b, b->pmgr + 0x290);
+		b->sys_on_pmgr = ane_rd32(b, b->pmgr + b->soc->pmgr_sys);
 		if (b->sys_off_at)
 			b->sys_off_ns += now - b->sys_off_at;
 		b->sys_off_at = 0;
@@ -1106,6 +1106,7 @@ static int ane_fw_power(struct ane_fw_backend *b, bool raw_boot)
  */
 static int ane_fw_power_up(struct ane_fw_backend *b, bool raw_boot, bool cold_engine)
 {
+	void __iomem *cpu = b->pmgr + b->soc->pmgr_cpu, *sub = b->pmgr + b->soc->pmgr_subblock;
 	struct device *dev = &b->pdev->dev;
 	u64 ce;
 	int ret;
@@ -1117,7 +1118,7 @@ static int ane_fw_power_up(struct ane_fw_backend *b, bool raw_boot, bool cold_en
 			return ret;
 		b->power_ref = true;
 	}
-	if ((ane_rd32(b, b->pmgr + 0x290) & 0xff) != 0xff)
+	if ((ane_rd32(b, b->pmgr + b->soc->pmgr_sys) & 0xff) != 0xff)
 		return -EIO;
 	/* The child state may not have moved since the probe stage. */
 	ane_fw_snapshot_pmgr(b);
@@ -1126,16 +1127,16 @@ static int ane_fw_power_up(struct ane_fw_backend *b, bool raw_boot, bool cold_en
 		dev_info(dev, "H17 ANE: child power or gate not in the cold state; refusing\n");
 		return -EPERM;
 	}
-	ane_wr32(b, ane_rd32(b, b->pmgr + 0xc000) | 0xf, b->pmgr + 0xc000);
-	ret = ane_poll32(b, b->pmgr + 0xc000, 0xff, 0xff, 1, 100000);
+	ane_wr32(b, ane_rd32(b, cpu) | 0xf, cpu);
+	ret = ane_poll32(b, cpu, 0xff, 0xff, 1, 100000);
 	if (ret)
 		return ret;
 	ane_wr32(b, 0, b->gate + 0xc);
 	ret = ane_poll32(b, b->gate + 0xc, 3, 0, 1, 100000);
 	if (ret)
 		return ret;
-	ane_wr32(b, ane_rd32(b, b->pmgr + 0xc008) | 0xf, b->pmgr + 0xc008);
-	ret = ane_poll32(b, b->pmgr + 0xc008, 0xff, 0xff, 1, 100000);
+	ane_wr32(b, ane_rd32(b, sub) | 0xf, sub);
+	ret = ane_poll32(b, sub, 0xff, 0xff, 1, 100000);
 	if (ret)
 		return ret;
 	ret = ane_poll32(b, b->gate + 0x30, U32_MAX, 0, 1, 100000);
@@ -1144,7 +1145,7 @@ static int ane_fw_power_up(struct ane_fw_backend *b, bool raw_boot, bool cold_en
 	b->powered = true;
 	ane_fw_snapshot_engine(b);
 	/* A warm resume finds a suspended firmware's state, not reset values. */
-	if (cold_engine && !ane_fw_cold_engine_valid(&b->cold)) {
+	if (cold_engine && !ane_fw_cold_engine_valid(&b->cold, b->soc)) {
 		dev_info(dev, "H17 ANE: engine or DART not in its reset state; refusing\n");
 		return -EPERM;
 	}
@@ -1165,7 +1166,7 @@ static int ane_fw_dapf(struct ane_fw_backend *b)
 {
 	unsigned int i;
 
-	for (i = 0; i < ANE_FW_DAPF_RANGES; i++) {
+	for (i = 0; i < b->soc->dapf_count; i++) {
 		void __iomem *r = b->engine + 0x1810000 + i * 0x40;
 		u64 start = b->ranges[i * 2], end = b->ranges[i * 2 + 1];
 
@@ -1183,17 +1184,6 @@ static int ane_fw_dapf(struct ane_fw_backend *b)
 	}
 	return 0;
 }
-
-/*
- * The measured 26.6.2 H17 TEXT. A different firmware build is refused before
- * anything is powered or written.
- */
-static const u8 ane_fw_text_pin[SHA256_DIGEST_SIZE] = {
-	0xcd, 0xa0, 0x9e, 0xc1, 0xae, 0xe6, 0x8b, 0x88,
-	0xb4, 0x7e, 0xdc, 0x0e, 0xeb, 0xc8, 0x10, 0x45,
-	0x25, 0x32, 0xa8, 0x55, 0x56, 0x3f, 0xbd, 0x65,
-	0x0b, 0x95, 0xe2, 0x84, 0x6c, 0x34, 0x53, 0x10,
-};
 
 /*
  * The loader's preload hand-off. apple,preload-data-sha256 is optional: with
@@ -1264,7 +1254,7 @@ static int ane_fw_preload(struct ane_fw_backend *b)
 		sha256_init(&hash);
 		sha256_update(&hash, snapshots[i].cpu, size[i]);
 		sha256_final(&hash, digest);
-		if (memcmp(digest, i ? data_pin : ane_fw_text_pin, sizeof(digest)))
+		if (memcmp(digest, i ? data_pin : b->soc->text_pin, sizeof(digest)))
 			return -EKEYREJECTED;
 	}
 	/* Preserve every personalized DATA byte, including the iBoot TLV table. */
@@ -1281,6 +1271,15 @@ static int ane_fw_preload(struct ane_fw_backend *b)
 		dev_info(&b->pdev->dev, "ANE map: firmware heap tail at %#llx bytes %#llx\n",
 			 tail, tail_size);
 	return ret;
+}
+
+/* An earlier DAPF record already covers record i's 16 KiB page. */
+static bool ane_fw_dapf_page_seen(const struct ane_fw_backend *b, unsigned int i)
+{
+	for (unsigned int j = 0; j < i; j++)
+		if (round_down(b->ranges[j * 2], SZ_16K) == round_down(b->ranges[i * 2], SZ_16K))
+			return true;
+	return false;
 }
 
 static int ane_fw_prepare(struct ane_fw_backend *b)
@@ -1317,9 +1316,12 @@ static int ane_fw_prepare(struct ane_fw_backend *b)
 	ret = ane_fw_preload(b);
 	if (ret)
 		return ret;
-	for (i = 0; i < ANE_FW_DAPF_RANGES; i++) {
+	for (i = 0; i < b->soc->dapf_count; i++) {
 		u64 page = round_down(b->ranges[i * 2], SZ_16K);
 
+		/* T6050's first two records share a PMGR page: map it once. */
+		if (ane_fw_dapf_page_seen(b, i))
+			continue;
 		ret = ane_fw_map(b, page, page, SZ_16K, IOMMU_READ | IOMMU_WRITE | IOMMU_MMIO);
 		if (ret)
 			return ret;
@@ -1716,7 +1718,7 @@ static bool ane_fw_handoff_present(struct platform_device *pdev,
 	struct device_node *np = pdev->dev.of_node;
 	struct device_node *chosen __free(device_node) = of_find_node_by_path("/chosen");
 	struct ane_fw_handoff h = {};
-	u8 digest[SHA256_DIGEST_SIZE];
+	u8 digest[SHA256_DIGEST_SIZE] = {};
 	unsigned int i;
 
 	if (chosen)
@@ -1739,7 +1741,7 @@ static bool ane_fw_handoff_present(struct platform_device *pdev,
 		if (text) {
 			sha256(text, h.size[0], digest);
 			memunmap(text);
-			h.text_ok = !memcmp(digest, ane_fw_text_pin, sizeof(digest));
+			h.text_ok = !memcmp(digest, soc->text_pin, sizeof(digest));
 		}
 	}
 	*hp = h;
@@ -1749,6 +1751,9 @@ static bool ane_fw_handoff_present(struct platform_device *pdev,
 		 !h.marker || strcmp(h.marker, ANE_FW_COLD_BOOT_EVIDENCE) ? "raw-boot marker" :
 		 !h.preloaded || !h.regions_ok ? "preload reservations" :
 		 !h.text_ok ? "firmware TEXT pin" : "preload layout");
+	if (h.regions_ok && !h.text_ok)
+		dev_info(&pdev->dev, "H17 ANE: preloaded TEXT sha256 %*phN\n",
+			 (int)sizeof(digest), digest);
 	return false;
 }
 
@@ -1821,7 +1826,7 @@ int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platfor
 	u32 dart_phandles[ANE_FW_DARTS];
 	int ret = -EINVAL;
 
-	if (ane_backend || soc->soc != 0x8140)
+	if (ane_backend || !ane_fw_platform_staged(soc) || soc->dapf_count > ANE_FW_DAPF_MAX)
 		return -EOPNOTSUPP;
 	/* No hand-off (an older loader, a warm boot): leave the engine alone. */
 	if (!ane_fw_handoff_present(pdev, soc, &handoff))
@@ -1849,17 +1854,14 @@ int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platfor
 		    strcmp(name, soc->reg_names[i]))
 			goto fail;
 	}
-	if (of_property_read_u64_array(np, "apple,dapf-ranges", b->ranges,
-				       ARRAY_SIZE(b->ranges)))
+	if (of_property_count_u64_elems(np, "apple,dapf-ranges") != soc->dapf_count * 2 ||
+	    of_property_read_u64_array(np, "apple,dapf-ranges", b->ranges, soc->dapf_count * 2))
 		goto fail;
-	for (i = 0; i < ANE_FW_DAPF_RANGES; i++) {
+	for (i = 0; i < soc->dapf_count; i++) {
 		u64 start = b->ranges[i * 2], end = b->ranges[i * 2 + 1];
 
 		if (start > end || round_down(start, SZ_16K) != round_down(end, SZ_16K))
 			goto fail;
-		for (unsigned int j = 0; j < i; j++)
-			if (round_down(start, SZ_16K) == round_down(b->ranges[j * 2], SZ_16K))
-				goto fail;
 	}
 	if (of_count_phandle_with_args(np, "iommus", "#iommu-cells") != ANE_FW_DARTS)
 		goto fail;
@@ -1870,7 +1872,7 @@ int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platfor
 		if (ret)
 			goto fail;
 		if (args.args_count != 1 || args.args[0] ||
-		    !of_device_is_compatible(args.np, "apple,t8140-ane-dart")) {
+		    !of_device_is_compatible(args.np, soc->dart_compatible)) {
 			of_node_put(args.np);
 			ret = -EINVAL;
 			goto fail;

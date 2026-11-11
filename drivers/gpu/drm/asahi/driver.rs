@@ -547,6 +547,17 @@ impl AsahiPlatformDriver {
     fn probe_m5<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,
     ) -> Result<AsahiPlatformDriverData<'bound>> {
+        // Without aura's 25G76 profile (the macOS 27.0 stub's 26A428 firmware), take the M5
+        // graph's G17 path (J813 bring-up).
+        let has_25g76 = of::chosen().is_some_and(|chosen| {
+            matches!(
+                chosen.get_opt_property::<KVec<u8>>(c"aurora,m5-gpu-firmware-profile"),
+                Ok(Some(_))
+            )
+        });
+        if !has_25g76 {
+            return Self::probe_g17(pdev, regs::G17Resources::new(pdev)?, &hw::t8142::CONFIG);
+        }
         // SAFETY: The M5 UAT has 42 output bits.
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(42)?)? };
         let resources = regs::Resources::new(pdev)?;
