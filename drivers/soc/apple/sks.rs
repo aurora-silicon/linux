@@ -129,8 +129,10 @@ impl SepData {
     }
 
     pub(crate) fn sks_next_seq(&self) -> crate::sks::Sequence {
-        let n = self.sks_seq.load(Relaxed);
-        self.sks_seq.store(n.wrapping_add(1), Relaxed);
+        // One atomic step: concurrent callers build requests outside the
+        // exchange lock, and two requests with the same sequence would defeat
+        // the late-reply bookkeeping of an abandoned one.
+        let n = self.sks_seq.fetch_add(1, Relaxed);
         crate::sks::Sequence::from_counter(n as u8)
     }
 
@@ -1236,12 +1238,15 @@ impl SepData {
                 || guard.captured.len() >= until || remaining == 0 {
                 return;
             }
+            // A reply wait sleeps uninterruptibly: with a signal pending an
+            // interruptible wait returns at once with the time left unchanged,
+            // so this loop would spin until the reply came, or forever.
             match self
                 .sks_wq
-                .wait_interruptible_timeout(&mut guard, remaining)
+                .wait_timeout(&mut guard, remaining)
             {
                 CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
-                CondVarTimeoutResult::Signal { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Signal { .. } => remaining = 0,
                 CondVarTimeoutResult::Timeout => remaining = 0,
             }
         }

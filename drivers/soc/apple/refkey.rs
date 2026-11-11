@@ -291,6 +291,11 @@ impl SepData {
         if !self.sks_ready() {
             return Err(ENODEV);
         }
+        // The identity bag is loaded, used and unloaded under
+        // `key_bag_lock`, as `with_identity_bag` does: /dev/sep-key calls run
+        // concurrently, and an unload here must not end the handle one of
+        // them is using.
+        let _bag = self.key_bag_lock.lock();
         self.with_identity_keybag(|stored| {
             let (handle, _uuid) = self.sks_recover(stored).ok_or(EIO)?;
             self.sks_machine_refkey(handle, stored.secret());
@@ -345,6 +350,8 @@ impl SepData {
             b.extend_from_slice(&mk.blob, GFP_KERNEL)?;
             b
         };
+        // See `ensure_machine_refkey`.
+        let _bag = self.key_bag_lock.lock();
         self.with_identity_keybag(|stored| {
             let (handle, _uuid) = self.sks_recover(stored).ok_or(EIO)?;
             // The first unlock under a changed boot policy rewrites one session
@@ -444,6 +451,8 @@ impl SepData {
             p.extend_from_slice(&mk.pub_raw, GFP_KERNEL)?;
             (b, p)
         };
+        // See `ensure_machine_refkey`.
+        let _bag = self.key_bag_lock.lock();
         let keybag::State::Present(stored) = keybag::read(keybag::Slot::Identity)? else {
             return Err(ENODEV);
         };

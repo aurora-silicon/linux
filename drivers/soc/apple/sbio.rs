@@ -2706,6 +2706,10 @@ impl SepData {
                 evaluation
             }
         };
+        // A /dev/sep-key call owns its evaluation outright: it is deleted
+        // when this goes, on every path out of this run, never kept open
+        // for a later touch, and never shared with /dev/sep-bio.
+        let key_context = key_mode.then(|| crate::key::OwnedContext::new(self, evaluation));
 
         let mut outcome = self.verify_one_image();
         // A retry straight from the capture (no finger in time, partial
@@ -2791,7 +2795,10 @@ impl SepData {
             }
             *self.match_context.lock() = None;
             self.match_scope_gen.store(0, Relaxed);
-            self.close_unlock_evaluation(&evaluation);
+            match key_context {
+                Some(context) => drop(context),
+                None => self.close_unlock_evaluation(&evaluation),
+            }
             if key_mode && matched {
                 self.key_touch_after_close(&evaluation);
             }
@@ -4692,12 +4699,15 @@ impl SepData {
                 drop(guard);
                 return Err(ETIMEDOUT);
             }
+            // A reply wait sleeps uninterruptibly: with a signal pending an
+            // interruptible wait returns at once with the time left unchanged,
+            // so this loop would spin until the reply came, or forever.
             match self
                 .sbio_wq
-                .wait_interruptible_timeout(&mut guard, remaining)
+                .wait_timeout(&mut guard, remaining)
             {
                 CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
-                CondVarTimeoutResult::Signal { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Signal { .. } => remaining = 0,
                 CondVarTimeoutResult::Timeout => remaining = 0,
             }
         }
@@ -4789,12 +4799,15 @@ impl SepData {
                 drop(guard);
                 return Err(ETIMEDOUT);
             }
+            // A reply wait sleeps uninterruptibly: with a signal pending an
+            // interruptible wait returns at once with the time left unchanged,
+            // so this loop would spin until the reply came, or forever.
             match self
                 .sbio_wq
-                .wait_interruptible_timeout(&mut guard, remaining)
+                .wait_timeout(&mut guard, remaining)
             {
                 CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
-                CondVarTimeoutResult::Signal { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Signal { .. } => remaining = 0,
                 CondVarTimeoutResult::Timeout => remaining = 0,
             }
         }
@@ -5286,22 +5299,7 @@ impl SepData {
             bio::IOC_LOCKOUT_STATE => self.write_lockout_state(arg),
             bio::IOC_REARM => {
                 bio::require_admin()?;
-                let mut request: bio::Rearm = kernel::uaccess::UserSlice::new(
-                    kernel::uaccess::UserPtr::from_addr(arg),
-                    core::mem::size_of::<bio::Rearm>(),
-                )
-                .reader()
-                .read()?;
-                let len = request.secret_len as usize;
-                if request.reserved != 0 || len == 0 || len > request.secret.len() {
-                    image::wipe(&mut request.secret);
-                    return Err(EINVAL);
-                }
-                let mut bytes = KVec::new();
-                let copied = bytes.extend_from_slice(&request.secret[..len], GFP_KERNEL);
-                image::wipe(&mut request.secret);
-                copied?;
-                self.rearm_after_password(crate::Secret(bytes))
+                self.rearm_after_password(bio::read_rearm(arg)?)
             }
             bio::IOC_REQUIRE_PASSWORD => {
                 bio::require_admin()?;

@@ -268,6 +268,18 @@ pub(crate) const SELFTEST_UNSEAL_UNSATISFIED: u32 = 22;
 /// kernel log has every enclave status.
 pub(crate) const SELFTEST_UNSEAL_CONTEXT_PROBE: u32 = 24;
 
+/// Whether this kernel has self-test `mode` at all. The modes that run a
+/// second operation in a matched, still open context (20, 21) exist only
+/// in research kernels built with `CONFIG_APPLE_SEP_KEY_RESEARCH`.
+pub(crate) fn selftest_mode_built(mode: u32) -> bool {
+    match mode {
+        SELFTEST_TOUCH_TWO_SIGNATURES | SELFTEST_TOUCH_SIGN_THEN_UNSEAL => {
+            cfg!(CONFIG_APPLE_SEP_KEY_RESEARCH)
+        }
+        _ => true,
+    }
+}
+
 /// Rows of `SELFTEST_UNSEAL_CONTEXT_PROBE`: (name, operation, context).
 /// Context 0 none, 1 a fresh unsatisfied one, 2 the key bag's secret.
 /// Operation `unseal` is SEP_KEY_UNSEAL's own path.
@@ -321,6 +333,169 @@ pub(crate) const IOC_SELFTEST: u32 = _IOWR::<Selftest>(MAGIC, 0x24);
 pub(crate) const IOC_CANCEL: u32 = _IO(MAGIC, 0x25);
 pub(crate) const IOC_SEAL: u32 = _IOWR::<Seal>(MAGIC, 0x26);
 pub(crate) const IOC_UNSEAL: u32 = _IOWR::<Seal>(MAGIC, 0x27);
+
+/// A sealed secret's plaintext never outlives the request that carries it:
+/// `SEAL` brings it in, `UNSEAL` takes it out.
+impl Seal {
+    fn wipe_secret(&mut self) {
+        crate::image::wipe(&mut self.secret);
+    }
+}
+
+impl Drop for Seal {
+    fn drop(&mut self) {
+        self.wipe_secret();
+    }
+}
+
+/// The research self-tests carry passwords in the handle and digest buffers.
+impl Drop for Selftest {
+    fn drop(&mut self) {
+        crate::image::wipe(&mut self.handle);
+        crate::image::wipe(&mut self.digest);
+    }
+}
+
+/// Copies a `T` from userspace straight into a new kernel allocation, so no
+/// copy of a request (some carry secrets) is left on the kernel stack. A
+/// copy that faults part way is wiped before the error returns.
+pub(crate) fn read_user_boxed<T: kernel::transmute::FromBytes>(user: UserPtr) -> Result<KBox<T>> {
+    let size = core::mem::size_of::<T>();
+    let mut b = KBox::<T>::new_uninit(GFP_KERNEL)?;
+    // SAFETY: the allocation is `size` bytes, uniquely owned here, and any
+    // byte value may be written to `MaybeUninit` storage.
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut((*b).as_mut_ptr().cast::<core::mem::MaybeUninit<u8>>(), size)
+    };
+    if let Err(e) = UserSlice::new(user, size).reader().read_raw(bytes) {
+        for byte in bytes.iter_mut() {
+            // SAFETY: a valid, uniquely borrowed byte of the allocation.
+            unsafe { core::ptr::write_volatile(byte.as_mut_ptr(), 0) };
+        }
+        return Err(e);
+    }
+    // SAFETY: every byte was written above, and `T: FromBytes` makes any
+    // bit pattern a valid `T`.
+    Ok(unsafe { b.assume_init() })
+}
+
+fn write_user<T: kernel::transmute::AsBytes>(user: UserPtr, value: &T) -> Result {
+    UserSlice::new(user, core::mem::size_of::<T>()).writer().write(value)
+}
+
+/// A `/dev/sep-key` request, copied in from userspace and checked. Nothing
+/// in it has reached the enclave, and anything malformed was refused before
+/// a touch is asked for.
+pub(crate) enum KeyRequest {
+    Info,
+    Create(KBox<Create>, Policy),
+    Sign(KBox<Sign>),
+    Public(KBox<Public>),
+    Cancel,
+    Seal(KBox<Seal>),
+    Unseal(KBox<Seal>),
+    Selftest(KBox<Selftest>),
+}
+
+/// The enclave record in a request's handle, refused unless it is a ref-key
+/// record (it carries a public point).
+fn checked_record(handle: &[u8; HANDLE_MAX], len: u32) -> Result<(&[u8], u8)> {
+    let (blob, flags) = decode_handle(handle, len)?;
+    SepData::user_key_public(blob)?;
+    Ok((blob, flags))
+}
+
+pub(crate) fn check_create(req: &Create) -> Result<Policy> {
+    if req.reserved != [0; 3] {
+        return Err(EINVAL);
+    }
+    create_policy(req.flags)
+}
+
+pub(crate) fn check_sign(req: &Sign) -> Result<(&[u8], u8)> {
+    if req.flags != 0 {
+        return Err(EINVAL);
+    }
+    checked_record(&req.handle, req.handle_len)
+}
+
+pub(crate) fn check_public(req: &Public) -> Result<&[u8]> {
+    if req.flags != 0 || req.reserved != [0; 3] {
+        return Err(EINVAL);
+    }
+    Ok(checked_record(&req.handle, req.handle_len)?.0)
+}
+
+/// `SEAL` and `UNSEAL` take only keys whose use the enclave gates on a touch.
+fn check_seal_common(req: &Seal) -> Result<(&[u8], u8)> {
+    if req.flags != 0 {
+        return Err(EINVAL);
+    }
+    let (blob, flags) = checked_record(&req.handle, req.handle_len)?;
+    if flags & HANDLE_BIOMETRY == 0 {
+        return Err(EINVAL);
+    }
+    Ok((blob, flags))
+}
+
+pub(crate) fn check_seal(req: &Seal) -> Result<(&[u8], u8, &[u8])> {
+    let (blob, flags) = check_seal_common(req)?;
+    let n = req.secret_len as usize;
+    if n == 0 || n > SECRET_MAX {
+        return Err(EINVAL);
+    }
+    Ok((blob, flags, &req.secret[..n]))
+}
+
+/// The sealed blob must have the shape `SEAL` makes before the caller is
+/// asked to touch the sensor for it.
+pub(crate) fn check_unseal(req: &Seal) -> Result<(&[u8], u8, &[u8])> {
+    let (blob, flags) = check_seal_common(req)?;
+    let n = req.sealed_len as usize;
+    if n == 0 || n > SEALED_MAX {
+        return Err(EINVAL);
+    }
+    let sealed = &req.sealed[..n];
+    crate::refkey_seal::sealed_ephemeral(sealed)?;
+    Ok((blob, flags, sealed))
+}
+
+/// Copies in and checks the request `cmd` at `arg`. This is the whole of
+/// what `/dev/sep-key` does with user memory before it acts.
+pub(crate) fn read_request(cmd: u32, arg: usize) -> Result<KeyRequest> {
+    let user = UserPtr::from_addr(arg);
+    Ok(match cmd {
+        IOC_INFO => KeyRequest::Info,
+        IOC_CANCEL => KeyRequest::Cancel,
+        IOC_CREATE => {
+            let req = read_user_boxed::<Create>(user)?;
+            let policy = check_create(&req)?;
+            KeyRequest::Create(req, policy)
+        }
+        IOC_SIGN => {
+            let req = read_user_boxed::<Sign>(user)?;
+            check_sign(&req)?;
+            KeyRequest::Sign(req)
+        }
+        IOC_PUBLIC => {
+            let req = read_user_boxed::<Public>(user)?;
+            check_public(&req)?;
+            KeyRequest::Public(req)
+        }
+        IOC_SEAL => {
+            let req = read_user_boxed::<Seal>(user)?;
+            check_seal(&req)?;
+            KeyRequest::Seal(req)
+        }
+        IOC_UNSEAL => {
+            let req = read_user_boxed::<Seal>(user)?;
+            check_unseal(&req)?;
+            KeyRequest::Unseal(req)
+        }
+        IOC_SELFTEST => KeyRequest::Selftest(read_user_boxed::<Selftest>(user)?),
+        _ => return Err(ENOTTY),
+    })
+}
 
 pub(crate) fn info() -> Info {
     Info {
@@ -483,31 +658,175 @@ pub(crate) enum TouchOp {
     Unseal,
 }
 
-/// The touch-gated operation a `SIGN` or `UNSEAL` call is waiting for. Lives
-/// only for that call; the verify it runs fills it in.
-pub(crate) struct KeyTouch {
-    blob: KVec<u8>,
+/// The one key operation a touch-gated `SIGN` or `UNSEAL` call may have the
+/// enclave run in the credential context its Touch ID match satisfied.
+///
+/// The enclave does not limit what a matched context authorises: one match
+/// lets any number of operations through until the context is deleted
+/// (measured, self-test 20). The bound is this type. A grant is made only
+/// by [`KeyTouch::new`], once per call, and [`KeyGrant::run`] takes it by
+/// value: an operation that ran, or failed in any way that might have let
+/// the enclave act, consumes it, so nothing is left to run a second
+/// operation with. Only an outright refusal by the enclave (`EKEYREJECTED`:
+/// it performed nothing) hands the grant back, once, for the one retry
+/// the verify makes after it completes the evaluation.
+pub(crate) struct KeyGrant {
     op: TouchOp,
+    blob: KVec<u8>,
     digest: [u8; DIGEST_LEN],
     sealed: KVec<u8>,
-    constraint: KVec<u8>,
-    sign_again_after_delete: bool,
-    /// Self-test only: a second operation in the same matched context.
+    retry: bool,
+}
+
+/// How a [`KeyGrant`] ended.
+pub(crate) enum GrantEnd {
+    /// The operation's result. The grant is gone.
+    Done(Result<crate::Secret>),
+    /// The enclave refused before doing anything; one more attempt in the
+    /// same context may use the grant that comes back.
+    Refused(KeyGrant),
+}
+
+impl KeyGrant {
+    pub(crate) fn op(&self) -> TouchOp {
+        self.op
+    }
+
+    /// Runs the operation through `exec` (the enclave call: operation,
+    /// record, digest, sealed blob). Consumes the grant.
+    pub(crate) fn run(
+        mut self,
+        exec: impl FnOnce(TouchOp, &[u8], &[u8; DIGEST_LEN], &[u8]) -> Result<KVec<u8>>,
+    ) -> GrantEnd {
+        match exec(self.op, &self.blob, &self.digest, &self.sealed) {
+            Err(e) if e == EKEYREJECTED && self.retry => {
+                self.retry = false;
+                GrantEnd::Refused(self)
+            }
+            r => GrantEnd::Done(r.map(crate::Secret)),
+        }
+    }
+}
+
+/// Deletes an enclave credential context.
+pub(crate) trait ContextDelete {
+    fn delete_context(&self, handle: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]);
+}
+
+impl ContextDelete for SepData {
+    fn delete_context(&self, handle: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) {
+        self.close_unlock_evaluation(handle);
+    }
+}
+
+/// A credential context the kernel opened for one operation: deleted when
+/// this is dropped, on every path out of the code that owns it (success,
+/// error, cancel, timeout, signal). Its handle never leaves the kernel.
+pub(crate) struct OwnedContext<'a, D: ContextDelete + ?Sized> {
+    owner: &'a D,
+    handle: [u8; crate::scrd::SCRD_ACM_HANDLE_LEN],
+}
+
+impl<'a, D: ContextDelete + ?Sized> OwnedContext<'a, D> {
+    pub(crate) fn new(owner: &'a D, handle: [u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) -> Self {
+        OwnedContext { owner, handle }
+    }
+
+    pub(crate) fn handle(&self) -> &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN] {
+        &self.handle
+    }
+}
+
+impl<D: ContextDelete + ?Sized> Drop for OwnedContext<'_, D> {
+    fn drop(&mut self) {
+        self.owner.delete_context(&self.handle);
+        crate::image::wipe(&mut self.handle);
+    }
+}
+
+/// Self-test copies of the operation's inputs, for the measurement modes
+/// that act again after the one operation (5 always; 20 and 21 only with
+/// `CONFIG_APPLE_SEP_KEY_RESEARCH`).
+struct Probe {
+    blob: KVec<u8>,
+    digest: [u8; DIGEST_LEN],
+    #[cfg(CONFIG_APPLE_SEP_KEY_RESEARCH)]
+    sealed: KVec<u8>,
+    /// Mode 5: sign once more with the matched context's handle after it
+    /// was deleted (the enclave must refuse).
+    after_delete: bool,
+    /// Modes 20 and 21: a second operation in the same, still open, matched
+    /// context. Not built into production kernels.
+    #[cfg(CONFIG_APPLE_SEP_KEY_RESEARCH)]
     then: Option<TouchOp>,
+}
+
+/// The touch-gated call that is waiting for a match. Lives only for that
+/// call; the verify it runs fills it in.
+pub(crate) struct KeyTouch {
+    op: TouchOp,
+    grant: Option<KeyGrant>,
+    constraint: KVec<u8>,
     outcome: Option<TouchOutcome>,
-    sig: Option<Result<KVec<u8>>>,
+    result: Option<Result<crate::Secret>>,
     status: i32,
-    again: Option<Result<KVec<u8>>>,
+    probe: Option<Probe>,
+    again: Option<Result<crate::Secret>>,
     again_status: i32,
 }
 
 impl KeyTouch {
+    pub(crate) fn new(op: TouchOp, blob: &[u8], digest: &[u8; DIGEST_LEN], sealed: &[u8], constraint: KVec<u8>) -> Result<KeyTouch> {
+        let mut b = KVec::new();
+        b.extend_from_slice(blob, GFP_KERNEL)?;
+        let mut sl = KVec::new();
+        sl.extend_from_slice(sealed, GFP_KERNEL)?;
+        Ok(KeyTouch {
+            op,
+            grant: Some(KeyGrant { op, blob: b, digest: *digest, sealed: sl, retry: true }),
+            constraint,
+            outcome: None,
+            result: None,
+            status: 0,
+            probe: None,
+            again: None,
+            again_status: 0,
+        })
+    }
+
     pub(crate) fn set_outcome(&mut self, outcome: &crate::bio::VerifyOutcome) {
         self.outcome = Some(match outcome {
             crate::bio::VerifyOutcome::Matched(_) => TouchOutcome::Matched,
             crate::bio::VerifyOutcome::NoMatch => TouchOutcome::NoMatch,
             crate::bio::VerifyOutcome::Failed(s) => TouchOutcome::Failed(*s),
         });
+    }
+
+    /// The grant, if the call's one operation has not run yet.
+    pub(crate) fn take_grant(&mut self) -> Option<KeyGrant> {
+        self.grant.take()
+    }
+
+    /// Files what the grant ended with. Returns whether the operation is
+    /// done (the grant is gone for good).
+    pub(crate) fn settle(&mut self, end: GrantEnd, status: i32) -> bool {
+        self.status = status;
+        match end {
+            GrantEnd::Done(r) => {
+                self.result = Some(r);
+                true
+            }
+            GrantEnd::Refused(g) => {
+                self.grant = Some(g);
+                self.result = Some(Err(EKEYREJECTED));
+                false
+            }
+        }
+    }
+
+    /// The operation's output, once it ran.
+    pub(crate) fn into_result(mut self) -> Result<crate::Secret> {
+        self.result.take().ok_or(EIO)?
     }
 }
 
@@ -714,10 +1033,13 @@ impl SepData {
 
     /// Whether the capture a verify is waiting on is still wanted: the
     /// touch-gated signature that owns it, or /dev/sep-bio's live session.
+    /// A touch-gated call runs its capture in the caller's own thread, so a
+    /// signal to the caller (or its death) ends the capture at once.
     pub(crate) fn capture_live(&self) -> bool {
         (self.key_touch_active.load(Relaxed)
             && !self.key_touch_cancel.load(Relaxed)
-            && !self.shutting_down.load(Relaxed))
+            && !self.shutting_down.load(Relaxed)
+            && !kernel::current!().signal_pending())
             || crate::bio::capture_is_live(&self.bio_session.lock(), self.capture_epoch.load(Relaxed))
     }
 
@@ -789,79 +1111,98 @@ impl SepData {
         }
     }
 
-    /// Runs the waiting job in `evaluation`, the context the match just
-    /// satisfied. Called from the verify, at most once with success.
+    /// Runs the waiting call's one operation in `evaluation`, the context
+    /// the match just satisfied. The verify calls this after the match and,
+    /// in case the enclave wanted the completed evaluation, once more after
+    /// it: the second call finds no grant unless the first was refused
+    /// outright, so at most one operation ever runs per match.
     pub(crate) fn key_touch_sign(&self, evaluation: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN], when: &CStr) {
-        let (op, then, blob, digest, sealed) = {
-            let guard = self.key_touch.lock();
-            let Some(job) = guard.as_ref() else {
-                return;
-            };
-            if matches!(job.sig, Some(Ok(_))) {
-                return;
-            }
-            let mut b = KVec::new();
-            let mut d = KVec::new();
-            if b.extend_from_slice(&job.blob, GFP_KERNEL).is_err()
-                || d.extend_from_slice(&job.sealed, GFP_KERNEL).is_err()
-            {
-                return;
-            }
-            (job.op, job.then, b, job.digest, d)
+        let grant = match &mut *self.key_touch.lock() {
+            Some(job) => job.take_grant(),
+            None => None,
         };
-        let r = self.key_touch_op(op, &blob, &digest, &sealed, evaluation);
+        let Some(grant) = grant else {
+            return;
+        };
+        let op = grant.op();
+        let end = grant.run(|op, blob, digest, sealed| self.key_touch_op(op, blob, digest, sealed, evaluation));
         let status = self.last_key_status.load(Relaxed) as i32;
+        let ok = matches!(end, GrantEnd::Done(Ok(_)));
         dev_info!(
             self.dev,
             "sep-key: touch-gated {:?} {}: {} (enclave status {})\n",
             op,
             when,
-            (if r.is_ok() { "done" } else { "refused" }),
+            (if ok { "done" } else { "refused" }),
             status
         );
-        let ok = r.is_ok();
         if let Some(job) = &mut *self.key_touch.lock() {
-            job.sig = Some(r);
-            job.status = status;
+            job.settle(end, status);
         }
-        // Self-test only: a second operation in the context that is still open.
-        if let (true, Some(second)) = (ok, then) {
-            let r2 = self.key_touch_op(second, &blob, &digest, &sealed, evaluation);
-            let status2 = self.last_key_status.load(Relaxed) as i32;
-            dev_info!(
-                self.dev,
-                "sep-key: self-test: second operation ({:?}) in the same matched context: {} (enclave status {})\n",
-                second,
-                (if r2.is_ok() { "DONE" } else { "refused" }),
-                status2
-            );
-            if let Some(job) = &mut *self.key_touch.lock() {
-                if job.again.is_none() {
-                    job.again = Some(r2);
-                    job.again_status = status2;
-                }
+        if ok {
+            self.key_touch_research_second(evaluation);
+        }
+    }
+
+    /// Production kernels: nothing runs after the one operation.
+    #[cfg(not(CONFIG_APPLE_SEP_KEY_RESEARCH))]
+    fn key_touch_research_second(&self, _evaluation: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) {}
+
+    /// Research build only (modes 20 and 21): a second operation in the
+    /// matched context that is still open, to measure what the enclave lets
+    /// through. Production kernels do not contain this.
+    #[cfg(CONFIG_APPLE_SEP_KEY_RESEARCH)]
+    fn key_touch_research_second(&self, evaluation: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) {
+        let (second, blob, digest, sealed) = {
+            let guard = self.key_touch.lock();
+            let Some(Probe { then: Some(second), blob, digest, sealed, .. }) = guard.as_ref().and_then(|j| j.probe.as_ref()) else {
+                return;
+            };
+            let mut b = KVec::new();
+            let mut sl = KVec::new();
+            if b.extend_from_slice(blob, GFP_KERNEL).is_err() || sl.extend_from_slice(sealed, GFP_KERNEL).is_err() {
+                return;
+            }
+            (*second, b, *digest, sl)
+        };
+        let r2 = self.key_touch_op(second, &blob, &digest, &sealed, evaluation).map(crate::Secret);
+        let status2 = self.last_key_status.load(Relaxed) as i32;
+        dev_info!(
+            self.dev,
+            "sep-key: self-test: second operation ({:?}) in the same matched context: {} (enclave status {})\n",
+            second,
+            (if r2.is_ok() { "DONE" } else { "refused" }),
+            status2
+        );
+        if let Some(job) = &mut *self.key_touch.lock() {
+            if job.again.is_none() {
+                job.again = Some(r2);
+                job.again_status = status2;
             }
         }
     }
 
-    /// Self-test only: after the matched context is deleted, sign once more
-    /// with its old handle.
+    /// Self-test only (mode 5): after the matched context is deleted, sign
+    /// once more with its old handle; the enclave must refuse.
     pub(crate) fn key_touch_after_close(&self, evaluation: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) {
         let (blob, digest) = {
             let guard = self.key_touch.lock();
             let Some(job) = guard.as_ref() else {
                 return;
             };
-            if !job.sign_again_after_delete || !matches!(job.sig, Some(Ok(_))) {
+            let Some(probe) = job.probe.as_ref().filter(|p| p.after_delete) else {
+                return;
+            };
+            if !matches!(job.result, Some(Ok(_))) {
                 return;
             }
             let mut b = KVec::new();
-            if b.extend_from_slice(&job.blob, GFP_KERNEL).is_err() {
+            if b.extend_from_slice(&probe.blob, GFP_KERNEL).is_err() {
                 return;
             }
-            (b, job.digest)
+            (b, probe.digest)
         };
-        let r = self.user_key_sign(&blob, &digest, Some(evaluation));
+        let r = self.user_key_sign(&blob, &digest, Some(evaluation)).map(crate::Secret);
         let status = self.last_key_status.load(Relaxed) as i32;
         dev_info!(
             self.dev,
@@ -878,13 +1219,13 @@ impl SepData {
     /// A touch-gated signature: one fresh credential context, one Touch ID
     /// match in it, the signature, and the context deleted, all inside this
     /// call. Waits about a minute for a finger.
-    fn key_sign_with_touch(&self, blob: &[u8], flags: u8, digest: &[u8; DIGEST_LEN], again: bool) -> Result<KeyTouch> {
-        self.key_touch_run(blob, flags, TouchOp::Sign, digest, &[], again, None)
+    fn key_sign_with_touch(&self, blob: &[u8], flags: u8, digest: &[u8; DIGEST_LEN]) -> Result<KeyTouch> {
+        self.key_touch_run(blob, flags, TouchOp::Sign, digest, &[], None)
     }
 
     /// A touch-gated operation (see `key_sign_with_touch`). `CANCEL` ends
-    /// the wait with `ECANCELED`.
-    #[allow(clippy::too_many_arguments)]
+    /// the wait with `ECANCELED`, a signal to the caller (including its
+    /// death) with `EINTR`.
     fn key_touch_run(
         &self,
         blob: &[u8],
@@ -892,31 +1233,16 @@ impl SepData {
         op: TouchOp,
         digest: &[u8; DIGEST_LEN],
         sealed: &[u8],
-        again: bool,
-        then: Option<TouchOp>,
+        probe: Option<Probe>,
     ) -> Result<KeyTouch> {
         let acl = self.key_bio_acl(flags & HANDLE_BIOMETRY_ANY != 0)?;
-        let mut owned = KVec::new();
-        owned.extend_from_slice(blob, GFP_KERNEL)?;
-        let mut owned_sealed = KVec::new();
-        owned_sealed.extend_from_slice(sealed, GFP_KERNEL)?;
+        let mut job = KeyTouch::new(op, blob, digest, sealed, acl.constraint)?;
+        job.probe = probe;
         // Serialises with /dev/sep-bio's enrol and verify work, as they do
-        // with each other.
+        // with each other, and with every other touch-gated call: one job,
+        // one grant, one context at a time.
         let _writer = self.catacomb_writer.lock();
-        *self.key_touch.lock() = Some(KeyTouch {
-            blob: owned,
-            op,
-            digest: *digest,
-            sealed: owned_sealed,
-            constraint: acl.constraint,
-            sign_again_after_delete: again,
-            then,
-            outcome: None,
-            sig: None,
-            status: 0,
-            again: None,
-            again_status: 0,
-        });
+        *self.key_touch.lock() = Some(job);
         self.key_touch_cancel.store(false, Relaxed);
         self.key_touch_active.store(true, Relaxed);
         dev_info!(self.dev, "sep-key: waiting for a Touch ID match ({:?})\n", op);
@@ -928,6 +1254,9 @@ impl SepData {
             if self.key_touch_cancel.load(Relaxed) {
                 break Err(ECANCELED);
             }
+            if kernel::current!().signal_pending() {
+                break Err(EINTR);
+            }
             if !self.capture_begin() {
                 break Err(EAGAIN);
             }
@@ -937,8 +1266,13 @@ impl SepData {
                 Some(job) => job.outcome.take(),
                 None => None,
             };
-            if self.key_touch_cancel.load(Relaxed) && outcome != Some(TouchOutcome::Matched) {
-                break Err(ECANCELED);
+            if outcome != Some(TouchOutcome::Matched) {
+                if self.key_touch_cancel.load(Relaxed) {
+                    break Err(ECANCELED);
+                }
+                if kernel::current!().signal_pending() {
+                    break Err(EINTR);
+                }
             }
             match outcome {
                 Some(TouchOutcome::Matched) => break Ok(()),
@@ -954,13 +1288,14 @@ impl SepData {
         };
         self.key_touch_active.store(false, Relaxed);
         self.key_touch_cancel.store(false, Relaxed);
+        // Whatever is left of the grant goes with the job.
         let job = self.key_touch.lock().take().ok_or(EIO)?;
         dev_info!(
             self.dev,
             "sep-key: touch-gated {:?} ended: {:?}, result {}\n",
             op,
             ended,
-            errno_of(&job.sig)
+            errno_of(&job.result)
         );
         ended?;
         Ok(job)
@@ -1105,8 +1440,9 @@ impl SepData {
             };
             let mut r = [0i32; 8];
             r[5] = self.userbag_lock_phase(user).map(|p| p as i32).unwrap_or(-1);
-            let (stale, _) = self.key_context_for(uid, Some((user.special_handle(), &pw[..len])))?;
-            r[0] = sign(Some(&stale));
+            // Owned: an early return below still deletes it.
+            let stale = OwnedContext::new(self, self.key_context_for(uid, Some((user.special_handle(), &pw[..len])))?.0);
+            r[0] = sign(Some(stale.handle()));
             // Lock for good: the screen lock, then grace-timer fires (as the
             // Mac's kernel sends them) until the store locks the bag, for at
             // most LOCK_WAIT_S. The store sets the grace period itself.
@@ -1135,8 +1471,8 @@ impl SepData {
                 (crate::shim::boottime_ns() - start) / 1_000_000_000
             );
             r[6] = self.userbag_lock_phase(user).map(|p| p as i32).unwrap_or(-1);
-            r[1] = sign(Some(&stale));
-            self.close_unlock_evaluation(&stale);
+            r[1] = sign(Some(stale.handle()));
+            drop(stale);
             r[2] = sign(None);
             let (fresh, v) = self.key_context_for(uid, Some((user.special_handle(), &pw[..len])))?;
             r[3] = if v == 0 { sign(Some(&fresh)) } else { v };
@@ -1326,20 +1662,19 @@ impl SepData {
         for (row, (what, op, ctx_kind)) in UNSEAL_CONTEXT_PROBE_ROWS.iter().enumerate() {
             let ctx = match ctx_kind {
                 0 => None,
-                1 => Some(self.open_unlock_evaluation(user).ok_or(EIO)?),
-                _ => Some(self.passcode_context()?),
+                1 => Some(OwnedContext::new(self, self.open_unlock_evaluation(user).ok_or(EIO)?)),
+                _ => Some(OwnedContext::new(self, self.passcode_context()?)),
             };
             let (eph, z) = crate::refkey_seal::ecdh_probe_pair(&point)?;
             self.last_key_status.store(0, Relaxed);
+            let acm = ctx.as_ref().map(|c| c.handle());
             let r = match *op {
-                b"unseal" => self.user_key_unseal(&blob, &sealed, ctx.as_ref()).map(|v| (0, v)),
-                b"osgn" => self.user_key_raw_op(&blob, op, b"d", &digest, ctx.as_ref()),
-                b"oecd" => self.user_key_raw_op(&blob, op, b"d", &sealed, ctx.as_ref()),
-                _ => self.user_key_raw_op(&blob, op, b"pub", &eph, ctx.as_ref()),
+                b"unseal" => self.user_key_unseal(&blob, &sealed, acm).map(|v| (0, v)),
+                b"osgn" => self.user_key_raw_op(&blob, op, b"d", &digest, acm),
+                b"oecd" => self.user_key_raw_op(&blob, op, b"d", &sealed, acm),
+                _ => self.user_key_raw_op(&blob, op, b"pub", &eph, acm),
             };
-            if let Some(c) = ctx.as_ref() {
-                self.close_unlock_evaluation(c);
-            }
+            drop(ctx);
             let (status, out) = match r {
                 Ok(v) => v,
                 Err(_) => (self.last_key_status.load(Relaxed) as i32, KVec::new()),
@@ -1406,6 +1741,9 @@ impl SepData {
             return Err(EPERM);
         }
         crate::bio::require_admin()?;
+        if !selftest_mode_built(req.mode) {
+            return Err(EOPNOTSUPP);
+        }
         if req.mode == SELFTEST_PRESENCE_PROBE {
             return self.key_presence_probe(req);
         }
@@ -1439,16 +1777,12 @@ impl SepData {
         let (result, status) = match req.mode {
             SELFTEST_NO_CONTEXT => record(self.user_key_sign(&owned, &digest, None), self),
             SELFTEST_UNSATISFIED => {
-                let ctx = self.open_unlock_evaluation(user).ok_or(EIO)?;
-                let r = record(self.user_key_sign(&owned, &digest, Some(&ctx)), self);
-                self.close_unlock_evaluation(&ctx);
-                r
+                let ctx = OwnedContext::new(self, self.open_unlock_evaluation(user).ok_or(EIO)?);
+                record(self.user_key_sign(&owned, &digest, Some(ctx.handle())), self)
             }
             SELFTEST_PASSCODE => {
-                let ctx = self.passcode_context()?;
-                let r = record(self.user_key_sign(&owned, &digest, Some(&ctx)), self);
-                self.close_unlock_evaluation(&ctx);
-                r
+                let ctx = OwnedContext::new(self, self.passcode_context()?);
+                record(self.user_key_sign(&owned, &digest, Some(ctx.handle())), self)
             }
             SELFTEST_DELETED => {
                 let ctx = self.open_unlock_evaluation(user).ok_or(EIO)?;
@@ -1456,38 +1790,57 @@ impl SepData {
                 record(self.user_key_sign(&owned, &digest, Some(&ctx)), self)
             }
             SELFTEST_TOUCH_THEN_DELETED => {
-                let job = self.key_sign_with_touch(&owned, flags, &digest, true)?;
+                let mut b = KVec::new();
+                b.extend_from_slice(&owned, GFP_KERNEL)?;
+                let probe = Probe {
+                    blob: b,
+                    digest,
+                    #[cfg(CONFIG_APPLE_SEP_KEY_RESEARCH)]
+                    sealed: KVec::new(),
+                    after_delete: true,
+                    #[cfg(CONFIG_APPLE_SEP_KEY_RESEARCH)]
+                    then: None,
+                };
+                let job = self.key_touch_run(&owned, flags, TouchOp::Sign, &digest, &[], Some(probe))?;
                 req.result2 = errno_of(&job.again);
                 req.enclave_status2 = job.again_status;
-                (errno_of(&job.sig), job.status)
+                (errno_of(&job.result), job.status)
             }
-            SELFTEST_TOUCH_TWO_SIGNATURES => {
-                let job = self.key_touch_run(&owned, flags, TouchOp::Sign, &digest, &[], false,
-                                             Some(TouchOp::Sign))?;
-                req.result2 = errno_of(&job.again);
-                req.enclave_status2 = job.again_status;
-                (errno_of(&job.sig), job.status)
-            }
-            SELFTEST_TOUCH_SIGN_THEN_UNSEAL => {
-                let sealed = seal_to(&owned, &digest)?;
-                let job = self.key_touch_run(&owned, flags, TouchOp::Sign, &digest, &sealed, false,
-                                             Some(TouchOp::Unseal))?;
+            #[cfg(CONFIG_APPLE_SEP_KEY_RESEARCH)]
+            SELFTEST_TOUCH_TWO_SIGNATURES | SELFTEST_TOUCH_SIGN_THEN_UNSEAL => {
+                let two = req.mode == SELFTEST_TOUCH_TWO_SIGNATURES;
+                let sealed = if two { KVec::new() } else { seal_to(&owned, &digest)? };
+                let mut b = KVec::new();
+                b.extend_from_slice(&owned, GFP_KERNEL)?;
+                let mut sl = KVec::new();
+                sl.extend_from_slice(&sealed, GFP_KERNEL)?;
+                let probe = Probe {
+                    blob: b,
+                    digest,
+                    sealed: sl,
+                    after_delete: false,
+                    then: Some(if two { TouchOp::Sign } else { TouchOp::Unseal }),
+                };
+                let job = self.key_touch_run(&owned, flags, TouchOp::Sign, &digest, &sealed, Some(probe))?;
                 req.result2 = match &job.again {
-                    Some(Ok(secret)) if secret[..] == digest[..] => 0,
-                    Some(Ok(_)) => EIO.to_errno(),
+                    Some(Ok(secret)) if !two && secret[..] == digest[..] => 0,
+                    Some(Ok(_)) if !two => EIO.to_errno(),
                     other => errno_of(other),
                 };
                 req.enclave_status2 = job.again_status;
-                (errno_of(&job.sig), job.status)
+                (errno_of(&job.result), job.status)
             }
+            // The context-reuse measurements are built only into research
+            // kernels (CONFIG_APPLE_SEP_KEY_RESEARCH).
+            #[cfg(not(CONFIG_APPLE_SEP_KEY_RESEARCH))]
+            SELFTEST_TOUCH_TWO_SIGNATURES | SELFTEST_TOUCH_SIGN_THEN_UNSEAL => return Err(EOPNOTSUPP),
             SELFTEST_UNSEAL_UNSATISFIED => {
                 let sealed = seal_to(&owned, &digest)?;
                 let r = record(self.user_key_unseal(&owned, &sealed, None), self);
                 self.last_key_status.store(0, Relaxed);
-                let ctx = self.open_unlock_evaluation(user).ok_or(EIO)?;
+                let ctx = OwnedContext::new(self, self.open_unlock_evaluation(user).ok_or(EIO)?);
                 (req.result2, req.enclave_status2) =
-                    record(self.user_key_unseal(&owned, &sealed, Some(&ctx)), self);
-                self.close_unlock_evaluation(&ctx);
+                    record(self.user_key_unseal(&owned, &sealed, Some(ctx.handle())), self);
                 r
             }
             _ => return Err(EINVAL),
@@ -1509,18 +1862,10 @@ impl SepData {
             return Err(ENODEV);
         }
         let user = UserPtr::from_addr(arg);
-        match cmd {
-            IOC_INFO => UserSlice::new(user, core::mem::size_of::<Info>())
-                .writer()
-                .write(&info()),
-            IOC_CREATE => {
-                let slice = UserSlice::new(user, core::mem::size_of::<Create>());
-                let (mut reader, mut writer) = slice.reader_writer();
-                let mut req: Create = reader.read()?;
-                if req.reserved != [0; 3] {
-                    return Err(EINVAL);
-                }
-                let (acl, flags) = match create_policy(req.flags)? {
+        match read_request(cmd, arg)? {
+            KeyRequest::Info => write_user(user, &info()),
+            KeyRequest::Create(mut req, policy) => {
+                let (acl, flags) = match policy {
                     Policy::None => (None, 0),
                     Policy::BiometryCurrentSet => (Some(self.key_bio_acl(false)?), HANDLE_BIOMETRY),
                     Policy::BiometryAny => (Some(self.key_bio_acl(true)?), HANDLE_BIOMETRY | HANDLE_BIOMETRY_ANY),
@@ -1528,40 +1873,26 @@ impl SepData {
                 let (blob, point) = self.user_key_create(acl.as_ref().map(|a| &a.ed[..]))?;
                 req.handle_len = encode_handle(&blob, flags, &mut req.handle)? as u32;
                 req.public_key = point;
-                writer.write(&req)
+                write_user(user, &*req)
             }
-            IOC_SIGN => {
-                let slice = UserSlice::new(user, core::mem::size_of::<Sign>());
-                let (mut reader, mut writer) = slice.reader_writer();
-                let mut req: Sign = reader.read()?;
-                if req.flags != 0 {
-                    return Err(EINVAL);
-                }
+            KeyRequest::Sign(mut req) => {
                 let sig = {
-                    let (blob, flags) = decode_handle(&req.handle, req.handle_len)?;
+                    let (blob, flags) = check_sign(&req)?;
                     if flags & HANDLE_BIOMETRY != 0 {
                         let digest = req.digest;
-                        let job = self.key_sign_with_touch(blob, flags, &digest, false)?;
-                        job.sig.ok_or(EIO)??
+                        self.key_sign_with_touch(blob, flags, &digest)?.into_result()?
                     } else {
-                        self.user_key_sign(blob, &req.digest, None)?
+                        crate::Secret(self.user_key_sign(blob, &req.digest, None)?)
                     }
                 };
                 put_signature(&sig, &mut req)?;
-                writer.write(&req)
+                write_user(user, &*req)
             }
-            IOC_PUBLIC => {
-                let slice = UserSlice::new(user, core::mem::size_of::<Public>());
-                let (mut reader, mut writer) = slice.reader_writer();
-                let mut req: Public = reader.read()?;
-                if req.flags != 0 || req.reserved != [0; 3] {
-                    return Err(EINVAL);
-                }
-                req.public_key =
-                    SepData::user_key_public(decode_handle(&req.handle, req.handle_len)?.0)?;
-                writer.write(&req)
+            KeyRequest::Public(mut req) => {
+                req.public_key = SepData::user_key_public(check_public(&req)?)?;
+                write_user(user, &*req)
             }
-            IOC_CANCEL => {
+            KeyRequest::Cancel => {
                 // Ends the touch-gated call that is waiting, whoever made it:
                 // like pulling a security key, it can only make a request fail.
                 if self.key_touch_active.load(Relaxed) {
@@ -1570,52 +1901,31 @@ impl SepData {
                 }
                 Ok(())
             }
-            IOC_SEAL | IOC_UNSEAL => {
-                let slice = UserSlice::new(user, core::mem::size_of::<Seal>());
-                let (mut reader, mut writer) = slice.reader_writer();
-                let mut req: Seal = reader.read()?;
-                if req.flags != 0 {
-                    return Err(EINVAL);
-                }
-                let (blob, flags) = decode_handle(&req.handle, req.handle_len)?;
-                // Only for keys whose use the enclave gates on a touch.
-                if flags & HANDLE_BIOMETRY == 0 {
-                    return Err(EINVAL);
-                }
-                if cmd == IOC_SEAL {
-                    let n = req.secret_len as usize;
-                    if n == 0 || n > SECRET_MAX {
-                        return Err(EINVAL);
-                    }
-                    let sealed = seal_to(blob, &req.secret[..n])?;
-                    req.sealed.fill(0);
-                    req.sealed[..sealed.len()].copy_from_slice(&sealed);
-                    req.sealed_len = sealed.len() as u32;
-                } else {
-                    let n = req.sealed_len as usize;
-                    if n == 0 || n > SEALED_MAX {
-                        return Err(EINVAL);
-                    }
-                    let job = self.key_touch_run(blob, flags, TouchOp::Unseal, &[0; DIGEST_LEN],
-                                                 &req.sealed[..n], false, None)?;
-                    let secret = job.sig.ok_or(EIO)??;
-                    let r = put_secret(&secret, &mut req);
-                    let mut secret = secret;
-                    secret.fill(0);
-                    r?;
-                }
-                let r = writer.write(&req);
-                req.secret.fill(0);
-                r
+            KeyRequest::Seal(mut req) => {
+                let sealed = {
+                    let (blob, _, secret) = check_seal(&req)?;
+                    seal_to(blob, secret)?
+                };
+                req.sealed.fill(0);
+                req.sealed[..sealed.len()].copy_from_slice(&sealed);
+                req.sealed_len = sealed.len() as u32;
+                // `req` wipes the plaintext when it drops.
+                write_user(user, &*req)
             }
-            IOC_SELFTEST => {
-                let slice = UserSlice::new(user, core::mem::size_of::<Selftest>());
-                let (mut reader, mut writer) = slice.reader_writer();
-                let mut req: Selftest = reader.read()?;
+            KeyRequest::Unseal(mut req) => {
+                let secret = {
+                    let (blob, flags, sealed) = check_unseal(&req)?;
+                    self.key_touch_run(blob, flags, TouchOp::Unseal, &[0; DIGEST_LEN], sealed, None)?
+                        .into_result()?
+                };
+                put_secret(&secret, &mut req)?;
+                write_user(user, &*req)
+                // `secret` and `req` wipe the plaintext when they drop.
+            }
+            KeyRequest::Selftest(mut req) => {
                 self.key_selftest(&mut req)?;
-                writer.write(&req)
+                write_user(user, &*req)
             }
-            _ => Err(ENOTTY),
         }
     }
 }
@@ -1653,4 +1963,403 @@ unsafe extern "C" fn key_ioctl_trampoline(ctx: *mut c_void, cmd: c_uint, arg: c_
 /// As for `key_open_trampoline`.
 unsafe extern "C" fn key_ready_trampoline(_ctx: *mut c_void) -> c_int {
     0
+}
+
+/// KUnit hook for `sep_ioctl_test.c`: [`read_request`] on user memory the
+/// test maps, so the copy-in of every request is exercised from real user
+/// addresses (unaligned, faulting, truncated) with no hardware.
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[no_mangle]
+pub extern "C" fn sep_kunit_key_read_request(cmd: c_uint, arg: c_ulong) -> c_int {
+    match read_request(cmd, arg as usize) {
+        Ok(_) => 0,
+        Err(e) => e.to_errno(),
+    }
+}
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[::kernel::macros::kunit_tests(apple_sep_key_one_op)]
+mod one_op_tests {
+    use super::*;
+    use core::cell::Cell;
+
+    fn job() -> KeyTouch {
+        KeyTouch::new(TouchOp::Sign, &[1, 2, 3], &[9; DIGEST_LEN], &[], KVec::new()).unwrap()
+    }
+
+    /// What `key_touch_sign` does with the job: take the grant, run it,
+    /// settle. Returns how many times the enclave was asked.
+    fn step(job: &mut KeyTouch, calls: &Cell<u32>, answer: Result<()>) {
+        let Some(grant) = job.take_grant() else {
+            return;
+        };
+        let end = grant.run(|op, blob, digest, _| {
+            // Count only calls that carry the job's own operation and inputs.
+            if op == TouchOp::Sign && blob == [1, 2, 3] && digest == &[9; DIGEST_LEN] {
+                calls.set(calls.get() + 1);
+            }
+            answer.map(|()| {
+                let mut v = KVec::new();
+                v.push(0x30, GFP_KERNEL).unwrap();
+                v
+            })
+        });
+        job.settle(end, 0);
+    }
+
+    // The verify offers the matched context twice (after the match, after
+    // the completed evaluation); one success leaves nothing to run again.
+    #[test]
+    fn a_match_runs_one_operation() {
+        let calls = Cell::new(0);
+        let mut j = job();
+        step(&mut j, &calls, Ok(()));
+        step(&mut j, &calls, Ok(()));
+        step(&mut j, &calls, Ok(()));
+        assert_eq!(calls.get(), 1);
+        assert!(j.take_grant().is_none());
+        assert!(matches!(j.into_result(), Ok(ref s) if s[..] == [0x30]));
+    }
+
+    // An outright refusal (the enclave did nothing) leaves one retry.
+    #[test]
+    fn a_refusal_allows_exactly_one_retry() {
+        let calls = Cell::new(0);
+        let mut j = job();
+        step(&mut j, &calls, Err(EKEYREJECTED));
+        assert!(matches!(j.result, Some(Err(e)) if e == EKEYREJECTED));
+        step(&mut j, &calls, Ok(()));
+        step(&mut j, &calls, Ok(()));
+        assert_eq!(calls.get(), 2);
+        assert!(j.into_result().is_ok());
+
+        let calls = Cell::new(0);
+        let mut j = job();
+        step(&mut j, &calls, Err(EKEYREJECTED));
+        step(&mut j, &calls, Err(EKEYREJECTED));
+        step(&mut j, &calls, Ok(()));
+        assert_eq!(calls.get(), 2);
+        assert!(matches!(j.into_result(), Err(e) if e == EKEYREJECTED));
+    }
+
+    // Any other failure may have let the enclave act (a lost reply): the
+    // grant is gone and nothing is retried.
+    #[test]
+    fn other_failures_consume_the_grant() {
+        for e in [EIO, EINVAL, ENOMEM, EBADMSG, ETIMEDOUT] {
+            let calls = Cell::new(0);
+            let mut j = job();
+            step(&mut j, &calls, Err(e));
+            step(&mut j, &calls, Ok(()));
+            assert_eq!(calls.get(), 1);
+            assert!(matches!(j.into_result(), Err(x) if x == e));
+        }
+    }
+
+    // A job that never ran (no match, cancel, timeout, signal) reports no
+    // result; its grant dies with it.
+    #[test]
+    fn an_unrun_job_has_no_result() {
+        let j = job();
+        assert!(matches!(j.into_result(), Err(e) if e == EIO));
+    }
+
+    struct Deleter {
+        deleted: Cell<u32>,
+        last: Cell<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>,
+    }
+
+    impl ContextDelete for Deleter {
+        fn delete_context(&self, handle: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) {
+            self.deleted.set(self.deleted.get() + 1);
+            self.last.set(*handle);
+        }
+    }
+
+    fn deleter() -> Deleter {
+        Deleter { deleted: Cell::new(0), last: Cell::new([0; crate::scrd::SCRD_ACM_HANDLE_LEN]) }
+    }
+
+    /// An operation owning a context that leaves at step `fail_at` (0: runs
+    /// to the end).
+    fn owning(d: &Deleter, fail_at: u32) -> Result<u32> {
+        let ctx = OwnedContext::new(d, [0xa5; crate::scrd::SCRD_ACM_HANDLE_LEN]);
+        for step in 1..=4 {
+            if step == fail_at {
+                return Err([EINTR, ECANCELED, ETIMEDOUT, ENODEV][step as usize - 1]);
+            }
+            if ctx.handle() != &[0xa5; crate::scrd::SCRD_ACM_HANDLE_LEN] {
+                return Err(EIO);
+            }
+        }
+        Ok(0)
+    }
+
+    // The context is deleted exactly once on success and on each way out
+    // (signal, cancel, timeout, device gone).
+    #[test]
+    fn an_owned_context_is_deleted_on_every_path() {
+        for fail_at in 0..=4 {
+            let d = deleter();
+            let r = owning(&d, fail_at);
+            assert_eq!(r.is_ok(), fail_at == 0);
+            assert_eq!(d.deleted.get(), 1);
+            assert_eq!(d.last.get(), [0xa5; crate::scrd::SCRD_ACM_HANDLE_LEN]);
+        }
+        let d = deleter();
+        let maybe = Some(OwnedContext::new(&d, [1; crate::scrd::SCRD_ACM_HANDLE_LEN]));
+        assert_eq!(d.deleted.get(), 0);
+        drop(maybe);
+        assert_eq!(d.deleted.get(), 1);
+    }
+
+    // Production kernels do not build the reuse measurements.
+    #[test]
+    fn reuse_measurements_are_research_only() {
+        let built = cfg!(CONFIG_APPLE_SEP_KEY_RESEARCH);
+        assert_eq!(selftest_mode_built(SELFTEST_TOUCH_TWO_SIGNATURES), built);
+        assert_eq!(selftest_mode_built(SELFTEST_TOUCH_SIGN_THEN_UNSEAL), built);
+        for mode in [SELFTEST_NO_CONTEXT, SELFTEST_DELETED, SELFTEST_TOUCH_THEN_DELETED, SELFTEST_UNSEAL_UNSATISFIED] {
+            assert!(selftest_mode_built(mode));
+        }
+    }
+}
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[::kernel::macros::kunit_tests(apple_sep_key_fuzz)]
+mod fuzz_tests {
+    use super::*;
+    use kernel::transmute::AsBytes;
+
+    /// A small deterministic generator, so a failure replays.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn fill(&mut self, b: &mut [u8]) {
+            for v in b.iter_mut() {
+                *v = self.next() as u8;
+            }
+        }
+    }
+
+    fn zeroed<T: kernel::transmute::FromBytes>() -> KBox<T> {
+        let b = KBox::<T>::new_uninit(GFP_KERNEL | kernel::alloc::flags::__GFP_ZERO).unwrap();
+        // SAFETY: zero-filled, and any bit pattern is a valid `T`.
+        unsafe { b.assume_init() }
+    }
+
+    /// A ref-key record carrying a public point, as the enclave makes them.
+    fn record() -> KVec<u8> {
+        let mut point = [0x11u8; crate::refkey_seal::POINT_LEN];
+        point[0] = 0x04;
+        let inner = crate::der::encode_refkey_set(&[(b"pub".as_slice(), RV::Octets(&point))]).unwrap();
+        crate::der::encode_refkey_set(&[(b"rk".as_slice(), RV::Der(&inner))]).unwrap()
+    }
+
+    fn handle(flags: u8) -> ([u8; HANDLE_MAX], u32) {
+        let mut h = [0u8; HANDLE_MAX];
+        let n = encode_handle(&record(), flags, &mut h).unwrap();
+        (h, n as u32)
+    }
+
+    fn sealed_blob() -> KVec<u8> {
+        let mut v = KVec::new();
+        v.push(0x04, GFP_KERNEL).unwrap();
+        v.extend_from_slice(&[7; crate::refkey_seal::POINT_LEN - 1 + 16 + 8], GFP_KERNEL).unwrap();
+        v
+    }
+
+    /// Whatever a check accepts must be a well-formed record and handle.
+    fn accepted_handle_is_sound(blob: &[u8], flags: u8, len: u32) -> bool {
+        handle_flags_valid(flags)
+            && blob.len() + HANDLE_HEADER == len as usize
+            && !blob.is_empty()
+            && blob.len() <= BLOB_MAX
+            && SepData::user_key_public(blob).is_ok()
+    }
+
+    #[test]
+    fn valid_requests_pass_the_checks() {
+        assert!(SepData::user_key_public(&record()).is_ok());
+        let mut s = zeroed::<Sign>();
+        (s.handle, s.handle_len) = handle(0);
+        assert!(check_sign(&s).is_ok());
+        let mut p = zeroed::<Public>();
+        (p.handle, p.handle_len) = handle(HANDLE_BIOMETRY);
+        assert!(check_public(&p).is_ok());
+        let mut q = zeroed::<Seal>();
+        (q.handle, q.handle_len) = handle(HANDLE_BIOMETRY | HANDLE_BIOMETRY_ANY);
+        q.secret_len = SECRET_MAX as u32;
+        assert!(check_seal(&q).is_ok());
+        let blob = sealed_blob();
+        q.sealed[..blob.len()].copy_from_slice(&blob);
+        q.sealed_len = blob.len() as u32;
+        assert!(check_unseal(&q).is_ok());
+        let c = zeroed::<Create>();
+        assert_eq!(check_create(&c), Ok(Policy::None));
+    }
+
+    // Every length field at its edges and beyond: refused with EINVAL,
+    // never a panic or an out-of-range slice.
+    #[test]
+    fn lengths_at_and_past_their_bounds() {
+        let (h, n) = handle(HANDLE_BIOMETRY);
+        let mut s = zeroed::<Sign>();
+        s.handle = h;
+        for len in [0, 1, HANDLE_HEADER as u32, n - 1, n + 1, HANDLE_MAX as u32, HANDLE_MAX as u32 + 1, u32::MAX / 2, u32::MAX] {
+            s.handle_len = len;
+            assert_eq!(check_sign(&s).err(), Some(EINVAL));
+        }
+        let mut q = zeroed::<Seal>();
+        (q.handle, q.handle_len) = handle(HANDLE_BIOMETRY);
+        for len in [0, SECRET_MAX as u32 + 1, SEALED_MAX as u32, u32::MAX] {
+            q.secret_len = len;
+            assert_eq!(check_seal(&q).err(), Some(EINVAL));
+        }
+        let blob = sealed_blob();
+        q.sealed[..blob.len()].copy_from_slice(&blob);
+        for len in [0, 1, crate::refkey_seal::POINT_LEN as u32, (crate::refkey_seal::POINT_LEN + 16) as u32, SEALED_MAX as u32 + 1, u32::MAX] {
+            q.sealed_len = len;
+            assert_eq!(check_unseal(&q).err(), Some(EINVAL));
+        }
+        // The blob's own length field disagreeing with the request's.
+        let (mut h, n) = handle(0);
+        h[8] ^= 1;
+        s.handle = h;
+        s.handle_len = n;
+        assert_eq!(check_sign(&s).err(), Some(EINVAL));
+    }
+
+    // Every value of the enum-like fields: only the defined ones pass.
+    #[test]
+    fn out_of_range_flags_and_policies() {
+        let mut c = zeroed::<Create>();
+        for bit in 0..32 {
+            c.flags = 1 << bit;
+            let want = match c.flags {
+                CREATE_BIOMETRY_CURRENT_SET => Ok(Policy::BiometryCurrentSet),
+                CREATE_BIOMETRY_ANY => Ok(Policy::BiometryAny),
+                CREATE_USER_PRESENCE | CREATE_DEVICE_PASSCODE => Err(EOPNOTSUPP),
+                _ => Err(EINVAL),
+            };
+            assert_eq!(check_create(&c), want);
+        }
+        c.flags = CREATE_BIOMETRY_CURRENT_SET | CREATE_BIOMETRY_ANY;
+        assert_eq!(check_create(&c), Err(EINVAL));
+        c.flags = 0;
+        c.reserved = [0, 0, 1];
+        assert_eq!(check_create(&c), Err(EINVAL));
+        let mut s = zeroed::<Sign>();
+        for hf in 0..=255u8 {
+            let (mut h, n) = handle(0);
+            h[5] = hf;
+            s.handle = h;
+            s.handle_len = n;
+            assert_eq!(check_sign(&s).is_ok(), matches!(hf, 0 | 1 | 3));
+        }
+        let (h, n) = handle(0);
+        s.handle = h;
+        s.handle_len = n;
+        s.flags = 1;
+        assert_eq!(check_sign(&s).err(), Some(EINVAL));
+        // SEAL/UNSEAL refuse a key without a biometric list.
+        let mut q = zeroed::<Seal>();
+        (q.handle, q.handle_len) = handle(0);
+        q.secret_len = 1;
+        assert_eq!(check_seal(&q).err(), Some(EINVAL));
+    }
+
+    // Garbage and truncated DER where the record goes: refused, never a
+    // panic. Bytes are mutated from a valid record as well as drawn whole.
+    #[test]
+    fn garbage_records_are_refused_cleanly() {
+        let mut rng = Rng(0x5eb0_5eb0_d00d_f00d);
+        let good = record();
+        let mut s = zeroed::<Sign>();
+        let mut accepted = 0u32;
+        for i in 0..4000 {
+            let mut blob = [0u8; 256];
+            let len = 1 + rng.below(255) as usize;
+            if i % 2 == 0 {
+                rng.fill(&mut blob[..len]);
+            } else {
+                let len = core::cmp::min(len, good.len());
+                blob[..len].copy_from_slice(&good[..len]);
+                for _ in 0..1 + rng.below(4) {
+                    let at = rng.below(len as u64) as usize;
+                    blob[at] = rng.next() as u8;
+                }
+            }
+            let flags = [0u8, 1, 3][rng.below(3) as usize];
+            match encode_handle(&blob[..len], flags, &mut s.handle) {
+                Ok(n) => s.handle_len = n as u32,
+                Err(_) => continue,
+            }
+            if let Ok((b, f)) = check_sign(&s) {
+                accepted += 1;
+                assert!(accepted_handle_is_sound(b, f, s.handle_len));
+            }
+            let _ = crate::refkey_seal::sealed_ephemeral(&blob[..len]);
+        }
+        // Mutation keeps some records valid; most are refused.
+        assert!(accepted < 4000);
+    }
+
+    // Whole requests drawn at random: every check returns, and anything
+    // accepted is sound.
+    #[test]
+    fn random_requests_never_misbehave() {
+        let mut rng = Rng(0x0123_4567_89ab_cdef);
+        for _ in 0..500 {
+            let mut c = zeroed::<Create>();
+            rng.fill((*c).as_bytes_mut());
+            let _ = check_create(&c);
+            let mut s = zeroed::<Sign>();
+            rng.fill((*s).as_bytes_mut());
+            if rng.below(2) == 0 {
+                s.handle_len = rng.below(HANDLE_MAX as u64 + 64) as u32;
+            }
+            if let Ok((b, f)) = check_sign(&s) {
+                assert!(accepted_handle_is_sound(b, f, s.handle_len));
+            }
+            let mut p = zeroed::<Public>();
+            rng.fill((*p).as_bytes_mut());
+            let _ = check_public(&p);
+            let mut q = zeroed::<Seal>();
+            rng.fill((*q).as_bytes_mut());
+            let _ = check_seal(&q);
+            let _ = check_unseal(&q);
+            // A real record with random everything else.
+            (q.handle, q.handle_len) = handle(if rng.below(2) == 0 { 1 } else { 3 });
+            q.secret_len = rng.below(SECRET_MAX as u64 + 4) as u32;
+            q.sealed_len = rng.below(SEALED_MAX as u64 + 4) as u32;
+            if let Ok((_, _, secret)) = check_seal(&q) {
+                assert!((1..=SECRET_MAX).contains(&secret.len()));
+            }
+            if let Ok((_, _, sealed)) = check_unseal(&q) {
+                assert!(sealed.len() > crate::refkey_seal::POINT_LEN + 16 && sealed[0] == 0x04);
+            }
+        }
+    }
+
+    // The plaintext a SEAL or UNSEAL request carries is wiped when the
+    // request goes away (what `Drop for Seal` does).
+    #[test]
+    fn a_seal_request_wipes_its_secret() {
+        let mut q = zeroed::<Seal>();
+        q.secret = [0x77; SECRET_MAX];
+        q.wipe_secret();
+        assert!(q.secret.iter().all(|&b| b == 0));
+    }
 }
