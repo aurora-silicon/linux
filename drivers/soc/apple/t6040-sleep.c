@@ -577,6 +577,8 @@ struct t6040_sleep {
 	void __iomem *mini_ps;	/* 0x508300000: MiniPMGR PS words */
 	void __iomem *aop_ps;	/* MiniPMGR AOP + audio island PS words 0x508304000..0x158 */
 	void __iomem *snap_soc, *snap_east;	/* PS snapshot pages 0x502800000 / 0x502280000 */
+	u32 *ps_saved;				/* each PS word at the commit, see t6040_ps_restore() */
+	bool ps_saved_valid;
 	void __iomem *pmc_probe_io[9];	/* bring-up PMC probe words */
 	u32 aop_left;		/* AOP words left on << 8 | first index left on */
 	void __iomem *cpm_cfg[3];	/* cluster + 0xe50000 (iBoot idle power-down, bring-up) */
@@ -2010,6 +2012,84 @@ static const u32 t6040_ps_snap_pa[] = {
 };
 
 #define T6040_PS_SNAP_WORDS	DIV_ROUND_UP(ARRAY_SIZE(t6040_ps_snap_pa), 32)
+
+/*
+ * The power loss resets every power word, and only the domains a Linux driver owns are
+ * raised again when their devices resume. macOS's PMGR puts each device back as it was;
+ * here the SIO peripheral words (I2C0 .. UART6 in SOC-East) that were fully on at the commit
+ * and came back lower are raised again, parents first (ADT order). On J616s those are what
+ * the boot loader left on and no driver claims: I2C0, SPI0/1/3/4/5 (SPI4 goes to the
+ * internal panel), the UARTs, AES. Nothing else: the commit's snapshot also has the words
+ * the sleep engine and the coprocessors' drivers own (SIO_CPU, PMP, PMS_SRAM, ISP_SYS, the
+ * ATC commons the commit hands to the engine), and those are their owners' to raise.
+ */
+#define T6040_PS_RESTORE_FIRST	0x2280150	/* I2C0 */
+#define T6040_PS_RESTORE_LAST	0x2280228	/* UART6 */
+static bool ps_restore = true;
+module_param(ps_restore, bool, 0644);
+MODULE_PARM_DESC(ps_restore, "After a real sleep raise the SOC power words that were on at the commit and came back lower");
+
+static void __iomem *t6040_ps_snap_addr(struct t6040_sleep *s, unsigned int i)
+{
+	u32 pa = t6040_ps_snap_pa[i];
+	bool soc = (pa >> 16) == 0x0280;
+	void __iomem *b = soc ? s->snap_soc : s->snap_east;
+
+	return b ? b + (pa - (soc ? 0x02800000 : 0x02280000)) : NULL;
+}
+
+static void t6040_ps_save(struct t6040_sleep *s)
+{
+	unsigned int i;
+
+	s->ps_saved_valid = false;
+	if (!s->ps_saved)
+		return;
+	for (i = 0; i < ARRAY_SIZE(t6040_ps_snap_pa); i++) {
+		void __iomem *w = t6040_ps_snap_addr(s, i);
+
+		s->ps_saved[i] = w ? readl(w) : 0;
+	}
+	s->ps_saved_valid = true;
+}
+
+static void t6040_ps_restore(struct t6040_sleep *s)
+{
+	unsigned int i, n, raised = 0, failed = 0;
+	u32 val, cur = 0;
+
+	if (!s->ps_saved_valid || !READ_ONCE(ps_restore))
+		return;
+	s->ps_saved_valid = false;
+	for (i = 0; i < ARRAY_SIZE(t6040_ps_snap_pa); i++) {
+		void __iomem *w = t6040_ps_snap_addr(s, i);
+		u32 saved = s->ps_saved[i];
+
+		if (!w || t6040_ps_snap_pa[i] < T6040_PS_RESTORE_FIRST ||
+		    t6040_ps_snap_pa[i] > T6040_PS_RESTORE_LAST ||
+		    FIELD_GET(PS_TARGET, saved) != 0xf || FIELD_GET(PS_ACTUAL, saved) != 0xf)
+			continue;
+		val = readl(w);
+		if (FIELD_GET(PS_TARGET, val) == 0xf)
+			continue;
+		writel((val & ~PS_TARGET) | FIELD_PREP(PS_TARGET, 0xf), w);
+		/* Timekeeping is still suspended here: count the wait, no ktime. */
+		for (n = 0; n < 1000; n++) {
+			cur = readl(w);
+			if (FIELD_GET(PS_ACTUAL, cur) == 0xf)
+				break;
+			udelay(10);
+		}
+		if (n == 1000)
+			failed++;
+		raised++;
+		pr_info("t6040-sleep: wake: power word %#x: %#x at the commit, %#x after the wake, now %#x\n",
+			t6040_ps_snap_pa[i], saved, val, cur);
+	}
+	if (raised)
+		pr_info("t6040-sleep: wake: %u power word(s) raised again, %u not on\n", raised,
+			failed);
+}
 #define T6040_PS_SNAP_PMU	0xa2c0
 #define T6040_PS_SNAP_MAGIC	0x504e5350	/* "PSNP" in PMU byte order */
 
@@ -4396,6 +4476,7 @@ static int t6040_sleep_commit(unsigned long unused)
 
 	if (READ_ONCE(fab_on))
 		t6040_fabrics_on(s);
+	t6040_ps_save(s);
 	if (READ_ONCE(ps_snap))
 		t6040_ps_snap_store(s);
 	if (READ_ONCE(dcs_rec))
@@ -5828,8 +5909,10 @@ static int t6040_sleep_enter(suspend_state_t state)
 	if (s->returned)
 		t6040_ret_mark(s, 0x41);
 	t6040_wake_restore(s);
-	if (s->returned)
+	if (s->returned) {
 		t6040_ret_mark(s, 0x42);
+		t6040_ps_restore(s);
+	}
 	t6040_disp_back(s);
 	if (s->returned)
 		t6040_ret_mark(s, 0x43);
@@ -6302,6 +6385,8 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 	sleep->mtp_ps = t6040_ioremap_np(&pdev->dev, T6040_MTP_PS_PA, 8 * T6040_MTP_PS_WORDS);
 	sleep->aop_ps = t6040_ioremap_np(&pdev->dev, T6040_AOP_PS_PA, 0x160);
 	sleep->snap_soc = t6040_ioremap_np(&pdev->dev, 0x502800000ULL, 0x9000);
+	sleep->ps_saved = devm_kcalloc(&pdev->dev, ARRAY_SIZE(t6040_ps_snap_pa),
+				       sizeof(*sleep->ps_saved), GFP_KERNEL);
 	sleep->atc_aon = t6040_ioremap_np(&pdev->dev, 0x508320c00ULL, 0x200);
 	for (i = 0; i < 16; i++)
 		sleep->dcs[i] = t6040_ioremap_np(&pdev->dev, 0x220200000ULL +
