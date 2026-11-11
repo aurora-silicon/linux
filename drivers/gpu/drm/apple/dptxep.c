@@ -500,6 +500,7 @@ static int dptxport_call_set_active_lane_count(struct apple_epic_service *servic
 		 * dcp_dptx_connect() waits for this on alt-mode and tunnel
 		 * routes alike: DCP sends no FORCE_HOTPLUG_DETECT for a tunnel.
 		 */
+		WRITE_ONCE(dptx->link_configured, true);
 		complete(&dptx->linkcfg_completion);
 	}
 

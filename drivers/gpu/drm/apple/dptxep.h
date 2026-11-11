@@ -56,6 +56,8 @@ struct apple_epic_service;
 struct dptx_port {
 	struct dcp_dptx_caps caps;
 	bool enabled, connected;
+	/* The firmware set a lane count since the port was connected. */
+	bool link_configured;
 	/* A published session closed; unlike initial discovery, this is terminal. */
 	bool closed;
 	struct completion enable_completion;
