@@ -31,6 +31,9 @@
 		ethernet0 = &ethernet0;
 		gpu = &gpu;
 		aop = &aop;
+		dcp = &dcp;
+		disp0 = &display;
+		disp0-piodma = &disp0_piodma;
 	};
 
 	chosen {
@@ -1050,11 +1053,40 @@
 	memory-region = <&aop_mmio_pmgr>;
 };
 
+/*
+ * iBoot leaves the external display processors running with their firmware
+ * loaded. There is no panel, so the boot loader never hands the internal DCP
+ * over: it hands over each external processor's firmware memory on its own
+ * and then enables the display subsystem (found through the disp0 alias; dcp
+ * has to be there too), and the display gate enables the chains that have
+ * firmware memory.
+ */
+&display {
+	phandle = <&display>;
+};
+
+&disp0_piodma {
+	phandle = <&disp0_piodma>;
+};
+
+#include "t604x-extdisp.dtsi"
+
+/*
+ * Only typec1 carries an external display chain here. ATC3 is the fourth
+ * back Type-C port, not the J616c's HDMI PHY: drop that description, and
+ * t6041-j575c-atc3.dtsi describes the port instead.
+ */
+/delete-node/ &atcphy0_xbar;
+/delete-node/ &atcphy2_xbar;
+/delete-node/ &atcphy3_xbar;
+/delete-node/ &atcphy3;
+/delete-node/ &atcphy3_mbox;
 
 #include "t6041-j575c-atc3.dtsi"
 #include "t6041-j575c-usb3.dtsi"
+#include "t6041-j575c-usbc.dtsi"
 
 /*
- * Not described: HDMI and the external display chains (unknown PHY routing
- * on this board) and the SEP (no Touch ID sensor).
+ * Not described: HDMI (dcpext0 through display-crossbar0 to the lpdptx PHY
+ * and a DP-to-HDMI converter on i2c8) and the SEP (no Touch ID sensor).
  */
