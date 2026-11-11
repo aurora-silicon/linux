@@ -253,8 +253,6 @@ struct apple_nvme {
 	bool sleep_stop;
 	bool sleep_idled;
 	u32 sleep_csts;
-	/* The last sleep's shutdown notification, when it took over 100 ms */
-	u64 sleep_shn_slow_us;
 	/* ANS came back across a sleep, or failed to. reset_work picks these up. */
 	bool sleep_restarted;
 	bool sleep_failed;
@@ -2665,43 +2663,19 @@ out_detach_genpd:
 }
 
 /*
- * A sleep's shutdown notification, with interrupts off, before anything else stops. macOS
- * finds the controller enabled and shut down when it tells the firmware to idle. A failure
- * refuses: the firmware hasn't been told, and resume's controller reset takes it back.
+ * The sleep's last check, with interrupts off: the shutdown notification sent at suspend
+ * (apple_nvme_sleep_send_shn()) has completed. Nothing is written here.
  */
 static int apple_nvme_sleep_shutdown(void *data)
 {
 	struct apple_nvme *anv = data;
-	/* As long as the controller says shutdown takes (RTD3E), as the NVMe core waits. */
-	u64 timeout = max_t(u64, APPLE_ANS_SLEEP_SHN_TIMEOUT,
-			    (u64)anv->ctrl.shutdown_timeout * USEC_PER_SEC);
-	u64 waited = 0;
-	u32 csts;
-	int ret = 0;
+	u32 csts = readl(anv->mmio_nvme + NVME_REG_CSTS);
 
-	anv->ctrl.ctrl_config &= ~NVME_CC_SHN_MASK;
-	anv->ctrl.ctrl_config |= anv->hw->sleep_shn;
-	writel(anv->ctrl.ctrl_config, anv->mmio_nvme + NVME_REG_CC);
-	/* Timekeeping is suspended here: count the wait in its own steps. */
-	for (;;) {
-		csts = readl(anv->mmio_nvme + NVME_REG_CSTS);
-		if ((csts & NVME_CSTS_SHST_MASK) == NVME_CSTS_SHST_CMPLT)
-			break;
-		if (waited >= timeout) {
-			ret = -ETIMEDOUT;
-			break;
-		}
-		udelay(100);
-		waited += 100;
-	}
-	if (ret)
-		dev_err(anv->dev, "shutdown notification failed after %llu us: CSTS %#x\n",
-			waited, csts);
-	else if (waited > 100 * USEC_PER_MSEC)
-		anv->sleep_shn_slow_us = waited;
 	anv->sleep_csts = csts;
-
-	return ret;
+	if ((csts & NVME_CSTS_SHST_MASK) == NVME_CSTS_SHST_CMPLT)
+		return 0;
+	dev_err(anv->dev, "shutdown notification not complete at the commit: CSTS %#x\n", csts);
+	return -EIO;
 }
 
 /*
@@ -2878,11 +2852,6 @@ static int apple_nvme_resume_early(struct device *dev)
 	void __iomem *control = anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL;
 	int ret;
 
-	if (anv->sleep_shn_slow_us) {
-		dev_info(dev, "sleep's shutdown notification took %llu ms\n",
-			 div_u64(anv->sleep_shn_slow_us, USEC_PER_MSEC));
-		anv->sleep_shn_slow_us = 0;
-	}
 
 	if (!anv->hw->needs_ioq_registers || !anv->suspended || !anv->sleep_idled)
 		return 0;
@@ -3027,6 +2996,36 @@ static bool apple_nvme_sleep_wanted(struct apple_nvme *anv)
 	       apple_rtkit_is_running(anv->rtk);
 }
 
+/*
+ * As macOS sends it, from its power-state change during the device suspend: the shutdown
+ * notification, waited for with interrupts on for as long as macOS allows (35 s). The
+ * controller can take seconds to save its context (1.7 s in one macOS sleep). A sleep
+ * refused later finds it shut down, and resume's controller reset takes it back.
+ */
+#define APPLE_ANS_SLEEP_SHN_MACOS_TIMEOUT_US (35 * USEC_PER_SEC)
+
+static int apple_nvme_sleep_send_shn(struct apple_nvme *anv)
+{
+	ktime_t start = ktime_get();
+	u32 csts;
+	s64 us;
+	int ret;
+
+	anv->ctrl.ctrl_config &= ~NVME_CC_SHN_MASK;
+	anv->ctrl.ctrl_config |= anv->hw->sleep_shn;
+	writel(anv->ctrl.ctrl_config, anv->mmio_nvme + NVME_REG_CC);
+	ret = readl_poll_timeout(anv->mmio_nvme + NVME_REG_CSTS, csts,
+				 (csts & NVME_CSTS_SHST_MASK) == NVME_CSTS_SHST_CMPLT,
+				 1000, APPLE_ANS_SLEEP_SHN_MACOS_TIMEOUT_US);
+	us = ktime_us_delta(ktime_get(), start);
+	if (ret)
+		dev_err(anv->dev, "shutdown notification failed after %lld ms: CSTS %#x\n",
+			div_s64(us, USEC_PER_MSEC), csts);
+	else if (us > USEC_PER_SEC)
+		dev_info(anv->dev, "shutdown notification took %lld ms\n", div_s64(us, USEC_PER_MSEC));
+	return ret;
+}
+
 static int apple_nvme_suspend(struct device *dev)
 {
 	struct apple_nvme *anv = dev_get_drvdata(dev);
@@ -3071,6 +3070,13 @@ static int apple_nvme_suspend(struct device *dev)
 			/* Requests are stuck, so bring it back and refuse. */
 			dev_err(dev, "refusing to sleep: NVMe didn't quiesce\n");
 			anv->sleep_failed = false;
+			anv->sleep_stop = false;
+			WRITE_ONCE(anv->suspended, false);
+			nvme_try_sched_reset(&anv->ctrl);
+			return -EIO;
+		}
+		if (anv->sleep_stop && apple_nvme_sleep_send_shn(anv)) {
+			dev_err(dev, "refusing to sleep: NVMe shutdown notification didn't complete\n");
 			anv->sleep_stop = false;
 			WRITE_ONCE(anv->suspended, false);
 			nvme_try_sched_reset(&anv->ctrl);
