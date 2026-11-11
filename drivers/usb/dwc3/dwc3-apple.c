@@ -133,9 +133,9 @@
  *
  * The same steps run when the sleep is refused late or is a dry run. If any of them fails,
  * the host is restarted the old way once the system has resumed, and the devices enumerate
- * again; a core that may be unpowered is left alone until its reset releases. A port in a
- * DisplayPort mode or in USB4/Thunderbolt stops for the sleep as before, and
- * dwc3_apple.typec_sleep_in_place=0 makes every Type-C port do so.
+ * again; a core that may be unpowered is left alone until its reset releases. A port with a
+ * DisplayPort link, or whose four lanes are DisplayPort's, or in USB4/Thunderbolt stops for
+ * the sleep as before, and dwc3_apple.typec_sleep_in_place=0 makes every Type-C port do so.
  *
  * Runtime PM (T6040 and T8132, see dwc3_apple_core_probe()): the glue holds a reference from
  * the reset deassert to the end of the shutdown, so with no cable the controller can

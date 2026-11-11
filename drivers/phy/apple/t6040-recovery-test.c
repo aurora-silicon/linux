@@ -94,7 +94,11 @@ static void t6040_sleep_no_host_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, t6040_can_sleep_in_place(tphy));
 }
 
-/* DisplayPort on the lanes, with any pin assignment, and USB4/Thunderbolt stop the host. */
+/*
+ * DisplayPort's four lanes (pin assignments C and E), a DisplayPort link and
+ * USB4/Thunderbolt stop the host. Pin assignment D without a link does not:
+ * USB2 alone or with USB3, it is a USB port until the DP phy powers on.
+ */
 static void t6040_sleep_other_modes_test(struct kunit *test)
 {
 	struct t6040_usb2_phy *tphy = t6040_sleep_test_phy(test);
@@ -102,12 +106,15 @@ static void t6040_sleep_other_modes_test(struct kunit *test)
 	tphy->dp_alt = true;
 	KUNIT_EXPECT_FALSE(test, t6040_can_sleep_in_place(tphy));
 	tphy->dp_two_lanes = true;
+	KUNIT_EXPECT_TRUE(test, t6040_can_sleep_in_place(tphy));
 	tphy->usb3_up = true;
+	KUNIT_EXPECT_FALSE(test, t6040_can_sleep_in_place(tphy));
 	tphy->pipe_switched = true;
+	KUNIT_EXPECT_TRUE(test, t6040_can_sleep_in_place(tphy));
+	tphy->dp_up = true;
 	KUNIT_EXPECT_FALSE(test, t6040_can_sleep_in_place(tphy));
 	tphy->dp_alt = false;
 	tphy->dp_two_lanes = false;
-	tphy->dp_up = true;
 	KUNIT_EXPECT_FALSE(test, t6040_can_sleep_in_place(tphy));
 	tphy->dp_up = false;
 	KUNIT_EXPECT_TRUE(test, t6040_can_sleep_in_place(tphy));
