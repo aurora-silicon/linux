@@ -1488,6 +1488,16 @@ impl Gpu {
         }
         let m5 = cfg.profile.is_m5();
         if m5 {
+            // The M5 graph builds the InitData layouts the firmware build names. A build that
+            // names none is refused here, before anything is written to the GPU.
+            if variant.m5_layouts.is_none() {
+                dev_err!(
+                    dev.as_ref(),
+                    "No M5 InitData layouts for this GPU firmware build ({:?})\n",
+                    variant.m5_layouts
+                );
+                return Err(ENODEV);
+            }
             let board = cfg.m5.ok_or(EINVAL)?;
             // The M5 layouts are sized for every core slot of the board, fused-off cores
             // included, so the GPU is matched on clusters and slots, not on enabled cores.
@@ -1882,7 +1892,7 @@ impl Gpu {
             .inspect_err(at("root adoption"))?;
         session
             .init
-            .build_m5(dev, &session.uat, id, board)
+            .build_m5(dev, &session.uat, id, board, shared.variant)
             .inspect_err(at("M5 graph"))?;
         session
             .init

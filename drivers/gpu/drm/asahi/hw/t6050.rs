@@ -42,33 +42,90 @@ pub(crate) const CONFIG: Config = Config {
     fabric_bridge: false,
     recovery_slot_keys: None,
     gpu_generation: GpuGen::G17,
-    // The firmware in `fw-text` must be this build. iBoot loads the G17S build of both roles
-    // back to back: the primary's TEXT 0x50000, then the secondary's 0x54000, with the same
-    // entropy records and boot-filled ranges as the M5 Max. The digest is that of the
-    // firmware's TEXT with those ranges zeroed, measured on two J714s boots.
-    firmware: crate::g17::fw::variant::Firmware::Identified(&[crate::g17::fw::variant::Build {
-        os_version: [27, 0, 0],
-        name: "27.0 (26A428), G17S",
-        images: &[
-            crate::fwid::FirmwareBuild {
-                name: "26A428 for T6050 G17S, primary then secondary",
+    // The firmware in `fw-text` must be one of these builds. iBoot loads the G17S build of both
+    // roles back to back: the primary's text at 0x50000 of `fw-text`, then the secondary's at
+    // 0x54000, with the same entropy records and boot-filled ranges as the M5 Max (27.2 and 27.3
+    // move the primary's records by a few bytes). Each digest is that of the firmware's text with
+    // those ranges zeroed, a loaded copy normalizing to it on every boot. Newest first.
+    firmware: crate::g17::fw::variant::Firmware::Identified(&[
+        crate::g17::fw::variant::Build {
+            os_version: [27, 3, 0],
+            name: "27.3 (26C5035r), G17S",
+            images: &[crate::fwid::FirmwareBuild {
+                name: "26C5035r for T6050 G17S, primary then secondary",
                 text_size: 0xa4000,
                 data_size: 0x184000,
-                entropy: &[[0x49e60, 0x49f43], [0x9d918, 0x9d9fb]],
+                entropy: &[[0x49eac, 0x49f8f], [0x9d92c, 0x9da0f]],
                 boot_filled: &[
-                    (0x224, 4), (0x23c, 8), (0x49720, 0x740), (0x49e60, 0x231),
-                    (0x50224, 4), (0x5023c, 8), (0x9d1d8, 0x740), (0x9d918, 0x231),
+                    (0x224, 4),
+                    (0x23c, 8),
+                    (0x4976c, 0x740),
+                    (0x49eac, 0x231),
+                    (0x50224, 4),
+                    (0x5023c, 8),
+                    (0x9d1ec, 0x740),
+                    (0x9d92c, 0x231),
                 ],
                 text_sha256: [
-                    0x85, 0xd0, 0xfd, 0x82, 0x80, 0xf7, 0x24, 0x65, 0x5c, 0xa9, 0xa9, 0x71, 0x7b,
-                    0xc9, 0x1a, 0x8a, 0x5e, 0xf6, 0x09, 0x28, 0xd7, 0x72, 0x00, 0xf6, 0xd5, 0x3b,
-                    0xd0, 0x99, 0xb9, 0x47, 0x39, 0xc6,
+                    0xb5, 0x53, 0x7c, 0x8f, 0x06, 0xbd, 0x19, 0xeb, 0xf0, 0xef, 0xd0, 0xcb, 0xfb,
+                    0x65, 0x52, 0x33, 0x9a, 0x10, 0xd4, 0xaf, 0xc4, 0xed, 0xa9, 0xd2, 0x1c, 0xbe,
+                    0xdc, 0x36, 0x66, 0x76, 0x36, 0x00,
                 ],
-            },
-        ],
-        variant: &crate::g17::fw::variant::V26A428_M5,
-        config: None,
-    }]),
+            }],
+            variant: &crate::g17::fw::variant::V26C5035_M5,
+            config: None,
+        },
+        crate::g17::fw::variant::Build {
+            os_version: [27, 2, 0],
+            name: "27.2 (26B123), G17S",
+            images: &[crate::fwid::FirmwareBuild {
+                name: "26B123 for T6050 G17S, primary then secondary",
+                text_size: 0xa4000,
+                data_size: 0x184000,
+                entropy: &[[0x49ea4, 0x49f87], [0x9d92c, 0x9da0f]],
+                boot_filled: &[
+                    (0x224, 4),
+                    (0x23c, 8),
+                    (0x49764, 0x740),
+                    (0x49ea4, 0x231),
+                    (0x50224, 4),
+                    (0x5023c, 8),
+                    (0x9d1ec, 0x740),
+                    (0x9d92c, 0x231),
+                ],
+                text_sha256: [
+                    0x2b, 0x46, 0x13, 0xc6, 0x2a, 0x8a, 0x00, 0x7f, 0x22, 0xa9, 0x41, 0x01, 0x70,
+                    0x2c, 0x9a, 0xc6, 0xc4, 0xe9, 0x0f, 0x2e, 0x12, 0x3f, 0x3b, 0x36, 0xfb, 0xe6,
+                    0xff, 0xea, 0x91, 0x3f, 0x0f, 0xd9,
+                ],
+            }],
+            variant: &crate::g17::fw::variant::V26B123_M5,
+            config: None,
+        },
+        crate::g17::fw::variant::Build {
+            os_version: [27, 0, 0],
+            name: "27.0 (26A428), G17S",
+            images: &[
+                crate::fwid::FirmwareBuild {
+                    name: "26A428 for T6050 G17S, primary then secondary",
+                    text_size: 0xa4000,
+                    data_size: 0x184000,
+                    entropy: &[[0x49e60, 0x49f43], [0x9d918, 0x9d9fb]],
+                    boot_filled: &[
+                        (0x224, 4), (0x23c, 8), (0x49720, 0x740), (0x49e60, 0x231),
+                        (0x50224, 4), (0x5023c, 8), (0x9d1d8, 0x740), (0x9d918, 0x231),
+                    ],
+                    text_sha256: [
+                        0x85, 0xd0, 0xfd, 0x82, 0x80, 0xf7, 0x24, 0x65, 0x5c, 0xa9, 0xa9, 0x71,
+                        0x7b, 0xc9, 0x1a, 0x8a, 0x5e, 0xf6, 0x09, 0x28, 0xd7, 0x72, 0x00, 0xf6,
+                        0xd5, 0x3b, 0xd0, 0x99, 0xb9, 0x47, 0x39, 0xc6,
+                    ],
+                },
+            ],
+            variant: &crate::g17::fw::variant::V26A428_M5,
+            config: None,
+        },
+    ]),
     // Two clusters of ten cores. The buffers are sized for every core slot of the board, so the
     // board's cluster and slot counts admit the GPU, whichever cores are fused off.
     core_layout: CoreLayout {

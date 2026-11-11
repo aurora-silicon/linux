@@ -172,6 +172,12 @@ impl WorkPublication<'_> {
 /// Session-long storage and mappings. Aliases are released before their backing objects.
 pub(super) struct InitData {
     m5: bool,
+    /// The layout of the M5 graph, once [`InitData::build_m5`] has chosen it.
+    m5_layout: &'static super::fw::m5::initdata::M5Layout,
+    /// Power-policy layout of the M5 firmware build.
+    m5_policy: &'static crate::g17::fw::m5::initdata::M5PolicyMap,
+    /// Status-config layout of the M5 firmware build.
+    m5_status_config: &'static crate::g17::fw::m5::initdata::M5StatusConfigMap,
     outer_credits: Option<Arc<outer_credit::Credits>>,
     // Live publication uses interior writes under the device mutex. This owner is Send but not
     // Sync, so safe host code cannot issue those writes concurrently through shared references.
@@ -284,6 +290,9 @@ impl InitData {
     pub(super) fn new() -> Self {
         Self {
             m5: false,
+            m5_layout: &super::fw::m5::initdata::M5_LAYOUT_26A428,
+            m5_policy: &crate::g17::fw::m5::initdata::M5_26A428_POLICY,
+            m5_status_config: &crate::g17::fw::m5::initdata::M5_26A428_STATUS_CONFIG,
             outer_credits: None,
             _single_publisher: core::marker::PhantomData,
             aliases: KVec::new(),
@@ -1655,17 +1664,17 @@ impl InitData {
     }
 
     fn main_config_offset(&self, role: Role) -> usize {
-        if self.m5 { super::fw::m5::initdata::M5_MAIN_BUNDLE_OFFSETS[role as usize] }
+        if self.m5 { self.m5_layout.shared.main_config[role as usize] }
         else { abi::bundle::MAIN_CONFIG[role as usize] }
     }
 
     fn work_ring_offset(&self, channel: usize) -> usize {
-        if self.m5 { super::fw::m5::initdata::M5_WORK_RING_BUNDLE_OFFSETS[channel] }
+        if self.m5 { super::fw::m5::initdata::work_ring_offsets(&self.m5_layout.shared)[channel] }
         else { abi::work_ring_offset(channel) }
     }
 
     fn state_offset(&self, role: Role) -> usize {
-        if self.m5 { return super::fw::m5::initdata::M5_PRIVATE_STATE_GRIDS[role as usize]; }
+        if self.m5 { return self.m5_layout.private_state_grids()[role as usize]; }
         match role {
             Role::Primary => abi::private::PRIMARY_STATE,
             Role::Secondary => abi::private::SECONDARY_STATE,
@@ -1673,7 +1682,7 @@ impl InitData {
     }
 
     fn status_offset(&self, role: Role) -> usize {
-        if self.m5 { return super::fw::m5::initdata::M5_PRIVATE_STATUS_A[role as usize]; }
+        if self.m5 { return self.m5_layout.private_status_a()[role as usize]; }
         match role {
             Role::Primary => self.status_a,
             Role::Secondary => abi::private::SECONDARY_STATUS_A,
@@ -1770,7 +1779,7 @@ impl InitData {
         next: u32,
     ) -> Result {
         let ring_base = if self.m5 {
-            super::fw::m5::initdata::M5_CONTROL_RING_BUNDLE_OFFSETS[0]
+            self.m5_layout.shared.control_ring[0]
         } else { self.main_config_offset(Role::Primary) + abi::MainConfig::CONTROL_RING };
         let offset = ring_base + (slot as usize).checked_mul(record.len()).ok_or(EINVAL)?;
         let ring = self.object(self.bundle)?.pointer(offset, record.len())?;
@@ -1827,14 +1836,13 @@ impl InitData {
         fence(Ordering::Acquire);
         Ok(self
             .object(self.cluster)?
-            .word(m::M5_PRIVATE_LAYOUT.status_b + m::M5_PROGRESS)?
+            .word(self.m5_layout.private.status_b + m::M5_PROGRESS)?
             .load(Ordering::Relaxed))
     }
 
     fn recovery_state_offset(&self) -> usize {
         if self.m5 {
-            super::fw::m5::initdata::M5_PRIVATE_LAYOUT.status_b
-                + super::fw::m5::initdata::M5_RECOVERY_STATE
+            self.m5_layout.private.status_b + super::fw::m5::initdata::M5_RECOVERY_STATE
         } else { self.status_b + abi::PrimaryStatusB::RECOVERY_STATE }
     }
 
@@ -1842,7 +1850,7 @@ impl InitData {
     fn recovery_view_words<const N: usize>(&self, view: usize, offset: usize) -> Result<[u32; N]> {
         let bundle = self.object(self.bundle)?;
         let extent = if self.m5 {
-            *super::fw::m5::initdata::M5_BUNDLE_VIEW_EXTENTS.get(view).ok_or(EINVAL)?
+            *self.m5_layout.bundle_view_extents().get(view).ok_or(EINVAL)?
         } else {
             *abi::recovery::VIEW_EXTENTS.get(view).ok_or(EINVAL)?
         };
@@ -1851,7 +1859,7 @@ impl InitData {
             Some(views) => (self.object(*views.get(view).ok_or(EINVAL)?)?, 0),
             None if self.m5 => (
                 bundle,
-                *super::fw::m5::initdata::M5_BUNDLE_VIEW_OFFSETS.get(view).ok_or(EINVAL)?,
+                *self.m5_layout.bundle_view_offsets().get(view).ok_or(EINVAL)?,
             ),
             None => (bundle, *abi::bundle::VIEWS.get(view).ok_or(EINVAL)?),
         };
@@ -1879,8 +1887,7 @@ impl super::recovery::Memory for InitData {
     }
     fn fault_sources(&self) -> Result<super::recovery::Sources> {
         let mask_offset = if self.m5 {
-            super::fw::m5::initdata::M5_PRIVATE_LAYOUT.status_b
-                + super::fw::m5::initdata::M5_RECOVERY_SLOT_MASK
+            self.m5_layout.private.status_b + super::fw::m5::initdata::M5_RECOVERY_SLOT_MASK
         } else {
             self.status_b + abi::PrimaryStatusB::RECOVERY_SLOT_MASK
         };
@@ -1927,8 +1934,7 @@ impl super::recovery::Memory for InitData {
         Ok(self
             .object(self.cluster)?
             .word(if self.m5 {
-                super::fw::m5::initdata::M5_PRIVATE_LAYOUT.status_b
-                    + super::fw::m5::initdata::M5_HOST_RECOVERY
+                self.m5_layout.private.status_b + super::fw::m5::initdata::M5_HOST_RECOVERY
             } else {
                 self.status_b + abi::PrimaryStatusB::HOST_RECOVERY
             })?
@@ -1956,7 +1962,7 @@ impl super::recovery::Memory for InitData {
             Some(views) => (self.object(*views.get(4).ok_or(EINVAL)?)?, 0),
             None if self.m5 => (
                 self.object(self.bundle)?,
-                super::fw::m5::initdata::M5_BUNDLE_VIEW_OFFSETS[4],
+                self.m5_layout.bundle_view_offsets()[4],
             ),
             None => (self.object(self.bundle)?, abi::bundle::VIEWS[4]),
         };
@@ -1982,8 +1988,7 @@ impl super::recovery::Memory for InitData {
         }
         let cluster = self.object(self.cluster)?;
         let base = if self.m5 {
-            super::fw::m5::initdata::M5_PRIVATE_LAYOUT.status_b
-                + super::fw::m5::initdata::M5_RECOVERY_INFO
+            self.m5_layout.private.status_b + super::fw::m5::initdata::M5_RECOVERY_INFO
         } else {
             self.status_b + abi::PrimaryStatusB::RECOVERY_INFO
         };
@@ -2016,7 +2021,7 @@ impl InitData {
     pub(super) fn m5_gpu_power_mw(&self) -> Result<u32> {
         if !self.m5 { return Err(EINVAL); }
         Ok(self.object(self.bundle)?
-            .word(super::fw::m5::initdata::M5_SHARED_LAYOUT.policy + super::thermal::POLICY_GPU_POWER)?
+            .word(self.m5_layout.shared.policy + super::thermal::POLICY_GPU_POWER)?
             .load(Ordering::Relaxed))
     }
 
@@ -2025,7 +2030,7 @@ impl InitData {
     pub(super) fn m5_firmware_clamped(&self) -> Result<bool> {
         if !self.m5 { return Err(EINVAL); }
         let block = self.object(self.bundle)?;
-        let base = super::fw::m5::initdata::M5_SHARED_LAYOUT.policy;
+        let base = self.m5_layout.shared.policy;
         let mask = block.word(base + super::thermal::POLICY_LIMITER_MASK)?.load(Ordering::Relaxed);
         let limit = block.word(base + super::thermal::POLICY_LIMITER_LIMIT)?.load(Ordering::Relaxed);
         Ok(super::thermal::is_emergency_clamp(mask, limit))
