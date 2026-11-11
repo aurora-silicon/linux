@@ -378,6 +378,18 @@ unsafe impl kernel::transmute::FromBytes for Seal {}
 unsafe impl kernel::transmute::AsBytes for Selftest {}
 // SAFETY: as above.
 unsafe impl kernel::transmute::FromBytes for Selftest {}
+// SAFETY: as above (`repr(C)`, no padding: the size asserts).
+unsafe impl kernel::transmute::AsBytes for CreateUser {}
+// SAFETY: as above.
+unsafe impl kernel::transmute::FromBytes for CreateUser {}
+// SAFETY: as above (`repr(C)`, no padding: the size asserts).
+unsafe impl kernel::transmute::AsBytes for SignPassword {}
+// SAFETY: as above.
+unsafe impl kernel::transmute::FromBytes for SignPassword {}
+// SAFETY: as above (`repr(C)`, no padding: the size asserts).
+unsafe impl kernel::transmute::AsBytes for UnsealPassword {}
+// SAFETY: as above.
+unsafe impl kernel::transmute::FromBytes for UnsealPassword {}
 
 pub(crate) const IOC_INFO: u32 = _IOR::<Info>(MAGIC, 0x20);
 pub(crate) const IOC_CREATE: u32 = _IOWR::<Create>(MAGIC, 0x21);
