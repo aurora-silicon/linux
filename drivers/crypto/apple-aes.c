@@ -173,14 +173,15 @@ static int apple_sio_aes_push(struct apple_sio_aes *aes, u32 word)
 	return 0;
 }
 
-static int apple_sio_aes_push_be(struct apple_sio_aes *aes, const u8 *buf,
-				 unsigned int len)
+/* Key and IV bytes go into the FIFO as little-endian 32-bit words. */
+static int apple_sio_aes_push_bytes(struct apple_sio_aes *aes, const u8 *buf,
+				    unsigned int len)
 {
 	unsigned int i;
 	int ret;
 
 	for (i = 0; i < len; i += 4) {
-		ret = apple_sio_aes_push(aes, get_unaligned_be32(buf + i));
+		ret = apple_sio_aes_push(aes, get_unaligned_le32(buf + i));
 		if (ret)
 			return ret;
 	}
@@ -242,14 +243,14 @@ static int apple_sio_aes_run(struct apple_sio_aes *aes,
 	      FIELD_PREP(AES_KEY_MODE, rctx->mode);
 	ret = apple_sio_aes_push(aes, cmd);
 	if (!ret)
-		ret = apple_sio_aes_push_be(aes, ctx->key, ctx->keylen);
+		ret = apple_sio_aes_push_bytes(aes, ctx->key, ctx->keylen);
 
 	if (!ret && rctx->mode != AES_MODE_ECB) {
 		cmd = FIELD_PREP(AES_CMD_OPCODE, AES_OP_SET_IV) |
 		      FIELD_PREP(AES_IV_SLOT, 0);
 		ret = apple_sio_aes_push(aes, cmd);
 		if (!ret)
-			ret = apple_sio_aes_push_be(aes, iv, AES_BLOCK_SIZE);
+			ret = apple_sio_aes_push_bytes(aes, iv, AES_BLOCK_SIZE);
 	}
 
 	if (!ret) {
