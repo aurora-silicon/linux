@@ -133,11 +133,13 @@
 };
 
 /*
- * Pin 112 takes an SError when read (as on J716c and J716s), so only the pin a
- * node here names is exposed: 80, PCIe port 0's PERST#.
+ * Pin 112 takes an SError when read (as on J716c and J716s), so only the pins a
+ * node here names are exposed: 80, PCIe port 0's PERST#; 106 and 107, the speaker
+ * amps' interrupt and shutdown line; 134 and 139, the jack codec's interrupt and
+ * reset; 136 and 137, the speaker ID.
  */
 &pinctrl_ap {
-	gpio-reserved-ranges = <0 80>, <81 140>;
+	gpio-reserved-ranges = <0 80>, <81 25>, <108 26>, <135 1>, <138 1>, <140 81>;
 };
 
 /* The keyboard backlight: ADT pwm0/kbd-backlight, channel 0 at 25 kHz */
@@ -440,15 +442,197 @@
 #include "t6050-j714s-display.dtsi"
 
 /*
- * Audio is not brought up: ADT i2c1 has the left sn012776 amplifiers and i2c2 the
- * cs42l84 codec, so both buses stay off.
+ * Sound through the AOP, as on J813: its audio service runs the serializers, the
+ * CS42L84 headphone jack on admac-base-ns TX2/RX2 and the six SN012776 speaker amps
+ * on TX0, their voltage and current sense on RX0 (ADT iop-audio-controller).
+ *
+ * The amps (ADT /arm-io/i2c1/audio-speaker* and /arm-io/i2c3/audio-speaker*) share
+ * one shutdown line, AP pin 107 (function-reset of the first), and one fault
+ * interrupt, pin 106. The ADT's speaker-config gives amp N playback slot N, its
+ * voltage sense in slot 4N and current sense in 4N+2, in the order of the first
+ * amp's speakerN: left woofer 1, right woofer 1, left woofer 2, right woofer 2,
+ * left tweeter, right tweeter. The firmware's speaker frame is 250 BCLKs of 12 MHz
+ * (ADT audio-speaker stream), which the amps' ratio detection rejects.
  */
-&i2c1 {
-	status = "disabled";
+/ {
+	speaker_sdz: regulator-sn012776-sdz {
+		compatible = "regulator-fixed";
+		regulator-name = "sn012776-sdz";
+		gpios = <&pinctrl_ap 107 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
 };
 
+&i2c1 {
+	status = "okay";
+
+	speaker_left_woof1: codec@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 1";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <2>;
+		ti,vmon-slot-no = <0>;
+		ti,bclk-ratio = <250>;
+	};
+
+	speaker_left_woof2: codec@39 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x39>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 2";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <10>;
+		ti,vmon-slot-no = <8>;
+		ti,bclk-ratio = <250>;
+	};
+
+	speaker_left_tweet: codec@3a {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3a>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Tweeter";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <18>;
+		ti,vmon-slot-no = <16>;
+		ti,bclk-ratio = <250>;
+	};
+};
+
+/* The I2C power states have no described parent (SIO), as for i2c1 and i2c2 */
+&ps_i2c3 {
+	/delete-property/ power-domains;
+	status = "okay";
+};
+
+&i2c3 {
+	/* The ADT gives i2c1, i2c2 and i2c3 the same clock-ids (4) */
+	clocks = <&clkref>;
+	status = "okay";
+
+	speaker_right_woof1: codec@3b {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3b>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 1";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <6>;
+		ti,vmon-slot-no = <4>;
+		ti,bclk-ratio = <250>;
+	};
+
+	speaker_right_woof2: codec@3c {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3c>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 2";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <14>;
+		ti,vmon-slot-no = <12>;
+		ti,bclk-ratio = <250>;
+	};
+
+	speaker_right_tweet: codec@3d {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3d>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Tweeter";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <22>;
+		ti,vmon-slot-no = <20>;
+		ti,bclk-ratio = <250>;
+	};
+};
+
+/*
+ * The CS42L84 headphone codec (ADT /arm-io/i2c2/audio-codec-output): its reset line
+ * is AP pin 139, driven high to run the codec, and its interrupt AP pin 134, level
+ * low.
+ */
 &i2c2 {
-	status = "disabled";
+	status = "okay";
+
+	jack_codec: codec@4b {
+		compatible = "cirrus,cs42l84";
+		reg = <0x4b>;
+		reset-gpios = <&pinctrl_ap 139 GPIO_ACTIVE_HIGH>;
+		interrupts-extended = <&pinctrl_ap 134 IRQ_TYPE_LEVEL_LOW>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Jack";
+	};
+};
+
+&admac_base_ns {
+	status = "okay";
+};
+
+&aop_audio {
+	apple,chassis-name = "J714";
+	apple,machine-kind = "MacBook Pro";
+};
+
+/ {
+	sound {
+		compatible = "apple,j714-macaudio", "apple,macaudio";
+		model = "MacBook Pro J714";
+		/* ADT audio-speaker function-speaker-id0 and -id1 */
+		speaker-id-gpios = <&pinctrl_ap 136 GPIO_ACTIVE_HIGH>,
+				   <&pinctrl_ap 137 GPIO_ACTIVE_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&aop_audio 0>;
+			};
+
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+
+		dai-link@1 {
+			reg = <1>;
+			link-name = "Speaker";
+			/*
+			 * Codecs in ADT speaker-config order, so that macaudio gives them
+			 * playback slots 0-5 as macOS does (left channels in slots 0, 2
+			 * and 4, right in 1, 3 and 5). The idle masks are the ADT
+			 * amp-tx-zd-config rows 0 and 1: left woofer 1 drives zeros in the
+			 * right amps' sense slots, right woofer 1 in the left amps'.
+			 */
+			dai-tdm-idle-mode-0 = "zero";
+			dai-tdm-slot-tx-idle-mask-0 = <0xfff0f0f0>;
+			dai-tdm-idle-mode-1 = "zero";
+			dai-tdm-slot-tx-idle-mask-1 = <0xff0f0f0f>;
+
+			cpu {
+				sound-dai = <&aop_audio 3>;
+			};
+
+			codec {
+				sound-dai = <&speaker_left_woof1>, <&speaker_right_woof1>,
+					    <&speaker_left_woof2>, <&speaker_right_woof2>,
+					    <&speaker_left_tweet>, <&speaker_right_tweet>;
+			};
+		};
+	};
 };
 
 /* The AOP, booted through its setup port, with its sensor and audio services. */
