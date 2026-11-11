@@ -917,6 +917,21 @@ struct apple_dcp {
 	/* T6030 HDMI converter service requests, see dcp-hdmi.c */
 	struct dcp_hdmi *hdmi;
 
+	/*
+	 * Interrupts of a Thunderbolt DP tunnel's DP IN adapter, to pass to
+	 * the DPTX port; see apple_dcp_tb_dp_event().
+	 */
+	struct work_struct tb_event_work;
+	/* Serializes event delivery against attachment retirement. */
+	struct mutex tb_event_lock;
+	struct apple_dcp_typec_route *tb_event_route;
+	u64 tb_event_generation;
+	unsigned long tb_events;
+	bool tb_event_hpd;
+	unsigned int tb_irq_hpd_count;
+	unsigned int tb_hpd_count;
+	ktime_t tb_irq_hpd_last;
+
 	/* Kept last: the template instances share the layout above. */
 	struct dcp_desktop_state *desktop;
 	/* Internal panel identity; NULL without an internal panel. */

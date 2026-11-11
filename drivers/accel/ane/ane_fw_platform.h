@@ -77,6 +77,11 @@ struct ane_fw_platform {
 	 * Without either, H16 refuses system sleep.
 	 */
 	bool sleep_cold;
+	/*
+	 * The PMP report of the SoC: the firmware is first released at boot only
+	 * once that PMP runs (see ane_h16_wait_pmp()).
+	 */
+	const char *pmp_report;
 };
 
 /* Pure range check: the boot loader supplies the physical addresses. */
