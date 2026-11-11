@@ -177,7 +177,11 @@ static int apple_actuator_probe(struct hid_device *haptic_hdev, const struct hid
 		return ret;
 	}
 
-	ret = hid_hw_start(haptic_hdev, HID_CONNECT_HIDRAW);
+	/*
+	 * The driver uses the actuator itself, through raw requests, so it
+	 * claims it. hidraw is optional and must not decide the probe.
+	 */
+	ret = hid_hw_start(haptic_hdev, HID_CONNECT_HIDRAW | HID_CONNECT_DRIVER);
 	if (ret) {
 		hid_err(haptic_hdev, "hw start failed\n");
 		return ret;
