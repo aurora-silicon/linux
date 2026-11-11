@@ -41,6 +41,7 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
+#include <linux/phy/apple-atc.h>
 #include <linux/phy/apple-t6040-cio.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
@@ -315,6 +316,15 @@ struct t6040_usb2_phy {
 	bool router_running;	/* the USB4 router runs on this port's CIO link */
 	bool usb3_tunnel_req;	/* the router carries USB3 for the controller */
 	bool cio_flip;
+
+	/* A sleep with the host kept, see apple_t6040_atcphy_sleep_prepare() */
+	bool sleep_armed;	/* taken on by the prepare, until the finish */
+	bool sleep_down;	/* USB2 off and USB3 asleep for it, behind their consumers */
+	bool sleep_reset;	/* the controller held in reset for it, behind its consumer */
+	bool sleep_usb3;	/* USB3 ran when it went down, and comes back with USB2 */
+	bool sleep_waking;	/* in that wake: no power cycle of the PHY's domains */
+	bool sleep_no_keep;	/* a wake of its own failed: the host stops for later sleeps */
+	int sleep_ret;		/* what the wake has come to, for the controller's glue */
 };
 
 static inline void t6040_usb2_mask32(void __iomem *reg, u32 mask, u32 set)
@@ -543,10 +553,12 @@ static int t6040_usb2_power_off(struct phy *phy)
 	if (!tphy->powered)
 		return 0;
 
+	/* Also the stop of a host whose PHY a sleep left down: the sequence only repeats. */
 	ret = t6040_usb2_off_locked(tphy);
 	if (ret)
 		return ret;
 	tphy->powered = false;
+	tphy->sleep_down = false;
 	return 0;
 }
 
@@ -1119,6 +1131,11 @@ static void t6040_usb3_up_locked(struct t6040_usb2_phy *tphy)
 	lockdep_assert_held(&tphy->lock);
 	if (!tphy->usb3_ok || tphy->usb3_up)
 		return;
+	/* Down for a sleep with the host kept: USB3 comes back with the wake, after USB2. */
+	if (tphy->sleep_down) {
+		dev_dbg(tphy->dev, "USB3: the PHY is down for a sleep, not started\n");
+		return;
+	}
 	/* DP mode owns all four lanes; USB3 comes back in t6040_usb3_reclaim_locked(). */
 	if (tphy->dp_up) {
 		dev_dbg(tphy->dev, "USB3: lanes held by DP, USB2 only for now\n");
@@ -1172,7 +1189,11 @@ retry_or_fail:
 	t6040_usb3_shutdown_lanes(tphy);
 	t6040_usb3_firmware_power_down(tphy);
 	t6040_usb3_sleep(tphy);
-	if (t6040_recovery_retry(&tphy->recovery)) {
+	/*
+	 * The retry power-cycles the PHY's domains, which don't go off under a system
+	 * resume: a wake with the host kept leaves it to the host's restart after it.
+	 */
+	if (t6040_recovery_retry(&tphy->recovery) && !tphy->sleep_waking) {
 		cycle = true;
 		goto retry;
 	}
@@ -2963,6 +2984,8 @@ static int t6040_usb2_reset_assert(struct reset_controller_dev *rcdev,
 
 	guard(mutex)(&tphy->lock);
 	t6040_dwc3_reset_hold_locked(tphy);
+	/* From here the reset is its consumer's again, whatever a sleep did with it. */
+	tphy->sleep_reset = false;
 	if (tphy->dwc3_running) {
 		tphy->dwc3_running = false;
 		pm_runtime_put(tphy->dev);
@@ -2988,6 +3011,7 @@ static int t6040_usb2_reset_deassert(struct reset_controller_dev *rcdev,
 	ret = t6040_dwc3_reset_release_locked(tphy);
 	if (ret)
 		return ret;
+	tphy->sleep_reset = false;
 	if (!tphy->dwc3_running) {
 		pm_runtime_get_noresume(tphy->dev);
 		tphy->dwc3_running = true;
@@ -3124,6 +3148,249 @@ static int t6040_usb2_probe(struct platform_device *pdev)
 	provider = devm_of_phy_provider_register(dev, t6040_usb2_xlate);
 	return PTR_ERR_OR_ZERO(provider);
 }
+
+/* ---- a sleep with the host kept (linux/phy/apple-atc.h) ----
+ *
+ * A deep sleep powers the SoC down, and with it this PHY, the controller and
+ * its xHC. dwc3-apple used to stop the host for it, which removes every USB
+ * device, and start it again afterwards. For a port that only does USB it
+ * keeps the xHCI device and its USB devices instead, and the PHY goes through
+ * the same stop and start below them: down once xHCI has suspended
+ * (apple_t6040_atcphy_sleep_enter()), the controller out of reset before its
+ * core is touched again (apple_t6040_atcphy_sleep_result()), USB2 and USB3 back
+ * once the core is set up (apple_t6040_atcphy_sleep_power_up()). xHCI then
+ * starts over and the USB core resets the devices it finds again.
+ *
+ * The register sequences are those of power_off, power_on and the reset, in
+ * the order dwc3-apple's stop and start run them, so the CFG block is parked
+ * at the sleep's commit as after any detach. The platform has the PHY's firmware
+ * save its state instead and restore it at the wake;
+ * the devices stay without that, and it isn't
+ * done here. The steps are the same whether or not the SoC then loses power
+ * (a refused sleep, a dry run), and leave nothing the wake doesn't set up
+ * again.
+ *
+ * The phys' power counts and the reset's runtime PM reference are their
+ * consumers' and stay as they are; sleep_down and sleep_reset say what the
+ * hardware is behind them. A host that stops after all goes through the phys'
+ * and the reset's own operations, which end that.
+ */
+
+static struct t6040_usb2_phy *t6040_from_usb2_phy(struct phy *phy)
+{
+	if (!phy || phy->ops != &t6040_usb2_phy_ops)
+		return NULL;
+	return phy_get_drvdata(phy);
+}
+
+/*
+ * A USB2 host that runs, alone or with USB3 on this PHY and the PIPE on it.
+ * DisplayPort on the lanes, with any pin assignment, and USB4/Thunderbolt have
+ * clients of their own, which come back in their own order: such a port's
+ * host stops for the sleep.
+ */
+static bool t6040_can_sleep_in_place(const struct t6040_usb2_phy *tphy)
+{
+	return tphy->pipehandler && tphy->powered && tphy->dwc3_running &&
+	       tphy->mode == PHY_MODE_USB_HOST && !tphy->shutdown_failed &&
+	       !tphy->sleep_no_keep && !tphy->sleep_down && !tphy->sleep_reset &&
+	       !tphy->cio_up && !tphy->pipe_tunneled && !tphy->router_running &&
+	       !tphy->dp_up && !tphy->dp_alt && !tphy->usb3_lent &&
+	       tphy->usb3_up == tphy->pipe_switched;
+}
+
+int apple_t6040_atcphy_sleep_prepare(struct phy *usb2_phy)
+{
+	struct t6040_usb2_phy *tphy = t6040_from_usb2_phy(usb2_phy);
+
+	if (!tphy)
+		return -EOPNOTSUPP;
+
+	guard(mutex)(&tphy->lock);
+	if (!t6040_can_sleep_in_place(tphy)) {
+		dev_info(tphy->dev,
+			 "the host stops for the sleep: USB2 %d, USB3 %d, PIPE %d, DP %d/%d, CIO %d, lent %d, failed %d/%d\n",
+			 tphy->powered, tphy->usb3_up, tphy->pipe_switched, tphy->dp_alt,
+			 tphy->dp_up, tphy->cio_up, tphy->usb3_lent, tphy->shutdown_failed,
+			 tphy->sleep_no_keep);
+		return -EBUSY;
+	}
+	tphy->sleep_armed = true;
+	tphy->sleep_ret = 0;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_t6040_atcphy_sleep_prepare);
+
+int apple_t6040_atcphy_sleep_enter(struct phy *usb2_phy)
+{
+	struct t6040_usb2_phy *tphy = t6040_from_usb2_phy(usb2_phy);
+	int ret;
+
+	if (!tphy)
+		return -EOPNOTSUPP;
+
+	PM_RUNTIME_ACQUIRE(tphy->dev, pm);
+	ret = PM_RUNTIME_ACQUIRE_ERR(&pm);
+	if (ret)
+		return ret;
+
+	guard(mutex)(&tphy->lock);
+	if (!tphy->sleep_armed)
+		return -EINVAL;
+	if (tphy->sleep_down)
+		return 0;
+	/* The mux moved since the prepare: that mode's clients don't come back this way. */
+	if (!t6040_can_sleep_in_place(tphy)) {
+		dev_err(tphy->dev,
+			"USB changed for the sleep (USB3 %d, PIPE %d, DP %d/%d, CIO %d): refusing it\n",
+			tphy->usb3_up, tphy->pipe_switched, tphy->dp_alt, tphy->dp_up,
+			tphy->cio_up);
+		tphy->sleep_ret = -EBUSY;
+		return -EBUSY;
+	}
+
+	/* As dwc3-apple's stop: USB3 with its PIPE, USB2, then the controller's reset. */
+	tphy->sleep_usb3 = tphy->usb3_up;
+	t6040_usb3_down_locked(tphy);
+	ret = t6040_usb2_off_locked(tphy);
+	if (ret)
+		dev_err(tphy->dev, "USB2 did not power down for the sleep: %d\n", ret);
+	t6040_dwc3_reset_hold_locked(tphy);
+	tphy->sleep_down = true;
+	tphy->sleep_reset = true;
+	dev_info(tphy->dev, "PHY down for the sleep with the host kept, USB3 %s\n",
+		 tphy->sleep_usb3 ? "was up" : "was off");
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_t6040_atcphy_sleep_enter);
+
+/* -ENODEV while the reset does not read back released: the core must not be touched. */
+static int t6040_sleep_release_locked(struct t6040_usb2_phy *tphy)
+{
+	lockdep_assert_held(&tphy->lock);
+	if (t6040_dwc3_reset_release_locked(tphy)) {
+		dev_err(tphy->dev, "the controller's reset did not release after the sleep: %#x\n",
+			readl(tphy->pipehandler + T6040_PIPEHANDLER_AON_GEN));
+		tphy->sleep_ret = -ENODEV;
+		return -ENODEV;
+	}
+	tphy->sleep_reset = false;
+	tphy->sleep_ret = APPLE_ATCPHY_SLEEP_RESET;
+	return APPLE_ATCPHY_SLEEP_RESET;
+}
+
+int apple_t6040_atcphy_sleep_result(struct phy *usb2_phy)
+{
+	struct t6040_usb2_phy *tphy = t6040_from_usb2_phy(usb2_phy);
+	int ret;
+
+	if (!tphy)
+		return -EOPNOTSUPP;
+
+	PM_RUNTIME_ACQUIRE(tphy->dev, pm);
+	ret = PM_RUNTIME_ACQUIRE_ERR(&pm);
+
+	guard(mutex)(&tphy->lock);
+	if (!tphy->sleep_armed)
+		return -ENODATA;
+	/* The first call after the sleep: without the PHY's power the reset can't release. */
+	if (tphy->sleep_reset && ret)
+		tphy->sleep_ret = -ENODEV;
+	else if (tphy->sleep_reset)
+		t6040_sleep_release_locked(tphy);
+	return tphy->sleep_ret;
+}
+EXPORT_SYMBOL_GPL(apple_t6040_atcphy_sleep_result);
+
+int apple_t6040_atcphy_sleep_power_up(struct phy *usb2_phy)
+{
+	struct t6040_usb2_phy *tphy = t6040_from_usb2_phy(usb2_phy);
+	int ret;
+
+	if (!tphy)
+		return -EOPNOTSUPP;
+
+	PM_RUNTIME_ACQUIRE(tphy->dev, pm);
+	ret = PM_RUNTIME_ACQUIRE_ERR(&pm);
+	if (ret)
+		return ret;
+
+	guard(mutex)(&tphy->lock);
+	/* Only for a controller this sleep's result has taken out of reset. */
+	if (!tphy->sleep_armed || tphy->sleep_reset)
+		return -EINVAL;
+	if (!tphy->sleep_down)
+		return tphy->sleep_ret < 0 ? tphy->sleep_ret : 0;
+
+	/* As dwc3-apple's start, in the core's init: USB2, then USB3 if it ran. */
+	ret = tphy->shutdown_failed ? -EIO : t6040_usb2_on_locked(tphy);
+	if (ret)
+		goto failed;
+	tphy->sleep_down = false;
+	if (tphy->sleep_usb3) {
+		/* A coprocessor that didn't stop cleanly needs its domains' power cycle first. */
+		if (!tphy->recovery.cycle_pending) {
+			tphy->sleep_waking = true;
+			t6040_usb3_up_locked(tphy);
+			tphy->sleep_waking = false;
+		}
+		if (!tphy->usb3_up) {
+			ret = -EIO;
+			goto failed;
+		}
+	}
+	dev_info(tphy->dev, "PHY back after the sleep with the host kept, USB3 %s\n",
+		 tphy->usb3_up ? "up" : "off");
+	return 0;
+
+failed:
+	dev_err(tphy->dev, "PHY not back after the sleep (%d, USB2 %s): the host has to restart\n",
+		ret, tphy->sleep_down ? "off" : "on");
+	tphy->sleep_ret = ret;
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_t6040_atcphy_sleep_power_up);
+
+int apple_t6040_atcphy_sleep_recover(struct phy *usb2_phy)
+{
+	struct t6040_usb2_phy *tphy = t6040_from_usb2_phy(usb2_phy);
+
+	if (!tphy)
+		return -EOPNOTSUPP;
+
+	PM_RUNTIME_ACQUIRE(tphy->dev, pm);
+	if (PM_RUNTIME_ACQUIRE_ERR(&pm))
+		return -ENODEV;
+
+	guard(mutex)(&tphy->lock);
+	/* Not held in reset by a sleep: there is nothing of this PHY's to put right. */
+	if (!tphy->sleep_reset)
+		return -ENODEV;
+	return t6040_sleep_release_locked(tphy);
+}
+EXPORT_SYMBOL_GPL(apple_t6040_atcphy_sleep_recover);
+
+void apple_t6040_atcphy_sleep_finish(struct phy *usb2_phy, bool kept)
+{
+	struct t6040_usb2_phy *tphy = t6040_from_usb2_phy(usb2_phy);
+
+	if (!tphy)
+		return;
+
+	guard(mutex)(&tphy->lock);
+	if (!tphy->sleep_armed)
+		return;
+	/* A sleep refused for a USB change doesn't count, nor a restart for another reason. */
+	if (!kept && tphy->sleep_ret < 0 && tphy->sleep_ret != -EBUSY) {
+		tphy->sleep_no_keep = true;
+		dev_warn(tphy->dev,
+			 "PHY did not come back from a sleep with the host kept (%d): the host stops for sleeps from now on\n",
+			 tphy->sleep_ret);
+	}
+	tphy->sleep_armed = false;
+	tphy->sleep_ret = 0;
+}
+EXPORT_SYMBOL_GPL(apple_t6040_atcphy_sleep_finish);
 
 #ifdef CONFIG_HIBERNATION
 static int t6040_phy_count(struct phy *phy)
