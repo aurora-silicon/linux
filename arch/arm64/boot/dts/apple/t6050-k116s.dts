@@ -28,6 +28,8 @@
 		/* The loader fills the N1's factory addresses through these */
 		wifi0 = &n1_alpha;
 		bluetooth0 = &n1_beta;
+		/* the boot loader reserves the SEP firmware and adds its manifests through this alias */
+		sep = &sep;
 	};
 };
 
@@ -433,6 +435,79 @@
 		atcphy1 = &atc1_phy;
 		atcphy2 = &atc2_phy;
 	};
+};
+
+/*
+ * The PMP (ADT pmp0, /chosen, /arm-io/pmgr), as on the J714s: iBoot loads its firmware and
+ * the driver starts it with these boot arguments and the firmware properties in the tunables
+ * file. Its report tells it which devices are on; the PMC honours its votes next to the CLPC.
+ * The AOP's audio firmware needs it too: its LEAP cluster enable goes through PMP-managed
+ * power domains (every AOP and AUDIO domain of this ADT is "no_ps"), and without the PMP it
+ * fails, the audio controller never reaches systemReady and no AOP service is announced.
+ */
+&ps_pms {
+	status = "okay";
+};
+
+&ps_pmp {
+	status = "okay";
+};
+
+&ps_pms_sram {
+	status = "okay";
+};
+
+&pmp0_dart {
+	status = "okay";
+};
+
+&pmp0_mbox {
+	status = "okay";
+};
+
+&pmp0 {
+	/* ADT /chosen board-id, dram-vendor-id */
+	apple,board-id = <22>;
+	apple,dram-vendor-id = <1>;
+	/* ADT /arm-io/pmgr pmc, pmc-pmgr */
+	apple,pmc = <1>;
+	apple,pmc-pmgr = <63>;
+	status = "okay";
+};
+
+&pmp0_report {
+	status = "okay";
+};
+
+&pmc {
+	/* PMP, CLPC and AP agents, once the PMP runs */
+	apple,static-voters = <0 1 3>;
+	apple,pmp = <&pmp0>;
+};
+
+#include "t6050-k116s-pmp-tunables.dtsi"
+
+/*
+ * The SEP (ADT sep, dart-sep), as on the J714s: its mailbox, and its power domain with the two
+ * fabric parents left to the firmware, which genpd votes on and never turns off. The boot
+ * loader enables the SEP itself through its alias.
+ */
+&sep_mbox {
+	status = "okay";
+};
+
+&ps_sep {
+	status = "okay";
+};
+
+&ps_fab8_soc {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_fab0_piogw {
+	apple,firmware-owned;
+	status = "okay";
 };
 
 /* Sound: the J714s description, every value checked against the K116s ADT. */
