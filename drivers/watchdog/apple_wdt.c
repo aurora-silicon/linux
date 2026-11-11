@@ -7,6 +7,7 @@
 
 #include <linux/bits.h>
 #include <linux/clk.h>
+#include <linux/crash_dump.h>
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
@@ -185,12 +186,25 @@ static int apple_wdt_probe(struct platform_device *pdev)
 	wdt->wdd.timeout = APPLE_WDT_TIMEOUT_DEFAULT;
 
 	wdt_ctrl = readl_relaxed(wdt->regs + APPLE_WDT_WD1_CTRL);
-	if (wdt_ctrl & APPLE_WDT_CTRL_RESET_EN)
+	if ((wdt_ctrl & APPLE_WDT_CTRL_RESET_EN) && !is_kdump_kernel())
 		set_bit(WDOG_HW_RUNNING, &wdt->wdd.status);
 
 	watchdog_set_nowayout(&wdt->wdd, WATCHDOG_NOWAYOUT);
 	watchdog_init_timeout(&wdt->wdd, 0, dev);
 	apple_wdt_set_timeout(&wdt->wdd, wdt->wdd.timeout);
+
+	/*
+	 * A crash kernel only saves the dump and restarts. If it stalls, the
+	 * machine must still restart rather than hang: arm the watchdog at its
+	 * longest timeout and leave it unpinged, unless userspace opens it.
+	 */
+	if (is_kdump_kernel()) {
+		apple_wdt_set_timeout(&wdt->wdd,
+				      wdt->wdd.max_hw_heartbeat_ms / 1000);
+		apple_wdt_start(&wdt->wdd);
+		dev_info(dev, "crash kernel: restarting in %u s unless done\n",
+			 wdt->wdd.timeout);
+	}
 	watchdog_stop_on_unregister(&wdt->wdd);
 	watchdog_set_restart_priority(&wdt->wdd, 128);
 

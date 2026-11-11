@@ -6,6 +6,7 @@ config DRM_ACCEL_ANE
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on APPLE_RTKIT
 	depends on APPLE_DART || COMPILE_TEST
+	depends on APPLE_PMGR_PWRSTATE || !APPLE_PMGR_PWRSTATE
 	depends on MMU
 	select INTERCONNECT
 	select PM_OPP

@@ -73,6 +73,7 @@ const struct ane_fw_platform ane_h16_platform = {
 	.sleep_cold = true,
 	.firmware_preloaded = true,
 	.safe_reset = false,
+	.pmp_report = "apple,t6041-pmp-v2-report",
 };
 
 const struct ane_fw_platform ane_h17_platform = {

@@ -123,10 +123,15 @@ def atc_cio_helpers(source):
     The mux and PIPE functions call these; older sources have neither: ''.
     """
     result = ''
-    for name in ('atcphy_mode_is_cio', 'atcphy_pipe_state_for'):
+    for name in ('atcphy_mode_is_cio', 'atcphy_pipe_state_for',
+                 'atcphy_usb2_sig_host'):
         marker = re.search(r'^static [^;{}()]+\b' + name + r'\([^;{}]*\)\s*\{', source, re.M)
         if marker:
-            result += block(source, marker.start()) + '\n'
+            helper = block(source, marker.start())
+            if name == 'atcphy_usb2_sig_host':
+                helper = helper.replace('static u32',
+                                        'static __attribute__((unused)) u32', 1)
+            result += helper + '\n'
     return result
 
 

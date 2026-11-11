@@ -28,12 +28,14 @@ static int sep_pm_notify(struct notifier_block *nb, unsigned long action,
 	case PM_SUSPEND_PREPARE:
 	case PM_HIBERNATION_PREPARE:
 	case PM_RESTORE_PREPARE:
+		sep_diag_sleep(true);
 		event(true);
 		return NOTIFY_OK;
 	case PM_POST_SUSPEND:
 	case PM_POST_HIBERNATION:
 	case PM_POST_RESTORE:
 		event(false);
+		sep_diag_sleep(false);
 		return NOTIFY_OK;
 	default:
 		return NOTIFY_DONE;

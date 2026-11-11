@@ -243,6 +243,15 @@ pub(crate) struct RenderPass {
     pub(crate) few_primitives: bool,
     /// Host-only: the resolved barriers order the fragment kick, not the tiling kick.
     pub(crate) fragment_barriers: bool,
+    /// Host-only: the tiling kick waits on its own render and compute prefixes
+    /// (`Order::tiling_wait_through`), the fragment kick on the whole ones. M5 only.
+    pub(crate) stage_prefixes: bool,
+    /// Host-only: the render writes whole attachments: its tile stores reach no pixel
+    /// outside its own render area (hazard ordering). M5 only.
+    pub(crate) whole_attachments: bool,
+    /// A graphics program of the render writes external memory (buffer or image stores,
+    /// atomics); render-target outputs do not count. M5 only.
+    pub(crate) shader_writes_memory: bool,
     /// GPU address of the occlusion-query results, or zero.
     pub(crate) occlusion_query_va: u64,
     /// GPU address of the sampler heap, or zero.
@@ -326,6 +335,10 @@ pub(crate) struct RenderResources {
     pub(crate) deflake_va: u64,
     /// GPU address of the tiling status word.
     pub(crate) ta_status_va: u64,
+    /// The TA mesh rendering buffer word for mesh/object kicks: the context VA
+    /// of the queue's mesh rendering buffer in the low 48 bits and its
+    /// 64 KiB chunk count above. Zero leaves the register out of the program.
+    pub(crate) mesh_storage: u64,
     /// GPU address of the fragment status word, as seen by the pass's VM.
     pub(crate) fragment_status_va: u64,
     /// Firmware alias of the fragment status word.
@@ -334,6 +347,9 @@ pub(crate) struct RenderResources {
     pub(crate) aux_fb_va: u64,
     /// GPU address of the pass's start/end timestamp pair.
     pub(crate) timestamp_va: u64,
+    /// Firmware window addresses of the user's vertex and fragment start/end stamps
+    /// (the second pair at TA +0x90e and 3D +0x21a8), 0 for a stamp the firmware does not write.
+    pub(crate) timestamp_window: [u64; 4],
     /// Object IDs of the tiling stage.
     pub(crate) ta_ids: ObjectIds,
     /// Object IDs of the fragment stage.
@@ -469,7 +485,11 @@ struct PassWords {
 
 impl PassWords {
     fn new(pass: &RenderPass) -> Result<Self> {
-        if pass.samples_log2 > SAMPLES_LOG2_MAX {
+        Self::with_sample_limit(pass, SAMPLES_LOG2_MAX)
+    }
+
+    fn with_sample_limit(pass: &RenderPass, max_samples_log2: u8) -> Result<Self> {
+        if pass.samples_log2 > max_samples_log2 {
             return Err(EINVAL);
         }
         let samples = 1u64 << pass.samples_log2;
@@ -998,6 +1018,97 @@ fn partial_load_registers(
     ]
 }
 
+/// The M5 render register storage, shared by its phases. Keep this in the caller's heap
+/// workspace when constructing descriptors.
+pub(crate) struct M5RegisterPrograms {
+    pub(crate) ta: [RegisterWrite; TA_REGISTERS],
+    pub(crate) fragment: [RegisterWrite; FRAGMENT_REGISTERS],
+    pub(crate) store: [RegisterWrite; PARTIAL_STORE_REGISTERS],
+    pub(crate) resume: [RegisterWrite; PARTIAL_RESUME_REGISTERS],
+    pub(crate) load: [RegisterWrite; PARTIAL_LOAD_REGISTERS],
+}
+// SAFETY: All members contain only integer register writes.
+unsafe impl Zeroable for M5RegisterPrograms {}
+impl M5RegisterPrograms {
+    /// M5 partial phases add only their own depth/stencil direction while
+    /// preserving the pass's existing operations and surface layout bits.
+    pub(crate) fn write_m5(&mut self, args: &RenderArgs<'_>) -> Result {
+        // The M5 forms of the shared lowering: the A18 Pro arrays without the SCS enable
+        // (the M5 adaptation brackets its own scratch and intersection words), the
+        // one-cluster deflake layout, and up to eight samples.
+        let none = super::render_rt::RayQueryStage {
+            intersection: super::compute::IntersectionTables::NONE,
+            scratch: super::compute::ScratchRequest::new(0)?,
+        };
+        let args = &RenderArgs {
+            programs: RegisterPrograms::G17P,
+            deflake: Deflake::ONE_CLUSTER,
+            ray_query: [none; 2],
+            ..*args
+        };
+        let g = Geometry::new(args.pass)?;
+        let w = PassWords::with_sample_limit(args.pass, 3)?;
+        without_scs_enable(&mut self.ta, &ta_registers(args, &g, &w)?, TA_SCS_ENABLE_INDEX)?;
+        without_scs_enable(
+            &mut self.fragment,
+            &fragment_registers(args, &g, &w),
+            FRAGMENT_SCS_ENABLE_INDEX,
+        )?;
+        self.store = partial_store_registers(args.pass, &w);
+        self.resume = partial_resume_registers(args.pass, &w);
+        self.load = partial_load_registers(args.pass, &w);
+        // The partial phases start from the pass's ZLS word with both directions of each
+        // present surface, as the M5 lowering always has.
+        let mut partial = args.pass.zls_control;
+        if args.pass.depth.va != 0 {
+            partial |= ZLS_LOAD_DEPTH | ZLS_STORE_DEPTH;
+        }
+        if args.pass.stencil.va != 0 {
+            partial |= ZLS_LOAD_STENCIL | ZLS_STORE_STENCIL;
+        }
+        for array in [&mut self.store[..], &mut self.resume[..], &mut self.load[..]] {
+            for register in array {
+                if register.reg == 0x15319 {
+                    register.value = partial;
+                }
+            }
+        }
+        const LOAD: u64 = (1 << 14) | (1 << 15);
+        const STORE: u64 = (1 << 18) | (1 << 19);
+        for register in &mut self.store {
+            if register.reg == 0x15319 {
+                register.value = (register.value & !LOAD) | (args.pass.zls_control & LOAD);
+            } else if register.reg == 0x10039
+                && (args.pass.depth.va != 0 || args.pass.stencil.va != 0)
+            {
+                // A partial store forces empty tiles when either stored ZLS
+                // address (depth or stencil) exists.
+                register.value |= TILE_CONFIG_PROCESS_EMPTY_TILES;
+            }
+        }
+        for register in &mut self.load {
+            if register.reg == 0x15319 {
+                register.value = (register.value & !STORE) | (args.pass.zls_control & STORE);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Copies a lowered array without its SCS enable entry.
+fn without_scs_enable<const N: usize, const M: usize>(
+    out: &mut [RegisterWrite; N],
+    lowered: &[RegisterWrite; M],
+    index: usize,
+) -> Result {
+    if M != N + 1 || lowered.get(index).is_none_or(|write| write.reg != SCS_ENABLE) {
+        return Err(EINVAL);
+    }
+    out[..index].copy_from_slice(&lowered[..index]);
+    out[index..].copy_from_slice(&lowered[index + 1..]);
+    Ok(())
+}
+
 /// Tiling (TA) work descriptor (tag 0).
 #[repr(C, packed)]
 #[derive(Debug)]
@@ -1112,6 +1223,8 @@ static_assert!(core::mem::offset_of!(TaDescriptor, predecessor_id) == 0x86e);
 static_assert!(core::mem::offset_of!(TaDescriptor, stamp_va) == 0x8a6);
 static_assert!(core::mem::offset_of!(TaDescriptor, completion) == 0x8c6);
 static_assert!(core::mem::offset_of!(TaDescriptor, timestamp_start_va) == 0x8fe);
+// The firmware-sampled vertex start/end pair (macOS fills it with timestamp-window addresses).
+static_assert!(core::mem::offset_of!(TaDescriptor, unk_90e) == 0x90e);
 static_assert!(core::mem::offset_of!(TaDescriptor, free_list_control_va) == 0x934);
 static_assert!(core::mem::offset_of!(TaDescriptor, status_va) == 0x945);
 
@@ -1183,6 +1296,8 @@ impl TaDescriptor {
         self.current_id = resources.ta_ids.current.into();
         self.ordinal = args.ordinal as u32;
         self.timestamp_start_va = resources.timestamp_va;
+        self.unk_90e[..8].copy_from_slice(&resources.timestamp_window[0].to_le_bytes());
+        self.unk_90e[8..16].copy_from_slice(&resources.timestamp_window[1].to_le_bytes());
         self.unk_932 = match args.programs == RegisterPrograms::V25G83 {
             true => TA_SLOT_INDEX_25G83 + u8::from(scs_register),
             false => Self::UNK_932,
@@ -1397,6 +1512,8 @@ static_assert!(core::mem::offset_of!(FragmentDescriptor, unk_2104) == 0x2104);
 static_assert!(core::mem::offset_of!(FragmentDescriptor, stamp_va) == 0x2140);
 static_assert!(core::mem::offset_of!(FragmentDescriptor, completion) == 0x2160);
 static_assert!(core::mem::offset_of!(FragmentDescriptor, timestamp_start_va) == 0x2198);
+// The firmware-sampled fragment start/end pair.
+static_assert!(core::mem::offset_of!(FragmentDescriptor, unk_21a8) == 0x21a8);
 static_assert!(core::mem::offset_of!(FragmentDescriptor, free_list_control_va) == 0x21ce);
 static_assert!(core::mem::offset_of!(FragmentDescriptor, status_va) == 0x21d7);
 static_assert!(core::mem::offset_of!(FragmentDescriptor, unk_222d) == 0x222d);
@@ -1545,6 +1662,8 @@ impl FragmentSlot {
         desc.ordinal = args.ordinal as u32;
         desc.timestamp_start_va = resources.timestamp_va;
         desc.timestamp_end_va = timestamp_end_va;
+        desc.unk_21a8[..8].copy_from_slice(&resources.timestamp_window[2].to_le_bytes());
+        desc.unk_21a8[8..16].copy_from_slice(&resources.timestamp_window[3].to_le_bytes());
         desc.unk_21cc = match args.programs == RegisterPrograms::V25G83 {
             true => FRAGMENT_SLOT_INDEX_25G83 + u8::from(args.ray_query[1].scratch.enabled()),
             false => Self::UNK_21CC,
@@ -1629,14 +1748,43 @@ mod ta_mode_tests {
         }
     }
 
+    /// The variants of the builds T6041 admits: 25F84, then 25G83, which the 40- and the
+    /// 32-core configurations run with the same rules.
+    fn t6041_variants() -> [&'static Variant; 2] {
+        let Firmware::Identified(builds) = crate::hw::t6041::CONFIG.firmware else {
+            panic!("T6041 must identify its loaded firmware");
+        };
+        assert_eq!(builds.len(), 3);
+        let (g83, g83_32) = (builds[1].variant, builds[2].variant);
+        assert_eq!(g83.ta_mode_1, g83_32.ta_mode_1);
+        assert_eq!(g83.compute, g83_32.compute);
+        assert_eq!(g83.programs, g83_32.programs);
+        [builds[0].variant, g83]
+    }
+
+    /// The TA mode of every admitted T6041 build.
+    fn t6041_ta_mode_1() -> bool {
+        let [f84, g83] = t6041_variants();
+        assert_eq!(f84.ta_mode_1, g83.ta_mode_1);
+        f84.ta_mode_1
+    }
+
     #[test]
-    fn policy_is_local_to_the_admitted_t6041_build() {
-        let max = selected(&crate::hw::t6041::CONFIG.firmware);
+    fn policy_is_local_to_the_admitted_t6041_builds() {
+        let [f84, g83] = t6041_variants();
         let pro = selected(&crate::hw::t6040::CONFIG.firmware);
-        assert_eq!(max.compute, crate::g17::fw::compute::ComputeProgram::V25F84);
-        assert!(max.split_firmware_area);
-        assert_eq!(max.programs, RegisterPrograms::V25G83);
-        assert!(max.ta_mode_1);
+        assert_eq!(f84.compute, crate::g17::fw::compute::ComputeProgram::V25F84);
+        assert!(f84.split_firmware_area);
+        // 25G83 keeps the M4 Pro's queue and compute rules on the M4 Max.
+        assert_eq!(g83.compute, pro.compute);
+        assert_eq!(g83.split_firmware_area, pro.split_firmware_area);
+        assert_eq!(g83.opening_record, pro.opening_record);
+        assert_eq!(g83.qid_floor, pro.qid_floor);
+        assert_eq!(g83.registration, pro.registration);
+        for max in [f84, g83] {
+            assert_eq!(max.programs, RegisterPrograms::V25G83);
+            assert!(max.ta_mode_1);
+        }
         assert!(!pro.ta_mode_1);
         assert!(!V25F84.ta_mode_1);
         assert!(!V25G83.ta_mode_1);
@@ -1704,7 +1852,7 @@ mod ta_mode_tests {
             for scs in [false, true] {
                 let mut args = args(&pass, &resources, scs);
                 let (before, count) = ta_registers_25g83(&args, &geometry, &words).unwrap();
-                args.ta_mode_1 = selected(&crate::hw::t6041::CONFIG.firmware).ta_mode_1;
+                args.ta_mode_1 = t6041_ta_mode_1();
                 let (after, new_count) = ta_registers_25g83(&args, &geometry, &words).unwrap();
                 assert_eq!(count, 83 + usize::from(scs));
                 assert_eq!(new_count, count);

@@ -764,6 +764,22 @@ static inline int tb_port_write(struct tb_port *port, const void *buffer,
 
 struct tb *icm_probe(struct tb_nhi *nhi);
 struct tb *tb_probe(struct tb_nhi *nhi);
+#if IS_ENABLED(CONFIG_KUNIT)
+int tb_consumed_dp_bandwidth(struct tb *tb, struct tb_port *src_port,
+			     struct tb_port *dst_port, struct tb_port *port,
+			     int *consumed_up, int *consumed_down);
+u32 tb_dp_host_rate_limit(struct tb *tb);
+void tb_dp_host_tunnel_gone(struct tb *tb, unsigned int before);
+#endif
+#if IS_ENABLED(CONFIG_USB4_KUNIT_TEST)
+size_t tb_test_cm_size(void);
+void tb_test_cm_init(struct tb *tb);
+struct list_head *tb_test_cm_tunnels(struct tb *tb);
+struct list_head *tb_test_cm_dp_resources(struct tb *tb);
+void tb_test_cm_set_relink_deferred(struct tb *tb, bool deferred);
+bool tb_test_cm_relink_armed(struct tb *tb);
+void tb_test_cm_stop(struct tb *tb);
+#endif
 
 extern const struct device_type tb_domain_type;
 extern const struct device_type tb_retimer_type;
@@ -772,6 +788,8 @@ extern const struct device_type usb4_port_device_type;
 
 int tb_domain_init(void);
 void tb_domain_exit(void);
+void tb_dp_pm_gate_init(void);
+void tb_dp_pm_gate_exit(void);
 int tb_xdomain_init(void);
 void tb_xdomain_exit(void);
 
@@ -1043,6 +1061,7 @@ int tb_switch_tmu_post_time(struct tb_switch *sw);
 int tb_switch_tmu_disable(struct tb_switch *sw);
 int tb_switch_tmu_enable(struct tb_switch *sw);
 int tb_switch_tmu_configure(struct tb_switch *sw, enum tb_switch_tmu_mode mode);
+bool tb_switch_tmu_host_managed(const struct tb_switch *sw);
 
 /**
  * tb_switch_tmu_is_configured() - Is given TMU mode configured

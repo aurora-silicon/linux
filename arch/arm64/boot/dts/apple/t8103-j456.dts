@@ -19,6 +19,7 @@
 
 	aliases {
 		ethernet0 = &ethernet0;
+		sep = &sep;
 	};
 };
 
@@ -169,3 +170,8 @@
 &isp {
 	apple,platform-id = <2>;
 };
+
+/* Two fans on the 4-port model, from the product spec, not an ADT. */
+#include "hwmon-fan-dual.dtsi"
+
+#include "t8103-j456-control.dtsi"

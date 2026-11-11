@@ -14,34 +14,67 @@
 #include <linux/suspend.h>
 #include <linux/unaligned.h>
 
-#define APPLE_PMU_RTC_CONTROL	0x0
-#define APPLE_PMU_RTC_COUNTER	0x2
-#define APPLE_PMU_RTC_COMPARE	0x8
-#define APPLE_PMU_RTC_MASK	0xe
 #define APPLE_PMU_RTC_ARM		BIT(6)
 #define APPLE_PMU_RTC_ALARM		BIT(0)
 #define APPLE_PMU_RTC_HZ_SHIFT	16
 #define APPLE_PMU_RTC_MAX_DELAY	3600
 
+/*
+ * Register addresses in the PMIC's SPMI space. The counter is six bytes
+ * at 65536 Hz; the comparator is four bytes of whole counter seconds.
+ */
 struct apple_pmu_rtc_hw {
-	u16 base;
+	u16 control;
+	u16 counter;
+	u16 compare;
+	u16 mask;
 	u16 event;
 	u8 event_bit;
+	u8 control_event_bit;
 	u8 monitor_bit;
 	bool offset_in_seconds;
 };
 
 static const struct apple_pmu_rtc_hw apple_pmu_rtc_baku = {
-	.base = 0xf800,
+	.control = 0xf800,
+	.counter = 0xf802,
+	.compare = 0xf808,
+	.mask = 0xf80e,
 	.event = 0xf80c,
 	.event_bit = BIT(0),
 	.offset_in_seconds = true,
 };
 
 static const struct apple_pmu_rtc_hw apple_pmu_rtc_abbey = {
-	.base = 0x2000,
+	.control = 0x2000,
+	.counter = 0x2002,
+	.compare = 0x2008,
+	.mask = 0x200e,
 	.event = 0x2000,
 	.event_bit = BIT(1),
+	.monitor_bit = BIT(0),
+};
+
+/* M2 (t8112): Baku's register block with the offset in 1/32768 s. */
+static const struct apple_pmu_rtc_hw apple_pmu_rtc_stowe = {
+	.control = 0xf800,
+	.counter = 0xf802,
+	.compare = 0xf808,
+	.mask = 0xf80e,
+	.event = 0xf80c,
+	.event_bit = BIT(0),
+	.monitor_bit = BIT(0),
+};
+
+/* M1 Pro, Max and Ultra (t600x), offset in 1/32768 s */
+static const struct apple_pmu_rtc_hw apple_pmu_rtc_maverick = {
+	.control = 0x1401,
+	.counter = 0x1406,
+	.compare = 0x140c,
+	.mask = 0x14c2,
+	.event = 0x14c0,
+	.event_bit = BIT(0),
+	.control_event_bit = BIT(1),
 	.monitor_bit = BIT(0),
 };
 
@@ -61,7 +94,7 @@ static int apple_pmu_rtc_counter(struct apple_pmu_rtc *rtc, u64 *ticks)
 	u8 count[8] = {};
 	int error;
 
-	error = regmap_bulk_read(rtc->map, rtc->hw->base + APPLE_PMU_RTC_COUNTER,
+	error = regmap_bulk_read(rtc->map, rtc->hw->counter,
 				 count, 6);
 	if (error)
 		return error;
@@ -123,11 +156,11 @@ static int apple_pmu_rtc_ack_alarm(struct apple_pmu_rtc *rtc)
 	int error;
 
 	/*
-	 * The event is W1C. Abbey shares the byte with ARM and MONITOR,
-	 * unlike Baku's dedicated event register. Preserve the control bits
+	 * The event is W1C. Abbey shares the byte with ARM and MONITOR;
+	 * the other PMUs have a dedicated event register. Preserve the control bits
 	 * when acknowledging, rather than writing only the event bit.
 	 */
-	if (rtc->hw->event == rtc->hw->base + APPLE_PMU_RTC_CONTROL) {
+	if (rtc->hw->event == rtc->hw->control) {
 		error = regmap_read(rtc->map, rtc->hw->event, &control);
 		if (error)
 			return error;
@@ -140,24 +173,26 @@ static int apple_pmu_rtc_arm(struct apple_pmu_rtc *rtc, bool enable)
 	unsigned int control;
 	int error;
 
-	error = regmap_read(rtc->map, rtc->hw->base + APPLE_PMU_RTC_CONTROL, &control);
+	error = regmap_read(rtc->map, rtc->hw->control, &control);
 	if (error)
 		return error;
 	/* Do not acknowledge a shared W1C event as a side effect of RMW. */
-	if (rtc->hw->event == rtc->hw->base + APPLE_PMU_RTC_CONTROL)
+	if (rtc->hw->event == rtc->hw->control)
 		control &= ~rtc->hw->event_bit;
+	/* Maverick clears its additional fired latch when this bit is zero. */
+	control &= ~rtc->hw->control_event_bit;
 	control &= ~APPLE_PMU_RTC_ARM;
 	if (enable)
 		control |= APPLE_PMU_RTC_ARM;
 	control |= rtc->hw->monitor_bit;
-	return regmap_write(rtc->map, rtc->hw->base + APPLE_PMU_RTC_CONTROL, control);
+	return regmap_write(rtc->map, rtc->hw->control, control);
 }
 
 static int apple_pmu_rtc_stop_alarm(struct apple_pmu_rtc *rtc)
 {
 	int error;
 
-	error = regmap_update_bits(rtc->map, rtc->hw->base + APPLE_PMU_RTC_MASK,
+	error = regmap_update_bits(rtc->map, rtc->hw->mask,
 				   APPLE_PMU_RTC_ALARM, APPLE_PMU_RTC_ALARM);
 	if (error)
 		return error;
@@ -173,7 +208,7 @@ static int apple_pmu_rtc_start_alarm(struct apple_pmu_rtc *rtc)
 
 	error = apple_pmu_rtc_ack_alarm(rtc);
 	if (!error)
-		error = regmap_update_bits(rtc->map, rtc->hw->base + APPLE_PMU_RTC_MASK,
+		error = regmap_update_bits(rtc->map, rtc->hw->mask,
 					   APPLE_PMU_RTC_ALARM, 0);
 	if (!error)
 		error = apple_pmu_rtc_arm(rtc, true);
@@ -210,14 +245,14 @@ static int apple_pmu_rtc_read_alarm(struct device *dev, struct rtc_wkalrm *alarm
 	error = apple_pmu_rtc_offset(rtc, &epoch);
 	if (error)
 		return error;
-	error = regmap_bulk_read(rtc->map, rtc->hw->base + APPLE_PMU_RTC_COMPARE,
+	error = regmap_bulk_read(rtc->map, rtc->hw->compare,
 				 &comparator, sizeof(comparator));
 	if (!error)
-		error = regmap_read(rtc->map, rtc->hw->base + APPLE_PMU_RTC_CONTROL, &control);
+		error = regmap_read(rtc->map, rtc->hw->control, &control);
 	if (!error)
 		error = regmap_read(rtc->map, rtc->hw->event, &event);
 	if (!error)
-		error = regmap_read(rtc->map, rtc->hw->base + APPLE_PMU_RTC_MASK, &mask);
+		error = regmap_read(rtc->map, rtc->hw->mask, &mask);
 	if (error)
 		return error;
 	rtc_time64_to_tm((epoch >> APPLE_PMU_RTC_HZ_SHIFT) +
@@ -251,11 +286,11 @@ static int apple_pmu_rtc_set_alarm(struct device *dev, struct rtc_wkalrm *alarm)
 	if (error)
 		return error;
 	comparator = cpu_to_le32(deadline);
-	error = regmap_bulk_write(rtc->map, rtc->hw->base + APPLE_PMU_RTC_COMPARE,
+	error = regmap_bulk_write(rtc->map, rtc->hw->compare,
 				  &comparator, sizeof(comparator));
 	if (error)
 		return error;
-	error = regmap_bulk_read(rtc->map, rtc->hw->base + APPLE_PMU_RTC_COMPARE,
+	error = regmap_bulk_read(rtc->map, rtc->hw->compare,
 				 &readback, sizeof(readback));
 	if (error)
 		return error;
@@ -277,7 +312,7 @@ static int apple_pmu_rtc_alarm_enable(struct device *dev, unsigned int enable)
 		return apple_pmu_rtc_stop_alarm(rtc);
 	if (rtc->io_failed)
 		return -EIO;
-	error = regmap_bulk_read(rtc->map, rtc->hw->base + APPLE_PMU_RTC_COMPARE,
+	error = regmap_bulk_read(rtc->map, rtc->hw->compare,
 				 &comparator, sizeof(comparator));
 	if (error)
 		return error;
@@ -326,11 +361,11 @@ static int apple_pmu_rtc_init_alarm(struct apple_pmu_rtc *rtc)
 	__le32 comparator;
 	int error;
 
-	error = regmap_read(rtc->map, rtc->hw->base + APPLE_PMU_RTC_CONTROL, &control);
+	error = regmap_read(rtc->map, rtc->hw->control, &control);
 	if (!error)
-		error = regmap_read(rtc->map, rtc->hw->base + APPLE_PMU_RTC_MASK, &mask);
+		error = regmap_read(rtc->map, rtc->hw->mask, &mask);
 	if (!error)
-		error = regmap_bulk_read(rtc->map, rtc->hw->base + APPLE_PMU_RTC_COMPARE,
+		error = regmap_bulk_read(rtc->map, rtc->hw->compare,
 					 &comparator, sizeof(comparator));
 	if (error)
 		return error;
@@ -438,6 +473,8 @@ disable_wakeup:
 static const struct of_device_id apple_pmu_rtc_match[] = {
 	{ .compatible = "apple,j700-pmu-rtc", .data = &apple_pmu_rtc_baku },
 	{ .compatible = "apple,t6041-pmu-rtc", .data = &apple_pmu_rtc_abbey },
+	{ .compatible = "apple,t8112-pmu-rtc", .data = &apple_pmu_rtc_stowe },
+	{ .compatible = "apple,t6000-pmu-rtc", .data = &apple_pmu_rtc_maverick },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, apple_pmu_rtc_match);

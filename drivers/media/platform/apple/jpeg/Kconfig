@@ -9,9 +9,9 @@ config VIDEO_APPLE_JPEG
 	select VIDEOBUF2_DMA_CONTIG
 	help
 	  V4L2 memory-to-memory baseline JPEG encoder for the JPEG engine
-	  in Apple A18 Pro (T8140) SoCs. It takes full-range NV12M (4:2:0)
-	  or NV16M (4:2:2) frames. Other SoCs' engines are identified and
-	  refused until their register layout is supported.
+	  in T6000, T6041, T8112 and T8140 SoCs. It takes full-range NV12
+	  (4:2:0) or NV16 (4:2:2) frames. The device compatible selects the
+	  register layout and address width; unrecognized revisions are refused.
 
 	  To compile this driver as a module, choose M here: the module
 	  will be called apple-jpeg.

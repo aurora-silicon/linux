@@ -148,3 +148,9 @@
 	power-domains = <&ps_ane_sys_cpu>, <&ps_ane_set1>,
 		<&ps_ane_set2>, <&ps_ane_set3>, <&ps_ane_set4>, <&ps_pms_sram>;
 };
+
+#ifndef APPLE_T6000_SUBSET
+#include "t6001-peripherals.dtsi"
+#include "t6001-aux-spmi.dtsi"
+#include "t6001-display-extra.dtsi"
+#endif

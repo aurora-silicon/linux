@@ -221,6 +221,7 @@ def brightness_takeover(root):
 #define WRITE_ONCE(x,v) ((x)=(v))
 #define DCP_FIRMWARE_V_26_6_DESKTOP 5
 #define DCP_FIRMWARE_H17P 1
+#define DCP_FIRMWARE_V_27_0 6
 #define DCP_IOMFB_METHODS_H17G 7
 #define MAX_BRIGHTNESS_PART2 510U
 #define BACKLIGHT_PLATFORM 1
@@ -397,7 +398,8 @@ def panel_identity(root, output=None):
     backend = (root / 'drivers/gpu/drm/apple/iomfb_v26_6_desktop.c').read_text()
     dictionary = block((root/'drivers/gpu/drm/apple/parser.c').read_text(), 'static int parse_panel_edid_value(')
     dictionary += block((root/'drivers/gpu/drm/apple/parser.c').read_text(), 'int parse_panel_edid_data(')
-    dictionary += block(backend, 'struct dcp_dict_passthrough_req_v26_6 {')+';\n'
+    # The dictionary record is shared with firmware 27's analytics event.
+    dictionary += block((root/'drivers/gpu/drm/apple/iomfb.h').read_text(), 'struct dcp_dict_passthrough_req {')+';\n'
     dictionary += block(backend, 'static bool trampoline_panel_dictionary_v26_6(')
     dictionary += block(backend, 'static bool iomfb_check_callback_exact_v26_6_desktop(')
     dictionary += '\n#define iomfb_check_callback_v26_6_desktop iomfb_check_callback_exact_v26_6_desktop\n'
@@ -414,10 +416,11 @@ def panel_identity(root, output=None):
 #ifndef READ_ONCE
 #define READ_ONCE(x) (x)
 #endif
+''' + block((root / 'drivers/gpu/drm/apple/dcp-internal.h').read_text(), 'struct dcp_panel_identity {') + r''';
 struct apple_dcp {
     int fw_compat;bool has_panel;struct {bool lock;} metadata;
-    struct {struct dcp_display_metadata panel_metadata, panel_adt_identity;u64 panel_metadata_generation;bool panel_metadata_valid;u8 panel_raw_edid[4096];size_t panel_raw_edid_size;} *desktop;
-    struct {u32 width_mm,height_mm,peak_nits;} panel;void *connector;
+    struct dcp_panel_identity *panel_identity;
+    struct {u32 width_mm,height_mm,peak_nits;const struct dcp_color_space *color_target;} panel;void *connector;
 };
 static unsigned notifications;
 static bool dcp_has_panel(struct apple_dcp *d) {return d->has_panel;}
@@ -433,7 +436,7 @@ int main(int argc, char **argv)
     assert(!strcmp(metadata.name,"Synthetic Int"));
     /* Optional color/date fields are absent; timings come from the catalog. */
     struct apple_dcp d={.fw_compat=5,.has_panel=true,.panel={345,223},.connector=&d};
-    __typeof__(*d.desktop) desktop={0};d.desktop=&desktop;
+    __typeof__(*d.panel_identity) desktop={0};d.panel_identity=&desktop;
     struct dcp_display_mode modes[3]={0};
     for(unsigned i=0;i<3;i++)modes[i].mode=(struct drm_display_mode){.clock=i==0?1080005:i==1?540005:432000,
         .hdisplay=3456,.hsync_start=3500,.hsync_end=3550,.htotal=4000,
@@ -441,7 +444,7 @@ int main(int argc, char **argv)
         .flags=DRM_MODE_FLAG_PHSYNC|DRM_MODE_FLAG_PVSYNC,.type=i==0?DRM_MODE_TYPE_PREFERRED:0};
     modes[0].vrr=true;modes[0].min_vrr=24U<<16;modes[0].max_vrr=120U<<16;
     u64 generation=99;
-    desktop.panel_adt_identity=(struct dcp_display_metadata){.manufacturer="APP",.product=0x616};
+    desktop.adt=(struct dcp_display_metadata){.manufacturer="APP",.product=0x616};
     /* A peak above the SDR range adds the HDR block: 1600 cd/m2 is code 160. */
     d.panel.peak_nits=1600;
     const struct drm_edid *hdr=dcp_panel_edid_snapshot(&d,modes,3,&generation);
@@ -461,7 +464,7 @@ int main(int argc, char **argv)
     };
     for(unsigned form=0;form<3;form++) {
         desktop=(__typeof__(desktop)){0};notifications=0;
-        struct dcp_dict_passthrough_req_v26_6 wire={0};u32 result=0;
+        struct dcp_dict_passthrough_req wire={0};u32 result=0;
         strcpy((char *)wire.key,form?"ProductAttributes":"DisplayAttributes");
         const u8 *data=form==2?minimal:form?product:attributes;
         size_t size=form==2?sizeof(minimal):form?sizeof(product):sizeof(attributes);
@@ -478,9 +481,9 @@ int main(int argc, char **argv)
         assert(iomfb_check_callback_v26_6_desktop(413,sizeof(service),4));
         assert(!iomfb_check_callback_v26_6_desktop(413,sizeof(service)-1,4));
         assert(handlers[413](&d,413,&result,service) && result==1);
-        assert(desktop.panel_metadata_valid && notifications==1);
-        assert(desktop.panel_metadata.serial==(form==2?0:metadata.serial));
-        assert(!strcmp(desktop.panel_metadata.manufacturer,"TST"));
+        assert(desktop.metadata_valid && notifications==1);
+        assert(desktop.metadata.serial==(form==2?0:metadata.serial));
+        assert(!strcmp(desktop.metadata.manufacturer,"TST"));
         if(form==2) {
             const struct drm_edid *minimal_edid=dcp_panel_edid_snapshot(&d,modes,3,&generation);
             assert(!IS_ERR(minimal_edid) && drm_edid_valid(minimal_edid));
@@ -496,7 +499,7 @@ int main(int argc, char **argv)
     }
     desktop=(__typeof__(desktop)){0};notifications=0;
     dcp_panel_metadata_replace(&d,&metadata);
-    assert(notifications==1 && desktop.panel_metadata_valid);
+    assert(notifications==1 && desktop.metadata_valid);
     const struct drm_edid *edid=dcp_panel_edid_snapshot(&d,modes,3,&generation);
     assert(!IS_ERR(edid) && drm_edid_valid(edid) && dcp_panel_metadata_current(&d,generation));
     const u8 *bytes=(const void *)&edid->raw;
@@ -519,7 +522,7 @@ int main(int argc, char **argv)
     /* A real EDID replaces the fallback; invalid replacement preserves it. */
     u8 real[128];memcpy(real,bytes,128);real[12]^=1;real[127]^=1;
     dcp_panel_edid_receive(&d,real,sizeof(real));
-    assert(desktop.panel_raw_edid_size==128);
+    assert(desktop.raw_edid_size==128);
     u8 nested[148]={0};u32 word;
     word=0xd3;memcpy(nested,&word,4);word=0x01000001;memcpy(nested+4,&word,4);
     word=0x09000004;memcpy(nested+8,&word,4);memcpy(nested+12,"EDID",4);
@@ -528,7 +531,7 @@ int main(int argc, char **argv)
     assert(!parse_panel_edid_data(nested,sizeof(nested),&nested_raw,&nested_size));
     assert(nested_size==128 && !memcmp(nested_raw,real,128));
     dcp_panel_edid_receive(&d,nested,sizeof(nested));
-    generation=desktop.panel_metadata_generation;
+    generation=desktop.generation;
     const struct drm_edid *copied=dcp_panel_edid_snapshot(&d,modes,3,&generation);
     assert(!IS_ERR(copied) && !memcmp(&copied->raw,real,128));drm_edid_free(copied);
     unsigned previous=notifications;
@@ -539,7 +542,7 @@ int main(int argc, char **argv)
     for(unsigned j=0;j<127;j++)real[127]-=real[j];
     assert(!dcp_panel_edid_has_identity(real));
     dcp_panel_edid_receive(&d,real,sizeof(real));assert(notifications==previous);
-    desktop.panel_raw_edid_size=0;notifications=1;
+    desktop.raw_edid_size=0;notifications=1;
     drm_edid_free(edid);
     /* Repeated and partial dictionaries cannot trigger monitor/brightness restore loops. */
     for(unsigned repeat=0;repeat<32;repeat++) {
@@ -550,17 +553,20 @@ int main(int argc, char **argv)
     struct dcp_display_metadata partial={.manufacturer="TST",.product=42};
     dcp_panel_metadata_replace(&d,&partial);
     assert(dcp_panel_metadata_current(&d,generation) && notifications==1);
-    assert(desktop.panel_metadata.serial==metadata.serial);
+    assert(desktop.metadata.serial==metadata.serial);
     metadata.serial++;
     dcp_panel_metadata_replace(&d,&metadata);
     assert(!dcp_panel_metadata_current(&d,generation) && notifications==2);
     edid=dcp_panel_edid_snapshot(&d,modes,3,&generation);
     assert(!IS_ERR(edid) && dcp_panel_metadata_current(&d,generation));
     drm_edid_free(edid);
-    /* Another firmware/profile cannot publish a desktop panel identity. */
+    /* Any firmware's internal panel takes its identity; no identity, nothing published. */
     desktop=(__typeof__(desktop)){0};d.fw_compat=2;dcp_panel_metadata_replace(&d,&metadata);
-    assert(!desktop.panel_metadata_valid);
-    metadata.manufacturer[0]='?';assert(IS_ERR(dcp_panel_edid(&metadata,modes,3,345,223)));
+    assert(desktop.metadata_valid && !strcmp(desktop.metadata.manufacturer,"TST"));
+    desktop=(__typeof__(desktop)){0};d.panel_identity=NULL;dcp_panel_metadata_replace(&d,&metadata);
+    assert(!desktop.metadata_valid && !dcp_panel_metadata_current(&d,0));
+    assert(PTR_ERR(dcp_panel_edid_snapshot(&d,modes,3,&generation))==-ENODEV);
+    metadata.manufacturer[0]='?';assert(IS_ERR(dcp_panel_edid(&metadata,NULL,modes,3,345,223)));
     return 0;
 }
 '''
@@ -591,6 +597,7 @@ def powerlog_framing(root):
     prefix += r'''
 #define DCP_FIRMWARE_H17P 1
 #define DCP_FIRMWARE_V_26_6_DESKTOP 5
+#define DCP_FIRMWARE_V_27_0 6
 #define DCP_IOMFB_METHODS_H17G 7
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
@@ -600,7 +607,9 @@ def powerlog_framing(root):
 #define __le64 u64
 #define EPIC_SUBTYPE_STD_SERVICE 0xc0
 enum epic_subtype { REPORT = 0xc0 };
-struct apple_dcp {void *dev;int fw_compat;struct {int iomfb_method_profile;} hw;struct {u32 nits;} brightness;};
+struct work_struct { unsigned scheduled; };
+static void __attribute__((unused)) schedule_work(struct work_struct *w) { w->scheduled++; }
+struct apple_dcp {void *dev;int fw_compat;struct {int iomfb_method_profile;} hw;struct {u32 nits,maximum;void *bl_dev;} brightness;struct work_struct bl_register_wq;};
 struct apple_epic_service;
 struct apple_dcp_afkep {struct apple_dcp *dcp;unsigned endpoint;struct apple_epic_service *service;};
 struct apple_epic_service_ops {int (*report)(struct apple_epic_service *,enum epic_subtype,const void *,size_t);};
@@ -657,10 +666,18 @@ int main(void)
     d.fw_compat=DCP_FIRMWARE_H17P;
     afk_recv_compact_message(&ep,3,wire,sizeof(wire)-8);
     assert(hints==3 && !service.users);
+    d.fw_compat=DCP_FIRMWARE_V_27_0;
+    afk_recv_compact_message(&ep,3,wire,sizeof(wire)-8);
+    assert(hints==3 && !service.users);
     d.fw_compat=DCP_FIRMWARE_V_26_6_DESKTOP;
     /* The first key without its value gives no reading. */
     afk_recv_compact_message(&ep,3,wire,24+12);
     assert(hints==3 && !service.users);
+    /* Firmware 27 takes a framed report's hint as H17P does. */
+    d.fw_compat=DCP_FIRMWARE_V_27_0;hint=0;
+    memcpy(wire+16,report,sizeof(report));
+    afk_recv_compact_message(&ep,3,wire,16+sizeof(report));
+    assert(hints==4 && hint==123000 && !service.users);
     return 0;
 }
 '''
@@ -787,8 +804,9 @@ def adt_identity(root):
 #include <stddef.h>
 #include <string.h>
 #include <errno.h>
-typedef uint8_t u8;typedef uint32_t u32;
+typedef uint8_t u8;typedef uint32_t u32;typedef int32_t s32;typedef int64_t s64;
 #define U16_MAX UINT16_MAX
+#define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
 #define SZ_16M (16U<<20)
 #define ALIGN(x,n) (((x)+(n)-1)&~((n)-1))
 #define ERR_PTR(x) ((void *)(intptr_t)(x))
@@ -796,7 +814,9 @@ typedef uint8_t u8;typedef uint32_t u32;
 #define IS_ERR(x) ((uintptr_t)(x)>(uintptr_t)-4096)
 static u32 get_unaligned_le32(const void *p) {u32 n;memcpy(&n,p,4);return n;}
 '''
-    code+=block((base/'dcp-display-metadata.h').read_text(),'struct dcp_display_metadata {')+';\n'
+    metadata=(base/'dcp-display-metadata.h').read_text()
+    code+=block(metadata,'struct dcp_display_metadata {')+';\n'
+    code+=block(metadata,'enum dcp_panel_gamut {')+';\n'
     code+=block(header,'struct dcp_panel_adt {')+';\n'+source
     code+='static const u8 fixture[]={'+','.join(map(str,data))+'};\n'
     return code+r'''

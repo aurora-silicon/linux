@@ -8,6 +8,7 @@ use core::ffi::{c_int, c_void};
 
 type ReadStats = unsafe extern "C" fn(*const c_void, *mut Readout);
 type SuspendStats = unsafe extern "C" fn(*const c_void, bool);
+type ReadFrequency = unsafe extern "C" fn(*const c_void, u32, *mut u64) -> bool;
 
 extern "C" {
     fn asahi_sysfs_register(
@@ -18,6 +19,7 @@ extern "C" {
         handle: *mut *mut c_void,
         read: Option<ReadStats>,
         suspend: Option<SuspendStats>,
+        frequency: Option<ReadFrequency>,
     ) -> c_int;
     fn asahi_sysfs_unregister(dev: *mut c_void, handle: *mut c_void);
 }
@@ -49,7 +51,14 @@ pub(crate) fn register(
     snapshot: *const StatsSnapshot,
     export_enabled: bool,
 ) -> kernel::error::Result<*mut c_void> {
-    register_with_callbacks(dev, snapshot, export_enabled, None, None)
+    register_with_callbacks(
+        dev,
+        snapshot,
+        export_enabled,
+        None,
+        None,
+        Some(read_frequency),
+    )
 }
 
 /// The caller retains the G17 snapshot Arc until unregister joins both sysfs
@@ -65,7 +74,24 @@ pub(crate) fn register_g17(
         export_enabled,
         Some(read_g17),
         Some(suspend_g17),
+        None,
     )
+}
+
+/// Look up the exact pstate printed by C in the retained firmware table.
+///
+/// # Safety
+///
+/// Registration retains `snapshot`; `out` is writable for one u64.
+unsafe extern "C" fn read_frequency(snapshot: *const c_void, pstate: u32, out: *mut u64) -> bool {
+    // SAFETY: The attribute is removed and readers joined before the Arc is dropped.
+    let snapshot = unsafe { &*snapshot.cast::<StatsSnapshot>() };
+    let Some(frequency) = snapshot.requested_frequency(pstate) else {
+        return false;
+    };
+    // SAFETY: C provides writable, aligned storage for this call.
+    unsafe { out.write(frequency) };
+    true
 }
 
 /// Copy the locked qualified snapshot to the C formatter's local output.
@@ -108,6 +134,7 @@ fn register_with_callbacks(
     export_enabled: bool,
     read: Option<ReadStats>,
     suspend: Option<SuspendStats>,
+    frequency: Option<ReadFrequency>,
 ) -> kernel::error::Result<*mut c_void> {
     let mut handle = core::ptr::null_mut();
     // SAFETY: The bound driver keeps the device and optional snapshot alive until
@@ -121,6 +148,7 @@ fn register_with_callbacks(
             &mut handle,
             read,
             suspend,
+            frequency,
         )
     };
     if ret < 0 {

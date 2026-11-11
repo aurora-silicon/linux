@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * MacBook Pro (14-inch PROLED XDR, M5 Pro, 2026)
+ *
+ * target-type: K114s (Mac17,13)
+ *
+ * Preliminary: described from the ADT only, not yet booted on the hardware.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+#include "t6050-k114-k116.dtsi"
+
+/ {
+	compatible = "apple,k114s", "apple,t6050", "apple,arm-platform";
+	model = "Apple MacBook Pro (14-inch PROLED XDR, M5 Pro, 2026)";
+};
+
+&mtp_multitouch {
+	firmware-name = "apple/tpmtfw-k114s.bin";
+};
+
+#define T6050_K114S
+#include "t6050-peripherals.dtsi"

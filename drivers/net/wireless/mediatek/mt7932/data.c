@@ -33,6 +33,12 @@ void mt_data_clean_locked(struct mt7932 *m)
 	if (READ_ONCE(m->connected) && mt_rf_allowed(m) && mt_bss_tx_allowed(m) &&
 	    !m->data_live[q->head] && q->queued < q->count - 1)
 		netif_wake_queue(m->netdev);
+#if IS_ENABLED(CONFIG_MT7932_AWDL)
+	if (READ_ONCE(m->awdl.active) && READ_ONCE(m->awdl.sync_enabled) &&
+	    READ_ONCE(m->awdl.slot_open) && !m->data_live[q->head] &&
+	    q->queued < q->count - 1)
+		netif_wake_queue(m->awdl.netdev);
+#endif
 }
 
 /*

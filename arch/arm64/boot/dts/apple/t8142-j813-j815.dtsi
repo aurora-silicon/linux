@@ -1,0 +1,302 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Shared by the 13- and 15-inch M5 MacBook Air (J813, J815).
+ *
+ * The J813 and J815 ADTs (25G83) describe the same CPU performance states,
+ * cluster controllers, PMC, SMC, MTP, ANS, watchdog and PMU. Each board
+ * supplies the CPUs, AIC, PMGR and MTP DART these nodes use, and names its
+ * trackpad firmware (the multi-touch hid-merge-personality differs).
+ */
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	aliases {
+		mtp = &mtp;
+		keyboard = &keyboard;
+	};
+
+	/* State 1 is 300 MHz; firmware SRAM OPP tables begin at state 2. */
+	/* Cap each cluster at its measured J813 firmware handoff state. */
+	ecluster_opp: opp-table-0 {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp-300000000 {
+			opp-hz = /bits/ 64 <300000000>;
+			opp-level = <1>;
+		};
+
+		opp-972000000 {
+			opp-hz = /bits/ 64 <972000000>;
+			opp-level = <2>;
+		};
+
+		opp-1152000000 {
+			opp-hz = /bits/ 64 <1152000000>;
+			opp-level = <3>;
+		};
+
+		opp-1584000000 {
+			opp-hz = /bits/ 64 <1584000000>;
+			opp-level = <4>;
+		};
+
+		opp-1992000000 {
+			opp-hz = /bits/ 64 <1992000000>;
+			opp-level = <5>;
+		};
+
+		opp-2352000000 {
+			opp-hz = /bits/ 64 <2352000000>;
+			opp-level = <6>;
+		};
+
+		opp-2700000000 {
+			opp-hz = /bits/ 64 <2700000000>;
+			opp-level = <7>;
+		};
+
+		opp-2964000000 {
+			opp-hz = /bits/ 64 <2964000000>;
+			opp-level = <8>;
+		};
+	};
+
+	pcluster_opp: opp-table-1 {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp-300000000 {
+			opp-hz = /bits/ 64 <300000000>;
+			opp-level = <1>;
+		};
+
+		opp-1308000000 {
+			opp-hz = /bits/ 64 <1308000000>;
+			opp-level = <2>;
+		};
+
+		opp-1608000000 {
+			opp-hz = /bits/ 64 <1608000000>;
+			opp-level = <3>;
+		};
+
+		opp-1932000000 {
+			opp-hz = /bits/ 64 <1932000000>;
+			opp-level = <4>;
+		};
+
+		opp-2220000000 {
+			opp-hz = /bits/ 64 <2220000000>;
+			opp-level = <5>;
+		};
+
+		opp-2508000000 {
+			opp-hz = /bits/ 64 <2508000000>;
+			opp-level = <6>;
+		};
+
+		opp-2820000000 {
+			opp-hz = /bits/ 64 <2820000000>;
+			opp-level = <7>;
+		};
+
+		opp-3072000000 {
+			opp-hz = /bits/ 64 <3072000000>;
+			opp-level = <8>;
+		};
+
+		opp-3300000000 {
+			opp-hz = /bits/ 64 <3300000000>;
+			opp-level = <9>;
+		};
+
+		opp-3516000000 {
+			opp-hz = /bits/ 64 <3516000000>;
+			opp-level = <10>;
+		};
+
+		/* ADT levels 11-20, measured on J813 (level 19, 4416 MHz, is below
+		 * level 18 and left out). The SoC throttles them when hot. */
+		opp-3720000000 {
+			opp-hz = /bits/ 64 <3720000000>;
+			opp-level = <11>;
+		};
+
+		opp-3876000000 {
+			opp-hz = /bits/ 64 <3876000000>;
+			opp-level = <12>;
+		};
+
+		opp-4020000000 {
+			opp-hz = /bits/ 64 <4020000000>;
+			opp-level = <13>;
+		};
+
+		opp-4176000000 {
+			opp-hz = /bits/ 64 <4176000000>;
+			opp-level = <14>;
+		};
+
+		opp-4248000000 {
+			opp-hz = /bits/ 64 <4248000000>;
+			opp-level = <15>;
+		};
+
+		opp-4272000000 {
+			opp-hz = /bits/ 64 <4272000000>;
+			opp-level = <16>;
+		};
+
+		opp-4332000000 {
+			opp-hz = /bits/ 64 <4332000000>;
+			opp-level = <17>;
+		};
+
+		opp-4428000000 {
+			opp-hz = /bits/ 64 <4428000000>;
+			opp-level = <18>;
+		};
+
+		opp-4464000000 {
+			opp-hz = /bits/ 64 <4464000000>;
+			opp-level = <20>;
+		};
+	};
+};
+
+&{/soc} {
+	cpufreq_e: performance-controller@210e20000 {
+		compatible = "apple,t8142-cluster-cpufreq";
+		reg = <0x2 0x10e20000 0 0x1000>;
+		#performance-domain-cells = <0>;
+	};
+
+	cpufreq_p: performance-controller@211e20000 {
+		compatible = "apple,t8142-cluster-cpufreq";
+		reg = <0x2 0x11e20000 0 0x1000>;
+		#performance-domain-cells = <0>;
+	};
+
+	/*
+	 * PMC voter interface (AppleT8142PMC, ADT pmc-pmgr 31 + 0x700000):
+	 * floors at 0x382700000 + agent * 0x4000, per-agent states at
+	 * +0x106000, rail enables at +0x108000. Agents (ADT voter-agent):
+	 * PMP 0, CLPC 1, GFX 2, AP 3. iBoot leaves every enable at 0, so
+	 * no vote is honoured and DRAM and fabric stay at their lowest
+	 * states (CPU DRAM latency 171 ns instead of 70 ns).
+	 */
+	pmc: power-management@382700000 {
+		compatible = "apple,t8142-pmc";
+		reg = <0x3 0x82700000 0x0 0x10000>,
+		      <0x3 0x82806000 0x0 0x3000>;
+		reg-names = "voters", "rails";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		/* PMP, CLPC and AP agents */
+		apple,static-voters = <0 1 3>;
+
+		clpc: performance-controller@1 {
+			compatible = "apple,t8142-clpc";
+			reg = <1>;
+		};
+	};
+
+	smc_mbox: mailbox@38c608000 {
+		compatible = "apple,t8142-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <3 0x8c608000 0 0x4000>;
+		interrupts = <AIC_IRQ 633 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 634 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 635 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 636 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+
+	smc: smc@38c600000 {
+		compatible = "apple,t8142-smc", "apple,t8103-smc";
+		reg = <3 0x8c600000 0 0x4000>, <3 0x8de00000 0 0x120000>;
+		reg-names = "smc", "sram";
+		mboxes = <&smc_mbox>;
+
+		hwmon {
+			compatible = "apple,smc-hwmon";
+			apple,discover-temperatures;
+		};
+
+		smc_gpio: gpio {
+			compatible = "apple,smc-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+	};
+
+	mtp: mtp@394600000 {
+		compatible = "apple,t8142-mtp", "apple,t8142-rtk-helper-asc4",
+			     "apple,mtp", "apple,rtk-helper-asc4";
+		/* The second region is firmware SRAM, not the ASC control window. */
+		reg = <3 0x94600000 0 0x4000>, <3 0x94c00000 0 0x100000>;
+		reg-names = "asc", "sram";
+		mboxes = <&mtp_mbox>;
+		iommus = <&mtp_dart 0>;
+	};
+
+	mtp_mbox: mailbox@394608000 {
+		compatible = "apple,t8142-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <3 0x94608000 0 0x4000>;
+		interrupts = <AIC_IRQ 1299 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1300 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1301 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1302 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+
+	mtp_dockchannel: fifo@394b14000 {
+		compatible = "apple,t8142-dockchannel", "apple,dockchannel";
+		reg = <3 0x94b14000 0 0x1000>;
+		reg-names = "irq";
+		interrupts = <AIC_IRQ 1277 IRQ_TYPE_LEVEL_HIGH>;
+		ranges = <0 3 0x94b28000 0x20000>;
+		nonposted-mmio;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+
+		mtp_hid: input@8000 {
+			compatible = "apple,dockchannel-hid";
+			reg = <0x8000 0x1000>, <0xc000 0x1000>,
+			      <0x0000 0x1000>, <0x4000 0x1000>;
+			reg-names = "config", "data", "rmt-config", "rmt-data";
+			iommus = <&mtp_dart 0>;
+			interrupt-parent = <&mtp_dockchannel>;
+			interrupts = <2 IRQ_TYPE_LEVEL_HIGH>, <3 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "tx", "rx";
+			apple,fifo-size = <0x800>;
+			apple,helper-cpu = <&mtp>;
+			/*
+			 * ADT dockchannel-mtp/mtp-transport/multi-touch:
+			 * function-afe-reset = smc-pmu pKW4('gP1c'), SMC GPIO 28.
+			 * The MTP firmware cannot reach the AFE on its own ("No
+			 * HINT_L"): after macOS left it running the trackpad
+			 * worked, after a Linux warm reboot it stayed in reset.
+			 */
+			apple,afe-reset-gpios = <&smc_gpio 28 GPIO_ACTIVE_LOW>;
+
+			stm { };
+
+			/* Each board names its own trackpad firmware. */
+			multi-touch {
+				apple,power-method = <2>;
+			};
+
+			/* Layout is filled by the loader using this machine's own data. */
+			keyboard: keyboard { };
+		};
+	};
+};
+
+#include "t8142-j813-psci-idle.dtsi"
+#include "t8142-j813-nvme.dtsi"
+#include "t8142-j813-power.dtsi"

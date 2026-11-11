@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT) AND GPL-2.0-only
 /*
  * Apple SMC (System Management Controller) MFD driver
  *
@@ -59,9 +59,59 @@ static const struct mfd_cell apple_smc_devs[] = {
 	MFD_CELL_OF("macsmc-rtc", NULL, NULL, 0, 0, "apple,smc-rtc"),
 };
 
-/* The second GPIO bank ('gp' keys) only exists on some SMCs. */
-static const struct mfd_cell apple_smc_low_gpio_dev =
-	MFD_CELL_OF("macsmc-low-gpio", NULL, NULL, 0, 0, "apple,smc-low-gpio");
+/* This profile exposes notifications and the explicitly described outputs. */
+static const struct mfd_cell apple_smc_t6050_devs[] = {
+	MFD_CELL_NAME("macsmc-input"),
+	MFD_CELL_NAME("macsmc-power"),
+	MFD_CELL_OF("macsmc-hwmon", NULL, NULL, 0, 0, "apple,smc-hwmon"),
+};
+
+/*
+ * Cells registered only where the device tree describes them: the MFD core would otherwise
+ * create an unbound device and warn that it found no node on every SMC without one. The pcIO
+ * outputs and the second GPIO bank ('gp' keys) only exist on some SMCs.
+ */
+static const struct mfd_cell apple_smc_described_devs[] = {
+	MFD_CELL_OF("macsmc-gpio", NULL, NULL, 0, 0, "apple,smc-pcio-gpio"),
+	MFD_CELL_OF("macsmc-low-gpio", NULL, NULL, 0, 0, "apple,smc-low-gpio"),
+};
+
+/*
+ * T6050's reboot/power-off and RTC, for a kernel that owns the machine (J775D, booted bare
+ * metal). Registered only where the device tree describes them, so a T6050 device tree without
+ * them registers what it did before.
+ */
+static const struct mfd_cell apple_smc_t6050_described_devs[] = {
+	MFD_CELL_OF("macsmc-reboot", NULL, NULL, 0, 0, "apple,smc-reboot"),
+	MFD_CELL_OF("macsmc-rtc", NULL, NULL, 0, 0, "apple,smc-rtc"),
+};
+
+static int apple_smc_add_described_devices(struct apple_smc *smc, const struct mfd_cell *cells,
+					   size_t count)
+{
+	struct device_node *np;
+	size_t i;
+	int ret;
+
+	for (i = 0; i < count; i++) {
+		np = of_get_compatible_child(smc->dev->of_node, cells[i].of_compatible);
+		if (!np)
+			continue;
+		of_node_put(np);
+		ret = devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE, &cells[i], 1,
+					   NULL, 0, NULL);
+		if (ret)
+			return dev_err_probe(smc->dev, ret, "Failed to register %s\n",
+					     cells[i].name);
+	}
+
+	return 0;
+}
+
+/* T8152 currently exposes read-only telemetry; firmware owns fan control. */
+static const struct mfd_cell apple_smc_telemetry_devs[] = {
+	MFD_CELL_OF("macsmc-hwmon", NULL, NULL, 0, 0, "apple,smc-hwmon"),
+};
 
 static void apple_smc_read_sram(struct apple_smc *smc, void *buf, size_t size)
 {
@@ -245,8 +295,8 @@ int apple_smc_get_key_info(struct apple_smc *smc, smc_key key, struct apple_smc_
 	u8 key_info[6];
 	int ret;
 
+	/* Keep the shared reply buffer stable until its metadata is copied. */
 	guard(mutex)(&smc->mutex);
-
 	ret = apple_smc_cmd_locked(smc, SMC_MSG_GET_KEY_INFO, key, 0, 0, NULL);
 	if (ret >= 0 && info) {
 		apple_smc_read_sram(smc, key_info, sizeof(key_info));
@@ -478,9 +528,9 @@ static void apple_smc_disable_notifications(void *data)
 static int apple_smc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-	struct device_node *np;
 	struct apple_smc *smc;
 	__be32 count = 0;
+	bool t6050;
 	int ret;
 
 	smc = devm_kzalloc(dev, sizeof(*smc), GFP_KERNEL);
@@ -541,37 +591,43 @@ static int apple_smc_probe(struct platform_device *pdev)
 		return dev_err_probe(smc->dev, ret, "Failed to get key count");
 	smc->key_count = be32_to_cpu(count);
 
+	/* Notifications, GPIO and power management are not qualified on T8152. */
+	if (of_device_is_compatible(dev->of_node, "apple,t8152-smc"))
+		return devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
+					    apple_smc_telemetry_devs,
+					    ARRAY_SIZE(apple_smc_telemetry_devs),
+					    NULL, 0, NULL);
+
 	/* Enable notifications */
 	apple_smc_write_flag(smc, SMC_KEY(NTAP), true);
 	ret = devm_add_action_or_reset(dev, apple_smc_disable_notifications, smc);
 	if (ret)
 		return ret;
 
-	ret = devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
-				   apple_smc_devs, ARRAY_SIZE(apple_smc_devs),
-				   NULL, 0, NULL);
+	t6050 = of_device_is_compatible(dev->of_node, "apple,t6050-smc");
+	if (t6050)
+		ret = devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
+					 apple_smc_t6050_devs,
+					 ARRAY_SIZE(apple_smc_t6050_devs), NULL, 0, NULL);
+	else
+		ret = devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
+					 apple_smc_devs, ARRAY_SIZE(apple_smc_devs),
+					 NULL, 0, NULL);
 	if (ret)
 		return dev_err_probe(smc->dev, ret, "Failed to register sub-devices");
 
-	/*
-	 * Register the second GPIO bank only where the device tree describes
-	 * it: the MFD core would otherwise create an unbound device and warn
-	 * that it found no node on every SMC without one.
-	 */
-	np = of_get_compatible_child(dev->of_node, "apple,smc-low-gpio");
-	if (np) {
-		of_node_put(np);
-		ret = devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
-					   &apple_smc_low_gpio_dev, 1, NULL, 0, NULL);
-		if (ret)
-			return dev_err_probe(smc->dev, ret,
-					     "Failed to register the second GPIO bank");
-	}
+	ret = apple_smc_add_described_devices(smc, apple_smc_described_devs,
+					      ARRAY_SIZE(apple_smc_described_devs));
+	if (ret || !t6050)
+		return ret;
 
-	return 0;
+	return apple_smc_add_described_devices(smc, apple_smc_t6050_described_devs,
+					       ARRAY_SIZE(apple_smc_t6050_described_devs));
 }
 
 static const struct of_device_id apple_smc_of_match[] = {
+	{ .compatible = "apple,t8152-smc" },
+	{ .compatible = "apple,t6050-smc" },
 	{ .compatible = "apple,t8103-smc" },
 	{ .compatible = "apple,smc" },
 	{},

@@ -10,6 +10,7 @@
 /dts-v1/;
 
 #include "t6034.dtsi"
+#include "t6031-dcp.dtsi"
 #include "t603x-j514-j516.dtsi"
 
 / {
@@ -29,6 +30,22 @@
 	brcm,board-type = "apple,texa";
 };
 
+/* The J514S panel: the same chassis. Not yet read from a J514M. */
+&dcp {
+	panel: panel {
+		compatible = "apple,panel-j514", "apple,panel-mini-led", "apple,panel";
+		width-mm = <302>;
+		height-mm = <196>;
+		adj-height-mm = <189>;
+		apple,max-brightness = <500>;
+	};
+};
+
+&framebuffer0 {
+	panel = <&panel>;
+	post-init-providers = <&panel>;
+};
+
 &aop_audio {
 	apple,chassis-name = "J514";
 	apple,machine-kind = "MacBook Pro";
@@ -37,4 +54,20 @@
 &sound {
 	compatible = "apple,j514-macaudio", "apple,j314-macaudio", "apple,macaudio";
 	model = "MacBook Pro J514";
+};
+
+&i2c4 {
+	sd_card_control: card-control@20 {
+		compatible = "apple,t6031-sd-card-control", "apple,sd-card-control";
+		reg = <0x20>;
+		status = "disabled";
+	};
+};
+
+&i2c8 {
+	display_pcon: display-converter@8 {
+		compatible = "apple,t6031-display-pcon", "apple,display-pcon";
+		reg = <0x8>;
+		status = "disabled";
+	};
 };

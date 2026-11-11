@@ -14,9 +14,9 @@
 //!
 //! # Plugging into the shared driver
 //!
-//! - [`Driver`] is a separate platform driver for `apple,agx-t8132` without a module alias, so
-//!   probing (which boots the firmware) happens when userspace loads the module after the native
-//!   display is up. It calls [`crate::driver::AsahiPlatformDriver::probe_g16`].
+//! - [`Driver`] is a separate platform driver for `apple,agx-t8132` with a module alias. Its
+//!   probe waits for the PMP supplier and the native display before booting firmware. It calls
+//!   [`crate::driver::AsahiPlatformDriver::probe_g16`].
 //! - [`Gpu`] implements [`crate::gpu::Gpu`]: GET_PARAMS identity, VM creation (`new_vm`),
 //!   queues (`new_queue`, see [`queue`]) and timestamp buffers.
 //! - User VMs are shared-layer [`mmu::Vm`]s on a [`mmu::Uat::new_adopted`] UAT with tracked
@@ -118,15 +118,19 @@ pub(crate) struct Config {
 }
 
 /// OF match table of the G16 platform driver.
-///
-/// Deliberately not exported with `module_device_table!`: without a module alias, the asahi
-/// module is not loaded at boot for this GPU, and the firmware only starts when userspace loads
-/// the module after the native display is up (the J713 bring-up order).
 const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, &'static Config, 1> =
     kernel::device_id::IdArray::new([(
         of::DeviceId::new(c_str!("apple,agx-t8132")),
         &&hw::t8132::CONFIG,
     )]);
+
+// Probe admission waits for the PMP supplier and the native display before
+// firmware starts, so the module may be loaded at device creation.
+kernel::of_device_table!(
+    AUTOLOAD_OF_TABLE,
+    @none,
+    [of::DeviceId::new(c_str!("apple,agx-t8132"))]
+);
 
 /// The G16 platform driver: the shared [`AsahiPlatformDriver`] probed through
 /// [`AsahiPlatformDriver::probe_g16`].
@@ -169,7 +173,8 @@ impl platform::Driver for Driver {
     fn unbind<'bound>(_pdev: &'bound platform::Device<Core<'_>>, this: Pin<&Self::Data<'bound>>) {
         if let Some(driver) = this.get_ref() {
             if let Some(gpu) = &driver.g16 {
-                gpu.retain();
+                // Admission pinned the module; this only confirms the pin.
+                let _ = gpu.retain();
             }
             driver.close_binding();
         }
@@ -411,17 +416,17 @@ impl Gpu {
             },
             GFP_KERNEL,
         )?;
-        gpu.retain();
+        gpu.retain()?;
         Ok(gpu)
     }
 
     /// Keeps the firmware session and this module alive until reboot.
     ///
-    /// Takes the module reference once. Nothing firmware-reachable is freed on any path: the
-    /// RTKit callbacks hold [`Shared`], which holds the [`Firmware`] (or the [`boot::Orphan`] of a
-    /// failed start) until reboot.
-    pub(crate) fn retain(&self) {
-        boot::glue::retain_module();
+    /// Takes the module reference once; admission already took it, so this only confirms it.
+    /// Nothing firmware-reachable is freed on any path: the RTKit callbacks hold [`Shared`],
+    /// which holds the [`Firmware`] (or the [`boot::Orphan`] of a failed start) until reboot.
+    pub(crate) fn retain(&self) -> Result {
+        boot::glue::retain_module()
     }
 }
 

@@ -108,18 +108,27 @@ static int powerlog_report(struct apple_epic_service *service, enum epic_subtype
 	dev_dbg(dcp->dev, "systemep: mNits event: Nits: %u.%03u, iDAC: %u\n",
 		mnits.millinits / 1000, mnits.millinits % 1000, mnits.idac);
 have_mnits:
-	if ((dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	if (((dcp->fw_compat == DCP_FIRMWARE_H17P || dcp->fw_compat == DCP_FIRMWARE_V_27_0) &&
 	     dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) ||
 	    dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
 		if (!dcp_has_panel(dcp))
 			return 0;
 		ret = dcp_backlight_takeover(dcp, mnits.millinits);
-		if (ret && ret != -EBUSY)
+		/*
+		 * With EDR the firmware reports the panel level times the
+		 * headroom, beyond the SDR range: not a loader level, and
+		 * reported with every EDR step, so not worth a message.
+		 */
+		if (ret && ret != -EBUSY && ret != -ERANGE)
 			dev_dbg(dcp->dev, "backlight takeover hint unavailable: %d\n", ret);
 		return 0;
 	}
 
 	dcp->brightness.nits = mnits.millinits / 1000;
+	/* H17G publishes no NITS property; its first report registers the device. */
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G &&
+	    dcp_has_panel(dcp) && !dcp->brightness.bl_dev && dcp->brightness.maximum > 0)
+		schedule_work(&dcp->bl_register_wq);
 
 	return 0;
 }

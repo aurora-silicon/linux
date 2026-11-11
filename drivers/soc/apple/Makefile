@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
+obj-$(CONFIG_APPLE_SIO_AES) += apple-sio-aes.o
+
+obj-$(CONFIG_APPLE_DBGVIEW) += apple-dbgview.o
+apple-dbgview-y = dbgview.o
+
 obj-$(CONFIG_APPLE_DOCKCHANNEL) += apple-dockchannel.o
 apple-dockchannel-y = dockchannel.o
 
@@ -44,7 +49,7 @@ obj-$(CONFIG_APPLE_SEP_FV_INTERFACE) += fv_shim.o
 obj-$(CONFIG_APPLE_SEP) += apple-sep.o
 apple-sep-y := sep.o hwrng_shim.o store_shim.o bio_shim.o sha_shim.o \
 		crypto_shim.o sensor_shim.o p256_shim.o trusted_shim.o work_shim.o \
-		pm_shim.o diag_shim.o
+		pm_shim.o diag_shim.o attach_shim.o
 
 obj-$(CONFIG_APPLE_PMP) += apple-pmp.o
 apple-pmp-y := pmp.o pmp-export.o pmp-display.o pmp-telemetry.o
@@ -56,4 +61,7 @@ apple-mcc-y := mcc.o
 
 obj-$(CONFIG_APPLE_CLPC) += clpc.o
 
-obj-$(CONFIG_APPLE_SART_APIF) += apple-sart-apif.o
+obj-$(CONFIG_APPLE_REGVIEW) += apple-regview.o
+apple-regview-y := regview.o
+
+obj-$(CONFIG_APPLE_AURORA_BOOT_SECURITY) += aurora-boot-security.o

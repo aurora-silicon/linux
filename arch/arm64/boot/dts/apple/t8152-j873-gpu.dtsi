@@ -1,0 +1,151 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple Mac mini (M6), J873: G18G GPU resources of the T8152.
+ *
+ * Addresses and sizes follow the 26A428 ADT /arm-io/sgx, gfx-asc and
+ * gfx1-asc nodes. This only describes the hardware; it does not start the
+ * firmware or change the GPU's power state.
+ *
+ * Unless a loader prepares the boot, nothing here starts the GPU:
+ *  - the driver's G18 backend binds "apple,agx-t8152", but refuses with
+ *    ENODEV before any firmware access unless the loader's /chosen
+ *    aurora,g18g-gpu-firmware-profile receipt matches, and before any MMIO
+ *    with aurora.g18_initdata_test=0;
+ *  - the eight reserved regions are boot-local. They stay disabled with a
+ *    zero reg until the loader copies this boot's /arm-io/sgx base and size
+ *    values into them and sets status = "okay" (as m1n1 dt_set_resvmem()
+ *    does). The loader finds them by these node names;
+ *  - the four firmware segment carveouts (GFX/GFX1 __DATA and
+ *    __DATA_SHARED_RO) are no-map, so they never enter the linear map. The
+ *    driver only takes their resources, and maps __DATA read-only to scan
+ *    for a crash log. The four UAT regions stay mapped: the driver uses
+ *    their pages as System RAM;
+ *  - the GFX and GFX1 ASCWrap v8 mailboxes stay disabled. The loader enables
+ *    both together with the /chosen aurora,g18g-gpu-firmware-profile
+ *    property, and only after it has checked the loaded firmware images.
+ *    Even then the provider only maps its windows: ASC CPU control is
+ *    refused unless apple_mailbox.ascwrap_v8_cpu_control=1 is given, and the
+ *    receive side is polled, with no interrupt enabled, unless
+ *    apple_mailbox.ascwrap_v8_rx_irq=1 is given.
+ *
+ * No power-domain is attached. The GPU is powered by PMGR2 PSD services 3
+ * (sgx), 81 (gfx-asc) and 82 (gfx1-asc). Their 0x100-byte service blocks
+ * are listed for state reads (state +0x80, ack +0xbc).
+ */
+
+/* Loaders locate the node through this alias (m1n1 dt_set_gpu()). */
+&{/aliases} {
+	gpu = &gpu;
+};
+
+&{/reserved-memory} {
+	/* sgx gpu-region */
+	uat_ttbs: uat-ttbs {
+		reg = <0 0 0 0>;
+		status = "disabled";
+	};
+
+	/* sgx gfx-shared-region (0x80000) */
+	uat_pagetables: uat-pagetables {
+		reg = <0 0 0 0>;
+		status = "disabled";
+	};
+
+	/* sgx gfx-handoff */
+	uat_handoff: uat-handoff {
+		reg = <0 0 0 0>;
+		status = "disabled";
+	};
+
+	/* sgx gfx-shared-l2-region */
+	uat_l2_pagetables: uat-l2-pagetables {
+		reg = <0 0 0 0>;
+		status = "disabled";
+	};
+
+	/* GFX __DATA (0xbc000 on 26A428) */
+	gfx_data: gfx-data {
+		reg = <0 0 0 0>;
+		no-map;
+		status = "disabled";
+	};
+
+	/* GFX1 __DATA (0xb4000 on 26A428) */
+	gfx1_data: gfx1-data {
+		reg = <0 0 0 0>;
+		no-map;
+		status = "disabled";
+	};
+
+	/* GFX __DATA_SHARED_RO (0x8000, firmware VA +0x10c000), never host-writable */
+	gfx_data_shared_ro: gfx-data-shared-ro {
+		reg = <0 0 0 0>;
+		no-map;
+		status = "disabled";
+	};
+
+	/* GFX1 __DATA_SHARED_RO (0x8000, firmware VA +0x108000), never host-writable */
+	gfx1_data_shared_ro: gfx1-data-shared-ro {
+		reg = <0 0 0 0>;
+		no-map;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	gpu: gpu@580000000 {
+		compatible = "apple,agx-t8152";
+		/*
+		 * ADT sgx reg[0]. ADT reg[1] (0x580d00000/0x180000) lies inside
+		 * it and is reached through this window. The PSD service blocks
+		 * follow.
+		 */
+		reg = <5 0x80000000 0 0x4000000>,
+		      <3 0x03a10300 0 0x100>,
+		      <3 0x03a15100 0 0x100>,
+		      <3 0x03a15200 0 0x100>;
+		reg-names = "sgx", "psd-sgx", "psd-gfx-asc", "psd-gfx1-asc";
+		memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>,
+				<&uat_l2_pagetables>, <&gfx_data>, <&gfx1_data>,
+				<&gfx_data_shared_ro>, <&gfx1_data_shared_ro>;
+		memory-region-names = "ttbs", "pagetables", "handoff", "shared-l2",
+				      "gfx-data", "gfx1-data",
+				      "gfx-data-shared-ro", "gfx1-data-shared-ro";
+		mboxes = <&gfx_asc>, <&gfx1_asc>;
+	};
+
+	/*
+	 * ADT gfx-asc: iop,ascwrap-v8, msgbox-mailbox-num = 1, alias,
+	 * postoffice. Only this role's 0x80-byte post-office window
+	 * (0x316020000 + (2 * 1 + 0) * 0x80) is claimed; the rest of the
+	 * 0x316020000 bank belongs to PMP, DCP, DCPEXT and SCALER0.
+	 * Interrupt index 0 is send-empty and index 1 recv-not-empty, as in
+	 * the macOS ASCWrap v8 driver. The provider polls by default.
+	 */
+	gfx_asc: mailbox@582600000 {
+		compatible = "apple,t8152-gfx-ascwrap-v8";
+		reg = <5 0x82600000 0 0x74000>, <5 0x82050000 0 8>,
+		      <3 0x16020100 0 0x80>, <3 0x03a15100 0 0x100>;
+		reg-names = "wrapper", "iop-vbar", "mailbox", "psd";
+		interrupts = <AIC_IRQ 300 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 260 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "recv-not-empty";
+		apple,firmware-role = "GFX";
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	/* ADT gfx1-asc: msgbox-mailbox-num = 2, window 0x316020200. */
+	gfx1_asc: mailbox@582e00000 {
+		compatible = "apple,t8152-gfx-ascwrap-v8";
+		reg = <5 0x82e00000 0 0x74000>, <5 0x82850000 0 8>,
+		      <3 0x16020200 0 0x80>, <3 0x03a15200 0 0x100>;
+		reg-names = "wrapper", "iop-vbar", "mailbox", "psd";
+		interrupts = <AIC_IRQ 301 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 261 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "recv-not-empty";
+		apple,firmware-role = "GFX1";
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+};

@@ -93,7 +93,9 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *r,void *x) { (
 struct tps6598x;
 struct tipd_data { REMOVE_RETURN (*remove)(struct tps6598x *); void (*unregister_port)(struct tps6598x *); int (*reset)(struct tps6598x *); };
 struct typec_port { struct typec_mux *mux; };
-struct tps6598x { bool remove_safe_prepared; struct typec_mux *mux; void *partner,*dev,*psy,*role_sw,*reset,*partner_altmode_dp; int irq,wq_poll; struct typec_port *port; struct tipd_data *data; };
+struct tps6598x;
+struct tipd_contaminant_ops { int (*update)(struct tps6598x *); void (*stop)(struct tps6598x *); };
+struct tps6598x { bool remove_safe_prepared; struct typec_mux *mux; void *partner,*dev,*psy,*role_sw,*reset,*partner_altmode_dp; int irq,wq_poll; struct typec_port *port; struct tipd_data *data; const struct tipd_contaminant_ops *contaminant_ops; };
 struct cd321x { struct tps6598x tps; struct typec_mux *mux; void *tbt_switch; };
 struct typec_thunderbolt_switch_data { int state; };
 static void cd321x_stop_work(struct cd321x *c) { (void)c;event('W'); }

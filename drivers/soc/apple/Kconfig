@@ -4,6 +4,33 @@ if ARCH_APPLE || COMPILE_TEST
 
 menu "Apple SoC drivers"
 
+config APPLE_SIO_AES
+	tristate "Apple SIO AES probe-time diagnostics"
+	depends on OF && HAS_IOMEM && PM && IOMMU_API
+	help
+	  Capture the S8000-family AES readiness and hardware-key disable
+	  state once at probe on T6000, T8112, T6041 and T8140. The snapshot
+	  is logged and available in a root-readable debugfs state file.
+	  Revision is reported from the SoC compatible; register words are
+	  raw diagnostics, not a claim that a hardware key is usable.
+
+	  This does not enable the engine, submit commands, handle interrupts,
+	  register crypto algorithms or provide a device node. Keep the DT
+	  node disabled except during an explicitly enabled diagnostic boot.
+
+config APPLE_DBGVIEW
+	tristate "Apple SoC read-only debug register views"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on ARM64 && OF && DEBUG_FS
+	help
+	  Root-only debugfs views of Apple SoC debug register blocks: the
+	  interrupt controller timebase, the debug dock connection
+	  status and the unused DWI interface of T6000, T8112 and T8140.
+	  The driver only reads registers, and only when a debugfs file is
+	  read.
+
+	  Say m here if you debug an Apple SoC.
+
 config APPLE_DOCKCHANNEL
 	tristate "Apple DockChannel FIFO"
 	depends on ARCH_APPLE || COMPILE_TEST
@@ -104,16 +131,6 @@ config APPLE_SART
 
 	  Say 'y' here if you have an Apple SoC.
 
-config APPLE_SART_APIF
-	bool "Apple SART over the Aurora platform interface"
-	depends on ARM64 && OF && APPLE_SART=y
-	select AURORA_APIF_MMIO
-	help
-	  SART provider for a trusted Linux guest under Aura and SPTM.
-	  Consumers retain the existing Apple SART API. Native call selection,
-	  region tracking and completion interpretation stay in this backend.
-	  Existing raw-MMIO SART providers continue to serve other systems.
-
 config APPLE_TUNABLE
 	tristate
 	depends on ARCH_APPLE || COMPILE_TEST
@@ -203,6 +220,19 @@ config APPLE_SEP_KUNIT_TEST
 
 	  If unsure, say N.
 
+config APPLE_SEP_KEY_RESEARCH
+	bool "Apple SEP: /dev/sep-key context-reuse measurements (research only)"
+	depends on APPLE_SEP
+	help
+	  Build the SEP_KEY_SELFTEST modes that run a second key operation in
+	  a credential context a Touch ID match has satisfied (modes 20 and
+	  21). They measure what the enclave allows; a production kernel never
+	  issues more than one operation per match, and without this option
+	  the code that could do so is not built at all. The modes still need
+	  root and the key_selftest module parameter.
+
+	  Say N unless you are measuring the enclave on a lab machine.
+
 config APPLE_PMP
 	tristate "Apple Power Management Processor"
 	depends on ARCH_APPLE || COMPILE_TEST
@@ -237,6 +267,18 @@ config APPLE_T8132_PLATFORM_KUNIT_TEST
 	  Tests require a J713 description; a QEMU fixture can supply a legacy
 	  tree without enabling any Apple hardware drivers. These tests only
 	  read metadata and never access the described MMIO resources.
+
+config APPLE_REGVIEW
+	tristate "Apple SoC read-only register views"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on OF && DEBUG_FS
+	help
+	  Exposes fixed lists of registers of Apple SoC blocks that have no
+	  functional driver, such as the memory cache controller, as
+	  read-only files under /sys/kernel/debug/apple-regview. The driver never writes to these
+	  blocks. Only registers known to be safe to read are listed.
+
+	  This is a development aid. If unsure, say 'n'.
 
 config APPLE_CLPC
 	tristate "Apple host performance controller floors"
@@ -325,6 +367,35 @@ config APPLE_DISPLAY_GATE_KUNIT_TEST
 	  J616c: each external display chain is enabled without a PMP once
 	  its processor has firmware memory, and the display subsystem's
 	  status is never written.
+
+config APPLE_AURORA_BOOT_SECURITY
+	tristate "Report how the boot chain verified this boot"
+	depends on OF
+	default y if ARCH_APPLE
+	help
+	  aura (Stage 1 and Stage 2) and U-Boot leave a record of what
+	  each stage measured and verified in /chosen/aurora,boot-security,
+	  together with what iBoot reports about the LocalPolicy that
+	  admitted Stage 1. This driver logs the chain state at boot and
+	  exposes it in /sys/firmware/aurora/boot_security/.
+
+	  The record is the firmware's account, not a proof: it is only
+	  called verified when an enforcing Stage 1 verified Stage 2.
+
+config APPLE_AURORA_BOOT_SECURITY_LOCKDOWN
+	bool "Lock the kernel down (integrity) on a verified boot"
+	depends on APPLE_AURORA_BOOT_SECURITY=y && SECURITY_LOCKDOWN_LSM && EFI
+	default y
+	help
+	  Raise lockdown to integrity when the firmware says this boot is
+	  on the secure path: UEFI Secure Boot is enforcing (the SecureBoot
+	  variable, or U-Boot's entry in the boot record), or the record's
+	  chain is verified from an enforcing Stage 1 on. This is the
+	  equivalent of locking down under UEFI Secure Boot on other
+	  platforms. Unsigned modules, unsigned kexec, /dev/mem and similar
+	  interfaces are then refused. A boot in audit or off mode is not
+	  locked down by this option; lockdown= on the command line still
+	  applies.
 
 endmenu
 

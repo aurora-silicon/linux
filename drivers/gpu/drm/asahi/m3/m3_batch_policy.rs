@@ -83,8 +83,50 @@ pub(crate) const fn packet_retired(pending: bool, active: bool) -> bool {
     !pending && !active
 }
 
+/// A failed packet that no batch ever included can drop its VM job guard: the firmware never saw
+/// it. Any other keeps the guard, and its VM stays quarantined, until the runtime drops it.
+pub(crate) const fn release_unpublished(may_be_published: bool) -> bool {
+    !may_be_published
+}
+
 pub(crate) const fn retain_runtime(stop_failed: bool, gpu_pending: bool) -> bool {
     stop_failed || gpu_pending
+}
+
+/// One firmware start per boot. `stop_asc` only clears RUN: it doesn't reset the firmware or
+/// give back a reusable RTKit or InitData state, and TTBAT context 0 still names the lower root
+/// the first start adopted, which is freed once ASC has stopped. Claimed just before the first
+/// ASC start and never released.
+pub(crate) struct StartLatch(core::sync::atomic::AtomicBool);
+impl StartLatch {
+    pub(crate) const fn new() -> Self { Self(core::sync::atomic::AtomicBool::new(false)) }
+    /// True for the first claim only.
+    pub(crate) fn claim(&self) -> bool { !self.0.swap(true, core::sync::atomic::Ordering::AcqRel) }
+}
+
+/// Why a start was refused before ASC.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StartRefusal {
+    /// The module is being removed: nothing is claimed or started.
+    Removing,
+    /// This boot's start already happened: the extra module reference is dropped again.
+    AlreadyStarted,
+}
+
+/// Pins the module, then claims `latch`. The pin comes first, so a probe racing an ordinary
+/// rmmod fails closed instead of reviving the module's reference count. A start that loses the
+/// claim drops only its own pin; the winner keeps its pin for good, so a reload can't forget the
+/// latch.
+pub(crate) fn claim_start(latch: &StartLatch, pin: impl FnOnce() -> bool, unpin: impl FnOnce())
+    -> Result<(), StartRefusal> {
+    if !pin() {
+        return Err(StartRefusal::Removing);
+    }
+    if !latch.claim() {
+        unpin();
+        return Err(StartRefusal::AlreadyStarted);
+    }
+    Ok(())
 }
 
 #[derive(Default)]

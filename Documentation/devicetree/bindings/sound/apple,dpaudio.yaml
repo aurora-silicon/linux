@@ -1,0 +1,93 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/apple,dpaudio.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple DisplayPort audio interface
+
+maintainers:
+  - Ryan Murray <ryan@aurorasilicon.org>
+
+description: |
+  The display processor provides a firmware audio service. Samples arrive
+  through an SIO DMA channel, and the graph connects the audio interface to
+  the display processor's audio service. The interface has a PMGR power gate.
+
+  Existing device trees also identify a register window. The firmware audio
+  transport does not program that window directly.
+
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t8112-dpaudio
+  required:
+    - compatible
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t8112-dpaudio
+      - const: apple,dpaudio
+
+  reg:
+    maxItems: 1
+
+  dmas:
+    maxItems: 1
+
+  dma-names:
+    const: tx
+
+  power-domains:
+    maxItems: 1
+
+  reset-domains:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    maxItems: 1
+    items:
+      maxItems: 1
+    description: PMGR provider used to reset the display audio interface.
+
+  ports:
+    $ref: /schemas/graph.yaml#/properties/ports
+    properties:
+      port@0:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: Connection to the display processor's audio service.
+    required:
+      - port@0
+
+required:
+  - compatible
+  - dmas
+  - dma-names
+  - power-domains
+  - ports
+
+additionalProperties: false
+
+examples:
+  - |
+    audio-controller {
+        compatible = "apple,t8112-dpaudio", "apple,dpaudio";
+        dmas = <&sio 0x66>;
+        dma-names = "tx";
+        power-domains = <&ps_dpa1>;
+
+        ports {
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            port@0 {
+                reg = <0>;
+
+                endpoint {
+                    remote-endpoint = <&dcpext_audio>;
+                };
+            };
+        };
+    };

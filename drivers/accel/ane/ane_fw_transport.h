@@ -86,10 +86,28 @@ struct ane_fw_transport_ops {
 	u64 (*now_ns)(void *ctx);
 	/* Wait before the next poll of a wait that began waited_ns ago. */
 	void (*relax)(void *ctx, u64 waited_ns);
+	/*
+	 * Optional: the non-waiting half of relax() (drain the mailbox, check
+	 * faults). It touches shared transport state, so callers that drop
+	 * their lock around the pause call it first, with the lock held.
+	 */
+	void (*service)(void *ctx);
+	/*
+	 * Optional: the waiting half of relax(), safe without the caller's
+	 * lock (it may end early on the channel IRQ). Default
+	 * ane_fw_poll_pause().
+	 */
+	void (*pause)(void *ctx, u64 waited_ns);
 	int (*alloc)(void *ctx, size_t size, u32 tag, struct ane_fw_surface *surface);
 	void (*refused)(void *ctx, u64 word0, u64 word1, u64 word2, int error);
 	/* Optional: a shared allocation was freed ("FREE") or served again ("reuse"). */
 	void (*shared_note)(void *ctx, const char *event, u64 dva, u64 size, u32 tag);
+	/*
+	 * Optional: true once the firmware's CPU no longer runs, so no reply can
+	 * come. A wait then ends at once with -ESHUTDOWN instead of at its
+	 * deadline.
+	 */
+	bool (*stopped)(void *ctx);
 };
 
 struct ane_fw_transaction {
@@ -311,7 +329,7 @@ static inline int ane_fw_transport_arm(struct ane_fw_transport *t)
 }
 
 /*
- * The H17 firmware's direct submission path reuses the engine's current BAR
+ * The H16/H17 firmware's direct submission path reuses the engine's current BAR
  * context. When that context came from a different program, a job (of a new
  * or previously loaded program, even after the earlier one was destroyed) can
  * write through the earlier program's output binding. Bit 0 of the request
@@ -319,8 +337,7 @@ static inline int ane_fw_transport_arm(struct ane_fw_transport *t)
  * installs a fresh BAR context. Queue the first EXECUTE after any change of program, process or
  * program lifetime; later jobs of the same process keep the direct path. This
  * lifts the one-program-per-firmware-session limit. Applies to the pool copy,
- * so every published EXECUTE follows the rule. H16 shares the firmware
- * architecture but has not executed under Linux yet; it is left unchanged.
+ * so every published EXECUTE follows the rule.
  */
 static inline void
 ane_fw_transport_bar_context(struct ane_fw_transport *t, u8 *copy, size_t size)
@@ -350,12 +367,11 @@ ane_fw_transport_bar_context(struct ane_fw_transport *t, u8 *copy, size_t size)
 
 /*
  * Whether one firmware session may run several programs: the transport
- * queues the first EXECUTE after every program change (H17, above). H16
- * shares the firmware design, but the rule is unconfirmed there.
+ * queues the first EXECUTE after every program change (above).
  */
 static inline bool ane_fw_transport_switch_safe(const struct ane_fw_transport *t)
 {
-	return t->soc->chip_family == 17;
+	return t->soc->chip_family == 16 || t->soc->chip_family == 17;
 }
 
 /* Commands are copied into a monotonic pool arena, never external DMA memory. */
@@ -904,6 +920,8 @@ static inline int ane_fw_transport_wait(struct ane_fw_transport *t, unsigned int
 		now = t->ops->now_ns(t->ctx);
 		if (now >= t->pending[ch].deadline_ns)
 			return ane_fw_transport_fail(t, -ETIMEDOUT);
+		if (t->ops->stopped && t->ops->stopped(t->ctx))
+			return ane_fw_transport_fail(t, -ESHUTDOWN);
 		t->polls++;
 		t->ops->relax(t->ctx, now - start);
 	}

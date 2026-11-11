@@ -267,6 +267,11 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 			dev_dbg(dchid->dev, "No OF node for subdevice %s, ignoring\n", name);
 			return NULL;
 		}
+		if (!of_device_is_available(of_node)) {
+			dev_dbg(dchid->dev, "Subdevice %s is disabled, ignoring\n", name);
+			of_node_put(of_node);
+			return NULL;
+		}
 
 		of_property_read_u32(of_node, "apple,power-method", &power_method);
 		firmware_managed_reset =
@@ -555,7 +560,8 @@ static int dchid_register_ring(struct dockchannel_hid *dchid)
 /*
  * Power method 2: announce the transition, drive the AFE reset line to the
  * new state and confirm the transition. The reset is asserted for a power-off
- * and held for 50 ms, and released for a power-on.
+ * and held for 50 ms, and released for a power-on and given 50 ms to settle
+ * before the transition is confirmed.
  */
 static int dchid_pm2_set_power(struct dchid_iface *iface, u8 state)
 {
@@ -573,12 +579,23 @@ static int dchid_pm2_set_power(struct dchid_iface *iface, u8 state)
 		if (state == DCHID_POWER_STATE_ON)
 			fsleep(50 * USEC_PER_MSEC);
 	} else {
-		ret = gpiod_set_value_cansleep(dchid->afe_reset,
-					       state == DCHID_POWER_STATE_OFF);
-		if (ret < 0)
+		bool off = state == DCHID_POWER_STATE_OFF;
+
+		ret = gpiod_set_value_cansleep(dchid->afe_reset, off);
+		if (ret < 0) {
+			dev_err(dchid->dev, "%s: failed to %s the AFE reset: %d\n",
+				iface->name, off ? "assert" : "release", ret);
 			return ret;
-		if (state == DCHID_POWER_STATE_OFF)
-			fsleep(50 * USEC_PER_MSEC);
+		}
+		dev_dbg(dchid->dev, "%s: AFE reset %s\n", iface->name,
+			off ? "asserted" : "released");
+		/*
+		 * The sequence validated on J716s (M5 Pro, MTP firmware
+		 * 6320.86.1, "Touch MT ready" on 3 of 3 boots) also waits
+		 * 50 ms after the release before HasChanged, as the
+		 * firmware-managed path above does.
+		 */
+		fsleep(50 * USEC_PER_MSEC);
 	}
 
 	dchid_pm2_command(iface->index, state, true, msg);

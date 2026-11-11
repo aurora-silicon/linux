@@ -284,6 +284,7 @@ struct effect_job {
  * @haptic_deep_down: The host-derived click is in its deep stage.
  * @hdev: Pointer to the underlying HID device.
  * @work: Workqueue to handle initialization retry for quirky devices.
+ * @work_held: @work was pending at suspend and must run again on resume.
  * @battery_timer: Timer for obtaining battery level information.
  * @input_ops: Input ops based on device type.
  */
@@ -324,6 +325,7 @@ struct magicmouse_sc {
 
 	struct hid_device *hdev;
 	struct delayed_work work;
+	bool work_held;
 	struct timer_list battery_timer;
 	struct magicmouse_input_ops input_ops;
 };
@@ -2553,12 +2555,34 @@ static void magicmouse_remove(struct hid_device *hdev)
 }
 
 #ifdef CONFIG_PM
+static int magicmouse_suspend(struct hid_device *hdev, pm_message_t message)
+{
+	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
+
+	/*
+	 * The multitouch enable work sends a feature report. The transport
+	 * powers down right after its children suspend, and the work's timer
+	 * can fire while the system is still suspending or before the
+	 * transport has resumed, so stop it here and re-arm it on resume.
+	 */
+	if (msc)
+		msc->work_held = cancel_delayed_work_sync(&msc->work);
+	return 0;
+}
+
 static int magicmouse_resume(struct hid_device *hdev)
 {
 	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
 
-	if (msc)
-		magicmouse_haptic_forget_mode(msc);
+	if (!msc)
+		return 0;
+
+	/* The device kept its state, so only finish what suspend stopped. */
+	if (msc->work_held) {
+		msc->work_held = false;
+		schedule_delayed_work(&msc->work, msecs_to_jiffies(10));
+	}
+	magicmouse_haptic_forget_mode(msc);
 	return 0;
 }
 
@@ -2570,6 +2594,8 @@ static int magicmouse_reset_resume(struct hid_device *hdev)
 	 * enable report.  Only the HID_TYPE_USBMOUSE interface accepts it, and
 	 * it must be deferred. Sending it inline here is too early.
 	 */
+	if (msc)
+		msc->work_held = false;
 	if (msc && (hdev->type == HID_TYPE_USBMOUSE || hdev->bus == BUS_SPI))
 		schedule_delayed_work(&msc->work, msecs_to_jiffies(500));
 
@@ -2648,6 +2674,7 @@ static struct hid_driver magicmouse_driver = {
 	.input_mapping = magicmouse_input_mapping,
 	.input_configured = magicmouse_input_configured,
 #ifdef CONFIG_PM
+	.suspend = magicmouse_suspend,
 	.resume = magicmouse_resume,
 	.reset_resume = magicmouse_reset_resume,
 #endif

@@ -15,6 +15,7 @@
 
 #include "parser.h"
 #include "dcp-refresh.h"
+#include "dcp-peer-v27.h"
 #include "trace.h"
 
 #define DCP_PARSE_HEADER 0xd3
@@ -1761,12 +1762,58 @@ int parse_panel_metadata(struct dcp_parse_ctx *handle, struct dcp_display_metada
 	return 0;
 }
 
+int parse_dptx_caps(struct dcp_parse_ctx *handle, struct dcp_dptx_caps *caps)
+{
+	struct iterator it;
+	struct dcp_dptx_caps parsed = {};
+	int ret = 0;
+
+	ret = iterator_begin(handle, &it, true);
+	if (ret)
+		return ret;
+	for (; it.idx < it.len; ++it.idx) {
+		u32 *field = NULL;
+		char *key = parse_string(it.handle);
+		s64 value;
+
+		if (IS_ERR(key))
+			return PTR_ERR(key);
+		if (!strcmp(key, "MaxPixelWidth"))
+			field = &parsed.width;
+		else if (!strcmp(key, "MaxTotalPixelRate"))
+			field = &parsed.total_rate;
+		else if (!strcmp(key, "MaxActivePixelRate"))
+			field = &parsed.active_rate;
+		kfree(key);
+		if (!field) {
+			ret = skip(it.handle);
+			if (ret)
+				return ret;
+			if (it.handle->pos > it.handle->len)
+				return -EINVAL;
+			continue;
+		}
+		if (*field)
+			return -EINVAL;
+		ret = parse_int_bound(it.handle, &value, 1, U32_MAX);
+		if (ret)
+			return ret;
+		*field = value;
+	}
+	if (!parsed.width || !parsed.total_rate || !parsed.active_rate)
+		return -ENOENT;
+	*caps = parsed;
+	return 0;
+}
+
 int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
-			    const char **class, s64 *unit, bool h17p_keys)
+			    const char **class, s64 *unit, bool h17p_keys,
+			    bool epic_unit_first)
 {
 	int ret = 0;
 	struct iterator it;
 	bool parsed_unit = false;
+	bool explicit_unit = false;
 	bool parsed_name = false;
 	bool parsed_class = false;
 
@@ -1793,7 +1840,9 @@ int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
 		 * service to ask and idles the panel, so no vblank and no swap
 		 * ever completes.  Only H17P callers accept them.  If a
 		 * dictionary carries both spellings, the later value wins and
-		 * the earlier string is freed.
+		 * the earlier string is freed, except that with
+		 * @epic_unit_first (firmware 27) EPICUnit is the unit in
+		 * either order.
 		 */
 		if (!strcmp(key, "EPICName") ||
 		    (h17p_keys && !strcmp(key, "compartment"))) {
@@ -1814,10 +1863,13 @@ int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
 			else
 				parsed_class = true;
 		} else if (!strcmp(key, "EPICUnit") ||
-			   (h17p_keys && !strcmp(key, "interface-id"))) {
+			   (h17p_keys && !explicit_unit && !strcmp(key, "interface-id"))) {
 			ret = parse_int(it.handle, unit);
-			if (!ret)
+			if (!ret) {
 				parsed_unit = true;
+				explicit_unit |= epic_unit_first &&
+						 !strcmp(key, "EPICUnit");
+			}
 		} else {
 			ret = skip(it.handle);
 		}
@@ -2296,7 +2348,7 @@ static int parse_color_element(struct dcp_parse_ctx *handle, struct dcp_color_el
 
 	*e = (struct dcp_color_element) {
 		.id = -1, .depth = -1, .range = -1, .eotf = -1, .encoding = -1,
-		.colorimetry = -1, .score = -1, .is_virtual = true, .restricted = false,
+		.colorimetry = -1, .score = -1, .is_virtual = true,
 	};
 	if (ret)
 		return ret;
@@ -2354,31 +2406,32 @@ static int parse_id_list(struct dcp_parse_ctx *handle, s64 *ids, unsigned int *c
 
 /*
  * Each colour element (virtual ones too) of the timing @timing_id in a
- * TimingElements catalog, flagged if the timing lists it as unsafe or as
- * needing DSC; whether the timing is interlaced. A malformed timing entry is
- * skipped. -ENOENT if the catalog has no such timing.
+ * TimingElements catalog, flagged if the timing lists it as unsafe and if it
+ * lists it as needing DSC; whether the timing is interlaced. A malformed
+ * timing entry is skipped. -ENOENT if the catalog has no such timing.
  */
 int dcp_parse_timing_colors(const void *blob, size_t len, u32 timing_id,
 			    dcp_color_element_fn emit, void *data, bool *interlaced)
 {
 	struct dcp_parse_ctx ctx;
 	struct iterator timings;
-	s64 *restricted;
+	s64 *unsafe, *dsc;
 	int ret = parse(blob, len, &ctx);
 
 	if (!ret)
 		ret = iterator_begin(&ctx, &timings, false);
 	if (ret)
 		return ret;
-	restricted = kcalloc(DCP_TIMING_RESTRICTED_MAX, sizeof(*restricted), GFP_KERNEL);
-	if (!restricted)
+	unsafe = kcalloc(2 * DCP_TIMING_RESTRICTED_MAX, sizeof(*unsafe), GFP_KERNEL);
+	if (!unsafe)
 		return -ENOMEM;
+	dsc = unsafe + DCP_TIMING_RESTRICTED_MAX;
 	ret = -ENOENT;
 	for (; timings.idx < timings.len; ++timings.idx) {
 		struct dcp_parse_ctx entry_start = ctx, colors = {};
 		struct iterator entry, it;
 		bool match = false, have_colors = false, is_interlaced = false;
-		unsigned int nr_restricted = 0;
+		unsigned int nr_unsafe = 0, nr_dsc = 0;
 		int err;
 
 		/* ColorModes may come before the ID: find both, then walk the colours. */
@@ -2398,9 +2451,10 @@ int dcp_parse_timing_colors(const void *blob, size_t len, u32 timing_id,
 				colors = ctx;
 				have_colors = true;
 				err = skip(&ctx);
-			} else if (!strcmp(key, "UnsafeColorElementIDs") ||
-				   !strcmp(key, "DSCRequiredColorElementIDs")) {
-				err = parse_id_list(&ctx, restricted, &nr_restricted);
+			} else if (!strcmp(key, "UnsafeColorElementIDs")) {
+				err = parse_id_list(&ctx, unsafe, &nr_unsafe);
+			} else if (!strcmp(key, "DSCRequiredColorElementIDs")) {
+				err = parse_id_list(&ctx, dsc, &nr_dsc);
 			} else if (!strcmp(key, "IsInterlaced")) {
 				err = parse_bool(&ctx, &is_interlaced);
 			} else {
@@ -2431,14 +2485,16 @@ int dcp_parse_timing_colors(const void *blob, size_t len, u32 timing_id,
 			ret = parse_color_element(it.handle, &e);
 			if (ret)
 				break;
-			for (unsigned int i = 0; i < nr_restricted; i++)
-				e.restricted |= restricted[i] == e.id;
+			for (unsigned int i = 0; i < nr_unsafe; i++)
+				e.unsafe |= unsafe[i] == e.id;
+			for (unsigned int i = 0; i < nr_dsc; i++)
+				e.dsc_required |= dsc[i] == e.id;
 			emit(data, &e);
 		}
 		goto out;
 	}
 out:
-	kfree(restricted);
+	kfree(unsafe);
 	return ret;
 }
 

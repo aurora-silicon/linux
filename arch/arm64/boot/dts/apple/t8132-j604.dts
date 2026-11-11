@@ -4,33 +4,365 @@
  *
  * target-type: J604
  *
+ * Wired from the J604 ADT (macOS 27.0).
+ *
  * Copyright The Asahi Linux Contributors
  */
 
 /dts-v1/;
 
 #include "t8132.dtsi"
-#include "t8132-jxxx.dtsi"
-#include <dt-bindings/leds/common.h>
+#include "t8132-laptop.dtsi"
+#include "t8132-atc23.dtsi"
+#include "t8132-apcie-port2.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/spmi/spmi.h>
 
 / {
 	compatible = "apple,j604", "apple,t8132", "apple,arm-platform";
 	model = "Apple MacBook Pro (14-inch, M4, 2024)";
-	chassis-type = "laptop";
 
-	led-controller {
-		compatible = "pwm-leds";
-		led-0 {
-			pwms = <&fpwm1 0 40000>;
-			label = "kbd_backlight";
-			function = LED_FUNCTION_KBD_BACKLIGHT;
-			color = <LED_COLOR_ID_WHITE>;
-			max-brightness = <255>;
-			default-state = "keep";
+	/*
+	 * iBoot leaves the J604's MTP stopped, where the J713's runs it, so the
+	 * loader programs its DART filter as for a halted consumer and Linux
+	 * cold-starts it.
+	 */
+	chosen {
+		linux-enablement-mac,dapf-halted-handoff = "/arm-io/mtp";
+	};
+
+	/*
+	 * The AOP firmware runs the stream: the J616s frame, six playback and
+	 * twelve sense slots, one serializer for all six amps. The codecs are
+	 * listed in the ADT provider order, so each gets its native playback
+	 * slot (LW1 0, RW1 1, LW2 2, RW2 3, LT 4, RT 5). The idle masks are
+	 * the ADT amp-tx-zd-config rows 0 and 1: LW1 drives zeros in the right
+	 * amps' sense slots, RW1 in the left amps'.
+	 *
+	 * The speakers wait for their own bring-up and a J604 protection
+	 * profile; until then the card and the amps stay disabled.
+	 */
+	sound: sound {
+		compatible = "apple,j604-macaudio", "apple,macaudio";
+		model = "MacBook Pro J604";
+		/* ADT function-speaker-id0 and -id1 */
+		speaker-id-gpios = <&pinctrl_ap 4 GPIO_ACTIVE_HIGH>,
+				   <&pinctrl_ap 13 GPIO_ACTIVE_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Speakers";
+			dai-tdm-idle-mode-0 = "zero";
+			dai-tdm-idle-mode-1 = "zero";
+			dai-tdm-slot-tx-idle-mask-0 = <0xf0f0f0>;
+			dai-tdm-slot-tx-idle-mask-1 = <0x0f0f0f>;
+
+			cpu {
+				sound-dai = <&aop_audio 3>;
+			};
+
+			codec {
+				sound-dai = <&speaker_left_woof1>, <&speaker_right_woof1>,
+					    <&speaker_left_woof2>, <&speaker_right_woof2>,
+					    <&speaker_left_tweet>, <&speaker_right_tweet>;
+			};
+		};
+	};
+
+	/*
+	 * Physical size of the firmware framebuffer's 3024x1890 area below
+	 * the notch (14.2" panel, 254 ppi), so simpledrm reports the real DPI.
+	 */
+	fb_panel: panel {
+		width-mm = <302>;
+		height-mm = <189>;
+		status = "disabled";
+	};
+};
+
+/* The full 3024x1964 panel including the notch rows, 254 ppi. */
+&dcp {
+	apple,panel-width-mm = <302>;
+	apple,panel-height-mm = <196>;
+};
+
+/*
+ * The M4 PMGR policy disables ps_dptx_phy, which the shared boot
+ * framebuffer lists; as on the J713, the loader keeps the display on.
+ */
+&framebuffer0 {
+	/delete-property/ power-domains;
+};
+
+&sound_jack {
+	compatible = "apple,j604-macaudio-jack", "apple,macaudio";
+	model = "MacBook Pro J604 Jack";
+};
+
+&aop_audio {
+	apple,chassis-name = "J604";
+	apple,machine-kind = "MacBook Pro";
+};
+
+/*
+ * The six SN012776 speaker amps (ADT /arm-io/i2c3/audio-speaker at 0x38
+ * and its speaker1..5): one interrupt line on AP GPIO 14, level low; sense
+ * slots from speaker-config (amp i at bytes 4i and 4i + 2, in provider
+ * order). Every amp joins the SDZ fail-closed group. Disabled until the
+ * speakers' bring-up.
+ */
+&i2c3 {
+	status = "okay";
+
+	speaker_left_woof1: codec@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 1";
+		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <0>;
+		ti,vmon-slot-no = <2>;
+		status = "disabled";
+	};
+
+	speaker_left_woof2: codec@39 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x39>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 2";
+		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <8>;
+		ti,vmon-slot-no = <10>;
+		status = "disabled";
+	};
+
+	speaker_left_tweet: codec@3a {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3a>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Tweeter";
+		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <16>;
+		ti,vmon-slot-no = <18>;
+		status = "disabled";
+	};
+
+	speaker_right_woof1: codec@3b {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3b>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 1";
+		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <4>;
+		ti,vmon-slot-no = <6>;
+		status = "disabled";
+	};
+
+	speaker_right_woof2: codec@3c {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3c>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 2";
+		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <12>;
+		ti,vmon-slot-no = <14>;
+		status = "disabled";
+	};
+
+	speaker_right_tweet: codec@3d {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3d>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Tweeter";
+		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <20>;
+		ti,vmon-slot-no = <22>;
+		status = "disabled";
+	};
+};
+
+&typec0 {
+	label = "USB-C Left Front";
+};
+
+&typec1 {
+	label = "USB-C Left Rear";
+};
+
+/* hpm3 is ATC3's port controller; hpm5, the MagSafe port's, is not wired. */
+&nub_spmi_a1 {
+	status = "okay";
+
+	hpm3: usb-pd@c {
+		compatible = "apple,t8132-sn201202x", "apple,sn201202x";
+		reg = <0xc SPMI_USID>;
+		interrupts = <11 IRQ_TYPE_EDGE_RISING>,
+			     <17 IRQ_TYPE_EDGE_RISING>,
+			     <19 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "sleep", "wake";
+		wakeup-source;
+
+		typec3: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Right";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec3_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_3_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec3_connector_ss: endpoint {
+						remote-endpoint = <&atcphy3_typec_lanes>;
+					};
+				};
+			};
 		};
 	};
 };
 
-&fpwm1 {
+&atcphy3 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			atcphy3_typec_lanes: endpoint {
+				remote-endpoint = <&typec3_connector_ss>;
+			};
+		};
+	};
+};
+
+&dwc3_3_dart_0 {
+	status = "okay";
+};
+
+&dwc3_3_dart_1 {
+	status = "okay";
+};
+
+&dwc3_3 {
+	dr_mode = "host";
+	maximum-speed = "super-speed";
+	phys = <&atcphy3 PHY_TYPE_USB2>, <&atcphy3 PHY_TYPE_USB3>;
+	phy-names = "usb2-phy", "usb3-phy";
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dwc3_3_hs: endpoint {
+				remote-endpoint = <&typec3_connector_hs>;
+			};
+		};
+	};
+};
+
+/*
+ * The HDMI port is dispext0 through ATC2's DisplayPort PHY (ADT atc-phy2,
+ * atc2-dpxbar, no USB controller) and a DP-to-HDMI converter at i2c0 0x08
+ * (pcon0), with hot-plug on AOP GPIO 41. ATC2 stays off with dispext0.
+ */
+
+&wifi0 {
+	/* ADT /arm-io/wlan module-instance */
+	brcm,board-type = "apple,guam";
+};
+
+&bluetooth0 {
+	brcm,board-type = "apple,guam";
+};
+
+/*
+ * The SD card reader, a GL9755 (ADT pci-bridge2/pcie-sdreader), powered by
+ * the SMC's gP19 (function-sd_pwr_en).
+ */
+&port02 {
+	pwren-gpios = <&smc_gpio 0x19 GPIO_ACTIVE_HIGH>;
+};
+
+/*
+ * The cold-started MTP runs on DART stream 0, as on the M4 Pro and Max,
+ * instead of the stream 1 the J713's running MTP is handed over on.
+ * ADT "remap": streams 1 2 3 are stream 0.
+ */
+&mtp_dart {
+	apple,remap-streams = <1 0>, <2 0>, <3 0>;
+};
+
+&mtp {
+	iommus = <&mtp_dart 0>;
+};
+
+&mtp_hid {
+	iommus = <&mtp_dart 0>;
+
+	multi-touch {
+		firmware-name = "apple/tpmtfw-j604.bin";
+	};
+};
+
+&mesa {
+	/*
+	 * Per-device factory data from this Mac's own iBoot system container:
+	 * the calibration, and the signed root key the nonce session loads.
+	 */
+	firmware-name = "apple/mesacal-j604.bin", "apple/msrk-j604.bin";
+};
+
+#include "hwmon-common.dtsi"
+#include "hwmon-laptop.dtsi"
+#include "hwmon-fan-dual.dtsi"
+
+/*
+ * The PMGR domains of the USB-C ports this board wires beyond ATC0/ATC1, as
+ * the M4 firmware path's policy enables ATC0/ATC1's.
+ */
+&ps_atc3_common {
+	status = "okay";
+};
+
+&ps_atc3_usb_aon {
+	status = "okay";
+};
+
+&ps_atc3_usb {
 	status = "okay";
 };

@@ -10,10 +10,18 @@
 /dts-v1/;
 
 #include "t8132.dtsi"
-#include "t8132-jxxx.dtsi"
+#include "t8132-j623-j624.dtsi"
 
 / {
 	compatible = "apple,j623", "apple,t8132", "apple,arm-platform";
 	model = "Apple iMac (24-inch, 2x USB-C, M4, 2024)";
-	chassis-type = "all-in-one";
+};
+
+&sound_jack {
+	compatible = "apple,j623-macaudio-jack", "apple,macaudio";
+	model = "iMac J623 Jack";
+};
+
+&aop_audio {
+	apple,chassis-name = "J623";
 };

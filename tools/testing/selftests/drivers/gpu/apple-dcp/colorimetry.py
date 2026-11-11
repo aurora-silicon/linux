@@ -8,8 +8,40 @@ import rate
 
 
 def panel(root, output):
+    def adt_node(props, children=()):
+        data = bytearray(struct.pack('<II', len(props), len(children)))
+        for name, value in props:
+            data += name.encode().ljust(32, b'\0') + struct.pack('<I', len(value)) + value
+            data += b'\0' * (-len(data) % 4)
+        return bytes(data) + b''.join(children)
+
+    def target_adt(name, coefficients):
+        matrix = struct.pack('<I9i', 1, *coefficients)
+        product = adt_node((('name', b'product\0'),
+                            ('artwork-display-gamut', name.encode() + b'\0'),
+                            ('primary-calibration-matrix', matrix)))
+        return adt_node((('name', b'device-tree\0'),), (product,))
+
+    q24 = 1 << 24
+    # Deliberately simple row-neutral matrices, unrelated to any panel data.
+    p3_adt = target_adt('P3', (q24 + q24 // 16, -q24 // 16, 0,
+                               0, q24, 0, 0, 0, q24))
+    srgb_adt = target_adt('sRGB', (q24, 0, 0,
+                                   -q24 // 32, q24 + q24 // 32, 0, 0, 0, q24))
     fixture = rate.parser_fixture(root)
     unit = desktop.panel_identity(root).split('int main(int argc, char **argv)')[0]
+    base = root / 'drivers/gpu/drm/apple'
+    unit += r'''
+typedef int32_t s32;
+#define ALIGN(x,n) (((x)+(n)-1)&~((n)-1))
+#define SZ_16M (16U<<20)
+static u32 get_unaligned_le32(const void *p) {u32 n;memcpy(&n,p,4);return n;}
+'''
+    unit += block((base / 'dcp-panel-adt.h').read_text(), 'struct dcp_panel_adt {') + ';\n'
+    unit += '\n'.join(line for line in (base / 'dcp-panel-adt.c').read_text().splitlines()
+                       if not line.startswith('#include'))
+    unit += 'static const u8 p3_adt[]={%s};\n' % ','.join(map(str, p3_adt))
+    unit += 'static const u8 srgb_adt[]={%s};\n' % ','.join(map(str, srgb_adt))
     # Standard colour-space coordinates, never a captured panel calibration.
     p3 = {'Chromaticity': {'Red': {'X': 44564, 'Y': 20972},
                           'Green': {'X': 17367, 'Y': 45220},
@@ -37,6 +69,9 @@ def panel(root, output):
     for i, value in enumerate(inputs):
         raw = bytearray(struct.pack('<I', 0xd3)); fixture['wire'](value, raw)
         unit += 'static const u8 color_%u[]={%s};\n' % (i, ','.join(map(str, raw)))
+    unit += 'static const u8 *const colors[]={%s};\n' % ','.join('color_%u' % i for i in range(len(inputs)))
+    unit += 'static const size_t sizes[]={%s};\n' % ','.join('sizeof(color_%u)' % i for i in range(len(inputs)))
+    unit += 'static const unsigned inputs=%u;\n' % len(inputs)
     unit += r'''
 static struct dcp_display_metadata decode(const u8 *raw, size_t size)
 {
@@ -52,7 +87,7 @@ static const struct dcp_display_mode timing={.mode={
     .flags=DRM_MODE_FLAG_PHSYNC|DRM_MODE_FLAG_PVSYNC,.type=DRM_MODE_TYPE_PREFERRED}};
 static void check(const struct dcp_display_metadata *metadata, bool color, const char *path)
 {
-    const struct drm_edid *edid=dcp_panel_edid(metadata,&timing,1,300,170);
+    const struct drm_edid *edid=dcp_panel_edid(metadata,NULL,&timing,1,300,170);
     assert(!IS_ERR(edid) && drm_edid_valid(edid));
     const u8 *raw=(const void *)&edid->raw;
     if(color) {
@@ -72,6 +107,15 @@ static void check(const struct dcp_display_metadata *metadata, bool color, const
         assert(!raw[25] && !(raw[26]&0xf0));
     }
     if(path) {FILE *file=fopen(path,"wb");assert(file);assert(fwrite(raw,128,1,file)==1);fclose(file);}
+    drm_edid_free(edid);
+}
+/* EDID bytes 23..34: gamma, features and the ten-bit chromaticities. */
+static void colour(const struct dcp_display_metadata *metadata,
+                   const struct dcp_color_space *target, u8 *out)
+{
+    const struct drm_edid *edid=dcp_panel_edid(metadata,target,&timing,1,300,170);
+    assert(!IS_ERR(edid) && drm_edid_valid(edid));
+    memcpy(out,(const u8 *)&edid->raw+23,12);
     drm_edid_free(edid);
 }
 int main(int argc, char **argv)
@@ -94,23 +138,66 @@ int main(int argc, char **argv)
     check(&invalid,false,NULL);
     invalid=p3;invalid.white[0]=1;invalid.white[1]=1;check(&invalid,false,NULL);
     invalid=p3;invalid.chromaticity[0][0]=65535;check(&invalid,false,NULL);
+    /* Raw ADT targets name the same standard coordinates as the fixtures. */
+    struct dcp_panel_adt p3_panel={0},srgb_panel={0};
+    assert(!dcp_panel_adt_parse(p3_adt,sizeof(p3_adt),&p3_panel));
+    assert(!dcp_panel_adt_parse(srgb_adt,sizeof(srgb_adt),&srgb_panel));
+    assert(p3_panel.gamut==DCP_PANEL_GAMUT_DISPLAY_P3);
+    assert(srgb_panel.gamut==DCP_PANEL_GAMUT_SRGB);
+    const struct dcp_color_space *p3_target=dcp_panel_gamut_color_space(p3_panel.gamut);
+    const struct dcp_color_space *srgb_target=dcp_panel_gamut_color_space(srgb_panel.gamut);
+    assert(!IS_ERR(p3_target) && !IS_ERR(srgb_target));
+    assert(IS_ERR(dcp_color_space_lookup("p3")) && IS_ERR(dcp_color_space_lookup("")) &&
+           IS_ERR(dcp_color_space_lookup(NULL)) && IS_ERR(dcp_color_space_lookup("Display-P3")));
+    assert(!memcmp(p3_target->chromaticity,p3.chromaticity,sizeof(p3.chromaticity)));
+    assert(!memcmp(p3_target->white,p3.white,sizeof(p3.white)) && p3_target->gamma==p3.gamma);
+    assert(!memcmp(srgb_target->chromaticity,srgb.chromaticity,sizeof(srgb.chromaticity)));
+    assert(!memcmp(srgb_target->white,srgb.white,sizeof(srgb.white)) && srgb_target->gamma==srgb.gamma);
+    for (unsigned n=0;n<sizeof(p3_adt);n++) {
+        struct dcp_panel_adt panel={.identity={.manufacturer="TST"}},before=panel;
+        assert(dcp_panel_adt_parse(p3_adt,n,&panel)<0);
+        assert(!memcmp(&panel,&before,sizeof(panel)));
+    }
+    {
+        u8 firmware[12],named[12],plain[12];
+        struct dcp_display_metadata none=decode(color_2,sizeof(color_2));
+        /* No firmware primaries: the target gives the firmware-equivalent EDID. */
+        colour(&p3,NULL,firmware);colour(&none,p3_target,named);
+        assert(!memcmp(firmware,named,sizeof(named)) && named[0]==120);
+        colour(&srgb,NULL,firmware);colour(&none,srgb_target,named);
+        assert(!memcmp(firmware,named,sizeof(named)));
+        /* Firmware primaries win over a different target. */
+        colour(&srgb,p3_target,named);assert(!memcmp(firmware,named,sizeof(named)));
+        /* Absent, partial or rejected firmware colour falls back to the target. */
+        colour(&p3,NULL,firmware);
+        for (unsigned i=2;i<inputs;i++) {
+            struct dcp_display_metadata m=decode(colors[i],sizes[i]);
+            if (i==6) continue; /* primaries without gamma are firmware colour */
+            colour(&m,p3_target,named);assert(!memcmp(firmware,named,sizeof(named)));
+        }
+        struct dcp_display_metadata rejected=p3;rejected.chromaticity[0][0]=65535;
+        colour(&rejected,p3_target,named);assert(!memcmp(firmware,named,sizeof(named)));
+        /* Without a target the white-only block is unchanged. */
+        colour(&none,NULL,plain);
+        assert(plain[0]==255 && !plain[2] && !(plain[3]&0xf0));
+    }
     /* A ProductAttributes-only setter must preserve the established colour. */
     struct apple_dcp d={.fw_compat=5,.has_panel=true,.connector=&d};
-    __typeof__(*d.desktop) state={0};d.desktop=&state;notifications=0;
+    __typeof__(*d.panel_identity) state={0};d.panel_identity=&state;notifications=0;
     dcp_panel_metadata_replace(&d,&p3);assert(notifications==1);
     struct dcp_display_metadata partial=decode(color_2,sizeof(color_2));
     dcp_panel_metadata_replace(&d,&partial);
-    assert(notifications==1 && !memcmp(&state.panel_metadata,&p3,sizeof(p3)));
+    assert(notifications==1 && !memcmp(&state.metadata,&p3,sizeof(p3)));
     /* Newly reported primaries with unknown gamma must not inherit an old gamma. */
     struct dcp_display_metadata unknown_gamma=decode(color_6,sizeof(color_6));
     dcp_panel_metadata_replace(&d,&unknown_gamma);
-    assert(notifications==2 && !state.panel_metadata.gamma && state.panel_metadata.white[0]);
+    assert(notifications==2 && !state.metadata.gamma && state.metadata.white[0]);
     dcp_panel_metadata_replace(&d,&partial);
-    assert(notifications==2 && !state.panel_metadata.gamma && state.panel_metadata.white[0]);
+    assert(notifications==2 && !state.metadata.gamma && state.metadata.white[0]);
     /* A replacement panel must not inherit another serial's colour data. */
     partial.serial++;
     dcp_panel_metadata_replace(&d,&partial);
-    assert(notifications==3 && !state.panel_metadata.gamma);
+    assert(notifications==3 && !state.metadata.gamma);
     return 0;
 }
 '''

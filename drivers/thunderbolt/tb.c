@@ -13,6 +13,9 @@
 #include <linux/of.h>
 #include <linux/pm_runtime.h>
 #include <linux/platform_data/x86/apple.h>
+#include <linux/suspend.h>
+#include <linux/workqueue.h>
+#include <kunit/visibility.h>
 
 #include "tb.h"
 #include "tb_regs.h"
@@ -64,6 +67,20 @@ MODULE_PARM_DESC(asym_threshold,
  *		 runtime resume
  * @dp_tunnel_work: Re-pair DP resources after retired DPRX work releases its paths
  * @dp_tunnel_pending: A pairing request not yet serviced, retained across sleep
+ * @dp_relink_work: Waits on the freezable queue until no system sleep
+ *		    transition is in progress, then queues @dp_relink_run
+ * @dp_relink_run: The host DP tunnel re-link work proper, on the domain
+ *		   queue: after any DPRX or teardown work queued before it
+ * @dp_relink_deferred: The pairing that needs a host DP tunnel's re-link
+ *			waits for system sleep to end (@dp_tunnel_pending is
+ *			set with it, for the resume and thaw replays)
+ * @dp_relink_tries: Runtime resume failures of @dp_relink_run in a row
+ * @dp_relink_due: When the host DP tunnel left alone may be re-linked at a
+ *		   higher rate
+ * @dp_relink_delay: The debounce before that (ms), longer while it flaps
+ * @dp_relinked_at: When the last such re-link was made
+ * @dp_host_hold_shared: The next host DP tunnels are set up at HBR2 at
+ *			 most: one re-linked at a higher rate did not come up
  * @groups: Bandwidth groups used in this domain.
  */
 struct tb_cm {
@@ -74,6 +91,14 @@ struct tb_cm {
 	struct delayed_work remove_work;
 	struct work_struct dp_tunnel_work;
 	bool dp_tunnel_pending;
+	struct delayed_work dp_relink_work;
+	struct work_struct dp_relink_run;
+	bool dp_relink_deferred;
+	unsigned int dp_relink_tries;
+	unsigned long dp_relink_due;
+	unsigned int dp_relink_delay;
+	unsigned long dp_relinked_at;
+	bool dp_host_hold_shared;
 	struct tb_bandwidth_group groups[MAX_GROUPS];
 };
 
@@ -98,6 +123,7 @@ static void tb_dp_resource_unavailable(struct tb *tb, struct tb_port *port,
 static void tb_queue_dp_bandwidth_request(struct tb *tb, u64 route, u8 port,
 					  int retry, unsigned long delay);
 static void tb_dp_tunnel_active(struct tb_tunnel *tunnel, void *data);
+static void tb_queue_dp_tunnels(struct tb *tb);
 
 static void tb_queue_hotplug(struct tb *tb, u64 route, u8 port, bool unplug)
 {
@@ -328,6 +354,10 @@ static bool tb_tmu_hifi_uni_required(struct tb *tb)
 static int tb_enable_tmu(struct tb_switch *sw)
 {
 	int ret;
+
+	/* The host router's firmware runs its TMU on these hosts. */
+	if (!tb_route(sw) && tb_switch_tmu_host_managed(sw))
+		return 0;
 
 	/*
 	 * If both routers at the end of the link are v2 we simply
@@ -612,12 +642,9 @@ static int tb_consumed_usb3_pcie_bandwidth(struct tb *tb,
  *
  * Return: %0 on success, negative errno otherwise.
  */
-static int tb_consumed_dp_bandwidth(struct tb *tb,
-				    struct tb_port *src_port,
-				    struct tb_port *dst_port,
-				    struct tb_port *port,
-				    int *consumed_up,
-				    int *consumed_down)
+VISIBLE_IF_KUNIT int tb_consumed_dp_bandwidth(struct tb *tb, struct tb_port *src_port,
+					      struct tb_port *dst_port, struct tb_port *port,
+					      int *consumed_up, int *consumed_down)
 {
 	int group_reserved[MAX_GROUPS + 1] = {};
 	struct tb_cm *tcm = tb_priv(tb);
@@ -723,9 +750,10 @@ static int tb_maximum_bandwidth(struct tb *tb, struct tb_port *src_port,
 
 	/*
 	 * Can include asymmetric, only if it is actually supported by
-	 * the lane adapter.
+	 * the lane adapter and allowed on the host.
 	 */
-	if (!tb_asym_supported(src_port, dst_port, port))
+	if (!tb_asym_supported(src_port, dst_port, port) ||
+	    (tb->nhi->quirks & QUIRK_NO_ASYM))
 		include_asym = false;
 
 	if (tb_is_upstream_port(port)) {
@@ -1055,7 +1083,7 @@ static int tb_configure_asym(struct tb *tb, struct tb_port *src_port,
 	struct tb_port *up;
 	int ret = 0;
 
-	if (!asym_threshold)
+	if (!asym_threshold || (tb->nhi->quirks & QUIRK_NO_ASYM))
 		return 0;
 
 	downstream = tb_port_path_direction_downstream(src_port, dst_port);
@@ -1991,6 +2019,7 @@ static void tb_dp_tunnel_active(struct tb_tunnel *tunnel, void *data)
 	struct tb_port *in = tunnel->src_port;
 	struct tb_port *out = tunnel->dst_port;
 	struct tb *tb = data;
+	struct tb_cm *tcm = tb_priv(tb);
 
 	mutex_lock(&tb->lock);
 
@@ -2047,15 +2076,36 @@ static void tb_dp_tunnel_active(struct tb_tunnel *tunnel, void *data)
 		 * loaded or not all DP cables where connected to the
 		 * discrete router.
 		 */
-		tb_tunnel_warn(tunnel, "not active, tearing down\n");
-		tb_dp_resource_unavailable(tb, in,
-					   "DPRX negotiation failed");
+		if (tb_dp_relink_activation(tunnel->host_relinked_up, false) ==
+		    TB_DP_RELINK_NOW) {
+			/*
+			 * Set up at a higher rate when it was left alone: set
+			 * it up at HBR2 again, once, from the domain queue
+			 * once this DPRX work has released its paths. The
+			 * adapters stay listed.
+			 */
+			tb_tunnel_warn(tunnel, "not active at the higher rate, setting it up again at up to %u Mb/s per lane\n",
+				       TB_DP_HOST_RATE_SHARED);
+			tb_deactivate_and_free_tunnel(tunnel);
+			tcm->dp_host_hold_shared = true;
+			tb_recalc_estimated_bandwidth(tb);
+			tb_queue_dp_tunnels(tb);
+		} else {
+			tb_tunnel_warn(tunnel, "not active, tearing down\n");
+			tb_dp_resource_unavailable(tb, in,
+						   "DPRX negotiation failed");
+		}
 	}
 	mutex_unlock(&tb->lock);
 }
 
-static void tb_tunnel_one_dp(struct tb *tb, struct tb_port *in,
-			     struct tb_port *out)
+/*
+ * Set up a DP tunnel from @in to @out. @rate_limit: the highest link rate
+ * (Mb/s per lane) under TB_HOST_DP_SHARED_RATE. The tunnel if it is up or
+ * being activated, NULL if not.
+ */
+static struct tb_tunnel *tb_tunnel_one_dp(struct tb *tb, struct tb_port *in,
+					  struct tb_port *out, u32 rate_limit)
 {
 	int available_up, available_down, ret, link_nr;
 	struct tb_cm *tcm = tb_priv(tb);
@@ -2117,6 +2167,7 @@ static void tb_tunnel_one_dp(struct tb *tb, struct tb_port *in,
 		tb_port_dbg(out, "could not allocate DP tunnel\n");
 		goto err_reclaim_usb;
 	}
+	tunnel->host_rate_limit = rate_limit;
 
 	list_add_tail(&tunnel->list, &tcm->tunnel_list);
 
@@ -2133,7 +2184,7 @@ static void tb_tunnel_one_dp(struct tb *tb, struct tb_port *in,
 		list_del(&tunnel->list);
 		goto err_free;
 	}
-	return;
+	return tunnel;
 
 err_free:
 	tb_tunnel_put(tunnel);
@@ -2148,11 +2199,12 @@ err_rpm_put:
 	pm_runtime_put_autosuspend(&out->sw->dev);
 	pm_runtime_mark_last_busy(&in->sw->dev);
 	pm_runtime_put_autosuspend(&in->sw->dev);
+	return NULL;
 }
 
 /*
  * The link rate (Mb/s per lane) another DP tunnel from @tunnel's host router
- * was given under TB_HOST_DP_HBR2_MAX, 0 if there is none. Called with the
+ * was given under TB_HOST_DP_SHARED_RATE, 0 if there is none. Called with the
  * domain lock held, from the tunnel's activation.
  */
 u32 tb_dp_host_shared_rate(const struct tb_tunnel *tunnel)
@@ -2167,15 +2219,567 @@ u32 tb_dp_host_shared_rate(const struct tb_tunnel *tunnel)
 	return 0;
 }
 
+/*
+ * TB_HOST_DP_SHARED_RATE: the highest link rate (Mb/s per lane) each of
+ * @tunnels DP tunnels from the host router's DP IN adapters may offer: HBR3
+ * for one, HBR2 for more (two 4K60 streams fit at HBR2 x4).
+ */
+u32 tb_dp_host_rate_for(unsigned int tunnels)
+{
+	return tunnels > 1 ? TB_DP_HOST_RATE_SHARED : TB_DP_HOST_RATE_ALONE;
+}
+
+/*
+ * TB_HOST_DP_SHARED_RATE: whether a host DP tunnel up at @rate (Mb/s per
+ * lane) is set up again at HBR2 when @tunnels are wanted on its host router
+ * in all. Above HBR2 next to another it is, so that both streams of the PHY
+ * run at one rate; while system sleep is in progress (@sleeping) only once
+ * it is over.
+ */
+enum tb_dp_relink tb_dp_relink_down(u32 rate, unsigned int tunnels, bool sleeping)
+{
+	if (tunnels < 2 || rate <= TB_DP_HOST_RATE_SHARED)
+		return TB_DP_RELINK_NONE;
+	return sleeping ? TB_DP_RELINK_WAIT : TB_DP_RELINK_NOW;
+}
+
+/*
+ * TB_HOST_DP_SHARED_RATE re-links tear a display's DP tunnel down and set it
+ * up again. None runs during a system sleep transition: from its PREPARE
+ * event, before any other PM notifier hears of it, until the transition is
+ * over, its POST callbacks and the rollback of a refused PREPARE included.
+ * Every PM notifier call is made with the system sleep lock held, so the
+ * gate is reopened by a work item that takes that lock after the POST event.
+ * Admission holds tb_dp_pm_gate for reading while it re-links; the notifier
+ * takes it for writing, so a re-link in progress is over before any other
+ * notifier hears of the transition.
+ */
+static DECLARE_RWSEM(tb_dp_pm_gate);
+static struct tb_dp_pm_state tb_dp_pm;
+
+/*
+ * PREPARE closes the gate, and drops a reopen asked for by an earlier POST
+ * that has not run yet (the snapshot device lets go of the system sleep lock
+ * between its PREPARE and POST). The notifier comes first and refuses
+ * nothing, so it gets the POST event of every PREPARE it got, also when the
+ * PREPARE is refused after it: POST asks for the reopen (true). Other
+ * events: nothing.
+ */
+bool tb_dp_pm_event(struct tb_dp_pm_state *s, unsigned long event)
+{
+	switch (event) {
+	case PM_SUSPEND_PREPARE:
+	case PM_HIBERNATION_PREPARE:
+	case PM_RESTORE_PREPARE:
+		s->sleeping = true;
+		s->reopen = false;
+		return false;
+	case PM_POST_SUSPEND:
+	case PM_POST_HIBERNATION:
+	case PM_POST_RESTORE:
+		s->reopen = true;
+		return true;
+	}
+	return false;
+}
+
+/* No transition in progress (system sleep lock held): reopen if one ended. */
+void tb_dp_pm_reopen(struct tb_dp_pm_state *s)
+{
+	if (s->reopen)
+		s->sleeping = false;
+	s->reopen = false;
+}
+
+static void tb_dp_pm_reopen_fn(struct work_struct *work)
+{
+	unsigned int flags = lock_system_sleep();
+
+	down_write(&tb_dp_pm_gate);
+	tb_dp_pm_reopen(&tb_dp_pm);
+	up_write(&tb_dp_pm_gate);
+	unlock_system_sleep(flags);
+}
+
+static DECLARE_WORK(tb_dp_pm_reopen_work, tb_dp_pm_reopen_fn);
+
+static int tb_dp_pm_notify(struct notifier_block *nb, unsigned long event, void *unused)
+{
+	bool reopen;
+
+	down_write(&tb_dp_pm_gate);
+	reopen = tb_dp_pm_event(&tb_dp_pm, event);
+	up_write(&tb_dp_pm_gate);
+	if (reopen)
+		queue_work(system_dfl_wq, &tb_dp_pm_reopen_work);
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block tb_dp_pm_nb = {
+	.notifier_call = tb_dp_pm_notify,
+	.priority = INT_MAX,
+};
+
+void tb_dp_pm_gate_init(void)
+{
+	register_pm_notifier(&tb_dp_pm_nb);
+}
+
+void tb_dp_pm_gate_exit(void)
+{
+	unregister_pm_notifier(&tb_dp_pm_nb);
+	flush_work(&tb_dp_pm_reopen_work);
+}
+
+/*
+ * Whether a host DP tunnel may be re-linked now; if so, tb_dp_relink_done()
+ * once it is. Never waits for a transition to start or end.
+ */
+static bool tb_dp_relink_admit(void)
+{
+	if (!down_read_trylock(&tb_dp_pm_gate))
+		return false;
+	if (!tb_dp_pm.sleeping)
+		return true;
+	up_read(&tb_dp_pm_gate);
+	return false;
+}
+
+static void tb_dp_relink_done(void)
+{
+	up_read(&tb_dp_pm_gate);
+}
+
+/* No system sleep transition in progress, as far as can be told now. */
+static bool tb_dp_pm_open(void)
+{
+	if (!tb_dp_relink_admit())
+		return false;
+	tb_dp_relink_done();
+	return true;
+}
+
+/*
+ * The delay (ms) before the re-link work is tried again after its @tries-th
+ * failure to runtime resume the domain in a row, 0 for not any more: the
+ * request then waits for the next resume, thaw or plug event.
+ */
+unsigned int tb_dp_relink_retry_delay(unsigned int tries)
+{
+	return tries < TB_DP_RELINK_RETRIES ? TB_DP_RELINK_DELAY_MS << tries : 0;
+}
+
+/*
+ * TB_HOST_DP_SHARED_RATE: as tb_dp_host_rate_for(), HBR2 at most while a
+ * tunnel re-linked at a higher rate that did not come up is set up again
+ * (@recovering).
+ */
+u32 tb_dp_host_rate_after(unsigned int tunnels, bool recovering)
+{
+	return recovering ? TB_DP_HOST_RATE_SHARED : tb_dp_host_rate_for(tunnels);
+}
+
+/*
+ * TB_HOST_DP_SHARED_RATE: whether, after a hot unplug took DP tunnels from
+ * the host router, the one left (@tunnels) up at @rate is marked to be set up
+ * again at the higher rate both its adapters take (@max_rate, HBR3 at most).
+ * Nothing is decided while system sleep is in progress (@sleeping).
+ */
+bool tb_dp_relink_up_wanted(unsigned int tunnels, u32 rate, u32 max_rate, bool sleeping)
+{
+	return !sleeping && tunnels == 1 && rate < min(max_rate, TB_DP_HOST_RATE_ALONE);
+}
+
+/*
+ * TB_HOST_DP_SHARED_RATE: whether the host DP tunnel @marked by
+ * tb_dp_relink_up_wanted() is set up again at the higher rate. Not if
+ * another one is up or could be paired (@pairable) by now, nor if it got
+ * that rate already; only after @due, the end of the debounce, and not
+ * while system sleep is in progress.
+ */
+enum tb_dp_relink tb_dp_relink_up(bool marked, unsigned int tunnels, u32 rate, u32 max_rate,
+				  bool pairable, bool sleeping, unsigned long now,
+				  unsigned long due)
+{
+	if (!marked || pairable || !tb_dp_relink_up_wanted(tunnels, rate, max_rate, false))
+		return TB_DP_RELINK_NONE;
+	if (sleeping || time_before(now, due))
+		return TB_DP_RELINK_WAIT;
+	return TB_DP_RELINK_NOW;
+}
+
+/*
+ * The debounce (ms) before the next re-link to a higher rate: doubled, up
+ * to TB_DP_RELINK_DELAY_MAX_MS, each time a second DP tunnel takes the rate
+ * back down soon after such a re-link (@flapping), the base one otherwise.
+ */
+unsigned int tb_dp_relink_backoff(unsigned int delay_ms, bool flapping)
+{
+	if (!flapping)
+		return TB_DP_RELINK_DELAY_MS;
+	return min(delay_ms * 2, TB_DP_RELINK_DELAY_MAX_MS);
+}
+
+/*
+ * A host DP tunnel's activation ended, @active or not: NOW if it is set up
+ * at HBR2 again because it was re-linked at a higher rate (@relinked_up)
+ * and did not come up. Only once: that tunnel is not re-linked up.
+ */
+enum tb_dp_relink tb_dp_relink_activation(bool relinked_up, bool active)
+{
+	return relinked_up && !active ? TB_DP_RELINK_NOW : TB_DP_RELINK_NONE;
+}
+
+/*
+ * TB_HOST_DP_SHARED_RATE: another host DP tunnel is wanted while @tunnel,
+ * marked by tb_dp_host_tunnel_gone(), waits for its re-link at a higher
+ * rate. The re-link is dropped and @tunnel stays capped at HBR2, the rate
+ * the new one takes next to it, so that it is counted at HBR2 when the
+ * bandwidth for the new one is worked out. True if a re-link was dropped.
+ */
+bool tb_dp_host_drop_relink_up(struct tb_tunnel *tunnel)
+{
+	if (!tunnel->host_relink)
+		return false;
+	tunnel->host_relink = false;
+	tunnel->host_rate_limit = TB_DP_HOST_RATE_SHARED;
+	tunnel->max_rate = min(tunnel->max_rate, TB_DP_HOST_RATE_SHARED);
+	return true;
+}
+
+static bool tb_dp_host_shares_rate(const struct tb *tb)
+{
+	return tb->nhi && (tb->nhi->host_dp_policy & TB_HOST_DP_SHARED_RATE);
+}
+
+/* A DP tunnel from a DP IN adapter of the (Apple) host router. */
+static bool tb_tunnel_is_host_dp(const struct tb_tunnel *tunnel)
+{
+	return tb_tunnel_is_dp(tunnel) && tb_port_is_apple_host_dpin(tunnel->src_port);
+}
+
+/* The DP tunnels from the host router's DP IN adapters; @last: the last one. */
+static unsigned int tb_dp_host_tunnels(struct tb *tb, struct tb_tunnel **last)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+	struct tb_tunnel *tunnel;
+	unsigned int n = 0;
+
+	list_for_each_entry(tunnel, &tcm->tunnel_list, list) {
+		if (!tb_tunnel_is_host_dp(tunnel))
+			continue;
+		n++;
+		if (last)
+			*last = tunnel;
+	}
+	return n;
+}
+
+/*
+ * How many more DP tunnels from the host router's DP IN adapters pairing
+ * can set up now: its free DP IN adapters against the free DP OUT adapters
+ * of the other routers (see tb_find_dp_out()).
+ */
+static unsigned int tb_dp_host_free_pairs(struct tb *tb)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+	unsigned int ins = 0, outs = 0;
+	struct tb_port *port;
+
+	list_for_each_entry(port, &tcm->dp_resources, list) {
+		if (tb_port_is_dpin(port)) {
+			if (tb_port_is_apple_host_dpin(port) && !tb_port_is_enabled(port))
+				ins++;
+		} else if (tb_port_is_dpout(port) && tb_route(port->sw) &&
+			   !tb_port_is_enabled(port)) {
+			outs++;
+		}
+	}
+	return min(ins, outs);
+}
+
+/* A new DP tunnel comes: none is re-linked to a higher rate any more. */
+static void tb_dp_host_clear_relink(struct tb *tb)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+	struct tb_tunnel *tunnel;
+
+	list_for_each_entry(tunnel, &tcm->tunnel_list, list)
+		if (tb_tunnel_is_host_dp(tunnel))
+			tunnel->host_relink = false;
+}
+
+/*
+ * Another host DP tunnel is wanted: a tunnel waiting for its re-link at a
+ * higher rate is held at HBR2 instead (tb_dp_host_drop_relink_up()) and its
+ * estimated bandwidth worked out again, before any bandwidth is given to
+ * the new one. The debounce is stopped unless deferred pairing needs the
+ * re-link work. Domain lock held.
+ */
+static void tb_dp_host_cancel_relink_up(struct tb *tb)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+	struct tb_tunnel *tunnel;
+	bool dropped = false;
+
+	list_for_each_entry(tunnel, &tcm->tunnel_list, list) {
+		if (!tb_tunnel_is_host_dp(tunnel) || !tb_dp_host_drop_relink_up(tunnel))
+			continue;
+		tb_tunnel_info(tunnel, "another DP tunnel is wanted: kept at up to %u Mb/s per lane\n",
+			       TB_DP_HOST_RATE_SHARED);
+		dropped = true;
+	}
+	if (!dropped)
+		return;
+	if (!tcm->dp_relink_deferred && cancel_delayed_work(&tcm->dp_relink_work))
+		tb_domain_put(tb);
+	tb_recalc_estimated_bandwidth(tb);
+}
+
+/*
+ * Run the re-link work (dp_relink_run) @delay_ms from now, and only once no
+ * system sleep transition is in progress. One domain reference for each
+ * queued execution of either work, as for dp_tunnel_work. Domain lock held.
+ */
+static void tb_dp_relink_arm(struct tb *tb, unsigned int delay_ms)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+
+	lockdep_assert_held(&tb->lock);
+	if (tcm->stopping)
+		return;
+	tb_domain_get(tb);
+	if (mod_delayed_work(system_freezable_wq, &tcm->dp_relink_work,
+			     msecs_to_jiffies(delay_ms)))
+		tb_domain_put(tb);
+}
+
+/*
+ * Tear @tunnel down and set it up again between the same adapters, at
+ * @rate_limit (Mb/s per lane) at most, because of @why. Its display sees an
+ * unplug and a plug. Only on the domain queue, so that the DPRX work of
+ * @tunnel is not running (the queue is ordered) and releases its paths when
+ * canceled; with the domain lock held and the re-link admitted
+ * (tb_dp_relink_admit()). The new tunnel, NULL if there is none.
+ */
+static struct tb_tunnel *tb_dp_host_relink(struct tb *tb, struct tb_tunnel *tunnel,
+					   u32 rate_limit, const char *why)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+	struct tb_tunnel *relinked;
+	struct tb_port *in = tunnel->src_port;
+	struct tb_port *out = tunnel->dst_port;
+
+	tb_tunnel_info(tunnel, "%s: re-linking at up to %u Mb/s per lane (was %u)\n",
+		       why, rate_limit, tunnel->host_rate);
+	tb_deactivate_and_free_tunnel(tunnel);
+	tb_recalc_estimated_bandwidth(tb);
+	relinked = tb_tunnel_one_dp(tb, in, out, rate_limit);
+	if (relinked)
+		return relinked;
+	/* Not at the higher rate: at the shared one, as before. */
+	if (rate_limit > TB_DP_HOST_RATE_SHARED) {
+		relinked = tb_tunnel_one_dp(tb, in, out, TB_DP_HOST_RATE_SHARED);
+		if (relinked) {
+			tb_port_warn(in, "DP tunnel set up again at up to %u Mb/s per lane\n",
+				     TB_DP_HOST_RATE_SHARED);
+			return relinked;
+		}
+		tcm->dp_host_hold_shared = true;
+	}
+	/* The adapters stay listed: pairing tries again, at the next event too. */
+	tb_port_warn(in, "DP tunnel not set up again, pairing again\n");
+	tb_queue_dp_tunnels(tb);
+	return NULL;
+}
+
+/*
+ * TB_HOST_DP_SHARED_RATE: the link rate limit (Mb/s per lane) for the DP
+ * tunnels pairing sets up now from the host router's DP IN adapters: HBR3
+ * when one tunnel will be up, HBR2 when more will. A tunnel already up
+ * above HBR2 when more are wanted is set up again at HBR2 first, between
+ * the same adapters, so that the streams of the PHY share one rate. Not
+ * while system sleep is in progress: then 0, and the host router's DP IN
+ * adapters are paired once it is over (dp_relink_work), or at the next
+ * resume or thaw. 0 without the policy. Domain lock held.
+ */
+VISIBLE_IF_KUNIT u32 tb_dp_host_rate_limit(struct tb *tb)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+	struct tb_tunnel *tunnel, *above;
+	bool admitted, recovering = false;
+	enum tb_dp_relink action;
+	unsigned int up, want;
+	unsigned long calm;
+
+	if (!tb_dp_host_shares_rate(tb))
+		return 0;
+	up = tb_dp_host_tunnels(tb, NULL);
+	want = up + tb_dp_host_free_pairs(tb);
+	/*
+	 * Another one comes: the one alone is not re-linked to a higher rate,
+	 * and counts at HBR2 for the new one's bandwidth.
+	 */
+	if (want > up) {
+		tb_dp_host_cancel_relink_up(tb);
+		recovering = tcm->dp_host_hold_shared;
+		tcm->dp_host_hold_shared = false;
+	}
+
+	/* Each round sets one tunnel up again at HBR2 at most. */
+	for (;;) {
+		above = NULL;
+		list_for_each_entry(tunnel, &tcm->tunnel_list, list) {
+			if (tb_tunnel_is_host_dp(tunnel) &&
+			    tunnel->host_rate > TB_DP_HOST_RATE_SHARED) {
+				above = tunnel;
+				break;
+			}
+		}
+		if (!above)
+			break;
+
+		admitted = tb_dp_relink_admit();
+		action = tb_dp_relink_down(above->host_rate, want, !admitted);
+		if (action == TB_DP_RELINK_NOW) {
+			/* Soon after a re-link up: back off the next one. */
+			calm = tcm->dp_relinked_at + msecs_to_jiffies(TB_DP_RELINK_CALM_MS);
+			tcm->dp_relink_delay = tb_dp_relink_backoff(tcm->dp_relink_delay,
+								    time_before(jiffies, calm));
+			tb_dp_host_relink(tb, above, TB_DP_HOST_RATE_SHARED,
+					  "another DP tunnel is wanted");
+		}
+		if (admitted) {
+			tb_dp_relink_done();
+			tcm->dp_relink_deferred = false;
+		}
+		if (action == TB_DP_RELINK_NONE)
+			break;
+		if (action == TB_DP_RELINK_WAIT) {
+			if (!tcm->dp_relink_deferred)
+				tb_tunnel_info(above, "another DP tunnel is wanted during system sleep, re-linking after it\n");
+			/* Replayed by dp_relink_work, and at resume or thaw. */
+			tcm->dp_relink_deferred = true;
+			tcm->dp_tunnel_pending = true;
+			tcm->dp_host_hold_shared |= recovering;
+			tb_dp_relink_arm(tb, 0);
+			return 0;
+		}
+	}
+	return tb_dp_host_rate_after(want, recovering);
+}
+
+/*
+ * TB_HOST_DP_SHARED_RATE: a hot unplug took DP tunnels from the host
+ * router's DP IN adapters (@before were up). The one left alone below the
+ * rate it could get is set up again at that rate once the debounce
+ * (dp_relink_delay) is over, unless another one comes by then, so that an
+ * unplug and replug or a retraining does not cause a re-link. Until it is
+ * set up again, it keeps its HBR2 cap and is counted at HBR2. Nothing is
+ * marked during a system sleep transition. Domain lock held.
+ */
+VISIBLE_IF_KUNIT void tb_dp_host_tunnel_gone(struct tb *tb, unsigned int before)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+	struct tb_tunnel *tunnel = NULL;
+	unsigned int up;
+
+	if (!tb_dp_host_shares_rate(tb))
+		return;
+	up = tb_dp_host_tunnels(tb, &tunnel);
+	if (!tunnel || up >= before ||
+	    !tb_dp_relink_up_wanted(up, tunnel->host_rate, tunnel->host_max_rate,
+				    !tb_dp_pm_open()))
+		return;
+
+	tunnel->host_relink = true;
+	tcm->dp_relink_due = jiffies + msecs_to_jiffies(tcm->dp_relink_delay);
+	tb_tunnel_info(tunnel, "alone at %u Mb/s per lane: re-linking at up to %u in %u ms if no other DP tunnel comes\n",
+		       tunnel->host_rate, min(tunnel->host_max_rate, TB_DP_HOST_RATE_ALONE),
+		       tcm->dp_relink_delay);
+	tb_dp_relink_arm(tb, tcm->dp_relink_delay);
+}
+
+/* A host DP tunnel waits for its re-link to a higher rate. */
+static bool tb_dp_host_relink_marked(struct tb *tb)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+	struct tb_tunnel *tunnel;
+
+	list_for_each_entry(tunnel, &tcm->tunnel_list, list)
+		if (tb_tunnel_is_host_dp(tunnel) && tunnel->host_relink)
+			return true;
+	return false;
+}
+
+/*
+ * The debounced part of tb_dp_host_tunnel_gone(), from dp_relink_run on the
+ * domain queue. Domain lock held.
+ */
+static void tb_dp_host_relink_up(struct tb *tb)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+	struct tb_tunnel *tunnel = NULL, *relinked;
+	enum tb_dp_relink action;
+	unsigned int up;
+	bool admitted;
+	long left;
+
+	if (!tb_dp_host_relink_marked(tb))
+		return;
+	up = tb_dp_host_tunnels(tb, &tunnel);
+
+	admitted = tb_dp_relink_admit();
+	action = tb_dp_relink_up(tunnel->host_relink, up, tunnel->host_rate,
+				 tunnel->host_max_rate, tb_dp_host_free_pairs(tb) > 0,
+				 !admitted, jiffies, tcm->dp_relink_due);
+	switch (action) {
+	case TB_DP_RELINK_NONE:
+		tb_dbg(tb, "DP tunnel re-link to a higher rate not needed any more\n");
+		tb_dp_host_clear_relink(tb);
+		break;
+	case TB_DP_RELINK_WAIT:
+		left = (long)(tcm->dp_relink_due - jiffies);
+		tb_dp_relink_arm(tb, left > 0 ? jiffies_to_msecs(left) : TB_DP_RELINK_POLL_MS);
+		break;
+	case TB_DP_RELINK_NOW:
+		tunnel->host_relink = false;
+		tcm->dp_relinked_at = jiffies;
+		relinked = tb_dp_host_relink(tb, tunnel, TB_DP_HOST_RATE_ALONE,
+					     "alone on the host router");
+		/* Set up at HBR2 again if it does not come up at this rate. */
+		if (relinked && relinked->host_rate_limit > TB_DP_HOST_RATE_SHARED)
+			relinked->host_relinked_up = true;
+		break;
+	}
+	if (admitted)
+		tb_dp_relink_done();
+}
+
+/* Replays a re-link that waited, at resume and runtime resume. Domain lock held. */
+static void tb_dp_relink_replay(struct tb *tb)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+
+	if (tcm->dp_relink_deferred || tb_dp_host_relink_marked(tb))
+		tb_dp_relink_arm(tb, 0);
+}
+
 static void tb_tunnel_dp(struct tb *tb)
 {
 	struct tb_cm *tcm = tb_priv(tb);
 	struct tb_port *port, *in, *out;
+	bool host_waits;
+	u32 rate_limit;
 
 	if (!tb_acpi_may_tunnel_dp()) {
 		tb_dbg(tb, "DP tunneling disabled, not creating tunnel\n");
 		return;
 	}
+
+	/* Under TB_HOST_DP_SHARED_RATE: may set a tunnel up again first. */
+	rate_limit = tb_dp_host_rate_limit(tb);
+	host_waits = tb_dp_host_shares_rate(tb) && !rate_limit;
 
 	/*
 	 * Find pair of inactive DP IN and DP OUT adapters and then
@@ -2197,9 +2801,14 @@ static void tb_tunnel_dp(struct tb *tb)
 		in = port;
 		tb_port_dbg(in, "DP IN available\n");
 
+		if (host_waits && tb_port_is_apple_host_dpin(in)) {
+			tb_port_dbg(in, "waiting for system sleep to end\n");
+			continue;
+		}
+
 		out = tb_find_dp_out(tb, port);
 		if (out)
-			tb_tunnel_one_dp(tb, in, out);
+			tb_tunnel_one_dp(tb, in, out, rate_limit);
 		else
 			tb_port_dbg(in, "no suitable DP OUT adapter available, not tunneling\n");
 	}
@@ -2313,6 +2922,79 @@ static void tb_dp_tunnel_work(struct work_struct *work)
 	pm_runtime_mark_last_busy(&tb->dev);
 	pm_runtime_put_autosuspend(&tb->dev);
 put_domain:
+	tb_domain_put(tb);
+}
+
+/*
+ * The timer and gate of the re-link work, on the freezable queue: it does
+ * not run while tasks are frozen, and hands dp_relink_run to the domain
+ * queue only while no system sleep transition is in progress.
+ */
+static void tb_dp_relink_work(struct work_struct *work)
+{
+	struct tb_cm *tcm = container_of(to_delayed_work(work), struct tb_cm,
+					 dp_relink_work);
+	struct tb *tb = tcm_to_tb(tcm);
+
+	mutex_lock(&tb->lock);
+	if (!tcm->stopping) {
+		if (!tb_dp_pm_open()) {
+			tb_dp_relink_arm(tb, TB_DP_RELINK_POLL_MS);
+		} else {
+			tb_domain_get(tb);
+			if (!queue_work(tb->wq, &tcm->dp_relink_run))
+				tb_domain_put(tb);
+		}
+	}
+	mutex_unlock(&tb->lock);
+	tb_domain_put(tb);
+}
+
+/*
+ * Pairing that waited for system sleep to end, see tb_dp_host_rate_limit(),
+ * and the debounced re-link of tb_dp_host_tunnel_gone(). On the domain
+ * queue: behind DPRX and teardown work queued before it, so a tunnel torn
+ * down there has released its paths.
+ */
+static void tb_dp_relink_run(struct work_struct *work)
+{
+	struct tb_cm *tcm = container_of(work, struct tb_cm, dp_relink_run);
+	struct tb *tb = tcm_to_tb(tcm);
+	unsigned int delay;
+	int ret;
+
+	/* Runtime resume can acquire the domain lock, so do it first. */
+	ret = pm_runtime_resume_and_get(&tb->dev);
+
+	mutex_lock(&tb->lock);
+	if (tcm->stopping || !tb->root_switch)
+		goto unlock;
+	if (ret < 0) {
+		/* A few more tries; then the next resume, thaw or plug event. */
+		delay = tb_dp_relink_retry_delay(tcm->dp_relink_tries++);
+		if (delay)
+			tb_dp_relink_arm(tb, delay);
+		else
+			tb_dbg(tb, "DP re-link waits for the next event: runtime resume failed: %d\n",
+			       ret);
+		goto unlock;
+	}
+	tcm->dp_relink_tries = 0;
+	if (tcm->hotplug_active && tcm->dp_relink_deferred) {
+		tb_dbg(tb, "system sleep over, pairing DP resources\n");
+		tcm->dp_tunnel_pending = false;
+		/* Checks the gate again, and defers again if it is closed. */
+		tb_tunnel_dp(tb);
+	}
+	if (tcm->hotplug_active)
+		tb_dp_host_relink_up(tb);
+unlock:
+	mutex_unlock(&tb->lock);
+
+	if (ret >= 0) {
+		pm_runtime_mark_last_busy(&tb->dev);
+		pm_runtime_put_autosuspend(&tb->dev);
+	}
 	tb_domain_put(tb);
 }
 
@@ -2484,11 +3166,21 @@ static int tb_approve_xdomain_paths(struct tb *tb, struct tb_xdomain *xd,
 	struct tb_switch *sw;
 	int ret;
 
+	mutex_lock(&tb->lock);
+
+	/*
+	 * A service driver can still ask for paths after the XDomain was
+	 * unplugged or while the domain is being stopped, when the router
+	 * may already be gone and tb->root_switch is NULL.
+	 */
+	if (xd->is_unplugged || !tb->root_switch) {
+		mutex_unlock(&tb->lock);
+		return -ENODEV;
+	}
+
 	sw = tb_to_switch(xd->dev.parent);
 	dst_port = tb_port_at(xd->route, sw);
 	nhi_port = tb_switch_find_port(tb->root_switch, TB_TYPE_NHI);
-
-	mutex_lock(&tb->lock);
 
 	/*
 	 * When tunneling DMA paths the link should not enter CL states
@@ -2571,6 +3263,15 @@ static int tb_disconnect_xdomain_paths(struct tb *tb, struct tb_xdomain *xd,
 
 /* hotplug handling */
 
+/* The partner on a host router lane adapter went away */
+static void tb_host_link_lost(struct tb *tb, struct tb_port *port)
+{
+	if (tb_route(port->sw) || !tb_port_is_null(port))
+		return;
+	if (tb->nhi->ops && tb->nhi->ops->link_lost)
+		tb->nhi->ops->link_lost(tb->nhi);
+}
+
 /*
  * tb_handle_hotplug() - handle hotplug event
  *
@@ -2614,6 +3315,8 @@ static void tb_handle_hotplug(struct work_struct *work)
 	pm_runtime_get_sync(&sw->dev);
 
 	if (ev->unplug) {
+		unsigned int dp_up = tb_dp_host_tunnels(tb, NULL);
+
 		tb_retimer_remove_all(port);
 
 		if (tb_port_has_remote(port)) {
@@ -2632,6 +3335,8 @@ static void tb_handle_hotplug(struct work_struct *work)
 			/* Maybe we can create another DP tunnel */
 			tb_recalc_estimated_bandwidth(tb);
 			tb_tunnel_dp(tb);
+			tb_dp_host_tunnel_gone(tb, dp_up);
+			tb_host_link_lost(tb, port);
 		} else if (port->xdomain) {
 			struct tb_xdomain *xd = tb_xdomain_get(port->xdomain);
 
@@ -2649,8 +3354,12 @@ static void tb_handle_hotplug(struct work_struct *work)
 			__tb_disconnect_xdomain_paths(tb, xd, -1, -1, -1, -1);
 			tb_xdomain_put(xd);
 			tb_port_unconfigure_xdomain(port);
+			tb_host_link_lost(tb, port);
 		} else if (tb_port_is_dpout(port) || tb_port_is_dpin(port)) {
 			tb_dp_resource_unavailable(tb, port, "adapter unplug");
+			/* A display went: the DP tunnel left may take a higher rate. */
+			if (tb_port_is_dpout(port))
+				tb_dp_host_tunnel_gone(tb, dp_up);
 		} else if (!port->port) {
 			tb_sw_dbg(sw, "xHCI disconnect request\n");
 			tb_switch_xhci_disconnect(sw);
@@ -3110,6 +3819,10 @@ static void tb_stop(struct tb *tb)
 	tcm->stopping = true;
 	tcm->hotplug_active = false;
 	cancel_delayed_work(&tcm->remove_work);
+	if (cancel_delayed_work(&tcm->dp_relink_work))
+		tb_domain_put(tb);
+	if (cancel_work(&tcm->dp_relink_run))
+		tb_domain_put(tb);
 	list_for_each_entry(tunnel, &tcm->tunnel_list, list) {
 		if (tb_tunnel_is_dp(tunnel))
 			tb_dp_tunnel_cancel_dprx(tunnel);
@@ -3169,6 +3882,11 @@ static void tb_deinit(struct tb *tb)
 	/* Cancel all the release bandwidth workers */
 	for (i = 0; i < ARRAY_SIZE(tcm->groups); i++)
 		cancel_delayed_work_sync(&tcm->groups[i].release_work);
+	/* Stopped: nothing queues them again. */
+	if (cancel_delayed_work_sync(&tcm->dp_relink_work))
+		tb_domain_put(tb);
+	if (cancel_work_sync(&tcm->dp_relink_run))
+		tb_domain_put(tb);
 }
 
 static int tb_scan_finalize_switch(struct device *dev, void *data)
@@ -3251,9 +3969,11 @@ static int tb_start(struct tb *tb, bool reset)
 	 * To support highest CLx state, we set host router's TMU to
 	 * Normal mode.
 	 */
-	tb_switch_tmu_configure(tb->root_switch, TB_SWITCH_TMU_MODE_LOWRES);
-	/* Enable TMU if it is off */
-	tb_switch_tmu_enable(tb->root_switch);
+	if (!tb_switch_tmu_host_managed(tb->root_switch)) {
+		tb_switch_tmu_configure(tb->root_switch, TB_SWITCH_TMU_MODE_LOWRES);
+		/* Enable TMU if it is off */
+		tb_switch_tmu_enable(tb->root_switch);
+	}
 
 	/*
 	 * Boot firmware might have created tunnels of its own. Since we
@@ -3540,6 +4260,7 @@ static void tb_complete(struct tb *tb)
 	/* A noirq replay may have failed while runtime PM was disabled. */
 	if (tcm->dp_tunnel_pending)
 		tb_queue_dp_tunnels(tb);
+	tb_dp_relink_replay(tb);
 }
 
 static int tb_runtime_suspend(struct tb *tb)
@@ -3596,6 +4317,7 @@ static int tb_runtime_resume(struct tb *tb)
 	tcm->hotplug_active = true;
 	if (tcm->dp_tunnel_pending)
 		tb_queue_dp_tunnels(tb);
+	tb_dp_relink_replay(tb);
 	mutex_unlock(&tb->lock);
 
 	/*
@@ -3694,12 +4416,30 @@ static bool tb_apple_add_links(struct tb_nhi *nhi)
 	return ret;
 }
 
+/* Hosts without ACPI tables may order their tunneled native ports themselves. */
+static bool tb_nhi_add_links(struct tb_nhi *nhi)
+{
+	return nhi->ops && nhi->ops->add_links && nhi->ops->add_links(nhi);
+}
+
+static void tb_cm_init(struct tb_cm *tcm)
+{
+	INIT_LIST_HEAD(&tcm->tunnel_list);
+	INIT_LIST_HEAD(&tcm->dp_resources);
+	INIT_DELAYED_WORK(&tcm->remove_work, tb_remove_work);
+	INIT_WORK(&tcm->dp_tunnel_work, tb_dp_tunnel_work);
+	INIT_DELAYED_WORK(&tcm->dp_relink_work, tb_dp_relink_work);
+	INIT_WORK(&tcm->dp_relink_run, tb_dp_relink_run);
+	tcm->dp_relink_delay = TB_DP_RELINK_DELAY_MS;
+	tcm->dp_relinked_at = jiffies - msecs_to_jiffies(TB_DP_RELINK_CALM_MS);
+	tb_init_bandwidth_groups(tcm);
+}
+
 struct tb *tb_probe(struct tb_nhi *nhi)
 {
-	struct tb_cm *tcm;
 	struct tb *tb;
 
-	tb = tb_domain_alloc(nhi, TB_TIMEOUT, sizeof(*tcm));
+	tb = tb_domain_alloc(nhi, TB_TIMEOUT, sizeof(struct tb_cm));
 	if (!tb)
 		return NULL;
 
@@ -3710,12 +4450,7 @@ struct tb *tb_probe(struct tb_nhi *nhi)
 
 	tb->cm_ops = &tb_cm_ops;
 
-	tcm = tb_priv(tb);
-	INIT_LIST_HEAD(&tcm->tunnel_list);
-	INIT_LIST_HEAD(&tcm->dp_resources);
-	INIT_DELAYED_WORK(&tcm->remove_work, tb_remove_work);
-	INIT_WORK(&tcm->dp_tunnel_work, tb_dp_tunnel_work);
-	tb_init_bandwidth_groups(tcm);
+	tb_cm_init(tb_priv(tb));
 
 	tb_dbg(tb, "using software connection manager\n");
 
@@ -3724,9 +4459,67 @@ struct tb *tb_probe(struct tb_nhi *nhi)
 	 * before the PCIe/USB stack is resumed so complain here if we
 	 * found them missing.
 	 */
-	if (!tb_apple_add_links(nhi) && !tb_acpi_add_links(nhi))
+	if (!tb_nhi_add_links(nhi) && !tb_apple_add_links(nhi) &&
+	    !tb_acpi_add_links(nhi))
 		tb_warn(tb, "device links to tunneled native ports are missing!\n");
 
 	return tb;
 }
 EXPORT_SYMBOL_FOR_MODULES(tb_probe, "thunderbolt_apple");
+
+#if IS_ENABLED(CONFIG_USB4_KUNIT_TEST)
+/*
+ * For the KUnit tests: the software connection manager of a domain the test
+ * sets up itself, with no hardware behind it. The domain is allocated with
+ * tb_test_cm_size() bytes of private data.
+ */
+size_t tb_test_cm_size(void)
+{
+	return sizeof(struct tb_cm);
+}
+
+void tb_test_cm_init(struct tb *tb)
+{
+	tb_cm_init(tb_priv(tb));
+}
+
+struct list_head *tb_test_cm_tunnels(struct tb *tb)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+
+	return &tcm->tunnel_list;
+}
+
+struct list_head *tb_test_cm_dp_resources(struct tb *tb)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+
+	return &tcm->dp_resources;
+}
+
+void tb_test_cm_set_relink_deferred(struct tb *tb, bool deferred)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+
+	tcm->dp_relink_deferred = deferred;
+}
+
+/* The re-link work's timer is armed. */
+bool tb_test_cm_relink_armed(struct tb *tb)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+
+	return delayed_work_pending(&tcm->dp_relink_work);
+}
+
+/* Stop the re-link work as tb_deinit() does, dropping its domain references. */
+void tb_test_cm_stop(struct tb *tb)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+
+	if (cancel_delayed_work_sync(&tcm->dp_relink_work))
+		tb_domain_put(tb);
+	if (cancel_work_sync(&tcm->dp_relink_run))
+		tb_domain_put(tb);
+}
+#endif

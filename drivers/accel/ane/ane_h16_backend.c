@@ -15,10 +15,15 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/soc/apple/clpc.h>
+#include <linux/soc/apple/pmgr-pwrstate.h>
+#include <linux/soc/apple/pmp-report.h>
 #include <linux/scatterlist.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/vmalloc.h>
+#include <linux/wait.h>
 #include <linux/workqueue.h>
 
 #include "ane_fw_sleep.h"
@@ -49,6 +54,8 @@ struct ane_h16_device {
 	/* Optional "perf" floor, voted only while an EXECUTE is in flight. */
 	struct device *perf;
 	bool perf_held;
+	/* Optional CLPC input: DRAM and fabric floors while an EXECUTE is in flight. */
+	struct apple_clpc_ane *clpc;
 	struct device *dart[3];
 	u32 powered;
 	u32 darts_powered;
@@ -62,6 +69,20 @@ struct ane_h16_device {
 	/* While pinned: refuse system sleep (ane_fw_sleep.h). */
 	struct notifier_block pm_notifier;
 	int irq;
+	/*
+	 * The channel IRQ (ANE_FW_IRQ_CHANNELS) as a wakeup for the polled
+	 * waits once the firmware is up: pause() arms it before sleeping and
+	 * the handler disables it again. The transport still reads,
+	 * acknowledges and drains every ring itself, as before. irq_seq
+	 * counts IRQs, so concurrent waiters each see their own wakeup.
+	 */
+	spinlock_t irq_lock;
+	wait_queue_head_t irq_wq;
+	bool irq_wait;
+	bool irq_armed;
+	unsigned long irq_seq;
+	u64 irq_wakeups;
+	u64 irq_timeouts;
 	struct ane_fw_rtk rtk;
 	struct {
 		u64 word0;
@@ -101,6 +122,7 @@ struct ane_h16_device {
 	bool engine_on;
 	u64 resume_first_ns;
 	unsigned int resume_replayed;
+	unsigned int resume_restarts;
 	bool resume_cold;
 	struct ane_h16_session session;
 	struct work_struct start;
@@ -155,9 +177,14 @@ static void ane_h16_log(void *ctx, const char *item, u64 a, u64 b)
 	dev_info(h->dev, "H16 %s %llx %llx\n", item, a, b);
 }
 
+static void ane_h16_startup_fwlog(struct ane_h16_device *h);
+
 static void ane_h16_quarantine(void *ctx, int error)
 {
 	struct ane_h16_device *h = ctx;
+
+	if ((error == -ETIMEDOUT || error == -ESHUTDOWN) && h->boot.stage == ANE_H16_BOOT)
+		ane_h16_startup_fwlog(h);
 
 	dev_err(h->dev, "H16 quarantine error %d; mappings, power and module held until reboot\n",
 		error);
@@ -177,6 +204,31 @@ static void ane_h16_quarantine(void *ctx, int error)
 
 static void ane_h16_busy(void *ctx, bool busy);
 static void ane_h16_sleep_trace(struct ane_h16_device *h, const char *when);
+
+/*
+ * Let the channel IRQ wake the waits, or go back to pure polling. Off
+ * across power down and the firmware startup that follows it, so the
+ * startup handshake keeps its proven polled timing.
+ */
+static void ane_h16_irq_wait_set(struct ane_h16_device *h, bool on)
+{
+	if (h->irq < 0 || h->boot.soc->irq_role != ANE_FW_IRQ_CHANNELS)
+		return;
+	/*
+	 * Arming and disarming both happen under irq_lock, so a pause racing
+	 * with power down either armed before this (and is disarmed here) or
+	 * sees irq_wait clear and polls.
+	 */
+	scoped_guard(spinlock_irqsave, &h->irq_lock) {
+		WRITE_ONCE(h->irq_wait, on);
+		if (!on && h->irq_armed) {
+			h->irq_armed = false;
+			disable_irq_nosync(h->irq);
+		}
+	}
+	if (!on)
+		synchronize_irq(h->irq);
+}
 
 static int ane_h16_suspend_firmware(struct ane_h16_device *h)
 {
@@ -253,6 +305,7 @@ static void ane_h16_power_down(struct ane_h16_device *h)
 	unsigned int i;
 
 	ane_h16_busy(h, false);
+	ane_h16_irq_wait_set(h, false);
 	for (i = ARRAY_SIZE(h->dart); i-- > 0; )
 		pm_runtime_put_sync(h->dart[i]);
 	for (i = h->powered; i-- > 0; )
@@ -344,8 +397,10 @@ static int ane_h16_warm_boot(struct ane_h16_device *h)
 		return ret;
 	ret = ane_fw_transport_check(&b->transport);
 	h->resume_ready_ns = ktime_get_ns();
-	if (!ret)
+	if (!ret) {
+		ane_h16_irq_wait_set(h, true);
 		dev_info(h->dev, "H16 ANE: firmware resumed (warm boot); programs kept\n");
+	}
 	return ret;
 }
 
@@ -380,24 +435,65 @@ static void ane_h16_genpd_record(struct ane_h16_device *h)
 }
 
 /*
- * The cold fallback after a failed warm boot: the engine is powered off
- * again, then booted from the preload as at bring-up (pristine DATA, heap
- * tail, pool, IPC and heap cleared and reused, RTKit restarted, 0x29 at
- * startup), the shared allocations carried over, and every open program
- * replayed behind its handle.
+ * Power the engine off (if on) and on again, then restore what a release of
+ * the CPU from the preload needs: DAPF records, RVBAR, the verified DATA, a
+ * cleared heap tail and fresh RTKit state. With @verify, the cpu, mpm, td and
+ * base domains must each have reported an OFF transition, so the CPU and the
+ * engine were reset. The first domain, sys, is their parent and stays on at
+ * runtime under the DARTs, so with @verify it is then power cycled on its own
+ * (ane_h16_sys_cycle()); in system sleep it goes off with the others.
  */
-static int ane_h16_cold_boot(struct ane_h16_device *h)
+/*
+ * Power the sys domain (the first, the parent of the other four) off and on
+ * again. At runtime the ANE DARTs, which sit in it, hold it on, so it stays
+ * on across a runtime power cycle of the other four. A firmware startup stall
+ * on the J616s survives that, and is cleared once sys is off too, as it is in
+ * system sleep. The DARTs keep their SID0 state across it, as they do across
+ * system sleep (the ANE DART's suspend and resume neither save nor restore).
+ */
+static int ane_h16_sys_cycle(struct ane_h16_device *h)
+{
+	struct device_node *np = of_parse_phandle(h->dev->of_node, "power-domains", 0);
+	int ret;
+
+	if (!np)
+		return -ENODEV;
+	ret = apple_pmgr_ps_cycle(np);
+	of_node_put(np);
+	if (ret)
+		dev_err(h->dev, "H16 ANE: sys domain power cycle failed, error %d\n", ret);
+	return ret;
+}
+
+static int ane_h16_power_cycle(struct ane_h16_device *h, bool verify)
 {
 	struct ane_h16_boot *b = &h->boot;
-	struct ane_fw_transport *old;
 	size_t size = b->soc->preload_size[1];
+	unsigned int offs[ARRAY_SIZE(h->genpd)], i;
 	void *live;
 	int ret;
 
 	if (!h->pristine_data)
 		return -ENODATA;
+	for (i = 0; i < h->powered; i++)
+		offs[i] = h->genpd[i].offs;
 	if (h->engine_on)
 		ane_h16_power_down(h);
+	for (i = 1; verify && i < h->powered; i++) {
+		if (!h->genpd[i].added || h->genpd[i].offs == offs[i]) {
+			dev_err(h->dev, "H16 ANE: domain %u did not power off; no restart\n", i);
+			/* Powered again, so the quarantine can read its evidence. */
+			ret = ane_h16_power_up(h);
+			return ret ?: -EIO;
+		}
+	}
+	if (verify) {
+		ret = ane_h16_sys_cycle(h);
+		if (ret) {
+			ret = ane_h16_power_up(h) ?: ret;
+			return ret;
+		}
+	}
 	ret = ane_h16_power_up(h);
 	if (!ret)
 		ret = ane_h16_dapf(b, true);
@@ -418,6 +514,27 @@ static int ane_h16_cold_boot(struct ane_h16_device *h)
 	h->tx_read = 0;
 	h->tx_write = 0;
 	h->mode_stopped = false;
+	return 0;
+}
+
+/*
+ * The cold fallback after a failed warm boot: the engine is powered off
+ * again, then booted from the preload as at bring-up (pristine DATA, heap
+ * tail, pool, IPC and heap cleared and reused, RTKit restarted, 0x29 at
+ * startup), the shared allocations carried over, and every open program
+ * replayed behind its handle. The firmware can stop part way through this
+ * startup as it does at bring-up; it gets the same bounded, verified restart,
+ * with a budget of its own for each wake.
+ */
+static int ane_h16_cold_boot(struct ane_h16_device *h)
+{
+	struct ane_h16_boot *b = &h->boot;
+	struct ane_fw_transport *old;
+	int ret;
+
+	ret = ane_h16_power_cycle(h, false);
+	if (ret)
+		return ret;
 	old = kmemdup(&b->transport, sizeof(*old), GFP_KERNEL);
 	if (!old)
 		return -ENOMEM;
@@ -426,10 +543,12 @@ static int ane_h16_cold_boot(struct ane_h16_device *h)
 		ane_fw_transport_carry_shared(&b->transport, old);
 	kfree(old);
 	if (!ret)
-		ret = ane_h16_startup(b);
+		ret = ane_h16_startup_restarting(b, &h->resume_restarts,
+						 "resume restart/budget");
 	if (ret)
 		return ret;
 	h->resume_ready_ns = ktime_get_ns();
+	ane_h16_irq_wait_set(h, true);
 	dev_info(h->dev, "H16 ANE: booted again from the preload after system sleep\n");
 	ane_h16_session_restart(&h->session);
 	ret = ane_h16_session_replay(&h->session, &h->resume_replayed, &h->resume_first_ns);
@@ -495,6 +614,7 @@ static void ane_h16_sleep_resume(struct ane_h16_device *h)
 	h->resume_first_ns = 0;
 	h->resume_replayed = 0;
 	h->resume_cold = !h->boot.soc->sleep_warm;
+	h->resume_restarts = 0;
 	if (h->resume_cold) {
 		ret = ane_h16_cold_boot(h);
 	} else {
@@ -519,9 +639,10 @@ static void ane_h16_sleep_resume(struct ane_h16_device *h)
 	ready = h->resume_ready_ns ? div_u64(h->resume_ready_ns - start, NSEC_PER_MSEC) : -1;
 	first = h->resume_first_ns ? div_u64(h->resume_first_ns - start, NSEC_PER_MSEC) : -1;
 	dev_info(h->dev,
-		 "H16 ANE: resume %s: %s, firmware ready %lld ms, first program ready %lld ms, node reopened %llu ms, %u programs replayed\n",
+		 "H16 ANE: resume %s: %s, firmware ready %lld ms, first program ready %lld ms, node reopened %llu ms, %u programs replayed, %u restarts\n",
 		 ret ? "FAILED" : "ok", h->resume_cold ? "cold" : "warm", ready, first,
-		 div_u64(ktime_get_ns() - start, NSEC_PER_MSEC), h->resume_replayed);
+		 div_u64(ktime_get_ns() - start, NSEC_PER_MSEC), h->resume_replayed,
+		 h->resume_restarts);
 }
 
 static int ane_h16_pm_event(struct notifier_block *nb, unsigned long event, void *unused)
@@ -900,12 +1021,60 @@ static u64 ane_h16_now(void *ctx)
 }
 
 /*
- * The channel IRQ stays masked, so every wait polls, with the shared pacing
- * (see ane_fw_poll_sleep_us()): busy steps for the first 30 us, then short
- * sleeps. A fixed 1 ms sleep made each of the four waits of an EXECUTE cost
- * at least a millisecond.
+ * Every wait polls, with the shared pacing (see ane_fw_poll_sleep_us()):
+ * busy steps for the first 30 us, then short sleeps. A fixed 1 ms sleep
+ * made each of the four waits of an EXECUTE cost at least a millisecond.
+ *
+ * After the busy window an EXECUTE reply (typically 40-50 us) landed in a
+ * 20-50 us sleep and was seen 40-50 us late. Once the firmware is up, the
+ * sleep therefore also ends on the channel IRQ, the way macOS drains the
+ * rings from IRQ 1054; the timeout keeps the polled cadence as a bound.
  */
-static void ane_h16_relax(void *ctx, u64 waited_ns)
+static void ane_h16_irq_pause(struct ane_h16_device *h, u64 waited_ns)
+{
+	unsigned int min_us, max_us;
+	unsigned long seq = 0;
+	bool armed = false;
+	long ret;
+
+	min_us = ane_fw_poll_sleep_us(waited_ns, &max_us);
+	scoped_guard(spinlock_irqsave, &h->irq_lock) {
+		if (h->irq_wait) {
+			seq = h->irq_seq;
+			if (!h->irq_armed) {
+				h->irq_armed = true;
+				enable_irq(h->irq);
+			}
+			armed = true;
+		}
+	}
+	if (!armed) {
+		ane_fw_poll_pause(waited_ns);
+		return;
+	}
+	ret = wait_event_hrtimeout(h->irq_wq, READ_ONCE(h->irq_seq) != seq,
+				   us_to_ktime(min_us));
+	scoped_guard(spinlock_irqsave, &h->irq_lock) {
+		if (ret)
+			h->irq_timeouts++;
+		else
+			h->irq_wakeups++;
+	}
+}
+
+/* The waiting half of relax(); callers may hold no lock. */
+static void ane_h16_pause(void *ctx, u64 waited_ns)
+{
+	struct ane_h16_device *h = ctx;
+
+	if (READ_ONCE(h->irq_wait) && waited_ns >= ANE_FW_POLL_SPIN_NS &&
+	    !READ_ONCE(h->boot.transport.error))
+		ane_h16_irq_pause(h, waited_ns);
+	else
+		ane_fw_poll_pause(waited_ns);
+}
+
+static void ane_h16_service(void *ctx)
 {
 	struct ane_h16_device *h = ctx;
 	int ret;
@@ -914,7 +1083,12 @@ static void ane_h16_relax(void *ctx, u64 waited_ns)
 	ret = ane_h16_faults(&h->boot, false);
 	if (ret)
 		ane_fw_transport_fail(&h->boot.transport, ret);
-	ane_fw_poll_pause(waited_ns);
+}
+
+static void ane_h16_relax(void *ctx, u64 waited_ns)
+{
+	ane_h16_service(ctx);
+	ane_h16_pause(ctx, waited_ns);
 }
 
 static int ane_h16_alloc_shared(void *ctx, size_t size, u32 tag, struct ane_fw_surface *out)
@@ -946,6 +1120,62 @@ static void ane_h16_shared_note(void *ctx, const char *event, u64 dva, u64 size,
 		 event, size, tag, dva);
 }
 
+/*
+ * The firmware's own text log (its first SHAREDMALLOC) after a startup that
+ * stopped: where the firmware got to. Read only.
+ */
+static void ane_h16_startup_fwlog(struct ane_h16_device *h)
+{
+	struct ane_fw_transport *t = &h->boot.transport;
+	const struct ane_fw_surface *log = ane_fw_transport_shared_tagged(t, ANE_FW_SHARED_LOG);
+	char line[ANE_H16_FWLOG_RECORD];
+	unsigned int i, lines = 0;
+
+	if (!log || !log->cpu)
+		return;
+	t->ops->read_barrier(t->ctx);
+	for (i = 0; i < log->size / ANE_H16_FWLOG_RECORD; i++) {
+		const u8 *r = (const u8 *)log->cpu + i * ANE_H16_FWLOG_RECORD;
+
+		if (!ane_h16_fwlog_line(r, line))
+			continue;
+		dev_info(h->dev, "H16 startup fwlog[%03x] %s\n", i, line);
+		lines++;
+	}
+	dev_info(h->dev, "H16 startup fwlog records %u\n", lines);
+}
+
+/*
+ * Power cycles allowed after a startup timeout or stop at bring-up. On the
+ * J616s the firmware's CPU is stopped part way through startup on about one
+ * boot in six: it posts no further request and never answers the pending
+ * command.
+ */
+#define ANE_H16_STARTUP_RESTARTS 2
+
+/*
+ * A startup that timed out at bring-up: keep the log, then a verified power
+ * cycle. Every mapping stays; nothing is released while the engine may hold it.
+ */
+static bool ane_h16_powered(void *ctx)
+{
+	return ((struct ane_h16_device *)ctx)->engine_on;
+}
+
+static int ane_h16_restart_engine(void *ctx)
+{
+	struct ane_h16_device *h = ctx;
+	int ret;
+
+	ane_h16_startup_fwlog(h);
+	ret = ane_h16_power_cycle(h, true);
+	if (ret)
+		dev_err(h->dev, "H16 ANE: startup timed out; power cycle failed, error %d\n", ret);
+	else
+		dev_warn(h->dev, "H16 ANE: startup timed out; engine power cycled, booting again\n");
+	return ret;
+}
+
 static const struct ane_h16_boot_ops ane_h16_ops = {
 	.read32 = ane_h16_mmio_read32,
 	.read64 = ane_h16_mmio_read64,
@@ -958,9 +1188,27 @@ static const struct ane_h16_boot_ops ane_h16_ops = {
 	.mailbox = ane_h16_mailbox,
 	.log = ane_h16_log,
 	.quarantine = ane_h16_quarantine,
+	.restart = ane_h16_restart_engine,
+	.powered = ane_h16_powered,
 };
 
 static void ane_h16_busy(void *ctx, bool busy);
+
+/*
+ * On the J616s the firmware's CPU is sometimes stopped part way through its
+ * startup, 8 to 12 ms after RUN: its wrapper control word reads 0 (RUN
+ * cleared) and the status 0x30006a. It then answers nothing until it is
+ * power cycled. Seen during startup only, so only watched there.
+ */
+static bool ane_h16_cpu_stopped(void *ctx)
+{
+	struct ane_h16_device *h = ctx;
+	const struct ane_h16_build *f = h->boot.build;
+
+	if (!h->boot.starting || !h->engine_on)
+		return false;
+	return !(ane_h16_mmio_read32(h, ANE_H16_ENGINE, f->cpu_control) & f->run);
+}
 
 static const struct ane_h16_session_ops ane_h16_session_ops = {
 	.map = ane_h16_program_map,
@@ -977,9 +1225,12 @@ static const struct ane_fw_transport_ops ane_h16_transport_ops = {
 	.write32 = ane_h16_engine_write,
 	.now_ns = ane_h16_now,
 	.relax = ane_h16_relax,
+	.pause = ane_h16_pause,
+	.service = ane_h16_service,
 	.alloc = ane_h16_alloc_shared,
 	.refused = ane_h16_refused,
 	.shared_note = ane_h16_shared_note,
+	.stopped = ane_h16_cpu_stopped,
 };
 
 /* Pre-RUN rollback of everything a stage acquired. h itself stays. */
@@ -1036,6 +1287,8 @@ static void ane_h16_release(struct ane_h16_device *h)
 		dev_pm_domain_detach(h->perf, false);
 		h->perf = NULL;
 	}
+	apple_clpc_ane_put(h->clpc);
+	h->clpc = NULL;
 	while (h->powered) {
 		struct device *pd = h->power[--h->powered];
 
@@ -1049,9 +1302,20 @@ static void ane_h16_release(struct ane_h16_device *h)
 	dev_info(h->dev, "H16 pre-RUN rollback complete; no CPU release\n");
 }
 
-static irqreturn_t ane_h16_masked_irq(int irq, void *data)
+/* Wake the sleeping wait and stay disabled until relax() arms it again. */
+static irqreturn_t ane_h16_irq(int irq, void *data)
 {
-	return IRQ_NONE;
+	struct ane_h16_device *h = data;
+
+	scoped_guard(spinlock_irqsave, &h->irq_lock) {
+		if (h->irq_armed) {
+			disable_irq_nosync(irq);
+			h->irq_armed = false;
+		}
+		WRITE_ONCE(h->irq_seq, h->irq_seq + 1);
+	}
+	wake_up(&h->irq_wq);
+	return IRQ_HANDLED;
 }
 
 /*
@@ -1081,6 +1345,7 @@ static void ane_h16_busy(void *ctx, bool busy)
 {
 	struct ane_h16_device *h = ctx;
 
+	apple_clpc_ane_set_active(h->clpc, busy);
 	if (!h->perf)
 		return;
 	if (busy) {
@@ -1157,6 +1422,10 @@ static int ane_h16_acquire(struct platform_device *pdev, struct ane_h16_device *
 		if (ret)
 			return ret;
 	}
+	/* Optional: success with no input when the SoC's CLPC takes none. */
+	ret = apple_clpc_ane_get(h->dev, &h->clpc);
+	if (ret)
+		return ret;
 	for (i = 0; i < ARRAY_SIZE(names); i++) {
 		struct resource *r = platform_get_resource_byname(pdev, IORESOURCE_MEM, names[i]);
 
@@ -1212,11 +1481,10 @@ static int ane_h16_acquire(struct platform_device *pdev, struct ane_h16_device *
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0)
 		return irq;
-	ret = request_irq(irq, ane_h16_masked_irq, IRQF_NO_AUTOEN, "ane-h16-polled", h);
+	ret = request_irq(irq, ane_h16_irq, IRQF_NO_AUTOEN, "ane-h16", h);
 	if (ret)
 		return ret;
 	h->irq = irq;
-	dev_info(h->dev, "H16 polled mode; channel IRQ remains masked\n");
 	return 0;
 }
 
@@ -1287,6 +1555,7 @@ static int ane_h16_preload_identity(struct ane_h16_device *h)
 	if (b->soc->sleep_warm || b->soc->sleep_cold) {
 		h->pristine_data = snap[1];
 		snap[1] = NULL;
+		b->max_restarts = ANE_H16_STARTUP_RESTARTS;
 	}
 	h->shared_next = b->build->shared_dva;
 	h->program_next = b->build->shared_dva + ANE_FW_SHARED_TOTAL;
@@ -1312,6 +1581,9 @@ static int ane_h16_program_stage(struct ane_h16_device *h)
 {
 	int ret;
 
+	/* Before the node exists: the CLPC may have bound after acquire. */
+	if (!h->clpc && apple_clpc_ane_get(h->dev, &h->clpc))
+		h->clpc = NULL;
 	ret = ane_h16_session_init(&h->session, &h->boot.transport, &ane_h16_session_ops, h,
 				   h->boot.build->command_timeout_ns);
 	if (!ret) {
@@ -1324,8 +1596,9 @@ static int ane_h16_program_stage(struct ane_h16_device *h)
 		return ret;
 	}
 	h->program_ready = true;
-	dev_info(h->dev, "H16 stage 5 program window %llx..%llx\n", h->program_next,
-		 h->program_end - 1);
+	ane_h16_irq_wait_set(h, true);
+	dev_info(h->dev, "H16 stage 5 program window %llx..%llx%s\n", h->program_next,
+		 h->program_end - 1, h->clpc ? ", CLPC input attached" : "");
 	return 0;
 }
 
@@ -1389,10 +1662,41 @@ refuse:
  * path. A failure before RUN leaves the device refused; after RUN it is held
  * until reboot, as for a stage written to debugfs.
  */
+/* How long bring-up waits for the PMP before it starts the firmware anyway. */
+#define ANE_H16_PMP_WAIT_MS 10000
+
+/*
+ * On the J616s, Linux starts the PMP itself, about a second before the ANE
+ * probes, and its firmware takes about another second to come up. A H16 CPU
+ * released while it does is stopped part way through its startup on about
+ * one boot in six (the wrapper control word reads 0, RUN cleared): 0 of 22
+ * when the release waited until the PMP ran. Wait for it, outside every lock.
+ * The stop detection and restart stay as the fallback.
+ */
+static void ane_h16_wait_pmp(struct ane_h16_device *h)
+{
+	const char *compatible = h->boot.soc->pmp_report;
+	struct device_node *np;
+	int ret;
+
+	if (!compatible)
+		return;
+	np = of_find_compatible_node(NULL, NULL, compatible);
+	if (!np)
+		return;
+	ret = apple_pmp_report_wait_running(np, ANE_H16_PMP_WAIT_MS);
+	of_node_put(np);
+	if (ret && ret != -ENODEV)
+		dev_warn(h->dev, "H16 ANE: PMP not running (%d); starting the firmware anyway\n",
+			 ret);
+}
+
 static void ane_h16_start_work(struct work_struct *work)
 {
 	struct ane_h16_device *h = container_of(work, struct ane_h16_device, start);
 	unsigned int flags;
+
+	ane_h16_wait_pmp(h);
 
 	/* Never start the firmware in the middle of a system sleep transition. */
 	flags = lock_system_sleep();
@@ -1520,6 +1824,8 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	}
 	h->dev = &pdev->dev;
 	h->irq = -1;
+	spin_lock_init(&h->irq_lock);
+	init_waitqueue_head(&h->irq_wq);
 	INIT_LIST_HEAD(&h->mappings);
 	h->boot.soc = soc;
 	/* The build, and with it the DVA layout, is chosen from the preload. */
@@ -1546,6 +1852,8 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	h->debugfs = debugfs_create_dir(dev_name(h->dev), ane_h16_debugfs);
 	debugfs_create_file("stage", 0600, h->debugfs, h, &ane_h16_stage_fops);
 	debugfs_create_file("execute", 0600, h->debugfs, h, &ane_h16_execute_fops);
+	debugfs_create_u64("irq_wakeups", 0400, h->debugfs, &h->irq_wakeups);
+	debugfs_create_u64("irq_timeouts", 0400, h->debugfs, &h->irq_timeouts);
 	platform_set_drvdata(pdev, h);
 	INIT_WORK(&h->start, ane_h16_start_work);
 	schedule_work(&h->start);
@@ -1567,8 +1875,11 @@ void ane_h16_backend_remove(struct platform_device *pdev)
 		return;
 	/* Waits for the boot bring-up and any stage write in progress. */
 	cancel_work_sync(&h->start);
-	if (h->program_ready)
+	if (h->program_ready) {
 		cancel_delayed_work_sync(&h->session.gate_work);
+		/* Return released exports; mapped ones stay with their mappings. */
+		flush_work(&h->session.export_work);
+	}
 	debugfs_remove_recursive(h->debugfs);
 	mutex_lock(&ane_h16_lock);
 	if (!--ane_h16_debugfs_users) {

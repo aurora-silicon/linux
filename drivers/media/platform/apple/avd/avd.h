@@ -41,6 +41,10 @@
 #define AVD_QUIRK_HEVC_V5_HEADER	BIT(2)
 /* T8140: pace only HEVC submissions, with a shorter back-off. */
 #define AVD_QUIRK_V5_QUEUE_PACING	BIT(3)
+/* H.264 co-located motion vectors take 128 bytes per macroblock, not 64. */
+#define AVD_QUIRK_H264_MV_128	BIT(4)
+/* A reset after a timeout hangs the machine: stay parked and retire the decoder */
+#define AVD_QUIRK_NO_RECOVERY_RESET BIT(5)
 
 #define VP_SLOT_NONE		255
 #define INST_FIFO_SLOT_NONE	255
@@ -362,6 +366,8 @@ bool avd_h264_find_slice_data(const u8 *data, u32 len, u32 header_len,
 			      u32 *off);
 bool avd_h264_slice_fits(const struct v4l2_ctrl_h264_sps *sps, size_t held,
 			 size_t held_bytes, u32 len, size_t decoded_size);
+bool avd_h264_scaling_is_flat(const struct v4l2_ctrl_h264_pps *pps,
+			      const struct v4l2_ctrl_h264_scaling_matrix *scaling);
 #endif
 
 extern const struct avd_coded_fmt_ops avd_h264_fmt_ops;

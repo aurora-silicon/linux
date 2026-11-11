@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/iommu/apple,ave-dma.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple video encoder auxiliary DMA apertures
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  Auxiliary translation and protection apertures accompany the video
+  encoder DMA DARTs. They are described separately because they do not
+  implement the programming model of the general-purpose DART driver.
+  The interrupt is shared with the codec DART instances.
+
+properties:
+  compatible:
+    oneOf:
+      - items:
+          - enum:
+              - apple,t8103-ave-dma
+          - const: apple,ave-dma
+      - items:
+          - const: apple,t6000-ave-dma
+          - const: apple,ave-dma
+
+  reg:
+    minItems: 2
+    maxItems: 2
+
+  interrupts:
+    maxItems: 1
+
+  power-domains:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - power-domains
+
+additionalProperties: false

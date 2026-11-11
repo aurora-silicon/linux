@@ -279,7 +279,8 @@ unsafe impl Send for Charge {}
 unsafe impl Sync for Charge {}
 
 impl Charge {
-    /// An object that is not counted (a dma-buf import).
+    /// An object that is not counted: a dma-buf import, or a kernel object whose owner holds a
+    /// user charge for it.
     pub(crate) fn none() -> Self {
         Self {
             kind: Kind::None,
@@ -349,6 +350,33 @@ impl Charge {
                 }
             }
         }
+    }
+
+    /// Moves a user object's charge to `to`, the client now using it: its committed bytes,
+    /// within `to`'s limit, and its held bytes. The device totals and the process attribution
+    /// stay as they are. A refusal fails with `ENOMEM` and leaves the charge where it was.
+    /// Other kinds are attributed to no client and are left alone.
+    pub(crate) fn transfer(&mut self, to: &Arc<Client>) -> Result {
+        let bytes = self.bytes;
+        let held = *self.held.get_mut();
+        let Kind::User { commit, .. } = &mut self.kind else {
+            return Ok(());
+        };
+        if Arc::ptr_eq(&commit.client, to) {
+            return Ok(());
+        }
+        let ledger = commit.ledger;
+        if !try_add_within(&to.committed, bytes, ledger.client_limit.load(Ordering::Relaxed), 0) {
+            ledger.refused.fetch_add(1, Ordering::Relaxed);
+            return Err(ENOMEM);
+        }
+        if held {
+            to.resident.fetch_add(bytes, Ordering::AcqRel);
+            sub(&commit.client.resident, bytes);
+        }
+        sub(&commit.client.committed, bytes);
+        commit.client = to.clone();
+        Ok(())
     }
 
     /// Records that the GPU now holds (or no longer holds) the object's backing.
@@ -487,6 +515,36 @@ mod tests {
         assert_eq!(a.committed(), 0);
         assert_eq!(HELD.user_resident.load(Ordering::Relaxed), 0);
         assert_eq!(HELD.user_committed.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    static MOVE: Ledger = Ledger::new();
+
+    #[test]
+    fn a_transfer_moves_the_charge_once() -> Result {
+        MOVE.set_limits(Limits { device: 100 * MIB, client: 60 * MIB });
+        let a = Client::new()?;
+        let b = Client::new()?;
+        let mut charge = Charge::user(MOVE.admit(&a, 40 * MIB)?, None);
+        charge.set_held(true);
+        let other = MOVE.admit(&b, 30 * MIB)?;
+        // b is within 60 MiB only without the 40 MiB: refused, and nothing moved.
+        assert_eq!(charge.transfer(&b), Err(ENOMEM));
+        assert_eq!((a.committed(), a.resident(), b.committed()), (40 * MIB, 40 * MIB, 30 * MIB));
+        drop(other);
+        charge.transfer(&b)?;
+        assert_eq!((a.committed(), a.resident()), (0, 0));
+        assert_eq!((b.committed(), b.resident()), (40 * MIB, 40 * MIB));
+        // The device counts the bytes once, before and after the move.
+        assert_eq!(MOVE.user_committed.load(Ordering::Relaxed), 40 * MIB);
+        assert_eq!(MOVE.user_resident.load(Ordering::Relaxed), 40 * MIB);
+        assert_eq!(MOVE.kernel_resident.load(Ordering::Relaxed), 0);
+        // Moving to the current client changes nothing; dropping uncharges the new client.
+        charge.transfer(&b)?;
+        drop(charge);
+        assert_eq!((b.committed(), b.resident()), (0, 0));
+        assert_eq!(MOVE.user_committed.load(Ordering::Relaxed), 0);
+        assert_eq!(MOVE.user_resident.load(Ordering::Relaxed), 0);
         Ok(())
     }
 

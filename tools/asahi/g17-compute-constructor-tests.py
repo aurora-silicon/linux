@@ -53,7 +53,7 @@ impl Changed{
 }
 struct Shared{preparations:Gate,state:State,changed:Changed,crashed:AtomicBool}
 impl Shared{fn drm(&self)->Result<()>{Ok(())} fn note_changed(&self){self.changed.notify_all();}}
-struct Context;impl Context{fn vm(&self)->&(){&()}}
+struct Context{m5:bool}impl Context{fn vm(&self)->&(){&()} fn is_m5(&self)->bool{self.m5}}
 struct Backend{shared:Shared,context:Context}
 struct Allocator<'a>{dev:&'a (),uat:&'a ()}
 struct ComputeShared;struct ComputeScheduler;
@@ -76,7 +76,7 @@ impl Backend{
 fn main(){
  for scheduler in [false,true]{for cancel in [false,true]{for building in [false,true]{
   NOW.store(0,Ordering::SeqCst);CANCEL.store(cancel,Ordering::SeqCst);ALLOCATE.store(!building,Ordering::SeqCst);
-  let b=Backend{context:Context,shared:Shared{preparations:Gate,changed:Changed,crashed:AtomicBool::new(false),state:State(Mutex::new(Some(Box::new(Firmware{uat:(),init:Init{shared:false,scheduler:false},queues:Queues{compute_building:building,compute_scheduler_building:building}}))))}};
+  let b=Backend{context:Context{m5:false},shared:Shared{preparations:Gate,changed:Changed,crashed:AtomicBool::new(false),state:State(Mutex::new(Some(Box::new(Firmware{uat:(),init:Init{shared:false,scheduler:false},queues:Queues{compute_building:building,compute_scheduler_building:building}}))))}};
   let check=||{if CANCEL.load(Ordering::SeqCst)&&now_ns()>=10_000_000{Err(ECANCELED)}else{Ok(())}};
   let admission=Admission::new(20_000_000,&check);
   let alloc=Allocator{dev:&(),uat:&()};
@@ -87,7 +87,13 @@ fn main(){
   assert!(!fw.init.shared&&!fw.init.scheduler,"expired constructor must not install");
   if !building{assert!(!fw.queues.compute_building&&!fw.queues.compute_scheduler_building,"failed constructor must clear builder flag");}
  }}}
- println!("PASS 8 production shared/scheduler constructor waits: expiry, cancellation, off-lock-build expiry, no installation and flag cleanup");
+ // M5 compute queues need no shared aperture: nothing waits, builds or installs.
+ NOW.store(0,Ordering::SeqCst);CANCEL.store(false,Ordering::SeqCst);ALLOCATE.store(true,Ordering::SeqCst);
+ let b=Backend{context:Context{m5:true},shared:Shared{preparations:Gate,changed:Changed,crashed:AtomicBool::new(false),state:State(Mutex::new(Some(Box::new(Firmware{uat:(),init:Init{shared:false,scheduler:false},queues:Queues{compute_building:true,compute_scheduler_building:false}}))))}};
+ let check=||Ok(());
+ assert_eq!(b.shared_compute(&Admission::new(20_000_000,&check)),Ok(()));
+ assert_eq!(now_ns(),0);assert!(!b.shared.state.lock().as_ref().unwrap().init.shared);
+ println!("PASS 8 production shared/scheduler constructor waits: expiry, cancellation, off-lock-build expiry, no installation and flag cleanup; M5 skips the G17P shared aperture");
 }
 '''
 

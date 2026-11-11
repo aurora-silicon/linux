@@ -50,6 +50,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "aic";
+		apple,always-on; /* Core device */
 	};
 
 	ps_dwi: power-controller@118 {
@@ -782,6 +783,7 @@
 		#reset-cells = <0>;
 		label = "dispext0_cpu";
 		power-domains = <&ps_dispext0_fe>;
+		apple,min-state = <4>;
 	};
 
 	ps_trace_fab: power-controller@3e8 {
@@ -808,6 +810,7 @@
 		#reset-cells = <0>;
 		label = "dispext1_cpu";
 		power-domains = <&ps_dispext1_fe>;
+		apple,min-state = <4>;
 	};
 
 	ps_dptx_phy: power-controller@408 {

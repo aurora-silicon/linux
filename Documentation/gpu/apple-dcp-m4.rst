@@ -51,8 +51,9 @@ wire messages interchangeable.
 Boot and validation
 -------------------
 
-The candidate boot admits the inherited display DARTs and explicitly loads
-``appledrm`` before the GPU. It does not use the retired qualification
+The candidate boot admits the inherited display DARTs and loads ``appledrm``
+before the GPU starts: the G16 probe defers until the display registers. It
+does not use the retired qualification
 driver's ``ready``, ``startup`` or ``kms`` sysfs triggers. The boot loader's
 older ``apple,t8132-display-diagnostics`` name remains accepted as an input
 handoff ABI; the common display driver owns the device in either case.
