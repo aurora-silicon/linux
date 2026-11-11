@@ -508,6 +508,23 @@ pub(crate) const SECRET_MAX: usize = 256;
 /// The lowest designated user the key store accepts (`DesignateUser`).
 pub(crate) const MIN_UID: u32 = crate::sks::SKS_DESIGNATE_USER_MIN as u32;
 
+/// Linux user bags are designated at `USER_BAG_BASE + uid`, never at the
+/// uid itself: the Linux identity bag (trusted keys, the machine ref-key,
+/// Touch ID's catacomb user) is designated as user 1000, which is also the
+/// first desktop user's uid. Offsetting every user bag keeps the two apart
+/// for every uid.
+pub(crate) const USER_BAG_BASE: u32 = 0x0100_0000;
+/// The largest Linux uid with a user bag.
+pub(crate) const MAX_UID: u32 = i32::MAX as u32 - USER_BAG_BASE;
+
+/// The key store's designated user for `uid`'s bag.
+pub(crate) fn bag_designation(uid: u32) -> Result<crate::sks::DesignateUser> {
+    if uid > MAX_UID {
+        return Err(EINVAL);
+    }
+    crate::sks::DesignateUser::new((USER_BAG_BASE + uid) as i32).ok_or(EINVAL)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum BagState {
     /// Since boot (or logout) no password has opened the bag.
@@ -835,7 +852,7 @@ pub(crate) fn parse_unlock(
     {
         return Err(EINVAL);
     }
-    let user = crate::sks::DesignateUser::new(req.uid as i32).ok_or(EINVAL)?;
+    let user = bag_designation(req.uid)?;
     Ok((user, &req.secret[..len]))
 }
 
@@ -874,7 +891,7 @@ pub(crate) fn parse_change(
     {
         return Err(EINVAL);
     }
-    let user = crate::sks::DesignateUser::new(req.uid as i32).ok_or(EINVAL)?;
+    let user = bag_designation(req.uid)?;
     Ok((user, &req.old_secret[..old_len], &req.new_secret[..new_len]))
 }
 
@@ -1184,7 +1201,7 @@ impl crate::SepData {
                 let mut blob = KVec::<u8>::with_capacity(core::mem::size_of::<BagBlob>(), GFP_KERNEL)?;
                 reader.read_all(&mut blob, GFP_KERNEL)?;
                 let uid = blob_uid(&blob);
-                let user = crate::sks::DesignateUser::new(i32::try_from(uid).map_err(|_| EINVAL)?).ok_or(EINVAL)?;
+                let user = bag_designation(uid)?;
                 if uid < MIN_UID {
                     return Err(EINVAL);
                 }
@@ -1204,7 +1221,7 @@ impl crate::SepData {
                 if uid < MIN_UID || len == 0 || len > BAG_BLOB_MAX {
                     return Err(EINVAL);
                 }
-                let user = crate::sks::DesignateUser::new(i32::try_from(uid).map_err(|_| EINVAL)?).ok_or(EINVAL)?;
+                let user = bag_designation(uid)?;
                 if !self.xart_writable() {
                     return Err(EROFS);
                 }
@@ -1233,7 +1250,7 @@ impl crate::SepData {
                         .reader()
                         .read()?;
                 let (uid, reason, grace_s) = parse_lock(&request)?;
-                let user = crate::sks::DesignateUser::new(uid as i32).ok_or(EINVAL)?;
+                let user = bag_designation(uid)?;
                 let screen = reason == LOCK_REASON_SCREEN;
                 self.userbag_lock(user, screen, lock_is_immediate(reason, grace_s))?;
                 crate::bio::ok()
@@ -1253,7 +1270,7 @@ impl crate::SepData {
                         .reader()
                         .read()?;
                 let user =
-                    crate::sks::DesignateUser::new(i32::try_from(reply.uid).map_err(|_| EINVAL)?)
+                    bag_designation(reply.uid).ok()
                         .ok_or(EINVAL)?;
                 let state = self.userbag_state(user)?;
                 let configuration = self.userbag_configuration(user)?;
@@ -1658,7 +1675,8 @@ mod tests {
             secret: [0x61; SECRET_MAX],
         };
         let (user, secret) = parse_unlock(&req, false).expect("valid request");
-        assert_eq!(user.special_handle().value(), -1000);
+        // uid 1000's bag is not the identity bag's designation (1000).
+        assert_eq!(user.special_handle().value(), -((USER_BAG_BASE + 1000) as i32));
         assert_eq!(secret.len(), 4);
         req.secret_len = 0;
         assert!(parse_unlock(&req, false).is_err());

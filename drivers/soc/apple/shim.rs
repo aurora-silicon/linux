@@ -228,6 +228,7 @@ extern "C" {
     fn sep_bio_unregister(dev: *mut c_void);
     fn sep_bio_wake(dev: *mut c_void);
     fn sep_bio_capable_admin() -> c_int;
+    fn sep_bio_current_euid() -> u32;
     fn sep_bio_monotonic_ns() -> u64;
     fn sep_bio_boottime_ns() -> u64;
 }
@@ -235,6 +236,11 @@ extern "C" {
 pub(crate) fn capable_admin() -> bool {
     // SAFETY: no preconditions; reads the current task's credentials.
     unsafe { sep_bio_capable_admin() != 0 }
+}
+
+pub(crate) fn current_euid() -> u32 {
+    // SAFETY: no preconditions; reads the current task's credentials.
+    unsafe { sep_bio_current_euid() }
 }
 
 pub(crate) fn monotonic_ns() -> u64 {

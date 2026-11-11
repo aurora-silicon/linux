@@ -2,6 +2,7 @@
 /* Copyright 2026 Dj */
 
 #include <linux/capability.h>
+#include <linux/cred.h>
 #include <linux/fs.h>
 #include <linux/mutex.h>
 #include <linux/ktime.h>
@@ -239,6 +240,12 @@ void sep_bio_wake(void *dev)
 int sep_bio_capable_admin(void)
 {
 	return capable(CAP_SYS_ADMIN) ? 1 : 0;
+}
+
+/* The calling task's effective uid in the initial user namespace. */
+__u32 sep_bio_current_euid(void)
+{
+	return from_kuid_munged(&init_user_ns, current_euid());
 }
 
 __u64 sep_bio_monotonic_ns(void)
