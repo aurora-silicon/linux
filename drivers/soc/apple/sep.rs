@@ -885,6 +885,8 @@ struct SepData {
     key_touch_active: Atomic<bool>,
     /// `SEP_KEY_CANCEL`: ends the touch-gated operation that is waiting.
     key_touch_cancel: Atomic<bool>,
+    /// An unconfirmed credential disposal disables private key operations.
+    key_context_failed: Atomic<bool>,
     // The enclave status of the last /dev/sep-key signature (self-test).
     last_key_status: Atomic<u32>,
 
@@ -1274,6 +1276,7 @@ impl SepData {
                 key_touch <- new_mutex!(None),
                 key_touch_active: Atomic::new(false),
                 key_touch_cancel: Atomic::new(false),
+                key_context_failed: Atomic::new(false),
                 last_key_status: Atomic::new(0),
                 bio_lockout: Atomic::new(false),
                 bio_after_boot: Atomic::new(false),
@@ -2777,13 +2780,21 @@ impl SepData {
     }
 
     pub(crate) fn close_unlock_evaluation(&self, handle: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) {
+        let _ = self.delete_unlock_evaluation(handle);
+    }
+
+    pub(crate) fn delete_unlock_evaluation(&self, handle: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) -> Result<()> {
         match self.scrd_command(&crate::scrd::scrd_context_delete(handle)) {
-            Some((0, _)) => {}
-            other => dev_warn_ratelimited!(
-                self.dev,
-                "scrd: deleting the unlock evaluation answered {:?}\n",
-                other.map(|(status, _)| status)
-            ),
+            Some((0, _)) => Ok(()),
+            other => {
+                self.key_context_failed.store(true, Relaxed);
+                dev_warn_ratelimited!(
+                    self.dev,
+                    "scrd: deleting the unlock evaluation answered {:?}; private key operations disabled until reboot\n",
+                    other.map(|(status, _)| status)
+                );
+                Err(EIO)
+            }
         }
     }
 
