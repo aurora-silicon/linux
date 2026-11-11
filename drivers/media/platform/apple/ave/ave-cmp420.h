@@ -53,7 +53,7 @@ struct ave_cmp420_geom {
 
 /* Reader counts for one plane: 32-sample blocks, then storage tiles */
 struct ave_cmp420_stats {
-	u32 raw, solid, other;
+	u32 raw, solid, coded, other;
 	u32 tiles_raw, tiles_solid, tiles_mixed, tiles_other;
 };
 

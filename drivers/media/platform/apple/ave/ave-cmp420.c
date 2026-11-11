@@ -51,6 +51,16 @@ static inline u32 ave_cmp420_spread(u32 v)
 	return v;
 }
 
+/*
+ * Metadata is not row-major: the metadata of storage tile (tx, ty) sits at
+ * slot M(tx, ty) of a square, power-of-two grid, with the tx bits on the
+ * even bit positions and the ty bits on the odd ones.
+ */
+static inline u32 ave_cmp420_meta_slot(u32 tx, u32 ty)
+{
+	return ave_cmp420_spread(tx) | ave_cmp420_spread(ty) << 1;
+}
+
 int ave_cmp420_geom(struct ave_cmp420_geom *g, u32 width, u32 height)
 {
 	u32 cols, rows;
@@ -62,8 +72,12 @@ int ave_cmp420_geom(struct ave_cmp420_geom *g, u32 width, u32 height)
 	g->height = height;
 	g->tiles_x = DIV_ROUND_UP(width, AVE_CMP420_Y_TILE);
 	g->tiles_y = DIV_ROUND_UP(height, AVE_CMP420_Y_TILE);
-	cols = ALIGN(g->tiles_x, AVE_CMP420_META_ALIGN);
-	rows = ALIGN(g->tiles_y, AVE_CMP420_META_ALIGN);
+	/* Morton slots of 8 bits per axis at most (ave_cmp420_spread()) */
+	if (g->tiles_x > 256 || g->tiles_y > 256)
+		return -EINVAL;
+	cols = roundup_pow_of_two(max3(g->tiles_x, g->tiles_y,
+				       (u32)AVE_CMP420_META_ALIGN));
+	rows = cols;
 	g->y_pitch = g->tiles_x * AVE_CMP420_Y_BODY;
 	g->y_meta = g->tiles_y * g->y_pitch;
 	g->y_meta_pitch = cols * AVE_CMP420_Y_META;
@@ -83,7 +97,8 @@ static void ave_cmp420_pack_y(const struct ave_cmp420_geom *g, u8 *surf,
 
 	for (u32 x = 0; x < AVE_CMP420_Y_TILE; x++)
 		sx[x] = ave_cmp420_spread(x) << 1;
-	memset(surf + g->y_meta, 0, g->c - g->y_meta);
+	/* Every slot raw, the padding tiles' included: the reader visits them. */
+	memset(surf + g->y_meta, AVE_CMP420_Y_RAW, g->c - g->y_meta);
 
 	for (u32 ty = 0; ty < g->tiles_y; ty++) {
 		for (u32 tx = 0; tx < g->tiles_x; tx++) {
@@ -106,9 +121,6 @@ static void ave_cmp420_pack_y(const struct ave_cmp420_geom *g, u8 *surf,
 				for (u32 x = 0; x < AVE_CMP420_Y_TILE; x++)
 					body[sy | sx[x]] = s[x];
 			}
-			memset(surf + g->y_meta + ty * g->y_meta_pitch +
-			       tx * AVE_CMP420_Y_META, AVE_CMP420_Y_RAW,
-			       AVE_CMP420_Y_META);
 		}
 	}
 }
@@ -122,7 +134,7 @@ static void ave_cmp420_pack_c(const struct ave_cmp420_geom *g, u8 *surf,
 
 	for (u32 x = 0; x < AVE_CMP420_C_TILE; x++)
 		sx[x] = ave_cmp420_spread(x) << 1;
-	memset(surf + g->c_meta, 0, g->bytes - g->c_meta);
+	memset(surf + g->c_meta, AVE_CMP420_C_RAW, g->bytes - g->c_meta);
 
 	for (u32 ty = 0; ty < g->tiles_y; ty++) {
 		for (u32 tx = 0; tx < g->tiles_x; tx++) {
@@ -150,9 +162,6 @@ static void ave_cmp420_pack_c(const struct ave_cmp420_geom *g, u8 *surf,
 					body[m + 1] = s[2 * x + 1];
 				}
 			}
-			memset(surf + g->c_meta + ty * g->c_meta_pitch +
-			       tx * AVE_CMP420_C_META, AVE_CMP420_C_RAW,
-			       AVE_CMP420_C_META);
 		}
 	}
 }
@@ -175,40 +184,139 @@ void ave_cmp420_pack(const struct ave_cmp420_geom *g, u8 *surf,
 	ave_cmp420_pack_c(g, surf, cbcr, stride);
 }
 
-/* Decode one luma compression tile into @out in Morton order */
-static unsigned int ave_cmp420_y_ctile(const u8 *body, const u8 *meta, u8 *out,
+/* LSB-first bit reader over one block payload */
+struct ave_cmp420_bits {
+	const u8 *p;
+	u32 len, pos;
+};
+
+static u32 ave_cmp420_get(struct ave_cmp420_bits *b, u32 n)
+{
+	u32 v = 0;
+
+	for (u32 i = 0; i < n; i++, b->pos++)
+		if (b->pos / 8 < b->len && (b->p[b->pos / 8] >> (b->pos % 8)) & 1)
+			v |= BIT(i);
+	return v;
+}
+
+static s32 ave_cmp420_sget(struct ave_cmp420_bits *b, u32 n)
+{
+	u32 v = ave_cmp420_get(b, n);
+
+	return n && (v & BIT(n - 1)) ? (s32)v - (s32)BIT(n) : (s32)v;
+}
+
+/*
+ * Neighbour modes (1, 5): each residual slot predicts from another slot,
+ * growing out from the origin; AVE_CMP420_FROM_BASE predicts from the base.
+ * The origin is sample 7 (the block centre) and sample 0 takes its slot.
+ */
+#define AVE_CMP420_FROM_BASE	0xff
+static const u8 ave_cmp420_nb_pred[AVE_CMP420_BLOCK] = {
+	[1] = 4, [2] = 3, [3] = 6, [4] = AVE_CMP420_FROM_BASE,
+	[5] = AVE_CMP420_FROM_BASE, [6] = AVE_CMP420_FROM_BASE, [7] = 1,
+	[8] = 9, [9] = 12, [10] = 11, [11] = 12, [12] = AVE_CMP420_FROM_BASE,
+	[13] = AVE_CMP420_FROM_BASE, [14] = 12, [15] = 13,
+	[16] = AVE_CMP420_FROM_BASE, [17] = 16, [18] = AVE_CMP420_FROM_BASE,
+	[19] = 18, [20] = 17, [21] = 20, [22] = 19, [23] = 22,
+	[24] = AVE_CMP420_FROM_BASE, [25] = 24, [26] = 24, [27] = 24,
+	[28] = 25, [29] = 28, [30] = 27, [31] = 30,
+};
+
+/* Slots of the neighbour modes in an order where every predictor comes first */
+static const u8 ave_cmp420_nb_order[AVE_CMP420_BLOCK - 1] = {
+	4, 5, 6, 12, 13, 16, 18, 24,
+	1, 3, 9, 11, 14, 15, 17, 19, 25, 26, 27,
+	7, 2, 8, 10, 20, 22, 28, 30,
+	21, 23, 29, 31,
+};
+
+/*
+ * Decode one coded luma block (modes 0, 1, 4, 5) into 32 samples in Morton
+ * order. Payload: has_bias:1, width-1:3, base:8, [four 2-bit width
+ * reductions, modes 4/5], [signed bias:width], then 31 signed residuals,
+ * slot k at width - reduction[k / 8]; the bias applies to full-width
+ * regions only. Returns false for a mode this reader does not know.
+ */
+static bool ave_cmp420_y_coded(const u8 *p, u32 len, u8 mode, u8 *o)
+{
+	struct ave_cmp420_bits b = { .p = p, .len = len };
+	u32 w, red[4] = { 0 };
+	s32 bias = 0, eff[AVE_CMP420_BLOCK] = { 0 };
+	bool has_bias;
+	u8 base, v[AVE_CMP420_BLOCK];
+
+	if (mode != 0 && mode != 1 && mode != 4 && mode != 5)
+		return false;
+	has_bias = ave_cmp420_get(&b, 1);
+	w = ave_cmp420_get(&b, 3) + 1;
+	base = ave_cmp420_get(&b, 8);
+	if (mode >= 4)
+		for (u32 r = 0; r < 4; r++)
+			red[r] = ave_cmp420_get(&b, 2);
+	if (has_bias)
+		bias = ave_cmp420_sget(&b, w);
+	for (u32 k = 1; k < AVE_CMP420_BLOCK; k++) {
+		u32 g = k / 8, n = w > red[g] ? w - red[g] : 0;
+
+		eff[k] = ave_cmp420_sget(&b, n) - (red[g] ? 0 : bias);
+	}
+	if (mode == 0 || mode == 4) {
+		o[0] = base;
+		for (u32 k = 1; k < AVE_CMP420_BLOCK; k++)
+			o[k] = base + eff[k];
+		return true;
+	}
+	v[0] = base;
+	for (u32 i = 0; i < ARRAY_SIZE(ave_cmp420_nb_order); i++) {
+		u8 k = ave_cmp420_nb_order[i], from = ave_cmp420_nb_pred[k];
+
+		v[k] = (from == AVE_CMP420_FROM_BASE ? base : v[from]) + eff[k];
+	}
+	for (u32 k = 0; k < AVE_CMP420_BLOCK; k++)
+		o[k == 0 ? 7 : k == 7 ? 0 : k] = v[k];
+	return true;
+}
+
+/*
+ * Decode the four luma compression tiles of one storage tile into @out
+ * (1024 samples, Morton order). The 32 block payloads are packed from the
+ * start of the body in metadata order.
+ */
+static unsigned int ave_cmp420_y_stile(const u8 *body, const u8 *meta, u8 *out,
 				       struct ave_cmp420_stats *st)
 {
-	const u32 size = AVE_CMP420_CTILE * AVE_CMP420_CTILE;
 	unsigned int seen = 0;
-	bool sync = true;
 	u32 off = 0;
 
-	for (u32 i = 0; i < 8; i++) {
-		u8 m = meta[i];
-		u8 *o = out + i * AVE_CMP420_BLOCK;
+	for (u32 i = 0; i < 32; i++) {
+		u8 m = meta[i], *o = out + i * AVE_CMP420_BLOCK;
+		u32 n = (m & 0x1f) + 1;
 
-		if (sync && m == AVE_CMP420_Y_RAW && off + AVE_CMP420_BLOCK <= size) {
+		if (off + n > AVE_CMP420_Y_BODY) {
+			memset(o, AVE_CMP420_Y_MARK, AVE_CMP420_BLOCK);
+			st->other++;
+			seen |= SEEN_OTHER;
+			continue;
+		}
+		if (m == AVE_CMP420_Y_RAW) {
 			memcpy(o, body + off, AVE_CMP420_BLOCK);
-			off += AVE_CMP420_BLOCK;
 			st->raw++;
 			seen |= SEEN_RAW;
-			continue;
-		}
-		if (sync && m == AVE_CMP420_Y_SOLID && off < size) {
+		} else if (m == AVE_CMP420_Y_SOLID) {
 			memset(o, body[off], AVE_CMP420_BLOCK);
-			off += 1;
 			st->solid++;
 			seen |= SEEN_SOLID;
-			continue;
+		} else if (ave_cmp420_y_coded(body + off, n, m >> 5, o)) {
+			st->coded++;
+			seen |= SEEN_RAW;
+		} else {
+			memset(o, AVE_CMP420_Y_MARK, AVE_CMP420_BLOCK);
+			st->other++;
+			seen |= SEEN_OTHER;
 		}
-		memset(o, AVE_CMP420_Y_MARK, AVE_CMP420_BLOCK);
-		st->other++;
-		seen |= SEEN_OTHER;
-		if (sync && m && (m >> 5) != 7)
-			off += (m & 0x1f) + 1;
-		else
-			sync = false;
+		off += n;
 	}
 	return seen;
 }
@@ -243,14 +351,27 @@ static unsigned int ave_cmp420_c_ctile(const u8 *body, const u8 *meta, u8 *out,
 			seen |= SEEN_SOLID;
 			continue;
 		}
-		for (u32 j = 0; j < AVE_CMP420_BLOCK; j++) {
-			o[2 * j] = AVE_CMP420_CB_MARK;
-			o[2 * j + 1] = AVE_CMP420_CR_MARK;
+		{
+			u32 n = (m & 0x3f) + 1;
+			struct ave_cmp420_bits b = { .p = body + off,
+						     .len = off + n <= size ? n : 0 };
+			u8 cb, cr;
+
+			/* Coded RG8 block: only its two bases are known (bits 14, 22). */
+			b.pos = 14;
+			cb = ave_cmp420_get(&b, 8);
+			cr = ave_cmp420_get(&b, 8);
+			for (u32 j = 0; j < AVE_CMP420_BLOCK; j++) {
+				o[2 * j] = sync && b.len ? cb : AVE_CMP420_CB_MARK;
+				o[2 * j + 1] = sync && b.len ? cr : AVE_CMP420_CR_MARK;
+			}
+			st->other++;
+			seen |= SEEN_OTHER;
+			if (b.len)
+				off += n;
+			else
+				sync = false;
 		}
-		st->other++;
-		seen |= SEEN_OTHER;
-		/* The CbCr mode sizes are not known: lose the place. */
-		sync = false;
 	}
 	return seen;
 }
@@ -270,39 +391,28 @@ static void ave_cmp420_count_tile(struct ave_cmp420_stats *st, unsigned int seen
 static void ave_cmp420_unpack_y(const struct ave_cmp420_geom *g, const u8 *surf,
 				u8 *dst, u32 stride, struct ave_cmp420_stats *st)
 {
-	u32 sx[AVE_CMP420_CTILE];
-	u8 tmp[AVE_CMP420_CTILE * AVE_CMP420_CTILE];
+	u32 sx[AVE_CMP420_Y_TILE];
+	u8 tmp[AVE_CMP420_Y_TILE * AVE_CMP420_Y_TILE];
 
-	for (u32 x = 0; x < AVE_CMP420_CTILE; x++)
+	for (u32 x = 0; x < AVE_CMP420_Y_TILE; x++)
 		sx[x] = ave_cmp420_spread(x) << 1;
 
 	for (u32 ty = 0; ty < g->tiles_y; ty++) {
 		for (u32 tx = 0; tx < g->tiles_x; tx++) {
 			const u8 *body = surf + ty * g->y_pitch + tx * AVE_CMP420_Y_BODY;
-			const u8 *meta = surf + g->y_meta + ty * g->y_meta_pitch +
-					 tx * AVE_CMP420_Y_META;
-			unsigned int seen = 0;
+			const u8 *meta = surf + g->y_meta +
+					 ave_cmp420_meta_slot(tx, ty) * AVE_CMP420_Y_META;
+			u32 x0 = tx * AVE_CMP420_Y_TILE, y0 = ty * AVE_CMP420_Y_TILE;
+			u32 n = min_t(u32, AVE_CMP420_Y_TILE, g->width - x0);
 
-			for (u32 q = 0; q < 4; q++) {
-				u32 x0 = tx * AVE_CMP420_Y_TILE + (q >> 1) * AVE_CMP420_CTILE;
-				u32 y0 = ty * AVE_CMP420_Y_TILE + (q & 1) * AVE_CMP420_CTILE;
-				u32 n;
+			ave_cmp420_count_tile(st, ave_cmp420_y_stile(body, meta, tmp, st));
+			for (u32 yy = 0; yy < AVE_CMP420_Y_TILE && y0 + yy < g->height; yy++) {
+				u8 *d = dst + (size_t)(y0 + yy) * stride + x0;
+				u32 sy = ave_cmp420_spread(yy);
 
-				seen |= ave_cmp420_y_ctile(body + q * (AVE_CMP420_Y_BODY / 4),
-							   meta + q * 8, tmp, st);
-				if (x0 >= g->width)
-					continue;
-				n = min_t(u32, AVE_CMP420_CTILE, g->width - x0);
-				for (u32 yy = 0; yy < AVE_CMP420_CTILE &&
-				     y0 + yy < g->height; yy++) {
-					u8 *d = dst + (size_t)(y0 + yy) * stride + x0;
-					u32 sy = ave_cmp420_spread(yy);
-
-					for (u32 x = 0; x < n; x++)
-						d[x] = tmp[sy | sx[x]];
-				}
+				for (u32 x = 0; x < n; x++)
+					d[x] = tmp[sy | sx[x]];
 			}
-			ave_cmp420_count_tile(st, seen);
 		}
 	}
 }
@@ -321,8 +431,8 @@ static void ave_cmp420_unpack_c(const struct ave_cmp420_geom *g, const u8 *surf,
 		for (u32 tx = 0; tx < g->tiles_x; tx++) {
 			const u8 *body = surf + g->c + ty * g->c_pitch +
 					 tx * AVE_CMP420_C_BODY;
-			const u8 *meta = surf + g->c_meta + ty * g->c_meta_pitch +
-					 tx * AVE_CMP420_C_META;
+			const u8 *meta = surf + g->c_meta +
+					 ave_cmp420_meta_slot(tx, ty) * AVE_CMP420_C_META;
 			u32 x0 = tx * AVE_CMP420_C_TILE, y0 = ty * AVE_CMP420_C_TILE;
 			u32 n = min_t(u32, AVE_CMP420_C_TILE, cw - x0);
 
@@ -375,15 +485,15 @@ void ave_cmp420_meta_hist(const struct ave_cmp420_geom *g, const u8 *surf,
 			  bool chroma, u16 hist[256])
 {
 	u32 per = chroma ? AVE_CMP420_C_META : AVE_CMP420_Y_META;
-	u32 pitch = chroma ? g->c_meta_pitch : g->y_meta_pitch;
 	const u8 *meta = surf + (chroma ? g->c_meta : g->y_meta);
 
 	memset(hist, 0, 256 * sizeof(*hist));
-	for (u32 ty = 0; ty < g->tiles_y; ty++) {
-		const u8 *p = meta + ty * pitch;
+	for (u32 ty = 0; ty < g->tiles_y; ty++)
+		for (u32 tx = 0; tx < g->tiles_x; tx++) {
+			const u8 *p = meta + ave_cmp420_meta_slot(tx, ty) * per;
 
-		for (u32 i = 0; i < g->tiles_x * per; i++)
-			if (hist[p[i]] != U16_MAX)
-				hist[p[i]]++;
-	}
+			for (u32 i = 0; i < per; i++)
+				if (hist[p[i]] != U16_MAX)
+					hist[p[i]]++;
+		}
 }
