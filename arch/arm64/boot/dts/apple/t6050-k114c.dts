@@ -22,3 +22,122 @@
 
 #define T6050_K114C
 #include "t6050-peripherals.dtsi"
+
+/*
+ * Audio: the amplifiers and the jack codec on I2C; the I2S side is the
+ * AOP's.
+ *
+ * K114c: the ADT (K114c, 2026-11-10) lists the same six sn012776 amps at
+ * 0x38-0x3d on i2c1/i2c3, the cs42l84 at 0x4b on i2c2 and the same GPIOs
+ * (amp shutdown 107, amp irq 106, codec reset 139, codec irq 134), so the
+ * J714c nodes apply as they are.
+ *
+ * ADT /arm-io/i2c1: audio-speaker 0x38 (the primary amp, holds
+ * speaker-config), audio-speaker-left-woofer-2 0x39, audio-speaker-left-
+ * tweeter 0x3a. /arm-io/i2c3: audio-speaker-right-woofer-1 0x3b,
+ * audio-speaker-right-woofer-2 0x3c, audio-speaker-right-tweeter 0x3d. All
+ * six are sn012776. /arm-io/i2c2: audio-codec-output 0x4b, cs42l84, the
+ * headphone jack.
+ *
+ * Lines, all on gpio0 (pinctrl_ap): amps share shutdown GPIO 107
+ * (function-reset GPIO(0x6b)) and interrupt 106; codec reset GPIO 139
+ * (function-reset GPIO(0x8b)), interrupt 134. Speaker-id GPIOs 136/137 are
+ * unused. Polarities follow the in-tree J516 and the J716s reference:
+ * active-high shutdown and reset, level-low interrupts; the ADT flag words
+ * (0x10001 amps, 0x1 codec) are not decoded.
+ *
+ * Sense slots: speaker-config row n is the amp the ADT names speakerN
+ * (audio-speaker, then speaker1..speaker5 = LW1 RW1 LW2 RW2 LT RT); amp n
+ * carries I in slot 4n and V in slot 4n+2, the tas2764/J516 convention
+ * (the ADT labels the two the other way round).
+ *
+ * There is no sound card yet: the AOP audio driver is not on this branch.
+ * The amps leave hardware shutdown only from the ASoC component probe, so
+ * the shared shutdown line stays low until a card binds.
+ */
+&i2c1 {
+	status = "okay";
+
+	speaker_left_woof1: codec@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		shutdown-gpios = <&pinctrl_ap 107 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 1";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <0>;
+		ti,vmon-slot-no = <2>;
+	};
+
+	speaker_left_woof2: codec@39 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x39>;
+		shutdown-gpios = <&pinctrl_ap 107 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 2";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <8>;
+		ti,vmon-slot-no = <10>;
+	};
+
+	speaker_left_tweet: codec@3a {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3a>;
+		shutdown-gpios = <&pinctrl_ap 107 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Tweeter";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <16>;
+		ti,vmon-slot-no = <18>;
+	};
+};
+
+&i2c2 {
+	status = "okay";
+
+	jack_codec: codec@4b {
+		compatible = "cirrus,cs42l84";
+		reg = <0x4b>;
+		reset-gpios = <&pinctrl_ap 139 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		interrupts-extended = <&pinctrl_ap 134 IRQ_TYPE_LEVEL_LOW>;
+		sound-name-prefix = "Jack";
+	};
+};
+
+&i2c3 {
+	status = "okay";
+
+	speaker_right_woof1: codec@3b {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3b>;
+		shutdown-gpios = <&pinctrl_ap 107 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 1";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <4>;
+		ti,vmon-slot-no = <6>;
+	};
+
+	speaker_right_woof2: codec@3c {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3c>;
+		shutdown-gpios = <&pinctrl_ap 107 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 2";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <12>;
+		ti,vmon-slot-no = <14>;
+	};
+
+	speaker_right_tweet: codec@3d {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3d>;
+		shutdown-gpios = <&pinctrl_ap 107 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Tweeter";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <20>;
+		ti,vmon-slot-no = <22>;
+	};
+};
