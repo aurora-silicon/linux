@@ -167,6 +167,10 @@ struct sio_hw_data {
 	 * uses its DMA here, and its service parameters haven't been traced.
 	 */
 	bool firmware_only;
+	/* Without the boot tables for DMA, still run the firmware so a sleep can stop it. */
+	bool firmware_without_tables;
+	/* macOS idles this firmware in the sleep's last step: leave it running until then. */
+	bool stop_at_commit;
 	/* DMA arrays owned by the driver, if not protocol 9's */
 	const struct sio_dma_arrays *arrays;
 	int (*check_boot_tables)(struct device *dev);
@@ -182,6 +186,9 @@ struct sio_data {
 	struct apple_rtkit *rtk;
 	/* The firmware is stopped for a system sleep. */
 	bool asleep;
+	bool firmware_only;
+	bool commit_registered;
+	bool commit_used;
 	u32 protocol;
 	void *shmem;
 	dma_addr_t shmem_iova;
@@ -547,7 +554,9 @@ static int sio_t6041_check_boot_tables(struct device *dev)
 	u32 size[ARRAY_SIZE(sio_t6041_params)] = {};
 
 	if (sio_t6041_check_node(dev->of_node, addr, size)) {
-		dev_err(dev, "boot tables are not T6041 SIO tables; leaving the SIO stopped\n");
+		/* T8140 still runs its firmware, and says so once it does. */
+		if (!of_device_is_compatible(dev->of_node, "apple,t8140-sio"))
+			dev_err(dev, "boot tables are not T6041 SIO tables; leaving the SIO stopped\n");
 		return -ENODEV;
 	}
 	return 0;
@@ -652,6 +661,8 @@ static const struct sio_hw_data sio_hw_t6041 = {
  * (ADT dp-audioN dma-channels): [2, 0, 0x800, 0x800, 0x800, 0].
  */
 static const struct sio_hw_data sio_hw_t8140 = {
+	.firmware_without_tables = true,
+	.stop_at_commit = true,
 	.protocol = 10,
 	.fifo_threshold = 0x800,
 	.cfg_word4 = 0x800,
@@ -1925,6 +1936,19 @@ badprop:
 	return dev_err_probe(sio->dev, err, "failed to read '%s'\n", propname);
 }
 
+/* Interrupts off, one CPU: the idle pair and the closed mailbox. The caller clears the run bit. */
+static int sio_commit_stop(void *data)
+{
+	struct sio_data *sio = data;
+	unsigned int us;
+	int ret;
+
+	ret = apple_rtkit_sleep_idle_polled(sio->rtk, sio->base + REG_CPU_CONTROL, &us);
+	apple_rtkit_mailbox_recv_off(sio->rtk);
+
+	return ret ? 1 : 0;
+}
+
 static int sio_probe(struct platform_device *pdev)
 {
 	struct device_node *np = pdev->dev.of_node;
@@ -1932,6 +1956,7 @@ static int sio_probe(struct platform_device *pdev)
 	const struct sio_hw_data *hw;
 	struct sio_data *sio;
 	struct dma_device *dma;
+	bool firmware_only;
 	int nchannels;
 	int err, i;
 
@@ -1940,10 +1965,13 @@ static int sio_probe(struct platform_device *pdev)
 		return -ENODEV;
 	hw = match->data;
 	/* Refuse incompatible firmware tables before DMA or hardware setup. */
+	firmware_only = hw->firmware_only;
 	if (hw->check_boot_tables) {
 		err = hw->check_boot_tables(&pdev->dev);
-		if (err)
+		if (err && !hw->firmware_without_tables)
 			return err;
+		if (err)
+			firmware_only = true;
 	}
 
 	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(42));
@@ -1963,6 +1991,7 @@ static int sio_probe(struct platform_device *pdev)
 	sio->dev = &pdev->dev;
 	sio->nchannels = nchannels;
 	sio->hw = hw;
+	sio->firmware_only = firmware_only;
 
 	sio->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(sio->base))
@@ -2023,7 +2052,7 @@ static int sio_probe(struct platform_device *pdev)
 	if (err)
 		return dev_err_probe(&pdev->dev, err, "SIO did not boot\n");
 
-	if (hw->firmware_only) {
+	if (sio->firmware_only) {
 		dev_info(&pdev->dev, "firmware running, no DMA service\n");
 		goto rpm_put;
 	}
@@ -2062,6 +2091,9 @@ static int sio_probe(struct platform_device *pdev)
 	}
 
 rpm_put:
+	if (!err && hw->stop_at_commit)
+		sio->commit_registered = !apple_sleep_coproc_register(&pdev->dev, sio->base, false,
+								      sio_commit_stop, sio);
 	pm_runtime_put(&pdev->dev);
 
 	return err;
@@ -2071,7 +2103,9 @@ static void sio_remove(struct platform_device *pdev)
 {
 	struct sio_data *sio = platform_get_drvdata(pdev);
 
-	if (sio->hw->firmware_only)
+	if (sio->commit_registered)
+		apple_sleep_coproc_unregister(&pdev->dev);
+	if (sio->firmware_only)
 		return;
 
 	of_dma_controller_free(pdev->dev.of_node);
@@ -2119,6 +2153,19 @@ static __maybe_unused int sio_suspend_late(struct device *dev)
 		}
 	}
 
+	if (sio->commit_registered && apple_sleep_commit_stops_coprocs()) {
+		apple_sleep_coproc_set_ready(dev, true);
+		sio->commit_used = true;
+		sio->asleep = true;
+		return 0;
+	}
+
+	/* Idled any earlier, a refusal after it would leave it stopped. */
+	if (sio->hw->stop_at_commit && apple_sleep_commit_stops_coprocs()) {
+		dev_err(dev, "no stop at the sleep's commit: refusing the sleep\n");
+		return -EBUSY;
+	}
+
 	ret = apple_rtkit_sleep_stop(sio->rtk, sio->base + REG_CPU_CONTROL);
 	if (ret) {
 		dev_err(dev, "firmware did not stop for sleep: %d\n", ret);
@@ -2138,6 +2185,17 @@ static __maybe_unused int sio_resume_early(struct device *dev)
 
 	if (!sio->asleep)
 		return 0;
+	/* Left for the commit: if the sleep was refused before it, the firmware never idled. */
+	if (sio->commit_used) {
+		bool stopped = apple_sleep_coproc_stopped(dev);
+
+		sio->commit_used = false;
+		apple_sleep_coproc_set_ready(dev, false);
+		if (!pm_resume_via_firmware() && !stopped) {
+			sio->asleep = false;
+			return 0;
+		}
+	}
 	/*
 	 * A refused sleep: an idled firmware doesn't wake with its power kept, and SIO_CPU shares
 	 * SIO's switch, so it can't be power-cycled alone. The sleep engine's own PMGR reset of it
