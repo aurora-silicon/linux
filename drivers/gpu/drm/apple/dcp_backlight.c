@@ -408,6 +408,34 @@ void dcp_backlight_finish_fade(struct apple_dcp *dcp)
 		dcp_backlight_kick(dcp);
 }
 
+/*
+ * After the S2R display restart: ask for the user's level again and send it, whatever the
+ * backlight core's flags say at that moment. The class device resumes on its own schedule:
+ * when it runs after the restart the panel stays dark until then (suspended and core_blank
+ * still set at the mode set, 11 Nov), and when it runs before, its request goes to a firmware
+ * that isn't up yet and nothing sends it again (the dark lid wakes).
+ */
+void dcp_backlight_s2r_restore(struct apple_dcp *dcp)
+{
+	struct backlight_device *bd = READ_ONCE(dcp->brightness.bl_dev);
+	unsigned long flags;
+
+	if (!dcp_backlight_desktop(dcp) || !bd)
+		return;
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	/*
+	 * A level sent to the firmware that the stop then took down never gets its answer: the
+	 * state stayed in_flight for good and nothing was sent again (dark lid wake of 20:30,
+	 * "sent 0 ... dirty 1 in_flight 1"). The restarted firmware knows nothing of it.
+	 */
+	dcp->backlight.state.in_flight = false;
+	dcp->backlight.state.retries = 0;
+	dcp_bl_request(&dcp->backlight.state, bd->props.brightness, false, false);
+	dcp->backlight.state.dirty = true;
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	dcp_backlight_kick(dcp);
+}
+
 int dcp_backlight_dpms(struct apple_dcp *dcp, bool on)
 {
 	unsigned long flags;

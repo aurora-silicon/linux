@@ -44,6 +44,7 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	IOMFB_METHOD("A469", iomfbep_abort_swaps_dcp),
 	IOMFB_METHOD("A473", dcpep_set_power_state),
 	IOMFB_METHOD("A474", dcpep_pipe_query_474),
+	IOMFB_METHOD("A500", dcpep_unnamed_500),
 	/* A364 get_mode_info and A420/A421 gamma: see iomfb_template.c */
 };
 
@@ -234,9 +235,11 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[576] = trampoline_nop,
 	[581] = trampoline_nop,
 	[582] = trampoline_true, /* create_default_fb_surface */
+	[583] = trampoline_nop, /* clear_default_surface */
 	[588] = trampoline_nop, /* resize_default_fb_surface_gated */
 	[590] = trampoline_swap_complete,
 	[592] = trampoline_swap_complete_intent_gated,
+	[597] = trampoline_zero, /* sleep test: (0, 4), purpose unknown */
 	[593] = trampoline_abort_swap_ap_gated,
 	/* a four-byte padded notification; only its first byte is read */
 	[594] = trampoline_enable_backlight_message_ap_gated,
@@ -323,9 +326,11 @@ static const struct dcp_cb_min_v26_6_desktop cb_min[IOMFB_MAX_CB] = {
 	[576] = CB_MIN(0, 0),
 	[581] = CB_MIN(0, 0),
 	[582] = CB_MIN(0, sizeof(u8)),
+	[583] = CB_MIN(0, 0),
 	[588] = CB_MIN(0, 0),
 	[590] = CB_MIN(sizeof(struct DCP_FW_NAME(dc_swap_complete_resp)), 0),
 	[592] = CB_MIN(sizeof(dcp_swap_intent_t), 0),
+	[597] = CB_MIN(0, sizeof(u32)),
 	[593] = CB_MIN(sizeof(u32), 0),
 	[594] = CB_MIN(sizeof(u8), 0),
 	[595] = CB_MIN(0, 0),
