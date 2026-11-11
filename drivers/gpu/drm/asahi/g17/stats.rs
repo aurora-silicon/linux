@@ -26,6 +26,18 @@ impl Reader {
         view
     }
 
+    /// The frequency of the state the GPU runs at, while the firmware reports one, and the
+    /// highest frequency of the board's states, in Hz; `None` without the board's performance
+    /// states.
+    pub(crate) fn frequency(&self) -> Option<(Option<u64>, u64)> {
+        let max = u64::from(self.1?.iter().map(|state| state.0).max()?) * 1_000_000;
+        let view = self.read();
+        let current = (view.pstate_status == super::telemetry::VALID
+            && view.achieved_frequency_hz != 0)
+            .then_some(view.achieved_frequency_hz);
+        Some((current, max))
+    }
+
     fn read_firmware(&self) -> Readout {
         let m5 = self.0.variant.m5_commands;
         let mut state = self.0.state.lock();

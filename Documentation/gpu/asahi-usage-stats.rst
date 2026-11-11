@@ -51,11 +51,25 @@ successful stages that retired before a later failure remain counted. An
 unexecuted G17 replay contributes only when it eventually retires successfully.
 There is no submit-to-completion wall-time fallback in the current backends.
 
-``drm-cycles-*`` and ``drm-maxfreq-*`` are intentionally absent. The timestamp
-clock is independent of the variable GPU execution clock. Treating command timer
-ticks as GPU busy cycles, or multiplying time by a sampled/maximum GPU frequency,
-would give incorrect frequency-weighted utilization. Per-client execution-cycle
-counters would require a separate hardware measurement source.
+``drm-cycles-*`` is intentionally absent. The timestamp clock is independent of
+the variable GPU execution clock. Treating command timer ticks as GPU busy
+cycles, or multiplying time by a sampled/maximum GPU frequency, would give
+incorrect frequency-weighted utilization. Per-client execution-cycle counters
+would require a separate hardware measurement source.
+
+On the M5 each engine also has the frequency keys::
+
+    drm-curfreq-compute: 1620000000 Hz
+    drm-maxfreq-compute: 1620000000 Hz
+
+``drm-curfreq-<engine>`` is ``achieved_frequency_hz`` of ``agx_stats`` (see
+below): the frequency of the performance state the firmware reports. It is
+absent while the firmware reports none, as when the GPU is gated.
+``drm-maxfreq-<engine>`` is the highest frequency in the board's table. One clock
+drives the three engines, so both values are the device's, the same for every
+engine and every client. They show the clock at the time of the read and are
+not a weight for the engine times: without ``drm-cycles-*`` there is nothing to
+scale. Other GPUs print neither key.
 
 Accounting cost
 ---------------
@@ -66,7 +80,9 @@ per valid stage, with no new locks or allocations. The native backends reuse
 existing timestamp reads. Classic completion callbacks read two internal cells
 per stage; commands without application timestamps also execute two existing
 timestamp microsequence operations per stage. Reading fdinfo loads three counters
-and does not traverse queues, wait for fences or access hardware.
+and does not traverse queues, wait for fences or access hardware. On the M5 a
+read also takes the device mutex once and drains the statistics rings, as a read
+of ``agx_stats`` does, for the frequency keys.
 
 G16S and G17P device utilisation
 ------------------------------
