@@ -242,6 +242,9 @@ config USB_DWC3_APPLE_KUNIT_TEST
 	  Test the helper with which the Apple Silicon DWC3 glue chooses
 	  the USB2 PHY mode it selects before the core leaves reset:
 	  device mode, never host mode, and nothing for other states.
+	  Also test its decisions for a deep sleep with the host kept in
+	  place: which ports may, and what the host's resume does for
+	  each thing the PHY can say of the sleep.
 	  The tests need no Apple hardware or platform support. They are
 	  built under USB_DWC3, so UML without DMA emulation cannot run
 	  them.
