@@ -867,24 +867,6 @@
 	       <&admac_ec_proxy 1>;
 	dma-names = "cout", "cin", "spkr", "sense", "hpai";
 };
-
-#if 1
-/*
- * OPTIONAL stop-gap, only while booting an aura without kboot_audio.c (the booted
- * aura-m5pro-v4.bin, aura main 58d65df, does not copy apple,speaker-config): the rows of the
- * K116s ADT speaker-config, byte for byte (rx_slot, amp_gain, vsense_slot, isense_slot),
- * group order LW1, RW1, LW2, RW2, LT, RT. macaudio takes byte 1 & 0x1f = 15 as the level.
- * Prefer the aura patch: this hard-codes one Mac's ADT into a shared tree. Remove once aura
- * fills the property (aura's copy overwrites it anyway).
- */
-&speaker_left_woof1  { apple,speaker-config = /bits/ 8 <0x00 0x0f 0x00 0x02>; };
-&speaker_right_woof1 { apple,speaker-config = /bits/ 8 <0x01 0x0f 0x04 0x06>; };
-&speaker_left_woof2  { apple,speaker-config = /bits/ 8 <0x02 0x0f 0x08 0x0a>; };
-&speaker_right_woof2 { apple,speaker-config = /bits/ 8 <0x03 0x0f 0x0c 0x0e>; };
-&speaker_left_tweet  { apple,speaker-config = /bits/ 8 <0x04 0x0f 0x10 0x12>; };
-&speaker_right_tweet { apple,speaker-config = /bits/ 8 <0x05 0x0f 0x14 0x16>; };
-#endif
-
 /* The GPU, handed over by the boot loader */
 #include "t6050-k116s-gpu.dtsi"
 
