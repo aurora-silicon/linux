@@ -3209,9 +3209,10 @@
 		status = "disabled";
 	};
 
+	/* Each engine's register block is the first 16 KiB of its ADT window. */
 	jpeg0: jpeg@2281000000 {
 		compatible = "apple,t6050-jpeg", "apple,jpeg";
-		reg = <0x22 0x81000000 0x0 0x20000>;
+		reg = <0x22 0x81000000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 1355 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&jpeg0_dart 0>;
 		power-domains = <&ps_jpg>;
@@ -3221,7 +3222,7 @@
 
 	jpeg1: jpeg@2281060000 {
 		compatible = "apple,t6050-jpeg", "apple,jpeg";
-		reg = <0x22 0x81060000 0x0 0x44000>;
+		reg = <0x22 0x81060000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 1358 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&jpeg0_dart 1>;
 		power-domains = <&ps_jpg>;
@@ -3236,6 +3237,7 @@
 		interrupts = <AIC_IRQ 0 1356 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_jpg>;
 		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
 		status = "disabled";
 	};
 
