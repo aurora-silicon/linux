@@ -53,6 +53,7 @@
 #include "../pci.h"
 #include "pci-host-common.h"
 #include "pcie-apple-t8140-bootstrap.h"
+#include "pcie-apple-pref-window.h"
 
 static ATOMIC_NOTIFIER_HEAD(apple_pcie_tunnel_notifiers);
 
@@ -3976,7 +3977,8 @@ static int apple_pcie_config_write(struct pci_bus *bus, unsigned int devfn,
 	if (pcie->hw->mps_timers && where == PCIEC_RP_DEVCTL)
 		apple_pcie_update_mps_timers(pcie,
 					     FIELD_GET(PCI_EXP_DEVCTL_PAYLOAD, val));
-	if (!(pcie->kernel_init || pcie->tunnel_cold_init))
+	if (!apple_pcie_mirror_pref_window(pcie->kernel_init, pcie->tunnel_cold_init,
+					   pcie->hw->tunnel_intr2axi))
 		return ret;
 	/* Root-port prefetchable window. The port block has to be told too. */
 	if (where < 0x24 || where >= 0x30)

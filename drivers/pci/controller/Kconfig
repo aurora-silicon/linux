@@ -51,6 +51,17 @@ config PCIE_APPLE_T8140_BOOTSTRAP
 	  issuing another request. Hibernation, deeper sleep and kexec remain
 	  blocked after activation, as do removal and arbitrary downstream use.
 
+config PCIE_APPLE_PREF_WINDOW_KUNIT_TEST
+	tristate "Apple PCIe pref-window mirror tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Test the prefetchable-window mirror decision of
+	  apple_pcie_config_write() without accessing hardware: the mirror
+	  must follow kernel_init, tunnel_cold_init and the Intr2AXI
+	  (USB4 PCIe-C) tunnel ports, whose stale port-block window latch
+	  made BAR0 MMIO read all-ones on retained-power boots.
+
 config PCIE_APPLE_T8140_BOOTSTRAP_KUNIT_TEST
 	tristate "Apple T8140 PCIe bootstrap tests" if !KUNIT_ALL_TESTS
 	depends on KUNIT
