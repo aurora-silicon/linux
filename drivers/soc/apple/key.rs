@@ -224,6 +224,27 @@ pub(crate) const SELFTEST_UNSEAL_UNSATISFIED: u32 = 22;
 /// returned the secret; `result2` is 0 when a key whose list names none of
 /// them still unseals (then the list does not govern the decrypt at all).
 pub(crate) const SELFTEST_UNSEAL_ACL_PROBE: u32 = 23;
+/// Research probe, no finger, ignores the handle: which list entry and
+/// which context the enclave wants for a decrypt. Five throwaway keys (no
+/// list; the list with `oecd` free; with none of the decrypt entries free;
+/// with `ock` free; macOS's plain list, `ock`/`odel`/`osgn`/`oa`/`okd` free),
+/// each tried with `UNSEAL_CONTEXT_PROBE_ROWS`. Bit `8 * key + row` of
+/// `result` (keys 0-3) or bit `row` of `result2` (key 4) is set when that
+/// operation succeeded (a key exchange counts only when it returned the
+/// expected shared secret). The kernel log has every enclave status.
+pub(crate) const SELFTEST_UNSEAL_CONTEXT_PROBE: u32 = 24;
+
+/// Rows of `SELFTEST_UNSEAL_CONTEXT_PROBE`: (name, operation, context).
+/// Context 0 none, 1 a fresh unsatisfied one, 2 the key bag's secret.
+pub(crate) const UNSEAL_CONTEXT_PROBE_ROWS: [(&str, &[u8], u8); 7] = [
+    ("sign, no context", b"osgn".as_slice(), 0),
+    ("sign, unsatisfied context", b"osgn", 1),
+    ("decrypt, no context", b"oecd", 0),
+    ("decrypt, unsatisfied context", b"oecd", 1),
+    ("decrypt, key-bag-secret context", b"oecd", 2),
+    ("key exchange, no context", b"ock", 0),
+    ("key exchange, unsatisfied context", b"ock", 1),
+];
 
 static_assert!(core::mem::size_of::<Info>() == 16);
 static_assert!(core::mem::size_of::<Create>() == 2124);
@@ -1033,6 +1054,108 @@ impl SepData {
         Ok(())
     }
 
+    /// One `SELFTEST_UNSEAL_CONTEXT_PROBE` key: the bits of the rows that
+    /// succeeded on it.
+    fn key_unseal_context_probe_key(&self, name: &str, free: Option<&[&[u8]]>, secret: &[u8]) -> Result<i32> {
+        use crate::der::RefKeyValue as RV;
+        let ed = match free {
+            None => None,
+            Some(ops) => {
+                let mut items: KVec<(&[u8], RV<'_>)> = KVec::new();
+                for op in ops {
+                    items.push((op, RV::Bool(true)), GFP_KERNEL)?;
+                }
+                let acl = crate::der::encode_refkey_set(&items)?;
+                Some(crate::der::encode_refkey_set(&[(b"acl".as_slice(), RV::Der(&acl))])?)
+            }
+        };
+        let (blob, point) = self.user_key_create(ed.as_deref())?;
+        let sealed = seal_to(&blob, secret)?;
+        let digest = [0x5au8; DIGEST_LEN];
+        let user = crate::sbio::UserId::new(crate::SBIO_PROBE_USER_ID).ok_or(EINVAL)?;
+        let mut bits = 0i32;
+        for (row, (what, op, ctx_kind)) in UNSEAL_CONTEXT_PROBE_ROWS.iter().enumerate() {
+            let ctx = match ctx_kind {
+                0 => None,
+                1 => Some(self.open_unlock_evaluation(user).ok_or(EIO)?),
+                _ => Some(self.passcode_context()?),
+            };
+            let (eph, z) = crate::refkey_seal::ecdh_probe_pair(&point)?;
+            let d: &[u8] = match *op {
+                b"osgn" => &digest,
+                b"oecd" => &sealed,
+                _ => &eph,
+            };
+            let r = self.user_key_raw_op(&blob, op, d, ctx.as_ref());
+            if let Some(c) = ctx.as_ref() {
+                self.close_unlock_evaluation(c);
+            }
+            let (status, out) = match r {
+                Ok(v) => v,
+                Err(e) => (i32::MIN, {
+                    dev_info!(self.dev, "sep-key: self-test decrypt probe: {}: {}: no reply ({:?})\n", name, what, e);
+                    KVec::new()
+                }),
+            };
+            let ok = status == 0
+                && match *op {
+                    b"oecd" => out[..] == secret[..],
+                    b"ock" => out.windows(32).any(|w| w == z),
+                    _ => !out.is_empty(),
+                };
+            let at = if *op == b"ock" { out.windows(32).position(|w| w == z) } else { None };
+            dev_info!(
+                self.dev,
+                "sep-key: self-test decrypt probe: {}: {}: {} (enclave status {}, {} reply bytes, shared secret at {:?})\n",
+                name,
+                what,
+                (if ok { "OK" } else { "refused" }),
+                status,
+                out.len(),
+                at
+            );
+            if ok {
+                bits |= 1 << row;
+            }
+        }
+        Ok(bits)
+    }
+
+    fn key_unseal_context_probe(&self, req: &mut Selftest) -> Result<()> {
+        let secret = req.digest;
+        const OECD_FREE: &[&[u8]] = &[b"oa", b"odel", b"osgn", b"oecd"];
+        const NO_DECRYPT: &[&[u8]] = &[b"oa", b"odel", b"osgn"];
+        const OCK_FREE: &[&[u8]] = &[b"oa", b"odel", b"osgn", b"ock"];
+        const MACOS_PLAIN: &[&[u8]] = &[b"oa", b"ock", b"odel", b"okd", b"osgn"];
+        let keys: [(&str, Option<&[&[u8]]>); 5] = [
+            ("no list", None),
+            ("oecd free", Some(OECD_FREE)),
+            ("no decrypt entry", Some(NO_DECRYPT)),
+            ("ock free", Some(OCK_FREE)),
+            ("macOS plain", Some(MACOS_PLAIN)),
+        ];
+        let (mut lo, mut hi) = (0i32, 0i32);
+        for (i, (name, free)) in keys.iter().enumerate() {
+            let bits = match self.key_unseal_context_probe_key(name, *free, &secret) {
+                Ok(b) => b,
+                Err(e) => {
+                    dev_info!(self.dev, "sep-key: self-test decrypt probe: {}: key failed ({:?})\n", name, e);
+                    0
+                }
+            };
+            if i < 4 {
+                lo |= bits << (8 * i);
+            } else {
+                hi = bits;
+            }
+        }
+        req.result = lo;
+        req.enclave_status = 0;
+        req.result2 = hi;
+        req.enclave_status2 = 0;
+        Ok(())
+    }
+
     fn key_selftest(&self, req: &mut Selftest) -> Result<()> {
         if crate::module_parameters::key_selftest.value() == 0 {
             return Err(EPERM);
@@ -1043,6 +1166,9 @@ impl SepData {
         }
         if req.mode == SELFTEST_UNSEAL_ACL_PROBE {
             return self.key_unseal_acl_probe(req);
+        }
+        if req.mode == SELFTEST_UNSEAL_CONTEXT_PROBE {
+            return self.key_unseal_context_probe(req);
         }
         let (blob, flags) = decode_handle(&req.handle, req.handle_len)?;
         if flags & HANDLE_BIOMETRY == 0 {

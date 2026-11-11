@@ -217,6 +217,20 @@ pub(crate) fn ecies_encrypt_parts(
     })
 }
 
+/// A fresh sender ephemeral for `recipient_pub` (uncompressed point) and the
+/// ECDH shared X it makes with that key: what an enclave key exchange
+/// (`ock`) with the returned point must give back. Self-test only.
+pub(crate) fn ecdh_probe_pair(recipient_pub: &[u8]) -> Result<([u8; POINT_LEN], [u8; 32])> {
+    if recipient_pub.len() != POINT_LEN || recipient_pub[0] != 0x04 {
+        return Err(EINVAL);
+    }
+    let (coords, shared) = p256_sender(&recipient_pub[1..])?;
+    let mut point = [0u8; POINT_LEN];
+    point[0] = 0x04;
+    point[1..].copy_from_slice(&coords);
+    Ok((point, shared))
+}
+
 /// Returns the enclave-ready blob: `ephemeral_point ‖ ciphertext ‖ tag`.
 pub(crate) fn ecies_seal(recipient_pub: &[u8], secret: &[u8]) -> Result<KVec<u8>> {
     let parts = ecies_encrypt_parts(

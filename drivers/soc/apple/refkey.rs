@@ -500,6 +500,42 @@ impl SepData {
         self.with_identity_bag(|handle, _secret| self.sks_refkey_decrypt(handle, blob, sealed, acm))
     }
 
+    /// Self-test only: one ref-key operation `op` with data `d` on the key in
+    /// `blob`, with an optional credential context. Returns the enclave's
+    /// status and, when it is 0, the record the reply carries.
+    pub(crate) fn user_key_raw_op(
+        &self,
+        blob: &[u8],
+        op: &[u8],
+        d: &[u8],
+        acm: Option<&[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>,
+    ) -> Result<(i32, KVec<u8>)> {
+        use crate::der::RefKeyValue as RV;
+        Self::refkey_pub(blob).ok_or(EINVAL)?;
+        self.with_identity_bag(|handle, _secret| {
+            let mut items: KVec<(&[u8], RV<'_>)> = KVec::new();
+            if let Some(acm) = acm {
+                items.push((b"acmh", RV::Octets(acm)), GFP_KERNEL)?;
+            }
+            items.push((b"d", RV::Octets(d)), GFP_KERNEL)?;
+            items.push((b"o", RV::Utf8(op)), GFP_KERNEL)?;
+            items.push((b"rk", RV::Der(blob)), GFP_KERNEL)?;
+            let der = crate::der::encode_refkey_set(&items)?;
+            let out = self.sks_send(self.sks_req_refkey(handle.value(), &der)).ok_or(EIO)?;
+            let status = i32::from(out.reply.status);
+            let mut owned: KVec<u8> = KVec::new();
+            if status == 0 {
+                if let Some(body) = self.sks_report_response(crate::sks::SKS_PERFORM_OP_NAME, &out) {
+                    let mut f = proto::FieldCursor::new(body);
+                    if let (Some(0), Some(rec)) = (f.i32(), f.blob()) {
+                        owned.extend_from_slice(rec, GFP_KERNEL)?;
+                    }
+                }
+            }
+            Ok((status, owned))
+        })
+    }
+
     /// Op `oecd` with an optional credential context (`acmh`); the enclave's
     /// status is kept in `last_key_status` like a signature's.
     fn sks_refkey_decrypt(
