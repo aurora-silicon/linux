@@ -475,4 +475,52 @@ struct sep_keybag_blob {
 #define SEP_BIO_KEYBAG_EXPORT _IOWR(SEP_BIO_IOC_MAGIC, 0x35, struct sep_keybag_blob)
 #define SEP_BIO_KEYBAG_IMPORT _IOW(SEP_BIO_IOC_MAGIC, 0x36, struct sep_keybag_blob)
 
+/*
+ * DESIGN DRAFT, not a stable ABI: sealing a disk-encryption secret (a LUKS2
+ * key-slot secret) to a user's key bag, as FileVault ties the volume key to
+ * the user's password. Root only, on the re-arm node.
+ *
+ * FDE_CREATE makes a P-256 sealing key inside the enclave under the
+ * designated, unlocked bag of 'uid' and returns its record. The record holds
+ * no secret and works only with this Mac's enclave. FDE_SEAL encrypts
+ * 'secret' to that key and has the enclave open the result once before
+ * returning 'sealed'. FDE_UNSEAL returns the secret; the enclave opens it
+ * only while the bag of 'uid' is unlocked (SEP_BIO_KEYBAG_UNLOCK with the
+ * user's password, which the enclave checks and counts).
+ *
+ * The secret is bound to the OS install that sealed it (the apple_sep
+ * os_uuid_hi/lo identity, else /chosen/apfs-preboot-uuid): the identity is
+ * sealed with the secret and FDE_UNSEAL returns the secret only under the
+ * same identity, as FileVault binds a volume key to its volume.
+ *
+ * Errors: EINVAL for a malformed request, EKEYREJECTED when the enclave
+ * refuses (bag locked, a record or blob from another Mac or another bag),
+ * EXDEV on FDE_UNSEAL of a secret sealed under another OS install, ENOKEY
+ * when the kernel has no OS identity (FDE_SEAL and FDE_UNSEAL),
+ * EOPNOTSUPP on a key store without user bags.
+ */
+#define SEP_FDE_RECORD_MAX 2048
+#define SEP_FDE_SECRET_MAX 64
+#define SEP_FDE_SEALED_MAX 256
+
+struct sep_fde_key {
+	__u32 uid;                         /* in */
+	__u32 record_len;                  /* out */
+	__u8  record[SEP_FDE_RECORD_MAX];  /* out */
+};
+
+struct sep_fde_seal {
+	__u32 uid;                         /* in */
+	__u32 record_len;                  /* in */
+	__u32 secret_len;                  /* SEAL: in; UNSEAL: out (in 0) */
+	__u32 sealed_len;                  /* SEAL: out (in 0); UNSEAL: in */
+	__u8  secret[SEP_FDE_SECRET_MAX];
+	__u8  sealed[SEP_FDE_SEALED_MAX];
+	__u8  record[SEP_FDE_RECORD_MAX];  /* in */
+};
+
+#define SEP_BIO_FDE_CREATE _IOWR(SEP_BIO_IOC_MAGIC, 0x37, struct sep_fde_key)
+#define SEP_BIO_FDE_SEAL   _IOWR(SEP_BIO_IOC_MAGIC, 0x38, struct sep_fde_seal)
+#define SEP_BIO_FDE_UNSEAL _IOWR(SEP_BIO_IOC_MAGIC, 0x39, struct sep_fde_seal)
+
 #endif /* _UAPI_LINUX_APPLE_SEP_H */

@@ -23,6 +23,7 @@
 #![allow(dead_code)]
 
 use kernel::prelude::*;
+use kernel::transmute::FromBytes;
 use kernel::uaccess::{UserPtr, UserSlice};
 
 const CLIENT: u64 = crate::sks::SKS_CLIENT_ID;
@@ -815,10 +816,133 @@ fn blob_len(blob: &[u8]) -> usize {
     u32::from_ne_bytes([blob[4], blob[5], blob[6], blob[7]]) as usize
 }
 
+/// The largest sealing-key record `SEP_BIO_FDE_*` carry.
+pub(crate) const FDE_RECORD_MAX: usize = 2048;
+/// The largest volume secret the enclave seals (a LUKS2 key-slot secret).
+pub(crate) const FDE_SECRET_MAX: usize = 64;
+/// `ephemeral point (65) || ciphertext || tag (16)` for the largest secret.
+pub(crate) const FDE_SEALED_MAX: usize = 256;
+
+/// Magic and version at the front of every sealed FDE plaintext.
+const FDE_BINDING_MAGIC: [u8; 8] = *b"AURFDEO1";
+/// Magic followed by the 16-byte OS install identity, then the secret.
+const FDE_BINDING_LEN: usize = FDE_BINDING_MAGIC.len() + 16;
+
+/// Frames a volume secret with the OS install identity it is sealed under.
+/// The frame sits inside the ECIES envelope, so the enclave's AEAD covers it.
+pub(crate) fn fde_bind(os: &[u8; 16], secret: &[u8]) -> Result<KVec<u8>> {
+    if secret.is_empty() || secret.len() > FDE_SECRET_MAX {
+        return Err(EINVAL);
+    }
+    let mut v = KVec::with_capacity(FDE_BINDING_LEN + secret.len(), GFP_KERNEL)?;
+    v.extend_from_slice(&FDE_BINDING_MAGIC, GFP_KERNEL)?;
+    v.extend_from_slice(os, GFP_KERNEL)?;
+    v.extend_from_slice(secret, GFP_KERNEL)?;
+    Ok(v)
+}
+
+/// The secret inside a frame made by [`fde_bind`], if it was bound to `os`:
+/// `EXDEV` for a secret sealed under another OS install, `EKEYREJECTED` for a
+/// plaintext without the frame (not sealed by this driver).
+pub(crate) fn fde_unbind<'a>(os: &[u8; 16], framed: &'a [u8]) -> Result<&'a [u8]> {
+    if framed.len() <= FDE_BINDING_LEN
+        || framed.len() > FDE_BINDING_LEN + FDE_SECRET_MAX
+        || framed[..FDE_BINDING_MAGIC.len()] != FDE_BINDING_MAGIC
+    {
+        return Err(EKEYREJECTED);
+    }
+    if framed[FDE_BINDING_MAGIC.len()..FDE_BINDING_LEN] != os[..] {
+        return Err(EXDEV);
+    }
+    Ok(&framed[FDE_BINDING_LEN..])
+}
+
+/// The UAPI `struct sep_fde_key`: a sealing key made under `uid`'s bag.
+#[repr(C)]
+pub(crate) struct FdeKey {
+    pub(crate) uid: u32,
+    pub(crate) record_len: u32,
+    pub(crate) record: [u8; FDE_RECORD_MAX],
+}
+
+/// The UAPI `struct sep_fde_seal`, for both SEAL and UNSEAL.
+#[repr(C)]
+pub(crate) struct FdeSeal {
+    pub(crate) uid: u32,
+    pub(crate) record_len: u32,
+    pub(crate) secret_len: u32,
+    pub(crate) sealed_len: u32,
+    pub(crate) secret: [u8; FDE_SECRET_MAX],
+    pub(crate) sealed: [u8; FDE_SEALED_MAX],
+    pub(crate) record: [u8; FDE_RECORD_MAX],
+}
+
+impl Drop for FdeSeal {
+    fn drop(&mut self) {
+        crate::image::wipe(&mut self.secret);
+    }
+}
+
+static_assert!(core::mem::size_of::<FdeKey>() == 8 + FDE_RECORD_MAX);
+static_assert!(
+    core::mem::size_of::<FdeSeal>() == 16 + FDE_SECRET_MAX + FDE_SEALED_MAX + FDE_RECORD_MAX
+);
+// SAFETY: C layout, no padding, every bit pattern valid.
+unsafe impl kernel::transmute::FromBytes for FdeKey {}
+// SAFETY: as above.
+unsafe impl kernel::transmute::AsBytes for FdeKey {}
+// SAFETY: as above.
+unsafe impl kernel::transmute::FromBytes for FdeSeal {}
+// SAFETY: as above.
+unsafe impl kernel::transmute::AsBytes for FdeSeal {}
+
+pub(crate) const IOC_FDE_CREATE: u32 = kernel::ioctl::_IOWR::<FdeKey>(IOC_MAGIC, 0x37);
+pub(crate) const IOC_FDE_SEAL: u32 = kernel::ioctl::_IOWR::<FdeSeal>(IOC_MAGIC, 0x38);
+pub(crate) const IOC_FDE_UNSEAL: u32 = kernel::ioctl::_IOWR::<FdeSeal>(IOC_MAGIC, 0x39);
+
+/// Checks a SEAL/UNSEAL request: the user, the record, and on SEAL the
+/// secret, on UNSEAL the sealed blob.
+pub(crate) fn parse_fde(req: &FdeSeal, seal: bool) -> Result<crate::sks::DesignateUser> {
+    let record_len = req.record_len as usize;
+    let secret_len = req.secret_len as usize;
+    let sealed_len = req.sealed_len as usize;
+    if req.uid < MIN_UID || req.uid > i32::MAX as u32 || record_len == 0 || record_len > FDE_RECORD_MAX {
+        return Err(EINVAL);
+    }
+    if seal && (secret_len == 0 || secret_len > FDE_SECRET_MAX || sealed_len != 0) {
+        return Err(EINVAL);
+    }
+    if !seal && (sealed_len == 0 || sealed_len > FDE_SEALED_MAX || secret_len != 0) {
+        return Err(EINVAL);
+    }
+    crate::sks::DesignateUser::new(req.uid as i32).ok_or(EINVAL)
+}
+
 pub(crate) fn is_ioctl(cmd: u32) -> bool {
     matches!(
         cmd,
-        IOC_STATE | IOC_UNLOCK | IOC_LOCK | IOC_CHANGE | IOC_CREATE | IOC_EXPORT | IOC_IMPORT
+        IOC_STATE
+            | IOC_UNLOCK
+            | IOC_LOCK
+            | IOC_CHANGE
+            | IOC_CREATE
+            | IOC_EXPORT
+            | IOC_IMPORT
+            | IOC_FDE_CREATE
+            | IOC_FDE_SEAL
+            | IOC_FDE_UNSEAL
+    )
+}
+
+/// The requests a password unlock in the initrd needs: load the bag saved in
+/// the volume's token, unlock it with the typed password, open the sealed
+/// key-slot secret, lock the bag again, and read its state. Enrolment and
+/// password changes (create, change, export, new or re-sealed keys) wait for
+/// the real root, where the host state and Touch ID are attached.
+pub(crate) fn is_initrd_ioctl(cmd: u32) -> bool {
+    matches!(
+        cmd,
+        IOC_STATE | IOC_IMPORT | IOC_UNLOCK | IOC_LOCK | IOC_FDE_UNSEAL
     )
 }
 
@@ -1211,6 +1335,71 @@ impl crate::SepData {
                 self.userbag_import(user, &blob[8..8 + len])?;
                 crate::bio::ok()
             }
+            IOC_FDE_CREATE => {
+                // 2 KiB: keep the request off the kernel stack.
+                let (reader, mut writer) =
+                    UserSlice::new(user_ptr, core::mem::size_of::<FdeKey>()).reader_writer();
+                let mut buf = KVec::<u8>::with_capacity(core::mem::size_of::<FdeKey>(), GFP_KERNEL)?;
+                reader.read_all(&mut buf, GFP_KERNEL)?;
+                let key = FdeKey::from_bytes_mut(&mut buf).ok_or(EINVAL)?;
+                if key.uid < MIN_UID || key.uid > i32::MAX as u32 {
+                    return Err(EINVAL);
+                }
+                let user = crate::sks::DesignateUser::new(key.uid as i32).ok_or(EINVAL)?;
+                let record = self.fde_key_create(user)?;
+                if record.len() > FDE_RECORD_MAX {
+                    return Err(E2BIG);
+                }
+                key.record.fill(0);
+                key.record[..record.len()].copy_from_slice(&record);
+                key.record_len = record.len() as u32;
+                writer.write_slice(&buf)?;
+                crate::bio::ok()
+            }
+            IOC_FDE_SEAL | IOC_FDE_UNSEAL => {
+                let seal = cmd == IOC_FDE_SEAL;
+                // 2.4 KiB: keep the request off the kernel stack. It carries the
+                // volume secret, so the buffer is wiped when it is dropped.
+                let (reader, mut writer) =
+                    UserSlice::new(user_ptr, core::mem::size_of::<FdeSeal>()).reader_writer();
+                let mut buf = crate::Secret(KVec::<u8>::with_capacity(
+                    core::mem::size_of::<FdeSeal>(),
+                    GFP_KERNEL,
+                )?);
+                reader.read_all(&mut buf.0, GFP_KERNEL)?;
+                let req = FdeSeal::from_bytes_mut(&mut buf.0).ok_or(EINVAL)?;
+                let user = parse_fde(req, seal)?;
+                let record_len = req.record_len as usize;
+                if seal {
+                    let sealed = self.fde_seal(
+                        user,
+                        &req.record[..record_len],
+                        &req.secret[..req.secret_len as usize],
+                    )?;
+                    if sealed.len() > FDE_SEALED_MAX {
+                        return Err(E2BIG);
+                    }
+                    req.sealed.fill(0);
+                    req.sealed[..sealed.len()].copy_from_slice(&sealed);
+                    req.sealed_len = sealed.len() as u32;
+                    crate::image::wipe(&mut req.secret);
+                    req.secret_len = 0;
+                } else {
+                    let secret = crate::Secret(self.fde_unseal(
+                        user,
+                        &req.record[..record_len],
+                        &req.sealed[..req.sealed_len as usize],
+                    )?);
+                    if secret.len() > FDE_SECRET_MAX {
+                        return Err(E2BIG);
+                    }
+                    req.secret.fill(0);
+                    req.secret[..secret.len()].copy_from_slice(&secret);
+                    req.secret_len = secret.len() as u32;
+                }
+                writer.write_slice(&buf)?;
+                crate::bio::ok()
+            }
             IOC_CREATE | IOC_UNLOCK => {
                 let request: UnlockRequest =
                     UserSlice::new(user_ptr, core::mem::size_of::<UnlockRequest>())
@@ -1294,6 +1483,17 @@ mod tests {
         let mut p = Policy::at_boot();
         p.password_unlocked(t);
         p
+    }
+
+    #[test]
+    fn initrd_allows_only_the_password_unlock() {
+        for cmd in [IOC_STATE, IOC_IMPORT, IOC_UNLOCK, IOC_LOCK, IOC_FDE_UNSEAL] {
+            assert!(is_initrd_ioctl(cmd));
+            assert!(is_ioctl(cmd));
+        }
+        for cmd in [IOC_CREATE, IOC_CHANGE, IOC_EXPORT, IOC_FDE_CREATE, IOC_FDE_SEAL] {
+            assert!(!is_initrd_ioctl(cmd));
+        }
     }
 
     const USER_HANDLE: i32 = -501;
@@ -1716,5 +1916,67 @@ mod tests {
         assert_eq!(r.biometry, 0);
         assert_eq!(r.since_password_s, 5);
         assert_eq!(r.enclave_lock_state, 0);
+    }
+
+    fn fde_request(uid: u32, record_len: u32, secret_len: u32, sealed_len: u32) -> FdeSeal {
+        FdeSeal {
+            uid,
+            record_len,
+            secret_len,
+            sealed_len,
+            secret: [0; FDE_SECRET_MAX],
+            sealed: [0; FDE_SEALED_MAX],
+            record: [0; FDE_RECORD_MAX],
+        }
+    }
+
+    #[test]
+    fn fde_secret_is_bound_to_its_os_install() {
+        let a = [0x11u8; 16];
+        let b = [0x22u8; 16];
+        let secret = [0x5au8; 32];
+        let framed = fde_bind(&a, &secret).expect("bind");
+        assert_eq!(framed.len(), FDE_BINDING_LEN + secret.len());
+        assert_eq!(fde_unbind(&a, &framed).expect("same install"), &secret[..]);
+        assert_eq!(fde_unbind(&b, &framed), Err(EXDEV));
+        // A plaintext without the frame (an older draft's blob) is refused.
+        assert_eq!(fde_unbind(&a, &secret), Err(EKEYREJECTED));
+        let mut bad = [0u8; FDE_BINDING_LEN + 32];
+        bad.copy_from_slice(&framed);
+        bad[0] ^= 1;
+        assert_eq!(fde_unbind(&a, &bad), Err(EKEYREJECTED));
+        assert_eq!(fde_unbind(&a, &framed[..FDE_BINDING_LEN]), Err(EKEYREJECTED));
+        assert!(fde_bind(&a, &[]).is_err());
+        assert!(fde_bind(&a, &[0u8; FDE_SECRET_MAX + 1]).is_err());
+        assert!(fde_bind(&a, &[0u8; FDE_SECRET_MAX]).is_ok());
+    }
+
+    #[test]
+    fn fde_parse_bounds() {
+        let ok = MIN_UID + 1;
+        assert!(parse_fde(&fde_request(ok, 600, 32, 0), true).is_ok());
+        assert!(parse_fde(&fde_request(ok, 600, 0, 113), false).is_ok());
+        // SEAL needs a secret and no sealed blob, UNSEAL the reverse.
+        assert!(parse_fde(&fde_request(ok, 600, 0, 0), true).is_err());
+        assert!(parse_fde(&fde_request(ok, 600, 32, 113), true).is_err());
+        assert!(parse_fde(&fde_request(ok, 600, 32, 113), false).is_err());
+        assert!(parse_fde(&fde_request(ok, 600, 0, 0), false).is_err());
+        // Lengths past the arrays and system uids are refused.
+        assert!(parse_fde(&fde_request(ok, 600, FDE_SECRET_MAX as u32 + 1, 0), true).is_err());
+        assert!(parse_fde(&fde_request(ok, 600, 0, FDE_SEALED_MAX as u32 + 1), false).is_err());
+        assert!(parse_fde(&fde_request(ok, 0, 32, 0), true).is_err());
+        assert!(parse_fde(&fde_request(ok, FDE_RECORD_MAX as u32 + 1, 32, 0), true).is_err());
+        assert!(parse_fde(&fde_request(MIN_UID - 1, 600, 32, 0), true).is_err());
+        assert!(parse_fde(&fde_request(u32::MAX, 600, 32, 0), true).is_err());
+    }
+
+    #[test]
+    fn fde_ioctls_are_userbag_ioctls() {
+        assert!(is_ioctl(IOC_FDE_CREATE));
+        assert!(is_ioctl(IOC_FDE_SEAL));
+        assert!(is_ioctl(IOC_FDE_UNSEAL));
+        assert_ne!(IOC_FDE_SEAL, IOC_FDE_UNSEAL);
+        // The largest sealed secret fits: point || ciphertext || tag.
+        assert!(65 + FDE_SECRET_MAX + 16 <= FDE_SEALED_MAX);
     }
 }

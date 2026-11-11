@@ -270,4 +270,14 @@ unsigned char *sep_tk_blob_ptr(struct trusted_key_payload *p);
 unsigned int sep_tk_blob_len(const struct trusted_key_payload *p);
 void sep_tk_set_blob_len(struct trusted_key_payload *p, unsigned int n);
 
+
+/* Initrd attach and completion; sysfs removal drains the callback. */
+bool sep_keystore_only(void);
+bool sep_keystore_user_bags(void);
+int sep_complete_attach_register(struct device *dev, void *ctx,
+                                int (*complete)(void *ctx));
+void sep_complete_attach_unregister(struct device *dev);
+void sep_diag_keystore_ended(void);
+void sep_diag_set_xart(bool writable);
+
 #endif /* SEP_SHIM_H */
