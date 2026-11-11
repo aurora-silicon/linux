@@ -565,3 +565,26 @@
 	       <&admac_ec_proxy 1>;
 	dma-names = "cout", "cin", "spkr", "sense", "hpai";
 };
+
+/* The video decoder (J714sAP ADT avd0, as on the J714c), its DART and power states. */
+&pmgr4 {
+	status = "okay";
+};
+
+/* macOS turns FAB1_SOC on once at boot and never gates it. */
+&ps_fab1_soc {
+	apple,always-on;
+	status = "okay";
+};
+
+&ps_avd_sys {
+	status = "okay";
+};
+
+&avd_dart {
+	status = "okay";
+};
+
+&avd {
+	status = "okay";
+};
