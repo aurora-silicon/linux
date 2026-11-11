@@ -22,3 +22,6 @@
 
 #define T6050_K114C
 #include "t6050-peripherals.dtsi"
+
+/* The Neural Engine, started only after the boot loader's preload hand-off */
+#include "t6050-j714s-ane.dtsi"
