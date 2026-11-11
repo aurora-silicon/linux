@@ -152,6 +152,13 @@
 	apple,platform-id = <0x72>;
 };
 
+&aop_audio {
+	/* The microphone card's name: AppleJ815HPAI. */
+	apple,chassis-name = "J815";
+	/* ADT iop-audio-controller/audio-speaker: 6 slots, 12 sense words. */
+	apple,speaker-amps = <6>;
+};
+
 /*
  * Ambient light sensor, the AOP's "als" service: an ST VD6286, as on the
  * M4 Pro, not T8140's CT817. aop_als sends it the per-device calibration
@@ -162,6 +169,61 @@
 &aop {
 	aop_als: als {
 		compatible = "apple,t8142-aop-als", "apple,aop-als";
+	};
+};
+
+/* Names as in speakersafetyd's j815.conf; slots from ADT speaker-config. */
+&speaker_left_woofer {
+	sound-name-prefix = "Left Woofer 1";
+};
+
+&speaker_right_woofer {
+	sound-name-prefix = "Right Woofer 1";
+};
+
+&i2c3 {
+	speaker_left_woofer_2: codec@3a {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3a>;
+		shutdown-gpios = <&pinctrl_ap 151 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 2";
+		ti,imon-slot-no = <18>;
+		ti,vmon-slot-no = <16>;
+		ti,bclk-ratio = <250>;
+	};
+
+	speaker_right_woofer_2: codec@3d {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3d>;
+		shutdown-gpios = <&pinctrl_ap 151 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 2";
+		ti,imon-slot-no = <22>;
+		ti,vmon-slot-no = <20>;
+		ti,bclk-ratio = <250>;
+	};
+};
+
+/ {
+	sound {
+		compatible = "apple,j815-macaudio", "apple,macaudio";
+		model = "MacBook Air J815";
+
+		dai-link@1 {
+			/*
+			 * ADT speaker-config order: macaudio gives codec k playback
+			 * slot k (left in 0, 2, 4; right in 1, 3, 5) as macOS does.
+			 * The TX idle masks are J813's: J815's amp-tx-zd-config has
+			 * the same words (left amps drive slots 0-3, 8-11, 16-19 on
+			 * line 0, right amps 4-7, 12-15, 20-23 on line 1).
+			 */
+			codec {
+				sound-dai = <&speaker_left_woofer>, <&speaker_right_woofer>,
+					    <&speaker_left_tweeter>, <&speaker_right_tweeter>,
+					    <&speaker_left_woofer_2>, <&speaker_right_woofer_2>;
+			};
+		};
 	};
 };
 
@@ -355,18 +417,4 @@
 
 &pinctrl_nub {
 	gpio-reserved-ranges = <0 18>, <19 17>, <37 3>;
-};
-
-/*
- * J815 has six speaker amplifiers, not J813's four. Keep J813's sound card
- * and the AOP audio service off until the J815 speaker layout is described.
- */
-&aop_audio {
-	status = "disabled";
-};
-
-/ {
-	sound {
-		status = "disabled";
-	};
 };
