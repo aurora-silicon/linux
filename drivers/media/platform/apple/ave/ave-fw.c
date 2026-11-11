@@ -448,6 +448,14 @@ static int ave_fw_prepare_restart(struct ave_dev *ave)
 			return -EAGAIN; /* A runtime PM suspend/resume must intervene. */
 		if (readl(ave->coproc + ave->variant->regs->ctrl))
 			return -EBUSY;
+		/*
+		 * The firmware confirmed its Halt through scratch0, the core
+		 * read back stopped, and runtime PM cycled the VENC power
+		 * before the state left HALTED: the sessions it saw can give
+		 * their memory back now. Without this every 6070 session's
+		 * buffers stayed quarantined until the module was removed.
+		 */
+		ave_sess_reap(ave);
 		status = readl(ave->mbox + AVE_MBOX_STATUS);
 		if (status)
 			writel(status, ave->mbox + AVE_MBOX_STATUS);
