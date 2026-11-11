@@ -8904,7 +8904,8 @@ int apple_dart_display_keep(struct device *dev, u32 streams, bool save);
  * words = before the power words go back to boot state; stop = between steps 1 and 2;
  * down = after step 2.
  */
-static unsigned int s2r_settle_ms = 1000, s2r_words_ms = 500, s2r_stop_ms = 2000, s2r_down_ms = 1000;
+/* Defaults as run on 11 Nov (lit on every wake once the backlight and DART fixes were in). */
+static unsigned int s2r_settle_ms = 200, s2r_words_ms = 100, s2r_stop_ms = 300, s2r_down_ms = 100;
 module_param(s2r_settle_ms, uint, 0644);
 module_param(s2r_words_ms, uint, 0644);
 module_param(s2r_stop_ms, uint, 0644);
