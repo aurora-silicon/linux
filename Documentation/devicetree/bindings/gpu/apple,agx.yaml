@@ -81,10 +81,11 @@ properties:
       - description:
           Shared global variables, preserved firmware data or text segment of
           the loaded GPU firmware
+      - description: Additional firmware crash-log data on T8142
 
   memory-region-names:
     minItems: 3
-    maxItems: 6
+    maxItems: 7
 
   apple,clpc:
     $ref: /schemas/types.yaml#/definitions/phandle
@@ -509,6 +510,7 @@ allOf:
             - description: Shared L2 page tables
             - description: GFX firmware data
             - description: GFX1 firmware data
+            - description: Combined firmware data and shared read-only crash logs
         memory-region-names:
           items:
             - const: ttbs
@@ -517,6 +519,7 @@ allOf:
             - const: shared-l2
             - const: gfx-data
             - const: gfx1-data
+            - const: fw-data
       required:
         - reg-names
         - mboxes
@@ -526,6 +529,8 @@ allOf:
         - operating-points-v2
     else:
       properties:
+        memory-region:
+          maxItems: 6
         memory-region-names:
           minItems: 3
           items:
