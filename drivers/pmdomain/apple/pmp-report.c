@@ -642,6 +642,50 @@ int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int t
 }
 EXPORT_SYMBOL_GPL(apple_pmp_report_wait_supplier_ready);
 
+/**
+ * apple_pmp_report_wait_running() - wait until the PMP behind a report runs
+ * @report_np: report region node
+ * @timeout_ms: how long to wait
+ *
+ * While its firmware starts, the PMP takes over the power management of the
+ * SoC's coprocessors, and a coprocessor CPU released before then can be
+ * stopped by it. A driver that releases such a CPU at boot waits here first.
+ *
+ * Context: process context; sleeps.
+ * Return: 0 once the PMP runs, -ENODEV for a report that is not available,
+ * -EPROBE_DEFER while the report is not bound, -ETIMEDOUT otherwise.
+ */
+int apple_pmp_report_wait_running(struct device_node *report_np, unsigned int timeout_ms)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(timeout_ms);
+	struct platform_device *pdev;
+	int ret;
+
+	if (!report_np || !of_device_is_available(report_np))
+		return -ENODEV;
+	pdev = of_find_device_by_node(report_np);
+	if (!pdev)
+		return -EPROBE_DEFER;
+	for (;;) {
+		struct apple_pmp_report *rep;
+
+		ret = -EPROBE_DEFER;
+		/* Never wait behind the report's removal. */
+		if (device_trylock(&pdev->dev)) {
+			rep = device_is_bound(&pdev->dev) ? platform_get_drvdata(pdev) : NULL;
+			if (rep)
+				ret = apple_pmp_report_running(rep) ? 0 : -ETIMEDOUT;
+			device_unlock(&pdev->dev);
+		}
+		if (!ret || time_after(jiffies, deadline))
+			break;
+		usleep_range(10000, 20000);
+	}
+	put_device(&pdev->dev);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_wait_running);
+
 /*
  * Starting a halted PMP (T8122, T6031, opted-in T6030)
  *

@@ -338,8 +338,10 @@ impl Firmware {
         for &role in self.roles() {
             self.rings.drain_trace(dev, &self.init, role);
         }
+        // Each drain is bracketed by power observations; consecutive roles share the one
+        // between them (each reads the GPU's power register).
+        self.observe_statistics_power();
         for &role in self.roles() {
-            self.observe_statistics_power();
             self.rings.drain_statistics(&self.primary.state.shared.dev, &self.init, role);
             self.observe_statistics_power();
         }

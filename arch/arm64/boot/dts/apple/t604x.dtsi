@@ -1227,6 +1227,11 @@
 			dmas = <&admac0 1>, <&admac1 0>, <&admac1 1>, <&admac1 4>,
 			       <&admac1 5>;
 			dma-names = "dma", "spkr", "sense", "cout", "cin";
+			/*
+			 * The low-power microphone ring: the stream of the ADT
+			 * I/O buffer device, shared with admac-base-ns.
+			 */
+			iommus = <&aop_dart 8>;
 			#sound-dai-cells = <1>;
 		};
 
