@@ -690,6 +690,7 @@ struct Firmware {
     rings: channel::Rings,
     recovery: recovery::State,
     effort: power::Effort,
+    ceiling: Option<power::Ceiling>,
     hold: power::Hold,
     /// M5: host GPU power budget governor (Region C's budget word).
     governor: thermal::Governor,
@@ -930,7 +931,7 @@ impl Firmware {
         if self.effort.streaming() && self.effort.note_waiters(now_ns, fence::waiters()) {
             self.apply_effort(power::FULL_EFFORT)?;
         }
-        let effort = match self.effort.idle(now_ns, in_flight || submitted) {
+        let mut effort = match self.effort.idle(now_ns, in_flight || submitted) {
             power::IdleAction::None => None,
             power::IdleAction::Clear => {
                 self.port.set_effort_full(false);
@@ -944,12 +945,18 @@ impl Firmware {
             }
             power::IdleAction::Recheck(delay) => Some(delay),
         };
-        Ok(
-            match (effort, self.idle_hold(now_ns, in_flight || submitted)) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            },
-        )
+        if let Some(ceiling) = self.ceiling.as_mut() {
+            ceiling.update(&self.init)?;
+            if in_flight || submitted {
+                effort = Some(effort.map_or(power::PMP_REPORT_PERIOD_NS, |delay| {
+                    delay.min(power::PMP_REPORT_PERIOD_NS)
+                }));
+            }
+        }
+        Ok(match (effort, self.idle_hold(now_ns, in_flight || submitted)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        })
     }
 
     /// Drives the idle hold (see power::Hold); returns the delay in ns for its next check. A
@@ -1082,6 +1089,8 @@ struct Shared {
     firmware_test: bool,
     /// The M5 shared-queue resource policy (frozen device topology).
     render_policy: Option<render_resources::M5Policy>,
+    /// PMP report aperture selected by the GPU node, if this SoC has one.
+    pmp_report: Option<u32>,
     crashed: AtomicBool,
     feed: Arc<feed::Feed>,
     #[pin]
@@ -1530,6 +1539,7 @@ impl Gpu {
         let node = dev.as_ref().as_ref().of_node().ok_or(EIO)?;
         let idle_delay =
             power::idle_delay(node.get_opt_property(c_str!("apple,idle-off-delay-ms"))?)?;
+        let pmp_report = node.get_opt_property(c_str!("apple,pmp-report"))?;
         power::IDLE_HOLD_MS.store(idle_delay, Ordering::Relaxed);
         dev_info!(
             dev.as_ref(),
@@ -1598,6 +1608,7 @@ impl Gpu {
                 submission_enabled: submits,
                 firmware_test: !submits,
                 render_policy,
+                pmp_report,
                 crashed: AtomicBool::new(false),
                 feed,
                 feed_work <- new_work!("g17::Shared::feed_work"),
@@ -2014,6 +2025,7 @@ impl Gpu {
                 rings: channel::Rings::new(shared.variant.graph)?,
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
+                ceiling: None,
                 hold: power::Hold::new(),
                 governor: thermal::Governor::new(),
                 registration_power_release_pending: false,
@@ -2057,6 +2069,9 @@ impl Gpu {
             shared.active_cores,
             shared.variant,
         )?;
+        if let Some(report) = shared.pmp_report {
+            session.ceiling = Some(power::Ceiling::new(report, session.init.ppm_target()?));
+        }
         if let Some(root_entries) = root_entries {
             session.uat.confirm_firmware_root_entries(root_entries)?;
         }
