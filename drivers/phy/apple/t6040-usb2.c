@@ -1863,6 +1863,12 @@ static void t6040_usb3_reclaim_locked(struct t6040_usb2_phy *tphy)
  * then finds the port as on any running host: USB3 up for pin assignment D
  * to share, or to lend its lanes. If the wake fails or doesn't come, DP goes
  * on and gets what it gets on a port without a host.
+ *
+ * The wait runs in a work item, not under the PM core: the display's driver
+ * powers a port's DP phy on from its link work, and after a sleep it queues
+ * that from its own resume on a workqueue that isn't frozen, so the work can
+ * get here while devices still resume. What the Type-C controller reports
+ * comes from works that stay frozen until every device has resumed.
  */
 static void t6040_dp_wait_host(struct t6040_usb2_phy *tphy)
 {
