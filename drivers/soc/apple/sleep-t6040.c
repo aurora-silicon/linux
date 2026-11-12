@@ -112,15 +112,14 @@
 #define PS_APCIE_GP_CLKGATED	0x00000244
 
 /*
- * cluster-ctl (pmgr reg0 + cluster-ctl-offset 0x20000 = 0x502820000). Measured
- * on the J616s: the three CPU complexes are at E +0x0, P0 +0x4,
- * P1 +0x8; the platform writes the low nibble 0 to power one down
- * and raises it to 0xf to power one up, with +0xc the status/poll word. Three
- * complexes on J616s (T8140 had E/P/AVE).
+ * cluster-ctl (ADT pmgr reg[0] + cluster-ctl-offset 0x20000 = 0x502820000), one word per
+ * complex, measured on the J616s: the CPU complexes E +0x0, P0 +0x4 and P1 +0x8, then the
+ * internal and the external display's complexes +0xc and +0x10. The low nibble 0 powers a
+ * complex down and 0xf powers it up; BIT4 reads set until a power-down has finished.
  */
 #define CLUSTER_CTL(n)		((n) * 4)
-#define CLUSTER_CTL_NR		5	/* E, P0, P1 and two more complexes (+0xc, +0x10) */
-#define CLUSTER_CTL_FIRST_WAIT	3	/* the platform waits past the third: the last two are polled */
+#define CLUSTER_CTL_NR		5	/* E, P0, P1, internal and external display */
+#define CLUSTER_CTL_FIRST_WAIT	3	/* the two display complexes are polled */
 #define CLUSTER_CTL_BUSY	BIT(4)
 #define CLUSTER_CTL_NIBBLE	GENMASK(3, 0)
 #define CLUSTER_CTL_ON		0xf
@@ -2167,15 +2166,14 @@ static void t6040_gp_pcie_clk(struct t6040_sleep *s)
 }
 
 /*
- * The wake return (t6040_sleep_return), reached on the boot core after aura's
- * AURAS2R1 mailbox hands it back to cpu_resume. aura restores NO SoC register;
- * every write here is the OS driver's job. It is the
- * mirror of the PMGR wake restore: the three CPU complexes on, the two wake
- * pwrgates, SOC-East retention off (with the busy poll), the axi2af
- * fabric-bridge re-arm, the CPM voters re-asserted, the clk mux restored, the
- * AP-global S2R control cleared, and the wake-status words read. Between them,
- * what a Linux sleep needs on top: ANS's storage link, the GP PCIe ports' clocks
- * and the AOP island's power words.
+ * The wake return, on the boot core, once the boot object's mailbox has handed it to the
+ * resume entry. The boot object restores no SoC register: every write here is this driver's.
+ * In order: the timer and IRQ routing, the stopped CPUs and the AIC, then as the PMGR
+ * wake restore the complexes back, the two wake pwrgates, SOC-East retention off (with the
+ * busy poll) and the axi2af fabric-bridge re-arm; what a Linux sleep needs on top, ANS's
+ * storage link, the GP PCIe ports' clocks and the AOP island's power words; then the CPM
+ * voters re-asserted, the clk mux restored, the AOP-global S2R control cleared, the
+ * keep-alive bits back, WD2 armed over the device resume, and the wake-status words read.
  */
 static void t6040_sleep_return(struct t6040_sleep *s)
 {
@@ -2194,9 +2192,9 @@ static void t6040_sleep_return(struct t6040_sleep *s)
 	t6040_wake_sync();
 
 	/*
-	 * The three CPU complexes back on (E, P0, P1), nibble 0xf, poll +0xc for
-	 * the ready bit. The platform then also writes 1 to register 0xe440f8 of each
-	 * complex. That is not done here: the secondaries come up through the
+	 * The complexes back: E, P0 and P1 to 0xf, the two display complexes to the nibble
+	 * the commit found, with no poll. Register 0xe440f8 of each CPU complex could also
+	 * be written 1. That is not done here: the secondaries come up through the
 	 * normal per-CPU start afterwards, and all 14 CPUs of the J616s are
 	 * online after a wake without it.
 	 */
@@ -2938,8 +2936,8 @@ static void __iomem *t6040_sleep_map(struct device *dev, const char *name)
  * of these, so until aura fills the node @valid stays false and a real sleep
  * with ANS stopped refuses (t6040_sleep_refuse). The reg-names and tunable
  * property names match the T8140's apple,apcie shape exactly, so the same
- * loader fills both SoCs. The GP PCIe host (pcie@1cb0000000, Wi-Fi + SD) is a
- * different node and is left to cold-recover.
+ * loader fills both SoCs. The GP PCIe host (pcie@1cb0000000, Wi-Fi and SD) is a
+ * different node, mapped by t6040_sleep_map_gp().
  */
 static void t6040_sleep_map_apcie(struct t6040_sleep *s)
 {
