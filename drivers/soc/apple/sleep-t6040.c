@@ -276,7 +276,7 @@ static const struct {
 #define DISP_PWRGATE_B		0x60	/* := 0 before DISP_SYS goes down, 1 after it is up */
 #define PS_DISP_FE		0x368	/* soc_east */
 #define PS_DISP_SYS		0x258	/* soc_east */
-#define PS_MACOS_TIMEOUT_US	8000
+#define DISP_PS_TIMEOUT_US	8000
 #define DISP_CPU_GATE_US	50000
 
 /* The GP PCIe (t602x port layout, as T8140's radio port): power words in soc_east. */
@@ -372,7 +372,7 @@ struct t6040_sleep {
 	void __iomem *pwrgate;
 	void __iomem *dcp_dart;		/* dart-dcp, for its transaction idle wait */
 	void __iomem *disp_pwrgate;	/* internal display retention window 0x5022a1000 */
-	bool disp_down;			/* t6040_disp_off_macos() lowered the internal display */
+	bool disp_down;			/* t6040_disp_off() lowered the internal display */
 	void __iomem *pmc_dcp;		/* PMS pmc-dcp voter pair 0x5048a9c14/c18 */
 	u32 pmc_dcp_saved[2];
 	u32 pmc_if_saved[2];		/* BWR and boost interface enables at the commit */
@@ -511,7 +511,7 @@ static bool t6040_sleep_ps_on(u32 val, bool cpu)
 	return !cpu && FIELD_GET(PS_TARGET, val);
 }
 
-static unsigned int t6040_sleep_show_group(struct seq_file *s, const struct t6040_sleep_group *g)
+static unsigned int t6040_sleep_show_group(struct seq_file *m, const struct t6040_sleep_group *g)
 {
 	unsigned int on = 0;
 	u32 off;
@@ -524,16 +524,16 @@ static unsigned int t6040_sleep_show_group(struct seq_file *s, const struct t604
 		ret = regmap_read(g->regmap, off, &val);
 		if (ret) {
 			/* Unreadable counts as on: the refusal fails closed. */
-			if (s)
-				seq_printf(s, "  %-12s +%#05x  read failed (%d)\n", g->name, off,
+			if (m)
+				seq_printf(m, "  %-12s +%#05x  read failed (%d)\n", g->name, off,
 					   ret);
 			on++;
 			continue;
 		}
 		if (t6040_sleep_ps_on(val, cpu))
 			on++;
-		if (s)
-			seq_printf(s, "  %-12s +%#05x %s %#010x target %lu actual %lu%s\n", g->name,
+		if (m)
+			seq_printf(m, "  %-12s +%#05x %s %#010x target %lu actual %lu%s\n", g->name,
 				   off, cpu ? "cpu  " : "child", val, FIELD_GET(PS_TARGET, val),
 				   FIELD_GET(PS_ACTUAL, val),
 				   t6040_sleep_ps_on(val, cpu) ? "  ON" : "");
@@ -567,33 +567,33 @@ static unsigned int t6040_sleep_parkable(const char **name)
  * .suspend stops the DCP and lowers its domains), so .begin excludes them and
  * only .enter, after the device suspend, enforces them.
  */
-static unsigned int t6040_sleep_live_blockers(struct t6040_sleep *sleep, struct seq_file *s,
+static unsigned int t6040_sleep_live_blockers(struct t6040_sleep *s, struct seq_file *m,
 					      unsigned int *disp_out)
 {
 	/* Mapped and aura's: after a resume from disk, this boot's (t6040_sleep_restore()). */
-	bool mailbox = sleep->mbox;
+	bool mailbox = s->mbox;
 	bool el2 = is_kernel_in_hyp_mode();
 	unsigned int i, blockers = 0, disp = 0, parkable;
 	const char *ops_name;
 
 	parkable = t6040_sleep_parkable(&ops_name);
 
-	if (s) {
-		seq_printf(s, "kernel at EL2: %s\n", el2 ? "yes" : "no");
-		seq_printf(s, "boot object return path (/chosen/aurora,s2r-mailbox): %s\n",
+	if (m) {
+		seq_printf(m, "kernel at EL2: %s\n", el2 ? "yes" : "no");
+		seq_printf(m, "boot object return path (/chosen/aurora,s2r-mailbox): %s\n",
 			   mailbox ? "yes" : "no");
-		seq_printf(s, "secondaries that can leave the kernel: %u of %u (%s)\n", parkable,
+		seq_printf(m, "secondaries that can leave the kernel: %u of %u (%s)\n", parkable,
 			   num_possible_cpus() - 1, ops_name);
 	}
 	blockers += !el2 + !mailbox + (parkable != num_possible_cpus() - 1);
 
-	if (s)
-		seq_puts(s, "power states macOS checks before sleep (device-check-ps-b4-sleep):\n");
-	for (i = 0; i < sleep->ngroups; i++) {
-		unsigned int on = t6040_sleep_show_group(s, &sleep->groups[i]);
+	if (m)
+		seq_puts(m, "power states macOS checks before sleep (device-check-ps-b4-sleep):\n");
+	for (i = 0; i < s->ngroups; i++) {
+		unsigned int on = t6040_sleep_show_group(m, &s->groups[i]);
 
-		if (s)
-			seq_printf(s, "  %-12s %u on\n", sleep->groups[i].name, on);
+		if (m)
+			seq_printf(m, "  %-12s %u on\n", s->groups[i].name, on);
 		disp += !!on;
 	}
 
@@ -603,12 +603,12 @@ static unsigned int t6040_sleep_live_blockers(struct t6040_sleep *sleep, struct 
 }
 
 /* The display groups' on-state, one line per group, no allocation. For the log at the commit point. */
-static unsigned int t6040_sleep_log_groups(struct t6040_sleep *sleep)
+static unsigned int t6040_sleep_log_groups(struct t6040_sleep *s)
 {
 	unsigned int i, blockers = 0;
 
-	for (i = 0; i < sleep->ngroups; i++) {
-		const struct t6040_sleep_group *g = &sleep->groups[i];
+	for (i = 0; i < s->ngroups; i++) {
+		const struct t6040_sleep_group *g = &s->groups[i];
 		u32 off, on_mask = 0, val;
 		unsigned int bit = 0;
 
@@ -629,12 +629,12 @@ static unsigned int t6040_sleep_log_groups(struct t6040_sleep *sleep)
 }
 
 /* Log the blockers outside the display, for a refused or dry .begin. */
-static void t6040_sleep_log_blockers(struct t6040_sleep *sleep)
+static void t6040_sleep_log_blockers(struct t6040_sleep *s)
 {
 	const char *ops_name;
 
 	pr_info("t6040-sleep: EL2 %s, s2r-mailbox %s, parkable %u/%u (%s)\n",
-		is_kernel_in_hyp_mode() ? "yes" : "no", sleep->mbox ? "yes" : "no",
+		is_kernel_in_hyp_mode() ? "yes" : "no", s->mbox ? "yes" : "no",
 		t6040_sleep_parkable(&ops_name), num_possible_cpus() - 1, ops_name);
 }
 
@@ -1208,7 +1208,7 @@ static void t6040_secondaries_off(struct t6040_sleep *s)
 }
 
 /* The hardware steps of the generic PMGR quiesce, in macOS's order (see t6040_acc_apsc_pa). */
-static void t6040_macos_quiesce(struct t6040_sleep *s)
+static void t6040_pmgr_quiesce(struct t6040_sleep *s)
 {
 	u64 q;
 	u32 v;
@@ -1291,40 +1291,40 @@ static void __iomem *t6040_axi2af_ps(struct t6040_sleep *s, const struct t6040_a
 }
 
 /* The preflight's list of the axi2af domains' power words. */
-static void t6040_axi2af_show(struct t6040_sleep *sleep, struct seq_file *s)
+static void t6040_axi2af_show(struct t6040_sleep *s, struct seq_file *m)
 {
 	int i;
 
-	seq_puts(s, "axi2af domains (macOS's quiesce gate wants every one off):\n");
+	seq_puts(m, "axi2af domains (macOS's quiesce gate wants every one off):\n");
 	for (i = 0; i < T6040_AXI2AF_DOMAINS; i++) {
-		void __iomem *ps = t6040_axi2af_ps(sleep, &t6040_axi2af[i]);
+		void __iomem *ps = t6040_axi2af_ps(s, &t6040_axi2af[i]);
 		u32 val = ps ? readl(ps) : 0;
 
-		seq_printf(s, "  %-13s %#010x%s\n", t6040_axi2af[i].name, val,
+		seq_printf(m, "  %-13s %#010x%s\n", t6040_axi2af[i].name, val,
 			   ps ? (FIELD_GET(PS_ACTUAL, val) ? "  ON" : "") : "  (unmapped)");
 	}
 }
 
-static int t6040_sleep_preflight_show(struct seq_file *s, void *unused)
+static int t6040_sleep_preflight_show(struct seq_file *m, void *unused)
 {
-	struct t6040_sleep *sleep = s->private;
-	unsigned int live = t6040_sleep_live_blockers(sleep, s, NULL);
+	struct t6040_sleep *s = m->private;
+	unsigned int live = t6040_sleep_live_blockers(s, m, NULL);
 	unsigned int i;
 
-	apple_sleep_registry_show(s);
-	t6040_axi2af_show(sleep, s);
-	seq_printf(s, "verdict: %u live blocker(s)\n", live);
-	seq_printf(s, "dry_run %u, wd2_secs %u, allow_entry %d, parking ops %s\n",
+	apple_sleep_registry_show(m);
+	t6040_axi2af_show(s, m);
+	seq_printf(m, "verdict: %u live blocker(s)\n", live);
+	seq_printf(m, "dry_run %u, wd2_secs %u, allow_entry %d, parking ops %s\n",
 		   READ_ONCE(dry_run), READ_ONCE(wd2_secs), allow_entry,
-		   sleep->power_ops ? "registered" : "not registered");
-	if (sleep->cluster_ctl) {
+		   s->power_ops ? "registered" : "not registered");
+	if (s->cluster_ctl) {
 		static const char * const nm[] = {
 			"EACC", "PACC0", "PACC1_ANE", "DISP_INT", "DISP_EXT",
 		};
 
 		for (i = 0; i < CLUSTER_CTL_NR; i++)
-			seq_printf(s, "cluster-ctl +%#x %-9s %#x\n", CLUSTER_CTL(i), nm[i],
-				   readl(sleep->cluster_ctl + CLUSTER_CTL(i)));
+			seq_printf(m, "cluster-ctl +%#x %-9s %#x\n", CLUSTER_CTL(i), nm[i],
+				   readl(s->cluster_ctl + CLUSTER_CTL(i)));
 	}
 
 	return 0;
@@ -1445,7 +1445,7 @@ static bool t6040_ps_actual_on(void __iomem *base, u32 offset)
 }
 
 /* The shared PHY and PHY-IP to sleep (macOS's root complex disable; it polls unbounded). */
-static void t6040_apcie_phy_off_macos(struct t6040_sleep *s)
+static void t6040_apcie_phy_off(struct t6040_sleep *s)
 {
 	struct t6040_apcie_st *a = &s->apcie_st;
 	void __iomem *ctrl = a->phy + APCIE_PHY_CTRL;
@@ -1482,7 +1482,7 @@ static void t6040_apcie_phy_sw_gate(struct t6040_sleep *s)
 }
 
 /* The PCIe PLL shutdown: the clock generator's control word, as macOS writes it. */
-static void t6040_apcie_pll_off_macos(struct t6040_sleep *s)
+static void t6040_apcie_pll_off(struct t6040_sleep *s)
 {
 	void __iomem *clk = s->apcie_st.clkgen + APCIE_CLK_CTRL;
 	u32 val;
@@ -1708,10 +1708,10 @@ static void t6040_sleep_lower_apcie_st(struct t6040_sleep *s)
 
 	/* The PHY's registers need a lane domain on; quiet it first (shared). */
 	if (a->phy && t6040_ps_actual_on(ps, PS_APCIE_SYS_ST0))
-		t6040_apcie_phy_off_macos(s);
+		t6040_apcie_phy_off(s);
 	t6040_apcie_phy_sw_gate(s);
 	if (a->clkgen && t6040_ps_actual_on(ps, PS_APCIE_SYS_ST0))
-		t6040_apcie_pll_off_macos(s);
+		t6040_apcie_pll_off(s);
 
 	/* AXI enables off (shared). */
 	if (a->axi) {
@@ -2044,7 +2044,7 @@ static int t6040_sleep_commit(unsigned long unused)
 
 	/*
 	 * ANS's storage link, once ANS has been stopped by its driver (see
-	 * t6040_apcie_phy_off_macos). It follows every refusal, so a refused sleep finds
+	 * t6040_apcie_phy_off). It follows every refusal, so a refused sleep finds
 	 * the link up. No-op unless the apple,apcie windows are present (apcie_st.valid).
 	 */
 	if (s->soc_east)
@@ -2074,7 +2074,7 @@ static int t6040_sleep_commit(unsigned long unused)
 	 * the clock quiesce, the keep-alive bits off, then the S2R timer.
 	 */
 	t6040_secondaries_off(s);
-	t6040_macos_quiesce(s);
+	t6040_pmgr_quiesce(s);
 	t6040_agx_gate(s);
 	t6040_clusters_off(s);
 
@@ -2521,7 +2521,7 @@ static int t6040_psw_poll(const struct t6040_psw *w, u32 mask, u32 want)
 {
 	unsigned int us;
 
-	for (us = 0; us < PS_MACOS_TIMEOUT_US; us++) {
+	for (us = 0; us < DISP_PS_TIMEOUT_US; us++) {
 		if ((t6040_psw_read(w) & mask) == want)
 			return 0;
 		udelay(1);
@@ -2535,8 +2535,8 @@ static int t6040_psw_poll(const struct t6040_psw *w, u32 mask, u32 want)
  * wait for ACTUAL 15; then @pre (the SYS hooks); then TARGET 0 with bits 9:8 written 1 and
  * bits 10-12, 24-31 kept; then poll bit11 clear and ACTUAL 0.
  */
-static int t6040_ps_macos_off(struct t6040_sleep *s, const struct t6040_psw *w,
-			      void (*pre)(struct t6040_sleep *s))
+static int t6040_psw_off(struct t6040_sleep *s, const struct t6040_psw *w,
+			 void (*pre)(struct t6040_sleep *s))
 {
 	u32 v = t6040_psw_read(w);
 
@@ -2579,7 +2579,7 @@ static int t6040_dcp_dart_idle(struct t6040_sleep *s)
 		return 0;
 	for (i = 0; i < ARRAY_SIZE(regs); i++)
 		while (readl(s->dcp_dart + regs[i]) & DCP_DART_TXN_COUNT) {
-			if (++us > PS_MACOS_TIMEOUT_US)
+			if (++us > DISP_PS_TIMEOUT_US)
 				return -ETIMEDOUT;
 			udelay(1);
 		}
@@ -2587,7 +2587,7 @@ static int t6040_dcp_dart_idle(struct t6040_sleep *s)
 }
 
 /* The internal display's FE and SYS domains, child first, after its sub-blocks (macOS's order). */
-static int t6040_disp_off_macos(struct t6040_sleep *s, const struct t6040_sleep_group *g)
+static int t6040_disp_off(struct t6040_sleep *s, const struct t6040_sleep_group *g)
 {
 	struct t6040_psw cpu = { .map = g->regmap, .off = g->first };
 	struct t6040_psw fe = { .io = s->soc_east, .off = PS_DISP_FE };
@@ -2626,9 +2626,9 @@ static int t6040_disp_off_macos(struct t6040_sleep *s, const struct t6040_sleep_
 		t6040_dcp_dart_idle(s);
 	t6040_psw_poll_long(&cpu, PS_ACTUAL, 0, DISP_CPU_GATE_US);
 
-	ret = t6040_ps_macos_off(s, &fe, NULL);
+	ret = t6040_psw_off(s, &fe, NULL);
 	if (!ret)
-		ret = t6040_ps_macos_off(s, &sys, t6040_disp_sys_pre);
+		ret = t6040_psw_off(s, &sys, t6040_disp_sys_pre);
 	return ret;
 }
 
@@ -2637,8 +2637,8 @@ static int t6040_disp_off_macos(struct t6040_sleep *s, const struct t6040_sleep_
  * retention pair (A := 0, B := 1) and the axi2af bridge bit0s set; then bits 9:8 cleared and
  * AUTO_ENABLE back where macOS sets it (DISP_CPU, DISP_SYS).
  */
-static int t6040_ps_macos_on(struct t6040_sleep *s, const struct t6040_psw *w, bool sys,
-			     bool autoen)
+static int t6040_psw_on(struct t6040_sleep *s, const struct t6040_psw *w, bool sys,
+			bool autoen)
 {
 	u32 v = t6040_psw_read(w);
 	int ret;
@@ -2673,9 +2673,9 @@ static void t6040_disp_back(struct t6040_sleep *s)
 		return;
 	s->disp_down = false;
 	/* DISP_CPU's word can't be written from here: automatic mode raises it. */
-	if (t6040_ps_macos_on(s, &sys, true, true))
+	if (t6040_psw_on(s, &sys, true, true))
 		return;
-	if (t6040_ps_macos_on(s, &fe, false, false))
+	if (t6040_psw_on(s, &fe, false, false))
 		return;
 	if (s->pmc_dcp) {
 		writel(s->pmc_dcp_saved[1], s->pmc_dcp + 4);
@@ -2735,7 +2735,7 @@ static unsigned int t6040_sleep_lower_display(struct t6040_sleep *s)
 				break;
 			off -= PS_STRIDE;
 		}
-		if (!i && !strcmp(g->name, "disp") && t6040_disp_off_macos(s, g))
+		if (!i && !strcmp(g->name, "disp") && t6040_disp_off(s, g))
 			left++;
 	}
 	return left;
@@ -2836,46 +2836,46 @@ static const struct platform_suspend_ops t6040_sleep_ops = {
 	.end = t6040_sleep_end,
 };
 
-static int t6040_sleep_parse_groups(struct t6040_sleep *sleep)
+static int t6040_sleep_parse_groups(struct t6040_sleep *s)
 {
-	struct device_node *np = sleep->dev->of_node;
+	struct device_node *np = s->dev->of_node;
 	const char *prop = "apple,check-ps-b4-sleep";
 	int n, i;
 
 	/* Each group: the PMGR syscon, the CPU's offset and the last sub-block's. */
 	n = of_property_count_u32_elems(np, prop);
 	if (n <= 0 || n % 3)
-		return dev_err_probe(sleep->dev, -EINVAL, "no valid %s\n", prop);
+		return dev_err_probe(s->dev, -EINVAL, "no valid %s\n", prop);
 	n /= 3;
 	if (of_property_count_strings(np, "apple,check-ps-b4-sleep-names") != n)
-		return dev_err_probe(sleep->dev, -EINVAL, "one name per %s group\n", prop);
+		return dev_err_probe(s->dev, -EINVAL, "one name per %s group\n", prop);
 
-	sleep->groups = devm_kcalloc(sleep->dev, n, sizeof(*sleep->groups), GFP_KERNEL);
-	if (!sleep->groups)
+	s->groups = devm_kcalloc(s->dev, n, sizeof(*s->groups), GFP_KERNEL);
+	if (!s->groups)
 		return -ENOMEM;
 
 	for (i = 0; i < n; i++) {
-		struct t6040_sleep_group *g = &sleep->groups[i];
+		struct t6040_sleep_group *g = &s->groups[i];
 		struct of_phandle_args args;
 		int ret;
 
 		ret = of_parse_phandle_with_fixed_args(np, prop, 2, i, &args);
 		if (ret)
-			return dev_err_probe(sleep->dev, ret, "%s[%d]\n", prop, i);
+			return dev_err_probe(s->dev, ret, "%s[%d]\n", prop, i);
 		g->regmap = syscon_node_to_regmap(args.np);
 		of_node_put(args.np);
 		if (IS_ERR(g->regmap))
-			return dev_err_probe(sleep->dev, PTR_ERR(g->regmap), "%s[%d] regmap\n",
+			return dev_err_probe(s->dev, PTR_ERR(g->regmap), "%s[%d] regmap\n",
 					     prop, i);
 		g->first = args.args[0];
 		g->last = args.args[1];
 		if (g->first > g->last || (g->last - g->first) % PS_STRIDE ||
 		    (g->last - g->first) / PS_STRIDE >= PS_MAX_PER_GROUP)
-			return dev_err_probe(sleep->dev, -EINVAL, "%s[%d]: bad range %#x..%#x\n",
+			return dev_err_probe(s->dev, -EINVAL, "%s[%d]: bad range %#x..%#x\n",
 					     prop, i, g->first, g->last);
 		of_property_read_string_index(np, "apple,check-ps-b4-sleep-names", i, &g->name);
 	}
-	sleep->ngroups = n;
+	s->ngroups = n;
 
 	return 0;
 }
@@ -3090,19 +3090,19 @@ out:
 
 static int t6040_sleep_probe(struct platform_device *pdev)
 {
-	struct t6040_sleep *sleep;
+	struct t6040_sleep *s;
 	struct dentry *dir;
 	int ret, i;
 
 	/* This sleep was tested with neither the lid's state at the wake nor USB wake ports. */
 	apple_sleep_set_part_plain_wake();
 
-	sleep = devm_kzalloc(&pdev->dev, sizeof(*sleep), GFP_KERNEL);
-	if (!sleep)
+	s = devm_kzalloc(&pdev->dev, sizeof(*s), GFP_KERNEL);
+	if (!s)
 		return -ENOMEM;
-	sleep->dev = &pdev->dev;
+	s->dev = &pdev->dev;
 
-	ret = t6040_sleep_parse_groups(sleep);
+	ret = t6040_sleep_parse_groups(s);
 	if (ret)
 		return ret;
 
@@ -3114,70 +3114,70 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 	BUILD_BUG_ON(ARRAY_SIZE(t6040_axi2af) != T6040_AXI2AF_DOMAINS);
 	BUILD_BUG_ON(ARRAY_SIZE(t6040_tvm) != ARRAY_SIZE(((struct t6040_sleep *)0)->tvm_ctl));
 	BUILD_BUG_ON(ARRAY_SIZE(t6040_acc_apsc_pa) != ARRAY_SIZE(((struct t6040_sleep *)0)->acc_apsc));
-	sleep->cpu_start = t6040_sleep_map(&pdev->dev, "cpu-start");
-	sleep->wdt = t6040_sleep_map(&pdev->dev, "wdt");
+	s->cpu_start = t6040_sleep_map(&pdev->dev, "cpu-start");
+	s->wdt = t6040_sleep_map(&pdev->dev, "wdt");
 	{
 		struct resource wres;
 		int widx = of_property_match_string(pdev->dev.of_node, "reg-names", "wdt");
 
-		sleep->wdt_stub_ok = widx >= 0 &&
+		s->wdt_stub_ok = widx >= 0 &&
 			!of_address_to_resource(pdev->dev.of_node, widx, &wres) &&
 			wres.start == T6040_WDT_PA;
-		if (!sleep->wdt_stub_ok)
+		if (!s->wdt_stub_ok)
 			dev_warn(&pdev->dev,
 				 "the wdt block is not the AON watchdog: no WD2 restart at the wake\n");
 	}
-	sleep->cluster_ctl = t6040_sleep_map(&pdev->dev, "cluster-ctl");
-	sleep->pwrgate = t6040_sleep_map(&pdev->dev, "soc-pwrgate");
-	sleep->clkgen = t6040_sleep_map(&pdev->dev, "clkgen");
-	sleep->spmi0 = t6040_sleep_map(&pdev->dev, "spmi0");
-	sleep->spmi_a0 = t6040_sleep_map(&pdev->dev, "spmi-a0");
-	sleep->mastermini = t6040_sleep_map(&pdev->dev, "mastermini");
-	sleep->aop_ps = t6040_ioremap_np(&pdev->dev, T6040_AOP_PS_PA, 0x160);
-	sleep->pmgr_soc = t6040_ioremap_np(&pdev->dev, 0x502800000ULL, 0x9000);
-	for (i = 0; i < ARRAY_SIZE(sleep->dcs); i++)
-		sleep->dcs[i] = t6040_ioremap_np(&pdev->dev, 0x220200000ULL +
-						 (i / 4) * 0x2000000ULL + (i % 4) * 0x200000ULL,
-						 0x2000);
-	for (i = 0; i < ARRAY_SIZE(sleep->atc_cfg); i++)
-		sleep->atc_cfg[i] = t6040_ioremap_np(&pdev->dev,
-						     0x383200000ULL + i * 0x8000000ULL, 0x100);
-	sleep->pmgr_east = t6040_ioremap_np(&pdev->dev, 0x502280000ULL, 0xd000);
-	sleep->soc_east = t6040_sleep_map(&pdev->dev, "soc-east");
-	sleep->soc_ps = t6040_sleep_map(&pdev->dev, "soc-ps");
-	sleep->aop_global = t6040_sleep_map(&pdev->dev, "aop-global");
+	s->cluster_ctl = t6040_sleep_map(&pdev->dev, "cluster-ctl");
+	s->pwrgate = t6040_sleep_map(&pdev->dev, "soc-pwrgate");
+	s->clkgen = t6040_sleep_map(&pdev->dev, "clkgen");
+	s->spmi0 = t6040_sleep_map(&pdev->dev, "spmi0");
+	s->spmi_a0 = t6040_sleep_map(&pdev->dev, "spmi-a0");
+	s->mastermini = t6040_sleep_map(&pdev->dev, "mastermini");
+	s->aop_ps = t6040_ioremap_np(&pdev->dev, T6040_AOP_PS_PA, 0x160);
+	s->pmgr_soc = t6040_ioremap_np(&pdev->dev, 0x502800000ULL, 0x9000);
+	for (i = 0; i < ARRAY_SIZE(s->dcs); i++)
+		s->dcs[i] = t6040_ioremap_np(&pdev->dev, 0x220200000ULL +
+					     (i / 4) * 0x2000000ULL + (i % 4) * 0x200000ULL,
+					     0x2000);
+	for (i = 0; i < ARRAY_SIZE(s->atc_cfg); i++)
+		s->atc_cfg[i] = t6040_ioremap_np(&pdev->dev,
+						 0x383200000ULL + i * 0x8000000ULL, 0x100);
+	s->pmgr_east = t6040_ioremap_np(&pdev->dev, 0x502280000ULL, 0xd000);
+	s->soc_east = t6040_sleep_map(&pdev->dev, "soc-east");
+	s->soc_ps = t6040_sleep_map(&pdev->dev, "soc-ps");
+	s->aop_global = t6040_sleep_map(&pdev->dev, "aop-global");
 	for (i = 0; i < T6040_AXI2AF_DOMAINS; i++)
-		sleep->axi2af_bridge[i] = t6040_ioremap_np(&pdev->dev,
+		s->axi2af_bridge[i] = t6040_ioremap_np(&pdev->dev,
 						       t6040_axi2af[i].bridge_pa, 0x200);
-	t6040_sleep_map_apcie(sleep);
-	t6040_sleep_map_mailbox(sleep);
-	t6040_sleep_watch_init(sleep, T6040_WATCH_SEP, "apple,sep", "sep");
-	t6040_sleep_watch_init(sleep, T6040_WATCH_ANS, "apple,t6041-nvme-ans2", "ans");
+	t6040_sleep_map_apcie(s);
+	t6040_sleep_map_mailbox(s);
+	t6040_sleep_watch_init(s, T6040_WATCH_SEP, "apple,sep", "sep");
+	t6040_sleep_watch_init(s, T6040_WATCH_ANS, "apple,t6041-nvme-ans2", "ans");
 	/* Fixed PAs: dart-dcp's counters and the internal display's retention pair. */
-	sleep->dcp_dart = t6040_ioremap_np(&pdev->dev, T6040_DCP_DART_PA, 0x1000);
-	sleep->disp_pwrgate = t6040_ioremap_np(&pdev->dev, T6040_DISP_PWRGATE_PA, 0x100);
-	sleep->pmc_dcp = t6040_ioremap_np(&pdev->dev, T6040_PMC_DCP_PA, 12);
-	sleep->pmc_bwr = t6040_ioremap_np(&pdev->dev, T6040_PMC_BWR_PA, 0x10);
-	sleep->ka_soc = t6040_ioremap_np(&pdev->dev, T6040_KA_SOC_PA, KA_SIZE);
-	sleep->ka_east = t6040_ioremap_np(&pdev->dev, T6040_KA_EAST_PA, KA_SIZE);
-	sleep->smc_wdt_deadline = t6040_ioremap_np(&pdev->dev, T6040_SMC_WDT_DEADLINE_PA, 4);
-	sleep->agx_gate = t6040_ioremap_np(&pdev->dev, T6040_AGX_GATE_PA, 4);
-	sleep->s2r_lo_count = t6040_ioremap_np(&pdev->dev, T6040_S2R_LO_COUNT_PA, 4);
+	s->dcp_dart = t6040_ioremap_np(&pdev->dev, T6040_DCP_DART_PA, 0x1000);
+	s->disp_pwrgate = t6040_ioremap_np(&pdev->dev, T6040_DISP_PWRGATE_PA, 0x100);
+	s->pmc_dcp = t6040_ioremap_np(&pdev->dev, T6040_PMC_DCP_PA, 12);
+	s->pmc_bwr = t6040_ioremap_np(&pdev->dev, T6040_PMC_BWR_PA, 0x10);
+	s->ka_soc = t6040_ioremap_np(&pdev->dev, T6040_KA_SOC_PA, KA_SIZE);
+	s->ka_east = t6040_ioremap_np(&pdev->dev, T6040_KA_EAST_PA, KA_SIZE);
+	s->smc_wdt_deadline = t6040_ioremap_np(&pdev->dev, T6040_SMC_WDT_DEADLINE_PA, 4);
+	s->agx_gate = t6040_ioremap_np(&pdev->dev, T6040_AGX_GATE_PA, 4);
+	s->s2r_lo_count = t6040_ioremap_np(&pdev->dev, T6040_S2R_LO_COUNT_PA, 4);
 	for (i = 0; i < ARRAY_SIZE(t6040_acc_apsc_pa); i++)
-		sleep->acc_apsc[i] = t6040_ioremap_np(&pdev->dev, t6040_acc_apsc_pa[i], 8);
+		s->acc_apsc[i] = t6040_ioremap_np(&pdev->dev, t6040_acc_apsc_pa[i], 8);
 	for (i = 0; i < ARRAY_SIZE(t6040_tvm); i++) {
-		sleep->tvm_ctl[i] = t6040_ioremap_np(&pdev->dev, t6040_tvm[i].ctl, 4);
-		sleep->tvm_status[i] = t6040_ioremap_np(&pdev->dev, t6040_tvm[i].status, 4);
+		s->tvm_ctl[i] = t6040_ioremap_np(&pdev->dev, t6040_tvm[i].ctl, 4);
+		s->tvm_status[i] = t6040_ioremap_np(&pdev->dev, t6040_tvm[i].status, 4);
 	}
-	sleep->afr_ps = t6040_ioremap_np(&pdev->dev, T6040_AFR_PS_PA, 4);
-	t6040_sleep_map_gp(sleep);
+	s->afr_ps = t6040_ioremap_np(&pdev->dev, T6040_AFR_PS_PA, 4);
+	t6040_sleep_map_gp(s);
 	t6040_ed_map(&pdev->dev);
 
-	platform_set_drvdata(pdev, sleep);
-	t6040_sleep = sleep;
+	platform_set_drvdata(pdev, s);
+	t6040_sleep = s;
 
 	dir = debugfs_create_dir("t6040-sleep", NULL);
-	debugfs_create_file("preflight", 0400, dir, sleep, &t6040_sleep_preflight_fops);
+	debugfs_create_file("preflight", 0400, dir, s, &t6040_sleep_preflight_fops);
 
 	/*
 	 * The CPU power ops act only when a commit stops the parked secondaries, and a dry run
@@ -3186,19 +3186,19 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 	 * keeps refusing parking CPUs as before. Parking itself needs no power ops.
 	 */
 	if (allow_entry)
-		t6040_sleep_power_ops(sleep);
+		t6040_sleep_power_ops(s);
 
 	suspend_set_ops(&t6040_sleep_ops);
 	dev_info(&pdev->dev,
 		 "refusal-first: %u display groups, cpu-start %s, wdt %s, commit/wake blocks %s, storage-apcie %s, s2r-mailbox %s, parking ops %s, dry run %u\n",
-		 sleep->ngroups, sleep->cpu_start ? "mapped" : "absent",
-		 sleep->wdt ? "mapped" : "absent",
-		 (sleep->cluster_ctl && sleep->pwrgate && sleep->mastermini && sleep->spmi0 &&
-		  sleep->soc_east && sleep->aop_global) ? "mapped" : "incomplete",
-		 sleep->apcie_st.valid ? "mapped" : "absent",
-		 sleep->mbox ? "present" : "absent",
-		 sleep->power_ops ? "registered" : "not registered", READ_ONCE(dry_run));
-	t6040_sleep_log_s2r_state(sleep, "probe");
+		 s->ngroups, s->cpu_start ? "mapped" : "absent",
+		 s->wdt ? "mapped" : "absent",
+		 (s->cluster_ctl && s->pwrgate && s->mastermini && s->spmi0 &&
+		  s->soc_east && s->aop_global) ? "mapped" : "incomplete",
+		 s->apcie_st.valid ? "mapped" : "absent",
+		 s->mbox ? "present" : "absent",
+		 s->power_ops ? "registered" : "not registered", READ_ONCE(dry_run));
+	t6040_sleep_log_s2r_state(s, "probe");
 
 	return 0;
 }
