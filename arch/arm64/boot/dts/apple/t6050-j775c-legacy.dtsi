@@ -18,7 +18,7 @@
 #include <dt-bindings/spmi/spmi.h>
 
 /* Reuse integration's common nodes; retain the booted peripheral inventory below. */
-#include "t6050-base.dtsi"
+#include "t6050-j775c-base.dtsi"
 
 / {
 	compatible = "apple,t6050", "apple,arm-platform";

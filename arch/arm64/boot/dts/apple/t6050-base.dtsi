@@ -289,11 +289,11 @@
 	};
 
 	/* Die 0 MMIO */
-	die0: soc {
+	die0: soc@200000000 {
 		compatible = "simple-bus";
 		#address-cells = <2>;
 		#size-cells = <2>;
-		ranges;
+		ranges = <0x2 0x0 0x2 0x0 0x3 0xc0000000>;
 		nonposted-mmio;
 	};
 };
