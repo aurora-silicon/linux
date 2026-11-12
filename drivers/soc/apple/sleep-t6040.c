@@ -693,14 +693,13 @@ static unsigned int t6040_sleep_log_groups(struct t6040_sleep *sleep)
 	return blockers;
 }
 
-/* Log the full blocker list (interrupts may be off: no allocation, pr_* only). */
+/* Log the blockers outside the display, for a refused or dry .begin. */
 static void t6040_sleep_log_blockers(struct t6040_sleep *sleep)
 {
 	const char *ops_name;
 
 	pr_info("t6040-sleep: EL2 %s, s2r-mailbox %s, parkable %u/%u (%s)\n",
-		is_kernel_in_hyp_mode() ? "yes" : "no",
-		of_property_present(of_chosen, "aurora,s2r-mailbox") ? "yes" : "no",
+		is_kernel_in_hyp_mode() ? "yes" : "no", sleep->mbox ? "yes" : "no",
 		t6040_sleep_parkable(&ops_name), num_possible_cpus() - 1, ops_name);
 }
 
@@ -2765,7 +2764,7 @@ static unsigned int t6040_sleep_lower_display(struct t6040_sleep *s)
 
 		for (;;) {
 			bool cpu = off == g->first;
-			u32 val, cur;
+			u32 val, cur = 0;
 
 			/* An automatically gated CPU still powered: wait for the PMGR to gate it. */
 			if (cpu && !regmap_read(g->regmap, off, &val) && (val & PS_AUTO_ENABLE) &&
