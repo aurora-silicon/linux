@@ -383,8 +383,14 @@ def static_checks():
 
 def sampling_checks():
     # Failure modes: absent/removed policy, leaked reference, mask use after
-    # put, hotplug during iteration, stale utilization after CPU re-online.
+    # put, hotplug during iteration, stale utilization after CPU re-online,
+    # CPUFreq-disabled builds, lost iowait or changed counter/wall ordering.
     src = block(SRC.read_text(), 'static void j613_floor_sample_cpus(')
+    # Exact CPUFreq io_busy=0 accounting is the reference, not a new formula.
+    reference = block((ROOT / 'drivers/cpufreq/cpufreq.c').read_text(),
+                      'u64 get_cpu_idle_time(')
+    reference = reference.replace('u64 get_cpu_idle_time(',
+                                  'u64 reference_cpu_idle_time(', 1)
     harness = r"""
 #include <assert.h>
 #include <stdbool.h>
@@ -417,8 +423,27 @@ static unsigned int cpumask_first(unsigned int *m)
 { assert(locked && refs == 1 && m == &mask); return *m; }
 static void cpufreq_cpu_put(struct cpufreq_policy *p)
 { assert(p == &policy && refs == 1); refs--; puts++; }
-static u64 get_cpu_idle_time(unsigned int cpu, u64 *wall, int io)
-{ (void)cpu; (void)io; assert(locked); *wall = 1030; return 100; }
+static unsigned int counter_phase[2];
+static u64 sample_idle = 60, sample_iowait = 40, sample_wall = 1030;
+static u64 get_cpu_idle_time_us(int cpu, u64 *wall)
+{
+    assert(locked && cpu >= 0 && cpu < 2 && !wall && !counter_phase[cpu]);
+    counter_phase[cpu] = 1;
+    return sample_idle;
+}
+static u64 get_cpu_iowait_time_us(int cpu, u64 *wall)
+{
+    assert(locked && wall && counter_phase[cpu] == 1);
+    counter_phase[cpu] = 0;
+    *wall = sample_wall;
+    return sample_iowait;
+}
+""" + reference + r"""
+/* cpufreq.h exposes this wrapper only when CONFIG_CPU_FREQ is enabled. */
+#ifdef CONFIG_CPU_FREQ
+u64 get_cpu_idle_time(unsigned int cpu, u64 *wall, int io)
+{ return reference_cpu_idle_time(cpu, wall, io); }
+#endif
 #include "gov.h"
 """ + src + r"""
 int main(void)
@@ -439,6 +464,23 @@ int main(void)
     online[1] = true; pct = sum = 0;
     j613_floor_sample_cpus(&f, 30000000, &pct, &sum);
     assert(pct == 0 && sum == 0 && f.cpu_wall[1] == 1030 && !locked && !refs);
+    const u64 vectors[][3] = {
+        {0, 0, 1030}, {60, 40, 1030}, {UINT64_MAX, 0, UINT64_MAX},
+        {UINT64_MAX, 1, 1030}, {1, UINT64_MAX, 1030},
+        {UINT64_MAX, UINT64_MAX, 1030}, {0, UINT64_MAX, 0},
+        {UINT64_MAX - 10, 20, UINT64_MAX},
+    };
+    for (unsigned int i = 0; i < sizeof(vectors) / sizeof(vectors[0]); i++) {
+        sample_idle = vectors[i][0]; sample_iowait = vectors[i][1]; sample_wall = vectors[i][2];
+        u64 wall;
+        cpus_read_lock();
+        u64 expected = reference_cpu_idle_time(0, &wall, 0);
+        cpus_read_unlock();
+        f.primed = false; pct = sum = 0;
+        j613_floor_sample_cpus(&f, 30000000, &pct, &sum);
+        for (unsigned int cpu = 0; cpu < 2; cpu++)
+            assert(f.cpu_idle[cpu] == expected && f.cpu_wall[cpu] == wall && !counter_phase[cpu]);
+    }
     return 0;
 }
 """
@@ -446,10 +488,12 @@ int main(void)
         d = Path(d)
         (d / 'gov.h').write_text(HDR.read_text())
         (d / 'sample.c').write_text(harness)
-        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
-                        '-Werror', '-fsanitize=undefined', '-fno-sanitize-recover=all',
-                        str(d / 'sample.c'), '-o', str(d / 'sample')], check=True)
-        subprocess.run([str(d / 'sample')], check=True)
+        for config, flags in [('no-cpufreq', []), ('cpufreq', ['-DCONFIG_CPU_FREQ'])]:
+            subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
+                            '-Werror', '-fsanitize=undefined', '-fno-sanitize-recover=all',
+                            *flags, str(d / 'sample.c'), '-o', str(d / 'sample')], check=True)
+            subprocess.run([str(d / 'sample')], check=True)
+            print(f'pmp-j613-floor: {config} referenced sampling/counter accounting passed')
     print('pmp-j613-floor: referenced sampling, removal and hotplug passed')
 
 
