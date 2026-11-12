@@ -81,17 +81,6 @@ static int link_up_timeout = 500;
 module_param(link_up_timeout, int, 0644);
 MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 
-/*
- * T6040 S2R (bring-up): a real sleep takes a conventional host's power as a
- * resume from disk does, so its ports come back the same way.
- */
-static bool s2r_conventional = true;
-module_param(s2r_conventional, bool, 0644);
-static bool s2r_noirq_up = true;
-module_param(s2r_noirq_up, bool, 0644);
-MODULE_PARM_DESC(s2r_noirq_up, "After a real S2R bring a conventional host's links up in the noirq phase, with what the boot loader had set on the ports put back");
-MODULE_PARM_DESC(s2r_conventional, "Set a conventional host's ports up again after a real S2R, as after a resume from disk");
-
 /* T8103 (original M1) and related SoCs */
 #define CORE_RC_PHYIF_CTL		0x00024
 #define   CORE_RC_PHYIF_CTL_RUN		BIT(0)
@@ -5890,7 +5879,7 @@ static void apple_pcie_stop_for_sleep(struct device *dev)
 }
 
 static void apple_pcie_neo_save_functions(struct apple_pcie *pcie);
-static bool apple_pcie_s2r_conventional(struct apple_pcie *pcie);
+static bool apple_pcie_hib_conventional(struct apple_pcie *pcie);
 static void apple_pcie_hib_save(struct apple_pcie *pcie);
 static void apple_pcie_hib_restore_noirq(struct apple_pcie *pcie, const char *what);
 static void apple_pcie_s2r_up_noirq(struct apple_pcie *pcie);
@@ -6001,7 +5990,7 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 	if (!pcie->hw->tunneled) {
 		if (pm_suspend_no_platform() && pcie->num_pds)
 			return apple_pcie_hold_domains(pcie);
-		if (apple_pcie_s2r_conventional(pcie) && pm_suspend_via_firmware())
+		if (apple_pcie_hib_conventional(pcie) && pm_suspend_via_firmware())
 			apple_pcie_hib_save(pcie);
 		return 0;
 	}
@@ -6494,9 +6483,8 @@ static int apple_pcie_resume_noirq(struct device *dev)
 		return ret;
 	}
 	if (!pcie->hw->tunneled) {
-		if (apple_pcie_s2r_conventional(pcie) && pm_resume_via_firmware()) {
-			if (READ_ONCE(s2r_noirq_up))
-				apple_pcie_s2r_up_noirq(pcie);
+		if (apple_pcie_hib_conventional(pcie) && pm_resume_via_firmware()) {
+			apple_pcie_s2r_up_noirq(pcie);
 			apple_pcie_hib_restore_noirq(pcie, "S2R");
 		}
 		return 0;
@@ -6591,16 +6579,13 @@ static int apple_pcie_prepare(struct device *dev)
  * that resumed it went through the boot loader, and when its kernel did not set the ports up
  * (a boot kernel without the GPIO drivers that probing the host takes), the endpoints sit
  * unpowered or in reset behind a link that is down. The restore then does what probe did.
+ * A real suspend-to-RAM takes the host's power as a resume from disk does, so its ports
+ * come back the same way.
  */
 static bool apple_pcie_hib_conventional(struct apple_pcie *pcie)
 {
 	return !pcie->hw->tunneled && !pcie->managed_sids && !pcie->piodma_supplier &&
 	       !pcie->hw->root_bus_only;
-}
-
-static bool apple_pcie_s2r_conventional(struct apple_pcie *pcie)
-{
-	return READ_ONCE(s2r_conventional) && apple_pcie_hib_conventional(pcie);
 }
 
 /*
@@ -6927,7 +6912,7 @@ static int apple_pcie_resume(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
 
-	if (!apple_pcie_s2r_conventional(pcie) || !pm_resume_via_firmware())
+	if (!apple_pcie_hib_conventional(pcie) || !pm_resume_via_firmware())
 		return 0;
 	apple_pcie_conventional_up(pcie, "S2R");
 	return 0;
