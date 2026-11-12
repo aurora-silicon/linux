@@ -351,8 +351,6 @@ unsafe extern "C" {
     fn asahi_clpc_gpu_get(dev: *mut core::ffi::c_void, out: *mut *mut core::ffi::c_void) -> core::ffi::c_int;
     fn asahi_clpc_gpu_set_active(gpu: *mut core::ffi::c_void, active: bool);
     fn asahi_clpc_gpu_put(gpu: *mut core::ffi::c_void);
-    fn asahi_g17_light_effort() -> u32;
-    fn asahi_g17_light_param(which: core::ffi::c_uint) -> core::ffi::c_uint;
     fn asahi_clpc_gpu_set_busy(gpu: *mut core::ffi::c_void, permille: core::ffi::c_uint);
 }
 
@@ -369,10 +367,43 @@ const LIGHT_WINDOWS: u32 = 4;
 static LIGHT: AtomicBool = AtomicBool::new(false);
 static QUIET_WINDOWS: AtomicU32 = AtomicU32::new(0);
 
+/// A SoC's light effort for quiet GPU work. Light effort runs the same work about twice as
+/// long, so the way back to full effort sits at about twice the way in, or work that fits
+/// light effort sticks at full. Shares in permille of a busy window.
+pub(crate) struct LightEffort {
+    /// Firmware performance effort, of 65536.
+    pub(crate) effort: u32,
+    /// A window below this share with no job longer than `job_enter_us` is quiet.
+    pub(crate) enter_permille: u32,
+    /// Back to full effort from this share, or from a job of `job_exit_us`.
+    pub(crate) exit_permille: u32,
+    pub(crate) job_enter_us: u32,
+    pub(crate) job_exit_us: u32,
+}
+
+static LIGHT_EFFORT: AtomicU32 = AtomicU32::new(0);
+static LIGHT_ENTER: AtomicU32 = AtomicU32::new(0);
+static LIGHT_EXIT: AtomicU32 = AtomicU32::new(0);
+static LIGHT_JOB_ENTER_US: AtomicU32 = AtomicU32::new(0);
+static LIGHT_JOB_EXIT_US: AtomicU32 = AtomicU32::new(0);
+
+/// Takes the SoC's light effort from its configuration; `None` keeps full effort.
+pub(super) fn configure_light(light: Option<&LightEffort>) {
+    let (effort, enter, exit, job_enter, job_exit) = light.map_or((0, 0, 0, 0, 0), |l| {
+        (l.effort, l.enter_permille, l.exit_permille, l.job_enter_us, l.job_exit_us)
+    });
+    LIGHT_ENTER.store(enter, Ordering::Relaxed);
+    LIGHT_EXIT.store(exit, Ordering::Relaxed);
+    LIGHT_JOB_ENTER_US.store(job_enter, Ordering::Relaxed);
+    LIGHT_JOB_EXIT_US.store(job_exit, Ordering::Relaxed);
+    LIGHT.store(false, Ordering::Relaxed);
+    QUIET_WINDOWS.store(0, Ordering::Relaxed);
+    LIGHT_EFFORT.store(effort, Ordering::Relaxed);
+}
+
 /// The effort for the next submission: light once the GPU has been quiet for a while.
 pub(super) fn submission_effort() -> u32 {
-    // SAFETY: reads a module parameter.
-    let light = unsafe { asahi_g17_light_effort() };
+    let light = LIGHT_EFFORT.load(Ordering::Relaxed);
     if LIGHT.load(Ordering::Relaxed) && light != 0 {
         light
     } else {
@@ -380,18 +411,20 @@ pub(super) fn submission_effort() -> u32 {
     }
 }
 
-fn light_param(which: u32) -> u64 {
-    // SAFETY: a plain read of a module parameter.
-    u64::from(unsafe { asahi_g17_light_param(which) })
+fn light_param(param: &AtomicU32) -> u64 {
+    u64::from(param.load(Ordering::Relaxed))
 }
 
 fn light_step(permille: u64, longest_ns: u64) {
+    if LIGHT_EFFORT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     if LIGHT.load(Ordering::Relaxed) {
-        if permille >= light_param(1) || longest_ns >= light_param(3) * 1000 {
+        if permille >= light_param(&LIGHT_EXIT) || longest_ns >= light_param(&LIGHT_JOB_EXIT_US) * 1000 {
             LIGHT.store(false, Ordering::Relaxed);
             QUIET_WINDOWS.store(0, Ordering::Relaxed);
         }
-    } else if permille < light_param(0) && longest_ns < light_param(2) * 1000 {
+    } else if permille < light_param(&LIGHT_ENTER) && longest_ns < light_param(&LIGHT_JOB_ENTER_US) * 1000 {
         if QUIET_WINDOWS.fetch_add(1, Ordering::Relaxed) + 1 >= LIGHT_WINDOWS {
             LIGHT.store(true, Ordering::Relaxed);
         }
@@ -442,9 +475,10 @@ impl Demand {
         }
         let permille = busy.saturating_mul(1000) / elapsed;
         light_step(permille, crate::usage::MAX_NS.swap(0, Ordering::Relaxed));
-        // Full effort does the same work in about half the time; report the share in light
-        // effort's terms so that one memory ladder fits both.
-        let scaled = if LIGHT.load(Ordering::Relaxed) { permille } else { permille * 2 };
+        // Where light effort is configured, full effort does the same work in about half the
+        // time; report the share in light effort's terms so that one memory ladder fits both.
+        let light = LIGHT_EFFORT.load(Ordering::Relaxed) != 0;
+        let scaled = if !light || LIGHT.load(Ordering::Relaxed) { permille } else { permille * 2 };
         // SAFETY: the retained reference is live; NULL denotes no DT provider.
         unsafe { asahi_clpc_gpu_set_busy(self.0, scaled.min(1000) as core::ffi::c_uint) };
     }

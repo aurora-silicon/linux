@@ -30,7 +30,8 @@ def main():
     types = '\n'.join(item(source, s) + ';' for s in [
         'struct apple_clpc_hw {', 'struct apple_clpc_vote {'])
     tables = '\n'.join(item(source, 'static const struct apple_clpc_hw ' + n) + ';'
-                       for n in ['apple_clpc_hw_t8132', 'apple_clpc_hw_t8140', 'apple_clpc_hw_t6040'])
+                       for n in ['apple_clpc_hw_t8132', 'apple_clpc_hw_t8140', 'apple_clpc_hw_t6040',
+                                 'apple_clpc_hw_t6041'])
     methods = '\n'.join(item(source, s) for s in [
         'static unsigned int apple_clpc_vote(', 'static u32 apple_clpc_floor(',
         'static bool apple_clpc_gpu_streaming(',
@@ -177,13 +178,13 @@ static void check_t6040_ane(void) {
  ane.active=true; jiffies=2040; apple_clpc_sample(&c); assert(qos_adds==1 && qos_min==3756000);
 }
 
-// T6040 GPU work takes its floor from the busy share the driver reports:
+// T6041 GPU work takes its floor from the busy share the driver reports:
 // DCS 1, 2, 4 or 5 and fabric 0, 0, 0 or 2, split at 160, 500 and 800
 // permille. A higher level applies at once, a lower one at the first sample
 // at least 400 ms after the last one that asked for the current level or more.
-static void check_t6040_busy(void) {
+static void check_t6041_busy(void) {
  struct apple_clpc_gpu gpu={0};
- struct apple_clpc c={.hw=&apple_clpc_hw_t6040,.agent=1,.mask=3,.gpu=&gpu};
+ struct apple_clpc c={.hw=&apple_clpc_hw_t6041,.agent=1,.mask=3,.gpu=&gpu};
  assert(c.hw->gpu_busy_mid==160 && c.hw->gpu_busy_high==500 && c.hw->gpu_busy_top==800);
  read_error=vote_error=0; pmgr_status=0xf0; pmp_floor=0; published=~0u;
  // No share reported: the top of the table, as before the busy share.
@@ -314,14 +315,14 @@ int main(void) {
  assert(published==0x12 && c.last_reason==1);
  c.clusters[0].request[0]=c.clusters[0].request[1]=0;
  jiffies=264; apple_clpc_sample(&c); assert(published==0);
- check_t6040_busy();
+ check_t6041_busy();
  check_t8132();
  check_read_error();
  check_t8140();
  check_t8140_dense();
  check_t8140_ane();
  check_t6040_ane();
- puts("PASS: T6040 and T8132 host demand; T6040 GPU busy share and down-step hold; T8140 ANE, streaming, dense work, read errors and PMP backoff; idle release");
+ puts("PASS: T6040 and T8132 host demand; T6041 GPU busy share and down-step hold; T8140 ANE, streaming, dense work, read errors and PMP backoff; idle release");
 }
 '''
     code = code.replace('#define APPLE_PMC_RAIL_SHIFT(r) ((r)*8)', rail_shift)

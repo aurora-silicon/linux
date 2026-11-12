@@ -1380,6 +1380,8 @@ static const struct platform_profile_ops apple_clpc_profile_ops = {
 	.profile_set = apple_clpc_profile_set,
 };
 
+static const struct apple_clpc_hw *apple_clpc_machine_hw(const struct apple_clpc_hw *hw);
+
 static int apple_clpc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -1394,7 +1396,7 @@ static int apple_clpc_probe(struct platform_device *pdev)
 
 	clpc->dev = dev;
 	clpc->pmc = dev->parent;
-	clpc->hw = of_device_get_match_data(dev);
+	clpc->hw = apple_clpc_machine_hw(of_device_get_match_data(dev));
 	/* T6040 firmware keeps GFX powered for its whole lifetime. A separate
 	 * host publication/idle input, not that supplier state, drives demand;
 	 * the T8132 and M5 (T8142) GPU drivers report through the same input.
@@ -1643,9 +1645,8 @@ static const struct apple_clpc_hw apple_clpc_hw_t8140 = {
 /*
  * T6040: DCS states 0-5 on rail 0, fabric states 0-2 on rail 1. No cluster
  * runs below a quarter of its maximum (P 1260 of 4512 MHz, E 1020 of
- * 2592 MHz), so the first column only completes the table. Both clusters
- * take their quarters from 4512 MHz, so the E cluster at its top speed
- * (57 %) gets the third column, not the fourth. With the floor held at DCS 5
+ * 2592 MHz), so the first column only completes the table. A busy cluster
+ * in the upper half asks for the top states. With the floor held at DCS 5
  * and fabric 2 the CPUs read 237-242 GB/s at 135 ns DRAM latency, against
  * 41 GB/s and 314 ns at 0 and 0. The second column is provisional until the
  * power of each DCS state is measured.
@@ -1653,34 +1654,24 @@ static const struct apple_clpc_hw apple_clpc_hw_t8140 = {
  * A cluster requests only after three busy samples in a row (12 ms). At idle
  * a single busy sample raised the floor about 60 % of the time, from short
  * bursts of background work; three in a row bring that to about 11 %.
- * GPU demand bypasses the CPU streak and takes its states from gpu_busy by
- * the busy share the GPU driver reports, the qualified DCS 5 / fabric 2 at
- * the top or with no share reported, until publication/in-flight demand
- * ends and HOLD_MS expires.
+ * GPU demand bypasses the CPU streak and uses the same qualified DCS 5 /
+ * fabric 2 states until publication/in-flight demand ends and HOLD_MS expires.
  * GFX supplier power cannot drive this input: firmware keeps it always on.
  */
 static const struct apple_clpc_hw apple_clpc_hw_t6040 = {
 	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
 	.map = {
-		[APPLE_CLPC_DCS] = { 1, 1, 3, 4 },
-		[APPLE_CLPC_SOC] = { 0, 0, 0, 0 },
+		[APPLE_CLPC_DCS] = { 1, 2, 5, 5 },
+		[APPLE_CLPC_SOC] = { 0, 1, 2, 2 },
 	},
 	.sustain = 3,
 	.gpu_demand = false,
 	.gpu_input = true,
-	.gpu_busy = {
-		[APPLE_CLPC_DCS] = { 1, 2, 4, 5 },
-		[APPLE_CLPC_SOC] = { 0, 0, 0, 2 },
-	},
-	.gpu_busy_mid = 160,
-	.gpu_busy_high = 500,
-	.gpu_busy_top = 800,
-	.level_khz = 4512000,
 	/*
 	 * ANE work needs two things its own floor (PMC SoC-max: fabric 2)
 	 * does not give it. ResNet-50 streams about 50 MB of weights per
-	 * inference and runs DRAM bound at DCS 0, so hold the qualified
-	 * DCS 5 / fabric 2. And the engine runs at a speed set by
+	 * inference and runs DRAM bound at DCS 0, so hold the DCS 5 / fabric
+	 * 2 a busy CPU cluster gets. And the engine runs at a speed set by
 	 * the frequency of the second P cluster (cpu-map cluster2), whatever
 	 * runs on it: MobileNetV1 takes 65-375 us of engine time (mean 165)
 	 * with that cluster at its idle frequency and 88-91 us with it at
@@ -1700,6 +1691,58 @@ static const struct apple_clpc_hw apple_clpc_hw_t6040 = {
 	.low_power_khz = 2808000,
 	.low_power_machine = "apple,t6041",
 };
+
+/*
+ * T6041 (M4 Max): the M4 Pro's DCS and fabric states, with the floor scaled
+ * to what the work needs. The M4 Pro shares the CLPC compatible and keeps
+ * apple_clpc_hw_t6040; apple_clpc_probe() picks this table on an
+ * "apple,t6041" machine.
+ *
+ * A busy CPU cluster asks for DCS 1, 1, 3 or 4 and fabric 0. Both clusters
+ * take their quarters from 4512 MHz, so the E cluster at its top speed
+ * (57 %) gets the third column, not the fourth. Measured on a J616c with a
+ * 3 GB/s copy: DCS 0 / fabric 0 5.46 W at 309 ns DRAM latency, DCS 3 6.22 W
+ * at 166 ns, DCS 4 6.92 W at 114 ns, DCS 5 7.04 W at 113 ns; fabric 1 and 2
+ * add 0.3 and 1.4 W with less gain than a DCS step.
+ *
+ * GPU work takes its states from gpu_busy by the busy share the GPU driver
+ * reports, DCS 5 / fabric 2 at the top or with no share reported, until
+ * publication/in-flight demand ends and HOLD_MS expires. Scrolling a
+ * browser went from 24.9 to 22.1 W on AC with this and the G17 light
+ * effort, against the T6040 table.
+ *
+ * The ANE keeps the T6040 rails. Its cluster floor was measured on the
+ * M4 Pro only and is left out here.
+ */
+static const struct apple_clpc_hw apple_clpc_hw_t6041 = {
+	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
+	.map = {
+		[APPLE_CLPC_DCS] = { 1, 1, 3, 4 },
+		[APPLE_CLPC_SOC] = { 0, 0, 0, 0 },
+	},
+	.sustain = 3,
+	.gpu_demand = false,
+	.gpu_input = true,
+	.gpu_busy = {
+		[APPLE_CLPC_DCS] = { 1, 2, 4, 5 },
+		[APPLE_CLPC_SOC] = { 0, 0, 0, 2 },
+	},
+	.gpu_busy_mid = 160,
+	.gpu_busy_high = 500,
+	.gpu_busy_top = 800,
+	.level_khz = 4512000,
+	.ane = { [APPLE_CLPC_DCS] = 5, [APPLE_CLPC_SOC] = 2 },
+	.low_power_khz = 2808000,
+	.low_power_machine = "apple,t6041",
+};
+
+/* The M4 Max shares the M4 Pro's compatible but has its own table. */
+static const struct apple_clpc_hw *apple_clpc_machine_hw(const struct apple_clpc_hw *hw)
+{
+	if (hw == &apple_clpc_hw_t6040 && of_machine_is_compatible("apple,t6041"))
+		return &apple_clpc_hw_t6041;
+	return hw;
+}
 
 /*
  * T8142: DCS states 0-7 on rail 0, fabric states 0-4 on rail 1. The fabric

@@ -252,6 +252,8 @@ pub(crate) struct Config {
     pub(crate) gpu_generation: hw::GpuGen,
     /// The firmware builds this SoC runs.
     pub(crate) firmware: fw::variant::Firmware,
+    /// Lower firmware effort for quiet GPU work; `None` runs every submission at full effort.
+    pub(crate) light_effort: Option<power::LightEffort>,
     /// Layouts of the command buffers that follow the GPU's core layout.
     pub(crate) core_layout: CoreLayout,
 }
@@ -1579,6 +1581,7 @@ impl Gpu {
         cfg: &'static Config,
         regs: regs::G17Resources,
     ) -> Result<Arc<Gpu>> {
+        power::configure_light(cfg.light_effort.as_ref());
         let calibration = if cfg.chip_id == crate::hw::t6040::CHIP_ID {
             Some(calibration::Calibration::read(dev).inspect_err(|_| {
                 dev_err!(
