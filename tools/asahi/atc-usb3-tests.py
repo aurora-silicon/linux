@@ -98,7 +98,7 @@ struct apple_atcphy {
     bool pipe_pending, t8103_dummy_pending, t8103_usb3_retry, t8103_usb3_workaround, mode_dirty, usb_off_pending;
     bool host_active, usb3_port_off, dp_only, ss_tunables, fixed_usb2, t8140_dp_tunables, dp_tunables;
     /* T8132 state: the modeled machines never select that generation. */
-    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables;
+    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
     struct { void *usb3_dp; } tunables;
 };
 struct phy { struct apple_atcphy *data; };
@@ -401,6 +401,10 @@ static void target_mode_table_and_dirty(void) {
  reset(ATCPHY_GENERATION_T8103,false);struct typec_mux_state state={.mode=TYPEC_DP_STATE_D};struct typec_altmode alt={.svid=USB_TYPEC_DP_SID};state.alt=&alt;
  assert(atcphy_typec_target_mode(&p,&state)==APPLE_ATCPHY_MODE_USB3_DP);state.mode=TYPEC_DP_STATE_C;
  assert(atcphy_typec_target_mode(&p,&state)==APPLE_ATCPHY_MODE_DP);
+ /* T8132: 4-lane DP stays DP only on a port marked apple,dp-alt-mode. */
+ hw.gen=ATCPHY_GENERATION_T8132;assert(atcphy_typec_target_mode(&p,&state)==APPLE_ATCPHY_MODE_USB2);
+ p.t8132_dp_alt=true;assert(atcphy_typec_target_mode(&p,&state)==APPLE_ATCPHY_MODE_DP);
+ hw.gen=ATCPHY_GENERATION_T8103;p.t8132_dp_alt=false;
  p.mode=APPLE_ATCPHY_MODE_USB3;p.mode_dirty=true;assert(atcphy_usb3_route(&p,true)==-EBUSY);assert(!muxes&&!configure_calls);
  p.mode_dirty=false;p.usb_off_pending=true;assert(atcphy_usb3_set_mode(&phy,PHY_MODE_USB_HOST,0)==-EBUSY);
 }
@@ -683,6 +687,7 @@ def harness(source):
     scope_c = "static const enum atcphy_generation scope_generations[] = {" + ",".join(r["generation"] for r in scope) + "};\n"
     # The PIPE backend of a mode, which T8132 CIO keeps on the dummy one.
     helpers = [block(source, "static bool atcphy_mode_is_cio("),
+               block(source, "static bool atcphy_t8132_dp_on("),
                block(source, "static enum atcphy_pipehandler_state\natcphy_pipe_state_for(")]
     functions = "\n".join(helpers + [block(source, "static " + kind + " " + name + "(")
                                       for kind, name in function_specs])

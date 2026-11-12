@@ -182,6 +182,7 @@ allOf:
               const: apple,t8132-atcphy
     then:
       properties:
+        apple,dp-alt-mode: false
         apple,tunable-usb3-axi2af: false
         apple,tunable-usb3-lioa: false
         apple,tunable-usb3-fabric: false
@@ -296,6 +297,14 @@ properties:
       port@3:
         $ref: /schemas/graph.yaml#/properties/port
         description: Incoming endpoint from the USB4/Thunderbolt controller.
+
+  apple,dp-alt-mode:
+    type: boolean
+    description: >
+      T8132 only. The board wires this port's SuperSpeed lanes for
+      DisplayPort alternate mode, so 4-lane DP and USB3+DP run the PHY's own
+      DP transmitter instead of falling back to USB. Without it, DP on T8132
+      is only carried in USB4/Thunderbolt tunnels.
 
   apple,tunable-usb3-axi2af:
     $ref: "#/$defs/apple,tunable"

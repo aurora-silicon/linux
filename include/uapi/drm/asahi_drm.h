@@ -96,6 +96,12 @@ enum drm_asahi_ioctl_id {
 
 	/** @DRM_ASAHI_GEM_MADVISE: Mark a VM-private object purgeable or needed. */
 	DRM_ASAHI_GEM_MADVISE,
+
+	/**
+	 * @DRM_ASAHI_GEM_USERPTR: Create a buffer object over the caller's own
+	 * memory (DRM_ASAHI_FEATURE_USERPTR).
+	 */
+	DRM_ASAHI_GEM_USERPTR,
 };
 
 #define DRM_ASAHI_MAX_CLUSTERS	64
@@ -489,6 +495,12 @@ enum drm_asahi_feature {
  */
 #define DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION ((1ULL) << 34)
 
+/*
+ * DRM_ASAHI_FEATURE_USERPTR: DRM_IOCTL_ASAHI_GEM_USERPTR is available. A
+ * feature bit like those of enum drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_USERPTR ((1ULL) << 37)
+
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
 #define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2
 
@@ -671,6 +683,12 @@ enum drm_asahi_gem_flags {
 	 * @DRM_ASAHI_GEM_VM_PRIVATE: BO is private to this GPU VM (no exports).
 	 */
 	DRM_ASAHI_GEM_VM_PRIVATE = (1L << 1),
+
+	/**
+	 * @DRM_ASAHI_GEM_USERPTR_READ_ONLY: The GPU only reads the memory of a
+	 * DRM_IOCTL_ASAHI_GEM_USERPTR object. Only that ioctl accepts it.
+	 */
+	DRM_ASAHI_GEM_USERPTR_READ_ONLY = (1L << 2),
 };
 
 /**
@@ -681,6 +699,75 @@ struct drm_asahi_gem_create {
 	__u64 size;
 
 	/** @flags: Combination of drm_asahi_gem_flags flags. */
+	__u32 flags;
+
+	/**
+	 * @vm_id: VM ID to assign to the BO, if DRM_ASAHI_GEM_VM_PRIVATE is set
+	 */
+	__u32 vm_id;
+
+	/** @handle: Returned GEM handle for the BO */
+	__u32 handle;
+
+	/** @pad: MBZ */
+	__u32 pad;
+};
+
+/**
+ * struct drm_asahi_gem_userptr - Arguments passed to
+ * DRM_IOCTL_ASAHI_GEM_USERPTR
+ *
+ * Creates a buffer object whose backing is the caller's memory at
+ * [@userptr, @userptr + @size), without a copy: the CPU accesses it through
+ * the caller's own mapping, and the GPU through VM_BIND mappings of the
+ * object, as for any other object. Available when DRM_ASAHI_FEATURE_USERPTR
+ * is set; otherwise the ioctl fails with EOPNOTSUPP or EINVAL.
+ *
+ * The pages of the range are pinned when the object is created and stay
+ * pinned until it is freed: all of them or, on failure, none. They are the
+ * pages the range maps at creation; later changes to the caller's mappings
+ * (munmap, mremap, a new mapping over the range, truncating a mapped file)
+ * leave the object on those pages, which stay allocated until it is freed.
+ * After fork(), the child gets copies of the pinned anonymous pages; the
+ * object stays the parent's memory. The CPU and GPU views are coherent
+ * without cache maintenance.
+ *
+ * The pinned pages count against the caller's RLIMIT_MEMLOCK, together with
+ * its other long-term pins, unless it has CAP_IPC_LOCK (ENOMEM otherwise),
+ * and their size against the client and device limits of
+ * drm_asahi_params_global::client_memory_limit and
+ * drm_asahi_params_global::memory_limit (ENOMEM). They are never released by
+ * memory-pressure reclaim.
+ *
+ * Without DRM_ASAHI_GEM_USERPTR_READ_ONLY, the whole range must be mapped
+ * writable, and not be a shared mapping of a file whose filesystem tracks
+ * writes. With it, any readable mapping is accepted, and the object takes
+ * only GPU read-only VM_BIND mappings (a mapping with DRM_ASAHI_BIND_WRITE
+ * fails with EACCES). Pages of private mappings, file mappings included, are
+ * pinned as the caller's own copies, as a write would make them: a private
+ * file mapping is copied out of the page cache. A read-only shared file
+ * mapping pins the page-cache pages themselves, which then stay resident
+ * while the object lives. Device and PFN mappings, including CPU mappings of
+ * other buffer objects, are refused (EFAULT).
+ *
+ * The object cannot be mapped with DRM_IOCTL_ASAHI_GEM_MMAP_OFFSET, exported,
+ * given advice with DRM_IOCTL_ASAHI_GEM_MADVISE, bound with
+ * DRM_IOCTL_ASAHI_GEM_BIND_OBJECT or registered as a VM status mirror (all
+ * EINVAL).
+ */
+struct drm_asahi_gem_userptr {
+	/**
+	 * @userptr: Start of the range, aligned to both the CPU page size and
+	 * the GPU page size (16 KiB).
+	 */
+	__u64 userptr;
+
+	/** @size: Size of the range, a non-zero multiple of both page sizes. */
+	__u64 size;
+
+	/**
+	 * @flags: DRM_ASAHI_GEM_VM_PRIVATE and DRM_ASAHI_GEM_USERPTR_READ_ONLY.
+	 */
 	__u32 flags;
 
 	/**
@@ -2193,6 +2280,7 @@ enum {
 	DRM_IOCTL_ASAHI_QUEUE_DESTROY    = DRM_IOCTL_ASAHI(W, QUEUE_DESTROY, queue_destroy),
 	DRM_IOCTL_ASAHI_SUBMIT           = DRM_IOCTL_ASAHI(W, SUBMIT, submit),
 	DRM_IOCTL_ASAHI_GEM_MADVISE      = DRM_IOCTL_ASAHI(WR, GEM_MADVISE, gem_madvise),
+	DRM_IOCTL_ASAHI_GEM_USERPTR      = DRM_IOCTL_ASAHI(WR, GEM_USERPTR, gem_userptr),
 };
 
 #if defined(__cplusplus)

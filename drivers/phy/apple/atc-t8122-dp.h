@@ -349,6 +349,14 @@ static inline void atc_t8122_dp_rxtx_power(void __iomem *core, unsigned int pair
 	}
 }
 
+/*
+ * How the T8132 lane start differs from the T8122 one; 0 is the T8122
+ * sequence.
+ */
+#define ATC_T8132_DP_START_EQ BIT(0)	/* both blocks start at swing 0 / pre-emphasis 0 */
+#define ATC_T8132_DP_VREF BIT(1)	/* RX VREF filter 3, held over both DTVREG enables */
+#define ATC_T8132_DP_NO_LDOCLK_BYPASS BIT(2)	/* HBR3: no LDOCLK1 bypass in the TX start */
+
 /* Override the receiver feedback path before the PMA lane reset is released */
 static inline void atc_t8122_dp_lane_pre_reset(void __iomem *core, unsigned int pair)
 {
@@ -357,7 +365,8 @@ static inline void atc_t8122_dp_lane_pre_reset(void __iomem *core, unsigned int 
 			  ATC_T8122_DFE10_DFEH1FB_EN_OV);
 }
 
-static inline void atc_t8122_dp_tx_start(void __iomem *core, unsigned int pair, bool div2)
+static inline void atc_t8122_dp_tx_start(void __iomem *core, unsigned int pair, bool div2,
+					 unsigned int flags)
 {
 	void __iomem *top = atc_t8122_dp_lane(core, pair, ATC_T8122_TX_TOP);
 	void __iomem *shm = atc_t8122_dp_lane(core, pair, ATC_T8122_TX_SHM);
@@ -382,9 +391,11 @@ static inline void atc_t8122_dp_tx_start(void __iomem *core, unsigned int pair, 
 	atc_t8122_dp_mask(top + ATC_T8122_TX_EQ17, ATC_T8122_EQ17_DEEMPH,
 			  ATC_T8122_TX_EQ17_INIT);
 
-	atc_t8122_dp_mask(shm + ATC_T8122_TX_LDOCLK1, 0, ATC_T8122_LDOCLK1_BYPASS_SMALL);
-	ndelay(250);
-	atc_t8122_dp_mask(shm + ATC_T8122_TX_LDOCLK1, 0, ATC_T8122_LDOCLK1_BYPASS_BIG);
+	if (!(flags & ATC_T8132_DP_NO_LDOCLK_BYPASS)) {
+		atc_t8122_dp_mask(shm + ATC_T8122_TX_LDOCLK1, 0, ATC_T8122_LDOCLK1_BYPASS_SMALL);
+		ndelay(250);
+		atc_t8122_dp_mask(shm + ATC_T8122_TX_LDOCLK1, 0, ATC_T8122_LDOCLK1_BYPASS_BIG);
+	}
 	udelay(1);
 
 	atc_t8122_dp_mask(shm + ATC_T8122_TX_MAIN2,
@@ -403,10 +414,12 @@ static inline void atc_t8122_dp_tx_start(void __iomem *core, unsigned int pair, 
 			  ATC_T8122_CLKMON1_HIZ_OV);
 }
 
-static inline void atc_t8122_dp_rxtx_start(void __iomem *core, unsigned int pair, bool div2)
+static inline void atc_t8122_dp_rxtx_start(void __iomem *core, unsigned int pair, bool div2,
+					   unsigned int flags)
 {
 	void __iomem *top = atc_t8122_dp_lane(core, pair, ATC_T8122_RX_TOP);
 	void __iomem *shm = atc_t8122_dp_lane(core, pair, ATC_T8122_RX_SHM);
+	bool vref;
 
 	atc_t8122_dp_mask(top + ATC_T8122_RX_TXMODE, 0, ATC_T8122_RX_TXMODE_EN);
 	atc_t8122_dp_mask(top + ATC_T8122_RX_DCO1, ATC_T8122_DCO1_LPBKIN_RECOVERED_DATA,
@@ -444,20 +457,32 @@ static inline void atc_t8122_dp_rxtx_start(void __iomem *core, unsigned int pair
 			  ATC_T8122_DFE12_TX_BYTECLK_SYNC_CLR_OV);
 	ndelay(100);
 
+	/*
+	 * T8132 keeps the VREF filter adjust at 3 until both DTVREG stages are
+	 * enabled; T8122 sets 1 and clears it before them.
+	 */
+	vref = flags & ATC_T8132_DP_VREF;
 	atc_t8122_dp_mask(shm + ATC_T8122_RX_VREF22,
 			  ATC_T8122_VREF22_EN | ATC_T8122_VREF22_FILTER_ADJUST,
-			  ATC_T8122_VREF22_EN | FIELD_PREP(ATC_T8122_VREF22_FILTER_ADJUST, 1));
+			  ATC_T8122_VREF22_EN |
+			  FIELD_PREP(ATC_T8122_VREF22_FILTER_ADJUST, vref ? 3 : 1));
 	atc_t8122_dp_mask(shm + ATC_T8122_RX_VREF23, ATC_T8122_VREF23_BOOST,
 			  FIELD_PREP(ATC_T8122_VREF23_BOOST, 1));
 	ndelay(500);
-	atc_t8122_dp_mask(shm + ATC_T8122_RX_VREF22, ATC_T8122_VREF22_FILTER_ADJUST, 0);
-	ndelay(200);
+	if (!vref) {
+		atc_t8122_dp_mask(shm + ATC_T8122_RX_VREF22, ATC_T8122_VREF22_FILTER_ADJUST, 0);
+		ndelay(200);
+	}
 	atc_t8122_dp_mask(shm + ATC_T8122_RX_DFE11, 0,
 			  ATC_T8122_DFE11_DTVREG_SMALL_EN | ATC_T8122_DFE11_DTVREG_SMALL_EN_OV);
-	ndelay(200);
+	ndelay(vref ? 500 : 200);
 	atc_t8122_dp_mask(shm + ATC_T8122_RX_DFE11, 0,
 			  ATC_T8122_DFE11_DTVREG_BIG_EN | ATC_T8122_DFE11_DTVREG_BIG_EN_OV);
-	ndelay(200);
+	ndelay(vref ? 500 : 200);
+	if (vref) {
+		atc_t8122_dp_mask(shm + ATC_T8122_RX_VREF22, ATC_T8122_VREF22_FILTER_ADJUST, 0);
+		ndelay(200);
+	}
 	atc_t8122_dp_mask(shm + ATC_T8122_RX_VREF23, ATC_T8122_VREF23_BOOST,
 			  FIELD_PREP(ATC_T8122_VREF23_BOOST, 3));
 	udelay(1);
@@ -492,10 +517,18 @@ static inline void atc_t8122_dp_rxtx_start(void __iomem *core, unsigned int pair
 	ndelay(100);
 }
 
-static inline void atc_t8122_dp_lane_start(void __iomem *core, unsigned int pair, bool div2)
+static inline void atc_t8122_dp_lane_drive(void __iomem *core, unsigned int pair, bool tx,
+					   u32 preset);
+
+static inline void atc_t8122_dp_lane_start(void __iomem *core, unsigned int pair, bool div2,
+					   unsigned int flags)
 {
-	atc_t8122_dp_tx_start(core, pair, div2);
-	atc_t8122_dp_rxtx_start(core, pair, div2);
+	atc_t8122_dp_tx_start(core, pair, div2, flags);
+	atc_t8122_dp_rxtx_start(core, pair, div2, flags);
+	if (flags & ATC_T8132_DP_START_EQ) {
+		atc_t8122_dp_lane_drive(core, pair, true, atc_t8122_dp_presets[0][0]);
+		atc_t8122_dp_lane_drive(core, pair, false, atc_t8122_dp_presets[0][0]);
+	}
 }
 
 static inline void atc_t8122_dp_lane_stop(void __iomem *core, unsigned int pair)
