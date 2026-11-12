@@ -1561,11 +1561,16 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 					      (ep->dcp->fw_compat == DCP_FIRMWARE_H17P || ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0),
 					      ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0);
 		if (ret == -ENOENT &&
-		    ep->dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G) {
+		    (ep->dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G ||
+		     (ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+		      ep->dcp->hw.firmware_compat == DCP_FIRMWARE_H17P))) {
 			/*
 			 * M5 (H17G) announces powerlog-service with only
-			 * ep-has-desc-mgr and interface-id; match it by the
-			 * announced name, as for props-less announces.
+			 * ep-has-desc-mgr and interface-id, on 26.x and on
+			 * firmware 27 alike (the T8142, an H17P-generation
+			 * processor, is the one that runs firmware 27); match
+			 * it by the announced name, as for props-less
+			 * announces.
 			 */
 			epic_name = NULL;
 			epic_class = NULL;
