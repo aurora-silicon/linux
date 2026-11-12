@@ -46,10 +46,13 @@ properties:
 
   apple,reset-inherited-usb2-connection:
     type: boolean
-    description:
-      The boot USB port retains a USB2 repeater connection that cannot be
-      recovered by resetting the host PHY. Renegotiate a normal application
-      connection before starting the host controllers. Debug routes are preserved.
+    description: |
+      A connection that is up when the OS starts keeps state from the boot
+      chain that resetting the host PHY does not recover: a USB2 repeater
+      connection on the boot port (J716c), or a Type-C retimer set up before
+      the host PHY ran, which keeps SuperSpeed from training (J575c).
+      Renegotiate a normal application connection before starting the host
+      controllers. Debug routes are preserved.
 
 required:
   - compatible
