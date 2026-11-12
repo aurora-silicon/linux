@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple Mac Studio (M5 Max, 2026) with the Neural Engine enabled, for a
+ * trial boot: J775c plus ANE_SYS, the three ANE DART instances and the
+ * ANE. The DARTs probe at boot (powering ANE_SYS); the ANE engine itself
+ * is only touched from firmware_stage, after the loader hand-off.
+ */
+
+#include "t6050-j775c.dts"
+
+&ps_ane_sys {
+	status = "okay";
+};
+
+&ane_dart0 {
+	status = "okay";
+};
+
+&ane_dart1 {
+	status = "okay";
+};
+
+&ane_dart2 {
+	status = "okay";
+};
+
+&ane {
+	status = "okay";
+};

@@ -1,0 +1,416 @@
+/* J775c rear USB4 routers. Per-controller resources and tunables from J775c ADT. */
+
+
+&{/aliases} {
+	usb4-0-acio = &acio0;
+	usb4-0-nhi = &acio0_nhi;
+	usb4-1-acio = &acio1;
+	usb4-1-nhi = &acio1_nhi;
+	usb4-2-acio = &acio2;
+	usb4-2-nhi = &acio2_nhi;
+	usb4-3-acio = &acio3;
+	usb4-3-nhi = &acio3_nhi;
+};
+
+
+&pmgr0 {
+
+	ps_atc0_cio: power-controller@280 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x280 4>;
+		label = "atc0_cio";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc0_common>;
+	};
+
+	ps_atc0_cio_pcie: power-controller@338 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x338 4>;
+		label = "atc0_cio_pcie";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc0_cio>;
+	};
+
+	ps_atc0_cio_usb: power-controller@340 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x340 4>;
+		label = "atc0_cio_usb";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc0_cio>;
+	};
+
+	ps_atc0_cio_auss: power-controller@348 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x348 4>;
+		label = "atc0_cio_auss";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc0_cio>, <&ps_auss>;
+	};
+
+	ps_atc1_cio: power-controller@290 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x290 4>;
+		label = "atc1_cio";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc1_common>;
+	};
+
+	ps_atc1_cio_pcie: power-controller@350 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x350 4>;
+		label = "atc1_cio_pcie";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc1_cio>;
+	};
+
+	ps_atc1_cio_usb: power-controller@358 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x358 4>;
+		label = "atc1_cio_usb";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc1_cio>;
+	};
+
+	ps_atc1_cio_auss: power-controller@360 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x360 4>;
+		label = "atc1_cio_auss";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc1_cio>, <&ps_auss>;
+	};
+
+	ps_atc2_cio: power-controller@2e8 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2e8 4>;
+		label = "atc2_cio";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc2_common>;
+	};
+
+	ps_atc2_cio_pcie: power-controller@3f8 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3f8 4>;
+		label = "atc2_cio_pcie";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc2_cio>;
+	};
+
+	ps_atc2_cio_usb: power-controller@400 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x400 4>;
+		label = "atc2_cio_usb";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc2_cio>;
+	};
+
+	ps_atc2_cio_auss: power-controller@408 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x408 4>;
+		label = "atc2_cio_auss";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc2_cio>, <&ps_auss>;
+	};
+
+	ps_atc3_cio: power-controller@2f8 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2f8 4>;
+		label = "atc3_cio";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc3_common>;
+	};
+
+	ps_atc3_cio_pcie: power-controller@410 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x410 4>;
+		label = "atc3_cio_pcie";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc3_cio>;
+	};
+
+	ps_atc3_cio_usb: power-controller@418 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x418 4>;
+		label = "atc3_cio_usb";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc3_cio>;
+	};
+
+	ps_atc3_cio_auss: power-controller@420 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x420 4>;
+		label = "atc3_cio_auss";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc3_cio>, <&ps_auss>;
+	};
+
+	ps_auss: power-controller@248 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x248 4>;
+		label = "auss";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		apple,always-on;
+	};
+};
+
+
+&atc0_phy {
+	apple,tunable-lane0-rx-top-cio = <0x35c 0xe00 0x200>;
+	apple,tunable-lane1-rx-top-cio = <0x35c 0xe00 0x200>;
+};
+
+
+&atc1_phy {
+	apple,tunable-lane0-rx-top-cio = <0x35c 0xe00 0x200>;
+	apple,tunable-lane1-rx-top-cio = <0x35c 0xe00 0x200>;
+};
+
+
+&atc2_phy {
+	apple,tunable-lane0-rx-top-cio = <0x35c 0xe00 0x200>;
+	apple,tunable-lane1-rx-top-cio = <0x35c 0xe00 0x200>;
+};
+
+
+&atc3_phy {
+	apple,tunable-lane0-rx-top-cio = <0x35c 0xe00 0x200>;
+	apple,tunable-lane1-rx-top-cio = <0x35c 0xe00 0x200>;
+};
+
+
+&pinctrl_aop {
+	/* Keep HDMI GPIO 14 available, and reserve every pin except CIO LSTX 77/79/81/83. */
+	gpio-reserved-ranges = <0 14>, <15 62>, <78 1>, <80 1>, <82 1>, <84 1>;
+	status = "okay";
+
+
+
+	acio2_lstx_pins: acio2-lstx-pins {
+		pinmux = <0x10051>;
+	};
+
+
+};
+
+
+&hpm0 {
+	connector {
+		ports {
+			port@3 {
+				reg = <3>;
+				hpm0_usb4: endpoint {
+					remote-endpoint = <&acio0_tbt>;
+				};
+			};
+		};
+	};
+};
+
+
+&hpm1 {
+	connector {
+		ports {
+			port@3 {
+				reg = <3>;
+				hpm1_usb4: endpoint {
+					remote-endpoint = <&acio1_tbt>;
+				};
+			};
+		};
+	};
+};
+
+
+&hpm2 {
+	connector {
+		ports {
+			port@3 {
+				reg = <3>;
+				hpm2_usb4: endpoint {
+					remote-endpoint = <&acio2_tbt>;
+				};
+			};
+		};
+	};
+};
+
+
+&hpm3 {
+	connector {
+		ports {
+			port@3 {
+				reg = <3>;
+				hpm3_usb4: endpoint {
+					remote-endpoint = <&acio3_tbt>;
+				};
+			};
+		};
+	};
+};
+
+
+&{/soc} {
+	cio_reconfig0: cio_reset: reset-controller@280620000 {
+		compatible = "apple,t6050-cio-reset";
+		reg = <0x2 0x80620000 0x0 0x4000>;
+		#reset-cells = <1>;
+	};
+
+
+
+
+
+	acio2_mbox: mailbox@381108000 {
+		compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x81108000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 857 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 858 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 859 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 860 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+#if !(defined(T6050_J714C) || defined(T6050_J714S) || defined(T6050_J716C))
+		status = "disabled";
+#endif
+	};
+
+	acio2: acio@381ac0000 {
+		compatible = "apple,t6050-usb4-acio";
+		reg = <0x3 0x81ac0000 0x0 0xc000>,
+		      <0x3 0x81080000 0x0 0x26000>,
+		      <0x3 0x81e44000 0x0 0x4000>,
+		      <0x3 0x81100000 0x0 0x4000>,
+		      <0x3 0x81c80000 0x0 0x4000>;
+		reg-names = "rc", "sram", "pcie-adapter", "cpu", "router-ap-fw";
+		mboxes = <&acio2_mbox>;
+		resets = <&cio_reconfig0 2>;
+		power-domains = <&ps_atc2_cio>, <&ps_atc2_cio_pcie>,
+				<&ps_atc2_cio_usb>, <&ps_atc2_cio_auss>;
+		thunderbolt-switch;
+#if !(defined(T6050_J714C) || defined(T6050_J714S) || defined(T6050_J716C))
+		status = "disabled";
+#endif
+		pinctrl-0 = <&acio2_lstx_pins>;
+		pinctrl-names = "lstx";
+		lstx-gpios = <&pinctrl_aop 81 GPIO_ACTIVE_HIGH>;
+
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges = <0x0 0x3 0x81000000 0x1000000>;
+		nonposted-mmio;
+
+		/*
+		 * /arm-io/dart-acio2, populated with the NHI once the router runs, so that it is
+		 * first read with the router up. Nothing initialises it before Linux: its tunables
+		 * (dart-tunables-instance-0), stream 15 (bypass-15) in bypass, every error
+		 * reported and the context cache flushed. vm-base 0x100_0000_0000.
+		 */
+		acio2_dart: iommu@a80000 {
+			compatible = "apple,t6050-dart", "apple,t8110-dart";
+			reg = <0xa80000 0xc000>;
+			interrupts = <AIC_IRQ 0 1670 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_atc2_cio>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x4000 0x0 0xffff0000>;
+			apple,bypass-sids = <15>;
+			apple,full-error-reporting;
+			apple,ctc-flush;
+		};
+
+		/* Interrupts 0x66b.. are the TX rings and 0x677.. the RX rings */
+		acio2_nhi: nhi@f00000 {
+			compatible = "apple,t6050-usb4-nhi";
+			reg = <0xf00000 0x100000>;
+			reg-names = "nhi";
+			/* The board or boot loader supplies the host DROM. */
+			apple,thunderbolt-drom = [00];
+			interrupts = <AIC_IRQ 0 1643 IRQ_TYPE_LEVEL_HIGH>,
+					     <AIC_IRQ 0 1644 IRQ_TYPE_LEVEL_HIGH>,
+					     <AIC_IRQ 0 1645 IRQ_TYPE_LEVEL_HIGH>,
+					     <AIC_IRQ 0 1646 IRQ_TYPE_LEVEL_HIGH>,
+					     <AIC_IRQ 0 1647 IRQ_TYPE_LEVEL_HIGH>,
+					     <AIC_IRQ 0 1648 IRQ_TYPE_LEVEL_HIGH>,
+					     <AIC_IRQ 0 1649 IRQ_TYPE_LEVEL_HIGH>,
+					     <AIC_IRQ 0 1650 IRQ_TYPE_LEVEL_HIGH>,
+					     <AIC_IRQ 0 1651 IRQ_TYPE_LEVEL_HIGH>,
+					     <AIC_IRQ 0 1652 IRQ_TYPE_LEVEL_HIGH>,
+					     <AIC_IRQ 0 1653 IRQ_TYPE_LEVEL_HIGH>,
+					     <AIC_IRQ 0 1654 IRQ_TYPE_LEVEL_HIGH>,
+					     <AIC_IRQ 0 1655 IRQ_TYPE_LEVEL_HIGH>,
+					     <AIC_IRQ 0 1656 IRQ_TYPE_LEVEL_HIGH>,
+					     <AIC_IRQ 0 1657 IRQ_TYPE_LEVEL_HIGH>,
+					     <AIC_IRQ 0 1658 IRQ_TYPE_LEVEL_HIGH>,
+					     <AIC_IRQ 0 1659 IRQ_TYPE_LEVEL_HIGH>,
+					     <AIC_IRQ 0 1660 IRQ_TYPE_LEVEL_HIGH>,
+					     <AIC_IRQ 0 1661 IRQ_TYPE_LEVEL_HIGH>,
+					     <AIC_IRQ 0 1662 IRQ_TYPE_LEVEL_HIGH>,
+					     <AIC_IRQ 0 1663 IRQ_TYPE_LEVEL_HIGH>,
+					     <AIC_IRQ 0 1664 IRQ_TYPE_LEVEL_HIGH>,
+					     <AIC_IRQ 0 1665 IRQ_TYPE_LEVEL_HIGH>,
+					     <AIC_IRQ 0 1666 IRQ_TYPE_LEVEL_HIGH>,
+					     <AIC_IRQ 0 1672 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "txring0", "txring1", "txring2", "txring3", "txring4", "txring5",
+						  "txring6", "txring7", "txring8", "txring9", "txring10", "txring11",
+						  "rxring0", "rxring1", "rxring2", "rxring3", "rxring4", "rxring5",
+						  "rxring6", "rxring7", "rxring8", "rxring9", "rxring10", "rxring11",
+						  "parity";
+			iommus = <&acio2_dart 0>,
+				 <&acio2_dart 1>,
+				 <&acio2_dart 2>,
+				 <&acio2_dart 3>,
+				 <&acio2_dart 4>,
+				 <&acio2_dart 5>,
+				 <&acio2_dart 6>,
+				 <&acio2_dart 7>,
+				 <&acio2_dart 8>,
+				 <&acio2_dart 9>,
+				 <&acio2_dart 10>,
+				 <&acio2_dart 11>,
+				 <&acio2_dart 16>,
+				 <&acio2_dart 17>,
+				 <&acio2_dart 18>,
+				 <&acio2_dart 19>,
+				 <&acio2_dart 20>,
+				 <&acio2_dart 21>,
+				 <&acio2_dart 22>,
+				 <&acio2_dart 23>,
+				 <&acio2_dart 24>,
+				 <&acio2_dart 25>,
+				 <&acio2_dart 26>,
+				 <&acio2_dart 27>;
+		};
+	};
+
+
+
+};
+
+/* The inherited USB DARTs have no secure-monitor power-down operation in
+ * Linux's direct T8110 backend. Do not cut their domain from pre-freezer
+ * Type-C teardown or system PM. Router-only CIO domains remain cycleable.
+ * Keeping USB also retains its AON/common suppliers for wake. This can be
+ * relaxed only with a qualified DART ownership/power-down handoff. */
+&ps_atc0_usb { apple,always-on; };
+&ps_atc1_usb { apple,always-on; };
+&ps_atc2_usb { apple,always-on; };
+&ps_atc3_usb { apple,always-on; };
+
+&acio2_mbox { status = "okay"; };
+&acio2 { status = "okay"; port { acio2_tbt: endpoint { remote-endpoint = <&hpm2_usb4>; }; }; };
