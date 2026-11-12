@@ -2704,12 +2704,13 @@ static bool dcp_hdr_output_supported(struct apple_dcp *dcp)
 }
 
 /*
- * A desktop 26.x panel keeps its SDR link and shows PQ content as EDR, with
- * the peak the firmware reports for it (see res_max_panel_brightness()).
+ * A desktop 26.x or firmware 27 panel keeps its SDR link and shows PQ
+ * content as EDR, given the panel's peak (see res_max_panel_brightness()).
  */
 static bool dcp_panel_edr_supported(struct apple_dcp *dcp)
 {
-	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
+	return (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+		dcp->fw_compat == DCP_FIRMWARE_V_27_0) &&
 	       dcp_has_panel(dcp) && READ_ONCE(dcp->panel.peak_nits);
 }
 
@@ -3357,6 +3358,7 @@ bool iomfb_apply_backlight_h17p(struct apple_dcp *dcp,
 			return true;
 		if (!dcp->brightness.maximum)
 			return false;
+		dcp->edr_present_sdr = 0;
 		iomfb_encode_backlight_h17p(wire, 0,
 					    dcp->brightness.maximum, false);
 		return true;
@@ -3380,6 +3382,7 @@ bool iomfb_apply_backlight_h17p(struct apple_dcp *dcp,
 		transaction->backlight = present;
 		transaction->backlight_reserved = true;
 	}
+	dcp->edr_present_sdr = present.nits;
 	iomfb_encode_backlight_h17p(wire, present.nits,
 				    dcp->brightness.maximum, !ret);
 	return true;
@@ -3682,11 +3685,14 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 		return;
 	}
 
-	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
+	if ((dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+	     dcp->fw_compat == DCP_FIRMWARE_V_27_0) &&
 	    READ_ONCE(dcp->mode_state.valid) && dcp->connector &&
 	    READ_ONCE(dcp->connector->connected)) {
+		/* A panel's EDR switches without a mode set (dcp_edr_live()). */
 		dcp_edr_sync(dcp, crtc, commit);
-		dcp_hdr_metadata_sync(dcp, crtc, commit);
+		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+			dcp_hdr_metadata_sync(dcp, crtc, commit);
 	}
 
 	if (iomfb_uses_queue(dcp)) {

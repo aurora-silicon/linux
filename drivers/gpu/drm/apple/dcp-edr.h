@@ -4,6 +4,7 @@
 #ifndef __APPLE_DCP_EDR_H__
 #define __APPLE_DCP_EDR_H__
 
+#include <linux/bits.h>
 #include <linux/limits.h>
 #include <linux/math64.h>
 #include <linux/minmax.h>
@@ -61,6 +62,36 @@ static inline u32 dcp_edr_next(u32 cur, u32 target, u32 prev_sdr, u32 sdr)
 		return min_t(u64, div_u64((u64)cur * prev_sdr + sdr / 2, sdr), target);
 	return min_t(u64, div_u64((u64)cur * DCP_EDR_STEP_UP, DCP_EDR_UNITY) + 1,
 		     target);
+}
+
+/* The binary64 nearest @num / @den, for small positive integers. */
+static inline u64 dcp_binary64_ratio(u64 num, u64 den)
+{
+	u64 mantissa = 0;
+	int exponent = 0;
+
+	while (num >= 2 * den) {
+		den <<= 1;
+		exponent++;
+	}
+	while (num < den) {
+		num <<= 1;
+		exponent--;
+	}
+	/* den <= num < 2 den: 53 quotient bits, then round to nearest */
+	for (unsigned int i = 0; i < 53; i++) {
+		mantissa <<= 1;
+		if (num >= den) {
+			mantissa |= 1;
+			num -= den;
+		}
+		num <<= 1;
+	}
+	if (num >= den && ++mantissa == 1ULL << 53) {
+		mantissa >>= 1;
+		exponent++;
+	}
+	return (u64)(exponent + 1023) << 52 | (mantissa & GENMASK_ULL(51, 0));
 }
 
 #endif /* __APPLE_DCP_EDR_H__ */

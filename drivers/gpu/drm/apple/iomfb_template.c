@@ -126,36 +126,6 @@ static void dcp_swap_set_brightness(struct DCP_FW_NAME(dcp_swap) *swap, u32 nits
 	put_unaligned_le64(bits, &swap->bl_nits);
 }
 
-/* The binary64 nearest @num / @den, for small positive integers. */
-static u64 dcp_binary64_ratio(u64 num, u64 den)
-{
-	u64 mantissa = 0;
-	int exponent = 0;
-
-	while (num >= 2 * den) {
-		den <<= 1;
-		exponent++;
-	}
-	while (num < den) {
-		num <<= 1;
-		exponent--;
-	}
-	/* den <= num < 2 den: 53 quotient bits, then round to nearest */
-	for (unsigned int i = 0; i < 53; i++) {
-		mantissa <<= 1;
-		if (num >= den) {
-			mantissa |= 1;
-			num -= den;
-		}
-		num <<= 1;
-	}
-	if (num >= den && ++mantissa == 1ULL << 53) {
-		mantissa >>= 1;
-		exponent++;
-	}
-	return (u64)(exponent + 1023) << 52 | (mantissa & GENMASK_ULL(51, 0));
-}
-
 /*
  * EDR on a desktop 26.x panel, as macOS drives it.  With applied headroom H
  * (x1000 below), a swap asks for brightness SDR white x H, display EDR
@@ -376,6 +346,60 @@ static void dcp_external_stamp_submit(struct apple_dcp *dcp, struct dcp_swap_v27
 	if (dcp_external_swap_stamps(dcp) && swap->timestamp[1])
 		swap->timestamp[0] = swap->timestamp[4] = swap->timestamp[6] = dcp_swap_time();
 }
+
+/*
+ * EDR on a firmware 27 panel, as macOS 27 drives it (a DCP trace on the M5
+ * Pro): its swaps carry the desktop 26.x brightness block, at the same
+ * offsets, and take the same steps as dcp_edr_prepare().  With headroom H a
+ * swap asks for brightness SDR white x H, EDR scale 1 / H and, while the
+ * frame uses EDR, headroom used H.  macOS also sends the brightness limit,
+ * 1.3 x the brightness, whenever that limit is above 400 nits.  @carries:
+ * the swap already carries a brightness change; @sdr: its SDR white.
+ */
+static void dcp_edr_prepare_v27(struct apple_dcp *dcp, struct dcp_swap_v27 *swap,
+				bool carries, u32 sdr)
+{
+	u32 cur = dcp->edr_hm ?: DCP_EDR_UNITY, target = DCP_EDR_UNITY, next;
+	u32 prev_sdr = dcp->edr_sdr;
+	bool restart = dcp->edr_restart;
+	u64 bri;
+
+	dcp->edr_restart = false;
+	if ((!dcp->output_edr && !dcp->edr_hm) || !sdr)
+		return;
+	if (dcp->output_edr)
+		target = dcp_edr_target(READ_ONCE(dcp->panel.peak_nits), sdr,
+					dcp->panel.edr_ceiling);
+	if (restart && dcp->output_edr) {
+		cur = DCP_EDR_UNITY;
+		prev_sdr = sdr;
+	}
+	dcp->edr_sdr = sdr;
+	if (cur == target && !carries && !restart && dcp->edr_sent == dcp->output_edr)
+		return;
+
+	next = dcp_edr_next(cur, target, prev_sdr, sdr);
+	bri = (u64)sdr * next / DCP_EDR_UNITY;
+	swap->brightness_update = 1;
+	swap->brightness_nits = dcp_binary64_ratio(bri, 1);
+	swap->bl_flags[2] = 1;
+	swap->edr_scale = dcp_binary64_ratio(DCP_EDR_UNITY, next);
+	if (dcp->output_edr) {
+		swap->bl_flags[4] = 1;
+		swap->edr_headroom = dcp_binary64_ratio(next, DCP_EDR_UNITY);
+		dcp->edr_sent = true;
+	} else if (dcp->edr_sent) {
+		swap->bl_flags[4] = 1;
+		swap->edr_headroom = dcp_binary64_ratio(1, 1);
+		dcp->edr_sent = false;
+	}
+	if (bri * 13 > 4000) {
+		swap->bl_flags[1] = 1;
+		swap->bl_limit = dcp_binary64_ratio(bri * 13, 10);
+	}
+	/* Back at 1.0 without EDR: leave the firmware's values alone again. */
+	dcp->edr_hm = (!dcp->output_edr && next == DCP_EDR_UNITY) ? 0 : next;
+}
 #endif
 
 #if DCP_FW_H17(DCP_FW_VER)
@@ -399,6 +423,10 @@ static void dcp_swap_submit(struct apple_dcp *dcp, bool oob,
 		dcp->present_v27.swap.brightness_nits =
 			get_unaligned_le64(dcp->present_h17p.swap + 0x35e);
 		dcp_external_stamp_submit(dcp, &dcp->present_v27.swap);
+		if (dcp_has_panel(dcp))
+			dcp_edr_prepare_v27(dcp, &dcp->present_v27.swap,
+					    dcp->present_v27.swap.brightness_update,
+					    dcp->edr_present_sdr);
 		data = &dcp->present_v27;
 #else
 		data = &dcp->present_h17p;

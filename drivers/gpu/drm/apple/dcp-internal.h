@@ -661,6 +661,8 @@ struct apple_dcp {
 	u32 edr_hm;
 	u32 edr_sdr;
 	bool edr_restart;
+	/* SDR white in nits of the present being built (H17P backlight) */
+	u32 edr_present_sdr;
 	struct dcp_set_digital_out_mode_req mode;
 
 	/* completion for active turning true */
