@@ -510,6 +510,10 @@ static const struct of_device_id sn201202x_of_match[] = {
 /*
  * In system sleep the wake interrupt is suspended, so the controller is
  * polled as without interrupts.
+ *
+ * A controller that is awake answers a WAKEUP with no interrupt. One whose
+ * wake interrupt has come since it was sent to sleep woke by itself: it is
+ * checked at once, as when polled, instead of waited for.
  */
 static int sn201202x_wake_poll(struct sn201202x *sn, bool poll)
 {
@@ -520,6 +524,8 @@ static int sn201202x_wake_poll(struct sn201202x *sn, bool poll)
 	u8 size;
 	int ret;
 
+	if (completion_done(&sn->wake_completion))
+		poll = true;
 	reinit_completion(&sn->wake_completion);
 	ret = spmi_command_wakeup(sn->sdev);
 	if (ret)
@@ -585,6 +591,8 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_runtime_suspend(struct device *dev
 		return -EBUSY;
 
 	reinit_completion(&sn->sleep_completion);
+	/* A wake interrupt from here on is its own, see sn201202x_wake_poll() */
+	reinit_completion(&sn->wake_completion);
 	if (spmi_command_sleep(sn->sdev))
 		goto retry;
 	if (!sn->polled &&
@@ -928,6 +936,8 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_resume(struct device *dev)
 		/* Waits for a running sleep_event() */
 		disable_irq(tps->irq);
 		WRITE_ONCE(sn->sleep_watch, false);
+		/* The watch woke it and sent it to sleep again: not its own wake */
+		reinit_completion(&sn->wake_completion);
 	}
 	/* One that slept on from idle sleep wakes through runtime PM */
 	if (pm_runtime_status_suspended(dev)) {
@@ -998,6 +1008,8 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_suspend(struct device *dev)
 	/* Registered before xHCI, so its root port has suspended by now. */
 	tipd_usb_wake(tps, true);
 	reinit_completion(&sn->sleep_completion);
+	/* A wake interrupt from here on is its own, see sn201202x_wake_poll() */
+	reinit_completion(&sn->wake_completion);
 	err = spmi_command_sleep(sn->sdev);
 	if (err)
 		goto out_resume;
