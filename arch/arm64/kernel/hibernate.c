@@ -107,23 +107,6 @@ static u64 hibernate_layout_mix(u64 h, const void *p, size_t len)
 }
 
 /*
- * The image restores every page to the frame it came from, so the boot that
- * resumes it must give the kernel what the boot that wrote it did: the same
- * RAM, and on Apple machines at EL2 the same CTXR exec window (secondaries only
- * execute inside it) and aura's fixed hibernation layout. A boot loader decides
- * them on every boot; the kernel build check above cannot see them.
- *
- * aura's own image moves with the boot object, and its CPU release addresses
- * and S2R mailbox with it, inside the range the layout keeps from Linux. The
- * restored kernel uses neither address of the boot that wrote the image: its
- * CPUs come back from the boot kernel's pen, a CPU started at its reset vector
- * again finds the release target the boot kernel wrote (both kernels run at the
- * window's fixed address), and the T6040 sleep driver takes this boot's mailbox
- * from aura's tree after the restore. What has to match is the spin table's
- * shape (the same CPUs, at the same offsets from the mailbox) and that this
- * boot keeps all of it out of the image.
- */
-/*
  * Mix one memory span less the parts in @ex, ranges that this boot keeps out of
  * the image. iBoot's no-map allocations inside aura's fixed layout (the DCP
  * oslogs, ANS firmware) move with the boot object and split memblock's regions
@@ -147,6 +130,23 @@ static u64 hibernate_mix_span(u64 h, u64 b, u64 e, u32 flags, const u64 (*ex)[2]
 	return hibernate_layout_mix(h, &flags, sizeof(flags));
 }
 
+/*
+ * The image restores every page to the frame it came from, so the boot that
+ * resumes it must give the kernel what the boot that wrote it did: the same
+ * RAM, and on Apple machines at EL2 the same CTXR exec window (secondaries only
+ * execute inside it) and aura's fixed hibernation layout. A boot loader decides
+ * them on every boot; the kernel build check above cannot see them.
+ *
+ * aura's own image moves with the boot object, and its CPU release addresses
+ * and S2R mailbox with it, inside the range the layout keeps from Linux. The
+ * restored kernel uses neither address of the boot that wrote the image: its
+ * CPUs come back from the boot kernel's pen, a CPU started at its reset vector
+ * again finds the release target the boot kernel wrote (both kernels run at the
+ * window's fixed address), and the T6040 sleep driver takes this boot's mailbox
+ * from aura's tree after the restore. What has to match is the spin table's
+ * shape (the same CPUs, at the same offsets from the mailbox) and that this
+ * boot keeps all of it out of the image.
+ */
 static u64 hibernate_boot_layout(void)
 {
 	static const char * const chosen_props[] = {
