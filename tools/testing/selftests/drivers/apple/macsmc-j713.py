@@ -35,6 +35,7 @@ def main():
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+typedef uint8_t u8;
 typedef uint32_t u32;
 typedef uint64_t u64;
 typedef uint32_t smc_key;
@@ -42,6 +43,7 @@ struct device { int unused; };
 struct apple_smc { int unused; };
 struct gpio_chip { void *data; };
 struct mutex { bool held; };
+struct notifier_block { void *notifier_call; };
 #define DECLARE_BITMAP(name, bits) unsigned long name[((bits) + 63) / 64]
 #define GPIO_LINE_DIRECTION_OUT 0
 #define GPIO_LINE_DIRECTION_IN 1
