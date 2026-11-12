@@ -128,6 +128,14 @@ properties:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: Display panel node
 
+  apple,internal-panel:
+    type: boolean
+    description:
+      The framebuffer drives the machine's built-in laptop panel, handed over by
+      the boot loader before a display controller driver takes over. simpledrm
+      reports it as an eDP connector instead of an unknown one, so that user
+      space does not count it as an external monitor.
+
   allwinner,pipeline:
     description: Pipeline used by the framebuffer on Allwinner SoCs
     enum:
