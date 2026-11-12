@@ -787,8 +787,8 @@ static int apple_gpio_pinctrl_resume_noirq(struct device *dev)
 	if (pctl->saved_global_valid) {
 		val = readl(pctl->base + REG_GLOBAL);
 		writel(pctl->saved_global, pctl->base + REG_GLOBAL);
-		dev_info(dev, "resume: global word %#x, put back to %#x\n", val,
-			 pctl->saved_global);
+		dev_dbg(dev, "resume: global word %#x, put back to %#x\n", val,
+			pctl->saved_global);
 		pctl->saved_global_valid = false;
 	}
 
@@ -810,11 +810,11 @@ static int apple_gpio_pinctrl_resume_noirq(struct device *dev)
 	if (pctl->cached)
 		regcache_cache_bypass(pctl->map, false);
 	if (restored)
-		dev_info(dev, "resume: %u of %u configured pins put back\n", restored,
-			 bitmap_weight(pctl->saved_valid, pctl->pinctrl_desc.npins));
+		dev_dbg(dev, "resume: %u of %u configured pins put back\n", restored,
+			bitmap_weight(pctl->saved_valid, pctl->pinctrl_desc.npins));
 	if (pctl->restored && !bitmap_empty(pctl->restored, pctl->pinctrl_desc.npins))
-		dev_info(dev, "resume: pins not set up by Linux put back: %*pbl\n",
-			 pctl->pinctrl_desc.npins, pctl->restored);
+		dev_dbg(dev, "resume: pins not set up by Linux put back: %*pbl\n",
+			pctl->pinctrl_desc.npins, pctl->restored);
 	bitmap_zero(pctl->saved_valid, pctl->pinctrl_desc.npins);
 
 	return 0;
@@ -856,7 +856,7 @@ static int __maybe_unused apple_gpio_pinctrl_restore_early(struct device *dev)
 		armed++;
 	}
 	if (armed)
-		dev_info(dev, "resume from disk: %u interrupt pin(s) set up again\n", armed);
+		dev_dbg(dev, "resume from disk: %u interrupt pin(s) set up again\n", armed);
 
 	return 0;
 }
