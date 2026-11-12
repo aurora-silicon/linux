@@ -3129,10 +3129,22 @@ static const char *const t6041_max_usbc2_nodes[] = {
 	"/dcp@606e00000",
 };
 
+/* The third USB-C processor of the J614c/J616c, dcpext3, as dcpext2's chain. */
+static const char *const t6041_max_usbc3_nodes[] = {
+	"/iommu@306340000",
+	"/iommu@306300000",
+	"/mailbox@306e08000",
+	"/dcp@306e00000/typec-routes/route@0",
+	"/dcp@306e00000/typec-routes/route@1",
+	"/dcp@306e00000/typec-routes/route@2",
+	"/dcp@306e00000",
+};
+
 static const struct gate_staged t6041_max_stages[] = {
 	{ "/iommu@3a2300000", t6041_max_hdmi_nodes, ARRAY_SIZE(t6041_max_hdmi_nodes) },
 	{ "/iommu@602300000", t6041_max_usbc_nodes, ARRAY_SIZE(t6041_max_usbc_nodes) },
 	{ "/iommu@606300000", t6041_max_usbc2_nodes, ARRAY_SIZE(t6041_max_usbc2_nodes) },
+	{ "/iommu@306300000", t6041_max_usbc3_nodes, ARRAY_SIZE(t6041_max_usbc3_nodes) },
 };
 
 /*

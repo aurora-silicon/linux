@@ -2,7 +2,8 @@
 /*
  * Test device tree for the display gate KUnit test: the J616c's external
  * display chains at their real paths (t604x-extdisp.dtsi,
- * t6041-j616c-hdmi.dtsi, t6041-j616c-usbc.dtsi, t6041-j616c-usbc-dcpext2.dtsi),
+ * t6041-j616c-hdmi.dtsi, t6041-j616c-usbc.dtsi, t6041-j616c-usbc-dcpext2.dtsi,
+ * t6041-j616c-usbc-dcpext3.dtsi),
  * disabled, and the display
  * subsystem with the internal display's DART. There is no PMP. The data and
  * heap regions of both processors are the boot loader's disabled
@@ -60,6 +61,20 @@
 				};
 
 				dcpext2_heap: dcpext2-heap {
+					compatible = "apple,asc-mem";
+					status = "disabled";
+				};
+
+				dcpext3_text: dcpext3-text {
+					compatible = "apple,asc-mem";
+				};
+
+				dcpext3_data: dcpext3-data {
+					compatible = "apple,asc-mem";
+					status = "disabled";
+				};
+
+				dcpext3_heap: dcpext3-heap {
 					compatible = "apple,asc-mem";
 					status = "disabled";
 				};
@@ -221,6 +236,45 @@
 
 				piodma {
 					iommus = <&dispext2_dart 16>;
+				};
+			};
+
+			dcpext3_dart: iommu@306340000 {
+				#iommu-cells = <1>;
+				status = "disabled";
+			};
+
+			dispext3_dart: iommu@306300000 {
+				#iommu-cells = <1>;
+				status = "disabled";
+			};
+
+			mailbox@306e08000 {
+				status = "disabled";
+			};
+
+			dcp@306e00000 {
+				compatible = "apple,t6041-dcpext";
+				iommus = <&dcpext3_dart 23>;
+				memory-region = <&dcpext3_data>, <&dcpext3_heap>, <&dcpext3_text>;
+				status = "disabled";
+
+				typec-routes {
+					route@0 {
+						status = "disabled";
+					};
+
+					route@1 {
+						status = "disabled";
+					};
+
+					route@2 {
+						status = "disabled";
+					};
+				};
+
+				piodma {
+					iommus = <&dispext3_dart 16>;
 				};
 			};
 
