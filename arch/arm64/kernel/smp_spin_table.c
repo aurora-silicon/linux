@@ -146,8 +146,10 @@ const struct cpu_operations smp_spin_table_ops = {
  * masked. From there it goes back through secondary_holding_pen, or, when the
  * platform suspends the system, it stops and takes its last WFI after the commit.
  * It is then started again at its reset vector. Stopping and starting a CPU is
- * SoC-specific, so a platform driver provides it. Until one has, CPU hotplug
- * fails cleanly, as on plain spin-table.
+ * SoC-specific, so a platform driver provides it (spin_table_set_power_ops());
+ * until one has, a suspend that needs the parked CPUs stopped is refused.
+ * Parking and leaving the park need only cpu_soft_restart(): without
+ * KEXEC_CORE, CPU hotplug fails cleanly, as on plain spin-table.
  *
  * A CPU left awake at the commit can hang the machine, and the commit can't be
  * undone. So each parked CPU first answers a hold, while the suspend can still
@@ -176,9 +178,8 @@ static bool spin_table_stop_released;
  * the kernel build that is running; with the boot kernel loaded at the image
  * kernel's physical address (checked when the resume starts) the pen is at the
  * same place in both, and the restored kernel reads what the boot kernel left
- * there. It
- * starts each CPU from the pen through secondary_holding_pen, as at boot.
- * Nothing is powered off, so this needs no platform power ops.
+ * there. It starts each CPU from the pen through secondary_holding_pen, as at
+ * boot. Nothing is powered off, so this needs no platform power ops.
  */
 #define SPIN_TABLE_PEN_MAGIC	0x314e455034535053ULL	/* "SPS4PEN1" */
 #define SPIN_TABLE_PEN_HERE	0x45524548ULL		/* "HERE", from the pen */
