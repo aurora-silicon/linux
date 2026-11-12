@@ -413,4 +413,12 @@
 &ps_atc3_usb { apple,always-on; };
 
 &acio2_mbox { status = "okay"; };
-&acio2 { status = "okay"; port { acio2_tbt: endpoint { remote-endpoint = <&hpm2_usb4>; }; }; };
+&acio2 {
+	status = "okay";
+
+	port {
+		acio2_tbt: endpoint {
+			remote-endpoint = <&hpm2_usb4>;
+		};
+	};
+};
