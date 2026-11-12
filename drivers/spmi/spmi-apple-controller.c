@@ -117,8 +117,6 @@ struct apple_spmi {
 	bool notify_irq;
 	bool notify_parked;
 	bool prev_fail;
-	/* The noirq restore rewrote the masks after a resume from disk. */
-	bool hib_resynced;
 };
 
 static void apple_spmi_irq_ack_raw(struct apple_spmi *spmi, u32 irq)
@@ -737,41 +735,24 @@ static void apple_spmi_hib_resync_irqs(struct apple_spmi *spmi)
 	raw_spin_unlock_irqrestore(&spmi->irq_mask_lock, flags);
 }
 
-static int apple_spmi_restore_noirq(struct device *dev)
-{
-	struct apple_spmi *spmi = dev_get_drvdata(dev);
-
-	/* Hibernation aborted before the image (PMSG_RESTORE then too): nothing restarted. */
-	if (!pm_hibernate_is_restored())
-		return apple_spmi_resume_noirq(dev);
-	if (spmi->irq < 0)
-		return 0;
-
-	apple_spmi_hib_resync_irqs(spmi);
-	spmi->hib_resynced = true;
-
-	return 0;
-}
-
 /*
- * A controller in a PM domain does not get the callback above: genpd's
- * restore_noirq calls the driver's resume_noirq instead (outside a wakeup
- * path). The masks then stay as the boot kernel left them, everything masked
+ * Left alone, the masks stay as the boot kernel left them, everything masked
  * but the interrupts of the drivers it loaded, and the IRQ core does not write
  * them again (it disables lazily and unmasks only an IRQ it recorded as
  * masked). A device whose driver the boot kernel did not load, such as a
  * Type-C port controller on nub_spmi_a0/a1, would raise no event after the
- * restore. genpd does not wrap the early restore, so the masks are rewritten
- * there, before the devices on the bus are restored.
+ * restore.
+ *
+ * In the early restore, for every controller alike: one in a PM domain gets no
+ * restore_noirq of its own, as genpd calls the driver's resume_noirq there
+ * (outside a wakeup path), and genpd does not wrap the early restore. It still
+ * runs before the devices on the bus are restored.
  */
 static int apple_spmi_restore_early(struct device *dev)
 {
 	struct apple_spmi *spmi = dev_get_drvdata(dev);
 
-	if (spmi->hib_resynced) {
-		spmi->hib_resynced = false;
-		return 0;
-	}
+	/* Hibernation aborted before the image (PMSG_RESTORE then too): nothing restarted. */
 	if (!pm_hibernate_is_restored() || spmi->irq < 0)
 		return 0;
 
@@ -785,15 +766,10 @@ static int apple_spmi_restore_early(struct device *dev)
 
 /*
  * Suspend-to-RAM parks the notification queue; a resume from disk rewrites the
- * masks, in the early restore where a PM domain kept the noirq one from running.
+ * masks in the early restore.
  */
 static const struct dev_pm_ops apple_spmi_pm_ops = {
-	.suspend_noirq = pm_sleep_ptr(apple_spmi_suspend_noirq),
-	.resume_noirq = pm_sleep_ptr(apple_spmi_resume_noirq),
-	.freeze_noirq = pm_sleep_ptr(apple_spmi_suspend_noirq),
-	.thaw_noirq = pm_sleep_ptr(apple_spmi_resume_noirq),
-	.poweroff_noirq = pm_sleep_ptr(apple_spmi_suspend_noirq),
-	.restore_noirq = pm_sleep_ptr(apple_spmi_restore_noirq),
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_spmi_suspend_noirq, apple_spmi_resume_noirq)
 	.restore_early = pm_sleep_ptr(apple_spmi_restore_early),
 };
 
