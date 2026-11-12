@@ -251,7 +251,7 @@
 		#size-cells = <1>;
 	};
 
-	sleep-controller {
+	t6040_sleep: sleep-controller {
 		compatible = "apple,t6040-sleep";
 		/*
 		 * The SoC blocks the commit and wake
@@ -309,6 +309,8 @@
 		 * (ps_ans, ps_apcie_st0/st1, ps_apcie_sys_st0/st1) live in SOC-East and
 		 * are driven by the controller's soc-east window, not from a node here.
 		 */
+		/* Only on a board whose sleep has been tested. */
+		status = "disabled";
 	};
 };
 
