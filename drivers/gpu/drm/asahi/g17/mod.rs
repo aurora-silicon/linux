@@ -75,7 +75,6 @@ use kernel::{
     c_str,
     device::{self, Core},
     io::{
-        IoBase,
         IoSysMap,
         Region, //
     },
