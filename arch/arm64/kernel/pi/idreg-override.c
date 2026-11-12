@@ -454,9 +454,38 @@ static __init void parse_cmdline(const void *fdt, int chosen)
 		__parse_cmdline(prop, true);
 }
 
+/*
+ * Apple SoCs keep MTE tag storage in DRAM that only the boot loader can
+ * place. Keep MTE off unless the device tree reserves that storage.
+ */
+static __init bool apple_mte_storage_unreserved(const void *fdt)
+{
+	static const char platform[] __initconst = "apple,arm-platform";
+	static const char reserved[] __initconst = "/reserved-memory";
+	static const char storage[] __initconst = "apple,mte-tag-storage";
+	u64 mte = cpuid_feature_extract_unsigned_field(read_sysreg(id_aa64pfr1_el1),
+						       ID_AA64PFR1_EL1_MTE_SHIFT);
+	int parent, node;
+
+	if (mte < ID_AA64PFR1_EL1_MTE_MTE2 ||
+	    fdt_node_check_compatible(fdt, 0, platform))
+		return false;
+
+	parent = fdt_path_offset(fdt, reserved);
+	if (parent < 0)
+		return true;
+
+	fdt_for_each_subnode(node, fdt, parent)
+		if (!fdt_node_check_compatible(fdt, node, storage))
+			return false;
+
+	return true;
+}
+
 void __init init_feature_override(u64 boot_status, const void *fdt,
 				  int chosen)
 {
+	static const char nomte[] __initconst = "arm64.nomte";
 	struct arm64_ftr_override *override;
 	const struct ftr_set_desc *reg;
 	int i;
@@ -472,6 +501,9 @@ void __init init_feature_override(u64 boot_status, const void *fdt,
 	__boot_status = boot_status;
 
 	parse_cmdline(fdt, chosen);
+
+	if (apple_mte_storage_unreserved(fdt))
+		__parse_cmdline(nomte, true);
 
 	for (i = 0; i < ARRAY_SIZE(regs); i++) {
 		reg = prel64_pointer(regs[i].reg);
