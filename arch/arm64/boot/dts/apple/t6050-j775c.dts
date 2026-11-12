@@ -20,7 +20,7 @@
  * die-0 addresses, no nub-spmi-a2, and CPU MPIDRs 0x5/0x105/0x205 for each cluster's sixth core.
  * J775c-specific: the N1's platform ID and firmware name carry board 0x10.
  *
- * Not yet booted on J775c.
+ * Compatibility layout booted as 9c038a05 on J775c; see commit messages.
  *
  * Copyright The Asahi Linux Contributors
  */
