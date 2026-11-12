@@ -4334,6 +4334,8 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 		iomfb_poweroff_v27(dcp);
 		if (dcp->edr_hm)
 			dcp->edr_restart = true;
+		WRITE_ONCE(dcp->edr_ramping, false);
+		cancel_delayed_work(&dcp->iomfb.edr_tick);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
