@@ -57,8 +57,10 @@ PRELUDE = r'''
 typedef uint32_t u32;
 #define BIT(n) (1U << (n))
 #define GENMASK(h,l) ((UINT32_MAX >> (31-(h))) & (UINT32_MAX << (l)))
-#define dev_warn(...) ((void)0)
-#define dev_err(...) ((void)0)
+/* Warnings and errors the driver reports; debug output is not counted. */
+static unsigned reports;
+#define dev_warn(...) ((void)reports++)
+#define dev_err(...) ((void)reports++)
 #define dev_dbg(...) ((void)0)
 #define lockdep_assert_held(...) ((void)0)
 #define guard(which) (void)
@@ -202,7 +204,7 @@ static void reset(enum atcphy_generation generation, bool t8140) {
     p.t8103_usb3_workaround = atcphy_has_t8103_usb3_workaround(&hw, &root);
     phy.data = &p;
     polls = sleeps = sets = clears = muxes = bist_old = bist_new = 0;
-    configure_calls = restore_calls = unlocks = warnings = 0;
+    configure_calls = restore_calls = unlocks = warnings = reports = 0;
     dummy_muxes = pending_seen_at_unlock = 0;
     usb2_power_off_calls = 0;
     ack_on = 1;
@@ -548,6 +550,24 @@ static void role_after_typec_mux(void) {
  assert(p.host_active!=host&&muxes==1&&polls==old_polls&&bist_new==(gen&&host));
  }
 }
+/*
+ * A PIPE lock that times out is no fault of the PHY's own: a USB3 handoff
+ * returns the timeout for its caller to report, and retry, while a lock that
+ * is only best-effort goes on and says so once.
+ */
+static void lock_timeout_left_to_caller(void) {
+ for(unsigned neo=0;neo<2;neo++) {
+ reset(ATCPHY_GENERATION_T8122,neo);p.mode=APPLE_ATCPHY_MODE_USB3;ack_on=0;
+ assert(atcphy_configure_pipehandler(&p,true)==-ETIMEDOUT);
+ assert(polls==1&&!bist_new&&!muxes&&p.pipe_pending&&!reports);
+ }
+ setup_legacy_usb3();ack_on=0;
+ assert(atcphy_park_live_t8103_pipehandler(&p)==-ETIMEDOUT);
+ assert(polls==10&&!reports);
+ reset(ATCPHY_GENERATION_T8103,false);ack_on=0;
+ assert(!atcphy_configure_pipehandler_usb4(&p));
+ assert(polls==1&&reports==1);
+}
 int main(void) {
  TEST(both_role_and_typec_orders_complete_usb3);
  TEST(nonusb3_commit_discharges_deferred_role);
@@ -563,6 +583,7 @@ int main(void) {
  TEST(live_lock_failure_restores_masks);TEST(live_park_then_pending_completion);TEST(legacy_live_dispatch_and_generation);TEST(pending_blocks_lane_and_backend);
  TEST(canceled_lane_change_reconnects);TEST(role_finishes_pending);TEST(target_failure_preserves_reconnect);TEST(nonusb_commit_clears_retry);TEST(dp_assignment_d_retains_usb3);TEST(modern_safe_refusal_retained);
  TEST(fixed_hub_host_dispatch);TEST(reset_release_retries_before_writes);TEST(reset_assert_failure_and_stop);TEST(power_off_preserves_dp_and_finishes_pending);TEST(setup_known_reset_clears_obligations);TEST(target_mode_table_and_dirty);
+ TEST(lock_timeout_left_to_caller);
  printf("%u ATCPHY USB3 host cases passed\n",tests);
 }
 '''
@@ -820,6 +841,17 @@ MUTATIONS = {'no-live-retry': ('atcphy_pipehandler_lock_live', '? 10 : 1;', '? 1
                                   'if (!ret && pipe_state != ATCPHY_PIPEHANDLER_STATE_USB3)\n'
                                   '\t\t\tatcphy->t8103_usb3_retry = false;',
                                   '(void)0;'),
+ 'lock-timeout-warns': ('atcphy_pipehandler_lock_timeout',
+                        'clear32(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ, 1);',
+                        'clear32(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ, 1);\n'
+                        '\t\tdev_warn(atcphy->dev, "Pipehandler lock not acked.\\n");'),
+ 'usb3-lock-timeout-errs': ('atcphy_configure_pipehandler_usb3',
+                            'if (ret)\n\t\t\treturn ret;\n\n\t\t/* BIST dance */',
+                            'if (ret) {\n\t\t\tdev_err(atcphy->dev, "Failed to lock pipehandler\\n");\n'
+                            '\t\t\treturn ret;\n\t\t}\n\n\t\t/* BIST dance */'),
+ 'usb4-lock-timeout-silent': ('atcphy_configure_pipehandler_usb4',
+                              'dev_warn(atcphy->dev, "Failed to lock pipehandler\\n");',
+                              '(void)0;'),
  'outer-noop-ignores-new-obligations': ('bool atcphy_mux_in_mode',
                                         'atcphy->t8103_dummy_pending || atcphy->t8103_usb3_retry',
                                         'false')}

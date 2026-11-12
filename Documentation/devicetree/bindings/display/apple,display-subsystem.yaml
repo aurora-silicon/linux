@@ -41,6 +41,11 @@ properties:
     maxItems: 64
     description: Reserved memory retaining the inherited display mappings.
 
+  memory-region-names:
+    items:
+      - const: framebuffer
+    description: Identifies the boot framebuffer reservation supplied by the loader.
+
   apple,j713-inherited-mappings:
     type: boolean
     description: The loader validated the inherited J713 SID0 scanout mapping.

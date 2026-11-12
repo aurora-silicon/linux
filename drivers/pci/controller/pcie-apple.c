@@ -258,10 +258,10 @@ struct hw_info {
 	 * keeps its link while the domain stays on, see apple_pcie_hold_domains().
 	 */
 	bool s2idle_hold_domain;
-	/* AppleT8152PCIePort::_initializeRefclkBuffer clears REFBUF_OFF. */
+	/* Port init clears REFBUF_OFF in the refclk buffer control. */
 	bool refbuf_off;
 	/*
-	 * APCIECoreRCGen5Port::enablePortHardware: after PERST#, wait for the
+	 * Port enable: after PERST#, wait for the
 	 * lane PIPE reset status, then release PORT_T8152_PIPE_RST.
 	 */
 	bool pipe_rst;
@@ -4598,7 +4598,7 @@ static void apple_pcie_neo_recover(void *data)
 	/* Pairs with the barrier at PM_POST_SUSPEND: one side sees the other's write. */
 	smp_mb();
 	if (!READ_ONCE(pcie->neo_sleep_armed))
-		queue_work(system_unbound_wq, &pcie->neo_recover_work);
+		queue_work(system_dfl_wq, &pcie->neo_recover_work);
 }
 
 /* Runs before the freezer. The radios stay bound, and their drivers do their own suspend. */
@@ -4622,7 +4622,7 @@ static int apple_pcie_neo_pm_notify(struct notifier_block *nb, unsigned long act
 		smp_mb();
 		apple_piodma_bootstrap_set_sleep(pcie->piodma_supplier, false);
 		if (READ_ONCE(pcie->neo_recover))
-			queue_work(system_unbound_wq, &pcie->neo_recover_work);
+			queue_work(system_dfl_wq, &pcie->neo_recover_work);
 		break;
 	default:
 		break;

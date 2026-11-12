@@ -358,6 +358,26 @@ DCP_THUNK_OUT(dcp_finish_wake, dcpep_pipe_query_474, u32);
 IOMFB_THUNK_INOUT(abort_swaps_dcp);
 #endif
 
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+static u64 __maybe_unused dcp_swap_time(void);
+
+/*
+ * macOS stamps every external swap, adaptive sync or not, in the firmware's
+ * 24 MHz continuous time: word 1 at the swap start, words 0, 4 and 6 at the
+ * submission. The panel keeps its own pacing timestamps.
+ */
+static bool dcp_external_swap_stamps(struct apple_dcp *dcp)
+{
+	return !dcp->main_display && !dcp_has_panel(dcp);
+}
+
+static void dcp_external_stamp_submit(struct apple_dcp *dcp, struct dcp_swap_v27 *swap)
+{
+	if (dcp_external_swap_stamps(dcp) && swap->timestamp[1])
+		swap->timestamp[0] = swap->timestamp[4] = swap->timestamp[6] = dcp_swap_time();
+}
+#endif
+
 #if DCP_FW_H17(DCP_FW_VER)
 static void dcp_swap_submit(struct apple_dcp *dcp, bool oob,
 			    struct dcp_swap_submit_req_h17p *request,
@@ -378,6 +398,7 @@ static void dcp_swap_submit(struct apple_dcp *dcp, bool oob,
 			dcp->present_h17p.swap[0x354] & 1;
 		dcp->present_v27.swap.brightness_nits =
 			get_unaligned_le64(dcp->present_h17p.swap + 0x35e);
+		dcp_external_stamp_submit(dcp, &dcp->present_v27.swap);
 		data = &dcp->present_v27;
 #else
 		data = &dcp->present_h17p;
@@ -540,7 +561,9 @@ DCP_THUNK_INOUT(dcp_pipe_cfg_414, dcpep_pipe_cfg_414, u64, u64);
 DCP_THUNK_OUT(dcp_pipe_query_478, dcpep_pipe_query_478, u32);
 DCP_THUNK_OUT(dcp_pipe_query_474, dcpep_pipe_query_474, u32);
 DCP_THUNK_IN(dcp_pipe_set_476, dcpep_pipe_set_476, u32);
+#if DCP_FW_VER < DCP_FW_VERSION(27, 0, 0)
 DCP_THUNK_IN(dcp_unnamed_500, dcpep_unnamed_500, u32);
+#endif
 #endif
 DCP_THUNK_INOUT(dcp_set_brightness_correction, iomfbep_set_brightness_correction, u32, u32);
 
@@ -3389,6 +3412,16 @@ static void do_swap(struct apple_dcp *dcp, void *data, void *cookie)
 				smp_store_release(&dcp->brightness.update, true);
 			}
 		}
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+		if (dcp_external_swap_stamps(dcp)) {
+			bool surface = false;
+
+			for (unsigned int i = 0; i < SWAP_SURFACES; i++)
+				surface |= !req->surf_null[i];
+			if (surface)
+				req->swap.timestamp[1] = dcp_swap_time();
+		}
+#endif
 		dcp_swap_start(dcp, false, &start_req, dcp_swap_started, NULL);
 	} else {
 		dcp_drm_crtc_vblank(dcp->crtc);
@@ -3956,6 +3989,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	struct dcp_display_mode selected, *mode = &selected;
 	struct dcp_wait_cookie *cookie;
 	struct dcp_color_mode *cmode = NULL;
+	bool paired = false;
 	int ret;
 
 	if (!lookup_mode(dcp, &crtc_state->mode, mode)) {
@@ -4023,10 +4057,17 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	} else
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
 	if ((ret = dcp_peer_modeset_v27(dcp, mode->timing_mode_id,
-				      mode->color_mode_id, crtc_state->vrr_enabled)) != -EOPNOTSUPP) {
+				      mode->color_mode_id,
+				      crtc_state->vrr_enabled && mode->vrr ? mode->min_vrr : 0)) != -EOPNOTSUPP) {
 		cookie->status = ret;
+		paired = true;
 		if (!ret)
 			crtc_state->color_mgmt_changed = true;
+		complete_set_digital_out_mode(dcp, NULL, cookie);
+	} else if (dcp_peer_needs_pair_v27(dcp, mode->mode.clock)) {
+		/* No pair for a timing one engine cannot drive: never single-pipe it. */
+		cookie->status = -EINVAL;
+		paired = true;
 		complete_set_digital_out_mode(dcp, NULL, cookie);
 	} else
 #endif
@@ -4063,6 +4104,13 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		dev_dbg(dcp->dev,
 			"set_digital_out_mode finished with %d to spare\n",
 			jiffies_to_msecs(ret));
+	}
+	/* A paired mode set that failed left the CRTC with no timing. */
+	if (paired && READ_ONCE(cookie->status)) {
+		ret = (int)READ_ONCE(cookie->status);
+		dev_err_ratelimited(dcp->dev, "paired mode set failed: %d\n", ret);
+		kref_put(&cookie->refcount, release_wait_cookie);
+		return ret;
 	}
 	/*
 	 * The external H17P display reports a link that does not come up
