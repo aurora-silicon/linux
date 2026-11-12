@@ -912,7 +912,9 @@ select_config:
 	if (err)
 		return err;
 
-	err = isp_cmd_ch_mbnr_enable(isp, ch, 0, ISP_MBNR_MODE_ENABLE, 1);
+	err = isp_cmd_ch_mbnr_enable(isp, ch, 0,
+				     isp->preview_26 ? ISP_MBNR_MODE_DISABLE :
+				     ISP_MBNR_MODE_ENABLE, 1);
 	if (err)
 		return err;
 
@@ -946,7 +948,11 @@ select_config:
 			return err;
 	}
 
-	err = isp_ch_configure_temporal_filter(isp, ch);
+	/* Preview has no consumer for temporal history on this firmware. */
+	if (isp->preview_26)
+		err = isp_cmd_apple_ch_temporal_filter_disable(isp, ch);
+	else
+		err = isp_ch_configure_temporal_filter(isp, ch);
 	if (err)
 		return err;
 
