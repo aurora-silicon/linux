@@ -2550,6 +2550,7 @@ static void t6040_cio_down_locked(struct t6040_usb2_phy *tphy)
 static int t6040_cio_up_locked(struct t6040_usb2_phy *tphy)
 {
 	void __iomem *core = t6040_core(tphy);
+	unsigned int lane;
 	bool flip;
 	int ret;
 
@@ -2603,6 +2604,16 @@ static int t6040_cio_up_locked(struct t6040_usb2_phy *tphy)
 	return 0;
 
 firmware:
+	/*
+	 * The lanes are powered by now: as t6040_cio_down_locked(), both TX lanes
+	 * and the common block down, then the receivers, before the coprocessor
+	 * stops and the CFG block goes back to its boot state.
+	 */
+	t6040_phy_tx_cmn_shutdown(tphy);
+	for (lane = 0; lane < 2; lane++)
+		t6040_cio_steps(tphy, t6040_cio_rx_powerdown, ARRAY_SIZE(t6040_cio_rx_powerdown),
+				lane);
+	fsleep(200);
 	t6040_usb3_firmware_power_down(tphy);
 sleep:
 	t6040_usb3_sleep(tphy);
