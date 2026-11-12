@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Initial M5 queue installation names physical execution/QoS identities
-//! before an Active command exists. Retain the exact tokens independently.
+//! An empty queue installation names physical execution/QoS identities before
+//! an Active command exists. Retain the exact tokens independently.
 
 use super::{Context, Cursors, ITEM_RING_ENTRIES};
 use crate::mmu::ContextPin;

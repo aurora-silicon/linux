@@ -146,6 +146,10 @@ module! {
             default: 1,
             description: "Enable single-layer D32 compressed 2x/4x ZLS admission",
         },
+        g17_ordered_compute_reinstall: u32 {
+            default: 0,
+            description: "25G83: reinstall a retained compute QID and wait for configuration consumption before publishing successor work (0: off)",
+        },
         debug_flags: u64 {
             default: 0,
             // permissions: 0o644,

@@ -659,6 +659,12 @@ pub(crate) struct Queue {
     rearm_for: Option<u64>,
     configuration: Option<configuration::Configuration>,
     m5_install: Option<u32>,
+    /// A retained 25G83 QID must consume a standalone configuration before
+    /// another command can name it. `Some` is the configuration's end cursor.
+    ordered_reinstall: bool,
+    ordered_reinstall_end: Option<u32>,
+    ordered_reinstall_marks: u32,
+    ordered_reinstalls: u32,
     /// Bit `p` set once a work slot of priority class `p` named this queue.
     outer_started: u8,
     published_config: Option<ConfigIdentity>,
@@ -746,6 +752,10 @@ impl Queue {
             rearm_for: None,
             configuration: None,
             m5_install: None,
+            ordered_reinstall: false,
+            ordered_reinstall_end: None,
+            ordered_reinstall_marks: 0,
+            ordered_reinstalls: 0,
             outer_started: 0,
             published_config: None,
             config_cache: None,
@@ -827,11 +837,50 @@ impl Queue {
     pub(crate) fn qid(&self) -> u8 {
         self.kick.id().qid()
     }
+    fn ordered_reinstall_enabled(&self) -> bool {
+        crate::module_parameters::g17_ordered_compute_reinstall.value() != 0
+            && !self.graph.m5
+            && self.graph.pointers.recovery_target.is_none()
+    }
+    fn require_ordered_reinstall(&mut self) {
+        if self.ordered_reinstall_enabled() && self.installed {
+            if !self.ordered_reinstall {
+                self.ordered_reinstall_marks = self.ordered_reinstall_marks.saturating_add(1);
+            }
+            self.ordered_reinstall = true;
+            self.config_cache = None;
+        }
+    }
+    /// Firmware is halted at the recovery state-3 boundary. An interrupted
+    /// configuration-only transaction has no Active command and may be reset
+    /// without destroying command-retirement evidence. Every retained QID is
+    /// then reinstalled before later work.
+    pub(crate) fn prepare_recovery_restart(&mut self) -> Result {
+        if !self.ordered_reinstall_enabled() || !self.installed {
+            return Ok(());
+        }
+        if self.configuration.is_some() {
+            if self.active.len != 0 {
+                return Err(EIO);
+            }
+            self.graph.reset_items()?;
+            self.configuration.take().ok_or(EIO)?.release();
+            self.ordered_reinstall_end = None;
+        }
+        self.require_ordered_reinstall();
+        Ok(())
+    }
+    pub(crate) fn ordered_reinstall_pending(&self) -> bool {
+        self.ordered_reinstall_enabled() && self.ordered_reinstall
+    }
     /// The queue record the firmware runs this queue from.
     pub(crate) fn queue_record_va(&self) -> u64 {
         self.graph.graph.gpu_va()
     }
     pub(crate) fn set_channel_error(&mut self, pending: bool) {
+        if pending {
+            self.require_ordered_reinstall();
+        }
         self.channel_error = pending;
     }
     pub(crate) fn owner(&self) -> Option<u64> {
@@ -1082,6 +1131,7 @@ impl Queue {
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result<Option<Arc<VmStatus>>> {
         if !self.quarantined {
+            self.require_ordered_reinstall();
             self.quarantined = true;
             self.quarantine_error = Some(error);
             self.failure_status_pending = true;
@@ -1813,6 +1863,11 @@ impl Queue {
         if !self.reusable() {
             return Err(EBUSY);
         }
+        // Binding mutates the public queue record before every fallible alias
+        // and capacity step has completed. Even a refused first attempt makes
+        // the retained QID require a complete ordered configuration before it
+        // can execute work for either the successor or a rolled-back owner.
+        self.require_ordered_reinstall();
         self.source_hint.reset_for_owner(&self.source_readers)?;
         if !context.is_current() {
             return Err(EFAULT);
@@ -2058,6 +2113,7 @@ impl Queue {
         Ok(true)
     }
     fn recycle_settled(&mut self) -> Result {
+        self.require_ordered_reinstall();
         self.graph.reset_items()?;
         self.config_cache = None;
         self.exit = None;
@@ -2570,6 +2626,8 @@ impl Queue {
             if *sampler_count != 0 || !native.is_empty() { return Err(EINVAL); }
             if plan.is_some_and(|plan| !self.pool.fits(Some(plan.geometry))) { return Err(EINVAL); }
             self.install_m5(&packet, host)?;
+        } else {
+            self.install_ordered(&packet, host)?;
         }
         let work = packet.completion.work_state()?;
         let work_word = work.word();
@@ -3105,6 +3163,108 @@ impl Queue {
         result
     }
 
+    /// Rebuild a retained 25G83 QID as a transaction separate from client
+    /// work. The firmware must consume the complete configuration while the
+    /// item ring is empty; only a later publication may expose a descriptor.
+    fn install_ordered(&mut self, packet: &Arc<Packet>, host: &mut impl Host) -> Result {
+        if !self.ordered_reinstall_pending() {
+            return Ok(());
+        }
+        // A successor is bound only to an idle queue. After recovery, retained
+        // commands must first be classified and retired (or moved to replay).
+        if self.active.len != 0 {
+            return Err(EAGAIN);
+        }
+        let (epoch, state) = host.epoch()?;
+        if state != 0 {
+            return Err(EBUSY);
+        }
+        self.retire_configuration(epoch)?;
+
+        let context = &packet.context;
+        let policy = context.policy();
+        let identity = ConfigIdentity {
+            scheduler: context.scheduler_va(),
+            qos: context.qos_id(),
+            context: context.id(),
+        };
+        let config = QueueConfig::new(&QueueConfigArgs {
+            target: QueueConfigTarget::Compute,
+            kick_ring_va: self.kick.low_va(),
+            kick_ring_fw_va: self.kick.firmware_va(),
+            qid: self.qid(),
+            install: true,
+            completion_seed: None,
+            context_id: context.id().try_into()?,
+            free_list: FreeListBinding {
+                va: self.pool.control_va(),
+                generation: u64::from(context.scheduler_generation()),
+                slot: u32::from(self.pool.id()),
+            },
+            scheduler_va: identity.scheduler,
+            policy,
+            qos_slot: identity.qos,
+            qos_update: true,
+            owner_pid: context.owner_pid(),
+            context_update: true,
+        })?;
+
+        if self.ordered_reinstall_end.is_some() {
+            if self.configuration.is_some() {
+                return Err(EAGAIN);
+            }
+            self.ordered_reinstall_end = None;
+            self.ordered_reinstall = false;
+            self.ordered_reinstalls = self.ordered_reinstalls.saturating_add(1);
+            self.published_config = Some(identity);
+            self.config_cache = Some((config, epoch));
+            return Ok(());
+        }
+        if self.configuration.is_some() {
+            return Err(EBUSY);
+        }
+        let cursors = self.graph.cursors()?;
+        if cursors.count != ITEM_RING_ENTRIES
+            || cursors.producer >= cursors.count
+            || cursors.consumer >= cursors.count
+        {
+            return Err(EIO);
+        }
+        if cursors.producer != cursors.consumer {
+            return Err(EAGAIN);
+        }
+        self.graph.recycle(cursors)?;
+        let target = (cursors.producer + 1) % ITEM_RING_ENTRIES;
+        self.configuration = Some(configuration::Configuration::new(context, target, epoch)?);
+        let result = (|| {
+            let va = self.graph.record(None, CONFIG, 0xc0, config)?;
+            let configuration = self.configuration.as_mut().ok_or(EIO)?;
+            let producer = self
+                .graph
+                .append(cursors.producer, va, || configuration.mark_visible())?;
+            self.ordered_reinstall_end = Some(producer);
+            host.publish_qid(self.kick.id())?;
+            host.publish_outer(
+                policy.priority(),
+                &crate::g17::fw::channels::WorkSlot::new(
+                    DataMaster::Compute,
+                    self.graph.graph.gpu_va(),
+                    self.qid(),
+                    producer.try_into()?,
+                    true,
+                )?,
+            )?;
+            self.outer_started |= 1 << policy.priority();
+            host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
+            Err(EAGAIN)
+        })();
+        if result.is_err() && self.configuration.as_ref().is_some_and(|owner| !owner.visible()) {
+            self.configuration.take().ok_or(EIO)?.release();
+            self.ordered_reinstall_end = None;
+        }
+        result
+    }
+
     /// Everything that must hold before a publication changes any state: a healthy device
     /// epoch, room in the active ring (or this packet at the replay front), the bound
     /// owner's current context and a clean completion status. Returns the epoch and the
@@ -3216,10 +3376,13 @@ impl Queue {
 
 impl Queue {
     pub(crate) fn write_capacity(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
-        write!(f, "compute_queue qid={} owned={} released={} reusable={} quarantined={} awaiting_witness={} previous={} exit={} growing={} pool={:?} active={} total={} ",
+        write!(f, "compute_queue qid={} owned={} released={} reusable={} quarantined={} awaiting_witness={} previous={} exit={} growing={} ordered_reinstall={} reinstall_published={} reinstall_marks={} reinstalls={} pool={:?} active={} total={} ",
                self.qid(), u8::from(self.owner.is_some()), u8::from(self.released), u8::from(self.reusable()),
                u8::from(self.quarantined), u8::from(self.awaiting_witness), u8::from(self.previous.is_some()),
-               u8::from(self.exit.is_some()), u8::from(self.growing), self.pool_phase, self.active.len, IN_FLIGHT)?;
+               u8::from(self.exit.is_some()), u8::from(self.growing),
+               u8::from(self.ordered_reinstall_pending()), u8::from(self.ordered_reinstall_end.is_some()),
+               self.ordered_reinstall_marks, self.ordered_reinstalls,
+               self.pool_phase, self.active.len, IN_FLIGHT)?;
         match self.graph.cursors() {
             Ok(cursors) if cursors.count != 0 => writeln!(
                 f,
@@ -3395,6 +3558,7 @@ impl Queue {
         owner: u64,
         context: &Arc<Context>,
     ) -> Result<(bool, Option<Binding>)> {
+        self.require_ordered_reinstall();
         if self.owner != Some(owner)
             || !self.unpublished_binding
             || self

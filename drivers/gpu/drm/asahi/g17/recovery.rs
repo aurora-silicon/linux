@@ -103,6 +103,10 @@ pub(super) trait Queues {
     /// Copy every retained queue's live producer to its recovery target, then
     /// issue a full barrier. A failed graph must not skip subsequent queues.
     fn publish_recovery_targets(&self) -> Option<Error>;
+    /// Firmware is halted in state 3. Abandon any empty compute-queue
+    /// configuration transaction which the restart interrupted, then mark
+    /// retained QIDs for reinstall before firmware resumes.
+    fn prepare_compute_restart(&mut self) -> Result { Ok(()) }
     fn oldest_spared(&self, qid: u8) -> Option<bool>;
     fn visit_owners(&self, qid: u8, visit: &mut dyn FnMut(&Arc<VmStatus>));
     /// Classify every in-flight completion; return QIDs of render slots with spared work.
@@ -302,6 +306,7 @@ pub(super) fn service<H: Host>(
     // still retire it with stamps and records that look like success, so it is
     // marked before firmware resumes and never reports success.
     let entries = read_entries(host);
+    host.prepare_compute_restart()?;
     host.transition(3, 0)?;
     if host.recovery_state()? != 0 {
         return Err(EIO);

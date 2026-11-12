@@ -2013,6 +2013,7 @@ impl Backend {
         }
         let mut queue = cell.lock()?;
         if !queue.installed()
+            || queue.ordered_reinstall_pending()
             || queue.spared_pending()
             || !queue.pool_fits(required)
             || queue.pending_switch_from().is_some()

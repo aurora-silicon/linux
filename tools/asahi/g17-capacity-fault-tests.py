@@ -126,6 +126,9 @@ impl Queue {
     fn valid_ticket(&self, _: &Active, _: &Ticket) -> Result { Ok(()) }
     fn qos_owner(&self) -> u64 { 1 }
     fn context(&self) -> Option<&Arc<Context>> { self.binding.as_ref().map(|binding| &binding.context) }
+    // Ordered-reinstall policy is exercised by its own fixture. These capacity
+    // controls retain the production call sites without modelling that policy.
+    fn require_ordered_reinstall(&mut self) {}
 ''' + methods + r'''
 }
 fn idle(live: &Arc<AtomicUsize>) -> Queue {

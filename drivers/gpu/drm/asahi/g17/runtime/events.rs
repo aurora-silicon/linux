@@ -213,6 +213,15 @@ impl recovery::Queues for Service<'_> {
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         failure
     }
+    fn prepare_compute_restart(&mut self) -> Result {
+        for entry in self.firmware.queues.compute.iter_mut().flatten() {
+            if let Some(mut queue) = entry.queue.as_deref_mut() {
+                queue.prepare_recovery_restart()?;
+            }
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
     fn render_scheduler_active(&self) -> bool {
         self.firmware.queues.render_scheduler_active() || !self.firmware.queues.teardown.is_empty()
     }
