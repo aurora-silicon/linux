@@ -8,6 +8,9 @@
 /* Matched only once its sleep has been tested on hardware. */
 static const char *const apple_sleep_test_tested[] = {
 	"apple,t8140-sleep",
+#if IS_ENABLED(CONFIG_APPLE_T6040_SLEEP)
+	"apple,t6040-sleep",
+#endif
 };
 
 static bool apple_sleep_test_has(const struct apple_sleep_words *all, u32 offset)
@@ -76,6 +79,9 @@ static void apple_sleep_test_words(struct kunit *test)
 		};
 		int i;
 
+		/* A SoC with its own sequences has no lists. */
+		if (soc->part)
+			continue;
 		apple_sleep_test_full(test, c, "ps_all", all);
 		apple_sleep_test_full(test, c, "ps_aon_all", aon);
 		for (i = 0; i < ARRAY_SIZE(named); i++)
@@ -112,6 +118,8 @@ static void apple_sleep_test_books(struct kunit *test)
 	for (id = apple_sleep_of_match; id->compatible[0]; id++) {
 		const struct apple_sleep_soc *soc = id->data;
 
+		if (soc->part)
+			continue;
 		KUNIT_EXPECT_LE(test, soc->nstray, BITS_PER_LONG);
 		KUNIT_EXPECT_LE(test, soc->ngate_coprocs,
 				ARRAY_SIZE(((struct apple_sleep *)0)->gate));
@@ -126,6 +134,8 @@ static void apple_sleep_test_wake_names(struct kunit *test)
 		const struct apple_sleep_soc *soc = id->data;
 		int i, j;
 
+		if (soc->part)
+			continue;
 		KUNIT_EXPECT_NE(test, soc->wake_last_word, 0);
 		for (i = 0; i < soc->nwake_names; i++) {
 			u32 n = soc->wake_names[i].id;

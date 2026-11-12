@@ -780,6 +780,32 @@ void apple_sleep_restore_pins(void)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_restore_pins);
 
+/*
+ * The dry run level of the suspend in progress, for a SoC's part that has dry runs: every
+ * sleep step that can be taken back runs, and the sleep is refused before the commit. 0
+ * otherwise.
+ */
+static unsigned int apple_sleep_dry;
+
+void apple_sleep_set_dry(unsigned int level)
+{
+	WRITE_ONCE(apple_sleep_dry, level);
+}
+
+bool apple_sleep_power_loss(void)
+{
+	return pm_suspend_via_firmware() && !READ_ONCE(apple_sleep_dry);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_power_loss);
+
+bool apple_sleep_last_steps(void)
+{
+	unsigned int dry = READ_ONCE(apple_sleep_dry);
+
+	return pm_suspend_via_firmware() && (!dry || dry >= 2);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_last_steps);
+
 /* The registry's questions, answered for this SoC's sleep. */
 static bool apple_sleep_reg_commit_stops(void)
 {
@@ -3809,12 +3835,22 @@ static const struct apple_sleep_soc t8140_sleep_soc = {
 	.ave_pmc_cluster = 3,
 };
 
+#if IS_ENABLED(CONFIG_APPLE_T6040_SLEEP)
+/* T6040 (MacBook Pro J616s): its own sequences, in sleep-t6040.c. */
+static const struct apple_sleep_soc t6040_sleep_soc = {
+	.part = &t6040_sleep_part,
+};
+#endif
+
 /*
  * Only SoCs whose sleep was measured and tested. On every other the driver doesn't bind, and
  * s2idle stays the only sleep.
  */
 static const struct of_device_id apple_sleep_of_match[] = {
 	{ .compatible = "apple,t8140-sleep", .data = &t8140_sleep_soc },
+#if IS_ENABLED(CONFIG_APPLE_T6040_SLEEP)
+	{ .compatible = "apple,t6040-sleep", .data = &t6040_sleep_soc },
+#endif
 	{ }
 };
 

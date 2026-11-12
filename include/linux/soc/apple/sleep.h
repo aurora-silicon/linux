@@ -330,7 +330,7 @@ static inline int apple_sleep_engine_reset(struct device *dev)
 
 /*
  * Whether this firmware-driven suspend may end in a real power loss of the SoC, so that a
- * driver may stop what only a power cycle brings back. A T6040 dry run sets
+ * driver may stop what only a power cycle brings back. A dry run, which the T6040 has, sets
  * pm_suspend_via_firmware() to run every sleep step that can still be taken back and then
  * refuses before the commit: there this is false, and such a stop has to be left out.
  * Everywhere else it is pm_suspend_via_firmware().
@@ -339,7 +339,7 @@ static inline int apple_sleep_engine_reset(struct device *dev)
  * just (the SMC's sleep commit, each coprocessor's last check), run too. A real sleep and
  * the deepest dry run take them.
  */
-#if IS_ENABLED(CONFIG_APPLE_T6040_SLEEP)
+#if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP)
 bool apple_sleep_power_loss(void);
 bool apple_sleep_last_steps(void);
 #else

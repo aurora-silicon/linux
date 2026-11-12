@@ -5,7 +5,7 @@
  * A driver whose coprocessor can only be stopped once a sleep is certain
  * registers it here, readies it in its own suspend and leaves the last stop to
  * the commit of whichever sleep controller is bound on this SoC (sleep.c,
- * t6040-sleep.c). The table lives apart from the controllers so that one
+ * sleep-t6040.c). The table lives apart from the controllers so that one
  * kernel can carry all of them; each binds only to its own SoC.
  */
 
