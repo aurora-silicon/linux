@@ -815,8 +815,9 @@ static unsigned int t6040_sleep_log_groups(struct t6040_sleep *sleep)
 				pr_info("t6040-sleep:   %s +%#x = %#x\n", g->name, off, val);
 			}
 		}
-		pr_info("t6040-sleep: %-8s %s (on mask %#x, cpu first)\n", g->name,
-			on_mask ? "ON" : "off", on_mask);
+		if (on_mask)
+			pr_info("t6040-sleep: %-8s ON (on mask %#x, cpu first)\n", g->name,
+				on_mask);
 		blockers += !!on_mask;
 	}
 
@@ -897,7 +898,7 @@ static void t6040_ed_map(struct device *dev)
 						 k * T6040_ED_CORE_STRIDE, 0x1000);
 		n += !!t6040_ed[c][k];
 	}
-	dev_info(dev, "external debug windows mapped for %u cores\n", n);
+	dev_dbg(dev, "external debug windows mapped for %u cores\n", n);
 }
 
 static void t6040_ed_release(void)
@@ -985,7 +986,7 @@ static void t6040_sleep_power_ops(struct t6040_sleep *s)
 		return;
 	if (!spin_table_set_power_ops(&t6040_cpu_power_ops)) {
 		s->power_ops = true;
-		dev_info(s->dev, "CPU parking power ops registered\n");
+		dev_dbg(s->dev, "CPU parking power ops registered\n");
 	}
 }
 
@@ -1068,8 +1069,8 @@ static unsigned int t6040_sleep_refuse(struct t6040_sleep *s)
 			refused++;
 		}
 	}
-	pr_info("t6040-sleep: %u of %u registered coprocessors ready for the commit\n", ready,
-		registered);
+	pr_debug("t6040-sleep: %u of %u registered coprocessors ready for the commit\n", ready,
+		 registered);
 
 	if (num_online_cpus() != 1 || !s->mbox ||
 	    (read_cpuid_mpidr() & MPIDR_HWID_BITMASK) != s->mbox->boot_mpidr) {
@@ -1138,7 +1139,7 @@ static int t6040_sleep_coprocs_check(void)
 			pr_err("t6040-sleep: refused: %s: %d\n", dev_name(c->dev), ret);
 			return ret;
 		}
-		pr_info("t6040-sleep: last check of %s passed\n", dev_name(c->dev));
+		pr_debug("t6040-sleep: last check of %s passed\n", dev_name(c->dev));
 	}
 
 	return 0;
@@ -1264,12 +1265,12 @@ static void t6040_sio_ps_restore(struct t6040_sleep *s)
 		if (n == 1000)
 			failed++;
 		raised++;
-		pr_info("t6040-sleep: wake: SOC-East power word +%#x: %#x at the commit, %#x after the wake, now %#x\n",
-			off, saved, val, cur);
+		pr_debug("t6040-sleep: wake: SOC-East power word +%#x: %#x at the commit, %#x after the wake, now %#x\n",
+			 off, saved, val, cur);
 	}
-	if (raised)
-		pr_info("t6040-sleep: wake: %u power word(s) raised again, %u not on\n", raised,
-			failed);
+	if (failed)
+		pr_warn("t6040-sleep: wake: %u of %u SIO power word(s) raised again did not come on\n",
+			failed, raised);
 }
 
 /* As on T8140, measured on ANS: status and control read, then the run bit cleared twice. */
@@ -1328,7 +1329,7 @@ static const u32 t6040_wake_mask[AOP_WAKE_WORDS] = {
  * regmap 1 + 0x70970 shifted right by 3; the platform reads
  * 0x508370970 at quiesce. It tells "the SoC entered S2R" from "the
  * engine never finished". Read-only, with the AOP-global S2R control, wake masks and
- * wake status, logged at probe so the boot after a failed sleep shows them.
+ * wake status, at debug level: at probe, for the boot after a failed sleep, and in a dry run.
  */
 #define T6040_S2R_LO_COUNT_PA	0x508370970ULL
 
@@ -1347,12 +1348,12 @@ static void t6040_sleep_log_s2r_state(struct t6040_sleep *s, const char *when)
 			st[i] = readl(s->aop_global + AOP_WAKE_STATUS(i));
 		}
 	}
-	dev_info(s->dev, "S2R state at %s: S2R-lo count %u (raw %#x), AOP-global ctl %#x\n",
-		 when, raw >> 3, raw, ctl);
-	dev_info(s->dev, "S2R state at %s: wake masks %*ph\n", when,
-		 (int)sizeof(m), m);
-	dev_info(s->dev, "S2R state at %s: wake status %*ph\n", when,
-		 (int)sizeof(st), st);
+	dev_dbg(s->dev, "S2R state at %s: S2R-lo count %u (raw %#x), AOP-global ctl %#x\n",
+		when, raw >> 3, raw, ctl);
+	dev_dbg(s->dev, "S2R state at %s: wake masks %*ph\n", when,
+		(int)sizeof(m), m);
+	dev_dbg(s->dev, "S2R state at %s: wake status %*ph\n", when,
+		(int)sizeof(st), st);
 }
 
 /*
@@ -1615,7 +1616,7 @@ static void t6040_axi2af_show(struct t6040_sleep *sleep, struct seq_file *s)
 
 /*
  * Read-only axi2af gate: on entry the platform panics unless every reachable domain's
- * power word reads [7:4]==0. We only log the ones still on, as a safety check.
+ * power word reads [7:4]==0. Here the ones still on are only named, at debug level.
  */
 static void t6040_axi2af_readcheck(struct t6040_sleep *s)
 {
@@ -1629,13 +1630,13 @@ static void t6040_axi2af_readcheck(struct t6040_sleep *s)
 			continue;
 		val = readl(ps);
 		if (FIELD_GET(PS_ACTUAL, val)) {
-			pr_info("t6040-sleep: axi2af %s still on (%#x) at commit\n",
-				t6040_axi2af[i].name, val);
+			pr_debug("t6040-sleep: axi2af %s still on (%#x) at commit\n",
+				 t6040_axi2af[i].name, val);
 			on++;
 		}
 	}
 	if (on)
-		pr_info("t6040-sleep: %d axi2af domain(s) still powered at commit\n", on);
+		pr_debug("t6040-sleep: %d axi2af domain(s) still powered at commit\n", on);
 }
 
 /*
@@ -1660,8 +1661,8 @@ static void t6040_axi2af_rearm(struct t6040_sleep *s)
 		if (FIELD_GET(PS_TARGET, val) != 0xf)
 			continue;
 		if (!FIELD_GET(PS_ACTUAL, val)) {
-			pr_info("t6040-sleep: wake: axi2af %s not re-armed, PS %#x (gated)\n",
-				t6040_axi2af[i].name, val);
+			pr_debug("t6040-sleep: wake: axi2af %s not re-armed, PS %#x (gated)\n",
+				 t6040_axi2af[i].name, val);
 			continue;
 		}
 		t6040_wake_sync();
@@ -2584,7 +2585,7 @@ static void t6040_sleep_return(struct t6040_sleep *s)
 
 	if (s->mbox) {
 		dcache_inval_poc((unsigned long)s->mbox, (unsigned long)(s->mbox + 1));
-		pr_info("t6040-sleep: wake: resumes now %llu\n", READ_ONCE(s->mbox->resumes));
+		pr_debug("t6040-sleep: wake: resumes now %llu\n", READ_ONCE(s->mbox->resumes));
 	}
 	if (s->aop_global)
 		for (i = 0; i < AOP_WAKE_WORDS; i++)
@@ -2676,22 +2677,21 @@ static int t6040_sleep_begin(suspend_state_t state)
 	if (dcs_to)
 		pr_warn("t6040-sleep: DCS power words %#x did not read on before automatic mode\n",
 			dcs_to);
-	pr_info("t6040-sleep: suspend requested: %u live blocker(s) (%u display, cleared during device suspend)\n",
-		live, disp);
-	t6040_sleep_log_blockers(s);
-
 	if (!begin_total && allow_entry && !dry) {
 		/* The non-display blockers are clear and no dry run is asked for: proceed
 		 * to device suspend; .enter holds the real commit until the display is
 		 * also off. The AON WD2 is the net from here. */
-		if (disp)
-			pr_warn("t6040-sleep: entering: %u display pipe(s) still on, relying on device suspend to lower them before the commit\n",
-				disp);
+		pr_debug("t6040-sleep: entering: %u display pipe(s) on, to be lowered before the commit\n",
+			 disp);
 		t6040_sleep_power_ops(s);
 		t6040_sleep_set_wd2(s, WDT_SUSPEND_SECS);
 		pm_set_suspend_via_firmware();
 		return 0;
 	}
+
+	pr_info("t6040-sleep: suspend requested: %u live blocker(s) (%u display, cleared during device suspend)\n",
+		live, disp);
+	t6040_sleep_log_blockers(s);
 
 	if (dry >= 2) {
 		dry = min(dry, 3U);
@@ -3023,8 +3023,8 @@ static void t6040_disp_back(struct t6040_sleep *s)
 		if (boost != s->pmc_if_saved[1])
 			writel(boost | s->pmc_if_saved[1], s->pmc_bwr + PMC_BOOST);
 		if (bwr != s->pmc_if_saved[0] || boost != s->pmc_if_saved[1])
-			pr_info("t6040-sleep: wake: PMC display interfaces BWR %#x boost %#x, put back to %#x %#x\n",
-				bwr, boost, readl(s->pmc_bwr), readl(s->pmc_bwr + PMC_BOOST));
+			pr_debug("t6040-sleep: wake: PMC display interfaces BWR %#x boost %#x, put back to %#x %#x\n",
+				 bwr, boost, readl(s->pmc_bwr), readl(s->pmc_bwr + PMC_BOOST));
 	}
 }
 
@@ -3117,7 +3117,7 @@ static int t6040_sleep_enter(suspend_state_t state)
 	if (!ret)
 		t6040_sleep_return(s);
 	if (s->ans_bridge_quiesced)
-		pr_info("t6040-sleep: ANS's fabric bridge was armed at the commit: quiesced\n");
+		pr_debug("t6040-sleep: ANS's fabric bridge was armed at the commit: quiesced\n");
 
 	if (s->returned)
 		t6040_wake_sync();
@@ -3444,9 +3444,9 @@ static void t6040_sleep_map_gp(struct t6040_sleep *s)
 			s->gp_pins = t6040_ioremap_np(s->dev, res.start, resource_size(&res));
 		of_node_put(pins);
 	}
-	dev_info(s->dev, "GP PCIe: ports %d/%d phys %d/%d, PERST# pins %d/%d\n",
-		 !!s->gp_port[0], !!s->gp_port[1], !!s->gp_phy[0], !!s->gp_phy[1],
-		 s->gp_perst[0], s->gp_perst[1]);
+	dev_dbg(s->dev, "GP PCIe: ports %d/%d phys %d/%d, PERST# pins %d/%d\n",
+		!!s->gp_port[0], !!s->gp_port[1], !!s->gp_phy[0], !!s->gp_phy[1],
+		s->gp_perst[0], s->gp_perst[1]);
 out:
 	of_node_put(host);
 }
@@ -3482,8 +3482,9 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 		sleep->wdt_stub_ok = widx >= 0 &&
 			!of_address_to_resource(pdev->dev.of_node, widx, &wres) &&
 			wres.start == T6040_WDT_PA;
-		dev_info(&pdev->dev, "wake stub (WD2 60 s before cpu_resume): %s\n",
-			 sleep->wdt_stub_ok ? "ready" : "no, wdt block is not the AON WDT");
+		if (!sleep->wdt_stub_ok)
+			dev_warn(&pdev->dev,
+				 "the wdt block is not the AON watchdog: no WD2 restart at the wake\n");
 	}
 	sleep->cluster_ctl = t6040_sleep_map(&pdev->dev, "cluster-ctl");
 	sleep->pwrgate = t6040_sleep_map(&pdev->dev, "soc-pwrgate");
@@ -3530,16 +3531,6 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 		sleep->tvm_status[i] = t6040_ioremap_np(&pdev->dev, t6040_tvm[i].status, 4);
 	}
 	sleep->afr_ps = t6040_ioremap_np(&pdev->dev, T6040_AFR_PS_PA, 4);
-	if (sleep->ka_soc && sleep->ka_east) {
-		u32 soc = 0, east = 0;
-
-		for (i = 0; i < KA_WORDS; i++) {
-			soc |= (readl(sleep->ka_soc + i * KA_STRIDE) & 1) << i;
-			east |= (readl(sleep->ka_east + i * KA_STRIDE) & 1) << i;
-		}
-		dev_info(&pdev->dev, "keep-alive bits at probe: SOC %#010x, SOC-East %#010x\n",
-			 soc, east);
-	}
 	t6040_sleep_map_gp(sleep);
 	t6040_ed_map(&pdev->dev);
 
