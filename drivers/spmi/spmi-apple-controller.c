@@ -739,16 +739,14 @@ static int apple_spmi_restore_noirq(struct device *dev)
 
 /*
  * A controller in a PM domain does not get the callback above: genpd's
- * restore_noirq ends in the driver's resume_noirq, whatever callback
- * genpd_finish_resume() was given (outside a wakeup path), and that has
- * nothing to do after a resume from disk. The masks then stay as the boot
- * kernel left them: its probe masked everything, and only its own drivers
- * unmasked theirs before it loaded the image (on T6040 not the Type-C port
- * controllers, whose driver is a module). The IRQ core disables lazily and
- * unmasks only an IRQ it recorded as masked, so it does not write them again
- * either, and the port controllers on nub_spmi_a0/a1 raise no event after the
- * restore. genpd does not wrap the early restore: catch up there, before the
- * devices on the bus are restored.
+ * restore_noirq calls the driver's resume_noirq instead (outside a wakeup
+ * path). The masks then stay as the boot kernel left them, everything masked
+ * but the interrupts of the drivers it loaded, and the IRQ core does not write
+ * them again (it disables lazily and unmasks only an IRQ it recorded as
+ * masked). A device whose driver the boot kernel did not load, such as a
+ * Type-C port controller on nub_spmi_a0/a1, would raise no event after the
+ * restore. genpd does not wrap the early restore, so the masks are rewritten
+ * there, before the devices on the bus are restored.
  */
 static int apple_spmi_restore_early(struct device *dev)
 {
