@@ -532,6 +532,15 @@ static void apple_spmi_irq_handler(struct irq_desc *desc)
 	chained_irq_exit(chip, desc);
 }
 
+/* Every interrupt masked, the notification included, and what is latched dropped. */
+static void apple_spmi_irq_reset(struct apple_spmi *spmi)
+{
+	for (size_t offset = 0; offset < (spmi->hw->num_irqs + 32) / 8; offset += 4) {
+		writel(0, spmi->regs + SPMI_IRQ_MASK_BASE + offset);
+		writel(U32_MAX, spmi->regs + SPMI_IRQ_ACK_BASE + offset);
+	}
+}
+
 static void apple_spmi_teardown_irq(void *data)
 {
 	struct apple_spmi *spmi = data;
@@ -556,10 +565,7 @@ static int apple_spmi_init_irq(struct platform_device *pdev,
 
 	raw_spin_lock_init(&spmi->irq_mask_lock);
 
-	for (size_t offset = 0; offset < (spmi->hw->num_irqs + 32) / 8; offset += 4) {
-		writel(0, spmi->regs + SPMI_IRQ_MASK_BASE + offset);
-		writel(U32_MAX, spmi->regs + SPMI_IRQ_ACK_BASE + offset);
-	}
+	apple_spmi_irq_reset(spmi);
 
 	spmi->irqd = devm_irq_domain_instantiate(&pdev->dev, &info);
 	if (IS_ERR(spmi->irqd))
@@ -719,10 +725,7 @@ static void apple_spmi_hib_resync_irqs(struct apple_spmi *spmi)
 	 * pending complete a register selection of a device restored now
 	 * before its own answer arrives. The devices read their state afresh.
 	 */
-	for (size_t offset = 0; offset < (nirq + 32) / 8; offset += 4) {
-		writel(0, spmi->regs + SPMI_IRQ_MASK_BASE + offset);
-		writel(U32_MAX, spmi->regs + SPMI_IRQ_ACK_BASE + offset);
-	}
+	apple_spmi_irq_reset(spmi);
 	for (size_t offset = 0; offset < (nirq + 32) / 8; offset += 4) {
 		u32 val = 0;
 
