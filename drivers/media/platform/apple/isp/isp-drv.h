@@ -411,6 +411,10 @@ struct apple_isp {
 	} fw;
 	/* changes under video_lock once the video device is registered */
 	enum isp_fw_state fw_state;
+	/* First IPC failure; cleared only after fresh channel initialization. */
+	int ipc_error;
+	/* End the current receive invocation before resident reclamation. */
+	bool ipc_quiescing;
 	/* firmware that starts again, idling until fw_idle_work stops it */
 	bool fw_idle;
 	struct delayed_work fw_idle_work;

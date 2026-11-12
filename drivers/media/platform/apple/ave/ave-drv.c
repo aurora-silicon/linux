@@ -120,6 +120,28 @@ static const struct ave_variant ave_t8140 = {
 };
 
 /*
+ * The M5 Pro and Max (T6050) run the macOS 27.0 (26A428) firmware build, preloaded with TEXT
+ * 0x154000 and DATA 0x134000 (ADT ave0 segment-ranges). macOS starts the coprocessor as on the
+ * A18 Pro, after clearing the SVE idle word at mailbox +0x118. Its boot configuration names
+ * device 28, and so does its handshake's device type.
+ */
+static const struct ave_variant ave_t6050 = {
+	.regs = &ave_coproc_v40,
+	.fw_text_size = 0x154000,
+	.fw_data_size = 0x134000,
+	.boot_device_id = 28,
+	.boot_arg_value = AVE_COPROC_BOOT_ARG_VALUE,
+	.timebase_multiplier = 1,
+	.vcbar_mask = U64_MAX,
+	.vcbar_flags = AVE_COPROC_VCBAR_VALID,
+	.device_type = 28,
+	.lfs_ref_scale = 2,
+	.text_crc = AVE_FW_TEXT_CRC_T6050_26A428,
+	.mbox_idle = 0x118,
+	.boot_qualified = true,
+};
+
+/*
  * debugfs: apple-ave/last_start_{h264,hevc} hold the last Start built and
  * last_process0_{h264,hevc} the first Process of the last session, so the
  * generated commands can be compared with reference captures.
@@ -545,6 +567,7 @@ static const struct dev_pm_ops ave_pm_ops = {
 static const struct of_device_id ave_of_match[] = {
 	{ .compatible = "apple,t6000-ave", .data = &ave_t6000 },
 	{ .compatible = "apple,t6041-ave", .data = &ave_t6041 },
+	{ .compatible = "apple,t6050-ave", .data = &ave_t6050 },
 	{ .compatible = "apple,t8112-ave", .data = &ave_t8112 },
 	{ .compatible = "apple,t8140-ave", .data = &ave_t8140 },
 	{}
