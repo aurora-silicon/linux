@@ -58,7 +58,7 @@ static void apple_ptd_test_read(void *ctx, struct apple_ptd_sample *out)
 	for (i = 0; i < PTD_BATT_WORDS; i++)
 		out->word[i] = 0x100 + i;
 	if (src->reads < src->torn)
-		out->word[PTD_POWER_10MS] = src->reads;
+		out->word[PTD_SYS_POWER] = src->reads;
 	src->reads++;
 }
 
@@ -68,8 +68,8 @@ static void apple_ptd_test_stable_read(struct kunit *test)
 	struct apple_ptd_sample s = {};
 
 	KUNIT_EXPECT_EQ(test, apple_ptd_stable_read(apple_ptd_test_read, &src, &s), 0);
-	KUNIT_EXPECT_EQ(test, s.word[PTD_POWER_10MS], 0x104);
-	KUNIT_EXPECT_EQ(test, s.word[PTD_VOLT_10MS], 0x100);
+	KUNIT_EXPECT_EQ(test, s.word[PTD_SYS_POWER], 0x101);
+	KUNIT_EXPECT_EQ(test, s.word[PTD_BATT_VOLT], 0x100);
 	/* Pairs (0,1) and (2,3) disagree, the third pair agrees. */
 	KUNIT_EXPECT_EQ(test, src.reads, 6);
 }
@@ -86,52 +86,46 @@ static void apple_ptd_test_stable_read_gives_up(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, s.word[0], 7);
 }
 
-/* Signed Q16.16 from a count of quarter units (no floating point). */
-#define Q16Q(q)	((u32)(s32)((q) * 16384))
-
 static void apple_ptd_test_convert(struct kunit *test)
 {
+	/* Values seen on a J616s: 13095.4 mV battery, 0.4335 W system. */
 	struct apple_ptd_sample s = {
 		.word = {
-			[PTD_VOLT_10MS] = Q16Q(50),
-			[PTD_CURR_100MS] = 1234,
-			[PTD_CURR_10MS] = Q16Q(-5),
-			[PTD_POWER_100MS] = Q16Q(63),
-			[PTD_POWER_10MS] = Q16Q(-82),
-			[PTD_VOLT_100MS] = Q16Q(49),
+			[PTD_BATT_VOLT] = 858218725,
+			[PTD_SYS_POWER] = 28410,
 		},
 	};
 	long v;
 
 	KUNIT_EXPECT_EQ(test, apple_ptd_convert(&s, hwmon_in, 0, &v), 0);
-	KUNIT_EXPECT_EQ(test, v, 12500);
-	KUNIT_EXPECT_EQ(test, apple_ptd_convert(&s, hwmon_in, 1, &v), 0);
-	KUNIT_EXPECT_EQ(test, v, 12250);
-	KUNIT_EXPECT_EQ(test, apple_ptd_convert(&s, hwmon_curr, 0, &v), 0);
-	KUNIT_EXPECT_EQ(test, v, -1250);
-	KUNIT_EXPECT_EQ(test, apple_ptd_convert(&s, hwmon_curr, 1, &v), 0);
-	KUNIT_EXPECT_EQ(test, v, 1234);
+	KUNIT_EXPECT_EQ(test, v, 13095);
 	KUNIT_EXPECT_EQ(test, apple_ptd_convert(&s, hwmon_power, 0, &v), 0);
-	KUNIT_EXPECT_EQ(test, v, -20500000);
-	KUNIT_EXPECT_EQ(test, apple_ptd_convert(&s, hwmon_power, 1, &v), 0);
-	KUNIT_EXPECT_EQ(test, v, 15750000);
+	KUNIT_EXPECT_EQ(test, v, 433502);
+	KUNIT_EXPECT_EQ(test, apple_ptd_convert(&s, hwmon_in, 1, &v), -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, apple_ptd_convert(&s, hwmon_curr, 0, &v), -EOPNOTSUPP);
 	KUNIT_EXPECT_EQ(test, apple_ptd_convert(&s, hwmon_temp, 0, &v), -EOPNOTSUPP);
 }
 
-static void apple_ptd_test_q16_truncates(struct kunit *test)
+static void apple_ptd_test_uq16(struct kunit *test)
 {
 	long v;
 
-	/* One LSB is 15.26 uV: truncated toward zero on both signs. */
-	KUNIT_EXPECT_EQ(test, apple_ptd_q16(1, MICRO, &v), 0);
+	/* Truncated: one LSB is 15.26 uW, 1/65536 mV. */
+	KUNIT_EXPECT_EQ(test, apple_ptd_uq16(1, MICRO, &v), 0);
 	KUNIT_EXPECT_EQ(test, v, 15);
-	KUNIT_EXPECT_EQ(test, apple_ptd_q16((u32)-1, MICRO, &v), 0);
-	KUNIT_EXPECT_EQ(test, v, -15);
-	/* Full-scale values keep their sign; nothing is read as unsigned. */
-	KUNIT_EXPECT_EQ(test, apple_ptd_q16(0x80000000, MILLI, &v), 0);
-	KUNIT_EXPECT_EQ(test, v, -32768000);
-	KUNIT_EXPECT_EQ(test, apple_ptd_q16(0x7fffffff, MILLI, &v), 0);
-	KUNIT_EXPECT_EQ(test, v, 32767999);
+	KUNIT_EXPECT_EQ(test, apple_ptd_uq16(65535, 1, &v), 0);
+	KUNIT_EXPECT_EQ(test, v, 0);
+	/* The top bit is magnitude, not sign. */
+	KUNIT_EXPECT_EQ(test, apple_ptd_uq16(0x80000000, 1, &v), 0);
+	KUNIT_EXPECT_EQ(test, v, 32768);
+	KUNIT_EXPECT_EQ(test, apple_ptd_uq16(0xffffffff, 1, &v), 0);
+	KUNIT_EXPECT_EQ(test, v, 65535);
+#if BITS_PER_LONG == 64
+	KUNIT_EXPECT_EQ(test, apple_ptd_uq16(0xffffffff, MICRO, &v), 0);
+	KUNIT_EXPECT_EQ(test, v, 65535999984L);
+#else
+	KUNIT_EXPECT_EQ(test, apple_ptd_uq16(0xffffffff, MICRO, &v), -EOVERFLOW);
+#endif
 }
 
 static struct kunit_case apple_ptd_test_cases[] = {
@@ -140,7 +134,7 @@ static struct kunit_case apple_ptd_test_cases[] = {
 	KUNIT_CASE(apple_ptd_test_stable_read),
 	KUNIT_CASE(apple_ptd_test_stable_read_gives_up),
 	KUNIT_CASE(apple_ptd_test_convert),
-	KUNIT_CASE(apple_ptd_test_q16_truncates),
+	KUNIT_CASE(apple_ptd_test_uq16),
 	{}
 };
 

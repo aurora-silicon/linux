@@ -417,11 +417,10 @@ config SENSORS_APPLE_AON_PTD
 	depends on (ARCH_APPLE && OF) || COMPILE_TEST
 	depends on HAS_IOMEM
 	help
-	  Read-only battery voltage, current and power from the always-on
-	  power telemetry (PTD) block of Apple M4 Pro (T6041) machines, as
-	  10 ms and 100 ms filtered samples. The driver maps only the
-	  block's non-consuming peek window, takes no interrupts, writes
-	  nothing and sets no trips.
+	  Read-only battery voltage and system power from the always-on
+	  power telemetry (PTD) block of Apple M4 Pro (T6041) machines. The
+	  driver maps only the block's non-consuming peek window, takes no
+	  interrupts, writes nothing and sets no trips.
 
 	  This driver can also be built as a module. If so, the module will
 	  be called apple-aon-ptd-hwmon.

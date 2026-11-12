@@ -11,8 +11,10 @@
  * or interrupt-control windows, takes no interrupts, writes nothing and sets
  * no trips.
  *
- * The record words are 10 ms and 100 ms filtered battery samples, already
- * averaged by the producer, so the driver adds no filtering of its own.
+ * Read passively, the record carries battery voltage and a non-negative
+ * system power figure, both already filtered by the producer, so the driver
+ * adds no filtering of its own. Its other words are either zero or a
+ * producer counter and are not read.
  */
 
 #include <linux/hwmon.h>
@@ -20,7 +22,6 @@
 #include <linux/kernel.h>
 #include <linux/ktime.h>
 #include <linux/limits.h>
-#include <linux/math64.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -37,9 +38,9 @@
 #define PTD_BATT_VERSION	1
 #define PTD_BATT_MIN_SLOTS	4
 
-/* Words read, from byte 0x04 of the record; see enum ptd_batt_word. */
-#define PTD_BATT_FIRST		0x04
-#define PTD_BATT_WORDS		6
+/* Words read, from byte 0x10 of the record; see enum ptd_batt_word. */
+#define PTD_BATT_FIRST		0x10
+#define PTD_BATT_WORDS		2
 
 /* Two identical back-to-back reads make a sample; give up after this many. */
 #define PTD_READ_TRIES		8
@@ -47,12 +48,8 @@
 #define PTD_CACHE_NS		(10 * NSEC_PER_MSEC)
 
 enum ptd_batt_word {
-	PTD_VOLT_10MS,		/* 0x04: signed Q16.16 volts */
-	PTD_CURR_100MS,		/* 0x08: unsigned milliamps */
-	PTD_CURR_10MS,		/* 0x0c: signed Q16.16 amperes */
-	PTD_POWER_100MS,	/* 0x10: signed Q16.16 watts */
-	PTD_POWER_10MS,		/* 0x14: signed Q16.16 watts */
-	PTD_VOLT_100MS,		/* 0x18: signed Q16.16 volts */
+	PTD_BATT_VOLT,		/* 0x10: unsigned Q16.16 millivolts */
+	PTD_SYS_POWER,		/* 0x14: unsigned Q16.16 watts */
 };
 
 struct apple_ptd_sample {
@@ -113,12 +110,12 @@ static int apple_ptd_stable_read(apple_ptd_read_fn read, void *ctx,
 	return -EAGAIN;
 }
 
-/* Signed Q16.16 to @scale units per unit, truncated toward zero. */
-static int apple_ptd_q16(u32 raw, s64 scale, long *val)
+/* Unsigned Q16.16 to @scale units per unit, truncated. */
+static int apple_ptd_uq16(u32 raw, u32 scale, long *val)
 {
-	s64 v = div_s64((s64)(s32)raw * scale, 65536);
+	u64 v = ((u64)raw * scale) >> 16;
 
-	if (v > LONG_MAX || v < LONG_MIN)
+	if (v > LONG_MAX)
 		return -EOVERFLOW;
 	*val = v;
 	return 0;
@@ -128,20 +125,15 @@ static int apple_ptd_convert(const struct apple_ptd_sample *s,
 			     enum hwmon_sensor_types type, int channel,
 			     long *val)
 {
+	if (channel)
+		return -EOPNOTSUPP;
+
 	switch (type) {
 	case hwmon_in:
-		return apple_ptd_q16(s->word[channel ? PTD_VOLT_100MS : PTD_VOLT_10MS],
-				     MILLI, val);
-	case hwmon_curr:
-		if (!channel)
-			return apple_ptd_q16(s->word[PTD_CURR_10MS], MILLI, val);
-		if (s->word[PTD_CURR_100MS] > LONG_MAX)
-			return -EOVERFLOW;
-		*val = s->word[PTD_CURR_100MS];
-		return 0;
+		/* The voltage word is already in millivolts. */
+		return apple_ptd_uq16(s->word[PTD_BATT_VOLT], 1, val);
 	case hwmon_power:
-		return apple_ptd_q16(s->word[channel ? PTD_POWER_100MS : PTD_POWER_10MS],
-				     MICRO, val);
+		return apple_ptd_uq16(s->word[PTD_SYS_POWER], MICRO, val);
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -180,7 +172,7 @@ static int apple_ptd_read_string(struct device *dev,
 				 enum hwmon_sensor_types type, u32 attr,
 				 int channel, const char **str)
 {
-	*str = channel ? "Battery 100 ms" : "Battery 10 ms";
+	*str = type == hwmon_in ? "Battery" : "System";
 	return 0;
 }
 
@@ -192,15 +184,8 @@ static umode_t apple_ptd_is_visible(const void *data,
 }
 
 static const struct hwmon_channel_info * const apple_ptd_info[] = {
-	HWMON_CHANNEL_INFO(in,
-			   HWMON_I_INPUT | HWMON_I_LABEL,
-			   HWMON_I_INPUT | HWMON_I_LABEL),
-	HWMON_CHANNEL_INFO(curr,
-			   HWMON_C_INPUT | HWMON_C_LABEL,
-			   HWMON_C_INPUT | HWMON_C_LABEL),
-	HWMON_CHANNEL_INFO(power,
-			   HWMON_P_INPUT | HWMON_P_LABEL,
-			   HWMON_P_INPUT | HWMON_P_LABEL),
+	HWMON_CHANNEL_INFO(in, HWMON_I_INPUT | HWMON_I_LABEL),
+	HWMON_CHANNEL_INFO(power, HWMON_P_INPUT | HWMON_P_LABEL),
 	NULL
 };
 

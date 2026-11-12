@@ -23,22 +23,24 @@ driver does not bind. Machines whose firmware has no such record, such as
 the MacBook Neo (T8140), do not carry the property.
 
 The SMC driver (macsmc-hwmon, macsmc-power) remains the source of battery
-state and charge information. These channels add the 10 ms and 100 ms
-filtered voltage, current and power that the PTD block carries.
+state, current and charge information. The PTD record adds the battery
+voltage and the system power as the producer filters them.
 
 Sysfs entries
 -------------
 
 =============== ===== ==================================================
-in0_input       mV    battery voltage, 10 ms filter
-in1_input       mV    battery voltage, 100 ms filter
-curr1_input     mA    battery current, 10 ms filter (signed)
-curr2_input     mA    battery current, 100 ms filter
-power1_input    uW    battery power, 10 ms filter (signed)
-power2_input    uW    battery power, 100 ms filter (signed)
-\*_label              ``Battery 10 ms`` or ``Battery 100 ms``
+in0_input       mV    battery voltage
+in0_label             ``Battery``
+power1_input    uW    system power (never negative; this is not the
+                      battery charge or discharge power)
+power1_label          ``System``
 =============== ===== ==================================================
 
-Each read takes the six words twice and uses them only when both reads
+The record holds both values as unsigned Q16.16 fixed point: the voltage in
+millivolts, the power in watts. Its other words read as zero or as a
+producer counter and are not reported.
+
+Each read takes the two words twice and uses them only when both reads
 agree; after eight disagreeing attempts the read fails with ``-EAGAIN``.
 Reads within 10 ms of each other share one sample.
