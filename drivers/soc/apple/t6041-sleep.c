@@ -2029,8 +2029,11 @@ static int t6041_sleep_probe(struct platform_device *pdev)
 			if (IS_ERR(s->mbox) || READ_ONCE(s->mbox->magic) != T6041_S2R_MAGIC)
 				s->mbox = NULL;
 		}
-		if (!s->mbox)
-			dev_warn(dev, "no aura S2R mailbox: sleep refused\n");
+		/* With no way back, a sleep would end in aura's boot flow over this kernel. */
+		if (!s->mbox) {
+			dev_info(dev, "no aura S2R mailbox: no deep sleep\n");
+			return -ENODEV;
+		}
 	}
 
 	{
