@@ -37,9 +37,9 @@
  *    suspend and resume around it.
  *
  * Why this file and not a generalisation of sleep.c: the port keeps
- * the T8140 behaviour byte-identical, and the per-SoC match data should be
- * built once the T6040 commit and wake are known from a trace. Until then it is
- * a controller of its own. The coprocessor and enclave registry is shared
+ * the T8140 behaviour byte-identical, and the T6040 commit and wake differ
+ * from it in most steps, so it is a controller of its own. The coprocessor and
+ * enclave registry is shared
  * (sleep-registry.c), so one kernel carries both controllers, and each binds
  * only to its own SoC.
  */
@@ -2022,7 +2022,7 @@ static void t6040_bridge_rearm(void __iomem *bridge)
 
 /*
  * RESUME: raise ANS's storage link from power-off, the two-lane adaptation of
- * #1208's t8140_sleep_raise_apcie(). Runs atomic on the waking core in
+ * T8140's t8140_sleep_raise_apcie(). Runs atomic on the waking core in
  * t6040_sleep_return(), AFTER t6040_axi2af_rearm() and BEFORE control returns to
  * the PM core, so nvme's resume_early sets the ANS run bit onto a live link.
  * Both lanes come up; the PLL/clkgen/PHY tables run once (shared). The two
