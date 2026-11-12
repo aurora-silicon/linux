@@ -301,6 +301,19 @@ static int sn201202x_ldcm_set_mitigation(void *ctx, bool enable)
 		return 0;
 
 	/*
+	 * As macOS, which reads a dry port's status but sends it no LDCM
+	 * command: only a mitigation this driver requested since the
+	 * controller's last reset needs removing.
+	 */
+	if (!enable && !sn->ldcm_requested) {
+		sn->ldcm_mitigation_known = true;
+		sn->ldcm_mitigated = false;
+		return 0;
+	}
+	if (enable)
+		sn->ldcm_requested = true;
+
+	/*
 	 * Successful task completion is the controller's mitigation ACK.
 	 * Startup commands can take more than a second on SN201202x. Wait for
 	 * completion before a retry can request the opposite mitigation state.
@@ -310,6 +323,8 @@ static int sn201202x_ldcm_set_mitigation(void *ctx, bool enable)
 	sn->ldcm_mitigation_known = !ret;
 	if (!ret)
 		sn->ldcm_mitigated = enable;
+	if (!ret && !enable)
+		sn->ldcm_requested = false;
 	return ret;
 }
 
@@ -465,6 +480,7 @@ static void sn201202x_ldcm_invalidate(struct tps6598x *tps)
 	tps->contaminant = TYPEC_CONTAMINANT_UNKNOWN;
 	sn->ldcm_mitigated = false;
 	sn->ldcm_mitigation_known = false;
+	sn->ldcm_requested = false;
 	sn201202x_ldcm_event(tps);
 }
 
