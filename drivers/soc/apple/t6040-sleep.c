@@ -4892,10 +4892,17 @@ static void t6040_sleep_return(struct t6040_sleep *s)
 	s->returned = true;
 }
 
+/*
+ * Offer "deep" only when the system was booted with allow_entry: without it
+ * every suspend to RAM is refused, so mem_sleep keeps s2idle as its default.
+ */
 static int t6040_sleep_valid(suspend_state_t state)
 {
-	return state == PM_SUSPEND_MEM;
+	return state == PM_SUSPEND_MEM && READ_ONCE(allow_entry);
 }
+
+/* Set by .begin for a suspend to RAM; .end only undoes what .begin did. */
+static bool t6040_sleep_mem_begun;
 
 /*
  * The refusal-first gate. Default: print the blocker list and return an error
@@ -4997,6 +5004,15 @@ static int t6040_sleep_begin(suspend_state_t state)
 	 * full set at the commit point, by which time the display is off. */
 	unsigned int begin_total = live - disp;
 	unsigned int dry = READ_ONCE(dry_run), secs;
+
+	/*
+	 * The PM core calls .begin and .end for suspend-to-idle too when there
+	 * are no s2idle_ops. s2idle needs nothing from this controller.
+	 */
+	t6040_sleep_mem_begun = false;
+	if (state != PM_SUSPEND_MEM)
+		return 0;
+	t6040_sleep_mem_begun = true;
 
 	WRITE_ONCE(t6040_sleep_dry, 0);
 	s->returned = false;
@@ -5976,6 +5992,9 @@ static void t6040_sleep_end(void)
 	struct t6040_sleep *s = t6040_sleep;
 	unsigned int dry = READ_ONCE(t6040_sleep_dry);
 
+	if (!t6040_sleep_mem_begun)
+		return;
+	t6040_sleep_mem_begun = false;
 	t6040_sleep_clear_wd2(s);
 	WRITE_ONCE(pm_bringup_dev_mark, NULL);
 	/* Any return or refusal after .begin: the wake alarm back where the RTC driver set it. */
