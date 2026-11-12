@@ -1045,7 +1045,9 @@ impl Firmware {
             }
             power::IdleAction::Recheck(delay) => Some(delay),
         };
-        if let Some(ceiling) = self.ceiling.as_mut() {
+        // A stopped firmware polls nothing; the next pass after the wake samples again.
+        let sleeping = self.primary.state.shared.sleeping();
+        if let Some(ceiling) = self.ceiling.as_mut().filter(|_| !sleeping) {
             ceiling.update(&self.init)?;
             if in_flight || submitted {
                 effort = Some(effort.map_or(power::PMP_REPORT_PERIOD_NS, |delay| {
