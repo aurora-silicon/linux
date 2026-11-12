@@ -216,6 +216,8 @@ const RNG_MAX_WORDS_PER_READ: usize = 16;
 // already being written can still go out once the sleep has begun; see
 // `send_entropy_request()`.
 const RNG_SLEEP_DRAIN_MS: u32 = proto::CONTROL_TIMEOUT_MS + 1000;
+/// How long a full mailbox may take to drain before a sleep is refused.
+const MAILBOX_DRAIN_MS: u32 = 100;
 
 extern "C" {
     fn sep_cancel_work_sync(work: *mut c_void);
@@ -1460,7 +1462,13 @@ impl SepData {
     pub(crate) fn sleep_enter(&self) -> Result<()> {
         match self.sleep_gate() {
             // A failed earlier wake is not repaired by another precommit attempt.
-            pm::SleepGate::Lost => return Err(EIO),
+            pm::SleepGate::Lost => {
+                dev_err!(
+                    self.dev,
+                    "deep sleep refused: the enclave did not come back from a sleep earlier this boot\n"
+                );
+                return Err(EBUSY);
+            }
             pm::SleepGate::Open => {}
             _ => return Err(EBUSY),
         }
@@ -1469,6 +1477,14 @@ impl SepData {
             dev_warn_ratelimited!(
                 self.dev,
                 "sleep refused: the enclave did not finish coming up\n"
+            );
+            return Err(EBUSY);
+        }
+        // Refused here, at once, rather than at the commit after its send wait.
+        if !self.mailbox_drains() {
+            dev_err!(
+                self.dev,
+                "deep sleep refused: the enclave isn't taking messages (its mailbox stays full)\n"
             );
             return Err(EBUSY);
         }
@@ -1517,6 +1533,20 @@ impl SepData {
         self.sleep_hold_rx();
         dev_dbg!(self.dev, "SEP SLEEP staged for the irreversible commit\n");
         Ok(())
+    }
+
+    /// Whether the enclave takes messages: its receive FIFO drains within `MAILBOX_DRAIN_MS`. A
+    /// FIFO that stays full means it stopped reading, and a sleep request would only time out.
+    fn mailbox_drains(&self) -> bool {
+        for _ in 0..MAILBOX_DRAIN_MS / 5 {
+            match self.mbox.lock().as_ref() {
+                Some(mbox) if mbox.send_ready() => return true,
+                Some(_) => {}
+                None => return false,
+            }
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(5));
+        }
+        false
     }
 
     /// Holds off the receive interrupt, whose handler reads the mailbox.
