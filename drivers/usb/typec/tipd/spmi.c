@@ -751,7 +751,7 @@ static int sn201202x_roles_finish(struct sn201202x *sn)
 		sn201202x_ldcm_refresh(tps);
 	}
 	tipd_complete(tps->dev);
-	dev_info(tps->dev, "resume from disk: USB role switch looked up again, port revalidates\n");
+	dev_dbg(tps->dev, "resume from disk: USB role switch looked up again, port revalidates\n");
 	return 0;
 }
 
@@ -1043,9 +1043,10 @@ EXPORT_SYMBOL_IF_KUNIT(sn201202x_suspend);
  * A resume from hibernation is a cold boot: the boot loader and the kernel
  * that loaded the image have taken the controller through their own bring-up,
  * so the state saved in the image (its sleep, the latched events) no longer
- * exists and waking it the suspend way times out. Leave it alone with its
- * interrupt still masked; the controller is probed again from scratch after
- * the restore (userspace unbinds and binds it, e.g. from a sleep hook).
+ * exists. Wake the controller and set it up again in place, as its probe
+ * would; its port is revalidated once the connector's USB role switch is
+ * there, see sn201202x_roles_finish(). A controller that does not take this
+ * is left alone, with its event interrupt still disabled, for a new probe.
  */
 static int __maybe_unused sn201202x_restore(struct device *dev)
 {
@@ -1100,7 +1101,7 @@ static int __maybe_unused sn201202x_restore(struct device *dev)
 		WRITE_ONCE(sn->roles_pending, true);
 		sn->hib_in_place = true;
 	}
-	dev_info(dev, "resume from disk: controller restored, port revalidation waits for the USB role switch\n");
+	dev_dbg(dev, "resume from disk: controller restored, port revalidation waits for the USB role switch\n");
 	return 0;
 }
 
