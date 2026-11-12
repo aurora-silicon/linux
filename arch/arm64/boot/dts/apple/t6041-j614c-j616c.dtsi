@@ -2526,9 +2526,6 @@
 
 #include "t604x-extdisp.dtsi"
 
-/delete-node/ &atcphy0_xbar;
-/delete-node/ &atcphy2_xbar;
-
 #include "t6041-j616c-hdmi.dtsi"
 #include "t6041-j616c-usbc.dtsi"
 

@@ -119,7 +119,15 @@
 				status = "okay";
 			};
 
+			mux@38324c000 {
+				status = "disabled";
+			};
+
 			mux@38b24c000 {
+				status = "disabled";
+			};
+
+			mux@39324c000 {
 				status = "disabled";
 			};
 
@@ -144,7 +152,15 @@
 				status = "disabled";
 
 				typec-routes {
+					route@0 {
+						status = "disabled";
+					};
+
 					route@1 {
+						status = "disabled";
+					};
+
+					route@2 {
 						status = "disabled";
 					};
 				};
