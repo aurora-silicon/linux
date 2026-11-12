@@ -14,9 +14,14 @@
  *    plain 32-bit counters; the interrupt status and acknowledge words of
  *    the window are left out, since clearing them takes a write.
  *
+ * A block that also has a functional driver keeps a single owner: that
+ * driver binds the node and creates a "regview" auxiliary device, and the
+ * view is picked from the parent node's compatible.
+ *
  * Copyright The Asahi Linux Contributors
  */
 
+#include <linux/auxiliary_bus.h>
 #include <linux/debugfs.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
@@ -173,21 +178,27 @@ static void apple_regview_remove_debugfs(void *data)
 	debugfs_remove_recursive(data);
 }
 
-static int apple_regview_probe(struct platform_device *pdev)
+/*
+ * @dev owns the allocations, @np describes the registers and @name names the
+ * debugfs directory.
+ */
+static int apple_regview_setup(struct device *dev, struct device_node *np,
+			       const char *name,
+			       const struct apple_regview_hw *hw)
 {
-	struct device *dev = &pdev->dev;
 	struct apple_regview *rv;
 	unsigned int i;
 	int ret;
+
+	if (!np || !hw)
+		return -ENODEV;
 
 	rv = devm_kzalloc(dev, sizeof(*rv), GFP_KERNEL);
 	if (!rv)
 		return -ENOMEM;
 
 	rv->dev = dev;
-	rv->hw = of_device_get_match_data(dev);
-	if (!rv->hw)
-		return -ENODEV;
+	rv->hw = hw;
 
 	rv->maps = devm_kcalloc(dev, rv->hw->nr_regs, sizeof(*rv->maps),
 				GFP_KERNEL);
@@ -197,7 +208,7 @@ static int apple_regview_probe(struct platform_device *pdev)
 	for (i = 0; i < rv->hw->nr_regs; i++) {
 		struct resource res;
 
-		ret = of_address_to_resource(dev->of_node, i, &res);
+		ret = of_address_to_resource(np, i, &res);
 		if (ret)
 			return dev_err_probe(dev, ret, "missing reg %u\n", i);
 		if (resource_size(&res) & 3)
@@ -217,21 +228,61 @@ static int apple_regview_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "register list exceeds the apertures\n");
 
-	rv->dir = debugfs_create_dir(dev_name(dev), apple_regview_root);
+	rv->dir = debugfs_create_dir(name, apple_regview_root);
 	debugfs_create_file("regs", 0400, rv->dir, rv, &apple_regview_fops);
 
 	return devm_add_action_or_reset(dev, apple_regview_remove_debugfs,
 					rv->dir);
 }
 
+static int apple_regview_probe(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+
+	return apple_regview_setup(dev, dev->of_node, dev_name(dev),
+				   of_device_get_match_data(dev));
+}
+
 static const struct of_device_id apple_regview_of_match[] = {
-	{ .compatible = "apple,t8112-mcc", .data = &apple_regview_t8112_mcc_hw },
 	{ .compatible = "apple,t6000-mcc", .data = &apple_regview_t6000_mcc_hw },
 	{ .compatible = "apple,t8112-spmi-sideband",
 	  .data = &apple_regview_t8112_spmi_sb_hw },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_regview_of_match);
+
+/* Blocks whose functional driver hands the view over as an auxiliary device. */
+static const struct of_device_id apple_regview_aux_of_match[] = {
+	{ .compatible = "apple,t8112-mcc", .data = &apple_regview_t8112_mcc_hw },
+	{}
+};
+
+static int apple_regview_aux_probe(struct auxiliary_device *adev,
+				   const struct auxiliary_device_id *id)
+{
+	struct device *parent = adev->dev.parent;
+	const struct of_device_id *match;
+
+	match = of_match_node(apple_regview_aux_of_match, parent->of_node);
+	if (!match)
+		return -ENODEV;
+
+	/* Name the directory after the node, as for a directly bound block. */
+	return apple_regview_setup(&adev->dev, parent->of_node,
+				   dev_name(parent), match->data);
+}
+
+static const struct auxiliary_device_id apple_regview_aux_ids[] = {
+	{ .name = "apple_mcc.regview" },
+	{}
+};
+MODULE_DEVICE_TABLE(auxiliary, apple_regview_aux_ids);
+
+static struct auxiliary_driver apple_regview_aux_driver = {
+	.name = "regview",
+	.probe = apple_regview_aux_probe,
+	.id_table = apple_regview_aux_ids,
+};
 
 static struct platform_driver apple_regview_driver = {
 	.driver = {
@@ -248,13 +299,23 @@ static int __init apple_regview_init(void)
 	apple_regview_root = debugfs_create_dir("apple-regview", NULL);
 	ret = platform_driver_register(&apple_regview_driver);
 	if (ret)
-		debugfs_remove_recursive(apple_regview_root);
+		goto err_debugfs;
+	ret = auxiliary_driver_register(&apple_regview_aux_driver);
+	if (ret)
+		goto err_platform;
+	return 0;
+
+err_platform:
+	platform_driver_unregister(&apple_regview_driver);
+err_debugfs:
+	debugfs_remove_recursive(apple_regview_root);
 	return ret;
 }
 module_init(apple_regview_init);
 
 static void __exit apple_regview_exit(void)
 {
+	auxiliary_driver_unregister(&apple_regview_aux_driver);
 	platform_driver_unregister(&apple_regview_driver);
 	debugfs_remove_recursive(apple_regview_root);
 }
