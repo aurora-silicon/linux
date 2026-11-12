@@ -1805,19 +1805,6 @@ bool apple_sleep_coprocs_ans_stopped(void)
 	return false;
 }
 
-/* How many registered coprocessors are ready and how many stopped. */
-void apple_sleep_coprocs_count(int *reg, int *ready, int *stopped)
-{
-	int i;
-
-	*reg = *ready = *stopped = 0;
-	for (i = 0; i < SLEEP_COPROCS; i++) {
-		*reg += !!apple_sleep_coprocs[i].dev;
-		*ready += apple_sleep_coprocs[i].dev && apple_sleep_coprocs[i].ready;
-		*stopped += apple_sleep_coprocs[i].dev && apple_sleep_coprocs[i].stopped;
-	}
-}
-
 const struct apple_sleep_smc_policy *apple_sleep_smc_policy(void)
 {
 	return apple_sleep && pm_suspend_via_firmware() ? apple_sleep->soc->smc_policy : NULL;
