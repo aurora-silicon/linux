@@ -124,6 +124,13 @@ const fn window_slot(index: usize) -> bool {
     index == 3
 }
 
+/// Test only (aurora.g17_test_stage_window, bit i = slot i): the vertex start, vertex end and
+/// fragment start slots also go through the window, for per-stage profiling. The host never
+/// writes such a slot; it holds what the firmware wrote, or what userspace left there.
+fn test_stage_window(index: usize) -> bool {
+    index < 3 && (crate::module_parameters::g17_test_stage_window.value() >> index) & 1 != 0
+}
+
 /// Timestamp destinations resolved and retained before any command is enqueued. Dropping
 /// one releases only a buffer reference; the buffer defers its own mapping release.
 pub(crate) struct Destinations {
@@ -162,7 +169,7 @@ impl Destinations {
             return [0; 4];
         }
         let vas: [u64; 4] = core::array::from_fn(|i| {
-            let destination = self.stamps[i].as_ref().filter(|_| window_slot(i));
+            let destination = self.stamps[i].as_ref().filter(|_| window_slot(i) || test_stage_window(i));
             destination.and_then(|d| d.window_va).unwrap_or(0)
         });
         if vas.iter().any(|&va| va != 0) {
@@ -183,6 +190,7 @@ impl Destinations {
         let handed = self.handed.load(Ordering::Acquire);
         for (index, (destination, ticks)) in self.stamps.iter().zip(ticks).enumerate() {
             match destination {
+                Some(destination) if handed && test_stage_window(index) && destination.window_va.is_some() => {}
                 Some(destination) if handed && window_slot(index) && destination.window_va.is_some() => {
                     destination.write_window(ticks)
                 }
