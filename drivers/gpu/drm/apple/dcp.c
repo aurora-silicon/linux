@@ -7515,7 +7515,7 @@ VISIBLE_IF_KUNIT void dcp_platform_shutdown(struct platform_device *pdev)
 	 * as for a live session that has no stop sequence.
 	 */
 	if (dcp && dcp_hibernating()) {
-		pr_emerg("dcp: hibernation power-off, skipping teardown\n");
+		dev_dbg(dcp->dev, "hibernation power-off: teardown skipped\n");
 		iomfb_queue_stop(dcp);
 		cancel_delayed_work_sync(&dcp->bl_fallback_wq);
 		dcp_backlight_stop(dcp);
@@ -9215,8 +9215,12 @@ static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 					      (cur & DCP_PS_ACTUAL) == DCP_PS_ACTUAL, 1, 8000) ||
 		    readl_poll_timeout_atomic(ps + o.cpu, cur, !(cur & DCP_PS_BUSY), 1, 8000))
 			ret = -ETIMEDOUT;
-		dev_info(dcp->dev, "S2R resume: CPU power word %#x -> %#x%s\n", v,
-			 readl(ps + o.cpu), ret ? " (timeout)" : "");
+		cur = readl(ps + o.cpu);
+		if (ret)
+			dev_warn(dcp->dev, "S2R resume: CPU power word %#x -> %#x, not on\n",
+				 v, cur);
+		else
+			dev_dbg(dcp->dev, "S2R resume: CPU power word %#x -> %#x\n", v, cur);
 	}
 	/*
 	 * The 11 children of the CPU word (+0x8..+0x58) are at target 0 after the sleep (the
@@ -9237,8 +9241,11 @@ static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 				to |= BIT(i);
 		}
 		dcp->s2r_child_valid = false;
-		dev_info(dcp->dev, "S2R resume: CPU children back, saved %#x..%#x, not on %#x\n",
-			 dcp->s2r_child_saved[0], dcp->s2r_child_saved[10], to);
+		if (to)
+			dev_warn(dcp->dev, "S2R resume: CPU power word children %#x not on\n",
+				 to);
+		dev_dbg(dcp->dev, "S2R resume: CPU children back, saved %#x..%#x\n",
+			dcp->s2r_child_saved[0], dcp->s2r_child_saved[10]);
 	}
 	dcp_pmc_set(dcp, pmc, true);	/* shared voter: counts every powered DCP */
 
@@ -9274,7 +9281,7 @@ static void dcp_t6041_gapf_release_all(struct apple_dcp *dcp)
 		writel(v & ~DCP_T6041_GAPF_PROTECT, b + DCP_T6041_GAPF_SLICE(i));
 		rel++;
 	}
-	dev_info(dcp->dev, "S2R: GAPF clock protection cleared on %u of %u slices\n", rel, n);
+	dev_dbg(dcp->dev, "S2R: GAPF clock protection cleared on %u of %u slices\n", rel, n);
 	iounmap(b);
 }
 
@@ -9327,7 +9334,8 @@ static void dcp_t6041_s2r_cpu_off(struct apple_dcp *dcp)
 	if (dcp->s2r_dcp_dart)
 		dret = apple_dart_display_streams(dcp->s2r_dcp_dart, DCP_S2R_DCP_STREAMS,
 						  false, true);
-	dev_info(dcp->dev, "S2R: DCP DART streams off + flush: %d\n", dret);
+	if (dret)
+		dev_warn(dcp->dev, "S2R: DCP DART streams not stopped: %d\n", dret);
 
 	res = platform_get_resource_byname(to_platform_device(dcp->dev), IORESOURCE_MEM, "coproc");
 	gpa = !dcp->external ? DCP_T6041_GAPF_DCP :
@@ -9339,7 +9347,7 @@ static void dcp_t6041_s2r_cpu_off(struct apple_dcp *dcp)
 
 		writel(gv & ~DCP_T6041_GAPF_PROTECT, g);
 		ga = readl(g);
-		dev_info(dcp->dev, "S2R: GAPF slice %pa %#x -> %#x\n", &gpa, gv, ga);
+		dev_dbg(dcp->dev, "S2R: GAPF slice %pa %#x -> %#x\n", &gpa, gv, ga);
 		iounmap(g);
 	}
 	dcp_t6041_gapf_release_all(dcp);
@@ -9362,8 +9370,11 @@ static void dcp_t6041_s2r_cpu_off(struct apple_dcp *dcp)
 	ret |= readl_poll_timeout_atomic(w, cur, !(cur & DCP_PS_BUSY), 1, 8000);
 	ret |= readl_poll_timeout_atomic(w, cur, !(cur & DCP_PS_ACTUAL), 1, 8000);
 	after = readl(w);
-	dev_info(dcp->dev, "S2R: CPU power word +%#x %#x -> %#x%s\n", o.cpu, v, after,
-		 ret ? " (timeout)" : "");
+	if (ret)
+		dev_warn(dcp->dev, "S2R: CPU power word +%#x %#x -> %#x, not off\n",
+			 o.cpu, v, after);
+	else
+		dev_dbg(dcp->dev, "S2R: CPU power word +%#x %#x -> %#x\n", o.cpu, v, after);
 	iounmap(ps);
 	iounmap(pmc);
 }
@@ -9398,8 +9409,8 @@ static void dcp_t6041_s2r_afk(struct apple_dcp *dcp, bool resume)
 		else
 			done++;
 	}
-	dev_info(dcp->dev, "S2R: %u of %u AFK endpoints %s\n", done, total,
-		 resume ? "resumed" : "paused");
+	dev_dbg(dcp->dev, "S2R: %u of %u AFK endpoints %s\n", done, total,
+		resume ? "resumed" : "paused");
 }
 
 /*
@@ -9495,7 +9506,7 @@ static int dcp_t6041_s2r_stop(struct apple_dcp *dcp)
 	status = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS);
 	dcp_t6041_s2r_cpu_off(dcp);
 	dcp->t6041_s2r_stopped = true;
-	dev_info(dcp->dev, "firmware stopped for the sleep: status %#x\n", status);
+	dev_dbg(dcp->dev, "firmware stopped for the sleep: status %#x\n", status);
 
 
 	return 0;
@@ -9597,7 +9608,7 @@ static int dcp_platform_suspend(struct device *dev)
 	if (pm_suspend_via_firmware() && dcp_t6041_s2r_capable(dcp)) {
 		if (apple_sleep_power_loss())
 			return dcp_t6041_s2r_stop(dcp);
-		dev_info(dev, "dry run: firmware kept running and its domains on, as for suspend-to-idle\n");
+		dev_dbg(dev, "sleep keeps power: firmware kept running, domains on\n");
 	}
 
 	/*
@@ -9885,9 +9896,9 @@ static void dcp_hib_log_coproc(struct apple_dcp *dcp, const char *when)
 	u32 ctl = readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
 	u32 sts = readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS);
 
-	dev_info(dcp->dev,
-		 "hibernation restore: %s: CPU_CONTROL %#x (RUN %d) CPU_STATUS %#x\n",
-		 when, ctl, !!(ctl & APPLE_DCP_COPROC_CPU_CONTROL_RUN), sts);
+	dev_dbg(dcp->dev,
+		"hibernation restore: %s: CPU_CONTROL %#x (RUN %d) CPU_STATUS %#x\n",
+		when, ctl, !!(ctl & APPLE_DCP_COPROC_CPU_CONTROL_RUN), sts);
 }
 
 /*
@@ -10077,9 +10088,9 @@ static void dcp_hib_release_ext_link(struct apple_dcp *dcp)
 	if (ret >= 0)
 		ret = dcp_peer_stop_26_6(dcp);
 	if (ret < 0)
-		dev_warn(dcp->dev, "hibernation: dual-pipe pair not stopped: %d\n", ret);
+		dev_warn(dcp->dev, "sleep: dual-pipe pair not stopped: %d\n", ret);
 	else if (ret > 0)
-		dev_info(dcp->dev, "hibernation: dual-pipe pair stopped\n");
+		dev_dbg(dcp->dev, "sleep: dual-pipe pair stopped\n");
 	ret = 0;
 	if (dcp->avep)
 		av_service_disconnect(dcp);
@@ -10089,10 +10100,10 @@ static void dcp_hib_release_ext_link(struct apple_dcp *dcp)
 			ret = dptxport_set_hpd(dcp->dptxport[0].service, false);
 	}
 	if (ret)
-		dev_warn(dcp->dev, "hibernation: DPTX HPD not dropped: %d\n", ret);
+		dev_warn(dcp->dev, "sleep: DPTX HPD not dropped: %d\n", ret);
 	ret = dcp_dptx_disconnect(dcp, 0);
 	if (ret)
-		dev_warn(dcp->dev, "hibernation: display link not released: %d\n", ret);
+		dev_warn(dcp->dev, "sleep: display link not released: %d\n", ret);
 	if (!dcp->main_display)
 		dcp->desktop->ext_pipe_off = true;
 	if (typec)
@@ -10106,11 +10117,11 @@ phys:
 		dcp->hib_fixed_phy_off = true;
 	}
 	dcp_hdmi_converter_power(dcp, false);
-	dev_info(dcp->dev,
-		 "hibernation: display link released (display %s), DP PHY off: route %d, fixed %d\n",
-		 shown ? "reported gone" :
-		 (con && READ_ONCE(con->connected)) ? "kept (DPMS off)" : "none",
-		 route_phy, dcp->hib_fixed_phy_off);
+	dev_dbg(dcp->dev,
+		"sleep: display link released (display %s), DP PHY off: route %d, fixed %d\n",
+		shown ? "reported gone" :
+		(con && READ_ONCE(con->connected)) ? "kept (DPMS off)" : "none",
+		route_phy, dcp->hib_fixed_phy_off);
 }
 
 /* The fixed PHY back on, as probe powers it (dcp_desktop_probe_routes()). */
@@ -10131,8 +10142,7 @@ static void dcp_hib_fixed_phy_on(struct apple_dcp *dcp)
 		 * Stays off: the device action at unbind must not power off a
 		 * PHY that is not on.  The HDMI output has no link then.
 		 */
-		dev_err(dcp->dev, "hibernation: fixed DP PHY not powered again: %d\n",
-			ret);
+		dev_err(dcp->dev, "fixed DP PHY not powered again: %d\n", ret);
 		return;
 	}
 	dcp->hib_fixed_phy_off = false;
@@ -10152,8 +10162,8 @@ static void dcp_hib_peer_reset(struct apple_dcp *dcp)
 	peer = dcp->peer_reserved;
 	owner = dcp->peer_owner;
 	if (peer || owner)
-		dev_info(dcp->dev, "hibernation restore: dual-pipe pairing with %s dropped\n",
-			 dev_name((peer ?: owner)->dev));
+		dev_dbg(dcp->dev, "hibernation restore: dual-pipe pairing with %s dropped\n",
+			dev_name((peer ?: owner)->dev));
 	if (peer) {
 		peer->peer_owner = NULL;
 		memset(&peer->peer_tiling, 0, sizeof(peer->peer_tiling));
@@ -10256,13 +10266,13 @@ static void dcp_hib_quiesce_ext(struct apple_dcp *dcp)
 	d->ext_pipe_off = true;
 	dcp_hib_peer_reset(dcp);
 
-	dev_info(dcp->dev,
-		 "hibernation restore: external session dropped: route %s, cable %d, display %s\n",
-		 READ_ONCE(dcp->active_typec_route) ? "Type-C" :
-		 dcp->fixed_phy ? "fixed" : "none",
-		 READ_ONCE(dcp->typec_cable_connected),
-		 shown ? "reported gone" :
-		 (con && READ_ONCE(con->connected)) ? "kept (DPMS off)" : "none");
+	dev_dbg(dcp->dev,
+		"hibernation restore: external session dropped: route %s, cable %d, display %s\n",
+		READ_ONCE(dcp->active_typec_route) ? "Type-C" :
+		dcp->fixed_phy ? "fixed" : "none",
+		READ_ONCE(dcp->typec_cable_connected),
+		shown ? "reported gone" :
+		(con && READ_ONCE(con->connected)) ? "kept (DPMS off)" : "none");
 }
 
 /* Commits that started before the locks were taken finish first. */
@@ -10280,7 +10290,7 @@ static void dcp_hib_wait_commits(struct drm_crtc *crtc)
 		return;
 	if (!wait_for_completion_timeout(&commit->cleanup_done, 10 * HZ))
 		dev_warn(crtc->dev->dev,
-			 "hibernation restore: earlier commit did not finish\n");
+			 "firmware restart: earlier commit did not finish\n");
 	drm_crtc_commit_put(commit);
 }
 
@@ -10304,7 +10314,7 @@ static int dcp_hib_recommit(struct apple_dcp *dcp)
 	if (!acrtc) {
 		/* No DRM pipeline: nothing to set, the firmware is up. */
 		WRITE_ONCE(dcp->hib_phase, DCP_HIB_NONE);
-		dev_info(dcp->dev, "hibernation restore: no CRTC, no mode to set\n");
+		dev_dbg(dcp->dev, "firmware restart: no CRTC, no mode to set\n");
 		return 0;
 	}
 	crtc = &acrtc->base;
@@ -10316,8 +10326,8 @@ static int dcp_hib_recommit(struct apple_dcp *dcp)
 		if (!dcp_uses_soft_dpms(dcp)) {
 			/* dcp_poweron() powers the pipe on the enable. */
 			WRITE_ONCE(dcp->hib_phase, DCP_HIB_NONE);
-			dev_info(dcp->dev,
-				 "hibernation restore: CRTC off, pipe and mode set on enable\n");
+			dev_dbg(dcp->dev,
+				"firmware restart: CRTC off, pipe and mode set on enable\n");
 			goto unlock;
 		}
 		if (!powered) {
@@ -10332,11 +10342,11 @@ static int dcp_hib_recommit(struct apple_dcp *dcp)
 		ret = dcp_backlight_dpms(dcp, false);
 		if (ret)
 			dev_warn(dcp->dev,
-				 "hibernation restore: backlight blank unavailable: %d\n",
+				 "firmware restart: backlight blank unavailable: %d\n",
 				 ret);
 		ret = 0;
-		dev_info(dcp->dev,
-			 "hibernation restore: CRTC off, pipe powered, mode set on enable\n");
+		dev_dbg(dcp->dev,
+			"firmware restart: CRTC off, pipe powered, mode set on enable\n");
 		goto unlock;
 	}
 
@@ -10372,12 +10382,11 @@ static int dcp_hib_recommit(struct apple_dcp *dcp)
 	ret = drm_atomic_commit(state);
 	/* The commit succeeds even when the firmware refused the mode set in it. */
 	if (!ret && READ_ONCE(dcp->mode_state.valid) && !READ_ONCE(dcp->crashed))
-		dev_info(dcp->dev,
-			 "hibernation restore: mode " DRM_MODE_FMT " set\n",
-			 DRM_MODE_ARG(&cs->mode));
+		dev_dbg(dcp->dev, "firmware restart: mode " DRM_MODE_FMT " set\n",
+			DRM_MODE_ARG(&cs->mode));
 	else if (!ret)
 		dev_err(dcp->dev,
-			"hibernation restore: mode " DRM_MODE_FMT " committed but not set (crashed %d)\n",
+			"firmware restart: mode " DRM_MODE_FMT " not set (crashed %d)\n",
 			DRM_MODE_ARG(&cs->mode), READ_ONCE(dcp->crashed));
 	else if (ret != -EDEADLK)
 		WRITE_ONCE(dcp->hib_phase, DCP_HIB_RESTARTING);
@@ -10393,7 +10402,7 @@ unlock:
 static void dcp_hib_give_up(struct apple_dcp *dcp, const char *step, int ret)
 {
 	dev_err(dcp->dev,
-		"hibernation restore: firmware restart failed at %s (%d). Display left to the boot loader, IOMFB traffic stopped\n",
+		"firmware restart failed at %s (%d): IOMFB traffic stopped until reboot\n",
 		step, ret);
 	WRITE_ONCE(dcp->hib_phase, DCP_HIB_FAILED);
 	WRITE_ONCE(dcp->ext_dead, true);
@@ -10432,7 +10441,7 @@ static void dcp_hib_ext_relink(struct apple_dcp *dcp)
 			dcp_hdmi_converter_power(dcp, true);
 		else
 			msleep(100);
-		dev_info(dcp->dev, "HDMI converter powered again\n");
+		dev_dbg(dcp->dev, "HDMI converter powered again\n");
 	}
 	dcp_hib_fixed_phy_on(dcp);
 	if (dcp->hib_typec_disabled) {
@@ -10470,13 +10479,13 @@ static void dcp_hib_ext_link_up(struct apple_dcp *dcp, const char *when)
 
 	dcp_hib_ext_relink(dcp);
 	dcp_hib_ext_put(dcp, false, true);
-	dev_info(dcp->dev,
-		 "%s: external link replayed: display %d, route %s, cable %d, DPTX port 0 connected %d\n",
-		 when, display,
-		 READ_ONCE(dcp->active_typec_route) ? "Type-C" :
-		 dcp->fixed_phy ? "fixed" : "none",
-		 READ_ONCE(dcp->typec_cable_connected),
-		 READ_ONCE(dcp->dptxport[0].connected));
+	dev_dbg(dcp->dev,
+		"%s: external link replayed: display %d, route %s, cable %d, DPTX port 0 connected %d\n",
+		when, display,
+		READ_ONCE(dcp->active_typec_route) ? "Type-C" :
+		dcp->fixed_phy ? "fixed" : "none",
+		READ_ONCE(dcp->typec_cable_connected),
+		READ_ONCE(dcp->dptxport[0].connected));
 }
 
 /*
@@ -10558,9 +10567,9 @@ static void dcp_desktop_cold_restart(struct apple_dcp *dcp)
 		dcp_hib_give_up(dcp, "iomfb-ready", ret);
 		return;
 	}
-	dev_info(dcp->dev,
-		 "firmware session up, endpoints %#010x, main display %d\n",
-		 dcp->desktop->graph_started, dcp->main_display);
+	dev_dbg(dcp->dev,
+		"firmware session up, endpoints %#010x, main display %d\n",
+		dcp->desktop->graph_started, dcp->main_display);
 
 	ret = dcp_hib_recommit(dcp);
 	if (ret) {
@@ -10581,6 +10590,7 @@ static void dcp_desktop_cold_restart(struct apple_dcp *dcp)
  */
 static void dcp_t6041_s2r_warm_restart(struct apple_dcp *dcp)
 {
+	u32 ctl, sts;
 	int ret;
 
 	WRITE_ONCE(dcp->hib_phase, DCP_HIB_RESTARTING);
@@ -10591,9 +10601,11 @@ static void dcp_t6041_s2r_warm_restart(struct apple_dcp *dcp)
 		dcp->hib_rx_held = false;
 		apple_rtkit_resume_rx(dcp->rtk);
 	}
-	dev_info(dcp->dev, "S2R resume: warm restart of the idled firmware: %d (CPU_CONTROL %#x STATUS %#x)\n",
-		 ret, readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL),
-		 readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS));
+	ctl = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	sts = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS);
+	dev_dbg(dcp->dev,
+		"S2R resume: warm restart of the idled firmware: %d (CPU_CONTROL %#x STATUS %#x)\n",
+		ret, ctl, sts);
 	if (ret) {
 		dcp_hib_give_up(dcp, "warm-restart", ret);
 		return;
@@ -10601,7 +10613,7 @@ static void dcp_t6041_s2r_warm_restart(struct apple_dcp *dcp)
 	dcp_t6041_s2r_afk(dcp, true);
 	/* As the platform powers the framebuffer after the wake: the hard power state back on. */
 	ret = iomfb_system_power_v26_6_desktop(dcp, true);
-	dev_info(dcp->dev, "S2R resume: system power state 1: %d\n", ret);
+	dev_dbg(dcp->dev, "S2R resume: system power state 1: %d\n", ret);
 
 	ret = dcp_hib_recommit(dcp);
 	if (ret) {
@@ -10622,6 +10634,7 @@ static void dcp_t6041_s2r_warm_restart(struct apple_dcp *dcp)
  */
 static void dcp_t6041_s2r_warm_restart_ext(struct apple_dcp *dcp)
 {
+	u32 ctl, sts;
 	int ret;
 
 	dcp_s2r_forget_crash(dcp);
@@ -10632,16 +10645,18 @@ static void dcp_t6041_s2r_warm_restart_ext(struct apple_dcp *dcp)
 		dcp->hib_rx_held = false;
 		apple_rtkit_resume_rx(dcp->rtk);
 	}
-	dev_info(dcp->dev, "S2R resume: warm restart of the idled firmware: %d (CPU_CONTROL %#x STATUS %#x)\n",
-		 ret, readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL),
-		 readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS));
+	ctl = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	sts = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS);
+	dev_dbg(dcp->dev,
+		"S2R resume: warm restart of the idled firmware: %d (CPU_CONTROL %#x STATUS %#x)\n",
+		ret, ctl, sts);
 	if (ret) {
 		dcp_hib_give_up(dcp, "warm-restart", ret);
 		return;
 	}
 	dcp_t6041_s2r_afk(dcp, true);
 	ret = iomfb_system_power_v26_6_desktop(dcp, true);
-	dev_info(dcp->dev, "S2R resume: system power state 1: %d\n", ret);
+	dev_dbg(dcp->dev, "S2R resume: system power state 1: %d\n", ret);
 
 	dcp->link_recovery_tries = 0;
 	dcp_release_after_sleep(dcp);
@@ -10736,7 +10751,7 @@ static int dcp_hib_prepare(struct apple_dcp *dcp)
 		return 0;
 	if (dcp_hib_busy(dcp)) {
 		dev_warn(dcp->dev,
-			 "refusing hibernation: firmware restart after the last resume still running\n");
+			 "refusing the sleep: firmware restart after the last resume still running\n");
 		return -EBUSY;
 	}
 	if (!dcp_hib_can_restart(dcp) || !dcp_desktop_external(dcp))
@@ -10873,8 +10888,8 @@ static int dcp_platform_restore_early(struct device *dev)
 		dcp->hib_ext_idle_pending = true;
 		atomic_inc(&dcp_hib_ext_idle);
 	}
-	dev_info(dev,
-		 "hibernation restore: old firmware session dropped; restart after PM_POST_HIBERNATION\n");
+	dev_dbg(dev,
+		"hibernation restore: old firmware session dropped; restart after PM_POST_HIBERNATION\n");
 	return 0;
 }
 
@@ -10909,8 +10924,8 @@ static int dcp_platform_restore(struct device *dev)
 				 "hibernation restore: RTKit receive was not held in the image\n");
 		dcp_hib_quiesce(dcp);
 		dcp_hib_release_dma(dcp);
-		dev_info(dev,
-			 "hibernation restore: old firmware session dropped; restart after PM_POST_HIBERNATION\n");
+		dev_dbg(dev,
+			"hibernation restore: old firmware session dropped; restart after PM_POST_HIBERNATION\n");
 		return 0;
 	}
 
