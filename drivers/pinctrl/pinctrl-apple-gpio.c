@@ -101,19 +101,6 @@ struct apple_gpio_pinctrl {
  */
 #define REG_GLOBAL           0xc48
 
-/*
- * T6040 bring-up: put the configured pins back after a firmware-driven
- * suspend also on a cached block, by reading and writing the hardware past
- * the cache. Off restores only the uncached blocks, as before.
- */
-static bool resume_cached = true;
-module_param(resume_cached, bool, 0644);
-MODULE_PARM_DESC(resume_cached, "Put configured pins back after S2R on a cached block too (bring-up)");
-
-static bool resume_all = true;
-module_param(resume_all, bool, 0644);
-MODULE_PARM_DESC(resume_all, "After S2R put back every pin of a block marked apple,resume-restore-all, as macOS (bring-up)");
-
 static const struct regmap_config regmap_config = {
 	.reg_bits = 32,
 	.val_bits = 32,
@@ -756,8 +743,6 @@ static int apple_gpio_pinctrl_suspend_noirq(struct device *dev)
 	if (!pctl->saved || pm_suspend_target_state != PM_SUSPEND_MEM ||
 	    !pm_suspend_via_firmware())
 		return 0;
-	if (pctl->cached && !READ_ONCE(resume_cached))
-		return 0;
 
 	bitmap_zero(pctl->saved_valid, pctl->pinctrl_desc.npins);
 	/*
@@ -766,7 +751,7 @@ static int apple_gpio_pinctrl_suspend_noirq(struct device *dev)
 	 * back. The pins of the panel's TCON bus, set up by the boot loader, are among them.
 	 */
 	pctl->saved_global_valid = false;
-	if (pctl->restore_all && READ_ONCE(resume_all)) {
+	if (pctl->restore_all) {
 		pctl->saved_global = readl(pctl->base + REG_GLOBAL);
 		pctl->saved_global_valid = true;
 		if (pctl->cached)
