@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Diagnostic-only ramoops region, inside the J775c's reported System RAM
+ * 0x10003d70000..0x10fcf3effff and outside its existing reserved ranges.
+ * Excluded by memblock before allocation; no-map avoids a cached linear alias.
+ * Reset/firmware retention is measured separately, never assumed.
+ */
+/ {
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		usb4_ramoops: ramoops@10100000000 {
+			compatible = "ramoops";
+			reg = <0x101 0x0 0x0 0x200000>;
+			no-map;
+			record-size = <0x40000>;
+			console-size = <0x80000>;
+			pmsg-size = <0x40000>;
+			ecc-size = <16>;
+		};
+	};
+};
