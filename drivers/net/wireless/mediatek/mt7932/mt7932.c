@@ -1442,7 +1442,7 @@ static int mt_hif_restart(struct mt7932 *m)
  *
  * Trouble here costs Wi-Fi at the wake, never the machine its sleep.
  */
-static int mt_hif_suspend(struct mt7932 *m)
+static int mt_hif_suspend(struct mt7932 *m, bool s2idle)
 {
 	int ret;
 
@@ -1480,6 +1480,13 @@ static int mt_hif_suspend(struct mt7932 *m)
 	ret = mt_dma_stop(m);
 	if (ret)
 		dev_err(&m->pdev->dev, "DMA did not stop for the sleep: %d\n", ret);
+	/* Suspend-to-idle keeps the link: the firmware's request for the host wakes it. */
+	m->wow_irq_mask = s2idle && m->wow_armed ? mt_wow_s2idle_irq : 0;
+	if (m->wow_irq_mask) {
+		mt_write(m, W + 0x1f0, mt_read(m, W + 0x1f0));
+		mt_write(m, W + 0x200, mt_read(m, W + 0x200));
+		mt_write(m, W + 0x204, m->wow_irq_mask);
+	}
 	mt_write(m, 0xe0010, 1);
 	ret = mt_poll(m, 0xe0010, BIT(2), BIT(2), 50000);
 	if (ret)
@@ -1501,21 +1508,19 @@ static int mt_suspend(struct device *dev)
 	struct mt7932 *m = pci_get_drvdata(pdev);
 
 	if (!pm_suspend_no_platform())
-		return mt_hif_suspend(m);
+		return mt_hif_suspend(m, false);
 	/*
 	 * Suspend-to-idle with Wi-Fi wake: the firmware gets the same WoW setup and
 	 * host interface stop as for a deep sleep, and the link stays up. Only the
 	 * firmware's own interrupt is left enabled, as the wakeup.
 	 */
 	if (READ_ONCE(m->wow_detect)) {
-		mt_hif_suspend(m);
-		if (m->wow_armed && mt_wow_s2idle_irq) {
-			mt_write(m, W + 0x200, mt_read(m, W + 0x200));
-			mt_write(m, W + 0x204, mt_wow_s2idle_irq);
+		mt_hif_suspend(m, true);
+		if (m->wow_irq_mask)
 			m->wow_irq_wake = !enable_irq_wake(pci_irq_vector(pdev, 0));
-		}
-		dev_dbg(dev, "suspend-to-idle with Wi-Fi wake%s armed, irq mask %#x\n",
-			m->wow_armed ? "" : " not", m->wow_irq_wake ? mt_wow_s2idle_irq : 0);
+		dev_dbg(dev, "suspend-to-idle with Wi-Fi wake%s armed, irq mask %#x%s\n",
+			m->wow_armed ? "" : " not", m->wow_irq_mask,
+			m->wow_irq_wake ? ", wakeup" : "");
 	}
 	pci_save_state(pdev);
 	device_set_awake_path(dev);
@@ -1532,9 +1537,12 @@ static int mt_resume(struct device *dev)
 	if (m->wow_irq_wake) {
 		disable_irq_wake(pci_irq_vector(pdev, 0));
 		m->wow_irq_wake = false;
-		dev_dbg(dev, "Wi-Fi wake: interrupt causes %#x, MCU %#x\n",
-			mt_read(m, W + 0x200), mt_read(m, W + 0x1f0));
+	}
+	if (m->wow_irq_mask) {
+		m->wow_irq_mask = 0;
 		mt_write(m, W + 0x204, 0);
+		dev_dbg(dev, "after the sleep: interrupt causes %#x, MCU %#x\n",
+			mt_read(m, W + 0x200), mt_read(m, W + 0x1f0));
 	}
 	if (!READ_ONCE(m->hif_suspended))
 		return 0;

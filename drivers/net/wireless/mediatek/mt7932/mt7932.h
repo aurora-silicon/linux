@@ -170,6 +170,7 @@ struct mt7932 {
 	bool wow_armed;
 	/* The device interrupt is armed to wake suspend-to-idle. */
 	bool wow_irq_wake;
+	u32 wow_irq_mask;
 	/* A wake reason is awaited, and the one received; response_lock. */
 	bool wow_report;
 	u8 wow_reason;
