@@ -70,16 +70,6 @@
 
 #include "sleep-internal.h"
 
-/* Must match aura's struct aura_s2r_mailbox. */
-#define AURA_S2R_MAGIC		0x3152325341525541ULL	/* "AURAS2R1" */
-
-struct aura_s2r_mailbox {
-	u64 magic;		/* aura, before the kernel starts */
-	u64 boot_mpidr;		/* aura: the only core that may take resume_pa */
-	u64 resume_pa;		/* kernel, armed before a commit; aura clears it */
-	u64 resumes;		/* aura: resume_pa taken this many times */
-};
-
 /* PS word */
 #define PS_AUTO_ENABLE		BIT(28)
 #define PS_UNLATCH		BIT(12)
@@ -423,6 +413,8 @@ struct apple_sleep_soc {
 	/* The PMC whose cluster vote for the encoders needs the complex up, and its bit */
 	const char *ave_pmc;
 	u32 ave_pmc_cluster;
+	/* The SoC's own sequences, in place of the lists above, or NULL */
+	const struct apple_sleep_part *part;
 };
 
 struct apple_sleep {
@@ -3479,8 +3471,21 @@ static int apple_sleep_alloc_books(struct apple_sleep *s)
 static int apple_sleep_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	const struct apple_sleep_soc *soc = of_device_get_match_data(dev);
 	struct apple_sleep *s;
 	int ret;
+
+	/* A SoC with its own sequences also has its own conditions, and its own answers. */
+	if (soc && soc->part) {
+		ret = apple_sleep_registry_bind(&soc->part->registry);
+		if (ret)
+			return dev_err_probe(dev, ret, "another sleep controller is bound\n");
+		ret = soc->part->probe(pdev);
+		if (ret)
+			apple_sleep_registry_unbind(&soc->part->registry);
+
+		return ret;
+	}
 
 	/* Below EL2 a monitor owns all of this. */
 	if (!is_kernel_in_hyp_mode())
@@ -3761,10 +3766,25 @@ static const struct of_device_id apple_sleep_of_match[] = {
 	{ }
 };
 
+static int apple_sleep_restore(struct device *dev)
+{
+	const struct apple_sleep_soc *soc = of_device_get_match_data(dev);
+
+	if (soc && soc->part && soc->part->restore)
+		return soc->part->restore(dev);
+
+	return 0;
+}
+
+static const struct dev_pm_ops apple_sleep_pm_ops = {
+	.restore = pm_sleep_ptr(apple_sleep_restore),
+};
+
 static struct platform_driver apple_sleep_driver = {
 	.driver = {
 		.name = "apple-sleep",
 		.of_match_table = apple_sleep_of_match,
+		.pm = pm_sleep_ptr(&apple_sleep_pm_ops),
 		.suppress_bind_attrs = true,
 	},
 	.probe = apple_sleep_probe,
