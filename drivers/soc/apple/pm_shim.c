@@ -164,7 +164,6 @@ static int sep_pm_notify(struct notifier_block *nb, unsigned long action,
 		event(SEP_PM_HIBERNATE);
 		return NOTIFY_OK;
 	case PM_RESTORE_PREPARE:
-		sep_diag_sleep(true);
 		/*
 		 * This kernel is about to load an image. If it registered with the
 		 * enclave, the enclave keeps that session and may DMA into memory
@@ -175,6 +174,8 @@ static int sep_pm_notify(struct notifier_block *nb, unsigned long action,
 			pr_err("apple_sep: this kernel attached the SEP; refusing to restore a hibernation image over it\n");
 			return NOTIFY_BAD;
 		}
+		/* Not before the refusal: no PM_POST_RESTORE comes to the one who refused. */
+		sep_diag_sleep(true);
 		return NOTIFY_OK;
 	case PM_POST_RESTORE:
 		event(SEP_PM_HIBERNATE_WARM);

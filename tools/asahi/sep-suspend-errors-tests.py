@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
 """Compile actual SEP commit/error paths with host-only dependency stubs.
 
-Extract current C stop/finish/prepare/noirq, provider poll-one and registration,
-Rust wrappers/enter/leave/exit/kick, and the kernel polling macros verbatim.
+Extract current C stop/finish/prepare/noirq, the PM notifier, provider poll-one and
+registration, Rust wrappers/enter/leave/exit/kick, and the kernel polling macros verbatim.
 C fatal paths are observed wholly within C, never by unwinding a Rust frame.
 Virtual time/MMIO only test AP control decisions, not firmware timing or safety.
 No target access or kernel build occurs.
@@ -88,6 +88,8 @@ MUTATIONS = {
                   'msg = apple_mbox_read_msg(mbox);\n\t\tmbox->rx(mbox, msg, mbox->cookie);\n\t\tret = 2;'),
     'post-send-wake-refusal': ('sep_pm_commit_stop', 'c->sent = true;',
                               'c->sent = true;\n\tif (pm_wakeup_pending()) return -EBUSY;'),
+    'held-before-refusal': ('sep_pm_notify', 'if (event(SEP_PM_RESTORE) > 0) {',
+                            'sep_diag_sleep(true);\n\t\tif (event(SEP_PM_RESTORE) > 0) {'),
 }
 
 C_PREFIX = r'''
@@ -162,6 +164,22 @@ static struct apple_mbox_msg queue[4];
 static unsigned queued, consumed;
 static ktime_t now;
 static bool (*sep_pm_told)(void);
+/* The PM notifier: its events go to the driver, and the diag state shows a sleep held. */
+struct notifier_block { int unused; };
+enum { NOTIFY_DONE, NOTIFY_OK, NOTIFY_BAD = 0x8002 };
+enum { PM_HIBERNATION_PREPARE = 1, PM_POST_HIBERNATION, PM_SUSPEND_PREPARE, PM_POST_SUSPEND,
+       PM_RESTORE_PREPARE, PM_POST_RESTORE };
+#define pr_err(...) ((void)0)
+static int (*sep_pm_event)(int event);
+static struct device *sep_pm_dev;
+static int sep_pm_cold_base, cold_restarts, held, sleeps_ended, reprobes;
+static bool restored;
+static void sep_diag_sleep(bool entering) {
+    if (entering) held = 1; else if (held) { held = 0; ++sleeps_ended; }
+}
+static int apple_pmp_cold_restarts(void) { return cold_restarts; }
+static bool pm_hibernate_is_restored(void) { return restored; }
+static void sep_pm_schedule_reprobe(struct device *d) { ++reprobes; }
 static bool yes(void) { return true; }
 static bool no(void) { return false; }
 static bool pm_suspend_via_firmware(void) { return firmware; }
@@ -268,6 +286,8 @@ void fixture(void) {
     resource_bytes = 4; close_gate = 1; early_gate = 0; read_error_after = 1;
     queued = consumed = 0; message_in_lock = matched_read = false; now = 0;
     fatal_armed = false; fatal_message[0] = 0; sep_pm_told = yes;
+    sep_pm_event = NULL; sep_pm_dev = &device; sep_pm_cold_base = cold_restarts = 0;
+    held = sleeps_ended = reprobes = 0; restored = false;
 }
 void parameter(int which, int value) {
     switch (which) {
@@ -443,8 +463,31 @@ static void test_poll_contract(void) {
     fixture(); sep_pm_told = NULL; assert(noirq() == 0 && !lookups);
     fixture(); sep_pm_told = no; assert(noirq() == 0 && !lookups);
 }
+static int attached, last_event;
+static int driver_event(int event) {
+    last_event = event; return event == SEP_PM_RESTORE ? attached : 0;
+}
+static void test_notifier(void) {
+    struct notifier_block nb;
+    // No driver registered: the chain goes on untouched.
+    fixture(); assert(sep_pm_notify(&nb, PM_RESTORE_PREPARE, NULL) == NOTIFY_DONE && !held);
+    // A kernel that attached the enclave refuses to load an image. The PM core sends no
+    // PM_POST_RESTORE to the notifier that refused, so nothing may be left held.
+    fixture(); sep_pm_event = driver_event; attached = 1;
+    assert(sep_pm_notify(&nb, PM_RESTORE_PREPARE, NULL) == NOTIFY_BAD);
+    assert(last_event == SEP_PM_RESTORE && !held && !sleeps_ended);
+    // One that did not goes on, and the end of the restore ends the hold.
+    attached = 0;
+    assert(sep_pm_notify(&nb, PM_RESTORE_PREPARE, NULL) == NOTIFY_OK && held);
+    assert(sep_pm_notify(&nb, PM_POST_RESTORE, NULL) == NOTIFY_OK);
+    assert(last_event == SEP_PM_HIBERNATE_WARM && !held && sleeps_ended == 1);
+    // A suspend holds and releases the same way.
+    assert(sep_pm_notify(&nb, PM_SUSPEND_PREPARE, NULL) == NOTIFY_OK && held);
+    assert(sep_pm_notify(&nb, PM_POST_SUSPEND, NULL) == NOTIFY_OK && !held && sleeps_ended == 2);
+}
 int main(void) {
     test_prepare_and_cleanup(); test_unsent(); test_provider(); test_sent(); test_poll_contract();
+    test_notifier();
     puts("SEP C commit controls passed"); return 0;
 }
 #endif
@@ -669,6 +712,9 @@ def sources(source, contracts, mutation):
     pm = (source / 'drivers/soc/apple/pm.rs').read_text()
     sep = (source / 'drivers/soc/apple/sep.rs').read_text()
     shim = (source / 'drivers/soc/apple/pm_shim.c').read_text()
+    events = re.findall(r'^#define SEP_PM_[A-Z_]+\s+\d+$',
+                        (source / 'drivers/soc/apple/shim.h').read_text(), re.M)
+    assert len(events) == 6, events
     mailbox = (source / 'drivers/soc/apple/mailbox.c').read_text()
     sleep = (source / 'drivers/soc/apple/sleep.c').read_text()
     registry = (source / 'drivers/soc/apple/sleep-registry.c').read_text()
@@ -676,7 +722,8 @@ def sources(source, contracts, mutation):
     names = {
         'shim': ['sep_pm_wait_gated', 'sep_pm_clear_dev_disable', 'sep_pm_dart_restore',
                  'sep_pm_commit_rx', 'sep_pm_commit_take_rx', 'sep_pm_commit_stop',
-                 'sep_pm_commit_prepare', 'sep_pm_commit_finish', 'sep_pm_suspend_noirq'],
+                 'sep_pm_commit_prepare', 'sep_pm_commit_finish', 'sep_pm_suspend_noirq',
+                 'sep_pm_notify'],
         'mailbox': ['apple_mbox_poll_one_supported', 'apple_mbox_poll_one'],
         'sleep': ['apple_sleep_reg_commit_stops', 'apple_sleep_reg_enclave_admit'],
         'registry': ['apple_sleep_commit_stops_coprocs', 'apple_sleep_enclave_register',
@@ -695,6 +742,7 @@ def sources(source, contracts, mutation):
     c = C_PREFIX + '\n' + '\n'.join(macro(iopoll, n) for n in macros)
     c += '\n' + '\n'.join(re.search(r'^#define ' + n + r'\s+.*$', shim, re.M).group()
                             for n in ['SEP_PM_POLL_US', 'SEP_PM_TIMEOUT_US'])
+    c += '\n' + '\n'.join(events)
     start = shim.index('static struct sep_pm_commit {')
     c += '\n' + shim[start:shim.index('} sep_pm_commit;', start) + len('} sep_pm_commit;')]
     # Use the actual provider helper, with only removal/capability dependency state
