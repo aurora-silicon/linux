@@ -7076,19 +7076,20 @@ static int atcphy_suspend_noirq(struct device *dev)
 }
 
 /*
- * A PHY in a DisplayPort mode doesn't sleep in place, and a sleep that reached its commit
- * lowered ATC0_COMMON under it, behind its power domain's back: the lanes and the AUX
- * channel went. Have atcphy_resume() set the tracked mode up again, before the display
- * controller connects the link anew.
+ * A PHY that didn't sleep in place had ATC0_COMMON lowered under it by a sleep that reached
+ * its commit, behind its power domain's back, in any mode. In a DisplayPort mode the lanes
+ * and the AUX channel went; with no controller bound, the PIPE's dummy PHY enable, without
+ * which the next host's PIPE lock isn't acknowledged. Have the next PHY operation set the
+ * tracked mode up again, as after the domain was off, before the display controller
+ * connects the link anew or a controller starts.
  */
-static void atcphy_sleep_lost_dp(struct apple_atcphy *atcphy)
+static void atcphy_sleep_lost_common(struct apple_atcphy *atcphy)
 {
 	if (!atcphy->hw->has_t8140_dp || !atcphy->hw->restore_after_pd_off ||
-	    !pm_resume_via_firmware() || !atcphy_modes[atcphy->mode].enable_dp_aux)
+	    !pm_resume_via_firmware())
 		return;
 	WRITE_ONCE(atcphy->pd_was_off, true);
-	dev_dbg(atcphy->dev, "DisplayPort mode %d lost in the sleep: setting it up again\n",
-		atcphy->mode);
+	dev_dbg(atcphy->dev, "mode %d lost in the sleep: setting it up again\n", atcphy->mode);
 }
 
 static int atcphy_resume_noirq(struct device *dev)
@@ -7097,7 +7098,7 @@ static int atcphy_resume_noirq(struct device *dev)
 
 	guard(mutex)(&atcphy->lock);
 	if (!atcphy->hibernated) {
-		atcphy_sleep_lost_dp(atcphy);
+		atcphy_sleep_lost_common(atcphy);
 		return 0;
 	}
 	apple_sleep_usb_set_asleep(false);
