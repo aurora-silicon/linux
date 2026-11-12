@@ -340,7 +340,15 @@
 	};
 };
 
+/*
+ * Touch ID: the ADT names the J604's Mesa sensor "R3", J613's generation, so
+ * it runs in J613's SPI mode 1 (spi-cpha), not the mode 2 (spi-cpol) the
+ * T8132 node defaults to for J713's V3 sensor. In mode 3 (both) every wake
+ * read returns sixteen zero bytes and apple_sep gates the sensor.
+ */
 &mesa {
+	/delete-property/ spi-cpol;
+	spi-cpha;
 	/*
 	 * Per-device factory data from this Mac's own iBoot system container:
 	 * the calibration, and the signed root key the nonce session loads.
