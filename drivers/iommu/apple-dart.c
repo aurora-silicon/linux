@@ -6411,9 +6411,37 @@ EXPORT_SYMBOL_GPL(apple_dart_state_restore);
  * restarts the port clock in its own noirq callbacks. The adopted J613 MTP stays live:
  * system s2idle must retain, never reset it.
  */
+/*
+ * On Apple T6050 the USB controllers (generic xhci or dwc3) stay live across
+ * system sleep, so the DARTs in front of them have to stay live too:
+ * force-suspending a DART under a running controller reset the machine on a J714s,
+ * found by aborting pm_test=devices at each device in turn. The default names
+ * the USB DARTs of the K114c device tree. Read-only at runtime so suspend and
+ * resume always take the same path.
+ */
+static char *t6050_keep_live = "2a2f00000.iommu,2a2f80000.iommu,2aaf00000.iommu,2aaf80000.iommu,382f00000.iommu,382f80000.iommu";
+module_param(t6050_keep_live, charp, 0444);
+MODULE_PARM_DESC(t6050_keep_live, "On Apple T6050, DARTs (comma-separated device names) left alone across system sleep");
+
+static bool apple_dart_keep_live(struct device *dev)
+{
+	const char *list = READ_ONCE(t6050_keep_live), *p;
+	size_t n = strlen(dev_name(dev));
+
+	if (!list || !of_machine_is_compatible("apple,t6050"))
+		return false;
+	for (p = list; (p = strstr(p, dev_name(dev))); p += n)
+		if ((p == list || p[-1] == ',') && (p[n] == ',' || p[n] == '\0'))
+			return true;
+	return false;
+}
+
 static int apple_dart_system_suspend(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
+
+	if (apple_dart_keep_live(dev))
+		return 0;
 
 	if (!dart->live_mtp)
 		return pm_suspend_via_firmware() ? 0 : pm_runtime_force_suspend(dev);
@@ -6431,6 +6459,9 @@ static int apple_dart_system_suspend(struct device *dev)
 static int apple_dart_system_resume(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
+
+	if (apple_dart_keep_live(dev))
+		return 0;
 
 	if (!dart->live_mtp)
 		return pm_suspend_via_firmware() ? 0 : pm_runtime_force_resume(dev);

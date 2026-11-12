@@ -13,6 +13,8 @@ pre=r'''
 #include <stdbool.h>
 #include <stdint.h>
 #include <errno.h>
+#include <string.h>
+#define READ_ONCE(x) (x)
 #define dev_dbg(...) ((void)0)
 #define dev_err(...) ((void)0)
 #define DART_TCR(d,s) (s)
@@ -20,11 +22,12 @@ pre=r'''
 #define APPLE_ASC_CPU_CONTROL_RUN 16
 #define PM_SUSPEND_TO_IDLE 1
 static int pm_suspend_target_state=1;
-struct device {void *data;bool awake;};
+struct device {void *data;bool awake;const char *name;};
 struct hw {unsigned tcr_bypass;};
 struct apple_dart {bool live_mtp,live_mtp_sleep;struct hw *hw;unsigned tcr;};
 struct apple_rtkit_helper {bool adopted;unsigned char *asc_base;};
 static void *dev_get_drvdata(struct device *d){return d->data;}
+static const char *dev_name(struct device *d){return d->name;}
 static unsigned apple_dart_readl(struct apple_dart *d,unsigned sid){assert(sid==1);return d->tcr;}
 static void device_set_awake_path(struct device *d){d->awake=true;}
 static unsigned forced_suspend,forced_resume;
@@ -38,12 +41,16 @@ static int apple_rtkit_helper_ap_idle(struct apple_rtkit_helper *h){assert(!"fir
 /* Its AP-on notice is a no-op without an earlier idle notice. */
 static void apple_rtkit_helper_ap_on(struct apple_rtkit_helper *h){assert(h);}
 '''
-body=fn(s,'apple_dart_system_suspend')+fn(s,'apple_dart_system_resume')+fn(h,'apple_rtkit_helper_suspend')+fn(h,'apple_rtkit_helper_resume')
+def keep_live(s):
+ a=s.index('static char *t6050_keep_live');b=s.index('\n',a)+1
+ c=s.index('static bool apple_dart_keep_live(');d=s.index('\n}',c)+2
+ return s[a:b]+s[c:d]+'\n'
+body=keep_live(s)+fn(s,'apple_dart_system_suspend')+fn(s,'apple_dart_system_resume')+fn(h,'apple_rtkit_helper_suspend')+fn(h,'apple_rtkit_helper_resume')
 for forbidden in ['writel','hw_reset','invalidate_tlb','apple_rtkit_wake','apple_rtkit_boot','apple_rtkit_quiesce']:
  assert forbidden not in body,forbidden
 checks=r'''
 int main(void){
- struct hw hw={.tcr_bypass=3};struct apple_dart a={.live_mtp=true,.hw=&hw,.tcr=3};struct device d={.data=&a};
+ struct hw hw={.tcr_bypass=3};struct apple_dart a={.live_mtp=true,.hw=&hw,.tcr=3};struct device d={.data=&a,.name="ffff.iommu"};
  assert(!apple_dart_system_suspend(&d)&&d.awake&&a.live_mtp_sleep);
  assert(!apple_dart_system_resume(&d)&&!a.live_mtp_sleep&&a.tcr==3&&!forced_suspend&&!forced_resume);
  // Abort unwind is the same retained transaction, and can be repeated.
@@ -52,6 +59,13 @@ int main(void){
  a.tcr=0;assert(apple_dart_system_suspend(&d)==-EIO);a.tcr=3;
  assert(!apple_dart_system_suspend(&d));a.tcr=0;assert(apple_dart_system_resume(&d)==-EIO&&a.tcr==0);
  a.live_mtp=false;assert(apple_dart_system_suspend(&d)==7&&apple_dart_system_resume(&d)==8);
+ // t6050_keep_live: a listed DART (first, last) is left alone; a longer name, a prefix or a suffix of a listed one is not.
+ {const char *listed[]={"2a2f00000.iommu","382f80000.iommu"},*other[]={"2a2f00000.iommux","2a2f00000.iomm","f00000.iommu","x2a2f00000.iommu"};
+  forced_suspend=forced_resume=0;
+  for(int i=0;i<2;i++){d.name=listed[i];assert(!apple_dart_system_suspend(&d)&&!apple_dart_system_resume(&d));}
+  assert(!forced_suspend&&!forced_resume);
+  for(int i=0;i<4;i++){d.name=other[i];assert(apple_dart_system_suspend(&d)==7&&apple_dart_system_resume(&d)==8);}
+  assert(forced_suspend==4&&forced_resume==4);d.name="ffff.iommu";}
  unsigned regs[32]={0};struct apple_rtkit_helper h={.adopted=true,.asc_base=(void *)regs};d.data=&h;d.awake=false;
  regs[0x44/4]=16;assert(!apple_rtkit_helper_suspend(&d)&&d.awake);assert(!apple_rtkit_helper_resume(&d));
  regs[0x44/4]=0;assert(apple_rtkit_helper_resume(&d)==-EHOSTDOWN&&!regs[0x44/4]);
