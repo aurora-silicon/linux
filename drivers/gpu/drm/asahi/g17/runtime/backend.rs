@@ -133,6 +133,9 @@ impl job::Backend for Backend {
     fn render_pairs(&self) -> u32 {
         u32::from(self.pairs)
     }
+    fn publication_credits(&self) -> Option<u32> {
+        self.shared.variant.publication_credits
+    }
     fn input_sources(&self, inputs: &[crate::file::SyncItem])
         -> Option<Arc<crate::g17::sync_input::Sources>>
     {

@@ -29,6 +29,28 @@ const COMPUTE_CREDITS: u32 = crate::hw::t8140::queues::COMPUTE_DEPTH as u32;
 /// quadratic, about 1 ms of CPU. Past this many, the scheduler waits on one
 /// merged fence instead: the same wait, while status checks keep each fence.
 const MERGED_DEPENDENCIES: usize = 8;
+/// A firmware publication policy (`Variant::publication_credits`) or the
+/// `g17_publication_credits` override caps both engines of a logical queue at
+/// this many firmware-visible commands. The override is bounded to the
+/// separately testable sweep (1, 2, 4, 8, 16) and is never inferred from
+/// descriptor or kick capacity.
+const MAX_PUBLICATION_CREDITS: u32 = 16;
+
+/// The firmware-visible front of one logical engine, if capped: the module
+/// parameter when set, otherwise the firmware's policy.
+pub(super) fn publication_credits(policy: Option<u32>) -> Option<u32> {
+    match crate::module_parameters::g17_publication_credits.value() {
+        0 => policy,
+        credits => Some(credits),
+    }
+    .map(|credits| credits.clamp(1, MAX_PUBLICATION_CREDITS))
+}
+
+/// An unfinished logical frontier consumes an inline publication credit. Counting queued work
+/// too is conservative and prevents a later dependency-free command from overtaking it.
+pub(super) fn frontier_has_credit(frontier: usize, credits: u32) -> bool {
+    frontier < credits as usize
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Engine {
@@ -328,6 +350,8 @@ pub(crate) trait Backend: Send + Sync {
     /// Render pairs this logical queue may hold, fixed when it is created: its
     /// render scheduler's credits are fixed then too.
     fn render_pairs(&self) -> u32 { 1 }
+    /// The firmware's cap on visible commands per logical engine, if it has one.
+    fn publication_credits(&self) -> Option<u32> { None }
     fn supports_engine(&self, _engine: Engine) -> bool { true }
     /// Device policy applied to a validated command before it is ordered (the M5 resource
     /// plan).
@@ -457,6 +481,8 @@ pub(crate) struct Scheduler<B: Backend> {
     entity: sched::Entity<Job<B>>,
     _scheduler: sched::Scheduler<Job<B>>,
     backend: Arc<B>,
+    /// Firmware-visible commands this logical engine may hold, if capped.
+    publication_cap: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -487,13 +513,16 @@ impl Fences {
 
 impl<B: Backend> Scheduler<B> {
     pub(crate) fn new(dev: &AsahiDrmDevice, backend: Arc<B>, engine: Engine) -> Result<Self> {
-        let (credits, name) = match engine {
+        let (capacity, name) = match engine {
             Engine::Render => (
                 RENDER_CREDITS.checked_mul(backend.render_pairs()).ok_or(EOVERFLOW)?,
                 c_str!("aurora_g17_render"),
             ),
             Engine::Compute => (COMPUTE_CREDITS, c_str!("aurora_g17_compute")),
         };
+        // A capped front keeps the rest of a deep batch in this scheduler.
+        let publication_cap = publication_credits(backend.publication_credits());
+        let credits = publication_cap.map_or(capacity, |cap| cap.min(capacity));
         let device = dev.as_ref().as_ref();
         let submit = if backend.creator_cluster_scheduling() {
             // The run and free work stays in the creating CPU's cluster, as the event work
@@ -513,7 +542,15 @@ impl<B: Backend> Scheduler<B> {
             entity,
             _scheduler: scheduler,
             backend,
+            publication_cap,
         })
+    }
+
+    /// Whether a frontier of `frontier` unfinished commands leaves this engine a
+    /// publication credit for an inline publication.
+    pub(crate) fn has_credit(&self, frontier: usize) -> bool {
+        self.publication_cap
+            .map_or(true, |credits| frontier_has_credit(frontier, credits))
     }
 
     pub(crate) fn enqueue(
@@ -521,9 +558,11 @@ impl<B: Backend> Scheduler<B> {
         packet: Arc<Packet>,
         dependencies: KVec<Fence>,
         early: bool,
+        credit_blocked: bool,
         publication: Option<super::completion::PreparedPublication>,
     ) -> Result<Fences> {
-        super::trace::schedule(&packet, 0, dependencies.len() as i32);
+        let dependency_count = dependencies.len();
+        super::trace::schedule(&packet, 0, dependency_count as i32);
         let completed = packet.completion.fence();
         let host_timestamps = packet.completion.has_timestamps();
         // Only commands which actually write timestamps become host-prefix
@@ -561,7 +600,16 @@ impl<B: Backend> Scheduler<B> {
         // All fallible scheduler setup precedes early hardware publication. The
         // scheduler still owns watchdog, credits and cancellation after push.
         let inline = early && self.backend.try_early(&packet);
-        super::trace::schedule(&packet, if inline { 1 } else { 2 }, 0);
+        let queued_reason = if credit_blocked {
+            1
+        } else if dependency_count != 0 {
+            2
+        } else if early {
+            3
+        } else {
+            0
+        };
+        super::trace::schedule(&packet, if inline { 1 } else { 2 }, queued_reason);
         if !inline {
             if packet.completion.needs_source_ready() {
                 packet.completion.set_source_ready(ready.clone());
@@ -570,5 +618,46 @@ impl<B: Backend> Scheduler<B> {
         }
         job.push();
         Ok(Fences { ready, completed, publication: host_publication, owner: packet.completion.clone() })
+    }
+}
+
+#[kunit_tests(asahi_g17_publication_credits)]
+mod publication_credit_tests {
+    use super::*;
+
+    fn drain(commands: usize, credits: u32) {
+        let mut host = commands;
+        let mut published = 0;
+        while host != 0 || published != 0 {
+            while host != 0 && frontier_has_credit(published, credits) {
+                host -= 1;
+                published += 1;
+                assert!(published <= credits as usize);
+            }
+            assert_ne!(published, 0);
+            published -= 1;
+        }
+    }
+
+    #[test]
+    fn credit_one_keeps_deep_engine_backlogs_host_side() {
+        drain(128, 1);
+        drain(64, 1);
+    }
+
+    #[test]
+    fn logical_engines_account_independently() {
+        let mut fronts = [0usize; 2];
+        assert!(frontier_has_credit(fronts[Engine::Compute.index()], 1));
+        fronts[Engine::Compute.index()] += 1;
+        assert!(!frontier_has_credit(fronts[Engine::Compute.index()], 1));
+        assert!(frontier_has_credit(fronts[Engine::Render.index()], 1));
+    }
+
+    #[test]
+    fn sweep_values_never_exceed_the_selected_front() {
+        for credits in [1, 2, 4, 8, 16] {
+            drain(192, credits);
+        }
     }
 }

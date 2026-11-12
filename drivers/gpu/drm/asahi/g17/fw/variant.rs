@@ -87,6 +87,10 @@ pub(crate) struct Variant {
     /// work. The bare-metal M5 firmware powers the cores for work by its own policy: under a
     /// hold, the M5 Ultra's core-power witness reads unpowered until the hold is released.
     pub(crate) registration_power_hold: bool,
+    /// Firmware-visible commands one logical queue may hold per engine, or `None` for the
+    /// physical ring depth. The rest of a deeper batch waits in the DRM scheduler and is
+    /// published as earlier commands retire.
+    pub(crate) publication_credits: Option<u32>,
 }
 
 /// A firmware build a SoC supports, identified by its loaded TEXT.
@@ -137,6 +141,10 @@ pub(crate) const V26A428: Variant = Variant {
     split_firmware_area: false,
     m5_commands: false,
     registration_power_hold: true,
+    // A logical queue that exposes a deep front (128 compute + 64 render commands queued at
+    // once) crashes this firmware even with ring and descriptor room to spare. Expose one
+    // command per engine and keep the backlog on the host.
+    publication_credits: Some(1),
 };
 
 /// The M4 Pro firmware (25G83, `mBoot-18000.161.10`).
@@ -171,6 +179,7 @@ pub(crate) const V25G83: Variant = Variant {
     split_firmware_area: false,
     m5_commands: false,
     registration_power_hold: true,
+    publication_credits: None,
 };
 
 /// The 26A428 firmware of the M5 GPUs, which runs the M5 protocol (the M5 graph, queues and
@@ -179,6 +188,7 @@ pub(crate) const V26A428_M5: Variant = Variant {
     m5_commands: true,
     render_ray_query: false,
     registration_power_hold: false,
+    publication_credits: None,
     ..V26A428
 };
 
