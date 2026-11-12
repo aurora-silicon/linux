@@ -28,6 +28,7 @@
 		/* kboot fills the N1's factory addresses from /chosen through these */
 		wifi0 = &n1_alpha;
 		bluetooth0 = &n1_beta;
+		nvram = &nvram;
 	};
 };
 
@@ -329,4 +330,30 @@
 	       <&admac_base_ns 0>, <&admac_base_ns 1>,
 	       <&admac_ec_proxy 1>;
 	dma-names = "cout", "cin", "spkr", "sense", "hpai";
+};
+
+/*
+ * The boot NOR. spi-nor reads the part's JEDEC ID itself. The partition is
+ * read-only: no program or erase reaches the flash until a later change lifts it.
+ */
+&qspi {
+	status = "okay";
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <25000000>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			nvram: partition@700000 {
+				label = "nvram";
+				reg = <0x700000 0xc0000>;
+				read-only;
+			};
+		};
+	};
 };
