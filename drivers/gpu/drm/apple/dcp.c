@@ -33,11 +33,9 @@
 #include <linux/random.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
-#include <linux/soc/apple/sleep.h>
 #include <linux/soc/apple/pmp-report.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/string.h>
-#include <linux/suspend.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_mux.h>
