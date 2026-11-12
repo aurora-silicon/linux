@@ -388,7 +388,9 @@ properties:
     properties:
       compatible:
         oneOf:
-          - const: apple,panel
+          - enum:
+              - apple,panel
+              - apple,panel-mini-led
           - items:
               - pattern: '^apple,panel-j[0-9]+$'
               - const: apple,panel
