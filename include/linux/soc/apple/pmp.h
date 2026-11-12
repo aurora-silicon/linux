@@ -57,8 +57,6 @@ struct apple_pmp_commit_stop {
 	void __iomem *sram;
 	u32 *words;
 	size_t count;
-	/* Bytes from the SRAM's start to @sram: the firmware's text before its kept data. */
-	size_t offset;
 };
 
 int apple_pmp_sleep_prepare(const void *data, struct apple_pmp_commit_stop *stop);

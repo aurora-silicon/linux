@@ -200,16 +200,6 @@ EXPORT_SYMBOL_GPL(apple_pmp_t6030_gpu_ready);
 static struct apple_pmp_commit_stop pmp_commit;
 static bool pmp_commit_registered, pmp_commit_used;
 
-/*
- * T6040 bring-up: whether the firmware's text, which the sleep doesn't keep,
- * survived it. One word per 4 KiB of the text, read at the commit and again
- * before the restart; read only, inside the ADT's __TEXT segment.
- */
-#define PMP_TEXT_STEP		0x1000
-#define PMP_TEXT_SAMPLES	128
-static u32 pmp_text_sample[PMP_TEXT_SAMPLES];
-static unsigned int pmp_text_samples;
-
 /* Interrupts off, one CPU: what apple_pmp_sleep() does, through pointers taken before. */
 static int apple_pmp_commit_stop_fn(void *unused)
 {
@@ -222,11 +212,6 @@ static int apple_pmp_commit_stop_fn(void *unused)
 	apple_rtkit_mailbox_recv_off(c->rtk);
 	for (i = 0; c->sram && i < c->count; i++)
 		c->words[i] = readl_relaxed(c->sram + 4 * i);
-	pmp_text_samples = 0;
-	if (c->sram && of_machine_is_compatible("apple,t6040"))
-		for (i = 0; i < c->offset / PMP_TEXT_STEP && i < PMP_TEXT_SAMPLES; i++)
-			pmp_text_sample[pmp_text_samples++] =
-				readl_relaxed(c->sram - c->offset + i * PMP_TEXT_STEP);
 	/* Told to idle, it can't carry on whatever it answered: the sleep goes on. */
 	return ret ? 1 : 0;
 }
@@ -337,17 +322,6 @@ static int apple_pmp_resume_early(struct device *dev)
 		return 0;
 	}
 	pmp_asleep = false;
-	if (pmp_text_samples && pmp_commit.sram) {
-		unsigned int i, changed = 0;
-
-		for (i = 0; i < pmp_text_samples; i++)
-			if (readl_relaxed(pmp_commit.sram - pmp_commit.offset + i * PMP_TEXT_STEP) !=
-			    pmp_text_sample[i])
-				changed++;
-		dev_info(dev, "firmware text across the sleep: %u of %u sampled words changed\n",
-			 changed, pmp_text_samples);
-		pmp_text_samples = 0;
-	}
 	ret = apple_pmp_wake(pmp_data);
 	if (ret)
 		dev_err(dev, "firmware did not come back from sleep: %d\n", ret);
