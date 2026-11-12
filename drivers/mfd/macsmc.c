@@ -23,7 +23,6 @@
 #include <linux/overflow.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
-#include <linux/suspend.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/suspend.h>
@@ -731,7 +730,7 @@ static int apple_smc_freeze(struct device *dev)
 	struct apple_smc *smc = dev_get_drvdata(dev);
 
 	/* Only the image-loading kernel, right before it enters the image. */
-	if (apple_smc_loading_image && smc && apple_rtkit_is_running(smc->rtk)) {
+	if (apple_smc_loading_image && apple_rtkit_is_running(smc->rtk)) {
 		int ret;
 
 		apple_smc_write_flag(smc, SMC_KEY(NTAP), false);
