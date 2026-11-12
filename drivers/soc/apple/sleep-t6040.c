@@ -2375,10 +2375,10 @@ static void t6040_sleep_pmvc(struct t6040_sleep *s)
 }
 
 /*
- * The refusal-first gate. Default: print the blocker list and return an error
- * here, before any device suspends, so nothing is entered. A dry run proceeds
- * and refuses at .enter. allow_entry with no blocker and no dry run: the
- * path that reaches the commit.
+ * The refusal-first gate of a suspend to RAM, which t6040_sleep_valid() offers only with
+ * allow_entry. With a blocker left, print the blocker list and return an error here, before
+ * any device suspends, so nothing is entered. A dry run proceeds and refuses at .enter. No
+ * blocker and no dry run: the path that reaches the commit.
  */
 static int t6040_sleep_begin(suspend_state_t state)
 {
@@ -2411,7 +2411,7 @@ static int t6040_sleep_begin(suspend_state_t state)
 	if (dcs_to)
 		pr_warn("t6040-sleep: DCS power words %#x did not read on before automatic mode\n",
 			dcs_to);
-	if (!begin_total && allow_entry && !dry) {
+	if (!begin_total && !dry) {
 		/* The non-display blockers are clear and no dry run is asked for: proceed
 		 * to device suspend; .enter holds the real commit until the display is
 		 * also off. The AON WD2 is the net from here. */
@@ -2803,7 +2803,7 @@ static int t6040_sleep_enter(suspend_state_t state)
 	left = t6040_sleep_lower_display(s);
 	if (left)
 		pr_warn("t6040-sleep: %u display power word(s) did not go off\n", left);
-	if (t6040_sleep_total_blockers(s) || !allow_entry || !apple_sleep_power_loss()) {
+	if (t6040_sleep_total_blockers(s)) {
 		unsigned int on = t6040_sleep_log_groups(s);
 
 		pr_info("t6040-sleep: at the commit point: %u CPU(s) online, %u display group(s) on; refusing\n",
@@ -3237,10 +3237,10 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 	debugfs_create_file("preflight", 0400, dir, sleep, &t6040_sleep_preflight_fops);
 
 	/*
-	 * The CPU power ops act only when a commit stops the parked secondaries.
-	 * A real entry needs allow_entry; a dry run registers them at its .begin,
-	 * for the hold. Until then kexec keeps refusing parking CPUs as before.
-	 * Parking itself needs no power ops.
+	 * The CPU power ops act only when a commit stops the parked secondaries, and a dry run
+	 * needs them for the hold. Both are suspends to RAM, offered only with allow_entry, so
+	 * only then are they registered (.begin tries again if this failed). Without it kexec
+	 * keeps refusing parking CPUs as before. Parking itself needs no power ops.
 	 */
 	if (allow_entry)
 		t6040_sleep_power_ops(sleep);
