@@ -179,8 +179,11 @@ bool apple_t8122_25g83_board(void);
 void dcp_typec_hybrid_first_dt(void);
 void dcp_fabric_hdmi_unplugged(struct apple_dcp *dcp);
 void dcp_fabric_hybrid_kick(struct apple_dcp *dcp, unsigned int delay_ms);
+void dcp_fabric_hybrid_woken(struct apple_dcp *dcp);
 void dcp_hdmi_yield_link(struct apple_dcp *dcp);
 void dcp_link_recovery_schedule(struct apple_dcp *dcp);
+void dcp_wake_list_check(struct apple_dcp *dcp);
+bool dcp_wake_reread_pending(struct apple_dcp *dcp);
 
 /* Desktop 26.6 dual-pipe peer (dcp-peer-v26_6.inc, included from dcp.c) */
 struct dptx_port;

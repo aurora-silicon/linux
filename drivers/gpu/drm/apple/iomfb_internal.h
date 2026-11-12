@@ -112,6 +112,8 @@ int dcp_parse_tag(char tag[4]);
 
 void dcp_ack(struct apple_dcp *dcp, enum dcp_context_id context);
 
+u32 dcp_modes_signature(struct apple_dcp *dcp);
+
 /* The user may own drm_display_mode, so we need to search for our copy */
 bool lookup_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode,
 		 struct dcp_display_mode *out);

@@ -153,6 +153,8 @@ static LIST_HEAD(dcp_typec_ports);
 static unsigned long dcp_hybrid_moved;
 /* failed takes of the hybrid since the last success or Type-C DP exit */
 static unsigned int dcp_hybrid_fails;
+/* when a wake last connected an external display again, 0 if never; lockless */
+static unsigned long dcp_hybrid_woken;
 #define DCP_HYBRID_MAX_FAILS	2
 /* Current DTs wire the same stream capacity on every physical port. */
 static atomic_t dcp_dual_stream_routes = ATOMIC_INIT(0);
@@ -715,6 +717,8 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 
 	WRITE_ONCE(dcp->peer_starved, false);
 	WRITE_ONCE(dcp->typec_narrow, false);
+	/* Nor is its list a wake's to compare: another display comes here. */
+	WRITE_ONCE(dcp->wake_list_sig, 0);
 	/* A peer reserved for this route's display is not needed any more. */
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
 		dcp_peer_release_26_6(dcp);
@@ -5057,6 +5061,22 @@ void dcp_fabric_hybrid_kick(struct apple_dcp *dcp, unsigned int delay_ms)
 	mod_delayed_work(system_freezable_wq, &dcp->hybrid_wq, msecs_to_jiffies(delay_ms));
 }
 
+/*
+ * A wake connects every external display again, and a display that its link
+ * has just woken can list the modes of its standby first: a G95NC in
+ * picture-by-picture mode lists its full width then and asks for both pipes.
+ * dcp_wake_list_check() reads such a display again.  Until then, and until an
+ * HDMI display is back that the wake found behind a converter without power,
+ * the pipes stay with the displays the sleep found on them: the wake counts
+ * as a hand-over, and the next one waits for the cooldown.
+ */
+void dcp_fabric_hybrid_woken(struct apple_dcp *dcp)
+{
+	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP)
+		return;
+	WRITE_ONCE(dcp_hybrid_woken, jiffies ?: 1);
+}
+
 /* typec_hybrid_first was written: apply it now, past any cooldown. */
 static void dcp_fabric_hybrid_policy_changed(void)
 {
@@ -5064,6 +5084,7 @@ static void dcp_fabric_hybrid_policy_changed(void)
 	struct apple_dcp_typec_route *route;
 
 	guard(mutex)(&dcp_typec_fabric_lock);
+	WRITE_ONCE(dcp_hybrid_woken, 0);
 	dcp_hybrid_moved = 0;
 	dcp_hybrid_fails = 0;
 	list_for_each_entry(port, &dcp_typec_ports, link)
@@ -5099,6 +5120,7 @@ static void dcp_hybrid_work(struct work_struct *work)
 	struct apple_dcp *self = container_of(to_delayed_work(work), struct apple_dcp,
 					      hybrid_wq);
 	unsigned long cooldown = msecs_to_jiffies(DCP_HYBRID_COOLDOWN_MS);
+	unsigned long woken = READ_ONCE(dcp_hybrid_woken);
 	bool typec_first = dcp_typec_hybrid_first();
 	struct apple_dcp_typec_port *port;
 	bool unyielded = false;
@@ -5107,6 +5129,11 @@ static void dcp_hybrid_work(struct work_struct *work)
 	if (dcp_hybrid_moved && time_before(jiffies, dcp_hybrid_moved + cooldown)) {
 		mod_delayed_work(system_freezable_wq, &self->hybrid_wq,
 				 dcp_hybrid_moved + cooldown - jiffies);
+		return;
+	}
+	if (woken && time_before(jiffies, woken + cooldown)) {
+		mod_delayed_work(system_freezable_wq, &self->hybrid_wq,
+				 woken + cooldown - jiffies);
 		return;
 	}
 
