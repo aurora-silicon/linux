@@ -277,13 +277,7 @@ static const struct apple_cio_hw apple_cio_t6040_hw = {
 	.cio_phy = true,
 	.sleep_stop = true,
 	.tbt_settle = true,
-	/*
-	 * The DP IN adapter handshake is the t8103 one, as on M3 (the platform
-	 * has one handshake for every SoC). Off unless
-	 * t6040_dp_tunnels is set: the DP IN adapter to dpin0/1 mapping is
-	 * not decoded.
-	 */
-	.dp = &apple_dpin_m3,
+	.dp = &apple_dpin_disabled,
 };
 
 /* The platform sleeps 400 ms on the embedded CPU's enable if CIO generation < 3. */
@@ -577,11 +571,6 @@ static bool dp_display = true;
 module_param(dp_display, bool, 0444);
 MODULE_PARM_DESC(dp_display, "Drive displays behind qualified Thunderbolt DP tunnels (default: true)");
 
-static bool t6040_dp_tunnels;
-module_param(t6040_dp_tunnels, bool, 0444);
-MODULE_PARM_DESC(t6040_dp_tunnels,
-		 "T6040/T6041: tunnel DisplayPort from the routers' DP IN adapters (default off: the DP IN adapter to dpin0/1 mapping is not decoded)");
-
 /*
  * The M1 Pro/Max ATC is the t8103 generation: same DP IN adapter registers,
  * same crossbar and the same tunnel pixel clock sequence.
@@ -598,9 +587,6 @@ static const struct of_device_id apple_dpin_qualified_soc[] = {
 	{ .compatible = "apple,t8132" },
 	/* T6050: t8103 DP IN handshake, M3 flow, four DP IN adapters */
 	{ .compatible = "apple,t6050" },
-	/* M4 Pro/Max: only with t6040_dp_tunnels, see apple_cio_t6040_hw. */
-	{ .compatible = "apple,t6040" },
-	{ .compatible = "apple,t6041" },
 	{},
 };
 
@@ -4331,8 +4317,6 @@ static int apple_cio_probe(struct platform_device *pdev)
 	acio->dp_dual_stream = apple_dp_tunnel_dual_stream(acio->connector_np);
 	/* Register layout, root qualification and connector wiring are separate. */
 	acio->dp = apple_dpin_policy_select(acio->hw->dp, of_root, acio->dp_dual_stream);
-	if (acio->hw->cio_phy && !t6040_dp_tunnels)
-		acio->dp = &apple_dpin_disabled;
 	if (acio->connector_np) {
 		ret = devm_add_action_or_reset(dev, apple_cio_of_node_put,
 					       acio->connector_np);

@@ -362,9 +362,6 @@ static void apple_dpin_qualification_profiles(struct kunit *test)
 		{ "apple,t8132", &apple_dpin_m4, false, &apple_dpin_m4 },
 		{ "apple,t6050", &apple_dpin_m5, true, &apple_dpin_m5 },
 		{ "apple,t6050", &apple_dpin_m5, false, &apple_dpin_m5 },
-		/* T6040/T6041 qualify; the router keeps them off without t6040_dp_tunnels. */
-		{ "apple,t6040", &apple_dpin_m3, true, &apple_dpin_m3 },
-		{ "apple,t6041", &apple_dpin_m3, true, &apple_dpin_m3 },
 		{ "apple,unknown", &apple_dpin_m1, true, &apple_dpin_disabled },
 	};
 	unsigned int i;
