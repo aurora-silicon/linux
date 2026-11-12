@@ -9,15 +9,19 @@ title: Apple T6040 system sleep controller
 maintainers:
   - František Balázsy <frantisekbalazsy@gmail.com>
 
-description:
-  The power states macOS checks before it lets the T6040 sleep engine take
-  the SoC down (the ADT's device-check-ps-b4-sleep table). Each entry names a
-  PMGR register block, the offset of a display pipe's CPU power state and the
-  offset of its last sub-block; the states in between are 8 bytes apart.
+description: |
+  What an operating system that runs at EL2, with no firmware below it to ask,
+  drives itself to suspend the T6040 to RAM and to bring it back: the CPU
+  start block, the always-on watchdog, the complex and power-gate words, the
+  PMU's SPMI controllers and the always-on timer that starts the SoC's sleep
+  engine. All of these register blocks are shared with the devices that own
+  them. Without the blocks a suspend can be checked, and not entered.
 
-  The optional register blocks are the SoC words the entry and the wake write.
-  All of them are shared with the drivers that own them, and are touched only
-  once nothing blocks the sleep any more.
+  The sleep engine waits for the display pipes, so the node lists the power
+  states that have to be off before a sleep, as the ADT's
+  device-check-ps-b4-sleep table does. Each entry names a PMGR register block,
+  the offset of a display pipe's CPU power state and the offset of its last
+  sub-block; the states in between are 8 bytes apart.
 
 properties:
   compatible:
@@ -55,6 +59,9 @@ properties:
 
   apple,check-ps-b4-sleep:
     $ref: /schemas/types.yaml#/definitions/phandle-array
+    description:
+      The display pipes whose power states have to be off before a sleep, one
+      entry per pipe.
     items:
       items:
         - description: PMGR syscon
@@ -63,6 +70,14 @@ properties:
 
   apple,check-ps-b4-sleep-names:
     description: One name per apple,check-ps-b4-sleep entry.
+
+  apple,apcie:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The PCIe host whose shared registers and tunables the storage controller's
+      link depends on. The boot loader adds it, with those registers and
+      tunables on the host's node. Without it the storage controller can't be
+      stopped for a sleep.
 
 required:
   - compatible
