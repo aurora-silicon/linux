@@ -435,8 +435,8 @@ static int apple_pmu_rtc_prepare(struct device *dev)
 	 * Suspend to idle keeps the PMU powered and the alarm wakes the system.
 	 * A firmware-driven suspend programs the wake sources itself, and the
 	 * alarm stays armed in the PMU, which stays powered. Hibernation (the
-	 * target state stays PM_SUSPEND_ON) is accepted as well: the alarm is
-	 * stopped before the power-off below. Only a sleep state without any of
+	 * target state stays PM_SUSPEND_ON) is accepted as well: the restore
+	 * below has the alarm set again. Only a sleep state without any of
 	 * these has no way to bring the alarm back.
 	 */
 	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE &&
@@ -446,6 +446,8 @@ static int apple_pmu_rtc_prepare(struct device *dev)
 }
 
 /*
+ * Only a hibernation that powers off through platform hibernation ops gets
+ * here; a plain power-off or reboot after the image leaves the alarm as it is.
  * Whether an armed PMU alarm powers the machine on again after the
  * hibernation power-off is not established, so do not leave one armed.
  */
@@ -462,9 +464,28 @@ static int apple_pmu_rtc_poweroff(struct device *dev)
 	return 0;
 }
 
+/*
+ * A resume from disk went through a boot. The firmware and the kernel that
+ * loaded the image had the PMU in between: either may have stopped the alarm
+ * or set the comparator anew, and the alarm's time may have passed with the
+ * machine off, its event acknowledged by one of them. The RTC core still
+ * counts the alarm as set. Have it go through its timers: an alarm that is due
+ * is reported, a later one is written to the PMU again, and with none set the
+ * PMU's alarm is stopped. Not after a hibernation given up before its image.
+ */
+static int apple_pmu_rtc_restore(struct device *dev)
+{
+	struct apple_pmu_rtc *rtc = dev_get_drvdata(dev);
+
+	if (pm_hibernate_is_restored())
+		rtc_update_irq(rtc->clock, 1, RTC_IRQF | RTC_AF);
+	return 0;
+}
+
 static const struct dev_pm_ops apple_pmu_rtc_pm = {
 	.prepare = apple_pmu_rtc_prepare,
 	.poweroff = apple_pmu_rtc_poweroff,
+	.restore = apple_pmu_rtc_restore,
 };
 
 static void apple_pmu_rtc_release(void *context)

@@ -28,6 +28,10 @@ MUTATIONS = {
     'baku-limit': ('.max_delay = U32_MAX,', '.max_delay = APPLE_PMU_RTC_MAX_DELAY,'),
     'set-no-round': ('(counter + BIT(APPLE_PMU_RTC_HZ_SHIFT - 1))', '(counter)'),
     'set-negative': ('if (offset < 0 || offset', 'if (offset'),
+    'restore-unrestored': ('if (pm_hibernate_is_restored())',
+                           'if (pm_hibernate_is_restored() || true)'),
+    'restore-nothing': ('if (pm_hibernate_is_restored())',
+                        'if (pm_hibernate_is_restored() && false)'),
 }
 
 PRELUDE = r'''
@@ -77,8 +81,9 @@ struct regmap {
     int ops, fail;
 };
 static int disabled, pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
-static bool firmware_suspend;
+static bool firmware_suspend, restored;
 static bool pm_suspend_via_firmware(void) { return firmware_suspend; }
+static bool pm_hibernate_is_restored(void) { return restored; }
 static inline __attribute__((unused)) s64 sign_extend64(u64 v, int bit) { return (s64)(v << (63 - bit)) >> (63 - bit); }
 static u64 get_unaligned_le64(const void *p) { u64 v; memcpy(&v, p, 8); return v; }
 static void mutex_lock(struct mutex *m) { (void)m; }
@@ -335,7 +340,7 @@ static void run_variant(int v) {
     firmware_suspend = true;
     assert(!apple_pmu_rtc_prepare(&dev));
     firmware_suspend = false;
-    /* Hibernation is accepted: its power-off stops the alarm, and goes on if that fails. */
+    /* Hibernation is accepted. A platform power-off stops the alarm, and goes on if that fails. */
     pm_suspend_target_state = PM_SUSPEND_ON;
     assert(!apple_pmu_rtc_prepare(&dev));
     assert(!apple_pmu_rtc_set_alarm(&dev, &alarm) && (map.bytes[map.ctrl] & 0x40));
@@ -344,6 +349,16 @@ static void run_variant(int v) {
     map.ops = 0; map.fail = 1;
     assert(!apple_pmu_rtc_poweroff(&dev));
     pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
+    /*
+     * After a resume from disk the RTC core goes through its alarm again, without
+     * a PMU access of the driver's own; a hibernation given up before its image
+     * leaves the alarm alone.
+     */
+    reset(v);
+    assert(!apple_pmu_rtc_restore(&dev) && clock_model.events == 0 && map.ops == 0);
+    restored = true;
+    assert(!apple_pmu_rtc_restore(&dev) && clock_model.events == 1 && map.ops == 0);
+    restored = false;
 }
 int main(void) {
     run_variant(BAKU); run_variant(ABBEY); run_variant(STOWE); run_variant(MAVERICK);
