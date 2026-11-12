@@ -119,12 +119,9 @@ properties:
 
   apple,pmp:
     $ref: /schemas/types.yaml#/definitions/phandle
-    description: PMP firmware provider owning the GPU power vote and telemetry
-
-  apple,pmp-report:
-    $ref: /schemas/types.yaml#/definitions/phandle
     description:
-      PMP report aperture publishing the GPU lifetime-servo effort
+      PMP firmware provider owning the GPU power vote, telemetry and runtime
+      lifetime-servo effort
 
   operating-points-v2: true
 
@@ -398,9 +395,6 @@ allOf:
         - power-domains
         - reg-names
         - memory-region-names
-    else:
-      properties:
-        apple,pmp: false
   - if:
       properties:
         compatible:
@@ -435,7 +429,18 @@ allOf:
       required:
         - power-domains
         - operating-points-v2
-        - apple,pmp-report
+        - apple,pmp
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              enum:
+                - apple,agx-t8132
+                - apple,agx-t8140
+    then:
+      properties:
+        apple,pmp: false
   - if:
       properties:
         compatible:
