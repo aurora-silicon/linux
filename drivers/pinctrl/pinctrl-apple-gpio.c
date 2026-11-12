@@ -59,13 +59,13 @@ struct apple_gpio_pinctrl {
 	/* Pins this driver has written. Others belong to someone else. */
 	unsigned long *touched;
 	/*
-	 * The block whose every pin macOS puts back after a sleep that lost its power
-	 * (apple,resume-restore-all), but those in gpio-reserved-ranges.
+	 * A block whose every pin has to be put back after a sleep that lost its
+	 * power (apple,resume-restore-all), but those in gpio-reserved-ranges.
 	 */
 	bool restore_all;
 	unsigned long *no_restore;
 	unsigned long *restored;
-	/* The block's word at REG_GLOBAL, which macOS keeps across a sleep too. */
+	/* The block's word at REG_GLOBAL, kept across a sleep as well. */
 	u32 saved_global;
 	bool saved_global_valid;
 	struct apple_gpio_irq_group irqgrps[];
@@ -95,9 +95,9 @@ struct apple_gpio_pinctrl {
 #define REG_GPIOx_DRIVE_STRENGTH1 GENMASK(23, 22)
 #define REG_IRQ(g, x)        (0x800 + 0x40 * (g) + 4 * ((x) >> 5))
 /*
- * One word past the pins and the interrupt groups. macOS reads it when the
- * system quiesces and writes it back on the wake, before it puts the pins back. It is 1
- * on a running J616s; with it lost, no pin reads its input any more.
+ * One word past the pins and the interrupt groups. The block loses it with its
+ * power, and it has to be back before the pins are: with it lost, no pin reads
+ * its input any more. It is 1 on a running J616s.
  */
 #define REG_GLOBAL           0xc48
 
@@ -705,10 +705,10 @@ static const struct of_device_id apple_gpio_pinctrl_of_match[] = {
 MODULE_DEVICE_TABLE(of, apple_gpio_pinctrl_of_match);
 
 /*
- * A pin's whole word written the way macOS writes it: the
+ * A pin's whole word, in the order the pin takes it after a power loss: the
  * configuration first with the input buffer as it is (off after a power loss), then the
  * input enable in a write of its own, the lock last. A locked pin is left alone. Written
- * in one go, with the input enable among the rest, a pin read 0 for good after the wake.
+ * in one go, with the input enable among the rest, the pin reads 0 for good after the wake.
  */
 static void apple_gpio_safe_reconfigure(struct apple_gpio_pinctrl *pctl, unsigned int pin,
 					u32 old, u32 cfg)
@@ -746,9 +746,9 @@ static int apple_gpio_pinctrl_suspend_noirq(struct device *dev)
 
 	bitmap_zero(pctl->saved_valid, pctl->pinctrl_desc.npins);
 	/*
-	 * As macOS on the AP block at the system wake: every pin as the
-	 * hardware has it now, but the ones the device tree names, which may not be written
-	 * back. The pins of the panel's TCON bus, set up by the boot loader, are among them.
+	 * A block that loses every pin: every pin as the hardware has it now, but the ones
+	 * the device tree lists in gpio-reserved-ranges, which may not be written back. The
+	 * pins of the panel's TCON bus, set up by the boot loader, are among them.
 	 */
 	pctl->saved_global_valid = false;
 	if (pctl->restore_all) {
