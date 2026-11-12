@@ -471,6 +471,23 @@ static unsigned int external_sdr_rank(const struct color_mode *color)
 	}
 }
 
+/*
+ * SDR RGB on a firmware 27 external: Default RGB first, then sRGB or BT.709,
+ * then any other colorimetry, so a wide-gamut element stays a fallback.
+ */
+static unsigned int sdr_default_rgb_rank(const struct color_mode *color)
+{
+	switch (color->colorimetry) {
+	case DCP_COLORIMETRY_RGB:
+		return 3;
+	case DCP_COLORIMETRY_SRGB:
+	case DCP_COLORIMETRY_BT709:
+		return 2;
+	default:
+		return 1;
+	}
+}
+
 /* Firmware lists color element IDs which this timing cannot safely use. */
 #define DCP_TIMING_COLOR_ID_LIMIT 64
 
@@ -603,6 +620,7 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 	struct iterator outer_it;
 	struct dcp_color_mode bootstrap = { .score = -1 };
 	unsigned int best_sdr_rank = 0, best_unsafe_rank = 0, best_pq_rank = 0;
+	unsigned int best_rgb_rank = 0;
 	int ret = 0;
 	out->sdr_444.score = -1;
 	out->sdr_rgb.score = -1;
@@ -735,6 +753,17 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 
 		if (cmode.eotf == DCP_EOTF_SDR_GAMMA) {
 			if (cmode.pixel_encoding == DCP_COLOR_FORMAT_RGB &&
+			    cmode.depth <= 10 && handle->sdr_default_rgb) {
+				struct dcp_color_mode color = { .score = -1 };
+				unsigned int rank = sdr_default_rgb_rank(&cmode);
+
+				if (!fill_color_mode(&color, &cmode) && color.score >= 0 &&
+				    (rank > best_rgb_rank ||
+				     (rank == best_rgb_rank && color.score > out->sdr_rgb.score))) {
+					out->sdr_rgb = color;
+					best_rgb_rank = rank;
+				}
+			} else if (cmode.pixel_encoding == DCP_COLOR_FORMAT_RGB &&
 				cmode.depth <= 10)
 				fill_color_mode(&out->sdr_rgb, &cmode);
 			else if (cmode.pixel_encoding == DCP_COLOR_FORMAT_YCBCR444 &&
