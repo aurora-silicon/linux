@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * K114c (M5 Max) internal panel, for the boot loader's display handoff. Everything here
+ * stays disabled: the loader checks the ADT and the live DCP and DART state, publishes the
+ * DCP's firmware properties, and only then enables the nodes. A loader without the handoff,
+ * or one whose checks fail, leaves the boot framebuffer to simpledrm.
+ *
+ * Same layout as the internal panel half of t6050-j714s-gpu-panel.dtsi. The panel is the
+ * 14.2-inch tandem OLED of the K114 (ADT oled-display), with no I2C backlight controller, so
+ * its brightness is a DCP request (ADT backlight node: dcp-brightness-node).
+ */
+
+/ {
+	aliases {
+		/* The loader writes apple,notch-height into the "dcp" alias */
+		dcp = &dcp;
+		disp0 = &display;
+	};
+
+	/* As on t6050-ultra.dtsi, with the internal display's DART (disp0, SID 0) */
+	display: display-subsystem {
+		compatible = "apple,display-subsystem";
+		iommus = <&disp0_dart 0>;
+		status = "disabled";
+	};
+};
+
+/* ADT dart-dcp and dart-disp0: vm-base 1 TiB, vm-size 3 TiB */
+&dcp_dart {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+&disp0_dart {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+&dcp {
+	/* The ADT lists no clocks for the DCP (clock-ids = []); firmware 27 needs the property */
+	apple,clock-ids;
+
+	/*
+	 * An OLED, so the generic panel node only, not the mini-LED compatible. The
+	 * K114c ADT carries no panel dimensions: the 14.2-inch 3024x1964 panel is
+	 * the size of J714s (ADT disp0 dot-pitch 254.6 ppi). The ADT backlight
+	 * node's user-accessible-max-nits is 1000 (0x03e80000 in 16.16).
+	 */
+	panel {
+		compatible = "apple,panel";
+		width-mm = <302>;
+		height-mm = <196>;
+		apple,max-brightness = <1000>;
+	};
+};
