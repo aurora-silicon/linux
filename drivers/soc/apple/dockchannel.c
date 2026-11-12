@@ -453,23 +453,14 @@ static void dockchannel_irq_unmask(struct irq_data *data)
  * The controller hangs off a single chained AIC interrupt, which the IRQ core
  * never disables for system sleep and which keeps being delivered in
  * suspend-to-idle. A FIFO interrupt left unmasked can therefore end a
- * suspend-to-idle without configuring anything here. A suspend-to-RAM masks
- * every AIC interrupt that is not a wakeup source, so arming a FIFO interrupt
- * arms the chained parent too; the IRQ core counts the arms.
+ * suspend-to-idle without configuring anything, here or in the AIC.
  */
-static int dockchannel_irq_set_wake(struct irq_data *data, unsigned int on)
-{
-	struct dockchannel_common *dcc = irq_data_get_irq_chip_data(data);
-
-	return irq_set_irq_wake(dcc->irq, on);
-}
-
 static const struct irq_chip dockchannel_irqchip = {
 	.name = "dockchannel-irqc",
 	.irq_ack = dockchannel_irq_ack,
 	.irq_mask = dockchannel_irq_mask,
 	.irq_unmask = dockchannel_irq_unmask,
-	.irq_set_wake = dockchannel_irq_set_wake,
+	.flags = IRQCHIP_SKIP_SET_WAKE,
 };
 
 static int dockchannel_irq_domain_map(struct irq_domain *d, unsigned int virq,
