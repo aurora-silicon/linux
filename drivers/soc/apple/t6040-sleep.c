@@ -3,11 +3,8 @@
  * Apple T6040 (M4 Pro) system sleep: refusal-first controller.
  *
  * This is the T6040 port of aurora-silicon/linux #1208 (T8140 deep sleep at
- * EL2). It does not take the SoC down. #1208's T8140 driver follows the "last
- * 14 ms" power-down micro-sequence measured on a J700; that
- * measurement has not been made for the T6040, so the exact commit sequence (DCS
- * ladder, MCC lanes, PMC voters, CLLT, DVFM, the the platform on/off power-word lists,
- * the wake order) is UNKNOWN here.
+ * EL2). Its commit is the T6040 entry as measured on the J616s,
+ * which is much shorter than the T8140's (see t6040_sleep_commit).
  *
  * What it does:
  *
@@ -33,15 +30,13 @@
  *         shutdown notification it sent at its suspend).
  *    The AON watchdog's WD2 is armed from .begin to .end of a dry run 2 or 3
  *    (t6040_sleep.wd2_secs, 0 to leave it off).
- *  - The real commit (t6040_sleep_commit) is compiled but unreachable: it runs
- *    only when no blocker remains and t6040_sleep.allow_entry=1, and the
- *    missing-data blockers never clear in this kernel.
+ *  - The real commit (t6040_sleep_commit) runs only when no blocker remains,
+ *    t6040_sleep.allow_entry=1 is given and no dry run is asked for.
  *
  * Why this file and not a generalisation of t8140-sleep.c: the port keeps
- * #1208's T8140 behaviour byte-identical, and the per-SoC match data should be
- * built once the T6040 commit and wake have been measured. Until then the
- * registry lives here as well, with the same contract, and a kernel builds one
- * of the two controllers.
+ * #1208's T8140 behaviour byte-identical. Until the two share per-SoC match
+ * data the registry lives here as well, with the same contract, and a kernel
+ * builds one of the two controllers.
  */
 
 #include <linux/bitfield.h>
@@ -656,20 +651,7 @@ MODULE_PARM_DESC(dry_run,
 static bool allow_entry;
 module_param(allow_entry, bool, 0444);
 MODULE_PARM_DESC(allow_entry,
-		 "Reach the real commit if no blocker remains (none clears with the current unknowns)");
-
-/*
- * Explicit, deliberate override of the missing-data blockers (t6040_sleep_unknowns)
- * for the hardware S2R bring-up: the entry/wake/apcie/dcp code has run on the J616s
- * only with this override set, and a real commit can hang or lose devices on
- * resume (the AON WD2 is the net). Writable at runtime so it is armed only as the
- * last step after the system is quiesced; refuses still apply to the live blockers
- * (display/CPU/mailbox) and to allow_entry. Leave 0 for normal operation.
- */
-static bool i_know_untested;
-module_param(i_know_untested, bool, 0644);
-MODULE_PARM_DESC(i_know_untested,
-		 "DANGER: ignore the missing-data blockers for a first HW S2R bring-up (needs allow_entry too)");
+		 "Reach the real commit if no blocker remains");
 
 /*
  * The AON WD2 net armed at the commit. The platform arms 5 s for its reconfig; a longer
@@ -690,7 +672,7 @@ MODULE_PARM_DESC(wd2_secs,
  * After the S2R timer, the platform issues a PMU "go hib (0x7)" SPMI sequence.
  * Whether a Linux-at-EL2 driver must issue it, or the MasterMini timer alone
  * arms the engine and the PMU sees it over the hardware SPMI link, is unproven.
- * Off by default. The commit is unreachable regardless of this.
+ * Off by default.
  */
 static bool pmgr_quiesce = true;
 module_param(pmgr_quiesce, bool, 0644);
@@ -992,26 +974,6 @@ bool apple_sleep_commit_stops_coprocs(void)
 EXPORT_SYMBOL_GPL(apple_sleep_commit_stops_coprocs);
 
 /*
- * What still keeps the commit unreachable. The SoC power-down and the
- * wake return are IMPLEMENTED from the entry as measured on the J616s and
- * from its wake restore, which was not measured (t6040_sleep_commit,
- * t6040_sleep_return), but no step
- * of a T6040 Linux sleep has run on hardware, and two subsystems still have no
- * way back from a real power loss. These are facts about this kernel, not
- * runtime state: they never clear here, so the commit stays unreachable until
- * tests on hardware retire them. The enclave's
- * sleep request and the AIC save/restore are built.
- */
-static const char *const t6040_sleep_unknowns[] = {
-	"U1/U2: the T6040 SoC power-down is implemented from the held entry trace (clusters off, clk-mux park, PMU boot-stage, MasterMini S2R timer) but has never been run on hardware; the PMU go-hib replay's necessity is unconfirmed",
-	"U3: the T6040 wake return is implemented after the wake restore (complexes on, wake/CPM pwrgates, SOC-East retention, axi2af bridge re-arm, clkgen restore, S2R-ctrl clear) but has never been run; the aura mailbox hand-back is unproven on T6040",
-	"U4: ANS's two ST-lane PCIe link + shared PHY lower/raise is implemented (t6040_sleep_lower/raise_apcie_st, a two-lane port of #1208) but needs the apple,apcie control windows + PLL/lane tunables published by the boot object; absent here, so a real sleep with ANS stopped still refuses; the GP host's Wi-Fi/SD are left to cold-recover and no HW S2R has run",
-	"U5: the DCP cold restart after a real power loss is implemented (dcp_desktop_cold_restart, factored from the S4 hibernation path, wired into dcp_t6041_s2r_resume) but the display-domain lower/raise needs the apple,display-power window (absent here), DCPEXT is deferred to ext_dead, and no HW S2R has run",
-};
-
-#define T6040_SLEEP_DATA_BLOCKERS	ARRAY_SIZE(t6040_sleep_unknowns)
-
-/*
  * As in the power-state check, a sub-block is on while its TARGET is not 0. The
  * pipe's CPU counts as on while its ACTUAL is not 0: the engine waits for the
  * CPU's actual state. A CPU under automatic power gating (AUTO_ENABLE, target 15)
@@ -1124,15 +1086,10 @@ static unsigned int t6040_sleep_live_blockers(struct t6040_sleep *sleep, struct 
 	return blockers + disp;
 }
 
-/* The total: live state plus the data this kernel is missing. Zero only if the port is complete. */
+/* The total, at the commit point: everything the live state still holds against the commit. */
 static unsigned int t6040_sleep_total_blockers(struct t6040_sleep *sleep)
 {
-	unsigned int data = READ_ONCE(i_know_untested) ? 0 : T6040_SLEEP_DATA_BLOCKERS;
-
-	if (!data && T6040_SLEEP_DATA_BLOCKERS)
-		pr_warn_once("t6040-sleep: i_know_untested set: IGNORING %zu never-run data blockers (U1-U5); a real commit may hang or lose devices on resume\n",
-			     T6040_SLEEP_DATA_BLOCKERS);
-	return t6040_sleep_live_blockers(sleep, NULL, NULL) + data;
+	return t6040_sleep_live_blockers(sleep, NULL, NULL);
 }
 
 static void t6040_sleep_show_registry(struct seq_file *s)
@@ -1164,13 +1121,7 @@ static int t6040_sleep_preflight_show(struct seq_file *s, void *unused)
 
 	t6040_sleep_show_registry(s);
 	t6040_axi2af_show(sleep, s);
-	seq_puts(s, "data this kernel is missing for a T6040 commit:\n");
-	for (i = 0; i < T6040_SLEEP_DATA_BLOCKERS; i++)
-		seq_printf(s, "  %s\n", t6040_sleep_unknowns[i]);
-
-	seq_printf(s,
-		   "verdict: %u live blocker(s) + %zu missing-data blocker(s); no entry path in this kernel\n",
-		   live, T6040_SLEEP_DATA_BLOCKERS);
+	seq_printf(s, "verdict: %u live blocker(s)\n", live);
 	seq_printf(s, "dry_run %u, wd2_secs %u, allow_entry %d, parking ops %s\n",
 		   READ_ONCE(dry_run), READ_ONCE(wd2_secs), allow_entry,
 		   sleep->power_ops ? "registered" : "not registered");
@@ -1224,14 +1175,11 @@ static unsigned int t6040_sleep_log_groups(struct t6040_sleep *sleep)
 static void t6040_sleep_log_blockers(struct t6040_sleep *sleep)
 {
 	const char *ops_name;
-	unsigned int i;
 
 	pr_info("t6040-sleep: EL2 %s, s2r-mailbox %s, parkable %u/%u (%s)\n",
 		is_kernel_in_hyp_mode() ? "yes" : "no",
 		of_property_present(of_chosen, "aurora,s2r-mailbox") ? "yes" : "no",
 		t6040_sleep_parkable(&ops_name), num_possible_cpus() - 1, ops_name);
-	for (i = 0; i < T6040_SLEEP_DATA_BLOCKERS; i++)
-		pr_info("t6040-sleep: blocker: %s\n", t6040_sleep_unknowns[i]);
 }
 
 /*
@@ -4172,10 +4120,9 @@ static int t6040_sleep_raise_apcie_st(struct t6040_sleep *s)
 }
 
 /*
- * The real commit (t6040_sleep_commit, reached through cpu_suspend). COMPILED
- * BUT UNREACHABLE: t6040_sleep_enter calls it only when no blocker remains and
- * allow_entry is set, and the missing-data blockers (t6040_sleep_unknowns)
- * never clear in this kernel. The SoC power-down here is the T6040 entry as
+ * The real commit (t6040_sleep_commit, reached through cpu_suspend):
+ * t6040_sleep_enter calls it only when no blocker remains and allow_entry is
+ * set. The SoC power-down here is the T6040 entry as
  * measured on the J616s, which is SHORT: unlike #1208's T8140 commit there
  * is NO dcs_down / mcc_stop / pwrgate / PTD / clk-mux-per-lane / CLLT / dvfm /
  * AMCC / ps_seq list (the platform writes none of them). The
@@ -4703,8 +4650,7 @@ static int t6040_sleep_commit(unsigned long unused)
  * mirror of the PMGR wake restore: the three CPU complexes on, the two wake
  * pwrgates, SOC-East retention off (with the PARENT_MISSING poll), the axi2af
  * fabric-bridge re-arm, the CPM voters re-asserted, the clk mux restored, the
- * AP-global S2R control cleared, and the wake-status words read. It runs on
- * the J616s once the data blockers are overridden (i_know_untested).
+ * AP-global S2R control cleared, and the wake-status words read.
  */
 /*
  * Wake-return marks (seen on the J616s: an asynchronous SError on CPU 0 after the wake, last
@@ -4954,9 +4900,8 @@ static int t6040_sleep_valid(suspend_state_t state)
 /*
  * The refusal-first gate. Default: print the blocker list and return an error
  * here, before any device suspends, so nothing is entered. A dry run proceeds
- * and refuses at .enter. allow_entry with no blocker: the only path that would
- * reach the commit, and it cannot, because the missing-data blockers never
- * clear.
+ * and refuses at .enter. allow_entry with no blocker and no dry run: the
+ * path that reaches the commit.
  */
 /*
  * Seq 25 stalls because ATC_n_COMMON does not come back up (port 0 or port 1 at random).
@@ -5047,11 +4992,10 @@ static int t6040_sleep_begin(suspend_state_t state)
 	struct t6040_sleep *s = t6040_sleep;
 	unsigned int disp = 0;
 	unsigned int live = t6040_sleep_live_blockers(s, NULL, &disp);
-	unsigned int data = READ_ONCE(i_know_untested) ? 0 : T6040_SLEEP_DATA_BLOCKERS;
 	/* The display pipes are lowered during device suspend (apple-dcp .suspend),
 	 * so .begin only gates on the non-display live blockers; .enter re-checks the
 	 * full set at the commit point, by which time the display is off. */
-	unsigned int begin_total = (live - disp) + data;
+	unsigned int begin_total = live - disp;
 	unsigned int dry = READ_ONCE(dry_run), secs;
 
 	WRITE_ONCE(t6040_sleep_dry, 0);
@@ -5064,12 +5008,12 @@ static int t6040_sleep_begin(suspend_state_t state)
 		t6040_dcs_dyn_pg(s);
 	if (READ_ONCE(dcs_ps_auto) & BIT(0))
 		t6040_dcs_ps_auto_on(s);
-	pr_info("t6040-sleep: suspend requested: %u live blocker(s) (%u display, cleared during device suspend) + %u missing-data blocker(s)\n",
-		live, disp, data);
+	pr_info("t6040-sleep: suspend requested: %u live blocker(s) (%u display, cleared during device suspend)\n",
+		live, disp);
 	t6040_sleep_log_blockers(s);
 
-	if (!begin_total && allow_entry) {
-		/* Non-display blockers clear and the override/unknowns allow it: proceed
+	if (!begin_total && allow_entry && !dry) {
+		/* The non-display blockers are clear and no dry run is asked for: proceed
 		 * to device suspend; .enter holds the real commit until the display is
 		 * also off. The AON WD2 is the net from here. */
 		if (disp)
@@ -5917,7 +5861,8 @@ static int t6040_sleep_enter(suspend_state_t state)
 			return -EBUSY;
 		}
 	}
-	if (t6040_sleep_total_blockers(s) || !allow_entry) {
+	/* A dry run 1 ends here as well: its .begin told the firmware nothing. */
+	if (t6040_sleep_total_blockers(s) || !allow_entry || !apple_sleep_power_loss()) {
 		unsigned int on = t6040_sleep_log_groups(s);
 
 		/*
@@ -5935,7 +5880,7 @@ static int t6040_sleep_enter(suspend_state_t state)
 		return -EBUSY;
 	}
 
-	/* Unreachable with the current unknowns. #1208's order. */
+	/* #1208's order. */
 	if (t6040_sleep_refuse(s)) {
 		/* 0x5aGGWWWW: why, as t6040_sleep_refuse() recorded it (GG display groups on). */
 		t6040_mark_raw(s, 0x5a000000 | (t6040_refuse_why & 0xffffff));

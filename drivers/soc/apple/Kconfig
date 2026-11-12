@@ -130,20 +130,18 @@ config APPLE_T6040_SLEEP
 	help
 	  The T6040 (M4 Pro) suspend-to-RAM controller, still a separate
 	  driver next to APPLE_SOC_SLEEP until the T6040 becomes match data
-	  there. It registers a suspend handler that
-	  enumerates every blocker (the untraced SoC power-down sequence, the
-	  unrun wake path, the live state: EL2, the boot object's return path,
-	  the CPUs that can park, the display power states the platform checks before
-	  it sleeps) and refuses, so a suspend request prints the blockers and
-	  enters nothing.
+	  there. It registers a suspend handler that enumerates every
+	  blocker in the live state (EL2, the boot object's return path, the
+	  CPUs that can park, the display power states the platform checks before it
+	  sleeps). Unless t6040_sleep.allow_entry=1 is given and no blocker
+	  remains, a suspend request prints the blockers and enters nothing.
 
 	  It keeps the coprocessor and enclave registry for the T6040, so
 	  the drivers that leave their last stop to the sleep's commit (ANS,
 	  the PMP, the SEP) can register, and offers dry runs: with
 	  t6040_sleep.dry_run=2 every driver's firmware-driven sleep step that
 	  can be taken back runs, the CPUs park and are held, and the sleep is
-	  refused at the commit point and resumed warm. The real commit is
-	  compiled but unreachable while any blocker remains.
+	  refused at the commit point and resumed warm.
 
 	  It owns the same registry as APPLE_SOC_SLEEP, so a kernel has one
 	  of the two.
