@@ -1344,7 +1344,7 @@ static void t6040_usb3_down_locked(struct t6040_usb2_phy *tphy)
 		t6040_usb3_pipe_park(tphy);
 		tphy->pipe_switched = false;
 	}
-	/* The USB3 mode 0 from 3: the park from the USB4 router uses the same writes. */
+	/* Off the USB4 router: the park from there uses the same writes. */
 	if (tphy->pipe_tunneled) {
 		t6040_usb3_pipe_park(tphy);
 		tphy->pipe_tunneled = false;
@@ -2076,12 +2076,12 @@ static const struct phy_ops t6040_dp_phy_ops = {
 /* ---- DP tunnels: the pixel clocks of the router's DP IN adapters (PHY in CIO) ----
  *
  * The DP 1.4 tunnel's init, update and shutdown and the DP clock
- * configuration, as the platform sequences them: one fixed
- * AUSPLL frequency feeds the DPTX pixel clocks, whose select field divides it
- * per link rate. DP IN adapter 0 is taken to use PCLK1 and clock switch 1,
- * adapter 1 PCLK2 and switch 2 (the PHY does not choose; the platform gets the index
- * from the display controller). Driven only by appledrm through
- * apple_atc_dp_tunnel_rate(), and only while the PHY is in CIO.
+ * configuration: one fixed AUSPLL frequency feeds the DPTX pixel clocks,
+ * whose select field divides it per link rate. DP IN adapter 0 is taken to
+ * use PCLK1 and clock switch 1, adapter 1 PCLK2 and switch 2 (the PHY does
+ * not choose: the index is the display controller's). Driven only by
+ * appledrm through apple_atc_dp_tunnel_rate(), and only while the PHY is in
+ * CIO.
  */
 #define T6040_CORE_RCAL1		0x804	/* AUS40CMN_DIG RCAL1 */
 #define T6040_CORE_RCAL1_DONE		BIT(0)
@@ -2261,7 +2261,7 @@ static int t6040_tun_switch(struct t6040_usb2_phy *tphy, unsigned int dpin, bool
 	return 0;
 }
 
-/* All tunnel clocks down, as the lane configuration does before the ACIO shutdown. */
+/* All tunnel clocks down, which the PHY's shutdown of mode 2 starts with. */
 static void t6040_tun_stop_all_locked(struct t6040_usb2_phy *tphy)
 {
 	unsigned int dpin;
@@ -2371,8 +2371,8 @@ EXPORT_SYMBOL_GPL(apple_atc_dp_tunnel_open);
  * without them every mux state takes the path it took before.
  *
  * USB3 runs tunnelled through the router: the controller's PIPE goes to the
- * USB4 backend (the USB3 mode 3, see t6040_cio_pipe_tunnel)
- * while the PHY is in CIO and the router has asked for it.
+ * USB4 backend (see t6040_cio_pipe_tunnel()) while the PHY is in CIO and the
+ * router has asked for it.
  */
 
 /* The ADT tables of the CIO-only tunables, in order; lane0/1 are required. */
@@ -2470,9 +2470,9 @@ static void t6040_cio_slpctrl(struct t6040_usb2_phy *tphy)
 }
 
 /*
- * The USB3 mode 3 from 0: the PIPE from the dummy backend to the USB4
- * router, with the lock handshake only while the controller is out of reset.
- * No non-selected override and no BIST bracket, unlike the PHY's own USB3.
+ * The PIPE from the dummy backend to the USB4 router, with the lock handshake
+ * only while the controller is out of reset. No non-selected override and no
+ * BIST bracket, unlike the PHY's own USB3.
  */
 static void t6040_cio_pipe_tunnel(struct t6040_usb2_phy *tphy)
 {
@@ -2498,9 +2498,9 @@ static void t6040_cio_pipe_tunnel(struct t6040_usb2_phy *tphy)
 
 /*
  * The PIPE is on the router while the router runs and carries USB3 for the
- * controller (the platform asks for USB3 mode 3 only for a tunnelled USB3
- * transport, once it uses the tunnel), dwc3 holds the USB3 phy with its PIPE
- * and the controller is out of reset. Otherwise it goes back to the dummy.
+ * controller (only a tunnelled USB3 transport needs it there, and only once
+ * it uses the tunnel), dwc3 holds the USB3 phy with its PIPE and the
+ * controller is out of reset. Otherwise it goes back to the dummy.
  */
 static void t6040_cio_pipe_update_locked(struct t6040_usb2_phy *tphy)
 {
@@ -2528,7 +2528,7 @@ static void t6040_cio_down_locked(struct t6040_usb2_phy *tphy)
 	if (!tphy->cio_up)
 		return;
 	t6040_tun_stop_all_locked(tphy);
-	/* The USB3 mode 0 from 3: the same writes as the park from 2 */
+	/* Off the router: the same writes as the park from this PHY */
 	if (tphy->pipe_tunneled) {
 		t6040_usb3_pipe_park(tphy);
 		tphy->pipe_tunneled = false;
@@ -3334,12 +3334,11 @@ static int t6040_usb2_probe(struct platform_device *pdev)
  *
  * The register sequences are those of power_off, power_on and the reset, in
  * the order dwc3-apple's stop and start run them, so the CFG block is parked
- * at the sleep's commit as after any detach. The platform has the PHY's firmware
- * save its state instead and restore it at the wake;
- * the devices stay without that, and it isn't
- * done here. The steps are the same whether or not the SoC then loses power
- * (a refused sleep, a dry run), and leave nothing the wake doesn't set up
- * again.
+ * at the sleep's commit as after any detach. The PHY's firmware can save its
+ * state for a sleep and restore it at the wake instead; the devices stay
+ * without that, and it isn't done here. The steps are the same whether or
+ * not the SoC then loses power (a refused sleep, a dry run), and leave
+ * nothing the wake doesn't set up again.
  *
  * The phys' power counts and the reset's runtime PM reference are their
  * consumers' and stay as they are; sleep_down and sleep_reset say what the
