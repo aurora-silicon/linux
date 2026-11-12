@@ -4139,6 +4139,10 @@ static const struct ane_t602x_soc ane_h16_soc = {
 	.platform = &ane_h16_platform,
 };
 
+static const struct ane_t602x_soc ane_t8132_soc = {
+	.platform = &ane_t8132_platform,
+};
+
 static const struct ane_t602x_soc ane_h17_soc = {
 	.platform = &ane_h17_platform,
 };
@@ -4153,6 +4157,7 @@ static const struct of_device_id ane_rtclient_of_match[] = {
 	{ .compatible = "apple,t6022-ane", .data = &ane_t6022_soc },
 	{ .compatible = "apple,t8112-ane", .data = &ane_t8112_soc },
 	{ .compatible = "apple,t6041-ane", .data = &ane_h16_soc },
+	{ .compatible = "apple,t8132-ane", .data = &ane_t8132_soc },
 	{ .compatible = "apple,t8140-ane", .data = &ane_h17_soc },
 	{ .compatible = "apple,t6050-ane", .data = &ane_t6050_soc },
 	{ }

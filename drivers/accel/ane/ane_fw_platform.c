@@ -23,6 +23,15 @@ static const u32 ane_h16_reg_sizes[] = {
 	0x2000000, 0x18000, 0x4000, 0x30000, 0xff4000, 0x2000000, 0x4000,
 };
 
+/* T8132 has no second engine (aux-3); retain the ADT window ordering. */
+static const char * const ane_t8132_reg_names[] = {
+	"engine", "pmgr", "aux-0", "aux-1", "aux-2", "aux-4",
+};
+
+static const u32 ane_t8132_reg_sizes[] = {
+	0x2000000, 0x18000, 0x4000, 0x30000, 0xff4000, 0x4000,
+};
+
 /* Offsets in reg[1]; genpd, never the ANE driver, owns transitions. */
 static const u32 ane_h16_power_words[] = {
 	0x3c0, 0xc008, 0xc000, 0xc010, 0xc018,
@@ -89,9 +98,37 @@ const struct ane_fw_platform ane_h16_platform = {
 	 * EXCLAVE_MODE_STOP.
 	 */
 	.sleep_cold = true,
+	.boot_qualified = true,
 	.firmware_preloaded = true,
 	.safe_reset = false,
 	.pmp_report = "apple,t6041-pmp-v2-report",
+};
+
+/*
+ * M4: resource metadata from the public T8132 J773/J604/J713 ADTs.
+ * The shared H16 path is selected, but T6041's firmware profiles, MMIO
+ * tables, power sequence and second-engine window are not qualified here.
+ * Keep boot_qualified false until an owner validates a T8132 preload and
+ * the backend handles its single engine, two IRQs and five DAPF records.
+ */
+const struct ane_fw_platform ane_t8132_platform = {
+	.soc = 0x8132,
+	.chip_family = 16,
+	.ane_type = 0x100,
+	.interrupt_count = 2,
+	.irq_role = ANE_FW_IRQ_UNKNOWN,
+	.owner = ANE_FW_OWNER_AP,
+	.reg_names = ane_t8132_reg_names,
+	.reg_sizes = ane_t8132_reg_sizes,
+	.reg_count = ARRAY_SIZE(ane_t8132_reg_names),
+	.dapf_dart = 0,
+	.dapf_offset = 0x10000,
+	.dapf_size = SZ_16K,
+	.dapf_count = 5,
+	.preload_dva = { 0x10000000000, 0x100000c0000 },
+	.preload_size = { 0xc0000, 0x2ac000 },
+	.boot_qualified = false,
+	.firmware_preloaded = true,
 };
 
 const struct ane_fw_platform ane_h17_platform = {
@@ -114,6 +151,7 @@ const struct ane_fw_platform ane_h17_platform = {
 	.preload_dva = { 0x10000000000, 0x100000c0000 },
 	.preload_size = { 0xc0000, 0x2ac000 },
 	.stream_mask = BIT(0),
+	.boot_qualified = true,
 	.firmware_preloaded = true,
 	.safe_reset = false,
 	/* 25G83 boots this firmware in Exclave mode (SPEC-ANE-SLEEP-H17.md). */
@@ -164,6 +202,7 @@ const struct ane_fw_platform ane_t6050_platform = {
 	.preload_dva = { 0x10000000000, 0x100000c0000 },
 	.preload_size = { 0xc0000, 0x2ac000 },
 	.stream_mask = BIT(0),
+	.boot_qualified = true,
 	.firmware_preloaded = true,
 	.safe_reset = false,
 	.sleep_warm = false,
@@ -250,6 +289,12 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 	u32 ane_type;
 	unsigned int i;
 	int ret;
+
+	/* Refuse unqualified SoCs before resources, DMA, power or MMIO. */
+	if (!soc->boot_qualified)
+		return dev_err_probe(dev, -EOPNOTSUPP,
+			"ANE boot unqualified for SoC %#x; requires owner qualification and bootloader firmware preload support\n",
+			soc->soc);
 
 	/* No backend has acquired ownership, even if DT omits the marker.
 	 * Check before resources, firmware, power, IOMMU or engine access.
