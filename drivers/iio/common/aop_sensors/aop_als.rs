@@ -160,9 +160,9 @@ fn set_als_property(aop: &dyn AOP, svc: &EPICService, tag: u32, data: &[u8]) -> 
 ///
 /// The AOP mailbox interrupt stays enabled in suspend-to-idle, so every
 /// report ends the CPUs' idle period: at the 200 ms interval the sensor
-/// woke the system five times a second. A zero interval stops the reports;
-/// The platform writes one to its AOP sensors when the system sleeps and the
-/// interval they had when it wakes.
+/// woke the system five times a second. A zero interval stops the reports:
+/// it is written when the system sleeps and the previous interval when it
+/// wakes.
 ///
 /// Only suspend is handled. A hibernation powers the system off, and after
 /// a resume from disk the AOP core may have restarted the co-processor and
