@@ -2031,6 +2031,7 @@ impl Gpu {
                 rings: channel::Rings::new(shared.variant.graph)?,
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
+                ceiling: None,
                 hold: power::Hold::new(),
                 governor: thermal::Governor::new(),
                 registration_power_release_pending: false,
