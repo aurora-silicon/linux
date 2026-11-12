@@ -2258,9 +2258,10 @@ static void t6040_sleep_return(struct t6040_sleep *s)
 
 	/*
 	 * The three CPU complexes back on (E, P0, P1), nibble 0xf, poll +0xc for
-	 * the ready bit. The ACC restore then writes ACC register 0xe440f8
-	 * := 1 per complex; that per-complex ACC window is not mapped here (TODO)
-	 * and is left to the normal per-CPU bring-up.
+	 * the ready bit. The platform then also writes 1 to register 0xe440f8 of each
+	 * complex. That is not done here: the secondaries come up through the
+	 * normal per-CPU start afterwards, and all 14 CPUs of the J616s are
+	 * online after a wake without it.
 	 */
 	if (s->cluster_ctl)
 		for (i = 0; i < CLUSTER_CTL_NR; i++) {
@@ -2292,9 +2293,9 @@ static void t6040_sleep_return(struct t6040_sleep *s)
 	t6040_wake_sync();
 
 	/*
-	 * The SOC DPE restore (the 14 DPE energy accumulators |= 1) is skipped:
-	 * the DPE RegMap base and its offset list are not resolved here, and it
-	 * is energy accounting only, benign to skip. TODO.
+	 * Bit 0 of the SoC's 14 energy accumulators could be set again here. They
+	 * only account energy and nothing in this kernel reads them, so they are
+	 * left as the power loss left them.
 	 */
 
 	/* The fabric-bridge retention re-arm (the ANS/Wi-Fi/display-dead guard). */

@@ -9035,24 +9035,18 @@ bool dcp_s2r_firmware_stopped(struct platform_device *pdev)
 }
 
 /*
- * The display power domains across a T6040 S2R, the raw-MMIO fallback
- * adapted from the T8140 dcp_s2r_ext_domains_on/off. The bases come from an
- * apple,display-power node (reg-names "ps" + "pmc-dcp") the boot object would
- * publish; our static tree has none, so dcp_t6041_display_power() returns
- * -ENODEV, the entry lower is skipped (the commit's axi2af readcheck logs the
- * pipe still on) and the resume keeps the panel off -- both refusal-safe, so
- * this stays a sleep blocker until the window (or the preferred apple-pmgr-pwrstate
- * genpd extension for conditional-retention + the axi2af bridge) lands and an
- * S2R on hardware proves the sequence.
+ * The display power domains across a T6040 S2R. Their two blocks come from the
+ * apple,display-power node (reg-names "ps" and "pmc-dcp") that the boot object
+ * publishes. Without it dcp_t6041_display_power() returns -ENODEV and the
+ * domains are left as they are: the sleep controller then finds the pipe on at
+ * its commit and refuses the sleep.
  *
- * The internal panel's (402e00000.dcp) display power-state registers, in the
- * SOC-East "ps" window aura publishes (apple,display-power, base 0x502280000):
- * DISP_SYS +0x258, DISP_FE +0x368, DISP_CPU +0x10000 (= pmgr_disp 0x502290000,
- * ps_disp_cpu@0). Confirmed against this tree's t6040-pmgr.dtsi power-controller
- * nodes: ps_disp_sys@258, ps_disp_fe@368, &pmgr_disp/ps_disp_cpu@0, versus
- * ps_dispext0_{sys@340,fe@348,cpu@350} (the old DISPEXT0 placeholders).
- * TODO(ADT): the conditional-retention disable/enable values are still from the
- * ADT, not handled here (refusal-safe without them for a first panel test).
+ * The internal panel's processor (dcp@402e00000) has its power words in the
+ * SoC's east block: DISP_SYS +0x258, DISP_FE +0x368, DISP_CPU +0x10000, as the
+ * power-controller nodes ps_disp_sys@258, ps_disp_fe@368 and ps_disp_cpu@0 of
+ * t6040-pmgr.dtsi name them. The platform also turns the domains' conditional
+ * retention off before the sleep and on after it; that is not done here, and
+ * the J616s sleeps and wakes without it.
  */
 #define DCP_T6041_PS_SYS	0x258
 #define DCP_T6041_PS_FE		0x368
@@ -9062,11 +9056,10 @@ bool dcp_s2r_firmware_stopped(struct platform_device *pdev)
  * The two external DCPs share the DISPEXT power-state words in the west SOC-PS
  * block (the "ps" window aura publishes, base 0x502800000), each at its own
  * offsets: DISPEXT0 (HDMI, coproc dcp@3a2e00000) SYS/FE/CPU +0x340/0x348/0x350,
- * DISPEXT1 (USB-C DP, coproc dcp@602e00000) +0x490/0x498/0x4a0. From the
- * ADT's /arm-io/pmgr power-state devices (group 0) and this tree's
- * t6040-pmgr.dtsi ps_dispext{0,1}_* nodes, cross-checked by the sleep
- * controller's apple,check-ps-b4-sleep. The coproc base is the authoritative
- * per-DISPEXT discriminator (reg[0] = reg-name "coproc").
+ * DISPEXT1 (USB-C DP, coproc dcp@602e00000) +0x490/0x498/0x4a0, as the
+ * ps_dispext{0,1}_* nodes of t6040-pmgr.dtsi and the sleep controller's
+ * apple,check-ps-b4-sleep name them. The coprocessor's base (reg-name "coproc")
+ * tells the two apart.
  */
 #define DCP_T6041_DISPEXT0_COPROC	0x3a2e00000ULL	/* dcp@3a2e00000, HDMI */
 #define DCP_T6041_DISPEXT1_COPROC	0x602e00000ULL	/* dcp@602e00000, USB-C DP */
@@ -9162,7 +9155,6 @@ static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 	if (ret)
 		return ret;
 
-	/* TODO(ADT): conditional-retention enable + axi2af bridge bit0 set first. */
 	val = readl(ps + o.sys) & ~(GENMASK(9, 8) | GENMASK(3, 0) | BIT(28));
 	writel(val | 0xf, ps + o.sys);
 	if (readl_poll_timeout_atomic(ps + o.sys, val, (val & GENMASK(7, 4)) == GENMASK(7, 4),
