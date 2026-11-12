@@ -985,6 +985,11 @@ static struct spmi_driver sn201202x_driver = {
 		.name = "sn201202x",
 		.pm = &sn201202x_pm_ops,
 		.of_match_table = sn201202x_of_match,
+		/*
+		 * Renegotiating an inherited connection waits several seconds per
+		 * port; let the ports of one machine probe at the same time.
+		 */
+		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
 	},
 	.probe = sn201202x_probe,
 	.remove = sn201202x_remove,
