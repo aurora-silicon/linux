@@ -2372,7 +2372,10 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	if (rep->offsets == &apple_pmp_offsets_t600x)
 		apple_pmp_agx_activity_resume();
 
-	if (rep->offsets->fast_die || apple_pmp_report_has_gpu_effort(rep) || rep->start)
+	if (rep->offsets->fast_die ||
+	    of_device_is_compatible(np, "apple,t8112-pmp-v2-report") ||
+	    of_device_is_compatible(np, "apple,t8140-pmp-v2-report") ||
+	    rep->start)
 		rep->debugfs = debugfs_create_file(dev_name(dev), 0400,
 						   apple_pmp_report_debugfs, rep,
 						   &apple_pmp_report_status_fops);
