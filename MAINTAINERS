@@ -2777,6 +2777,7 @@ F:	drivers/hwmon/macsmc-hwmon*.c
 F:	drivers/pmdomain/apple/
 F:	drivers/pmdomain/apple/.kunitconfig.apple-pmp
 F:	drivers/pmdomain/apple/.kunitconfig.pmgr-pwrstate
+F:	drivers/i2c/busses/i2c-dp855*
 F:	drivers/i2c/busses/i2c-pasemi-core.c
 F:	drivers/i2c/busses/i2c-pasemi-platform.c
 F:	drivers/input/misc/macsmc-input.c
@@ -2802,6 +2803,8 @@ F:	tools/asahi/apple-pwm-pm-tests.py
 F:	drivers/reset/reset-apple-cio.c
 F:	drivers/rtc/rtc-macsmc.c
 F:	drivers/soc/apple/*
+F:	tools/asahi/isp-preview-flow-tests.py
+F:	tools/asahi/isp-preview-tests.py
 F:	tools/asahi/m3-uapi-*
 F:	drivers/soc/apple/clpc.kunitconfig
 F:	tools/asahi/pmp-bootargs-tests.rs

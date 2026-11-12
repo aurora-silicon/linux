@@ -299,7 +299,7 @@
  *   ATC0 usb-drd0 left-back  hpm0 nub-spmi-a0 0x0c (the debug port, not described)
  *   ATC1 usb-drd1 left-front hpm1 nub-spmi-a0 0x0a
  *   ATC2 usb-drd2 right      hpm2 nub-spmi-a1 0x0c
- *   hpm5 nub-spmi-a0 0x08 (MagSafe, not a USB-C connector)
+ *   hpm5 nub-spmi-a0 0x08 (MagSafe 3, power in only: no connector node)
  * There is no usb-drd3 and no nub-spmi-a2, so ATC3's USB chain and that bus stay
  * off. Both described ports are wired as on J716s.
  */
@@ -358,6 +358,18 @@
 				};
 			};
 		};
+	};
+
+	/*
+	 * The MagSafe 3 port's PD controller (ADT hpm5, port-type 0x11). It has no USB data
+	 * path, so it gets no connector node; tipd registers a Type-C port and a power supply
+	 * for it, as on J616s. Its ADT features-supported is <3>, "Power In" only: no liquid
+	 * detection (LDCM, feature 2 of the USB-C ports' <1 2 3>).
+	 */
+	hpm5: usb-pd@8 {
+		compatible = "apple,sn201202x";
+		reg = <0x8 SPMI_USID>;
+		apple,no-liquid-detection;
 	};
 };
 
@@ -509,6 +521,48 @@
 		/* Per-device factory data from this Mac's own iBoot system container */
 		firmware-name = "apple/mesacal-j714s.bin", "apple/msrk-j714s.bin";
 	};
+};
+
+/*
+ * The ProRes engine (apr0) and its DART, in the SCODEC power state. Its
+ * parent fab7-soc also feeds the display pipeline, so it is left to the
+ * firmware, as fab0-piogw is.
+ */
+&ps_fab7_soc {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_scodec {
+	status = "okay";
+};
+
+&apr0_dart {
+	status = "okay";
+};
+
+&apr0 {
+	status = "okay";
+};
+
+/*
+ * Both JPEG engines and their shared DART, under the media fabric that the
+ * video encoder above already enables.
+ */
+&ps_jpg {
+	status = "okay";
+};
+
+&jpeg0_dart {
+	status = "okay";
+};
+
+&jpeg0 {
+	status = "okay";
+};
+
+&jpeg1 {
+	status = "okay";
 };
 
 #include "t6050-j714s-pmp-tunables.dtsi"

@@ -352,7 +352,7 @@ static void complete_all(struct completion *c)
 }
 #define complete complete_all
 #define INIT_WORK(w, f) ((w)->func = (f), (w)->pending = false)
-#define system_unbound_wq NULL
+#define system_dfl_wq NULL
 /* Deferred requests are not part of the T6030 graph: never queued here. */
 #define INIT_DELAYED_WORK(w, f) INIT_WORK(&(w)->work, f)
 #define system_freezable_power_efficient_wq NULL

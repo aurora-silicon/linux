@@ -4,6 +4,7 @@
  */
 
 #include <kunit/device.h>
+#include <kunit/static_stub.h>
 #include <kunit/test.h>
 #include <linux/ctype.h>
 #include <linux/device.h>
@@ -111,6 +112,18 @@ struct cd321x_mux_test {
 	unsigned int now_ms;
 	/* The time the driver's latest series of retries of a held mux began */
 	unsigned int series_ms;
+	/*
+	 * Run the work of the port in the thread of the test, where the static
+	 * stubs that count the driver's reports apply, see
+	 * cd321x_mux_test_count_reports(). @missed counts the runs that a
+	 * worker took first.
+	 */
+	bool here;
+	unsigned int missed;
+	/* Failures reported quietly and as warnings, and series given up */
+	unsigned int quiet;
+	unsigned int warned;
+	unsigned int gave_up;
 };
 
 static int cd321x_mux_test_read(void *context, const void *reg, size_t reg_size,
@@ -398,7 +411,14 @@ static void cd321x_mux_test_run(struct cd321x_mux_test *t, struct delayed_work *
 			pm->mux_since_ms = jiffies_to_msecs(jiffies) -
 					   (t->now_ms - t->series_ms);
 	}
-	flush_delayed_work(dwork);
+	if (!t->here) {
+		flush_delayed_work(dwork);
+	} else if (cancel_delayed_work(dwork)) {
+		dwork->work.func(&dwork->work);
+	} else {
+		t->missed++;
+		flush_delayed_work(dwork);
+	}
 	scoped_guard(mutex, &t->cd.tps.lock) {
 		if (!retrying && pm->mux_retry_ms)
 			t->series_ms = t->now_ms;
@@ -908,6 +928,94 @@ static void cd321x_mux_held_then_other_error_test(struct kunit *test)
 	cd321x_mux_test_expect_usb(test, t);
 }
 
+static void cd321x_mux_test_failed(struct cd321x *cd, const char *what, int ret, bool held)
+{
+	struct cd321x_mux_test *t = container_of(cd, struct cd321x_mux_test, cd);
+
+	if (held)
+		t->quiet++;
+	else
+		t->warned++;
+}
+
+static void cd321x_mux_test_gave_up(struct cd321x *cd, unsigned int retries,
+				    unsigned int held_ms)
+{
+	container_of(cd, struct cd321x_mux_test, cd)->gave_up++;
+}
+
+/* Count the failures the driver reports, and at which level */
+static void cd321x_mux_test_count_reports(struct kunit *test, struct cd321x_mux_test *t)
+{
+	t->here = true;
+	kunit_activate_static_stub(test, cd321x_mux_failed, cd321x_mux_test_failed);
+	kunit_activate_static_stub(test, cd321x_mux_gave_up, cd321x_mux_test_gave_up);
+}
+
+/*
+ * A dock on the rear port of a J700 whose USB2 hub enumerates while the PHY
+ * moves the PIPE: the PHY cannot get the PIPE lock for a few retries, then the
+ * change goes through. That hold-up is no fault, and nothing warns of it.
+ */
+static void cd321x_mux_held_recovers_quietly_test(struct kunit *test)
+{
+	struct cd321x_mux_test *t = cd321x_mux_test_j700_port(test);
+
+	cd321x_mux_test_count_reports(test, t);
+	t->phy.held = true;
+	cd321x_mux_test_attach(t);
+	while (t->phy.refused < 3)
+		KUNIT_ASSERT_TRUE(test, cd321x_mux_test_next(t));
+
+	t->phy.held = false;
+	memset(t->phy.log, 0, sizeof(t->phy.log));
+	cd321x_mux_test_settle(test, t);
+	KUNIT_EXPECT_STREQ(test, t->phy.log, "su");
+	cd321x_mux_test_expect_usb(test, t);
+	KUNIT_EXPECT_EQ(test, t->missed, 0U);
+	KUNIT_EXPECT_EQ(test, t->quiet, t->phy.refused);
+	KUNIT_EXPECT_EQ(test, t->warned, 0U);
+	KUNIT_EXPECT_EQ(test, t->gave_up, 0U);
+}
+
+/* A hold-up that outlasts the retries is a fault, and warned of once. */
+static void cd321x_mux_held_gives_up_warns_once_test(struct kunit *test)
+{
+	struct cd321x_mux_test *t = cd321x_mux_test_j700_port(test);
+
+	cd321x_mux_test_count_reports(test, t);
+	t->phy.held = true;
+	cd321x_mux_test_attach(t);
+	while (t->now_ms < 2 * CD321X_MUX_HELD_MS && cd321x_mux_test_next(t))
+		;
+	KUNIT_EXPECT_EQ(test, cd321x_mux_test_phase(t), CD321X_PM_STALE);
+	KUNIT_EXPECT_EQ(test, t->missed, 0U);
+	KUNIT_EXPECT_GT(test, t->phy.refused, 1U);
+	KUNIT_EXPECT_EQ(test, t->quiet, t->phy.refused);
+	KUNIT_EXPECT_EQ(test, t->warned, 0U);
+	KUNIT_EXPECT_EQ(test, t->gave_up, 1U);
+}
+
+/*
+ * A timeout of a PHY that does not declare its timeouts transient, as on M1
+ * and M2, is not retried as a hold-up: each failure is warned of, once.
+ */
+static void cd321x_mux_unretried_timeout_warns_test(struct kunit *test)
+{
+	struct cd321x_mux_test *t = cd321x_mux_test_port(test, false);
+
+	cd321x_mux_test_count_reports(test, t);
+	t->phy.held = true;
+	cd321x_mux_test_attach(t);
+	cd321x_mux_test_settle(test, t);
+	KUNIT_EXPECT_EQ(test, cd321x_mux_test_phase(t), CD321X_PM_STALE);
+	KUNIT_EXPECT_EQ(test, t->missed, 0U);
+	KUNIT_EXPECT_GT(test, t->phy.refused, 0U);
+	KUNIT_EXPECT_EQ(test, t->warned, t->phy.refused);
+	KUNIT_EXPECT_EQ(test, t->quiet, 0U);
+	KUNIT_EXPECT_EQ(test, t->gave_up, 0U);
+}
+
 /* A dock already attached when probe's first SAFE request times out. */
 static struct cd321x_mux_test *cd321x_mux_test_boot(struct kunit *test, bool transient)
 {
@@ -1008,6 +1116,9 @@ static struct kunit_case cd321x_mux_cases[] = {
 	KUNIT_CASE(cd321x_mux_held_dense_events_test),
 	KUNIT_CASE(cd321x_mux_held_release_after_events_test),
 	KUNIT_CASE(cd321x_mux_held_then_other_error_test),
+	KUNIT_CASE(cd321x_mux_held_recovers_quietly_test),
+	KUNIT_CASE(cd321x_mux_held_gives_up_warns_once_test),
+	KUNIT_CASE(cd321x_mux_unretried_timeout_warns_test),
 	{}
 };
 

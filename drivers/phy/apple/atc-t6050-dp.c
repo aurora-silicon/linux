@@ -227,7 +227,7 @@ static int atc_firmware(struct t6050_dp *dp, bool start)
 		if (!ret)
 			ret = apple_rtkit_start_ep(dp->rtkit, 0x20);
 	} else {
-		/* CIO80PhyMBI::sendPowerDown, then the RTBuddy power transition. */
+		/* The PHY mailbox Power Down message, then the RTKit power transition. */
 		ret = apple_rtkit_send_message(dp->rtkit, 0x20, BIT_ULL(56), NULL, false);
 		if (!ret)
 			ret = apple_rtkit_shutdown(dp->rtkit);

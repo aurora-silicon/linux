@@ -618,7 +618,7 @@
 		reg = <0x4 0xb200000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1187 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_avd_sys>;
+		power-domains = <&ps_msr0>;
 		#iommu-cells = <1>;
 		status = "disabled";
 	};

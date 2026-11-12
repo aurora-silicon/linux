@@ -391,6 +391,9 @@ static const struct sn201202x_ldcm_ops sn201202x_ldcm_ops = {
 
 static int sn201202x_ldcm_update(struct tps6598x *tps)
 {
+	if (!tps->contaminant_ops)
+		return 0;
+
 	return sn201202x_ldcm_update_state(tps, &sn201202x_ldcm_ops,
 					   tps->contaminant);
 }
@@ -749,7 +752,9 @@ static int sn201202x_probe(struct spmi_device *device)
 	mutex_init(&tps->lock);
 	tps->dev = &device->dev;
 	tps->data = data;
-	tps->contaminant_ops = &sn201202x_contaminant_ops;
+	/* A port without liquid detection (MagSafe 3) gets no LDCM commands */
+	if (!of_property_read_bool(device->dev.of_node, "apple,no-liquid-detection"))
+		tps->contaminant_ops = &sn201202x_contaminant_ops;
 	INIT_DELAYED_WORK(&sn->ldcm_work, sn201202x_ldcm_work);
 
 	init_completion(&sn->select_completion);

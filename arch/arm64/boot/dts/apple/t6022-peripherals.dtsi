@@ -1158,7 +1158,7 @@
 		reg = <0x4 0xb200000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1187 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_avd_sys>;
+		power-domains = <&ps_msr0>;
 		#iommu-cells = <1>;
 		status = "disabled";
 	};
@@ -1237,6 +1237,7 @@
 		reg = <0x4 0x8d304000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1022 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext2_cpu0>;
 		#iommu-cells = <1>;
 		status = "disabled";
 	};
@@ -1246,6 +1247,7 @@
 		reg = <0x4 0x8d30c000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1022 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext2_cpu0>;
 		#iommu-cells = <1>;
 		status = "disabled";
 	};
@@ -1393,6 +1395,7 @@
 		reg = <0x5 0xd304000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1058 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext3_cpu0>;
 		#iommu-cells = <1>;
 		status = "disabled";
 	};
@@ -1402,6 +1405,7 @@
 		reg = <0x5 0xd30c000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1058 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext3_cpu0>;
 		#iommu-cells = <1>;
 		status = "disabled";
 	};
@@ -1977,7 +1981,7 @@
 		reg = <0x4 0xb200000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1187 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_spi3>;
+		power-domains = <&ps_msr0_die1>;
 		#iommu-cells = <1>;
 		status = "disabled";
 	};
@@ -2056,6 +2060,7 @@
 		reg = <0x4 0x8d304000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1022 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext2_cpu0_die1>;
 		#iommu-cells = <1>;
 		status = "disabled";
 	};
@@ -2065,6 +2070,7 @@
 		reg = <0x4 0x8d30c000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1022 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext2_cpu0_die1>;
 		#iommu-cells = <1>;
 		status = "disabled";
 	};
@@ -2212,6 +2218,7 @@
 		reg = <0x5 0xd304000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1058 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext3_cpu0_die1>;
 		#iommu-cells = <1>;
 		status = "disabled";
 	};
@@ -2221,6 +2228,7 @@
 		reg = <0x5 0xd30c000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1058 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext3_cpu0_die1>;
 		#iommu-cells = <1>;
 		status = "disabled";
 	};

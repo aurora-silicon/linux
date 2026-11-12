@@ -794,7 +794,8 @@ static int apple_smc_wake_reason_names(u64 record, char *buf, size_t size)
 	return len;
 }
 
-static void apple_smc_notice_on(struct apple_smc *smc)
+/* Returns whether MBSW was read. */
+static bool apple_smc_notice_on(struct apple_smc *smc)
 {
 	u8 record[8] = {};
 	char names[128];
@@ -817,6 +818,8 @@ static void apple_smc_notice_on(struct apple_smc *smc)
 	apple_smc_wake_reason_names(smc->wake_record, names, sizeof(names));
 	dev_info(smc->dev, "wake record: MBSE %#x, MBSW %8ph%s%s\n", event, record,
 		 names[0] ? ": " : "", names);
+
+	return ret >= 0;
 }
 
 /* MBSW's bit for a wake reason, by its name, or -1. */
@@ -832,23 +835,26 @@ static int apple_smc_wake_reason_bit(const char *name)
 }
 
 /*
- * Woken for the lid alone, which the SMC reports for the lid opening and for it closing:
- * tell the sleep driver if it's closed now.
+ * Tell the sleep driver where the lid is now, for the display. Woken for the lid alone,
+ * which the SMC reports for the lid opening and for it closing: also if it's closed now.
  */
 static void apple_smc_lid_wake(struct apple_smc *smc)
 {
 	int bit = apple_smc_wake_reason_bit("lid");
+	bool lid_alone = bit >= 0 && smc->wake_record == BIT_ULL(bit);
 	u8 lid = 0;
 	int ret;
 
-	if (bit < 0 || smc->wake_record != BIT_ULL(bit))
-		return;
-
+	/* No MSLD on a machine without a lid: the display then isn't told either way. */
 	ret = apple_smc_read_u8(smc, SMC_KEY(MSLD), &lid);
 	if (ret < 0) {
-		dev_warn(smc->dev, "Failed to read the lid after a wake: %d\n", ret);
+		if (lid_alone)
+			dev_warn(smc->dev, "Failed to read the lid after a wake: %d\n", ret);
 		return;
 	}
+	apple_sleep_lid_at_wake(lid);
+	if (!lid_alone)
+		return;
 	dev_info(smc->dev, "woken for the lid, which is %s\n", lid ? "closed" : "open");
 	if (lid)
 		apple_sleep_lid_closed_wake();
@@ -872,7 +878,10 @@ static bool apple_smc_port_reasons_only(u64 record)
 
 static void apple_smc_sleep_wake(struct apple_smc *smc)
 {
-	apple_smc_notice_on(smc);
+	/* Zero when nothing the SMC watches woke the AP: the PMU's RTC, for one. */
+	if (apple_smc_notice_on(smc))
+		apple_sleep_radio_at_wake(smc->wake_record &
+					  BIT_ULL(apple_smc_wake_reason_bit("wifibt")));
 	apple_smc_write_mbse(smc, SMC_KEY(waka));
 	smc->sleep_warned = false;
 	apple_smc_lid_wake(smc);
