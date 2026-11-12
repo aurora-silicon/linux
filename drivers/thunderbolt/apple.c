@@ -154,6 +154,11 @@ struct apple_cio_hw {
 	bool skip_run;
 	/* Hand LSTX to the router after RTKit boot, not before it. */
 	bool lstx_after_boot;
+	/*
+	 * A stopped router left LSTX high unless it drives the pin low: one
+	 * its firmware released counts as high as well.
+	 */
+	bool lstx_released_high;
 	bool strict_fw_ready;
 	/* Keep the links of the host router out of CL states. */
 	bool no_host_clx;
@@ -266,6 +271,7 @@ static const struct apple_cio_hw apple_cio_t6040_hw = {
 	.lstx_explicit = true,
 	.skip_run = true,
 	.lstx_after_boot = true,
+	.lstx_released_high = true,
 	.strict_fw_ready = true,
 	.no_host_clx = true,
 	.cio_phy = true,
@@ -3173,17 +3179,17 @@ static void apple_cio_stop(struct apple_cio *acio)
 	acio->rtk = NULL;
 	apple_cio_cpu_halt(acio);
 
-	/*
-	 * High only if the router left it high with the cable still in. Type 7
-	 * follows the platform (its disable of the embedded CPU): anything but
-	 * "driven low" (2) counts as high, including a pin the firmware released.
-	 */
-	if (acio->hw->lstx_after_boot) {
+	if (acio->hw->lstx_released_high) {
 		u32 lstx = readl(acio->rc_base + APPLE_CIO_M3_CTRL);
-		bool high = acio->type7 ? lstx != APPLE_CIO_LSTX_CTRL_ENABLE :
-				      lstx & APPLE_CIO_LSTX_CTRL_LEVEL;
 
-		apple_cio_lstx_hold(acio, acio->target_cable_info && high);
+		/* High unless the router drives it low, with the cable still in */
+		apple_cio_lstx_hold(acio, acio->target_cable_info &&
+				    lstx != APPLE_CIO_LSTX_CTRL_ENABLE);
+	} else if (acio->hw->lstx_after_boot) {
+		/* High only if the router left it driven high with the cable still in */
+		apple_cio_lstx_hold(acio, acio->target_cable_info &&
+				    (readl(acio->rc_base + APPLE_CIO_M3_CTRL) &
+				     APPLE_CIO_LSTX_CTRL_LEVEL));
 	}
 
 	/* Finally, remove the links to the PD domains to power everything off */
