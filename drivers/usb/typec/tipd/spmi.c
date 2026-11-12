@@ -6,6 +6,7 @@
 #include <linux/iopoll.h>
 #include <linux/of_device.h>
 #include <linux/of_irq.h>
+#include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
@@ -716,6 +717,60 @@ static bool sn201202x_sleep_event(struct tps6598x *tps)
 	return true;
 }
 
+/*
+ * A port restored from disk is revalidated once its USB role switch is there.
+ * The USB controller that provides it does not come through a resume from disk
+ * bound, and its new probe registers a new switch: the one looked up before
+ * the image was made is unregistered and only refuses requests. Take the new
+ * one and let the port read its cable afresh, without taking the port, or a
+ * display on it, down.
+ *
+ * Return: 0 once the port revalidates, or why the switch could not be taken.
+ */
+static int sn201202x_roles_finish(struct sn201202x *sn)
+{
+	struct tps6598x *tps = &sn->cd.tps;
+	int ret;
+
+	ret = tipd_refresh_role_switch(tps);
+	if (ret)
+		return ret;
+	scoped_guard(mutex, &tps->lock) {
+		if (!sn->roles_pending)
+			return 0;
+		WRITE_ONCE(sn->roles_pending, false);
+		/* Refresh the detector snapshot before cable revalidation is thawed. */
+		sn201202x_ldcm_refresh(tps);
+	}
+	tipd_complete(tps->dev);
+	dev_info(tps->dev, "resume from disk: USB role switch looked up again, port revalidates\n");
+	return 0;
+}
+
+static void sn201202x_role_work(struct work_struct *work)
+{
+	struct sn201202x *sn = container_of(work, struct sn201202x, role_work);
+
+	if (READ_ONCE(sn->roles_pending))
+		sn201202x_roles_finish(sn);
+}
+
+/*
+ * A USB controller has bound, and its probe registers its role switch: a port
+ * that waits for one after a resume from disk looks again.
+ */
+static int sn201202x_role_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct sn201202x *sn = container_of(nb, struct sn201202x, role_nb);
+
+	if (action != BUS_NOTIFY_BOUND_DRIVER || !READ_ONCE(sn->roles_pending) ||
+	    !device_property_present(data, "usb-role-switch"))
+		return NOTIFY_DONE;
+
+	queue_work(system_freezable_wq, &sn->role_work);
+	return NOTIFY_OK;
+}
+
 static int sn201202x_probe(struct spmi_device *device)
 {
 	const struct of_device_id *match;
@@ -761,6 +816,7 @@ static int sn201202x_probe(struct spmi_device *device)
 	if (!of_property_read_bool(device->dev.of_node, "apple,no-liquid-detection"))
 		tps->contaminant_ops = &sn201202x_contaminant_ops;
 	INIT_DELAYED_WORK(&sn->ldcm_work, sn201202x_ldcm_work);
+	INIT_WORK(&sn->role_work, sn201202x_role_work);
 
 	init_completion(&sn->select_completion);
 	init_completion(&sn->sleep_completion);
@@ -833,6 +889,12 @@ static int sn201202x_probe(struct spmi_device *device)
 	tps->data->irq_handler(tps->irq, tps);
 
 	sn201202x_idle_sleep_start(tps);
+
+	sn->role_nb.notifier_call = sn201202x_role_notify;
+	ret = bus_register_notifier(&platform_bus_type, &sn->role_nb);
+	if (ret)
+		dev_warn(&device->dev, "cannot watch for the USB role switch: %d\n", ret);
+	sn->role_watch = !ret;
 	return 0;
 }
 
@@ -841,6 +903,9 @@ static void sn201202x_remove(struct spmi_device *device)
 	struct tps6598x *tps = spmi_device_get_drvdata(device);
 	struct sn201202x *sn = tps_to_sn(tps);
 
+	if (sn->role_watch)
+		bus_unregister_notifier(&platform_bus_type, &sn->role_nb);
+	disable_work_sync(&sn->role_work);
 	/* The hold freeze took on one the restore left alone */
 	if (sn->cold_restored)
 		pm_runtime_put_noidle(tps->dev);
@@ -1021,7 +1086,10 @@ static int __maybe_unused sn201202x_restore(struct device *dev)
 		enable_irq(tps->irq);
 	/* Give back the hold freeze took, as resume does */
 	pm_runtime_put_autosuspend(dev);
-	sn->roles_pending = true;
+	scoped_guard(mutex, &tps->lock) {
+		WRITE_ONCE(sn->roles_pending, true);
+		sn->hib_in_place = true;
+	}
 	dev_info(dev, "resume from disk: controller restored, port revalidation waits for the USB role switch\n");
 	return 0;
 }
@@ -1038,7 +1106,10 @@ static int sn201202x_prepare(struct device *dev)
 	struct sn201202x *sn = tps_to_sn(tps);
 	int ret;
 
-	sn->roles_pending = false;
+	scoped_guard(mutex, &tps->lock) {
+		WRITE_ONCE(sn->roles_pending, false);
+		sn->hib_in_place = false;
+	}
 	if (sn->cold_restored)
 		return tipd_prepare(dev);
 
@@ -1069,28 +1140,34 @@ static void sn201202x_complete(struct device *dev)
 	/* A controller the restore from disk left alone is probed again instead. */
 	if (sn->cold_restored)
 		return;
+	/*
+	 * A port restored from disk waits for its USB role switch: now, if the
+	 * USB controller is bound, or when sn201202x_role_notify() sees it bind.
+	 */
+	if (READ_ONCE(sn->roles_pending)) {
+		sn201202x_roles_finish(sn);
+		return;
+	}
 	/* Refresh the detector snapshot before cable revalidation is thawed. */
 	scoped_guard(mutex, &tps->lock)
 		sn201202x_ldcm_refresh(tps);
-	/* A port whose USB role switch is not back yet: hib_resume below starts it. */
-	if (!sn->roles_pending)
-		tipd_complete(dev);
+	tipd_complete(dev);
 }
 
 /*
- * hib_resume: the state a resume from disk left the controller in: "none",
- * "roles-pending" (restored, waiting for the USB controller to be bound
- * again) or "failed" (to be probed again). Writing "roles" once the USB
- * controller is bound looks its role switch up again and revalidates the
- * port, without taking the port (and a display on it) down.
+ * hib_resume: how the last resume from disk left the controller: "none",
+ * "roles-pending" (restored in place) or "failed" (to be probed again). The
+ * kernel revalidates a port restored in place by itself; writing "roles" only
+ * takes note of it, after which the attribute reads "none".
  */
 static ssize_t hib_resume_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct tps6598x *tps = dev_get_drvdata(dev);
 	struct sn201202x *sn = tps_to_sn(tps);
 
+	guard(mutex)(&tps->lock);
 	return sysfs_emit(buf, "%s\n", sn->cold_restored ? "failed" :
-			  sn->roles_pending ? "roles-pending" : "none");
+			  sn->hib_in_place ? "roles-pending" : "none");
 }
 
 static ssize_t hib_resume_store(struct device *dev, struct device_attribute *attr,
@@ -1098,20 +1175,16 @@ static ssize_t hib_resume_store(struct device *dev, struct device_attribute *att
 {
 	struct tps6598x *tps = dev_get_drvdata(dev);
 	struct sn201202x *sn = tps_to_sn(tps);
-	int ret;
 
 	if (!sysfs_streq(buf, "roles"))
 		return -EINVAL;
-	if (!sn->roles_pending)
-		return -EALREADY;
-	ret = tipd_refresh_role_switch(tps);
-	if (ret)
-		return ret == -EPROBE_DEFER ? -EAGAIN : ret;
-	sn->roles_pending = false;
-	scoped_guard(mutex, &tps->lock)
-		sn201202x_ldcm_refresh(tps);
-	tipd_complete(dev);
-	dev_info(dev, "resume from disk: USB role switch looked up again, port revalidates\n");
+	scoped_guard(mutex, &tps->lock) {
+		if (!sn->hib_in_place)
+			return -EALREADY;
+		sn->hib_in_place = false;
+	}
+	/* A port that still waits looks again, as this write used to make it. */
+	queue_work(system_freezable_wq, &sn->role_work);
 	return count;
 }
 static DEVICE_ATTR_RW(hib_resume);

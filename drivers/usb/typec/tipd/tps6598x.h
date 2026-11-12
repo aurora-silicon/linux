@@ -512,6 +512,12 @@ struct sn201202x {
 	bool cold_restored;
 	/* Restored from disk: revalidation waits for the new USB role switch. */
 	bool roles_pending;
+	/* Restored from disk in place, as hib_resume reports it (tps.lock) */
+	bool hib_in_place;
+	/* Looks the role switch up again when a USB controller binds */
+	struct notifier_block role_nb;
+	struct work_struct role_work;
+	bool role_watch;
 	/* Restored from disk: the controller is driven polled until a new probe. */
 	bool cold_polled;
 };
