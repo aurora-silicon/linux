@@ -95,6 +95,8 @@ struct apple_t8140_bootstrap {
 	/* The host stops the radios for a sleep that takes this engine's power. */
 	bool sleep_armed;
 	bool power_lost;
+	/* The engine has answered once since boot; later bootstraps follow a lost power. */
+	bool answered;
 	/* After a real sleep: read the engine once the host's port is up again. */
 	bool power_check;
 	bool irq_held;
@@ -512,7 +514,7 @@ static int apple_t8140_bootstrap_submit(struct apple_t8140_bootstrap *bootstrap,
 	u64 comp = descriptor + PIODMA_COMPLETION_OFFSET;
 	unsigned long waited;
 	u32 fifo, command, tag = index + 1;
-	int i, ret;
+	int i, checks, ret;
 
 	ret = apple_t8140_bootstrap_check_slots(bootstrap);
 	if (ret || READ_ONCE(bootstrap->irq_fault))
@@ -567,12 +569,18 @@ static int apple_t8140_bootstrap_submit(struct apple_t8140_bootstrap *bootstrap,
 				 (fifo & PIODMA_FIFO_MASK) == 16, 10, 50000);
 	if (ret)
 		return ret;
-	for (i = 0; i < 10; i++) {
+	/*
+	 * The slots must hold still after the response. After a sleep, the same engine has
+	 * answered the same request before, and the slots are read again before every sleep.
+	 */
+	checks = bootstrap->answered ? 2 : 10;
+	for (i = 0; i < checks; i++) {
 		usleep_range(1000, 2000);
 		ret = apple_t8140_bootstrap_check_slots(bootstrap);
 		if (ret || READ_ONCE(bootstrap->irq_fault))
 			return ret ?: -EIO;
 	}
+	bootstrap->answered = true;
 	dev_dbg(bootstrap->dev,
 		"READ_VALIDATED request=%u word=%#x FIFO=%#x command=%#x; retained slots stable\n",
 		index, slot->result, fifo, command);
