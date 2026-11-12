@@ -1000,8 +1000,6 @@ impl Firmware {
         Ok(())
     }
 
-    /// Whether every coprocessor of this GPU was found halted (see [`Coprocessor::halted`]);
-    /// logs the CPU words. A mix of halted and running instances is `EIO`.
     /// Whether the firmware must be re-booted after a hibernation transition: a coprocessor
     /// was found halted, or the no-map handoff/TTBAT no longer hold the host's words (a second
     /// witness that cannot survive a cold boot; see `mmu::Uat::reserved_state_mismatches`).
@@ -1022,6 +1020,8 @@ impl Firmware {
         Ok(halted.unwrap_or(true) || mismatches != 0)
     }
 
+    /// Whether every coprocessor of this GPU was found halted (see [`Coprocessor::halted`]);
+    /// logs the CPU words. A mix of halted and running instances is `EIO`.
     fn coprocessors_halted(&self, dev: &AsahiDrmDevice) -> Result<bool> {
         let mut halted = None;
         for coprocessor in Iterator::chain(core::iter::once(&self.primary), self.secondary.as_ref()) {
