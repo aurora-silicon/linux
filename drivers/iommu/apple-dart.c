@@ -6802,8 +6802,8 @@ static int apple_dart_reimport_locked(struct apple_dart *dart)
 		}
 		done++;
 	}
-	dev_info(dart->dev, "hibernation restore: %d locked streams re-imported from the boot loader's roots (%d)\n",
-		 done, ret);
+	dev_dbg(dart->dev, "hibernation restore: %d locked streams re-imported from the boot loader's roots, first error %d\n",
+		done, ret);
 	return ret;
 }
 
