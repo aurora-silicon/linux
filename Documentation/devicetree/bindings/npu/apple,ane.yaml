@@ -493,6 +493,7 @@ allOf:
               - apple,t6041-ane
               - apple,t6050-ane
               - apple,t6001-ane
+    then: {}
     else:
       properties:
         power-domains:
@@ -519,6 +520,7 @@ allOf:
             enum:
               - apple,t6001-ane
               - apple,t6050-ane
+    then: {}
     else:
       properties:
         clocks: false
