@@ -494,6 +494,24 @@ Description:
 		(it is an hwrng, named apple-sep) or "failed" (the survey
 		gave up; the kernel log says why).
 
+What:		/sys/bus/platform/devices/<unit>.sep/diag/stac
+What:		/sys/bus/platform/devices/<unit>.sep/diag/stac_onlines
+Date:		November 2026
+KernelVersion:	7.3
+Contact:	Ryan Murray <ryan@aurorasilicon.org>
+Description:
+		(RO) The enclave's trusted-accessory service (endpoint
+		stac). The driver tells it the system is online once the
+		bring-up ends and again after each wake of the enclave from
+		a sleep it was told of, as macOS does; it sends the service
+		nothing else. stac reads "pending" until the first report,
+		then "online" (the service took it), "absent" (the enclave
+		does not offer the endpoint with the buffer layout the
+		driver knows, so it is left alone) or "failed" (the last
+		report was refused, malformed, unanswered or not sent; the
+		kernel log says which). stac_onlines counts the accepted
+		reports since probe, as an unsigned decimal.
+
 What:		/sys/bus/platform/devices/<unit>.sep/diag/xarm_failures
 Date:		November 2026
 KernelVersion:	7.3
