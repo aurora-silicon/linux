@@ -56,6 +56,8 @@ struct apple_gpio_pinctrl {
 	unsigned long *saved_valid;
 	/* The regmap caches the block: it holds what this driver set, not the hardware. */
 	bool cached;
+	/* A pin is written back in steps: see apple_gpio_safe_reconfigure(). */
+	bool staged;
 	/* Pins this driver has written. Others belong to someone else. */
 	unsigned long *touched;
 	/*
@@ -420,11 +422,21 @@ struct apple_gpio_hw {
 	 * only within the valid GPIO registers minus gpio-reserved-ranges.
 	 */
 	bool no_regcache;
+	/*
+	 * A pin written back after a sleep or a resume from disk takes its word in
+	 * steps (apple_gpio_safe_reconfigure()). Elsewhere the word goes back whole.
+	 */
+	bool staged_restore;
 };
 
 /* T8140 (A18 Pro) and T8132 (M4) both have faulting slots in this block. */
 static const struct apple_gpio_hw apple_gpio_uncached_hw = {
 	.no_regcache = true,
+};
+
+/* T6040 and T6041 (M4 Pro and Max) */
+static const struct apple_gpio_hw apple_gpio_t6041_hw = {
+	.staged_restore = true,
 };
 
 static int apple_gpio_regmap_access(struct device *dev, unsigned int npins,
@@ -625,6 +637,7 @@ static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 	 * writes the hardware past it.
 	 */
 	pctl->cached = !(hw && hw->no_regcache);
+	pctl->staged = hw && hw->staged_restore;
 	pctl->saved = devm_kcalloc(&pdev->dev, npins, sizeof(*pctl->saved), GFP_KERNEL);
 	pctl->saved_valid = devm_bitmap_zalloc(&pdev->dev, npins, GFP_KERNEL);
 	if (!pctl->saved || !pctl->saved_valid)
@@ -696,6 +709,7 @@ static const struct of_device_id apple_gpio_pinctrl_of_match[] = {
 	{ .compatible = "apple,t8140-pinctrl", .data = &apple_gpio_uncached_hw },
 	{ .compatible = "apple,t8132-pinctrl", .data = &apple_gpio_uncached_hw },
 	{ .compatible = "apple,t6050-pinctrl", .data = &apple_gpio_uncached_hw },
+	{ .compatible = "apple,t6041-pinctrl", .data = &apple_gpio_t6041_hw },
 	{ .compatible = "apple,t8103-pinctrl", },
 	{ .compatible = "apple,pinctrl", },
 	{ }
@@ -707,12 +721,17 @@ MODULE_DEVICE_TABLE(of, apple_gpio_pinctrl_of_match);
  * configuration first with the input buffer as it is (off after a power loss), then the
  * input enable in a write of its own, the lock last. A locked pin is left alone. Written
  * in one go, with the input enable among the rest, the pin reads 0 for good after the wake.
+ * That is established for the T6041 blocks; any other block gets its word whole, as before.
  */
 static void apple_gpio_safe_reconfigure(struct apple_gpio_pinctrl *pctl, unsigned int pin,
 					u32 old, u32 cfg)
 {
 	u32 val = cfg & ~(REG_GPIOx_LOCK | REG_GPIOx_INPUT_ENABLE);
 
+	if (!pctl->staged) {
+		regmap_write(pctl->map, REG_GPIO(pin), cfg);
+		return;
+	}
 	if (old & REG_GPIOx_LOCK)
 		return;
 	if (!(cfg & REG_GPIOx_INPUT_ENABLE)) {
