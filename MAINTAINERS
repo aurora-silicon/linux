@@ -2765,6 +2765,7 @@ F:	Documentation/devicetree/bindings/thunderbolt/apple,t8103-usb4-nhi.yaml
 F:	Documentation/devicetree/bindings/usb/apple,dwc3.yaml
 F:	Documentation/devicetree/bindings/usb/apple,sn201202x.yaml
 F:	Documentation/devicetree/bindings/watchdog/apple,wdt.yaml
+F:	Documentation/hwmon/apple-aon-ptd-hwmon.rst
 F:	Documentation/hwmon/macsmc-hwmon.rst
 F:	Documentation/power/apple-s2idle.rst
 F:	arch/arm64/boot/dts/apple/
@@ -2774,6 +2775,7 @@ F:	drivers/cpufreq/apple-soc-cpufreq.c
 F:	drivers/dma/apple-admac.c
 F:	drivers/dma/apple-piodma.c
 F:	drivers/gpio/gpio-macsmc.c
+F:	drivers/hwmon/apple-aon-ptd-hwmon*.c
 F:	drivers/hwmon/macsmc-hwmon*.c
 F:	drivers/pmdomain/apple/
 F:	drivers/pmdomain/apple/.kunitconfig.apple-pmp

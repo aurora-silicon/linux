@@ -412,6 +412,30 @@ config SENSORS_ARCTIC_FAN_CONTROLLER
 	  This driver can also be built as a module. If so, the module
 	  will be called arctic_fan_controller.
 
+config SENSORS_APPLE_AON_PTD
+	tristate "Apple AON PTD battery telemetry (M4 Pro)"
+	depends on (ARCH_APPLE && OF) || COMPILE_TEST
+	depends on HAS_IOMEM
+	help
+	  Read-only battery voltage, current and power from the always-on
+	  power telemetry (PTD) block of Apple M4 Pro (T6041) machines, as
+	  10 ms and 100 ms filtered samples. The driver maps only the
+	  block's non-consuming peek window, takes no interrupts, writes
+	  nothing and sets no trips.
+
+	  This driver can also be built as a module. If so, the module will
+	  be called apple-aon-ptd-hwmon.
+
+config SENSORS_APPLE_AON_PTD_KUNIT_TEST
+	bool "KUnit tests for the Apple AON PTD battery telemetry" if !KUNIT_ALL_TESTS
+	depends on SENSORS_APPLE_AON_PTD && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Unit tests for the record placement checks, the stable two-read
+	  sample and the unit conversions of the Apple AON PTD battery
+	  telemetry driver. No hardware is needed. Only useful for kernel
+	  developers.
+
 config SENSORS_APPLE_PMP_J613
 	tristate "Apple J613 (M3 MacBook Air) PMP sensor records"
 	depends on (ARCH_APPLE && OF) || COMPILE_TEST
