@@ -226,6 +226,9 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 #define BRCMF_PCIE_MIN_SHARED_VERSION		5
 #define BRCMF_PCIE_MAX_SHARED_VERSION		BRCMF_PCIE_SHARED_VERSION_7
 #define BRCMF_PCIE_SHARED_VERSION_MASK		0x00FF
+#define BRCMF_PCIE_SHARED_ASSERT_BUILT		0x0100
+#define BRCMF_PCIE_SHARED_ASSERT		0x0200
+#define BRCMF_PCIE_SHARED_TRAP			0x0400
 #define BRCMF_PCIE_SHARED_DMA_INDEX		0x10000
 #define BRCMF_PCIE_SHARED_DMA_2B_IDX		0x100000
 #define BRCMF_PCIE_SHARED_USE_MAILBOX		0x2000000
@@ -286,6 +289,7 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 #define BRCMF_HOSTCAP2_DURATION_SCALE_MASK	0x3F
 
 #define BRCMF_SHARED_FLAGS_OFFSET		0
+#define BRCMF_SHARED_TRAP_ADDR_OFFSET		4
 #define BRCMF_SHARED_MAX_RXBUFPOST_OFFSET	34
 #define BRCMF_SHARED_RING_BASE_OFFSET		52
 #define BRCMF_SHARED_RX_DATAOFFSET_OFFSET	36
@@ -335,6 +339,12 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 
 #define BRCMF_PCIE_MBDATA_TIMEOUT		msecs_to_jiffies(2000)
 
+/* Stalled control requests in a row before a silent dongle counts as dead. */
+#define BRCMF_PCIE_CTL_STALL_MAX		3
+/* Firmware recoveries allowed per window before the driver gives up. */
+#define BRCMF_PCIE_RECOVERY_MAX			5
+#define BRCMF_PCIE_RECOVERY_WINDOW_S		600
+
 #define BRCMF_PCIE_CFGREG_STATUS_CMD		0x4
 #define BRCMF_PCIE_CFGREG_PM_CSR		0x4C
 #define BRCMF_PCIE_CFGREG_MSI_CAP		0x58
@@ -362,6 +372,9 @@ struct brcmf_pcie_console {
 	u32 read_idx;
 	u8 log_str[256];
 	u8 log_idx;
+	u32 scan_idx;
+	u8 scan_line[8];
+	u8 scan_len;
 };
 
 struct brcmf_pcie_shared_info {
@@ -438,6 +451,9 @@ struct brcmf_pciedev_info {
 	struct brcmf_mp_device *settings;
 	struct brcmf_otp_params otp;
 	bool fwseed;
+	bool fw_dead;
+	u32 recoveries;
+	unsigned long recovery_window;
 #ifdef DEBUG
 	u32 console_interval;
 	bool console_active;
@@ -933,6 +949,122 @@ brcmf_pcie_send_mb_data(struct brcmf_pciedev_info *devinfo, u32 htod_mb_data)
 	return 0;
 }
 
+/*
+ * The dongle firmware is dead: a halt notice, a trap or assert recorded in
+ * shared RAM or on its console, or a control ring that stopped moving. Stop
+ * using it and reset the chip the way the debugfs "reset" entry does, which
+ * reloads the firmware and registers the interfaces again. A firmware that
+ * keeps dying is left alone after BRCMF_PCIE_RECOVERY_MAX resets in
+ * BRCMF_PCIE_RECOVERY_WINDOW_S seconds.
+ */
+static void brcmf_pcie_fw_died(struct brcmf_pciedev_info *devinfo,
+			       const char *reason)
+{
+	struct device *dev = &devinfo->pdev->dev;
+	struct brcmf_bus *bus = dev_get_drvdata(dev);
+
+	if (xchg(&devinfo->fw_dead, true))
+		return;
+
+	if (!devinfo->recoveries ||
+	    time_after(jiffies, devinfo->recovery_window +
+				BRCMF_PCIE_RECOVERY_WINDOW_S * HZ)) {
+		devinfo->recovery_window = jiffies;
+		devinfo->recoveries = 0;
+	}
+	if (++devinfo->recoveries > BRCMF_PCIE_RECOVERY_MAX) {
+		brcmf_err(bus, "firmware died (%s), %d resets in %d s, not resetting again\n",
+			  reason, BRCMF_PCIE_RECOVERY_MAX,
+			  BRCMF_PCIE_RECOVERY_WINDOW_S);
+		return;
+	}
+
+	brcmf_err(bus, "firmware died (%s), resetting the chip (%u/%u)\n",
+		  reason, devinfo->recoveries, (u32)BRCMF_PCIE_RECOVERY_MAX);
+	/* Fail further firmware commands at once instead of timing out. */
+	if (bus)
+		brcmf_bus_change_state(bus, BRCMF_BUS_DOWN);
+	brcmf_fw_crashed(dev);
+}
+
+/*
+ * Look for a trap the firmware printed on its console since the last scan.
+ * Its trap handler starts the report with a line beginning "TRAP ".
+ */
+static bool brcmf_pcie_console_trapped(struct brcmf_pciedev_info *devinfo)
+{
+	struct brcmf_pcie_console *console = &devinfo->shared.console;
+	static const char marker[] = "TRAP ";
+	bool trapped = false;
+	u32 widx;
+	u8 ch;
+
+	if (!console->base_addr || !console->bufsize)
+		return false;
+	widx = brcmf_pcie_read_tcm32(devinfo, console->base_addr +
+				     BRCMF_CONSOLE_WRITEIDX_OFFSET);
+	if (widx >= console->bufsize || console->scan_idx >= console->bufsize)
+		return false;
+
+	while (console->scan_idx != widx) {
+		ch = brcmf_pcie_read_tcm8(devinfo,
+					  console->buf_addr + console->scan_idx);
+		if (++console->scan_idx == console->bufsize)
+			console->scan_idx = 0;
+		if (ch == '\n') {
+			console->scan_len = 0;
+			continue;
+		}
+		if (console->scan_len >= sizeof(marker) - 1)
+			continue;
+		if (ch != marker[console->scan_len]) {
+			/* Not at a line start any more: skip to the newline. */
+			console->scan_len = sizeof(marker) - 1;
+			continue;
+		}
+		if (++console->scan_len == sizeof(marker) - 1)
+			trapped = true;
+	}
+
+	return trapped;
+}
+
+static void brcmf_pcie_ctl_stall(struct device *dev, u32 stalls)
+{
+	struct brcmf_bus *bus = dev_get_drvdata(dev);
+	struct brcmf_pciedev_info *devinfo = bus->bus_priv.pcie->devinfo;
+	struct brcmf_pcie_shared_info *shared = &devinfo->shared;
+	const char *reason = NULL;
+	u32 flags, addr;
+
+	if (devinfo->state != BRCMFMAC_PCIE_STATE_UP || READ_ONCE(devinfo->fw_dead))
+		return;
+
+	flags = brcmf_pcie_read_tcm32(devinfo, shared->tcm_base_address +
+				      BRCMF_SHARED_FLAGS_OFFSET);
+	if (flags == ~0U) {
+		reason = "device not responding";
+	} else if (flags & BRCMF_PCIE_SHARED_TRAP) {
+		addr = brcmf_pcie_read_tcm32(devinfo, shared->tcm_base_address +
+					     BRCMF_SHARED_TRAP_ADDR_OFFSET);
+		/* trap type, then the exception pc */
+		brcmf_err(bus, "firmware trap 0x%x at 0x%08x\n",
+			  brcmf_pcie_read_tcm32(devinfo, addr),
+			  brcmf_pcie_read_tcm32(devinfo, addr + 4));
+		reason = "trap in shared RAM";
+	} else if ((flags & BRCMF_PCIE_SHARED_ASSERT_BUILT) &&
+		   (flags & BRCMF_PCIE_SHARED_ASSERT)) {
+		reason = "assert in shared RAM";
+	} else if (brcmf_pcie_console_trapped(devinfo)) {
+		reason = "trap on the firmware console";
+	} else if (stalls >= BRCMF_PCIE_CTL_STALL_MAX) {
+		reason = "no response to control requests";
+	}
+
+	if (reason)
+		brcmf_pcie_fw_died(devinfo, reason);
+}
+
 static void brcmf_pcie_handle_mb_data(struct brcmf_pciedev_info *devinfo, u32 data)
 {
 	brcmf_dbg(PCIE, "D2H_MB_DATA: 0x%04x\n", data);
@@ -950,7 +1082,7 @@ static void brcmf_pcie_handle_mb_data(struct brcmf_pciedev_info *devinfo, u32 da
 	}
 	if (data & BRCMF_D2H_DEV_FWHALT) {
 		brcmf_dbg(PCIE, "D2H_MB_DATA: FW HALT\n");
-		brcmf_fw_crashed(&devinfo->pdev->dev);
+		brcmf_pcie_fw_died(devinfo, "firmware halt notice");
 	}
 }
 
@@ -998,6 +1130,9 @@ static void brcmf_pcie_bus_console_init(struct brcmf_pciedev_info *devinfo)
 	console->buf_addr = brcmf_pcie_read_tcm32(devinfo, addr);
 	addr = console->base_addr + BRCMF_CONSOLE_BUFSIZE_OFFSET;
 	console->bufsize = brcmf_pcie_read_tcm32(devinfo, addr);
+	addr = console->base_addr + BRCMF_CONSOLE_WRITEIDX_OFFSET;
+	console->scan_idx = brcmf_pcie_read_tcm32(devinfo, addr);
+	console->scan_len = 0;
 
 	brcmf_dbg(FWCON, "Console: base %x, buf %x, size %d\n",
 		  console->base_addr, console->buf_addr, console->bufsize);
@@ -1769,16 +1904,27 @@ static int brcmf_pcie_reset(struct device *dev)
 	struct brcmf_fw_request *fwreq;
 	int err;
 
+	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
 	brcmf_pcie_intr_disable(devinfo);
+	if (devinfo->irq_allocated)
+		synchronize_irq(devinfo->pdev->irq);
 
 	brcmf_pcie_bus_console_read(devinfo, true);
+
+	/*
+	 * Stop the dongle before its host buffers go away, as remove does:
+	 * firmware that is still running DMAs into the RX buffers that
+	 * brcmf_detach() unmaps.
+	 */
+	brcmf_pcie_reset_device(devinfo);
 
 	brcmf_detach(dev);
 
 	brcmf_pcie_release_irq(devinfo);
 	brcmf_pcie_release_scratchbuffers(devinfo);
 	brcmf_pcie_release_ringbuffers(devinfo);
-	brcmf_pcie_reset_device(devinfo);
+	kfree(bus_if->msgbuf->flowrings);
+	bus_if->msgbuf->flowrings = NULL;
 
 	fwreq = brcmf_pcie_prepare_fw_request(devinfo);
 	if (!fwreq) {
@@ -1808,6 +1954,7 @@ static const struct brcmf_bus_ops brcmf_pcie_bus_ops = {
 	.reset = brcmf_pcie_reset,
 	.debugfs_create = brcmf_pcie_debugfs_create,
 	.d2h_mb_rx = brcmf_pcie_d2h_mb_rx,
+	.ctl_stall = brcmf_pcie_ctl_stall,
 };
 
 
@@ -2608,6 +2755,7 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 	if (ret)
 		goto fail;
 
+	WRITE_ONCE(devinfo->fw_dead, false);
 	devinfo->state = BRCMFMAC_PCIE_STATE_UP;
 
 	ret = brcmf_pcie_init_ringbuffers(devinfo);
