@@ -490,9 +490,15 @@ impl Firmware {
             if f.renders != 0 {
                 self.recovery.last_retired[1] = Some(f.ta_target);
                 self.recovery.last_retired[2] = Some(f.fs_target);
-                let committed = f.job.resources.pb(f.first).and_then(|epoch| {
-                    self.pools
-                        .retire_binding(timestamp_claims.pass[0] as usize, epoch)
+                let committed = match f.pb.as_ref() {
+                    Some(epoch) => Ok(epoch),
+                    None => f.job.resources.pb(f.first),
+                }
+                .and_then(|epoch| {
+                    let k = timestamp_claims.pass[0] as usize;
+                    let enabled = crate::module_parameters::g16_pb_reuse.value() != 0;
+                    self.pools.retire_epoch(enabled, k, epoch, result.is_ok());
+                    self.pools.retire_binding(k, epoch)
                 });
                 if let Err(error) = committed {
                     self.retain(&f.job);
@@ -514,6 +520,10 @@ impl Firmware {
         } else {
             // Only an actual passed abort lacks the full owner receipt. An affected job
             // with a full normal receipt fails its fence without poisoning healthy storage.
+            if f.renders != 0 {
+                // The quarantined slot is not picked again, but keep no epoch of it for reuse.
+                self.pools.forget(timestamp_claims.pass[0] as usize);
+            }
             self.slots.quarantine(&mut f.claims);
             self.retain(&f.job);
             self.recovery.aborted_receipts = self.recovery.aborted_receipts.saturating_add(1);
