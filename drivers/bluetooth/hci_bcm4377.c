@@ -617,6 +617,8 @@ struct bcm4377_data {
 	bool resume_powered;
 	bool resume_guarded;
 	bool resume_recovering;
+	/* Back from a system sleep without its firmware: nothing is sent until the reset. */
+	bool resume_cold;
 	struct work_struct resume_work;
 	bdaddr_t bdaddr;
 
@@ -1475,6 +1477,7 @@ static int bcm4377_pci_reset(struct bcm4377_data *bcm4377)
 	}
 
 	bcm4377->needs_reset = false;
+	WRITE_ONCE(bcm4377->resume_cold, false);
 	dev_info(&bcm4377->pdev->dev,
 		 "hardware reset recovery completed successfully\n");
 	return 0;
@@ -1592,8 +1595,8 @@ static void bcm4377_setup_retry_work(struct work_struct *work)
 
 static bool bcm4377_resume_recovery_supported(struct bcm4377_data *bcm4377)
 {
-	return bcm4377->hw->id == 0x4378 &&
-	       of_machine_is_compatible("apple,j493");
+	return (bcm4377->hw->id == 0x4378 && of_machine_is_compatible("apple,j493")) ||
+	       (bcm4377->hw->id == 0x4388 && of_machine_is_compatible("apple,j616s"));
 }
 
 static bool bcm4377_resume_recovery_allowed(struct hci_dev *hdev)
@@ -1640,8 +1643,12 @@ static int bcm4377_resume_recovery_sync(struct hci_dev *hdev, void *data)
 	if (!allowed)
 		return 0;
 
-	dev_warn(&bcm4377->pdev->dev,
-		 "recovering transport once after resume command timeout\n");
+	if (READ_ONCE(bcm4377->resume_cold))
+		dev_info(&bcm4377->pdev->dev,
+			 "restarting the transport: the sleep left no firmware running\n");
+	else
+		dev_warn(&bcm4377->pdev->dev,
+			 "recovering transport once after resume command timeout\n");
 	ret = hci_reset_dev_sync(hdev);
 	spin_lock_irqsave(&bcm4377->resume_lock, flags);
 	bcm4377->resume_recovering = false;
@@ -1988,6 +1995,12 @@ static int bcm4377_hci_send_frame(struct hci_dev *hdev, struct sk_buff *skb)
 	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
 	struct bcm4377_transfer_ring *ring;
 	int ret;
+
+	/* No firmware behind the rings: fail at once, a command must not wait out its timeout. */
+	if (READ_ONCE(bcm4377->resume_cold)) {
+		hdev->stat.err_tx++;
+		return -ENODEV;
+	}
 
 	switch (hci_skb_pkt_type(skb)) {
 	case HCI_COMMAND_PKT:
@@ -3156,16 +3169,50 @@ static int bcm4377_suspend(struct device *dev)
 	return 0;
 }
 
+/*
+ * A system sleep that takes the chip's power or resets it leaves the function's private
+ * windows at their reset values and no firmware: a J616s after a suspend to RAM reads
+ * window 1 as 0x19328000 and, once the windows are back, boot stage 0. Put the windows
+ * back and say whether a firmware still runs behind them.
+ */
+static bool bcm4377_resume_cold(struct bcm4377_data *bcm4377)
+{
+	u32 win = bcm4377->hw->bar0_window1, bootstage, rti_status;
+
+	pci_read_config_dword(bcm4377->pdev, BCM4377_PCIECFG_BAR0_WINDOW1, &win);
+	if (win == bcm4377->hw->bar0_window1)
+		return false;
+	if (bcm4377_init_cfg(bcm4377))
+		return true;
+	bootstage = ioread32(bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_BOOTSTAGE);
+	rti_status = ioread32(bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_RTI_STATUS);
+	dev_info(&bcm4377->pdev->dev,
+		 "the sleep reset the function (window %#x): boot stage %u, RTI status %u\n",
+		 win, bootstage, rti_status);
+	return bootstage != 2 || rti_status != 2;
+}
+
 static int bcm4377_resume(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
 	unsigned long flags;
+	bool cold;
 	int ret;
 
 	if (bcm4377->wake_armed) {
 		disable_irq_wake(pdev->irq);
 		bcm4377->wake_armed = false;
+	}
+
+	/* A function an earlier sleep left cold stays cold until a reset boots it. */
+	cold = bcm4377_resume_recovery_supported(bcm4377) &&
+	       (bcm4377_resume_cold(bcm4377) || READ_ONCE(bcm4377->resume_cold));
+	if (cold) {
+		/* No firmware to wake: the next open resets the function and boots it. */
+		bcm4377->quiesced = false;
+		bcm4377->needs_reset = true;
+		WRITE_ONCE(bcm4377->resume_cold, true);
 	}
 
 	if (bcm4377->quiesced) {
@@ -3187,6 +3234,19 @@ static int bcm4377_resume(struct device *dev)
 
 	ret = hci_resume_dev(bcm4377->hdev);
 	WRITE_ONCE(bcm4377->setup_retry_blocked, false);
+	if (cold) {
+		/* What a command timeout would start, without the timeout. */
+		spin_lock_irqsave(&bcm4377->resume_lock, flags);
+		if (bcm4377->resume_armed) {
+			bcm4377->resume_armed = false;
+			bcm4377->resume_pending = bcm4377->resume_epoch;
+			queue_work(system_freezable_wq, &bcm4377->resume_work);
+		}
+		spin_unlock_irqrestore(&bcm4377->resume_lock, flags);
+		/* A setup retry the suspend held back needs no firmware: its open resets. */
+		bcm4377_queue_setup_retry(bcm4377);
+		return 0;
+	}
 	if (!ret)
 		bcm4377_queue_setup_retry(bcm4377);
 	return ret;
