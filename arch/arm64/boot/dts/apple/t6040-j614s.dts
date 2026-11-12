@@ -237,3 +237,5 @@
 &usb4_2_nhi {
 	status = "okay";
 };
+
+#include "t6040-j614s-extdisp-hdmi.dtsi"
