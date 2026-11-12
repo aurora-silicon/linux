@@ -1670,7 +1670,7 @@ static void t6040_dcs_dyn_pg(struct t6040_sleep *s)
 /*
  * ANS's own fabric bridge (0x4_0b00_0000 +0x104/+0x108 bit 0). The bit is cleared before a
  * retained domain goes off and set again once it is back up; here the wake sets it
- * (t6040_sleep_raise_apcie_st()) and the SoC's sleep engine, not this driver, takes ANS down.
+ * (t6040_apcie_st_raise()) and the SoC's sleep engine, not this driver, takes ANS down.
  * The boot loader leaves the bit clear, so a boot's first sleep goes down with it clear;
  * without this the next one meets the bridge as the first wake armed it. Only while ANS is
  * on: the bridge sits in it.
@@ -1703,7 +1703,7 @@ static void t6040_ans_bridge_quiesce(struct t6040_sleep *s)
  * Linux never uses, and does only what the engine needs before it runs: the shared PHY put
  * to sleep, APCIE_PHY_SW clock-gated while APCIE_GP is still on, the PCIe PLL shut down.
  */
-static void t6040_sleep_lower_apcie_st(struct t6040_sleep *s)
+static void t6040_apcie_st_lower(struct t6040_sleep *s)
 {
 	struct t6040_apcie_st *a = &s->apcie_st;
 	void __iomem *ps = s->soc_east;
@@ -1750,7 +1750,7 @@ static void t6040_bridge_rearm(void __iomem *bridge)
  * waited for before the PHY's clocks are requested. @apcie_wake_step tells a
  * failed raise's stage.
  */
-static int t6040_sleep_raise_apcie_st(struct t6040_sleep *s)
+static int t6040_apcie_st_raise(struct t6040_sleep *s)
 {
 	struct t6040_apcie_st *a = &s->apcie_st;
 	void __iomem *ps = s->soc_east;
@@ -1911,7 +1911,7 @@ static int t6040_ps_lower_word(void __iomem *reg)
 					 PS_OFF_TIMEOUT_US);
 }
 
-static void t6040_sleep_lower_atc(struct t6040_sleep *s)
+static void t6040_atc_lower(struct t6040_sleep *s)
 {
 	int p, k;
 
@@ -1976,7 +1976,7 @@ static void t6040_gp_port_stop(struct t6040_sleep *s, int p)
 }
 
 /* The GP host's two ports, while the block's domains are all still on. */
-static void t6040_sleep_stop_gp_ports(struct t6040_sleep *s)
+static void t6040_gp_ports_stop(struct t6040_sleep *s)
 {
 	int p;
 
@@ -1992,7 +1992,7 @@ static void t6040_sleep_stop_gp_ports(struct t6040_sleep *s)
  * hung the bus. T8140's order: SYS_ST, ST, SYS_GP, GP. APCIE_GP goes to clock-gated
  * (TARGET 4), the state the sleep engine itself asks for, not to off.
  */
-static void t6040_sleep_lower_apcie_gp(struct t6040_sleep *s)
+static void t6040_apcie_gp_lower(struct t6040_sleep *s)
 {
 	void __iomem *sys, *gp, *bridge = s->axi2af_bridge[AXI2AF_APCIE_SYS_GP];
 	u32 val;
@@ -2044,8 +2044,8 @@ static int t6040_sleep_commit(unsigned long unused)
 	 * J616s: release them now, and wait for their power words to read off further down.
 	 */
 	spin_table_release_stopped();
-	t6040_sleep_lower_atc(s);
-	t6040_sleep_stop_gp_ports(s);
+	t6040_atc_lower(s);
+	t6040_gp_ports_stop(s);
 
 	/*
 	 * ANS's storage link, once ANS has been stopped by its driver (see
@@ -2055,8 +2055,8 @@ static int t6040_sleep_commit(unsigned long unused)
 	if (s->soc_east)
 		t6040_ps_raise_start(s->soc_east, PS_APCIE_SYS_ST1);
 	if (s->pcie_ans_stopped)
-		t6040_sleep_lower_apcie_st(s);
-	t6040_sleep_lower_apcie_gp(s);
+		t6040_apcie_st_lower(s);
+	t6040_apcie_gp_lower(s);
 
 	/* WD0 off, then the AON WD2 net (5 s covers the reconfig). */
 	if (s->wdt)
@@ -2243,7 +2243,7 @@ static void t6040_sleep_return(struct t6040_sleep *s)
 	s->apcie_wake_step = 0;
 	s->pcie_ans_on_ret = 0;
 	if (s->pcie_ans_stopped)
-		s->pcie_ans_on_ret = t6040_sleep_raise_apcie_st(s);
+		s->pcie_ans_on_ret = t6040_apcie_st_raise(s);
 	t6040_gp_pcie_clk(s);
 	t6040_wake_sync();
 	t6040_aop_ps_restore(s);
@@ -2709,7 +2709,7 @@ static void t6040_disp_back(struct t6040_sleep *s)
  * driver powers a domain off (TARGET 0, the one-shot bits clear), polled to ACTUAL 0. The
  * internal display's FE and SYS domains follow. Returns the number of words left on.
  */
-static unsigned int t6040_sleep_lower_display(struct t6040_sleep *s)
+static unsigned int t6040_disp_lower(struct t6040_sleep *s)
 {
 	unsigned int i, left = 0;
 
@@ -2755,7 +2755,7 @@ static int t6040_sleep_enter(suspend_state_t state)
 	if (dry)
 		return t6040_sleep_dry_enter(s, dry);
 
-	left = t6040_sleep_lower_display(s);
+	left = t6040_disp_lower(s);
 	if (left)
 		pr_warn("t6040-sleep: %u display power word(s) did not go off\n", left);
 	if (t6040_sleep_live_blockers(s, NULL, NULL)) {

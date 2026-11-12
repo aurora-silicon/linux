@@ -3313,7 +3313,7 @@ static const struct apple_nvme_hw apple_nvme_t6040_hw = {
 	 * restart, controller reset + namespace re-attach) are all generic and
 	 * already wired through this sleep_untraced state; the controller stops
 	 * ANS at the commit and raises its two ST lanes on wake
-	 * (t6040_sleep_lower/raise_apcie_st). Whether a sleep cuts the power
+	 * (t6040_apcie_st_lower/raise). Whether a sleep cuts the power
 	 * is the controller's decision (apple_sleep_power_loss()); a dry run (2
 	 * or 3) flushes, quiesces and sends the shutdown notification at the
 	 * device suspend, as a sleep does, and resets the controller as after
