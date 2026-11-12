@@ -17,6 +17,7 @@
  * Copyright The Asahi Linux Contributors
  */
 
+#include <linux/auxiliary_bus.h>
 #include <linux/debugfs.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
@@ -62,6 +63,10 @@ struct apple_regview {
 #define MCC_TZ_BASE		0x6a0
 #define MCC_TZ_STRIDE		0x10
 #define MCC_TZ_REGIONS		4
+#define T8112_DCS_STRIDE		0x40000
+#define T8112_DCS_CHANNELS	8
+#define T8112_DCS_DRAM_CONFIG_0	0xdc4
+#define T8112_DCS_DRAM_CONFIG_1	0xdbc
 
 /*
  * Plane 0 carveout start, end and enable of each region, then the cache
@@ -73,12 +78,17 @@ static const struct apple_regview_range apple_regview_t8112_mcc[] = {
 	{ 1, MCC_TZ_BASE + 0x4, MCC_TZ_REGIONS, MCC_TZ_STRIDE, "tz-end" },
 	{ 1, MCC_TZ_BASE + 0x8, MCC_TZ_REGIONS, MCC_TZ_STRIDE, "tz-enable" },
 	{ 1, MCC_PLANE_CACHE_STATUS, 4, MCC_PLANE_STRIDE, "cache-status" },
+	/* Public m1n1 names these per-channel words DCC_DRAMCFG0/1. */
+	{ 2, T8112_DCS_DRAM_CONFIG_0, T8112_DCS_CHANNELS, T8112_DCS_STRIDE,
+	  "dcs-dram-config-0" },
+	{ 2, T8112_DCS_DRAM_CONFIG_1, T8112_DCS_CHANNELS, T8112_DCS_STRIDE,
+	  "dcs-dram-config-1" },
 };
 
 static const struct apple_regview_hw apple_regview_t8112_mcc_hw = {
 	.ranges = apple_regview_t8112_mcc,
 	.nr_ranges = ARRAY_SIZE(apple_regview_t8112_mcc),
-	.nr_regs = 2,
+	.nr_regs = 3,
 };
 
 /* T6000: one reg entry per controller, each with four planes at offset 0. */
@@ -173,9 +183,10 @@ static void apple_regview_remove_debugfs(void *data)
 	debugfs_remove_recursive(data);
 }
 
-static int apple_regview_probe(struct platform_device *pdev)
+/* @dev owns the allocations; @np describes the register apertures. */
+static int apple_regview_setup(struct device *dev, struct device_node *np,
+			       const char *name, const struct apple_regview_hw *hw)
 {
-	struct device *dev = &pdev->dev;
 	struct apple_regview *rv;
 	unsigned int i;
 	int ret;
@@ -185,7 +196,7 @@ static int apple_regview_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	rv->dev = dev;
-	rv->hw = of_device_get_match_data(dev);
+	rv->hw = hw;
 	if (!rv->hw)
 		return -ENODEV;
 
@@ -197,7 +208,7 @@ static int apple_regview_probe(struct platform_device *pdev)
 	for (i = 0; i < rv->hw->nr_regs; i++) {
 		struct resource res;
 
-		ret = of_address_to_resource(dev->of_node, i, &res);
+		ret = of_address_to_resource(np, i, &res);
 		if (ret)
 			return dev_err_probe(dev, ret, "missing reg %u\n", i);
 		if (resource_size(&res) & 3)
@@ -217,21 +228,53 @@ static int apple_regview_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "register list exceeds the apertures\n");
 
-	rv->dir = debugfs_create_dir(dev_name(dev), apple_regview_root);
+	rv->dir = debugfs_create_dir(name, apple_regview_root);
 	debugfs_create_file("regs", 0400, rv->dir, rv, &apple_regview_fops);
 
 	return devm_add_action_or_reset(dev, apple_regview_remove_debugfs,
 					rv->dir);
 }
 
+static int apple_regview_probe(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+
+	return apple_regview_setup(dev, dev->of_node, dev_name(dev),
+				   of_device_get_match_data(dev));
+}
+
 static const struct of_device_id apple_regview_of_match[] = {
-	{ .compatible = "apple,t8112-mcc", .data = &apple_regview_t8112_mcc_hw },
 	{ .compatible = "apple,t6000-mcc", .data = &apple_regview_t6000_mcc_hw },
 	{ .compatible = "apple,t8112-spmi-sideband",
 	  .data = &apple_regview_t8112_spmi_sb_hw },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_regview_of_match);
+
+/* The functional MCC driver owns the T8112 node and hands its view over. */
+static int apple_regview_aux_probe(struct auxiliary_device *adev,
+				   const struct auxiliary_device_id *id)
+{
+	struct device *parent = adev->dev.parent;
+
+	if (!of_device_is_compatible(parent->of_node, "apple,t8112-mcc"))
+		return -ENODEV;
+
+	return apple_regview_setup(&adev->dev, parent->of_node, dev_name(parent),
+				   &apple_regview_t8112_mcc_hw);
+}
+
+static const struct auxiliary_device_id apple_regview_aux_ids[] = {
+	{ .name = "apple_mcc.regview" },
+	{}
+};
+MODULE_DEVICE_TABLE(auxiliary, apple_regview_aux_ids);
+
+static struct auxiliary_driver apple_regview_aux_driver = {
+	.name = "regview",
+	.probe = apple_regview_aux_probe,
+	.id_table = apple_regview_aux_ids,
+};
 
 static struct platform_driver apple_regview_driver = {
 	.driver = {
@@ -248,13 +291,20 @@ static int __init apple_regview_init(void)
 	apple_regview_root = debugfs_create_dir("apple-regview", NULL);
 	ret = platform_driver_register(&apple_regview_driver);
 	if (ret)
-		debugfs_remove_recursive(apple_regview_root);
+		goto err_debugfs;
+	ret = auxiliary_driver_register(&apple_regview_aux_driver);
+	if (!ret)
+		return 0;
+	platform_driver_unregister(&apple_regview_driver);
+err_debugfs:
+	debugfs_remove_recursive(apple_regview_root);
 	return ret;
 }
 module_init(apple_regview_init);
 
 static void __exit apple_regview_exit(void)
 {
+	auxiliary_driver_unregister(&apple_regview_aux_driver);
 	platform_driver_unregister(&apple_regview_driver);
 	debugfs_remove_recursive(apple_regview_root);
 }

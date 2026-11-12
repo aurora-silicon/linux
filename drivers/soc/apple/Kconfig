@@ -54,9 +54,10 @@ config APPLE_MAILBOX
 	  Say Y here if you have an Apple SoC.
 
 config APPLE_MCC
-	tristate "Apple T8140 and T6040 system level cache"
+	tristate "Apple memory-controller performance handoff"
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on OF
+	select AUXILIARY_BUS
 	default ARCH_APPLE
 	help
 	  The boot firmware of the Apple T8140 and T6040 SoCs enables the
@@ -64,7 +65,11 @@ config APPLE_MCC
 	  allocation once the devices that took over DMA from the bootloader
 	  are bound.
 
-	  Say 'y' or 'm' here if you have an Apple T8140 or T6040 SoC.
+	  On T8112 this also captures the inherited per-channel DCS DRAM
+	  configuration before the PMP starts, publishes a read-only comparison,
+	  and provides an explicitly opted-in restore for qualification.
+
+	  Say 'y' or 'm' here if you have a supported Apple SoC.
 
 config APPLE_MCC_KUNIT_TEST
 	bool "KUnit tests for Apple MCC allocation and unwind" if !KUNIT_ALL_TESTS
@@ -312,6 +317,7 @@ config APPLE_REGVIEW
 	tristate "Apple SoC read-only register views"
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on OF && DEBUG_FS
+	select AUXILIARY_BUS
 	help
 	  Exposes fixed lists of registers of Apple SoC blocks that have no
 	  functional driver, such as the memory cache controller, as

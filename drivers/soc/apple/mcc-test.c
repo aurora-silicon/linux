@@ -10,7 +10,34 @@ struct apple_mcc_test {
 	unsigned long attempted;
 	unsigned long disabled;
 	unsigned long flushed;
+	struct t8112_dram_config live[T8112_DCS_CHANNELS];
+	unsigned int config_writes;
+	unsigned int reject_config_once;
+	bool config_rejected;
 };
+
+static struct t8112_dram_config apple_mcc_test_read_config(struct apple_mcc *mcc,
+							   unsigned int channel)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct apple_mcc_test *ctx = test->priv;
+
+	return ctx->live[channel];
+}
+
+static void apple_mcc_test_write_config(struct apple_mcc *mcc, unsigned int channel,
+					const struct t8112_dram_config *config)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct apple_mcc_test *ctx = test->priv;
+
+	ctx->config_writes++;
+	if (channel == ctx->reject_config_once && !ctx->config_rejected) {
+		ctx->config_rejected = true;
+		return;
+	}
+	ctx->live[channel] = *config;
+}
 
 static void apple_mcc_test_write(struct apple_mcc *mcc, unsigned int plane,
 				 u32 val, u32 offset)
@@ -48,6 +75,7 @@ static struct apple_mcc_test *apple_mcc_test_alloc(struct kunit *test)
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, mcc->dev);
 	mcc->nr_planes = 3;
 	ctx->reject_plane = MCC_MAX_PLANES;
+	ctx->reject_config_once = T8112_DCS_CHANNELS;
 	for (i = 0; i < mcc->nr_planes; i++) {
 		mcc->planes[i] = (__force void __iomem *)kunit_kzalloc(test, SZ_16K, GFP_KERNEL);
 		KUNIT_ASSERT_NOT_NULL(test, mcc->planes[i]);
@@ -57,6 +85,10 @@ static struct apple_mcc_test *apple_mcc_test_alloc(struct kunit *test)
 	}
 	test->priv = ctx;
 	kunit_activate_static_stub(test, apple_mcc_writel, apple_mcc_test_write);
+	kunit_activate_static_stub(test, apple_mcc_t8112_read_config,
+				   apple_mcc_test_read_config);
+	kunit_activate_static_stub(test, apple_mcc_t8112_write_config,
+				   apple_mcc_test_write_config);
 	return ctx;
 }
 
@@ -103,10 +135,57 @@ static void apple_mcc_test_not_ready(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ctx->flushed, 0UL);
 }
 
+static void apple_mcc_test_t8112_dram_restore(struct kunit *test)
+{
+	struct apple_mcc_test *ctx = apple_mcc_test_alloc(test);
+	struct apple_mcc *mcc = &ctx->mcc;
+	unsigned int i;
+
+	for (i = 0; i < T8112_DCS_CHANNELS; i++) {
+		mcc->boot_config[i] = (struct t8112_dram_config) {
+			.config0 = 0x100 + i,
+			.config1 = 0x200 + i,
+		};
+		ctx->live[i] =
+			(struct t8112_dram_config) { .config0 = i, .config1 = i + 1 };
+		mcc->pmp_config[i] = ctx->live[i];
+	}
+
+	KUNIT_ASSERT_EQ(test, apple_mcc_t8112_restore_config(mcc), 0);
+	KUNIT_EXPECT_EQ(test, ctx->config_writes, T8112_DCS_CHANNELS);
+	for (i = 0; i < T8112_DCS_CHANNELS; i++)
+		KUNIT_EXPECT_TRUE(test, apple_mcc_t8112_config_equal(&ctx->live[i],
+								     &mcc->boot_config[i]));
+}
+
+static void apple_mcc_test_t8112_dram_rollback(struct kunit *test)
+{
+	struct apple_mcc_test *ctx = apple_mcc_test_alloc(test);
+	struct apple_mcc *mcc = &ctx->mcc;
+	unsigned int i;
+
+	for (i = 0; i < T8112_DCS_CHANNELS; i++) {
+		mcc->boot_config[i] =
+			(struct t8112_dram_config) { .config0 = 0x10 + i, .config1 = 0x20 + i };
+		ctx->live[i] =
+			(struct t8112_dram_config) { .config0 = 0x30 + i, .config1 = 0x40 + i };
+		mcc->pmp_config[i] = ctx->live[i];
+	}
+	ctx->reject_config_once = 3;
+
+	KUNIT_ASSERT_EQ(test, apple_mcc_t8112_restore_config(mcc), -EIO);
+	KUNIT_EXPECT_EQ(test, ctx->config_writes, 2 * T8112_DCS_CHANNELS);
+	for (i = 0; i < T8112_DCS_CHANNELS; i++)
+		KUNIT_EXPECT_TRUE(test, apple_mcc_t8112_config_equal(&ctx->live[i],
+								     &mcc->pmp_config[i]));
+}
+
 static struct kunit_case apple_mcc_test_cases[] = {
 	KUNIT_CASE(apple_mcc_test_partial_enable),
 	KUNIT_CASE(apple_mcc_test_quiesce),
 	KUNIT_CASE(apple_mcc_test_not_ready),
+	KUNIT_CASE(apple_mcc_test_t8112_dram_restore),
+	KUNIT_CASE(apple_mcc_test_t8112_dram_rollback),
 	{}
 };
 
