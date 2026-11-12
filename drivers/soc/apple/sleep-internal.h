@@ -9,6 +9,8 @@
 #define _APPLE_SLEEP_INTERNAL_H_
 
 #include <linux/bits.h>
+#include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/mutex.h>
 #include <linux/types.h>
 
@@ -195,6 +197,22 @@ struct aura_s2r_mailbox {
 #define SYS_APL_IPI_SR_EL1	sys_reg(3, 5, 15, 1, 1)
 #define IPI_SR_PENDING		BIT(0)
 #define SYS_APL_SIQ_CFG_EL1	sys_reg(3, 4, 15, 10, 4)
+
+/* As macOS writes the PMU: the reply's vector masked, then acknowledged, so none is left raised. */
+static inline void apple_sleep_pmu_write(void __iomem *spmi, u16 reg, u8 val)
+{
+	u32 status, enable;
+
+	enable = readl(spmi + SPMI_NOTIFY_ENABLE);
+	writel(enable & ~SPMI_NOTIFY_REPLY, spmi + SPMI_NOTIFY_ENABLE);
+	writel(((u32)reg << 16) | SPMI_CMD_WRITE, spmi + SPMI_CMD);
+	writel(val, spmi + SPMI_CMD);
+	if (!readl_poll_timeout_atomic(spmi + SPMI_STATUS, status,
+				       !(status & SPMI_STATUS_RX_EMPTY), 1, 1000))
+		readl(spmi + SPMI_REPLY);
+	writel(1, spmi + SPMI_NOTIFY_ACK);
+	writel(enable, spmi + SPMI_NOTIFY_ENABLE);
+}
 
 /*
  * A SoC whose sleep doesn't fit the lists of struct apple_sleep_soc brings its own sequences.

@@ -1169,26 +1169,11 @@ static const struct t6040_axi2af_domain {
 	{ "apcie_sys_gp", true,  0x390, 0x416000000 },
 };
 
-/*
- * As macOS writes the PMU over SPMI (mirror of T8140's t8140_pmu_write): the
- * reply vector masked, the command and value written to +0x4, the reply polled
- * and acknowledged, so none is left raised.
- */
+/* Only with the PMU's bus mapped. */
 static void t6040_pmu_write(struct t6040_sleep *s, u16 reg, u8 val)
 {
-	u32 status, enable;
-
-	if (!s->spmi0)
-		return;
-	enable = readl(s->spmi0 + SPMI_NOTIFY_ENABLE);
-	writel(enable & ~SPMI_NOTIFY_REPLY, s->spmi0 + SPMI_NOTIFY_ENABLE);
-	writel(((u32)reg << 16) | SPMI_CMD_WRITE, s->spmi0 + SPMI_CMD);
-	writel(val, s->spmi0 + SPMI_CMD);
-	if (!readl_poll_timeout_atomic(s->spmi0 + SPMI_STATUS, status,
-				       !(status & SPMI_STATUS_RX_EMPTY), 1, 1000))
-		readl(s->spmi0 + SPMI_REPLY);
-	writel(1, s->spmi0 + SPMI_NOTIFY_ACK);
-	writel(enable, s->spmi0 + SPMI_NOTIFY_ENABLE);
+	if (s->spmi0)
+		apple_sleep_pmu_write(s->spmi0, reg, val);
 }
 
 /*
