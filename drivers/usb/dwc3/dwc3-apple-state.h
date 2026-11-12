@@ -91,7 +91,6 @@ static inline enum dwc3_apple_state dwc3_apple_state_for_role_kept(enum usb_role
  * dwc3_apple_sleep_may_keep() - whether a deep sleep may find the host kept in place
  * @fixed_hub: the controller serves a fixed hub
  * @phy_restart: a Type-C port whose PHY keeps the host by the core's reset
- * @typec_allowed: Type-C ports may sleep in place (the typec_sleep_in_place parameter)
  * @state: the controller's state
  * @shutting_down: the glue is going away
  * @dead: the core didn't come back from an earlier sleep
@@ -101,11 +100,11 @@ static inline enum dwc3_apple_state dwc3_apple_state_for_role_kept(enum usb_role
  *
  * Return: true if the PHY is to be asked.
  */
-static inline bool dwc3_apple_sleep_may_keep(bool fixed_hub, bool phy_restart, bool typec_allowed,
+static inline bool dwc3_apple_sleep_may_keep(bool fixed_hub, bool phy_restart,
 					     enum dwc3_apple_state state, bool shutting_down,
 					     bool dead)
 {
-	return (fixed_hub || (phy_restart && typec_allowed)) && state == DWC3_APPLE_HOST &&
+	return (fixed_hub || phy_restart) && state == DWC3_APPLE_HOST &&
 	       !shutting_down && !dead;
 }
 

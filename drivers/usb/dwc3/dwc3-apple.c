@@ -135,7 +135,7 @@
  * the host is restarted the old way once the system has resumed, and the devices enumerate
  * again; a core that may be unpowered is left alone until its reset releases. A port with a
  * DisplayPort link, or whose four lanes are DisplayPort's, or in USB4/Thunderbolt stops for
- * the sleep as before, and dwc3_apple.typec_sleep_in_place=0 makes every Type-C port do so.
+ * the sleep as before.
  *
  * Runtime PM (T6040 and T8132, see dwc3_apple_core_probe()): the glue holds a reference from
  * the reset deassert to the end of the shutdown, so with no cable the controller can
@@ -237,12 +237,6 @@ struct dwc3_apple {
 };
 
 #define to_dwc3_apple(d) container_of((d), struct dwc3_apple, dwc)
-
-/* Read before the freezer of each sleep, so both ways can be compared in one boot. */
-static bool typec_sleep_in_place = true;
-module_param(typec_sleep_in_place, bool, 0644);
-MODULE_PARM_DESC(typec_sleep_in_place,
-		 "Keep a Type-C port's host and its USB devices through a deep sleep where the PHY can (T6040); off, the host stops before the sleep and starts again after it (default Y)");
 
 /*
  * Apple Silicon dwc3 vendor-specific registers
@@ -1586,7 +1580,6 @@ static int dwc3_apple_pm_notify(struct notifier_block *nb, unsigned long action,
 		scoped_guard(mutex, &appledwc->lock)
 			in_place = dwc3_apple_sleep_may_keep(appledwc->fixed_hub,
 							     appledwc->sleep_restart,
-							     READ_ONCE(typec_sleep_in_place),
 							     appledwc->state,
 							     appledwc->shutting_down,
 							     appledwc->sleep_dead);
