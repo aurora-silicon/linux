@@ -102,10 +102,6 @@ def check(tree, output, dtc, board, soc, pmp_addr, report_addr, trial, avd_vmax=
         power = get(dtb, gpu, 'power-domains', 'x')[0]
         expected = get(dtb, gfx, 'phandle', 'x')[0]
         assert (int(power, 16) == int(expected, 16)) == trial
-        mcc = get(dtb, '/__symbols__', 'm2_mcc')[0]
-        pmp_phandle = get(dtb, pmp, 'phandle', 'x')[0]
-        assert get(dtb, mcc, 'apple,pmp', 'x', default=[]) == (
-            [pmp_phandle] if trial else [])
     if soc == 't8112':
         # Media performance requests come from the bootloader's ADT copy, and
         # only in the opt-in profile: the baseline DTB must not carry them.

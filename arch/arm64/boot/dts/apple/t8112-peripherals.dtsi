@@ -51,10 +51,6 @@
 			<0x2 0x1000000 0x0 0x2000000>,
 			<0x2 0xf00000 0x0 0x100000>,
 			<0x2 0x3b3c0000 0x0 0x20000>;
-		#ifdef APPLE_USE_PMP
-		/* Restore the cache mode only after this PMP has started. */
-		apple,pmp = <&pmp>;
-		#endif
 	};
 
 	m2_aft: fabric-tracker@200110000 {
