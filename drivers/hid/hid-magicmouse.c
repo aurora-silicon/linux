@@ -264,7 +264,8 @@ struct effect_job {
  * @query_dimensions: Whether to query and update dimensions on first open
  * @mtp_c1fe: Whether the MTP trackpad sends the J700 C1FE report layout.
  * @mtp_palms: Whether the controller's contact classes are trusted for palms
- *             on the standard MTP report (T6041).
+ *             on the standard MTP report (T6041, J616s).
+ * @mtp_palm_size: Whether a tool area alone marks an MTP contact as a palm.
  * @mtp_palm_ids: MTP contact IDs reported as palms until they lift.
  * @ntouches: Number of touches in most recent touch report.
  * @scroll_accel: Number of consecutive scroll motions.
@@ -294,6 +295,7 @@ struct magicmouse_sc {
 	bool query_dimensions;
 	bool mtp_c1fe;
 	bool mtp_palms;
+	bool mtp_palm_size;
 	DECLARE_BITMAP(mtp_palm_ids, U8_MAX + 1);
 
 	int ntouches;
@@ -1004,7 +1006,7 @@ static void magicmouse_mtp_update_palms(struct magicmouse_sc *msc,
 		id = magicmouse_mtp_contact_id(f);
 		class = le16_to_cpu(f->unknown2) & 0xff;
 		tool = le16_to_int(f->tool_major);
-		if (tool > MAGICMOUSE_MTP_PALM_TOOL_MAJOR ||
+		if ((msc->mtp_palm_size && tool > MAGICMOUSE_MTP_PALM_TOOL_MAJOR) ||
 		    (class >= MAGICMOUSE_MTP_PALM_CLASS_MIN &&
 		     tool > MAGICMOUSE_MTP_CLASSED_PALM_TOOL_MAJOR) ||
 		    test_bit(id, msc->mtp_palm_ids))
@@ -1376,9 +1378,9 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 	 */
 	if (!msc->mtp_c1fe) {
 		/*
-		 * A palm's tool area on the T6041 trackpad exceeds 5000 once
-		 * scaled, so allow the full range of the record's 16-bit fields
-		 * there.
+		 * A palm's tool area on the T6041 and J616s trackpads exceeds
+		 * 5000 once scaled, so allow the full range of the record's
+		 * 16-bit fields there.
 		 */
 		int area_max = msc->mtp_palms ? 2 * S16_MAX : 5000;
 
@@ -1405,7 +1407,7 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 				     J314_TP_MAX_FINGER_ORIENTATION, 0, 0);
 	}
 
-	/* The T6041 controller classifies palms. */
+	/* The T6041 and J616s controllers classify palms. */
 	if (msc->mtp_palms)
 		input_set_abs_params(input, ABS_MT_TOOL_TYPE, 0, MT_TOOL_MAX,
 				     0, 0);
@@ -2395,8 +2397,16 @@ static int magicmouse_probe(struct hid_device *hdev,
 		/* The J700 trackpad sends a different report layout. */
 		np = of_get_child_by_name(dev_of_node(hdev->dev.parent), "multi-touch");
 		msc->mtp_c1fe = of_device_is_compatible(np, "apple,j700-multitouch");
-		msc->mtp_palms = !msc->mtp_c1fe &&
-				 of_machine_is_compatible("apple,t6041");
+		msc->mtp_palm_size = !msc->mtp_c1fe &&
+				     of_machine_is_compatible("apple,t6041");
+		/*
+		 * The J616s controller classes contacts the same way, but its
+		 * fingers reach a tool area of 2475, so only the class marks its
+		 * palms there.
+		 */
+		msc->mtp_palms = msc->mtp_palm_size ||
+				 (!msc->mtp_c1fe &&
+				  of_machine_is_compatible("apple,j616s"));
 		of_node_put(np);
 
 		msc->input_ops.raw_event = magicmouse_raw_event_mtp;
