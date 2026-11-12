@@ -10445,9 +10445,9 @@ static void dcp_hib_ext_restore(struct apple_dcp *dcp)
 
 /*
  * The firmware-facing restart prefix shared by the internal and external cold
- * restarts, and by S2R: RUN asserted, RTKit re-initialised, the receive
- * ring released, then dcp_start_desktop() as at probe (RTKit wake/HELLO/EPMAP
- * through set_shmem). Returns 0 with the session starting; on failure it has
+ * restarts after a resume from disk: RUN asserted, RTKit re-initialised, the
+ * receive ring released, then dcp_start_desktop() as at probe (RTKit
+ * wake/HELLO/EPMAP through set_shmem). Returns 0 with the session starting; on failure it has
  * already called dcp_hib_give_up() and returns the error.
  */
 static int dcp_cold_session_start(struct apple_dcp *dcp)
