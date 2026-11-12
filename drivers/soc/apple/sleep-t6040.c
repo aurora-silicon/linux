@@ -343,7 +343,6 @@ struct t6040_sleep_group {
 /* A device the commit point looks at: bound or not, and its own power word. */
 struct t6040_sleep_watch {
 	const char *compatible;
-	const char *name;
 	struct regmap *ps_regmap;
 	u32 ps_offset;
 	bool has_ps;
@@ -450,7 +449,6 @@ struct t6040_sleep {
 	/* ANS's storage ST lanes: windows + whether a commit stopped ANS. */
 	struct t6040_apcie_st apcie_st;
 	bool pcie_ans_stopped;
-	bool ans_bridge_quiesced;	/* the commit found ANS's fabric bridge armed */
 	int pcie_ans_on_ret;
 	u32 apcie_wake_step;
 	u32 gp_phy_saved[2], gp_appclk_saved[2], gp_perst_saved[2];
@@ -624,12 +622,6 @@ static unsigned int t6040_sleep_live_blockers(struct t6040_sleep *sleep, struct 
 	if (disp_out)
 		*disp_out = disp;
 	return blockers + disp;
-}
-
-/* The total, at the commit point: everything the live state still holds against the commit. */
-static unsigned int t6040_sleep_total_blockers(struct t6040_sleep *sleep)
-{
-	return t6040_sleep_live_blockers(sleep, NULL, NULL);
 }
 
 static void t6040_axi2af_show(struct t6040_sleep *sleep, struct seq_file *s);
@@ -1145,7 +1137,7 @@ static const struct t6040_axi2af_domain {
 	bool east;		/* power word in soc_east (true) or soc_ps (false) */
 	u32 ps_off;
 	phys_addr_t bridge_pa;
-} t6040_axi2af[T6040_AXI2AF_DOMAINS] = {
+} t6040_axi2af[] = {
 	{ "atc0_common",  false, 0x390, 0x380000000 },
 	{ "atc1_common",  false, 0x3b8, 0x388000000 },
 	{ "atc2_common",  false, 0x3e0, 0x390000000 },
@@ -1482,13 +1474,6 @@ static bool t6040_ps_actual_on(void __iomem *base, u32 offset)
 	return FIELD_GET(PS_ACTUAL, readl(base + offset));
 }
 
-/* Read-modify-write a tunable in table order, writing only where it changes. */
-static void t6040_tunable_apply_changed(void __iomem *regs, const struct apple_tunable *t)
-{
-	if (t)
-		apple_sleep_tunable_apply_changed(regs, t);
-}
-
 /*
  * ENTRY: quiesce ANS's storage link, once ANS has been stopped by its driver. The PHY, the
  * clock generator and the AXI enables are treated as shared by the two ST lanes.
@@ -1714,24 +1699,22 @@ static void t6040_dcs_dyn_pg(struct t6040_sleep *s)
  * (t6040_sleep_raise_apcie_st()) and the SoC's sleep engine, not this driver, takes ANS down.
  * The boot loader leaves the bit clear, so a boot's first sleep goes down with it clear;
  * without this the next one meets the bridge as the first wake armed it. Only while ANS is
- * on: the bridge sits in it. Returns whether the bit was set.
+ * on: the bridge sits in it.
  */
-static bool t6040_ans_bridge_quiesce(struct t6040_sleep *s)
+static void t6040_ans_bridge_quiesce(struct t6040_sleep *s)
 {
 	void __iomem *bridge = s->axi2af_bridge[AXI2AF_ANS];
 	u32 a, b;
 
 	if (!bridge || !s->soc_east ||
 	    FIELD_GET(PS_ACTUAL, readl(s->soc_east + PS_ANS)) != 0xf)
-		return false;
+		return;
 	a = readl(bridge + AXI2AF_BRIDGE_104);
 	b = readl(bridge + AXI2AF_BRIDGE_108);
 	if (!((a | b) & BIT(0)))
-		return false;
+		return;
 	writel(a & ~BIT(0), bridge + AXI2AF_BRIDGE_104);
 	writel(b & ~BIT(0), bridge + AXI2AF_BRIDGE_108);
-
-	return true;
 }
 
 static void t6040_sleep_lower_apcie_st(struct t6040_sleep *s)
@@ -1754,7 +1737,7 @@ static void t6040_sleep_lower_apcie_st(struct t6040_sleep *s)
 		writel(readl(a->axi + APCIE_AXI_EN0) & ~BIT(0), a->axi + APCIE_AXI_EN0);
 		writel(readl(a->axi + APCIE_AXI_EN1) & ~BIT(0), a->axi + APCIE_AXI_EN1);
 	}
-	s->ans_bridge_quiesced = t6040_ans_bridge_quiesce(s);
+	t6040_ans_bridge_quiesce(s);
 }
 
 static void t6040_bridge_rearm(void __iomem *bridge)
@@ -1860,8 +1843,8 @@ static int t6040_sleep_raise_apcie_st(struct t6040_sleep *s)
 	s->apcie_wake_step = 5;
 
 	writel(readl(run) | APCIE_PHY_RUN_EN, run);
-	t6040_tunable_apply_changed(a->phy_ip, a->phy_ip_pll);
-	t6040_tunable_apply_changed(a->phy_ip, a->phy_ip_lanes);
+	apple_sleep_tunable_apply_changed(a->phy_ip, a->phy_ip_pll);
+	apple_sleep_tunable_apply_changed(a->phy_ip, a->phy_ip_lanes);
 	writel(readl(a->phy_ip + APCIE_PHY_IP_PLL_CTL) & ~APCIE_PHY_IP_PLL_HOLD,
 	       a->phy_ip + APCIE_PHY_IP_PLL_CTL);
 	writel(readl(run) | APCIE_PHY_RUN_EN2, run);
@@ -2803,7 +2786,7 @@ static int t6040_sleep_enter(suspend_state_t state)
 	left = t6040_sleep_lower_display(s);
 	if (left)
 		pr_warn("t6040-sleep: %u display power word(s) did not go off\n", left);
-	if (t6040_sleep_total_blockers(s)) {
+	if (t6040_sleep_live_blockers(s, NULL, NULL)) {
 		unsigned int on = t6040_sleep_log_groups(s);
 
 		pr_info("t6040-sleep: at the commit point: %u CPU(s) online, %u display group(s) on; refusing\n",
@@ -2831,7 +2814,6 @@ static int t6040_sleep_enter(suspend_state_t state)
 		return ret;
 	}
 	s->pcie_ans_stopped = false;
-	s->ans_bridge_quiesced = false;
 	apple_sleep_coprocs_stop(true, &s->pcie_ans_stopped);
 	apple_sleep_coprocs_stop(false, &s->pcie_ans_stopped);
 	t6040_wake_arm(s);
@@ -2841,8 +2823,6 @@ static int t6040_sleep_enter(suspend_state_t state)
 	ret = cpu_suspend(0, t6040_sleep_commit);
 	if (!ret)
 		t6040_sleep_return(s);
-	if (s->ans_bridge_quiesced)
-		pr_debug("t6040-sleep: ANS's fabric bridge was armed at the commit: quiesced\n");
 
 	if (s->returned)
 		t6040_wake_sync();
@@ -2945,7 +2925,6 @@ static void t6040_sleep_watch_init(struct t6040_sleep *s, unsigned int i,
 	struct regmap *regmap;
 
 	w->compatible = compatible;
-	w->name = name;
 	np = of_find_compatible_node(NULL, NULL, compatible);
 	if (!np)
 		return;
