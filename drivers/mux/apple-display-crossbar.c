@@ -239,12 +239,10 @@ static void t602x_dump(struct apple_dpxbar *xbar, const char *tag)
 #define T602X_MUX_SELECT 0x030
 #define T602X_ATC_ENABLE 0x034
 /*
- * T604X (as the platform brings a connection up): 0x34 holds a
- * per-clock UHBR select
- * (bit n set when the link rate is UHBR, cleared when it is not)
- * and the ATC is enabled at 0x38 (its bit ORed in);
- * The teardown clears neither. Used for DP IN tunnels only: the DP alt
- * mode output keeps the T6030 write that runs on this machine today.
+ * T604X, when a connection comes up: 0x34 holds a per-clock UHBR select
+ * (bit n set when the link rate is UHBR, cleared when it is not) and the ATC
+ * is enabled at 0x38 (its bit ORed in); neither is cleared at teardown. Used
+ * for DP IN tunnels only: the DP alt mode output keeps the T6030 write.
  */
 #define T604X_ATC_UHBR_SELECT 0x034
 #define T604X_ATC_ENABLE 0x038
