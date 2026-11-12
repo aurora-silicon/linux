@@ -34,9 +34,15 @@
 #define BCM4377_BAR0_SLEEP_CONTROL_QUIESCE 1
 #define BCM4377_BAR0_SLEEP_CONTROL_UNQUIESCE 0
 #define system_freezable_wq 0
+#define BIT(n) (1U << (n))
+#define HCI_COMMAND_PKT 1
+#define HCI_ACLDATA_PKT 2
+#define HCI_SCODATA_PKT 3
 #define container_of(p,t,m) ((t*)((char*)(p)-offsetof(t,m)))
 #define to_delayed_work(p) container_of(p,struct delayed_work,work)
-struct work_struct { int queued; };
+struct work_struct {
+	int queued, queues;
+};
 struct delayed_work { struct work_struct work; };
 typedef struct { unsigned char b[6]; } bdaddr_t;
 static const bdaddr_t zero={};
@@ -45,8 +51,29 @@ static void bacpy(bdaddr_t *a,const bdaddr_t *b) { *a=*b; }
 static int bacmp(const bdaddr_t *a,const bdaddr_t *b) { return memcmp(a,b,6); }
 struct bcm4377_data;
 struct firmware { const unsigned char *data; int size; };
-struct hci_dev { struct bcm4377_data *data; unsigned int flags; void *req_workqueue,*workqueue; struct work_struct power_on,cmd_sync_work,cmd_work; struct delayed_work cmd_timer,ncmd_timer; int req_lock,cmd_cnt,suspend_state,wake_reason,wake_addr_type; bdaddr_t wake_addr; int *req_skb; void (*reset)(struct hci_dev*); bdaddr_t setup_addr,public_addr,bdaddr; };
+struct hci_dev {
+	struct bcm4377_data *data;
+	unsigned int flags;
+	void *req_workqueue, *workqueue;
+	struct work_struct power_on, cmd_sync_work, cmd_work;
+	struct delayed_work cmd_timer, ncmd_timer;
+	int req_lock, cmd_cnt, suspend_state, wake_reason, wake_addr_type;
+	bdaddr_t wake_addr;
+	int *req_skb;
+	void (*reset)(struct hci_dev *hdev);
+	bdaddr_t setup_addr, public_addr, bdaddr;
+	struct {
+		int err_tx, cmd_tx, acl_tx, sco_tx, byte_tx;
+	} stat;
+};
 struct ring { bool enabled; };
+/* bcm4377_hci_send_frame() names the transfer ring type; the fixture has one ring type. */
+#define bcm4377_transfer_ring ring
+struct sk_buff {
+	int pkt_type;
+	unsigned char *data;
+	unsigned int len;
+};
 struct pci_dev {
 	int irq, dev;
 	void *data;
@@ -59,11 +86,11 @@ struct bcm4377_data {
 	bool setup_retry_used, setup_retry_pending, setup_retry_blocked;
 	struct delayed_work setup_retry_work;
 	bdaddr_t bdaddr;
-	char *bar0;
+	char *bar0, *bar2;
 	pthread_mutex_t resume_lock;
 	uint64_t resume_epoch, resume_pending;
 	bool resume_armed, resume_blocked, resume_powered;
-	bool resume_guarded, resume_recovering;
+	bool resume_guarded, resume_recovering, resume_cold;
 	struct work_struct resume_work;
  struct ring acl_d2h_ring,acl_h2d_ring,sco_d2h_ring,sco_h2d_ring,hci_d2h_ring,hci_h2d_ring,sco_event_ring,sco_ack_ring,hci_acl_event_ring,hci_acl_ack_ring;
 };
@@ -91,10 +118,42 @@ static int bcm4377_check_bdaddr(struct bcm4377_data *b) { return 0; }
 static int bcm4377_destroy_transfer_ring(struct bcm4377_data *b,struct ring *r) { r->enabled=false;return close_error; }
 static int bcm4377_destroy_completion_ring(struct bcm4377_data *b,struct ring *r) { r->enabled=false;return close_error; }
 static int bcm4377_hci_set_bdaddr(struct hci_dev *h,const bdaddr_t *a) { addr_count++;if(addr_error)return addr_error;h->bdaddr=*a;return 0; }
-static int bcm4377_pci_reset(struct bcm4377_data *b) { reset_count++;if(active_callback_pause){pthread_barrier_wait(&active_started);pthread_barrier_wait(&active_release);}if(reset_error)return reset_error;b->needs_reset=false;return 0; }
+
+/* What the function shows the driver: its private config windows and the firmware's status. */
+static uint32_t cfg[64], cfg_probe[64];
+static int cfg_reads, cfg_writes, cfg_error, fw_bootstage = 2, fw_rti_status = 2;
+
+/*
+ * Controlled boundary for the function reset, the window setup, the firmware boot and the
+ * RTI handshake. Like the driver's, a reset that succeeds ends the cold state.
+ */
+static int bcm4377_pci_reset(struct bcm4377_data *b)
+{
+	reset_count++;
+	if (active_callback_pause) {
+		pthread_barrier_wait(&active_started);
+		pthread_barrier_wait(&active_release);
+	}
+	if (reset_error)
+		return reset_error;
+	memcpy(cfg, cfg_probe, sizeof(cfg));
+	fw_bootstage = 2;
+	fw_rti_status = 2;
+	b->needs_reset = false;
+	b->resume_cold = false;
+	return 0;
+}
+
 static int bcm4377_hci_open_rings(struct bcm4377_data *b) { open_count++;return rings_error; }
 static int mod_delayed_work(int wq,struct delayed_work *w,int delay) { w->work.queued=1;return 1; }
-static int queue_work(void *wq,struct work_struct *w) { w->queued=1;queued_count++;return 1; }
+
+static int queue_work(void *wq, struct work_struct *w)
+{
+	w->queued = 1;
+	w->queues++;
+	queued_count++;
+	return 1;
+}
 
 typedef uint64_t u64;
 #define spin_lock_irqsave(l,f) do { (f)=0;pthread_mutex_lock(l); } while(0)
@@ -107,7 +166,16 @@ static pthread_t producer_thread;
 static void hci_cmd_timeout(struct work_struct *work);
 static struct bcm4377_data *active;
 static bool hdev_is_powered(struct hci_dev *h) {return (h->flags&HCI_UP) && !(h->flags&HCI_AUTO_OFF);}
-static bool of_machine_is_compatible(const char *s) {assert(!strcmp(s,"apple,j493"));return board_j493;}
+static bool board_j616s;
+
+static bool of_machine_is_compatible(const char *s)
+{
+	if (!strcmp(s, "apple,j616s"))
+		return board_j616s;
+	assert(!strcmp(s, "apple,j493"));
+	return board_j493;
+}
+
 static void *kmalloc(size_t n,int flags) {return allocation_error?NULL:malloc(n);}
 static void kfree(void *p) {free(p);}
 #define bt_dev_warn(...) ((void)0)
@@ -122,13 +190,70 @@ static void cancel_delayed_work_sync(struct delayed_work *w) {if(w==&active->hde
 #define disable_delayed_work_sync cancel_delayed_work_sync
 static struct pci_dev *to_pci_dev(struct device *d) {return d->pci;}
 static void *pci_get_drvdata(struct pci_dev *p) {return p->data;}
-static void iowrite32(int val,void *addr) {if(val==1){assert(!request.fn && !active->resume_work.queued && !active_running);quiesces++;}}
+
+/* An UNQUIESCE through windows a sleep reset does not reach the sleep control register. */
+static int unquiesces, misdirected;
+
+static void iowrite32(int val, void *addr)
+{
+	if (val == BCM4377_BAR0_SLEEP_CONTROL_QUIESCE) {
+		assert(!request.fn && !active->resume_work.queued && !active_running);
+		quiesces++;
+		return;
+	}
+	assert(val == BCM4377_BAR0_SLEEP_CONTROL_UNQUIESCE);
+	unquiesces++;
+	if (memcmp(cfg, cfg_probe, sizeof(cfg)))
+		misdirected++;
+}
+
 static bool fixture_wakeup;
 static bool device_may_wakeup(struct device *d) { return fixture_wakeup; }
 static void pci_save_state(struct pci_dev *p) {}
 static int enable_irq_wake(int irq) { return 0; }
 static void disable_irq_wake(int irq) {}
-static int ioread32(void *addr) { return 0; }
+static int ioread32(void *addr);
+
+static int pci_read_config_dword(struct pci_dev *p, int where, uint32_t *val)
+{
+	assert(p == active->pdev && !(where & 3) && where < 256);
+	cfg_reads++;
+	*val = cfg[where / 4];
+	return 0;
+}
+
+static int pci_write_config_dword(struct pci_dev *p, int where, uint32_t val)
+{
+	assert(p == active->pdev && !(where & 3) && where < 256);
+	if (cfg_error)
+		return cfg_error;
+	cfg_writes++;
+	cfg[where / 4] = val;
+	return 0;
+}
+
+static int enqueued, skbs_freed;
+static struct ring *enqueued_ring;
+
+static int hci_skb_pkt_type(struct sk_buff *skb)
+{
+	return skb->pkt_type;
+}
+
+static int bcm4377_enqueue(struct bcm4377_data *b, struct ring *r, void *data, size_t len,
+			   bool wait)
+{
+	assert(!wait);
+	enqueued++;
+	enqueued_ring = r;
+	return 0;
+}
+
+static void kfree_skb(struct sk_buff *skb)
+{
+	skbs_freed++;
+}
+
 static int hci_suspend_dev(struct hci_dev *h);
 static int hci_resume_dev(struct hci_dev *h);
 static void hci_unregister_dev(struct hci_dev *h) {assert(!request.fn&&!active->resume_work.queued&&!active_running);h->flags|=HCI_UNREGISTER;unregistered++;}
